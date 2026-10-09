@@ -216,6 +216,11 @@ IMM_WS_FAST=1). `ev` is one of:
   cancel carries `by: "fast"`.
 - `gone`: it left the book with no cancel or amend of ours: filled out, or
   expired. Its fills are in `fills_*.jsonl`, by `order_id`.
+- `narrow` (2026-10-08, IMM_WS_FAST_MIN_GAP_C > 0): the episode reached the
+  narrow gate's gap -- the moment the gated fast cancel goes (`mode` live)
+  or would go (dry). Once per episode, and NOT an end: the episode closes
+  with one of the rows above. It carries `gap_c`, `min_gap_c`,
+  `since_flag_s` and `phase`.
 
 Every end row carries `stale_s` (seconds since the flag). A cycle's `amend` /
 `cancel` / `gone` row is stamped with that CYCLE's start time, so its
@@ -274,6 +279,12 @@ counts (window, window_bad_top, window_bad_book). Since the same evening
 reads_s, run_s, period_s, last_reads_s, last_run_s). A live fast-path cancel
 (IMM_WS=on + IMM_WS_FAST=1, not enabled) would carry the orders-row cancel
 reason `ws_stale`.
+Since 2026-10-08: `latency.ws.fast_min_gap_c` (the narrow gate),
+`fast_stats.would_cancel_narrow`, `latency.ws.cand` (IMM_WS_CANDIDATES:
+mode, want = candidates on the feed, ws / rest / rest_fallback reads,
+audits, warm_waits, warm_s, and `shadow` -- the compare of candidate REST
+reads with the WS book), and `latency.universe` (the universe refreshes:
+n, median_s, last_s, last_reads, last_ws, last_at).
 
 ## Two compatibility traps, both tested
 

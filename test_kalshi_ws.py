@@ -391,6 +391,18 @@ class TestFeed(unittest.TestCase):
         self.assertIn("A", dirty)
         self.assertEqual((ev, dropped), ([], 0))
 
+    def test_ready_counts_the_servable_books_without_copying(self):
+        c = self._start(["A", "B"])
+        sid = self._book_sub()[0]["id"]
+        self.assertEqual(self.feed.ready(["A", "B", "Z"]), 0)
+        c.send_json(_snap(sid, 1, "A", [("0.40", "1")], [("0.50", "1")]))
+        self.assertTrue(_wait(lambda: self.feed.ready(["A", "B"]) == 1))
+        c.send_json(_snap(sid, 2, "B", [("0.10", "1")], [("0.80", "1")]))
+        self.assertTrue(_wait(lambda: self.feed.ready(["A", "B"]) == 2))
+        self.assertEqual(self.feed.ready(["A", "B", "Z"]), 2)   # Z never wanted
+        self.feed.set_markets(["A"])                            # B no longer wanted
+        self.assertEqual(self.feed.ready(["A", "B"]), 1)
+
     def test_gap_invalidates_and_resnapshots_and_ok_counts_in_sequence(self):
         c = self._start(["A", "B"])
         sid = self._book_sub()[0]["id"]

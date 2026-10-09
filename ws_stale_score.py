@@ -33,6 +33,15 @@ The dry check runs only in the bot's ~10s idle between cycles, so a rung that
 went stale mid-cycle is flagged at the next idle -- exactly what the fast
 path as built would see. Fills before the flag are reported, never counted.
 
+NARROW FAST CANCEL (2026-10-08, IMM_WS_FAST_MIN_GAP_C): a fast cancel only for
+a rung at least N cents ahead of the rest of its side. The bot writes a
+`narrow` line the first time an open episode reaches the gap (the moment the
+gated cancel goes); --min-gap N (default 10) scores that rule the same way,
+each episode from its narrow line -- or, for episodes logged before the gate
+existed, from its flag when the flag was already that far ahead. A clear or
+open episode's re-place moves with the later start; an amend / cancel /
+gone keeps the moment the cycle acted or the order left.
+
 It also scores the EVENT SWEEP BREAKER's dry trips (ws_sweep_*.jsonl): each
 trip would have pulled every quote we had in its event for its hold, so
 our fills there in (trip + 2s, trip + hold] are what it would have avoided
@@ -41,6 +50,7 @@ our fills there in (trip + 2s, trip + hold] are what it would have avoided
 
     python ws_stale_score.py                        # every ws_stale file
     python ws_stale_score.py --since 2026-10-04T19:00 --json out.json
+    python ws_stale_score.py --min-gap 0           # no narrow section
 """
 
 from __future__ import annotations
@@ -106,7 +116,8 @@ def _family(ticker: str) -> str:
 def load_episodes(d: str, since: Optional[float], until: Optional[float]
                   ) -> List[dict]:
     """The flag lines in [since, until), each with its end line (matched by
-    run and order) or end=None while still open."""
+    run and order) or end=None while still open, and its first `narrow`
+    line (the narrow gate reached; never an end) when there is one."""
     rows: List[dict] = []
     for p in _day_files(d, "ws_stale", ".jsonl"):
         with open(p, encoding="utf-8") as f:
@@ -132,6 +143,10 @@ def load_episodes(d: str, since: Optional[float], until: Optional[float]
             ts = float(r["ts"])
             if (since is None or ts >= since) and (until is None or ts < until):
                 eps.append(ep)
+        elif r.get("ev") == "narrow":
+            ep = open_.get(key)
+            if ep is not None and "narrow" not in ep:
+                ep["narrow"] = r
         else:
             ep = open_.pop(key, None)
             if ep is not None:
@@ -385,9 +400,27 @@ def _acted_stale(e: dict, actions: Dict[str, List[float]]) -> Optional[float]:
     return (later[0] - t0) if later else float(end["stale_s"])
 
 
+def narrow_start(e: dict, min_gap: float) -> Optional[float]:
+    """When the narrow gate (IMM_WS_FAST_MIN_GAP_C = min_gap) would cancel
+    the episode's rung: its `narrow` line's time when the bot logged one at
+    this gap, else the flag's time if the flag was already that far ahead
+    (episodes logged before the gate, or at another gap), else None."""
+    n = e.get("narrow")
+    if n is not None and abs(float(n.get("min_gap_c") or 0.0) - min_gap) < 1e-9:
+        return float(n["ts"])
+    g = e["flag"].get("gap_c")
+    if g is not None and float(g) >= min_gap - 1e-9:
+        return float(e["flag"]["ts"])
+    return None
+
+
 def score(eps: List[dict], fills: Dict[str, List[dict]],
           cyc: Dict[str, List[tuple]],
-          actions: Optional[Dict[str, List[float]]] = None) -> dict:
+          actions: Optional[Dict[str, List[float]]] = None,
+          start_of=None) -> dict:
+    """Score each episode as if a fast path cancelled its rung -- at the
+    flag, or at start_of(episode) for a gated rule (None: that rule never
+    acts on it, and it is left out, `ungated`)."""
     actions = actions or {}
     acted = {id(e): _acted_stale(e, actions) for e in eps}
     fixed = [v for v in acted.values() if v is not None]
@@ -412,19 +445,27 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
         if oid in window_until and t0 < window_until[oid]:
             res.append({"ticker": t, "order_id": oid, "end": ev, "folded": True})
             continue
+        ts0 = t0 if start_of is None else start_of(e)
+        if ts0 is None:                      # the gated rule never acts on it
+            res.append({"ticker": t, "order_id": oid, "end": ev, "ungated": True})
+            continue
+        # the re-place: the cycle's own amend / cancel, or the order leaving
+        # (gone), stay where they were; a clear / open one comes D after the
+        # cancel, so it moves with a gated rule's later start
         if ev in ("amend", "cancel"):
-            A = stale
+            end_abs = t0 + stale
         elif ev == "gone":
-            A = min(stale, D)
+            end_abs = min(t0 + stale, ts0 + D)
         else:                                # clear, open
-            A = D
-        window_until[oid] = t0 + A
+            end_abs = ts0 + D
+        A = max(0.0, end_abs - ts0)
+        window_until[oid] = end_abs
         px = float(fl["px"])
         mine = [f for f in fills.get(oid, ())
                 if abs(float(f.get("yes_price_cents") or -1) - px) <= PRICE_TOL]
-        before = [f for f in mine if t0 - 5.0 <= float(f["ts"]) < t0 + CANCEL_LAND_SECS]
+        before = [f for f in mine if ts0 - 5.0 <= float(f["ts"]) < ts0 + CANCEL_LAND_SECS]
         avoid = [f for f in mine
-                 if t0 + CANCEL_LAND_SECS <= float(f["ts"]) <= t0 + A
+                 if ts0 + CANCEL_LAND_SECS <= float(f["ts"]) <= end_abs
                  and f.get("fill_id") not in used_fills]
         used_fills.update(f.get("fill_id") for f in avoid)
         while_stale = [f for f in avoid
@@ -443,7 +484,8 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
             "ticker": t, "family": _family(t), "order_id": oid, "side": fl["side"],
             "phase": fl.get("phase") or "idle",
             "px": px, "rem": float(fl["rem"]), "gap_c": fl.get("gap_c"),
-            "t0": t0, "end": ev, "stale_s": stale, "replace_s": A,
+            "t0": t0, "start_s": round(ts0 - t0, 3), "end": ev,
+            "stale_s": stale, "replace_s": A,
             "fills_before": sum(float(f["count"]) for f in before),
             "avoid_n": len(avoid),
             "avoid_ct": sum(float(f["count"]) for f in avoid),
@@ -458,7 +500,8 @@ def score(eps: List[dict], fills: Dict[str, List[dict]],
 
 def summarize(sc: dict, t_lo: float, t_hi: float) -> dict:
     eps = [r for r in sc["episodes"]
-           if not (r.get("live") or r.get("folded") or r.get("phantom"))]
+           if not (r.get("live") or r.get("folded") or r.get("phantom")
+                   or r.get("ungated"))]
     hours = max((t_hi - t_lo) / 3600.0, 1e-9)
 
     def agg(rs: List[dict]) -> dict:
@@ -573,6 +616,41 @@ def render(s: dict) -> str:
                 f"{r['end']} |")
     return "\n".join(out) + "\n"
 
+
+
+def render_narrow(s: dict, min_gap: float) -> str:
+    """The narrow fast cancel (IMM_WS_FAST_MIN_GAP_C), scored: the cancels it
+    sends are the episodes that reach the gap."""
+    T = s["total"]
+    h5, h30 = HORIZONS
+    pd = s["per_day"]
+    out = ["", f"# Narrow fast cancel (>= {min_gap:g}c ahead), scored "
+               f"({s['hours']:.1f}h)", "",
+           f"{T['episodes']} episodes reached the gap ({pd['episodes']:.0f}/day: "
+           f"the cancels it would send); {T['hit']} were hit after the gated "
+           f"cancel, {T['avoid_ct']:.0f} contracts. Each starts at its `narrow` "
+           f"line (logged since 2026-10-08), else at its flag when the flag "
+           f"was already that far ahead.", "",
+           "| | total | per day |", "|---|---|---|",
+           f"| avoided (5m mark-out) | ${T[f'avoided_{h5}']:+.2f} | ${pd[f'avoided_{h5}']:+.2f} |",
+           f"| avoided (30m mark-out) | ${T[f'avoided_{h30}']:+.2f} | ${pd[f'avoided_{h30}']:+.2f} |",
+           f"| reward given up (model) | ${-T['reward_cost']:+.2f} | ${-pd['reward_cost']:+.2f} |",
+           f"| **net, 5m basis** | **${T[f'net_{h5}']:+.2f}** | **${pd[f'net_{h5}']:+.2f}** |",
+           f"| **net, 30m basis** | **${T[f'net_{h30}']:+.2f}** | **${pd[f'net_{h30}']:+.2f}** |"]
+    if s.get("by_phase"):
+        out += ["", "| phase | episodes | hit | avoided 30m | net 30m |",
+                "|---|---|---|---|---|"]
+        for k in ("cycle", "idle"):
+            v = s["by_phase"].get(k)
+            if v:
+                out.append(f"| {k} | {v['episodes']} | {v['hit']} | "
+                           f"${v[f'avoided_{h30}']:+.2f} | ${v[f'net_{h30}']:+.2f} |")
+    fams = sorted(s["by_family"].items(), key=lambda kv: kv[1][f"net_{h30}"])
+    if fams:
+        out += ["", "| family | episodes | hit | net 30m |", "|---|---|---|---|"]
+        for k, v in fams:
+            out.append(f"| {k} | {v['episodes']} | {v['hit']} | ${v[f'net_{h30}']:+.2f} |")
+    return "\n".join(out) + "\n"
 
 
 # ---- event sweep breaker (ws_sweep_*.jsonl) ------------------------------------
@@ -774,6 +852,9 @@ def main(argv=None) -> int:
     ap.add_argument("--since", help="UTC, e.g. 2026-10-04T19:00")
     ap.add_argument("--until", help="UTC")
     ap.add_argument("--json", help="also write the summary here")
+    ap.add_argument("--min-gap", type=float, default=10.0,
+                    help="score the narrow fast cancel at this gap, cents "
+                         "(IMM_WS_FAST_MIN_GAP_C; 0 = skip)")
     a = ap.parse_args(argv)
     since, until = _parse_when(a.since), _parse_when(a.until)
     eps = load_episodes(a.dir, since, until)
@@ -796,6 +877,13 @@ def main(argv=None) -> int:
         s = summarize(score(eps, fills, cyc, actions), since or t_lo, until or t_hi)
         sys.stdout.write(render(s))
         out = s
+        if a.min_gap > 0:
+            g = a.min_gap
+            sn = summarize(score(eps, fills, cyc, actions,
+                                 start_of=lambda e: narrow_start(e, g)),
+                           since or t_lo, until or t_hi)
+            sys.stdout.write(render_narrow(sn, g))
+            out["narrow"] = dict(sn, min_gap_c=g)
     if trips:
         sres = score_sweeps(trips, efills, cyc)
         hours = max(((until or t_hi) - (since or t_lo)) / 3600.0, 1e-9)

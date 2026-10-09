@@ -82,7 +82,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 import pytz
 import requests
@@ -3058,6 +3058,16 @@ def _ws_cents(dollars: Optional[float]) -> Optional[float]:
     return None if dollars is None else round(dollars * 100.0, 2)
 
 
+def _ws_gap_c(side: str, px: float, ext_bid: Optional[float],
+              ext_ask: Optional[float]) -> Optional[float]:
+    """How many cents our rung at `px` (cents) sits ahead of the rest of its
+    side of the book -- the external best bid (dollars) for a bid, the
+    external best ask for an ask. None when nothing else rests on that side."""
+    if side == "bid":
+        return None if ext_bid is None else px - ext_bid * 100.0
+    return None if ext_ask is None else ext_ask * 100.0 - px
+
+
 def _ws_top(levels: Dict[float, float], n: int = 60) -> List[List[float]]:
     """One side of a WS book ({dollars: qty}): its best `n` levels, best
     first, as [cents, qty] -- deep enough for the reward model's qualifying
@@ -3084,6 +3094,54 @@ def _ws_top(levels: Dict[float, float], n: int = 60) -> List[List[float]]:
 # cycle re-places. Episodes carry phase "cycle" / "idle".
 WS_CHECK_IN_CYCLE = os.environ.get("IMM_WS_CHECK_IN_CYCLE", "1") == "1"
 WS_TICK_SECS = max(0.2, _env_float("IMM_WS_TICK_SECS", 1.0))
+
+# NARROW FAST CANCEL (Jack 2026-10-08: "yes" to a dry run of a fast cancel
+# only for quotes far ahead of the touch). Scored over 10/4-10/8 (86.5h,
+# 18,724 stale episodes, 0.4% hit), cancelling every would-cancel would have
+# netted ~+$13/day at 5m and +$14 at 30m -- lumpy (two price jumps, 40c and
+# 35c, carried ~40%; the last day alone ~$0). The value sat in big GAPS, how
+# far our rung is ahead of the rest of its side of the book (a jump left it
+# behind). Per day, 30m net:
+#   gap <= 1c  ~1,160 episodes  +$0.8
+#       1-3c     ~860           +$1.9
+#       3-10c  ~2,270           +$3.2
+#       > 10c    ~890           +$8.6
+# Cancelling only past 10c keeps ~60% of the value for ~1/6 of the cancels.
+# IMM_WS_FAST_MIN_GAP_C=N (cents, > 0) is that gate. With IMM_WS_FAST=1 a
+# flagged rung is cancelled only once it sits >= N cents ahead (the gap can
+# grow after the flag); a rung alone on its side (no gap) never qualifies.
+# DRY (IMM_WS_FAST off): the first time an episode reaches the gap it writes
+# a `narrow` line to ws_stale_<date>.jsonl -- the moment the gated cancel
+# would go -- and counts `would_cancel_narrow`; ws_stale_score.py scores the
+# gated rule from those lines. 0 = no gate (every flag acts).
+WS_FAST_MIN_GAP_C = max(0.0, _env_float("IMM_WS_FAST_MIN_GAP_C", 0.0))
+
+# WEBSOCKET CANDIDATE BOOKS (Jack 2026-10-08: "yes" to "build the
+# WebSocket-fed universe refresh"). With the managed books on the feed, the
+# universe refresh is the slow part of the cycle: every ~10 min it reads each
+# candidate's book over REST (~3,000-3,500 on 10/8) before it writes
+# anything -- a median 148s (p90 179s) with no order written, 27% of 10/8,
+# and growing with the candidate pool (~106s on 10/5).
+#    IMM_WS_CANDIDATES=off    -- THE DEFAULT: candidate books over REST, as
+#                    before.
+#    IMM_WS_CANDIDATES=shadow -- the feed also carries every candidate the
+#                    refresh reads; the refresh still reads REST and compares
+#                    each read with the WS book (status latency.ws.cand), and 1
+#                    in WS_AUDIT_EVERY of those compares feeds the REST audit's
+#                    window, as the managed books' shadow did. Nothing trades
+#                    on the feed's candidate books.
+#    IMM_WS_CANDIDATES=on     -- (with IMM_WS=on) the refresh reads each
+#                    candidate's WS book when it is trustworthy, REST
+#                    otherwise; 1 read in WS_AUDIT_EVERY also reads REST and
+#                    uses it, feeding the same audit as the managed books, so a
+#                    trip sends every read, managed and candidate, to REST.
+# A refresh that adds WS_CAND_WARM_MIN+ books at once (a restart's first)
+# waits up to WS_CAND_WARM_SECS for their snapshots; the rest read REST.
+WS_CANDIDATES = os.environ.get("IMM_WS_CANDIDATES", "off").strip().lower()
+if WS_CANDIDATES not in ("off", "shadow", "on"):
+    WS_CANDIDATES = "off"
+WS_CAND_WARM_SECS = max(0.0, _env_float("IMM_WS_CAND_WARM_SECS", 5.0))
+WS_CAND_WARM_MIN = 50
 
 # EVENT SWEEP BREAKER (Jack 2026-10-04: "Build these 3" -- pull quotes when
 # related markets move). Trigger: a maker fill that takes ALL that was left of
@@ -7495,6 +7553,8 @@ _CONFIG_CODE_KNOBS = (
     # ...the in-cycle check and the event sweep breaker (2026-10-04)
     "WS_CHECK_IN_CYCLE", "WS_TICK_SECS", "SWEEP_BREAKER", "SWEEP_HOLD_SECS",
     "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
+    # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
+    "WS_FAST_MIN_GAP_C", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
 )
 
 
@@ -13593,7 +13653,10 @@ class IncentiveMarketMaker:
         # twice -- each is a cancel a fast path would send
         self._ws_flagged: Dict[str, dict] = {}
         self._ws_fast = {"cancels": 0, "events": 0, "wakes": 0, "fills": 0,
-                         "skipped_budget": 0, "would_cancel": 0}
+                         "skipped_budget": 0, "would_cancel": 0,
+                         "would_cancel_narrow": 0}
+        # the narrow gate's dry log sample (WS_FAST_MIN_GAP_C), its own budget
+        self._ws_narrow_logged: Deque[float] = deque()
         self._ws_cancel_times: Deque[float] = deque()
         self._ws_wake = False
         self._last_cycle_start = 0.0
@@ -13629,6 +13692,18 @@ class IncentiveMarketMaker:
                        "cancels": 0, "skipped_budget": 0, "skipped_writes": 0,
                        "fills_seen": 0, "unparsed": 0, "unknown_order": 0,
                        "exempt": 0}
+        # candidate books on the feed (2026-10-08, WS_CANDIDATES): the
+        # candidates the last universe refresh read (the feed carries them
+        # beside the managed set last sent), how their books were read, the
+        # shadow compare of the REST reads, and per refresh (start, end,
+        # candidate reads, of them from WS) for latency.universe
+        self._ws_cand_want: Set[str] = set()
+        self._ws_managed_last: Set[str] = set()
+        self._ws_cand = {"ws": 0, "rest": 0, "rest_fallback": 0, "audits": 0,
+                         "warm_waits": 0, "warm_s": 0.0}
+        self._ws_cand_shadow = {"compared": 0, "exact": 0, "top": 0,
+                                "ws_missing": 0}
+        self._universe_times: Deque[Tuple[float, float, int, int]] = deque(maxlen=20)
         self._load_persist()
         # the ladder-asks cash latch lives in module state for series_bid_only
         _LADDER_ASKS_STATE["on_at"] = self.state.ladder_asks_on_at or None
@@ -15261,6 +15336,90 @@ class IncentiveMarketMaker:
             self._ws_compare(ticker, ob, audit=self._ws_audit_draw())
         return ob
 
+    def _read_candidate_book(self, ticker: str) -> dict:
+        """A candidate's book for the universe refresh (WS_CANDIDATES). off:
+        the REST read as before. shadow: REST, compared with the feed's book
+        (latency.ws.cand.shadow; 1 compare in WS_AUDIT_EVERY feeds the audit
+        window). on (with IMM_WS=on): the feed's book when trustworthy, else
+        REST; 1 read in WS_AUDIT_EVERY also reads REST, uses it and feeds the
+        audit, and a tripped audit sends every read to REST (compared, so the
+        window can re-arm). A REST failure raises -- the caller marks the
+        book unreadable, as before -- except on an audit read, which then
+        uses the WS book."""
+        ws = self._ws
+        st = self._ws_cand
+        if (ws is not None and WS_CANDIDATES == "on" and WS_MODE == "on"
+                and not self._ws_audit["tripped"]):
+            ob = ws.book_fp(ticker)
+            if ob is not None:
+                if not self._ws_audit_draw():
+                    st["ws"] += 1
+                    return ob
+                try:
+                    rest = self.client.get_orderbook(ticker=ticker)
+                except Exception:
+                    self._ws_audit["rest_errors"] += 1
+                    st["ws"] += 1
+                    return ob
+                st["rest"] += 1
+                st["audits"] += 1
+                self._ws_compare(ticker, rest, audit=True,
+                                 stats=self._ws_cand_shadow)
+                return rest
+            st["rest_fallback"] += 1
+        ob = self.client.get_orderbook(ticker=ticker)
+        st["rest"] += 1
+        if ws is not None and WS_CANDIDATES != "off" and WS_MODE in ("shadow", "on"):
+            self._ws_compare(ticker, ob, audit=self._ws_audit_draw(),
+                             stats=self._ws_cand_shadow)
+        return ob
+
+    def _ws_cand_subscribe(self, tickers: Iterable[str]) -> None:
+        """Put the universe refresh's candidates on the feed (WS_CANDIDATES
+        shadow / on), beside the managed set last sent, just before their
+        books are read. In on mode a refresh that adds WS_CAND_WARM_MIN+ new
+        books (a restart's first) waits up to WS_CAND_WARM_SECS for their
+        snapshots, ticking the WS checks meanwhile; whatever has not arrived
+        by then reads REST. Never raises."""
+        ws = self._ws
+        if ws is None or WS_CANDIDATES == "off":
+            return
+        try:
+            want = set(tickers)
+            new = want - self._ws_cand_want - self._ws_managed_last
+            self._ws_cand_want = want
+            ws.set_markets(self._ws_managed_last | want)
+            if (WS_CANDIDATES != "on" or WS_MODE != "on"
+                    or len(new) < WS_CAND_WARM_MIN or WS_CAND_WARM_SECS <= 0):
+                return
+            t0 = time.time()
+            while time.time() - t0 < WS_CAND_WARM_SECS:
+                if ws.ready(new) >= 0.98 * len(new):
+                    break
+                self._ws_cycle_tick()
+                time.sleep(0.25)
+            self._ws_cand["warm_waits"] += 1
+            self._ws_cand["warm_s"] = round(
+                self._ws_cand["warm_s"] + time.time() - t0, 1)
+        except Exception as e:
+            log(f"{self.tag} ! WS candidate sync failed: {e}")
+
+    def _note_universe_refresh(self, t0: float, t1: float, before: dict) -> None:
+        """One universe refresh ran from t0 to t1: keep it for
+        latency.universe and, with WS_CANDIDATES on, log where its candidate
+        books came from. `before` is self._ws_cand as the refresh began."""
+        st = self._ws_cand
+        d = {k: st[k] - before.get(k, 0) for k in ("ws", "rest", "rest_fallback",
+                                                   "audits")}
+        reads = d["ws"] + d["rest"]
+        self._universe_times.append((t0, t1, reads, d["ws"]))
+        if WS_CANDIDATES != "off" and self._ws is not None:
+            log(f"{self.tag} universe refresh: {t1 - t0:.0f}s; candidate books "
+                f"{d['ws']} from WS, {d['rest']} REST"
+                + (f" ({d['rest_fallback']} not ready on the feed, "
+                   f"{d['audits']} audits)" if WS_CANDIDATES == "on" else
+                   " (shadow: every REST read compared)"))
+
     def _ws_audit_draw(self) -> bool:
         """True for 1 book read in WS_AUDIT_EVERY, at random. Only these
         compares feed the audit's trip window, in every mode: shadow then
@@ -15269,16 +15428,17 @@ class IncentiveMarketMaker:
         back) cannot crowd the window with timing mismatches."""
         return self._ws_rng.random() * WS_AUDIT_EVERY < 1.0
 
-    def _ws_compare(self, ticker: str, rest_ob: dict, audit: bool = False) -> None:
+    def _ws_compare(self, ticker: str, rest_ob: dict, audit: bool = False,
+                    stats: Optional[dict] = None) -> None:
         """Compare the WS book with a REST read of the same market: count
-        whole-book / top-of-book agreement (status latency.ws.shadow), log a
-        sample of top mismatches, and -- an audit draw -- feed the audit's
-        trip window. Never raises; trading sees the outcome only through a
-        trip."""
+        whole-book / top-of-book agreement (status latency.ws.shadow, or
+        `stats` -- the candidate books' own counters), log a sample of top
+        mismatches, and -- an audit draw -- feed the audit's trip window.
+        Never raises; trading sees the outcome only through a trip."""
         try:
             import kalshi_ws
             lv = self._ws.book_levels(ticker)
-            st = self._ws_shadow
+            st = self._ws_shadow if stats is None else stats
             if lv is None:
                 st["ws_missing"] += 1
                 return
@@ -15457,7 +15617,10 @@ class IncentiveMarketMaker:
         >= 2s old; pads are never touched; in_cycle, an order this cycle has
         already amended or cancelled is skipped. DRY (shadow, or on without
         IMM_WS_FAST): count it once in `would_cancel` and log a sample. LIVE
-        (on + IMM_WS_FAST=1): cancel it and start the next cycle early.
+        (on + IMM_WS_FAST=1): cancel it and start the next cycle early. With
+        the narrow gate (WS_FAST_MIN_GAP_C > 0) only a rung at least that
+        many cents ahead of the rest of its side acts -- the others stay dry
+        -- and an episode's first time past the gap is logged (`narrow`).
         Returns cancels sent."""
         ws = self._ws
         if ws is None:
@@ -15521,10 +15684,18 @@ class IncentiveMarketMaker:
                 first = self._ws_suspect.setdefault(oid, now_ts)
                 if now_ts - first < 1.0:
                     continue
+                # the narrow gate (WS_FAST_MIN_GAP_C): only a rung at least
+                # that far ahead is cancelled; the other flags stay dry
+                gap = _ws_gap_c(o["side"], o["px"], ext_bid, ext_ask)
+                wide = WS_FAST_MIN_GAP_C <= 0 or (
+                    gap is not None and gap >= WS_FAST_MIN_GAP_C - 1e-9)
+                act = not dry and wide
                 new = self._ws_episode_flag(t, o, now_ts, first, ext_bid,
-                                            ext_ask, yes, no, orders, dry,
+                                            ext_ask, yes, no, orders, not act,
                                             phase=phase)
-                if dry:
+                if WS_FAST_MIN_GAP_C > 0 and wide:
+                    self._ws_episode_narrow(t, o, now_ts, gap, not act, phase)
+                if not act:
                     # count each episode once; never cancel, never spend budget
                     if new:
                         self._ws_fast["would_cancel"] = \
@@ -15579,10 +15750,7 @@ class IncentiveMarketMaker:
                                  "at": now_ts}
         if WS_STALE_LOG:
             px = o["px"]
-            if o["side"] == "bid":
-                gap = None if ext_bid is None else px - ext_bid * 100.0
-            else:
-                gap = None if ext_ask is None else ext_ask * 100.0 - px
+            gap = _ws_gap_c(o["side"], px, ext_bid, ext_ask)
             self._sink("ws_stale", {
                 "ev": "flag", "ts": round(now_ts, 3),
                 "mode": "dry" if dry else "live", "phase": phase,
@@ -15595,6 +15763,40 @@ class IncentiveMarketMaker:
                 "yes": _ws_top(yes), "no": _ws_top(no),
                 "ours": [[x["side"], x["px"], x["rem"]] for x in orders]})
         return True
+
+    def _ws_episode_narrow(self, t: str, o: dict, now_ts: float,
+                           gap: Optional[float], dry: bool,
+                           phase: str = "idle") -> None:
+        """The narrow gate (WS_FAST_MIN_GAP_C): the first time an open
+        episode sits at least the gap ahead, log its `narrow` line -- the
+        moment the gated fast cancel goes (live) or would go (dry) -- and,
+        dry, count it in `would_cancel_narrow` with a log sample. Once per
+        episode; the episode itself stays open until its usual end line."""
+        ep = self._ws_flagged.get(o["order_id"])
+        if ep is None or ep.get("narrow"):
+            return
+        ep["narrow"] = True
+        if WS_STALE_LOG:
+            self._sink("ws_stale", {
+                "ev": "narrow", "ts": round(now_ts, 3),
+                "mode": "dry" if dry else "live", "phase": phase,
+                "ticker": t, "order_id": o["order_id"], "side": o["side"],
+                "px": o["px"], "rem": o["rem"],
+                "gap_c": None if gap is None else round(gap, 2),
+                "min_gap_c": WS_FAST_MIN_GAP_C,
+                "since_flag_s": round(now_ts - ep["at"], 2)})
+        if not dry:
+            return
+        self._ws_fast["would_cancel_narrow"] = \
+            self._ws_fast.get("would_cancel_narrow", 0) + 1
+        while self._ws_narrow_logged and \
+                self._ws_narrow_logged[0] < now_ts - 3600:
+            self._ws_narrow_logged.popleft()
+        if len(self._ws_narrow_logged) < WS_SHADOW_LOG_PER_HOUR:
+            self._ws_narrow_logged.append(now_ts)
+            log(f"{self.tag} WS fast (dry, >= {WS_FAST_MIN_GAP_C:g}c): would "
+                f"cancel {t} {o['side'].upper()} @ {o['px']:g}c -- "
+                f"{gap:.1f}c ahead of the rest of its side")
 
     def _ws_episode_end(self, oid: str, ev: str, now_ts: float,
                         **extra: Any) -> None:
@@ -16872,6 +17074,9 @@ class IncentiveMarketMaker:
                      float(o.get("remaining_count", 0))))
         self._prune_near_cliff_boost()
         self._prune_yield_boost()
+        # the books pass 2 reads go on the WebSocket feed (WS_CANDIDATES)
+        self._ws_cand_subscribe(m.ticker for m in screened
+                                if m.event_ticker not in self.state.event_live_halt)
         ranked: List[MarketMeta] = []
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -17944,12 +18149,12 @@ class IncentiveMarketMaker:
             meta.est_frac = meta.est_dollars_per_day = 0.0
             meta.yield_per_contract = 0.0
             return True
-        # the universe refresh reads ~1,400 candidate books over REST (40-140s):
-        # without a tick here our WS fills waited it out (10/4 21:01Z: two
-        # sweep trips logged 37s after their fills)
+        # the universe refresh reads ~3,000 candidate books (REST: ~150s on
+        # 10/8): without a tick here our WS fills waited it out (10/4 21:01Z:
+        # two sweep trips logged 37s after their fills)
         self._ws_cycle_tick()
         try:
-            ob = self.client.get_orderbook(ticker=meta.ticker)
+            ob = self._read_candidate_book(meta.ticker)   # WS_CANDIDATES
         except Exception:
             return False
         if BOOK_LOG_CANDIDATES:
@@ -19063,7 +19268,10 @@ class IncentiveMarketMaker:
                         and self._event_of(st) not in manual_evts):
                     self.state.manual_standoff.pop(st, None)
                     log(f"{self.tag} {st}: manual activity cleared; market eligible again")
+            _u_t0, _u_at, _u_c0 = time.time(), self.state.universe_at, dict(self._ws_cand)
             self.refresh_universe(now_utc, positions)
+            if self.state.universe_at != _u_at:       # a refresh ran
+                self._note_universe_refresh(_u_t0, time.time(), _u_c0)
         if not fast_only:
             self.restore_orphan_metas(positions)
 
@@ -19111,10 +19319,12 @@ class IncentiveMarketMaker:
         self.state.known_tickers |= set(managed)
         # Prune dead entries (unmanaged, flat) so the set stays bounded.
         self.state.known_tickers &= (set(managed) | set(positions))
-        # WebSocket books follow the managed set (IMM_WS != off, 2026-10-03)
+        # WebSocket books follow the managed set (IMM_WS != off, 2026-10-03),
+        # plus the last universe refresh's candidates (WS_CANDIDATES)
         if self._ws is not None:
             try:
-                self._ws.set_markets(managed)
+                self._ws_managed_last = set(managed)
+                self._ws.set_markets(self._ws_managed_last | self._ws_cand_want)
             except Exception as e:
                 log(f"{self.tag} ! WS market sync failed: {e}")
         # Settle-or-drop own-book entries whose market vanished from the
@@ -21287,7 +21497,13 @@ class IncentiveMarketMaker:
                                         window_bad_book=sum(1 for e, _tp in win
                                                             if not e)),
                           "stale_open": len(self._ws_flagged),
-                          "check_in_cycle": WS_CHECK_IN_CYCLE}}
+                          "check_in_cycle": WS_CHECK_IN_CYCLE,
+                          # the narrow fast-cancel gate (2026-10-08)
+                          "fast_min_gap_c": WS_FAST_MIN_GAP_C,
+                          # candidate books on the feed (2026-10-08)
+                          "cand": dict(self._ws_cand, mode=WS_CANDIDATES,
+                                       want=len(self._ws_cand_want),
+                                       shadow=dict(self._ws_cand_shadow))}}
             if self._ws is not None:
                 out["ws"]["feed"] = self._ws.status()
             # the event sweep breaker (2026-10-04, SWEEP_BREAKER)
@@ -21311,6 +21527,17 @@ class IncentiveMarketMaker:
                                 "last_reads_s": round(ct[-1][1] - ct[-1][0], 1)
                                 if ct[-1][1] > ct[-1][0] else None,
                                 "last_run_s": round(ct[-1][2] - ct[-1][0], 1)}
+            # universe refreshes (2026-10-08): how long each took and where
+            # its candidate books came from (WS_CANDIDATES)
+            ut = list(self._universe_times)
+            if ut:
+                durs = [t1 - t0 for t0, t1, _n, _w in ut]
+                out["universe"] = {
+                    "n": len(ut), "median_s": round(statistics.median(durs), 1),
+                    "last_s": round(durs[-1], 1), "last_reads": ut[-1][2],
+                    "last_ws": ut[-1][3],
+                    "last_at": datetime.fromtimestamp(
+                        ut[-1][1], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
             return out
         except Exception as e:
             return {"error": str(e)[:200]}
@@ -22502,7 +22729,22 @@ class IncentiveMarketMaker:
             log("WS stale-quote check (2026-10-04): "
                 + (f"between cycles AND inside them (every {WS_TICK_SECS:g}s "
                    f"from the book reads and write loops)" if WS_CHECK_IN_CYCLE
-                   else "between cycles only"))
+                   else "between cycles only")
+                + (f"; narrow gate (2026-10-08): only a rung >= "
+                   f"{WS_FAST_MIN_GAP_C:g}c ahead of the rest of its side "
+                   + ("is cancelled" if WS_FAST and WS_MODE == "on" else
+                      "would be cancelled -- DRY, logged as `narrow`")
+                   if WS_FAST_MIN_GAP_C > 0 else ""))
+            log(f"WS candidate books (2026-10-08): {WS_CANDIDATES}"
+                + {"shadow": " -- the feed also carries every candidate the "
+                             "universe refresh reads; it still reads REST, each "
+                             "read compared",
+                   "on": (" -- the universe refresh reads candidates from the "
+                          f"feed, REST otherwise; 1 in {WS_AUDIT_EVERY} audited"
+                          if WS_MODE == "on" else
+                          " -- needs IMM_WS=on to read them; shadow until then"),
+                   "off": " -- the universe refresh reads REST"
+                   }.get(WS_CANDIDATES, ""))
         log(f"event sweep breaker (2026-10-04): {SWEEP_BREAKER}"
             + {"dry": f" -- a maker fill that clears our order trips its event; "
                       f"the trip is LOGGED (ws_sweep_<date>.jsonl), nothing pulled"

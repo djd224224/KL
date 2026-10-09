@@ -268,5 +268,104 @@ class TestScore(unittest.TestCase):
         self.assertIsNone(wss.net_live([r for r in res if r["mode"] == "on"], 1.0))
 
 
+def _narrow(ts, oid, gap, min_gap=10.0, ticker=A, run="r1", since_flag=0.0):
+    return {"ev": "narrow", "ts": ts, "mode": "dry", "phase": "idle",
+            "ticker": ticker, "order_id": oid, "side": "bid", "px": 49.0,
+            "rem": 20.0, "gap_c": gap, "min_gap_c": min_gap,
+            "since_flag_s": since_flag, "run_id": run}
+
+
+class TestNarrowGate(unittest.TestCase):
+    """The narrow fast cancel (IMM_WS_FAST_MIN_GAP_C, 2026-10-08): scored
+    from each episode's `narrow` line, else from a flag already that far
+    ahead; the narrow line never ends an episode."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = self.tmp.name
+        stale = [
+            # X: flagged 2c ahead, past 10c 10s later, cleared at +20
+            _flag(T + 3000, "oX", "bid", 49.0, 20.0, gap=2.0, **BOOK_A),
+            _narrow(T + 3010, "oX", 14.0, since_flag=10.0),
+            _end(T + 3020, "clear", "oX", "bid", 49.0, 20.0),
+            # Y: logged before the gate existed, already 12c ahead at its flag
+            _flag(T + 4000, "oY", "bid", 49.0, 20.0, gap=12.0, **BOOK_A),
+            _end(T + 4010, "clear", "oY", "bid", 49.0, 10.0),
+            # Z: 2c ahead and never more -- the gate never acts
+            _flag(T + 5000, "oZ", "bid", 49.0, 20.0, gap=2.0, **BOOK_A),
+            _end(T + 5010, "clear", "oZ", "bid", 49.0, 10.0),
+        ]
+        with open(os.path.join(self.d, "ws_stale_2026-10-04.jsonl"), "w") as f:
+            for r in stale:
+                f.write(json.dumps(r) + "\n")
+        fills = [
+            _fill(T + 3005, "x1", "oX", A, "bid", 49.0, 5),   # before the gate
+            _fill(T + 3015, "x2", "oX", A, "bid", 49.0, 7),   # after it
+            _fill(T + 4030, "y1", "oY", A, "bid", 49.0, 3),
+            _fill(T + 5010, "z1", "oZ", A, "bid", 49.0, 4),
+        ]
+        with open(os.path.join(self.d, "fills_2026-10-04.jsonl"), "w") as f:
+            for r in fills:
+                f.write(json.dumps(r) + "\n")
+        hdr = imm.IncentiveMarketMaker.CYCLE_LOG_HEADER.strip().split(",")
+        with open(os.path.join(self.d, "cycle_log_2026-10-04.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(hdr)
+            for k in range(40, 141):
+                row = {c: "" for c in hdr}
+                row.update(ts=_iso(T + 60 * k), ticker=A, ext_bid=44, ext_ask=46,
+                           target=100, discount=0.5, pool_per_day=86.4, est_frac=0.05)
+                w.writerow([row[c] for c in hdr])
+
+    def _score(self, start_of=None):
+        eps = wss.load_episodes(self.d, None, None)
+        oids = {e["flag"]["order_id"] for e in eps}
+        fills = wss.load_fills(self.d, oids)
+        cyc = wss.load_cycle_rows(self.d, {A}, T, T + 9000)
+        return wss.score(eps, fills, cyc, {}, start_of=start_of)
+
+    def test_a_narrow_line_rides_on_its_episode(self):
+        eps = {e["flag"]["order_id"]: e for e in wss.load_episodes(self.d, None, None)}
+        self.assertEqual(eps["oX"]["end"]["ev"], "clear")
+        self.assertEqual(eps["oX"]["narrow"]["gap_c"], 14.0)
+        self.assertNotIn("narrow", eps["oY"])
+        self.assertEqual([wss.narrow_start(eps[o], 10.0) for o in ("oX", "oY", "oZ")],
+                         [T + 3010, T + 4000, None])
+        # a line logged at another gap falls back to the flag's own gap (2c)
+        self.assertIsNone(wss.narrow_start(eps["oX"], 5.0))
+        self.assertEqual(wss.narrow_start(eps["oX"], 2.0), T + 3000)
+
+    def test_the_gated_rule_counts_only_fills_after_its_cancel(self):
+        broad = {r["order_id"]: r for r in self._score()["episodes"]}
+        self.assertEqual([broad[o]["avoid_n"] for o in ("oX", "oY", "oZ")], [2, 1, 1])
+        narrow = {r["order_id"]: r for r in self._score(
+            lambda e: wss.narrow_start(e, 10.0))["episodes"]}
+        self.assertTrue(narrow["oZ"].get("ungated"))
+        self.assertEqual((narrow["oX"]["avoid_n"], narrow["oX"]["avoid_ct"],
+                          narrow["oX"]["start_s"]), (1, 7.0, 10.0))
+        self.assertEqual(narrow["oX"]["fills_before"], 5.0)   # x1, never counted
+        # a clear's re-place comes D (no cycle action here: 120s) after the cancel
+        self.assertEqual(narrow["oX"]["replace_s"], 120.0)
+        self.assertEqual(narrow["oY"]["avoid_n"], 1)
+        s = wss.summarize(self._score(lambda e: wss.narrow_start(e, 10.0)), T, T + 3600)
+        self.assertEqual((s["total"]["episodes"], s["total"]["hit"],
+                          s["total"]["avoid_ct"]), (2, 2, 10.0))
+        # 7 + 3 contracts at 49c marked at 45
+        self.assertAlmostEqual(s["total"]["avoided_300"], 0.40, places=9)
+        self.assertIn("Narrow fast cancel (>= 10c ahead)", wss.render_narrow(s, 10.0))
+
+    def test_main_reports_the_narrow_rule_unless_min_gap_is_0(self):
+        out = os.path.join(self.d, "s.json")
+        self.assertEqual(wss.main(["--dir", self.d, "--json", out]), 0)
+        with open(out) as f:
+            j = json.load(f)
+        self.assertEqual((j["narrow"]["min_gap_c"], j["narrow"]["total"]["episodes"]),
+                         (10.0, 2))
+        self.assertEqual(wss.main(["--dir", self.d, "--json", out, "--min-gap", "0"]), 0)
+        with open(out) as f:
+            self.assertNotIn("narrow", json.load(f))
+
+
 if __name__ == "__main__":
     unittest.main()

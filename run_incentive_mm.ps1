@@ -361,7 +361,6 @@ if ($Probe) {
     # Status latency.ws (books_used, rest_fallback, audit) and latency.cycle
     # (reads_s) show it working.
     # STILL OFF: IMM_WS_FAST=1 (fast stale-quote cancels; the check runs dry).
-    # The event sweep breaker stays dry (code default).
     # BACK OUT: IMM_WS=shadow (or off) here, then restart_imm.ps1 -Task.
     # EVENT SWEEP BREAKER -- ON (Jack 2026-10-04: "do Whole event, both sides,
     # 2 min. but monitor to make sure it's effective and net positive").
@@ -376,7 +375,21 @@ if ($Probe) {
     # netted against its control trips"), and a daily task reports it. Set
     # the holdout to 0 once it has proven out.
     # BACK OUT: IMM_SWEEP_BREAKER=dry here, then restart_imm.ps1 -Task.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=120&& set IMM_SWEEP_HOLDOUT=0.2&&"
+    # WEBSOCKET CANDIDATE BOOKS -- SHADOW (Jack 2026-10-08: "yes" to "build
+    # the WebSocket-fed universe refresh"). The feed also carries every
+    # candidate the universe refresh reads (~3,000), and each REST read is
+    # compared with the WS book (status latency.ws.cand). Nothing trades on
+    # them yet. WHY: each refresh read them all over REST, ~150s with no
+    # order written, every ~10 min (27% of 10/8).
+    # NEXT: IMM_WS_CANDIDATES=on once the shadow is clean (Jack's call).
+    # BACK OUT: IMM_WS_CANDIDATES=off here, then restart_imm.ps1 -Task.
+    # NARROW FAST CANCEL -- DRY (same day). IMM_WS_FAST_MIN_GAP_C=10 only
+    # logs the episodes a fast cancel gated at 10c would act on (`narrow`
+    # lines in ws_stale, scored by ws_stale_score.py); IMM_WS_FAST is still
+    # off, so nothing is cancelled. Before any live flip, exempt families
+    # that lead thin books by design (Carbon Arc: 2,991 of 4,349 gated
+    # episodes on 10/4-10/8, 0 hits).
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=120&& set IMM_SWEEP_HOLDOUT=0.2&& set IMM_WS_CANDIDATES=shadow&& set IMM_WS_FAST_MIN_GAP_C=10&&"
 }
 
 while ($true) {

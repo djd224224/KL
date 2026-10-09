@@ -21959,6 +21959,9 @@ class _FakeFeed:
         lv = self.book_levels(t)
         return None if lv is None else _kw.book_to_rest_shape(*lv)
 
+    def ready(self, tickers):
+        return sum(1 for t in tickers if t in self.books)
+
     def drain(self):
         d, e = self.dirty, self.events
         self.dirty, self.events = set(), []
@@ -23107,6 +23110,281 @@ class TestLatencyCycleAndSweepStatus(unittest.TestCase):
         self.assertEqual((lat["sweep"]["trips"], lat["sweep"]["held_now"],
                           lat["sweep"]["mode"]), (3, 1, imm.SWEEP_BREAKER))
         self.assertEqual(lat["ws"]["check_in_cycle"], imm.WS_CHECK_IN_CYCLE)
+
+
+class TestWSCandidateBooks(unittest.TestCase):
+    """IMM_WS_CANDIDATES (Jack 2026-10-08, the WebSocket-fed universe
+    refresh): off reads every candidate over REST as before; shadow puts the
+    candidates on the feed and compares each REST read; on reads the feed's
+    book, audited 1 in WS_AUDIT_EVERY, REST when it is missing or tripped."""
+    T = "KXGOOD-99DEC31-A"
+    W = "KXWIDE-99DEC31-B"       # a candidate with no book anywhere (unreadable)
+
+    def _bot(self, ws_mode, cand):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._ws_rng = mock.Mock(random=lambda: 0.99)      # no audit draws
+        for name, v in (("WS_MODE", ws_mode), ("WS_CANDIDATES", cand)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.feed = _FakeFeed()
+        bot._ws = self.feed
+        bot.run_cycle()              # a first refresh, the feed still empty
+        bot._ws_cand = {k: 0 for k in bot._ws_cand}
+        bot._ws_cand_shadow = {k: 0 for k in bot._ws_cand_shadow}
+        reads = []
+        base = bot.client.get_orderbook
+
+        def counted(ticker, depth=None):
+            reads.append(ticker)
+            return base(ticker, depth)
+        bot.client.get_orderbook = counted
+        return bot, reads
+
+    def _refresh(self, bot):
+        bot.state.universe_at = 0.0                       # this cycle refreshes
+        bot.run_cycle()
+
+    def _est(self, bot):
+        return {t: round(m.est_dollars_per_day, 9) for t, m in bot.state.selected.items()}
+
+    def test_off_reads_rest_and_the_feed_keeps_to_the_managed_set(self):
+        bot, reads = self._bot("on", "off")
+        self.feed.books[self.T] = _GOOD_WS_BOOK          # managed reads use it
+        self._refresh(bot)
+        self.assertEqual(sorted(reads), [self.T, self.W])   # the refresh's own
+        self.assertEqual(bot._ws_cand_want, set())
+        self.assertEqual(self.feed.markets, set(bot.state.selected))
+        self.assertEqual(bot._ws_cand_shadow["compared"], 0)
+
+    def test_shadow_reads_rest_compares_and_carries_the_candidates(self):
+        bot, reads = self._bot("on", "shadow")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        self._refresh(bot)
+        self.assertEqual(sorted(reads), [self.T, self.W])   # still REST
+        self.assertEqual(bot._ws_cand_want, {self.T, self.W})
+        self.assertTrue(bot._ws_cand_want <= self.feed.markets)
+        self.assertEqual((bot._ws_cand_shadow["compared"], bot._ws_cand_shadow["exact"],
+                          bot._ws_cand_shadow["top"]), (1, 1, 1))
+        # W's REST read raised (book_unreadable, as before): nothing to compare
+        self.assertEqual((bot._ws_cand["ws"], bot._ws_cand["rest"]), (0, 1))
+
+    def test_on_reads_the_feed_and_selects_exactly_as_rest_did(self):
+        bot_rest, _ = self._bot("on", "off")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        self._refresh(bot_rest)
+        want = self._est(bot_rest)
+        bot, reads = self._bot("on", "on")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        self._refresh(bot)
+        self.assertEqual(reads, [self.W])                 # T never went to REST
+        self.assertEqual((bot._ws_cand["ws"], bot._ws_cand["rest"],
+                          bot._ws_cand["rest_fallback"]), (1, 0, 1))
+        self.assertEqual(self._est(bot), want)
+        self.assertIn(self.T, want)
+
+    def test_on_reads_rest_until_the_feed_has_the_book(self):
+        bot, reads = self._bot("on", "on")
+        self._refresh(bot)                                # feed: no book yet
+        # T twice: the refresh's read, then the cycle's managed read (on mode
+        # without a WS book falls back to REST there too)
+        self.assertEqual(sorted(reads), [self.T, self.T, self.W])
+        self.assertEqual((bot._ws_cand["rest_fallback"], bot._ws_cand["rest"]), (2, 1))
+        self.assertEqual(bot._ws_cand_shadow["ws_missing"], 1)
+
+    def test_on_audit_draws_read_rest_use_it_and_feed_the_window(self):
+        bot, reads = self._bot("on", "on")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        bot._ws_rng = mock.Mock(random=lambda: 0.0)       # every read is a draw
+        n0 = len(bot._ws_audit_win)
+        self._refresh(bot)
+        self.assertEqual(bot._ws_cand["audits"], 1)
+        self.assertEqual(bot._ws_cand_shadow["compared"], 1)
+        self.assertGreater(len(bot._ws_audit_win), n0)
+        self.assertIn(self.T, reads)
+
+    def test_a_tripped_audit_sends_candidate_reads_to_rest(self):
+        bot, reads = self._bot("on", "on")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        bot._ws_audit["tripped"] = True
+        bot._ws_audit["tripped_at"] = time.time()
+        self._refresh(bot)
+        self.assertEqual((bot._ws_cand["ws"], bot._ws_cand["rest"]), (0, 1))
+        self.assertEqual(bot._ws_cand_shadow["compared"], 1)   # compared, to re-arm
+
+    def test_on_without_ws_on_is_shadow(self):
+        bot, reads = self._bot("shadow", "on")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        self._refresh(bot)
+        self.assertIn(self.T, reads)
+        self.assertEqual(bot._ws_cand["ws"], 0)
+        self.assertEqual(bot._ws_cand_shadow["compared"], 1)
+
+    def test_candidates_that_leave_the_universe_leave_the_feed(self):
+        bot, _ = self._bot("on", "shadow")
+        self.assertIn(self.T, self.feed.markets)
+        bot._ws_managed_last = set()
+        bot._ws_cand_subscribe(["KXOTHER-1"])
+        self.assertEqual(bot._ws_cand_want, {"KXOTHER-1"})
+        self.assertEqual(self.feed.markets, {"KXOTHER-1"})
+
+    def test_a_big_new_batch_waits_briefly_for_its_snapshots(self):
+        bot, _ = self._bot("on", "on")
+        looks = []
+
+        def ready(ts):
+            looks.append(1)
+            return 0 if len(looks) < 3 else len(set(ts))
+        self.feed.ready = ready
+        with mock.patch.object(imm, "WS_CAND_WARM_MIN", 2), \
+                mock.patch.object(imm.time, "sleep") as sleep:
+            bot._ws_cand_subscribe(["N1", "N2", "N3"])
+        self.assertEqual((len(looks), sleep.call_count), (3, 2))
+        self.assertEqual(bot._ws_cand["warm_waits"], 1)
+        # the same set again adds nothing new: no wait
+        with mock.patch.object(imm, "WS_CAND_WARM_MIN", 2):
+            bot._ws_cand_subscribe(["N1", "N2", "N3"])
+        self.assertEqual(len(looks), 3)
+
+    def test_shadow_never_waits_and_a_short_wait_gives_up(self):
+        bot, _ = self._bot("on", "shadow")
+        self.feed.ready = mock.Mock(return_value=0)
+        with mock.patch.object(imm, "WS_CAND_WARM_MIN", 1):
+            bot._ws_cand_subscribe(["N1", "N2"])
+        self.feed.ready.assert_not_called()
+        bot2, _ = self._bot("on", "on")
+        self.feed.ready = mock.Mock(return_value=0)
+        with mock.patch.object(imm, "WS_CAND_WARM_MIN", 1), \
+                mock.patch.object(imm, "WS_CAND_WARM_SECS", 0.05), \
+                mock.patch.object(imm.time, "sleep"):
+            bot2._ws_cand_subscribe(["N1", "N2"])
+        self.assertTrue(self.feed.ready.called)
+        self.assertEqual(bot2._ws_cand["warm_waits"], 1)
+
+    def test_the_status_and_log_report_each_refresh(self):
+        bot, _ = self._bot("on", "on")
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            self._refresh(bot)
+        self.assertTrue(any("universe refresh:" in s and "1 from WS, 0 REST" in s
+                            for s in lines), lines)
+        lat = bot._latency_status()
+        self.assertEqual((lat["ws"]["cand"]["mode"], lat["ws"]["cand"]["ws"],
+                          lat["ws"]["cand"]["want"]), ("on", 1, len(bot._ws_cand_want)))
+        self.assertEqual((lat["universe"]["n"], lat["universe"]["last_reads"],
+                          lat["universe"]["last_ws"]), (2, 1, 1))
+        self.assertIn("median_s", lat["universe"])
+
+    def test_off_logs_no_refresh_line(self):
+        bot, _ = self._bot("on", "off")
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            self._refresh(bot)
+        self.assertFalse(any("universe refresh:" in s for s in lines))
+        self.assertEqual(bot._latency_status()["universe"]["last_reads"], 1)
+
+
+class TestWSNarrowGate(unittest.TestCase):
+    """IMM_WS_FAST_MIN_GAP_C (Jack 2026-10-08, a dry run of the narrow fast
+    cancel): only a rung at least N cents ahead of the rest of its side acts;
+    dry, an episode's first time past the gap is a `narrow` line."""
+    T = "KXGOOD-99DEC31-A"
+    NEAR = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})   # our 49c bid, 2c ahead
+    FAR = ({0.35: 500.0, 0.49: 20.0}, {0.49: 1200.0})    # ... 14c ahead
+    ALONE = ({0.49: 20.0}, {0.49: 1200.0})               # no other bid: no gap
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append(oid) or True
+        self.bot._resting_view = {self.T: [{
+            "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": self.now - 100.0, "pad": False}]}
+
+    def _gate(self, mode, fast, gap):
+        for name, v in (("WS_MODE", mode), ("WS_FAST", fast),
+                        ("WS_FAST_MIN_GAP_C", gap)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _check(self, book, dt, dry):
+        self.feed.books[self.T] = book
+        return self.bot._ws_fast_check({self.T}, self.now + dt, dry=dry)
+
+    def _ev(self, ev):
+        return [r for name, r in self.recs if name == "ws_stale" and r["ev"] == ev]
+
+    def test_dry_logs_the_moment_the_gap_is_reached_once(self):
+        self._gate("on", False, 10.0)
+        self._check(self.NEAR, 0.0, True)
+        self._check(self.NEAR, 1.5, True)                 # flagged, 2c ahead
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+        self.assertEqual(self._ev("narrow"), [])
+        self._check(self.FAR, 5.0, True)                  # the gap grows to 14c
+        self._check(self.FAR, 6.0, True)
+        n = self._ev("narrow")
+        self.assertEqual(len(n), 1)
+        self.assertEqual((n[0]["gap_c"], n[0]["min_gap_c"], n[0]["mode"],
+                          n[0]["order_id"]), (14.0, 10.0, "dry", "o1"))
+        self.assertAlmostEqual(n[0]["since_flag_s"], 3.5, places=6)
+        self.assertEqual((self.bot._ws_fast["would_cancel_narrow"],
+                          self.bot._ws_fast["would_cancel"]), (1, 1))
+        self.assertEqual(self.cancelled, [])
+        # the narrow line leaves the episode open; the touch coming back ends it
+        self._check(({0.49: 520.0}, {0.49: 1200.0}), 8.0, True)
+        self.assertEqual([r["ev"] for name, r in self.recs if name == "ws_stale"],
+                         ["flag", "narrow", "clear"])
+
+    def test_a_rung_far_ahead_at_the_flag_is_narrow_at_once(self):
+        self._gate("shadow", False, 10.0)
+        self._check(self.FAR, 0.0, True)
+        self._check(self.FAR, 1.5, True)
+        n = self._ev("narrow")
+        self.assertEqual((len(n), n[0]["since_flag_s"]), (1, 0.0))
+
+    def test_a_rung_alone_on_its_side_never_qualifies(self):
+        self._gate("on", False, 10.0)
+        self._check(self.ALONE, 0.0, True)
+        self._check(self.ALONE, 1.5, True)
+        self.assertEqual(self.bot._ws_fast["would_cancel"], 1)
+        self.assertEqual(self._ev("narrow"), [])
+        self.assertIsNone(self._ev("flag")[0]["gap_c"])
+
+    def test_live_cancels_only_past_the_gap(self):
+        self._gate("on", True, 10.0)
+        self.assertEqual(self._check(self.NEAR, 0.0, False), 0)
+        self.assertEqual(self._check(self.NEAR, 1.5, False), 0)
+        self.assertEqual(self.cancelled, [])
+        self.assertEqual(self._ev("flag")[0]["mode"], "dry")   # below the gap
+        self.assertEqual(self._check(self.FAR, 5.0, False), 1)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual(self._ev("narrow")[0]["mode"], "live")
+        self.assertEqual(self._ev("cancel")[0]["by"], "fast")
+        self.assertEqual(self.bot._ws_fast["would_cancel_narrow"], 0)
+        self.assertTrue(self.bot._ws_wake)
+
+    def test_no_gate_keeps_every_flag_live(self):
+        self._gate("on", True, 0.0)
+        self._check(self.NEAR, 0.0, False)
+        self.assertEqual(self._check(self.NEAR, 1.5, False), 1)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual(self._ev("narrow"), [])
+
+    def test_the_gap_helper(self):
+        self.assertEqual(imm._ws_gap_c("bid", 49.0, 0.47, None), 2.0)
+        self.assertAlmostEqual(imm._ws_gap_c("ask", 51.0, None, 0.62), 11.0)
+        self.assertIsNone(imm._ws_gap_c("bid", 49.0, None, 0.51))
+        self.assertIsNone(imm._ws_gap_c("ask", 51.0, 0.49, None))
 
 
 class TestElectionBatch20261005(unittest.TestCase):

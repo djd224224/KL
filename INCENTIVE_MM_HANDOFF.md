@@ -9346,3 +9346,62 @@ Dry run 13:22Z:
 - their real estimates are $0.56-3.79/day, all under $5.
 
 Tests: TestEventMap. Suite 2,347 OK.
+
+## 2026-10-09 ~13:30Z — WebSocket candidate books (shadow) and the narrow fast-cancel gate (dry) (Jack: "yes" to "build the WebSocket-fed universe refresh and a dry-run version of the narrow fast-cancel")
+
+WHY (the 10/8 check-in, 10/4 23:10Z - 10/8 13:40Z):
+- The WS books are healthy: 29k REST audits in one run with 0 mismatches,
+  and 4 feed drops in 3.6 days, each back within 1-2s.
+- The slow part is now the universe refresh. Every ~10 min it read every
+  candidate's book over REST (~3,000-3,500), a median 148s (p90 179s) with
+  no order written. That was 27% of 10/8, and it grows with the candidate
+  pool (106s on 10/5). Median cycle: 32-36s on 10/5, 56s on 10/8; p90 182s.
+- The dry stale-quote check: +$13/+$14 a day if every would-cancel had been
+  live, but lumpy. The value sits in big gaps: >10c ahead was ~890
+  episodes/day for +$8.6/day.
+
+WHAT 1: IMM_WS_CANDIDATES = off (default) | shadow | on.
+- `_ws_cand_subscribe` puts every candidate pass 2 will read on the feed,
+  just before the reads. The cycle's set_markets now sends the managed set
+  plus those candidates.
+- shadow: `_read_candidate_book` still reads REST and compares each read
+  with the WS book (status `latency.ws.cand.shadow`). 1 compare in
+  WS_AUDIT_EVERY feeds the shared audit window.
+- on (needs IMM_WS=on): the WS book when trustworthy, else REST
+  (`rest_fallback`). 1 read in WS_AUDIT_EVERY also reads REST, uses it and
+  feeds the audit. A tripped audit sends every read, managed and candidate,
+  to REST. A refresh that adds 50+ new books (a restart's first) waits up to
+  IMM_WS_CAND_WARM_SECS=5 for their snapshots (new `KalshiFeed.ready`).
+- Each refresh goes into status `latency.universe` {n, median_s, last_s,
+  last_reads, last_ws, last_at}. With the mode not off it also logs
+  "universe refresh: <s>s; candidate books <n> from WS, <m> REST (...)".
+
+WHAT 2: IMM_WS_FAST_MIN_GAP_C = N cents (default 0 = no gate).
+- Live (IMM_WS_FAST=1): only a flagged rung at least N cents ahead of the
+  rest of its side is cancelled. The gap can grow after the flag. A rung
+  alone on its side (no gap) never qualifies.
+- Dry: the first time an open episode reaches the gap it writes a `narrow`
+  line to ws_stale (gap_c, min_gap_c, since_flag_s, mode, phase), counts
+  `would_cancel_narrow`, and logs a sample: "WS fast (dry, >= 10c): would
+  cancel ...". The narrow line never ends the episode.
+- ws_stale_score.py attaches the narrow line to its episode. `--min-gap N`
+  (default 10) adds "Narrow fast cancel (>= Nc ahead), scored". Each
+  episode counts from its narrow line or, before 10/8, from its flag if the
+  flag was already that far ahead. A clear / open episode's re-place moves
+  with the later start; an amend / cancel / gone keeps its time.
+- 10/4-10/8 at 10c: 4,349 episodes (1,207/day), 10 hit, net +$8.1/day (5m)
+  and +$9.0/day (30m). AI & tech +$15.4 and Gas & diesel +$15.4 over the
+  86h carry it.
+- CAVEAT: 2,991 of those 4,349 are Carbon Arc consumer, with 0 hits. Those
+  quotes lead thin books by design (ca-fair), so a LIVE gate would cancel
+  them and the cycle would re-place them, every cycle. Exempt them (or any
+  family that leads by design) before IMM_WS_FAST=1.
+
+DEPLOY: IMM_WS_CANDIDATES=shadow and IMM_WS_FAST_MIN_GAP_C=10 in
+run_incentive_mm.ps1, via restart_imm.ps1 -Task. IMM_WS_FAST stays off.
+Flip IMM_WS_CANDIDATES=on after a clean shadow (exact compares, no feed
+errors or gaps at the larger book count) -- Jack's call.
+
+Tests: TestWSCandidateBooks, TestWSNarrowGate (test_incentive_mm);
+test_ready_counts_the_servable_books_without_copying (test_kalshi_ws);
+TestNarrowGate (test_ws_stale_score).

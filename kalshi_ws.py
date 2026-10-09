@@ -363,7 +363,7 @@ class KalshiFeed(threading.Thread):
     fills and order-group events, over one Kalshi WebSocket connection.
 
     Thread contract: the main thread calls `set_markets`, `book_fp`,
-    `book_levels`, `drain`, `healthy`, `status`, `stop`; everything else
+    `book_levels`, `ready`, `drain`, `healthy`, `status`, `stop`; everything else
     runs on this thread. Network sends happen outside the state lock."""
 
     def __init__(self, url: str,
@@ -454,6 +454,19 @@ class KalshiFeed(threading.Thread):
         (the caller falls back to REST)."""
         lv = self.book_levels(ticker)
         return None if lv is None else book_to_rest_shape(*lv)
+
+    def ready(self, tickers: Iterable[str]) -> int:
+        """How many of `tickers` book_levels would serve right now -- without
+        copying any book (a caller waiting for a batch of new snapshots)."""
+        if not self.healthy():
+            return 0
+        with self._lock:
+            n = 0
+            for t in tickers:
+                b = self._books.get(t)
+                if b is not None and b.ok and t in self._want:
+                    n += 1
+            return n
 
     def drain(self) -> Tuple[Set[str], List[Tuple[str, dict]], int]:
         """(tickers whose book changed, [(kind, msg)], dropped-event count)
