@@ -9406,6 +9406,13 @@ Tests: TestWSCandidateBooks, TestWSNarrowGate (test_incentive_mm);
 test_ready_counts_the_servable_books_without_copying (test_kalshi_ws);
 TestNarrowGate (test_ws_stale_score).
 
+2026-10-09 ~20:05Z -- IMM_WS_CANDIDATES=on (Jack: "set IMM_WS_CANDIDATES=on
+to minimize time that isnt quoting"). Shadow 13:30-20:00Z, 3 runs: 2,593 of
+2,595 candidate books exact vs REST (the misses: a competitor's 179-lot bid
+flickering on KXDIESELYE-26DEC31-T7.40), 2,600 books on the feed, 0 gaps,
+0 errors, 0 audit trips, bot ~0.42 cores. Refreshes in shadow (still REST,
+~2,600 reads): 146-297s, median ~160s.
+
 ### 2026-10-09 ~13:30Z — OpenRouter share family OFF: the ten KX<AUTHOR>SHARE series blocklisted by exact series (Jack: "yes do both", after "is it still underperforming after the latest changes around breaks and control measures?")
 
 WHY. Fills were marked to the 10/09 13:11Z ladder; positions rebuilt from
