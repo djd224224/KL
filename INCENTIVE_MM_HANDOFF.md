@@ -9182,3 +9182,48 @@ cancels the resting quotes in its first cycle; positions ride. The states,
 weeklies, KXAAAGASM and the diesel annuals are untouched.
 
 The 2-week gas-trial report (~10/15) will still email; ignore its verdict.
+
+## 2026-10-09 ~12:45Z — Israeli minister markets dated; research rule for post-vote markets; config gaps prune (Jack, of the IMM-WATCH email listing KXISRINTMIN / NATSECMIN / FINMIN / FORMIN / JUSMIN-26OCT27: "why are these not able to quote?")
+
+WHY THEY WERE DARK.
+- Five Kalshi-Elections series, enrolled 10/09 00:20Z, 102 markets, ~$41/day
+  est: "Who will be Israeli <X> minister after the election?". They resolve
+  on who "formally takes office ... as a result of the government formation
+  following the 2026 Israeli legislative election before Oct 27, 2027".
+- Election family: no verified row means fail closed. Kalshi's own dates
+  (Oct 27 2027, the deadline) are never used.
+- Research found the right day twice (Oct 27 2026, Wikipedia + Times of
+  Israel) but filed it as judgment. The prompt said "appointment ... is NOT
+  a vote", a rule meant for markets with no vote behind them (rallies,
+  debates, court cases).
+
+FIX.
+1. Hand row `KXISR*MIN-26OCT27 = 2026-10-27 @Asia/Jerusalem` (cutoff 22:00Z
+   10/26). Sources fetched here:
+   - Wikipedia "scheduled to be held in Israel on 27 October 2026";
+   - IFES ElectionGuide "Oct. 27, 2026 Confirmed".
+   The glob covers a ministry added later. The bot loaded it 12:28:57Z.
+2. Research rule: the row is the day of the vote the market hinges on. A
+   market decided by WHAT a named vote decides -- who becomes PM / a
+   minister / forms the government after that election -- takes that vote's
+   day. An appointment that hinges on no scheduled vote is still judgment.
+3. Config gaps prune (incentive_mm). _config_gaps was add-only per process,
+   so a fixed gap stayed in config_gaps.json until a restart. The
+   OUTPERFORMRCP batch, fixed 10/08 14:43Z, was still listed at 02:21Z 10/09.
+   The watch re-alerts an open gap daily, so these five would have
+   re-emailed tomorrow, and the 7:20 ACTION list carried them too.
+   - Every gap met is marked (_config_gaps_seen).
+   - At the start of each universe refresh, the gaps not met since the
+     previous refresh began are dropped: "[IMM] config gaps cleared: ...".
+     The window is that refresh plus the orphan restores after it, so a
+     held-position gap does not flap.
+   - Dropped gaps log again if they recur.
+   - Only after a refresh that built candidates: a failed read must not
+     empty the file.
+4. Watch: live_gaps() filters the file for BOTH research and the alert:
+   - a gap a row written since the bot's last write now covers;
+   - an ELECTION_EXCLUDE series. That is 6347d8e's research-only skip
+     (KXPUBLICTALARICO), merged into the shared filter.
+
+Tests: TestConfigGapsPrune 2; test_imm_family_watch 22 (+live_gaps, + the
+post-vote prompt line). Suite 2,340 OK.

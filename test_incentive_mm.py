@@ -23198,5 +23198,50 @@ class TestConfigGaps(unittest.TestCase):
                 self.assertEqual(js["gaps"]["KXBAR-26"]["series"], "KXBAR")
 
 
+class TestConfigGapsPrune(unittest.TestCase):
+    """2026-10-09: a gap a row has since fixed leaves the file at the next
+    universe refresh instead of at the next restart."""
+
+    def setUp(self):
+        self._saved = (dict(imm._config_gaps), set(imm._release_guard_warned),
+                       set(imm._config_gaps_seen), imm._config_gaps_window_ok)
+        imm._config_gaps.clear()
+        imm._config_gaps_seen.clear()
+        imm._config_gaps_window_done(False)
+        for ev in ("KXA-26", "KXB-26"):
+            imm._release_guard_warned.discard(ev)
+
+    def tearDown(self):
+        gaps, warned, seen, ok = self._saved
+        imm._config_gaps.clear()
+        imm._config_gaps.update(gaps)
+        imm._release_guard_warned.clear()
+        imm._release_guard_warned.update(warned)
+        imm._config_gaps_seen.clear()
+        imm._config_gaps_seen.update(seen)
+        imm._config_gaps_window_done(ok)
+
+    def test_a_fixed_gap_leaves_at_the_next_refresh(self):
+        imm._config_gap("KXA", "KXA-26", "no row")
+        imm._config_gap("KXB", "KXB-26", "no row")
+        imm._config_gaps_window_done(True)             # refresh built candidates
+        self.assertEqual(imm._config_gaps_prune(), [])  # both met: kept
+        imm._config_gap("KXA", "KXA-26", "no row")      # B got its row
+        imm._config_gaps_window_done(True)
+        self.assertEqual(imm._config_gaps_prune(), ["KXB-26"])
+        self.assertEqual(set(imm._config_gaps), {"KXA-26"})
+        self.assertNotIn("KXB-26", imm._release_guard_warned)  # re-logs if it recurs
+        imm._config_gap("KXB", "KXB-26", "no row again")
+        self.assertEqual(imm._config_gaps["KXB-26"]["msg"], "no row again")
+
+    def test_a_refresh_without_candidates_prunes_nothing(self):
+        imm._config_gap("KXA", "KXA-26", "no row")
+        imm._config_gaps_window_done(True)
+        imm._config_gaps_prune()                        # opens a new window
+        imm._config_gaps_window_done(False)             # a failed read met nothing
+        self.assertEqual(imm._config_gaps_prune(), [])
+        self.assertIn("KXA-26", imm._config_gaps)
+
+
 if __name__ == "__main__":
     unittest.main()

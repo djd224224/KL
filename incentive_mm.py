@@ -10959,6 +10959,7 @@ def _write_config_gaps() -> None:
 def _config_gap(series: str, event_ticker: str, msg: str) -> None:
     """A hand-config gap on one event: logged once ("[IMM] ! <series>: msg")
     and recorded in CONFIG_GAPS_FILE."""
+    _config_gaps_seen.add(event_ticker)
     if event_ticker in _release_guard_warned:
         return
     _release_guard_warned.add(event_ticker)
@@ -10967,6 +10968,42 @@ def _config_gap(series: str, event_ticker: str, msg: str) -> None:
         "series": series, "msg": msg,
         "since": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     _write_config_gaps()
+
+
+# PRUNE (Jack 2026-10-09, five Israeli minister events: "why are these not
+# able to quote?"). A gap fixed by a row used to stay in the file until the
+# next restart: the KX*OUTPERFORMRCP batch, dated 10/08 14:43Z, was still
+# listed at 02:21Z 10/09, and the family watch re-alerts an open gap daily.
+# Every gap the bot meets is marked; at the start of each universe refresh
+# the gaps not met since the previous refresh began -- that refresh plus the
+# orphan restores after it -- are dropped, and log again if they recur. Only
+# after a refresh that built candidates: a failed read meets nothing and
+# must not empty the file.
+_config_gaps_seen: Set[str] = set()
+_config_gaps_window_ok = False
+
+
+def _config_gaps_prune() -> List[str]:
+    """Drop the gaps not met since the last refresh began (when that refresh
+    completed with candidates) and open a new window. Returns the dropped."""
+    global _config_gaps_window_ok
+    gone: List[str] = []
+    if _config_gaps_window_ok:
+        gone = sorted(ev for ev in _config_gaps if ev not in _config_gaps_seen)
+        for ev in gone:
+            _config_gaps.pop(ev, None)
+            _release_guard_warned.discard(ev)
+        if gone:
+            log(f"[IMM] config gaps cleared: {', '.join(gone)}")
+            _write_config_gaps()
+    _config_gaps_seen.clear()
+    _config_gaps_window_ok = False
+    return gone
+
+
+def _config_gaps_window_done(ok: bool) -> None:
+    global _config_gaps_window_ok
+    _config_gaps_window_ok = ok
 
 
 _write_config_gaps()           # the live bot starts the file empty
@@ -16343,6 +16380,7 @@ class IncentiveMarketMaker:
         if (now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS
                 and not hour_crossed and not in_activation_window):
             return
+        _config_gaps_prune()          # gaps fixed since the last refresh
         by_market = self.fetch_programs()
         # Live-program set for the no-rent freeze (empty on a failed/empty
         # read keeps the failsafe in the consumers: never mass-freeze on a
@@ -17482,6 +17520,7 @@ class IncentiveMarketMaker:
                    else f"(hard cap {scan_ceiling()}")
                 + (", HALTED today" if self.state.scan_halt_day == _halt_day_key(now_utc) else "")
                 + f"); rejects {dict(sorted(scan_skips.items()))}")
+        _config_gaps_window_done(bool(metas))
 
     # ---- Carbon Arc name-pattern families (2026-09-22) ---------------------
 

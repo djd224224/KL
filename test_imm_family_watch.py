@@ -258,6 +258,8 @@ class TestResearchOnArrival(unittest.TestCase):
         self.assertIn("TWO independent sources", p)
         self.assertIn("RESULT_JSON:", p)
         self.assertIn("NOT a vote", p)
+        # 10/09: a minister-after-the-election market takes the vote's day
+        self.assertIn("OR by what a named upcoming vote decides", p)
 
     def test_parse_result_line(self):
         txt = ("did the work\n```\nRESULT_JSON: {\"gap:KXISR-26OCT27\": {\"status\": "
@@ -350,6 +352,21 @@ class TestResearchOnArrival(unittest.TestCase):
                                   lambda c, now: []):
             t = fw.research_targets(None, gaps, datetime.now(timezone.utc), dry=True)
         self.assertEqual(sorted(t), ["gap:KXB-26NOV03"])
+
+    def test_live_gaps_drops_fixed_and_excluded_gaps(self):
+        # the alert reads the same filter as research: a gap whose row landed
+        # after the bot's last write (or an excluded series) is not dark
+        from unittest import mock
+        msg = " has no verified election day in ELECTION_DATES"
+        gaps = {"KXA-26NOV03": {"series": "KXA", "msg": "KXA-26NOV03" + msg},
+                "KXB-26NOV03": {"series": "KXB", "msg": "KXB-26NOV03" + msg},
+                "KXX-26": {"series": "KXX", "msg": "KXX-26" + msg},
+                "KXV-1": {"series": "KXV", "msg": "Vercel pre-D cutoff needs the measured day"}}
+        dated = lambda ev, market=None: (datetime(2026, 11, 3, 5, tzinfo=timezone.utc)
+                                         if ev == "KXA-26NOV03" else None)
+        with mock.patch.object(fw.imm, "election_cutoff_utc", dated), \
+                mock.patch.object(fw.imm, "ELECTION_EXCLUDE", frozenset({"KXX"})):
+            self.assertEqual(sorted(fw.live_gaps(gaps)), ["KXB-26NOV03", "KXV-1"])
 
     def test_start_targets_become_alert_items(self):
         progs = {"KXTRUMPMENTION-26OCT08-AI": {

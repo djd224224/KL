@@ -301,26 +301,37 @@ def gap_kind(msg: str) -> str:
     return ""
 
 
+def live_gaps(gaps: dict) -> dict:
+    """The bot's config gaps minus the ones nothing should act on: an election
+    / award gap a row written since the bot's last config_gaps.json write
+    already covers (the dating pass, research, a hand fix -- the bot drops it
+    at its next refresh, 2026-10-09), and a series carved out of the election
+    family (2026-10-08, Jack on KXPUBLICTALARICO: "should not be quoted"; it
+    is never dated). Both research and the alert read this."""
+    imm.load_election_dates_extra()
+    imm.load_awards_dates_extra()
+    out = {}
+    for ev, g in (gaps or {}).items():
+        kind = gap_kind(g.get("msg") or "")
+        if kind == "election" and imm.election_cutoff_utc(ev) is not None:
+            continue
+        if kind == "election" and \
+                (g.get("series") or imm.series_of(ev)) in imm.ELECTION_EXCLUDE:
+            continue
+        if kind == "award" and imm.awards_event_start(ev, None, dates_only=True) is not None:
+            continue
+        out[ev] = g
+    return out
+
+
 def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, dict]:
     """{key: {kind, event, series, msg}} for what only research can fix.
     Broadcast mention events the automatic resolvers CAN place are written
     here and now (as the overrides task's Phase 4 would), not researched."""
     targets: Dict[str, dict] = {}
     imm.load_file_event_overrides()       # a --set since import is not a target
-    imm.load_election_dates_extra()       # nor a row written since the bot's
-    imm.load_awards_dates_extra()         # last config_gaps.json (the dating pass)
-    for ev, g in sorted((gaps or {}).items()):
+    for ev, g in sorted(live_gaps(gaps).items()):   # nor a fixed / excluded gap
         kind = gap_kind(g.get("msg") or "")
-        if kind == "election" and imm.election_cutoff_utc(ev) is not None:
-            continue
-        # a series carved out of the election family (2026-10-08, Jack on
-        # KXPUBLICTALARICO: "should not be quoted") is never dated: the bot
-        # only drops its gap at a restart, so the gap alone is no target
-        if kind == "election" and \
-                (g.get("series") or imm.series_of(ev)) in imm.ELECTION_EXCLUDE:
-            continue
-        if kind == "award" and imm.awards_event_start(ev, None, dates_only=True) is not None:
-            continue
         if kind:
             targets[f"gap:{ev}"] = {"kind": kind, "event": ev,
                                     "series": g.get("series") or imm.series_of(ev),
@@ -403,9 +414,19 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "calendar-full.json, events.gop.com -- or reputable press / Wikipedia / "
         "Ballotpedia). Put the URLs in --source. If sources disagree or you have "
         "fewer than two, do not write: status unresolved.",
-        "- Election targets: only a market decided by a VOTE gets a row (an "
-        "election, referendum, chamber control, vote share). A rally, debate, "
-        "court case, retirement, appointment or announcement is NOT a vote: "
+        # 2026-10-09 (Jack, of five Israeli minister markets research had
+        # filed as judgment: "why are these not able to quote?"): the row is
+        # the day the bot must be out by, so a market decided by WHAT A VOTE
+        # DECIDES (who becomes a minister after the 10/27 Knesset election)
+        # takes that vote's day too; "appointment" alone had read as no vote
+        "- Election targets: the row is the day of the scheduled VOTE the "
+        "market hinges on -- the bot stops quoting from that day. Write it "
+        "when the market is decided by a vote (an election, referendum, "
+        "chamber control, vote share) OR by what a named upcoming vote "
+        "decides: who becomes prime minister or a minister, or forms the "
+        "government, after that election -- its day is the information "
+        "event. A rally, debate, court case, retirement, or an appointment "
+        "or announcement that hinges on no scheduled vote is NOT a vote: "
         "write nothing, status judgment.",
         "- The only commands you may run are the ones shown, plus "
         "`python imm_rows.py election lookup EVENT` (read-only: Kalshi's own "
@@ -546,6 +567,7 @@ def main(argv=None) -> int:
             gaps = (json.load(f) or {}).get("gaps") or {}
     except (OSError, ValueError):
         gaps = {}
+    gaps = live_gaps(gaps)
     targets: Dict[str, dict] = {}
     if not args.no_research:
         try:
