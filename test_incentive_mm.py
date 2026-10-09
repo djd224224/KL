@@ -18415,16 +18415,20 @@ class TestVercelPreDGate(unittest.TestCase):
                       for o in bot.state.sim_orders.values()
                       if o["ticker"] == self.T)
 
-    def test_anthvreq_doubled_size(self):
-        # Jack 2026-10-08: "double size of series" -- KXANTHVREQ x2 on the
-        # global geometry; the caps scale with it, the other labs stay x1
-        self.assertEqual(imm.ANTHVREQ_SIZE_MULT, 2.0)
-        self.assertEqual(imm.series_override("KXANTHVREQ").size_mult, 2.0)
-        self.assertEqual(imm.applied_mention_mult("KXANTHVREQ"), 2.0)
-        self.assertEqual(imm.series_max_position("KXANTHVREQ"),
-                         2.0 * imm.MAX_POSITION_CONTRACTS)
-        for s in ("KXANTHVSPEND", "KXGOOGVREQ", "KXOPENVREQ", "KXDEEPVREQ"):
-            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+    def test_the_whole_family_is_doubled(self):
+        # Jack 2026-10-09: "i think intent was to double all vercel markets
+        # not just this one" (KXANTHVREQ alone since 10/08) -> every Vercel
+        # series x2 on the global geometry: rungs and caps scale together,
+        # and the yield x1.5 no longer stacks on top
+        self.assertEqual(imm.VERCEL_SIZE_MULT, 2.0)
+        self.assertEqual(len(imm.VERCEL_SERIES), 8)
+        for s in imm.VERCEL_SERIES:
+            self.assertEqual(imm.series_override(s).size_mult, 2.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s),
+                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+            self.assertFalse(imm.yield_size_eligible(s), s)
+        self.assertEqual(imm.applied_mention_mult("KXGOOD"), 1.0)
 
     def test_enrolled_with_a_pre_d_cutoff(self):
         for s in ("KXOPENVSPEND", "KXMOONVSPEND", "KXANTHVSPEND", "KXGOOGVREQ",

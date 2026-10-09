@@ -9438,3 +9438,41 @@ WHAT.
 Also 10/09: the rewards report's fill-cost convention was fixed (report v24).
 The fills API returns the bot's NO buys as action "sell", side "no", and the
 generator had priced those at the YES price. See report_tools/README.md.
+
+## 2026-10-09 ~13:45Z — the whole Vercel family x2 (Jack: "i think intent was to double all vercel markets not just this one" -> "yes do it")
+
+395d3df (10/08, "double size of series") had doubled KXANTHVREQ alone. At
+x2 its 12OCT26 event went from 1 quoted strike to all 9 (the 12:58Z refresh
+after the 12:55Z relaunch). Now VERCEL_SIZE_MULT (IMM_VERCEL_SIZE_MULT,
+default 2.0) puts size_mult on all eight VERCEL_SERIES, replacing
+ANTHVREQ_SIZE_MULT. It's in the config hash and the "vercel gate:" startup
+line.
+
+THE FAMILY WHEN THIS WIDENED (sinks, since ~10/5 when it began to rest).
+$126 credited vs -$67 trading: realized +$31 (mostly a September KXANTHVREQ
+position) and -$98 of marks, -$34 of those still open on D=10/10. Net +$59.
+- D=10/8 cohort: $107 credited (0.97 of the modelled $110) vs -$64 trading,
+  plus ~$16 still due for KXOPENSOURCESHARE-26OCT09.
+- D=10/10 cohort: ~$110 modelled so far vs -$34 open marks.
+- Trading ran ~-4c a filled contract over 1,572 contracts, in line with the
+  10/05 study's -5c/ct pre-D tape. Most of it was whole rungs that went to
+  1c/99c: KXOPENSOURCESHARE-26OCT09-T66.8 bought 135 @20 (-$26),
+  KXDEEPVREQ-08OCT26-T16P5 bought 90 @19 (-$16), KXANTHVSPEND-08OCT26-T29P5
+  sold 150 @89 (-$15).
+- Per series it is noise (1-2 events each). KXANTHVSPEND -$32 and
+  KXGOOGVREQ -$19 were the worst.
+
+WHAT x2 DOES. On the 12:58Z refresh, 131 of 153 Vercel markets were already
+selected at x1 and 18 were held out by the payout floor, 8 of them
+KXOPENVSPEND-10OCT26. So it mostly doubles size where we already quote:
+roughly double the reward share, and double the whole-rung fills.
+- Rungs 20 -> 40 a side, 120 at the x3 overnight hours.
+- The per-market cap 150 -> 300 and the per-event cap 1000 -> 2000 (applied_mention_mult).
+- The yield x1.5 stops applying (a family multiplier), so the markets that
+  had it go x1.5 -> x2.
+- The pre-D cutoff, the fair gate and the sweep breaker are unchanged.
+
+RE-SCORE on the D=10/12 and 10/14 events.
+
+Tests: TestVercelPreDGate.test_the_whole_family_is_doubled (replaces
+test_anthvreq_doubled_size). test_incentive_mm 1132 OK.

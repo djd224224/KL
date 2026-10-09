@@ -7515,6 +7515,7 @@ _CONFIG_CODE_KNOBS = (
     "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
+    "VERCEL_SIZE_MULT",           # the family x2 (2026-10-09)
     # YouTube #2 top-video pilot (2026-10-05)
     "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_FROM_CLOSE_MIN",
     "YT2_CHART_DAY_CUTOFF", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
@@ -9727,18 +9728,27 @@ for _s in VERCEL_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
         cutoff_from_close_min=0, safe_join=True)
-# KXANTHVREQ x2 (Jack 2026-10-08: "double size of series"). The 12OCT26
-# strikes each pay $18/day (programs 10/08 16:02Z -> 10/11 03:59Z) with
-# 8k-12k contracts already in band, so the standard ladder's 1-3% share
-# projected $1.11-1.36 on five strikes against the $1.50 entry bar and
-# only T7P2 ($2.08) quoted. x2 roughly doubles the share; the per-market
-# and per-event caps scale with it (applied_mention_mult), and the pre-D
-# cutoff and the fair gate are unchanged. IMM_ANTHVREQ_SIZE_MULT=1
-# reverts (env => task-level restart).
-ANTHVREQ_SIZE_MULT = _env_float("IMM_ANTHVREQ_SIZE_MULT", 2.0)
-if "KXANTHVREQ" in SERIES_OVERRIDES:
-    SERIES_OVERRIDES["KXANTHVREQ"] = replace(SERIES_OVERRIDES["KXANTHVREQ"],
-                                             size_mult=ANTHVREQ_SIZE_MULT)
+# THE WHOLE VERCEL FAMILY x2 (Jack 2026-10-09: "i think intent was to double
+# all vercel markets not just this one" -> "yes do it"). It started 10/08
+# as KXANTHVREQ alone ("double size of series", 395d3df): the 12OCT26
+# strikes' 1-3% share projected $1.11-1.36 against the $1.50 entry bar, so
+# only T7P2 quoted; at x2 all nine did. The family when this widened (since
+# ~10/5, when it began to rest): $126 credited vs -$67 trading (-$34 of it
+# open marks on D=10/10), +$59 net; D=10/8 paid 0.97 of the modelled
+# reward. Trading ran ~-4c a filled contract over 1,572, mostly whole rungs
+# that went to 1c/99c, so x2 doubles those fills along with the reward
+# share. On the 10/09 12:58Z refresh 131 of 153 Vercel markets were
+# already selected at x1 and 18 were held out by the payout floor (8 on
+# KXOPENVSPEND-10OCT26). Rides the family size_mult wire: rungs 20 -> 40 a
+# side (x3 overnight -> 120), the per-market and per-event caps scale with
+# it (applied_mention_mult), and the yield x1.5 stops applying (a family
+# multiplier), so its markets go x1.5 -> x2. The pre-D cutoff and the fair
+# gate are unchanged. IMM_VERCEL_SIZE_MULT=1 reverts (env => task-level
+# restart). Re-score on the D=10/12 and 10/14 events.
+VERCEL_SIZE_MULT = _env_float("IMM_VERCEL_SIZE_MULT", 2.0)
+for _s in VERCEL_SERIES:
+    SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES[_s],
+                                   size_mult=VERCEL_SIZE_MULT)
 
 
 def vercel_series(series: str) -> bool:
@@ -22613,6 +22623,7 @@ class IncentiveMarketMaker:
             log("quake gate: OFF -- KXBIGGESTQUAKE not enrolled")
         if VERCEL_ENABLE:
             log(f"vercel gate: {','.join(sorted(VERCEL_SERIES))} PRE-D only, "
+                f"size x{VERCEL_SIZE_MULT:g}, "
                 f"fail-closed, out {VERCEL_CUTOFF_BEFORE_D_MIN}m before the "
                 f"measured day, tol {VERCEL_FAIR_TOL_CENTS}c, decided outside "
                 f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
