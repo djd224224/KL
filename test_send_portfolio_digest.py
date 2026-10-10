@@ -140,8 +140,8 @@ class BuildEmailTests(unittest.TestCase):
 
     def test_section_present_in_text_and_html(self):
         subject, text, html = pf.build_email(self._pf(), [], chart_ok=False)
-        self.assertIn("Biggest movers since yesterday, by family / event / market", text)
-        self.assertIn("Biggest movers since yesterday, by family / event / market", html)
+        self.assertIn("Biggest movers since yesterday, by family / event,", text)
+        self.assertIn("Biggest movers since yesterday, by family / event <", html)
         # ranked: crypto first, weather second, in both parts
         self.assertLess(text.index("Crypto"), text.index("Weather & quakes"))
         self.assertLess(html.index("Crypto"), html.index("Weather &amp; quakes"))
@@ -197,32 +197,23 @@ class BuildEmailTests(unittest.TestCase):
         self.assertIn("(day -$0.5k incl. any deposits: trading -$0.2k, "
                       "rewards & deposits +$0.1k)", subject)
 
-    def test_events_list_their_markets(self):
-        """The dashboard's third level: an event whose move came from two or
-        more markets lists its biggest; a single moving market's strike rides
-        on the event line."""
+    def test_table_stops_at_family_and_event(self):
+        """Jack 2026-10-10: "no need to show market. just family/event so the
+        table is more condensed". Events keep the dashboard's group label."""
         p = self._pf()
-        mk = [{"ticker": "KXCPIYOY-26NOV-T3.6", "day": -26.2, "realized": 0.0,
-               "value_d": -26.2, "value_now": 15.0, "note": ""},
-              {"ticker": "KXCPIYOY-26NOV-T3.7", "day": -11.07, "realized": -4.2,
-               "value_d": -6.87, "value_now": 7.4, "note": ""},
-              {"ticker": "KXCPIYOY-26NOV-T3.5", "day": 3.45, "realized": 0.0,
-               "value_d": 3.45, "value_now": 27.7, "note": "settled yes"}]
         cpi = _row("KXCPIYOY-26NOV", realized=-4.2, value_d=-29.62, value_now=50.1)
-        cpi["markets"] = mk
         one = _row("KXRT-YOUC", value_d=5.0, value_now=9.0)
-        one["markets"] = [{"ticker": "KXRT-YOUC-96", "day": 5.0, "realized": 0.0,
-                           "value_d": 5.0, "value_now": 9.0, "note": ""}]
         p["rows"] = list(ROWS) + [cpi, one]
         _, text, html = pf.build_email(p, [], chart_ok=False)
         self.assertIn("Econ & rates", text)
         self.assertIn("CPI & inflation", text)             # the dashboard's group label
-        self.assertIn("    T3.6", text)                    # top two markets, indented
-        self.assertIn("    T3.7", text)
-        self.assertIn("+1 more market", text)
-        self.assertIn("KXRT-YOUC  96", text)               # one market: on the event line
-        self.assertNotIn("    96", text)
-        self.assertIn(">T3.6<", html)
+        self.assertIn("  KXCPIYOY-26NOV  CPI & inflation", text)
+        self.assertIn("by family / event,", text)
+        self.assertIn("FAMILY / EVENT ", text)
+        self.assertNotIn("MARKET", text)
+        self.assertNotIn("more market", text)
+        self.assertIn(">KXCPIYOY-26NOV<", html)
+        self.assertIn("Family / event</td>", html)
         self.assertIn("CPI &amp; inflation", html)
 
     def test_risk_block_sits_under_the_chart(self):
@@ -791,6 +782,51 @@ class SubaccountTests(unittest.TestCase):
         finally:
             pf.DATA_DIR, pf.HISTORY_CSV = old
         self.assertEqual(back[0]["subs_equity"], 300.0)
+
+
+class ProfitChartTests(unittest.TestCase):
+    """Jack 2026-10-10: "instead of chart of account value, show 2 lines:
+    Realized profit (+$23,916.81) / Estimated profit (est. +$27,021.04 after
+    rewards are paid out)"."""
+
+    def _history(self):
+        rows = pf.upsert_history([], "2026-09-28", 10000.0, 12900.0, 22900.0,
+                                 12500.0, 124.95)                 # no estimate yet
+        rows = pf.upsert_history(rows, "2026-10-09", 20127.28, 22997.7, 43124.98,
+                                 20160.48, 120.27, 1897.31, 300.0)
+        return pf.upsert_history(rows, "2026-10-10", 10332.79, 33764.43, 44097.22,
+                                 31163.03, 120.99, 3104.23, 300.0)
+
+    # 16k in before 9/28; a 2k deposit at 10/9 16:00Z; a 500 withdrawal on
+    # 10/9 at 10:59Z, before that morning's 7:00 ET cut
+    TRANSFERS = [(1790000000.0, 16000.0), (1791561600.0, 2000.0),
+                 (1791543540.0, -500.0)]
+
+    def test_each_morning_nets_the_transfers_made_by_then(self):
+        pts = pf.profit_series(self._history(), self.TRANSFERS)
+        (d0, p0, e0), (d1, p1, e1), (d2, p2, e2) = pts
+        self.assertEqual(str(d0), "2026-09-28")
+        self.assertEqual(p0, 6624.95)
+        self.assertIsNone(e0)                                     # not recorded then
+        self.assertEqual(p1, round(40708.03 - 16000.0 + 500.0, 2))
+        self.assertEqual(e1, round(p1 + 1897.31, 2))
+        self.assertEqual(p2, round(41916.81 - 18000.0 + 500.0, 2))
+
+    def test_today_is_the_headline_figure(self):
+        pts = pf.profit_series(self._history(), self.TRANSFERS,
+                               today="2026-10-10", today_profit=23916.81)
+        self.assertEqual(pts[-1][1:], (23916.81, 27021.04))
+
+    def test_no_deposit_history_no_chart(self):
+        self.assertFalse(pf.render_chart(self._history(), None, "unused.png"))
+
+    def test_renders(self):
+        import os
+        import tempfile
+        out = os.path.join(tempfile.mkdtemp(), "c.png")
+        self.assertTrue(pf.render_chart(self._history(), self.TRANSFERS, out,
+                                        "2026-10-10", 23916.81))
+        self.assertGreater(os.path.getsize(out), 1000)
 
 
 class CollateralTests(unittest.TestCase):

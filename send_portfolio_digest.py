@@ -3,12 +3,13 @@ r"""
 send_portfolio_digest.py — 7:00 AM ET whole-account portfolio email.
 
 One email covering the ENTIRE Kalshi account (every bot + manual trades):
-a chart of daily account value (cash + open positions marked to mid), the
-IMM's risk-controls table right under it (since 2026-10-03), then the
-biggest movers since the prior morning by family / event / market, grouped
-exactly as the IMM dashboard's Drivers table groups them (imm_dashboard.
-family_of, since 2026-10-03; settled and unrealized alike, ranked by the
-size of the move, realized and mark-to-mid split out).
+a chart of daily profit, realized and estimated after rewards are paid out
+(since 2026-10-10; it was account value, which jumps with every deposit),
+the IMM's risk-controls table right under it (since 2026-10-03), then the
+biggest movers since the prior morning by family / event (markets dropped
+2026-10-10), grouped exactly as the IMM dashboard's Drivers table groups
+them (imm_dashboard.family_of, since 2026-10-03; settled and unrealized
+alike, ranked by the size of the move, realized and mark-to-mid split out).
 (The "Settled since yesterday, by series" table was removed 2026-09-29.)
 
 Then the IMM bot's section (since 2026-10-02, when its own 7:10 email was
@@ -46,7 +47,8 @@ credits: "portfolio 2026-10-05: profit +$18.1k (day +$1.1k: trading
 
 State lives in portfolio_daily\:
     pf_snapshot_YYYY-MM-DD.json  - per-event E components (diff baseline)
-    balance_history.csv          - date,cash,positions_value,equity (chart)
+    balance_history.csv          - date,cash,positions_value,equity,... (chart,
+                                   with the deposits read each morning)
 Snapshots/history are written on the real morning run (at build time, so a
 failed send still baselines tomorrow's diff); --test and --dry-run never
 write them. First ever run has no baseline and reports P&L to date instead.
@@ -107,7 +109,8 @@ RECIPIENTS = [r.strip() for r in os.environ.get(
     "PF_DIGEST_TO", "jackdu224@gmail.com").split(",") if r.strip()]
 
 # Chart + table colors (dataviz reference palette, light mode fixed for email).
-C_EQUITY = "#2a78d6"     # series 1 blue — total account value
+C_EQUITY = "#2a78d6"     # series 1 blue — realized profit
+C_EST = "#eb6834"        # series 2 orange — estimated profit (dashed)
 C_INK = "#0b0b0b"
 C_INK2 = "#52514e"
 C_MUTED = "#898781"
@@ -446,8 +449,7 @@ def replay_day(start, fills, settlements, end, ev_of):
     cash + value now - value at the prior morning.
 
     Returns (events, cash, mismatches, settled): events maps event ->
-    {"realized", "value_d", "markets"}, markets mapping each ticker to its
-    own {"realized", "value_d", "value_now", "settled"}; cash = the day's trading + settlement cash;
+    {"realized", "value_d"}; cash = the day's trading + settlement cash;
     mismatches = markets whose replayed position disagrees with `end`;
     settled = event -> set of market results."""
     st = {}
@@ -506,38 +508,10 @@ def replay_day(start, fills, settlements, end, ev_of):
         q_end, v_end = end.get(tk, (0.0, 0.0))
         if abs(d["q"] - q_end) > 0.011:
             mismatches.append(tk)
-        e = events.setdefault(ev_of(tk), {"realized": 0.0, "value_d": 0.0,
-                                          "markets": {}})
+        e = events.setdefault(ev_of(tk), {"realized": 0.0, "value_d": 0.0})
         e["realized"] += d["real"]
         e["value_d"] += v_end - d["basis"]
-        # the market level of the family / event / market table
-        e["markets"][tk] = {"realized": d["real"], "value_d": v_end - d["basis"],
-                            "value_now": v_end, "settled": d.get("settled")}
     return events, round(cash, 2), mismatches, settled
-
-
-def market_rows(event: str, markets: dict) -> list:
-    """An event's markets as the movers table's third level (the dashboard's
-    family / event / market): each market's own day = realized + value_d,
-    its value now and a settled note, largest move first. Markets that did
-    not move are left out."""
-    out = []
-    for tk, m in markets.items():
-        realized, value_d = round(m["realized"], 2), round(m["value_d"], 2)
-        day = round(realized + value_d, 2)
-        if abs(day) < 0.005 and abs(realized) < 0.005 and abs(value_d) < 0.005:
-            continue
-        out.append({"ticker": tk, "day": day, "realized": realized,
-                    "value_d": value_d, "value_now": round(m["value_now"], 2),
-                    "note": f"settled {m['settled']}" if m.get("settled") else ""})
-    out.sort(key=lambda r: -abs(r["day"]))
-    return out
-
-
-def market_label(event: str, ticker: str) -> str:
-    """A market as the dashboard prints it under its event: the strike
-    suffix (KXCPIYOY-26NOV-T3.6 -> T3.6)."""
-    return ticker[len(event) + 1:] if ticker.startswith(event + "-") else ticker
 
 
 def fetch_market_info(client, tickers):
@@ -978,8 +952,7 @@ def build_portfolio(now_utc: datetime):
             else:
                 note = ""
             rows.append({"event": ev, "day": day, "realized": realized,
-                         "value_d": value_d, "value_now": value_now, "note": note,
-                         "markets": market_rows(ev, e.get("markets") or {})})
+                         "value_d": value_d, "value_now": value_now, "note": note})
         no_trade_cash = round(cash - _f(prior.get("cash")) - trade_cash, 2)
         if transfers is not None:
             dep, wd = sum_transfers(transfers, prior_created, now_utc)
@@ -1043,7 +1016,7 @@ def build_portfolio(now_utc: datetime):
                              else round(collat - _f(prior["collateral_returned"]), 2)),
             "account_value": account_value,
             "unpaid": unpaid, "deposited": deposited, "withdrawn": withdrawn,
-            "total_profit": total_profit,
+            "total_profit": total_profit, "transfers": transfers,
             "rows": rows, "snapshot": snapshot, "prior": prior,
             "mark_src": mark_src, "unreadable": unreadable,
             "n_settlements": len(settlements),
@@ -1056,7 +1029,47 @@ def build_portfolio(now_utc: datetime):
 # Chart
 # ----------------------------------------------------------------------------
 
-def render_chart(history, out_png: str) -> bool:
+def history_account_value(r) -> float:
+    """A balance_history row's account value on Kalshi's own positions
+    valuation (Jack 8/14: "value it based on Kalshi"); rows predating that
+    column fall back to our marks. Perpetuals are in from 9/28, numbered
+    subaccounts from 10/9 (earlier rows have none recorded)."""
+    return ((r["cash"] + r["kalshi_positions_value"]
+             if isinstance(r.get("kalshi_positions_value"), float) else r["equity"])
+            + sum(r[k] for k in ("perps_equity", "subs_equity")
+                  if isinstance(r.get(k), float)))
+
+
+def profit_series(history, transfers, today=None, today_profit=None):
+    """[(date, realized, estimated)], one per history row: realized = that
+    morning's account value less every dollar deposited, plus every dollar
+    withdrawn, by 7:00 ET (the headline's total profit; `today`'s point is
+    `today_profit` exactly), estimated = realized + that morning's
+    unpaid-rewards estimate, None before 9/29 when it was not recorded."""
+    out = []
+    for r in history:
+        d = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        if r["date"] == today and today_profit is not None:
+            profit = today_profit
+        else:
+            dep, wd = sum_transfers(transfers, None,
+                                    ET.localize(datetime(d.year, d.month, d.day, 7)))
+            profit = round(history_account_value(r) - dep + wd, 2)
+        unpaid = r.get("unpaid_rewards_est")
+        out.append((d, profit,
+                    round(profit + unpaid, 2) if isinstance(unpaid, float) else None))
+    return out
+
+
+def render_chart(history, transfers, out_png: str, today=None,
+                 today_profit=None) -> bool:
+    """Daily profit, two lines (Jack 2026-10-10: "instead of chart of account
+    value, show 2 lines: Realized profit (+$23,916.81) / Estimated profit
+    (est. +$27,021.04 after rewards are paid out)"). No deposit history
+    today = no chart: profit can't be told from a deposit without it."""
+    if transfers is None:
+        log("! deposit history unread; sending without the profit chart")
+        return False
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1066,26 +1079,31 @@ def render_chart(history, out_png: str) -> bool:
     except Exception as e:
         log(f"! matplotlib unavailable ({e}); sending without chart")
         return False
-    hist = history[-120:]
-    dates = [datetime.strptime(r["date"], "%Y-%m-%d").date() for r in hist]
-    # Account value on Kalshi's own positions valuation (Jack 8/14: "value it
-    # based on Kalshi"); rows predating that column fall back to our marks.
-    # Perpetuals are in from 9/28, numbered subaccounts from 10/9 (earlier
-    # rows have none recorded).
-    eq = [(r["cash"] + r["kalshi_positions_value"]
-           if isinstance(r.get("kalshi_positions_value"), float) else r["equity"])
-          + sum(r[k] for k in ("perps_equity", "subs_equity")
-                if isinstance(r.get(k), float))
-          for r in hist]
+    pts = profit_series(history[-120:], transfers, today, today_profit)
+    dates = [d for d, _, _ in pts]
+    real = [p for _, p, _ in pts]
+    est = [(d, e) for d, _, e in pts if e is not None]
 
     fig, ax = plt.subplots(figsize=(7.6, 3.1), dpi=180)
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#ffffff")
-    ax.plot(dates, eq, color=C_EQUITY, lw=2.2, marker="o", ms=4.5, zorder=3)
-    ax.annotate(f"${eq[-1]:,.0f}", (dates[-1], eq[-1]), xytext=(7, 6),
-                textcoords="offset points", color=C_INK, fontsize=9,
-                fontweight="bold")
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    # a dot per morning only while they stay apart; always one on the latest
+    dots = dict(marker="o", ms=4.5, mec="#ffffff", mew=0.8)
+    every = dots if len(dates) <= 20 else {}
+    ax.plot(dates, real, color=C_EQUITY, lw=2.2, zorder=3, **every,
+            label=f"Realized profit ({_signed_usd(real[-1])})")
+    ax.plot(dates[-1:], real[-1:], color=C_EQUITY, zorder=4, **dots)
+    if est:
+        ax.plot([d for d, _ in est], [e for _, e in est], color=C_EST, lw=2.2,
+                ls=(0, (4, 1.6)), zorder=3, **every,
+                label="Estimated profit" + (
+                    "" if pts[-1][2] is None else
+                    f" (est. {_signed_usd(pts[-1][2])} after rewards are paid out)"))
+        ax.plot(est[-1][:1], est[-1][1:], color=C_EST, zorder=4, **dots)
+    ax.legend(loc="upper left", frameon=False, fontsize=8.5, labelcolor=C_INK2,
+              handlelength=2.6)
+    ax.yaxis.set_major_formatter(FuncFormatter(
+        lambda v, _: f"{'-' if v < 0 else ''}${abs(v):,.0f}"))
     if len(dates) <= 4:      # AutoDateLocator invents year ticks for sparse data
         ax.set_xticks(dates)
         ax.set_xlim(dates[0] - timedelta(days=1), dates[-1] + timedelta(days=1))
@@ -1099,8 +1117,10 @@ def render_chart(history, out_png: str) -> bool:
     ax.spines["bottom"].set_color(C_AXIS)
     ax.margins(x=0.05 if len(dates) > 1 else 0.3)
     lo, hi = ax.get_ylim()
+    if lo < 0 < hi:
+        ax.axhline(0, color=C_AXIS, lw=0.8, zorder=1)
     pad = max((hi - lo) * 0.12, 1.0)
-    ax.set_ylim(lo - pad * 0.3, hi + pad)          # room for the end label
+    ax.set_ylim(lo - pad * 0.3, hi + pad * 2.5)    # room for the legend
     fig.tight_layout()
     fig.savefig(out_png, facecolor="#ffffff")
     plt.close(fig)
@@ -1149,32 +1169,14 @@ def family_movers(rows, top_n: int = 25, per_family: int = 3):
     return shown, totals, (len(hidden), hidden_net)
 
 
-MARKETS_PER_EVENT = 2
-
-
-def mover_lines(r) -> list:
-    """[(level, label, sub, numbers, tag)] for one event row of the movers
-    table and, under it, its markets: the dashboard's family / event /
-    market, levels 1 and 2. `sub` is the dashboard's group label beside an
-    event (CPI & inflation, Treasury yields, ...; none where the group is
-    just the series). An event whose moves came from two or more markets
-    lists its top MARKETS_PER_EVENT; a single moving market's strike rides
-    on the event line rather than repeating its numbers. A trailing
-    (2, "+N more markets", "", None, "") line counts the rest."""
+def mover_group(r) -> str:
+    """The dashboard's group label beside an event row of the movers table
+    (CPI & inflation, Treasury yields, ...; "" where the group is just the
+    series). The table stops at family / event: its markets are left out
+    (Jack 2026-10-10: "no need to show market. just family/event so the
+    table is more condensed")."""
     _fam, grp = family_and_group(r["event"])
-    series = r["event"].split("-", 1)[0]
-    sub = grp if grp and grp != series else ""
-    mk = r.get("markets") or []
-    if len(mk) == 1:
-        sub = (sub + " · " if sub else "") + market_label(r["event"], mk[0]["ticker"])
-    out = [(1, r["event"], sub, r, _mover_tag(r))]
-    if len(mk) >= 2:
-        for m in mk[:MARKETS_PER_EVENT]:
-            out.append((2, market_label(r["event"], m["ticker"]), "", m, m.get("note") or ""))
-        rest = len(mk) - MARKETS_PER_EVENT
-        if rest > 0:
-            out.append((2, f"+{rest} more market{'s' if rest != 1 else ''}", "", None, ""))
-    return out
+    return grp if grp and grp != r["event"].split("-", 1)[0] else ""
 
 
 def _mover_tag(r) -> str:
@@ -1392,10 +1394,10 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         lines.append("")
         lines.append(imm["risk_text"])
     lines.append("")
-    lines.append(f"Biggest movers since yesterday, by family / event / market, grouped "
+    lines.append(f"Biggest movers since yesterday, by family / event, grouped "
                  f"as on the IMM dashboard (settled + unrealized; top {len(movers)} of "
                  f"{mv_tot['n_families']} families):")
-    lines.append(f"{'FAMILY / EVENT / MARKET':56s} {'DAY P&L':>9s} {'REALIZED':>9s} "
+    lines.append(f"{'FAMILY / EVENT':56s} {'DAY P&L':>9s} {'REALIZED':>9s} "
                  f"{'UNREALIZED':>10s} {'OPEN NOW':>9s}")
     for name, g in movers:
         n = len(g["rows"])
@@ -1403,14 +1405,11 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      f"{g['day']:>+9.2f} {g['realized']:>+9.2f} "
                      f"{g['unreal']:>+10.2f} {g['value_now']:>9.2f}")
         for r in g["top"]:
-            for lvl, lbl, sub, x, tag in mover_lines(r):
-                lbl = "  " * lvl + lbl + (f"  {sub}" if sub else "")
-                if x is None:
-                    lines.append(lbl)
-                    continue
-                lines.append(f"{lbl[:56]:56s} {x['day']:>+9.2f} {x['realized']:>+9.2f} "
-                             f"{x['value_d']:>+10.2f} {x['value_now']:>9.2f}"
-                             + (f"  {tag}" if tag else ""))
+            sub, tag = mover_group(r), _mover_tag(r)
+            lbl = "  " + r["event"] + (f"  {sub}" if sub else "")
+            lines.append(f"{lbl[:56]:56s} {r['day']:>+9.2f} {r['realized']:>+9.2f} "
+                         f"{r['value_d']:>+10.2f} {r['value_now']:>9.2f}"
+                         + (f"  {tag}" if tag else ""))
         more = n - len(g["top"])
         if more > 0:
             lines.append(f"  +{more} more event{'s' if more != 1 else ''}")
@@ -1489,7 +1488,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                  f'baseline saved; day-over-day starts tomorrow.</div>')
     if chart_ok:
         h.append('<div style="margin:10px 0"><img src="cid:balancechart" '
-                 'alt="Daily account balance" width="760" '
+                 'alt="Daily profit, realized and estimated after rewards" width="760" '
                  'style="width:100%;max-width:760px;height:auto"></div>')
 
     # the risk-controls block right under the chart (Jack 2026-10-03: "move
@@ -1499,7 +1498,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         h.append(imm["risk_html"])
 
     h.append(f'<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
-             f'Biggest movers since yesterday, by family / event / market'
+             f'Biggest movers since yesterday, by family / event'
              f' <span style="color:{C_MUTED};font-weight:400;font-size:13px">'
              f'grouped as on the IMM dashboard &middot; settled + unrealized '
              f'&middot; top {len(movers)} of {mv_tot["n_families"]} families</span></div>')
@@ -1507,7 +1506,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
         mono = "font-family:Consolas,Menlo,monospace;font-size:12px"
         h.append('<table style="border-collapse:collapse;font-size:13px">')
         h.append(f'<tr style="background:#f0f0f0;font-weight:600">'
-                 f'<td style="{TDL}">Family / event / market</td>'
+                 f'<td style="{TDL}">Family / event</td>'
                  f'<td style="{TD}">Day P&amp;L $</td>'
                  f'<td style="{TD}">Realized $</td><td style="{TD}">Unrealized $</td>'
                  f'<td style="{TD}">Open now $</td><td style="{TDL}">Why</td></tr>')
@@ -1523,22 +1522,18 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      f'<td style="{TD}">{g["value_now"]:,.2f}</td>'
                      f'<td style="{TDL}"></td></tr>')
             for r in g["top"]:
-                for lvl, lbl, sub, x, tag in mover_lines(r):
-                    pad = "padding-left:22px;" if lvl == 1 else "padding-left:42px;"
-                    lab = (f'<span style="{mono}">{_esc(lbl)}</span>' if x is not None
-                           else f'<span style="color:{C_MUTED};font-size:11px">{_esc(lbl)}</span>')
-                    if sub:
-                        lab += f' <span style="color:{C_MUTED};font-size:11px">{_esc(sub)}</span>'
-                    if x is None:
-                        h.append(f'<tr><td style="{TDL}{pad}" colspan="6">{lab}</td></tr>')
-                        continue
-                    h.append(f'<tr>'
-                             f'<td style="{TDL}{pad}">{lab}</td>'
-                             f'<td style="{TD}">{_pnl_span(x["day"])}</td>'
-                             f'<td style="{TD}">{_pnl_span(x["realized"])}</td>'
-                             f'<td style="{TD}">{_pnl_span(x["value_d"])}</td>'
-                             f'<td style="{TD}">{x["value_now"]:,.2f}</td>'
-                             f'<td style="{TDL}color:{C_MUTED};font-size:12px">{_esc(tag)}</td></tr>')
+                sub = mover_group(r)
+                lab = f'<span style="{mono}">{_esc(r["event"])}</span>'
+                if sub:
+                    lab += f' <span style="color:{C_MUTED};font-size:11px">{_esc(sub)}</span>'
+                h.append(f'<tr>'
+                         f'<td style="{TDL}padding-left:22px;">{lab}</td>'
+                         f'<td style="{TD}">{_pnl_span(r["day"])}</td>'
+                         f'<td style="{TD}">{_pnl_span(r["realized"])}</td>'
+                         f'<td style="{TD}">{_pnl_span(r["value_d"])}</td>'
+                         f'<td style="{TD}">{r["value_now"]:,.2f}</td>'
+                         f'<td style="{TDL}color:{C_MUTED};font-size:12px">'
+                         f'{_esc(_mover_tag(r))}</td></tr>')
             more = n - len(g["top"])
             if more > 0:
                 h.append(f'<tr><td style="{TDL}padding-left:22px;color:{C_MUTED};font-size:11px" '
@@ -1726,7 +1721,8 @@ def main(argv=None) -> int:
         log(f"snapshot + history written for {today_str}")
 
     chart_png = os.path.join(LOG_DIR, f"chart_{today_str}.png")
-    chart_ok = render_chart(history_preview, chart_png)
+    chart_ok = render_chart(history_preview, pf.get("transfers"), chart_png,
+                            today_str, pf.get("total_profit"))
 
     imm = None
     if IMM_SECTION_ENABLED and not args.no_imm:
