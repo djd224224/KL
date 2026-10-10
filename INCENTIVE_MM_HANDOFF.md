@@ -9543,3 +9543,38 @@ At 20% the control trips were costing ~$17-20/day of pickoffs a pull would
 have stopped. IMM_SWEEP_HOLDOUT=0.05 keeps a thin control (~15 trips/day)
 for the scorer. Hold, scope and trigger are unchanged.
 
+
+## 2026-10-10 ~02:50Z — rain: the 13 missing NWS stations, and the mid-move breaker on rain only (Jack: "fix" / "15c move, 30-min pause ... add")
+
+WHY. On 10/09 KXRAIN-26OCT10-CMH went 54 -> 74 -> 14 -> 71 in one day. The
+book sold YES at 14-18c in the trough and lost -$121 on that market. CMH,
+TAM, ABQ and LEX were $196 of the day's -$217 daily-rain loss. Nothing gated
+it, for two reasons:
+- The NWS fair gate exempts the next-day event by design
+  (rain_fair_exempt, 7/28), and that is the only daily the bot quotes.
+- rain_fair.py had stations for only the 20 cities of 7/28, while Kalshi now
+  lists 33.
+
+1. rain_fair.STATIONS +13: ABQ CLL CMH EWR IND LEX MKE PIT PVD SGF STL TAM
+   TTN.
+   - CLI codes come from the market rules (TAM = CLITPA).
+   - Coordinates and time zones come from the NWS station records.
+   - Dry run 02:40Z: 33 stations ok, 0 failed. 10/10 reads CMH 68c (book
+     71.5), LEX 98c (93.5), TAM 98c (82.5), IND 67c.
+   - This prices the new cities for the fair gate and the directional take
+     on events 2+ days out. The next-day exemption is unchanged.
+   - test_rain_fair.py is new.
+2. MOVE_BREAKER_SERIES (IMM_MOVE_BREAKER_SERIES, default "KXRAIN,KXRAINWKND"):
+   the mid-move breaker alone runs on these series with IMM_BREAKERS off.
+   - The defaults are MID_MOVE_BREAKER_CENTS 15 and BREAKER_COOLDOWN_SECS
+     1800: an external mid 15c+ away from the previous cycle's cancels the
+     market for 30 min. The market stays selected ("breaker" is not a sticky
+     death reason) and the trip alert is non-urgent (log only).
+   - Replayed 9/12-10/10 net of the modelled reward it forgoes: +$130
+     (+$45 before 10/9), ~25 trips/day. 15c/60m tested +$210, 20c -$31.
+   - In the config hash and on a "mid-move breaker:" startup line.
+   - Test: TestDryRunCycle.test_mid_move_breaker_runs_on_rain_with_breakers_off.
+
+DEPLOY: a normal ff of KL, so incentive_mm.py's code-change exit restarts the
+bot with a handoff. That restart also loads rain_fair.py (imported in run())
+and the pending weekend-rain x1 (3b089a9).

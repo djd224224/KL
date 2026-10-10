@@ -3949,6 +3949,28 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(bot.state.sim_orders)       # still quoting (repriced)
         self.assertEqual(bot.state.breaker_until, {})
 
+    def test_mid_move_breaker_runs_on_rain_with_breakers_off(self):
+        # Jack 2026-10-09: "15c move, 30-min pause (the built-in default) --
+        # add" on rain: the mid-move breaker alone guards the listed series
+        # with IMM_BREAKERS off (the fixture series stands in for rain here)
+        self.assertFalse(imm.BREAKERS_ENABLED)
+        self.assertEqual(imm.MOVE_BREAKER_SERIES,
+                         frozenset({"KXRAIN", "KXRAINWKND"}))
+        self.assertTrue(imm.move_breaker_on("KXRAINWKND"))
+        self.assertFalse(imm.move_breaker_on("KXRAINNYCM"))     # not the monthlies
+        self.assertFalse(imm.move_breaker_on("KXGOOD"))
+        bot = self._bot()
+        with mock.patch.object(imm, "MOVE_BREAKER_SERIES", frozenset({"KXGOOD"})):
+            bot.run_cycle()
+            self.assertTrue(bot.state.sim_orders)
+            bot.client.books["KXGOOD-99DEC31-A"] = {"orderbook_fp": {
+                "yes_dollars": [["0.68", "500"], ["0.69", "600"]],
+                "no_dollars": [["0.29", "1200"]]}}      # mid 50 -> 70
+            bot.run_cycle()
+            self.assertEqual(bot.state.sim_orders, {})
+            self.assertGreater(bot.state.breaker_until.get("KXGOOD-99DEC31-A", 0),
+                               time.time() + imm.BREAKER_COOLDOWN_SECS - 120)
+
     def test_fill_burst_breaker(self):
         bot = self._bot()
         old = imm.BREAKERS_ENABLED

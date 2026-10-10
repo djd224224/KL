@@ -22,8 +22,12 @@ the bot hot-reloads the JSON by mtime. Also runnable standalone:
 
     python rain_fair.py [--out rain_fair_values.json] [--days 3]
 
-Station set = the 20 CLI stations named in the KXRAIN market rules
-(fetched 2026-07-28; note CHI=O'Hare, DAL=DFW, HOU=IAH, NYC=Central Park).
+Station set = the 33 CLI stations named in the KXRAIN market rules: 20
+fetched 2026-07-28 (note CHI=O'Hare, DAL=DFW, HOU=IAH, NYC=Central Park),
+and the 13 cities Kalshi listed since, added 2026-10-09 (Jack: "fix"), after
+CMH/TAM/ABQ/LEX went unpriced on a -$196 day. Their coordinates and time zones
+are the NWS station records (api.weather.gov/stations/K...); note TAM=CLITPA.
+A city Kalshi adds later needs its own row here.
 Per-station failures keep the previous entry (with its old fetched_at, so
 the bot's TTL naturally expires it) — one flaky NWS endpoint must not
 blank the other 19 cities.
@@ -62,6 +66,20 @@ STATIONS: Dict[str, dict] = {
     "SATX": {"cli": "CLISAT", "name": "San Antonio Intl",      "lat": 29.533, "lon": -98.469, "tz": "US/Central"},
     "HOU":  {"cli": "CLIIAH", "name": "Houston Bush",          "lat": 29.980, "lon": -95.360, "tz": "US/Central"},
     "OKC":  {"cli": "CLIOKC", "name": "Oklahoma City Rogers",  "lat": 35.389, "lon": -97.600, "tz": "US/Central"},
+    # added 2026-10-09: the cities Kalshi listed after 7/28
+    "ABQ":  {"cli": "CLIABQ", "name": "Albuquerque Intl",      "lat": 35.042, "lon": -106.615, "tz": "America/Denver"},
+    "CLL":  {"cli": "CLICLL", "name": "College Station Easterwood", "lat": 30.582, "lon": -96.362, "tz": "America/Chicago"},
+    "CMH":  {"cli": "CLICMH", "name": "Columbus John Glenn",   "lat": 39.991, "lon": -82.877, "tz": "America/New_York"},
+    "EWR":  {"cli": "CLIEWR", "name": "Newark Liberty",        "lat": 40.683, "lon": -74.169, "tz": "America/New_York"},
+    "IND":  {"cli": "CLIIND", "name": "Indianapolis Intl",     "lat": 39.725, "lon": -86.282, "tz": "America/Indiana/Indianapolis"},
+    "LEX":  {"cli": "CLILEX", "name": "Lexington Blue Grass",  "lat": 38.034, "lon": -84.612, "tz": "America/New_York"},
+    "MKE":  {"cli": "CLIMKE", "name": "Milwaukee Mitchell",    "lat": 42.955, "lon": -87.904, "tz": "America/Chicago"},
+    "PIT":  {"cli": "CLIPIT", "name": "Pittsburgh Intl",       "lat": 40.485, "lon": -80.215, "tz": "America/New_York"},
+    "PVD":  {"cli": "CLIPVD", "name": "Providence TF Green",   "lat": 41.722, "lon": -71.428, "tz": "America/New_York"},
+    "SGF":  {"cli": "CLISGF", "name": "Springfield-Branson",   "lat": 37.240, "lon": -93.390, "tz": "America/Chicago"},
+    "STL":  {"cli": "CLISTL", "name": "St. Louis Lambert",     "lat": 38.753, "lon": -90.374, "tz": "America/Chicago"},
+    "TAM":  {"cli": "CLITPA", "name": "Tampa Intl",            "lat": 27.961, "lon": -82.540, "tz": "America/New_York"},
+    "TTN":  {"cli": "CLITTN", "name": "Trenton-Mercer",        "lat": 40.276, "lon": -74.816, "tz": "America/New_York"},
 }
 
 HOURLY_EXP = float(os.environ.get("RAIN_FAIR_HOURLY_EXP", "0.5"))

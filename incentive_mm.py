@@ -2800,6 +2800,26 @@ FILL_BURST_COOLDOWN_SECS = _env_int("IMM_FILL_BURST_COOLDOWN", 3600)
 # breakers off: skew caps, per-market/event position caps, reduce-only
 # windows, crossed/wide-book cancels, the daily loss halt, and marks/MTM.
 BREAKERS_ENABLED = os.environ.get("IMM_BREAKERS", "0") == "1"
+# ...EXCEPT the mid-move breaker on rain (Jack 2026-10-09: "15c move, 30-min
+# pause (the built-in default) -- add"). KXRAIN-26OCT10-CMH went 54 -> 74 ->
+# 14 -> 71 in one day, and the book sold YES at 14-18c in the trough, -$121
+# on that market. Nothing gated it: the NWS fair gate exempts the next-day
+# event (the only daily the bot quotes) and the weekend book has no fair.
+# The mid-move breaker alone (not fill-burst or one-sided) runs on these
+# series at MID_MOVE_BREAKER_CENTS / BREAKER_COOLDOWN_SECS (15c, 30 min)
+# with IMM_BREAKERS off. Replayed 9/12-10/10 on the cycle logs against the
+# dashboard's to-date mark-outs, net of the modelled reward a stand-down
+# forgoes: +$130 (+$45 before 10/9; the CMH day alone ~$85), ~25 trips a
+# day. 15c/60m tested +$210, 20c -$31. A trip alerts non-urgent (log and the
+# daily summary only). IMM_MOVE_BREAKER_SERIES: exact series, comma-
+# separated; empty = none (IMM_BREAKERS=1 still turns it on everywhere).
+MOVE_BREAKER_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_MOVE_BREAKER_SERIES", "KXRAIN,KXRAINWKND").split(",") if s.strip())
+
+
+def move_breaker_on(series: str) -> bool:
+    """Does the mid-move breaker guard this series?"""
+    return BREAKERS_ENABLED or series in MOVE_BREAKER_SERIES
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
@@ -7463,7 +7483,8 @@ _CONFIG_CODE_KNOBS = (
     # EST_PEAK_TTL_SECS are listed with the hopeless clock below)
     "GUARD_LOG", "SELECTION_INPUTS", "HOPELESS_EXIT",
     "FLOOR_ACCRUAL_PER_PERIOD", "RATE_FLOOR_ESCAPE_DAYS",
-    "MAX_JOIN_SPREAD_CENTS", "BREAKERS_ENABLED", "EVENT_FILL_HALT_CONTRACTS",
+    "MAX_JOIN_SPREAD_CENTS", "BREAKERS_ENABLED", "MOVE_BREAKER_SERIES",
+    "MID_MOVE_BREAKER_CENTS", "BREAKER_COOLDOWN_SECS", "EVENT_FILL_HALT_CONTRACTS",
     "EVENT_FILL_HALT_STRIKES", "EVENT_DEPTH_RESUME_SECS", "RAIN_FAIR_ENABLE",
     "RAIN_FAIR_TOL_CENTS", "STICKY_PRICE_MIN", "STICKY_PRICE_MAX",
     "SCAN_HOPELESS_EXIT", "SCAN_HOPELESS_BAR", "BLIND_PRESERVE_CYCLES",
@@ -19925,7 +19946,7 @@ class IncentiveMarketMaker:
                 pm = self.state.prev_mid.get(t)
                 self.state.prev_mid[t] = mid
                 self._mark_from_book(t, ext_bid, ext_ask, marked)
-                if (BREAKERS_ENABLED and pm is not None
+                if (move_breaker_on(meta.series) and pm is not None
                         and abs(mid - pm) >= MID_MOVE_BREAKER_CENTS):
                     self.state.breaker_until[t] = now_ts + BREAKER_COOLDOWN_SECS
                     n = self.cancel_market_orders(t, resting)
@@ -22791,6 +22812,14 @@ class IncentiveMarketMaker:
                         f"(the monitoring)" if SWEEP_HOLDOUT > 0 else "")
                      + f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
                "off": ""}.get(SWEEP_BREAKER, ""))
+        log("mid-move breaker: "
+            + ("EVERY series (IMM_BREAKERS=1)" if BREAKERS_ENABLED else
+               (",".join(sorted(MOVE_BREAKER_SERIES)) + " only (2026-10-09)")
+               if MOVE_BREAKER_SERIES else "off")
+            + (f" -- an external mid that moves {MID_MOVE_BREAKER_CENTS}c+ "
+               f"between cycles cancels the market and stands it down "
+               f"{BREAKER_COOLDOWN_SECS // 60} min"
+               if BREAKERS_ENABLED or MOVE_BREAKER_SERIES else ""))
         if SCAN_TOP_N > 0:
             log(f"open-scan tier: {SCAN_TOP_N} slots "
                 f"(ceiling {scan_ceiling()}), {SCAN_EVENT_TOP_N}/event, "
