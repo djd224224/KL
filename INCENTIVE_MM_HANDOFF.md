@@ -9579,3 +9579,37 @@ DEPLOY: a normal ff of KL, so incentive_mm.py's code-change exit restarts the
 bot with a handoff. That restart also loads rain_fair.py (imported in run())
 and the pending weekend-rain x1 (3b089a9). Live: run 192dde18 at 02:22:48Z
 (2,724 orders handed over); "rain-fair refresh: 33 stations ok" at 02:24:14Z.
+
+## 2026-10-10 ~02:35Z -- family watch survives a lost result line and a bot restart (Jack, of KXABBOTSFORDMAYOR / KXNBPCLEAD-26OCT17: "so these would have found an end date and quoted automatically?")
+
+ANSWER.
+- KXABBOTSFORDMAYOR: yes, untouched. Research dated it (and Coquitlam /
+  Delta / Revelstoke) 2026-10-17 at 01:21Z, and it quoted from 01:43Z.
+- KXNBPCLEAD (PC Party of NB leadership race): the bot listed the gap at
+  01:22Z, a minute after that run's research. I wrote it by hand at 01:35Z:
+  2026-10-17 @America/Moncton, from CBC + Radio-Canada.
+- Without that, the 02:20Z run would almost surely have dated it; that run
+  wrote KXALBERTAREFS and KXCZECHSENATE. The 01:50Z run was lost to the
+  host-wide network outage (first log line 02:09:45Z), and the bot's freeze
+  and restart (01:47-02:10Z) held DMON's admission to 02:20Z either way.
+
+TWO BUGS, FIXED.
+1. The 02:20Z research run wrote two rows but printed no RESULT_JSON line,
+   so all 8 targets were filed "unresolved -- no result" with the 2h
+   backoff. apply_results now checks each uncovered target against the rows
+   themselves (target_fixed):
+   - a row in place -> "written";
+   - else "error", retried after RESEARCH_ERROR_RETRY_H (0.5h).
+   A run with no result line logs the tail of its output.
+2. A bot restart starts config_gaps.json empty. The 02:09Z run saw no gaps
+   and dropped every research and alert record, so 02:20Z re-researched the
+   judgment calls (KXOBAMARALLY, KXLULAFLAVIODEBATE, the *LEADRUN-26) and
+   would have re-alerted them as new.
+   - Records now outlive an item's absence for STATE_GRACE_HOURS (6,
+     IMM_WATCH_STATE_GRACE_H) in both due_alerts and prune_research.
+   - An item that comes back keeps its first / alerted / attempts.
+   - Tonight's records were already lost: the six judgment calls get one
+     more research pass at ~04:24Z, and OBAMARALLY may re-alert once.
+
+Tests: TestResearchResilience 3; the drop test updated for the grace.
+Suite 2,389 OK.

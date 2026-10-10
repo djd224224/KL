@@ -63,6 +63,11 @@ GAP_REALERT_HOURS = float(os.environ.get("IMM_GAP_REALERT_HOURS", "24"))
 # median est_frac of the quoted rows of 10/07's cycle log (p25 0.010, p75 0.042)
 GAP_CAPTURE = float(os.environ.get("IMM_GAP_CAPTURE", "0.022"))
 STATE_FILE = os.path.join(imm.STATUS_DIR, "family_watch_state.json")
+# how long an alert / research record outlives its item's absence from the
+# bot's gaps file (2026-10-10: a bot restart empties the file for a refresh
+# or two; the 02:09Z run then dropped every record, and 02:20Z re-researched
+# two judgment calls and would have re-alerted them as new)
+STATE_GRACE_HOURS = float(os.environ.get("IMM_WATCH_STATE_GRACE_H", "6"))
 
 US_ELECTION_TAGS = frozenset({"US Elections", "Other US Elections"})
 US_GENERAL_2026 = "2026-11-03"
@@ -232,8 +237,11 @@ def due_alerts(state_items: Dict[str, dict], items: Dict[str, dict], now_ts: flo
     """(the items to email now [(key, item, minutes dark)], the new state).
     An item is tracked from first sight; it is due once it has been dark
     after_min and is worth min_dpd, then again every realert_hours while it
-    stays open -- except new:<series>, which is sent once. Items no longer
-    present drop out of the state (fixed, or gone)."""
+    stays open -- except new:<series>, which is sent once. An item no
+    longer present keeps its record for STATE_GRACE_HOURS (a bot restart
+    empties config_gaps.json until its first refresh re-meets the gaps:
+    2026-10-10 02:09Z), so one that comes back is not new; then it drops
+    out (fixed, or gone)."""
     after_min = GAP_ALERT_AFTER_MIN if after_min is None else after_min
     min_dpd = GAP_ALERT_MIN_DPD if min_dpd is None else min_dpd
     realert_hours = GAP_REALERT_HOURS if realert_hours is None else realert_hours
@@ -242,7 +250,7 @@ def due_alerts(state_items: Dict[str, dict], items: Dict[str, dict], now_ts: flo
         prev = state_items.get(key) or {}
         first = float(prev.get("first") or now_ts)
         alerted = prev.get("alerted")
-        rec = {"first": first, "alerted": alerted, "est": it["est"]}
+        rec = {"first": first, "alerted": alerted, "est": it["est"], "seen": now_ts}
         dark_min = (now_ts - first) / 60.0
         if not it.get("hold") and it["est"] >= min_dpd and dark_min >= after_min and (
                 alerted is None or (not key.startswith("new:")
@@ -250,6 +258,10 @@ def due_alerts(state_items: Dict[str, dict], items: Dict[str, dict], now_ts: flo
             due.append((key, it, dark_min))
             rec["alerted"] = now_ts
         fresh[key] = rec
+    for key, rec in state_items.items():
+        if key not in fresh and now_ts - float(rec.get("seen") or rec.get("first") or 0) \
+                < STATE_GRACE_HOURS * 3600:
+            fresh[key] = rec
     return due, fresh
 
 
@@ -473,6 +485,9 @@ RESEARCH_MAX_TARGETS = int(os.environ.get("IMM_WATCH_RESEARCH_MAX", "8"))
 RESEARCH_TIMEOUT_SECS = int(os.environ.get("IMM_WATCH_RESEARCH_TIMEOUT", "720"))
 RESEARCH_BUDGET_USD = float(os.environ.get("IMM_WATCH_RESEARCH_BUDGET_USD", "3"))
 RESEARCH_BACKOFF_H = (2.0, 4.0, 8.0)        # after attempt 1, 2, 3+
+# a run that returned no result for a target (no RESULT_JSON entry, and no
+# row landed) is a failed run, not "not published yet": retry sooner
+RESEARCH_ERROR_RETRY_H = float(os.environ.get("IMM_WATCH_RESEARCH_ERROR_RETRY_H", "0.5"))
 RESEARCH_MAX_ATTEMPTS = int(os.environ.get("IMM_WATCH_RESEARCH_ATTEMPTS", "6"))
 # alert on a researchable item only once research gave up on it (a judgment
 # call, or unresolved twice) -- or when it has simply been dark this long
@@ -570,7 +585,8 @@ def research_due(rstate: Dict[str, dict], targets: Dict[str, dict], now_ts: floa
         if r.get("status") == "judgment" or n >= RESEARCH_MAX_ATTEMPTS:
             continue
         if n:
-            wait = RESEARCH_BACKOFF_H[min(n - 1, len(RESEARCH_BACKOFF_H) - 1)] * 3600
+            wait = (RESEARCH_ERROR_RETRY_H if r.get("status") == "error" else
+                    RESEARCH_BACKOFF_H[min(n - 1, len(RESEARCH_BACKOFF_H) - 1)]) * 3600
             if now_ts - float(r.get("last") or 0) < wait:
                 continue
         due.append(key)
@@ -684,12 +700,67 @@ def run_research(prompt: str) -> Tuple[str, float, str]:
         "" if p.returncode == 0 else f"exit {p.returncode}: {(p.stderr or '')[:200]}")
 
 
+def prune_research(rstate: Dict[str, dict], targets: Dict[str, dict],
+                   now_ts: float) -> Dict[str, dict]:
+    """The research records to keep: every current target's (stamped seen
+    now), and an absent one's for STATE_GRACE_HOURS after it was last seen --
+    a judgment call must not be re-researched because a bot restart hid its
+    gap for a run."""
+    out = {}
+    for k, v in rstate.items():
+        if k in targets:
+            out[k] = dict(v, seen=now_ts)
+        elif now_ts - float(v.get("seen") or v.get("last") or 0) < STATE_GRACE_HOURS * 3600:
+            out[k] = v
+    return out
+
+
+def target_fixed(t: dict) -> bool:
+    """Whether a research target's row / start time is now in place."""
+    ev = t["event"]
+    if t["kind"] == "election":
+        return imm.election_cutoff_utc(ev) is not None
+    if t["kind"] == "award":
+        return imm.awards_event_start(ev, None, dates_only=True) is not None
+    if t["kind"] == "start":
+        return ev in imm.EVENT_START_OVERRIDES
+    return False
+
+
+def apply_results(rstate: Dict[str, dict], due: List[str], targets: Dict[str, dict],
+                  res: Dict[str, dict], err: str, now_ts: float) -> List[str]:
+    """Record one research run for each due target. A target the RESULT_JSON
+    line does not cover is checked against the rows themselves (2026-10-10
+    02:24Z: the run wrote KXALBERTAREFS and KXCZECHSENATE but printed no
+    result line, and all 8 were filed "unresolved -- no result"): a row in
+    place is "written"; otherwise the run failed for it -- "error", retried
+    after RESEARCH_ERROR_RETRY_H."""
+    imm.load_election_dates_extra()
+    imm.load_awards_dates_extra()
+    imm.load_file_event_overrides()
+    notes = []
+    for k in due:
+        r = rstate.setdefault(k, {})
+        r["attempts"] = int(r.get("attempts") or 0) + 1
+        r["last"] = r["seen"] = now_ts
+        got = res.get(k) or {}
+        status, note = got.get("status"), got.get("note") or ""
+        if status not in ("written", "judgment", "unresolved"):
+            if target_fixed(targets[k]):
+                status, note = "written", "row in place after the run (no result line)"
+            else:
+                status, note = "error", (err or "no result line for this target")
+        r["status"], r["note"] = status, note[:300]
+        notes.append(f"{k}: {status} -- {r['note']}")
+    return notes
+
+
 def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str, dict], List[str]]:
     """Collect targets, research the due ones, update state["research"].
     Returns (targets, summary lines)."""
     now_ts = time.time()
     targets = research_targets(client, gaps, datetime.now(timezone.utc), dry)
-    rstate = {k: v for k, v in (state.get("research") or {}).items() if k in targets}
+    rstate = prune_research(state.get("research") or {}, targets, now_ts)
     pools = event_pools(ifa.fetch_active_programs(client)) if targets else {}
     est = {k: pools.get(t["event"], 0.0) * GAP_CAPTURE for k, t in targets.items()}
     due = research_due(rstate, targets, now_ts, est)
@@ -699,15 +770,9 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
                  for k in due]
         text, cost, err = run_research(research_prompt(items))
         res = parse_research(text)
-        for k in due:
-            r = rstate.setdefault(k, {})
-            r["attempts"] = int(r.get("attempts") or 0) + 1
-            r["last"] = now_ts
-            got = res.get(k) or {}
-            r["status"] = got.get("status") if got.get("status") in (
-                "written", "judgment", "unresolved") else "unresolved"
-            r["note"] = (got.get("note") or err or "no result")[:300]
-            notes.append(f"{k}: {r['status']} -- {r['note']}")
+        if not res:
+            notes.append(f"research: no RESULT_JSON line; ends {(text or err)[-240:]!r}")
+        notes += apply_results(rstate, due, targets, res, err, now_ts)
         notes.append(f"research: {len(due)} target(s), ${cost:.2f}" + (f", {err}" if err else ""))
     elif due:
         notes.append(f"research due ({'dry' if dry else 'disabled'}): {', '.join(due)}")

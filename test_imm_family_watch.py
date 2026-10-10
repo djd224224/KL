@@ -178,8 +178,15 @@ class TestGapAlert(unittest.TestCase):
         self.assertEqual(due, [])                                     # sent already
         due, st = fw.due_alerts(st, items, t + 25 * 3600)
         self.assertEqual([k for k, _, _ in due], ["gap:KXA-26"])      # daily; new: once
-        # fixed: drops out of the state
+        # gone from the gaps file: the record outlives it for the grace period
+        # (a bot restart empties the file for a refresh), so a return is not new
         due, st = fw.due_alerts(st, {"new:KXNEW": items["new:KXNEW"]}, t + 26 * 3600)
+        self.assertEqual(set(st), {"gap:KXA-26", "gap:KXB-26", "new:KXNEW"})
+        due, st = fw.due_alerts(st, items, t + 26.5 * 3600)
+        self.assertEqual(due, [])                                     # back: not re-sent
+        # gone past the grace: dropped (fixed, or gone)
+        later = t + 26.5 * 3600 + (fw.STATE_GRACE_HOURS + 0.1) * 3600
+        due, st = fw.due_alerts(st, {"new:KXNEW": items["new:KXNEW"]}, later)
         self.assertEqual(set(st), {"new:KXNEW"})
 
     def test_alert_body_names_value_age_and_fix(self):
@@ -545,6 +552,57 @@ class TestRealEstimates(unittest.TestCase):
         self.assertIn("~$6.00/day (pool proxy)", body)
         self.assertNotIn("per event:", body)               # one event: no breakdown
         self.assertIn("no $1/market floor", body)
+
+
+class TestResearchResilience(unittest.TestCase):
+    """2026-10-10: a research run that wrote rows but printed no RESULT_JSON
+    line, and a bot restart that emptied the gaps file for a run."""
+
+    T = {"gap:KXALBERTAREFS-26OCT19": {"kind": "election", "event": "KXALBERTAREFS-26OCT19",
+                                       "series": "KXALBERTAREFS", "msg": "m"},
+         "gap:KXOBAMARALLY-26NOV03": {"kind": "election", "event": "KXOBAMARALLY-26NOV03",
+                                      "series": "KXOBAMARALLY", "msg": "m"}}
+
+    def test_no_result_line_is_checked_against_the_rows(self):
+        from unittest import mock
+        dated = lambda ev, market=None: (datetime(2026, 10, 19, 6, tzinfo=timezone.utc)
+                                         if ev == "KXALBERTAREFS-26OCT19" else None)
+        rstate = {}
+        with mock.patch.object(fw.imm, "election_cutoff_utc", dated), \
+                mock.patch.object(fw.imm, "load_election_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_awards_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_file_event_overrides", lambda: 0):
+            fw.apply_results(rstate, list(self.T), self.T, {}, "", 1_800_000_000.0)
+        self.assertEqual(rstate["gap:KXALBERTAREFS-26OCT19"]["status"], "written")
+        self.assertEqual(rstate["gap:KXOBAMARALLY-26NOV03"]["status"], "error")
+        # an error retries after half an hour, not the 2h backoff
+        t = 1_800_000_000.0
+        self.assertEqual(fw.research_due(rstate, self.T, t + 0.4 * 3600), [])
+        self.assertEqual(fw.research_due(rstate, self.T, t + 0.6 * 3600),
+                         ["gap:KXOBAMARALLY-26NOV03"])
+
+    def test_a_result_line_still_wins(self):
+        from unittest import mock
+        rstate = {}
+        res = {"gap:KXOBAMARALLY-26NOV03": {"status": "judgment", "note": "a rally"}}
+        with mock.patch.object(fw.imm, "election_cutoff_utc", lambda ev, market=None: None), \
+                mock.patch.object(fw.imm, "load_election_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_awards_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_file_event_overrides", lambda: 0):
+            fw.apply_results(rstate, ["gap:KXOBAMARALLY-26NOV03"], self.T, res, "", 1.0)
+        self.assertEqual(rstate["gap:KXOBAMARALLY-26NOV03"]["status"], "judgment")
+
+    def test_research_records_outlive_a_restart_blip(self):
+        t = 1_800_000_000.0
+        rstate = {"gap:KXOBAMARALLY-26NOV03": {"attempts": 1, "status": "judgment",
+                                               "last": t - 86400, "seen": t}}
+        kept = fw.prune_research(rstate, {}, t + 600)                 # gaps file empty
+        self.assertEqual(set(kept), {"gap:KXOBAMARALLY-26NOV03"})
+        self.assertEqual(fw.research_due(kept, self.T, t + 1200), ["gap:KXALBERTAREFS-26OCT19"])
+        gone = fw.prune_research(rstate, {}, t + (fw.STATE_GRACE_HOURS + 0.1) * 3600)
+        self.assertEqual(gone, {})
+        back = fw.prune_research(rstate, self.T, t + 7200)
+        self.assertEqual(back["gap:KXOBAMARALLY-26NOV03"]["seen"], t + 7200)
 
 
 if __name__ == "__main__":
