@@ -9527,3 +9527,19 @@ DEPLOY: written into KL with incentive_mm.py's mtime preserved (no restart).
 LIVE AT THE NEXT RESTART. Nothing is lost in between: KXRAINWKND-26OCT10
 stopped quoting at 00:00 ET Saturday (its cutoff), and the next weekend
 event lists Thursday 10/15.
+
+## 2026-10-10 ~02:10Z — sweep-breaker holdout 20% -> 5% (Jack: "cut the holdout to 5%. keep the breaker.")
+
+The 10/9 check (by hand; the imm-sweep-breaker-check routine was deleted at
+Jack's ask after its runs stalled on permission prompts), cumulative 10/4
+23:10Z - 10/10 00:47Z:
+- 1,249 live / 318 control trips, 50 control trips with fills.
+- Net +$66/day at 5m and +$80/day at 30m, after ~$5.5/day of reward.
+- Bootstrap 90% CI at 5m: +$18 to +$128.
+- Lumpy: the top 2 control trips are 61% of the avoided loss (KXAPRPOTUS
+  10/8 $41, KXRAIN-26OCT10 $25). Without the biggest: +$38/+$48.
+
+At 20% the control trips were costing ~$17-20/day of pickoffs a pull would
+have stopped. IMM_SWEEP_HOLDOUT=0.05 keeps a thin control (~15 trips/day)
+for the scorer. Hold, scope and trigger are unchanged.
+

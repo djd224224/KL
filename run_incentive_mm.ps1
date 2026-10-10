@@ -369,11 +369,14 @@ if ($Probe) {
     # pulled for IMM_SWEEP_HOLD_SECS=120.
     # Backtest 9/6-10/4 for this setting: +$21/day at 5m mark-outs and +$30 at
     # 30m, net of ~$4/day of reward.
-    # IMM_SWEEP_HOLDOUT=0.2: a random 20% of trips stay a DRY CONTROL. Once
-    # live, a pull hides the losses it prevents, and the control trips show
-    # them. ws_stale_score.py nets the live trips against them ("LIVE,
-    # netted against its control trips"), and a daily task reports it. Set
-    # the holdout to 0 once it has proven out.
+    # IMM_SWEEP_HOLDOUT=0.05 (Jack 2026-10-10: "cut the holdout to 5%. keep
+    # the breaker."): a random 5% of trips stay a DRY CONTROL (20% until
+    # then). A live pull hides the losses it prevents; the control trips show
+    # them, and ws_stale_score.py nets the live trips against them ("LIVE,
+    # netted against its control trips"). 10/4-10/9 at 20%: net +$66/day
+    # (5m) and +$80 (30m) over 1,249 live / 318 control trips (50 with
+    # fills); lumpy (top 2 trips 61%), +$38/+$48 without the biggest. The 20%
+    # control was costing ~$17-20/day of pickoffs; 5% keeps a thin read.
     # BACK OUT: IMM_SWEEP_BREAKER=dry here, then restart_imm.ps1 -Task.
     # WEBSOCKET CANDIDATE BOOKS -- ON (Jack 2026-10-09: "set
     # IMM_WS_CANDIDATES=on to minimize time that isnt quoting"). The universe
@@ -391,7 +394,7 @@ if ($Probe) {
     # off, so nothing is cancelled. Before any live flip, exempt families
     # that lead thin books by design (Carbon Arc: 2,991 of 4,349 gated
     # episodes on 10/4-10/8, 0 hits).
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=120&& set IMM_SWEEP_HOLDOUT=0.2&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=2.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-05&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=120&& set IMM_SWEEP_HOLDOUT=0.05&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
 }
 
 while ($true) {
