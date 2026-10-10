@@ -10957,6 +10957,47 @@ class TestCarbonArcFairGate(unittest.TestCase):
             self._write_fair({"KXFAKECC": dict(vague, mu=61.6)})
             self.assertIsNone(imm.ca_fair_band(t, time.time()))
 
+    def _et(self, h, m=0):
+        return imm.ET.localize(datetime(2026, 10, 12, h, m)).astimezone(timezone.utc)
+
+    def test_one_x_while_the_category_data_lands(self):
+        # Jack 2026-10-10: "reduce carbon arc families to only be at 1x in
+        # their regular window of when new data lands" -- that morning every
+        # Carbon Arc market quoted x6 (quiet-hours x3 x Saturday x2) through
+        # the point-of-sale / foot-traffic drops
+        self.assertEqual(imm.ca_category("KXFAKECC"), "credit card")   # by suffix
+        self.assertIsNone(imm.ca_category("KXNOTCACC"))                # not Carbon Arc
+        self.assertTrue(imm.ca_landing_window("KXFAKECC", self._et(12)))
+        self.assertFalse(imm.ca_landing_window("KXFAKECC", self._et(16)))
+        self.assertFalse(imm.ca_landing_window("KXNOTCACC", self._et(12)))
+        with mock.patch.object(imm, "_hour_window_mult", lambda s, now: 3.0), \
+                mock.patch.object(imm, "saturday_size_mult", lambda s, now: 2.0):
+            self.assertEqual(imm.hour_size_mult("KXFAKECC", self._et(12)), 1.0)
+            self.assertEqual(imm.hour_size_mult("KXFAKECC", self._et(16)), 6.0)
+            self.assertEqual(imm.hour_size_mult("KXNOTCACC", self._et(12)), 6.0)
+        with mock.patch.object(imm, "_hour_window_mult", lambda s, now: 0.5):
+            self.assertEqual(imm.hour_size_mult("KXFAKECC", self._et(12)), 0.5)   # a cut stays
+
+    def test_ad_spend_window_wraps_midnight_and_the_read_sets_the_category(self):
+        self._write_fair({"KXFAKECC": dict(self._entry(100.0), category="Advertising")})
+        self.assertEqual(imm.ca_category("KXFAKECC"), "advertising")
+        for h, inside in ((23, True), (3, True), (5, True), (7, False),
+                          (12, True), (16, False)):
+            self.assertEqual(imm.ca_landing_window("KXFAKECC", self._et(h)), inside, h)
+
+    def test_per_market_boosts_are_off_inside_the_window(self):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        bot._yield_boost[self.T] = 1.0
+        bot._near_cliff_boost[self.T] = 1.0
+        with mock.patch.object(imm, "yield_size_active", lambda *a: True), \
+                mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.5), \
+                mock.patch.object(imm, "ca_landing_window", lambda s, now: True):
+            self.assertEqual(bot._market_size_mult(self.T), 1.0)
+        with mock.patch.object(imm, "yield_size_active", lambda *a: True), \
+                mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.5), \
+                mock.patch.object(imm, "ca_landing_window", lambda s, now: False):
+            self.assertEqual(bot._market_size_mult(self.T), 1.5 * imm.YIELD_SIZE_MULT)
+
     def test_ad_spend_holds_an_hour_after_a_new_read(self):
         # Jack 2026-10-10: the sweep came 47 min - 3 h after the 02:32 ET
         # read; ad spend holds 60 min, the other categories keep 10

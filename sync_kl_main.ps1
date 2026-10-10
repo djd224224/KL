@@ -11,10 +11,12 @@ New-Item -ItemType Directory -Force (Split-Path $Log) | Out-Null
 
 $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 # THE FETCH IS CHECKED, NOT DISCARDED (Jack 2026-10-10: "yes fix the sync
-# logging"). Its output used to go to Out-Null, so a failing fetch left
-# origin/main stale and the merge below logged "Already up to date". From
-# 23:45 ET 10/09 that line repeated for 8 hours while two pushed commits never
-# reached KL. Now a failed fetch logs its exit code and git's message, and
+# logging"). Its output used to go to Out-Null, so a failing fetch would leave
+# origin/main stale and the merge below would still log "Already up to date"
+# -- a broken sync read exactly like a healthy one. (The 10/10 scare that
+# prompted this was not one: 3ffa643/8641439 were committed 23:30 ET 10/09 but
+# only pushed at 07:26 ET 10/10, so the overnight "Already up to date" lines
+# were true.) Now a failed fetch logs its exit code and git's message, and
 # every run cross-checks KL's HEAD against what GitHub actually has (ls-remote),
 # so a stale sync can't read as healthy. Problem lines start with "!".
 $fetchOut = (git -C $Repo fetch origin 2>&1 | ForEach-Object { "$_" }) -join ' | '

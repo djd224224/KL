@@ -9972,3 +9972,53 @@ Tests: TestCarbonArcFairGate.test_ad_spend_and_apps_gate_through_a_vague_read
 and .test_ad_spend_holds_an_hour_after_a_new_read. test_incentive_mm 1171 OK.
 
 DEPLOY: ff KL; the code-change exit restarts the bot (handoff).
+
+## 2026-10-10 ~12:40Z — Carbon Arc quotes 1x while its data lands (Jack: "reduce carbon arc families to only be at 1x in their regular window of when new data lands")
+
+WHY. At the 11:38Z refresh (Saturday 07:38 ET) every Carbon Arc market ran at
+est_hour_mult 6.0 (quiet-hours x3 x Saturday x2), and 17 of them also had the
+yield x1.5. The point-of-sale and foot-traffic reads land at 07-08 ET, so
+those drops met x6-x9 rungs. The 10/10 ad-spend sweep (-$424, entry above) hit
+x3 overnight rungs.
+
+WHAT. CA_LANDING_WINDOWS (IMM_CA_LANDING_WINDOWS, "cat=a-b+c-d;...", ET hours,
+[start, end), wraps midnight; "" turns it off). Inside its category's window
+a Carbon Arc market quotes at 1x:
+- hour_size_mult() caps at 1.0, so there is no quiet-hours x3, Saturday x2 or
+  evening x1.5. A cut below 1.0 is kept.
+- _yield_size_mult() and _near_cliff_size_mult() return 1.0.
+Outside the windows nothing changes.
+
+Default windows (ET; each is the landing hours plus ~2h for takers):
+- point of sale 07-10 (lands 07-08h);
+- foot traffic 08-11 (~08h);
+- app 08-12 (mostly 08-10h; the rarer 04-06h and afternoon drops are not
+  covered);
+- credit card 11-15 (11-14h);
+- advertising 21-06 and 11-14 (02h, 21h and 11h drops). Ad spend therefore
+  gives up the overnight x3 entirely.
+
+The category comes from the read (carbon_arc_fair.json "category") and falls
+back to the ticker suffix (ADS / APP / POS / FT / CC). Only
+carbon_arc_settled() series qualify, so a non-Carbon-Arc series ending in CC
+is untouched. No Carbon Arc series carries a family size_mult (checked: 0 of
+115 overrides), so with these caps every CA rung is base size inside its
+window.
+
+Startup line: "ca 1x while data lands (2026-10-10): ...". Config hash covers
+CA_LANDING_WINDOWS.
+
+Tests (TestCarbonArcFairGate):
+- .test_one_x_while_the_category_data_lands
+- .test_ad_spend_window_wraps_midnight_and_the_read_sets_the_category
+- .test_per_market_boosts_are_off_inside_the_window
+test_incentive_mm 1174 OK.
+
+ALSO: a correction to the 6350804 sync-logging entry. The "sync silently
+failed for 8 hours" diagnosis was WRONG. 3ffa643 and 8641439 were committed at
+23:30 ET 10/09 but first pushed at 07:26 ET 10/10 (KL reflog: "update by
+push"), so the overnight "Already up to date" lines were true. The logging fix
+stands on its own, since a failing fetch used to read exactly like a healthy
+one. Only the comment in sync_kl_main.ps1 changed.
+
+DEPLOY: ff KL; the code-change exit restarts the bot (handoff).

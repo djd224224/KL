@@ -1865,14 +1865,82 @@ def _share_x1(series: str) -> bool:
     return series in globals().get("SHARE_FAIR_SERIES", ())
 
 
+# CARBON ARC AT 1x WHILE ITS DATA LANDS (Jack 2026-10-10: "reduce carbon arc
+# families to only be at 1x in their regular window of when new data lands").
+# Each Carbon Arc category refreshes at its own time of day (the prisms'
+# last_refreshed_at, 9/27-10/10, ET):
+#   point of sale  07-08h (12 of 13 drops)   foot traffic ~08h (12 of 16)
+#   apps           mostly 08-10h             card spend   11-14h (all 18)
+#   ad spend       02h x2, 21h, 11h x2 (lumps every 1-5 days)
+# and the informed flow trades the new read within hours: on 10/10 the
+# ad-spend read landed 02:32 ET and the sweep ran 03:20-05:43 (-$424), every
+# rung 120-150 lots because the quiet-hours x3 (00-08h ET) was on. That
+# morning every Carbon Arc market quoted at x6 (x3 quiet hours x Saturday x2)
+# straight through the point-of-sale and foot-traffic drops. Inside its
+# category's window a Carbon Arc market is at 1x: the hour / Saturday
+# multipliers are capped at 1 here, and the per-market boosts (yield x1.5,
+# near-cliff) are off in the bot (ca_landing_window). The windows are the
+# landing hours plus ~2h for the reaction, [start, end) in ET hours; a window
+# may wrap midnight. IMM_CA_LANDING_WINDOWS: "category=a-b+c-d;..." (prism
+# categories, lowercased); empty = off.
+_DEFAULT_CA_LANDING_WINDOWS = ("point of sale=7-10;foot traffic=8-11;app=8-12;"
+                               "credit card=11-15;advertising=21-6+11-14")
+CA_LANDING_WINDOWS: Dict[str, List[Tuple[int, int]]] = {}
+for _part in os.environ.get("IMM_CA_LANDING_WINDOWS", _DEFAULT_CA_LANDING_WINDOWS).split(";"):
+    if "=" not in _part:
+        continue
+    _cat, _spans = _part.split("=", 1)
+    for _span in _spans.split("+"):
+        try:
+            _a, _b = (int(x) % 24 for x in _span.split("-", 1))
+        except ValueError:
+            continue
+        CA_LANDING_WINDOWS.setdefault(_cat.strip().lower(), []).append((_a, _b))
+# a series with no read yet is categorised by its ticker suffix
+_CA_SUFFIX_CATEGORY = (("ADS", "advertising"), ("APP", "app"),
+                       ("POS", "point of sale"), ("FT", "foot traffic"),
+                       ("CC", "credit card"))
+
+
+def ca_category(series: str) -> Optional[str]:
+    """The Carbon Arc category of a Carbon Arc-settled series (lowercased
+    prism category, else its suffix's), or None."""
+    if not carbon_arc_settled(series):
+        return None
+    e = (globals().get("_ca_fair_state") or {}).get("entries", {}).get(series)
+    if e and e.get("category"):
+        return str(e["category"]).strip().lower()
+    for suf, cat in _CA_SUFFIX_CATEGORY:
+        if series.endswith(suf):
+            return cat
+    return None
+
+
+def ca_landing_window(series: str, now_utc: datetime) -> bool:
+    """True while `series` is a Carbon Arc series inside its category's data
+    landing window (CA_LANDING_WINDOWS)."""
+    if not CA_LANDING_WINDOWS:
+        return False
+    cat = ca_category(series)
+    if not cat or cat not in CA_LANDING_WINDOWS:
+        return False
+    h = now_utc.astimezone(ET).hour
+    return any((a <= h < b) if a < b else (h >= a or h < b)
+               for a, b in CA_LANDING_WINDOWS[cat])
+
+
 def hour_size_mult(series: str, now_utc: datetime) -> float:
     """Active ladder multiplier for this series at this instant: the
     hour-of-day window (global or per-series) times the Saturday multiplier;
     1.0 when neither applies, and always for the OpenRouter market-share
-    family (_share_x1)."""
+    family (_share_x1). Capped at 1 for a Carbon Arc series inside its data
+    landing window (CA_LANDING_WINDOWS)."""
     if _share_x1(series):
         return 1.0
-    return _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
+    m = _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
+    if m > 1.0 and ca_landing_window(series, now_utc):
+        return 1.0
+    return m
 
 
 # Mention-family ladder multiplier. Jack 2026-07-28: x1.5 ("raise any caps
@@ -7576,6 +7644,7 @@ _CONFIG_CODE_KNOBS = (
     "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
     "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
     "CA_FAIR_REL_SIGMA_EXEMPT", "CA_FAIR_REFRESH_HOLD_BY_CAT",   # ADS / apps (2026-10-10)
+    "CA_LANDING_WINDOWS",          # Carbon Arc 1x while data lands (2026-10-10)
     "CA_FAIR_CAP",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
     # fair file's "model" block (openrouter_fair.py)
@@ -16807,13 +16876,21 @@ class IncentiveMarketMaker:
         or the market leaves the selection), else 1.0."""
         if NEAR_CLIFF_SIZE_MULT <= 0 or NEAR_CLIFF_SIZE_MULT == 1.0:
             return 1.0
-        return NEAR_CLIFF_SIZE_MULT if ticker in self._near_cliff_boost else 1.0
+        if ticker not in self._near_cliff_boost:
+            return 1.0
+        # a Carbon Arc market is 1x while its data lands (CA_LANDING_WINDOWS)
+        if ca_landing_window(series_of(ticker), datetime.now(timezone.utc)):
+            return 1.0
+        return NEAR_CLIFF_SIZE_MULT
 
     def _yield_size_mult(self, ticker: str) -> float:
-        """YIELD_SIZE_MULT while `ticker` is in the yield size mode, else 1.0."""
-        if not yield_size_active():
+        """YIELD_SIZE_MULT while `ticker` is in the yield size mode, else 1.0
+        (and 1.0 for a Carbon Arc market inside its data landing window)."""
+        if not yield_size_active() or ticker not in self._yield_boost:
             return 1.0
-        return YIELD_SIZE_MULT if ticker in self._yield_boost else 1.0
+        if ca_landing_window(series_of(ticker), datetime.now(timezone.utc)):
+            return 1.0
+        return YIELD_SIZE_MULT
 
     def _market_size_mult(self, ticker: str) -> float:
         """Every PER-MARKET ladder multiplier: near-cliff size mode x yield size
@@ -23077,6 +23154,11 @@ class IncentiveMarketMaker:
                 + ("caps the side (rests only while it earns)" if CA_FAIR_CAP
                    else "parks both sides")
                 + f", file {CA_FAIR_FILE}")
+            if CA_LANDING_WINDOWS:
+                log("ca 1x while data lands (2026-10-10): "
+                    + "; ".join(f"{c} " + "+".join(f"{a:02d}-{b:02d}h" for a, b in w)
+                                for c, w in sorted(CA_LANDING_WINDOWS.items()))
+                    + " ET -- no hour / Saturday / yield / near-cliff boost inside")
         if OR_FAIR_ENABLE:
             log(f"or-fair gate: {','.join(sorted(OR_FAIR_SERIES))} fail-closed "
                 f"at-touch, tol {OR_FAIR_TOL_CENTS}c, band sigma "
