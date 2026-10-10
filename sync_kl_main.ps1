@@ -10,9 +10,42 @@ $Log = Join-Path $Repo "run-logs\sync-kl-main.log"
 New-Item -ItemType Directory -Force (Split-Path $Log) | Out-Null
 
 $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-git -C $Repo fetch origin 2>&1 | Out-Null
-$out = (git -C $Repo merge --ff-only origin/main 2>&1) -join ' | '
-"$stamp $out" | Add-Content -Path $Log -Encoding utf8
+# THE FETCH IS CHECKED, NOT DISCARDED (Jack 2026-10-10: "yes fix the sync
+# logging"). Its output used to go to Out-Null, so a failing fetch left
+# origin/main stale and the merge below logged "Already up to date". From
+# 23:45 ET 10/09 that line repeated for 8 hours while two pushed commits never
+# reached KL. Now a failed fetch logs its exit code and git's message, and
+# every run cross-checks KL's HEAD against what GitHub actually has (ls-remote),
+# so a stale sync can't read as healthy. Problem lines start with "!".
+$fetchOut = (git -C $Repo fetch origin 2>&1 | ForEach-Object { "$_" }) -join ' | '
+$fetchRc = $LASTEXITCODE
+if ($fetchRc -ne 0) {
+    "$stamp ! FETCH FAILED (exit $fetchRc): $fetchOut" | Add-Content -Path $Log -Encoding utf8
+}
+$branch = (git -C $Repo branch --show-current 2>&1 | ForEach-Object { "$_" }) -join ''
+$out = (git -C $Repo merge --ff-only origin/main 2>&1 | ForEach-Object { "$_" }) -join ' | '
+$mergeRc = $LASTEXITCODE
+$mark = if ($mergeRc -ne 0) { "! MERGE FAILED (exit $mergeRc): " } else { "" }
+$onBranch = if ($branch -and $branch -ne 'main') { " [! KL is on branch '$branch', not main]" } else { "" }
+"$stamp $mark$out$onBranch" | Add-Content -Path $Log -Encoding utf8
+# what GitHub has vs what KL runs (a fetch that "worked" but left KL behind
+# shows up here too)
+$remoteLine = (git -C $Repo ls-remote origin refs/heads/main 2>&1 | ForEach-Object { "$_" }) -join ' | '
+$lsRc = $LASTEXITCODE
+$head = (git -C $Repo rev-parse HEAD 2>&1 | ForEach-Object { "$_" }) -join ''
+if ($lsRc -ne 0) {
+    "$stamp ! ls-remote FAILED (exit $lsRc): $remoteLine" | Add-Content -Path $Log -Encoding utf8
+} else {
+    $remoteSha = ($remoteLine -split '\s+')[0]
+    if ($remoteSha -and $head -and $remoteSha -ne $head) {
+        $isAncestor = $false
+        git -C $Repo merge-base --is-ancestor $remoteSha $head 2>$null
+        if ($LASTEXITCODE -eq 0) { $isAncestor = $true }
+        if (-not $isAncestor) {
+            "$stamp ! BEHIND origin: GitHub main is $($remoteSha.Substring(0,7)), KL runs $($head.Substring(0,7))" | Add-Content -Path $Log -Encoding utf8
+        }
+    }
+}
 
 # One-time bootstrap: the first sync after register_dashboard_task.ps1 lands,
 # register the daily 7 AM dashboard rebuild and kick its first run — so the
