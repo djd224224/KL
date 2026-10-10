@@ -75,6 +75,7 @@ import smtplib
 import threading
 import sys
 import time
+import traceback
 import uuid
 import zlib
 from collections import deque
@@ -83,6 +84,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import pytz
 import requests
@@ -3008,6 +3010,66 @@ WAKE_GAP_SECS = 600
 # heartbeat lands for this long; the launcher relaunches within 30s, and the
 # per-placement journal + persisted halt/carry make a hard exit safe.
 CYCLE_HANG_EXIT_SECS = _env_int("IMM_CYCLE_HANG_EXIT", 600)
+# WEDGE STACKS (2026-10-09 audit). The watchdog fired twice in network
+# trouble (10/09 12:54Z, 10/10 01:57Z) with no trace of the hanging call --
+# background threads kept logging, only the cycle stopped. Now every thread's
+# Python stack goes to STATUS_DIR/wedge_<utc>.txt twice: at
+# CYCLE_HANG_DUMP_SECS without a heartbeat (0 = off) and again at the exit.
+# The same main-thread frames in both = one call wedged; different frames =
+# a slow loop. The log line names the main thread's innermost frames. A
+# heartbeat that comes back after the first snapshot is logged as a slow
+# phase. Stacks come from sys._current_frames(), not faulthandler: faulthandler
+# writes while holding the GIL, so a stalled disk would freeze every thread.
+# Each tick's file writes and log lines run on a helper thread that is given
+# at most WEDGE_IO_TIMEOUT_SECS, so a stalled disk can delay the exit but
+# never block it. 360s clears a restart's first cycle: its refresh ran
+# 167-225s on the WS candidate books (10/10), 297s on REST (10/9 19:56Z).
+CYCLE_HANG_DUMP_SECS = _env_int("IMM_CYCLE_HANG_DUMP", 360)
+HANG_WATCHDOG_TICK_SECS = 30
+WEDGE_IO_TIMEOUT_SECS = 20.0
+# WATCHDOG HANDOFF (2026-10-09 audit). The hard exit skipped the order
+# handoff, so the relaunch cancelled every leftover order and rebuilt at the
+# placement cap: 10/10 01:57Z, 1,989 orders cancelled by 02:07Z on the bad
+# network, book back ~02:16Z. Now the exit hands the book over the way a
+# planned restart does, from memory only (no network: the wedged main
+# thread may hold the client, and the network may be the trouble). It keeps
+# the ledger's orders that _restart_keep_ok passes and lists them in the
+# handoff. The relaunch cancels every other resting imm- order before it
+# adopts the rest: gated, fast-lane, near-cutoff or unselected markets, plus
+# anything placed during the hang. Refused, so the relaunch cancels as before,
+# when the bot is halted, when no full cycle has completed in this process
+# (a relaunch that wedges on its first cycle must not keep re-adopting
+# an unpriced book), or when the hang outran the exit by more than
+# WATCHDOG_HANDOFF_SLACK_SECS (the watchdog itself was starved; the book is
+# too old to keep). IMM_WATCHDOG_HANDOFF=0 restores cancel-everything.
+WATCHDOG_HANDOFF = os.environ.get("IMM_WATCHDOG_HANDOFF", "1") == "1"
+WATCHDOG_HANDOFF_SLACK_SECS = 120
+# MAIN-THREAD NETWORK BOUNDS (2026-10-09 audit). The trading client's shared
+# defaults: a (5s connect, 20s read) timeout, 3 tries per GET with 1s + 3s
+# backoff, and up to 2 connect retries per try inside the session. A GET
+# could take ~110s before it failed. The bot's own client (main() ->
+# bound_trading_client) now uses a 10s read timeout and 2 GET tries (one
+# retry): ~50s worst case per GET, ~25s per write. A failed read costs one
+# cycle, and the cycle loop is the retry. Other bots and the offline tools
+# that call build_client keep the shared defaults. DNS lookups (getaddrinfo)
+# still have no timeout anywhere in Python; the wedge stacks will show if
+# that is the hang.
+HTTP_CONNECT_TIMEOUT_SECS = _env_float("IMM_HTTP_CONNECT_TIMEOUT", 5.0)
+HTTP_READ_TIMEOUT_SECS = _env_float("IMM_HTTP_READ_TIMEOUT", 10.0)
+HTTP_GET_ATTEMPTS = max(1, _env_int("IMM_HTTP_GET_ATTEMPTS", 2))
+# CANDIDATE REST BUDGET (same audit). Pass 2 of the universe refresh reads
+# one book per candidate (~2,500). Since 10/9 the WS feed serves them, but a
+# feed that is down, not ready or audit-tripped sends every read to REST,
+# with no heartbeat touch until the cycle's first write. 9/27 01:09Z, the
+# first refresh after a start took ~10 minutes on a bad network and the
+# watchdog fired 6s after its universe line. 10/09 12:44Z (REST candidates),
+# pass 2 was on pace at 12:46:48 and never finished. Now pass 2 stops
+# reading REST after CAND_REST_BUDGET_SECS, or after CAND_REST_MAX_FAILS
+# network failures in a row (0 = that bound off). Feed books are still read.
+# An unread candidate is what one failed read always was: a member rides
+# through (sticky), a fresh one waits for the next refresh.
+CAND_REST_BUDGET_SECS = _env_float("IMM_CAND_REST_BUDGET_SECS", 300.0)
+CAND_REST_MAX_FAILS = _env_int("IMM_CAND_REST_MAX_FAILS", 3)
 WAKE_GRACE_SECS = 120
 BLIND_PRESERVE_CYCLES = 3
 
@@ -7601,6 +7663,11 @@ _CONFIG_CODE_KNOBS = (
     "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
     "WS_FAST_MIN_GAP_C", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
+    # hang watchdog: wedge stacks, its handoff, the main-thread network
+    # bounds and the candidate REST budget (2026-10-09 audit)
+    "CYCLE_HANG_EXIT_SECS", "CYCLE_HANG_DUMP_SECS", "WATCHDOG_HANDOFF",
+    "HTTP_CONNECT_TIMEOUT_SECS", "HTTP_READ_TIMEOUT_SECS", "HTTP_GET_ATTEMPTS",
+    "CAND_REST_BUDGET_SECS", "CAND_REST_MAX_FAILS",
 )
 
 
@@ -7834,6 +7901,78 @@ def _keep_awake() -> None:
     if ok != _keep_awake_state["ok"]:   # log transitions only, not every cycle
         _keep_awake_state["ok"] = ok
         log(f"[IMM] keep-awake (block idle sleep): {'ON' if ok else 'FAILED'}")
+
+
+def is_network_error(e: BaseException) -> bool:
+    """True for a call that never got an answer: connect, TLS, timeout or a
+    dropped connection. False for an HTTP error status (the server
+    answered), a parse error, or a test double's RuntimeError."""
+    return isinstance(e, (requests.exceptions.ConnectionError,
+                          requests.exceptions.Timeout,
+                          requests.exceptions.ChunkedEncodingError,
+                          ConnectionError, TimeoutError))
+
+
+def run_bounded(fn: Callable[[], Any], timeout: float,
+                name: str) -> Tuple[bool, Any]:
+    """Run fn on a daemon thread and wait at most `timeout` seconds for it.
+    Returns (True, its result) when it returned in time. Otherwise returns
+    (False, the exception it raised), or (False, None) while it still runs;
+    a still-running fn is left to finish or die with the process. The hang
+    watchdog's file writes and log lines go through this (see
+    WEDGE_IO_TIMEOUT_SECS)."""
+    box: Dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["r"] = fn()
+        except BaseException as e:
+            box["e"] = e
+    t = threading.Thread(target=target, daemon=True, name=name)
+    t.start()
+    t.join(timeout)
+    if "r" in box:
+        return True, box["r"]
+    return False, box.get("e")
+
+
+def format_thread_stacks(skip_ident: Optional[int] = None) -> Tuple[str, str]:
+    """(every thread's Python stack, a one-line summary of the main thread's).
+    Main thread first, then by name; innermost call last, as in a traceback.
+    The summary is the main thread's three innermost frames plus its
+    innermost frame in this file. `skip_ident`: the calling thread."""
+    frames = sys._current_frames()
+    by_ident = {t.ident: t for t in threading.enumerate()}
+    main_ident = threading.main_thread().ident
+    here = os.path.basename(__file__)
+    out: List[str] = []
+    summary = ""
+    for ident in sorted(frames, key=lambda i: (
+            i != main_ident, getattr(by_ident.get(i), "name", "?"))):
+        if ident == skip_ident:
+            continue
+        th = by_ident.get(ident)
+        out.append(f"--- thread {getattr(th, 'name', '?')} (ident {ident}"
+                   f"{', daemon' if th is not None and th.daemon else ''}) ---\n")
+        stack = traceback.extract_stack(frames[ident])
+        out.extend(traceback.format_list(stack))
+        if ident == main_ident and stack:
+            inner = list(reversed(stack[-3:]))
+            parts = [f"{os.path.basename(fs.filename)}:{fs.lineno} {fs.name}"
+                     for fs in inner]
+            own = next((fs for fs in reversed(stack)
+                        if os.path.basename(fs.filename) == here), None)
+            if own is not None and own not in inner:
+                parts.append(f"... {here}:{own.lineno} {own.name}")
+            summary = " <- ".join(parts)
+    return "".join(out), summary
+
+
+def wedge_dump_path(now_ts: float) -> str:
+    """STATUS_DIR/wedge_<utc>.txt. Resolved at call time: tests re-point
+    STATUS_DIR after import."""
+    return os.path.join(STATUS_DIR, "wedge_" + time.strftime(
+        "%Y%m%dT%H%M%SZ", time.gmtime(now_ts)) + ".txt")
 
 
 def parse_iso_utc(s) -> Optional[datetime]:
@@ -10862,6 +11001,14 @@ def parse_mention_game(event_ticker: str) -> Optional[Tuple[datetime, str, str]]
     return ET.localize(naive).astimezone(timezone.utc), a, b
 
 
+class ResolverHostDown(Exception):
+    """An EventStartResolver lookup skipped: its host failed to answer lately."""
+
+    def __init__(self, host: str, until: float):
+        super().__init__(f"{host} skipped until {until:.0f}")
+        self.host, self.until = host, until
+
+
 class EventStartResolver:
     """Best-effort real event start times for mention markets.
 
@@ -10869,20 +11016,42 @@ class EventStartResolver:
     World Cup: ESPN public scoreboard. Fixed-hour series from SERIES_START_ET.
     Everything else / any failure -> None, and the caller falls back to the
     midnight-ET ticker-date rule (the safe direction). Results cached; failures
-    cached briefly so a dead API can't stall the refresh loop."""
+    cached briefly so a dead API can't stall the refresh loop.
+
+    It runs on the trading thread, once per uncached event, inside the
+    universe refresh. A call that gets no answer (connect, TLS, timeout)
+    marks its host down for HOST_DOWN_SECS (2026-10-09 audit). Until then
+    every lookup on that host is skipped: None, cached only until the host
+    is tried again. So a dead feed costs one timeout per refresh, not one
+    per event. (9/27 01:00-01:02Z: ESPN failures 80s apart in a refresh that
+    ran ~10 minutes and tripped the hang watchdog.)"""
 
     NEG_TTL = 1800
     POS_TTL = 6 * 3600
+    HOST_DOWN_SECS = 120
 
     def __init__(self, http_get_json=None):
-        self._get = http_get_json or self._default_get
+        self._fetch = http_get_json or self._default_get
         self.cache: Dict[str, Tuple[float, Optional[datetime]]] = {}
+        self._host_down: Dict[str, float] = {}     # host -> retry at (epoch)
+
+    def _get(self, url: str):
+        host = urlparse(url).hostname or ""
+        until = self._host_down.get(host, 0.0)
+        if until > time.time():
+            raise ResolverHostDown(host, until)
+        try:
+            return self._fetch(url)
+        except Exception as e:
+            if is_network_error(e):
+                self._host_down[host] = time.time() + self.HOST_DOWN_SECS
+            raise
 
     @staticmethod
     def _default_get(url: str):
         # Full browser UA: Nasdaq's earnings API 403s minimal UAs; harmless for
-        # statsapi/ESPN.
-        r = requests.get(url, timeout=10, headers={
+        # statsapi/ESPN. (connect, read) bound: 2026-10-09 audit.
+        r = requests.get(url, timeout=(5, 10), headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/124.0 Safari/537.36",
@@ -10904,8 +11073,14 @@ class EventStartResolver:
             return hit[1]
         try:
             start = self._resolve_uncached(series, event_ticker)
+        except ResolverHostDown as e:
+            # skipped, never asked: ask again once the host is retried
+            self.cache[event_ticker] = (e.until, None)
+            return None
         except Exception as e:
-            log(f"[IMM] ! event-start resolve failed for {event_ticker}: {e}")
+            log(f"[IMM] ! event-start resolve failed for {event_ticker}: {e}"
+                + (f" (its host is skipped for {self.HOST_DOWN_SECS}s)"
+                   if is_network_error(e) else ""))
             start = None
         ttl = self.POS_TTL if start is not None else self.NEG_TTL
         self.cache[event_ticker] = (now + ttl, start)
@@ -13579,6 +13754,11 @@ class BotState:
 # The market maker
 # ----------------------------------------------------------------------------
 
+class CandidateRestOff(Exception):
+    """A candidate's REST book read skipped: pass 2's REST budget is spent
+    (CAND_REST_BUDGET_SECS / CAND_REST_MAX_FAILS). Unread, like a failed read."""
+
+
 class IncentiveMarketMaker:
     TAG = "IMM"
 
@@ -13646,6 +13826,9 @@ class IncentiveMarketMaker:
         self._nfl_stood: Set[str] = set()         # NFL prop gate stand-asides
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._heartbeat = time.time()      # hang-watchdog liveness marker
+        # full cycles this PROCESS completed: the watchdog hands the book over
+        # only after the first one (WATCHDOG_HANDOFF)
+        self._full_cycles = 0
         # (account value, anchor) from the last floor check, for risk_line
         self._acct_reading: Optional[Tuple[float, float]] = None
         # ---- analytics sink state (see _sink) ----
@@ -13756,10 +13939,13 @@ class IncentiveMarketMaker:
         self._ws_cand_want: Set[str] = set()
         self._ws_managed_last: Set[str] = set()
         self._ws_cand = {"ws": 0, "rest": 0, "rest_fallback": 0, "audits": 0,
-                         "warm_waits": 0, "warm_s": 0.0}
+                         "warm_waits": 0, "warm_s": 0.0, "rest_skipped": 0}
         self._ws_cand_shadow = {"compared": 0, "exact": 0, "top": 0,
                                 "ws_missing": 0}
         self._universe_times: Deque[Tuple[float, float, int, int]] = deque(maxlen=20)
+        # the running pass 2's REST budget (CAND_REST_BUDGET_SECS /
+        # CAND_REST_MAX_FAILS): {"t0", "fails", "off"}; None outside pass 2
+        self._cand_rest: Optional[dict] = None
         self._load_persist()
         # the ladder-asks cash latch lives in module state for series_bid_only
         _LADDER_ASKS_STATE["on_at"] = self.state.ladder_asks_on_at or None
@@ -15401,18 +15587,21 @@ class IncentiveMarketMaker:
         audit, and a tripped audit sends every read to REST (compared, so the
         window can re-arm). A REST failure raises -- the caller marks the
         book unreadable, as before -- except on an audit read, which then
-        uses the WS book."""
+        uses the WS book. Once pass 2's REST budget is spent (_cand_rest_off)
+        a feed book is used without the audit draw, and a book the feed
+        cannot serve raises CandidateRestOff without a REST call."""
         ws = self._ws
         st = self._ws_cand
+        off = self._cand_rest_off()
         if (ws is not None and WS_CANDIDATES == "on" and WS_MODE == "on"
                 and not self._ws_audit["tripped"]):
             ob = ws.book_fp(ticker)
             if ob is not None:
-                if not self._ws_audit_draw():
+                if off or not self._ws_audit_draw():
                     st["ws"] += 1
                     return ob
                 try:
-                    rest = self.client.get_orderbook(ticker=ticker)
+                    rest = self._cand_rest_read(ticker)
                 except Exception:
                     self._ws_audit["rest_errors"] += 1
                     st["ws"] += 1
@@ -15423,11 +15612,49 @@ class IncentiveMarketMaker:
                                  stats=self._ws_cand_shadow)
                 return rest
             st["rest_fallback"] += 1
-        ob = self.client.get_orderbook(ticker=ticker)
+        if off:
+            st["rest_skipped"] += 1
+            raise CandidateRestOff(off)
+        ob = self._cand_rest_read(ticker)
         st["rest"] += 1
         if ws is not None and WS_CANDIDATES != "off" and WS_MODE in ("shadow", "on"):
             self._ws_compare(ticker, ob, audit=self._ws_audit_draw(),
                              stats=self._ws_cand_shadow)
+        return ob
+
+    def _cand_rest_off(self) -> str:
+        """Why pass 2 has stopped reading candidate books over REST, or ""
+        while it may: CAND_REST_BUDGET_SECS spent, or CAND_REST_MAX_FAILS
+        network failures in a row (_cand_rest_read). No budget outside pass
+        2. Once off, off for the rest of the pass."""
+        b = self._cand_rest
+        if b is None:
+            return ""
+        if (not b["off"] and CAND_REST_BUDGET_SECS > 0
+                and time.monotonic() - b["t0"] > CAND_REST_BUDGET_SECS):
+            b["off"] = f"its {CAND_REST_BUDGET_SECS:g}s REST budget ran out"
+        return b["off"]
+
+    def _cand_rest_read(self, ticker: str) -> dict:
+        """A candidate's REST book, kept in pass 2's failure streak: a
+        network failure adds one, an answer of any kind (a book, an HTTP
+        error) ends the streak."""
+        b = self._cand_rest
+        try:
+            ob = self.client.get_orderbook(ticker=ticker)
+        except Exception as e:
+            if b is not None:
+                if not is_network_error(e):
+                    b["fails"] = 0
+                else:
+                    b["fails"] += 1
+                    if (not b["off"] and CAND_REST_MAX_FAILS > 0
+                            and b["fails"] >= CAND_REST_MAX_FAILS):
+                        b["off"] = (f"{b['fails']} network failures in a row "
+                                    f"({type(e).__name__})")
+            raise
+        if b is not None:
+            b["fails"] = 0
         return ob
 
     def _ws_cand_subscribe(self, tickers: Iterable[str]) -> None:
@@ -17133,6 +17360,10 @@ class IncentiveMarketMaker:
         # the books pass 2 reads go on the WebSocket feed (WS_CANDIDATES)
         self._ws_cand_subscribe(m.ticker for m in screened
                                 if m.event_ticker not in self.state.event_live_halt)
+        # ...and its REST reads are budgeted (CAND_REST_BUDGET_SECS), from
+        # after the feed's warm-up wait
+        self._cand_rest = {"t0": time.monotonic(), "fails": 0, "off": ""}
+        _rest_skip0 = self._ws_cand["rest_skipped"]
         ranked: List[MarketMeta] = []
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
@@ -17380,6 +17611,14 @@ class IncentiveMarketMaker:
                 # re-entrant, admitted on its first reading)
                 self.state.hopeless_since.pop(meta.ticker, None)
                 ranked.append(meta)
+        if self._cand_rest["off"]:
+            log(f"{self.tag} ! universe refresh: candidate REST reads stopped "
+                f"after {time.monotonic() - self._cand_rest['t0']:.0f}s -- "
+                f"{self._cand_rest['off']}; "
+                f"{self._ws_cand['rest_skipped'] - _rest_skip0} book(s) not "
+                f"read (members ride through, fresh candidates wait for the "
+                f"next refresh)")
+        self._cand_rest = None
         # Mild stickiness so estimator jitter doesn't churn the selection.
         ranked.sort(key=lambda m: -m.yield_per_contract
                     * (1.15 if m.ticker in self.state.selected else 1.0))
@@ -21777,6 +22016,45 @@ class IncentiveMarketMaker:
             f"near-cutoff / unselected markets")
         return True
 
+    def _watchdog_handoff(self, wedge: float,
+                          stacks: str = "") -> Tuple[Optional[int], str]:
+        """The hang watchdog's exit hands the book to the relaunch
+        (WATCHDOG_HANDOFF) instead of leaving it to the startup cancel. Runs
+        on the watchdog's I/O helper while the main thread is wedged: memory
+        and one local file only. No network, no _save_persist (the main thread
+        saved after its last placements, and the journal holds any since).
+        Lists the ledger's orders that _restart_keep_ok passes; the relaunch
+        cancels every other resting imm- order first (_adopt_restart_handoff,
+        kind "watchdog"). Returns (orders listed, "ok"), or (None, why) when
+        refused -- then no file is written and the relaunch cancels as
+        before."""
+        if not (WATCHDOG_HANDOFF and RESTART_KEEP_ORDERS and self.live):
+            return None, "off"
+        now_ts = time.time()
+        if os.path.exists(HALT_FILE) or self.state.halted_until > now_ts:
+            return None, "the bot is halted"
+        if self._full_cycles < 1:
+            return None, "no full cycle completed in this process"
+        if wedge > CYCLE_HANG_EXIT_SECS + WATCHDOG_HANDOFF_SLACK_SECS:
+            return None, f"the book went {wedge:.0f}s unmanaged"
+        try:
+            keep = sorted(str(oid) for oid, led in list(self.state.ledger.items())
+                          if oid and self._restart_keep_ok(
+                              str(led.get("ticker") or ""), now_ts))
+            payload = {"ts": round(now_ts, 3), "run_id": RUN_ID,
+                       "source_mtime": _SOURCE_MTIME, "kind": "watchdog",
+                       "kept": len(keep), "cancelled": 0, "order_ids": keep,
+                       "wedge_s": round(wedge), "stacks": stacks,
+                       "fill_join": self._join_export()}
+            os.makedirs(STATUS_DIR, exist_ok=True)
+            tmp = restart_handoff_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, restart_handoff_path())
+        except Exception as e:
+            return None, f"{type(e).__name__}: {str(e)[:120]}"
+        return len(keep), "ok"
+
     def _restart_requested(self) -> bool:
         """Between cycles: act on an operator handoff request (see
         RESTART_REQUEST_FILE). Hands the book over exactly as the code-change
@@ -21799,11 +22077,12 @@ class IncentiveMarketMaker:
         return True
 
     def _adopt_restart_handoff(self) -> Optional[int]:
-        """Startup: adopt the book a planned restart handed over. Returns the
-        number of resting orders adopted, or None when the caller must cancel
-        everything as before (no/unreadable/stale handoff file, knob off, or
-        the resting read failed). The file is consumed either way, so a
-        handoff can never be adopted twice."""
+        """Startup: adopt the book a planned restart handed over, or the hang
+        watchdog's exit (kind "watchdog": the orders it did not list are
+        cancelled first). Returns the number of resting orders adopted, or
+        None when the caller must cancel everything as before (no/unreadable/
+        stale handoff file, knob off, or the resting read failed). The file
+        is consumed either way, so a handoff can never be adopted twice."""
         path = restart_handoff_path()
         try:
             with open(path, encoding="utf-8") as f:
@@ -21841,8 +22120,14 @@ class IncentiveMarketMaker:
             log(f"{self.tag} restart handoff: resting read failed ({e}); "
                 f"cancelling the book as before")
             return None
+        # a WATCHDOG handoff (_watchdog_handoff) lists only the orders its
+        # hung run passed with _restart_keep_ok; every other resting imm-
+        # order is cancelled here before the rest is adopted
+        listed: Optional[Set[str]] = None
+        if data.get("kind") == "watchdog":
+            listed = {str(i) for i in (data.get("order_ids") or [])}
         now_ts = time.time()
-        n = 0
+        n = n_cx = 0
         for o in orders:
             oid = o.get("order_id")
             parsed = order_yes_book_cents(o)
@@ -21866,11 +22151,109 @@ class IncentiveMarketMaker:
             self._join_set(oid, o.get("ticker", ""), parsed[0], parsed[1],
                            order_yes_exact_cents(o), order_remaining(o),
                            o.get("client_order_id"), placed)
+            # (booked first, so the cancel's row names the market and fills
+            # before it are still ours; a failed cancel leaves it adopted)
+            if listed is not None and str(oid) not in listed \
+                    and self.cancel_order(oid, reason="watchdog_handoff"):
+                n_cx += 1
+                continue
             n += 1
         log(f"{self.tag} startup: adopted {n} resting imm- order(s) handed over "
-            f"by run {data.get('run_id')} {age:.0f}s ago (restart handoff); the "
-            f"first cycle re-prices, keeps or strays them")
+            f"by run {data.get('run_id')} {age:.0f}s ago "
+            + (f"(WATCHDOG handoff after a {data.get('wedge_s')}s hang, stacks "
+               f"{data.get('stacks') or 'not written'}; cancelled {n_cx} it did "
+               f"not list: gated / fast-lane / near-cutoff / unselected "
+               f"markets, or placed during the hang)" if listed is not None
+               else "(restart handoff)")
+            + "; the first cycle re-prices, keeps or strays them")
         return n
+
+    def _write_wedge_snapshot(self, path: str, label: str, wedge: float,
+                              hb: float) -> str:
+        """Append one snapshot of every thread's stack (WEDGE STACKS) to
+        `path`; returns the main thread's one-line summary. Raises on a
+        failed write. Called on the watchdog's I/O helper thread, which it
+        leaves out of the snapshot."""
+        text, summary = format_thread_stacks(skip_ident=threading.get_ident())
+
+        def iso(ts: float) -> str:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"=== IMM hang watchdog: no cycle heartbeat for {wedge:.0f}s "
+                    f"({label}) ===\n"
+                    f"utc {iso(time.time())} | last heartbeat {iso(hb)} | run "
+                    f"{RUN_ID} | pid {os.getpid()} | config {CONFIG_HASH} | "
+                    f"source mtime {_SOURCE_MTIME}\n"
+                    f"main thread: {summary}\n\n{text}\n")
+        return summary
+
+    def _hang_watchdog_tick(self, wd: dict, now: float,
+                            late: float = 0.0) -> bool:
+        """One tick of the hang watchdog (run()'s daemon thread, every
+        HANG_WATCHDOG_TICK_SECS; `late` = how far past that the tick woke).
+        True = hard-exit now. `wd` carries one stall's snapshot file across
+        ticks. What a tick does, in order:
+          - a tick that woke a whole tick late: the PROCESS stalled, not
+            just the cycle (a thread holding the GIL, or the machine slept);
+          - a heartbeat that came back after a snapshot: a slow phase, logged;
+          - CYCLE_HANG_DUMP_SECS without one: every thread's stack to
+            wedge_<utc>.txt (WEDGE STACKS), once per stall;
+          - past CYCLE_HANG_EXIT_SECS: the book handed over when that is
+            safe (_watchdog_handoff), a snapshot appended to the same file,
+            the exit.
+        The decision is made here; the file writes and log lines run on one
+        helper thread this tick waits on for at most WEDGE_IO_TIMEOUT_SECS."""
+        hb = self._heartbeat
+        wedge = now - hb
+        notes: List[str] = []
+        if late >= HANG_WATCHDOG_TICK_SECS:
+            notes.append(f"{self.tag} ! hang watchdog: a {HANG_WATCHDOG_TICK_SECS}s "
+                         f"tick took {HANG_WATCHDOG_TICK_SECS + late:.0f}s -- the "
+                         f"whole process stalled (a thread holding the GIL, or "
+                         f"the machine slept)")
+        if wd.get("path") and hb != wd.get("hb"):
+            notes.append(f"{self.tag} cycle heartbeat back after "
+                         f"{hb - wd['hb']:.0f}s (stacks in {wd['path']}): a slow "
+                         f"phase, not a wedge")
+            wd.clear()
+        exiting = wedge > CYCLE_HANG_EXIT_SECS
+        label = None
+        if exiting:
+            label = "snapshot 2, at the exit" if wd.get("path") else "at the exit"
+        elif (CYCLE_HANG_DUMP_SECS > 0 and wedge > CYCLE_HANG_DUMP_SECS
+              and not wd.get("path")):
+            label = f"snapshot 1; the exit follows at {CYCLE_HANG_EXIT_SECS}s"
+        if label is not None and not wd.get("path"):
+            wd["path"], wd["hb"] = wedge_dump_path(now), hb
+        if not notes and label is None:
+            return False
+        path = wd.get("path", "")
+
+        def io() -> None:
+            for line in notes:
+                log(line)
+            if label is None:
+                return
+            # the handoff first: it is what keeps the book up
+            kept, why = (self._watchdog_handoff(wedge, path) if exiting
+                         else (None, ""))
+            try:
+                summary = self._write_wedge_snapshot(path, label, wedge, hb)
+                where = f"stacks -> {path} (main: {summary})"
+            except Exception as e:
+                where = f"stack dump FAILED ({type(e).__name__}: {str(e)[:120]})"
+            if not exiting:
+                log(f"{self.tag} ! no cycle heartbeat for {wedge:.0f}s -- {where}; "
+                    f"hard exit at {CYCLE_HANG_EXIT_SECS}s")
+                return
+            log(f"{self.tag} !! no cycle heartbeat for {wedge:.0f}s — wedged "
+                f"syscall? hard-exiting for launcher relaunch (state is "
+                f"journaled); {where}; "
+                + (f"book handed to the relaunch ({kept} order(s) listed; it "
+                   f"cancels the rest)" if kept is not None
+                   else f"no handoff ({why}): the relaunch cancels the book"))
+        run_bounded(io, WEDGE_IO_TIMEOUT_SECS, "hang-watchdog-io")
+        return exiting
 
     def shutdown_cancel(self) -> None:
         if self._shutdown_done or not self.live:
@@ -21910,13 +22293,17 @@ class IncentiveMarketMaker:
             f"config={CONFIG_HASH} ===")
         if not once:
             def _hang_watchdog():
+                wd: dict = {}
                 while True:
-                    time.sleep(30)
-                    wedge = time.time() - self._heartbeat
-                    if wedge > CYCLE_HANG_EXIT_SECS:
-                        log(f"{self.tag} !! no cycle heartbeat for {wedge:.0f}s "
-                            f"— wedged syscall? hard-exiting for launcher "
-                            f"relaunch (state is journaled)")
+                    t0 = time.monotonic()
+                    time.sleep(HANG_WATCHDOG_TICK_SECS)
+                    late = time.monotonic() - t0 - HANG_WATCHDOG_TICK_SECS
+                    try:
+                        exit_now = self._hang_watchdog_tick(wd, time.time(), late)
+                    except Exception:
+                        # a bug in the snapshot / handoff never costs the exit
+                        exit_now = time.time() - self._heartbeat > CYCLE_HANG_EXIT_SECS
+                    if exit_now:
                         os._exit(86)
             threading.Thread(target=_hang_watchdog, daemon=True,
                              name="hang-watchdog").start()
@@ -22943,6 +23330,7 @@ class IncentiveMarketMaker:
                     self._cycle_last_read = 0.0
                     self.run_cycle()
                     self.state.consecutive_errors = 0
+                    self._full_cycles += 1      # (WATCHDOG_HANDOFF)
                     # latency.cycle: this full cycle's read phase and length
                     self._cycle_times.append(
                         (top, self._cycle_last_read, time.time()))
@@ -23087,6 +23475,16 @@ def build_client() -> ExchangeClient:
     return client
 
 
+def bound_trading_client(client: Any) -> None:
+    """The bot's own network bounds on its trading client (MAIN-THREAD
+    NETWORK BOUNDS). Set in main() only: the offline tools that call
+    build_client keep the shared client defaults."""
+    client.http_timeout = (HTTP_CONNECT_TIMEOUT_SECS, HTTP_READ_TIMEOUT_SECS)
+    client.get_attempts = HTTP_GET_ATTEMPTS
+    log(f"[IMM] trading client bounds: {HTTP_CONNECT_TIMEOUT_SECS:g}s connect, "
+        f"{HTTP_READ_TIMEOUT_SECS:g}s read, {HTTP_GET_ATTEMPTS} tries per GET")
+
+
 def _fair_reader_client() -> ExchangeClient:
     return ExchangeClient(exchange_api_base=KALSHI_API_BASE,
                           key_id=KEY_ID, private_key=load_private_key())
@@ -23166,6 +23564,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if ok else 1
 
     client = build_client()
+    bound_trading_client(client)
     try:
         _bal = client.get_balance()
         _val = account_value_dollars(_bal)

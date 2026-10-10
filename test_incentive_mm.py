@@ -23620,5 +23620,458 @@ class TestConfigGapsPrune(unittest.TestCase):
         self.assertIn("KXA-26", imm._config_gaps)
 
 
+# ---------------------------------------------------------------------------
+# Hang watchdog audit (2026-10-09): wedge stacks, the watchdog handoff, the
+# main-thread network bounds and the candidate REST budget
+# ---------------------------------------------------------------------------
+
+import requests as _requests                     # noqa: E402  (error classes)
+import KalshiClientsBaseV2ApiKey_FIXED as _kc    # noqa: E402
+
+
+class TestWedgeStacks(unittest.TestCase):
+    """10/09 12:54Z and 10/10 01:57Z: the hang watchdog hard-exited with no
+    trace of the hanging call. It now writes every thread's stack to
+    STATUS_DIR/wedge_<utc>.txt at CYCLE_HANG_DUMP_SECS and again at the exit,
+    and names the main thread's innermost frames in the log line."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=None, live=False)
+        for p in glob.glob(os.path.join(imm.STATUS_DIR, "wedge_*.txt")):
+            os.remove(p)
+        self.lines = []
+        p = mock.patch.object(imm, "log", side_effect=self.lines.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_defaults(self):
+        self.assertEqual((imm.CYCLE_HANG_EXIT_SECS, imm.CYCLE_HANG_DUMP_SECS,
+                          imm.HANG_WATCHDOG_TICK_SECS, imm.WATCHDOG_HANDOFF),
+                         (600, 360, 30, True))
+        for k in ("CYCLE_HANG_DUMP_SECS", "WATCHDOG_HANDOFF",
+                  "HTTP_READ_TIMEOUT_SECS", "HTTP_GET_ATTEMPTS",
+                  "CAND_REST_BUDGET_SECS", "CAND_REST_MAX_FAILS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_every_thread_is_named_with_its_stack(self):
+        stop = _threading.Event()
+
+        def _wedged_here():
+            stop.wait(10)
+        t = _threading.Thread(target=_wedged_here, name="fake-wedge", daemon=True)
+        t.start()
+        try:
+            text, summary = imm.format_thread_stacks()
+        finally:
+            stop.set()
+            t.join()
+        self.assertTrue(text.startswith("--- thread MainThread"), text[:80])
+        block = text.split("--- thread fake-wedge")[1].split("--- thread ")[0]
+        self.assertIn("in _wedged_here", block)
+        self.assertIn("stop.wait(10)", block)               # the source line
+        self.assertIn("format_thread_stacks", summary)
+        self.assertIn("test_every_thread_is_named_with_its_stack", summary)
+        # the caller can leave its own thread out (the watchdog's writer)
+        text2, _s = imm.format_thread_stacks(
+            skip_ident=_threading.main_thread().ident)
+        self.assertNotIn("--- thread MainThread", text2)
+
+    def test_a_fresh_heartbeat_does_nothing(self):
+        self.bot._heartbeat = time.time()
+        self.assertFalse(self.bot._hang_watchdog_tick({}, time.time() + 60))
+        self.assertEqual(self.lines, [])
+        self.assertEqual(glob.glob(os.path.join(imm.STATUS_DIR, "wedge_*.txt")), [])
+
+    def test_one_stall_gets_two_snapshots_in_one_file_then_the_exit(self):
+        b, wd = self.bot, {}
+        hb = time.time() - 2000.0
+        b._heartbeat = hb
+        self.assertFalse(b._hang_watchdog_tick(wd, hb + imm.CYCLE_HANG_DUMP_SECS + 5))
+        path = wd["path"]
+        self.assertEqual(os.path.dirname(path), imm.STATUS_DIR)
+        self.assertRegex(os.path.basename(path), r"^wedge_\d{8}T\d{6}Z\.txt$")
+        first = f"[IMM] ! no cycle heartbeat for {imm.CYCLE_HANG_DUMP_SECS + 5}s"
+        self.assertTrue(any(s.startswith(first) and path in s and "main: " in s
+                            and "hard exit at 600s" in s for s in self.lines),
+                        self.lines)
+        # later ticks of the same stall add nothing until the exit
+        n = len(self.lines)
+        self.assertFalse(b._hang_watchdog_tick(wd, hb + imm.CYCLE_HANG_DUMP_SECS + 35))
+        self.assertEqual(len(self.lines), n)
+        self.assertTrue(b._hang_watchdog_tick(wd, hb + imm.CYCLE_HANG_EXIT_SECS + 5))
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(text.count("=== IMM hang watchdog: no cycle heartbeat"), 2)
+        self.assertIn("(snapshot 1; the exit follows at 600s)", text)
+        self.assertIn("(snapshot 2, at the exit)", text)
+        self.assertIn("--- thread MainThread", text)
+        out = [s for s in self.lines if "!! no cycle heartbeat for 605s" in s]
+        self.assertEqual(len(out), 1, self.lines)
+        self.assertIn("hard-exiting for launcher relaunch", out[0])
+        self.assertIn(f"stacks -> {path} (main: ", out[0])
+        self.assertIn("run_bounded", out[0])           # the main thread's frame
+        self.assertIn("no handoff (off): the relaunch cancels the book", out[0])
+
+    def test_a_heartbeat_back_after_a_snapshot_is_a_slow_phase(self):
+        b, wd = self.bot, {}
+        hb = time.time() - 2000.0
+        b._heartbeat = hb
+        b._hang_watchdog_tick(wd, hb + imm.CYCLE_HANG_DUMP_SECS + 5)
+        path = wd["path"]
+        b._heartbeat = hb + imm.CYCLE_HANG_DUMP_SECS + 40      # the cycle moved
+        self.assertFalse(b._hang_watchdog_tick(wd, hb + imm.CYCLE_HANG_DUMP_SECS + 45))
+        back = f"cycle heartbeat back after {imm.CYCLE_HANG_DUMP_SECS + 40}s"
+        self.assertTrue(any(back in s and path in s
+                            and "a slow phase, not a wedge" in s
+                            for s in self.lines), self.lines)
+        self.assertEqual(wd, {})
+
+    def test_without_the_early_snapshot_the_exit_still_dumps(self):
+        b, wd = self.bot, {}
+        hb = time.time() - 2000.0
+        b._heartbeat = hb
+        with mock.patch.object(imm, "CYCLE_HANG_DUMP_SECS", 0):
+            self.assertFalse(b._hang_watchdog_tick(wd, hb + 400))
+            self.assertEqual((wd, self.lines), ({}, []))
+            self.assertTrue(b._hang_watchdog_tick(wd, hb + imm.CYCLE_HANG_EXIT_SECS + 1))
+        with open(wd["path"], encoding="utf-8") as f:
+            self.assertEqual(f.read().count("(at the exit)"), 1)
+
+    def test_a_late_tick_says_the_whole_process_stalled(self):
+        self.bot._heartbeat = time.time()
+        self.assertFalse(self.bot._hang_watchdog_tick({}, time.time(), late=95.0))
+        self.assertTrue(any("a 30s tick took 125s" in s
+                            and "whole process stalled" in s for s in self.lines),
+                        self.lines)
+        self.lines.clear()
+        self.assertFalse(self.bot._hang_watchdog_tick({}, time.time(), late=3.0))
+        self.assertEqual(self.lines, [])
+
+    def test_a_stalled_disk_delays_the_exit_by_the_io_bound_only(self):
+        b, gate = self.bot, _threading.Event()
+        self.addCleanup(gate.set)
+        hb = time.time() - 2000.0
+        b._heartbeat = hb
+        with mock.patch.object(imm, "WEDGE_IO_TIMEOUT_SECS", 0.2), \
+                mock.patch.object(b, "_write_wedge_snapshot",
+                                  side_effect=lambda *a: gate.wait(30)):
+            t0 = time.monotonic()
+            self.assertTrue(b._hang_watchdog_tick({}, hb + imm.CYCLE_HANG_EXIT_SECS + 5))
+            self.assertLess(time.monotonic() - t0, 5.0)
+
+    def test_run_bounded(self):
+        self.assertEqual(imm.run_bounded(lambda: 7, 1.0, "t"), (True, 7))
+        ok, e = imm.run_bounded(lambda: 1 / 0, 1.0, "t")
+        self.assertFalse(ok)
+        self.assertIsInstance(e, ZeroDivisionError)
+        gate = _threading.Event()
+        self.addCleanup(gate.set)
+        t0 = time.monotonic()
+        self.assertEqual(imm.run_bounded(lambda: gate.wait(30), 0.1, "t"),
+                         (False, None))
+        self.assertLess(time.monotonic() - t0, 5.0)
+
+
+class TestWatchdogHandoff(unittest.TestCase):
+    """10/10 01:57Z: the hard exit left no handoff, so the relaunch cancelled
+    1,989 leftover orders (done 02:07Z on the bad network) and the book was
+    back ~02:16Z. The exit now hands the book over from memory; the relaunch
+    cancels every resting order the hung run did not list."""
+
+    OK, NEAR, GATED, UNSEL = (TestRestartHandoff.OK, TestRestartHandoff.NEAR,
+                              TestRestartHandoff.GATED, TestRestartHandoff.UNSEL)
+    setUp = TestRestartHandoff.setUp
+    tearDown = TestRestartHandoff.setUp
+    _order = TestRestartHandoff._order
+    _bot = TestRestartHandoff._bot
+
+    def _hung_bot(self):
+        """A live bot that completed a cycle, its ledger holding o0..o3."""
+        bot = self._bot()
+        for o in bot.client.resting:
+            bot.state.ledger[o["order_id"]] = {
+                "order_id": o["order_id"], "ticker": o["ticker"],
+                "book_side": "bid", "yes_price": 40, "remaining_count": 20.0,
+                "_placed_at": time.time() - 600, "_confirmed": True}
+        bot._full_cycles = 1
+        return bot
+
+    def _handoff(self):
+        with open(imm.restart_handoff_path(), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_the_exit_lists_the_safe_part_of_the_book_without_the_network(self):
+        bot = self._hung_bot()
+        bot.client.get_orders = mock.Mock(side_effect=AssertionError("network"))
+        self.assertEqual(bot._watchdog_handoff(615.0, "C:/x/wedge.txt"), (1, "ok"))
+        self.assertFalse(getattr(bot.client, "cancelled", []))
+        data = self._handoff()
+        self.assertEqual((data["kind"], data["order_ids"], data["kept"],
+                          data["wedge_s"], data["stacks"], data["run_id"]),
+                         ("watchdog", ["o0"], 1, 615, "C:/x/wedge.txt", imm.RUN_ID))
+        self.assertIn("fill_join", data)
+
+    def test_refused_when_off_halted_on_the_first_cycle_or_too_late(self):
+        bot = self._hung_bot()
+        bot._full_cycles = 0
+        self.assertEqual(bot._watchdog_handoff(615.0),
+                         (None, "no full cycle completed in this process"))
+        bot._full_cycles = 1
+        for patch, why in ((mock.patch.object(imm, "WATCHDOG_HANDOFF", False), "off"),
+                           (mock.patch.object(imm, "RESTART_KEEP_ORDERS", False), "off"),
+                           (mock.patch.object(imm, "HALT_FILE", __file__), "halted")):
+            with patch:
+                kept, w = bot._watchdog_handoff(615.0)
+            self.assertIsNone(kept)
+            self.assertIn(why, w)
+        kept, w = bot._watchdog_handoff(
+            imm.CYCLE_HANG_EXIT_SECS + imm.WATCHDOG_HANDOFF_SLACK_SECS + 1)
+        self.assertIsNone(kept)
+        self.assertIn("unmanaged", w)
+        dry = IncentiveMarketMaker(client=FakeClient(), live=False)
+        dry._full_cycles = 1
+        self.assertEqual(dry._watchdog_handoff(615.0), (None, "off"))
+        self.assertFalse(os.path.exists(imm.restart_handoff_path()))
+
+    def test_the_watchdog_exit_writes_the_handoff_and_the_stacks(self):
+        bot = self._hung_bot()
+        for p in glob.glob(os.path.join(imm.STATUS_DIR, "wedge_*.txt")):
+            os.remove(p)
+        hb = time.time() - 2000.0
+        bot._heartbeat = hb
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            self.assertTrue(bot._hang_watchdog_tick({}, hb + imm.CYCLE_HANG_EXIT_SECS + 5))
+        data = self._handoff()
+        self.assertEqual((data["kind"], data["order_ids"]), ("watchdog", ["o0"]))
+        self.assertTrue(os.path.exists(data["stacks"]))
+        self.assertTrue(any("book handed to the relaunch (1 order(s) listed; it "
+                            "cancels the rest)" in s for s in lines), lines)
+
+    def _write(self, listed):
+        with open(imm.restart_handoff_path(), "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time() - 40, "run_id": "hung", "kind": "watchdog",
+                       "kept": len(listed), "order_ids": listed, "wedge_s": 618,
+                       "stacks": "C:/x/wedge.txt"}, f)
+
+    def test_the_relaunch_cancels_what_the_hung_run_did_not_list(self):
+        self._write(["o0"])
+        bot = self._bot()
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            self.assertEqual(bot._adopt_restart_handoff(), 1)
+        self.assertEqual(sorted(bot.client.cancelled), ["o1", "o2", "o3"])
+        self.assertEqual([o["order_id"] for o in bot.client.resting], ["o0"])
+        self.assertEqual(set(bot.state.ledger), {"o0"})
+        # fills from before the cancel are still matched as ours
+        self.assertTrue({"o0", "o1", "o2", "o3"} <= set(bot.state.our_order_ids))
+        self.assertTrue(any("adopted 1 resting imm- order(s)" in s
+                            and "WATCHDOG handoff after a 618s hang" in s
+                            and "stacks C:/x/wedge.txt" in s and "cancelled 3" in s
+                            for s in lines), lines)
+
+    def test_a_failed_cancel_leaves_the_order_adopted(self):
+        self._write(["o0"])
+        bot = self._bot()
+        bot.client.cancel_order = mock.Mock(side_effect=RuntimeError("down"))
+        self.assertEqual(bot._adopt_restart_handoff(), 4)
+        self.assertEqual(set(bot.state.ledger), {"o0", "o1", "o2", "o3"})
+
+    def test_a_planned_handoff_still_adopts_everything(self):
+        with open(imm.restart_handoff_path(), "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time() - 30, "run_id": "old", "kept": 1,
+                       "order_ids": ["o0"]}, f)
+        bot = self._bot()
+        self.assertEqual(bot._adopt_restart_handoff(), 4)
+        self.assertFalse(getattr(bot.client, "cancelled", []))
+
+
+class TestCandidateRestBudget(unittest.TestCase):
+    """10/09 12:44Z (REST candidate books): pass 2 of the universe refresh
+    was on pace at 12:46:48 and never finished; the watchdog fired at 12:54Z.
+    Pass 2 now stops reading REST after CAND_REST_BUDGET_SECS, or after
+    CAND_REST_MAX_FAILS network failures in a row. An unread candidate is
+    what one failed read always was: a member rides through, a fresh one
+    waits for the next refresh."""
+
+    T, W = "KXGOOD-99DEC31-A", "KXWIDE-99DEC31-B"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _budget(self, **kw):
+        self.bot._cand_rest = dict({"t0": time.monotonic(), "fails": 0, "off": ""}, **kw)
+
+    def test_defaults_and_no_budget_outside_pass_2(self):
+        self.assertEqual((imm.CAND_REST_BUDGET_SECS, imm.CAND_REST_MAX_FAILS), (300.0, 3))
+        self.assertIsNone(self.bot._cand_rest)
+        self.assertEqual(self.bot._cand_rest_off(), "")
+        self.assertIn("orderbook_fp", self.bot._read_candidate_book(self.T))
+
+    def test_a_spent_time_budget_skips_rest_reads(self):
+        b = self.bot
+        self._budget(t0=time.monotonic() - imm.CAND_REST_BUDGET_SECS - 1)
+        b.client.get_orderbook = mock.Mock(side_effect=AssertionError("REST read"))
+        with self.assertRaises(imm.CandidateRestOff):
+            b._read_candidate_book(self.T)
+        self.assertEqual(b._ws_cand["rest_skipped"], 1)
+        self.assertIn("300s REST budget ran out", b._cand_rest["off"])
+
+    def test_network_failures_in_a_row_stop_rest_and_an_answer_ends_the_streak(self):
+        b = self.bot
+        self._budget()
+        net = _requests.exceptions.ConnectionError("SSLError: EOF")
+        b.client.get_orderbook = mock.Mock(side_effect=[
+            net, HttpError("not found", 404), net, RuntimeError("no book"),
+            net, net, net])
+        for exc in (_requests.exceptions.ConnectionError, HttpError,
+                    _requests.exceptions.ConnectionError, RuntimeError):
+            with self.assertRaises(exc):
+                b._read_candidate_book(self.T)
+            self.assertEqual(b._cand_rest["off"], "")
+        for _ in range(3):
+            with self.assertRaises(_requests.exceptions.ConnectionError):
+                b._read_candidate_book(self.T)
+        self.assertEqual(b._cand_rest["off"], "3 network failures in a row (ConnectionError)")
+        with self.assertRaises(imm.CandidateRestOff):
+            b._read_candidate_book(self.T)
+        self.assertEqual(b.client.get_orderbook.call_count, 7)
+
+    def test_feed_books_are_still_read_once_rest_is_off(self):
+        b = self.bot
+        feed = _FakeFeed()
+        feed.books[self.T] = _GOOD_WS_BOOK
+        b._ws = feed
+        b._ws_rng = mock.Mock(random=lambda: 0.0)   # every read would be an audit
+        b.client.get_orderbook = mock.Mock(side_effect=AssertionError("REST read"))
+        self._budget(off="test")
+        with mock.patch.object(imm, "WS_MODE", "on"), \
+                mock.patch.object(imm, "WS_CANDIDATES", "on"):
+            self.assertEqual(b._read_candidate_book(self.T),
+                             _kw.book_to_rest_shape(*_GOOD_WS_BOOK))
+            with self.assertRaises(imm.CandidateRestOff):
+                b._read_candidate_book(self.W)       # not on the feed: unread
+        self.assertEqual((b._ws_cand["ws"], b._ws_cand["audits"],
+                          b._ws_cand["rest_skipped"]), (1, 0, 1))
+
+    def test_a_refresh_on_a_dead_network_stops_early_and_keeps_its_members(self):
+        b = self.bot
+        b.run_cycle()
+        self.assertIn(self.T, b.state.selected)
+        calls = []
+
+        def dead(ticker, depth=None):
+            calls.append(ticker)
+            raise _requests.exceptions.ConnectTimeout("connect timed out")
+        b.client.get_orderbook = dead
+        b.state.universe_at = 0.0
+        lines = []
+        with mock.patch.object(imm, "CAND_REST_MAX_FAILS", 1), \
+                mock.patch.object(imm, "log", side_effect=lines.append):
+            b.refresh_universe(datetime.now(timezone.utc), {})
+        self.assertEqual(len(calls), 1)               # the other never went to REST
+        self.assertIn(self.T, b.state.selected)       # the member rode through
+        self.assertIsNone(b._cand_rest)
+        self.assertTrue(any("candidate REST reads stopped" in s
+                            and "1 network failures in a row (ConnectTimeout)" in s
+                            and "1 book(s) not read" in s for s in lines), lines)
+
+
+class TestResolverHostDown(unittest.TestCase):
+    """9/27 01:00-01:02Z: event-start lookups to ESPN failed ~80s apart in a
+    first refresh that ran ~10 minutes and tripped the hang watchdog. One
+    network failure now skips its host for HOST_DOWN_SECS."""
+
+    NFL = "KXNFLLADDERREC"
+
+    def test_one_network_failure_skips_the_host_for_a_while(self):
+        calls = []
+
+        def get(url):
+            calls.append(url)
+            if "espn.com" in url:
+                raise _requests.exceptions.ConnectionError("SSLError: EOF")
+            return TestEventStartResolver.MLB_JSON
+        r = imm.EventStartResolver(http_get_json=get)
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            self.assertIsNone(r.resolve(self.NFL, f"{self.NFL}-26SEP24ATLGB"))
+            n = len(calls)
+            self.assertEqual(n, 1)
+            self.assertIsNone(r.resolve(self.NFL, f"{self.NFL}-26SEP24KCLAC"))
+            self.assertEqual(len(calls), n)          # skipped: no call at all
+            # another host still answers
+            self.assertEqual(r.resolve("KXMLBMENTION", "KXMLBMENTION-26JUL12MILPIT"),
+                             utc(2026, 7, 12, 22, 40))
+        self.assertEqual([s for s in lines if "event-start resolve failed" in s],
+                         [lines[0]])
+        self.assertIn("(its host is skipped for 120s)", lines[0])
+        # the skipped event is cached only until the host is tried again...
+        until = r._host_down["site.web.api.espn.com"]
+        self.assertEqual(r.cache[f"{self.NFL}-26SEP24KCLAC"], (until, None))
+        # ...and then it is asked again
+        r._host_down["site.web.api.espn.com"] = time.time() - 1
+        r.cache.pop(f"{self.NFL}-26SEP24KCLAC")
+        with mock.patch.object(imm, "log"):
+            r.resolve(self.NFL, f"{self.NFL}-26SEP24KCLAC")
+        self.assertEqual(len(calls), n + 2)
+
+    def test_an_answer_with_an_error_status_does_not(self):
+        def get(url):
+            raise _requests.exceptions.HTTPError("503 Server Error")
+        r = imm.EventStartResolver(http_get_json=get)
+        with mock.patch.object(imm, "log"):
+            self.assertIsNone(r.resolve(self.NFL, f"{self.NFL}-26SEP24ATLGB"))
+        self.assertEqual(r._host_down, {})
+
+    def test_network_errors_are_the_unanswered_calls(self):
+        for e in (_requests.exceptions.ConnectionError(),
+                  _requests.exceptions.ReadTimeout(), _requests.exceptions.SSLError(),
+                  ConnectionAbortedError(10053, "aborted"), TimeoutError()):
+            self.assertTrue(imm.is_network_error(e), repr(e))
+        for e in (HttpError("bad", 400), _requests.exceptions.HTTPError("503"),
+                  RuntimeError("no book"), ValueError("json")):
+            self.assertFalse(imm.is_network_error(e), repr(e))
+
+
+class TestTradingClientBounds(unittest.TestCase):
+    """The shared client could spend ~110s on one failing GET (3 tries x
+    3 connects x 5s + a 20s read). The bot bounds its own client; every other
+    user keeps the shared defaults."""
+
+    def _client(self):
+        c = _kc.KalshiClient("https://example.invalid", "k", None)
+        c.request_headers = lambda method, path: {}
+        c.rate_limit = lambda: None
+        return c
+
+    def test_the_shared_defaults_are_unchanged(self):
+        c = self._client()
+        self.assertEqual((c.http_timeout, c.get_attempts),
+                         (_kc.HTTP_TIMEOUT_SECONDS, _kc.GET_RETRY_ATTEMPTS))
+
+    def test_the_bot_bounds_its_own_client(self):
+        c = self._client()
+        with mock.patch.object(imm, "log"):
+            imm.bound_trading_client(c)
+        self.assertEqual((c.http_timeout, c.get_attempts), ((5.0, 10.0), 2))
+        http = mock.Mock()
+        http.get.side_effect = _requests.exceptions.ConnectTimeout("timed out")
+        ok = mock.Mock(status_code=200)
+        ok.json.return_value = {}
+        http.post.return_value = http.delete.return_value = ok
+        c._http = lambda: http
+        with mock.patch.object(_kc.time, "sleep"), \
+                self.assertRaises(_requests.exceptions.ConnectTimeout):
+            c.get("/markets")
+        self.assertEqual(http.get.call_count, 2)
+        c.post("/portfolio/orders", {})
+        c.delete("/portfolio/orders/x")
+        for call in (http.get.call_args, http.post.call_args, http.delete.call_args):
+            self.assertEqual(call.kwargs["timeout"], (5.0, 10.0))
+
+
 if __name__ == "__main__":
     unittest.main()

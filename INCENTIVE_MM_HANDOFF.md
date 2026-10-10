@@ -9668,3 +9668,144 @@ TestModelCoveragePass, and test_incentive_mm's wiring guard (7 refreshers).
 
 DEPLOY: ff KL. The code-change exit restarts the bot, which loads the new
 rain_fair. The watch picks up pass 5 on its next run.
+
+## 2026-10-10 ~03:05Z — hang watchdog: every thread's stack at a wedge, the book handed over at its exit, main-thread network calls bounded
+
+The ask: the watchdog's hard exit ("!! no cycle heartbeat for 6xxs") came
+twice in network trouble, with no stack: 10/09 12:54Z
+(incentive-mm-2026-10-07.log) and 10/10 01:57Z (incentive-mm-2026-10-09.log).
+A hard exit leaves no handoff, so each relaunch cancelled ~2,000 leftover
+orders and rebuilt the book: 15-20 min dark each time.
+
+What the logs show (no stack, so not the call itself):
+- 10/09: the stuck cycle began 12:43:59 (its heartbeat) with a universe
+  refresh that read candidate books over REST (WS candidates went on only at
+  20:06Z). Pass 2 was on its usual pace at 12:46:48 (its near-cliff lines),
+  and the universe line due ~12:47:30 never came. Trouble from ~12:48 (CNBC
+  SSL error, then the WS silent).
+- 10/10: the last heartbeat (01:47:25) was the cycle's last placement
+  ("placement pacing: 865 placed", 01:47:26), and no next cycle ever began.
+  So it hung in the cycle's tail or between cycles: state saves, cycle log,
+  write_status, book-log flush, or _idle draining the WS feed. Read in full,
+  none of these makes a main-thread network call. The same stretch had
+  already stalled 5 min that night ("resume detected (604s gap)" 01:35:19;
+  placements ended 01:30:18).
+- In both, the WS thread's own 1s loop also stopped for minutes ("no frames
+  for 212s" / "98s" against a 20s stale limit). One wedged socket on the
+  main thread does not explain that; a process-wide stall might.
+- 9/27 01:09Z (the third watchdog exit) was a slow loop, not a wedge. A
+  first refresh after a start ran ~10 min (ESPN event-start lookups failing
+  ~80s apart, then REST candidate books). The watchdog fired 6s after its
+  universe line.
+
+(a) WEDGE STACKS (IMM_CYCLE_HANG_DUMP, default 360; 0 = off)
+- At 360s without a cycle heartbeat, every thread's Python stack (named,
+  with source lines, main thread first) goes to
+  run-logs\incentive-mm\wedge_<utc>.txt. At the exit (600s) a second
+  snapshot is appended to the same file.
+- Log lines: "! no cycle heartbeat for 3xxs -- stacks -> <path> (main:
+  <innermost frames>)", then the usual "!! no cycle heartbeat ...
+  hard-exiting ..." with the path, the main thread's frames and the handoff
+  result.
+- Reading it: the same main-thread frames in both snapshots = one call
+  wedged. Different frames = a slow loop.
+- 360s clears a restart's first cycle: its refresh ran 167-225s on the WS
+  candidate books (10/10 restarts), 297s on REST (10/9 19:56Z).
+- "cycle heartbeat back after Ns (stacks in <path>): a slow phase, not a
+  wedge" = it recovered after the first snapshot.
+- "hang watchdog: a 30s tick took Ns -- the whole process stalled" = the
+  watchdog thread itself was starved (a thread holding the GIL, or a
+  machine sleep).
+- Stacks come from sys._current_frames(), not faulthandler: faulthandler
+  writes while holding the GIL, so a stalled disk would freeze every thread
+  and the exit with them. Each tick's writes and log lines run on a helper
+  thread given at most 20s (WEDGE_IO_TIMEOUT_SECS), so a stalled disk can
+  delay the exit but never block it (the old exit's own log() could).
+
+(b) MAIN-THREAD NETWORK CALLS, audited
+- Kalshi REST, the trading client (book reads, resting orders, positions,
+  fills, programs, place/amend/cancel):
+  - was (5s connect, 20s read), 3 tries per GET with 1s + 3s backoff, and up
+    to 2 connect retries per try inside the session: ~110s per failing GET,
+    ~35s per write.
+  - now the bot's own client (main() -> bound_trading_client) uses a 10s
+    read and 2 GET tries: ~50s per GET, ~25s per write. The cycle loop is
+    the retry.
+  - Other bots and the offline tools that call imm.build_client keep the
+    shared defaults (KalshiClient.http_timeout / .get_attempts default to
+    the module constants).
+- Pagination loops (resting orders 40 pages, positions 40, fills 20,
+  programs 20): page-capped, and a failed page raises. Unchanged.
+- Refresh pass 2, one book per candidate (~2,500; REST whenever the feed
+  cannot serve: down, not ready, or audit-tripped):
+  - was no time budget at all.
+  - now REST reads stop after 300s (IMM_CAND_REST_BUDGET_SECS) or after 3
+    network failures in a row (IMM_CAND_REST_MAX_FAILS); an HTTP error
+    resets the streak. Feed books are still read.
+  - An unread candidate is what one failed read always was: a member rides
+    through (sticky seeding), a fresh one waits for the next refresh. Logged
+    as "! universe refresh: candidate REST reads stopped after Ns -- <why>;
+    N book(s) not read".
+- Refresh bulk market reads (get_markets, 50 tickers per call, ~70 calls):
+  unchanged. Skipping chunks would drop selected members and cancel them.
+- Event-start resolver (ESPN / MLB statsapi, once per uncached event, up to
+  3 calls each, 15 for WNBA; on the trading thread):
+  - was timeout=10 and no breaker: every event paid its own failure.
+  - now timeout=(5, 10), and one network failure skips that host for 120s.
+    The skipped events get None, cached only until the host is retried, and
+    there is one log line per failure.
+- Managed book reads, REST fallback: the per-call bound above, no loop
+  budget. Cutting the loop would mark its tail blind, and 3 blind cycles
+  cancel quotes. The watchdog plus (c) is the backstop.
+- Unchanged: family series reads (capped at 80 per refresh, usually 0);
+  SMTP alerts (timeout 15 per op); subprocesses (git sha 5s, restart
+  preflight 120s).
+- WS feed and the fair refreshers: on their own threads. The main thread
+  only takes the feed's lock for in-memory reads, and the refreshers talk to
+  it through JSON files.
+- Still unbounded: DNS (getaddrinfo), in every call above. Python has no
+  timeout for it. No resolution failure appears in any of the three windows
+  (TLS errors and WinError 10053 do). If it is the hang, the stacks will
+  show socket.getaddrinfo.
+
+(c) WATCHDOG HANDOFF (IMM_WATCHDOG_HANDOFF, default 1)
+- The exit now writes restart_handoff.json (kind "watchdog") from memory
+  only: no network (the wedged thread may hold the client, and the network
+  may be the trouble) and no _save_persist (the main thread saved after its
+  last placements; the journal holds any since).
+- It lists the ledger's orders that _restart_keep_ok passes. The relaunch
+  (_adopt_restart_handoff) cancels every OTHER resting imm- order first --
+  gated / fast-lane / near-cutoff / unselected markets, and anything placed
+  during the hang -- then adopts the rest. A failed cancel there is adopted,
+  and the first cycle re-prices or strays it.
+- Refused, so the relaunch cancels as before: halted; no full cycle
+  completed in this process (a relaunch that wedges on its first cycle must
+  not keep re-adopting an unpriced book); or the hang outran the exit by
+  more than 120s (the watchdog itself was starved; the book is too old).
+- Why safe: the book had already rested unmanaged through the hang. A
+  planned restart already leaves an adopted book ~5 min before its first
+  re-price (10/9 13:30:24 adopt, refresh done 13:34:40). And the cancel path
+  was no safer: 10/10's startup sweep took 8.5 min (01:58-02:07Z), the
+  orders resting meanwhile, then ~10 min with no book.
+- Startup line: "startup: adopted N ... (WATCHDOG handoff after a Ns hang,
+  stacks <path>; cancelled M it did not list ...)".
+
+Tests: TestWedgeStacks, TestWatchdogHandoff, TestCandidateRestBudget,
+TestResolverHostDown, TestTradingClientBounds (25). Full suite green.
+
+DEPLOY: pushed to origin/main. The :15/:45 ET "KL sync-kl-main"
+fast-forwards KL, and the incentive_mm.py mtime change restarts the bot
+(planned handoff). Live from that restart: its banner area logs
+"[IMM] trading client bounds: 5s connect, 10s read, 2 tries per GET".
+KalshiClientsBaseV2ApiKey_FIXED.py also changed (per-client attributes,
+same defaults); other bots pick it up at their own restarts, unchanged in
+behaviour. BACK OUT: IMM_WATCHDOG_HANDOFF=0 / IMM_CYCLE_HANG_DUMP=0 /
+IMM_CAND_REST_BUDGET_SECS=0 + IMM_CAND_REST_MAX_FAILS=0 /
+IMM_HTTP_READ_TIMEOUT=20 + IMM_HTTP_GET_ATTEMPTS=3 in run_incentive_mm.ps1,
+then restart_imm.ps1 -Task (the launcher env is built once).
+
+Side finding, NOT changed: imm_state.json is 54.4MB, and 52.8MB of it is
+our_order_ids (a 7-day horizon of every order id). _save_persist runs after
+every placing cycle and again in write_status, ~2.2s per dump measured here,
+plus ~108MB of disk writes per cycle. Orders die at the 30-min TTL and the
+fills read starts hours back, so a ~1-day horizon would cut it ~7x.

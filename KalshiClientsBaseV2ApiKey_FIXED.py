@@ -60,6 +60,11 @@ class KalshiClient:
         self.private_key: private_key
         self.user_id = user_id
         self.last_api_call = datetime.now()
+        # Per-client network bounds: the module defaults, so every bot is
+        # unchanged unless it sets its own (incentive_mm.bound_trading_client,
+        # 2026-10-09: a hang watchdog to feed).
+        self.http_timeout = HTTP_TIMEOUT_SECONDS
+        self.get_attempts = GET_RETRY_ATTEMPTS
         # Opt-in HTTP keep-alive (KALSHI_HTTP_KEEPALIVE=1): reuse one pooled
         # TLS connection instead of paying a fresh ~1s handshake on EVERY call
         # (measured 2026-07-19: ~1070ms/call cold vs ~30ms pooled). Default OFF
@@ -106,7 +111,7 @@ class KalshiClient:
 
         response = self._http().post(
             self.host + path, data=body, headers=self.request_headers("POST", path),
-            timeout=HTTP_TIMEOUT_SECONDS,
+            timeout=self.http_timeout,
         )
         self.raise_if_bad_response(response)
         return response.json()
@@ -115,9 +120,10 @@ class KalshiClient:
         """GETs from an authenticated Kalshi HTTP endpoint.
         Returns the response body. Raises an HttpError on non-2XX results.
         Transient failures (connection reset/timeout, 429/5xx) are retried up
-        to GET_RETRY_ATTEMPTS times — safe because GETs are idempotent."""
+        to self.get_attempts (GET_RETRY_ATTEMPTS) times — safe because GETs
+        are idempotent."""
         last_error = None
-        for attempt in range(GET_RETRY_ATTEMPTS):
+        for attempt in range(self.get_attempts):
             if attempt:
                 time.sleep(GET_RETRY_BACKOFF_SECONDS[
                     min(attempt - 1, len(GET_RETRY_BACKOFF_SECONDS) - 1)])
@@ -127,7 +133,7 @@ class KalshiClient:
                 # a timestamp Kalshi rejects once it drifts stale.
                 response = self._http().get(
                     self.host + path, headers=self.request_headers("GET", path), params=params,
-                    timeout=HTTP_TIMEOUT_SECONDS,
+                    timeout=self.http_timeout,
                 )
                 self.raise_if_bad_response(response)
                 return response.json()
@@ -148,7 +154,7 @@ class KalshiClient:
 
         response = self._http().delete(
             self.host + path, headers=self.request_headers("DELETE", path), params=params,
-            timeout=HTTP_TIMEOUT_SECONDS,
+            timeout=self.http_timeout,
         )
         self.raise_if_bad_response(response)
         return response.json()
