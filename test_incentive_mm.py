@@ -7236,6 +7236,9 @@ class TestStickySelection(unittest.TestCase):
         # before, and nothing Kalshi stamps on the market may push it later.
         ov = imm.series_override("KXRAINWKND")
         self.assertEqual(ov.cutoff_before_event_min, 0)
+        # x1 again (Jack 2026-10-09: "undouble weekend rain"); daily stays x2
+        self.assertEqual(imm.applied_mention_mult("KXRAINWKND"), 1.0)
+        self.assertEqual(imm.applied_mention_mult("KXRAIN"), 2.0)
         self.assertEqual((imm.series_price_min("KXRAINWKND"),
                           imm.series_price_max("KXRAINWKND")), (5, 90))
         self.assertIsNone(ov.cutoff_from_close_min)
@@ -13518,13 +13521,18 @@ class TestDailyRainSizeMult(unittest.TestCase):
                              [(t, max(1, int(z * 1.0 + 0.5))) for t, z in base])
 
     def test_every_other_rain_shape_is_x2(self):
-        for s in ("KXRAINNYCM", "KXRAINAUSM", "KXRAINWKND",
+        for s in ("KXRAINNYCM", "KXRAINAUSM",
                   imm.RAINSTORM_ARCHETYPE, "KXRAINNAPAM"):
             self.assertIn(s, imm.SERIES_OVERRIDES, s)
             self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 2.0, s)
             self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
             self.assertEqual(imm.series_max_position(s),
                              2.0 * imm.MAX_POSITION_CONTRACTS, s)
+        # ...except the weekend book, back to x1 (Jack 2026-10-09:
+        # "undouble weekend rain")
+        self.assertEqual(imm.SERIES_OVERRIDES["KXRAINWKND"].size_mult, 1.0)
+        self.assertEqual(imm.series_max_position("KXRAINWKND"),
+                         imm.MAX_POSITION_CONTRACTS)
         self.assertEqual(imm.QUAKE_SIZE_MULT, 4.0)          # Jack 2026-10-07: x4
 
 class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):

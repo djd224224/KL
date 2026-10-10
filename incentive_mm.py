@@ -851,7 +851,8 @@ _RAIN_LEVELS_SPEC = os.environ.get("IMM_RAIN_LEVELS", "").strip()
 # IMM_RAIN_DAILY_SIZE_MULT=1.0 reverts (env => task-level restart).
 # x1.5 -> x2 (Jack 2026-10-07: "add 2x multiplier on ... rain events", then
 # "Bring all rain to x2"): the daily KXRAIN binaries, and the monthlies
-# (RAIN_MONTHLY_SIZE_MULT), weekend KXRAINWKND (RAINWKND_SIZE_MULT) and the
+# (RAIN_MONTHLY_SIZE_MULT), weekend KXRAINWKND (RAINWKND_SIZE_MULT; back to
+# x1 on 10/09) and the
 # KXRAINS<CITY> rainstorm spans (RAINSTORM_SIZE_MULT) with them; the period
 # family (KXRAINNAPAM, RAIN_PERIOD_SIZE_MULT) was already x2. The 19-01 ET
 # halving still composes on top where it applied (dailies, weekend,
@@ -901,7 +902,12 @@ for _s in os.environ.get(
 # which the daily station fair does not price. Allowance is in code
 # (_DEFAULT_WEATHER_SERIES), unlike the daily KXRAIN, which rides the
 # extra-allow file.
-RAINWKND_SIZE_MULT = _env_float("IMM_RAINWKND_SIZE_MULT", 2.0)     # 2026-10-07
+# x2 on 10/07 with every rain family ("Bring all rain to x2"), back to x1
+# 2026-10-09 (Jack: "undouble weekend rain"). The weekend book is the one
+# rain family without a fair gate, and it is the one that loses: -$124 net
+# over the four weeks to 10/9 ($193 rewards vs -$317 trading), -$99 of it
+# in the three days since the x2. The other rain families stay x2.
+RAINWKND_SIZE_MULT = _env_float("IMM_RAINWKND_SIZE_MULT", 1.0)     # 2026-10-09
 for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(

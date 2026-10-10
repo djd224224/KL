@@ -9512,3 +9512,18 @@ before Nov 15 / Mar 24, $200 a market over a 7.5-day program, target 500.
   as the books changed: a live snapshot, not a smoothed figure.
 
 Tests: TestRealEstimates 5. Suite 2,371 OK.
+
+## 2026-10-09 ~02:00Z (10/10) — weekend rain back to x1 (Jack: "undouble weekend rain")
+
+RAINWKND_SIZE_MULT default 2.0 -> 1.0 (IMM_RAINWKND_SIZE_MULT overrides it).
+The 10/07 "Bring all rain to x2" stays on the daily, monthly, storm and
+period rain. Weekend rain is the one rain family without a fair gate (the
+daily station fair doesn't price "rain on either day"), and it is the one
+that loses: -$124 net over the four weeks to 10/9 ($193 rewards vs -$317
+trading), -$99 of it in the three days since the x2. Daily KXRAIN is +$422
+over the same four weeks.
+
+DEPLOY: written into KL with incentive_mm.py's mtime preserved (no restart).
+LIVE AT THE NEXT RESTART. Nothing is lost in between: KXRAINWKND-26OCT10
+stopped quoting at 00:00 ET Saturday (its cutoff), and the next weekend
+event lists Thursday 10/15.
