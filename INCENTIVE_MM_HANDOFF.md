@@ -9544,7 +9544,7 @@ have stopped. IMM_SWEEP_HOLDOUT=0.05 keeps a thin control (~15 trips/day)
 for the scorer. Hold, scope and trigger are unchanged.
 
 
-## 2026-10-10 ~02:50Z — rain: the 13 missing NWS stations, and the mid-move breaker on rain only (Jack: "fix" / "15c move, 30-min pause ... add")
+## 2026-10-10 ~02:20Z — rain: the 13 missing NWS stations, and the mid-move breaker on rain only (Jack: "fix" / "15c move, 30-min pause ... add")
 
 WHY. On 10/09 KXRAIN-26OCT10-CMH went 54 -> 74 -> 14 -> 71 in one day. The
 book sold YES at 14-18c in the trough and lost -$121 on that market. CMH,
@@ -9559,7 +9559,7 @@ it, for two reasons:
    TTN.
    - CLI codes come from the market rules (TAM = CLITPA).
    - Coordinates and time zones come from the NWS station records.
-   - Dry run 02:40Z: 33 stations ok, 0 failed. 10/10 reads CMH 68c (book
+   - Dry run 02:16Z: 33 stations ok, 0 failed. 10/10 reads CMH 68c (book
      71.5), LEX 98c (93.5), TAM 98c (82.5), IND 67c.
    - This prices the new cities for the fair gate and the directional take
      on events 2+ days out. The next-day exemption is unchanged.
@@ -9577,4 +9577,5 @@ it, for two reasons:
 
 DEPLOY: a normal ff of KL, so incentive_mm.py's code-change exit restarts the
 bot with a handoff. That restart also loads rain_fair.py (imported in run())
-and the pending weekend-rain x1 (3b089a9).
+and the pending weekend-rain x1 (3b089a9). Live: run 192dde18 at 02:22:48Z
+(2,724 orders handed over); "rain-fair refresh: 33 stations ok" at 02:24:14Z.
