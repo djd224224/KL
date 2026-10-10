@@ -9928,3 +9928,47 @@ first save prunes ~850k ids. Check after the restart that imm_state.json is
 ~4MB. BACK OUT: IMM_ORDER_ID_KEEP_HOURS=168 in run_incentive_mm.ps1
 restores 7 days of ids (still before the cursor), then restart_imm.ps1
 -Task. The single save has no knob: revert the commit.
+
+## 2026-10-10 ~11:50Z — Carbon Arc ad spend: the gate works through a vague read (ad spend + apps), and ad spend holds 60 min after new data (Jack: "Do 1 and 2")
+
+WHAT HAPPENED 10/10. The first October ad-spend read landed at 02:32 ET
+(prism refresh). The bot held every ADS market 10 min, then resumed at the
+old prices. 8 of the 11 ADS series had sigma > 20% of mu (Fitness 45%,
+Footwear 49%, Sportsbook 90%), so CA_FAIR_MAX_REL_SIGMA dropped their gate
+entirely. From 03:20 to 05:43 ET informed takers swept 20 rungs, mostly
+120-150-lot overnight x3 rungs, for -$424 to date. The reads were decisive at
+those strikes despite their width:
+- Electronics read 200 vs our 43c ask on T130: fair 93c.
+- Fitness read 61 vs our 58c bid on T115: fair 2c.
+October ADS went from about +$220 to -$186 net.
+
+1. CA_FAIR_REL_SIGMA_EXEMPT (IMM_CA_FAIR_REL_SIGMA_EXEMPT, default
+   "advertising,app"): the 20%-of-mu cut-off no longer drops the gate for
+   these prism categories. The band, which widens with sigma, decides alone.
+   - Replay: it would have capped 7 of the 20 fills, $343 of the $424.
+   - Their September sigmas were calibrated (rms err / sigma 0.7-1.1).
+   - Card spend keeps the cut-off: its day-1 reads ran 2.8x sigma.
+   - Live before the change: 29 of 93 series had no gate (ads 8/11, apps
+     14/23, card 6/31, POS 1/18).
+2. CA_FAIR_REFRESH_HOLD_BY_CAT (IMM_CA_FAIR_REFRESH_HOLD_BY_CAT, default
+   "advertising:60"): ad spend holds 60 min after a read moves; the rest keep
+   CA_FAIR_REFRESH_HOLD_MIN (10).
+   - ADS data lands in lumps every 1-5 days, 3 of its 5 drops at night.
+   - Replay: 60 min covers $250 of the $424, for ~$1.20 of reward per drop.
+3. BUG FOUND ON THE WAY: load_ca_fair kept only mu/sigma/month/ts and DROPPED
+   the prism category. It now keeps "category", which both rules key on.
+
+Arrival times (prism refresh, ET, 9/27-10/10):
+- point of sale 07-08h (12 of 13);
+- foot traffic ~08h (12 of 16);
+- apps mostly 08-10h (also 04-06h, 14-17h);
+- card spend 11-14h (all 18);
+- ad spend 02h x2, 11h x2, 21h x1.
+Only ad spend lands at night, but the quiet-hours x3 runs 00-08h ET (through
+08:59), so POS, FT and most app drops also land on x3 size. The x3
+recommendation for Carbon Arc is open with Jack.
+
+Tests: TestCarbonArcFairGate.test_ad_spend_and_apps_gate_through_a_vague_read
+and .test_ad_spend_holds_an_hour_after_a_new_read. test_incentive_mm 1171 OK.
+
+DEPLOY: ff KL; the code-change exit restarts the bot (handoff).

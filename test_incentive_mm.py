@@ -10933,6 +10933,48 @@ class TestCarbonArcFairGate(unittest.TestCase):
         self.assertEqual(imm.fair_gate_breach(3, 6, lo * 100, 15, hi * 100),
                          (False, False))
 
+    def test_ad_spend_and_apps_gate_through_a_vague_read(self):
+        # Jack 2026-10-10 "do 1 and 2", after the ad-spend sweep: Fitness
+        # read 61 with sigma 27 (45% of mu) vs our 58c bid on T115 -- the
+        # 20%-of-mu cut-off dropped the gate; for ad spend / apps it no longer
+        # does, so the far strike's breach caps the bid
+        t = "KXFAKECC-68DEC07-T115"
+        vague = dict(self._entry(61.0, sigma=27.4), category="Advertising")
+        self._write_fair({"KXFAKECC": vague})
+        band = imm.ca_fair_band(t, time.time())
+        self.assertIsNotNone(band)
+        _pc, lo, hi = band
+        self.assertLess(hi, 0.05)                          # fair ~2c
+        self.assertEqual(imm.fair_gate_breach(56, 60, lo * 100,
+                                              imm.CA_FAIR_TOL_CENTS, hi * 100),
+                         (True, False))
+        self._write_fair({"KXFAKECC": dict(vague, category="App", mu=61.2)})
+        self.assertIsNotNone(imm.ca_fair_band(t, time.time()))
+        # card spend keeps the cut-off (its early reads ran 2.8x sigma)
+        self._write_fair({"KXFAKECC": dict(vague, category="Credit Card", mu=61.4)})
+        self.assertIsNone(imm.ca_fair_band(t, time.time()))
+        with mock.patch.object(imm, "CA_FAIR_REL_SIGMA_EXEMPT", frozenset()):
+            self._write_fair({"KXFAKECC": dict(vague, mu=61.6)})
+            self.assertIsNone(imm.ca_fair_band(t, time.time()))
+
+    def test_ad_spend_holds_an_hour_after_a_new_read(self):
+        # Jack 2026-10-10: the sweep came 47 min - 3 h after the 02:32 ET
+        # read; ad spend holds 60 min, the other categories keep 10
+        self.assertEqual(imm.ca_refresh_hold_min("Advertising"), 60)
+        self.assertEqual(imm.ca_refresh_hold_min("Point of Sale"),
+                         imm.CA_FAIR_REFRESH_HOLD_MIN)
+        ads = dict(self._entry(100.0), category="Advertising")
+        self._write_fair({"KXFAKECC": ads})                      # first load
+        self._write_fair({"KXFAKECC": dict(ads, mu=100.4)})      # read moved
+        now_ts = time.time()
+        self.assertTrue(imm.ca_refresh_held(self.T, now_ts + 30 * 60))
+        self.assertFalse(imm.ca_refresh_held(self.T, now_ts + 61 * 60))
+        pos = dict(ads, category="Point of Sale", mu=100.9)
+        self._write_fair({"KXFAKECC": pos})                      # moved again
+        now_ts = time.time()
+        self.assertTrue(imm.ca_refresh_held(self.T, now_ts + 5 * 60))
+        self.assertFalse(imm.ca_refresh_held(self.T, now_ts + 30 * 60))
+
     def test_refresh_hold_after_a_moved_read_not_on_first_load(self):
         self._write_fair({"KXFAKECC": self._entry(100.0)})     # first load
         self.assertFalse(imm.ca_refresh_held(self.T, time.time()))

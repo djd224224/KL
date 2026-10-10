@@ -7575,6 +7575,7 @@ _CONFIG_CODE_KNOBS = (
     # carbon_arc_fair.py and ride along in the fair file's "model" block
     "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
     "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
+    "CA_FAIR_REL_SIGMA_EXEMPT", "CA_FAIR_REFRESH_HOLD_BY_CAT",   # ADS / apps (2026-10-10)
     "CA_FAIR_CAP",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
     # fair file's "model" block (openrouter_fair.py)
@@ -8462,6 +8463,44 @@ CA_FAIR_REFRESH_SECS = _env_int("IMM_CA_FAIR_REFRESH_SECS", 120)
 CA_FAIR_SIGMA_LO_FRAC = _env_float("IMM_CA_FAIR_SIGMA_LO_FRAC", 0.5)
 CA_FAIR_MAX_REL_SIGMA = _env_float("IMM_CA_FAIR_MAX_REL_SIGMA", 0.20)
 CA_FAIR_REFRESH_HOLD_MIN = _env_float("IMM_CA_FAIR_REFRESH_HOLD_MIN", 10)
+# AD SPEND AND APPS GATE THROUGH A VAGUE READ (Jack 2026-10-10: "do 1 and 2",
+# after the 10/10 ad-spend sweep). The first October ad-spend read landed at
+# 02:32 ET; 8 of the 11 ADS series had sigma > 20% of mu (Fitness 45%,
+# Footwear 49%, Sportsbook 90%), so the cut-off above dropped their gate
+# entirely, and 03:20-05:43 ET informed takers swept 20 rungs for -$424 --
+# against reads that were decisive at those strikes despite the width
+# (Electronics read 200 vs our 43c ask on T130: fair 93c; Fitness 61 vs our
+# 58c bid on T115: fair 2c). The band already widens with sigma, so a vague
+# read only trips strikes far from it: replayed, keeping the gate would have
+# capped 7 of the 20 fills, $343 of the $424. Lifted for ad spend and apps,
+# whose September sigmas were calibrated (rms error / sigma 0.7-1.1 on days
+# 6-30); card spend keeps the cut-off (its early reads ran 2.8x sigma on day
+# 1). Categories are the prism's, lowercased. Empty = the cut-off everywhere.
+CA_FAIR_REL_SIGMA_EXEMPT = frozenset(c.strip().lower() for c in os.environ.get(
+    "IMM_CA_FAIR_REL_SIGMA_EXEMPT", "advertising,app").split(",") if c.strip())
+# ...and AD SPEND HOLDS 60 MIN after a new read (same day): its data lands in
+# lumps every 1-5 days, three of its five drops at night (21:29, 02:31,
+# 02:32 ET), and on 10/10 the sweep came 47 min to 3 h after the read --
+# long after the 10-minute hold had lifted. Replayed, a 60-minute hold covers
+# $250 of the $424, for ~$1.20 of reward per drop (ADS earns ~$29/day).
+# "category:minutes,..." per prism category; the rest keep
+# CA_FAIR_REFRESH_HOLD_MIN.
+CA_FAIR_REFRESH_HOLD_BY_CAT: Dict[str, float] = {}
+for _part in os.environ.get("IMM_CA_FAIR_REFRESH_HOLD_BY_CAT", "advertising:60").split(","):
+    if ":" in _part:
+        _cat, _min = _part.rsplit(":", 1)
+        try:
+            CA_FAIR_REFRESH_HOLD_BY_CAT[_cat.strip().lower()] = float(_min)
+        except ValueError:
+            pass
+
+
+def ca_refresh_hold_min(category) -> float:
+    """The post-read hold, in minutes, for a prism category."""
+    return CA_FAIR_REFRESH_HOLD_BY_CAT.get(str(category or "").strip().lower(),
+                                           CA_FAIR_REFRESH_HOLD_MIN)
+
+
 CA_FAIR_FILE = os.environ.get(
     "IMM_CA_FAIR_FILE", os.path.join(STATUS_DIR, "carbon_arc_fair.json"))
 # series -> entry; series -> epoch its read last moved (refresh hold)
@@ -8527,7 +8566,10 @@ def load_ca_fair() -> Tuple[int, int]:
                 or sigma <= 0:
             continue
         fresh[str(series)] = {"mu": mu, "sigma": sigma, "month": month,
-                              "ts": ts.timestamp()}
+                              "ts": ts.timestamp(),
+                              # the prism's category: the per-category noise
+                              # cut-off and hold (2026-10-10) key on it
+                              "category": str(e.get("category") or "")}
     moved = [s for s, e in fresh.items()
              if (old.get(s) or {}).get("mu") != e["mu"]
              or (old.get(s) or {}).get("month") != e["month"]]
@@ -8593,13 +8635,15 @@ def ca_fair_band(ticker: str, now_ts: float
     """(p_center, p_lo, p_hi): P(first print > K) at sigma and at sigma *
     CA_FAIR_SIGMA_LO_FRAC. None when there is no fresh read of the market's
     month, or the read is too uncertain to overrule the book (sigma above
-    CA_FAIR_MAX_REL_SIGMA of mu)."""
+    CA_FAIR_MAX_REL_SIGMA of mu, except the CA_FAIR_REL_SIGMA_EXEMPT
+    categories, whose band alone decides)."""
     r = _ca_read(ticker, now_ts)
     if r is None:
         return None
     e, k = r
     if CA_FAIR_MAX_REL_SIGMA > 0 and \
-            e["sigma"] > CA_FAIR_MAX_REL_SIGMA * abs(e["mu"]):
+            e["sigma"] > CA_FAIR_MAX_REL_SIGMA * abs(e["mu"]) and \
+            str(e.get("category") or "").strip().lower() not in CA_FAIR_REL_SIGMA_EXEMPT:
         return None
     pc = _p_above(k, e["mu"], e["sigma"])
     pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * CA_FAIR_SIGMA_LO_FRAC))
@@ -8607,14 +8651,18 @@ def ca_fair_band(ticker: str, now_ts: float
 
 
 def ca_refresh_held(ticker: str, now_ts: float) -> bool:
-    """True for CA_FAIR_REFRESH_HOLD_MIN after this series' read moved, for
-    a market of the read's month (the book is repricing to new data)."""
-    if CA_FAIR_REFRESH_HOLD_MIN <= 0:
-        return False
+    """True for the category's hold (ca_refresh_hold_min) after this series'
+    read moved, for a market of the read's month (the book is repricing to
+    new data)."""
     moved = _ca_fair_state["moved_at"].get(series_of(ticker))
-    if moved is None or now_ts - moved > CA_FAIR_REFRESH_HOLD_MIN * 60:
+    longest = max([CA_FAIR_REFRESH_HOLD_MIN, *CA_FAIR_REFRESH_HOLD_BY_CAT.values()])
+    if moved is None or now_ts - moved > longest * 60:
+        return False                 # past every hold: skip the read lookup
+    r = _ca_read(ticker, now_ts)
+    if r is None:
         return False
-    return _ca_read(ticker, now_ts) is not None
+    hold = ca_refresh_hold_min(r[0].get("category"))
+    return hold > 0 and now_ts - moved <= hold * 60
 
 
 def fair_gate_breach(ext_bid: Optional[float], ext_ask: Optional[float],
@@ -20343,10 +20391,12 @@ class IncentiveMarketMaker:
                 ca_in: dict = {}     # guard-skip inputs, built on THIS path
                 band = None
                 if ca_refresh_held(t, now_ts):
+                    _ca_r = _ca_read(t, now_ts)
+                    _ca_hold = ca_refresh_hold_min(
+                        _ca_r[0].get("category") if _ca_r else None)
                     ca_why = (f"new Carbon Arc read, holding "
-                              f"{CA_FAIR_REFRESH_HOLD_MIN:g}m while the book "
-                              f"reprices")
-                    ca_in = dict(hold_min=CA_FAIR_REFRESH_HOLD_MIN)
+                              f"{_ca_hold:g}m while the book reprices")
+                    ca_in = dict(hold_min=_ca_hold)
                 else:
                     band = ca_fair_band(t, now_ts)
                     if band is not None:
@@ -23017,8 +23067,12 @@ class IncentiveMarketMaker:
         if CA_FAIR_ENABLE:
             log(f"ca-fair gate: Carbon Arc-settled at-touch, tol "
                 f"{CA_FAIR_TOL_CENTS}c, band sigma x{CA_FAIR_SIGMA_LO_FRAC:g}-1, "
-                f"max sigma {CA_FAIR_MAX_REL_SIGMA:g} of mu, refresh hold "
-                f"{CA_FAIR_REFRESH_HOLD_MIN:g}m, ttl {CA_FAIR_TTL_MIN}m, "
+                f"max sigma {CA_FAIR_MAX_REL_SIGMA:g} of mu"
+                + (f" (not {','.join(sorted(CA_FAIR_REL_SIGMA_EXEMPT))})"
+                   if CA_FAIR_REL_SIGMA_EXEMPT else "")
+                + f", refresh hold {CA_FAIR_REFRESH_HOLD_MIN:g}m"
+                + "".join(f" ({c} {m:g}m)" for c, m in sorted(CA_FAIR_REFRESH_HOLD_BY_CAT.items()))
+                + f", ttl {CA_FAIR_TTL_MIN}m, "
                 f"refresh {CA_FAIR_REFRESH_SECS}s, a breach "
                 + ("caps the side (rests only while it earns)" if CA_FAIR_CAP
                    else "parks both sides")
