@@ -27,19 +27,33 @@ fetched 2026-07-28 (note CHI=O'Hare, DAL=DFW, HOU=IAH, NYC=Central Park),
 and the 13 cities Kalshi listed since, added 2026-10-09 (Jack: "fix"), after
 CMH/TAM/ABQ/LEX went unpriced on a -$196 day. Their coordinates and time zones
 are the NWS station records (api.weather.gov/stations/K...); note TAM=CLITPA.
-A city Kalshi adds later needs its own row here.
+
+NEW CITIES ARE MODELED AUTOMATICALLY (Jack 2026-10-09: "when new markets are
+added onto an event that is modeled separately like cities in rain, they
+should automatically be modeled generally"). Every DISCOVER_SECS the writer
+reads Kalshi's open KXRAIN markets (signed reader when the bot hands one
+over, else the public endpoint). Any city suffix without a STATIONS row is
+resolved from its own rules: "total precipitation at CLITPA" names the CLI
+product, whose airport is K + code (PHNL-style P + code as a fallback), and
+the NWS station record gives coordinates and time zone. Resolved rows live
+in the output file's "auto_stations" and are priced exactly like the seed
+table, which always wins. A listed city that can't be resolved (no CLI code
+in its rules, no NWS station) goes to "unmapped" with the reason. The IMM
+family watch alerts on that list (model coverage), so a city the bot quotes
+without a fair never goes unnoticed.
 Per-station failures keep the previous entry (with its old fetched_at, so
 the bot's TTL naturally expires it) — one flaky NWS endpoint must not
-blank the other 19 cities.
+blank the other cities.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytz
 import requests
@@ -86,6 +100,12 @@ HOURLY_EXP = float(os.environ.get("RAIN_FAIR_HOURLY_EXP", "0.5"))
 P_FLOOR, P_CAP = 0.02, 0.98
 UA = {"User-Agent": "KL rain_fair (jackdu224@gmail.com)"}
 TIMEOUT = 20
+# auto-discovery of the cities Kalshi lists (see the module docstring)
+SERIES = "KXRAIN"
+KALSHI_MARKETS_URL = os.environ.get(
+    "RAIN_FAIR_MARKETS_URL", "https://api.elections.kalshi.com/trade-api/v2/markets")
+DISCOVER_SECS = float(os.environ.get("RAIN_FAIR_DISCOVER_SECS", str(6 * 3600)))
+_CLI_RE = re.compile(r"\bCLI([A-Z0-9]{3})\b")
 
 
 def _get_json(url: str, retries: int = 2) -> dict:
@@ -101,8 +121,66 @@ def _get_json(url: str, retries: int = 2) -> dict:
     raise RuntimeError(f"GET {url}: {last}")
 
 
-def resolve_hourly_url(city: str) -> str:
-    st = STATIONS[city]
+def _markets_page(params: dict, get_json: Optional[Callable] = None) -> dict:
+    """One /markets page: the bot's signed reader when it handed one over,
+    else (or on its failure) the public endpoint."""
+    if get_json is not None:
+        try:
+            js = get_json("/markets", dict(params))
+            if isinstance(js, dict):
+                return js
+        except Exception:                            # noqa: BLE001 - public fallback
+            pass
+    r = requests.get(KALSHI_MARKETS_URL, params=params, headers=UA, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json() or {}
+
+
+def listed_cities(get_json: Optional[Callable] = None) -> Dict[str, Optional[str]]:
+    """{city suffix: CLI product named in its rules, or None} for every open
+    KXRAIN market Kalshi lists right now."""
+    out: Dict[str, Optional[str]] = {}
+    cursor = None
+    for _ in range(20):
+        params = {"series_ticker": SERIES, "status": "open", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        js = _markets_page(params, get_json)
+        for m in js.get("markets") or []:
+            parts = str(m.get("ticker") or "").split("-")
+            if len(parts) != 3 or parts[0] != SERIES:
+                continue
+            hit = _CLI_RE.search(str(m.get("rules_primary") or ""))
+            if out.get(parts[2]) is None:
+                out[parts[2]] = hit.group(0) if hit else None
+        cursor = js.get("cursor")
+        if not cursor:
+            break
+    return out
+
+
+def resolve_station(cli: str) -> dict:
+    """A STATIONS-shaped row for a CLI product ("CLITPA") from the NWS
+    record of its airport: K + code, then P + code (Alaska / Hawaii)."""
+    code = cli[3:]
+    errs = []
+    for sid in (f"K{code}", f"P{code}"):
+        try:
+            js = _get_json(f"https://api.weather.gov/stations/{sid}", retries=1)
+        except RuntimeError as e:
+            errs.append(str(e)[:80])
+            continue
+        lon, lat = (js.get("geometry") or {}).get("coordinates")[:2]
+        props = js.get("properties") or {}
+        tz = props.get("timeZone")
+        pytz.timezone(tz)                            # raises on an unknown zone
+        return {"cli": cli, "name": props.get("name") or sid, "lat": round(float(lat), 3),
+                "lon": round(float(lon), 3), "tz": tz, "station": sid, "auto": True}
+    raise RuntimeError(f"no NWS station for {cli} ({'; '.join(errs)})")
+
+
+def resolve_hourly_url(city: str, st: Optional[dict] = None) -> str:
+    st = st or STATIONS[city]
     pts = _get_json(f"https://api.weather.gov/points/{st['lat']:.4f},{st['lon']:.4f}")
     url = (pts.get("properties") or {}).get("forecastHourly")
     if not url:
@@ -144,8 +222,53 @@ def day_probability(pops: List[Tuple[datetime, float]], tzname: str,
             "n_hours": len(hours), "fetched_at": now_utc.isoformat()}
 
 
-def write_fair_file(path: str, days: int = 3) -> Tuple[int, int]:
-    """Refresh fair values for every station x next `days` local days.
+def discover_stations(old: dict, now_ts: float, get_json: Optional[Callable] = None,
+                      lister: Callable = listed_cities,
+                      resolver: Callable = resolve_station
+                      ) -> Tuple[Dict[str, dict], Dict[str, Optional[str]],
+                                 Optional[float], Dict[str, str], List[str]]:
+    """The auto-modeled cities: (auto_stations, listed, listed_at, unmapped,
+    errors). Kalshi's listing is re-read every DISCOVER_SECS (a failed read
+    keeps the previous one). Every listed city without a STATIONS row gets
+    an auto row from its rules' CLI product, or an "unmapped" reason; an auto
+    row whose city Kalshi no longer lists is dropped."""
+    auto: Dict[str, dict] = dict(old.get("auto_stations") or {})
+    listed: Dict[str, Optional[str]] = dict(old.get("listed") or {})
+    listed_at = old.get("listed_at")
+    errors: List[str] = []
+    if listed_at is None or now_ts - float(listed_at) >= DISCOVER_SECS:
+        try:
+            fresh = lister(get_json)
+            if fresh:
+                listed, listed_at = fresh, now_ts
+            else:
+                errors.append("discovery: Kalshi listed no open KXRAIN market")
+        except Exception as e:                       # noqa: BLE001 - keep the old listing
+            errors.append(f"discovery: {e}"[:160])
+    if listed:
+        auto = {c: v for c, v in auto.items() if c in listed}
+    unmapped: Dict[str, str] = {}
+    for city, cli in sorted(listed.items()):
+        if city in STATIONS:
+            continue
+        have = auto.get(city)
+        if have and (cli is None or have.get("cli") == cli):
+            continue
+        if not cli:
+            unmapped[city] = "no CLI station named in the market rules"
+            continue
+        try:
+            auto[city] = resolver(cli)
+        except Exception as e:                       # noqa: BLE001 - retried next write
+            unmapped[city] = f"{cli}: {e}"[:160]
+    return auto, listed, listed_at, unmapped, errors
+
+
+def write_fair_file(path: str, days: int = 3, get_json: Optional[Callable] = None,
+                    discover: bool = True, lister: Callable = listed_cities,
+                    resolver: Callable = resolve_station) -> Tuple[int, int]:
+    """Refresh fair values for every station x next `days` local days: the
+    seed STATIONS plus the auto-modeled cities (discover_stations).
     Merges over the existing file (failed stations keep old entries and old
     fetched_at). Returns (stations_ok, stations_failed)."""
     now_utc = datetime.now(timezone.utc)
@@ -160,17 +283,26 @@ def write_fair_file(path: str, days: int = 3) -> Tuple[int, int]:
 
     ok = failed = 0
     errors: List[str] = []
-    for city, st in STATIONS.items():
+    auto: Dict[str, dict] = dict(old.get("auto_stations") or {})
+    listed = dict(old.get("listed") or {})
+    listed_at, unmapped = old.get("listed_at"), dict(old.get("unmapped") or {})
+    if discover:
+        auto, listed, listed_at, unmapped, errs = discover_stations(
+            old, now_utc.timestamp(), get_json, lister, resolver)
+        errors += errs
+    stations: Dict[str, dict] = dict(auto)
+    stations.update(STATIONS)                        # the verified seed rows win
+    for city, st in stations.items():
         try:
             url = grid_urls.get(city)
             if not url:
-                url = resolve_hourly_url(city)
+                url = resolve_hourly_url(city, st)
                 grid_urls[city] = url
             try:
                 pops = fetch_hourly_pops(url)
             except RuntimeError:
                 # cached gridpoint may have gone stale/moved -> re-resolve once
-                url = resolve_hourly_url(city)
+                url = resolve_hourly_url(city, st)
                 grid_urls[city] = url
                 pops = fetch_hourly_pops(url)
             local_today = now_utc.astimezone(pytz.timezone(st["tz"])).date()
@@ -190,7 +322,10 @@ def write_fair_file(path: str, days: int = 3) -> Tuple[int, int]:
     fair = {d: c for d, c in fair.items() if d >= cutoff}
 
     out = {"generated_at": now_utc.isoformat(), "hourly_exp": HOURLY_EXP,
-           "fair": fair, "grid_urls": grid_urls, "errors": errors[:10]}
+           "fair": fair, "grid_urls": grid_urls, "errors": errors[:10],
+           # model coverage: auto rows, Kalshi's listing, the cities with none
+           "auto_stations": auto, "listed": listed, "listed_at": listed_at,
+           "unmapped": unmapped}
     tmp = path + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
@@ -214,6 +349,10 @@ def main() -> int:
         row = "  ".join(f"{c}:{int(round(e['p'] * 100)):>2}c"
                         for c, e in sorted(cities.items()))
         print(f"{date_iso}  {row}")
+    for city, st in sorted((data.get("auto_stations") or {}).items()):
+        print(f"  auto: {city} = {st.get('cli')} {st.get('station')} {st.get('name')}")
+    for city, why in sorted((data.get("unmapped") or {}).items()):
+        print(f"  ! UNMAPPED {city}: {why}")
     for err in data.get("errors") or []:
         print(f"  ! {err}")
     return 1 if failed and not ok else 0

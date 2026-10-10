@@ -21554,13 +21554,15 @@ class TestSignedFairReads(unittest.TestCase):
 
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
-        monthly rain, monthly snow and GasBuddy refreshers each build a
-        reader with fair_reader() and pass it to their module's
-        write_fair_file (the threads live inside run(), so read its source)."""
+        monthly rain, monthly snow, GasBuddy and daily rain (its city
+        discovery, 2026-10-09) refreshers each build a reader with
+        fair_reader() and pass it to their module's write_fair_file (the
+        threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 6)
-        for mod, path in (("carbon_arc_fair", "CA_FAIR_FILE"),
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 7)
+        for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
+                          ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
                           ("openrouter_share_fair", "SHARE_FAIR_FILE"),
                           ("rain_monthly_fair", "RAIN_MONTHLY_FILE"),

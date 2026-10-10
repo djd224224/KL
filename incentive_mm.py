@@ -21932,11 +21932,23 @@ class IncentiveMarketMaker:
                 except Exception as e:
                     log(f"{self.tag} ! rain-fair refresher disabled: {e}")
                     return
+                # the writer also reads Kalshi's open KXRAIN cities and
+                # models any new one from its rules (2026-10-09); a city it
+                # can't resolve lands in the file's "unmapped" list, which
+                # the family watch alerts on
+                kalshi_get = fair_reader()
                 while True:
                     try:
-                        ok, fail = rain_fair.write_fair_file(RAIN_FAIR_FILE)
+                        ok, fail = rain_fair.write_fair_file(
+                            RAIN_FAIR_FILE, get_json=kalshi_get)
+                        with open(RAIN_FAIR_FILE, encoding="utf-8") as fh:
+                            _rf = json.load(fh) or {}
+                        _auto = sorted((_rf.get("auto_stations") or {}))
+                        _um = sorted((_rf.get("unmapped") or {}))
                         log(f"{self.tag} rain-fair refresh: {ok} stations ok"
-                            + (f", {fail} FAILED" if fail else ""))
+                            + (f", {fail} FAILED" if fail else "")
+                            + (f"; auto-modeled {','.join(_auto)}" if _auto else "")
+                            + (f"; ! UNMAPPED {','.join(_um)}" if _um else ""))
                     except Exception as e:
                         log(f"{self.tag} ! rain-fair refresh failed: {e}")
                     time.sleep(max(300, RAIN_FAIR_REFRESH_MIN * 60))

@@ -9613,3 +9613,58 @@ TWO BUGS, FIXED.
 
 Tests: TestResearchResilience 3; the drop test updated for the grace.
 Suite 2,389 OK.
+
+## 2026-10-10 ~02:50Z — new markets in per-entity families: modeled automatically where possible, ALERTED otherwise (Jack: "when new markets are added onto an event that is modeled separately like cities in rain, they should automatically be modeled generally....ensure i get alerted if this is not the case")
+
+1. **Daily rain models a new city by itself.** Every 6h (RAIN_FAIR_DISCOVER_SECS)
+   rain_fair reads Kalshi's open KXRAIN markets, using the bot's signed reader
+   (kalshi_get, now 7 refreshers in the wiring test) or the public endpoint.
+   - A city with no STATIONS row is resolved from its rules: "CLITPA" -> KTPA
+     (K + code, then P + code), with coordinates and zone from the NWS station
+     record.
+   - These rows live in rain_fair_values.json "auto_stations". The seed table
+     wins.
+   - What can't be resolved goes to "unmapped" with the reason. The refresh log
+     line names both ("auto-modeled X", "! UNMAPPED Y").
+2. **Everything else is alerted.** imm_model_coverage.py runs as family-watch
+   pass 5, every 30 min. It checks each paying market against its family's
+   model, using the bot's own membership tests and the fair files.
+
+   | Family | What it checks | Fail mode |
+   |---|---|---|
+   | Daily rain | city has a station | open |
+   | Carbon Arc | carbon_arc_settled series is in series_map | open |
+   | Monthly/period rain, snow | event state "no station" or never read | closed |
+   | Pokemon | unmapped event or missing from the read | closed |
+   | NFL props | not in the read, or err | closed |
+   | Treasury | classify / strike_of | closed |
+   | Vercel | series not in LAB_SERIES, or unparsed event | closed |
+   | Data center | state with programs but no count | closed |
+   | YouTube weekly | artist not in YTW_ARTISTS | once, by design |
+   | Sports ladders | league other than NFL that the bot allows | open |
+   | Vercel labs | lab in the logger export but not OPEN_WEIGHT_LABS | once |
+
+   - A stale fair file (> 6h) and a check that raises are gaps too.
+   - Email: "IMM-WATCH model coverage: N gap(s)". A gap is sent on first sight,
+     then every 24h while open. A by-design "once" gap is sent once and
+     remembered 30 days after it closes. On the pass's first run the existing
+     once-gaps are baselined without an email: 12 YouTube artists outside the
+     pilot and 28 export labs outside the open-weight list (incl.
+     typesafe-ai, spacexai, perplexity, meta, mistral).
+   - If the pass itself fails it emails "...pass FAILED", at most daily.
+   - Live check at deploy: 40 gaps over 6,811 paying markets, all once-gaps,
+     0 real. KXDPZFT/KXSBUXFT/KXWMTFT (Carbon Arc FT with a generic settlement
+     link, unmapped) have no live programs now. They will alert when they
+     get one.
+   - Mortgage is left out: it is shape-only and its rules gaps are config gaps.
+   - KXAVGT / KXTEMP / KXAQICITY per-station rows fall back to defaults; not
+     checked.
+   - CLI: `python imm_model_coverage.py` prints the current gaps (read-only).
+     `imm_family_watch.py --no-model` skips the pass.
+
+Tests: test_rain_fair (auto stations: resolve, unmapped, cadence, delist,
+rules parse), test_imm_model_coverage (8), test_imm_family_watch
+TestModelCoveragePass, and test_incentive_mm's wiring guard (7 refreshers).
+
+DEPLOY: ff KL. The code-change exit restarts the bot, which loads the new
+rain_fair. The watch picks up pass 5 on its next run.

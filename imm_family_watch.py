@@ -29,6 +29,15 @@ threshold". Three passes, each fail-safe on its own:
    pool $/day x GAP_CAPTURE where no book was read): the live
    bot's config gaps (re-sent daily while open), and series that newly appear
    paying but not allowed -- a new family, which is Jack's call (sent once).
+5. MODEL COVERAGE (2026-10-09, Jack: "when new markets are added onto an event
+   that is modeled separately like cities in rain, they should automatically
+   be modeled generally....ensure i get alerted if this is not the case") --
+   imm_model_coverage checks every paying market of a per-entity-modeled
+   family (daily rain cities, Carbon Arc entities, monthly rain / snow
+   stations, Pokemon items, NFL players, Treasury shapes, Vercel labs, data
+   center states, the YouTube pilot's artists, non-NFL sports ladders) against
+   its model and emails what is not modeled: on first sight, then daily while
+   open (a by-design exclusion once). A failing pass is emailed too (daily).
 
 Imports imm_quote_gaps first: it mirrors the launcher's env (blocklist, allow
 lists, pilots) before incentive_mm is imported, so "allowed" means what the live
@@ -780,6 +789,40 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
     return targets, notes
 
 
+MODEL_PASS_ERR_HOURS = 24.0
+
+
+def model_coverage_pass(progs: Dict[str, dict], state: dict, dry: bool,
+                        summary: List[str]) -> None:
+    """Pass 5 (Jack 2026-10-09): every paying market in a per-entity-modeled
+    family must be modeled (imm_model_coverage). A gap is emailed on first
+    sight and re-sent daily while open; the pass's own failure is emailed
+    too (at most daily), so a broken check can never go quiet."""
+    import imm_model_coverage as mcov
+    now_ts = time.time()
+    try:
+        gaps = mcov.find_gaps(progs, now_ts)
+        first = "model_gaps" not in state
+        due_m, state["model_gaps"] = mcov.due(state.get("model_gaps") or {}, gaps,
+                                              now_ts, baseline_once=first)
+        if due_m:
+            subject, text = mcov.body(due_m)
+            log("[WATCH] model coverage alert:\n" + text)
+            if not dry:
+                imm.Alerter("IMM-WATCH", live=True).send_message(text, subject)
+        summary.append(f"model gaps {len(gaps)}, alerted {len(due_m)}")
+    except Exception as e:                           # noqa: BLE001 - emailed below
+        log(f"[WATCH] ! model coverage pass failed: {e!r}")
+        last = state.get("model_pass_err_sent") or 0
+        if not dry and now_ts - float(last) >= MODEL_PASS_ERR_HOURS * 3600:
+            imm.Alerter("IMM-WATCH", live=True).send_message(
+                f"The IMM family watch's model coverage pass failed: {e!r}\n"
+                f"Until it is fixed, new markets that are not modeled are NOT "
+                f"being reported. Log: run-logs\\incentive-mm\\family-watch.log",
+                "IMM-WATCH model coverage pass FAILED")
+            state["model_pass_err_sent"] = now_ts
+
+
 def _load_state() -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -802,6 +845,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-date", action="store_true")
     ap.add_argument("--no-research", action="store_true")
     ap.add_argument("--no-alert", action="store_true")
+    ap.add_argument("--no-model", action="store_true", help="skip pass 5 (model coverage)")
     args = ap.parse_args(argv)
     t0 = time.time()
     client = ieo.build_client()
@@ -871,6 +915,8 @@ def main(argv=None) -> int:
             summary.append(f"tracking {len(items)}, alerted {len(due)}")
         except Exception as e:
             log(f"[WATCH] ! alert pass failed: {e!r}")
+    if not args.no_model:
+        model_coverage_pass(progs, state, args.dry, summary)
     if not args.dry:
         _save_state(state)
     log(f"[WATCH] {', '.join(summary)} ({time.time() - t0:.0f}s"

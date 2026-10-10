@@ -607,3 +607,34 @@ class TestResearchResilience(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModelCoveragePass(unittest.TestCase):
+    """Pass 5 (Jack 2026-10-09: "ensure i get alerted"): gaps are emailed,
+    and a failing pass is emailed too -- at most daily -- so it can never go
+    quiet."""
+
+    def test_gaps_are_emailed_and_a_failing_pass_says_so(self):
+        from unittest import mock
+        import imm_model_coverage as mcov
+        sent = []
+        gap = mcov._gap("Daily rain (rain_fair)", "BNA", ["KXRAIN-26OCT12-BNA"],
+                        "open", "no station", "add a row")
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(mcov, "find_gaps", lambda progs, now: {gap["key"]: gap}):
+            state, summary = {}, []
+            fw.model_coverage_pass({}, state, False, summary)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("model coverage: 1 gap(s)", sent[0])
+            fw.model_coverage_pass({}, state, False, summary)   # same gap, same day: quiet
+            self.assertEqual(len(sent), 1)
+
+        def boom(progs, now):
+            raise RuntimeError("fair file unreadable")
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(mcov, "find_gaps", boom):
+            fw.model_coverage_pass({}, state, False, [])
+            fw.model_coverage_pass({}, state, False, [])         # a second failure: no repeat
+        self.assertEqual(sent[1:], ["IMM-WATCH model coverage pass FAILED"])
