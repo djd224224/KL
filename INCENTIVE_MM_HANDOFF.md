@@ -9809,3 +9809,36 @@ our_order_ids (a 7-day horizon of every order id). _save_persist runs after
 every placing cycle and again in write_status, ~2.2s per dump measured here,
 plus ~108MB of disk writes per cycle. Orders die at the 30-min TTL and the
 fills read starts hours back, so a ~1-day horizon would cut it ~7x.
+
+## 2026-10-10 ~03:30Z — Carbon Arc: the point-of-sale day in progress is no longer priced (Jack: "ship 1", fix #1 of the Carbon Arc review)
+
+THE BUG. Since 10/07 14:43Z the POS prisms carry the CURRENT day as their
+last mtd_yoy point. The index is MTD this year over last year, so a day that
+has barely begun puts last year's whole day in the denominator against a
+sliver of this year's.
+- Those reads sat at ~(k-1)/k of the complete value: -11% to -14% on Oct 7-9.
+- The books priced the complete value: the implied median was +16.2% over
+  the raw reads and +1.4% over the corrected ones.
+- 52-72% of POS rows had their BIDS capped on it, with no price
+  follow-through.
+
+THE FIX (carbon_arc_fair.entity_entry). A point dated on or after the current
+calendar day in CA_DAY_TZ is dropped, and the previous complete day is priced.
+- CA_DAY_TZ is US/Pacific, the last US day to end, so the 8pm-midnight ET
+  stretch counts as still in progress.
+- The entry carries "open_day_dropped".
+- A lone in-progress point (day 1) is no read.
+- Kill switch: IMM_CA_DROP_OPEN_DAY=0.
+
+LIVE CHECK, 03:25Z, against the live feed (written to scratch):
+- All 18 POS series had dropped 10/09 and priced 10/08.
+- Their mu rose +12.0% to +13.3% (median +12.9%), e.g. KXC4POS 113.25 ->
+  128.34 and KXMONSTERPOS 90.49 -> 102.45.
+- Card spend (31), foot traffic (10) and apps (23) were untouched.
+- The review's estimate is +$10-15/day of restored POS bid reward.
+
+Tests: TestOpenDay (4): today dropped, the US evening, the lone point and
+the knob, lagged categories untouched. test_carbon_arc_fair has 25.
+
+DEPLOY: carbon_arc_fair.py is a helper (the CA refresher imports it once),
+so: ff KL, then restart_imm.ps1 in default mode (the handoff keeps the book).

@@ -15,7 +15,9 @@ Jack 2026-09-26, with Carbon Arc's written consent: "use Carbon Arc's data
 when quoting". This module turns the feed into, per series and measurement
 month, a normal N(mu, sigma) for the first print:
 
-    mu      = latest MTD value + CA_DRIFT_PTS (default 0)
+    mu      = latest MTD value of a COMPLETE day + CA_DRIFT_PTS (default 0);
+              a point for the day still in progress is dropped
+              (CA_DROP_OPEN_DAY, 2026-10-10)
     sigma   = CA_SIGMA_MULT * sqrt(((1 - w) * sigma_m) ** 2 + floor ** 2)
               * early_sigma_mult(category, days observed)
     w       = days observed / days in the month (the data_through day)
@@ -101,6 +103,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+import pytz
 import requests
 
 
@@ -164,6 +167,21 @@ CA_MIN_OBS_DAYS = {"credit card": 2}
 # an MTD read whose data_through is older than this is not a read of the
 # month in progress (feed stalled) -> no entry
 CA_MAX_DATA_AGE_DAYS = _env_float("IMM_CA_MAX_DATA_AGE_DAYS", 10)
+# THE DAY IN PROGRESS IS NOT A READ (Jack 2026-10-10, "ship 1", from the
+# Carbon Arc review). Since 10/07 14:43Z the point-of-sale prisms carry the
+# CURRENT day as their last mtd_yoy point. The index is month-to-date this
+# year over last year, so a day that has barely begun puts last year's whole
+# day in the denominator against a sliver of this year's: those reads sat at
+# ~(k-1)/k of the complete-day value, -11% to -14% on Oct 7-9. The books
+# priced the complete value (implied median +16.2% over those reads, +1.4%
+# over the corrected ones), and 52-72% of the POS rows had their BIDS capped
+# by it, with no follow-through. A point dated on or after the current
+# calendar day in CA_DAY_TZ (US/Pacific, the last US day to end) is dropped
+# and the previous, complete day is priced. The other categories lag 3-6 days
+# and never carry such a point. IMM_CA_DROP_OPEN_DAY=0 restores the raw
+# last point.
+CA_DROP_OPEN_DAY = os.environ.get("IMM_CA_DROP_OPEN_DAY", "1") == "1"
+CA_DAY_TZ = os.environ.get("IMM_CA_DAY_TZ", "US/Pacific")
 SERIES_MAP_TTL_SECS = 24 * 3600
 HTTP_TIMEOUT = 20
 
@@ -392,6 +410,15 @@ def entity_entry(prism: dict, entity: dict,
     if not mtd:
         return None
     mtd.sort(key=lambda m: str(m["date"]))
+    open_day = None
+    if CA_DROP_OPEN_DAY:
+        aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        today = aware.astimezone(pytz.timezone(CA_DAY_TZ)).date().isoformat()
+        if str(mtd[-1]["date"])[:10] >= today:
+            open_day = str(mtd[-1]["date"])[:10]
+            mtd = [m for m in mtd if str(m["date"])[:10] < today]
+            if not mtd:
+                return None
     last = mtd[-1]
     try:
         d_last = datetime.strptime(str(last["date"])[:10], "%Y-%m-%d")
@@ -421,7 +448,7 @@ def entity_entry(prism: dict, entity: dict,
     early = early_sigma_mult(category, d_obs.day)
     sigma = (CA_SIGMA_MULT * math.sqrt(((1.0 - w) * sig_m) ** 2 + floor ** 2)
              * early)
-    return {
+    out = {
         "month": d_obs.strftime("%Y-%m"),
         "mu": round(mu0 + CA_DRIFT_PTS, 4),
         "mtd": round(mu0, 4),
@@ -433,6 +460,9 @@ def entity_entry(prism: dict, entity: dict,
         "refreshed_at": str(prism.get("last_refreshed_at") or ""),
         "category": str(prism.get("category") or ""),
     }
+    if open_day is not None:
+        out["open_day_dropped"] = open_day           # the in-progress point left out
+    return out
 
 
 def build_entries(payload: dict, series_map: Dict[str, dict],

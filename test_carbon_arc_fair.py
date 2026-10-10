@@ -181,6 +181,49 @@ class TestModel(unittest.TestCase):
         self.assertEqual(caf.p_above(99.0, 100.0, 0.0), 1.0)
 
 
+class TestOpenDay(unittest.TestCase):
+    """Jack 2026-10-10 "ship 1": since 10/07 14:43Z point of sale's last MTD
+    point is the day still in progress (~(k-1)/k of the complete value,
+    -11% to -14%). It is dropped and the previous complete day priced."""
+
+    def setUp(self):
+        self.pos = _prism("P", [], data_through="2026-10-09", category="Point of Sale")
+        self.path = [("2026-10-07", 98.5), ("2026-10-08", 99.1), ("2026-10-09", 88.2)]
+
+    def test_the_point_for_today_is_dropped(self):
+        now = datetime(2026, 10, 9, 15, 0, tzinfo=timezone.utc)      # 08:00 PT 10/09
+        out = caf.entity_entry(self.pos, _entity("C4 Energy", self.path, HIST), now)
+        self.assertEqual((out["mu"], out["data_through"]), (99.1, "2026-10-08"))
+        self.assertEqual(out["open_day_dropped"], "2026-10-09")
+        self.assertAlmostEqual(out["w"], round(8 / 31, 4))          # 8 complete days observed
+
+    def test_the_us_evening_counts_as_the_same_day(self):
+        # 03:00Z 10/10 is 20:00 PT 10/09: the 10/09 point is still in progress
+        now = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)
+        out = caf.entity_entry(self.pos, _entity("C4 Energy", self.path, HIST), now)
+        self.assertEqual(out["data_through"], "2026-10-08")
+        # ...and once 10/09 has ended in Pacific time it is a complete read
+        later = datetime(2026, 10, 10, 8, 0, tzinfo=timezone.utc)
+        out = caf.entity_entry(self.pos, _entity("C4 Energy", self.path, HIST), later)
+        self.assertEqual((out["mu"], out["data_through"]), (88.2, "2026-10-09"))
+        self.assertNotIn("open_day_dropped", out)
+
+    def test_a_lone_open_day_is_no_read_and_the_knob_restores_it(self):
+        now = datetime(2026, 10, 1, 18, 0, tzinfo=timezone.utc)
+        lone = _entity("C4 Energy", [("2026-10-01", 12.4)], HIST)    # day 1, an hour in
+        self.assertIsNone(caf.entity_entry(self.pos, lone, now))
+        with mock.patch.object(caf, "CA_DROP_OPEN_DAY", False):
+            self.assertAlmostEqual(caf.entity_entry(self.pos, lone, now)["mu"], 12.4)
+
+    def test_lagged_categories_are_untouched(self):
+        card = _prism("C", [], category="Credit Card")
+        now = datetime(2026, 10, 9, 15, 0, tzinfo=timezone.utc)
+        out = caf.entity_entry(card, _entity("Amazon", [("2026-10-05", 104.2),
+                                                        ("2026-10-06", 104.8)], HIST), now)
+        self.assertEqual((out["mu"], out["data_through"]), (104.8, "2026-10-06"))
+        self.assertNotIn("open_day_dropped", out)
+
+
 class TestBuildAndWrite(unittest.TestCase):
 
     def setUp(self):
