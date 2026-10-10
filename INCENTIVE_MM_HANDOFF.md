@@ -9842,3 +9842,89 @@ the knob, lagged categories untouched. test_carbon_arc_fair has 25.
 
 DEPLOY: carbon_arc_fair.py is a helper (the CA refresher imports it once),
 so: ff KL, then restart_imm.ps1 in default mode (the handoff keeps the book).
+
+## 2026-10-10 ~03:30Z — our_order_ids: 6h before the fills cursor (was 7 days), and one state save per placing cycle (Jack: "find every reader of state.our_order_ids and decide the shortest safe horizon")
+
+Follow-up to the side finding in the 03:05Z hang-watchdog entry.
+imm_state.json was 54.4MB, 52.8MB of it our_order_ids (896,742 ids, 7
+days), and a placing cycle dumped it twice:
+run_cycle right after placing, then write_status. ~2s a dump, ~108MB written
+per cycle.
+
+THE READERS (every one checked):
+- fetch_new_fills: a fill is ours when its order id is in the map. It reads
+  from last_fill_ts - 2s, so it needs only the orders that can still fill
+  after that cursor. An order fills only while it rests: ORDER_TTL_SECS
+  (1800s live) at most. Both create_order call sites set expiration_ts
+  (rain-DIR takes 600s), and an amend cannot extend it.
+- _unbooked_fills / _reconcile_orphaned_fills (startup): reads from an hour
+  before the inherited cursor. A fill counts as ours by the map OR by our
+  client_order_id prefix via GET /orders/{id}, so the map is only the fast
+  path; a pruned id costs one GET. The fills it exists for (read by the
+  killed run, not claimed) never had their id in the map.
+- Writers only: _load_journal, _adopt_restart_handoff (setdefault with the
+  order's created_time), and the reconcile's setdefault(fill ts). Every
+  value is the placement time or later, so they prune correctly.
+- Not readers: the WS fill / sweep path (ledger + resting view) and
+  resting-order ownership (_get_resting_orders_global, the client id
+  prefix).
+- Out of process: only imm_dashboard_verify.py (bot_order_ids). Its 7d
+  window read the orders log for its EDGE days only, so its middle five
+  days were the bot's through the 7-day map alone. It now reads every day's
+  `place` rows from two days before the window to an hour after, plus the
+  rain-DIR ledger (those takes write no place row), cached per file. The
+  other readers of imm_state.json read other keys: imm_dashboard
+  (accrued_est, own_*, scan_members, selected_tickers, toxic_*),
+  send_imm_digest (own_*, realized_lifetime, account_value_day_start),
+  imm_quote_gaps / send_imm_new_programs / restart_imm.ps1
+  (selected_tickers), send_portfolio_digest (scan_series_meta),
+  imm_cpi_pilot_report (accrued_est).
+
+THE HORIZON (ORDER_ID_KEEP_HOURS, env IMM_ORDER_ID_KEEP_HOURS, default 6):
+_save_persist keeps the ids placed within 6h before the fills CURSOR
+(last_fill_ts; now when there is none or it reads ahead of the clock),
+never less than the TTL + 2h. That is 12x the 30-min need.
+Why the cursor, not the clock: build_daily_summary saves at the top of the
+first cycle after a roll, BEFORE that cycle's fills read. After a sleep or
+an outage longer than a clock horizon, that save would prune the ids of the
+orders resting when it began. Their fills from the gap would then read as
+someone else's, a "manual" divergence on our own fill. After a sleep there
+is no reconcile at all; only a restart runs one. Only the fills read moves
+last_fill_ts, so the ids its next read needs survive any gap. A 1-day clock
+horizon would have had this hole at ~23.5h; the 7-day one at 7 days.
+
+THE SECOND SAVE: not needed after a save that ran right after placing.
+Between the two, the tail of run_cycle (placed_today, the WS resting view,
+cycles_today, last_markets_line, the cycle logs), run()'s bookkeeping and
+the fail-safe cancel (ledger / order_ages only) change nothing the file
+holds. So the post-placement save sets _cycle_saved, and write_status skips
+its own save when that is set. Unchanged:
+- a cycle that placed nothing still saves in write_status;
+- a failed post-placement save is retried there;
+- the post-placement save itself stays (the watchdog handoff relies on it);
+- the crash journal still covers every placed id.
+TestOneSavePerCycle checks that a save at write_status time writes exactly
+the file the cycle left.
+
+MEASURED on the live file (snapshot 03:19Z, through the real _save_persist,
+old origin/main code vs new):
+- 896,742 ids -> 42,791. 54.3MB -> 4.1MB.
+- _save_persist 1.7-2.3s -> 0.16s; json.load 1.43s -> 0.09s.
+- A placing cycle: ~4s and ~108MB of saves -> 0.16s and 4MB.
+- restart_imm.ps1's Windows PowerShell ConvertFrom-Json: 11.8s -> 1.0s
+  (both parse).
+- Ages: 7.4k ids under 1h, 42.6k under 6h, 148k under 24h.
+- Side note for the open freeze question (10/09-10): the dump does not
+  stall other threads. A 10ms ticker thread's worst gap during a 1.9s 54MB
+  json.dump was 20ms (json.dump encodes in Python chunks, not one C call).
+
+Tests: TestOrderIdRetention (5), TestOneSavePerCycle (6),
+test_imm_dashboard_verify (3). Full suite green.
+
+DEPLOY: pushed to origin/main. The :15/:45 ET "KL sync-kl-main"
+fast-forwards KL, and the incentive_mm.py mtime change restarts the bot
+(planned handoff). The relaunch loads the old 54MB file once (~1.4s); its
+first save prunes ~850k ids. Check after the restart that imm_state.json is
+~4MB. BACK OUT: IMM_ORDER_ID_KEEP_HOURS=168 in run_incentive_mm.ps1
+restores 7 days of ids (still before the cursor), then restart_imm.ps1
+-Task. The single save has no knob: revert the commit.

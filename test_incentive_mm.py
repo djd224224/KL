@@ -9339,6 +9339,80 @@ class TestOrderIdRetention(unittest.TestCase):
         self.assertEqual(bot.state.last_fill_ts, cursor + 600)
 
 
+class TestOneSavePerCycle(unittest.TestCase):
+    """2026-10-10: a cycle that placed orders saved right after placing and
+    then AGAIN in write_status, with nothing the file holds changed between
+    (in-process counters, the WS view and the cycle logs only)."""
+
+    def setUp(self):
+        _clean_persist()
+        self.addCleanup(_clean_persist)
+        self.client = FakeClient()
+        self.bot = IncentiveMarketMaker(client=self.client, live=True)
+        self.saves = []
+        real = self.bot._save_persist
+
+        def counted():
+            ok = real()
+            self.saves.append(ok)
+            return ok
+        self.bot._save_persist = counted
+
+    def _cycle(self):
+        self.bot.run_cycle()
+        self.bot.write_status(datetime.now(timezone.utc))
+
+    def test_a_placing_cycle_saves_once(self):
+        self._cycle()
+        self.assertTrue(getattr(self.client, "created", []))
+        self.assertEqual(self.saves, [True])
+        self.assertTrue(set(self.bot.state.our_order_ids)
+                        >= {f"real-{i + 1}" for i in range(len(self.client.created))})
+
+    def test_the_post_placement_save_already_holds_the_whole_cycle(self):
+        """What write_status no longer writes: the file after a placing
+        cycle is exactly what a save at write_status time produces."""
+        self._cycle()
+        self.assertEqual(self.saves, [True])
+        with open(IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as f:
+            after_cycle = json.load(f)
+        IncentiveMarketMaker._save_persist(self.bot)
+        with open(IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), after_cycle)
+
+    def test_a_cycle_that_placed_nothing_saves_in_write_status(self):
+        self.client.programs = []                 # nothing to quote
+        self._cycle()
+        self.assertEqual(getattr(self.client, "created", []), [])
+        self.assertEqual(self.saves, [True])
+
+    def test_a_failed_post_placement_save_is_retried_in_write_status(self):
+        real = IncentiveMarketMaker._save_persist
+        outcomes = iter([False])
+
+        def flaky():
+            ok = next(outcomes, None)
+            ok = real(self.bot) if ok is None else ok
+            self.saves.append(ok)
+            return ok
+        self.bot._save_persist = flaky
+        self._cycle()
+        self.assertTrue(getattr(self.client, "created", []))
+        self.assertEqual(self.saves, [False, True])
+
+    def test_the_next_cycle_starts_unsaved(self):
+        self._cycle()
+        self.client.programs = []
+        self._cycle()
+        self.assertEqual(self.saves, [True, True])
+
+    def test_a_dry_run_never_saves_in_write_status(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(bot, "_save_persist") as save:
+            bot.write_status(datetime.now(timezone.utc))
+        save.assert_not_called()
+
+
 class TestPersistence(unittest.TestCase):
     def test_round_trip(self):
         _clean_persist()

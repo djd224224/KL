@@ -13791,6 +13791,9 @@ class IncentiveMarketMaker:
         #   possibly half-connected post-sleep network (see run())
         self._reconciled = False      # one-time orphaned-own-fill cleanup pending
         self._reconcile_recheck_at = 0.0   # two-shot: second pass after sweep window
+        # the last run_cycle saved the state right after placing, and nothing
+        # it persists changed after that save: write_status's save is skipped
+        self._cycle_saved = False
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
         # near-cliff SIZE mode (2026-09-26): ticker -> armed ts; sticky until
         # the banked accrual crosses the cliff or the market leaves the selection
@@ -15112,7 +15115,8 @@ class IncentiveMarketMaker:
         anchor = min(now, cursor) if cursor > 0 else now
         return anchor - max(ORDER_ID_KEEP_HOURS * 3600.0, ORDER_TTL_SECS + 7200.0)
 
-    def _save_persist(self) -> None:
+    def _save_persist(self) -> bool:
+        """Write the state file; True when it was written."""
         try:
             self._fold_realized()
             os.makedirs(STATUS_DIR, exist_ok=True)
@@ -15338,8 +15342,10 @@ class IncentiveMarketMaker:
                 open(self.ORDER_JOURNAL_PATH, "w", encoding="utf-8").close()
             except OSError:
                 pass
+            return True
         except Exception as e:
             log(f"{self.tag} ! state save failed: {e}")
+            return False
 
     # ---- exchange wrappers (writes gated on self.live) ----------------------
 
@@ -19490,6 +19496,7 @@ class IncentiveMarketMaker:
         now_utc = datetime.now(timezone.utc)
         now_ts = now_utc.timestamp()
         self._heartbeat = now_ts
+        self._cycle_saved = False          # (write_status's save, below)
         # Book-log rows from this cycle join cycle_log on (cycle_ts, ticker):
         # same format as the cycle_log `ts` column.
         self._book_cycle_ts = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -21376,7 +21383,10 @@ class IncentiveMarketMaker:
             # save orphaned the fills (the order_id never hit disk, so the
             # fill read back as "manual"). Saving here shrinks that window to
             # near zero; the startup reconcile mops up anything still missed.
-            self._save_persist()
+            # Nothing the file holds changes in the rest of the cycle (in-
+            # process counters, the WS view, the cycle logs), so write_status
+            # does not write the same bytes again (_cycle_saved, 2026-10-10).
+            self._cycle_saved = self._save_persist()
         self.state.placed_today += placed
         # the stale-quote check's view of what rests now (shadow: counting)
         if self._ws is not None and WS_MODE in ("on", "shadow"):
@@ -21795,7 +21805,9 @@ class IncentiveMarketMaker:
             os.replace(tmp, path)
         except Exception as e:
             log(f"{self.tag} ! status write failed: {e}")
-        if self.live:   # dry-run markets must not contaminate the live "ours" set
+        # dry-run markets must not contaminate the live "ours" set; a cycle
+        # that saved right after placing already wrote everything (run_cycle)
+        if self.live and not self._cycle_saved:
             self._save_persist()
 
     def _latency_status(self) -> dict:
