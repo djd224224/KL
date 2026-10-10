@@ -2699,6 +2699,18 @@ HOURLY_ACTIVATION_WINDOW_SECS = _env_int("IMM_HOURLY_ACTIVATION_WINDOW", 720)
 HOURLY_ACTIVATION_AUTO = os.environ.get("IMM_HOURLY_ACTIVATION_AUTO", "1") == "1"
 HOURLY_PROGRAM_MAX_HOURS = _env_float("IMM_HOURLY_PROGRAM_MAX_HOURS", 2.0)
 ORDER_TTL_SECS = _env_int("IMM_ORDER_TTL_SECS", 600)
+# our_order_ids RETENTION (2026-10-10). The map is the fills read's ownership
+# test (fetch_new_fills; the startup reconcile tries it before asking Kalshi
+# for the order's client id), and an order fills only while it rests:
+# ORDER_TTL_SECS at most -- an amend cannot extend the exchange-side
+# expiration, and rain-DIR takes rest 600s. Every fill not yet read lies
+# after the fills cursor (last_fill_ts), so _save_persist keeps the ids placed
+# within ORDER_ID_KEEP_HOURS before THAT, never less than the TTL plus two
+# hours. The cursor, not the clock: a sleep or an outage leaves it where it
+# was, and with it every id the unread fills need. The orders log's `place`
+# rows stay the permanent record of which orders were ours. 7 days until
+# 2026-10-10: 897k ids, 52.8MB of the file's 54.4MB, ~2s a dump twice a cycle.
+ORDER_ID_KEEP_HOURS = _env_float("IMM_ORDER_ID_KEEP_HOURS", 6.0)
 ORDER_REFRESH_SECS = _env_int("IMM_ORDER_REFRESH_SECS", 420)
 # RENEWAL JITTER (Jack 2026-10-01, "both"). Every order renewed on the one
 # clock, so a book placed in one burst renewed in that same burst every
@@ -13722,7 +13734,7 @@ class BotState:
     # while own_pos/own_avg persist, so nothing tracked lifetime realized —
     # and a multi-week position that SETTLES cannot be reconstructed from
     # fills either (fills carry no client_order_id and our_order_ids prunes at
-    # 7 days). This counter folds in the tracker's delta each save, so
+    # ORDER_ID_KEEP_HOURS). This counter folds in the tracker's delta each save, so
     # settlements booked by _settle_or_drop are captured permanently.
     realized_lifetime: float = 0.0
     realized_seen: float = 0.0            # tracker total already folded in
@@ -14263,9 +14275,10 @@ class IncentiveMarketMaker:
                   `join_src` says where it came from: "ledger" (this run),
                   "handoff" (the run before a restart handoff) or "derived"
                   (no record of the order: our_book_side from Kalshi's side /
-                  action, the rest null). Past 7 days our_order_ids prunes
-                  and even OWNERSHIP of a historical fill becomes unprovable
-                  on a shared account.
+                  action, the rest null). our_order_ids keeps only the
+                  last ORDER_ID_KEEP_HOURS, so later the OWNERSHIP of a
+                  historical fill rests on the orders log's `place` rows
+                  alone on a shared account.
 
         `panel`   the book/reward state from the last cycle read — ext bid/ask,
                   depth, target, est_frac, pool. This is what makes
@@ -15089,14 +15102,24 @@ class IncentiveMarketMaker:
             return t in self.state.programmed
         return t in self._loaded_credit
 
+    def _order_id_horizon(self) -> float:
+        """The oldest placement time our_order_ids keeps (ORDER_ID_KEEP_HOURS):
+        that long before the fills cursor, which a sleep or an outage leaves
+        where it was -- or before now, when there is no cursor yet or it
+        reads ahead of this clock."""
+        now = time.time()
+        cursor = float(self.state.last_fill_ts or 0)
+        anchor = min(now, cursor) if cursor > 0 else now
+        return anchor - max(ORDER_ID_KEEP_HOURS * 3600.0, ORDER_TTL_SECS + 7200.0)
+
     def _save_persist(self) -> None:
         try:
             self._fold_realized()
             os.makedirs(STATUS_DIR, exist_ok=True)
             tmp = self.PERSIST_PATH + ".tmp"
-            # Bound our_order_ids: fills for week-old orders can't arrive
-            # (orders die at TTL/cutoff; fills read starts hours back at most).
-            horizon = time.time() - 7 * 86400
+            # Bound our_order_ids to the orders whose fills may still be
+            # unread (_order_id_horizon): an order fills only while it rests.
+            horizon = self._order_id_horizon()
             self.state.our_order_ids = {k: v for k, v in self.state.our_order_ids.items()
                                         if v >= horizon}
             with open(tmp, "w", encoding="utf-8") as f:

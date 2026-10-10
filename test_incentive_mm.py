@@ -9263,6 +9263,82 @@ class TestPlaceUncertain(unittest.TestCase):
         self.assertNotIn(("T", "bid", 49), bot.state.place_uncertain)
 
 
+class TestOrderIdRetention(unittest.TestCase):
+    """2026-10-10: imm_state.json was 54.4MB, 52.8MB of it our_order_ids (897k
+    ids, a 7-day horizon), dumped ~2s twice a cycle. An order fills only
+    while it rests (ORDER_TTL_SECS), and every fill not yet read lies after
+    the fills cursor, so the ids are kept ORDER_ID_KEEP_HOURS before THAT
+    cursor -- which a sleep or an outage leaves where it was."""
+
+    def setUp(self):
+        _clean_persist()
+        self.addCleanup(_clean_persist)
+        self.keep = max(imm.ORDER_ID_KEEP_HOURS * 3600.0,
+                        imm.ORDER_TTL_SECS + 7200.0)
+
+    def _saved_ids(self, bot):
+        bot._save_persist()
+        return set(IncentiveMarketMaker(client=FakeClient(),
+                                        live=False).state.our_order_ids)
+
+    def test_keeps_the_window_before_a_fresh_cursor(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot.state.last_fill_ts = int(now)
+        bot.state.our_order_ids = {"fresh": now - 60,
+                                   "inside": now - self.keep + 120,
+                                   "past": now - self.keep - 120,
+                                   "week": now - 6 * 86400}
+        self.assertEqual(self._saved_ids(bot), {"fresh", "inside"})
+        self.assertLess(self.keep, 86400)      # far under the old 7 days
+
+    def test_a_stale_cursor_keeps_the_ids_its_unread_fills_need(self):
+        """Back from a 3-day outage, the daily roll saves before the first
+        fills read: an order placed just before the outage keeps its id."""
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        cursor = time.time() - 3 * 86400
+        bot.state.last_fill_ts = int(cursor)
+        bot.state.our_order_ids = {"pre": cursor - 600,
+                                   "old": cursor - self.keep - 120}
+        self.assertEqual(self._saved_ids(bot), {"pre"})
+
+    def test_no_cursor_or_one_ahead_of_the_clock_anchors_on_now(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        for cursor in (0, int(now + 3600)):
+            bot.state.last_fill_ts = cursor
+            bot.state.our_order_ids = {"in": now - self.keep + 120,
+                                       "out": now - self.keep - 120}
+            self.assertEqual(self._saved_ids(bot), {"in"})
+
+    def test_never_shorter_than_the_ttl_plus_two_hours(self):
+        self.enterContext(mock.patch.object(imm, "ORDER_ID_KEEP_HOURS", 0.1))
+        self.enterContext(mock.patch.object(imm, "ORDER_TTL_SECS", 1800))
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot.state.last_fill_ts = int(now)
+        bot.state.our_order_ids = {"two_h": now - 7200, "three_h": now - 3 * 3600}
+        self.assertEqual(self._saved_ids(bot), {"two_h"})
+
+    def test_fill_after_an_outage_is_booked_though_a_save_ran_first(self):
+        """The failure mode a clock-anchored day-long horizon had: the save
+        before the first read pruned the id, and the outage's fill on it
+        read as someone else's (a 'manual' standoff on our own fill)."""
+        client = FakeClient()
+        bot = IncentiveMarketMaker(client=client, live=True)
+        cursor = int(time.time() - 2 * 86400)
+        bot.state.last_fill_ts = cursor
+        bot.state.our_order_ids = {"pre": cursor - 300.0}
+        bot._save_persist()                      # e.g. the daily roll's
+        client.fills = [{"fill_id": "f-pre", "order_id": "pre", "ts": cursor + 600,
+                         "ticker": "KXGOOD-99DEC31-A", "side": "yes",
+                         "action": "buy", "count_fp": "5", "yes_price_dollars": "0.49"}]
+        got = bot.fetch_new_fills()
+        self.assertEqual([f["fill_id"] for f in got], ["f-pre"])
+        # the read moved the cursor, and with it the horizon
+        self.assertEqual(bot.state.last_fill_ts, cursor + 600)
+
+
 class TestPersistence(unittest.TestCase):
     def test_round_trip(self):
         _clean_persist()

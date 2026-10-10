@@ -7,7 +7,8 @@ window independently of the bot's realized/avg-cost bookkeeping:
 
   * start positions  = the bot's 5-minute snapshot at the window's start edge
   * fills            = Kalshi GET /portfolio/fills, kept when the order id is
-                       the bot's (orders-log `place` rows + state our_order_ids)
+                       the bot's (orders-log `place` rows for every day of the
+                       window, the rain-DIR ledger, state our_order_ids)
   * exits            = every position gone from the end snapshot, settled at
                        Kalshi's market result (yes / no / scalar value); one
                        Kalshi has not settled is a transfer at its last mark
@@ -28,6 +29,7 @@ USAGE:
   python imm_dashboard_verify.py yesterday 24h
 Exit code 0 when every window agrees within a cent per market, 1 otherwise.
 """
+import csv
 import json
 import os
 import sys
@@ -42,14 +44,14 @@ from kalshi_reads import kalshi_get, kalshi_get_all   # noqa: E402
 TOL = 0.01
 
 
-def bot_order_ids(e0: float, e1: float) -> set:
-    ids = set(dash.load_json(os.path.join(dash.STATUS_DIR, "imm_state.json")).get("our_order_ids") or {})
-    days = sorted({time.strftime("%Y-%m-%d", time.gmtime(t))
-                   for t in (e0 - 2 * 86400, e0 - 86400, e0, e1, e1 + 3600)})
-    for day in days:
-        p = os.path.join(dash.STATUS_DIR, f"orders_{day}.jsonl")
-        if not os.path.exists(p):
-            continue
+_PLACE_IDS = {}                                     # orders log -> its place ids
+
+
+def _place_ids(p: str) -> set:
+    st = os.stat(p)
+    key = (p, st.st_size, st.st_mtime)
+    if key not in _PLACE_IDS:
+        ids = set()
         with open(p, encoding="utf-8", errors="replace") as f:
             for line in f:
                 if '"kind": "place"' not in line:
@@ -58,6 +60,32 @@ def bot_order_ids(e0: float, e1: float) -> set:
                     ids.add(json.loads(line)["order_id"])
                 except (ValueError, KeyError):
                     pass
+        _PLACE_IDS[key] = ids
+    return _PLACE_IDS[key]
+
+
+def bot_order_ids(e0: float, e1: float) -> set:
+    """The bot's order ids for a window: the orders log's `place` rows for
+    EVERY day from two before it to an hour after it, the rain-DIR takes'
+    ledger (they write no place row), and the state's our_order_ids -- which
+    holds only the last few hours since 2026-10-10 (ORDER_ID_KEEP_HOURS), so
+    a window's middle days come from the orders log alone."""
+    ids = set(dash.load_json(os.path.join(dash.STATUS_DIR, "imm_state.json")).get("our_order_ids") or {})
+    days = {time.strftime("%Y-%m-%d", time.gmtime(t)) for t in (e0 - 2 * 86400, e1 + 3600)}
+    t = e0 - 2 * 86400
+    while t < e1 + 3600:
+        days.add(time.strftime("%Y-%m-%d", time.gmtime(t)))
+        t += 86400
+    for day in sorted(days):
+        p = os.path.join(dash.STATUS_DIR, f"orders_{day}.jsonl")
+        if os.path.exists(p):
+            ids |= _place_ids(p)
+    try:
+        with open(os.path.join(dash.STATUS_DIR, "rain_directional_ledger.csv"),
+                  encoding="utf-8") as f:
+            ids |= {r["order_id"] for r in csv.DictReader(f) if r.get("order_id")}
+    except (OSError, KeyError, csv.Error):
+        pass
     return ids
 
 
