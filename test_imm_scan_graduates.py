@@ -1,6 +1,7 @@
 """Open scan off, its earners graduated, three losing classes cut (Jack
 2026-10-03: "yes do 1 - 4 but also keep Jobs (+$16), travel (+$10) and
 energy (+$5) and any other markets that are near-breakeven")."""
+import dataclasses
 import unittest
 
 import incentive_mm as imm
@@ -41,11 +42,15 @@ class ScanGraduateTests(unittest.TestCase):
         self.assertEqual(arch.levels, imm.SCAN_LEVELS)
         self.assertEqual(arch.max_position, imm.SCAN_MAX_POSITION)
         # a gas graduate takes the graduate guard, not the gas-daily parent's
+        # -- and never the archetype's OWN family size (KXSUEZWEEKLY x2 since
+        # 2026-10-11, incentive_mm.FAMILY_X2_1011)
+        guard = dataclasses.replace(arch, size_mult=None)
         for s in ("KXORBOFHARVEST", "KXAAAGASMTX"):
             saved = imm.SERIES_OVERRIDES.pop(s, None)
             try:
                 imm.ensure_family_override(s)
-                self.assertIs(imm.SERIES_OVERRIDES[s], arch, s)
+                self.assertEqual(imm.SERIES_OVERRIDES[s], guard, s)
+                self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
             finally:
                 imm.SERIES_OVERRIDES.pop(s, None)
                 if saved is not None:

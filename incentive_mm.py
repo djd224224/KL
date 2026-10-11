@@ -1352,9 +1352,19 @@ def global_hour_mults(et_day) -> Dict[int, float]:
 # window wins for the hours it names, a quiet hour is never also an evening
 # hour, Saturday multiplies on top (Saturday 18-21 ET = x3), and the floor
 # projection's hour walk sees it (it is part of hour_size_mult).
+# EXTENDED to 18-23 ET (Jack 2026-10-11: "do 1,2,6,8" -- #1 of the
+# consolidated recommendations). Weekdays 9/14-10/10, long-dated ex-ladders:
+# 22-23 ET netted 46c per 1k resting contract-hours at the 24h mark-out
+# (90% interval 36-57c), positive on all 20 weekdays, its fills +1.1c a
+# contract, and no single family carries it (leave-one-out >= 48c). The
+# daily hour steps since 10/05 show reward tracking size in the same markets
+# (21 -> 22 ET: size x0.686, modelled reward x0.697), so x1.5 there is about
+# +$20-30/day on weekdays at today's book. The study:
+# run-logs/incentive-mm/report_tools/mult_study (evidence_out.txt,
+# verify_room.py). "18-21:1.5" restores the old window.
 # IMM_EVENING_SIZE_MULT = the IMM_HOUR_SIZE_MULT syntax ("" = off);
 # IMM_EVENING_SIZE_MULT_FROM = the first ET day ("" = at once).
-EVENING_SIZE_MULTS = _parse_hour_mults(os.environ.get("IMM_EVENING_SIZE_MULT", "18-21:1.5"))
+EVENING_SIZE_MULTS = _parse_hour_mults(os.environ.get("IMM_EVENING_SIZE_MULT", "18-23:1.5"))
 EVENING_SIZE_MULT_FROM = _env_et_day("IMM_EVENING_SIZE_MULT_FROM", "2026-10-05")
 
 
@@ -6842,6 +6852,11 @@ def ensure_family_override(series: str) -> None:
             # NFL fantasy ladders stop at the inactive list, not kickoff - 30
             # (Jack 2026-10-04, see NFL_FFPTS_START_BUFFER_MIN)
             ov = replace(ov, start_buffer_min=NFL_FFPTS_START_BUFFER_MIN)
+        if parent == SCAN_GRADUATE_ARCHETYPE and ov.size_mult is not None:
+            # The graduate archetype is also a live series with its OWN
+            # family size (KXSUEZWEEKLY x2, 2026-10-11, FAMILY_X2_1011): a
+            # graduate clones the scan's guard set, never that size.
+            ov = replace(ov, size_mult=None)
         SERIES_OVERRIDES[series] = ov
         log(f"[IMM] {series}: family override inherited from {parent}")
         return
@@ -7845,6 +7860,12 @@ _CONFIG_CODE_KNOBS = (
     "ELECTION_ALLOW", "ELECTION_SERIES", "ELECTION_SERIES_PATTERNS",
     "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
     "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
+    # ...and four more families x2 the same day (FAMILY_X2_1011)
+    "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
+    "SHIPPING_X2_SERIES",
+    # join ahead of the pile (2026-10-11)
+    "JOIN_AHEAD_MODE", "JOIN_AHEAD_MIN_GAIN", "JOIN_AHEAD_MIN_DAY",
+    "JOIN_AHEAD_MIN_AHEAD", "JOIN_AHEAD_MIN_TICKS", "JOIN_AHEAD_EXCLUDE",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -12365,6 +12386,51 @@ CRITICS_SIZE_MULT = _env_float("IMM_CRITICS_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
                                         size_mult=CRITICS_SIZE_MULT)
 
+# FAMILY x2, 2026-10-11 (Jack: "do 1,2,6,8" -- #2 and #6 of the consolidated
+# recommendations): Rotten Tomatoes, Trump endorsements, the strait / port
+# shipping series and the AI adoption (Ramp AI Index) family. A FAMILY
+# multiplier was measured the same day on the elections switch to x2 (13:31Z):
+# modelled reward x1.8-2.1 for size x1.7-2.0 against untouched long-dated
+# families, so reward scales ~1:1. Four weeks 9/14-10/10 (paid rate, 24h
+# mark-out): KXRT nets ~$37/day (weeks $409 / $152 / $256 / $170), projected
+# +$41/day at x2 (+$22 if every fill loses 0.84c more, as the evening fills
+# did after their step); the other three barely fill (333, ~3,000 and 80
+# contracts in four weeks): endorsements +$10, shipping +$12, AI adoption
+# +$5/day. The fill side gets its real test in the 10/18 elections re-score.
+# Rides the family size_mult wire: rungs, per-market and per-event caps and
+# the skew knees scale together, and the yield x1.5 stops applying (a family
+# multiplier), so KXOPENADOPT's near-cliff markets go x1.5 -> x2.
+#   * Trump endorsements and most of the shipping series are open-scan
+#     GRADUATES: each keeps the graduate guard set (safe-join, no rate bar)
+#     and adds the size. KXSUEZWEEKLY is the graduate archetype itself;
+#     ensure_family_override keeps its x2 from reaching the other graduates.
+#   * The shipping list is the nine series that were measured. A new strait
+#     or port series comes in at x1 until it is added here.
+# One knob per family; 1 reverts it (env => task-level restart).
+RT_SIZE_MULT = _env_float("IMM_RT_SIZE_MULT", 2.0)
+ENDORSE_SIZE_MULT = _env_float("IMM_ENDORSE_SIZE_MULT", 2.0)
+SHIPPING_SIZE_MULT = _env_float("IMM_SHIPPING_SIZE_MULT", 2.0)
+AIADOPT_SIZE_MULT = _env_float("IMM_AIADOPT_SIZE_MULT", 2.0)
+SHIPPING_X2_SERIES: Tuple[str, ...] = tuple(s.strip() for s in os.environ.get(
+    "IMM_SHIPPING_X2_SERIES",
+    "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY,"
+    "KXVAPORTTEU,KXNYNJPORTTEU,KXMOBILETEU,KXSAVTEU,KXSCPORTTEU").split(",")
+    if s.strip())
+FAMILY_X2_1011: Tuple[Tuple[float, Tuple[str, ...]], ...] = (
+    (RT_SIZE_MULT, ("KXRT",)),
+    (ENDORSE_SIZE_MULT, ("KXTRUMPENDORSEMENTS",)),
+    (SHIPPING_SIZE_MULT, SHIPPING_X2_SERIES),
+    (AIADOPT_SIZE_MULT, tuple(RAMP_AI_SERIES)),
+)
+for _m, _ss in FAMILY_X2_1011:
+    if _m == 1.0:
+        continue
+    for _s in _ss:
+        _base = SERIES_OVERRIDES.get(_s)
+        if _base is None and scan_graduate_series(_s):
+            _base = SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE]
+        SERIES_OVERRIDES[_s] = replace(_base or SeriesOverride(), size_mult=_m)
+
 
 # ELECTION DAY (Jack 2026-09-28: "quote until election day", see
 # ELECTION_SERIES; then, on the first cut's use of Kalshi's dates abroad:
@@ -13598,6 +13664,114 @@ class Quote:
     #   integer bucket every other consumer (bands, caps, ledger) reasons in.
 
 
+# JOIN AHEAD OF THE PILE (Jack 2026-10-11: "do 1,2,6,8" -- #8 of the
+# consolidated recommendations, after his question that morning: "if im
+# quoting 200 contracts, and the orderbook is 5,10,2000 ... i should add the
+# 200 contracts to the 10 and be ahead of the 2000 contracts"). The
+# at-reference rung is placed on the book as it stands, so it never sees that
+# OUR size can move the reference: resting at a thinner level ahead of a pile
+# makes that level the reference and drops the pile behind it to discounted
+# weight (df^ticks), so the same contracts score a bigger share. A survey of
+# 1,074 live books (10/11 ~16:00Z, scored with _side_share; report_tools/
+# mult_study/survey_forward.py + forward_combine.py) found ~5% of at-reference
+# sides could gain. With the guards below: ~67 sides, +$26/day of modelled
+# reward against ~$2/day of extra fill cost (24h mark-outs by depth behind
+# the touch, cost_by_depth.py), about half of it outside the families left
+# out below. Per side, every cycle, on the EXTERNAL book (our orders netted out):
+#   * candidates run from the plain at-reference price up to
+#     JOIN_AHEAD_MIN_TICKS behind the external best -- never the touch
+#     itself, never improving it -- inside the safe-join offset and the band;
+#   * each candidate rests what the at-reference rule would rest at THAT
+#     depth (the deep-reference multiplier shrinks as the rung moves up);
+#   * the side moves to the best-scoring candidate only when that lifts its
+#     share by >= JOIN_AHEAD_MIN_GAIN and >= JOIN_AHEAD_MIN_DAY $/day while
+#     >= JOIN_AHEAD_MIN_AHEAD contracts still rest ahead of us; otherwise it
+#     rests at the external reference (so our own rung cannot hold the
+#     reference forward once the pile is gone).
+# Left out: sports ladders / escalators (1c ahead of their piles is its own
+# test, not taken), daily families and Carbon Arc (the most informed fills;
+# Carbon Arc's late-month rule is judged from 10/18), the approval markets
+# (JOIN_AHEAD_EXCLUDE), sub-penny books, any market whose fair gate caps a
+# side this cycle, and reduce-only / full-unwind sides.
+# IMM_JOIN_AHEAD=dry logs the moves without making them; off disables.
+JOIN_AHEAD_MODE = os.environ.get("IMM_JOIN_AHEAD", "on").strip().lower()
+JOIN_AHEAD_MIN_GAIN = _env_float("IMM_JOIN_AHEAD_MIN_GAIN", 0.5)
+JOIN_AHEAD_MIN_DAY = _env_float("IMM_JOIN_AHEAD_MIN_DAY", 0.05)
+JOIN_AHEAD_MIN_AHEAD = _env_float("IMM_JOIN_AHEAD_MIN_AHEAD", 50.0)
+JOIN_AHEAD_MIN_TICKS = max(1, _env_int("IMM_JOIN_AHEAD_MIN_TICKS", 1))
+JOIN_AHEAD_EXCLUDE: Tuple[str, ...] = tuple(
+    p.strip() for p in os.environ.get(
+        "IMM_JOIN_AHEAD_EXCLUDE", "KXTRUMPAPPROVE,KXAPRPOTUS").split(",")
+    if p.strip())
+
+
+def join_ahead_series(series: str) -> bool:
+    """May this series' at-reference rungs join ahead of a pile at all?"""
+    if JOIN_AHEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
+        return False
+    if sports_ladder_league(series) is not None or is_daily_series(series):
+        return False
+    # Carbon Arc by its verified source OR its name pattern: an unverified
+    # *POS / *FT / *APP / *ADS / *CC stays out too (fails toward no move)
+    if carbon_arc_settled(series) \
+            or series.endswith(tuple(suf for suf, _c in _CA_SUFFIX_CATEGORY)):
+        return False
+    return not series.startswith(JOIN_AHEAD_EXCLUDE)
+
+
+def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
+                    top_px: int, size_at: Callable[[int], int],
+                    target: float, df: float,
+                    pool_per_day: float) -> Optional[dict]:
+    """The join-ahead decision for ONE side, in that side's own price space
+    (YES cents for a bid, NO cents for an ask: higher = more aggressive).
+    `ext_levels`: the side's external levels (no own orders), best first.
+    `base_px`: where the plain at-reference rule rests; `top_px`: the most
+    aggressive price allowed; `size_at(px)`: the contracts that would rest
+    at px. None when the plain placement stands, else {px, size, share,
+    base_share, ahead, base_ahead, gain_day} (shares of the side; gain in
+    $/day of the market's pool, which pays each side half)."""
+    if target <= 0 or top_px <= base_px:
+        return None
+    by: Dict[int, float] = {}
+    for p, q in ext_levels:
+        if q > 0:
+            by[int(p)] = by.get(int(p), 0.0) + float(q)
+
+    def score(px: int, n: int) -> float:
+        lv = dict(by)
+        lv[px] = lv.get(px, 0.0) + n
+        return _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
+                           {px: float(n)}, target, df)[0]
+
+    def ahead(px: int) -> float:
+        return sum(q for p, q in by.items() if p >= px)
+
+    n0 = int(size_at(base_px))
+    if n0 <= 0:
+        return None
+    s0 = score(base_px, n0)
+    best: Optional[Tuple[int, float, int, float]] = None
+    for px in range(base_px + 1, top_px + 1):
+        a = ahead(px)
+        if a < JOIN_AHEAD_MIN_AHEAD:
+            continue
+        n = int(size_at(px))
+        if n <= 0:
+            continue
+        s = score(px, n)
+        if best is None or s > best[1] + 1e-12:      # a tie keeps the deeper price
+            best = (px, s, n, a)
+    if best is None:
+        return None
+    px, s, n, a = best
+    gain_day = pool_per_day * (s - s0) / 2.0
+    if s < (1.0 + JOIN_AHEAD_MIN_GAIN) * s0 or gain_day < JOIN_AHEAD_MIN_DAY:
+        return None
+    return dict(px=px, size=n, share=s, base_share=s0, ahead=a,
+                base_ahead=ahead(base_px), gain_day=gain_day)
+
+
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
                       opposite_best: Optional[int], room: float,
                       levels: Optional[List[Tuple[int, int]]] = None,
@@ -14523,6 +14697,9 @@ class IncentiveMarketMaker:
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
         self._nfl_stood: Set[str] = set()         # NFL prop gate stand-asides
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
+        # (ticker, side) -> YES price the side rests at ahead of a pile
+        # (JOIN_AHEAD_MODE); logging only, so a move is announced once
+        self._join_ahead_state: Dict[Tuple[str, str], int] = {}
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # full cycles this PROCESS completed: the watchdog hands the book over
         # only after the first one (WATCHDOG_HANDOFF)
@@ -19173,6 +19350,94 @@ class IncentiveMarketMaker:
         log(f"{self.tag} Carbon Arc late-month: {event_ticker} {_b} / {_a} "
             f"(inside {CA_LATE_DAYS:g}d of the measurement month's end){_tail}")
 
+    # ---- join ahead of the pile (2026-10-11, JOIN_AHEAD_MODE) --------------
+
+    def _join_ahead(self, t: str, meta, yes_levels, no_levels, own_in_book,
+                    ext_bid: Optional[int], ext_ask: Optional[int],
+                    ref_bid_px: Optional[int], ref_ask_px: Optional[int],
+                    lv_bid, lv_ask, room_buy: float, room_sell: float,
+                    unwind_bid: int, unwind_ask: int, hm: float,
+                    rung_lo: int, pmin_s: int, pmax_s: int
+                    ) -> Tuple[Optional[int], Optional[int]]:
+        """(bid, ask) reference prices for build_side_ladder (YES cents)
+        under JOIN_AHEAD_MODE: the join-ahead price where join_ahead_pick
+        moves a side; else the EXTERNAL reference, so our own forward rung
+        cannot hold the reference forward once the pile has gone; else the
+        plain reference unchanged (no external reference, no room, a full
+        unwind, mode dry). Logs each side's move and return once."""
+        ext_yes, ext_no = external_levels(yes_levels, no_levels, own_in_book)
+        target, df = meta.target_size, meta.discount_factor
+        pool = float(meta.dollars_per_day or 0.0)
+        safe = series_safe_join(meta.series)
+        live = JOIN_AHEAD_MODE == "on"
+        tag = "" if live else " (dry)"
+        out: List[Optional[int]] = []
+        for side in ("bid", "ask"):
+            ref = ref_bid_px if side == "bid" else ref_ask_px
+            anchor = ext_bid if side == "bid" else ext_ask
+            opp = ext_ask if side == "bid" else ext_bid
+            room = room_buy if side == "bid" else room_sell
+            unwind = unwind_bid if side == "bid" else unwind_ask
+            lv = lv_bid if side == "bid" else lv_ask
+            if ref is None or anchor is None or room < 1 or unwind > 0 or not lv:
+                out.append(ref)
+                continue
+            # post-only, exactly as build_side_ladder moves its anchor
+            if side == "bid" and opp is not None and anchor >= opp:
+                anchor = opp - 1
+            elif side == "ask" and opp is not None and anchor <= opp:
+                anchor = opp + 1
+            levels = levels_desc(ext_yes if side == "bid" else ext_no)
+            r_ext = side_reference_level(levels, target)
+            if r_ext is None:
+                out.append(ref)
+                continue
+            spread = (((opp - anchor) if side == "bid" else (anchor - opp))
+                      if opp is not None else None)
+            off = JOIN_AHEAD_MIN_TICKS
+            if safe and (spread is None or spread < SAFE_JOIN_MIN_SPREAD):
+                off = max(off, SAFE_JOIN_OFFSET_TICKS)
+            total0 = sum(s for _t, s in lv)
+            if side == "bid":
+                plain = r_ext
+                base_yes = min(anchor, max(r_ext, max(rung_lo, RUNG_DEEP_FLOOR)))
+                base_own = base_yes
+                top_own = min(anchor - off, pmax_s, STICKY_PRICE_MAX)
+            else:
+                plain = 100 - r_ext
+                base_yes = max(anchor, min(plain, min(pmax_s, STICKY_PRICE_MAX)))
+                base_own = 100 - base_yes
+                top_own = 100 - max(anchor + off, pmin_s, STICKY_PRICE_MIN)
+
+            def size_at(p_own: int, _side=side, _anchor=anchor, _total=total0,
+                        _room=room) -> int:
+                p_yes = p_own if _side == "bid" else 100 - p_own
+                m = capped_ref_mult(_anchor, p_yes, _side, hour_mult=hm,
+                                    series=meta.series)
+                return min(int(round(_total * m)), int(_room))
+
+            pick = join_ahead_pick(levels, base_own, top_own, size_at,
+                                   target, df, pool)
+            key = (t, side)
+            prev = self._join_ahead_state.get(key)
+            if pick is None:
+                if prev is not None:
+                    del self._join_ahead_state[key]
+                    log(f"{self.tag} join-ahead{tag} {t} {side}: back to the "
+                        f"reference {base_yes}c")
+                out.append(plain if live else ref)
+                continue
+            px_yes = pick["px"] if side == "bid" else 100 - pick["px"]
+            if prev != px_yes:
+                self._join_ahead_state[key] = px_yes
+                log(f"{self.tag} join-ahead{tag} {t} {side}: {base_yes}c -> "
+                    f"{px_yes}c (side share {100 * pick['base_share']:.1f}% -> "
+                    f"{100 * pick['share']:.1f}%, +${pick['gain_day']:.2f}/day; "
+                    f"{pick['base_ahead']:,.0f} -> {pick['ahead']:,.0f} contracts "
+                    f"ahead; {size_at(base_own)} -> {pick['size']} lots)")
+            out.append(px_yes if live else ref)
+        return out[0], out[1]
+
     def _resolve_family_verdicts(self, by_market: Dict[str, dict],
                                  now_ts: float) -> int:
         """Source-verify the family-suffix series in the LIVE programs feed
@@ -21845,6 +22110,29 @@ class IncentiveMarketMaker:
             if quake_ask_strike(t):
                 room_sell = min(room_sell, float(quake_ask_room))
 
+            # JOIN AHEAD OF THE PILE (2026-10-11, JOIN_AHEAD_MODE): the
+            # at-reference rung may rest ahead of a pile its own size
+            # demotes. Never where a fair gate caps a side this cycle (the
+            # gate owns that price), nor on sub-penny books or reduce-only.
+            pl_bid_px, pl_ask_px = ref_bid_px, ref_ask_px
+            if (join_ahead_series(meta.series) and not reduce_only
+                    and meta.price_step >= 0.01 and not quake_ask_strike(t)
+                    and quake_cap is None and mort_caps is None
+                    and poke_caps is None and nfl_caps is None
+                    and ca_caps is None and rain_caps is None):
+                try:
+                    pl_bid_px, pl_ask_px = self._join_ahead(
+                        t, meta, yes_levels, no_levels, own_in_book, ext_bid,
+                        ext_ask, ref_bid_px, ref_ask_px, lv_bid, lv_ask,
+                        room_buy, room_sell, unwind_bid, unwind_ask, hm,
+                        rung_lo, pmin_s, pmax_s)
+                except Exception as e:      # never costs the cycle: plain refs
+                    pl_bid_px, pl_ask_px = ref_bid_px, ref_ask_px
+                    if not getattr(self, "_join_ahead_err_logged", False):
+                        self._join_ahead_err_logged = True
+                        log(f"{self.tag} ! join-ahead failed on {t} ({e!r}); "
+                            f"plain reference placement (logged once)")
+
             mq: List[Quote] = []
             # atref: placement no longer follows the touch, so a touch
             # outside the band must not kill the side (see build_side_ladder).
@@ -21854,7 +22142,7 @@ class IncentiveMarketMaker:
                     or ext_bid >= pmin_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
-                                                levels=lv_bid, ref_px=ref_bid_px,
+                                                levels=lv_bid, ref_px=pl_bid_px,
                                                 band=(rung_lo, pmax_s),
                                                 hour_mult=hm, min_total=unwind_bid))
             if ext_ask is not None and room_sell > 0 and ask_in_band:
@@ -21862,7 +22150,7 @@ class IncentiveMarketMaker:
                     or ext_ask <= pmax_s
                 if px_ok:
                     mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
-                                                levels=lv_ask, ref_px=ref_ask_px,
+                                                levels=lv_ask, ref_px=pl_ask_px,
                                                 band=(rung_lo, pmax_s),
                                                 hour_mult=hm, min_total=unwind_ask))
 
@@ -24838,6 +25126,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             + (f" from 00:00 ET {EVENING_SIZE_MULT_FROM.isoformat()}"
                if EVENING_SIZE_MULT_FROM is not None else "")
             + f" ({'in force' if _ev_now else 'not yet in force'})")
+    _x2_1011 = [f"{','.join(ss) if len(ss) <= 2 else f'{len(ss)} series'} x{m:g}"
+                for m, ss in FAMILY_X2_1011 if m != 1.0]
+    if _x2_1011:
+        log(f"[IMM] family size 2026-10-11: KXRT / endorsements / shipping / "
+            f"AI adoption -> {'; '.join(_x2_1011)}")
+    if JOIN_AHEAD_MODE in ("on", "dry") and LADDER_MODE == "atref":
+        log(f"[IMM] join-ahead {JOIN_AHEAD_MODE.upper()}: an at-reference rung may "
+            f"rest ahead of a pile when that lifts the side's share >= "
+            f"{100 * JOIN_AHEAD_MIN_GAIN:g}% and >= ${JOIN_AHEAD_MIN_DAY:g}/day, "
+            f">= {JOIN_AHEAD_MIN_TICKS} tick(s) behind the touch, >= "
+            f"{JOIN_AHEAD_MIN_AHEAD:g} contracts ahead; not sports ladders, "
+            f"dailies, Carbon Arc, {','.join(JOIN_AHEAD_EXCLUDE) or '-'}")
     if YIELD_SIZE_MULT > 0 and YIELD_SIZE_MULT != 1.0:
         log(f"[IMM] yield size mode: x{YIELD_SIZE_MULT:g} on markets yielding >= "
             f"${YIELD_SIZE_MIN:g}/contract/day (held to x{YIELD_SIZE_EXIT_FRAC:g} of it), "

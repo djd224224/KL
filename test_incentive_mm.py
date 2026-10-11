@@ -1296,8 +1296,10 @@ class TestScreen(unittest.TestCase):
         self.assertIsNone(ov.max_position)
         self.assertIsNone(ov.price_min_cents)
         self.assertFalse(ov.safe_join)
+        # ...except the family x2 of 2026-10-11 (FAMILY_X2_1011), whose
+        # per-market cap scales with the size
         self.assertEqual(imm.series_max_position("KXRT"),
-                         imm.MAX_POSITION_CONTRACTS)
+                         imm.RT_SIZE_MULT * imm.MAX_POSITION_CONTRACTS)
         # the other entertainment series keep their cutoff-less life
         for s in ("KXMC", "KXCMA", "KXVENUEPERFORM"):
             self.assertIsNone(imm.series_override(s).cutoff_from_close_min, s)
@@ -9901,8 +9903,30 @@ class TestEveningWindow(unittest.TestCase):
         return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
 
     def test_code_default(self):
+        # 18-21 -> 18-23 ET (Jack 2026-10-11, "do 1,2,6,8")
         self.assertEqual(_EVENING_CODE_DEFAULT,
-                         ({18: 1.5, 19: 1.5, 20: 1.5, 21: 1.5}, datetime(2026, 10, 5).date()))
+                         ({h: 1.5 for h in range(18, 24)}, datetime(2026, 10, 5).date()))
+
+    def test_window_runs_to_midnight(self):
+        imm.EVENING_SIZE_MULTS = dict(_EVENING_CODE_DEFAULT[0])
+        s = "KXGOOD"
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 13, 17, 59)), 1.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 13, 21, 59)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 13, 22)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 13, 23, 59)), 1.5)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 14, 0)), 3.0)        # quiet hours
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 14, 9)), 1.0)
+        self.assertEqual(imm._hour_window_mult("KXNFLLADDERREC", self.et(2026, 10, 13, 23)),
+                         imm._hour_window_mult("KXNFLLADDERREC", self.et(2026, 10, 13, 12)))
+        self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", self.et(2026, 10, 13, 23)), 1.0)
+        imm.SAT_SIZE_MULT = 2.0                      # Saturday still multiplies on top
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 17, 23)), 3.0)
+        imm.SAT_SIZE_MULT = 1.0
+        # a Tuesday: 0-8 x3 (9h), 18-23 x1.5 (6h), the rest x1 (9h)
+        prof = dict(imm.size_mult_profile(s, self.et(2026, 10, 13, 0), 1.0))
+        self.assertAlmostEqual(prof[3.0], 9 / 24, places=9)
+        self.assertAlmostEqual(prof[1.5], 6 / 24, places=9)
+        self.assertAlmostEqual(prof[1.0], 9 / 24, places=9)
 
     def test_window_from_monday(self):
         s = "KXGOOD"
@@ -25026,6 +25050,156 @@ def _set_proc_prios(cpu, mem, io):
     k32.SetProcessInformation(me, 0, ctypes.byref(v), 4)
     v = wintypes.ULONG(io)
     nt.NtSetInformationProcess(me, 33, ctypes.byref(v), 4)
+
+
+class TestFamilyX2Oct11(unittest.TestCase):
+    """Jack 2026-10-11 ("do 1,2,6,8"): KXRT, Trump endorsements, the strait /
+    port shipping series and the AI adoption (Ramp AI) family at x2 on the
+    family size_mult wire; the graduates keep their guard set, and the x2 on
+    the graduate archetype (KXSUEZWEEKLY) never reaches the other graduates."""
+
+    def targets(self):
+        return (["KXRT", "KXTRUMPENDORSEMENTS"] + list(imm.SHIPPING_X2_SERIES)
+                + list(imm.RAMP_AI_SERIES))
+
+    def test_code_defaults(self):
+        self.assertEqual((imm.RT_SIZE_MULT, imm.ENDORSE_SIZE_MULT,
+                          imm.SHIPPING_SIZE_MULT, imm.AIADOPT_SIZE_MULT),
+                         (2.0, 2.0, 2.0, 2.0))
+        self.assertEqual(len(imm.SHIPPING_X2_SERIES), 9)
+        self.assertIn("KXOPENADOPT", imm.RAMP_AI_SERIES)
+
+    def test_every_member_doubles_with_its_caps(self):
+        for s in self.targets():
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s),
+                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+            self.assertEqual(imm.event_cap_contracts(s + "-26OCT"),
+                             2.0 * imm.MAX_EVENT_CONTRACTS, s)
+            self.assertFalse(imm.yield_size_eligible(s), s)    # no x1.5 on top
+        base = imm.series_levels("KXRT")
+        self.assertEqual(imm.base_scaled_levels("KXRT"),
+                         [(t, int(sz * 2 + 0.5)) for t, sz in base])
+        self.assertEqual(imm.applied_mention_mult("KXRTTV"), 1.0)   # not asked for
+
+    def test_graduates_keep_the_guard_set(self):
+        for s in ("KXTRUMPENDORSEMENTS", "KXHORMUZWEEKLY", "KXSUEZWEEKLY"):
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertTrue(ov.safe_join, s)
+            self.assertEqual(ov.min_est_per_day, 0.0, s)
+        # KXRT's own rules ride along (the close-anchored stand-down)
+        self.assertIsNotNone(imm.SERIES_OVERRIDES["KXRT"].cutoff_from_close_min)
+
+    def test_archetype_x2_never_reaches_other_graduates(self):
+        g = "KXFAKEGRADUATEZZ"
+        self.addCleanup(imm.SERIES_OVERRIDES.pop, g, None)
+        with mock.patch.object(imm, "SCAN_GRADUATE_SERIES",
+                               imm.SCAN_GRADUATE_SERIES | {g}):
+            imm.ensure_family_override(g)
+        ov = imm.SERIES_OVERRIDES[g]
+        self.assertIsNone(ov.size_mult)
+        self.assertTrue(ov.safe_join)
+        self.assertEqual(imm.applied_mention_mult(g), 1.0)
+
+
+class TestJoinAhead(unittest.TestCase):
+    """Jack 2026-10-11 ("do 1,2,6,8", #8): an at-reference rung may rest a
+    level or more ahead of a pile its own size demotes -- never at or ahead
+    of the external best, with JOIN_AHEAD_MIN_AHEAD contracts still in front,
+    and only for a >= 50% (and >= $0.05/day) lift in the side's share."""
+
+    def pick(self, ext, base, top, size, target=1000.0, df=0.5, pool=100.0):
+        sz = size if callable(size) else (lambda p: size)
+        return imm.join_ahead_pick(ext, base, top, sz, target, df, pool)
+
+    def test_moves_ahead_of_the_pile(self):
+        # 60 @49, 40 @48, 5,000 @46: the plain rule rests at 46 with the pile;
+        # 100 at 48 makes 48 the reference and the pile two ticks behind it
+        r = self.pick([(49, 60), (48, 40), (46, 5000)], base=46, top=48, size=100)
+        self.assertEqual(r["px"], 48)
+        self.assertAlmostEqual(r["base_share"], 100 / 5200)
+        self.assertAlmostEqual(r["share"], 100 / (60 + 140 + 0.25 * 5000))
+        self.assertEqual((r["ahead"], r["base_ahead"]), (100, 5100))
+        self.assertAlmostEqual(r["gain_day"], 100 * (r["share"] - r["base_share"]) / 2)
+
+    def test_jacks_example_needs_contracts_in_front(self):
+        # 5 / 10 / 2,000 with 200 to place: joining the 10 leaves only 15
+        # contracts ahead -- under the 50-contract guard, so the rung stays
+        ext = [(52, 5), (51, 10), (50, 2000)]
+        self.assertIsNone(self.pick(ext, base=50, top=51, size=200))
+        with mock.patch.object(imm, "JOIN_AHEAD_MIN_AHEAD", 0.0):
+            r = self.pick(ext, base=50, top=51, size=200)
+        self.assertEqual(r["px"], 51)
+        self.assertAlmostEqual(r["base_share"], 200 / 2215)        # 9%
+        self.assertAlmostEqual(r["share"], 200 / 1215)             # 16%
+
+    def test_small_lifts_stay_put(self):
+        # a mild discount (df 0.8) lifts the share only ~17%
+        self.assertIsNone(self.pick([(49, 60), (48, 40), (47, 1000)],
+                                    base=47, top=48, size=300, df=0.8))
+        # ...and a big relative lift worth under $0.05/day stays put too
+        self.assertIsNone(self.pick([(49, 60), (48, 40), (46, 5000)],
+                                    base=46, top=48, size=100, pool=1.0))
+
+    def test_size_at_the_new_depth(self):
+        # the deep-reference size shrinks as the rung moves up: 20 lots at 51
+        # cannot reach the reference, so there is no gain
+        with mock.patch.object(imm, "JOIN_AHEAD_MIN_AHEAD", 0.0):
+            self.assertIsNone(self.pick([(52, 5), (51, 10), (50, 2000)], base=50,
+                                        top=51, size=lambda p: 200 if p == 50 else 20))
+
+    def test_no_room_above_the_base(self):
+        self.assertIsNone(self.pick([(49, 60), (46, 5000)], base=46, top=46, size=100))
+        self.assertIsNone(self.pick([(49, 60), (46, 5000)], base=46, top=45, size=100))
+
+    def test_eligibility(self):
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            for s in ("KXGOOD", "KXRT", "KXOPENVREQ", "KXSUEZWEEKLY"):
+                self.assertTrue(imm.join_ahead_series(s), s)
+            for s in ("KXNFLLADDERREC", "KXNFLESCALATORRECYDS", "KXRAIN", "KXTEMPNYCH",
+                      "KXAPRPOTUS", "KXTRUMPAPPROVE", "KXC4POS", "KXMCDFT",
+                      "KXUBERAPP", "KXAMZNCC", "KXSPORTSBOOKADS"):
+                self.assertFalse(imm.join_ahead_series(s), s)
+            with mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+                self.assertFalse(imm.join_ahead_series("KXGOOD"))
+        with mock.patch.object(imm, "LADDER_MODE", "offsets"):
+            self.assertFalse(imm.join_ahead_series("KXGOOD"))
+
+    def _cycle(self, mode):
+        _clean_persist()
+        t = "KXGOOD-99DEC31-A"
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", mode), \
+                mock.patch.object(imm, "LEVELS", [(0, 100)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 300.0), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertIn(t, bot.state.selected)
+            bot.client.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.46", "5000"], ["0.48", "40"], ["0.49", "60"]],
+                "no_dollars": [["0.49", "1200"]]}}
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+        bids = [o for o in bot.state.sim_orders.values()
+                if o["ticker"] == t and o["book_side"] == "bid"
+                and o["yes_price"] > imm.PAD_BID_CENTS]
+        asks = [o for o in bot.state.sim_orders.values()
+                if o["ticker"] == t and o["book_side"] == "ask"
+                and o["yes_price"] < imm.PAD_ASK_CENTS]
+        return bot, bids, asks
+
+    def test_quote_loop_rests_ahead_when_on(self):
+        bot, bids, asks = self._cycle("on")
+        self.assertEqual(sorted({o["yes_price"] for o in bids}), [48])
+        self.assertEqual(sorted({o["yes_price"] for o in asks}), [51])   # touch: stays
+        self.assertEqual(bot._join_ahead_state, {("KXGOOD-99DEC31-A", "bid"): 48})
+
+    def test_quote_loop_dry_and_off_rest_at_the_reference(self):
+        for mode in ("dry", "off"):
+            bot, bids, _asks = self._cycle(mode)
+            self.assertEqual(sorted({o["yes_price"] for o in bids}), [46], mode)
+        self.assertEqual(bot._join_ahead_state, {})                       # off: no state
 
 
 if __name__ == "__main__":
