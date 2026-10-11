@@ -255,19 +255,35 @@ signed in as Jack).
   case -$14,882.
 - **Writes.** `imm_pocket.json` (~40 KB) and `imm_pocket.html` (the template
   with the data embedded), both beside the dashboard.
-- **Refresh.** The page subscribes to its own database document
-  `pocket/latest`. The desktop app's scheduled Claude task
-  "imm-pocket-refresh" runs every 30 minutes:
-  1. `python imm_pocket.py --summary`
-  2. ArtifactData `set` of `pocket/latest` from `imm_pocket.json`
-  3. an open page redraws without a reload
+- **Refresh (since 2026-10-10).** The Windows task "KL imm pocket" runs
+  `imm_pocket_publish.py` (pythonw) at :12 and :42, after the :05:55 /
+  :35:55 dashboard builds land (p50 84s, p90 193s):
+  1. the `imm_pocket.py` build
+  2. when the build is newer than the last one published, one headless
+     Claude Code run (Haiku, `claude -p --restricted`, only Read and
+     Artifact) reads `imm_pocket.html` and republishes it to the URL
 
-  It runs only while the Claude app is open on this PC. The chip at the top
-  says Live, Stale (over 45 min) or Snapshot (the copy built into the page,
-  shown when the database cannot be read).
-- **Template changes.** Edit `imm_pocket_template.html`, run the script,
-  read the whole `imm_pocket.html`, and republish to the same URL with
-  `url`. The data refresh never republishes the page.
+  It costs about $0.15-0.20 of Haiku at list price per publish. An unchanged
+  build is skipped without calling Claude. It runs whether or not the
+  Claude app is open, but not while the PC sleeps. A page already open on
+  the phone needs a reload. The log is `imm_pocket_publish.log`, the state
+  is `imm_pocket_publish_state.json` (dashboard folder). One email goes out
+  once the page's data is over 90 min old.
+
+  The earlier refresh paths kept dying, and the page sat stale 10/3-10/4
+  and 10/8-10/10:
+  - The desktop routine "imm-pocket-refresh" stops on an ArtifactData
+    prompt with no "always allow".
+  - A session's CronCreate timer dies with its session.
+  - The CLI has no ArtifactData tool.
+
+  The page still subscribes to `pocket/latest` and shows whichever build is
+  newer, so a hand push (ArtifactData `set` from `imm_pocket.json`) still
+  works. The chip at the top says Fresh (republished), Live (a newer
+  database copy) or Stale (over 60 min).
+- **Template changes.** Edit `imm_pocket_template.html`. The next
+  scheduled publish ships it, or run
+  `python imm_pocket_publish.py --force` to ship it now.
 
 ## Knobs (environment)
 

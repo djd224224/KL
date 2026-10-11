@@ -181,11 +181,12 @@ footer { font-size: 12px; color: var(--muted); display: flex; flex-direction: co
 </div>
 
 <script>
-// The build embedded at publish; a newer one arrives from the page's database
-// (pocket/latest), which a scheduled Claude task rewrites every 30 minutes.
+// The build embedded at publish: the Windows task "KL imm pocket"
+// (imm_pocket_publish.py) republishes the page every 30 minutes. A newer
+// build in the page's database (pocket/latest, a hand push) replaces it.
 let M = /*__POCKET_DATA__*/null;
 let SRC = "embedded";
-const STALE_MIN = 45;
+const STALE_MIN = 60;
 const WK = ["today", "yesterday", "24h", "7d"];
 const WL = { today: "Today", yesterday: "Yesterday", "24h": "24h", "7d": "7 days" };
 const MINUS = "−";
@@ -237,12 +238,11 @@ function renderHead() {
   $("asof").textContent = "Data as of " + ET_DT.format(new Date(M.generated * 1000)) + " ET · " + ago(M.generated);
   const old = Date.now() / 1000 - M.generated > STALE_MIN * 60;
   const f = $("fresh");
-  f.textContent = old ? (SRC === "live" ? "Stale" : "Snapshot") : (SRC === "live" ? "Live" : "Fresh");
+  f.textContent = old ? "Stale" : (SRC === "live" ? "Live" : "Fresh");
   f.className = "chip" + (old ? " stale" : "");
   f.title = old
-    ? (SRC === "live" ? "No refresh in the last " + STALE_MIN + " minutes; the scheduled update may have stopped (it runs while the Claude app is open on the PC)."
-      : "The copy built into this page; newer numbers load when the page's live data is available.")
-    : (SRC === "live" ? "Refreshed every 30 minutes from the 10-minute dashboard build." : "Built within the last " + STALE_MIN + " minutes.");
+    ? "Over " + STALE_MIN + " minutes old. Reload for the newest version; if it stays stale, the 30-minute republish on the PC (Windows task \"KL imm pocket\") has stopped."
+    : (SRC === "live" ? "From the page's live data (a hand push)." : "Republished every 30 minutes from the 10-minute dashboard build.");
   $("seg").innerHTML = WK.filter((k) => M.windows[k]).map((k) =>
     '<button type="button" data-w="' + k + '" aria-pressed="' + (k === W) + '">' + WL[k] + "</button>").join("");
 }
@@ -416,7 +416,7 @@ function renderFams() {
 function renderAll() {
   renderHead(); renderHero(); renderCurve(); renderTiles(); renderFams();
   $("foot").textContent = "From the IMM dashboard build of " + ET_DT.format(new Date(M.generated * 1000)) + " ET (" +
-    (SRC === "live" ? "live: refreshed every 30 minutes" : "the copy built into this page") + "). Windows are ET days.";
+    (SRC === "live" ? "the page's live data" : "republished every 30 minutes; reload for the newest") + "). Windows are ET days.";
 }
 
 document.addEventListener("click", (e) => {
