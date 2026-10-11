@@ -10281,3 +10281,46 @@ third, faster trigger.
 
 Tests: TestAskVerdict (8), TestQuakeFarStrikeAsks (11); test_incentive_mm
 1204 OK, test_usgs_quake_fair 24 OK.
+## 2026-10-11 ~03:00Z — daily Carbon Arc email: each family, judged against what we expect (Jack: "i want careful monitoring on carbon arc. give me a daily email, reporting on each family and if it's performing as expected")
+
+send_ca_monitor.py runs as "KL imm carbon-arc" (register_imm_carbon_arc.ps1)
+at 07:35 ET, 15 min after quote-gaps. It reports the prior ET day, with one
+section and verdict per family (point of sale, card spend, apps, foot
+traffic, ad spend). Subject: "IMM Carbon Arc MM/DD: <worst> | POS OK | CC
+WATCH | ...".
+
+Each section covers:
+- money: reward, own fills marked to now, carried positions re-marked, net,
+  7-day net;
+- our fills by side, the day and 7 days (context outside the window);
+- #3's blocked side and its Aug/Sep benchmark;
+- market: every public Kalshi trade of the day in the family's live markets,
+  maker P&L by side marked to the current mid (4 threads, ~4 req/s, 15-min
+  budget). Each day is stored in ca_monitor_market.json for the window
+  totals;
+- read: refresh and data_through age, read changes, and any read that moved
+  with no new refresh (the 10/10 POS hole signature);
+- gate: caps, not earning and stand-asides by side, plus the peak share of
+  the family capped on one side in a 10-min bucket;
+- landing-window (1x) fills;
+- open book long/short YES and unrealized.
+
+PROBLEM if any of:
+- the day's net <= -$150;
+- in the late window, any fill or place/amend on the blocked side (pads
+  aside);
+- a read moved with no new data, or the family has no read.
+WATCH if any of:
+- the day's net <= -$50, or the 3-day net < 0;
+- the refresh or data is stale for the family's cadence;
+- in the window, our kept side runs 10c/ct+ under its Aug/Sep benchmark;
+- in the window, the market's makers do better on the blocked side;
+- one side is capped on >= 60% of the family at once;
+- landing-window fills <= -$40.
+
+Run on 10/10 it flags POS PROBLEM (18 reads fell back at 03:00 ET) and ADS
+PROBLEM (the -$366 sweep day).
+
+Sources, all read-only: the dashboard D object, carbon_arc_fair.json and the
+vintages file, the day log, orders_<UTC date>.jsonl, and Kalshi public
+endpoints. Tests: test_send_ca_monitor.py (10).
