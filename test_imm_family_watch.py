@@ -196,6 +196,28 @@ class TestGapAlert(unittest.TestCase):
         self.assertIn("~$44.00/day (pool proxy), dark 1.6h  KXA-26: no row", body)
         self.assertIn("fix: add a row", body)
 
+    def test_alert_says_what_each_item_is(self):
+        # Jack 2026-10-11: "make sure the description of the event is listed,
+        # otherwise i dont know what 'KXTSAD' is"
+        class Client:
+            def get(self, path, params=None):
+                if path == "/series/KXTSAD":
+                    return {"series": {"title": "Daily TSA passenger screenings",
+                                       "category": "Economics", "frequency": "daily"}}
+                if path == "/events/KXA-26":
+                    return {"event": {"title": "Who will win the A primary?",
+                                      "sub_title": "Nov 3, 2026"}}
+                raise RuntimeError("down")
+        due = [("new:KXTSAD", {"est": 68.0, "what": "KXTSAD: newly paying", "fix": "x"}, 30.0),
+               ("gap:KXA-26", {"est": 44.0, "what": "KXA-26: no row", "fix": "y"}, 30.0),
+               ("gap:KXB-26", {"est": 9.0, "what": "KXB-26: no row", "fix": "z"}, 30.0)]
+        fw.describe(Client(), due)
+        _subject, body = fw.alert_body(due)
+        self.assertIn("KXTSAD: newly paying\n    what it is: Daily TSA passenger "
+                      "screenings (Economics, daily)", body)
+        self.assertIn("what it is: Who will win the A primary? -- Nov 3, 2026", body)
+        self.assertNotIn("title", due[2][1])            # a failed read: no line
+
 
 class TestEventKeys(unittest.TestCase):
 

@@ -303,6 +303,36 @@ def _fmt_end(iso: str) -> str:
         return "?"
 
 
+def describe(client, due: List[Tuple[str, dict, float]]) -> None:
+    """Give each alerted item a plain description, `title` (Jack 2026-10-11:
+    "make sure the description of the event is listed, otherwise i dont know
+    what 'KXTSAD' is"): new:<series> -> the series' title, category and
+    cadence from Kalshi's /series record ("Daily TSA passenger screenings
+    (Economics, daily)"); gap:/start:<event> -> the event's title and
+    subtitle from /events. A failed read just leaves the item without one."""
+    for key, it, _dark in due:
+        if it.get("title"):
+            continue
+        kind, _, tick = key.partition(":")
+        try:
+            if kind == "new":
+                s = ieo.series_meta(client, tick)
+                desc = str(s.get("title") or "").strip()
+                extra = ", ".join(str(x) for x in (s.get("category"), s.get("frequency")) if x)
+                if desc and extra:
+                    desc += f" ({extra})"
+            else:
+                ev = (client.get(f"/events/{tick}") or {}).get("event") or {}
+                title = str(ev.get("title") or "").strip()
+                sub = str(ev.get("sub_title") or "").strip()
+                desc = title + (f" -- {sub}" if sub and sub not in title else "")
+        except Exception as e:
+            log(f"[WATCH] ! no description for {key}: {e!r}")
+            continue
+        if desc:
+            it["title"] = desc
+
+
 def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
     daily = sum(it["est"] for _, it, _ in due)
     whole = sum(it.get("est_total") or 0.0 for _, it, _ in due)
@@ -319,6 +349,8 @@ def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
                       f"{max(e[3] for e in evs):.1f} of {max(e[4] for e in evs):.1f} "
                       f"days, ends {_fmt_end(max(e[5] for e in evs))})")
         lines.append(f"- {worth} ({src}), dark {dark / 60:.1f}h  {it['what']}")
+        if it.get("title"):
+            lines.append(f"    what it is: {it['title']}")
         if len(evs) > 1:
             per = "; ".join(f"{e[0]} ~${e[1]:,.2f}/day = ~${e[2]:,.2f} "
                             f"({e[3]:.1f}d left)" for e in evs[:4])
@@ -905,6 +937,7 @@ def main(argv=None) -> int:
                 log(f"[WATCH] ! real estimates failed ({e!r}); pool proxy kept")
             due, state["items"] = due_alerts(state.get("items") or {}, items, time.time())
             if due:
+                describe(client, due)
                 subject, body = alert_body(due)
                 log("[WATCH] alert:\n" + body)
                 if not args.dry:
