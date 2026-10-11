@@ -10071,3 +10071,47 @@ Tests (TestOpenDay):
 
 DEPLOY: carbon_arc_fair is imported once by the refresher thread, so ff KL
 then run restart_imm.ps1 (default handoff mode).
+
+## 2026-10-11 ~02:10Z — universe refresh network guard: defer in network trouble, end with the universe kept (Jack: "do 1", of "stop the network hangs")
+
+WHY. Three watchdog hangs in ~36h: 10/09 12:44Z, 10/10 01:47Z and 10/11
+~01:18Z (its stacks: fetch_programs at 360s, a REST candidate book at the
+600s exit). Two of the three began right after this laptop left Modern
+Standby with a power-source change. Windows' System log has Kernel-Power
+507 + 105 at 10/10 01:24:14Z and 10/11 01:08:41Z; the laptop was on
+battery (79%) on 10/11. Every outside host then failed for minutes (TLS
+errors, WinError 10053), and on 10/11 the whole process stalled 192s ("a 30s
+tick took 192s"). A refresh started into that crawls: programs pages, ~75
+bulk market reads, then REST candidate books whenever the feed is down.
+- MACHINE (Jack's to change): keep it plugged in. Set the screen to Never
+  turn off when plugged in, and the lid to Do nothing when plugged in.
+  Display-off is 5 min on AC and 3 on battery, and a display-off enters
+  Modern Standby (S0 low power idle, network connected).
+
+WHAT (UNIVERSE_NET_GUARD, default on; IMM_UNIVERSE_NET_GUARD=0 = off):
+- DEFER: a due refresh is skipped, with the current universe kept, while
+  any of these hold:
+  - the WS feed is down or silent (feed.healthy());
+  - the wake grace after a resume is running;
+  - the main thread saw a network error (is_network_error) within
+    UNIVERSE_NET_TROUBLE_SECS = 120s.
+  Errors are noted from cycle errors, managed book reads and REST candidate
+  reads (_note_net_error). After UNIVERSE_DEFER_MAX_SECS = 900s of deferring
+  it runs anyway, under the other bounds. Logs: "universe refresh deferred:
+  <why>; ..." once per run of deferrals, then "... resumes after Ns
+  deferred" or "... running it anyway".
+- ABORT, with the universe kept and logged "! universe refresh aborted:
+  <why>; the current universe stays ...":
+  - the programs read gets no answer (a network error, or 429/5xx after the
+    client's retries). This was a cycle error toward the 4-error fail-safe.
+  - a bulk market read gets no answer. This was "chunk skipped", which dropped
+    that chunk's selected members, so their quotes were cancelled as
+    unselected.
+  - the bulk reads run over UNIVERSE_BULK_BUDGET_SECS = 120s (normally ~10s).
+  A refused request (e.g. a 400) still skips its chunk as before.
+- Status latency.universe: deferred, aborted, last_skip, deferring_s.
+- NOT changed: managed book reads' REST fallback when the feed is down (the
+  watchdog + its handoff stay the backstop there, per the 10/10 audit), the
+  pass-2 candidate REST budget, and the bounded trading client.
+
+Tests: TestUniverseNetGuard (9). test_incentive_mm 1183 OK.

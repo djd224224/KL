@@ -3150,6 +3150,30 @@ HTTP_GET_ATTEMPTS = max(1, _env_int("IMM_HTTP_GET_ATTEMPTS", 2))
 # through (sticky), a fresh one waits for the next refresh.
 CAND_REST_BUDGET_SECS = _env_float("IMM_CAND_REST_BUDGET_SECS", 300.0)
 CAND_REST_MAX_FAILS = _env_int("IMM_CAND_REST_MAX_FAILS", 3)
+# UNIVERSE REFRESH NETWORK GUARD (Jack 2026-10-11: "do 1" -- stop the network
+# hangs). This laptop drops in and out of Modern Standby (Kernel-Power
+# 506/507), and two of the three watchdog hangs (10/10 01:4xZ, 10/11
+# 01:18Z) began right after a standby exit paired with a power-source
+# change. The network then fails for minutes, and a refresh started into it
+# (programs pages, ~75 bulk market reads, REST candidate books) crawls past
+# the 600s watchdog. 10/11's stacks: fetch_programs at 360s, a REST
+# candidate book at the exit.
+#  - DEFER: a refresh that comes due while the network is in trouble is
+#    skipped, and the current universe stays. Trouble means one of three:
+#    the WS feed is down or stale, the wake grace after a resume is running,
+#    or the main thread saw a network error in the last
+#    UNIVERSE_NET_TROUBLE_SECS. After UNIVERSE_DEFER_MAX_SECS of deferring
+#    it runs anyway, under the bounds below.
+#  - ABORT: a network error while reading the programs or the bulk market
+#    data, or bulk reads over UNIVERSE_BULK_BUDGET_SECS, end the refresh with
+#    the current universe kept. Before this, a failed bulk chunk was skipped,
+#    which dropped its selected members and cancelled their quotes; a failed
+#    programs read was a cycle error toward the fail-safe.
+# IMM_UNIVERSE_NET_GUARD=0 turns the whole guard off.
+UNIVERSE_NET_GUARD = os.environ.get("IMM_UNIVERSE_NET_GUARD", "1") == "1"
+UNIVERSE_NET_TROUBLE_SECS = _env_float("IMM_UNIVERSE_NET_TROUBLE_SECS", 120.0)
+UNIVERSE_DEFER_MAX_SECS = _env_float("IMM_UNIVERSE_DEFER_MAX_SECS", 900.0)
+UNIVERSE_BULK_BUDGET_SECS = _env_float("IMM_UNIVERSE_BULK_BUDGET_SECS", 120.0)
 WAKE_GRACE_SECS = 120
 BLIND_PRESERVE_CYCLES = 3
 
@@ -7750,6 +7774,9 @@ _CONFIG_CODE_KNOBS = (
     "CYCLE_HANG_EXIT_SECS", "CYCLE_HANG_DUMP_SECS", "WATCHDOG_HANDOFF",
     "HTTP_CONNECT_TIMEOUT_SECS", "HTTP_READ_TIMEOUT_SECS", "HTTP_GET_ATTEMPTS",
     "CAND_REST_BUDGET_SECS", "CAND_REST_MAX_FAILS",
+    # ...and the universe refresh's network guard (2026-10-11)
+    "UNIVERSE_NET_GUARD", "UNIVERSE_NET_TROUBLE_SECS", "UNIVERSE_DEFER_MAX_SECS",
+    "UNIVERSE_BULK_BUDGET_SECS",
 )
 
 
@@ -14075,6 +14102,12 @@ class IncentiveMarketMaker:
         self._ws_cand_shadow = {"compared": 0, "exact": 0, "top": 0,
                                 "ws_missing": 0}
         self._universe_times: Deque[Tuple[float, float, int, int]] = deque(maxlen=20)
+        # the refresh's network guard (2026-10-11, UNIVERSE_NET_GUARD): the
+        # main thread's last network error, when the current run of deferred
+        # refreshes began, and the counts for latency.universe
+        self._net_err_at = 0.0
+        self._universe_deferred_since: Optional[float] = None
+        self._universe_guard = {"deferred": 0, "aborted": 0, "last": ""}
         # the running pass 2's REST budget (CAND_REST_BUDGET_SECS /
         # CAND_REST_MAX_FAILS): {"t0", "fails", "off"}; None outside pass 2
         self._cand_rest: Optional[dict] = None
@@ -15789,6 +15822,7 @@ class IncentiveMarketMaker:
         try:
             ob = self.client.get_orderbook(ticker=ticker)
         except Exception as e:
+            self._note_net_error(e)             # (UNIVERSE_NET_GUARD)
             if b is not None:
                 if not is_network_error(e):
                     b["fails"] = 0
@@ -17000,6 +17034,54 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} paid-basis: {len(stale)} market(s) uncrossed -- "
                     f"this period is under the ${PAYOUT_FLOOR_DOLLARS:.2f} floor")
 
+    # ---- the universe refresh's network guard (2026-10-11, UNIVERSE_NET_GUARD)
+
+    def _note_net_error(self, e: Optional[BaseException] = None) -> None:
+        """A main-thread call that got no answer (is_network_error; None =
+        the caller already knows): the universe refresh then defers for
+        UNIVERSE_NET_TROUBLE_SECS. Never raises."""
+        if e is None or is_network_error(e):
+            self._net_err_at = time.time()
+
+    @staticmethod
+    def _refresh_abort_worthy(e: BaseException) -> bool:
+        """Kalshi out of reach (a network error) or overloaded (a 429 / 5xx
+        that outlasted the client's retries), not a bad request."""
+        return is_network_error(e) or (
+            isinstance(e, HttpError) and e.status in (429, 500, 502, 503, 504))
+
+    def _universe_net_trouble(self, now_ts: float) -> str:
+        """Why a due universe refresh should wait (UNIVERSE_NET_GUARD), or ''."""
+        if now_ts < self.wake_grace_until:
+            return (f"waking from a sleep (grace {self.wake_grace_until - now_ts:.0f}s "
+                    f"left)")
+        if self._net_err_at and now_ts - self._net_err_at < UNIVERSE_NET_TROUBLE_SECS:
+            return f"a network error {now_ts - self._net_err_at:.0f}s ago"
+        ws = self._ws
+        if ws is not None and WS_MODE != "off":
+            try:
+                if not ws.healthy():
+                    return "the WebSocket feed is down or silent"
+            except Exception:
+                pass
+        return ""
+
+    def _universe_skip(self, kind: str, why: str, now_ts: float) -> None:
+        """Count a deferred / aborted refresh for latency.universe."""
+        g = self._universe_guard
+        g[kind] = g.get(kind, 0) + 1
+        g["last"] = (f"{kind} {datetime.fromtimestamp(now_ts, timezone.utc):%m-%d %H:%M:%S}Z"
+                     f": {why}")
+
+    def _universe_abort(self, why: str, e: Optional[BaseException],
+                        now_ts: float) -> None:
+        """End this refresh with the current universe kept (UNIVERSE_NET_GUARD)."""
+        if e is not None:
+            self._note_net_error(e)
+        self._universe_skip("aborted", why, now_ts)
+        log(f"{self.tag} ! universe refresh aborted: {why}; the current universe "
+            f"stays, and the next due refresh waits for the network")
+
     def refresh_universe(self, now_utc: datetime, positions: Dict[str, float]) -> None:
         now_ts = now_utc.timestamp()
         # Pick up call-time overrides and auto-enrolled series written since
@@ -17052,8 +17134,38 @@ class IncentiveMarketMaker:
         if (now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS
                 and not hour_crossed and not in_activation_window):
             return
+        # NETWORK GUARD (UNIVERSE_NET_GUARD): a refresh that comes due in
+        # network trouble waits, with the current universe kept, for up to
+        # UNIVERSE_DEFER_MAX_SECS
+        if UNIVERSE_NET_GUARD:
+            why = self._universe_net_trouble(now_ts)
+            since = self._universe_deferred_since
+            if why:
+                if since is None:
+                    self._universe_deferred_since = since = now_ts
+                    log(f"{self.tag} universe refresh deferred: {why}; the current "
+                        f"universe stays (it runs anyway after "
+                        f"{UNIVERSE_DEFER_MAX_SECS / 60:.0f} min)")
+                if now_ts - since < UNIVERSE_DEFER_MAX_SECS:
+                    self._universe_skip("deferred", why, now_ts)
+                    return
+                log(f"{self.tag} universe refresh: deferred {now_ts - since:.0f}s "
+                    f"and still {why}; running it anyway")
+            elif since is not None:
+                log(f"{self.tag} universe refresh resumes after "
+                    f"{now_ts - since:.0f}s deferred")
+            self._universe_deferred_since = None
         _config_gaps_prune()          # gaps fixed since the last refresh
-        by_market = self.fetch_programs()
+        try:
+            by_market = self.fetch_programs()
+        except Exception as e:
+            # out of reach: keep the universe rather than a cycle error toward
+            # the fail-safe (UNIVERSE_NET_GUARD)
+            if not (UNIVERSE_NET_GUARD and self._refresh_abort_worthy(e)):
+                raise
+            self._universe_abort(f"the programs read got no answer ({e!r:.80})",
+                                 e, now_ts)
+            return
         # Live-program set for the no-rent freeze (empty on a failed/empty
         # read keeps the failsafe in the consumers: never mass-freeze on a
         # transient feed outage).
@@ -17232,13 +17344,30 @@ class IncentiveMarketMaker:
         unquotable_now: Set[str] = set()
         tickers = [t for t, _info in candidates] + [t for t, _i in scan_pre]
         markets: Dict[str, dict] = {}
+        _bulk_t0 = time.monotonic()
         for i in range(0, len(tickers), 50):
             chunk = tickers[i:i + 50]
+            # NETWORK GUARD: a chunk that cannot be read must not drop its
+            # members (their quotes would be cancelled as unselected), so a
+            # Kalshi that is out of reach or slow ends the refresh instead
+            if (UNIVERSE_NET_GUARD and UNIVERSE_BULK_BUDGET_SECS > 0
+                    and time.monotonic() - _bulk_t0 > UNIVERSE_BULK_BUDGET_SECS):
+                self._universe_abort(
+                    f"bulk market reads ran over {UNIVERSE_BULK_BUDGET_SECS:.0f}s "
+                    f"({i} of {len(tickers)} tickers read)", None, now_ts)
+                self._note_net_error()
+                return
             try:
                 resp = self.client.get_markets(tickers=",".join(chunk), limit=len(chunk))
                 for m in (resp.get("markets") or []):
                     markets[m.get("ticker", "")] = m
             except Exception as e:
+                if UNIVERSE_NET_GUARD and self._refresh_abort_worthy(e):
+                    self._universe_abort(
+                        f"a bulk market read got no answer ({e!r:.80})", e, now_ts)
+                    if not is_network_error(e):
+                        self._note_net_error()      # Kalshi overloaded: wait too
+                    return
                 log(f"{self.tag} ! bulk market read failed ({e}); chunk skipped")
 
         # (imm_quote_gaps.py mirrors this meta construction — keep in sync.)
@@ -20135,6 +20264,7 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels = orderbook_levels(ob)
                 self.state.blind_streak.pop(t, None)
             except Exception as e:
+                self._note_net_error(e)         # (UNIVERSE_NET_GUARD)
                 streak = self.state.blind_streak.get(t, 0) + 1
                 self.state.blind_streak[t] = streak
                 if streak <= BLIND_PRESERVE_CYCLES:
@@ -21995,6 +22125,14 @@ class IncentiveMarketMaker:
                     "last_ws": ut[-1][3],
                     "last_at": datetime.fromtimestamp(
                         ut[-1][1], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            # ...and the network guard's deferred / aborted refreshes
+            # (2026-10-11, UNIVERSE_NET_GUARD)
+            g = self._universe_guard
+            if g["deferred"] or g["aborted"] or self._universe_deferred_since:
+                out.setdefault("universe", {}).update(
+                    deferred=g["deferred"], aborted=g["aborted"], last_skip=g["last"],
+                    deferring_s=(round(time.time() - self._universe_deferred_since)
+                                 if self._universe_deferred_since else 0))
             return out
         except Exception as e:
             return {"error": str(e)[:200]}
@@ -23372,6 +23510,13 @@ class IncentiveMarketMaker:
                           " -- needs IMM_WS=on to read them; shadow until then"),
                    "off": " -- the universe refresh reads REST"
                    }.get(WS_CANDIDATES, ""))
+        log("universe refresh network guard (2026-10-11): "
+            + (f"on -- a due refresh waits while the WS feed is down, after a "
+               f"wake, or within {UNIVERSE_NET_TROUBLE_SECS:.0f}s of a network "
+               f"error (at most {UNIVERSE_DEFER_MAX_SECS / 60:.0f} min); a programs "
+               f"or bulk market read that gets no answer, or bulk reads over "
+               f"{UNIVERSE_BULK_BUDGET_SECS:.0f}s, end it with the universe kept"
+               if UNIVERSE_NET_GUARD else "off"))
         log(f"event sweep breaker (2026-10-04): {SWEEP_BREAKER}"
             + {"dry": f" -- a maker fill that clears our order trips its event; "
                       f"the trip is LOGGED (ws_sweep_<date>.jsonl), nothing pulled"
@@ -23509,6 +23654,7 @@ class IncentiveMarketMaker:
                     now = time.time()
                     if now - top > WAKE_GAP_SECS:
                         self.wake_grace_until = now + WAKE_GRACE_SECS
+                    self._note_net_error(e)     # (UNIVERSE_NET_GUARD)
                     self.state.errors_today += 1
                     if now < self.wake_grace_until:
                         log(f"{self.tag} ! cycle error during wake grace: {e!r}")

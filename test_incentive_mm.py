@@ -24306,5 +24306,171 @@ class TestTradingClientBounds(unittest.TestCase):
             self.assertEqual(call.kwargs["timeout"], (5.0, 10.0))
 
 
+class TestUniverseNetGuard(unittest.TestCase):
+    """UNIVERSE_NET_GUARD (Jack 2026-10-11, "do 1"): a universe refresh that
+    comes due in network trouble (the WS feed down, a wake, a recent network
+    error) waits with the current universe kept, and one that meets a dead
+    or overloaded Kalshi mid-way ends with the universe kept, instead of
+    crawling into the hang watchdog or dropping members."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.bot.run_cycle()
+        self.assertIn(self.T, self.bot.state.selected)
+        self.bot.state.universe_at = 0.0                 # due
+        self.lines = []
+        p = mock.patch.object(imm, "log", side_effect=self.lines.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _feed(self, healthy):
+        feed = _FakeFeed()
+        feed.healthy = lambda: healthy
+        self.bot._ws = feed
+        p = mock.patch.object(imm, "WS_MODE", "on")
+        p.start()
+        self.addCleanup(p.stop)
+        return feed
+
+    def _refresh(self):
+        self.bot.refresh_universe(datetime.now(timezone.utc), {})
+
+    def _spy_programs(self):
+        calls = []
+        real = self.bot.fetch_programs
+
+        def spy():
+            calls.append(1)
+            return real()
+        self.bot.fetch_programs = spy
+        return calls
+
+    def test_defaults(self):
+        self.assertEqual((imm.UNIVERSE_NET_GUARD, imm.UNIVERSE_NET_TROUBLE_SECS,
+                          imm.UNIVERSE_DEFER_MAX_SECS, imm.UNIVERSE_BULK_BUDGET_SECS),
+                         (True, 120.0, 900.0, 120.0))
+
+    def test_a_due_refresh_waits_while_the_feed_is_down(self):
+        b = self.bot
+        feed = self._feed(False)
+        calls = self._spy_programs()
+        before = set(b.state.selected)
+        self._refresh()
+        self._refresh()
+        self.assertEqual(calls, [])                      # no programs read at all
+        self.assertEqual((b.state.universe_at, set(b.state.selected)), (0.0, before))
+        self.assertEqual(b._universe_guard["deferred"], 2)
+        deferred = [s for s in self.lines if "universe refresh deferred" in s]
+        self.assertEqual(len(deferred), 1)               # once per run of deferrals
+        self.assertIn("the WebSocket feed is down or silent", deferred[0])
+        feed.healthy = lambda: True                      # back: it runs
+        self._refresh()
+        self.assertEqual(calls, [1])
+        self.assertGreater(b.state.universe_at, 0.0)
+        self.assertIsNone(b._universe_deferred_since)
+        self.assertTrue(any("universe refresh resumes after" in s for s in self.lines))
+
+    def test_a_recent_network_error_or_a_wake_defers_it_too(self):
+        b = self.bot
+        calls = self._spy_programs()
+        b._net_err_at = time.time() - 30
+        self._refresh()
+        self.assertEqual(calls, [])
+        self.assertIn("a network error 30s ago", b._universe_guard["last"])
+        b._net_err_at = time.time() - imm.UNIVERSE_NET_TROUBLE_SECS - 5
+        b.wake_grace_until = time.time() + 60
+        self._refresh()
+        self.assertEqual(calls, [])
+        self.assertIn("waking from a sleep", b._universe_guard["last"])
+        b.wake_grace_until = 0.0
+        self._refresh()
+        self.assertEqual(calls, [1])
+
+    def test_it_runs_anyway_after_the_deferral_cap(self):
+        b = self.bot
+        self._feed(False)
+        calls = self._spy_programs()
+        b._universe_deferred_since = time.time() - imm.UNIVERSE_DEFER_MAX_SECS - 1
+        self._refresh()
+        self.assertEqual(calls, [1])
+        self.assertTrue(any("running it anyway" in s for s in self.lines))
+
+    def test_off_is_the_old_behaviour(self):
+        self._feed(False)
+        calls = self._spy_programs()
+        with mock.patch.object(imm, "UNIVERSE_NET_GUARD", False):
+            self._refresh()
+        self.assertEqual(calls, [1])
+
+    def test_a_programs_read_with_no_answer_ends_it_without_a_cycle_error(self):
+        b = self.bot
+        before = set(b.state.selected)
+        b.fetch_programs = mock.Mock(
+            side_effect=_requests.exceptions.ConnectionError("SSLError: EOF"))
+        self._refresh()                                  # no exception
+        self.assertEqual((b.state.universe_at, set(b.state.selected)), (0.0, before))
+        self.assertEqual(b._universe_guard["aborted"], 1)
+        self.assertGreater(b._net_err_at, 0.0)           # the next due one waits
+        self.assertTrue(any("universe refresh aborted: the programs read got no answer"
+                            in s for s in self.lines), self.lines)
+        b.fetch_programs = mock.Mock(side_effect=HttpError("Bad Request", 400))
+        b._net_err_at = 0.0
+        with self.assertRaises(HttpError):               # a bad request: as before
+            self._refresh()
+
+    def test_a_bulk_read_with_no_answer_keeps_every_member(self):
+        b = self.bot
+        b.client.get_markets = mock.Mock(
+            side_effect=_requests.exceptions.ReadTimeout("read timed out"))
+        self._refresh()
+        self.assertIn(self.T, b.state.selected)          # kept, quotes and all
+        self.assertEqual((b.state.universe_at, b._universe_guard["aborted"]), (0.0, 1))
+        self.assertTrue(any("a bulk market read got no answer" in s for s in self.lines))
+        # an overloaded Kalshi (503 after the client's retries) is the same...
+        b._net_err_at = 0.0
+        b.client.get_markets = mock.Mock(side_effect=HttpError("Unavailable", 503))
+        self._refresh()
+        self.assertEqual((b.state.universe_at, b._universe_guard["aborted"]), (0.0, 2))
+        self.assertGreater(b._net_err_at, 0.0)
+        # ...while a request Kalshi refuses still just skips its chunk
+        b._net_err_at = 0.0
+        b.client.get_markets = mock.Mock(side_effect=HttpError("Bad Request", 400))
+        self._refresh()
+        self.assertGreater(b.state.universe_at, 0.0)
+        self.assertTrue(any("bulk market read failed" in s and "chunk skipped" in s
+                            for s in self.lines))
+
+    def test_bulk_reads_over_their_budget_end_it(self):
+        b = self.bot
+        with mock.patch.object(imm, "UNIVERSE_BULK_BUDGET_SECS", -1.0):
+            self._refresh()                              # budget off: runs
+        self.assertGreater(b.state.universe_at, 0.0)
+        b.state.universe_at = 0.0
+        clock = iter(range(0, 10 ** 6, 1000))
+        with mock.patch.object(imm.time, "monotonic", lambda: float(next(clock))):
+            self._refresh()
+        self.assertEqual((b.state.universe_at, b._universe_guard["aborted"]), (0.0, 1))
+        self.assertTrue(any("bulk market reads ran over 120s" in s for s in self.lines))
+        self.assertIn(self.T, b.state.selected)
+
+    def test_network_errors_are_noted_and_the_status_reports_the_guard(self):
+        b = self.bot
+        b._note_net_error(HttpError("Bad Request", 400))
+        self.assertEqual(b._net_err_at, 0.0)             # an answer is not trouble
+        b.client.get_orderbook = mock.Mock(
+            side_effect=_requests.exceptions.ConnectionError("aborted"))
+        with self.assertRaises(_requests.exceptions.ConnectionError):
+            b._read_candidate_book(self.T)
+        self.assertGreater(b._net_err_at, 0.0)
+        self._refresh()                                  # deferred: error just now
+        u = b._latency_status()["universe"]
+        self.assertEqual((u["deferred"], u["aborted"]), (1, 0))
+        self.assertIn("deferred", u["last_skip"])
+        self.assertGreaterEqual(u["deferring_s"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

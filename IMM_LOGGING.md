@@ -285,6 +285,9 @@ mode, want = candidates on the feed, ws / rest / rest_fallback reads,
 audits, warm_waits, warm_s, and `shadow` -- the compare of candidate REST
 reads with the WS book), and `latency.universe` (the universe refreshes:
 n, median_s, last_s, last_reads, last_ws, last_at).
+Since 2026-10-11 `latency.universe` also carries the refresh network
+guard's counts (UNIVERSE_NET_GUARD): deferred, aborted, last_skip (kind,
+time, why) and deferring_s (how long the current run of deferrals has lasted).
 
 ## Two compatibility traps, both tested
 
