@@ -247,6 +247,10 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("YTW_ENABLE") \
             and series == globals().get("YTW_SERIES"):
         m = min(m, max(1.0, globals().get("YTW_REF_MULT_CAP", 1.0)))
+    # the Trump weekly pilots (2026-10-11): the same, TWK_REF_MULT_CAP
+    if series is not None and globals().get("TWK_ENABLE") \
+            and series in globals().get("TWK_SERIES", ()):
+        m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
     return m
 
 
@@ -1611,6 +1615,9 @@ def is_daily_series(series: str) -> bool:
     # ... and so is the YouTube weekly pilot (2026-10-06)
     if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
         return True
+    # ... and so are the Trump weekly pilots (2026-10-11)
+    if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -2300,6 +2307,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the YouTube weekly pilot (2026-10-06): YTW_EVENT_CAP net per event
     if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
         return globals()["YTW_EVENT_CAP"]
+    # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
+    if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
+        return globals()["TWK_EVENT_CAP"]
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -4934,6 +4944,11 @@ _DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D,KXYTTOPVIDEO2D"
 # ytw_pilot_ticker in _allowed -- the series is never in ALLOW_SERIES, so
 # every other artist stays out. IMM_YTW_ENABLE=0 takes it out.
 _YTW_LIVE = os.environ.get("IMM_YTW_ENABLE", "1") == "1"
+# TRUMP WEEKLY PILOTS (Jack 2026-10-11: "yes pilot both, $40/day halt"):
+# KXTRUTHSOCIAL early in the week, KXEOWEEK bids only (see TWK_ENABLE).
+# IMM_TWK_ENABLE=0 or IMM_ALLOW_TWK_SERIES="" takes them out.
+_TWK_LIVE = os.environ.get("IMM_TWK_ENABLE", "1") == "1"
+_DEFAULT_TWK_SERIES = "KXTRUTHSOCIAL,KXEOWEEK"
 # LONG-DATED MORTGAGE RATES (Jack 2026-09-28: "yes" to "build a fair-value
 # gate for KXFM30YMTG and KXMORTGAGERATE"): Freddie Mac PMMS year-end and
 # how-high-in-a-year markets, $100 per strike per period from 9/28. Enrolled
@@ -5228,6 +5243,10 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_YT2_SERIES",
                                         _DEFAULT_YT2_SERIES)
                          if _YT2_LIVE else "")
+                # Trump weekly pilots (2026-10-11): only while the pilot is on
+                + "," + (os.environ.get("IMM_ALLOW_TWK_SERIES",
+                                        _DEFAULT_TWK_SERIES)
+                         if _TWK_LIVE else "")
                 # long-dated mortgage rates (2026-09-28): only while the
                 # mortgage gate is on
                 + "," + (os.environ.get("IMM_ALLOW_MORT_SERIES",
@@ -7848,6 +7867,10 @@ _CONFIG_CODE_KNOBS = (
     "YTW_ENABLE", "YTW_ARTISTS", "YTW_CUTOFF_FROM_CLOSE_MIN", "YTW_MAX_POSITION",
     "YTW_REF_MULT_CAP", "YTW_EVENT_CAP", "YTW_DAILY_LOSS_LIMIT", "YTW_FAIR_TOL_CENTS",
     "YTW_FAIR_MIN_P", "YTW_FAIR_TTL_MIN", "YTW_FAIR_REFRESH_SECS",
+    # Trump weekly pilots (2026-10-11)
+    "TWK_ENABLE", "TWK_SERIES", "TWK_EARLY_SERIES", "TWK_EARLY_CUTOFF_FROM_CLOSE_MIN",
+    "TWK_BID_ONLY_SERIES", "TWK_MAX_POSITION", "TWK_REF_MULT_CAP", "TWK_EVENT_CAP",
+    "TWK_DAILY_LOSS_LIMIT",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -10169,8 +10192,9 @@ def series_bid_only(series: str) -> bool:
     """A family quoted with YES bids only: no ask rungs, no ask pad, and the
     two-sided depth test never counts an ask pad. The quake gate's family
     (whose far strikes may still rest an ask, see quake_ask_strike), and the
-    sports ladders / escalators while SPORTS_LADDER_ASKS_OFF."""
-    return quake_gated(series) or (
+    sports ladders / escalators while SPORTS_LADDER_ASKS_OFF, and the
+    Trump weekly pilot's KXEOWEEK (twk_bid_only, 2026-10-11)."""
+    return quake_gated(series) or twk_bid_only(series) or (
         SPORTS_LADDER_ASKS_OFF and not ladder_asks_relatched()
         and sports_ladder_league(series) is not None)
 
@@ -10836,6 +10860,65 @@ def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
                         tzinfo=timezone.utc)
     except (KeyError, ValueError):
         return None
+
+
+# ----------------------------------------------------------------------------
+# TRUMP WEEKLY PILOTS (Jack 2026-10-11: "yes pilot both, $40/day halt").
+# Two weekly Politics counts, out of the book since the 10/03 scan cut:
+#   KXTRUTHSOCIAL-<YYMMMDD>: "Trump Truth Social posts this week?", ~10
+#     range buckets, listed Sunday 14:00Z, closing the next Sunday ~13:59Z.
+#     EARLY WEEK ONLY: out TWK_EARLY_CUTOFF_FROM_CLOSE_MIN (7,200 = 5 days)
+#     before the close, i.e. quoted Sunday 10am -> Tuesday ~10am ET.
+#   KXEOWEEK-<YYMMMDD>: "How many Executive Orders will Trump sign this
+#     week?", "Above N" strikes closing ~2 weeks after the week. BIDS ONLY
+#     (series_bid_only via twk_bid_only): the bot only buys YES. The normal
+#     ticker-date cutoff (00:00 ET on the week's last day) still applies.
+# WHY. The public tape of the 10 settled weeks of each (8/01-9/27, every
+# trade at 5-95c, maker P&L to settlement): KXTRUTHSOCIAL makers made +4.6
+# c/ct more than 6 days before the close (8 of 9 weeks positive) and +1.6 at
+# 5-6 days (6 of 9), then lost on most days (-2.7 to -4.9; 2-3 of 10 weeks
+# positive). KXEOWEEK makers' ASKS lost in every window (-10 to -26 c/ct:
+# the takers buying "an EO gets signed" are early), their bids mostly won.
+# The same tape scores KXTRUMPENDORSEMENTS -11 c/ct while the bot made +$255
+# there (rewards $233, trading +$23 since 9/13), so the tape ranks the risk
+# rather than pricing our fills. KXTRUMPACT (-10.4) and KXTRUMPNOMNUM
+# (-13.5) stay out.
+# THE RULES: safe-join placement (KXTRUMPENDORSEMENTS's scan-graduate guard),
+# the global 20-lot ladder at x1 every hour (is_daily_series: no quiet-hours,
+# evening, Saturday or yield size), no deep-reference size (TWK_REF_MULT_CAP
+# 1.0), TWK_MAX_POSITION 100 per market and TWK_EVENT_CAP 100 net per event,
+# and a DAILY LOSS HALT PER SERIES: a series' realized + marked P&L today at
+# or below -TWK_DAILY_LOSS_LIMIT ($40) cancels its orders and stands it aside
+# until the 5am-CT roll; positions ride. Emails "twk_halt".
+# Kill switch IMM_TWK_ENABLE=0 (or IMM_ALLOW_TWK_SERIES=""); positions ride.
+TWK_ENABLE = _TWK_LIVE
+TWK_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_ALLOW_TWK_SERIES", _DEFAULT_TWK_SERIES).split(",") if s.strip())
+TWK_EARLY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_TWK_EARLY_SERIES", "KXTRUTHSOCIAL").split(",") if s.strip())
+TWK_EARLY_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_TWK_EARLY_CUTOFF_FROM_CLOSE_MIN", 7200)
+TWK_BID_ONLY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_TWK_BID_ONLY_SERIES", "KXEOWEEK").split(",") if s.strip())
+TWK_MAX_POSITION = _env_float("IMM_TWK_MAX_POSITION", 100)
+TWK_REF_MULT_CAP = _env_float("IMM_TWK_REF_MULT_CAP", 1.0)
+TWK_EVENT_CAP = _env_float("IMM_TWK_EVENT_CAP", 100)
+TWK_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_DAILY_LOSS_LIMIT", 40)
+
+if TWK_ENABLE:
+    for _s in TWK_SERIES:
+        _kw = {"max_position": TWK_MAX_POSITION, "safe_join": True}
+        if _s in TWK_EARLY_SERIES:
+            _kw["cutoff_from_close_min"] = TWK_EARLY_CUTOFF_FROM_CLOSE_MIN
+        SERIES_OVERRIDES[_s] = replace(
+            SERIES_OVERRIDES.get(_s) or SeriesOverride(), **_kw)
+
+
+def twk_series(series: str) -> bool:
+    return TWK_ENABLE and series in TWK_SERIES
+
+
+def twk_bid_only(series: str) -> bool:
+    return twk_series(series) and series in TWK_BID_ONLY_SERIES
 
 
 # ----------------------------------------------------------------------------
@@ -14564,6 +14647,12 @@ class BotState:
     ytw_pnl_baseline: Optional[float] = None   # NOT persisted
     ytw_pnl_carry: float = 0.0
     ytw_pnl_today_last: float = 0.0
+    # Trump weekly pilots' daily loss halt (2026-10-11, TWK_DAILY_LOSS_LIMIT),
+    # PER SERIES: series -> roll day / baseline / carry / last P&L today
+    twk_halt_day: Dict[str, str] = field(default_factory=dict)
+    twk_pnl_baseline: Dict[str, float] = field(default_factory=dict)   # NOT persisted
+    twk_pnl_carry: Dict[str, float] = field(default_factory=dict)
+    twk_pnl_today_last: Dict[str, float] = field(default_factory=dict)
     programmed: Set[str] = field(default_factory=set)   # markets with a LIVE incentive
     #   program at the last universe refresh — the no-rent freeze (Jack 2026-07-26,
     #   KXRT: "why still quoting when the rewards have expired") keys off this
@@ -15848,6 +15937,8 @@ class IncentiveMarketMaker:
             self.state.scan_halt_day = str(data.get("scan_halt_day") or "")
             self.state.yt2_halt_day = str(data.get("yt2_halt_day") or "")
             self.state.ytw_halt_day = str(data.get("ytw_halt_day") or "")
+            self.state.twk_halt_day = {
+                str(k): str(v) for k, v in (data.get("twk_halt_day") or {}).items()}
             for _t in sorted(self.state.scan_book):
                 ensure_scan_override(series_of(_t))
             # MIGRATION (2026-08-04, first load after the paid-basis counters
@@ -15928,6 +16019,9 @@ class IncentiveMarketMaker:
                 # YouTube #2 pilot P&L carry (2026-10-05), same rule
                 self.state.yt2_pnl_carry = float(data.get("yt2_pnl_carry") or 0.0)
                 self.state.ytw_pnl_carry = float(data.get("ytw_pnl_carry") or 0.0)
+                self.state.twk_pnl_carry = {
+                    str(k): float(v or 0.0)
+                    for k, v in (data.get("twk_pnl_carry") or {}).items()}
                 if self.state.halted_until > time.time():
                     log(f"{self.tag} restored ACTIVE daily-loss halt "
                         f"(pnl carry ${self.state.pnl_carry:+.2f})")
@@ -16165,6 +16259,9 @@ class IncentiveMarketMaker:
                            "yt2_pnl_carry": round(self.state.yt2_pnl_today_last, 2),
                            "ytw_halt_day": self.state.ytw_halt_day,
                            "ytw_pnl_carry": round(self.state.ytw_pnl_today_last, 2),
+                           "twk_halt_day": dict(self.state.twk_halt_day),
+                           "twk_pnl_carry": {k: round(v, 2) for k, v in
+                                             self.state.twk_pnl_today_last.items()},
                            # live-event depth halts (pruned with the same 7d
                            # TTL: mention events settle within a day, this
                            # just stops dead events accreting)
@@ -19748,6 +19845,21 @@ class IncentiveMarketMaker:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
 
+    def _twk_pnl(self, series: str) -> float:
+        """One Trump weekly pilot series' realized + mark-to-market over its
+        tickers in the bot's own P&L book; the cross-restart composition is
+        twk_pnl_carry[series]."""
+        total = 0.0
+        for t in set(self.pnl.realized) | set(self.pnl.pos):
+            if series_of(t) != series:
+                continue
+            total += self.pnl.realized.get(t, 0.0)
+            p = self.pnl.pos.get(t, 0.0)
+            mark = self.state.last_mark.get(t)
+            if abs(p) > 1e-9 and mark is not None:
+                total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
+        return total
+
     def _ytw_pnl(self) -> float:
         """The YouTube weekly pilot's realized + mark-to-market over every
         KXYTVIEWSW ticker in the bot's own P&L book (only pilot artists are
@@ -21971,6 +22083,18 @@ class IncentiveMarketMaker:
                     self._ytw_stood.discard(t)
                     log(f"{self.tag} ytw resume {t}")
 
+            # TRUMP WEEKLY PILOT LOSS HALT (Jack 2026-10-11, see TWK_ENABLE):
+            # this series' daily loss limit tripped this roll day -- stood
+            # aside until the 5am-CT roll; positions ride.
+            if twk_series(meta.series) and self.state.twk_halt_day.get(
+                    meta.series) == _halt_day_key(now_utc):
+                self.cancel_market_orders(t, resting)
+                twk_in = {"pnl_today": round(
+                              self.state.twk_pnl_today_last.get(meta.series, 0.0), 2),
+                          "limit": TWK_DAILY_LOSS_LIMIT}
+                self._gskip(t, "twk_halt", lambda: twk_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                continue
+
             # TREASURY GATE (Jack 2026-10-01, see TREASURY_GATE_ENABLE; every
             # Treasury series since 2026-10-02, TREASURY_GATE_ALL): quoted
             # only against the live CNBC yield's fair; fails CLOSED without a
@@ -22695,6 +22819,35 @@ class IncentiveMarketMaker:
                     key="ytw_halt")
                 self._save_persist()
 
+        # TRUMP WEEKLY PILOTS DAILY LOSS HALT (Jack 2026-10-11, see
+        # TWK_ENABLE): the YouTube pilots' scheme, one budget PER SERIES.
+        if TWK_ENABLE and TWK_DAILY_LOSS_LIMIT > 0 and not fast_only:
+            _roll_day = _halt_day_key(now_utc)
+            for tw_s in sorted(TWK_SERIES):
+                tw_total = self._twk_pnl(tw_s)
+                if tw_s not in self.state.twk_pnl_baseline:
+                    self.state.twk_pnl_baseline[tw_s] = tw_total
+                tw_today = (tw_total - self.state.twk_pnl_baseline[tw_s]
+                            + self.state.twk_pnl_carry.get(tw_s, 0.0))
+                self.state.twk_pnl_today_last[tw_s] = tw_today
+                if tw_today <= -TWK_DAILY_LOSS_LIMIT \
+                        and self.state.twk_halt_day.get(tw_s) != _roll_day:
+                    self.state.twk_halt_day[tw_s] = _roll_day
+                    halted_ids = {str(o.get("ticker", "")) for o in resting
+                                  if series_of(str(o.get("ticker", ""))) == tw_s}
+                    n_cx = 0
+                    for t_h in sorted(halted_ids):
+                        n_cx += self.cancel_market_orders(t_h, resting)
+                    desired = [q for q in desired if series_of(q.ticker) != tw_s]
+                    self.alerter.alert(
+                        "twk_halt",
+                        f"Trump weekly pilot {tw_s} P&L today ${tw_today:+.2f} <= "
+                        f"-${TWK_DAILY_LOSS_LIMIT:.0f}; cancelled {n_cx} orders on "
+                        f"{len(halted_ids)} market(s) and stood {tw_s} aside "
+                        f"until the {SUMMARY_HOUR_CT}am CT roll (positions ride)",
+                        key=f"twk_halt:{tw_s}")
+                    self._save_persist()
+
         # TOXIC-FLOW SIDE HALT (Jack 2026-09-29, see TOXIC_HALT): judge the
         # fills that came due against this cycle's marks (quoted markets were
         # marked from their books, every open position by _refresh_marks),
@@ -23380,6 +23533,9 @@ class IncentiveMarketMaker:
         s.ytw_pnl_baseline = None
         s.ytw_pnl_carry = 0.0
         s.ytw_pnl_today_last = 0.0
+        s.twk_pnl_baseline = {}
+        s.twk_pnl_carry = {}
+        s.twk_pnl_today_last = {}
         s.scan_book = {t for t in s.scan_book
                        if t in s.scan_members
                        or abs(self.pnl.pos.get(t, 0.0)) > 1e-9}
@@ -24616,6 +24772,18 @@ class IncentiveMarketMaker:
                        datetime.now(timezone.utc)) else ""))
         else:
             log("ytw pilot: OFF -- KXYTVIEWSW is not enrolled")
+        if TWK_ENABLE:
+            _tw_today = _halt_day_key(datetime.now(timezone.utc))
+            log(f"twk pilot: {','.join(sorted(TWK_SERIES))}; early-week only "
+                f"({TWK_EARLY_CUTOFF_FROM_CLOSE_MIN}m before the close): "
+                f"{','.join(sorted(TWK_EARLY_SERIES & TWK_SERIES)) or '-'}; bids only: "
+                f"{','.join(sorted(TWK_BID_ONLY_SERIES & TWK_SERIES)) or '-'}; safe-join, "
+                f"x1 at every hour, {TWK_MAX_POSITION:g}/market and {TWK_EVENT_CAP:g}/event "
+                f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
+                + "".join(f" ({_s} HALTED this roll day)" for _s, _d in
+                          sorted(self.state.twk_halt_day.items()) if _d == _tw_today))
+        else:
+            log("twk pilot: OFF -- KXTRUTHSOCIAL / KXEOWEEK are not enrolled")
         if TREASURY_GATE_ENABLE:
             log("treasury gate: "
                 + (f"ALL {len(TREASURY_GATED_SERIES)} Treasury series"

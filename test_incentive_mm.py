@@ -2994,7 +2994,11 @@ class TestAllowlist(unittest.TestCase):
             self.assertFalse(a(t), t)
         # non-ticker lookalikes still excluded
         self.assertFalse(a("KXMUSKNW-26JUL31-T950"))
-        self.assertFalse(a("KXTRUTHSOCIAL-26JUL25-T240"))
+        # KXTRUTHSOCIAL is allowlisted by the Trump weekly pilot since
+        # 2026-10-11 -- by name, not by the company-metric rule
+        with mock.patch.object(imm, "ALLOW_SERIES", imm.ALLOW_SERIES - imm.TWK_SERIES):
+            self.assertFalse(a("KXTRUTHSOCIAL-26JUL25-T240"))
+        self.assertTrue(a("KXTRUTHSOCIAL-26JUL25-T240"))
 
     def test_econ_series(self):
         a = IncentiveMarketMaker._allowed
@@ -19287,6 +19291,115 @@ class TestYouTube2Pilot(unittest.TestCase):
         self.assertEqual(bot.state.yt2_halt_day, "2000-01-01")
 
 
+class TestTrumpWeeklyPilot(unittest.TestCase):
+    """The Trump weekly pilots (Jack 2026-10-11: "yes pilot both, $40/day
+    halt"): KXTRUTHSOCIAL quoted only until 5 days before the close,
+    KXEOWEEK bids only; both safe-join, x1 at every hour, 100 per market and
+    per event, and a daily loss halt PER SERIES."""
+
+    TS = "KXTRUTHSOCIAL-68DEC09-B109"
+    EO = "KXEOWEEK-68DEC09-1"
+    CLOSE = datetime(2068, 12, 10, 13, 59, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _bot(self):
+        client = FakeClient()
+        # a wide 40/60 touch, so safe-join rests AT it (spread >= 5 ticks)
+        lv = [["0.36", "400"], ["0.37", "400"], ["0.38", "400"],
+              ["0.39", "400"], ["0.40", "300"]]
+        for t in (self.TS, self.EO):
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "yes_bid_dollars": "0.4000", "yes_ask_dollars": "0.6000",
+                "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    @staticmethod
+    def _sides(bot, t):
+        return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+    def test_enrolled_with_the_pilot_rules(self):
+        for s in ("KXTRUTHSOCIAL", "KXEOWEEK"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.twk_series(s), s)
+            ov = imm.series_override(s)
+            self.assertTrue(ov.safe_join, s)                 # KXTRUMPENDORSEMENTS's guard
+            self.assertEqual(imm.series_max_position(s), 100.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT17"), 100.0, s)
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            for when in (datetime(2026, 10, 13, 7, 0, tzinfo=timezone.utc),    # quiet
+                         datetime(2026, 10, 13, 23, 30, tzinfo=timezone.utc),  # evening
+                         datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)):  # Saturday
+                self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+            with mock.patch.object(imm, "LADDER_MODE", "atref"):
+                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
+        self.assertTrue(imm.series_bid_only("KXEOWEEK"))
+        self.assertFalse(imm.series_bid_only("KXTRUTHSOCIAL"))
+        # KXTRUTHSOCIAL: out 5 days before the close; KXEOWEEK keeps the
+        # ticker-date rule (its markets close ~2 weeks after the week)
+        close = datetime(2026, 10, 18, 13, 59, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTRUTHSOCIAL", "KXTRUTHSOCIAL-26OCT17", close, close_time=close),
+            close - timedelta(days=5))
+        self.assertIsNone(imm.series_override("KXEOWEEK").cutoff_from_close_min)
+        # the two the tape ruled out stay out
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for s in ("KXTRUMPACT", "KXTRUMPNOMNUM"):
+                self.assertFalse(IncentiveMarketMaker._allowed(f"{s}-26OCT11-X"), s)
+            self.assertTrue(IncentiveMarketMaker._allowed(self.TS))
+            self.assertTrue(IncentiveMarketMaker._allowed(self.EO))
+
+    def test_bids_only_and_a_loss_halt_per_series(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.EO), {"bid"})          # bids only
+        self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})
+        self.assertEqual(bot.state.twk_pnl_baseline.get("KXEOWEEK"), 0.0)
+        # KXEOWEEK past its $40: it stands aside, KXTRUTHSOCIAL quotes on
+        bot.pnl.realized[self.EO] = -(imm.TWK_DAILY_LOSS_LIMIT + 1)
+        bot.run_cycle()
+        roll_day = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.twk_halt_day.get("KXEOWEEK"), roll_day)
+        self.assertNotIn("KXTRUTHSOCIAL", bot.state.twk_halt_day)
+        self.assertEqual(self._sides(bot, self.EO), set())
+        self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})
+        self.assertIn("twk_halt", [c for c, _m in bot.alerter.today])
+        self.assertEqual(bot.state.halted_until, 0.0)                 # whole book untouched
+        # the halt and the carry survive a restart
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertEqual(bot2.state.twk_halt_day.get("KXEOWEEK"), roll_day)
+        self.assertAlmostEqual(bot2.state.twk_pnl_carry.get("KXEOWEEK"),
+                               -(imm.TWK_DAILY_LOSS_LIMIT + 1))
+        # next roll day: quoting resumes
+        bot.state.twk_halt_day = {"KXEOWEEK": "2000-01-01"}
+        bot.state.twk_pnl_baseline = {}
+        bot.pnl.realized[self.EO] = 0.0
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.EO), {"bid"})
+
+    def test_kill_switch(self):
+        with mock.patch.object(imm, "TWK_ENABLE", False):
+            self.assertFalse(imm.twk_series("KXEOWEEK"))
+            self.assertFalse(imm.series_bid_only("KXEOWEEK"))
+
+
 class TestYouTubeWeeklyPilot(unittest.TestCase):
     """The YouTube weekly artist-views pilot (Jack 2026-10-06: "live now"):
     KXYTVIEWSW for KATSEYE / Drake / The Weeknd only, quoted against
@@ -20887,8 +21000,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # gate (2026-10-03) + the NFL player-prop gate (2026-10-03) + the
         # YouTube #2 pilot's family loss halt (2026-10-05) + the YouTube
         # weekly pilot's loss halt and fair gate (2026-10-06) + the book-read
-        # REST budget's rest_off (2026-10-11)
-        self.assertEqual(len(conts), 40)
+        # REST budget's rest_off (2026-10-11) + the Trump weekly pilots' loss
+        # halt (2026-10-11)
+        self.assertEqual(len(conts), 41)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
