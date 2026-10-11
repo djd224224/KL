@@ -8,7 +8,8 @@ after the :05:55 / :35:55 dashboard builds land: p50 84s, p90 193s on
 2. when that build is newer than the last one published, ONE headless Claude
    Code run (Haiku, `claude -p --restricted`, only the Read and Artifact
    tools, both allowed, nothing else) reads imm_pocket.html and republishes
-   it to the page's URL.
+   it to the page's URL. The run sets CLAUDE_CODE_ENTRYPOINT=claude-desktop:
+   the CLI's Artifact tool exists only under the desktop app's entrypoint.
 
 Why a republish and not the page's database (pocket/latest): the CLI has no
 ArtifactData tool, and the desktop-app paths kept dying -- the routine
@@ -119,13 +120,19 @@ def build():
 def publish():
     """(status line, cost USD, error) from one headless Claude Code run."""
     exe = shutil.which("claude") or CLAUDE_FALLBACK
+    # The CLI's Artifact tool is gated to the desktop app's entrypoint: a plain
+    # Task Scheduler `claude -p` has none (probed 10/10, 2.1.268: the only var
+    # that turns it on). Undocumented and internal -- Jack chose it 10/10 over
+    # a bypass-mode routine; if a CLI update drops it, runs fail and the
+    # stale email fires.
+    env = dict(os.environ, CLAUDE_CODE_ENTRYPOINT="claude-desktop")
     cmd = [exe, "-p", PROMPT, "--output-format", "json", "--no-session-persistence",
            "--model", MODEL, "--max-budget-usd", f"{BUDGET_USD:g}", "--restricted",
            "--strict-mcp-config", "--tools", "Read", "Artifact",
            "--allowedTools", "Read", "Artifact"]
     try:
-        p = subprocess.run(cmd, cwd=DASH_DIR, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=TIMEOUT_SECS,
+        p = subprocess.run(cmd, cwd=DASH_DIR, env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=TIMEOUT_SECS,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as e:
         return "", 0.0, f"{type(e).__name__}: {e}"

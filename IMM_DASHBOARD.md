@@ -261,7 +261,11 @@ signed in as Jack).
   1. the `imm_pocket.py` build
   2. when the build is newer than the last one published, one headless
      Claude Code run (Haiku, `claude -p --restricted`, only Read and
-     Artifact) reads `imm_pocket.html` and republishes it to the URL
+     Artifact) reads `imm_pocket.html` and republishes it to the URL. The run
+     sets `CLAUDE_CODE_ENTRYPOINT=claude-desktop`: the CLI's Artifact tool
+     exists only under the desktop app's entrypoint (undocumented; Jack's
+     choice 10/10 over a bypass-mode routine). If a CLI update drops it,
+     the runs fail and the stale email fires.
 
   It costs about $0.15-0.20 of Haiku at list price per publish. An unchanged
   build is skipped without calling Claude. It runs whether or not the
