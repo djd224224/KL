@@ -18643,7 +18643,7 @@ class TestQuakeBidOnlyGate(unittest.TestCase):
 
 
 class TestQuakeFarStrikeAsks(unittest.TestCase):
-    """The far strikes (QUAKE_ASK_STRIKES, 6.6/6.8/7.0) also rest a small YES
+    """The far strikes (QUAKE_ASK_STRIKES, 6.2-7.0) also rest a small YES
     ask, floored at the fair, pulled from the refresher thread the moment the
     ask verdict turns off (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes
     start at the far strikes"). Fixture = TOMORROW's 6.6: whole-day fair
@@ -18701,10 +18701,11 @@ class TestQuakeFarStrikeAsks(unittest.TestCase):
                                 "time": now - 60, "place": "x"}], now)
 
     def test_which_strikes_and_the_kill_switch(self):
-        self.assertEqual(imm.QUAKE_ASK_STRIKES, frozenset({6.6, 6.8, 7.0}))
+        self.assertEqual(imm.QUAKE_ASK_STRIKES, frozenset({6.2, 6.4, 6.6, 6.8, 7.0}))
         self.assertTrue(imm.quake_ask_strike(self.T))
         self.assertTrue(imm.quake_ask_strike(f"{self.EV}-7.0"))
-        self.assertFalse(imm.quake_ask_strike(f"{self.EV}-6.4"))
+        self.assertTrue(imm.quake_ask_strike(f"{self.EV}-6.2"))     # since 03:30Z
+        self.assertFalse(imm.quake_ask_strike(f"{self.EV}-6.0"))
         self.assertFalse(imm.quake_ask_strike(f"{self.EV}-x"))
         self.assertFalse(imm.quake_ask_strike("KXOTHER-26OCT11-6.6"))
         self.assertTrue(imm.series_bid_only("KXBIGGESTQUAKE"))     # family stays bid-only
@@ -18872,7 +18873,7 @@ class TestQuakeFarStrikeAsks(unittest.TestCase):
         self.assertEqual((v["action"], v["reason"], v["cap_c"], v["ask_floor_c"]),
                          ("quote", "ask_only", 0, 2))
         self.assertEqual(imm.quake_probe_caps(f"{self.EV}-7.0", t), (0, 2))
-        v = imm.quake_gate(f"{self.EV}-6.4", t)               # no ask strike: stands
+        v = imm.quake_gate(f"{self.EV}-6.0", t)               # no ask strike: stands
         self.assertEqual((v["action"], v["reason"]), ("stand", "fair_floor"))
         self.assertNotIn("ask_floor_c", v)
 

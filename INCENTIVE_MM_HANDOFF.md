@@ -10364,3 +10364,14 @@ call (it is the strike whose pick-off costs ~95c a contract).
 
 Tests: TestEmscFeed (5), TestQuakeFarStrikeAsks +2; test_incentive_mm +
 test_usgs_quake_fair 1236 OK.
+
+## 2026-10-11 ~03:30Z — quake far-strike asks: 6.2 and 6.4 added (Jack: "yes add 6.2 and 6.4")
+
+QUAKE_ASK_STRIKES default "6.6,6.8,7.0" -> "6.2,6.4,6.6,6.8,7.0". On the 03:24Z
+book: 6.4 ~$5.5/day of NO-side reward (26% of the NO side) vs ~$2-4/day of
+pick-offs at GFZ / EMSC speed ($8 at USGS speed), off on ~28% of days (day max
+>= 6.0); 6.2 ~$8.0 (38%) vs ~$3-5 ($11), off on ~41% (day max >= 5.8). Pull
+lines: 6.2 on M5.4+, 6.4 on M5.6+ (the EMSC thread logs / sweeps from M5.4).
+6.0 and below stay out (break-even at best; their asks would sit out most of
+the day). Worst day with 6.2-6.8 live: ~$350 if every ask were lifted before
+the pull (was ~$180). Re-judge 6.0 after ~a week of fills vs quakes.

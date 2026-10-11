@@ -9866,8 +9866,12 @@ QUAKE_STATUS_FILE = os.environ.get(
 # strikes would earn ~$62/day of NO-side reward against ~$87/day lost to
 # pick-offs at USGS speed (~$41 cancelling on GFZ, the 9/27 study), and only
 # M6.6-7.0 come out ahead even at USGS speed (~$19-26/day vs ~$11; a 7.0+ day
-# costs ~$270). On the strikes in QUAKE_ASK_STRIKES the family also rests a
-# YES ask (= a NO bid):
+# costs ~$270). 6.2 + 6.4 joined at 03:30Z (Jack: "yes add 6.2 and 6.4"): at
+# GFZ / EMSC speed ~$8.0 / $5.5/day of NO-side reward vs ~$3-5 / $2-4 of
+# pick-offs, off on 41% / 28% of days (the day-max gap); 6.0 and below stay
+# out -- break-even at best, and their asks would sit out most of the day.
+# On the strikes in QUAKE_ASK_STRIKES the family also rests a YES ask (= a
+# NO bid):
 #   - at most QUAKE_ASK_MAX_CONTRACTS a strike, the asks' own short included
 #     (resting + already sold <= the cap), never the family / hour multiples;
 #   - priced no lower than usgs_quake_fair's ask floor (fair + its
@@ -9897,7 +9901,7 @@ def _quake_ask_strikes(raw: str) -> frozenset:
 
 
 QUAKE_ASK_STRIKES = _quake_ask_strikes(
-    os.environ.get("IMM_QUAKE_ASK_STRIKES", "6.6,6.8,7.0"))
+    os.environ.get("IMM_QUAKE_ASK_STRIKES", "6.2,6.4,6.6,6.8,7.0"))
 QUAKE_ASK_MAX_CONTRACTS = _env_int("IMM_QUAKE_ASK_MAX_CONTRACTS", 100)
 QUAKE_ASK_TTL_SECS = _env_int("IMM_QUAKE_ASK_TTL_SECS", 600)
 QUAKE_ASK_RENEW_LEAD_SECS = _env_int("IMM_QUAKE_ASK_RENEW_LEAD_SECS", 180)
