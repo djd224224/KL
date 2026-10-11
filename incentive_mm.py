@@ -3174,6 +3174,25 @@ UNIVERSE_NET_GUARD = os.environ.get("IMM_UNIVERSE_NET_GUARD", "1") == "1"
 UNIVERSE_NET_TROUBLE_SECS = _env_float("IMM_UNIVERSE_NET_TROUBLE_SECS", 120.0)
 UNIVERSE_DEFER_MAX_SECS = _env_float("IMM_UNIVERSE_DEFER_MAX_SECS", 900.0)
 UNIVERSE_BULK_BUDGET_SECS = _env_float("IMM_UNIVERSE_BULK_BUDGET_SECS", 120.0)
+# BOOK-READ REST BUDGET (Jack 2026-10-11: "fix the issue where it hangs when i
+# take laptop off power"). On battery this laptop's Wi-Fi drops to Medium
+# Power Saving (power plan: AC index 0, DC index 2). Connections then stall
+# and abort (WinError 10053) while the link stays up: the 10/11 run on
+# battery logged a 556s refresh and a 389s heartbeat gap. The WS feed goes
+# silent, and every managed book falls back to REST: ~1,500 reads at up to
+# ~50s each, plus audits (1 in 20) that are slow too.
+# With IMM_WS=on, a cycle's REST book reads (fallbacks and audits) now stop
+# once they have spent BOOK_REST_BUDGET_SECS, or after BOOK_REST_MAX_FAILS
+# network failures in a row:
+#  - an audit then trades on the WS book;
+#  - a market the feed cannot serve keeps its quotes as they rest -- blind
+#    for this cycle WITHOUT a blind-streak count, so an outage never ripens
+#    into the 3-cycle cancel.
+# Each cycle starts with a fresh budget. While the REST audit is tripped
+# (every read on REST by design) only the failure streak applies. 0 turns
+# either bound off.
+BOOK_REST_BUDGET_SECS = _env_float("IMM_BOOK_REST_BUDGET_SECS", 120.0)
+BOOK_REST_MAX_FAILS = _env_int("IMM_BOOK_REST_MAX_FAILS", 3)
 WAKE_GRACE_SECS = 120
 BLIND_PRESERVE_CYCLES = 3
 
@@ -7777,6 +7796,8 @@ _CONFIG_CODE_KNOBS = (
     # ...and the universe refresh's network guard (2026-10-11)
     "UNIVERSE_NET_GUARD", "UNIVERSE_NET_TROUBLE_SECS", "UNIVERSE_DEFER_MAX_SECS",
     "UNIVERSE_BULK_BUDGET_SECS",
+    # ...and the quote loop's book-read REST budget (2026-10-11)
+    "BOOK_REST_BUDGET_SECS", "BOOK_REST_MAX_FAILS",
 )
 
 
@@ -8010,6 +8031,97 @@ def _keep_awake() -> None:
     if ok != _keep_awake_state["ok"]:   # log transitions only, not every cycle
         _keep_awake_state["ok"] = ok
         log(f"[IMM] keep-awake (block idle sleep): {'ON' if ok else 'FAILED'}")
+
+
+# POWER (Jack 2026-10-11: "fix the issue where it hangs when i take laptop off
+# power"). Off AC, Windows can throttle a background process to its efficient
+# cores and low clocks (EcoQoS). The bot runs hidden, so it qualifies, and on
+# 10/11 the whole process once stalled 192s. _no_power_throttling opts this
+# process out, once at start (IMM_NO_POWER_THROTTLING=0 leaves it).
+# _power_check logs each switch between AC and battery (and battery saver) and
+# feeds the status file's `power`, so a hang can be lined up with the power
+# source. On battery the Wi-Fi adapter's power plan setting (Medium Power
+# Saving on this laptop) is what degrades the network; the bot cannot change
+# that -- Jack's to set (Power Options > Wireless Adapter Settings).
+_power_state: Dict[str, Any] = {}
+
+
+def _no_power_throttling() -> bool:
+    """SetProcessInformation(ProcessPowerThrottling): EXECUTION_SPEED
+    controlled and off, so this process runs at full speed on battery.
+    True when Windows took it. Never raises."""
+    if sys.platform != "win32" or os.environ.get("IMM_NO_POWER_THROTTLING", "1") != "1":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PPTS(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+        # a private kernel32 handle: typed arguments (the pseudo-handle -1
+        # overflows ctypes' default int) without touching windll's shared one
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                              ctypes.c_void_p, wintypes.DWORD]
+        k32.SetProcessInformation.restype = wintypes.BOOL
+        st = _PPTS(1, 0x1, 0x0)     # CURRENT_VERSION, EXECUTION_SPEED, not throttled
+        ok = bool(k32.SetProcessInformation(k32.GetCurrentProcess(), 4,  # ProcessPowerThrottling
+                                            ctypes.byref(st), ctypes.sizeof(st)))
+    except Exception:
+        ok = False
+    log(f"[IMM] power throttling (EcoQoS) for this process: "
+        + ("OFF -- full speed on battery" if ok else "could not be turned off"))
+    return ok
+
+
+def _read_power_status() -> Optional[Tuple[Optional[bool], Optional[int], bool]]:
+    """(on AC? None = unknown, battery %, battery saver on) from
+    GetSystemPowerStatus, or None off Windows / on failure."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _SPS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte),
+                        ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong),
+                        ("BatteryFullLifeTime", ctypes.c_ulong)]
+        s = _SPS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)):
+            return None
+    except Exception:
+        return None
+    return ({0: False, 1: True}.get(s.ACLineStatus),
+            None if s.BatteryLifePercent == 255 else int(s.BatteryLifePercent),
+            bool(s.SystemStatusFlag & 1))
+
+
+def _power_check(read: Callable[[], Optional[tuple]] = _read_power_status) -> None:
+    """Log a change of power source / battery saver (checked every cycle) and
+    keep the latest reading for the status file. Never raises."""
+    try:
+        r = read()
+    except Exception:
+        r = None
+    if r is None:
+        return
+    ac, pct, saver = r
+    _power_state.update(ac=ac, pct=pct, saver=saver,
+                        at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    key = (ac, saver)
+    if _power_state.get("key") == key:
+        return
+    _power_state["key"] = key
+    what = ("an unknown power source" if ac is None else
+            "AC power" if ac else "BATTERY")
+    log(f"[IMM] power: on {what}" + (f" ({pct}%)" if pct is not None else "")
+        + (", battery saver ON" if saver else "")
+        + (" -- on battery the Wi-Fi drops to its power-saving mode and "
+           "connections stall; plug in" if ac is False else ""))
 
 
 def is_network_error(e: BaseException) -> bool:
@@ -13910,6 +14022,12 @@ class BotState:
 # The market maker
 # ----------------------------------------------------------------------------
 
+class BookRestOff(Exception):
+    """A managed book's REST read skipped: this cycle's REST budget is spent
+    (BOOK_REST_BUDGET_SECS / BOOK_REST_MAX_FAILS). The market keeps its
+    quotes as they rest, without a blind-streak count."""
+
+
 class CandidateRestOff(Exception):
     """A candidate's REST book read skipped: pass 2's REST budget is spent
     (CAND_REST_BUDGET_SECS / CAND_REST_MAX_FAILS). Unread, like a failed read."""
@@ -14108,6 +14226,10 @@ class IncentiveMarketMaker:
         self._net_err_at = 0.0
         self._universe_deferred_since: Optional[float] = None
         self._universe_guard = {"deferred": 0, "aborted": 0, "last": ""}
+        # the quote loop's book-read REST budget (2026-10-11,
+        # BOOK_REST_BUDGET_SECS): this cycle's, None outside the read loop
+        self._book_rest: Optional[dict] = None
+        self._book_rest_stats = {"cycles_off": 0, "skipped": 0, "last": ""}
         # the running pass 2's REST budget (CAND_REST_BUDGET_SECS /
         # CAND_REST_MAX_FAILS): {"t0", "fails", "off"}; None outside pass 2
         self._cand_rest: Optional[dict] = None
@@ -15732,7 +15854,10 @@ class IncentiveMarketMaker:
         also reads REST, trades on the REST book and compares the two, and a
         tripped audit sends every read to REST (compared) until it re-arms.
         A REST failure raises as it always did (the blind path is unchanged),
-        except on an audit read, which then trades on the WS book."""
+        except on an audit read, which then trades on the WS book. With
+        IMM_WS=on the REST reads are budgeted per cycle (BOOK_REST_BUDGET_SECS):
+        once spent, an audit trades on the WS book and a book the feed cannot
+        serve raises BookRestOff without a REST call."""
         # the read phase's clock (latency.cycle), and the in-cycle stale check
         self._cycle_last_read = time.time()
         self._ws_cycle_tick()
@@ -15740,11 +15865,11 @@ class IncentiveMarketMaker:
         if ws is not None and WS_MODE == "on" and not self._ws_audit["tripped"]:
             ob = ws.book_fp(ticker)
             if ob is not None:
-                if not self._ws_audit_draw():
+                if not self._ws_audit_draw() or self._book_rest_off():
                     self._ws_books_used += 1
                     return ob
                 try:
-                    rest = self.client.get_orderbook(ticker=ticker)
+                    rest = self._book_rest_read(ticker)
                 except Exception:
                     self._ws_audit["rest_errors"] += 1
                     self._ws_books_used += 1
@@ -15752,9 +15877,55 @@ class IncentiveMarketMaker:
                 self._ws_compare(ticker, rest, audit=True)
                 return rest
             self._ws_rest_fallback += 1
-        ob = self.client.get_orderbook(ticker=ticker)
+        budgeted = ws is not None and WS_MODE == "on"
+        if budgeted and self._book_rest_off():
+            raise BookRestOff(self._book_rest["off"])
+        ob = (self._book_rest_read(ticker) if budgeted
+              else self.client.get_orderbook(ticker=ticker))
         if ws is not None and WS_MODE in ("shadow", "on"):
             self._ws_compare(ticker, ob, audit=self._ws_audit_draw())
+        return ob
+
+    def _book_rest_off(self) -> str:
+        """Why this cycle's quote loop has stopped reading books over REST, or
+        "" while it may (BOOK_REST_BUDGET_SECS of REST time spent, or
+        BOOK_REST_MAX_FAILS network failures in a row; the time bound is
+        waived while the REST audit is tripped, when every read is REST by
+        design). No budget outside the read loop. Once off, off for the rest
+        of the cycle."""
+        b = self._book_rest
+        if b is None:
+            return ""
+        if (not b["off"] and BOOK_REST_BUDGET_SECS > 0
+                and not self._ws_audit["tripped"]
+                and b["spent"] > BOOK_REST_BUDGET_SECS):
+            b["off"] = f"its {BOOK_REST_BUDGET_SECS:g}s REST budget ran out"
+        return b["off"]
+
+    def _book_rest_read(self, ticker: str) -> dict:
+        """A managed book over REST, timed into this cycle's budget: a network
+        failure extends the streak, any answer (a book or an HTTP error)
+        ends it."""
+        b = self._book_rest
+        t0 = time.monotonic()
+        try:
+            ob = self.client.get_orderbook(ticker=ticker)
+        except Exception as e:
+            self._note_net_error(e)
+            if b is not None:
+                b["spent"] += time.monotonic() - t0
+                if not is_network_error(e):
+                    b["fails"] = 0
+                else:
+                    b["fails"] += 1
+                    if (not b["off"] and BOOK_REST_MAX_FAILS > 0
+                            and b["fails"] >= BOOK_REST_MAX_FAILS):
+                        b["off"] = (f"{b['fails']} network failures in a row "
+                                    f"({type(e).__name__})")
+            raise
+        if b is not None:
+            b["spent"] += time.monotonic() - t0
+            b["fails"] = 0
         return ob
 
     def _read_candidate_book(self, ticker: str) -> dict:
@@ -20072,6 +20243,8 @@ class IncentiveMarketMaker:
                 if _depth < len(by_event[e]):
                     order_of_play.append(by_event[e][_depth])
             _depth += 1
+        # this cycle's book-read REST budget (BOOK_REST_BUDGET_SECS)
+        self._book_rest = {"spent": 0.0, "fails": 0, "off": "", "skipped": 0}
         for meta in order_of_play:
             # Fast tick: only fast-lane series are (re)quoted; everything else
             # is untouched this tick (its resting orders are preserved through
@@ -20263,6 +20436,18 @@ class IncentiveMarketMaker:
                 ob = self._read_book(t)
                 yes_levels, no_levels = orderbook_levels(ob)
                 self.state.blind_streak.pop(t, None)
+            except BookRestOff:
+                # this cycle's REST budget is spent (BOOK_REST_BUDGET_SECS):
+                # the market keeps its quotes as they rest, and its blind
+                # streak does NOT advance -- an outage must not ripen into
+                # the 3-cycle cancel
+                blind.add(t)
+                if self._book_rest is not None:
+                    self._book_rest["skipped"] += 1
+                self._book_rest_stats["skipped"] += 1
+                _why = (self._book_rest or {}).get("off", "")
+                self._gskip(t, "rest_off", lambda: dict(why=_why))
+                continue
             except Exception as e:
                 self._note_net_error(e)         # (UNIVERSE_NET_GUARD)
                 streak = self.state.blind_streak.get(t, 0) + 1
@@ -21305,6 +21490,18 @@ class IncentiveMarketMaker:
                 else:
                     self.state.zero_share_streak.pop(t, None)
 
+        # the book-read REST budget's verdict for this cycle, then no budget
+        # outside the read loop (BOOK_REST_BUDGET_SECS)
+        br, self._book_rest = self._book_rest, None
+        if br is not None and br["off"]:
+            st = self._book_rest_stats
+            st["cycles_off"] += 1
+            st["last"] = (f"{datetime.fromtimestamp(now_ts, timezone.utc):%m-%d %H:%M:%S}Z: "
+                          f"{br['off']} ({br['skipped']} kept as they rest)")
+            log(f"{self.tag} ! book reads: REST stopped after {br['spent']:.0f}s -- "
+                f"{br['off']}; {br['skipped']} market(s) the feed could not serve "
+                f"kept their quotes as they rest (no blind count)")
+
         # Guard-skip sink: full cycles evaluate every managed market, so a
         # ticker missing from _guard_now reliably means its guard CLEARED.
         # Fast ticks touch only fast-lane series and never flush.
@@ -22087,6 +22284,10 @@ class IncentiveMarketMaker:
                           "check_in_cycle": WS_CHECK_IN_CYCLE,
                           # the narrow fast-cancel gate (2026-10-08)
                           "fast_min_gap_c": WS_FAST_MIN_GAP_C,
+                          # the quote loop's book-read REST budget (2026-10-11)
+                          "book_rest": dict(self._book_rest_stats,
+                                            budget_s=BOOK_REST_BUDGET_SECS,
+                                            max_fails=BOOK_REST_MAX_FAILS),
                           # candidate books on the feed (2026-10-08)
                           "cand": dict(self._ws_cand, mode=WS_CANDIDATES,
                                        want=len(self._ws_cand_want),
@@ -22125,6 +22326,9 @@ class IncentiveMarketMaker:
                     "last_ws": ut[-1][3],
                     "last_at": datetime.fromtimestamp(
                         ut[-1][1], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            # the power source (2026-10-11, POWER)
+            if _power_state:
+                out["power"] = {k: v for k, v in _power_state.items() if k != "key"}
             # ...and the network guard's deferred / aborted refreshes
             # (2026-10-11, UNIVERSE_NET_GUARD)
             g = self._universe_guard
@@ -23517,6 +23721,12 @@ class IncentiveMarketMaker:
                f"or bulk market read that gets no answer, or bulk reads over "
                f"{UNIVERSE_BULK_BUDGET_SECS:.0f}s, end it with the universe kept"
                if UNIVERSE_NET_GUARD else "off"))
+        log("book-read REST budget (2026-10-11): "
+            + (f"with IMM_WS=on a cycle's REST book reads stop after "
+               f"{BOOK_REST_BUDGET_SECS:g}s or {BOOK_REST_MAX_FAILS} network "
+               f"failures in a row; the rest keep their quotes (no blind count)"
+               if WS_MODE == "on" and (BOOK_REST_BUDGET_SECS > 0 or BOOK_REST_MAX_FAILS > 0)
+               else "inactive (needs IMM_WS=on)"))
         log(f"event sweep breaker (2026-10-04): {SWEEP_BREAKER}"
             + {"dry": f" -- a maker fill that clears our order trips its event; "
                       f"the trip is LOGGED (ws_sweep_<date>.jsonl), nothing pulled"
@@ -23627,6 +23837,7 @@ class IncentiveMarketMaker:
         atexit.register(self.shutdown_cancel)
         if not once:
             self._ws_start()       # no-op under IMM_WS=off
+            _no_power_throttling()  # full speed on battery (2026-10-11, POWER)
 
         try:
             while True:
@@ -23637,6 +23848,7 @@ class IncentiveMarketMaker:
                 top = time.time()
                 self._last_cycle_start = top      # _idle's early-wake floor
                 _keep_awake()   # re-assert every cycle (wakes can clear it)
+                _power_check()  # log AC <-> battery switches (2026-10-11, POWER)
                 if prev_top is not None and top - prev_top > WAKE_GAP_SECS:
                     self.wake_grace_until = top + WAKE_GRACE_SECS
                     log(f"{self.tag} resume detected ({top - prev_top:.0f}s gap); "

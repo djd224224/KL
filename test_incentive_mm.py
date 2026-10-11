@@ -20530,8 +20530,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # (2026-10-01) + the Treasury touch gate (2026-10-01) + the Pokemon
         # gate (2026-10-03) + the NFL player-prop gate (2026-10-03) + the
         # YouTube #2 pilot's family loss halt (2026-10-05) + the YouTube
-        # weekly pilot's loss halt and fair gate (2026-10-06)
-        self.assertEqual(len(conts), 39)
+        # weekly pilot's loss halt and fair gate (2026-10-06) + the book-read
+        # REST budget's rest_off (2026-10-11)
+        self.assertEqual(len(conts), 40)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -24470,6 +24471,167 @@ class TestUniverseNetGuard(unittest.TestCase):
         self.assertEqual((u["deferred"], u["aborted"]), (1, 0))
         self.assertIn("deferred", u["last_skip"])
         self.assertGreaterEqual(u["deferring_s"], 0)
+
+
+class TestBookRestBudget(unittest.TestCase):
+    """BOOK_REST_BUDGET_SECS (Jack 2026-10-11, "fix the issue where it hangs
+    when i take laptop off power"): with IMM_WS=on a cycle's REST book reads
+    stop after their time budget or a run of network failures; the markets
+    the feed cannot serve then keep their quotes, without a blind count."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.bot._ws_rng = mock.Mock(random=lambda: 0.99)    # no audit draws
+        p = mock.patch.object(imm, "WS_MODE", "on")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _budget(self, **kw):
+        self.bot._book_rest = dict({"spent": 0.0, "fails": 0, "off": "",
+                                    "skipped": 0}, **kw)
+
+    def test_defaults_and_no_budget_outside_the_read_loop(self):
+        self.assertEqual((imm.BOOK_REST_BUDGET_SECS, imm.BOOK_REST_MAX_FAILS), (120.0, 3))
+        self.assertIsNone(self.bot._book_rest)
+        self.assertEqual(self.bot._book_rest_off(), "")
+        self.assertIn("orderbook_fp", self.bot._read_book(self.T))   # REST fallback
+
+    def test_network_failures_in_a_row_stop_rest_and_an_answer_ends_the_streak(self):
+        b = self.bot
+        self._budget()
+        net = _requests.exceptions.ConnectionError("aborted (10053)")
+        b.client.get_orderbook = mock.Mock(side_effect=[
+            net, HttpError("not found", 404), net, net, net])
+        for exc in (_requests.exceptions.ConnectionError, HttpError):
+            with self.assertRaises(exc):
+                b._read_book(self.T)
+            self.assertEqual(b._book_rest["off"], "")
+        for _ in range(3):
+            with self.assertRaises(_requests.exceptions.ConnectionError):
+                b._read_book(self.T)
+        self.assertEqual(b._book_rest["off"], "3 network failures in a row (ConnectionError)")
+        with self.assertRaises(imm.BookRestOff):
+            b._read_book(self.T)
+        self.assertEqual(b.client.get_orderbook.call_count, 5)
+        self.assertGreater(b._net_err_at, 0.0)          # the refresh guard sees it
+
+    def test_a_spent_budget_skips_audits_and_fallbacks(self):
+        b = self.bot
+        self.feed.books[self.T] = _GOOD_WS_BOOK
+        b._ws_rng = mock.Mock(random=lambda: 0.0)       # every read an audit draw
+        b.client.get_orderbook = mock.Mock(side_effect=AssertionError("REST read"))
+        self._budget(spent=imm.BOOK_REST_BUDGET_SECS + 1)
+        self.assertEqual(b._read_book(self.T), _kw.book_to_rest_shape(*_GOOD_WS_BOOK))
+        self.assertIn("120s REST budget ran out", b._book_rest["off"])
+        self.feed.books.clear()                          # the feed cannot serve it
+        with self.assertRaises(imm.BookRestOff):
+            b._read_book(self.T)
+        b.client.get_orderbook.assert_not_called()
+
+    def test_a_tripped_audit_waives_only_the_time_bound(self):
+        b = self.bot
+        b._ws_audit["tripped"] = True                    # every read is REST
+        self._budget(spent=imm.BOOK_REST_BUDGET_SECS + 1)
+        self.assertIn("orderbook_fp", b._read_book(self.T))
+        self.assertEqual(b._book_rest["off"], "")
+        self._budget(fails=2)
+        b.client.get_orderbook = mock.Mock(
+            side_effect=_requests.exceptions.ReadTimeout("read timed out"))
+        with self.assertRaises(_requests.exceptions.ReadTimeout):
+            b._read_book(self.T)
+        self.assertIn("3 network failures in a row", b._book_rest["off"])
+
+    def test_shadow_mode_is_never_budgeted(self):
+        b = self.bot
+        self._budget(spent=10 ** 6, off="test")
+        with mock.patch.object(imm, "WS_MODE", "shadow"):
+            self.assertIn("orderbook_fp", b._read_book(self.T))
+
+    def test_the_quote_loop_keeps_quotes_without_a_blind_count(self):
+        b = self.bot
+        b.run_cycle()                                    # quotes resting
+        before = sorted((o["book_side"], o["yes_price"])
+                        for o in b.state.sim_orders.values() if o["ticker"] == self.T)
+        self.assertTrue(before)
+        b.state.universe_at = time.time()                # no refresh
+        b._read_book = mock.Mock(side_effect=imm.BookRestOff("test"))
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            b._book_rest_off = lambda: "test"
+            b.run_cycle()
+        after = sorted((o["book_side"], o["yes_price"])
+                       for o in b.state.sim_orders.values() if o["ticker"] == self.T)
+        self.assertEqual(after, before)                  # kept as they rest
+        self.assertNotIn(self.T, b.state.blind_streak)   # no blind count
+        self.assertIsNone(b._book_rest)                  # no budget outside the loop
+        self.assertGreaterEqual(b._book_rest_stats["skipped"], 1)
+
+    def test_a_cycle_that_runs_out_logs_it_once(self):
+        b = self.bot
+        b.run_cycle()
+        b.state.universe_at = time.time()
+        b.client.get_orderbook = mock.Mock(
+            side_effect=_requests.exceptions.ConnectTimeout("connect timed out"))
+        lines = []
+        with mock.patch.object(imm, "BOOK_REST_MAX_FAILS", 1), \
+                mock.patch.object(imm, "log", side_effect=lines.append):
+            b.run_cycle()
+        hit = [s for s in lines if "book reads: REST stopped after" in s]
+        self.assertEqual(len(hit), 1, lines)
+        self.assertIn("1 network failures in a row (ConnectTimeout)", hit[0])
+        self.assertEqual(b._book_rest_stats["cycles_off"], 1)
+        self.assertIn("1 network failures in a row", b._book_rest_stats["last"])
+        st = b._latency_status()["ws"]["book_rest"]
+        self.assertEqual((st["budget_s"], st["max_fails"], st["cycles_off"]),
+                         (imm.BOOK_REST_BUDGET_SECS, imm.BOOK_REST_MAX_FAILS, 1))
+
+
+class TestPowerHelpers(unittest.TestCase):
+    """POWER (Jack 2026-10-11): each switch between AC and battery is logged
+    and kept for the status file; the process opts out of power throttling."""
+
+    def setUp(self):
+        imm._power_state.clear()
+        self.addCleanup(imm._power_state.clear)
+
+    def test_switches_are_logged_once_each(self):
+        readings = iter([(True, 80, False), (True, 79, False), (False, 79, False),
+                         (False, 70, True)])
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            for _ in range(4):
+                imm._power_check(read=lambda: next(readings))
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("power: on AC power (80%)", lines[0])
+        self.assertIn("power: on BATTERY (79%)", lines[1])
+        self.assertIn("plug in", lines[1])
+        self.assertIn("battery saver ON", lines[2])
+        self.assertEqual((imm._power_state["ac"], imm._power_state["pct"]), (False, 70))
+
+    def test_a_failed_read_changes_nothing(self):
+        def boom():
+            raise OSError("no power API")
+        with mock.patch.object(imm, "log") as lg:
+            imm._power_check(read=boom)
+            imm._power_check(read=lambda: None)
+        lg.assert_not_called()
+        self.assertEqual(imm._power_state, {})
+
+    def test_the_status_carries_the_power_reading(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "log"):
+            imm._power_check(read=lambda: (False, 55, False))
+        self.assertEqual(bot._latency_status()["power"]["ac"], False)
+
+    def test_the_throttling_opt_out_can_be_turned_off(self):
+        with mock.patch.dict(os.environ, {"IMM_NO_POWER_THROTTLING": "0"}):
+            self.assertFalse(imm._no_power_throttling())
 
 
 if __name__ == "__main__":

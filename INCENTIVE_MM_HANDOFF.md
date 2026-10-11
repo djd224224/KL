@@ -10115,3 +10115,49 @@ WHAT (UNIVERSE_NET_GUARD, default on; IMM_UNIVERSE_NET_GUARD=0 = off):
   pass-2 candidate REST budget, and the bounded trading client.
 
 Tests: TestUniverseNetGuard (9). test_incentive_mm 1183 OK.
+
+## 2026-10-11 ~02:20Z — on battery: a book-read REST budget, no power throttling, the power source logged (Jack: "fix the issue where it hangs when i take laptop off power")
+
+WHY (10/11):
+- The laptop ran on battery (Win32_Battery status 1, 79%) from ~01:08Z
+  (Kernel-Power 105) until Jack plugged in at ~01:55Z.
+- The power plan puts the Wi-Fi adapter (Intel AX211, the only link) in
+  Medium Power Saving on battery (AC index 0, DC index 2). Connections
+  stall and abort (WinError 10053) with no WLAN disconnect logged.
+- That stretch had a 606s watchdog hang (handoff, 1,291 orders kept). The
+  next run's first refresh then took 556s, with a 389s heartbeat gap whose
+  stacks show an SSL read. On a degraded network the WS feed goes silent, and
+  every managed book falls back to REST: ~1,500 reads at up to ~50s each,
+  plus audits that are slow too.
+
+WHAT:
+- BOOK_REST_BUDGET_SECS = 120 / BOOK_REST_MAX_FAILS = 3 (IMM_WS=on only).
+  - A cycle's REST book reads (fallbacks and audits, timed in
+    _book_rest_read) stop once they have spent 120s, or after 3 network
+    failures in a row.
+  - An audit then trades on the WS book. A market the feed cannot serve
+    raises BookRestOff: the read loop marks it blind (quotes kept as they
+    rest) WITHOUT advancing its blind streak, so an outage never ripens into
+    the 3-cycle cancel. Guard-skip reason "rest_off".
+  - While the REST audit is tripped (every read REST by design) only the
+    failure bound applies.
+  - Logs "! book reads: REST stopped after Ns -- <why>; N market(s) ... kept
+    their quotes as they rest (no blind count)" once per cycle. Status
+    latency.ws.book_rest {cycles_off, skipped, last, budget_s, max_fails}.
+- _no_power_throttling() at start: SetProcessInformation(ProcessPowerThrottling,
+  EXECUTION_SPEED off), so the hidden process is not moved to EcoQoS on
+  battery (on 10/11 the whole process once stalled 192s). Logs "power
+  throttling (EcoQoS) for this process: OFF -- full speed on battery".
+  IMM_NO_POWER_THROTTLING=0 leaves it.
+- _power_check() every cycle: logs each AC/battery/battery-saver switch
+  ("power: on BATTERY (79%) -- ... plug in"), and status `power` {ac, pct,
+  saver, at}.
+- MACHINE (Jack's to set; the bot can't): on battery, Wi-Fi power saving to
+  Maximum Performance. Control Panel > Power Options > Change plan
+  settings > Change advanced power settings > Wireless Adapter Settings >
+  Power Saving Mode > On battery: Maximum Performance. Or:
+  powercfg /setdcvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0
+  then powercfg /setactive SCHEME_CURRENT.
+
+Tests: TestBookRestBudget (7), TestPowerHelpers (4); the guard-skip sweep
+count is 40. test_incentive_mm 1194 OK.

@@ -288,6 +288,10 @@ n, median_s, last_s, last_reads, last_ws, last_at).
 Since 2026-10-11 `latency.universe` also carries the refresh network
 guard's counts (UNIVERSE_NET_GUARD): deferred, aborted, last_skip (kind,
 time, why) and deferring_s (how long the current run of deferrals has lasted).
+Since the same day also `latency.ws.book_rest` (the quote loop's book-read
+REST budget: cycles_off, skipped, last, budget_s, max_fails) and a top-level
+`power` block (ac: true / false / null, pct, saver, at), from the bot's
+per-cycle power check.
 
 ## Two compatibility traps, both tested
 
