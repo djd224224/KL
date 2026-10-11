@@ -24,7 +24,11 @@ if ($alive.Count -gt 0) {
 
 # Battery-safe like every other KL task: start on battery, survive AC unplug.
 # (The 2026-08-08 registration used defaults, so one unplug stopped the fleet.)
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+# No time limit, like the touch fleet (2026-10-11): the 72h default ended each
+# task every 3 days, which orphaned its launcher + bot, and the watchdog's
+# restart added an idle launcher per asset each time (crypto_launcher_guard.ps1).
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
 foreach ($a in $assets) {
     Register-ScheduledTask -TaskName "KL crypto_updown_mm $a" `
         -Action (New-ScheduledTaskAction -Execute "wscript.exe" `

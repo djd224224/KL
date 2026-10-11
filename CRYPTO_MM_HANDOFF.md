@@ -172,6 +172,16 @@ ratios (risk cap 30%, skew full at 30%, reduce-only at 60% of the event cap):
   PowerShell launcher with `windowstyle 0`. The shim **waits** (`sh.Run cmd, 0, True`) so the
   task stays `Running` — a fire-and-forget shim would make the watchdog treat it as dead and
   spawn duplicate fleets. Process chain: `wscript ← powershell ← cmd ← python`.
+- **One launcher per market** (2026-10-11, `crypto_launcher_guard.ps1`, all 4 launchers). Ending
+  a task kills only its wscript shim. The launcher + bot ran on, the watchdog started the Ready
+  task again, and the new launcher's python bounced off the singleton lock every ~30s, forever.
+  The annual/updown tasks had Task Scheduler's default **72h time limit**, so this repeated every
+  3 days: by 10/11 there were 45 idle launchers (~60MB each) starting ~85k pythons a day. Now a
+  launcher exits within 15s of its own shim dying (a running bot is left alone), stands by
+  behind an older launcher for the same market, and adopts (waits on) a bot that is already
+  running. It never kills anything. Its lines go to `run-logs\<fleet>\launcher-guard.log` (UTC).
+  `fix_crypto_task_time_limit.bat` (elevated) sets the 15 annual/updown tasks to no time limit,
+  like the touch fleet, and the register scripts now do the same.
 - **Deliberate pause** = `Disable-ScheduledTask` (the watchdog skips Disabled). Killing
   processes or plain `Stop-ScheduledTask` gets auto-revived within 15 min.
 - **Restart procedure** (do it exactly this way): stop tasks → kill the **whole chain**

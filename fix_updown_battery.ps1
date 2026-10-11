@@ -8,7 +8,10 @@
 # Set-ScheduledTask only updates the task definition - it does NOT restart the
 # running instance, so this is safe to run while the bots are live (no
 # duplicate/orphan chains are created).
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+# -Settings replaces ALL settings: keep the no-time-limit fix (2026-10-11,
+# fix_crypto_task_time_limit.ps1) or a re-run brings the 72h default back.
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
 foreach ($a in "BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE") {
     Set-ScheduledTask -TaskName "KL crypto_updown_mm $a" -Settings $settings | Out-Null
     Write-Host "patched KL crypto_updown_mm $a"

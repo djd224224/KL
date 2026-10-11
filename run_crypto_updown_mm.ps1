@@ -41,18 +41,42 @@ foreach ($v in "ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD") {
     }
 }
 
+function Get-DayLog {
+    # A comma cadence list ("daily,weekly") is sanitized for the filename.
+    $CadenceTag = $Cadence.ToLower() -replace ",", "+"
+    Join-Path $Repo ("run-logs\crypto-updown\{0}-{1}-{2}.log" -f $Asset.ToLower(), $CadenceTag, (Get-Date -Format "yyyy-MM-dd"))
+}
+
+# One supervisor per asset (crypto_launcher_guard.ps1): exit when this task
+# run ends, stand by behind an older launcher, adopt a bot that is already up.
+# Per ASSET, not asset+cadence: the bot's singleton lock is per asset.
+# Set up before the jitter sleep, while the task's wrapper is surely alive.
+try {
+    . (Join-Path $Repo "crypto_launcher_guard.ps1")
+    Initialize-LauncherGuard -Launcher "run_crypto_updown_mm.ps1" -Wrapper "run_crypto_updown_mm_hidden.vbs" `
+        -Bot "crypto_updown_mm.py" -ArgName "asset" -ArgValue $Asset `
+        -GuardLog (Join-Path $Repo "run-logs\crypto-updown\launcher-guard.log")
+} catch {
+    Add-Content (Get-DayLog) "$(Get-Date -Format u) launcher: ! crypto_launcher_guard.ps1 failed to load ($_); not starting"
+    exit 1
+}
+
 # Spread startups so the fleet doesn't hammer the data APIs simultaneously.
 Start-Sleep -Seconds (Get-Random -Maximum 45)
 
 while ($true) {
-    # A comma cadence list ("daily,weekly") is sanitized for the filename.
-    $CadenceTag = $Cadence.ToLower() -replace ",", "+"
-    $log = Join-Path $Repo ("run-logs\crypto-updown\{0}-{1}-{2}.log" -f $Asset.ToLower(), $CadenceTag, (Get-Date -Format "yyyy-MM-dd"))
+    # The guard may hold us for days (standby / adopted bot): date the log after it.
+    if (-not (Wait-LauncherTurn)) { exit 0 }
+    $log = Get-DayLog
     Add-Content $log "$(Get-Date -Format u) launcher: starting updown $Asset ($Cadence) live"
     # cmd-level redirection appends raw utf-8 bytes; PowerShell's *>> would
     # write UTF-16 and wrap stderr lines in NativeCommandError noise.
     Add-Content $log "launcher env: PYTHONPATH=$UserSite CUD_POLL_SECS=$env:CUD_POLL_SECS"
-    & cmd.exe /c "set PYTHONPATH=$UserSite&& set CUD_POLL_SECS=$PollSecs&& `"$Python`" `"$Repo\crypto_updown_mm.py`" --asset $Asset --cadence $Cadence --live >> `"$log`" 2>&1"
-    Add-Content $log "$(Get-Date -Format u) launcher: bot exited (code $LASTEXITCODE); restarting in 30s"
+    $code = Invoke-GuardedBot "set PYTHONPATH=$UserSite&& set CUD_POLL_SECS=$PollSecs&& `"$Python`" `"$Repo\crypto_updown_mm.py`" --asset $Asset --cadence $Cadence --live >> `"$log`" 2>&1" $Repo
+    if ($null -eq $code) {
+        Write-GuardLog "task ended ($GuardParentDesc gone); exiting, bot left running for the next task run to adopt"
+        exit 0
+    }
+    Add-Content $log "$(Get-Date -Format u) launcher: bot exited (code $code); restarting in 30s"
     Start-Sleep -Seconds 30
 }
