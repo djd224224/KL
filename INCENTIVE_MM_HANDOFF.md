@@ -10200,3 +10200,84 @@ Tests:
 test_incentive_mm 1195 OK.
 
 DEPLOY: ff KL; the code-change exit restarts the bot (handoff).
+
+## 2026-10-11 ~03:00Z — KXBIGGESTQUAKE far strikes (6.6/6.8/7.0) also rest a small YES ask, pulled by the quake refresher on GFZ / USGS (Jack: "yes GFZ-triggered cancel", "yes start at the far strikes")
+
+WHY (10/11):
+- Since 10/10 the family quoted 4 strikes a day (7-9 on 10/1-10/9). Other
+  makers bid 1-4c over our fair on 9 of 10 strikes (2,440 YES at 11c on
+  6.4 vs our 10c cap), so the capped bids sat outside the 500-contract
+  qualifying walk and estimated $0 (zero_yield / hopeless).
+- Jack asked "should i also quote no if the yes is overvalued?". A NO bid
+  is a resting YES ask, the order a quake picks off: on the 62 crossed
+  strikes of the 9/27 study the first informed YES buy came before GFZ 11
+  times, between GFZ and USGS 11, within 60s of USGS 27. On the 02:22Z
+  book a 100-lot NO bid joining the best NO price on all ten strikes earned
+  ~$62/day of NO-side reward (each side normalizes to half the $42.90/day
+  pool) against ~$87/day of pick-offs cancelling on USGS (~$41 on GFZ).
+  Only 6.6-7.0 came out ahead even at USGS speed: ~$19-26/day vs ~$11, worst
+  day ~$270 (a 7.0+, ~once a month).
+
+WHAT (usgs_quake_fair.QuakeWatch.ask_verdict + incentive_mm):
+- QUAKE_ASK_STRIKES (IMM_QUAKE_ASK_STRIKES, default 6.6,6.8,7.0) rest a YES
+  ask as well as the capped bids. The family stays series_bid_only (pads,
+  depth test); side_size_mults keeps the ask side for these strikes only.
+- Size: QUAKE_ASK_MAX_CONTRACTS = 100 a strike, the asks' own short
+  included (room_sell = 100 - short), never scaled by the family x4 or the
+  hour multipliers.
+- Price: never under the ask floor = ceil(fair + ASK_MARGIN_CENTS 1c), the
+  fair taken with GFZ's 0.15h unpublished tail. quake_cap_quotes floors and
+  cuts the asks (the estimator and the quote loop both); a resting ask under
+  the floor is cancelled by the cycle (_quake_pull_asks), which also drops it
+  from `resting` so the diff neither keeps nor amends it.
+- The ask is OFF (QuakeWatch.ask_verdict) while: USGS or GFZ is stale (a
+  stale GFZ only holds the bids, but it is the asks' trigger); today's USGS
+  max or a GFZ event inside the day is within ASK_DAYMAX_GAP_MAG 0.4 of the
+  strike; or a quake >= strike - ASK_PULL_BELOW_MAG 0.8 on either feed was
+  first seen within ASK_COOLOFF_MIN 30, or is news and NEIC has not
+  confirmed it. Per strike: 6.6 pulls on M5.8+, 6.8 on 6.0+, 7.0 on 6.2+.
+- THE PULL: the quake refresher thread (USGS every 15s, GFZ every 20s)
+  calls _quake_ask_sweep every second, right after any fresh read. It finds
+  our resting quake asks in the ledger (sim book in a dry run) plus the WS
+  resting view and cancels each whose verdict is off ("quake ask PULL
+  <t>: <why> -- cancelled N (refresher, off the trading thread)"). It never
+  waits for the cycle, and it keeps running through a trading-thread
+  wedge. A failed cancel retries after 5s; the heartbeat is restored around
+  these cancels so they never mask a wedge from the hang watchdog.
+- place_order re-checks the verdict right before an ask goes out ("not
+  placing ... quake ask off (...)").
+- Short expiry: quake asks carry QUAKE_ASK_TTL_SECS = 600 at the exchange
+  (not 1800) and renew from 420s of age, or 180s before expiry
+  (quake_ask_renew_due; diff_orders and quake_hold_renewals), so a frozen,
+  crashed or sleeping process leaves none resting for long.
+- Holds: an M4.8+ detection under the pull threshold holds the bids AND
+  keeps the ask (renewed on its own clock, ask_ok); one at or over it pulls
+  the ask while the bids hold.
+- FILL BRAKE: any fill on one of our quake asks (WS fill, or the REST
+  fills read: own YES position went down) stops every ask in that event for
+  QUAKE_ASK_FILL_BRAKE_MIN = 30 (in memory; "quake ask brake <event>: ...").
+- Late in the day the bid's fair can leave no bid (fair_floor, e.g. 7.0
+  after ~10Z) while the ask may still rest: quake_gate then quotes
+  reason "ask_only" with cap_c 0, and quake_cap_quotes drops the bids.
+- Restarts: unchanged -- _restart_keep_ok refuses every quake order, so a
+  planned handoff cancels them and a watchdog handoff leaves them for the
+  relaunch's startup cancel.
+- Logs: "quake ask on <t>: floor Nc, up to 100 contracts" / "quake ask off
+  <t>: <why>" once per flip; cancel reasons quake_ask_pull (refresher),
+  quake_ask_off / quake_ask_floor (cycle). Knobs in config history; the
+  verdict's knobs in usgs_quake_state.json "knobs".
+- Kill switch: IMM_QUAKE_ASK_STRIKES="" (env => task restart), or drop the
+  default in code. Other knobs: IMM_QUAKE_ASK_MAX_CONTRACTS,
+  IMM_QUAKE_ASK_TTL_SECS, IMM_QUAKE_ASK_RENEW_LEAD_SECS,
+  IMM_QUAKE_ASK_FILL_BRAKE_MIN, IMM_QUAKE_ASK_MARGIN_CENTS,
+  IMM_QUAKE_ASK_PULL_BELOW_MAG, IMM_QUAKE_ASK_DAYMAX_GAP_MAG,
+  IMM_QUAKE_ASK_COOLOFF_MIN.
+
+TO SCORE: fills on the three strikes' asks (fills_<date>.jsonl, our_book_side
+ask) against the day's USGS max: a fill followed by a crossing is a
+pick-off. Reward: selection_events est on 6.6-7.0. Expect ~+$5-15/day net.
+NEXT if it holds up: GFZ poll 20s -> 10s, or EMSC's realtime feed as a
+third, faster trigger.
+
+Tests: TestAskVerdict (8), TestQuakeFarStrikeAsks (11); test_incentive_mm
+1204 OK, test_usgs_quake_fair 24 OK.

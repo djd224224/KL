@@ -7764,6 +7764,10 @@ _CONFIG_CODE_KNOBS = (
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
     "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_SIZE_MULT",
+    # ...its far-strike asks (2026-10-11); the ask verdict's knobs ride in the
+    # same status-file "knobs" block
+    "QUAKE_ASK_STRIKES", "QUAKE_ASK_MAX_CONTRACTS", "QUAKE_ASK_TTL_SECS",
+    "QUAKE_ASK_RENEW_LEAD_SECS", "QUAKE_ASK_FILL_BRAKE_MIN",
     # Vercel pre-D gate (2026-09-27); vercel_fair's model knobs ride in the
     # fair file's "model" block
     "VERCEL_ENABLE", "VERCEL_SERIES", "VERCEL_CUTOFF_BEFORE_D_MIN",
@@ -9846,8 +9850,50 @@ QUAKE_SIZE_MULT = _env_float("IMM_QUAKE_SIZE_MULT", 4.0)
 QUAKE_HOLD_RENEW = os.environ.get("IMM_QUAKE_HOLD_RENEW", "1") == "1"
 QUAKE_STATUS_FILE = os.environ.get(
     "IMM_QUAKE_STATUS_FILE", os.path.join(STATUS_DIR, "usgs_quake_state.json"))
-# the QuakeWatch the refresher thread owns; None = no feed (gate closed)
-_quake_state: dict = {"watch": None}
+# ASKS ON THE FAR STRIKES (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes
+# start at the far strikes"). The 10/11 check: a 100-lot NO ladder on all ten
+# strikes would earn ~$62/day of NO-side reward against ~$87/day lost to
+# pick-offs at USGS speed (~$41 cancelling on GFZ, the 9/27 study), and only
+# M6.6-7.0 come out ahead even at USGS speed (~$19-26/day vs ~$11; a 7.0+ day
+# costs ~$270). On the strikes in QUAKE_ASK_STRIKES the family also rests a
+# YES ask (= a NO bid):
+#   - at most QUAKE_ASK_MAX_CONTRACTS a strike, the asks' own short included
+#     (resting + already sold <= the cap), never the family / hour multiples;
+#   - priced no lower than usgs_quake_fair's ask floor (fair + its
+#     ASK_MARGIN_CENTS, the fair with GFZ's unpublished tail);
+#   - only while QuakeWatch.ask_verdict allows it (both feeds fresh, no quake
+#     within ASK_PULL_BELOW_MAG of the strike seen in the last ASK_COOLOFF_MIN
+#     or awaiting NEIC, today's maximum not within ASK_DAYMAX_GAP_MAG) and no
+#     ask of the event filled in the last QUAKE_ASK_FILL_BRAKE_MIN -- a fill
+#     on one of these asks is most likely a quake our feeds do not show yet;
+#   - with a QUAKE_ASK_TTL_SECS exchange-side expiry, renewed from
+#     QUAKE_ASK_TTL_SECS - QUAKE_ASK_RENEW_LEAD_SECS of age, so a frozen,
+#     crashed or sleeping process leaves none on the book for long.
+# THE PULL is not the cycle's job: the quake refresher thread (which polls
+# GFZ every QUAKE_GFZ_POLL_SECS) checks every resting ask of ours each second
+# and cancels the ones whose verdict turned off (_quake_ask_sweep), and
+# place_order re-checks right before an ask goes out. Planned restarts and
+# watchdog handoffs already cancel every quake order (_restart_keep_ok).
+# Kill switch: IMM_QUAKE_ASK_STRIKES="" -- the family is bid-only again.
+def _quake_ask_strikes(raw: str) -> frozenset:
+    out = set()
+    for tok in (raw or "").split(","):
+        try:
+            out.add(round(float(tok), 1))
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
+QUAKE_ASK_STRIKES = _quake_ask_strikes(
+    os.environ.get("IMM_QUAKE_ASK_STRIKES", "6.6,6.8,7.0"))
+QUAKE_ASK_MAX_CONTRACTS = _env_int("IMM_QUAKE_ASK_MAX_CONTRACTS", 100)
+QUAKE_ASK_TTL_SECS = _env_int("IMM_QUAKE_ASK_TTL_SECS", 600)
+QUAKE_ASK_RENEW_LEAD_SECS = _env_int("IMM_QUAKE_ASK_RENEW_LEAD_SECS", 180)
+QUAKE_ASK_FILL_BRAKE_MIN = _env_float("IMM_QUAKE_ASK_FILL_BRAKE_MIN", 30)
+# the QuakeWatch the refresher thread owns; None = no feed (gate closed).
+# ask_brake: event ticker -> unix time its asks stay braked until.
+_quake_state: dict = {"watch": None, "ask_brake": {}}
 _QUAKE_DAY_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})$")
 
 for _s in QUAKE_SERIES:
@@ -9864,18 +9910,82 @@ def quake_gated(series: str) -> bool:
 
 def series_bid_only(series: str) -> bool:
     """A family quoted with YES bids only: no ask rungs, no ask pad, and the
-    two-sided depth test never counts an ask pad. The quake gate's family,
-    and the sports ladders / escalators while SPORTS_LADDER_ASKS_OFF."""
+    two-sided depth test never counts an ask pad. The quake gate's family
+    (whose far strikes may still rest an ask, see quake_ask_strike), and the
+    sports ladders / escalators while SPORTS_LADDER_ASKS_OFF."""
     return quake_gated(series) or (
         SPORTS_LADDER_ASKS_OFF and not ladder_asks_relatched()
         and sports_ladder_league(series) is not None)
 
 
+def quake_ask_strike(ticker: str) -> bool:
+    """A quake strike that may also rest a YES ask (QUAKE_ASK_STRIKES)."""
+    if not QUAKE_ASK_STRIKES or not quake_gated(series_of(ticker)):
+        return False
+    try:
+        return round(float(ticker.rpartition("-")[2]), 1) in QUAKE_ASK_STRIKES
+    except ValueError:
+        return False
+
+
+def quake_ask_floor(ticker: str, now_ts: float) -> Tuple[Optional[int], str]:
+    """(floor_c, "") -- the lowest YES price an ask on this quake strike may
+    rest at right now -- or (None, why) when no ask may rest there (any that
+    does is pulled). Fails CLOSED: not an ask strike, no feed, a braked
+    event, an unparseable ticker, or QuakeWatch.ask_verdict says off."""
+    if not quake_ask_strike(ticker):
+        return None, "not an ask strike"
+    watch = _quake_state.get("watch")
+    if watch is None:
+        return None, "quake feed not running"
+    event_ticker, _, ks = ticker.rpartition("-")
+    until = _quake_state["ask_brake"].get(event_ticker, 0.0)
+    if until > now_ts:
+        return None, (f"an ask in {event_ticker} filled; asks braked "
+                      f"{(until - now_ts) / 60:.0f} more min")
+    day = quake_event_day(event_ticker)
+    if day is None:
+        return None, f"unparseable quake ticker {ticker}"
+    v = watch.ask_verdict(float(ks), day.timestamp(), now_ts)
+    if not v.get("ok"):
+        return None, str(v.get("why") or v.get("reason") or "off")
+    return int(v["floor_c"]), ""
+
+
+def quake_ask_brake(event_ticker: str, now_ts: float) -> bool:
+    """One of our asks in this quake event filled: no asks in the event for
+    QUAKE_ASK_FILL_BRAKE_MIN (a later fill extends it). True when this
+    started a brake (the caller logs it)."""
+    brakes = _quake_state["ask_brake"]       # (the WS and trading threads)
+    for ev in [e for e, u in list(brakes.items()) if u < now_ts - 86400]:
+        brakes.pop(ev, None)
+    fresh = brakes.get(event_ticker, 0.0) <= now_ts
+    brakes[event_ticker] = max(brakes.get(event_ticker, 0.0),
+                               now_ts + QUAKE_ASK_FILL_BRAKE_MIN * 60)
+    return fresh
+
+
+def quake_ask_renew_due(order: dict, age: float, now_ts: float) -> bool:
+    """A resting quake ask (QUAKE_ASK_TTL_SECS expiry) due for its renewal:
+    QUAKE_ASK_RENEW_LEAD_SECS before it expires, by its age or by the
+    exchange's own clock (the one that survives a lost age)."""
+    if not quake_gated(series_of(str(order.get("ticker") or ""))):
+        return False
+    parsed = order_yes_book_cents(order)
+    if parsed is None or parsed[0] != "ask":
+        return False
+    if age >= max(QUAKE_ASK_TTL_SECS - QUAKE_ASK_RENEW_LEAD_SECS, 0):
+        return True
+    exp = order_expiry_ts(order)
+    return exp is not None and exp - now_ts <= QUAKE_ASK_RENEW_LEAD_SECS
+
+
 def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
     """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
-    late-month rule, with asks zeroed for a bid-only family."""
+    late-month rule, with asks zeroed for a bid-only family (a quake ask
+    strike keeps its ask side; quake_cap_quotes sizes and floors it)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
-    if series_bid_only(series_of(ticker)):
+    if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
         am = 0.0
     return bm, am
 
@@ -9978,17 +10088,36 @@ def quake_gate(ticker: str, now_ts: float,
         return {"action": "stand",
                 "why": (f"close {close_time.isoformat()} is not on the "
                         f"ticker's day {day.date()}"), "reason": "close_day"}
-    return watch.verdict(k, day.timestamp(), now_ts, QUAKE_MARGIN_CENTS)
+    v = watch.verdict(k, day.timestamp(), now_ts, QUAKE_MARGIN_CENTS)
+    if quake_ask_strike(ticker):
+        # an ask strike carries the ask side's own verdict (None = no ask)
+        floor, why = quake_ask_floor(ticker, now_ts)
+        v = dict(v, ask_floor_c=floor, ask_why=why)
+        if v.get("action") == "stand" and v.get("reason") == "fair_floor" \
+                and floor is not None:
+            # the fair leaves no BID (late in the day) but the ask may rest:
+            # quote with a cap under 1c, which quake_cap_quotes drops
+            v = dict(v, action="quote", reason="ask_only", cap_c=0)
+    return v
+
+
+def quake_probe_caps(ticker: str, now_ts: float,
+                     close_time: Optional[datetime] = None
+                     ) -> Tuple[Optional[int], Optional[int]]:
+    """(bid cap, ask floor) the reward estimate assumes: the gate's cap when
+    it quotes or holds, else (None, None) -- the estimate is then zero; the
+    ask floor only on an ask strike whose ask may rest (else None)."""
+    v = quake_gate(ticker, now_ts, close_time)
+    if v.get("action") in ("quote", "hold") and v.get("cap_c") is not None:
+        floor = v.get("ask_floor_c")
+        return int(v["cap_c"]), (None if floor is None else int(floor))
+    return None, None
 
 
 def quake_probe_cap(ticker: str, now_ts: float,
                     close_time: Optional[datetime] = None) -> Optional[int]:
-    """The bid cap the reward estimate assumes: the gate's cap when it quotes
-    or holds, None when it stands aside (the estimate is then zero)."""
-    v = quake_gate(ticker, now_ts, close_time)
-    if v.get("action") in ("quote", "hold") and v.get("cap_c") is not None:
-        return int(v["cap_c"])
-    return None
+    """The bid cap the reward estimate assumes (quake_probe_caps)."""
+    return quake_probe_caps(ticker, now_ts, close_time)[0]
 
 
 def quake_past_cutoff(qk: dict, cutoff: Optional[datetime],
@@ -10002,17 +10131,36 @@ def quake_past_cutoff(qk: dict, cutoff: Optional[datetime],
     return qk
 
 
-def quake_cap_quotes(quotes: List["Quote"], cap_c: int) -> List["Quote"]:
-    """Bid rungs only, each priced at most cap_c cents (a rung that would
-    fall under 1c is dropped); a moved rung loses any sub-penny price."""
+def quake_cap_quotes(quotes: List["Quote"], cap_c: int,
+                     ask_floor_c: Optional[int] = None,
+                     ask_max: Optional[int] = None) -> List["Quote"]:
+    """Bid rungs each priced at most cap_c cents (a rung that would fall
+    under 1c is dropped). Ask rungs only with an ask floor (an ask strike
+    whose ask may rest, quake_ask_floor): each priced at least ask_floor_c
+    (none past 99c), the asks together cut to ask_max contracts (None =
+    uncut); without a floor every ask is dropped. A moved rung loses any
+    sub-penny price."""
     out = []
+    ask_left = ask_max
     for q in quotes:
-        if q.book_side != "bid":
+        if q.book_side == "bid":
+            if q.price_cents > cap_c:
+                if cap_c < 1:
+                    continue
+                q = replace(q, price_cents=int(cap_c), price_exact=None)
+            out.append(q)
             continue
-        if q.price_cents > cap_c:
-            if cap_c < 1:
+        if ask_floor_c is None or ask_floor_c > 99:
+            continue
+        px = q.price_exact if q.price_exact is not None else q.price_cents
+        if px < ask_floor_c - 1e-9:
+            q = replace(q, price_cents=int(ask_floor_c), price_exact=None)
+        if ask_left is not None:
+            if ask_left < 1:
                 continue
-            q = replace(q, price_cents=int(cap_c), price_exact=None)
+            if q.count > ask_left:
+                q = replace(q, count=int(ask_left))
+            ask_left -= q.count
         out.append(q)
     return out
 
@@ -10031,7 +10179,8 @@ def order_expiry_ts(order: dict) -> Optional[float]:
 
 
 def quake_hold_renewals(resting: List[dict], held: Set[str],
-                        order_ages: Dict[str, float], now_ts: float
+                        order_ages: Dict[str, float], now_ts: float,
+                        ask_ok: Optional[Set[str]] = None
                         ) -> Tuple[List["Quote"], List[str]]:
     """(to_place, to_cancel) renewing the resting orders of quake-HELD
     markets that are due for the TTL refresh (QUAKE_HOLD_RENEW): older than
@@ -10041,7 +10190,9 @@ def quake_hold_renewals(resting: List[dict], held: Set[str],
     cancelled and re-placed at its own price (sub-penny kept) and its own
     remaining size floored to whole contracts, the two lists in matching
     order so pair_requotes swaps them one for one. Orders on other tickers,
-    or not yet due, are left alone."""
+    or not yet due, are left alone. An ASK renews only on a ticker in
+    `ask_ok` (its ask verdict still allows it), on its own short clock
+    (quake_ask_renew_due)."""
     to_place: List["Quote"] = []
     to_cancel: List[str] = []
     lead = max(ORDER_TTL_SECS - ORDER_REFRESH_SECS, 0)
@@ -10054,9 +10205,13 @@ def quake_hold_renewals(resting: List[dict], held: Set[str],
         if parsed is None:
             continue
         age = now_ts - order_ages.get(oid, now_ts)
-        exp = order_expiry_ts(o)
-        if age <= order_refresh_secs(oid) and (exp is None or exp - now_ts > lead):
-            continue
+        if parsed[0] == "ask":
+            if tk not in (ask_ok or ()) or not quake_ask_renew_due(o, age, now_ts):
+                continue
+        else:
+            exp = order_expiry_ts(o)
+            if age <= order_refresh_secs(oid) and (exp is None or exp - now_ts > lead):
+                continue
         count = int(math.floor(order_remaining(o) + 1e-9))
         if count < 1:
             continue
@@ -13494,7 +13649,9 @@ def diff_orders(desired: List[Quote], resting: List[dict],
         remaining = order_remaining(o)
         ox = order_yes_exact_cents(o)
         age = now_ts - order_ages.get(oid, now_ts)
-        stale = age > order_refresh_secs(oid)
+        # (a quake ask rests on a short exchange expiry: its own clock)
+        stale = age > order_refresh_secs(oid) or (
+            book_side == "ask" and quake_ask_renew_due(o, age, now_ts))
         tk = o.get("ticker")
         match = next((q for q in unmatched
                       if matches(q, tk, book_side, px, remaining, ox)), None)
@@ -14136,6 +14293,11 @@ class IncentiveMarketMaker:
         self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
         self._quake_held: Set[str] = set()        # quake gate holds (frozen bids)
+        # far-strike asks (QUAKE_ASK_STRIKES): ticker -> "on" / "off" (the
+        # log's flip state), and the order ids the refresher's pull already
+        # cancelled (-> when) so a view that still lists one is not re-sent
+        self._quake_ask_state: Dict[str, str] = {}
+        self._quake_ask_pulled: Dict[str, float] = {}
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
         self._ytw_stood: Set[str] = set()         # YouTube weekly pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
@@ -14568,6 +14730,11 @@ class IncentiveMarketMaker:
             avg_before = self.pnl.avg.get(tkr, 0.0)
             self.pnl.on_fill(tkr, side, action, count, px_cents)
             self.state.fills_today += count
+            if QUAKE_ASK_STRIKES and quake_gated(series_of(tkr)) \
+                    and self.pnl.pos.get(tkr, 0.0) < pos_before - 1e-9:
+                # one of our quake asks sold YES: brake the event's asks
+                # (the WS fill usually got here first)
+                self._quake_ask_brake_note(tkr, now_ts, "fill")
             self._log_fill(f, tkr, side, action, count, px_cents,
                            now_ts, pos_before, avg_before)
             if toxic:
@@ -15686,6 +15853,17 @@ class IncentiveMarketMaker:
         label = (f"{q.ticker} {q.book_side.upper():4s} {q.count}x @ "
                  + (f"{q.price_exact:.2f}c" if q.price_exact is not None
                     else f"{q.price_cents}c"))
+        if q.book_side == "ask" and quake_gated(series_of(q.ticker)):
+            # far-strike quake ask (QUAKE_ASK_STRIKES): the verdict again, at
+            # the last moment (a quake may have landed since the cycle quoted
+            # it), and the short exchange-side expiry
+            floor, why = quake_ask_floor(q.ticker, time.time())
+            px = q.price_exact if q.price_exact is not None else q.price_cents
+            if floor is None or px < floor - 1e-9:
+                log(f"{self.tag} not placing {label}: quake ask "
+                    + (f"off ({why})" if floor is None else f"under the {floor}c floor"))
+                return False
+            expiration_ts = min(expiration_ts, int(time.time() + QUAKE_ASK_TTL_SECS))
         if not self.live:
             oid = f"sim-{uuid.uuid4().hex[:12]}"
             self.state.sim_orders[oid] = {
@@ -16522,6 +16700,13 @@ class IncentiveMarketMaker:
             if mine is not None:
                 rem, side, px = mine["rem"], mine["side"], mine["px"]
                 mine["rem"] = max(0.0, rem - n)        # the view books the fill
+            if maker and QUAKE_ASK_STRIKES and quake_gated(series_of(t)):
+                # a fill on one of our far-strike quake asks: brake every ask
+                # in the event at once (QUAKE_ASK_FILL_BRAKE_MIN)
+                q_side = mine["side"] if mine is not None else \
+                    str((self.state.ledger.get(oid) or {}).get("book_side") or "")
+                if q_side == "ask":
+                    self._quake_ask_brake_note(t, now_ts, "WS fill")
             if SWEEP_BREAKER == "off":
                 return
             self._sweep["fills_seen"] += 1
@@ -16895,6 +17080,129 @@ class IncentiveMarketMaker:
                     o.get("order_id", ""), reason="market_cancel"):
                 n += 1
         return n
+
+    # ---- far-strike quake asks (QUAKE_ASK_STRIKES, 2026-10-11) -------------
+
+    def _quake_pull_asks(self, ticker: str, resting: List[dict],
+                         floor_c: Optional[int], why: str) -> int:
+        """The cycle's own pull: cancel our resting asks on quake market
+        `ticker` that the ask verdict no longer allows -- every ask when
+        floor_c is None, else those priced under floor_c. Pulled orders leave
+        `resting` (in place) so the diff neither keeps nor re-cancels them."""
+        pulled: Set[str] = set()
+        for o in resting:
+            if o.get("ticker") != ticker:
+                continue
+            parsed = order_yes_book_cents(o)
+            if parsed is None or parsed[0] != "ask":
+                continue
+            ox = order_yes_exact_cents(o)
+            px = float(parsed[1]) if ox is None else ox
+            if floor_c is not None and px >= floor_c - 1e-9:
+                continue
+            oid = str(o.get("order_id") or "")
+            if oid and self.cancel_order(
+                    oid, reason="quake_ask_off" if floor_c is None
+                    else "quake_ask_floor"):
+                self.state.cancelled_today += 1
+                pulled.add(oid)
+        if pulled:
+            resting[:] = [o for o in resting if o.get("order_id") not in pulled]
+            log(f"{self.tag} quake ask pull {ticker}: "
+                + (why if floor_c is None else f"priced under the {floor_c}c floor")
+                + f" -- cancelled {len(pulled)}")
+        return len(pulled)
+
+    def _quake_ask_note(self, ticker: str, floor_c: Optional[int],
+                        why: str) -> None:
+        """One log line each time a far strike's ask turns on or off."""
+        state = "off" if floor_c is None else "on"
+        if self._quake_ask_state.get(ticker) != state:
+            log(f"{self.tag} quake ask {state} {ticker}: "
+                + (why if floor_c is None else f"floor {floor_c}c, "
+                   f"up to {QUAKE_ASK_MAX_CONTRACTS} contracts"))
+        self._quake_ask_state[ticker] = state
+
+    def _quake_ask_brake_note(self, ticker: str, now_ts: float,
+                              src: str) -> None:
+        """One of our asks on a quake market filled (src: 'WS fill' / 'fill'):
+        brake every ask in its event (quake_ask_brake); the refresher's next
+        sweep pulls the rest. Never raises."""
+        try:
+            ev = self._event_of(ticker)
+            if quake_ask_brake(ev, now_ts):
+                log(f"{self.tag} quake ask brake {ev}: an ask on {ticker} filled "
+                    f"({src}) -- no asks in the event for "
+                    f"{QUAKE_ASK_FILL_BRAKE_MIN:g} min")
+        except Exception as e:
+            log(f"{self.tag} ! quake ask brake failed: {e}")
+
+    def _quake_resting_asks(self) -> List[Tuple[str, str, float]]:
+        """[(ticker, order_id, yes price)] for every resting ask of ours on a
+        quake market: the ledger (every order this process placed or adopted;
+        the dry run's sim book instead) plus the cycle's resting view (built
+        with the WS feed), less the ids the refresher has already pulled.
+        Read off the trading thread (snapshots only)."""
+        out: Dict[str, Tuple[str, float]] = {}
+        for t, lst in list(self._resting_view.items()):
+            if not quake_gated(series_of(t)):
+                continue
+            for o in list(lst):
+                oid = str(o.get("order_id") or "")
+                if oid and o.get("side") == "ask" and float(o.get("rem") or 0.0) > 0:
+                    out[oid] = (t, float(o.get("px") or 0.0))
+        book = self.state.ledger if self.live else self.state.sim_orders
+        for oid, led in list(book.items()):
+            t = str(led.get("ticker") or "")
+            if not oid or oid in out or not quake_gated(series_of(t)) \
+                    or led.get("book_side") != "ask" \
+                    or float(led.get("remaining_count") or 0.0) <= 0:
+                continue
+            px = led.get("yes_price_exact")
+            out[oid] = (t, float(px) if px is not None
+                        else float(led.get("yes_price") or 0.0))
+        now_ts = time.time()
+        return [(t, oid, px) for oid, (t, px) in out.items()
+                if self._quake_ask_pulled.get(oid, 0.0) <= now_ts]
+
+    def _quake_ask_sweep(self, now_ts: float) -> int:
+        """THE PULL (QUAKE_ASK_STRIKES): cancel each resting quake ask of ours
+        whose verdict is off (quake_ask_floor), straight from the quake
+        refresher thread -- every second, the GFZ / USGS polls being the
+        trigger, so nothing waits for the trading thread's cycle (which may
+        be minutes long, or wedged). A pulled id is skipped for 15 min, a
+        failed cancel retried after 5 s. Leaves the cycle heartbeat as it
+        found it: these cancels must never hide a wedged trading thread from
+        the hang watchdog. Returns the number cancelled."""
+        for oid in [o for o, until in self._quake_ask_pulled.items()
+                    if until < now_ts - 60]:
+            self._quake_ask_pulled.pop(oid, None)
+        asks = self._quake_resting_asks()
+        if not asks:
+            return 0
+        verdicts: Dict[str, Tuple[Optional[int], str]] = {}
+        pulled: Dict[str, List[str]] = {}
+        for t, oid, _px in asks:
+            if t not in verdicts:
+                verdicts[t] = quake_ask_floor(t, now_ts)
+            if verdicts[t][0] is not None:
+                continue
+            hb = self._heartbeat
+            try:
+                ok = self.cancel_order(oid, reason="quake_ask_pull")
+            finally:
+                self._heartbeat = hb
+            self._quake_ask_pulled[oid] = now_ts + (900.0 if ok else 5.0)
+            if ok:
+                self.state.cancelled_today += 1
+                pulled.setdefault(t, []).append(oid)
+                for o in list(self._resting_view.get(t, ())):
+                    if o.get("order_id") == oid:
+                        o["rem"] = 0.0
+        for t, oids in pulled.items():
+            log(f"{self.tag} quake ask PULL {t}: {verdicts[t][1]} -- cancelled "
+                f"{len(oids)} (refresher, off the trading thread)")
+        return sum(len(v) for v in pulled.values())
 
     def fetch_positions(self) -> Dict[str, float]:
         """ticker -> signed YES position, all unsettled markets on the account.
@@ -19065,6 +19373,8 @@ class IncentiveMarketMaker:
                 int(round(sum(s for _t, s in lvb) * rmb)),
                 int(round(sum(s for _t, s in lva) * rma)),
                 series_max_position(meta.series))
+            if quake_ask_strike(meta.ticker):
+                sma = min(sma, QUAKE_ASK_MAX_CONTRACTS)   # the loop's ask cap
             out: List[Quote] = []
             band: Optional[Tuple[int, int]] = None
             if ESTIMATE_SIDE_BAND:
@@ -19102,10 +19412,12 @@ class IncentiveMarketMaker:
                     bid_size=smb if "bid" not in _has else 0,
                     ask_size=sma if "ask" not in _has else 0)
             if quake_gated(meta.series):
-                # quake gate: the bids the loop will rest, capped at fair
-                _qcap = quake_probe_cap(meta.ticker, _now.timestamp(),
-                                        meta.close_time)
-                out = [] if _qcap is None else quake_cap_quotes(out, _qcap)
+                # quake gate: the bids the loop will rest, capped at fair --
+                # and on an ask strike the ask it may rest, floored at fair
+                _qcap, _qask = quake_probe_caps(meta.ticker, _now.timestamp(),
+                                                meta.close_time)
+                out = [] if _qcap is None else quake_cap_quotes(
+                    out, _qcap, _qask, QUAKE_ASK_MAX_CONTRACTS)
             if mort_series(meta.series):
                 # mortgage gate: nothing while it stands aside, else the
                 # rungs held MORT_FAIR_TOL_CENTS clear of the fair
@@ -20230,6 +20542,8 @@ class IncentiveMarketMaker:
         # detection holds every strike of the family at once, so no sibling
         # hands out room those bids could consume.
         quake_held: Set[str] = set()
+        # ...of those, the ask strikes whose ask may still rest (renewable)
+        quake_ask_renew: Set[str] = set()
         marked: Set[str] = set()          # tickers marked from live books this cycle
         # live-event depth gate, per-cycle books: events seen thin this
         # cycle, and per-event count of gated markets that read healthy —
@@ -20991,8 +21305,13 @@ class IncentiveMarketMaker:
             # strike crossed or its fair leaves no bid; HOLD -- resting bids
             # left exactly as they are, never raised on the news -- while a
             # fresh quake detection awaits NEIC; otherwise the bid ladder
-            # below is capped at the fair cap.
+            # below is capped at the fair cap. On a far strike
+            # (QUAKE_ASK_STRIKES) the ask side has its own verdict: no ask
+            # while it is off (the refresher has usually pulled it already),
+            # else asks floored at the fair -- and a hold keeps (renews) an
+            # ask only while that verdict allows it.
             quake_cap: Optional[int] = None
+            quake_ask_c: Optional[int] = None
             if quake_gated(meta.series):
                 qk = quake_past_cutoff(quake_gate(t, now_ts, meta.close_time),
                                        meta.cutoff, now_utc)
@@ -21004,11 +21323,18 @@ class IncentiveMarketMaker:
                     self.cancel_market_orders(t, resting)
                     self._gskip(t, "quake", lambda: qk, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
+                quake_ask_c = qk.get("ask_floor_c")
+                if quake_ask_strike(t):
+                    self._quake_ask_note(t, quake_ask_c, qk.get("ask_why") or "")
+                self._quake_pull_asks(t, resting, quake_ask_c,
+                                      qk.get("ask_why") or "not an ask strike")
                 if qk["action"] == "hold":
                     if t not in self._quake_held:
                         self._quake_held.add(t)
                         log(f"{self.tag} quake hold {t}: {qk['why']}")
                     quake_held.add(t)
+                    if quake_ask_c is not None:
+                        quake_ask_renew.add(t)
                     self._gskip(t, "quake_hold", lambda: qk, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
                 quake_cap = int(qk["cap_c"])
@@ -21168,7 +21494,7 @@ class IncentiveMarketMaker:
             ca_bm, ca_am = ca_late_month_mults(t, now_utc)
             lv_bid = scale_levels(lv, ca_bm)
             lv_ask = scale_levels(lv, ca_am)
-            if series_bid_only(meta.series):
+            if series_bid_only(meta.series) and not quake_ask_strike(t):
                 lv_ask = []          # bid-only family (quake gate): no ask rungs
             if (ca_bm, ca_am) != (1.0, 1.0):
                 self._ca_late_note(meta.event_ticker, ca_bm, ca_am)
@@ -21219,6 +21545,11 @@ class IncentiveMarketMaker:
                     room_buy = min(room_buy, -own_pos)
                 else:
                     room_buy = room_sell = 0.0
+            # far-strike ask (QUAKE_ASK_STRIKES): QUAKE_ASK_MAX_CONTRACTS at
+            # most, less the short its fills already sold
+            quake_ask_room = int(max(0.0, QUAKE_ASK_MAX_CONTRACTS - max(0.0, -cap_pos)))
+            if quake_ask_strike(t):
+                room_sell = min(room_sell, float(quake_ask_room))
 
             mq: List[Quote] = []
             # atref: placement no longer follows the touch, so a touch
@@ -21241,9 +21572,10 @@ class IncentiveMarketMaker:
                                                 band=(rung_lo, pmax_s),
                                                 hour_mult=hm, min_total=unwind_ask))
 
-            # quake gate: every bid rung at most the fair cap (no asks exist)
+            # quake gate: every bid rung at most the fair cap; asks only on an
+            # ask strike whose ask may rest, at the floor or above
             if quake_cap is not None:
-                mq = quake_cap_quotes(mq, quake_cap)
+                mq = quake_cap_quotes(mq, quake_cap, quake_ask_c, quake_ask_room)
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -21796,7 +22128,8 @@ class IncentiveMarketMaker:
         # the TTL refresh at their own price and size (QUAKE_HOLD_RENEW)
         if QUAKE_HOLD_RENEW and quake_held:
             renew_place, renew_cancel = quake_hold_renewals(
-                resting, quake_held, self.state.order_ages, now_ts)
+                resting, quake_held, self.state.order_ages, now_ts,
+                ask_ok=quake_ask_renew)
             for q in renew_place:
                 log(f"{self.tag} quake hold renew {q.ticker}: "
                     f"{q.book_side.upper()} {q.count}x @ "
@@ -23241,6 +23574,18 @@ class IncentiveMarketMaker:
                             uqf.write_status(QUAKE_STATUS_FILE, watch)
                         except Exception:
                             pass      # observability only
+                    if QUAKE_ASK_STRIKES:
+                        # THE PULL (QUAKE_ASK_STRIKES): every second, right
+                        # after any fresh read -- asks whose verdict turned
+                        # off are cancelled from here, not by the cycle
+                        try:
+                            self._quake_ask_sweep(time.time())
+                            last["sweep"] = None
+                        except Exception as e:
+                            err = f"{type(e).__name__}: {str(e)[:120]}"
+                            if last.get("sweep") != err:
+                                log(f"{self.tag} ! quake ask sweep failed: {err}")
+                            last["sweep"] = err
                     time.sleep(1.0)
             threading.Thread(target=_quake_refresh, daemon=True,
                              name="quake").start()

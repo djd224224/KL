@@ -14,7 +14,9 @@ can only make YES worth more, so a resting YES bid is never on the wrong
 side of the news, while resting YES asks were lifted within ~12 s of USGS
 publishing on 24 of 62 crossed strikes (and before USGS, off faster feeds,
 on 22 more). The bot rests bids only, priced at most QUAKE_MARGIN_CENTS
-under the model's fair value.
+under the model's fair value -- except on the far strikes (Jack 2026-10-11,
+IMM_QUAKE_ASK_STRIKES), where a small ask may also rest while
+QuakeWatch.ask_verdict allows it (see ASK_MARGIN_CENTS).
 
 Fair value, for a strike not yet crossed:
     P(day max >= K) = 1 - exp(-lam(K) * W / 24)
@@ -106,6 +108,25 @@ NEWS_MAX_AGE_MIN = _env_float("IMM_QUAKE_NEWS_MAX_AGE_MIN", 105)
 # well inside it), so a live process is unchanged and a restart cannot
 # extend a freeze past origin + FIRST_SEEN_MAX_LAG_MIN + FREEZE_MAX_MIN.
 FIRST_SEEN_MAX_LAG_MIN = _env_float("IMM_QUAKE_FIRST_SEEN_MAX_LAG_MIN", 20)
+# ASKS ON THE FAR STRIKES (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes
+# start at the far strikes"). A resting YES ask (a NO bid) is the order a
+# quake picks off, so QuakeWatch.ask_verdict lets one rest only while BOTH
+# feeds are fresh and no quake near the strike is in sight. Per strike K,
+# asks are OFF while:
+#   - USGS or GFZ is stale (no GFZ = no early warning; that IS the trigger);
+#   - today's USGS maximum, or a GFZ event inside the day, reached
+#     K - ASK_DAYMAX_GAP_MAG (a later magnitude revision could cross K);
+#   - a quake of K - ASK_PULL_BELOW_MAG or more (either feed) was first seen
+#     within ASK_COOLOFF_MIN, or is still waiting for NEIC's solution (first
+#     magnitudes run low, and a foreshock can come first).
+# Otherwise an ask may rest no lower than the fair + ASK_MARGIN_CENTS, the
+# fair taken with GFZ's unpublished tail (GFZ_LAG_H). The bot's quake
+# refresher pulls resting asks the moment the verdict turns off -- every
+# poll and every second while it stays off, off the trading thread.
+ASK_MARGIN_CENTS = _env_float("IMM_QUAKE_ASK_MARGIN_CENTS", 1.0)
+ASK_PULL_BELOW_MAG = _env_float("IMM_QUAKE_ASK_PULL_BELOW_MAG", 0.8)
+ASK_DAYMAX_GAP_MAG = _env_float("IMM_QUAKE_ASK_DAYMAX_GAP_MAG", 0.4)
+ASK_COOLOFF_MIN = _env_float("IMM_QUAKE_ASK_COOLOFF_MIN", 30)
 
 
 def lam_eff(k: float) -> Optional[float]:
@@ -417,6 +438,61 @@ class QuakeWatch:
                             why="frozen: GFZ feed stale")
             return dict(base, action="quote", reason="ok", why="")
 
+    def ask_verdict(self, k: float, day_start_ts: float, now_ts: float,
+                    margin_cents: Optional[float] = None) -> dict:
+        """{'ok', 'floor_c', 'reason', 'why', ...} for a YES ask on strike k
+        (see ASK_MARGIN_CENTS): ok=False -> no ask may rest (pull any that
+        do); ok=True -> an ask may rest at floor_c cents or higher."""
+        margin = ASK_MARGIN_CENTS if margin_cents is None else margin_cents
+        k = float(k)
+
+        def off(reason: str, why: str, **extra) -> dict:
+            return dict({"ok": False, "floor_c": None, "reason": reason,
+                         "why": why}, **extra)
+
+        with self._lock:
+            if not self._usgs_fresh(now_ts):
+                return off("usgs_stale", "USGS feed stale or missing")
+            if not self._gfz_fresh(now_ts):
+                return off("gfz_stale", "GFZ feed stale or missing")
+            near = k - ASK_DAYMAX_GAP_MAG - 1e-9
+            top = self._day_max(day_start_ts)
+            if top is not None and top["mag"] >= near:
+                return off("near_daymax",
+                           f"today's USGS max M{top['mag']:g} ({top['id']}) is "
+                           f"within {ASK_DAYMAX_GAP_MAG:g} of {k:g}",
+                           quake=top["id"], mag=top["mag"])
+            thr = k - ASK_PULL_BELOW_MAG - 1e-9
+            cool = ASK_COOLOFF_MIN * 60
+            news = NEWS_MAX_AGE_MIN * 60
+            for src, evs in (("usgs", self.usgs), ("gfz", self.gfz)):
+                for e in evs.values():
+                    if e["mag"] < thr:
+                        continue
+                    tag = (f"M{e['mag']:g} {src} {e['id']} "
+                           f"(>= {k:g} - {ASK_PULL_BELOW_MAG:g})")
+                    if src == "gfz" and e["mag"] >= near \
+                            and day_start_ts <= e["time"] < day_start_ts + 86400.0:
+                        return off("gfz_near", f"GFZ shows {tag} inside the day",
+                                   quake=e["id"], mag=e["mag"])
+                    if now_ts - self._freeze_start(e) <= cool:
+                        return off("detection", f"{tag} seen under "
+                                   f"{ASK_COOLOFF_MIN:g} min ago",
+                                   quake=e["id"], mag=e["mag"])
+                    cp = e if src == "usgs" else self._match_usgs(e["time"])
+                    if now_ts - e["time"] <= news and not self._confirmed(cp, now_ts):
+                        return off("pending", f"{tag} not confirmed by NEIC yet",
+                                   quake=e["id"], mag=e["mag"])
+            fair = p_yes(k, day_start_ts, now_ts, GFZ_LAG_H)
+            if fair is None:
+                return off("no_model", f"no rate model for M{k:g}")
+            floor_c = max(1, int(math.ceil(fair * 100.0 + margin - 1e-9)))
+            if floor_c > 99:
+                return off("fair_ceiling", f"fair {fair * 100:.1f}c leaves no ask",
+                           fair=round(fair * 100.0, 2))
+            return {"ok": True, "floor_c": floor_c, "reason": "ok", "why": "",
+                    "fair": round(fair * 100.0, 2)}
+
     def open_detections(self, now_ts: float) -> List[dict]:
         """The detections currently holding the quake markets."""
         with self._lock:
@@ -448,7 +524,11 @@ class QuakeWatch:
                           "match_secs": MATCH_SECS,
                           "usgs_stale_secs": USGS_STALE_SECS,
                           "usgs_gen_stale_secs": USGS_GEN_STALE_SECS,
-                          "gfz_stale_secs": GFZ_STALE_SECS},
+                          "gfz_stale_secs": GFZ_STALE_SECS,
+                          "ask_margin_cents": ASK_MARGIN_CENTS,
+                          "ask_pull_below_mag": ASK_PULL_BELOW_MAG,
+                          "ask_daymax_gap_mag": ASK_DAYMAX_GAP_MAG,
+                          "ask_cooloff_min": ASK_COOLOFF_MIN},
             }
 
 

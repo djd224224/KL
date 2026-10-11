@@ -149,6 +149,7 @@ def setUpModule():
     imm.QUAKE_STATUS_FILE = os.path.join(tmp, "usgs_quake_state.json")
     imm.CONFIG_GAPS_FILE = os.path.join(tmp, "config_gaps.json")
     imm._quake_state["watch"] = None
+    imm._quake_state["ask_brake"] = {}       # far-strike ask brakes (2026-10-11)
     # the Vercel pre-D fair file (2026-09-27) is read by every run_cycle
     imm.VERCEL_FAIR_FILE = os.path.join(tmp, "vercel_fair.json")
     imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
@@ -18639,6 +18640,217 @@ class TestQuakeBidOnlyGate(unittest.TestCase):
         self.assertEqual(cancel, ["f"])
         self.assertEqual([(q.price_cents, q.count, q.price_exact) for q in place],
                          [(86, 60, None)])
+
+
+class TestQuakeFarStrikeAsks(unittest.TestCase):
+    """The far strikes (QUAKE_ASK_STRIKES, 6.6/6.8/7.0) also rest a small YES
+    ask, floored at the fair, pulled from the refresher thread the moment the
+    ask verdict turns off (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes
+    start at the far strikes"). Fixture = TOMORROW's 6.6: whole-day fair
+    8.05c -> bid cap 7c, ask floor 10c. Book 3-7 x 12-16, 300 a level."""
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        d = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+        self.day = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        self.EV = f"KXBIGGESTQUAKE-{d.day:02d}{_MON3[d.month - 1]}{d.year % 100:02d}"
+        self.T = f"{self.EV}-6.6"
+        self.close = self.day + timedelta(hours=23, minutes=59, seconds=59)
+        now = time.time()
+        self.watch = uqf.QuakeWatch()
+        self.watch.update_usgs(now - 30, [], now)
+        self.watch.update_gfz([], now)
+        imm._quake_state["watch"] = self.watch
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._quake_state["watch"] = None
+        imm._quake_state["ask_brake"] = {}
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "500.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.close.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.0700", "yes_ask_dollars": "0.1200",
+            "volume_fp": "500.00"}
+        yes = [["0.03", "300"], ["0.04", "300"], ["0.05", "300"],
+               ["0.06", "300"], ["0.07", "300"]]
+        no = [["0.84", "300"], ["0.85", "300"], ["0.86", "300"],
+              ["0.87", "300"], ["0.88", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": yes,
+                                                 "no_dollars": no}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _orders(self, bot, side=None):
+        return sorted((oid, o["book_side"], o["yes_price"], o["remaining_count"])
+                      for oid, o in bot.state.sim_orders.items()
+                      if o["ticker"] == self.T and (side is None or o["book_side"] == side))
+
+    def _detect(self, mag):
+        now = time.time()
+        self.watch.update_gfz([{"id": "g1", "mag": mag, "mag_type": "mb",
+                                "time": now - 60, "place": "x"}], now)
+
+    def test_which_strikes_and_the_kill_switch(self):
+        self.assertEqual(imm.QUAKE_ASK_STRIKES, frozenset({6.6, 6.8, 7.0}))
+        self.assertTrue(imm.quake_ask_strike(self.T))
+        self.assertTrue(imm.quake_ask_strike(f"{self.EV}-7.0"))
+        self.assertFalse(imm.quake_ask_strike(f"{self.EV}-6.4"))
+        self.assertFalse(imm.quake_ask_strike(f"{self.EV}-x"))
+        self.assertFalse(imm.quake_ask_strike("KXOTHER-26OCT11-6.6"))
+        self.assertTrue(imm.series_bid_only("KXBIGGESTQUAKE"))     # family stays bid-only
+        now = datetime.now(timezone.utc)
+        self.assertEqual(imm.side_size_mults(self.T, now), (1.0, 1.0))
+        self.assertEqual(imm.side_size_mults(f"{self.EV}-6.0", now), (1.0, 0.0))
+        with mock.patch.object(imm, "QUAKE_ASK_STRIKES", frozenset()):
+            self.assertFalse(imm.quake_ask_strike(self.T))
+            self.assertEqual(imm.side_size_mults(self.T, now), (1.0, 0.0))
+        self.assertEqual(imm._quake_ask_strikes("6.6, 7.0,x,"), frozenset({6.6, 7.0}))
+
+    def test_cap_quotes_floors_and_cuts_the_ask(self):
+        qs = [imm.Quote(self.T, "bid", 9, 50),
+              imm.Quote(self.T, "ask", 8, 80, price_exact=8.4),
+              imm.Quote(self.T, "ask", 14, 80)]
+        out = imm.quake_cap_quotes(qs, 7, 10, 100)
+        self.assertEqual([(q.book_side, q.price_cents, q.count, q.price_exact) for q in out],
+                         [("bid", 7, 50, None), ("ask", 10, 80, None), ("ask", 14, 20, None)])
+        self.assertEqual([q.book_side for q in imm.quake_cap_quotes(qs, 7)], ["bid"])
+        self.assertEqual([q.book_side for q in imm.quake_cap_quotes(qs, 0, 10, 100)],
+                         ["ask", "ask"])                       # the ask-only late day
+
+    def test_quotes_a_capped_bid_and_a_small_floored_ask(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bids, asks = self._orders(bot, "bid"), self._orders(bot, "ask")
+        self.assertTrue(bids)
+        self.assertTrue(asks)
+        self.assertLessEqual(max(px for _o, _s, px, _n in bids), 7)
+        self.assertGreaterEqual(min(px for _o, _s, px, _n in asks), 10)
+        self.assertLessEqual(sum(n for _o, _s, _p, n in asks), imm.QUAKE_ASK_MAX_CONTRACTS)
+        for oid, _s, _p, _n in asks:                          # the short expiry
+            self.assertLessEqual(bot.state.sim_orders[oid]["expire_at"],
+                                 time.time() + imm.QUAKE_ASK_TTL_SECS + 2)
+        self.assertEqual(bot._quake_ask_state.get(self.T), "on")
+
+    def test_the_asks_own_short_comes_off_its_cap(self):
+        bot = self._bot()
+        bot.pnl.pos[self.T] = -40.0
+        bot.client.positions[self.T] = -40.0
+        bot.run_cycle()
+        asks = self._orders(bot, "ask")
+        self.assertTrue(asks)
+        self.assertLessEqual(sum(n for _o, _s, _p, n in asks),
+                             imm.QUAKE_ASK_MAX_CONTRACTS - 40)
+
+    def test_a_detection_pulls_the_ask_off_the_trading_thread_and_holds_bids(self):
+        bot = self._bot()
+        bot.run_cycle()
+        bids = self._orders(bot, "bid")
+        self.assertTrue(self._orders(bot, "ask"))
+        self._detect(5.9)                                     # >= 6.6 - 0.8
+        self.assertGreaterEqual(bot._quake_ask_sweep(time.time()), 1)
+        self.assertEqual(self._orders(bot, "ask"), [])
+        self.assertEqual(self._orders(bot, "bid"), bids)      # bids untouched
+        self.assertEqual(bot._quake_ask_sweep(time.time()), 0)   # nothing left to pull
+        bot.run_cycle()                                       # the cycle: a hold
+        self.assertIn(self.T, bot._quake_held)
+        self.assertEqual(self._orders(bot, "bid"), bids)
+        self.assertEqual(self._orders(bot, "ask"), [])        # no ask while off
+        self.assertEqual(bot._quake_ask_state.get(self.T), "off")
+        # ...and none can slip out between the cycle and the wire
+        self.assertFalse(bot.place_order(imm.Quote(self.T, "ask", 12, 50), time.time()))
+
+    def test_a_small_detection_holds_bids_and_keeps_the_ask(self):
+        bot = self._bot()
+        bot.run_cycle()
+        before = self._orders(bot)
+        self._detect(5.1)                                     # a hold, under 5.8
+        self.assertEqual(bot._quake_ask_sweep(time.time()), 0)
+        bot.run_cycle()
+        self.assertIn(self.T, bot._quake_held)
+        self.assertEqual(self._orders(bot), before)           # all of it frozen
+
+    def test_the_cycle_pulls_an_ask_the_refresher_missed(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._orders(bot, "ask"))
+        self.watch.gfz_ok = time.time() - uqf.GFZ_STALE_SECS - 10   # GFZ gone
+        bot.run_cycle()                                       # bids hold, ask pulled
+        self.assertIn(self.T, bot._quake_held)
+        self.assertTrue(self._orders(bot, "bid"))
+        self.assertEqual(self._orders(bot, "ask"), [])
+
+    def test_an_ask_fill_brakes_the_event(self):
+        bot = self._bot()
+        bot.run_cycle()
+        now = time.time()
+        bot._book_fill({"ticker": self.T, "side": "no", "action": "buy",
+                        "count": 10, "yes_price_dollars": "0.1200",
+                        "order_id": "x", "fill_id": "f1"}, now)
+        floor, why = imm.quake_ask_floor(self.T, now)
+        self.assertIsNone(floor)
+        self.assertIn("braked", why)
+        self.assertIsNone(imm.quake_ask_floor(f"{self.EV}-7.0", now)[0])  # whole event
+        self.assertGreaterEqual(bot._quake_ask_sweep(now), 1)
+        self.assertEqual(self._orders(bot, "ask"), [])
+        later = now + imm.QUAKE_ASK_FILL_BRAKE_MIN * 60 + 1
+        self.watch.update_usgs(later - 30, [], later)
+        self.watch.update_gfz([], later)
+        self.assertIsNotNone(imm.quake_ask_floor(self.T, later)[0])
+        # a bid fill (YES bought) brakes nothing
+        imm._quake_state["ask_brake"] = {}
+        bot._book_fill({"ticker": self.T, "side": "yes", "action": "buy",
+                        "count": 10, "yes_price_dollars": "0.0700",
+                        "order_id": "y", "fill_id": "f2"}, now)
+        self.assertEqual(imm._quake_state["ask_brake"], {})
+
+    def test_the_ask_renews_on_its_own_short_clock(self):
+        now = 1_000_000.0
+        due = now - (imm.QUAKE_ASK_TTL_SECS - imm.QUAKE_ASK_RENEW_LEAD_SECS) - 1
+        ask = {"order_id": "a", "ticker": self.T, "book_side": "ask",
+               "yes_price": 12, "remaining_count": 100.0}
+        bid = {"order_id": "b", "ticker": self.T, "book_side": "bid",
+               "yes_price": 7, "remaining_count": 100.0}
+        desired = [imm.Quote(self.T, "ask", 12, 100), imm.Quote(self.T, "bid", 7, 100)]
+        with mock.patch.object(imm, "ORDER_TTL_SECS", 1800), \
+                mock.patch.object(imm, "ORDER_REFRESH_SECS", 1500):  # the launcher's
+            place, cancel, _am = imm.diff_orders(desired, [ask, bid],
+                                                 {"a": due, "b": due}, now)
+            self.assertEqual(cancel, ["a"])                   # the bid's clock is long
+            self.assertEqual([(q.book_side, q.price_cents) for q in place],
+                             [("ask", 12)])
+            place, cancel, _am = imm.diff_orders(desired, [ask, bid],
+                                                 {"a": now - 60, "b": due}, now)
+            self.assertEqual((place, cancel), ([], []))
+        # held: an ask renews on that clock only while its verdict allows it
+        place, cancel = imm.quake_hold_renewals([ask, bid], {self.T},
+                                                {"a": due, "b": now}, now,
+                                                ask_ok={self.T})
+        self.assertEqual(cancel, ["a"])
+        place, cancel = imm.quake_hold_renewals([ask, bid], {self.T},
+                                                {"a": due, "b": now}, now)
+        self.assertEqual((place, cancel), ([], []))
+
+    def test_late_in_the_day_the_ask_quotes_alone(self):
+        t = self.day.timestamp() + 23 * 3600
+        self.watch.update_usgs(t - 30, [], t)
+        self.watch.update_gfz([], t)
+        v = imm.quake_gate(f"{self.EV}-7.0", t)               # fair ~0.2c: no bid
+        self.assertEqual((v["action"], v["reason"], v["cap_c"], v["ask_floor_c"]),
+                         ("quote", "ask_only", 0, 2))
+        self.assertEqual(imm.quake_probe_caps(f"{self.EV}-7.0", t), (0, 2))
+        v = imm.quake_gate(f"{self.EV}-6.4", t)               # no ask strike: stands
+        self.assertEqual((v["action"], v["reason"]), ("stand", "fair_floor"))
+        self.assertNotIn("ask_floor_c", v)
 
 
 def imm_usgs_stale_secs():

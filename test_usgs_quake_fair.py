@@ -250,6 +250,112 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(st["today_max"]["mag"], 5.1)
         self.assertEqual(st["usgs_events"], 1)
         self.assertIn("freeze_max_min", st["knobs"])
+        self.assertIn("ask_pull_below_mag", st["knobs"])
+
+
+def _watch(now, usgs=(), gfz=(), gen_age=30, gfz_age=5):
+    w = q.QuakeWatch()
+    w.created = now - 3600
+    w.update_usgs(now - gen_age, list(usgs), now)
+    w.update_gfz(list(gfz), now - gfz_age)
+    return w
+
+
+def settled_ev(eid, mag, t, net="us"):
+    """A USGS solution unchanged since 10 min after its origin: a new
+    process credits it as settled on its first read (_settled_since)."""
+    return dict(usgs_ev(eid, mag, t, net=net), updated=t + 600)
+
+
+class TestAskVerdict(unittest.TestCase):
+    """QuakeWatch.ask_verdict: when a far-strike YES ask may rest, and how low
+    (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes start at the far
+    strikes"). Pull-below 0.8, day-max gap 0.4, cool-off 30 min (defaults)."""
+
+    def test_quiet_feeds_allow_an_ask_floored_at_the_fair(self):
+        now = DAY + 12 * H
+        w = _watch(now)
+        v = w.ask_verdict(6.6, DAY, now)
+        fair = q.p_yes(6.6, DAY, now, q.GFZ_LAG_H) * 100
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["floor_c"], math.ceil(fair + q.ASK_MARGIN_CENTS))
+        self.assertEqual(w.ask_verdict(6.6, DAY, now, margin_cents=3)["floor_c"],
+                         math.ceil(fair + 3))
+
+    def test_either_feed_stale_turns_the_ask_off(self):
+        now = DAY + 12 * H
+        w = _watch(now)
+        self.assertEqual(w.ask_verdict(6.6, DAY, now + q.USGS_STALE_SECS + 1)["reason"],
+                         "usgs_stale")
+        # a stale GFZ only HOLDS the bids; it takes the asks off (it is the trigger)
+        w = _watch(now, gfz_age=q.GFZ_STALE_SECS + 10)
+        self.assertEqual(w.verdict(6.6, DAY, now)["action"], "hold")
+        self.assertEqual(w.ask_verdict(6.6, DAY, now)["reason"], "gfz_stale")
+        never = q.QuakeWatch()
+        never.update_usgs(now - 30, [], now)
+        self.assertEqual(never.ask_verdict(6.6, DAY, now)["reason"], "gfz_stale")
+
+    def test_a_gfz_detection_near_the_strike_pulls_only_that_strike(self):
+        now = DAY + 12 * H
+        w = _watch(now, gfz=[gfz_ev("g1", 5.9, now - 60)], gfz_age=0)
+        v = w.ask_verdict(6.6, DAY, now)                 # 5.9 >= 6.6 - 0.8
+        self.assertEqual((v["ok"], v["reason"]), (False, "detection"))
+        self.assertIsNone(v["floor_c"])
+        self.assertTrue(w.ask_verdict(7.0, DAY, now)["ok"])   # 5.9 < 6.2
+        w = _watch(now, gfz=[gfz_ev("g2", 5.7, now - 60)], gfz_age=0)
+        self.assertTrue(w.ask_verdict(6.6, DAY, now)["ok"])   # too small for any
+
+    def test_off_through_the_cooloff_then_back_once_neic_settles_low(self):
+        now = DAY + 12 * H
+        t0 = now - 120
+        g = [gfz_ev("g1", 6.0, t0)]
+        w = _watch(now, gfz=g, gfz_age=0)
+        self.assertEqual(w.ask_verdict(6.6, DAY, now)["reason"], "detection")
+        us = [usgs_ev("us1", 6.0, t0 + 3)]               # NEIC publishes 5 min later
+        TestVerdict.poll(w, now + 300, us, gfz=g)
+        self.assertEqual(w.ask_verdict(6.6, DAY, now + 300)["reason"], "detection")
+        late = now + 300 + q.ASK_COOLOFF_MIN * 60 + 10   # cool-off over, NEIC settled
+        TestVerdict.poll(w, late, us, gfz=g)
+        v = w.ask_verdict(6.6, DAY, late)
+        self.assertTrue(v["ok"], v)
+        # ...but the same day's M6.0 sits within the 0.4 gap of a 6.4 strike
+        self.assertEqual(w.ask_verdict(6.4, DAY, late)["reason"], "near_daymax")
+
+    def test_an_unconfirmed_detection_stays_pending_until_it_is_old_news(self):
+        now = DAY + 12 * H
+        g = [gfz_ev("g1", 5.9, now - 60 * 60)]           # an hour old, no NEIC match
+        w = _watch(now, gfz=g, gfz_age=0)
+        self.assertEqual(w.ask_verdict(6.6, DAY, now)["reason"], "pending")
+        old = [gfz_ev("g1", 5.9, now - (q.NEWS_MAX_AGE_MIN + 5) * 60)]
+        w = _watch(now, gfz=old, gfz_age=0)
+        self.assertTrue(w.ask_verdict(6.6, DAY, now)["ok"])
+
+    def test_a_big_gfz_number_inside_the_day_keeps_the_ask_off(self):
+        now = DAY + 12 * H
+        w = _watch(now, gfz=[gfz_ev("g1", 6.3, now - H)], gfz_age=0)
+        self.assertEqual(w.ask_verdict(6.6, DAY, now)["reason"], "gfz_near")
+        self.assertEqual(w.ask_verdict(6.8, DAY, now)["reason"], "pending")  # 6.3 >= 6.0
+        # yesterday's: not this day's maximum, and long past news
+        now = DAY + 2 * H
+        w = _watch(now, gfz=[gfz_ev("g1", 6.3, DAY - 2 * H)], gfz_age=0)
+        self.assertTrue(w.ask_verdict(6.6, DAY, now)["ok"])
+
+    def test_todays_usgs_max_within_the_gap_keeps_the_ask_off(self):
+        now = DAY + 12 * H
+        w = _watch(now, usgs=[settled_ev("us1", 6.2, DAY + 2 * H)])
+        v = w.ask_verdict(6.6, DAY, now)
+        self.assertEqual((v["reason"], v["mag"]), ("near_daymax", 6.2))
+        self.assertTrue(w.ask_verdict(6.8, DAY, now)["ok"])   # settled, old, 6.2 < 6.4
+        w = _watch(now, usgs=[settled_ev("us0", 6.9, DAY - 2 * H)])   # yesterday's
+        self.assertTrue(w.ask_verdict(6.6, DAY, now)["ok"])
+
+    def test_the_ask_outlives_the_bid_late_in_the_day(self):
+        now = DAY + 20 * H
+        w = _watch(now)
+        self.assertEqual(w.verdict(7.0, DAY, now)["reason"], "fair_floor")
+        v = w.ask_verdict(7.0, DAY, now)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["floor_c"], 2)                 # ~0.6c fair + 1c, rounded up
 
 
 if __name__ == "__main__":
