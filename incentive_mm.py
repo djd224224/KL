@@ -763,7 +763,7 @@ for _s in os.environ.get(
             # band this bought was quoted for exactly zero reward — it is
             # clamped back to PAYOUT_FLOOR_DOLLARS by series_min_est_total()
             # regardless. 1.00 until 2026-09-12; now NO per-series value, so
-            # temp inherits the global MIN_EST_TOTAL_DOLLARS ($1.50 -- Jack:
+            # temp inherits the global MIN_EST_TOTAL_DOLLARS ($1.30 since 10/11 -- Jack:
             # "across IMM going forward"). Set IMM_TEMP_MIN_EST_TOTAL to pin
             # a temp-only bar again (still clamped to the exchange minimum).
             min_est_total=(_env_float("IMM_TEMP_MIN_EST_TOTAL", 0.0) or None),
@@ -6946,7 +6946,13 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # exchange, not a choice.
 # Per-series override: SeriesOverride.min_est_total via series_min_est_total(),
 # but NOTHING may sit below PAYOUT_FLOOR_DOLLARS — see series_min_est_total().
-MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.5)
+# 1.5 -> 1.3 (Jack 2026-10-11: "lower payout bar to $1.30 (since pays out
+# 1.15x on average, so a $1.30 payout bar is equivalent to ~$1.5 in
+# reality)"): the bar is tested against the bot's ESTIMATE, and Kalshi pays
+# ~1.15x the estimate on average, so $1.30 estimated ~ $1.50 paid. Same
+# single bar everywhere series_min_est_total() is read; the exit still uses
+# the $1.00 cliff (EXIT_FLOOR_IS_PAYOUT) and ladders keep their own $1.20.
+MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.3)
 # The exchange's own minimum: a market whose payout for a program period comes
 # to less than this is paid NOTHING. Measured, not assumed — across all 2,720
 # LIQUIDITY credits on Jack's 2026-08-04 statement the smallest is exactly
