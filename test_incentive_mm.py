@@ -2715,8 +2715,9 @@ class TestPayoutFloorOneFifty(unittest.TestCase):
                 if imm.SPORTS_LADDER_LEAGUE_RE.fullmatch(s):
                     # the ONE family with its own fresh-entry bar (Jack
                     # 2026-09-26 pm: "lower entry floor to 1.2 for
-                    # ESCALATOR/LADDER"); the $1.00 cliff still binds
-                    self.assertEqual(imm.series_min_est_total(s), 1.2, s)
+                    # ESCALATOR/LADDER"; 2026-10-11: "lower ladders and
+                    # escalators to $1") -- the $1.00 cliff itself
+                    self.assertEqual(imm.series_min_est_total(s), 1.0, s)
                     continue
                 self.assertGreaterEqual(imm.series_min_est_total(s), 1.3,
                                         f"{s} carries a bar under $1.30")
@@ -5770,10 +5771,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             # fresh-entry bar for the family; the cliff for banked / members.
             # 2026-09-29: x4 ("increase LADDER and ESCALATOR families to 4x
             # multiplier, from the 3x"); 2026-10-02: x5 ("increase
-            # LADDER/ESCALATOR to 5x immediately")
+            # LADDER/ESCALATOR to 5x immediately"); 2026-10-11: the fresh bar
+            # $1.20 -> $1.00 ("lower ladders and escalators to $1")
             self.assertEqual(imm.applied_mention_mult("KXNBALADDERPTS"), 5.0)
-            self.assertEqual(imm.series_min_est_total("KXNBALADDERPTS"), 1.2)
-            self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=False), 1.2)
+            self.assertEqual(imm.series_min_est_total("KXNBALADDERPTS"), 1.0)
+            self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=False), 1.0)
             self.assertEqual(imm.floor_bar_dollars("KXNBALADDERPTS", banked=True),
                              imm.PAYOUT_FLOOR_DOLLARS)
             self.assertEqual(imm.series_min_est_total("KXGOOD"), imm.MIN_EST_TOTAL_DOLLARS)

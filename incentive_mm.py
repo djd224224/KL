@@ -6517,9 +6517,14 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # 600 when the Saturday gate steps it up to x2.
 # 2026-10-11 (Jack: "increase LADDER/ESCALATOR to 4x"): that hour part x3 ->
 # x4 -- 400 a side all day, Saturday 600 (x2 gated clips at the 750 cap).
+# 2026-10-11 (Jack: "lower ladders and escalators to $1"): fresh-entry bar
+# $1.20 -> $1.00, the exchange cliff itself (series_min_est_total never goes
+# lower). Kalshi pays ~1.15x the estimate on average (the same day's global
+# $1.50 -> $1.30), so a $1.00 projection is ~$1.15 paid -- but a market that
+# enters right at the bar has no margin if its book thickens afterwards.
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
-    min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),
+    min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.0),
     safe_join=True,
     price_min_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MIN", 1),
     price_max_cents=_env_int("IMM_SPORTS_LADDER_PRICE_MAX", 99),
@@ -6672,7 +6677,7 @@ for _s in os.environ.get("IMM_RATES_EXTRA_SERIES", _DEFAULT_RATES_EXTRA_SERIES).
 # (20-lot rung, 150 / 1,000 caps): 60 a side, 180 in the 0-8 ET quiet hours
 # (x3 since 10/05) up to the 07:00 cutoff, no Saturday step (a daily
 # series); caps 450 per market / 3,000 net per event. Only the size
-# -- not the ladders' 1-99c band or $1.20 entry bar.
+# -- not the ladders' 1-99c band or $1.00 entry bar.
 # IMM_TRUMPAPPROVE_SIZE_MULT=1.0 reverts.
 SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
     event_day_cutoff_et=(
@@ -6951,7 +6956,7 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # reality)"): the bar is tested against the bot's ESTIMATE, and Kalshi pays
 # ~1.15x the estimate on average, so $1.30 estimated ~ $1.50 paid. Same
 # single bar everywhere series_min_est_total() is read; the exit still uses
-# the $1.00 cliff (EXIT_FLOOR_IS_PAYOUT) and ladders keep their own $1.20.
+# the $1.00 cliff (EXIT_FLOOR_IS_PAYOUT) and ladders have their own $1.00.
 MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.3)
 # The exchange's own minimum: a market whose payout for a program period comes
 # to less than this is paid NOTHING. Measured, not assumed — across all 2,720
