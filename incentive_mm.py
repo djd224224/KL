@@ -1420,7 +1420,11 @@ SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
 # per-event caps (750 / 5,000) and skew knees are unchanged -- they ride the
 # family multiplier only. Wins over the daily-family and scan exclusions
 # below: the whole pattern family takes it. 0 = off (the global window).
-SPORTS_LADDER_HOUR_MULT = _env_float("IMM_SPORTS_LADDER_HOUR_MULT", 3.0)
+# 2026-10-11 (Jack: "increase LADDER/ESCALATOR to 4x instead of the 3x
+# multiplier currently"): 3 -> 4 -- 20 x 5 x 4 = 400 a side at every hour;
+# Saturday x1.5 = 600, and the gated x2 (800) clips at the 750 per-market
+# cap (clamp_side_max_to_position_cap). Caps and skew knees unchanged.
+SPORTS_LADDER_HOUR_MULT = _env_float("IMM_SPORTS_LADDER_HOUR_MULT", 4.0)
 
 # DAILY SERIES BACK ON THE QUIET HOURS (Jack 2026-10-06: "does
 # KXTRUMPAPPROVE move much overnight? if not then include it as part of 3x",
@@ -1986,6 +1990,9 @@ EARNINGS_SIZE_MULT = _env_float("IMM_EARNINGS_SIZE_MULT", 1.5)
 # Evidence (9/18-10/1): +$81/day net at the paid rate, positive 13 of 14
 # days; since the x1.5 (9/17) net per resting contract-hour rose 25 -> 33
 # -> 66c per 1k and settled P&L per filled contract went -9c -> +9c.
+# 2026-10-11 (Jack: "increase it to 3x"): the launcher's NEXT is 3.0 from
+# 2026-10-11 -- rung 20 -> 60, per-market cap 450, per-event 3,000, skew
+# knees 90/180.
 EARNINGS_SIZE_MULT_NEXT = _env_float("IMM_EARNINGS_SIZE_MULT_NEXT", 0.0)
 EARNINGS_SIZE_MULT_FROM = _env_et_day("IMM_EARNINGS_SIZE_MULT_FROM")
 EARNINGS_SIZE_MULT_FROM_TS = _et_day_start_ts(EARNINGS_SIZE_MULT_FROM)
@@ -6489,6 +6496,8 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # ESCALATOR/LADDER events"): the hour part is a flat x3 at every hour
 # (SPORTS_LADDER_HOUR_MULT) -- 300 a side all day; Saturday x1.5 = 450, or
 # 600 when the Saturday gate steps it up to x2.
+# 2026-10-11 (Jack: "increase LADDER/ESCALATOR to 4x"): that hour part x3 ->
+# x4 -- 400 a side all day, Saturday 600 (x2 gated clips at the 750 cap).
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
     min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.2),

@@ -9966,7 +9966,7 @@ class TestSportsLadderHourMult(unittest.TestCase):
         return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
 
     def test_code_default(self):
-        self.assertEqual(_LADDER_HOUR_MULT_CODE_DEFAULT, 3.0)
+        self.assertEqual(_LADDER_HOUR_MULT_CODE_DEFAULT, 4.0)
 
     def test_x3_every_hour(self):
         for s in self.LADDERS:
