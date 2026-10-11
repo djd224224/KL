@@ -10022,3 +10022,18 @@ stands on its own, since a failing fetch used to read exactly like a healthy
 one. Only the comment in sync_kl_main.ps1 changed.
 
 DEPLOY: ff KL; the code-change exit restarts the bot (handoff).
+
+## 2026-10-11 ~01:25Z — sweep-breaker holdout 5% -> 0 (Jack: "drop the holdout to 0")
+
+The 10/10 check (by hand), cumulative 10/4 23:10Z - 10/10 12:07Z:
+- 1,361 live / 323 control trips, 51 control trips with fills.
+- Net +$65.62/day at 5m and +$78.68/day at 30m, after ~$5.5/day of reward.
+- Bootstrap 90% CI: +$19..+$128 (5m), +$23..+$147 (30m); P(net < 0) ~0.1%.
+- Lumpy: top 2 control trips are 60% of the avoided loss. Without the biggest: +$38/+$47.
+
+At 5% the control cost ~$4-5/day. IMM_SWEEP_HOLDOUT=0 makes every trip live, so
+ws_stale_score.py's "LIVE, netted against its control trips" estimate can only
+use the control trips logged up to now. A new window with no control trips
+prints the live count and the reward given up, with no net. To re-measure
+later, set a small holdout (e.g. 0.05) for a week.
+
