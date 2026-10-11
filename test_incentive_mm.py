@@ -18840,6 +18840,30 @@ class TestQuakeFarStrikeAsks(unittest.TestCase):
                                                 {"a": due, "b": now}, now)
         self.assertEqual((place, cancel), ([], []))
 
+    def test_gfz_every_10s_and_emsc_on(self):
+        # Jack 2026-10-11: "poll GFZ every 10s instead of 20s, or add the
+        # faster EMSC feed" -> "implement"
+        self.assertEqual(imm.QUAKE_GFZ_POLL_SECS, 10)
+        self.assertTrue(imm.QUAKE_EMSC_ENABLE)
+
+    def test_an_emsc_push_pulls_the_ask_at_once(self):
+        from test_usgs_quake_fair import emsc_msg
+        bot = self._bot()
+        bot.run_cycle()
+        bids = self._orders(bot, "bid")
+        self.assertTrue(self._orders(bot, "ask"))
+        now = time.time()
+        ev = bot._quake_emsc_note(self.watch, emsc_msg("e0", 3.0, now - 30), now)
+        self.assertEqual(ev["mag"], 3.0)                      # parsed, not kept
+        self.assertNotIn("e0", self.watch.emsc)
+        self.assertTrue(self._orders(bot, "ask"))
+        self.assertIsNone(bot._quake_emsc_note(self.watch, "not json", now))
+        # an M6.0 (>= 6.6 - 0.8): the ask comes off within the same call
+        bot._quake_emsc_note(self.watch, emsc_msg("e1", 6.0, now - 30), now)
+        self.assertEqual(self._orders(bot, "ask"), [])
+        self.assertEqual(self._orders(bot, "bid"), bids)      # bids untouched
+        self.assertIsNone(imm.quake_ask_floor(self.T, now)[0])
+
     def test_late_in_the_day_the_ask_quotes_alone(self):
         t = self.day.timestamp() + 23 * 3600
         self.watch.update_usgs(t - 30, [], t)

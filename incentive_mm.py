@@ -7768,6 +7768,7 @@ _CONFIG_CODE_KNOBS = (
     # same status-file "knobs" block
     "QUAKE_ASK_STRIKES", "QUAKE_ASK_MAX_CONTRACTS", "QUAKE_ASK_TTL_SECS",
     "QUAKE_ASK_RENEW_LEAD_SECS", "QUAKE_ASK_FILL_BRAKE_MIN",
+    "QUAKE_EMSC_ENABLE", "QUAKE_EMSC_PING_SECS", "QUAKE_EMSC_DEAD_SECS",
     # Vercel pre-D gate (2026-09-27); vercel_fair's model knobs ride in the
     # fair file's "model" block
     "VERCEL_ENABLE", "VERCEL_SERIES", "VERCEL_CUTOFF_BEFORE_D_MIN",
@@ -9824,7 +9825,17 @@ QUAKE_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_QUAKE_SERIES", "KXBIGGESTQUAKE").split(",") if s.strip())
 QUAKE_MARGIN_CENTS = _env_float("IMM_QUAKE_MARGIN_CENTS", 1.0)
 QUAKE_USGS_POLL_SECS = _env_float("IMM_QUAKE_USGS_POLL_SECS", 15)
-QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 20)
+# 20 -> 10s (Jack 2026-10-11: "poll GFZ every 10s instead of 20s, or add the
+# faster EMSC feed" -> "implement"): GFZ is the far-strike asks' trigger
+QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 10)
+# ...and EMSC's realtime push feed as a third trigger, read on its own thread
+# (_quake_emsc_loop; usgs_quake_fair.EMSC_MIN_MAG): an accelerator for the
+# asks only. Pinged every QUAKE_EMSC_PING_SECS; a connection silent (not even
+# a pong) for QUAKE_EMSC_DEAD_SECS is dropped and redialled. IMM_QUAKE_EMSC=0
+# leaves it off.
+QUAKE_EMSC_ENABLE = os.environ.get("IMM_QUAKE_EMSC", "1") == "1"
+QUAKE_EMSC_PING_SECS = _env_float("IMM_QUAKE_EMSC_PING_SECS", 15)
+QUAKE_EMSC_DEAD_SECS = _env_float("IMM_QUAKE_EMSC_DEAD_SECS", 60)
 QUAKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN", 10)
 # x3 -> x4 (Jack 2026-10-07: "increase KXBIGGESTQUAKE to 4x"). Not a daily
 # series, so the hour windows still compose on top: x4 by day, x6 in the
@@ -14298,6 +14309,8 @@ class IncentiveMarketMaker:
         # cancelled (-> when) so a view that still lists one is not re-sent
         self._quake_ask_state: Dict[str, str] = {}
         self._quake_ask_pulled: Dict[str, float] = {}
+        # the pull runs on the quake refresher AND the EMSC reader thread
+        self._quake_ask_lock = threading.Lock()
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
         self._ytw_stood: Set[str] = set()         # YouTube weekly pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
@@ -17169,11 +17182,87 @@ class IncentiveMarketMaker:
         """THE PULL (QUAKE_ASK_STRIKES): cancel each resting quake ask of ours
         whose verdict is off (quake_ask_floor), straight from the quake
         refresher thread -- every second, the GFZ / USGS polls being the
-        trigger, so nothing waits for the trading thread's cycle (which may
-        be minutes long, or wedged). A pulled id is skipped for 15 min, a
-        failed cancel retried after 5 s. Leaves the cycle heartbeat as it
-        found it: these cancels must never hide a wedged trading thread from
-        the hang watchdog. Returns the number cancelled."""
+        trigger -- and from the EMSC reader the moment a big enough quake is
+        pushed, so nothing waits for the trading thread's cycle (which may be
+        minutes long, or wedged). A pulled id is skipped for 15 min, a failed
+        cancel retried after 5 s. Leaves the cycle heartbeat as it found it:
+        these cancels must never hide a wedged trading thread from the hang
+        watchdog. Returns the number cancelled."""
+        with self._quake_ask_lock:
+            return self._quake_ask_sweep_locked(now_ts)
+
+    def _quake_emsc_note(self, watch: Any, text: str, now_ts: float) -> Optional[dict]:
+        """One EMSC realtime message into the watch (usgs_quake_fair
+        .parse_emsc / update_emsc). A kept quake big enough to pull a far-strike
+        ask (the lowest ask strike - ASK_PULL_BELOW_MAG) is logged and the asks
+        are re-checked at once rather than on the refresher's next second.
+        Returns the parsed event, or None when the message is not one."""
+        import usgs_quake_fair as uqf
+        parsed = uqf.parse_emsc(text)
+        if parsed is None:
+            return None
+        action, ev = parsed
+        kept = watch.update_emsc(ev, now_ts)
+        if kept and QUAKE_ASK_STRIKES and \
+                ev["mag"] >= min(QUAKE_ASK_STRIKES) - uqf.ASK_PULL_BELOW_MAG - 1e-9:
+            log(f"{self.tag} quake EMSC {action or 'event'} M{ev['mag']:g} "
+                f"{ev['id']} ({ev['place']}) -- far-strike asks re-checked")
+            self._quake_ask_sweep(time.time())
+        return ev
+
+    def _quake_emsc_loop(self, watch: Any) -> None:
+        """The EMSC realtime reader (QUAKE_EMSC_ENABLE), on its own daemon
+        thread: one websocket (kalshi_ws.WSConnection, stdlib only), a ping
+        every QUAKE_EMSC_PING_SECS, redialled with capped backoff on any
+        failure or after QUAKE_EMSC_DEAD_SECS without a frame (not even a
+        pong). Each message goes through _quake_emsc_note. Never raises; a
+        failure is logged once until the feed is back."""
+        import socket as _socket
+        import kalshi_ws
+        import usgs_quake_fair as uqf
+        backoff, last_err = 5.0, None
+        while True:
+            conn = kalshi_ws.WSConnection(uqf.EMSC_WS_URL, timeout=5.0)
+            try:
+                conn.connect()
+                watch.emsc_alive(time.time())
+                log(f"{self.tag} quake: EMSC realtime feed "
+                    + ("back" if last_err else "connected"))
+                backoff, last_err, last_ping = 5.0, None, 0.0
+                while True:
+                    mono = time.monotonic()
+                    if mono - last_ping >= QUAKE_EMSC_PING_SECS:
+                        conn.ping(b"imm")
+                        last_ping = mono
+                    try:
+                        op, payload = conn.recv_message()
+                    except _socket.timeout:
+                        op = payload = None
+                    # a frame of any kind (pongs included) is a live feed
+                    watch.emsc_alive(time.time() - (time.monotonic() - conn.last_rx))
+                    if time.monotonic() - conn.last_rx > QUAKE_EMSC_DEAD_SECS:
+                        raise kalshi_ws.WSError(
+                            f"no frame for {QUAKE_EMSC_DEAD_SECS:g}s (not even a pong)")
+                    if op == kalshi_ws.OP_TEXT and payload:
+                        try:
+                            self._quake_emsc_note(
+                                watch, payload.decode("utf-8", "replace"), time.time())
+                        except Exception as e:
+                            log(f"{self.tag} ! quake EMSC message skipped: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+            except Exception as e:
+                err = f"{type(e).__name__}: {str(e)[:120]}"
+                if err != last_err:
+                    log(f"{self.tag} ! quake EMSC feed: {err}; redialling "
+                        f"(asks still pulled on GFZ / USGS)")
+                last_err = err
+            finally:
+                conn.close()
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 120.0)
+
+    def _quake_ask_sweep_locked(self, now_ts: float) -> int:
+        """_quake_ask_sweep's body (the caller holds _quake_ask_lock)."""
         for oid in [o for o, until in self._quake_ask_pulled.items()
                     if until < now_ts - 60]:
             self._quake_ask_pulled.pop(oid, None)
@@ -23526,6 +23615,10 @@ class IncentiveMarketMaker:
                     return
                 watch = uqf.QuakeWatch()
                 _quake_state["watch"] = watch
+                if QUAKE_EMSC_ENABLE and QUAKE_ASK_STRIKES:
+                    # EMSC's push feed, the asks' third trigger (2026-10-11)
+                    threading.Thread(target=self._quake_emsc_loop, args=(watch,),
+                                     daemon=True, name="quake-emsc").start()
                 due_u = due_g = due_s = 0.0
                 last = {"usgs": None, "gfz": None}
                 seen_det: Set[str] = set()
@@ -23956,6 +24049,13 @@ class IncentiveMarketMaker:
                 f"{QUAKE_USGS_POLL_SECS:g}s + GFZ every {QUAKE_GFZ_POLL_SECS:g}s, "
                 f"hold on a new quake until NEIC confirms, cutoff close-"
                 f"{QUAKE_CUTOFF_FROM_CLOSE_MIN}m, status {QUAKE_STATUS_FILE}")
+            if QUAKE_ASK_STRIKES:
+                log(f"quake far-strike asks: strikes "
+                    f"{','.join(f'{k:g}' for k in sorted(QUAKE_ASK_STRIKES))}, <= "
+                    f"{QUAKE_ASK_MAX_CONTRACTS} contracts each, TTL "
+                    f"{QUAKE_ASK_TTL_SECS}s, fill brake {QUAKE_ASK_FILL_BRAKE_MIN:g}m; "
+                    f"pulled on GFZ / USGS"
+                    + (" / EMSC realtime" if QUAKE_EMSC_ENABLE else ""))
         else:
             log("quake gate: OFF -- KXBIGGESTQUAKE not enrolled")
         if VERCEL_ENABLE:

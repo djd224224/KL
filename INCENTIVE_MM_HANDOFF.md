@@ -10324,3 +10324,43 @@ PROBLEM (the -$366 sweep day).
 Sources, all read-only: the dashboard D object, carbon_arc_fair.json and the
 vintages file, the day log, orders_<UTC date>.jsonl, and Kalshi public
 endpoints. Tests: test_send_ca_monitor.py (10).
+
+## 2026-10-11 ~03:15Z — quake far-strike asks: GFZ every 10s, and EMSC's realtime push feed as a third trigger (Jack: "poll GFZ every 10s instead of 20s, or add the faster EMSC feed" -> "implement")
+
+WHAT:
+- QUAKE_GFZ_POLL_SECS 20 -> 10 (IMM_QUAKE_GFZ_POLL_SECS). The GFZ FDSN query
+  is small (M4.8+, last 180 min); the bids' freeze reads the same feed.
+- EMSC realtime (wss://www.seismicportal.eu/standing_order/websocket): a
+  daemon thread "quake-emsc" (_quake_emsc_loop) holds one websocket through
+  kalshi_ws.WSConnection (stdlib, no new dependency), pings every
+  QUAKE_EMSC_PING_SECS 15, redials with 5s..120s backoff on any failure or
+  after QUAKE_EMSC_DEAD_SECS 60 without a frame (pongs count). Started by
+  the quake refresher once its watch exists, only while QUAKE_ASK_STRIKES is
+  set. IMM_QUAKE_EMSC=0 leaves it off.
+- Message (verified live 10/11 03:01Z, a Costa Rica M2.5 pushed ~4 min
+  after origin): {"action": "create"|"update", "data": {"id", "properties":
+  {"unid", "time", "mag", "magtype", "flynn_region", "lastupdate", ...}}}.
+  usgs_quake_fair.parse_emsc -> QuakeWatch.update_emsc keeps events from
+  EMSC_MIN_MAG 4.8 (a revision replaces the record, first sighting kept, so
+  a downgrade counts at once) and drops them EMSC_KEEP_MIN 180 after origin.
+- EMSC quakes count in ask_verdict exactly like GFZ's: detection (first seen
+  within the cool-off), pending (no confirmed NEIC match while news), and
+  emsc_near (inside the day within ASK_DAYMAX_GAP_MAG). A kept quake at or
+  over min(ask strikes) - ASK_PULL_BELOW_MAG (5.8) logs "quake EMSC create
+  M6.1 <unid> (<region>) -- far-strike asks re-checked" and runs the pull
+  right on the EMSC thread (_quake_ask_sweep, now under _quake_ask_lock:
+  two threads pull).
+- An ACCELERATOR only: EMSC down never turns the asks off (GFZ + USGS stay
+  the requirement), and EMSC never holds the bids (_open_detections is
+  unchanged). Status file: emsc_ok_age_s, emsc_events, emsc_max; knobs
+  emsc_min_mag / emsc_keep_min. Log: "quake: EMSC realtime feed connected"
+  / "back" / "! quake EMSC feed: <err>; redialling (asks still pulled on GFZ
+  / USGS)".
+
+NOTE (not changed): KXBIGGESTQUAKE-*-7.0 rarely enters -- its mid (~4c) is
+under the fresh-entry mid band (MID_BAND_LO 5c), "extreme_mid". 6.6 / 6.8
+admitted at ~$6.2 / $6.4/day est on 10/11 02:55Z. Letting 7.0 in is Jack's
+call (it is the strike whose pick-off costs ~95c a contract).
+
+Tests: TestEmscFeed (5), TestQuakeFarStrikeAsks +2; test_incentive_mm +
+test_usgs_quake_fair 1236 OK.

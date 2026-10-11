@@ -34,6 +34,8 @@ Feeds (both official, polled from incentive_mm's refresher thread):
   GFZ   geofon.gfz.de/fdsnws/event/1/query (the GEOFON FDSN event service;
         earthquake products CC BY 4.0 -- source: GEOFON data centre, GFZ
         Helmholtz Centre for Geosciences)
+  EMSC  wss://www.seismicportal.eu/standing_order/websocket (pushed, read on
+        its own thread; far-strike asks only -- see EMSC_MIN_MAG)
 
 The EARLY WARNING (Jack 2026-09-27: "also use GFZ data"): a new M >= 4.8
 detection on either feed FREEZES the quake markets -- resting bids are held
@@ -61,6 +63,10 @@ USGS_URL = os.environ.get(
     "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson")
 GFZ_URL = os.environ.get(
     "IMM_QUAKE_GFZ_URL", "https://geofon.gfz.de/fdsnws/event/1/query")
+# EMSC's realtime push feed (seismicportal.eu): one JSON message per new or
+# revised event, the moment EMSC publishes it -- often minutes before GFZ.
+EMSC_WS_URL = os.environ.get(
+    "IMM_QUAKE_EMSC_URL", "wss://www.seismicportal.eu/standing_order/websocket")
 HTTP_TIMEOUT = 20
 USER_AGENT = "KL-IMM-quake-gate/1.0"
 
@@ -127,6 +133,16 @@ ASK_MARGIN_CENTS = _env_float("IMM_QUAKE_ASK_MARGIN_CENTS", 1.0)
 ASK_PULL_BELOW_MAG = _env_float("IMM_QUAKE_ASK_PULL_BELOW_MAG", 0.8)
 ASK_DAYMAX_GAP_MAG = _env_float("IMM_QUAKE_ASK_DAYMAX_GAP_MAG", 0.4)
 ASK_COOLOFF_MIN = _env_float("IMM_QUAKE_ASK_COOLOFF_MIN", 30)
+# EMSC, THE THIRD TRIGGER (Jack 2026-10-11: "poll GFZ every 10s instead of
+# 20s, or add the faster EMSC feed" -> "implement"). EMSC's realtime
+# websocket pushes each event as EMSC publishes it (update_emsc); its quakes
+# count in ask_verdict exactly like GFZ's (detection / pending / near the day
+# max). It is an ACCELERATOR only: a dead EMSC connection never turns an ask
+# off (GFZ + USGS stay the requirement) and it never holds the bids. Events
+# under EMSC_MIN_MAG are not kept; kept ones are dropped EMSC_KEEP_MIN after
+# their origin.
+EMSC_MIN_MAG = _env_float("IMM_QUAKE_EMSC_MIN_MAG", 4.8)
+EMSC_KEEP_MIN = _env_float("IMM_QUAKE_EMSC_KEEP_MIN", 180)
 
 
 def lam_eff(k: float) -> Optional[float]:
@@ -235,6 +251,27 @@ def parse_gfz(text: str) -> List[dict]:
     return out
 
 
+def parse_emsc(text) -> Optional[Tuple[str, dict]]:
+    """(action, event) from one EMSC realtime message --
+    {"action": "create"|"update", "data": {"properties": {"unid", "time",
+    "mag", "magtype", "flynn_region", ...}}} -- or None when it is not a
+    usable event (no id / time / finite magnitude, or not JSON)."""
+    try:
+        msg = json.loads(text)
+        data = msg.get("data") or {}
+        p = data.get("properties") or {}
+        eid = str(p.get("unid") or data.get("id") or "").strip()
+        mag = float(p["mag"])
+        t = _iso_ts(str(p.get("time") or ""))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if not eid or t is None or not math.isfinite(mag):
+        return None
+    return (str(msg.get("action") or ""),
+            {"id": eid, "mag": mag, "mag_type": str(p.get("magtype") or ""),
+             "time": t, "place": str(p.get("flynn_region") or "")[:80]})
+
+
 def fetch_usgs(timeout: float = HTTP_TIMEOUT) -> Tuple[Optional[float], List[dict]]:
     r = requests.get(USGS_URL, headers={"User-Agent": USER_AGENT},
                      timeout=timeout)
@@ -267,6 +304,8 @@ class QuakeWatch:
         self.usgs_ok: Optional[float] = None       # last successful USGS read
         self.usgs_generated: Optional[float] = None
         self.gfz_ok: Optional[float] = None        # last successful GFZ read
+        self.emsc: Dict[str, dict] = {}
+        self.emsc_ok: Optional[float] = None       # last EMSC frame (or pong)
         self.created = time.time()
 
     # -- updates -----------------------------------------------------------
@@ -319,6 +358,30 @@ class QuakeWatch:
                 fresh[e["id"]] = rec
             self.gfz = fresh
             self.gfz_ok = now_ts
+
+    def update_emsc(self, event: dict, now_ts: float) -> bool:
+        """One pushed EMSC event (parse_emsc). A revision replaces the record
+        (first sighting kept), so a downgrade counts as soon as it lands; a
+        new event under EMSC_MIN_MAG is not kept. Prunes events older than
+        EMSC_KEEP_MIN. True when the event is (now) kept."""
+        with self._lock:
+            old = self.emsc.get(event["id"])
+            self.emsc_ok = now_ts
+            for eid in [i for i, e in self.emsc.items()
+                        if now_ts - e["time"] > EMSC_KEEP_MIN * 60]:
+                del self.emsc[eid]
+            if old is None and (event["mag"] < EMSC_MIN_MAG
+                                or now_ts - event["time"] > EMSC_KEEP_MIN * 60):
+                return False
+            rec = dict(event)
+            rec["first_seen"] = old["first_seen"] if old else now_ts
+            self.emsc[event["id"]] = rec
+            return True
+
+    def emsc_alive(self, now_ts: float) -> None:
+        """The EMSC connection delivered a frame (a message or a pong)."""
+        with self._lock:
+            self.emsc_ok = now_ts
 
     # -- reads (callers hold the lock) --------------------------------------
     def _usgs_fresh(self, now_ts: float) -> bool:
@@ -465,24 +528,26 @@ class QuakeWatch:
             thr = k - ASK_PULL_BELOW_MAG - 1e-9
             cool = ASK_COOLOFF_MIN * 60
             news = NEWS_MAX_AGE_MIN * 60
-            for src, evs in (("usgs", self.usgs), ("gfz", self.gfz)):
+            for src, evs in (("usgs", self.usgs), ("gfz", self.gfz),
+                             ("emsc", self.emsc)):
                 for e in evs.values():
                     if e["mag"] < thr:
                         continue
                     tag = (f"M{e['mag']:g} {src} {e['id']} "
                            f"(>= {k:g} - {ASK_PULL_BELOW_MAG:g})")
-                    if src == "gfz" and e["mag"] >= near \
+                    if src != "usgs" and e["mag"] >= near \
                             and day_start_ts <= e["time"] < day_start_ts + 86400.0:
-                        return off("gfz_near", f"GFZ shows {tag} inside the day",
-                                   quake=e["id"], mag=e["mag"])
+                        return off(f"{src}_near",
+                                   f"{src.upper()} shows {tag} inside the day",
+                                   quake=e["id"], mag=e["mag"], src=src)
                     if now_ts - self._freeze_start(e) <= cool:
                         return off("detection", f"{tag} seen under "
                                    f"{ASK_COOLOFF_MIN:g} min ago",
-                                   quake=e["id"], mag=e["mag"])
+                                   quake=e["id"], mag=e["mag"], src=src)
                     cp = e if src == "usgs" else self._match_usgs(e["time"])
                     if now_ts - e["time"] <= news and not self._confirmed(cp, now_ts):
                         return off("pending", f"{tag} not confirmed by NEIC yet",
-                                   quake=e["id"], mag=e["mag"])
+                                   quake=e["id"], mag=e["mag"], src=src)
             fair = p_yes(k, day_start_ts, now_ts, GFZ_LAG_H)
             if fair is None:
                 return off("no_model", f"no rate model for M{k:g}")
@@ -510,7 +575,10 @@ class QuakeWatch:
                 "usgs_generated_age_s": (None if self.usgs_generated is None
                                          else round(now_ts - self.usgs_generated)),
                 "gfz_ok_age_s": None if self.gfz_ok is None else round(now_ts - self.gfz_ok),
+                "emsc_ok_age_s": None if self.emsc_ok is None else round(now_ts - self.emsc_ok),
                 "usgs_events": len(self.usgs), "gfz_events": len(self.gfz),
+                "emsc_events": len(self.emsc),
+                "emsc_max": max((e["mag"] for e in self.emsc.values()), default=None),
                 "today_max": None if top is None else {
                     k: top[k] for k in ("id", "mag", "mag_type", "net", "place")},
                 "open_detections": det,
@@ -528,7 +596,9 @@ class QuakeWatch:
                           "ask_margin_cents": ASK_MARGIN_CENTS,
                           "ask_pull_below_mag": ASK_PULL_BELOW_MAG,
                           "ask_daymax_gap_mag": ASK_DAYMAX_GAP_MAG,
-                          "ask_cooloff_min": ASK_COOLOFF_MIN},
+                          "ask_cooloff_min": ASK_COOLOFF_MIN,
+                          "emsc_min_mag": EMSC_MIN_MAG,
+                          "emsc_keep_min": EMSC_KEEP_MIN},
             }
 
 

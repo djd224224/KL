@@ -4,6 +4,7 @@ import math
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import usgs_quake_fair as q
@@ -356,6 +357,84 @@ class TestAskVerdict(unittest.TestCase):
         v = w.ask_verdict(7.0, DAY, now)
         self.assertTrue(v["ok"])
         self.assertEqual(v["floor_c"], 2)                 # ~0.6c fair + 1c, rounded up
+
+
+def emsc_msg(unid, mag, t, action="create", region="SOMEWHERE"):
+    """One message as EMSC's realtime websocket pushes it."""
+    iso = datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-5] + "Z"
+    return json.dumps({"action": action, "data": {
+        "type": "Feature", "id": unid,
+        "geometry": {"type": "Point", "coordinates": [140.1, 35.2, -10.0]},
+        "properties": {"source_id": "1", "source_catalog": "EMSC-RTS",
+                       "lastupdate": iso, "time": iso, "flynn_region": region,
+                       "lat": 35.2, "lon": 140.1, "depth": 10.0, "evtype": "ke",
+                       "auth": "EMSC", "mag": mag, "magtype": "mb", "unid": unid}}})
+
+
+class TestEmscFeed(unittest.TestCase):
+    """EMSC's realtime push feed, the far-strike asks' third trigger (Jack
+    2026-10-11: "poll GFZ every 10s instead of 20s, or add the faster EMSC
+    feed" -> "implement"): parsed, kept from EMSC_MIN_MAG, and counted in
+    ask_verdict like GFZ -- never in the bids' freeze."""
+
+    def test_parse(self):
+        now = DAY + 12 * H
+        action, ev = q.parse_emsc(emsc_msg("20261011_0000123", 6.1, now - 90.5))
+        self.assertEqual(action, "create")
+        self.assertEqual((ev["id"], ev["mag"], ev["mag_type"], ev["place"]),
+                         ("20261011_0000123", 6.1, "mb", "SOMEWHERE"))
+        self.assertAlmostEqual(ev["time"], now - 90.5, places=1)
+        self.assertIsNone(q.parse_emsc("not json"))
+        self.assertIsNone(q.parse_emsc(json.dumps({"action": "create"})))
+        self.assertIsNone(q.parse_emsc(emsc_msg("x", "nan", now)))
+        bad = json.loads(emsc_msg("x", 5.0, now))
+        bad["data"]["properties"]["time"] = ""
+        self.assertIsNone(q.parse_emsc(json.dumps(bad)))
+
+    def test_kept_from_the_floor_revised_in_place_and_pruned(self):
+        now = DAY + 12 * H
+        w = _watch(now)
+        self.assertFalse(w.update_emsc(q.parse_emsc(emsc_msg("e0", 3.2, now))[1], now))
+        self.assertTrue(w.update_emsc(q.parse_emsc(emsc_msg("e1", 6.0, now - 60))[1], now))
+        self.assertEqual(w.emsc_ok, now)
+        # a revision (even under the floor) replaces it, first sighting kept
+        later = now + 120
+        self.assertTrue(w.update_emsc(
+            q.parse_emsc(emsc_msg("e1", 4.5, now - 60, action="update"))[1], later))
+        self.assertEqual((w.emsc["e1"]["mag"], w.emsc["e1"]["first_seen"]), (4.5, now))
+        gone = now - 60 + q.EMSC_KEEP_MIN * 60 + 1
+        w.update_emsc(q.parse_emsc(emsc_msg("e2", 5.0, gone - 10))[1], gone)
+        self.assertNotIn("e1", w.emsc)
+        self.assertIn("e2", w.emsc)
+
+    def test_an_emsc_quake_pulls_the_ask_like_gfz_and_never_holds_bids(self):
+        now = DAY + 12 * H
+        w = _watch(now)
+        w.update_emsc(q.parse_emsc(emsc_msg("e1", 5.9, now - 60))[1], now)
+        v = w.ask_verdict(6.6, DAY, now)
+        self.assertEqual((v["ok"], v["reason"], v["src"]), (False, "detection", "emsc"))
+        self.assertTrue(w.ask_verdict(7.0, DAY, now)["ok"])          # 5.9 < 6.2
+        self.assertEqual(w.verdict(6.6, DAY, now)["action"], "quote")  # bids untouched
+        # revised down under the pull line: the ask is back at once
+        w.update_emsc(q.parse_emsc(emsc_msg("e1", 5.5, now - 60, "update"))[1], now + 30)
+        self.assertTrue(w.ask_verdict(6.6, DAY, now + 30)["ok"])
+
+    def test_an_emsc_number_near_the_strike_inside_the_day(self):
+        now = DAY + 12 * H
+        w = _watch(now)
+        w.update_emsc(q.parse_emsc(emsc_msg("e1", 6.3, now - H))[1], now)
+        v = w.ask_verdict(6.6, DAY, now)
+        self.assertEqual((v["reason"], v["src"]), ("emsc_near", "emsc"))
+        self.assertEqual(w.ask_verdict(6.8, DAY, now)["reason"], "pending")   # no NEIC match
+
+    def test_status_reports_emsc(self):
+        now = DAY + 12 * H
+        w = _watch(now)
+        w.update_emsc(q.parse_emsc(emsc_msg("e1", 5.6, now - 60))[1], now)
+        snap = w.snapshot(now + 5)
+        self.assertEqual((snap["emsc_events"], snap["emsc_max"], snap["emsc_ok_age_s"]),
+                         (1, 5.6, 5))
+        self.assertIn("emsc_min_mag", snap["knobs"])
 
 
 if __name__ == "__main__":
