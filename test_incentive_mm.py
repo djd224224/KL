@@ -1635,8 +1635,11 @@ class TestScreen(unittest.TestCase):
                 "KXTORONTOMAYOR", "KXTORONTOMAYOR-X", None))
 
         # guards: a pattern member and a list member both clone the archetype
-        # on first sight -- the 1-99c band, nothing else (safe-join OFF since
-        # Jack's "optimizing for rewards like the IMM bot" -- at-ref placement)
+        # on first sight -- the 1-99c band and the family x2 (Jack
+        # 2026-10-11: "yes double elections"), nothing else (safe-join OFF
+        # since Jack's "optimizing for rewards like the IMM bot" -- at-ref
+        # placement)
+        self.assertEqual(imm.ELECTION_SIZE_MULT, 2.0)
         for s in ("KXCOLLINCOUNTYJUDGE", "KXSAARLAND"):
             imm.SERIES_OVERRIDES.pop(s, None)
         try:
@@ -1647,7 +1650,14 @@ class TestScreen(unittest.TestCase):
                 self.assertEqual(imm.member_price_band(s, False), (1, 99))
                 self.assertEqual(imm.member_price_band(s, True), (1, 99))
                 self.assertFalse(imm.series_safe_join(s))
-                self.assertEqual(imm.applied_mention_mult(s), 1.0)
+                # x2 on the global geometry: rungs, the per-market and the
+                # per-event caps together; the yield x1.5 never applies
+                self.assertEqual(imm.applied_mention_mult(s), 2.0)
+                self.assertEqual(imm.series_max_position(s),
+                                 2.0 * imm.MAX_POSITION_CONTRACTS)
+                self.assertEqual(imm.event_cap_contracts(s + "-26"),
+                                 2.0 * imm.MAX_EVENT_CONTRACTS)
+                self.assertFalse(imm.yield_size_eligible(s))
                 self.assertEqual(imm.series_min_est_total(s),
                                  imm.MIN_EST_TOTAL_DOLLARS)
                 self.assertEqual(imm.event_top_n_for(s), 0)

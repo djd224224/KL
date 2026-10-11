@@ -6544,11 +6544,30 @@ def nfl_ffpts_series(series: str) -> bool:
 # tight touch. Off, the family places exactly like the default book:
 # at-ref, the deepest full-weight price. Knobs IMM_ELECTION_PRICE_MIN /
 # _MAX; IMM_ELECTION_SAFE_JOIN=1 puts safe-join back.
+#
+# THE WHOLE FAMILY x2 (Jack 2026-10-11: "are elections worth doubling
+# size?" -> "yes double elections, re-score 10/18"). Since 9/29: ~$890
+# credited vs -$315 trading at 4h mark-outs (+$575, 65% kept); the 7-day
+# dashboard at full marks kept 43% (+$249). Our median share of a market's
+# scored book is ~0.6%, so x2 roughly doubles the reward -- and the
+# whole-rung fills that carry all of the loss (-$348 at 4h on 11.6k of
+# 14.9k contracts; partial fills +$5) double with it, so the net about
+# doubles too. The cost: ~$3.2k of election inventory, held to the vote,
+# goes to ~$6.3k, and the family worst case ~$2.1k -> ~$4.1k. Rides the
+# family size_mult wire (every member clones this override): rungs, the
+# per-market cap (100 -> 200) and the per-event cap scale together, and the
+# estimator projects the doubled ladder against the payout floor (15 of 54
+# floored markets clear it, the 11 newer KXSTATELEG chambers among them).
+# Elections never took the yield x1.5. IMM_ELECTION_SIZE_MULT=1 reverts
+# (env => task-level restart). Re-scored by imm_election_x2_rescore.py on
+# 10/18 (emailed).
+ELECTION_SIZE_MULT = _env_float("IMM_ELECTION_SIZE_MULT", 2.0)
 ELECTION_ARCHETYPE = "KXBEXARCOUNTYJUDGE"
 SERIES_OVERRIDES[ELECTION_ARCHETYPE] = SeriesOverride(
     safe_join=os.environ.get("IMM_ELECTION_SAFE_JOIN", "0") == "1",
     price_min_cents=_env_int("IMM_ELECTION_PRICE_MIN", 1),
-    price_max_cents=_env_int("IMM_ELECTION_PRICE_MAX", 99))
+    price_max_cents=_env_int("IMM_ELECTION_PRICE_MAX", 99),
+    size_mult=ELECTION_SIZE_MULT)
 
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
@@ -7825,6 +7844,7 @@ _CONFIG_CODE_KNOBS = (
     # election family: membership, the election-day table (2026-09-28)
     "ELECTION_ALLOW", "ELECTION_SERIES", "ELECTION_SERIES_PATTERNS",
     "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
+    "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
