@@ -24259,6 +24259,16 @@ class TestWedgeStacks(unittest.TestCase):
         self.assertFalse(self.bot._hang_watchdog_tick({}, time.time(), late=3.0))
         self.assertEqual(self.lines, [])
 
+    def test_a_stall_line_carries_the_free_ram(self):
+        # PRIORITY + MEMORY (2026-10-11): a stall lined up with the RAM left
+        self.bot._heartbeat = time.time()
+        with mock.patch.object(imm, "_read_memory_status",
+                               return_value=(230, 16076, 49000, 57500)):
+            self.bot._hang_watchdog_tick({}, time.time(), late=95.0)
+        self.assertTrue(any("whole process stalled" in s and "paged out" in s
+                            and "; free RAM 0.2 of 15.7GB, 48 of 56GB committed" in s
+                            for s in self.lines), self.lines)
+
     def test_a_stalled_disk_delays_the_exit_by_the_io_bound_only(self):
         b, gate = self.bot, _threading.Event()
         self.addCleanup(gate.set)
@@ -24886,7 +24896,6 @@ class TestPowerHelpers(unittest.TestCase):
         self.assertEqual(len(lines), 3, lines)
         self.assertIn("power: on AC power (80%)", lines[0])
         self.assertIn("power: on BATTERY (79%)", lines[1])
-        self.assertIn("plug in", lines[1])
         self.assertIn("battery saver ON", lines[2])
         self.assertEqual((imm._power_state["ac"], imm._power_state["pct"]), (False, 70))
 
@@ -24909,6 +24918,106 @@ class TestPowerHelpers(unittest.TestCase):
     def test_the_throttling_opt_out_can_be_turned_off(self):
         with mock.patch.dict(os.environ, {"IMM_NO_POWER_THROTTLING": "0"}):
             self.assertFalse(imm._no_power_throttling())
+
+    # PRIORITY + MEMORY (Jack 2026-10-11): normal priorities at start; a spell
+    # of low RAM logged once, and its end
+    def test_normal_priority_can_be_turned_off(self):
+        with mock.patch.dict(os.environ, {"IMM_NORMAL_PRIORITY": "0"}):
+            self.assertIsNone(imm._normal_priority())
+
+    @unittest.skipUnless(os.name == "nt", "Windows process priorities")
+    def test_normal_priority_raises_the_task_schedulers_low_ones(self):
+        before = _proc_prios()
+        self.addCleanup(_set_proc_prios, *before)
+        _set_proc_prios(0x4000, 2, 1)       # how the Task Scheduler task starts it
+        with mock.patch.object(imm, "log") as lg:
+            got = imm._normal_priority()
+        self.assertEqual(got, {"cpu": "below normal -> normal", "memory": "2 -> 5",
+                               "io": "low -> normal"})
+        self.assertEqual(_proc_prios(), (0x20, 5, 2))
+        self.assertIn("process priority: CPU below normal -> normal, memory 2 -> 5, "
+                      "I/O low -> normal", lg.call_args[0][0])
+        self.assertEqual(imm._power_state["priority"]["io"], "low -> normal")
+
+    @unittest.skipUnless(os.name == "nt", "Windows process priorities")
+    def test_normal_priority_never_lowers_one(self):
+        before = _proc_prios()
+        self.addCleanup(_set_proc_prios, *before)
+        _set_proc_prios(0x8000, 5, 2)       # above normal stays above normal
+        with mock.patch.object(imm, "log"):
+            got = imm._normal_priority()
+        self.assertEqual(got, {"cpu": "above normal", "memory": "5", "io": "normal"})
+        self.assertEqual(_proc_prios(), (0x8000, 5, 2))
+
+    def test_a_low_ram_spell_is_logged_once_and_its_end(self):
+        readings = iter([(3000, 16000, 40000, 60000), (300, 16000, 49000, 60000),
+                         (200, 16000, 49000, 60000), (800, 16000, 49000, 60000),
+                         (1500, 16000, 45000, 60000)])
+        lines = []
+        with mock.patch.object(imm, "log", side_effect=lines.append):
+            for _ in range(5):
+                imm._memory_check(read=lambda: next(readings))
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("memory: LOW -- free RAM 0.3 of 15.6GB, 48 of 59GB committed",
+                      lines[0])
+        self.assertIn("memory: ok again -- free RAM 1.5 of 15.6GB", lines[1])
+        self.assertEqual(imm._power_state["memory"]["free_mb"], 1500)
+        self.assertFalse(imm._power_state["memory"]["low"])
+
+    def test_a_failed_ram_read_changes_nothing(self):
+        def boom():
+            raise OSError("no memory API")
+        with mock.patch.object(imm, "log") as lg:
+            imm._memory_check(read=boom)
+            imm._memory_check(read=lambda: None)
+        lg.assert_not_called()
+        self.assertEqual(imm._power_state, {})
+        self.assertEqual(imm._memory_note(read=lambda: None), "")
+
+    def test_the_status_carries_the_ram_reading(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "log"):
+            imm._memory_check(read=lambda: (300, 16000, 49000, 60000))
+        mem = bot._latency_status()["power"]["memory"]
+        self.assertEqual((mem["free_mb"], mem["low"]), (300, True))
+
+
+def _proc_prios():
+    """(CPU priority class, memory priority, I/O priority) of this process."""
+    import ctypes
+    from ctypes import wintypes
+    k32, nt = ctypes.WinDLL("kernel32"), ctypes.WinDLL("ntdll")
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+    k32.GetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                          ctypes.c_void_p, wintypes.DWORD]
+    nt.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                             ctypes.c_void_p, wintypes.ULONG,
+                                             ctypes.c_void_p]
+    me = k32.GetCurrentProcess()
+    mp, io = wintypes.ULONG(0), wintypes.ULONG(0)
+    k32.GetProcessInformation(me, 0, ctypes.byref(mp), 4)
+    nt.NtQueryInformationProcess(me, 33, ctypes.byref(io), 4, None)
+    return int(k32.GetPriorityClass(me)), int(mp.value), int(io.value)
+
+
+def _set_proc_prios(cpu, mem, io):
+    import ctypes
+    from ctypes import wintypes
+    k32, nt = ctypes.WinDLL("kernel32"), ctypes.WinDLL("ntdll")
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                          ctypes.c_void_p, wintypes.DWORD]
+    nt.NtSetInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                           ctypes.c_void_p, wintypes.ULONG]
+    me = k32.GetCurrentProcess()
+    k32.SetPriorityClass(me, cpu)
+    v = wintypes.ULONG(mem)
+    k32.SetProcessInformation(me, 0, ctypes.byref(v), 4)
+    v = wintypes.ULONG(io)
+    nt.NtSetInformationProcess(me, 33, ctypes.byref(v), 4)
 
 
 if __name__ == "__main__":

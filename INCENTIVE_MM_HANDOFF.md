@@ -10375,3 +10375,50 @@ lines: 6.2 on M5.4+, 6.4 on M5.6+ (the EMSC thread logs / sweeps from M5.4).
 6.0 and below stay out (break-even at best; their asks would sit out most of
 the day). Worst day with 6.2-6.8 live: ~$350 if every ask were lifted before
 the pull (was ~$180). Re-judge 6.0 after ~a week of fills vs quakes.
+
+## 2026-10-11 ~13:45Z — normal process priorities at start; the laptop's free RAM logged (Jack: "plugged in, i thought this was fixed")
+
+WHY. The bot froze again at 10/11 13:07:34-13:17:20Z, with no cycles and the
+watchdog logging "a 30s tick took 72s", then 144s. A 401
+header_timestamp_expired (signed, then frozen before the send) and WS "no
+frames" followed. It was not the network fix failing, and not the battery.
+- Each whole-process stall on 10/11 came just after the laptop left Modern
+  Standby (Kernel-Power 507): 00:26:48Z on AC (72s stall), 01:08:41Z (192s),
+  and 13:07:36Z. The last was unplugging after 9h asleep, and the laptop was
+  back on AC 13:07:53-13:14:05Z, mid-freeze.
+- The laptop is short of RAM. At 13:24Z: 0.2GB free of 15.7GB, 49 of 60GB
+  committed, ~5,400 page reads/s. 34 claude processes held 13GB committed
+  (3.6GB in RAM), 26 chrome 8.6GB (3.6GB), and 78 powershell 4.9GB. About 45
+  of those are idle leftover crypto launchers from the 10/4, 10/7 and 10/10
+  relaunches, with one bot per asset still running.
+- The Task Scheduler task starts the bot at priority 7: CPU below normal,
+  memory priority 2 (of 5), I/O priority low. When standby ends every app
+  wakes at once, and the bot's pages are trimmed first and read back last. A
+  hard page fault inside code holding the GIL stops every thread, the
+  watchdog's included.
+- Scratch A/B under that pressure (touch 400MB, then idle):
+  - Normal priorities read it back in 1.7s, against 4.1s at the task's.
+  - A hard working-set minimum (SetProcessWorkingSetSizeEx, 300MB) did NOT
+    hold: trimmed to 14MB, like the control. So the bot sets none.
+
+WHAT:
+- _normal_priority() once at start, after _no_power_throttling(). Where they
+  are below normal it raises CPU to NORMAL_PRIORITY_CLASS, memory priority to
+  5 and I/O priority to normal. It never lowers one.
+  - Logs "process priority: CPU below normal -> normal, memory 2 -> 5, I/O
+    low -> normal (...)".
+  - Status power.priority.
+  - IMM_NORMAL_PRIORITY=0 leaves them as started.
+- _memory_check() every cycle, after _power_check().
+  - Status power.memory {free_mb, total_mb, committed_mb, commit_limit_mb, low}.
+  - Logs "memory: LOW -- free RAM x of yGB, a of bGB committed; ..." once per
+    spell under MEM_LOW_MB = 512, and "memory: ok again" back over
+    MEM_OK_MB = 1024.
+- The watchdog's stall line now ends with "; free RAM x of yGB, a of bGB
+  committed", and its hint names being paged out for want of RAM.
+- The battery switch line drops its "plug in" hint. Jack set the Wi-Fi to
+  Maximum Performance on battery on 10/11.
+- MACHINE (Jack's): free RAM. Close Claude sessions and Chrome tabs not in
+  use. The leftover crypto launchers are a separate cleanup.
+
+Tests: TestPowerHelpers +6, the watchdog stall-line test. test_incentive_mm 1224 OK.

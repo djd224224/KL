@@ -8116,8 +8116,8 @@ def _keep_awake() -> None:
 # _power_check logs each switch between AC and battery (and battery saver) and
 # feeds the status file's `power`, so a hang can be lined up with the power
 # source. On battery the Wi-Fi adapter's power plan setting (Medium Power
-# Saving on this laptop) is what degrades the network; the bot cannot change
-# that -- Jack's to set (Power Options > Wireless Adapter Settings).
+# Saving on this laptop) is what degraded the network; the bot cannot change
+# that. Jack set it to Maximum Performance on 10/11 (powercfg DC index 0).
 _power_state: Dict[str, Any] = {}
 
 
@@ -8149,6 +8149,170 @@ def _no_power_throttling() -> bool:
     log(f"[IMM] power throttling (EcoQoS) for this process: "
         + ("OFF -- full speed on battery" if ok else "could not be turned off"))
     return ok
+
+
+# PRIORITY + MEMORY (Jack 2026-10-11: "plugged in, i thought this was fixed").
+# The Task Scheduler task starts the bot at its default priority 7: CPU below
+# normal, memory priority 2 (of 5) and I/O priority low. This 16GB laptop runs
+# short of RAM (10/11 13:24Z: 0.2GB free, 49 of 60GB committed, ~5,400 page
+# reads/s), so Windows trims every working set hard and the bot's pages are
+# the last to come back. Leaving Modern Standby wakes every app at once, and
+# each time on 10/11 the bot then froze for minutes ("a 30s tick took 72s" at
+# 00:28Z on AC, 192s at 01:18Z, 72s + 144s at 13:11-13:16Z): a hard page fault
+# inside code that holds the GIL stops every thread. _normal_priority raises
+# all three to normal, once at start (IMM_NORMAL_PRIORITY=0 leaves them). In a
+# scratch A/B under that pressure a process at normal priority read 400MB back
+# in 1.7s, against 4.1s at the task's priorities. A hard working-set minimum
+# did NOT hold there (trimmed to 14MB like the control), so none is set.
+# _memory_check logs the laptop going short of RAM and back (status
+# power.memory), and the watchdog's stall line carries the free RAM, so the
+# next stall can be lined up with it. Freeing RAM is Jack's (close idle apps).
+MEM_LOW_MB = 512    # free RAM below this: "memory: LOW" (once per spell)
+MEM_OK_MB = 1024    # ...and back above this: "memory: ok again"
+
+
+def _normal_priority() -> Optional[Dict[str, str]]:
+    """Raise this process's CPU priority class, memory priority and I/O
+    priority to normal where they are below it (never lowers one). Returns
+    {"cpu", "memory", "io"} -> "<was> -> <now>" / "<as is>" / "failed", or
+    None off Windows / when turned off. Logs one line. Never raises."""
+    if sys.platform != "win32" or os.environ.get("IMM_NORMAL_PRIORITY", "1") != "1":
+        return None
+    out = {"cpu": "failed", "memory": "failed", "io": "failed"}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        H = wintypes.HANDLE
+        # private handles: typed arguments (the pseudo-handle -1 overflows
+        # ctypes' default int) without touching windll's shared ones
+        k32 = ctypes.WinDLL("kernel32")
+        nt = ctypes.WinDLL("ntdll")
+        k32.GetCurrentProcess.restype = H
+        k32.GetPriorityClass.argtypes = [H]
+        k32.GetPriorityClass.restype = wintypes.DWORD
+        k32.SetPriorityClass.argtypes = [H, wintypes.DWORD]
+        k32.SetPriorityClass.restype = wintypes.BOOL
+        for f in (k32.GetProcessInformation, k32.SetProcessInformation):
+            f.argtypes = [H, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            f.restype = wintypes.BOOL
+        nt.NtQueryInformationProcess.argtypes = [H, ctypes.c_int, ctypes.c_void_p,
+                                                 wintypes.ULONG, ctypes.c_void_p]
+        nt.NtQueryInformationProcess.restype = ctypes.c_long
+        nt.NtSetInformationProcess.argtypes = [H, ctypes.c_int, ctypes.c_void_p,
+                                               wintypes.ULONG]
+        nt.NtSetInformationProcess.restype = ctypes.c_long
+        me = k32.GetCurrentProcess()
+    except Exception:
+        log("[IMM] process priority: could not be read")
+        return out
+    cpu_names = {0x40: "idle", 0x4000: "below normal", 0x20: "normal",
+                 0x8000: "above normal", 0x80: "high", 0x100: "realtime"}
+    try:    # CPU: idle / below normal -> NORMAL_PRIORITY_CLASS
+        pc = int(k32.GetPriorityClass(me))
+        if pc in (0x40, 0x4000):
+            out["cpu"] = (f"{cpu_names[pc]} -> normal" if k32.SetPriorityClass(me, 0x20)
+                          else f"{cpu_names[pc]} (raise failed)")
+        elif pc:
+            out["cpu"] = cpu_names.get(pc, hex(pc))
+    except Exception:
+        pass
+    try:    # memory priority (ProcessMemoryPriority = 0): 0..5, 5 = normal
+        v = wintypes.ULONG(0)
+        if k32.GetProcessInformation(me, 0, ctypes.byref(v), 4):
+            was = int(v.value)
+            if was < 5:
+                v = wintypes.ULONG(5)
+                out["memory"] = (f"{was} -> 5" if k32.SetProcessInformation(
+                    me, 0, ctypes.byref(v), 4) else f"{was} (raise failed)")
+            else:
+                out["memory"] = str(was)
+    except Exception:
+        pass
+    io_names = {0: "very low", 1: "low", 2: "normal", 3: "high"}
+    try:    # I/O priority (ProcessIoPriority = 33): 0 very low, 1 low, 2 normal
+        v = wintypes.ULONG(9)
+        if nt.NtQueryInformationProcess(me, 33, ctypes.byref(v), 4, None) == 0:
+            was = int(v.value)
+            if was < 2:
+                v = wintypes.ULONG(2)
+                out["io"] = (f"{io_names[was]} -> normal"
+                             if nt.NtSetInformationProcess(me, 33, ctypes.byref(v), 4) == 0
+                             else f"{io_names[was]} (raise failed)")
+            else:
+                out["io"] = io_names.get(was, str(was))
+    except Exception:
+        pass
+    _power_state["priority"] = dict(out)
+    log(f"[IMM] process priority: CPU {out['cpu']}, memory {out['memory']}, "
+        f"I/O {out['io']} (the Task Scheduler task starts it low, and a low one "
+        f"is paged out first when the laptop runs short of RAM)")
+    return out
+
+
+def _read_memory_status() -> Optional[Tuple[int, int, int, int]]:
+    """(free RAM MB, total RAM MB, committed MB, commit limit MB) from
+    GlobalMemoryStatusEx, or None off Windows / on failure."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _MSX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = _MSX()
+        m.dwLength = ctypes.sizeof(m)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return None
+    except Exception:
+        return None
+    mb = 2 ** 20
+    return (int(m.ullAvailPhys // mb), int(m.ullTotalPhys // mb),
+            int((m.ullTotalPageFile - m.ullAvailPageFile) // mb),
+            int(m.ullTotalPageFile // mb))
+
+
+def _memory_note(read: Optional[Callable[[], Optional[tuple]]] = None) -> str:
+    """'free RAM 0.2 of 15.7GB, 48 of 59GB committed', or '' when unknown.
+    Never raises."""
+    try:
+        r = (read or _read_memory_status)()
+        free, total, used, limit = r
+    except Exception:
+        return ""
+    return (f"free RAM {free / 1024:.1f} of {total / 1024:.1f}GB, "
+            f"{used / 1024:.0f} of {limit / 1024:.0f}GB committed")
+
+
+def _memory_check(read: Optional[Callable[[], Optional[tuple]]] = None) -> None:
+    """Every cycle: keep the latest RAM reading for the status file
+    (power.memory) and log a spell of free RAM under MEM_LOW_MB once, and its
+    end (back over MEM_OK_MB). Never raises."""
+    try:
+        r = (read or _read_memory_status)()
+        free, total, used, limit = r
+    except Exception:
+        return
+    low = bool((_power_state.get("memory") or {}).get("low"))
+    note = None
+    if not low and free < MEM_LOW_MB:
+        low, note = True, (
+            f"[IMM] memory: LOW -- {_memory_note(lambda: r)}; Windows pages "
+            f"processes out when RAM runs short, and the bot stalls while its "
+            f"pages come back (close apps that are not needed)")
+    elif low and free > MEM_OK_MB:
+        low, note = False, f"[IMM] memory: ok again -- {_memory_note(lambda: r)}"
+    _power_state["memory"] = {"free_mb": free, "total_mb": total,
+                              "committed_mb": used, "commit_limit_mb": limit,
+                              "low": low}
+    if note:
+        log(note)
 
 
 def _read_power_status() -> Optional[Tuple[Optional[bool], Optional[int], bool]]:
@@ -8194,9 +8358,7 @@ def _power_check(read: Callable[[], Optional[tuple]] = _read_power_status) -> No
     what = ("an unknown power source" if ac is None else
             "AC power" if ac else "BATTERY")
     log(f"[IMM] power: on {what}" + (f" ({pct}%)" if pct is not None else "")
-        + (", battery saver ON" if saver else "")
-        + (" -- on battery the Wi-Fi drops to its power-saving mode and "
-           "connections stall; plug in" if ac is False else ""))
+        + (", battery saver ON" if saver else ""))
 
 
 def is_network_error(e: BaseException) -> bool:
@@ -23207,10 +23369,12 @@ class IncentiveMarketMaker:
         wedge = now - hb
         notes: List[str] = []
         if late >= HANG_WATCHDOG_TICK_SECS:
+            mem = _memory_note()    # paged out for want of RAM? (2026-10-11)
             notes.append(f"{self.tag} ! hang watchdog: a {HANG_WATCHDOG_TICK_SECS}s "
                          f"tick took {HANG_WATCHDOG_TICK_SECS + late:.0f}s -- the "
-                         f"whole process stalled (a thread holding the GIL, or "
-                         f"the machine slept)")
+                         f"whole process stalled (a thread holding the GIL, the "
+                         f"machine asleep, or the bot paged out for want of RAM)"
+                         + (f"; {mem}" if mem else ""))
         if wd.get("path") and hb != wd.get("hb"):
             notes.append(f"{self.tag} cycle heartbeat back after "
                          f"{hb - wd['hb']:.0f}s (stacks in {wd['path']}): a slow "
@@ -24368,6 +24532,7 @@ class IncentiveMarketMaker:
         if not once:
             self._ws_start()       # no-op under IMM_WS=off
             _no_power_throttling()  # full speed on battery (2026-10-11, POWER)
+            _normal_priority()      # not paged out first (2026-10-11, PRIORITY)
 
         try:
             while True:
@@ -24379,6 +24544,7 @@ class IncentiveMarketMaker:
                 self._last_cycle_start = top      # _idle's early-wake floor
                 _keep_awake()   # re-assert every cycle (wakes can clear it)
                 _power_check()  # log AC <-> battery switches (2026-10-11, POWER)
+                _memory_check()  # log running short of RAM (2026-10-11, MEMORY)
                 if prev_top is not None and top - prev_top > WAKE_GAP_SECS:
                     self.wake_grace_until = top + WAKE_GRACE_SECS
                     log(f"{self.tag} resume detected ({top - prev_top:.0f}s gap); "

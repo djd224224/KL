@@ -292,6 +292,10 @@ Since the same day also `latency.ws.book_rest` (the quote loop's book-read
 REST budget: cycles_off, skipped, last, budget_s, max_fails) and a top-level
 `power` block (ac: true / false / null, pct, saver, at), from the bot's
 per-cycle power check.
+`power.priority` (cpu, memory, io: "<was> -> <now>" as _normal_priority set
+them at start) and `power.memory` (free_mb, total_mb, committed_mb,
+commit_limit_mb, low: in a spell under 512MB free) are there too, from
+2026-10-11 ~13:45Z.
 
 ## Two compatibility traps, both tested
 
