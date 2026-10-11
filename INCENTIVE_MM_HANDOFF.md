@@ -10422,3 +10422,28 @@ WHAT:
   use. The leftover crypto launchers are a separate cleanup.
 
 Tests: TestPowerHelpers +6, the watchdog stall-line test. test_incentive_mm 1224 OK.
+
+## 2026-10-11 ~18:45Z — quake far-strike asks OFF (Jack: "yes turn them all off")
+
+QUAKE_ASK_STRIKES default "6.2,6.4,6.6,6.8,7.0" -> "" (bid-only again; the code
+stays, an IMM_QUAKE_ASK_STRIKES list in the env turns it back on; the EMSC
+thread only starts while asks are on; GFZ stays at 10s).
+
+WHY: front-run on essentially every crossing, ahead of every public feed.
+- 10/11 14:07:23Z M6.2 (79 km SSE of Panguna, PNG): at 14:12:23Z one taker
+  lifted our 6.2 ask (80 @ 16c, plus 200 others') and 6.4 ask (100 @ 9c),
+  80s before EMSC (14:13:43) and GFZ (14:13:45) published; USGS 14:25:53.
+  The fill brake + sweep breaker pulled 6.6 / 6.8 / 7.0 a second later.
+  6.2 crossed (-$67.20); 6.4 +$9 if nothing bigger hits today: ~-$58.
+- 9/27-10/11, 50 crossed strikes (report_tools-style check: first YES taker
+  buy <= 90c after the crossing quake's USGS origin): within 4 min of origin
+  on 16, within 5 min on 22 (GFZ publishes a median ~5.3 min after origin).
+  Every big-quake day on the far strikes was bought first: 10/08 M6.3 (6.2 at
+  191s), 10/09 M7.7 (6.2-7.0 all at 79-80s -- ~-$470 had our five 100-lot
+  asks rested), 10/11 M6.2 (300s).
+- So each 100-lot far-strike ask costs ~P(cross) x $90/day (6.4 ~$11, 6.6 ~$7,
+  6.8 ~$5, 7.0 ~$3) against ~$4-6/day of NO-side reward: negative to
+  break-even, with a ~$470 day about monthly. The 9/27 study's 11 of 62
+  "before GFZ" understated today's flow.
+Tests: TestQuakeFarStrikeAsks now patches the strikes on (the shipped default
+is asserted empty).

@@ -18656,10 +18656,16 @@ class TestQuakeFarStrikeAsks(unittest.TestCase):
     """The far strikes (QUAKE_ASK_STRIKES, 6.2-7.0) also rest a small YES
     ask, floored at the fair, pulled from the refresher thread the moment the
     ask verdict turns off (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes
-    start at the far strikes"). Fixture = TOMORROW's 6.6: whole-day fair
-    8.05c -> bid cap 7c, ask floor 10c. Book 3-7 x 12-16, 300 a level."""
+    start at the far strikes"). SHIPPED OFF since 10/11 ~18:45Z ("yes turn
+    them all off"): these tests switch 6.2-7.0 on, as the env would.
+    Fixture = TOMORROW's 6.6: whole-day fair 8.05c -> bid cap 7c, ask floor
+    10c. Book 3-7 x 12-16, 300 a level."""
 
     def setUp(self):
+        self._default_strikes = imm.QUAKE_ASK_STRIKES
+        self._strikes = mock.patch.object(
+            imm, "QUAKE_ASK_STRIKES", frozenset({6.2, 6.4, 6.6, 6.8, 7.0}))
+        self._strikes.start()
         _clean_persist()
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
@@ -18675,6 +18681,7 @@ class TestQuakeFarStrikeAsks(unittest.TestCase):
         imm._quake_state["watch"] = self.watch
 
     def tearDown(self):
+        self._strikes.stop()
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
         imm._quake_state["watch"] = None
         imm._quake_state["ask_brake"] = {}
@@ -18711,6 +18718,7 @@ class TestQuakeFarStrikeAsks(unittest.TestCase):
                                 "time": now - 60, "place": "x"}], now)
 
     def test_which_strikes_and_the_kill_switch(self):
+        self.assertEqual(self._default_strikes, frozenset())          # shipped OFF
         self.assertEqual(imm.QUAKE_ASK_STRIKES, frozenset({6.2, 6.4, 6.6, 6.8, 7.0}))
         self.assertTrue(imm.quake_ask_strike(self.T))
         self.assertTrue(imm.quake_ask_strike(f"{self.EV}-7.0"))

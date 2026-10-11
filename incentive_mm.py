@@ -10081,6 +10081,16 @@ QUAKE_STATUS_FILE = os.environ.get(
 # place_order re-checks right before an ask goes out. Planned restarts and
 # watchdog handoffs already cancel every quake order (_restart_keep_ok).
 # Kill switch: IMM_QUAKE_ASK_STRIKES="" -- the family is bid-only again.
+# OFF SINCE 10/11 ~18:45Z (Jack: "yes turn them all off"): the default is ""
+# again. At 14:12:23Z a taker lifted our 6.2 (80 @ 16c) and 6.4 (100 @ 9c)
+# asks 5 min after an M6.2 (PNG), 80s before EMSC / GFZ published it (~-$58).
+# Over 9/27-10/11 the first informed YES buy came within 4 min of origin on 16
+# of 50 crossed strikes and within 5 min on 22 -- ahead of every public feed --
+# and every big-quake day on the far strikes was bought first (10/08 M6.3 at 3
+# min; 10/09 M7.7: 6.2-7.0 all at 79-80s, ~-$470 had our five asks rested).
+# Front-run on essentially every crossing, each 100-lot strike costs ~P(cross)
+# x $90/day ($11 at 6.4 .. $3 at 7.0) against ~$4-6 of reward. The code stays;
+# a strike list in the env turns it back on.
 def _quake_ask_strikes(raw: str) -> frozenset:
     out = set()
     for tok in (raw or "").split(","):
@@ -10092,7 +10102,7 @@ def _quake_ask_strikes(raw: str) -> frozenset:
 
 
 QUAKE_ASK_STRIKES = _quake_ask_strikes(
-    os.environ.get("IMM_QUAKE_ASK_STRIKES", "6.2,6.4,6.6,6.8,7.0"))
+    os.environ.get("IMM_QUAKE_ASK_STRIKES", ""))
 QUAKE_ASK_MAX_CONTRACTS = _env_int("IMM_QUAKE_ASK_MAX_CONTRACTS", 100)
 QUAKE_ASK_TTL_SECS = _env_int("IMM_QUAKE_ASK_TTL_SECS", 600)
 QUAKE_ASK_RENEW_LEAD_SECS = _env_int("IMM_QUAKE_ASK_RENEW_LEAD_SECS", 180)
