@@ -1473,14 +1473,30 @@ SPORTS_LADDER_HOUR_MULT = _env_float("IMM_SPORTS_LADDER_HOUR_MULT", 4.0)
 #     and the Saturday step, as for every daily).
 # IMM_QUIET_DAILY_SERIES = exact series names ("" = none);
 # IMM_QUIET_RAIN_PERIOD=0 takes the period family back out.
+# KXTRUMPAPPROVE LEFT this list on 2026-10-11 (QUIET_HOURS_OFF_SERIES below).
 QUIET_DAILY_SERIES = frozenset(s.strip() for s in os.environ.get(
-    "IMM_QUIET_DAILY_SERIES", "KXTRUMPAPPROVE,KXTRUMPMENTIONB").split(",")
+    "IMM_QUIET_DAILY_SERIES", "KXTRUMPMENTIONB").split(",")
     if s.strip())
 QUIET_RAIN_PERIOD = os.environ.get("IMM_QUIET_RAIN_PERIOD", "1") == "1"
+# APPROVAL OFF THE QUIET HOURS (Jack 2026-10-11: "drop overnight x3 on
+# approval"). Members never take the global 0-8 ET quiet-hours multiplier,
+# daily or long-dated; everything else about their size stays (the family x3,
+# and for long-dated KXAPRPOTUS the evening x1.5 and the Saturday step). The
+# 10/06 case for the quiet hours (+3.4c/ct overnight at x1) reversed once they
+# applied: approval fills 00-08 ET lost -$550 on 9.3k contracts (-5.9c/ct)
+# from 10/07 03:10Z (58a9f77) to 10/11, at x9 (family x3 x quiet x3), against
+# +$302 (+4.0c/ct) before; the day hours since were flat (-$6). The 30-day
+# losses are slow drift on single fills (-$538), not bursts (-$10).
+# IMM_QUIET_HOURS_OFF_SERIES = exact series names ("" = none).
+QUIET_HOURS_OFF_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_QUIET_HOURS_OFF_SERIES", "KXTRUMPAPPROVE,KXAPRPOTUS").split(",")
+    if s.strip())
 
 
 def quiet_daily_member(series: str) -> bool:
     """A daily-classified series that still takes the global quiet hours."""
+    if series in QUIET_HOURS_OFF_SERIES:
+        return False
     return series in QUIET_DAILY_SERIES or (
         QUIET_RAIN_PERIOD and rain_period_member(series))
 
@@ -1529,7 +1545,8 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     if any(series.startswith(p) for p in HOUR_MULT_EXCLUDE):
         return 1.0
     if hour in mults:
-        return mults[hour]
+        # (approval: never the quiet hours, 2026-10-11)
+        return 1.0 if series in QUIET_HOURS_OFF_SERIES else mults[hour]
     # the evening window (2026-10-05): never on a quiet hour, never on the
     # sports ladders / escalators (their pre-kickoff window)
     if hour in evening and not sports_ladder_league(series):
@@ -6693,9 +6710,10 @@ for _s in os.environ.get("IMM_RATES_EXTRA_SERIES", _DEFAULT_RATES_EXTRA_SERIES).
 # applied_mention_mult scales the rungs, the per-market and per-event caps
 # and the skew knees together, and the estimator's hypothetical ladder, so
 # the payout-floor projection sees the x3 size. With the launcher geometry
-# (20-lot rung, 150 / 1,000 caps): 60 a side, 180 in the 0-8 ET quiet hours
-# (x3 since 10/05) up to the 07:00 cutoff, no Saturday step (a daily
-# series); caps 450 per market / 3,000 net per event. Only the size
+# (20-lot rung, 150 / 1,000 caps): 60 a side at every hour since 2026-10-11
+# (QUIET_HOURS_OFF_SERIES; 180 in the 0-8 ET quiet hours 10/07-10/11), no
+# Saturday step (a daily series); caps 450 per market / 3,000 net per
+# event. Only the size
 # -- not the ladders' 1-99c band or $1.00 entry bar.
 # IMM_TRUMPAPPROVE_SIZE_MULT=1.0 reverts.
 SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
@@ -7804,6 +7822,9 @@ _CONFIG_CODE_KNOBS = (
     "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "YIELD_SIZE_MULT",
     "YIELD_SIZE_MULT_FROM", "YIELD_SIZE_MIN", "YIELD_SIZE_EXIT_FRAC",
     "YIELD_SIZE_EXCLUDE_PREFIXES", "YIELD_SIZE_EXCLUDE_WORDS",
+    # quiet hours by series: dailies kept on them (2026-10-06), approval off
+    # them (2026-10-11)
+    "QUIET_DAILY_SERIES", "QUIET_HOURS_OFF_SERIES",
     # Carbon Arc fair-value gate (2026-09-26); the model's knobs live in
     # carbon_arc_fair.py and ride along in the fair file's "model" block
     "CA_FAIR_ENABLE", "CA_FAIR_TOL_CENTS", "CA_FAIR_TTL_MIN",
@@ -25301,7 +25322,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{dict(sorted(HOUR_SIZE_MULTS.items()))}; excluded prefixes: "
             f"{','.join(HOUR_MULT_EXCLUDE) or '(none)'} + daily families "
             f"(quiet hours kept: {','.join(sorted(QUIET_DAILY_SERIES)) or '(none)'}"
-            f"{' + period rain' if QUIET_RAIN_PERIOD else ''})")
+            f"{' + period rain' if QUIET_RAIN_PERIOD else ''}); never the quiet "
+            f"hours: {','.join(sorted(QUIET_HOURS_OFF_SERIES)) or '(none)'}")
     for _knob, _has_next, _from in (
             ("IMM_HOUR_SIZE_MULT", bool(HOUR_SIZE_MULTS_NEXT), HOUR_SIZE_MULT_FROM),
             ("IMM_EARNINGS_SIZE_MULT", EARNINGS_SIZE_MULT_NEXT > 0, EARNINGS_SIZE_MULT_FROM)):

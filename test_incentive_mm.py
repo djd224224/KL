@@ -100,6 +100,8 @@ _EVENT_TOP_N_LIFETIME_CODE_DEFAULT = imm.EVENT_TOP_N_LIFETIME
 imm.EVENT_TOP_N_LIFETIME = True
 # the daily series kept on the quiet hours (2026-10-06): TestQuietDailyMembers
 _QUIET_DAILY_SERIES_CODE_DEFAULT = imm.QUIET_DAILY_SERIES
+# ...and the approval series kept OFF them (2026-10-11)
+_QUIET_HOURS_OFF_CODE_DEFAULT = imm.QUIET_HOURS_OFF_SERIES
 _QUIET_RAIN_PERIOD_CODE_DEFAULT = imm.QUIET_RAIN_PERIOD
 
 
@@ -10103,7 +10105,7 @@ class TestQuietDailyMembers(unittest.TestCase):
         self._saved = {k: getattr(imm, k) for k in (
             "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "HOUR_SIZE_MULTS",
             "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM", "SAT_SIZE_MULT",
-            "QUIET_DAILY_SERIES", "QUIET_RAIN_PERIOD")}
+            "QUIET_DAILY_SERIES", "QUIET_RAIN_PERIOD", "QUIET_HOURS_OFF_SERIES")}
         imm.EVENING_SIZE_MULTS = imm._parse_hour_mults("18-21:1.5")
         imm.EVENING_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
         imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
@@ -10112,6 +10114,8 @@ class TestQuietDailyMembers(unittest.TestCase):
         imm.SAT_SIZE_MULT = 1.5
         imm.QUIET_DAILY_SERIES = frozenset({"KXTRUMPAPPROVE", "KXTRUMPMENTIONB"})
         imm.QUIET_RAIN_PERIOD = True
+        # the mechanism tests below run with the 10/11 off-list empty
+        imm.QUIET_HOURS_OFF_SERIES = frozenset()
         self._dyn = mock.patch.object(imm, "DAILY_SERIES_DYNAMIC",
                                       {"KXTRUMPAPPROVE": {}, "KXYTTOPVIDEO2D": {}})
         self._dyn.start()
@@ -10129,9 +10133,34 @@ class TestQuietDailyMembers(unittest.TestCase):
         return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
 
     def test_code_defaults(self):
-        self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT,
-                         frozenset({"KXTRUMPAPPROVE", "KXTRUMPMENTIONB"}))
+        # KXTRUMPAPPROVE left the keep-list on 2026-10-11 for the off-list
+        self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT, frozenset({"KXTRUMPMENTIONB"}))
+        self.assertEqual(_QUIET_HOURS_OFF_CODE_DEFAULT,
+                         frozenset({"KXTRUMPAPPROVE", "KXAPRPOTUS"}))
         self.assertTrue(_QUIET_RAIN_PERIOD_CODE_DEFAULT)
+
+    def test_approval_never_takes_the_quiet_hours(self):
+        """Jack 2026-10-11: "drop overnight x3 on approval" -- daily
+        KXTRUMPAPPROVE and long-dated KXAPRPOTUS rest x1 at 0-8 ET, even with
+        KXTRUMPAPPROVE on the keep-list; KXAPRPOTUS keeps its evening x1.5 and
+        Saturday step; other series keep the quiet hours."""
+        imm.QUIET_HOURS_OFF_SERIES = _QUIET_HOURS_OFF_CODE_DEFAULT
+        a, w, c = "KXTRUMPAPPROVE", "KXAPRPOTUS", "KXTRUMPMENTIONB"
+        self.assertTrue(imm.is_daily_series(a))
+        self.assertFalse(imm.is_daily_series(w))
+        for h in (0, 4, 8):
+            self.assertEqual(imm.hour_size_mult(a, self.et(2026, 10, 6, h)), 1.0, h)
+            self.assertEqual(imm.hour_size_mult(w, self.et(2026, 10, 6, h)), 1.0, h)
+            self.assertEqual(imm.hour_size_mult(c, self.et(2026, 10, 6, h)), 3.0, h)
+        self.assertFalse(imm.quiet_daily_member(a))
+        self.assertEqual(imm.hour_size_mult(w, self.et(2026, 10, 6, 19)), 1.5)   # evening kept
+        self.assertEqual(imm.hour_size_mult(a, self.et(2026, 10, 6, 19)), 1.0)
+        sat_noon, sat_night = self.et(2026, 10, 10, 12), self.et(2026, 10, 10, 4)
+        self.assertEqual(imm.hour_size_mult(w, sat_noon), imm.hour_size_mult(c, sat_noon))
+        self.assertAlmostEqual(imm.hour_size_mult(w, sat_night) * 3.0,
+                               imm.hour_size_mult(c, sat_night))         # Saturday kept
+        prof = dict(imm.size_mult_profile(a, self.et(2026, 10, 6, 0), 1.0))
+        self.assertEqual(prof, {1.0: 1.0})                               # floor projection
 
     def test_trumpmentionb_pinned_through_a_daily_flip(self):
         """Jack 2026-10-07 "yes": x3 in the quiet hours whether or not the

@@ -10490,3 +10490,24 @@ vercel_fair.DOW_SERIES default + KXGOOGVREQ, KXDEEPVREQ, KXANTHVREQ (IMM_VERCEL_
   pricing midweek off the weekend level. Watch the D = 10/13-10/15 settlements against both.
 Deploy: helper module, so restart_imm.ps1 (plain). Check: vercel_fair.json "model" dow_series
 lists the four series and the three requests series' entries carry "adj".
+
+## 2026-10-11 ~21:15Z — approval off the overnight x3 (Jack: "drop overnight x3 on approval")
+
+QUIET_HOURS_OFF_SERIES (IMM_QUIET_HOURS_OFF_SERIES, default
+KXTRUMPAPPROVE,KXAPRPOTUS): members never take the global 0-8 ET quiet-hours
+multiplier, daily or long-dated -- checked in _hour_window_mult's long-dated
+branch and in quiet_daily_member (so the off-list wins over the keep-list).
+KXTRUMPAPPROVE also left QUIET_DAILY_SERIES' default (now KXTRUMPMENTIONB
+only). Unchanged: the family x3 size, and for long-dated KXAPRPOTUS the
+evening x1.5 and the Saturday step. Both knobs joined the config registry;
+the startup line "hour-size multipliers ..." names the off-list.
+
+WHY: the 10/06 case for the quiet hours (+3.4c/ct overnight at x1) reversed
+once they applied. Approval fills 00-08 ET, 10/07 03:10Z (58a9f77) - 10/11:
+-$550 on 9.3k contracts (-5.9c/ct; KXAPRPOTUS -21c/ct, KXTRUMPAPPROVE -4.0c)
+at x9 (family x3 x quiet x3), against +$302 (+4.0c/ct) before; the day hours
+since were flat (-$6). Context: RCP (the settlement source) is behind
+DataDome, so there is no feed to build; the 30-day losses are slow drift on
+single fills (-$538), not bursts after RCP updates (-$10 final, -$335 at 5m).
+Tests: TestQuietDailyMembers +1 (the shipped defaults), mechanism tests run
+with the off-list empty.
