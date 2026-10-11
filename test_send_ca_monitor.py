@@ -97,7 +97,7 @@ class TestVerdict(unittest.TestCase):
         bad = {"bid": [10, 400, -40.0, 0.0]}                        # -10c/ct: 14c under
         lvl, why = cm.verdict(self.ctx(sides_window=bad))
         self.assertEqual(lvl, "WATCH")
-        self.assertIn("the side #3 keeps", why[0])
+        self.assertIn("the bids we still quote", why[0])
         thin = {"bid": [2, 100, -40.0, 0.0]}                        # too few contracts
         self.assertEqual(cm.verdict(self.ctx(sides_window=thin))[0], "OK")
 
@@ -173,6 +173,57 @@ class TestFills(unittest.TestCase):
             out = cm.late_violations(fills, orders, _fam, _ts(2026, 10, 17, 0), _ts(2026, 10, 20, 0))
         self.assertEqual(out["point of sale"], [1, 1])
         self.assertEqual(out["foot traffic"], [1, 0])
+
+
+class TestSimpleEmail(unittest.TestCase):
+    """The simplified email (Jack 2026-10-11: "simplify the carbon arc email
+    so it's easier to read"): a total, one row per family, reasons only for
+    the families that aren't OK, no per-side / gate / read numbers."""
+
+    def ctx(self):
+        def fam(name, cat, level, net, reasons=()):
+            return {"name": name, "tag": name[:3].upper(), "cat": cat, "level": level,
+                    "reasons": list(reasons),
+                    "money": {"rew": 10.0, "own": net - 10.0, "carried": 0.0, "net": net,
+                              "net7": 2 * net},
+                    "sides": {"bid": [2, 300, -20.0, 0.0], "ask": [1, 100, 5.0, 0.0]},
+                    "book": {"markets": 4, "unreal": -12.0}}
+        ws, stop = cm.late_window(date(2026, 10, 10))
+        return {"day": date(2026, 10, 10), "now": datetime(2026, 10, 11, 11, 35, tzinfo=timezone.utc),
+                "late": (ws, stop), "late_active": False, "notes": [],
+                "families": [fam("Point of sale", "point of sale", "PROBLEM", 21.0,
+                                 ["Our Carbon Arc read changed with no new data: x"]),
+                             fam("Card spend", "credit card", "OK", 8.0),
+                             fam("Apps", "app", "WATCH", 38.0, ["Down $115 over the last 3 days"]),
+                             fam("Ad spend", "advertising", "PROBLEM", -363.0,
+                                 ["Lost $363 on the day"])]}
+
+    def test_subject_names_the_flagged_families_worst_first(self):
+        self.assertEqual(cm.subject_for(self.ctx()),
+                         "IMM Carbon Arc 10/10: net -$296 | PROBLEM Ad spend, Point of sale"
+                         " | WATCH Apps")
+
+    def test_body_lists_reasons_only_for_flagged_families(self):
+        text = cm.render_text(self.ctx())
+        self.assertIn("Net -$296 on the day", text)
+        self.assertIn("Late-month rule (#3) starts Sun 10/18 (in 7 days)", text)
+        look = text.split("NEEDS A LOOK")[1]
+        self.assertLess(look.index("Ad spend -- PROBLEM"), look.index("Point of sale -- PROBLEM"))
+        self.assertNotIn("Card spend", look)
+        self.assertIn("Our fills: 3 (400 contracts, -$15). Open positions: 4 markets, -$12 "
+                      "unrealized.", look)
+        for noise in ("gate:", "stand-asides", "Aug / Sep", "c/ct"):
+            self.assertNotIn(noise, text)
+        html = cm.render_html(self.ctx())
+        self.assertIn("Needs a look", html)
+        self.assertNotIn("<pre", html)
+
+    def test_a_clean_day_says_so(self):
+        c = self.ctx()
+        for f in c["families"]:
+            f["level"], f["reasons"] = "OK", []
+        self.assertTrue(cm.subject_for(c).endswith("| all OK"))
+        self.assertIn("Every family performed as expected.", cm.render_text(c))
 
 
 if __name__ == "__main__":

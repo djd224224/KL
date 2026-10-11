@@ -3,6 +3,11 @@ r"""send_ca_monitor.py -- the daily Carbon Arc email (Jack 2026-10-11: "ship
 #3 for all three, but i want careful monitoring on carbon arc. give me a
 daily email, reporting on each family and if it's performing as expected").
 
+THE EMAIL (simplified 2026-10-11, Jack: "simplify the carbon arc email so
+it's easier to read"): the day's total, one row per family with its verdict,
+and plain-English reasons only for the families that aren't OK. The full
+per-family numbers below go to the task log (and --dry), not the email.
+
 ONE SECTION PER FAMILY (point of sale, card spend, apps, foot traffic, ad
 spend) for the prior ET day. Each ends in a verdict, OK / WATCH / PROBLEM,
 naming the checks that fired:
@@ -544,57 +549,73 @@ def window_market_totals(store: dict, day, ws: datetime, stop: datetime) -> dict
 
 # ---- verdict -----------------------------------------------------------------
 
+def _et_at(z) -> str:
+    """'2026-10-10 11:40Z' -> ' at 07:40 ET'; '' when unparseable."""
+    try:
+        t = datetime.strptime(str(z), "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    return f" at {t.astimezone(imm.ET):%H:%M} ET"
+
+
 def verdict(f: dict) -> tuple:
-    """(level, [reasons]) for one family's context. Pure: the tests drive it."""
+    """(level, [reasons]) for one family's context, worst first. Pure: the
+    tests drive it."""
     cat, probs, watch = f["cat"], [], []
     blk = blocked_side(cat)
     keep = other(blk)
+    # Reasons are plain sentences (Jack 2026-10-11: "simplify the carbon arc
+    # email so it's easier to read"); the numbers behind them stay in the
+    # detail block (render_detail, task log / --dry).
     m = f.get("money") or {}
     net = m.get("net", 0.0)
     if net <= NET_DAY_PROBLEM:
-        probs.append(f"lost ${-net:,.0f} net on the day")
+        probs.append(f"Lost ${-net:,.0f} on the day")
     elif net <= NET_DAY_WATCH:
-        watch.append(f"lost ${-net:,.0f} net on the day")
-    if m.get("days7", 0) >= 3 and m.get("net3", 0.0) < 0:
-        watch.append(f"3-day net ${m['net3']:,.0f}")
+        watch.append(f"Lost ${-net:,.0f} on the day")
     viol = f.get("late_viol") or [0, 0]
     if viol[0] or viol[1]:
-        probs.append(f"late window: {viol[0]} fill(s) / {viol[1]} order(s) on the "
-                     f"BLOCKED {blk} side")
+        probs.append(f"Late-month rule broken: {viol[0]} fill(s) and {viol[1]} order(s) "
+                     f"on the BLOCKED {blk} side")
     rd = f.get("read") or {}
     for a in rd.get("anomalies") or []:
-        probs.append(f"read moved without new data: {a}")
+        probs.append("Our Carbon Arc read changed with no new data: "
+                     + a.split(" (data through")[0])
     if rd.get("n", 0) == 0:
-        probs.append("no Carbon Arc read for the family")
+        probs.append("No Carbon Arc data for this family")
     if rd.get("refresh_h") is not None and rd["refresh_h"] > REFRESH_MAX_H.get(cat, 48):
-        watch.append(f"no new data for {rd['refresh_h']:.0f}h "
-                     f"(normal <= {REFRESH_MAX_H.get(cat, 48)}h)")
+        watch.append(f"No new Carbon Arc data for {rd['refresh_h']:.0f}h "
+                     f"(usually under {REFRESH_MAX_H.get(cat, 48)}h)")
     if rd.get("data_d") is not None and rd["data_d"] > DATA_MAX_D.get(cat, 8):
-        watch.append(f"data through {rd.get('thru_max')} ({rd['data_d']:.1f}d old)")
+        watch.append(f"Newest Carbon Arc data is {rd['data_d']:.0f} days old "
+                     f"(through {rd.get('thru_max')})")
     kw = (f.get("sides_window") or {}).get(keep)
     bench = [x for x in (BENCH.get(cat, {}).get(keep) or ()) if x is not None]
     if kw and kw[1] >= SIDE_MIN_CTS and bench:
         kc = 100.0 * kw[2] / kw[1]
         if kc < min(bench) - KEPT_SLACK_C:
-            watch.append(f"late window: our {keep}s (the side #3 keeps) {kc:+.1f}c/ct on "
-                         f"{kw[1]:,.0f} ct, worse than Aug/Sep makers ({min(bench):+.1f}c) "
-                         f"by more than {KEPT_SLACK_C:g}c")
+            watch.append(f"Late-month: the {keep}s we still quote are losing {-kc:.0f}c a "
+                         f"contract, well under Aug/Sep ({min(bench):+.0f}c)")
     mw = f.get("market_window") or {}
     if mw:
         mb, mk = mw.get(blk) or [0, 0], mw.get(keep) or [0, 0]
         if mb[0] >= MARKET_MIN_CTS and mk[0] >= MARKET_MIN_CTS:
             bc, kc = 100.0 * mb[1] / mb[0], 100.0 * mk[1] / mk[0]
             if bc > kc:
-                watch.append(f"market makers in the window: blocked {blk}s {bc:+.1f}c/ct "
-                             f"beat kept {keep}s {kc:+.1f}c/ct")
+                watch.append(f"Late-month: other makers did better on the {blk}s we block "
+                             f"({bc:+.0f}c) than on the {keep}s we keep ({kc:+.0f}c), "
+                             f"so the rule may be backwards")
     g = f.get("gate") or {}
     if g.get("storm_frac", 0.0) >= CAP_STORM_FRAC and f.get("selected", 0) >= 5:
-        watch.append(f"{g['storm_side']}s capped on {g['storm_frac']:.0%} of the family "
-                     f"at {g.get('storm_at')} (read vs book disagree wholesale)")
+        watch.append(f"Our read disagreed with the market on most of the family "
+                     f"({g['storm_side']}s held back on {g['storm_frac']:.0%}"
+                     f"{_et_at(g.get('storm_at'))})")
     land = f.get("landing") or {}
     land_pnl = sum((land.get(s) or [0, 0, 0.0])[2] for s in ("bid", "ask"))
     if land_pnl <= LANDING_LOSS_WATCH:
-        watch.append(f"landing-window fills lost ${-land_pnl:,.0f}")
+        watch.append(f"Lost ${-land_pnl:,.0f} on fills while new data was landing")
+    if m.get("days7", 0) >= 3 and m.get("net3", 0.0) < 0:
+        watch.append(f"Down ${-m['net3']:,.0f} over the last 3 days")
     level = "PROBLEM" if probs else ("WATCH" if watch else "OK")
     return level, probs + watch
 
@@ -706,27 +727,108 @@ def _bench(cat: str, side: str) -> str:
     return " / ".join("n/a" if x is None else f"{x:+.1f}c" for x in v)
 
 
+def _totals(ctx) -> dict:
+    """The day's money summed over the families that have it."""
+    t = {"rew": 0.0, "trade": 0.0, "net": 0.0, "net7": 0.0, "n": 0}
+    for f in ctx["families"]:
+        m = f["money"]
+        if not m:
+            continue
+        t["n"] += 1
+        t["rew"] += m.get("rew", 0.0)
+        t["trade"] += m.get("own", 0.0) + m.get("carried", 0.0)
+        t["net"] += m.get("net", 0.0)
+        t["net7"] += m.get("net7", 0.0)
+    return t
+
+
+def _flagged(ctx) -> list:
+    """The families that aren't OK: PROBLEM before WATCH, worst day first."""
+    return sorted((f for f in ctx["families"] if f["level"] != "OK"),
+                  key=lambda f: (-LEVELS.index(f["level"]), (f["money"] or {}).get("net", 0.0)))
+
+
 def subject_for(ctx) -> str:
-    parts = [f"{f['tag']} {f['level']}" for f in ctx["families"]]
-    worst = max((LEVELS.index(f["level"]) for f in ctx["families"]), default=0)
-    head = {0: "all OK", 1: "watch", 2: "PROBLEM"}[worst]
-    return f"IMM Carbon Arc {ctx['day']:%m/%d}: {head} | " + " | ".join(parts)
+    t = _totals(ctx)
+    head = (f"IMM Carbon Arc {ctx['day']:%m/%d}: "
+            + (f"net {_usd(t['net'])}" if t["n"] else "no money data"))
+    parts = []
+    for lvl in ("PROBLEM", "WATCH"):
+        names = [f["name"] for f in _flagged(ctx) if f["level"] == lvl]
+        if names:
+            parts.append(f"{lvl} {', '.join(names)}")
+    return head + " | " + (" | ".join(parts) if parts else "all OK")
 
 
 def _late_text(ctx) -> str:
     ws, stop = ctx["late"]
     now = ctx["now"]
     if now < ws:
-        return (f"late-month window opens {ws.astimezone(imm.ET):%a %m/%d %H:%M} ET "
-                f"({(ws - now).total_seconds() / 86400:.1f} days), stops "
-                f"{stop.astimezone(imm.ET):%a %m/%d %H:%M} ET")
+        days = round((ws - now).total_seconds() / 86400)
+        return (f"Late-month rule (#3) starts {ws.astimezone(imm.ET):%a %m/%d} "
+                f"(in {days} day{'' if days == 1 else 's'}) and ends "
+                f"{stop.astimezone(imm.ET):%a %m/%d}.")
     if now < stop:
-        return (f"late-month window OPEN since {ws.astimezone(imm.ET):%m/%d} -- stops "
-                f"{stop.astimezone(imm.ET):%a %m/%d %H:%M} ET")
-    return f"late-month window closed {stop.astimezone(imm.ET):%m/%d} (quoting stopped)"
+        by = defaultdict(list)
+        for cat, _tag, name in FAMILIES:
+            by[blocked_side(cat)].append(name.lower())
+        blocks = "; ".join(f"{side}s blocked on {', '.join(n)}" for side, n in by.items())
+        return (f"Late-month rule (#3) is ON until {stop.astimezone(imm.ET):%a %m/%d}: "
+                f"{blocks}.")
+    return (f"Late-month rule (#3) ended {stop.astimezone(imm.ET):%m/%d}; Carbon Arc "
+            f"quoting is stopped for the rest of the month.")
+
+
+def _fills_book(f) -> str:
+    """'Our fills: 32 (3,030 contracts, -$392). Open positions: ...' for one family."""
+    s = f["sides"]
+    n, ct, pnl = (sum((s.get(x) or [0, 0, 0.0])[i] for x in ("bid", "ask")) for i in (0, 1, 2))
+    out = (f"Our fills: {n} ({ct:,.0f} contracts, {_usd(pnl)})." if n else "Our fills: none.")
+    b = f["book"]
+    if b:
+        out += (f" Open positions: {b.get('markets', 0)} markets, "
+                f"{_usd(b.get('unreal', 0))} unrealized.")
+    return out
+
+
+DETAIL_WHERE = r"run-logs\incentive-mm\carbon-arc-task.log"
 
 
 def render_text(ctx) -> str:
+    """The email (Jack 2026-10-11: "simplify the carbon arc email so it's
+    easier to read"): the day's total, one line per family, then a short
+    block of plain reasons for each family that isn't OK. Every number
+    behind them is in render_detail (task log / --dry)."""
+    t = _totals(ctx)
+    L = [f"Carbon Arc -- {ctx['day']:%a %m/%d}"]
+    if t["n"]:
+        L.append(f"Net {_usd(t['net'])} on the day (rewards {_usd(t['rew'])}, trading "
+                 f"{_usd(t['trade'])}). Last 7 days: {_usd(t['net7'])}.")
+    L.append(_late_text(ctx))
+    L += [f"! {n}" for n in ctx["notes"]]
+    L.append("")
+    w = max(len(f["name"]) for f in ctx["families"])
+    for f in ctx["families"]:
+        m = f["money"]
+        money = (f"day {_usd(m.get('net', 0)):>6}   7 days {_usd(m.get('net7', 0)):>6}"
+                 if m else "no money data")
+        L.append(f"{f['name']:<{w}}  {f['level']:<7}  {money}")
+    flagged = _flagged(ctx)
+    if flagged:
+        L += ["", "NEEDS A LOOK"]
+        for f in flagged:
+            L += ["", f"{f['name']} -- {f['level']}"]
+            L += [f"  - {r}" for r in f["reasons"]]
+            L.append(f"  {_fills_book(f)}")
+    else:
+        L += ["", "Every family performed as expected."]
+    L += ["", f"Full numbers per family: {DETAIL_WHERE}"]
+    return "\n".join(L)
+
+
+def render_detail(ctx) -> str:
+    """Every number behind the verdicts, per family: the task log and
+    --dry print it; the email does not carry it (2026-10-11)."""
     L = [f"Carbon Arc daily -- {ctx['day']:%a %Y-%m-%d} (ET day)", _late_text(ctx)]
     L += [f"! {n}" for n in ctx["notes"]]
     L.append("")
@@ -784,6 +886,7 @@ def render_text(ctx) -> str:
 
 def render_html(ctx) -> str:
     color = {"OK": "#1a7f37", "WATCH": "#b26b00", "PROBLEM": "#c62828"}
+    t = _totals(ctx)
     rows = []
     for f in ctx["families"]:
         m = f["money"]
@@ -791,23 +894,32 @@ def render_html(ctx) -> str:
             "<tr>"
             f"<td style='{TDL}'><b>{_esc(f['name'])}</b></td>"
             f"<td style='{TDL};color:{color[f['level']]}'><b>{f['level']}</b></td>"
-            f"<td style='{TD}'>{_usd(m.get('rew', 0)) if m else '-'}</td>"
-            f"<td style='{TD}'>{_usd(m.get('own', 0) + m.get('carried', 0)) if m else '-'}</td>"
             f"<td style='{TD}'>{_usd(m.get('net', 0)) if m else '-'}</td>"
             f"<td style='{TD}'>{_usd(m.get('net7', 0)) if m else '-'}</td>"
-            f"<td style='{TDL}'>{blocked_side(f['cat'])}s</td>"
-            f"<td style='{TDL}'>{_esc('; '.join(f['reasons'][:2])) or 'as expected'}</td>"
             "</tr>")
     head = ("<tr>" + "".join(f"<th style='{TDL}'>{h}</th>" for h in
-            ("family", "verdict", "reward", "trading", "net", "7-day net",
-             "#3 blocks", "why")) + "</tr>")
-    body = "".join(f"<p>{_esc(n)}</p>" for n in ctx["notes"])
-    detail = _esc(render_text(ctx))
-    return (f"<div style='font-family:Arial,sans-serif;font-size:13px'>"
-            f"<h3 style='margin:0 0 6px'>Carbon Arc daily -- {ctx['day']:%a %m/%d}</h3>"
-            f"<p style='margin:0 0 8px'>{_esc(_late_text(ctx))}</p>{body}"
-            f"<table style='border-collapse:collapse'>{head}{''.join(rows)}</table>"
-            f"<pre style='font-size:12px;margin-top:14px'>{detail}</pre></div>")
+            ("Family", "Status", "Day", "7 days")) + "</tr>")
+    top = (f"<p style='margin:0 0 4px;font-size:16px'><b>Net {_usd(t['net'])}</b> on the day "
+           f"(rewards {_usd(t['rew'])}, trading {_usd(t['trade'])}). "
+           f"Last 7 days: {_usd(t['net7'])}.</p>" if t["n"] else "")
+    notes = "".join(f"<p style='margin:0 0 4px;color:#c62828'>{_esc(n)}</p>" for n in ctx["notes"])
+    flagged = _flagged(ctx)
+    if flagged:
+        look = "<h3 style='margin:18px 0 0'>Needs a look</h3>"
+        for f in flagged:
+            look += (f"<p style='margin:12px 0 2px'><b>{_esc(f['name'])}</b> "
+                     f"<span style='color:{color[f['level']]}'><b>{f['level']}</b></span></p>"
+                     "<ul style='margin:0;padding-left:20px'>"
+                     + "".join(f"<li>{_esc(r)}</li>" for r in f["reasons"])
+                     + f"</ul><p style='margin:2px 0 0;color:#555'>{_esc(_fills_book(f))}</p>")
+    else:
+        look = "<p style='margin:14px 0 0'>Every family performed as expected.</p>"
+    return (f"<div style='font-family:Arial,sans-serif;font-size:14px;line-height:1.45;max-width:640px'>"
+            f"<h2 style='margin:0 0 6px'>Carbon Arc &mdash; {ctx['day']:%a %m/%d}</h2>{top}"
+            f"<p style='margin:0 0 12px;color:#555'>{_esc(_late_text(ctx))}</p>{notes}"
+            f"<table style='border-collapse:collapse'>{head}{''.join(rows)}</table>{look}"
+            f"<p style='margin:18px 0 0;color:#888;font-size:12px'>Full numbers per family "
+            f"(fills by side, read, gate, market check): {_esc(DETAIL_WHERE)}</p></div>")
 
 
 def main(argv=None) -> int:
@@ -832,7 +944,7 @@ def main(argv=None) -> int:
         return 0
     ctx = build_report(day, with_market=not args.no_market, now=now_utc)
     text, html, subject = render_text(ctx), render_html(ctx), subject_for(ctx)
-    log("carbon arc email: " + subject + "\n" + text)
+    log("carbon arc email: " + subject + "\n" + text + "\n\n-- detail --\n" + render_detail(ctx))
     if args.dry:
         return 0
     attempts = 1 if args.test else 8
