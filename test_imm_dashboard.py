@@ -6,6 +6,7 @@ cycle log, mark-to-market trading P&L across a window (realized + change in
 unrealized), a settlement, a manual offset treated as a transfer, and a fill's
 30-minute mark-out."""
 
+import ast
 import json
 import os
 import shutil
@@ -22,6 +23,26 @@ def _ts(s: str) -> float:
 
 
 class FamilyTests(unittest.TestCase):
+    """Names alone: no Kalshi series records (series_meta), no bot election
+    file and no imported bot -- each test writes the files it needs."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = (dash.STATUS_DIR, dash.CACHE_DIR, dash._imm_mod)
+        dash.STATUS_DIR = dash.CACHE_DIR = self.dir
+        dash._imm_mod = None
+
+    def tearDown(self):
+        dash.STATUS_DIR, dash.CACHE_DIR, dash._imm_mod = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, name, obj):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def _meta(self, series):
+        self._write(dash.SERIES_META_CACHE, {"at": 0, "series": series})
+
     def test_mentions(self):
         self.assertEqual(dash.family_of("KXEARNINGSMENTIONCCL"), ("Earnings mentions", "CCL"))
         self.assertEqual(dash.family_of("KXTRUMPMENTIONB")[1], "TRUMPMENTION-B")
@@ -46,9 +67,27 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(dash.family_of("KXAMZNCC"), ("Carbon Arc consumer", "*CC card spend"))
         self.assertEqual(dash.family_of("KXGEMINIAPP")[1], "*APP app charts")
         self.assertEqual(dash.family_of("KXCAVAFT")[1], "*FT foot traffic")
-        # KXCOCACOLAPOS / KXYUMTBFT are price trackers despite the suffix
-        self.assertEqual(dash.family_of("KXCOCACOLAPOS"), ("Company KPIs", "Food price trackers"))
-        self.assertEqual(dash.family_of("KXYUMTBFT"), ("Company KPIs", "Food price trackers"))
+        # the food trackers are the Spice Data menu prices. KXCOCACOLAPOS and
+        # KXYUMTBFT, filed with them until 2026-10-10, settle on Carbon Arc
+        # (Coca-Cola point of sale, Taco Bell foot traffic): the bot's family
+        # verdicts say carbon_arc for both
+        self.assertEqual(dash.family_of("KXCHIPBURRITO"), ("Company KPIs", "Food price trackers"))
+        self.assertEqual(dash.family_of("KXMCDSBIGMAC"), ("Company KPIs", "Food price trackers"))
+        self.assertEqual(dash.family_of("KXCOCACOLAPOS"), ("Carbon Arc consumer", "*POS point of sale"))
+        self.assertEqual(dash.family_of("KXYUMTBFT"), ("Carbon Arc consumer", "*FT foot traffic"))
+
+    def test_settlement_source_decides_carbon_arc_and_food_trackers(self):
+        self._meta({"KXALBUMSALESSWIFT": {"c": "Entertainment", "t": ["Music"],
+                                          "s": ["Hits Daily Double"]},
+                    "KXAMZNCC": {"c": "Financials", "t": ["Credit Card Spend"], "s": ["Carbon Arc"]},
+                    "KXZZZPRISM": {"c": "Economics", "t": [], "s": ["Carbon Arc"]},
+                    "KXZZZMENU": {"c": "Economics", "t": ["Inflation"], "s": ["Spice Data"]}})
+        # SWIFT ends in FT, but a sales chart is not Carbon Arc
+        self.assertEqual(dash.family_of("KXALBUMSALESSWIFT"),
+                         ("Sports & awards", "Awards, charts & media"))
+        self.assertEqual(dash.family_of("KXAMZNCC"), ("Carbon Arc consumer", "*CC card spend"))
+        self.assertEqual(dash.family_of("KXZZZPRISM"), ("Carbon Arc consumer", "KXZZZPRISM"))
+        self.assertEqual(dash.family_of("KXZZZMENU"), ("Company KPIs", "Food price trackers"))
 
     def test_other_families(self):
         self.assertEqual(dash.family_of("KXRT"), ("Rotten Tomatoes", "KXRT"))
@@ -90,8 +129,220 @@ class FamilyTests(unittest.TestCase):
     def test_kalshi_category_places_unknown_series(self):
         self.assertEqual(dash.family_of("KXZZZUNKNOWN", "Economics")[0], "Econ & rates")
         self.assertEqual(dash.family_of("KXZZZUNKNOWN", "Science and Technology")[0], "AI & tech")
-        # a rule always beats the category
+        # a name rule beats the category
         self.assertEqual(dash.family_of("KXRAIN", "Economics")[0], "Weather & quakes")
+
+    def test_1010_audit_misfits(self):
+        # Jack 2026-10-10: "'other prints' seems to have events that belong in
+        # other families". Each of these was filed wrong; the names alone now
+        # place them (the Kalshi-record tests below cover the rest)
+        for s, fam in (("KXAPRPOTUS", "Politics & approval"), ("KXBILLSSIGNED", "Politics & approval"),
+                       ("KXLAGODAYS", "Politics & approval"),
+                       ("KXNJGOLFVISITCOUNT", "Politics & approval"),
+                       ("KXPUBLICTALARICO", "Politics & approval"),
+                       ("KXCRYPTOSTRUCTURE", "Politics & approval"), ("KXCOST", "Company KPIs"),
+                       ("KXTSNOWFALLBIGSKYM", "Weather & quakes"),
+                       ("KXKYBOURBONBARRELS", "Econ & rates"), ("KXNFCI", "Econ & rates"),
+                       ("KXCTMINWAGE", "Econ & rates"), ("KXDEFRANCHISETAX", "Econ & rates")):
+            self.assertEqual(dash.family_of(s)[0], fam, s)
+        for s, fg in (("KXGOOGVREQ", ("AI & tech", "Vercel shares")),
+                      ("KXANTHSHARE", ("AI & tech", "OpenRouter shares")),
+                      ("KXTOKENUSEM", ("AI & tech", "OpenRouter tokens")),
+                      ("KXAIFOOD", ("AI & tech", "AI adoption")),
+                      ("KXPADATACENTERS", ("AI & tech", "Data centers")),
+                      ("KXALMWP", ("Commodities & shipping", "Metals")),
+                      ("KXSOFRD", ("Econ & rates", "Central banks")),
+                      ("KXCAFAIRPLAN", ("Econ & rates", "Housing & mortgage")),
+                      ("KXTRUEV", ("Econ & rates", "Truflation")),
+                      ("KX10YR550PCT", ("Econ & rates", "Treasury yields")),
+                      ("KXAAAGASEOYNJ", ("Gas & diesel", "AAA year-end")),
+                      ("KXFLDENGUE", ("Other prints", "Health & medicine")),
+                      ("KXSCREWWORMCOUNT", ("Other prints", "Health & medicine")),
+                      ("KXHURCAT", ("Weather & quakes", "Hurricanes")),
+                      ("KXART", ("Sports & awards", "Collectibles")),
+                      ("KXPOKEMON", ("Sports & awards", "Collectibles")),
+                      ("KXSTATELEG", ("Elections", "State legislatures"))):
+            self.assertEqual(dash.family_of(s), fg, s)
+
+    def test_name_collisions(self):
+        # Pennsylvania natural-gas production, not a pump price
+        self.assertEqual(dash.family_of("KXPAGAS"), ("Commodities & shipping", "Energy & mining"))
+        # BROILER holds OIL; the one KXBOI series is Boise airport, not the Bank
+        # of Israel; a player's next team is not KXNEXT politics
+        self.assertEqual(dash.family_of("KXARBROILER"), ("Commodities & shipping", "Agriculture"))
+        self.assertEqual(dash.family_of("KXBOIPASSENGERS"), ("Other prints", "Travel & visits"))
+        self.assertEqual(dash.family_of("KXNEXTTEAMNFL")[0], "Sports & awards")
+        # Artemis II is not art, Mahomes not a home, an IPO not a population,
+        # an AirTag not AI
+        self.assertNotEqual(dash.family_of("KXARTEMISII")[0], "Sports & awards")
+        self.assertNotEqual(dash.family_of("KXFFQBALLENMAHOMES")[1], "Housing & mortgage")
+        self.assertNotEqual(dash.family_of("KXIPOPLAID")[1], "Jobs & economy")
+        self.assertNotEqual(dash.family_of("KXAIRTAG2")[0], "AI & tech")
+
+    def test_bot_election_family_without_the_bot(self):
+        # the bot's own Elections-category file, and its carve-outs
+        self._write(dash.ELECTION_EXTRA_FILE, {"series": ["KXESGOV", "KXPUBLICTALARICO"]})
+        self.assertEqual(dash.family_of("KXESGOV"), ("Elections", "General elections"))
+        self.assertEqual(dash.family_of("KXPUBLICTALARICO")[0], "Politics & approval")
+
+    def test_bot_election_family_from_the_live_module(self):
+        class _Bot:
+            ELECTION_EXCLUDE = frozenset(("KXZZZCALL",))
+
+            @staticmethod
+            def election_series(s):
+                return s == "KXZZZVOTE"
+        dash._imm_mod = _Bot()
+        self._meta({"KXZZZCALL": {"c": "Elections", "t": []}})
+        self.assertEqual(dash.family_of("KXZZZVOTE")[0], "Elections")
+        self.assertNotEqual(dash.family_of("KXSAARLAND")[0], "Elections")   # the bot says no
+        self.assertNotEqual(dash.family_of("KXZZZCALL")[0], "Elections")
+
+    def test_kalshi_elections_category_files_every_vote(self):
+        self._meta({"KXRSENATEWON": {"c": "Elections", "t": ["US Elections"]},
+                    "KXDEMMENVOTE": {"c": "Elections", "t": ["House", "US Elections"]},
+                    "KXCOOPEROUTPERFORMRCP": {"c": "Elections", "t": ["Senate"]},
+                    "KXSPAINTURNOUT": {"c": "Elections", "t": ["International elections"]},
+                    "KXHOLBORNLABMOV": {"c": "Elections", "t": ["International elections"]},
+                    "KXSFBALLOTMEASURES": {"c": "Elections", "t": ["Referendums"]},
+                    "KXISTANBULMAYOR": {"c": "Elections", "t": []}})
+        self.assertEqual(dash.family_of("KXRSENATEWON"), ("Elections", "General elections"))
+        self.assertEqual(dash.family_of("KXDEMMENVOTE"), ("Elections", "Turnout & exit polls"))
+        self.assertEqual(dash.family_of("KXCOOPEROUTPERFORMRCP"), ("Elections", "Candidates vs polls"))
+        self.assertEqual(dash.family_of("KXSPAINTURNOUT"), ("Elections", "Turnout & exit polls"))
+        self.assertEqual(dash.family_of("KXHOLBORNLABMOV"), ("Elections", "International elections"))
+        self.assertEqual(dash.family_of("KXSFBALLOTMEASURES"), ("Elections", "Referendums & measures"))
+        # the bot's carve-outs stay out though Kalshi files them under Elections
+        self.assertEqual(dash.family_of("KXISTANBULMAYOR"), ("Politics & approval", "KXISTANBULMAYOR"))
+
+    def test_mentions_category(self):
+        self._meta({"KXTRUMPSAY": {"c": "Mentions", "t": ["Trump"]}})
+        self.assertEqual(dash.family_of("KXTRUMPSAY")[0], "Other mentions")
+
+    def test_word_rules_defer_to_a_disagreeing_category(self):
+        self._meta({"KXEPLCORNERS": {"c": "Sports", "t": ["Soccer"]},
+                    "KXIACORN": {"c": "Economics", "t": ["Growth"]},
+                    "KXCOVIDBILL": {"c": "Politics", "t": []},
+                    "KXUSTAKEOVER": {"c": "Politics", "t": []},
+                    "KXGTA6ONTIME": {"c": "Entertainment", "t": ["Video games"]},
+                    "KXNFLXA": {"c": "Companies", "t": ["KPIs"]}})
+        self.assertEqual(dash.family_of("KXEPLCORNERS")[0], "Sports & awards")
+        self.assertEqual(dash.family_of("KXIACORN"), ("Commodities & shipping", "Agriculture"))
+        self.assertEqual(dash.family_of("KXCOVIDBILL")[0], "Politics & approval")
+        self.assertEqual(dash.family_of("KXUSTAKEOVER")[0], "Politics & approval")
+        self.assertEqual(dash.family_of("KXGTA6ONTIME")[0], "Sports & awards")
+        self.assertEqual(dash.family_of("KXNFLXA")[0], "Company KPIs")
+        # with no record the names alone decide, as before
+        self.assertEqual(dash.family_of("KXZZZCORN"), ("Commodities & shipping", "Agriculture"))
+
+    def test_kalshi_tags_refine_the_category(self):
+        self._meta({"KXZZZA": {"c": "Science and Technology", "t": ["Public Health"]},
+                    "KXZZZB": {"c": "Financials", "t": ["Indices", "Stock Market"]},
+                    "KXZZZC": {"c": "Financials", "t": ["Companies", "KPIs"]},
+                    "KXZZZD": {"c": "Economics", "t": ["Inflation"]},
+                    "KXZZZE": {"c": "Economics", "t": ["Oil and energy"]},
+                    "KXZZZF": {"c": "Commodities", "t": ["Industrial Metals"]},
+                    "KXZZZG": {"c": "Climate and Weather", "t": ["Hurricanes"]},
+                    "KXZZZH": {"c": "Entertainment", "t": ["Collectibles"]}})
+        for s, fg in (("KXZZZA", ("Other prints", "Health & medicine")),
+                      ("KXZZZB", ("Econ & rates", "KXZZZB")),
+                      ("KXZZZC", ("Company KPIs", "KXZZZC")),
+                      ("KXZZZD", ("Econ & rates", "CPI & inflation")),
+                      ("KXZZZE", ("Commodities & shipping", "Energy & mining")),
+                      ("KXZZZF", ("Commodities & shipping", "Metals")),
+                      ("KXZZZG", ("Weather & quakes", "Hurricanes")),
+                      ("KXZZZH", ("Sports & awards", "Collectibles"))):
+            self.assertEqual(dash.family_of(s), fg, s)
+
+
+class ElectionListDriftTest(unittest.TestCase):
+    """family_of's copies of the bot's election lists -- what it uses when
+    incentive_mm is not imported (the portfolio email, a --no-api build) --
+    are the bot's own defaults, read from its source rather than imported."""
+
+    def test_fallback_lists_match_incentive_mm(self):
+        with open(os.path.join(dash.HERE, "incentive_mm.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        dflt = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "get" \
+                    and len(node.args) == 2 and isinstance(node.args[0], ast.Constant) \
+                    and isinstance(node.args[1], ast.Constant):
+                dflt[node.args[0].value] = node.args[1].value
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and getattr(node.targets[0], "id", "") == "ELECTION_EXTRA_FILE":
+                dflt["ELECTION_EXTRA_FILE"] = node.value.value
+
+        def items(k):
+            return [x.strip() for x in dflt[k].split(",") if x.strip()]
+        self.assertEqual(set(dash._ELECTION_EXACT), set(items("IMM_ELECTION_SERIES")))
+        self.assertEqual(set(dash._ELECTION_EXCLUDE), set(items("IMM_ELECTION_EXCLUDE")))
+        self.assertEqual([p.pattern for p in dash._ELECTION_PATTERNS],
+                         items("IMM_ELECTION_SERIES_PATTERNS"))
+        self.assertEqual(dash.ELECTION_EXTRA_FILE, dflt["ELECTION_EXTRA_FILE"])
+
+
+class SeriesMetaTests(unittest.TestCase):
+    """Builder.refresh_series_meta: Kalshi's series records, one GET /series,
+    into the cache family_of reads."""
+    NOW = _ts("2026-10-10T12:00:00Z")
+    ROWS = [{"ticker": "KXZZZA", "category": "Elections", "tags": ["US Elections"],
+             "settlement_sources": [{"name": "AP", "url": "https://apnews.com"}]},
+            {"ticker": "KXZZZB", "category": "Economics", "tags": [],
+             "settlement_sources": [{"name": "Carbon Arc", "url": "https://www.carbonarc.co"}]}]
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = (dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR, dash._imm_mod)
+        dash.STATUS_DIR = self.dir
+        dash.DASH_DIR = os.path.join(self.dir, "dashboard")
+        dash.CACHE_DIR = os.path.join(dash.DASH_DIR, "cache")
+        dash._imm_mod = None
+        self.reads = 0
+
+    def tearDown(self):
+        dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR, dash._imm_mod = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _refresh(self, at, series, rows=None, api=True):
+        b = dash.Builder(self.NOW + at, api=api, api_force=False)
+
+        def read():
+            self.reads += 1
+            if isinstance(rows, Exception):
+                raise rows
+            return self.ROWS if rows is None else rows
+        b.series_list = read
+        b.refresh_series_meta(series)
+
+    def test_read_daily_and_for_a_new_series(self):
+        self._refresh(0, {"KXZZZA"}, api=False)
+        self.assertEqual(self.reads, 0)                      # no API, no read
+        self._refresh(0, {"KXZZZA"})
+        self.assertEqual(self.reads, 1)
+        self.assertEqual(dash.series_meta()["KXZZZB"], {"c": "Economics", "t": [], "s": ["Carbon Arc"]})
+        self.assertEqual(dash.family_of("KXZZZA")[0], "Elections")
+        self.assertEqual(dash.family_of("KXZZZB"), ("Carbon Arc consumer", "KXZZZB"))
+        # within the day a known series reads nothing, a missing one waits an hour
+        self._refresh(600, {"KXZZZA", "KXZZZNEW"})
+        self.assertEqual(self.reads, 1)
+        self._refresh(3700, {"KXZZZA", "KXZZZNEW"})
+        self.assertEqual(self.reads, 2)
+        # Kalshi does not list it: absent, not re-read every hour
+        self._refresh(7400, {"KXZZZNEW"})
+        self.assertEqual(self.reads, 2)
+        self._refresh(26 * 3600, {"KXZZZA"})                 # a day after the last read
+        self.assertEqual(self.reads, 3)
+
+    def test_a_failed_or_empty_read_keeps_the_cache(self):
+        self._refresh(0, {"KXZZZA"})
+        self._refresh(25 * 3600, {"KXZZZA"}, rows=RuntimeError("Kalshi down"))
+        self._refresh(26 * 3600, {"KXZZZA"}, rows=[])
+        self.assertEqual(self.reads, 3)
+        self.assertEqual(dash.series_meta(force=True)["KXZZZA"]["c"], "Elections")
+        # a series Kalshi stops listing keeps its last record
+        self._refresh(50 * 3600, {"KXZZZA"}, rows=[self.ROWS[1]])
+        self.assertEqual(dash.series_meta(force=True)["KXZZZA"]["c"], "Elections")
 
 
 class ProjectionTests(unittest.TestCase):

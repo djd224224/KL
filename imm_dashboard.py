@@ -132,6 +132,11 @@ EDGE_MAX_SPREAD = 50              # an arrival book this wide has no mid (incent
 MARKET_NOW_TTL = 1800             # re-read an unsettled market's touch every 30 min
 MARKET_READ_BUDGET = 1500         # tickers per build for market records (50 per call)
 EVENT_READ_BUDGET = 60            # GET /events/{e} per build (exclusivity of word/name events)
+# Kalshi's series records for family_of (series_meta): one GET /series lists
+# every series (~15k in ~3 s); re-read daily, or hourly while a series on the
+# page is missing from the cache (a new launch)
+SERIES_META_TTL_H = float(os.environ.get("IMM_DASH_SERIES_META_TTL_H", "24"))
+SERIES_META_MISS_H = 1.0
 FAMILY_CURVE_STEP = 3600          # per-family sparklines: hourly points
 NUMERIC_STRIKES = frozenset(("greater", "greater_or_equal", "less", "less_or_equal", "between"))
 PROMISING_EST = float(os.environ.get("IMM_DASH_PROMISING_EST", "3.0"))
@@ -231,16 +236,36 @@ def fx_array(v: dict):
 # rain, gas and temp under one "Quiet-print & scan" family -- which is now
 # most of the book, so for triage its SUBJECT groups are promoted to
 # families here, and the families the bot has added since (elections, sports
-# ladders, awards, approval polls) get their own. Pure functions; tested.
+# ladders, awards, approval polls) get their own. Tested.
+#
+# How a series is placed: exact names and family prefixes first; then the
+# word rules, each only where Kalshi's own category for the series agrees (or
+# is unknown) -- "CORN" is a crop in Economics but soccer CORNERS in Sports;
+# then the category itself, refined by Kalshi's tags. Kalshi's settlement
+# source decides Carbon Arc (the bot's own test) and the Spice Data food
+# trackers. Kalshi's series records come from series_meta (one GET /series,
+# cached by the API build); without them the names alone decide, as before.
+# Every family_of caller -- this page, the rewards report, the portfolio
+# email, ws_stale_score -- reads the same files, so they file a series alike.
+#
+# 2026-10-10 (Jack: "'other prints' seems to have events that belong in other
+# families"): the category fallback had read the bot's open-scan cache
+# (imm_state.json scan_series_meta), which emptied a week after the scan tier
+# went off on 10/3 (7-day TTL), and the markets table filed elections before
+# the bot was imported, against a stale copy of its list -- so 53 series sat
+# in "Other prints", Trump's RCP approval ($326 of rewards that week) and 30
+# election series among them.
 # ----------------------------------------------------------------------------
 
 _CARBON_ARC_SUFFIX = (("APP", "*APP app charts"), ("FT", "*FT foot traffic"),
                       ("POS", "*POS point of sale"), ("CC", "*CC card spend"),
                       ("ADS", "*ADS ad spend"))
+# the Spice Data menu-price trackers (settlement source, when series_meta has
+# the series). KXCOCACOLAPOS / KXYUMTBFT, once listed here, are Carbon Arc.
 _FOOD = frozenset(("KXCHIPBURRITO", "KXDDCOLDBREW", "KXWENBACONATOR",
                    "KXTBCRUNCHWRAP", "KXBKNUGGETS", "KXCFACHICKSAND",
-                   "KXYUMTBFT", "KXSBUXSAR", "KXCOCACOLAPOS", "KXBKDWHOPPER",
-                   "KXPOPCHICKSAND"))
+                   "KXSBUXSAR", "KXBKDWHOPPER", "KXPOPCHICKSAND"))
+_FOOD_PREFIX = ("KXMCDS",)          # McDonald's Big Mac / Egg McMuffin
 _KPI = frozenset(("KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
                   "KXBBY", "KXWSM", "KXOKTA"))
 # Treasury yields beyond the KXUST names -- the bot's rates allowlist
@@ -251,65 +276,169 @@ _KPI = frozenset(("KXDKS", "KXZM", "KXURBN", "KXLOW", "KXDG", "KXAFRM",
 _TREASURY_PREFIX = ("KXUST", "KXNOTE", "KXTNOTE", "TNOTE", "KXTREASURYMAX", "KX3MTBILL",
                     "TBILL", "KX2YFOMC", "KX10Y2Y", "KX10Y3M", "10Y2Y", "10Y3M",
                     "KXYINVERT", "YINVERT", "KX30YUSTW")
-_TREASURY_RE = re.compile(r"KX\d+YR(DIR|RATE)[A-Z0-9]*")
+# ... and the "will the 10Y hit 5.50%" ladders (KX10YR550PCT, KX30YR6PCT)
+_TREASURY_RE = re.compile(r"KX\d+YR(DIR|RATE|\d+PCT)[A-Z0-9]*")
 _CO_RE = re.compile(
-    r"KX(AAL|ALK|AMZN|AXP|BA|CART|CCL|CMG|COINBASE|CVNA|DPZ|FSLR|GOOG|GOOGL|HOOD|"
-    r"INTC|LMND|LUV|META|MELI|MELIA|NCLH|NFLX|PM|RACE|RBLX|RDDT|RIVN|SBUX|SG|TLN|TTAN|"
-    r"VZ|WH|WING|YOU|YUM|DKS|ZM|URBN|LOW|DG|AFRM|BBY|WSM|OKTA|CTC|VSX)[AY]?")
-# the bot's election membership (incentive_mm.ELECTION_SERIES / _PATTERNS);
-# election_series() below prefers the live module when it is importable
+    r"KX(AAL|ALK|AMZN|AXP|BA|CAKE|CART|CCL|CMG|COINBASE|COST|CVNA|DPZ|FSLR|GOOG|GOOGL|HOOD|"
+    r"INTC|LMND|LUV|META|MELI|MELIA|NCLH|NFLX|PM|RACE|RBLX|RDDT|RIVN|SBUX|SG|STZ|TLN|TTAN|"
+    r"UAL|VZ|WH|WING|YOU|YUM|DKS|ZM|URBN|LOW|DG|AFRM|BBY|WSM|OKTA|CTC|VSX)[AY]?")
+# The bot's election family, copied for a caller that has not imported it
+# (incentive_mm ELECTION_SERIES / ELECTION_EXCLUDE / ELECTION_SERIES_PATTERNS
+# defaults; a drift test compares them) plus its Elections-category file,
+# read where the bot reads it. election_series() asks the live module first.
 _ELECTION_EXACT = frozenset((
     "KXSERBIAPRES", "KXBC2ND", "KXBC3RD", "KXQUEBEC4TH", "KXQUEBEC5TH",
     "KXSAARLAND", "KXNORDRHEINWESTFALEN", "KXSCHLESWIGHOLSTEIN",
     "KXPUNJABASSEMBLY", "KXBRAZILTURNOUT", "KXDEMTRIFECTA", "KXUNDERHARRIS",
     "KXVOTEGENERAL", "KXCAATTORNEYGENERAL", "KXFULTONCHAIR",
-    # the 2026-10-05 batch (the live module also reads the Elections-category
-    # file, election_extra_series.json; this fallback only sees the list)
     "KXSPAIN2ND", "KXSPAIN3RD", "KXSPAINMOV", "KXSPAINGOVT", "KXVOTESPAIN",
     "KXBRPRES2MOV", "KXBRPRES2MOVD", "KXBRRUNOFFABROAD", "KXBRRUNOFFCOUNTRIES",
     "KXBRRUNOFFSTATES", "KXVOTEBR2", "KXARGENTINAPRES1R", "KXISRAELTURNOUT",
-    "KXSNAPELECTIONSWE", "KXUKBYELECTION"))
+    "KXSNAPELECTIONSWE", "KXUKBYELECTION", "KXSTATELEG"))
+_ELECTION_EXCLUDE = frozenset((
+    "KXSENMIN", "KXSERBIAELECTIONCALL", "KXGENERICBALLOTVOTEHUB", "KXVPRESPERSON",
+    "KXISTANBULMAYOR", "KXACKMANMAYOR", "KXAPCALLLAMAYOR", "KXBBGMAYOR",
+    "KXPUBLICTALARICO"))
 _ELECTION_PATTERNS = tuple(re.compile(p) for p in (
-    r"KX[A-Z]+CO(UNTY)?JUDGE", r"KX[A-Z]+JUDGE",
+    r"KX[A-Z]+CO(UNTY)?JUDGE",
     r"(?!KX(ISTANBUL|ACKMAN|APCALLLA|BBG)MAYOR$)KX[A-Z]+MAYOR",
     r"KXHOUSEWINSTATE", r"KXHOUSE[A-Z][A-Z]\d\d?", r"KX[A-Z][A-Z]HOUSE1R",
     r"KXATTYGEN[A-Z][A-Z]"))
+ELECTION_EXTRA_FILE = "election_extra_series.json"     # incentive_mm's, in STATUS_DIR
+_STATE_LEGISLATURES = frozenset(("KXPAHOUSE", "KXPASEN", "KXTXHOUSE", "KXVAHOUSE"))
+_EXIT_POLL_RE = re.compile(r"KX(DEM|GOP)[A-Z]*VOTE(RS)?")    # KXDEMMENVOTE, KXDEMTRUMPVOTERS
 _SPORTS_LADDER_RE = re.compile(
     r"KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAB|CFB|CBB|MLS)[A-Z0-9]*(LADDER|ESCALATOR)[A-Z0-9]*")
 _SPORTS_PREFIX = ("KXNFL", "KXMLB", "KXNBA", "KXNHL", "KXWNBA", "KXNCAA", "KXUFC",
                   "KXVENUEPERFORM", "KXMLS", "KXWC", "KXF1", "KXTTELITE", "KXPGA",
-                  "KXATP", "KXWTA")
-_AWARDS_PREFIX = ("KXGGNOM", "KXGRAMMY", "KXOSCAR", "KXCMA", "KXART", "KXTOP10BB",
+                  "KXATP", "KXWTA", "KXCFB")
+# KXGRAM: every Grammy category (KXGRAMAOTY ...), not only KXGRAMMY*. KXARTIST*
+# are music; KXART itself is the art-auction price (Collectibles below), and
+# KXARTEMISII / KXARTICICE are a launch and sea ice.
+_AWARDS_PREFIX = ("KXGGNOM", "KXGRAM", "KXOSCAR", "KXCMA", "KXARTIST", "KXTOP10BB",
                   "KXNETFLIXTOP", "KXWEEKSNUM", "KXNATBOOK", "KXVMA", "KXEMMY",
                   "KXSPOTIFY", "KXBILLBOARD", "KXBOXOFFICE", "KXCRITICS")
+_COLLECTIBLES = frozenset(("KXART", "KXARTCOLLECTION"))       # + KXPOKEMON*
 _imm_mod = None      # set by _import_imm() when incentive_mm is importable
-# the rewards report's exact "Politics & policy" members (_QP_RULES)
+# the rewards report's exact "Politics & policy" members (_QP_RULES), less the
+# two Kalshi files under Economics, plus Trump's output and schedule, a
+# candidate's public appearances and the crypto market-structure bill
 _POLICY_EXACT = frozenset(("KXBCNDPSEATS", "KXCANALBERTAREMAIN", "KXMAMDANIEO",
-                           "KXDEFRANCHISETAX", "KXCAFAIRPLAN", "KXCASESSION",
-                           "KXPAMAILMARGIN", "KXPAMAILREQ"))
-# Kalshi's own series category, for a series no rule above recognises
+                           "KXCASESSION", "KXPAMAILMARGIN", "KXPAMAILREQ",
+                           "KXBILLSSIGNED", "KXLAGODAYS", "KXNJGOLFVISITCOUNT",
+                           "KXPUBLICTALARICO", "KXCRYPTOSTRUCTURE"))
+_POLITICS_PREFIX = ("KXTRUMP", "KXGENERICBALLOT", "KXEOWEEK", "KXVANCE", "KXHARRIS",
+                    "KXGABBARD", "KXRFK", "KXMAMDANI", "KXNEWSOM", "KXSCOTUS", "KXAPRPOTUS")
+_POLITICS_WORDS = ("APPROVE", "BALLOT", "SENATE", "TARIFF", "VOTE", "ELECTION", "GOVERNOR",
+                   "CABINET", "IMPEACH", "SHUTDOWN", "PRESPERSON", "NOMINEE", "PARLIAMENT",
+                   "CONGRESS")
+_HEALTH_WORDS = ("DENGUE", "SCREWWORM", "MEASLES", "COVID", "MPOX", "H5N1", "BIRDFLU",
+                 "EBOLA", "PLAGUE", "PATHOGEN", "OUTBREAK", "PANDEMIC", "MALARIA", "POLIO",
+                 "INFLUENZA", "FDAAPPROV")
+# "CORN" but not soccer CORNERS or Senator Cornyn
+_AGRI_RE = re.compile(r"CORN(?!ER|YN)|WHEAT|COTTON|CATTLE|ETHANOL|FARMLAND|MAPLE|MILK|LOBSTER|"
+                      r"QUAHOG|HARVEST|SOYBEAN|BROILER|POTATO|CATFISH|CRAB")
+_VERCEL_RE = re.compile(r"KX[A-Z]+V(REQ|SPEND)")              # KXANTHVREQ, KXGOOGVREQ ...
+# The Kalshi categories each word rule may claim a series from (lower case; a
+# series with no record in series_meta passes every one)
+_C_POLITICS = frozenset(("politics", "elections", "world", "business"))
+_C_ECON = frozenset(("economics", "financials", "world"))
+_C_COMPANY = frozenset(("financials", "companies", "economics"))
+_C_COMMODITY = frozenset(("economics", "commodities", "world", "financials"))
+_C_SHIPPING = _C_COMMODITY | {"politics", "transportation"}     # the strait weeklies are "Politics"
+_C_ENERGY = _C_COMMODITY | {"climate and weather", "science and technology"}
+_C_WEATHER = frozenset(("climate and weather", "science and technology", "world"))
+_C_HEALTH = frozenset(("health", "science and technology", "world"))
+_C_SPORTS = frozenset(("sports", "entertainment", "exotics", "culture"))
+_C_AWARDS = _C_SPORTS | {"science and technology"}
+_C_TECH = frozenset(("science and technology", "economics", "companies", "financials", "culture"))
+_C_CRYPTO = frozenset(("crypto", "financials", "economics", "social"))
+_C_TRAVEL = frozenset(("economics", "transportation", "world"))
+# Kalshi's series category, for a series no rule recognises: (family, group;
+# None = the series itself). _category_place refines it by the series' tags.
 _CATEGORY_FAMILY = {
-    "economics": "Econ & rates", "financials": "Company KPIs", "companies": "Company KPIs",
-    "politics": "Politics & approval", "elections": "Politics & approval",
-    "world": "Politics & approval", "science and technology": "AI & tech",
-    "entertainment": "Sports & awards", "sports": "Sports & awards",
-    "climate and weather": "Weather & quakes", "crypto": "Crypto",
-    "commodities": "Commodities & shipping", "transportation": "Other prints",
-    "health": "Other prints",
+    "economics": ("Econ & rates", None), "financials": ("Econ & rates", None),
+    "companies": ("Company KPIs", None),
+    "politics": ("Politics & approval", None), "elections": ("Politics & approval", None),
+    "world": ("Politics & approval", None), "business": ("Politics & approval", None),
+    "science and technology": ("AI & tech", None),
+    "entertainment": ("Sports & awards", None), "sports": ("Sports & awards", None),
+    "exotics": ("Sports & awards", None),
+    "climate and weather": ("Weather & quakes", None), "crypto": ("Crypto", None),
+    "commodities": ("Commodities & shipping", None),
+    "transportation": ("Other prints", "Travel & visits"),
+    "health": ("Other prints", "Health & medicine"),
+    "mentions": ("Other mentions", None),
 }
+_COMPANY_TAGS = frozenset(("Companies", "KPIs", "Company metrics", "CEOs", "Product launches",
+                           "M&A", "IPOs", "Headcount"))
+_ECON_TAG_GROUPS = (("Inflation", "CPI & inflation"), ("Housing", "Housing & mortgage"),
+                    ("Fed", "Central banks"), ("Jobs & Economy", "Jobs & economy"),
+                    ("Growth", "Jobs & economy"))
+_METAL_TAGS = frozenset(("Metals", "Industrial Metals", "Precious Metals", "Gold", "Silver",
+                         "Copper", "Aluminum"))
+SERIES_META_CACHE = "series_meta.json"     # in CACHE_DIR, by Builder.refresh_series_meta
+_series_meta_memo = {"path": None, "mtime": None, "at": 0.0, "val": {}}
+_election_extra_memo = {"path": None, "mtime": None, "at": 0.0, "val": frozenset()}
+
+
+def _file_memo(memo: dict, path: str, parse, force: bool = False):
+    """parse(the JSON at path), re-read when the path or the file's mtime
+    changes; the mtime is looked at no more than every 5 s (family_of runs
+    once per market)."""
+    now = time.monotonic()
+    if not force and memo["path"] == path and now - memo["at"] < 5.0:
+        return memo["val"]
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    if force or memo["path"] != path or memo["mtime"] != mtime:
+        js = load_json(path, {}) if mtime is not None else {}
+        memo["val"] = parse(js if isinstance(js, dict) else {})
+        memo["path"], memo["mtime"] = path, mtime
+    memo["at"] = now
+    return memo["val"]
+
+
+def series_meta(force: bool = False) -> dict:
+    """{series: {"c": Kalshi category, "t": [tags], "s": [settlement source
+    names]}} -- Kalshi's GET /series as Builder.refresh_series_meta cached it
+    ({} before an API build has)."""
+    return _file_memo(_series_meta_memo, os.path.join(CACHE_DIR, SERIES_META_CACHE),
+                      lambda js: js.get("series") or {}, force)
+
+
+def election_extra_series() -> frozenset:
+    """The bot's Elections-category members (incentive_mm ELECTION_EXTRA_FILE,
+    written by the overrides task's new-series pass)."""
+    return _file_memo(_election_extra_memo, os.path.join(STATUS_DIR, ELECTION_EXTRA_FILE),
+                      lambda js: frozenset(str(s).strip() for s in js.get("series") or []))
+
+
+def election_excluded(series: str) -> bool:
+    """One of the bot's ELECTION_EXCLUDE carve-outs: filed under Elections by
+    Kalshi but not a vote (a court case, a call, an appearance)."""
+    excl = getattr(_imm_mod, "ELECTION_EXCLUDE", None) if _imm_mod is not None else None
+    return series in (excl if excl is not None else _ELECTION_EXCLUDE)
 
 
 def election_series(series: str) -> bool:
+    """The bot's election family: incentive_mm.election_series when the bot is
+    imported, else its exact list, its Elections-category file and its name
+    patterns, less the carve-outs."""
     if _imm_mod is not None and hasattr(_imm_mod, "election_series"):
         try:
-            if _imm_mod.election_series(series):
-                return True
+            return bool(_imm_mod.election_series(series))
         except Exception:
             pass
-    return series in _ELECTION_EXACT or any(p.fullmatch(series) for p in _ELECTION_PATTERNS)
+    if series in _ELECTION_EXCLUDE:
+        return False
+    return (series in _ELECTION_EXACT or series in election_extra_series()
+            or any(p.fullmatch(series) for p in _ELECTION_PATTERNS))
 
 
-def _election_group(series: str) -> str:
+def _election_group(series: str, tags=frozenset()) -> str:
     if "JUDGE" in series:
         return "County judges"
     if series.endswith("MAYOR"):
@@ -318,43 +447,117 @@ def _election_group(series: str) -> str:
         return "Attorneys general"
     if series.startswith("KXHOUSE") or series.endswith("HOUSE1R"):
         return "US House"
+    if series.startswith("KXSTATELEG") or series in _STATE_LEGISLATURES or "SUPERMAJ" in series:
+        return "State legislatures"
+    if "OUTPERFORM" in series or series == "KXUNDERHARRIS":
+        return "Candidates vs polls"
+    if any(k in series for k in ("TURNOUT", "EARLYVOTE", "MAILVOTE", "MAILREQ", "MAILMARGIN",
+                                 "EXIT")) or _EXIT_POLL_RE.fullmatch(series):
+        return "Turnout & exit polls"
+    if "Referendums" in tags or any(k in series for k in ("REFS", "REFERENDUM", "BALLOTMEASURE")):
+        return "Referendums & measures"
+    if tags & {"International elections", "Foreign Elections"}:
+        return "International elections"
     return "General elections"
+
+
+def _ai_group(series: str) -> str:
+    if _VERCEL_RE.fullmatch(series):
+        return "Vercel shares"
+    if series.endswith("SHARE"):
+        return "OpenRouter shares"
+    if series.startswith("KXTOKENUSE"):
+        return "OpenRouter tokens"
+    if "ADOPT" in series or series.startswith("KXAISPEND") \
+            or series in ("KXAIFOOD", "KXAIHEALTH", "KXAIMANU", "KXAITECH"):
+        return "AI adoption"
+    if "DATACENT" in series:
+        return "Data centers"
+    return series
+
+
+def _category_place(cat: str, tags=frozenset()):
+    """(family, group or None) for Kalshi category `cat` (lower case) refined
+    by the series' tags; None for a category this table does not know."""
+    if tags & {"Public Health", "Medicine"}:
+        return "Other prints", "Health & medicine"
+    if cat in ("financials", "companies"):
+        return ("Company KPIs", None) if cat == "companies" or tags & _COMPANY_TAGS \
+            else ("Econ & rates", None)
+    if cat == "economics":
+        for tag, grp in _ECON_TAG_GROUPS:
+            if tag in tags:
+                return "Econ & rates", grp
+        if "Oil and energy" in tags:
+            return "Commodities & shipping", "Energy & mining"
+    if cat == "commodities":
+        if "Agriculture" in tags:
+            return "Commodities & shipping", "Agriculture"
+        if tags & _METAL_TAGS:
+            return "Commodities & shipping", "Metals"
+        if "Oil & Gas" in tags:
+            return "Commodities & shipping", "Energy & mining"
+    if cat == "science and technology" and "Space" in tags:
+        return "AI & tech", "Space"
+    if cat == "climate and weather" and "Hurricanes" in tags:
+        return "Weather & quakes", "Hurricanes"
+    if cat == "entertainment" and "Collectibles" in tags:
+        return "Sports & awards", "Collectibles"
+    return _CATEGORY_FAMILY.get(cat)
 
 
 def family_of(series: str, category: str = ""):
     """(family, group) for a series ticker. `category` (Kalshi's series
-    category, when known) places a series none of the rules recognise."""
+    category; else series_meta's), the series' Kalshi tags and settlement
+    sources, when known, steer the word rules and place a series no rule
+    recognises. Two categories outrank the name rules: Mentions (a word
+    market) and Elections (less the bot's carve-outs)."""
     s = series or ""
+    rec = series_meta().get(s) or {}
+    cat = (category or rec.get("c") or "").strip().lower()
+    tags = frozenset(rec.get("t") or ())
+    src = " ".join(rec.get("s") or ()).lower()
+
+    def fits(cats):                     # Kalshi's category agrees, or is unknown
+        return not cat or cat in cats
+
     if s.startswith("KXEARNINGSMENTION"):
         return "Earnings mentions", s[len("KXEARNINGSMENTION"):] or "earnings"
     if s.startswith("KXTRUMPMENTION"):
         return "TRUMP mentions", ("TRUMPMENTION-B" if s.startswith("KXTRUMPMENTIONB")
                                   else "TRUMPMENTION")
-    if "MENTION" in s:
+    if "MENTION" in s or cat == "mentions":                   # KXTRUMPSAY: words Trump says
         return "Other mentions", s
-    if election_series(s):
-        return "Elections", _election_group(s)
+    if election_series(s) or (cat == "elections" and not election_excluded(s)):
+        return "Elections", _election_group(s, tags)
     if s in _POLICY_EXACT:
         return "Politics & approval", s
     if s.startswith("KXTEMPHELP"):                # temporary-help employment, not weather
         return "Econ & rates", "Jobs & economy"
-    if s.startswith(("KXTRUMP", "KXGENERICBALLOT", "KXEOWEEK", "KXVANCE", "KXHARRIS",
-                     "KXGABBARD", "KXRFK", "KXMAMDANI", "KXNEWSOM", "KXSCOTUS", "KXNEXT")) \
-            or any(k in s for k in ("APPROVE", "BALLOT", "SENATE", "TARIFF", "MINWAGE", "VOTE",
-                                    "ELECTION", "GOVERNOR", "CABINET", "IMPEACH", "SHUTDOWN",
-                                    "PRESPERSON", "NOMINEE", "PARLIAMENT", "CONGRESS")):
+    if fits(_C_POLITICS) and (s.startswith(_POLITICS_PREFIX)
+                              or any(k in s for k in _POLITICS_WORDS)):
         return "Politics & approval", s
     if s == "KXRT":
         return "Rotten Tomatoes", "KXRT"
+    # Carbon Arc: the bot's test is the settlement source; the suffix names
+    # the prism. Without Kalshi's record, the suffix alone (Taylor SWIFT and
+    # MSFT end in FT, so the record wins when there is one).
     for sfx, name in _CARBON_ARC_SUFFIX:
-        if s.endswith(sfx) and s not in _FOOD:
+        if s.endswith(sfx) and ("carbon arc" in src if rec else s not in _FOOD):
             return "Carbon Arc consumer", name
+    if "carbon arc" in src:
+        return "Carbon Arc consumer", s
+    if s in _FOOD or s.startswith(_FOOD_PREFIX) or "spice data" in src:
+        return "Company KPIs", "Food price trackers"
     if _SPORTS_LADDER_RE.fullmatch(s):
         return "Sports & awards", "Sports ladders"
-    if s.startswith(_SPORTS_PREFIX):
+    if fits(_C_SPORTS) and (s.startswith(_SPORTS_PREFIX) or "NEXTTEAM" in s):
         return "Sports & awards", "Sports & venues"
-    if s.startswith(_AWARDS_PREFIX) or s == "KXMC" or "NOBEL" in s or "ALBUM" in s \
-            or s.startswith(("KXYT", "KXMUSIC", "KXDWTS")):
+    if s in _COLLECTIBLES or s.startswith("KXPOKEMON"):
+        return "Sports & awards", "Collectibles"
+    if "NOBEL" in s or fits(_C_AWARDS) and (
+            s.startswith(_AWARDS_PREFIX) or s == "KXMC" or "ALBUM" in s
+            or s.startswith(("KXYT", "KXMUSIC", "KXDWTS")) or "DANCINGWITHTHESTARS" in s):
         return "Sports & awards", "Awards, charts & media"
     if re.fullmatch(r"KX[A-Z]{2,6}SNOWM", s):
         return "Weather & quakes", "Snow monthlies"
@@ -363,9 +566,16 @@ def family_of(series: str, category: str = ""):
                                     "Weekend rain" if s.startswith("KXRAINWKND") else "Rain spans")
     if s.startswith("KXTEMP"):
         return "Weather & quakes", "Hourly temp"
-    if any(k in s for k in ("QUAKE", "HURRICANE", "AQI", "TORNADO")) or s.startswith(("KXAVGT", "KXHIGH", "KXLOWT", "KXHURCAT")):
-        return "Weather & quakes", s
-    if s.startswith(("KXDIESEL", "KXAAAGAS", "KXUSGASCPI", "KXPAGAS")):
+    if fits(_C_WEATHER):
+        if "HURRICANE" in s or s.startswith("KXHUR"):
+            return "Weather & quakes", "Hurricanes"
+        if any(k in s for k in ("QUAKE", "AQI", "TORNADO", "SNOWFALL")) \
+                or s.startswith(("KXAVGT", "KXHIGH", "KXLOWT")):
+            return "Weather & quakes", s
+    if fits(_C_HEALTH) and any(k in s for k in _HEALTH_WORDS):
+        return "Other prints", "Health & medicine"
+    # KXPAGAS is Pennsylvania natural-gas PRODUCTION (energy), not a pump price
+    if s.startswith(("KXDIESEL", "KXAAAGAS", "KXUSGASCPI")):
         if s == "KXAAAGASD":
             g = "AAA national daily"
         elif s.startswith("KXAAAGASD"):
@@ -374,6 +584,8 @@ def family_of(series: str, category: str = ""):
             g = "AAA weekly"
         elif s.startswith("KXAAAGASM"):
             g = "AAA monthly"
+        elif s.startswith("KXAAAGASEOY"):
+            g = "AAA year-end"
         elif s.startswith("KXDIESELD"):
             g = "Diesel daily"
         elif s.startswith("KXDIESELW"):
@@ -383,47 +595,64 @@ def family_of(series: str, category: str = ""):
         else:
             g = "Gas CPI"
         return "Gas & diesel", g
-    if s in _FOOD:
-        return "Company KPIs", "Food price trackers"
-    if s in _KPI or _CO_RE.fullmatch(s):
+    if s in _KPI or (fits(_C_COMPANY) and _CO_RE.fullmatch(s)):
         return "Company KPIs", s
-    if s.startswith(("KXCBD", "KXFED", "KXRBNZ", "KXBOI", "KXECB")):
-        return "Econ & rates", "Central banks"
-    if s.startswith("KXCPI") or "INFL" in s or s in ("KXOER", "KXIBONDFIX", "KXPCE", "KXCOREPCE",
-                                                        "KXSAMOMINF"):
-        return "Econ & rates", "CPI & inflation"
-    if s.startswith(_TREASURY_PREFIX) or _TREASURY_RE.fullmatch(s):
+    # (KXUSTAKEOVER, KXUSTR and KXUSTESTSMATH are not Treasuries: Politics / Science)
+    if fits(_C_ECON) and (s.startswith(_TREASURY_PREFIX) or _TREASURY_RE.fullmatch(s)):
         return "Econ & rates", "Treasury yields"
-    if any(k in s for k in ("MORT", "MTG", "HOME", "HPI", "HOUSING", "NHSALES", "OFFVAC", "PERMITS")):
-        return "Econ & rates", "Housing & mortgage"
-    if any(k in s for k in ("EMP", "JOBS", "JOLTS", "GDP", "CFNAI", "RETAIL", "WALLSTBONUS",
-                            "VEHICLEPROD", "POP", "UNEMP", "REMIT", "DEFICIT", "DEBT")):
-        return "Econ & rates", "Jobs & economy"
-    if any(k in s for k in ("SUEZ", "BABELMANDEB", "HORMUZ", "PANAMA", "BOSPORUS", "MALACCA",
-                            "TEU", "SCFI", "FREIGHT")):
+    if s.startswith("KXCPI") or s in ("KXOER", "KXIBONDFIX", "KXPCE", "KXCOREPCE", "KXSAMOMINF"):
+        return "Econ & rates", "CPI & inflation"
+    if s.startswith(("KXTRUF", "KXTRUEV")):                  # Truflation's daily indices
+        return "Econ & rates", "Truflation"
+    if fits(_C_ECON):
+        # (KXBOI was a guess at the Bank of Israel; the one KXBOI series is
+        # Boise airport's passenger count)
+        if s.startswith(("KXCBD", "KXFED", "KXRBNZ", "KXECB")) or "SOFR" in s or "RATECUT" in s:
+            return "Econ & rates", "Central banks"
+        if "INFL" in s:
+            return "Econ & rates", "CPI & inflation"
+        if any(k in s for k in ("MORT", "MTG", "HPI", "HOUSING", "NHSALES", "OFFVAC", "PERMITS",
+                                "HOMEPRICE", "USHOME", "HOMEINVENT", "FAIRPLAN", "ASKRENT")):
+            return "Econ & rates", "Housing & mortgage"
+        # state jobs series end in EMP (KXMIAUTOEMP), so TEMP / OZEMPIC do not count
+        if s.endswith("EMP") or any(k in s for k in (
+                "UNEMP", "JOBS", "JOLTS", "GDP", "CFNAI", "NFCI", "RETAIL", "WALLSTBONUS",
+                "VEHICLEPROD", "POPULATION", "REMIT", "DEFICIT", "DEBT", "MINWAGE",
+                "FRANCHISETAX", "BOURBON", "PMI")) or re.fullmatch(r"KX[A-Z]{2}POP", s):
+            return "Econ & rates", "Jobs & economy"
+    if fits(_C_SHIPPING) and (s.endswith("TEU") or any(
+            k in s for k in ("SUEZ", "BABELMANDEB", "HORMUZ", "PANAMA", "BOSPORUS", "MALACCA",
+                             "SCFI", "FREIGHT"))):
         return "Commodities & shipping", "Straits, ports & freight"
-    if any(k in s for k in ("CRUDE", "OIL", "SPRLVL", "COAL", "TACONITE", "MARCELLUS",
-                            "NUCLEAR", "RESPOWER", "NATGAS")):
+    if fits(_C_COMMODITY):
+        if _AGRI_RE.search(s) or s == "KXNECOF":            # Nebraska cattle on feed
+            return "Commodities & shipping", "Agriculture"
+        if s in ("KXALMWP", "KXAPSMM"):                      # aluminum premium, tungsten
+            return "Commodities & shipping", "Metals"
+    if fits(_C_ENERGY) and (s == "KXPAGAS" or any(
+            k in s for k in ("CRUDE", "OIL", "SPRLVL", "COAL", "TACONITE", "MARCELLUS",
+                             "NUCLEAR", "RESPOWER", "NATGAS", "ERCOT", "PJM"))):
         return "Commodities & shipping", "Energy & mining"
-    if any(k in s for k in ("CORN", "WHEAT", "COTTON", "CATTLE", "ETHANOL", "FARMLAND", "MAPLE",
-                            "MILK", "LOBSTER", "QUAHOG", "HARVEST", "SOYBEAN", "SCREWWORM")) \
-            or s == "KXNECOF":                      # Nebraska cattle on feed
-        return "Commodities & shipping", "Agriculture"
-    if s.startswith(("KXAI", "KXANTHV", "KXOPENV", "KXMOONV", "KXDEEPV", "KXLLM", "KXOAI",
-                     "KXANTHROPIC", "KXOPENAI", "KXGEMINI", "KXGOOGSHARE", "KXANTHSHARE",
-                     "KXWAYMO", "KXTESLA", "KXMODEL", "KXARENA", "KXTOPMODEL", "KXCHINAAI")) \
-            or "ADOPT" in s or s.startswith("KXTOKENUSE") or "DATACENT" in s \
+    if fits(_C_TECH) and (
+            (s.startswith("KXAI") and not s.startswith("KXAIR"))
+            or s.startswith(("KXANTHV", "KXOPENV", "KXMOONV", "KXDEEPV", "KXLLM", "KXOAI",
+                             "KXANTHROPIC", "KXOPENAI", "KXGEMINI", "KXGOOGSHARE", "KXANTHSHARE",
+                             "KXWAYMO", "KXTESLA", "KXMODEL", "KXARENA", "KXTOPMODEL",
+                             "KXCHINAAI", "KXTOKENUSE"))
+            or any(k in s for k in ("ADOPT", "DATACENT", "LLM")) or _VERCEL_RE.fullmatch(s)
             or s in ("KXOPENSOURCESHARE", "KXXIAOMISHARE", "KXOPENSHARE",
-                     "KXDEEPSHARE", "KXB200WS", "KXGPU"):
-        return "AI & tech", s
-    if s.startswith(("KXBTC", "KXETH", "KXBNB", "KXSOL", "KXXRP", "KXDOGE", "KXCRYPTO",
-                     "KXINXVSBTC", "KXCHINAUNBANBTC")):
+                     "KXDEEPSHARE", "KXB200WS", "KXGPU")):
+        return "AI & tech", _ai_group(s)
+    if fits(_C_CRYPTO) and not s.startswith("KXSOLAR") and s.startswith((
+            "KXBTC", "KXETH", "KXBNB", "KXSOL", "KXXRP", "KXDOGE", "KXCRYPTO", "KXINXVSBTC",
+            "KXCHINAUNBANBTC")):
         return "Crypto", s
-    if any(k in s for k in ("VISIT", "HOTEL", "SUBWAY", "ONTIME", "TSA", "ATTENDANCE", "AIRPORT")):
+    if fits(_C_TRAVEL) and any(k in s for k in ("VISIT", "HOTEL", "SUBWAY", "ONTIME", "TSA",
+                                                "ATTENDANCE", "AIRPORT", "PASSENGER")):
         return "Other prints", "Travel & visits"
-    fam = _CATEGORY_FAMILY.get((category or "").strip().lower())
-    if fam:
-        return fam, s
+    place = _category_place(cat, tags)
+    if place:
+        return place[0], place[1] or s
     return "Other prints", s
 
 
@@ -1363,6 +1592,13 @@ def _kalshi_event(ev):
             "markets": e.get("markets") or js.get("markets") or []}
 
 
+def _kalshi_series_list():
+    """Every Kalshi series record (GET /series: ~15k in one ~19 MB response)."""
+    sys.path.insert(0, HERE)
+    from kalshi_reads import kalshi_get
+    return (kalshi_get("/series", {}) or {}).get("series") or []
+
+
 def _import_imm():
     """(imm_quote_gaps, incentive_mm) with the launcher env mirrored first, or
     (None, None). imm_quote_gaps must be imported BEFORE incentive_mm."""
@@ -1639,6 +1875,7 @@ class Builder:
         self.exits = []
         self.market_lookup = None     # tests inject {ticker: market} lookups
         self.event_lookup = None      # ... and an event -> {mutually_exclusive, markets} one
+        self.series_list = None       # ... and Kalshi's series records (() -> [record])
         self.mrec, self.evmeta = {}, {}
         self.now_values = {}
         self.markouts_h = {}
@@ -2113,6 +2350,57 @@ class Builder:
                     os.replace(p_ + ".tmp", p_)
             except OSError:
                 pass
+
+    def refresh_series_meta(self, series) -> None:
+        """Kalshi's category, tags and settlement sources for every series
+        (series_meta, which family_of reads) from one GET /series, cached in
+        CACHE_DIR/series_meta.json. Re-read every SERIES_META_TTL_H, or after
+        SERIES_META_MISS_H while one of `series` is missing from it (a new
+        launch); a series Kalshi does not list stays "absent" until the next
+        daily read, and a series Kalshi drops keeps its last record."""
+        if not self.api:
+            return
+        path = os.path.join(CACHE_DIR, SERIES_META_CACHE)
+        cur = load_json(path, {})
+        have = cur.get("series") or {}
+        absent = set(cur.get("absent") or [])
+        age_h = (self.now - _f(cur.get("at"))) / 3600.0
+        missing = sorted(s for s in series if s and s not in have and s not in absent)
+        if age_h < SERIES_META_TTL_H and not (missing and age_h >= SERIES_META_MISS_H):
+            return
+        t0 = time.time()
+        try:
+            rows = (self.series_list or _kalshi_series_list)()
+        except Exception as e:
+            log(f"! series records read failed ({e!r}); families keep the cached categories")
+            return
+        out = {}
+        for so in rows or []:
+            t = (so or {}).get("ticker")
+            if t:
+                srcs = [str((x or {}).get("name") or "") for x in (so.get("settlement_sources") or [])
+                        if isinstance(x, dict)]
+                out[t] = {"c": so.get("category") or "", "t": list(so.get("tags") or []),
+                          "s": sorted({x for x in srcs if x})[:4]}
+        if not out:
+            log("! series records: Kalshi listed none; families keep the cached categories")
+            return
+        for t, v in have.items():
+            out.setdefault(t, v)
+        absent_now = sorted(s for s in set(series) | (absent if age_h < SERIES_META_TTL_H else set())
+                            if s and s not in out)
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"at": self.now, "absent": absent_now, "series": out}, f,
+                          separators=(",", ":"))
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            log(f"! series records not saved ({e!r})")
+            return
+        series_meta(force=True)
+        log(f"series records: {len(out)} in {time.time() - t0:.1f}s "
+            f"({len(missing)} were missing, {len(absent_now)} not listed by Kalshi)")
 
     def struct_of(self, t: str):
         """(strike type, floor, cap, market type) or None (not read yet)."""
@@ -2783,12 +3071,16 @@ class Builder:
             if t:
                 snap_by_t[t] = r
 
-        cats = {k: str((v or {}).get("category") or "")
-                for k, v in (st.get("scan_series_meta") or {}).items()}
+        # families: the bot's own election family (imported here, before any
+        # market is filed, not first by the API sections below) and Kalshi's
+        # series records, which family_of reads itself
+        if self.api:
+            _import_imm()
+        self.refresh_series_meta({series_of(t) for t in market_union})
         markets = {}
         for t in market_union:
             ser = series_of(t)
-            fam, grp = family_of(ser, cats.get(ser, ""))
+            fam, grp = family_of(ser)
             rec = {"t": t, "ev": event_of(t), "ser": ser, "fam": fam, "grp": grp,
                    "sel": t in selected, "scanm": t in scan_members,
                    "pos": round(own_pos.get(t, 0.0), 2), "avg": round(own_avg.get(t, 0.0), 2),
@@ -2882,7 +3174,7 @@ class Builder:
 
         def fam_of_t(tk):
             r = markets.get(tk)
-            return r["fam"] if r else family_of(series_of(tk), cats.get(series_of(tk), ""))[0]
+            return r["fam"] if r else family_of(series_of(tk))[0]
         fcurves = {k: self.family_curves(w["start"], w["end"], fam_of_t)
                    for k, w in self.windows.items() if k in ("today", "yesterday", "24h", "7d")}
         for dd in days.values():
@@ -2891,7 +3183,7 @@ class Builder:
                 if fc:
                     dd["fc"] = fc
         changes = self.load_changes(min(self.windows["7d"]["start"], self.detail_from))
-        realize = rollup_realization(self.calib, lambda s: family_of(s, cats.get(s, ""))[0])
+        realize = rollup_realization(self.calib, lambda s: family_of(s)[0])
         self._t("drivers", t1)
 
         per_market_paths = self._market_paths(markets, wins)
@@ -2947,7 +3239,7 @@ class Builder:
         proj = self.projection(snap_by_t, cycle_ts)     # after the API import: the size schedule
         # fills through the day: resting $ per family per hour + the size schedule
         fday = fill_day_payload(
-            self.rest, lambda tk: family_of(series_of(tk), cats.get(series_of(tk), ""))[0],
+            self.rest, lambda tk: family_of(series_of(tk))[0],
             int((self.now - HISTORY_DAYS * 86400) // 3600), int(self.now // 3600) + 1,
             self.now,
             mult_of=(lambda d: long_dated_hour_mults(_imm_mod, d)) if _imm_mod is not None else None)
@@ -3251,6 +3543,8 @@ class Builder:
         now_utc = datetime.fromtimestamp(self.now, timezone.utc)
         progs, p_at, p_err = _api_cached("programs", PROGRAMS_TTL_MIN, self.api_force,
                                          lambda: fetch_programs(gaps, imm, now_utc))
+        if progs:                           # a new launch's series files by its category too
+            self.refresh_series_meta({r["series"] for r in progs.values()})
         reg_path = os.path.join(DASH_DIR, "programs_seen.json")
         reg = load_json(reg_path, {})
         if not reg:
