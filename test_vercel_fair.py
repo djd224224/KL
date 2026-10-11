@@ -325,9 +325,25 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
     def test_defaults(self):
         if os.environ.get("IMM_VERCEL_HORIZON_DAYS") is None:
             self.assertEqual(vf.HORIZON_DAYS, 4)
-        self.assertEqual(vf.DOW_SERIES, frozenset({"KXOPENSOURCESHARE"}))
+        # + the Google / DeepSeek / Anthropic requests series (2026-10-11)
+        self.assertEqual(vf.DOW_SERIES, frozenset({"KXOPENSOURCESHARE", "KXGOOGVREQ",
+                                                   "KXDEEPVREQ", "KXANTHVREQ"}))
         self.assertEqual(vf.MR_SERIES, frozenset({"KXMOONVSPEND"}))
         self.assertEqual(vf.SQRT_SERIES, frozenset({"KXMOONVSPEND"}))
+
+    def test_requests_series_take_the_weekday_term(self):
+        # Jack 2026-10-11 ("yes ship 3"): GOOG / DEEP / ANTH requests carry the
+        # weekday term; the other lab series (OPENVREQ here) do not
+        x = weekly_open()
+        fri = max(date.fromisoformat(d) for d in x if date.fromisoformat(d).weekday() == 4)
+        x = {d: v for d, v in x.items() if d <= fri.isoformat()}
+        sun = fri + timedelta(days=2)
+        for s in ("KXGOOGVREQ", "KXDEEPVREQ", "KXANTHVREQ"):
+            e = vf.fair_entry(x, sun, fri, 1.0, s)
+            self.assertAlmostEqual(e["adj"]["dow"], 15.0, delta=0.6, msg=s)
+            self.assertAlmostEqual(e["x_l"] + statistics.median(e["errs"]), 75.0,
+                                   delta=1.0, msg=s)
+        self.assertNotIn("adj", vf.fair_entry(x, sun, fri, 1.0, "KXOPENVREQ"))
 
     def test_dow_profile_of_a_weekly_pattern(self):
         z = weekly_open(wiggle=False)
@@ -409,12 +425,14 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
         self.assertEqual((n, miss, mode), (8 * vf.HORIZON_DAYS, 0, "complete"))
         m = data["model"]
         self.assertEqual((m["dow_series"], m["mr_series"], m["sqrt_series"]),
-                         (["KXOPENSOURCESHARE"], ["KXMOONVSPEND"], ["KXMOONVSPEND"]))
+                         (["KXANTHVREQ", "KXDEEPVREQ", "KXGOOGVREQ", "KXOPENSOURCESHARE"],
+                          ["KXMOONVSPEND"], ["KXMOONVSPEND"]))
         self.assertEqual((m["season_days"], m["mr_trail_days"], m["open_widen"]),
                          (vf.SEASON_DAYS, vf.MR_TRAIL_DAYS, vf.OPEN_WIDEN))
         self.assertIn("adj", data["entries"]["KXOPENSOURCESHARE-26SEP29"])
         self.assertIn("adj", data["entries"]["KXMOONVSPEND-28SEP26"])
         self.assertNotIn("adj", data["entries"]["KXOPENVREQ-28SEP26"])
+        self.assertIn("adj", data["entries"]["KXGOOGVREQ-28SEP26"])        # 2026-10-11
 
     def test_history_read_covers_the_weekday_window(self):
         r = mock.Mock()

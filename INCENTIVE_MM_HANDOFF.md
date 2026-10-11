@@ -10447,3 +10447,46 @@ WHY: front-run on essentially every crossing, ahead of every public feed.
   "before GFZ" understated today's flow.
 Tests: TestQuakeFarStrikeAsks now patches the strikes on (the shipped default
 is asserted empty).
+
+## 2026-10-11 ~18:47Z — evening 1.5x through 23:00 ET; x2 on KXRT / endorsements / shipping / AI adoption; join ahead of the pile (Jack: "do 1,2,6,8")
+
+2a1321c, live in run b329f93d (18:47:13Z code-change handoff, 1,676 orders adopted). Study:
+run-logs/incentive-mm/report_tools/mult_study (evidence_out.txt, verify_room.py, survey_forward.py,
+forward_combine.py).
+- EVENING_SIZE_MULTS default 18-21 -> 18-23 ET x1.5 (IMM_EVENING_SIZE_MULT=18-21:1.5 restores).
+  22-23 ET netted 46c per 1k resting contract-hours at the 24h mark-out, positive 20/20
+  weekdays; at the daily hour steps reward tracks size in the same markets (21->22 ET: size
+  x0.686, modelled reward x0.697), so ~+$20-30/day on weekdays. Saturday still stacks (x3).
+- FAMILY_X2_1011: KXRT, KXTRUMPENDORSEMENTS, SHIPPING_X2_SERIES (the nine measured strait / port
+  series) and every RAMP_AI_SERIES at x2 on the size_mult wire (rungs, caps, skew knees; the
+  yield x1.5 stops applying). Knobs IMM_RT/ENDORSE/SHIPPING/AIADOPT_SIZE_MULT (1 reverts).
+  KXSUEZWEEKLY is the scan-graduate ARCHETYPE: ensure_family_override now drops size_mult when
+  it clones that archetype, so other graduates stay x1 (test_imm_scan_graduates checks equality,
+  not identity, now). First cycle amended KXRT / endorsements / shipping rungs 20 -> 40-50.
+- JOIN AHEAD (JOIN_AHEAD_MODE, default on): per side, on the EXTERNAL book, the at-reference
+  rung may rest ahead of a pile its own size demotes when that lifts the side's share >= 50%
+  and >= $0.05/day, >= 1 tick behind the external best, with >= 50 contracts still ahead; each
+  candidate is sized at its own depth (capped_ref_mult). Otherwise the rung rests at the
+  EXTERNAL reference. Not: sports ladders, dailies, Carbon Arc (verified or suffix), approval
+  (IMM_JOIN_AHEAD_EXCLUDE), sub-penny, gate-capped markets, reduce-only / unwind sides.
+  Errors fall back to the plain reference (logged once). IMM_JOIN_AHEAD=dry logs only; off.
+  First cycle: 25 sides moved (21 Vercel 14OCT26 strikes, ~3,000 -> ~110 contracts ahead),
+  +$5.42/day modelled. Log: "join-ahead TICKER side: Xc -> Yc (...)" / "back to the reference".
+
+## 2026-10-11 ~19:30Z — Vercel fair: the weekday term on the Google / DeepSeek / Anthropic requests series (Jack: "yes ship 3")
+
+vercel_fair.DOW_SERIES default + KXGOOGVREQ, KXDEEPVREQ, KXANTHVREQ (IMM_VERCEL_DOW_SERIES restores
+"KXOPENSOURCESHARE"). Evidence:
+- the 10/05 walk-forward (fairfix-2026-10-05/bt_lag0.json, anchors Jun-Oct, widen 1.5): CRPS
+  -24.6% / -9.5% / -8.5%, 90% coverage unchanged; the other four series got slightly worse
+  (+0.6 to +1.9%), so they stay off;
+- re-run on the live export for anchors 9/14-10/09: -31.5% / -6.4% / +2.4%; the second half
+  (after DeepSeek's ~20% -> ~12% drop on 9/28) -39.2% / -17.5% / -33.5%.
+- Weekday profiles are stable over 4 / 8 / 13 weeks: Google low on Saturday (-3.2 pp), DeepSeek
+  high on weekends (+2 to +3 pp), Anthropic low on Saturday (-1.5 pp).
+- On the 11 Oct (Sunday) books the new fairs sit further from the market than the old (mean
+  |fair - mid| 13.4c vs 6.4c on 26 14OCT26 strikes: DeepSeek ~3 pp lower midweek, Google
+  ~1.5-1.8 pp higher). No gate decision flipped at the 15c tolerance; the market looks to be
+  pricing midweek off the weekend level. Watch the D = 10/13-10/15 settlements against both.
+Deploy: helper module, so restart_imm.ps1 (plain). Check: vercel_fair.json "model" dow_series
+lists the four series and the three requests series' entries carry "adj".

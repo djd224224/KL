@@ -53,7 +53,8 @@ found the running fair ~9 pp low on the open-weights share for a weekend D
 (a Friday running share priced a Sunday) and ~6 pp low on Moonshot spend
 after its 10/01 drop, with Brier vs the book +0.066 and +0.170. Two terms,
 each on by series (the other six series are unchanged):
-  DOW_SERIES (KXOPENSOURCESHARE): changes of the series less its weekday
+  DOW_SERIES (KXOPENSOURCESHARE; + KXGOOGVREQ / KXDEEPVREQ / KXANTHVREQ
+      since 2026-10-11): changes of the series less its weekday
       effect (each day's deviation from its centred 7-day mean over
       SEASON_DAYS, by weekday; open-weights runs ~+4 pp Sat/Sun, -1 to -2.6
       Mon-Thu), re-centred by effect(D) - effect(anchor day).
@@ -131,8 +132,15 @@ OPEN_WIDEN = _env_float("IMM_VERCEL_OPEN_WIDEN", 1.5)          # 1.0 until 2026-
 # D = 10/8 programs, posted 10/4 16:02Z, sat without a read until 00:00Z)
 HORIZON_DAYS = int(_env_float("IMM_VERCEL_HORIZON_DAYS", 4))
 MIN_SAMPLE = 20
-# weekday effect / mean reversion / sqrt space, by series (2026-10-05)
-DOW_SERIES = _env_set("IMM_VERCEL_DOW_SERIES", "KXOPENSOURCESHARE")
+# weekday effect / mean reversion / sqrt space, by series (2026-10-05).
+# The weekday term also on the Google / DeepSeek / Anthropic REQUESTS series
+# since 2026-10-11 (Jack: "yes ship 3"): the 10/05 walk-forward backtest
+# (fairfix-2026-10-05/bt_lag0.json, anchors Jun-Oct, widen 1.5) cut their
+# CRPS 24.6% / 9.5% / 8.5% with the 90% band's coverage unchanged (98 -> 97%,
+# 89 -> 88%, 94 -> 94%). It made the other four series slightly worse (OPENVREQ,
+# OPENVSPEND, ANTHVSPEND, MOONVSPEND +0.6 to +1.9%), so they stay off.
+DOW_SERIES = _env_set("IMM_VERCEL_DOW_SERIES",
+                      "KXOPENSOURCESHARE,KXGOOGVREQ,KXDEEPVREQ,KXANTHVREQ")
 SEASON_DAYS = int(_env_float("IMM_VERCEL_SEASON_DAYS", 90))
 MR_SERIES = _env_set("IMM_VERCEL_MR_SERIES", "KXMOONVSPEND")
 MR_TRAIL_DAYS = int(_env_float("IMM_VERCEL_MR_TRAIL_DAYS", 7))
