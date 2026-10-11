@@ -19294,8 +19294,9 @@ class TestYouTube2Pilot(unittest.TestCase):
 class TestTrumpWeeklyPilot(unittest.TestCase):
     """The Trump weekly pilots (Jack 2026-10-11: "yes pilot both, $40/day
     halt"): KXTRUTHSOCIAL quoted only until 5 days before the close,
-    KXEOWEEK bids only; both safe-join, x1 at every hour, 100 per market and
-    per event, and a daily loss halt PER SERIES."""
+    KXEOWEEK on both sides (shipped bids-only, switched the same evening:
+    "yes switch EO to both sides"); both safe-join, x1 at every hour, 100
+    per market and per event, and a daily loss halt PER SERIES."""
 
     TS = "KXTRUTHSOCIAL-68DEC09-B109"
     EO = "KXEOWEEK-68DEC09-1"
@@ -19349,8 +19350,10 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
                 self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
             with mock.patch.object(imm, "LADDER_MODE", "atref"):
                 self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
-        self.assertTrue(imm.series_bid_only("KXEOWEEK"))
+        self.assertFalse(imm.series_bid_only("KXEOWEEK"))          # both sides
         self.assertFalse(imm.series_bid_only("KXTRUTHSOCIAL"))
+        with mock.patch.object(imm, "TWK_BID_ONLY_SERIES", frozenset({"KXEOWEEK"})):
+            self.assertTrue(imm.series_bid_only("KXEOWEEK"))       # the knob
         # KXTRUTHSOCIAL: out 5 days before the close; KXEOWEEK keeps the
         # ticker-date rule (its markets close ~2 weeks after the week)
         close = datetime(2026, 10, 18, 13, 59, tzinfo=timezone.utc)
@@ -19365,10 +19368,10 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
             self.assertTrue(IncentiveMarketMaker._allowed(self.TS))
             self.assertTrue(IncentiveMarketMaker._allowed(self.EO))
 
-    def test_bids_only_and_a_loss_halt_per_series(self):
+    def test_both_sides_and_a_loss_halt_per_series(self):
         bot = self._bot()
         bot.run_cycle()
-        self.assertEqual(self._sides(bot, self.EO), {"bid"})          # bids only
+        self.assertEqual(self._sides(bot, self.EO), {"bid", "ask"})
         self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})
         self.assertEqual(bot.state.twk_pnl_baseline.get("KXEOWEEK"), 0.0)
         # KXEOWEEK past its $40: it stands aside, KXTRUTHSOCIAL quotes on
@@ -19392,7 +19395,14 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         bot.state.twk_pnl_baseline = {}
         bot.pnl.realized[self.EO] = 0.0
         bot.run_cycle()
-        self.assertEqual(self._sides(bot, self.EO), {"bid"})
+        self.assertEqual(self._sides(bot, self.EO), {"bid", "ask"})
+
+    def test_bids_only_knob(self):
+        with mock.patch.object(imm, "TWK_BID_ONLY_SERIES", frozenset({"KXEOWEEK"})):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._sides(bot, self.EO), {"bid"})
+            self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})
 
     def test_kill_switch(self):
         with mock.patch.object(imm, "TWK_ENABLE", False):

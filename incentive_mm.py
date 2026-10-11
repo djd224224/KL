@@ -4945,7 +4945,7 @@ _DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D,KXYTTOPVIDEO2D"
 # every other artist stays out. IMM_YTW_ENABLE=0 takes it out.
 _YTW_LIVE = os.environ.get("IMM_YTW_ENABLE", "1") == "1"
 # TRUMP WEEKLY PILOTS (Jack 2026-10-11: "yes pilot both, $40/day halt"):
-# KXTRUTHSOCIAL early in the week, KXEOWEEK bids only (see TWK_ENABLE).
+# KXTRUTHSOCIAL early in the week, KXEOWEEK both sides (see TWK_ENABLE).
 # IMM_TWK_ENABLE=0 or IMM_ALLOW_TWK_SERIES="" takes them out.
 _TWK_LIVE = os.environ.get("IMM_TWK_ENABLE", "1") == "1"
 _DEFAULT_TWK_SERIES = "KXTRUTHSOCIAL,KXEOWEEK"
@@ -10870,9 +10870,18 @@ def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
 #     EARLY WEEK ONLY: out TWK_EARLY_CUTOFF_FROM_CLOSE_MIN (7,200 = 5 days)
 #     before the close, i.e. quoted Sunday 10am -> Tuesday ~10am ET.
 #   KXEOWEEK-<YYMMMDD>: "How many Executive Orders will Trump sign this
-#     week?", "Above N" strikes closing ~2 weeks after the week. BIDS ONLY
-#     (series_bid_only via twk_bid_only): the bot only buys YES. The normal
-#     ticker-date cutoff (00:00 ET on the week's last day) still applies.
+#     week?", "Above N" strikes closing ~2 weeks after the week. BOTH SIDES
+#     since the same evening (Jack: "yes switch EO to both sides"): shipped
+#     bids-only, it projected $0.08-0.66 per strike per daily period -- under
+#     Kalshi's $1 minimum, so it never quoted. Re-scored on the trades
+#     before the bot's cutoff only (the first cut mixed in post-week
+#     trading): makers' bids +1.9 c/ct (5/9 weeks positive), asks -14.7
+#     (4/9) -- lumpy, a week with a surprise EO; two-sided roughly doubles
+#     the reward, and the bot's own 9/15-10/03 two-sided run made +$32
+#     ($40 rewards, -$8 trading). The caps bound a bad EO week to ~-$55 per
+#     strike and the $40 halt stops the day. Bids-only stays a knob:
+#     IMM_TWK_BID_ONLY_SERIES=KXEOWEEK. The normal ticker-date cutoff
+#     (00:00 ET on the week's last day) applies.
 # WHY. The public tape of the 10 settled weeks of each (8/01-9/27, every
 # trade at 5-95c, maker P&L to settlement): KXTRUTHSOCIAL makers made +4.6
 # c/ct more than 6 days before the close (8 of 9 weeks positive) and +1.6 at
@@ -10898,7 +10907,7 @@ TWK_EARLY_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_TWK_EARLY_SERIES", "KXTRUTHSOCIAL").split(",") if s.strip())
 TWK_EARLY_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_TWK_EARLY_CUTOFF_FROM_CLOSE_MIN", 7200)
 TWK_BID_ONLY_SERIES = frozenset(s.strip() for s in os.environ.get(
-    "IMM_TWK_BID_ONLY_SERIES", "KXEOWEEK").split(",") if s.strip())
+    "IMM_TWK_BID_ONLY_SERIES", "").split(",") if s.strip())
 TWK_MAX_POSITION = _env_float("IMM_TWK_MAX_POSITION", 100)
 TWK_REF_MULT_CAP = _env_float("IMM_TWK_REF_MULT_CAP", 1.0)
 TWK_EVENT_CAP = _env_float("IMM_TWK_EVENT_CAP", 100)
