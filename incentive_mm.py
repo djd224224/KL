@@ -2598,7 +2598,16 @@ EVENT_TOP_N_TWO_SIDED = os.environ.get("IMM_EVENT_TOP_N_TWO_SIDED", "1") == "1"
 # the event's capacity repeatedly. Entries are pruned by age only (file
 # hygiene) — never by the event going quiet, or a lull would silently reset
 # the cap. IMM_EVENT_TOP_N_LIFETIME=0 restores the concurrent cap.
-EVENT_TOP_N_LIFETIME = os.environ.get("IMM_EVENT_TOP_N_LIFETIME", "1") == "1"
+#
+# OFF since 2026-10-11 (Jack: "always give a slot back when it stops quoting,
+# even if it has fills"), after KXBABELMANDEBWEEKLY-26OCT18 quoted nothing:
+# its 3 slots sat on T180/T190/T210, quoted in earlier reward periods and now
+# under the $1.50 payout bar, while T170 -- the one strike over it ($1.76) --
+# was cut as event_top_n. The cap is concurrent again: a capped family's
+# quoting markets hold their slots (EVENT_TOP_N_STICKY, two-sided first) and
+# a market that drops out frees its slot for the next-best. The per-event net
+# cap still bounds inventory spread across strikes. Back: =1.
+EVENT_TOP_N_LIFETIME = os.environ.get("IMM_EVENT_TOP_N_LIFETIME", "0") == "1"
 # A lifetime slot is EARNED BY TRADING, not merely by being selected (Jack
 # 2026-09-09: "release a lifetime slot if <=5 contracts were filled on it and
 # it becomes unquotable (both sides out of band). only count lifetime slots

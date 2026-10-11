@@ -93,6 +93,11 @@ imm._LADDER_ASKS_STATE["on_at"] = None
 # arms it.
 _LADDER_HOUR_MULT_CODE_DEFAULT = imm.SPORTS_LADDER_HOUR_MULT
 imm.SPORTS_LADDER_HOUR_MULT = 0.0
+# the lifetime event-slot ledger is OFF in code since 2026-10-11 (concurrent
+# cap); its machinery is still tested, so the suite arms it and
+# test_event_top_n_concurrent_by_default checks the code default.
+_EVENT_TOP_N_LIFETIME_CODE_DEFAULT = imm.EVENT_TOP_N_LIFETIME
+imm.EVENT_TOP_N_LIFETIME = True
 # the daily series kept on the quiet hours (2026-10-06): TestQuietDailyMembers
 _QUIET_DAILY_SERIES_CODE_DEFAULT = imm.QUIET_DAILY_SERIES
 _QUIET_RAIN_PERIOD_CODE_DEFAULT = imm.QUIET_RAIN_PERIOD
@@ -5236,6 +5241,44 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                 {f"{ev}-T5.94", f"{ev}-T5.96"})   # replaced by the newcomers
         finally:
             imm.EVENT_TOP_N_LIFETIME = True
+
+    def test_event_top_n_concurrent_by_default(self):
+        # Jack 2026-10-11: "always give a slot back when it stops quoting,
+        # even if it has fills" -- the lifetime ledger is off in code.
+        self.assertFalse(_EVENT_TOP_N_LIFETIME_CODE_DEFAULT)
+
+        def m(t, est):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=100.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=10.0, est_collateral_dollars=0.0,
+                quotable_sides=2)
+        ev = "KXBABELMANDEBWEEKLY-26OCT18"
+        cap = [("=KXBABELMANDEBWEEKLY", 3)]
+        # T180/T190/T210 took the slots in earlier reward periods and then
+        # fell under the payout bar, so T170 is the only candidate left
+        only = [m(f"{ev}-T170", 1.9)]
+        spent = {ev: [f"{ev}-T180", f"{ev}-T190", f"{ev}-T210"]}
+        with mock.patch.object(imm, "EVENT_TOP_N", cap), \
+                mock.patch.object(imm, "EVENT_TOP_N_LIFETIME", True):
+            self.assertEqual(imm.event_top_n_cut(only, incumbent=set(), slots_used=spent),
+                             {f"{ev}-T170"})                 # the 10/11 miss
+        with mock.patch.object(imm, "EVENT_TOP_N", cap), \
+                mock.patch.object(imm, "EVENT_TOP_N_LIFETIME", False):
+            self.assertEqual(imm.event_top_n_cut(only, incumbent=set()), set())
+            # still N AT A TIME: three quoting markets hold their slots
+            # against a better-looking fourth
+            four = [m(f"{ev}-T170", 2.0), m(f"{ev}-T180", 1.0),
+                    m(f"{ev}-T190", 1.1), m(f"{ev}-T200", 1.2)]
+            quoting = {f"{ev}-T180", f"{ev}-T190", f"{ev}-T200"}
+            self.assertEqual(imm.event_top_n_cut(four, incumbent=quoting, members=quoting),
+                             {f"{ev}-T170"})
+            # ...and the moment one stops quoting, its slot is free
+            self.assertEqual(imm.event_top_n_cut(four[:3], incumbent=quoting,
+                                                 members=quoting - {f"{ev}-T200"}),
+                             set())
 
     def test_finecon_sweep_enrollment_and_guards(self):
         # Jack 2026-09-02: Finance/Economics sweep — the risk-screened
