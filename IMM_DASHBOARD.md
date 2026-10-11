@@ -255,39 +255,40 @@ signed in as Jack).
   case -$14,882.
 - **Writes.** `imm_pocket.json` (~40 KB) and `imm_pocket.html` (the template
   with the data embedded), both beside the dashboard.
-- **Refresh (since 2026-10-10).** The Windows task "KL imm pocket" runs
-  `imm_pocket_publish.py` (pythonw) at :12 and :42, after the :05:55 /
-  :35:55 dashboard builds land (p50 84s, p90 193s):
-  1. the `imm_pocket.py` build
-  2. when the build is newer than the last one published, one headless
-     Claude Code run (Haiku, `claude -p --restricted`, only Read and
-     Artifact) reads `imm_pocket.html` and republishes it to the URL. The run
-     sets `CLAUDE_CODE_ENTRYPOINT=claude-desktop`: the CLI's Artifact tool
-     exists only under the desktop app's entrypoint (undocumented; Jack's
-     choice 10/10 over a bypass-mode routine). If a CLI update drops it,
-     the runs fail and the stale email fires.
+- **Refresh: on request only (Jack 2026-10-10).** His words: "i dont want
+  it to always run. but i want to be able to call on it to refresh at any
+  time through claude". Say "refresh IMM Pocket" (or `/imm-pocket`) in any
+  Claude session on the PC, including one reached from the phone through
+  Remote Control. That runs the user-level skill
+  `~/.claude/skills/imm-pocket`:
+  1. `python imm_pocket.py --summary`
+  2. ArtifactData `get` (for the version), then `set` of `pocket/latest`
+     from `imm_pocket.json` with `if_version`. An open page redraws without
+     a reload. Both steps are allowlisted in `~/.claude/settings.json`, so a
+     normal desktop session doesn't prompt.
 
-  It costs about $0.15-0.20 of Haiku at list price per publish. An unchanged
-  build is skipped without calling Claude. It runs whether or not the
-  Claude app is open, but not while the PC sleeps. A page already open on
-  the phone needs a reload. The log is `imm_pocket_publish.log`, the state
-  is `imm_pocket_publish_state.json` (dashboard folder). One email goes out
-  once the page's data is over 90 min old.
+  A session without ArtifactData (a plain CLI) runs `imm_pocket_publish.py`
+  instead. It rebuilds the page, and one headless Claude Code run (Haiku,
+  `claude -p --restricted`, only Read and Artifact) reads the live page and
+  `imm_pocket.html`, then republishes it. That costs ~$0.08-0.20 at list
+  price, and a page open on the phone needs a reload. The run sets
+  `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, because the CLI's Artifact tool
+  exists only under the desktop app's entrypoint (undocumented; Jack's call
+  10/10). Its log is `imm_pocket_publish.log` in the dashboard folder.
 
-  The earlier refresh paths kept dying, and the page sat stale 10/3-10/4
-  and 10/8-10/10:
+  Nothing refreshes it on a schedule. The scheduled paths were removed:
   - The desktop routine "imm-pocket-refresh" stops on an ArtifactData
-    prompt with no "always allow".
+    prompt with no "always allow". It is retired and disabled.
   - A session's CronCreate timer dies with its session.
-  - The CLI has no ArtifactData tool.
+  - The 30-minute Windows task "KL imm pocket" (10/10, a87652f) was
+    deleted the same night.
 
-  The page still subscribes to `pocket/latest` and shows whichever build is
-  newer, so a hand push (ArtifactData `set` from `imm_pocket.json`) still
-  works. The chip at the top says Fresh (republished), Live (a newer
-  database copy) or Stale (over 60 min).
-- **Template changes.** Edit `imm_pocket_template.html`. The next
-  scheduled publish ships it, or run
-  `python imm_pocket_publish.py --force` to ship it now.
+  The page shows whichever build is newer, the embedded one or
+  `pocket/latest`. The chip at the top says Live (database), Fresh (the
+  embedded copy) or Stale (over 60 min, with a tooltip asking for a
+  refresh).
+- **Template changes.** Edit `imm_pocket_template.html`, then run
+  `python imm_pocket_publish.py` to republish the page.
 
 ## Knobs (environment)
 

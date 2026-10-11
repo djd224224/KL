@@ -10,11 +10,12 @@ imm_pocket.html (imm_pocket_template.html with the data embedded) beside the
 dashboard.
 
 The page is published to claude.ai as "IMM Pocket"
-(https://claude.ai/artifact/4qqWauCV23mEMCUT1g8Lj9). The Windows task
-"KL imm pocket" (imm_pocket_publish.py) rebuilds and republishes it every 30
-minutes, so its numbers are the build embedded at publish. The page's
-database document pocket/latest still wins when it holds a newer build (a
-hand push: ArtifactData set from imm_pocket.json).
+(https://claude.ai/artifact/4qqWauCV23mEMCUT1g8Lj9). It refreshes on request
+only: the imm-pocket skill (~/.claude/skills/imm-pocket) runs this script,
+then ArtifactData sets the page's database document pocket/latest from
+imm_pocket.json. The page shows whichever build is newer, that one or the
+one embedded at publish. imm_pocket_publish.py republishes the page itself
+(template changes, or a session without ArtifactData).
 
     python imm_pocket.py [--dash path\\imm_dashboard.html] [--out dir] [--template path] [--summary]
 """

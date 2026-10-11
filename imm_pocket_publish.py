@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
-"""IMM Pocket publisher: rebuild the phone page and republish it to claude.ai.
+"""IMM Pocket republish: rebuild the phone page and republish it to claude.ai.
 
-The Windows task "KL imm pocket" runs this every 30 minutes (:12 and :42,
-after the :05:55 / :35:55 dashboard builds land: p50 84s, p90 193s on
-10/10), under pythonw:
+On demand only (Jack 2026-10-10: "i dont want it to always run. but i want
+to be able to call on it to refresh at any time through claude"). The usual
+refresh is the imm-pocket skill (~/.claude/skills/imm-pocket): imm_pocket.py,
+then an ArtifactData set of pocket/latest from a desktop Claude session.
+This script is the other path, for a template change or a session without
+ArtifactData (a plain CLI):
 1. imm_pocket.py's build -> imm_pocket.json / imm_pocket.html
-2. when that build is newer than the last one published, ONE headless Claude
-   Code run (Haiku, `claude -p --restricted`, only the Read and Artifact
-   tools, both allowed, nothing else) reads imm_pocket.html and republishes
-   it to the page's URL. The run sets CLAUDE_CODE_ENTRYPOINT=claude-desktop:
-   the CLI's Artifact tool exists only under the desktop app's entrypoint.
+2. ONE headless Claude Code run (Haiku, `claude -p --restricted`, only the
+   Read and Artifact tools, both allowed, nothing else) reads imm_pocket.html
+   and republishes it to the page's URL. The run sets
+   CLAUDE_CODE_ENTRYPOINT=claude-desktop: the CLI's Artifact tool exists only
+   under the desktop app's entrypoint.
 
-Why a republish and not the page's database (pocket/latest): the CLI has no
-ArtifactData tool, and the desktop-app paths kept dying -- the routine
-"imm-pocket-refresh" stops on an ArtifactData prompt that has no "always
-allow", and a session's CronCreate timer dies with its session and expires
-after 7 days (the page sat stale 10/3-10/4 and 10/8-10/10). The page shows
-whichever build is newer, the embedded one or pocket/latest, so a hand push
-from a Claude session still works.
+A publish costs about $0.08-0.20 of Haiku at list price (the ~66 KB page is
+read twice: the live copy, then the new build). A page open on the phone
+needs a reload to show it. The page shows whichever build is newer, the
+embedded one or pocket/latest.
+Log: imm_pocket_publish.log (dashboard folder).
 
-A publish costs about $0.15-0.20 of Haiku at list price (the ~66 KB page is
-read twice: the live copy, then the new build); an unchanged build is
-skipped without calling Claude.
-
-Alerts: one email (send_alert_email.py) once the page's data is more than
-ALERT_AFTER_MIN old, then none until a publish succeeds.
-State: imm_pocket_publish_state.json; log: imm_pocket_publish.log (both in
-the dashboard folder).
-
-    python imm_pocket_publish.py [--force] [--dry]
+    python imm_pocket_publish.py [--dry]
 """
 import argparse
 import contextlib
@@ -42,17 +34,14 @@ import time
 
 import imm_pocket
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 DASH_DIR = imm_pocket.DASH_DIR
 HTML = os.path.join(DASH_DIR, "imm_pocket.html")
 JSON_OUT = os.path.join(DASH_DIR, "imm_pocket.json")
-STATE_FILE = os.path.join(DASH_DIR, "imm_pocket_publish_state.json")
 LOG_FILE = os.path.join(DASH_DIR, "imm_pocket_publish.log")
 URL = "https://claude.ai/artifact/4qqWauCV23mEMCUT1g8Lj9"
 MODEL = os.environ.get("IMM_POCKET_MODEL", "haiku")
 BUDGET_USD = 0.5
 TIMEOUT_SECS = 300
-ALERT_AFTER_MIN = 90
 CLAUDE_FALLBACK = os.path.join(
     os.path.expanduser("~"), "AppData", "Local", "Microsoft", "WinGet", "Packages",
     "Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe", "claude.exe")
@@ -70,61 +59,26 @@ def log(msg):
     line = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()) + " " + msg
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
-    if sys.stdout:
-        print(line)
-
-
-def load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f) or {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=1, sort_keys=True)
-    os.replace(tmp, STATE_FILE)
-
-
-def user_env():
-    """The ALERT_EMAIL_* vars: Task Scheduler sessions do not reliably
-    inherit user env vars, so fall back to HKCU (as the recap launcher does)."""
-    env = dict(os.environ)
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
-            for n in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD", "ALERT_EMAIL_TO"):
-                if not env.get(n):
-                    try:
-                        env[n] = str(winreg.QueryValueEx(k, n)[0])
-                    except OSError:
-                        pass
-    except (ImportError, OSError):
-        pass
-    return env
+    print(line)
 
 
 def build():
-    """Run imm_pocket's build; (generated ts, generated_et, summary text)."""
+    """Run imm_pocket's build; (generated_et, summary text)."""
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         imm_pocket.main(["--summary"])
     with open(JSON_OUT, encoding="utf-8") as f:
         data = json.load(f)
-    return float(data["generated"]), data.get("generated_et") or "?", out.getvalue()
+    return data.get("generated_et") or "?", out.getvalue()
 
 
 def publish():
     """(status line, cost USD, error) from one headless Claude Code run."""
     exe = shutil.which("claude") or CLAUDE_FALLBACK
     # The CLI's Artifact tool is gated to the desktop app's entrypoint: a plain
-    # Task Scheduler `claude -p` has none (probed 10/10, 2.1.268: the only var
-    # that turns it on). Undocumented and internal -- Jack chose it 10/10 over
-    # a bypass-mode routine; if a CLI update drops it, runs fail and the
-    # stale email fires.
+    # `claude -p` has none (probed 10/10, 2.1.268: the only var that turns it
+    # on). Undocumented and internal -- Jack chose it 10/10; if a CLI update
+    # drops it, this fails with "no Artifact tool".
     env = dict(os.environ, CLAUDE_CODE_ENTRYPOINT="claude-desktop")
     cmd = [exe, "-p", PROMPT, "--output-format", "json", "--no-session-persistence",
            "--model", MODEL, "--max-budget-usd", f"{BUDGET_USD:g}", "--restricted",
@@ -146,68 +100,19 @@ def publish():
     return status, float(js.get("total_cost_usd") or 0.0), err
 
 
-def maybe_alert(state, now, reason, dry):
-    pub = float(state.get("published_generated") or 0)
-    # nothing published by this script yet (a first, attended run): no basis
-    if not pub or (now - pub) / 60 <= ALERT_AFTER_MIN or state.get("alerted"):
-        return
-    age = f"{(now - pub) / 60:.0f} min"
-    subj = f"IMM Pocket stale: page data {age} old"
-    try:
-        with open(LOG_FILE, encoding="utf-8") as f:
-            tail = "".join(f.readlines()[-12:])
-    except OSError:
-        tail = ""
-    body = (f"The IMM Pocket page ({URL}) has not been refreshed for {age}.\n"
-            f"Last problem: {reason}\n\nLog: {LOG_FILE}\n\n{tail}")
-    if dry:
-        log(f"[dry] would email: {subj}")
-        return
-    p = subprocess.run([sys.executable, os.path.join(HERE, "send_alert_email.py"), subj, body],
-                       cwd=HERE, capture_output=True, text=True, env=user_env(),
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    log(f"alert email: {subj} ({(p.stdout or p.stderr or '').strip()[:120]})")
-    state["alerted"] = True
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--force", action="store_true", help="publish even if the build is unchanged")
-    ap.add_argument("--dry", action="store_true", help="build only: no Claude run, no email")
+    ap.add_argument("--dry", action="store_true", help="build only: no Claude run")
     a = ap.parse_args(argv)
-    state = load_state()
-    now = time.time()
-    try:
-        gen, gen_et, summary = build()
-    except Exception as e:  # a dashboard mid-write, a model change: retried next run
-        reason = f"build failed: {type(e).__name__}: {e}"
-        log(reason)
-        maybe_alert(state, now, reason, a.dry)
-        save_state(state)
-        return 1
-    today = next((ln.strip() for ln in summary.splitlines() if ln.strip().startswith("today")), "")
-    if not a.force and gen <= float(state.get("published_generated") or 0):
-        reason = f"build {gen_et} already published (dashboard build not newer)"
-        log("skip: " + reason)
-        maybe_alert(state, now, reason, a.dry)
-        save_state(state)
-        return 0
+    gen_et, summary = build()
+    print(summary, end="")
     if a.dry:
-        log(f"[dry] would publish build {gen_et}: {today}")
         return 0
     t0 = time.time()
     status, cost, err = publish()
     ok = status.startswith("PUBLISHED") or status.startswith("UNCHANGED")
     log(f"{'ok' if ok else 'FAILED'}: build {gen_et} -> {status or '(no reply)'}"
-        f"{' ' + err if err else ''} ({time.time() - t0:.0f}s, ${cost:.3f}) {today}")
-    state["last_cost_usd"] = round(cost, 4)
-    if ok:
-        state.update(published_generated=gen, published_et=gen_et, published_at=now,
-                     alerted=False, failures=0)
-    else:
-        state["failures"] = int(state.get("failures") or 0) + 1
-        maybe_alert(state, now, f"publish failed: {status or err or 'no reply'}", a.dry)
-    save_state(state)
+        f"{' ' + err if err else ''} ({time.time() - t0:.0f}s, ${cost:.3f})")
     return 0 if ok else 1
 
 

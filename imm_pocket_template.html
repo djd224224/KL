@@ -181,9 +181,9 @@ footer { font-size: 12px; color: var(--muted); display: flex; flex-direction: co
 </div>
 
 <script>
-// The build embedded at publish: the Windows task "KL imm pocket"
-// (imm_pocket_publish.py) republishes the page every 30 minutes. A newer
-// build in the page's database (pocket/latest, a hand push) replaces it.
+// The build embedded at publish; a newer one in the page's database
+// (pocket/latest) replaces it. Both refresh on request only: "refresh IMM
+// Pocket" in a Claude session on the PC (the imm-pocket skill).
 let M = /*__POCKET_DATA__*/null;
 let SRC = "embedded";
 const STALE_MIN = 60;
@@ -241,8 +241,8 @@ function renderHead() {
   f.textContent = old ? "Stale" : (SRC === "live" ? "Live" : "Fresh");
   f.className = "chip" + (old ? " stale" : "");
   f.title = old
-    ? "Over " + STALE_MIN + " minutes old. Reload for the newest version; if it stays stale, the 30-minute republish on the PC (Windows task \"KL imm pocket\") has stopped."
-    : (SRC === "live" ? "From the page's live data (a hand push)." : "Republished every 30 minutes from the 10-minute dashboard build.");
+    ? "Over " + STALE_MIN + " minutes old. Ask Claude to \"refresh IMM Pocket\" (a session on the PC) for the latest."
+    : (SRC === "live" ? "From the page's live data, refreshed on request." : "The copy built into this page.");
   $("seg").innerHTML = WK.filter((k) => M.windows[k]).map((k) =>
     '<button type="button" data-w="' + k + '" aria-pressed="' + (k === W) + '">' + WL[k] + "</button>").join("");
 }
@@ -416,7 +416,7 @@ function renderFams() {
 function renderAll() {
   renderHead(); renderHero(); renderCurve(); renderTiles(); renderFams();
   $("foot").textContent = "From the IMM dashboard build of " + ET_DT.format(new Date(M.generated * 1000)) + " ET (" +
-    (SRC === "live" ? "the page's live data" : "republished every 30 minutes; reload for the newest") + "). Windows are ET days.";
+    (SRC === "live" ? "live data, refreshed on request" : "the copy built into this page") + "). Windows are ET days.";
 }
 
 document.addEventListener("click", (e) => {
