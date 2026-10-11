@@ -10161,3 +10161,42 @@ WHAT:
 
 Tests: TestBookRestBudget (7), TestPowerHelpers (4); the guard-skip sweep
 count is 40. test_incentive_mm 1194 OK.
+
+## 2026-10-11 ~03:10Z — Carbon Arc late-month rule: the blocked side is per category (Jack: "ship #3 for all three")
+
+WHAT CHANGED. From 14 days before the measurement month's end until the
+5-day stop, the late-month rule blocked BIDS and halved asks on every Carbon
+Arc market (CA_LATE_TOXIC_SIDE=bid, from pooled 9/06-9/24 fills marked at
+24h). It now blocks the side each category's data makes toxic.
+CA_LATE_TOXIC_SIDE_BY_CAT (IMM_CA_LATE_TOXIC_SIDE_BY_CAT):
+- point of sale, credit card, app: ASKS blocked, bids at half size;
+- foot traffic, advertising: BIDS blocked, asks at half size (unchanged);
+- any other category: CA_LATE_TOXIC_SIDE (bid).
+The category comes from ca_category (the prism category, else the ticker
+suffix). The October window opens 00:00 ET 10/18 and stops 00:00 ET 10/27.
+
+EVIDENCE. Maker P&L to settlement on every public Kalshi trade in the rule's
+window (month end -14d to -5d) on all 1,624 settled Carbon Arc markets,
+bids / asks in c/ct:
+- POS: Aug +14.8 / -33.0, Sep +4.2 / -13.2 (asks lost in 15/15 and 17/18
+  series);
+- CC: Aug -12.6 / -9.9 (a tie), Sep +6.6 / -17.7;
+- APP: Aug -0.5 / -5.1, Sep -9.8 / -19.9 (series split ~evenly);
+- FT: Aug -41.5 / +26.5, Sep -33.1 / +28.2;
+- ADS: Sep -14.0 / +0.9.
+The original 24h-markout choice reverses at settlement: our own September
+fills lost more on asks in both halves of the month. Only two late windows
+exist (Kalshi's Carbon Arc markets start with July/August), so re-score
+after the October prints (~11/3-11/8). Jack asked for a daily Carbon Arc
+email to watch it (send_ca_monitor.py).
+
+Startup line: "ca late-month (2026-10-11 per category): ...". Config hash
+covers CA_LATE_TOXIC_SIDE_BY_CAT.
+
+Tests:
+- test_late_month_rule_halves_and_skews_carbon_arc_markets (card spend now
+  (0.5, 0.0));
+- test_late_month_toxic_side_is_per_category.
+test_incentive_mm 1195 OK.
+
+DEPLOY: ff KL; the code-change exit restarts the bot (handoff).

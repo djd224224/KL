@@ -17395,23 +17395,27 @@ class TestFamilySourceVerdicts(unittest.TestCase):
                          "2026-09-17 00:00")
         before, after = ws - timedelta(minutes=1), ws + timedelta(minutes=1)
         self.assertEqual(imm.ca_late_month_mults(t, before), (1.0, 1.0))
-        self.assertEqual(imm.ca_late_month_mults(t, after), (0.0, 0.5))
+        # card spend's toxic side is ASKS since 2026-10-11 (#3, per category)
+        self.assertEqual(imm.ca_late_month_mults(t, after), (0.5, 0.0))
         # ...and it holds through the print-day close, past month-end
         self.assertEqual(imm.ca_late_month_mults(t, utc(2026, 10, 6, 12, 0)),
-                         (0.0, 0.5))
-        # exact-list Carbon Arc families are covered by their verdict too
+                         (0.5, 0.0))
+        # exact-list Carbon Arc families are covered by their verdict too;
+        # foot traffic keeps BIDS as its toxic side
         self.assertEqual(imm.ca_late_month_mults("KXFAKEFT-26OCT08-T101", after),
                          (0.0, 0.5))
         # not Carbon Arc, unknown, or undated -> the plain ladder
         for x in ("KXFAKEPOS-26OCT03-T90", "KXUNREADCC-26OCT07-T1",
                   "KXGOOD-26OCT07-T1", "KXFAKECC-DOG-T1"):
             self.assertEqual(imm.ca_late_month_mults(x, after), (1.0, 1.0), x)
-        # the other toxic side, and the kill switch
-        with mock.patch.object(imm, "CA_LATE_TOXIC_SIDE", "ask"):
-            self.assertEqual(imm.ca_late_month_mults(t, after), (0.5, 0.0))
+        # no category map -> the single CA_LATE_TOXIC_SIDE, either value
+        with mock.patch.object(imm, "CA_LATE_TOXIC_SIDE_BY_CAT", {}):
+            self.assertEqual(imm.ca_late_month_mults(t, after), (0.0, 0.5))
+            with mock.patch.object(imm, "CA_LATE_TOXIC_SIDE", "ask"):
+                self.assertEqual(imm.ca_late_month_mults(t, after), (0.5, 0.0))
         # a softer toxic-side multiplier is still available by env
         with mock.patch.object(imm, "CA_LATE_TOXIC_MULT", 0.5):
-            self.assertEqual(imm.ca_late_month_mults(t, after), (0.25, 0.5))
+            self.assertEqual(imm.ca_late_month_mults(t, after), (0.5, 0.25))
         with mock.patch.object(imm, "CA_LATE_SIZE_MULT", 1.0), \
                 mock.patch.object(imm, "CA_LATE_TOXIC_MULT", 1.0):
             self.assertEqual(imm.ca_late_month_mults(t, after), (1.0, 1.0))
@@ -17421,6 +17425,32 @@ class TestFamilySourceVerdicts(unittest.TestCase):
         self.assertEqual(imm.scale_levels(lv, 0.5), [(0, 10), (1, 5), (2, 1)])
         self.assertIs(imm.scale_levels(lv, 1.0), lv)
         self.assertEqual(imm.scale_levels(lv, 0.0), [])          # a blocked side
+
+    def test_late_month_toxic_side_is_per_category(self):
+        # Jack 2026-10-11, "ship #3 for all three": maker P&L to settlement on
+        # every public trade in the late window (Aug + Sep) -- point of sale,
+        # card spend and apps print ABOVE the late book (asks lose), foot
+        # traffic and ad spend below (bids lose)
+        self.assertEqual(imm.CA_LATE_TOXIC_SIDE_BY_CAT, {
+            "point of sale": "ask", "credit card": "ask", "app": "ask",
+            "foot traffic": "bid", "advertising": "bid"})
+        ver = {s: {"carbon_arc": True, "ts": 1.0, "title": ""} for s in (
+            "KXFAKEPOS", "KXFAKECC", "KXFAKEAPP", "KXFAKEFT", "KXFAKEADS", "KXFAKEODD")}
+        with mock.patch.dict(imm.FAMILY_VERDICTS, ver),                 mock.patch.dict(imm._ca_fair_state, {"entries": {}}):
+            got = {s: imm.ca_late_toxic_side(s) for s in ver}
+            self.assertEqual(got, {"KXFAKEPOS": "ask", "KXFAKECC": "ask",
+                                   "KXFAKEAPP": "ask", "KXFAKEFT": "bid",
+                                   "KXFAKEADS": "bid",
+                                   "KXFAKEODD": "bid"})     # no category: the global side
+            after = imm.ca_late_window_start("KXFAKEPOS-26NOV03-T90") + timedelta(hours=1)
+            self.assertEqual(imm.ca_late_month_mults("KXFAKEPOS-26NOV03-T90", after), (0.5, 0.0))
+            self.assertEqual(imm.ca_late_month_mults("KXFAKEADS-26NOV06-T90", after), (0.0, 0.5))
+            # the read's prism category wins over the ticker suffix
+            with mock.patch.dict(imm._ca_fair_state,
+                                 {"entries": {"KXFAKECC": {"category": "Foot Traffic"}}}):
+                self.assertEqual(imm.ca_late_toxic_side("KXFAKECC"), "bid")
+        # not Carbon Arc: no category, so the global side (and no rule anyway)
+        self.assertEqual(imm.ca_late_toxic_side("KXGOOD"), imm.CA_LATE_TOXIC_SIDE)
 
     def test_late_month_stop_is_the_last_five_days_of_the_month(self):
         # Jack 2026-09-24 pm: "stop quoting entirely in the last 5 days OF

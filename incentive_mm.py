@@ -3992,10 +3992,11 @@ def carbon_arc_settled(series: str) -> bool:
 # of the MEASUREMENT month until the market closes, every ladder rung is
 # scaled by CA_LATE_SIZE_MULT on both sides and by CA_LATE_TOXIC_MULT again
 # on the toxic side (CA_LATE_TOXIC_SIDE = the book side we rest that side
-# on: "bid" = we buy YES). Jack, minutes after the first instruction:
+# on: "bid" = we buy YES; PER CATEGORY since 2026-10-11, see
+# CA_LATE_TOXIC_SIDE_BY_CAT). Jack, minutes after the first instruction:
 # "completely block the toxic side when 2 weeks from month-end" -> the
-# toxic multiplier defaults to 0: NO bid rungs at all inside the window,
-# asks at 50% of the normal ladder. (The 1c depth pad on the bid side is
+# toxic multiplier defaults to 0: NO rungs at all on the toxic side inside
+# the window, the other side at 50% of the normal ladder. (The 1c depth pad on the bid side is
 # not a quote in this sense -- it rests at 1c only to qualify the reward
 # snapshot, carries ~1c/contract of worst case, and stays.) The
 # measurement month is the month
@@ -4013,6 +4014,43 @@ CA_LATE_DAYS = _env_float("IMM_CA_LATE_DAYS", 14)
 CA_LATE_SIZE_MULT = _env_float("IMM_CA_LATE_SIZE_MULT", 0.5)
 CA_LATE_TOXIC_SIDE = os.environ.get("IMM_CA_LATE_TOXIC_SIDE", "bid").strip().lower()
 CA_LATE_TOXIC_MULT = _env_float("IMM_CA_LATE_TOXIC_MULT", 0.0)
+# THE TOXIC SIDE IS PER CATEGORY (Jack 2026-10-11: "ship #3 for all three").
+# "Buying YES is toxic" came from every category pooled, marked at 24h. Held
+# to SETTLEMENT and split by category, the losing side follows the way each
+# index drifts from the late-month book into the print. Maker P&L on every
+# public trade in the window this rule covers (month end -14d to -5d), all
+# 1,624 settled Carbon Arc markets, bids / asks in cents per contract:
+#   point of sale  Aug +14.8 / -33.0  Sep  +4.2 / -13.2  (asks lost in 15/15, 17/18 series)
+#   card spend     Aug -12.6 /  -9.9  Sep  +6.6 / -17.7
+#   apps           Aug  -0.5 /  -5.1  Sep  -9.8 / -19.9
+#   foot traffic   Aug -41.5 / +26.5  Sep -33.1 / +28.2  (July's final days the same)
+#   ad spend           n/a            Sep -14.0 /  +0.9
+# Point of sale, card spend and apps print ABOVE the late book (informed
+# buyers lift our asks); foot traffic and ad spend print below (they hit our
+# bids). So the window blocks ASKS (bids at half size) for the first three
+# and keeps blocking BIDS for the last two. Keyed on ca_category (the
+# prism's category, else the ticker suffix); a category not listed takes
+# CA_LATE_TOXIC_SIDE. IMM_CA_LATE_TOXIC_SIDE_BY_CAT: "category=bid|ask;...",
+# "" = CA_LATE_TOXIC_SIDE everywhere. Re-score after the October prints
+# (11/3-11/8): two months of late windows is all that exists.
+_DEFAULT_CA_LATE_TOXIC_SIDE_BY_CAT = ("point of sale=ask;credit card=ask;app=ask;"
+                                      "foot traffic=bid;advertising=bid")
+CA_LATE_TOXIC_SIDE_BY_CAT: Dict[str, str] = {}
+for _part in os.environ.get("IMM_CA_LATE_TOXIC_SIDE_BY_CAT",
+                            _DEFAULT_CA_LATE_TOXIC_SIDE_BY_CAT).split(";"):
+    if "=" not in _part:
+        continue
+    _cat, _side = (x.strip().lower() for x in _part.split("=", 1))
+    if _cat and _side in ("bid", "ask"):
+        CA_LATE_TOXIC_SIDE_BY_CAT[_cat] = _side
+
+
+def ca_late_toxic_side(series: str) -> str:
+    """The book side the late-month rule blocks for this Carbon Arc series
+    ("bid" = we buy YES): its category's entry in CA_LATE_TOXIC_SIDE_BY_CAT,
+    else CA_LATE_TOXIC_SIDE."""
+    cat = ca_category(series)
+    return CA_LATE_TOXIC_SIDE_BY_CAT.get(cat or "", CA_LATE_TOXIC_SIDE)
 # ...and then STOP (Jack 2026-09-24 pm, after the cost/benefit of the
 # half-size rule -- reward accrues linearly, the informed flow is back-loaded
 # -- "stop quoting entirely in the last 5 days OF THE MONTH"): from
@@ -4075,9 +4113,10 @@ def ca_late_month_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
     if start is None or now_utc < start:
         return (1.0, 1.0)
     bm = am = CA_LATE_SIZE_MULT
-    if CA_LATE_TOXIC_SIDE == "bid":
+    side = ca_late_toxic_side(series_of(ticker))       # per category (#3)
+    if side == "bid":
         bm *= CA_LATE_TOXIC_MULT
-    elif CA_LATE_TOXIC_SIDE == "ask":
+    elif side == "ask":
         am *= CA_LATE_TOXIC_MULT
     return (bm, am)
 # Series-name PREFIXES — for mention/incentive families that append a variable
@@ -7230,8 +7269,9 @@ KEEP_ACCRUAL_WHILE_PROGRAMMED = os.environ.get(
 #
 # (1) THE FLOOR PROJECTION FOLLOWS THE PER-SIDE SCHEDULE TOO.
 # side_size_mults() is clock-driven like the hour schedule: the Carbon Arc
-# late-month rule takes a market from full size to NO bids and half-size
-# asks at ca_late_window_start (00:00 ET fourteen days before the
+# late-month rule takes a market from full size to one side blocked and the
+# other at half size (per category since 2026-10-11; it was always NO bids
+# and half-size asks) at ca_late_window_start (00:00 ET fourteen days before the
 # measurement month ends: Oct 18 for the October cycle). The projection read
 # it once, at `now`, for the whole window, so a weekly period that runs into
 # the window start (Oct 12 -> Oct 19) was projected at full size through its
@@ -7688,6 +7728,7 @@ _CONFIG_CODE_KNOBS = (
     "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
     "CA_FAIR_REL_SIGMA_EXEMPT", "CA_FAIR_REFRESH_HOLD_BY_CAT",   # ADS / apps (2026-10-10)
     "CA_LANDING_WINDOWS",          # Carbon Arc 1x while data lands (2026-10-10)
+    "CA_LATE_TOXIC_SIDE_BY_CAT",   # late-month blocked side per category (2026-10-11)
     "CA_FAIR_CAP",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
     # fair file's "model" block (openrouter_fair.py)
@@ -23501,6 +23542,17 @@ class IncentiveMarketMaker:
                     + "; ".join(f"{c} " + "+".join(f"{a:02d}-{b:02d}h" for a, b in w)
                                 for c, w in sorted(CA_LANDING_WINDOWS.items()))
                     + " ET -- no hour / Saturday / yield / near-cliff boost inside")
+        if CA_LATE_SIZE_MULT < 1.0 or CA_LATE_TOXIC_MULT < 1.0:
+            _blk: Dict[str, List[str]] = {}
+            for _c, _s in sorted(CA_LATE_TOXIC_SIDE_BY_CAT.items()):
+                _blk.setdefault(_s, []).append(_c)
+            log(f"ca late-month (2026-10-11 per category): from {CA_LATE_DAYS:g}d "
+                f"before the measurement month's end -- "
+                + "; ".join(f"{s}s x{CA_LATE_SIZE_MULT * CA_LATE_TOXIC_MULT:g} "
+                            f"(other side x{CA_LATE_SIZE_MULT:g}) for {', '.join(cs)}"
+                            for s, cs in sorted(_blk.items()))
+                + f"; anything else {CA_LATE_TOXIC_SIDE}s; quoting stops "
+                f"{CA_LATE_STOP_DAYS:g}d before the end")
         if OR_FAIR_ENABLE:
             log(f"or-fair gate: {','.join(sorted(OR_FAIR_SERIES))} fail-closed "
                 f"at-touch, tol {OR_FAIR_TOL_CENTS}c, band sigma "
