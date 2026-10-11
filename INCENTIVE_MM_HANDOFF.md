@@ -10037,3 +10037,37 @@ use the control trips logged up to now. A new window with no control trips
 prints the live count and the reward given up, with no net. To re-measure
 later, set a small holdout (e.g. 0.05) for a week.
 
+
+## 2026-10-11 ~01:45Z — Carbon Arc point of sale: the open day is the prism's refresh day, not the clock's (hole in d9a8d7a)
+
+WHAT HAPPENED. d9a8d7a (10/10 "ship 1") dropped a POS point dated on or after
+TODAY in US/Pacific. The point a refresh carries for its own day stays
+partial until the NEXT refresh, and POS refreshes once a day at ~07:50 ET.
+So at Pacific midnight (07:00Z) yesterday's partial point became "complete",
+and every POS read fell back to it until the morning refresh:
+- KXSPRITEPOS: 91.64 (03:26Z) -> 81.83 (07:00Z) -> 93.56 (11:55Z).
+- KXC4POS: 128.34 -> 113.25 -> 129.68.
+From the vintages file and the cycle log, 10/10:
+- POS markets with a resting bid per cycle: ~125 at 00-02 ET, 39 at 03-07 ET,
+  ~125 again from 08 ET.
+- POS est reward fell ~$130/day -> ~$83/day through the x6 Saturday quiet
+  hours, roughly $10 of reward that night.
+- The 07:00Z flip also started a spurious 10-min refresh hold on all 18 POS
+  series.
+
+FIX (carbon_arc_fair.entity_entry):
+- The cut-off is min(today, Pacific day of the prism's last_refreshed_at).
+- A stamp that is missing, unparseable or older than the last point falls
+  back to the clock.
+- Lagged categories (3-6 days) never carry a point on their refresh day, so
+  they are untouched.
+
+Tests (TestOpenDay):
+- .test_a_point_stays_open_until_the_next_refresh (the 10/10 07:00Z case)
+- .test_a_missing_or_stale_refresh_stamp_falls_back_to_the_clock
+- The old second half of .test_the_us_evening_counts_as_the_same_day
+  encoded the wrong assumption and was removed.
+- test_carbon_arc_fair 27 OK.
+
+DEPLOY: carbon_arc_fair is imported once by the refresher thread, so ff KL
+then run restart_imm.ps1 (default handoff mode).

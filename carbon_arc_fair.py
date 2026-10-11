@@ -180,6 +180,18 @@ CA_MAX_DATA_AGE_DAYS = _env_float("IMM_CA_MAX_DATA_AGE_DAYS", 10)
 # and the previous, complete day is priced. The other categories lag 3-6 days
 # and never carry such a point. IMM_CA_DROP_OPEN_DAY=0 restores the raw
 # last point.
+#
+# "THE CURRENT DAY" IS THE DAY OF THE PRISM'S LAST REFRESH, not the clock's
+# (2026-10-11, a hole in the 10/10 fix). The point a refresh carries for
+# its own day stays partial until the NEXT refresh, and point of sale
+# refreshes once a day at ~07:50 ET. Keyed on the clock, Pacific midnight
+# made yesterday's partial point "complete": on 10/10 from 07:00Z to the
+# 11:55Z refresh every POS read fell back to it (Sprite 91.64 -> 81.83, C4
+# 128.34 -> 113.25), and the gate capped the bids of ~86 of ~125 POS markets
+# (resting bids per cycle 39, against ~125 either side of the gap) through
+# the x6 Saturday quiet hours. A point is now open when it is dated on or
+# after the Pacific day of the prism's last_refreshed_at (or of now, when
+# that stamp is missing, unparseable or older than the point itself).
 CA_DROP_OPEN_DAY = os.environ.get("IMM_CA_DROP_OPEN_DAY", "1") == "1"
 CA_DAY_TZ = os.environ.get("IMM_CA_DAY_TZ", "US/Pacific")
 SERIES_MAP_TTL_SECS = 24 * 3600
@@ -400,6 +412,20 @@ def month_spread(hist: List[dict]) -> Optional[float]:
     return statistics.pstdev(ch)
 
 
+def _refresh_day(prism: dict, tz) -> Optional[str]:
+    """'YYYY-MM-DD' in `tz` of the prism's last_refreshed_at, or None."""
+    raw = str((prism or {}).get("last_refreshed_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(tz).date().isoformat()
+
+
 def entity_entry(prism: dict, entity: dict,
                  now: datetime) -> Optional[dict]:
     """The N(mu, sigma) entry for one entity's month in progress, or None
@@ -412,8 +438,14 @@ def entity_entry(prism: dict, entity: dict,
     mtd.sort(key=lambda m: str(m["date"]))
     open_day = None
     if CA_DROP_OPEN_DAY:
+        tz = pytz.timezone(CA_DAY_TZ)
         aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-        today = aware.astimezone(pytz.timezone(CA_DAY_TZ)).date().isoformat()
+        today = aware.astimezone(tz).date().isoformat()
+        # the day in progress when the prism was last refreshed (see
+        # CA_DROP_OPEN_DAY): a stamp older than the last point is no stamp
+        refreshed = _refresh_day(prism, tz)
+        if refreshed is not None and refreshed >= str(mtd[-1]["date"])[:10]:
+            today = min(today, refreshed)
         if str(mtd[-1]["date"])[:10] >= today:
             open_day = str(mtd[-1]["date"])[:10]
             mtd = [m for m in mtd if str(m["date"])[:10] < today]

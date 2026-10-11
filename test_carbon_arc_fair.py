@@ -202,11 +202,40 @@ class TestOpenDay(unittest.TestCase):
         now = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)
         out = caf.entity_entry(self.pos, _entity("C4 Energy", self.path, HIST), now)
         self.assertEqual(out["data_through"], "2026-10-08")
-        # ...and once 10/09 has ended in Pacific time it is a complete read
+
+    def test_a_point_stays_open_until_the_next_refresh(self):
+        # 10/10 07:00-11:55Z: Pacific midnight passed, but the prism was last
+        # refreshed 10/09 11:58Z (04:58 PT 10/09), so its 10/09 point is the
+        # partial one it carried then -- still dropped
+        pos = _prism("P", [], data_through="2026-10-09", category="Point of Sale",
+                     refreshed="2026-10-09T11:58:00+00:00")
         later = datetime(2026, 10, 10, 8, 0, tzinfo=timezone.utc)
-        out = caf.entity_entry(self.pos, _entity("C4 Energy", self.path, HIST), later)
+        out = caf.entity_entry(pos, _entity("C4 Energy", self.path, HIST), later)
+        self.assertEqual((out["mu"], out["data_through"]), (99.1, "2026-10-08"))
+        self.assertEqual(out["open_day_dropped"], "2026-10-09")
+        # the 10/10 11:54Z refresh completes 10/09 and opens 10/10
+        pos = _prism("P", [], data_through="2026-10-10", category="Point of Sale",
+                     refreshed="2026-10-10T11:54:00+00:00")
+        path = self.path[:2] + [("2026-10-09", 99.6), ("2026-10-10", 87.0)]
+        now = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+        out = caf.entity_entry(pos, _entity("C4 Energy", path, HIST), now)
+        self.assertEqual((out["mu"], out["data_through"]), (99.6, "2026-10-09"))
+        self.assertEqual(out["open_day_dropped"], "2026-10-10")
+        # a refresh after Pacific midnight with no point for its own day:
+        # the last point is complete
+        pos = _prism("P", [], data_through="2026-10-09", category="Point of Sale",
+                     refreshed="2026-10-10T07:30:00+00:00")
+        out = caf.entity_entry(pos, _entity("C4 Energy", self.path, HIST), later)
         self.assertEqual((out["mu"], out["data_through"]), (88.2, "2026-10-09"))
         self.assertNotIn("open_day_dropped", out)
+
+    def test_a_missing_or_stale_refresh_stamp_falls_back_to_the_clock(self):
+        later = datetime(2026, 10, 10, 8, 0, tzinfo=timezone.utc)
+        for stamp in ("", "not a time", "2026-09-26T13:29:00+00:00"):
+            pos = _prism("P", [], data_through="2026-10-09",
+                         category="Point of Sale", refreshed=stamp)
+            out = caf.entity_entry(pos, _entity("C4 Energy", self.path, HIST), later)
+            self.assertEqual(out["data_through"], "2026-10-09", stamp)
 
     def test_a_lone_open_day_is_no_read_and_the_knob_restores_it(self):
         now = datetime(2026, 10, 1, 18, 0, tzinfo=timezone.utc)
