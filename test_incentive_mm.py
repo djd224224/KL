@@ -24394,6 +24394,19 @@ class TestElectionBatch20261005(unittest.TestCase):
                 ("KXUKBYELECTION-28", utc(2028, 1, 1, 0, 0))):
             self.assertEqual(imm.election_cutoff_utc(ev), want, ev)
 
+    def test_the_2026_10_12_batch_rows(self):
+        # Jack 2026-10-12: "yes add bulgaria and france, argentina too"
+        for ev, want in (
+                ("KXBULGARIAPRES1R2ND-26OCT25-2", utc(2026, 10, 24, 21, 0)),   # 00:00 Sofia
+                ("KXBULGARIAPRES1R3RD-26OCT25-3", utc(2026, 10, 24, 21, 0)),
+                ("KXFRPRES1R1ST-27-1", utc(2027, 4, 17, 22, 0)),               # 00:00 Paris
+                ("KXFRPRES1R2ND-27-2", utc(2027, 4, 17, 22, 0)),
+                ("KXFRPRES1R3RD-27-3", utc(2027, 4, 17, 22, 0)),
+                ("KXARGENTINAPERONISTNOM-27AUG08", utc(2027, 8, 8, 3, 0))):    # 00:00 B. Aires
+            self.assertEqual(imm.election_cutoff_utc(ev), want, ev)
+        # the French winner market keeps its own row
+        self.assertEqual(imm.election_cutoff_utc("KXFRENCHPRES-27"), utc(2027, 4, 17, 22, 0))
+
     def test_the_2026_10_07_config_gap_rows(self):
         # Jack 2026-10-07: "also resolve issues like this going forward" --
         # the two real elections in config_gaps get their verified days

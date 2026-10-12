@@ -12935,10 +12935,31 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # Argentina: general election Sun 2027-10-24 (fourth Sunday of October,
     # Ley 19.945), the first round.
     "KXARGENTINAPRES1R-27OCT24*=2027-10-24@America/Argentina/Buenos_Aires",
+    # --- the 2026-10-12 20:20Z batch (Jack: "yes add bulgaria and france,
+    # argentina too"; each date read 10/12) ---
+    # Argentina: the Peronist (PJ) presidential nominee. 27AUG08 is the
+    # national primaries' legal day (PASO: the second Sunday of August, Ley
+    # 26.571 art. 20 -> Sun 2027-08-08). The government wants the PASO
+    # scrapped or suspended for 2027 (its bill lacked the votes in July;
+    # suspension is the plan B -- iProfesional 2026-07-20, Wikipedia's 2027
+    # election page). Without them the nominee comes out of party deals
+    # before the list deadline, so this runs as an ANNOUNCEMENT-style market
+    # by Jack's call: quoted to the primary day, with the risk that the news
+    # lands first.
+    "KXARGENTINAPERONISTNOM-27AUG08*=2027-08-08@America/Argentina/Buenos_Aires",
     # France: presidential first round Sun 2027-04-18, runoff May 2 (set by
     # the cabinet 2026-06-30 -- France 24 / Bloomberg). The winner market's
     # first reveal is the first round, so the stand-down is there.
     "KXFRENCHPRES-27*=2027-04-18@Europe/Paris",
+    # ...and the first-round PLACING markets (1st / 2nd / 3rd place,
+    # KXFRPRES1R1ST/2ND/3RD-27, listed 2026-10-12) resolve on that same
+    # first round (dates re-read 10/12: Reuters / Bernama 2026-07-01).
+    "KXFRPRES1R*-27*=2027-04-18@Europe/Paris",
+    # Bulgaria: presidential first round Sun 2026-10-25 (National Assembly
+    # vote 2026-07-31; runoff Sun Nov 1 if no one clears 50% -- AP / BNT /
+    # Sofia Globe). The 2nd- and 3rd-place markets (KXBULGARIAPRES1R2ND /
+    # 1R3RD-26OCT25) resolve on the first round's certified result.
+    "KXBULGARIAPRES1R*-26OCT25*=2026-10-25@Europe/Sofia",
     # Slovenia local (Ljubljana mayor): Sun 2026-11-15, called 2026-07-08 by
     # the National Assembly Speaker (DVK; municipal notices; CoE calendar).
     # Early voting Nov 10-12 is not counted before the 15th; runoff Nov 29.

@@ -10511,3 +10511,19 @@ DataDome, so there is no feed to build; the 30-day losses are slow drift on
 single fills (-$538), not bursts after RCP updates (-$10 final, -$335 at 5m).
 Tests: TestQuietDailyMembers +1 (the shipped defaults), mechanism tests run
 with the off-list empty.
+
+## 2026-10-12 ~20:45Z — election rows: Bulgaria first round, the French first-round placings, the Peronist nominee (Jack: "yes add bulgaria and france, argentina too")
+
+The family watch enrolled KXBULGARIAPRES1R2ND/1R3RD, KXFRPRES1R1ST/2ND/3RD and
+KXARGENTINAPERONISTNOM at 20:20Z (Kalshi Elections category) but could not date
+them: its research step has failed since 17:50Z ("OAuth session expired" -- the
+headless `claude` login needs a re-login). Hand rows in _ELECTION_DATES_DEFAULT:
+- KXBULGARIAPRES1R*-26OCT25* = Sun 2026-10-25 @Europe/Sofia (parliament 7/31; runoff Nov 1;
+  AP / BNT / Sofia Globe). Cutoff 2026-10-24 21:00Z.
+- KXFRPRES1R*-27* = Sun 2027-04-18 @Europe/Paris (the KXFRENCHPRES row's first round; Reuters /
+  Bernama 7/1). Cutoff 2027-04-17 22:00Z.
+- KXARGENTINAPERONISTNOM-27AUG08* = Sun 2027-08-08 @America/Argentina/Buenos_Aires: the PASO's
+  legal day (second Sunday of August, Ley 26.571). The PASO may be scrapped or suspended for 2027,
+  so it runs as an announcement-style market by Jack's call. Cutoff 2027-08-08 03:00Z.
+Programs (10/12-10/18): Bulgaria 8 markets x $125/period per event, France 14 x $100, Argentina
+11 x $100 (~$190-260/day of pool per event); books were 1c x 80-99c placeholders at listing.
