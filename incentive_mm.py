@@ -251,9 +251,6 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("TWK_ENABLE") \
             and series in globals().get("TWK_SERIES", ()):
         m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
-    # the NFL auto families at pilot size (2026-10-12): the same
-    if series is not None and nfl_auto_pilot(series):
-        m = min(m, 1.0)
     return m
 
 
@@ -1560,7 +1557,8 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
         return 1.0 if series in QUIET_HOURS_OFF_SERIES else mults[hour]
     # the evening window (2026-10-05): never on a quiet hour, never on the
     # sports ladders / escalators (their pre-kickoff window)
-    if hour in evening and not sports_ladder_league(series):
+    if hour in evening and not sports_ladder_league(series) \
+            and nfl_auto_entry(series) is None:
         return evening[hour]
     return 1.0
 
@@ -1630,6 +1628,10 @@ def is_daily_series(series: str) -> bool:
     prefixes never count."""
     if any(series.startswith(p) for p in DAILY_EXEMPT_PREFIXES):
         return False
+    # the NFL auto families take the overnight / Saturday step-ups (Jack
+    # 2026-10-12) -- never daily, whatever the feed classifier reads
+    if nfl_auto_entry(series) is not None:
+        return False
     if any(series.startswith(p) for p in DAILY_PREFIXES):
         return True
     # the snow monthlies (2026-10-04) sit with the rain monthlies, which the
@@ -1645,9 +1647,6 @@ def is_daily_series(series: str) -> bool:
         return True
     # ... and so are the Trump weekly pilots (2026-10-11)
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
-        return True
-    # ... and so are the NFL auto families at pilot size (2026-10-12)
-    if nfl_auto_pilot(series):
         return True
     return series in DAILY_SERIES_DYNAMIC
 
@@ -2341,9 +2340,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return globals()["TWK_EVENT_CAP"]
-    # the NFL auto families at pilot size (2026-10-12): NFL_AUTO_EVENT_CAP
-    if nfl_auto_pilot(series):
-        return NFL_AUTO_EVENT_CAP
+    # the NFL auto families (2026-10-12): the ladders' / escalators' event cap
+    if nfl_auto_entry(series) is not None:
+        return MAX_EVENT_CONTRACTS * applied_mention_mult("KXNFLLADDERREC")
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -4560,22 +4559,30 @@ def load_election_extra_series() -> int:
 #                    ANY NFL GAME IS LIVE (nfl_live_verdict: kicked off and
 #                    not yet final, plus NFL_LIVE_COOLDOWN_MIN after it goes
 #                    final; a scoreboard that cannot be read counts as live).
-#   size "pilot"  -- safe-join, the 20-lot ladder at x1 every hour, no
-#                    deep-reference size, NFL_AUTO_MAX_POSITION per market,
-#                    NFL_AUTO_EVENT_CAP net per event, and a daily loss halt
-#                    PER SERIES at -NFL_AUTO_DAILY_LOSS_LIMIT on the pilots'
-#                    halt machinery (pilot_halt_key).
+#   size "pilot"  -- the default (Jack the same evening: "do a 3x
+#                    multiplier, include overnight/saturday scale ups. raise
+#                    halt to $100/day and make it per event. set event caps
+#                    to be same as ladder/escalator"; it first shipped at 20
+#                    lots x1, 100 / 100, $40 per series): safe-join, the
+#                    family size_mult NFL_AUTO_SIZE_MULT (x3: the rung, the
+#                    per-market cap and the skew knees together -- 60 lots,
+#                    450 per market at the launcher's 20 / 150), the
+#                    overnight quiet hours and the Saturday step on top
+#                    (never daily-classified; no evening window, as the
+#                    ladders), the deep-reference size, the ladders' event
+#                    cap, and a daily loss halt PER EVENT at
+#                    -NFL_AUTO_DAILY_LOSS_LIMIT ($100) on the pilots' halt
+#                    machinery (pilot_budget_key "NFLAUTO:<event>").
 #   size "ladder" -- upsized by hand ("size" in the file): safe-join and the
 #                    sports ladders' multipliers (family size_mult, the flat
-#                    hour multiplier, Saturday), caps scaling with them, no
+#                    hour multiplier, Saturday), the same event cap, no
 #                    halt.
 # IMM_NFL_AUTO_ENABLE=0 takes every member out; positions ride.
 NFL_AUTO_ENABLE = os.environ.get("IMM_NFL_AUTO_ENABLE", "1") == "1"
 NFL_AUTO_FILE = "nfl_auto_series.json"                  # in STATUS_DIR
 NFL_AUTO_INACTIVE_BUFFER_MIN = _env_int("IMM_NFL_AUTO_INACTIVE_BUFFER_MIN", 90)
-NFL_AUTO_MAX_POSITION = _env_float("IMM_NFL_AUTO_MAX_POSITION", 100)
-NFL_AUTO_EVENT_CAP = _env_float("IMM_NFL_AUTO_EVENT_CAP", 100)
-NFL_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_AUTO_DAILY_LOSS_LIMIT", 40)
+NFL_AUTO_SIZE_MULT = _env_float("IMM_NFL_AUTO_SIZE_MULT", 3.0)
+NFL_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_AUTO_DAILY_LOSS_LIMIT", 100)   # per event
 NFL_LIVE_COOLDOWN_MIN = _env_int("IMM_NFL_LIVE_COOLDOWN_MIN", 15)
 NFL_LIVE_TTL_SECS = _env_int("IMM_NFL_LIVE_TTL_SECS", 60)
 NFL_AUTO_SERIES: Dict[str, dict] = {}
@@ -4614,14 +4621,15 @@ def nfl_auto_ladder(series: str) -> bool:
 
 def nfl_auto_override(entry: dict) -> "SeriesOverride":
     """A member's guard set (see NFL_AUTO_ENABLE): safe-join always; a game
-    member's start buffer; the pilot cap, or the ladders' size multiplier."""
+    member's start buffer; the family multiplier NFL_AUTO_SIZE_MULT, or the
+    ladders' at ladder size."""
     kw: dict = {"safe_join": True}
     if entry["kind"] == "game":
         kw["start_buffer_min"] = int(entry["buffer_min"])
     if entry["size"] == "ladder":
         kw["size_mult"] = SERIES_OVERRIDES["KXNFLLADDERREC"].size_mult
     else:
-        kw["max_position"] = NFL_AUTO_MAX_POSITION
+        kw["size_mult"] = NFL_AUTO_SIZE_MULT
     return SeriesOverride(**kw)
 
 
@@ -8169,8 +8177,8 @@ _CONFIG_CODE_KNOBS = (
     # NFL head-to-head pilot (2026-10-12)
     "NFL_H2H_ENABLE", "NFL_H2H_START_BUFFER_MIN", "NFL_H2H_DAILY_LOSS_LIMIT",
     # NFL auto families (2026-10-12)
-    "NFL_AUTO_ENABLE", "NFL_AUTO_INACTIVE_BUFFER_MIN", "NFL_AUTO_MAX_POSITION",
-    "NFL_AUTO_EVENT_CAP", "NFL_AUTO_DAILY_LOSS_LIMIT", "NFL_LIVE_COOLDOWN_MIN",
+    "NFL_AUTO_ENABLE", "NFL_AUTO_INACTIVE_BUFFER_MIN", "NFL_AUTO_SIZE_MULT",
+    "NFL_AUTO_DAILY_LOSS_LIMIT", "NFL_LIVE_COOLDOWN_MIN",
     "NFL_LIVE_TTL_SECS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
@@ -11421,16 +11429,36 @@ def pilot_halt_key(series: str) -> Optional[str]:
         return series
     if nfl_h2h_series(series) and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         return NFL_H2H_HALT_KEY
-    # an NFL auto family at pilot size: its own budget (2026-10-12)
-    if nfl_auto_pilot(series) and NFL_AUTO_DAILY_LOSS_LIMIT > 0:
-        return series
     return None
+
+
+NFL_AUTO_BUDGET_PREFIX = "NFLAUTO:"
+
+
+def nfl_auto_event_key(ticker: str) -> str:
+    """'KXNFLTD-26OCT15SEADEN-SEAEWILSON23-3' -> 'KXNFLTD-26OCT15SEADEN': the
+    series and its game / season segment -- Kalshi's event for every NFL
+    auto family seen (KXNFLTD-26OCT15SEADEN, KXNFLLASTTOWIN-27,
+    KXNFLPLAYOFFC-27NYJNYG; event_ticker_of would cut KXNFLTD per player)."""
+    return "-".join(ticker.split("-")[:2])
+
+
+def pilot_budget_key(ticker: str) -> Optional[str]:
+    """The daily loss budget a pilot MARKET spends: its series' (a Trump
+    weekly series, the NFL head-to-head family -- pilot_halt_key), or one
+    per EVENT for an NFL auto family at pilot size (Jack 2026-10-12: "make
+    it per event"), 'NFLAUTO:<event>'."""
+    series = series_of(ticker)
+    if nfl_auto_pilot(series):
+        return (NFL_AUTO_BUDGET_PREFIX + nfl_auto_event_key(ticker)
+                if NFL_AUTO_DAILY_LOSS_LIMIT > 0 else None)
+    return pilot_halt_key(series)
 
 
 def pilot_halt_limit(key: str) -> float:
     if key == NFL_H2H_HALT_KEY:
         return NFL_H2H_DAILY_LOSS_LIMIT
-    if nfl_auto_entry(key) is not None:
+    if key.startswith(NFL_AUTO_BUDGET_PREFIX):
         return NFL_AUTO_DAILY_LOSS_LIMIT
     return TWK_DAILY_LOSS_LIMIT
 
@@ -11440,8 +11468,6 @@ def pilot_halt_keys() -> List[str]:
     keys = sorted(TWK_SERIES) if TWK_ENABLE else []
     if NFL_H2H_ENABLE and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         keys.append(NFL_H2H_HALT_KEY)
-    if NFL_AUTO_DAILY_LOSS_LIMIT > 0:
-        keys += sorted(s_ for s_ in NFL_AUTO_SERIES if nfl_auto_pilot(s_))
     return keys
 
 
@@ -20479,7 +20505,7 @@ class IncentiveMarketMaker:
         twk_pnl_carry[key]."""
         total = 0.0
         for t in set(self.pnl.realized) | set(self.pnl.pos):
-            if pilot_halt_key(series_of(t)) != key:
+            if pilot_budget_key(t) != key:
                 continue
             total += self.pnl.realized.get(t, 0.0)
             p = self.pnl.pos.get(t, 0.0)
@@ -22722,7 +22748,7 @@ class IncentiveMarketMaker:
             # aside until the 5am-CT roll; positions ride.
             # (the NFL head-to-head family rides the same machinery, as one
             # budget: pilot_halt_key, 2026-10-12)
-            _pk = pilot_halt_key(meta.series)
+            _pk = pilot_budget_key(t)
             if _pk is not None and self.state.twk_halt_day.get(
                     _pk) == _halt_day_key(now_utc):
                 self.cancel_market_orders(t, resting)
@@ -23487,9 +23513,16 @@ class IncentiveMarketMaker:
         # PILOT DAILY LOSS HALTS (Jack 2026-10-11, see TWK_ENABLE): the
         # YouTube pilots' scheme, one budget per pilot_halt_key -- each Trump
         # weekly series, and the NFL head-to-head family as one (2026-10-12).
-        if pilot_halt_keys() and not fast_only:
+        tw_keys = pilot_halt_keys()
+        if NFL_AUTO_ENABLE and NFL_AUTO_DAILY_LOSS_LIMIT > 0 and NFL_AUTO_SERIES:
+            # the NFL auto families' per-event budgets (2026-10-12): every
+            # event with P&L on the book or a selected market
+            _tk = set(self.pnl.realized) | set(self.pnl.pos) | set(self.state.selected)
+            tw_keys += sorted({k for k in map(pilot_budget_key, _tk)
+                               if k and k.startswith(NFL_AUTO_BUDGET_PREFIX)})
+        if tw_keys and not fast_only:
             _roll_day = _halt_day_key(now_utc)
-            for tw_s in pilot_halt_keys():
+            for tw_s in tw_keys:
                 tw_limit = pilot_halt_limit(tw_s)
                 if tw_limit <= 0:
                     continue
@@ -23503,12 +23536,12 @@ class IncentiveMarketMaker:
                         and self.state.twk_halt_day.get(tw_s) != _roll_day:
                     self.state.twk_halt_day[tw_s] = _roll_day
                     halted_ids = {str(o.get("ticker", "")) for o in resting
-                                  if pilot_halt_key(series_of(str(o.get("ticker", "")))) == tw_s}
+                                  if pilot_budget_key(str(o.get("ticker", ""))) == tw_s}
                     n_cx = 0
                     for t_h in sorted(halted_ids):
                         n_cx += self.cancel_market_orders(t_h, resting)
                     desired = [q for q in desired
-                               if pilot_halt_key(series_of(q.ticker)) != tw_s]
+                               if pilot_budget_key(q.ticker) != tw_s]
                     self.alerter.alert(
                         "twk_halt",
                         f"pilot {tw_s} P&L today ${tw_today:+.2f} <= "
@@ -25542,9 +25575,11 @@ class IncentiveMarketMaker:
             log(f"nfl auto families: {len(NFL_AUTO_SERIES)} enrolled -- game: "
                 f"{','.join(_g) or '-'}; season (off while any NFL game is live, "
                 f"+{NFL_LIVE_COOLDOWN_MIN}m): {','.join(_ss) or '-'}; ladder size: "
-                f"{','.join(_lad) or '-'}; pilot = safe-join x1, "
-                f"{NFL_AUTO_MAX_POSITION:g}/market, {NFL_AUTO_EVENT_CAP:g}/event, "
-                f"halt -${NFL_AUTO_DAILY_LOSS_LIMIT:g}/series")
+                f"{','.join(_lad) or '-'}; pilot = safe-join, family "
+                f"x{NFL_AUTO_SIZE_MULT:g} + overnight / Saturday steps, "
+                f"{MAX_POSITION_CONTRACTS * NFL_AUTO_SIZE_MULT:g}/market, "
+                f"{MAX_EVENT_CONTRACTS * applied_mention_mult('KXNFLLADDERREC'):g}/event "
+                f"(the ladders'), halt -${NFL_AUTO_DAILY_LOSS_LIMIT:g} per event")
         else:
             log("nfl auto families: OFF (IMM_NFL_AUTO_ENABLE=0)")
         if TREASURY_GATE_ENABLE:

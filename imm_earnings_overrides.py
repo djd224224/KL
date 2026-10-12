@@ -759,10 +759,13 @@ def nfl_auto_notify(additions: dict) -> None:
                          f"live (+{imm.NFL_LIVE_COOLDOWN_MIN} min after it ends)")
         lines.append(f"    e.g. {e.get('sample', '')}")
     lines += ["",
-              f"Pilot size: safe-join, 20 lots x1 at every hour, "
-              f"{imm.NFL_AUTO_MAX_POSITION:g} per market, {imm.NFL_AUTO_EVENT_CAP:g} "
-              f"net per event, quoting stops for the day at "
-              f"-${imm.NFL_AUTO_DAILY_LOSS_LIMIT:g} on the family.",
+              f"Pilot size: safe-join, x{imm.NFL_AUTO_SIZE_MULT:g} "
+              f"({imm.NFL_AUTO_SIZE_MULT * 20:g} lots, "
+              f"{imm.MAX_POSITION_CONTRACTS * imm.NFL_AUTO_SIZE_MULT:g} per market) "
+              f"with the overnight and Saturday step-ups on top, the ladders' "
+              f"event cap ({imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult('KXNFLLADDERREC'):g}), "
+              f"and quoting on an event stops for the day at "
+              f"-${imm.NFL_AUTO_DAILY_LOSS_LIMIT:g} on that event.",
               "To size one like the ladders / escalators (x5, x4 hours, caps "
               "750 / 5,000, no halt), set its \"size\" to \"ladder\" in "
               f"{imm.nfl_auto_path()} -- the bot reloads it within one "

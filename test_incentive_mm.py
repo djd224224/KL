@@ -19876,23 +19876,43 @@ class TestNflAutoFamilies(unittest.TestCase):
         self.assertEqual(td.start_buffer_min, 90)               # the inactive list
         self.assertEqual(rs.start_buffer_min, 0)                # fair-price rule: kickoff
         self.assertIsNone(lw.start_buffer_min)                  # a season prop: no cutoff
-        # pilot size: x1 at every hour, 100 / 100, no deep-reference size
+        # pilot size (Jack: "do a 3x multiplier, include overnight/saturday
+        # scale ups. raise halt to $100/day and make it per event. set event
+        # caps to be same as ladder/escalator")
+        lad_cap = imm.event_cap_contracts("KXNFLLADDERREC-26OCT12BUFLAR")
         for s in ("KXNFLTD", "KXNFLLASTTOWIN"):
-            self.assertTrue(imm.is_daily_series(s), s)
-            self.assertEqual(imm.series_max_position(s), 100.0, s)
-            self.assertEqual(imm.event_cap_contracts(f"{s}-27-X"), 100.0, s)
-            self.assertEqual(imm.hour_size_mult(s, datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)), 1.0, s)
-            self.assertEqual(imm.pilot_halt_key(s), s)          # its own $40 budget
-            self.assertEqual(imm.pilot_halt_limit(s), imm.NFL_AUTO_DAILY_LOSS_LIMIT)
-            with mock.patch.object(imm, "LADDER_MODE", "atref"):
-                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
-        self.assertIn("KXNFLTD", imm.pilot_halt_keys())
+            self.assertEqual(imm.series_override(s).size_mult, imm.NFL_AUTO_SIZE_MULT, s)
+            self.assertEqual(imm.applied_mention_mult(s), 3.0, s)
+            self.assertFalse(imm.is_daily_series(s), s)
+            self.assertEqual(imm.series_max_position(s), imm.MAX_POSITION_CONTRACTS * 3.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-27-X"), lad_cap, s)
+            self.assertIsNone(imm.pilot_halt_key(s), s)         # budgets are per EVENT
+            with mock.patch.object(imm, "LADDER_MODE", "atref"):  # the normal deep-ref size
+                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s),
+                                 imm.capped_ref_mult(49, 55, "ask", series="KXGOOD"), s)
+        self.assertEqual(imm.NFL_AUTO_DAILY_LOSS_LIMIT, 100)
+        self.assertEqual(imm.pilot_budget_key(self.GAME_T), "NFLAUTO:KXNFLTD-67OCT05ATLNO")
+        self.assertEqual(imm.pilot_budget_key(self.SEASON_T), "NFLAUTO:KXNFLLASTTOWIN-27")
+        self.assertEqual(imm.pilot_halt_limit("NFLAUTO:KXNFLTD-67OCT05ATLNO"), 100)
+        self.assertNotIn("KXNFLTD", imm.pilot_halt_keys())
+        # the overnight quiet hours and the Saturday step, not the evening window
+        with mock.patch.object(imm, "HOUR_SIZE_MULTS", imm._parse_hour_mults("0-8:3.0")),                 mock.patch.object(imm, "HOUR_SIZE_MULTS_NEXT", {}),                 mock.patch.object(imm, "HOUR_SIZE_MULT_FROM", None),                 mock.patch.object(imm, "EVENING_SIZE_MULTS", imm._parse_hour_mults("18-21:1.5")),                 mock.patch.object(imm, "EVENING_SIZE_MULT_FROM", datetime(2026, 10, 5).date()),                 mock.patch.object(imm, "SAT_SIZE_MULT", 1.5):
+            quiet = datetime(2026, 10, 13, 7, 0, tzinfo=timezone.utc)      # 3am ET Tuesday
+            evening = datetime(2026, 10, 13, 23, 30, tzinfo=timezone.utc)  # 7:30pm ET
+            sat = datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)       # 11am ET Saturday
+            for s in ("KXNFLTD", "KXNFLLASTTOWIN"):
+                self.assertEqual(imm.hour_size_mult(s, quiet), 3.0, s)
+                self.assertEqual(imm.hour_size_mult(s, evening), 1.0, s)
+                self.assertEqual(imm.hour_size_mult(s, sat), 1.5, s)
+            self.assertEqual(imm.hour_size_mult("KXGOOD", evening), 1.5)  # (the window is on)
         # ladder size ("you upsize"): the ladders' multipliers, no halt
         self.assertEqual(rs.size_mult, lad_ov.size_mult)
         self.assertFalse(imm.is_daily_series("KXNFLRSHYDS"))
         self.assertEqual(imm.series_max_position("KXNFLRSHYDS"),
                          imm.series_max_position("KXNFLLADDERREC"))
         self.assertIsNone(imm.pilot_halt_key("KXNFLRSHYDS"))
+        self.assertIsNone(imm.pilot_budget_key("KXNFLRSHYDS-26OCT12BUFLAR-BUFJCOOK4-50"))
+        self.assertEqual(imm.event_cap_contracts("KXNFLRSHYDS-26OCT12BUFLAR"), lad_cap)
         with mock.patch.object(imm, "SPORTS_LADDER_HOUR_MULT", 4.0):
             self.assertEqual(imm.hour_size_mult("KXNFLRSHYDS", datetime(2026, 10, 13, 16, 0, tzinfo=timezone.utc)), 4.0)
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
@@ -19992,6 +20012,24 @@ class TestNflAutoFamilies(unittest.TestCase):
         bot._nfl_live_cache = (time.time() + 3600, False, "")
         bot.run_cycle()
         self.assertEqual(self._sides(bot, self.SEASON_T), {"bid", "ask"})
+
+    def test_the_loss_halt_is_per_event(self):
+        self._write({"KXNFLPLAYOFFC": {"kind": "season", "size": "pilot"}})
+        a, b = "KXNFLPLAYOFFC-27NYJNYG-Y", "KXNFLPLAYOFFC-27DALPHI-Y"
+        bot = self._bot([a, b], close="2068-01-10T00:00:00Z")
+        bot._nfl_live_cache = (time.time() + 3600, False, "")
+        bot.run_cycle()
+        for t in (a, b):
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"}, t)
+        bot.pnl.realized[a] = -(imm.NFL_AUTO_DAILY_LOSS_LIMIT + 1)
+        bot.run_cycle()
+        roll = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.twk_halt_day.get("NFLAUTO:KXNFLPLAYOFFC-27NYJNYG"), roll)
+        self.assertNotIn("NFLAUTO:KXNFLPLAYOFFC-27DALPHI", bot.state.twk_halt_day)
+        self.assertEqual(self._sides(bot, a), set())
+        self.assertEqual(self._sides(bot, b), {"bid", "ask"})     # the other event quotes on
+        self.assertIn("twk_halt", [c for c, _m in bot.alerter.today])
+        self.assertEqual(bot.state.halted_until, 0.0)               # whole book untouched
 
     def test_a_game_member_stops_at_its_buffer_and_holds_on_team_news(self):
         self._write({"KXNFLTD": {"kind": "game", "size": "pilot", "buffer_min": 90}})
