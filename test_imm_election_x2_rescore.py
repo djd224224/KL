@@ -69,6 +69,20 @@ class RescoreTests(unittest.TestCase):
         self.assertEqual(R.book_now(D), {"quoted": 1, "positions": 1, "cost": 10.0, "unreal": -2.0})
         text.encode("ascii")                      # the task console is cp1252
 
+    def test_presrun_x6_is_kept_out(self):
+        # KXPRESRUN (2026-10-11) files under Elections but quotes NO-only at x6
+        days = dict(self.x1)
+        days["2026-10-12"] = (row(160, -90, 60, 2000, -46.0), row(0, 0))
+        D = model(days)
+        t = "KXPRESRUN-28-28NOV07-TMAS"
+        D["markets"][t] = {"fam": "Elections", "pos": 1, "risk": 500.0, "u": -50.0,
+                           "cur": {"q": 1}}
+        D["days"]["2026-10-12"]["m"][t] = row(30, -300, 10, 900, -40.0)
+        fd = R.family_days(D, first="2026-10-01")
+        self.assertAlmostEqual(fd["2026-10-12"]["rew"], 160)
+        self.assertAlmostEqual(fd["2026-10-12"]["pnl"], -90)
+        self.assertEqual(R.book_now(D), {"quoted": 1, "positions": 1, "cost": 10.0, "unreal": -2.0})
+
 
 if __name__ == "__main__":
     unittest.main()

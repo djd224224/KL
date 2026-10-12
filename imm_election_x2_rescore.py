@@ -52,6 +52,14 @@ SEND_FROM = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)   # 08:00 ET
 PRE_BOOK = {"quoted": 97, "positions": 183, "cost": 3159.7, "unreal": -426.5}
 MARKER = "election_x2_rescore_sent.marker"
 DAY_KEYS = ("rew", "pnl", "fills", "cts", "mk", "mk_cts", "cs")
+# Election-family series NOT on the family x2, kept out of both windows so
+# they cannot move the verdict: KXPRESRUN (2026-10-11, 5d1c0d5) quotes the
+# NO side only at x6.
+EXCLUDE_PREFIXES = ("KXPRESRUN-",)
+
+
+def excluded(ticker):
+    return ticker.startswith(EXCLUDE_PREFIXES)
 
 
 def num(v):
@@ -74,7 +82,7 @@ def family_days(D, family=FAMILY, first=FIRST_DAY):
         acc = dict.fromkeys(DAY_KEYS, 0.0)
         for t, row in (d.get("m") or {}).items():
             m = D["markets"].get(t)
-            if not m or m.get("fam") != family:
+            if not m or m.get("fam") != family or excluded(t):
                 continue
             for k, i in ix.items():
                 acc[k] += num(row[i]) if i < len(row) else 0.0
@@ -101,7 +109,7 @@ def window(days, isos):
 
 
 def book_now(D, family=FAMILY):
-    el = [m for m in D["markets"].values() if m.get("fam") == family]
+    el = [m for t, m in D["markets"].items() if m.get("fam") == family and not excluded(t)]
     pos = [m for m in el if m.get("pos")]
     return {"quoted": sum(1 for m in el if (m.get("cur") or {}).get("q")),
             "positions": len(pos),
