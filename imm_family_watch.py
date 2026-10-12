@@ -23,6 +23,7 @@ threshold". Three passes, each fail-safe on its own:
    verified voting day, an awards event with no hand row, a broadcast mention
    event the WH / RNC / TVmaze resolvers cannot place) goes to one headless
    Claude Code run on first sight, retried on a backoff; see research_pass.
+   A run that dies on the Claude Code login is emailed at once (LOGIN FAILURES).
 4. ALERT -- one email per run for what has stayed dark >= GAP_ALERT_AFTER_MIN
    (30 min) and is worth >= GAP_ALERT_MIN_DPD ($5/day of estimated reward: the
    bot's own estimator on the live books since 2026-10-09, see REAL ESTIMATES;
@@ -541,6 +542,19 @@ RESEARCH_TOOLS = ("Bash", "WebSearch", "WebFetch")
 RESEARCH_ALLOWED = ("Bash(python imm_rows.py:*)",
                     "Bash(python imm_earnings_overrides.py --set:*)",
                     "WebSearch", "WebFetch")
+# LOGIN FAILURES (Jack 2026-10-12: "send an email right away when research
+# fails on a login error, instead of waiting until items give up"). From 17:50Z
+# that day every run ended "Failed to authenticate: OAuth session expired and
+# could not be refreshed". apply_results filed each target "error" and spent a
+# try, and hold_researched kept the items quiet until research gave up (6 tries
+# 30 min apart) or they had been dark ALERT_STALE_HOURS -- longer than the 5.5h
+# KXWORLDNEWSMENTION-26OCT12 program it left without a start. Now a run that
+# dies on the login emails at once, again every RESEARCH_LOGIN_REALERT_H while
+# it lasts, and costs no target a try (none was researched).
+RESEARCH_LOGIN_RE = re.compile(r"failed to authenticate|oauth (?:session|token)|"
+                               r"not logged in|run /login|invalid api key|"
+                               r"authentication_error", re.I)
+RESEARCH_LOGIN_REALERT_H = float(os.environ.get("IMM_WATCH_LOGIN_REALERT_H", "6"))
 
 
 def gap_kind(msg: str) -> str:
@@ -741,6 +755,46 @@ def run_research(prompt: str) -> Tuple[str, float, str]:
         "" if p.returncode == 0 else f"exit {p.returncode}: {(p.stderr or '')[:200]}")
 
 
+def research_login_failure(text: str, err: str) -> str:
+    """The login error a FAILED research run died on, else ''. A clean exit
+    is never a login failure, whatever its text says."""
+    if not err:
+        return ""
+    for line in reversed(f"{text}\n{err}".splitlines()):
+        if RESEARCH_LOGIN_RE.search(line):
+            return line.strip()[:200]
+    return ""
+
+
+def alert_login_failure(state: dict, why: str, due: List[str], est: Dict[str, float],
+                        now_ts: float) -> bool:
+    """Email a research login failure: on the first failed run, then every
+    RESEARCH_LOGIN_REALERT_H while it lasts (state["research_login"]; a send
+    that fails is retried next run). True when an email went out."""
+    rec = state.setdefault("research_login", {"first": now_ts})
+    last = rec.get("alerted")
+    if last is not None and now_ts - float(last) < RESEARCH_LOGIN_REALERT_H * 3600:
+        return False
+    since = datetime.fromtimestamp(float(rec["first"]), timezone.utc)
+    lines = [f"The family watch's research run cannot log in to Claude Code "
+             f"(failing since {since:%Y-%m-%d %H:%M}Z):",
+             f"  {why}",
+             "",
+             f"Nothing gets researched until the login works. Waiting ({len(due)}):"]
+    lines += [f"  - {k}  (~${est.get(k, 0.0):.2f}/day, pool proxy)" for k in due]
+    lines += ["",
+              "Fix: open a terminal, run `claude`, and sign in again with /login. The "
+              "watch runs the WinGet claude.exe as this Windows user, and its next "
+              "run (every 30 min) retries on its own.",
+              f"This repeats every {RESEARCH_LOGIN_REALERT_H:g}h while the login "
+              f"keeps failing. Log: run-logs\\incentive-mm\\family-watch.log"]
+    if not imm.Alerter("IMM-WATCH", live=True).send_message(
+            "\n".join(lines), "IMM-WATCH research DOWN: Claude Code login failed"):
+        return False
+    rec["alerted"] = now_ts
+    return True
+
+
 def prune_research(rstate: Dict[str, dict], targets: Dict[str, dict],
                    now_ts: float) -> Dict[str, dict]:
     """The research records to keep: every current target's (stamped seen
@@ -811,10 +865,18 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
                  for k in due]
         text, cost, err = run_research(research_prompt(items))
         res = parse_research(text)
-        if not res:
-            notes.append(f"research: no RESULT_JSON line; ends {(text or err)[-240:]!r}")
-        notes += apply_results(rstate, due, targets, res, err, now_ts)
-        notes.append(f"research: {len(due)} target(s), ${cost:.2f}" + (f", {err}" if err else ""))
+        login = "" if res else research_login_failure(text, err)
+        if login:
+            # nothing was researched: no target spends a try, all stay due
+            notes.append(f"research: LOGIN FAILED ({login}); {len(due)} target(s) wait")
+            if alert_login_failure(state, login, due, est, now_ts):
+                notes.append("research: login failure emailed")
+        else:
+            state.pop("research_login", None)
+            if not res:
+                notes.append(f"research: no RESULT_JSON line; ends {(text or err)[-240:]!r}")
+            notes += apply_results(rstate, due, targets, res, err, now_ts)
+            notes.append(f"research: {len(due)} target(s), ${cost:.2f}" + (f", {err}" if err else ""))
     elif due:
         notes.append(f"research due ({'dry' if dry else 'disabled'}): {', '.join(due)}")
     state["research"] = rstate

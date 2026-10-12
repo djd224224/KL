@@ -299,5 +299,69 @@ class TestSingleWordUnique(unittest.TestCase):
         self.assertIsNone(ieo.wh_schedule_start(
             "What will Trump say during his announcement?", date(2026, 10, 7)))
 
+
+class _Sched:
+    """A TVmaze /schedule response."""
+
+    def __init__(self, entries):
+        self._entries = entries
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._entries
+
+
+def _ep(name, airstamp, network="ABC"):
+    return {"airstamp": airstamp, "show": {"name": name, "network": {"name": network}}}
+
+
+# the 2026-10-12 US schedule, trimmed
+OCT12_TV = [
+    _ep("ABC News Live Reports", "2026-10-12T21:00:00+00:00", None),
+    _ep("ABC World News Tonight with David Muir", "2026-10-12T22:30:00+00:00"),
+    _ep("Dancing with the Stars", "2026-10-13T00:00:00+00:00"),
+]
+
+
+class TestTvmazeAirtime(unittest.TestCase):
+    """Jack 2026-10-12, KXWORLDNEWSMENTION-26OCT12: the anchor in TVmaze's
+    show name left every World News Tonight event without a start."""
+
+    def _air(self, title, entries):
+        from unittest import mock
+        with mock.patch.object(ieo.requests, "get", lambda *a, **k: _Sched(entries)):
+            return ieo.tvmaze_airtime(title, date(2026, 10, 12))
+
+    def test_the_anchor_is_cut_from_the_show_name(self):
+        title = ieo.SHOW_TITLE_RE.search(
+            "What will the reporters say during ABC World News Tonight?").group(1)
+        dt, net = self._air(title, OCT12_TV)
+        self.assertEqual((dt.isoformat(), net), ("2026-10-12T18:30:00-04:00", "ABC"))
+
+    def test_a_lower_case_tail_is_not_an_anchor(self):
+        self.assertIsNone(self._air("Dancing", OCT12_TV))
+        dt, _ = self._air("Dancing with the Stars", OCT12_TV)
+        self.assertEqual(dt.isoformat(), "2026-10-12T20:00:00-04:00")
+
+    def test_an_exact_name_beats_an_anchored_one(self):
+        entries = [_ep("Special Report with Bret Baier", "2026-10-12T22:00:00+00:00", "FOX News"),
+                   _ep("Special Report", "2026-10-13T03:00:00+00:00", "FOX News")]
+        dt, _ = self._air("Special Report", entries)
+        self.assertEqual(dt.isoformat(), "2026-10-12T23:00:00-04:00")
+
+    def test_the_earliest_airing_wins(self):
+        entries = [_ep("ABC World News Tonight with David Muir", "2026-10-12T23:30:00+00:00"),
+                   _ep("ABC World News Tonight with David Muir", "2026-10-12T22:30:00+00:00")]
+        dt, _ = self._air("ABC World News Tonight", entries)
+        self.assertEqual(dt.isoformat(), "2026-10-12T18:30:00-04:00")
+
+    def test_no_match_or_no_airstamp_is_nothing(self):
+        self.assertIsNone(self._air("NBC Nightly News", OCT12_TV))
+        self.assertIsNone(self._air("ABC World News Tonight",
+                                    [_ep("ABC World News Tonight with David Muir", None)]))
+
+
 if __name__ == "__main__":
     unittest.main()

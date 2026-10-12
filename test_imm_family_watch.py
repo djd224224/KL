@@ -660,3 +660,83 @@ class TestModelCoveragePass(unittest.TestCase):
             fw.model_coverage_pass({}, state, False, [])
             fw.model_coverage_pass({}, state, False, [])         # a second failure: no repeat
         self.assertEqual(sent[1:], ["IMM-WATCH model coverage pass FAILED"])
+
+
+class TestResearchLoginFailure(unittest.TestCase):
+    """Jack 2026-10-12: "send an email right away when research fails on a
+    login error, instead of waiting until items give up"."""
+
+    EV = "KXWORLDNEWSMENTION-26OCT12"
+    KEY = "start:" + EV
+    T = {KEY: {"kind": "start", "event": EV, "series": "KXWORLDNEWSMENTION",
+               "msg": "no start time"}}
+    EXPIRED = ("Failed to authenticate: OAuth session expired and could not be "
+               "refreshed", 0.0, "exit 1: ")
+
+    def test_only_a_failed_runs_login_error_counts(self):
+        self.assertEqual(fw.research_login_failure(*self.EXPIRED[::2]), self.EXPIRED[0])
+        self.assertTrue(fw.research_login_failure("Invalid API key · Please run /login",
+                                                  "exit 1: "))
+        self.assertEqual(fw.research_login_failure(self.EXPIRED[0], ""), "")   # exit 0
+        self.assertEqual(fw.research_login_failure("Exceeded USD budget (3)", "exit 1: "), "")
+        self.assertEqual(fw.research_login_failure("", "TimeoutExpired: 720s"), "")
+
+    def _run(self, state, t, result):
+        from unittest import mock
+        sent = []
+        with mock.patch.object(fw, "research_targets", lambda *a, **k: dict(self.T)), \
+                mock.patch.object(fw.ifa, "fetch_active_programs", lambda client: {}), \
+                mock.patch.object(fw, "event_pools", lambda progs: {self.EV: 1000.0}), \
+                mock.patch.object(fw.imm_rows, "lookup", lambda ev: "ctx"), \
+                mock.patch.object(fw, "run_research", lambda prompt: result), \
+                mock.patch.object(fw.time, "time", lambda: t), \
+                mock.patch.object(fw.imm, "election_cutoff_utc", lambda ev, market=None: None), \
+                mock.patch.object(fw.imm, "load_election_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_awards_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_file_event_overrides", lambda: 0), \
+                mock.patch.object(imm.Alerter, "send_message",
+                                  lambda self, body, subject=None: sent.append((subject, body)) or True):
+            _, notes = fw.research_pass(None, {}, state, False)
+        return sent, notes
+
+    def test_emailed_at_once_then_every_6h_and_no_try_is_spent(self):
+        t, state = 1_800_000_000.0, {}
+        sent, notes = self._run(state, t, self.EXPIRED)
+        self.assertEqual([s for s, _ in sent], ["IMM-WATCH research DOWN: Claude Code login failed"])
+        body = sent[0][1]
+        self.assertIn(self.EXPIRED[0], body)
+        self.assertIn(self.KEY, body)
+        self.assertIn(f"~${1000 * fw.GAP_CAPTURE:.2f}/day", body)  # the pool proxy
+        self.assertIn("/login", body)
+        self.assertTrue(any("LOGIN FAILED" in n for n in notes))
+        self.assertNotIn(self.KEY, state["research"])            # no try spent
+        self.assertEqual(fw.research_due(state["research"], self.T, t + 60), [self.KEY])
+        sent, _ = self._run(state, t + 1800, self.EXPIRED)       # 30 min on: quiet
+        self.assertEqual(sent, [])
+        sent, _ = self._run(state, t + 6.1 * 3600, self.EXPIRED)  # still down 6h on
+        self.assertEqual(len(sent), 1)
+        self.assertIn("failing since 2027-01-15 08:00Z", sent[0][1])
+
+    def test_a_working_run_clears_it_and_the_next_failure_emails_at_once(self):
+        t, state = 1_800_000_000.0, {}
+        self._run(state, t, self.EXPIRED)
+        ok = ('RESULT_JSON: {"%s": {"status": "unresolved", "note": "not listed"}}'
+              % self.KEY, 0.12, "")
+        sent, _ = self._run(state, t + 1800, ok)
+        self.assertEqual(sent, [])
+        self.assertNotIn("research_login", state)
+        self.assertEqual(state["research"][self.KEY]["attempts"], 1)
+        sent, _ = self._run(state, t + 3600, self.EXPIRED)       # in its 2h backoff: no run
+        self.assertEqual(sent, [])
+        sent, _ = self._run(state, t + 1800 + 2.1 * 3600, self.EXPIRED)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(state["research"][self.KEY]["attempts"], 1)
+
+    def test_a_failed_send_is_retried_next_run(self):
+        from unittest import mock
+        state = {}
+        with mock.patch.object(imm.Alerter, "send_message", lambda self, body, subject=None: False):
+            self.assertFalse(fw.alert_login_failure(state, "x", [], {}, 1.0))
+        self.assertNotIn("alerted", state["research_login"])
+        with mock.patch.object(imm.Alerter, "send_message", lambda self, body, subject=None: True):
+            self.assertTrue(fw.alert_login_failure(state, "x", [], {}, 1801.0))

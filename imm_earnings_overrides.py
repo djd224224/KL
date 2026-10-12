@@ -758,6 +758,15 @@ def discover_company_disclosure(client, now):
 BROADCAST_LOOKAHEAD_DAYS = int(os.environ.get("IMM_BCAST_LOOKAHEAD_DAYS", "3"))
 TVMAZE_SCHED = "https://api.tvmaze.com/schedule?country=US&date={date}"
 SHOW_TITLE_RE = re.compile(r"during\s+(?:fox news:\s*)?([^?]+?)\s*\??\s*$", re.I)
+# ANCHOR NAMES (Jack 2026-10-12, KXWORLDNEWSMENTION-26OCT12: "so it doesnt
+# happen again"). TVmaze names a news show with its anchor -- "ABC World News
+# Tonight with David Muir" -- where Kalshi's title does not ("during ABC World
+# News Tonight?"), so the exact match never placed a WORLDNEWS event. With no
+# start, the event's fill tripwire armed from midnight, and two pre-show fills
+# at 4:24pm ET "confirmed" the 6:30pm show live and stood it down for good.
+# A show name also matches with a trailing "with <Capitalized Name>" cut; the
+# capitals keep "Dancing with the Stars" whole. An exact match still wins.
+ANCHOR_SUFFIX_RE = re.compile(r"\s+with\s+[A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*)*\s*$")
 
 
 def _norm_show(s: str) -> str:
@@ -802,9 +811,10 @@ def discover_broadcast_mention_events(client, now):
 
 
 def tvmaze_airtime(show_title: str, date_et):
-    """(datetime ET, network) for an exact normalized show-name match on the
-    US schedule that day, else None. Exact match only — a wrong air time is
-    worse than an email."""
+    """(datetime ET, network) for a normalized show-name match on the US
+    schedule that day, else None: an exact match, else the show name less its
+    anchor (ANCHOR_SUFFIX_RE); the earliest airing of the matches. Name
+    matches only — a wrong air time is worse than an email."""
     try:
         r = requests.get(TVMAZE_SCHED.format(date=date_et.isoformat()),
                          headers=UA, timeout=15)
@@ -816,15 +826,23 @@ def tvmaze_airtime(show_title: str, date_et):
     want = _norm_show(show_title)
     if not want:
         return None
+    exact, anchorless = [], []
     for e in entries:
         show = ((e.get("show") or {}).get("name")) or ""
-        if _norm_show(show) == want and e.get("airstamp"):
-            dt = parse_iso_utc(e["airstamp"])
-            if dt:
-                net = (((e.get("show") or {}).get("network") or {})
-                       .get("name")) or "?"
-                return dt.astimezone(ET), net
-    return None
+        dt = parse_iso_utc(e["airstamp"]) if e.get("airstamp") else None
+        if dt is None:
+            continue
+        if _norm_show(show) == want:
+            exact.append((dt, e))
+        elif _norm_show(ANCHOR_SUFFIX_RE.sub("", show)) == want:
+            anchorless.append((dt, e))
+    hits = exact or anchorless
+    if not hits:
+        return None
+    # the earliest airing: the bot must be out before the first one
+    dt, e = min(hits, key=lambda h: h[0])
+    net = (((e.get("show") or {}).get("network") or {}).get("name")) or "?"
+    return dt.astimezone(ET), net
 
 
 # White-House schedule auto-resolve (Jack 2026-08-03, KXTRUMPMENTION-26AUG03
