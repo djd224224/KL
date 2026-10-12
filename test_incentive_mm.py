@@ -19728,7 +19728,7 @@ class TestNflH2HPilot(unittest.TestCase):
 
     def test_team_news_hold_fails_closed(self):
         now = time.time()
-        g = imm.nfl_h2h_gate
+        g = imm.nfl_team_news_gate
         imm._nfl_state["snap"] = None
         self.assertEqual(g(self.REC, now)[1]["reason"], "no_read")
         imm._nfl_state["snap"] = self._snap(now)
@@ -19811,6 +19811,274 @@ class TestNflH2HPilot(unittest.TestCase):
         self.assertEqual(self._sides(bot, self.RSH), set())
         self.assertIn("twk_halt", [c for c, _m in bot.alerter.today])
         self.assertEqual(bot.state.halted_until, 0.0)            # whole book untouched
+
+
+class TestNflAutoFamilies(unittest.TestCase):
+    """NFL families auto-enrolled like the Elections category (Jack
+    2026-10-12: "anything tied to a single NFL game or season props", "Pilot
+    size, you upsize", "any props that go beyond a single game, should be
+    turned off anytime there's a live game")."""
+
+    KICKOFF = datetime(2067, 10, 6, 0, 15, tzinfo=timezone.utc)
+    GAME_T = "KXNFLTD-67OCT05ATLNO-ATLBROBINSON7-1"
+    SEASON_T = "KXNFLLASTTOWIN-27-MIA"
+
+    def setUp(self):
+        _clean_persist()
+        overrides = dict(imm.SERIES_OVERRIDES)
+        members = dict(imm.NFL_AUTO_SERIES)
+        state = dict(imm._nfl_auto_state)
+        hours = imm.SERIES_HOUR_MULTS
+        snap = imm._nfl_state.get("snap")
+
+        def restore():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+            imm.NFL_AUTO_SERIES.clear()
+            imm.NFL_AUTO_SERIES.update(members)
+            imm._nfl_auto_state.clear()
+            imm._nfl_auto_state.update(state)
+            imm.SERIES_HOUR_MULTS = hours
+            imm._nfl_state["snap"] = snap
+            try:
+                os.remove(imm.nfl_auto_path())
+            except OSError:
+                pass
+        self.addCleanup(restore)
+        imm.SERIES_HOUR_MULTS = []
+
+    def _write(self, series):
+        with open(imm.nfl_auto_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+        imm._nfl_auto_state["mtime"] = 0.0
+        return imm.load_nfl_auto_series()
+
+    def _members(self):
+        return self._write({
+            "KXNFLTD": {"kind": "game", "size": "pilot", "buffer_min": 90},
+            "KXNFLLASTTOWIN": {"kind": "season", "size": "pilot"},
+            "KXNFLRSHYDS": {"kind": "game", "size": "ladder", "buffer_min": 0},
+            "KXNFLLADDERREC": {"kind": "game", "size": "pilot"},   # hand-configured: refused
+            "KXFOO": {"kind": "game"},                             # not NFL: refused
+            "KXNFLWHAT": {"kind": "weekly"}})                      # not understood
+
+    def test_the_file_sets_membership_and_guard_sets(self):
+        lad_ov = imm.SERIES_OVERRIDES["KXNFLLADDERREC"]
+        self.assertEqual(self._members(), 3)
+        self.assertEqual(set(imm.NFL_AUTO_SERIES), {"KXNFLTD", "KXNFLLASTTOWIN", "KXNFLRSHYDS"})
+        self.assertIs(imm.SERIES_OVERRIDES["KXNFLLADDERREC"], lad_ov)    # untouched
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t in (self.GAME_T, self.SEASON_T, "KXNFLRSHYDS-26OCT12BUFLAR-BUFJCOOK4-50"):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed("KXNFLWHAT-27-X"))
+        td, lw, rs = (imm.series_override(s) for s in ("KXNFLTD", "KXNFLLASTTOWIN", "KXNFLRSHYDS"))
+        self.assertTrue(td.safe_join and lw.safe_join and rs.safe_join)
+        self.assertEqual(td.start_buffer_min, 90)               # the inactive list
+        self.assertEqual(rs.start_buffer_min, 0)                # fair-price rule: kickoff
+        self.assertIsNone(lw.start_buffer_min)                  # a season prop: no cutoff
+        # pilot size: x1 at every hour, 100 / 100, no deep-reference size
+        for s in ("KXNFLTD", "KXNFLLASTTOWIN"):
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertEqual(imm.series_max_position(s), 100.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-27-X"), 100.0, s)
+            self.assertEqual(imm.hour_size_mult(s, datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)), 1.0, s)
+            self.assertEqual(imm.pilot_halt_key(s), s)          # its own $40 budget
+            self.assertEqual(imm.pilot_halt_limit(s), imm.NFL_AUTO_DAILY_LOSS_LIMIT)
+            with mock.patch.object(imm, "LADDER_MODE", "atref"):
+                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
+        self.assertIn("KXNFLTD", imm.pilot_halt_keys())
+        # ladder size ("you upsize"): the ladders' multipliers, no halt
+        self.assertEqual(rs.size_mult, lad_ov.size_mult)
+        self.assertFalse(imm.is_daily_series("KXNFLRSHYDS"))
+        self.assertEqual(imm.series_max_position("KXNFLRSHYDS"),
+                         imm.series_max_position("KXNFLLADDERREC"))
+        self.assertIsNone(imm.pilot_halt_key("KXNFLRSHYDS"))
+        with mock.patch.object(imm, "SPORTS_LADDER_HOUR_MULT", 4.0):
+            self.assertEqual(imm.hour_size_mult("KXNFLRSHYDS", datetime(2026, 10, 13, 16, 0, tzinfo=timezone.utc)), 4.0)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "on"):
+            self.assertFalse(imm.join_ahead_series("KXNFLRSHYDS"))
+        # game members follow the NFL schedule; season members never pre-drop on it
+        self.assertTrue(imm.schedule_resolved_series("KXNFLTD"))
+        self.assertFalse(imm.schedule_resolved_series("KXNFLLASTTOWIN"))
+        # an entry leaving the file takes its guard set with it
+        self._write({"KXNFLTD": {"kind": "game", "buffer_min": 90}})
+        self.assertNotIn("KXNFLLASTTOWIN", imm.NFL_AUTO_SERIES)
+        self.assertNotIn("KXNFLLASTTOWIN", imm.SERIES_OVERRIDES)
+        with mock.patch.object(imm, "NFL_AUTO_ENABLE", False):          # kill switch
+            self.assertIsNone(imm.nfl_auto_entry("KXNFLTD"))
+
+    def test_the_live_game_verdict(self):
+        now = datetime(2026, 10, 12, 21, 0, tzinfo=timezone.utc)       # 5pm ET Monday
+        ts = now.timestamp()
+        urls = []
+
+        def board(events):
+            def get(url):
+                urls.append(url)
+                return {"events": events}
+            return get
+
+        def ev(state, kick, name="X", gid="1", completed=False):
+            return {"id": gid, "shortName": "BUF @ LAR",
+                    "date": kick.strftime("%Y-%m-%dT%H:%MZ"),
+                    "status": {"type": {"state": state, "name": name,
+                                        "completed": completed, "detail": "Q2"}}}
+        v = imm.nfl_live_verdict
+        self.assertEqual(v(board([]), ts, {}), (False, ""))
+        self.assertTrue(urls[-1].endswith("/football/nfl/scoreboard?dates=20261012"))
+        self.assertEqual(v(board([ev("pre", now + timedelta(hours=3))]), ts, {})[0], False)
+        self.assertTrue(v(board([ev("in", now - timedelta(hours=1))]), ts, {})[0])
+        self.assertTrue(v(board([ev("pre", now - timedelta(minutes=2))]), ts, {})[0])   # ESPN lagging
+        self.assertEqual(v(board([ev("pre", now - timedelta(hours=1), "STATUS_POSTPONED")]), ts, {})[0], False)
+        seen = {}
+        fin = [ev("post", now - timedelta(hours=3), "STATUS_FINAL", completed=True)]
+        self.assertTrue(v(board(fin), ts, seen)[0])                       # just went final
+        self.assertTrue(v(board(fin), ts + 14 * 60, seen)[0])
+        self.assertFalse(v(board(fin), ts + 16 * 60, seen)[0])            # cooldown over
+        old = [ev("post", now - timedelta(hours=6), "STATUS_FINAL", completed=True)]
+        self.assertFalse(v(board(old), ts, {})[0])                        # long over
+        def down(url):
+            raise ConnectionError("espn down")
+        self.assertIsNone(v(down, ts, {})[0])                             # caller fails closed
+        urls.clear()
+        late = datetime(2026, 10, 13, 6, 30, tzinfo=timezone.utc)         # 2:30am ET: yesterday too
+        v(board([]), late.timestamp(), {})
+        self.assertEqual([u[-8:] for u in urls], ["20261013", "20261012"])
+
+    def _bot(self, tickers, close="2067-10-09T00:15:00Z"):
+        client = FakeClient()
+        lv = [["0.36", "400"], ["0.37", "400"], ["0.38", "400"],
+              ["0.39", "400"], ["0.40", "300"]]
+        for t in tickers:
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                "close_time": close, "yes_bid_dollars": "0.4000",
+                "yes_ask_dollars": "0.6000", "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+        kick = {"events": [{
+            "date": self.KICKOFF.strftime("%Y-%m-%dT%H:%MZ"), "shortName": "ATL @ NO",
+            "status": {"type": {"name": "STATUS_SCHEDULED", "state": "pre"}},
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "NO", "location": "New Orleans"}, "homeAway": "home"},
+                {"team": {"abbreviation": "ATL", "location": "Atlanta"}, "homeAway": "away"}]}]}]}
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: kick)
+        return bot
+
+    @staticmethod
+    def _sides(bot, t):
+        return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+    def test_a_season_member_is_out_while_any_nfl_game_is_live(self):
+        self._write({"KXNFLLASTTOWIN": {"kind": "season", "size": "pilot"}})
+        bot = self._bot([self.SEASON_T], close="2068-01-10T00:00:00Z")
+        bot._nfl_live_cache = (time.time() + 3600, False, "")      # no game on
+        bot.run_cycle()
+        self.assertIn(self.SEASON_T, bot.state.selected)
+        self.assertEqual(self._sides(bot, self.SEASON_T), {"bid", "ask"})
+        bot._nfl_live_cache = (time.time() + 3600, True, "BUF @ LAR live (Q2)")
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.SEASON_T), set())
+        bot._nfl_live_cache = (time.time() + 3600, None, "NFL scoreboard unreadable")
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.SEASON_T), set())   # fails closed
+        bot._nfl_live_cache = (time.time() + 3600, False, "")
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.SEASON_T), {"bid", "ask"})
+
+    def test_a_game_member_stops_at_its_buffer_and_holds_on_team_news(self):
+        self._write({"KXNFLTD": {"kind": "game", "size": "pilot", "buffer_min": 90}})
+        now = time.time()
+        imm._nfl_state["snap"] = {"ts": now + 3600, "markets": {}, "teams": {},
+                                  "rosters": {"atl": now + 3600, "no": now + 3600}}
+        bot = self._bot([self.GAME_T])
+        bot.run_cycle()
+        self.assertIn(self.GAME_T, bot.state.selected)
+        self.assertEqual(bot.state.selected[self.GAME_T].cutoff,
+                         self.KICKOFF - timedelta(minutes=90))
+        self.assertEqual(self._sides(bot, self.GAME_T), {"bid", "ask"})
+        imm._nfl_state["snap"]["teams"] = {"atl": {"news": "Bijan Robinson RB Out",
+                                                   "news_at": time.time() - 60}}
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.GAME_T), set())
+
+    def test_the_new_series_pass_enrolls_by_kalshi_category_and_emails(self):
+        import imm_earnings_overrides as ieo
+        meta = {
+            "KXNFLTD": {"category": "Sports", "tags": ["Football"], "title": "Pro Football Touchdowns",
+                        "contract_url": "https://x/FOOTBALLENTITYSTAT.pdf"},
+            "KXNFLLASTTOWIN": {"category": "Sports", "tags": ["Football"], "title": "Last to win",
+                               "contract_url": "https://x/ENTITYOUTCOME.pdf"},
+            "KXNFLSTADIUM": {"category": "Sports", "tags": ["Football"], "title": "Stadium",
+                             "contract_url": "https://x/SPORTSPROJECTS.pdf"},
+            "KXNFLXAPPS": {"category": "Companies", "tags": [], "title": "App"}}
+        rules = {"KXNFLTD-26OCT15SEADEN-SEAEWILSON23-3":
+                 "If Emanuel Wilson is active but never takes a snap, the market "
+                 "settles to the fair market price before game start."}
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [
+                        {"market_ticker": "KXNFLTD-26OCT15SEADEN-SEAEWILSON23-3"},
+                        {"market_ticker": "KXNFLLASTTOWIN-27-MIA"},
+                        {"market_ticker": "KXNFLSTADIUM-27MAR01TENNSTAD-Y"},
+                        {"market_ticker": "KXNFLXAPPS-26NOV08-T5"}]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                if path.startswith("/markets/"):
+                    return {"market": {"rules_secondary": rules.get(path[9:], "")}}
+                raise AssertionError(path)
+        p = mock.patch.object(imm, "ALLOWLIST_ONLY", True)
+        p.start()
+        self.addCleanup(p.stop)
+        sent = []
+        with mock.patch.object(ieo, "nfl_auto_notify", lambda adds: sent.append(dict(adds))):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual(sorted(s for s, _w, _x in enrolled), ["KXNFLLASTTOWIN", "KXNFLTD"])
+        self.assertEqual(sorted(s for s, _w, _x in review), ["KXNFLSTADIUM", "KXNFLXAPPS"])
+        self.assertEqual(sorted(sent[0]), ["KXNFLLASTTOWIN", "KXNFLTD"])
+        with open(imm.nfl_auto_path(), encoding="utf-8") as f:
+            ser = json.load(f)["series"]
+        self.assertEqual((ser["KXNFLTD"]["kind"], ser["KXNFLTD"]["buffer_min"],
+                          ser["KXNFLTD"]["size"]), ("game", 90, "pilot"))   # inactive: silent
+        self.assertEqual(ser["KXNFLLASTTOWIN"]["kind"], "season")
+        # quoted from the next refresh; the next pass sees them covered
+        imm.load_nfl_auto_series()
+        self.assertTrue(IncentiveMarketMaker._allowed("KXNFLTD-26OCT15SEADEN-SEAEWILSON23-3"))
+        with mock.patch.object(ieo, "nfl_auto_notify", lambda adds: sent.append(dict(adds))):
+            enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual(enrolled2, [])
+        self.assertEqual(len(sent), 1)
+        # a hand-set size survives a later merge
+        ser["KXNFLTD"]["size"] = "ladder"
+        with open(imm.nfl_auto_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": ser}, f)
+        ieo._merge_nfl_auto_file(imm.nfl_auto_path(), {"KXNFLTD": {"kind": "game", "size": "pilot"}})
+        with open(imm.nfl_auto_path(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["series"]["KXNFLTD"]["size"], "ladder")
+
+    def test_the_fair_price_rule_reads_kickoff(self):
+        import imm_earnings_overrides as ieo
+
+        class _C:
+            def __init__(self, txt):
+                self.txt = txt
+
+            def get(self, path, params=None):
+                return {"market": {"rules_secondary": self.txt}}
+        h2h = ("If one or both players do not enter the game, or if the game is "
+               "cancelled ..., all markets will resolve to a fair price.")
+        self.assertEqual(ieo.nfl_dnp_buffer(_C(h2h), "X")[0], 0)
+        self.assertEqual(ieo.nfl_dnp_buffer(_C("Sleeper ... deemed to have scored 0.0 points"), "X")[0],
+                         imm.NFL_AUTO_INACTIVE_BUFFER_MIN)
 
 
 class TestYouTubeWeeklyPilot(unittest.TestCase):
@@ -21417,7 +21685,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # weekly pilot's loss halt and fair gate (2026-10-06) + the book-read
         # REST budget's rest_off (2026-10-11) + the Trump weekly pilots' loss
         # halt (2026-10-11) + the NFL head-to-head team-news hold (2026-10-12)
-        self.assertEqual(len(conts), 42)
+        # + the NFL auto families' live-game stand-aside (2026-10-12)
+        self.assertEqual(len(conts), 43)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

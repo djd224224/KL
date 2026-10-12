@@ -542,6 +542,8 @@ def classify_series(series: str, sample_ticker: str):
 def enroll_new_series(client, dry: bool):
     """Returns (enrolled, review) lists for the email."""
     load_extra_allow_series()
+    imm.load_election_extra_series()
+    imm.load_nfl_auto_series()
     seen: dict = {}
     cursor = None
     while True:
@@ -601,6 +603,7 @@ def enroll_new_series(client, dry: bool):
     # the Carbon Arc check below, so still one read per novel series.
     fin_additions = []
     elec_additions = []
+    nfl_additions: dict = {}
     still_review = []
     for s, why, sample in review:
         se = series_meta(client, s)
@@ -610,6 +613,13 @@ def enroll_new_series(client, dry: bool):
         elif imm.series_is_carbon_arc(se):
             fin_additions.append(s)
             enrolled.append((s, "Carbon Arc source -> finecon group", sample))
+        elif imm.NFL_AUTO_ENABLE and s.startswith("KXNFL"):
+            entry, why_not = nfl_auto_entry_for(client, s, sample, se)
+            if entry is not None:
+                nfl_additions[s] = entry
+                enrolled.append((s, nfl_auto_why(entry), sample))
+            else:
+                still_review.append((s, f"{why}; nfl auto: {why_not}", sample))
         else:
             still_review.append((s, why, sample))
     review = still_review
@@ -624,10 +634,140 @@ def enroll_new_series(client, dry: bool):
     if additions and not dry:
         _merge_series_file(EXTRA_ALLOW_FILE, additions)
         log(f"enrolled {len(additions)} new series -> {EXTRA_ALLOW_FILE}")
+    if nfl_additions and not dry:
+        _merge_nfl_auto_file(imm.nfl_auto_path(), nfl_additions)
+        log(f"nfl-auto-enrolled {len(nfl_additions)} series -> {imm.nfl_auto_path()}")
+        try:
+            nfl_auto_notify(nfl_additions)
+        except Exception as e:                       # noqa: BLE001
+            log(f"! nfl auto enrollment email failed: {e!r}")
     return enrolled, review
 
 
 ELECTION_ENROLL_WHY = "Kalshi Elections category -> election family"
+
+# NFL AUTO FAMILIES (Jack 2026-10-12: "can you automatically quote new NFL
+# game families, like how new election families are automatically quoted?";
+# scope "anything tied to a single NFL game or season props", start "Pilot
+# size, you upsize"). A REVIEW series named KXNFL* that Kalshi files under
+# Sports / Football joins the NFL auto family through
+# incentive_mm.NFL_AUTO_FILE (hot-reloaded; the bot's rules are documented at
+# incentive_mm.NFL_AUTO_ENABLE) -- a "game" member when its event names one
+# NFL game (date + two team codes), a "season" member otherwise -- unless its
+# contract is off-field (the draft, combine, stadiums, sellouts, player
+# contracts, trades, coaching, the Hall of Fame, media lists). Every
+# enrollment is emailed (nfl_auto_notify) so Jack can upsize or drop it.
+NFL_AUTO_WHY = "NFL auto family"
+NFL_AUTO_OFFFIELD_CONTRACTS = frozenset({
+    "DRAFTCOUNT", "NFLDRAFT", "TOPDRAFTSUP", "TEAMDRAFT", "DRAFTPICK",
+    "NFLDRAFTACHIEVEMENT", "POSITIONDRAFT", "DRAFTOVUN", "TOPDRAFT",
+    "NFLDRAFTTEAM", "LASTDRAFTPOSITION", "DRAFTCAT", "DRAFTCOMPARISON",
+    "DRAFTMATCHUP", "NFLCOMBINES", "NFLCOMBINE", "SPORTSPROJECTS",
+    "NFLSELLOUT", "SPORTINGCORPANNOUNCEMENT", "NFLPERIODMEDIACONSUMPTION",
+    "NFLCONTRACT", "NFLTRADE", "RETIRESPORT", "HALLOFFAME", "NFLT100LIST",
+    "COACHOUTFIRST", "NFLCOACHOUT", "NEXTCOACHOUT", "ATHLETENEXTTEAM",
+    "SPORTSIGN", "SPORTEVENTLOCATION", "NFLREBOOT", "NFLPREPACK", "NFLCOMBO"})
+# the same classes by name, for a series whose contract is new or unread
+NFL_AUTO_OFFFIELD_WORDS = (
+    "DRAFT", "COMBINE", "STADIUM", "SELLOUT", "OWNER", "VIEWERSHIP",
+    "CONTRACT", "TRADE", "RETIRE", "HALLOFFAME", "HOF", "T100", "COACH",
+    "NEXTTEAM", "REBOOT", "PREPACK", "COMBO", "PRACFIELD", "GAMELOCATION")
+_NFL_SITS_RE = re.compile(r"(do(es)?\s+not|fails?\s+to)\s+(enter|play|participate|appear)",
+                          re.I)
+
+
+def nfl_dnp_buffer(client, sample: str):
+    """(start buffer minutes, why) for a single-game NFL series: 0 when the
+    market's rules resolve a player who does not enter the game at a fair
+    price (the receptions / yards ladders' and the head-to-heads' rule),
+    else incentive_mm.NFL_AUTO_INACTIVE_BUFFER_MIN -- out when the inactive
+    list posts -- for a $0 rule, rules that say nothing, or a failed read."""
+    try:
+        m = (client.get(f"/markets/{sample}") or {}).get("market") or {}
+    except Exception as e:                           # noqa: BLE001
+        return imm.NFL_AUTO_INACTIVE_BUFFER_MIN, f"rules unread ({type(e).__name__})"
+    text = f"{m.get('rules_primary') or ''} {m.get('rules_secondary') or ''}"
+    if _NFL_SITS_RE.search(text) and re.search(r"fair\s+price", text, re.I):
+        return 0, "a player who does not enter the game resolves at a fair price"
+    return imm.NFL_AUTO_INACTIVE_BUFFER_MIN, "no fair-price rule for a player who sits"
+
+
+def nfl_auto_entry_for(client, series: str, sample: str, se: dict):
+    """(entry for incentive_mm.NFL_AUTO_FILE, '') for a series the NFL auto
+    family takes, else (None, why not)."""
+    if not series.startswith("KXNFL") or "MENTION" in series:
+        return None, "not an NFL prop series"
+    if se.get("category") != "Sports" or "Football" not in (se.get("tags") or []):
+        return None, f"Kalshi category {se.get('category')!r}, tags {se.get('tags')!r}"
+    contract = str(se.get("contract_url") or "").rsplit("/", 1)[-1].replace(".pdf", "")
+    if contract in NFL_AUTO_OFFFIELD_CONTRACTS \
+            or any(w in series[5:] for w in NFL_AUTO_OFFFIELD_WORDS):
+        return None, f"off-field ({contract or 'by name'})"
+    import nfl_prop_fair
+    game = (imm.parse_event_date(sample) is not None
+            and nfl_prop_fair.split_event_teams(sample) is not None)
+    entry = {"kind": "game" if game else "season", "size": "pilot",
+             "title": str(se.get("title") or ""), "contract": contract,
+             "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "sample": sample}
+    if game:
+        entry["buffer_min"], entry["buffer_why"] = nfl_dnp_buffer(client, sample)
+    return entry, ""
+
+
+def nfl_auto_why(entry: dict) -> str:
+    if entry["kind"] == "game":
+        cut = ("to kickoff" if not entry.get("buffer_min")
+               else f"to {entry['buffer_min']}m before kickoff")
+        return f"{NFL_AUTO_WHY}: one NFL game per event, quoted {cut}, pilot size"
+    return f"{NFL_AUTO_WHY}: season prop, off while any NFL game is live, pilot size"
+
+
+def _merge_nfl_auto_file(path: str, additions: dict) -> None:
+    """Add entries to incentive_mm.NFL_AUTO_FILE, atomically. An existing
+    entry is never overwritten, so a hand-set "size" survives."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        data = {}
+    cur = dict(data.get("series") or {})
+    for s_, e in additions.items():
+        cur.setdefault(s_, e)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"series": dict(sorted(cur.items()))}, f, indent=1)
+    os.replace(tmp, path)
+
+
+def nfl_auto_notify(additions: dict) -> None:
+    """One email for the NFL families just enrolled."""
+    n = len(additions)
+    subject = (f"IMM: {n} NFL famil{'y' if n == 1 else 'ies'} auto-enrolled at "
+               f"pilot size -- {', '.join(sorted(additions))}")
+    lines = [subject, ""]
+    for s_, e in sorted(additions.items()):
+        lines.append(f"- {s_}: {e.get('title') or '(no title)'} [{e.get('contract') or '?'}]")
+        if e["kind"] == "game":
+            cut = ("until kickoff" if not e.get("buffer_min")
+                   else f"until {e['buffer_min']} min before kickoff")
+            lines.append(f"    one game per event -- quoted {cut} ({e.get('buffer_why', '')}), "
+                         f"paused 15 min after team news")
+        else:
+            lines.append("    season prop -- no cutoff; OFF whenever any NFL game is "
+                         f"live (+{imm.NFL_LIVE_COOLDOWN_MIN} min after it ends)")
+        lines.append(f"    e.g. {e.get('sample', '')}")
+    lines += ["",
+              f"Pilot size: safe-join, 20 lots x1 at every hour, "
+              f"{imm.NFL_AUTO_MAX_POSITION:g} per market, {imm.NFL_AUTO_EVENT_CAP:g} "
+              f"net per event, quoting stops for the day at "
+              f"-${imm.NFL_AUTO_DAILY_LOSS_LIMIT:g} on the family.",
+              "To size one like the ladders / escalators (x5, x4 hours, caps "
+              "750 / 5,000, no halt), set its \"size\" to \"ladder\" in "
+              f"{imm.nfl_auto_path()} -- the bot reloads it within one "
+              "refresh -- or ask Claude. To drop one, delete its entry."]
+    imm.Alerter("IMM-NFL", live=True).send_message("\n".join(lines), subject)
 
 
 def series_meta(client, series: str) -> dict:

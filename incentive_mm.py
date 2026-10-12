@@ -251,6 +251,9 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("TWK_ENABLE") \
             and series in globals().get("TWK_SERIES", ()):
         m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
+    # the NFL auto families at pilot size (2026-10-12): the same
+    if series is not None and nfl_auto_pilot(series):
+        m = min(m, 1.0)
     return m
 
 
@@ -1527,7 +1530,8 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     # sports ladders / escalators: one flat value at every hour (2026-10-06)
     # -- and the NFL head-to-head family, sized as the ladders (2026-10-12)
     if SPORTS_LADDER_HOUR_MULT > 0 and (sports_ladder_league(series)
-                                        or nfl_h2h_series(series)):
+                                        or nfl_h2h_series(series)
+                                        or nfl_auto_ladder(series)):
         return SPORTS_LADDER_HOUR_MULT
     # Daily (print) families never take the GLOBAL window (Jack 2026-09-12,
     # with the 0-9am ET extension): the quiet hours are quiet for long-dated
@@ -1641,6 +1645,9 @@ def is_daily_series(series: str) -> bool:
         return True
     # ... and so are the Trump weekly pilots (2026-10-11)
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
+        return True
+    # ... and so are the NFL auto families at pilot size (2026-10-12)
+    if nfl_auto_pilot(series):
         return True
     return series in DAILY_SERIES_DYNAMIC
 
@@ -2334,6 +2341,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return globals()["TWK_EVENT_CAP"]
+    # the NFL auto families at pilot size (2026-10-12): NFL_AUTO_EVENT_CAP
+    if nfl_auto_pilot(series):
+        return NFL_AUTO_EVENT_CAP
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -4381,7 +4391,7 @@ def schedule_resolved_series(series: str) -> bool:
     league that has an ESPN path."""
     return series in SCHEDULE_RESOLVED_SERIES \
         or sports_ladder_league(series) in ESPN_LEAGUE_PATHS \
-        or nfl_h2h_series(series)
+        or nfl_h2h_series(series) or nfl_auto_game(series)
 
 
 # ELECTIONS (Jack 2026-09-28: "allowlist county judge markets e.g.
@@ -4522,6 +4532,190 @@ def load_election_extra_series() -> int:
         log(f"[IMM] election extra series: {len(fresh)} enrolled "
             f"({changed} changed)")
     return changed
+
+
+# NFL GAME / SEASON FAMILIES, AUTO-ENROLLED (Jack 2026-10-12: "can you
+# automatically quote new NFL game families, like how new election families
+# are automatically quoted?" -> scope "anything tied to a single NFL game or
+# season props", start "Pilot size, you upsize"; then "any props that go
+# beyond a single game, should be turned off anytime there's a live game").
+# The new-series pass (imm_earnings_overrides.enroll_new_series, run by the
+# 30-min family watch and the overrides task) writes each newly paying,
+# not-yet-allowed KXNFL series that Kalshi files under Sports / Football --
+# less the off-field contracts (draft, combine, stadium, sellouts, player
+# contracts, trades, coaching, Hall of Fame ...) -- into NFL_AUTO_FILE and
+# emails it:
+#   {"series": {S: {"kind": "game" | "season", "buffer_min": int | null,
+#                   "size": "pilot" | "ladder", "title", "contract", "since"}}}
+# Hot-reloaded by mtime at import and every universe refresh. A member
+# quotes with this guard set (nfl_auto_override):
+#   kind "game"   -- one NFL game per event ("26OCT12BUFLAR"): cut off at
+#                    the ESPN NFL scoreboard's kickoff less buffer_min -- 0
+#                    when Kalshi's rules resolve a player who does not enter
+#                    the game at a fair price, else NFL_AUTO_INACTIVE_BUFFER_MIN
+#                    (90, the inactive list) -- plus the ladders' team-news
+#                    hold (nfl_team_news_gate).
+#   kind "season" -- beyond a single game (season / weekly props): no cutoff
+#                    (the undated guard set's precedent) and NO QUOTES WHILE
+#                    ANY NFL GAME IS LIVE (nfl_live_verdict: kicked off and
+#                    not yet final, plus NFL_LIVE_COOLDOWN_MIN after it goes
+#                    final; a scoreboard that cannot be read counts as live).
+#   size "pilot"  -- safe-join, the 20-lot ladder at x1 every hour, no
+#                    deep-reference size, NFL_AUTO_MAX_POSITION per market,
+#                    NFL_AUTO_EVENT_CAP net per event, and a daily loss halt
+#                    PER SERIES at -NFL_AUTO_DAILY_LOSS_LIMIT on the pilots'
+#                    halt machinery (pilot_halt_key).
+#   size "ladder" -- upsized by hand ("size" in the file): safe-join and the
+#                    sports ladders' multipliers (family size_mult, the flat
+#                    hour multiplier, Saturday), caps scaling with them, no
+#                    halt.
+# IMM_NFL_AUTO_ENABLE=0 takes every member out; positions ride.
+NFL_AUTO_ENABLE = os.environ.get("IMM_NFL_AUTO_ENABLE", "1") == "1"
+NFL_AUTO_FILE = "nfl_auto_series.json"                  # in STATUS_DIR
+NFL_AUTO_INACTIVE_BUFFER_MIN = _env_int("IMM_NFL_AUTO_INACTIVE_BUFFER_MIN", 90)
+NFL_AUTO_MAX_POSITION = _env_float("IMM_NFL_AUTO_MAX_POSITION", 100)
+NFL_AUTO_EVENT_CAP = _env_float("IMM_NFL_AUTO_EVENT_CAP", 100)
+NFL_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_AUTO_DAILY_LOSS_LIMIT", 40)
+NFL_LIVE_COOLDOWN_MIN = _env_int("IMM_NFL_LIVE_COOLDOWN_MIN", 15)
+NFL_LIVE_TTL_SECS = _env_int("IMM_NFL_LIVE_TTL_SECS", 60)
+NFL_AUTO_SERIES: Dict[str, dict] = {}
+_nfl_auto_state: dict = {"mtime": 0.0, "installed": set()}
+
+
+def nfl_auto_path() -> str:
+    return os.path.join(STATUS_DIR, NFL_AUTO_FILE)
+
+
+def nfl_auto_entry(series: str) -> Optional[dict]:
+    """The series' NFL auto-family entry, None when it is not a member (or
+    the family is off)."""
+    return NFL_AUTO_SERIES.get(series) if NFL_AUTO_ENABLE else None
+
+
+def nfl_auto_game(series: str) -> bool:
+    e = nfl_auto_entry(series)
+    return bool(e) and e["kind"] == "game"
+
+
+def nfl_auto_season(series: str) -> bool:
+    e = nfl_auto_entry(series)
+    return bool(e) and e["kind"] == "season"
+
+
+def nfl_auto_pilot(series: str) -> bool:
+    e = nfl_auto_entry(series)
+    return bool(e) and e["size"] == "pilot"
+
+
+def nfl_auto_ladder(series: str) -> bool:
+    e = nfl_auto_entry(series)
+    return bool(e) and e["size"] == "ladder"
+
+
+def nfl_auto_override(entry: dict) -> "SeriesOverride":
+    """A member's guard set (see NFL_AUTO_ENABLE): safe-join always; a game
+    member's start buffer; the pilot cap, or the ladders' size multiplier."""
+    kw: dict = {"safe_join": True}
+    if entry["kind"] == "game":
+        kw["start_buffer_min"] = int(entry["buffer_min"])
+    if entry["size"] == "ladder":
+        kw["size_mult"] = SERIES_OVERRIDES["KXNFLLADDERREC"].size_mult
+    else:
+        kw["max_position"] = NFL_AUTO_MAX_POSITION
+    return SeriesOverride(**kw)
+
+
+def load_nfl_auto_series() -> int:
+    """Hot-reload NFL_AUTO_FILE by mtime into NFL_AUTO_SERIES and (re)install
+    each member's guard set; entries changed on a reload, else 0. Refuses
+    blocklisted series and the hand-configured NFL families (the ladders /
+    escalators and the head-to-head pilot keep their own rules)."""
+    try:
+        mtime = os.path.getmtime(nfl_auto_path())
+    except OSError:
+        return 0
+    if mtime == _nfl_auto_state["mtime"]:
+        return 0
+    _nfl_auto_state["mtime"] = mtime
+    try:
+        with open(nfl_auto_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! nfl auto file unreadable: {e}")
+        return 0
+    fresh: Dict[str, dict] = {}
+    for s_, e in (data.get("series") or {}).items():
+        s_ = str(s_).strip()
+        if not s_.startswith("KXNFL") or not isinstance(e, dict):
+            continue
+        if any(s_.startswith(p_) for p_ in SERIES_BLOCKLIST_PREFIXES):
+            log(f"[IMM] ! refused blocklisted series in nfl auto: {s_}")
+            continue
+        if sports_ladder_league(s_) or nfl_h2h_series(s_):
+            continue
+        kind, size = e.get("kind"), e.get("size") or "pilot"
+        if kind not in ("game", "season") or size not in ("pilot", "ladder"):
+            log(f"[IMM] ! nfl auto {s_}: kind/size {kind!r}/{size!r} not understood, skipped")
+            continue
+        try:
+            buf = int(e["buffer_min"]) if e.get("buffer_min") is not None \
+                else NFL_AUTO_INACTIVE_BUFFER_MIN
+        except (TypeError, ValueError):
+            buf = NFL_AUTO_INACTIVE_BUFFER_MIN
+        fresh[s_] = {"kind": kind, "size": size, "buffer_min": max(0, buf),
+                     "title": str(e.get("title") or "")}
+    for s_ in _nfl_auto_state["installed"] - set(fresh):
+        SERIES_OVERRIDES.pop(s_, None)
+    for s_, e in fresh.items():
+        SERIES_OVERRIDES[s_] = nfl_auto_override(e)
+    changed = sum(1 for s_ in set(fresh) | set(NFL_AUTO_SERIES)
+                  if fresh.get(s_) != NFL_AUTO_SERIES.get(s_))
+    NFL_AUTO_SERIES.clear()
+    NFL_AUTO_SERIES.update(fresh)
+    _nfl_auto_state["installed"] = set(fresh)
+    if changed:
+        log(f"[IMM] nfl auto families: {len(fresh)} enrolled ({changed} changed)")
+    return changed
+
+
+def nfl_live_verdict(get_json, now_ts: float,
+                     final_seen: Dict[str, float]) -> Tuple[Optional[bool], str]:
+    """(True, why) while any NFL game is live -- past its scheduled kickoff
+    and not final, or final less than NFL_LIVE_COOLDOWN_MIN ago (by when
+    `final_seen` first saw it; a game that kicked off over 5h ago is long
+    over); (False, '') when none is; (None, why) when the scoreboard cannot
+    be read -- callers treat that as live (fail closed). Reads today's ET
+    scoreboard, and yesterday's before 4am ET (a late game past midnight)."""
+    now = datetime.fromtimestamp(now_ts, timezone.utc)
+    et = now.astimezone(ET)
+    days = [et.date()] + ([et.date() - timedelta(days=1)] if et.hour < 4 else [])
+    for d in days:
+        try:
+            data = get_json(f"{ESPN_SITE_API}/{ESPN_LEAGUE_PATHS['NFL']}/"
+                            f"scoreboard?dates={d.strftime('%Y%m%d')}")
+        except Exception as e:                       # noqa: BLE001
+            return None, f"NFL scoreboard unreadable ({type(e).__name__})"
+        for ev in (data or {}).get("events") or []:
+            st = (ev.get("status") or {}).get("type") or {}
+            name, state = str(st.get("name") or ""), str(st.get("state") or "")
+            if name in ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED"):
+                continue
+            kick = parse_iso_utc(ev.get("date", ""))
+            short = ev.get("shortName") or ev.get("id") or "game"
+            if state == "in":
+                return True, f"{short} live ({st.get('detail') or name})"
+            if state == "post" or st.get("completed"):
+                if kick is not None and now - kick > timedelta(hours=5):
+                    continue
+                gid = str(ev.get("id") or short)
+                first = final_seen.setdefault(gid, now_ts)
+                if now_ts - first < NFL_LIVE_COOLDOWN_MIN * 60:
+                    return True, (f"{short} final {(now_ts - first) / 60:.0f}m ago "
+                                  f"(cooldown {NFL_LIVE_COOLDOWN_MIN}m)")
+                continue
+            if kick is not None and kick <= now:
+                return True, f"{short} past kickoff, not yet live on ESPN"
+    return False, ""
 
 
 def election_series(series: str) -> bool:
@@ -7974,6 +8168,10 @@ _CONFIG_CODE_KNOBS = (
     "TWK_DAILY_LOSS_LIMIT",
     # NFL head-to-head pilot (2026-10-12)
     "NFL_H2H_ENABLE", "NFL_H2H_START_BUFFER_MIN", "NFL_H2H_DAILY_LOSS_LIMIT",
+    # NFL auto families (2026-10-12)
+    "NFL_AUTO_ENABLE", "NFL_AUTO_INACTIVE_BUFFER_MIN", "NFL_AUTO_MAX_POSITION",
+    "NFL_AUTO_EVENT_CAP", "NFL_AUTO_DAILY_LOSS_LIMIT", "NFL_LIVE_COOLDOWN_MIN",
+    "NFL_LIVE_TTL_SECS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -8908,6 +9106,7 @@ def save_family_verdicts() -> None:
 load_family_verdicts()
 load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
 load_election_extra_series()   # Elections-category members (beside election_series)
+load_nfl_auto_series()         # NFL auto families (beside the election file)
 
 
 # ----------------------------------------------------------------------------
@@ -11187,7 +11386,7 @@ def twk_bid_only(series: str) -> bool:
 # Saturday step on top, the deep-reference size and no join-ahead -- 20 x 5
 # x 4 = 400 a side, caps 750 / 5,000 at the launcher's 150 / 1,000. Then
 # the ladders' team-news hold
-# (nfl_h2h_gate: news on either team inside NFL_NEWS_HOLD_MIN, or a stale /
+# (nfl_team_news_gate: news on either team inside NFL_NEWS_HOLD_MIN, or a stale /
 # missing NFL read or roster, stands it aside -- fails closed). NO family
 # loss halt (Jack the same evening: "remove the $40 halt for H2H"; at 400
 # a side one 10c pick-off is -$40): NFL_H2H_DAILY_LOSS_LIMIT 0. A value > 0
@@ -11222,11 +11421,18 @@ def pilot_halt_key(series: str) -> Optional[str]:
         return series
     if nfl_h2h_series(series) and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         return NFL_H2H_HALT_KEY
+    # an NFL auto family at pilot size: its own budget (2026-10-12)
+    if nfl_auto_pilot(series) and NFL_AUTO_DAILY_LOSS_LIMIT > 0:
+        return series
     return None
 
 
 def pilot_halt_limit(key: str) -> float:
-    return NFL_H2H_DAILY_LOSS_LIMIT if key == NFL_H2H_HALT_KEY else TWK_DAILY_LOSS_LIMIT
+    if key == NFL_H2H_HALT_KEY:
+        return NFL_H2H_DAILY_LOSS_LIMIT
+    if nfl_auto_entry(key) is not None:
+        return NFL_AUTO_DAILY_LOSS_LIMIT
+    return TWK_DAILY_LOSS_LIMIT
 
 
 def pilot_halt_keys() -> List[str]:
@@ -11234,6 +11440,8 @@ def pilot_halt_keys() -> List[str]:
     keys = sorted(TWK_SERIES) if TWK_ENABLE else []
     if NFL_H2H_ENABLE and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         keys.append(NFL_H2H_HALT_KEY)
+    if NFL_AUTO_DAILY_LOSS_LIMIT > 0:
+        keys += sorted(s_ for s_ in NFL_AUTO_SERIES if nfl_auto_pilot(s_))
     return keys
 
 
@@ -11818,8 +12026,9 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
-def nfl_h2h_gate(ticker: str, now_ts: float) -> Tuple[str, dict]:
-    """('', {}) when an NFL head-to-head market may quote, else (why,
+def nfl_team_news_gate(ticker: str, now_ts: float) -> Tuple[str, dict]:
+    """('', {}) when a single-game NFL market (the head-to-head pilot, an NFL
+    auto family's game member) may quote, else (why,
     guard-skip inputs). The ladders' TEAM-NEWS HOLD for both teams of the
     game (news inside NFL_NEWS_HOLD_MIN on either stands it aside), failing
     CLOSED like nfl_gate: a missing or stale NFL read, a game segment that
@@ -12285,7 +12494,7 @@ class EventStartResolver:
             return self._espn_game_start(path, event_ticker, 2) if path else None
         # NFL head-to-head (2026-10-12): the same '<date><AWAY><HOME>' game
         # segment, the NFL scoreboard
-        if nfl_h2h_series(series):
+        if nfl_h2h_series(series) or nfl_auto_game(series):
             path = ESPN_LEAGUE_PATHS.get("NFL")
             return self._espn_game_start(path, event_ticker, 2) if path else None
         game = parse_mention_game(event_ticker)
@@ -14209,7 +14418,7 @@ def join_ahead_series(series: str) -> bool:
     if JOIN_AHEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
         return False
     if sports_ladder_league(series) is not None or is_daily_series(series) \
-            or nfl_h2h_series(series):
+            or nfl_h2h_series(series) or nfl_auto_entry(series) is not None:
         return False
     # Carbon Arc by its verified source OR its name pattern: an unverified
     # *POS / *FT / *APP / *ADS / *CC stays out too (fails toward no move)
@@ -15203,6 +15412,10 @@ class IncentiveMarketMaker:
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
         self._nfl_stood: Set[str] = set()         # NFL prop gate stand-asides
+        # NFL auto season members' live-game check (nfl_live_verdict):
+        # (checked_at, verdict, why) and when each game was first seen final
+        self._nfl_live_cache: Optional[Tuple[float, Optional[bool], str]] = None
+        self._nfl_final_seen: Dict[str, float] = {}
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
@@ -18358,6 +18571,7 @@ class IncentiveMarketMaker:
             snow_monthly_series(series) or \
             cpi_pilot_active(ticker) or \
             nfl_h2h_series(series) or \
+            nfl_auto_entry(series) is not None or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -18598,6 +18812,7 @@ class IncentiveMarketMaker:
         load_extra_allow_series()
         load_finecon_extra_series()
         load_election_extra_series()
+        load_nfl_auto_series()        # NFL auto families (2026-10-12)
         load_election_dates_extra()   # hot-reloaded rows (2026-10-07)
         load_awards_dates_extra()
         load_family_verdicts()
@@ -20245,6 +20460,17 @@ class IncentiveMarketMaker:
             if abs(p) > 1e-9 and mark is not None:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
+
+    def _nfl_live_games(self, now_ts: float) -> Tuple[Optional[bool], str]:
+        """nfl_live_verdict on the resolver's ESPN client (its host-down
+        skip), cached NFL_LIVE_TTL_SECS."""
+        c = self._nfl_live_cache
+        if c is not None and now_ts - c[0] < NFL_LIVE_TTL_SECS:
+            return c[1], c[2]
+        verdict, why = nfl_live_verdict(self.resolver._get, now_ts,
+                                        self._nfl_final_seen)
+        self._nfl_live_cache = (now_ts, verdict, why)
+        return verdict, why
 
     def _twk_pnl(self, key: str) -> float:
         """One pilot budget's realized + mark-to-market (pilot_halt_key: a
@@ -22578,16 +22804,31 @@ class IncentiveMarketMaker:
                     self.cancel_market_orders(t, resting)
                     self._gskip(t, "nfl_fair", lambda: nf_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
-            # NFL HEAD-TO-HEAD PILOT (Jack 2026-10-12, see NFL_H2H_ENABLE): the
+            # NFL HEAD-TO-HEAD PILOT and the NFL AUTO FAMILIES' GAME members
+            # (Jack 2026-10-12, see NFL_H2H_ENABLE / NFL_AUTO_ENABLE): the
             # ladders' team-news hold on both teams, failing closed.
-            if nfl_h2h_series(meta.series):
-                h2_why, h2_in = nfl_h2h_gate(t, now_ts)
+            if nfl_h2h_series(meta.series) or nfl_auto_game(meta.series):
+                h2_why, h2_in = nfl_team_news_gate(t, now_ts)
                 if h2_why:
                     if t not in self._nfl_stood:
                         self._nfl_stood.add(t)
-                        log(f"{self.tag} nfl h2h stand-aside {t}: {h2_why}")
+                        log(f"{self.tag} nfl team-news stand-aside {t}: {h2_why}")
                     self.cancel_market_orders(t, resting)
-                    self._gskip(t, "nfl_h2h", lambda: h2_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    self._gskip(t, "nfl_team_news", lambda: h2_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            # ... and their SEASON members are out while any NFL game is live
+            # (Jack 2026-10-12: "any props that go beyond a single game,
+            # should be turned off anytime there's a live game")
+            if nfl_auto_season(meta.series):
+                lv_live, lv_why = self._nfl_live_games(now_ts)
+                if lv_live is not False:
+                    if t not in self._nfl_stood:
+                        self._nfl_stood.add(t)
+                        log(f"{self.tag} nfl live-game stand-aside {t}: {lv_why}")
+                    self.cancel_market_orders(t, resting)
+                    lv_in = {"reason": "live_game" if lv_live else "scoreboard",
+                             "why": lv_why}
+                    self._gskip(t, "nfl_live", lambda: lv_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
             if t in self._nfl_stood:
                 self._nfl_stood.discard(t)
@@ -25294,6 +25535,18 @@ class IncentiveMarketMaker:
                    == _halt_day_key(datetime.now(timezone.utc)) else ""))
         else:
             log("nfl h2h pilot: OFF -- the KXNFL*H2H series are not enrolled")
+        if NFL_AUTO_ENABLE:
+            _g = sorted(s_ for s_, e in NFL_AUTO_SERIES.items() if e["kind"] == "game")
+            _ss = sorted(s_ for s_, e in NFL_AUTO_SERIES.items() if e["kind"] == "season")
+            _lad = sorted(s_ for s_, e in NFL_AUTO_SERIES.items() if e["size"] == "ladder")
+            log(f"nfl auto families: {len(NFL_AUTO_SERIES)} enrolled -- game: "
+                f"{','.join(_g) or '-'}; season (off while any NFL game is live, "
+                f"+{NFL_LIVE_COOLDOWN_MIN}m): {','.join(_ss) or '-'}; ladder size: "
+                f"{','.join(_lad) or '-'}; pilot = safe-join x1, "
+                f"{NFL_AUTO_MAX_POSITION:g}/market, {NFL_AUTO_EVENT_CAP:g}/event, "
+                f"halt -${NFL_AUTO_DAILY_LOSS_LIMIT:g}/series")
+        else:
+            log("nfl auto families: OFF (IMM_NFL_AUTO_ENABLE=0)")
         if TREASURY_GATE_ENABLE:
             log("treasury gate: "
                 + (f"ALL {len(TREASURY_GATED_SERIES)} Treasury series"
