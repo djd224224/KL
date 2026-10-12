@@ -197,6 +197,8 @@ def setUpModule():
     imm._cpi_fair_state.update(mtime=0.0, markets={}, events={})
     imm.RAIN_WKND_FILE = os.path.join(tmp, "rain_wknd_fair.json")
     imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
+    imm.RT_FAIR_FILE = os.path.join(tmp, "rt_fair.json")
+    imm._rt_fair_state.update(mtime=0.0, markets={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -12166,6 +12168,116 @@ class TestRainWkndGate(TestCpiFairGate):
         self.assertIn("weekend rain fair 30c", why)
 
 
+class TestRtFairGate(TestCpiFairGate):
+    """rt_fair.json -> load_rt_fair / rt_fair_gate -> KXRT (Jack 2026-10-12:
+    "yes fandango is authorized"): fails OPEN (no read, a stale read or a
+    film without enough reviews quotes as before the feed), caps a side more
+    than RT_FAIR_TOL_CENTS through a priced fair, and stands the market
+    aside RT_FAIR_HOLD_MIN after a review-count jump. Fixture KXRT-ZZT-50
+    (closing in 30 days, before the release-week stand-down); the CPI
+    class's bot fixture runs on it."""
+
+    T = "KXRT-ZZT-50"
+    EV = "KXRT-ZZT"
+
+    def setUp(self):
+        super().setUp()
+        imm._rt_fair_state.update(mtime=0.0, markets={})
+        try:
+            os.remove(imm.RT_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        super().tearDown()
+        imm.RT_FAIR_CAP = True
+
+    def _write(self, p=0.5, age_secs=0, n=40, jump_age_secs=None):
+        at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        jump = (None if jump_age_secs is None else
+                (datetime.now(timezone.utc) - timedelta(seconds=jump_age_secs)).isoformat())
+        with open(imm.RT_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p, "n": n,
+                                            "jump_at": jump,
+                                            "fetched_at": at.isoformat()}}}, f)
+        os.utime(imm.RT_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestCpiFairGate._bump += 1
+        return imm.load_rt_fair()
+
+    def test_wiring(self):
+        self.assertTrue(imm.rt_fair_series("KXRT"))
+        for s in ("KXRTTV", "KXRTX", "KXCPICORE"):
+            self.assertFalse(imm.rt_fair_series(s), s)
+        with mock.patch.object(imm, "RT_FAIR_ENABLE", False):
+            self.assertIsNone(imm.fair_file_gate("KXRT", self.T, time.time(), 49, 51))
+        self.assertEqual(imm.fair_file_gate("KXRT", self.T, time.time(), 49, 51)[0],
+                         "rt-fair")
+        for k in ("RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN",
+                  "RT_FAIR_HOLD_MIN", "RT_FAIR_CAP", "RT_FAIR_BAND"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        import imm_risk_controls
+        self.assertIn("rt_fair", imm_risk_controls.GATE_GUARDS)
+        # shipped: the hold alone; the band (15c) only on IMM_RT_FAIR_BAND=1
+        self.assertFalse(imm.RT_FAIR_BAND)
+        self.assertEqual(imm.RT_FAIR_TOL_CENTS, 15)
+
+    @mock.patch.object(imm, "RT_FAIR_BAND", True)
+    def test_gate_reasons_and_caps(self):
+        g = imm.rt_fair_gate
+        open_ = ("", {}, None)
+        self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # no read
+        self._write(p=None, n=3)
+        self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # too few reviews
+        self._write(p=0.30, age_secs=imm.RT_FAIR_TTL_MIN * 60 + 5)
+        self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # stale
+        # a review jump 5 minutes ago: out for the hold, whatever the price
+        self._write(p=0.50, n=60, jump_age_secs=300)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["n"], caps), ("review_jump", 60, None))
+        self.assertIn("jumped to 60", why)
+        # past the hold: the band (bid 49 > 30 + 15 caps the bid at 45)
+        self._write(p=0.30, n=60, jump_age_secs=imm.RT_FAIR_HOLD_MIN * 60 + 5)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["bid_bad"]), ("", (45, 15), True))
+        self._write(p=0.40)
+        self.assertEqual(g(self.T, time.time(), 49, 51), open_)
+        imm.RT_FAIR_CAP = False
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+        self.assertIn("RT fair 30c", why)
+
+    def test_band_off_keeps_the_hold(self):
+        g = imm.rt_fair_gate
+        with mock.patch.object(imm, "RT_FAIR_BAND", False):
+            self._write(p=0.30, n=60)
+            self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+            self._write(p=0.30, n=60, jump_age_secs=60)
+            self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "review_jump")
+
+    def test_quotes_through_the_gate(self):
+        bot = self._bot()
+        bot.run_cycle()                                       # no file: quotes (open)
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        self._write(p=0.5, n=60, jump_age_secs=60)            # the embargo lifts
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        # the hold over (band off, as shipped): both sides back at the touch
+        self._write(p=0.30, n=60, jump_age_secs=imm.RT_FAIR_HOLD_MIN * 60 + 5)
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"bid", "ask"})
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        # with the band on, the fair at 30: the bid capped at 45 is behind the book
+        with mock.patch.object(imm, "RT_FAIR_BAND", True):
+            bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"ask"})
+        self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -22981,13 +23093,13 @@ class TestSignedFairReads(unittest.TestCase):
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
         monthly rain, monthly snow, GasBuddy, daily rain (its city
-        discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11)
-        refreshers each build a reader with
+        discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11) and
+        Rotten Tomatoes (2026-10-12) refreshers each build a reader with
         fair_reader() and pass it to their module's write_fair_file (the
         threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 9)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 10)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -22996,7 +23108,8 @@ class TestSignedFairReads(unittest.TestCase):
                           ("snow_monthly_fair", "SNOW_MONTHLY_FILE"),
                           ("gasbuddy_fair", "GB_FAIR_FILE"),
                           ("cpi_fair", "CPI_FAIR_FILE"),
-                          ("rain_wknd_fair", "RAIN_WKND_FILE")):
+                          ("rain_wknd_fair", "RAIN_WKND_FILE"),
+                          ("rt_fair", "RT_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)

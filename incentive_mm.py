@@ -8134,6 +8134,9 @@ _CONFIG_CODE_KNOBS = (
     "CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP",
     # the weekend rain gate (2026-10-11); model knobs in rain_wknd_fair.py
     "RAIN_WKND_ENABLE", "RAIN_WKND_TOL_CENTS", "RAIN_WKND_TTL_MIN", "RAIN_WKND_CAP",
+    # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
+    "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
+    "RT_FAIR_CAP", "RT_FAIR_BAND",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -10091,7 +10094,13 @@ def simple_fair_gate(state: dict, ticker: str, now_ts: float,
         return f"no {label} fair for this market", {"reason": "no_read"}, None
     if now_ts - e["ts"] > ttl_min * 60:
         return f"{label} fair is stale", {"reason": "stale"}, None
-    fair_c = e["p"] * 100.0
+    return fair_band_verdict(e["p"] * 100.0, ext_bid, ext_ask, tol, label, cap)
+
+
+def fair_band_verdict(fair_c: float, ext_bid: Optional[float],
+                      ext_ask: Optional[float], tol: float, label: str, cap: bool
+                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """simple_fair_gate's band check on a fair in cents."""
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair_c, tol)
     if not (bid_bad or ask_bad):
         return "", {}, None
@@ -10185,6 +10194,103 @@ def rain_wknd_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                             label="weekend rain", cap=RAIN_WKND_CAP)
 
 
+# ROTTEN TOMATOES FAIR GATE (Jack 2026-10-11, the build above; 2026-10-12
+# "yes fandango is authorized" -- RT's terms bar automated reads without
+# Fandango's written authorization). rt_fair.py reads each open film's page
+# (L fresh of N All Critics reviews; the Tomatometer is round-half-up(100
+# L / N)) and prices every strike P(score > K at the Monday 10:00 ET close)
+# with the reviews still to come drawn from the settled titles' Wayback
+# trajectories (see rt_fair.FIT): late reviews run below the early ones and
+# scatter far more than a binomial would.
+# THE JOB IS THE EMBARGO LIFT, NOT THE PRICE. On 66 settled titles the
+# market beat the model at every horizon (Brier 0.084 vs 0.091 more than 7
+# days out) and where they disagreed by 10c+ the outcome sided with the
+# market on the bid side, so the band is OFF (RT_FAIR_BAND; the price is
+# written for scoring). But 17 of the 66 passed 10 reviews while the bot
+# still quoted (more than 7 days out) and their near-money strikes moved a
+# median 14c across that first batch, nearly always up (COY 90: 36c -> 92c)
+# -- the resting asks get lifted (HEA's in-week lift on 9/22 cost
+# 13.5c/contract at 4h on 980). So a jump in the review count
+# (rt_fair.MIN_JUMP+ reviews and +50% between reads; a film without reviews
+# 7-21 days out is read every 2 minutes) stands the event's markets aside
+# RT_FAIR_HOLD_MIN while the market re-prices.
+# The gate fails OPEN -- the family nets ~$37/day on the market's own
+# prior: no fresh read or no jump, and the family quotes as before. The
+# release-week stand-down (KXRT_CUTOFF_BEFORE_CLOSE_DAYS) is unchanged, so
+# the gate works the weeks before it. IMM_RT_FAIR_ENABLE=0 turns it off;
+# IMM_RT_FAIR_BAND=1 adds the band (a touch more than RT_FAIR_TOL_CENTS
+# through the model caps that side; the capped side rests only while it
+# earns).
+RT_FAIR_ENABLE = os.environ.get("IMM_RT_FAIR_ENABLE", "1") == "1"
+RT_FAIR_SERIES = frozenset(("KXRT",))
+RT_FAIR_TOL_CENTS = _env_int("IMM_RT_FAIR_TOL_CENTS", 15)
+RT_FAIR_TTL_MIN = _env_int("IMM_RT_FAIR_TTL_MIN", 30)
+RT_FAIR_HOLD_MIN = _env_int("IMM_RT_FAIR_HOLD_MIN", 30)
+RT_FAIR_REFRESH_SECS = _env_int("IMM_RT_FAIR_REFRESH_SECS", 60)
+RT_FAIR_CAP = os.environ.get("IMM_RT_FAIR_CAP", "1") == "1"
+RT_FAIR_BAND = os.environ.get("IMM_RT_FAIR_BAND", "0") == "1"
+RT_FAIR_FILE = os.environ.get(
+    "IMM_RT_FAIR_FILE", os.path.join(STATUS_DIR, "rt_fair.json"))
+_rt_fair_state: dict = {"mtime": 0.0, "markets": {}}
+
+
+def rt_fair_series(series: str) -> bool:
+    return RT_FAIR_ENABLE and series in RT_FAIR_SERIES
+
+
+def load_rt_fair() -> int:
+    """Hot-reload RT_FAIR_FILE by mtime: markets {ticker: {p (None without
+    a price), event, n, ts, jump_ts}}; the market count, else -1."""
+    try:
+        mtime = os.path.getmtime(RT_FAIR_FILE)
+    except OSError:
+        return -1
+    if mtime == _rt_fair_state["mtime"]:
+        return -1
+    _rt_fair_state["mtime"] = mtime
+    try:
+        with open(RT_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! RT fair file unreadable: {e}")
+        return -1
+    markets: Dict[str, dict] = {}
+    for t, e in (data.get("markets") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            p = None if e.get("p") is None else float(e["p"])
+            ev = str(e["event"])
+            n = int(e.get("n") or 0)
+            jt = parse_iso_utc(str(e["jump_at"])) if e.get("jump_at") else None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or (p is not None and not 0.0 <= p <= 1.0):
+            continue
+        markets[str(t)] = {"p": p, "event": ev, "n": n, "ts": ts.timestamp(),
+                           "jump_ts": jt.timestamp() if jt else None}
+    _rt_fair_state["markets"] = markets
+    return len(markets)
+
+
+def rt_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                 ext_ask: Optional[float]
+                 ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', {}, None) to quote as before the feed; ('', inputs, caps) when a
+    side is capped; (why, inputs, None) to stand aside (a review jump)."""
+    e = _rt_fair_state["markets"].get(ticker)
+    if e is None or now_ts - e["ts"] > RT_FAIR_TTL_MIN * 60:
+        return "", {}, None
+    if e["jump_ts"] is not None and 0 <= now_ts - e["jump_ts"] < RT_FAIR_HOLD_MIN * 60:
+        left = (RT_FAIR_HOLD_MIN * 60 - (now_ts - e["jump_ts"])) / 60.0
+        return (f"RT review count jumped to {e['n']} -- out {left:.0f} more min "
+                f"while the market re-prices",
+                {"reason": "review_jump", "n": e["n"]}, None)
+    if e["p"] is None or not RT_FAIR_BAND:
+        return "", {}, None
+    return fair_band_verdict(e["p"] * 100.0, ext_bid, ext_ask, RT_FAIR_TOL_CENTS,
+                             "RT", RT_FAIR_CAP)
+
+
 def fair_file_gate(series: str, ticker: str, now_ts: float,
                    ext_bid: Optional[float], ext_ask: Optional[float]
                    ) -> Optional[Tuple[str, str, dict,
@@ -10195,6 +10301,8 @@ def fair_file_gate(series: str, ticker: str, now_ts: float,
         return ("cpi-fair",) + cpi_fair_gate(ticker, now_ts, ext_bid, ext_ask)
     if rain_wknd_series(series):
         return ("rain-wknd",) + rain_wknd_gate(ticker, now_ts, ext_bid, ext_ask)
+    if rt_fair_series(series):
+        return ("rt-fair",) + rt_fair_gate(ticker, now_ts, ext_bid, ext_ask)
     return None
 
 
@@ -18856,6 +18964,7 @@ class IncentiveMarketMaker:
         load_snow_monthly()
         load_cpi_fair()
         load_rain_wknd()
+        load_rt_fair()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
             log(f"{self.tag} share-fair reloaded: {_sh_n} events, "
@@ -22580,7 +22689,8 @@ class IncentiveMarketMaker:
             # The snow monthlies (2026-10-04, SNOW_MONTHLY_ENABLE) take the
             # same gate on their own file, with the period markets' caps,
             # and so do the 2026-10-11 fair-file gates (fair_file_gate:
-            # the CPI pilot, weekend rain) without the station checks.
+            # the CPI pilot, weekend rain, Rotten Tomatoes) without the
+            # station checks.
             rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             rain_period = rain_period_gated(t)
             snow = snow_monthly_series(meta.series)
@@ -24953,6 +25063,40 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_rain_wknd_refresh, daemon=True,
                              name="rain-wknd").start()
+        if RT_FAIR_ENABLE and not once:
+            # Rotten Tomatoes fair refresher (2026-10-12): the CPI
+            # refresher's contract on rt_fair.py and RT_FAIR_FILE, a pass
+            # every minute -- rt_fair paces each film's page itself (2 min
+            # while an embargo can lift on our quotes, 5 with reviews, 10
+            # far out, 30 in release week); Kalshi's open events hourly.
+            def _rt_fair_refresh():
+                try:
+                    import rt_fair
+                except Exception as e:
+                    log(f"{self.tag} ! rt-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(30, RT_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = rt_fair.write_fair_file(
+                            RT_FAIR_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} rt-fair refresh: {ok} markets "
+                                f"priced"
+                                + (f", {miss} without a price" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! rt-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = max(delay, 120)
+                    time.sleep(delay)
+            threading.Thread(target=_rt_fair_refresh, daemon=True,
+                             name="rt-fair").start()
         if GB_FAIR_ENABLE and not once:
             # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
             # refresher's contract -- every network call off the trading

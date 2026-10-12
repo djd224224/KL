@@ -10608,3 +10608,54 @@ hourly (every pass while none is open). Unchanged: x1 size, out at 00:00 ET
 Saturday, the KXRAIN 7pm halving, the 15c/30m move breaker. Kill switch
 IMM_RAIN_WKND_ENABLE=0. Tests: test_rain_wknd_fair.py (11),
 TestRainWkndGate (3 + the CPI class's quote test); wiring guard counts 9.
+
+## 2026-10-12 ~22:10Z — Rotten Tomatoes feed on KXRT: the embargo-lift hold (Jack: "build the KXRT ... models"; "yes fandango is authorized")
+
+RT's terms (section 10) bar automated access without Fandango's written
+authorization; Jack has it (2026-10-12). rt_fair.py (new):
+- Kalshi: open KXRT events (nested markets, strike_type greater), hourly
+  (every pass while none is open). The film page is the event's settlement
+  source (rottentomatoes.com/m/<slug>); events naming only the site root
+  resolve through SLUG_OVERRIDES (EBE -> ebenezer_2026, HOWT ->
+  how_to_rob_a_bank_2026) or RT's search (one exact title in the close year or
+  the year before), cached per event.
+- RT: the page's media-scorecard-json -> overlay.criticsAll (liked, reviews),
+  the headline Tomatometer = round-half-up(100 L / N) (108/108 Wayback reads).
+  YES iff the score is ABOVE K at the Monday 10:00 ET close: 200 (L + X) >=
+  (2K + 1)(N + M) (yes_threshold, integers).
+- Reads paced per film (poll_every): 2 min without reviews 7-21 days out (an
+  embargo can lift on our quotes), 5 min with reviews, 10 min further out,
+  30 min in release week (the bot is out). ~150 pages/hour, ~0.4 s each.
+- A review jump (MIN_JUMP 15+ reviews AND +50% between reads; 0 -> 15+ is the
+  embargo lift) stamps the event jump_at. A failed read keeps the last counts
+  (logged once per failure streak); fetched_at ages them out in the gate.
+- Model (shadow price, written per strike): M reviews to come ~ NegBin(mean
+  N (1/g - 1), size 4), X fresh ~ BetaBinomial(M, k p, k (1 - p)), p = the
+  rate shrunk to 0.67 (weight 2) plus a drift; g / drift / k by days to close
+  (rt_fair.FIT). Fit 10/12 on 66 settled titles' Wayback trajectories (502
+  snapshots, 42 -> 0.3 days) against Kalshi's hourly mids (1,196 markets):
+  the MARKET IS BETTER at every horizon -- Brier 0.084 vs 0.091 more than 7
+  days out (441 strike-snapshots), 0.040 vs 0.045 inside; where they
+  disagreed by 10c+ more than 7 days out with the model under the mid, the
+  outcome was YES 95% (mid 81, model 64). So no band by default.
+- Why the feed anyway: 17 of the 66 titles passed 10 reviews more than 7
+  days before the close (inside the bot's window) and their near-money strikes
+  moved a median 14c, mean 20c, across that first batch, nearly always UP
+  (COY 90 36 -> 92c, SHEE 85 45 -> 88c, PRI 85 46 -> 81c): resting asks get
+  lifted.
+- 10/12 21:57Z probe: priced 86 strikes on GOD 39/41, WILD 75/80, IPL 37/44,
+  WILDW 17/17 and the release-week four; vs the books the shadow model is
+  ~18c under on GOD 90-94 and ~20c over on IPL 77-82.
+
+incentive_mm (fair_file_gate's third family, "rt-fair", guard "rt_fair"):
+fails OPEN -- no read, a stale read (RT_FAIR_TTL_MIN 30) or no jump quotes as
+before. Within RT_FAIR_HOLD_MIN (30) of a jump the event's markets stand aside
+(cancelled; "rt-fair stand-aside ... RT review count jumped to N"), then
+resume. RT_FAIR_BAND (default 0) adds the band: a touch more than
+RT_FAIR_TOL_CENTS (15) through the shadow price caps that side (rests only
+while it earns). Refresher thread "rt-fair" every 60 s; the loader runs each
+cycle. Unchanged: the release-week stand-down (7 days), x2 family size.
+KXRTTV is not covered (TV pages; settles 3 days after the premiere).
+Kill switch IMM_RT_FAIR_ENABLE=0. Calibration scripts: session scratchpad rt/
+(wayback_long.py, candles.py, calib2-4.py). Tests: test_rt_fair.py (14),
+TestRtFairGate (4 + the CPI class's bot fixture); wiring guard counts 10.
