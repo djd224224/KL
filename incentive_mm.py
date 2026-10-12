@@ -1203,7 +1203,8 @@ def pad_quantity(external_and_touch_depth: float, target: float) -> int:
 
 def sides_can_qualify(series: str, target: float, depth_yes: float,
                       depth_no: float, ext_bid: Optional[int],
-                      ext_ask: Optional[int]) -> Tuple[bool, bool]:
+                      ext_ask: Optional[int],
+                      ticker: Optional[str] = None) -> Tuple[bool, bool]:
     """(bid_side_ok, ask_side_ok) — can each side reach the reward target,
     counting a pad ONLY where one will actually be placed?
 
@@ -1230,6 +1231,8 @@ def sides_can_qualify(series: str, target: float, depth_yes: float,
             return False
         if not is_bid and series_bid_only(series):
             return False     # a bid-only family never pads its ask side
+        if is_bid and ticker is not None and no_side_only(ticker):
+            return False     # ...nor a NO-side-only market its bid side
         if is_bid:
             if ext_bid is None or ext_bid - PAD_BID_CENTS < PAD_MIN_TICKS_BEHIND:
                 return False
@@ -4431,7 +4434,13 @@ ELECTION_SERIES = frozenset(
         # isnt XSTATELEG-TXSENA26, KXSTATELEG-MNHOUSE26 quoting as part of
         # elections?"): 28 chambers x R/D. Kalshi files it under Elections,
         # but it lit after the 4:45pm ET category pass, so it is listed here
-        "KXSTATELEG").split(",") if s.strip())
+        "KXSTATELEG,"
+        # "Who will run for president in 2028?" (2026-10-11, Jack: "allowlist
+        # KXPRESRUN family"): one market per person, lit 23:02Z 10/11. The
+        # category pass enrolled it within the hour; listed here so the
+        # membership does not hang on that file. Its own size and the
+        # NO-side-only rule: see PRESRUN_SIZE_MULT.
+        "KXPRESRUN").split(",") if s.strip())
 # The 9/28 carve-outs above, as data: Kalshi files them under Elections, so
 # the overrides task's Elections-category rule (ELECTION_EXTRA_FILE) would
 # otherwise enroll them. Refused by election_series() and by the loader.
@@ -6641,6 +6650,43 @@ SERIES_OVERRIDES[ELECTION_ARCHETYPE] = SeriesOverride(
     price_max_cents=_env_int("IMM_ELECTION_PRICE_MAX", 99),
     size_mult=ELECTION_SIZE_MULT)
 
+# KXPRESRUN (Jack 2026-10-11: "allowlist KXPRESRUN family. for KXPRESRUN-28
+# specifically, quote the No side and use a 6x multiplier"). "Who will run
+# for president in 2028?": 19 people, one market each, $120 per market per
+# period from 23:02Z 10/11. At listing (00:40Z 10/12) 14 books were a YES
+# bid at 2-4c under ~300-500 NO at 90c; Amash / West / Carlson sat at
+# 15-20c YES, Massie and RFK Jr. at 40c and 47c. Behind the NO touch there
+# was almost nothing above 35c, so the touch IS the NO side's reference.
+# An election-family member (the exact list), dated to its Nov 7 2028
+# deadline (ELECTION_DATES).
+#   * x6 IN PLACE OF the family x2: the election guard set (1-99c band, no
+#     safe-join) at size_mult PRESRUN_SIZE_MULT, so rungs 20 -> 120, the
+#     per-market cap 150 -> 900 and the per-event cap 1,000 -> 6,000; the
+#     hour windows compose on top, as for every family multiplier. The
+#     size is per SERIES (the family wire is): KXPRESRUN-28 is its only
+#     event, and a later one stays dark until it gets its own date row.
+#   * NO SIDE ONLY (no_side_only): YES asks (= NO bids) only, for the
+#     events in NO_SIDE_ONLY_EVENTS -- no YES bid rungs, no YES bid pad,
+#     and the estimate scores the NO side alone. A filled NO is held: the
+#     YES bid that would reduce it is the side that never rests.
+# IMM_PRESRUN_SIZE_MULT=2 puts it back on the family size; IMM_NO_SIDE_ONLY_
+# EVENTS="" quotes both sides (env => task-level restart).
+PRESRUN_SIZE_MULT = _env_float("IMM_PRESRUN_SIZE_MULT", 6.0)
+SERIES_OVERRIDES["KXPRESRUN"] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
+                                        size_mult=PRESRUN_SIZE_MULT)
+NO_SIDE_ONLY_EVENTS = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_NO_SIDE_ONLY_EVENTS", "KXPRESRUN-28").split(",") if s.strip())
+
+
+def no_side_only(ticker: str) -> bool:
+    """A market quoted on the NO side only (YES asks, no YES bids): its event
+    is in NO_SIDE_ONLY_EVENTS. The mirror of series_bid_only. A prefix test,
+    not event_ticker_of: KXPRESRUN-28's markets carry a date segment too
+    (KXPRESRUN-28-28NOV07-TMAS), which that helper would keep."""
+    return any(ticker == ev or ticker.startswith(ev + "-")
+               for ev in NO_SIDE_ONLY_EVENTS)
+
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
 # global ladder and caps. Every member clones it (FAMILY_OVERRIDE_PARENTS).
@@ -7936,6 +7982,7 @@ _CONFIG_CODE_KNOBS = (
     "ELECTION_ALLOW", "ELECTION_SERIES", "ELECTION_SERIES_PATTERNS",
     "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
     "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
+    "PRESRUN_SIZE_MULT", "NO_SIDE_ONLY_EVENTS",   # KXPRESRUN-28 (2026-10-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",
@@ -10297,17 +10344,20 @@ def quake_ask_renew_due(order: dict, age: float, now_ts: float) -> bool:
 def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
     """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
     late-month rule, with asks zeroed for a bid-only family (a quake ask
-    strike keeps its ask side; quake_cap_quotes sizes and floors it)."""
+    strike keeps its ask side; quake_cap_quotes sizes and floors it) and
+    bids zeroed for a NO-side-only market (no_side_only)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
     if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
         am = 0.0
+    if no_side_only(ticker):
+        bm = 0.0
     return bm, am
 
 
 def side_mult_change_points(ticker: str) -> List[datetime]:
     """UTC instants at which side_size_mults() can change value for this
-    market: the Carbon Arc late-month window start (the bid-only family is
-    constant). A new clock-driven per-side rule must list its change points
+    market: the Carbon Arc late-month window start (the bid-only family and
+    the NO-side-only markets are constant). A new clock-driven per-side rule must list its change points
     here, or floor_size_profile() scores it at one instant per piece."""
     if not carbon_arc_settled(series_of(ticker)):
         return []
@@ -12762,6 +12812,12 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # .. Jan 1 2028) in ONE event, so the row is the last deadline. Expect
     # the one-time "Kalshi dates the vote 2026-11-01" log line for it.
     "KXUKBYELECTION-28*=2028-01-01@Europe/London",
+    # US 2028 presidential runs (KXPRESRUN-28, 2026-10-11): "has announced
+    # that they will run ... after Issuance and before Nov 7, 2028" (the
+    # contract's own rules, every market; close 2028-11-07 15:00Z). Nov 7
+    # 2028 is also the statutory Election Day (3 U.S.C. s.1: the Tuesday
+    # after the first Monday in November -- Mon Nov 6, Tue Nov 7). ET.
+    "KXPRESRUN-28*=2028-11-07",
     # SERBIA: NOT the presidential day, which is not set. Vucic resigned
     # 2026-09-27; the Speaker must call the vote >= 30 days ahead (RIK) and
     # hold it within three months (by Dec 26/27 -- Kalshi's 26DEC27 is that
@@ -20037,7 +20093,7 @@ class IncentiveMarketMaker:
         _bid_ok, _ask_ok = sides_can_qualify(
             meta.series, meta.target_size,
             sum(q for _px, q in yes_levels), sum(q for _px, q in no_levels),
-            ext_b, ext_a)
+            ext_b, ext_a, ticker=meta.ticker)
         if not (_bid_ok and _ask_ok):
             meta.est_frac = meta.est_dollars_per_day = 0.0
             meta.yield_per_contract = 0.0
@@ -20192,7 +20248,7 @@ class IncentiveMarketMaker:
                 nt_bid = sum(q.count for q in quotes if q.book_side == "bid")
                 nt_ask = sum(q.count for q in quotes if q.book_side == "ask")
                 if nt_bid > 0 or nt_ask > 0:
-                    if eb is not None \
+                    if eb is not None and not no_side_only(meta.ticker) \
                             and eb - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND:
                         n = pad_quantity(sum(sz for _px, sz in ylv) + nt_bid,
                                          meta.target_size)
@@ -21800,7 +21856,7 @@ class IncentiveMarketMaker:
             depth_no = sum(q for _px, q in no_levels)
             bid_ok, ask_ok = sides_can_qualify(
                 meta.series, meta.target_size, depth_yes, depth_no,
-                ext_bid, ext_ask)
+                ext_bid, ext_ask, ticker=t)
             if not (bid_ok and ask_ok):
                 n_cx = self.cancel_market_orders(t, resting)
                 if n_cx:
@@ -22241,6 +22297,8 @@ class IncentiveMarketMaker:
             lv_ask = scale_levels(lv, ca_am)
             if series_bid_only(meta.series) and not quake_ask_strike(t):
                 lv_ask = []          # bid-only family (quake gate): no ask rungs
+            if no_side_only(t):
+                lv_bid = []          # NO side only (KXPRESRUN-28): no bid rungs
             if (ca_bm, ca_am) != (1.0, 1.0):
                 self._ca_late_note(meta.event_ticker, ca_bm, ca_am)
             # deep-reference size multiplier feeds the side_max component of
@@ -23156,7 +23214,8 @@ class IncentiveMarketMaker:
                         and ext_bid - PAD_BID_CENTS >= PAD_MIN_TICKS_BEHIND)
         ask_pad_safe = (ext_ask is not None
                         and PAD_ASK_CENTS - ext_ask >= PAD_MIN_TICKS_BEHIND)
-        if bid_pad_safe and (nt_bid > 0 or (pad_missing_side and nt_ask > 0)):
+        if bid_pad_safe and (nt_bid > 0 or (pad_missing_side and nt_ask > 0)) \
+                and not no_side_only(ticker):
             # live: book already holds our near-touch, subtract only our pad;
             # dry: sim orders aren't in the book, add this cycle's near-touch.
             basis = (yes_depth - own_pad_bid) if self.live else (yes_depth + nt_bid)

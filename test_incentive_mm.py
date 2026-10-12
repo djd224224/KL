@@ -25404,5 +25404,108 @@ class TestJoinAhead(unittest.TestCase):
         self.assertEqual(bot._join_ahead_state, {})                       # off: no state
 
 
+class TestPresRunNoSideOnly(unittest.TestCase):
+    """KXPRESRUN (Jack 2026-10-11: "allowlist KXPRESRUN family. for
+    KXPRESRUN-28 specifically, quote the No side and use a 6x multiplier"):
+    an election member dated to its Nov 7 2028 deadline, the family x2
+    replaced by x6, and KXPRESRUN-28 quoted with YES asks (= NO bids) only.
+    Fixture = Massie as listed: YES 40c bid / 49c ask, both sides deep."""
+
+    EV = "KXPRESRUN-28"
+    T = "KXPRESRUN-28-28NOV07-TMAS"
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def test_allowlisted_dated_to_the_deadline_at_x6(self):
+        prev_only = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            # on the exact list: no dependence on the category file
+            with mock.patch.object(imm, "ELECTION_EXTRA_SERIES", set()):
+                self.assertTrue(imm.election_series("KXPRESRUN"))
+                self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        finally:
+            imm.ALLOWLIST_ONLY = prev_only
+        # "before Nov 7, 2028": out at 00:00 EST that day
+        self.assertEqual(imm.election_cutoff_utc(self.EV), utc(2028, 11, 7, 5, 0))
+        # a later event of the series has no row: stood down
+        self.assertIsNone(imm.election_cutoff_utc("KXPRESRUN-32"))
+        ov = imm.SERIES_OVERRIDES["KXPRESRUN"]
+        self.assertEqual(ov.size_mult, 6.0)
+        el = imm.SERIES_OVERRIDES[imm.ELECTION_ARCHETYPE]
+        self.assertEqual((ov.price_min_cents, ov.price_max_cents, ov.safe_join),
+                         (el.price_min_cents, el.price_max_cents, el.safe_join))
+        self.assertEqual(imm.applied_mention_mult("KXPRESRUN"), 6.0)
+        self.assertEqual(imm.series_max_position("KXPRESRUN"),
+                         imm.MAX_POSITION_CONTRACTS * 6)
+        self.assertEqual(imm.event_cap_contracts(self.EV),
+                         imm.MAX_EVENT_CONTRACTS * 6)
+
+    def test_bids_zeroed_pads_and_depth_test_no_side_only(self):
+        now = datetime.now(timezone.utc)
+        self.assertTrue(imm.no_side_only(self.T))
+        self.assertFalse(imm.no_side_only("KXPRESRUN-32-32NOV02-TMAS"))
+        self.assertFalse(imm.no_side_only("KXGOOD-99DEC31-A"))
+        self.assertEqual(imm.side_size_mults(self.T, now), (0.0, 1.0))
+        self.assertEqual(imm.side_size_mults("KXPRESRUN-32-32NOV02-TMAS", now),
+                         (1.0, 1.0))
+        # a thin YES side is never padded up for a NO-side-only market
+        self.assertEqual(imm.sides_can_qualify("KXPRESRUN", 1000, 100, 1500, 40, 49,
+                                               ticker=self.T), (False, True))
+        self.assertEqual(imm.sides_can_qualify("KXPRESRUN", 1000, 100, 1500, 40, 49),
+                         (True, True))
+        self.assertEqual(imm.sides_can_qualify("KXPRESRUN", 1000, 1500, 1500, 40, 49,
+                                               ticker=self.T), (True, True))
+        with mock.patch.object(imm, "NO_SIDE_ONLY_EVENTS", frozenset()):
+            self.assertFalse(imm.no_side_only(self.T))
+            self.assertEqual(imm.side_size_mults(self.T, now), (1.0, 1.0))
+
+    def _bot(self, yes_depth="3000"):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 1200000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": "2028-11-07T15:00:00Z",
+            "yes_bid_dollars": "0.4000", "yes_ask_dollars": "0.4900",
+            "volume_fp": "500.00"}
+        # Massie's book at 00:40Z 10/12: 687 NO at 51c (ext ask 49), then a
+        # gap to 6c; the YES side deep from 40c down
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "4000"], ["0.38", "2000"], ["0.40", yes_depth]],
+            "no_dollars": [["0.04", "5000"], ["0.06", "39"], ["0.51", "687"]]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _orders(self, bot):
+        return [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+
+    def test_quotes_asks_only_at_six_times_size(self):
+        bot = self._bot()
+        bot.run_cycle()
+        orders = self._orders(bot)
+        self.assertTrue(orders)
+        self.assertEqual({o["book_side"] for o in orders}, {"ask"})   # no bids, no bid pad
+        x1 = sum(s for _t, s in imm.hour_scaled_levels(
+            "KXGOOD", datetime.now(timezone.utc)))
+        self.assertGreater(sum(order_remaining(o) for o in orders), x1)
+
+    def test_both_sides_when_switched_off(self):
+        with mock.patch.object(imm, "NO_SIDE_ONLY_EVENTS", frozenset()):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual({o["book_side"] for o in self._orders(bot)},
+                             {"bid", "ask"})
+
+
 if __name__ == "__main__":
     unittest.main()
