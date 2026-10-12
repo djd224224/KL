@@ -20519,11 +20519,13 @@ class TestNflFantasyLadderCutoff(unittest.TestCase):
         for s_ in self.FAMILY:
             imm.ensure_family_override(s_)
         arch = imm.SERIES_OVERRIDES["KXNFLLADDERREC"]
-        self.assertIsNone(arch.start_buffer_min)
+        # the family stops AT kickoff since 2026-10-11 ("change
+        # ladders/escalators to stop at kickoff"); the fantasy ladder keeps 90
+        self.assertEqual(arch.start_buffer_min, 0)
         ff = imm.SERIES_OVERRIDES["KXNFLFFPTSLADDER"]
         self.assertEqual(ff.start_buffer_min, 90)
         # every other guard is still the family's
-        self.assertEqual(dataclasses.replace(ff, start_buffer_min=None), arch)
+        self.assertEqual(dataclasses.replace(ff, start_buffer_min=0), arch)
         for s_ in ("KXNFLLADDERRECYDS", "KXNFLESCALATORREC", "KXNBAFFPTSLADDER"):
             self.assertEqual(imm.SERIES_OVERRIDES[s_], arch, s_)
 
@@ -20571,7 +20573,7 @@ class TestNflFantasyLadderCutoff(unittest.TestCase):
             self.KICKOFF - timedelta(minutes=90))
         self.assertEqual(
             self._selected_cutoff("KXNFLLADDERREC-67OCT05ATLNO-ATLBROBINSON7"),
-            self.KICKOFF - timedelta(minutes=imm.EVENT_START_BUFFER_MIN))
+            self.KICKOFF)                             # at kickoff since 10/11
 
 
 class TestRejectReason(unittest.TestCase):

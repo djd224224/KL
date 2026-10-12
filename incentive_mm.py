@@ -1346,8 +1346,9 @@ def global_hour_mults(et_day) -> Dict[int, float]:
 # AI, Carbon Arc, earnings, KXRT all net positive there). Modelled +$20/day.
 # A knob of its own rather than more hours on the quiet-hours window:
 #   * sports ladders / escalators never take it -- 18-21 ET is their pre-
-#     kickoff window (inactives post ~90 min before kickoff, the cutoff is
-#     kickoff - 30 min) and the study left them out;
+#     kickoff window (inactives post ~90 min before kickoff, the cutoff
+#     was kickoff - 30 min, kickoff itself since 10/11) and the study left
+#     them out;
 #   * the quiet hours keep their meaning for imm_saturday_tracker's quiet /
 #     day blocks (the tracker reads evening_hour_mults to keep these hours
 #     out of its day-block hour_mult, the Saturday-level read).
@@ -4232,7 +4233,8 @@ ALLOW_SERIES_PREFIXES = tuple(
 # would have quoted three hours INTO the game. The schedule resolver owns
 # the cutoff instead: EventStartResolver looks the game up on the league's
 # ESPN scoreboard (ESPN_LEAGUE_PATHS) and refresh_universe cuts off
-# EVENT_START_BUFFER_MIN before kickoff. When the resolver cannot place the
+# the family's start_buffer_min before kickoff (0 since 2026-10-11, was the
+# global EVENT_START_BUFFER_MIN; the NFL fantasy ladders 90). When the resolver cannot place the
 # game (no ESPN path for the league, API down, unknown team code) the
 # ticker-date midnight-ET rule wins the min() in trade_cutoff_utc -- out
 # the night before the game, the safe direction -- never the occurrence.
@@ -6558,7 +6560,16 @@ for _s in ("KXAMUSEMENTADS", "KXDRPEPPERPOS"):
 # lower). Kalshi pays ~1.15x the estimate on average (the same day's global
 # $1.50 -> $1.30), so a $1.00 projection is ~$1.15 paid -- but a market that
 # enters right at the bar has no margin if its book thickens afterwards.
+# 2026-10-11 (Jack: "change ladders/escalators to stop at kickoff"): the
+# family's start buffer 30 min -> 0 (start_buffer_min) -- quoted up to the
+# scheduled kickoff / tip / first pitch the resolver reads off ESPN, and
+# every order's expiry is capped at that cutoff, so nothing rests into the
+# game. The NFL fantasy ladders keep NFL_FFPTS_START_BUFFER_MIN (90): an
+# inactive player has no Sleeper figure and scores 0.0 -- YES pays $0
+# (Kalshi's FFPTSSCALAR rules, re-read the same day).
+# IMM_SPORTS_LADDER_START_BUFFER_MIN=30 restores the old cutoff.
 SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
+    start_buffer_min=_env_int("IMM_SPORTS_LADDER_START_BUFFER_MIN", 0),
     min_est_per_day=_env_float("IMM_SPORTS_LADDER_MIN_RATE", 0.0),
     min_est_total=_env_float("IMM_SPORTS_LADDER_MIN_EST_TOTAL", 1.0),
     safe_join=True,
@@ -6575,8 +6586,9 @@ SERIES_OVERRIDES["KXNFLLADDERREC"] = SeriesOverride(
 # points -- YES pays $0, a total loss for a YES holder -- while
 # FOOTBALLENTITYSCALARSTAT (the receptions / yards ladders and escalators)
 # resolves at the Exchange's last fair price from before the news. So only
-# the fantasy ladder moves its cutoff, from kickoff - EVENT_START_BUFFER_MIN
-# (30) to kickoff - NFL_FFPTS_START_BUFFER_MIN, set as start_buffer_min on
+# the fantasy ladder moves its cutoff, from the family's kickoff cutoff
+# (kickoff - 30 until 2026-10-11, kickoff itself since) to kickoff -
+# NFL_FFPTS_START_BUFFER_MIN, set as start_buffer_min on
 # the family clone (ensure_family_override): the selection cutoff, the
 # estimator's window, the screen and imm_quote_gaps all read it from there.
 # Orphan-restored positions already stop at the ticker-date fallback.
