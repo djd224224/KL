@@ -24,6 +24,8 @@ threshold". Three passes, each fail-safe on its own:
    event the WH / RNC / TVmaze resolvers cannot place) goes to one headless
    Claude Code run on first sight, retried on a backoff; see research_pass.
    A run that dies on the Claude Code login is emailed at once (LOGIN FAILURES).
+   With a `claude setup-token` token in RESEARCH_TOKEN_FILE the runs use that
+   one-year login instead of the interactive one (RESEARCH TOKEN).
 4. ALERT -- one email per run for what has stayed dark >= GAP_ALERT_AFTER_MIN
    (30 min) and is worth >= GAP_ALERT_MIN_DPD ($5/day of estimated reward: the
    bot's own estimator on the live books since 2026-10-09, see REAL ESTIMATES;
@@ -46,6 +48,7 @@ bot means.
 
   python imm_family_watch.py            # the scheduled run
   python imm_family_watch.py --dry      # report only: no writes, no email
+  python imm_family_watch.py --check-login   # test the research login, nothing else
 """
 
 import argparse
@@ -58,7 +61,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import imm_quote_gaps  # noqa: F401  (launcher env, then incentive_mm)
 import incentive_mm as imm
@@ -555,6 +558,23 @@ RESEARCH_LOGIN_RE = re.compile(r"failed to authenticate|oauth (?:session|token)|
                                r"not logged in|run /login|invalid api key|"
                                r"authentication_error", re.I)
 RESEARCH_LOGIN_REALERT_H = float(os.environ.get("IMM_WATCH_LOGIN_REALERT_H", "6"))
+# RESEARCH TOKEN (Jack 2026-10-12: "do it for me" -- a login the interactive
+# one cannot take down). `claude setup-token` signs in once and prints a
+# one-year OAuth token. Saved in RESEARCH_TOKEN_FILE (Jack's profile, outside
+# the repo), it reaches the research runs ONLY, as CLAUDE_CODE_OAUTH_TOKEN in
+# the subprocess env, where it outranks the stored /login credentials that
+# expired on 10/12. A user-wide variable would put every Claude session on it.
+# ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN outrank it and bill the API per
+# token, so a run with the token drops them. No file, or no token in it = the
+# stored login, as before. The token itself is never logged.
+RESEARCH_TOKEN_FILE = os.environ.get(
+    "IMM_WATCH_CLAUDE_TOKEN_FILE",
+    os.path.join(os.path.expanduser("~"), ".claude", "imm-research-token.txt"))
+_TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
+# the token lasts a year from when it was made, which the file's mtime stands
+# in for: remind from day RESEARCH_TOKEN_RENEW_DAYS, weekly, until replaced
+RESEARCH_TOKEN_RENEW_DAYS = float(os.environ.get("IMM_WATCH_TOKEN_RENEW_DAYS", "350"))
+RESEARCH_TOKEN_REMIND_DAYS = 7.0
 
 
 def gap_kind(msg: str) -> str:
@@ -731,6 +751,42 @@ def parse_research(text: str) -> Dict[str, dict]:
     return {}
 
 
+def research_token() -> str:
+    """The research token in RESEARCH_TOKEN_FILE, or '' (no file, unreadable,
+    or no token in it). The first sk-ant-... run counts, so a paste of
+    setup-token's whole output works as well as the bare token."""
+    try:
+        with open(RESEARCH_TOKEN_FILE, encoding="utf-8-sig") as f:
+            raw = f.read()
+    except (OSError, ValueError):
+        return ""
+    m = _TOKEN_RE.search(raw)
+    if m:
+        return m.group(0)
+    raw = raw.strip()
+    return raw if raw and not any(c.isspace() for c in raw) else ""
+
+
+def research_auth() -> str:
+    """Which login the research runs use, for the log and the emails."""
+    if research_token():
+        return "token file"
+    if os.path.exists(RESEARCH_TOKEN_FILE):
+        return "stored login (no token in the token file)"
+    return "stored login"
+
+
+def research_env() -> Dict[str, str]:
+    """The research subprocess's env: the token when the file holds one."""
+    env = dict(os.environ)
+    token = research_token()
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    return env
+
+
 def run_research(prompt: str) -> Tuple[str, float, str]:
     """(result text, cost USD, error) from one headless Claude Code run."""
     exe = shutil.which("claude") or CLAUDE_FALLBACK
@@ -744,7 +800,7 @@ def run_research(prompt: str) -> Tuple[str, float, str]:
     try:
         p = subprocess.run(cmd, cwd=KL_DIR, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           timeout=RESEARCH_TIMEOUT_SECS)
+                           timeout=RESEARCH_TIMEOUT_SECS, env=research_env())
     except (OSError, subprocess.TimeoutExpired) as e:
         return "", 0.0, f"{type(e).__name__}: {e}"
     try:
@@ -782,10 +838,18 @@ def alert_login_failure(state: dict, why: str, due: List[str], est: Dict[str, fl
              "",
              f"Nothing gets researched until the login works. Waiting ({len(due)}):"]
     lines += [f"  - {k}  (~${est.get(k, 0.0):.2f}/day, pool proxy)" for k in due]
-    lines += ["",
-              "Fix: open a terminal, run `claude`, and sign in again with /login. The "
-              "watch runs the WinGet claude.exe as this Windows user, and its next "
-              "run (every 30 min) retries on its own.",
+    if research_token():
+        fix = ("Fix: the research token in " + RESEARCH_TOKEN_FILE + " was rejected "
+               "(expired or revoked). In a terminal run `claude setup-token`, sign "
+               "in, and paste the new token over the file's contents.")
+    else:
+        fix = ("Fix: open a terminal, run `claude`, and sign in again with /login. "
+               "Sturdier: run `claude setup-token` and paste its one-year token into "
+               + RESEARCH_TOKEN_FILE + " -- the research runs then use that instead.")
+    lines += ["", fix,
+              "The watch runs the WinGet claude.exe as this Windows user; its next run "
+              "(every 30 min) retries on its own. Test any time: python "
+              "imm_family_watch.py --check-login",
               f"This repeats every {RESEARCH_LOGIN_REALERT_H:g}h while the login "
               f"keeps failing. Log: run-logs\\incentive-mm\\family-watch.log"]
     if not imm.Alerter("IMM-WATCH", live=True).send_message(
@@ -793,6 +857,53 @@ def alert_login_failure(state: dict, why: str, due: List[str], est: Dict[str, fl
         return False
     rec["alerted"] = now_ts
     return True
+
+
+def token_renewal_due(state: dict, now_ts: float) -> Optional[float]:
+    """The token file's age in days when a renewal reminder is due, else None."""
+    if not research_token():
+        return None
+    try:
+        age = (now_ts - os.path.getmtime(RESEARCH_TOKEN_FILE)) / 86400
+    except OSError:
+        return None
+    last = state.get("token_reminded")
+    if age < RESEARCH_TOKEN_RENEW_DAYS or (
+            last is not None and now_ts - float(last) < RESEARCH_TOKEN_REMIND_DAYS * 86400):
+        return None
+    return age
+
+
+def remind_token_renewal(state: dict, now_ts: float, dry: bool) -> bool:
+    """Email the renewal reminder when due. True when an email went out."""
+    age = token_renewal_due(state, now_ts)
+    if age is None:
+        return False
+    body = (f"The family watch's research token ({RESEARCH_TOKEN_FILE}) was saved "
+            f"{age:.0f} days ago, and `claude setup-token` tokens last a year. Renew it "
+            f"before it lapses: in a terminal run `claude setup-token`, sign in, and "
+            f"paste the new token over the file's contents. Then test it: python "
+            f"imm_family_watch.py --check-login\n"
+            f"This repeats weekly until the file is replaced.")
+    log("[WATCH] research token renewal due:\n" + body)
+    if dry or not imm.Alerter("IMM-WATCH", live=True).send_message(
+            body, "IMM-WATCH renew the research token"):
+        return False
+    state["token_reminded"] = now_ts
+    return True
+
+
+def check_login() -> int:
+    """--check-login: one tiny run on the research login, so a new token can
+    be tested without waiting for a target. Prints OK or the error; 0 = OK."""
+    auth = research_auth()
+    text, cost, err = run_research("Reply with the single word OK. Use no tools.")
+    if err or "OK" not in (text or ""):
+        why = research_login_failure(text, err) or err or (text or "")[-200:]
+        print(f"research login FAILED via {auth}: {why}")
+        return 1
+    print(f"research login OK via {auth} (${cost:.2f})")
+    return 0
 
 
 def prune_research(rstate: Dict[str, dict], targets: Dict[str, dict],
@@ -863,12 +974,14 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
     if due and RESEARCH_ENABLE and not dry:
         items = [(k, targets[k], imm_rows.lookup(targets[k]["event"]).replace("\n", " / ")[:900])
                  for k in due]
+        auth = research_auth()
         text, cost, err = run_research(research_prompt(items))
         res = parse_research(text)
         login = "" if res else research_login_failure(text, err)
         if login:
             # nothing was researched: no target spends a try, all stay due
-            notes.append(f"research: LOGIN FAILED ({login}); {len(due)} target(s) wait")
+            notes.append(f"research: LOGIN FAILED via {auth} ({login}); "
+                         f"{len(due)} target(s) wait")
             if alert_login_failure(state, login, due, est, now_ts):
                 notes.append("research: login failure emailed")
         else:
@@ -876,7 +989,8 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
             if not res:
                 notes.append(f"research: no RESULT_JSON line; ends {(text or err)[-240:]!r}")
             notes += apply_results(rstate, due, targets, res, err, now_ts)
-            notes.append(f"research: {len(due)} target(s), ${cost:.2f}" + (f", {err}" if err else ""))
+            notes.append(f"research: {len(due)} target(s), ${cost:.2f}"
+                         + (f", {err}" if err else "") + f" [{auth}]")
     elif due:
         notes.append(f"research due ({'dry' if dry else 'disabled'}): {', '.join(due)}")
     state["research"] = rstate
@@ -940,7 +1054,11 @@ def main(argv=None) -> int:
     ap.add_argument("--no-research", action="store_true")
     ap.add_argument("--no-alert", action="store_true")
     ap.add_argument("--no-model", action="store_true", help="skip pass 5 (model coverage)")
+    ap.add_argument("--check-login", action="store_true",
+                    help="test the research login with one tiny run, then exit")
     args = ap.parse_args(argv)
+    if args.check_login:
+        return check_login()
     t0 = time.time()
     client = ieo.build_client()
     summary = []
@@ -983,6 +1101,11 @@ def main(argv=None) -> int:
             summary.append(f"research targets {len(targets)}")
         except Exception as e:
             log(f"[WATCH] ! research pass failed: {e!r}")
+        try:
+            if remind_token_renewal(state, time.time(), args.dry):
+                summary.append("token renewal reminded")
+        except Exception as e:
+            log(f"[WATCH] ! token renewal check failed: {e!r}")
     if not args.no_alert:
         try:
             audit = ifa.run_audit(client, progs)

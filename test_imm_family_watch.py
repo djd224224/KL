@@ -15,6 +15,21 @@ import incentive_mm as imm
 
 US = {"category": "Elections", "tags": ["Other US Elections"]}
 
+_token_patch = None
+
+
+def setUpModule():
+    # no test may read the real research token (~/.claude/imm-research-token.txt)
+    global _token_patch
+    from unittest import mock
+    _token_patch = mock.patch.object(
+        fw, "RESEARCH_TOKEN_FILE", os.path.join(tempfile.mkdtemp(prefix="notok_"), "none.txt"))
+    _token_patch.start()
+
+
+def tearDownModule():
+    _token_patch.stop()
+
 
 def mk(rules, event="KXSTATELEG-TXSENA26", exp="2026-11-03T15:00:00Z", title=""):
     return {"rules_primary": rules, "event_ticker": event,
@@ -740,3 +755,105 @@ class TestResearchLoginFailure(unittest.TestCase):
         self.assertNotIn("alerted", state["research_login"])
         with mock.patch.object(imm.Alerter, "send_message", lambda self, body, subject=None: True):
             self.assertTrue(fw.alert_login_failure(state, "x", [], {}, 1801.0))
+
+
+class TestResearchToken(unittest.TestCase):
+    """Jack 2026-10-12: "do it for me" -- research runs on a one-year
+    `claude setup-token` token instead of the interactive login."""
+
+    TOKEN = "sk-ant-oat01-" + "Ab3_x-" * 8
+
+    def setUp(self):
+        from unittest import mock
+        self.tmp = tempfile.mkdtemp(prefix="tok_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "imm-research-token.txt")
+        p = mock.patch.object(fw, "RESEARCH_TOKEN_FILE", self.path)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write(self, text, encoding="utf-8"):
+        with open(self.path, "w", encoding=encoding) as f:
+            f.write(text)
+
+    def test_the_token_is_read_bare_or_from_a_pasted_output(self):
+        self.assertEqual((fw.research_token(), fw.research_auth()), ("", "stored login"))
+        self._write(self.TOKEN + "\r\n")
+        self.assertEqual((fw.research_token(), fw.research_auth()), (self.TOKEN, "token file"))
+        self._write("Long-lived authentication token created successfully!\n\n"
+                    f"Your OAuth token (valid for 1 year):\n\n{self.TOKEN}\n\n"
+                    "Store this token securely.")
+        self.assertEqual(fw.research_token(), self.TOKEN)
+        self._write(self.TOKEN, encoding="utf-8-sig")                 # Notepad's BOM
+        self.assertEqual(fw.research_token(), self.TOKEN)
+        self._write("  \n")
+        self.assertEqual((fw.research_token(), fw.research_auth()),
+                         ("", "stored login (no token in the token file)"))
+        self._write("paste the token here")
+        self.assertEqual(fw.research_token(), "")
+
+    def test_only_the_research_run_gets_the_token_and_no_api_key(self):
+        from unittest import mock
+        seen = {}
+
+        class P:
+            returncode = 0
+            stdout = json.dumps({"result": "OK", "total_cost_usd": 0.01})
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            seen["env"] = kw["env"]
+            return P()
+        with mock.patch.object(fw.subprocess, "run", fake_run), \
+                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k", "ANTHROPIC_AUTH_TOKEN": "t"}):
+            fw.run_research("x")                                       # no file: as before
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen["env"])
+            self.assertEqual(seen["env"]["ANTHROPIC_API_KEY"], "k")
+            self._write(self.TOKEN)
+            fw.run_research("x")
+            self.assertEqual(seen["env"]["CLAUDE_CODE_OAUTH_TOKEN"], self.TOKEN)
+            self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", seen["env"])
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", os.environ)    # the watch's own env
+
+    def test_the_login_email_names_the_fix_for_the_login_in_use(self):
+        from unittest import mock
+        bodies = []
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: bodies.append(body) or True):
+            fw.alert_login_failure({}, "x", [], {}, 1.0)
+            self._write(self.TOKEN)
+            fw.alert_login_failure({}, "x", [], {}, 1.0)
+        self.assertIn("/login", bodies[0])
+        self.assertIn("claude setup-token", bodies[0])
+        self.assertIn("was rejected", bodies[1])
+        self.assertNotIn(self.TOKEN, bodies[1])
+
+    def test_renewal_reminder_from_day_350_then_weekly(self):
+        from unittest import mock
+        now = 1_800_000_000.0
+        self.assertIsNone(fw.token_renewal_due({}, now))               # no token
+        self._write(self.TOKEN)
+        os.utime(self.path, (now - 349 * 86400, now - 349 * 86400))
+        self.assertIsNone(fw.token_renewal_due({}, now))
+        os.utime(self.path, (now - 351 * 86400, now - 351 * 86400))
+        sent = []
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append((subject, body)) or True):
+            state = {}
+            self.assertTrue(fw.remind_token_renewal(state, now, False))
+            self.assertFalse(fw.remind_token_renewal(state, now + 6 * 86400, False))
+            self.assertTrue(fw.remind_token_renewal(state, now + 7.1 * 86400, False))
+            self.assertFalse(fw.remind_token_renewal({}, now, True))    # dry: log only
+        self.assertEqual([s for s, _ in sent], ["IMM-WATCH renew the research token"] * 2)
+        self.assertIn("351 days", sent[0][1])
+        self.assertNotIn(self.TOKEN, sent[0][1])
+
+    def test_check_login(self):
+        from unittest import mock
+        with mock.patch.object(fw, "run_research", lambda p: ("OK", 0.01, "")):
+            self.assertEqual(fw.check_login(), 0)
+        with mock.patch.object(fw, "run_research",
+                               lambda p: ("Failed to authenticate: OAuth session expired",
+                                          0.0, "exit 1: ")):
+            self.assertEqual(fw.check_login(), 1)
