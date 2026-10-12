@@ -88,8 +88,8 @@ def run_audit(client=None, progs=None) -> dict:
       n_programs      int
       cap_warning     str | None      (MAX_CANDIDATE_BOOKS truncation)
       miss_lines      [str]           (per excluded-but-paying event)
-      unearnable      set[str]        (series with an UNEARNABLE event)
-      absent          [str]           (enrolled close-anchored, no programs)
+      unearnable      set[str]        (series whose EVERY live event is UNEARNABLE)
+      absent          [str]           (enrolled close-anchored, not blocked, no programs)
       not_allowed     {series: $/day} (every not-allowed series, unfiltered)
     """
     now = datetime.now(timezone.utc)
@@ -119,8 +119,10 @@ def run_audit(client=None, progs=None) -> dict:
                        f"are being silently truncated (bit the company-metric "
                        f"class 2026-07-22)")
 
-    miss_lines = []
-    unearnable = set()
+    entries = []            # (event, n markets, series, [status])
+    unearn_ev = {}          # event -> series, flagged per event
+    renewed = {}            # event -> (status index, text if its series is earnable)
+    earnable_series = set()
     for ev_t in sorted(by_event):
         tickers = by_event[ev_t]
         t0 = tickers[0]
@@ -174,7 +176,11 @@ def run_audit(client=None, progs=None) -> dict:
                     f"date) until imm_earnings_overrides dates it")
         elif (cutoff is not None and resolved is None and not mention_family
                 and pstart is not None and pstart >= cutoff):
-            unearnable.add(series)
+            unearn_ev[ev_t] = series
+            renewed[ev_t] = (len(status), (
+                f"cutoff passed ({cutoff:%m-%d %H:%MZ} midnight-fallback; "
+                f"Kalshi renewed its program {pstart:%m-%d %H:%MZ}+, after "
+                f"the cutoff -- the series' live event is quoted)"))
             status.append(
                 f"UNEARNABLE(program {pstart:%m-%d %H:%MZ}+ entirely after "
                 f"midnight-fallback cutoff {cutoff:%m-%d %H:%MZ} — "
@@ -189,9 +195,26 @@ def run_audit(client=None, progs=None) -> dict:
             else:
                 status.append(f"cutoff passed ({cutoff:%m-%d %H:%MZ} "
                               f"{'resolved' if resolved else 'midnight-fallback'})")
+        if ev_t not in unearn_ev and pstart is not None:
+            earnable_series.add(series)
         if status:
-            miss_lines.append(
-                f"{ev_t} ({len(tickers)} mkts, {series}): {'; '.join(status)}")
+            entries.append((ev_t, len(tickers), series, status))
+
+    # UNEARNABLE IS A SERIES VERDICT (Jack 2026-10-11, "yes fix"): Kalshi now
+    # renews a market's reward period every day for as long as it is open,
+    # so a FINISHED event -- last week's strait transits or KXEOWEEK,
+    # yesterday's KXTRUMPAPPROVE read -- carries a fresh period that starts
+    # after its cutoff while the bot stands down on purpose. The KXTEMPMIAH
+    # class is a series whose EVERY event pays only after its cutoff, so a
+    # series counts as UNEARNABLE only when none of its live events has a
+    # period starting before its cutoff; the rest read "cutoff passed".
+    unearnable = {s_ for s_ in unearn_ev.values() if s_ not in earnable_series}
+    miss_lines = []
+    for ev_t, n, series, status in entries:
+        if ev_t in renewed and series not in unearnable:
+            i, txt = renewed[ev_t]
+            status = status[:i] + [txt] + status[i + 1:]
+        miss_lines.append(f"{ev_t} ({n} mkts, {series}): {'; '.join(status)}")
 
     # Enrolled close-anchored families (the per-city override lists) with no
     # ACTIVE programs — the 2026-08-04 class: Kalshi ends a family's programs
@@ -200,9 +223,12 @@ def run_audit(client=None, progs=None) -> dict:
     # their hour (published ~hh:11), so one absent series can be a timing
     # artifact; a family absent across reruns has genuinely lost its rewards.
     prog_series = {imm.series_of(t) for t in progs}
+    # A blocked family losing its programs is no miss (2026-10-11: the
+    # OpenRouter share family, blocklisted since 10/09, kept pinging).
     absent = sorted(s for s, ov in imm.SERIES_OVERRIDES.items()
                     if ov.cutoff_from_close_min is not None
-                    and s not in prog_series)
+                    and s not in prog_series
+                    and not bot._blocked(f"{s}-99DEC31-X"))
 
     # NOT-ALLOWED families by pool $/day — deliberate exclusions, listed so a
     # NEW paying family is visible the day Kalshi lights it up.
