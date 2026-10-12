@@ -251,9 +251,6 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("TWK_ENABLE") \
             and series in globals().get("TWK_SERIES", ()):
         m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
-    # the NFL head-to-head pilot (2026-10-12): the same, NFL_H2H_REF_MULT_CAP
-    if series is not None and nfl_h2h_series(series):
-        m = min(m, max(1.0, globals().get("NFL_H2H_REF_MULT_CAP", 1.0)))
     return m
 
 
@@ -1527,7 +1524,9 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
                 and not rain_period_member(series):
             return hours[hour]
     # sports ladders / escalators: one flat value at every hour (2026-10-06)
-    if SPORTS_LADDER_HOUR_MULT > 0 and sports_ladder_league(series):
+    # -- and the NFL head-to-head family, sized as the ladders (2026-10-12)
+    if SPORTS_LADDER_HOUR_MULT > 0 and (sports_ladder_league(series)
+                                        or nfl_h2h_series(series)):
         return SPORTS_LADDER_HOUR_MULT
     # Daily (print) families never take the GLOBAL window (Jack 2026-09-12,
     # with the 0-9am ET extension): the quiet hours are quiet for long-dated
@@ -1641,9 +1640,6 @@ def is_daily_series(series: str) -> bool:
         return True
     # ... and so are the Trump weekly pilots (2026-10-11)
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
-        return True
-    # ... and so is the NFL head-to-head pilot (2026-10-12)
-    if nfl_h2h_series(series):
         return True
     return series in DAILY_SERIES_DYNAMIC
 
@@ -2337,9 +2333,6 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return globals()["TWK_EVENT_CAP"]
-    # the NFL head-to-head pilot (2026-10-12): NFL_H2H_EVENT_CAP net per pair
-    if nfl_h2h_series(series):
-        return globals()["NFL_H2H_EVENT_CAP"]
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -7975,8 +7968,7 @@ _CONFIG_CODE_KNOBS = (
     "TWK_BID_ONLY_SERIES", "TWK_MAX_POSITION", "TWK_REF_MULT_CAP", "TWK_EVENT_CAP",
     "TWK_DAILY_LOSS_LIMIT",
     # NFL head-to-head pilot (2026-10-12)
-    "NFL_H2H_ENABLE", "NFL_H2H_START_BUFFER_MIN", "NFL_H2H_MAX_POSITION",
-    "NFL_H2H_REF_MULT_CAP", "NFL_H2H_EVENT_CAP", "NFL_H2H_DAILY_LOSS_LIMIT",
+    "NFL_H2H_ENABLE", "NFL_H2H_START_BUFFER_MIN", "NFL_H2H_DAILY_LOSS_LIMIT",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -11053,9 +11045,15 @@ def twk_bid_only(series: str) -> bool:
 # those (NFL_H2H_START_BUFFER_MIN 0; the cutoff from the ESPN schedule,
 # every order's expiry capped at it).
 # A PILOT: one settled event so far (10/08), no tape to score. THE RULES:
-# safe-join, the 20-lot ladder at x1 every hour (is_daily_series), no
-# deep-reference size, NFL_H2H_MAX_POSITION 100 per market and
-# NFL_H2H_EVENT_CAP 100 net per pair, the ladders' team-news hold
+# safe-join, SIZED AS THE SPORTS LADDERS / ESCALATORS (Jack the same day:
+# "same multiplier as ESCALATOR/LADDER"; it first shipped at 20 lots x1,
+# 100 per market and per pair): the ladder family's size multiplier
+# (size_mult = the KXNFLLADDERREC override's, IMM_SPORTS_LADDER_SIZE_MULT)
+# scales the rung, the per-market and per-event caps and the skew knees
+# together, the flat SPORTS_LADDER_HOUR_MULT at every hour with the
+# Saturday step on top, the deep-reference size and no join-ahead -- 20 x 5
+# x 4 = 400 a side, caps 750 / 5,000 at the launcher's 150 / 1,000. Then
+# the ladders' team-news hold
 # (nfl_h2h_gate: news on either team inside NFL_NEWS_HOLD_MIN, or a stale /
 # missing NFL read or roster, stands it aside -- fails closed), and a FAMILY
 # daily loss halt at -NFL_H2H_DAILY_LOSS_LIMIT ($40) on the pilots' halt
@@ -11067,17 +11065,14 @@ def twk_bid_only(series: str) -> bool:
 NFL_H2H_ENABLE = _NFL_H2H_LIVE
 NFL_H2H_ARCHETYPE = "KXNFLPASSYDSH2H"
 NFL_H2H_START_BUFFER_MIN = _env_int("IMM_NFL_H2H_START_BUFFER_MIN", 0)
-NFL_H2H_MAX_POSITION = _env_float("IMM_NFL_H2H_MAX_POSITION", 100)
-NFL_H2H_REF_MULT_CAP = _env_float("IMM_NFL_H2H_REF_MULT_CAP", 1.0)
-NFL_H2H_EVENT_CAP = _env_float("IMM_NFL_H2H_EVENT_CAP", 100)
 NFL_H2H_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_H2H_DAILY_LOSS_LIMIT", 40)
 NFL_H2H_HALT_KEY = "NFL_H2H"
 
 if NFL_H2H_ENABLE:
     SERIES_OVERRIDES[NFL_H2H_ARCHETYPE] = replace(
         SERIES_OVERRIDES.get(NFL_H2H_ARCHETYPE) or SeriesOverride(),
-        start_buffer_min=NFL_H2H_START_BUFFER_MIN,
-        max_position=NFL_H2H_MAX_POSITION, safe_join=True)
+        start_buffer_min=NFL_H2H_START_BUFFER_MIN, safe_join=True,
+        size_mult=SERIES_OVERRIDES["KXNFLLADDERREC"].size_mult)
     for _s in ("KXNFLRSHYDSH2H", "KXNFLRECYDSH2H"):
         SERIES_OVERRIDES[_s] = SERIES_OVERRIDES[NFL_H2H_ARCHETYPE]
 
@@ -14055,7 +14050,8 @@ def join_ahead_series(series: str) -> bool:
     """May this series' at-reference rungs join ahead of a pile at all?"""
     if JOIN_AHEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
         return False
-    if sports_ladder_league(series) is not None or is_daily_series(series):
+    if sports_ladder_league(series) is not None or is_daily_series(series) \
+            or nfl_h2h_series(series):
         return False
     # Carbon Arc by its verified source OR its name pattern: an unverified
     # *POS / *FT / *APP / *ADS / *CC stays out too (fails toward no move)
@@ -25055,8 +25051,10 @@ class IncentiveMarketMaker:
         if NFL_H2H_ENABLE:
             log(f"nfl h2h pilot: every KXNFL*H2H series, quoted to "
                 f"{'kickoff' if NFL_H2H_START_BUFFER_MIN <= 0 else f'kickoff - {NFL_H2H_START_BUFFER_MIN}m'}"
-                f", safe-join, x1 at every hour, {NFL_H2H_MAX_POSITION:g}/market and "
-                f"{NFL_H2H_EVENT_CAP:g}/pair net, team-news hold {NFL_NEWS_HOLD_MIN}m, "
+                f", safe-join, sized as the sports ladders (family x"
+                f"{applied_mention_mult(NFL_H2H_ARCHETYPE):g}, hour x"
+                f"{SPORTS_LADDER_HOUR_MULT:g}, caps {series_max_position(NFL_H2H_ARCHETYPE):g}"
+                f"/market), team-news hold {NFL_NEWS_HOLD_MIN}m, "
                 f"family halt at -${NFL_H2H_DAILY_LOSS_LIMIT:g} P&L today"
                 + (" (HALTED this roll day)" if self.state.twk_halt_day.get(NFL_H2H_HALT_KEY)
                    == _halt_day_key(datetime.now(timezone.utc)) else ""))

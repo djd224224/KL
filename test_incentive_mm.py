@@ -19442,9 +19442,10 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
 class TestNflH2HPilot(unittest.TestCase):
     """The NFL head-to-head pilot (Jack 2026-10-12: "quote NFL H2H markets e.g.
     KXNFLPASSYDSH2H, KXNFLRSHYDSH2H, KXNFLRECYDSH2H"): every KXNFL*H2H series,
-    quoted to kickoff off the NFL scoreboard, safe-join, x1 at every hour, 100
-    per market and per pair, the ladders' team-news hold, and one daily loss
-    halt for the whole family."""
+    quoted to kickoff off the NFL scoreboard, safe-join, sized exactly as the
+    sports ladders ("same multiplier as ESCALATOR/LADDER", the same evening),
+    the ladders' team-news hold, and one daily loss halt for the whole
+    family."""
 
     KICKOFF = datetime(2067, 10, 6, 0, 15, tzinfo=timezone.utc)
     REC = "KXNFLRECYDSH2H-67OCT05ATLNO-DLONDON5COLAVE12-DLONDON5"
@@ -19485,16 +19486,33 @@ class TestNflH2HPilot(unittest.TestCase):
             ov = imm.series_override(s)
             self.assertEqual(ov.start_buffer_min, 0, s)           # to kickoff
             self.assertTrue(ov.safe_join, s)
-            self.assertEqual(imm.series_max_position(s), 100.0, s)
-            self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT12BUFLAR-AB1CD2"), 100.0, s)
-            self.assertTrue(imm.is_daily_series(s), s)
             self.assertTrue(imm.schedule_resolved_series(s), s)
             self.assertEqual(imm.pilot_halt_key(s), imm.NFL_H2H_HALT_KEY, s)
-            for when in (datetime(2026, 10, 13, 7, 0, tzinfo=timezone.utc),
-                         datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)):
-                self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+            # SIZED EXACTLY AS THE LADDERS ("same multiplier as
+            # ESCALATOR/LADDER"): family multiplier, caps, hours, Saturday,
+            # deep-reference size, no join-ahead
+            lad = "KXNFLLADDERREC"
+            self.assertEqual(ov.size_mult, imm.SERIES_OVERRIDES[lad].size_mult, s)
+            self.assertGreater(imm.applied_mention_mult(s), 1.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), imm.applied_mention_mult(lad), s)
+            self.assertEqual(imm.series_max_position(s), imm.series_max_position(lad), s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT12BUFLAR-AB1CD2"),
+                             imm.event_cap_contracts(f"{lad}-26OCT12BUFLAR"), s)
+            self.assertFalse(imm.is_daily_series(s), s)
+            with mock.patch.object(imm, "SPORTS_LADDER_HOUR_MULT", 4.0):
+                for when in (datetime(2026, 10, 13, 7, 0, tzinfo=timezone.utc),    # quiet
+                             datetime(2026, 10, 13, 16, 0, tzinfo=timezone.utc),   # day
+                             datetime(2026, 10, 13, 23, 30, tzinfo=timezone.utc),  # evening
+                             datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)):  # Saturday
+                    self.assertEqual(imm.hour_size_mult(s, when),
+                                     imm.hour_size_mult(lad, when), (s, when))
+                self.assertEqual(imm.hour_size_mult(
+                    s, datetime(2026, 10, 13, 16, 0, tzinfo=timezone.utc)), 4.0)
             with mock.patch.object(imm, "LADDER_MODE", "atref"):
-                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
+                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s),
+                                 imm.capped_ref_mult(49, 55, "ask", series=lad), s)
+                with mock.patch.object(imm, "JOIN_AHEAD_MODE", "on"):
+                    self.assertFalse(imm.join_ahead_series(s), s)
         # a new KXNFL*H2H series clones the archetype on first sight
         overrides = dict(imm.SERIES_OVERRIDES)
         self.addCleanup(lambda: (imm.SERIES_OVERRIDES.clear(),
