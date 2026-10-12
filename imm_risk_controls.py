@@ -92,7 +92,9 @@ CANCELLED_RE = re.compile(r"cancelled (\d+)")
 GATE_GUARDS = ("treasury_yield", "rain_monthly", "rain_period", "snow_monthly", "rain_fair",
                "quake", "quake_hold",
                "vercel_fair", "or_fair", "share_fair", "mort_fair", "gb_fair",
-               "ca_fair", "dc_count", "poke_fair", "manual_yield")
+               "ca_fair", "dc_count", "poke_fair", "manual_yield",
+               # the 2026-10-11 fair-file gates (incentive_mm.fair_file_gate)
+               "cpi_fair", "rt_fair", "rain_wknd")
 BLACKOUT_GUARDS = ("cpi_blackout", "aaa_blackout")
 DEPTH_GUARDS = ("event_depth_trip", "event_depth_hold")
 CUTOFF_GUARDS = ("closing", "cutoff_passed", "cutoff_extra")

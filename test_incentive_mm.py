@@ -192,6 +192,9 @@ def setUpModule():
     # ...and the monthly snow one (2026-10-04)
     imm.SNOW_MONTHLY_FILE = os.path.join(tmp, "snow_monthly_fair.json")
     imm._snow_monthly_state.update(mtime=0.0, markets={}, events={})
+    # the 2026-10-11 fair-file gates (CPI pilot, ...)
+    imm.CPI_FAIR_FILE = os.path.join(tmp, "cpi_fair.json")
+    imm._cpi_fair_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -11973,6 +11976,122 @@ class TestSnowMonthlyGate(unittest.TestCase):
         self.assertIn(self.T, bot.state.selected)                 # sticky
 
 
+class TestCpiFairGate(unittest.TestCase):
+    """cpi_fair.json -> load_cpi_fair / cpi_fair_gate -> the CPI pilot's core
+    markets (Jack 2026-10-11: "build the KXRT, CPI, KXRAINWKND models"): the
+    fair-file gate fails closed and caps the side whose touch is more than
+    CPI_FAIR_TOL_CENTS through the fair. Fixture KXCPICOREYOY-68DEC-T2.6 (a
+    pilot-family event far from any cutoff)."""
+
+    T = "KXCPICOREYOY-68DEC-T2.6"
+    EV = "KXCPICOREYOY-68DEC"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._cpi_fair_state.update(mtime=0.0, markets={}, events={})
+        try:
+            os.remove(imm.CPI_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self._blackout = mock.patch.object(imm, "series_in_blackout", return_value=False)
+        self._blackout.start()
+
+    def tearDown(self):
+        self._blackout.stop()
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm.CPI_FAIR_CAP = True
+
+    def _write(self, p=0.5, age_secs=0):
+        at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        with open(imm.CPI_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p,
+                                            "fetched_at": at.isoformat()}}}, f)
+        os.utime(imm.CPI_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestCpiFairGate._bump += 1
+        return imm.load_cpi_fair()
+
+    def _bot(self):
+        client = FakeClient()
+        far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_wiring(self):
+        for s in ("KXCPICORE", "KXCPICOREYOY"):
+            self.assertTrue(imm.cpi_fair_series(s), s)
+        for s in ("KXCPI", "KXCPIYOY", "KXCPICOREX"):
+            self.assertFalse(imm.cpi_fair_series(s), s)
+        with mock.patch.object(imm, "CPI_FAIR_ENABLE", False):
+            self.assertFalse(imm.cpi_fair_series("KXCPICORE"))
+            self.assertIsNone(imm.fair_file_gate("KXCPICORE", self.T, time.time(), 49, 51))
+        self.assertEqual(imm.fair_file_gate("KXCPICORE", self.T, time.time(), 49, 51)[0],
+                         "cpi-fair")
+        self.assertIsNone(imm.fair_file_gate("KXRAINCHIM", self.T, time.time(), 49, 51))
+        for k in ("CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        import imm_risk_controls
+        self.assertIn("cpi_fair", imm_risk_controls.GATE_GUARDS)
+
+    def test_gate_reasons_and_caps(self):
+        g = imm.cpi_fair_gate
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, inp["reason"], caps),
+                         ("no CPI fair for this market", "no_read", None))
+        self._write()
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(age_secs=imm.CPI_FAIR_TTL_MIN * 60 + 5)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "stale")
+        # bid 49 > 30 + 15: the bid is capped at 45, the ask keeps the touch
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["bid_bad"]), ("", (45, 15), True))
+        # inside the 15c band: no cap
+        self._write(p=0.40)
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        imm.CPI_FAIR_CAP = False
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+        self.assertIn("CPI fair 30c", why)
+
+    def test_quotes_through_the_gate(self):
+        bot = self._bot()
+        bot.run_cycle()                                       # no file: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self._write()
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        # the fair drops to 30: the bid capped at 45 is behind 1,900 contracts
+        self._write(p=0.30)
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"ask"})
+        self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -22480,20 +22599,22 @@ class TestSignedFairReads(unittest.TestCase):
 
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
-        monthly rain, monthly snow, GasBuddy and daily rain (its city
-        discovery, 2026-10-09) refreshers each build a reader with
+        monthly rain, monthly snow, GasBuddy, daily rain (its city
+        discovery, 2026-10-09) and CPI pilot (2026-10-11) refreshers each
+        build a reader with
         fair_reader() and pass it to their module's write_fair_file (the
         threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 7)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 8)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
                           ("openrouter_share_fair", "SHARE_FAIR_FILE"),
                           ("rain_monthly_fair", "RAIN_MONTHLY_FILE"),
                           ("snow_monthly_fair", "SNOW_MONTHLY_FILE"),
-                          ("gasbuddy_fair", "GB_FAIR_FILE")):
+                          ("gasbuddy_fair", "GB_FAIR_FILE"),
+                          ("cpi_fair", "CPI_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)

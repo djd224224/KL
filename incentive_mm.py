@@ -7927,6 +7927,8 @@ _CONFIG_CODE_KNOBS = (
     "SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_TTL_MIN",
     "SNOW_MONTHLY_DRY_MIN", "SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN", "SNOW_MONTHLY_CAP",
     "SNOW_MONTHLY_SIZE_MULT",
+    # the CPI pilot's fair gate (2026-10-11); model knobs in cpi_fair.py
+    "CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -9856,6 +9858,90 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         dry_min=SNOW_MONTHLY_DRY_MIN, label="monthly snow",
         wet=("snowing", "snowed"))
     return _cap_band_breach(why, inp, SNOW_MONTHLY_TOL_CENTS, SNOW_MONTHLY_CAP)
+
+
+# ----------------------------------------------------------------------------
+# FAIR-FILE GATES WITHOUT A STATION (Jack 2026-10-11: "build the KXRT, CPI,
+# KXRAINWKND models"). A writer prices each market into a file in the rain
+# writer's shape (markets {ticker: {p, event, fetched_at}}, read with its
+# loader), and the gate -- the monthly weather gates' contract without the
+# station checks -- stands a market aside without a fresh price (fail
+# CLOSED), and when its touch fights the price by more than the family's
+# tolerance CAPS that side at fair +- tol (the period-rain rule: the capped
+# side rests only while the scored walk still reaches it; the other side
+# joins the touch). One quote-loop branch serves them all (fair_file_gate).
+def simple_fair_gate(state: dict, ticker: str, now_ts: float,
+                     ext_bid: Optional[float], ext_ask: Optional[float],
+                     tol: float, ttl_min: float, label: str, cap: bool
+                     ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', {}, None) to quote at the touch; ('', inputs, caps) when a side
+    is capped; else (why, guard-skip inputs, None) -- stand aside."""
+    e = state["markets"].get(ticker)
+    if e is None:
+        return f"no {label} fair for this market", {"reason": "no_read"}, None
+    if now_ts - e["ts"] > ttl_min * 60:
+        return f"{label} fair is stale", {"reason": "stale"}, None
+    fair_c = e["p"] * 100.0
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair_c, tol)
+    if not (bid_bad or ask_bad):
+        return "", {}, None
+    why = (f"book {ext_bid}x{ext_ask} vs {label} fair {fair_c:.0f}c (tol "
+           f"{tol:g}c, {'bid' if bid_bad else 'ask'} side)")
+    inp = {"reason": "band", "fair": round(fair_c, 2), "tol": tol,
+           "bid_bad": bid_bad, "ask_bad": ask_bad}
+    return _cap_band_breach(why, inp, tol, cap)
+
+
+# CPI PILOT FAIR GATE (Jack 2026-10-11, the build above; see CPI_PILOT_*).
+# cpi_fair.py prices the core pilot series from the BLS indexes alone (the
+# Cleveland Fed core nowcast's own construction; their feed's terms are
+# non-commercial): mu = the 12-month average adjusted MoM, carried into the
+# YoY; sigma by days to the release from the 2022-onward backtest. Against
+# Kalshi's mids the market is the better forecaster inside ~15 days and
+# the model beyond 30 on core MoM (strikes the market priced 10-25c settled
+# YES 0-1% of the time), so the model is a WIDE band, CPI_FAIR_TOL_CENTS,
+# not a price: a touch more than 15c through it caps that side. On 10/11
+# the model sat under the market on nearly every pilot strike (CORE-26NOV
+# T0.1: 65 vs a 87 mid), so it mostly caps bids. The pilot's own guards
+# stay (weekday 08:25-11:05 ET blackout, out 7 days before close).
+# IMM_CPI_FAIR_ENABLE=0 turns the gate off (plain pilot quoting).
+CPI_FAIR_ENABLE = os.environ.get("IMM_CPI_FAIR_ENABLE", "1") == "1"
+CPI_FAIR_SERIES = frozenset(("KXCPICORE", "KXCPICOREYOY"))
+CPI_FAIR_TOL_CENTS = _env_int("IMM_CPI_FAIR_TOL_CENTS", 15)
+CPI_FAIR_TTL_MIN = _env_int("IMM_CPI_FAIR_TTL_MIN", 180)
+CPI_FAIR_REFRESH_SECS = _env_int("IMM_CPI_FAIR_REFRESH_SECS", 1800)
+CPI_FAIR_CAP = os.environ.get("IMM_CPI_FAIR_CAP", "1") == "1"
+CPI_FAIR_FILE = os.environ.get(
+    "IMM_CPI_FAIR_FILE", os.path.join(STATUS_DIR, "cpi_fair.json"))
+_cpi_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+
+def cpi_fair_series(series: str) -> bool:
+    return CPI_FAIR_ENABLE and series in CPI_FAIR_SERIES
+
+
+def load_cpi_fair() -> int:
+    """Hot-reload CPI_FAIR_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(CPI_FAIR_FILE, _cpi_fair_state, "CPI")
+
+
+def cpi_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                  ext_ask: Optional[float]
+                  ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    return simple_fair_gate(_cpi_fair_state, ticker, now_ts, ext_bid, ext_ask,
+                            tol=CPI_FAIR_TOL_CENTS, ttl_min=CPI_FAIR_TTL_MIN,
+                            label="CPI", cap=CPI_FAIR_CAP)
+
+
+def fair_file_gate(series: str, ticker: str, now_ts: float,
+                   ext_bid: Optional[float], ext_ask: Optional[float]
+                   ) -> Optional[Tuple[str, str, dict,
+                                       Optional[Tuple[Optional[int], Optional[int]]]]]:
+    """(log label, why, inputs, caps) for a market under one of the
+    2026-10-11 fair-file gates, else None."""
+    if cpi_fair_series(series):
+        return ("cpi-fair",) + cpi_fair_gate(ticker, now_ts, ext_bid, ext_ask)
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -18480,6 +18566,7 @@ class IncentiveMarketMaker:
                 f"{_or_moved} with a new day")
         load_rain_monthly()
         load_snow_monthly()
+        load_cpi_fair()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
             log(f"{self.tag} share-fair reloaded: {_sh_n} events, "
@@ -22191,13 +22278,19 @@ class IncentiveMarketMaker:
             # the fair -- rain_caps, applied last below, where only a side
             # that still earns rests (RAIN_PERIOD_CAP).
             # The snow monthlies (2026-10-04, SNOW_MONTHLY_ENABLE) take the
-            # same gate on their own file, with the period markets' caps.
+            # same gate on their own file, with the period markets' caps,
+            # and so do the 2026-10-11 fair-file gates (fair_file_gate:
+            # the CPI pilot, ...) without the station checks.
             rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             rain_period = rain_period_gated(t)
             snow = snow_monthly_series(meta.series)
-            wx = "snow-monthly" if snow else "rain-period" if rain_period else "rain-monthly"
-            if rain_monthly_series(meta.series) or rain_period or snow:
-                if snow:
+            ffg = fair_file_gate(meta.series, t, now_ts, ext_bid, ext_ask)
+            wx = ffg[0] if ffg else ("snow-monthly" if snow else
+                                     "rain-period" if rain_period else "rain-monthly")
+            if rain_monthly_series(meta.series) or rain_period or snow or ffg:
+                if ffg:
+                    _, rm_why, rm_in, rain_caps = ffg
+                elif snow:
                     rm_why, rm_in, rain_caps = snow_monthly_gate(
                         t, now_ts, ext_bid, ext_ask)
                 elif rain_period:
@@ -24471,6 +24564,39 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_snow_monthly_refresh, daemon=True,
                              name="snow-monthly").start()
+        if CPI_FAIR_ENABLE and not once:
+            # CPI pilot fair refresher (2026-10-11): the snow refresher's
+            # contract on cpi_fair.py and CPI_FAIR_FILE -- the BLS read is
+            # cached in the file (every 3 hours; 25 keyless queries a day),
+            # Kalshi's open events hourly, the horizon's sigma every pass.
+            def _cpi_fair_refresh():
+                try:
+                    import cpi_fair
+                except Exception as e:
+                    log(f"{self.tag} ! cpi-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, CPI_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = cpi_fair.write_fair_file(
+                            CPI_FAIR_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} cpi-fair refresh: {ok} events "
+                                f"with a fair"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! cpi-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_cpi_fair_refresh, daemon=True,
+                             name="cpi-fair").start()
         if GB_FAIR_ENABLE and not once:
             # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
             # refresher's contract -- every network call off the trading

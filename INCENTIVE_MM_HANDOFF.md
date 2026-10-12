@@ -10527,3 +10527,41 @@ headless `claude` login needs a re-login). Hand rows in _ELECTION_DATES_DEFAULT:
   so it runs as an announcement-style market by Jack's call. Cutoff 2027-08-08 03:00Z.
 Programs (10/12-10/18): Bulgaria 8 markets x $125/period per event, France 14 x $100, Argentina
 11 x $100 (~$190-260/day of pool per event); books were 1c x 80-99c placeholders at listing.
+
+## 2026-10-12 ~01:30Z — CPI pilot fair gate (Jack: "build the KXRT, CPI, KXRAINWKND models")
+
+cpi_fair.py (new) prices the pilot's core series from the BLS indexes alone
+(api.bls.gov v2, keyless, one query every 3 hours, cached in the file):
+- KXCPICORE (first-print seasonally adjusted MoM) and KXCPICOREYOY
+  (unadjusted 12-month change), both rounded to one decimal: YES iff the
+  unrounded change >= K + 0.05, P = 1 - Phi((K + 0.05 - mu) / sigma(h)).
+- mu MoM = the 12-month geometric average adjusted change through the
+  latest print -- the Cleveland Fed core nowcast's own construction (their
+  feed's terms are non-commercial, so it is not used); mu YoY = the last
+  printed unadjusted YoY + sum over unprinted months of (mu MoM - the
+  adjusted MoM a year earlier). October 2025 was never published: its
+  year-ago term is 0, November 2025's is the Sep->Nov two-month change.
+- sigma by days to the release (2022-onward backtest of this construction,
+  151 months): MoM 0.124-0.136; YoY 0.116 (<4 wk) .. 0.413 (14-19 wk).
+- Research (scratchpad cpi/, 2026-10-11): settlement definitions matched
+  Kalshi's settled history 45/45 (YoY) and 61/62 (MoM; Nov 2025 had none);
+  vs Kalshi daily mids (1,051 markets) the market is better within ~15
+  days, the model better on core MoM past 30 days; strikes the market
+  priced 10-25c settled YES 0-1% of the time. 10/12 01:00Z: CORE-26NOV T0.1
+  model 65 vs mid 87, COREYOY-26DEC T2.6 46 vs 68 -- under the market on
+  nearly every pilot strike.
+
+incentive_mm: the model is a WIDE band, not a price. CPI_FAIR_TOL_CENTS 15
+(IMM_CPI_FAIR_TOL_CENTS): a touch more than 15c through the fair caps that
+side at fair +- 15 (CPI_FAIR_CAP; the capped side rests only while the
+scored walk reaches it), no fresh read (CPI_FAIR_TTL_MIN 180) stands the
+market aside. Refresher thread "cpi-fair" every 30 min (CPI_FAIR_REFRESH_SECS)
+writes CPI_FAIR_FILE (run-logs/incentive-mm/cpi_fair.json); loaded each
+universe refresh. Shared machinery for the 10/11 fair-file families:
+simple_fair_gate (the monthly weather gates' contract without the station
+checks) and fair_file_gate, dispatched inside the monthly rain/snow quote-loop
+branch (log label "cpi-fair", guard "cpi_fair"; imm_risk_controls lists it).
+The pilot's own guards are unchanged (weekday 08:25-11:05 ET blackout, out 7
+days before close; review 10/13). Kill switch IMM_CPI_FAIR_ENABLE=0.
+Tests: test_cpi_fair.py (9), TestCpiFairGate (3); the signed-reader wiring
+guard counts 8 refreshers.
