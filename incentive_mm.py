@@ -11055,9 +11055,12 @@ def twk_bid_only(series: str) -> bool:
 # x 4 = 400 a side, caps 750 / 5,000 at the launcher's 150 / 1,000. Then
 # the ladders' team-news hold
 # (nfl_h2h_gate: news on either team inside NFL_NEWS_HOLD_MIN, or a stale /
-# missing NFL read or roster, stands it aside -- fails closed), and a FAMILY
-# daily loss halt at -NFL_H2H_DAILY_LOSS_LIMIT ($40) on the pilots' halt
-# machinery (pilot_halt_key -> NFL_H2H_HALT_KEY). No injury rule: Jack
+# missing NFL read or roster, stands it aside -- fails closed). NO family
+# loss halt (Jack the same evening: "remove the $40 halt for H2H"; at 400
+# a side one 10c pick-off is -$40): NFL_H2H_DAILY_LOSS_LIMIT 0. A value > 0
+# brings the family budget back on the pilots' halt machinery
+# (pilot_halt_key -> NFL_H2H_HALT_KEY); the bot-wide daily loss limit, the
+# toxic-flow side halts and the sweep breaker still apply. No injury rule: Jack
 # 2026-10-04 keeps the non-fantasy props quoting through designations, and a
 # player who sits resolves at a fair price. Every KXNFL*H2H series is in
 # (NFL_H2H_RE); a new one clones the archetype (FAMILY_OVERRIDE_PARENTS).
@@ -11065,7 +11068,7 @@ def twk_bid_only(series: str) -> bool:
 NFL_H2H_ENABLE = _NFL_H2H_LIVE
 NFL_H2H_ARCHETYPE = "KXNFLPASSYDSH2H"
 NFL_H2H_START_BUFFER_MIN = _env_int("IMM_NFL_H2H_START_BUFFER_MIN", 0)
-NFL_H2H_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_H2H_DAILY_LOSS_LIMIT", 40)
+NFL_H2H_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_H2H_DAILY_LOSS_LIMIT", 0)
 NFL_H2H_HALT_KEY = "NFL_H2H"
 
 if NFL_H2H_ENABLE:
@@ -11080,10 +11083,11 @@ if NFL_H2H_ENABLE:
 def pilot_halt_key(series: str) -> Optional[str]:
     """The daily loss budget a pilot series spends: its own name for a Trump
     weekly pilot (one budget per series), NFL_H2H_HALT_KEY for the whole NFL
-    head-to-head family, None for everything else."""
+    head-to-head family while it has one (NFL_H2H_DAILY_LOSS_LIMIT > 0; off
+    since 2026-10-12), None for everything else."""
     if twk_series(series):
         return series
-    if nfl_h2h_series(series):
+    if nfl_h2h_series(series) and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         return NFL_H2H_HALT_KEY
     return None
 
@@ -11095,7 +11099,7 @@ def pilot_halt_limit(key: str) -> float:
 def pilot_halt_keys() -> List[str]:
     """Every live pilot budget, Trump weekly series first."""
     keys = sorted(TWK_SERIES) if TWK_ENABLE else []
-    if NFL_H2H_ENABLE:
+    if NFL_H2H_ENABLE and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         keys.append(NFL_H2H_HALT_KEY)
     return keys
 
@@ -25076,7 +25080,8 @@ class IncentiveMarketMaker:
                 f"{applied_mention_mult(NFL_H2H_ARCHETYPE):g}, hour x"
                 f"{SPORTS_LADDER_HOUR_MULT:g}, caps {series_max_position(NFL_H2H_ARCHETYPE):g}"
                 f"/market), team-news hold {NFL_NEWS_HOLD_MIN}m, "
-                f"family halt at -${NFL_H2H_DAILY_LOSS_LIMIT:g} P&L today"
+                + (f"family halt at -${NFL_H2H_DAILY_LOSS_LIMIT:g} P&L today"
+                   if NFL_H2H_DAILY_LOSS_LIMIT > 0 else "no family loss halt")
                 + (" (HALTED this roll day)" if self.state.twk_halt_day.get(NFL_H2H_HALT_KEY)
                    == _halt_day_key(datetime.now(timezone.utc)) else ""))
         else:

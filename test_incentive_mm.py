@@ -19487,7 +19487,11 @@ class TestNflH2HPilot(unittest.TestCase):
             self.assertEqual(ov.start_buffer_min, 0, s)           # to kickoff
             self.assertTrue(ov.safe_join, s)
             self.assertTrue(imm.schedule_resolved_series(s), s)
-            self.assertEqual(imm.pilot_halt_key(s), imm.NFL_H2H_HALT_KEY, s)
+            # no family loss halt ("remove the $40 halt for H2H"); the knob
+            # brings the budget back
+            self.assertIsNone(imm.pilot_halt_key(s), s)
+            with mock.patch.object(imm, "NFL_H2H_DAILY_LOSS_LIMIT", 40.0):
+                self.assertEqual(imm.pilot_halt_key(s), imm.NFL_H2H_HALT_KEY, s)
             # SIZED EXACTLY AS THE LADDERS ("same multiplier as
             # ESCALATOR/LADDER"): family multiplier, caps, hours, Saturday,
             # deep-reference size, no join-ahead
@@ -19579,13 +19583,31 @@ class TestNflH2HPilot(unittest.TestCase):
     def _sides(bot, t):
         return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
 
-    def test_quotes_to_kickoff_and_one_halt_for_the_family(self):
+    def test_quotes_to_kickoff_with_no_family_halt(self):
+        # Jack 2026-10-12: "remove the $40 halt for H2H"
+        self.assertEqual(imm.NFL_H2H_DAILY_LOSS_LIMIT, 0)
+        self.assertNotIn(imm.NFL_H2H_HALT_KEY, imm.pilot_halt_keys())
         imm._nfl_state["snap"] = self._snap(time.time() + 3600)   # fresh all test
         bot = self._bot()
         bot.run_cycle()
         for t in (self.REC, self.RSH):
             self.assertIn(t, bot.state.selected)
             self.assertEqual(bot.state.selected[t].cutoff, self.KICKOFF)
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"})
+        bot.pnl.realized[self.REC] = -500.0                     # a bad night
+        bot.run_cycle()
+        self.assertNotIn(imm.NFL_H2H_HALT_KEY, bot.state.twk_halt_day)
+        for t in (self.REC, self.RSH):
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"})
+
+    def test_the_knob_brings_one_halt_for_the_family_back(self):
+        imm._nfl_state["snap"] = self._snap(time.time() + 3600)   # fresh all test
+        lim = mock.patch.object(imm, "NFL_H2H_DAILY_LOSS_LIMIT", 40.0)
+        lim.start()
+        self.addCleanup(lim.stop)
+        bot = self._bot()
+        bot.run_cycle()
+        for t in (self.REC, self.RSH):
             self.assertEqual(self._sides(bot, t), {"bid", "ask"})
         # one market's loss trips the FAMILY budget: both series stand aside
         bot.pnl.realized[self.REC] = -(imm.NFL_H2H_DAILY_LOSS_LIMIT + 1)
