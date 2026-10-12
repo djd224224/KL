@@ -2058,11 +2058,38 @@ _band_tilt_lo = (BAND_TILT_LO_CENTS_EVENING if RUN_SLOT == "evening"
 # ~67% until a cap binds. The 100/150-contract caps and the $125/market
 # cash cap are unchanged and still bind first, so the worst case on any
 # single market is exactly what it is today.
+#
+# ---- 2026-10-12: READ OUT AND ENDED (Jack). Morning + west_late 25, evening 15. ----
+# 9/06–10/11, orders joined to fills by order id. Conversion, the readout
+# this was designed for: morning 4.28% at 25 vs 3.90% at 15, all slots
+# 4.4% vs 3.7%; contracts filled per market-day 7.1 vs 5.1 in the morning.
+# No capacity loss. Matched on depth behind the best NO bid at placement
+# (9/20–10/11, morning; fill rate / contracts filled per order, 15 → 25):
+#   4–7c     28.3% → 29.3%   3.19 → 5.51   scales with size
+#   8–12c    16.0% →  9.8%   1.88 → 1.89   saturated at this depth
+#   13–20c    3.1% →  3.5%   0.36 → 0.69
+#   >20c      0.39% → 0.48%  0.05 → 0.09
+# c/ct is no worse at 25 in any morning band, but per the MDE above that
+# readout can't resolve it. Evening STAYS 15: its edge is thin (+2.5c/ct
+# since July; its control arm lost money in this window) and its cap
+# already refuses most of what it wants -- the same reason MORNING_CAP_MULT
+# is morning-only. west_late groups with morning, as for the band tilt.
+# The 8–12c saturation hints the limit is near 25; if anything is tested
+# next, it is 25 vs 40 on mornings. SIZE_EXP_ENABLED=true restores the
+# 50/50 split for that.
 # =====================================================================
 SIZE_EXP_NAME = "starting_contracts_15_vs_25"
-SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "true").lower() == "true"
+SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "false").lower() == "true"
 SIZE_EXP_TREATMENT_CONTRACTS = int(os.environ.get("SIZE_EXP_TREATMENT_CONTRACTS", "25"))
 SIZE_EXP_PROPORTION = float(os.environ.get("SIZE_EXP_PROPORTION", "0.5"))
+BASE_CONTRACTS_DAY = int(os.environ.get("BASE_CONTRACTS_DAY", "25"))          # morning + west_late
+BASE_CONTRACTS_EVENING = int(os.environ.get("BASE_CONTRACTS_EVENING", "15"))
+
+
+def slot_base_contracts(run_slot):
+    """Base contracts per rung outside the experiment: the evening keeps 15,
+    morning and west_late (a few hours into an already-known day) get 25."""
+    return BASE_CONTRACTS_EVENING if run_slot == "evening" else BASE_CONTRACTS_DAY
 
 # Per-city max contracts override — cities listed here carry their own cap
 # instead of the global max_contracts (larger for the deep books, smaller
@@ -2191,23 +2218,30 @@ def _size_exp_assign_arm(market_ticker):
     interaction term, which needs roughly 4x the data.
     """
     if not SIZE_EXP_ENABLED:
-        return "control"
+        return "off"     # was "control" while the experiment ran; rows now carry the slot base
     key = f"{SIZE_EXP_NAME}|{market_ticker}"
     u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
     return "treatment" if u < SIZE_EXP_PROPORTION else "control"
 
 
 def _size_exp_base_contracts(arm):
-    """Base contracts for this arm. Control = the frozen production value."""
+    """Base contracts for this arm. With the experiment off (the default since
+    2026-10-12) every market gets its run slot's base -- slot_base_contracts."""
+    if not SIZE_EXP_ENABLED:
+        return slot_base_contracts(RUN_SLOT)
     return SIZE_EXP_TREATMENT_CONTRACTS if arm == "treatment" else starting_contracts
 
 
 print(f"\n[AB] test={AB_TEST_NAME} enabled={AB_TEST_ENABLED} "
       f"margin={AB_SAFETY_MARGIN_CENTS}c proportion={AB_TREATMENT_PROPORTION:.0%}")
-print(f"[SIZE-EXP] test={SIZE_EXP_NAME} enabled={SIZE_EXP_ENABLED} "
-      f"control={starting_contracts} treatment={SIZE_EXP_TREATMENT_CONTRACTS} "
-      f"proportion={SIZE_EXP_PROPORTION:.0%} "
-      f"(read out on fills/ordered contract, not on c/ct)")
+if SIZE_EXP_ENABLED:
+    print(f"[SIZE-EXP] test={SIZE_EXP_NAME} enabled=True "
+          f"control={starting_contracts} treatment={SIZE_EXP_TREATMENT_CONTRACTS} "
+          f"proportion={SIZE_EXP_PROPORTION:.0%} "
+          f"(read out on fills/ordered contract, not on c/ct)")
+else:
+    print(f"[SIZE] base {slot_base_contracts(RUN_SLOT)} contracts/rung for the {RUN_SLOT} slot "
+          f"(day {BASE_CONTRACTS_DAY}, evening {BASE_CONTRACTS_EVENING}; size experiment ended 2026-10-12)")
 
 # Write the run-start marker now that all config is known. If anything below
 # crashes (BQ errors, Kalshi outages, etc.), this row remains as a "started_at
@@ -2217,7 +2251,8 @@ write_run_row(
     variable=int(variable),
     night_size_mult=float(night_size_mult),
     central_time_hour=int(central_time.hour),
-    starting_contracts=int(starting_contracts),
+    # the base this run actually used (15 = control while the experiment runs)
+    starting_contracts=int(starting_contracts if SIZE_EXP_ENABLED else slot_base_contracts(RUN_SLOT)),
     ab_test_name=AB_TEST_NAME,
     ab_test_enabled=bool(AB_TEST_ENABLED),
     ab_treatment_proportion=float(AB_TREATMENT_PROPORTION),
