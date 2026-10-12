@@ -251,6 +251,9 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("TWK_ENABLE") \
             and series in globals().get("TWK_SERIES", ()):
         m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
+    # the NFL head-to-head pilot (2026-10-12): the same, NFL_H2H_REF_MULT_CAP
+    if series is not None and nfl_h2h_series(series):
+        m = min(m, max(1.0, globals().get("NFL_H2H_REF_MULT_CAP", 1.0)))
     return m
 
 
@@ -1639,6 +1642,9 @@ def is_daily_series(series: str) -> bool:
     # ... and so are the Trump weekly pilots (2026-10-11)
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return True
+    # ... and so is the NFL head-to-head pilot (2026-10-12)
+    if nfl_h2h_series(series):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -2331,6 +2337,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return globals()["TWK_EVENT_CAP"]
+    # the NFL head-to-head pilot (2026-10-12): NFL_H2H_EVENT_CAP net per pair
+    if nfl_h2h_series(series):
+        return globals()["NFL_H2H_EVENT_CAP"]
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -4377,7 +4386,8 @@ def schedule_resolved_series(series: str) -> bool:
     exact SCHEDULE_RESOLVED_SERIES set plus every sports ladder / escalator
     league that has an ESPN path."""
     return series in SCHEDULE_RESOLVED_SERIES \
-        or sports_ladder_league(series) in ESPN_LEAGUE_PATHS
+        or sports_ladder_league(series) in ESPN_LEAGUE_PATHS \
+        or nfl_h2h_series(series)
 
 
 # ELECTIONS (Jack 2026-09-28: "allowlist county judge markets e.g.
@@ -4977,6 +4987,17 @@ _YTW_LIVE = os.environ.get("IMM_YTW_ENABLE", "1") == "1"
 # IMM_TWK_ENABLE=0 or IMM_ALLOW_TWK_SERIES="" takes them out.
 _TWK_LIVE = os.environ.get("IMM_TWK_ENABLE", "1") == "1"
 _DEFAULT_TWK_SERIES = "KXTRUTHSOCIAL,KXEOWEEK"
+# NFL HEAD-TO-HEAD PILOT (Jack 2026-10-12: "quote NFL H2H markets e.g.
+# KXNFLPASSYDSH2H, KXNFLRSHYDSH2H, KXNFLRECYDSH2H"): every KXNFL*H2H series,
+# see NFL_H2H_ENABLE. IMM_NFL_H2H_ENABLE=0 takes the family out.
+_NFL_H2H_LIVE = os.environ.get("IMM_NFL_H2H_ENABLE", "1") == "1"
+NFL_H2H_RE = re.compile(r"^KXNFL[A-Z0-9]*H2H$")
+
+
+def nfl_h2h_series(series: str) -> bool:
+    """An NFL head-to-head stat series ('KXNFLRECYDSH2H') while the pilot is
+    on (NFL_H2H_ENABLE, read at call time -- defined with the pilot block)."""
+    return bool(globals().get("NFL_H2H_ENABLE")) and bool(NFL_H2H_RE.match(series or ""))
 # LONG-DATED MORTGAGE RATES (Jack 2026-09-28: "yes" to "build a fair-value
 # gate for KXFM30YMTG and KXMORTGAGERATE"): Freddie Mac PMMS year-end and
 # how-high-in-a-year markets, $100 per strike per period from 9/28. Enrolled
@@ -6920,6 +6941,9 @@ FAMILY_OVERRIDE_PARENTS = (
     ("predicate", datacenter_series, DATACENTER_ARCHETYPE),
     # open-scan graduates (2026-10-03): the scan's guard set, see above
     ("predicate", scan_graduate_series, SCAN_GRADUATE_ARCHETYPE),
+    # NFL head-to-head (2026-10-12): a new KXNFL*H2H stat series, see
+    # NFL_H2H_ENABLE (archetype KXNFLPASSYDSH2H)
+    ("predicate", nfl_h2h_series, "KXNFLPASSYDSH2H"),
 )
 _family_override_warned: Set[str] = set()
 
@@ -7950,6 +7974,9 @@ _CONFIG_CODE_KNOBS = (
     "TWK_ENABLE", "TWK_SERIES", "TWK_EARLY_SERIES", "TWK_EARLY_CUTOFF_FROM_CLOSE_MIN",
     "TWK_BID_ONLY_SERIES", "TWK_MAX_POSITION", "TWK_REF_MULT_CAP", "TWK_EVENT_CAP",
     "TWK_DAILY_LOSS_LIMIT",
+    # NFL head-to-head pilot (2026-10-12)
+    "NFL_H2H_ENABLE", "NFL_H2H_START_BUFFER_MIN", "NFL_H2H_MAX_POSITION",
+    "NFL_H2H_REF_MULT_CAP", "NFL_H2H_EVENT_CAP", "NFL_H2H_DAILY_LOSS_LIMIT",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -11014,6 +11041,71 @@ def twk_bid_only(series: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
+# NFL HEAD-TO-HEAD PILOT (Jack 2026-10-12: "quote NFL H2H markets e.g.
+# KXNFLPASSYDSH2H, KXNFLRSHYDSH2H, KXNFLRECYDSH2H"). KXNFL<STAT>H2H-
+# <YYMMMDD><AWAY><HOME>-<PLAYER A><PLAYER B>-<PLAYER>: "<A> records more
+# <stat> than <B>", one market per player, listed ~2-6h before kickoff
+# (TB@DAL 10/08 at 22:15Z for 00:15Z; BUF@LAR 10/12 at 18:30Z), $100 per
+# market over a program that runs to the close (~$45/day). A tie resolves
+# 50/50, and "if one or both players do not enter the game ... all markets
+# will resolve to a fair price" (FOOTBALLH2HSTAT) -- the receptions / yards
+# ladders' rule, not the fantasy ladder's $0 -- so it quotes TO KICKOFF like
+# those (NFL_H2H_START_BUFFER_MIN 0; the cutoff from the ESPN schedule,
+# every order's expiry capped at it).
+# A PILOT: one settled event so far (10/08), no tape to score. THE RULES:
+# safe-join, the 20-lot ladder at x1 every hour (is_daily_series), no
+# deep-reference size, NFL_H2H_MAX_POSITION 100 per market and
+# NFL_H2H_EVENT_CAP 100 net per pair, the ladders' team-news hold
+# (nfl_h2h_gate: news on either team inside NFL_NEWS_HOLD_MIN, or a stale /
+# missing NFL read or roster, stands it aside -- fails closed), and a FAMILY
+# daily loss halt at -NFL_H2H_DAILY_LOSS_LIMIT ($40) on the pilots' halt
+# machinery (pilot_halt_key -> NFL_H2H_HALT_KEY). No injury rule: Jack
+# 2026-10-04 keeps the non-fantasy props quoting through designations, and a
+# player who sits resolves at a fair price. Every KXNFL*H2H series is in
+# (NFL_H2H_RE); a new one clones the archetype (FAMILY_OVERRIDE_PARENTS).
+# Kill switch IMM_NFL_H2H_ENABLE=0; positions ride.
+NFL_H2H_ENABLE = _NFL_H2H_LIVE
+NFL_H2H_ARCHETYPE = "KXNFLPASSYDSH2H"
+NFL_H2H_START_BUFFER_MIN = _env_int("IMM_NFL_H2H_START_BUFFER_MIN", 0)
+NFL_H2H_MAX_POSITION = _env_float("IMM_NFL_H2H_MAX_POSITION", 100)
+NFL_H2H_REF_MULT_CAP = _env_float("IMM_NFL_H2H_REF_MULT_CAP", 1.0)
+NFL_H2H_EVENT_CAP = _env_float("IMM_NFL_H2H_EVENT_CAP", 100)
+NFL_H2H_DAILY_LOSS_LIMIT = _env_float("IMM_NFL_H2H_DAILY_LOSS_LIMIT", 40)
+NFL_H2H_HALT_KEY = "NFL_H2H"
+
+if NFL_H2H_ENABLE:
+    SERIES_OVERRIDES[NFL_H2H_ARCHETYPE] = replace(
+        SERIES_OVERRIDES.get(NFL_H2H_ARCHETYPE) or SeriesOverride(),
+        start_buffer_min=NFL_H2H_START_BUFFER_MIN,
+        max_position=NFL_H2H_MAX_POSITION, safe_join=True)
+    for _s in ("KXNFLRSHYDSH2H", "KXNFLRECYDSH2H"):
+        SERIES_OVERRIDES[_s] = SERIES_OVERRIDES[NFL_H2H_ARCHETYPE]
+
+
+def pilot_halt_key(series: str) -> Optional[str]:
+    """The daily loss budget a pilot series spends: its own name for a Trump
+    weekly pilot (one budget per series), NFL_H2H_HALT_KEY for the whole NFL
+    head-to-head family, None for everything else."""
+    if twk_series(series):
+        return series
+    if nfl_h2h_series(series):
+        return NFL_H2H_HALT_KEY
+    return None
+
+
+def pilot_halt_limit(key: str) -> float:
+    return NFL_H2H_DAILY_LOSS_LIMIT if key == NFL_H2H_HALT_KEY else TWK_DAILY_LOSS_LIMIT
+
+
+def pilot_halt_keys() -> List[str]:
+    """Every live pilot budget, Trump weekly series first."""
+    keys = sorted(TWK_SERIES) if TWK_ENABLE else []
+    if NFL_H2H_ENABLE:
+        keys.append(NFL_H2H_HALT_KEY)
+    return keys
+
+
+# ----------------------------------------------------------------------------
 # YOUTUBE WEEKLY ARTIST-VIEWS PILOT (Jack 2026-10-06: "consider quoting
 # KATSEYE, Drake and The Weeknd with realtime data" -> "live now").
 # KXYTVIEWSW-<CODE><YYMMMDD>-<K>M: "Will <artist> have above K daily views at
@@ -11594,6 +11686,54 @@ def nfl_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
+def nfl_h2h_gate(ticker: str, now_ts: float) -> Tuple[str, dict]:
+    """('', {}) when an NFL head-to-head market may quote, else (why,
+    guard-skip inputs). The ladders' TEAM-NEWS HOLD for both teams of the
+    game (news inside NFL_NEWS_HOLD_MIN on either stands it aside), failing
+    CLOSED like nfl_gate: a missing or stale NFL read, a game segment that
+    does not parse, or a missing / stale ESPN roster read for either team.
+    No fair band and no injury rule (see NFL_H2H_ENABLE)."""
+    snap = _nfl_state.get("snap")
+    if snap is None:
+        return "no nfl read yet", {"reason": "no_read"}
+    age = now_ts - float(snap.get("ts") or 0.0)
+    if age > NFL_FAIR_TTL_MIN * 60:
+        return (f"nfl read is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)})
+    try:
+        import nfl_prop_fair as _npf
+        pair = _npf.split_event_teams(ticker)
+    except Exception as e:                       # noqa: BLE001
+        return (f"team parse failed: {type(e).__name__}",
+                {"reason": "teams", "err": str(e)[:120]})
+    if not pair:
+        return "teams not parsed from the ticker", {"reason": "teams"}
+    rosters = snap.get("rosters") or {}
+    teams = snap.get("teams") or {}
+    for team in pair:
+        # the snapshot's ESPN key, exactly as nfl_prop_fair.build_snapshot
+        nt = _npf.KALSHI_TO_NFLV.get(team, team)
+        key = _npf.NFLV_TO_ESPN.get(nt, nt.lower())
+        rts = rosters.get(key)
+        rage = now_ts - float(rts) if rts is not None else None
+        if rage is None or rage > NFL_ROSTER_TTL_MIN * 60:
+            return (f"ESPN roster for {team} is "
+                    f"{'missing' if rage is None else f'{rage / 60:.0f}m old'}",
+                    {"reason": "stale_roster", "team": team,
+                     "age_s": None if rage is None else round(rage)})
+        ctx = teams.get(key) or {}
+        nat = ctx.get("news_at")
+        if NFL_NEWS_HOLD_MIN > 0 and nat is not None:
+            nage = now_ts - float(nat)
+            # a stamp a little ahead of our clock still holds; far ahead is junk
+            if -600.0 <= nage < NFL_NEWS_HOLD_MIN * 60:
+                return (f"{team} news: {ctx.get('news')} {max(0.0, nage) / 60:.0f}m "
+                        f"ago (hold {NFL_NEWS_HOLD_MIN}m)",
+                        {"reason": "news_hold", "team": team,
+                         "news": ctx.get("news"), "age_s": round(nage)})
+    return "", {}
+
+
 def nfl_cap_quotes(quotes: List["Quote"], bid_cap: Optional[float],
                    ask_floor: Optional[float],
                    price_step: float = 0.01) -> List["Quote"]:
@@ -12010,6 +12150,11 @@ class EventStartResolver:
         lg = sports_ladder_league(series)
         if lg is not None:
             path = ESPN_LEAGUE_PATHS.get(lg)
+            return self._espn_game_start(path, event_ticker, 2) if path else None
+        # NFL head-to-head (2026-10-12): the same '<date><AWAY><HOME>' game
+        # segment, the NFL scoreboard
+        if nfl_h2h_series(series):
+            path = ESPN_LEAGUE_PATHS.get("NFL")
             return self._espn_game_start(path, event_ticker, 2) if path else None
         game = parse_mention_game(event_ticker)
         if game is None:
@@ -14745,8 +14890,9 @@ class BotState:
     ytw_pnl_baseline: Optional[float] = None   # NOT persisted
     ytw_pnl_carry: float = 0.0
     ytw_pnl_today_last: float = 0.0
-    # Trump weekly pilots' daily loss halt (2026-10-11, TWK_DAILY_LOSS_LIMIT),
-    # PER SERIES: series -> roll day / baseline / carry / last P&L today
+    # the pilots' daily loss halts (2026-10-11): one budget per pilot_halt_key
+    # -- each Trump weekly series, and the NFL head-to-head family as one
+    # (2026-10-12): key -> roll day / baseline / carry / last P&L today
     twk_halt_day: Dict[str, str] = field(default_factory=dict)
     twk_pnl_baseline: Dict[str, float] = field(default_factory=dict)   # NOT persisted
     twk_pnl_carry: Dict[str, float] = field(default_factory=dict)
@@ -18057,6 +18203,7 @@ class IncentiveMarketMaker:
             ytw_pilot_ticker(ticker) or \
             snow_monthly_series(series) or \
             cpi_pilot_active(ticker) or \
+            nfl_h2h_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -19943,13 +20090,14 @@ class IncentiveMarketMaker:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
 
-    def _twk_pnl(self, series: str) -> float:
-        """One Trump weekly pilot series' realized + mark-to-market over its
-        tickers in the bot's own P&L book; the cross-restart composition is
-        twk_pnl_carry[series]."""
+    def _twk_pnl(self, key: str) -> float:
+        """One pilot budget's realized + mark-to-market (pilot_halt_key: a
+        Trump weekly series, or the NFL head-to-head family) over its tickers
+        in the bot's own P&L book; the cross-restart composition is
+        twk_pnl_carry[key]."""
         total = 0.0
         for t in set(self.pnl.realized) | set(self.pnl.pos):
-            if series_of(t) != series:
+            if pilot_halt_key(series_of(t)) != key:
                 continue
             total += self.pnl.realized.get(t, 0.0)
             p = self.pnl.pos.get(t, 0.0)
@@ -22184,12 +22332,15 @@ class IncentiveMarketMaker:
             # TRUMP WEEKLY PILOT LOSS HALT (Jack 2026-10-11, see TWK_ENABLE):
             # this series' daily loss limit tripped this roll day -- stood
             # aside until the 5am-CT roll; positions ride.
-            if twk_series(meta.series) and self.state.twk_halt_day.get(
-                    meta.series) == _halt_day_key(now_utc):
+            # (the NFL head-to-head family rides the same machinery, as one
+            # budget: pilot_halt_key, 2026-10-12)
+            _pk = pilot_halt_key(meta.series)
+            if _pk is not None and self.state.twk_halt_day.get(
+                    _pk) == _halt_day_key(now_utc):
                 self.cancel_market_orders(t, resting)
                 twk_in = {"pnl_today": round(
-                              self.state.twk_pnl_today_last.get(meta.series, 0.0), 2),
-                          "limit": TWK_DAILY_LOSS_LIMIT}
+                              self.state.twk_pnl_today_last.get(_pk, 0.0), 2),
+                          "limit": pilot_halt_limit(_pk), "budget": _pk}
                 self._gskip(t, "twk_halt", lambda: twk_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
 
@@ -22264,6 +22415,17 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} nfl stand-aside {t}: {nf_why}")
                     self.cancel_market_orders(t, resting)
                     self._gskip(t, "nfl_fair", lambda: nf_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            # NFL HEAD-TO-HEAD PILOT (Jack 2026-10-12, see NFL_H2H_ENABLE): the
+            # ladders' team-news hold on both teams, failing closed.
+            if nfl_h2h_series(meta.series):
+                h2_why, h2_in = nfl_h2h_gate(t, now_ts)
+                if h2_why:
+                    if t not in self._nfl_stood:
+                        self._nfl_stood.add(t)
+                        log(f"{self.tag} nfl h2h stand-aside {t}: {h2_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "nfl_h2h", lambda: h2_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
             if t in self._nfl_stood:
                 self._nfl_stood.discard(t)
@@ -22919,30 +23081,35 @@ class IncentiveMarketMaker:
                     key="ytw_halt")
                 self._save_persist()
 
-        # TRUMP WEEKLY PILOTS DAILY LOSS HALT (Jack 2026-10-11, see
-        # TWK_ENABLE): the YouTube pilots' scheme, one budget PER SERIES.
-        if TWK_ENABLE and TWK_DAILY_LOSS_LIMIT > 0 and not fast_only:
+        # PILOT DAILY LOSS HALTS (Jack 2026-10-11, see TWK_ENABLE): the
+        # YouTube pilots' scheme, one budget per pilot_halt_key -- each Trump
+        # weekly series, and the NFL head-to-head family as one (2026-10-12).
+        if pilot_halt_keys() and not fast_only:
             _roll_day = _halt_day_key(now_utc)
-            for tw_s in sorted(TWK_SERIES):
+            for tw_s in pilot_halt_keys():
+                tw_limit = pilot_halt_limit(tw_s)
+                if tw_limit <= 0:
+                    continue
                 tw_total = self._twk_pnl(tw_s)
                 if tw_s not in self.state.twk_pnl_baseline:
                     self.state.twk_pnl_baseline[tw_s] = tw_total
                 tw_today = (tw_total - self.state.twk_pnl_baseline[tw_s]
                             + self.state.twk_pnl_carry.get(tw_s, 0.0))
                 self.state.twk_pnl_today_last[tw_s] = tw_today
-                if tw_today <= -TWK_DAILY_LOSS_LIMIT \
+                if tw_today <= -tw_limit \
                         and self.state.twk_halt_day.get(tw_s) != _roll_day:
                     self.state.twk_halt_day[tw_s] = _roll_day
                     halted_ids = {str(o.get("ticker", "")) for o in resting
-                                  if series_of(str(o.get("ticker", ""))) == tw_s}
+                                  if pilot_halt_key(series_of(str(o.get("ticker", "")))) == tw_s}
                     n_cx = 0
                     for t_h in sorted(halted_ids):
                         n_cx += self.cancel_market_orders(t_h, resting)
-                    desired = [q for q in desired if series_of(q.ticker) != tw_s]
+                    desired = [q for q in desired
+                               if pilot_halt_key(series_of(q.ticker)) != tw_s]
                     self.alerter.alert(
                         "twk_halt",
-                        f"Trump weekly pilot {tw_s} P&L today ${tw_today:+.2f} <= "
-                        f"-${TWK_DAILY_LOSS_LIMIT:.0f}; cancelled {n_cx} orders on "
+                        f"pilot {tw_s} P&L today ${tw_today:+.2f} <= "
+                        f"-${tw_limit:.0f}; cancelled {n_cx} orders on "
                         f"{len(halted_ids)} market(s) and stood {tw_s} aside "
                         f"until the {SUMMARY_HOUR_CT}am CT roll (positions ride)",
                         key=f"twk_halt:{tw_s}")
@@ -24885,6 +25052,16 @@ class IncentiveMarketMaker:
                           sorted(self.state.twk_halt_day.items()) if _d == _tw_today))
         else:
             log("twk pilot: OFF -- KXTRUTHSOCIAL / KXEOWEEK are not enrolled")
+        if NFL_H2H_ENABLE:
+            log(f"nfl h2h pilot: every KXNFL*H2H series, quoted to "
+                f"{'kickoff' if NFL_H2H_START_BUFFER_MIN <= 0 else f'kickoff - {NFL_H2H_START_BUFFER_MIN}m'}"
+                f", safe-join, x1 at every hour, {NFL_H2H_MAX_POSITION:g}/market and "
+                f"{NFL_H2H_EVENT_CAP:g}/pair net, team-news hold {NFL_NEWS_HOLD_MIN}m, "
+                f"family halt at -${NFL_H2H_DAILY_LOSS_LIMIT:g} P&L today"
+                + (" (HALTED this roll day)" if self.state.twk_halt_day.get(NFL_H2H_HALT_KEY)
+                   == _halt_day_key(datetime.now(timezone.utc)) else ""))
+        else:
+            log("nfl h2h pilot: OFF -- the KXNFL*H2H series are not enrolled")
         if TREASURY_GATE_ENABLE:
             log("treasury gate: "
                 + (f"ALL {len(TREASURY_GATED_SERIES)} Treasury series"

@@ -19439,6 +19439,147 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
             self.assertFalse(imm.series_bid_only("KXEOWEEK"))
 
 
+class TestNflH2HPilot(unittest.TestCase):
+    """The NFL head-to-head pilot (Jack 2026-10-12: "quote NFL H2H markets e.g.
+    KXNFLPASSYDSH2H, KXNFLRSHYDSH2H, KXNFLRECYDSH2H"): every KXNFL*H2H series,
+    quoted to kickoff off the NFL scoreboard, safe-join, x1 at every hour, 100
+    per market and per pair, the ladders' team-news hold, and one daily loss
+    halt for the whole family."""
+
+    KICKOFF = datetime(2067, 10, 6, 0, 15, tzinfo=timezone.utc)
+    REC = "KXNFLRECYDSH2H-67OCT05ATLNO-DLONDON5COLAVE12-DLONDON5"
+    RSH = "KXNFLRSHYDSH2H-67OCT05ATLNO-BROBINSON7AKAMARA41-BROBINSON7"
+
+    def setUp(self):
+        _clean_persist()
+        saved = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self.addCleanup(lambda: setattr(imm, "SERIES_HOUR_MULTS", saved))
+        snap = imm._nfl_state.get("snap")
+        self.addCleanup(lambda: imm._nfl_state.__setitem__("snap", snap))
+
+    def _kick(self):
+        return {"events": [{
+            "date": self.KICKOFF.strftime("%Y-%m-%dT%H:%MZ"),
+            "shortName": "ATL @ NO",
+            "status": {"type": {"name": "STATUS_SCHEDULED"}},
+            "competitions": [{"competitors": [
+                {"team": {"abbreviation": "NO", "location": "New Orleans"},
+                 "homeAway": "home"},
+                {"team": {"abbreviation": "ATL", "location": "Atlanta"},
+                 "homeAway": "away"}]}]}]}
+
+    @staticmethod
+    def _snap(now_ts, teams=None, rosters=("atl", "no"), age=0.0):
+        return {"ts": now_ts - age, "markets": {}, "teams": teams or {},
+                "rosters": {k: now_ts - age for k in rosters}}
+
+    def test_enrolled_with_the_pilot_rules(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for s in ("KXNFLPASSYDSH2H", "KXNFLRSHYDSH2H", "KXNFLRECYDSH2H",
+                      "KXNFLRECH2H"):                     # a future stat: the pattern
+                self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-26OCT12BUFLAR-AB1CD2-AB1"), s)
+            for s in ("KXLLMH2H", "KXNBAPTSH2H"):         # not NFL
+                self.assertFalse(IncentiveMarketMaker._allowed(f"{s}-26OCT12X-Y"), s)
+        for s in ("KXNFLPASSYDSH2H", "KXNFLRSHYDSH2H", "KXNFLRECYDSH2H"):
+            ov = imm.series_override(s)
+            self.assertEqual(ov.start_buffer_min, 0, s)           # to kickoff
+            self.assertTrue(ov.safe_join, s)
+            self.assertEqual(imm.series_max_position(s), 100.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT12BUFLAR-AB1CD2"), 100.0, s)
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertTrue(imm.schedule_resolved_series(s), s)
+            self.assertEqual(imm.pilot_halt_key(s), imm.NFL_H2H_HALT_KEY, s)
+            for when in (datetime(2026, 10, 13, 7, 0, tzinfo=timezone.utc),
+                         datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)):
+                self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+            with mock.patch.object(imm, "LADDER_MODE", "atref"):
+                self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
+        # a new KXNFL*H2H series clones the archetype on first sight
+        overrides = dict(imm.SERIES_OVERRIDES)
+        self.addCleanup(lambda: (imm.SERIES_OVERRIDES.clear(),
+                                 imm.SERIES_OVERRIDES.update(overrides)))
+        imm.ensure_family_override("KXNFLRECH2H")
+        self.assertEqual(imm.SERIES_OVERRIDES["KXNFLRECH2H"],
+                         imm.SERIES_OVERRIDES["KXNFLPASSYDSH2H"])
+        with mock.patch.object(imm, "NFL_H2H_ENABLE", False):    # kill switch
+            self.assertFalse(imm.nfl_h2h_series("KXNFLRECYDSH2H"))
+            self.assertIsNone(imm.pilot_halt_key("KXNFLRECYDSH2H"))
+
+    def test_kickoff_comes_from_the_nfl_scoreboard(self):
+        res = imm.EventStartResolver(http_get_json=lambda url: self._kick())
+        self.assertEqual(res.resolve("KXNFLRECYDSH2H", self.REC.rsplit("-", 1)[0]),
+                         self.KICKOFF)
+
+    def test_team_news_hold_fails_closed(self):
+        now = time.time()
+        g = imm.nfl_h2h_gate
+        imm._nfl_state["snap"] = None
+        self.assertEqual(g(self.REC, now)[1]["reason"], "no_read")
+        imm._nfl_state["snap"] = self._snap(now)
+        self.assertEqual(g(self.REC, now), ("", {}))
+        imm._nfl_state["snap"] = self._snap(now, teams={"no": {
+            "news": "Alvin Kamara RB Out", "news_at": now - 60}})
+        why, inp = g(self.REC, now)
+        self.assertEqual(inp["reason"], "news_hold")
+        self.assertIn("NO news", why)
+        imm._nfl_state["snap"] = self._snap(now, teams={"no": {
+            "news": "old", "news_at": now - (imm.NFL_NEWS_HOLD_MIN + 1) * 60}})
+        self.assertEqual(g(self.REC, now), ("", {}))
+        imm._nfl_state["snap"] = self._snap(now, rosters=("atl",))
+        self.assertEqual(g(self.REC, now)[1]["reason"], "stale_roster")
+        imm._nfl_state["snap"] = self._snap(now, age=(imm.NFL_FAIR_TTL_MIN + 1) * 60)
+        self.assertEqual(g(self.REC, now)[1]["reason"], "stale")
+        # Kalshi LAR is nflverse LA is ESPN lar (nfl_prop_fair's map)
+        imm._nfl_state["snap"] = self._snap(now, rosters=("buf", "lar"))
+        self.assertEqual(g("KXNFLRECYDSH2H-26OCT12BUFLAR-PNACUA12DADAMS17-PNACUA12", now),
+                         ("", {}))
+
+    def _bot(self):
+        client = FakeClient()
+        lv = [["0.36", "400"], ["0.37", "400"], ["0.38", "400"],
+              ["0.39", "400"], ["0.40", "300"]]
+        for t in (self.REC, self.RSH):
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                "close_time": "2067-10-09T00:15:00Z",
+                "yes_bid_dollars": "0.4000", "yes_ask_dollars": "0.6000",
+                "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+        kick = self._kick()
+        bot.resolver = imm.EventStartResolver(http_get_json=lambda url: kick)
+        return bot
+
+    @staticmethod
+    def _sides(bot, t):
+        return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+    def test_quotes_to_kickoff_and_one_halt_for_the_family(self):
+        imm._nfl_state["snap"] = self._snap(time.time() + 3600)   # fresh all test
+        bot = self._bot()
+        bot.run_cycle()
+        for t in (self.REC, self.RSH):
+            self.assertIn(t, bot.state.selected)
+            self.assertEqual(bot.state.selected[t].cutoff, self.KICKOFF)
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"})
+        # one market's loss trips the FAMILY budget: both series stand aside
+        bot.pnl.realized[self.REC] = -(imm.NFL_H2H_DAILY_LOSS_LIMIT + 1)
+        bot.run_cycle()
+        roll_day = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.twk_halt_day.get(imm.NFL_H2H_HALT_KEY), roll_day)
+        self.assertEqual(self._sides(bot, self.REC), set())
+        self.assertEqual(self._sides(bot, self.RSH), set())
+        self.assertIn("twk_halt", [c for c, _m in bot.alerter.today])
+        self.assertEqual(bot.state.halted_until, 0.0)            # whole book untouched
+
+
 class TestYouTubeWeeklyPilot(unittest.TestCase):
     """The YouTube weekly artist-views pilot (Jack 2026-10-06: "live now"):
     KXYTVIEWSW for KATSEYE / Drake / The Weeknd only, quoted against
@@ -21042,8 +21183,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # YouTube #2 pilot's family loss halt (2026-10-05) + the YouTube
         # weekly pilot's loss halt and fair gate (2026-10-06) + the book-read
         # REST budget's rest_off (2026-10-11) + the Trump weekly pilots' loss
-        # halt (2026-10-11)
-        self.assertEqual(len(conts), 41)
+        # halt (2026-10-11) + the NFL head-to-head team-news hold (2026-10-12)
+        self.assertEqual(len(conts), 42)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
