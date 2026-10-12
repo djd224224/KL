@@ -101,6 +101,9 @@ jobs:
         # KXHIGH_BASE_CONTRACTS_DAY / KXHIGH_BASE_CONTRACTS_EVENING.
         BASE_CONTRACTS_DAY: ${{ vars.KXHIGH_BASE_CONTRACTS_DAY || '25' }}
         BASE_CONTRACTS_EVENING: ${{ vars.KXHIGH_BASE_CONTRACTS_EVENING || '15' }}
+        # Per-market cash cap, $125 -> $175 (Jack 2026-10-12); repo variable
+        # KXHIGH_MARKET_CASH_CAP_DOLLARS overrides it without a deploy.
+        MARKET_CASH_CAP_DOLLARS: ${{ vars.KXHIGH_MARKET_CASH_CAP_DOLLARS || '175' }}
       run: |
         set -o pipefail
         python high_temp_trading.py 2>&1 | tee run.log

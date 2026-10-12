@@ -1991,8 +1991,10 @@ max_contracts1 = 100
 # first at typical 40–60c entries); it exists to stop the next June-style
 # oversize (28 markets >150ct = 64% of the June −$1,732). Default raised
 # 100 → 125 on 2026-08-09 (Jack) for extra headroom on tilted/night
-# ladders in 150-cap cities. Set <= 0 to disable.
-MARKET_CASH_CAP_DOLLARS = float(os.environ.get("MARKET_CASH_CAP_DOLLARS", "125"))
+# ladders in 150-cap cities. Raised 125 → 175 on 2026-10-12 (Jack), with
+# base 25 on mornings and 225-contract morning caps: at 225 contracts, $125
+# binds from ~56c NO, $175 only from ~78c. Set <= 0 to disable.
+MARKET_CASH_CAP_DOLLARS = float(os.environ.get("MARKET_CASH_CAP_DOLLARS", "175"))
 
 # NO entry-price band size tilt: order BAND_TILT_MULT× at any rung whose own
 # price lands in the band. Introduced 2026-08-09 at 61–80c, when 61c+ entries
@@ -2134,6 +2136,35 @@ CITY_MAX_CONTRACTS = {
 # cities scale in proportion.
 # =====================================================================
 MORNING_CAP_MULT = float(os.environ.get("MORNING_CAP_MULT", "1.0"))
+
+# Morning-only per-city cap bases (Jack 2026-10-12). These 100-cap cities
+# take the 150 base on the morning slot only, so at MORNING_CAP_MULT 1.5
+# their morning cap is 225 like the deep-book cities; evening and west_late
+# keep 100. Since the 1.5x cap went live (10/7) their morning ladders were
+# refused 20–34% of wanted contracts (other 100-cap cities 0–14%), and
+# their morning fills since July earned:
+#     Boston        +20.5c/ct      Oklahoma City  +14.7c/ct
+#     New Orleans    +6.8c/ct      Phoenix         +7.5c/ct
+# (New Orleans +14.0c, Phoenix +7.6c since September). Per-city c/ct is
+# only good to about ±5–7c on 30–70 days of fills.
+MORNING_CITY_MAX_CONTRACTS = {
+    "Boston": 150,
+    "Oklahoma City": 150,
+    "New Orleans": 150,
+    "Phoenix": 150,
+}
+
+
+def market_position_cap(city, run_slot):
+    """Contracts one market may hold plus rest: the city's cap; on the morning
+    slot, its morning base if listed, times MORNING_CAP_MULT. Keyed on the slot,
+    not on `variable`, so a west_late run keeps the base cap."""
+    cap = CITY_MAX_CONTRACTS.get(city, max_contracts)
+    if run_slot == "morning":
+        cap = max(cap, MORNING_CITY_MAX_CONTRACTS.get(city, 0))
+        if MORNING_CAP_MULT != 1.0:
+            cap = int(round(cap * MORNING_CAP_MULT))
+    return cap
 
 market_cutoff_probability = .2
 # print('hi')
@@ -2616,12 +2647,8 @@ for index, row in combined_table.iterrows():
         f"×{BAND_TILT_MULT:g} on rungs in {_band_tilt_lo}-{BAND_TILT_HI_CENTS}c; "
         f"increment={_inc_show}c)")
 
-  _cap = CITY_MAX_CONTRACTS.get(row['City'], max_contracts)
-  # Morning-only cap multiplier (inert at 1.0) — see MORNING_CAP_MULT above.
-  # Keyed on RUN_SLOT, not on `variable`, so a west_late run keeps the base
-  # cap rather than inheriting the morning's.
-  if RUN_SLOT == "morning" and MORNING_CAP_MULT != 1.0:
-    _cap = int(round(_cap * MORNING_CAP_MULT))
+  # City cap; morning slot: per-city morning base x MORNING_CAP_MULT (above).
+  _cap = market_position_cap(row['City'], RUN_SLOT)
   _headroom = _cap - float(row['position']) - float(row['resting_order_count'])
   print(f"    Position:   held={row['position']}, resting={row['resting_order_count']}, "
         f"cap={_cap} (headroom={_headroom:g})")

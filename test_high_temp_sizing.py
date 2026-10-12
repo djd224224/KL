@@ -73,5 +73,50 @@ class TestBaseContracts(unittest.TestCase):
                                     for t in self.TICKERS})
 
 
+def caps(env=None):
+    """Execute the per-market cap config + market_position_cap under `env`."""
+    with open(SRC, encoding="utf-8") as f:
+        src = f.read()
+    code = (_slice(src, "max_contracts = 100", "max_contracts = 100")
+            + _slice(src, "MARKET_CASH_CAP_DOLLARS = float(", "MARKET_CASH_CAP_DOLLARS = float(")
+            + _slice(src, "CITY_MAX_CONTRACTS = {", "}\n")
+            + _slice(src, "MORNING_CAP_MULT = float(", "            cap = int(round(cap * MORNING_CAP_MULT))")
+            + "    return cap\n")
+    g = {"os": os}
+    clean = {k: v for k, v in os.environ.items()
+             if k not in ("MORNING_CAP_MULT", "MARKET_CASH_CAP_DOLLARS")}
+    clean.update(env or {})
+    with mock.patch.dict(os.environ, clean, clear=True):
+        exec(code, g)
+    return g
+
+
+class TestCaps(unittest.TestCase):
+    """Live workflow: MORNING_CAP_MULT=1.5 (37e11bf)."""
+
+    def test_morning_overrides_and_base_caps(self):
+        cap = caps({"MORNING_CAP_MULT": "1.5"})["market_position_cap"]
+        for city in ("Boston", "Oklahoma City", "New Orleans", "Phoenix"):
+            self.assertEqual(cap(city, "morning"), 225, city)
+            self.assertEqual(cap(city, "evening"), 100, city)
+            self.assertEqual(cap(city, "west_late"), 100, city)     # Phoenix runs west_late: base cap
+        self.assertEqual(cap("New York City", "morning"), 225)
+        self.assertEqual(cap("New York City", "evening"), 150)
+        self.assertEqual(cap("Miami", "morning"), 150)              # not overridden
+        self.assertEqual(cap("Atlanta", "morning"), 150)
+        self.assertEqual(cap("San Diego", "morning"), 75)
+        self.assertEqual(cap("San Diego", "evening"), 50)
+
+    def test_reverting_the_morning_multiplier_still_reverts_the_scale(self):
+        cap = caps({"MORNING_CAP_MULT": "1.0"})["market_position_cap"]
+        self.assertEqual(cap("Boston", "morning"), 150)
+        self.assertEqual(cap("New York City", "morning"), 150)
+        self.assertEqual(cap("Boston", "evening"), 100)
+
+    def test_cash_cap_default_and_override(self):
+        self.assertEqual(caps()["MARKET_CASH_CAP_DOLLARS"], 175.0)
+        self.assertEqual(caps({"MARKET_CASH_CAP_DOLLARS": "125"})["MARKET_CASH_CAP_DOLLARS"], 125.0)
+
+
 if __name__ == "__main__":
     unittest.main()
