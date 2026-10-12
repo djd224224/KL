@@ -253,7 +253,15 @@ signed in as Jack).
   addM / derive / baseline). It ties to the page: 9:55 ET 10/03, net +$618,
   rewards $1,009, trading -$391, fills 69, 1,771 markets quoting, worst
   case -$14,882.
-- **Writes.** `imm_pocket.json` (~40 KB) and `imm_pocket.html` (the template
+- **Top events (2026-10-12).** Jack: "when I click into a family, I should
+  be able to see the top events contributing". An expanded family opens with
+  its 8 biggest events by |net| in the window. The rest are summed in one row,
+  so the list ties to the family row. Titles come from the dashboard's
+  `cache/event_titles.json`, then `cache/pocket_event_titles.json`. That file
+  is filled from Kalshi's public `/events/{ticker}`; a 404 falls back to the
+  parent event, then the series. It fetches at most 60 per build; `--no-fetch`
+  skips the fetching.
+- **Writes.** `imm_pocket.json` (~90 KB) and `imm_pocket.html` (the template
   with the data embedded), both beside the dashboard.
 - **Refresh: on request only (Jack 2026-10-10).** His words: "i dont want
   it to always run. but i want to be able to call on it to refresh at any

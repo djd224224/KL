@@ -23,6 +23,8 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +35,18 @@ WINS = ["today", "yesterday", "24h", "7d"]
 SUM_KEYS = ["rew", "pnl", "real", "du", "fills", "cts", "usd", "mk", "mk_n", "mk_cts", "rest",
             "cr", "cs", "fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts", "mt", "mt_cts"]
 CURVE_MAX = 144
+# Top events per family (Jack 2026-10-12: "when I click into a family, I
+# should be able to see the top events contributing"): the TOP_EVENTS
+# biggest by |net| in the window, the rest summed in one row so the list ties
+# to the family row.
+TOP_EVENTS = 8
+# Event titles: the dashboard's cache (events with a live program) first,
+# then this file's own cache, filled from Kalshi's public GET /events/{ticker}
+# at most TITLE_FETCH_BUDGET per build ("" = looked up, no title).
+DASH_TITLES = os.path.join(DASH_DIR, "cache", "event_titles.json")
+TITLE_CACHE = os.path.join(DASH_DIR, "cache", "pocket_event_titles.json")
+TITLE_FETCH_BUDGET = 60
+KALSHI_PUBLIC = "https://api.elections.kalshi.com/trade-api/v2"
 
 
 def num(v):
@@ -133,18 +147,106 @@ def thin(points, n=CURVE_MAX):
     return [points[round(i * step)] for i in range(n)]
 
 
-def build(D):
+def top_events(evs, quoting):
+    """(rows, rest) for one family in one window: the TOP_EVENTS events with
+    the biggest |net|, each {e, rew, pnl, net, fills, q}, and the remainder
+    summed as {n, rew, pnl, net, fills} (None when nothing is left over)."""
+    live = [(e, a) for e, a in evs.items()
+            if abs(a["rew"]) >= 0.005 or abs(a["pnl"]) >= 0.005 or a["fills"]]
+    live.sort(key=lambda x: (-abs(x[1]["rew"] + x[1]["pnl"]), -x[1]["rew"]))
+    rows = [r2({"e": e, "rew": a["rew"], "pnl": a["pnl"], "net": a["rew"] + a["pnl"],
+                "fills": int(a["fills"]), "q": quoting.get(e, 0)}) for e, a in live[:TOP_EVENTS]]
+    left = live[TOP_EVENTS:]
+    rest = None
+    if left:
+        rew = sum(a["rew"] for _e, a in left)
+        pnl = sum(a["pnl"] for _e, a in left)
+        rest = r2({"n": len(left), "rew": rew, "pnl": pnl, "net": rew + pnl,
+                   "fills": int(sum(a["fills"] for _e, a in left))})
+    return rows, rest
+
+
+def load_json_file(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def kalshi_title(e):
+    """Kalshi's title for a dashboard event key: GET /events/{e}; on a 404 the
+    parent event (a key like KXBRPRES2MOV-26OCT25-FBOL is one market's
+    ticker), then the series (series-level keys like KXBTCVSGOLD). '' when
+    none exists; raises on anything but a 404 (rate limit, network)."""
+    paths = [f"/events/{e}"]
+    if e.count("-") >= 2:
+        paths.append(f"/events/{e.rsplit('-', 1)[0]}")
+    paths.append(f"/series/{e.split('-')[0]}")
+    for p in paths:
+        try:
+            with urllib.request.urlopen(KALSHI_PUBLIC + p, timeout=5) as r:
+                d = json.load(r) or {}
+        except urllib.error.HTTPError as err:
+            if err.code == 404:
+                continue
+            raise
+        t = str((d.get("event") or d.get("series") or {}).get("title") or "").strip()
+        if t:
+            return t
+    return ""
+
+
+def event_titles(evs, fetch=True):
+    """{event: title} for `evs`: the dashboard's title cache, this file's own
+    cache, then Kalshi's public endpoints for up to TITLE_FETCH_BUDGET misses
+    (a rate-limited or failed read stops the fetching; the page shows the
+    ticker instead)."""
+    dash = load_json_file(DASH_TITLES, {})
+    cache = load_json_file(TITLE_CACHE, {})
+    out, miss = {}, []
+    for e in sorted(evs):
+        t = dash.get(e) or cache.get(e)
+        if t:
+            out[e] = t
+        elif e not in cache:
+            miss.append(e)
+    fetched = 0
+    if fetch:
+        for e in miss[:TITLE_FETCH_BUDGET]:
+            try:
+                cache[e] = kalshi_title(e)
+            except Exception:
+                break
+            fetched += 1
+            if cache[e]:
+                out[e] = cache[e]
+    if fetched:
+        try:
+            os.makedirs(os.path.dirname(TITLE_CACHE), exist_ok=True)
+            with open(TITLE_CACHE + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(TITLE_CACHE + ".tmp", TITLE_CACHE)
+        except OSError:
+            pass
+    return out
+
+
+def build(D, fetch_titles=True):
     gen = D["generated"]
     FD = fam_daily(D)
     w7 = D["windows"].get("7d") or {}
     days7 = max((w7.get("end", gen) - w7.get("start", gen - 7 * 86400)) / 86400, 1)
     events_now = D.get("events") or {}
 
-    # event -> quoting now (any market resting a quote)
+    # event -> quoting now (any market resting a quote); markets quoting per event
     ev_q = defaultdict(bool)
+    ev_nq = defaultdict(int)
     for m in D["markets"].values():
         if (m.get("cur") or {}).get("q"):
             ev_q[m["ev"]] = True
+            ev_nq[m["ev"]] += 1
+    shown = set()
 
     out = {"generated": gen, "generated_et": D.get("generated_et"), "windows": {}, "curves": {}}
     for wkey in WINS:
@@ -152,10 +254,17 @@ def build(D):
         if not w:
             continue
         fams, tot = {}, blank()
+        fam_ev = defaultdict(dict)        # family -> event -> window sums
         for m in D["markets"].values():
             f = fams.setdefault(m["fam"], blank())
             add_market(f, m, wkey)
             add_market(tot, m, wkey)
+            mw = (m.get("w") or {}).get(wkey)
+            if mw:
+                a = fam_ev[m["fam"]].setdefault(m["ev"], {"rew": 0.0, "pnl": 0.0, "fills": 0.0})
+                a["rew"] += num(mw.get("rew"))
+                a["pnl"] += num(mw.get("pnl"))
+                a["fills"] += num(mw.get("fills"))
         iso = eod_iso(D, wkey)
         wc_src = (D["days"].get(iso) or {}).get("wc") or {} if iso else None
         seen = set()
@@ -177,7 +286,9 @@ def build(D):
             if not (abs(f["rew"]) >= 0.005 or abs(f["pnl"]) >= 0.005 or f["fills"] or f["q1"] + f["q2"]
                     or f["npos"] or abs(f["wc"]) >= 0.005):
                 continue
-            rows.append(r2({
+            ev_rows, ev_rest = top_events(fam_ev.get(name, {}), ev_nq)
+            shown.update(r["e"] for r in ev_rows)
+            rows.append(dict(r2({
                 "name": name, "rew": f["rew"], "pnl": f["pnl"], "net": f["rew"] + f["pnl"], "nf": nf,
                 "cr": f["cr"], "cs": f["cs"], "fills": int(f["fills"]), "cts": f["cts"],
                 "mk": f["mk"], "mk_cts": f["mk_cts"], "fe": f["fe"], "fe_cts": f["fe_cts"],
@@ -186,7 +297,7 @@ def build(D):
                 "q": f["q1"] + f["q2"], "held": f["held"], "qev": qev.get(name, 0),
                 "est": f["estNow"], "exp": f["estNow"] + f["pnl7"] / days7, "npos": f["npos"], "u": f["u"],
                 "typ": typical(FD, name, w["start"]),
-            }))
+            }), ev=ev_rows, ev_rest=ev_rest))
         rows.sort(key=lambda r: r["net"])
         span_days = max((w["end"] - w["start"]) / 86400, 1 / 24)
         t = r2({k: tot[k] for k in SUM_KEYS + ["nset", "pset", "q2", "q1", "held", "restNow", "estNow",
@@ -220,6 +331,7 @@ def build(D):
                 best = q
         if best:
             out["ystd"] = {"rew": round(num(best[1]), 2), "pnl": round(num(best[2]), 2)}
+    out["titles"] = event_titles(shown, fetch=fetch_titles)
     return out
 
 
@@ -237,8 +349,10 @@ def main(argv=None):
     ap.add_argument("--out", default=DASH_DIR)
     ap.add_argument("--template", default=TEMPLATE, help="page template the data is embedded in")
     ap.add_argument("--summary", action="store_true", help="print each window's totals")
+    ap.add_argument("--no-fetch", action="store_true",
+                    help="no Kalshi reads for missing event titles (cached titles only)")
     a = ap.parse_args(argv)
-    data = build(load_model(a.dash))
+    data = build(load_model(a.dash), fetch_titles=not a.no_fetch)
     os.makedirs(a.out, exist_ok=True)
     jp = os.path.join(a.out, "imm_pocket.json")
     with open(jp + ".tmp", "w", encoding="utf-8") as f:

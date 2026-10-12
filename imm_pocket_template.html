@@ -142,6 +142,15 @@ tr.det td { background: var(--surface-2); padding: 10px 12px; text-align: left; 
 .dl div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dashed var(--grid); padding-bottom: 3px; }
 .dl dt { color: var(--ink-2); }
 .dl dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
+.evh { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+.evh span { font-weight: 400; color: var(--muted); }
+tr.det table.evt { font-size: 13px; margin-bottom: 14px; }
+tr.det .evt th { padding: 4px; }
+tr.det .evt td { background: transparent; padding: 7px 4px; text-align: right; white-space: nowrap; }
+tr.det .evt td:first-child { text-align: left; white-space: normal; padding-left: 0; }
+.evt .en { line-height: 1.3; }
+.evt .et { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; margin-top: 1px; }
+tr.det .evt tr.evmore td { color: var(--ink-2); border-bottom: 0; }
 .tag { font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 6px; }
 .tag.crit { background: var(--chip-crit); color: var(--down); }
 .tag.warn { background: var(--chip-warn); color: var(--warn-ink); }
@@ -376,6 +385,29 @@ function covCell(r) {
   const s = r.cov >= 10 ? "≥10×" : r.cov.toFixed(1) + "×";
   return r.cov < 1 ? '<span class="tag crit">' + s + "</span>" : r.cov < 2 ? '<span class="tag warn">' + s + "</span>" : s;
 }
+// The family's biggest events by |net| in the window, the rest summed so the
+// list ties to the family row (builds before 2026-10-12 carry no list).
+function topEvents(r, w) {
+  if (!r.ev) return "";
+  if (!r.ev.length) return '<p class="note" style="margin:0 0 12px">No event earned or traded in this window.</p>';
+  const na = w.pnl_na, T = M.titles || {};
+  // phone-first: the title takes the row, net on the right, the split under it
+  const split = (x) => "rewards " + fmtUSD(x.rew) + " · trading " + (na ? "n/a" : money(x.pnl));
+  const net = (x) => '<td class="net">' + (na ? "n/a" : money(x.net)) + "</td>";
+  let h = '<div class="evh">Top events <span>· biggest by net, either way</span></div>' +
+    '<table class="evt"><thead><tr><th scope="col">Event</th><th scope="col">Net</th></tr></thead><tbody>';
+  for (const e of r.ev) {
+    const sub = [split(e)];
+    if (e.fills) sub.push(fmtN(e.fills) + (e.fills === 1 ? " fill" : " fills"));
+    if (e.q) sub.push("quoting " + e.q + (e.q === 1 ? " mkt" : " mkts"));
+    h += '<tr><td><div class="en">' + esc(T[e.e] || e.e) + '</div><div class="et">' + sub.join(" · ") + "</div>" +
+      (T[e.e] ? '<div class="et">' + esc(e.e) + "</div>" : "") + "</td>" + net(e) + "</tr>";
+  }
+  const x = r.ev_rest;
+  if (x) h += '<tr class="evmore"><td><div class="en">' + fmtN(x.n) + " other event" + (x.n === 1 ? "" : "s") +
+    '</div><div class="et">' + split(x) + (x.fills ? " · " + fmtN(x.fills) + (x.fills === 1 ? " fill" : " fills") : "") + "</div></td>" + net(x) + "</tr>";
+  return h + "</tbody></table>";
+}
 function detail(r, w) {
   const na = w.pnl_na, yest = W === "yesterday";
   const items = [
@@ -394,13 +426,13 @@ function detail(r, w) {
     ["Typical full day (7d)", r.typ != null ? money(r.typ) : "—"],
   ];
   if (r.nset) items.push(["Settled in window", r.nset + " mkts · " + fmtUSD(r.pset, true)]);
-  return '<dl class="dl">' + items.map((x) => "<div><dt>" + x[0] + "</dt><dd>" + x[1] + "</dd></div>").join("") + "</dl>";
+  return topEvents(r, w) + '<dl class="dl">' + items.map((x) => "<div><dt>" + x[0] + "</dt><dd>" + x[1] + "</dd></div>").join("") + "</dl>";
 }
 function renderFams() {
   const w = M.windows[W], na = w.pnl_na;
   $("sortseg").innerHTML = Object.keys(SORTS).map((k) => '<button type="button" data-s="' + k + '" aria-pressed="' + (k === SORT) + '">' + SORTS[k][0] + "</button>").join("");
   const rows = w.fams.slice().sort(SORTS[SORT][1]);
-  $("famNote").textContent = "Trading P&L = the window's new fills + inventory carried in. Tap a family for the split, mark-outs and worst case.";
+  $("famNote").textContent = "Trading P&L = the window's new fills + inventory carried in. Tap a family for its top events, the split, mark-outs and worst case.";
   let h = '<thead><tr><th scope="col">Family</th><th scope="col">Net</th><th scope="col">Rewards</th><th scope="col">Trading</th></tr></thead><tbody>';
   for (const r of rows) {
     const open = OPEN.has(r.name);
