@@ -192,9 +192,11 @@ def setUpModule():
     # ...and the monthly snow one (2026-10-04)
     imm.SNOW_MONTHLY_FILE = os.path.join(tmp, "snow_monthly_fair.json")
     imm._snow_monthly_state.update(mtime=0.0, markets={}, events={})
-    # the 2026-10-11 fair-file gates (CPI pilot, ...)
+    # the 2026-10-11 fair-file gates (CPI pilot, weekend rain)
     imm.CPI_FAIR_FILE = os.path.join(tmp, "cpi_fair.json")
     imm._cpi_fair_state.update(mtime=0.0, markets={}, events={})
+    imm.RAIN_WKND_FILE = os.path.join(tmp, "rain_wknd_fair.json")
+    imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -12092,6 +12094,78 @@ class TestCpiFairGate(unittest.TestCase):
         self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
 
 
+class TestRainWkndGate(TestCpiFairGate):
+    """rain_wknd_fair.json -> load_rain_wknd / rain_wknd_gate -> KXRAINWKND
+    (Jack 2026-10-11: "build the KXRT, CPI, KXRAINWKND models"): the same
+    fair-file gate at RAIN_WKND_TOL_CENTS, failing closed. Fixture
+    KXRAINWKND-68OCT13-NYC (a Saturday far from the midnight cutoff); the CPI
+    class's bot and quote checks run on it."""
+
+    T = "KXRAINWKND-68OCT13-NYC"
+    EV = "KXRAINWKND-68OCT13"
+
+    def setUp(self):
+        super().setUp()
+        imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
+        try:
+            os.remove(imm.RAIN_WKND_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        super().tearDown()
+        imm.RAIN_WKND_CAP = True
+
+    def _write(self, p=0.5, age_secs=0):
+        at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        with open(imm.RAIN_WKND_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p,
+                                            "fetched_at": at.isoformat()}}}, f)
+        os.utime(imm.RAIN_WKND_FILE, (time.time(), time.time() + self._bump))
+        TestCpiFairGate._bump += 1
+        return imm.load_rain_wknd()
+
+    def test_wiring(self):
+        self.assertTrue(imm.rain_wknd_series("KXRAINWKND"))
+        for s in ("KXRAIN", "KXRAINNYCM", "KXRAINSBOS", "KXRAINWKNDX"):
+            self.assertFalse(imm.rain_wknd_series(s), s)
+        with mock.patch.object(imm, "RAIN_WKND_ENABLE", False):
+            self.assertIsNone(imm.fair_file_gate("KXRAINWKND", self.T, time.time(), 49, 51))
+        self.assertEqual(imm.fair_file_gate("KXRAINWKND", self.T, time.time(), 49, 51)[0],
+                         "rain-wknd")
+        for k in ("RAIN_WKND_ENABLE", "RAIN_WKND_TOL_CENTS", "RAIN_WKND_TTL_MIN",
+                  "RAIN_WKND_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        import imm_risk_controls
+        self.assertIn("rain_wknd", imm_risk_controls.GATE_GUARDS)
+
+    def test_gate_reasons_and_caps(self):
+        g = imm.rain_wknd_gate
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, inp["reason"], caps),
+                         ("no weekend rain fair for this market", "no_read", None))
+        self._write()
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(age_secs=imm.RAIN_WKND_TTL_MIN * 60 + 5)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "stale")
+        # bid 49 > 30 + 10: the bid is capped at 40, the ask keeps the touch
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["bid_bad"]), ("", (40, 20), True))
+        # ask 51 < 62 - 10: the ask is floored at 52
+        self._write(p=0.62)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((caps, inp["ask_bad"]), ((72, 52), True))
+        # inside the 10c band: no cap
+        self._write(p=0.40)
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        imm.RAIN_WKND_CAP = False
+        self._write(p=0.30)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+        self.assertIn("weekend rain fair 30c", why)
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -22600,13 +22674,13 @@ class TestSignedFairReads(unittest.TestCase):
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
         monthly rain, monthly snow, GasBuddy, daily rain (its city
-        discovery, 2026-10-09) and CPI pilot (2026-10-11) refreshers each
-        build a reader with
+        discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11)
+        refreshers each build a reader with
         fair_reader() and pass it to their module's write_fair_file (the
         threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 8)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 9)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -22614,7 +22688,8 @@ class TestSignedFairReads(unittest.TestCase):
                           ("rain_monthly_fair", "RAIN_MONTHLY_FILE"),
                           ("snow_monthly_fair", "SNOW_MONTHLY_FILE"),
                           ("gasbuddy_fair", "GB_FAIR_FILE"),
-                          ("cpi_fair", "CPI_FAIR_FILE")):
+                          ("cpi_fair", "CPI_FAIR_FILE"),
+                          ("rain_wknd_fair", "RAIN_WKND_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)

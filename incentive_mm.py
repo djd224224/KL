@@ -909,10 +909,11 @@ for _s in os.environ.get(
 # (_DEFAULT_WEATHER_SERIES), unlike the daily KXRAIN, which rides the
 # extra-allow file.
 # x2 on 10/07 with every rain family ("Bring all rain to x2"), back to x1
-# 2026-10-09 (Jack: "undouble weekend rain"). The weekend book is the one
-# rain family without a fair gate, and it is the one that loses: -$124 net
+# 2026-10-09 (Jack: "undouble weekend rain"). The weekend book was the one
+# rain family without a fair gate, and it is the one that lost: -$124 net
 # over the four weeks to 10/9 ($193 rewards vs -$317 trading), -$99 of it
-# in the three days since the x2. The other rain families stay x2.
+# in the three days since the x2. The other rain families stay x2. Its
+# gate since 2026-10-11: RAIN_WKND_ENABLE (the NBM's weekend probability).
 RAINWKND_SIZE_MULT = _env_float("IMM_RAINWKND_SIZE_MULT", 1.0)     # 2026-10-09
 for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
     if _s.strip():
@@ -7929,6 +7930,8 @@ _CONFIG_CODE_KNOBS = (
     "SNOW_MONTHLY_SIZE_MULT",
     # the CPI pilot's fair gate (2026-10-11); model knobs in cpi_fair.py
     "CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP",
+    # the weekend rain gate (2026-10-11); model knobs in rain_wknd_fair.py
+    "RAIN_WKND_ENABLE", "RAIN_WKND_TOL_CENTS", "RAIN_WKND_TTL_MIN", "RAIN_WKND_CAP",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -9933,6 +9936,48 @@ def cpi_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                             label="CPI", cap=CPI_FAIR_CAP)
 
 
+# WEEKEND RAIN FAIR GATE (Jack 2026-10-11, the build above; the family is
+# RAINWKND_SIZE_MULT's). rain_wknd_fair.py prices P(>= 0.01 in at the CLI
+# station on the Saturday or the Sunday, local standard time -- the rules)
+# from the National Blend's 12-hour PoPs (NBE station guidance, via the
+# IEM), recalibrated by lead time on 54 weekends x 24 stations: Brier 0.10
+# inside a day to 0.14 at 4-5.5 days against 0.21 for each city's base
+# rate, and 0.089 against the mid's 0.113 on the 7 settled Kalshi weekends
+# at the same hours (the mid overpriced YES in the 10-50c range). Our fills
+# 10c+ through the model lost $90 at 30 minutes (7 weekends), so a touch
+# more than RAIN_WKND_TOL_CENTS through it caps that side. Fails CLOSED
+# like the monthly rain gate: no fresh fair, no quote (the family lost
+# $124 net in the four weeks to 10/9 without one). The bot is out of each
+# weekend at 00:00 ET Saturday as before, and the move breaker stays.
+# IMM_RAIN_WKND_ENABLE=0 turns the gate off (the family quotes as before).
+RAIN_WKND_ENABLE = os.environ.get("IMM_RAIN_WKND_ENABLE", "1") == "1"
+RAIN_WKND_SERIES = frozenset(("KXRAINWKND",))
+RAIN_WKND_TOL_CENTS = _env_int("IMM_RAIN_WKND_TOL_CENTS", 10)
+RAIN_WKND_TTL_MIN = _env_int("IMM_RAIN_WKND_TTL_MIN", 240)
+RAIN_WKND_REFRESH_SECS = _env_int("IMM_RAIN_WKND_REFRESH_SECS", 1800)
+RAIN_WKND_CAP = os.environ.get("IMM_RAIN_WKND_CAP", "1") == "1"
+RAIN_WKND_FILE = os.environ.get(
+    "IMM_RAIN_WKND_FILE", os.path.join(STATUS_DIR, "rain_wknd_fair.json"))
+_rain_wknd_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+
+def rain_wknd_series(series: str) -> bool:
+    return RAIN_WKND_ENABLE and series in RAIN_WKND_SERIES
+
+
+def load_rain_wknd() -> int:
+    """Hot-reload RAIN_WKND_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(RAIN_WKND_FILE, _rain_wknd_state, "weekend rain")
+
+
+def rain_wknd_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                   ext_ask: Optional[float]
+                   ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    return simple_fair_gate(_rain_wknd_state, ticker, now_ts, ext_bid, ext_ask,
+                            tol=RAIN_WKND_TOL_CENTS, ttl_min=RAIN_WKND_TTL_MIN,
+                            label="weekend rain", cap=RAIN_WKND_CAP)
+
+
 def fair_file_gate(series: str, ticker: str, now_ts: float,
                    ext_bid: Optional[float], ext_ask: Optional[float]
                    ) -> Optional[Tuple[str, str, dict,
@@ -9941,6 +9986,8 @@ def fair_file_gate(series: str, ticker: str, now_ts: float,
     2026-10-11 fair-file gates, else None."""
     if cpi_fair_series(series):
         return ("cpi-fair",) + cpi_fair_gate(ticker, now_ts, ext_bid, ext_ask)
+    if rain_wknd_series(series):
+        return ("rain-wknd",) + rain_wknd_gate(ticker, now_ts, ext_bid, ext_ask)
     return None
 
 
@@ -18567,6 +18614,7 @@ class IncentiveMarketMaker:
         load_rain_monthly()
         load_snow_monthly()
         load_cpi_fair()
+        load_rain_wknd()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
             log(f"{self.tag} share-fair reloaded: {_sh_n} events, "
@@ -22280,7 +22328,7 @@ class IncentiveMarketMaker:
             # The snow monthlies (2026-10-04, SNOW_MONTHLY_ENABLE) take the
             # same gate on their own file, with the period markets' caps,
             # and so do the 2026-10-11 fair-file gates (fair_file_gate:
-            # the CPI pilot, ...) without the station checks.
+            # the CPI pilot, weekend rain) without the station checks.
             rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             rain_period = rain_period_gated(t)
             snow = snow_monthly_series(meta.series)
@@ -24597,6 +24645,40 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_cpi_fair_refresh, daemon=True,
                              name="cpi-fair").start()
+        if RAIN_WKND_ENABLE and not once:
+            # weekend rain fair refresher (2026-10-11): the CPI refresher's
+            # contract on rain_wknd_fair.py and RAIN_WKND_FILE -- Kalshi's
+            # open events hourly (cached in the file), every mapped
+            # station's latest NBE run each pass (a failed read reuses the
+            # file's copy while the run is young enough).
+            def _rain_wknd_refresh():
+                try:
+                    import rain_wknd_fair
+                except Exception as e:
+                    log(f"{self.tag} ! rain-wknd refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, RAIN_WKND_REFRESH_SECS)
+                    try:
+                        ok, miss = rain_wknd_fair.write_fair_file(
+                            RAIN_WKND_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} rain-wknd refresh: {ok} markets "
+                                f"with a fair"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! rain-wknd refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_rain_wknd_refresh, daemon=True,
+                             name="rain-wknd").start()
         if GB_FAIR_ENABLE and not once:
             # GasBuddy state-gas refresher (2026-09-27): the OpenRouter
             # refresher's contract -- every network call off the trading

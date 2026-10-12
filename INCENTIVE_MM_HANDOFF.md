@@ -10565,3 +10565,46 @@ The pilot's own guards are unchanged (weekday 08:25-11:05 ET blackout, out 7
 days before close; review 10/13). Kill switch IMM_CPI_FAIR_ENABLE=0.
 Tests: test_cpi_fair.py (9), TestCpiFairGate (3); the signed-reader wiring
 guard counts 8 refreshers.
+
+## 2026-10-12 ~01:45Z — Weekend rain fair gate (same request: KXRAINWKND)
+
+rain_wknd_fair.py (new) prices KXRAINWKND-<Sat>-<CITY>: YES iff the CLI
+station shows >= 0.01 in on the Saturday or the Sunday, each a climate day in
+LOCAL STANDARD time (rules: "on any day within <Sat> through <Sun> is
+strictly greater than 0 inches"; the station code is read from the rules,
+CLI<XXX> or "at CLL"). The named source (weather.com/kalshi) republishes the
+NWS CLI; its terms forbid automation and the NWS data reproduced all 156
+settled markets (Aug 22 - Oct 3), so the model reads no TWC page.
+- Input: the National Blend's NBE station guidance via the IEM
+  (mesonet.agron.iastate.edu/api/1/mos.json?station=K...&model=NBE): p12 =
+  P(>= 0.01 in) in the 12 hours ending at ftime. 24 cities mapped in
+  STATIONS (CLI code -> NBM id, LST offset); WPB's CLIDJT is KPBI there.
+- Model: over the periods overlapping [Sat 00:00, Mon 00:00) LST with
+  overlap f_i, L = sum f_i ln(1 - p_i), P_raw = max(max p over half-in
+  periods, 1 - exp(0.85 L)), then logistic recal by lead (window start -
+  (run + 3h)): <24h (-0.06, 1.12), 24-48 (0.01, 1.11), 48-72 (0.17, 1.12),
+  72-96 (0.24, 1.08), 96+ (0.20, 1.10). Fit on 54 weekends x 24 stations
+  (9/2025-10/2026, ACIS outcomes): Brier 0.100 (<1 day) .. 0.143 (4-5.5
+  days) vs 0.21 base rate; on the 7 settled Kalshi weekends at the same
+  hours model 0.089 vs mid 0.113 (the mid overprices YES at 10-50c). Our
+  fills 10c+ through the model: -$90.5 at 30 min.
+- No fair (gate stands aside) when: coverage < 3.9 half-days, lead > 144h
+  (fit ends 132h; Kalshi lists Monday 09:10Z, ~122-137h out), the run older
+  than 30h, an unmapped station, a rules window other than the ticker's
+  Sat-Sun, or the weekend started. A failed/short IEM read reuses the
+  file's copy of that station's run (subject to the 30h age).
+- 10/12 01:25Z probe on next weekend (10/17, the 10/12 00Z run; MIA/WPB
+  still 10/11 12Z): WPB 97, MIA 97, SEA 71, BOS 55, NYC 30, EWR 29, PHIL
+  25, TTN 23, PHX 18, DC 17 ... LAX/SFO 1. The 12Z->00Z run moved CHI 26->7
+  and ATL 12->5: five-day PoPs swing, hence a 10c band, not a price.
+
+incentive_mm: fair_file_gate's second family ("rain-wknd", guard
+"rain_wknd"): RAIN_WKND_TOL_CENTS 10 caps a side whose touch is more than 10c
+through the fair (RAIN_WKND_CAP; capped side rests only while it earns),
+fails CLOSED without a fair younger than RAIN_WKND_TTL_MIN 240. Refresher
+thread "rain-wknd" every 30 min (RAIN_WKND_REFRESH_SECS) writes
+RAIN_WKND_FILE (run-logs/incentive-mm/rain_wknd_fair.json); Kalshi events
+hourly (every pass while none is open). Unchanged: x1 size, out at 00:00 ET
+Saturday, the KXRAIN 7pm halving, the 15c/30m move breaker. Kill switch
+IMM_RAIN_WKND_ENABLE=0. Tests: test_rain_wknd_fair.py (11),
+TestRainWkndGate (3 + the CPI class's quote test); wiring guard counts 9.

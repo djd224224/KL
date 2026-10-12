@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Weekend-rain fair values for incentive_mm's KXRAINWKND gate.
+
+Jack 2026-10-11: "build the KXRT, CPI, KXRAINWKND models". KXRAINWKND-
+<YYMONDD>-<CITY> ("If the total precipitation at CLIATL in Atlanta on any day
+within August 22, 2026 through August 23, 2026 is strictly greater than 0
+inches, then the market resolves to Yes") names The Weather Company's
+weather.com/kalshi page as the source, which republishes the NWS climate
+report (CLI) unchanged -- and whose terms forbid automated use. The NWS data
+itself reproduces every settlement (research 2026-10-11: 156 of 156 settled
+markets, Aug 22 - Oct 3): YES iff the CLI station shows >= 0.01 in (a trace
+is 0) on the Saturday or the Sunday, each a climate day in LOCAL STANDARD
+time (01:00-01:00 local during daylight time).
+
+The bot quotes the family only before the weekend (out at 00:00 ET Saturday),
+so this is a forecast model, no observation layer: the National Blend of
+Models' station guidance (NBE, via the Iowa Environmental Mesonet's public
+api/1/mos.json -- the IEM the rain monthlies already read), its 12-hour
+probabilities of >= 0.01 in (p12, valid for the 12 hours ending at ftime).
+Over the 12-hour periods overlapping the window [Sat 00:00, Mon 00:00) local
+standard time, with overlap fractions f_i:
+    L     = sum f_i * ln(1 - p_i)
+    P_raw = max(max p_i over periods >= half inside, 1 - exp(W * L))
+    P     = logistic(a + b * logit(P_raw)), (a, b) by lead time
+W = 0.85 and the (a, b) table are the walk-free fit on 1,296 station-weekends
+(54 weekends, 9/2025-10/2026, ACIS outcomes, which equal settlement here):
+Brier 0.100 inside 24 hours to 0.143 at 4-5.5 days, against 0.21 for each
+city's base rate. On the 7 settled Kalshi weekends at the same hours: model
+0.089, the market mid 0.113 (the mid overprices YES in the 10-50c range).
+A period set covering less than 3.9 of the window's 4 half-days, a run older
+than NBE_MAX_AGE_HOURS, a lead beyond MAX_LEAD_HOURS (the fit stops at 5.5
+days; Kalshi lists each weekend Monday 09:10Z, ~122-137 hours out), an
+unmapped station, rules naming any window but the ticker's Saturday-Sunday,
+or a weekend already started gets no fair (the gate stands aside). An
+older run is not a worse input than its lead says: the lead is measured
+from the run, so a run the IEM is late with is read as the longer forecast
+it is.
+
+Writes RAIN_WKND_FILE for incentive_mm: markets {ticker: {p, event,
+fetched_at, ...}} (the loader's shape) plus per-event info.
+
+Standalone:  python rain_wknd_fair.py [--out path]
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Callable, Dict, List, Optional, Tuple
+
+import requests
+
+STATUS_DIR = os.environ.get(
+    "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
+SERIES = "KXRAINWKND"
+KALSHI_MARKETS_URL = os.environ.get(
+    "IMM_RAIN_WKND_MARKETS_URL", "https://api.elections.kalshi.com/trade-api/v2/markets")
+NBE_URL = os.environ.get("IMM_RAIN_WKND_NBE_URL",
+                         "https://mesonet.agron.iastate.edu/api/1/mos.json")
+# the rules' CLI code -> (NBM station, local standard time offset from UTC,
+# hours). Palm Beach's CLI is CLIDJT (the renamed airport); the NBM station
+# list still calls it KPBI. College Station's rules say "at CLL".
+STATIONS: Dict[str, Tuple[str, int]] = {
+    "ATL": ("KATL", 5), "BOS": ("KBOS", 5), "DCA": ("KDCA", 5), "EWR": ("KEWR", 5),
+    "MIA": ("KMIA", 5), "NYC": ("KNYC", 5), "PHL": ("KPHL", 5), "TTN": ("KTTN", 5),
+    "DJT": ("KPBI", 5),
+    "AUS": ("KAUS", 6), "ORD": ("KORD", 6), "CLL": ("KCLL", 6), "DFW": ("KDFW", 6),
+    "HOU": ("KHOU", 6), "MSP": ("KMSP", 6), "MSY": ("KMSY", 6), "OKC": ("KOKC", 6),
+    "SAT": ("KSAT", 6),
+    "DEN": ("KDEN", 7), "PHX": ("KPHX", 7),
+    "LAX": ("KLAX", 8), "LAS": ("KLAS", 8), "SEA": ("KSEA", 8), "SFO": ("KSFO", 8),
+}
+W = 0.85
+# (lead upper bound, hours) -> logistic recalibration (a, b)
+RECAL = ((24, -0.06, 1.12), (48, 0.01, 1.11), (72, 0.17, 1.12),
+         (96, 0.24, 1.08), (1e9, 0.20, 1.10))
+MIN_COVERAGE = 3.9           # of the window's 4 half-days
+MIN_PERIODS = 10             # a run read back with fewer rows is a failed read
+NBE_LAG_HOURS = 3.0          # a run is usable ~3h after its nominal time
+NBE_MAX_AGE_HOURS = float(os.environ.get("IMM_RAIN_WKND_NBE_MAX_AGE_HOURS", "30"))
+MAX_LEAD_HOURS = float(os.environ.get("IMM_RAIN_WKND_MAX_LEAD_HOURS", "144"))
+EVENTS_TTL_SECS = 3600
+HTTP_TIMEOUT = 30
+USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
+_MON = {m: i + 1 for i, m in enumerate(
+    "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split())}
+_CODE_RE = re.compile(r"\bat (?:CLI)?([A-Z]{3})\b")
+_SPAN_RE = re.compile(r"within ([A-Z][a-z]+ \d{1,2}, \d{4}) through ([A-Z][a-z]+ \d{1,2}, \d{4})")
+
+
+def _log(msg: str) -> None:
+    print(f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}Z [rain-wknd] {msg}",
+          flush=True)
+
+
+def station_code(rules: str) -> Optional[str]:
+    """'... at CLIDJT in West Palm Beach ...' -> 'DJT'; 'at CLL' -> 'CLL'."""
+    m = _CODE_RE.search(rules or "")
+    return m.group(1) if m else None
+
+
+def rules_span(rules: str) -> Optional[Tuple[date, date]]:
+    """'... on any day within October 10, 2026 through October 11, 2026 ...'
+    -> (date(2026, 10, 10), date(2026, 10, 11)), else None."""
+    m = _SPAN_RE.search(rules or "")
+    if not m:
+        return None
+    try:
+        a, b = (datetime.strptime(x, "%B %d, %Y").date() for x in m.groups())
+    except ValueError:
+        return None
+    return a, b
+
+
+def event_saturday(event_ticker: str) -> Optional[date]:
+    """'KXRAINWKND-26OCT10' -> date(2026, 10, 10), only if a Saturday."""
+    parts = (event_ticker or "").split("-")
+    if len(parts) < 2 or len(parts[1]) != 7:
+        return None
+    seg = parts[1]
+    try:
+        d = date(2000 + int(seg[:2]), _MON[seg[2:5]], int(seg[5:7]))
+    except (KeyError, ValueError):
+        return None
+    return d if d.weekday() == 5 else None
+
+
+def window(sat: date, lst_hours: int) -> Tuple[datetime, datetime]:
+    """[Sat 00:00, Mon 00:00) local standard time, in UTC."""
+    s = datetime(sat.year, sat.month, sat.day, tzinfo=timezone.utc) + timedelta(hours=lst_hours)
+    return s, s + timedelta(hours=48)
+
+
+def _logit(p: float) -> float:
+    p = min(max(p, 1e-3), 1 - 1e-3)
+    return math.log(p / (1 - p))
+
+
+def recalibrate(p: float, lead_h: float) -> float:
+    for hi, a, b in RECAL:
+        if lead_h < hi:
+            return 1.0 / (1.0 + math.exp(-(a + b * _logit(p))))
+    return p
+
+
+def weekend_p(periods: List[Tuple[datetime, float]], ws: datetime, we: datetime
+              ) -> Optional[Tuple[float, float]]:
+    """(P_raw, coverage) from [(ftime, p12 in 0..1)]: the 12-hour periods
+    ending at ftime, weighted by their overlap with [ws, we)."""
+    pers = []
+    for ft, p in periods:
+        ov = (min(ft, we) - max(ft - timedelta(hours=12), ws)).total_seconds() / 43200.0
+        if ov > 0:
+            pers.append((ov, p))
+    cov = sum(f for f, _ in pers)
+    if not pers or cov < MIN_COVERAGE:
+        return None
+    lp = sum(f * math.log(max(1.0 - min(p, 0.995), 1e-6)) for f, p in pers)
+    big = [p for f, p in pers if f >= 0.5]
+    pmax = max(big) if big else max(p for _, p in pers)
+    return max(pmax, 1.0 - math.exp(W * lp)), cov
+
+
+def market_fair(periods: List[Tuple[datetime, float]], runtime: datetime,
+                sat: date, lst_hours: int) -> Optional[dict]:
+    """{'p', 'p_raw', 'lead_h', 'coverage'} for one city's weekend, else None
+    (a weekend that has started, a lead past the fit, or periods that do not
+    cover it)."""
+    ws, we = window(sat, lst_hours)
+    lead = (ws - (runtime + timedelta(hours=NBE_LAG_HOURS))).total_seconds() / 3600.0
+    if lead < 0 or lead > MAX_LEAD_HOURS:
+        return None
+    r = weekend_p(periods, ws, we)
+    if r is None:
+        return None
+    p_raw, cov = r
+    p = min(max(recalibrate(p_raw, lead), 0.01), 0.99)
+    return {"p": round(p, 4), "p_raw": round(p_raw, 4), "lead_h": round(lead, 1),
+            "coverage": round(cov, 2)}
+
+
+def _ts(s: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "")).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def parse_nbe(payload: dict) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
+    """(latest runtime, [(ftime, p12)]) from IEM api/1/mos.json (NBE)."""
+    rows = (payload or {}).get("data") or []
+    runs: Dict[datetime, List[Tuple[datetime, float]]] = {}
+    for r in rows:
+        rt, ft, p = _ts(r.get("runtime") or ""), _ts(r.get("ftime") or ""), r.get("p12")
+        if rt is None or ft is None or p is None:
+            continue
+        try:
+            runs.setdefault(rt, []).append((ft, float(p) / 100.0))
+        except (TypeError, ValueError):
+            continue
+    if not runs:
+        return None, []
+    rt = max(runs)
+    return rt, sorted(runs[rt])
+
+
+def fetch_nbe(station: str) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
+    r = requests.get(NBE_URL, params={"station": station, "model": "NBE"},
+                     timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+    r.raise_for_status()
+    return parse_nbe(r.json())
+
+
+def _cached_nbe(c: dict) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
+    """The file's copy of a station's run ({'run', 'periods': [[ftime, p]]})."""
+    rt = _ts(str(c.get("run") or ""))
+    per = []
+    for row in c.get("periods") or []:
+        try:
+            ft, p = _ts(str(row[0])), float(row[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if ft is not None:
+            per.append((ft, p))
+    return (rt, sorted(per)) if rt is not None and per else (None, [])
+
+
+def station_run(sid: str, cache: dict, nbe_fn: Callable
+                ) -> Tuple[Tuple[Optional[datetime], list], Optional[str]]:
+    """(the newer of the station's fresh read and the file's copy, the read's
+    error or None). A run with fewer than MIN_PERIODS rows is a failed read."""
+    err = None
+    try:
+        rt, per = nbe_fn(sid)
+        if rt is None or len(per) < MIN_PERIODS:
+            raise ValueError(f"run {rt} with {len(per)} periods")
+    except Exception as ex:
+        rt, per = None, []
+        err = f"{type(ex).__name__}: {str(ex)[:80]}"
+    crt, cper = _cached_nbe(cache.get(sid) or {})
+    if crt is not None and (rt is None or crt > rt):
+        return (crt, cper), err
+    return (rt, per), err
+
+
+def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
+    if get_json is not None:
+        try:
+            js = get_json("/markets", dict(params))
+            if isinstance(js, dict):
+                return js
+        except Exception:
+            pass
+    for attempt in range(3):
+        r = requests.get(KALSHI_MARKETS_URL, params=params, timeout=HTTP_TIMEOUT,
+                         headers={"User-Agent": USER_AGENT})
+        if (r.status_code == 429 or r.status_code >= 500) and attempt < 2:
+            time.sleep(3 * (attempt + 1) ** 2)
+            continue
+        r.raise_for_status()
+        return r.json() or {}
+    return {}
+
+
+def fetch_events(get_json: Optional[Callable] = None) -> Dict[str, dict]:
+    """Open weekend events: event -> {'sat': ISO date, 'markets': {ticker:
+    {'code': CLI code or None, 'span': [first, last] ISO days from the
+    rules, or None}}}."""
+    out: Dict[str, dict] = {}
+    js = _signed_or_public(get_json, {"series_ticker": SERIES, "status": "open",
+                                      "limit": 200})
+    for m in js.get("markets") or []:
+        ev = str(m.get("event_ticker") or "")
+        t = str(m.get("ticker") or "")
+        sat = event_saturday(ev)
+        if not ev or not t or sat is None:
+            continue
+        rules = str(m.get("rules_primary") or "")
+        span = rules_span(rules)
+        e = out.setdefault(ev, {"sat": sat.isoformat(), "markets": {}})
+        e["markets"][t] = {"code": station_code(rules),
+                           "span": [d.isoformat() for d in span] if span else None}
+    return out
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_fair_file(path: str, now: Optional[datetime] = None,
+                    get_json: Optional[Callable] = None,
+                    events: Optional[Dict[str, dict]] = None,
+                    nbe_fn: Callable = fetch_nbe) -> Tuple[int, int]:
+    """Build and atomically write the weekend-rain fair file; returns
+    (markets with a fair, open markets without one). Kalshi's open events
+    are re-read hourly, and every pass while none is open (the Monday gap
+    between a weekend's close and the next listing); a failed read reuses
+    the cache. Each station's NBE run is read every pass, and a failed read
+    falls back to the file's copy of the run (still subject to
+    NBE_MAX_AGE_HOURS)."""
+    now = now or datetime.now(timezone.utc)
+    ts = now.timestamp()
+    old = _read_json(path)
+    nbe_cache = old.get("nbe") or {}
+    ev_cache = old.get("open_events") or {}
+    events_at = float(old.get("events_at") or 0.0)
+    if events is None:
+        if ev_cache and ts - events_at < EVENTS_TTL_SECS:
+            events = ev_cache
+        else:
+            try:
+                events = fetch_events(get_json)
+                events_at = ts
+            except Exception:
+                if not ev_cache:
+                    raise
+                events = ev_cache
+    stamp = now.isoformat()
+    nbe: Dict[str, Tuple[Optional[datetime], list]] = {}
+    failed: Dict[str, str] = {}
+    markets: Dict[str, dict] = {}
+    missing: Dict[str, str] = {}
+    for ev, e in events.items():
+        sat = date.fromisoformat(e["sat"])
+        for t, mk in sorted(e["markets"].items()):
+            code, span = mk.get("code"), mk.get("span")
+            st = STATIONS.get(code or "")
+            if st is None:
+                missing[t] = f"unmapped station {code}"
+                continue
+            if span and span != [sat.isoformat(), (sat + timedelta(days=1)).isoformat()]:
+                missing[t] = f"rules window {span[0]}..{span[1]} is not the weekend"
+                continue
+            sid, lst = st
+            if now >= window(sat, lst)[0]:
+                missing[t] = "weekend started"
+                continue
+            if sid not in nbe:
+                nbe[sid], err = station_run(sid, nbe_cache, nbe_fn)
+                if err:
+                    failed[sid] = err
+            rt, periods = nbe[sid]
+            if rt is None or (ts - rt.timestamp()) / 3600.0 > NBE_MAX_AGE_HOURS:
+                missing[t] = "no fresh NBE run"
+                continue
+            f = market_fair(periods, rt, sat, lst)
+            if f is None:
+                missing[t] = "lead past the fit or periods short of the weekend"
+                continue
+            markets[t] = dict(f, event=ev, station=sid, run=rt.isoformat(),
+                              fetched_at=stamp)
+    if failed:
+        sid, err = sorted(failed.items())[0]
+        _log(f"NBE read failed for {len(failed)} station(s) ({sid}: {err}); "
+             "the file's runs stand in while young enough")
+    runs = {sid: {"run": rt.isoformat(),
+                  "periods": [[ft.isoformat(), p] for ft, p in per]}
+            for sid, (rt, per) in sorted(nbe.items()) if rt is not None}
+    payload = {"generated_at": stamp, "events_at": events_at, "open_events": events,
+               "markets": markets, "missing": missing, "nbe": runs,
+               "model": {"w": W, "recal": RECAL, "min_coverage": MIN_COVERAGE,
+                         "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS}}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=1)
+    os.replace(tmp, path)
+    return len(markets), len(missing)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--out", default=os.path.join(STATUS_DIR, "rain_wknd_fair.json"))
+    args = ap.parse_args(argv)
+    ok, miss = write_fair_file(args.out)
+    d = _read_json(args.out)
+    _log(f"{ok} markets priced, {miss} without a fair")
+    for t, m in sorted((d.get("markets") or {}).items()):
+        _log(f"  {t}: {m['p'] * 100:.0f}c (raw {m['p_raw'] * 100:.0f}, lead "
+             f"{m['lead_h']:.0f}h, {m['station']})")
+    for t, why in sorted((d.get("missing") or {}).items()):
+        _log(f"  {t}: no fair -- {why}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
