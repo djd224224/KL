@@ -240,7 +240,8 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
     # the pool over the window Kalshi will pay -- mirrors refresh_universe
     dpd, pool_end = imm.trimmed_pool_rate(
         series, event_ticker, info["dollars_per_day"],
-        info.get("start"), info["end"])
+        info.get("start"), info["end"],
+        rules=m.get("rules_primary") or "", now=now_utc)
     meta = imm.MarketMeta(
         ticker=t, event_ticker=event_ticker, series=series,
         dollars_per_day=dpd, program_end=info["end"],

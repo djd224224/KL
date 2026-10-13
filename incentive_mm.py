@@ -7630,37 +7630,82 @@ CUTOFF_SCREEN_BUFFER_MIN = _env_int("IMM_CUTOFF_SCREEN_BUFFER", 5)
 # median 2.9h after the scheduled start across 112 mention events
 # (TRUMPMENTION 26OCT05 / 26OCT12: 2.4h / 2.6h). A program already ending
 # near its event (the 10/05-10/09 shape, earnings calls) is left alone.
-# IMM_TRIMMED_POOL=0 restores the listed window.
+# THE RULES' DATE WHEN NO START IS KNOWN (Jack 2026-10-13: "build it"): 13 of
+# the 16 stretched mention events since 9/06 had no start time (the September
+# WORLDNEWSMENTION shows, TRUMPMENTION 26SEP29 / 26OCT01, MAMDANIMENTION). The
+# newer markets' rules name the day ("... as part of Midterm Rally in Durant,
+# Oklahoma originally scheduled for Oct 1, 2026"), so such an event's pool is
+# spread to TRIMMED_POOL_DATE_END_H ET the morning after it (06:00: past an
+# Alaska or Hawaii evening and its close), and only while that is still ahead
+# -- a postponed event keeps its markets open past it. A "next NYC Mayor's
+# Office announcement" (MAMDANIMENTION) names no day and keeps the listed
+# window. The auto-enrolled Mentions-category singles (mention_auto_series:
+# KXDJTRALLY ... on the TRUMPMENTION contract) are covered beside the
+# MENTION-named series. IMM_TRIMMED_POOL=0 restores the listed window.
 TRIMMED_POOL = os.environ.get("IMM_TRIMMED_POOL", "1") == "1"
 TRIMMED_POOL_CLOSE_PAD_H = _env_float("IMM_TRIMMED_POOL_CLOSE_PAD_H", 3.0)
 TRIMMED_POOL_MIN_STRETCH_H = _env_float("IMM_TRIMMED_POOL_MIN_STRETCH_H", 24.0)
+TRIMMED_POOL_DATE_END_H = _env_float("IMM_TRIMMED_POOL_DATE_END_H", 6.0)
 TRIMMED_POOL_WORDS = tuple(
     w for w in os.environ.get("IMM_TRIMMED_POOL_WORDS", "MENTION").split(",") if w)
+_SCHEDULED_FOR_RE = re.compile(
+    r"originally scheduled for\s+([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", re.I)
+
+
+def rules_scheduled_date(rules: str) -> Optional[date]:
+    """The day in a market's "... originally scheduled for October 13, 2026"
+    (or "Oct 1, 2026") rules line, else None."""
+    m = _SCHEDULED_FOR_RE.search(rules or "")
+    if not m:
+        return None
+    month = _MONTHS.get(m.group(1)[:3].upper())
+    if month is None:
+        return None
+    try:
+        return date(int(m.group(3)), month, int(m.group(2)))
+    except ValueError:
+        return None
 
 
 def trimmed_pool_rate(series: str, event_ticker: str, dollars_per_day: float,
                       program_start: Optional[datetime],
-                      program_end: Optional[datetime]
+                      program_end: Optional[datetime],
+                      rules: str = "", now: Optional[datetime] = None
                       ) -> Tuple[float, Optional[datetime]]:
     """(pool $/day, effective window end) for a market's program: the listed
-    rate with None, or -- a TRIMMED_POOL_WORDS series whose event start is
-    known and whose program is listed far past it -- the same pool over
-    [program start, start + TRIMMED_POOL_CLOSE_PAD_H] and that end."""
+    rate with None, or -- a TRIMMED_POOL_WORDS / mention_auto_series series
+    whose program is listed far past its event -- the same pool over
+    [program start, start + TRIMMED_POOL_CLOSE_PAD_H] when the start is known,
+    else to TRIMMED_POOL_DATE_END_H ET after the rules' scheduled day, and
+    that end."""
     if not TRIMMED_POOL or dollars_per_day <= 0 \
             or program_start is None or program_end is None \
-            or not any(w in series for w in TRIMMED_POOL_WORDS):
+            or not (any(w in series for w in TRIMMED_POOL_WORDS)
+                    or mention_auto_series(series)):
         return dollars_per_day, None
     start = EVENT_START_OVERRIDES.get(event_ticker)
-    if start is None \
-            or program_end - start <= timedelta(hours=TRIMMED_POOL_MIN_STRETCH_H):
-        return dollars_per_day, None
-    eff_end = start + timedelta(hours=TRIMMED_POOL_CLOSE_PAD_H)
+    if start is not None:
+        if program_end - start <= timedelta(hours=TRIMMED_POOL_MIN_STRETCH_H):
+            return dollars_per_day, None
+        eff_end = start + timedelta(hours=TRIMMED_POOL_CLOSE_PAD_H)
+    else:
+        day = rules_scheduled_date(rules)
+        if day is None:
+            return dollars_per_day, None
+        eff_end = ET.localize(datetime(day.year, day.month, day.day)
+                              + timedelta(days=1, hours=TRIMMED_POOL_DATE_END_H)
+                              ).astimezone(timezone.utc)
+        if program_end - eff_end <= timedelta(hours=TRIMMED_POOL_MIN_STRETCH_H) \
+                or (now or datetime.now(timezone.utc)) >= eff_end:
+            return dollars_per_day, None
     if eff_end <= program_start:
         return dollars_per_day, None
     # fetch_programs' days floor (1h) holds for the trimmed window too
     eff_secs = max((eff_end - program_start).total_seconds(), 3600.0)
     listed_secs = max((program_end - program_start).total_seconds(), 3600.0)
     return dollars_per_day * listed_secs / eff_secs, eff_end
+
+
 # Series with a real schedule API. Their games can be POSTPONED past the
 # ticker date (NYDAL 7/16 -> makeup 7/20 while 18 program markets kept paying
 # $100/day each), so the cheap 24h ticker-date pre-drop must not apply — the
@@ -19867,14 +19912,17 @@ class IncentiveMarketMaker:
             # the pool over the window Kalshi will pay (trimmed_pool_rate)
             _dpd, _pool_end = trimmed_pool_rate(
                 series, event_ticker, info["dollars_per_day"],
-                info.get("start"), info["end"])
+                info.get("start"), info["end"],
+                rules=m.get("rules_primary") or "", now=now_utc)
             if _pool_end is not None \
                     and self._trimmed_pool_noted.get(event_ticker) != _pool_end:
                 self._trimmed_pool_noted[event_ticker] = _pool_end
+                _st = EVENT_START_OVERRIDES.get(event_ticker)
                 log(f"{self.tag} trimmed-window pool {event_ticker}: program "
-                    f"listed to {info['end']:%m-%d %H:%MZ}, event starts "
-                    f"{EVENT_START_OVERRIDES[event_ticker]:%m-%d %H:%MZ} -> "
-                    f"pool spread to {_pool_end:%m-%d %H:%MZ}: "
+                    f"listed to {info['end']:%m-%d %H:%MZ}, "
+                    + (f"event starts {_st:%m-%d %H:%MZ}" if _st is not None
+                       else "no start time, the rules' scheduled day")
+                    + f" -> pool spread to {_pool_end:%m-%d %H:%MZ}: "
                     f"${info['dollars_per_day']:.2f} -> ${_dpd:.2f}/day per market "
                     f"(Kalshi trims the period to the close and pays it whole)")
             meta = MarketMeta(

@@ -22189,6 +22189,71 @@ class TestTrimmedPoolRate(unittest.TestCase):
                 self.P0, self.P1)
         self.assertEqual((rate, end), (self.listed, None))
 
+    RULES = ("If \n Donald Trump says ICE as part of Midterm Rally in Wasilla, "
+             "Alaska originally scheduled for October 13, 2026\n, then the "
+             "market resolves to Yes.")
+    NOW = utc(2026, 10, 13, 12, 0)
+
+    def test_rules_scheduled_date(self):
+        self.assertEqual(imm.rules_scheduled_date(self.RULES), datetime(2026, 10, 13).date())
+        # 26OCT01 abbreviates the month
+        self.assertEqual(imm.rules_scheduled_date(
+            "Midterm Rally in Durant, Oklahoma originally scheduled for Oct 1, 2026 , then"),
+            datetime(2026, 10, 1).date())
+        self.assertEqual(imm.rules_scheduled_date(
+            "originally scheduled for Sept 29, 2026"), datetime(2026, 9, 29).date())
+        # MAMDANIMENTION / earnings name no day
+        self.assertIsNone(imm.rules_scheduled_date(
+            "Zohran Mamdani says Afford as part of next NYC Mayor's Office announcement"))
+        self.assertIsNone(imm.rules_scheduled_date("originally scheduled for Smarch 4, 2026"))
+        self.assertIsNone(imm.rules_scheduled_date(""))
+
+    def test_no_start_spreads_to_the_morning_after_the_rules_day(self):
+        # 13 of 16 stretched events since 9/06 had no start (26SEP29, 26OCT01,
+        # the September World News shows): the window runs to 06:00 ET 10/14
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True):
+            rate, end = imm.trimmed_pool_rate(
+                "KXTRUMPMENTION", self.EV, self.listed, self.P0, self.P1,
+                rules=self.RULES, now=self.NOW)
+        self.assertEqual(end, utc(2026, 10, 14, 10, 0))          # 06:00 EDT
+        self.assertAlmostEqual(rate, 100.0 / (31.25 / 24.0), places=2)
+
+    def test_rules_day_needs_a_stretched_listing_and_a_day_still_ahead(self):
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True):
+            # the 10/05-10/09 shape: program ends the rally night
+            self.assertEqual(imm.trimmed_pool_rate(
+                "KXTRUMPMENTION", self.EV, 31.0, self.P0, utc(2026, 10, 14, 2, 0),
+                rules=self.RULES, now=self.NOW), (31.0, None))
+            # past the morning after: a postponed event's markets stay open
+            self.assertEqual(imm.trimmed_pool_rate(
+                "KXTRUMPMENTION", self.EV, self.listed, self.P0, self.P1,
+                rules=self.RULES, now=utc(2026, 10, 14, 10, 0)), (self.listed, None))
+            # no day named (a "next announcement" market)
+            self.assertEqual(imm.trimmed_pool_rate(
+                "KXMAMDANIMENTION", "KXMAMDANIMENTION-26OCT14", self.listed,
+                self.P0, self.P1, rules="as part of next NYC Mayor's Office "
+                "announcement", now=self.NOW), (self.listed, None))
+
+    def test_a_known_start_beats_the_rules_day(self):
+        rate, end = imm.trimmed_pool_rate(
+            "KXTRUMPMENTION", self.EV, self.listed, self.P0, self.P1,
+            rules=self.RULES.replace("October 13", "October 20"), now=self.NOW)
+        self.assertEqual(end, self.START + timedelta(hours=imm.TRIMMED_POOL_CLOSE_PAD_H))
+
+    def test_mention_auto_members_are_covered(self):
+        # KXDJTRALLY-style singles on the TRUMPMENTION contract, enrolled by
+        # Kalshi category; a non-member of the same shape keeps the listing
+        ev = "KXDJTRALLY-26OCT13"
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True):
+            with mock.patch.object(imm, "MENTION_AUTO_SERIES", {"KXDJTRALLY"}):
+                rate, end = imm.trimmed_pool_rate(
+                    "KXDJTRALLY", ev, self.listed, self.P0, self.P1,
+                    rules=self.RULES, now=self.NOW)
+                self.assertEqual(end, utc(2026, 10, 14, 10, 0))
+            self.assertEqual(imm.trimmed_pool_rate(
+                "KXDJTRALLY", ev, self.listed, self.P0, self.P1,
+                rules=self.RULES, now=self.NOW), (self.listed, None))
+
     def test_start_before_the_program_or_kill_switch_leaves_it(self):
         with mock.patch.dict(imm.EVENT_START_OVERRIDES,
                              {self.EV: self.P0 - timedelta(days=2)}):
@@ -22241,6 +22306,35 @@ class TestTrimmedPoolRate(unittest.TestCase):
         self.assertTrue(pools)
         for v in pools:
             self.assertAlmostEqual(v, 700.0 / eff_days, places=1)
+
+    def test_refresh_reads_the_rules_day_without_a_start(self):
+        """End to end, no start time: the bulk-read market's own rules line
+        sets the window (06:00 ET the morning after its day)."""
+        sd = tempfile.mkdtemp(prefix="imm_tp_")
+        p = mock.patch.object(imm, "STATUS_DIR", sd)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(_clean_persist)
+        _clean_persist()
+        client = FakeClient()
+        prog = client.programs[0]
+        p0 = imm.parse_iso_utc(prog["start_date"])
+        day = (datetime.now(timezone.utc) + timedelta(days=2)).astimezone(imm.ET).date()
+        client.markets["KXGOOD-99DEC31-A"]["rules_primary"] = (
+            "If \n someone says Good as part of a broadcast originally scheduled "
+            f"for {day:%B} {day.day}, {day.year}\n, then the market resolves to Yes.")
+        with mock.patch.object(imm, "TRIMMED_POOL_WORDS", ("MENTION", "KXGOOD")), \
+                mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+        rows = [r for r in _sink_rows(sd, "selection_events")
+                if r["ticker"] == "KXGOOD-99DEC31-A"]
+        self.assertTrue(rows)
+        end = imm.ET.localize(datetime(day.year, day.month, day.day)
+                              + timedelta(days=1, hours=6)).astimezone(timezone.utc)
+        self.assertEqual(rows[-1]["pool_end_eff"], end.isoformat())
+        self.assertAlmostEqual(rows[-1]["dollars_per_day"],
+                               700.0 / ((end - p0).total_seconds() / 86400.0), places=1)
 
 
 # ----------------------------------------------------------------------------
