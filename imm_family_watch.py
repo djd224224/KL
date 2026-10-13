@@ -8,7 +8,9 @@ threshold". Three passes, each fail-safe on its own:
 
 1. ENROLL -- the overrides task's new-series pass
    (imm_earnings_overrides.enroll_new_series: Kalshi's Elections category,
-   mention families, the FT/APP consumer families, Carbon Arc sources). It ran
+   mention families, the FT/APP consumer families, Carbon Arc sources, the
+   NFL auto families, and since 2026-10-12 the award shows by Kalshi tag --
+   a new awards member stands down until pass 3 dates its event). It ran
    at 6:45am / 12:45pm / 4:45pm ET only, so an evening batch waited half a day
    (KXSTATELEG, 28 state chambers, lit 22:31Z 10/07).
 2. DATE -- an election-family event with no row that is a US race of the 2026

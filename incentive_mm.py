@@ -2692,6 +2692,10 @@ def event_top_n_for(series: str) -> int:
                 return _scaled_top_n(_n)
         elif not mention and series.startswith(_pat):
             return _scaled_top_n(_n)
+    if awards_auto_rules(series):
+        # an awards family member by Kalshi tag (2026-10-12): the award
+        # shows' 3 per event
+        return _scaled_top_n(AWARDS_AUTO_EVENT_TOP_N)
     return 0
 
 
@@ -4265,7 +4269,12 @@ _SPORTS_LADDER_PATTERN = (
 # nominations for ...", a count ladder) is another shape and stays out. The
 # family parent "KXGRAMMYNOM" (FAMILY_OVERRIDE_PARENTS) carries the awards
 # rule set: 3/event, safe-join, out 31 days before the Nov 16 nominations.
-_GRAMMY_NOM_PATTERN = r"KXGRAMMYNOM(?!COUNT)[A-Z0-9]+"
+# The bare KXGRAMMYNOM is in too (2026-10-12, Jack: "why isnt
+# KXGRAMMYNOM-69BPDGP, KXGRAMMYNOM-69BDPR quoting"): Kalshi's one-series
+# shape, the category IN the event segment (-69BPDGP, -69BDPR, -69BDP,
+# -69BPSP: 60 markets, $100-125 each, lit 10/13 00:08Z), which the "+" here left
+# out -- the KXCRITICSCHOICENOM lesson again.
+_GRAMMY_NOM_PATTERN = r"KXGRAMMYNOM(?!COUNT)[A-Z0-9]*"
 GRAMMY_NOM_FAMILY_RE = re.compile(_GRAMMY_NOM_PATTERN)
 ALLOW_SERIES_PATTERNS = tuple(
     re.compile(p.strip()) for p in os.environ.get(
@@ -4531,6 +4540,100 @@ def load_election_extra_series() -> int:
         log(f"[IMM] election extra series: {len(fresh)} enrolled "
             f"({changed} changed)")
     return changed
+
+
+# AWARDS BY KALSHI TAG (Jack 2026-10-12: "all awards families should be
+# looked at, just like election and nfl families"). The award shows were
+# allowed name by name -- KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY, KXVMA exact,
+# KXOSCAR and KXCRITICS by prefix, the Grammy nominees by pattern -- so a
+# show, category series or ticker shape Kalshi lists outside those names sat
+# dark until someone asked. On 10/12: KXGRAMMYNOM (the category in the event
+# segment, 60 markets) and KXGRAMAOTY ("Grammy winner: Album of the Year").
+# The new-series pass (imm_earnings_overrides.enroll_new_series, run by the
+# 30-min family watch and the overrides task) now reads each newly paying,
+# not-yet-allowed series' Kalshi /series record and writes the ones Kalshi
+# files under Entertainment with an award tag ("Awards", or the show's own:
+# "Oscars", "Grammys", "Emmys", "CMA Awards", "Nobel Prizes" ...) here,
+# {"series": [...]} -- less the mention books (their own family) and the
+# count / threshold ladders (another shape, like KXGRAMMYNOMCOUNT*; review).
+# Hot-reloaded by mtime at import and every universe refresh. A member takes
+# the awards rule set through FAMILY_OVERRIDE_PARENTS (AWARDS_AUTO_PARENT:
+# safe-join, out AWARDS_PRE_EVENT_DAYS before the first narrowing,
+# table-only dates) and AWARDS_AUTO_EVENT_TOP_N markets per event. It quotes
+# once a dated row covers its event -- a code row, its show's row by name
+# and edition (awards_family_default), or the row the family watch's
+# research writes (imm_rows.py award add ..., two sources) -- and is stood
+# down until then (fail closed, listed in config_gaps.json). A code family
+# that covers the series as well keeps its own rules. AWARDS_EXCLUDE (the
+# carve-outs, as ELECTION_EXCLUDE) and the blocklist always win;
+# IMM_AWARDS_AUTO=0 takes every member of the file out (positions ride).
+AWARDS_AUTO = os.environ.get("IMM_AWARDS_AUTO", "1") == "1"
+AWARDS_EXTRA_FILE = "awards_extra_series.json"          # in STATUS_DIR
+# the members' family parent: a key only, no such Kalshi series (the kind
+# "KXOSCAR" and "KXCRITICS" are); its override is registered beside
+# AWARDS_SERIES, where AWARDS_PRE_EVENT_DAYS is known
+AWARDS_AUTO_PARENT = "KXAWARDSAUTO"
+AWARDS_AUTO_EVENT_TOP_N = _env_int("IMM_AWARDS_AUTO_EVENT_TOP_N", 3)
+AWARDS_EXCLUDE = frozenset(
+    s.strip() for s in os.environ.get("IMM_AWARDS_EXCLUDE", "").split(",")
+    if s.strip())
+AWARDS_EXTRA_SERIES: Set[str] = set()
+_awards_extra_state = {"mtime": 0.0}
+
+
+def awards_extra_path() -> str:
+    return os.path.join(STATUS_DIR, AWARDS_EXTRA_FILE)
+
+
+def load_awards_extra_series() -> int:
+    """Re-read AWARDS_EXTRA_FILE when it changed; members changed, else 0.
+    Refuses blocklisted series, mention books and AWARDS_EXCLUDE."""
+    try:
+        mtime = os.path.getmtime(awards_extra_path())
+    except OSError:
+        return 0
+    if mtime == _awards_extra_state["mtime"]:
+        return 0
+    _awards_extra_state["mtime"] = mtime
+    try:
+        with open(awards_extra_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! awards extra file unreadable: {e}")
+        return 0
+    fresh: Set[str] = set()
+    for s in data.get("series") or []:
+        s = str(s).strip()
+        if not s or not s.startswith("KX") or "MENTION" in s or s in AWARDS_EXCLUDE:
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(s):
+            log(f"[IMM] ! refused blocklisted series in awards extra: {s}")
+            continue
+        fresh.add(s)
+    changed = len(fresh ^ AWARDS_EXTRA_SERIES)
+    AWARDS_EXTRA_SERIES.clear()
+    AWARDS_EXTRA_SERIES.update(fresh)
+    if changed:
+        log(f"[IMM] awards extra series: {len(fresh)} enrolled "
+            f"({changed} changed)")
+    return changed
+
+
+def awards_extra_series(series: str) -> bool:
+    """An awards family member by Kalshi tag (AWARDS_EXTRA_FILE); nothing
+    while IMM_AWARDS_AUTO=0."""
+    return AWARDS_AUTO and series in AWARDS_EXTRA_SERIES
+
+
+def awards_auto_rules(series: str) -> bool:
+    """A tag member running on the awards rule set: its override is the
+    family parent's (or not yet inherited, before the refresh's
+    ensure_family_override). A code family that covers the series as well
+    (KXCMA's undated guard set) keeps its own caps too."""
+    ov = SERIES_OVERRIDES.get(series)
+    return awards_extra_series(series) and (
+        ov is None or ov == SERIES_OVERRIDES.get(AWARDS_AUTO_PARENT))
 
 
 # NFL GAME / SEASON FAMILIES, AUTO-ENROLLED (Jack 2026-10-12: "can you
@@ -4896,6 +4999,8 @@ _DEFAULT_ECON_SERIES = (
 #     Kalshi closes these BEFORE it, so the bot is out by construction
 #     rather than by a cutoff rule -- occurrence_datetime sits AFTER
 #     expected_expiration here, so it never becomes a cutoff candidate.
+#     (No longer by 10/12: they close 2027-11-18, a year after the show, so
+#     the show's day is now a cutoff of its own -- CMA_PRE_EVENT_DAYS.)
 #   KXMC-<TITLE>-<SCORE>: "is the Metascore above N seven days after
 #     release", 156 markets over 12 titles (13 strikes each), $1,773/day.
 #     Close IS the resolution instant (10:00 ET on day seven), so the
@@ -7154,6 +7259,9 @@ FAMILY_OVERRIDE_PARENTS = (
     # NFL head-to-head (2026-10-12): a new KXNFL*H2H stat series, see
     # NFL_H2H_ENABLE (archetype KXNFLPASSYDSH2H)
     ("predicate", nfl_h2h_series, "KXNFLPASSYDSH2H"),
+    # awards by Kalshi tag (2026-10-12): the awards rule set, see
+    # AWARDS_EXTRA_FILE; last, so a family named above keeps its own
+    ("predicate", awards_extra_series, AWARDS_AUTO_PARENT),
 )
 _family_override_warned: Set[str] = set()
 
@@ -8079,6 +8187,8 @@ _CONFIG_CODE_KNOBS = (
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
     "AWARDS_TABLE_ONLY_SERIES",
+    # awards by Kalshi tag (2026-10-12)
+    "AWARDS_AUTO", "AWARDS_AUTO_EVENT_TOP_N", "AWARDS_EXCLUDE",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -9132,6 +9242,7 @@ load_family_verdicts()
 load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
 load_election_extra_series()   # Elections-category members (beside election_series)
 load_nfl_auto_series()         # NFL auto families (beside the election file)
+load_awards_extra_series()     # awards by Kalshi tag (beside the election file)
 
 
 # ----------------------------------------------------------------------------
@@ -12972,6 +13083,17 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #                       Recording Academy's May 12 2026 release, grammy.com)
 #                       for every category -> out Oct 16. Kalshi's
 #                       occurrence on AOTY / BRA (Nov 2 04:59Z) is not it.
+#                       Since 2026-10-12 also the ONE-series shape,
+#                       KXGRAMMYNOM-69<CATEGORY> (-69BPDGP ...; the
+#                       KXGRAMMYNOM*-69 glob needs a bare -69), re-checked
+#                       that day: notjustok.com ("The Recording Academy also
+#                       confirmed ... Monday, November 16, 2026") and
+#                       happymag.tv.
+#     KXGRAM*-69          the 69th's per-category WINNER series in Kalshi's
+#                       KXGRAM<CATEGORY> naming (KXGRAMAOTY-69, "Grammy
+#                       winner: Album of the Year", 2026-10-12): the same
+#                       Nov 16 nominations are their first narrowing. They
+#                       come in through the awards tag (AWARDS_EXTRA_FILE).
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
 AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
@@ -13027,6 +13149,9 @@ _CRITICS_NOM_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR",
                          "LIMACTR", "LIMSUPACTO", "LIMSUPACTR")
 _AWARDS_DATES_DEFAULT = (
     "KXGRAMMY-*69=2026-11-16,KXGRAMMYNOM*-69=2026-11-16,"
+    "KXGRAMMYNOM-69*=2026-11-16,KXGRAM*-69=2026-11-16,"
+    # the 60th CMA Awards themselves (CMA_PRE_EVENT_DAYS)
+    "KXCMA-*26=2026-11-18,"
     "KXNATBOOKAWARDS-*26=2026-10-06,"
     + "".join(f"KXCRITICS{_c}-27=2026-11-16," for _c in _CRITICS_CRAFTS_27)
     + "".join(f"KXCRITICS{_c}-27=2026-12-04," for _c in _CRITICS_OTHER_27)
@@ -13169,9 +13294,10 @@ def awards_family_default(event_ticker: str) -> Optional[datetime]:
     sibling (an early stand-down is the safe error) and quotes until then
     instead of not at all. A show with no rows (next year's) still gets
     None, as does a series outside AWARDS_TABLE_ONLY_SERIES. The same show
-    is the same edition, the event segment's trailing number, so a series
-    that carries the category IN the segment (KXCRITICSCHOICENOM-SONG27)
-    finds its siblings' rows (-CINE27, and the winners' -27) too."""
+    is the same edition, the event segment's trailing number (else its
+    leading one, _awards_edition), so a series that carries the category IN
+    the segment (KXCRITICSCHOICENOM-SONG27, KXGRAMMYNOM-69BPDGP) finds its
+    siblings' rows (-CINE27, and the winners' -27) too."""
     series, _, suffix = event_ticker.partition("-")
     fam = max((f for f in AWARDS_TABLE_ONLY_SERIES if series.startswith(f)),
               key=len, default=None)
@@ -13192,8 +13318,10 @@ def awards_family_default(event_ticker: str) -> Optional[datetime]:
 
 def _awards_edition(segment: str) -> Optional[str]:
     """The show's edition off an event segment or its glob: the trailing
-    number ('27' of '27' / 'ACTR27' / '*27', '69' of 'BAMP69'), else None."""
-    m = re.search(r"\d+$", segment)
+    number ('27' of '27' / 'ACTR27' / '*27', '69' of 'BAMP69'), else a
+    leading one ('69' of '69BPDGP' / '69*', the one-series KXGRAMMYNOM
+    shape, 2026-10-12), else None."""
+    m = re.search(r"\d+$", segment) or re.match(r"\d+", segment)
     return m.group(0) if m else None
 
 
@@ -13202,6 +13330,26 @@ for _s in AWARDS_SERIES:
         SERIES_OVERRIDES.get(_s) or SeriesOverride(),
         safe_join=True, pre_event_days=AWARDS_PRE_EVENT_DAYS,
         pre_event_dates_only=(_s in AWARDS_TABLE_ONLY_SERIES))
+# ...and the parent of the awards by Kalshi tag (AWARDS_EXTRA_FILE): the same
+# rule set, table-only, with nothing of any one show's (no size_mult)
+SERIES_OVERRIDES[AWARDS_AUTO_PARENT] = SeriesOverride(
+    safe_join=True, pre_event_days=AWARDS_PRE_EVENT_DAYS,
+    pre_event_dates_only=True)
+# CMA AWARDS OUT ON THE SHOW'S DAY (2026-10-12, the awards review Jack asked
+# for: "all awards families should be looked at"). KXCMA quotes on the
+# undated guard set by his 9/11 call, between the nominations and the show,
+# on the premise "Kalshi closes these BEFORE it" -- no longer true: every
+# KXCMA-<CATEGORY>26 market now closes 2027-11-18, a year after the 60th CMA
+# Awards (Wed Nov 18 2026, live on ABC 8-11pm ET; the CMA's announcement via
+# Holler and Lakes Media), and the bot logged cutoff None for them, so it
+# would have quoted through the live reveal. It keeps its guard set and now
+# quotes to 00:00 ET of the show's day: pre_event_days 0 on the hand row
+# (KXCMA-*26), else Kalshi's expected expiration (the show's morning, 15:00Z).
+# The award shows' month-before stand-down and 3/event cap are NOT applied
+# here -- that is Jack's call. IMM_CMA_PRE_EVENT_DAYS moves it.
+CMA_PRE_EVENT_DAYS = _env_float("IMM_CMA_PRE_EVENT_DAYS", 0.0)
+SERIES_OVERRIDES["KXCMA"] = replace(SERIES_OVERRIDES.get("KXCMA") or SeriesOverride(),
+                                    pre_event_days=CMA_PRE_EVENT_DAYS)
 # CRITICS CHOICE x2 (Jack 2026-10-07: "2x"). Six of the 8 TV categories
 # Kalshi listed late sat out on the floor: every in-band nominee shares its
 # $19.40/day with 26k-57k contracts already in the band, so the standard
@@ -18697,7 +18845,8 @@ class IncentiveMarketMaker:
         pattern families (prefixes; *CC/*ADS/*POS via ALLOW_FAMILY_SUFFIXES,
         source-verified -- family_series_allowed; the sports ladder /
         escalator regexes, ALLOW_SERIES_PATTERNS; the election family,
-        election_series) unless ALLOWLIST_ONLY is off."""
+        election_series; the awards by Kalshi tag, awards_extra_series)
+        unless ALLOWLIST_ONLY is off."""
         if cls._blocked(ticker):
             return False
         if not ALLOWLIST_ONLY:
@@ -18720,6 +18869,7 @@ class IncentiveMarketMaker:
             cpi_pilot_active(ticker) or \
             nfl_h2h_series(series) or \
             nfl_auto_entry(series) is not None or \
+            awards_extra_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -18961,6 +19111,7 @@ class IncentiveMarketMaker:
         load_finecon_extra_series()
         load_election_extra_series()
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
+        load_awards_extra_series()    # awards by Kalshi tag (2026-10-12)
         load_election_dates_extra()   # hot-reloaded rows (2026-10-07)
         load_awards_dates_extra()
         load_family_verdicts()

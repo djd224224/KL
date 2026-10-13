@@ -544,6 +544,7 @@ def enroll_new_series(client, dry: bool):
     load_extra_allow_series()
     imm.load_election_extra_series()
     imm.load_nfl_auto_series()
+    imm.load_awards_extra_series()
     seen: dict = {}
     cursor = None
     while True:
@@ -601,9 +602,11 @@ def enroll_new_series(client, dry: bool):
     # carve-outs (ELECTION_EXCLUDE). It still needs a verified ELECTION_DATES
     # row to quote -- the email's ACTION list names it. Same /series read as
     # the Carbon Arc check below, so still one read per novel series.
+    # Awards by Kalshi tag (2026-10-12), the same read: see AWARDS_KALSHI_TAGS.
     fin_additions = []
     elec_additions = []
     nfl_additions: dict = {}
+    awards_additions = []
     still_review = []
     for s, why, sample in review:
         se = series_meta(client, s)
@@ -620,6 +623,13 @@ def enroll_new_series(client, dry: bool):
                 enrolled.append((s, nfl_auto_why(entry), sample))
             else:
                 still_review.append((s, f"{why}; nfl auto: {why_not}", sample))
+        elif imm.AWARDS_AUTO and awards_tagged(se):
+            why_not = awards_auto_why_not(s, sample, se)
+            if not why_not:
+                awards_additions.append(s)
+                enrolled.append((s, AWARDS_ENROLL_WHY, sample))
+            else:
+                still_review.append((s, f"{why}; awards: {why_not}", sample))
         else:
             still_review.append((s, why, sample))
     review = still_review
@@ -641,10 +651,73 @@ def enroll_new_series(client, dry: bool):
             nfl_auto_notify(nfl_additions)
         except Exception as e:                       # noqa: BLE001
             log(f"! nfl auto enrollment email failed: {e!r}")
+    if awards_additions and not dry:
+        _merge_series_file(imm.awards_extra_path(), awards_additions)
+        log(f"awards-enrolled {len(awards_additions)} Kalshi award-tagged "
+            f"series -> {imm.awards_extra_path()}")
     return enrolled, review
 
 
 ELECTION_ENROLL_WHY = "Kalshi Elections category -> election family"
+
+# AWARDS BY KALSHI TAG (Jack 2026-10-12: "all awards families should be
+# looked at, just like election and nfl families"). A REVIEW series Kalshi
+# files under Entertainment with an award tag joins the awards family through
+# incentive_mm.AWARDS_EXTRA_FILE (hot-reloaded; the bot's rules are
+# documented there) -- unless it is not a nominee / winner binary. Kalshi's
+# tags are uneven: most award series carry "Awards", but the Critics Choice,
+# CMA, Oscar-nomination, Emmy, National Book Award and Nobel series carry only
+# the show's own tag, so both count, and so does any tag naming an award or a
+# prize ("The Game Awards", "Anime Awards"). Of the 569 award-tagged series in
+# Kalshi's catalog on 10/12, 548 are one market per nominee for one category;
+# the 21 others are what the checks below send to review: wins / nomination
+# COUNT ladders (KXOSCARCOUNT*, KXEMMYCOUNT, the 10/07 carve-out of
+# KXGRAMMYNOMCOUNT*), the mention book, viewership, and the news-driven
+# appearance books -- who attends (KXACTORAWARDSATTEND), who is on a cover
+# (KXROLLINGSTONECOVER) -- the adverse-selection class Jack took out of the
+# elections (KXPUBLICTALARICO, 10/08). The family still needs a dated row per
+# event to quote (the family watch researches it), so the alert for a member
+# research cannot date is the backstop for a shape these miss.
+AWARDS_ENROLL_WHY = "Kalshi awards tag -> awards family"
+AWARDS_KALSHI_TAGS = frozenset({
+    "Awards", "Oscars", "Grammys", "Latin Grammys", "Emmys", "Daytime Emmys",
+    "Sports Emmys", "Golden Globes", "Tonys", "BAFTA", "SAG", "Cannes", "VMA",
+    "ACMs", "AMAs", "Nobel Prizes"})
+_AWARD_TAG_RE = re.compile(r"\b(awards?|prizes?)\b", re.I)
+# (a cover STORY, not "Best Album Cover", a Grammy category)
+AWARDS_NOT_NOMINEE_TITLE_RE = re.compile(
+    r"\b(how many|number of|attend\w*|appear\w*|on the \w+ cover|cover of|"
+    r"viewer\w*|ratings?|red carpet|speech\w*|wear\w*|says?|said|mention\w*)\b",
+    re.I)
+_AWARDS_COUNT_RE = re.compile(r"COUNT(?!RY)")        # not KXVMACOUNTRY
+_AWARDS_STRIKE_RE = re.compile(r"T\d+(\.\d+)?")
+
+
+def awards_tagged(se: dict) -> bool:
+    """Kalshi files the series as an award: Entertainment, with an award tag
+    (AWARDS_KALSHI_TAGS, or any tag naming an award or a prize)."""
+    return se.get("category") == "Entertainment" and any(
+        t in AWARDS_KALSHI_TAGS or _AWARD_TAG_RE.search(str(t))
+        for t in (se.get("tags") or []))
+
+
+def awards_auto_why_not(series: str, sample: str, se: dict) -> str:
+    """'' when the awards family takes an award-tagged series, else why not:
+    a carve-out, the blocklist, a mention book, or not a nominee binary (a
+    COUNT series, a T<n> threshold strike, an appearance / viewership title)."""
+    if series in imm.AWARDS_EXCLUDE:
+        return "carved out (incentive_mm.AWARDS_EXCLUDE)"
+    if imm.series_pattern_blocked(series):
+        return "blocklisted (SERIES_BLOCK_PATTERNS)"
+    if "MENTION" in series:
+        return "a mention book (the mention family's rules)"
+    if _AWARDS_COUNT_RE.search(series) \
+            or _AWARDS_STRIKE_RE.fullmatch(sample.rsplit("-", 1)[-1]):
+        return "a count / threshold ladder, not a nominee binary"
+    title = str(se.get("title") or "")
+    if AWARDS_NOT_NOMINEE_TITLE_RE.search(title):
+        return f"not a nominee binary ({title!r})"
+    return ""
 
 # NFL AUTO FAMILIES (Jack 2026-10-12: "can you automatically quote new NFL
 # game families, like how new election families are automatically quoted?";

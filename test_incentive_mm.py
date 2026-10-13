@@ -200,6 +200,10 @@ def setUpModule():
     imm.ELECTION_DATES_EXTRA[:] = []
     imm.AWARDS_DATES_EXTRA[:] = []
     imm._rows_extra_state.clear()
+    # ...and the awards by Kalshi tag (awards_extra_series.json, 2026-10-12),
+    # the same way: its path follows STATUS_DIR, so only memory is reset
+    imm.AWARDS_EXTRA_SERIES.clear()
+    imm._awards_extra_state["mtime"] = 0.0
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
@@ -2343,13 +2347,38 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         # instant to anchor to. If a later change gives one of them a real
         # occurrence-based cutoff this test should be updated, not deleted.
         for ev in ("KXMLBPLAYOFFS-26", "KXMLBSEASONGAMES-27",
-                   "KXVENUEPERFORM-REDROCKS28JAN01",
-                   "KXCMA-NAOTY26", "KXMC-MARV"):
+                   "KXVENUEPERFORM-REDROCKS28JAN01", "KXMC-MARV"):
             self.assertIsNone(imm.parse_event_date(ev), ev)
             self.assertIsNone(
                 imm.apply_series_cutoff_adjustments(
                     imm.series_of(ev + "-X"), ev,
                     imm.trade_cutoff_utc(ev, None, None), None), ev)
+
+    def test_the_cma_awards_stand_down_on_the_shows_day(self):
+        # Updated 2026-10-12: KXCMA had no cutoff on the premise that Kalshi
+        # closes it before the show; its markets now close 2027-11-18, a
+        # year after the 60th CMA Awards (Wed Nov 18 2026, 8pm ET), so the
+        # show's day is its cutoff -- the hand row, else Kalshi's expected
+        # expiration (the show's morning). Its guard set is otherwise kept.
+        cma = {"close_time": "2027-11-18T15:00:00Z",
+               "expected_expiration_time": "2026-11-18T15:00:00Z",
+               "occurrence_datetime": "2026-11-19T04:59:00Z"}
+        self.assertIsNone(imm.trade_cutoff_utc(
+            "KXCMA-NAOTY26", utc(2026, 11, 19, 4, 59), utc(2026, 11, 18, 15, 0)))
+        for ev in ("KXCMA-NAOTY26", "KXCMA-SOTY26"):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXCMA", ev, None, close_time=utc(2027, 11, 18, 15, 0), market=cma),
+                utc(2026, 11, 18, 5, 0), ev)                  # 00:00 ET
+        # a year with no row: Kalshi's expiration, the show's morning
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXCMA", "KXCMA-NAOTY27", None, close_time=None,
+            market=dict(cma, expected_expiration_time="2027-11-17T15:00:00Z",
+                        occurrence_datetime="2027-11-18T04:59:00Z")),
+            utc(2027, 11, 17, 15, 0))
+        ov = imm.series_override("KXCMA")
+        self.assertTrue(ov.safe_join)
+        self.assertFalse(ov.pre_event_dates_only)
+        self.assertEqual(imm.event_top_n_for("KXCMA"), 0)              # no cap
 
     def test_no_event_window_standdown_does_not_reach_them(self):
         # That screen is scoped to the MENTION suffix; a bare cutoff-less
@@ -25072,6 +25101,195 @@ class TestWSNarrowGate(unittest.TestCase):
         self.assertAlmostEqual(imm._ws_gap_c("ask", 51.0, None, 0.62), 11.0)
         self.assertIsNone(imm._ws_gap_c("bid", 49.0, None, 0.51))
         self.assertIsNone(imm._ws_gap_c("ask", 51.0, 0.49, None))
+
+
+class TestAwardsByKalshiTag(unittest.TestCase):
+    """Jack 2026-10-12: "why isnt KXGRAMMYNOM-69BPDGP, KXGRAMMYNOM-69BDPR
+    quoting", then "all awards families should be looked at, just like
+    election and nfl families"."""
+
+    # market objects as Kalshi served them on 10/12
+    GRN = {"occurrence_datetime": "2026-11-02T04:59:00Z",
+           "expected_expiration_time": "2027-11-01T15:00:00Z",
+           "close_time": "2027-11-01T15:00:00Z"}
+    AOTY = {"occurrence_datetime": "2027-02-08T04:59:00Z",
+            "expected_expiration_time": "2027-02-08T04:59:00Z",
+            "close_time": "2027-12-31T15:00:00Z"}
+    EVS = ("KXGRAMMYNOM-69BPDGP", "KXGRAMMYNOM-69BDPR", "KXGRAMMYNOM-70BPDGP",
+           "KXGRAMAOTY-69", "KXTONYPLAY-27")
+
+    def setUp(self):
+        overrides = dict(imm.SERIES_OVERRIDES)
+
+        def reset():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+            imm.AWARDS_EXTRA_SERIES.clear()
+            imm._awards_extra_state["mtime"] = 0.0
+            try:
+                os.remove(imm.awards_extra_path())
+            except OSError:
+                pass
+            for ev in self.EVS:
+                imm._release_guard_warned.discard(ev)
+                imm._config_gaps.pop(ev, None)
+        reset()
+        self.addCleanup(reset)
+
+    def _write(self, series):
+        with open(imm.awards_extra_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+        imm._awards_extra_state["mtime"] = 0.0
+        return imm.load_awards_extra_series()
+
+    def test_the_one_series_grammy_nominee_shape_is_admitted_and_dated(self):
+        # KXGRAMMYNOM-69<CATEGORY>: the category in the event segment, which
+        # the KXGRAMMYNOM<CATEGORY> pattern ("+") and the KXGRAMMYNOM*-69 row
+        # both missed -- 60 markets dark from 10/13 00:08Z
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t in ("KXGRAMMYNOM-69BPDGP-ANI", "KXGRAMMYNOM-69BDPR-SWA"):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
+            # the nomination count ladders still are not
+            self.assertFalse(IncentiveMarketMaker._allowed("KXGRAMMYNOMCOUNTKL-69-T10"))
+        self.assertEqual(imm.event_top_n_for("KXGRAMMYNOM"), 3)
+        ov = imm.series_override("KXGRAMMYNOM")
+        self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
+                         (31.0, True, True))
+        for ev in ("KXGRAMMYNOM-69BPDGP", "KXGRAMMYNOM-69BDPR"):
+            # nominations Mon Nov 16 -> out Oct 16, not Kalshi's Nov 2
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGRAMMYNOM", ev, None, close_time=None, market=self.GRN),
+                utc(2026, 10, 16, 5, 0), ev)
+            self.assertNotIn(ev, imm._config_gaps, ev)
+        # the next edition has no row: stood down, a gap for the research
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGRAMMYNOM", "KXGRAMMYNOM-70BPDGP", None, close_time=None,
+            market=self.GRN), imm.RELEASE_GUARD_UNKNOWN)
+        self.assertIn("no usable date",
+                      imm._config_gaps["KXGRAMMYNOM-70BPDGP"]["msg"])
+
+    def test_the_edition_is_read_from_either_end_of_the_segment(self):
+        self.assertEqual(imm._awards_edition("69BPDGP"), "69")
+        self.assertEqual(imm._awards_edition("69*"), "69")
+        self.assertEqual(imm._awards_edition("SOTY26"), "26")     # trailing first
+        self.assertEqual(imm._awards_edition("BAMP69"), "69")
+        self.assertIsNone(imm._awards_edition("BPDGP"))
+        # so a category the rows do not name takes its show's earliest row
+        with mock.patch.object(imm, "AWARDS_EVENT_DATES",
+                               imm._parse_awards_dates("KXGRAMMYNOM*-69=2026-11-16")):
+            self.assertEqual(imm.awards_family_default("KXGRAMMYNOM-69BPDGP"),
+                             utc(2026, 11, 16, 5, 0))
+            self.assertIsNone(imm.awards_family_default("KXGRAMMYNOM-70BPDGP"))
+
+    def test_the_tag_file_joins_the_awards_family(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(IncentiveMarketMaker._allowed("KXGRAMAOTY-69-LIF"))
+        self.assertEqual(self._write(["KXGRAMAOTY", "KXTONYPLAY", "KXOSCARAWARDACTR",
+                                      "KXFOOAWARDSMENTION", "notaseries"]), 2)
+        self.assertEqual(imm.AWARDS_EXTRA_SERIES, {"KXGRAMAOTY", "KXTONYPLAY"})
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(IncentiveMarketMaker._allowed("KXGRAMAOTY-69-LIF"))
+            # the SAG series under the Oscar prefix stays blocked
+            self.assertFalse(IncentiveMarketMaker._allowed("KXOSCARAWARDACTR-27-X"))
+        for s in ("KXGRAMAOTY", "KXTONYPLAY"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+            self.assertEqual(imm.event_top_n_for(s), 3, s)      # before inheriting
+            imm.ensure_family_override(s)
+            ov = imm.series_override(s)
+            self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join,
+                              ov.size_mult), (31.0, True, True, None), s)
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        # KXGRAMAOTY-69 (the 69th's Album of the Year winner): the Nov 16
+        # nominations are its first narrowing -> out Oct 16, not at the show
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGRAMAOTY", "KXGRAMAOTY-69", None, close_time=None, market=self.AOTY),
+            utc(2026, 10, 16, 5, 0))
+        self.assertNotIn("KXGRAMAOTY-69", imm._config_gaps)
+        # a show with no row stands down -- Kalshi's dates are not used --
+        # and is a gap for the family watch's research
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTONYPLAY", "KXTONYPLAY-27", None, close_time=None, market=self.AOTY),
+            imm.RELEASE_GUARD_UNKNOWN)
+        self.assertIn("no usable date", imm._config_gaps["KXTONYPLAY-27"]["msg"])
+        self.assertEqual(imm.load_awards_extra_series(), 0)      # mtime-gated
+        with mock.patch.object(imm, "AWARDS_AUTO", False), \
+                mock.patch.object(imm, "ALLOWLIST_ONLY", True):  # the kill switch
+            self.assertFalse(IncentiveMarketMaker._allowed("KXGRAMAOTY-69-LIF"))
+            self.assertEqual(imm.event_top_n_for("KXGRAMAOTY"), 0)
+        with mock.patch.object(imm, "AWARDS_EXCLUDE", frozenset({"KXTONYPLAY"})):
+            self.assertEqual(self._write(["KXGRAMAOTY", "KXTONYPLAY"]), 1)
+        self.assertEqual(imm.AWARDS_EXTRA_SERIES, {"KXGRAMAOTY"})
+
+    def test_a_code_family_in_the_file_keeps_its_own_rules(self):
+        # KXCMA quotes on the undated guard set (safe-join, no cap) by Jack's
+        # 9/11 call, out on the show's day; a tag entry must not give it the
+        # awards rules (the month-before stand-down, 3/event)
+        cma = imm.SERIES_OVERRIDES["KXCMA"]
+        self._write(["KXCMA"])
+        imm.ensure_family_override("KXCMA")
+        self.assertIs(imm.SERIES_OVERRIDES["KXCMA"], cma)
+        self.assertEqual(cma.pre_event_days, 0.0)
+        self.assertEqual(imm.event_top_n_for("KXCMA"), 0)
+
+    def test_the_new_series_pass_enrolls_award_tagged_nominee_series(self):
+        import imm_earnings_overrides as ieo
+        meta = {
+            "KXGRAMAOTY": {"category": "Entertainment", "tags": ["Awards", "Grammys"],
+                           "title": "Grammy for Album of the Year"},
+            # the show's own tag only, as Kalshi files the CMA categories
+            "KXAWARDSCMAEOTY": {"category": "Entertainment", "tags": ["CMA Awards"],
+                                "title": "Entertainer of the Year"},
+            "KXGRAMBAC": {"category": "Entertainment", "tags": ["Awards", "Grammys"],
+                          "title": "Best Album Cover"},
+            "KXVMACOUNTRY": {"category": "Entertainment", "tags": ["Awards", "VMA"],
+                             "title": "BEST COUNTRY"},
+            # not nominee binaries: review
+            "KXGRAMMYCOUNTSZA": {"category": "Entertainment", "tags": ["Awards", "Grammys"],
+                                 "title": "SZA Grammy wins"},
+            "KXGGVIEWERS": {"category": "Entertainment", "tags": ["Golden Globes", "Awards"],
+                            "title": "Golden Globes viewership"},
+            "KXACTORAWARDSATTEND": {"category": "Entertainment", "tags": ["Awards"],
+                                    "title": "WHO WILL ATTEND THE ACTOR AWARDS"},
+            "KXROLLINGSTONECOVER": {"category": "Entertainment", "tags": ["Awards"],
+                                    "title": "WHO WILL BE ON THE ROLLINGSTONE COVER THIS YEAR"},
+            # an MVP is a sports award Kalshi files under Sports: review
+            "KXMLBALCSMVP": {"category": "Sports", "tags": ["Baseball"],
+                             "title": "Pro Baseball American League Championship Series MVP"},
+        }
+        tickers = ["KXGRAMAOTY-69-LIF", "KXAWARDSCMAEOTY-26-MOR", "KXGRAMBAC-69-ABC",
+                   "KXVMACOUNTRY-27-ABC", "KXGRAMMYCOUNTSZA-69-T3", "KXGGVIEWERS-27-T20",
+                   "KXACTORAWARDSATTEND-27-ABC", "KXROLLINGSTONECOVER-26-ABC",
+                   "KXMLBALCSMVP-26-ABC"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                raise AssertionError(path)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+            took = ["KXAWARDSCMAEOTY", "KXGRAMAOTY", "KXGRAMBAC", "KXVMACOUNTRY"]
+            self.assertEqual(sorted(s for s, _w, _x in enrolled), took)
+            self.assertEqual({w for _s, w, _x in enrolled}, {ieo.AWARDS_ENROLL_WHY})
+            why = {s: w for s, w, _x in review}
+            self.assertEqual(sorted(why), ["KXACTORAWARDSATTEND", "KXGGVIEWERS",
+                                           "KXGRAMMYCOUNTSZA", "KXMLBALCSMVP",
+                                           "KXROLLINGSTONECOVER"])
+            for s in ("KXGRAMMYCOUNTSZA", "KXGGVIEWERS"):
+                self.assertIn("count / threshold ladder", why[s], s)
+            for s in ("KXACTORAWARDSATTEND", "KXROLLINGSTONECOVER"):
+                self.assertIn("not a nominee binary", why[s], s)
+            self.assertNotIn("awards:", why["KXMLBALCSMVP"])
+            with open(imm.awards_extra_path(), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["series"], took)
+            imm.load_awards_extra_series()
+            self.assertTrue(IncentiveMarketMaker._allowed("KXGRAMAOTY-69-LIF"))
+            # the next run sees them covered: no re-enroll
+            enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+            self.assertEqual(enrolled2, [])
 
 
 class TestElectionBatch20261005(unittest.TestCase):
