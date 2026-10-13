@@ -67,6 +67,28 @@ if ($task.State -ne 'Running') {
     Remove-Item $missFile -ErrorAction SilentlyContinue
 }
 
+# THE BACKUP PATH (Jack 2026-10-12): Chrome Remote Desktop. Its host service
+# ("chromoting") starts at boot, so it reaches the PC even at the Windows
+# sign-in screen after a restart (this org-joined PC can't auto sign in), and
+# whatever state the claude login is in. Starting a service needs admin, which
+# this task doesn't have, so a stopped one is an email.
+$crd = Get-Service -Name 'chromoting' -ErrorAction SilentlyContinue
+if (-not $crd) {
+    Write-Log "Chrome Remote Desktop host: not installed"
+} elseif ($crd.Status -ne 'Running') {
+    Write-Log "Chrome Remote Desktop host: $($crd.Status)"
+    Send-AlertThrottled 'crd' 6 "Chrome Remote Desktop host NOT running" `
+        ("The Chrome Remote Desktop host service on the trading box is $($crd.Status), " +
+         "so the backup way in (it works even at the Windows sign-in screen) is down.`n`n" +
+         "Fix on the PC, in an admin PowerShell:`n    Start-Service chromoting`n" +
+         "or open remotedesktop.google.com/access and turn remote access back on.`n" +
+         "Log: $LogPath")
+} else {
+    Write-Log "Chrome Remote Desktop host: running"
+    Clear-Alert 'crd' "Chrome Remote Desktop host running again" `
+        "The Chrome Remote Desktop host service on the trading box is running again. Log: $LogPath"
+}
+
 $probe = Test-ClaudeLogin
 if ($probe.auth) {
     Write-Log "login DEAD: $($probe.why)"
