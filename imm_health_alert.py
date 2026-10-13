@@ -25,6 +25,17 @@ State is kept in a tiny JSON file next to the bot's status so repeated runs
 under Task Scheduler do not re-send. SMS is dead (tmomail gateway bounces
 since 2026-06-29) — email only.
 
+OUTSIDE HEARTBEAT (Jack 2026-10-12, healthchecks.io). Everything above runs
+ON the trading box, so it goes quiet with it: after a restart this
+Entra-joined PC waits at the sign-in screen (no auto sign-in), and nothing,
+this alerter included, runs until someone signs in, while the bot's resting
+orders sit unmanaged. So every scheduled run first pings the URL in
+IMM_HEARTBEAT_URL (user env / HKCU\Environment, like the ALERT_EMAIL_*
+pair), with the bot's state as the body. A restart, crash, sleep, dead
+battery or lost internet stops the pings, and healthchecks.io says so from
+outside. The ping goes out even when probe() raises, so a bug here cannot
+pose as the box going dark. --status / --test do not ping.
+
 Usage:
     python imm_health_alert.py            # check once, email on transition
     python imm_health_alert.py --status   # print state, send nothing
@@ -38,6 +49,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 
@@ -229,15 +241,46 @@ def check_credit_staleness(alerter, state: dict, now: str) -> None:
         log(f"! credit staleness check failed ({e}); continuing")
 
 
+HEARTBEAT_ENV = "IMM_HEARTBEAT_URL"
+HEARTBEAT_TIMEOUT_SECS = 10
+
+
+def heartbeat(body: str = "") -> bool:
+    """Ping the outside heartbeat (see OUTSIDE HEARTBEAT); True when it
+    answered. No URL configured = nothing to do. A failed ping is logged and
+    swallowed: the email alerting below must still run, and a missed ping is
+    exactly what the outside check exists to notice."""
+    url = (os.environ.get(HEARTBEAT_ENV) or _env_from_registry(HEARTBEAT_ENV)).strip()
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(url, data=body.encode("utf-8")[:10000],
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=HEARTBEAT_TIMEOUT_SECS) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log(f"[IMM-HEALTH] ! heartbeat ping failed: {e!r}")
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--status", action="store_true", help="print, send nothing")
     ap.add_argument("--test", action="store_true", help="force a test email")
     args = ap.parse_args(argv)
 
-    ok, headline, detail = probe()
+    scheduled = not (args.status or args.test)
+    try:
+        ok, headline, detail = probe()
+    except Exception as e:
+        if scheduled:
+            heartbeat(f"probe failed: {e!r}")
+        raise
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log(f"[IMM-HEALTH] {'OK' if ok else 'DOWN'} — {headline} — {detail}")
+    if scheduled:
+        heartbeat(f"IMM {'OK' if ok else 'DOWN'} -- {headline} -- {detail}")
     if args.status:
         return 0
 

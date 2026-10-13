@@ -188,6 +188,80 @@ class ProbeRestartWindow(_ProbeFixture):
         self.assertFalse(ok)
         self.assertIn("HEARTBEAT STALE", headline)
 
+class TestHeartbeat(unittest.TestCase):
+    """Jack 2026-10-12: an outside heartbeat (healthchecks.io), so a restart
+    that leaves the box at the sign-in screen is noticed from outside. No test
+    here may reach the network or read the real IMM_HEARTBEAT_URL."""
+
+    URL = "https://hc-ping.example/test-uuid"
+
+    def setUp(self):
+        import io
+        self.calls = []
+
+        def fake_urlopen(req, timeout=None):
+            self.calls.append((req.full_url, req.data, req.get_method(), timeout))
+            if getattr(self, "net_down", False):
+                raise OSError("network down")
+            return io.BytesIO(b"OK")
+        p1 = mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen)
+        p2 = mock.patch.object(ha, "_env_from_registry", lambda name: "")
+        p3 = mock.patch.dict(os.environ, {ha.HEARTBEAT_ENV: self.URL})
+        for p in (p1, p2, p3):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_no_url_no_ping(self):
+        with mock.patch.dict(os.environ, {ha.HEARTBEAT_ENV: ""}):
+            self.assertFalse(ha.heartbeat("x"))
+        self.assertEqual(self.calls, [])
+
+    def test_pings_the_url_with_the_status(self):
+        self.assertTrue(ha.heartbeat("IMM OK -- alive"))
+        self.assertEqual(self.calls, [(self.URL, b"IMM OK -- alive", "POST",
+                                       ha.HEARTBEAT_TIMEOUT_SECS)])
+
+    def test_a_failed_ping_is_logged_not_raised(self):
+        self.net_down = True
+        self.assertFalse(ha.heartbeat("x"))
+        self.assertEqual(len(self.calls), 1)
+
+    def _fake_alerter(self):
+        sent = []
+
+        class FakeAlerter:
+            enabled = False
+
+            def __init__(self, tag, live):
+                pass
+
+            def send_message(self, body, subject=None):
+                sent.append(subject)
+                return True
+        return FakeAlerter, sent
+
+    def test_main_pings_on_scheduled_runs_only(self):
+        fa, sent = self._fake_alerter()
+        with mock.patch.object(ha, "probe", lambda: (True, "alive", "pid 1")),                 mock.patch.object(ha, "Alerter", fa):
+            ha.main([])                       # credentials-missing exit, after the ping
+            self.assertEqual(len(self.calls), 1)
+            self.assertIn(b"IMM OK", self.calls[0][1])
+            ha.main(["--status"])
+            ha.main(["--test"])
+        self.assertEqual(len(self.calls), 1)  # neither manual mode pinged
+        self.assertEqual(sent, ["IMM health: test"])
+
+    def test_main_still_pings_when_the_probe_raises(self):
+        fa, _ = self._fake_alerter()
+
+        def boom():
+            raise RuntimeError("probe bug")
+        with mock.patch.object(ha, "probe", boom), mock.patch.object(ha, "Alerter", fa):
+            with self.assertRaises(RuntimeError):
+                ha.main([])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn(b"probe failed", self.calls[0][1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
