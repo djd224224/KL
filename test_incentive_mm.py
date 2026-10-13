@@ -204,6 +204,9 @@ def setUpModule():
     # the same way: its path follows STATUS_DIR, so only memory is reset
     imm.AWARDS_EXTRA_SERIES.clear()
     imm._awards_extra_state["mtime"] = 0.0
+    # ...and the graduate families by Kalshi metadata (graduate_auto_series.json)
+    imm.GRADUATE_AUTO_SERIES.clear()
+    imm._graduate_auto_state["mtime"] = 0.0
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
@@ -25455,6 +25458,141 @@ class TestMlbPostseasonMvp(unittest.TestCase):
         # an unreadable board holds the ALCS MVP too (fail closed)
         cycle(ConnectionError("espn down"))
         self.assertEqual(self._sides(bot, self.ALCS_T), set())
+
+
+class TestGraduateAutoFamilies(unittest.TestCase):
+    """Jack 2026-10-12: "Build 1,2 as auto families" -- strait traffic on IMF
+    PortWatch and the state statistics on Kalshi's ECONSTATE contracts join
+    the 10/03 graduates' guard set when they start paying."""
+
+    def setUp(self):
+        overrides = dict(imm.SERIES_OVERRIDES)
+
+        def reset():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+            imm.GRADUATE_AUTO_SERIES.clear()
+            imm._graduate_auto_state["mtime"] = 0.0
+            try:
+                os.remove(imm.graduate_auto_path())
+            except OSError:
+                pass
+        reset()
+        self.addCleanup(reset)
+
+    def _write(self, series):
+        with open(imm.graduate_auto_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+        imm._graduate_auto_state["mtime"] = 0.0
+        return imm.load_graduate_auto_series()
+
+    def test_the_file_joins_the_graduate_guard_set_at_x1(self):
+        a = IncentiveMarketMaker._allowed
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(a("KXHORMUZPEAK-26OCT18-T10"))
+        n = self._write({"KXHORMUZPEAK": {"family": "portwatch"},
+                         "KXNYCASKRENT": {"family": "econstate"},
+                         "KXCTMINWAGE": {"family": "econstate"},       # left behind 10/03
+                         "KXWIDGET": {"family": "widgets"},            # unknown family
+                         "KXOSCARAWARDACTR": {"family": "econstate"},  # blocklisted
+                         "notaseries": {"family": "econstate"}})
+        self.assertEqual(n, 2)
+        self.assertEqual(imm.GRADUATE_AUTO_SERIES,
+                         {"KXHORMUZPEAK": "portwatch", "KXNYCASKRENT": "econstate"})
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(a("KXHORMUZPEAK-26OCT18-T10"))
+            self.assertTrue(a("KXNYCASKRENT-27JAN31-T4500"))
+            self.assertFalse(a("KXCTMINWAGE-27JUL30-T16"))
+        arch = imm.SERIES_OVERRIDES[imm.SCAN_GRADUATE_ARCHETYPE]
+        self.assertEqual(arch.size_mult, imm.SHIPPING_SIZE_MULT)    # KXSUEZWEEKLY x2
+        for s in ("KXHORMUZPEAK", "KXNYCASKRENT"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+            self.assertEqual(imm.event_top_n_for(s), 3, s)          # before inheriting
+            imm.ensure_family_override(s)
+            ov = imm.series_override(s)
+            # the graduates' guard set, never the archetype's family size
+            self.assertEqual(ov, dataclasses.replace(arch, size_mult=None), s)
+            self.assertTrue(ov.safe_join, s)
+            self.assertEqual(ov.min_est_per_day, 0.0, s)
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+        # the settling print is guarded the graduates' way: the ticker day
+        self.assertEqual(imm.trade_cutoff_utc("KXHORMUZPEAK-26OCT18", None, None),
+                         utc(2026, 10, 18, 4, 0))
+        self.assertEqual(imm.load_graduate_auto_series(), 0)        # mtime-gated
+        with mock.patch.object(imm, "GRADUATE_AUTO", False), \
+                mock.patch.object(imm, "ALLOWLIST_ONLY", True):     # the kill switch
+            self.assertFalse(a("KXHORMUZPEAK-26OCT18-T10"))
+            self.assertEqual(imm.event_top_n_for("KXHORMUZPEAK"), 0)
+
+    def test_a_code_family_in_the_file_keeps_its_own_rules(self):
+        mc = imm.SERIES_OVERRIDES["KXMC"]
+        self._write({"KXMC": {"family": "econstate"}})
+        imm.ensure_family_override("KXMC")
+        self.assertIs(imm.SERIES_OVERRIDES["KXMC"], mc)
+        self.assertEqual(imm.event_top_n_for("KXMC"), 0)
+
+    def test_the_new_series_pass_enrolls_by_source_and_contract(self):
+        import imm_earnings_overrides as ieo
+        pw = [{"name": "IMF PortWatch", "url": "https://portwatch.imf.org/"}]
+
+        def rec(cat, contract, title, sources=None):
+            return {"category": cat, "title": title, "tags": [],
+                    "contract_url": f"https://x/{contract}.pdf",
+                    "settlement_sources": sources or [{"name": "State agency", "url": "https://x.gov/"}]}
+        meta = {
+            "KXHORMUZPEAK": rec("Politics", "POLITICALSTAT",
+                                "Peak traffic through the Strait of Hormuz?", pw),
+            "KXHORMUZMAX": rec("Politics", "POLITICALSTAT",
+                               "Maximum traffic through the Strait of Hormuz?", pw),
+            "KXSUEZTRAFFIC": rec("Politics", "SUEZTRAFFIC", "Suez traffic", pw),
+            "KXNYCASKRENT": rec("Economics", "ECONSTATE", "NYC median asking rent",
+                                [{"name": "Federal Reserve Bank of New York", "url": "https://newyorkfed.org/"}]),
+            "KXPAMFGEMP": rec("Economics", "ECONSTATE2", "Pennsylvania manufacturing employment"),
+            "KXCTMINWAGE": rec("Economics", "ECONSTATE2", "Connecticut minimum wage on [date]"),
+            "KXWATECHEMP": rec("Economics", "ECONSTATE", "Washington technical services employment"),
+            "KXTXERCOTPEAK": rec("Economics", "ECONSTATE", "Texas ERCOT peak electricity demand",
+                                 [{"name": "ERCOT", "url": "https://www.ercot.com/"}]),
+            "KXRUSWAGE": rec("Economics", "ECONSTATE", "Russia wages"),
+            "KXGRIDLOAD": rec("Economics", "ECONSTATE", "Grid load",
+                              [{"name": "PJM", "url": "https://www.pjm.com/"}]),
+        }
+        tickers = ["KXHORMUZPEAK-26OCT18-T10", "KXHORMUZMAX-26OCT18-OCT14",
+                   "KXSUEZTRAFFIC-26OCT18-X", "KXNYCASKRENT-27JAN31-T4500",
+                   "KXPAMFGEMP-27APR30-T560", "KXCTMINWAGE-27JUL30-T16",
+                   "KXWATECHEMP-27FEB28-T200", "KXTXERCOTPEAK-27JAN01-T80",
+                   "KXRUSWAGE-RUS26SEP-T5", "KXGRIDLOAD-27JAN31-T5"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                raise AssertionError(path)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+            got = {s: w for s, w, _x in enrolled}
+            self.assertEqual(got, {"KXHORMUZPEAK": ieo.GRADUATE_AUTO_WHY["portwatch"],
+                                   "KXNYCASKRENT": ieo.GRADUATE_AUTO_WHY["econstate"],
+                                   "KXPAMFGEMP": ieo.GRADUATE_AUTO_WHY["econstate"]})
+            why = {s: w for s, w, _x in review}
+            self.assertIn("not a threshold ladder", why["KXHORMUZMAX"])
+            self.assertIn("contract SUEZTRAFFIC", why["KXSUEZTRAFFIC"])
+            self.assertIn("left behind 10/03", why["KXCTMINWAGE"])
+            self.assertIn("scan exclude prefix", why["KXWATECHEMP"])      # 9/02 reject
+            self.assertIn("scan exclude prefix", why["KXTXERCOTPEAK"])    # live grid
+            self.assertIn("names no day", why["KXRUSWAGE"])
+            self.assertIn("live_source", why["KXGRIDLOAD"])
+            with open(imm.graduate_auto_path(), encoding="utf-8") as f:
+                data = json.load(f)["series"]
+            self.assertEqual(sorted(data), ["KXHORMUZPEAK", "KXNYCASKRENT", "KXPAMFGEMP"])
+            self.assertEqual(data["KXHORMUZPEAK"]["family"], "portwatch")
+            self.assertEqual(data["KXNYCASKRENT"]["contract"], "ECONSTATE")
+            imm.load_graduate_auto_series()
+            self.assertTrue(IncentiveMarketMaker._allowed("KXHORMUZPEAK-26OCT18-T10"))
+            # the next run sees them covered: no re-enroll
+            enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+            self.assertEqual(enrolled2, [])
 
 
 class TestElectionBatch20261005(unittest.TestCase):

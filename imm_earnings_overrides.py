@@ -545,6 +545,7 @@ def enroll_new_series(client, dry: bool):
     imm.load_election_extra_series()
     imm.load_nfl_auto_series()
     imm.load_awards_extra_series()
+    imm.load_graduate_auto_series()
     seen: dict = {}
     cursor = None
     while True:
@@ -602,20 +603,26 @@ def enroll_new_series(client, dry: bool):
     # carve-outs (ELECTION_EXCLUDE). It still needs a verified ELECTION_DATES
     # row to quote -- the email's ACTION list names it. Same /series read as
     # the Carbon Arc check below, so still one read per novel series.
-    # Awards by Kalshi tag (2026-10-12), the same read: see AWARDS_KALSHI_TAGS.
+    # Awards by Kalshi tag (2026-10-12), the same read: see AWARDS_KALSHI_TAGS;
+    # and the graduate families by source / contract: graduate_auto_family.
     fin_additions = []
     elec_additions = []
     nfl_additions: dict = {}
     awards_additions = []
+    grad_additions: dict = {}
     still_review = []
     for s, why, sample in review:
         se = series_meta(client, s)
+        gfam, gwhy = graduate_auto_family(s, sample, se)
         if s not in imm.ELECTION_EXCLUDE and se.get("category") == "Elections":
             elec_additions.append(s)
             enrolled.append((s, ELECTION_ENROLL_WHY, sample))
         elif imm.series_is_carbon_arc(se):
             fin_additions.append(s)
             enrolled.append((s, "Carbon Arc source -> finecon group", sample))
+        elif imm.GRADUATE_AUTO and gfam:
+            grad_additions[s] = graduate_auto_entry(gfam, sample, se)
+            enrolled.append((s, GRADUATE_AUTO_WHY[gfam], sample))
         elif imm.NFL_AUTO_ENABLE and s.startswith("KXNFL"):
             entry, why_not = nfl_auto_entry_for(client, s, sample, se)
             if entry is not None:
@@ -631,7 +638,7 @@ def enroll_new_series(client, dry: bool):
             else:
                 still_review.append((s, f"{why}; awards: {why_not}", sample))
         else:
-            still_review.append((s, why, sample))
+            still_review.append((s, f"{why}; {gwhy}" if gwhy else why, sample))
     review = still_review
     if elec_additions and not dry:
         _merge_series_file(imm.election_extra_path(), elec_additions)
@@ -655,7 +662,78 @@ def enroll_new_series(client, dry: bool):
         _merge_series_file(imm.awards_extra_path(), awards_additions)
         log(f"awards-enrolled {len(awards_additions)} Kalshi award-tagged "
             f"series -> {imm.awards_extra_path()}")
+    if grad_additions and not dry:
+        _merge_nfl_auto_file(imm.graduate_auto_path(), grad_additions)
+        log(f"graduate-enrolled {len(grad_additions)} series "
+            f"({', '.join(sorted(grad_additions))}) -> {imm.graduate_auto_path()}")
     return enrolled, review
+
+
+# GRADUATE FAMILIES BY KALSHI METADATA (Jack 2026-10-12: "Build 1,2 as auto
+# families"). A REVIEW series joins one of two 10/03 graduate families
+# through incentive_mm.GRADUATE_AUTO_FILE (hot-reloaded; the bot's rules are
+# documented there):
+#   portwatch -- a settlement source naming IMF PortWatch, Kalshi's
+#                POLITICALSTAT contract and a threshold ladder (T<n>): the
+#                shape of the four *WEEKLY strait graduates (KXHORMUZPEAK).
+#                KXHORMUZMAX -- WHICH day traffic peaks, OCT05..OCT11 -- and
+#                KXSUEZTRAFFIC (a contract of its own) stay in review.
+#   econstate -- Kalshi's ECONSTATE / ECONSTATE2 contract with a DAY-dated
+#                ticker, so the bot is out at midnight ET of the print day
+#                (the 9/02 KXUE lesson: a month-only ticker quotes through
+#                the print). All 102 paying on 10/12 settle months out on a
+#                print the ticker names; the graduates of the same shape
+#                (state jobs, ports, permits) made money in the scan.
+# Both pass the scan's own screens first -- SCAN_EXCLUDE_PREFIXES (the 9/02
+# rejects KXWATECHEMP / KXWAAEROEMP, the ERCOT / PJM grid feeds, other bots'
+# families) and scan_series_meta_verdict (live-feed settlement sources) --
+# and incentive_mm.GRADUATE_AUTO_EXCLUDE (the 10/03 left-behind).
+GRADUATE_AUTO_WHY = {
+    "portwatch": "IMF PortWatch source -> strait traffic family (graduate rules)",
+    "econstate": "Kalshi ECONSTATE contract -> state statistics family (graduate rules)"}
+_THRESHOLD_STRIKE_RE = re.compile(r"T\d+(\.\d+)?")
+
+
+def _contract_of(se: dict) -> str:
+    return str(se.get("contract_url") or "").rsplit("/", 1)[-1].replace(".pdf", "")
+
+
+def graduate_auto_family(series: str, sample: str, se: dict):
+    """(family, '') when a graduate auto family takes the series; (None, why
+    not) when a family's key matched but a screen refused it; (None, '') when
+    no family's key matches."""
+    contract = _contract_of(se)
+    sources = " ".join(f"{x.get('name') or ''} {x.get('url') or ''}"
+                       for x in se.get("settlement_sources") or []
+                       if isinstance(x, dict)).lower()
+    if "portwatch" in sources:
+        fam = "portwatch"
+        if contract != "POLITICALSTAT":
+            return None, f"PortWatch, but contract {contract or '?'}"
+        if not _THRESHOLD_STRIKE_RE.fullmatch(sample.rsplit("-", 1)[-1]):
+            return None, "PortWatch, but not a threshold ladder (a categorical)"
+    elif contract in ("ECONSTATE", "ECONSTATE2"):
+        fam = "econstate"
+        if imm.parse_event_date(sample.rsplit("-", 1)[0]) is None:
+            return None, ("ECONSTATE, but its ticker names no day (no midnight-ET "
+                          "exit before the print)")
+    else:
+        return None, ""
+    if series in imm.GRADUATE_AUTO_EXCLUDE:
+        return None, f"{fam}: left behind 10/03 (GRADUATE_AUTO_EXCLUDE)"
+    if any(series.startswith(p) for p in imm.SCAN_EXCLUDE_PREFIXES):
+        return None, f"{fam}: a scan exclude prefix (9/02 reject, live feed, another bot's)"
+    ok, screen, _cat = imm.scan_series_meta_verdict(se)
+    if not ok:
+        return None, f"{fam}: the scan's series screen says {screen}"
+    return fam, ""
+
+
+def graduate_auto_entry(fam: str, sample: str, se: dict) -> dict:
+    """An incentive_mm.GRADUATE_AUTO_FILE entry."""
+    return {"family": fam, "title": str(se.get("title") or ""),
+            "contract": _contract_of(se), "sample": sample,
+            "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
 ELECTION_ENROLL_WHY = "Kalshi Elections category -> election family"
@@ -802,7 +880,9 @@ def nfl_auto_why(entry: dict) -> str:
 
 def _merge_nfl_auto_file(path: str, additions: dict) -> None:
     """Add entries to incentive_mm.NFL_AUTO_FILE, atomically. An existing
-    entry is never overwritten, so a hand-set "size" survives."""
+    entry is never overwritten, so a hand-set "size" survives. The graduate
+    families' file (GRADUATE_AUTO_FILE) has the same {"series": {S: entry}}
+    shape and is merged here too."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f) or {}

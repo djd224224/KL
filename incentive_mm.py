@@ -2696,6 +2696,10 @@ def event_top_n_for(series: str) -> int:
                 return _scaled_top_n(_n)
         elif not mention and series.startswith(_pat):
             return _scaled_top_n(_n)
+    if graduate_auto_rules(series):
+        # a graduate family member by Kalshi metadata (2026-10-12): the
+        # graduates' 3 per event
+        return _scaled_top_n(SCAN_GRADUATE_EVENT_TOP_N)
     if awards_auto_rules(series):
         # an awards family member by Kalshi tag (2026-10-12): the award
         # shows' 3 per event
@@ -7117,6 +7121,113 @@ SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE] = SeriesOverride(
     levels=SCAN_LEVELS, max_position=SCAN_MAX_POSITION,
     safe_join=True, min_est_per_day=0.0)
 
+# GRADUATE FAMILIES BY KALSHI METADATA (Jack 2026-10-12: "Build 1,2 as auto
+# families", from the audit he asked for -- "what other event families dont
+# consider all new events added, but should (like NFL, elections, awards)?").
+# Two of the 10/03 graduate families were named series by series
+# (SCAN_GRADUATE_SERIES), so a sibling Kalshi listed later never quoted:
+#   portwatch -- strait / canal traffic settled on IMF PortWatch, the four
+#                *WEEKLY graduates' data: KXHORMUZPEAK ($1,500/period, 15
+#                markets, same week and close as KXHORMUZWEEKLY) had paid
+#                since July and never quoted;
+#   econstate -- state and local statistics on Kalshi's ECONSTATE /
+#                ECONSTATE2 contracts (most of the graduates' jobs, travel,
+#                energy, farm and port series): 43 series paying on 10/12
+#                (~$2.5k/day of pool) that the scan never reached -- NYC
+#                asking rent, Illinois nuclear output, Florida visitors,
+#                state permits and manufacturing jobs, airport traffic.
+# The new-series pass (imm_earnings_overrides.enroll_new_series, run by the
+# 30-min family watch and the overrides task) writes each newly paying,
+# not-yet-allowed series that its rules take (graduate_auto_family there:
+# PortWatch + POLITICALSTAT threshold ladders; ECONSTATE with a day-dated
+# ticker; both through the scan's own series screen and exclude prefixes)
+# here: {"series": {S: {"family": "portwatch" | "econstate", "title",
+# "contract", "since", "sample"}}}. Hot-reloaded by mtime at import and every
+# universe refresh. A member takes the graduates' guard set through
+# FAMILY_OVERRIDE_PARENTS (GRADUATE_AUTO_PARENT: the scan archetype's ladder,
+# caps, safe-join and no rate bar -- never a family size: a new strait or
+# port series comes in at x1, per FAMILY_X2_1011) and SCAN_GRADUATE_EVENT_
+# TOP_N markets per event. The settling print is guarded the graduates' way:
+# the ticker day's midnight-ET exit. A code family that covers the series as
+# well keeps its own rules. GRADUATE_AUTO_EXCLUDE (the 10/03 left-behind that
+# match: KXCTMINWAGE, KXDEFRANCHISETAX) and the blocklist always win;
+# IMM_GRADUATE_AUTO=0 takes every member out (positions ride).
+GRADUATE_AUTO = os.environ.get("IMM_GRADUATE_AUTO", "1") == "1"
+GRADUATE_AUTO_FILE = "graduate_auto_series.json"        # in STATUS_DIR
+GRADUATE_AUTO_FAMILIES = ("portwatch", "econstate")
+# the members' family parent: a key only, no such Kalshi series; a COPY of
+# the scan archetype's guard set, so the archetype's own family size
+# (KXSUEZWEEKLY x2, FAMILY_X2_1011) never reaches it
+GRADUATE_AUTO_PARENT = "KXGRADUATEAUTO"
+SERIES_OVERRIDES[GRADUATE_AUTO_PARENT] = replace(
+    SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE], size_mult=None)
+GRADUATE_AUTO_EXCLUDE = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_GRADUATE_AUTO_EXCLUDE", "KXCTMINWAGE,KXDEFRANCHISETAX").split(",")
+    if s.strip())
+GRADUATE_AUTO_SERIES: Dict[str, str] = {}               # series -> family
+_graduate_auto_state = {"mtime": 0.0}
+
+
+def graduate_auto_path() -> str:
+    return os.path.join(STATUS_DIR, GRADUATE_AUTO_FILE)
+
+
+def load_graduate_auto_series() -> int:
+    """Re-read GRADUATE_AUTO_FILE when it changed; members changed, else 0.
+    Refuses blocklisted series, mention books, GRADUATE_AUTO_EXCLUDE and an
+    entry without a known family."""
+    try:
+        mtime = os.path.getmtime(graduate_auto_path())
+    except OSError:
+        return 0
+    if mtime == _graduate_auto_state["mtime"]:
+        return 0
+    _graduate_auto_state["mtime"] = mtime
+    try:
+        with open(graduate_auto_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! graduate auto file unreadable: {e}")
+        return 0
+    fresh: Dict[str, str] = {}
+    for s, e in (data.get("series") or {}).items():
+        s = str(s).strip()
+        fam = str((e or {}).get("family") or "") if isinstance(e, dict) else ""
+        if not s.startswith("KX") or "MENTION" in s or s in GRADUATE_AUTO_EXCLUDE:
+            continue
+        if fam not in GRADUATE_AUTO_FAMILIES:
+            log(f"[IMM] ! graduate auto {s}: family {fam!r} not understood, skipped")
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(s):
+            log(f"[IMM] ! refused blocklisted series in graduate auto: {s}")
+            continue
+        fresh[s] = fam
+    changed = sum(1 for s in set(fresh) | set(GRADUATE_AUTO_SERIES)
+                  if fresh.get(s) != GRADUATE_AUTO_SERIES.get(s))
+    GRADUATE_AUTO_SERIES.clear()
+    GRADUATE_AUTO_SERIES.update(fresh)
+    if changed:
+        log(f"[IMM] graduate auto series: {len(fresh)} enrolled ({changed} changed)")
+    return changed
+
+
+def graduate_auto_series(series: str) -> bool:
+    """A member of a graduate family by Kalshi metadata (GRADUATE_AUTO_FILE);
+    nothing while IMM_GRADUATE_AUTO=0."""
+    return GRADUATE_AUTO and series in GRADUATE_AUTO_SERIES
+
+
+def graduate_auto_rules(series: str) -> bool:
+    """A member running on the graduates' guard set: its override is the
+    family parent's (or not yet inherited, before the refresh's
+    ensure_family_override). A code family that covers the series as well
+    keeps its own caps."""
+    ov = SERIES_OVERRIDES.get(series)
+    return graduate_auto_series(series) and (
+        ov is None or ov == SERIES_OVERRIDES.get(GRADUATE_AUTO_PARENT))
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -7332,6 +7443,9 @@ FAMILY_OVERRIDE_PARENTS = (
     ("predicate", datacenter_series, DATACENTER_ARCHETYPE),
     # open-scan graduates (2026-10-03): the scan's guard set, see above
     ("predicate", scan_graduate_series, SCAN_GRADUATE_ARCHETYPE),
+    # graduate families by Kalshi metadata (2026-10-12): a copy of that
+    # guard set without the archetype's family size, see GRADUATE_AUTO_FILE
+    ("predicate", graduate_auto_series, GRADUATE_AUTO_PARENT),
     # NFL head-to-head (2026-10-12): a new KXNFL*H2H stat series, see
     # NFL_H2H_ENABLE (archetype KXNFLPASSYDSH2H)
     ("predicate", nfl_h2h_series, "KXNFLPASSYDSH2H"),
@@ -8265,6 +8379,8 @@ _CONFIG_CODE_KNOBS = (
     "AWARDS_TABLE_ONLY_SERIES",
     # awards by Kalshi tag (2026-10-12)
     "AWARDS_AUTO", "AWARDS_AUTO_EVENT_TOP_N", "AWARDS_EXCLUDE",
+    # graduate families by Kalshi metadata (2026-10-12)
+    "GRADUATE_AUTO", "GRADUATE_AUTO_EXCLUDE",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -9322,6 +9438,7 @@ load_sat_gate()          # Saturday step-up verdict (defined next to saturday_si
 load_election_extra_series()   # Elections-category members (beside election_series)
 load_nfl_auto_series()         # NFL auto families (beside the election file)
 load_awards_extra_series()     # awards by Kalshi tag (beside the election file)
+load_graduate_auto_series()    # graduate families by Kalshi metadata (ditto)
 
 
 # ----------------------------------------------------------------------------
@@ -18940,7 +19057,8 @@ class IncentiveMarketMaker:
         pattern families (prefixes; *CC/*ADS/*POS via ALLOW_FAMILY_SUFFIXES,
         source-verified -- family_series_allowed; the sports ladder /
         escalator regexes, ALLOW_SERIES_PATTERNS; the election family,
-        election_series; the awards by Kalshi tag, awards_extra_series)
+        election_series; the awards by Kalshi tag, awards_extra_series; the
+        graduate families by Kalshi metadata, graduate_auto_series)
         unless ALLOWLIST_ONLY is off."""
         if cls._blocked(ticker):
             return False
@@ -18966,6 +19084,7 @@ class IncentiveMarketMaker:
             nfl_auto_entry(series) is not None or \
             awards_extra_series(series) or \
             mlb_mvp_series(series) or \
+            graduate_auto_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -19208,6 +19327,7 @@ class IncentiveMarketMaker:
         load_election_extra_series()
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
         load_awards_extra_series()    # awards by Kalshi tag (2026-10-12)
+        load_graduate_auto_series()   # graduate families by metadata (2026-10-12)
         load_election_dates_extra()   # hot-reloaded rows (2026-10-07)
         load_awards_dates_extra()
         load_family_verdicts()
