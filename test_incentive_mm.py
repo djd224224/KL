@@ -187,6 +187,19 @@ def setUpModule():
         imm.SERIES_OVERRIDES.pop(s, None)
     imm.NFL_AUTO_SERIES.clear()
     imm._nfl_auto_state.update(mtime=0.0, installed=set())
+    # ...and so do the election family's two files: the Elections-category
+    # members (election_extra_series.json, 2026-10-05) and the hot-reloaded
+    # voting-day rows (election_dates_extra.json, 2026-10-07) -- 57 series and
+    # 50 rows at the 10/13 00:36Z import, so an election test could pass on
+    # the trading box's enrollment or verified row instead of its own fixture.
+    # Both paths follow STATUS_DIR (election_extra_path / election_dates_
+    # extra_path), so only memory is reset; the awards rows share that loader
+    # and its mtime map (no live file yet).
+    imm.ELECTION_EXTRA_SERIES.clear()
+    imm._election_extra_state["mtime"] = 0.0
+    imm.ELECTION_DATES_EXTRA[:] = []
+    imm.AWARDS_DATES_EXTRA[:] = []
+    imm._rows_extra_state.clear()
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})

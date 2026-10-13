@@ -10714,3 +10714,30 @@ Tests: TestNflAutoFamilies +2 (both red before the code fix). Full suite
 Not done (same leak class, nothing fails today): the import also loads the
 live election extra file (57 series) and the election dates extra file (50
 rows). setUpModule resets neither.
+
+## 2026-10-13 ~01:00Z — tests: the election extra series and dates rows no longer leak in at import (the "Not done" above)
+
+Test-only (test_incentive_mm.setUpModule). incentive_mm.py is untouched, so
+the deploy restarts nothing.
+
+- load_election_extra_series() and load_election_dates_extra() run at
+  import, before setUpModule redirects STATUS_DIR. So every run started with
+  the box's 57 Elections-category members and 50 voting-day rows. From the
+  live files alone, KXALBERTAREFS was a member and KXALBERTAREFS-26OCT19 had
+  a cutoff. Only TestElectionBatch20261005 cleared the series (in its setUp);
+  nothing reset the rows.
+- Both paths resolve at call time (election_extra_path /
+  election_dates_extra_path follow STATUS_DIR), so only memory is reset:
+  - ELECTION_EXTRA_SERIES and _election_extra_state;
+  - ELECTION_DATES_EXTRA and the rows loader's mtime map _rows_extra_state;
+  - AWARDS_DATES_EXTRA too: it shares that loader and map. There is no live
+    awards file yet, so it was latent.
+- A bare import opens five live files (checked with a spy on open): family
+  verdicts, the Saturday gate, NFL auto, and these two. All five are now
+  redirected or reset.
+- No test depended on the live data. The full suite (test_incentive_mm +
+  test_imm_risk_controls) is 1279 OK, as before. It is also 1279 OK with an
+  empty IMM_STATUS_DIR at import.
+- A scratch check run under unittest (with the real setUpModule) saw 57/50
+  at import and empty state afterwards. Against origin/main's test file the
+  same check fails.
