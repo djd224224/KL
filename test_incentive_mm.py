@@ -22138,6 +22138,108 @@ class TestSelectionDecisionInputs(unittest.TestCase):
         self.assertEqual(orders[True], orders[False])
 
 
+class TestTrimmedPoolRate(unittest.TestCase):
+    """Jack 2026-10-13, KXTRUMPMENTION-26OCT13: "why is it not quoting? it
+    should". Kalshi listed the rally's $100 programs to the markets' close 14
+    days out; the bot spread the pool over that ($6.91/day) and floored every
+    strike, while Kalshi trims the period to the real close and pays it whole
+    (credited / (estimate x stretch) = 0.96-1.06 on 20 past mention events)."""
+
+    EV = "KXTRUMPMENTION-26OCT13"
+    P0 = utc(2026, 10, 13, 2, 45)            # program start (the real listing)
+    P1 = utc(2026, 10, 27, 14, 0)            # listed end = the market's close
+    START = utc(2026, 10, 13, 23, 30)        # remarks, 3:30pm AKDT (WH / RNC)
+
+    def setUp(self):
+        p = mock.patch.dict(imm.EVENT_START_OVERRIDES, {self.EV: self.START})
+        p.start()
+        self.addCleanup(p.stop)
+        self.listed = 100.0 / ((self.P1 - self.P0).total_seconds() / 86400.0)
+
+    def test_stretched_rally_program_pays_over_the_trimmed_window(self):
+        self.assertAlmostEqual(self.listed, 6.91, places=2)
+        rate, end = imm.trimmed_pool_rate(
+            "KXTRUMPMENTION", self.EV, self.listed, self.P0, self.P1)
+        self.assertEqual(end, self.START + timedelta(hours=imm.TRIMMED_POOL_CLOSE_PAD_H))
+        # $100 over 02:45Z -> 02:30Z next day (23.75h)
+        self.assertAlmostEqual(rate, 100.0 / (23.75 / 24.0), places=2)
+
+    def test_listed_window_stands_without_a_known_start(self):
+        rate, end = imm.trimmed_pool_rate(
+            "KXTRUMPMENTION", "KXTRUMPMENTION-26OCT14", self.listed, self.P0, self.P1)
+        self.assertEqual((rate, end), (self.listed, None))
+
+    def test_listed_window_stands_for_a_program_ending_at_its_event(self):
+        # the 10/05-10/09 shape (26OCT09: program to 02:00Z the rally night)
+        # and earnings calls: the listed window already is the paid one
+        rate, end = imm.trimmed_pool_rate(
+            "KXTRUMPMENTION", self.EV, 31.07, self.P0,
+            self.START + timedelta(hours=3))
+        self.assertEqual((rate, end), (31.07, None))
+
+    def test_non_mention_series_untouched(self):
+        # a quake / treasury / rain program trims on an unpredictable trigger
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES,
+                             {"KXBIGGESTQUAKE-26OCT13": self.START}):
+            rate, end = imm.trimmed_pool_rate(
+                "KXBIGGESTQUAKE", "KXBIGGESTQUAKE-26OCT13", self.listed,
+                self.P0, self.P1)
+        self.assertEqual((rate, end), (self.listed, None))
+
+    def test_start_before_the_program_or_kill_switch_leaves_it(self):
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES,
+                             {self.EV: self.P0 - timedelta(days=2)}):
+            self.assertEqual(imm.trimmed_pool_rate(
+                "KXTRUMPMENTION", self.EV, self.listed, self.P0, self.P1),
+                (self.listed, None))
+        with mock.patch.object(imm, "TRIMMED_POOL", False):
+            self.assertEqual(imm.trimmed_pool_rate(
+                "KXTRUMPMENTION", self.EV, self.listed, self.P0, self.P1),
+                (self.listed, None))
+
+    def test_refresh_quotes_on_the_trimmed_pool(self):
+        """End to end: the meta, the selection row and the cycle log's
+        pool_per_day all carry the re-spread rate."""
+        sd = tempfile.mkdtemp(prefix="imm_tp_")
+        p = mock.patch.object(imm, "STATUS_DIR", sd)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(_clean_persist)
+        _clean_persist()
+        client = FakeClient()
+        prog = client.programs[0]                   # KXGOOD-99DEC31-A, $700
+        p0 = imm.parse_iso_utc(prog["start_date"])
+        p1 = imm.parse_iso_utc(prog["end_date"])
+        start = p0 + timedelta(days=4)              # 2 days before the listed end
+        with mock.patch.object(imm, "TRIMMED_POOL_WORDS", ("MENTION", "KXGOOD")), \
+                mock.patch.dict(imm.EVENT_START_OVERRIDES, {"KXGOOD-99DEC31": start}):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+        rows = [r for r in _sink_rows(sd, "selection_events")
+                if r["ticker"] == "KXGOOD-99DEC31-A"]
+        self.assertTrue(rows)
+        listed = 700.0 / ((p1 - p0).total_seconds() / 86400.0)
+        eff_days = (start + timedelta(hours=imm.TRIMMED_POOL_CLOSE_PAD_H)
+                    - p0).total_seconds() / 86400.0
+        self.assertAlmostEqual(rows[-1]["dollars_per_day"], 700.0 / eff_days, places=1)
+        self.assertAlmostEqual(rows[-1]["pool_listed_per_day"], listed, places=1)
+        self.assertIn("KXGOOD-99DEC31", bot._trimmed_pool_noted)
+        # the accrual sensor (cycle log pool_per_day) reads the same rate
+        pools = []
+        for path in glob.glob(os.path.join(sd, "cycle_log_*.csv")):
+            with open(path, encoding="utf-8") as f:
+                hdr = None
+                for line in f:
+                    cells = line.rstrip("\n").split(",")
+                    if cells[0] == "ts":
+                        hdr = cells
+                    elif hdr and cells[hdr.index("ticker")] == "KXGOOD-99DEC31-A":
+                        pools.append(float(cells[hdr.index("pool_per_day")]))
+        self.assertTrue(pools)
+        for v in pools:
+            self.assertAlmostEqual(v, 700.0 / eff_days, places=1)
+
+
 # ----------------------------------------------------------------------------
 # ROI scan 2026-09-27 (Jack: "build 1,2,3,4")
 # ----------------------------------------------------------------------------

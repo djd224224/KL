@@ -237,9 +237,13 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
         volume_24h = float(m.get("volume_24h_fp") or m.get("volume_24h") or 0)
     except (TypeError, ValueError):
         volume_24h = 0.0
-    return imm.MarketMeta(
+    # the pool over the window Kalshi will pay -- mirrors refresh_universe
+    dpd, pool_end = imm.trimmed_pool_rate(
+        series, event_ticker, info["dollars_per_day"],
+        info.get("start"), info["end"])
+    meta = imm.MarketMeta(
         ticker=t, event_ticker=event_ticker, series=series,
-        dollars_per_day=info["dollars_per_day"], program_end=info["end"],
+        dollars_per_day=dpd, program_end=info["end"],
         target_size=info["target"], discount_factor=info["df"],
         cutoff=cutoff, close_time=close_time,
         mid_cents=((bid + ask) / 2.0 if bid and ask else None),
@@ -247,6 +251,10 @@ def build_meta(bot, t: str, info: dict, m: dict, now_utc: datetime):
         volume=volume, volume_24h=volume_24h, status=m.get("status", ""),
         open_time=imm.parse_iso_utc(m.get("open_time", "")),
         program_start=info.get("start"))
+    if pool_end is not None:
+        meta.pool_listed_per_day = info["dollars_per_day"]
+        meta.pool_end_eff = pool_end
+    return meta
 
 
 def bulk_market_details(client, tickers) -> dict:

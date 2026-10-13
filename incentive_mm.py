@@ -7529,6 +7529,56 @@ OVERRIDE_BUFFER_MIN = _env_int("IMM_OVERRIDE_BUFFER_MIN", 10)
 # (pointless entry + placement race); MEMBERS are exempt and quote to the
 # true cutoff — the exchange-side order expiration is the hard stop there.
 CUTOFF_SCREEN_BUFFER_MIN = _env_int("IMM_CUTOFF_SCREEN_BUFFER", 5)
+# THE POOL RATE OVER THE WINDOW KALSHI PAYS (Jack 2026-10-13 on
+# KXTRUMPMENTION-26OCT13: "why is it not quoting? it should"). From 26OCT12
+# Kalshi lists a rally's programs to the MARKET's close -- 14 days after the
+# rally, its postponement window -- where 10/05-10/09 ran to the rally night
+# (26OCT09: 10/06 20:45Z -> 10/10 02:00Z). fetch_programs spread the same $100
+# pool over that listed stretch: $6.91/day per market on 26OCT13 against
+# $31-400/day on 10/05-10/09, so every strike sat under the $1.30 payout bar
+# (26OCT12 quoted nothing, 26OCT13 one strike for an hour). But Kalshi TRIMS
+# the period to the market's real close and pays the WHOLE pool over it:
+# across 20 past mention events whose program had been listed 2-136x longer
+# than it ran (TRUMPMENTION 26AUG03-26OCT01, MAMDANIMENTION, WORLDNEWSMENTION),
+# credited / (bot estimate x stretch) = 0.96-1.06. So for a MENTION event with
+# a start time (EVENT_START_OVERRIDES: the WH / RNC / TVmaze / hand-set start)
+# whose program is listed more than TRIMMED_POOL_MIN_STRETCH_H past it, the
+# pool rate is the reward over [program start, start +
+# TRIMMED_POOL_CLOSE_PAD_H], the close Kalshi trims to: programs ended a
+# median 2.9h after the scheduled start across 112 mention events
+# (TRUMPMENTION 26OCT05 / 26OCT12: 2.4h / 2.6h). A program already ending
+# near its event (the 10/05-10/09 shape, earnings calls) is left alone.
+# IMM_TRIMMED_POOL=0 restores the listed window.
+TRIMMED_POOL = os.environ.get("IMM_TRIMMED_POOL", "1") == "1"
+TRIMMED_POOL_CLOSE_PAD_H = _env_float("IMM_TRIMMED_POOL_CLOSE_PAD_H", 3.0)
+TRIMMED_POOL_MIN_STRETCH_H = _env_float("IMM_TRIMMED_POOL_MIN_STRETCH_H", 24.0)
+TRIMMED_POOL_WORDS = tuple(
+    w for w in os.environ.get("IMM_TRIMMED_POOL_WORDS", "MENTION").split(",") if w)
+
+
+def trimmed_pool_rate(series: str, event_ticker: str, dollars_per_day: float,
+                      program_start: Optional[datetime],
+                      program_end: Optional[datetime]
+                      ) -> Tuple[float, Optional[datetime]]:
+    """(pool $/day, effective window end) for a market's program: the listed
+    rate with None, or -- a TRIMMED_POOL_WORDS series whose event start is
+    known and whose program is listed far past it -- the same pool over
+    [program start, start + TRIMMED_POOL_CLOSE_PAD_H] and that end."""
+    if not TRIMMED_POOL or dollars_per_day <= 0 \
+            or program_start is None or program_end is None \
+            or not any(w in series for w in TRIMMED_POOL_WORDS):
+        return dollars_per_day, None
+    start = EVENT_START_OVERRIDES.get(event_ticker)
+    if start is None \
+            or program_end - start <= timedelta(hours=TRIMMED_POOL_MIN_STRETCH_H):
+        return dollars_per_day, None
+    eff_end = start + timedelta(hours=TRIMMED_POOL_CLOSE_PAD_H)
+    if eff_end <= program_start:
+        return dollars_per_day, None
+    # fetch_programs' days floor (1h) holds for the trimmed window too
+    eff_secs = max((eff_end - program_start).total_seconds(), 3600.0)
+    listed_secs = max((program_end - program_start).total_seconds(), 3600.0)
+    return dollars_per_day * listed_secs / eff_secs, eff_end
 # Series with a real schedule API. Their games can be POSTPONED past the
 # ticker date (NYDAL 7/16 -> makeup 7/20 while 18 program markets kept paying
 # $100/day each), so the cheap 24h ticker-date pre-drop must not apply — the
@@ -15603,6 +15653,10 @@ class MarketMeta:
     # the reward window's START (its end is program_end); with open_time /
     # close_time it is what the live-feed rule's prong B measures (2026-09-24)
     program_start: Optional[datetime] = None
+    # trimmed_pool_rate (2026-10-13): the LISTED pool $/day and the window end
+    # dollars_per_day was re-spread to; None = the listed window stands
+    pool_listed_per_day: Optional[float] = None
+    pool_end_eff: Optional[datetime] = None
     est_frac: float = 0.0               # estimated pool share with our ladder resting
     est_dollars_per_day: float = 0.0    # est_frac x pool rate
     floor_dollars_per_day: float = 0.0  # the $ floors' projection: window-weighted over the
@@ -15898,6 +15952,8 @@ class IncentiveMarketMaker:
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
         self._near_cliff_noted: Dict[str, float] = {}   # ticker -> ts of the last verdict log
+        # event -> the trimmed pool window end last logged (trimmed_pool_rate)
+        self._trimmed_pool_noted: Dict[str, datetime] = {}
         # yield size mode (2026-10-05): ticker -> armed ts; sticky with
         # hysteresis until the yield falls under YIELD_SIZE_EXIT_FRAC of the
         # bar or the market leaves the selection
@@ -19720,9 +19776,22 @@ class IncentiveMarketMaker:
                 volume = float(m.get("volume_fp") or m.get("volume") or 0)
             except (TypeError, ValueError):
                 volume = 0.0
+            # the pool over the window Kalshi will pay (trimmed_pool_rate)
+            _dpd, _pool_end = trimmed_pool_rate(
+                series, event_ticker, info["dollars_per_day"],
+                info.get("start"), info["end"])
+            if _pool_end is not None \
+                    and self._trimmed_pool_noted.get(event_ticker) != _pool_end:
+                self._trimmed_pool_noted[event_ticker] = _pool_end
+                log(f"{self.tag} trimmed-window pool {event_ticker}: program "
+                    f"listed to {info['end']:%m-%d %H:%MZ}, event starts "
+                    f"{EVENT_START_OVERRIDES[event_ticker]:%m-%d %H:%MZ} -> "
+                    f"pool spread to {_pool_end:%m-%d %H:%MZ}: "
+                    f"${info['dollars_per_day']:.2f} -> ${_dpd:.2f}/day per market "
+                    f"(Kalshi trims the period to the close and pays it whole)")
             meta = MarketMeta(
                 ticker=t, event_ticker=event_ticker, series=series,
-                dollars_per_day=info["dollars_per_day"], program_end=info["end"],
+                dollars_per_day=_dpd, program_end=info["end"],
                 target_size=info["target"], discount_factor=info["df"],
                 cutoff=cutoff, close_time=close_time,
                 mid_cents=_mid,
@@ -19731,6 +19800,9 @@ class IncentiveMarketMaker:
                 open_time=parse_iso_utc(m.get("open_time", "")),
                 program_start=info.get("start"),
                 price_step=market_price_step(m))
+            if _pool_end is not None:
+                meta.pool_listed_per_day = info["dollars_per_day"]
+                meta.pool_end_eff = _pool_end
             # Band state for the LIFETIME SLOT RULE (2026-09-09), recorded
             # here because this is the last point a slot-holding market is
             # still in hand: one whose touches are outside the band is
@@ -20490,6 +20562,9 @@ class IncentiveMarketMaker:
                                         if mt.program_end else None),
                         "screen_waived": screen_waived.get(mt.ticker),
                     }
+                    if mt.pool_end_eff is not None:     # trimmed_pool_rate
+                        out["pool_listed_per_day"] = round(mt.pool_listed_per_day, 2)
+                        out["pool_end_eff"] = mt.pool_end_eff.isoformat()
                     out.update(floor_in.get(mt.ticker, {}))
                     return {k: v for k, v in out.items() if k not in _RESERVED}
                 except Exception:
