@@ -694,10 +694,10 @@ def enroll_new_series(client, dry: bool):
 # -COUNTRY ...), a week / month in the series or event title ("What will
 # Trump say this week?", "... in October?"), or an event sub-title reading
 # "Before <date>" (Kalshi's for every TRUMPSAY event). The event ticker must
-# name a day too (the bot's cutoff is 00:00 ET of it); one GET /events per
-# novel series.
+# name a day too (the bot is out at 00:00 ET the day before it, unless a
+# start is known); one GET /events per novel series.
 MENTION_AUTO_WHY = ("Kalshi Mentions category, one event -> mention auto family "
-                    "(out 00:00 ET of the event day)")
+                    "(out 00:00 ET the day before the ticker's day, unless a start is known)")
 MENTION_WINDOWED_CONTRACTS = frozenset({"TRUMPSAY"})
 _MENTION_WINDOW_RE = re.compile(
     r"\b(this|next|each|every) (week|month)\b|\bweekly\b|\bmonthly\b|"

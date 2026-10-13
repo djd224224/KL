@@ -7256,12 +7256,16 @@ def graduate_auto_rules(series: str) -> bool:
 # sub-title, a day in its event ticker -- here, {"series": [...]}.
 # Hot-reloaded by mtime at import and every universe refresh. A member takes
 # MENTION_AUTO_PARENT (safe-join, the standard ladder; no event cap -- no
-# mention book is capped by event) and the GENERIC cutoff: 00:00 ET of the
-# event day, or Kalshi's occurrence when earlier. The named families'
-# start-time machinery (the resolvers, the listing-date rule, the live-event
-# gate) keys on the MENTION name and does not reach these, so a member stops
-# the night before its broadcast -- the safe error. MENTION_AUTO_EXCLUDE and
-# the blocklist always win; IMM_MENTION_AUTO=0 takes every member out.
+# mention book is capped by event). Its cutoff: with a start in
+# EVENT_START_OVERRIDES, the resolver's start - OVERRIDE_BUFFER_MIN like any
+# event; with none, 00:00 ET of the day BEFORE the ticker's day
+# (apply_series_cutoff_adjustments) -- Kalshi dates some single events by
+# their UTC day (KXDJTCONF-25FEB28 was "On Feb 27, 2025"), so the ticker's
+# own midnight can fall after an evening event. Nothing writes those starts
+# for these series yet: the broadcast discovery that feeds the automatic
+# resolvers and the family watch's research keys on the MENTION name.
+# MENTION_AUTO_EXCLUDE and the blocklist always win; IMM_MENTION_AUTO=0 takes
+# every member out.
 MENTION_AUTO = os.environ.get("IMM_MENTION_AUTO", "1") == "1"
 MENTION_AUTO_FILE = "mention_auto_series.json"          # in STATUS_DIR
 MENTION_AUTO_PARENT = "KXMENTIONAUTO"                   # a key only
@@ -14219,6 +14223,16 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         if td is not None:
             early = td - timedelta(minutes=ov.cutoff_before_event_min)
             cutoff = early if cutoff is None else min(cutoff, early)
+    if mention_auto_series(series) and event_ticker not in EVENT_START_OVERRIDES:
+        # MENTION AUTO, NO KNOWN START (2026-10-13): out at 00:00 ET of the
+        # day BEFORE the ticker's day. Kalshi dates some single events by
+        # their UTC day -- KXDJTCONF-25FEB28 was "On Feb 27, 2025" -- so the
+        # ticker's own midnight can fall after an evening event. A start in
+        # EVENT_START_OVERRIDES (the resolver path: start - 10 min) replaces
+        # this; an undated ticker stands down.
+        td = parse_event_date(event_ticker)
+        early = td - timedelta(days=1) if td is not None else RELEASE_GUARD_UNKNOWN
+        cutoff = early if cutoff is None else min(cutoff, early)
     if ov and ov.release_guard_day is not None:
         ym = market_data_month(market)
         if ym is None:

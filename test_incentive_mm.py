@@ -25881,12 +25881,31 @@ class TestMentionAutoFamily(unittest.TestCase):
         self.assertTrue(ov.safe_join)
         self.assertIsNone(ov.size_mult)
         self.assertEqual(imm.event_top_n_for("KXDJTRALLY"), 0)    # no event cap
-        # the generic cutoff: 00:00 ET of the event day, or an earlier occurrence
+        # the ticker-date fallback is 00:00 ET of the ticker's day (or an
+        # earlier occurrence) ...
         self.assertEqual(imm.trade_cutoff_utc("KXDJTRALLY-26OCT20", None, None),
                          utc(2026, 10, 20, 4, 0))
         self.assertEqual(imm.trade_cutoff_utc("KXDJTRALLY-26OCT20", utc(2026, 10, 19, 23, 0),
                                               utc(2026, 10, 21, 4, 0)),
                          utc(2026, 10, 19, 23, 0))
+        # ... but with no known start a member is out a DAY earlier: Kalshi
+        # dates some single events by their UTC day (KXDJTCONF-25FEB28 was
+        # "On Feb 27, 2025"), so the ticker's midnight can follow the event
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXDJTRALLY", "KXDJTRALLY-26OCT20", utc(2026, 10, 20, 4, 0)),
+            utc(2026, 10, 19, 4, 0))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXDJTRALLY", "KXDJTRALLY-26OCT20", None), utc(2026, 10, 19, 4, 0))
+        # a known start (EVENT_START_OVERRIDES: the resolver's start - 10 min)
+        # replaces the fallback
+        start_cut = utc(2026, 10, 20, 22, 50)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES,
+                             {"KXDJTRALLY-26OCT20": utc(2026, 10, 20, 23, 0)}):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXDJTRALLY", "KXDJTRALLY-26OCT20", start_cut), start_cut)
+        # a non-member keeps the plain ticker-date cutoff
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGOOD", "KXGOOD-26OCT20", utc(2026, 10, 20, 4, 0)), utc(2026, 10, 20, 4, 0))
         with mock.patch.object(imm, "MENTION_AUTO", False),                 mock.patch.object(imm, "ALLOWLIST_ONLY", True):      # the kill switch
             self.assertFalse(a(t))
         with mock.patch.object(imm, "MENTION_AUTO_EXCLUDE", frozenset({"KXDJTRALLY"})):
