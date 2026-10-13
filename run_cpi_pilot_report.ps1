@@ -210,7 +210,7 @@ OVERRIDES
 
 4. Today is {TODAY} (ET). Judge the freshness of reward_credits.csv (SKILL.md step 2) against that.
 
-5. Your answer: the final message is the review Jack reads. It is emailed as is, as Markdown, and the launcher puts the script's full report under it, so do not paste or repeat that report or the script's output. Follow the SKILL.md's shape: the bottom line first, about 15 lines, one Markdown table, and the saved report's path at the end. No preamble about the steps you took. Then, as the very last line, exactly:
+5. Your answer: the final message is the review Jack reads. It is emailed as is, as Markdown, and the launcher puts the script's full report under it, so do not paste or repeat that report or the script's output. Quote its figures as printed (net per day included) rather than recomputing them. Follow the SKILL.md's shape: the bottom line first, about 15 lines, one Markdown table, and the saved report's path at the end. No preamble about the steps you took. Then, as the very last line, exactly:
 REPORT_SUMMARY: <recommend keep | recommend block | borderline> - net <signed dollars> over <days> days, 24h mark-out <signed cents>c
 For example: REPORT_SUMMARY: recommend keep - net +$12.34 over 14.2 days, 24h mark-out -1.5c
 '@
