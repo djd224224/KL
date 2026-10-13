@@ -238,7 +238,8 @@ function Find-Report([datetime]$Since) {
 
 # ---------------------------------------------------------------- main
 
-Log "=== CPI pilot report start (auth: $Auth$(if ($NoEmail) { '; -NoEmail, a test' })) ==="
+$mail = if ($env:ALERT_EMAIL_FROM -and $env:ALERT_EMAIL_PASSWORD) { "set" } else { "NOT SET, no email can go out" }
+Log "=== CPI pilot report start (auth: $Auth; email account: $mail$(if ($NoEmail) { '; -NoEmail, a test' })) ==="
 if (-not (Test-Path $Skill)) {
     Log "! the prompt file $Skill is missing"
     Send-Alert "CPI pilot report FAILED (no prompt file)" "run_cpi_pilot_report.ps1: $Skill is missing (was the desktop task deleted?). Nothing ran. The report script itself: python imm_cpi_pilot_report.py in KL. Log: $LogPath"
