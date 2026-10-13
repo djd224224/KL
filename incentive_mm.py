@@ -4893,8 +4893,18 @@ MLB_LIVE_COOLDOWN_MIN = _env_int("IMM_MLB_LIVE_COOLDOWN_MIN", 15)
 MLB_LIVE_TTL_SECS = _env_int("IMM_MLB_LIVE_TTL_SECS", 60)
 MLB_GAME_OVER_AFTER_H = _env_float("IMM_MLB_GAME_OVER_AFTER_H", 8.0)  # extra innings
 MLB_DECIDED_LOOKBACK_DAYS = _env_int("IMM_MLB_DECIDED_LOOKBACK_DAYS", 3)
+# x2 on the WORLD SERIES MVP (Jack 2026-10-13: "2x", after "KXMLBWSMVP-26 is
+# not quoting"): every in-band player sat on payout_floor -- touches ~2,000
+# contracts deep, our share 2-7%, $0.19-0.92 projected per market over the
+# 1.5 days left in the program (to 10/14 23:19Z) against the $1.30 bar. At x2
+# Ramirez / Caminero / Chourio project ~$1.4-1.8 each. The family size_mult
+# wire scales rungs, caps and skew knees together; the LCS MVPs stay x1.
+# IMM_MLB_WSMVP_SIZE_MULT=1 reverts.
+MLB_WSMVP_SIZE_MULT = _env_float("IMM_MLB_WSMVP_SIZE_MULT", 2.0)
 for _s in MLB_MVP_ROUNDS:
     SERIES_OVERRIDES[_s] = SeriesOverride(safe_join=True)
+SERIES_OVERRIDES["KXMLBWSMVP"] = replace(SERIES_OVERRIDES["KXMLBWSMVP"],
+                                         size_mult=MLB_WSMVP_SIZE_MULT)
 
 
 def mlb_mvp_series(series: str) -> bool:
@@ -8051,6 +8061,26 @@ STICKY_DEATH_REASONS = frozenset(
 # the inventory-skew logic would passively unwind his deliberate bets, his
 # fills would pollute the loss halt, and STP would eat his crossing orders.
 MANUAL_STANDOFF_CONTRACTS = _env_float("IMM_MANUAL_STANDOFF", 5)
+# EVENTS THE BOT TRADES BESIDE THE USER'S HAND POSITIONS (Jack 2026-10-13:
+# "yes feel free to trade these even though there are previous hand orders").
+# Five state-statistics events the graduate auto family enrolled on 10/13 sat
+# dark on the event standoff: the account held ~100 lots per strike there that
+# the bot never placed. In these events his positions neither stand the bot
+# off nor count as its inventory -- the quote_all (Love Island) treatment
+# WITHOUT its forced selection: the cap, skew and unwind track the bot's OWN
+# book, and only a live non-imm order still yields the one market it rests on.
+# Selection, the payout floor and every other guard apply as usual.
+MANUAL_COEXIST_EVENTS = frozenset(e.strip() for e in os.environ.get(
+    "IMM_MANUAL_COEXIST_EVENTS",
+    "KXVTPERMITS-27MAY03,KXNYCASKRENT-27JAN31,KXILNUCLEAR-27FEB28,"
+    "KXCABUILDPERMITS-27JAN27,KXPAMFGEMP-27APR30").split(",") if e.strip())
+
+
+def manual_coexist(series: str, event_ticker: str) -> bool:
+    """The user's hand positions here are his, not the bot's inventory and
+    not a reason to stand off: a quote_all series, or MANUAL_COEXIST_EVENTS."""
+    return bool((series_override(series) or SeriesOverride()).quote_all
+                or event_ticker in MANUAL_COEXIST_EVENTS)
 
 # Self-trade prevention. The bot's orders are ALWAYS post-only (resting
 # makers), so the only self-cross possible is the USER aggressing into a bot
@@ -8501,7 +8531,9 @@ _CONFIG_CODE_KNOBS = (
     "NFL_LIVE_TTL_SECS",
     # MLB postseason MVPs (2026-10-12)
     "MLB_MVP_ENABLE", "MLB_LIVE_COOLDOWN_MIN", "MLB_LIVE_TTL_SECS",
-    "MLB_GAME_OVER_AFTER_H", "MLB_DECIDED_LOOKBACK_DAYS",
+    "MLB_GAME_OVER_AFTER_H", "MLB_DECIDED_LOOKBACK_DAYS", "MLB_WSMVP_SIZE_MULT",
+    # hand positions the bot trades beside (2026-10-13)
+    "MANUAL_COEXIST_EVENTS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -19838,13 +19870,14 @@ class IncentiveMarketMaker:
         screen_waived: Dict[str, str] = {}
         for meta in metas:
             t = meta.ticker
-            quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
+            coexist = manual_coexist(meta.series, meta.event_ticker)
             manual = abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
             foreign_n = self._foreign_resting.get(t, 0) if self.live else 0
             # quote_all markets yield ONLY on a live foreign order here (or an
             # active standoff from one); positions and sibling activity don't
-            # stop the bot — the user wants full event coverage.
-            if quote_all:
+            # stop the bot — the user wants full event coverage. The same for
+            # MANUAL_COEXIST_EVENTS (2026-10-13).
+            if coexist:
                 manual_skip = bool(foreign_n) or t in self.state.manual_standoff
             else:
                 manual_skip = (t in self.state.manual_standoff or foreign_n
@@ -21787,20 +21820,21 @@ class IncentiveMarketMaker:
         if not EVENT_LEVEL_STANDOFF:
             return events
 
-        def quote_all(t: str) -> bool:
-            return (series_override(series_of(t)) or SeriesOverride()).quote_all
+        def coexist(t: str) -> bool:
+            return manual_coexist(series_of(t), self._event_of(t))
 
         for t, v in positions.items():
-            # quote_all series (Love Island): the user explicitly wants the bot
-            # in these events, so his POSITIONS there don't yield — only a live
-            # order on a specific market does (handled per-market below).
-            if quote_all(t):
+            # quote_all series (Love Island) and MANUAL_COEXIST_EVENTS: the
+            # user explicitly wants the bot in these events, so his POSITIONS
+            # there don't yield — only a live order on a specific market does
+            # (handled per-market below).
+            if coexist(t):
                 continue
             if abs(v - self.pnl.pos.get(t, 0.0)) >= MANUAL_STANDOFF_CONTRACTS:
                 events.add(self._event_of(t))
         if self.live:
             for t, n in self._foreign_resting.items():
-                if n and not quote_all(t):
+                if n and not coexist(t):
                     events.add(self._event_of(t))
         return events
 
@@ -22504,14 +22538,16 @@ class IncentiveMarketMaker:
             # until the manual activity is gone. Without this, skew logic
             # would passively unwind his bets and STP would eat his orders.
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
+            coexist = manual_coexist(meta.series, meta.event_ticker)
             own_pos = self.pnl.pos.get(t, 0.0)
             manual_pos = pos - own_pos
             foreign_n = self._foreign_resting.get(t, 0) if self.live else 0
-            event_manual = (meta.event_ticker in manual_evts) and not quote_all
-            pos_manual = (abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS) and not quote_all
-            # quote_all (Love Island): yield a market ONLY when the user has a
-            # live order resting on it (direct order-collision risk); his
-            # positions and sibling markets never stop the bot there.
+            event_manual = (meta.event_ticker in manual_evts) and not coexist
+            pos_manual = (abs(manual_pos) >= MANUAL_STANDOFF_CONTRACTS) and not coexist
+            # quote_all (Love Island) and MANUAL_COEXIST_EVENTS: yield a market
+            # ONLY when the user has a live order resting on it (direct
+            # order-collision risk); his positions and sibling markets never
+            # stop the bot there.
             if foreign_n or pos_manual or event_manual:
                 if t not in self.state.manual_standoff:
                     if in_grace:
@@ -23462,7 +23498,8 @@ class IncentiveMarketMaker:
             maxpos = series_max_position(meta.series)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
-            cap_pos = own_pos if quote_all else pos
+            # (MANUAL_COEXIST_EVENTS too: the user's positions there are his)
+            cap_pos = own_pos if coexist else pos
             # FULL UNWIND (unwind_side_sizes): the reducing side's ladder bound
             # becomes the whole position; the position cap, the event share
             # and the skew below still bind. A side with no ladder stays dark.

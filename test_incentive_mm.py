@@ -8862,6 +8862,43 @@ class TestEventLevelStandoff(unittest.TestCase):
         finally:
             imm.EVENT_LEVEL_STANDOFF = old
 
+    def test_a_coexist_event_trades_beside_hand_positions(self):
+        """Jack 2026-10-13: "feel free to trade these even though there are
+        previous hand orders" -- in MANUAL_COEXIST_EVENTS his positions (a
+        sibling's, and the quoted market's own) neither stand the bot off nor
+        count as its inventory: no skew toward unwinding them."""
+        _clean_persist()
+        a, b = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
+        self.assertEqual(imm.MANUAL_COEXIST_EVENTS, frozenset({
+            "KXVTPERMITS-27MAY03", "KXNYCASKRENT-27JAN31", "KXILNUCLEAR-27FEB28",
+            "KXCABUILDPERMITS-27JAN27", "KXPAMFGEMP-27APR30"}))
+        self.assertTrue(imm.manual_coexist("KXNYCASKRENT", "KXNYCASKRENT-27JAN31"))
+        self.assertFalse(imm.manual_coexist("KXNYCASKRENT", "KXNYCASKRENT-27FEB28"))
+
+        def run(coexist):
+            client = FakeClient()
+            client.markets[b] = dict(client.markets[a], ticker=b)
+            client.positions[b] = 100          # his, on the sibling
+            client.positions[a] = 100          # his, on the quoted market
+            bot = IncentiveMarketMaker(client=client, live=False)
+            evs = frozenset({"KXGOOD-99DEC31"}) if coexist else frozenset()
+            with mock.patch.object(imm, "MANUAL_COEXIST_EVENTS", evs):
+                self.assertEqual(bot.manual_events(client.positions),
+                                 set() if coexist else {"KXGOOD-99DEC31"})
+                bot.run_cycle()
+            return bot
+        bot = run(coexist=True)
+        self.assertIn(a, bot.state.selected)
+        size = {}
+        for o in bot.state.sim_orders.values():
+            if o["ticker"] == a:
+                size[o["book_side"]] = size.get(o["book_side"], 0) + o["remaining_count"]
+        self.assertEqual(set(size), {"bid", "ask"})
+        self.assertEqual(size["bid"], size["ask"])     # no skew off his +100
+        bot = run(coexist=False)                       # elsewhere: the standoff
+        self.assertNotIn(a, bot.state.selected)
+        self.assertEqual(bot.state.sim_orders, {})
+
 
 class TestStpProtectsUser(unittest.TestCase):
     def test_orders_placed_with_maker_stp(self):
@@ -25363,6 +25400,14 @@ class TestMlbPostseasonMvp(unittest.TestCase):
             self.assertFalse(a("KXMLBMENTION-26SEP12PITNYM-HOME"))
             with mock.patch.object(imm, "MLB_MVP_ENABLE", False):   # kill switch
                 self.assertFalse(a(self.ALCS_T))
+        # x2 on the World Series MVP only (Jack 2026-10-13: "2x")
+        self.assertEqual(imm.series_override("KXMLBWSMVP").size_mult, 2.0)
+        self.assertEqual(imm.applied_mention_mult("KXMLBWSMVP"), 2.0)
+        self.assertEqual(imm.series_max_position("KXMLBWSMVP"),
+                         2.0 * imm.MAX_POSITION_CONTRACTS)
+        for s in ("KXMLBALCSMVP", "KXMLBNLCSMVP"):
+            self.assertIsNone(imm.series_override(s).size_mult, s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
 
     def test_a_round_is_decided_by_its_completed_series(self):
         now = datetime(2025, 10, 21, 3, 0, tzinfo=timezone.utc)
