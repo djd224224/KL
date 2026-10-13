@@ -546,6 +546,7 @@ def enroll_new_series(client, dry: bool):
     imm.load_nfl_auto_series()
     imm.load_awards_extra_series()
     imm.load_graduate_auto_series()
+    imm.load_mention_auto_series()
     seen: dict = {}
     cursor = None
     while True:
@@ -610,6 +611,7 @@ def enroll_new_series(client, dry: bool):
     nfl_additions: dict = {}
     awards_additions = []
     grad_additions: dict = {}
+    mention_additions = []
     still_review = []
     for s, why, sample in review:
         se = series_meta(client, s)
@@ -623,6 +625,13 @@ def enroll_new_series(client, dry: bool):
         elif imm.GRADUATE_AUTO and gfam:
             grad_additions[s] = graduate_auto_entry(gfam, sample, se)
             enrolled.append((s, GRADUATE_AUTO_WHY[gfam], sample))
+        elif imm.MENTION_AUTO and se.get("category") == "Mentions":
+            why_not = mention_auto_why_not(client, s, sample, se)
+            if not why_not:
+                mention_additions.append(s)
+                enrolled.append((s, MENTION_AUTO_WHY, sample))
+            else:
+                still_review.append((s, f"{why}; mentions: {why_not}", sample))
         elif imm.NFL_AUTO_ENABLE and s.startswith("KXNFL"):
             entry, why_not = nfl_auto_entry_for(client, s, sample, se)
             if entry is not None:
@@ -666,7 +675,64 @@ def enroll_new_series(client, dry: bool):
         _merge_nfl_auto_file(imm.graduate_auto_path(), grad_additions)
         log(f"graduate-enrolled {len(grad_additions)} series "
             f"({', '.join(sorted(grad_additions))}) -> {imm.graduate_auto_path()}")
+    if mention_additions and not dry:
+        _merge_series_file(imm.mention_auto_path(), mention_additions)
+        log(f"mention-enrolled {len(mention_additions)} single-event Mentions "
+            f"series ({', '.join(sorted(mention_additions))}) -> {imm.mention_auto_path()}")
     return enrolled, review
+
+
+# SINGLE-EVENT MENTIONS BY KALSHI CATEGORY (Jack 2026-10-13: "build 3 Mentions
+# as auto-family (but dont include things like KXTRUMPSAY / -COMPANY / -MONTH
+# that require it's own rules and run a week or month with no broadcast to
+# stop before. only trade single events"). A REVIEW series Kalshi files under
+# Mentions (a MENTION-named one never gets here: classify_series enrolls it
+# as a mention family) joins incentive_mm.MENTION_AUTO_FILE (hot-reloaded;
+# the bot's rules are documented there) when it is ONE event. A WINDOW --
+# "anything said before <date>" -- has no broadcast to stand down before, so
+# it stays in review: the TRUMPSAY contract (KXTRUMPSAY / -COMPANY / -MONTH /
+# -COUNTRY ...), a week / month in the series or event title ("What will
+# Trump say this week?", "... in October?"), or an event sub-title reading
+# "Before <date>" (Kalshi's for every TRUMPSAY event). The event ticker must
+# name a day too (the bot's cutoff is 00:00 ET of it); one GET /events per
+# novel series.
+MENTION_AUTO_WHY = ("Kalshi Mentions category, one event -> mention auto family "
+                    "(out 00:00 ET of the event day)")
+MENTION_WINDOWED_CONTRACTS = frozenset({"TRUMPSAY"})
+_MENTION_WINDOW_RE = re.compile(
+    r"\b(this|next|each|every) (week|month)\b|\bweekly\b|\bmonthly\b|"
+    r"\bin (january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\b", re.I)
+_MENTION_BEFORE_RE = re.compile(r"^\s*(before|by|through|until)\b", re.I)
+
+
+def mention_auto_why_not(client, series: str, sample: str, se: dict) -> str:
+    """'' when the mention auto family takes a Mentions-category series, else
+    why not: a carve-out, the blocklist, a window rather than one event, no
+    day in the event ticker, or an unreadable event (review, retried)."""
+    if series in imm.MENTION_AUTO_EXCLUDE:
+        return "carved out (incentive_mm.MENTION_AUTO_EXCLUDE)"
+    if imm.series_pattern_blocked(series):
+        return "blocklisted (SERIES_BLOCK_PATTERNS)"
+    contract = _contract_of(se)
+    if contract in MENTION_WINDOWED_CONTRACTS:
+        return f"a window, not one event (contract {contract})"
+    title = str(se.get("title") or "")
+    if _MENTION_WINDOW_RE.search(title):
+        return f"a window, not one event ({title!r})"
+    event = sample.rsplit("-", 1)[0]
+    if imm.parse_event_date(event) is None:
+        return "no event day in the ticker"
+    try:
+        ev = (client.get(f"/events/{event}") or {}).get("event") or {}
+    except Exception as e:                           # noqa: BLE001
+        return f"event unread ({type(e).__name__})"
+    for text in (ev.get("title"), ev.get("sub_title")):
+        if text and _MENTION_WINDOW_RE.search(str(text)):
+            return f"a window, not one event ({text!r})"
+    if _MENTION_BEFORE_RE.search(str(ev.get("sub_title") or "")):
+        return f"a window, not one event ({ev.get('sub_title')!r})"
+    return ""
 
 
 # GRADUATE FAMILIES BY KALSHI METADATA (Jack 2026-10-12: "Build 1,2 as auto

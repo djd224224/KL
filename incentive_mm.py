@@ -4893,18 +4893,18 @@ MLB_LIVE_COOLDOWN_MIN = _env_int("IMM_MLB_LIVE_COOLDOWN_MIN", 15)
 MLB_LIVE_TTL_SECS = _env_int("IMM_MLB_LIVE_TTL_SECS", 60)
 MLB_GAME_OVER_AFTER_H = _env_float("IMM_MLB_GAME_OVER_AFTER_H", 8.0)  # extra innings
 MLB_DECIDED_LOOKBACK_DAYS = _env_int("IMM_MLB_DECIDED_LOOKBACK_DAYS", 3)
-# x2 on the WORLD SERIES MVP (Jack 2026-10-13: "2x", after "KXMLBWSMVP-26 is
-# not quoting"): every in-band player sat on payout_floor -- touches ~2,000
-# contracts deep, our share 2-7%, $0.19-0.92 projected per market over the
-# 1.5 days left in the program (to 10/14 23:19Z) against the $1.30 bar. At x2
-# Ramirez / Caminero / Chourio project ~$1.4-1.8 each. The family size_mult
-# wire scales rungs, caps and skew knees together; the LCS MVPs stay x1.
-# IMM_MLB_WSMVP_SIZE_MULT=1 reverts.
-MLB_WSMVP_SIZE_MULT = _env_float("IMM_MLB_WSMVP_SIZE_MULT", 2.0)
+# x2 on every MVP series (Jack 2026-10-13: "2x" after "KXMLBWSMVP-26 is not
+# quoting", then "why not 2x the other MVP markets?"). Every in-band WS MVP
+# player sat on payout_floor -- touches ~2,000 contracts deep, our share 2-7%,
+# $0.19-0.92 projected per market over the 1.5 days left in the program (to
+# 10/14 23:19Z) against the $1.30 bar; at x2 Ramirez / Caminero / Chourio
+# project ~$1.4-1.8. The LCS MVPs at x1 quoted two NLCS markets (Contreras,
+# Turang) with three ALCS ones just under the bar (Diaz / Ramirez / Caminero
+# $0.73-1.06). The family size_mult wire scales rungs, caps and skew knees
+# together. IMM_MLB_MVP_SIZE_MULT=1 reverts.
+MLB_MVP_SIZE_MULT = _env_float("IMM_MLB_MVP_SIZE_MULT", 2.0)
 for _s in MLB_MVP_ROUNDS:
-    SERIES_OVERRIDES[_s] = SeriesOverride(safe_join=True)
-SERIES_OVERRIDES["KXMLBWSMVP"] = replace(SERIES_OVERRIDES["KXMLBWSMVP"],
-                                         size_mult=MLB_WSMVP_SIZE_MULT)
+    SERIES_OVERRIDES[_s] = SeriesOverride(safe_join=True, size_mult=MLB_MVP_SIZE_MULT)
 
 
 def mlb_mvp_series(series: str) -> bool:
@@ -7238,6 +7238,85 @@ def graduate_auto_rules(series: str) -> bool:
     return graduate_auto_series(series) and (
         ov is None or ov == SERIES_OVERRIDES.get(GRADUATE_AUTO_PARENT))
 
+
+# MENTIONS BY KALSHI CATEGORY (Jack 2026-10-13: "build 3 Mentions as
+# auto-family (but dont include things like KXTRUMPSAY / -COMPANY / -MONTH
+# that require it's own rules and run a week or month with no broadcast to
+# stop before. only trade single events"). The mention families are admitted
+# by NAME -- the MENTION suffix, the classifier's "MENTION" rule -- which 416
+# of Kalshi's 455 Mentions-category series carry. The other 39 never could:
+# Trump's single events on the TRUMPMENTION contract (KXDJTRALLY,
+# KXDJTHANNITY, KXBUSINESSROUNDTABLE ...), the Stephen A. Smith / The Beat /
+# game-broadcast mentions, the Berkshire call, topic / count / duration /
+# starts-late markets -- and the windowed TRUMPSAY series. None paid on
+# 10/13 but TRUMPSAY's three. The new-series pass
+# (imm_earnings_overrides.mention_auto_why_not) writes each newly paying,
+# not-yet-allowed Mentions-category series that is ONE event -- not the
+# TRUMPSAY contract, no week / month window in its title or a "Before <date>"
+# sub-title, a day in its event ticker -- here, {"series": [...]}.
+# Hot-reloaded by mtime at import and every universe refresh. A member takes
+# MENTION_AUTO_PARENT (safe-join, the standard ladder; no event cap -- no
+# mention book is capped by event) and the GENERIC cutoff: 00:00 ET of the
+# event day, or Kalshi's occurrence when earlier. The named families'
+# start-time machinery (the resolvers, the listing-date rule, the live-event
+# gate) keys on the MENTION name and does not reach these, so a member stops
+# the night before its broadcast -- the safe error. MENTION_AUTO_EXCLUDE and
+# the blocklist always win; IMM_MENTION_AUTO=0 takes every member out.
+MENTION_AUTO = os.environ.get("IMM_MENTION_AUTO", "1") == "1"
+MENTION_AUTO_FILE = "mention_auto_series.json"          # in STATUS_DIR
+MENTION_AUTO_PARENT = "KXMENTIONAUTO"                   # a key only
+SERIES_OVERRIDES[MENTION_AUTO_PARENT] = SeriesOverride(safe_join=True)
+MENTION_AUTO_EXCLUDE = frozenset(
+    s.strip() for s in os.environ.get("IMM_MENTION_AUTO_EXCLUDE", "").split(",")
+    if s.strip())
+MENTION_AUTO_SERIES: Set[str] = set()
+_mention_auto_state = {"mtime": 0.0}
+
+
+def mention_auto_path() -> str:
+    return os.path.join(STATUS_DIR, MENTION_AUTO_FILE)
+
+
+def load_mention_auto_series() -> int:
+    """Re-read MENTION_AUTO_FILE when it changed; members changed, else 0.
+    Refuses blocklisted series, MENTION_AUTO_EXCLUDE and a MENTION-named
+    series (the named families' rules are its own)."""
+    try:
+        mtime = os.path.getmtime(mention_auto_path())
+    except OSError:
+        return 0
+    if mtime == _mention_auto_state["mtime"]:
+        return 0
+    _mention_auto_state["mtime"] = mtime
+    try:
+        with open(mention_auto_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! mention auto file unreadable: {e}")
+        return 0
+    fresh: Set[str] = set()
+    for s in data.get("series") or []:
+        s = str(s).strip()
+        if not s.startswith("KX") or "MENTION" in s or s in MENTION_AUTO_EXCLUDE:
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(s):
+            log(f"[IMM] ! refused blocklisted series in mention auto: {s}")
+            continue
+        fresh.add(s)
+    changed = len(fresh ^ MENTION_AUTO_SERIES)
+    MENTION_AUTO_SERIES.clear()
+    MENTION_AUTO_SERIES.update(fresh)
+    if changed:
+        log(f"[IMM] mention auto series: {len(fresh)} enrolled ({changed} changed)")
+    return changed
+
+
+def mention_auto_series(series: str) -> bool:
+    """A single-event Mentions-category member by Kalshi category
+    (MENTION_AUTO_FILE); nothing while IMM_MENTION_AUTO=0."""
+    return MENTION_AUTO and series in MENTION_AUTO_SERIES
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -7456,6 +7535,9 @@ FAMILY_OVERRIDE_PARENTS = (
     # graduate families by Kalshi metadata (2026-10-12): a copy of that
     # guard set without the archetype's family size, see GRADUATE_AUTO_FILE
     ("predicate", graduate_auto_series, GRADUATE_AUTO_PARENT),
+    # single-event mentions by Kalshi category (2026-10-13): safe-join on the
+    # generic cutoff, see MENTION_AUTO_FILE
+    ("predicate", mention_auto_series, MENTION_AUTO_PARENT),
     # NFL head-to-head (2026-10-12): a new KXNFL*H2H stat series, see
     # NFL_H2H_ENABLE (archetype KXNFLPASSYDSH2H)
     ("predicate", nfl_h2h_series, "KXNFLPASSYDSH2H"),
@@ -8461,6 +8543,8 @@ _CONFIG_CODE_KNOBS = (
     "AWARDS_AUTO", "AWARDS_AUTO_EVENT_TOP_N", "AWARDS_EXCLUDE",
     # graduate families by Kalshi metadata (2026-10-12)
     "GRADUATE_AUTO", "GRADUATE_AUTO_EXCLUDE",
+    # single-event mentions by Kalshi category (2026-10-13)
+    "MENTION_AUTO", "MENTION_AUTO_EXCLUDE",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -8581,7 +8665,7 @@ _CONFIG_CODE_KNOBS = (
     "NFL_LIVE_TTL_SECS",
     # MLB postseason MVPs (2026-10-12)
     "MLB_MVP_ENABLE", "MLB_LIVE_COOLDOWN_MIN", "MLB_LIVE_TTL_SECS",
-    "MLB_GAME_OVER_AFTER_H", "MLB_DECIDED_LOOKBACK_DAYS", "MLB_WSMVP_SIZE_MULT",
+    "MLB_GAME_OVER_AFTER_H", "MLB_DECIDED_LOOKBACK_DAYS", "MLB_MVP_SIZE_MULT",
     # hand positions the bot trades beside (2026-10-13)
     "MANUAL_COEXIST_EVENTS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
@@ -9521,6 +9605,7 @@ load_election_extra_series()   # Elections-category members (beside election_ser
 load_nfl_auto_series()         # NFL auto families (beside the election file)
 load_awards_extra_series()     # awards by Kalshi tag (beside the election file)
 load_graduate_auto_series()    # graduate families by Kalshi metadata (ditto)
+load_mention_auto_series()     # single-event mentions by Kalshi category (ditto)
 
 
 # ----------------------------------------------------------------------------
@@ -19146,7 +19231,8 @@ class IncentiveMarketMaker:
         source-verified -- family_series_allowed; the sports ladder /
         escalator regexes, ALLOW_SERIES_PATTERNS; the election family,
         election_series; the awards by Kalshi tag, awards_extra_series; the
-        graduate families by Kalshi metadata, graduate_auto_series)
+        graduate families by Kalshi metadata, graduate_auto_series; the
+        single-event mentions by Kalshi category, mention_auto_series)
         unless ALLOWLIST_ONLY is off."""
         if cls._blocked(ticker):
             return False
@@ -19173,6 +19259,7 @@ class IncentiveMarketMaker:
             awards_extra_series(series) or \
             mlb_mvp_series(series) or \
             graduate_auto_series(series) or \
+            mention_auto_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -19416,6 +19503,7 @@ class IncentiveMarketMaker:
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
         load_awards_extra_series()    # awards by Kalshi tag (2026-10-12)
         load_graduate_auto_series()   # graduate families by metadata (2026-10-12)
+        load_mention_auto_series()    # single-event mentions by category (2026-10-13)
         load_election_dates_extra()   # hot-reloaded rows (2026-10-07)
         load_awards_dates_extra()
         load_family_verdicts()

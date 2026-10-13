@@ -207,6 +207,9 @@ def setUpModule():
     # ...and the graduate families by Kalshi metadata (graduate_auto_series.json)
     imm.GRADUATE_AUTO_SERIES.clear()
     imm._graduate_auto_state["mtime"] = 0.0
+    # ...and the single-event mentions by Kalshi category (mention_auto_series.json)
+    imm.MENTION_AUTO_SERIES.clear()
+    imm._mention_auto_state["mtime"] = 0.0
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
@@ -25502,14 +25505,13 @@ class TestMlbPostseasonMvp(unittest.TestCase):
             self.assertFalse(a("KXMLBMENTION-26SEP12PITNYM-HOME"))
             with mock.patch.object(imm, "MLB_MVP_ENABLE", False):   # kill switch
                 self.assertFalse(a(self.ALCS_T))
-        # x2 on the World Series MVP only (Jack 2026-10-13: "2x")
-        self.assertEqual(imm.series_override("KXMLBWSMVP").size_mult, 2.0)
-        self.assertEqual(imm.applied_mention_mult("KXMLBWSMVP"), 2.0)
-        self.assertEqual(imm.series_max_position("KXMLBWSMVP"),
-                         2.0 * imm.MAX_POSITION_CONTRACTS)
-        for s in ("KXMLBALCSMVP", "KXMLBNLCSMVP"):
-            self.assertIsNone(imm.series_override(s).size_mult, s)
-            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+        # x2 on every MVP series (Jack 2026-10-13: "2x", "why not 2x the
+        # other MVP markets?")
+        for s in ("KXMLBWSMVP", "KXMLBALCSMVP", "KXMLBNLCSMVP"):
+            self.assertEqual(imm.series_override(s).size_mult, 2.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s),
+                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
 
     def test_a_round_is_decided_by_its_completed_series(self):
         now = datetime(2025, 10, 21, 3, 0, tzinfo=timezone.utc)
@@ -25738,6 +25740,114 @@ class TestGraduateAutoFamilies(unittest.TestCase):
             imm.load_graduate_auto_series()
             self.assertTrue(IncentiveMarketMaker._allowed("KXHORMUZPEAK-26OCT18-T10"))
             # the next run sees them covered: no re-enroll
+            enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+            self.assertEqual(enrolled2, [])
+
+
+class TestMentionAutoFamily(unittest.TestCase):
+    """Jack 2026-10-13: "build 3 Mentions as auto-family (but dont include
+    things like KXTRUMPSAY / -COMPANY / -MONTH that require it's own rules and
+    run a week or month with no broadcast to stop before. only trade single
+    events"."""
+
+    def setUp(self):
+        overrides = dict(imm.SERIES_OVERRIDES)
+
+        def reset():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+            imm.MENTION_AUTO_SERIES.clear()
+            imm._mention_auto_state["mtime"] = 0.0
+            try:
+                os.remove(imm.mention_auto_path())
+            except OSError:
+                pass
+        reset()
+        self.addCleanup(reset)
+
+    def _write(self, series):
+        with open(imm.mention_auto_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+        imm._mention_auto_state["mtime"] = 0.0
+        return imm.load_mention_auto_series()
+
+    def test_a_member_quotes_safe_join_to_the_night_before_its_event(self):
+        a = IncentiveMarketMaker._allowed
+        t = "KXDJTRALLY-26OCT20-TARIFF"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(a(t))
+        self.assertEqual(self._write(["KXDJTRALLY", "KXSASMITHMENTION", "KXOSCARAWARDACTR",
+                                      "notaseries"]), 1)
+        self.assertEqual(imm.MENTION_AUTO_SERIES, {"KXDJTRALLY"})
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(a(t))
+        imm.SERIES_OVERRIDES.pop("KXDJTRALLY", None)
+        imm.ensure_family_override("KXDJTRALLY")
+        ov = imm.series_override("KXDJTRALLY")
+        self.assertTrue(ov.safe_join)
+        self.assertIsNone(ov.size_mult)
+        self.assertEqual(imm.event_top_n_for("KXDJTRALLY"), 0)    # no event cap
+        # the generic cutoff: 00:00 ET of the event day, or an earlier occurrence
+        self.assertEqual(imm.trade_cutoff_utc("KXDJTRALLY-26OCT20", None, None),
+                         utc(2026, 10, 20, 4, 0))
+        self.assertEqual(imm.trade_cutoff_utc("KXDJTRALLY-26OCT20", utc(2026, 10, 19, 23, 0),
+                                              utc(2026, 10, 21, 4, 0)),
+                         utc(2026, 10, 19, 23, 0))
+        with mock.patch.object(imm, "MENTION_AUTO", False),                 mock.patch.object(imm, "ALLOWLIST_ONLY", True):      # the kill switch
+            self.assertFalse(a(t))
+        with mock.patch.object(imm, "MENTION_AUTO_EXCLUDE", frozenset({"KXDJTRALLY"})):
+            self.assertEqual(self._write(["KXDJTRALLY"]), 1)
+        self.assertEqual(imm.MENTION_AUTO_SERIES, set())
+
+    def test_the_new_series_pass_takes_single_events_not_windows(self):
+        import imm_earnings_overrides as ieo
+
+        def rec(contract, title):
+            return {"category": "Mentions", "title": title, "tags": ["Politicians"],
+                    "contract_url": f"https://x/{contract}.pdf"}
+        meta = {
+            "KXDJTRALLY": rec("TRUMPMENTION", "Trump Rally mention"),
+            "KXSASMITH": rec("MENTION", "Stephen A Smith Mention"),
+            "KXTRUMPSAY": rec("TRUMPSAY", "What will trump say"),
+            "KXTRUMPSAYMONTH": rec("TRUMPSAY", "Trump Monthly"),
+            "KXFOOSAYWEEK": rec("MENTION", "What will Foo say this week?"),
+            "KXBARSAY": rec("MENTION", "Bar says"),
+            "KXNODAY": rec("MENTION", "No day"),
+        }
+        events = {
+            "KXDJTRALLY-26OCT20": {"title": "What will Trump say during his rally?",
+                                   "sub_title": "Donald Trump - Rally Pittsburgh"},
+            "KXSASMITH-26OCT21": {"title": "What will Stephen A. Smith say?",
+                                  "sub_title": "on Oct 21, 2026"},
+            "KXBARSAY-26OCT19": {"title": "What will Bar say?", "sub_title": "Before Oct 19, 2026"},
+        }
+        tickers = ["KXDJTRALLY-26OCT20-TARIFF", "KXSASMITH-26OCT21-LEBRON",
+                   "KXTRUMPSAY-26OCT19-ANTI", "KXTRUMPSAYMONTH-26NOV01-ANTI",
+                   "KXFOOSAYWEEK-26OCT19-A", "KXBARSAY-26OCT19-A", "KXNODAY-ABC-A"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                if path.startswith("/events/"):
+                    return {"event": events.get(path[8:], {})}
+                raise AssertionError(path)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+            self.assertEqual(sorted(s for s, _w, _x in enrolled), ["KXDJTRALLY", "KXSASMITH"])
+            self.assertEqual({w for _s, w, _x in enrolled}, {ieo.MENTION_AUTO_WHY})
+            why = {s: w for s, w, _x in review}
+            for s in ("KXTRUMPSAY", "KXTRUMPSAYMONTH"):
+                self.assertIn("contract TRUMPSAY", why[s], s)
+            self.assertIn("a window", why["KXFOOSAYWEEK"])
+            self.assertIn("Before Oct 19", why["KXBARSAY"])
+            self.assertIn("no event day", why["KXNODAY"])
+            with open(imm.mention_auto_path(), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["series"], ["KXDJTRALLY", "KXSASMITH"])
+            imm.load_mention_auto_series()
+            self.assertTrue(IncentiveMarketMaker._allowed("KXDJTRALLY-26OCT20-TARIFF"))
             enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
             self.assertEqual(enrolled2, [])
 
