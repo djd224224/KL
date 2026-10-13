@@ -2354,12 +2354,13 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
                     imm.series_of(ev + "-X"), ev,
                     imm.trade_cutoff_utc(ev, None, None), None), ev)
 
-    def test_the_cma_awards_stand_down_on_the_shows_day(self):
+    def test_the_cma_awards_are_under_the_awards_rules(self):
         # Updated 2026-10-12: KXCMA had no cutoff on the premise that Kalshi
         # closes it before the show; its markets now close 2027-11-18, a
-        # year after the 60th CMA Awards (Wed Nov 18 2026, 8pm ET), so the
-        # show's day is its cutoff -- the hand row, else Kalshi's expected
-        # expiration (the show's morning). Its guard set is otherwise kept.
+        # year after the 60th CMA Awards (Wed Nov 18 2026, 8pm ET). Jack:
+        # "KXCMA move it to the award rules" -- out 31 days before the show
+        # (its nominations came before its markets listed), 3 per event,
+        # safe-join, table-only.
         cma = {"close_time": "2027-11-18T15:00:00Z",
                "expected_expiration_time": "2026-11-18T15:00:00Z",
                "occurrence_datetime": "2026-11-19T04:59:00Z"}
@@ -2368,17 +2369,28 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         for ev in ("KXCMA-NAOTY26", "KXCMA-SOTY26"):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXCMA", ev, None, close_time=utc(2027, 11, 18, 15, 0), market=cma),
-                utc(2026, 11, 18, 5, 0), ev)                  # 00:00 ET
-        # a year with no row: Kalshi's expiration, the show's morning
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXCMA", "KXCMA-NAOTY27", None, close_time=None,
-            market=dict(cma, expected_expiration_time="2027-11-17T15:00:00Z",
-                        occurrence_datetime="2027-11-18T04:59:00Z")),
-            utc(2027, 11, 17, 15, 0))
+                utc(2026, 10, 18, 5, 0), ev)          # Nov 18 00:00 ET - 31d
+        # next year's show has no row: stood down (Kalshi's dates are not
+        # used), a config gap for the research
+        ev27 = "KXCMA-NAOTY27"
+        imm._release_guard_warned.discard(ev27)
+        imm._config_gaps.pop(ev27, None)
+        try:
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXCMA", ev27, None, close_time=None,
+                market=dict(cma, expected_expiration_time="2027-11-17T15:00:00Z",
+                            occurrence_datetime="2027-11-18T04:59:00Z")),
+                imm.RELEASE_GUARD_UNKNOWN)
+            self.assertIn("no usable date", imm._config_gaps[ev27]["msg"])
+        finally:
+            imm._release_guard_warned.discard(ev27)
+            imm._config_gaps.pop(ev27, None)
         ov = imm.series_override("KXCMA")
-        self.assertTrue(ov.safe_join)
-        self.assertFalse(ov.pre_event_dates_only)
-        self.assertEqual(imm.event_top_n_for("KXCMA"), 0)              # no cap
+        self.assertEqual((ov.safe_join, ov.pre_event_days, ov.pre_event_dates_only),
+                         (True, 31.0, True))
+        self.assertIsNone(ov.size_mult)
+        self.assertEqual(imm.event_top_n_for("KXCMA"), 3)
+        self.assertEqual(imm.event_top_n_for("KXCMAX"), 0)   # exact entry
 
     def test_no_event_window_standdown_does_not_reach_them(self):
         # That screen is scoped to the MENTION suffix; a bare cutoff-less
@@ -25169,6 +25181,23 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         self.assertIn("no usable date",
                       imm._config_gaps["KXGRAMMYNOM-70BPDGP"]["msg"])
 
+    def test_the_grammy_nominees_quote_at_x2(self):
+        # Jack 2026-10-12: "yes 2x grammy" -- on the family parent, so the
+        # bare series and every KXGRAMMYNOM<CATEGORY> member, caps with it
+        self.assertEqual(imm.GRAMMY_NOM_SIZE_MULT, 2.0)
+        imm.SERIES_OVERRIDES.pop("KXGRAMMYNOMBPVA", None)
+        imm.ensure_family_override("KXGRAMMYNOMBPVA")
+        for s in ("KXGRAMMYNOM", "KXGRAMMYNOMBPVA"):
+            self.assertEqual(imm.series_override(s).size_mult, 2.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s),
+                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+        # the winner series stay x1, the count ladders stay out
+        self.assertIsNone(imm.series_override("KXGRAMMY").size_mult)
+        self.assertIsNone(imm.SERIES_OVERRIDES[imm.AWARDS_AUTO_PARENT].size_mult)
+        imm.ensure_family_override("KXGRAMMYNOMCOUNTKL")
+        self.assertNotIn("KXGRAMMYNOMCOUNTKL", imm.SERIES_OVERRIDES)
+
     def test_the_edition_is_read_from_either_end_of_the_segment(self):
         self.assertEqual(imm._awards_edition("69BPDGP"), "69")
         self.assertEqual(imm._awards_edition("69*"), "69")
@@ -25222,15 +25251,15 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         self.assertEqual(imm.AWARDS_EXTRA_SERIES, {"KXGRAMAOTY"})
 
     def test_a_code_family_in_the_file_keeps_its_own_rules(self):
-        # KXCMA quotes on the undated guard set (safe-join, no cap) by Jack's
-        # 9/11 call, out on the show's day; a tag entry must not give it the
-        # awards rules (the month-before stand-down, 3/event)
-        cma = imm.SERIES_OVERRIDES["KXCMA"]
-        self._write(["KXCMA"])
-        imm.ensure_family_override("KXCMA")
-        self.assertIs(imm.SERIES_OVERRIDES["KXCMA"], cma)
-        self.assertEqual(cma.pre_event_days, 0.0)
-        self.assertEqual(imm.event_top_n_for("KXCMA"), 0)
+        # KXMC quotes on the undated guard set (safe-join, no cap) by Jack's
+        # 9/11 call; a tag entry must not give it the awards rules (the
+        # month-before stand-down, 3/event)
+        mc = imm.SERIES_OVERRIDES["KXMC"]
+        self._write(["KXMC"])
+        imm.ensure_family_override("KXMC")
+        self.assertIs(imm.SERIES_OVERRIDES["KXMC"], mc)
+        self.assertIsNone(mc.pre_event_days)
+        self.assertEqual(imm.event_top_n_for("KXMC"), 0)
 
     def test_the_new_series_pass_enrolls_award_tagged_nominee_series(self):
         import imm_earnings_overrides as ieo

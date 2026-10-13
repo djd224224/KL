@@ -1069,6 +1069,7 @@ SERIES_OVERRIDES["KXRAINNYCW"] = SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE]
 # 2026-09-11 pm (KXMLBPLAYOFFS, KXMLBSEASONGAMES, KXVENUEPERFORM, then
 # KXCMA and KXMC -- see _DEFAULT_SPORTS_SERIES and
 # _DEFAULT_ENTERTAINMENT_SERIES for what each is and what it pays).
+# KXCMA left it on 2026-10-12 for the awards rules (AWARDS_SERIES).
 # All five are season/venue/title-level tickers whose second
 # segment does not parse as a date, so trade_cutoff_utc returns None and NO
 # hour of the day stands them down: "breakers are the only protection", per
@@ -1103,7 +1104,7 @@ SERIES_OVERRIDES["KXRAINNYCW"] = SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE]
 # KXHURCAT (2026-10-08) is the same shape: one event per storm, no date.
 for _s in os.environ.get(
         "IMM_UNDATED_GUARD_SERIES",
-        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM,KXCMA,KXMC,"
+        "KXMLBPLAYOFFS,KXMLBSEASONGAMES,KXVENUEPERFORM,KXMC,"
         "KXHURCAT").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(safe_join=True)
@@ -2572,6 +2573,9 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # Grammy nominees, a pattern
                                                 # FAMILY (2026-10-07)
                                                 "KXGRAMMYNOM:3,"
+                                                # CMA Awards, the awards
+                                                # rules since 2026-10-12
+                                                "=KXCMA:3,"
                                                 # OpenRouter token usage
                                                 # UNCAPPED (Jack 2026-09-29:
                                                 # "remove the 3-strike cap on
@@ -4999,8 +5003,8 @@ _DEFAULT_ECON_SERIES = (
 #     Kalshi closes these BEFORE it, so the bot is out by construction
 #     rather than by a cutoff rule -- occurrence_datetime sits AFTER
 #     expected_expiration here, so it never becomes a cutoff candidate.
-#     (No longer by 10/12: they close 2027-11-18, a year after the show, so
-#     the show's day is now a cutoff of its own -- CMA_PRE_EVENT_DAYS.)
+#     (No longer by 10/12: they close 2027-11-18, a year after the show.
+#     KXCMA has been under the awards rules since -- AWARDS_SERIES.)
 #   KXMC-<TITLE>-<SCORE>: "is the Metascore above N seven days after
 #     release", 156 markets over 12 titles (13 strikes each), $1,773/day.
 #     Close IS the resolution instant (10:00 ET on day seven), so the
@@ -13094,6 +13098,18 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #                       winner: Album of the Year", 2026-10-12): the same
 #                       Nov 16 nominations are their first narrowing. They
 #                       come in through the awards tag (AWARDS_EXTRA_FILE).
+#   60th CMA Awards     the show itself, Wed Nov 18 2026 (live on ABC 8-11pm
+#                       ET; the CMA's announcement via Holler and Lakes
+#                       Media) -> out Oct 18. KXCMA (allowed 9/11 on the
+#                       undated guard set) joined the awards rules on
+#                       2026-10-12 (Jack: "KXCMA move it to the award
+#                       rules"). Its markets listed AFTER the September
+#                       nominations (6 nominees each on 9/11), so the only
+#                       narrowing left is the show; the 9/11 premise that
+#                       Kalshi closes them before it no longer held (they
+#                       close 2027-11-18, and the bot logged cutoff None).
+#                       Table-only like the other winner families: next
+#                       year's KXCMA-*27 waits for a row (its nominations).
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
 AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
@@ -13101,13 +13117,13 @@ AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_SERIES",
         "KXGGNOM,KXNATBOOKAWARDS,KXGRAMMY,KXVMA,KXOSCAR,KXCRITICS,"
-        "KXGRAMMYNOM").split(",")
+        "KXGRAMMYNOM,KXCMA").split(",")
     if s.strip())
 AWARDS_TABLE_ONLY_SERIES = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_TABLE_ONLY_SERIES",
         "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICS,"
-        "KXGRAMMYNOM").split(",") if s.strip())
+        "KXGRAMMYNOM,KXCMA").split(",") if s.strip())
 # 99th-Oscars categories whose first narrowing is the Dec 15 2026 SHORTLIST
 # (winner AND nomination series, by Kalshi's own names; KXOSCARNOMBSOUND is
 # "Oscar nomination for Best Song" and KXOSCARVIS is Makeup & Hairstyling
@@ -13150,7 +13166,7 @@ _CRITICS_NOM_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR",
 _AWARDS_DATES_DEFAULT = (
     "KXGRAMMY-*69=2026-11-16,KXGRAMMYNOM*-69=2026-11-16,"
     "KXGRAMMYNOM-69*=2026-11-16,KXGRAM*-69=2026-11-16,"
-    # the 60th CMA Awards themselves (CMA_PRE_EVENT_DAYS)
+    # the 60th CMA Awards themselves (see "60th CMA Awards" above)
     "KXCMA-*26=2026-11-18,"
     "KXNATBOOKAWARDS-*26=2026-10-06,"
     + "".join(f"KXCRITICS{_c}-27=2026-11-16," for _c in _CRITICS_CRAFTS_27)
@@ -13335,21 +13351,6 @@ for _s in AWARDS_SERIES:
 SERIES_OVERRIDES[AWARDS_AUTO_PARENT] = SeriesOverride(
     safe_join=True, pre_event_days=AWARDS_PRE_EVENT_DAYS,
     pre_event_dates_only=True)
-# CMA AWARDS OUT ON THE SHOW'S DAY (2026-10-12, the awards review Jack asked
-# for: "all awards families should be looked at"). KXCMA quotes on the
-# undated guard set by his 9/11 call, between the nominations and the show,
-# on the premise "Kalshi closes these BEFORE it" -- no longer true: every
-# KXCMA-<CATEGORY>26 market now closes 2027-11-18, a year after the 60th CMA
-# Awards (Wed Nov 18 2026, live on ABC 8-11pm ET; the CMA's announcement via
-# Holler and Lakes Media), and the bot logged cutoff None for them, so it
-# would have quoted through the live reveal. It keeps its guard set and now
-# quotes to 00:00 ET of the show's day: pre_event_days 0 on the hand row
-# (KXCMA-*26), else Kalshi's expected expiration (the show's morning, 15:00Z).
-# The award shows' month-before stand-down and 3/event cap are NOT applied
-# here -- that is Jack's call. IMM_CMA_PRE_EVENT_DAYS moves it.
-CMA_PRE_EVENT_DAYS = _env_float("IMM_CMA_PRE_EVENT_DAYS", 0.0)
-SERIES_OVERRIDES["KXCMA"] = replace(SERIES_OVERRIDES.get("KXCMA") or SeriesOverride(),
-                                    pre_event_days=CMA_PRE_EVENT_DAYS)
 # CRITICS CHOICE x2 (Jack 2026-10-07: "2x"). Six of the 8 TV categories
 # Kalshi listed late sat out on the floor: every in-band nominee shares its
 # $19.40/day with 26k-57k contracts already in the band, so the standard
@@ -13362,6 +13363,18 @@ SERIES_OVERRIDES["KXCMA"] = replace(SERIES_OVERRIDES.get("KXCMA") or SeriesOverr
 CRITICS_SIZE_MULT = _env_float("IMM_CRITICS_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
                                         size_mult=CRITICS_SIZE_MULT)
+# GRAMMY NOMINEES x2 (Jack 2026-10-12: "yes 2x grammy"), the Critics Choice
+# precedent: the one-series KXGRAMMYNOM books were stacked from listing (~50k
+# contracts per market, placeholders at 1c / 99c), so at x1 only 3 of the 60
+# cleared the $1 payout floor ($0.17-0.40/day each) with ~3 days left to the
+# Oct 16 stand-down. Set on the family parent "KXGRAMMYNOM": the bare series
+# reads it directly and every KXGRAMMYNOM<CATEGORY> member clones it, so the
+# rungs, caps and skew knees scale together; the hour windows still compose.
+# The Grammy WINNER series (KXGRAMMY, the tag-enrolled KXGRAMAOTY) stay x1.
+# IMM_GRAMMY_NOM_SIZE_MULT=1 reverts (env => task-level restart).
+GRAMMY_NOM_SIZE_MULT = _env_float("IMM_GRAMMY_NOM_SIZE_MULT", 2.0)
+SERIES_OVERRIDES["KXGRAMMYNOM"] = replace(SERIES_OVERRIDES["KXGRAMMYNOM"],
+                                          size_mult=GRAMMY_NOM_SIZE_MULT)
 
 # FAMILY x2, 2026-10-11 (Jack: "do 1,2,6,8" -- #2 and #6 of the consolidated
 # recommendations): Rotten Tomatoes, Trump endorsements, the strait / port
