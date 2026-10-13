@@ -4815,15 +4815,27 @@ def nfl_live_verdict(get_json, now_ts: float,
     over); (False, '') when none is; (None, why) when the scoreboard cannot
     be read -- callers treat that as live (fail closed). Reads today's ET
     scoreboard, and yesterday's before 4am ET (a late game past midnight)."""
+    return espn_live_verdict("NFL", get_json, now_ts, final_seen,
+                             NFL_LIVE_COOLDOWN_MIN, 5.0, "kickoff")
+
+
+def espn_live_verdict(league: str, get_json, now_ts: float,
+                      final_seen: Dict[str, float], cooldown_min: float,
+                      over_after_h: float, start_word: str
+                      ) -> Tuple[Optional[bool], str]:
+    """nfl_live_verdict for any ESPN_LEAGUE_PATHS league: live while a game
+    is past its scheduled start and not final, or final less than
+    `cooldown_min` ago (a final that started over `over_after_h` hours ago is
+    long over); None when the scoreboard cannot be read."""
     now = datetime.fromtimestamp(now_ts, timezone.utc)
     et = now.astimezone(ET)
     days = [et.date()] + ([et.date() - timedelta(days=1)] if et.hour < 4 else [])
     for d in days:
         try:
-            data = get_json(f"{ESPN_SITE_API}/{ESPN_LEAGUE_PATHS['NFL']}/"
+            data = get_json(f"{ESPN_SITE_API}/{ESPN_LEAGUE_PATHS[league]}/"
                             f"scoreboard?dates={d.strftime('%Y%m%d')}")
         except Exception as e:                       # noqa: BLE001
-            return None, f"NFL scoreboard unreadable ({type(e).__name__})"
+            return None, f"{league} scoreboard unreadable ({type(e).__name__})"
         for ev in (data or {}).get("events") or []:
             st = (ev.get("status") or {}).get("type") or {}
             name, state = str(st.get("name") or ""), str(st.get("state") or "")
@@ -4834,17 +4846,77 @@ def nfl_live_verdict(get_json, now_ts: float,
             if state == "in":
                 return True, f"{short} live ({st.get('detail') or name})"
             if state == "post" or st.get("completed"):
-                if kick is not None and now - kick > timedelta(hours=5):
+                if kick is not None and now - kick > timedelta(hours=over_after_h):
                     continue
                 gid = str(ev.get("id") or short)
                 first = final_seen.setdefault(gid, now_ts)
-                if now_ts - first < NFL_LIVE_COOLDOWN_MIN * 60:
+                if now_ts - first < cooldown_min * 60:
                     return True, (f"{short} final {(now_ts - first) / 60:.0f}m ago "
-                                  f"(cooldown {NFL_LIVE_COOLDOWN_MIN}m)")
+                                  f"(cooldown {cooldown_min:g}m)")
                 continue
             if kick is not None and kick <= now:
-                return True, f"{short} past kickoff, not yet live on ESPN"
+                return True, f"{short} past {start_word}, not yet live on ESPN"
     return False, ""
+
+
+# MLB POSTSEASON MVPs (Jack 2026-10-12: "yes quote MLB MVPs under a
+# no-quotes-during-games rule"). KXMLBALCSMVP / KXMLBNLCSMVP / KXMLBWSMVP:
+# one market per player ("If <player> wins the ... MVP in the 2026 season"),
+# 49 / 49 / 98 markets, $100 per market per period on the 10/12 programs
+# (~$7.6k across the three); not award-tagged (Sports / Baseball). Kalshi's
+# dates are placeholders (close Dec 8, expiration Dec 31; can_close_early),
+# so the markets give no cutoff. The MVP is decided INSIDE games -- every
+# at-bat moves it -- and announced on the field minutes after the clinching
+# out, before Kalshi closes the event. So a member sits out (orders
+# cancelled, positions ride):
+#   * while ANY MLB game is live -- espn_live_verdict on ESPN's MLB board:
+#     started and not final, or final under MLB_LIVE_COOLDOWN_MIN ago (an
+#     LCS game moves the World Series MVP too) -- the NFL season props' rule;
+#   * for good once its ROUND is decided: a game of that round ("ALCS - Game
+#     7", "World Series - Game 4" in ESPN's notes) whose series is completed,
+#     on today's board or the MLB_DECIDED_LOOKBACK_DAYS before it (sticky for
+#     the process; after that the repriced book -- 1c / 99c -- is outside the
+#     band anyway);
+#   * whenever a board cannot be read (fail closed).
+# Safe-join, the standard ladder and caps (no family size). Exact series
+# names only: KXMLBMENTION is mlb_trading.py's book. IMM_MLB_MVP_ENABLE=0
+# takes them out.
+MLB_MVP_ENABLE = os.environ.get("IMM_MLB_MVP_ENABLE", "1") == "1"
+# series -> the ESPN round its MVP is decided in (the game note's prefix)
+MLB_MVP_ROUNDS = {"KXMLBALCSMVP": "ALCS", "KXMLBNLCSMVP": "NLCS",
+                  "KXMLBWSMVP": "World Series"}
+MLB_LIVE_COOLDOWN_MIN = _env_int("IMM_MLB_LIVE_COOLDOWN_MIN", 15)
+MLB_LIVE_TTL_SECS = _env_int("IMM_MLB_LIVE_TTL_SECS", 60)
+MLB_GAME_OVER_AFTER_H = _env_float("IMM_MLB_GAME_OVER_AFTER_H", 8.0)  # extra innings
+MLB_DECIDED_LOOKBACK_DAYS = _env_int("IMM_MLB_DECIDED_LOOKBACK_DAYS", 3)
+for _s in MLB_MVP_ROUNDS:
+    SERIES_OVERRIDES[_s] = SeriesOverride(safe_join=True)
+
+
+def mlb_mvp_series(series: str) -> bool:
+    """A postseason MVP series (MLB_MVP_ROUNDS); nothing while
+    IMM_MLB_MVP_ENABLE=0."""
+    return MLB_MVP_ENABLE and series in MLB_MVP_ROUNDS
+
+
+def mlb_rounds_decided(board) -> Dict[str, str]:
+    """{round: series summary} for the postseason rounds an ESPN MLB board
+    shows decided: a game whose series is completed (the clinching game,
+    "TOR wins series 4-3"), or a side with the wins to take it."""
+    out: Dict[str, str] = {}
+    for ev in (board or {}).get("events") or []:
+        comp = (ev.get("competitions") or [{}])[0]
+        rnd = " ".join(str(n.get("headline") or "")
+                       for n in comp.get("notes") or []).split(" - ")[0].strip()
+        ser = comp.get("series") or {}
+        if not rnd or not ser:
+            continue
+        total = int(ser.get("totalCompetitions") or 0)
+        wins = max((int(c.get("wins") or 0) for c in ser.get("competitors") or []),
+                   default=0)
+        if ser.get("completed") or (total and wins >= total // 2 + 1):
+            out[rnd] = str(ser.get("summary") or f"{wins} wins")
+    return out
 
 
 def election_series(series: str) -> bool:
@@ -8311,6 +8383,9 @@ _CONFIG_CODE_KNOBS = (
     "NFL_AUTO_ENABLE", "NFL_AUTO_INACTIVE_BUFFER_MIN", "NFL_AUTO_SIZE_MULT",
     "NFL_AUTO_DAILY_LOSS_LIMIT", "NFL_LIVE_COOLDOWN_MIN",
     "NFL_LIVE_TTL_SECS",
+    # MLB postseason MVPs (2026-10-12)
+    "MLB_MVP_ENABLE", "MLB_LIVE_COOLDOWN_MIN", "MLB_LIVE_TTL_SECS",
+    "MLB_GAME_OVER_AFTER_H", "MLB_DECIDED_LOOKBACK_DAYS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
     # status file's "knobs" block
     "TREASURY_GATE_ENABLE", "TREASURY_GATE_ALL",
@@ -15725,6 +15800,13 @@ class IncentiveMarketMaker:
         # (checked_at, verdict, why) and when each game was first seen final
         self._nfl_live_cache: Optional[Tuple[float, Optional[bool], str]] = None
         self._nfl_final_seen: Dict[str, float] = {}
+        # MLB postseason MVPs (_mlb_mvp_hold): ESPN boards by URL (checked_at,
+        # data), when each game was first seen final, the rounds seen decided
+        # (sticky for the process) and the series standing aside (logged once)
+        self._mlb_get_cache: Dict[str, Tuple[float, Any]] = {}
+        self._mlb_final_seen: Dict[str, float] = {}
+        self._mlb_decided: Dict[str, str] = {}
+        self._mlb_stood_series: Set[str] = set()
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
@@ -18883,6 +18965,7 @@ class IncentiveMarketMaker:
             nfl_h2h_series(series) or \
             nfl_auto_entry(series) is not None or \
             awards_extra_series(series) or \
+            mlb_mvp_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -20784,6 +20867,52 @@ class IncentiveMarketMaker:
                                         self._nfl_final_seen)
         self._nfl_live_cache = (now_ts, verdict, why)
         return verdict, why
+
+    def _mlb_get(self, url: str, now_ts: float, ttl: float):
+        """An ESPN MLB board through the resolver's client (its host-down
+        skip), cached per URL for `ttl` seconds; raises when unreadable."""
+        hit = self._mlb_get_cache.get(url)
+        if hit is not None and now_ts - hit[0] < ttl:
+            return hit[1]
+        data = self.resolver._get(url)
+        self._mlb_get_cache[url] = (now_ts, data)
+        return data
+
+    def _mlb_mvp_hold(self, series: str, now_ts: float) -> str:
+        """Why an MLB postseason MVP market sits out now ('' = quote): its
+        round decided on ESPN's boards -- today's and the
+        MLB_DECIDED_LOOKBACK_DAYS before it, sticky for the process -- or
+        any MLB game live (espn_live_verdict). An unreadable board holds it
+        too (fail closed). See MLB_MVP_ROUNDS."""
+        rnd = MLB_MVP_ROUNDS[series]
+        today = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(ET).date()
+        for k in range(MLB_DECIDED_LOOKBACK_DAYS + 1):
+            if rnd in self._mlb_decided:
+                break
+            d = today - timedelta(days=k)
+            url = (f"{ESPN_SITE_API}/{ESPN_LEAGUE_PATHS['MLB']}/"
+                   f"scoreboard?dates={d.strftime('%Y%m%d')}")
+            try:
+                # today's / yesterday's boards as fresh as the live check;
+                # older ones are final
+                board = self._mlb_get(url, now_ts,
+                                      MLB_LIVE_TTL_SECS if k <= 1 else 6 * 3600)
+            except Exception as e:                       # noqa: BLE001
+                return f"MLB scoreboard unreadable ({type(e).__name__})"
+            for r, summary in mlb_rounds_decided(board).items():
+                if r not in self._mlb_decided:
+                    self._mlb_decided[r] = summary
+                    log(f"{self.tag} mlb {r} decided ({summary}): its MVP "
+                        f"markets stay out")
+        if rnd in self._mlb_decided:
+            return f"{rnd} decided ({self._mlb_decided[rnd]})"
+        live, why = espn_live_verdict(
+            "MLB", lambda u: self._mlb_get(u, now_ts, MLB_LIVE_TTL_SECS),
+            now_ts, self._mlb_final_seen, MLB_LIVE_COOLDOWN_MIN,
+            MLB_GAME_OVER_AFTER_H, "first pitch")
+        if live is not False:
+            return why or "MLB scoreboard unreadable"
+        return ""
 
     def _twk_pnl(self, key: str) -> float:
         """One pilot budget's realized + mark-to-market (pilot_halt_key: a
@@ -23147,6 +23276,23 @@ class IncentiveMarketMaker:
             if t in self._nfl_stood:
                 self._nfl_stood.discard(t)
                 log(f"{self.tag} nfl resume {t}")
+            # MLB POSTSEASON MVPs (Jack 2026-10-12: "quote MLB MVPs under a
+            # no-quotes-during-games rule", see MLB_MVP_ROUNDS): out while any
+            # MLB game is live, and for good once the round is decided.
+            # Logged per series (49-98 markets each).
+            if mlb_mvp_series(meta.series):
+                mv_why = self._mlb_mvp_hold(meta.series, now_ts)
+                if mv_why:
+                    if meta.series not in self._mlb_stood_series:
+                        self._mlb_stood_series.add(meta.series)
+                        log(f"{self.tag} mlb mvp stand-aside {meta.series}: {mv_why}")
+                    self.cancel_market_orders(t, resting)
+                    mv_in = {"why": mv_why}
+                    self._gskip(t, "mlb_mvp", lambda: mv_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                if meta.series in self._mlb_stood_series:
+                    self._mlb_stood_series.discard(meta.series)
+                    log(f"{self.tag} mlb mvp resume {meta.series}")
 
             # Past-cutoff managed markets (only reduce-only EXTRAS can reach
             # here — selected members die at the _screen): cancel and go

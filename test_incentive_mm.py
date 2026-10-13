@@ -21963,7 +21963,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # REST budget's rest_off (2026-10-11) + the Trump weekly pilots' loss
         # halt (2026-10-11) + the NFL head-to-head team-news hold (2026-10-12)
         # + the NFL auto families' live-game stand-aside (2026-10-12)
-        self.assertEqual(len(conts), 43)
+        # + the MLB postseason MVPs' live-game / decided stand-aside (10-12)
+        self.assertEqual(len(conts), 44)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -25282,14 +25283,14 @@ class TestAwardsByKalshiTag(unittest.TestCase):
                                     "title": "WHO WILL ATTEND THE ACTOR AWARDS"},
             "KXROLLINGSTONECOVER": {"category": "Entertainment", "tags": ["Awards"],
                                     "title": "WHO WILL BE ON THE ROLLINGSTONE COVER THIS YEAR"},
-            # an MVP is a sports award Kalshi files under Sports: review
-            "KXMLBALCSMVP": {"category": "Sports", "tags": ["Baseball"],
-                             "title": "Pro Baseball American League Championship Series MVP"},
+            # a sports award Kalshi files under Sports: review
+            "KXSUPERBALLONDOR": {"category": "Sports", "tags": ["Soccer"],
+                                 "title": "Super Ballon d'Or"},
         }
         tickers = ["KXGRAMAOTY-69-LIF", "KXAWARDSCMAEOTY-26-MOR", "KXGRAMBAC-69-ABC",
                    "KXVMACOUNTRY-27-ABC", "KXGRAMMYCOUNTSZA-69-T3", "KXGGVIEWERS-27-T20",
                    "KXACTORAWARDSATTEND-27-ABC", "KXROLLINGSTONECOVER-26-ABC",
-                   "KXMLBALCSMVP-26-ABC"]
+                   "KXSUPERBALLONDOR-30-ABC"]
 
         class _Client:
             def get(self, path, params=None):
@@ -25305,13 +25306,13 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             self.assertEqual({w for _s, w, _x in enrolled}, {ieo.AWARDS_ENROLL_WHY})
             why = {s: w for s, w, _x in review}
             self.assertEqual(sorted(why), ["KXACTORAWARDSATTEND", "KXGGVIEWERS",
-                                           "KXGRAMMYCOUNTSZA", "KXMLBALCSMVP",
-                                           "KXROLLINGSTONECOVER"])
+                                           "KXGRAMMYCOUNTSZA", "KXROLLINGSTONECOVER",
+                                           "KXSUPERBALLONDOR"])
             for s in ("KXGRAMMYCOUNTSZA", "KXGGVIEWERS"):
                 self.assertIn("count / threshold ladder", why[s], s)
             for s in ("KXACTORAWARDSATTEND", "KXROLLINGSTONECOVER"):
                 self.assertIn("not a nominee binary", why[s], s)
-            self.assertNotIn("awards:", why["KXMLBALCSMVP"])
+            self.assertNotIn("awards:", why["KXSUPERBALLONDOR"])
             with open(imm.awards_extra_path(), encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["series"], took)
             imm.load_awards_extra_series()
@@ -25319,6 +25320,141 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             # the next run sees them covered: no re-enroll
             enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
             self.assertEqual(enrolled2, [])
+
+
+class TestMlbPostseasonMvp(unittest.TestCase):
+    """Jack 2026-10-12: "yes quote MLB MVPs under a no-quotes-during-games
+    rule" -- KXMLBALCSMVP / KXMLBNLCSMVP / KXMLBWSMVP."""
+
+    ALCS_T = "KXMLBALCSMVP-26-JCAMINERO13"
+    NLCS_T = "KXMLBNLCSMVP-26-WCONTRERAS24"
+
+    @staticmethod
+    def _game(state, start, rnd="ALCS - Game 1", gid="1", completed=False,
+              summary="", wins=(0, 0)):
+        """An ESPN MLB board event, the shape served on 10/12."""
+        return {"id": gid, "shortName": "CLE @ TB",
+                "date": start.strftime("%Y-%m-%dT%H:%MZ"),
+                "status": {"type": {"state": state, "completed": state == "post",
+                                    "name": {"in": "STATUS_IN_PROGRESS",
+                                             "post": "STATUS_FINAL"}.get(state, "STATUS_SCHEDULED"),
+                                    "detail": "Top 5th"}},
+                "competitions": [{"notes": [{"headline": rnd}],
+                                  "series": {"type": "playoff", "title": "Playoff Series",
+                                             "summary": summary, "completed": completed,
+                                             "totalCompetitions": 7,
+                                             "competitors": [{"id": "30", "wins": wins[0]},
+                                                             {"id": "5", "wins": wins[1]}]}}]}
+
+    def test_the_three_series_are_admitted_by_exact_name(self):
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t in (self.ALCS_T, self.NLCS_T, "KXMLBWSMVP-26-YYAMAMOTO18"):
+                self.assertTrue(a(t), t)
+                self.assertFalse(b(t), t)
+                self.assertTrue(imm.series_override(imm.series_of(t)).safe_join, t)
+                self.assertEqual(imm.event_top_n_for(imm.series_of(t)), 0, t)
+            # exact names: no KXMLB prefix bleed, mlb_trading.py's book frozen
+            self.assertFalse(a("KXMLBALCSMVPX-26-A"))
+            self.assertTrue(b("KXMLBMENTION-26SEP12PITNYM-HOME"))
+            self.assertFalse(a("KXMLBMENTION-26SEP12PITNYM-HOME"))
+            with mock.patch.object(imm, "MLB_MVP_ENABLE", False):   # kill switch
+                self.assertFalse(a(self.ALCS_T))
+
+    def test_a_round_is_decided_by_its_completed_series(self):
+        now = datetime(2025, 10, 21, 3, 0, tzinfo=timezone.utc)
+        board = {"events": [
+            self._game("post", now - timedelta(hours=4), "ALCS - Game 7", "1", True,
+                       "TOR wins series 4-3", (4, 3)),
+            self._game("post", now - timedelta(hours=8), "NLCS - Game 2", "2", False,
+                       "MIL leads series 2-0", (2, 0)),
+            # the wins alone decide it if ESPN has not flagged the series yet
+            self._game("post", now - timedelta(hours=3), "World Series - Game 4", "3",
+                       False, "LAD lead series 4-0", (4, 0)),
+            {"id": "4", "competitions": [{"notes": [], "series": {}}]}]}
+        self.assertEqual(imm.mlb_rounds_decided(board),
+                         {"ALCS": "TOR wins series 4-3",
+                          "World Series": "LAD lead series 4-0"})
+        self.assertEqual(imm.mlb_rounds_decided({}), {})
+        self.assertEqual(imm.mlb_rounds_decided(None), {})
+
+    def _bot(self, boards):
+        """A bot quoting the two LCS MVP markets; ESPN answers from `boards`
+        (a one-item list holding the board every date returns, or an
+        exception to raise)."""
+        client = FakeClient()
+        lv = [["0.36", "400"], ["0.37", "400"], ["0.38", "400"],
+              ["0.39", "400"], ["0.40", "300"]]
+        for t in (self.ALCS_T, self.NLCS_T):
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                "close_time": "2068-12-08T15:00:00Z", "yes_bid_dollars": "0.4000",
+                "yes_ask_dollars": "0.6000", "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+
+        def espn(url):
+            if isinstance(boards[0], Exception):
+                raise boards[0]
+            return boards[0]
+        bot.resolver = imm.EventStartResolver(http_get_json=espn)
+        return bot
+
+    @staticmethod
+    def _sides(bot, t):
+        return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+    def test_out_while_any_game_is_live_and_for_good_once_the_round_is_decided(self):
+        _clean_persist()
+        self.addCleanup(_clean_persist)
+        now = datetime.now(timezone.utc)
+        boards = [{"events": []}]
+        bot = self._bot(boards)
+        bot.run_cycle()                                     # no game on: both quote
+        for t in (self.ALCS_T, self.NLCS_T):
+            self.assertIn(t, bot.state.selected, t)
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"}, t)
+
+        def cycle(board):
+            boards[0] = board
+            bot._mlb_get_cache.clear()
+            bot.run_cycle()
+        # an NLCS game in progress: BOTH series out (any game)
+        cycle({"events": [self._game("in", now - timedelta(hours=1), "NLCS - Game 3")]})
+        for t in (self.ALCS_T, self.NLCS_T):
+            self.assertEqual(self._sides(bot, t), set(), t)
+        self.assertEqual(bot._mlb_stood_series, {"KXMLBALCSMVP", "KXMLBNLCSMVP"})
+        # final: out for the cooldown, back after it
+        fin = {"events": [self._game("post", now - timedelta(hours=3), "NLCS - Game 3",
+                                     summary="MIL leads series 3-0", wins=(3, 0))]}
+        cycle(fin)
+        self.assertEqual(self._sides(bot, self.NLCS_T), set())
+        bot._mlb_final_seen["1"] = time.time() - (imm.MLB_LIVE_COOLDOWN_MIN + 1) * 60
+        cycle(fin)
+        for t in (self.ALCS_T, self.NLCS_T):
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"}, t)
+        self.assertEqual(bot._mlb_stood_series, set())
+        # the NLCS clinched: its MVP stays out after the cooldown; the ALCS
+        # MVP quotes on
+        won = {"events": [self._game("post", now - timedelta(hours=3), "NLCS - Game 4",
+                                     gid="2", completed=True,
+                                     summary="MIL wins series 4-0", wins=(4, 0))]}
+        bot._mlb_final_seen["2"] = time.time() - (imm.MLB_LIVE_COOLDOWN_MIN + 1) * 60
+        cycle(won)
+        self.assertEqual(self._sides(bot, self.NLCS_T), set())
+        self.assertEqual(self._sides(bot, self.ALCS_T), {"bid", "ask"})
+        self.assertEqual(bot._mlb_decided, {"NLCS": "MIL wins series 4-0"})
+        cycle({"events": []})                           # sticky for the process
+        self.assertEqual(self._sides(bot, self.NLCS_T), set())
+        # an unreadable board holds the ALCS MVP too (fail closed)
+        cycle(ConnectionError("espn down"))
+        self.assertEqual(self._sides(bot, self.ALCS_T), set())
 
 
 class TestElectionBatch20261005(unittest.TestCase):
