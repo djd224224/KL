@@ -17,8 +17,9 @@
 #     the next morning still writes the day it missed.
 #  2. Waits for the evening BigQuery load. The "5 PM ET" cron in
 #     run_high_temp_monitoring.yml (21:00Z) has really started 7:15-9:35 PM
-#     ET, and D's settlements are not in BigQuery before it. Checked every
-#     10 min for up to 5 h; after that the digest is written with estimates.
+#     ET, and 10:17 PM on 10/12; D's settlements are not in BigQuery before
+#     it. Checked every 10 min for up to 7 h; after that the digest is
+#     written with estimates.
 #  3. claude -p writes run-logs\high-temp\<D>.html in its own worktree,
 #     $Wt (detached at origin/main), never in KL, the live bot's checkout.
 #  4. This script, not Claude, checks the file, updates latest.html, commits
@@ -47,7 +48,7 @@ $Skill = "C:\Users\jackd\.claude\scheduled-tasks\high-temp-daily-digest\SKILL.md
 $Python = "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe"
 $SdkBin = "C:\Users\jackd\tools\google-cloud-sdk\bin"
 $ClaudeTimeoutMin = 45
-$LoadWaitHours = 5
+$LoadWaitHours = 7
 $LoadPollMin = 10
 
 $LogDir = Join-Path $Repo "run-logs\high-temp-digest"

@@ -3,12 +3,12 @@
 # itself). Replaces the Claude Desktop scheduled task "high-temp-daily-digest",
 # whose runs stalled on permission prompts (disabled 2026-10-12).
 # Battery-safe, StartWhenAvailable for a trigger missed in standby, one
-# instance at a time. 7 h limit: up to 5 h waiting for the evening BigQuery
+# instance at a time. 9 h limit: up to 7 h waiting for the evening BigQuery
 # load, then up to 45 min of claude -p per day.
 # Safe to re-run: -Force replaces the definition.
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 7)
+    -ExecutionTimeLimit (New-TimeSpan -Hours 9)
 Register-ScheduledTask -TaskName "KL high-temp-digest" `
     -Description "KXHIGH daily digest: waits for the evening BigQuery load, claude -p writes run-logs\high-temp\<D>.html in its own worktree, then commit + push + email (run_high_temp_digest.ps1)." `
     -Action (New-ScheduledTaskAction -Execute "wscript.exe" `
