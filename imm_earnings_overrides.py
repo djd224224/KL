@@ -1142,7 +1142,11 @@ def _norm_show(s: str) -> str:
 def discover_broadcast_mention_events(client, now):
     """[(event, series)] for active-program non-earnings MENTION events with
     a parseable ticker date within the lookahead that the bot's resolver
-    cannot place — the population that silently dies at the midnight rule."""
+    cannot place — the population that silently dies at the midnight rule.
+    The single-event Mentions auto family (incentive_mm.mention_auto_series,
+    2026-10-13: KXDJTRALLY ... -- no MENTION in the name) is discovered the
+    same way, so its starts get written too."""
+    imm.load_mention_auto_series()
     events = {}
     cursor = None
     for _page in range(20):
@@ -1154,7 +1158,8 @@ def discover_broadcast_mention_events(client, now):
         for p in batch:
             t = p.get("market_ticker") or ""
             series = t.split("-")[0]
-            if not series.endswith("MENTION") or series.startswith(_EARNINGS_PREFIX):
+            if not (series.endswith("MENTION") or imm.mention_auto_series(series)) \
+                    or series.startswith(_EARNINGS_PREFIX):
                 continue
             events.setdefault("-".join(t.split("-")[:2]), series)
         cursor = resp.get("next_cursor")
@@ -1475,8 +1480,12 @@ def auto_broadcast_start(client, ev: str, series: str):
         return None, None, None, title
     d_et = d.astimezone(ET).date()
     # WH-schedule series: try the Factbase calendar before TVmaze -- these
-    # events are appearances, not shows
-    if series.startswith(WH_SCHEDULE_SERIES):
+    # events are appearances, not shows. So is a Trump single event of the
+    # Mentions auto family (2026-10-13: KXDJTRALLY, KXBUSINESSROUNDTABLE ...,
+    # the TRUMPMENTION contract), known by Trump in its event's title.
+    if series.startswith(WH_SCHEDULE_SERIES) or (
+            imm.mention_auto_series(series)
+            and "trump" in f"{title} {sub_title}".lower()):
         wh = wh_schedule_start(title, d_et, sub_title)
         if wh:
             dt_et, det = wh

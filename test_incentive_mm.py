@@ -25888,26 +25888,33 @@ class TestMentionAutoFamily(unittest.TestCase):
         self.assertEqual(imm.trade_cutoff_utc("KXDJTRALLY-26OCT20", utc(2026, 10, 19, 23, 0),
                                               utc(2026, 10, 21, 4, 0)),
                          utc(2026, 10, 19, 23, 0))
-        # ... but with no known start a member is out a DAY earlier: Kalshi
-        # dates some single events by their UTC day (KXDJTCONF-25FEB28 was
-        # "On Feb 27, 2025"), so the ticker's midnight can follow the event
+        # ... which the tighteners keep for a dated member (Jack 2026-10-13:
+        # Kalshi dates these events by their ET day now) ...
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXDJTRALLY", "KXDJTRALLY-26OCT20", utc(2026, 10, 20, 4, 0)),
-            utc(2026, 10, 19, 4, 0))
+            utc(2026, 10, 20, 4, 0))
+        # ... while an undated member with no start stands down (the named
+        # families' no_event_window screen keys on the MENTION name)
         self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXDJTRALLY", "KXDJTRALLY-26OCT20", None), utc(2026, 10, 19, 4, 0))
+            "KXDJTRALLY", "KXDJTRALLY-ABC", None), imm.RELEASE_GUARD_UNKNOWN)
         # a known start (EVENT_START_OVERRIDES: the resolver's start - 10 min)
-        # replaces the fallback
+        # passes through
         start_cut = utc(2026, 10, 20, 22, 50)
         with mock.patch.dict(imm.EVENT_START_OVERRIDES,
                              {"KXDJTRALLY-26OCT20": utc(2026, 10, 20, 23, 0)}):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXDJTRALLY", "KXDJTRALLY-26OCT20", start_cut), start_cut)
-        # a non-member keeps the plain ticker-date cutoff
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXGOOD", "KXGOOD-26OCT20", utc(2026, 10, 20, 4, 0)), utc(2026, 10, 20, 4, 0))
-        with mock.patch.object(imm, "MENTION_AUTO", False),                 mock.patch.object(imm, "ALLOWLIST_ONLY", True):      # the kill switch
+        # the live-event gate (Jack: "yes build it with the gate"): pads off
+        # and the thin-book / fill-burst / settled-strike stand-downs
+        self.assertTrue(imm.series_event_depth_gated("KXDJTRALLY"))
+        self.assertFalse(imm.series_pad_to_target("KXDJTRALLY"))
+        with mock.patch.object(imm, "MENTION_AUTO_GATE", False):
+            self.assertFalse(imm.series_event_depth_gated("KXDJTRALLY"))
+        self.assertFalse(imm.series_event_depth_gated("KXGOOD"))
+        with mock.patch.object(imm, "MENTION_AUTO", False), \
+                mock.patch.object(imm, "ALLOWLIST_ONLY", True):      # the kill switch
             self.assertFalse(a(t))
+            self.assertFalse(imm.series_event_depth_gated("KXDJTRALLY"))
         with mock.patch.object(imm, "MENTION_AUTO_EXCLUDE", frozenset({"KXDJTRALLY"})):
             self.assertEqual(self._write(["KXDJTRALLY"]), 1)
         self.assertEqual(imm.MENTION_AUTO_SERIES, set())
@@ -25963,6 +25970,49 @@ class TestMentionAutoFamily(unittest.TestCase):
             self.assertTrue(IncentiveMarketMaker._allowed("KXDJTRALLY-26OCT20-TARIFF"))
             enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
             self.assertEqual(enrolled2, [])
+
+    def test_discovery_and_the_white_house_lookup_take_members(self):
+        # Jack 2026-10-13: "yes build it with the gate" -- the broadcast
+        # discovery that feeds the automatic start lookups and the family
+        # watch's research takes the family beside the MENTION-named series,
+        # and a Trump single event goes to the WH / RNC lookups
+        import imm_earnings_overrides as ieo
+        self._write(["KXDJTRALLY", "KXSASMITH"])
+        now = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+        tickers = ["KXDJTRALLY-26OCT14-TARIFF", "KXSASMITH-26OCT15-LEBRON",
+                   "KXBARMENTION-26OCT14-A", "KXFOOBAR-26OCT14-A",
+                   "KXDJTRALLY-26OCT30-TARIFF"]          # past the lookahead
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                raise AssertionError(path)
+
+            def get_event(self, ev):
+                if ev.startswith("KXDJTRALLY"):
+                    return {"event": {"title": "What will Trump say during his rally?",
+                                      "sub_title": "Donald Trump - Rally Pittsburgh"}}
+                return {"event": {"title": "What will Stephen A. Smith say during First Take?",
+                                  "sub_title": "on Oct 15, 2026"}}
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True):
+            found = ieo.discover_broadcast_mention_events(_Client(), now)
+        self.assertEqual(found, [("KXBARMENTION-26OCT14", "KXBARMENTION"),
+                                 ("KXDJTRALLY-26OCT14", "KXDJTRALLY"),
+                                 ("KXSASMITH-26OCT15", "KXSASMITH")])
+        wh_start = imm.ET.localize(datetime(2026, 10, 14, 19, 0))
+        with mock.patch.object(ieo, "wh_schedule_start",
+                               return_value=(wh_start, "Rally in Pittsburgh")) as wh, \
+                mock.patch.object(ieo, "tvmaze_airtime", return_value=None):
+            iso, src, _det, _title = ieo.auto_broadcast_start(
+                _Client(), "KXDJTRALLY-26OCT14", "KXDJTRALLY")
+            self.assertEqual((iso, src), (wh_start.isoformat(), "WH schedule"))
+            # a show is not a WH event: TVmaze only (no air time here)
+            wh.reset_mock()
+            iso, _src, _det, _title = ieo.auto_broadcast_start(
+                _Client(), "KXSASMITH-26OCT15", "KXSASMITH")
+            self.assertIsNone(iso)
+            wh.assert_not_called()
 
 
 class TestElectionBatch20261005(unittest.TestCase):

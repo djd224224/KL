@@ -678,6 +678,8 @@ def dynamic_depth_gated_series(now_ts: Optional[float] = None) -> Set[str]:
 def series_event_depth_gated(series: str) -> bool:
     if series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES)):
         return True
+    if MENTION_AUTO_GATE and mention_auto_series(series):
+        return True        # the single-event Mentions auto family (2026-10-13)
     if not MENTION_NO_CUTOFF_GATE:
         return False
     ts = _DYNAMIC_DEPTH_GATE.get(series)
@@ -7256,17 +7258,25 @@ def graduate_auto_rules(series: str) -> bool:
 # sub-title, a day in its event ticker -- here, {"series": [...]}.
 # Hot-reloaded by mtime at import and every universe refresh. A member takes
 # MENTION_AUTO_PARENT (safe-join, the standard ladder; no event cap -- no
-# mention book is capped by event). Its cutoff: with a start in
-# EVENT_START_OVERRIDES, the resolver's start - OVERRIDE_BUFFER_MIN like any
-# event; with none, 00:00 ET of the day BEFORE the ticker's day
-# (apply_series_cutoff_adjustments) -- Kalshi dates some single events by
-# their UTC day (KXDJTCONF-25FEB28 was "On Feb 27, 2025"), so the ticker's
-# own midnight can fall after an evening event. Nothing writes those starts
-# for these series yet: the broadcast discovery that feeds the automatic
-# resolvers and the family watch's research keys on the MENTION name.
+# mention book is capped by event).
+# START TIMES AND THE GATE (Jack 2026-10-13: "yes build it with the gate"):
+# the broadcast discovery (imm_earnings_overrides.discover_broadcast_mention_
+# events) takes these series beside the MENTION-named ones, so the automatic
+# lookups -- the WH / Factbase calendar and RNC rally pages for a Trump event,
+# TVmaze for a show -- and the family watch's research write their starts to
+# EVENT_START_OVERRIDES, and the bot quotes to start - OVERRIDE_BUFFER_MIN
+# like any event. With no start, 00:00 ET of the ticker's day (Kalshi dates
+# these events by their ET day; Jack: the UTC-dated KXDJTCONF-25FEB28 "On
+# Feb 27, 2025" is long gone); undated with no start -> stood down. Every
+# member is on the live-event depth gate (series_event_depth_gated, the
+# KXTRUMPMENTION protections: pads off, thin-book and fill-burst
+# stand-downs, the settled-strike jump confirm), armed on the event day and,
+# with a start on file, from start - EVENT_LIVE_GATE_START_PREARM_SECS;
+# IMM_MENTION_AUTO_GATE=0 takes them off it.
 # MENTION_AUTO_EXCLUDE and the blocklist always win; IMM_MENTION_AUTO=0 takes
 # every member out.
 MENTION_AUTO = os.environ.get("IMM_MENTION_AUTO", "1") == "1"
+MENTION_AUTO_GATE = os.environ.get("IMM_MENTION_AUTO_GATE", "1") == "1"
 MENTION_AUTO_FILE = "mention_auto_series.json"          # in STATUS_DIR
 MENTION_AUTO_PARENT = "KXMENTIONAUTO"                   # a key only
 SERIES_OVERRIDES[MENTION_AUTO_PARENT] = SeriesOverride(safe_join=True)
@@ -8593,7 +8603,7 @@ _CONFIG_CODE_KNOBS = (
     # graduate families by Kalshi metadata (2026-10-12)
     "GRADUATE_AUTO", "GRADUATE_AUTO_EXCLUDE",
     # single-event mentions by Kalshi category (2026-10-13)
-    "MENTION_AUTO", "MENTION_AUTO_EXCLUDE",
+    "MENTION_AUTO", "MENTION_AUTO_EXCLUDE", "MENTION_AUTO_GATE",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -14223,16 +14233,14 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         if td is not None:
             early = td - timedelta(minutes=ov.cutoff_before_event_min)
             cutoff = early if cutoff is None else min(cutoff, early)
-    if mention_auto_series(series) and event_ticker not in EVENT_START_OVERRIDES:
-        # MENTION AUTO, NO KNOWN START (2026-10-13): out at 00:00 ET of the
-        # day BEFORE the ticker's day. Kalshi dates some single events by
-        # their UTC day -- KXDJTCONF-25FEB28 was "On Feb 27, 2025" -- so the
-        # ticker's own midnight can fall after an evening event. A start in
-        # EVENT_START_OVERRIDES (the resolver path: start - 10 min) replaces
-        # this; an undated ticker stands down.
-        td = parse_event_date(event_ticker)
-        early = td - timedelta(days=1) if td is not None else RELEASE_GUARD_UNKNOWN
-        cutoff = early if cutoff is None else min(cutoff, early)
+    if mention_auto_series(series) and cutoff is None \
+            and event_ticker not in EVENT_START_OVERRIDES:
+        # MENTION AUTO WITH NO EVENT WINDOW (2026-10-13): no start on file and
+        # nothing dated -- stand down, as the named mention families'
+        # no_event_window screen does (it keys on the MENTION name). A dated
+        # event keeps 00:00 ET of its ticker's day; a start on file, the
+        # resolver's start - OVERRIDE_BUFFER_MIN.
+        cutoff = RELEASE_GUARD_UNKNOWN
     if ov and ov.release_guard_day is not None:
         ym = market_data_month(market)
         if ym is None:
