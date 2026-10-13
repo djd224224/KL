@@ -1651,6 +1651,9 @@ def is_daily_series(series: str) -> bool:
     # ... and so are the Trump weekly pilots (2026-10-11)
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return True
+    # ... and Big Sky's resort snowfall (2026-10-13), quoted with no fair
+    if series in globals().get("BIGSKY_SERIES", ()) and globals().get("BIGSKY_ENABLE"):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -5467,6 +5470,53 @@ def snow_monthly_series(series: str) -> bool:
     return _SNOW_MONTHLY_LIVE and (
         series in SNOW_MONTHLY_SERIES
         or bool(SNOW_MONTHLY_SERIES_RE and SNOW_MONTHLY_SERIES_RE.fullmatch(series)))
+
+
+# BIG SKY RESORT SNOWFALL (Jack 2026-10-13: "why is KXTSNOWFALLBIGSKYM-26DEC
+# not quoting?" -> "safe-join, out before Dec"). KXTSNOWFALLBIGSKYM-<YYMON>,
+# "Total snowfall in Big Sky in <Month>?", strikes T5-T50 settled on
+# OnTheSnow's resort-reported month total -- not an NWS climate report, so
+# the snow gate above has no fair for it. Nor can one be calibrated against
+# the source: OnTheSnow publishes only its multi-season monthly AVERAGE (Dec
+# 57.4", 145.69 cm; archived pages show it re-averaging, 153.32 in 2023,
+# 146.90 in 2024) and season totals, never one season's month. The nearest
+# NOAA record (BIG SKY 2WNW, 18 complete Decembers 1979-2012, median 33")
+# scaled to that average reads P(>50") ~55-60% against a 21/34 market.
+# So it is quoted WITHOUT a fair, only while its month is unknowable: out at
+# 00:00 ET BIGSKY_STOP_DAYS (7) before the first of the settlement month --
+# the 26DEC event on Nov 24, before forecasts reach December; an unreadable
+# month stands it down (fail closed). Safe-join placement (join, never lead),
+# x1 at every hour (is_daily_series), BIGSKY_MAX_POSITION 150 per market.
+# The program it was built for: $500 per strike, 10/13 21:00Z -> 10/18
+# 04:59Z ($115/day each, 10 strikes, mostly 86-90c asks). Kill switch
+# IMM_BIGSKY_ENABLE=0 (or IMM_ALLOW_BIGSKY_SERIES=""); positions ride.
+BIGSKY_ENABLE = os.environ.get("IMM_BIGSKY_ENABLE", "1") == "1"
+BIGSKY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_ALLOW_BIGSKY_SERIES", "KXTSNOWFALLBIGSKYM").split(",") if s.strip())
+BIGSKY_STOP_DAYS = _env_float("IMM_BIGSKY_STOP_DAYS", 7.0)
+BIGSKY_MAX_POSITION = _env_float("IMM_BIGSKY_MAX_POSITION", 150)
+
+if BIGSKY_ENABLE:
+    for _s in BIGSKY_SERIES:
+        SERIES_OVERRIDES[_s] = replace(
+            SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+            max_position=BIGSKY_MAX_POSITION, safe_join=True)
+
+
+def bigsky_series(series: str) -> bool:
+    return BIGSKY_ENABLE and series in BIGSKY_SERIES
+
+
+def bigsky_cutoff(event_ticker: str) -> datetime:
+    """00:00 ET BIGSKY_STOP_DAYS before the first of the event's month
+    ('KXTSNOWFALLBIGSKYM-26DEC' -> 2026-11-24 00:00 ET), or
+    RELEASE_GUARD_UNKNOWN (stand down) when the ticker names no month."""
+    first = parse_event_month(event_ticker)
+    if first is None:
+        return RELEASE_GUARD_UNKNOWN
+    first_et = first.astimezone(ET).replace(tzinfo=None)
+    return ET.localize(first_et - timedelta(days=BIGSKY_STOP_DAYS)) \
+        .astimezone(timezone.utc)
 # POKEMON (Jack 2026-10-03: "yes build the gate to quote all pokemon events").
 # KXPOKEMON -- one "Up or Down" market per item per month on Collectr's
 # ungraded price, $55/day per market from 10/3 -- is enrolled here only with
@@ -14233,6 +14283,15 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         if td is not None:
             early = td - timedelta(minutes=ov.cutoff_before_event_min)
             cutoff = early if cutoff is None else min(cutoff, early)
+    if bigsky_series(series):
+        # BIG SKY (2026-10-13): out BIGSKY_STOP_DAYS before its month starts;
+        # no month in the ticker -> stood down (fail closed), logged once
+        stop = bigsky_cutoff(event_ticker)
+        if stop == RELEASE_GUARD_UNKNOWN:
+            _config_gap(series, event_ticker,
+                        f"Big Sky stop needs the month in {event_ticker} "
+                        f"(<YYMON>) -- standing it down (fail closed)")
+        cutoff = stop if cutoff is None else min(cutoff, stop)
     if mention_auto_series(series) and cutoff is None \
             and event_ticker not in EVENT_START_OVERRIDES:
         # MENTION AUTO WITH NO EVENT WINDOW (2026-10-13): no start on file and
@@ -19320,6 +19379,7 @@ class IncentiveMarketMaker:
             rain_period_gated(ticker) or \
             ytw_pilot_ticker(ticker) or \
             snow_monthly_series(series) or \
+            bigsky_series(series) or \
             cpi_pilot_active(ticker) or \
             nfl_h2h_series(series) or \
             nfl_auto_entry(series) is not None or \

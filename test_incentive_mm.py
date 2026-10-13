@@ -11998,7 +11998,9 @@ class TestSnowMonthlyGate(unittest.TestCase):
             # report, the old KXSNOW* lines, the crab catch
             for s in ("KXDENSNOWMB", "KXTSNOWFALLBIGSKYM", "KXSNOWNYM", "KXSNOWCRABCATCH"):
                 self.assertFalse(imm.snow_monthly_series(s), s)
-                self.assertFalse(a(f"{s}-26DEC-8"), s)
+                # Big Sky is allowed since 2026-10-13 on its own no-fair
+                # safe-join rule (TestBigSkySnowfall), never the snow gate
+                self.assertEqual(a(f"{s}-26DEC-8"), s == "KXTSNOWFALLBIGSKYM", s)
         finally:
             imm.ALLOWLIST_ONLY = old
         for s in self.TEN:
@@ -22139,6 +22141,84 @@ class TestSelectionDecisionInputs(unittest.TestCase):
                                     for o in bot.state.sim_orders.values())
         self.assertTrue(orders[True])
         self.assertEqual(orders[True], orders[False])
+
+
+class TestBigSkySnowfall(unittest.TestCase):
+    """Jack 2026-10-13: "why is KXTSNOWFALLBIGSKYM-26DEC not quoting?" ->
+    "safe-join, out before Dec". Resort snowfall settled on OnTheSnow (no
+    fair possible against the source): exact name, safe-join, x1 every hour,
+    150 per market, out 00:00 ET seven days before the settlement month."""
+
+    S = "KXTSNOWFALLBIGSKYM"
+
+    def test_enrolled_by_exact_name_on_the_safe_join_rules(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):   # the module runs it off
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(f"{self.S}-26DEC-T50"))
+            self.assertFalse(imm.IncentiveMarketMaker._allowed("KXTSNOWFALLVAILM-26DEC-T50"))
+        self.assertFalse(imm.snow_monthly_series(self.S))       # not the NWS gate
+        ov = imm.series_override(self.S)
+        self.assertTrue(ov.safe_join)
+        self.assertEqual(ov.max_position, imm.BIGSKY_MAX_POSITION)
+        self.assertEqual(imm.BIGSKY_MAX_POSITION, 150)
+        self.assertTrue(imm.is_daily_series(self.S))            # x1 at every hour
+
+    def test_out_seven_days_before_the_settlement_month(self):
+        cut = imm.apply_series_cutoff_adjustments(self.S, f"{self.S}-26DEC", None)
+        self.assertEqual(cut, imm.ET.localize(datetime(2026, 11, 24)).astimezone(timezone.utc))
+        jan = imm.apply_series_cutoff_adjustments(self.S, f"{self.S}-27JAN", None)
+        self.assertEqual(jan, imm.ET.localize(datetime(2026, 12, 25)).astimezone(timezone.utc))
+        # an earlier cutoff already resolved still wins
+        early = utc(2026, 11, 1)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            self.S, f"{self.S}-26DEC", early), early)
+
+    def test_a_ticker_without_its_month_stands_down(self):
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            self.S, f"{self.S}-SEASON", None), imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_kill_switch(self):
+        with mock.patch.object(imm, "BIGSKY_ENABLE", False), \
+                mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(imm.IncentiveMarketMaker._allowed(f"{self.S}-26DEC-T50"))
+            self.assertFalse(imm.is_daily_series(self.S))
+            self.assertIsNone(imm.apply_series_cutoff_adjustments(
+                self.S, f"{self.S}-26DEC", None))
+
+    def test_refresh_selects_and_quotes_it(self):
+        """End to end on the dry bot: nothing else in the refresh screens a
+        month-named resort market out (no day in the ticker, no fair)."""
+        sd = tempfile.mkdtemp(prefix="imm_bs_")
+        p = mock.patch.object(imm, "STATUS_DIR", sd)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(_clean_persist)
+        _clean_persist()
+        now = datetime.now(timezone.utc)
+        mon = (now + timedelta(days=62)).astimezone(imm.ET)      # stop ~a month out
+        ev = f"{self.S}-{mon:%y}{mon:%b}".upper()
+        t = f"{ev}-T40"
+        client = FakeClient()
+        prog = dict(client.programs[0], market_ticker=t)
+        client.programs = [prog]
+        client.markets = {t: {
+            "ticker": t, "event_ticker": ev, "status": "active",
+            "close_time": (now + timedelta(days=100)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.2100", "yes_ask_dollars": "0.3400",
+            "volume_fp": "5000.00"}}
+        # T50's 10/13 book shape: 13c wide, so safe-join joins the touch
+        client.books = {t: {"orderbook_fp": {
+            "yes_dollars": [["0.20", "500"], ["0.21", "600"]],
+            "no_dollars": [["0.66", "1200"]]}}}               # ext ask = 34
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        placed = [o for o in bot.state.sim_orders.values() if o["ticker"] == t]
+        self.assertTrue(placed)
+        for o in placed:                          # safe-join: never leads the touch
+            if o["book_side"] == "bid":
+                self.assertLessEqual(o["yes_price"], 21)
+            else:
+                self.assertGreaterEqual(o["yes_price"], 34)
 
 
 class TestTrimmedPoolRate(unittest.TestCase):
