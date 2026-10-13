@@ -4542,8 +4542,10 @@ def load_election_extra_series() -> int:
 # 30-min family watch and the overrides task) writes each newly paying,
 # not-yet-allowed KXNFL series that Kalshi files under Sports / Football --
 # less the off-field contracts (draft, combine, stadium, sellouts, player
-# contracts, trades, coaching, Hall of Fame ...) -- into NFL_AUTO_FILE and
-# emails it:
+# contracts, trades, coaching, Hall of Fame ...) and the hand-configured
+# families (ladders / escalators, H2H: nfl_hand_configured, refused by name
+# here and in the loader even with their own switches off) -- into
+# NFL_AUTO_FILE and emails it:
 #   {"series": {S: {"kind": "game" | "season", "buffer_min": int | null,
 #                   "size": "pilot" | "ladder", "title", "contract", "since"}}}
 # Hot-reloaded by mtime at import and every universe refresh. A member
@@ -4633,11 +4635,22 @@ def nfl_auto_override(entry: dict) -> "SeriesOverride":
     return SeriesOverride(**kw)
 
 
+def nfl_hand_configured(series: str) -> bool:
+    """An NFL family with hand-set rules of its own -- the sports ladders /
+    escalators and the head-to-head pilot -- matched by NAME, whatever its
+    kill switch says, so the auto family never takes one in and a family
+    switched off stays off. (nfl_h2h_series reads False with the H2H switch
+    off, and at the import-time load, which runs before NFL_H2H_ENABLE is
+    defined -- 2026-10-12.)"""
+    return bool(sports_ladder_league(series) or NFL_H2H_RE.match(series))
+
+
 def load_nfl_auto_series() -> int:
     """Hot-reload NFL_AUTO_FILE by mtime into NFL_AUTO_SERIES and (re)install
     each member's guard set; entries changed on a reload, else 0. Refuses
     blocklisted series and the hand-configured NFL families (the ladders /
-    escalators and the head-to-head pilot keep their own rules)."""
+    escalators and the head-to-head pilot keep their own rules,
+    nfl_hand_configured)."""
     try:
         mtime = os.path.getmtime(nfl_auto_path())
     except OSError:
@@ -4659,7 +4672,8 @@ def load_nfl_auto_series() -> int:
         if any(s_.startswith(p_) for p_ in SERIES_BLOCKLIST_PREFIXES):
             log(f"[IMM] ! refused blocklisted series in nfl auto: {s_}")
             continue
-        if sports_ladder_league(s_) or nfl_h2h_series(s_):
+        if nfl_hand_configured(s_):
+            log(f"[IMM] ! refused hand-configured NFL family in nfl auto: {s_}")
             continue
         kind, size = e.get("kind"), e.get("size") or "pilot"
         if kind not in ("game", "season") or size not in ("pilot", "ladder"):

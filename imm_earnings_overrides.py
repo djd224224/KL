@@ -697,6 +697,10 @@ def nfl_auto_entry_for(client, series: str, sample: str, se: dict):
     family takes, else (None, why not)."""
     if not series.startswith("KXNFL") or "MENTION" in series:
         return None, "not an NFL prop series"
+    if imm.nfl_hand_configured(series):
+        # a ladder / escalator or H2H series reaches here only with its own
+        # family switched off (ladder block, IMM_NFL_H2H_ENABLE=0): it stays off
+        return None, "hand-configured NFL family (ladder / escalator / H2H rules)"
     if se.get("category") != "Sports" or "Football" not in (se.get("tags") or []):
         return None, f"Kalshi category {se.get('category')!r}, tags {se.get('tags')!r}"
     contract = str(se.get("contract_url") or "").rsplit("/", 1)[-1].replace(".pdf", "")

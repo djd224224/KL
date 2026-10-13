@@ -10659,3 +10659,58 @@ KXRTTV is not covered (TV pages; settles 3 days after the premiere).
 Kill switch IMM_RT_FAIR_ENABLE=0. Calibration scripts: session scratchpad rt/
 (wayback_long.py, candles.py, calib2-4.py). Tests: test_rt_fair.py (14),
 TestRtFairGate (4 + the CPI class's bot fixture); wiring guard counts 10.
+
+## 2026-10-13 ~00:50Z — NFL auto families: the two red TestNflAutoFamilies tests were the test; hand-configured NFL families refused by name (Jack: "Decide whether the code or the test is wrong ... Fix it")
+
+Red on a clean main since the 21:50Z family watch:
+test_the_file_sets_membership_and_guard_sets (4 != 3) and
+test_the_new_series_pass_enrolls_by_kalshi_category_and_emails (enrolled
+only KXNFLTD).
+
+THE TEST WAS WRONG:
+- load_nfl_auto_series() runs at import, before setUpModule redirects
+  STATUS_DIR. It read the LIVE run-logs\incentive-mm\nfl_auto_series.json,
+  which the 21:50:16Z family watch had written (KXNFLLASTTOWIN,
+  KXNFLPLAYOFFC). Nothing reset that membership, so every test started with
+  those two.
+- The 4 is the loader's CHANGED count, not the member count:
+  - KXNFLTD and KXNFLRSHYDS added;
+  - KXNFLLASTTOWIN's title changed;
+  - KXNFLPLAYOFFC dropped.
+- Membership was exactly KXNFLTD / KXNFLLASTTOWIN / KXNFLRSHYDS.
+  KXNFLLADDERREC was refused and its override left untouched.
+- The enroll pass skipped KXNFLLASTTOWIN as already _allowed.
+- fdc233f and 959080a fail the same way with the live file present, and
+  pass with an empty IMM_STATUS_DIR at import. The file's arrival broke
+  them, not either commit.
+- Fix: setUpModule uninstalls the import-time members' guard sets and clears
+  NFL_AUTO_SERIES / _nfl_auto_state. The path already follows STATUS_DIR.
+
+THE LIVE CONCERN, CHECKED. The ladder refusal held: sports_ladder_league is a
+pure regex. The H2H refusal did not, because it read the H2H kill switch
+(nfl_h2h_series):
+- IMM_NFL_H2H_ENABLE=0 takes KXNFL*H2H out of _allowed. The 30-min enroll
+  pass would then write those series to nfl_auto_series.json, and the loader
+  would take them back in at pilot x3 with the $100/event halt. The switch
+  would not hold.
+- The import-time load runs before NFL_H2H_ENABLE is defined. So an H2H
+  entry in the file was accepted at EVERY startup, and it stayed a member
+  until the file's mtime next changed. Checked with a scratch-dir import:
+  members ['KXNFLRSHYDSH2H'], pilot_budget_key NFLAUTO:...
+- With IMM_SPORTS_LADDER_BLOCK=1, the enroll pass would have written the
+  ladders to the file and named them in the "auto-enrolled" email. The
+  loader refused them, so those entries were dead; only the email was wrong.
+- Fix: nfl_hand_configured(series) matches SPORTS_LADDER_LEAGUE_RE or
+  NFL_H2H_RE by name, whatever the switches say. It is used in:
+  - load_nfl_auto_series, which logs "! refused hand-configured NFL family
+    in nfl auto: S";
+  - imm_earnings_overrides.nfl_auto_entry_for, which sends the series to
+    review as "hand-configured NFL family".
+- No live change: the live file holds only KXNFLLASTTOWIN / KXNFLPLAYOFFC.
+
+Tests: TestNflAutoFamilies +2 (both red before the code fix). Full suite
+(test_incentive_mm + test_imm_risk_controls): 1279 OK.
+
+Not done (same leak class, nothing fails today): the import also loads the
+live election extra file (57 series) and the election dates extra file (50
+rows). setUpModule resets neither.

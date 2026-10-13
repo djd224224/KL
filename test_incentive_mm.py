@@ -177,6 +177,16 @@ def setUpModule():
     # the NFL prop gate's status file and in-memory snapshot (2026-10-03)
     imm.NFL_STATUS_FILE = os.path.join(tmp, "nfl_prop_fair.json")
     imm._nfl_state["snap"] = None
+    # the NFL auto families (2026-10-12) load the LIVE nfl_auto_series.json at
+    # import, before the redirect above: forget those members and the guard
+    # sets they installed, or every test starts with the trading box's
+    # enrollments (the 21:50Z family watch enrolled KXNFLLASTTOWIN /
+    # KXNFLPLAYOFFC, and two TestNflAutoFamilies tests failed from then on).
+    # The path follows STATUS_DIR (nfl_auto_path), so only memory is reset.
+    for s in imm._nfl_auto_state["installed"]:
+        imm.SERIES_OVERRIDES.pop(s, None)
+    imm.NFL_AUTO_SERIES.clear()
+    imm._nfl_auto_state.update(mtime=0.0, installed=set())
     # the data center count file (2026-10-01) is reloaded by every run_cycle
     imm.DC_FAIR_FILE = os.path.join(tmp, "datacenter_fair.json")
     imm._dc_state.update(mtime=0.0, entries={})
@@ -20039,6 +20049,69 @@ class TestNflAutoFamilies(unittest.TestCase):
         self.assertNotIn("KXNFLLASTTOWIN", imm.SERIES_OVERRIDES)
         with mock.patch.object(imm, "NFL_AUTO_ENABLE", False):          # kill switch
             self.assertIsNone(imm.nfl_auto_entry("KXNFLTD"))
+
+    def test_hand_configured_families_stay_out_with_their_switches_off(self):
+        # The ladders / escalators and the H2H pilot keep their own rules BY
+        # NAME. IMM_NFL_H2H_ENABLE=0 takes the H2H family out of _allowed; the
+        # file must not take it back in at pilot size (and the import-time
+        # load runs before NFL_H2H_ENABLE exists, so a switch-reading check
+        # let one in there too).
+        h2h_ov = imm.SERIES_OVERRIDES["KXNFLRSHYDSH2H"]
+        lad_ov = imm.SERIES_OVERRIDES["KXNFLLADDERREC"]
+        h2h_t = "KXNFLRSHYDSH2H-67OCT05ATLNO-BROBINSON7AKAMARA41-BROBINSON7"
+        with mock.patch.object(imm, "NFL_H2H_ENABLE", False), \
+                mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self._write({
+                "KXNFLTD": {"kind": "game", "size": "pilot", "buffer_min": 90},
+                "KXNFLRSHYDSH2H": {"kind": "game", "size": "pilot", "buffer_min": 0},
+                "KXNFLLADDERREC": {"kind": "game", "size": "pilot"}})
+            self.assertEqual(set(imm.NFL_AUTO_SERIES), {"KXNFLTD"})
+            self.assertFalse(IncentiveMarketMaker._allowed(h2h_t))      # the switch holds
+            self.assertIsNone(imm.pilot_budget_key(h2h_t))
+        self.assertIs(imm.SERIES_OVERRIDES["KXNFLRSHYDSH2H"], h2h_ov)    # untouched
+        self.assertIs(imm.SERIES_OVERRIDES["KXNFLLADDERREC"], lad_ov)
+
+    def test_the_new_series_pass_leaves_hand_configured_families_alone(self):
+        # with the H2H switch off and the ladder block on, neither family is
+        # _allowed, so both reach the NFL branch: review, never the file or
+        # the enrollment email
+        import imm_earnings_overrides as ieo
+        football = {"category": "Sports", "tags": ["Football"]}
+        meta = {"KXNFLTD": dict(football, title="Pro Football Touchdowns",
+                                contract_url="https://x/FOOTBALLENTITYSTAT.pdf"),
+                "KXNFLRSHYDSH2H": dict(football, title="Rushing yards head to head",
+                                       contract_url="https://x/FOOTBALLH2H.pdf"),
+                "KXNFLLADDERREC": dict(football, title="Receptions ladder",
+                                       contract_url="https://x/FOOTBALLENTITYSTAT.pdf")}
+        tickers = ["KXNFLTD-26OCT15SEADEN-SEAEWILSON23-3",
+                   "KXNFLRSHYDSH2H-26OCT15SEADEN-KWALKER9JDOBBINS27-KWALKER9",
+                   "KXNFLLADDERREC-26OCT15SEADEN-SEAJSMITHNJIGBA11"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                if path.startswith("/markets/"):
+                    return {"market": {"rules_secondary": ""}}
+                raise AssertionError(path)
+        sent = []
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True), \
+                mock.patch.object(imm, "NFL_H2H_ENABLE", False), \
+                mock.patch.object(imm, "SERIES_BLOCK_PATTERNS",
+                                  imm.SERIES_BLOCK_PATTERNS + (imm._SPORTS_LADDER_BLOCK_RE,)), \
+                mock.patch.object(ieo, "nfl_auto_notify", lambda adds: sent.append(dict(adds))):
+            for t in tickers[1:]:
+                self.assertFalse(IncentiveMarketMaker._allowed(t), t)   # both switched off
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual([s for s, _w, _x in enrolled], ["KXNFLTD"])
+        why = {s: w for s, w, _x in review}
+        for s in ("KXNFLLADDERREC", "KXNFLRSHYDSH2H"):
+            self.assertIn("hand-configured", why[s], s)
+        self.assertEqual(sorted(sent[0]), ["KXNFLTD"])
+        with open(imm.nfl_auto_path(), encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)["series"]), ["KXNFLTD"])
 
     def test_the_live_game_verdict(self):
         now = datetime(2026, 10, 12, 21, 0, tzinfo=timezone.utc)       # 5pm ET Monday
