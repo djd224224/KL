@@ -13689,7 +13689,11 @@ AWARDS_EVENT_DATES = _parse_awards_dates(os.environ.get(
 # match.
 ELECTION_DATES_EXTRA_FILE = "election_dates_extra.json"     # in STATUS_DIR
 AWARDS_DATES_EXTRA_FILE = "awards_dates_extra.json"         # in STATUS_DIR
-ROWS_GLOB_RE = re.compile(r"KX[A-Z0-9*?\[\]-]+")
+# a series name of 3+ letters/digits, then the glob: Kalshi's legacy
+# un-prefixed series (CONTROLH, ECMOV, POPVOTEMOV) date here too -- the old
+# KX-only pattern refused them (2026-10-14) -- and no row may open on a
+# wildcard (the old pattern took a catch-all "KX*")
+ROWS_GLOB_RE = re.compile(r"[A-Z][A-Z0-9]{2,}[A-Z0-9*?\[\]-]*")
 ELECTION_DATES_EXTRA: List[Tuple[str, datetime, Any, Any]] = []
 AWARDS_DATES_EXTRA: List[Tuple[str, datetime]] = []
 _rows_extra_state: Dict[str, float] = {}
@@ -14122,6 +14126,17 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # to be held ... on November 7, 2028"). ET.
     "ECMOV-28NOV07*=2028-11-07",
     "POPVOTEMOV-28NOV07*=2028-11-07",
+    # US 2028 House / Senate control (2026-10-14, Jack: "add the 2028 rows
+    # for CONTROLH and CONTROLS"): "2028 House winner" / "2028 Senate
+    # winner", D and R; settled early on a consensus of media calls, else the
+    # Speaker's / President pro tempore's party on 2029-02-01 -- the calls
+    # come on Election Day. 2 U.S.C. s.7 (House: "the Tuesday next after the
+    # 1st Monday in November, in every even numbered year") and s.1 (Senate
+    # seats at that same regular election) -> Tue Nov 7, 2028; Wikipedia's
+    # 2028 Senate elections and 2028 United States elections articles
+    # ("scheduled ... on November 7, 2028"). ET.
+    "CONTROLH-2028*=2028-11-07",
+    "CONTROLS-2028*=2028-11-07",
     # SERBIA: NOT the presidential day, which is not set. Vucic resigned
     # 2026-09-27; the Speaker must call the vote >= 30 days ahead (RIK) and
     # hold it within three months (by Dec 26/27 -- Kalshi's 26DEC27 is that

@@ -140,6 +140,19 @@ class TestRows(unittest.TestCase):
         imm.load_election_dates_extra()
         self.assertIsNone(imm.election_cutoff_utc("KXSTATELEG-LAHOUSE27"))
 
+    def test_legacy_unprefixed_series_take_hot_rows(self):
+        # 2026-10-14: Kalshi's un-prefixed election series (CONTROLH, ECMOV)
+        # were refused by a KX-only glob; a leading wildcard still is
+        for g in ("KX*", "*", "C*", "controlh-2028"):
+            self.assertIn("bad event glob", imm_rows.validate(
+                "election", g, "2028-11-07", "", ["a", "b"]), g)
+        ok, msg = imm_rows.add_row("election", "SENATEMOV-28NOV07*", "2028-11-07",
+                                   ["2 U.S.C. 1", "2 U.S.C. 7"], by="test")
+        self.assertTrue(ok, msg)
+        self.assertGreater(imm.load_election_dates_extra(), 0)
+        self.assertEqual(imm.election_cutoff_utc("SENATEMOV-28NOV07"),
+                         datetime(2028, 11, 7, 5, 0, tzinfo=timezone.utc))
+
     def test_award_rows_reach_the_lookup_and_the_family_default(self):
         ok, msg = imm_rows.add_row("award", "KXOSCARPIC-28", "2028-01-20",
                                    ["academy schedule", "deadline"])

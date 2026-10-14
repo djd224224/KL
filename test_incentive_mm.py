@@ -26220,6 +26220,14 @@ class TestElectionBatch20261005(unittest.TestCase):
             # 3 U.S.C. 21(1): Tue Nov 7, 2028 -> 00:00 EST
             self.assertEqual(imm.election_cutoff_utc(ev), utc(2028, 11, 7, 5, 0), ev)
 
+    def test_2028_house_and_senate_control_dated_election_day(self):
+        # Jack 2026-10-14: "add the 2028 rows for CONTROLH and CONTROLS"
+        # (2 U.S.C. 7 / 1: Tue Nov 7, 2028 -> 00:00 EST); 2026 stays undated
+        for ev in ("CONTROLH-2028", "CONTROLS-2028"):
+            self.assertEqual(imm.election_cutoff_utc(ev), utc(2028, 11, 7, 5, 0), ev)
+        for ev in ("CONTROLH-2026", "CONTROLS-2026"):
+            self.assertIsNone(imm.election_cutoff_utc(ev), ev)
+
     def test_the_category_file_takes_legacy_unprefixed_names(self):
         # the KX-only check dropped ECMOV / POPVOTEMOV / CONTROLH while the
         # family watch re-enrolled them every 30 minutes

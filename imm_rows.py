@@ -65,7 +65,8 @@ def validate(kind: str, glob: str, day: str, zone: str, sources: List[str]) -> s
     if kind not in KINDS:
         return f"kind must be one of {KINDS}"
     if not imm.ROWS_GLOB_RE.fullmatch(glob or ""):
-        return f"bad event glob {glob!r} (KX..., letters/digits/-/*?[])"
+        return (f"bad event glob {glob!r} (a series name of 3+ letters/digits, "
+                f"then letters/digits/-/*?[])")
     try:
         datetime.strptime(day, "%Y-%m-%d")
     except (TypeError, ValueError):
