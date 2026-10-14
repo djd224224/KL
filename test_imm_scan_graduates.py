@@ -3,6 +3,7 @@
 energy (+$5) and any other markets that are near-breakeven")."""
 import dataclasses
 import unittest
+from unittest import mock
 
 import incentive_mm as imm
 
@@ -21,10 +22,18 @@ class ScanGraduateTests(unittest.TestCase):
             self.assertTrue(imm.scan_graduate_series(s), s)
 
     def test_the_scan_losers_stay_out_of_the_normal_book(self):
-        for s in ("KXBILLSSIGNED", "KXDIESELMON", "KXDIESELELECT",
-                  "KXTOP10BBSPOTS", "KXUSHOMEINVENT", "KXEOWEEK"):
-            self.assertFalse(imm.scan_graduate_series(s), s)
-            self.assertFalse(M._allowed(f"{s}-X"), s)
+        # KXEOWEEK is allowlisted by the Trump weekly pilot since 2026-10-11
+        # (incentive_mm.TWK_ENABLE, Jack: "yes pilot both, $40/day halt") --
+        # by name, under the pilot's guards, not as a graduate -- so the cut
+        # is checked with the pilot's ALLOW_SERIES entry taken out, as
+        # IMM_TWK_ENABLE=0 leaves it
+        with mock.patch.object(imm, "ALLOW_SERIES",
+                               imm.ALLOW_SERIES - imm.TWK_SERIES):
+            for s in ("KXBILLSSIGNED", "KXDIESELMON", "KXDIESELELECT",
+                      "KXTOP10BBSPOTS", "KXUSHOMEINVENT", "KXEOWEEK"):
+                self.assertFalse(imm.scan_graduate_series(s), s)
+                self.assertFalse(M._allowed(f"{s}-X"), s)
+        self.assertTrue(M._allowed("KXEOWEEK-X"))
 
     def test_three_strikes_per_event_like_the_scan(self):
         self.assertEqual(imm.SCAN_GRADUATE_EVENT_TOP_N, imm.SCAN_EVENT_TOP_N)
