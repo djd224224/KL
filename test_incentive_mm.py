@@ -26209,6 +26209,32 @@ class TestElectionBatch20261005(unittest.TestCase):
         enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
         self.assertEqual(enrolled2, [])
 
+    def test_2028_margins_of_victory_are_members_on_election_day(self):
+        # Jack 2026-10-13: "POPVOTEMOV, ECMOV should be enrolled under
+        # election family" -- Kalshi's legacy un-prefixed names
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t in ("ECMOV-28NOV07-DEM131T210", "POPVOTEMOV-28NOV07-REP800T899"):
+                self.assertTrue(imm.election_series(t.split("-")[0]), t)
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+        for ev in ("ECMOV-28NOV07", "POPVOTEMOV-28NOV07"):
+            # 3 U.S.C. 21(1): Tue Nov 7, 2028 -> 00:00 EST
+            self.assertEqual(imm.election_cutoff_utc(ev), utc(2028, 11, 7, 5, 0), ev)
+
+    def test_the_category_file_takes_legacy_unprefixed_names(self):
+        # the KX-only check dropped ECMOV / POPVOTEMOV / CONTROLH while the
+        # family watch re-enrolled them every 30 minutes
+        with open(imm.election_extra_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": ["SENATEMOV", "CONTROLH", "KXFOOELECTION",
+                                  "senatemov", "X", "SENATE MOV", "",
+                                  "KXSERBIAELECTIONCALL"]}, f)
+        self.assertEqual(imm.load_election_extra_series(), 3)
+        for s in ("SENATEMOV", "CONTROLH", "KXFOOELECTION"):
+            self.assertTrue(imm.election_series(s), s)
+        for s in ("senatemov", "X", "SENATE MOV", "KXSERBIAELECTIONCALL"):
+            self.assertFalse(imm.election_series(s), s)
+        # still no row -> no cutoff -> stood down until someone dates it
+        self.assertIsNone(imm.election_cutoff_utc("SENATEMOV-28NOV07"))
+
 
 
 class TestConfigGaps(unittest.TestCase):

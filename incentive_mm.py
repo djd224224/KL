@@ -4475,7 +4475,13 @@ ELECTION_SERIES = frozenset(
         # category pass enrolled it within the hour; listed here so the
         # membership does not hang on that file. Its own size and the
         # NO-side-only rule: see PRESRUN_SIZE_MULT.
-        "KXPRESRUN").split(",") if s.strip())
+        "KXPRESRUN,"
+        # 2028 Electoral College / popular vote margin of victory (2026-10-13,
+        # Jack: "POPVOTEMOV, ECMOV should be enrolled under election family"):
+        # Kalshi's legacy un-prefixed names, so the category file's old
+        # KX-only check dropped them while the family watch re-enrolled them
+        # every 30 minutes. Rows: ECMOV-28NOV07 / POPVOTEMOV-28NOV07.
+        "ECMOV,POPVOTEMOV").split(",") if s.strip())
 # The 9/28 carve-outs above, as data: Kalshi files them under Elections, so
 # the overrides task's Elections-category rule (ELECTION_EXTRA_FILE) would
 # otherwise enroll them. Refused by election_series() and by the loader.
@@ -4515,6 +4521,7 @@ ELECTION_SERIES_PATTERNS = tuple(
 # stood down, fail closed); the task's email lists the rows to add.
 # ELECTION_EXCLUDE and the blocklist always win.
 ELECTION_EXTRA_FILE = "election_extra_series.json"      # in STATUS_DIR
+ELECTION_SERIES_NAME_RE = re.compile(r"[A-Z][A-Z0-9]{1,39}")
 ELECTION_EXTRA_SERIES: Set[str] = set()
 _election_extra_state = {"mtime": 0.0}
 
@@ -4540,7 +4547,11 @@ def load_election_extra_series() -> int:
     fresh: Set[str] = set()
     for s in data.get("series") or []:
         s = str(s).strip()
-        if not s or not s.startswith("KX") or s in ELECTION_EXCLUDE:
+        # any well-formed series name: Kalshi's legacy Elections series carry
+        # no KX prefix (ECMOV, POPVOTEMOV, SENATEMOV, HOUSEMOV -- a KX-only
+        # check dropped them silently, 2026-10-13). A member still quotes
+        # only with a verified ELECTION_DATES row.
+        if not ELECTION_SERIES_NAME_RE.fullmatch(s) or s in ELECTION_EXCLUDE:
             continue
         if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
             log(f"[IMM] ! refused blocklisted series in election extra: {s}")
@@ -14102,6 +14113,15 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # 2028 is also the statutory Election Day (3 U.S.C. s.1: the Tuesday
     # after the first Monday in November -- Mon Nov 6, Tue Nov 7). ET.
     "KXPRESRUN-28*=2028-11-07",
+    # US 2028 presidential margins of victory (2026-10-13): ECMOV-28NOV07
+    # "2028 Electoral College margin of victory?" and POPVOTEMOV-28NOV07
+    # "2028 popular vote margin of victory?", both sub-titled Nov 7, 2028
+    # (Kalshi; markets close 2029-05-06). Election Day = 3 U.S.C. s.21(1),
+    # "the Tuesday next after the first Monday in November" -- Mon Nov 6,
+    # Tue Nov 7, 2028 -- and Wikipedia's 2028 election article ("scheduled
+    # to be held ... on November 7, 2028"). ET.
+    "ECMOV-28NOV07*=2028-11-07",
+    "POPVOTEMOV-28NOV07*=2028-11-07",
     # SERBIA: NOT the presidential day, which is not set. Vucic resigned
     # 2026-09-27; the Speaker must call the vote >= 30 days ahead (RIK) and
     # hold it within three months (by Dec 26/27 -- Kalshi's 26DEC27 is that
