@@ -19628,7 +19628,11 @@ class TestYouTube2Pilot(unittest.TestCase):
                       if o["ticker"] == self.T)
 
     def test_enrolled_x1_daily_with_caps(self):
-        for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
+        # global only since 2026-10-14 (Jack: "do 1, 2 and 3"): US #2 has no
+        # fair (no geography in the API) and lost 17 c/ct to settlement
+        self.assertFalse(imm.yt2_series("KXYTTOPVIDEO2D"))
+        self.assertNotIn("KXYTTOPVIDEO2D", imm.YT2_SERIES)
+        for s in ("KXYTTOPVIDEOG2D",):
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.yt2_series(s), s)
             ov = imm.series_override(s)
@@ -19648,7 +19652,7 @@ class TestYouTube2Pilot(unittest.TestCase):
         # no deep-reference size: 20 lots wherever the atref rung rests (the
         # first live cycle rested a 50-lot ask 6 ticks behind the touch)
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
-            for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
+            for s in ("KXYTTOPVIDEOG2D",):
                 self.assertEqual(imm.capped_ref_mult(49, 55, "ask", series=s), 1.0, s)
                 self.assertEqual(imm.capped_ref_mult(42, 36, "bid", series=s), 1.0, s)
             self.assertGreater(imm.capped_ref_mult(49, 55, "ask", series="KXOPENVREQ"), 1.0)
@@ -19656,43 +19660,114 @@ class TestYouTube2Pilot(unittest.TestCase):
         # ALLOWLIST_ONLY off; live it is on)
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             for s in ("KXYTDAILYTOPVIDEOG", "KXYTVIEWSW", "KXYTVIEWSHIGH",
-                      "KXYTVIEWSD"):
+                      "KXYTVIEWSD", "KXYTTOPVIDEO2D"):
                 self.assertNotIn(s, imm.ALLOW_SERIES, s)
                 self.assertFalse(imm.yt2_series(s), s)
                 self.assertFalse(IncentiveMarketMaker._allowed(f"{s}-26OCT05-X"), s)
-            self.assertTrue(IncentiveMarketMaker._allowed("KXYTTOPVIDEO2D-26OCT05-DAI"))
+            self.assertFalse(IncentiveMarketMaker._allowed("KXYTTOPVIDEO2D-26OCT05-DAI"))
             self.assertTrue(IncentiveMarketMaker._allowed("KXYTTOPVIDEOG2D-26OCT05-XAM"))
 
-    def test_cutoff_is_one_hour_before_the_close(self):
-        # Jack 2026-10-05 00:40Z: "move the cutoff to 1 hour before close"
+    def test_cutoff_is_the_end_of_the_chart_day(self):
+        # back on 2026-10-14 (Jack: "do 1, 2 and 3"): out at 00:00Z after the
+        # UTC chart day -- its fills after that lost 37 c/ct. Behind it, the
+        # close anchor of 2026-10-05 ("move the cutoff to 1 hour before close")
         close = datetime(2026, 10, 6, 3, 59, tzinfo=timezone.utc)
         hour_before = datetime(2026, 10, 6, 2, 59, tzinfo=timezone.utc)
         day_end = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
-        self.assertEqual(imm.yt2_chart_day("KXYTTOPVIDEOG2D-26OCT05"),
+        s = "KXYTTOPVIDEOG2D"
+        self.assertTrue(imm.YT2_CHART_DAY_CUTOFF)
+        self.assertEqual(imm.yt2_chart_day(f"{s}-26OCT05"),
                          datetime(2026, 10, 5, tzinfo=timezone.utc))
-        for s in ("KXYTTOPVIDEOG2D", "KXYTTOPVIDEO2D"):
-            # the producer hands a close-anchored series close - 60; a raw
-            # close (or the ticker-date 04:00Z D rule) is anchored here too
+        # the producer hands a close-anchored series close - 60; a raw close
+        # (or the ticker-date 04:00Z D rule) is anchored here too
+        for raw in (hour_before, close):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
-                s, f"{s}-26OCT05", hour_before, close_time=close), hour_before, s)
+                s, f"{s}-26OCT05", raw, close_time=close), day_end, raw)
+        with mock.patch.object(imm, "YT2_CUTOFF_BEFORE_DAY_END_MIN", 30):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
-                s, f"{s}-26OCT05", close, close_time=close), hour_before, s)
-        # the first rule (end of the UTC chart day) is still there, behind a knob
-        with mock.patch.object(imm, "YT2_CHART_DAY_CUTOFF", True):
-            self.assertEqual(imm.apply_series_cutoff_adjustments(
-                "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-26OCT05", hour_before,
-                close_time=close), day_end)
-            with mock.patch.object(imm, "YT2_CUTOFF_BEFORE_DAY_END_MIN", 30):
+                s, f"{s}-26OCT05", hour_before, close_time=close),
+                day_end - timedelta(minutes=30))
+        # IMM_YT2_CHART_DAY_CUTOFF=0: the close anchor alone
+        with mock.patch.object(imm, "YT2_CHART_DAY_CUTOFF", False):
+            for raw in (hour_before, close):
                 self.assertEqual(imm.apply_series_cutoff_adjustments(
-                    "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-26OCT05", hour_before,
-                    close_time=close), day_end - timedelta(minutes=30))
-        self.assertIsNone(imm.yt2_chart_day("KXYTTOPVIDEO2D-XYZ"))
+                    s, f"{s}-26OCT05", raw, close_time=close), hour_before, raw)
+        self.assertIsNone(imm.yt2_chart_day(f"{s}-XYZ"))
         self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXYTTOPVIDEO2D", "KXYTTOPVIDEO2D-XYZ", close, close_time=close),
-            imm.RELEASE_GUARD_UNKNOWN)
+            s, f"{s}-XYZ", close, close_time=close), imm.RELEASE_GUARD_UNKNOWN)
         # kill switch: not a pilot series, so no pilot cutoff
         with mock.patch.object(imm, "YT2_ENABLE", False):
-            self.assertFalse(imm.yt2_series("KXYTTOPVIDEOG2D"))
+            self.assertFalse(imm.yt2_series(s))
+
+    def _fill(self, ticker=None, **kw):
+        f = {"ticker": ticker or self.T, "side": "yes", "action": "buy",
+             "count": 5, "yes_price_dollars": "0.4900", "order_id": "o-yt2",
+             "fill_id": "f-yt2"}
+        f.update(kw)
+        return f
+
+    def test_a_paused_event_stands_aside_until_the_pause_ends(self):
+        # Jack 2026-10-14 ("do 1, 2 and 3"): any maker fill of ours stands the
+        # whole event aside YT2_FILL_PAUSE_MIN -- the follow-up fills within
+        # the hour lost 16 c/ct against 3 for the first fill. (The pause is
+        # set directly here: a fill booked in the dry harness without its
+        # account position also trips the manual standoff.)
+        self.assertEqual(imm.YT2_FILL_PAUSE_MIN, 60)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot), [])
+        now = time.time()
+        bot.state.yt2_fill_pause_until[self.EV] = now + 3600
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])           # pulled, both sides
+        self.assertEqual(bot._guard_now[self.T]["guard"], "yt2_fill_pause")
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])           # stays aside
+        # it survives a restart
+        bot._save_persist()
+        bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+        self.assertAlmostEqual(bot2.state.yt2_fill_pause_until[self.EV],
+                               now + 3600, delta=0.1)
+        # over: quoting resumes
+        bot.state.yt2_fill_pause_until[self.EV] = now - 1
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot._guard_now)
+
+    def test_our_fills_start_the_pause(self):
+        bot = self._bot()
+        now = time.time()
+        # the cycle's fill read: from the fill's own exchange time; a later
+        # fill extends it, an earlier one does not shorten it
+        bot._book_fill(self._fill(ts=int(now) - 5), now)
+        self.assertEqual(bot.state.yt2_fill_pause_until[self.EV], int(now) - 5 + 3600)
+        bot._book_fill(self._fill(ts=int(now) + 60, fill_id="f2"), now + 60)
+        self.assertEqual(bot.state.yt2_fill_pause_until[self.EV], int(now) + 60 + 3600)
+        bot._book_fill(self._fill(ts=int(now) - 600, fill_id="f3"), now + 60)
+        self.assertEqual(bot.state.yt2_fill_pause_until[self.EV], int(now) + 60 + 3600)
+        bot.state.yt2_fill_pause_until.clear()
+        # the WS feed's maker fill (exchange ms), ahead of the cycle's read
+        bot._sweep_note_fill({"order_id": "o-ws", "market_ticker": self.T,
+                              "count_fp": "3.00", "ts_ms": int(now * 1000),
+                              "is_taker": False}, now)
+        self.assertAlmostEqual(bot.state.yt2_fill_pause_until[self.EV],
+                               now + 3600, delta=1)
+        bot.state.yt2_fill_pause_until.clear()
+        # a fill older than the pause (a startup reconcile), a taker fill, a
+        # fill on any other series, and the knob at 0 start nothing
+        bot._book_fill(self._fill(ts=int(now) - 3601), now, toxic=False)
+        bot._book_fill(self._fill(ts=int(now), is_taker=True), now)
+        bot._book_fill(self._fill("KXYTTOPVIDEO2D-68DEC05-XAM", ts=int(now)), now)
+        bot._sweep_note_fill({"order_id": "o-ws2", "market_ticker": self.T,
+                              "count_fp": "3.00", "ts_ms": int(now * 1000),
+                              "is_taker": True}, now)
+        with mock.patch.object(imm, "YT2_FILL_PAUSE_MIN", 0):
+            bot._book_fill(self._fill(ts=int(now)), now)
+        self.assertEqual(bot.state.yt2_fill_pause_until, {})
+        # the kill switch takes the pause with the pilot
+        with mock.patch.object(imm, "YT2_ENABLE", False):
+            bot._book_fill(self._fill(ts=int(now)), now)
+        self.assertEqual(bot.state.yt2_fill_pause_until, {})
 
     def test_quotes_and_the_family_loss_halt(self):
         bot = self._bot()
@@ -22009,7 +22084,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # halt (2026-10-11) + the NFL head-to-head team-news hold (2026-10-12)
         # + the NFL auto families' live-game stand-aside (2026-10-12)
         # + the MLB postseason MVPs' live-game / decided stand-aside (10-12)
-        self.assertEqual(len(conts), 44)
+        # + the YouTube #2 pilot's fill pause (2026-10-14)
+        self.assertEqual(len(conts), 45)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

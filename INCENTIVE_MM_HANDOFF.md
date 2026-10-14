@@ -10741,3 +10741,45 @@ the deploy restarts nothing.
 - A scratch check run under unittest (with the real setUpModule) saw 57/50
   at import and empty state afterwards. Against origin/main's test file the
   same check fails.
+
+## 2026-10-14 ~12:50Z — the YouTube #2 pilot: a fill pauses its event for an hour, out at the end of the chart day, global only (Jack: "do 1, 2 and 3")
+
+The family loss halt tripped 10/12 21:51Z and 10/13 22:20Z (and 10/6). Over
+10/05 16Z-10/13, from the dashboard model and every maker fill marked to its
+settlement: bot-estimated reward $78.48 (it matched Kalshi's credits for
+10/5-10/9 within ~3%) against -$163.38 on fills, net about -$10/day (the
+launch model said +$11-34). API watchers pick the quotes off: edge at the
+fill +5.6 c/ct, 4h -8.2, to date -11.3; US -17.1 c/ct, global -7.7.
+
+THE CHANGES (replayed on that window -- in-sample, 93 fills, four events
+carry most of the loss):
+1. FILL PAUSE. YT2_FILL_PAUSE_MIN (IMM_YT2_FILL_PAUSE_MIN, 60; 0 = off): any
+   maker fill of ours stands its whole event aside for an hour from the
+   fill's exchange time; a later fill extends it. Noted from the WS fill
+   (_sweep_note_fill) and the cycle's fill read (_book_fill); the quote loop
+   cancels the event's orders on its next cycle (guard "yt2_fill_pause").
+   Persisted in imm_state.json (yt2_fill_pause_until), so a restart keeps
+   it; a fill older than the pause (a startup reconcile) starts nothing.
+   Why: 60 of the 93 fills came within an hour of an earlier fill on the
+   same event and lost 16 c/ct (-$145); first fills lost 3.3 (-$18). The
+   follow-ups came 1-60 min later (one inside 10 s), so the ~20 s cycle is
+   quick enough. Replay: 60 min keeps 87% of the reward, net about +$3/day
+   (30 min ~0, 120 min +$1.75, 240 min +$4.2 -- noisy).
+2. OUT AT THE END OF THE UTC CHART DAY: YT2_CHART_DAY_CUTOFF defaults on
+   again (IMM_YT2_CHART_DAY_CUTOFF=0 restores the close anchor alone). The
+   fills after 00:00Z D+1 lost 37 c/ct for $2.50 of reward.
+3. GLOBAL ONLY: _DEFAULT_YT2_SERIES = KXYTTOPVIDEOG2D. US #2 can never have a
+   fair (the API has no geography). Its open positions ride to settlement.
+The -$40/day family halt is unchanged.
+
+Startup line: "yt2 pilot: KXYTTOPVIDEOG2D quoted plain to 60m before the close
+and 00:00Z after the chart day, ..., each fill pauses its event 60m, family
+halt at -$40 P&L today".
+Log line: "yt2 fill pause <event>: our fill on <ticker> (WS fill|fill) -> the
+event stays aside until HH:MM:SSZ".
+Tests: TestYouTube2Pilot (test_enrolled_x1_daily_with_caps,
+test_cutoff_is_the_end_of_the_chart_day,
+test_a_paused_event_stands_aside_until_the_pause_ends,
+test_our_fills_start_the_pause); TestGuardSkipSink counts 45 continues.
+Review: the 10/15 YouTube re-score (task "KL yt-rescore") scores the pilot
+mostly before this change; re-score the change itself after a week or two.

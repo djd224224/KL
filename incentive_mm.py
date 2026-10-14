@@ -5394,8 +5394,11 @@ _DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
 # #2 stays a toss-up even for the API watchers. Quoted only with the YT2_*
 # rules (see YT2_ENABLE); IMM_YT2_ENABLE=0 or IMM_ALLOW_YT2_SERIES="" takes
 # them out.
+# GLOBAL ONLY since 2026-10-14 (Jack: "do 1, 2 and 3"): US #2 (KXYTTOPVIDEO2D)
+# can never have a fair (the API has no geography) and its fills lost 17.1
+# c/ct to settlement over 10/05-10/13, against 7.7 for global.
 _YT2_LIVE = os.environ.get("IMM_YT2_ENABLE", "1") == "1"
-_DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D,KXYTTOPVIDEO2D"
+_DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D"
 # YOUTUBE WEEKLY ARTIST-VIEWS PILOT (Jack 2026-10-06: "consider quoting
 # KATSEYE, Drake and The Weeknd with realtime data" -> "live now"):
 # KXYTVIEWSW for three artist codes only, quoted against yt_weekly_fair's
@@ -8768,6 +8771,7 @@ _CONFIG_CODE_KNOBS = (
     "YT2_ENABLE", "YT2_SERIES", "YT2_CUTOFF_FROM_CLOSE_MIN",
     "YT2_CHART_DAY_CUTOFF", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
     "YT2_MAX_POSITION", "YT2_REF_MULT_CAP", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
+    "YT2_FILL_PAUSE_MIN",         # the fill pause (2026-10-14)
     # YouTube weekly pilot (2026-10-06); yt_weekly_fair's knobs ride in the
     # fair file's "model" block
     "YTW_ENABLE", "YTW_ARTISTS", "YTW_CUTOFF_FROM_CLOSE_MIN", "YTW_MAX_POSITION",
@@ -11980,20 +11984,37 @@ def vercel_gate_reason(ticker: str, now_ts: float,
 #   - otherwise the normal book: selection, payout floor, pads, the toxic-
 #     flow side halt and the sweep breaker all apply as for any series.
 # Review: the 10/15 YouTube re-score scores the pilot from fills_*.jsonl.
-# Kill switch IMM_YT2_ENABLE=0 (or IMM_ALLOW_YT2_SERIES="") takes both
-# series out of the allowlist; positions ride.
+# Kill switch IMM_YT2_ENABLE=0 (or IMM_ALLOW_YT2_SERIES="") takes the
+# pilot's series out of the allowlist; positions ride.
+# THE 2026-10-14 CHANGES (Jack: "do 1, 2 and 3", after the family halt
+# tripped 10/12 and 10/13). Over 10/05 16Z-10/13 the pilot's bot-estimated
+# reward was $78.48 against -$163 of fills marked to settlement, net about
+# -$10/day, mostly paid to API watchers:
+#   1. FILL PAUSE (YT2_FILL_PAUSE_MIN, 60): any maker fill of ours stands its
+#      whole event aside for an hour. 60 of the 93 fills came within an hour
+#      of an earlier fill on the same event and lost 16 c/ct (-$145); the
+#      first fills lost 3.3 (-$18). Replayed: 60 min keeps 87% of the
+#      reward, net about +$3/day (30 min about 0, 240 min +$4).
+#   2. OUT AT THE END OF THE UTC CHART DAY (YT2_CHART_DAY_CUTOFF on): the
+#      fills after 00:00Z D+1 lost 37 c/ct for $2.50 of reward.
+#   3. GLOBAL ONLY (_DEFAULT_YT2_SERIES above).
+# In-sample on 93 fills, four events carrying most of the loss.
 YT2_ENABLE = _YT2_LIVE
 YT2_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_YT2_SERIES", _DEFAULT_YT2_SERIES).split(",") if s.strip())
 YT2_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_YT2_CUTOFF_FROM_CLOSE_MIN", 60)
-# the first rule (2026-10-05 15:40Z -> 10/06): out at the end of the UTC chart
-# day as well; off since Jack's "move the cutoff to 1 hour before close"
-YT2_CHART_DAY_CUTOFF = os.environ.get("IMM_YT2_CHART_DAY_CUTOFF", "0") == "1"
+# out at the end of the UTC chart day as well: the first rule (2026-10-05
+# 15:40Z -> 10/06), off after Jack's "move the cutoff to 1 hour before
+# close", back on 2026-10-14 (see THE 2026-10-14 CHANGES)
+YT2_CHART_DAY_CUTOFF = os.environ.get("IMM_YT2_CHART_DAY_CUTOFF", "1") == "1"
 YT2_CUTOFF_BEFORE_DAY_END_MIN = _env_int("IMM_YT2_CUTOFF_BEFORE_DAY_END_MIN", 0)
 YT2_MAX_POSITION = _env_float("IMM_YT2_MAX_POSITION", 100)
 YT2_REF_MULT_CAP = _env_float("IMM_YT2_REF_MULT_CAP", 1.0)
 YT2_EVENT_CAP = _env_float("IMM_YT2_EVENT_CAP", 100)
 YT2_DAILY_LOSS_LIMIT = _env_float("IMM_YT2_DAILY_LOSS_LIMIT", 40)
+# minutes a maker fill of ours stands its event aside (see THE 2026-10-14
+# CHANGES); a later fill extends it; 0 = off
+YT2_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_YT2_FILL_PAUSE_MIN", 60))
 
 for _s in YT2_SERIES:
     SERIES_OVERRIDES[_s] = replace(
@@ -16081,6 +16102,9 @@ class BotState:
     yt2_pnl_baseline: Optional[float] = None   # NOT persisted
     yt2_pnl_carry: float = 0.0      # pilot P&L today carried across restarts
     yt2_pnl_today_last: float = 0.0
+    # its fill pause (2026-10-14, YT2_FILL_PAUSE_MIN): event -> unix time
+    # the event stays aside until; persisted, so a restart keeps it
+    yt2_fill_pause_until: Dict[str, float] = field(default_factory=dict)
     # YouTube weekly pilot daily loss halt (2026-10-06, YTW_DAILY_LOSS_LIMIT)
     ytw_halt_day: str = ""
     ytw_pnl_baseline: Optional[float] = None   # NOT persisted
@@ -16692,6 +16716,11 @@ class IncentiveMarketMaker:
                 # one of our quake asks sold YES: brake the event's asks
                 # (the WS fill usually got here first)
                 self._quake_ask_brake_note(tkr, now_ts, "fill")
+            if not f.get("is_taker") and yt2_series(series_of(tkr)):
+                # a fill on the YouTube #2 pilot: stand its event aside
+                # (YT2_FILL_PAUSE_MIN; the WS fill usually got here first)
+                self._yt2_fill_pause_note(tkr, float(self._fill_ts(f) or now_ts),
+                                          "fill")
             self._log_fill(f, tkr, side, action, count, px_cents,
                            now_ts, pos_before, avg_before)
             if toxic:
@@ -17389,6 +17418,9 @@ class IncentiveMarketMaker:
                 if isinstance(v, dict)}
             self.state.scan_halt_day = str(data.get("scan_halt_day") or "")
             self.state.yt2_halt_day = str(data.get("yt2_halt_day") or "")
+            self.state.yt2_fill_pause_until = {
+                str(e): float(v)
+                for e, v in (data.get("yt2_fill_pause_until") or {}).items()}
             self.state.ytw_halt_day = str(data.get("ytw_halt_day") or "")
             self.state.twk_halt_day = {
                 str(k): str(v) for k, v in (data.get("twk_halt_day") or {}).items()}
@@ -17710,6 +17742,11 @@ class IncentiveMarketMaker:
                            "scan_pnl_carry": round(self.state.scan_pnl_today_last, 2),
                            "yt2_halt_day": self.state.yt2_halt_day,
                            "yt2_pnl_carry": round(self.state.yt2_pnl_today_last, 2),
+                           # a snapshot: the WS thread adds pauses
+                           "yt2_fill_pause_until": {
+                               e: round(v, 1)
+                               for e, v in list(self.state.yt2_fill_pause_until.items())
+                               if v > time.time()},
                            "ytw_halt_day": self.state.ytw_halt_day,
                            "ytw_pnl_carry": round(self.state.ytw_pnl_today_last, 2),
                            "twk_halt_day": dict(self.state.twk_halt_day),
@@ -18672,6 +18709,10 @@ class IncentiveMarketMaker:
                     str((self.state.ledger.get(oid) or {}).get("book_side") or "")
                 if q_side == "ask":
                     self._quake_ask_brake_note(t, now_ts, "WS fill")
+            if maker and yt2_series(series_of(t)):
+                # a fill on the YouTube #2 pilot: stand its event aside
+                # (YT2_FILL_PAUSE_MIN; the cycle's fill read notes it too)
+                self._yt2_fill_pause_note(t, fts, "WS fill")
             if SWEEP_BREAKER == "off":
                 return
             self._sweep["fills_seen"] += 1
@@ -19101,6 +19142,34 @@ class IncentiveMarketMaker:
                     f"{QUAKE_ASK_FILL_BRAKE_MIN:g} min")
         except Exception as e:
             log(f"{self.tag} ! quake ask brake failed: {e}")
+
+    def _yt2_fill_pause_note(self, ticker: str, fill_ts: float,
+                             src: str) -> None:
+        """A maker fill of ours on a YouTube #2 market (src: 'WS fill' /
+        'fill'): its whole event stays aside until YT2_FILL_PAUSE_MIN after
+        the fill; a later fill extends it. The quote loop pulls the event's
+        orders on its next cycle (~20 s; the follow-up fills this stops came
+        1-60 min later). A fill older than the pause (a startup reconcile)
+        starts nothing. Never raises."""
+        try:
+            if YT2_FILL_PAUSE_MIN <= 0 or not yt2_series(series_of(ticker)):
+                return
+            now_ts = time.time()
+            until = float(fill_ts or now_ts) + YT2_FILL_PAUSE_MIN * 60
+            pauses = self.state.yt2_fill_pause_until  # (the WS and trading threads)
+            ev = self._event_of(ticker)
+            prev = pauses.get(ev, 0.0)
+            if until <= now_ts or until <= prev:
+                return
+            for e_old in [e for e, u in list(pauses.items()) if u < now_ts]:
+                pauses.pop(e_old, None)
+            pauses[ev] = until
+            log(f"{self.tag} yt2 fill pause {ev}: our fill on {ticker} ({src}) "
+                f"-> the event stays aside until "
+                f"{datetime.fromtimestamp(until, timezone.utc):%H:%M:%SZ}"
+                + (" (extended)" if prev > now_ts else ""))
+        except Exception as e:
+            log(f"{self.tag} ! yt2 fill pause failed: {e}")
 
     def _quake_resting_asks(self) -> List[Tuple[str, str, float]]:
         """[(ticker, order_id, yes price)] for every resting ask of ours on a
@@ -23622,6 +23691,16 @@ class IncentiveMarketMaker:
                           "limit": YT2_DAILY_LOSS_LIMIT}
                 self._gskip(t, "yt2_halt", lambda: yt2_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
+            # YOUTUBE #2 PILOT FILL PAUSE (Jack 2026-10-14, see
+            # YT2_FILL_PAUSE_MIN): a fill of ours stood the event aside.
+            if yt2_series(meta.series) and self.state.yt2_fill_pause_until.get(
+                    meta.event_ticker, 0.0) > now_ts:
+                self.cancel_market_orders(t, resting)
+                yt2_until = self.state.yt2_fill_pause_until.get(meta.event_ticker, 0.0)
+                yt2_pin = {"until": round(yt2_until, 1),
+                           "left_s": round(yt2_until - now_ts)}
+                self._gskip(t, "yt2_fill_pause", lambda: yt2_pin, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                continue
 
             # YOUTUBE WEEKLY PILOT (Jack 2026-10-06, see YTW_ENABLE): its own
             # family loss halt, then the realtime fair gate (fails closed).
@@ -26468,6 +26547,8 @@ class IncentiveMarketMaker:
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
         if YT2_ENABLE:
+            yt2_paused = sum(1 for u in list(self.state.yt2_fill_pause_until.values())
+                             if u > time.time())
             log(f"yt2 pilot: {','.join(sorted(YT2_SERIES))} quoted plain to "
                 f"{YT2_CUTOFF_FROM_CLOSE_MIN}m before the close"
                 + ((" and 00:00Z after the chart day"
@@ -26476,8 +26557,11 @@ class IncentiveMarketMaker:
                    if YT2_CHART_DAY_CUTOFF else "")
                 + f", x1 at every hour (deep-ref cap {YT2_REF_MULT_CAP:g}), "
                 f"{YT2_MAX_POSITION:g}/market and "
-                f"{YT2_EVENT_CAP:g}/event net, family halt at "
-                f"-${YT2_DAILY_LOSS_LIMIT:g} P&L today"
+                f"{YT2_EVENT_CAP:g}/event net, "
+                + (f"each fill pauses its event {YT2_FILL_PAUSE_MIN:g}m"
+                   + (f" ({yt2_paused} paused now)" if yt2_paused else "")
+                   if YT2_FILL_PAUSE_MIN > 0 else "no fill pause")
+                + f", family halt at -${YT2_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f" (HALTED this roll day, ${self.state.yt2_pnl_carry:+.2f})"
                    if self.state.yt2_halt_day == _halt_day_key(
                        datetime.now(timezone.utc)) else ""))
