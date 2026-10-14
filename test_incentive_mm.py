@@ -26127,6 +26127,29 @@ class TestMentionAutoFamily(unittest.TestCase):
             enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
             self.assertEqual(enrolled2, [])
 
+    def test_discovery_takes_the_same_day_b_series(self):
+        # Jack 2026-10-14, "why is KXTRUMPMENTIONB-26OCT14 not quoting?": the
+        # Kalispell rally (second of the day) never got a start because the
+        # discovery matched names ENDING in MENTION; with no start its fill
+        # tripwire was armed all day and four routine fills halted it for
+        # good. One trailing letter is Kalshi's same-day event suffix; a word
+        # after MENTION (a window, a count) is not a broadcast.
+        import imm_earnings_overrides as ieo
+        self._write([])
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        tickers = ["KXTRUMPMENTIONB-26OCT14-COAL", "KXTRUMPMENTION-26OCT14-OIL",
+                   "KXTRUMPMENTIONWEEK-26OCT14-OIL", "KXEARNINGSMENTIONDPZ-26OCT15-PIZZ"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                raise AssertionError(path)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {}, clear=True):
+            found = ieo.discover_broadcast_mention_events(_Client(), now)
+        self.assertEqual(found, [("KXTRUMPMENTION-26OCT14", "KXTRUMPMENTION"),
+                                 ("KXTRUMPMENTIONB-26OCT14", "KXTRUMPMENTIONB")])
+
     def test_discovery_and_the_white_house_lookup_take_members(self):
         # Jack 2026-10-13: "yes build it with the gate" -- the broadcast
         # discovery that feeds the automatic start lookups and the family

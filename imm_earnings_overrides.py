@@ -1139,6 +1139,15 @@ def _norm_show(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
 
+# A broadcast mention series: the name ends in MENTION, or in MENTION plus ONE
+# letter -- Kalshi's suffix for a second event the same day (KXTRUMPMENTIONB,
+# 2026-10-14: the Kalispell rally beside Bullhead City never got a start
+# because this matched only names ENDING in MENTION, so its fill tripwire ran
+# armed all day and four routine fills halted it for good). A word after
+# MENTION (a window, a count) is not one broadcast.
+BROADCAST_MENTION_RE = re.compile(r"MENTION[A-Z]?$")
+
+
 def discover_broadcast_mention_events(client, now):
     """[(event, series)] for active-program non-earnings MENTION events with
     a parseable ticker date within the lookahead that the bot's resolver
@@ -1158,7 +1167,8 @@ def discover_broadcast_mention_events(client, now):
         for p in batch:
             t = p.get("market_ticker") or ""
             series = t.split("-")[0]
-            if not (series.endswith("MENTION") or imm.mention_auto_series(series)) \
+            if not (BROADCAST_MENTION_RE.search(series)
+                    or imm.mention_auto_series(series)) \
                     or series.startswith(_EARNINGS_PREFIX):
                 continue
             events.setdefault("-".join(t.split("-")[:2]), series)
