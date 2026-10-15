@@ -12099,8 +12099,9 @@ def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
 # 3-hourly discovery has not found) taking #1 -- 4 of the 25 #1 events from
 # 9/9 settled with no listed winner, 10/09 among the 13 replayed (no fill).
 # YT1_MODE (IMM_YT1_MODE): "shadow" (the default) -- the fair runs and every
-#   change of leader or of the bid it would rest is logged ("yt1 shadow"),
-#   nothing is quoted; "live" -- allowlisted and quoted; "off".
+#   change of leader or of the bid it would rest is logged ("yt1 shadow",
+#   yt1_shadow_note; past the 00:00Z cutoff one "out" line with the last
+#   fair), nothing is quoted; "live" -- allowlisted and quoted; "off".
 YT1_MODE = _YT1_MODE
 YT1_ENABLE = _YT1_LIVE
 YT1_SERIES = "KXYTDAILYTOPVIDEOG"
@@ -12178,6 +12179,28 @@ def yt1_gate_reason(ticker: str, now_ts: float) -> Tuple[str, dict, Optional[int
     if cap < 1:
         return f"no bid under {p * 100:.0f}% - {YT1_EDGE_CENTS}c", {"reason": "cap"}, None
     return "", {"p": round(p, 4), "cap": cap}, cap
+
+
+def yt1_shadow_note(ev: str, e: dict, now_ts: float) -> Tuple[tuple, str]:
+    """SHADOW mode's (dedupe key, log text) for one yt_top1_fair.json entry:
+    what the live pilot would do on the event now. The fair keeps running
+    until the API window closes (01:30Z D+1), but the live pilot is out at
+    00:00Z (apply_series_cutoff_adjustments), so past it the line says
+    "out" with the last fair instead of a bid live would not rest."""
+    fair = f"leader {e['leader']} {e['p'] * 100:.0f}% at {e['h']:.1f} h"
+    d0 = yt2_chart_day(ev)
+    if d0 is None:
+        return ("out",), f"{fair} -> out (no chart day in the ticker)"
+    if now_ts >= (d0 + timedelta(days=1)).timestamp():
+        return ("out",), f"{fair} -> out (the chart day ended at 00:00Z)"
+    cap = yt1_bid_cap(e["p"]) if e["p"] >= YT1_MIN_P else None
+    th = e.get("threat") or {}
+    return ((e["leader"], None if cap is None else cap // 5),
+            f"{fair} -> "
+            + (f"would bid at most {cap}c" if cap is not None
+               else f"would stand aside (< {YT1_MIN_P * 100:.0f}%)")
+            + (f"; unlisted {th['id']} {th['p'] * 100:.0f}%"
+               if th.get("p", 0) >= 0.05 else ""))
 
 
 # ----------------------------------------------------------------------------
@@ -26456,19 +26479,13 @@ class IncentiveMarketMaker:
                                 + (f", skipped {out['skipped']}" if out.get("skipped") else ""))
                         last = st
                         if YT1_MODE == "shadow":
+                            now_ts = time.time()
                             for ev, e in sorted(out["entries"].items()):
-                                cap = yt1_bid_cap(e["p"]) if e["p"] >= YT1_MIN_P else None
-                                key = (e["leader"], None if cap is None else cap // 5)
+                                key, text = yt1_shadow_note(ev, e, now_ts)
                                 if seen.get(ev) == key:
                                     continue
                                 seen[ev] = key
-                                th = e.get("threat") or {}
-                                log(f"{self.tag} yt1 shadow {ev}: leader {e['leader']} "
-                                    f"{e['p'] * 100:.0f}% at {e['h']:.1f} h -> "
-                                    + (f"would bid at most {cap}c" if cap is not None
-                                       else f"would stand aside (< {YT1_MIN_P * 100:.0f}%)")
-                                    + (f"; unlisted {th['id']} {th['p'] * 100:.0f}%"
-                                       if th.get("p", 0) >= 0.05 else ""))
+                                log(f"{self.tag} yt1 shadow {ev}: {text}")
                     except Exception as e:
                         err = f"err:{type(e).__name__}:{str(e)[:80]}"
                         if last != err:

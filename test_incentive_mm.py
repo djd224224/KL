@@ -20052,6 +20052,32 @@ class TestYouTube1Pilot(unittest.TestCase):
             self.assertEqual(self._quotes(bot, self.LEAD), [])
             self.assertIn("twk_halt", [c for c, _m in bot.alerter.today])
 
+    def test_shadow_note_stops_at_the_chart_day_cutoff(self):
+        # 10/15 00:47Z the first shadow line said "would bid at most 75c" on
+        # 26OCT14 -- 47 min after the live pilot's 00:00Z cutoff
+        e = {"leader": "DAI", "p": 0.8578, "h": 23.3,
+             "threat": {"id": "3DcoC8p9az8", "p": 0.0}}
+        ev = "KXYTDAILYTOPVIDEOG-26OCT14"
+        ts = lambda *a: datetime(*a, tzinfo=timezone.utc).timestamp()
+        key, text = imm.yt1_shadow_note(ev, e, ts(2026, 10, 14, 23, 59))
+        self.assertEqual(key, ("DAI", 75 // 5))
+        self.assertEqual(text, "leader DAI 86% at 23.3 h -> would bid at most 75c")
+        key, text = imm.yt1_shadow_note(ev, e, ts(2026, 10, 15, 0, 0))
+        self.assertEqual(key, ("out",))
+        self.assertEqual(text, "leader DAI 86% at 23.3 h -> out (the chart day ended at 00:00Z)")
+        # same instant: the live pilot's cutoff
+        with mock.patch.object(imm, "YT1_ENABLE", True):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                imm.YT1_SERIES, ev, datetime(2026, 10, 15, 3, 59, tzinfo=timezone.utc),
+                close_time=datetime(2026, 10, 15, 3, 59, tzinfo=timezone.utc)),
+                datetime(2026, 10, 15, tzinfo=timezone.utc))
+        key, text = imm.yt1_shadow_note(
+            ev, dict(e, p=0.62, threat={"id": "abc", "p": 0.3}), ts(2026, 10, 14, 9, 0))
+        self.assertEqual(key, ("DAI", None))
+        self.assertEqual(text, "leader DAI 62% at 23.3 h -> would stand aside (< 80%); "
+                               "unlisted abc 30%")
+        self.assertEqual(imm.yt1_shadow_note("KXYTDAILYTOPVIDEOG-BAD", e, 0)[0], ("out",))
+
 
 class TestTrumpWeeklyPilot(unittest.TestCase):
     """The Trump weekly pilots (Jack 2026-10-11: "yes pilot both, $40/day

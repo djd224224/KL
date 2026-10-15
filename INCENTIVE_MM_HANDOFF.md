@@ -10804,6 +10804,7 @@ THE RULES (YT1_*; yt1_gate_reason in the quote loop):
 
 MODES (IMM_YT1_MODE):
 - "shadow", the default: the fair runs and "yt1 shadow <event>: leader ... -> would bid at most Nc" is logged on each change of leader or 5c band. Nothing is quoted; the series is not allowlisted.
+  - From 00:00Z after the chart day (the live cutoff) one "-> out (the chart day ended at 00:00Z)" line with the last fair instead (yt1_shadow_note, 10/15 ~01:05Z; the first shadow line at 00:47Z had said "would bid at most 75c" on 26OCT14 after the cutoff).
 - "live": allowlisted and quoted.
 - "off".
 
