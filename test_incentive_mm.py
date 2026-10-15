@@ -3512,9 +3512,12 @@ class FakeClient:
         self.created.append(kw)
         return {"order": {"order_id": f"real-{len(self.created)}"}}
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, exchange_index=None, market_ticker=None):
         self.cancelled = getattr(self, "cancelled", [])
         self.cancelled.append(order_id)
+        # (order id, exchange_index, market_ticker) per call: the shard routing
+        self.cancel_calls = getattr(self, "cancel_calls", [])
+        self.cancel_calls.append((order_id, exchange_index, market_ticker))
         return {}
 
 
@@ -9064,10 +9067,10 @@ class _FillJoinClient(FakeClient):
     def get_orders(self, **kw):
         return {"orders": [dict(o) for o in self.resting], "cursor": None}
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, **kw):
         if order_id in self.dead:
             raise HttpError("Not Found", self.dead[order_id])
-        super().cancel_order(order_id)
+        super().cancel_order(order_id, **kw)
         self.resting = [o for o in self.resting if o["order_id"] != order_id]
         return {}
 
@@ -9076,6 +9079,110 @@ class _FillJoinClient(FakeClient):
             raise HttpError("Conflict", self.dead[kw["order_id"]])
         self.amended = getattr(self, "amended", []) + [kw]
         return {"order": {"order_id": kw["order_id"]}}
+
+
+class TestShardCancelRouting(unittest.TestCase):
+    """2026-10-14 (Jack: "KXMLBWSMVP-26 still not quoting"). Kalshi shards
+    its exchange: baseball / basketball / tennis events live on shard 3,
+    crypto / commodities on 2, the rest on 0. A create or an amend carries
+    the ticker and is routed by it; a cancel is a bare DELETE by order id,
+    which goes to shard 0, where an order resting elsewhere 404s -- booked
+    "already gone" while it kept resting (207 KXSTRKMAXY/MINY cancels on
+    10/14, doubled rungs on the book). A cancel of an order whose market
+    is not known to be on shard 0 now carries exchange_index=-1 and the
+    market's ticker; a shard-0 cancel is the legacy call, unchanged."""
+
+    T3 = "KXMLBWSMVP-26-JCHOURIO11"
+    T0 = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+
+    def _bot(self, resting=()):
+        bot = IncentiveMarketMaker(client=_FillJoinClient(resting), live=True)
+        bot.state.universe_at = time.time()          # no universe refresh
+        return bot
+
+    @staticmethod
+    def _order(oid, ticker, shard):
+        o = {"order_id": oid, "ticker": ticker, "status": "resting",
+             "client_order_id": f"{imm.CLIENT_ORDER_PREFIX}-run-{oid}",
+             "book_side": "bid", "yes_price_dollars": "0.0600",
+             "remaining_count_fp": "60.00"}
+        if shard is not None:
+            o["exchange_index"] = shard
+        return o
+
+    def _ledger(self, bot, oid, ticker):
+        bot.state.ledger[oid] = {
+            "order_id": oid, "ticker": ticker, "book_side": "bid",
+            "yes_price": 6, "remaining_count": 60.0, "status": "resting",
+            "_placed_at": time.time(), "_confirmed": False}
+
+    def test_off_shard_order_from_the_read_is_routed(self):
+        # an order the ledger does not hold (handed over, a stray): the
+        # orders read gives its ticker and its shard
+        bot = self._bot([self._order("o3", self.T3, 3),
+                         self._order("o0", self.T0, 0)])
+        bot._get_resting_orders_global()
+        self.assertTrue(bot.cancel_order("o3", reason="requote_diff"))
+        self.assertTrue(bot.cancel_order("o0", reason="requote_diff"))
+        self.assertEqual(bot.client.cancel_calls, [
+            ("o3", -1, self.T3),
+            ("o0", None, None)])          # shard 0: the legacy DELETE
+
+    def test_ledger_order_routes_by_the_universe_read(self):
+        # placed this cycle, not on a read yet: the market read knows the shard
+        client = FakeClient()
+        client.markets[self.T0]["exchange_index"] = 0
+        client.markets["KXWIDE-99DEC31-B"]["exchange_index"] = 3
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.refresh_universe(datetime.now(timezone.utc), {})
+        self.assertEqual(bot._ticker_shard,
+                         {self.T0: 0, "KXWIDE-99DEC31-B": 3})
+        bot.live = True
+        self._ledger(bot, "a", "KXWIDE-99DEC31-B")
+        self._ledger(bot, "b", self.T0)
+        bot.cancel_order("a")
+        bot.cancel_order("b")
+        self.assertEqual(client.cancel_calls, [
+            ("a", -1, "KXWIDE-99DEC31-B"), ("b", None, None)])
+
+    def test_unknown_shard_is_routed(self):
+        bot = self._bot()
+        self._ledger(bot, "o9", "KXNEW-26-X")
+        self.assertTrue(bot.cancel_order("o9"))
+        self.assertEqual(bot.client.cancel_calls, [("o9", -1, "KXNEW-26-X")])
+        self.assertNotIn("o9", bot.state.ledger)
+
+    def test_no_ticker_keeps_the_legacy_call(self):
+        bot = self._bot()
+        bot.cancel_order("ghost")
+        self.assertEqual(bot.client.cancel_calls, [("ghost", None, None)])
+
+    def test_routed_404_is_still_gone(self):
+        bot = self._bot([self._order("o3", self.T3, 3)])
+        bot._get_resting_orders_global()
+        self._ledger(bot, "o3", self.T3)
+        bot.client.dead["o3"] = 404
+        self.assertTrue(bot.cancel_order("o3"))
+        self.assertNotIn("o3", bot.state.ledger)
+
+    def test_order_map_is_the_last_read_shards_stick(self):
+        bot = self._bot([self._order("o3", self.T3, 3)])
+        bot._get_resting_orders_global()
+        self.assertEqual(bot._order_ticker, {"o3": self.T3})
+        bot.client.resting = []
+        bot._get_resting_orders_global()
+        self.assertEqual(bot._order_ticker, {})
+        self.assertEqual(bot._ticker_shard, {self.T3: 3})
+
+    def test_read_without_exchange_index_leaves_the_shard_unknown(self):
+        bot = self._bot([self._order("o1", self.T0, None)])
+        bot._get_resting_orders_global()
+        self.assertEqual(bot._ticker_shard, {})
+        bot.cancel_order("o1")
+        self.assertEqual(bot.client.cancel_calls, [("o1", -1, self.T0)])
 
 
 class TestFillLedgerJoin(unittest.TestCase):
@@ -22734,8 +22841,8 @@ class _HandoffClient(FakeClient):
     def get_orders(self, **kw):
         return {"orders": [dict(o) for o in self.resting], "cursor": None}
 
-    def cancel_order(self, order_id):
-        super().cancel_order(order_id)
+    def cancel_order(self, order_id, **kw):
+        super().cancel_order(order_id, **kw)
         self.resting = [o for o in self.resting if o["order_id"] != order_id]
         return {}
 

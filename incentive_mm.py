@@ -16209,6 +16209,11 @@ class IncentiveMarketMaker:
         self._coverage_ema: Dict[str, float] = {}
         self.resolver = EventStartResolver()
         self._foreign_resting: Dict[str, int] = {}
+        # Kalshi exchange shards (see cancel_order): ticker -> exchange_index
+        # from every market / order read, and order id -> ticker for our
+        # resting orders in the last orders read (orders the ledger lacks).
+        self._ticker_shard: Dict[str, int] = {}
+        self._order_ticker: Dict[str, str] = {}
         self._shutdown_done = False
         self.wake_grace_until = 0.0   # epoch; cycles before this ran on a
         #   possibly half-connected post-sleep network (see run())
@@ -17961,8 +17966,22 @@ class IncentiveMarketMaker:
         # order id alone is meaningless.
         led = self.state.ledger.get(order_id) or {}
         placed_at = led.get("_placed_at")
+        ticker = led.get("ticker") or self._order_ticker.get(order_id, "")
         try:
-            self.client.cancel_order(order_id)
+            if ticker and self._ticker_shard.get(ticker) != 0:
+                # EXCHANGE SHARDS (2026-10-14, Jack: "KXMLBWSMVP-26 still not
+                # quoting"): this DELETE goes to shard 0 unless told otherwise,
+                # and an order resting on another shard (2 = crypto /
+                # commodities, 3 = baseball / basketball / tennis) 404s there,
+                # which the handler below books as "already gone" while the
+                # order keeps resting -- 207 KXSTRKMAXY/MINY cancels on 10/14,
+                # and doubled rungs on the book. Route by the market, as the
+                # crypto bots do; a market not yet seen on a read is routed
+                # too. Creates and amends carry the ticker and route already.
+                self.client.cancel_order(order_id, exchange_index=-1,
+                                         market_ticker=ticker)
+            else:
+                self.client.cancel_order(order_id)
             self._cycle_cancelled.add(order_id)
             self.state.order_ages.pop(order_id, None)
             self.state.ledger.pop(order_id, None)
@@ -18930,6 +18949,7 @@ class IncentiveMarketMaker:
         manual-standoff yield."""
         orders: List[dict] = []
         foreign: Dict[str, int] = {}
+        order_ticker: Dict[str, str] = {}
         cursor = None
         for _page in range(40):
             resp = self.client.get_orders(status="resting", limit=200, cursor=cursor)
@@ -18939,6 +18959,9 @@ class IncentiveMarketMaker:
                     continue
                 if str(o.get("client_order_id", "")).startswith(CLIENT_ORDER_PREFIX + "-"):
                     orders.append(o)
+                    t = o.get("ticker", "")
+                    order_ticker[o.get("order_id", "")] = t
+                    self._note_shard(t, o.get("exchange_index"))
                 else:
                     t = o.get("ticker", "")
                     foreign[t] = foreign.get(t, 0) + 1
@@ -18946,7 +18969,19 @@ class IncentiveMarketMaker:
             if not cursor or not batch:
                 break
         self._foreign_resting = foreign
+        self._order_ticker = order_ticker
         return orders
+
+    def _note_shard(self, ticker: str, exchange_index) -> None:
+        """Remember the Kalshi exchange shard a market lives on (the
+        exchange_index on market and order reads); cancel_order routes by
+        it. Shards are per event and Kalshi does not migrate live markets."""
+        if not ticker:
+            return
+        try:
+            self._ticker_shard[ticker] = int(exchange_index)
+        except (TypeError, ValueError):
+            pass
 
     def _merge_ledger(self, exchange_orders: List[dict], now_ts: float) -> List[dict]:
         """Union of the exchange view and the local ledger (Kalshi portfolio
@@ -20008,6 +20043,7 @@ class IncentiveMarketMaker:
                 resp = self.client.get_markets(tickers=",".join(chunk), limit=len(chunk))
                 for m in (resp.get("markets") or []):
                     markets[m.get("ticker", "")] = m
+                    self._note_shard(m.get("ticker", ""), m.get("exchange_index"))
             except Exception as e:
                 if UNIVERSE_NET_GUARD and self._refresh_abort_worthy(e):
                     self._universe_abort(
@@ -22153,6 +22189,7 @@ class IncentiveMarketMaker:
                 return
             for m in (resp.get("markets") or []):
                 t = m.get("ticker", "")
+                self._note_shard(t, m.get("exchange_index"))
                 event_ticker = m.get("event_ticker") or t.rsplit("-", 1)[0]
                 self.state.managed_extra[t] = MarketMeta(
                     ticker=t, event_ticker=event_ticker, series=t.split("-")[0],
