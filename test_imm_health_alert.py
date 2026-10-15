@@ -263,5 +263,229 @@ class TestHeartbeat(unittest.TestCase):
         self.assertIn(b"probe failed", self.calls[0][1])
 
 
+class TestShardCash(unittest.TestCase):
+    """Jack 2026-10-15: "email alert me if a shard ever runs out of cash".
+    The MLB MVPs sat on an unfunded shard 3 for two days with every order
+    refused, so both a low balance and refused orders must alert. No test may
+    reach Kalshi: every read goes through the fake `get` below."""
+
+    REFUSED = ('{"error":{"code":"insufficient_shard_balance","message":"insufficient '
+               'shard balance","details":"Exchange user not found."}}')
+    CROSS = '{"error":{"code":"invalid_order","details":"post only cross"}}'
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="imm_shard_cash_")
+        self.cash = {0: 28000.0, 1: 0.0, 2: 235.0, 3: 0.0}
+        self.events = {"KXMLBWSMVP-26": 3, "KXMLBALCSMVP-26": 3, "KXGOOD-99DEC31": 0}
+        self.reads, self.sent, self.state = [], [], {}
+        self.down = False
+        self.t = datetime(2026, 10, 15, 3, 0, tzinfo=timezone.utc).timestamp()
+        sent = self.sent
+
+        class FakeAlerter:
+            def send_message(self, body, subject=""):
+                sent.append((subject, body))
+                return True
+        self.alerter = FakeAlerter()
+
+    def get(self, path, params=None):
+        self.reads.append(path)
+        if self.down:
+            raise RuntimeError("kalshi unreachable")
+        if path == "/portfolio/balance":
+            return {"balance_breakdown": [{"exchange_index": n, "balance": f"{v:.4f}"}
+                                          for n, v in self.cash.items()]}
+        if path.startswith("/events/"):
+            return {"event": {"exchange_index": self.events[path.split("/")[2]]}}
+        raise AssertionError(f"unexpected read {path}")
+
+    def run_check(self, hours=0.0):
+        self.t += hours * 3600
+        now = datetime.fromtimestamp(self.t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return ha.check_shard_cash(self.alerter, self.state, now, get=self.get,
+                                   status_dir=self.dir, now_ts=self.t)
+
+    def log_path(self, day="2026-10-15"):
+        return os.path.join(self.dir, f"orders_{day}.jsonl")
+
+    def write(self, rows, day="2026-10-15", tail=""):
+        with open(self.log_path(day), "a", encoding="utf-8", newline="") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+            f.write(tail)
+
+    def reject(self, ticker, series, body=None):
+        return {"kind": "reject", "ticker": ticker, "series": series,
+                "event_ticker": ticker.rsplit("-", 1)[0], "book_side": "bid",
+                "error_body": body or self.REFUSED, "http_status": 404}
+
+    def mvp(self, n, series="KXMLBWSMVP"):
+        return [self.reject(f"{series}-26-P{i}", series) for i in range(n)]
+
+    def test_first_run_starts_at_the_end_and_unfunded_shards_stay_quiet(self):
+        self.write(self.mvp(5))                       # history, before the first run
+        self.assertEqual(self.run_check(), [])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.state["shard_cash"]["log"],
+                         ["orders_2026-10-15.jsonl", os.path.getsize(self.log_path())])
+        self.assertEqual(self.state["shard_cash"]["funded"], [0, 2])   # shards 1, 3: $0
+
+    def test_refusals_on_an_unfunded_shard_alert_then_throttle(self):
+        self.run_check()
+        self.write(self.mvp(4) + self.mvp(1, "KXMLBALCSMVP")
+                   + [self.reject("KXGOOD-99DEC31-A", "KXGOOD", self.CROSS)]
+                   + [{"kind": "place", "ticker": "KXGOOD-99DEC31-A"}] * 2)
+        self.run_check(hours=5 / 60)
+        self.assertEqual(len(self.sent), 1)
+        subj, body = self.sent[0]
+        self.assertEqual(subj, "Kalshi shard 3 out of cash: $0.00")
+        self.assertIn("since the last check: 5 (KXMLBWSMVP 4, KXMLBALCSMVP 1)", body)
+        self.assertIn("'amount': 5000000, 'source_exchange_shard': 0, "
+                      "'destination_exchange_shard': 3", body)
+        self.assertEqual(self.reads.count("/events/KXMLBWSMVP-26"), 1)   # cached
+        self.write(self.mvp(5))
+        self.run_check(hours=1)
+        self.assertEqual(len(self.sent), 1)           # inside the 6h window
+        self.write(self.mvp(5))
+        self.run_check(hours=ha.SHARD_REALERT_HOURS)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.reads.count("/events/KXMLBWSMVP-26"), 1)
+
+    def test_funding_the_shard_sends_the_all_clear(self):
+        self.run_check()
+        self.write(self.mvp(3))
+        self.run_check(hours=5 / 60)
+        self.cash[3] = 1000.0
+        self.run_check(hours=5 / 60)
+        self.assertEqual([s for s, _ in self.sent],
+                         ["Kalshi shard 3 out of cash: $0.00",
+                          "Kalshi shard 3 cash OK again: $1,000.00"])
+        self.assertEqual(self.state["shard_cash"]["alerts"], {})
+        self.assertIn(3, self.state["shard_cash"]["funded"])
+
+    def test_low_cash_on_a_funded_shard_alerts_with_hysteresis(self):
+        self.run_check()                              # shard 2 funded at $235
+        self.cash[2] = 50.0
+        self.run_check(hours=5 / 60)
+        self.assertEqual(self.sent[-1][0], "Kalshi shard 2 low on cash: $50.00 (floor $100)")
+        self.cash[2] = 110.0                          # over the floor, under 1.25x
+        self.run_check(hours=2)
+        self.assertEqual(len(self.sent), 1)
+        self.cash[2] = 130.0
+        self.run_check(hours=5 / 60)
+        self.assertEqual(self.sent[-1][0], "Kalshi shard 2 cash OK again: $130.00")
+        self.cash[2] = 0.0                            # once funded, empty = out
+        self.run_check(hours=5 / 60)
+        self.assertEqual(self.sent[-1][0], "Kalshi shard 2 out of cash: $0.00")
+
+    def test_shard_zero_floor_is_1000_and_names_a_donor(self):
+        self.cash[3] = 1000.0
+        self.run_check()
+        self.cash[0] = 900.0
+        self.run_check(hours=5 / 60)
+        subj, body = self.sent[-1]
+        self.assertEqual(subj, "Kalshi shard 0 low on cash: $900.00 (floor $1,000)")
+        self.assertIn("deposit to the account", body)
+        self.assertIn("'source_exchange_shard': 3, 'destination_exchange_shard': 0", body)
+        self.cash[0] = 1300.0                         # >= 1.25 x $1,000
+        self.run_check(hours=5 / 60)
+        self.assertEqual(self.sent[-1][0], "Kalshi shard 0 cash OK again: $1,300.00")
+
+    def test_post_only_crosses_and_too_few_refusals_stay_quiet(self):
+        self.run_check()
+        self.write(self.mvp(ha.SHARD_REFUSAL_MIN - 1)
+                   + [self.reject("KXGOOD-99DEC31-A", "KXGOOD", self.CROSS)] * 10)
+        self.run_check(hours=5 / 60)
+        self.assertEqual(self.sent, [])
+
+    def test_an_unreadable_balance_is_swallowed_and_loses_nothing(self):
+        self.run_check()
+        self.write(self.mvp(5))
+        self.down = True
+        self.assertEqual(self.run_check(hours=5 / 60), [])    # no raise, no email
+        self.assertEqual(self.sent, [])
+        self.down = False
+        self.run_check(hours=5 / 60)                  # the refusals are still there
+        self.assertEqual([s for s, _ in self.sent], ["Kalshi shard 3 out of cash: $0.00"])
+
+    def test_the_day_roll_finishes_yesterdays_log(self):
+        self.t = datetime(2026, 10, 14, 23, 58, tzinfo=timezone.utc).timestamp()
+        self.write(self.mvp(2), day="2026-10-14")
+        self.run_check()                              # starts at the end of 10/14
+        self.write(self.mvp(2), day="2026-10-14")
+        self.write(self.mvp(2))                       # 10/15
+        self.run_check(hours=5 / 60)
+        self.assertIn("since the last check: 4 (KXMLBWSMVP 4)", self.sent[-1][1])
+        self.assertEqual(self.state["shard_cash"]["log"],
+                         ["orders_2026-10-15.jsonl", os.path.getsize(self.log_path())])
+
+    def test_a_half_written_line_waits_for_its_newline(self):
+        self.run_check()
+        partial = json.dumps(self.reject("KXMLBWSMVP-26-PX", "KXMLBWSMVP"))
+        self.write(self.mvp(3), tail=partial)
+        self.run_check(hours=5 / 60)
+        self.assertIn("since the last check: 3 (", self.sent[-1][1])
+        self.assertEqual(self.state["shard_cash"]["log"][1],
+                         os.path.getsize(self.log_path()) - len(partial))
+
+    def test_transfer_command_is_the_one_jack_ran(self):
+        cmd = ha.transfer_command(0, 3, 1000)
+        self.assertTrue(cmd.startswith('python -c "import sys, json; sys.path.insert(0, r\''))
+        self.assertIn("import kalshi_subaccount as ks; print(ks.client().post(path="
+                      "'/portfolio/intra_exchange_instance_transfer', body=json.dumps("
+                      "{'source': 'event_contract', 'destination': 'event_contract', "
+                      "'amount': 10000000, 'source_exchange_shard': 0, "
+                      "'destination_exchange_shard': 3})))\"", cmd)
+
+    def test_main_runs_it_on_scheduled_runs_only(self):
+        calls = []
+        d = tempfile.mkdtemp(prefix="imm_health_main_")
+
+        class FakeAlerter:
+            enabled = True
+
+            def __init__(self, tag, live):
+                pass
+
+            def send_message(self, body, subject=None):
+                return True
+        with mock.patch.object(ha, "probe", lambda: (True, "alive", "pid 1")), \
+                mock.patch.object(ha, "Alerter", FakeAlerter), \
+                mock.patch.object(ha, "heartbeat", lambda body="": True), \
+                mock.patch.object(ha, "check_credit_staleness", lambda *a: None), \
+                mock.patch.object(ha, "STATE_PATH", os.path.join(d, "state.json")), \
+                mock.patch.object(ha, "check_shard_cash",
+                                  lambda alerter, state, now, **kw: calls.append(now)):
+            ha.main([])
+            ha.main(["--status"])
+            ha.main(["--test"])
+        self.assertEqual(len(calls), 1)
+
+    def test_the_shards_flag_is_a_dry_run(self):
+        import io
+        from contextlib import redirect_stdout
+        self.state = {"shard_cash": {"log": ["orders_2026-10-15.jsonl", 0], "funded": [0, 2]}}
+        self.write(self.mvp(5))
+        state_path = os.path.join(self.dir, "state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(self.state, f)
+
+        def saved():
+            with open(state_path, encoding="utf-8") as f:
+                return f.read()
+        before = saved()
+        buf = io.StringIO()
+        with mock.patch.object(ha, "_kalshi_get", self.get), \
+                mock.patch.object(ha, "STATE_PATH", state_path), \
+                mock.patch.object(ha, "STATUS_DIR", self.dir), \
+                mock.patch.object(ha, "Alerter", side_effect=AssertionError("no alerter")), \
+                redirect_stdout(buf):
+            self.assertEqual(ha.main(["--shards"]), 0)
+        out = buf.getvalue()
+        self.assertIn("shard cash: 0 = $28,000.00 | 1 = $0.00 | 2 = $235.00 | 3 = $0.00", out)
+        self.assertIn("WOULD SEND: Kalshi shard 3 out of cash: $0.00", out)
+        self.assertEqual(saved(), before)             # saved nothing
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
