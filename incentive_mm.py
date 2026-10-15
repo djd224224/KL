@@ -243,6 +243,10 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("YT2_ENABLE") \
             and series in globals().get("YT2_SERIES", ()):
         m = min(m, max(1.0, globals().get("YT2_REF_MULT_CAP", 1.0)))
+    # the YouTube #1 leader-bid pilot (2026-10-14): the same, 20 lots
+    if series is not None and globals().get("YT1_ENABLE") \
+            and series == globals().get("YT1_SERIES"):
+        m = min(m, 1.0)
     # the YouTube weekly pilot (2026-10-06): the same, YTW_REF_MULT_CAP
     if series is not None and globals().get("YTW_ENABLE") \
             and series == globals().get("YTW_SERIES"):
@@ -1645,6 +1649,9 @@ def is_daily_series(series: str) -> bool:
     # left to the feed classifier (read at call time: defined further down)
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return True
+    # ... and so is the YouTube #1 leader-bid pilot (2026-10-14)
+    if series == globals().get("YT1_SERIES") and globals().get("YT1_ENABLE"):
+        return True
     # ... and so is the YouTube weekly pilot (2026-10-06)
     if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
         return True
@@ -2340,6 +2347,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the YouTube #2 pilot (2026-10-05): YT2_EVENT_CAP net per event
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return globals()["YT2_EVENT_CAP"]
+    # the YouTube #1 leader-bid pilot (2026-10-14): YT1_EVENT_CAP net per event
+    if series == globals().get("YT1_SERIES") and globals().get("YT1_ENABLE"):
+        return globals()["YT1_EVENT_CAP"]
     # the YouTube weekly pilot (2026-10-06): YTW_EVENT_CAP net per event
     if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
         return globals()["YTW_EVENT_CAP"]
@@ -5399,6 +5409,14 @@ _DEFAULT_VERCEL_SERIES = ("KXOPENVSPEND,KXMOONVSPEND,KXANTHVSPEND,KXGOOGVREQ,"
 # c/ct to settlement over 10/05-10/13, against 7.7 for global.
 _YT2_LIVE = os.environ.get("IMM_YT2_ENABLE", "1") == "1"
 _DEFAULT_YT2_SERIES = "KXYTTOPVIDEOG2D"
+# YOUTUBE #1 LEADER-BID PILOT (Jack 2026-10-14: "build the #1 leader bid
+# strategy"): KXYTDAILYTOPVIDEOG, a YES bid on the listed video yt_top1_fair
+# makes the #1 favorite, never an ask (see YT1_MODE). In the allowlist only
+# when live; "shadow", the default, runs the fair and logs what it would bid.
+_YT1_MODE = os.environ.get("IMM_YT1_MODE", "shadow").strip().lower()
+if _YT1_MODE not in ("off", "shadow", "live"):
+    _YT1_MODE = "off"
+_YT1_LIVE = _YT1_MODE == "live"
 # YOUTUBE WEEKLY ARTIST-VIEWS PILOT (Jack 2026-10-06: "consider quoting
 # KATSEYE, Drake and The Weeknd with realtime data" -> "live now"):
 # KXYTVIEWSW for three artist codes only, quoted against yt_weekly_fair's
@@ -5763,6 +5781,8 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_YT2_SERIES",
                                         _DEFAULT_YT2_SERIES)
                          if _YT2_LIVE else "")
+                # YouTube #1 leader-bid pilot (2026-10-14): only when live
+                + "," + ("KXYTDAILYTOPVIDEOG" if _YT1_LIVE else "")
                 # Trump weekly pilots (2026-10-11): only while the pilot is on
                 + "," + (os.environ.get("IMM_ALLOW_TWK_SERIES",
                                         _DEFAULT_TWK_SERIES)
@@ -8772,6 +8792,10 @@ _CONFIG_CODE_KNOBS = (
     "YT2_CHART_DAY_CUTOFF", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
     "YT2_MAX_POSITION", "YT2_REF_MULT_CAP", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
     "YT2_FILL_PAUSE_MIN",         # the fill pause (2026-10-14)
+    # YouTube #1 leader-bid pilot (2026-10-14); yt_top1_fair's knobs are
+    # its own IMM_YT1_* env vars
+    "YT1_MODE", "YT1_EDGE_CENTS", "YT1_MIN_P", "YT1_MAX_POSITION", "YT1_EVENT_CAP",
+    "YT1_DAILY_LOSS_LIMIT", "YT1_FAIR_TTL_MIN", "YT1_FAIR_REFRESH_SECS",
     # YouTube weekly pilot (2026-10-06); yt_weekly_fair's knobs ride in the
     # fair file's "model" block
     "YTW_ENABLE", "YTW_ARTISTS", "YTW_CUTOFF_FROM_CLOSE_MIN", "YTW_MAX_POSITION",
@@ -11351,9 +11375,10 @@ def series_bid_only(series: str) -> bool:
     """A family quoted with YES bids only: no ask rungs, no ask pad, and the
     two-sided depth test never counts an ask pad. The quake gate's family
     (whose far strikes may still rest an ask, see quake_ask_strike), and the
-    sports ladders / escalators while SPORTS_LADDER_ASKS_OFF, and the
-    Trump weekly pilot's KXEOWEEK (twk_bid_only, 2026-10-11)."""
-    return quake_gated(series) or twk_bid_only(series) or (
+    sports ladders / escalators while SPORTS_LADDER_ASKS_OFF, the Trump
+    weekly pilot's KXEOWEEK (twk_bid_only, 2026-10-11), and the YouTube #1
+    leader-bid pilot (yt1_series, 2026-10-14: never an ask on the leader)."""
+    return quake_gated(series) or twk_bid_only(series) or yt1_series(series) or (
         SPORTS_LADDER_ASKS_OFF and not ladder_asks_relatched()
         and sports_ladder_league(series) is not None)
 
@@ -12042,6 +12067,120 @@ def yt2_chart_day(event_ticker: str) -> Optional[datetime]:
 
 
 # ----------------------------------------------------------------------------
+# YOUTUBE #1 LEADER-BID PILOT (Jack 2026-10-14: "build the #1 leader bid
+# strategy"). KXYTDAILYTOPVIDEOG-<YYMMMDD>-<CODE>: which listed video ranks #1
+# on YouTube Charts' Daily Top Music Videos Global chart dated the ticker's
+# UTC day (the event closes ~03:59Z the next day).
+# WHY (KL-data/youtube-analysis-2026-10-14-topvid2 and -top1): a view-count
+# nowcast named the eventual #1 by hour 3 on 10 of 13 chart days (9/28-10/12)
+# while the market priced the eventual #1 at 56-64c through midday. Replayed
+# with Kalshi's own trades (fills optimistic: no queue), a 20-lot bid on the
+# fair's leader at most P - 10c while P >= 0.70 made +$33 on 104 contracts
+# over the 13 days (+$40 at 5c; +$25 at 15c with P >= 0.80) -- every fill on
+# Dai Dai, two days carrying it. MODELLED and thin.
+# THE FAIR: yt_top1_fair.py (refresher thread "yt1-fair", every
+# YT1_FAIR_REFRESH_SECS): P(each listed video is #1) from the 20-min view
+# snapshots of the collector and the "KL yt-topvid-feed" task -- views so
+# far over each video's own share of its day by then, x a chart/API ratio,
+# N_SIM draws against every listed video and the 40 fastest unlisted ones.
+# THE RULES (yt1_gate_reason, quote loop):
+#   - only the fair's leader is quoted, while its P >= YT1_MIN_P, from an
+#     entry fresh within YT1_FAIR_TTL_MIN (the module writes none before
+#     MIN_H hours into the chart day or on stale API data: fails closed);
+#   - bids only (series_bid_only), every rung at most P - YT1_EDGE_CENTS
+#     (quake_cap_quotes); when the leader changes, the old leader's market
+#     stands aside and its position rides;
+#   - out at the END OF THE UTC CHART DAY, 00:00Z D+1 (makers in #1 lost 27
+#     c/ct in the hours after it, the 10/05 study);
+#   - 20 lots x1 at every hour, YT1_MAX_POSITION 100 per market, YT1_EVENT_CAP
+#     100 per event, its own daily loss budget YT1_DAILY_LOSS_LIMIT ($40;
+#     the pilot_halt_key machinery, "twk_halt" emails).
+# THE RISK THE FAIR CANNOT SEE: a video no feed tracks yet (a release the
+# 3-hourly discovery has not found) taking #1 -- 4 of the 25 #1 events from
+# 9/9 settled with no listed winner, 10/09 among the 13 replayed (no fill).
+# YT1_MODE (IMM_YT1_MODE): "shadow" (the default) -- the fair runs and every
+#   change of leader or of the bid it would rest is logged ("yt1 shadow"),
+#   nothing is quoted; "live" -- allowlisted and quoted; "off".
+YT1_MODE = _YT1_MODE
+YT1_ENABLE = _YT1_LIVE
+YT1_SERIES = "KXYTDAILYTOPVIDEOG"
+YT1_EDGE_CENTS = _env_int("IMM_YT1_EDGE_CENTS", 10)
+YT1_MIN_P = _env_float("IMM_YT1_MIN_P", 0.80)
+YT1_MAX_POSITION = _env_float("IMM_YT1_MAX_POSITION", 100)
+YT1_EVENT_CAP = _env_float("IMM_YT1_EVENT_CAP", 100)
+YT1_DAILY_LOSS_LIMIT = _env_float("IMM_YT1_DAILY_LOSS_LIMIT", 40)
+YT1_FAIR_TTL_MIN = _env_int("IMM_YT1_FAIR_TTL_MIN", 30)
+YT1_FAIR_REFRESH_SECS = _env_int("IMM_YT1_FAIR_REFRESH_SECS", 600)
+YT1_FAIR_FILE = os.environ.get(
+    "IMM_YT1_FAIR_FILE", os.path.join(STATUS_DIR, "yt_top1_fair.json"))
+_yt1_state: dict = {"mtime": 0.0, "entries": {}}
+
+if YT1_ENABLE:
+    SERIES_OVERRIDES[YT1_SERIES] = replace(
+        SERIES_OVERRIDES.get(YT1_SERIES) or SeriesOverride(),
+        max_position=YT1_MAX_POSITION)
+
+
+def yt1_series(series: str) -> bool:
+    return YT1_ENABLE and series == YT1_SERIES
+
+
+def load_yt1_fair() -> int:
+    """Hot-reload YT1_FAIR_FILE by mtime into _yt1_state; events loaded on a
+    reload, else 0."""
+    try:
+        mtime = os.path.getmtime(YT1_FAIR_FILE)
+    except OSError:
+        return 0
+    if mtime == _yt1_state["mtime"]:
+        return 0
+    _yt1_state["mtime"] = mtime
+    try:
+        with open(YT1_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! yt #1 fair file unreadable: {e}")
+        return 0
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("entries") or {}).items():
+        ts = parse_iso_utc(str(e.get("fetched_at") or ""))
+        if ts is None or not e.get("leader") or e.get("p") is None:
+            continue
+        fresh[str(ev)] = {"ts": ts.timestamp(), "leader": str(e["leader"]),
+                          "p": float(e["p"]), "h": e.get("h")}
+    _yt1_state["entries"] = fresh
+    return len(fresh)
+
+
+def yt1_bid_cap(p: float) -> int:
+    """The highest YES bid (cents) on a leader at fair p: P - YT1_EDGE_CENTS."""
+    return int(math.floor(p * 100.0 - YT1_EDGE_CENTS + 1e-9))
+
+
+def yt1_gate_reason(ticker: str, now_ts: float) -> Tuple[str, dict, Optional[int]]:
+    """('', inputs, bid cap in cents) when a #1 pilot market may rest a bid,
+    else (reason, guard-skip inputs, None). Fails CLOSED on a missing or
+    stale entry."""
+    ev, _, code = ticker.rpartition("-")
+    e = _yt1_state["entries"].get(ev)
+    if e is None:
+        return "no YouTube #1 fair for this event", {"reason": "no_read"}, None
+    if now_ts - e["ts"] > YT1_FAIR_TTL_MIN * 60:
+        return "YouTube #1 fair is stale", {"reason": "stale"}, None
+    p = e["p"]
+    if code != e["leader"]:
+        return (f"not the leader ({e['leader']} at {p * 100:.0f}%)",
+                {"reason": "not_leader", "leader": e["leader"], "p": round(p, 4)}, None)
+    if p < YT1_MIN_P:
+        return (f"leader at {p * 100:.0f}% < {YT1_MIN_P * 100:.0f}%",
+                {"reason": "low_p", "p": round(p, 4)}, None)
+    cap = yt1_bid_cap(p)
+    if cap < 1:
+        return f"no bid under {p * 100:.0f}% - {YT1_EDGE_CENTS}c", {"reason": "cap"}, None
+    return "", {"p": round(p, 4), "cap": cap}, cap
+
+
+# ----------------------------------------------------------------------------
 # TRUMP WEEKLY PILOTS (Jack 2026-10-11: "yes pilot both, $40/day halt").
 # Two weekly Politics counts, out of the book since the 10/03 scan cut:
 #   KXTRUTHSOCIAL-<YYMMMDD>: "Trump Truth Social posts this week?", ~10
@@ -12166,6 +12305,9 @@ def pilot_halt_key(series: str) -> Optional[str]:
         return series
     if nfl_h2h_series(series) and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         return NFL_H2H_HALT_KEY
+    # the YouTube #1 leader-bid pilot (2026-10-14): one budget, its series
+    if yt1_series(series) and YT1_DAILY_LOSS_LIMIT > 0:
+        return series
     return None
 
 
@@ -12195,6 +12337,8 @@ def pilot_budget_key(ticker: str) -> Optional[str]:
 def pilot_halt_limit(key: str) -> float:
     if key == NFL_H2H_HALT_KEY:
         return NFL_H2H_DAILY_LOSS_LIMIT
+    if key == YT1_SERIES:
+        return YT1_DAILY_LOSS_LIMIT
     if key.startswith(NFL_AUTO_BUDGET_PREFIX):
         return NFL_AUTO_DAILY_LOSS_LIMIT
     return TWK_DAILY_LOSS_LIMIT
@@ -12205,6 +12349,8 @@ def pilot_halt_keys() -> List[str]:
     keys = sorted(TWK_SERIES) if TWK_ENABLE else []
     if NFL_H2H_ENABLE and NFL_H2H_DAILY_LOSS_LIMIT > 0:
         keys.append(NFL_H2H_HALT_KEY)
+    if YT1_ENABLE and YT1_DAILY_LOSS_LIMIT > 0:
+        keys.append(YT1_SERIES)
     return keys
 
 
@@ -14461,6 +14607,12 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
             end = d0 + timedelta(days=1,
                                  minutes=-YT2_CUTOFF_BEFORE_DAY_END_MIN)
             cutoff = end if cutoff is None else min(cutoff, end)
+    if yt1_series(series):
+        # YOUTUBE #1 LEADER-BID PILOT (2026-10-14, see YT1_MODE): out at the
+        # end of the UTC chart day; unparseable -> stood down
+        d0 = yt2_chart_day(event_ticker)
+        end = RELEASE_GUARD_UNKNOWN if d0 is None else d0 + timedelta(days=1)
+        cutoff = end if cutoff is None else min(cutoff, end)
     if ytw_series(series) and ytw_event_code(event_ticker) is None:
         # YOUTUBE WEEKLY PILOT (2026-10-06): the close anchor above is the
         # cutoff; an event whose artist code does not parse stands down
@@ -16272,6 +16424,7 @@ class IncentiveMarketMaker:
         self._quake_ask_lock = threading.Lock()
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
         self._ytw_stood: Set[str] = set()         # YouTube weekly pilot stand-asides
+        self._yt1_stood: Set[str] = set()         # YouTube #1 pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -19798,6 +19951,8 @@ class IncentiveMarketMaker:
                 f"{_vc_moved} with a new anchor")
         if YTW_ENABLE:
             load_ytw_fair()
+        if YT1_ENABLE:
+            load_yt1_fair()
         load_gb_fair()
         load_dc_fair()
         # Hourly program families (KXTEMP) activate at the TOP OF THE HOUR —
@@ -23760,6 +23915,25 @@ class IncentiveMarketMaker:
                     self._ytw_stood.discard(t)
                     log(f"{self.tag} ytw resume {t}")
 
+            # YOUTUBE #1 LEADER-BID PILOT (Jack 2026-10-14, see YT1_MODE):
+            # only the fair's leader, bids at most P - YT1_EDGE_CENTS (applied
+            # with the quake cap below); fails CLOSED without a fresh fair.
+            yt1_cap: Optional[int] = None
+            if yt1_series(meta.series):
+                y1_why, y1_in, y1_cap = yt1_gate_reason(t, now_ts)
+                if y1_why:
+                    if t not in self._yt1_stood:
+                        self._yt1_stood.add(t)
+                        log(f"{self.tag} yt1 stand-aside {t}: {y1_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "yt1_fair", lambda: y1_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                if t in self._yt1_stood:
+                    self._yt1_stood.discard(t)
+                    log(f"{self.tag} yt1 quoting {t}: bids at most {y1_cap}c "
+                        f"(fair {y1_in['p'] * 100:.0f}%)")
+                yt1_cap = y1_cap
+
             # TRUMP WEEKLY PILOT LOSS HALT (Jack 2026-10-11, see TWK_ENABLE):
             # this series' daily loss limit tripped this roll day -- stood
             # aside until the 5am-CT roll; positions ride.
@@ -23987,7 +24161,7 @@ class IncentiveMarketMaker:
             pl_bid_px, pl_ask_px = ref_bid_px, ref_ask_px
             if (join_ahead_series(meta.series) and not reduce_only
                     and meta.price_step >= 0.01 and not quake_ask_strike(t)
-                    and quake_cap is None and mort_caps is None
+                    and quake_cap is None and yt1_cap is None and mort_caps is None
                     and poke_caps is None and nfl_caps is None
                     and ca_caps is None and rain_caps is None):
                 try:
@@ -24028,6 +24202,9 @@ class IncentiveMarketMaker:
             # ask strike whose ask may rest, at the floor or above
             if quake_cap is not None:
                 mq = quake_cap_quotes(mq, quake_cap, quake_ask_c, quake_ask_room)
+            # the #1 leader-bid pilot: every bid rung at most its cap, no ask
+            if yt1_cap is not None:
+                mq = quake_cap_quotes(mq, yt1_cap)
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -26257,6 +26434,51 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_ytw_fair_refresh, daemon=True,
                              name="ytw-fair").start()
+        if YT1_MODE in ("shadow", "live") and not once:
+            # YouTube #1 fair refresher (2026-10-14, see YT1_MODE): the ytw
+            # refresher's contract. In shadow mode it also logs each change
+            # of an event's leader, or of the bid it would rest (5c bands).
+            def _yt1_fair_refresh():
+                try:
+                    import yt_top1_fair
+                except Exception as e:
+                    log(f"{self.tag} ! yt1-fair refresher disabled: {e}")
+                    return
+                last, seen = None, {}
+                while True:
+                    delay = max(120, YT1_FAIR_REFRESH_SECS)
+                    try:
+                        out = yt_top1_fair.write_fair_file(YT1_FAIR_FILE)
+                        st = (len(out["entries"]), out["status"])
+                        if last != st:
+                            log(f"{self.tag} yt1-fair refresh: {st[0]} events "
+                                f"with a fair, status {st[1]}"
+                                + (f", skipped {out['skipped']}" if out.get("skipped") else ""))
+                        last = st
+                        if YT1_MODE == "shadow":
+                            for ev, e in sorted(out["entries"].items()):
+                                cap = yt1_bid_cap(e["p"]) if e["p"] >= YT1_MIN_P else None
+                                key = (e["leader"], None if cap is None else cap // 5)
+                                if seen.get(ev) == key:
+                                    continue
+                                seen[ev] = key
+                                th = e.get("threat") or {}
+                                log(f"{self.tag} yt1 shadow {ev}: leader {e['leader']} "
+                                    f"{e['p'] * 100:.0f}% at {e['h']:.1f} h -> "
+                                    + (f"would bid at most {cap}c" if cap is not None
+                                       else f"would stand aside (< {YT1_MIN_P * 100:.0f}%)")
+                                    + (f"; unlisted {th['id']} {th['p'] * 100:.0f}%"
+                                       if th.get("p", 0) >= 0.05 else ""))
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! yt1-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = 120
+                    time.sleep(delay)
+            threading.Thread(target=_yt1_fair_refresh, daemon=True,
+                             name="yt1-fair").start()
         if TREASURY_GATE_ENABLE and not once:
             # Treasury live-yield refresher (2026-10-01): the quake
             # refresher's contract -- every network call off the trading
@@ -26604,6 +26826,14 @@ class IncentiveMarketMaker:
                        datetime.now(timezone.utc)) else ""))
         else:
             log("yt2 pilot: OFF -- the YouTube #2 series are not enrolled")
+        log(f"yt1 pilot ({YT1_SERIES}): {YT1_MODE.upper()}"
+            + ("" if YT1_MODE == "off" else
+               f" -- a YES bid on yt_top1_fair's leader only, at most P - "
+               f"{YT1_EDGE_CENTS}c while P >= {YT1_MIN_P * 100:.0f}%, never an ask, "
+               f"out at 00:00Z after the chart day, 20 lots x1, "
+               f"{YT1_MAX_POSITION:g}/market and {YT1_EVENT_CAP:g}/event, halt at "
+               f"-${YT1_DAILY_LOSS_LIMIT:g} P&L today"
+               + (" (shadow: the fair runs, nothing is quoted)" if YT1_MODE == "shadow" else "")))
         if YTW_ENABLE:
             log(f"ytw pilot: {YTW_SERIES} for {','.join(sorted(YTW_ARTISTS))} "
                 f"against the realtime fair (tol {YTW_FAIR_TOL_CENTS}c, decided "

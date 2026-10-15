@@ -163,6 +163,9 @@ def setUpModule():
     # the YouTube weekly pilot's fair file (2026-10-06) is read by every run_cycle
     imm.YTW_FAIR_FILE = os.path.join(tmp, "yt_weekly_fair.json")
     imm._ytw_state.update(mtime=0.0, entries={})
+    # ... and the YouTube #1 leader-bid pilot's (2026-10-14)
+    imm.YT1_FAIR_FILE = os.path.join(tmp, "yt_top1_fair.json")
+    imm._yt1_state.update(mtime=0.0, entries={})
     # the Treasury touch gate's status file + in-memory feed (2026-10-01)
     imm.TREASURY_STATUS_FILE = os.path.join(tmp, "treasury_yield_state.json")
     imm._treasury_state["watch"] = None
@@ -19916,6 +19919,140 @@ class TestYouTube2Pilot(unittest.TestCase):
         self.assertEqual(bot.state.yt2_halt_day, "2000-01-01")
 
 
+class TestYouTube1Pilot(unittest.TestCase):
+    """The YouTube #1 leader-bid pilot (Jack 2026-10-14: "build the #1 leader
+    bid strategy"): KXYTDAILYTOPVIDEOG, a YES bid at most P - YT1_EDGE_CENTS
+    on yt_top1_fair's leader only, never an ask, out at the end of the UTC
+    chart day, 20 lots x1, its own daily loss budget. Shadow by default.
+    Fixture event KXYTDAILYTOPVIDEOG-68DEC05 (far from any cutoff)."""
+
+    EV = "KXYTDAILYTOPVIDEOG-68DEC05"
+    LEAD = EV + "-DAI"
+    OTHER = EV + "-CAS"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        imm._yt1_state.update(mtime=0.0, entries={})
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._yt1_state.update(mtime=0.0, entries={})
+
+    def _fair(self, leader="DAI", p=0.9, age=0.0):
+        imm._yt1_state["entries"] = {self.EV: {"ts": time.time() - age, "leader": leader,
+                                               "p": p, "h": 12.0}}
+
+    def _bot(self):
+        client = FakeClient()
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        for t in (self.LEAD, self.OTHER):
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": self.EV, "status": "active",
+                "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+                "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot, t):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == t)
+
+    def test_shadow_by_default(self):
+        self.assertEqual(imm.YT1_MODE, "shadow")
+        self.assertFalse(imm.YT1_ENABLE)
+        self.assertFalse(imm.yt1_series(imm.YT1_SERIES))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertNotIn(imm.YT1_SERIES, imm.ALLOW_SERIES)
+            self.assertFalse(IncentiveMarketMaker._allowed(self.LEAD))
+        self.assertIsNone(imm.pilot_budget_key(self.LEAD))
+        self.assertNotIn(imm.YT1_SERIES, imm.pilot_halt_keys())
+
+    def test_live_is_bids_only_x1_with_caps_and_a_budget(self):
+        s = imm.YT1_SERIES
+        with mock.patch.object(imm, "YT1_ENABLE", True):
+            self.assertTrue(imm.series_bid_only(s))
+            self.assertEqual(imm.event_cap_contracts(self.EV), imm.YT1_EVENT_CAP)
+            for when in (datetime(2026, 10, 6, 7, 0, tzinfo=timezone.utc),
+                         datetime(2026, 10, 6, 23, 30, tzinfo=timezone.utc),
+                         datetime(2026, 10, 10, 15, 0, tzinfo=timezone.utc)):
+                self.assertEqual(imm.hour_size_mult(s, when), 1.0, when)
+            with mock.patch.object(imm, "LADDER_MODE", "atref"):
+                self.assertEqual(imm.capped_ref_mult(42, 36, "bid", series=s), 1.0)
+            self.assertEqual(imm.pilot_budget_key(self.LEAD), s)
+            self.assertEqual(imm.pilot_halt_limit(s), imm.YT1_DAILY_LOSS_LIMIT)
+            self.assertIn(s, imm.pilot_halt_keys())
+            # out at 00:00Z after the chart day, whatever the close
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                s, self.EV, self.CLOSE, close_time=self.CLOSE),
+                datetime(2068, 12, 6, 0, 0, tzinfo=timezone.utc))
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                s, f"{s}-XYZ", self.CLOSE, close_time=self.CLOSE), imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_the_gate(self):
+        now = time.time()
+        why, inp, cap = imm.yt1_gate_reason(self.LEAD, now)
+        self.assertEqual((inp["reason"], cap), ("no_read", None))
+        self._fair(age=imm.YT1_FAIR_TTL_MIN * 60 + 5)
+        self.assertEqual(imm.yt1_gate_reason(self.LEAD, now)[1]["reason"], "stale")
+        self._fair(p=0.9)
+        self.assertEqual(imm.yt1_gate_reason(self.OTHER, now)[1]["reason"], "not_leader")
+        why, inp, cap = imm.yt1_gate_reason(self.LEAD, now)
+        self.assertEqual((why, cap), ("", 90 - imm.YT1_EDGE_CENTS))
+        self._fair(p=imm.YT1_MIN_P - 0.01)
+        self.assertEqual(imm.yt1_gate_reason(self.LEAD, now)[1]["reason"], "low_p")
+        self.assertEqual(imm.yt1_bid_cap(0.855), 75)          # floor, never rounded up
+
+    def test_quotes_the_leader_only_bids_capped_never_an_ask(self):
+        with mock.patch.object(imm, "YT1_ENABLE", True), \
+                mock.patch.object(imm, "YT1_MIN_P", 0.5):
+            bot = self._bot()
+            bot.run_cycle()                                    # no fair: nothing
+            self.assertEqual(self._quotes(bot, self.LEAD), [])
+            self.assertEqual(self._quotes(bot, self.OTHER), [])
+            self._fair(p=0.9)                                  # cap 80, the touch 49
+            bot.run_cycle()
+            q = self._quotes(bot, self.LEAD)
+            self.assertTrue(q)
+            self.assertEqual({s_ for s_, _p in q}, {"bid"})   # never an ask
+            self.assertLessEqual(max(p for _s, p in q), 80)
+            self.assertEqual(self._quotes(bot, self.OTHER), [])
+            self._fair(p=0.55)                                 # cap 45, under the touch
+            bot.run_cycle()
+            q = self._quotes(bot, self.LEAD)
+            self.assertTrue(q)
+            self.assertLessEqual(max(p for _s, p in q), 45)
+            # a new leader: it takes over, the old one stands aside
+            self._fair(leader="CAS", p=0.9)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot, self.LEAD), [])
+            self.assertEqual({s_ for s_, _p in self._quotes(bot, self.OTHER)}, {"bid"})
+            self.assertEqual(bot._guard_now[self.LEAD]["guard"], "yt1_fair")
+
+    def test_the_daily_loss_budget(self):
+        with mock.patch.object(imm, "YT1_ENABLE", True):
+            self._fair(p=0.9)
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertTrue(self._quotes(bot, self.LEAD))
+            bot.pnl.realized[self.LEAD] = -(imm.YT1_DAILY_LOSS_LIMIT + 1)
+            bot.run_cycle()
+            roll_day = imm._halt_day_key(datetime.now(timezone.utc))
+            self.assertEqual(bot.state.twk_halt_day.get(imm.YT1_SERIES), roll_day)
+            self.assertEqual(self._quotes(bot, self.LEAD), [])
+            self.assertIn("twk_halt", [c for c, _m in bot.alerter.today])
+
+
 class TestTrumpWeeklyPilot(unittest.TestCase):
     """The Trump weekly pilots (Jack 2026-10-11: "yes pilot both, $40/day
     halt"): KXTRUTHSOCIAL quoted only until 5 days before the close,
@@ -22192,7 +22329,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the NFL auto families' live-game stand-aside (2026-10-12)
         # + the MLB postseason MVPs' live-game / decided stand-aside (10-12)
         # + the YouTube #2 pilot's fill pause (2026-10-14)
-        self.assertEqual(len(conts), 45)
+        # + the YouTube #1 leader-bid pilot's gate (2026-10-14)
+        self.assertEqual(len(conts), 46)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

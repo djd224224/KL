@@ -10783,3 +10783,34 @@ test_a_paused_event_stands_aside_until_the_pause_ends,
 test_our_fills_start_the_pause); TestGuardSkipSink counts 45 continues.
 Review: the 10/15 YouTube re-score (task "KL yt-rescore") scores the pilot
 mostly before this change; re-score the change itself after a week or two.
+
+## 2026-10-14 ~00:30Z (10/15) — the YouTube #1 leader-bid pilot, SHADOW by default (Jack: "build the #1 leader bid strategy")
+
+KXYTDAILYTOPVIDEOG asks which listed video ranks #1 on YouTube Charts' Global daily chart for a UTC day. Over 9/28-10/12 a view-count nowcast named the eventual #1 by hour 3 on 10 of 13 days, while the market priced the eventual #1 at 56-64c through midday (KL-data/youtube-analysis-2026-10-14-topvid2/verdict.md).
+
+THE FAIR: yt_top1_fair.py, refresher thread "yt1-fair" (YT1_FAIR_REFRESH_SECS 600) -> run-logs/incentive-mm/yt_top1_fair.json.
+- It reads the 20-min view snapshots of the collector (yt_snapshots.jsonl, to 10/18) and the new feed (yt_topvid_snapshots.jsonl, task "KL yt-topvid-feed", 531a69b), keeping 5 days in memory. Candidates come from the feed's yt_topvid_ids.json.
+- Nowcast: views so far divided by the video's own median share of its day by that hour (its previous 3 days), times a chart/API ratio (the 10/05 study's, to 10/03).
+- P: 4,000 draws against every listed video plus the 40 fastest unlisted ones.
+- Uncertainty, measured in KL-data/youtube-analysis-2026-10-14-top1/calib.py: log sd 0.24 to h4, ~0.3 at h6-8, 0.18 at h12, 0.04 at h18, 0.01 by h22.
+- It writes nothing before 2 h into the chart day or on API data older than 45 min (fails closed).
+
+THE RULES (YT1_*; yt1_gate_reason in the quote loop):
+- Only the fair's leader is quoted, while P >= YT1_MIN_P (0.80).
+- Bids only (series_bid_only); every rung at most P - YT1_EDGE_CENTS (10), applied with quake_cap_quotes. Join-ahead is off while a cap applies.
+- Out at 00:00Z after the chart day.
+- 20 lots x1 at every hour, 100 per market and per event.
+- Its own -$40/day budget through the pilot_halt_key machinery ("twk_halt" email, key KXYTDAILYTOPVIDEOG).
+
+MODES (IMM_YT1_MODE):
+- "shadow", the default: the fair runs and "yt1 shadow <event>: leader ... -> would bid at most Nc" is logged on each change of leader or 5c band. Nothing is quoted; the series is not allowlisted.
+- "live": allowlisted and quoted.
+- "off".
+
+BACKTEST (backtest.py; Kalshi's own trade tape; fills optimistic, no queue): at 10c / P >= 0.80 the 13 days made +$33.29 on 104 contracts, all Dai Dai. +$20.23 of it came on 10/06 and +$12.88 on 10/10. Other settings: 5c / 0.70 +$40.03, 15c / 0.80 +$24.66. Rewards are not counted.
+- 10/09 (no listed winner) and 10/01 (the fair briefly favored Casa Tupka) drew no fills.
+- The risk the fair cannot see: a release no feed tracks yet taking #1.
+
+Startup line: "yt1 pilot (KXYTDAILYTOPVIDEOG): SHADOW -- a YES bid on yt_top1_fair's leader only, at most P - 10c while P >= 80%, ...".
+Tests: test_yt_top1_fair.py (8); TestYouTube1Pilot (5); TestGuardSkipSink counts 46 continues.
+To go live: IMM_YT1_MODE=live in run_incentive_mm.ps1's env (or flip the default), then a restart.
