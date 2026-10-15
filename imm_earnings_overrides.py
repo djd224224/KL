@@ -544,6 +544,7 @@ def enroll_new_series(client, dry: bool):
     load_extra_allow_series()
     imm.load_election_extra_series()
     imm.load_nfl_auto_series()
+    imm.load_league_auto_series()
     imm.load_awards_extra_series()
     imm.load_graduate_auto_series()
     imm.load_mention_auto_series()
@@ -609,6 +610,7 @@ def enroll_new_series(client, dry: bool):
     fin_additions = []
     elec_additions = []
     nfl_additions: dict = {}
+    league_additions: dict = {}
     awards_additions = []
     grad_additions: dict = {}
     mention_additions = []
@@ -639,6 +641,13 @@ def enroll_new_series(client, dry: bool):
                 enrolled.append((s, nfl_auto_why(entry), sample))
             else:
                 still_review.append((s, f"{why}; nfl auto: {why_not}", sample))
+        elif imm.LEAGUE_AUTO_ENABLE and imm.series_league(s):
+            entry, why_not = league_auto_entry_for(client, s, sample, se)
+            if entry is not None:
+                league_additions[s] = entry
+                enrolled.append((s, league_auto_why(entry), sample))
+            else:
+                still_review.append((s, f"{why}; league auto: {why_not}", sample))
         elif imm.AWARDS_AUTO and awards_tagged(se):
             why_not = awards_auto_why_not(s, sample, se)
             if not why_not:
@@ -667,6 +676,14 @@ def enroll_new_series(client, dry: bool):
             nfl_auto_notify(nfl_additions)
         except Exception as e:                       # noqa: BLE001
             log(f"! nfl auto enrollment email failed: {e!r}")
+    if league_additions and not dry:
+        _merge_nfl_auto_file(imm.league_auto_path(), league_additions)
+        log(f"league-auto-enrolled {len(league_additions)} series "
+            f"({', '.join(sorted(league_additions))}) -> {imm.league_auto_path()}")
+        try:
+            league_auto_notify(league_additions)
+        except Exception as e:                       # noqa: BLE001
+            log(f"! league auto enrollment email failed: {e!r}")
     if awards_additions and not dry:
         _merge_series_file(imm.awards_extra_path(), awards_additions)
         log(f"awards-enrolled {len(awards_additions)} Kalshi award-tagged "
@@ -994,6 +1011,141 @@ def nfl_auto_notify(additions: dict) -> None:
               f"{imm.nfl_auto_path()} -- the bot reloads it within one "
               "refresh -- or ask Claude. To drop one, delete its entry."]
     imm.Alerter("IMM-NFL", live=True).send_message("\n".join(lines), subject)
+
+
+# NBA / WNBA / MLB AUTO FAMILIES (Jack 2026-10-15: "KXWNBAFINALSMVP should be
+# quoted", then "New NBA, WNBA, MLB families should be auto quoted like
+# elections, nfl, etc"). The NFL auto family's enrollment for three more
+# leagues: a REVIEW series named KXNBA* / KXWNBA* / KXMLB* that Kalshi files
+# under Sports with the league's tag (Basketball / Baseball) joins
+# incentive_mm.LEAGUE_AUTO_FILE (hot-reloaded; the bot's rules are
+# documented at incentive_mm.LEAGUE_AUTO_ENABLE) -- a "game" member when its
+# event names one game (date + team codes, the start resolver's own shape),
+# a "season" member otherwise, with the ESPN round that decides it when its
+# name or title ties it to one (league_decided_by) -- unless it is off-field
+# (the NFL family's list plus team sales, franchise values and attendance)
+# or has hand-set rules (incentive_mm.league_hand_configured). Every
+# enrollment is emailed (league_auto_notify).
+LEAGUE_AUTO_WHY = "league auto family"
+LEAGUE_AUTO_TAGS = {"NBA": "Basketball", "WNBA": "Basketball", "MLB": "Baseball"}
+LEAGUE_AUTO_OFFFIELD_CONTRACTS = NFL_AUTO_OFFFIELD_CONTRACTS | frozenset({
+    "FRANCHISECOST", "SPORTSTEAMSOLD", "BBALLWHATTEND"})
+LEAGUE_AUTO_OFFFIELD_WORDS = NFL_AUTO_OFFFIELD_WORDS + (
+    "FRANCHISE", "SALE", "SOLD", "ATTEND", "EXPANSION", "RELOCAT")
+# incentive_mm.EventStartResolver._espn_game_start's game segment
+_LEAGUE_GAME_SEG_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}[A-Z]{4,10}$")
+
+
+def _league_prefix(series: str) -> str:
+    return next((p for p in imm.LEAGUE_AUTO_PREFIXES if series.startswith(p)), "")
+
+
+def league_game_event(sample: str) -> bool:
+    """Does the market's event name ONE game ('KXNBAPTS-26OCT21LALGSW-...')?"""
+    parts = sample.split("-")
+    return (len(parts) >= 2 and bool(_LEAGUE_GAME_SEG_RE.match(parts[1]))
+            and imm.parse_event_date(sample) is not None)
+
+
+def league_decided_by(league: str, series: str, title: str):
+    """The ESPN round whose completion decides a season member, from its
+    name and Kalshi title (incentive_mm.LEAGUE_DECIDED_ROUNDS), else None
+    (the live-game rule alone): a league Finals series -> "<league> Finals"
+    (not a conference final); MLB ALCS / NLCS / World Series, and the
+    postseason-total series ("playoff" / "postseason") -> the World Series."""
+    rest = series[len(_league_prefix(series)):].upper()
+    t = str(title or "").upper()
+    if league in ("NBA", "WNBA"):
+        if ("FINALS" in rest or "FINALS" in t) and not any(
+                w in rest or w in t for w in ("CONF", "EAST", "WEST")):
+            return f"{league} Finals"
+        return None
+    if league == "MLB":
+        for rnd in ("ALCS", "NLCS"):
+            if rnd in rest or rnd in t:
+                return rnd
+        if rest.startswith("WS") or "WORLD SERIES" in t:
+            return "World Series"
+        if any(w in rest or w in t for w in ("PLAYOFF", "POSTSEASON")):
+            return "World Series"
+    return None
+
+
+def league_auto_entry_for(client, series: str, sample: str, se: dict):
+    """(entry for incentive_mm.LEAGUE_AUTO_FILE, '') for a series the league
+    auto family takes, else (None, why not)."""
+    league = imm.series_league(series)
+    if league is None:
+        return None, "not an NBA / WNBA / MLB series"
+    if imm.league_hand_configured(series):
+        return None, ("hand-configured family (ladder / escalator, MLB MVP, "
+                      "mentions or the exact sports allowlist)")
+    tag = LEAGUE_AUTO_TAGS[league]
+    if se.get("category") != "Sports" or tag not in (se.get("tags") or []):
+        return None, f"Kalshi category {se.get('category')!r}, tags {se.get('tags')!r}"
+    contract = str(se.get("contract_url") or "").rsplit("/", 1)[-1].replace(".pdf", "")
+    rest = series[len(_league_prefix(series)):]
+    if contract in LEAGUE_AUTO_OFFFIELD_CONTRACTS \
+            or any(w in rest for w in LEAGUE_AUTO_OFFFIELD_WORDS):
+        return None, f"off-field ({contract or 'by name'})"
+    game = league_game_event(sample)
+    title = str(se.get("title") or "")
+    entry = {"league": league, "kind": "game" if game else "season",
+             "size": "pilot", "title": title, "contract": contract,
+             "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "sample": sample}
+    if game:
+        entry["buffer_min"] = imm.LEAGUE_AUTO_GAME_BUFFER_MIN
+    else:
+        entry["decided_by"] = league_decided_by(league, series, title)
+    return entry, ""
+
+
+def league_auto_why(entry: dict) -> str:
+    league = entry["league"]
+    if entry["kind"] == "game":
+        return (f"{LEAGUE_AUTO_WHY}: one {league} game per event, quoted to "
+                f"{entry['buffer_min']}m before the start, pilot size")
+    tail = (f", out for good once the {entry['decided_by']} is decided"
+            if entry.get("decided_by") else "")
+    return (f"{LEAGUE_AUTO_WHY}: {league} season prop, off while any {league} "
+            f"game is live{tail}, pilot size")
+
+
+def league_auto_notify(additions: dict) -> None:
+    """One email for the league families just enrolled."""
+    n = len(additions)
+    leagues = "/".join(sorted({e["league"] for e in additions.values()}))
+    subject = (f"IMM: {n} {leagues} famil{'y' if n == 1 else 'ies'} auto-enrolled "
+               f"at pilot size -- {', '.join(sorted(additions))}")
+    lines = [subject, ""]
+    for s_, e in sorted(additions.items()):
+        lines.append(f"- {s_}: {e.get('title') or '(no title)'} [{e.get('contract') or '?'}]")
+        if e["kind"] == "game":
+            lines.append(f"    one {e['league']} game per event -- quoted until "
+                         f"{e['buffer_min']} min before the start (no team-news "
+                         f"feed for this league)")
+        else:
+            lines.append(f"    season prop -- no cutoff; OFF whenever any {e['league']} "
+                         f"game is live (+{imm.LEAGUE_LIVE_COOLDOWN_MIN} min after it ends)"
+                         + (f"; out for good once the {e['decided_by']} is decided"
+                            if e.get("decided_by") else ""))
+        lines.append(f"    e.g. {e.get('sample', '')}")
+    lines += ["",
+              f"Pilot size, as the NFL auto families: safe-join, "
+              f"x{imm.LEAGUE_AUTO_SIZE_MULT:g} ({imm.LEAGUE_AUTO_SIZE_MULT * 20:g} lots, "
+              f"{imm.MAX_POSITION_CONTRACTS * imm.LEAGUE_AUTO_SIZE_MULT:g} per market) "
+              f"with the overnight and Saturday step-ups on top, the ladders' "
+              f"event cap ({imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult('KXNFLLADDERREC'):g}), "
+              f"and quoting on an event stops for the day at "
+              f"-${imm.LEAGUE_AUTO_DAILY_LOSS_LIMIT:g} on that event.",
+              "New basketball / baseball events trade on Kalshi's exchange shard 3, "
+              "which holds its own cash: an empty shard refuses every order (the "
+              "health alert emails when one runs dry).",
+              f"To drop one, delete its entry in {imm.league_auto_path()} -- the "
+              "bot reloads it within one refresh -- or ask Claude."]
+    imm.Alerter("IMM-LEAGUE", live=True).send_message("\n".join(lines), subject)
+
 
 
 def series_meta(client, series: str) -> dict:

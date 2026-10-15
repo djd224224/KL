@@ -1565,7 +1565,8 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     # the evening window (2026-10-05): never on a quiet hour, never on the
     # sports ladders / escalators (their pre-kickoff window)
     if hour in evening and not sports_ladder_league(series) \
-            and nfl_auto_entry(series) is None:
+            and nfl_auto_entry(series) is None \
+            and league_auto_entry(series) is None:
         return evening[hour]
     return 1.0
 
@@ -1637,7 +1638,7 @@ def is_daily_series(series: str) -> bool:
         return False
     # the NFL auto families take the overnight / Saturday step-ups (Jack
     # 2026-10-12) -- never daily, whatever the feed classifier reads
-    if nfl_auto_entry(series) is not None:
+    if nfl_auto_entry(series) is not None or league_auto_entry(series) is not None:
         return False
     if any(series.startswith(p) for p in DAILY_PREFIXES):
         return True
@@ -2356,8 +2357,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         return globals()["TWK_EVENT_CAP"]
-    # the NFL auto families (2026-10-12): the ladders' / escalators' event cap
-    if nfl_auto_entry(series) is not None:
+    # the NFL auto families (2026-10-12) and the league auto families
+    # (2026-10-15): the ladders' / escalators' event cap
+    if nfl_auto_entry(series) is not None or league_auto_entry(series) is not None:
         return MAX_EVENT_CONTRACTS * applied_mention_mult("KXNFLLADDERREC")
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
@@ -4422,7 +4424,8 @@ def schedule_resolved_series(series: str) -> bool:
     league that has an ESPN path."""
     return series in SCHEDULE_RESOLVED_SERIES \
         or sports_ladder_league(series) in ESPN_LEAGUE_PATHS \
-        or nfl_h2h_series(series) or nfl_auto_game(series)
+        or nfl_h2h_series(series) or nfl_auto_game(series) \
+        or league_auto_game(series)
 
 
 # ELECTIONS (Jack 2026-09-28: "allowlist county judge markets e.g.
@@ -4957,6 +4960,188 @@ def mlb_rounds_decided(board) -> Dict[str, str]:
         if ser.get("completed") or (total and wins >= total // 2 + 1):
             out[rnd] = str(ser.get("summary") or f"{wins} wins")
     return out
+
+
+# NBA / WNBA / MLB FAMILIES, AUTO-ENROLLED (Jack 2026-10-15:
+# "KXWNBAFINALSMVP should be quoted", then "New NBA, WNBA, MLB families
+# should be auto quoted like elections, nfl, etc"). The NFL auto family's
+# machinery (NFL_AUTO_ENABLE) for three more leagues. The new-series pass
+# (imm_earnings_overrides.enroll_new_series, run by the 30-min family watch
+# and the overrides task) writes each newly paying, not-yet-allowed KXNBA /
+# KXWNBA / KXMLB series that Kalshi files under Sports with the league's tag
+# (Basketball / Baseball) -- less the off-field contracts (team sales,
+# franchise values, next team, attendance, plus the NFL family's list) and
+# the families with hand-set rules (league_hand_configured: the sports
+# ladders / escalators, the MLB postseason MVPs, the mention books, the
+# exact sports allowlist) -- into LEAGUE_AUTO_FILE and emails it:
+#   {"series": {S: {"league": "NBA" | "WNBA" | "MLB", "kind": "game" | "season",
+#                   "buffer_min": int | null, "size": "pilot",
+#                   "decided_by": round | null, "title", "contract", "since"}}}
+# Hot-reloaded by mtime at import and every universe refresh. A member
+# quotes with this guard set (league_auto_override):
+#   kind "game"   -- one game per event ("26OCT21LALGSW"): cut off at the
+#                    league's ESPN scoreboard start less buffer_min. These
+#                    leagues have no team-news feed (the NFL family's hold
+#                    reads nflverse rosters), so a game member is out
+#                    LEAGUE_AUTO_GAME_BUFFER_MIN (90) before the start: the
+#                    injury report / lineup window.
+#   kind "season" -- beyond a single game (awards, playoff props, series):
+#                    no cutoff; NO QUOTES WHILE ANY GAME OF ITS LEAGUE IS
+#                    LIVE (espn_live_verdict, plus LEAGUE_LIVE_COOLDOWN_MIN
+#                    after it goes final; a board that cannot be read counts
+#                    as live); and with "decided_by" -- the ESPN round its
+#                    result is settled in ("WNBA Finals", "NBA Finals",
+#                    "World Series", "ALCS", "NLCS") -- out for good once that
+#                    round is decided: the MLB MVPs' rule, since a Finals MVP
+#                    is announced on the floor minutes after the clinching
+#                    game, before Kalshi closes the event.
+#   size "pilot"  -- the NFL auto family's pilot as it stands (959080a):
+#                    safe-join, the family size_mult LEAGUE_AUTO_SIZE_MULT
+#                    (x3), the overnight quiet hours and the Saturday step
+#                    (never daily, no evening window), the ladders' event cap
+#                    and a daily loss halt PER EVENT at
+#                    -LEAGUE_AUTO_DAILY_LOSS_LIMIT ($100) on the pilots' halt
+#                    machinery (pilot_budget_key "LEAGUEAUTO:<event>").
+# New KXNBA / KXWNBA / KXMLB events land on Kalshi's exchange shard 3
+# (baseball / basketball / tennis), which holds its own cash: an empty shard
+# refuses every order (imm_health_alert emails when one runs dry).
+# IMM_LEAGUE_AUTO_ENABLE=0 takes every member out; positions ride.
+LEAGUE_AUTO_ENABLE = os.environ.get("IMM_LEAGUE_AUTO_ENABLE", "1") == "1"
+LEAGUE_AUTO_FILE = "league_auto_series.json"              # in STATUS_DIR
+# series prefix -> league (KXNBA does not prefix KXWNBA: the W comes first)
+LEAGUE_AUTO_PREFIXES = {"KXNBA": "NBA", "KXWNBA": "WNBA", "KXMLB": "MLB"}
+LEAGUE_AUTO_GAME_BUFFER_MIN = _env_int("IMM_LEAGUE_AUTO_GAME_BUFFER_MIN", 90)
+LEAGUE_AUTO_SIZE_MULT = _env_float("IMM_LEAGUE_AUTO_SIZE_MULT", NFL_AUTO_SIZE_MULT)
+LEAGUE_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_LEAGUE_AUTO_DAILY_LOSS_LIMIT", 100)  # per event
+LEAGUE_LIVE_COOLDOWN_MIN = _env_int("IMM_LEAGUE_LIVE_COOLDOWN_MIN", 15)
+LEAGUE_LIVE_TTL_SECS = _env_int("IMM_LEAGUE_LIVE_TTL_SECS", 60)
+# a final that started this long ago is long over (MLB: extra innings)
+LEAGUE_GAME_OVER_AFTER_H = {"NBA": 4.0, "WNBA": 4.0, "MLB": MLB_GAME_OVER_AFTER_H}
+LEAGUE_START_WORD = {"NBA": "tip-off", "WNBA": "tip-off", "MLB": "first pitch"}
+LEAGUE_DECIDED_ROUNDS = frozenset({"NBA Finals", "WNBA Finals", "World Series",
+                                   "ALCS", "NLCS"})
+LEAGUE_AUTO_BUDGET_PREFIX = "LEAGUEAUTO:"
+LEAGUE_AUTO_SERIES: Dict[str, dict] = {}
+_league_auto_state: dict = {"mtime": 0.0, "installed": set()}
+
+
+def league_auto_path() -> str:
+    return os.path.join(STATUS_DIR, LEAGUE_AUTO_FILE)
+
+
+def series_league(series: str) -> Optional[str]:
+    """'KXWNBAFINALSMVP' -> 'WNBA', 'KXMLBPLAYOFFHRS' -> 'MLB'; None for any
+    series outside the three leagues."""
+    for prefix, league in LEAGUE_AUTO_PREFIXES.items():
+        if series.startswith(prefix):
+            return league
+    return None
+
+
+def league_auto_entry(series: str) -> Optional[dict]:
+    """The series' league auto-family entry, None when it is not a member
+    (or the family is off)."""
+    return LEAGUE_AUTO_SERIES.get(series) if LEAGUE_AUTO_ENABLE else None
+
+
+def league_auto_game(series: str) -> bool:
+    e = league_auto_entry(series)
+    return bool(e) and e["kind"] == "game"
+
+
+def league_auto_season(series: str) -> bool:
+    e = league_auto_entry(series)
+    return bool(e) and e["kind"] == "season"
+
+
+def league_auto_pilot(series: str) -> bool:
+    e = league_auto_entry(series)
+    return bool(e) and e["size"] == "pilot"
+
+
+def league_hand_configured(series: str) -> bool:
+    """A league family with hand-set rules of its own, matched by NAME so the
+    auto family never takes one in: the sports ladders / escalators, the MLB
+    postseason MVPs (MLB_MVP_ROUNDS), the mention books (KXMLBMENTION is
+    mlb_trading.py's) and the exact sports allowlist (KXMLBPLAYOFFS,
+    KXMLBSEASONGAMES: the undated guard set)."""
+    return (bool(sports_ladder_league(series)) or series in MLB_MVP_ROUNDS
+            or "MENTION" in series or series in globals().get("ALLOW_SERIES", ()))
+
+
+def league_auto_override(entry: dict) -> "SeriesOverride":
+    """A member's guard set (see LEAGUE_AUTO_ENABLE): safe-join, the family
+    multiplier and, for a game member, its start buffer."""
+    kw: dict = {"safe_join": True, "size_mult": LEAGUE_AUTO_SIZE_MULT}
+    if entry["kind"] == "game":
+        kw["start_buffer_min"] = int(entry["buffer_min"])
+    return SeriesOverride(**kw)
+
+
+def load_league_auto_series() -> int:
+    """Hot-reload LEAGUE_AUTO_FILE by mtime into LEAGUE_AUTO_SERIES and
+    (re)install each member's guard set; entries changed on a reload, else 0.
+    Refuses blocklisted series, a league that disagrees with the name and
+    the hand-configured families (league_hand_configured)."""
+    try:
+        mtime = os.path.getmtime(league_auto_path())
+    except OSError:
+        return 0
+    if mtime == _league_auto_state["mtime"]:
+        return 0
+    _league_auto_state["mtime"] = mtime
+    try:
+        with open(league_auto_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! league auto file unreadable: {e}")
+        return 0
+    fresh: Dict[str, dict] = {}
+    for s_, e in (data.get("series") or {}).items():
+        s_ = str(s_).strip()
+        league = series_league(s_)
+        if league is None or not isinstance(e, dict):
+            continue
+        if e.get("league") not in (None, league):
+            log(f"[IMM] ! league auto {s_}: league {e.get('league')!r} is not "
+                f"the name's {league}, skipped")
+            continue
+        if any(s_.startswith(p_) for p_ in SERIES_BLOCKLIST_PREFIXES):
+            log(f"[IMM] ! refused blocklisted series in league auto: {s_}")
+            continue
+        if league_hand_configured(s_):
+            log(f"[IMM] ! refused hand-configured family in league auto: {s_}")
+            continue
+        kind, size = e.get("kind"), e.get("size") or "pilot"
+        if kind not in ("game", "season") or size != "pilot":
+            log(f"[IMM] ! league auto {s_}: kind/size {kind!r}/{size!r} not "
+                f"understood, skipped")
+            continue
+        try:
+            buf = int(e["buffer_min"]) if e.get("buffer_min") is not None \
+                else LEAGUE_AUTO_GAME_BUFFER_MIN
+        except (TypeError, ValueError):
+            buf = LEAGUE_AUTO_GAME_BUFFER_MIN
+        rnd = e.get("decided_by") or None
+        if rnd is not None and rnd not in LEAGUE_DECIDED_ROUNDS:
+            log(f"[IMM] ! league auto {s_}: decided_by {rnd!r} is not an ESPN "
+                f"round this rule knows, ignored")
+            rnd = None
+        fresh[s_] = {"league": league, "kind": kind, "size": size,
+                     "buffer_min": max(0, buf), "decided_by": rnd,
+                     "title": str(e.get("title") or "")}
+    for s_ in _league_auto_state["installed"] - set(fresh):
+        SERIES_OVERRIDES.pop(s_, None)
+    for s_, e in fresh.items():
+        SERIES_OVERRIDES[s_] = league_auto_override(e)
+    changed = sum(1 for s_ in set(fresh) | set(LEAGUE_AUTO_SERIES)
+                  if fresh.get(s_) != LEAGUE_AUTO_SERIES.get(s_))
+    LEAGUE_AUTO_SERIES.clear()
+    LEAGUE_AUTO_SERIES.update(fresh)
+    _league_auto_state["installed"] = set(fresh)
+    if changed:
+        log(f"[IMM] league auto families: {len(fresh)} enrolled ({changed} changed)")
+    return changed
 
 
 def election_series(series: str) -> bool:
@@ -8814,6 +8999,9 @@ _CONFIG_CODE_KNOBS = (
     # MLB postseason MVPs (2026-10-12)
     "MLB_MVP_ENABLE", "MLB_LIVE_COOLDOWN_MIN", "MLB_LIVE_TTL_SECS",
     "MLB_GAME_OVER_AFTER_H", "MLB_DECIDED_LOOKBACK_DAYS", "MLB_MVP_SIZE_MULT",
+    # NBA / WNBA / MLB auto families (2026-10-15)
+    "LEAGUE_AUTO_ENABLE", "LEAGUE_AUTO_GAME_BUFFER_MIN", "LEAGUE_AUTO_SIZE_MULT",
+    "LEAGUE_AUTO_DAILY_LOSS_LIMIT", "LEAGUE_LIVE_COOLDOWN_MIN", "LEAGUE_LIVE_TTL_SECS",
     # hand positions the bot trades beside (2026-10-13)
     "MANUAL_COEXIST_EVENTS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
@@ -9751,6 +9939,7 @@ load_family_verdicts()
 load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
 load_election_extra_series()   # Elections-category members (beside election_series)
 load_nfl_auto_series()         # NFL auto families (beside the election file)
+load_league_auto_series()      # NBA / WNBA / MLB auto families (ditto)
 load_awards_extra_series()     # awards by Kalshi tag (beside the election file)
 load_graduate_auto_series()    # graduate families by Kalshi metadata (ditto)
 load_mention_auto_series()     # single-event mentions by Kalshi category (ditto)
@@ -12354,6 +12543,10 @@ def pilot_budget_key(ticker: str) -> Optional[str]:
     if nfl_auto_pilot(series):
         return (NFL_AUTO_BUDGET_PREFIX + nfl_auto_event_key(ticker)
                 if NFL_AUTO_DAILY_LOSS_LIMIT > 0 else None)
+    # the league auto families (2026-10-15): the same budget per event
+    if league_auto_pilot(series):
+        return (LEAGUE_AUTO_BUDGET_PREFIX + nfl_auto_event_key(ticker)
+                if LEAGUE_AUTO_DAILY_LOSS_LIMIT > 0 else None)
     return pilot_halt_key(series)
 
 
@@ -12364,6 +12557,8 @@ def pilot_halt_limit(key: str) -> float:
         return YT1_DAILY_LOSS_LIMIT
     if key.startswith(NFL_AUTO_BUDGET_PREFIX):
         return NFL_AUTO_DAILY_LOSS_LIMIT
+    if key.startswith(LEAGUE_AUTO_BUDGET_PREFIX):
+        return LEAGUE_AUTO_DAILY_LOSS_LIMIT
     return TWK_DAILY_LOSS_LIMIT
 
 
@@ -13428,6 +13623,11 @@ class EventStartResolver:
         # segment, the NFL scoreboard
         if nfl_h2h_series(series) or nfl_auto_game(series):
             path = ESPN_LEAGUE_PATHS.get("NFL")
+            return self._espn_game_start(path, event_ticker, 2) if path else None
+        # the league auto families' game members (2026-10-15): the same
+        # '<date><AWAY><HOME>' segment, on their own league's scoreboard
+        if league_auto_game(series):
+            path = ESPN_LEAGUE_PATHS.get(league_auto_entry(series)["league"])
             return self._espn_game_start(path, event_ticker, 2) if path else None
         game = parse_mention_game(event_ticker)
         if game is None:
@@ -15443,7 +15643,8 @@ def join_ahead_series(series: str) -> bool:
     if JOIN_AHEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
         return False
     if sports_ladder_league(series) is not None or is_daily_series(series) \
-            or nfl_h2h_series(series) or nfl_auto_entry(series) is not None:
+            or nfl_h2h_series(series) or nfl_auto_entry(series) is not None \
+            or league_auto_entry(series) is not None:
         return False
     # Carbon Arc by its verified source OR its name pattern: an unverified
     # *POS / *FT / *APP / *ADS / *CC stays out too (fails toward no move)
@@ -16463,6 +16664,13 @@ class IncentiveMarketMaker:
         self._mlb_final_seen: Dict[str, float] = {}
         self._mlb_decided: Dict[str, str] = {}
         self._mlb_stood_series: Set[str] = set()
+        # league auto families (_league_auto_hold, 2026-10-15): the rounds seen
+        # decided per league (sticky), when each game was first seen final per
+        # league, and the season series standing aside (logged once); boards
+        # share the MLB MVPs' per-URL cache (_mlb_get)
+        self._league_decided: Dict[str, Dict[str, str]] = {}
+        self._league_final_seen: Dict[str, Dict[str, float]] = {}
+        self._league_stood_series: Set[str] = set()
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
@@ -19698,6 +19906,7 @@ class IncentiveMarketMaker:
             cpi_pilot_active(ticker) or \
             nfl_h2h_series(series) or \
             nfl_auto_entry(series) is not None or \
+            league_auto_entry(series) is not None or \
             awards_extra_series(series) or \
             mlb_mvp_series(series) or \
             graduate_auto_series(series) or \
@@ -19943,6 +20152,7 @@ class IncentiveMarketMaker:
         load_finecon_extra_series()
         load_election_extra_series()
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
+        load_league_auto_series()     # NBA / WNBA / MLB auto families (2026-10-15)
         load_awards_extra_series()    # awards by Kalshi tag (2026-10-12)
         load_graduate_auto_series()   # graduate families by metadata (2026-10-12)
         load_mention_auto_series()    # single-event mentions by category (2026-10-13)
@@ -21676,6 +21886,48 @@ class IncentiveMarketMaker:
             MLB_GAME_OVER_AFTER_H, "first pitch")
         if live is not False:
             return why or "MLB scoreboard unreadable"
+        return ""
+
+    def _league_auto_hold(self, series: str, now_ts: float) -> str:
+        """Why a league auto family SEASON member sits out now ('' =
+        quote): its deciding round ("decided_by") decided on its league's
+        ESPN boards -- today's and the MLB_DECIDED_LOOKBACK_DAYS before it,
+        sticky for the process -- or any game of its league live
+        (espn_live_verdict). An unreadable board holds it too (fail
+        closed). See LEAGUE_AUTO_ENABLE."""
+        e = league_auto_entry(series) or {}
+        league = e.get("league") or series_league(series) or ""
+        path = ESPN_LEAGUE_PATHS.get(league)
+        if not path:
+            return f"no ESPN scoreboard for {league or series}"
+        decided = self._league_decided.setdefault(league, {})
+        rnd = e.get("decided_by")
+        if rnd:
+            today = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(ET).date()
+            for k in range(MLB_DECIDED_LOOKBACK_DAYS + 1):
+                if rnd in decided:
+                    break
+                d = today - timedelta(days=k)
+                url = f"{ESPN_SITE_API}/{path}/scoreboard?dates={d.strftime('%Y%m%d')}"
+                try:
+                    board = self._mlb_get(url, now_ts,
+                                          LEAGUE_LIVE_TTL_SECS if k <= 1 else 6 * 3600)
+                except Exception as ex:                      # noqa: BLE001
+                    return f"{league} scoreboard unreadable ({type(ex).__name__})"
+                for r, summary in mlb_rounds_decided(board).items():
+                    if r not in decided:
+                        decided[r] = summary
+                        log(f"{self.tag} {league} {r} decided ({summary}): league "
+                            f"auto members tied to it stay out")
+            if rnd in decided:
+                return f"{rnd} decided ({decided[rnd]})"
+        live, why = espn_live_verdict(
+            league, lambda u: self._mlb_get(u, now_ts, LEAGUE_LIVE_TTL_SECS),
+            now_ts, self._league_final_seen.setdefault(league, {}),
+            LEAGUE_LIVE_COOLDOWN_MIN, LEAGUE_GAME_OVER_AFTER_H.get(league, 4.0),
+            LEAGUE_START_WORD.get(league, "the start"))
+        if live is not False:
+            return why or f"{league} scoreboard unreadable"
         return ""
 
     def _twk_pnl(self, key: str) -> float:
@@ -24073,6 +24325,23 @@ class IncentiveMarketMaker:
             if t in self._nfl_stood:
                 self._nfl_stood.discard(t)
                 log(f"{self.tag} nfl resume {t}")
+            # NBA / WNBA / MLB AUTO FAMILIES' SEASON members (Jack 2026-10-15,
+            # see LEAGUE_AUTO_ENABLE): out while any game of their league is
+            # live, and for good once their deciding round is. Logged per
+            # series.
+            if league_auto_season(meta.series):
+                la_why = self._league_auto_hold(meta.series, now_ts)
+                if la_why:
+                    if meta.series not in self._league_stood_series:
+                        self._league_stood_series.add(meta.series)
+                        log(f"{self.tag} league auto stand-aside {meta.series}: {la_why}")
+                    self.cancel_market_orders(t, resting)
+                    la_in = {"why": la_why}
+                    self._gskip(t, "league_live", lambda: la_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                if meta.series in self._league_stood_series:
+                    self._league_stood_series.discard(meta.series)
+                    log(f"{self.tag} league auto resume {meta.series}")
             # MLB POSTSEASON MVPs (Jack 2026-10-12: "quote MLB MVPs under a
             # no-quotes-during-games rule", see MLB_MVP_ROUNDS): out while any
             # MLB game is live, and for good once the round is decided.
@@ -24755,6 +25024,11 @@ class IncentiveMarketMaker:
             _tk = set(self.pnl.realized) | set(self.pnl.pos) | set(self.state.selected)
             tw_keys += sorted({k for k in map(pilot_budget_key, _tk)
                                if k and k.startswith(NFL_AUTO_BUDGET_PREFIX)})
+        if LEAGUE_AUTO_ENABLE and LEAGUE_AUTO_DAILY_LOSS_LIMIT > 0 and LEAGUE_AUTO_SERIES:
+            # ... and the league auto families' (2026-10-15), the same way
+            _tk = set(self.pnl.realized) | set(self.pnl.pos) | set(self.state.selected)
+            tw_keys += sorted({k for k in map(pilot_budget_key, _tk)
+                               if k and k.startswith(LEAGUE_AUTO_BUDGET_PREFIX)})
         if tw_keys and not fast_only:
             _roll_day = _halt_day_key(now_utc)
             for tw_s in tw_keys:

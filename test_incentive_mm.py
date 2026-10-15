@@ -190,6 +190,12 @@ def setUpModule():
         imm.SERIES_OVERRIDES.pop(s, None)
     imm.NFL_AUTO_SERIES.clear()
     imm._nfl_auto_state.update(mtime=0.0, installed=set())
+    # ...and the NBA / WNBA / MLB auto families (2026-10-15) the same way:
+    # league_auto_series.json is loaded at import too
+    for s in imm._league_auto_state["installed"]:
+        imm.SERIES_OVERRIDES.pop(s, None)
+    imm.LEAGUE_AUTO_SERIES.clear()
+    imm._league_auto_state.update(mtime=0.0, installed=set())
     # ...and so do the election family's two files: the Elections-category
     # members (election_extra_series.json, 2026-10-05) and the hot-reloaded
     # voting-day rows (election_dates_extra.json, 2026-10-07) -- 57 series and
@@ -20748,6 +20754,300 @@ class TestNflAutoFamilies(unittest.TestCase):
                          imm.NFL_AUTO_INACTIVE_BUFFER_MIN)
 
 
+class TestLeagueAutoFamilies(unittest.TestCase):
+    """NBA / WNBA / MLB families auto-enrolled like the NFL ones (Jack
+    2026-10-15: "KXWNBAFINALSMVP should be quoted", then "New NBA, WNBA, MLB
+    families should be auto quoted like elections, nfl, etc"). No team-news
+    feed for these leagues, so a game member stops LEAGUE_AUTO_GAME_BUFFER_MIN
+    before the start; a season member stops while its league plays and, when
+    tied to a round, for good once that round is decided."""
+
+    START = datetime(2067, 10, 22, 0, 0, tzinfo=timezone.utc)     # 8pm ET 10/21
+    GAME_T = "KXNBAPTS-67OCT21LALGSW-LALLJAMES23-25"
+    SEASON_T = "KXWNBAFINALSMVP-67-AWIL"
+    HRS_T = "KXMLBPLAYOFFHRS-67-T40"
+
+    def setUp(self):
+        _clean_persist()
+        overrides = dict(imm.SERIES_OVERRIDES)
+        members = dict(imm.LEAGUE_AUTO_SERIES)
+        state = dict(imm._league_auto_state)
+        hours = imm.SERIES_HOUR_MULTS
+
+        def restore():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+            imm.LEAGUE_AUTO_SERIES.clear()
+            imm.LEAGUE_AUTO_SERIES.update(members)
+            imm._league_auto_state.clear()
+            imm._league_auto_state.update(state)
+            imm.SERIES_HOUR_MULTS = hours
+            try:
+                os.remove(imm.league_auto_path())
+            except OSError:
+                pass
+        self.addCleanup(restore)
+        imm.SERIES_HOUR_MULTS = []
+        self.urls = []
+        self.boards = {"/nba/": {"events": []}, "/wnba/": {"events": []},
+                       "/mlb/": {"events": []}}
+
+    def _write(self, series):
+        with open(imm.league_auto_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+        imm._league_auto_state["mtime"] = 0.0
+        return imm.load_league_auto_series()
+
+    def _espn(self, url):
+        self.urls.append(url)
+        for key, board in self.boards.items():
+            if key in url:
+                if isinstance(board, Exception):
+                    raise board
+                return board
+        raise AssertionError(url)
+
+    def _ev(self, state, start, gid="1", short="ATL @ GS", note=None, series=None):
+        st = {"state": state, "name": {"in": "STATUS_IN_PROGRESS", "post": "STATUS_FINAL",
+                                       "pre": "STATUS_SCHEDULED"}[state],
+              "completed": state == "post", "detail": "Q2"}
+        comp = {"competitors": [
+            {"team": {"abbreviation": "GS", "location": "Golden State"}, "homeAway": "home"},
+            {"team": {"abbreviation": "LAL", "location": "Los Angeles"}, "homeAway": "away"}]}
+        if note:
+            comp["notes"] = [{"headline": note}]
+        if series:
+            comp["series"] = series
+        return {"id": gid, "shortName": short, "date": start.strftime("%Y-%m-%dT%H:%MZ"),
+                "status": {"type": st}, "competitions": [comp]}
+
+    def _bot(self, tickers, close="2067-10-30T00:00:00Z"):
+        client = FakeClient()
+        lv = [["0.36", "400"], ["0.37", "400"], ["0.38", "400"],
+              ["0.39", "400"], ["0.40", "300"]]
+        for t in tickers:
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                "close_time": close, "yes_bid_dollars": "0.4000",
+                "yes_ask_dollars": "0.6000", "volume_fp": "500.00"}
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.resolver = imm.EventStartResolver(http_get_json=self._espn)
+        return bot
+
+    @staticmethod
+    def _sides(bot, t):
+        return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+    def test_the_file_sets_membership_and_guard_sets(self):
+        mvp_ov = imm.SERIES_OVERRIDES["KXMLBWSMVP"]
+        lad_ov = imm.SERIES_OVERRIDES.get("KXNBALADDERPTS")
+        self.assertEqual(self._write({
+            "KXNBAPTS": {"league": "NBA", "kind": "game", "size": "pilot", "buffer_min": 90},
+            "KXWNBAFINALSMVP": {"league": "WNBA", "kind": "season", "size": "pilot",
+                                "decided_by": "WNBA Finals"},
+            "KXMLBPLAYOFFHRS": {"league": "MLB", "kind": "season", "decided_by": "World Series"},
+            "KXNBAODD": {"league": "NBA", "kind": "season", "decided_by": "NBA Cup"},
+            "KXMLBWSMVP": {"league": "MLB", "kind": "season"},        # hand-configured
+            "KXNBALADDERPTS": {"league": "NBA", "kind": "game"},      # a ladder
+            "KXMLBSEASONGAMES": {"league": "MLB", "kind": "season"},  # exact allowlist
+            "KXMLBMENTION": {"league": "MLB", "kind": "game"},        # mlb_trading.py's
+            "KXWNBAX": {"league": "NBA", "kind": "season"},           # league mismatch
+            "KXNFLTD": {"kind": "game"},                              # another family
+            "KXNBAWHAT": {"league": "NBA", "kind": "weekly"}}), 4)    # not understood
+        self.assertEqual(set(imm.LEAGUE_AUTO_SERIES),
+                         {"KXNBAPTS", "KXWNBAFINALSMVP", "KXMLBPLAYOFFHRS", "KXNBAODD"})
+        self.assertEqual(imm.LEAGUE_AUTO_SERIES["KXWNBAFINALSMVP"]["decided_by"], "WNBA Finals")
+        self.assertIsNone(imm.LEAGUE_AUTO_SERIES["KXNBAODD"]["decided_by"])   # unknown round
+        self.assertIs(imm.SERIES_OVERRIDES["KXMLBWSMVP"], mvp_ov)              # untouched
+        self.assertIs(imm.SERIES_OVERRIDES.get("KXNBALADDERPTS"), lad_ov)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            for t in (self.GAME_T, self.SEASON_T, self.HRS_T):
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed("KXNBAWHAT-67-X"))
+        g, s = imm.series_override("KXNBAPTS"), imm.series_override("KXWNBAFINALSMVP")
+        self.assertTrue(g.safe_join and s.safe_join)
+        self.assertEqual(g.start_buffer_min, 90)                # no team-news feed
+        self.assertIsNone(s.start_buffer_min)                   # a season prop: no cutoff
+        # the NFL auto family's pilot: x3, the ladders' event cap, budgets per event
+        lad_cap = imm.event_cap_contracts("KXNFLLADDERREC-26OCT12BUFLAR")
+        for ser in ("KXNBAPTS", "KXWNBAFINALSMVP"):
+            self.assertEqual(imm.series_override(ser).size_mult, imm.LEAGUE_AUTO_SIZE_MULT, ser)
+            self.assertEqual(imm.applied_mention_mult(ser), 3.0, ser)
+            self.assertFalse(imm.is_daily_series(ser), ser)
+            self.assertEqual(imm.series_max_position(ser), imm.MAX_POSITION_CONTRACTS * 3.0, ser)
+            self.assertEqual(imm.event_cap_contracts(f"{ser}-67-X"), lad_cap, ser)
+            self.assertIsNone(imm.pilot_halt_key(ser), ser)
+        self.assertEqual(imm.pilot_budget_key(self.SEASON_T), "LEAGUEAUTO:KXWNBAFINALSMVP-67")
+        self.assertEqual(imm.pilot_budget_key(self.GAME_T), "LEAGUEAUTO:KXNBAPTS-67OCT21LALGSW")
+        self.assertEqual(imm.pilot_halt_limit("LEAGUEAUTO:KXNBAPTS-67OCT21LALGSW"), 100)
+        with mock.patch.object(imm, "HOUR_SIZE_MULTS", imm._parse_hour_mults("0-8:3.0")), \
+                mock.patch.object(imm, "HOUR_SIZE_MULTS_NEXT", {}), \
+                mock.patch.object(imm, "HOUR_SIZE_MULT_FROM", None), \
+                mock.patch.object(imm, "EVENING_SIZE_MULTS", imm._parse_hour_mults("18-21:1.5")), \
+                mock.patch.object(imm, "EVENING_SIZE_MULT_FROM", datetime(2026, 10, 5).date()), \
+                mock.patch.object(imm, "SAT_SIZE_MULT", 1.5):
+            quiet = datetime(2026, 10, 13, 7, 0, tzinfo=timezone.utc)      # 3am ET Tuesday
+            evening = datetime(2026, 10, 13, 23, 30, tzinfo=timezone.utc)  # 7:30pm ET
+            sat = datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)       # 11am ET Saturday
+            for ser in ("KXNBAPTS", "KXWNBAFINALSMVP"):
+                self.assertEqual(imm.hour_size_mult(ser, quiet), 3.0, ser)
+                self.assertEqual(imm.hour_size_mult(ser, evening), 1.0, ser)
+                self.assertEqual(imm.hour_size_mult(ser, sat), 1.5, ser)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "on"):
+            self.assertFalse(imm.join_ahead_series("KXWNBAFINALSMVP"))
+        self.assertTrue(imm.schedule_resolved_series("KXNBAPTS"))
+        self.assertFalse(imm.schedule_resolved_series("KXWNBAFINALSMVP"))
+        # an entry leaving the file takes its guard set; the kill switch
+        self._write({"KXNBAPTS": {"league": "NBA", "kind": "game", "buffer_min": 90}})
+        self.assertNotIn("KXWNBAFINALSMVP", imm.LEAGUE_AUTO_SERIES)
+        self.assertNotIn("KXWNBAFINALSMVP", imm.SERIES_OVERRIDES)
+        with mock.patch.object(imm, "LEAGUE_AUTO_ENABLE", False):
+            self.assertIsNone(imm.league_auto_entry("KXNBAPTS"))
+
+    def test_rounds_and_game_shapes(self):
+        import imm_earnings_overrides as ieo
+        cases = [("WNBA", "KXWNBAFINALSMVP", "WNBA Finals MVP", "WNBA Finals"),
+                 ("NBA", "KXNBAFINALSMVP", "NBA Finals MVP", "NBA Finals"),
+                 ("NBA", "KXNBAWCFMVP", "Western Conference Finals MVP", None),
+                 ("NBA", "KXNBAMVP", "NBA MVP", None),
+                 ("MLB", "KXMLBPLAYOFFHRS", "Pro Baseball Playoff Home Runs", "World Series"),
+                 ("MLB", "KXMLBPLAYOFFHOST", "MLB Playoff Games Hosted", "World Series"),
+                 ("MLB", "KXMLBWSWINNER", "Who wins it all", "World Series"),
+                 ("MLB", "KXMLBALCSWINNER", "AL pennant", "ALCS"),
+                 ("MLB", "KXMLBNEWSX", "news", None),
+                 ("MLB", "KXMLBHR", "Home runs", None)]
+        for league, series, title, want in cases:
+            self.assertEqual(ieo.league_decided_by(league, series, title), want, series)
+        self.assertTrue(ieo.league_game_event("KXNBAPTS-26OCT21LALGSW-LALLJAMES23-25"))
+        self.assertTrue(ieo.league_game_event("KXWNBAGAME-26OCT17ATLGS-ATL"))
+        for t in ("KXWNBAFINALSMVP-26-AWIL", "KXMLBPLAYOFFHOST-26LAD",
+                  "KXNBAFRANCHISECOST-31DEC26LV"):
+            self.assertFalse(ieo.league_game_event(t), t)
+
+    def test_the_new_series_pass_enrolls_by_kalshi_category_and_emails(self):
+        import imm_earnings_overrides as ieo
+        bball = {"category": "Sports", "tags": ["Basketball"]}
+        base = {"category": "Sports", "tags": ["Baseball"]}
+        meta = {
+            "KXWNBAFINALSMVP": dict(bball, title="WNBA Finals MVP",
+                                    contract_url="https://x/NBAAWARD.pdf"),
+            "KXMLBPLAYOFFHRS": dict(base, title="Pro Baseball Playoff Home Runs",
+                                    contract_url="https://x/ENTITYOUTCOME.pdf"),
+            "KXNBAPTS": dict(bball, title="Pro Basketball Points",
+                             contract_url="https://x/BBALLENTITYSTAT.pdf"),
+            "KXMLBTEAMSALE": dict(base, title="Team sale", contract_url="https://x/SPORTSTEAMSOLD.pdf"),
+            "KXNBAWHATTEND": dict(bball, title="Who attends", contract_url="https://x/BBALLWHATTEND.pdf"),
+            "KXMLBHITS": dict(bball, title="Hits, mis-tagged", contract_url="https://x/X.pdf"),
+            "KXNBAXCORP": {"category": "Companies", "tags": [], "title": "Corp"}}
+        tickers = ["KXWNBAFINALSMVP-26-AWIL", "KXMLBPLAYOFFHRS-26-T40",
+                   "KXNBAPTS-26OCT21LALGSW-LALLJAMES23-25", "KXMLBTEAMSALE-27JANLAD",
+                   "KXNBAWHATTEND-26NYK", "KXMLBHITS-26-T3", "KXNBAXCORP-26NOV08-T5"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                raise AssertionError(path)
+        p = mock.patch.object(imm, "ALLOWLIST_ONLY", True)
+        p.start()
+        self.addCleanup(p.stop)
+        sent = []
+        with mock.patch.object(ieo, "league_auto_notify", lambda adds: sent.append(dict(adds))):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual(sorted(s for s, _w, _x in enrolled),
+                         ["KXMLBPLAYOFFHRS", "KXNBAPTS", "KXWNBAFINALSMVP"])
+        why = {s: w for s, w, _x in review}
+        self.assertIn("off-field", why["KXMLBTEAMSALE"])
+        self.assertIn("off-field", why["KXNBAWHATTEND"])
+        self.assertIn("tags", why["KXMLBHITS"])                 # Baseball series, Basketball tag
+        self.assertIn("Companies", why["KXNBAXCORP"])
+        self.assertEqual(sorted(sent[0]), ["KXMLBPLAYOFFHRS", "KXNBAPTS", "KXWNBAFINALSMVP"])
+        with open(imm.league_auto_path(), encoding="utf-8") as f:
+            ser = json.load(f)["series"]
+        self.assertEqual((ser["KXNBAPTS"]["league"], ser["KXNBAPTS"]["kind"],
+                          ser["KXNBAPTS"]["buffer_min"]), ("NBA", "game", 90))
+        self.assertEqual((ser["KXWNBAFINALSMVP"]["league"], ser["KXWNBAFINALSMVP"]["kind"],
+                          ser["KXWNBAFINALSMVP"]["decided_by"]), ("WNBA", "season", "WNBA Finals"))
+        self.assertEqual(ser["KXMLBPLAYOFFHRS"]["decided_by"], "World Series")
+        # quoted from the next refresh; the next pass sees them covered
+        imm.load_league_auto_series()
+        self.assertTrue(IncentiveMarketMaker._allowed("KXWNBAFINALSMVP-26-AWIL"))
+        with mock.patch.object(ieo, "league_auto_notify", lambda adds: sent.append(dict(adds))):
+            enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual(enrolled2, [])
+        self.assertEqual(len(sent), 1)
+
+    def test_a_game_member_stops_90_minutes_before_the_start(self):
+        self._write({"KXNBAPTS": {"league": "NBA", "kind": "game", "size": "pilot",
+                                  "buffer_min": 90}})
+        self.boards["/nba/"] = {"events": [self._ev("pre", self.START, short="LAL @ GS")]}
+        bot = self._bot([self.GAME_T])
+        bot.run_cycle()
+        self.assertIn(self.GAME_T, bot.state.selected)
+        self.assertEqual(bot.state.selected[self.GAME_T].cutoff,
+                         self.START - timedelta(minutes=90))
+        self.assertTrue(any("/basketball/nba/scoreboard?dates=20671021" in u for u in self.urls))
+        self.assertEqual(self._sides(bot, self.GAME_T), {"bid", "ask"})
+
+    def test_a_season_member_holds_on_its_leagues_games_and_its_round(self):
+        self._write({"KXWNBAFINALSMVP": {"league": "WNBA", "kind": "season", "size": "pilot",
+                                         "decided_by": "WNBA Finals"}})
+        bot = self._bot([self.SEASON_T], close="2068-01-10T00:00:00Z")
+        now = datetime.now(timezone.utc)
+
+        def cycle():
+            bot._mlb_get_cache.clear()                  # each phase reads afresh
+            bot.run_cycle()
+            return self._sides(bot, self.SEASON_T)
+        self.assertEqual(cycle(), {"bid", "ask"})                     # nothing on
+        self.assertIn(self.SEASON_T, bot.state.selected)
+        self.boards["/nba/"] = {"events": [self._ev("in", now - timedelta(hours=1))]}
+        self.assertEqual(cycle(), {"bid", "ask"})                     # another league
+        self.boards["/wnba/"] = {"events": [self._ev("in", now - timedelta(hours=1))]}
+        self.assertEqual(cycle(), set())                              # its league is live
+        self.boards["/wnba/"] = RuntimeError("espn down")
+        self.assertEqual(cycle(), set())                              # fails closed
+        self.boards["/wnba/"] = {"events": []}
+        self.assertEqual(cycle(), {"bid", "ask"})
+        clinch = self._ev("post", now - timedelta(hours=30), gid="9", note="WNBA Finals - Game 5",
+                          series={"summary": "ATL wins series 4-1", "completed": True,
+                                  "totalCompetitions": 7,
+                                  "competitors": [{"wins": 4}, {"wins": 1}]})
+        self.boards["/wnba/"] = {"events": [clinch]}
+        self.assertEqual(cycle(), set())                              # decided
+        self.assertEqual(bot._league_decided["WNBA"], {"WNBA Finals": "ATL wins series 4-1"})
+        self.boards["/wnba/"] = {"events": []}
+        self.assertEqual(cycle(), set())                              # for good
+
+    def test_the_loss_halt_is_per_event(self):
+        self._write({"KXMLBPLAYOFFHOST": {"league": "MLB", "kind": "season", "size": "pilot",
+                                          "decided_by": "World Series"}})
+        a, b = "KXMLBPLAYOFFHOST-67NYY-T3", "KXMLBPLAYOFFHOST-67MIL-T3"
+        bot = self._bot([a, b], close="2068-01-10T00:00:00Z")
+        bot.run_cycle()
+        for t in (a, b):
+            self.assertEqual(self._sides(bot, t), {"bid", "ask"}, t)
+        bot.pnl.realized[a] = -(imm.LEAGUE_AUTO_DAILY_LOSS_LIMIT + 1)
+        bot._mlb_get_cache.clear()
+        bot.run_cycle()
+        roll = imm._halt_day_key(datetime.now(timezone.utc))
+        self.assertEqual(bot.state.twk_halt_day.get("LEAGUEAUTO:KXMLBPLAYOFFHOST-67NYY"), roll)
+        self.assertNotIn("LEAGUEAUTO:KXMLBPLAYOFFHOST-67MIL", bot.state.twk_halt_day)
+        self.assertEqual(self._sides(bot, a), set())
+        self.assertEqual(self._sides(bot, b), {"bid", "ask"})       # the other event quotes on
+        self.assertEqual(bot.state.halted_until, 0.0)                 # whole book untouched
+
+
 class TestYouTubeWeeklyPilot(unittest.TestCase):
     """The YouTube weekly artist-views pilot (Jack 2026-10-06: "live now"):
     KXYTVIEWSW for KATSEYE / Drake / The Weeknd only, quoted against
@@ -22356,7 +22656,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the MLB postseason MVPs' live-game / decided stand-aside (10-12)
         # + the YouTube #2 pilot's fill pause (2026-10-14)
         # + the YouTube #1 leader-bid pilot's gate (2026-10-14)
-        self.assertEqual(len(conts), 46)
+        # + the NBA / WNBA / MLB auto families' live-game / decided
+        # stand-aside (2026-10-15)
+        self.assertEqual(len(conts), 47)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
