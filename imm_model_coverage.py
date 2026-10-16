@@ -135,12 +135,29 @@ def check_carbon_arc(progs: Dict[str, dict], now_ts: float) -> List[dict]:
                      "generated_at", now_ts, [t for ts in by_ser.values() for t in ts])
     mapped = set(data.get("series_map") or {})
     for s, ts in sorted(by_ser.items()):
-        if s not in mapped:
-            out.append(_gap(
-                "Carbon Arc (carbon_arc_fair)", s, ts, "open",
-                "no Prism entity in carbon_arc_fair's series map (its settlement "
-                "link did not resolve to a Carbon Arc entity)",
-                "map the series to its Carbon Arc entity in carbon_arc_fair"))
+        if s in mapped:
+            continue
+        if s.endswith("ARRAY"):
+            # A KNOWN gap (Jack 2026-10-16: "mark the ARRAY series as a known
+            # coverage gap"): the sector arrays' settlement link is the
+            # generic carbonarc.ai/prisms page and their prisms 404 for our
+            # token, so no map fixes them; carbon_arc_fair's shadow rebuilds
+            # each from its brand prism until the October prints say which
+            # composite is the array. Reported once, then remembered.
+            g = _gap("Carbon Arc (carbon_arc_fair)", s, ts, "open",
+                     "Carbon Arc sector array: no prism in its settlement link and "
+                     "the array prisms 404 for our token; the shadow "
+                     "(carbon_arc_fair CA_ARRAY_SHADOW) rebuilds it from its brand prism",
+                     "none until the October prints settle (imm_ca_shadow_report.py)")
+            g["once"] = True
+            out.append(g)
+            continue
+        out.append(_gap(
+            "Carbon Arc (carbon_arc_fair)", s, ts, "open",
+            "no Prism entity in carbon_arc_fair's series map (its settlement "
+            "link did not resolve to a Carbon Arc entity)",
+            "map the series to its Carbon Arc entity in carbon_arc_fair "
+            "(CA_SERIES_MAP_EXTRA when the link names no prism)"))
     return out
 
 

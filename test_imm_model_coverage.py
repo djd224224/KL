@@ -58,6 +58,22 @@ class TestCoverage(unittest.TestCase):
             gaps = mc.find_gaps(progs, self.now, [mc.check_carbon_arc])
         self.assertEqual(list(gaps), ["Carbon Arc (carbon_arc_fair)|KXDPZFT"])
 
+    def test_an_unmapped_sector_array_is_a_known_gap_reported_once(self):
+        # Jack 2026-10-16: "mark the ARRAY series as a known coverage gap"
+        progs = {"KXRIDEARRAY-26NOV08-T100": {}, "KXDPZFT-26NOV08-T50": {}}
+        verdict = {"KXRIDEARRAY": True, "KXDPZFT": True}.get
+        with mock.patch.object(imm, "family_verdict", verdict):
+            gaps = mc.find_gaps(progs, self.now, [mc.check_carbon_arc])
+        arr = gaps["Carbon Arc (carbon_arc_fair)|KXRIDEARRAY"]
+        self.assertTrue(arr.get("once"))
+        self.assertIn("shadow", arr["why"])
+        self.assertFalse(gaps["Carbon Arc (carbon_arc_fair)|KXDPZFT"].get("once"))
+        # already emailed once (the 10/16 08:50 alert): never again while open
+        st = {"Carbon Arc (carbon_arc_fair)|KXRIDEARRAY": {"first": 1.0, "sent": 1.0}}
+        due, _st = mc.due(st, {k: g for k, g in gaps.items() if "ARRAY" in k},
+                          1.0 + 3 * 86400)
+        self.assertEqual(due, [])
+
     def test_a_stale_fair_file_and_a_failing_check_are_gaps_too(self):
         _write(self.rain, {"generated_at": "2026-01-01T00:00:00+00:00"})
         progs = {"KXRAIN-26OCT12-NYC": {}}

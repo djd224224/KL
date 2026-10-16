@@ -307,6 +307,39 @@ class TestBuildAndWrite(unittest.TestCase):
         self.assertEqual((lines[-1]["series"], lines[-1]["data_through"]),
                          ("KXAMZNCC", "2026-09-24"))
 
+    def test_hand_mapped_series_fill_only_what_the_catalog_left_out(self):
+        # Jack 2026-10-16: KXDPZFT / KXSBUXFT / KXWMTFT settle on a generic
+        # carbonarc.co/welcome link, so the catalog cannot map them
+        self.assertEqual(caf.CA_SERIES_MAP_EXTRA["KXDPZFT"]["entity"], "Domino's Pizza")
+        self.assertEqual(sorted(caf.CA_SERIES_MAP_EXTRA),
+                         ["KXAFRMCC", "KXAFTERPAYCC", "KXDPZFT", "KXKLARCC",
+                          "KXSBUXFT", "KXWMTFT"])
+        # the BNPL card series share one prism (Jack 2026-10-16, same evening)
+        self.assertEqual({caf.CA_SERIES_MAP_EXTRA[s]["prism"]
+                          for s in ("KXAFRMCC", "KXAFTERPAYCC", "KXKLARCC")},
+                         {"b528a1d1-ebf5-4a46-bc1c-eaec177a21e9"})
+        self.assertEqual(caf.CA_SERIES_MAP_EXTRA["KXKLARCC"]["entity"], "Klarna")
+        p = self.payload["prisms"][0]
+        p["entities"].append(_entity("Walmart", [("2026-09-23", 101.5)], HIST))
+        extra = {"KXWMTFT": {"prism": p["prism_id"], "entity": "walmart"},   # case-insensitive
+                 "KXAMZNCC": {"prism": "WRONG", "entity": "Nope"}}
+        with mock.patch.object(caf, "CA_SERIES_MAP_EXTRA", extra), \
+                mock.patch.object(caf, "fetch_series_map", return_value=dict(self.smap)):
+            caf.write_fair_file(self.out, payload=self.payload, now=NOW,
+                                vintage_path=self.vint)
+        with open(self.out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertAlmostEqual(data["entries"]["KXWMTFT"]["mu"], 101.5)
+        self.assertEqual(data["series_map"]["KXWMTFT"]["entity"], "walmart")
+        self.assertEqual(data["series_map"]["KXAMZNCC"], self.smap["KXAMZNCC"])  # the catalog wins
+        # an explicit map is the caller's whole map: no extras
+        with mock.patch.object(caf, "CA_SERIES_MAP_EXTRA", extra):
+            caf.write_fair_file(self.out, payload=self.payload, now=NOW,
+                                series_map=self.smap, vintage_path=self.vint)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertNotIn("KXWMTFT", json.load(f)["series_map"])
+
+    @mock.patch.object(caf, "CA_SERIES_MAP_EXTRA", {})    # the catalog alone
     def test_series_map_reused_then_refreshed_and_kept_on_failure(self):
         caf.write_fair_file(self.out, payload=self.payload, now=NOW,
                             series_map=self.smap, vintage_path=self.vint)
@@ -746,6 +779,7 @@ class TestSignedSeriesCatalog(unittest.TestCase):
         lg.assert_called_once()
         self.assertEqual(list(m), ["KXAMZNCC"])
 
+    @mock.patch.object(caf, "CA_SERIES_MAP_EXTRA", {})    # the catalog alone
     def test_write_fair_file_hands_the_reader_to_the_catalog_read(self):
         tmp = tempfile.mkdtemp(prefix="caf_signed_")
         payload = {"prisms": [
