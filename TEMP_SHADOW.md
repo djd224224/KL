@@ -69,9 +69,10 @@ These were verified on 10/14.
 | `temp_shadow_scoring.py` | Reward scoring (an exact port of the IMM rules) plus book reconstruction from the ws stream. |
 | `temp_mm_policy.py` | THE QUOTING POLICY as pure logic (DEFAULT_POLICY, VARIANTS, `decide()` / `quote_market()`, risk sizing, order diff). The sim replays it and the live executor runs it, so shadow numbers describe the code that trades. |
 | `temp_shadow_sim.py` | Replay engine: feeds temp_mm_policy the replayed books, fairs and fills; fill models, reward accrual, settlement P&L. |
+| `temp_mm_live.py` / `run_temp_mm.ps1` | The LIVE executor of the same policy (DRY by default; `--live --subaccount N` is Jack's). It tails this collector's wx stream read-only. Handoff: TEMP_MM_LIVE.md. |
 | `temp_shadow_report.py` | Daily report (HTML email) plus the week summary and rule-based tweak suggestions. |
 | `run_temp_shadow_collector.ps1` / `run_temp_shadow_collector_hidden.vbs`, `run_temp_shadow_report_hidden.vbs`, `register_temp_shadow_collector.ps1`, `register_temp_shadow_report.ps1` | Windows tasks. |
-| `test_temp_shadow_*.py`, `test_temp_mm_policy.py` | Tests. They always sandbox `TEMP_SHADOW_DATA` to a temp dir, never the live data root. |
+| `test_temp_shadow_*.py`, `test_temp_mm_policy.py`, `test_temp_mm_live.py` | Tests. They always sandbox `TEMP_SHADOW_DATA` (and `TEMP_MM_DATA`) to a temp dir, never the live data roots. |
 
 **Data:** `C:\Users\jackd\Documents\KL-data\temp-shadow\` (env `TEMP_SHADOW_DATA`)
 
