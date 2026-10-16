@@ -597,5 +597,72 @@ class TestFSupersetOfG(unittest.TestCase):
         self.assertEqual(seen, {"live", "near", "decided"})
 
 
+class TestRestingWCL(unittest.TestCase):
+    """event_wcl_cap bounds FILLED positions; what RESTS can lose more when
+    only the losing side fills (review 10/16: an 8-strike F book at tau 50
+    risks $1,662 vs the $1,500 cap). wcl_resting (opt-in, live only) shares
+    one budget across the event's resting orders."""
+    STRIKES = (80.99, 81.99, 82.99, 83.99, 84.99, 85.99, 86.99, 87.99)
+    FAIRS = (0.995, 0.985, 0.94, 0.80, 0.50, 0.20, 0.06, 0.01)
+    SLOPES = (0.3, 0.6, 2.0, 4.0, 5.0, 4.0, 2.0, 0.3)
+
+    def markets(self, **kw):
+        out = []
+        for k, f, g in zip(self.STRIKES, self.FAIRS, self.SLOPES):
+            by, bn = int(round(100 * f)) - 3, int(round(100 * (1 - f))) - 3
+            yb = {by: 300.0, by - 1: 1000.0} if by >= 2 else {1: 2000.0}
+            nb = {bn: 300.0, bn - 1: 1000.0} if bn >= 2 else {1: 2000.0}
+            out.append(pol.MarketState(ticker=f"T{k}", strike=k, book_yes=yb, book_no=nb,
+                                       fair=f, slope_c=g, program_active=True, **kw))
+        return out
+
+    def decide(self, Pd, markets=None):
+        now = T0 - (T0 % 3600.0) + 605.0                       # :10:05, tau 50
+        return pol.decide(Pd, pol.EventContext(now=now, close_ts=now - 605.0 + 3600.0),
+                          markets or self.markets())
+
+    def adverse(self, dec):
+        ny = [md.yes for md in dec.markets]
+        nn = [md.no for md in dec.markets]
+        z = [0.0] * len(ny)
+        return max(pol.resting_scenario_losses(z, z, z, ny, nn))
+
+    def test_default_cap_is_on_filled_positions_only(self):
+        dec = self.decide(P("F_full"))
+        self.assertGreater(dec.resting_wcl, 1500.0)              # $1,662: documented, not capped
+        self.assertAlmostEqual(dec.resting_wcl, self.adverse(dec))
+        self.assertEqual(dec.worst_case_loss, 0.0)
+
+    def test_wcl_resting_keeps_the_adverse_case_under_the_cap(self):
+        off = self.decide(P("F_full"))
+        for variant, cap in (("F_full", 1500.0), ("K_full_wcl500", 500.0)):
+            on = self.decide(P(variant, wcl_resting=True))
+            self.assertLessEqual(on.resting_wcl, cap + 1e-6, variant)
+            self.assertAlmostEqual(on.resting_wcl, self.adverse(on))
+            for a, b in zip(off.markets, on.markets):          # only ever smaller
+                for side in ("yes", "no"):
+                    for p_, s_ in getattr(b, side).items():
+                        self.assertLessEqual(s_, getattr(a, side).get(p_, 0.0))
+            trimmed = [md for md in on.markets if md.diag.get("wcl_resting_trim")]
+            self.assertTrue(trimmed)
+
+    def test_wcl_resting_counts_filled_losses(self):
+        # 2,000 NO already held on the top strike at 90c: scenario 8 already
+        # loses $1,800 > the cap -> every order losing there is cleared
+        mk = self.markets()
+        mk[-1].no_pos, mk[-1].cost = 2000.0, 1800.0
+        on = self.decide(P("F_full", wcl_resting=True), mk)
+        self.assertEqual([md.no for md in on.markets], [{}] * len(mk))
+        self.assertTrue(any(md.yes for md in on.markets))       # the YES side is untouched
+
+    def test_off_by_default_and_not_simulated(self):
+        self.assertFalse(pol.DEFAULT_POLICY["wcl_resting"])
+        self.assertTrue(all(not v.get("wcl_resting") for v in pol.VARIANTS.values()))
+        import temp_shadow_sim as sim
+        with self.assertRaises(ValueError):
+            sim._resolve_variants({"X": {"wcl_resting": True}})
+        self.assertIn("F_full", sim._resolve_variants(None))
+
+
 if __name__ == "__main__":
     unittest.main()

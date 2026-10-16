@@ -1066,6 +1066,10 @@ def _resolve_variants(variants) -> Dict[str, dict]:
             raise ValueError(f"variant {name}: unknown policy keys {sorted(bad)}")
         P = dict(DEFAULT_POLICY)
         P.update(ov)
+        if P.get("wcl_resting"):
+            # the event-level resting budget needs every market at once; the
+            # replay decides per market (cached), so it is not simulated
+            raise ValueError(f"variant {name}: wcl_resting is not simulated (live-only switch)")
         out[name] = P
     return out
 

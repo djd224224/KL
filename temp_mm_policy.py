@@ -52,7 +52,20 @@ The rules (TEMP_SHADOW.md "Policy and variants"); each has a switch in P:
                                full, keep the loss in that side's losing
                                scenarios <= event_wcl_cap (a bid at p risks p
                                cents a contract); a side whose losing scenarios
-                               are already at the cap stops.
+                               are already at the cap stops. This bounds FILLED
+                               positions only: with nothing filled, every
+                               strike may rest up to the cap, so the orders
+                               that RESTS can lose more than event_wcl_cap if
+                               only the losing side fills (an 8-strike F book
+                               at tau 50: $1,662 vs the $1,500 cap).
+  resting WCL [wcl_resting]    opt-in (default off: the shadow measured F
+                               without it): one event budget for what rests --
+                               in every scenario j, the filled loss plus every
+                               desired order that loses in j (YES on strikes
+                               >= j, NO on strikes < j), filled in full, stays
+                               <= event_wcl_cap; the orders losing in the worst
+                               scenario are scaled down proportionally until
+                               none exceeds it (trim_resting_wcl).
   program_only                 quote only while the market's reward program is
                                active during the orders' resting interval.
 
@@ -69,6 +82,8 @@ API:
   DEFAULT_POLICY, VARIANTS, make_policy(variant=None, **overrides) -> dict
   decide(P, ctx: EventContext, markets: List[MarketState]) -> EventDecision
   diff_orders(resting, dy, dn) -> List[OrderOp]
+  resting_scenario_losses, trim_resting_wcl (wcl_resting; decide only -- the
+  sim's per-market cache does not apply it and refuses the switch)
   building blocks (the sim calls these directly): BookView, quote_market,
   quote_price, classify, guard_buffer, normal_slope_c, g_tau, live_size,
   overlap_window, window_flag, program_flag, risk_headroom, worst_case_loss,
@@ -82,7 +97,7 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 POLICY_VERSION = "1"
 
-DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0)
+DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False)
 VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000)}
 
 TARGET = 1000.0      # target_size_fp of every KXTEMPMIAH program (10/14)
@@ -363,6 +378,63 @@ def risk_headroom(P: dict, yes_q: Sequence[float], no_q: Sequence[float],
         rn = max(0.0, cap + net)
         out.append((ry, rn, wcap - pre[m], wcap - suf[m]))
     return out
+
+
+def resting_scenario_losses(yes_q: Sequence[float], no_q: Sequence[float],
+                            cost: Sequence[float], dys: Sequence[Dict[int, float]],
+                            dns: Sequence[Dict[int, float]]) -> List[float]:
+    """loss[j] (dollars) in scenario j if, on top of the filled positions,
+    every desired order that LOSES in j fills in full and none that wins
+    does (the adversarial case: a jump through the strikes lifts only the
+    losing side). YES bids on market m lose in j <= m, NO bids in j > m; a
+    bid at p loses p cents a contract."""
+    n = len(yes_q)
+    base = scenario_losses(yes_q, no_q, cost)
+    yc = [sum(s * p / 100.0 for p, s in d.items()) for d in dys]
+    nc = [sum(s * p / 100.0 for p, s in d.items()) for d in dns]
+    return [base[j] + sum(yc[j:]) + sum(nc[:j]) for j in range(n + 1)]
+
+
+def trim_resting_wcl(P: dict, yes_q: Sequence[float], no_q: Sequence[float],
+                     cost: Sequence[float], dys: List[Dict[int, float]],
+                     dns: List[Dict[int, float]]) -> int:
+    """wcl_resting: scale the desired orders (in place) until no scenario's
+    resting_scenario_losses exceeds event_wcl_cap. Each pass takes the worst
+    scenario and scales every order losing in it by (cap - filled loss) /
+    (their dollars at risk), floored to whole contracts (orders under 1
+    contract dropped); a scenario whose filled loss alone reaches the cap
+    clears them (and is then left at its filled loss). Returns the passes
+    that trimmed (0 = within the cap)."""
+    n = len(dys)
+    wcap = float(P["event_wcl_cap"])
+    base = scenario_losses(yes_q, no_q, cost)
+    # a scenario whose filled loss alone is past the cap is done once the
+    # orders losing in it are gone (nothing resting can make it smaller)
+    lim = [max(wcap, b) for b in base]
+    passes = 0
+    for _ in range(4 * (n + 1)):
+        loss = resting_scenario_losses(yes_q, no_q, cost, dys, dns)
+        j = max(range(n + 1), key=lambda i: (loss[i] - lim[i], -i))
+        if loss[j] <= lim[j] + 1e-9:
+            break
+        passes += 1
+        losing = list(dys[j:]) + list(dns[:j])
+        at_risk = sum(s * p / 100.0 for d in losing for p, s in d.items())
+        room = wcap - base[j]
+        f = room / at_risk if (room > 1e-9 and at_risk > 1e-9) else 0.0
+        for d in losing:
+            for p in list(d):
+                q = float(math.floor(d[p] * f + 1e-9))
+                if q < 1.0:
+                    del d[p]
+                else:
+                    d[p] = q
+    else:
+        # cannot happen (each pass brings its scenario under the cap and
+        # only lowers the others); fail closed
+        for d in list(dys) + list(dns):
+            d.clear()
+    return passes
 
 
 # --------------------------------------------------------------------------
@@ -683,6 +755,8 @@ class EventDecision:
     worst_case_loss: float           # dollars, on filled positions
     wcl_scenarios: List[int]
     headroom: List[Tuple[float, float, float, float]]
+    resting_wcl: float = 0.0         # dollars: filled + every losing-side desired order filled
+                                     # in full, worst scenario (resting_scenario_losses)
 
     def by_ticker(self) -> Dict[str, MarketDecision]:
         return {d.ticker: d for d in self.markets}
@@ -706,7 +780,7 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
     cost = [float(s.cost) for s in mk]
     risk = risk_headroom(P, yes_q, no_q, cost)
     wcl, scen = worst_case_loss(yes_q, no_q, cost)
-    out = []
+    rows = []
     for m, s in enumerate(mk):
         pflag = program_flag(P, a, b, s.program_start, s.program_end, ctx.close_ts,
                              s.program_active)
@@ -727,6 +801,17 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
                       "slope_src": slope_src}
         dy, dn, rule = quote_market(P, book, fair, slope, wflag, pflag, size_full,
                                     risk[m], float(s.target), tags, diag)
+        rows.append((s, dy, dn, rule, tags, diag))
+    if P.get("wcl_resting"):
+        dys, dns = [r[1] for r in rows], [r[2] for r in rows]
+        pre = [(dict(y), dict(n)) for y, n in zip(dys, dns)]
+        if trim_resting_wcl(P, yes_q, no_q, cost, dys, dns):
+            for r, (y0, n0) in zip(rows, pre):
+                if y0 != r[1] or n0 != r[2]:
+                    r[5]["wcl_resting_trim"] = {"yes": y0, "no": n0}   # before the trim
+    rloss = resting_scenario_losses(yes_q, no_q, cost, [r[1] for r in rows], [r[2] for r in rows])
+    out = []
+    for s, dy, dn, rule, tags, diag in rows:
         orders = [DesiredOrder(side, p, d[p], "+".join(tags.get((side, p), [])))
                   for side, d in (("yes", dy), ("no", dn)) for p in sorted(d, reverse=True)]
         ops = diff_orders({"yes": dict(s.resting_yes or {}), "no": dict(s.resting_no or {})},
@@ -736,4 +821,4 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
                                   diag=diag))
     return EventDecision(markets=out, tau_min=tau, size_full=size_full, wflag=wflag,
                          rest_from=a, rest_until=b, worst_case_loss=wcl,
-                         wcl_scenarios=scen, headroom=risk)
+                         wcl_scenarios=scen, headroom=risk, resting_wcl=max(0.0, max(rloss)))

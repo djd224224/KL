@@ -18,8 +18,13 @@
 # temp_mm_live.py (Ctrl+C / a normal exit also cancels every tmm- order).
 #
 # Exit codes: 2 = refused to start (no subaccount, $0 cash, lock held, bad
-# config) and 3 = halted (daily loss, subaccount mismatch, order errors) stop
-# the loop; anything else restarts after 20 s.
+# config, the fair model on built-in defaults) and 3 = halted (daily loss,
+# subaccount mismatch, an unconfirmable order, a position our fills do not
+# explain, cancels not landing, 40 order rejects) stop the loop; anything else
+# restarts after 20 s. Kalshi maintenance, 429s, 5xx and Wi-Fi drops do not
+# halt: the bot backs off and resumes by itself.
+# Emergency stop while it runs: temp_mm_live.py --live --subaccount N
+# --cancel-all (writes HALT, takes no lock).
 
 param(
     [switch]$Live,

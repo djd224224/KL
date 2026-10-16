@@ -25,6 +25,7 @@ for _k in list(os.environ):
 
 import datetime as _dt   # noqa: E402
 import json              # noqa: E402
+import time              # noqa: E402
 import unittest          # noqa: E402
 
 import temp_mm_live as L          # noqa: E402
@@ -185,6 +186,11 @@ class FakeExchange(MarketData):
         self.n = 0
         self.readable = True
         self.listable = True
+        self.report_sub = True      # GetOrder reports subaccount_number
+        self.scoped = True          # cancels and resting reads reach only the named
+                                    # subaccount (Kalshi's `subaccount` query param)
+        self.batch_ignores_sub = False   # a batch that answers not_found for everything
+        self.fail_reads = False     # the confirm reads time out
 
     def _maybe_fail(self, kind):
         lst = self.fail.get(kind)
@@ -198,23 +204,40 @@ class FakeExchange(MarketData):
 
     def resting(self):
         self.calls.append(("resting",))
-        return [dict(o) for o in self.orders.values() if o["status"] == "resting"]
+        return [dict(o) for o in self.orders.values() if o["status"] == "resting"
+                and (not self.scoped or o["subaccount_number"] == self.sub)]
+
+    def _read_fail(self):
+        if self.fail_reads:
+            raise L.ApiError("ReadTimeout: read timed out", None)
 
     def event_orders(self, events):
         self.calls.append(("event_orders", tuple(events)))
+        self._read_fail()
         if not self.listable:
             return []
         return [dict(o) for o in self.orders.values()
                 if o["ticker"].rsplit("-", 1)[0] in events and o["subaccount_number"] == self.sub]
 
-    def get_order(self, oid, scoped=True):
-        self.calls.append(("get_order", oid, scoped))
+    def get_order(self, oid, sync=False):
+        """GetOrder takes no subaccount param: any order of the account."""
+        self.calls.append(("get_order", oid, sync))
+        self._read_fail()
         o = self.orders.get(oid)
         if o is None or not self.readable:
             return None
-        if scoped and o["subaccount_number"] != self.sub:
-            return None
-        return dict(o)
+        r = dict(o)
+        if not self.report_sub:
+            r.pop("subaccount_number", None)
+        return r
+
+    def ticker_orders(self, ticker, sync=False):
+        self.calls.append(("ticker_orders", ticker, sync))
+        self._read_fail()
+        if not self.listable:
+            return []
+        return [dict(o) for o in self.orders.values()
+                if o["ticker"] == ticker and o["subaccount_number"] == self.sub]
 
     def fills(self, min_ts):
         self.calls.append(("fills", min_ts))
@@ -255,11 +278,15 @@ class FakeExchange(MarketData):
         r["remaining_count_fp"] = f"{rem:.2f}"
         return {"order_id": o.oid, "remaining_count": f"{rem:.2f}"}
 
-    def cancel(self, oid, ticker):
-        self.calls.append(("cancel", oid, ticker))
+    def _reach(self, r, sub):
+        return (r is not None and r["status"] == "resting"
+                and (not self.scoped or r["subaccount_number"] == (self.sub if sub is None else sub)))
+
+    def cancel(self, oid, ticker, subaccount=None):
+        self.calls.append(("cancel", oid, ticker, subaccount))
         self._maybe_fail("cancel")
         r = self.orders.get(oid)
-        if r is None or r["status"] != "resting":
+        if not self._reach(r, subaccount):
             raise L.ApiError("HttpError(404 Not Found)", 404, "not found")
         r["status"] = "canceled"
         return {"order_id": oid, "reduced_by": r["remaining_count_fp"]}
@@ -268,9 +295,10 @@ class FakeExchange(MarketData):
         self.calls.append(("batch_cancel", tuple(items)))
         self._maybe_fail("batch_cancel")
         out = []
-        for oid, _t in items:
+        for it in items:
+            oid = it[0]
             r = self.orders.get(oid)
-            if r is None or r["status"] != "resting":
+            if self.batch_ignores_sub or not self._reach(r, it[2] if len(it) > 2 else None):
                 out.append({"order_id": oid, "reduced_by": "0.00",
                             "error": {"code": "not_found", "message": "order not found"}})
             else:
@@ -471,8 +499,13 @@ class TestPlan(unittest.TestCase):
         ops = L.plan_market(T_MID, [o], {39: 600.0}, {}, {}, 100.0, self.cfg, {40: 500.0},
                             {55: 500.0}, caps={"yes": 45}, stable={"yes": True})
         self.assertEqual([(x.kind, x.price, x.urgent) for x in ops], [("amend", 39, False)])
-        # ... and not yet stable: nothing this round
+        # ... a move DOWN is never debounced (review 10/16: we would rest above
+        # the policy's price, alone at the top, while others back away)
         ops = L.plan_market(T_MID, [o], {39: 600.0}, {}, {}, 100.0, self.cfg, {40: 500.0},
+                            {55: 500.0}, caps={"yes": 45}, stable={"yes": False})
+        self.assertEqual([(x.kind, x.price, x.urgent) for x in ops], [("amend", 39, False)])
+        # ... a move UP (more aggressive) waits until the price has held
+        ops = L.plan_market(T_MID, [o], {41: 600.0}, {}, {}, 100.0, self.cfg, {40: 500.0},
                             {55: 500.0}, caps={"yes": 45}, stable={"yes": False})
         self.assertEqual(ops, [])
         # the fair fell: 40 is over the cap (35) -> urgent, debounce or not
@@ -810,7 +843,7 @@ class TestLive(unittest.TestCase):
         self.assertTrue(any(r["kind"] == "reject" and "post_only" in r["error_body"]
                             for r in orows))
 
-    def test_position_mismatch_halts_event(self):
+    def test_position_mismatch_halts_after_a_fills_sweep(self):
         bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
         started(bot, clock)
         yes_mid = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
@@ -819,9 +852,19 @@ class TestLive(unittest.TestCase):
         bot.step(clock.t)
         ex.positions_rows[EVENT] = [{"ticker": T_MID, "position_fp": "35.00"}]
         bot._on_reader(("positions", EVENT, ex.positions(EVENT), clock.t), clock.t)
-        self.assertNotIn(EVENT, bot.halted_events)
+        self.assertIsNone(bot.halt_reason)
+        self.assertIn(T_MID, bot.suspect)                    # held, a sweep forced
+        self.assertTrue({"fills", "verify"} <= bot.reader.force)
+        # the same mismatch again without a fills sweep in between: still check 1
         bot._on_reader(("positions", EVENT, ex.positions(EVENT), clock.t), clock.t)
-        self.assertIn(EVENT, bot.halted_events)
+        self.assertIsNone(bot.halt_reason)
+        # the next verify (every verify_s) sweeps fills, then reads positions:
+        # still 35 vs 10 -> HALT
+        for dt in (1.0, 1.5, 6.0):
+            clock.t = T0 + dt
+            bot.step(clock.t)
+        self.assertTrue(bot.halt_reason and "position mismatch" in bot.halt_reason)
+        self.assertEqual(ex.resting_ours(), {})
 
     def test_fills_restored_after_restart(self):
         bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
@@ -837,12 +880,12 @@ class TestLive(unittest.TestCase):
 
 
 class TestLiveMore(unittest.TestCase):
-    def test_reference_flicker_costs_no_writes(self):
+    def test_reference_flicker_up_costs_no_writes_drop_followed_at_once(self):
         bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
         started(bot, clock)
         n0 = len(ex.kinds("amend"))
-        # the YES reference drops 40 -> 39 for 1.2 s, then comes back
-        feed.books[T_MID] = ({40: 100.0, 39: 1000.0}, BOOKS[T_MID][1])
+        # the YES reference RISES 40 -> 41 for 1.2 s, then comes back: no write
+        feed.books[T_MID] = ({41: 300.0, 40: 500.0, 39: 1000.0}, BOOKS[T_MID][1])
         for dt in (0.3, 0.6, 0.9, 1.2):
             clock.t = T0 + dt
             bot.step(clock.t)
@@ -852,11 +895,17 @@ class TestLiveMore(unittest.TestCase):
             bot.step(clock.t)
         self.assertEqual(len(ex.kinds("amend")), n0)
         self.assertEqual(by_market(bot)[T_MID]["yes"], {40: 600.0})
-        # a lasting drop is followed after the debounce
-        feed.books[T_MID] = ({40: 100.0, 39: 1000.0}, BOOKS[T_MID][1])
+        # a lasting rise is followed after the debounce
+        feed.books[T_MID] = ({41: 300.0, 40: 500.0, 39: 1000.0}, BOOKS[T_MID][1])
         for dt in (6.0, 7.0, 8.5):
             clock.t = T0 + dt
             bot.step(clock.t)
+        self.assertEqual(by_market(bot)[T_MID]["yes"], {41: 600.0})
+        # a DROP (others pull 41 and 40) is followed at the next paced moment,
+        # not after 2 s: we never rest above the policy's price for long
+        feed.books[T_MID] = ({40: 100.0, 39: 1000.0}, BOOKS[T_MID][1])
+        clock.t = T0 + 9.6
+        bot.step(clock.t)
         self.assertEqual(by_market(bot)[T_MID]["yes"], {39: 600.0})
 
 
@@ -931,6 +980,15 @@ class TestGuards(unittest.TestCase):
         feed.ok = True
         clock.t = T0 + 1.5
         bot.step(clock.t)
+        # back: fills may have been missed while it was down -> every market of
+        # the traded event is held until a fills sweep + positions read agree
+        self.assertEqual(set(bot.suspect), set(TICKERS))
+        self.assertEqual(bot.orders, {})
+        n_pos = len(ex.kinds("positions"))
+        clock.t = T0 + 1.6
+        bot.step(clock.t)
+        self.assertGreater(len(ex.kinds("positions")), n_pos)
+        self.assertEqual(bot.suspect, {})
         self.assertEqual(len(bot.orders), 4)      # the write budget (3/s) paces the rest
         clock.t = T0 + 3.0
         bot.step(clock.t)
@@ -1101,7 +1159,7 @@ class TestExchangeWire(unittest.TestCase):
     def ex(self, sub=5, live=True):
         e = L.Exchange(sub, live=live)
         rec = self.Rec()
-        e._clients = {"w": rec, "r": rec}
+        e._clients = {"w": rec, "r": rec, "s": rec}
         return e, rec
 
     def test_create_body(self):
@@ -1168,8 +1226,11 @@ class TestExchangeWire(unittest.TestCase):
             return {"orders": [{"order_id": "o", "ticker": T_MID}]}
         rec.get = get
         self.assertIsNone(e.get_order("missing"))
-        self.assertEqual(e.get_order("x", scoped=False)["subaccount_number"], 5)
-        self.assertNotIn("subaccount", calls[-1][1])
+        self.assertEqual(e.get_order("x")["subaccount_number"], 5)
+        self.assertNotIn("subaccount", calls[-1][1])          # GetOrder takes no params
+        e.ticker_orders(T_MID)
+        self.assertEqual(calls[-1], ("/portfolio/orders",
+                                     {"ticker": T_MID, "limit": 1000, "subaccount": 5}))
         self.assertEqual([f["trade_id"] for f in e.fills(100)], ["a"])
         self.assertEqual(calls[-1][1], {"min_ts": 100, "limit": 1000, "subaccount": 5})
         self.assertEqual(e.positions(EVENT)[0]["position_fp"], "3.00")
@@ -1319,6 +1380,624 @@ class TestWx(unittest.TestCase):
         r2 = fe.result(ev, h + 60 + 200, 180.0)               # no new minute for 200 s
         self.assertTrue(r2.stale)
         self.assertEqual(L.FairEngine().result(ev, h, 180.0).stale, True)   # no data
+
+
+# --------------------------------------------------------------------------
+# Review fixes (2026-10-16 reviews of the live executor): one regression
+# test (or more) per finding, named f<N>_ after the review's order:
+#  f1 positions blind spot, f2 resting WCL (policy, see test_temp_mm_policy),
+#  f3/f10 cancels that cannot reach / do not land, f4 ambiguous create,
+#  f5 urgent reprice failure + expiry on renewals only, f6 size cut with a
+#  price move, f7/f12 --cancel-all under the lock, f8/f23 dry HALT,
+#  f9 429 storm, f11 GetOrder is not scoped, f13 409 is not gone, f14 fill
+#  price, f15 missed fills on cancel 404 / reconnect, f16 downward moves not
+#  debounced, f17 guard-forced moves batched, f18 default model, f19 short
+#  history, f20 outage, f21 results after a restart, f22 client bounds,
+#  f24 poller cadence, f25 per-event state pruned, f26 settle vs close.
+# --------------------------------------------------------------------------
+
+class NoFillsEx(FakeExchange):
+    """Neither the WebSocket nor GET /portfolio/fills delivers our fills."""
+
+    def fills(self, min_ts):
+        self.calls.append(("fills", min_ts))
+        return []
+
+
+def step_until(bot, clock, t_end, dt=0.25, stop=None):
+    t = clock.t
+    while t < t_end - 1e-9:
+        t = min(t_end, t + dt)
+        clock.t = t
+        bot.step(t)
+        if bot.halt_reason or (stop is not None and stop()):
+            break
+    return clock.t
+
+
+def creates_on(ex, ticker, side):
+    return [c for c in ex.kinds("create") if c[1] == ticker and c[2] == side]
+
+
+class TestReviewPositions(unittest.TestCase):
+    def test_f1_positions_read_for_a_traded_event_without_a_believed_position(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        self.assertEqual(bot.pos, {})
+        clock.t = T0 + 301.0
+        bot.step(clock.t)
+        self.assertIn(("positions", EVENT), ex.calls)
+
+    def test_f1_f15_unseen_fill_is_never_requoted_and_halts(self):
+        # Kalshi fills our whole T_MID YES order; no fill reaches the bot. The
+        # :18.9 pull finds it gone (not_found, then a single cancel's 404): the
+        # market is held, positions show +600 vs our 0 twice across a fills
+        # sweep -> HALT, and the 600 is never re-placed (the review's demo
+        # grew it to 2,840 against pos_cap 1,500)
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, ex=NoFillsEx())
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        ex.fill(yes.oid, 600.0, "trX")
+        ex.positions_rows[EVENT] = [{"ticker": T_MID, "position_fp": "600.00"}]
+        n0 = len(creates_on(ex, T_MID, "yes"))
+        step_until(bot, clock, M + 60.0)
+        self.assertTrue(bot.halt_reason and "position mismatch" in bot.halt_reason,
+                        bot.halt_reason)
+        self.assertEqual(len(creates_on(ex, T_MID, "yes")), n0)
+        self.assertEqual(ex.resting_ours(), {})
+        self.assertTrue(any("HALTED" in s for s, _ in mails))
+
+    def test_f1_kalshi_fill_count_enters_the_risk_inputs_at_once(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, ex=NoFillsEx())
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        ex.fill(yes.oid, 300.0, "trP")                       # a resting read will show it
+        seen = []
+        orig = L.pol.decide
+
+        def spy(P, ctx, states):
+            seen.append({s.ticker: s for s in states})
+            return orig(P, ctx, states)
+        L.pol.decide = spy
+        try:
+            clock.t = T0 + 61.0                              # the 60 s resting reconcile
+            bot.step(clock.t)
+        finally:
+            L.pol.decide = orig
+        st = seen[-1][T_MID]
+        self.assertEqual((st.yes_pos, st.no_pos), (300.0, 0.0))
+        self.assertAlmostEqual(st.cost, 120.0)
+        self.assertIn(T_MID, bot.suspect)
+        self.assertEqual(bot.pos.get(T_MID, L.MarketPos()).yes_q, 0.0)   # not booked as a fill
+
+    def test_f15_cancel_404_holds_the_market_until_fills_and_positions_agree(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        ex.fill(yes.oid, 600.0, "trQ")                       # the REST sweep has it, WS not
+        ex.positions_rows[EVENT] = [{"ticker": T_MID, "position_fp": "600.00"}]
+        step_until(bot, clock, M + 19.0)                     # the :18.9 pull
+        self.assertIn(T_MID, bot.suspect)
+        self.assertTrue({"fills", "verify"} & bot.reader.force or bot.reader_view["verify_events"])
+        step_until(bot, clock, M + 19.5)
+        self.assertNotIn(T_MID, bot.suspect)
+        self.assertEqual(bot.pos[T_MID].yes_q, 600.0)
+        i_fills = max(i for i, c in enumerate(ex.calls) if c[0] == "fills")
+        step_until(bot, clock, M + 47.0)                     # the :45.9 restore
+        i_new = [i for i, c in enumerate(ex.calls)
+                 if c[0] == "create" and c[1] == T_MID and c[2] == "yes"][-1]
+        self.assertLess(i_fills, i_new)                      # booked before re-quoting
+
+    def test_f15_suspect_market_holds_creates_not_cancels(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        y = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        bot.suspect[T_MID] = clock.t
+        n = len(ex.kinds("create"))
+        clock.t = T0 + 2.0
+        bot._execute([L.Op("create", T_MID, "no", 30, 100, None, False, "new", "live"),
+                      L.Op("cancel", T_MID, "yes", 40, 600, y, True, "pull", "live")], clock.t)
+        self.assertEqual(len(ex.kinds("create")), n)          # held
+        self.assertGreater(bot.deferred["suspect"], 0)
+        self.assertEqual(ex.orders[y.oid]["status"], "canceled")   # a cancel always goes
+
+
+class TestReviewCancels(unittest.TestCase):
+    def test_f3_misbooked_order_cancelled_where_it_booked_and_reported(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, booked_sub=0)
+        started(bot, clock)
+        self.assertIn(("cancel", "ord1", T_HI, 0), ex.calls)    # the primary, not ?subaccount=7
+        self.assertEqual(ex.orders["ord1"]["status"], "canceled")
+        body = next(b for s, b in mails if "HALTED" in s)
+        self.assertIn("booked to subaccount 0: cancelled (read back)", body)
+
+    def test_f3_misbooked_order_that_cannot_be_cancelled_is_named_in_the_email(self):
+        class Stuck(FakeExchange):
+            def cancel(self, oid, ticker, subaccount=None):
+                if subaccount is not None:
+                    self.calls.append(("cancel", oid, ticker, subaccount))
+                    raise L.ApiError("HttpError(404 Not Found)", 404, "not found")
+                return super().cancel(oid, ticker, subaccount)
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, ex=Stuck(booked_sub=0))
+        started(bot, clock)
+        self.assertEqual(ex.orders["ord1"]["status"], "resting")
+        body = next(b for s, b in mails if "HALTED" in s)
+        self.assertIn("NOT everything was cancelled", body)
+        self.assertIn("ord1", body)
+        self.assertIn("by hand", body)
+
+    def test_f3_batch_not_found_is_confirmed_by_a_single_cancel(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        mid = [o.oid for o in bot.orders.values() if o.ticker == T_MID]
+        ex.batch_ignores_sub = True          # the batch answers not_found for orders that rest
+        step_until(bot, clock, M + 19.0)
+        self.assertTrue(all(ex.orders[oid]["status"] == "canceled" for oid in mid))
+        self.assertEqual({c[1] for c in ex.kinds("cancel")}, set(mid))
+        self.assertEqual(bot.suspect, {})                    # the singles worked: nothing gone
+
+    def test_f3_order_still_resting_after_our_cancel_halts(self):
+        class Lying(FakeExchange):
+            def batch_cancel(self, items):
+                self.calls.append(("batch_cancel", tuple(items)))
+                return [{"order_id": it[0], "reduced_by": "1.00"} for it in items]
+
+            def cancel(self, oid, ticker, subaccount=None):
+                self.calls.append(("cancel", oid, ticker, subaccount))
+                return {"order_id": oid, "reduced_by": "1.00"}
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, ex=Lying())
+        started(bot, clock)
+        step_until(bot, clock, M + 70.0)
+        self.assertTrue(bot.halt_reason and "still rests" in bot.halt_reason, bot.halt_reason)
+
+    def test_f13_409_is_not_gone_and_not_counted(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        mid = {o.oid for o in bot.orders.values() if o.ticker == T_MID}
+        ex.fail["batch_cancel"] = [L.ApiError("HttpError(409 Conflict)", 409,
+                                              '{"code":"trading_is_paused"}')]
+        step_until(bot, clock, M + 19.0)
+        self.assertEqual({o.oid for o in bot.orders.values() if o.ticker == T_MID}, mid)
+        self.assertEqual(len(bot.errors), 0)
+        self.assertGreater(bot.write_backoff_until, clock.t)
+        step_until(bot, clock, M + 20.5)                     # after the backoff: cancelled
+        self.assertEqual([o for o in bot.orders.values() if o.ticker == T_MID], [])
+        self.assertTrue(all(ex.orders[oid]["status"] == "canceled" for oid in mid))
+        self.assertEqual(bot.suspect, {})
+
+    def test_f7_cancel_all_runs_while_a_live_bot_holds_the_lock(self):
+        lock = L.SingleInstance(os.path.join(L.DATA_DIR, "tmm_live.lock"))
+        self.assertTrue(lock.acquire())
+        state = {"rows": [{"order_id": "a1", "client_order_id": "tmm-1", "ticker": T_MID},
+                          {"order_id": "m1", "client_order_id": "manual", "ticker": T_MID}],
+                 "cancels": []}
+
+        class StubEx:
+            def __init__(self, sub, live=False, **kw):
+                self.sub, self.live = sub, live
+
+            def resting(self):
+                return [r for r in state["rows"] if r["order_id"] not in state["cancels"]]
+
+            def cancel(self, oid, ticker, subaccount=None):
+                state["cancels"].append(oid)
+                return {}
+        orig = L.Exchange
+        L.Exchange = StubEx
+        hp = os.path.join(L.DATA_DIR, "HALT")
+        try:
+            code = L.main(["--live", "--subaccount", "5", "--cancel-all", "--quiet"])
+            self.assertTrue(os.path.exists(hp))              # a running bot pauses too
+        finally:
+            L.Exchange = orig
+            lock.release()
+            if os.path.exists(hp):
+                os.remove(hp)
+        self.assertEqual(code, L.EXIT_OK)
+        self.assertEqual(state["cancels"], ["a1"])           # never a non-tmm order
+
+    def test_f8_dry_halt_never_pauses_live(self):
+        dry, *_r, dclock = make_bot(live=False)
+        started(dry, dclock)
+        dry.halt(dclock.t, "test: a dry step-exception storm")
+        self.assertTrue(os.path.exists(os.path.join(dry.root_dir, "dry", "HALT")))
+        self.assertFalse(os.path.exists(os.path.join(dry.root_dir, "HALT")))
+        ex = FakeExchange()
+        feed = FakeFeed()
+        clock = Clock(T0)
+        live = L.Bot(L.Config(email=False), pol.make_policy("F_full"), "F_full", True, 7, ex,
+                     feed, FakeWx(), FakeFair(), data_dir=dry.root_dir, clock=clock,
+                     threaded=False, mailer=None, echo=False)
+        feed.bot = live
+        started(live, clock)
+        self.assertEqual(len(live.orders), 6)                # the dry HALT is not the live one
+        open(os.path.join(dry.root_dir, "HALT"), "w").close()   # Jack's pause: both obey
+        clock.t = T0 + 0.5
+        live.step(clock.t)
+        self.assertEqual(live.orders, {})
+
+
+class TestReviewWrites(unittest.TestCase):
+    def test_f4_ambiguous_create_is_adopted_not_duplicated(self):
+        class TimeoutOnce(FakeExchange):
+            def create(self, ticker, side, price, count, coid, expiration_ts):
+                r = super().create(ticker, side, price, count, coid, expiration_ts)
+                if ticker == T_MID and side == "yes" and not getattr(self, "_done", False):
+                    self._done = True
+                    raise L.ApiError("ReadTimeout: read timed out", None)   # booked, no answer
+                return r
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, ex=TimeoutOnce())
+        started(bot, clock)
+        self.assertEqual(len(bot.ambiguous), 1)
+        self.assertIn("resting", bot.reader.force)
+        step_until(bot, clock, T0 + 3.0)
+        rest = [o for o in ex.resting_ours().values()
+                if o["ticker"] == T_MID and o["side_ours"] == "yes"]
+        self.assertEqual(len(rest), 1)                       # no duplicate at 40
+        self.assertIn(rest[0]["order_id"], bot.orders)       # and it is tracked
+        self.assertEqual(bot.ambiguous, {})
+        self.assertEqual(len(bot.errors), 0)
+
+    def test_f5_urgent_reprice_refused_cancels_the_order(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        fair.fairs[T_MID] = 0.30                             # YES cap 28 < 40
+        ex.fail["amend"] = [L.ApiError("HttpError(400 Bad Request)", 400, "invalid")]
+        wx.rows.append({"rx": T0 + 0.2, "t": 0})
+        clock.t = T0 + 0.25
+        bot.step(clock.t)
+        self.assertEqual(ex.orders[yes.oid]["status"], "canceled")
+        self.assertIsNone(bot.halt_reason)
+
+    def test_f5_urgent_reprice_throttled_is_cancelled_after_the_backoff(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        fair.fairs[T_MID] = 0.30
+        ex.fail["amend"] = [L.ApiError("HttpError(429)", 429, "too many requests")]
+        wx.rows.append({"rx": T0 + 0.2, "t": 0})
+        clock.t = T0 + 0.25
+        bot.step(clock.t)
+        self.assertTrue(yes.must_cancel)
+        step_until(bot, clock, T0 + 1.0)
+        self.assertEqual(ex.orders[yes.oid]["status"], "canceled")
+        self.assertEqual(len(bot.errors), 0)
+
+    def test_f5_only_renewals_carry_an_expiry(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        feed.books[T_MID] = ({39: 500.0, 38: 1000.0}, BOOKS[T_MID][1])   # YES ref 40 -> 39
+        step_until(bot, clock, T0 + 2.0)
+        rep = [c for c in ex.kinds("amend") if c[2] == 39]
+        self.assertTrue(rep)
+        self.assertTrue(all(c[4] is None for c in rep))      # a reprice keeps its expiry
+        step_until(bot, clock, T0 + 67.0)
+        ren = [c for c in ex.kinds("amend") if c[4] is not None]
+        self.assertTrue(ren)
+        self.assertTrue(all(c[4] >= T0 + 60 for c in ren))
+
+    def test_f5_silently_unextended_expiry_switches_to_replace(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        o = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        o.renewed = True
+        o.expires_at = T0 + 500.0                            # what we believe
+        clock.t = T0 + 61.0                                  # Kalshi still says T0 + 90
+        bot.step(clock.t)
+        self.assertFalse(bot.amend_expiry_ok)
+        self.assertEqual(o.expires_at, int(T0 + 90))
+
+    def test_f9_429_storm_backs_off_and_never_halts(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        mid = {o.oid for o in bot.orders.values() if o.ticker == T_MID}
+        e429 = lambda: L.ApiError("HttpError(429 Too Many Requests)", 429, "")   # noqa: E731
+        for k in ("batch_cancel", "cancel", "amend", "create", "decrease"):
+            ex.fail[k] = [e429() for _ in range(1000)]
+        step_until(bot, clock, M + 18.75)
+        n0 = len([c for c in ex.calls if c[0] in ("batch_cancel", "cancel", "amend", "create")])
+        step_until(bot, clock, M + 22.0)                     # the pull meets the throttle
+        writes = [c for c in ex.calls[:] if c[0] in ("batch_cancel", "cancel", "amend", "create")]
+        self.assertIsNone(bot.halt_reason)
+        self.assertEqual(len(bot.errors), 0)
+        self.assertLessEqual(len(writes) - n0, 4)            # 0.5, 1, 2 s backoff: not 58 in 0.55 s
+        self.assertEqual(ex.kinds("cancel"), [])             # no one-by-one after a batch 429
+        for k in list(ex.fail):
+            ex.fail[k] = []
+        step_until(bot, clock, M + 32.0)
+        self.assertTrue(all(ex.orders[oid]["status"] == "canceled" for oid in mid))
+
+    def test_f20_outage_backs_off_without_halting(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        e503 = lambda: L.ApiError("HttpError(503 Service Unavailable)", 503, "")   # noqa: E731
+        for k in ("batch_cancel", "cancel", "amend", "create", "decrease"):
+            ex.fail[k] = [e503() for _ in range(10000)]
+        n0 = len(ex.calls)
+        step_until(bot, clock, T0 + 120.0)
+        self.assertIsNone(bot.halt_reason)
+        self.assertIsNotNone(bot.unhealthy_since)
+        writes = [c for c in ex.calls[n0:]
+                  if c[0] in ("batch_cancel", "cancel", "amend", "create", "decrease")]
+        self.assertLess(len(writes), 30)                     # ~ one per 8 s
+        for k in list(ex.fail):
+            ex.fail[k] = []
+        step_until(bot, clock, T0 + 135.0)
+        self.assertIsNone(bot.unhealthy_since)               # recovered by itself
+
+    def test_f20_confirm_timeout_while_reads_fail_holds_instead_of_halting(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        self.assertEqual(len(bot.unconfirmed), 5)
+        ex.fail_reads = True
+        step_until(bot, clock, T0 + 70.0, dt=1.0)
+        self.assertIsNone(bot.halt_reason)
+        self.assertTrue(bot.confirm_hold)
+        ex.fail_reads = False
+        step_until(bot, clock, T0 + 82.0, dt=1.0)
+        self.assertEqual(bot.unconfirmed, {})
+        self.assertFalse(bot.confirm_hold)
+
+    def test_f17_guard_moves_go_as_one_batched_cancel(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        y = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        n = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "no")
+        na = len(ex.kinds("amend"))
+        ops = [L.Op("amend", T_MID, "yes", 30, 600.0, y, True, "reprice", "live", excess=6000.0),
+               L.Op("amend", T_MID, "no", 40, 600.0, n, True, "reprice", "live", excess=4800.0)]
+        clock.t = T0 + 2.0
+        bot._execute(ops, clock.t)
+        self.assertEqual(len(ex.kinds("amend")), na)         # no serial amends
+        self.assertEqual({c[0] for c in ex.kinds("batch_cancel")[-1][1]}, {y.oid, n.oid})
+        got = {(c[2], c[3]) for c in ex.kinds("create")[-2:]}
+        self.assertEqual(got, {("yes", 30), ("no", 40)})     # re-placed post_only
+
+    def test_f17_most_exposed_urgent_amend_first(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        y = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        f = next(o for o in bot.orders.values() if o.ticker == T_HI and o.side == "yes")
+        ops = [L.Op("amend", T_HI, "yes", f.price, 300.0, f, True, "renew", "fav", renew=True),
+               L.Op("amend", T_MID, "yes", 30, 600.0, y, True, "reprice", "live", excess=6000.0)]
+        clock.t = T0 + 2.0
+        bot._execute(ops, clock.t)
+        self.assertEqual([c[1] for c in ex.kinds("amend")[-2:]], [y.oid, f.oid])
+
+
+class TestReviewPlan(unittest.TestCase):
+    def test_f6_size_cut_with_a_price_move_cuts_at_once(self):
+        cfg = L.Config()
+        o = _o("o1", "yes", 45, 500)
+        tags = {("yes", 44): "live", ("yes", 46): "live"}
+        ops = L.plan_side(T_MID, "yes", [o], {44: 100.0}, tags, 100.0, cfg, {44: 500.0},
+                          {50: 500.0}, cap=47, stable=False)
+        self.assertEqual([(x.kind, x.price, x.size, x.urgent) for x in ops],
+                         [("decrease", 45, 400.0, True), ("amend", 44, 100.0, False)])
+        # a move UP is debounced, the cut is not
+        ops = L.plan_side(T_MID, "yes", [o], {46: 100.0}, tags, 100.0, cfg, {44: 500.0},
+                          {50: 500.0}, cap=47, stable=False)
+        self.assertEqual([(x.kind, x.price, x.size, x.urgent) for x in ops],
+                         [("decrease", 45, 400.0, True)])
+        # two orders at the old price: the smaller is cancelled, the larger cut
+        a, b = _o("a", "yes", 45, 300, placed=1.0), _o("b", "yes", 45, 200, placed=2.0)
+        ops = L.plan_side(T_MID, "yes", [a, b], {44: 100.0}, tags, 100.0, cfg, {44: 500.0},
+                          {50: 500.0}, cap=47, stable=True)
+        self.assertEqual(sorted((x.kind, x.order.oid, x.size, x.urgent) for x in ops),
+                         [("amend", "a", 100.0, False), ("cancel", "b", 200.0, True),
+                          ("decrease", "a", 200.0, True)])
+
+
+class TestReviewFills(unittest.TestCase):
+    def test_f14_fill_booked_at_its_own_price(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        body = ex.fill(yes.oid, 100.0, "trF")                # executed at 40c
+        yes.price = 38                                       # the bot amended it since
+        feed.events.append(("fill", body))
+        clock.t = T0 + 0.3
+        bot.step(clock.t)
+        self.assertAlmostEqual(bot.pos[T_MID].cost, 40.0)
+        self.assertEqual(L.fill_price_cents({"yes_price_dollars": "0.4000"}, "no"), 60)
+        self.assertEqual(L.fill_price_cents({"yes_price_dollars": "0.40",
+                                             "no_price_dollars": "0.61"}, "no"), 61)
+        self.assertIsNone(L.fill_price_cents({}, "yes"))
+
+    def test_f21_restart_after_the_close_keeps_the_event_loss(self):
+        class Closing(FakeExchange):
+            def markets(self, min_close_ts):
+                return [m for m in market_rows() if C.parse_iso(m["close_time"]) >= min_close_ts]
+
+            def event_markets(self, event):
+                return [{"ticker": t, "result": "no"} for t in TICKERS]
+        settled = os.path.join(C.DATA_ROOT, "settled", f"{EVENT}.json")
+        if os.path.exists(settled):          # another test's shadow settlement file
+            os.remove(settled)
+        ex = Closing(cash=5000.0)
+        bot, ex, feed, wx, fair, mails, clock = make_bot(
+            live=True, ex=ex, cfg={"event_loss_halt": 1e9, "daily_loss_halt": 200.0})
+        started(bot, clock)
+        yes = next(o for o in bot.orders.values() if o.ticker == T_MID and o.side == "yes")
+        feed.events.append(("fill", ex.fill(yes.oid, 600.0, "trR")))   # 600 YES @ 40 = $240
+        clock.t = T0 + 0.5
+        bot.step(clock.t)
+        clock.t = S + 180.0                                  # restart 3 min after the close
+        bot2 = L.Bot(bot.cfg, bot.P, bot.variant, True, 7, ex, FakeFeed(), FakeWx(), FakeFair(),
+                     data_dir=bot.root_dir, clock=clock, threaded=False,
+                     mailer=lambda s, b: mails.append((s, b)) or True, echo=False)
+        self.assertEqual(bot2.startup(clock.t), L.EXIT_OK)
+        self.assertNotIn(EVENT, bot2.events)                 # discovery no longer lists it
+        self.assertEqual(bot2.pos[T_MID].yes_q, 600.0)
+        step_until(bot2, clock, S + 420.0, dt=1.0)
+        self.assertEqual(bot2.results.get(T_MID), "no")
+        self.assertAlmostEqual(bot2.event_pnl(EVENT), -240.0)
+        self.assertTrue(bot2.halt_reason and "daily loss" in bot2.halt_reason)
+        st = json.load(open(bot2.state_path))
+        self.assertEqual(st["results"].get(T_MID), "no")     # saved as soon as fetched
+
+
+class TestReviewFair(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(dir=_SANDBOX, prefix="fair_")
+
+    def test_f18_live_refuses_the_built_in_default_model(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
+        bot.fair = L.FairEngine(params_path=os.path.join(self.root, "missing.json"),
+                                cals_path=os.path.join(self.root, "missing_cals.json"))
+        self.assertEqual(bot.fair.params_source, "defaults")
+        self.assertEqual(bot.startup(T0), L.EXIT_REFUSED)
+        self.assertEqual(ex.kinds("create"), [])
+        self.assertTrue(any("refused" in s.lower() for s, _ in mails))
+        # a dry run says so and goes on
+        dry, *_r, dclock = make_bot(live=False)
+        dry.fair = L.FairEngine(params_path=os.path.join(self.root, "missing.json"))
+        self.assertEqual(dry.startup(T0), L.EXIT_OK)
+
+    def test_f18_hourly_reload_keeps_the_model_when_the_file_goes(self):
+        import temp_shadow_model as tm
+        path = os.path.join(self.root, "model_params.json")
+        with open(path, "w") as f:
+            json.dump(tm.default_params(), f)
+        fe = L.FairEngine(params_path=path)
+        self.assertEqual(fe.params_source, path)
+        model = fe.model
+        os.remove(path)
+        fe.loaded_at -= 3601.0
+        note = fe.maybe_reload(time.time())
+        self.assertTrue(note and note.startswith("!"), note)
+        self.assertIs(fe.model, model)
+        self.assertEqual(fe.params_source, path)
+
+    @staticmethod
+    def row(rx, t_ms, c=27):
+        return TestWx.row(rx, t_ms, temps=(c, c, c, c, c))
+
+    def test_f19_history_seeded_when_the_collector_files_are_short(self):
+        h = 3600.0 * 500010
+        now = h + 1800.0
+        ts = []
+        for i in range(80):                                  # 80 minutes of history
+            m = now - 4800 + 60 * i
+            st = self.row(m + 140, int(m * 1000))["stations"]
+            ts.append({"t": int(m * 1000), "status": "incomplete", "v": None, "stations": st})
+        calls = []
+
+        def fetch(a, b):
+            calls.append((a, b))
+            return 200, {"timeseries": ts}
+        src = L.WxSource(L.Config(), L.WxTail(root=self.root), None,
+                         status_path=os.path.join(self.root, "none.json"), threaded=False,
+                         history_fetch=fetch)
+        rows_ = src.start(now)
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0][0], now - L.WX_LOOKBACK_S)
+        self.assertGreater(len(rows_), 60)
+        self.assertTrue(all(float(r["rx"]) <= now for r in rows_))
+        self.assertIn("seeded", src.seed_note)
+        fe = L.FairEngine(min_span_s=3600.0)
+        fe.add(rows_, now)
+        self.assertFalse(fe.short_history())       # from the rows: no snapshot needed (the
+        fe.snapshot(now)                           # reader must not seed at every start)
+        self.assertGreater(fe.history_span_s(), 3600.0)
+
+    def test_f19_fair_stale_until_the_history_spans_an_hour(self):
+        h = 3600.0 * 500011
+        rows_ = [self.row(h - 2400 + 60 * i + 150, int((h - 2400 + 60 * i) * 1000))
+                 for i in range(38)]                         # 38 minutes
+        fe = L.FairEngine(min_span_s=3600.0)
+        fe.add(rows_, h + 60)
+        ev = L.EventInfo(EVENT, h, h + 3600, h + 3600, [(80.99, "A")])
+        r = fe.result(ev, h + 60, 180.0)
+        self.assertTrue(r.stale)
+        self.assertTrue(r.reason.startswith("short_history"), r.reason)
+        older = [self.row(h - 4200 + 60 * i + 150, int((h - 4200 + 60 * i) * 1000))
+                 for i in range(30)]                         # 30 more, earlier
+        fe.add(older, h + 60)
+        r = fe.result(ev, h + 60, 180.0)
+        self.assertFalse(r.stale, r.reason)
+
+    def test_f24_fallback_poller_uses_the_collectors_cadence(self):
+        calls = []
+        resp = []
+
+        def fetch():
+            calls.append(1)
+            return resp.pop(0) if resp else (200, {"timeseries": []})
+        p = L.WxPoller(1.0, fetch=fetch)
+        h = 3600.0 * 500012
+        self.assertEqual(p.poll_once(h + 5.0), 0)            # outside :13-:50: one per 5 s
+        p.poll_once(h + 7.0)
+        p.poll_once(h + 10.0)
+        self.assertEqual(len(calls), 2)                      # 5.0 and 10.0
+        p.poll_once(h + 20.0)
+        p.poll_once(h + 21.0)                                # inside: one per second
+        self.assertEqual(len(calls), 4)
+        resp.append((429, None))
+        p.poll_once(h + 22.0)                                # 429: back off 2 s, then yield
+        self.assertEqual(len(calls), 5)
+        p.poll_once(h + 24.0)
+        p.poll_once(h + 25.0)                                # yield: 2 s inside the window
+        self.assertEqual(len(calls), 6)
+        p.poll_once(h + 26.0)
+        self.assertEqual(len(calls), 7)
+
+
+class TestReviewMisc(unittest.TestCase):
+    def test_f11_getorder_without_subaccount_number_does_not_confirm(self):
+        ex = FakeExchange(booked_sub=0)
+        ex.report_sub = False            # GetOrder leaves subaccount_number out
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, ex=ex)
+        started(bot, clock)
+        self.assertFalse(bot.first_confirmed)
+        self.assertEqual(len(ex.kinds("create")), 1)
+        step_until(bot, clock, T0 + 62.0, dt=1.0)
+        self.assertEqual(len(ex.kinds("create")), 1)         # nothing more placed
+        self.assertTrue(bot.halt_reason and "could not be confirmed" in bot.halt_reason)
+        self.assertEqual(ex.orders["ord1"]["status"], "canceled")   # probed in the primary
+        # booked where it should be: the subaccount's own order list confirms it
+        ex2 = FakeExchange()
+        ex2.report_sub = False
+        bot2, ex2, *_r, clock2 = make_bot(live=True, ex=ex2)
+        started(bot2, clock2)
+        self.assertTrue(bot2.first_confirmed)
+        self.assertEqual(len(ex2.kinds("create")), 6)
+
+    def test_f22_client_bounds(self):
+        e = L.Exchange(5, write_timeout_s=3.0, read_timeout_s=10.0, read_attempts=2,
+                       sync_read_timeout_s=3.0)
+
+        class Dummy:
+            http_timeout = (5, 20)
+            get_attempts = 3
+        w, r, s = (e.apply_bounds(Dummy(), k) for k in ("w", "r", "s"))
+        self.assertEqual((w.http_timeout, w.get_attempts), ((2.0, 3.0), 1))
+        self.assertEqual((r.http_timeout, r.get_attempts), ((5.0, 10.0), 2))
+        self.assertEqual((s.http_timeout, s.get_attempts), ((2.0, 3.0), 1))
+
+    def test_f25_closed_event_state_is_pruned(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=False)
+        started(bot, clock)
+        clock.t = S - 0.5
+        bot.step(clock.t)
+        self.assertIn(EVENT, bot.guards_now)
+        clock.t = S + 10.0
+        bot.step(clock.t)
+        for d in (bot.guards_now, bot.wflag_prev, bot.last_sample, bot.fair_last):
+            self.assertNotIn(EVENT, d)
+
+    def test_f26_close_time_off_the_tickers_hour_is_not_quoted(self):
+        ex = DryExchange()
+        rows_ = market_rows()
+        for m in rows_:
+            m["close_time"] = C.iso(S + 3600.0)              # e.g. a repeated DST hour
+        ex.markets_rows = rows_
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=False, ex=ex)
+        started(bot, clock)
+        self.assertEqual(bot.orders, {})
+        self.assertIn("settle_vs_close", bot.guards_now[EVENT])
+        self.assertEqual(L.build_events(rows_)[EVENT].settle_gap_s, 3600.0)
 
 
 if __name__ == "__main__":
