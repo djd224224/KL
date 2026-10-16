@@ -241,7 +241,11 @@ def book_from_rest(orderbook: dict) -> Tuple[Dict[int, float], Dict[int, float]]
 Trade = namedtuple("Trade", "ts rx ticker taker_side yes_cents count")
 # taker_side 'yes' = the taker BOUGHT YES (lifted YES asks = NO bids)
 
-LOOKBACK_S = 3600.0      # read this far before t0 for each market's snapshot
+LOOKBACK_S = 10800.0     # read this far before t0 for each market's snapshot.
+# 3 h, not 1 h (2026-10-15): when Kalshi skips hours (no 04/05 ET events on
+# 10/15) the next event lists ~2 h early, and a WS reconnect in that span
+# re-snapshots it 70 min before open -- a 1 h read missed the snapshot and the
+# whole 26OCT1506 hour replayed as untrusted.
 TRADE_SLACK_S = 10.0     # read ws rows this far past t1 (late-received trades)
 FUZZY_TRADE_S = 2.0      # ws trade without trade_id <-> REST match tolerance
 TAIL_SILENCE_S = 120.0   # no ws row this long before t1 -> report ws down

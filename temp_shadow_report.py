@@ -90,7 +90,7 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import temp_shadow_common as C
 
@@ -1422,9 +1422,16 @@ def _iter_lines(path: str) -> Iterator[str]:
         return
 
 
-def ws_health(t0: float, t1: float) -> dict:
+def ws_health(t0: float, t1: float,
+              spans: Optional[Sequence[Tuple[float, float]]] = None) -> dict:
     """Markers and per-minute presence of ws rows, without json-parsing the
-    (large) message rows: rx is read off the line's prefix."""
+    (large) message rows: rx is read off the line's prefix.
+
+    spans: when given, the [a, b) windows in which a KXTEMPMIAH market was
+    subscribed (open - 10 min .. close + 10 min). Minutes outside every span
+    are neither uptime nor downtime: with no market listed (Kalshi skipped
+    04:00/05:00 ET on 10/15) a healthy connection carries no rows, and those
+    hours read as a 9% "outage" (2026-10-15)."""
     minutes = set()
     markers: List[Tuple[float, str, str]] = []
     n = 0
@@ -1458,7 +1465,7 @@ def ws_health(t0: float, t1: float) -> dict:
     # about the minutes before it; a WS that really was down then has no rows
     # there, and the data test below counts those minutes down anyway.
     state = True
-    up, i = 0, 0
+    up, i, counted, no_market = 0, 0, 0, 0
     for kmin in range(n_min):
         mid = t0 + 60 * kmin + 30
         while i < len(markers) and markers[i][0] <= mid:
@@ -1467,13 +1474,18 @@ def ws_health(t0: float, t1: float) -> dict:
             elif markers[i][1] == "disconnect":
                 state = False
             i += 1
+        if spans is not None and not any(a <= mid < b for a, b in spans):
+            no_market += 1
+            continue
+        counted += 1
         # quiet books can skip a minute: data within +/- 1 min counts
         if state and (kmin in minutes or kmin - 1 in minutes or kmin + 1 in minutes):
             up += 1
     cnt = lambda kind: sum(1 for m in markers if m[1] == kind)   # noqa: E731
     disc = [m[2] for m in markers if m[1] == "disconnect" and m[2]]
-    return {"rows": n, "minutes": n_min, "data_minutes": len(minutes),
-            "uptime": (up / n_min) if n_min else None,
+    return {"rows": n, "minutes": counted, "data_minutes": len(minutes),
+            "minutes_no_market": no_market,
+            "uptime": (up / counted) if counted else None,
             "connects": cnt("connect"), "disconnects": cnt("disconnect"),
             "gaps": cnt("gap"), "resubscribes": cnt("resubscribe"),
             "disconnect_reasons": disc[:5]}
@@ -1741,6 +1753,28 @@ def expected_events(day: str, now: float, until: Optional[float] = None,
     return due, later
 
 
+def market_spans(sim_events: Sequence[dict], seen: Iterable[str] = ()
+                 ) -> Optional[List[Tuple[float, float]]]:
+    """[open - 10 min, close + 10 min) for every event with markets: the simmed
+    ones (their own open/close) and any other the collector saw listed (an
+    hour before its settlement to 10 min after). None when nothing is known,
+    which keeps ws_health's old every-minute denominator."""
+    spans: List[Tuple[float, float]] = []
+    have = set()
+    for ev in sim_events or []:
+        a, b = _opt_num(ev.get("open_ts")), _opt_num(ev.get("close_ts"))
+        if a is not None and b is not None:
+            spans.append((a - 600.0, b + 600.0))
+            have.add(ev.get("event"))
+    for ev in seen or ():
+        if ev in have:
+            continue
+        pe = C.parse_event(str(ev))
+        if pe:
+            spans.append((pe[1] - 3600.0 - 600.0, pe[1] + 600.0))
+    return spans or None
+
+
 def collector_health(day: str, sim_events: Sequence[dict], now: Optional[float] = None,
                      sim_summary: Optional[dict] = None) -> dict:
     now = C.utcnow() if now is None else now
@@ -1760,15 +1794,16 @@ def collector_health(day: str, sim_events: Sequence[dict], now: Optional[float] 
                            "started_late": t0h > t0, "ended_early": t1e < t1,
                            "shadow_ended": until < t1 and t1e >= until,
                            "recording_start": rec_start}
-    try:
-        out["ws"] = ws_health(t0h, t1e)
-    except Exception as e:  # noqa: BLE001
-        out["ws"] = {"error": f"{type(e).__name__}: {e}"}
     n_min = max(int((t1e - t0h) // 60), 0)
     try:
         out["poll"], meta = poll_health(t0h, t1e, n_min)
     except Exception as e:  # noqa: BLE001
         out["poll"], meta = {"error": f"{type(e).__name__}: {e}"}, {"errors": {}, "events_seen": set()}
+    try:
+        out["ws"] = ws_health(t0h, t1e, spans=market_spans(sim_events,
+                                                           meta.get("events_seen", set())))
+    except Exception as e:  # noqa: BLE001
+        out["ws"] = {"error": f"{type(e).__name__}: {e}"}
     out["errors"] = meta.get("errors", {})
     try:
         out["wx"], by_t = wx_health(t0, t1e, expect_from=t0h)
@@ -2160,7 +2195,10 @@ def _health_html(ctx: dict) -> str:
         rows.append(["ws", ws["error"]])
     else:
         rows.append(["ws uptime (connected, data flowing)",
-                     f"{pct(ws.get('uptime'))} of {ws.get('minutes', 0)} min; {ws.get('rows', 0):,} rows"])
+                     f"{pct(ws.get('uptime'))} of {ws.get('minutes', 0)} min with a market listed"
+                     + (f" ({ws['minutes_no_market']} min with none, not counted)"
+                        if ws.get('minutes_no_market') else "")
+                     + f"; {ws.get('rows', 0):,} rows"])
         rows.append(["ws reconnects / disconnects / seq gaps / resubscribes",
                      f"{ws.get('connects', 0)} / {ws.get('disconnects', 0)} / {ws.get('gaps', 0)} / "
                      f"{ws.get('resubscribes', 0)}"

@@ -100,11 +100,13 @@ import temp_shadow_common as C
 import temp_shadow_model as tmodel
 import temp_shadow_scoring as scoring
 
-SIM_VERSION = "3"   # 2: 75-min wx lookback, fair per wx update, relative size
+SIM_VERSION = "4"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # cuts + projected belief, near strikes only with decided,
                     # pre-trade worst-case-loss sizing (10/14 review fixes)
                     # 3: guard buffer from FairModel.slopes (mixture slope);
                     # fills_after_wx keyed on the five-station estimate
+                    # 4: scoring reads 3 h back for each market's
+                    # snapshot (early-listed events, 10/15)
 
 DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0)
 VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000)}
