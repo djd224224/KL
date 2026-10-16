@@ -9120,6 +9120,9 @@ _CONFIG_CODE_KNOBS = (
     "CA_FAIR_REL_SIGMA_EXEMPT", "CA_FAIR_REFRESH_HOLD_BY_CAT",   # ADS / apps (2026-10-10)
     "CA_LANDING_WINDOWS",          # Carbon Arc 1x while data lands (2026-10-10)
     "CA_LATE_TOXIC_SIDE_BY_CAT",   # late-month blocked side per category (2026-10-11)
+    # the scheduled-data stand-aside (2026-10-15)
+    "CA_SCHEDULE_HOLD", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
+    "CA_SCHEDULE_LATE_MAX_MIN",
     "CA_FAIR_CAP",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
     # fair file's "model" block (openrouter_fair.py)
@@ -10355,10 +10358,31 @@ def ca_refresh_hold_min(category) -> float:
                                            CA_FAIR_REFRESH_HOLD_MIN)
 
 
+# SCHEDULED DATA STAND-ASIDE (Jack 2026-10-15: "do 2 and 3" -- option 2).
+# carbon_arc_fair.py copies Carbon Arc's own schedule for each category's
+# panel (GET /v2/library/schedule; see its DATA SCHEDULES) into the fair
+# file. A prism refreshes minutes after its panel and our poll sees it after
+# that, so anyone reading the panel itself is ahead of us at every drop: a
+# Carbon Arc market therefore stands aside (both sides, like the refresh
+# hold) from CA_SCHEDULE_PRE_MIN before its category's window opens to
+# CA_SCHEDULE_POST_MIN after it closes, and the refresh hold takes over once
+# our read moves. A run that has not landed by then (last_update still
+# before the window) holds to CA_SCHEDULE_LATE_MAX_MIN past it. A schedule
+# not re-read for CA_SCHEDULE_TTL_H is ignored (the gate as before).
+# IMM_CA_SCHEDULE_HOLD=0 turns it off.
+CA_SCHEDULE_HOLD = os.environ.get("IMM_CA_SCHEDULE_HOLD", "1") == "1"
+CA_SCHEDULE_PRE_MIN = _env_float("IMM_CA_SCHEDULE_PRE_MIN", 10)
+CA_SCHEDULE_POST_MIN = _env_float("IMM_CA_SCHEDULE_POST_MIN", 20)
+CA_SCHEDULE_LATE_MAX_MIN = _env_float("IMM_CA_SCHEDULE_LATE_MAX_MIN", 60)
+CA_SCHEDULE_TTL_H = _env_float("IMM_CA_SCHEDULE_TTL_H", 26)
+
+
 CA_FAIR_FILE = os.environ.get(
     "IMM_CA_FAIR_FILE", os.path.join(STATUS_DIR, "carbon_arc_fair.json"))
-# series -> entry; series -> epoch its read last moved (refresh hold)
-_ca_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
+# series -> entry; series -> epoch its read last moved (refresh hold);
+# category -> its panel's next update window (scheduled stand-aside)
+_ca_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {},
+                        "schedules": {}, "schedules_ts": 0.0}
 _CA_STRIKE_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
 # REST THE SIDES THAT EARN, NOT A PARKED MARKET (Jack 2026-10-04: "the bot
 # should sit on the bid if it's earning money on it, but not if it wouldnt
@@ -10432,7 +10456,52 @@ def load_ca_fair() -> Tuple[int, int]:
         for s in moved:
             _ca_fair_state["moved_at"][s] = now_ts
     _ca_fair_state["entries"] = fresh
+    scheds: Dict[str, dict] = {}
+    for cat, s in (data.get("schedules") or {}).items():
+        if not isinstance(s, dict):
+            continue
+        st = parse_iso_utc(str(s.get("next_run_start") or ""))
+        en = parse_iso_utc(str(s.get("next_run_end") or ""))
+        lu = parse_iso_utc(str(s.get("last_update") or ""))
+        if st is None or en is None or en < st:
+            continue
+        scheds[str(cat).strip().lower()] = {
+            "start": st.timestamp(), "end": en.timestamp(),
+            "last": lu.timestamp() if lu else None,
+            "dataset": str(s.get("dataset") or "")}
+    _ca_fair_state["schedules"] = scheds
+    try:
+        _ca_fair_state["schedules_ts"] = float(data.get("schedules_ts") or 0.0)
+    except (TypeError, ValueError):
+        _ca_fair_state["schedules_ts"] = 0.0
     return len(fresh), len(moved)
+
+
+def ca_schedule_hold(ticker: str, now_ts: float) -> Optional[Tuple[str, dict]]:
+    """(why, inputs) while this Carbon Arc market's category is inside its
+    panel's scheduled update window (SCHEDULED DATA STAND-ASIDE), else None."""
+    if not (CA_FAIR_ENABLE and CA_SCHEDULE_HOLD):
+        return None
+    cat = ca_category(series_of(ticker))
+    s = (_ca_fair_state.get("schedules") or {}).get(cat or "")
+    if not s or now_ts - (_ca_fair_state.get("schedules_ts") or 0.0) \
+            > CA_SCHEDULE_TTL_H * 3600:
+        return None
+    lo = s["start"] - CA_SCHEDULE_PRE_MIN * 60
+    hi = s["end"] + CA_SCHEDULE_POST_MIN * 60
+    late = (s["last"] is None or s["last"] < s["start"]) and now_ts > hi
+    if late:
+        hi = s["end"] + max(CA_SCHEDULE_LATE_MAX_MIN, CA_SCHEDULE_POST_MIN) * 60
+    if not lo <= now_ts <= hi:
+        return None
+
+    def et(ts: float) -> datetime:
+        return datetime.fromtimestamp(ts, timezone.utc).astimezone(ET)
+    why = (f"Carbon Arc {cat} data due {et(s['start']):%H:%M}-{et(s['end']):%H:%M} ET"
+           f" ({s['dataset']}{', late' if late else ''}) -- out from "
+           f"{CA_SCHEDULE_PRE_MIN:g}m before to {CA_SCHEDULE_POST_MIN:g}m after")
+    return why, {"reason": "scheduled_data", "dataset": s["dataset"],
+                 "start": round(s["start"]), "end": round(s["end"]), "late": late}
 
 
 def ca_measurement_month(ticker: str) -> Optional[str]:
@@ -24305,7 +24374,12 @@ class IncentiveMarketMaker:
                 ca_why = ""
                 ca_in: dict = {}     # guard-skip inputs, built on THIS path
                 band = None
-                if ca_refresh_held(t, now_ts):
+                # the panel's scheduled update (2026-10-15), then the hold
+                # after our read moves, then the band
+                _ca_sched = ca_schedule_hold(t, now_ts)
+                if _ca_sched is not None:
+                    ca_why, ca_in = _ca_sched
+                elif ca_refresh_held(t, now_ts):
                     _ca_r = _ca_read(t, now_ts)
                     _ca_hold = ca_refresh_hold_min(
                         _ca_r[0].get("category") if _ca_r else None)
@@ -27389,6 +27463,12 @@ class IncentiveMarketMaker:
                 + ("caps the side (rests only while it earns)" if CA_FAIR_CAP
                    else "parks both sides")
                 + f", file {CA_FAIR_FILE}")
+            log("ca scheduled-data stand-aside (2026-10-15): "
+                + (f"each category out from {CA_SCHEDULE_PRE_MIN:g}m before its "
+                   f"panel's scheduled update to {CA_SCHEDULE_POST_MIN:g}m after "
+                   f"(a late run up to {CA_SCHEDULE_LATE_MAX_MIN:g}m), schedules "
+                   f"read by carbon_arc_fair"
+                   if CA_SCHEDULE_HOLD else "off (IMM_CA_SCHEDULE_HOLD=0)"))
             if CA_LANDING_WINDOWS:
                 log("ca 1x while data lands (2026-10-10): "
                     + "; ".join(f"{c} " + "+".join(f"{a:02d}-{b:02d}h" for a, b in w)

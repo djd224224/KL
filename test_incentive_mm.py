@@ -11165,7 +11165,8 @@ class TestCarbonArcFairGate(unittest.TestCase):
 
     def setUp(self):
         _clean_persist()
-        imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={})
+        imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={},
+                                  schedules={}, schedules_ts=0.0)
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
         imm.FAMILY_VERDICTS["KXFAKECC"] = {
@@ -11182,12 +11183,16 @@ class TestCarbonArcFairGate(unittest.TestCase):
         imm.FAMILY_VERDICTS.pop("KXFAKECC", None)
         imm.FAMILY_VERDICTS.pop("KXNOTCACC", None)
 
-    def _write_fair(self, entries, age_secs=0.0):
+    def _write_fair(self, entries, age_secs=0.0, schedules=None, schedules_age=0.0):
         fetched = (datetime.now(timezone.utc)
                    - timedelta(seconds=age_secs)).isoformat()
+        doc = {"entries": {s: dict(e, fetched_at=fetched)
+                           for s, e in entries.items()}}
+        if schedules is not None:
+            doc["schedules"] = schedules
+            doc["schedules_ts"] = time.time() - schedules_age
         with open(imm.CA_FAIR_FILE, "w", encoding="utf-8") as f:
-            json.dump({"entries": {s: dict(e, fetched_at=fetched)
-                                   for s, e in entries.items()}}, f)
+            json.dump(doc, f)
         os.utime(imm.CA_FAIR_FILE, (time.time(), time.time() + self._bump))
         TestCarbonArcFairGate._bump += 1
         n, _moved = imm.load_ca_fair()
@@ -11402,6 +11407,75 @@ class TestCarbonArcFairGate(unittest.TestCase):
         with mock.patch.object(imm, "CA_FAIR_REFRESH_HOLD_MIN", 0):
             self._write_fair({"KXFAKECC": self._entry(100.9)})
             self.assertFalse(imm.ca_refresh_held(self.T, time.time()))
+
+    @staticmethod
+    def _sched(start_min, end_min, last_min=-24 * 60, cat="credit card", ds="CA0056"):
+        now = datetime.now(timezone.utc)
+        iso = lambda m: (now + timedelta(minutes=m)).isoformat()   # noqa: E731
+        return {cat: {"dataset": ds, "next_run_start": iso(start_min),
+                      "next_run_end": iso(end_min), "last_update": iso(last_min)}}
+
+    def test_scheduled_data_window(self):
+        """Jack 2026-10-15: "do 2 and 3" (option 2) -- a category stands
+        aside from 10 min before its panel's scheduled update to 20 min after
+        the window; a run that has not landed holds to 60 min past it; the
+        knob, a stale schedule and another category leave it open."""
+        self.assertTrue(imm.CA_SCHEDULE_HOLD)
+        self.assertEqual((imm.CA_SCHEDULE_PRE_MIN, imm.CA_SCHEDULE_POST_MIN,
+                          imm.CA_SCHEDULE_LATE_MAX_MIN), (10, 20, 60))
+        for k in ("CA_SCHEDULE_HOLD", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
+                  "CA_SCHEDULE_LATE_MAX_MIN"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        self._write_fair({"KXFAKECC": self._entry(100.0)},
+                         schedules=self._sched(30, 60))   # last run yesterday
+        now = time.time()
+        h = imm.ca_schedule_hold
+        self.assertIsNone(h(self.T, now))                          # 30 min ahead
+        self.assertIsNotNone(h(self.T, now + 21 * 60))             # 9 min before
+        why, inp = h(self.T, now + 45 * 60)
+        self.assertEqual((inp["reason"], inp["dataset"], inp["late"]),
+                         ("scheduled_data", "CA0056", False))
+        self.assertIn("credit card data due", why)
+        self.assertIsNotNone(h(self.T, now + 79 * 60))             # 19 min after
+        self.assertTrue(h(self.T, now + 100 * 60)[1]["late"])      # not landed
+        self.assertIsNone(h(self.T, now + 121 * 60))
+        # landed inside the window: out 20 min after it, no late extension
+        self._write_fair({"KXFAKECC": self._entry(100.0)},
+                         schedules=self._sched(30, 60, last_min=55))
+        self.assertIsNotNone(h(self.T, now + 79 * 60))
+        self.assertIsNone(h(self.T, now + 100 * 60))
+        with mock.patch.object(imm, "CA_SCHEDULE_HOLD", False):
+            self.assertIsNone(h(self.T, now + 45 * 60))
+        # another category's window, a stale schedule, a non-Carbon Arc series
+        self._write_fair({"KXFAKECC": self._entry(100.0)},
+                         schedules=self._sched(30, 60, cat="advertising", ds="CA009"))
+        self.assertIsNone(h(self.T, now + 45 * 60))
+        self._write_fair({"KXFAKECC": self._entry(100.0)}, schedules=self._sched(30, 60),
+                         schedules_age=imm.CA_SCHEDULE_TTL_H * 3600 + 60)
+        self.assertIsNone(h(self.T, now + 45 * 60))
+        self._write_fair({"KXFAKECC": self._entry(100.0)}, schedules=self._sched(30, 60))
+        self.assertIsNone(h("KXNOTCACC-68DEC07-T100", now + 45 * 60))
+        # no schedules in the file: none held
+        self._write_fair({"KXFAKECC": self._entry(100.0)})
+        self.assertEqual(imm._ca_fair_state["schedules"], {})
+        self.assertIsNone(h(self.T, now + 45 * 60))
+
+    def test_a_scheduled_update_parks_both_sides_then_quoting_resumes(self):
+        self._write_fair({"KXFAKECC": self._entry(100.0)},
+                         schedules=self._sched(-5, 25))     # the window is open
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._ca_fair_stood)
+        self.assertIn(self.T, bot.state.selected)          # kept meanwhile
+        # the run lands (same read) and the schedule moves to tomorrow
+        self._write_fair({"KXFAKECC": self._entry(100.0)},
+                         schedules=self._sched(24 * 60, 24 * 60 + 30, last_min=-1))
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._ca_fair_stood)
+        q = self._quotes(bot)
+        self.assertTrue(any(s == "bid" for s, _p in q), q)
+        self.assertTrue(any(s == "ask" for s, _p in q), q)
 
     def test_caps_are_the_breach_limits(self):
         # bids at most the band top + 15, asks at least the bottom - 15; a

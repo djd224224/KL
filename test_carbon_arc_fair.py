@@ -428,8 +428,12 @@ class TestOfficialApi(unittest.TestCase):
         out = os.path.join(tmp, "fair.json")
         vint = os.path.join(tmp, "v.jsonl")
         smap = {"KXAMZNCC": {"prism": "P1", "entity": "Amazon"}}
+        sched_urls = []
 
         def fake_get(url, params=None, headers=None, timeout=None):
+            if url.startswith(TestSchedules.BASE):          # the panels' schedules
+                sched_urls.append(url)
+                return _resp(200, TestSchedules.sched(NOW))
             self.assertEqual(url, self.BASE + "/P1")
             return _resp(200, self._prism("P1", 245))
 
@@ -442,8 +446,13 @@ class TestOfficialApi(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["prism_insights"], {"P1": 245})
         self.assertAlmostEqual(data["entries"]["KXAMZNCC"]["mu"], 108.64)
+        # ...and every panel's schedule, read once
+        self.assertEqual(sorted(data["schedules"]), sorted(caf.CA_SCHEDULE_DATASETS))
+        self.assertEqual(data["schedules_ts"], NOW.timestamp())
+        self.assertEqual(len(sched_urls), len(caf.CA_SCHEDULE_DATASETS))
 
-        # next sweep: one grouped call per insight, no per-prism reads
+        # next sweep: one grouped call per insight, no per-prism reads (and,
+        # inside the refresh interval with every window ahead, no schedules)
         def grouped(url, params=None, headers=None, timeout=None):
             self.assertEqual((url, params), (self.BASE, {"insight_id": 245}))
             return _resp(200, {"prisms": [self._prism("P1", 245)]})
@@ -465,6 +474,102 @@ class TestOfficialApi(unittest.TestCase):
         with mock.patch.object(caf.requests, "get", return_value=resp):
             with self.assertRaises(ValueError):
                 caf.fetch_payload("https://x.invalid/p", "")
+
+
+class TestSchedules(unittest.TestCase):
+    """The panels' update schedules (Jack 2026-10-15: "do 2 and 3", option
+    2): GET /v2/library/schedule/<dataset> with the account token, written
+    to the fair file for incentive_mm's scheduled-data stand-aside."""
+
+    BASE = "https://api.carbonarc.co/v2/library/schedule"
+
+    @staticmethod
+    def sched(now, start_h=24.0, end_h=24.5, last_h=-4.0):
+        iso = lambda h: (now + timedelta(hours=h)).isoformat()   # noqa: E731
+        return {"schedules": [{"next_run_start": iso(start_h),
+                               "next_run_end": iso(end_h),
+                               "last_update": iso(last_h)}]}
+
+    def test_defaults(self):
+        self.assertEqual(caf.CA_SCHEDULE_DATASETS, {
+            "credit card": "CA0056", "point of sale": "CA0029",
+            "foot traffic": "CA0060", "app": "CA0054", "advertising": "CA009"})
+
+    def test_fetch_reads_each_panel_with_the_token(self):
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append((url, headers))
+            return _resp(200, {"schedules": [{
+                "next_run_start": "2026-10-16T19:30:00+00:00",
+                "next_run_end": "2026-10-16T20:00:00+00:00",
+                "last_update": "2026-10-15T15:40:27+00:00"}]})
+
+        with mock.patch.object(caf.requests, "get", side_effect=fake_get):
+            out = caf.fetch_schedules("tok", {"credit card": "CA0056",
+                                              "advertising": "CA009"})
+        self.assertEqual(out["credit card"], {
+            "dataset": "CA0056", "next_run_start": "2026-10-16T19:30:00+00:00",
+            "next_run_end": "2026-10-16T20:00:00+00:00",
+            "last_update": "2026-10-15T15:40:27+00:00"})
+        self.assertEqual(sorted(u for u, _h in calls),
+                         [self.BASE + "/CA0056", self.BASE + "/CA009"])
+        for _u, h in calls:
+            self.assertEqual(h["Authorization"], "Bearer tok")
+        with mock.patch.object(caf.requests, "get", return_value=_resp(500, {})):
+            with self.assertRaises(RuntimeError):
+                caf.fetch_schedules("tok", {"credit card": "CA0056"})
+
+    def test_refresh_cadence_and_failures(self):
+        reads = []
+
+        def fetch(tok):
+            reads.append(tok)
+            return {c: dict(self.sched(NOW)["schedules"][0], dataset=d)
+                    for c, d in caf.CA_SCHEDULE_DATASETS.items()}
+
+        self.assertEqual(caf.refresh_schedules({}, "", NOW, fetch), ({}, 0.0))
+        self.assertEqual(reads, [])                          # no token: no read
+        s, at = caf.refresh_schedules({}, "tok", NOW, fetch)
+        self.assertEqual((len(reads), at), (1, NOW.timestamp()))
+        prev = {"schedules": s, "schedules_ts": at}
+        # inside the interval, every window still ahead: kept
+        self.assertEqual(caf.refresh_schedules(prev, "tok", NOW + timedelta(minutes=5),
+                                               fetch), (s, at))
+        self.assertEqual(len(reads), 1)
+        # a window closed: re-read once the 2-minute recheck has passed
+        closed = {c: dict(v, next_run_end=(NOW - timedelta(minutes=1)).isoformat())
+                  for c, v in s.items()}
+        caf.refresh_schedules({"schedules": closed, "schedules_ts": at}, "tok",
+                              NOW + timedelta(minutes=1), fetch)
+        self.assertEqual(len(reads), 1)
+        caf.refresh_schedules({"schedules": closed, "schedules_ts": at}, "tok",
+                              NOW + timedelta(minutes=3), fetch)
+        self.assertEqual(len(reads), 2)
+        # past the interval: re-read
+        caf.refresh_schedules(prev, "tok", NOW + timedelta(
+            seconds=caf.CA_SCHEDULE_REFRESH_SECS), fetch)
+        self.assertEqual(len(reads), 3)
+
+        def down(tok):
+            raise RuntimeError("HTTP 503")
+        self.assertEqual(caf.refresh_schedules(prev, "tok", NOW + timedelta(hours=2),
+                                               down), (s, at))   # kept
+
+    def test_a_handed_in_payload_reads_no_schedules(self):
+        tmp = tempfile.mkdtemp(prefix="caf_sched_")
+        out = os.path.join(tmp, "fair.json")
+        payload = {"prisms": [_prism("P1", [_entity("Amazon", [("2026-09-23", 108.64)],
+                                                    HIST)])]}
+        with mock.patch.object(caf, "feed_settings", return_value=("", "tok")), \
+                mock.patch.object(caf.requests, "get",
+                                  side_effect=AssertionError("no network")):
+            caf.write_fair_file(out, payload=payload, now=NOW,
+                                series_map={"KXAMZNCC": {"prism": "P1", "entity": "Amazon"}},
+                                vintage_path=os.path.join(tmp, "v.jsonl"))
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual((data["schedules"], data["schedules_ts"]), ({}, 0.0))
 
 
 class TestSignedSeriesCatalog(unittest.TestCase):

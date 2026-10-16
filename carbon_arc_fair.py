@@ -196,6 +196,33 @@ CA_DROP_OPEN_DAY = os.environ.get("IMM_CA_DROP_OPEN_DAY", "1") == "1"
 CA_DAY_TZ = os.environ.get("IMM_CA_DAY_TZ", "US/Pacific")
 SERIES_MAP_TTL_SECS = 24 * 3600
 HTTP_TIMEOUT = 20
+# DATA SCHEDULES (Jack 2026-10-15: "do 2 and 3" -- option 2, stand aside
+# around each panel's scheduled update). Carbon Arc publishes when each data
+# panel next updates (GET /v2/library/schedule/<dataset>, free with the
+# account token): {"schedules": [{"next_run_start", "next_run_end",
+# "last_update"}]}, UTC. A prism refreshes minutes after its panel (card
+# spend on 10/15: panel 15:40:27Z, prism 15:43:43Z) and our poll sees it up
+# to CA_FAIR_REFRESH_SECS later, so anyone reading the panel itself is ahead
+# of us at every drop; ad spend updates weekly (10/10 06:30Z, then 10/17
+# 08:00Z; the 10/10 sweep followed its last drop). The fair file carries each
+# category's window and incentive_mm stands that category aside around it
+# (CA_SCHEDULE_HOLD). Category -> panel, matched on the 10/15 update times:
+# card spend CA0056 (US Complete Panel), point of sale CA0029 (convenience
+# stores), foot traffic CA0060, apps CA0054 (App Intelligence), ad spend
+# CA009 (Digital Advertising). IMM_CA_SCHEDULE_DATASETS: "category=dataset;
+# ..." ("" = off); re-read every CA_SCHEDULE_REFRESH_SECS, and within 2 min
+# once a window has closed (to pick up the next run).
+_DEFAULT_CA_SCHEDULE_DATASETS = ("credit card=CA0056;point of sale=CA0029;"
+                                 "foot traffic=CA0060;app=CA0054;advertising=CA009")
+CA_SCHEDULE_DATASETS: Dict[str, str] = {}
+for _part in os.environ.get("IMM_CA_SCHEDULE_DATASETS",
+                            _DEFAULT_CA_SCHEDULE_DATASETS).split(";"):
+    if "=" in _part:
+        _cat, _ds = (x.strip() for x in _part.split("=", 1))
+        if _cat and _ds:
+            CA_SCHEDULE_DATASETS[_cat.lower()] = _ds
+CA_SCHEDULE_REFRESH_SECS = _env_float("IMM_CA_SCHEDULE_REFRESH_SECS", 900)
+CA_SCHEDULE_RECHECK_SECS = 120
 
 
 def _log(msg: str) -> None:
@@ -305,6 +332,69 @@ def fetch_prisms_api(prism_ids: List[str], token: str,
             except (TypeError, ValueError):
                 pass
     return {"prisms": [got[k] for k in sorted(got)]}
+
+
+def fetch_schedules(token: str, datasets: Optional[Dict[str, str]] = None,
+                    timeout: float = HTTP_TIMEOUT) -> Dict[str, dict]:
+    """{category: {dataset, next_run_start, next_run_end, last_update}} from
+    Carbon Arc's data schedules (DATA SCHEDULES above). Raises on an HTTP
+    error so the caller keeps the previous ones."""
+    base = f"{CA_API_HOST.rstrip('/')}/v2/library/schedule"
+    headers = _auth_headers(token)
+    out: Dict[str, dict] = {}
+    for cat, ds in sorted((CA_SCHEDULE_DATASETS if datasets is None
+                           else datasets).items()):
+        r = requests.get(f"{base}/{ds}", headers=headers, timeout=timeout)
+        r.raise_for_status()
+        rows = (r.json() or {}).get("schedules") or []
+        s = rows[0] if rows and isinstance(rows[0], dict) else {}
+        out[cat] = {"dataset": ds, "next_run_start": s.get("next_run_start"),
+                    "next_run_end": s.get("next_run_end"),
+                    "last_update": s.get("last_update")}
+    return out
+
+
+def _iso_ts(raw) -> Optional[float]:
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+# the last schedule-read failure, so each distinct one is logged once
+_sched_err: Optional[str] = None
+
+
+def refresh_schedules(prev: dict, token: str, now: datetime,
+                      fetch: Callable[[str], Dict[str, dict]] = fetch_schedules
+                      ) -> Tuple[Dict[str, dict], float]:
+    """(schedules, read at): the previous file's, re-read every
+    CA_SCHEDULE_REFRESH_SECS and within CA_SCHEDULE_RECHECK_SECS of a window
+    closing. No token or no datasets -> nothing read; a failed read keeps
+    the previous ones (logged once)."""
+    global _sched_err
+    old = prev.get("schedules") or {}
+    at = float(prev.get("schedules_ts") or 0.0)
+    if not token or not CA_SCHEDULE_DATASETS:
+        return old, at
+    nts = now.timestamp()
+    due = nts - at >= CA_SCHEDULE_REFRESH_SECS or set(old) != set(CA_SCHEDULE_DATASETS)
+    if not due and nts - at >= CA_SCHEDULE_RECHECK_SECS:
+        due = any((_iso_ts(s.get("next_run_end")) or nts) < nts for s in old.values())
+    if not due:
+        return old, at
+    try:
+        new = fetch(token)
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:120]}"
+        if err != _sched_err:
+            _log(f"! data schedule read failed ({err}); keeping {len(old)} schedule(s)")
+        _sched_err = err
+        return old, at
+    if _sched_err is not None:
+        _log("data schedule reads back")
+    _sched_err = None
+    return new, nts
 
 
 def fetch_payload(url: str = "", token: str = "",
@@ -595,6 +685,10 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
             insights[str(k)] = int(v)
         except (TypeError, ValueError):
             continue
+    # the panels' update schedules ride along on the live (token) path only:
+    # a payload handed in (offline / tests) keeps the previous file's
+    schedules = prev.get("schedules") or {}
+    schedules_ts = float(prev.get("schedules_ts") or 0.0)
     if payload is None:
         payload = fetch_payload(
             prism_ids=sorted({r.get("prism", "") for r in smap.values()
@@ -602,6 +696,7 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
             insights=insights)
         if payload is None:
             return 0, 0
+        schedules, schedules_ts = refresh_schedules(prev, feed_settings()[1], now)
     entries, missing = build_entries(payload, smap, now)
     fetched_at = now.isoformat()
     for e in entries.values():
@@ -615,6 +710,8 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
         "series_map": smap,
         "series_map_ts": float(prev.get("series_map_ts") or time.time()),
         "prism_insights": insights,
+        "schedules": schedules,
+        "schedules_ts": schedules_ts,
         "model": {"sigma_mult": CA_SIGMA_MULT,
                   "sigma_floor_pts": CA_SIGMA_FLOOR_PTS,
                   "sigma_floor_rel": CA_SIGMA_FLOOR_REL,
