@@ -478,6 +478,33 @@ def prism_ref(url: str) -> Optional[Tuple[str, str]]:
     return pid, ent
 
 
+# HAND-MAPPED SERIES (Jack 2026-10-16: "Map KXDPZFT, KXSBUXFT and KXWMTFT to
+# their Carbon Arc foot-traffic entities"). Kalshi's settlement link for these
+# is the generic https://www.carbonarc.co/welcome, so prism_ref finds no prism
+# and the gate never read them (imm_model_coverage alerted FAIL-OPEN). Each
+# brand sits on a foot-traffic prism the sweep already reads: Domino's Pizza
+# on "QSR Foot Traffic" (with McDonald's), Starbucks on "Coffee Foot Traffic"
+# (with Dutch Bros), Walmart on "Wholesale Foot Traffic" (with Costco,
+# Target). write_fair_file adds these only where the catalog map has no entry,
+# so a fixed settlement link wins. IMM_CA_SERIES_MAP_EXTRA:
+# "SERIES=prism_id:Entity Name;...".
+_DEFAULT_CA_SERIES_MAP_EXTRA = (
+    "KXDPZFT=adc0fbe1-019a-4aad-9ca6-7a6bdce40c0c:Domino's Pizza;"
+    "KXSBUXFT=ec1ac3ec-b66e-48f7-9a2e-0a4da319a124:Starbucks;"
+    "KXWMTFT=718a9642-34a5-49bd-9f60-3d5a4bceaa7a:Walmart")
+CA_SERIES_MAP_EXTRA: Dict[str, dict] = {}
+for _part in os.environ.get("IMM_CA_SERIES_MAP_EXTRA",
+                            _DEFAULT_CA_SERIES_MAP_EXTRA).split(";"):
+    if "=" not in _part:
+        continue
+    _s, _rest = _part.split("=", 1)
+    if ":" not in _rest:
+        continue
+    _pid, _ent = _rest.split(":", 1)
+    if _s.strip() and _pid.strip() and _ent.strip():
+        CA_SERIES_MAP_EXTRA[_s.strip()] = {"prism": _pid.strip(), "entity": _ent.strip()}
+
+
 def series_map_from_catalog(series_list: List[dict]) -> Dict[str, dict]:
     """series ticker -> {"prism": id, "entity": name} for every series whose
     settlement source is a Carbon Arc prisms page."""
@@ -841,6 +868,10 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
             except Exception as e:   # keep the old map
                 _log(f"! series catalog read failed ({e}); "
                      f"keeping {len(smap)} mapped series")
+        # hand-mapped series fill only what the catalog left out
+        smap = dict(smap)
+        for s, ref in CA_SERIES_MAP_EXTRA.items():
+            smap.setdefault(s, dict(ref))
     insights: Dict[str, int] = {}
     for k, v in (prev.get("prism_insights") or {}).items():
         try:
