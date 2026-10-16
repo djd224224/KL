@@ -1976,11 +1976,24 @@ for _part in os.environ.get("IMM_CA_LANDING_WINDOWS", _DEFAULT_CA_LANDING_WINDOW
 _CA_SUFFIX_CATEGORY = (("ADS", "advertising"), ("APP", "app"),
                        ("POS", "point of sale"), ("FT", "foot traffic"),
                        ("CC", "credit card"))
+# ...and, with no suffix either, by the Kalshi series title its source
+# verdict stored (Jack 2026-10-16: "Ship A1 and A2 now"). The Carbon Arc
+# SECTOR ARRAYS listed 10/16 (KXSODAARRAY "Soda point of sale spend array",
+# KXFASTARRAY "Fast food credit card spend array", KXSTREAMARRAY "Streaming
+# app downloads array", ...) end in ARRAY, and their prisms 404 for our
+# token, so neither a read nor a suffix names the category the late-month
+# blocked side, the landing window and the scheduled-data hold key on.
+_CA_TITLE_CATEGORY = (("point of sale", "point of sale"),
+                      ("credit card", "credit card"),
+                      ("app download", "app"),
+                      ("foot traffic", "foot traffic"),
+                      ("ad spend", "advertising"),
+                      ("advertising", "advertising"))
 
 
 def ca_category(series: str) -> Optional[str]:
     """The Carbon Arc category of a Carbon Arc-settled series (lowercased
-    prism category, else its suffix's), or None."""
+    prism category, else its suffix's, else its verdict title's), or None."""
     if not carbon_arc_settled(series):
         return None
     e = (globals().get("_ca_fair_state") or {}).get("entries", {}).get(series)
@@ -1988,6 +2001,10 @@ def ca_category(series: str) -> Optional[str]:
         return str(e["category"]).strip().lower()
     for suf, cat in _CA_SUFFIX_CATEGORY:
         if series.endswith(suf):
+            return cat
+    title = str((FAMILY_VERDICTS.get(series) or {}).get("title") or "").lower()
+    for key, cat in _CA_TITLE_CATEGORY:
+        if key in title:
             return cat
     return None
 
@@ -4126,9 +4143,16 @@ def family_series_allowed(series: str) -> bool:
 # opportunistic email both need answered. Reading verdicts for them changes
 # nothing about admission -- family_series_allowed still requires a suffix
 # in ALLOW_FAMILY_SUFFIXES.
+# ARRAY (Jack 2026-10-16: "Ship A1 and A2 now"): the nine Carbon Arc sector
+# arrays (KXSODAARRAY, KXSTREAMARRAY, ...) reached the book through the
+# family watch's finecon enrolment with no verdict, so every Carbon Arc rail
+# keyed on carbon_arc_settled() skipped them: the late-month rule, the
+# 5-day stop, the scheduled-data hold, the landing-window 1x, the fair gate
+# and the join-ahead exclusion. Their category comes from the verdict title
+# (_CA_TITLE_CATEGORY). IMM_FAMILY_VERDICT_EXTRA_SUFFIXES=FT,APP reverts.
 FAMILY_VERDICT_EXTRA_SUFFIXES = tuple(
     s for s in os.environ.get("IMM_FAMILY_VERDICT_EXTRA_SUFFIXES",
-                              "FT,APP").split(",") if s)
+                              "FT,APP,ARRAY").split(",") if s)
 
 
 def series_verdict_wanted(series: str) -> bool:

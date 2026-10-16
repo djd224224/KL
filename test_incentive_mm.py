@@ -18250,6 +18250,53 @@ class TestFamilySourceVerdicts(unittest.TestCase):
         # not Carbon Arc: no category, so the global side (and no rule anyway)
         self.assertEqual(imm.ca_late_toxic_side("KXGOOD"), imm.CA_LATE_TOXIC_SIDE)
 
+    def test_sector_arrays_get_the_carbon_arc_rails(self):
+        # Jack 2026-10-16, "Ship A1 and A2 now": the nine Carbon Arc sector
+        # arrays end in ARRAY, so their source verdicts are read like *FT /
+        # *APP; with no suffix (and a 404 prism, so no read) the category
+        # comes from the verdict title
+        self.assertIn("ARRAY", imm.FAMILY_VERDICT_EXTRA_SUFFIXES)
+        self.assertTrue(imm.series_verdict_wanted("KXSODAARRAY"))
+        self.assertFalse(imm.series_verdict_wanted("KXSODA"))
+        ver = {
+            "KXSODAARRAY": {"carbon_arc": True, "ts": 1.0,
+                            "title": "Soda point of sale spend array"},
+            "KXFASTARRAY": {"carbon_arc": True, "ts": 1.0,
+                            "title": "Fast food credit card spend array"},
+            "KXSTREAMARRAY": {"carbon_arc": True, "ts": 1.0,
+                              "title": "Streaming app downloads array"},
+            "KXODDARRAY": {"carbon_arc": True, "ts": 1.0, "title": "Odd array"},
+            "KXNOTCAARRAY": {"carbon_arc": False, "ts": 1.0,
+                             "title": "Soda point of sale spend array"},
+        }
+        with mock.patch.dict(imm.FAMILY_VERDICTS, ver), \
+                mock.patch.dict(imm._ca_fair_state, {"entries": {}}):
+            self.assertEqual(imm.ca_category("KXSODAARRAY"), "point of sale")
+            self.assertEqual(imm.ca_category("KXFASTARRAY"), "credit card")
+            self.assertEqual(imm.ca_category("KXSTREAMARRAY"), "app")
+            self.assertIsNone(imm.ca_category("KXODDARRAY"))
+            self.assertIsNone(imm.ca_category("KXNOTCAARRAY"))     # not Carbon Arc
+            # the late-month rule blocks the category's toxic side (asks), not
+            # the global default
+            self.assertEqual(imm.ca_late_toxic_side("KXSODAARRAY"), "ask")
+            t = "KXSODAARRAY-26NOV03-T94"
+            after = imm.ca_late_window_start(t) + timedelta(hours=1)
+            self.assertEqual(imm.ca_late_month_mults(t, after), (0.5, 0.0))
+            # the 5-day stop caps the cutoff at 00:00 ET Oct 27
+            stop = imm.apply_series_cutoff_adjustments(
+                "KXSODAARRAY", "KXSODAARRAY-26NOV03", utc(2026, 11, 3, 5, 0),
+                close_time=utc(2026, 11, 3, 4, 59))
+            self.assertEqual(stop.astimezone(imm.ET).strftime("%Y-%m-%d %H:%M"),
+                             "2026-10-27 00:00")
+            # ...and join-ahead stays off it, as off every Carbon Arc family
+            with mock.patch.object(imm, "JOIN_AHEAD_MODE", "on"), \
+                    mock.patch.object(imm, "LADDER_MODE", "atref"):
+                self.assertFalse(imm.join_ahead_series("KXSODAARRAY"))
+        # an unverified array keeps none of it
+        self.assertIsNone(imm.ca_category("KXSODAARRAY"))
+        self.assertEqual(imm.ca_late_month_mults(
+            "KXSODAARRAY-26NOV03-T94", utc(2026, 10, 30, 12, 0)), (1.0, 1.0))
+
     def test_late_month_stop_is_the_last_five_days_of_the_month(self):
         # Jack 2026-09-24 pm: "stop quoting entirely in the last 5 days OF
         # THE MONTH" -> the cutoff is capped at 00:00 ET on the 26th of the

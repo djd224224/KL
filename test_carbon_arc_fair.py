@@ -420,8 +420,76 @@ class TestOfficialApi(unittest.TestCase):
     def test_other_http_errors_raise(self):
         with mock.patch.object(caf.requests, "get",
                                return_value=_resp(500, {})):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError):   # every read failed
                 caf.fetch_prisms_api(["P1"], "tok", {})
+        with mock.patch.object(caf.requests, "get",
+                               return_value=_resp(401, {})):
+            with self.assertRaises(RuntimeError):   # auth: still the whole sweep
+                caf.fetch_prisms_api(["P1"], "tok", {})
+
+    def test_a_server_error_on_one_prism_skips_only_that_prism(self):
+        # 2026-10-16: an unpublished array prism's 500 used to fail all 93 series
+        def fake_get(url, params=None, headers=None, timeout=None):
+            if url == self.BASE + "/P1":
+                return _resp(200, self._prism("P1", 245))
+            if url == self.BASE + "/P2":
+                return _resp(500, {})
+            if url == self.BASE + "/P3":
+                raise caf.requests.Timeout("read timed out")
+            if url == self.BASE + "/P4":
+                return _resp(404, {"detail": "not found"})
+            raise AssertionError(f"unexpected GET {url} {params}")
+
+        with mock.patch.object(caf.requests, "get", side_effect=fake_get), \
+                mock.patch.object(caf, "_prism_err", None):
+            out = caf.fetch_prisms_api(["P1", "P2", "P3", "P4"], "tok", {})
+        self.assertEqual([p["prism_id"] for p in out["prisms"]], ["P1"])
+        self.assertEqual(out["failed"], ["P2", "P3"])    # a 404 is not a failure
+
+    def test_a_failed_insight_batch_falls_back_to_per_prism_reads(self):
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append(url)
+            if url == self.BASE:
+                return _resp(502, {})
+            return _resp(200, self._prism(url.rsplit("/", 1)[1], 245))
+
+        with mock.patch.object(caf.requests, "get", side_effect=fake_get), \
+                mock.patch.object(caf, "_prism_err", None):
+            out = caf.fetch_prisms_api(["P1", "P2"], "tok", {"P1": 245, "P2": 245})
+        self.assertEqual([p["prism_id"] for p in out["prisms"]], ["P1", "P2"])
+        self.assertEqual(out["failed"], [])
+        self.assertEqual(calls, [self.BASE, self.BASE + "/P1", self.BASE + "/P2"])
+
+    def test_a_failed_prism_keeps_its_series_last_entry(self):
+        tmp = tempfile.mkdtemp(prefix="caf_carry_")
+        out = os.path.join(tmp, "fair.json")
+        vint = os.path.join(tmp, "v.jsonl")
+        smap = {"KXAMZNCC": {"prism": "P1", "entity": "Amazon"},
+                "KXWMTCC": {"prism": "P2", "entity": "Walmart"}}
+        first = {"prisms": [self._prism("P1", 245),
+                            self._prism("P2", 246, name="Walmart")],
+                 "failed": []}
+        self.assertEqual(caf.write_fair_file(out, payload=first, now=NOW,
+                                             series_map=smap,
+                                             vintage_path=vint), (2, 0))
+        later = NOW + timedelta(minutes=2)
+        second = {"prisms": [self._prism("P1", 245)], "failed": ["P2"]}
+        self.assertEqual(caf.write_fair_file(out, payload=second, now=later,
+                                             series_map=smap,
+                                             vintage_path=vint), (2, 0))
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["missing"], [])
+        self.assertEqual(data["entries"]["KXAMZNCC"]["fetched_at"], later.isoformat())
+        # the carried read keeps its own age, so the gate's TTL still applies
+        self.assertEqual(data["entries"]["KXWMTCC"]["fetched_at"], NOW.isoformat())
+        # ...but a prism that merely has no read (404) is still missing
+        third = {"prisms": [self._prism("P1", 245)], "failed": []}
+        self.assertEqual(caf.write_fair_file(out, payload=third, now=later,
+                                             series_map=smap,
+                                             vintage_path=vint), (1, 1))
 
     def test_token_only_write_reads_the_api_and_keeps_the_insight_map(self):
         tmp = tempfile.mkdtemp(prefix="caf_api_")

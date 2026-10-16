@@ -291,33 +291,65 @@ def _auth_headers(token: str) -> dict:
     return headers
 
 
+# the last set of prisms whose read failed server-side, so each distinct set
+# is logged once (the refresher runs every CA_FAIR_REFRESH_SECS)
+_prism_err: Optional[str] = None
+
+
 def fetch_prisms_api(prism_ids: List[str], token: str,
                      insights: Dict[str, int],
                      timeout: float = HTTP_TIMEOUT) -> dict:
-    """{"prisms": [...]} for `prism_ids` from the official Prisms API. One
-    GET /v2/prisms?insight_id= per insight already known in `insights`
-    (prism_id -> insight_id, updated in place), then GET /v2/prisms/<id>
-    for any prism still missing. A 404 (unknown / not public / never
-    published -- one answer by design) skips that prism; any other HTTP
-    error raises so the caller keeps the previous file."""
+    """{"prisms": [...], "failed": [prism ids]} for `prism_ids` from the
+    official Prisms API. One GET /v2/prisms?insight_id= per insight already
+    known in `insights` (prism_id -> insight_id, updated in place), then
+    GET /v2/prisms/<id> for any prism still missing. A 404 (unknown / not
+    public / never published -- one answer by design) skips that prism.
+
+    A SERVER-SIDE failure (5xx, timeout, dropped connection) skips only the
+    prisms it hit (Jack 2026-10-16: "Ship A1 and A2 now"): a failed insight
+    batch falls back to per-prism reads, and a prism whose own read fails is
+    listed in "failed" so write_fair_file carries its last entry forward.
+    Before this one 500 on one prism -- KXDELIVARRAY's unpublished array
+    prism at 15:28:41Z on 10/15, five failed sweeps that day -- raised for
+    the whole sweep, the caller kept the previous file, and every Carbon Arc
+    series aged toward the gate's fail-open together. Any other HTTP error
+    (auth, rate limit) still raises, and so does a sweep where every read
+    failed, so the caller keeps the previous file as before."""
+    global _prism_err
     base = f"{CA_API_HOST.rstrip('/')}/v2/prisms"
     headers = _auth_headers(token)
     want = set(prism_ids)
     got: Dict[str, dict] = {}
+    failed: Dict[str, str] = {}
+
+    def _get(url: str, params: Optional[dict] = None):
+        """(response, None), or (None, why) on a server-side failure."""
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            return None, type(e).__name__
+        if r.status_code >= 500:
+            return None, f"HTTP {r.status_code}"
+        return r, None
+
     by_insight: Dict[int, List[str]] = {}
     for pid in sorted(want):
         iid = insights.get(pid)
         if iid is not None:
             by_insight.setdefault(iid, []).append(pid)
     for iid in sorted(by_insight):
-        r = requests.get(base, params={"insight_id": iid}, headers=headers,
-                         timeout=timeout)
+        r, _why = _get(base, {"insight_id": iid})
+        if r is None:
+            continue                  # its prisms fall back to per-prism reads
         r.raise_for_status()
         for p in (r.json() or {}).get("prisms") or []:
             if isinstance(p, dict) and p.get("prism_id") in want:
                 got[p["prism_id"]] = p
     for pid in sorted(want - set(got)):
-        r = requests.get(f"{base}/{pid}", headers=headers, timeout=timeout)
+        r, why = _get(f"{base}/{pid}")
+        if r is None:
+            failed[pid] = why
+            continue
         if r.status_code == 404:
             continue
         r.raise_for_status()
@@ -331,7 +363,19 @@ def fetch_prisms_api(prism_ids: List[str], token: str,
                 insights[pid] = int(p["insight_id"])
             except (TypeError, ValueError):
                 pass
-    return {"prisms": [got[k] for k in sorted(got)]}
+    if failed and not got:
+        raise RuntimeError(f"every Carbon Arc prism read failed "
+                           f"({len(failed)}: {sorted(set(failed.values()))})")
+    err = (", ".join(f"{k[:8]} {v}" for k, v in sorted(failed.items()))
+           if failed else None)
+    if err != _prism_err:
+        if err:
+            _log(f"! {len(failed)} prism read(s) failed ({err}); "
+                 f"their series keep their last read")
+        elif _prism_err:
+            _log("prism reads back")
+    _prism_err = err
+    return {"prisms": [got[k] for k in sorted(got)], "failed": sorted(failed)}
 
 
 def fetch_schedules(token: str, datasets: Optional[Dict[str, str]] = None,
@@ -701,6 +745,17 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
     fetched_at = now.isoformat()
     for e in entries.values():
         e["fetched_at"] = fetched_at
+    # A prism whose read failed server-side this sweep (fetch_prisms_api's
+    # "failed") keeps its series' LAST entry, fetched_at and all, so each
+    # ages out on the gate's own TTL instead of vanishing from the file.
+    failed = set((payload or {}).get("failed") or [])
+    if failed:
+        old_entries = prev.get("entries") or {}
+        carried = [s for s in missing
+                   if (smap.get(s) or {}).get("prism") in failed and s in old_entries]
+        for s in carried:
+            entries[s] = old_entries[s]
+        missing = [s for s in missing if s not in set(carried)]
     _append_vintages(prev.get("entries") or {}, entries, fetched_at,
                      vintage_path or CA_VINTAGE_FILE)
     _write_json_atomic(path, {
