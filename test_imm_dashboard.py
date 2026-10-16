@@ -549,6 +549,24 @@ class CycleParseTests(unittest.TestCase):
         self.assertEqual(len(out["last"]), 4)
         self.assertEqual(out["last"]["KXD-1"]["_ts"], _ts("2026-09-28T04:00:30Z"))
 
+    def test_fine_keeps_each_cycle_from_fine_from(self):
+        path = self._write([
+            self._row("2026-09-28T04:00:00Z", "KXA-1", 0.1, 864),
+            self._row("2026-09-28T04:00:30Z", "KXA-1", 0.1, 864),
+            self._row("2026-09-28T04:01:00Z", "KXA-1", 0.2, 864),
+        ])
+        self.assertEqual(dash.parse_cycle_file(path)["fine"], {})
+        out = dash.parse_cycle_file(path, fine_from=_ts("2026-09-28T04:00:30Z"))
+        # each cycle's accrual under its own whole-second stamp, the same
+        # amounts the hourly bucket sums
+        self.assertEqual(sorted(out["fine"]["KXA-1"]), [int(_ts("2026-09-28T04:00:30Z")),
+                                                       int(_ts("2026-09-28T04:01:00Z"))])
+        self.assertAlmostEqual(out["fine"]["KXA-1"][int(_ts("2026-09-28T04:01:00Z"))], 0.2 * 864 * 30 / 86400)
+        h4 = int(_ts("2026-09-28T04:00:00Z") // 3600)
+        self.assertAlmostEqual(sum(out["fine"]["KXA-1"].values()), out["hourly"]["KXA-1"][h4])
+        late = dash.parse_cycle_file(path, fine_from=_ts("2026-09-28T04:00:45Z"))
+        self.assertEqual(list(late["fine"]["KXA-1"]), [int(_ts("2026-09-28T04:01:00Z"))])
+
 
 class NewEventGroupTests(unittest.TestCase):
     NOW = _ts("2026-09-28T20:00:00Z")
@@ -1246,6 +1264,135 @@ class BuilderIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(mk["KXS-1"]["pnl"], -90 * (12 - 82) / 100, places=6)
         self.assertAlmostEqual(mk["KXS-1"]["real"], 3.6, places=6)
         self.assertEqual(mk["KXS-1"]["settled"], "settled scalar 12.0c")
+
+
+class ShortWindowTests(unittest.TestCase):
+    """The Movers' 15 min / 30 min / 1 hour / 3 hours: between two 5-minute
+    position snapshots, with the rewards of the cycles in between."""
+
+    BASE = _ts("2026-09-28T16:00:30Z")
+    CYCLE_USD = 0.1 * 864 * 30 / 86400       # KXA-1's accrual per 30 s cycle
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = (dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR)
+        dash.STATUS_DIR = self.dir
+        dash.DASH_DIR = os.path.join(self.dir, "dashboard")
+        dash.CACHE_DIR = os.path.join(dash.DASH_DIR, "cache")
+
+    def tearDown(self):
+        dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _day(self, day, t0, t1, mtime=None, base=None):
+        """Cycles every 30 s over [t0, t1] (KXA-1 at 0.1 x $864/day) and a
+        snapshot half a second into every fifth-minute cycle from `base`,
+        as the bot stamps them: KXA-1 long 10 @ 40c, its mark up 1c a
+        snapshot from 40c at `base`; KXB-1 short 5, its mark flat."""
+        base = self.BASE if base is None else base
+        cyc, marks = [], []
+        ts = t0
+        while ts <= t1:
+            cyc.append(CycleParseTests._row(
+                datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "KXA-1", 0.1, 864))
+            if (ts - base) % 300 == 0:
+                s = datetime.fromtimestamp(ts + 0.5, timezone.utc).isoformat()
+                marks.append({"ts": s, "ticker": "KXA-1", "pos": 10, "avg_cents": 40,
+                              "mark_cents": 40 + (ts - base) / 300})
+                marks.append({"ts": s, "ticker": "KXB-1", "pos": -5, "avg_cents": 60, "mark_cents": 55})
+            ts += 30
+        paths = [os.path.join(self.dir, f"cycle_log_{day}.csv"), os.path.join(self.dir, f"marks_{day}.jsonl")]
+        with open(paths[0], "w", encoding="utf-8", newline="") as f:
+            f.write(",".join(dash._CYCLE_FIELDS) + "\n")
+            for r in cyc:
+                f.write(",".join(str(x) for x in r) + "\n")
+        with open(paths[1], "w", encoding="utf-8") as f:
+            for r in marks:
+                f.write(json.dumps(r) + "\n")
+        if mtime is not None:                    # a completed day file
+            for p in paths:
+                os.utime(p, (mtime, mtime))
+
+    def _fill(self, day, ts):
+        with open(os.path.join(self.dir, f"fills_{day}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": ts, "fill_id": f"f{ts}", "ticker": "KXA-1", "event_ticker": "KXA",
+                                "side": "yes", "action": "buy", "count": 1, "yes_price_cents": 50,
+                                "is_taker": False, "our_book_side": "bid", "is_pad": False}) + "\n")
+
+    def test_windows_run_between_snapshots(self):
+        self._day("2026-09-28", _ts("2026-09-28T16:00:00Z"), _ts("2026-09-28T19:59:30Z"))
+        self._fill("2026-09-28", _ts("2026-09-28T19:35:00Z"))       # in the 30 min, not the 15
+        m = dash.Builder(_ts("2026-09-28T20:00:00Z"), api=False, api_force=False).build()
+        end = _ts("2026-09-28T19:55:30Z") + 0.5                       # the newest snapshot
+        for key, mins in (("m15", 15), ("m30", 30), ("h1", 60), ("h3", 180)):
+            w, a = m["windows"][key], m["markets"]["KXA-1"]["w"][key]
+            self.assertEqual((w["start"], w["end"]), (end - mins * 60, end), key)
+            self.assertFalse(w["pnl_na"], key)
+            self.assertTrue(w.get("hidden"), key)                   # not a page-window button
+            # long 10, the mark up 1c per 5-minute snapshot
+            self.assertAlmostEqual(a["pnl"], 10 * (mins / 5) / 100, places=6, msg=key)
+            # the cycles stamped after the start snapshot, up to the end one
+            self.assertAlmostEqual(a["rew"], mins * 2 * self.CYCLE_USD, places=4, msg=key)
+            self.assertEqual((a["mk0"], a["mk1"]), (40 + (w["start"] - 0.5 - self.BASE) / 300,
+                                                    40 + (end - 0.5 - self.BASE) / 300), key)
+        self.assertEqual(m["windows"]["m15"]["desc"], "3:40 PM to 3:55 PM ET")
+        self.assertNotIn("fills", m["markets"]["KXA-1"]["w"]["m15"])
+        self.assertEqual(m["markets"]["KXA-1"]["w"]["m30"]["fills"], 1)
+        # a flat short position neither moved nor earned: not on the page
+        self.assertFalse(set(m["markets"]["KXB-1"]["w"]) & {"m15", "m30", "h1", "h3"})
+        self.assertIn("today", m["markets"]["KXB-1"]["w"])
+        # the page windows are untouched: today's rewards are every credited cycle
+        self.assertAlmostEqual(m["markets"]["KXA-1"]["w"]["today"]["rew"], (480 - 1) * self.CYCLE_USD, places=4)
+
+    def test_no_recent_snapshot_ends_now_without_pnl(self):
+        self._day("2026-09-28", _ts("2026-09-28T16:00:00Z"), _ts("2026-09-28T19:59:30Z"))
+        now = _ts("2026-09-28T20:30:00Z")                            # 34.5 min after the last one
+        m = dash.Builder(now, api=False, api_force=False).build()
+        w = m["windows"]["h1"]
+        self.assertEqual((w["start"], w["end"]), (now - 3600, now))
+        self.assertTrue(w["pnl_na"])
+        self.assertIn("no position snapshot since 3:55 PM ET", w["desc"])
+        # the bot's last half hour of cycles still counts
+        self.assertAlmostEqual(m["markets"]["KXA-1"]["w"]["h1"]["rew"], 59 * self.CYCLE_USD, places=4)
+
+    def test_a_window_across_utc_midnight_reads_the_cached_tail(self):
+        # the 3 hours at 01:00Z reach back into yesterday's completed file
+        now, base = _ts("2026-09-29T01:00:00Z"), _ts("2026-09-28T21:00:30Z")
+        self._day("2026-09-28", _ts("2026-09-28T21:00:00Z"), _ts("2026-09-28T23:59:30Z"),
+                  mtime=now - 3000, base=base)
+        self._day("2026-09-29", _ts("2026-09-29T00:00:00Z"), _ts("2026-09-29T00:59:30Z"), base=base)
+        files = {"cycle": "cycle_log_2026-09-28.csv", "marks": "marks_2026-09-28.jsonl"}
+
+        def h3():
+            m = dash.Builder(now, api=False, api_force=False).build()
+            return m["windows"]["h3"]["start"], m["markets"]["KXA-1"]["w"]["h3"]
+
+        def cached(name):
+            with open(os.path.join(dash.CACHE_DIR, f"{name}.pkl"), "rb") as f:
+                return dash.pickle.load(f)
+
+        start, first = h3()
+        self.assertEqual(start, _ts("2026-09-28T21:55:30Z") + 0.5)
+        self.assertAlmostEqual(first["pnl"], 10 * 36 / 100, places=6)
+        # every cycle in between but 00:00:00Z, the first of its file (no gap before it)
+        self.assertAlmostEqual(first["rew"], (360 - 1) * self.CYCLE_USD, places=4)
+        for name, fn in files.items():
+            self.assertTrue(cached(name)["files"][fn]["val"]["fine"], name)
+        self.assertEqual(h3(), (start, first))                      # the second build reads the cache
+        # an entry cached before the tail was kept is parsed again, once
+        for name, fn in files.items():
+            blob = cached(name)
+            blob["files"][fn]["val"].pop("fine")
+            with open(os.path.join(dash.CACHE_DIR, f"{name}.pkl"), "wb") as f:
+                dash.pickle.dump(blob, f)
+        self.assertEqual(h3(), (start, first))
+        for name, fn in files.items():
+            self.assertTrue(cached(name)["files"][fn]["val"]["fine"], name)
+        # once the windows have moved past it the tail leaves the cache
+        dash.Builder(_ts("2026-09-29T06:00:00Z"), api=False, api_force=False).build()
+        for name, fn in files.items():
+            self.assertFalse(cached(name)["files"][fn]["val"]["fine"], name)
 
 
 if __name__ == "__main__":

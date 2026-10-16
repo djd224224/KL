@@ -145,6 +145,16 @@ TITLE_BUDGET = int(os.environ.get("IMM_DASH_TITLE_BUDGET", "80"))
 PAD_BID, PAD_ASK = 1, 99  # incentive_mm PAD_BID_CENTS / PAD_ASK_CENTS
 CACHE_VERSION = 5
 DAY_CURVE_STEP = 900              # per-day intraday curves at 15-minute steps
+# the Movers section's own short windows (Jack 2026-10-16: "in 'Movers' section
+# ... i should be able to select in last 15min, last 30min, last hour, last 3
+# hours, last day"): (key, minutes, label). Each runs between two 5-minute
+# position snapshots -- from the one nearest its length before the newest, to
+# the newest -- with the rewards of the cycles in between; "last day" is the
+# 24h window. Per-cycle rewards and every snapshot are kept FINE_SPAN back.
+SHORT_WINDOWS = (("m15", 15, "Last 15 min"), ("m30", 30, "Last 30 min"),
+                 ("h1", 60, "Last hour"), ("h3", 180, "Last 3 hours"))
+FINE_SPAN = 3.5 * 3600
+SHORT_SNAP_STALE = 900            # no snapshot this recent: the windows end now, P&L n/a
 # per-market day arrays on the page: D.days[day].m[ticker] = [...] in this order.
 # "cr" / "cs" split trading P&L: the start-of-day position re-marked (cr) or
 # settled (cs); the rest is the day's own fills. "fx" is 0 for a market with
@@ -1067,6 +1077,10 @@ def day_files(prefix: str, ext: str, first_day: str):
     return sorted(out)
 
 
+def _utc_day_start(day: str) -> float:
+    return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+
+
 def file_complete(day: str, path: str, now: float) -> bool:
     """A UTC-day file is final once its day is over and it has sat still for
     10 minutes (the bot flushes the last cycle a little after midnight)."""
@@ -1122,18 +1136,21 @@ _CYCLE_FIELDS = ("ts", "ticker", "ext_bid", "ext_ask", "yes_depth", "no_depth", 
 
 
 def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
-                     max_ts: float = None) -> dict:
+                     max_ts: float = None, fine_from: float = None) -> dict:
     """One cycle_log day file ->
          hourly  {ticker: {utc_hour: est $}}       reward accrual
          rest    {ticker: {utc_hour: $-seconds}}   resting-dollar time
          cycles  [cycle epoch, ...]
          runs    {run_id: [first_ts, last_ts, n_cycles]}
          last    {ticker: row dict} of the last FULL cycle (keep_last only)
+         fine    {ticker: {cycle epoch: est $}}    the same accrual per cycle,
+                 for the cycles at or after fine_from (the Movers' short windows)
     The accrual reproduces imm_reward_recon._scan_cycle_log: each cycle is
     credited with est_frac x pool_per_day over the gap since the previous
     cycle, capped at max_dt, and lands in the UTC hour of its own timestamp."""
     hourly = defaultdict(lambda: defaultdict(float))
     rest = defaultdict(lambda: defaultdict(float))
+    fine = defaultdict(dict)
     cycles, runs = [], {}
     prev_ts = cur_ts = None
     cur_str = None
@@ -1141,17 +1158,21 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
 
     def flush(ts, rows, dt):
         hour = int(ts // 3600)
+        key = int(ts) if fine_from is not None and ts >= fine_from else None
         for tkr, frac, pool, rc, _row in rows:
             v = frac * pool * dt / 86400.0
             if v:
                 hourly[tkr][hour] += v
+                if key is not None:
+                    d = fine[tkr]
+                    d[key] = d.get(key, 0.0) + v
             if rc:
                 rest[tkr][hour] += rc / 100.0 * dt
 
     try:
         f = open(path, newline="", encoding="utf-8", errors="replace")
     except OSError:
-        return {"hourly": {}, "rest": {}, "cycles": [], "runs": {}, "last": {}}
+        return {"hourly": {}, "rest": {}, "cycles": [], "runs": {}, "last": {}, "fine": {}}
     with f:
         rdr = csv.reader(f)
         # rows the bot writes while this build runs are after the build's "now":
@@ -1215,7 +1236,7 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
             last[tkr] = d
     return {"hourly": {t: dict(h) for t, h in hourly.items()},
             "rest": {t: dict(h) for t, h in rest.items()},
-            "cycles": cycles, "runs": runs, "last": last}
+            "cycles": cycles, "runs": runs, "last": last, "fine": dict(fine)}
 
 
 # ----------------------------------------------------------------------------
@@ -1284,7 +1305,8 @@ def project_rest_of_day(rows, now: float, mult_at=None, end: float = None) -> fl
 # marks: 5-minute snapshots of every open own-book position
 # ----------------------------------------------------------------------------
 
-def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = None):
+def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = None,
+                     fine_from: float = None):
     """One marks day file ->
          totals  [(snap_ts, unrealized $, n_positions, gross $ at risk)]
          hours   {utc_hour: (snap_ts, {ticker: (pos, avg_c, mark_c)})} -- the FIRST
@@ -1294,6 +1316,8 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
          gone    [(ticker, pos, avg, mark, last_seen_ts, first_missing_ts)]
          came    [(ticker, first_seen_ts)] between consecutive snapshots
          edges   {et_midnight_ts: (snap_ts, book)} -- first snapshot of each ET day
+         fine    [(snap_ts, book)] every snapshot at or after fine_from, oldest
+                 first (the Movers' short windows)
     `queries` {key: (ticker, target_ts[, max_lag])} is answered in place with
     the first snapshot mark at or after target_ts (within max_lag, default
     MARKOUT_MAX_LAG): the fill mark-outs, resolved while the rows are in
@@ -1359,8 +1383,10 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
                 i = bisect.bisect_left(stamps, target)
                 if i < len(series) and series[i][0] - target <= lag:
                     queries[key] = ("ok", series[i][1], series[i][0])
+    fine = ([(ts, snaps[ts]) for ts in order if ts >= fine_from]
+            if fine_from is not None else [])
     return {"totals": totals, "hours": hours if keep_hours else {}, "last": last,
-            "first": first, "gone": gone, "came": came, "edges": edges}
+            "first": first, "gone": gone, "came": came, "edges": edges, "fine": fine}
 
 
 # ----------------------------------------------------------------------------
@@ -1881,6 +1907,7 @@ class Builder:
         self.now_values = {}
         self.markouts_h = {}
         self.env = {}
+        self.fine, self.fine_snaps = {}, []
 
     def _t(self, name, t0):
         self.timing[name] = round(time.time() - t0, 2)
@@ -1896,21 +1923,37 @@ class Builder:
         cache = FileCache("cycle")
         self.hourly = defaultdict(lambda: defaultdict(float))
         self.rest = defaultdict(lambda: defaultdict(float))
+        self.fine = defaultdict(dict)    # {ticker: {cycle epoch: est $}} since fine_from
+        fine_from = self.now - FINE_SPAN
         self.cycles, self.runs = [], {}
         self.last_cycle = {}
         files = day_files("cycle_log", "csv", self.first_day)
         live_path = files[-1][1] if files else None
         for day, path in files:
             complete = file_complete(day, path, self.now)
+            # a file the short windows reach into keeps its per-cycle tail (in
+            # the cache too, until the windows have moved past it)
+            want_fine = _utc_day_start(day) + 86400 > fine_from
             val = cache.get(path) if complete else None
+            if val is not None and want_fine and "fine" not in val:
+                val = None            # cached before the per-cycle tail was kept: re-parse
             if val is None:
                 val = parse_cycle_file(path, keep_last=(path == live_path),
-                                       max_ts=None if complete else self.now)
+                                       max_ts=None if complete else self.now,
+                                       fine_from=fine_from if want_fine else None)
                 if complete:
                     val = dict(val, last={})
                     cache.put(path, val)
                 log(f"parsed {os.path.basename(path)}"
                     f" ({os.path.getsize(path) / 1e6:.0f} MB){'' if complete else ' [live]'}")
+            elif not want_fine and val.get("fine"):
+                cache.put(path, dict(val, fine={}))
+            if want_fine:
+                for t, cs in (val.get("fine") or {}).items():
+                    d = self.fine[t]
+                    for c, v in cs.items():
+                        if c >= fine_from:
+                            d[c] = d.get(c, 0.0) + v
             for t, hs in val["hourly"].items():
                 d = self.hourly[t]
                 for h, v in hs.items():
@@ -1978,6 +2021,8 @@ class Builder:
         self.snap_totals = []            # [(ts, U, n, gross)]
         self.hour_snaps = {}             # {utc_hour: (ts, book)}
         self.last_snap = (0.0, {})
+        self.fine_snaps = []             # [(ts, book)] every snapshot since fine_from
+        fine_from = self.now - FINE_SPAN
         self.gone, self.came = [], []    # position exits / entries between snapshots
         prev_last = None
         files = day_files("marks", "jsonl", self.first_day)
@@ -1985,12 +2030,15 @@ class Builder:
         keep_names = set()
         for day, path in files:
             keep_names.add(os.path.basename(path))
-            dt_day = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+            dt_day = _utc_day_start(day)
             keep_hours = dt_day + 86400 >= self.detail_from
+            want_fine = dt_day + 86400 > fine_from
             complete = file_complete(day, path, self.now)
             val = cache.get(path) if complete else None
             if val is not None and keep_hours and not val.get("hours") and val.get("totals"):
                 val = None            # cached without detail: re-parse
+            if val is not None and want_fine and "fine" not in val:
+                val = None            # cached before every recent snapshot was kept: re-parse
             # queries whose target falls in (or before the end of) this file
             end = dt_day + 86400 + MARKOUT_MAX_LAG
             q = {k: v for k, v in queries.items() if dt_day - 86400 <= v[1] <= end}
@@ -1998,7 +2046,8 @@ class Builder:
                 val = None            # a completed file still owes mark-outs (a new horizon)
             if val is None:
                 val = parse_marks_file(path, keep_hours=True, queries=q,
-                                       max_ts=None if complete else self.now)
+                                       max_ts=None if complete else self.now,
+                                       fine_from=fine_from if want_fine else None)
                 for k, v in q.items():
                     if isinstance(v, tuple) and v and v[0] == "ok":
                         store(k, [round(v[1], 3), round(v[2], 1)])
@@ -2013,8 +2062,16 @@ class Builder:
                     cache.put(path, stored)
                 log(f"parsed {os.path.basename(path)}{'' if complete else ' [live]'}"
                     + (f" ({len(q)} mark-out queries)" if q else ""))
-            elif not keep_hours and val.get("hours"):
-                cache.put(path, dict(val, hours={}))
+            else:
+                trim = {}
+                if not keep_hours and val.get("hours"):
+                    trim["hours"] = {}
+                if not want_fine and val.get("fine"):
+                    trim["fine"] = []
+                if trim:
+                    cache.put(path, dict(val, **trim))
+            if want_fine:
+                self.fine_snaps.extend(s for s in val.get("fine") or () if s[0] >= fine_from)
             self.snap_totals.extend(val["totals"])
             if keep_hours:
                 self.hour_snaps.update(val["hours"])
@@ -2057,6 +2114,7 @@ class Builder:
         # the 30-minute mark-outs as before: absent = pending, None = no mark
         self.markouts = {k: v["mk"] for k, v in mk_cache.items() if "mk" in v}
         self.snap_totals.sort()
+        self.fine_snaps.sort(key=lambda s: s[0])
 
 
     # ---- when a realized row really happened ------------------------------------
@@ -2520,10 +2578,12 @@ class Builder:
             return None
         return best[3] if best[3] is not None else best[2]
 
-    def window_markets(self, w0: float, w1: float, sums=None) -> dict:
+    def window_markets(self, w0: float, w1: float, sums=None, snaps=None) -> dict:
         """{ticker: metrics} for one window. `sums` = ({ticker: rewards},
         {ticker: resting $-seconds}) precomputed for the window (the per-day
         pass buckets every market-hour once instead of once per day).
+        `snaps` = the (start, end) position snapshots, each (ts, book) or
+        None, when the caller picked them (the short windows); else snap_at.
 
         Trading P&L is split three ways (the parts add up to "pnl" exactly):
           cr  the position held at the window's start, re-marked from its
@@ -2564,8 +2624,11 @@ class Builder:
                         s_ += v
                 if s_:
                     m[t]["rest_s"] += s_
-        s0 = self.snap_at(w0)
-        s1 = self.snap_at(w1)
+        if snaps is not None:
+            s0, s1 = snaps
+        else:
+            s0 = self.snap_at(w0)
+            s1 = self.snap_at(w1)
         e0 = s0[0] if s0 else w0
         e1 = s1[0] if s1 else w1
         pnl_ok = s0 is not None and s1 is not None
@@ -2669,6 +2732,60 @@ class Builder:
                 continue
             out[t] = v
         return out, (e0, e1, pnl_ok)
+
+    def short_windows(self):
+        """The Movers' short windows: ({key: window}, {key: (markets, edges)}).
+        Each ends at the newest position snapshot and starts at the snapshot
+        nearest its length before that, so its P&L is exact between two
+        snapshots. Its rewards are the cycles in between: a cycle's accrual
+        covers the gap before it, and the cycle log stamps a snapshot's own
+        cycle at the snapshot's whole second -- so the cycles stamped after
+        the start snapshot, up to and including the end one. With no snapshot
+        in the last SHORT_SNAP_STALE seconds the bot is not running: the
+        windows end now and their P&L is n/a."""
+        snaps = self.fine_snaps
+        stamps = [s[0] for s in snaps]
+        last = snaps[-1] if snaps and self.now - snaps[-1][0] <= SHORT_SNAP_STALE else None
+        end = last[0] if last else self.now
+
+        def clock(ts):
+            return datetime.fromtimestamp(ts, ET).strftime("%I:%M %p").lstrip("0")
+        plan = []
+        for key, mins, label in SHORT_WINDOWS:
+            target = end - mins * 60
+            s0 = None
+            if last:
+                i = bisect.bisect_left(stamps, target)
+                near = [j for j in (i - 1, i) if 0 <= j < len(snaps) and stamps[j] < end]
+                if near:
+                    s0 = snaps[min(near, key=lambda j: abs(stamps[j] - target))]
+            plan.append((key, mins, label, s0[0] if s0 else target, s0))
+        # every window's rewards in one pass over the per-cycle accrual,
+        # earliest start first
+        sums = {p[0]: defaultdict(float) for p in plan}
+        starts = sorted(((p[3], p[0]) for p in plan))
+        for t, cs in self.fine.items():
+            for c, v in cs.items():
+                if c > end:
+                    continue
+                for start, key in starts:
+                    if c <= start:
+                        break
+                    sums[key][t] += v
+        meta, wins = {}, {}
+        for key, mins, label, start, s0 in plan:
+            mk, edges = self.window_markets(start, end, sums=(sums[key], {}), snaps=(s0, last))
+            desc = f"{clock(start)} to {clock(end)} ET"
+            if not snaps:
+                desc += f"; no position snapshot in the last {FINE_SPAN / 3600:g} h"
+            elif not last:
+                desc += "; no position snapshot since " + clock(stamps[-1]) + " ET"
+            elif not s0:
+                desc += "; no position snapshot near its start"
+            meta[key] = {"label": label, "start": start, "end": end, "desc": desc,
+                         "mins": mins, "hidden": True}
+            wins[key] = (mk, edges)
+        return meta, wins
 
     def day_list(self):
         """[(iso day, start, end)] for every ET day the cycle history covers
@@ -3038,6 +3155,15 @@ class Builder:
             mk, edges = self.window_markets(w["start"], w["end"])
             wins[key] = (mk, edges)
             market_union |= set(mk)
+        # the Movers' short windows: only what moved or earned goes on the page
+        t1 = time.time()
+        short_meta, short_wins = self.short_windows()
+        for key, (mk, edges) in short_wins.items():
+            mk = {t: v for t, v in mk.items()
+                  if abs(v["pnl"]) >= 0.005 or abs(v["rew"]) >= 0.005 or v["fills"] or v["settled"]}
+            wins[key] = (mk, edges)
+            market_union |= set(mk)
+        self._t("short_windows", t1)
         # current quoting state
         cur = {}
         for t, r in self.last_cycle.items():
@@ -3253,7 +3379,8 @@ class Builder:
         model = {
             "generated": self.now,
             "generated_et": datetime.fromtimestamp(self.now, ET).strftime("%a %b %d, %I:%M %p ET").replace(" 0", " "),
-            "windows": {k: dict(w, pnl_na=not wins[k][1][2]) for k, w in self.windows.items()},
+            "windows": {k: dict(w, pnl_na=not wins[k][1][2])
+                        for k, w in list(self.windows.items()) + list(short_meta.items())},
             "edges": {k: list(v[1][:2]) for k, v in wins.items()},
             "decisions": self._decision_mix(),
             "markets": markets, "events": events, "paths": per_market_paths,

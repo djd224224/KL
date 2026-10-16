@@ -81,7 +81,8 @@ settlements.
 - **Needs attention:** stale heartbeat, daily-loss / manual halts, toxic event
   and side halts, risk guards, a morning email that did not send, a stale credit
   ledger, restarts, promising new launches, open pick-off windows.
-- **Drivers** (below), **Movers**, **Quoting now** (coverage, share of pool,
+- **Drivers** (below), **Movers** (its own window: the page's, or the last
+  15 minutes to the last day, below), **Quoting now** (coverage, share of pool,
   yield in cents per $1 resting per day, why candidates are not quoted),
   **Opportunities**, **Risk & halts** (inventory by event, sorted by worst
   case), **Fill timing** (below), **Fills** (edge and every mark-out horizon
@@ -213,6 +214,33 @@ edited without a fill (a state restore, a reconcile adopting someone else's
 fill), and the dashboard follows the bot's book. First seen 9/30 on
 KXMLBSEASONGAMES-27-2425 (book -47.36 vs fills -25.00 until the 0077bd5
 restore), worth about $1-2 a day.
+
+## Movers: the last 15 minutes to the last day
+
+Jack 2026-10-16: "in 'Movers' section ... i should be able to select in last
+15min, last 30min, last hour, last 3 hours, last day". The Movers header has
+its own window buttons, kept per browser: the page's window (the default),
+15 min, 30 min, 1 hour, 3 hours, and 1 day (the 24h window).
+
+The four short windows (`SHORT_WINDOWS`) run between two 5-minute position
+snapshots: from the snapshot nearest their length before the newest one, to
+the newest. Trading P&L is exact between the two. Rewards are the modeled
+accrual of the cycles in between: a cycle's accrual covers the gap before
+it, and the cycle log stamps a snapshot's own cycle at the snapshot's whole
+second, so the window takes the cycles stamped after the start snapshot, up
+to and including the end one. The note beside the buttons gives the clock
+times, and a gap in the snapshots shows there as a longer or shorter span.
+With no snapshot in the last 15 minutes the windows end at the build and
+their P&L reads n/a. The page rebuilds every 10 minutes, so "last 15 min"
+means the 15 minutes before the newest snapshot the build saw.
+
+To serve them, the parsers keep `FINE_SPAN` (3.5 h) of per-cycle rewards
+(`fine` in `parse_cycle_file`) and of every snapshot (`fine` in
+`parse_marks_file`). A completed UTC-day file keeps that tail in its cache
+entry while a short window still reaches into it (the first hours after
+00:00 UTC) and drops it afterwards. An entry cached before the tail existed
+is re-parsed once, when it is needed. Only markets that moved, earned,
+filled or settled in a short window go on the page.
 
 ## New launches and "promising"
 

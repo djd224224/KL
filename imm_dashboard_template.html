@@ -381,6 +381,7 @@ footer { color: var(--muted); font-size: 12px; }
   .hero .big { font-size: 36px; }
   .search { width: 100%; }
   section { scroll-margin-top: 150px; }
+  #movSeg button { padding: 5px 8px; }
 }
 </style>
 
@@ -435,7 +436,8 @@ footer { color: var(--muted); font-size: 12px; }
   </section>
 
   <section id="movers">
-    <div class="shead"><h2>Movers</h2><span class="note">Markets whose mark-to-market moved the most in the window, and where the rewards came from.</span></div>
+    <div class="shead"><h2>Movers</h2><span class="note" id="movNote"></span>
+      <div class="right"><div class="seg" id="movSeg" role="group" aria-label="Movers window"></div></div></div>
     <div class="grid2">
       <div><div class="sub-h">Largest trading P&amp;L moves<span class="note">realized + change in open marks</span></div><div class="tw" id="movPnl"></div></div>
       <div><div class="sub-h">Top reward earners<span class="note">modeled accrual, with the trading P&amp;L beside it</span></div><div class="tw" id="movRew"></div></div>
@@ -615,6 +617,13 @@ let W = store("imm.win") || "today";
 if (WKEYS.indexOf(W) < 0 && !isDay(W)) W = "today";
 let Q = "";
 let newWin = store("imm.newWin") || "72";
+// the Movers' own window (Jack 2026-10-16: "in 'Movers' section ... i should be
+// able to select in last 15min, last 30min, last hour, last 3 hours, last day"):
+// "page" follows the window above; the short ones run between two of the bot's
+// 5-minute position snapshots, up to the newest; "1 day" is the 24h window
+const MOVKEYS = [["page", ""], ["m15", "15 min"], ["m30", "30 min"], ["h1", "1 hour"], ["h3", "3 hours"], ["24h", "1 day"]];
+let movWin = store("imm.movWin") || "page";
+function movKey() { return movWin !== "page" && D && D.windows && D.windows[movWin] ? movWin : null; }
 const openRows = new Set((() => { try { return JSON.parse(sessionStorage.getItem("imm.open") || "[]"); } catch (e) { return []; } })());
 function saveOpen() { try { sessionStorage.setItem("imm.open", JSON.stringify([...openRows])); } catch (e) { /* private mode */ } }
 function matchQ() {
@@ -1019,10 +1028,11 @@ function renderHeader() {
   }
   const bn = $("dayBanner");
   if (isDay(W)) {
-    const w = win();
+    const w = win(), mvk = movKey();
     bn.hidden = false;
     bn.innerHTML = "<span><b>" + esc(w.label) + "</b> \u00b7 " + esc(w.desc.replace(/ [A-Z][a-z]{2}, .*$/, "")) +
-      ". Rewards, trading, drivers, movers and fills are that day's, and the drivers' book columns show the book at that day's close; quoting, inventory, halts, opportunities and health show the book now." +
+      ". Rewards, trading, drivers" + (mvk ? "" : ", movers") + " and fills are that day's, and the drivers' book columns show the book at that day's close; quoting, inventory, halts, opportunities" +
+      (mvk ? ", health and movers (" + esc(D.windows[mvk].label.toLowerCase()) + ")" : " and health") + " show the book now." +
       (w.pnl_na ? " Trading P&amp;L is not available for this day: the position log starts later." : "") + "</span>" +
       '<button type="button" id="bnToday">Back to today</button>';
     $("bnToday").addEventListener("click", () => setWin("today"));
@@ -1697,12 +1707,12 @@ function renderMoHeat(fams, t) {
 }
 
 /* ======================= movers ======================= */
-function marketRows(filterFn) {
+function marketRows(filterFn, key) {       // key: one of D.windows, else the page's window
   const out = [];
   for (const t in D.markets) {
     const m = D.markets[t];
-    if (!hasW(m) || !matchQ(m.t, m.ev, m.fam, m.grp)) continue;
-    const w = mw(m);
+    if (!(key ? m.w[key] : hasW(m)) || !matchQ(m.t, m.ev, m.fam, m.grp)) continue;
+    const w = key ? m.w[key] : mw(m);
     if (filterFn && !filterFn(m, w)) continue;
     out.push(Object.assign({ t, m, ev: m.ev, fam: m.fam }, w));
   }
@@ -1717,8 +1727,19 @@ function cause(r) {
   return bits.join(" · ");
 }
 function renderMovers() {
-  const na = win().pnl_na;
-  const rows = marketRows((m, w) => Math.abs(w.pnl || 0) >= 0.01);
+  const key = movKey(), wn = key ? D.windows[key] : win(), na = wn.pnl_na;
+  const seg = $("movSeg");
+  seg.innerHTML = MOVKEYS.filter((x) => x[0] === "page" || D.windows[x[0]]).map((x) => {
+    const page = x[0] === "page";
+    return '<button type="button" data-k="' + x[0] + '" aria-pressed="' + ((key || "page") === x[0]) + '" title="' +
+      esc(page ? "the window picked at the top: " + win().desc : D.windows[x[0]].desc) + '">' + esc(page ? win().label : x[1]) + "</button>";
+  }).join("");
+  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { movWin = b.dataset.k; store("imm.movWin", movWin); renderMovers(); if (isDay(W)) renderHeader(); }));
+  const what = "Markets whose mark-to-market moved the most" + (key ? "" : " in the window") + ", and where the rewards came from.";
+  const off = key && wn.mins && Math.abs(wn.end - wn.start - wn.mins * 60) > 180;
+  $("movNote").textContent = key ? wn.label + ": " + wn.desc + (off ? " (" + dur(wn.end - wn.start) + " between the nearest position snapshots)" : "") + ". " + what : what;
+  $("movNote").title = key && wn.mins ? "From one of the bot's 5-minute position snapshots to the newest: trading P&L is exact between the two, rewards are the modeled accrual of the cycles in between. The page rebuilds every 10 minutes." : "";
+  const rows = marketRows((m, w) => Math.abs(w.pnl || 0) >= 0.01, key);
   table($("movPnl"), [
     { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam) + " · " + esc(cause(r))), sort: (r) => r.t },
     { k: "pos", label: "Position", num: true, title: "at the start and end of the window", fmt: (r) => { const p1 = r.pos1 != null ? r.pos1 : 0; return (r.pos0 != null && Math.round(r.pos0) !== Math.round(p1) ? fmtNum(r.pos0) + " \u2192 " : "") + fmtNum(p1); }, sort: (r) => Math.abs(r.pos1 || 0) },
@@ -1727,7 +1748,7 @@ function renderMovers() {
     { k: "pnl", label: "Trading", num: true, fmt: (r) => "<b>" + (na ? "n/a" : money(r.pnl)) + "</b>", sort: (r) => r.pnl },
     { k: "rew", label: "Rewards", num: true, fmt: (r) => fmtUSD(r.rew) },
   ], rows, { presort: (a, b) => Math.abs(b.pnl) - Math.abs(a.pnl), limit: 15, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => openMarket(r.t), empty: "No position moved in this window." });
-  const rw = marketRows((m, w) => (w.rew || 0) >= 0.01);
+  const rw = marketRows((m, w) => (w.rew || 0) >= 0.01, key);
   table($("movRew"), [
     { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam) + (r.m.cur ? " · now " + fmtUSD(r.m.cur.est_day) + "/day" : " · not quoting now")), sort: (r) => r.t },
     { k: "rew", label: "Rewards", num: true, fmt: (r) => "<b>" + fmtUSD(r.rew) + "</b>" },
