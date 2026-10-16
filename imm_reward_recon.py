@@ -4,9 +4,13 @@ imm_reward_recon.py — reconcile incentive_mm's reward ESTIMATE against the
 liquidity incentives Kalshi actually CREDITED.
 
 Kalshi exposes no credits endpoint (verified 2026-08-03 across 8 paths), so the
-credit side comes from the account statement: open the Kalshi UI rewards page,
-select all, paste into a text file, and feed it to --statement. The paste is
-4 lines per credit:
+credit side comes from the account statement. Since 2026-10-15 the UI lists
+rewards in a paginated dialog with event titles, not tickers, so select-all +
+paste no longer works. Instead, open kalshi.com/incentives in Chrome and run
+run-logs/incentive-mm/report_tools/kalshi_rewards_export.js, or its bookmarklet
+(that folder's README.md has the steps). It reads every credit from the page's
+own state and downloads <M.D.YY>.txt (ET date) in the old paste's format, 4
+lines per credit, for --statement:
 
     Liquidity Incentive for event <EVENT_TICKER>
     <Mon D, YYYY>
@@ -56,7 +60,7 @@ calibration only once its program ended IMM_RECON_CREDIT_LAG_DAYS (default
 for the next statement.
 
 Usage:
-    python imm_reward_recon.py --statement "C:/.../incentive rewards.txt"
+    python imm_reward_recon.py --statement "C:/Users/jackd/Downloads/10.15.26.txt"
     python imm_reward_recon.py --report
     python imm_reward_recon.py --report --refresh-programs   # paid_out/periods
     python imm_reward_recon.py --report --since 2026-08-01T19:13
