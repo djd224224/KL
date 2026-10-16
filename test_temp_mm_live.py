@@ -1384,16 +1384,16 @@ class TestWx(unittest.TestCase):
 
 # --------------------------------------------------------------------------
 # Review fixes (2026-10-16 reviews of the live executor): one regression
-# test (or more) per finding, named f<N>_ after the review's order:
+# test (or more) per finding, named f<N>_ after the review's order (1-26):
 #  f1 positions blind spot, f2 resting WCL (policy, see test_temp_mm_policy),
 #  f3/f10 cancels that cannot reach / do not land, f4 ambiguous create,
 #  f5 urgent reprice failure + expiry on renewals only, f6 size cut with a
-#  price move, f7/f12 --cancel-all under the lock, f8/f23 dry HALT,
+#  price move, f7/f12 --cancel-all under the lock, f8/f22 dry HALT,
 #  f9 429 storm, f11 GetOrder is not scoped, f13 409 is not gone, f14 fill
 #  price, f15 missed fills on cancel 404 / reconnect, f16 downward moves not
 #  debounced, f17 guard-forced moves batched, f18 default model, f19 short
-#  history, f20 outage, f21 results after a restart, f22 client bounds,
-#  f24 poller cadence, f25 per-event state pruned, f26 settle vs close.
+#  history, f20 results after a restart, f21 outage, f23 per-event state
+#  pruned, f24 poller cadence, f25 client bounds, f26 settle vs close.
 # --------------------------------------------------------------------------
 
 class NoFillsEx(FakeExchange):
@@ -1596,7 +1596,7 @@ class TestReviewCancels(unittest.TestCase):
         self.assertEqual(code, L.EXIT_OK)
         self.assertEqual(state["cancels"], ["a1"])           # never a non-tmm order
 
-    def test_f8_dry_halt_never_pauses_live(self):
+    def test_f8_f22_dry_halt_never_pauses_live(self):
         dry, *_r, dclock = make_bot(live=False)
         started(dry, dclock)
         dry.halt(dclock.t, "test: a dry step-exception storm")
@@ -1708,7 +1708,7 @@ class TestReviewWrites(unittest.TestCase):
         step_until(bot, clock, M + 32.0)
         self.assertTrue(all(ex.orders[oid]["status"] == "canceled" for oid in mid))
 
-    def test_f20_outage_backs_off_without_halting(self):
+    def test_f21_outage_backs_off_without_halting(self):
         bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
         started(bot, clock)
         e503 = lambda: L.ApiError("HttpError(503 Service Unavailable)", 503, "")   # noqa: E731
@@ -1726,7 +1726,7 @@ class TestReviewWrites(unittest.TestCase):
         step_until(bot, clock, T0 + 135.0)
         self.assertIsNone(bot.unhealthy_since)               # recovered by itself
 
-    def test_f20_confirm_timeout_while_reads_fail_holds_instead_of_halting(self):
+    def test_f21_confirm_timeout_while_reads_fail_holds_instead_of_halting(self):
         bot, ex, feed, wx, fair, mails, clock = make_bot(live=True)
         started(bot, clock)
         self.assertEqual(len(bot.unconfirmed), 5)
@@ -1805,7 +1805,7 @@ class TestReviewFills(unittest.TestCase):
                                              "no_price_dollars": "0.61"}, "no"), 61)
         self.assertIsNone(L.fill_price_cents({}, "yes"))
 
-    def test_f21_restart_after_the_close_keeps_the_event_loss(self):
+    def test_f20_restart_after_the_close_keeps_the_event_loss(self):
         class Closing(FakeExchange):
             def markets(self, min_close_ts):
                 return [m for m in market_rows() if C.parse_iso(m["close_time"]) >= min_close_ts]
@@ -1964,7 +1964,7 @@ class TestReviewMisc(unittest.TestCase):
         self.assertTrue(bot2.first_confirmed)
         self.assertEqual(len(ex2.kinds("create")), 6)
 
-    def test_f22_client_bounds(self):
+    def test_f25_client_bounds(self):
         e = L.Exchange(5, write_timeout_s=3.0, read_timeout_s=10.0, read_attempts=2,
                        sync_read_timeout_s=3.0)
 
@@ -1976,7 +1976,7 @@ class TestReviewMisc(unittest.TestCase):
         self.assertEqual((r.http_timeout, r.get_attempts), ((5.0, 10.0), 2))
         self.assertEqual((s.http_timeout, s.get_attempts), ((2.0, 3.0), 1))
 
-    def test_f25_closed_event_state_is_pruned(self):
+    def test_f23_closed_event_state_is_pruned(self):
         bot, ex, feed, wx, fair, mails, clock = make_bot(live=False)
         started(bot, clock)
         clock.t = S - 0.5
