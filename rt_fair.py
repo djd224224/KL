@@ -27,10 +27,11 @@ kinder), and a later review's fresh rate scatters around the current one by
 far more than a binomial would (k).
 
 A film with fewer than MIN_REVIEWS reviews gets no price (the market's own
-prior stands; the gate quotes as before the feed). A jump in the review
-count -- the embargo lift, MIN_JUMP+ reviews and +50% since the last read --
-stamps the event `jump_at`: the gate stands aside HOLD minutes from then
-while the market re-prices. 17 of the 66 settled titles passed 10 reviews
+prior stands; the bot stands a film with 1 to MIN_REVIEWS - 1 of them aside,
+see incentive_mm.RT_FAIR_FEW_REVIEWS). A jump in the review count -- the
+embargo lift, MIN_JUMP+ reviews and +50% since the last read, or a film's
+FIRST reviews whatever their number -- stamps the event `jump_at`: the gate
+stands aside HOLD minutes from then while the market re-prices. 17 of the 66 settled titles passed 10 reviews
 more than 7 days before the close -- inside the bot's quoting window -- and
 their near-money strikes moved a median 14c (mean 20c) across that first
 batch, nearly always up (festival critics are kind): resting asks are what
@@ -332,7 +333,15 @@ def poll_every(days: float, n: int) -> int:
 
 
 def is_jump(old_n: Optional[int], new_n: int) -> bool:
-    return old_n is not None and new_n - old_n >= max(MIN_JUMP, 0.5 * old_n)
+    """MIN_JUMP+ new reviews and +50% since the last read, or the first
+    reviews at all (0 -> any): Klara and the Sun's first 8 (1 fresh) showed
+    at 20:28:22Z on 10/15, the book crashed at 20:30:01 and the bot, with no
+    jump and no price, kept quoting through it (Jack 2026-10-15: "ship 1 - 4")."""
+    if old_n is None:
+        return False                      # first read ever: no baseline
+    if old_n == 0 and new_n > 0:
+        return True
+    return new_n - old_n >= max(MIN_JUMP, 0.5 * old_n)
 
 
 def resolve_slug(ev: str, e: dict, film: dict, search: Callable) -> Optional[str]:

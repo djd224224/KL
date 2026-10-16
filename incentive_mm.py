@@ -1499,9 +1499,20 @@ QUIET_RAIN_PERIOD = os.environ.get("IMM_QUIET_RAIN_PERIOD", "1") == "1"
 # from 10/07 03:10Z (58a9f77) to 10/11, at x9 (family x3 x quiet x3), against
 # +$302 (+4.0c/ct) before; the day hours since were flat (-$6). The 30-day
 # losses are slow drift on single fills (-$538), not bursts (-$10).
+# THE FOUR STRAIT WEEKLIES JOIN IT (Jack 2026-10-15: "ship 1 - 4", item 1 of
+# the 10/14-15 pick-off review). Same shape as approval: at x6 overnight
+# (FAMILY_X2_1011 shipping x2 x quiet x3, 120-200-lot rungs) the 00-08 ET
+# fills of 10/14-15 lost $187 marked to date against $42 of reward, and the
+# 05-08 ET ones -5.9c/ct at 5 min on 1,838 contracts -- moves that stuck
+# (traders counting transits off live ship tracking; PortWatch itself
+# updates only on Tuesdays). The day hours netted about +$44. They keep the
+# family x2, the evening x1.5 and Saturday; KXHORMUZPEAK (graduate auto, x1)
+# is not on the list.
 # IMM_QUIET_HOURS_OFF_SERIES = exact series names ("" = none).
 QUIET_HOURS_OFF_SERIES = frozenset(s.strip() for s in os.environ.get(
-    "IMM_QUIET_HOURS_OFF_SERIES", "KXTRUMPAPPROVE,KXAPRPOTUS").split(",")
+    "IMM_QUIET_HOURS_OFF_SERIES",
+    "KXTRUMPAPPROVE,KXAPRPOTUS,"
+    "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY").split(",")
     if s.strip())
 
 
@@ -3516,10 +3527,76 @@ SWEEP_HOLDOUT = min(1.0, max(0.0, _env_float("IMM_SWEEP_HOLDOUT", 0.0)))
 # ("MENTION" = every mention family, the repo's usual test); empty = none.
 SWEEP_EXEMPT_WORDS = tuple(w.strip().upper() for w in os.environ.get(
     "IMM_SWEEP_EXEMPT", "MENTION").split(",") if w.strip())
+# LINKED SERIES AND PER-SERIES HOLDS (Jack 2026-10-15: "ship 1 - 4", item 4
+# of the 10/14-15 pick-off review). KXTRUMPAPPROVE and KXAPRPOTUS settle on
+# the SAME RealClearPolitics approval average, so a poll RCP folds in
+# re-prices every open event of both at once. On 10/14 a sweep at 19:41:38Z
+# pulled KXTRUMPAPPROVE-26OCT15 alone for 120s; KXAPRPOTUS-26OCT16 was swept
+# 32s later on its own trip, the bot re-quoted both ladders at 19:44:09-43Z
+# and was swept again at 19:44:55Z, and the toxic halts only came at
+# 19:46:54Z. Fills inside 10 minutes of a twin's trip lost $61 (marked to
+# date) over 10/14-15. So a trip in a SWEEP_LINKED_GROUPS series holds EVERY
+# event of every series in its group -- one hold for the group, open events
+# with no order of ours included -- and SWEEP_HOLD_BY_SERIES sets its length
+# (the longest entry in the group, never under SWEEP_HOLD_SECS).
+# IMM_SWEEP_LINKED: groups split by ';', the series in a group by ','
+# ("" = none). IMM_SWEEP_HOLD_BY_SERIES: "SERIES:secs,..." ("" = none).
+
+
+def _parse_sweep_groups(raw: str) -> Tuple[Tuple[str, ...], ...]:
+    groups = []
+    for g in (raw or "").split(";"):
+        ss = tuple(sorted({s.strip() for s in g.split(",") if s.strip()}))
+        if len(ss) >= 2:
+            groups.append(ss)
+    return tuple(groups)
+
+
+def _parse_hold_by_series(raw: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for pair in (raw or "").split(","):
+        s, _, v = pair.partition(":")
+        try:
+            secs = float(v)
+        except ValueError:
+            continue
+        if s.strip() and secs >= 0:
+            out[s.strip()] = secs
+    return out
+
+
+SWEEP_LINKED_GROUPS = _parse_sweep_groups(
+    os.environ.get("IMM_SWEEP_LINKED", "KXTRUMPAPPROVE,KXAPRPOTUS"))
+SWEEP_HOLD_BY_SERIES = _parse_hold_by_series(
+    os.environ.get("IMM_SWEEP_HOLD_BY_SERIES", "KXTRUMPAPPROVE:600,KXAPRPOTUS:600"))
 
 
 def sweep_exempt(series: str) -> bool:
     return any(w in series for w in SWEEP_EXEMPT_WORDS)
+
+
+def sweep_linked_series(series: str) -> Tuple[str, ...]:
+    """The series one trip in `series` holds: its SWEEP_LINKED_GROUPS group,
+    else just itself."""
+    for g in SWEEP_LINKED_GROUPS:
+        if series in g:
+            return g
+    return (series,)
+
+
+def sweep_hold_key(event: str) -> str:
+    """What a trip's hold is keyed on: the event, or for a linked series its
+    whole group (so the group's other events, quoted or not, hold too)."""
+    g = sweep_linked_series(series_of(event))
+    return event if len(g) < 2 else "group:" + ",".join(g)
+
+
+def sweep_hold_secs(series: str) -> float:
+    """A trip's hold in `series`: the longest SWEEP_HOLD_BY_SERIES entry in its
+    linked group, never under SWEEP_HOLD_SECS."""
+    return max([SWEEP_HOLD_SECS] + [SWEEP_HOLD_BY_SERIES[s]
+                                    for s in sweep_linked_series(series)
+                                    if s in SWEEP_HOLD_BY_SERIES])
 
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
@@ -9070,6 +9147,8 @@ _CONFIG_CODE_KNOBS = (
     # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
     "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
     "RT_FAIR_CAP", "RT_FAIR_BAND",
+    # ...and its first-reviews stand-aside (2026-10-15)
+    "RT_FAIR_FEW_REVIEWS",
     # the Carbon Arc family and Ramp per-event caps, 0 since 2026-10-01
     "CA_FAMILY_EVENT_TOP_N", "RAMP_EVENT_TOP_N",
     # GasBuddy state-gas gate (2026-09-27); the model's knobs ride in the
@@ -9184,6 +9263,8 @@ _CONFIG_CODE_KNOBS = (
     # ...the in-cycle check and the event sweep breaker (2026-10-04)
     "WS_CHECK_IN_CYCLE", "WS_TICK_SECS", "SWEEP_BREAKER", "SWEEP_HOLD_SECS",
     "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
+    # ...its linked series and per-series holds (2026-10-15)
+    "SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
     "WS_FAST_MIN_GAP_C", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
     # hang watchdog: wedge stacks, its handoff, the main-thread network
@@ -11171,6 +11252,14 @@ def rain_wknd_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # IMM_RT_FAIR_BAND=1 adds the band (a touch more than RT_FAIR_TOL_CENTS
 # through the model caps that side; the capped side rests only while it
 # earns).
+# FIRST REVIEWS (Jack 2026-10-15: "ship 1 - 4", item 2 of the 10/14-15
+# pick-off review). KXRT-KLA (Klara and the Sun): the feed read its first 8
+# reviews (1 fresh) at 20:28:22Z, the book crashed at 20:30:01Z, and the bot
+# kept quoting -- 8 < MIN_JUMP was no jump, and under the file's min_reviews
+# there is no price -- for -$138 of the -$219 its fills lost. rt_fair.is_jump
+# now counts a film's first reviews (0 -> any) as a jump, and a film read
+# with 1 to min_reviews - 1 reviews stands aside (RT_FAIR_FEW_REVIEWS) until
+# it has enough to price. IMM_RT_FAIR_FEW_REVIEWS=0 restores the fail-open.
 RT_FAIR_ENABLE = os.environ.get("IMM_RT_FAIR_ENABLE", "1") == "1"
 RT_FAIR_SERIES = frozenset(("KXRT",))
 RT_FAIR_TOL_CENTS = _env_int("IMM_RT_FAIR_TOL_CENTS", 15)
@@ -11179,9 +11268,12 @@ RT_FAIR_HOLD_MIN = _env_int("IMM_RT_FAIR_HOLD_MIN", 30)
 RT_FAIR_REFRESH_SECS = _env_int("IMM_RT_FAIR_REFRESH_SECS", 60)
 RT_FAIR_CAP = os.environ.get("IMM_RT_FAIR_CAP", "1") == "1"
 RT_FAIR_BAND = os.environ.get("IMM_RT_FAIR_BAND", "0") == "1"
+RT_FAIR_FEW_REVIEWS = os.environ.get("IMM_RT_FAIR_FEW_REVIEWS", "1") == "1"
+RT_FAIR_MIN_REVIEWS_DEFAULT = 10      # rt_fair.MIN_REVIEWS, when the file has none
 RT_FAIR_FILE = os.environ.get(
     "IMM_RT_FAIR_FILE", os.path.join(STATUS_DIR, "rt_fair.json"))
-_rt_fair_state: dict = {"mtime": 0.0, "markets": {}}
+_rt_fair_state: dict = {"mtime": 0.0, "markets": {},
+                        "min_reviews": RT_FAIR_MIN_REVIEWS_DEFAULT}
 
 
 def rt_fair_series(series: str) -> bool:
@@ -11219,6 +11311,11 @@ def load_rt_fair() -> int:
         markets[str(t)] = {"p": p, "event": ev, "n": n, "ts": ts.timestamp(),
                            "jump_ts": jt.timestamp() if jt else None}
     _rt_fair_state["markets"] = markets
+    try:   # the feed's own pricing bar (rt_fair.MIN_REVIEWS), for the few-reviews hold
+        mr = int((data.get("model") or {}).get("min_reviews") or 0)
+    except (TypeError, ValueError, AttributeError):
+        mr = 0
+    _rt_fair_state["min_reviews"] = mr if mr > 0 else RT_FAIR_MIN_REVIEWS_DEFAULT
     return len(markets)
 
 
@@ -11226,7 +11323,8 @@ def rt_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                  ext_ask: Optional[float]
                  ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
     """('', {}, None) to quote as before the feed; ('', inputs, caps) when a
-    side is capped; (why, inputs, None) to stand aside (a review jump)."""
+    side is capped; (why, inputs, None) to stand aside (a review jump, or a
+    film with its first few reviews and no price yet)."""
     e = _rt_fair_state["markets"].get(ticker)
     if e is None or now_ts - e["ts"] > RT_FAIR_TTL_MIN * 60:
         return "", {}, None
@@ -11235,6 +11333,10 @@ def rt_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"RT review count jumped to {e['n']} -- out {left:.0f} more min "
                 f"while the market re-prices",
                 {"reason": "review_jump", "n": e["n"]}, None)
+    need = _rt_fair_state.get("min_reviews") or RT_FAIR_MIN_REVIEWS_DEFAULT
+    if RT_FAIR_FEW_REVIEWS and 0 < e["n"] < need:
+        return (f"RT has only {e['n']} review(s) -- out until it has {need} "
+                f"and a price", {"reason": "few_reviews", "n": e["n"]}, None)
     if e["p"] is None or not RT_FAIR_BAND:
         return "", {}, None
     return fair_band_verdict(e["p"] * 100.0, ext_bid, ext_ask, RT_FAIR_TOL_CENTS,
@@ -14791,6 +14893,50 @@ def release_guard_cutoff(year: int, month: int, day: int) -> datetime:
     return ET.localize(datetime(y, mo, day)).astimezone(timezone.utc)
 
 
+# SAME-DAY SECOND EVENT (Jack 2026-10-15: "ship 1 - 4", item 3 of the 10/14-15
+# pick-off review). Trump repeats his stump speech, so once his first event of
+# the day is under way, a later event's words are no longer a forecast.
+# KXTRUMPMENTIONB-26OCT14 (the Montana rally, 20:15 ET on file) was quoted
+# after KXTRUMPMENTION-26OCT14 (Arizona, 15:45 ET) had ended: on the words he
+# had just said in Arizona, 503 contracts of ours lost $134 at settlement; on
+# the words he had not, $7. So an event of a SAME_DAY_SPEAKER_PREFIXES series
+# with a start on file (EVENT_START_OVERRIDES: the WH / RNC / hand-set times)
+# is out from the earliest start, less OVERRIDE_BUFFER_MIN, of the group's
+# other events on the same ET day that start before it. An event with no
+# start on file keeps its rules: a ticker date can be a listing date
+# (ticker_date_is_listing_date), so it cannot place the event on a day.
+# IMM_SAME_DAY_SPEAKER_PREFIXES="" turns it off.
+SAME_DAY_SPEAKER_PREFIXES: Tuple[str, ...] = tuple(
+    p.strip() for p in os.environ.get(
+        "IMM_SAME_DAY_SPEAKER_PREFIXES", "KXTRUMPMENTION").split(",") if p.strip())
+_same_day_noted: Dict[str, str] = {}
+
+
+def same_day_speaker(series: str) -> Optional[str]:
+    """The SAME_DAY_SPEAKER_PREFIXES group a series belongs to, else None."""
+    return next((p for p in SAME_DAY_SPEAKER_PREFIXES if series.startswith(p)), None)
+
+
+def same_day_first_start(event_ticker: str) -> Optional[Tuple[datetime, str]]:
+    """(start, event) of the EARLIEST other event of event_ticker's speaker
+    group whose start on file falls on the same ET day and before its own,
+    else None. Both starts come from EVENT_START_OVERRIDES."""
+    grp = same_day_speaker(series_of(event_ticker))
+    own = EVENT_START_OVERRIDES.get(event_ticker)
+    if grp is None or own is None:
+        return None
+    day = own.astimezone(ET).date()
+    best: Optional[Tuple[datetime, str]] = None
+    for ev, st in EVENT_START_OVERRIDES.items():
+        if ev == event_ticker or st is None or st >= own \
+                or same_day_speaker(series_of(ev)) != grp \
+                or st.astimezone(ET).date() != day:
+            continue
+        if best is None or st < best[0]:
+            best = (st, ev)
+    return best
+
+
 def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                                     cutoff: Optional[datetime],
                                     close_time: Optional[datetime] = None,
@@ -14842,6 +14988,21 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                         f"Big Sky stop needs the month in {event_ticker} "
                         f"(<YYMON>) -- standing it down (fail closed)")
         cutoff = stop if cutoff is None else min(cutoff, stop)
+    first = same_day_first_start(event_ticker) if same_day_speaker(series) else None
+    if first is not None:
+        # SAME-DAY SECOND EVENT (2026-10-15): out once the speaker's earlier
+        # event of the day starts; logged once per (event, earlier event)
+        early = first[0] - timedelta(minutes=OVERRIDE_BUFFER_MIN)
+        note = f"{first[1]}@{first[0].isoformat()}"
+        if _same_day_noted.get(event_ticker) != note:
+            _same_day_noted[event_ticker] = note
+            log(f"[IMM] same-day second event: {event_ticker} "
+                f"(start {EVENT_START_OVERRIDES[event_ticker].astimezone(ET):%m-%d %H:%M} ET) "
+                f"is out from {early.astimezone(ET):%m-%d %H:%M} ET, "
+                f"{OVERRIDE_BUFFER_MIN} min before {first[1]} starts "
+                f"({first[0].astimezone(ET):%H:%M} ET) -- the speaker's first "
+                f"event of the day reveals the second's words")
+        cutoff = early if cutoff is None else min(cutoff, early)
     if mention_auto_series(series) and cutoff is None \
             and event_ticker not in EVENT_START_OVERRIDES:
         # MENTION AUTO WITH NO EVENT WINDOW (2026-10-13): no start on file and
@@ -19204,8 +19365,10 @@ class IncentiveMarketMaker:
 
     def sweep_held(self, event: str, now_ts: float) -> bool:
         """True while a LIVE sweep-breaker trip holds `event` out of quoting
-        (a control trip, SWEEP_HOLDOUT, never does)."""
-        return SWEEP_BREAKER == "on" and self._sweep_hold.get(event, 0.0) > now_ts
+        (a control trip, SWEEP_HOLDOUT, never does). A linked series' events
+        share their group's hold (sweep_hold_key)."""
+        return SWEEP_BREAKER == "on" and \
+            self._sweep_hold.get(sweep_hold_key(event), 0.0) > now_ts
 
     def _sweep_note_fill(self, body: dict, now_ts: float) -> None:
         """One of our WS fills. Every maker fill is logged (for the next view
@@ -19268,12 +19431,21 @@ class IncentiveMarketMaker:
             if rem <= 0 or n + 1e-6 < rem or n < SWEEP_MIN_CT:
                 return                                  # partial: no sweep
             ev = self._event_of(t)
-            if self._sweep_until.get(ev, 0.0) > now_ts:
+            # a linked series (SWEEP_LINKED_GROUPS) trips, holds and pulls its
+            # whole group, for its SWEEP_HOLD_BY_SERIES length
+            group = sweep_linked_series(series_of(t))
+            key = sweep_hold_key(ev)
+            hold_s = sweep_hold_secs(series_of(t))
+
+            def _in_trip(tk: str) -> bool:
+                return series_of(tk) in group if len(group) > 1 \
+                    else self._event_of(tk) == ev
+            if self._sweep_until.get(key, 0.0) > now_ts:
                 return                                  # already tripped
             for d in (self._sweep_until, self._sweep_hold):
                 for e_old in [e for e, u in d.items() if u < now_ts - 3600]:
                     del d[e_old]
-            self._sweep_until[ev] = now_ts + SWEEP_HOLD_SECS
+            self._sweep_until[key] = now_ts + hold_s
             if sweep_exempt(series_of(t)):
                 # mention families (SWEEP_EXEMPT_WORDS): logged, nothing pulled
                 self._sweep["exempt"] += 1
@@ -19281,7 +19453,7 @@ class IncentiveMarketMaker:
                     "ev": "trip", "ts": round(now_ts, 3), "mode": "exempt",
                     "event": ev, "ticker": t, "order_id": oid, "side": side,
                     "px": px, "count": n, "rem_before": rem, "fill_ts": fts,
-                    "trade_id": body.get("trade_id"), "hold_s": SWEEP_HOLD_SECS,
+                    "trade_id": body.get("trade_id"), "hold_s": hold_s,
                     "pull": []})
                 log(f"{self.tag} sweep breaker (exempt): {t} "
                     f"{side.upper()} @ {px:g}c filled out ({n:g}) -> mention "
@@ -19293,12 +19465,12 @@ class IncentiveMarketMaker:
                 not (SWEEP_HOLDOUT > 0 and self._ws_rng.random() < SWEEP_HOLDOUT)
             mode = "on" if live else ("control" if SWEEP_BREAKER == "on" else "dry")
             if live:
-                self._sweep_hold[ev] = now_ts + SWEEP_HOLD_SECS
+                self._sweep_hold[key] = now_ts + hold_s
                 self._sweep["trips_live"] += 1
             elif SWEEP_BREAKER == "on":
                 self._sweep["trips_control"] += 1
             pull = [(tk, o) for tk, lst in self._resting_view.items()
-                    if self._event_of(tk) == ev for o in lst
+                    if _in_trip(tk) for o in lst
                     if o["order_id"] != oid and o["rem"] > 0]
             # ...and the event's orders placed since the last rebuild, which
             # only the ledger holds yet
@@ -19307,7 +19479,7 @@ class IncentiveMarketMaker:
                 l_t = str(led.get("ticker") or "")
                 l_rem = float(led.get("remaining_count") or 0.0)
                 if l_oid in in_view or l_oid in self._cycle_cancelled or \
-                        l_rem <= 0 or self._event_of(l_t) != ev:
+                        l_rem <= 0 or not l_t or not _in_trip(l_t):
                     continue
                 if any(o["order_id"] == l_oid for o in self._resting_view.get(l_t, ())):
                     continue
@@ -19317,17 +19489,25 @@ class IncentiveMarketMaker:
                                    "px": float(l_px) if l_px is not None
                                    else float(led.get("yes_price") or 0),
                                    "rem": l_rem}))
-            self._sink("ws_sweep", {
+            rec = {
                 "ev": "trip", "ts": round(now_ts, 3), "mode": mode,
                 "event": ev, "ticker": t, "order_id": oid, "side": side,
                 "px": px, "count": n, "rem_before": rem, "fill_ts": fts,
-                "trade_id": body.get("trade_id"), "hold_s": SWEEP_HOLD_SECS,
+                "trade_id": body.get("trade_id"), "hold_s": hold_s,
                 "pull": [[tk, o["order_id"], o["side"], o["px"], o["rem"]]
-                         for tk, o in pull]})
+                         for tk, o in pull]}
+            if len(group) > 1:
+                rec["linked"] = list(group)
+            self._sink("ws_sweep", rec)
+            others = sorted({self._event_of(tk) for tk, _o in pull} - {ev})
             log(f"{self.tag} sweep breaker ({mode}): {t} "
                 f"{side.upper()} @ {px:g}c filled out ({n:g}) -> "
                 f"{'pulling' if live else 'would pull'} "
-                f"{len(pull)} order(s) in {ev} for {SWEEP_HOLD_SECS:.0f}s")
+                f"{len(pull)} order(s) in {ev}"
+                + (f" + linked {'/'.join(group)}"
+                   + (f" ({', '.join(others)})" if others else "")
+                   if len(group) > 1 else "")
+                + f" for {hold_s:.0f}s")
             if not live:
                 return
             for _tk, o in pull:
@@ -25848,6 +26028,8 @@ class IncentiveMarketMaker:
             now = time.time()
             out["sweep"] = dict(self._sweep, mode=SWEEP_BREAKER,
                                 hold_s=SWEEP_HOLD_SECS, holdout=SWEEP_HOLDOUT,
+                                hold_by_series=dict(SWEEP_HOLD_BY_SERIES),
+                                linked=[list(g) for g in SWEEP_LINKED_GROUPS],
                                 held_now=sum(1 for u in self._sweep_hold.values()
                                              if u > now))
             # cycle timing (2026-10-04): the REST book reads IMM_WS=on would
@@ -27514,6 +27696,12 @@ class IncentiveMarketMaker:
                       f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
                "on": f" -- a maker fill that clears our order pulls every quote "
                      f"we have in its event for {SWEEP_HOLD_SECS:.0f}s"
+                     + "".join(f"; linked (2026-10-15): {'+'.join(g)} trip and hold "
+                               f"as one, every event, for {sweep_hold_secs(g[0]):.0f}s"
+                               for g in SWEEP_LINKED_GROUPS)
+                     + "".join(f"; {s} holds {v:.0f}s"
+                               for s, v in SWEEP_HOLD_BY_SERIES.items()
+                               if not any(s in g for g in SWEEP_LINKED_GROUPS))
                      + (f"; {SWEEP_HOLDOUT:.0%} of trips stay a dry CONTROL "
                         f"(the monitoring)" if SWEEP_HOLDOUT > 0 else "")
                      + f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",

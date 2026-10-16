@@ -104,7 +104,12 @@ class TestPolling(unittest.TestCase):
     def test_jump(self):
         self.assertFalse(r.is_jump(None, 50))             # first read ever
         self.assertTrue(r.is_jump(0, r.MIN_JUMP))
-        self.assertFalse(r.is_jump(0, r.MIN_JUMP - 1))
+        # a film's first reviews are a jump whatever their number (Jack
+        # 2026-10-15: "ship 1 - 4" -- KXRT-KLA's first 8 crashed the book)
+        self.assertTrue(r.is_jump(0, r.MIN_JUMP - 1))
+        self.assertTrue(r.is_jump(0, 1))
+        self.assertFalse(r.is_jump(0, 0))
+        self.assertFalse(r.is_jump(8, 9))                 # later trickles: the old rule
         self.assertTrue(r.is_jump(40, 80))
         self.assertFalse(r.is_jump(40, 55))               # +15 but not +50%
 
@@ -181,6 +186,21 @@ class TestWrite(unittest.TestCase):
                          (later.isoformat(), 0, later.isoformat()))
         self.assertEqual(d["markets"]["KXRT-AVE-80"]["jump_at"], later.isoformat())
         self.assertIsNotNone(d["markets"]["KXRT-AVE-80"]["p"])
+
+    def test_a_first_small_batch_is_stamped_a_jump(self):
+        """0 -> 8 reviews (fewer than MIN_JUMP): jump_at and first_reviews_at
+        are stamped, the strike stays unpriced with its count for the bot."""
+        self.write(self.NOW)
+        self.counts["avengers_doomsday"] = (1, 8)
+        later = self.NOW + timedelta(seconds=r.POLL_FAR_SECS)
+        self.write(later)
+        d = self.load()
+        f = d["films"]["KXRT-AVE"]
+        self.assertEqual((f["jump_at"], f["jump_from"], f["first_reviews_at"]),
+                         (later.isoformat(), 0, later.isoformat()))
+        m = d["markets"]["KXRT-AVE-80"]
+        self.assertEqual((m["p"], m["n"], m["jump_at"]), (None, 8, later.isoformat()))
+        self.assertEqual(d["model"]["min_reviews"], r.MIN_REVIEWS)
 
     def test_a_failed_read_keeps_the_last_counts(self):
         self.write(self.NOW)

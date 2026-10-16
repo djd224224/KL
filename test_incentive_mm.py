@@ -10363,11 +10363,35 @@ class TestQuietDailyMembers(unittest.TestCase):
         return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
 
     def test_code_defaults(self):
-        # KXTRUMPAPPROVE left the keep-list on 2026-10-11 for the off-list
+        # KXTRUMPAPPROVE left the keep-list on 2026-10-11 for the off-list;
+        # the four strait weeklies joined the off-list on 2026-10-15
         self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT, frozenset({"KXTRUMPMENTIONB"}))
         self.assertEqual(_QUIET_HOURS_OFF_CODE_DEFAULT,
-                         frozenset({"KXTRUMPAPPROVE", "KXAPRPOTUS"}))
+                         frozenset({"KXTRUMPAPPROVE", "KXAPRPOTUS",
+                                    "KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY",
+                                    "KXHORMUZWEEKLY", "KXPANAMAWEEKLY"}))
         self.assertTrue(_QUIET_RAIN_PERIOD_CODE_DEFAULT)
+
+    def test_strait_weeklies_never_take_the_quiet_hours(self):
+        """Jack 2026-10-15: "ship 1 - 4" (item 1) -- the four strait weeklies
+        rest without the 0-8 ET x3 (their 05-08 ET fills were picked off at
+        x6); they keep the evening x1.5 and Saturday, and KXHORMUZPEAK,
+        not on the list, keeps the quiet hours."""
+        imm.QUIET_HOURS_OFF_SERIES = _QUIET_HOURS_OFF_CODE_DEFAULT
+        c = "KXTRUMPMENTIONB"
+        for s in ("KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY", "KXHORMUZWEEKLY",
+                  "KXPANAMAWEEKLY"):
+            self.assertFalse(imm.is_daily_series(s), s)
+            for h in (0, 5, 7):
+                self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 15, h)), 1.0,
+                                 (s, h))
+            self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 15, 19)), 1.5, s)
+            sat_noon = self.et(2026, 10, 17, 12)
+            self.assertEqual(imm.hour_size_mult(s, sat_noon),
+                             imm.hour_size_mult(c, sat_noon), s)      # Saturday kept
+        self.assertEqual(imm.hour_size_mult("KXHORMUZPEAK", self.et(2026, 10, 15, 5)),
+                         imm.hour_size_mult(c, self.et(2026, 10, 15, 5)))
+        self.assertEqual(imm.hour_size_mult(c, self.et(2026, 10, 15, 5)), 3.0)
 
     def test_approval_never_takes_the_quiet_hours(self):
         """Jack 2026-10-11: "drop overnight x3 on approval" -- daily
@@ -12417,14 +12441,16 @@ class TestRtFairGate(TestCpiFairGate):
         super().tearDown()
         imm.RT_FAIR_CAP = True
 
-    def _write(self, p=0.5, age_secs=0, n=40, jump_age_secs=None):
+    def _write(self, p=0.5, age_secs=0, n=40, jump_age_secs=None, model=None):
         at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
         jump = (None if jump_age_secs is None else
                 (datetime.now(timezone.utc) - timedelta(seconds=jump_age_secs)).isoformat())
+        doc = {"markets": {self.T: {"event": self.EV, "p": p, "n": n,
+                                    "jump_at": jump, "fetched_at": at.isoformat()}}}
+        if model is not None:
+            doc["model"] = model
         with open(imm.RT_FAIR_FILE, "w", encoding="utf-8") as f:
-            json.dump({"markets": {self.T: {"event": self.EV, "p": p, "n": n,
-                                            "jump_at": jump,
-                                            "fetched_at": at.isoformat()}}}, f)
+            json.dump(doc, f)
         os.utime(imm.RT_FAIR_FILE, (time.time(), time.time() + self._bump))
         TestCpiFairGate._bump += 1
         return imm.load_rt_fair()
@@ -12451,8 +12477,12 @@ class TestRtFairGate(TestCpiFairGate):
         g = imm.rt_fair_gate
         open_ = ("", {}, None)
         self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # no read
-        self._write(p=None, n=3)
-        self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # too few reviews
+        self._write(p=None, n=0)
+        self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # no reviews yet
+        self._write(p=None, n=3)                                          # too few: aside
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((inp["reason"], inp["n"], caps), ("few_reviews", 3, None))
+        self.assertIn("only 3 review(s)", why)
         self._write(p=0.30, age_secs=imm.RT_FAIR_TTL_MIN * 60 + 5)
         self.assertEqual(g(self.T, time.time(), 49, 51), open_)          # stale
         # a review jump 5 minutes ago: out for the hold, whatever the price
@@ -12479,6 +12509,30 @@ class TestRtFairGate(TestCpiFairGate):
             self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
             self._write(p=0.30, n=60, jump_age_secs=60)
             self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "review_jump")
+
+    def test_first_reviews_stand_the_film_aside_until_it_is_priced(self):
+        """Jack 2026-10-15: "ship 1 - 4" (item 2). KXRT-KLA: the first 8 reviews
+        (1 fresh) read at 20:28:22Z, the book crashed at 20:30:01Z, the bot
+        quoted on. The first reviews are a jump (rt_fair.is_jump) -- out for
+        the hold -- and a film read with 1 to min_reviews - 1 reviews stays
+        out past it, band on or off; the bar is the file's own min_reviews."""
+        g = imm.rt_fair_gate
+        self.assertTrue(imm.RT_FAIR_FEW_REVIEWS)                    # shipped on
+        self.assertIn("RT_FAIR_FEW_REVIEWS", imm._CONFIG_CODE_KNOBS)
+        self._write(p=None, n=8, jump_age_secs=100)                 # the first batch
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "review_jump")
+        self._write(p=None, n=8, jump_age_secs=imm.RT_FAIR_HOLD_MIN * 60 + 5)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "few_reviews")
+        self._write(p=0.40, n=10)                                   # priced: back
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(p=None, n=6, model={"min_reviews": 5})          # the file's bar
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(p=None, n=4, model={"min_reviews": 5})
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "few_reviews")
+        with mock.patch.object(imm, "RT_FAIR_FEW_REVIEWS", False):  # the old fail-open
+            self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(p=None, n=4, age_secs=imm.RT_FAIR_TTL_MIN * 60 + 5)
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))   # stale: open
 
     def test_quotes_through_the_gate(self):
         bot = self._bot()
@@ -28325,6 +28379,160 @@ class TestPresRunNoSideOnly(unittest.TestCase):
             bot.run_cycle()
             self.assertEqual({o["book_side"] for o in self._orders(bot)},
                              {"bid", "ask"})
+
+
+class TestSameDaySecondEvent(unittest.TestCase):
+    """Jack 2026-10-15: "ship 1 - 4" (item 3). KXTRUMPMENTIONB-26OCT14 (the
+    Montana rally, 20:15 ET on file) was quoted after KXTRUMPMENTION-26OCT14
+    (Arizona, 15:45 ET) ended and lost $134 on the words he had just said
+    there. A Trump-mention event with a start on file is out OVERRIDE_BUFFER_MIN
+    before the speaker's earlier event of the same ET day starts."""
+
+    A, B = "KXTRUMPMENTION-26OCT14", "KXTRUMPMENTIONB-26OCT14"
+
+    @staticmethod
+    def et(mo, d, h, mi=0):
+        return imm.ET.localize(datetime(2026, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def setUp(self):
+        p = mock.patch.dict(imm.EVENT_START_OVERRIDES, {
+            self.A: self.et(10, 14, 15, 45),
+            self.B: self.et(10, 14, 20, 15),
+            "KXTRUMPMENTION-26OCT16": self.et(10, 16, 15, 0),        # another day
+            "KXTRUMPMENTION-26SEP10": self.et(9, 10, 19, 0),         # same start
+            "KXTRUMPMENTION-26SEP10B": self.et(9, 10, 19, 0),
+            "KXWORLDNEWSMENTION-26OCT14": self.et(10, 14, 12, 0)},   # not the group
+            clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        imm._same_day_noted.clear()
+        self.addCleanup(imm._same_day_noted.clear)
+
+    def test_the_later_event_is_out_from_the_earlier_start(self):
+        self.assertEqual(imm.SAME_DAY_SPEAKER_PREFIXES, ("KXTRUMPMENTION",))
+        self.assertEqual(imm.same_day_first_start(self.B), (self.et(10, 14, 15, 45), self.A))
+        self.assertIsNone(imm.same_day_first_start(self.A))           # the first one
+        self.assertIsNone(imm.same_day_first_start("KXTRUMPMENTION-26OCT16"))
+        self.assertIsNone(imm.same_day_first_start("KXTRUMPMENTION-26SEP10B"))
+        self.assertIsNone(imm.same_day_first_start("KXTRUMPMENTIONB-26OCT15"))  # no start
+        own = self.et(10, 14, 20, 5)                       # its own start - 10 min
+        with mock.patch.object(imm, "SAME_DAY_SPEAKER_PREFIXES", ()):
+            base = imm.apply_series_cutoff_adjustments("KXTRUMPMENTIONB", self.B, own)
+            self.assertIsNone(imm.same_day_first_start(self.B))
+        got = imm.apply_series_cutoff_adjustments("KXTRUMPMENTIONB", self.B, own)
+        early = self.et(10, 14, 15, 45) - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN)
+        self.assertEqual(got, min(base, early))
+        self.assertEqual(got, early)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTRUMPMENTIONB", self.B, None), early)       # no cutoff yet: this one
+        # the first event and the other speakers' events keep theirs
+        first = self.et(10, 14, 15, 35)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXTRUMPMENTION", self.A, first), first)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXWORLDNEWSMENTION", "KXWORLDNEWSMENTION-26OCT14", own), own)
+
+    def test_the_earlier_event_can_be_the_b_series(self):
+        # 10/07: KXTRUMPMENTIONB 13:00 ET, KXTRUMPMENTION 19:00 ET
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {
+                "KXTRUMPMENTIONB-26OCT07": self.et(10, 7, 13, 0),
+                "KXTRUMPMENTION-26OCT07": self.et(10, 7, 19, 0)}):
+            self.assertEqual(imm.same_day_first_start("KXTRUMPMENTION-26OCT07"),
+                             (self.et(10, 7, 13, 0), "KXTRUMPMENTIONB-26OCT07"))
+            self.assertIsNone(imm.same_day_first_start("KXTRUMPMENTIONB-26OCT07"))
+
+    def test_logged_once_per_pairing(self):
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            for _ in range(3):
+                imm.apply_series_cutoff_adjustments("KXTRUMPMENTIONB", self.B, None)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("same-day second event: KXTRUMPMENTIONB-26OCT14", lines[0])
+        self.assertIn("before KXTRUMPMENTION-26OCT14 starts", lines[0])
+
+
+class TestSweepLinkedSeries(unittest.TestCase):
+    """Jack 2026-10-15: "ship 1 - 4" (item 4). KXTRUMPAPPROVE and KXAPRPOTUS
+    settle on the same RCP average: a sweep on either holds EVERY event of
+    both, quoted or not, for SWEEP_HOLD_BY_SERIES (600s)."""
+
+    def test_defaults_and_helpers(self):
+        self.assertEqual(imm.SWEEP_LINKED_GROUPS, (("KXAPRPOTUS", "KXTRUMPAPPROVE"),))
+        self.assertEqual(imm.SWEEP_HOLD_BY_SERIES,
+                         {"KXTRUMPAPPROVE": 600.0, "KXAPRPOTUS": 600.0})
+        self.assertEqual(imm.sweep_linked_series("KXAPRPOTUS"),
+                         ("KXAPRPOTUS", "KXTRUMPAPPROVE"))
+        self.assertEqual(imm.sweep_linked_series("KXEVT"), ("KXEVT",))
+        key = imm.sweep_hold_key("KXTRUMPAPPROVE-26OCT15")
+        self.assertEqual(key, imm.sweep_hold_key("KXAPRPOTUS-26OCT16"))
+        self.assertEqual(imm.sweep_hold_key("KXEVT-26OCT05"), "KXEVT-26OCT05")
+        with mock.patch.object(imm, "SWEEP_HOLD_SECS", 120.0):
+            self.assertEqual(imm.sweep_hold_secs("KXAPRPOTUS"), 600.0)
+            self.assertEqual(imm.sweep_hold_secs("KXEVT"), 120.0)
+        with mock.patch.object(imm, "SWEEP_HOLD_SECS", 900.0):
+            self.assertEqual(imm.sweep_hold_secs("KXTRUMPAPPROVE"), 900.0)  # never under
+        for k in ("SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_parsers(self):
+        self.assertEqual(imm._parse_sweep_groups(""), ())
+        self.assertEqual(imm._parse_sweep_groups("B, A ;C;D,E,D"),
+                         (("A", "B"), ("D", "E")))                  # singles dropped
+        self.assertEqual(imm._parse_hold_by_series("A:600, B:x,C:-1,:5,D:90"),
+                         {"A": 600.0, "D": 90.0})
+
+
+class TestSweepBreakerLinked(TestSweepBreaker):
+    """The breaker fixture with the RCP twins resting beside KXEVT."""
+    AP, WP, AP2 = "KXTRUMPAPPROVE-26OCT15", "KXAPRPOTUS-26OCT16", "KXTRUMPAPPROVE-26OCT16"
+
+    def setUp(self):
+        super().setUp()
+
+        def o(oid, side, px, rem):
+            return {"order_id": oid, "side": side, "px": px, "rem": rem,
+                    "placed": self.now - 100.0, "pad": False}
+        self.bot._resting_view.update({
+            self.AP + "-E38.6": [o("a1", "bid", 25.0, 60.0), o("a2", "ask", 26.0, 60.0)],
+            self.WP + "-38.6": [o("w1", "bid", 23.0, 60.0)]})
+        self.bot.state.ledger["w9"] = {"order_id": "w9", "ticker": self.AP2 + "-E39.0",
+                                       "book_side": "ask", "yes_price": 13,
+                                       "yes_price_exact": None, "remaining_count": 60.0}
+
+    def test_a_twin_sweep_pulls_and_holds_both_series(self):
+        """10/14 19:41:38Z: the sweep on KXTRUMPAPPROVE-26OCT15 left
+        KXAPRPOTUS-26OCT16 quoted, swept 32s later; at 120s the bot re-quoted
+        both into the second wave."""
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
+            self._fill("a1", 60, ticker=self.AP + "-E38.6")
+            for ev in (self.AP, self.WP, self.AP2, "KXAPRPOTUS-26OCT23"):  # quoted or not
+                self.assertTrue(self.bot.sweep_held(ev, self.now + 590), ev)
+                self.assertFalse(self.bot.sweep_held(ev, self.now + 601), ev)
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 10))   # KXEVT untouched
+            self._fill("w1", 60, ticker=self.WP + "-38.6", dt=30.0)     # already pulled
+        trips = self._trips()
+        self.assertEqual(len(trips), 1)
+        t = trips[0]
+        self.assertEqual((t["mode"], t["event"], t["hold_s"], t["linked"]),
+                         ("on", self.AP, 600.0, ["KXAPRPOTUS", "KXTRUMPAPPROVE"]))
+        self.assertEqual(sorted(x[1] for x in t["pull"]), ["a2", "w1", "w9"])
+        self.assertEqual(sorted(oid for oid, _r in self.cancelled), ["a2", "w1", "w9"])
+
+    def test_the_twin_cannot_retrip_inside_the_hold_but_can_after(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "dry"):
+            self._fill("a1", 60, ticker=self.AP + "-E38.6")
+            self._fill("w1", 60, ticker=self.WP + "-38.6", dt=300.0)    # 300 < 600
+            self.assertEqual(len(self._trips()), 1)
+            self._fill("a2", 60, ticker=self.AP + "-E38.6", dt=601.0)
+        self.assertEqual(len(self._trips()), 2)
+
+    def test_an_unlinked_event_keeps_the_global_hold(self):
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
+            self._fill("o1", 20)
+        t = self._trips()[0]
+        self.assertEqual((t["event"], t["hold_s"]), (self.E, 300.0))
+        self.assertNotIn("linked", t)
+        self.assertEqual(sorted(oid for oid, _r in self.cancelled), ["o2", "o3"])
 
 
 if __name__ == "__main__":
