@@ -67,10 +67,11 @@ These were verified on 10/14.
 | `temp_shadow_backfill.py` | One-shot history pull: 6 weeks of station readings plus settled markets and trades for model fitting and calibration. |
 | `temp_shadow_model.py` | Index replica plus the fair-value model (`fit` CLI writes model_params.json). |
 | `temp_shadow_scoring.py` | Reward scoring (an exact port of the IMM rules) plus book reconstruction from the ws stream. |
-| `temp_shadow_sim.py` | Replay engine: policies, variants, fill models, reward accrual, settlement P&L. |
+| `temp_mm_policy.py` | THE QUOTING POLICY as pure logic (DEFAULT_POLICY, VARIANTS, `decide()` / `quote_market()`, risk sizing, order diff). The sim replays it and the live executor runs it, so shadow numbers describe the code that trades. |
+| `temp_shadow_sim.py` | Replay engine: feeds temp_mm_policy the replayed books, fairs and fills; fill models, reward accrual, settlement P&L. |
 | `temp_shadow_report.py` | Daily report (HTML email) plus the week summary and rule-based tweak suggestions. |
 | `run_temp_shadow_collector.ps1` / `run_temp_shadow_collector_hidden.vbs`, `run_temp_shadow_report_hidden.vbs`, `register_temp_shadow_collector.ps1`, `register_temp_shadow_report.ps1` | Windows tasks. |
-| `test_temp_shadow.py` | Tests. They always sandbox `TEMP_SHADOW_DATA` to a temp dir, never the live data root. |
+| `test_temp_shadow_*.py`, `test_temp_mm_policy.py` | Tests. They always sandbox `TEMP_SHADOW_DATA` to a temp dir, never the live data root. |
 
 **Data:** `C:\Users\jackd\Documents\KL-data\temp-shadow\` (env `TEMP_SHADOW_DATA`)
 
@@ -199,7 +200,7 @@ These are all parameters of one policy, so a tweak is a config change.
 
 **Quoting window:** quote only inside the program window.
 
-**Variant grid:** the starting grid is in `temp_shadow_sim.VARIANTS`.
+**Variant grid:** the starting grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`).
 
 ## Daily report (08:30 ET, previous ET day, plus cumulative)
 

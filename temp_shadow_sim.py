@@ -55,6 +55,10 @@ Mechanics (all times are exchange/epoch seconds; our rx ~ exchange time):
     last book mid and the output says settled=false.
   * Mark-outs at +60/+300 s use the book mid (clamped to the last book before
     close), in cents per contract, signed in our favour.
+  * Policy: every quoting decision below (classes, prices, guard, window,
+    pads, skew, risk sizing, the order diff) is temp_mm_policy's, the
+    same code the live executor runs; the sim feeds it the replayed book,
+    fair, guard slope and filled positions.
   * Risk (pre-trade, on filled positions): per-market |net YES position| <=
     pos_cap (the side that adds is trimmed to the room left); event worst-case
     loss over the nested outcome scenarios: each side's resting orders are
@@ -96,6 +100,7 @@ import traceback
 from collections import deque
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import temp_mm_policy as pol
 import temp_shadow_common as C
 import temp_shadow_model as tmodel
 import temp_shadow_scoring as scoring
@@ -108,8 +113,10 @@ SIM_VERSION = "4"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # 4: scoring reads 3 h back for each market's
                     # snapshot (early-listed events, 10/15)
 
-DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0)
-VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000)}
+# The policy lives in temp_mm_policy (the live executor runs the same code);
+# re-exported here for the report and older callers.
+DEFAULT_POLICY = pol.DEFAULT_POLICY
+VARIANTS = pol.VARIANTS
 FILL_MODELS = ("opt", "cons")
 
 TAU_BUCKETS = ("0-5", "5-10", "10-20", "20-40", "40-60")
@@ -125,7 +132,6 @@ DEFAULT_PROGRAM = dict(start_after_open=120.0, reward=100.0, target=1000.0, df=0
 MAX_WORKERS = 4
 DEFAULT_WORKERS = int(os.environ.get("TEMP_SHADOW_SIM_WORKERS", "2") or 2)
 
-_SQRT2PI = math.sqrt(2.0 * math.pi)
 _TICK, _TRADE, _WX = 1, 0, 2          # event kinds (sort order at equal time)
 
 
@@ -141,12 +147,8 @@ def tau_bucket(tau_min: float) -> str:
     return "40-60"
 
 
-def _phi(z: float) -> float:
-    return math.exp(-0.5 * z * z) / _SQRT2PI
-
-
-def _floor(x: float) -> int:
-    return int(math.floor(x + 1e-9))
+_phi = pol._phi          # kept for older callers
+_floor = pol._floor
 
 
 def _r(x, nd=6):
@@ -333,28 +335,14 @@ def _trade_time(tr) -> Optional[float]:
     return ts
 
 
-class _BookInfo:
-    __slots__ = ("by", "bn", "best_y", "best_n", "sum_y", "sum_n", "ref_y",
-                 "ref_n", "mid", "two_sided", "paying", "locked99", "depth3")
+class _BookInfo(pol.BookView):
+    """The policy's BookView (what the quoting rules read) plus the sim's
+    market stats."""
+    __slots__ = ("paying", "locked99", "depth3")
 
     def __init__(self, book, target, df):
         by, bn = book
-        self.by, self.bn = by, bn
-        self.best_y = max(by) if by else None
-        self.best_n = max(bn) if bn else None
-        self.sum_y = sum(by.values()) if by else 0.0
-        self.sum_n = sum(bn.values()) if bn else 0.0
-        self.ref_y = scoring.reference_price(by, target) if by else None
-        self.ref_n = scoring.reference_price(bn, target) if bn else None
-        if self.best_y is not None and self.best_n is not None:
-            self.mid = (self.best_y + 100 - self.best_n) / 2.0
-            self.two_sided = True
-        elif self.best_y is not None:
-            self.mid, self.two_sided = float(self.best_y), False
-        elif self.best_n is not None:
-            self.mid, self.two_sided = float(100 - self.best_n), False
-        else:
-            self.mid, self.two_sided = None, False
+        pol.BookView.__init__(self, by, bn, target)
         self.paying = bool(scoring.score(by, bn, {}, {}, target, df)[1])
         self.locked99 = (self.best_y is not None and self.best_y >= 99) or (
             self.best_n is not None and self.best_n >= 99)
@@ -561,17 +549,14 @@ class _Shared:
                 errs += 1
             fl, gl = [], []
             for j, k in enumerate(self.strikes):
-                f = _by_strike(fr, k)
-                f = None if f is None or not math.isfinite(float(f)) else min(1.0, max(0.0, float(f)))
+                f = pol.clean_prob(_by_strike(fr, k))
                 fl.append(f)
                 g = None
                 if f is not None and sl is not None:
-                    gv = _by_strike(sl, k)
-                    g = float(gv) if gv is not None and math.isfinite(float(gv)) else None
+                    g = pol.clean_slope(_by_strike(sl, k))
                 elif dist and dist[1] and dist[1] > 0 and f is not None:
                     # models without slopes(): the spec's plain-normal buffer
-                    mu, sig = float(dist[0]), float(dist[1])
-                    g = 100.0 * _phi((thr[j] - mu) / sig) / sig * C.STEP_F
+                    g = pol.normal_slope_c(float(dist[0]), float(dist[1]), thr[j], C.STEP_F)
                 gl.append(g)
             state = (tuple(fl), tuple(gl))
             if state == prev_state:
@@ -731,25 +716,9 @@ class _Shared:
 # One policy x fill-model pass
 # --------------------------------------------------------------------------
 
-def _g_tau(P: dict, tau: float) -> float:
-    full, stop, lo = P["live_tau_full"], P["live_stop_min"], P["live_tau_min_frac"]
-    if tau >= full:
-        return 1.0
-    if tau < stop:
-        return 0.0
-    if full <= stop:
-        return 1.0
-    return lo + (1.0 - lo) * (tau - stop) / (full - stop)
-
-
-def _overlap_window(a: float, b: float, lo: float, hi: float) -> bool:
-    """Does [a, b) touch second-of-minute window [lo, hi+1) in any minute?"""
-    base = a - (a % 60.0)
-    while base < b:
-        if a < base + hi + 1.0 and b > base + lo:
-            return True
-        base += 60.0
-    return False
+# the policy (temp_mm_policy); aliases kept for older callers
+_g_tau = pol.g_tau
+_overlap_window = pol.overlap_window
 
 
 class _Pass:
@@ -779,198 +748,38 @@ class _Pass:
 
     # -- risk ----------------------------------------------------------
     def _wcl(self) -> Tuple[float, List[int]]:
-        nm = self.sh.nm
-        tot_cost = sum(self.cost)
-        pnl = []
-        for j in range(nm + 1):        # scenario j: index above strikes 0..j-1
-            v = sum(self.yes_q[:j]) + sum(self.no_q[j:]) - tot_cost
-            pnl.append(v)
-        mn = min(pnl)
-        return max(0.0, -mn), [j for j, v in enumerate(pnl) if v <= mn + 1e-9]
+        return pol.worst_case_loss(self.yes_q, self.no_q, self.cost)
 
     def _risk(self):
         if self._risk_cache[0] == self.risk_ver:
             return self._risk_cache[1]
-        P, nm = self.P, self.sh.nm
-        cap = float(P["pos_cap"])
-        wcap = float(P["event_wcl_cap"])
-        tot_cost = sum(self.cost)
-        loss = [tot_cost - (sum(self.yes_q[:j]) + sum(self.no_q[j:]))
-                for j in range(nm + 1)]          # scenario j: index above strikes 0..j-1
-        # pre[m] = max loss over j <= m; suf[m] = max loss over j > m
-        pre, run = [], -math.inf
-        for m in range(nm):
-            run = max(run, loss[m])
-            pre.append(run)
-        suf, run = [0.0] * nm, -math.inf
-        for m in range(nm - 1, -1, -1):
-            run = max(run, loss[m + 1])
-            suf[m] = run
-        out = []
-        for m in range(nm):
-            net = self.yes_q[m] - self.no_q[m]
-            ry = max(0.0, cap - net)
-            rn = max(0.0, cap + net)
-            # YES on market m loses (its price) in scenarios j <= m, NO in j > m:
-            # dollars a side may still put at risk before the event's worst
-            # case reaches the cap (<= 0 once breached: the side stops)
-            out.append((ry, rn, wcap - pre[m], wcap - suf[m]))
+        out = pol.risk_headroom(self.P, self.yes_q, self.no_q, self.cost)
         self._risk_cache = (self.risk_ver, out)
         return out
 
-    # -- policy ----------------------------------------------------------
+    # -- policy (temp_mm_policy) -------------------------------------------
     def _price(self, side, info, ref, f_side, buf, back, guard):
-        levels = info.by if side == "yes" else info.bn
-        p = ref
-        if p is None:
-            if levels:
-                p = max(levels)
-            elif f_side is not None:
-                p = _floor(100.0 * f_side - buf)
-            else:
-                return None
-        if guard and f_side is not None:
-            p = min(p, _floor(100.0 * f_side - buf))
-        if p < 1:
-            return None
-        if back:
-            p = max(1, p - int(self.P["back_ticks"]))
-        best_opp = info.best_n if side == "yes" else info.best_y
-        if best_opp is not None:
-            p = min(p, 99 - best_opp)
-        p = min(p, 99)
-        while p >= 1 and scoring.would_cross(info.by, info.bn, side, p):
-            p -= 1
-        return p if p >= 1 else None
+        return pol.quote_price(self.P, side, info, ref, f_side, buf, back, guard)
 
     def _desired(self, m, t, v, f, gf, wflag, pflag, size_full, risk):
         """-> (dy, dn, rule). dy/dn: {price: size}."""
-        sh, P = self.sh, self.P
-        if v < 0 or not pflag:
-            return {}, {}, None
-        info = sh.vinfo[m][v]
-        fx = f if f is not None else (info.mid / 100.0 if info.mid is not None else None)
-        if fx is None:
-            return {}, {}, None
-        if 0.10 <= fx <= 0.90:
-            cls = "live"
-        elif 0.03 <= fx <= 0.97:
-            cls = "near"
-        else:
-            cls = "decided"
-        buf = float(P["guard_min_c"])
-        if gf is not None:
-            buf = max(buf, float(P["guard_k"]) * gf)
-        dy: Dict[int, float] = {}
-        dn: Dict[int, float] = {}
-        rule = None
-        wm = P["window_mode"]
-        # Spec "Decided strikes (if enabled)": near-decided strikes (3-10% /
-        # 90-97%) are handled as live at half size -- part of the decided
-        # feature, so they need `decided` (not `live`) and count as class
-        # "decided" (live = fair 10-90c, as market_stats' live_frac).
-        near_live = cls == "near" and P["decided"] and P["near_decided_half"]
-        if (P["live"] and cls == "live") or near_live:
-            rule = "live" if cls == "live" else "decided"
-            if not (wflag and wm == "pull"):
-                size = size_full * (0.5 if cls == "near" else 1.0)
-                ys = ns = size
-                sk = float(P["skew"] or 0.0)
-                if sk and (0.05 <= fx <= 0.30 or 0.70 <= fx <= 0.95):
-                    ns, ys = size * (1.0 + sk), size * (1.0 - sk)
-                back = wflag and wm == "back"
-                guard = bool(P["fair_guard"]) and f is not None
-                ys, ns = math.floor(ys + 1e-9), math.floor(ns + 1e-9)
-                if ys >= 1:
-                    py = self._price("yes", info, info.ref_y, fx, buf, back, guard)
-                    if py is not None:
-                        dy[py] = float(ys)
-                if ns >= 1:
-                    pn = self._price("no", info, info.ref_n, 1.0 - fx, buf, back, guard)
-                    if pn is not None:
-                        dn[pn] = float(ns)
-        elif P["decided"] and cls != "live":
-            rule = "decided"
-            yes_long = fx < 0.5
-            # longshot side rests q_pad at 1c
-            ls = "yes" if yes_long else "no"
-            if P["q_pad"] >= 1 and not scoring.would_cross(info.by, info.bn, ls, 1):
-                (dy if ls == "yes" else dn)[1] = float(math.floor(P["q_pad"]))
-            fav = "no" if yes_long else "yes"
-            f_fav = 1.0 - fx if yes_long else fx
-            if f_fav >= float(P["fav_min_p"]) and P["q_fav"] >= 1:
-                ref = info.ref_n if fav == "no" else info.ref_y
-                p = self._price(fav, info, ref, f_fav, buf, False, True)
-                if p is not None:
-                    d = dn if fav == "no" else dy
-                    d[p] = d.get(p, 0.0) + float(math.floor(P["q_fav"]))
-        if not dy and not dn:
-            return {}, {}, rule
-        # qualification pads (1c) on a market we quote
-        if P["qual_pads"]:
-            prog = sh.progs[m]
-            tgt = float(prog["target"])
-            for side, d, depth in (("yes", dy, info.sum_y), ("no", dn, info.sum_n)):
-                tot = depth + sum(d.values())
-                if tot < tgt and not scoring.would_cross(info.by, info.bn, side, 1):
-                    d[1] = d.get(1, 0.0) + float(math.ceil(tgt + P["pad_extra"] - tot))
-        # risk, pre-trade (trim worst prices first): the position cap in
-        # contracts, then the event worst-case-loss headroom in dollars (each
-        # contract bid at p risks p cents in the side's losing scenarios)
-        ry, rn, hy, hn = risk[m]
-        for d, room, usd in ((dy, ry, hy), (dn, rn, hn)):
-            if not d:
-                continue
-            if usd <= 1e-9:
-                d.clear()
-                continue
-            tot = sum(d.values())
-            if tot > room + 1e-9:
-                excess = tot - room
-                for p in sorted(d):
-                    cut = min(d[p], excess)
-                    d[p] -= cut
-                    excess -= cut
-                    if excess <= 1e-9:
-                        break
-            for p in list(d):
-                d[p] = float(math.floor(d[p] + 1e-9))
-            at_risk = sum(s * p / 100.0 for p, s in d.items())
-            if at_risk > usd + 1e-9:
-                excess = at_risk - usd
-                for p in sorted(d):
-                    per = p / 100.0
-                    cut = min(d[p], float(math.ceil(excess / per - 1e-9)))
-                    d[p] -= cut
-                    excess -= cut * per
-                    if excess <= 1e-9:
-                        break
-            for p in [p for p, s in d.items() if s < 1.0]:
-                del d[p]
-        # never self-cross
-        if dy and dn:
-            my = max(dy)
-            for p in [p for p in dn if p + my >= 100]:
-                del dn[p]
-        return dy, dn, rule
+        info = self.sh.vinfo[m][v] if v >= 0 else None
+        return pol.quote_market(self.P, info, f, gf, wflag, pflag, size_full,
+                                risk[m], self.sh.progs[m]["target"])
 
     def _decide_all(self, t, idx, fs, t_next):
         sh, P = self.sh, self.P
         lat = float(P["order_latency_s"])
         a, b = t + lat, t_next + lat
-        wm = P["window_mode"]
-        wflag = wm != "none" and _overlap_window(a, b, float(P["win_lo"]), float(P["win_hi"]))
+        wflag = pol.window_flag(P, a, b)
         tau = (sh.close - t) / 60.0
-        size_full = math.floor(float(P["q_live"]) * _g_tau(P, tau) + 1e-9)
+        size_full = pol.live_size(P, tau)
         risk = self._risk()
         n = sh.n
         for m in range(sh.nm):
             v = sh.ver[m][idx] if 0 <= idx < n else -1
             pr = sh.progs[m]
-            if P["program_only"]:
-                pflag = a < pr["end"] and b > pr["start"]
-            else:
-                pflag = a < sh.close
+            pflag = pol.program_flag(P, a, b, pr["start"], pr["end"], sh.close)
             key = (v, fs, wflag, pflag, size_full, self.risk_ver)
             if key == self.last_key[m]:
                 continue
@@ -978,23 +787,9 @@ class _Pass:
             f = sh.st_f[fs][m] if fs >= 0 else None
             gf = sh.st_g[fs][m] if fs >= 0 else None
             dy, dn, rule = self._desired(m, t, v, f, gf, wflag, pflag, size_full, risk)
-            bel = self.belief[m]
-            ops = []
-            for side, d in (("yes", dy), ("no", dn)):
-                bs = bel[side]
-                for p in bs:
-                    if p not in d:
-                        ops.append((side, "cancel", p, 0.0))
-                for p, s in d.items():
-                    cur = bs.get(p)
-                    if cur is None:
-                        ops.append((side, "place", p, s))
-                    elif s > cur + 1e-9:
-                        ops.append((side, "inc", p, s - cur))
-                    elif s < cur - 1e-9:
-                        # relative cut (Kalshi reduce_by): a fill that lands
-                        # before activation leaves actual == projected belief
-                        ops.append((side, "dec", p, cur - s))
+            # size cuts are relative (Kalshi reduce_by): a fill that lands
+            # before activation leaves actual == projected belief
+            ops = pol.diff_orders(self.belief[m], dy, dn)
             if ops or (rule is not None and rule != self.mcls[m]):
                 self.belief[m] = {"yes": dict(dy), "no": dict(dn)}
                 self.pending.append((a, m, ops, rule))
