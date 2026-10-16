@@ -2130,12 +2130,20 @@ class TestQuoteHours(unittest.TestCase):
                          {"quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]})
         self.assertEqual(L.policy_overrides_from_env({"TMM_QUOTE_HOURS_ET": "[9]"}),
                          {"quote_hours_et": [9]})
-        for raw in ("all", "none"):
+        for raw in ("all", "ALL", " any "):
             self.assertEqual(L.policy_overrides_from_env({"TMM_QUOTE_HOURS_ET": raw}),
                              {"quote_hours_et": None})
-        for raw in ("24", "7.5", "x", "-1"):
+        # fix pass 10/16: "[]" / "none" / "null" used to mean every hour (the
+        # policy's [] quotes NO hour): ambiguous, so the bot refuses to start
+        for raw in ("24", "7.5", "x", "-1", "[]", "[ ]", "none", "None", "null", "NULL", ",",
+                    "[,]"):
             with self.assertRaises(ValueError, msg=raw):
                 L.policy_overrides_from_env({"TMM_QUOTE_HOURS_ET": raw})
+        # unset / empty: no override, the variant's own hours stay
+        for env_ in ({}, {"TMM_QUOTE_HOURS_ET": ""}, {"TMM_QUOTE_HOURS_ET": "  "}):
+            self.assertEqual(L.policy_overrides_from_env(env_), {})
+            self.assertEqual(pol.make_policy("FAV_night", **L.policy_overrides_from_env(env_))
+                             ["quote_hours_et"], [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])
         P = pol.make_policy("FAV_night", **L.policy_overrides_from_env(
             {"TMM_QUOTE_HOURS_ET": "9"}))
         pol._check_policy(P)

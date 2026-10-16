@@ -850,5 +850,221 @@ class TestSwpFillModel(SimTestBase):
             self.assertEqual(res["policies"]["FAV_night"]["quote_hours_et"],
                              [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])
 
+
+class TestSwpFixPass(SimTestBase):
+    """Fix pass 10/16 (review of the swp build): a failure in the sweep path
+    costs swp only (the event keeps opt / cons, swp_error, no |swp keys, and
+    is re-simmed next time); a model/ hazard or tails override that is not a
+    usable table is rejected (the repo default is used and the rejection is
+    recorded) instead of silently zeroing the hidden-sweep channel; run_day
+    takes a deadline (the report's re-sim time budget)."""
+
+    def setUp(self):
+        super().setUp()
+        self._draws = sim.SWP_DRAWS
+        self._hrepo, self._trepo = sim.SWP_HAZARD_REPO, sim.SWP_TAILS_REPO
+        sim.SWP_DRAWS = 2
+        sim._SWP_CACHE.clear()
+        self._model_dir = os.path.join(C.DATA_ROOT, "model")
+
+    def tearDown(self):
+        sim.SWP_DRAWS = self._draws
+        sim.SWP_HAZARD_REPO, sim.SWP_TAILS_REPO = self._hrepo, self._trepo
+        sim._SWP_CACHE.clear()
+        for n in ("sweep_hazard.json", "sweep_tails.json"):
+            p = os.path.join(self._model_dir, n)
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _fixture(self, event=EVENT):
+        return TestSwpFillModel._fixture(self, event)
+
+    def _write_model(self, name, doc_or_text):
+        os.makedirs(self._model_dir, exist_ok=True)
+        p = os.path.join(self._model_dir, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(doc_or_text if isinstance(doc_or_text, str) else json.dumps(doc_or_text))
+        sim._SWP_CACHE.clear()
+        return p
+
+    def test_swp_failure_keeps_opt_and_cons(self):
+        import temp_shadow_sweep as SW
+        from unittest import mock
+        self._fixture()
+        vs = ["G0_nohold", "FAV_only"]
+        good = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        with mock.patch.object(SW.VPass, "run", side_effect=RuntimeError("boom")):
+            bad = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self.assertEqual(set(bad["variants"]), {f"{v}|{f}" for v in vs for f in ("opt", "cons")})
+        self.assertTrue(bad["swp_error"].startswith("swp run failed: RuntimeError: boom"),
+                        bad["swp_error"])
+        self.assertIsNone(bad["swp"])
+        self.assertEqual(bad["fill_models"], ["opt", "cons"])
+        for v in vs:
+            for fm in ("opt", "cons"):
+                self.assertEqual(bad["variants"][f"{v}|{fm}"], good["variants"][f"{v}|{fm}"])
+        self.assertNotIn("swp_error", good)
+        # a setup failure (swp_config / SweepShared) is contained the same way
+        with mock.patch.object(sim, "swp_config", side_effect=ValueError("no table")):
+            bad2 = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self.assertTrue(bad2["swp_error"].startswith("swp setup failed: ValueError: no table"))
+        for v in vs:
+            for fm in ("opt", "cons"):
+                self.assertEqual(bad2["variants"][f"{v}|{fm}"], good["variants"][f"{v}|{fm}"])
+        # the cache wants every fill model: such a file is re-simmed ...
+        want = sim._policy_overrides(vs)
+        ident = sim.swp_config()["ident"]
+        self.assertTrue(sim._cached_ok(good, want, ident))
+        self.assertFalse(sim._cached_ok(bad, want, ident))
+        # ... unless swp itself is broken (a re-sim could not add it)
+        self.assertTrue(sim._cached_ok(bad, want, None, swp_broken=True))
+
+    def test_run_day_retries_an_event_whose_swp_failed(self):
+        import temp_shadow_sweep as SW
+        from unittest import mock
+        self._fixture()
+        day = C.et_day(S)
+        path = os.path.join(C.DATA_ROOT, "sim", day, f"{EVENT}.json")
+        with mock.patch.object(SW.VPass, "run", side_effect=RuntimeError("boom")):
+            out = sim.run_day(day, workers=1)
+        doc = [d for d in out if d["event"] == EVENT][0]
+        self.assertNotIn("error", doc)
+        self.assertIn("swp_error", doc)
+        self.assertIn("G0_nohold|cons", doc["variants"])
+        self.assertNotIn("G0_nohold|swp", doc["variants"])
+        self.assertIn("swp_error", C.read_json(path))
+        again = sim.run_day(day, workers=1)
+        doc2 = [d for d in again if d["event"] == EVENT][0]
+        self.assertNotIn("swp_error", doc2)
+        self.assertIn("G0_nohold|swp", doc2["variants"])
+        self.assertEqual(doc2["variants"]["G0_nohold|cons"], doc["variants"]["G0_nohold|cons"])
+
+    def test_run_day_with_swp_config_broken(self):
+        from unittest import mock
+        self._fixture()
+        day = C.et_day(S)
+        path = os.path.join(C.DATA_ROOT, "sim", day, f"{EVENT}.json")
+        with mock.patch.object(sim, "swp_config", side_effect=ValueError("repo table gone")):
+            out = sim.run_day(day, workers=1)
+            doc = [d for d in out if d["event"] == EVENT][0]
+            self.assertIn("swp setup failed: ValueError: repo table gone", doc["swp_error"])
+            self.assertIn("F_full|opt", doc["variants"])
+            m0 = os.path.getmtime(path)
+            time.sleep(0.05)
+            sim.run_day(day, workers=1)          # reused: a re-sim could not add swp
+            self.assertEqual(os.path.getmtime(path), m0)
+        sim.run_day(day, workers=1)              # swp back: re-simmed with it
+        self.assertGreater(os.path.getmtime(path), m0)
+        self.assertIn("F_full|swp", C.read_json(path)["variants"])
+
+    def test_hazard_and_tails_overrides_are_validated(self):
+        repo = sim.swp_config()["ident"]
+        self.assertEqual((repo["hazard_kind"], repo["tails_kind"]), ("repo", "repo"))
+        self.assertIsNone(repo["hazard_rejected"])
+        with open(self._hrepo, encoding="utf-8") as f:
+            hdoc = json.load(f)
+        with open(self._trepo, encoding="utf-8") as f:
+            tdoc = json.load(f)
+        zero = json.loads(json.dumps(hdoc))
+        zero["hazard"]["a"] = {fb: {ab: 0.0 for ab in d} for fb, d in zero["hazard"]["a"].items()}
+        zero["hazard"]["lam_pool"] = {k: 0.0 for k in zero["hazard"].get("lam_pool") or {}}
+        nosize = json.loads(json.dumps(hdoc))
+        nosize.pop("sizes_all")
+        # the review's file: no 'hazard' fit -> Hazard() would read it as all zero
+        for bad, why in (({"version": 1, "built": "x"}, "no 'hazard' fit"),
+                         (zero, "lam_max 0 <= 0"), (nosize, "no 'sizes_all'"),
+                         ("{not json", "")):
+            self._write_model("sweep_hazard.json", bad)
+            cfg = sim.swp_config()
+            ident = cfg["ident"]
+            self.assertEqual(ident["hazard_kind"], "repo", why)
+            self.assertEqual(ident["hazard_id"], repo["hazard_id"], why)
+            self.assertIn("sweep_hazard.json", ident["hazard_rejected"])
+            self.assertIn(why, ident["hazard_rejected"])
+            self.assertGreater(cfg["hazard"].lam_max, 0.0)
+        # a usable recalibration is used (and re-keys the cache)
+        better = json.loads(json.dumps(hdoc))
+        better["hazard"]["a"] = {fb: {ab: 2.0 * float(r) for ab, r in d.items()}
+                                 for fb, d in better["hazard"]["a"].items()}
+        self._write_model("sweep_hazard.json", better)
+        ident = sim.swp_config()["ident"]
+        self.assertEqual(ident["hazard_kind"], "override")
+        self.assertIsNone(ident["hazard_rejected"])
+        self.assertNotEqual(ident["hazard_id"], repo["hazard_id"])
+        # tails: no bucket rows / out of range -> rejected; a copy -> used
+        for bad, why in (({"buckets": []}, "no 'buckets'"),
+                         ({"buckets": [[0.0, 0.6, 0.1, 0.1, 0.0, 0.2]]}, "out of range"),
+                         ({"buckets": [[0.0, 0.1]]}, "not 6 numbers")):
+            self._write_model("sweep_tails.json", bad)
+            ident = sim.swp_config()["ident"]
+            self.assertEqual((ident["tails_kind"], ident["tails_id"]), ("repo", repo["tails_id"]))
+            self.assertIn(why, ident["tails_rejected"])
+        self._write_model("sweep_tails.json", tdoc)
+        ident = sim.swp_config()["ident"]
+        self.assertEqual((ident["tails_kind"], ident["tails_id"]), ("override", repo["tails_id"]))
+        # an unusable REPO table raises (run_event contains it)
+        badrepo = os.path.join(C.DATA_ROOT, "bad_repo_hazard.json")
+        with open(badrepo, "w", encoding="utf-8") as f:
+            json.dump({"version": 1}, f)
+        os.remove(os.path.join(self._model_dir, "sweep_hazard.json"))
+        sim.SWP_HAZARD_REPO = badrepo
+        sim._SWP_CACHE.clear()
+        with self.assertRaisesRegex(ValueError, "not usable"):
+            sim.swp_config()
+
+    def test_bad_override_does_not_zero_the_hidden_sweeps(self):
+        # the review's scenario: the malformed override used to give lam_max
+        # 0 and no hidden sweeps at all; now the event sims on the repo table
+        self._fixture()
+        vs = ["G0_nohold"]
+        a = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self._write_model("sweep_hazard.json", {"version": 1, "built": "x"})
+        b = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self.assertEqual(b["variants"]["G0_nohold|swp"], a["variants"]["G0_nohold|swp"])
+        self.assertGreater(b["swp"]["lam_max"], 0.0)
+        self.assertIn("no 'hazard' fit", b["swp"]["hazard_rejected"])
+
+    def test_run_day_deadline_defers_unstarted_events(self):
+        evs = [f"KXTEMPMIAH-26OCT14{h:02d}" for h in (9, 10, 11, 12, 13)]
+        for ev in evs:
+            self._fixture(ev)
+        day = C.et_day(S)
+        d = os.path.join(C.DATA_ROOT, "sim", day)
+        # sequential: past the deadline nothing starts; an older file stays
+        os.makedirs(d, exist_ok=True)
+        old = {"event": evs[0], "settled": True, "sim_version": "4", "variants": {}}
+        C.write_json_atomic(os.path.join(d, f"{evs[0]}.json"), old)
+        out = sim.run_day(day, workers=1, deadline=time.time() - 1.0)
+        mine = [r for r in out if r["event"] in evs]
+        self.assertEqual(sorted(r["event"] for r in mine), evs)
+        self.assertTrue(all(r.get("deferred") and r.get("settled") for r in mine), mine)
+        self.assertEqual(C.read_json(os.path.join(d, f"{evs[0]}.json")), old)
+        self.assertEqual(sorted(os.listdir(d)), [f"{evs[0]}.json"])
+        # the pool path (the report task's 2 workers), on threads so the
+        # sandbox's data root is shared (a spawned process would re-import
+        # this module and make a new one): what has not started is
+        # deferred, what started finishes and is written
+        import concurrent.futures as cf
+        from unittest import mock
+        pool = mock.patch.object(cf, "ProcessPoolExecutor", cf.ThreadPoolExecutor)
+        prio = mock.patch.object(sim, "_lower_priority", lambda: None)
+        with pool, prio:
+            out = sim.run_day(day, workers=2, deadline=time.time() - 1.0)
+        mine = {r["event"]: r for r in out if r["event"] in evs}
+        self.assertEqual(sorted(mine), evs)
+        done = [e for e, r in mine.items() if not r.get("deferred")]
+        deferred = [e for e, r in mine.items() if r.get("deferred")]
+        self.assertGreaterEqual(len(deferred), 2)          # at most the 2 workers had started
+        for e in done:
+            self.assertIn("variants", mine[e])
+            self.assertTrue(os.path.exists(os.path.join(d, f"{e}.json")))
+        for e in deferred:
+            if e != evs[0]:
+                self.assertFalse(os.path.exists(os.path.join(d, f"{e}.json")), e)
+        # no deadline: everything is simmed
+        with pool, prio:
+            out = sim.run_day(day, workers=2)
+        self.assertFalse([r for r in out if r["event"] in evs and not r.get("variants")])
+
 if __name__ == "__main__":
     unittest.main()

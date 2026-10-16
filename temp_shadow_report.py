@@ -69,6 +69,27 @@ cumulative days-positive count and the week verdict are judged on swp. Sim
 output from before SIM_VERSION 6 has no swp: the report then falls back to
 cons (and says so); headline_fill() picks the fill model.
 
+Fix pass 10/16 (review of the swp build):
+  * "Expected (calibrated tails)" (net_cal) is shown only for variants that
+    quote no live strikes (policy live=False, cal_ok()); for a live-quoting
+    variant a fill at a 10-90% fair keeps the model's own fair, so the cell
+    reads "(circular)" and the headline, the email text and the week risks
+    leave it out.
+  * Events without swp in the window (swp failed in the sim -- the event
+    keeps opt / cons -- or an older sim file) are counted in a banner and the
+    subject; a failed event whose older sim file is still loaded is named as
+    such instead of "left out of every figure".
+  * The swp hazard / tails tables in use (id, repo default or model/
+    override) are named under Variants and in the email text; a rejected
+    model/ override (not a usable table: the repo default is used) is a
+    banner and a subject flag.
+  * run_sim re-sims earlier window days within RESIM_BUDGET_MIN (env
+    TEMP_SHADOW_RESIM_BUDGET_MIN, 80) of its start: the report day is always
+    simmed in full first; earlier-day events not started by then are
+    deferred (their older files stay, flagged stale) and the next report
+    continues. Measured under the machine's normal load a full 200-event
+    window re-sim takes ~100 min against the task's 2 h limit.
+
 Variant letters: the pair rules look variants up by their leading letter
 (exact name "B", or "B" followed by a non-alphanumeric, e.g. "B_pull"); a
 pair whose variant is absent is skipped and named in the report. "G0" finds
@@ -145,8 +166,17 @@ CAL_NOTE = ("Expected (calibrated tails) = reward + every swp fill marked at the
             "longshot rate of its model-probability bucket given a taker hit a bid at that "
             "price (temp_shadow_sweep_tails.json, 530 settled hours) instead of the hour's "
             "actual settlement: an ESTIMATE of the expectation, free of the few upsets that "
-            "dominate realized nets; a fill at a 10-90% fair keeps the model's own fair, so "
-            "for live-strike quoting it is circular, not evidence.")
+            "dominate realized nets. Shown only for variants that quote no live strikes "
+            "(live=False): a fill at a 10-90% fair keeps the model's own fair, so for a "
+            "live-quoting variant the figure would be circular -- those cells read "
+            "\"(circular)\".")
+CIRCULAR = "(circular)"
+# run_sim: the earlier window days are re-simmed only within this many minutes
+# of its start (the report day is always simmed in full first); the task's
+# limit is 2 h (register_temp_shadow_report.ps1). Measured 10/16 under the
+# machine's normal load: ~29.5 s of wall time per event at 2 workers, so a
+# full 200-event window re-sim (~100 min) would not fit with the report.
+RESIM_BUDGET_MIN = float(os.environ.get("TEMP_SHADOW_RESIM_BUDGET_MIN", "80") or 80)
 SEND_SCRIPT = os.path.join(C.REPO, "send_html_email.py")
 EMAIL_ENV = ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD", "ALERT_EMAIL_TO")
 
@@ -330,6 +360,15 @@ def headline_fill(src) -> str:
         if f in have:
             return f
     return HEADLINE_FILL
+
+
+def cal_ok(policy: Optional["Policy"], name: Optional[str]) -> bool:
+    """Is net_cal ("expected at calibrated tails") evidence for this variant?
+    Only when it quotes no live strikes (policy live=False): its fills are
+    on decided / near strikes, which the tails table covers. A live-quoting
+    variant's fills at a 10-90% fair keep the model's own fair (circular).
+    Unknown variants / no policy -> False."""
+    return bool(name) and policy is not None and policy.get(name, "live") is False
 
 
 def resolve_variant(letter: str, names: Sequence[str]) -> Optional[str]:
@@ -1504,7 +1543,7 @@ def week_summary(win: Window, policy: Policy, model: dict,
         for f in ("cons", "opt"):
             if f"{best}|{f}" in win.agg:
                 parts.append(f"{f} {money(sum(_num(win.day_aggs[d][f'{best}|{f}']['net']) for d in days if f'{best}|{f}' in win.day_aggs[d]))}")
-        if win.has(key, "net_cal"):
+        if win.has(key, "net_cal") and cal_ok(policy, best):
             parts.append("expected at calibrated tails "
                          + money(sum(_num(win.day_aggs[d][key].get("net_cal")) for d in days)))
         risks.append("Fill model: " + ", ".join(parts) + " over the verdict's days: swp adds "
@@ -2017,11 +2056,16 @@ def _tally(res, into: dict) -> None:
             into["errors"].append((str(r.get("event")), str(r.get("error"))[:300]))
         elif r.get("pending"):
             into["pending"].append(str(r.get("event")))
+        elif r.get("deferred"):
+            into.setdefault("deferred", []).append(str(r.get("event")))
         else:
             into["ok"] += 1
+            if r.get("swp_error"):
+                into.setdefault("swp_errors", []).append(
+                    (str(r.get("event")), str(r.get("swp_error")).splitlines()[0][:300]))
 
 
-def run_sim(day: str) -> Tuple[Optional[str], dict]:
+def run_sim(day: str, budget_min: Optional[float] = None) -> Tuple[Optional[str], dict]:
     """temp_shadow_sim.run_day(day), then run_day for every earlier day of the
     cumulative window (window_days) -> (error text or None, summary).
 
@@ -2033,11 +2077,28 @@ def run_sim(day: str) -> Tuple[Optional[str], dict]:
     same overrides), so a SIM_VERSION bump or a VARIANTS change re-sims the
     whole window here instead of mixing old and new output in the cumulative
     figures (review fix 10/16: 10/15 stayed at SIM_VERSION 4, where
-    G_decided_only had no pad hold and G0_nohold did not exist)."""
-    summary: dict = {"ok": 0, "pending": [], "errors": [],
-                     "window": {"days": [], "ok": 0, "pending": [], "errors": []}}
+    G_decided_only had no pad hold and G0_nohold did not exist).
+
+    Time budget (fix pass 10/16): the earlier days run with run_day's
+    deadline = start + budget_min (RESIM_BUDGET_MIN); events not started by
+    then come back deferred (window "deferred": [event]) and keep their
+    older files (flagged stale); the next report continues. The report day
+    itself has no deadline. "swp_config_error": swp_config() raised (an
+    unusable repo table): every event is simmed without swp."""
+    summary: dict = {"ok": 0, "pending": [], "errors": [], "deferred": [],
+                     "swp_config_error": None,
+                     "window": {"days": [], "ok": 0, "pending": [], "errors": [],
+                                "deferred": [], "budget_min": None}}
+    t0 = time.time()
+    budget_min = RESIM_BUDGET_MIN if budget_min is None else float(budget_min)
+    summary["window"]["budget_min"] = budget_min
     try:
         import temp_shadow_sim as sim   # noqa: WPS433
+        if "swp" in getattr(sim, "FILL_MODELS", ()):
+            try:
+                sim.swp_config()
+            except Exception as e:      # noqa: BLE001 -- the sim records it per event
+                summary["swp_config_error"] = f"{type(e).__name__}: {e}"[:400]
         res = sim.run_day(day)
     except BaseException as e:          # noqa: BLE001
         if isinstance(e, KeyboardInterrupt):
@@ -2046,12 +2107,13 @@ def run_sim(day: str) -> Tuple[Optional[str], dict]:
                 summary)
     _tally(res, summary)
     win = summary["window"]
+    deadline = t0 + 60.0 * budget_min
     for d in window_days(day):
         if d == day:
             continue
         win["days"].append(d)
         try:
-            res = sim.run_day(d)
+            res = sim.run_day(d, deadline=deadline)
         except BaseException as e:      # noqa: BLE001 -- the report day still reports
             if isinstance(e, KeyboardInterrupt):
                 raise
@@ -2085,6 +2147,113 @@ def stale_sim_days(days_events: Dict[str, List[dict]],
                 if ev.get("sim_version") is not None and str(ev.get("sim_version")) != version)
         if n:
             out[d] = n
+    return out
+
+
+def _has_swp(ev: dict) -> bool:
+    return any(split_key(k)[1] == "swp" for k in (ev.get("variants") or {}))
+
+
+def swp_missing(days_events: Dict[str, List[dict]], day: str,
+                version: Optional[str]) -> dict:
+    """The loaded events without swp results (the headline is on swp):
+    {"day": [(event, why)], "by_day": {day: n}, "total": n, "events": n}.
+    why: the sim file's swp_error (swp failed; opt / cons kept), or an older
+    SIM_VERSION, or no swp run."""
+    out = {"day": [], "by_day": {}, "total": 0, "events": 0}
+    for d, evs in days_events.items():
+        for ev in evs:
+            out["events"] += 1
+            if _has_swp(ev):
+                continue
+            if ev.get("swp_error"):
+                why = "swp failed: " + str(ev["swp_error"]).splitlines()[0][:200]
+            elif version is not None and ev.get("sim_version") is not None \
+                    and str(ev.get("sim_version")) != version:
+                why = f"older sim file (SIM_VERSION {ev.get('sim_version')})"
+            else:
+                why = "no swp in the sim file"
+            out["by_day"][d] = out["by_day"].get(d, 0) + 1
+            out["total"] += 1
+            if d == day:
+                out["day"].append((str(ev.get("event")), why))
+    return out
+
+
+def _table_kind(src: Optional[str], kind: Optional[str]) -> str:
+    if kind == "override" or (kind is None and src and os.sep + "model" + os.sep in src):
+        return "model/ override"
+    return "repo default"
+
+
+def swp_tables(days_events: Dict[str, List[dict]]) -> List[dict]:
+    """The swp hazard / tails tables that produced the loaded swp numbers:
+    [{"hazard_id", "hazard", "tails_id", "tails", "draws", "events"}]
+    (one row per distinct combination, most events first); "hazard" /
+    "tails" = 'repo default' or 'model/ override'."""
+    acc: Dict[tuple, dict] = {}
+    for evs in days_events.values():
+        for ev in evs:
+            sw = ev.get("swp")
+            if not isinstance(sw, dict) or not _has_swp(ev):
+                continue
+            k = (sw.get("hazard_id"), _table_kind(sw.get("hazard_src"), sw.get("hazard_kind")),
+                 sw.get("tails_id"), _table_kind(sw.get("tails_src"), sw.get("tails_kind")),
+                 sw.get("draws"))
+            row = acc.setdefault(k, {"hazard_id": k[0], "hazard": k[1], "tails_id": k[2],
+                                     "tails": k[3], "draws": k[4], "events": 0})
+            row["events"] += 1
+    return sorted(acc.values(), key=lambda r: -r["events"])
+
+
+def current_swp_tables() -> Optional[dict]:
+    """temp_shadow_sim.swp_config()'s identity now (which tables the next sim
+    uses, and a rejected model/ override), {"error": text} when it raises,
+    None when the sim is not importable."""
+    try:
+        import temp_shadow_sim as sim   # noqa: WPS433 (lazy on purpose)
+    except BaseException as e:          # noqa: BLE001
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return None
+    if not hasattr(sim, "swp_config"):
+        return None
+    try:
+        return dict(sim.swp_config()["ident"])
+    except Exception as e:              # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"[:400]}
+
+
+def swp_tables_text(ctx: dict) -> str:
+    """One line naming the swp tables behind the figures (and the current
+    ones when they differ)."""
+    rows = ctx.get("swp_tables") or []
+    if not rows:
+        return ""
+    def one(r):
+        return (f"hazard {r['hazard_id']} ({r['hazard']}), tails {r['tails_id']} ({r['tails']}), "
+                f"{r['draws']} draws")
+    if len(rows) == 1:
+        s = "swp tables: " + one(rows[0]) + "."
+    else:
+        s = ("swp tables differ across the window: "
+             + "; ".join(f"{one(r)} on {r['events']} events" for r in rows) + ".")
+    cur = ctx.get("swp_current") or {}
+    if cur.get("hazard_id") and (cur.get("hazard_id"), cur.get("tails_id")) != (
+            rows[0]["hazard_id"], rows[0]["tails_id"]):
+        s += (f" The next sim uses hazard {cur['hazard_id']} "
+              f"({_table_kind(cur.get('hazard_src'), cur.get('hazard_kind'))}), tails "
+              f"{cur.get('tails_id')} ({_table_kind(cur.get('tails_src'), cur.get('tails_kind'))}).")
+    return s
+
+
+def swp_rejections(ctx: dict) -> List[str]:
+    """A model/ override the sim rejected (it used the repo default), or
+    swp_config() raising."""
+    cur = ctx.get("swp_current") or {}
+    out = [str(cur[k]) for k in ("hazard_rejected", "tails_rejected") if cur.get(k)]
+    if cur.get("error"):
+        out.append("swp_config() raised: " + str(cur["error"]))
     return out
 
 
@@ -2134,6 +2303,9 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
     # the headline fill model: swp, else (older sim output) cons
     ctx["fill"] = fill = headline_fill(win if win.by_key else agg)
     ctx["best"] = best_variant(agg, fill)
+    ctx["swp_missing"] = swp_missing(days_events, day, sim_version) if fill == "swp" else None
+    ctx["swp_tables"] = swp_tables(days_events)
+    ctx["swp_current"] = current_swp_tables()
     if day_number(day) >= 1:
         d0 = (_dt.date.fromisoformat(DAY1) - _dt.timedelta(days=1)).isoformat()
         ctx["day0_events"] = len(in_shadow(load_sim_day(d0), rec_start))
@@ -2286,7 +2458,8 @@ def _variant_rows(ctx: dict, fills: Sequence[str]) -> List[List[Any]]:
                 row.append(qty(a["filler_contracts"]) if a.get("filler_contracts") is not None
                            else "-")
                 if "expected (cal. tails)" in cols:
-                    row.append(M(a["net_cal"]) if a.get("net_cal") is not None else "-")
+                    row.append("-" if a.get("net_cal") is None else
+                               M(a["net_cal"]) if cal_ok(ctx.get("policy"), n) else CIRCULAR)
             row += [pct(a["avg_share"]),
                     R(f"{esc(qty(faw['contracts']))} / {m_html(faw['pnl'])}")]
         rows.append(row)
@@ -2594,7 +2767,9 @@ def _cumulative_html(ctx: dict) -> str:
                 se = win.mc_se(key)
                 row.append(usd(se) if se is not None else "-")
             if cal:
-                row.append(M(win.total(key, "net_cal")) if win.has(key, "net_cal") else "-")
+                row.append("-" if not win.has(key, "net_cal") else
+                           M(win.total(key, "net_cal")) if cal_ok(ctx.get("policy"), n)
+                           else CIRCULAR)
         else:
             row += ["-"] * (3 + (1 if swp_x else 0) + (1 if cal else 0))
         for f in others:
@@ -2641,6 +2816,14 @@ def _week_html(ctx: dict) -> str:
     return "".join(out)
 
 
+def _failed_but_loaded(ctx: dict) -> Dict[str, Any]:
+    """Report-day events that failed in this run's sim but whose older sim
+    file is still loaded (event -> its sim_version)."""
+    errs = {e for e, _ in ((ctx.get("sim_summary") or {}).get("errors") or [])}
+    return {str(ev.get("event")): ev.get("sim_version") for ev in ctx.get("events") or []
+            if str(ev.get("event")) in errs}
+
+
 def render_html(ctx: dict) -> str:
     day, agg = ctx["day"], ctx["agg"]
     best, fill = ctx["best"], ctx["fill"]
@@ -2657,11 +2840,47 @@ def render_html(ctx: dict) -> str:
                      f'pre-wrap;font-size:11px;margin:6px 0 0 0;">{esc(ctx["sim_error"])}</pre></div>')
     ss = ctx.get("sim_summary") or {}
     if ss.get("errors"):
+        old = _failed_but_loaded(ctx)
+        if not old:
+            how = " (left out of every figure below)"
+        elif len(old) == len(ss["errors"]):
+            how = (" -- an older sim file of each is still loaded and in the figures below "
+                   "(flagged stale)")
+        else:
+            how = (f" -- {len(old)} of them still show an older sim file in the figures below "
+                   "(flagged stale); the rest are left out")
         parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
                      f'margin:8px 0;"><b style="color:#9a6700;">{len(ss["errors"])} event(s) '
-                     f'failed in the sim</b> (left out of every figure below)'
-                     + table(["event", "error"], [[e, err] for e, err in ss["errors"][:12]],
-                             right=[False, False]) + "</div>")
+                     f'failed in the sim</b>{esc(how)}'
+                     + table(["event", "error", "in the figures"],
+                             [[e, err, (f"older file (SIM_VERSION {old[e]})" if e in old
+                                        else "no")] for e, err in ss["errors"][:12]],
+                             right=[False, False, False]) + "</div>")
+    sm = ctx.get("swp_missing") or {}
+    if sm.get("total"):
+        parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
+                     f'margin:8px 0;"><b style="color:#9a6700;">{sm["total"]} of {sm["events"]} '
+                     f'event(s) in the window have no swp results</b> ('
+                     + esc(", ".join(f"{d} x{n}" for d, n in sorted(sm["by_day"].items())))
+                     + '): the swp columns, the headline, the rules and the verdict cover the '
+                     'other events; opt and cons cover all of them.'
+                     + (table(["event (report day)", "why"], [[e, w] for e, w in sm["day"][:12]],
+                              right=[False, False]) if sm["day"] else "") + "</div>")
+    rej = swp_rejections(ctx)
+    if rej:
+        parts.append(f'<div style="border:2px solid {NEG};background:#fff5f5;padding:8px 10px;'
+                     f'margin:8px 0;"><b style="color:{NEG};">swp table problem</b> -- '
+                     + esc("; ".join(rej))
+                     + '. A rejected model/ override is not used: swp runs on the repo default '
+                     'table. Fix or remove the file (TEMP_SHADOW.md "Fill models").</div>')
+    wdef = (ss.get("window") or {}).get("deferred") or []
+    if wdef:
+        bm = (ss.get("window") or {}).get("budget_min")
+        parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
+                     f'margin:8px 0;"><b style="color:#9a6700;">{len(wdef)} earlier-day event(s) '
+                     f'not re-simmed within the time budget</b> ({esc(f"{bm:g}" if bm else "?")} '
+                     'min): their older sim files, if any, stay in the cumulative figures '
+                     '(flagged stale) and the next report continues the re-sim.</div>')
     w_err = (ss.get("window") or {}).get("errors") or []
     if w_err:
         parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
@@ -2697,7 +2916,11 @@ def render_html(ctx: dict) -> str:
             + f'.<br>Per event-hour ({a["n_events"]}): net {m_html(a["net"] / n)}, reward '
               f'{m_html(a["reward"] / n)}, trading {m_html(a["trading_pnl"] / n)}.'
             + (f'<br>Expected (calibrated tails): {m_html(a["net_cal"])} -- an estimate, see '
-               f'the note under Variants.' if a.get("net_cal") is not None else "")
+               f'the note under Variants.' if a.get("net_cal") is not None
+               and cal_ok(ctx.get("policy"), best) else "")
+            + (f'<br>No calibrated-tails expectation: {esc(best)} quotes live strikes, where it '
+               f'would be circular (the note under Variants).' if a.get("net_cal") is not None
+               and not cal_ok(ctx.get("policy"), best) else "")
             + '</p>')
         if fill == "swp":
             parts.append(note("Chosen on swp net: the sweep-aware fill model, where sweepers "
@@ -2736,7 +2959,8 @@ def render_html(ctx: dict) -> str:
         if "swp" in fills:
             dr = {a.get("draws") for k, a in agg.items() if split_key(k)[1] == "swp"}
             dr.discard(None)
-            parts.append(note(SWP_NOTE.format(draws=(dr.pop() if len(dr) == 1 else "N"))))
+            parts.append(note(SWP_NOTE.format(draws=(dr.pop() if len(dr) == 1 else "N"))
+                              + (" " + swp_tables_text(ctx) if swp_tables_text(ctx) else "")))
             if any(split_key(k)[1] == "swp" and a.get("net_cal") is not None
                    for k, a in agg.items()):
                 parts.append(note(CAL_NOTE))
@@ -2798,6 +3022,14 @@ def subject_line(ctx: dict) -> str:
         s += f" [{len(w_err)} window re-sim errors]"
     if ctx.get("stale_sim"):
         s += f" [{sum(ctx['stale_sim'].values())} stale sim files]"
+    sm = ctx.get("swp_missing") or {}
+    if sm.get("total"):
+        s += f" [{sm['total']} events without swp]"
+    if swp_rejections(ctx):
+        s += " [swp table problem]"
+    wdef = ((ctx.get("sim_summary") or {}).get("window") or {}).get("deferred") or []
+    if wdef:
+        s += f" [{len(wdef)} re-sims deferred]"
     if ctx.get("week"):
         s += f" -- week: {ctx['week']['verdict']}"
     return s
@@ -2809,11 +3041,26 @@ def render_text(ctx: dict) -> str:
         lines.append("THE SIM FAILED: " + ctx["sim_error"].strip().splitlines()[-1])
     errs = (ctx.get("sim_summary") or {}).get("errors") or []
     if errs:
-        lines.append(f"{len(errs)} event(s) failed in the sim, e.g. {errs[0][0]}: {errs[0][1]}")
+        old = _failed_but_loaded(ctx)
+        lines.append(f"{len(errs)} event(s) failed in the sim, e.g. {errs[0][0]}: {errs[0][1]}"
+                     + (f" ({len(old)} still show an older sim file: "
+                        + ", ".join(sorted(old)) + ")" if old else ""))
     w_err = ((ctx.get("sim_summary") or {}).get("window") or {}).get("errors") or []
     if w_err:
         lines.append(f"{len(w_err)} re-sim failure(s) on earlier window days (older output "
                      f"stays in the cumulative figures), e.g. {w_err[0][0]}: {w_err[0][1]}")
+    sm = ctx.get("swp_missing") or {}
+    if sm.get("total"):
+        lines.append(f"{sm['total']} of {sm['events']} event(s) in the window have no swp "
+                     "results (" + ", ".join(f"{d} x{n}" for d, n in sorted(sm["by_day"].items()))
+                     + "): swp figures cover the other events"
+                     + (f", e.g. {sm['day'][0][0]}: {sm['day'][0][1]}" if sm["day"] else "") + ".")
+    for r in swp_rejections(ctx):
+        lines.append("SWP TABLE PROBLEM: " + r + " (the repo default table is used).")
+    wdef = ((ctx.get("sim_summary") or {}).get("window") or {}).get("deferred") or []
+    if wdef:
+        lines.append(f"{len(wdef)} earlier-day event(s) not re-simmed within the time budget: "
+                     "older files stay (flagged stale); the next report continues.")
     stale = ctx.get("stale_sim") or {}
     if stale:
         lines.append(f"{sum(stale.values())} sim file(s) in the window are from an older "
@@ -2829,10 +3076,15 @@ def render_text(ctx: dict) -> str:
                      + (f" +/- {usd(se)} (Monte Carlo se)" if se is not None else "")
                      + f" over {a['n_events']} events"
                      + (f"; expected at calibrated tails {money(a['net_cal'])} (an estimate)"
-                        if a.get("net_cal") is not None else "") + ".")
+                        if a.get("net_cal") is not None and cal_ok(ctx.get("policy"), best)
+                        else "")
+                     + ("; no calibrated-tails expectation (it quotes live strikes: circular)"
+                        if a.get("net_cal") is not None and not cal_ok(ctx.get("policy"), best)
+                        else "") + ".")
         if fill == "swp":
             lines.append("swp = the sweep-aware fill model (sweepers take our 1c orders); the "
-                         "headline, rules and verdict use it.")
+                         "headline, rules and verdict use it."
+                         + (" " + swp_tables_text(ctx) if swp_tables_text(ctx) else ""))
     else:
         lines.append(_empty_reason(ctx))
     act = [s for s in ctx["suggestions"] if not s["suppressed"]][:5]
@@ -2914,9 +3166,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             ws = summary.get("window") or {}
             print(f"[{C.iso(C.utcnow())}] sim: {summary['ok']} ok, {len(summary['pending'])} "
-                  f"pending, {len(summary['errors'])} failed; earlier window days "
-                  f"{len(ws.get('days') or [])}: {ws.get('ok', 0)} ok, "
-                  f"{len(ws.get('pending') or [])} pending, {len(ws.get('errors') or [])} failed")
+                  f"pending, {len(summary['errors'])} failed, "
+                  f"{len(summary.get('swp_errors') or [])} without swp (swp failed); earlier "
+                  f"window days {len(ws.get('days') or [])}: {ws.get('ok', 0)} ok, "
+                  f"{len(ws.get('pending') or [])} pending, {len(ws.get('errors') or [])} failed, "
+                  f"{len(ws.get('deferred') or [])} deferred (budget "
+                  f"{ws.get('budget_min')} min), "
+                  f"{len(ws.get('swp_errors') or [])} without swp"
+                  + (f"; swp_config: {summary['swp_config_error']}"
+                     if summary.get("swp_config_error") else ""))
     ctx = build_context(day, sim_error=sim_error, sim_ran=not args.no_sim,
                         sim_summary=summary)
     page = render_html(ctx)
@@ -2927,8 +3185,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f.write(page)
     os.replace(tmp, path)
     print(path)
-    rc = 1 if sim_error or (summary and (summary["errors"]
-                                          or (summary.get("window") or {}).get("errors"))) else 0
+    # 1 = a sim problem: an event failed, or swp failed for an event (it kept
+    # opt / cons) or for the whole run (swp_config); deferred re-sims are not
+    ws_ = (summary or {}).get("window") or {}
+    rc = 1 if sim_error or (summary and (summary["errors"] or ws_.get("errors")
+                                          or summary.get("swp_errors") or ws_.get("swp_errors")
+                                          or summary.get("swp_config_error"))) else 0
+    if rc == 0 and swp_rejections(ctx):      # a model/ override was rejected (repo table used)
+        rc = 1
     if args.send:
         if not send_report(subject_line(ctx), path, render_text(ctx)):
             rc = 2

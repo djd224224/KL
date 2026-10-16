@@ -842,9 +842,16 @@ class TestQuoteHoursAndFav(unittest.TestCase):
         fo, fn = P("FAV_only"), P("FAV_night")
         self.assertEqual(pol.VARIANTS["FAV_only"],
                          dict(live=False, decided=True, q_pad=0, qual_pads=False,
-                              near_decided_half=False))
+                              near_decided_half=False, fav_min_price_c=50))
         self.assertEqual(fn, dict(fo, quote_hours_et=self.NIGHT))
         self.assertIsNone(pol.DEFAULT_POLICY["quote_hours_et"])
+        # the favorite floor is FAV_* only: every earlier variant keeps 0
+        self.assertEqual(pol.DEFAULT_POLICY["fav_min_price_c"], 0)
+        self.assertEqual(sorted(n for n, ov in pol.VARIANTS.items() if "fav_min_price_c" in ov),
+                         ["FAV_night", "FAV_only"])
+        for bad in (-1, 100, 50.0, "50", True, None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                pol._check_policy(P(fav_min_price_c=bad))
         self.assertEqual([n for n, ov in pol.VARIANTS.items() if ov.get("quote_hours_et")],
                          ["FAV_night"])
         for v in pol.VARIANTS:
@@ -926,41 +933,80 @@ class TestQuoteHoursAndFav(unittest.TestCase):
                          pol.et_hour(T0 + 1800.0) in self.NIGHT)
 
     def test_fav_only_never_rests_a_1c_order(self):
-        """FAV_only = G's favorite joins alone: on any realistic book (the
-        favorite side's bids near the favorite's price), at any fair, no
-        order at 1c -- no longshot pad, no qualification pad, no near-decided
-        quote -- and on a decided strike exactly G0's favorite order."""
+        """FAV_only = G's favorite joins alone: on any book, at any fair, no
+        order under fav_min_price_c (50c) -- no longshot pad, no
+        qualification pad, no near-decided quote, and no favorite "join" at a
+        1-5c reference -- and on a decided strike exactly G0's favorite
+        orders at 50c or more. The books include the fix-pass case (10/16
+        review): the favorite side's levels above a deep 1-5c pad hold under
+        target/5 = 200 contracts, so the reward reference IS the pad and G0
+        bids the favorite there (26OCT1611: YES 99:31, 98:0.01, 94:13 ...)."""
         rng = random.Random(29)
-        fo, g0 = P("FAV_only"), P("G0_nohold")
-        n_fav = 0
-        for _ in range(5000):
+        fo, fn, g0 = P("FAV_only"), P("FAV_night"), P("G0_nohold")
+        n_fav = n_thin = 0
+        for _ in range(8000):
             fx = rng.choice([rng.random(), rng.uniform(0, 0.03), rng.uniform(0.97, 1.0),
                              rng.uniform(0.03, 0.10), rng.uniform(0.90, 0.97)])
             fav_yes = fx >= 0.5
-            hi = {rng.randint(85, 98): float(rng.choice([20, 150, 600, 1500]))
-                  for _ in range(rng.randint(1, 3))}
-            lo = {rng.randint(1, 3): float(rng.choice([20, 150, 600, 1500]))
-                  for _ in range(rng.randint(0, 2))}
-            by, bn = (hi, lo) if fav_yes else (lo, hi)
+            if rng.random() < 0.4:
+                # thin favorite-side top (under target/5 in all) over a deep
+                # 1-5c pad on the SAME side; the longshot side thin or empty
+                fav = {rng.randint(80, 99): float(rng.choice([0.01, 5, 31, 60]))
+                       for _ in range(rng.randint(0, 3))}
+                fav.update({rng.randint(1, 5): float(rng.choice([300, 1500, 5000]))
+                            for _ in range(rng.randint(1, 2))})
+                ls = {rng.randint(1, 3): float(rng.choice([20, 150]))
+                      for _ in range(rng.randint(0, 1))}
+            else:
+                fav = {rng.randint(85, 98): float(rng.choice([20, 150, 600, 1500]))
+                       for _ in range(rng.randint(1, 3))}
+                ls = {rng.randint(1, 3): float(rng.choice([20, 150, 600, 1500]))
+                      for _ in range(rng.randint(0, 2))}
+            by, bn = (fav, ls) if fav_yes else (ls, fav)
             if by and bn and max(by) + max(bn) >= 100:
                 continue
             b = pol.BookView(by, bn)
             risk = rng.choice([NORISK, (200.0, 900.0, 50.0, 3.0)])
             args = (b, fx, rng.choice([None, 0.5, 3.0]), rng.random() < 0.3, True,
                     rng.choice([0, 150, 600]), risk, 1000.0)
-            tags = {}
-            dy, dn, rule = pol.quote_market(fo, *args, tags=tags)
-            self.assertNotIn(1, dy, (fx, by, bn))
-            self.assertNotIn(1, dn, (fx, by, bn))
-            self.assertTrue(all(t == ["fav"] for t in tags.values()), tags)
+            for pv in (fo, fn):
+                tags = {}
+                dy, dn, rule = pol.quote_market(pv, *args, tags=tags)
+                self.assertTrue(all(p >= 50 for p in list(dy) + list(dn)), (fx, by, bn, dy, dn))
+                self.assertTrue(all(t == ["fav"] for t in tags.values()), tags)
             if pol.classify(fx) == "decided" and risk == NORISK:
                 gt = {}
                 gy, gn, _ = pol.quote_market(g0, *args, tags=gt)
                 favs = {k for k, t in gt.items() if "fav" in t}
-                self.assertEqual((dy, dn), ({p: s for p, s in gy.items() if ("yes", p) in favs},
-                                            {p: s for p, s in gn.items() if ("no", p) in favs}))
+                self.assertEqual((dy, dn),
+                                 ({p: s for p, s in gy.items() if ("yes", p) in favs and p >= 50},
+                                  {p: s for p, s in gn.items() if ("no", p) in favs and p >= 50}))
+                n_thin += any(p <= 5 for _, p in favs)
             n_fav += bool(dy or dn)
         self.assertGreater(n_fav, 500)
+        self.assertGreater(n_thin, 100)     # G0 joined the favorite at a 1-5c pad
+
+    def test_fav_floor_on_the_recorded_book(self):
+        # 26OCT1611 at close - 96 s: YES 99:31, 98:0.01, 94:13 over a 1c pad,
+        # fair ~1.0 -> ref_y 1: G0 bids the favorite YES at 1c x300 (tag
+        # fav); FAV_only rests nothing there and says why
+        b = pol.BookView({99: 31.0, 98: 0.01, 94: 13.0, 1: 5000.0}, {})
+        self.assertEqual(b.ref_y, 1)
+        gt = {}
+        gy, gn, _ = pol.quote_market(P("G0_nohold"), b, 0.999, None, False, True, 300,
+                                     NORISK, 1000.0, gt)
+        self.assertGreaterEqual(gy.get(1, 0.0), 300.0)
+        self.assertIn("fav", gt[("yes", 1)])
+        diag = {}
+        dy, dn, rule = pol.quote_market(P("FAV_only"), b, 0.999, None, False, True, 300,
+                                        NORISK, 1000.0, {}, diag)
+        self.assertEqual((dy, dn, rule), ({}, {}, "decided"))
+        self.assertEqual(diag["fav_floor"], {"side": "yes", "price": 1, "min": 50})
+        # a reference at 79c (the dry run's 95 -> 79 move) is still joined
+        b2 = pol.BookView({99: 31.0, 79: 400.0, 1: 5000.0}, {})
+        dy, dn, _ = pol.quote_market(P("FAV_only"), b2, 0.999, None, False, True, 300,
+                                     NORISK, 1000.0)
+        self.assertEqual((dy, dn), ({79: 300.0}, {}))
 
 if __name__ == "__main__":
     unittest.main()

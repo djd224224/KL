@@ -11,7 +11,8 @@ Public API (the Interfaces contract):
     DEFAULT_POLICY, VARIANTS, FILL_MODELS ("opt", "cons", "swp")
     run_event(event_ticker, variants=None, fill_models=FILL_MODELS, model=None,
               until_ts=None, draws=None) -> dict          (sim output schema)
-    run_day(et_day, variants=None, force=False, workers=None) -> List[dict]
+    run_day(et_day, variants=None, force=False, workers=None, deadline=None)
+        -> List[dict]
 CLI:
     python temp_shadow_sim.py day --day YYYY-MM-DD [--force] [--workers N]
     python temp_shadow_sim.py event --event EVT [--variants A,B] [--write]
@@ -36,7 +37,15 @@ same with sweep_tails.json / temp_shadow_sweep_tails.json. Recalibrate:
 temp_shadow_sweep.py calibrate, then export --hazard <out>/hazard.json --to
 <TEMP_SHADOW_DATA>/model/sweep_hazard.json (TEMP_SHADOW.md); the cache key
 holds the hazard / tails identities and the draw count, so a new table
-re-sims the window. The output's top-level "swp" block names them.
+re-sims the window. The output's top-level "swp" block names them, with
+hazard_kind / tails_kind ("repo" | "override") and hazard_rejected /
+tails_rejected. An override that is not a usable table (no non-empty
+'hazard' fit, lam_max <= 0, no size draws; tails without bucket rows) is
+REJECTED: the repo default is used and the rejection is written there (the
+report flags it). swp is contained (fix pass 10/16): if the sweep path
+raises, the event keeps its opt / cons results, has no "|swp" keys and a
+top-level swp_error, and run_day re-sims it next time (_cached_ok wants
+every fill model).
 
 Mechanics (all times are exchange/epoch seconds; our rx ~ exchange time):
   * Ticks: one per second from open to close. Tick i sits at T_i = sec0+i+0.5,
@@ -1130,7 +1139,7 @@ def _resolve_variants(variants) -> Dict[str, dict]:
             raise ValueError(f"variant {name}: unknown policy keys {sorted(bad)}")
         P = dict(DEFAULT_POLICY)
         P.update(ov)
-        pol.check_quote_hours(P)
+        pol.check_values(P)
         if P.get("wcl_resting"):
             # the event-level resting budget needs every market at once; the
             # replay decides per market (cached), so it is not simulated
@@ -1144,11 +1153,67 @@ def _resolve_variants(variants) -> Dict[str, dict]:
 _SWP_CACHE: Dict[str, tuple] = {}
 
 
-def _swp_file(name: str, repo_path: str) -> str:
-    """<TEMP_SHADOW_DATA>/model/<name> when present (a recalibration), else the
-    repo default."""
-    p = os.path.join(C.DATA_ROOT, "model", name)
-    return p if os.path.exists(p) else repo_path
+def check_hazard_doc(doc) -> Optional[str]:
+    """Why a sweep_hazard table cannot be used (None = usable): it must hold a
+    non-empty 'hazard' fit (temp_shadow_sweep.Hazard reads a doc without one
+    as an all-zero table, which silently switches the hidden-sweep channel
+    off), a positive lam_max and the size draws ('sizes_all')."""
+    import temp_shadow_sweep as SW
+    if not isinstance(doc, dict):
+        return "not a JSON object"
+    hz = doc.get("hazard")
+    if not isinstance(hz, dict) or not hz.get("a"):
+        return "no 'hazard' fit (hazard.a missing or empty)"
+    try:
+        h = SW.Hazard(doc)
+    except Exception as e:              # noqa: BLE001
+        return f"Hazard() raised {type(e).__name__}: {e}"
+    if not h.lam_max > 0.0:
+        return f"lam_max {h.lam_max:g} <= 0 (every hidden-sweep rate is zero)"
+    if not doc.get("sizes_all"):
+        return "no 'sizes_all' size draws"
+    return None
+
+
+def check_tails_doc(doc) -> Optional[str]:
+    """Why a sweep_tails table cannot be used (None = usable): bucket rows
+    [lo, hi, model_mean, realized, ci_lo, ci_hi] with 0 <= lo < hi <= 0.5
+    and rates in [0, 1]."""
+    if not isinstance(doc, dict):
+        return "not a JSON object"
+    rows = doc.get("buckets")
+    if not isinstance(rows, list) or not rows:
+        return "no 'buckets'"
+    for r in rows:
+        try:
+            lo, hi, _m, mid, clo, chi = (float(x) for x in r[:6])
+        except (TypeError, ValueError):
+            return f"bucket row {r!r} is not 6 numbers"
+        if not (0.0 <= lo < hi <= 0.5) or not all(0.0 <= x <= 1.0 for x in (mid, clo, chi)):
+            return f"bucket row {r!r} is out of range"
+    return None
+
+
+def _swp_table(name: str, repo_path: str, check) -> Tuple[str, dict, str, Optional[str]]:
+    """(path, doc, kind 'override' | 'repo', why the override was rejected or
+    None). An override in <TEMP_SHADOW_DATA>/model/ that fails `check` falls
+    back to the repo table; an unusable repo table raises."""
+    over = os.path.join(C.DATA_ROOT, "model", name)
+    rejected = None
+    if os.path.exists(over):
+        try:
+            doc = _swp_doc(over)
+            why = check(doc)
+        except Exception as e:          # noqa: BLE001
+            why = f"{type(e).__name__}: {e}"
+        if why is None:
+            return over, doc, "override", None
+        rejected = f"{over}: {why}"
+    doc = _swp_doc(repo_path)
+    why = check(doc)
+    if why is not None:
+        raise ValueError(f"swp table {repo_path} is not usable: {why}")
+    return repo_path, doc, "repo", rejected
 
 
 def _swp_doc(path: str) -> dict:
@@ -1171,16 +1236,18 @@ def swp_config(draws: Optional[int] = None) -> dict:
     (TailCal) and the identity block written into every sim file / checked by
     run_day's cache (draws, rec_mode, channels, seed, the two tables' ids)."""
     import temp_shadow_sweep as SW      # lazy: temp_shadow_sweep imports this module
-    hp = _swp_file("sweep_hazard.json", SWP_HAZARD_REPO)
-    tp = _swp_file("sweep_tails.json", SWP_TAILS_REPO)
-    hz = SW.Hazard(_swp_doc(hp))
-    tc = SW.TailCal(_swp_doc(tp))
+    hp, hdoc, hkind, hrej = _swp_table("sweep_hazard.json", SWP_HAZARD_REPO, check_hazard_doc)
+    tp, tdoc, tkind, trej = _swp_table("sweep_tails.json", SWP_TAILS_REPO, check_tails_doc)
+    hz = SW.Hazard(hdoc)
+    tc = SW.TailCal(tdoc)
     n = int(SWP_DRAWS if draws is None else draws)
     if n < 1:
         raise ValueError("swp draws must be >= 1")
     ident = {"draws": n, "rec_mode": SWP_REC_MODE, "channels": SWP_CHANNELS, "seed": SWP_SEED,
-             "hazard_id": hz.ident(), "hazard_src": hp, "hazard_built": hz.doc.get("built"),
+             "hazard_id": hz.ident(), "hazard_src": hp, "hazard_kind": hkind,
+             "hazard_rejected": hrej, "hazard_built": hz.doc.get("built"),
              "lam_max": _r(hz.lam_max), "tails_id": tc.ident(), "tails_src": tp,
+             "tails_kind": tkind, "tails_rejected": trej,
              "tails_built": tc.doc.get("built"), "sweep_version": SW.SWEEP_VERSION}
     return {"hazard": hz, "tails": tc, "ident": ident}
 
@@ -1289,14 +1356,20 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
     inp = load_event_inputs(event_ticker)
     if model is None:
         model = tmodel.FairModel()
-    swp_cfg = None
+    swp_cfg, swp_err, sh = None, None, None
     if "swp" in fill_models:
-        import temp_shadow_sweep as SW
-        swp_cfg = swp_config(draws)
-        # _Shared plus the tape's 1c taker clusters; the books are _Shared's
-        # (live-order subtraction as configured), so opt / cons are unchanged
-        sh = SW.SweepShared(inp, model, until_ts, subtract=scoring.SUBTRACT_LIVE)
-    else:
+        # contained (fix pass 10/16): a failure in the sweep path costs swp
+        # only -- the event keeps opt / cons, with swp_error and no |swp keys
+        try:
+            import temp_shadow_sweep as SW
+            swp_cfg = swp_config(draws)
+            # _Shared plus the tape's 1c taker clusters; the books are
+            # _Shared's (live-order subtraction as configured), so opt /
+            # cons are unchanged
+            sh = SW.SweepShared(inp, model, until_ts, subtract=scoring.SUBTRACT_LIVE)
+        except Exception as e:          # noqa: BLE001
+            swp_cfg, sh, swp_err = None, None, _swp_error("setup", e)
+    if sh is None:
         sh = _Shared(inp, model, until_ts)
     react0 = float(DEFAULT_POLICY["react_s"])
     mstats = sh.market_stats()
@@ -1306,10 +1379,16 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
         for fm in fill_models:
             if fm != "swp":
                 det[f"{name}|{fm}"] = _Pass(sh, P, fm).run()
-    swp_out = run_swp(sh, Ps, swp_cfg) if swp_cfg is not None else {}
+    swp_out: Dict[str, dict] = {}
+    if swp_cfg is not None:
+        try:
+            swp_out = run_swp(sh, Ps, swp_cfg)
+        except Exception as e:          # noqa: BLE001
+            swp_out, swp_err = {}, _swp_error("run", e)
+    fms = [fm for fm in fill_models if fm != "swp" or swp_out]
     out_vars = {}
     for name in Ps:
-        for fm in fill_models:
+        for fm in fms:
             out_vars[f"{name}|{fm}"] = swp_out[name] if fm == "swp" else det[f"{name}|{fm}"]
     cov = sh.stream_cov or {}
     gaps = cov.get("gaps", 0)
@@ -1340,11 +1419,19 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
         "policies": {name: (variants[name] if isinstance(variants, dict) else VARIANTS.get(name, {}))
                      for name in Ps},
         "flags": flags,
-        "fill_models": list(fill_models),
-        "swp": dict(swp_cfg["ident"]) if swp_cfg is not None else None,
+        "fill_models": fms,
+        "swp": dict(swp_cfg["ident"]) if swp_out else None,
+        **({"swp_error": swp_err} if swp_err else {}),
         "runtime_s": round(time.time() - t_start, 2),
         "sim_version": SIM_VERSION,
     }
+
+
+def _swp_error(stage: str, e: BaseException) -> str:
+    """One line plus the traceback's tail: the swp_error written into a sim
+    file whose sweep path raised (the report shows it)."""
+    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    return f"swp {stage} failed: {type(e).__name__}: {e}"[:400] + "\n" + tb[-1200:]
 
 
 # -- day runner ---------------------------------------------------------------
@@ -1410,11 +1497,15 @@ def _policy_overrides(variants) -> Dict[str, dict]:
     return json.loads(json.dumps(src, default=str))
 
 
-def _cached_ok(doc, want: Dict[str, dict], swp_want: Optional[dict] = None) -> bool:
+def _cached_ok(doc, want: Dict[str, dict], swp_want: Optional[dict] = None,
+               swp_broken: bool = False) -> bool:
     """A sim file is reused only if it is settled, from this SIM_VERSION,
     holds every requested variant x fill model with the same overrides and,
     with swp_want (swp_config()["ident"]), the same swp draws / rec_mode /
-    channels / seed / hazard and tails tables."""
+    channels / seed / hazard and tails tables. A file whose swp failed
+    (swp_error, no |swp keys) is re-simmed -- unless swp_broken (run_day's
+    swp_config() raised: a re-sim could not add swp either, so opt / cons
+    suffice)."""
     if not isinstance(doc, dict) or not doc.get("settled") or doc.get("error"):
         return False
     if str(doc.get("sim_version")) != SIM_VERSION:
@@ -1425,15 +1516,17 @@ def _cached_ok(doc, want: Dict[str, dict], swp_want: Optional[dict] = None) -> b
             return False
     have = doc.get("variants") or {}
     pol = doc.get("policies") or {}
+    need = tuple(fm for fm in FILL_MODELS if not (swp_broken and fm == "swp"))
     for name, ov in want.items():
-        if any(f"{name}|{fm}" not in have for fm in FILL_MODELS):
+        if any(f"{name}|{fm}" not in have for fm in need):
             return False
         if pol.get(name) != ov:
             return False
     return True
 
 
-def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = None) -> List[dict]:
+def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = None,
+            deadline: Optional[float] = None) -> List[dict]:
     """Simulate every settled event of an ET day into sim/<day>/<EVENT>.json.
 
     Existing files are loaded and returned unless force, but only if they hold
@@ -1441,18 +1534,31 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
     current swp configuration (draws, hazard, tails); otherwise the event is
     re-run (and the file rewritten with the requested set).
     Unsettled events come back as {"event", "pending": True, "settled": False};
-    failures as {"event", "error"}."""
+    failures as {"event", "error"}.
+    deadline (epoch s; the report's time budget for re-simming earlier
+    window days): an event whose sim has not started by then is not run and
+    comes back as {"event", "deferred": True, "settled": True}; its existing
+    file (if any) is left as it is, and the next run_day picks it up. The
+    events already running finish.
+    swp_config() raising (an unusable repo table) costs swp only: run_event
+    writes opt / cons with swp_error, and cached files without swp are
+    reused (a re-sim could not add it)."""
     evs = day_events(et_day)
     out_dir = C.sim_dir(et_day)
     want = _policy_overrides(variants)
-    swp_want = swp_config()["ident"] if "swp" in FILL_MODELS else None
+    swp_want, swp_broken = None, False
+    if "swp" in FILL_MODELS:
+        try:
+            swp_want = swp_config()["ident"]
+        except Exception:               # noqa: BLE001 -- run_event records it per event
+            swp_broken = True
     results: List[dict] = []
     todo = []
     for ev in evs:
         path = os.path.join(out_dir, f"{ev}.json")
         if os.path.exists(path) and not force:
             doc = C.read_json(path)
-            if _cached_ok(doc, want, swp_want):
+            if _cached_ok(doc, want, swp_want, swp_broken):
                 results.append(doc)
                 continue
         try:
@@ -1467,18 +1573,37 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
     w = DEFAULT_WORKERS if workers is None else int(workers)
     w = max(1, min(MAX_WORKERS, w, len(todo) or 1))
     draws = swp_want["draws"] if swp_want else None     # the workers' draw count = the cache's
+    def _deferred(ev: str) -> dict:
+        return {"event": ev, "deferred": True, "settled": True}
+
     if w == 1 or len(todo) <= 1:
         for ev, path in todo:
+            if deadline is not None and time.time() >= deadline:
+                results.append(_deferred(ev))
+                continue
             results.append(_day_worker(ev, variants, path, draws))
     else:
-        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
         with ProcessPoolExecutor(max_workers=w, initializer=_lower_priority) as ex:
-            futs = [ex.submit(_day_worker, ev, variants, path, draws) for ev, path in todo]
-            for fu in futs:
-                try:
-                    results.append(fu.result())
-                except Exception as e:      # a dead worker
-                    results.append({"event": "?", "error": f"{type(e).__name__}: {e}"})
+            futs = {ex.submit(_day_worker, ev, variants, path, draws): ev for ev, path in todo}
+            pending = set(futs)
+            dl = deadline
+            while pending:
+                tmo = None if dl is None else max(0.0, dl - time.time())
+                done, pending = wait(pending, timeout=tmo, return_when=FIRST_COMPLETED)
+                for fu in done:
+                    try:
+                        results.append(fu.result())
+                    except Exception as e:      # a dead worker
+                        results.append({"event": futs[fu], "error": f"{type(e).__name__}: {e}"})
+                if dl is not None and time.time() >= dl:
+                    # past the budget: what has not started is deferred; the
+                    # running events finish
+                    for fu in list(pending):
+                        if fu.cancel():
+                            pending.discard(fu)
+                            results.append(_deferred(futs[fu]))
+                    dl = None
     results.sort(key=lambda d: d.get("event", ""))
     return results
 
@@ -1488,9 +1613,13 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
 # --------------------------------------------------------------------------
 
 def _print_event(res: dict) -> None:
-    if res.get("error") or res.get("pending"):
-        print(f"{res.get('event')}: {'PENDING' if res.get('pending') else res.get('error')}")
+    if res.get("error") or res.get("pending") or res.get("deferred"):
+        print(f"{res.get('event')}: " + ("PENDING" if res.get("pending") else
+                                         "DEFERRED" if res.get("deferred") else res.get("error")))
         return
+    if res.get("swp_error"):
+        print(f"{res['event']}: SWP FAILED (opt / cons kept): "
+              + str(res["swp_error"]).splitlines()[0])
     cov = res["coverage"]
     print(f"{res['event']} settled={res['settled']} value={res['settlement_value']} "
           f"book_trusted={cov['book_trusted_frac']} trades={cov['trades']} "

@@ -11,11 +11,14 @@ import tempfile
 os.environ["TEMP_SHADOW_DATA"] = tempfile.mkdtemp(prefix="tsr_test_")
 
 import datetime as _dt          # noqa: E402
+import glob                     # noqa: E402
+import json                     # noqa: E402
 import math                     # noqa: E402
 import random                   # noqa: E402
 import shutil                   # noqa: E402
 import subprocess               # noqa: E402
 import sys                      # noqa: E402
+import time                     # noqa: E402
 import types                    # noqa: E402
 import unittest                 # noqa: E402
 from unittest import mock       # noqa: E402
@@ -1309,6 +1312,14 @@ def write_day_swp(day, rng, hours=range(24), losing_hours=()):
                             erec(ev, variants))
 
 
+# G (decided only) quotes no live strikes: its net_cal is evidence; every
+# other test variant quotes live strikes (live=True), where it is circular
+POLICY_LIVE = R.Policy(dict(DEFAULT_POLICY, live=True),
+                       dict(VARIANTS, G_decidedonly={"decided": True, "q_live": 0,
+                                                     "live": False}))
+
+
+
 class TestSwpHeadline(unittest.TestCase):
     """Jack 2026-10-16, "1": the sweep-aware report column. Three fill-model
     columns; the headline best variant, the rules, the cumulative days + and
@@ -1322,7 +1333,7 @@ class TestSwpHeadline(unittest.TestCase):
         rng = random.Random(21)
         for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
             write_day_swp(day, rng)
-        ctx = R.build_context("2026-10-17", policy=POLICY, with_health=False, now=NOW)
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
         self.assertEqual(ctx["fill"], "swp")
         self.assertEqual(ctx["best"], "G_decidedonly")
         self.assertEqual(ctx["best_swp"], "G_decidedonly")
@@ -1400,7 +1411,7 @@ class TestSwpHeadline(unittest.TestCase):
         for i in range(7):
             write_day_swp((_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat(), rng,
                           hours=range(6))
-        ctx = R.build_context("2026-10-21", policy=POLICY, with_health=False, now=NOW)
+        ctx = R.build_context("2026-10-21", policy=POLICY_LIVE, with_health=False, now=NOW)
         w = ctx["week"]
         self.assertEqual(w["fill"], "swp")
         self.assertEqual(w["best"], "G_decidedonly")
@@ -1423,6 +1434,239 @@ class TestSwpHeadline(unittest.TestCase):
         self.assertIn("the headline uses cons", page)
         self.assertNotIn(">swp (sweep-aware)</th>", page)
         self.assertIn("/day on cons (reward", R.subject_line(ctx))
+
+
+class TestSwpFixPass(unittest.TestCase):
+    """Fix pass 10/16 (review of the swp build): net_cal only where it is not
+    circular; events without swp counted; a failed event whose older file is
+    still loaded named as such; the swp tables named and a rejected override
+    flagged; the re-sim time budget."""
+
+    def setUp(self):
+        clear_data()
+        self._model = os.path.join(DATA, "model", "sweep_hazard.json")
+
+    def tearDown(self):
+        if os.path.exists(self._model):
+            os.remove(self._model)
+        try:
+            import temp_shadow_sim as sim
+            sim._SWP_CACHE.clear()
+        except Exception:
+            pass
+
+    def _days(self, seed=21, days=("2026-10-15", "2026-10-16", "2026-10-17"), **kw):
+        rng = random.Random(seed)
+        for day in days:
+            write_day_swp(day, rng, **kw)
+
+    def test_net_cal_only_for_variants_without_live_quotes(self):
+        self._days()
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
+        self.assertEqual(ctx["best"], "G_decidedonly")
+        self.assertTrue(R.cal_ok(POLICY_LIVE, "G_decidedonly"))
+        self.assertFalse(R.cal_ok(POLICY_LIVE, "D_size"))
+        self.assertFalse(R.cal_ok(POLICY, "G_decidedonly"))         # live unknown -> not shown
+        self.assertFalse(R.cal_ok(POLICY_LIVE, "Z_unknown"))
+        page = R.render_html(ctx)
+        a = ctx["agg"]["G_decidedonly|swp"]
+        self.assertIn(f"Expected (calibrated tails): {R.m_html(a['net_cal'])}", page)
+        # the variants table and the cumulative table: G's figure, (circular) for the rest
+        rows = R._variant_rows(ctx, ["opt", "cons", "swp"])
+        g_row = [r for r in rows if "G_decidedonly" in str(r[0])][0]
+        d_row = [r for r in rows if "D_size" in str(r[0])][0]
+        self.assertNotIn(R.CIRCULAR, g_row)
+        self.assertIn(R.CIRCULAR, d_row)
+        cum = R._cumulative_html(ctx)
+        self.assertEqual(cum.count(f">{R.CIRCULAR}<"), len(VARIANTS) - 1)     # table cells
+        self.assertIn("those cells read", page)                     # the note says why
+        txt = R.render_text(ctx)
+        self.assertIn("expected at calibrated tails", txt)
+
+    def test_live_quoting_best_shows_no_expectation(self):
+        # the review's case: the swp headline is a live-quoting variant
+        # (H_noguard_pull on 10/15): its net_cal is circular -> not shown
+        self._days()
+        pol_ = R.Policy(dict(DEFAULT_POLICY, live=True),
+                        dict(VARIANTS, G_decidedonly={"decided": True, "q_live": 0,
+                                                      "live": True}))
+        ctx = R.build_context("2026-10-17", policy=pol_, with_health=False, now=NOW)
+        self.assertEqual(ctx["best"], "G_decidedonly")
+        page = R.render_html(ctx)
+        self.assertNotIn("Expected (calibrated tails): ", page)
+        self.assertIn("No calibrated-tails expectation: G_decidedonly quotes live strikes", page)
+        txt = R.render_text(ctx)
+        self.assertNotIn("expected at calibrated tails", txt)
+        self.assertIn("no calibrated-tails expectation (it quotes live strikes: circular)", txt)
+        self.assertEqual(R._cumulative_html(ctx).count(f">{R.CIRCULAR}<"), len(VARIANTS))
+        # the week risks line leaves it out too
+        clear_data()
+        rng = random.Random(25)
+        for i in range(7):
+            write_day_swp((_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat(), rng,
+                          hours=range(6))
+        w = R.build_context("2026-10-21", policy=pol_, with_health=False, now=NOW)["week"]
+        fm = [r for r in w["risks"] if r.startswith("Fill model: swp")]
+        self.assertEqual(len(fm), 1)
+        self.assertNotIn("calibrated tails", fm[0])
+        w2 = R.build_context("2026-10-21", policy=POLICY_LIVE, with_health=False, now=NOW)["week"]
+        self.assertTrue(any("expected at calibrated tails" in r for r in w2["risks"]))
+
+    def test_events_without_swp_are_counted(self):
+        self._days(hours=range(6))
+        d = os.path.join(DATA, "sim", "2026-10-17")
+        e1, e2 = event_ticker("2026-10-17", 1), event_ticker("2026-10-17", 2)
+        for ev, extra in ((e1, {"swp_error": "swp run failed: RuntimeError: boom\ntrace"}),
+                          (e2, {"sim_version": "4"})):
+            p = os.path.join(d, f"{ev}.json")
+            doc = C.read_json(p)
+            doc["variants"] = {k: v for k, v in doc["variants"].items() if not k.endswith("|swp")}
+            doc.update(extra)
+            C.write_json_atomic(p, doc)
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
+        self.assertEqual(ctx["fill"], "swp")
+        sm = ctx["swp_missing"]
+        self.assertEqual((sm["total"], sm["events"]), (2, 18))
+        self.assertEqual(sm["by_day"], {"2026-10-17": 2})
+        why = dict(sm["day"])
+        self.assertEqual(why[e1], "swp failed: swp run failed: RuntimeError: boom")
+        self.assertTrue(why[e2].startswith("older sim file (SIM_VERSION 4)")
+                        or why[e2] == "no swp in the sim file", why[e2])
+        self.assertEqual(ctx["agg"]["G_decidedonly|swp"]["n_events"], 4)
+        self.assertEqual(ctx["agg"]["G_decidedonly|cons"]["n_events"], 6)
+        page = R.render_html(ctx)
+        self.assertIn("2 of 18 event(s) in the window have no swp results", page)
+        self.assertIn("RuntimeError: boom", page)
+        self.assertIn("[2 events without swp]", R.subject_line(ctx))
+        self.assertIn("2 of 18 event(s) in the window have no swp results", R.render_text(ctx))
+        # all present: no banner, no flag
+        clear_data()
+        self._days(hours=range(6))
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
+        self.assertEqual(ctx["swp_missing"]["total"], 0)
+        self.assertNotIn("without swp", R.subject_line(ctx))
+        self.assertNotIn("have no swp results", R.render_html(ctx))
+
+    def test_failed_event_with_an_older_file_is_named(self):
+        self._days(days=("2026-10-17",), hours=range(4))
+        loaded = event_ticker("2026-10-17", 1)
+        gone = event_ticker("2026-10-17", 9)
+        ss = {"ok": 3, "pending": [], "deferred": [], "window": {},
+              "errors": [(loaded, "RuntimeError: x"), (gone, "RuntimeError: y")]}
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW,
+                              sim_summary=ss)
+        page = R.render_html(ctx)
+        self.assertIn("2 event(s) failed in the sim", page)
+        self.assertIn("1 of them still show an older sim file in the figures below", page)
+        self.assertNotIn("(left out of every figure below)", page)
+        self.assertIn(f"1 still show an older sim file: {loaded}", R.render_text(ctx))
+        ss["errors"] = [(gone, "RuntimeError: y")]
+        page = R.render_html(R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False,
+                                             now=NOW, sim_summary=ss))
+        self.assertIn("(left out of every figure below)", page)
+        ss["errors"] = [(loaded, "RuntimeError: x")]
+        page = R.render_html(R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False,
+                                             now=NOW, sim_summary=ss))
+        self.assertIn("an older sim file of each is still loaded", page)
+
+    def test_swp_tables_named_and_rejected_override_flagged(self):
+        import temp_shadow_sim as sim
+        repo = sim.swp_config()["ident"]
+        rng = random.Random(4)
+        write_day_swp("2026-10-17", rng, hours=range(3))
+        d = os.path.join(DATA, "sim", "2026-10-17")
+        for p in glob.glob(os.path.join(d, "*.json")):
+            doc = C.read_json(p)
+            doc["swp"] = dict(repo)
+            C.write_json_atomic(p, doc)
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
+        line = R.swp_tables_text(ctx)
+        self.assertEqual(line, f"swp tables: hazard {repo['hazard_id']} (repo default), tails "
+                               f"{repo['tails_id']} (repo default), {repo['draws']} draws.")
+        self.assertIn(line, R.render_html(ctx))
+        self.assertIn(line, R.render_text(ctx))
+        self.assertEqual(R.swp_rejections(ctx), [])
+        self.assertNotIn("swp table problem", R.subject_line(ctx))
+        # the review's malformed override: rejected, the repo table used, flagged
+        os.makedirs(os.path.dirname(self._model), exist_ok=True)
+        with open(self._model, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "built": "x"}, f)
+        sim._SWP_CACHE.clear()
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
+        rej = R.swp_rejections(ctx)
+        self.assertEqual(len(rej), 1)
+        self.assertIn("no 'hazard' fit", rej[0])
+        self.assertEqual(ctx["swp_current"]["hazard_id"], repo["hazard_id"])
+        page = R.render_html(ctx)
+        self.assertIn("swp table problem", page)
+        self.assertIn("[swp table problem]", R.subject_line(ctx))
+        self.assertIn("SWP TABLE PROBLEM", R.render_text(ctx))
+        self.assertEqual(R.main(["--day", "2026-10-17", "--no-sim", "--out",
+                                 os.path.join(DATA, "out", "rej.html")]), 1)
+        # files simmed on two different tables are named as such
+        p0 = sorted(glob.glob(os.path.join(d, "*.json")))[0]
+        doc = C.read_json(p0)
+        doc["swp"] = dict(repo, hazard_id="feedfacefeedface", hazard_kind="override",
+                          hazard_src=os.path.join(DATA, "model", "sweep_hazard.json"))
+        C.write_json_atomic(p0, doc)
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
+        line = R.swp_tables_text(ctx)
+        self.assertTrue(line.startswith("swp tables differ across the window: "), line)
+        self.assertIn("hazard feedfacefeedface (model/ override)", line)
+
+    def test_run_sim_time_budget(self):
+        calls = []
+
+        def run_day(d, *a, deadline=None, **k):
+            calls.append((d, deadline))
+            if deadline is not None:
+                return [{"event": event_ticker(d, 1), "deferred": True, "settled": True},
+                        {"event": event_ticker(d, 2), "variants": {}, "settled": True,
+                         "swp_error": "swp run failed: X\n..."}]
+            return [{"event": event_ticker(d, 3), "variants": {}, "settled": True}]
+        fake_sim = types.SimpleNamespace(run_day=run_day, DEFAULT_POLICY=DEFAULT_POLICY,
+                                         VARIANTS=VARIANTS)
+        with StubModules(temp_shadow_sim=fake_sim):
+            t0 = time.time()
+            err, summary = R.run_sim("2026-10-17", budget_min=7.0)
+        self.assertIsNone(err)
+        self.assertEqual([c[0] for c in calls], ["2026-10-17", "2026-10-15", "2026-10-16"])
+        self.assertIsNone(calls[0][1])                     # the report day: no deadline
+        for _, dl in calls[1:]:
+            self.assertAlmostEqual(dl, t0 + 420.0, delta=5.0)
+        w = summary["window"]
+        self.assertEqual(w["deferred"], [event_ticker("2026-10-15", 1),
+                                         event_ticker("2026-10-16", 1)])
+        self.assertEqual(w["budget_min"], 7.0)
+        self.assertEqual(len(w["swp_errors"]), 2)
+        self.assertEqual(R.RESIM_BUDGET_MIN, 80.0)
+        rng = random.Random(3)
+        write_day_swp("2026-10-17", rng, hours=range(3))
+        ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW,
+                              sim_summary=summary)
+        page = R.render_html(ctx)
+        self.assertIn("2 earlier-day event(s) not re-simmed within the time budget", page)
+        self.assertIn("(7 min)", page)
+        self.assertIn("[2 re-sims deferred]", R.subject_line(ctx))
+        self.assertIn("not re-simmed within the time budget", R.render_text(ctx))
+
+    def test_exit_code_on_swp_failure_not_on_deferral(self):
+        out = os.path.join(DATA, "out", "rc.html")
+
+        def rc_with(res_day, res_win):
+            fake = types.SimpleNamespace(
+                run_day=lambda d, *a, deadline=None, **k: res_win if deadline else res_day,
+                DEFAULT_POLICY=DEFAULT_POLICY, VARIANTS=VARIANTS)
+            with StubModules(temp_shadow_sim=fake):
+                return R.main(["--day", "2026-10-16", "--out", out])
+        ok = [{"event": event_ticker("2026-10-16", 1), "variants": {}, "settled": True}]
+        swp_bad = [{"event": event_ticker("2026-10-16", 2), "variants": {}, "settled": True,
+                    "swp_error": "swp run failed: X"}]
+        deferred = [{"event": event_ticker("2026-10-15", 3), "deferred": True, "settled": True}]
+        self.assertEqual(rc_with(ok, ok), 0)
+        self.assertEqual(rc_with(ok, deferred), 0)          # a deferral is the budget working
+        self.assertEqual(rc_with(swp_bad, ok), 1)           # swp failed (opt / cons kept)
+        self.assertEqual(rc_with(ok, swp_bad), 1)
 
 if __name__ == "__main__":
     unittest.main()

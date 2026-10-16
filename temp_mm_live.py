@@ -284,14 +284,28 @@ assert not (_CFG_NAMES & set(pol.DEFAULT_POLICY)), "Config / policy env names co
 
 
 def parse_hours(raw: Any) -> Optional[List[int]]:
-    """TMM_QUOTE_HOURS_ET: "20,21,0,1" (commas / spaces) -> [20, 21, 0, 1];
-    "", "all", "none", "null" -> None (every hour). ValueError on anything
-    that is not a whole hour 0..23."""
-    s = str(raw).strip().strip("[]").strip()
-    if s.lower() in ("", "all", "none", "null", "any"):
+    """TMM_QUOTE_HOURS_ET: "20,21,0,1" or "[20, 21, 0, 1]" (commas / spaces)
+    -> [20, 21, 0, 1]; "all" / "any" -> None (every hour). An unset or empty
+    variable never reaches here (policy_overrides_from_env skips it: the
+    variant's own quote_hours_et stays). ValueError (the bot refuses to
+    start) on anything that is not a whole hour 0..23, and on "none" /
+    "null" / "[]" / an empty value: in the policy an empty list quotes NO
+    hour while None quotes every hour, so those spellings are ambiguous
+    (fix pass 10/16: "[]" and "none" used to mean every hour, turning
+    FAV_night into 24-hour quoting). To quote nothing, do not start the bot."""
+    s = str(raw).strip()
+    if s.lower() in ("all", "any"):
         return None
+    if s.lower() in ("none", "null"):
+        raise ValueError(f"TMM_QUOTE_HOURS_ET={s!r} is ambiguous: 'all' quotes every hour, "
+                         "a list of ET hours quotes those; to quote nothing do not start the bot")
+    inner = s[1:-1].strip() if s.startswith("[") and s.endswith("]") else s
+    parts = inner.replace(",", " ").split()
+    if not parts:
+        raise ValueError(f"TMM_QUOTE_HOURS_ET={s!r}: an empty list would quote no hour; "
+                         "'all' quotes every hour; to quote nothing do not start the bot")
     out = []
-    for part in s.replace(",", " ").split():
+    for part in parts:
         if not part.isdigit() or not 0 <= int(part) <= 23:
             raise ValueError(f"TMM_QUOTE_HOURS_ET: {part!r} is not an ET hour 0..23")
         out.append(int(part))
