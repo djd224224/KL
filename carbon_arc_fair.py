@@ -485,13 +485,21 @@ def prism_ref(url: str) -> Optional[Tuple[str, str]]:
 # brand sits on a foot-traffic prism the sweep already reads: Domino's Pizza
 # on "QSR Foot Traffic" (with McDonald's), Starbucks on "Coffee Foot Traffic"
 # (with Dutch Bros), Walmart on "Wholesale Foot Traffic" (with Costco,
-# Target). write_fair_file adds these only where the catalog map has no entry,
-# so a fixed settlement link wins. IMM_CA_SERIES_MAP_EXTRA:
+# Target). The same evening (Jack: "Map KXAFRMCC, KXAFTERPAYCC and KXKLARCC
+# to the Carbon Arc 'Buy now, pay later (BNPL)' prism the same way"): the
+# BNPL card-spend series link to the generic carbonarc.ai/prisms page, and
+# Affirm, Afterpay and Klarna are the whole "Buy now, pay later (BNPL)" prism
+# (card-spend insight 626 -- new to the sweep, read once mapped).
+# write_fair_file adds these only where the catalog map has no entry, so a
+# fixed settlement link wins. IMM_CA_SERIES_MAP_EXTRA:
 # "SERIES=prism_id:Entity Name;...".
 _DEFAULT_CA_SERIES_MAP_EXTRA = (
     "KXDPZFT=adc0fbe1-019a-4aad-9ca6-7a6bdce40c0c:Domino's Pizza;"
     "KXSBUXFT=ec1ac3ec-b66e-48f7-9a2e-0a4da319a124:Starbucks;"
-    "KXWMTFT=718a9642-34a5-49bd-9f60-3d5a4bceaa7a:Walmart")
+    "KXWMTFT=718a9642-34a5-49bd-9f60-3d5a4bceaa7a:Walmart;"
+    "KXAFRMCC=b528a1d1-ebf5-4a46-bc1c-eaec177a21e9:Affirm;"
+    "KXAFTERPAYCC=b528a1d1-ebf5-4a46-bc1c-eaec177a21e9:Afterpay;"
+    "KXKLARCC=b528a1d1-ebf5-4a46-bc1c-eaec177a21e9:Klarna")
 CA_SERIES_MAP_EXTRA: Dict[str, dict] = {}
 for _part in os.environ.get("IMM_CA_SERIES_MAP_EXTRA",
                             _DEFAULT_CA_SERIES_MAP_EXTRA).split(";"):

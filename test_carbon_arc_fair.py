@@ -312,7 +312,13 @@ class TestBuildAndWrite(unittest.TestCase):
         # carbonarc.co/welcome link, so the catalog cannot map them
         self.assertEqual(caf.CA_SERIES_MAP_EXTRA["KXDPZFT"]["entity"], "Domino's Pizza")
         self.assertEqual(sorted(caf.CA_SERIES_MAP_EXTRA),
-                         ["KXDPZFT", "KXSBUXFT", "KXWMTFT"])
+                         ["KXAFRMCC", "KXAFTERPAYCC", "KXDPZFT", "KXKLARCC",
+                          "KXSBUXFT", "KXWMTFT"])
+        # the BNPL card series share one prism (Jack 2026-10-16, same evening)
+        self.assertEqual({caf.CA_SERIES_MAP_EXTRA[s]["prism"]
+                          for s in ("KXAFRMCC", "KXAFTERPAYCC", "KXKLARCC")},
+                         {"b528a1d1-ebf5-4a46-bc1c-eaec177a21e9"})
+        self.assertEqual(caf.CA_SERIES_MAP_EXTRA["KXKLARCC"]["entity"], "Klarna")
         p = self.payload["prisms"][0]
         p["entities"].append(_entity("Walmart", [("2026-09-23", 101.5)], HIST))
         extra = {"KXWMTFT": {"prism": p["prism_id"], "entity": "walmart"},   # case-insensitive
