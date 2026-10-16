@@ -20754,7 +20754,7 @@ class TestNflAutoFamilies(unittest.TestCase):
                          imm.NFL_AUTO_INACTIVE_BUFFER_MIN)
 
 
-class TestLeagueAutoFamilies(unittest.TestCase):
+class _LeagueAutoFixture(unittest.TestCase):
     """NBA / WNBA / MLB families auto-enrolled like the NFL ones (Jack
     2026-10-15: "KXWNBAFINALSMVP should be quoted", then "New NBA, WNBA, MLB
     families should be auto quoted like elections, nfl, etc"). No team-news
@@ -20790,7 +20790,26 @@ class TestLeagueAutoFamilies(unittest.TestCase):
         imm.SERIES_HOUR_MULTS = []
         self.urls = []
         self.boards = {"/nba/": {"events": []}, "/wnba/": {"events": []},
-                       "/mlb/": {"events": []}}
+                       "/mlb/": {"events": []}, "/nhl/": {"events": []}}
+        # the lolesports feed (League of Legends members)
+        self.lol_live, self.lol_sched, self.lol_paths = [], [], []
+        self.lol_down = False
+
+    def _lol(self, path):
+        self.lol_paths.append(path)
+        if self.lol_down:
+            raise ConnectionError("lolesports down")
+        if path.startswith("getLive"):
+            return {"data": {"schedule": {"events": list(self.lol_live)}}}
+        if path.startswith("getSchedule"):
+            return {"data": {"schedule": {"events": list(self.lol_sched), "pages": {}}}}
+        raise AssertionError(path)
+
+    @staticmethod
+    def _lol_ev(state, start, block, slug="worlds", mid="m1", codes=("T1", "GEN")):
+        return {"startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "state": state,
+                "type": "match", "blockName": block, "league": {"slug": slug},
+                "match": {"id": mid, "teams": [{"code": c} for c in codes]}}
 
     def _write(self, series):
         with open(imm.league_auto_path(), "w", encoding="utf-8") as f:
@@ -20844,6 +20863,9 @@ class TestLeagueAutoFamilies(unittest.TestCase):
     @staticmethod
     def _sides(bot, t):
         return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+class TestLeagueAutoFamilies(_LeagueAutoFixture):
+    """The NBA / WNBA / MLB rules (the fixture above)."""
 
     def test_the_file_sets_membership_and_guard_sets(self):
         mvp_ov = imm.SERIES_OVERRIDES["KXMLBWSMVP"]
@@ -21046,6 +21068,181 @@ class TestLeagueAutoFamilies(unittest.TestCase):
         self.assertEqual(self._sides(bot, a), set())
         self.assertEqual(self._sides(bot, b), {"bid", "ask"})       # the other event quotes on
         self.assertEqual(bot.state.halted_until, 0.0)                 # whole book untouched
+
+
+class TestLeagueAutoNhlAndLol(_LeagueAutoFixture):
+    """NHL rides the ESPN rules (Jack 2026-10-15: "same with NHL e.g.
+    KXNHLSEASONGOALS, KXNHLSEASONPPTS"); League of Legends rides lolesports'
+    feed (Jack the same day: "also build auto-quoting for esports similar to
+    existing sports categories e.g. KXLOLQUALIFIERS, KXLOLAWARD, KXLOLREGION,
+    KXLOL"): season members only, out while a match of their tournament is
+    live, out for good once their deciding stage is complete."""
+
+    QF = "KXLOLQUALIFIERS-26WORLDSQF-T1"
+    FIN = "KXLOLQUALIFIERS-26WORLDSFIN-T1"
+
+    def test_nhl_season_members_follow_espn_hockey(self):
+        self._write({"KXNHLSEASONGOALS": {"league": "NHL", "kind": "season", "size": "pilot"}})
+        t = "KXNHLSEASONGOALS-27C40-ADEBRINCAT"
+        bot = self._bot([t], close="2068-01-10T00:00:00Z")
+        now = datetime.now(timezone.utc)
+
+        def cycle():
+            bot._mlb_get_cache.clear()
+            bot.run_cycle()
+            return self._sides(bot, t)
+        self.assertEqual(cycle(), {"bid", "ask"})
+        self.boards["/nba/"] = {"events": [self._ev("in", now - timedelta(hours=1))]}
+        self.assertEqual(cycle(), {"bid", "ask"})                     # another league
+        self.boards["/nhl/"] = {"events": [self._ev("in", now - timedelta(hours=1),
+                                                    short="TOR @ BOS")]}
+        self.assertEqual(cycle(), set())                              # hockey is on
+        self.assertTrue(any("/hockey/nhl/scoreboard" in u for u in self.urls))
+        self.assertEqual(imm.series_override("KXNHLSEASONGOALS").size_mult,
+                         imm.LEAGUE_AUTO_SIZE_MULT)
+
+    def test_lol_tournament_and_stage_mapping(self):
+        self.assertEqual(imm.lol_event_tournament("KXLOLQUALIFIERS-26WORLDSQF"), "worlds")
+        self.assertEqual(imm.lol_event_tournament("KXLOL-DCGI26"), "demacia_cup")
+        self.assertEqual(imm.lol_event_tournament("KXLOL-MSI27"), "msi")
+        self.assertIsNone(imm.lol_event_tournament("KXLOLTEEMO-26LCK"))
+        stage = imm.lol_deciding_stage
+        self.assertEqual(stage("KXLOLQUALIFIERS-26WORLDSQF"), "Swiss")
+        self.assertEqual(stage("KXLOLQUALIFIERS-26WORLDSSF"), "Quarterfinals")
+        self.assertEqual(stage("KXLOLQUALIFIERS-26WORLDSFIN"), "Semifinals")
+        for ev in ("KXLOL-WORLDS26", "KXLOLAWARD-WORLDS26FMVP", "KXLOLREGION-WORLDS26",
+                   "KXLOLTOURPENTA-WORLDS26"):
+            self.assertEqual(stage(ev), "Finals", ev)
+        self.assertIsNone(stage("KXLOL-DCGI26"))                        # live rule only
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+        ts = now.timestamp()
+        old = [self._lol_ev("completed", now - timedelta(days=370), "Swiss", mid=f"o{i}")
+               for i in range(3)]                                     # last year's
+        self.assertFalse(imm.lol_stage_complete(old, "Swiss", ts))
+        cur = old + [self._lol_ev("completed", now - timedelta(days=2), "Swiss", mid="c1")]
+        self.assertTrue(imm.lol_stage_complete(cur, "Swiss", ts))
+        cur.append(self._lol_ev("unstarted", now + timedelta(days=1), "Swiss", mid="c2"))
+        self.assertFalse(imm.lol_stage_complete(cur, "Swiss", ts))
+
+    def test_the_lol_hold(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._lol_get = self._lol
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+        ts = now.timestamp()
+
+        def hold(ticker, at):
+            bot._lol_cache.clear()
+            return bot._lol_hold(ticker, at)
+        self.assertEqual(hold(self.QF, ts), "")
+        self.assertTrue(any(p.startswith("getSchedule") and "98767975604431411" in p
+                            for p in self.lol_paths))
+        self.lol_live = [self._lol_ev("inProgress", now - timedelta(minutes=30), "Swiss")]
+        self.assertIn("live", hold(self.QF, ts))
+        self.lol_live = [self._lol_ev("inProgress", now - timedelta(minutes=30), "Groups",
+                                      slug="lck_challengers_league")]
+        self.assertIn("cooldown", hold(self.QF, ts + 60))              # Worlds just ended
+        self.assertEqual(hold(self.QF, ts + 16 * 60), "")              # another league's match
+        self.assertIn("live", hold("KXLOLTEEMO-26LCK-X", ts + 16 * 60))   # unknown: any match
+        self.lol_live = []
+        self.lol_sched = [self._lol_ev("unstarted", now + timedelta(minutes=10), "Swiss")]
+        self.assertIn("past its start", hold(self.QF, ts + 20 * 60))
+        # the Swiss stage done: quarterfinalists decided for good, finalists not
+        self.lol_sched = [self._lol_ev("completed", now - timedelta(days=2), "Swiss", mid="s1"),
+                          self._lol_ev("completed", now - timedelta(days=1), "Swiss", mid="s2"),
+                          self._lol_ev("unstarted", now - timedelta(days=400), "Swiss", mid="z"),
+                          self._lol_ev("unstarted", now + timedelta(days=9), "Quarterfinals",
+                                       mid="q1")]
+        bot._lol_last_live.clear()
+        later = ts + 3600
+        self.assertEqual(hold(self.QF, later), "Swiss complete (worlds)")
+        self.assertEqual(hold(self.FIN, later), "")
+        self.lol_down = True
+        self.assertEqual(hold(self.QF, later), "Swiss complete (worlds)")   # sticky
+        self.assertIn("unreadable", hold(self.FIN, later))                  # fails closed
+
+    def test_lol_members_quote_and_hold_in_the_cycle(self):
+        self._write({"KXLOLQUALIFIERS": {"league": "LOL", "kind": "season", "size": "pilot"}})
+        bot = self._bot([self.QF], close="2068-01-10T00:00:00Z")
+        bot._lol_get = self._lol
+        bot.run_cycle()
+        self.assertIn(self.QF, bot.state.selected)
+        self.assertEqual(self._sides(bot, self.QF), {"bid", "ask"})
+        self.lol_live = [self._lol_ev("inProgress", datetime.now(timezone.utc)
+                                      - timedelta(minutes=20), "Swiss")]
+        bot._lol_cache.clear()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.QF), set())
+
+    def test_the_loader_takes_lol_season_members_only(self):
+        self.assertEqual(self._write({
+            "KXLOLAWARD": {"league": "LOL", "kind": "season"},
+            "KXWORLDSMVP": {"league": "LOL", "kind": "season"},       # LoL by its title
+            "KXLOLGAME": {"league": "LOL", "kind": "game"},           # single matches: no
+            "KXNBAX": {"league": "LOL", "kind": "season"},            # an NBA name
+            "KXNFLX": {"league": "LOL", "kind": "season"},            # never an NFL name
+            "KXLOLQUALIFIERS": {"kind": "season"}}), 2)               # no league named
+        self.assertEqual(set(imm.LEAGUE_AUTO_SERIES), {"KXLOLAWARD", "KXWORLDSMVP"})
+        self.assertEqual(imm.LEAGUE_AUTO_SERIES["KXLOLAWARD"]["league"], "LOL")
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(IncentiveMarketMaker._allowed("KXLOLAWARD-WORLDS26FMVP-FAKER"))
+        ov = imm.series_override("KXLOLAWARD")
+        self.assertTrue(ov.safe_join)
+        self.assertEqual(ov.size_mult, imm.LEAGUE_AUTO_SIZE_MULT)
+        self.assertEqual(imm.pilot_budget_key("KXLOLAWARD-WORLDS26FMVP-FAKER"),
+                         "LEAGUEAUTO:KXLOLAWARD-WORLDS26FMVP")
+
+    def test_the_new_series_pass_takes_lol_and_nhl(self):
+        import imm_earnings_overrides as ieo
+        es = {"category": "Sports", "tags": ["Esports"]}
+        hockey = {"category": "Sports", "tags": ["Hockey"]}
+        meta = {
+            "KXLOLQUALIFIERS": dict(es, title="League of Legends Qualifiers",
+                                    contract_url="https://x/ESPORTSMILESTONES.pdf"),
+            "KXLOLREGION": dict(es, title="Region of Champion",
+                                contract_url="https://x/ESPORTSFUTURE.pdf"),
+            "KXLOLGAME": dict(es, title="League of Legends Game",
+                              contract_url="https://x/ESPORTSGAME.pdf"),
+            "KXCS2": dict(es, title="Counter-Strike 2", contract_url="https://x/ESPORTSFUTURE.pdf"),
+            "KXROSTERT1": dict(es, title="League of Legends T1 roster",
+                               contract_url="https://x/X.pdf"),
+            "KXNHLSEASONGOALS": dict(hockey, title="Player to score X Goals in Season",
+                                     contract_url="https://x/HOCKEYENTITYSTAT.pdf"),
+            "KXNHLCUPWIN": dict(hockey, title="Stanley Cup Champion",
+                                contract_url="https://x/SPORTSFUTURE.pdf")}
+        tickers = ["KXLOLQUALIFIERS-26WORLDSQF-TSW", "KXLOLREGION-WORLDS26-LCK",
+                   "KXLOLGAME-26OCT151400MVKFUR-MVK", "KXCS2-26MAJOR-NAVI",
+                   "KXROSTERT1-27-FAKER", "KXNHLSEASONGOALS-27C40-ADEBRINCAT",
+                   "KXNHLCUPWIN-27-TOR"]
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in tickers]}
+                if path.startswith("/series/"):
+                    return {"series": meta.get(path[8:], {})}
+                raise AssertionError(path)
+        p = mock.patch.object(imm, "ALLOWLIST_ONLY", True)
+        p.start()
+        self.addCleanup(p.stop)
+        sent = []
+        with mock.patch.object(ieo, "league_auto_notify", lambda adds: sent.append(dict(adds))):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+        self.assertEqual(sorted(s for s, _w, _x in enrolled),
+                         ["KXLOLQUALIFIERS", "KXLOLREGION", "KXNHLCUPWIN", "KXNHLSEASONGOALS"])
+        why = {s: w for s, w, _x in review}
+        self.assertIn("single-match", why["KXLOLGAME"])
+        self.assertIn("without a live-match feed", why["KXCS2"])
+        self.assertIn("off-field", why["KXROSTERT1"])
+        with open(imm.league_auto_path(), encoding="utf-8") as f:
+            ser = json.load(f)["series"]
+        self.assertEqual((ser["KXLOLQUALIFIERS"]["league"], ser["KXLOLQUALIFIERS"]["kind"]),
+                         ("LOL", "season"))
+        self.assertEqual(ser["KXNHLSEASONGOALS"]["league"], "NHL")
+        self.assertIsNone(ser["KXNHLSEASONGOALS"]["decided_by"])
+        self.assertEqual(ser["KXNHLCUPWIN"]["decided_by"], "Stanley Cup Final")
+        imm.load_league_auto_series()
+        self.assertTrue(IncentiveMarketMaker._allowed("KXLOLREGION-WORLDS26-LCK"))
+        self.assertIn("lolesports", ieo.league_auto_why(ser["KXLOLQUALIFIERS"]))
 
 
 class TestYouTubeWeeklyPilot(unittest.TestCase):

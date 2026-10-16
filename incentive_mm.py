@@ -4962,19 +4962,22 @@ def mlb_rounds_decided(board) -> Dict[str, str]:
     return out
 
 
-# NBA / WNBA / MLB FAMILIES, AUTO-ENROLLED (Jack 2026-10-15:
+# NBA / WNBA / MLB / NHL FAMILIES, AUTO-ENROLLED (Jack 2026-10-15:
 # "KXWNBAFINALSMVP should be quoted", then "New NBA, WNBA, MLB families
-# should be auto quoted like elections, nfl, etc"). The NFL auto family's
+# should be auto quoted like elections, nfl, etc", then "same with NHL e.g.
+# KXNHLSEASONGOALS, KXNHLSEASONPPTS"; League of Legends rides the same
+# family on a live feed of its own, see LOL_API). The NFL auto family's
 # machinery (NFL_AUTO_ENABLE) for three more leagues. The new-series pass
 # (imm_earnings_overrides.enroll_new_series, run by the 30-min family watch
 # and the overrides task) writes each newly paying, not-yet-allowed KXNBA /
-# KXWNBA / KXMLB series that Kalshi files under Sports with the league's tag
-# (Basketball / Baseball) -- less the off-field contracts (team sales,
+# KXWNBA / KXMLB / KXNHL series that Kalshi files under Sports with the
+# league's tag (Basketball / Baseball / Hockey) -- less the off-field contracts (team sales,
 # franchise values, next team, attendance, plus the NFL family's list) and
 # the families with hand-set rules (league_hand_configured: the sports
 # ladders / escalators, the MLB postseason MVPs, the mention books, the
 # exact sports allowlist) -- into LEAGUE_AUTO_FILE and emails it:
-#   {"series": {S: {"league": "NBA" | "WNBA" | "MLB", "kind": "game" | "season",
+#   {"series": {S: {"league": "NBA" | "WNBA" | "MLB" | "NHL" | "LOL",
+#                   "kind": "game" | "season",
 #                   "buffer_min": int | null, "size": "pilot",
 #                   "decided_by": round | null, "title", "contract", "since"}}}
 # Hot-reloaded by mtime at import and every universe refresh. A member
@@ -4991,7 +4994,8 @@ def mlb_rounds_decided(board) -> Dict[str, str]:
 #                    after it goes final; a board that cannot be read counts
 #                    as live); and with "decided_by" -- the ESPN round its
 #                    result is settled in ("WNBA Finals", "NBA Finals",
-#                    "World Series", "ALCS", "NLCS") -- out for good once that
+#                    "World Series", "ALCS", "NLCS", "Stanley Cup Final") --
+#                    out for good once that
 #                    round is decided: the MLB MVPs' rule, since a Finals MVP
 #                    is announced on the floor minutes after the clinching
 #                    game, before Kalshi closes the event.
@@ -5009,17 +5013,20 @@ def mlb_rounds_decided(board) -> Dict[str, str]:
 LEAGUE_AUTO_ENABLE = os.environ.get("IMM_LEAGUE_AUTO_ENABLE", "1") == "1"
 LEAGUE_AUTO_FILE = "league_auto_series.json"              # in STATUS_DIR
 # series prefix -> league (KXNBA does not prefix KXWNBA: the W comes first)
-LEAGUE_AUTO_PREFIXES = {"KXNBA": "NBA", "KXWNBA": "WNBA", "KXMLB": "MLB"}
+LEAGUE_AUTO_PREFIXES = {"KXNBA": "NBA", "KXWNBA": "WNBA", "KXMLB": "MLB",
+                        "KXNHL": "NHL"}
 LEAGUE_AUTO_GAME_BUFFER_MIN = _env_int("IMM_LEAGUE_AUTO_GAME_BUFFER_MIN", 90)
 LEAGUE_AUTO_SIZE_MULT = _env_float("IMM_LEAGUE_AUTO_SIZE_MULT", NFL_AUTO_SIZE_MULT)
 LEAGUE_AUTO_DAILY_LOSS_LIMIT = _env_float("IMM_LEAGUE_AUTO_DAILY_LOSS_LIMIT", 100)  # per event
 LEAGUE_LIVE_COOLDOWN_MIN = _env_int("IMM_LEAGUE_LIVE_COOLDOWN_MIN", 15)
 LEAGUE_LIVE_TTL_SECS = _env_int("IMM_LEAGUE_LIVE_TTL_SECS", 60)
 # a final that started this long ago is long over (MLB: extra innings)
-LEAGUE_GAME_OVER_AFTER_H = {"NBA": 4.0, "WNBA": 4.0, "MLB": MLB_GAME_OVER_AFTER_H}
-LEAGUE_START_WORD = {"NBA": "tip-off", "WNBA": "tip-off", "MLB": "first pitch"}
+LEAGUE_GAME_OVER_AFTER_H = {"NBA": 4.0, "WNBA": 4.0, "MLB": MLB_GAME_OVER_AFTER_H,
+                            "NHL": 4.0}
+LEAGUE_START_WORD = {"NBA": "tip-off", "WNBA": "tip-off", "MLB": "first pitch",
+                     "NHL": "puck drop"}
 LEAGUE_DECIDED_ROUNDS = frozenset({"NBA Finals", "WNBA Finals", "World Series",
-                                   "ALCS", "NLCS"})
+                                   "ALCS", "NLCS", "Stanley Cup Final"})
 LEAGUE_AUTO_BUDGET_PREFIX = "LEAGUEAUTO:"
 LEAGUE_AUTO_SERIES: Dict[str, dict] = {}
 _league_auto_state: dict = {"mtime": 0.0, "installed": set()}
@@ -5078,6 +5085,116 @@ def league_auto_override(entry: dict) -> "SeriesOverride":
     return SeriesOverride(**kw)
 
 
+# LEAGUE OF LEGENDS (esports; Jack 2026-10-15: "also build auto-quoting for
+# esports similar to existing sports categories e.g. KXLOLQUALIFIERS,
+# KXLOLAWARD, KXLOLREGION, KXLOL"). ESPN does not carry esports, so the LoL
+# members ("league": "LOL" in LEAGUE_AUTO_FILE, written for Kalshi's
+# Esports-tagged League of Legends series) read lolesports.com's own feed
+# (LOL_API getLive / getSchedule, with the x-api-key the site's front end
+# ships: undocumented, so a read that fails means no quotes). SEASON members
+# only: the single-match markets (KXLOLGAME / KXLOLMAP ...) stay in review,
+# because Kalshi's ticker times do not match the official schedule
+# (KXLOLGAME-26OCT151400MVKFUR started 23:00Z on 10/15), so any cutoff would
+# be a guess. A member sits out:
+#   * while a match of its tournament (lol_event_tournament: Worlds / MSI /
+#     EWC / Demacia Cup, else any LoL match) is in progress, or past its
+#     scheduled start and not yet live, plus LEAGUE_LIVE_COOLDOWN_MIN after
+#     the last live sighting;
+#   * for good once its deciding stage (lol_deciding_stage) has every match
+#     of the current edition completed: Worlds quarterfinalists on the Swiss
+#     stage, semifinalists on the quarterfinals, finalists on the semifinals,
+#     everything else (champion, Finals MVP, region, tournament stats) on the
+#     Finals;
+#   * whenever the feed cannot be read.
+LOL_API = os.environ.get("IMM_LOL_API", "https://esports-api.lolesports.com/persisted/gw")
+LOL_API_KEY = os.environ.get("IMM_LOL_API_KEY", "0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z")
+LOL_LEAGUE_IDS = {"worlds": "98767975604431411", "msi": "98767991325878492",
+                  "ewc_lol": "116838530616006090", "demacia_cup": "117126995932274206"}
+LOL_SCHEDULE_TTL_SECS = _env_int("IMM_LOL_SCHEDULE_TTL_SECS", 600)
+LOL_SCHEDULE_PAGES = 3          # older / newer pages followed per read, each way
+LOL_EDITION_DAYS = 150          # an edition's matches start within this of now
+LOL_PAST_START_MAX_H = 12       # an unstarted match past its start this long reads live
+ESPORTS_LEAGUES = frozenset({"LOL"})
+
+
+def lol_get_json(path: str):
+    """One lolesports feed read (LOL_API + path); raises on failure."""
+    r = requests.get(f"{LOL_API}/{path}", timeout=(5, 10), headers={
+        "x-api-key": LOL_API_KEY, "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0 Safari/537.36"})
+    r.raise_for_status()
+    return r.json()
+
+
+def lol_event_tournament(event: str) -> Optional[str]:
+    """The lolesports league slug of a Kalshi LoL event, from its ticker
+    ('KXLOLQUALIFIERS-26WORLDSQF' -> 'worlds'); None = unknown (any LoL match
+    then gates it)."""
+    u = event.upper()
+    if "WORLDS" in u:
+        return "worlds"
+    if "MSI" in u or "MIDSEASON" in u:
+        return "msi"
+    if "DCGI" in u or "DEMACIA" in u:
+        return "demacia_cup"
+    if "EWC" in u:
+        return "ewc_lol"
+    return None
+
+
+def lol_deciding_stage(event: str) -> Optional[str]:
+    """The Worlds stage whose completion decides an event (see LOL_API);
+    None outside Worlds (the live rule alone)."""
+    if lol_event_tournament(event) != "worlds":
+        return None
+    seg = event.split("-")[1].upper() if "-" in event else ""
+    if seg.endswith("QF"):
+        return "Swiss"
+    if seg.endswith("SF"):
+        return "Quarterfinals"
+    if seg.endswith("FIN"):
+        return "Semifinals"
+    return "Finals"
+
+
+def _lol_start_ts(e: dict) -> Optional[float]:
+    d = parse_iso_utc(e.get("startTime", ""))
+    return d.timestamp() if d is not None else None
+
+
+def lol_stage_complete(events: List[dict], stage: str, now_ts: float) -> bool:
+    """Every match of `stage` in the current edition (start within
+    LOL_EDITION_DAYS of now: the feed also carries past years) is completed,
+    and there is at least one."""
+    rows = [e for e in events
+            if (e.get("type") or "match") == "match" and e.get("blockName") == stage
+            and _lol_start_ts(e) is not None
+            and abs(_lol_start_ts(e) - now_ts) <= LOL_EDITION_DAYS * 86400]
+    return bool(rows) and all(e.get("state") == "completed" for e in rows)
+
+
+def lol_live_reason(live: List[dict], schedule: List[dict],
+                    slug: Optional[str], now_ts: float) -> str:
+    """Why LoL reads live for a tournament ('' = it does not): a match in
+    progress on getLive (any league when slug is None), or a scheduled match
+    of the tournament past its start and not yet live."""
+    for e in live:
+        lg = (e.get("league") or {}).get("slug") or ""
+        if (e.get("type") or "match") == "match" and e.get("state") == "inProgress" \
+                and (slug is None or lg == slug):
+            codes = " vs ".join(str(t_.get("code") or "?")
+                                for t_ in (e.get("match") or {}).get("teams") or [])
+            return f"{lg or 'LoL'} {codes or 'match'} live ({e.get('blockName') or 'match'})"
+    for e in schedule:
+        st = _lol_start_ts(e)
+        if e.get("state") == "unstarted" and st is not None \
+                and st <= now_ts <= st + LOL_PAST_START_MAX_H * 3600:
+            return f"{slug} match past its start ({e.get('startTime')}), not yet live"
+    return ""
+
+
 def load_league_auto_series() -> int:
     """Hot-reload LEAGUE_AUTO_FILE by mtime into LEAGUE_AUTO_SERIES and
     (re)install each member's guard set; entries changed on a reload, else 0.
@@ -5099,8 +5216,13 @@ def load_league_auto_series() -> int:
     fresh: Dict[str, dict] = {}
     for s_, e in (data.get("series") or {}).items():
         s_ = str(s_).strip()
+        if not isinstance(e, dict):
+            continue
         league = series_league(s_)
-        if league is None or not isinstance(e, dict):
+        if league is None and e.get("league") in ESPORTS_LEAGUES \
+                and s_.startswith("KX") and not s_.startswith("KXNFL"):
+            league = e["league"]          # esports: the enrollment read the title
+        if league is None:
             continue
         if e.get("league") not in (None, league):
             log(f"[IMM] ! league auto {s_}: league {e.get('league')!r} is not "
@@ -5113,6 +5235,9 @@ def load_league_auto_series() -> int:
             log(f"[IMM] ! refused hand-configured family in league auto: {s_}")
             continue
         kind, size = e.get("kind"), e.get("size") or "pilot"
+        if league in ESPORTS_LEAGUES and kind != "season":
+            log(f"[IMM] ! league auto {s_}: {league} quotes season members only, skipped")
+            continue
         if kind not in ("game", "season") or size != "pilot":
             log(f"[IMM] ! league auto {s_}: kind/size {kind!r}/{size!r} not "
                 f"understood, skipped")
@@ -16671,6 +16796,13 @@ class IncentiveMarketMaker:
         self._league_decided: Dict[str, Dict[str, str]] = {}
         self._league_final_seen: Dict[str, Dict[str, float]] = {}
         self._league_stood_series: Set[str] = set()
+        # League of Legends (_lol_hold, 2026-10-15): the feed reader (tests swap
+        # it), its cache {key: (read_at, data)}, the stages seen complete
+        # ("worlds:Swiss", sticky) and when a tournament was last seen live
+        self._lol_get = lol_get_json
+        self._lol_cache: Dict[str, Tuple[float, Any]] = {}
+        self._lol_decided: Set[str] = set()
+        self._lol_last_live: Dict[str, float] = {}
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
@@ -21888,7 +22020,7 @@ class IncentiveMarketMaker:
             return why or "MLB scoreboard unreadable"
         return ""
 
-    def _league_auto_hold(self, series: str, now_ts: float) -> str:
+    def _league_auto_hold(self, series: str, now_ts: float, ticker: str = "") -> str:
         """Why a league auto family SEASON member sits out now ('' =
         quote): its deciding round ("decided_by") decided on its league's
         ESPN boards -- today's and the MLB_DECIDED_LOOKBACK_DAYS before it,
@@ -21897,6 +22029,8 @@ class IncentiveMarketMaker:
         closed). See LEAGUE_AUTO_ENABLE."""
         e = league_auto_entry(series) or {}
         league = e.get("league") or series_league(series) or ""
+        if league == "LOL":
+            return self._lol_hold(ticker or series, now_ts)
         path = ESPN_LEAGUE_PATHS.get(league)
         if not path:
             return f"no ESPN scoreboard for {league or series}"
@@ -21928,6 +22062,79 @@ class IncentiveMarketMaker:
             LEAGUE_START_WORD.get(league, "the start"))
         if live is not False:
             return why or f"{league} scoreboard unreadable"
+        return ""
+
+    def _lol_live(self, now_ts: float) -> List[dict]:
+        """getLive's events, cached LEAGUE_LIVE_TTL_SECS; raises when unreadable."""
+        c = self._lol_cache.get("live")
+        if c is not None and now_ts - c[0] < LEAGUE_LIVE_TTL_SECS:
+            return c[1]
+        data = self._lol_get("getLive?hl=en-US")
+        evs = list((((data or {}).get("data") or {}).get("schedule") or {}).get("events") or [])
+        self._lol_cache["live"] = (now_ts, evs)
+        return evs
+
+    def _lol_schedule(self, slug: str, now_ts: float) -> List[dict]:
+        """A tournament's schedule -- the default page plus LOL_SCHEDULE_PAGES
+        older and newer pages, deduplicated -- cached LOL_SCHEDULE_TTL_SECS;
+        raises when unreadable."""
+        key = f"sched:{slug}"
+        c = self._lol_cache.get(key)
+        if c is not None and now_ts - c[0] < LOL_SCHEDULE_TTL_SECS:
+            return c[1]
+        base = f"getSchedule?hl=en-US&leagueId={LOL_LEAGUE_IDS[slug]}"
+
+        def page(path):
+            return (((self._lol_get(path) or {}).get("data") or {}).get("schedule") or {})
+        first = page(base)
+        evs = list(first.get("events") or [])
+        for way in ("older", "newer"):
+            tok = (first.get("pages") or {}).get(way)
+            for _ in range(LOL_SCHEDULE_PAGES):
+                if not tok:
+                    break
+                p = page(f"{base}&pageToken={tok}")
+                evs += p.get("events") or []
+                tok = (p.get("pages") or {}).get(way)
+        seen: Set[Any] = set()
+        out: List[dict] = []
+        for e_ in evs:
+            k = (e_.get("match") or {}).get("id") or (e_.get("startTime"), e_.get("blockName"))
+            if k not in seen:
+                seen.add(k)
+                out.append(e_)
+        self._lol_cache[key] = (now_ts, out)
+        return out
+
+    def _lol_hold(self, ticker: str, now_ts: float) -> str:
+        """Why a League of Legends season member sits out now ('' = quote): its
+        deciding stage complete (sticky), a match of its tournament live or
+        just over (the cooldown), or the lolesports feed unreadable (fail
+        closed). See LOL_API."""
+        ev = "-".join(ticker.split("-")[:2])
+        slug = lol_event_tournament(ev)
+        stage = lol_deciding_stage(ev)
+        done = f"{slug}:{stage}"
+        if stage and done in self._lol_decided:
+            return f"{stage} complete ({slug})"
+        try:
+            sched = self._lol_schedule(slug, now_ts) if slug in LOL_LEAGUE_IDS else []
+            live = self._lol_live(now_ts)
+        except Exception as ex:                          # noqa: BLE001
+            return f"lolesports feed unreadable ({type(ex).__name__})"
+        if stage and lol_stage_complete(sched, stage, now_ts):
+            self._lol_decided.add(done)
+            log(f"{self.tag} LoL {slug} {stage} complete: its league auto members stay out")
+            return f"{stage} complete ({slug})"
+        why = lol_live_reason(live, sched, slug, now_ts)
+        k = slug or "*"
+        if why:
+            self._lol_last_live[k] = now_ts
+            return why
+        last = self._lol_last_live.get(k)
+        if last is not None and now_ts - last < LEAGUE_LIVE_COOLDOWN_MIN * 60:
+            return (f"{slug or 'a LoL'} match live {(now_ts - last) / 60:.0f}m ago "
+                    f"(cooldown {LEAGUE_LIVE_COOLDOWN_MIN}m)")
         return ""
 
     def _twk_pnl(self, key: str) -> float:
@@ -24330,18 +24537,19 @@ class IncentiveMarketMaker:
             # live, and for good once their deciding round is. Logged per
             # series.
             if league_auto_season(meta.series):
-                la_why = self._league_auto_hold(meta.series, now_ts)
+                la_why = self._league_auto_hold(meta.series, now_ts, t)
+                la_key = nfl_auto_event_key(t)          # logged per event
                 if la_why:
-                    if meta.series not in self._league_stood_series:
-                        self._league_stood_series.add(meta.series)
-                        log(f"{self.tag} league auto stand-aside {meta.series}: {la_why}")
+                    if la_key not in self._league_stood_series:
+                        self._league_stood_series.add(la_key)
+                        log(f"{self.tag} league auto stand-aside {la_key}: {la_why}")
                     self.cancel_market_orders(t, resting)
                     la_in = {"why": la_why}
                     self._gskip(t, "league_live", lambda: la_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
-                if meta.series in self._league_stood_series:
-                    self._league_stood_series.discard(meta.series)
-                    log(f"{self.tag} league auto resume {meta.series}")
+                if la_key in self._league_stood_series:
+                    self._league_stood_series.discard(la_key)
+                    log(f"{self.tag} league auto resume {la_key}")
             # MLB POSTSEASON MVPs (Jack 2026-10-12: "quote MLB MVPs under a
             # no-quotes-during-games rule", see MLB_MVP_ROUNDS): out while any
             # MLB game is live, and for good once the round is decided.

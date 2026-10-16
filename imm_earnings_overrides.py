@@ -641,7 +641,8 @@ def enroll_new_series(client, dry: bool):
                 enrolled.append((s, nfl_auto_why(entry), sample))
             else:
                 still_review.append((s, f"{why}; nfl auto: {why_not}", sample))
-        elif imm.LEAGUE_AUTO_ENABLE and imm.series_league(s):
+        elif imm.LEAGUE_AUTO_ENABLE and (imm.series_league(s)
+                                         or "Esports" in (se.get("tags") or [])):
             entry, why_not = league_auto_entry_for(client, s, sample, se)
             if entry is not None:
                 league_additions[s] = entry
@@ -1027,11 +1028,12 @@ def nfl_auto_notify(additions: dict) -> None:
 # or has hand-set rules (incentive_mm.league_hand_configured). Every
 # enrollment is emailed (league_auto_notify).
 LEAGUE_AUTO_WHY = "league auto family"
-LEAGUE_AUTO_TAGS = {"NBA": "Basketball", "WNBA": "Basketball", "MLB": "Baseball"}
+LEAGUE_AUTO_TAGS = {"NBA": "Basketball", "WNBA": "Basketball", "MLB": "Baseball",
+                    "NHL": "Hockey"}
 LEAGUE_AUTO_OFFFIELD_CONTRACTS = NFL_AUTO_OFFFIELD_CONTRACTS | frozenset({
     "FRANCHISECOST", "SPORTSTEAMSOLD", "BBALLWHATTEND"})
 LEAGUE_AUTO_OFFFIELD_WORDS = NFL_AUTO_OFFFIELD_WORDS + (
-    "FRANCHISE", "SALE", "SOLD", "ATTEND", "EXPANSION", "RELOCAT")
+    "FRANCHISE", "SALE", "SOLD", "ATTEND", "EXPANSION", "RELOCAT", "ROSTER")
 # incentive_mm.EventStartResolver._espn_game_start's game segment
 _LEAGUE_GAME_SEG_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}[A-Z]{4,10}$")
 
@@ -1060,6 +1062,10 @@ def league_decided_by(league: str, series: str, title: str):
                 w in rest or w in t for w in ("CONF", "EAST", "WEST")):
             return f"{league} Finals"
         return None
+    if league == "NHL":
+        if "STANLEY" in rest or "STANLEY" in t or "CUP FINAL" in t:
+            return "Stanley Cup Final"
+        return None
     if league == "MLB":
         for rnd in ("ALCS", "NLCS"):
             if rnd in rest or rnd in t:
@@ -1071,12 +1077,60 @@ def league_decided_by(league: str, series: str, title: str):
     return None
 
 
+# LEAGUE OF LEGENDS (Jack 2026-10-15: "also build auto-quoting for esports
+# similar to existing sports categories e.g. KXLOLQUALIFIERS, KXLOLAWARD,
+# KXLOLREGION, KXLOL"). Kalshi files esports under Sports with the "Esports"
+# tag. Only League of Legends has a live-match feed (incentive_mm.LOL_API),
+# so a LoL series (KXLOL*, or "League of Legends" / "LoL" in Kalshi's title)
+# joins as a SEASON member with "league": "LOL"; its single-match markets
+# (a dated event with a time and team codes: KXLOLGAME-26OCT151400MVKFUR) stay
+# in review, since Kalshi's ticker times do not match the official schedule.
+# Other esports titles (CS2, Valorant, Dota 2 ...) stay in review until one
+# has a feed.
+_ESPORTS_MATCH_SEG_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}\d{0,4}[A-Z]{3,}$")
+
+
+def esports_title(series: str, se: dict) -> str:
+    """'LOL' for a League of Legends series, else '' (the only esports title
+    with a live feed)."""
+    t = str(se.get("title") or "").upper()
+    if series.startswith("KXLOL") or "LEAGUE OF LEGENDS" in t or re.search(r"\bLOL\b", t):
+        return "LOL"
+    return ""
+
+
+def esports_entry_for(series: str, sample: str, se: dict):
+    """(entry, '') for an Esports-tagged series the league auto family takes
+    (League of Legends season markets), else (None, why not)."""
+    if imm.league_hand_configured(series):
+        return None, "hand-configured family"
+    if not esports_title(series, se):
+        return None, ("an esports title without a live-match feed (only League "
+                      "of Legends has one)")
+    contract = str(se.get("contract_url") or "").rsplit("/", 1)[-1].replace(".pdf", "")
+    rest = series[len("KXLOL"):] if series.startswith("KXLOL") else series[2:]
+    if contract in LEAGUE_AUTO_OFFFIELD_CONTRACTS \
+            or any(w in rest for w in LEAGUE_AUTO_OFFFIELD_WORDS):
+        return None, f"off-field ({contract or 'by name'})"
+    parts = sample.split("-")
+    if len(parts) >= 2 and _ESPORTS_MATCH_SEG_RE.match(parts[1]):
+        return None, ("a single-match esports market: no trusted start time "
+                      "(Kalshi's ticker times differ from the official schedule)")
+    return {"league": "LOL", "kind": "season", "size": "pilot",
+            "title": str(se.get("title") or ""), "contract": contract,
+            "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "sample": sample}, ""
+
+
 def league_auto_entry_for(client, series: str, sample: str, se: dict):
     """(entry for incentive_mm.LEAGUE_AUTO_FILE, '') for a series the league
     auto family takes, else (None, why not)."""
     league = imm.series_league(series)
+    if league is None and se.get("category") == "Sports" \
+            and "Esports" in (se.get("tags") or []):
+        return esports_entry_for(series, sample, se)
     if league is None:
-        return None, "not an NBA / WNBA / MLB series"
+        return None, "not an NBA / WNBA / MLB / NHL series"
     if imm.league_hand_configured(series):
         return None, ("hand-configured family (ladder / escalator, MLB MVP, "
                       "mentions or the exact sports allowlist)")
@@ -1103,6 +1157,10 @@ def league_auto_entry_for(client, series: str, sample: str, se: dict):
 
 def league_auto_why(entry: dict) -> str:
     league = entry["league"]
+    if league == "LOL":
+        return (f"{LEAGUE_AUTO_WHY}: League of Legends season prop, off while a "
+                f"match of its tournament is live (lolesports feed), out for good "
+                f"once its deciding stage is complete, pilot size")
     if entry["kind"] == "game":
         return (f"{LEAGUE_AUTO_WHY}: one {league} game per event, quoted to "
                 f"{entry['buffer_min']}m before the start, pilot size")
@@ -1121,7 +1179,11 @@ def league_auto_notify(additions: dict) -> None:
     lines = [subject, ""]
     for s_, e in sorted(additions.items()):
         lines.append(f"- {s_}: {e.get('title') or '(no title)'} [{e.get('contract') or '?'}]")
-        if e["kind"] == "game":
+        if e["league"] == "LOL":
+            lines.append(f"    tournament prop -- OFF while a match of its tournament "
+                         f"is live on lolesports.com (+{imm.LEAGUE_LIVE_COOLDOWN_MIN} "
+                         f"min), out for good once its deciding stage is complete")
+        elif e["kind"] == "game":
             lines.append(f"    one {e['league']} game per event -- quoted until "
                          f"{e['buffer_min']} min before the start (no team-news "
                          f"feed for this league)")
