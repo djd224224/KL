@@ -28424,6 +28424,170 @@ class TestJoinAhead(unittest.TestCase):
         self.assertEqual(bot._join_ahead_state, {})                       # off: no state
 
 
+class TestLoneReferenceGuard(unittest.TestCase):
+    """2026-10-16, after the LoL Worlds props were baited: one target/5 order
+    inside a wide spread IS the at-reference price, so a 200-lot walked our
+    KXLOLTEEMO bid from 6c to 69c and a seller hit it. A side whose EXTERNAL
+    reference rests on a thin top far above the rest of the book, reached by
+    a jump of our rung, trips the guard; "on" stands that side aside."""
+
+    # the KXLOLTEEMO-WORLDS26-Y bid side at 03:13:22Z, external, best first
+    TEEMO = [(69, 200.0), (9, 25.0), (8, 29.0), (7, 42.0), (6, 2000.0), (1, 2105.0)]
+    T = "KXGOOD-99DEC31-A"
+
+    def test_lone_reference_on_the_teemo_book(self):
+        self.assertEqual(imm.lone_reference(self.TEEMO, 1000.0, 2.0), (69, 200.0, 6))
+
+    def test_thick_tops_and_deep_books_are_not_lone(self):
+        # two 200-lots make 400: thin under x3, not under x2
+        two = [(69, 400.0)] + self.TEEMO[1:]
+        self.assertIsNone(imm.lone_reference(two, 1000.0, 2.0))
+        self.assertEqual(imm.lone_reference(two, 1000.0, 3.0), (69, 400.0, 6))
+        self.assertIsNone(imm.lone_reference([(50, 5000.0), (49, 3000.0)], 1000.0, 2.0))
+        # a side that never reaches target/5 has no reference at all
+        self.assertIsNone(imm.lone_reference([(50, 100.0)], 1000.0, 2.0))
+
+    def test_split_top_and_an_empty_rest(self):
+        # 100 + 100 over two levels is still one thin top
+        self.assertEqual(imm.lone_reference([(70, 100.0), (69, 100.0), (5, 3000.0)],
+                                            1000.0, 2.0), (69, 200.0, 5))
+        # nothing behind the top: the rest reference is 0
+        self.assertEqual(imm.lone_reference([(70, 250.0)], 1000.0, 2.0), (70, 250.0, 0))
+
+    def trip(self, ext, rest_px, window):
+        return imm.lone_ref_trip(ext, 1000.0, rest_px, window, max_mult=2.0, min_gap=15)
+
+    def test_a_jump_into_a_lone_top_trips(self):
+        # our rung rested at 6, 26, 60 and 67 inside the window
+        self.assertEqual(self.trip(self.TEEMO, 69, [6, 26, 60, 67]),
+                         dict(ref=69, top=200.0, rest=6, jump=63))
+        # no rung on the side inside the window: a fresh placement trips too
+        self.assertIsNone(self.trip(self.TEEMO, 69, [])["jump"])
+        # no jump test (a window of 0): the lone top alone trips
+        self.assertEqual(self.trip(self.TEEMO, 69, None)["jump"], 0)
+
+    def test_what_is_left_alone(self):
+        # a rung that has rested there all window
+        self.assertIsNone(self.trip(self.TEEMO, 69, [69, 68, 69]))
+        # a side resting near the rest of the book
+        self.assertIsNone(self.trip(self.TEEMO, 20, []))
+        # a small gap: 200 at 30 over 3,000 at 20
+        self.assertIsNone(self.trip([(30, 200.0), (20, 3000.0)], 30, []))
+        # no reference to rest at
+        self.assertIsNone(self.trip(self.TEEMO, None, []))
+
+    def test_defaults_and_the_mention_books(self):
+        self.assertEqual((imm.LONE_REF_MAX_MULT, imm.LONE_REF_MIN_GAP_C,
+                          imm.LONE_REF_JUMP_WINDOW_MIN), (3.0, 20, 60))
+        self.assertEqual(imm.LONE_REF_GUARD_MODE, "on")
+        for k in ("LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
+                  "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB", "KXEARNINGSMENTIONARITZIA",
+                  "KXWORLDNEWSMENTION"):
+            self.assertFalse(imm.lone_ref_series(s), s)
+        for s in ("KXLOLTEEMO", "KXLOLTOURPENTA", "KXGOOD", "KXOPENSHARE"):
+            self.assertTrue(imm.lone_ref_series(s), s)
+
+    def test_rung_history_across_the_window(self):
+        class Meta:
+            target_size = 1000.0
+        wide = [[6, 2000.0], [1, 2105.0]]                 # YES bids, cents
+        bait = [[69, 200.0]] + wide
+        no = [[27, 1500.0]]                               # asks at 73: a deep side
+        t0 = 1_000_000.0
+
+        def check(bot, yes, own, ref, ts):
+            return bot._lone_ref_check(self.T, Meta, yes, no, [], own, ref, 73, ts)[0]
+
+        on = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "LONE_REF_GUARD_MODE", "on"):
+            self.assertFalse(check(on, wide, [("bid", 6, 100.0)], 6, t0))
+            self.assertTrue(check(on, bait, [("bid", 6, 100.0)], 69, t0 + 30))   # 63c jump
+            self.assertTrue(check(on, bait, [], 69, t0 + 60))                   # stood aside
+            # an hour on with no rung there: still out while the 200-lot rests
+            self.assertTrue(check(on, bait, [], 69, t0 + 60 + 3700))
+            self.assertFalse(check(on, wide, [], 6, t0 + 60 + 3800))            # gone
+        self.assertEqual(on._lone_ref_held, set())
+        # dry follows the top: a rung that has rested at 69 all hour is left alone
+        dry = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "LONE_REF_GUARD_MODE", "dry"):
+            self.assertFalse(check(dry, wide, [("bid", 6, 100.0)], 6, t0))
+            self.assertTrue(check(dry, bait, [("bid", 6, 100.0)], 69, t0 + 30))
+            self.assertTrue(check(dry, bait, [("bid", 69, 100.0)], 69, t0 + 60))
+            self.assertFalse(check(dry, bait, [("bid", 69, 100.0)], 69, t0 + 60 + 3601))
+        # change points only: one entry per price, not one per cycle
+        self.assertEqual(len(dry._lone_ref_rungs[(self.T, "bid")]), 1)
+
+    def _cycles(self, mode, books, side="bid"):
+        """One selecting cycle on FakeClient's book, then one cycle per entry
+        of `books`: YES bids as [[dollars, size]] (the NO side then 1,500 at
+        27c, i.e. asks at 73c), or a (YES bids, NO bids) pair. Returns the bot
+        and the YES prices of its non-pad `side` orders after each cycle."""
+        _clean_persist()
+        seen = []
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "LONE_REF_GUARD_MODE", mode), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"), \
+                mock.patch.object(imm, "LEVELS", [(0, 100)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 300.0), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertIn(self.T, bot.state.selected)
+            for book in books:
+                yes, no = book if isinstance(book, tuple) else (book, [["0.27", "1500"]])
+                bot.client.books[self.T] = {"orderbook_fp": {
+                    "yes_dollars": yes, "no_dollars": no}}
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                seen.append(sorted({o["yes_price"] for o in bot.state.sim_orders.values()
+                                    if o["ticker"] == self.T and o["book_side"] == side
+                                    and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}))
+        return bot, seen
+
+    WIDE = [["0.01", "2105"], ["0.06", "2000"]]
+    BAIT = WIDE + [["0.69", "200"]]
+
+    def test_on_stands_the_bid_aside_and_comes_back(self):
+        bot, seen = self._cycles("on", [self.WIDE, self.BAIT, self.BAIT, self.WIDE])
+        self.assertEqual(seen[0], [6])          # the plain reference
+        self.assertEqual(seen[1], [])           # the 200-lot lands: bid side out
+        self.assertEqual(seen[2], [])           # ...and stays out while it rests
+        self.assertEqual(seen[3], [6])          # gone: back at the reference
+        self.assertEqual(bot._lone_ref_held, set())
+
+    def test_dry_and_off_follow_the_top(self):
+        bot, seen = self._cycles("dry", [self.WIDE, self.BAIT])
+        self.assertEqual(seen, [[6], [69]])
+        self.assertEqual(bot._lone_ref_held, {(self.T, "bid")})
+        bot, seen = self._cycles("off", [self.WIDE, self.BAIT])
+        self.assertEqual(seen, [[6], [69]])
+        self.assertEqual(bot._lone_ref_held, set())
+
+    def test_on_leaves_a_deep_top_alone(self):
+        # 2,000 at 69 is a real level, not a lone top: the bid joins it
+        _bot, seen = self._cycles("on", [self.WIDE, self.WIDE + [["0.69", "2000"]]])
+        self.assertEqual(seen, [[6], [69]])
+
+    def test_on_guards_the_ask_side_in_no_prices(self):
+        # bids 2,000 at 20; NO bids 3,000 at 15c (asks at 85), then a 200-lot
+        # NO bid at 69c pulls the ask reference down to 31c
+        yes = [["0.20", "2000"]]
+        wide_no = [["0.01", "2105"], ["0.15", "3000"]]
+        bait_no = wide_no + [["0.69", "200"]]
+        bot, seen = self._cycles("on", [(yes, wide_no), (yes, bait_no), (yes, wide_no)],
+                                 side="ask")
+        self.assertEqual(seen, [[85], [], [85]])
+        _bot, seen = self._cycles("off", [(yes, wide_no), (yes, bait_no)], side="ask")
+        self.assertEqual(seen, [[85], [31]])
+
+    def test_offsets_mode_skips_the_check(self):
+        with mock.patch.object(imm, "LADDER_MODE", "offsets"):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot._lone_ref_rungs, {})
+
+
 class TestPresRunNoSideOnly(unittest.TestCase):
     """KXPRESRUN (Jack 2026-10-11: "allowlist KXPRESRUN family. for
     KXPRESRUN-28 specifically, quote the No side and use a 6x multiplier"):

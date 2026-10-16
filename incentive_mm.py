@@ -9274,6 +9274,9 @@ _CONFIG_CODE_KNOBS = (
     # join ahead of the pile (2026-10-11)
     "JOIN_AHEAD_MODE", "JOIN_AHEAD_MIN_GAIN", "JOIN_AHEAD_MIN_DAY",
     "JOIN_AHEAD_MIN_AHEAD", "JOIN_AHEAD_MIN_TICKS", "JOIN_AHEAD_EXCLUDE",
+    # lone-reference guard (2026-10-16)
+    "LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
+    "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -15956,6 +15959,113 @@ def ladder_reference_prices(yes_levels: List[List[float]],
     return rb, (100 - rn) if rn is not None else None
 
 
+# LONE-REFERENCE GUARD (2026-10-16, after the League of Legends Worlds props
+# were baited). Under LADDER_MODE atref a side rests AT Kalshi's reward
+# reference: the first level, best first, where the cumulative size reaches
+# target/5. One order of target/5 contracts inside a wide spread therefore IS
+# our price. On 10/16 03:01-03:43Z a 200-lot (target 1000) walked the
+# KXLOLTEEMO / KXLOLTOURPENTA references from 2-10c up to 62-93c within
+# minutes. The bot followed each step. A seller then sold exactly our size 16
+# times, while the 200-lot ahead of us was pulled before each hit: about -$275
+# at mid for $0.34 of reward. Safe-join cannot help, since it is capped at the
+# reference.
+# A side TRIPS (lone_ref_trip) when all three hold:
+#   * its EXTERNAL reference (our own orders netted out) rests on a thin top,
+#     i.e. the external size at or above it is under LONE_REF_MAX_MULT x
+#     target/5;
+#   * where the side would rest sits >= LONE_REF_MIN_GAP_C above the
+#     reference the rest of the external book sets (0 when that never
+#     reaches target/5);
+#   * our rung got there by a jump: within the last LONE_REF_JUMP_WINDOW_MIN
+#     minutes it rested >= LONE_REF_MIN_GAP_C lower, or there was no rung on
+#     that side at all (a window of 0 drops this test).
+# A rung that has rested at its price for the whole window is left alone. A
+# side the guard holds out has no rung, so it stays out while the thin top
+# lasts. The mention books (LONE_REF_SKIP) have their own live gates and are
+# not checked.
+# Measured on 9/30-10/16 (41M book snapshots replayed, the bot's own share
+# model, fills at the dashboard's 4h markout), mention books out:
+#   * these defaults (x3, 20c, 60 min) give up ~$21/day of reward and avoid
+#     ~$48/day of fills, net ~+$27/day (+$13/day without 10/16);
+#   * x1.5 gives up ~$7/day for ~+$22/day net;
+#   * every rule WITHOUT the jump test loses (x3 20c: -$18/day).
+# IMM_LONE_REF_GUARD (on since 2026-10-16, Jack: "Ship the lone-reference
+# guard on at x3 / 20c / 60 min with mention books skipped"):
+#   "on"  stands a tripped side aside: no rungs that cycle, and the requote
+#         cancels the resting ones;
+#   "dry" logs each trip (its rung still follows the top, so dry shows where
+#         trips start, not how long "on" would hold);
+#   "off" skips the check.
+LONE_REF_GUARD_MODE = os.environ.get("IMM_LONE_REF_GUARD", "on").strip().lower()
+LONE_REF_MAX_MULT = _env_float("IMM_LONE_REF_MAX_MULT", 3.0)
+LONE_REF_MIN_GAP_C = _env_int("IMM_LONE_REF_MIN_GAP_C", 20)
+LONE_REF_JUMP_WINDOW_MIN = _env_int("IMM_LONE_REF_JUMP_WINDOW_MIN", 60)
+LONE_REF_SKIP: Tuple[str, ...] = tuple(
+    p.strip() for p in os.environ.get("IMM_LONE_REF_SKIP", "MENTION").split(",")
+    if p.strip())
+
+
+def lone_ref_series(series: str) -> bool:
+    """Is this series checked by the lone-reference guard? (Not the
+    LONE_REF_SKIP name parts: the mention books.)"""
+    return not any(p in series for p in LONE_REF_SKIP)
+
+
+def lone_reference(ext_levels_best_first: List[Tuple[int, float]], target: float,
+                   max_mult: Optional[float] = None
+                   ) -> Optional[Tuple[int, float, int]]:
+    """(reference, top size, rest reference) when one side's EXTERNAL reward
+    reference rests on a thin top -- external size at or above it under
+    max_mult x target/5 -- else None. The rest reference is the one the
+    external levels below the thin top set (0 when they never reach
+    target/5). One side, own price space, best price first."""
+    if max_mult is None:
+        max_mult = LONE_REF_MAX_MULT
+    ref = side_reference_level(ext_levels_best_first, target)
+    if ref is None:
+        return None
+    top = sum(q for p, q in ext_levels_best_first if p >= ref)
+    if top >= max_mult * target / 5.0:
+        return None
+    rest = side_reference_level([(p, q) for p, q in ext_levels_best_first
+                                 if p < ref], target)
+    return ref, top, (rest if rest is not None else 0)
+
+
+def lone_ref_trip(ext_levels_best_first: List[Tuple[int, float]], target: float,
+                  rest_px: Optional[int], rung_window: Optional[List[int]],
+                  max_mult: Optional[float] = None,
+                  min_gap: Optional[int] = None) -> Optional[dict]:
+    """The lone-reference guard's verdict for one side (see
+    LONE_REF_GUARD_MODE): None when it does not trip, else {ref, top, rest,
+    jump}. `rest_px` is where the side would rest and `rung_window` the
+    prices our rung on that side rested at within the jump window ([] = no
+    rung there, None = no jump test), all in the side's own price space (YES
+    cents for a bid, NO cents for an ask). `jump` is None for a fresh rung
+    and 0 without a jump test."""
+    if max_mult is None:
+        max_mult = LONE_REF_MAX_MULT
+    if min_gap is None:
+        min_gap = LONE_REF_MIN_GAP_C
+    if rest_px is None or target <= 0:
+        return None
+    lr = lone_reference(ext_levels_best_first, target, max_mult)
+    if lr is None:
+        return None
+    ref, top, rest = lr
+    if rest_px < rest + min_gap:
+        return None
+    if rung_window is None:
+        jump: Optional[int] = 0
+    elif not rung_window:
+        jump = None
+    else:
+        jump = rest_px - min(rung_window)
+        if jump < min_gap:
+            return None
+    return dict(ref=ref, top=top, rest=rest, jump=jump)
+
+
 def _side_share(levels_best_first: List[Tuple[int, float]], own: Dict[int, float],
                 target: float, df: float) -> Tuple[float, bool]:
     """Our expected score share for one side of the book.
@@ -17201,6 +17311,12 @@ class IncentiveMarketMaker:
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
         self._join_ahead_state: Dict[Tuple[str, str], int] = {}
+        # (ticker, side) -> change points (ts, own-space price or None) of
+        # where our rung rested, for the lone-reference guard's jump test;
+        # and the sides it holds right now
+        self._lone_ref_rungs: Dict[Tuple[str, str],
+                                   Deque[Tuple[float, Optional[int]]]] = {}
+        self._lone_ref_held: Set[Tuple[str, str]] = set()
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # full cycles this PROCESS completed: the watchdog hands the book over
         # only after the first one (WATCHDOG_HANDOFF)
@@ -21998,6 +22114,66 @@ class IncentiveMarketMaker:
         log(f"{self.tag} Carbon Arc late-month: {event_ticker} {_b} / {_a} "
             f"(inside {CA_LATE_DAYS:g}d of the measurement month's end){_tail}")
 
+    # ---- lone-reference guard (2026-10-16, LONE_REF_GUARD_MODE) ------------
+
+    def _lone_ref_check(self, t: str, meta, yes_levels, no_levels, own_in_book,
+                        own, ref_bid_px: Optional[int], ref_ask_px: Optional[int],
+                        now_ts: float) -> Tuple[bool, bool]:
+        """(bid, ask): True for a side the lone-reference guard trips this
+        cycle (LONE_REF_GUARD_MODE). The book is netted of `own_in_book`.
+        The jump test reads `own`, our resting orders (live or simulated):
+        each side's top price is kept as change points over the window
+        (None = no rung). Logs each hold and clear once."""
+        ext_yes, ext_no = external_levels(yes_levels, no_levels, own_in_book)
+        win_start = now_ts - LONE_REF_JUMP_WINDOW_MIN * 60.0
+        tag = "" if LONE_REF_GUARD_MODE == "on" else " (dry)"
+        out: List[bool] = []
+        for side, ref_yes, ext in (("bid", ref_bid_px, ext_yes),
+                                   ("ask", ref_ask_px, ext_no)):
+            key = (t, side)
+            own_px = (None if ref_yes is None
+                      else ref_yes if side == "bid" else 100 - ref_yes)
+            # where our rung rests now, before this cycle's requote (own
+            # price space): the price a move to the reference jumps from
+            mine = [int(px) if bs == "bid" else 100 - int(px)
+                    for bs, px, _n in own if bs == side]
+            cur = max(mine) if mine else None
+            hist = self._lone_ref_rungs.setdefault(key, deque())
+            if not hist or hist[-1][1] != cur:
+                hist.append((now_ts, cur))
+            # keep the change point in force at the window's start
+            while len(hist) > 1 and hist[1][0] <= win_start:
+                hist.popleft()
+            window = ([p for _ts, p in hist if p is not None]
+                      if LONE_REF_JUMP_WINDOW_MIN > 0 else None)
+            if hist[-1][1] is None and hist[-1][0] <= win_start:
+                del self._lone_ref_rungs[key]      # no rung all window
+            trip = lone_ref_trip(levels_desc(ext), meta.target_size, own_px, window)
+            if trip and key not in self._lone_ref_held:
+                self._lone_ref_held.add(key)
+
+                def yes(p: int, _side: str = side) -> int:
+                    return p if _side == "bid" else 100 - p
+
+                if trip["jump"] is None:
+                    how = "; no rung there before"
+                elif trip["jump"]:
+                    how = (f"; our rung jumped {trip['jump']}c in "
+                           f"{LONE_REF_JUMP_WINDOW_MIN}m")
+                else:
+                    how = ""
+                log(f"{self.tag} lone-ref guard{tag} {t} {side}: the reference "
+                    f"{yes(trip['ref'])}c rests on {trip['top']:.0f} external "
+                    f"contracts (< {LONE_REF_MAX_MULT:g} x "
+                    f"{meta.target_size / 5.0:.0f}), the rest of the book's is "
+                    f"{yes(trip['rest'])}c{how} -- "
+                    + ("side stood aside" if not tag else "would stand aside"))
+            elif not trip and key in self._lone_ref_held:
+                self._lone_ref_held.discard(key)
+                log(f"{self.tag} lone-ref guard{tag} {t} {side}: clear")
+            out.append(bool(trip))
+        return out[0], out[1]
+
     # ---- join ahead of the pile (2026-10-11, JOIN_AHEAD_MODE) --------------
 
     def _join_ahead(self, t: str, meta, yes_levels, no_levels, own_in_book,
@@ -25059,6 +25235,19 @@ class IncentiveMarketMaker:
             # capped so hour x ref <= TOTAL_SIZE_MULT_CAP
             ref_bid_px, ref_ask_px = ladder_reference_prices(
                 yes_levels, no_levels, meta.target_size)
+            # LONE-REFERENCE GUARD (LONE_REF_GUARD_MODE): a side whose
+            # reference rests on a thin external top our rung would jump to
+            # stands aside ("on": no rungs this cycle) or is logged ("dry")
+            if (LONE_REF_GUARD_MODE in ("on", "dry") and LADDER_MODE == "atref"
+                    and lone_ref_series(meta.series)):
+                lr_bid, lr_ask = self._lone_ref_check(
+                    t, meta, yes_levels, no_levels, own_in_book, own,
+                    ref_bid_px, ref_ask_px, now_ts)
+                if LONE_REF_GUARD_MODE == "on":
+                    if lr_bid:
+                        lv_bid = []
+                    if lr_ask:
+                        lv_ask = []
             side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
@@ -27994,6 +28183,17 @@ class IncentiveMarketMaker:
                         f"(the monitoring)" if SWEEP_HOLDOUT > 0 else "")
                      + f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
                "off": ""}.get(SWEEP_BREAKER, ""))
+        _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
+        log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
+            + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "
+               f"target/5 external contracts, >= {LONE_REF_MIN_GAP_C}c above the "
+               f"rest of the book's, that our rung jumped to within "
+               f"{LONE_REF_JUMP_WINDOW_MIN} min, "
+               + ("stands aside" if LONE_REF_GUARD_MODE == "on"
+                  else "is logged, nothing pulled")
+               + f"; not checked: {','.join(LONE_REF_SKIP) or 'nothing'}"
+               if _lr_live and LADDER_MODE == "atref"
+               else " (inactive: needs IMM_LADDER_MODE=atref)" if _lr_live else ""))
         log("mid-move breaker: "
             + ("EVERY series (IMM_BREAKERS=1)" if BREAKERS_ENABLED else
                (",".join(sorted(MOVE_BREAKER_SERIES)) + " only (2026-10-09)")
