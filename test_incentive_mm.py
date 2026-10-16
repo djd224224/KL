@@ -28681,5 +28681,99 @@ class TestSweepBreakerLinked(TestSweepBreaker):
         self.assertEqual(sorted(oid for oid, _r in self.cancelled), ["o2", "o3"])
 
 
+class TestCarbonArcShadow(unittest.TestCase):
+    """Jack 2026-10-16: "build B2, C and D in shadow mode for the November
+    array listings" -- the empty-book rule (C) and the 1-99 band within the
+    fair (D) are LOGGED from the live / shadow-array Carbon Arc read, never
+    quoted."""
+
+    T = "KXSODAARRAY-26NOV03-T94"
+    BOOK = [[1, 22000.0], [3, 2333.0], [4, 996.0]]     # the 10/16 placeholder ladder
+
+    def setUp(self):
+        self.now = utc(2026, 10, 16, 14, 0).timestamp()
+        self._p = mock.patch.dict(imm._ca_fair_state, {
+            "entries": {}, "moved_at": {},
+            "array_shadow": {"KXSODAARRAY": {"mu": 90.0, "sigma": 2.0, "month": "2026-10",
+                                             "ts": self.now, "category": "point of sale"}}})
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def meta(self, ticker=None, start=utc(2026, 10, 16, 0, 1)):
+        t = ticker or self.T
+        return imm.MarketMeta(ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                              series=t.split("-")[0], dollars_per_day=18.47,
+                              program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None, close_time=None,
+                              program_start=start)
+
+    def test_band_comes_from_the_live_read_else_the_array_shadow(self):
+        lo, hi, src = imm.ca_shadow_band(self.T, self.now)
+        self.assertEqual(src, "array_shadow")
+        self.assertLess(lo, hi)
+        self.assertAlmostEqual(hi, 100 * imm._p_above(94.0, 90.0, 2.0), places=6)
+        # stale, or another month's read: no band
+        self.assertIsNone(imm.ca_shadow_band(self.T, self.now + imm.CA_FAIR_TTL_MIN * 60 + 1))
+        self.assertIsNone(imm.ca_shadow_band("KXSODAARRAY-26DEC03-T94", self.now))
+        # a live read wins
+        with mock.patch.dict(imm._ca_fair_state, {"entries": {"KXSODAARRAY": {
+                "mu": 99.0, "sigma": 2.0, "month": "2026-10", "ts": self.now,
+                "category": "point of sale"}}}):
+            self.assertEqual(imm.ca_shadow_band(self.T, self.now)[2], "live")
+
+    def test_empty_book_and_wide_band_quote_only_the_side_the_fair_clears(self):
+        # T94 with the array ~90: YES is ~2% -- selling YES is safe, buying is not
+        p = imm.ca_shadow_proposals(self.meta(), self.BOOK, self.BOOK, 4, 96, self.now)
+        self.assertEqual(p["C"]["sides"], [["ask", 95]])       # one tick inside 96
+        self.assertEqual(p["C"]["by_size"]["1000"]["share"], 0.5)  # 100% of one side
+        self.assertEqual(p["C"]["by_size"]["200"]["share"], 0.1433)
+        self.assertEqual(p["D"]["sides"], [["ask", 96]])       # joins the 96c touch
+        self.assertFalse(p["D"]["eligible"])                   # an October program
+        # T84: YES ~100% -- the bid side only
+        p = imm.ca_shadow_proposals(self.meta("KXSODAARRAY-26NOV03-T84"),
+                                    self.BOOK, self.BOOK, 4, 96, self.now)
+        self.assertEqual(p["C"]["sides"], [["bid", 5]])
+        self.assertEqual(p["D"]["sides"], [["bid", 4]])
+        # at the money both sides clear the band
+        p = imm.ca_shadow_proposals(self.meta("KXSODAARRAY-26NOV03-T90"),
+                                    self.BOOK, self.BOOK, 4, 96, self.now)
+        self.assertEqual(p["C"]["sides"], [["bid", 5], ["ask", 95]])
+        # a November program is D-eligible
+        p = imm.ca_shadow_proposals(self.meta(start=utc(2026, 11, 16, 0, 1)),
+                                    self.BOOK, self.BOOK, 4, 96, self.now)
+        self.assertTrue(p["D"]["eligible"])
+
+    def test_nothing_to_log_on_a_real_book_or_without_a_fair(self):
+        real = [[40, 300.0], [39, 900.0]]
+        self.assertIsNone(imm.ca_shadow_proposals(self.meta(), real, real, 40, 60, self.now))
+        with mock.patch.dict(imm._ca_fair_state, {"array_shadow": {}}):
+            self.assertIsNone(imm.ca_shadow_proposals(self.meta(), self.BOOK, self.BOOK,
+                                                      4, 96, self.now))
+        # a thin placeholder (under the target) is no empty-book case
+        thin = [[4, 300.0]]
+        p = imm.ca_shadow_proposals(self.meta(), thin, thin, 4, 96, self.now)
+        self.assertNotIn("C", p or {})
+
+    def test_note_logs_once_an_hour_and_never_raises(self):
+        bot = mock.Mock(spec=[])               # a bare object with a __dict__
+        bot.tag = "[IMM]"
+        note = imm.IncentiveMarketMaker._ca_shadow_note
+        path = os.path.join(imm.STATUS_DIR, f"ca_shadow_{datetime.now(timezone.utc):%Y-%m-%d}.jsonl")
+        if os.path.exists(path):
+            os.remove(path)
+        with mock.patch.object(imm.time, "time", return_value=self.now):
+            note(bot, self.meta(), self.BOOK, self.BOOK, 4, 96)
+            note(bot, self.meta(), self.BOOK, self.BOOK, 4, 96)      # same proposal: skipped
+        with open(path, encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["ticker"], rows[0]["src"]), (self.T, "array_shadow"))
+        with mock.patch.object(imm, "ca_shadow_proposals", side_effect=ValueError("boom")):
+            note(bot, self.meta(), self.BOOK, self.BOOK, 4, 96)      # swallowed
+        os.remove(path)
+
+
 if __name__ == "__main__":
     unittest.main()

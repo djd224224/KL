@@ -10418,7 +10418,10 @@ CA_FAIR_FILE = os.environ.get(
 # series -> entry; series -> epoch its read last moved (refresh hold);
 # category -> its panel's next update window (scheduled stand-aside)
 _ca_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {},
-                        "schedules": {}, "schedules_ts": 0.0}
+                        "schedules": {}, "schedules_ts": 0.0,
+                        # SHADOW array reads (carbon_arc_fair CA_ARRAY_SHADOW):
+                        # logged from (CA_SHADOW), never gated on
+                        "array_shadow": {}}
 _CA_STRIKE_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
 # REST THE SIDES THAT EARN, NOT A PARKED MARKET (Jack 2026-10-04: "the bot
 # should sit on the bid if it's earning money on it, but not if it wouldnt
@@ -10510,6 +10513,21 @@ def load_ca_fair() -> Tuple[int, int]:
         _ca_fair_state["schedules_ts"] = float(data.get("schedules_ts") or 0.0)
     except (TypeError, ValueError):
         _ca_fair_state["schedules_ts"] = 0.0
+    shadow: Dict[str, dict] = {}
+    for series, e in (data.get("array_shadow") or {}).items():
+        try:
+            ts = parse_iso_utc(str(e["fetched_at"]))
+            mu, sigma = float(e["mu"]), float(e["sigma"])
+            month = str(e["month"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if ts is None or not (math.isfinite(mu) and math.isfinite(sigma)) \
+                or sigma <= 0:
+            continue
+        shadow[str(series)] = {"mu": mu, "sigma": sigma, "month": month,
+                               "ts": ts.timestamp(),
+                               "category": str(e.get("category") or "")}
+    _ca_fair_state["array_shadow"] = shadow
     return len(fresh), len(moved)
 
 
@@ -10609,6 +10627,114 @@ def ca_fair_band(ticker: str, now_ts: float
     pc = _p_above(k, e["mu"], e["sigma"])
     pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * CA_FAIR_SIGMA_LO_FRAC))
     return pc, min(pc, pt), max(pc, pt)
+
+
+# CARBON ARC SHADOW: THE EMPTY-BOOK RULE (C) AND THE 1-99 BAND (D) (Jack
+# 2026-10-16: "build B2, C and D in shadow mode for the November array
+# listings"; earlier the same night, "for carbon arc markets starting in
+# nov, increase to 1-99 range if within fair estimate"). Nothing here places
+# or moves an order: _estimate_candidate_yield hands every Carbon Arc book it
+# reads to ca_shadow_proposals and logs what the two rules WOULD quote to
+# ca_shadow_<UTC date>.jsonl, so both can be scored before November.
+#   C  A placeholder-only book (both external touches outside the quoting
+#      band, both sides at the target depth -- the arrays opened 10/16 with
+#      22,000 @1c / 2,333 @3c / ~1,000 @4c on YES and NO) with a fair: one
+#      tick INSIDE each touch, on each side the fair band clears by
+#      CA_SHADOW_TOL_CENTS (bid <= band bottom - tol, ask >= band top + tol),
+#      at each CA_SHADOW_SIZES size. Under the program's scoring a level
+#      scores in full only at or above the reference (where size first
+#      reaches target/5), so at 30 lots stepping inside earns exactly what
+#      joining the placeholder does; size is the lever (KXSODAARRAY-T94's
+#      book: 200 lots inside both sides 28.7% of the pool, 1,000 lots one
+#      side 50%).
+#   D  A touch outside the band but inside 1-99 (CA_WIDE_BAND_LO/HI), joined
+#      at the series' normal size on the side the fair clears by the same
+#      tol. "eligible" marks programs starting on/after CA_WIDE_BAND_FROM, the
+#      listings the rule is meant for; the shadow logs every market so the
+#      October books can be scored too.
+# The fair is the live read (ca_fair_band), else the array's SHADOW read
+# (carbon_arc_fair.build_array_shadow), with the same month and TTL tests.
+# IMM_CA_SHADOW=0 turns the logging off.
+CA_SHADOW_ENABLE = os.environ.get("IMM_CA_SHADOW", "1") == "1"
+CA_SHADOW_TOL_CENTS = _env_float("IMM_CA_SHADOW_TOL_CENTS", 3.0)
+CA_SHADOW_SIZES = tuple(int(x) for x in os.environ.get(
+    "IMM_CA_SHADOW_SIZES", "200,1000").split(",") if x.strip().isdigit())
+CA_SHADOW_LOG_SECS = _env_float("IMM_CA_SHADOW_LOG_SECS", 3600)
+CA_WIDE_BAND_LO = _env_int("IMM_CA_WIDE_BAND_LO", 1)
+CA_WIDE_BAND_HI = _env_int("IMM_CA_WIDE_BAND_HI", 99)
+CA_WIDE_BAND_FROM = os.environ.get("IMM_CA_WIDE_BAND_FROM", "2026-11-01")
+
+
+def ca_shadow_band(ticker: str, now_ts: float
+                   ) -> Optional[Tuple[float, float, str]]:
+    """(band bottom, band top) in cents and the read's source ("live" /
+    "array_shadow") for a Carbon Arc market, or None with no fresh read of
+    its measurement month."""
+    b = ca_fair_band(ticker, now_ts)
+    if b is not None:
+        return 100.0 * b[1], 100.0 * b[2], "live"
+    m = _CA_STRIKE_RE.search(ticker)
+    e = (_ca_fair_state.get("array_shadow") or {}).get(series_of(ticker))
+    if not m or e is None or now_ts - e["ts"] > CA_FAIR_TTL_MIN * 60 \
+            or e["month"] != ca_measurement_month(ticker):
+        return None
+    k = ca_strike_value(float(m.group(1)))
+    pc = _p_above(k, e["mu"], e["sigma"])
+    pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * CA_FAIR_SIGMA_LO_FRAC))
+    return 100.0 * min(pc, pt), 100.0 * max(pc, pt), "array_shadow"
+
+
+def ca_shadow_proposals(meta: "MarketMeta", yes_levels: List[List[float]],
+                        no_levels: List[List[float]], ext_b: Optional[int],
+                        ext_a: Optional[int], now_ts: float) -> Optional[dict]:
+    """What C and D would quote on this Carbon Arc book (see CA_SHADOW), with
+    the program-scoring estimate of each; None when neither would quote."""
+    band = ca_shadow_band(meta.ticker, now_ts)
+    if band is None or ext_b is None or ext_a is None:
+        return None
+    lo, hi, src = band
+    tol = CA_SHADOW_TOL_CENTS
+    blo, bhi = member_price_band(meta.series, True)
+    dy = sum(q for _px, q in yes_levels)
+    dn = sum(q for _px, q in no_levels)
+    pool = float(meta.dollars_per_day or 0.0)
+
+    def est(quotes: List[Tuple[str, int, float]]) -> Tuple[float, float]:
+        frac, _q = estimate_reward_share(yes_levels, no_levels, quotes,
+                                         meta.target_size, meta.discount_factor,
+                                         own_in_book=False)
+        return round(frac, 4), round(frac * pool, 2)
+
+    out: dict = {"ticker": meta.ticker, "src": src, "fair_lo": round(lo, 2),
+                 "fair_hi": round(hi, 2), "bid": ext_b, "ask": ext_a,
+                 "band": [blo, bhi], "depth": [round(dy), round(dn)],
+                 "target": meta.target_size, "pool_day": round(pool, 2)}
+    placeholder = (ext_b < blo and ext_a > bhi
+                   and dy >= meta.target_size and dn >= meta.target_size)
+    c_sides = []
+    if placeholder and 1 <= ext_b + 1 <= lo - tol:
+        c_sides.append(("bid", ext_b + 1))
+    if placeholder and ext_a - 1 <= 99 and ext_a - 1 >= hi + tol:
+        c_sides.append(("ask", ext_a - 1))
+    if c_sides:
+        out["C"] = {"sides": [list(s) for s in c_sides], "by_size": {
+            str(n): dict(zip(("share", "usd_day"),
+                             est([(sd, px, float(n)) for sd, px in c_sides])))
+            for n in CA_SHADOW_SIZES}}
+    d_sides = []
+    if CA_WIDE_BAND_LO <= ext_b < blo and ext_b <= lo - tol:
+        d_sides.append(("bid", ext_b))
+    if bhi < ext_a <= CA_WIDE_BAND_HI and ext_a >= hi + tol:
+        d_sides.append(("ask", ext_a))
+    if d_sides:
+        n = float(series_side_max(meta.series))
+        share, usd = est([(sd, px, n) for sd, px in d_sides])
+        start = meta.program_start
+        out["D"] = {"sides": [list(s) for s in d_sides], "size": n,
+                    "share": share, "usd_day": usd,
+                    "eligible": bool(start is not None and start.astimezone(ET)
+                                     .strftime("%Y-%m-%d") >= CA_WIDE_BAND_FROM)}
+    return out if ("C" in out or "D" in out) else None
 
 
 def ca_refresh_held(ticker: str, now_ts: float) -> bool:
@@ -22500,6 +22626,36 @@ class IncentiveMarketMaker:
         self._coverage_ema[ticker] = ema
         return ema
 
+    def _ca_shadow_note(self, meta: MarketMeta, yes_levels: List[List[float]],
+                        no_levels: List[List[float]], ext_b: Optional[int],
+                        ext_a: Optional[int]) -> None:
+        """Append what the Carbon Arc empty-book rule (C) and the 1-99 band
+        (D) WOULD quote on this book to ca_shadow_<UTC date>.jsonl (see
+        CA_SHADOW): once per CA_SHADOW_LOG_SECS per market, or sooner when
+        the proposal changes. Never raises; never touches `meta`."""
+        try:
+            now = time.time()
+            p = ca_shadow_proposals(meta, yes_levels, no_levels, ext_b, ext_a, now)
+            if p is None:
+                return
+            last = self.__dict__.setdefault("_ca_shadow_last", {})
+            sig = json.dumps([p["src"], (p.get("C") or {}).get("sides"),
+                              (p.get("D") or {}).get("sides")])
+            prev = last.get(meta.ticker)
+            if prev is not None and prev[0] == sig and now - prev[1] < CA_SHADOW_LOG_SECS:
+                return
+            last[meta.ticker] = (sig, now)
+            stamp = datetime.now(timezone.utc)
+            p["ts"] = stamp.isoformat(timespec="seconds")
+            with open(os.path.join(STATUS_DIR, f"ca_shadow_{stamp:%Y-%m-%d}.jsonl"),
+                      "a", encoding="utf-8") as f:
+                f.write(json.dumps(p, sort_keys=True) + "\n")
+        except Exception as e:
+            if not self.__dict__.get("_ca_shadow_err"):
+                self._ca_shadow_err = True
+                log(f"{self.tag} ! ca-shadow note failed ({type(e).__name__}: {e}); "
+                    f"quoting is unaffected")
+
     def _estimate_candidate_yield(self, meta: MarketMeta,
                                   own_live: List[Tuple[str, int, float]]) -> bool:
         """Fill meta.est_frac / est_dollars_per_day / yield_per_contract from
@@ -22538,6 +22694,12 @@ class IncentiveMarketMaker:
         meta.book_depth_contracts = (sum(q for _px, q in yes_levels)
                                      + sum(q for _px, q in no_levels))
         ext_b, ext_a = external_best(yes_levels, no_levels)
+        # CARBON ARC SHADOW (C / D, 2026-10-16): logs what the empty-book rule
+        # and the 1-99 band would quote; never changes this estimate
+        if CA_SHADOW_ENABLE and carbon_arc_settled(meta.series):
+            self._ca_shadow_note(meta, yes_levels, no_levels, *(
+                external_best(yes_levels, no_levels, own_live) if own_live
+                else (ext_b, ext_a)))
         # LIVE-EVENT DEPTH GATE, selection side (Jack 2026-08-31). This hook
         # is what makes the gate EVENT-wide in practice: a thin strike reads
         # est=0 and never gets selected, so the quote loop alone would never
@@ -27524,6 +27686,13 @@ class IncentiveMarketMaker:
                             for s, cs in sorted(_blk.items()))
                 + f"; anything else {CA_LATE_TOXIC_SIDE}s; quoting stops "
                 f"{CA_LATE_STOP_DAYS:g}d before the end")
+        if CA_SHADOW_ENABLE:
+            log(f"ca-shadow (2026-10-16, logs only): C = one tick inside a "
+                f"placeholder-only book at {'/'.join(str(n) for n in CA_SHADOW_SIZES)} "
+                f"lots, D = joining a {CA_WIDE_BAND_LO}-{CA_WIDE_BAND_HI}c touch "
+                f"(programs from {CA_WIDE_BAND_FROM}); each side only where the "
+                f"fair band clears it by {CA_SHADOW_TOL_CENTS:g}c -> "
+                f"ca_shadow_<date>.jsonl")
         if OR_FAIR_ENABLE:
             log(f"or-fair gate: {','.join(sorted(OR_FAIR_SERIES))} fail-closed "
                 f"at-touch, tol {OR_FAIR_TOL_CENTS}c, band sigma "

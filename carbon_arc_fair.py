@@ -660,6 +660,124 @@ def build_entries(payload: dict, series_map: Dict[str, dict],
     return entries, missing
 
 
+# SHADOW ARRAY FAIRS (Jack 2026-10-16: "build B2, C and D in shadow mode for
+# the November array listings"). The nine Carbon Arc sector arrays settle on
+# their own prisms (KXSODAARRAY -> "Soda Brands"), which 404 for our token.
+# Each array's brands sit together on ONE brand prism the bot already reads
+# -- Soda Brands = Coca-Cola, Pepsi, Dr. Pepper, Sprite, Mountain Dew on the
+# KXCOCACOLAPOS prism, whose category shares sum to 100 -- so the array's
+# year-over-year is rebuilt from them three ways, all logged:
+#   ly_share      sum(h_i * r_i) / sum(h_i): r_i the brand's month-to-date
+#                 year-over-year, h_i its share of the category in the same
+#                 month a year earlier (hist_share) -- exactly this year's
+#                 total over last year's IF the array is the category total;
+#   mtd_harmonic  sum(s_i) / sum(s_i / r_i) on this month's shares
+#                 (mtd_share): the same identity from this year's side;
+#   mean          the plain average, in case Carbon Arc equal-weights.
+# mu is ly_share (mtd_harmonic without last year's shares); sigma is the
+# share-weighted brand sigma, i.e. perfectly correlated brands -- the wide
+# end. The October prints (point-of-sale arrays 11/2-3, card 11/5, apps
+# 11/7-8) decide which variant, if any, is the array. SHADOW ONLY: written
+# under the fair file's "array_shadow" key, never "entries", so the live
+# gate cannot read it; the bot only logs from it (incentive_mm CA_SHADOW).
+CA_ARRAY_SHADOW = os.environ.get("IMM_CA_ARRAY_SHADOW", "1") == "1"
+_DEFAULT_CA_ARRAY_BRANDS = ("KXSODAARRAY=KXCOCACOLAPOS;KXENERGYARRAY=KXCELSIUSPOS;"
+                            "KXNICOTINEARRAY=KXZYNPOS;KXAIAPPARRAY=KXGPTAPP;"
+                            "KXDELIVARRAY=KXDASHAPP;KXRIDEARRAY=KXUBERAPP;"
+                            "KXSTREAMARRAY=KXNFLXAPP;KXFASTARRAY=KXMCDCC;"
+                            "KXBIGBOXARRAY=KXWMTCC")
+# array series -> one brand series on the array's brand prism
+CA_ARRAY_BRANDS: Dict[str, str] = {}
+for _part in os.environ.get("IMM_CA_ARRAY_BRANDS", _DEFAULT_CA_ARRAY_BRANDS).split(";"):
+    if "=" in _part:
+        _a, _b = (x.strip() for x in _part.split("=", 1))
+        if _a and _b:
+            CA_ARRAY_BRANDS[_a] = _b
+# the readable brands must cover this much of last year's category
+CA_ARRAY_MIN_COVERAGE = _env_float("IMM_CA_ARRAY_MIN_COVERAGE", 0.9)
+CA_ARRAY_VINTAGE_FILE = os.environ.get(
+    "IMM_CA_ARRAY_VINTAGE_FILE",
+    os.path.join(STATUS_DIR, "carbon_arc_array_shadow.jsonl"))
+
+
+def _point_value(points, key: str, want: Optional[str] = None) -> Optional[float]:
+    """The value of the point whose `key` equals `want` (the LAST point when
+    `want` is None) in a [{key: ..., "value": ...}] series, or None."""
+    rows = [x for x in (points or []) if isinstance(x, dict) and "value" in x]
+    if want is not None:
+        rows = [x for x in rows if str(x.get(key)) == want]
+    if not rows:
+        return None
+    try:
+        v = float(rows[-1]["value"])
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def array_entry(prism: Optional[dict], now: datetime) -> Optional[dict]:
+    """Composite shadow read of a sector array from its brand prism (see
+    CA_ARRAY_SHADOW), or None when a brand has no read, the brands disagree
+    on the month, or no variant can be built."""
+    if not isinstance(prism, dict):
+        return None
+    parts = []
+    for ent in prism.get("entities") or []:
+        if not isinstance(ent, dict):
+            continue
+        e = entity_entry(prism, ent, now)
+        if e is None:
+            return None              # a missing brand would bias the composite
+        y, m = int(e["month"][:4]), int(e["month"][5:7])
+        h = _point_value(ent.get("hist_share"), "month", f"{y - 1:04d}-{m:02d}")
+        s = _point_value(ent.get("mtd_share"), "date")
+        parts.append((str(ent.get("entity_name") or ""), e, h, s))
+    if not parts or len({e["month"] for _n, e, _h, _s in parts}) != 1:
+        return None
+    variants: Dict[str, float] = {
+        "mean": sum(e["mu"] for _n, e, _h, _s in parts) / len(parts)}
+    hs = [h for _n, _e, h, _s in parts]
+    coverage = (sum(hs) / 100.0) if all(h is not None for h in hs) else 0.0
+    if coverage >= CA_ARRAY_MIN_COVERAGE and sum(hs) > 0:
+        variants["ly_share"] = sum(h * e["mu"] for _n, e, h, _s in parts) / sum(hs)
+    ss = [s for _n, _e, _h, s in parts]
+    if all(s is not None and s > 0 for s in ss) and \
+            all(e["mu"] > 0 for _n, e, _h, _s in parts):
+        variants["mtd_harmonic"] = sum(ss) / sum(
+            s / e["mu"] for (_n, e, _h, _s), s in zip(parts, ss))
+    mu = variants.get("ly_share", variants.get("mtd_harmonic"))
+    if mu is None:
+        return None
+    ws = hs if "ly_share" in variants else ss
+    sigma = sum(w * e["sigma"] for (_n, e, _h, _s), w in zip(parts, ws)) / sum(ws)
+    first = parts[0][1]
+    return {"category": first.get("category"), "month": first["month"],
+            "data_through": min(e["data_through"] for _n, e, _h, _s in parts),
+            "w": first.get("w"), "mu": round(mu, 4), "mtd": round(mu, 4),
+            "sigma": round(sigma, 4),
+            "variants": {k: round(v, 4) for k, v in variants.items()},
+            "weights": {n: h for n, _e, h, _s in parts},
+            "brands": {n: [e["mu"], e["sigma"]] for n, e, _h, _s in parts},
+            "coverage": round(coverage, 4), "shadow": True}
+
+
+def build_array_shadow(payload: dict, series_map: Dict[str, dict],
+                       now: datetime) -> Dict[str, dict]:
+    """array series -> its shadow entry, from the brand prisms in `payload`."""
+    if not CA_ARRAY_SHADOW:
+        return {}
+    by_pid = {str(p["prism_id"]): p for p in (payload or {}).get("prisms") or []
+              if isinstance(p, dict) and p.get("prism_id")}
+    out: Dict[str, dict] = {}
+    for arr, brand in sorted(CA_ARRAY_BRANDS.items()):
+        pid = (series_map.get(brand) or {}).get("prism", "")
+        e = array_entry(by_pid.get(pid), now)
+        if e is not None:
+            e["source_prism"] = pid
+            out[arr] = e
+    return out
+
+
 def _read_json(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -758,9 +876,24 @@ def write_fair_file(path: str, payload: Optional[dict] = None,
         missing = [s for s in missing if s not in set(carried)]
     _append_vintages(prev.get("entries") or {}, entries, fetched_at,
                      vintage_path or CA_VINTAGE_FILE)
+    # the SHADOW array fairs (CA_ARRAY_SHADOW): own key, own vintage file, and
+    # the same carry-forward when the brand prism's read failed
+    array_shadow = build_array_shadow(payload, smap, now)
+    for e in array_shadow.values():
+        e["fetched_at"] = fetched_at
+    old_shadow = prev.get("array_shadow") or {}
+    for arr, brand in CA_ARRAY_BRANDS.items():
+        if arr not in array_shadow and arr in old_shadow and \
+                (smap.get(brand) or {}).get("prism") in failed:
+            array_shadow[arr] = old_shadow[arr]
+    if array_shadow:
+        _append_vintages(old_shadow, array_shadow, fetched_at,
+                         CA_ARRAY_VINTAGE_FILE if vintage_path is None
+                         else vintage_path + ".array")
     _write_json_atomic(path, {
         "generated_at": fetched_at,
         "entries": entries,
+        "array_shadow": array_shadow,
         "missing": missing,
         "series_map": smap,
         "series_map_ts": float(prev.get("series_map_ts") or time.time()),

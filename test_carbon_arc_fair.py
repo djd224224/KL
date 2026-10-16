@@ -333,6 +333,74 @@ class TestBuildAndWrite(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out))
 
 
+class TestArrayShadow(unittest.TestCase):
+    """Jack 2026-10-16 (B2, shadow): a sector array rebuilt from the brand
+    prism that holds its constituents."""
+
+    @staticmethod
+    def brand(name, mtd, ly_share, mtd_share):
+        e = _entity(name, [("2026-09-23", mtd)], HIST)
+        e["hist_share"] = [{"month": "2025-08", "value": 1.0},
+                           {"month": "2025-09", "value": ly_share}]
+        e["mtd_share"] = [{"date": "2026-09-22", "value": 1.0},
+                          {"date": "2026-09-23", "value": mtd_share}]
+        return e
+
+    def prism(self, *ents):
+        return _prism("BRANDS", list(ents), category="Point of Sale")
+
+    def test_three_variants_and_a_share_weighted_mu(self):
+        p = self.prism(self.brand("A", 90.0, 60.0, 55.0), self.brand("B", 110.0, 40.0, 45.0))
+        e = caf.array_entry(p, NOW)
+        self.assertEqual(e["month"], "2026-09")
+        v = e["variants"]
+        self.assertAlmostEqual(v["ly_share"], (60 * 90 + 40 * 110) / 100.0)      # 98.0
+        self.assertAlmostEqual(v["mean"], 100.0)
+        self.assertAlmostEqual(v["mtd_harmonic"], 100.0 / (55 / 90 + 45 / 110), places=3)
+        self.assertEqual(e["mu"], round(v["ly_share"], 4))
+        self.assertEqual(e["weights"], {"A": 60.0, "B": 40.0})
+        self.assertTrue(e["shadow"])
+        sa, sb = e["brands"]["A"][1], e["brands"]["B"][1]
+        self.assertAlmostEqual(e["sigma"], (60 * sa + 40 * sb) / 100.0, places=3)
+
+    def test_no_composite_without_every_brand_or_any_shares(self):
+        dead = _entity("C", [], HIST)                        # a brand with no read
+        self.assertIsNone(caf.array_entry(
+            self.prism(self.brand("A", 90.0, 60.0, 55.0), dead), NOW))
+        a, b = self.brand("A", 90.0, 60.0, 55.0), self.brand("B", 110.0, 40.0, 45.0)
+        for x in (a, b):
+            x["hist_share"], x["mtd_share"] = [], []
+        self.assertIsNone(caf.array_entry(self.prism(a, b), NOW))
+        # last year's shares missing: falls back to this month's
+        a, b = self.brand("A", 90.0, 60.0, 55.0), self.brand("B", 110.0, 40.0, 45.0)
+        a["hist_share"] = []
+        e = caf.array_entry(self.prism(a, b), NOW)
+        self.assertNotIn("ly_share", e["variants"])
+        self.assertEqual(e["mu"], round(e["variants"]["mtd_harmonic"], 4))
+
+    def test_written_under_its_own_key_never_the_gates(self):
+        tmp = tempfile.mkdtemp(prefix="caf_arr_")
+        out, vint = os.path.join(tmp, "fair.json"), os.path.join(tmp, "v.jsonl")
+        p = self.prism(self.brand("A", 90.0, 60.0, 55.0), self.brand("B", 110.0, 40.0, 45.0))
+        smap = {"KXAPOS": {"prism": "BRANDS", "entity": "A"},
+                "KXFAKEARRAY": {"prism": "ARR", "entity": "Fake Brands"}}   # 404s
+        with mock.patch.object(caf, "CA_ARRAY_BRANDS", {"KXFAKEARRAY": "KXAPOS"}):
+            ok, miss = caf.write_fair_file(out, payload={"prisms": [p], "failed": []},
+                                           now=NOW, series_map=smap, vintage_path=vint)
+        self.assertEqual((ok, miss), (1, 1))                 # the array is still "missing"
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertNotIn("KXFAKEARRAY", data["entries"])
+        self.assertAlmostEqual(data["array_shadow"]["KXFAKEARRAY"]["mu"], 98.0)
+        self.assertEqual(data["array_shadow"]["KXFAKEARRAY"]["source_prism"], "BRANDS")
+        self.assertTrue(os.path.exists(vint + ".array"))    # its own vintage file
+        with mock.patch.object(caf, "CA_ARRAY_SHADOW", False):
+            caf.write_fair_file(out, payload={"prisms": [p], "failed": []},
+                                now=NOW, series_map=smap, vintage_path=vint)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["array_shadow"], {})
+
+
 class TestFeedSettings(unittest.TestCase):
 
     def test_env_wins_then_home_file(self):
