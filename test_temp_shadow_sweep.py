@@ -305,8 +305,10 @@ class TestSweepModel(Base):
         self.assertEqual(cons["filler_contracts"], 0.0)        # 500 ahead of us
         size = SW.VPass(sh, G, "swp", channels="a", rec_mode="size").run()
         self.assertEqual(size["filler_contracts"], 200.0)      # min(ours, taker size)
+        front = SW.VPass(sh, G, "swp", channels="a", rec_mode="front").run()
+        self.assertEqual(front["filler_contracts"], 200.0)     # not cleared: we first
         level = SW.VPass(sh, G, "swp", channels="a").run()     # default 'level'
-        self.assertEqual(level["filler_contracts"], 200.0)     # it did not clear 500
+        self.assertEqual(level["filler_contracts"], 0.0)       # the 500 ahead of us take it
         allm = SW.VPass(sh, G, "swp", channels="a", rec_mode="all").run()
         self.assertEqual(allm["filler_contracts"], 1000.0)     # the whole pad
         self.assertEqual(allm["pos"][TICKER], -1000.0)
@@ -500,6 +502,307 @@ class TestCalibrationValidation(Base):
         self.assertEqual(v["actual"]["filler_contracts"], 1000.0)
         self.assertIn("swp", SW.format_validation(v))
         self.assertEqual(SW._cum_by_5min([(OPEN + 400, TICKER, "no", 1, 10.0)], OPEN)[5], 10.0)
+
+
+# --------------------------------------------------------------------------
+# 4. review fixes (2026-10-16 final pass)
+# --------------------------------------------------------------------------
+
+class TestQueueAhead(Base):
+    """Review finding 6: a non-clearing recorded taker reaches our 1c only
+    after the external size that rested there before our lot."""
+
+    def test_others_behind_us_fill_after(self):
+        # 100 NO@1 before our pad (ahead), 400 join after it (behind); a
+        # 300-lot taker does not clear the 500 level
+        write_event(deltas=[(60, "no", 1, 100), (300, "no", 1, 400), (600, "no", 1, -300)],
+                    trades=[(600, "yes", 99, 300, "s1")])
+        sh = self.shared()
+        self.assertEqual([(a[3], a[4]) for a in sh.arrivals], [(300.0, False)])
+        lv = SW.VPass(sh, G, "swp", channels="a").run()
+        self.assertEqual(lv["filler_contracts"], 200.0)        # 300 - 100 ahead
+        fr = SW.VPass(sh, G, "swp", channels="a", rec_mode="front").run()
+        self.assertEqual(fr["filler_contracts"], 300.0)
+
+    def test_queue_ahead_decays_with_the_level(self):
+        # 100 ahead of our pad; 80 of them cancel at t=400 (no trade then),
+        # 300 others join behind at t=450; a 200-lot taker at t=600
+        write_event(deltas=[(60, "no", 1, 100), (400, "no", 1, -80), (450, "no", 1, 300),
+                            (600, "no", 1, -200)],
+                    trades=[(600, "yes", 99, 200, "s1")])
+        sh = self.shared()
+        lv = SW.VPass(sh, G, "swp", channels="a").run()
+        self.assertEqual(lv["filler_contracts"], 180.0)        # ahead clamped to 20
+
+
+class TestHazardRuns(Base):
+    """Review findings 3 / 7 (--hazard-scale ignored) and 8 (the run cache
+    ignored the hazard)."""
+
+    VAR = {"G": SW.SWEEP_VARIANTS["G"]}
+
+    def setUp(self):
+        super().setUp()
+        write_event(trades=[(600, "yes", 99, 50, "s1")])
+        self.out = os.path.join(C.DATA_ROOT, "sweep_out")
+        self.calls = []
+        real = SW.run_event_variants
+
+        def spy(ev, variants=None, draws=1, hazard=None, **kw):
+            self.calls.append((hazard.scale, hazard.kind, round(hazard.lam_max, 9)))
+            return real(ev, variants, draws, hazard, model=ConstModel(), **kw)
+        self._real = real
+        SW.run_event_variants = spy
+
+    def tearDown(self):
+        SW.run_event_variants = self._real
+
+    def run_ev(self, hz, **kw):
+        return SW.run_events([EVENT], self.out, self.VAR, draws=1, hazard=hz, workers=1,
+                             tail=SW.TailCal({}), **kw)
+
+    def test_scale_reaches_the_worker(self):
+        base = SW.Hazard(hz_doc(rate=0.02))
+        half = SW.Hazard(hz_doc(rate=0.02), scale=0.5)
+        r = self.run_ev(half)[0]
+        self.assertEqual(self.calls[-1][0], 0.5)
+        self.assertAlmostEqual(self.calls[-1][2], base.lam_max * 0.5, places=9)
+        self.assertEqual(r["swp"]["hazard_scale"], 0.5)
+        self.assertAlmostEqual(r["swp"]["lam_max"], round(base.lam_max * 0.5, 6), places=6)
+        self.assertEqual(r["swp"]["hazard_id"], half.ident())
+        self.assertNotEqual(half.ident(), base.ident())
+
+    def test_cache_is_keyed_by_the_hazard(self):
+        a = SW.Hazard(hz_doc(rate=0.02))
+        self.run_ev(a)
+        self.assertEqual(len(self.calls), 1)
+        self.run_ev(a)                                       # same inputs: reused
+        self.assertEqual(len(self.calls), 1)
+        self.run_ev(SW.Hazard(hz_doc(rate=0.02), scale=1.5))  # scale -> recompute
+        self.assertEqual(len(self.calls), 2)
+        recal = hz_doc(rate=0.2)
+        recal["built"] = "test"                              # same stamp, other rates
+        self.run_ev(SW.Hazard(recal))
+        self.assertEqual(len(self.calls), 3)
+        self.run_ev(SW.Hazard(recal), join=(800.0, 5.0))      # joiners -> recompute
+        self.assertEqual(len(self.calls), 4)
+        self.run_ev(SW.Hazard(recal), tag="t1")               # a tag writes elsewhere
+        self.assertEqual(len(self.calls), 5)
+        self.assertTrue(os.path.isdir(SW.runs_dir(self.out, "t1")))
+        self.assertEqual(len(SW.load_runs(self.out)), 1)
+        self.assertEqual(len(SW.load_runs(self.out, tag="t1")), 1)
+        self.assertEqual(SW.sens_tags(self.out), ["t1"])
+
+    def test_noflash_kind(self):
+        with self.assertRaises(ValueError):
+            SW.Hazard(hz_doc(rate=0.02), kind="noflash")
+        d = hz_doc(rate=0.02)
+        d["hazard_noflash"] = hz_doc(rate=0.01)["hazard"]
+        h = SW.Hazard(d, kind="noflash")
+        self.assertAlmostEqual(h.lam_max, SW.Hazard(hz_doc(rate=0.01)).lam_max)
+        self.assertNotEqual(h.ident(), SW.Hazard(d).ident())
+        r = self.run_ev(h)[0]
+        self.assertEqual(r["swp"]["hazard_kind"], "noflash")
+
+
+class TestFlashCalibration(Base):
+    """Review finding 5: flash sweeps get FLASH_EXPO_S of exposure each and a
+    cleared flag from the level after them only; a flash-free fit exists."""
+
+    def test_flash_exposure_and_cleared(self):
+        write_event(deltas=[(300.6, "no", 1, 40), (300.85, "no", 1, -40),
+                            (600.6, "no", 1, 500), (600.85, "no", 1, -40)],
+                    trades=[(300.8, "yes", 99, 40, "f1"), (600.8, "yes", 99, 40, "f2")])
+        row = SW.calibrate_event(EVENT, model=ConstModel(0.985))
+        cl = sorted(row["clusters"], key=lambda c: c["t"])
+        self.assertEqual([(c["flash"], c["cleared"]) for c in cl], [(True, True), (True, False)])
+        fe = row["expo"]["flash"]["fav_age"]["0.97-0.99"]["0-5s"]
+        self.assertAlmostEqual(fe, 2 * SW.FLASH_EXPO_S)
+        agg = SW.aggregate_calibration([row])
+        fr = agg["recorded"]["all"]["fresh"]["0.97-0.99"]
+        self.assertEqual((fr["flash"], fr["nonflash"]), (2, 0))
+        self.assertIn("hazard_noflash", agg)
+        self.assertGreater(agg["hazard"]["a"]["0.97-0.99"]["0-5s"],
+                           agg["hazard_noflash"]["a"]["0.97-0.99"]["0-5s"])
+        self.assertEqual(agg["sizes_noflash"]["0-5s"], [])
+        self.assertIn("flash / non-flash", SW.format_calibration(agg))
+        SW.Hazard(SW.compact_hazard(agg), kind="noflash")      # compact keeps the fit
+
+
+class TestJoinersAndStrip(Base):
+    """Review finding 4: joiner dilution (reward only) and the joiner-free
+    replay of a live hour."""
+
+    def test_join_dilutes_reward_only(self):
+        write_event()
+        sh = self.shared()
+        a = SW.VPass(sh, G, "swp", channels="").run()
+        b = SW.VPass(sh, G, "swp", channels="", join_q=800.0, join_s=5.0).run()
+        self.assertLess(b["reward"], a["reward"])
+        self.assertEqual((a["contracts"], b["contracts"]), (0.0, 0.0))
+        with self.assertRaises(ValueError):
+            SW.VPass(sh, G, "cons", join_q=800.0)
+
+    def test_joiner_sides_and_strip(self):
+        # our live 1000 NO@1 opens the empty level at t=130; 600 others join
+        # at t=133; a taker at t=500 takes ours (live print) and 100 of theirs
+        write_event(deltas=[(130, "no", 1, 1000), (133, "no", 1, 600), (500, "no", 1, -1100)],
+                    trades=[(500, "yes", 99, 1000, "ours"), (500, "yes", 99, 100, "theirs")])
+        write_live(orders=[dict(ts=OPEN + 129.8, kind="place", oid="A", side="no", price=1,
+                                size=1000, expiration_ts=OPEN + 3000, tag="pad")],
+                   fills=[dict(ts=OPEN + 500.05, order_id="A", count=1000, price_ours=1,
+                               side_ours="no", trade_id="ours")])
+        full = SW.shared_for(EVENT, ConstModel(0.985), subtract=False)
+        js = SW.joiner_sides(full)
+        self.assertEqual(list(js), [(0, "no")])
+        sh = self.shared()
+        self.assertEqual(sh.level1(0, "no", 200), 600.0)            # joiners stay
+        self.assertEqual(len(sh.arrivals), 1)
+        nj = SW.shared_for(EVENT, ConstModel(0.985), subtract=True, strip_1c=js)
+        self.assertEqual(nj.level1(0, "no", 200), 0.0)
+        self.assertEqual(nj.level1(0, "no", 100), sh.level1(0, "no", 100))
+        self.assertEqual((len(nj.arrivals), nj.stripped_arrivals), (0, 1))
+
+
+class TestStatsAndTails(Base):
+    """Review finding 1: outcome uncertainty (bootstrap over hours) and the
+    realized-tail calibration."""
+
+    def test_variant_table_bootstrap(self):
+        res = [{"event": f"E{i}", "settled": True, "et_day": "2026-10-15", "hour_et": i,
+                "variants": {"G|swp": {"net": -10.0, "reward": 1.0, "draws": 2, "net_sd": 1.0}}}
+               for i in range(10)]
+        res.append({"event": "E10", "settled": True, "et_day": "2026-10-15", "hour_et": 10,
+                    "variants": {"G|swp": {"net": 200.0, "reward": 1.0, "draws": 2,
+                                           "net_sd": 1.0}}})
+        t = SW.variant_table(res, boot_n=2000)["table"]["G|swp"]
+        self.assertEqual(t["total"]["net"], 100.0)
+        self.assertEqual(t["ex_best"], -100.0)
+        self.assertLess(t["boot_p05"], 0.0)
+        self.assertGreater(t["boot_p95"], 100.0)
+        self.assertTrue(0.3 < t["p_pos"] < 0.8)            # P(the upset hour is drawn)
+        self.assertAlmostEqual(t["net_se"], math.sqrt(11 * 0.5), places=2)
+        self.assertIn("90% CI", SW.format_table(SW.variant_table(res, boot_n=200), ["G"]))
+
+    def test_tail_table_and_tailcal(self):
+        rows = []
+        # event A: strike s1 fav 0.985 all hour, longshot WINS; s2 fav 0.999, loses
+        for k in range(10):
+            rows.append(("A", "A-s1", k, 0.015, 1, "t"))     # YES is the 1.5% longshot, won
+            rows.append(("A", "A-s2", k, 0.9995, 1, "t"))    # NO is the 0.05% longshot
+        # event B: s1 fav 0.985, longshot loses
+        for k in range(10):
+            rows.append(("B", "B-s1", k, 0.985, 1, "t"))     # NO is the 1.5% longshot, lost
+        t = SW.tail_table(rows, boot_n=200)
+        b = {(r[0], r[1]): r for r in t["buckets"]}
+        self.assertEqual(b[(0.01, 0.02)][3], 0.5)             # 10 of 20 minutes
+        self.assertEqual(b[(0.01, 0.02)][7], 1)               # one upset strike
+        self.assertEqual(b[(0.0, 0.001)][3], 0.0)
+        fc = t["first_crossing"]["0.97"]
+        self.assertEqual((fc["strikes"], fc["realized"]), (3, 1))
+        self.assertAlmostEqual(fc["model_expected"], 0.015 + 0.0005 + 0.015, places=4)
+        tc = SW.TailCal({"buckets": [r[:6] for r in t["buckets"]]})
+        self.assertEqual(tc.p(0.015), 0.5)                    # our side the longshot
+        self.assertEqual(tc.p(0.985), 0.5)                    # ... the favorite: 1 - rate
+        self.assertEqual(tc.p(0.5), 0.5)                      # outside: the model
+        self.assertEqual(tc.p(0.9995), 1.0)
+
+    def test_cond_table_and_price_conditioning(self):
+        # strike fair YES 0.985 (NO the 1.5% longshot); sweepers buy YES at 99
+        # (hit NO bids at 1c): event A 100 lots, NO lost; event B 50 lots, NO won
+        pr = [("A", "A-s", 1.0, 0.985, 99, "yes", 100.0, 1, "t"),
+              ("B", "B-s", 1.0, 0.985, 99, "yes", 50.0, 0, "t"),
+              # a taker sells YES at 97 (hits a YES bid at 97c, our favorite); YES won
+              ("A", "A-s", 2.0, 0.985, 97, "no", 10.0, 1, "t"),
+              # a mid-price print: no class
+              ("A", "A-s", 3.0, 0.985, 50, "no", 10.0, 1, "t")]
+        cd = SW.cond_table(pr, boot_n=200)
+        self.assertEqual(sorted(cd), ["c1", "c97_99"])
+        r = cd["c1"][0]
+        self.assertEqual((r[0], r[1]), (0.01, 0.02))
+        self.assertAlmostEqual(r[3], 50.0 / 150.0, places=6)    # contract-weighted
+        self.assertEqual((r[6], r[7], r[8], r[9]), (150.0, 2, 2, 1))
+        self.assertAlmostEqual(r[10], 0.5)                      # per print
+        self.assertEqual(cd["c97_99"][0][3], 0.0)
+        self.assertEqual([SW.fill_class(x) for x in (1, 2, 3, 4, 96, 97, 99)],
+                         ["c1", "c2_3", "c2_3", None, None, "c97_99", "c97_99"])
+        tc = SW.TailCal({"buckets": [[0.01, 0.02, 0.015, 0.008, 0.005, 0.011]],
+                         "cond": {"c1": [[0.01, 0.02, 0.015, 0.001, 0.0, 0.002]]}})
+        self.assertAlmostEqual(tc.p(0.015, price=1), 0.001)      # a 1c fill: conditional
+        self.assertAlmostEqual(tc.p(0.015, price=5), 0.008)      # no class: unconditional
+        self.assertAlmostEqual(tc.p(0.985, price=97), 0.992)     # class without a table
+        self.assertAlmostEqual(tc.p(0.015, "hi", price=1), 0.002)
+        self.assertNotEqual(tc.ident(), SW.TailCal({"buckets": tc.doc["buckets"]}).ident())
+
+    def test_vpass_pnl_cal(self):
+        write_event(trades=[(600, "yes", 99, 50, "s1")])
+        sh = self.shared()                                    # fair YES 0.985: NO is 1.5%
+        tc = SW.TailCal({"buckets": [[0.01, 0.02, 0.015, 0.004, 0.002, 0.008]]})
+        r = SW.VPass(sh, G, "swp", channels="a", rec_mode="all", tail_cal=tc).run()
+        q = r["filler_contracts"]
+        self.assertGreater(q, 0)
+        self.assertAlmostEqual(r["pnl_cal"], q * (0.004 - 0.01), places=4)
+        self.assertAlmostEqual(r["pnl_cal_thi"], q * (0.008 - 0.01), places=4)
+        self.assertAlmostEqual(r["net_cal"], r["reward"] + r["pnl_cal"], places=4)
+        # with a 1c fill-conditional table, our 1c fills are marked at it
+        tc2 = SW.TailCal({"buckets": tc.doc["buckets"],
+                          "cond": {"c1": [[0.01, 0.02, 0.015, 0.001, 0.0, 0.003]]}})
+        r2 = SW.VPass(sh, G, "swp", channels="a", rec_mode="all", tail_cal=tc2).run()
+        self.assertAlmostEqual(r2["pnl_cal"], q * (0.001 - 0.01), places=4)
+        self.assertAlmostEqual(r2["pnl_cal_tlo"], q * (0.0 - 0.01), places=4)
+        self.assertNotIn("pnl_cal", SW.VPass(sh, G, "cons").run())
+
+
+class TestNoFutureRawDirs(Base):
+    """temp_shadow_common.raw_files creates the folder of every hour it
+    probes; recorded_events must not walk into empty future folders (it used
+    to leave one more empty raw/<day> behind per call -- in KL-data)."""
+
+    def test_recorded_events_leaves_no_future_dirs(self):
+        import datetime as _dt
+        import time as _time
+        write_event(trades=[(600, "yes", 99, 50, "s1")])     # a ws row inside the hour
+        rd = os.path.join(C.DATA_ROOT, "raw")
+        os.makedirs(os.path.join(rd, "2030-01-01"))
+        self.assertEqual(SW.recorded_events(None), [EVENT])
+        limit = (_dt.datetime.fromtimestamp(_time.time(), _dt.timezone.utc).date()
+                 + _dt.timedelta(days=2)).isoformat()
+        extra = [d for d in os.listdir(rd) if d != "2030-01-01" and d > limit]
+        self.assertEqual(extra, [])
+
+
+class TestLiveDirSandbox(unittest.TestCase):
+    """Review finding 9: a sandboxed recording never reads the real executor
+    logs; TEMP_MM_DATA (the executor's own relocation) is honoured."""
+
+    def test_live_dir(self):
+        saved = {k: os.environ.pop(k, None) for k in ("TEMP_MM_LIVE_DIR", "TEMP_MM_DATA")}
+        old_default = scoring.LIVE_DIR_DEFAULT
+        try:
+            fake = tempfile.mkdtemp(prefix="tss_fake_live_")
+            day = C.iso(OPEN)[:10]
+            with open(os.path.join(fake, f"orders_{day}.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"mode": "live", "ticker": TICKER, "ts": OPEN + 5,
+                                    "kind": "place", "oid": "Z", "side": "no", "price": 1,
+                                    "size": 10}) + "\n")
+            scoring._LIVE_CACHE.clear()
+            scoring.LIVE_DIR_DEFAULT = fake            # as if KL-data\temp-mm had rows
+            self.assertIsNone(scoring.live_dir())      # TEMP_SHADOW_DATA is a sandbox
+            self.assertIsNone(scoring.load_live_orders(EVENT))
+            os.environ["TEMP_MM_DATA"] = fake          # the executor relocated
+            self.assertEqual(scoring.live_dir(), fake)
+            self.assertIsNotNone(scoring.load_live_orders(EVENT))
+            self.assertEqual(SW.live_events(settled_only=False), [EVENT])
+            os.environ["TEMP_MM_LIVE_DIR"] = os.path.join(fake, "nope")
+            self.assertEqual(scoring.live_dir(), os.path.join(fake, "nope"))
+        finally:
+            scoring.LIVE_DIR_DEFAULT = old_default
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            scoring._LIVE_CACHE.clear()
 
 
 if __name__ == "__main__":

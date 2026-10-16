@@ -82,7 +82,9 @@ Never places an order and never touches the network.
    (temp_mm_live.py) rests its own orders in these markets, so the recorded
    books include them and a replay would count our size as competitors'.
    live_own_orders(event, sec0, sec1) rebuilds what we rested each second from
-   the executor's logs (TEMP_MM_LIVE_DIR, default KL-data\\temp-mm:
+   the executor's logs (TEMP_MM_LIVE_DIR, else TEMP_MM_DATA, else
+   KL-data\\temp-mm -- that default only while TEMP_SHADOW_DATA is the real
+   recording, so a sandboxed replay never reads the real executor's logs:
    orders_<UTC day>.jsonl kinds place / adopt / amend / renew (total) /
    decrease (reduce_by) / cancel / gone / expired, fills_<UTC day>.jsonl
    reducing what is left; an order also leaves the book at its expiration_ts
@@ -91,7 +93,10 @@ Never places an order and never touches the network.
    env TEMP_SHADOW_SUBTRACT_LIVE=0 turns it off) makes books_per_second /
    book_at return the recorded levels minus ours (clipped at 0) and drops the
    trades that filled our orders (by trade_id) from `trades` (the replayed
-   bot gets the tape of a market without us). With no live rows for the
+   bot gets the recorded market minus our own orders and fills; makers who
+   reacted to our orders -- e.g. joined a 1c level our pad had opened --
+   stay in it, so this is not a market that never saw us). With no live
+   rows for the
    event it is a no-op: the same objects come back, so every pre-13:00Z
    replay is bit-identical. EventStream.live_own / own_trades / trades_all
    keep what was subtracted; coverage["live_own"] (only when rows exist)
@@ -479,10 +484,23 @@ _LIVE_KINDS = {"place": 0, "adopt": 0, "amend": 1, "renew": 1, "decrease": 1,
 _LIVE_CACHE: Dict[str, tuple] = {}     # path -> (mtime, size, live rows)
 
 
-def live_dir() -> str:
-    """The live executor's data dir: env TEMP_MM_LIVE_DIR (read per call so
-    tests can sandbox it), default KL-data\\temp-mm."""
-    return os.environ.get("TEMP_MM_LIVE_DIR") or LIVE_DIR_DEFAULT
+DATA_ROOT_DEFAULT = r"C:\Users\jackd\Documents\KL-data\temp-shadow"
+
+
+def live_dir() -> Optional[str]:
+    """The live executor's data dir, read per call: env TEMP_MM_LIVE_DIR,
+    else env TEMP_MM_DATA (where temp_mm_live itself writes when relocated),
+    else KL-data\\temp-mm -- but only for the real recording: when
+    TEMP_SHADOW_DATA points elsewhere (a test sandbox, a copy) and neither
+    env names a live dir, None (nothing is subtracted), so a sandboxed replay
+    never reads the real executor's logs."""
+    d = os.environ.get("TEMP_MM_LIVE_DIR") or os.environ.get("TEMP_MM_DATA")
+    if d:
+        return d
+    if os.path.normcase(os.path.realpath(C.DATA_ROOT)) != \
+            os.path.normcase(os.path.realpath(DATA_ROOT_DEFAULT)):
+        return None
+    return LIVE_DIR_DEFAULT
 
 
 def _live_file_rows(path: str) -> List[dict]:
@@ -504,7 +522,7 @@ def live_log_rows(kind: str, t0: float, t1: float, root: Optional[str] = None
     """Live rows of the executor's `<kind>_<UTC day>.jsonl` (kind 'orders' or
     'fills') for every UTC day touching [t0 - 6 h, t1 + 1 h]."""
     root = root or live_dir()
-    if not os.path.isdir(root):
+    if not root or not os.path.isdir(root):
         return []
     out: List[dict] = []
     d = _dt.datetime.fromtimestamp(t0 - LIVE_READ_BEFORE_S, tz=_dt.timezone.utc).date()
