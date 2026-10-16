@@ -11415,11 +11415,33 @@ class TestCarbonArcFairGate(unittest.TestCase):
         return {cat: {"dataset": ds, "next_run_start": iso(start_min),
                       "next_run_end": iso(end_min), "last_update": iso(last_min)}}
 
+    def test_only_ad_spend_holds_by_default(self):
+        """Jack 2026-10-15: "Narrow the scheduled stand-aside to ad spend only
+        (the weekly data drop); turn it off for card spend, point of sale,
+        foot traffic and apps"."""
+        self.assertEqual(imm.CA_SCHEDULE_HOLD_CATS, ("advertising",))
+        self.assertIn("CA_SCHEDULE_HOLD_CATS", imm._CONFIG_CODE_KNOBS)
+        now = time.time()
+        # a card-spend market inside its own panel's window: not held
+        self._write_fair({"KXFAKECC": self._entry(100.0)}, schedules=self._sched(-5, 25))
+        self.assertIsNone(imm.ca_schedule_hold(self.T, now))
+        # the same market read as ad spend, inside the ad panel's window: held
+        ads = dict(self._entry(100.0), category="Advertising")
+        self._write_fair({"KXFAKECC": ads},
+                         schedules=self._sched(-5, 25, cat="advertising", ds="CA009"))
+        why, inp = imm.ca_schedule_hold(self.T, now)
+        self.assertEqual(inp["dataset"], "CA009")
+        self.assertIn("advertising data due", why)
+        with mock.patch.object(imm, "CA_SCHEDULE_HOLD_CATS", ()):
+            self.assertIsNone(imm.ca_schedule_hold(self.T, now))
+
+    @mock.patch.object(imm, "CA_SCHEDULE_HOLD_CATS", ("advertising", "credit card"))
     def test_scheduled_data_window(self):
         """Jack 2026-10-15: "do 2 and 3" (option 2) -- a category stands
         aside from 10 min before its panel's scheduled update to 20 min after
         the window; a run that has not landed holds to 60 min past it; the
-        knob, a stale schedule and another category leave it open."""
+        knob, a stale schedule and another category leave it open. (The
+        mechanism on the card-spend fixture, with card spend switched on.)"""
         self.assertTrue(imm.CA_SCHEDULE_HOLD)
         self.assertEqual((imm.CA_SCHEDULE_PRE_MIN, imm.CA_SCHEDULE_POST_MIN,
                           imm.CA_SCHEDULE_LATE_MAX_MIN), (10, 20, 60))
@@ -11461,16 +11483,19 @@ class TestCarbonArcFairGate(unittest.TestCase):
         self.assertIsNone(h(self.T, now + 45 * 60))
 
     def test_a_scheduled_update_parks_both_sides_then_quoting_resumes(self):
-        self._write_fair({"KXFAKECC": self._entry(100.0)},
-                         schedules=self._sched(-5, 25))     # the window is open
+        # the fixture read as ad spend (the one category held by default)
+        ads = dict(self._entry(100.0), category="Advertising")
+        self._write_fair({"KXFAKECC": ads},
+                         schedules=self._sched(-5, 25, cat="advertising", ds="CA009"))
         bot = self._bot()
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertIn(self.T, bot._ca_fair_stood)
         self.assertIn(self.T, bot.state.selected)          # kept meanwhile
-        # the run lands (same read) and the schedule moves to tomorrow
-        self._write_fair({"KXFAKECC": self._entry(100.0)},
-                         schedules=self._sched(24 * 60, 24 * 60 + 30, last_min=-1))
+        # the run lands (same read) and the schedule moves to next week
+        self._write_fair({"KXFAKECC": ads},
+                         schedules=self._sched(7 * 24 * 60, 7 * 24 * 60 + 30, last_min=-1,
+                                               cat="advertising", ds="CA009"))
         bot.run_cycle()
         self.assertNotIn(self.T, bot._ca_fair_stood)
         q = self._quotes(bot)

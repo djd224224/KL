@@ -9121,7 +9121,7 @@ _CONFIG_CODE_KNOBS = (
     "CA_LANDING_WINDOWS",          # Carbon Arc 1x while data lands (2026-10-10)
     "CA_LATE_TOXIC_SIDE_BY_CAT",   # late-month blocked side per category (2026-10-11)
     # the scheduled-data stand-aside (2026-10-15)
-    "CA_SCHEDULE_HOLD", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
+    "CA_SCHEDULE_HOLD", "CA_SCHEDULE_HOLD_CATS", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
     "CA_SCHEDULE_LATE_MAX_MIN",
     "CA_FAIR_CAP",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
@@ -10370,7 +10370,19 @@ def ca_refresh_hold_min(category) -> float:
 # before the window) holds to CA_SCHEDULE_LATE_MAX_MIN past it. A schedule
 # not re-read for CA_SCHEDULE_TTL_H is ignored (the gate as before).
 # IMM_CA_SCHEDULE_HOLD=0 turns it off.
+# AD SPEND ONLY (Jack 2026-10-15: "Narrow the scheduled stand-aside to ad
+# spend only (the weekly data drop); turn it off for card spend, point of
+# sale, foot traffic and apps"). Measured after shipping, Oct 1-14 (64
+# landings, 589 Carbon Arc fills, reward at the paid basis): the ~1h hold
+# avoided ~$56 of 30-min losses for ~$61 of reward, about -$0.4/day. Per
+# category, per day: ads +0.2, apps +0.5, card -0.1, foot traffic -1.0, POS
+# 0.0. The daily panels land on a steady clock; ad spend lands weekly, in
+# lumps, and its 10/10 drop was the sweep. carbon_arc_fair still reads every
+# panel's schedule. IMM_CA_SCHEDULE_HOLD_CATS: prism categories,
+# comma-separated ("" = none).
 CA_SCHEDULE_HOLD = os.environ.get("IMM_CA_SCHEDULE_HOLD", "1") == "1"
+CA_SCHEDULE_HOLD_CATS: Tuple[str, ...] = tuple(sorted({c.strip().lower() for c in os.environ.get(
+    "IMM_CA_SCHEDULE_HOLD_CATS", "advertising").split(",") if c.strip()}))
 CA_SCHEDULE_PRE_MIN = _env_float("IMM_CA_SCHEDULE_PRE_MIN", 10)
 CA_SCHEDULE_POST_MIN = _env_float("IMM_CA_SCHEDULE_POST_MIN", 20)
 CA_SCHEDULE_LATE_MAX_MIN = _env_float("IMM_CA_SCHEDULE_LATE_MAX_MIN", 60)
@@ -10483,6 +10495,8 @@ def ca_schedule_hold(ticker: str, now_ts: float) -> Optional[Tuple[str, dict]]:
     if not (CA_FAIR_ENABLE and CA_SCHEDULE_HOLD):
         return None
     cat = ca_category(series_of(ticker))
+    if cat not in CA_SCHEDULE_HOLD_CATS:
+        return None
     s = (_ca_fair_state.get("schedules") or {}).get(cat or "")
     if not s or now_ts - (_ca_fair_state.get("schedules_ts") or 0.0) \
             > CA_SCHEDULE_TTL_H * 3600:
@@ -27464,10 +27478,11 @@ class IncentiveMarketMaker:
                    else "parks both sides")
                 + f", file {CA_FAIR_FILE}")
             log("ca scheduled-data stand-aside (2026-10-15): "
-                + (f"each category out from {CA_SCHEDULE_PRE_MIN:g}m before its "
-                   f"panel's scheduled update to {CA_SCHEDULE_POST_MIN:g}m after "
-                   f"(a late run up to {CA_SCHEDULE_LATE_MAX_MIN:g}m), schedules "
-                   f"read by carbon_arc_fair"
+                + (f"{', '.join(sorted(CA_SCHEDULE_HOLD_CATS)) or '(no category)'} "
+                   f"out from {CA_SCHEDULE_PRE_MIN:g}m before its panel's "
+                   f"scheduled update to {CA_SCHEDULE_POST_MIN:g}m after (a late "
+                   f"run up to {CA_SCHEDULE_LATE_MAX_MIN:g}m), schedules read by "
+                   f"carbon_arc_fair"
                    if CA_SCHEDULE_HOLD else "off (IMM_CA_SCHEDULE_HOLD=0)"))
             if CA_LANDING_WINDOWS:
                 log("ca 1x while data lands (2026-10-10): "
