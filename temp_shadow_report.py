@@ -4,7 +4,9 @@ r"""temp_shadow_report.py -- the hourly-temp shadow test's DAILY REPORT
 
 Jack 2026-10-14: "build it and shadow test for a week, reporting results and
 suggestion tweaks daily". Every morning (task "KL temp-shadow report", 08:30
-ET) this sims the previous ET day (temp_shadow_sim.run_day), reads every
+ET) this sims the previous ET day (temp_shadow_sim.run_day) and brings every
+earlier day of the cumulative window up to the current SIM_VERSION (run_day
+again: cached files that pass its check are only loaded), reads every
 sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
 
   1 headline       "Day N of 7"; the best CONS variant by the day's net with
@@ -25,8 +27,10 @@ sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
                    missing events with the likely reason
   7 suggestions    a rule engine over the variant pairs (cons fill model):
                    window B-A, back vs pull C-B, size D-B ($ per extra
-                   contract of q_live), decided E-B and G alone, full F vs
-                   best, guard B-H; the opt-cons fill-model gap; tau-bucket
+                   contract of q_live), decided E-B and decided strikes
+                   alone (G0, the G without the pad hold, else G), the
+                   pad hold G-G0, full F vs best, guard B-H; the opt-cons
+                   fill-model gap; tau-bucket
                    losses at or above the current live_stop_min (->
                    live_stop_min); losing ET hours, each hour tested on its
                    own with a Bonferroni bar over 24 hours (-> smaller size
@@ -51,7 +55,16 @@ sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
 
 Variant letters: the pair rules look variants up by their leading letter
 (exact name "B", or "B" followed by a non-alphanumeric, e.g. "B_pull"); a
-pair whose variant is absent is skipped and named in the report.
+pair whose variant is absent is skipped and named in the report. "G0" finds
+G0_nohold (G without the 10/16 pad hold), which "G" never matches; the
+pad-hold rule and the decided-only baseline use it when present.
+
+Sim freshness: run_sim re-runs temp_shadow_sim.run_day for every day of the
+cumulative window, not only the report day; run_day reuses a cached file
+only when it is from the current SIM_VERSION with the current variant
+overrides, so a grid change re-sims the window. Files still older than the
+current SIM_VERSION (a --no-sim report, a failed re-sim) are flagged at the
+top of the report.
 
 Shadow days: day 1 = TEMP_SHADOW_DAY1 (2026-10-15, the first full ET day);
 day 0 = the partial 10/14. Cumulative figures cover day 1 .. the report day
@@ -744,7 +757,16 @@ _PAIR_RULES = (
     ("size", "B", "D", "Bigger live size (D-B)"),
     ("decided", "B", "E", "Decided strikes on (E-B)"),
     ("guard", "H", "B", "Guard value (B-H)"),
+    ("padhold", "G0", "G", "Pad hold value (G-G0)"),
 )
+
+
+def _hold_s(policy: "Policy", name: Optional[str]) -> float:
+    """The variant's pad_hold_open_s (0 when unset or not a number)."""
+    if not name:
+        return 0.0
+    v = _opt_num(policy.get(name, "pad_hold_open_s"))
+    return v if v is not None and v > 0 else 0.0
 
 
 def suggest(win: Window, today: str, policy: Policy, market: dict, model: dict,
@@ -756,8 +778,12 @@ def suggest(win: Window, today: str, policy: Policy, market: dict, model: dict,
     fill = HEADLINE_FILL
     names = win.names(fill)
     L = {c: resolve_variant(c, names) for c in "ABCDEFGH"}
+    # G0 = G without the 10/16 pad hold (G0_nohold): the decided-only
+    # baseline. Optional (older windows have no G0), so not in the
+    # missing-letter note.
+    L["G0"] = resolve_variant("G0", names)
     k = lambda n: f"{n}|{fill}"   # noqa: E731
-    missing = [c for c, n in L.items() if n is None]
+    missing = [c for c in "ABCDEFGH" if L[c] is None]
     if names and missing:
         notes.append("Pair rules skipped for absent variant(s) "
                      + ", ".join(missing) + f" (variants present: {', '.join(names)}).")
@@ -824,15 +850,20 @@ def suggest(win: Window, today: str, policy: Policy, market: dict, model: dict,
             out.append(_sugg("size", "policy",
                              f"Bigger size {'adds' if d >= 0 else 'costs'} {usd(d)}/day",
                              evidence(label, st), change, d, gate(st)))
-    # 4 decided E - B, and G alone
-    if L["B"] and (L["E"] or L["G"]):
+    # 4 decided E - B, and decided strikes alone: G0 (no pad hold) when the
+    # window has it, else G (labelled with its hold, if any)
+    g_alone = L["G0"] or L["G"]
+    g_hold = _hold_s(policy, g_alone)
+    g_tag = f" with the {g_hold:g} s pad hold" if g_hold else ""
+    if L["B"] and (L["E"] or g_alone):
         st_e = pair_stats(win, k(L["B"]), k(L["E"]), today) if L["E"] else None
-        st_g = single_stats(win, k(L["G"]), today) if L["G"] else None
+        st_g = single_stats(win, k(g_alone), today) if g_alone else None
         parts = []
         if st_e:
             parts.append(evidence(_PAIR_RULES[3][3], st_e))
         if st_g:
-            parts.append(evidence(f"{L['G']} alone (decided only)", st_g))
+            parts.append(evidence(f"{g_alone} alone (decided only"
+                                  + (f" + {g_hold:g} s pad hold" if g_hold else "") + ")", st_g))
         ev = "; ".join(parts)
         if st_e and (not gate(st_e) or not st_g or gate(st_g)):
             d = st_e["per_day"]
@@ -847,17 +878,39 @@ def suggest(win: Window, today: str, policy: Policy, market: dict, model: dict,
                                  d, gate(st_e)))
         elif st_g:
             d = st_g["per_day"]
-            src = L["E"] or L["G"]
+            src = L["E"] or g_alone
             if d >= 0:
                 out.append(_sugg("decided", "policy",
-                                 f"Decided strikes alone earn {usd(d)}/day",
+                                 f"Decided strikes alone{g_tag} earn {usd(d)}/day",
                                  ev, f"enable decided strikes ({policy.diff_text(L['B'], src)})",
                                  d, gate(st_g)))
             else:
                 out.append(_sugg("decided", "policy",
-                                 f"Decided strikes alone lose {usd(d)}/day: leave them off",
+                                 f"Decided strikes alone{g_tag} lose {usd(d)}/day: "
+                                 "leave them off",
                                  ev, f"no change (not {policy.diff_text(L['B'], src)})",
                                  d, gate(st_g)))
+    # 4b pad hold G - G0: what holding the 1c pads after the open is worth
+    # (Jack 2026-10-16: "hold the pads for the first 3 minutes of each hour
+    # going forward"); paired on the events both ran on
+    if L["G"] and L["G0"] and _hold_s(policy, L["G"]) != _hold_s(policy, L["G0"]):
+        st, label = pair("padhold", L["G0"], L["G"], _PAIR_RULES[5][3])
+        d = st["per_day"]
+        h, h0 = _hold_s(policy, L["G"]), _hold_s(policy, L["G0"])
+        if d >= 0:
+            out.append(_sugg("padhold", "policy",
+                             f"Holding the 1c pads for the first {h:g} s after the open "
+                             f"saves {usd(d)}/day: keep it",
+                             evidence(label, st),
+                             f"keep pad_hold_open_s={h:g} ({L['G']}, not {L['G0']})",
+                             d, gate(st)))
+        else:
+            out.append(_sugg("padhold", "policy",
+                             f"Holding the 1c pads for the first {h:g} s after the open "
+                             f"costs {usd(d)}/day",
+                             evidence(label, st),
+                             f"pad_hold_open_s {h:g} -> {h0:g} ({L['G0']}'s setting)",
+                             d, gate(st)))
     # 5 full F vs best
     if L["F"] and best:
         if best == L["F"]:
@@ -1846,10 +1899,34 @@ def collector_health(day: str, sim_events: Sequence[dict], now: Optional[float] 
 # --------------------------------------------------------------------------
 
 
+def _tally(res, into: dict) -> None:
+    """Add run_day's per-event results to {"ok", "pending", "errors"}."""
+    for r in res or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("error"):
+            into["errors"].append((str(r.get("event")), str(r.get("error"))[:300]))
+        elif r.get("pending"):
+            into["pending"].append(str(r.get("event")))
+        else:
+            into["ok"] += 1
+
+
 def run_sim(day: str) -> Tuple[Optional[str], dict]:
-    """temp_shadow_sim.run_day(day) -> (error text or None, summary of its
-    per-event results: {"ok", "pending": [events], "errors": [(event, err)]})."""
-    summary: dict = {"ok": 0, "pending": [], "errors": []}
+    """temp_shadow_sim.run_day(day), then run_day for every earlier day of the
+    cumulative window (window_days) -> (error text or None, summary).
+
+    The summary is the report day's per-event results, {"ok", "pending":
+    [events], "errors": [(event, err)]}, plus "window": the same tally over
+    the earlier window days ({"days", "ok", "pending", "errors"}; a run_day
+    that raises adds (day, error)). run_day only loads a cached file that
+    passes its own check (settled, this SIM_VERSION, every variant with the
+    same overrides), so a SIM_VERSION bump or a VARIANTS change re-sims the
+    whole window here instead of mixing old and new output in the cumulative
+    figures (review fix 10/16: 10/15 stayed at SIM_VERSION 4, where
+    G_decided_only had no pad hold and G0_nohold did not exist)."""
+    summary: dict = {"ok": 0, "pending": [], "errors": [],
+                     "window": {"days": [], "ok": 0, "pending": [], "errors": []}}
     try:
         import temp_shadow_sim as sim   # noqa: WPS433
         res = sim.run_day(day)
@@ -1858,16 +1935,48 @@ def run_sim(day: str) -> Tuple[Optional[str], dict]:
             raise
         return ("".join(traceback.format_exception(type(e), e, e.__traceback__))[-3000:],
                 summary)
-    for r in res or []:
-        if not isinstance(r, dict):
+    _tally(res, summary)
+    win = summary["window"]
+    for d in window_days(day):
+        if d == day:
             continue
-        if r.get("error"):
-            summary["errors"].append((str(r.get("event")), str(r.get("error"))[:300]))
-        elif r.get("pending"):
-            summary["pending"].append(str(r.get("event")))
-        else:
-            summary["ok"] += 1
+        win["days"].append(d)
+        try:
+            res = sim.run_day(d)
+        except BaseException as e:      # noqa: BLE001 -- the report day still reports
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            win["errors"].append((d, f"run_day raised {type(e).__name__}: {e}"[:300]))
+            continue
+        _tally(res, win)
     return None, summary
+
+
+def current_sim_version() -> Optional[str]:
+    """temp_shadow_sim.SIM_VERSION, or None when the sim is not importable."""
+    try:
+        import temp_shadow_sim as sim   # noqa: WPS433 (lazy on purpose)
+    except BaseException as e:          # noqa: BLE001
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return None
+    v = getattr(sim, "SIM_VERSION", None)
+    return None if v is None else str(v)
+
+
+def stale_sim_days(days_events: Dict[str, List[dict]],
+                   version: Optional[str]) -> Dict[str, int]:
+    """day -> count of loaded sim files whose sim_version is not `version`
+    (files without a sim_version are not judged)."""
+    out: Dict[str, int] = {}
+    if version is None:
+        return out
+    for d, evs in days_events.items():
+        n = sum(1 for ev in evs
+                if ev.get("sim_version") is not None and str(ev.get("sim_version")) != version)
+        if n:
+            out[d] = n
+    return out
 
 
 def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = False,
@@ -1901,7 +2010,12 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
                           agg_model(win.all_events), health)
     if policy.err:
         notes.append(f"temp_shadow_sim not importable for variant params ({policy.err}).")
+    # sim files older than the current SIM_VERSION (a --no-sim report, or a
+    # window day whose re-sim failed): flagged at the top of the report
+    sim_version = current_sim_version()
+    stale = stale_sim_days(days_events, sim_version)
     ctx = {"day": day, "day_n": day_number(day), "label": day_label(day),
+           "stale_sim": stale, "sim_version": sim_version,
            "generated": now, "sim_error": sim_error, "sim_ran": sim_ran,
            "events": events, "agg": agg, "market": market, "model": model,
            "coverage": cov, "health": health, "win": win, "policy": policy,
@@ -2249,6 +2363,13 @@ def _health_html(ctx: dict) -> str:
         rows.append(["sim run (this report)",
                      f"{ss.get('ok', 0)} ok, {len(ss.get('pending') or [])} pending (unsettled), "
                      f"{len(ss.get('errors') or [])} failed"])
+        ws = ss.get("window") or {}
+        if ws.get("days"):
+            rows.append(["sim run (earlier window days)",
+                         f"{ws.get('ok', 0)} ok, {len(ws.get('pending') or [])} pending "
+                         f"(unsettled), {len(ws.get('errors') or [])} failed over "
+                         f"{len(ws['days'])} day(s) (cached files that pass the sim's check "
+                         "are reused)"])
     flags = ctx["coverage"].get("flags") or {}
     if flags:
         rows.append(["sim flags (events)",
@@ -2390,6 +2511,24 @@ def render_html(ctx: dict) -> str:
                      f'failed in the sim</b> (left out of every figure below)'
                      + table(["event", "error"], [[e, err] for e, err in ss["errors"][:12]],
                              right=[False, False]) + "</div>")
+    w_err = (ss.get("window") or {}).get("errors") or []
+    if w_err:
+        parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
+                     f'margin:8px 0;"><b style="color:#9a6700;">{len(w_err)} re-sim failure(s) on '
+                     f'earlier window days</b> (the older sim output, if any, stays in the '
+                     f'cumulative figures)'
+                     + table(["event / day", "error"], [[e, err] for e, err in w_err[:12]],
+                             right=[False, False]) + "</div>")
+    stale = ctx.get("stale_sim") or {}
+    if stale:
+        parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
+                     f'margin:8px 0;"><b style="color:#9a6700;">{sum(stale.values())} sim file(s) '
+                     f'in the cumulative window are from an older SIM_VERSION than '
+                     f'{esc(str(ctx.get("sim_version")))}</b> ('
+                     + esc(", ".join(f"{d} x{n}" for d, n in sorted(stale.items())))
+                     + '): a variant name may hold different settings on those days, so the '
+                     'cumulative figures mix the two. Re-sim with <code>python temp_shadow_sim.py '
+                     'day --day &lt;day&gt;</code>.</div>')
     # 1 headline
     parts.append(h2("Headline"))
     if best:
@@ -2480,6 +2619,11 @@ def subject_line(ctx: dict) -> str:
         s += " [SIM FAILED]"
     elif (ctx.get("sim_summary") or {}).get("errors"):
         s += f" [{len(ctx['sim_summary']['errors'])} sim errors]"
+    w_err = ((ctx.get("sim_summary") or {}).get("window") or {}).get("errors") or []
+    if w_err:
+        s += f" [{len(w_err)} window re-sim errors]"
+    if ctx.get("stale_sim"):
+        s += f" [{sum(ctx['stale_sim'].values())} stale sim files]"
     if ctx.get("week"):
         s += f" -- week: {ctx['week']['verdict']}"
     return s
@@ -2492,6 +2636,16 @@ def render_text(ctx: dict) -> str:
     errs = (ctx.get("sim_summary") or {}).get("errors") or []
     if errs:
         lines.append(f"{len(errs)} event(s) failed in the sim, e.g. {errs[0][0]}: {errs[0][1]}")
+    w_err = ((ctx.get("sim_summary") or {}).get("window") or {}).get("errors") or []
+    if w_err:
+        lines.append(f"{len(w_err)} re-sim failure(s) on earlier window days (older output "
+                     f"stays in the cumulative figures), e.g. {w_err[0][0]}: {w_err[0][1]}")
+    stale = ctx.get("stale_sim") or {}
+    if stale:
+        lines.append(f"{sum(stale.values())} sim file(s) in the window are from an older "
+                     f"SIM_VERSION than {ctx.get('sim_version')} ("
+                     + ", ".join(f"{d} x{n}" for d, n in sorted(stale.items()))
+                     + "): the cumulative figures mix two grids; re-sim those days.")
     best = ctx["best_cons"]
     if best:
         a = ctx["agg"][f"{best}|cons"]
@@ -2576,8 +2730,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if sim_error:
             print(f"[{C.iso(C.utcnow())}] SIM FAILED:\n{sim_error}")
         else:
+            ws = summary.get("window") or {}
             print(f"[{C.iso(C.utcnow())}] sim: {summary['ok']} ok, {len(summary['pending'])} "
-                  f"pending, {len(summary['errors'])} failed")
+                  f"pending, {len(summary['errors'])} failed; earlier window days "
+                  f"{len(ws.get('days') or [])}: {ws.get('ok', 0)} ok, "
+                  f"{len(ws.get('pending') or [])} pending, {len(ws.get('errors') or [])} failed")
     ctx = build_context(day, sim_error=sim_error, sim_ran=not args.no_sim,
                         sim_summary=summary)
     page = render_html(ctx)
@@ -2588,7 +2745,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f.write(page)
     os.replace(tmp, path)
     print(path)
-    rc = 1 if sim_error or (summary and summary["errors"]) else 0
+    rc = 1 if sim_error or (summary and (summary["errors"]
+                                          or (summary.get("window") or {}).get("errors"))) else 0
     if args.send:
         if not send_report(subject_line(ctx), path, render_text(ctx)):
             rc = 2
