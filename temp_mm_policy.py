@@ -68,6 +68,17 @@ The rules (TEMP_SHADOW.md "Policy and variants"); each has a switch in P:
                                none exceeds it (trim_resting_wcl).
   program_only                 quote only while the market's reward program is
                                active during the orders' resting interval.
+  pad hold [pad_hold_open_s]   Jack 2026-10-16: "hold the pads for the first 3
+                               minutes of each hour going forward" (live G's
+                               first hour: sweepers took 4,659 of its 1c
+                               fillers within ~45 s of the program opening).
+                               No 1c filler -- longshot pad ("pad") or
+                               qualification pad ("qual") -- while the orders'
+                               resting interval starts before the event's open
+                               + pad_hold_open_s (pad_hold_flag; the open is
+                               the market open, close - 3600 when the caller
+                               does not know it). Favorite joins, live and
+                               near-decided quotes are unaffected. 0 = off.
 
 F vs G ("F is a superset of G"): F_full = q_live 600 + decided + skew 0.3;
 G_decided_only = live off + decided. On a decided strike (fair < 3% / > 97%)
@@ -77,6 +88,9 @@ q_live 600 * 0.5 = 300 a side (skewed inside 5-10% / 90-95%) vs G's 150
 unskewed. Both share one event risk budget (pos_cap, event_wcl_cap), so F's
 live fills can trim the decided orders G would rest. So: structurally a
 superset, not order-for-order (test_temp_mm_policy.TestFSupersetOfG).
+G_decided_only (what runs live since 10/16) also holds its 1c pads for the
+first 180 s after the open (pad_hold_open_s); G0_nohold is the G before the
+hold, kept for comparison. F has no hold.
 
 API:
   DEFAULT_POLICY, VARIANTS, make_policy(variant=None, **overrides) -> dict
@@ -86,7 +100,8 @@ API:
   sim's per-market cache does not apply it and refuses the switch)
   building blocks (the sim calls these directly): BookView, quote_market,
   quote_price, classify, guard_buffer, normal_slope_c, g_tau, live_size,
-  overlap_window, window_flag, program_flag, risk_headroom, worst_case_loss,
+  overlap_window, window_flag, program_flag, pad_hold_flag, risk_headroom,
+  worst_case_loss,
   scenario_losses, reference_price, best_price, would_cross, external_book.
 """
 from __future__ import annotations
@@ -95,10 +110,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-POLICY_VERSION = "1"
+POLICY_VERSION = "2"   # 2: pad_hold_open_s (10/16)
 
-DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False)
-VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000)}
+DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False, pad_hold_open_s=0.0)
+VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True, pad_hold_open_s=180.0), "G0_nohold": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000)}
 
 TARGET = 1000.0      # target_size_fp of every KXTEMPMIAH program (10/14)
 DF = 0.5             # discount_factor_bps 5000
@@ -326,6 +341,21 @@ def program_flag(P: dict, rest_from: float, rest_until: float,
     return rest_from < close_ts
 
 
+def pad_hold_flag(P: dict, rest_from: float, open_ts: float) -> bool:
+    """Are the 1c fillers (longshot and qualification pads) held for orders
+    resting over [rest_from, ...)? True while pad_hold_open_s > 0 and the
+    resting interval starts before open_ts + pad_hold_open_s -- it touches
+    the hold window [open_ts, open_ts + hold) (or lies before the open), the
+    same overlap test program_flag / window_flag apply to [rest_from,
+    rest_until). An order that would start resting before the hold ends is
+    held; the first one resting at or after it is placed. rest_from only
+    grows with the decision time, so the flag turns off once per event and
+    never comes back. open_ts = the event's market open (close - 3600 for
+    the hourly events when the caller does not know it)."""
+    hold = float(P.get("pad_hold_open_s") or 0.0)
+    return hold > 0.0 and rest_from < float(open_ts) + hold
+
+
 # --------------------------------------------------------------------------
 # Risk (event level, on FILLED positions; strikes ascending)
 # --------------------------------------------------------------------------
@@ -479,7 +509,8 @@ def _tag(tags, side, p, name):
 def quote_market(P: dict, book: Optional[BookView], fair: Optional[float],
                  slope_c: Optional[float], wflag: bool, pflag: bool, size_full: float,
                  risk: Tuple[float, float, float, float], target: float,
-                 tags: Optional[dict] = None, diag: Optional[dict] = None
+                 tags: Optional[dict] = None, diag: Optional[dict] = None,
+                 hold_pads: bool = False
                  ) -> Tuple[Dict[int, float], Dict[int, float], Optional[str]]:
     """The desired resting orders on one market -> (dy, dn, rule).
 
@@ -494,6 +525,9 @@ def quote_market(P: dict, book: Optional[BookView], fair: Optional[float],
     tags     optional dict, filled {(side, price): [tag, ...]} with tags
              'live' / 'near' / 'pad' / 'fav' / 'qual'
     diag     optional dict, filled with the decision's diagnostics
+    hold_pads  pad_hold_flag() for the resting interval: no longshot pad and
+             no qualification pads (the 1c fillers); every other rule as
+             usual (a near quote that happens to sit at 1c stays)
 
     dy / dn = {price: contracts} YES bids / NO bids (whole contracts >= 1).
     rule = the reward class the order books as ('live' | 'decided'), None
@@ -516,6 +550,8 @@ def quote_market(P: dict, book: Optional[BookView], fair: Optional[float],
     if diag is not None:
         diag.update(fx=fx, fair_src="model" if fair is not None else "mid", cls=cls,
                     buf=buf, wflag=wflag, pflag=pflag, size_full=size_full)
+        if hold_pads:
+            diag["pad_hold"] = True
     # Near-decided strikes are live at half size -- part of the decided
     # feature, so they need `decided` (not `live`) and book as "decided"
     near_live = cls == "near" and P["decided"] and P["near_decided_half"]
@@ -550,9 +586,9 @@ def quote_market(P: dict, book: Optional[BookView], fair: Optional[float],
     elif P["decided"] and cls != "live":
         rule = "decided"
         yes_long = fx < 0.5
-        # longshot side rests q_pad at 1c
+        # longshot side rests q_pad at 1c (not while the pads are held)
         ls = "yes" if yes_long else "no"
-        if P["q_pad"] >= 1 and not would_cross(book.by, book.bn, ls, 1):
+        if not hold_pads and P["q_pad"] >= 1 and not would_cross(book.by, book.bn, ls, 1):
             (dy if ls == "yes" else dn)[1] = float(math.floor(P["q_pad"]))
             if tags is not None:
                 _tag(tags, ls, 1, "pad")
@@ -568,8 +604,8 @@ def quote_market(P: dict, book: Optional[BookView], fair: Optional[float],
                     _tag(tags, fav, p, "fav")
     if not dy and not dn:
         return {}, {}, rule
-    # qualification pads (1c) on a market we quote
-    if P["qual_pads"]:
+    # qualification pads (1c) on a market we quote (not while the pads are held)
+    if P["qual_pads"] and not hold_pads:
         tgt = float(target)
         for side, d, depth in (("yes", dy, book.sum_y), ("no", dn, book.sum_n)):
             tot = depth + sum(d.values())
@@ -712,11 +748,18 @@ class MarketState:
 class EventContext:
     """now: decision time; close_ts: the event's close. The orders rest over
     [rest_from, rest_until): default now + order_latency_s for one second
-    (the next decision). The landing window and program tests use it."""
+    (the next decision). The landing window, program and pad-hold tests use
+    it. open_ts: the event's market open (the pad hold counts from it);
+    None -> close_ts - 3600 (the hourly events open an hour before close)."""
     now: float
     close_ts: float
     rest_from: Optional[float] = None
     rest_until: Optional[float] = None
+    open_ts: Optional[float] = None
+
+    def __post_init__(self):
+        if self.open_ts is None:
+            self.open_ts = float(self.close_ts) - 3600.0
 
 
 @dataclass
@@ -757,6 +800,7 @@ class EventDecision:
     headroom: List[Tuple[float, float, float, float]]
     resting_wcl: float = 0.0         # dollars: filled + every losing-side desired order filled
                                      # in full, worst scenario (resting_scenario_losses)
+    pad_hold: bool = False           # pad_hold_flag: the 1c fillers are held (event open + hold)
 
     def by_ticker(self) -> Dict[str, MarketDecision]:
         return {d.ticker: d for d in self.markets}
@@ -773,6 +817,8 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
     a = float(ctx.rest_from) if ctx.rest_from is not None else float(ctx.now) + lat
     b = float(ctx.rest_until) if ctx.rest_until is not None else a + 1.0
     wflag = window_flag(P, a, b)
+    open_ts = float(ctx.open_ts) if ctx.open_ts is not None else float(ctx.close_ts) - 3600.0
+    hold = pad_hold_flag(P, a, open_ts)
     tau = (float(ctx.close_ts) - float(ctx.now)) / 60.0
     size_full = live_size(P, tau)
     yes_q = [float(s.yes_pos) for s in mk]
@@ -800,7 +846,7 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
         diag: dict = {"second_of_minute": a % 60.0, "tau_min": tau, "slope_c": slope,
                       "slope_src": slope_src}
         dy, dn, rule = quote_market(P, book, fair, slope, wflag, pflag, size_full,
-                                    risk[m], float(s.target), tags, diag)
+                                    risk[m], float(s.target), tags, diag, hold_pads=hold)
         rows.append((s, dy, dn, rule, tags, diag))
     if P.get("wcl_resting"):
         dys, dns = [r[1] for r in rows], [r[2] for r in rows]
@@ -821,4 +867,5 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
                                   diag=diag))
     return EventDecision(markets=out, tau_min=tau, size_full=size_full, wflag=wflag,
                          rest_from=a, rest_until=b, worst_case_loss=wcl,
-                         wcl_scenarios=scen, headroom=risk, resting_wcl=max(0.0, max(rloss)))
+                         wcl_scenarios=scen, headroom=risk, resting_wcl=max(0.0, max(rloss)),
+                         pad_hold=hold)

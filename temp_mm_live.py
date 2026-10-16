@@ -62,6 +62,15 @@ loop_s = 250 ms and at once on a new station row, a book change or a fill):
                       guard-forced reprices go as one batched cancel + post-
                       only re-places; an order only moves to a price of its
                       own kind (a favorite giving way to a 1c pad is a pull)
+  pad hold            policy pad_hold_open_s (G: 180; Jack 2026-10-16: "hold
+                      the pads for the first 3 minutes of each hour going
+                      forward"): no 1c longshot / qualification pads while
+                      the orders would start resting before the event's open
+                      (EventInfo.open_ts, the markets' open_time) + the hold;
+                      the bot decides on the first wake past that edge and
+                      the pads are new creates (never debounced; paced like
+                      any create); 1c pads do not count in the debounce's
+                      price key, so they never delay a favorite's move
 
 Risk and safety (TEMP_MM_LIVE.md has every default):
   pos_cap / event_wcl_cap   the policy's pre-trade sizing on FILLED positions
@@ -2030,6 +2039,7 @@ class Bot:
         self.deferred: Counter = Counter()
         self.last_sample: Dict[str, float] = {}
         self.wflag_prev: Dict[str, bool] = {}
+        self.pad_hold_prev: Dict[str, bool] = {}     # event -> pad hold (pad_hold_open_s) last step
         self.pulls: Deque[dict] = deque(maxlen=30)
         self.last_status = 0.0
         self.last_save = 0.0
@@ -2353,6 +2363,9 @@ class Bot:
         wf = pol.window_flag(self.P, now + lat, now + lat + self.cfg.pull_lead_s)
         if wf != self.last_wflag:
             self.need_decide = True
+        # so is the end of an event's pad hold: the 1c pads go up on that wake
+        if self._pad_hold_edges(now, lat):
+            self.need_decide = True
         if self.need_decide or now - self.last_decide >= self.cfg.loop_s:
             self.need_decide = False
             self.last_decide = now
@@ -2598,12 +2611,36 @@ class Bot:
         line printed every closed event forever)."""
         q = {e.event for e in self._quotable_events(now)}
         for d in (self.guards_now, self.wflag_prev, self.last_sample, self.fair_last,
-                  self.resting_wcl):
+                  self.resting_wcl, self.pad_hold_prev):
             for k in [k for k in d if k not in q]:
                 d.pop(k, None)
         for e in [e for e, ts in self.traded.items()
                   if (self.events.get(e).close_ts if e in self.events else ts) < now - 3600.0]:
             self.traded.pop(e, None)
+
+    def _pad_hold_edges(self, now: float, lat: float) -> bool:
+        """True when an event's pad hold (temp_mm_policy.pad_hold_flag: no 1c
+        pads while the orders would start resting before the open +
+        pad_hold_open_s) ended since the last step, so the bot decides on this
+        wake (<= wake_s late) instead of the next loop_s tick -- the test the
+        policy applies, on the same resting start (now + order latency).
+        Logged once per event."""
+        hold_s = float(self.P.get("pad_hold_open_s") or 0.0)
+        if hold_s <= 0.0:
+            return False
+        edge = False
+        for ev in self._quotable_events(now):
+            h = pol.pad_hold_flag(self.P, now + lat, ev.open_ts)
+            prev = self.pad_hold_prev.get(ev.event)
+            self.pad_hold_prev[ev.event] = h
+            if prev and not h:
+                edge = True
+                self.log(f"{ev.event}: pad hold over ({hold_s:g} s after the open "
+                         f"{C.iso(ev.open_ts)}): 1c pads from now", now)
+                self.log.row("decisions", {"kind": "pad_hold_end", "event": ev.event,
+                                           "after_open_s": round(now + lat - ev.open_ts, 3)},
+                             now)
+        return edge
 
     def _feed_tickers(self, now: float) -> List[str]:
         out = []
@@ -3118,7 +3155,7 @@ class Bot:
                 self.marks[t] = f
         lat = float(P["order_latency_s"])
         ctx = pol.EventContext(now=now, close_ts=ev.close_ts, rest_from=now + lat,
-                               rest_until=now + lat + cfg.pull_lead_s)
+                               rest_until=now + lat + cfg.pull_lead_s, open_ts=ev.open_ts)
         dec = pol.decide(P, ctx, states)
         self.resting_wcl[ev.event] = dec.resting_wcl
         for g in guards:
@@ -3146,7 +3183,12 @@ class Bot:
             m = meta[md.ticker]
             stable = {}
             for side, want in (("yes", want_y), ("no", want_n)):
-                key = tuple(sorted(want))
+                # the 1c pads never reprice (a pad only pairs with a pad price),
+                # so a pad appearing -- the pad hold ending, a thin side's
+                # qualification pad -- does not restart the debounce of the
+                # favorite / live prices beside it
+                key = tuple(sorted(p for p in want
+                                   if tag_kind(tags.get((side, p), "")) != "pad"))
                 prev = self.want_since.get((md.ticker, side))
                 if prev is None or prev[0] != key:
                     self.want_since[(md.ticker, side)] = prev = (key, now)
@@ -3184,7 +3226,7 @@ class Bot:
             "guards": sorted(set(guards) | set(m["guards"])),
             "pos": [mp.yes_q, mp.no_q, round(mp.cost, 2)],
             "wcl": round(dec.worst_case_loss, 2), "resting_wcl": round(dec.resting_wcl, 2),
-            "suspect": md.ticker in self.suspect}, now)
+            "pad_hold": dec.pad_hold, "suspect": md.ticker in self.suspect}, now)
 
     # ---- execution -------------------------------------------------------
     def _execute(self, ops: List[Op], now: float) -> None:
@@ -3790,6 +3832,7 @@ class Bot:
         react = sorted(self.react)
         q = lambda a, f: round(a[min(len(a) - 1, int(f * len(a)))] * 1000, 2) if a else None
         ev_out = {}
+        hold_s = float(self.P.get("pad_hold_open_s") or 0.0)
         for ev in self._quotable_events(now):
             os_ = [o for o in self.orders.values() if self._event_of(o.ticker) == ev.event]
             fr = self.fair_last.get(ev.event)
@@ -3804,6 +3847,7 @@ class Bot:
                 "halted": self.halted_events.get(ev.event),
                 "guards": self.guards_now.get(ev.event, {}),
                 "resting_wcl": round(self.resting_wcl.get(ev.event, 0.0), 2),
+                "pad_hold_until": C.iso(ev.open_ts + hold_s) if hold_s > 0 else None,
                 "fair": ({t: round(f, 4) for t, f in fr.fairs.items()} if fr else {}),
                 "wx_latest_minute": (C.iso(fr.latest_minute_ms / 1000.0)
                                      if fr and fr.latest_minute_ms else None)}
