@@ -4,7 +4,7 @@ Jack, 2026-10-15: "yes build F, which is a superset of G right?" This followed t
 
 `temp_mm_live.py` quotes Kalshi's hourly Miami temperature markets with the same policy code the shadow replays (`temp_mm_policy.decide`). The shadow's numbers therefore describe the code that trades.
 
-- **Variants:** it runs F by default. `--variant G` (decided strikes only) or `--variant J` (decided, favorite size 100) switches it, and so does any `temp_mm_policy.VARIANTS` key.
+- **Variants:** it runs F by default. `--variant G` (decided strikes only, with the 180 s pad hold since 10/16) or `--variant J` (decided, favorite size 100) switches it, and so does any `temp_mm_policy.VARIANTS` key. `--variant G0` is G without the pad hold.
 - **Policy switches:** every policy setting is an env var, for example `TMM_Q_LIVE=300` or `TMM_EVENT_WCL_CAP=500`.
 
 **It is DRY by default.** It reads live data, logs `[DRY] would ...` for every create, amend, decrease and cancel, and keeps a dry book. It never sends an order unless started with `--live --subaccount N`.
@@ -21,6 +21,51 @@ In structure, yes. Order for order, not quite.
 - **Shared risk budget:** both share one event risk budget (`pos_cap`, `event_wcl_cap`), so F's live fills can trim decided orders G would have rested.
 
 `test_temp_mm_policy.TestFSupersetOfG` pins all of this.
+
+## Pad hold (10/16)
+
+Jack, 2026-10-16: "hold the pads for the first 3 minutes of each hour going forward".
+
+**Why.** G went live on subaccount 2 at 13:00Z on 10/16. In its first hour (26OCT1610), the pads went up at +152.9 s, when the programs appeared. Sweepers sold into them from +155.7 s: 4,650 1c contracts by +197 s (4,659 by +264 s), and positions hit the 1,500 cap on three strikes (`fills_2026-10-16.jsonl`).
+
+**What it does.** The policy key is `pad_hold_open_s`: 180 in `G_decided_only`, and 0 (off) everywhere else.
+- While the orders would start resting before the event's open + 180 s, no 1c longshot pad and no 1c qualification pad is placed.
+- Favorite joins, live and near-decided quotes are unaffected; a near quote that sits at 1c stays.
+- The open is `EventInfo.open_ts`, the markets' `open_time` (close − 3600 when unknown).
+- The test is `temp_mm_policy.pad_hold_flag`, on the same resting start the shadow uses (now + 0.15 s), so the bot and the sim agree on the boundary.
+- `TMM_PAD_HOLD_OPEN_S=<s>` overrides it; 0 turns it off.
+
+**At the boundary:**
+- The bot decides on the first wake past the edge (at most 50 ms late, as for the landing window), not on the next 250 ms tick. It logs `pad hold over` and a `pad_hold_end` row in `decisions_<day>.jsonl`.
+- The pads are new creates, so they are never debounced. They are paced like any create: 1 s per market, and the write budget of 3/s with a burst of 6.
+- 1c pads no longer count in the reprice debounce's price key, so a pad appearing (the hold ending, or a thin side's qualification pad) does not restart a favorite's 2 s wait.
+- Nothing already resting is touched. The flag only turns off once per event: pads placed after the edge stay, and only the favorites' expiry renewals follow.
+- `status.json` shows `pad_hold_until` per event.
+
+**What the recording says** (the shadow's 35 recorded hours, 10/14 21:00 ET – 10/16 09:00 ET, `G` vs `G0_nohold`):
+
+| ET day | hours | cons: G net | G0 net | G − G0 | opt: G net | G0 net | G − G0 |
+|---|---|---|---|---|---|---|---|
+| 10/14 (evening) | 3 | $175.74 | $189.66 | −$13.92 | $262.15 | $279.07 | −$16.92 |
+| 10/15 | 22 | $1,688.31 | $1,822.18 | −$133.87 | $1,811.14 | $1,947.01 | −$135.87 |
+| 10/16 (to 09:00 ET) | 10 | $1,552.36 | $1,417.36 | +$134.99 | $1,521.44 | $1,580.84 | −$59.40 |
+| total | 35 | $3,416.40 | $3,429.20 | −$12.80 | $3,594.73 | $3,806.92 | −$212.19 |
+
+- **The first 3 minutes:** the hold gives up $236 of reward and avoids 2,295 (cons) to 2,326 (opt) contracts of 1c fills, worth $23.
+- **The rest of the hour:** +$201 in cons. On 10/16, G0's early sweep fills used up its position cap and took the front of the 1c queue. The opt model has no queue: +$0.85 there.
+- **Sweep timing:** the 3-minute mark is already crowded. In 33 of the 35 hours, others add new 1c bids (typically 100 YES and 200 NO a strike, 2,000–21,000 contracts in all) between +179.5 s and +184.5 s. In 18 of those hours, a sweeper sells into fresh 1c bids at +181 to +186 s. A 180 s hold puts G's pads up in the same seconds, so that sweep hits them too. G's 1c fills in [+180.65 s, +240 s) are 11,454 against G0's 13,339 (cons), and 13,669 against 13,369 (opt).
+- **Other hold lengths:**
+
+| hold | cons net | opt net |
+|---|---|---|
+| none | $3,429 | $3,807 |
+| 180 s | $3,416 | $3,595 |
+| 185 s | $3,593 | $3,644 |
+| 190 s | $3,583 | $3,648 |
+| 240 s | $3,505 | $3,624 |
+| 300 s | $3,378 | $3,546 |
+
+These are other traders' habits over 35 hours, so they can change. The live hour 26OCT1610 is not in these numbers: it had not settled when they were run, and its recording holds the bot's own orders and fills.
 
 ## What it does
 
@@ -105,6 +150,7 @@ The plan also follows these rules:
 | station data stale: no new station minute for 3 min (`TMM_STALE_WX_S`), or the newest minute older than 3 min + the ~330 s publication lag | live, near and favorite quotes pulled. Only 1c longshot pads and 1c qualification pads rest. |
 | no model fair for a market (`TMM_REQUIRE_FAIR`) | no quotes there. The policy's book-mid fallback is never used live. |
 | no program known for a market (`TMM_REQUIRE_PROGRAM`) | no quotes there |
+| within `pad_hold_open_s` of the event's open (G: 180 s) | no 1c longshot or qualification pads; favorites, live and near quotes as usual |
 | within 1 s of the close | no quotes |
 | the API's close_time is not the ticker's hour (a DST fall-back hour?) | that event is not quoted (logged once); the model would price the wrong hour |
 | a market suspect of a missed fill (below) | no new orders there (cancels and cuts still go) |
@@ -190,7 +236,7 @@ Live files go in `C:\Users\jackd\Documents\KL-data\temp-mm\`. A dry run writes t
 
 ## Comparing with the shadow
 
-The shadow keeps simulating F, G and J on the same hours.
+The shadow keeps simulating F, G (with the pad hold), G0_nohold and J on the same hours.
 
 **Per hour:** compare `KL-data\temp-shadow\sim\<ET day>\<EVENT>.json`, variant `F_full|cons` and `|opt` (reward, contracts, trading P&L), with the live run:
 - contracts and P&L at settlement come from `fills_<day>.jsonl` and `summary.jsonl`;
@@ -261,7 +307,7 @@ No live write has ever been sent: the bot was only ever run DRY. The request sha
 
 ## Tests
 
-`test_temp_mm_live.py` uses no network: a fake exchange (whose cancels and resting reads reach only the named subaccount, as Kalshi's `subaccount` parameter does), fake feed, fake station rows and a fake fair drive `Bot.step()` on a fake clock. The `TestReview*` classes pin each fix of the 10/16 review (named `test_f<N>_…`): unseen fills never re-quoted and halting, Kalshi's fill count in the risk inputs, cancels that cannot reach or do not land, ambiguous creates adopted, refused urgent reprices cancelled, expiry only on renewals, size cuts with a reprice, `--cancel-all` under the lock, dry halts, 429 storms and outages without a halt, confirm holds, GetOrder without a subaccount, 409 not gone, fill prices, batched guard moves, the default-model refusal, history seeding and the 60-min span, the poller cadence, results after a restart, per-event pruning and the settle/close guard. It also covers:
+`test_temp_mm_live.py` uses no network. `TestPadHold` pins the 10/16 pad hold: no pad or qualification creates before open + 180 s, both on the first wake after it, no churn afterwards, the event's `open_time` as the start, and no delay to a favorite's move. The harness is a fake exchange (whose cancels and resting reads reach only the named subaccount, as Kalshi's `subaccount` parameter does), fake feed, fake station rows and a fake fair drive `Bot.step()` on a fake clock. The `TestReview*` classes pin each fix of the 10/16 review (named `test_f<N>_…`): unseen fills never re-quoted and halting, Kalshi's fill count in the risk inputs, cancels that cannot reach or do not land, ambiguous creates adopted, refused urgent reprices cancelled, expiry only on renewals, size cuts with a reprice, `--cancel-all` under the lock, dry halts, 429 storms and outages without a halt, confirm holds, GetOrder without a subaccount, 409 not gone, fill prices, batched guard moves, the default-model refusal, history seeding and the 60-min span, the poller cadence, results after a restart, per-event pruning and the settle/close guard. It also covers:
 - the order plan: create, cancel, decrease, increase, amend in place, the crossing fallback, TTL renewal and the size tolerance;
 - dry mode placing nothing;
 - live refused without `--subaccount`;

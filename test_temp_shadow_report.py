@@ -628,13 +628,19 @@ class TestMain(unittest.TestCase):
         self.assertIn("D_size", page)          # earlier sim output still reported
 
     def test_sim_success_called_with_day(self):
+        # the report day first, then every earlier day of the cumulative
+        # window (review fix 10/16: a SIM_VERSION bump left 10/15 at v4)
         calls = []
         fake_sim = types.SimpleNamespace(run_day=lambda d, *a, **k: calls.append(d) or [],
                                          DEFAULT_POLICY=DEFAULT_POLICY, VARIANTS=VARIANTS)
         with StubModules(temp_shadow_sim=fake_sim):
             rc = R.main(["--day", "2026-10-16", "--out", self.out])
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, ["2026-10-16"])
+        self.assertEqual(calls, ["2026-10-16", "2026-10-15"])
+        calls.clear()
+        with StubModules(temp_shadow_sim=fake_sim):
+            R.main(["--day", "2026-10-14", "--out", self.out])     # day 0: alone
+        self.assertEqual(calls, ["2026-10-14"])
 
 
 class TestSimIntegration(unittest.TestCase):
@@ -685,6 +691,249 @@ class TestSimIntegration(unittest.TestCase):
         ctx = R.build_context("2026-10-15", policy=pol, with_health=False, now=NOW)
         self.assertEqual(ctx["policy"].params("Z_new")["q_live"], 900)
         self.assertIn("q_live=900", R.render_html(ctx))
+
+
+class TestWindowResim(unittest.TestCase):
+    """Review fix 10/16 (finding 1): the SIM_VERSION 5 bump re-simmed only the
+    report day, so the cumulative window kept 10/15 at v4 -- G_decided_only
+    there was the old G (no pad hold) and G0_nohold did not exist. run_sim now
+    runs run_day for every window day, and files still older than the
+    current SIM_VERSION are flagged."""
+
+    OLD_G, NEW_G, G0 = 3.0, 2.5, 3.0     # per event: v4 G, v5 G (held), v5 G0
+
+    def setUp(self):
+        clear_data()
+
+    def _write(self, day, version, hours=range(6)):
+        os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+        for h in hours:
+            ev = event_ticker(day, h)
+            if version == "4":
+                variants = {"G_decided_only|cons": vrec(self.OLD_G),
+                            "G_decided_only|opt": vrec(self.OLD_G),
+                            "B_pull|cons": vrec(10.0), "B_pull|opt": vrec(11.0)}
+                pols = {"G_decided_only": {"live": False, "decided": True}, "B_pull": {}}
+            else:
+                variants = {"G_decided_only|cons": vrec(self.NEW_G),
+                            "G_decided_only|opt": vrec(self.NEW_G),
+                            "G0_nohold|cons": vrec(self.G0), "G0_nohold|opt": vrec(self.G0),
+                            "B_pull|cons": vrec(10.0), "B_pull|opt": vrec(11.0)}
+                pols = {"G_decided_only": {"live": False, "decided": True,
+                                           "pad_hold_open_s": 180.0},
+                        "G0_nohold": {"live": False, "decided": True}, "B_pull": {}}
+            rec = erec(ev, variants)
+            rec["sim_version"], rec["policies"] = version, pols
+            C.write_json_atomic(os.path.join(DATA, "sim", day, f"{ev}.json"), rec)
+
+    def _fake_sim(self, calls, fail_day=None):
+        """run_day(d) re-sims files from an older version to v5 (what the
+        real run_day does through _cached_ok)."""
+        def run_day(d, *a, **k):
+            calls.append(d)
+            if d == fail_day:
+                raise RuntimeError("disk full on " + d)
+            out = []
+            for rec in R.load_sim_day(d):
+                if str(rec.get("sim_version")) != "5":
+                    self._write(d, "5", hours=[int(rec["event"][-2:])])
+                out.append({"event": rec["event"]})
+            return out
+        return types.SimpleNamespace(
+            run_day=run_day, SIM_VERSION="5",
+            DEFAULT_POLICY={"live": True, "decided": False, "pad_hold_open_s": 0.0},
+            VARIANTS={"B_pull": {},
+                      "G_decided_only": {"live": False, "decided": True,
+                                         "pad_hold_open_s": 180.0},
+                      "G0_nohold": {"live": False, "decided": True}})
+
+    def test_report_resims_every_window_day(self):
+        self._write("2026-10-15", "4")
+        self._write("2026-10-16", "4")
+        calls = []
+        with StubModules(temp_shadow_sim=self._fake_sim(calls)), \
+                mock.patch.object(C, "utcnow", return_value=NOW):
+            err, summary = R.run_sim("2026-10-16")
+            self.assertIsNone(err)
+            self.assertEqual(calls, ["2026-10-16", "2026-10-15"])
+            self.assertEqual(summary["ok"], 6)
+            self.assertEqual(summary["window"]["days"], ["2026-10-15"])
+            self.assertEqual(summary["window"]["ok"], 6)
+            self.assertEqual(summary["window"]["errors"], [])
+            ctx = R.build_context("2026-10-16", with_health=False, now=NOW,
+                                  sim_summary=summary)
+        win = ctx["win"]
+        # every window day at v5: G0 on both days, G is the held G on both
+        self.assertEqual(win.days_with("G0_nohold|cons"), ["2026-10-15", "2026-10-16"])
+        self.assertAlmostEqual(win.total("G_decided_only|cons"), 12 * self.NEW_G)
+        self.assertAlmostEqual(win.total("G0_nohold|cons"), 12 * self.G0)
+        self.assertEqual(ctx["stale_sim"], {})
+        self.assertEqual(ctx["sim_version"], "5")
+        for d in ("2026-10-15", "2026-10-16"):
+            self.assertEqual({e["sim_version"] for e in R.load_sim_day(d)}, {"5"})
+        page = R.render_html(ctx)
+        self.assertNotIn("older SIM_VERSION", page)
+        self.assertNotIn("stale", R.subject_line(ctx))
+        # the pad-hold rule pairs all 12 events of both days
+        s = by_id(ctx["suggestions"])["padhold"]
+        self.assertIn("over 12 events / 2 days", s["evidence"])
+
+    def test_before_the_fix_window_mixes_versions(self):
+        # what the 10/17 report computed before the fix: 10/15 v4 + 10/16 v5
+        self._write("2026-10-15", "4")
+        self._write("2026-10-16", "5")
+        days = R.window_days("2026-10-16")
+        win = R.Window({d: R.load_sim_day(d) for d in days})
+        self.assertAlmostEqual(win.total("G_decided_only|cons"),
+                               6 * self.OLD_G + 6 * self.NEW_G)      # mixed
+        self.assertEqual(win.days_with("G0_nohold|cons"), ["2026-10-16"])
+        # ... and a report that does not re-sim (--no-sim) now flags it
+        with StubModules(temp_shadow_sim=self._fake_sim([])):
+            ctx = R.build_context("2026-10-16", with_health=False, now=NOW)
+        self.assertEqual(ctx["stale_sim"], {"2026-10-15": 6})
+        page = R.render_html(ctx)
+        self.assertIn("6 sim file(s) in the cumulative window are from an older SIM_VERSION "
+                      "than 5", page)
+        self.assertIn("2026-10-15 x6", page)
+        self.assertIn("[6 stale sim files]", R.subject_line(ctx))
+        self.assertIn("older SIM_VERSION than 5 (2026-10-15 x6)", R.render_text(ctx))
+
+    def test_window_day_failure_is_reported_and_exits_1(self):
+        self._write("2026-10-15", "4")
+        self._write("2026-10-16", "4")
+        calls = []
+        out = os.path.join(DATA, "out", "f.html")
+        with StubModules(temp_shadow_sim=self._fake_sim(calls, fail_day="2026-10-15")), \
+                mock.patch.object(C, "utcnow", return_value=NOW), \
+                mock.patch.object(R.subprocess, "run") as run:
+            rc = R.main(["--day", "2026-10-16", "--out", out])
+        run.assert_not_called()
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, ["2026-10-16", "2026-10-15"])
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn("1 re-sim failure(s) on earlier window days", page)
+        self.assertIn("run_day raised RuntimeError: disk full on 2026-10-15", page)
+        self.assertIn("2026-10-15 x6", page)          # still v4: flagged as stale
+        self.assertIn("6 ok, 0 pending (unsettled), 0 failed", page)    # the report day
+        self.assertIn("sim run (earlier window days)", page)
+        self.assertIn("0 ok, 0 pending (unsettled), 1 failed over 1 day(s)", page)
+
+    def test_files_without_a_version_are_not_judged(self):
+        self.assertEqual(R.stale_sim_days({"d": [{"event": "x"}, {"sim_version": "5"}]}, "5"),
+                         {})
+        self.assertEqual(R.stale_sim_days({"d": [{"sim_version": 4}]}, "5"), {"d": 1})
+        self.assertEqual(R.stale_sim_days({"d": [{"sim_version": "4"}]}, None), {})
+
+
+HOLD_DEFAULTS = dict(DEFAULT_POLICY, pad_hold_open_s=0.0)
+HOLD_VARIANTS = {"A_base": {"win_mode": "none"}, "B_pull": {}, "C_back": {"win_mode": "back"},
+                 "D_size": {"q_live": 1000}, "E_decided": {"decided": True},
+                 "F_full": {"q_live": 1000, "decided": True, "win_mode": "back"},
+                 "G_decided_only": {"decided": True, "q_live": 0, "pad_hold_open_s": 180.0},
+                 "G0_nohold": {"decided": True, "q_live": 0},
+                 "H_noguard": {"guard": False}}
+
+
+class TestPadHoldRules(unittest.TestCase):
+    """Review fix 10/16 (finding 2): letter G resolves to the held
+    G_decided_only, so "decided strikes alone" mixed in the 180 s pad hold
+    and no rule tracked what the hold is worth."""
+
+    def setUp(self):
+        clear_data()
+
+    def _write(self, g0, g_minus_g0, with_g0=True, with_e=True, e_minus_b=0.0, days=3):
+        rng = random.Random(17)
+        for i in range(days):
+            day = (_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat()
+            os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+            for h in range(24):
+                ev = event_ticker(day, h)
+                b = 13.0 + rng.gauss(0, 1.0)
+                x0 = g0 + rng.gauss(0, 0.3)
+                nets = {"A_base": b - 3.0, "B_pull": b, "C_back": b, "D_size": b,
+                        "F_full": b, "G_decided_only": x0 + g_minus_g0 + rng.gauss(0, 0.1),
+                        "H_noguard": b - 2.0}
+                if with_e:
+                    nets["E_decided"] = b + e_minus_b + rng.gauss(0, 0.02)
+                if with_g0:
+                    nets["G0_nohold"] = x0
+                variants = {}
+                for n, x in nets.items():
+                    variants[f"{n}|cons"] = vrec(x)
+                    variants[f"{n}|opt"] = vrec(x + 1.0)
+                C.write_json_atomic(os.path.join(DATA, "sim", day, f"{ev}.json"),
+                                    erec(ev, variants, paying=0.5))
+
+    def _ctx(self, variants=None):
+        variants = HOLD_VARIANTS if variants is None else variants
+        return R.build_context("2026-10-17", policy=R.Policy(HOLD_DEFAULTS, dict(variants)),
+                               with_health=False, now=NOW)
+
+    def test_resolve_g_and_g0(self):
+        names = ["G0_nohold", "G_decided_only"]
+        self.assertEqual(R.resolve_variant("G", names), "G_decided_only")
+        self.assertEqual(R.resolve_variant("G0", names), "G0_nohold")
+        self.assertIsNone(R.resolve_variant("G0", ["G_decided_only"]))
+
+    def test_decided_alone_uses_g0_and_hold_rule_fires(self):
+        # E-B is noise; G0 earns +5/event -> decided alone on G0; G = G0 - 0.5
+        self._write(g0=5.0, g_minus_g0=-0.5)
+        ctx = self._ctx()
+        s = by_id(ctx["suggestions"])
+        dec = s["decided"]
+        self.assertIn("G0_nohold alone (decided only)", dec["evidence"])
+        self.assertNotIn("pad hold", dec["evidence"])
+        self.assertTrue(dec["title"].startswith("Decided strikes alone earn $1"), dec["title"])
+        self.assertAlmostEqual(dec["usd"], 120.0, delta=6)          # G0's +5 x 24
+        self.assertIn("decided False -> True", dec["change"])
+        self.assertNotIn("pad_hold_open_s", dec["change"])           # src = E
+        hold = s["padhold"]
+        self.assertIn("Pad hold value (G-G0)", hold["evidence"])
+        self.assertIn("over 72 events / 3 days", hold["evidence"])
+        self.assertAlmostEqual(hold["usd"], -12.0, delta=1)          # -0.5 x 24
+        self.assertIn("first 180 s after the open costs", hold["title"])
+        self.assertEqual(hold["change"], "pad_hold_open_s 180 -> 0 (G0_nohold's setting)")
+        self.assertTrue(hold["action"])
+        self.assertFalse(hold["suppressed"])
+        self.assertFalse(any("G0" in n for n in ctx["notes"]))      # never a "missing" letter
+        self.assertIn("Pad hold value (G-G0)", R.render_html(ctx))
+
+    def test_hold_that_saves_says_keep(self):
+        self._write(g0=1.0, g_minus_g0=+0.8)
+        hold = by_id(self._ctx()["suggestions"])["padhold"]
+        self.assertAlmostEqual(hold["usd"], 19.2, delta=1)
+        self.assertIn("saves", hold["title"])
+        self.assertEqual(hold["change"],
+                         "keep pad_hold_open_s=180 (G_decided_only, not G0_nohold)")
+        self.assertFalse(hold["action"])
+
+    def test_without_g0_the_hold_is_named(self):
+        self._write(g0=5.0, g_minus_g0=0.0, with_g0=False)
+        variants = {k: v for k, v in HOLD_VARIANTS.items() if k != "G0_nohold"}
+        s = by_id(self._ctx(variants)["suggestions"])
+        self.assertNotIn("padhold", s)
+        dec = s["decided"]
+        self.assertIn("G_decided_only alone (decided only + 180 s pad hold)", dec["evidence"])
+        self.assertTrue(dec["title"].startswith(
+            "Decided strikes alone with the 180 s pad hold earn"), dec["title"])
+        self.assertIn("decided False -> True", dec["change"])        # src = E
+
+    def test_without_e_or_g0_the_change_names_the_hold(self):
+        self._write(g0=5.0, g_minus_g0=0.0, with_g0=False, with_e=False)
+        variants = {k: v for k, v in HOLD_VARIANTS.items()
+                    if k not in ("G0_nohold", "E_decided")}
+        dec = by_id(self._ctx(variants)["suggestions"])["decided"]
+        self.assertIn("with the 180 s pad hold", dec["title"])
+        self.assertIn("pad_hold_open_s 0 -> 180", dec["change"])
+
+    def test_no_hold_difference_no_rule(self):
+        self._write(g0=5.0, g_minus_g0=0.0)
+        variants = dict(HOLD_VARIANTS, G_decided_only={"decided": True, "q_live": 0})
+        s = by_id(self._ctx(variants)["suggestions"])
+        self.assertNotIn("padhold", s)
+        self.assertIn("G0_nohold alone (decided only)", s["decided"]["evidence"])
 
 
 UNTIL = "2026-10-23T12:00:00Z"        # the collector stops 10/23 08:00 ET
@@ -996,6 +1245,18 @@ class TestRealModules(unittest.TestCase):
         self.assertNotEqual(pol.get(b, "q_live"), pol.get(d, "q_live"))
         self.assertIsNotNone(pol.get(b, "live_stop_min"))
         self.assertIsNotNone(pol.get(b, "guard_k"))
+        # G0 (G without the pad hold) resolves; the pad-hold rule's pair
+        # differs by the hold alone
+        g, g0 = R.resolve_variant("G", names), R.resolve_variant("G0", names)
+        self.assertIsNotNone(g0)
+        self.assertNotEqual(g, g0)
+        self.assertEqual(pol.diff_text(g0, g), "pad_hold_open_s 0 -> 180")
+        self.assertEqual((R._hold_s(pol, g), R._hold_s(pol, g0)), (180.0, 0.0))
+
+    @unittest.skipUnless(_importable("temp_shadow_sim"), "temp_shadow_sim not importable")
+    def test_real_sim_version_is_read(self):
+        import temp_shadow_sim as sim
+        self.assertEqual(R.current_sim_version(), str(sim.SIM_VERSION))
 
     @unittest.skipUnless(_importable("temp_shadow_model"), "temp_shadow_model not importable")
     def test_real_replica_matches_lattice(self):

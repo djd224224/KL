@@ -613,5 +613,71 @@ class TestSchemaAndDay(SimTestBase):
         self.assertGreater(res["variants"]["T|opt"]["reward"], 0)
 
 
+class TestPadHold(SimTestBase):
+    """Jack 2026-10-16: "hold the pads for the first 3 minutes of each hour
+    going forward". G holds its 1c pads (pad_hold_open_s 180); G0_nohold is
+    the G before. A decided strike (index 73.4 F vs T80.99): G0 rests a YES
+    pad at 1c from the program start (+120 s) and a NO qualification pad;
+    sweeps sell YES at 1c at +150 s and either side of the hold's end."""
+
+    def _fixture(self):
+        write_fixture(temps=lambda m: DROP_C, books={TICKER: ({3: 300.0}, {95: 300.0})},
+                      trades=[(150.25, TICKER, "no", 1, 60.0),     # inside the hold
+                              (180.40, TICKER, "no", 1, 100.0),    # G's pad not active yet
+                              (180.75, TICKER, "no", 1, 100.0)],   # active from 180.65
+                      results={TICKER: "no"}, expiration_value=73.4)
+
+    def _run(self, variants):
+        self._fixture()
+        return sim.run_event(EVENT, variants=variants, model=FakeModel())
+
+    def test_g_holds_pads_g0_does_not(self):
+        res = self._run(["G_decided_only", "G0_nohold"])
+        for fm in ("opt", "cons"):                 # the 1c level is empty: no queue either way
+            g, g0 = (res["variants"][f"{n}|{fm}"] for n in ("G_decided_only", "G0_nohold"))
+            self.assertAlmostEqual(g0["by_side"]["yes_bid"]["contracts"], 260.0, msg=fm)
+            self.assertAlmostEqual(g0["trading_pnl"], -2.6, places=6)        # 260 x 1c, result no
+            self.assertEqual(g["fills_n"], 1, fm)                            # only the +180.75 sweep
+            self.assertAlmostEqual(g["contracts"], 100.0)
+            self.assertAlmostEqual(g["trading_pnl"], -1.0, places=6)
+            # in the hold G rests only the favorite: its YES side (300 deep) does
+            # not qualify, so the strike pays it nothing until the pads go up;
+            # from +180.65 both rest the same orders (the pad refilled after
+            # each fill), so the whole gap is the 61 program seconds of the hold
+            self.assertGreater(g0["reward"], g["reward"])
+            self.assertLessEqual(g0["reward"] - g["reward"], 61 * 100.0 / 3480.0 + 1e-6)
+            self.assertEqual(g["quoted_secs"], g0["quoted_secs"])            # the favorite quotes
+        self.assertEqual(res["policies"]["G_decided_only"]["pad_hold_open_s"], 180.0)
+
+    def test_hold_boundary_is_the_policys(self):
+        self._fixture()
+        inp = sim.load_event_inputs(EVENT)
+        sh = sim._Shared(inp, FakeModel(), None)
+        P = sim._resolve_variants(["G_decided_only"])["G_decided_only"]
+        ps = sim._Pass(sh, P, "opt")
+        seen = []
+        orig = ps._activate
+
+        def act(item):
+            orig(item)
+            o = ps.orders[0]
+            seen.append((item[0], sorted(o["yes"]), sorted(o["no"])))
+        ps._activate = act
+        ps.run()
+        first_pad = min(t for t, ys, ns in seen if 1 in ys)
+        self.assertGreaterEqual(first_pad, OPEN + 180.0)
+        self.assertLessEqual(first_pad, OPEN + 180.65 + 1e-6)
+        self.assertFalse(any(1 in ys or 1 in ns for t, ys, ns in seen if t < OPEN + 180.0))
+        self.assertTrue(any(95 in ns for t, ys, ns in seen if t < OPEN + 180.0))   # the favorite
+        # the NO qualification pad (300 deep + 300 fav < 1,000) went up with it
+        self.assertIn(1, [ns for t, ys, ns in seen if t == first_pad][0])
+
+    def test_zero_hold_is_g0(self):
+        res = self._run({"G0": dict(live=False, decided=True),
+                         "Gh0": dict(live=False, decided=True, pad_hold_open_s=0)})
+        for fm in ("opt", "cons"):
+            self.assertEqual(res["variants"][f"G0|{fm}"], res["variants"][f"Gh0|{fm}"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -201,7 +201,12 @@ These are all parameters of one policy, so a tweak is a config change.
 
 **Quoting window:** quote only inside the program window.
 
-**Variant grid:** the starting grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`).
+**Pad hold** (`pad_hold_open_s`, added 10/16). Jack, 2026-10-16: "hold the pads for the first 3 minutes of each hour going forward". In live G's first hour (26OCT1610, 13:02Z) sweepers took 4,659 of its 1c fillers within about 45 s of the program opening.
+- While the orders would start resting before the event's open + `pad_hold_open_s`, no 1c longshot pad and no 1c qualification pad rests. Favorite joins, live and near-decided quotes are unaffected (a near quote that sits at 1c stays).
+- The open is the markets' `open_time` (close − 3600 when unknown). The test is `temp_mm_policy.pad_hold_flag` on the orders' resting start (decision time + 0.15 s), the same rule the live executor applies. In the sim the pads are active by open + 180.65 s (the hh:03:00.5 tick, or an earlier station-row decision).
+- Default 0 (off). Only G holds (180 s); `G0_nohold` is the G before the hold, kept for comparison.
+
+**Variant grid:** the grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`). Since 10/16 `G_decided_only` (what runs live) holds its pads for 180 s and `G0_nohold` is the old G. SIM_VERSION 5 makes `run_day` re-sim the older cached files of any day it is asked for; the daily report asks for every day of its cumulative window (day 1 .. the report day), so the first report after a SIM_VERSION or `VARIANTS` change re-sims the whole window (review fix 10/16: before it only the report day re-simmed, so 10/15 stayed at SIM_VERSION 4, where `G_decided_only` had no hold and `G0_nohold` did not exist; the first report run with the fix re-sims it to 5).
 
 ## Daily report (08:30 ET, previous ET day, plus cumulative)
 
@@ -224,7 +229,9 @@ These are all parameters of one policy, so a tweak is a config change.
 - Our observation lag versus Kalshi's `received_at`.
 - Missing events or hours.
 
-**Suggested tweaks:** rule-based, from the variant deltas and diagnostics.
+**Suggested tweaks:** rule-based, from the variant deltas and diagnostics. The decided-strikes rule measures decided strikes alone on `G0_nohold` (G without the pad hold) when the window has it, else on G with its hold named. The pad-hold rule pairs `G_decided_only` with `G0_nohold` (G-G0) on the events both ran on.
+
+**Sim freshness:** the report re-runs `run_day` for every window day (cached files from the current SIM_VERSION with the current overrides are only loaded). A window file still from an older SIM_VERSION (a `--no-sim` report, a failed re-sim) is flagged at the top of the report and in the subject.
 
 **Week summary:** on and after day 7, with a go/no-go and a recommended starting configuration.
 
@@ -235,7 +242,7 @@ These are all parameters of one policy, so a tweak is a config change.
 | task | trigger | does |
 |---|---|---|
 | `KL temp-shadow collector` | at logon (+1 min), and every 10 min with IgnoreNew, no time limit | `run_temp_shadow_collector.ps1` restart loop |
-| `KL temp-shadow report` | daily 08:30 ET, StartWhenAvailable, 2 h limit | sim the previous ET day, build the report, email it |
+| `KL temp-shadow report` | daily 08:30 ET, StartWhenAvailable, 2 h limit | sim the previous ET day and re-sim any stale window day (a full 8-day re-sim after a grid change takes about 40 min at 2 workers), build the report, email it |
 
 To stop the test:
 - Create `KL-data\temp-shadow\HALT`.

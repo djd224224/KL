@@ -2000,5 +2000,112 @@ class TestReviewMisc(unittest.TestCase):
         self.assertEqual(L.build_events(rows_)[EVENT].settle_gap_s, 3600.0)
 
 
+
+class TestPadHold(unittest.TestCase):
+    """Jack 2026-10-16: "hold the pads for the first 3 minutes of each hour
+    going forward" -- live G's first hour (13:02Z): sweepers took 4,659 of
+    its 1c fillers within ~45 s of the program opening. G (pad_hold_open_s
+    180) rests no 1c longshot or qualification pad while its orders would
+    start resting before the open + 180 s; the favorites quote as usual."""
+
+    @staticmethod
+    def writes(calls):
+        return [c for c in calls if c[0] in ("create", "amend", "decrease", "cancel",
+                                             "batch_cancel")]
+
+    def test_no_pads_before_open_plus_180_then_at_once(self):
+        self.assertEqual(L.resolve_variant("G"), "G_decided_only")
+        self.assertEqual(L.resolve_variant("g0"), "G0_nohold")
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, variant="G_decided_only")
+        self.assertEqual(bot.P["pad_hold_open_s"], 180.0)
+        started(bot, clock, t=OPEN + 125.0)             # the programs started at +120
+        self.assertEqual(sorted((c[1], c[2], c[3]) for c in ex.kinds("create")),
+                         [(T_HI, "yes", 95), (T_LO, "no", 95)])    # the favorites only
+        for dt in (126.0, 130.0, 150.0, 170.0, 179.5, 179.84):    # rests from <= +179.99
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        self.assertFalse([c for c in ex.kinds("create") if c[3] == 1])
+        self.assertEqual(bot.status(clock.t)["events"][EVENT]["pad_hold_until"],
+                         C.iso(OPEN + 180.0))
+        last = bot.last_decide
+        n = len(ex.calls)
+        clock.t = OPEN + 179.86                          # 0.02 s later: rests from +180.01
+        bot.step(clock.t)
+        self.assertEqual(bot.last_decide, clock.t)       # decided on the edge, not the 250 ms tick
+        self.assertLess(clock.t - last, bot.cfg.loop_s)
+        new = self.writes(ex.calls[n:])
+        self.assertEqual(sorted((c[0], c[1], c[2], c[3], c[4]) for c in new),
+                         [("create", T_HI, "no", 1, 1000), ("create", T_LO, "yes", 1, 1000)])
+        self.assertTrue(all(c[6] == int(clock.t + 300) for c in new))   # the pads' TTL
+        self.assertEqual(by_market(bot)[T_HI], {"yes": {95: 300.0}, "no": {1: 1000.0}})
+        self.assertEqual(by_market(bot)[T_LO], {"yes": {1: 1000.0}, "no": {95: 300.0}})
+        dec = [r for r in rows(os.path.join(bot.dir, f"decisions_{L.utc_day(clock.t)}.jsonl"))
+               if r.get("kind") == "pad_hold_end"]
+        self.assertEqual([(r["event"], r["after_open_s"]) for r in dec], [(EVENT, 180.01)])
+        # no churn after the edge: the pads just rest; the only writes are the
+        # favorites' expiry renewals (placed at +125 with a 90 s TTL)
+        pad_ids = {o.oid for o in bot.orders.values() if o.price == 1}
+        n = len(ex.calls)
+        for dt in (180.2, 180.5, 181.0, 183.0, 190.0, 200.0):
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        later = self.writes(ex.calls[n:])
+        self.assertTrue(all(c[0] == "amend" and c[1] not in pad_ids and c[2] == 95
+                            and c[4] is not None for c in later), later)
+        self.assertEqual({o.oid for o in bot.orders.values() if o.price == 1}, pad_ids)
+
+    def test_g0_nohold_places_pads_with_the_favorites(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, variant="G0_nohold")
+        started(bot, clock, t=OPEN + 125.0)
+        self.assertEqual(sorted((c[1], c[2], c[3]) for c in ex.kinds("create")),
+                         [(T_HI, "no", 1), (T_HI, "yes", 95), (T_LO, "no", 95),
+                          (T_LO, "yes", 1)])
+
+    def test_the_hold_end_does_not_delay_a_favorites_move(self):
+        # thin favorite side: after the hold a 1c qualification pad joins the
+        # favorite's side; it must not restart the favorite's 2 s debounce
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, variant="G_decided_only")
+        feed.books[T_HI] = ({95: 300.0}, dict(BOOKS[T_HI][1]))
+        started(bot, clock, t=OPEN + 125.0)
+        self.assertEqual(by_market(bot)[T_HI], {"yes": {95: 300.0}})
+        feed.books[T_HI] = ({96: 300.0}, dict(BOOKS[T_HI][1]))   # the reference rises
+        for dt in (178.5, 179.0, 179.84):
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        self.assertEqual(by_market(bot)[T_HI], {"yes": {95: 300.0}})    # debounced
+        clock.t = OPEN + 179.86
+        bot.step(clock.t)                                # the hold ends: pads, the move still waits
+        self.assertEqual(by_market(bot)[T_HI], {"yes": {95: 300.0, 1: 450.0},
+                                                "no": {1: 1000.0}})
+        clock.t = OPEN + 180.9                           # 2.4 s after the rise, 1.04 s after the pads
+        bot.step(clock.t)
+        self.assertEqual(by_market(bot)[T_HI], {"yes": {96: 300.0, 1: 450.0},
+                                                "no": {1: 1000.0}})
+
+    def test_hold_counts_from_the_events_open_time(self):
+        # an event whose markets opened a minute early: the hold ends at +120
+        ex = FakeExchange()
+        ex.markets_rows = [dict(m, open_time=C.iso(OPEN - 60.0)) for m in market_rows()]
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, variant="G_decided_only",
+                                                         ex=ex)
+        started(bot, clock, t=OPEN + 125.0)
+        self.assertEqual(bot.events[EVENT].open_ts, OPEN - 60.0)
+        self.assertEqual(sorted((c[1], c[2], c[3]) for c in ex.kinds("create")),
+                         [(T_HI, "no", 1), (T_HI, "yes", 95), (T_LO, "no", 95),
+                          (T_LO, "yes", 1)])
+
+    def test_stale_wx_rests_nothing_in_the_hold(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=False, variant="G_decided_only")
+        fair.stale = True                                # stale: 1c pads only ...
+        started(bot, clock, t=OPEN + 125.0)
+        bot.step(OPEN + 150.0)
+        self.assertEqual(bot.orders, {})                 # ... and those are held
+        for dt in (179.86, 181.0):
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        self.assertTrue(bot.orders)
+        self.assertTrue(all(o.price == 1 for o in bot.orders.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

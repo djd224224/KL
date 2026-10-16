@@ -70,6 +70,13 @@ Mechanics (all times are exchange/epoch seconds; our rx ~ exchange time):
   * Classes: live = fair 10-90c (P.live); near = 3-10% / 90-97%, quoted as
     live at half size only when P.decided and P.near_decided_half (spec
     "Decided strikes"), labelled "decided" in by_class; the rest decided.
+  * Pad hold (P.pad_hold_open_s, G since 10/16): a decision whose orders
+    would start resting (t + order_latency_s) before the event's open +
+    the hold rests no 1c longshot / qualification pads (pol.pad_hold_flag,
+    the live executor's test); the flag is part of the per-market decision
+    key, so the pads go up at the first decision (a tick or a station row)
+    whose orders start resting at or after open + hold: with a 180 s hold
+    they are active by open + 180.65 s (the hh:03:00.5 tick + 0.15 s).
 
 Definitions used in the output beyond the schema text:
   quoted_secs  program-window strike-seconds (trusted book) with >= 1 order.
@@ -105,13 +112,15 @@ import temp_shadow_common as C
 import temp_shadow_model as tmodel
 import temp_shadow_scoring as scoring
 
-SIM_VERSION = "4"   # 2: 75-min wx lookback, fair per wx update, relative size
+SIM_VERSION = "5"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # cuts + projected belief, near strikes only with decided,
                     # pre-trade worst-case-loss sizing (10/14 review fixes)
                     # 3: guard buffer from FairModel.slopes (mixture slope);
                     # fills_after_wx keyed on the five-station estimate
                     # 4: scoring reads 3 h back for each market's
                     # snapshot (early-listed events, 10/15)
+                    # 5: pad_hold_open_s (G holds its 1c pads for the
+                    # first 180 s; G0_nohold = the old G), 10/16
 
 # The policy lives in temp_mm_policy (the live executor runs the same code);
 # re-exported here for the report and older callers.
@@ -761,17 +770,20 @@ class _Pass:
     def _price(self, side, info, ref, f_side, buf, back, guard):
         return pol.quote_price(self.P, side, info, ref, f_side, buf, back, guard)
 
-    def _desired(self, m, t, v, f, gf, wflag, pflag, size_full, risk):
+    def _desired(self, m, t, v, f, gf, wflag, pflag, size_full, risk, hold=False):
         """-> (dy, dn, rule). dy/dn: {price: size}."""
         info = self.sh.vinfo[m][v] if v >= 0 else None
         return pol.quote_market(self.P, info, f, gf, wflag, pflag, size_full,
-                                risk[m], self.sh.progs[m]["target"])
+                                risk[m], self.sh.progs[m]["target"], hold_pads=hold)
 
     def _decide_all(self, t, idx, fs, t_next):
         sh, P = self.sh, self.P
         lat = float(P["order_latency_s"])
         a, b = t + lat, t_next + lat
         wflag = pol.window_flag(P, a, b)
+        # the pad hold counts from the event's real open (the markets'
+        # open_time; close - 3600 when the meta has none)
+        hold = pol.pad_hold_flag(P, a, sh.open)
         tau = (sh.close - t) / 60.0
         size_full = pol.live_size(P, tau)
         risk = self._risk()
@@ -780,13 +792,13 @@ class _Pass:
             v = sh.ver[m][idx] if 0 <= idx < n else -1
             pr = sh.progs[m]
             pflag = pol.program_flag(P, a, b, pr["start"], pr["end"], sh.close)
-            key = (v, fs, wflag, pflag, size_full, self.risk_ver)
+            key = (v, fs, wflag, pflag, size_full, self.risk_ver, hold)
             if key == self.last_key[m]:
                 continue
             self.last_key[m] = key
             f = sh.st_f[fs][m] if fs >= 0 else None
             gf = sh.st_g[fs][m] if fs >= 0 else None
-            dy, dn, rule = self._desired(m, t, v, f, gf, wflag, pflag, size_full, risk)
+            dy, dn, rule = self._desired(m, t, v, f, gf, wflag, pflag, size_full, risk, hold)
             # size cuts are relative (Kalshi reduce_by): a fill that lands
             # before activation leaves actual == projected belief
             ops = pol.diff_orders(self.belief[m], dy, dn)

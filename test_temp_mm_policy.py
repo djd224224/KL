@@ -55,6 +55,14 @@ class TestPolicyDicts(unittest.TestCase):
         self.assertEqual((f["q_live"], f["decided"], f["skew"], f["live"]), (600, True, 0.3, True))
         g = P("G_decided_only")
         self.assertEqual((g["live"], g["decided"], g["q_fav"]), (False, True, 300))
+        # Jack 10/16: "hold the pads for the first 3 minutes of each hour going
+        # forward" -- G (what runs live) holds; G0_nohold is the G before it
+        self.assertEqual(g["pad_hold_open_s"], 180.0)
+        self.assertEqual(pol.VARIANTS["G0_nohold"], dict(live=False, decided=True))
+        self.assertEqual(P("G0_nohold"), dict(g, pad_hold_open_s=0.0))
+        self.assertEqual(pol.DEFAULT_POLICY["pad_hold_open_s"], 0.0)
+        held = [n for n, ov in pol.VARIANTS.items() if ov.get("pad_hold_open_s")]
+        self.assertEqual(held, ["G_decided_only"])
         j = P("J_decided_fav100")
         self.assertEqual((j["live"], j["decided"], j["q_fav"]), (False, True, 100))
         self.assertEqual(P("F_full", pos_cap=10)["pos_cap"], 10)
@@ -551,9 +559,11 @@ class TestDecide(unittest.TestCase):
             dec = pol.decide(p, ctx, mk)
             hr = pol.risk_headroom(p, [m.yes_pos for m in mk], [m.no_pos for m in mk],
                                    [m.cost for m in mk])
+            self.assertEqual(dec.pad_hold, pol.pad_hold_flag(p, dec.rest_from, ctx.open_ts))
             for i, m in enumerate(mk):
                 exp = pol.quote_market(p, pol.BookView(m.book_yes, m.book_no), m.fair, m.slope_c,
-                                       dec.wflag, True, dec.size_full, hr[i], 1000.0)
+                                       dec.wflag, True, dec.size_full, hr[i], 1000.0,
+                                       hold_pads=dec.pad_hold)
                 got = dec.markets[i]
                 self.assertEqual((got.yes, got.no, got.rule), exp, name)
 
@@ -662,6 +672,161 @@ class TestRestingWCL(unittest.TestCase):
         with self.assertRaises(ValueError):
             sim._resolve_variants({"X": {"wcl_resting": True}})
         self.assertIn("F_full", sim._resolve_variants(None))
+
+
+class TestPadHold(unittest.TestCase):
+    """Jack 2026-10-16: "hold the pads for the first 3 minutes of each hour
+    going forward" -- live G's first hour (10/16 13:02Z): sweepers took
+    4,659 of its 1c fillers within ~45 s of the program opening.
+    pad_hold_open_s: no longshot pad / qualification pad while the orders
+    would start resting before the event's open + the hold."""
+    OPEN = T0 - (T0 % 3600.0)                     # an hour boundary = the event's open
+    CLOSE = OPEN + 3600.0
+
+    def ctx(self, after_open, **kw):
+        return pol.EventContext(now=self.OPEN + after_open, close_ts=self.CLOSE, **kw)
+
+    def markets(self, **kw):
+        # programs from open + 90 s; strike 0 decided YES (fav YES 97, pad NO
+        # 1c), strike 4 decided NO (pad YES 1c, fav NO 97; its NO side is thin
+        # -> a NO qualification pad), strike 3 near-decided at 1c-ish prices
+        mk = _event(program_start=self.OPEN + 90.0, program_end=self.CLOSE, **kw)
+        mk[4].book_no = {97: 100.0}
+        return mk
+
+    def test_flag_boundary(self):
+        g, g0 = P("G_decided_only"), P("G0_nohold")
+        o = self.OPEN
+        self.assertTrue(pol.pad_hold_flag(g, o - 30.0, o))          # before the open
+        self.assertTrue(pol.pad_hold_flag(g, o + 0.15, o))
+        self.assertTrue(pol.pad_hold_flag(g, o + 179.99, o))
+        self.assertFalse(pol.pad_hold_flag(g, o + 180.0, o))        # starts resting at the end
+        self.assertFalse(pol.pad_hold_flag(g, o + 1800.0, o))
+        for v in pol.VARIANTS:
+            if v != "G_decided_only":
+                self.assertFalse(pol.pad_hold_flag(P(v), o + 1.0, o), v)
+        self.assertFalse(pol.pad_hold_flag(g0, o + 1.0, o))
+        self.assertTrue(pol.pad_hold_flag(P(pad_hold_open_s=30), o + 29.0, o))
+        self.assertFalse(pol.pad_hold_flag(P(pad_hold_open_s=30), o + 30.0, o))
+
+    def test_quote_market_holds_pad_and_qual_only(self):
+        g = P("G_decided_only")
+        b = bv(by={3: 200.0, 2: 400.0}, bn={95: 100.0})    # fair 1%: YES longshot, thin NO
+        tags, diag = {}, {}
+        free = q(g, 0.01, book=b, tags=tags)
+        self.assertEqual(free, ({1: 1000.0}, {95: 300.0, 1: 650.0}, "decided"))
+        self.assertEqual(tags[("yes", 1)], ["pad"])
+        self.assertEqual(tags[("no", 1)], ["qual"])
+        tags = {}
+        held = pol.quote_market(g, b, 0.01, None, False, True, 300, NORISK, 1000.0, tags, diag,
+                                hold_pads=True)
+        # the favorite join is untouched; the YES side (depth 600) would have
+        # taken a 1c qualification pad without the pad: held too
+        self.assertEqual(held, ({}, {95: 300.0}, "decided"))
+        self.assertEqual(tags, {("no", 95): ["fav"]})
+        self.assertTrue(diag["pad_hold"])
+        # near-decided: the live-style quotes stay, also at 1c; only the 1c
+        # qualification pad on top of them goes
+        e = P("E_live300_pull_decided")
+        thin = bv(by={2: 50.0}, bn={45: 30.0})
+        self.assertEqual(q(e, 0.03, book=thin)[:2], ({2: 150.0, 1: 850.0}, {45: 150.0, 1: 870.0}))
+        self.assertEqual(pol.quote_market(e, thin, 0.03, None, False, True, 300, NORISK, 1000.0,
+                                          hold_pads=True)[:2], ({2: 150.0}, {45: 150.0}))
+        near1 = bv(by={1: 50.0}, bn={45: 30.0})                   # the near YES quote sits at 1c
+        self.assertEqual(q(e, 0.03, book=near1)[0], {1: 150.0 + 850.0})
+        self.assertEqual(pol.quote_market(e, near1, 0.03, None, False, True, 300, NORISK, 1000.0,
+                                          hold_pads=True)[0], {1: 150.0})
+        # live quotes (F) are never held
+        f = P("F_full")
+        self.assertEqual(pol.quote_market(f, bv(), 0.5, None, False, True, 600, NORISK, 1000.0,
+                                          hold_pads=True), q(f, 0.5))
+
+    def test_hold_is_exactly_no_pad_no_qual(self):
+        """Under any book, fair, window and risk headroom, the hold = the same
+        policy with q_pad 0 and qual_pads off: favorites, live and near
+        quotes (and their risk trims) unchanged."""
+        rng = random.Random(17)
+        for _ in range(4000):
+            name = rng.choice(sorted(pol.VARIANTS))
+            p = P(name)
+            fx = rng.choice([rng.random(), rng.uniform(0, 0.03), rng.uniform(0.97, 1.0)])
+            by = {rng.randint(1, 98): float(rng.choice([20, 150, 600, 1500]))
+                  for _ in range(rng.randint(0, 4))}
+            bn = {rng.randint(1, 98): float(rng.choice([20, 150, 600, 1500]))
+                  for _ in range(rng.randint(0, 4))}
+            if by and bn and max(by) + max(bn) >= 100:
+                continue
+            b = pol.BookView(by, bn)
+            risk = rng.choice([NORISK, (200.0, 900.0, 50.0, 3.0), (0.0, 1e9, 1e9, 0.0)])
+            args = (b, fx, rng.choice([None, 0.5, 3.0]), rng.random() < 0.3, True,
+                    rng.choice([0, 150, 600]), risk, 1000.0)
+            held = pol.quote_market(p, *args, hold_pads=True)
+            ref = pol.quote_market(dict(p, q_pad=0, qual_pads=False), *args)
+            self.assertEqual(held, ref, name)
+            tags = {}
+            free = pol.quote_market(p, *args, tags=tags)
+            if not any(set(t) & {"pad", "qual"} for t in tags.values()):
+                self.assertEqual(held, free, name)          # nothing to hold: no change
+
+    def test_decide_g_vs_g0_differ_only_in_the_hold(self):
+        g, g0 = P("G_decided_only"), P("G0_nohold")
+        for after in (95.0, 150.0, 179.84):                  # rests from open + 179.99 at the latest
+            dg, d0 = pol.decide(g, self.ctx(after), self.markets()), pol.decide(
+                g0, self.ctx(after), self.markets())
+            self.assertTrue(dg.pad_hold, after)
+            self.assertFalse(d0.pad_hold)
+            for a, b in zip(dg.markets, d0.markets):
+                tag_g = {o.tag for o in a.orders}
+                self.assertFalse(tag_g & {"pad", "qual"}, (after, a.ticker, a.orders))
+                strip = [o for o in b.orders if o.tag not in ("pad", "qual", "pad+qual")]
+                self.assertEqual([(o.side, o.price, o.size, o.tag) for o in a.orders],
+                                 [(o.side, o.price, o.size, o.tag) for o in strip])
+                self.assertEqual((a.rule, a.cls), (b.rule, b.cls))
+                self.assertTrue(a.diag.get("pad_hold"))
+            self.assertTrue(any("pad" in o.tag for m in d0.markets for o in m.orders))
+            self.assertTrue(any("qual" in o.tag for m in d0.markets for o in m.orders))
+            favs = [(m.ticker, o.price, o.size) for m in dg.markets for o in m.orders
+                    if o.tag == "fav"]
+            self.assertEqual(len(favs), 2)
+        for after in (179.86, 180.0, 181.0, 600.0, 3000.0):  # rests from open + 180.01 or later
+            dg, d0 = pol.decide(g, self.ctx(after), self.markets()), pol.decide(
+                g0, self.ctx(after), self.markets())
+            self.assertFalse(dg.pad_hold, after)
+            self.assertEqual([(m.orders, m.ops, m.rule) for m in dg.markets],
+                             [(m.orders, m.ops, m.rule) for m in d0.markets], after)
+
+    def test_open_ts_defaults_to_close_minus_an_hour(self):
+        g = P("G_decided_only")
+        self.assertEqual(self.ctx(10.0).open_ts, self.OPEN)
+        self.assertTrue(pol.decide(g, self.ctx(150.0), self.markets()).pad_hold)
+        # the event's real open, when the caller knows it, moves the window
+        early = self.ctx(150.0, open_ts=self.OPEN - 60.0)
+        self.assertEqual(early.open_ts, self.OPEN - 60.0)
+        self.assertFalse(pol.decide(g, early, self.markets()).pad_hold)
+        late = self.ctx(200.0, open_ts=self.OPEN + 30.0)
+        self.assertTrue(pol.decide(g, late, self.markets()).pad_hold)
+        # an explicit resting interval is what counts (as for the window)
+        ex = self.ctx(170.0, rest_from=self.OPEN + 180.0, rest_until=self.OPEN + 181.0)
+        self.assertFalse(pol.decide(g, ex, self.markets()).pad_hold)
+
+    def test_hold_zero_is_a_no_op(self):
+        # G with the hold set to 0 is G0_nohold (the G before 10/16) at every
+        # instant, positions and all; no other variant ever holds
+        rng = random.Random(23)
+        for _ in range(300):
+            after = rng.uniform(0.0, 400.0)
+            mk = self.markets()
+            for m in mk:
+                m.yes_pos = float(rng.choice([0, 0, 300]))
+                m.no_pos = float(rng.choice([0, 0, 200]))
+                m.cost = 0.2 * (m.yes_pos + m.no_pos)
+            a = pol.decide(P("G_decided_only", pad_hold_open_s=0), self.ctx(after), mk)
+            b = pol.decide(P("G0_nohold"), self.ctx(after), mk)
+            self.assertFalse(a.pad_hold)
+            self.assertEqual([(m.yes, m.no, m.orders, m.ops, m.diag) for m in a.markets],
+                             [(m.yes, m.no, m.orders, m.ops, m.diag) for m in b.markets])
+            name = rng.choice([v for v in sorted(pol.VARIANTS) if v != "G_decided_only"])
+            self.assertFalse(pol.decide(P(name), self.ctx(after), mk).pad_hold, name)
 
 
 if __name__ == "__main__":
