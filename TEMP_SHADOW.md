@@ -353,3 +353,98 @@ def run_day(et_day: str, variants=None, force=False) -> List[dict]  # writes sim
 - `backfill/settled`: 492 events from 26SEP2322 to 26OCT1421, with 273,849 trades. Kalshi listed no event for 12 of those hours.
 - `backfill/calibrations.json`.
 - `backfill/study`: the 10/14 study data.
+
+## Sweep-aware shadow (2026-10-16)
+
+Jack 2026-10-16: "run the sweep-aware shadow, without pausing". In the live executor's first hour (variant G, subaccount 2, KXTEMPMIAH-26OCT1610) sweepers -- takers buying a near-certain favorite at 99c, which hits 1c longshot bids -- took our 1c pad / qual fillers within seconds: 10,006 contracts at 1c over the hour, 6 strikes capped at pos_cap 1,500, after which those strikes no longer qualified. The live hour earned an estimated $14 of reward and lost $96 on fills (net -$82); the shadow had said +$7 (opt) / +$13 (cons) for that hour.
+
+**Why the shadow missed it.** opt / cons fill us only from recorded trades, and sweepers in the recording only took the 1c liquidity that existed. On strongly decided strikes the longshot 1c level was usually empty (the other makers do not rest there), so the shadow saw our pads rest alone, take the whole side's reward share and never fill.
+
+### Live-order subtraction (temp_shadow_scoring)
+
+From 2026-10-16 13:00Z the recorded books contain our own live orders. `load_event_stream(..., subtract_live=None)` (default on; `TEMP_SHADOW_SUBTRACT_LIVE=0` turns it off) rebuilds our resting orders per second from the executor's `orders_` / `fills_<UTC day>.jsonl` (`TEMP_MM_LIVE_DIR`, default `KL-data\temp-mm`; `mode == "live"` rows only; place / adopt / amend / renew (total) / decrease (reduce_by) / cancel / gone / expired, fills reduce what is left, an order leaves at its `expiration_ts` unless renewed) and subtracts them from every recorded level (clipped at 0). The trades that filled our orders are dropped from the replay tape (kept in `EventStream.own_trades`). `live_own_orders(event, sec0, sec1)` exposes the reconstruction.
+
+With no live rows for an event it is a no-op. Regression on all 35 recorded settled hours before live (26OCT1421 through 26OCT1609): books (1,260,000 strike-seconds), trades and coverage are identical to origin/main, as is the full sim (12 VARIANTS x opt/cons: 32,760 values, 23,073 fills). On 26OCT1610 it removes 186 orders and 21 fills (10,108 contracts).
+
+### Sweep hazard (temp_shadow_sweep.py calibrate)
+
+Measured over the 36 recorded hours (books and tape NOT subtracted: anyone's 1c liquidity counts). A sweep is a taker cluster of 1c prints on one side (prints within 1 s). The hazard is sweeps per second while at least 1 contract rests at 1c on that side.
+
+| favorite fair | exposure h | sweeps | lambda /s | mean wait | cleared level | median size |
+|---|---|---|---|---|---|---|
+| 0.90-0.97 | 23.0 | 194 | 0.0023 | 426 s | 43% | 16 |
+| 0.97-0.99 | 13.4 | 219 | 0.0045 | 221 s | 38% | 21 |
+| 0.99-0.995 | 5.5 | 114 | 0.0057 | 174 s | 32% | 33 |
+| > 0.995 | 16.6 | 597 | 0.0100 | 100 s | 42% | 22 |
+
+The age of the 1c liquidity is the main driver. Fresh liquidity on a > 99.5% favorite is swept at 0.157/s (109 sweeps in 694 s). Across all favorites of 0.97 and up, 84% of the sweeps on fresh liquidity cleared the level. After 5-30 s the rate is 0.027/s, after 30-120 s 0.013/s, and after 2 min 0.0065/s. The 0.97-0.99 bucket runs 0.026, 0.017, 0.007 and 0.003/s.
+
+The fitted hazard is `a[fav][age] x mult[minute]`, using IOC sweeps only (the 7% that left a 99c bid behind are replayed from the tape instead). The minute multiplier is 0.8 between minutes 5 and 40, and 1.2-2.2x over the last 20 minutes. A hazard fit on the 35 pre-live hours alone is within a few percent of the 36-hour fit.
+
+**Live evidence (26OCT1610).** 96 orders rested at 1c; 14 of them were hit. Time from placement to first fill was 2.8, 3.2, 6.4, 13, 14, 15, 17.5, 31, 85, 101, 111, 119, 183 and 314 s; the fastest were the pads on the uncovered > 99.5% strikes. Our 1c orders resting alone at > 99.5% were hit 2 times in 13 s (0.15/s; the model gives 0.14/s). When others also rested at 1c we were hit at 0.0008 / 0.0033 / 0.0092 / 0.0115 per s by bucket, against a recorded 0.0023 / 0.0045 / 0.0057 / 0.0100. Both agree within the Poisson noise of 1-7 hits.
+
+### Fill model swp
+
+swp is cons plus three channels on our 1c orders (module docstring):
+- **(a) recorded taker clusters.** Each recorded taker cluster at 1c fills us. If it cleared the recorded level it takes all of ours; otherwise it takes min(ours, its size), because we sit at the front of the queue.
+- **(b) hidden IOC sweeps.** While we rest alone at 1c, hidden IOC sweeps arrive at the calibrated hazard. The draws are Monte Carlo with fixed seeds, 30 per variant, using common random numbers across variants.
+- **(c) new 99c bids.** A new 99c bid opposite our 1c would have crossed us, so it fills us.
+
+Re-pads after a sweep follow the policy, so pos_cap limits them and a capped strike stops qualifying.
+
+In a live hour, the cluster sizes in (a) include the prints that hit our live orders. A cluster made only of our prints is kept if others rested at 1c, and dropped if we were alone (in that case (b) has to predict it).
+
+Validation, 26OCT1610 (`validate`, hazard fit on the pre-live hours only, 30 draws, G):
+
+| | actual | opt | cons | swp | swp size | swp all | swp strict |
+|---|---|---|---|---|---|---|---|
+| filler contracts | 10,006 | 3,905 | 3,264 | 10,317 | 10,308 | 10,770 | 7,535 |
+| reward $ | 14.11 | 45.19 | 45.23 | 14.70 | 14.70 | 12.20 | 43.76 |
+| trading P&L $ | -95.99 | -37.93 | -32.64 | -103.17 | -103.08 | -107.70 | -75.35 |
+| net $ | -81.88 | +7.26 | +12.58 | -88.47 | -88.38 | -95.50 | -31.59 |
+
+Per strike, swp caps the same 6 strikes at 1,500 as live did. On T86.99 it fills 1,047 against 857 live, and on T87.99 270 against 150. The cumulative swept contracts track the live path at every 5 minutes; at 5 minutes swp had 5,196 against 4,659 live.
+
+"swp strict" drops every taker cluster that touched our live orders and leaves them to the hazard. It is a lower bound: it predicts the opening rush (4,520 vs 4,659 at 5 minutes) but not the later sweeps that hit us while others rested at 1c. Of the default swp's filler contracts, 7,715 come from recorded clusters and 2,602 from the hazard.
+
+No later live hours exist: the executor has been on its HALT file since 14:00Z.
+
+### Variants under opt / cons / swp (all 37 settled recorded hours, 26OCT1421-26OCT1611)
+
+Run with subtraction on, 30 swp draws, and the 36-hour hazard. Each variant is an explicit set of overrides of DEFAULT_POLICY. G = live off, decided, q_pad 1000, q_fav 300, pos_cap 1500. Dollars are totals over the 37 hours (10/14: 3 hours, 10/15: 22, 10/16: 12). "se" is the Monte Carlo standard error of the swp total.
+
+| variant | opt net | cons net | swp reward | swp P&L | swp net | se | swp net without 26OCT1606 |
+|---|---|---|---|---|---|---|---|
+| G | +3,945 | +3,565 | 1,259 | -1,798 | **-539** | 15 | -1,940 |
+| G_hold180 | +3,734 | +3,567 | 1,402 | -1,600 | **-198** | 10 | -1,601 |
+| pads_only (q_fav 0) | +2,117 | +2,330 | 869 | -1,861 | **-992** | 12 | -2,378 |
+| J (q_fav 100) | +3,089 | +2,909 | 1,042 | -1,828 | **-785** | 13 | -2,178 |
+| G q_pad 200 | +4,233 | +3,884 | 1,176 | -1,723 | **-548** | 14 | -1,951 |
+| G q_pad 500 | +4,073 | +3,723 | 1,209 | -1,760 | **-551** | 14 | -1,953 |
+| no fillers (q_pad 0, no qual) | +805 | +278 | 162 | +40 | **+202** | 1 | +190 |
+| G pos_cap 500 | +648 | +198 | 252 | -619 | **-367** | 3 | -838 |
+| G pos_cap 3000 | +4,194 | +3,883 | 1,970 | -3,110 | **-1,140** | 61 | -3,729 |
+| F (live 600, skew 0.3, decided) | +3,195 | +3,537 | 1,577 | -2,202 | **-626** | 15 | -2,030 |
+| extra: F, no fillers | -40 | +137 | 402 | -442 | -40 | 2 | -54 |
+| extra: F, live strikes only | -777 | -74 | 306 | -461 | -155 | 1 | -157 |
+
+**Reading it.**
+- Every filler variant loses under swp. G loses $13-99 in each of the 36 ordinary hours, about -$54 an hour.
+- 26OCT1606 (+$1,401 for G) is a single upset. The index settled at 82.04, so the T81.99 longshot we held 1,500 YES of at 1c paid out. One such upset in roughly every 27 hours would be needed to break even; 1 in 37 was observed.
+- Smaller pads change nothing, because the qual pads still top every side up to 1,050 at 1c. pos_cap 500 barely qualifies a side (reward $324 under cons against G's $3,954). pos_cap 3000 doubles the swept contracts. The 180 s hold helps only marginally (-$198 against -$539).
+- The model's fair is fat-tailed by design. Marked at that fair, G's swp fills look +$909, but over the 37 hours the realized longshot rate was about a third of the model's (0.97-0.99 favorites: 0.65% realized against 1.83% modelled; 0.99-0.995: 0.25% against 0.73%; above 0.995: none in 12,800 strike-minutes). At 1c the break-even is 1%, and the sweepers concentrate on favorites above 0.995.
+- The only variant positive under all three fill models is "no fillers": favorite joins only, with near-decided strikes quoted as live at half size. It makes +$202 under swp, about +$5.5 an hour (opt +$805, cons +$278).
+- By ET settle hour, no fillers is positive from 20:00 to 09:00 ET (+$1 to +$36 an hour) and slightly negative from 10:00 to 19:00 (-$0 to -$6; hour 17 was +$1). The per-hour table is printed by `table`.
+- G_hold180 under swp is negative in every hour except 06 ET (the 26OCT1606 upset).
+- F's live-strike quoting is not robust: realized P&L is negative under opt and cons as well.
+
+**Commands.** Outputs go to `--out`, which defaults to `TEMP_SHADOW_SWEEP_OUT`, else `<TEMP_SHADOW_DATA>\sweep`. The 2026-10-16 run wrote to the session scratchpad and left KL-data read-only.
+
+```
+python temp_shadow_sweep.py calibrate [--events ...] [--days ...]        # hazard.json + calibration.txt
+python temp_shadow_sweep.py validate --event KXTEMPMIAH-26OCT1610 [--draws 30] [--hazard X]
+python temp_shadow_sweep.py run --day 2026-10-15 [2026-10-16 ...] [--draws 30] [--variants G,F] [--rec-mode level|size|all]
+python temp_shadow_sweep.py table [--day ...]                              # variant_table.txt/.json, best swp variant by hour
+```
+
+Without a hazard.json, the built-in `DEFAULT_HAZARD` is used; it is the compact form of the 2026-10-16 calibration.

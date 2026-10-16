@@ -76,10 +76,31 @@ Never places an order and never touches the network.
 4. coverage -- trusted fraction per ticker over [t0, t1) (sampled exactly like
    books_per_second), gaps / reconnects / silent deaths / recorder gaps,
    ws-down seconds, trade counts by source and trades_src ws|rest|mixed|none.
+
+5. Live-order subtraction (2026-10-16; Jack: "run the sweep-aware shadow,
+   without pausing"). From 2026-10-16 13:00Z the LIVE executor
+   (temp_mm_live.py) rests its own orders in these markets, so the recorded
+   books include them and a replay would count our size as competitors'.
+   live_own_orders(event, sec0, sec1) rebuilds what we rested each second from
+   the executor's logs (TEMP_MM_LIVE_DIR, default KL-data\\temp-mm:
+   orders_<UTC day>.jsonl kinds place / adopt / amend / renew (total) /
+   decrease (reduce_by) / cancel / gone / expired, fills_<UTC day>.jsonl
+   reducing what is left; an order also leaves the book at its expiration_ts
+   unless a renewal moved it; only rows with mode == "live"), and
+   load_event_stream(..., subtract_live=None -> SUBTRACT_LIVE, default on,
+   env TEMP_SHADOW_SUBTRACT_LIVE=0 turns it off) makes books_per_second /
+   book_at return the recorded levels minus ours (clipped at 0) and drops the
+   trades that filled our orders (by trade_id) from `trades` (the replayed
+   bot gets the tape of a market without us). With no live rows for the
+   event it is a no-op: the same objects come back, so every pre-13:00Z
+   replay is bit-identical. EventStream.live_own / own_trades / trades_all
+   keep what was subtracted; coverage["live_own"] (only when rows exist)
+   counts it.
 """
 from __future__ import annotations
 
 import bisect
+import datetime as _dt
 import json
 import math
 import os
@@ -442,6 +463,246 @@ def _strike_key(t: str):
     return (s if s is not None else math.inf, t)
 
 
+# ==========================================================================
+# 5. Live-order reconstruction (our own orders inside the recorded books)
+# ==========================================================================
+
+LIVE_DIR_DEFAULT = r"C:\Users\jackd\Documents\KL-data\temp-mm"
+SUBTRACT_LIVE = os.environ.get("TEMP_SHADOW_SUBTRACT_LIVE", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+LIVE_READ_BEFORE_S = 6 * 3600.0   # executor log days read around a window
+LIVE_READ_AFTER_S = 3600.0
+# order-log kinds that change what rests (the rest -- reject, uncertain,
+# *_error, cancel_elsewhere (another subaccount), pull/restore -- do not)
+_LIVE_KINDS = {"place": 0, "adopt": 0, "amend": 1, "renew": 1, "decrease": 1,
+               "fill": 2, "cancel": 3, "gone": 3, "expired": 3}
+_LIVE_CACHE: Dict[str, tuple] = {}     # path -> (mtime, size, live rows)
+
+
+def live_dir() -> str:
+    """The live executor's data dir: env TEMP_MM_LIVE_DIR (read per call so
+    tests can sandbox it), default KL-data\\temp-mm."""
+    return os.environ.get("TEMP_MM_LIVE_DIR") or LIVE_DIR_DEFAULT
+
+
+def _live_file_rows(path: str) -> List[dict]:
+    """mode == "live" rows of one executor log, cached by (mtime, size)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    hit = _LIVE_CACHE.get(path)
+    if hit is not None and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+    rows = [r for r in C.iter_jsonl(path) if r.get("mode") == "live"]
+    _LIVE_CACHE[path] = (st.st_mtime, st.st_size, rows)
+    return rows
+
+
+def live_log_rows(kind: str, t0: float, t1: float, root: Optional[str] = None
+                  ) -> List[dict]:
+    """Live rows of the executor's `<kind>_<UTC day>.jsonl` (kind 'orders' or
+    'fills') for every UTC day touching [t0 - 6 h, t1 + 1 h]."""
+    root = root or live_dir()
+    if not os.path.isdir(root):
+        return []
+    out: List[dict] = []
+    d = _dt.datetime.fromtimestamp(t0 - LIVE_READ_BEFORE_S, tz=_dt.timezone.utc).date()
+    end = _dt.datetime.fromtimestamp(t1 + LIVE_READ_AFTER_S, tz=_dt.timezone.utc).date()
+    while d <= end:
+        out.extend(_live_file_rows(os.path.join(root, f"{kind}_{d.isoformat()}.jsonl")))
+        d += _dt.timedelta(days=1)
+    return out
+
+
+class LiveOrders:
+    """Our live orders on one event, rebuilt from the executor's logs.
+
+    orders   oid -> {ticker, side ('yes' | 'no' = YES bid | NO bid), price,
+             placed (ts), tag} for every order that rested
+    fills    the event's live fill rows (ts, order_id, count, trade_id, ...)
+    ops      [(ts, prio, oid, kind, row)] time-ordered state changes
+    trade_ids  trade ids of our fills (the tape entries that hit us)
+    """
+
+    def __init__(self, event: str, orders: List[dict], fills: List[dict]):
+        self.event = event
+        prefix = event + "-"
+        self.orders: Dict[str, dict] = {}
+        self.fills: List[dict] = []
+        ops: List[tuple] = []
+        for r in orders:
+            k = r.get("kind")
+            tk = str(r.get("ticker") or "")
+            oid = r.get("oid")
+            if k not in _LIVE_KINDS or k == "fill" or not oid or not tk.startswith(prefix):
+                continue
+            try:
+                ts = float(r["ts"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if k in ("place", "adopt") and oid not in self.orders:
+                try:
+                    self.orders[oid] = dict(ticker=tk, side=str(r.get("side")).lower(),
+                                            price=int(r["price"]), placed=ts,
+                                            tag=r.get("tag"))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            ops.append((ts, _LIVE_KINDS[k], oid, k, r))
+        tids: Set[str] = set()
+        for f in fills:
+            tk = str(f.get("ticker") or "")
+            oid = f.get("order_id")
+            if not oid or not tk.startswith(prefix):
+                continue
+            try:
+                ts = float(f["ts"])
+                cnt = float(f.get("count") or 0.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if cnt <= EPS:
+                continue
+            self.fills.append(f)
+            if f.get("trade_id"):
+                tids.add(str(f["trade_id"]))
+            ops.append((ts, _LIVE_KINDS["fill"], oid, "fill", f))
+        ops.sort(key=lambda o: (o[0], o[1]))
+        self.ops = ops
+        self.trade_ids = tids
+
+    def __bool__(self) -> bool:
+        return bool(self.orders)
+
+    def timeline(self, sec0: int, sec1: int,
+                 sample_offset: float = 0.5) -> List[Dict[str, Tuple[Dict[int, float], Dict[int, float]]]]:
+        """Entry i = {ticker: (own_yes, own_no)} resting as of
+        sec0 + i + sample_offset (books_per_second's sampling); tickers with
+        nothing resting are omitted. Unchanged seconds share the SAME dict
+        objects (read-only)."""
+        n = max(0, int(sec1) - int(sec0))
+        out: List[dict] = [None] * n
+        st: Dict[str, list] = {}          # oid -> [price, total, expires]
+        filled: Dict[str, float] = {}
+        ops = self.ops
+        j = 0
+        cur: dict = {}
+        dirty = True
+        next_exp = math.inf
+        for i in range(n):
+            b = sec0 + i + sample_offset
+            while j < len(ops) and ops[j][0] <= b:
+                ts, _, oid, k, r = ops[j]
+                j += 1
+                dirty = True
+                if k == "fill":
+                    filled[oid] = filled.get(oid, 0.0) + float(r.get("count") or 0.0)
+                    continue
+                if k in ("place", "adopt"):
+                    if oid not in self.orders:
+                        continue
+                    try:
+                        size = float(r.get("size") or 0.0)
+                    except (TypeError, ValueError):
+                        size = 0.0
+                    exp = r.get("expiration_ts")
+                    exp = float(exp) if exp not in (None, "") else math.inf
+                    total = size if k == "place" else filled.get(oid, 0.0) + size
+                    st[oid] = [int(r.get("price", self.orders[oid]["price"])), total, exp]
+                    continue
+                o = st.get(oid)
+                if o is None:
+                    continue
+                if k in ("amend", "renew"):
+                    try:
+                        if r.get("price") is not None:
+                            o[0] = int(r["price"])
+                        if r.get("total") not in (None, ""):
+                            o[1] = float(r["total"])
+                        elif r.get("size") not in (None, ""):
+                            o[1] = filled.get(oid, 0.0) + float(r["size"])
+                    except (TypeError, ValueError):
+                        pass
+                    if r.get("expiration_ts") not in (None, ""):
+                        o[2] = float(r["expiration_ts"])
+                elif k == "decrease":
+                    try:
+                        if r.get("reduce_by") not in (None, ""):
+                            o[1] -= float(r["reduce_by"])
+                        elif r.get("size") not in (None, ""):
+                            o[1] = filled.get(oid, 0.0) + float(r["size"])
+                    except (TypeError, ValueError):
+                        pass
+                else:                                  # cancel / gone / expired
+                    st.pop(oid, None)
+            if b >= next_exp:
+                dirty = True
+            if dirty:
+                cur = {}
+                next_exp = math.inf
+                for oid, o in list(st.items()):
+                    if o[2] <= b:                      # Kalshi expired it
+                        st.pop(oid, None)
+                        continue
+                    left = o[1] - filled.get(oid, 0.0)
+                    if left <= EPS:
+                        continue
+                    next_exp = min(next_exp, o[2])
+                    meta = self.orders[oid]
+                    pair = cur.get(meta["ticker"])
+                    if pair is None:
+                        pair = cur[meta["ticker"]] = ({}, {})
+                    d = pair[0] if meta["side"] == "yes" else pair[1]
+                    d[o[0]] = round(d.get(o[0], 0.0) + left, SIZE_DP)
+                dirty = False
+            out[i] = cur
+        return out
+
+
+def load_live_orders(event_ticker: str, t0: Optional[float] = None,
+                     t1: Optional[float] = None, root: Optional[str] = None
+                     ) -> Optional[LiveOrders]:
+    """The event's live orders (None when the executor logged none for it).
+    t0/t1 default to the ticker's hour."""
+    if t0 is None or t1 is None:
+        pe = C.parse_event(event_ticker)
+        if not pe:
+            return None
+        t0, t1 = pe[1] - 3600.0, pe[1]
+    orders = live_log_rows("orders", t0, t1, root)
+    if not orders:
+        return None
+    lo = LiveOrders(event_ticker, orders, live_log_rows("fills", t0, t1, root))
+    return lo if lo else None
+
+
+def live_own_orders(event_ticker: str, sec0: int, sec1: int,
+                    root: Optional[str] = None
+                    ) -> Optional[List[Dict[str, Tuple[Dict[int, float], Dict[int, float]]]]]:
+    """Our live resting orders per second: entry i = {ticker: (own_yes,
+    own_no)} ({cents: contracts} YES bids / NO bids) as of sec0 + i + 0.5,
+    the books_per_second sampling; tickers with nothing resting are omitted.
+    None when the live executor logged no order for the event (the
+    subtraction is then a no-op)."""
+    lo = load_live_orders(event_ticker, float(sec0), float(sec1), root)
+    if lo is None:
+        return None
+    return lo.timeline(int(sec0), int(sec1))
+
+
+def subtract_levels(levels: Dict[int, float], own: Optional[Dict[int, float]]
+                    ) -> Dict[int, float]:
+    """levels minus own per price, clipped at 0 (2-dp fixed point; levels
+    left <= 1e-9 dropped). Returns `levels` itself when own is empty."""
+    if not own:
+        return levels
+    out: Dict[int, float] = {}
+    for px, q in levels.items():
+        left = round(q - own.get(px, 0.0), SIZE_DP)
+        if left > EPS:
+            out[px] = left
+    return out
+
+
 class EventStream:
     """Books, trades and coverage of one event over [t0, t1) (see module doc).
 
@@ -472,6 +733,12 @@ class EventStream:
         # reads None inside them; deltas keep applying (a stall's backlog
         # arrives complete afterwards; a restart's connect marker untrusts)
         self._blackout: List[Tuple[float, float]] = []
+        # live-order subtraction (module doc 5): set by load_event_stream
+        self.subtract_live: bool = SUBTRACT_LIVE
+        self.live_root: Optional[str] = None
+        self.live_own: Optional[LiveOrders] = None   # None = nothing to subtract
+        self.own_trades: List[Trade] = []            # tape rows that filled us (removed)
+        self.trades_all: Optional[List[Trade]] = None  # the tape before removal
 
     # ---------------------------------------------------------------- books
     def books_per_second(self, sec0: int, sec1: int
@@ -479,15 +746,29 @@ class EventStream:
                                                              Dict[int, float]]]]]:
         """{ticker: [state for sec0 .. sec1-1]}; entry i = (yes, no) as of
         rx <= sec0 + i + 0.5, None when untrusted / unknown. Unchanged
-        seconds share one tuple and its dicts: treat them as READ-ONLY."""
+        seconds share one tuple and its dicts: treat them as READ-ONLY.
+        With live-order subtraction on (and live orders logged for the
+        event) our own resting sizes are taken out of every level."""
         sec0, sec1 = int(sec0), int(sec1)
-        return {t: self._replay(t, sec0, sec1, True) for t in self.tickers}
+        out = {t: self._replay(t, sec0, sec1, True) for t in self.tickers}
+        if self.subtract_live and self.live_own:
+            own = self.live_own.timeline(sec0, sec1)
+            out = {t: _subtract_series(lst, own, t) for t, lst in out.items()}
+        return out
 
     def book_at(self, ticker: str, ts: float
                 ) -> Optional[Tuple[Dict[int, float], Dict[int, float]]]:
-        """State as of rx <= ts (fresh copies)."""
+        """State as of rx <= ts (fresh copies; ours subtracted like
+        books_per_second)."""
         st = self._replay(ticker, 0, 1, True, first_boundary=ts)[0]
-        return None if st is None else (dict(st[0]), dict(st[1]))
+        if st is None:
+            return None
+        if self.subtract_live and self.live_own:
+            s0 = math.floor(ts)
+            own = self.live_own.timeline(s0, s0 + 1, sample_offset=ts - s0)[0].get(ticker)
+            if own:
+                st = (subtract_levels(st[0], own[0]), subtract_levels(st[1], own[1]))
+        return (dict(st[0]), dict(st[1]))
 
     def _replay(self, ticker: str, sec0: int, sec1: int, materialize: bool,
                 first_boundary: Optional[float] = None) -> list:
@@ -910,6 +1191,25 @@ class EventStream:
 
         self._merge_trades(ws_trades, rest_rows)
 
+        # ---- our live orders (module doc 5) ------------------------------
+        live_cov = None
+        if self.subtract_live:
+            lo = load_live_orders(ev, self.t0, self.t1, self.live_root)
+            if lo:
+                self.live_own = lo
+                self.trades_all = list(self.trades)
+                keep_t, keep_i = [], []
+                for tr, info in zip(self.trades, self.trade_info):
+                    if info[1] and str(info[1]) in lo.trade_ids:
+                        self.own_trades.append(tr)
+                    else:
+                        keep_t.append(tr)
+                        keep_i.append(info)
+                self.trades, self.trade_info = keep_t, keep_i
+                live_cov = {"orders": len(lo.orders), "fills": len(lo.fills),
+                            "trades_removed": len(self.own_trades),
+                            "contracts_removed": round(sum(t.count for t in self.own_trades), 2)}
+
         # ---- tickers -----------------------------------------------------
         tick = set(self.markets) | seen | set(ops)
         tick |= {t.ticker for t in self.trades}
@@ -943,6 +1243,8 @@ class EventStream:
             "trades_rest": n_rest, "trades_src": src,
             "settled_file": bool(st),
         }
+        if live_cov is not None:
+            self.coverage["live_own"] = live_cov
 
     def _read_settled(self, settled_path: Optional[str]) -> Optional[dict]:
         paths = [settled_path] if settled_path else [
@@ -1019,13 +1321,43 @@ def _merge_spans(spans: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     return out
 
 
+def _subtract_series(states: list, own: list, ticker: str) -> list:
+    """One ticker's books_per_second states minus our per-second own orders
+    (live_own_orders entries). Seconds where neither changed share one
+    result tuple (the copy-on-write contract); untouched seconds keep the
+    recorded objects."""
+    out = list(states)
+    last_key, last_val = None, None
+    for i, b in enumerate(states):
+        if b is None:
+            continue
+        o = own[i].get(ticker) if i < len(own) else None
+        if not o:
+            continue
+        key = (id(b), id(o))        # both stay referenced by the inputs
+        if key != last_key:
+            last_key = key
+            last_val = (subtract_levels(b[0], o[0]), subtract_levels(b[1], o[1]))
+        out[i] = last_val
+    return out
+
+
 def load_event_stream(event_ticker: str, t0: float, t1: float,
                       lookback: float = LOOKBACK_S,
-                      settled_path: Optional[str] = None) -> EventStream:
+                      settled_path: Optional[str] = None,
+                      subtract_live: Optional[bool] = None,
+                      live_root: Optional[str] = None) -> EventStream:
     """Rebuild one event's books and trades over [t0, t1) from the recording
     (ws rows from t0 - lookback so each market's snapshot is found) plus the
-    REST trades in settled/<EVENT>.json (backfill/settled/ as a fallback)."""
+    REST trades in settled/<EVENT>.json (backfill/settled/ as a fallback).
+
+    subtract_live (None -> SUBTRACT_LIVE, default True): take our live
+    executor's own resting orders out of the books and the trades that filled
+    them out of the tape (module doc 5); a no-op when it logged none for the
+    event. live_root overrides TEMP_MM_LIVE_DIR."""
     es = EventStream(event_ticker, t0, t1)
+    es.subtract_live = SUBTRACT_LIVE if subtract_live is None else bool(subtract_live)
+    es.live_root = live_root
     es._load(lookback, settled_path)
     return es
 
