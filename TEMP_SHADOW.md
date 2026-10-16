@@ -206,7 +206,7 @@ These are all parameters of one policy, so a tweak is a config change.
 - The open is the markets' `open_time` (close − 3600 when unknown). The test is `temp_mm_policy.pad_hold_flag` on the orders' resting start (decision time + 0.15 s), the same rule the live executor applies. In the sim the pads are active by open + 180.65 s (the hh:03:00.5 tick, or an earlier station-row decision).
 - Default 0 (off). Only G holds (180 s); `G0_nohold` is the G before the hold, kept for comparison.
 
-**Variant grid:** the grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`). Since 10/16 `G_decided_only` (what runs live) holds its pads for 180 s and `G0_nohold` is the old G. SIM_VERSION 5 makes `run_day` re-sim the older cached files of any day it is asked for; the daily report asks for every day of its cumulative window (day 1 .. the report day), so the first report after a SIM_VERSION or `VARIANTS` change re-sims the whole window (review fix 10/16: before it only the report day re-simmed, so 10/15 stayed at SIM_VERSION 4, where `G_decided_only` had no hold and `G0_nohold` did not exist; the first report run with the fix re-sims it to 5).
+**Variant grid:** the grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`). Since 10/16 `G_decided_only` (what runs live) holds its pads for 180 s and `G0_nohold` is the old G. SIM_VERSION 5 makes `run_day` re-sim the older cached files of any day it is asked for; the daily report asks for every day of its cumulative window (day 1 .. the report day), so the first report after a SIM_VERSION or `VARIANTS` change re-sims the whole window (review fix 10/16: before it only the report day re-simmed, so 10/15 stayed at SIM_VERSION 4, where `G_decided_only` had no hold and `G0_nohold` did not exist; the first report run with the fix re-sims it to 5). SIM_VERSION 5 also covers the live-order subtraction from the sweep-aware shadow (merged with it, see below): the 10/16 files simmed at 4 without it re-sim too. The sweep-aware shadow runs the same pair as `G_hold180` (= `G_decided_only`) and `G` (= `G0_nohold`).
 
 ## Daily report (08:30 ET, previous ET day, plus cumulative)
 
@@ -360,3 +360,179 @@ def run_day(et_day: str, variants=None, force=False) -> List[dict]  # writes sim
 - `backfill/settled`: 492 events from 26SEP2322 to 26OCT1421, with 273,849 trades. Kalshi listed no event for 12 of those hours.
 - `backfill/calibrations.json`.
 - `backfill/study`: the 10/14 study data.
+
+## Sweep-aware shadow (2026-10-16)
+
+Jack 2026-10-16: "run the sweep-aware shadow, without pausing". In the live executor's first hour (variant G, subaccount 2, KXTEMPMIAH-26OCT1610) sweepers took our 1c pad / qual fillers within seconds. Sweepers are takers buying a near-certain favorite at 99c, which hits 1c longshot bids. Over the hour 10,006 contracts filled at 1c and 6 strikes capped at pos_cap 1,500, after which those strikes no longer qualified. The hour earned an estimated $14 of reward and lost $96 on fills, a net of -$82. The shadow had said +$7 (opt) / +$13 (cons) for that hour. The executor has been on its HALT file since 14:00Z, so 26OCT1610 is the only live hour.
+
+**Why the shadow missed it.** opt / cons fill us only from recorded trades, and sweepers in the recording only took the 1c liquidity that existed. On strongly decided strikes the longshot 1c level was usually empty (the other makers do not rest there), so the shadow saw our pads rest alone, take the whole side's reward share and never fill.
+
+### Live-order subtraction (temp_shadow_scoring)
+
+From 2026-10-16 13:00Z the recorded books contain our own live orders. `load_event_stream(..., subtract_live=None)` (default on; `TEMP_SHADOW_SUBTRACT_LIVE=0` turns it off) rebuilds our resting orders per second from the executor's `orders_` / `fills_<UTC day>.jsonl` and subtracts them from every recorded level (clipped at 0). It reads `mode == "live"` rows only: place / adopt / amend / renew (total) / decrease (reduce_by) / cancel / gone / expired. Fills reduce what is left, and an order leaves at its `expiration_ts` unless renewed. The trades that filled our orders are dropped from the replay tape (kept in `EventStream.own_trades`). `live_own_orders(event, sec0, sec1)` exposes the reconstruction.
+
+The executor's logs are found at `TEMP_MM_LIVE_DIR`, else `TEMP_MM_DATA` (where temp_mm_live writes when relocated), else `KL-data\temp-mm`. That last default applies only while `TEMP_SHADOW_DATA` is the real recording, so a sandboxed test replay never reads the real executor's logs. Before this, the e2e tests on future-dated events would have started failing the day the live executor traded those hours.
+
+With no live rows for an event it is a no-op. On all 35 recorded settled hours before live (26OCT1421 through 26OCT1609) the books, trades, coverage and full sim are identical to origin/main. On 26OCT1610 it removes 186 orders and 21 fills (10,108 contracts).
+
+**What it does not remove.** The subtracted book is the recorded market minus our orders. It is not a market that never saw us. On 26OCT1610 other makers joined five 1c levels that our pads had opened, adding +200 to +800 within 2-12 s, and they stay in the subtracted book. A plain replay of the live hour therefore has company at 1c on those sides, where every pre-live replay has none. `validate` also runs the joiner-free replay (swp_nojoin below).
+
+### Sweep hazard (temp_shadow_sweep.py calibrate)
+
+Measured over the 38 recorded settled hours (26OCT1421 to 26OCT1612), with books and tape NOT subtracted, so anyone's 1c liquidity counts. A sweep is a taker cluster of 1c prints on one side (prints within 1 s). The hazard is sweeps per second while at least 1 contract rests at 1c on that side.
+
+| favorite fair | exposure h | sweeps | lambda /s | mean wait | cleared level | median size |
+|---|---|---|---|---|---|---|
+| 0.90-0.97 | 25.0 | 213 | 0.0024 | 423 s | 41% | 15 |
+| 0.97-0.99 | 14.7 | 236 | 0.0045 | 224 s | 39% | 21 |
+| 0.99-0.995 | 6.0 | 119 | 0.0055 | 181 s | 33% | 33 |
+| > 0.995 | 17.2 | 618 | 0.0100 | 100 s | 37% | 25 |
+
+The age of the 1c liquidity drives the hazard. On a > 99.5% favorite, liquidity 0-5 s old is swept at 0.138/s, 5-30 s at 0.026/s, 30-120 s at 0.013/s and after 2 minutes at about 0.0065/s. The fitted model is `a[fav][age] x mult[minute]`, IOC sweeps only (the ~7% that left a 99c bid behind are replayed from the tape instead). The minute multiplier is 0.8 between minutes 5 and 40 and 1.2-2.3x over the last 20 minutes.
+
+**Flash sweeps.** 74 of the 107 fresh-liquidity sweeps on > 99.5% favorites are "flash": the 1c liquidity appeared and was swept between two 1 s samples, so the samples saw none of its exposure. Each flash episode now counts 0.5 s of exposure, and its cleared flag reads only the level after it (empty = cleared) instead of being automatic. That gives 0.138/s. Without the flash sweeps the rate is 0.045/s. The first pass reported 0.157/s and an 84% clear rate; the corrected clear rates are 68% (flash) and 58% (non-flash). The flash-free fit (`a[>0.995][0-5s]` 0.039 against 0.119) is carried in hazard.json and run as the "noflash" sensitivity.
+
+**Live evidence (26OCT1610).** 96 of our orders rested at 1c and 14 were hit. Time from placement to first fill was 2.8, 3.2, 6.4, 13, 14, 15, 17.5, 31, 85, 101, 111, 119, 183 and 314 s. Resting alone at 1c on a > 99.5% favorite we were hit 2 times in 13 s (0.15/s). With others also at 1c we were hit at 0.0008 / 0.0033 / 0.0092 / 0.0115 per s by favorite bucket, against a recorded 0.0024 / 0.0045 / 0.0055 / 0.0100. Both agree within the noise of 1-7 hits. The fresh pads that were swept went whole (1,000 / 500 / 1,800 / 1,200 lots).
+
+### Fill model swp
+
+swp is cons plus three channels on our 1c orders (module docstring):
+- **(a) recorded taker clusters.** A recorded taker cluster at 1c that cleared the recorded level takes all of ours. One that did not clear it now meets price-time priority: the external size that rested at 1c when our lot was placed, clamped to the level at every sample since, is ahead of us. The first pass put us at the front of the queue, and that rule is kept as rec_mode "front".
+- **(b) hidden IOC sweeps.** While we rest alone at 1c, hidden IOC sweeps arrive at the calibrated hazard. The draws are Monte Carlo with fixed seeds, 30 per variant, with common random numbers across variants.
+- **(c) new 99c bids.** A new 99c bid opposite our 1c would have crossed us, so it fills us.
+
+Re-pads after a sweep follow the policy, so pos_cap limits them and a capped strike stops qualifying. In a live hour, the cluster sizes in (a) include the prints that hit our live orders. A cluster made only of our prints is kept if others rested at 1c, and dropped if we were alone (then (b) has to predict it).
+
+The live hour supports each queue rule on some clusters. A 1,075-lot taker filled 736 of ours behind 339 that were there first, which is exactly the queue rule. But 842 of a 1,000-lot taker went to us with 1,758 or more resting on the level, so we were nearly first; makers there re-place constantly. On another cluster others were filled ahead of an order of ours that had opened the level. The queue rule fills fewer 1c contracts, so it is the default that is kinder to the fillers.
+
+### Validation on the live hour (26OCT1610)
+
+`validate --live` runs every settled hour the executor traded; 26OCT1610 is the only one. The hazard here is fit on the 37 pre-live hours only (`hazard_prelive.json`), 30 draws, variant G:
+
+| | actual | opt | cons | swp (queue, default) | swp front | swp joiner-free | joiner-free, hazard x1.5 | swp strict |
+|---|---|---|---|---|---|---|---|---|
+| filler contracts | 10,006 | 3,905 | 3,264 | 9,271 | 10,296 | 7,354 | 8,177 | 7,322 |
+| reward $ | 14.11 | 45.19 | 45.23 | 29.90 | 15.21 | 36.16 | 30.60 | 45.38 |
+| trading P&L $ | -95.99 | -37.93 | -32.64 | -92.71 | -102.96 | -76.54 | -84.77 | -73.22 |
+| net $ | -81.88 | +7.26 | +12.58 | -62.80 | -87.75 | -40.38 | -54.17 | -27.84 |
+
+- "front" (we first in the queue) fits the live hour best. The queue rule misses T86.99: it fills 17 of the 857 contracts that filled live, so that pad keeps earning reward in the replay ($30 against $14).
+- "joiner-free" replays the five sides our pads opened (T79.99 / T80.99 / T81.99 NO, T87.99 / T88.99 YES) with nobody else at 1c and drops their 11 recorded 1c takers. That is the regime of every pre-live replay, so it is the out-of-sample test of the hidden-sweep hazard. It under-predicts: 3,337 contracts at minute 5 against 4,659 live, and 7,354 for the hour. At hazard x1.5 it reaches 4,795 at minute 5 and 8,177 for the hour. Our fresh pads went whole, while the corrected size draw clears only 58-68% of the time.
+- On this one hour, then, the default swp is if anything kind to the fillers.
+- opt / cons see none of it: +$7 / +$13 against -$82.
+
+### Realized tails, and why the sweeps matter (temp_shadow_sweep.py tails)
+
+The swp totals are dominated by a few settlements. A 1,500-lot longshot pays about $1,485 once in dozens of hours, so the Monte Carlo error next to a total says nothing about the outcome risk. `tails` measures the outcome side on every settled hour with station data: 492 backfill hours (26SEP to 26OCT1421, the model's tape) plus 38 recorded hours, 530 hours and 318,000 strike-minutes in all.
+
+**Unconditional.** The model's longshot probabilities are fat by design. Realized longshot rates by model bucket, with event-clustered 90% CIs:
+
+| model longshot P | model | realized | 90% CI |
+|---|---|---|---|
+| < 0.1% | 0.009% | 0.047% | 0.001-0.111% |
+| 0.1-0.3% | 0.19% | 0.18% | 0.02-0.37% |
+| 0.3-0.5% | 0.39% | 0.20% | 0.05-0.40% |
+| 0.5-1% | 0.73% | 0.44% | 0.24-0.67% |
+| 1-2% | 1.45% | 0.76% | 0.46-1.13% |
+| 2-3% | 2.46% | 1.57% | 1.05-2.19% |
+| 3-6% | 4.30% | 2.72% | 2.08-3.39% |
+
+Per distinct strike at its first crossing of a favorite level, the model is about right: 23.1 expected upsets against 23 realized at 0.99, and 11.7 against 12 at 0.995. The exception is the far tail: at 0.999 it expects 2.4 and 8 happened (P = 0.004). The review's point stands. The 37 recorded hours alone cannot pin the tail; their realized rate rests on one or two upset strikes.
+
+**Conditional on the fill.** This is what decides the fillers. The question is how often the longshot won when a taker actually hit a bid at that price. The data are every REST trade in those 530 hours, contract-weighted with event-clustered CIs:
+
+| model longshot P | a 1c bid hit (a sweeper buys the favorite at 99c) | unconditional | a 97-99c favorite bid hit (a taker buys the longshot) |
+|---|---|---|---|
+| < 0.1% | 0.026% (480k contracts) | 0.047% | 0.032% |
+| 0.1-0.3% | 0.18% | 0.18% | 0.008% |
+| 0.3-0.5% | 0.08% | 0.20% | 0.005% |
+| 0.5-1% | 0.77% [0-2.2] | 0.44% | 2.4% [0.06-6.7] |
+| 1-2% | 0.15% [0.04-0.32] (307k) | 0.76% | 0.25% |
+| 2-3% | 0.19% [0-0.48] | 1.57% | 0.79% |
+| 3-6% | 0.72% [0.10-1.49] | 2.72% | 0.51% |
+
+Sweepers buy the favorite when it is safe. Given a sweep, the longshot wins at a fraction of the unconditional rate, far below the 1% that a 1c bid needs. Every 1c fill therefore loses about 0.8-1c in expectation. Takers who buy longshots at 1-3c are the opposite case, lottery buyers who hit favorite bids when the favorite is safe. `net_cal` in the variant table marks every fill at the realized rate of its model bucket given a taker hit a bid at its price: the 1c, 2-3c and 97-99c classes, unconditional otherwise. The CI ends give the bracket. Fills at a 10-90% fair keep the model's own fair, so for live-strike quoting (the F variants) `net_cal` is circular and is not evidence.
+
+### Variants under opt / cons / swp (all 39 settled recorded hours, 26OCT1421-26OCT1613)
+
+Run with subtraction on, 30 swp draws, the 38-hour hazard and the conditional tails. Each variant is an explicit set of overrides of DEFAULT_POLICY. G = live off, decided, q_pad 1000, q_fav 300, pos_cap 1500: the live G before the 10/16 pad hold, `G0_nohold` in the grid. G_hold180 = G with the 180 s pad hold, `G_decided_only` in the grid (what runs live). This table was run on the temp-sweep branch, where G_hold180 was the sweep module's own decision-time hold (`hold_pads_s`); since the merge into temp-integrate it is the policy's `pad_hold_open_s` 180, and the two give identical results on all 39 hours (opt, cons and every swp draw). The hours are 10/14: 3, 10/15: 22, 10/16: 14. Column notes:
+- "90% CI" and "P>0" are a bootstrap of the swp total over hours.
+- "ex-best" is the swp total without its best hour.
+- "net_cal" is the swp total with fills marked at the fill-conditional realized tails, with its CI ends in brackets.
+
+| variant | opt net | cons net | swp reward | swp P&L | swp net | 90% CI | P>0 | ex-best | net_cal [CI ends] |
+|---|---|---|---|---|---|---|---|---|---|
+| G | +3,074 | +3,315 | 1,421 | -2,184 | -763 | -2,874..+2,084 | 0.25 | -2,166 | **-978** [-1,624, +63] |
+| G_hold180 | +2,853 | +3,319 | 1,541 | -1,998 | -457 | -2,556..+2,365 | 0.33 | -1,861 | -743 [-1,325, +202] |
+| pads_only (q_fav 0) | +2,132 | +2,366 | 973 | -1,885 | -912 | -2,502..+1,969 | 0.26 | -2,300 | -1,717 [-2,371, -663] |
+| J (q_fav 100) | +2,717 | +2,813 | 1,171 | -2,011 | -840 | -2,616..+2,031 | 0.25 | -2,234 | -1,385 [-2,036, -336] |
+| G q_pad 200 | +3,410 | +3,688 | 1,308 | -2,111 | -803 | -2,925..+2,055 | 0.25 | -2,211 | -1,031 [-1,664, -16] |
+| G q_pad 500 | +3,236 | +3,509 | 1,352 | -2,145 | -792 | -2,906..+2,060 | 0.25 | -2,197 | -1,013 [-1,653, +17] |
+| G pos_cap 500 | +286 | -95 | 315 | -914 | -599 | -1,669..+501 | 0.17 | -1,070 | -354 [-591, +26] |
+| G pos_cap 3000 | +3,146 | +3,648 | 2,206 | -3,478 | -1,271 | -4,687..+4,097 | 0.26 | -3,898 | -2,371 [-3,440, -632] |
+| no fillers (q_pad 0, no qual) | -98 | -37 | 199 | -300 | -101 | -1,121..+605 | 0.46 | -282 | +512 [+496, +529] |
+| no fillers, q_fav 600 | -195 | -179 | 310 | -554 | -244 | -1,832..+770 | 0.41 | -442 | +662 [+653, +665] |
+| **favorite joins only** (no fillers, no near-decided quotes) | -118 | -87 | 172 | -259 | **-87** | -1,100..+609 | 0.46 | -265 | **+499** [+479, +511] |
+| F (live 600, skew 0.3) | +2,010 | +3,276 | 1,780 | -2,652 | -872 | -3,252..+2,072 | 0.27 | -2,278 | (circular) |
+| F without fillers | -1,426 | -198 | 474 | -839 | -365 | -1,700..+870 | 0.33 | -725 | (circular) |
+| F live strikes only | -1,448 | -91 | 343 | -523 | -180 | -1,027..+685 | 0.35 | -537 | (circular) |
+
+Per day, swp net / net_cal:
+- G: -118 / -100 (10/14), -986 / -604 (10/15), +340 / -274 (10/16).
+- Favorite joins only: +26 / +26, +93 / +92, -205 / +381.
+
+`variant_table.txt` has every day and fill model.
+
+**Sensitivities** (`sens`, 10 draws, swp). Swp net and net_cal, with the hazard x0.5 / x1.5, the flash-free hazard, rec_mode size / front, and 800 joiners diluting our 1c reward:
+
+| config | G net | G net_cal | G_hold180 net | G_hold180 net_cal | pads_only net_cal | no fillers net | no fillers net_cal |
+|---|---|---|---|---|---|---|---|
+| base | -763 | -978 | -457 | -743 | -1,717 | -101 | +512 |
+| hazard x0.5 | -311 | -588 | -148 | -479 | -1,399 | -85 | +521 |
+| hazard x1.5 | -1,022 | -1,182 | -630 | -884 | -1,885 | -116 | +506 |
+| noflash | -562 | -786 | -287 | -583 | -1,549 | -95 | +516 |
+| rec size | -666 | -383 | -194 | +2 | -1,242 | -106 | +508 |
+| rec front | -933 | -1,115 | -638 | -891 | -1,842 | -116 | +503 |
+| joiners 800 | -737 | -953 | -456 | -748 | -1,837 | -102 | +512 |
+
+**Reading it.**
+- **Realized settlements cannot decide this alone.** Every swp total is negative, but each is driven by two settlements going opposite ways. 26OCT1606 (+$1,403 for G) is a longshot that won: the T81.99 YES we held 1,500 of at 1c. 26OCT1612 (-$592 for G, -$497 for favorite joins) is a favorite that lost: T86.99 YES at 97%+ settled NO at 86.36. P(total > 0) is 0.25 for G and 0.46 for favorite joins.
+- **The fill-conditional tails do decide it.**
+  - Every 1c filler variant is negative in expectation, by $354 to $2,371 over the 39 hours (about -$25/h for G). That holds in every sensitivity except G_hold180 under rec_mode size, which comes out at +2.
+  - Only the CI ends of G, G_hold180 and q_pad 500 reach positive, at +17 to +202, and they assume the high end of every 1c bucket at once.
+  - Smaller pads, a 180 s hold, joiners and a lower hazard shrink the loss without removing it.
+- **Favorite joins are positive in expectation and robust.** Without fillers, net_cal is +$499 to +$662 over 39 hours (+$13-17/h). No fillers stays at +503..+521 under every sensitivity. The realized total is -$87 because of one upset (26OCT1612). Without that hour it is +$410.
+  - Near-decided half-size quoting adds about $13 and 7,000 swept 1c contracts.
+  - q_fav 600 adds $150 of expectation and doubles the upset loss.
+- **By ET settle hour, favorite joins only:** +$6 to +$36 per hour from 20:00 to 07:00 ET, +$1-5 from 08:00 to 11:00, about $0-7 from 14:00 to 19:00 (reward about $1/h there). 12:00 and 13:00 hold the upset (-$496) and a +$179 hour.
+- **F's live-strike quoting loses** under opt and cons as well, and its net_cal is circular, so it is not a candidate.
+
+### Live-order subtraction and the 10/16 shadow numbers
+
+- 26OCT1600 to 1609 (before live) and 26OCT1611 to 1613 (after the HALT) have no live rows. The subtraction is a no-op there. On 1611 all 24 VARIANT x fill entries are identical.
+- On 26OCT1610 the plain shadow sim (temp_shadow_sim.run_event, as the KL checkout would run it in the 08:30 report) without the subtraction sees our own pads and the sweeps of them:
+
+  | variant | unsubtracted opt / cons | subtracted opt / cons |
+  |---|---|---|
+  | G_decided_only (SIM_VERSION 4, before the pad hold: today's G0_nohold) | -$71.71 / -$35.24 | +$7.26 / +$12.58 |
+  | F_full | -$21.38 / -$23.32 | +$59.37 / +$23.05 |
+  | I_pads_only | -$84.67 / -$42.75 | -$4.21 / +$2.22 |
+
+  Variants without decided-strike quoting move by about $0.02.
+- Neither opt/cons figure is right. The unsubtracted one is "right" only because our live orders were in the book. swp says -$63 (queue) / -$88 (front) against -$82 actual.
+
+### Commands
+
+Outputs go to `--out`, which defaults to `TEMP_SHADOW_SWEEP_OUT`, else `<TEMP_SHADOW_DATA>\sweep`. The 2026-10-16 runs wrote to the session scratchpad and left KL-data read-only.
+
+```
+python temp_shadow_sweep.py calibrate                        # hazard.json (+ hazard_prelive.json), calibration.txt
+python temp_shadow_sweep.py tails                            # tails.json / tails.txt: unconditional + fill-conditional rates
+python temp_shadow_sweep.py validate --live --hazard <out>\hazard_prelive.json
+python temp_shadow_sweep.py run --day 2026-10-14 2026-10-15 2026-10-16 [--draws 30] [--variants G,no_fillers]
+                                [--rec-mode level|front|size|all] [--hazard-scale X] [--hazard-kind noflash] [--tag T]
+python temp_shadow_sweep.py sens --day ... [--configs h0.5,h1.5,noflash,size,front,join800] [--draws 10]
+python temp_shadow_sweep.py table                            # variant_table.txt/.json incl. sensitivities
+```
+
+`run` and `sens` read `<out>\hazard.json` and `<out>\tails.json` when present, else the built-in `DEFAULT_HAZARD` / `DEFAULT_TAILS` (the 2026-10-16 calibrations). A cached run file is reused only when the draws, rec_mode, channels, policies, fill models, hazard (table, scale and kind), joiners and tails all match. The first pass had two bugs here. `--hazard-scale` never reached the worker, and a recalibrated hazard silently reused old run files.

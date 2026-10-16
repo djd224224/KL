@@ -120,7 +120,11 @@ SIM_VERSION = "5"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # 4: scoring reads 3 h back for each market's
                     # snapshot (early-listed events, 10/15)
                     # 5: pad_hold_open_s (G holds its 1c pads for the
-                    # first 180 s; G0_nohold = the old G), 10/16
+                    # first 180 s; G0_nohold = the old G), 10/16; also
+                    # covers scoring's live-order subtraction (temp-sweep,
+                    # merged with it: our live orders out of the books and
+                    # tape from 10/16 13:00Z), so the 10/16 files simmed
+                    # at 4 without it re-sim
 
 # The policy lives in temp_mm_policy (the live executor runs the same code);
 # re-exported here for the report and older callers.
