@@ -11,6 +11,7 @@ import tempfile
 os.environ["TEMP_SHADOW_DATA"] = tempfile.mkdtemp(prefix="tsr_test_")
 
 import datetime as _dt          # noqa: E402
+import math                     # noqa: E402
 import random                   # noqa: E402
 import shutil                   # noqa: E402
 import subprocess               # noqa: E402
@@ -1275,6 +1276,153 @@ class TestRealModules(unittest.TestCase):
 def tearDownModule():
     shutil.rmtree(DATA, ignore_errors=True)
 
+
+def swp_nets(rng, nets):
+    """swp nets for scenario_nets' cons nets: sweepers take the 1c fillers
+    of every variant but the decided-only one (G), which has none here --
+    best on cons is D_size, best on swp G_decidedonly; B-A stays +3, D-B
+    turns to -10."""
+    out = {n: x - 20.0 for n, x in nets.items()}
+    out["D_size"] = nets["D_size"] - 32.0
+    out["G_decidedonly"] = 4.0 + rng.gauss(0, 0.5)
+    return out
+
+
+def write_day_swp(day, rng, hours=range(24), losing_hours=()):
+    os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+    for h in hours:
+        ev = event_ticker(day, h)
+        nets = scenario_nets(rng, h)
+        sw = swp_nets(rng, nets)
+        if h in losing_hours:
+            sw = {k: v - 30.0 for k, v in sw.items()}
+        variants = {}
+        for n, x in nets.items():
+            variants[f"{n}|opt"] = vrec(x + 1.0)
+            variants[f"{n}|cons"] = vrec(x)
+            r = vrec(sw[n])
+            r.update(draws=8, net_sd=2.0, net_se=round(2.0 / 8 ** 0.5, 6),
+                     filler_contracts=0.0 if n == "G_decidedonly" else 900.0,
+                     net_cal=sw[n] + 1.5, swp_exact=n == "G_decidedonly")
+            variants[f"{n}|swp"] = r
+        C.write_json_atomic(os.path.join(DATA, "sim", day, f"{ev}.json"),
+                            erec(ev, variants))
+
+
+class TestSwpHeadline(unittest.TestCase):
+    """Jack 2026-10-16, "1": the sweep-aware report column. Three fill-model
+    columns; the headline best variant, the rules, the cumulative days + and
+    the week verdict on swp; the subject says swp; net_cal shown as
+    "expected (calibrated tails)" with its caveat."""
+
+    def setUp(self):
+        clear_data()
+
+    def test_three_columns_and_best_on_swp(self):
+        rng = random.Random(21)
+        for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
+            write_day_swp(day, rng)
+        ctx = R.build_context("2026-10-17", policy=POLICY, with_health=False, now=NOW)
+        self.assertEqual(ctx["fill"], "swp")
+        self.assertEqual(ctx["best"], "G_decidedonly")
+        self.assertEqual(ctx["best_swp"], "G_decidedonly")
+        self.assertEqual(ctx["best_cons"], "D_size")               # cons would have said D
+        self.assertEqual(ctx["win"].best("swp"), "G_decidedonly")
+        page = R.render_html(ctx)
+        for needle in ("Best swp variant <b>G_decidedonly</b>", "Monte Carlo se",
+                       "Chosen on swp net", ">opt</th>", ">cons</th>", ">swp (sweep-aware)</th>",
+                       "+/- mc se", "1c fillers", "expected (cal. tails)",
+                       "swp = the sweep-aware fill model", "Mean of 8 Monte Carlo draws",
+                       "Expected (calibrated tails) = reward", "an ESTIMATE",
+                       "Best cons variant D_size", "swp sum", "swp /day", "cons sum", "opt sum",
+                       "days + and the day columns are swp net", "Pairs use the swp fill model",
+                       "Variant G_decidedonly (swp fills, the sweep-aware model; means over 8 Monte Carlo"):
+            self.assertIn(needle, page)
+        # the variants table: one group of columns per fill model, opt / cons / swp
+        self.assertLess(page.index(">opt</th>"), page.index(">cons</th>"))
+        self.assertLess(page.index(">cons</th>"), page.index(">swp (sweep-aware)</th>"))
+        subj = R.subject_line(ctx)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): best G_decidedonly net +$"),
+                        subj)
+        self.assertIn("/day on swp (reward", subj)
+        txt = R.render_text(ctx)
+        self.assertIn("G_decidedonly (swp)", txt)
+        self.assertIn("Monte Carlo se", txt)
+        self.assertIn("expected at calibrated tails", txt)
+        # aggregates: Monte Carlo se adds in quadrature, net_cal and fillers sum
+        a = ctx["agg"]["G_decidedonly|swp"]
+        self.assertAlmostEqual(a["net_se"], math.sqrt(24) * 2.0 / math.sqrt(8), places=4)
+        self.assertAlmostEqual(a["net_cal"], a["net"] + 24 * 1.5, places=4)
+        self.assertEqual(ctx["agg"]["D_size|swp"]["filler_contracts"], 24 * 900.0)
+        self.assertIsNone(ctx["agg"]["D_size|cons"]["net_se"])
+        self.assertAlmostEqual(ctx["win"].mc_se("G_decidedonly|swp"),
+                               math.sqrt(72) * 2.0 / math.sqrt(8), places=4)
+
+    def test_rules_compare_on_swp(self):
+        rng = random.Random(23)
+        for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
+            write_day_swp(day, rng)
+        ctx = R.build_context("2026-10-17", policy=POLICY, with_health=False, now=NOW)
+        s = by_id(ctx["suggestions"])
+        # B-A is +3 on swp as on cons: keep the window
+        self.assertIn("keep", s["window"]["title"])
+        self.assertAlmostEqual(s["window"]["usd"], 72.0, delta=8)
+        # D-B: +2 an event on cons, -10 on swp -> the rule says it loses
+        self.assertIn("loses", s["size"]["title"])
+        self.assertLess(s["size"]["usd"], -200)
+        self.assertFalse(s["size"]["suppressed"])
+        # the sweep gap on the swp-best variant (G has no fillers: cons ~ -0.1, swp ~ +4)
+        self.assertIn("Sweep risk on G_decidedonly", s["fillgap"]["title"])
+        self.assertIn("cons - swp on G_decidedonly", s["fillgap"]["evidence"])
+        # F trails the swp-best G
+        self.assertIn("trails G_decidedonly", s["full"]["title"])
+        self.assertFalse([n for n in ctx["notes"] if "No swp results" in n])
+
+    def test_hour_rule_on_a_decided_only_best_names_quote_hours(self):
+        rng = random.Random(31)
+        for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
+            write_day_swp(day, rng, losing_hours=(2, 3))
+        pol_ = R.Policy(dict(DEFAULT_POLICY, live=True, quote_hours_et=None),
+                        dict(VARIANTS, G_decidedonly={"decided": True, "q_live": 0,
+                                                      "live": False}))
+        ctx = R.build_context("2026-10-17", policy=pol_, with_health=False, now=NOW)
+        self.assertEqual(ctx["best"], "G_decidedonly")
+        s = by_id(ctx["suggestions"])
+        self.assertFalse(s["hours"]["suppressed"])
+        self.assertIn("02, 03", s["hours"]["title"])
+        keep = [h for h in range(24) if h not in (2, 3)]
+        self.assertEqual(s["hours"]["change"],
+                         "stop quoting those settle hours: quote_hours_et all -> "
+                         + "[" + ",".join(str(h) for h in keep) + "]")
+
+    def test_week_verdict_on_swp(self):
+        rng = random.Random(25)
+        for i in range(7):
+            write_day_swp((_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat(), rng,
+                          hours=range(6))
+        ctx = R.build_context("2026-10-21", policy=POLICY, with_health=False, now=NOW)
+        w = ctx["week"]
+        self.assertEqual(w["fill"], "swp")
+        self.assertEqual(w["best"], "G_decidedonly")
+        self.assertEqual(w["verdict"], "EXTEND")      # positive every day, ~$24/day < $500
+        self.assertEqual(w["pos"], 7)
+        self.assertTrue(any(r.startswith("Fill model: swp") and "Monte Carlo se" in r
+                            and "expected at calibrated tails" in r for r in w["risks"]),
+                        w["risks"])
+        self.assertIn("-- week: EXTEND", R.subject_line(ctx))
+
+    def test_older_output_without_swp_falls_back_to_cons(self):
+        rng = random.Random(27)
+        write_day("2026-10-15", rng)
+        ctx = R.build_context("2026-10-15", policy=POLICY, with_health=False, now=NOW)
+        self.assertEqual(ctx["fill"], "cons")
+        self.assertEqual(ctx["best"], ctx["best_cons"])
+        self.assertIn("No swp results in the window", " ".join(ctx["notes"]))
+        page = R.render_html(ctx)
+        self.assertIn("Best cons variant", page)
+        self.assertIn("the headline uses cons", page)
+        self.assertNotIn(">swp (sweep-aware)</th>", page)
+        self.assertIn("/day on cons (reward", R.subject_line(ctx))
 
 if __name__ == "__main__":
     unittest.main()

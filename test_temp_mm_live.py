@@ -2107,5 +2107,102 @@ class TestPadHold(unittest.TestCase):
         self.assertTrue(all(o.price == 1 for o in bot.orders.values()))
 
 
+class TestQuoteHours(unittest.TestCase):
+    """Jack 2026-10-16, "1": FAV_night = favorite joins only, in the events
+    that settle 20:00-07:00 ET (policy quote_hours_et). The executor passes
+    the event's settle time (the ticker's hour) to decide(), which rests
+    nothing outside the hours -- the shadow sim's rule. EVENT settles at
+    09:00 ET (EDT)."""
+
+    @staticmethod
+    def writes(calls):
+        return [c for c in calls if c[0] in ("create", "amend", "decrease", "cancel",
+                                             "batch_cancel")]
+
+    def test_variant_names_and_env(self):
+        self.assertEqual(L.resolve_variant("FAV_night"), "FAV_night")
+        self.assertEqual(L.resolve_variant("FAV_only"), "FAV_only")
+        self.assertEqual(L.resolve_variant("F"), "F_full")          # FAV is not F
+        with self.assertRaises(ValueError):
+            L.resolve_variant("FAV")                                 # two FAV_* variants
+        env = {"TMM_QUOTE_HOURS_ET": "20, 21,22 23,0,1,2,3,4,5,6,7"}
+        self.assertEqual(L.policy_overrides_from_env(env),
+                         {"quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]})
+        self.assertEqual(L.policy_overrides_from_env({"TMM_QUOTE_HOURS_ET": "[9]"}),
+                         {"quote_hours_et": [9]})
+        for raw in ("all", "none"):
+            self.assertEqual(L.policy_overrides_from_env({"TMM_QUOTE_HOURS_ET": raw}),
+                             {"quote_hours_et": None})
+        for raw in ("24", "7.5", "x", "-1"):
+            with self.assertRaises(ValueError, msg=raw):
+                L.policy_overrides_from_env({"TMM_QUOTE_HOURS_ET": raw})
+        P = pol.make_policy("FAV_night", **L.policy_overrides_from_env(
+            {"TMM_QUOTE_HOURS_ET": "9"}))
+        pol._check_policy(P)
+        self.assertEqual(P["quote_hours_et"], [9])
+
+    def test_outside_the_hours_nothing_rests(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=True, variant="FAV_night")
+        self.assertEqual(L.event_settle_ts(EVENT), S)
+        self.assertEqual(pol.et_hour(S), 9)
+        started(bot, clock, t=OPEN + 125.0)
+        for dt in (126.0, 130.0, 200.0, 600.0, 1800.0):
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        self.assertEqual(self.writes(ex.calls), [])
+        self.assertEqual(bot.orders, {})
+        st = bot.status(clock.t)
+        self.assertEqual(st["quote_hours_et"], [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertFalse(st["events"][EVENT]["quote_hour"])
+        self.assertEqual(st["events"][EVENT]["guards"].get("off_hours"), 9)
+        samples = [r for r in rows(os.path.join(bot.dir, f"decisions_{L.utc_day(clock.t)}.jsonl"))
+                   if r.get("kind") == "sample"]
+        self.assertTrue(samples)
+        self.assertTrue(all(r["reason"] == "off_hours" and r["quote_hour"] is False
+                            for r in samples))
+        with open(os.path.join(bot.dir, f"tmm_{L.utc_day(clock.t)}.log"), encoding="utf-8") as f:
+            log = f.read()
+        self.assertEqual(log.count("outside quote_hours_et"), 1)     # logged once per event
+
+    def test_inside_the_hours_favorites_only(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(
+            live=True, variant="FAV_night", pol_over={"quote_hours_et": [8, 9]})
+        started(bot, clock, t=OPEN + 125.0)
+        for dt in (126.0, 150.0, 180.0, 200.0):
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        # the favorite joins of G at the reference, no 1c anything
+        self.assertEqual(sorted((c[1], c[2], c[3], c[4]) for c in ex.kinds("create")),
+                         [(T_HI, "yes", 95, 300), (T_LO, "no", 95, 300)])
+        self.assertTrue(bot.status(clock.t)["events"][EVENT]["quote_hour"])
+        self.assertFalse([o for o in bot.orders.values() if o.price == 1])
+
+    def test_hours_change_cancels_what_rests(self):
+        # a restart with a narrower TMM_QUOTE_HOURS_ET: what rests on an
+        # off-hours event is cancelled on the first decision (dry book)
+        bot, ex, feed, wx, fair, mails, clock = make_bot(live=False, variant="FAV_only")
+        started(bot, clock, t=OPEN + 125.0)
+        self.assertEqual(len(bot.orders), 2)
+        bot.P = dict(bot.P, quote_hours_et=[21])
+        bot.P_stale = L.stale_policy(bot.P)
+        clock.t = OPEN + 126.5
+        bot.step(clock.t)
+        self.assertEqual(bot.orders, {})
+
+    def test_dst_settle_hours_from_tickers(self):
+        # build_events takes the settle time from the ticker (fold 0 on the
+        # repeated 01:00); the policy's ET hour is DST-safe
+        P = pol.make_policy("FAV_night")
+        for ev, h, ok in (("KXTEMPMIAH-26NOV0101", 1, True), ("KXTEMPMIAH-26NOV0107", 7, True),
+                          ("KXTEMPMIAH-26NOV0108", 8, False), ("KXTEMPMIAH-26OCT3107", 7, True),
+                          ("KXTEMPMIAH-26OCT3108", 8, False)):
+            s = C.parse_event(ev)[1]
+            rows_ = [{"ticker": f"{ev}-T80.99", "event_ticker": ev, "floor_strike": 80.99,
+                      "status": "active", "open_time": C.iso(s - 3600), "close_time": C.iso(s)}]
+            info = L.build_events(rows_)[ev]
+            self.assertEqual(info.settle_ts, s)
+            self.assertEqual(pol.et_hour(info.settle_ts), h, ev)
+            self.assertEqual(pol.quote_hour_ok(P, info.settle_ts), ok, ev)
+
 if __name__ == "__main__":
     unittest.main()

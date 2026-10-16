@@ -373,7 +373,7 @@ class TestReviewFixes(SimTestBase):
         sh = sim._Shared(inp, FakeModel(), None)
         P = sim._resolve_variants({"T": dict(window_mode="none", decided=True,
                                              fair_guard=False)})["T"]
-        for fm in sim.FILL_MODELS:
+        for fm in ("opt", "cons"):
             ps = sim._Pass(sh, P, fm)
             n_chk = [0, 0]
 
@@ -678,6 +678,177 @@ class TestPadHold(SimTestBase):
         for fm in ("opt", "cons"):
             self.assertEqual(res["variants"][f"G0|{fm}"], res["variants"][f"Gh0|{fm}"])
 
+
+class TestSwpFillModel(SimTestBase):
+    """Jack 2026-10-16, "1": "ship the fixes + the sweep-aware report column,
+    and add favorite-only and overnight-favorite-only to the shadow". Every
+    variant gets "<variant>|swp" (temp_shadow_sweep's model, Monte Carlo with
+    fixed seeds) beside opt / cons. The fixture: a decided strike (index
+    73.4 F vs T80.99, NO the favorite) whose YES 1c level is empty, so G's
+    1c pad rests alone there (the hidden-sweep hazard applies) and recorded
+    1c taker clusters hit it."""
+
+    def setUp(self):
+        super().setUp()
+        self._draws = sim.SWP_DRAWS
+        self._seed = sim.SWP_SEED
+        sim.SWP_DRAWS = 3
+
+    def tearDown(self):
+        sim.SWP_DRAWS = self._draws
+        sim.SWP_SEED = self._seed
+
+    def _fixture(self, event=EVENT):
+        tk = f"{event}-T{K:.2f}"
+        write_fixture(event=event, temps=lambda m: DROP_C,
+                      books={tk: ({3: 300.0}, {95: 300.0})},
+                      trades=[(400.25, tk, "no", 1, 60.0), (1500.25, tk, "no", 1, 2000.0),
+                              (2500.25, tk, "no", 2, 40.0)],
+                      results={tk: "no"}, expiration_value=73.4)
+        return tk
+
+    def test_swp_for_every_variant_in_run_day(self):
+        self._fixture()
+        day = C.et_day(S)
+        out = sim.run_day(day, workers=1)
+        doc = [d for d in out if d["event"] == EVENT][0]
+        self.assertEqual(sim.FILL_MODELS, ("opt", "cons", "swp"))
+        self.assertEqual(set(doc["variants"]),
+                         {f"{v}|{f}" for v in sim.VARIANTS for f in sim.FILL_MODELS})
+        self.assertIn("FAV_only", sim.VARIANTS)
+        self.assertIn("FAV_night", sim.VARIANTS)
+        sw = doc["swp"]
+        cfg = sim.swp_config()["ident"]
+        self.assertEqual((sw["draws"], sw["rec_mode"], sw["channels"], sw["seed"]),
+                         (3, "level", "abc", "tmm-sweep-1"))
+        self.assertEqual(sw["hazard_id"], cfg["hazard_id"])
+        self.assertEqual(os.path.basename(sw["hazard_src"]), "temp_shadow_sweep_hazard.json")
+        self.assertEqual(os.path.basename(sw["tails_src"]), "temp_shadow_sweep_tails.json")
+        keys = TestSchemaAndDay.SCHEMA["variant"]
+        for v in sim.VARIANTS:
+            r = doc["variants"][f"{v}|swp"]
+            for k in keys + ["draws", "net_sd", "net_se", "draw_net", "swp_exact",
+                             "filler_contracts", "net_cal"]:
+                self.assertIn(k, r, (v, k))
+            self.assertEqual(r["draws"], 3)
+            self.assertEqual(len(r["draw_net"]), 3)
+            self.assertAlmostEqual(r["net"], sum(r["draw_net"]) / 3, places=3)
+            self.assertAlmostEqual(r["net"], r["reward"] + r["trading_pnl"] - r["fees"], places=4)
+            self.assertAlmostEqual(r["net_se"], r["net_sd"] / math.sqrt(3), places=5)
+        g0 = doc["variants"]["G0_nohold|swp"]
+        # sweepers took G0's 1c pad (the cons model never filled the 2,000 sweep fully)
+        self.assertGreater(g0["filler_contracts"], doc["variants"]["G0_nohold|cons"]["contracts"])
+        self.assertGreater(g0["sweep_src"].get("haz", 0) + g0["sweep_src"].get("rec", 0), 0)
+        # a cached file is reused while the swp configuration is the same ...
+        path = os.path.join(C.DATA_ROOT, "sim", day, f"{EVENT}.json")
+        m0 = os.path.getmtime(path)
+        time.sleep(0.05)
+        sim.run_day(day, workers=1)
+        self.assertEqual(os.path.getmtime(path), m0)
+        # ... and re-simmed when the draw count (or the hazard / tails table) changes
+        sim.SWP_DRAWS = 2
+        again = sim.run_day(day, workers=1)
+        self.assertGreater(os.path.getmtime(path), m0)
+        self.assertEqual(again[0]["variants"]["G0_nohold|swp"]["draws"], 2)
+        self.assertEqual(again[0]["variants"]["G0_nohold|swp"]["draw_net"],
+                         g0["draw_net"][:2])            # draw k = the same arrivals
+
+    def test_reproducible_with_fixed_seeds(self):
+        self._fixture()
+        vs = ["G0_nohold", "G_decided_only", "FAV_only"]
+        a = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        b = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        for v in vs:
+            self.assertEqual(a["variants"][f"{v}|swp"], b["variants"][f"{v}|swp"], v)
+        self.assertGreater(a["variants"]["G0_nohold|swp"]["net_sd"], 0.0)   # the draws differ
+        sim.SWP_SEED = "another-seed"
+        c = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self.assertNotEqual(c["variants"]["G0_nohold|swp"]["draw_net"],
+                            a["variants"]["G0_nohold|swp"]["draw_net"])
+        self.assertEqual(c["variants"]["FAV_only|swp"], a["variants"]["FAV_only|swp"])
+        for fm in ("opt", "cons"):               # the deterministic models never see the seed
+            self.assertEqual(c["variants"][f"G0_nohold|{fm}"], a["variants"][f"G0_nohold|{fm}"])
+
+    def test_shortcuts_are_exact(self):
+        import temp_shadow_sweep as SW
+        self._fixture()
+        inp = sim.load_event_inputs(EVENT)
+        sh = SW.SweepShared(inp, FakeModel(), None)
+        Ps = sim._resolve_variants(None)
+        cfg = sim.swp_config(4)
+        fast = sim.run_swp(sh, Ps, cfg, screen=True)
+        full = sim.run_swp(sh, Ps, cfg, screen=False)
+        for v in Ps:
+            self.assertEqual(json.dumps(fast[v], sort_keys=True),
+                             json.dumps(full[v], sort_keys=True), v)
+        self.assertTrue(fast["FAV_only"]["swp_exact"])
+        self.assertFalse(fast["G0_nohold"]["swp_exact"])
+        # opt / cons on the sweep's shared state = on the sim's own
+        sh0 = sim._Shared(inp, FakeModel(), None)
+        for v in ("G0_nohold", "F_full", "B_live300_pull"):
+            for fm in ("opt", "cons"):
+                self.assertEqual(sim._Pass(sh, Ps[v], fm).run(), sim._Pass(sh0, Ps[v], fm).run())
+
+    def test_fav_only_places_no_1c_orders(self):
+        import temp_shadow_sweep as SW
+        self._fixture()
+        inp = sim.load_event_inputs(EVENT)
+        sh = SW.SweepShared(inp, FakeModel(), None)
+        Ps = sim._resolve_variants(["FAV_only", "G0_nohold"])
+        placed = {}
+        for name in Ps:
+            for fm in ("opt", "cons", "swp"):
+                ps = (SW.VPass(sh, Ps[name], "swp", hazard=sim.swp_config()["hazard"],
+                               cands=SW.hazard_candidates(sh, 0, 0.3))
+                      if fm == "swp" else sim._Pass(sh, Ps[name], fm))
+                seen = placed.setdefault((name, fm), [])
+                orig = ps._activate
+
+                def act(item, _orig=orig, _seen=seen):
+                    _seen.extend((side, op, p) for side, op, p, s in item[2] if op in
+                                 ("place", "inc"))
+                    _orig(item)
+                ps._activate = act
+                ps.run()
+        for fm in ("opt", "cons", "swp"):
+            fav = placed[("FAV_only", fm)]
+            self.assertTrue(fav, fm)                                   # it quotes ...
+            self.assertFalse([x for x in fav if x[2] == 1], fm)        # ... never at 1c
+            self.assertTrue([x for x in fav if x[0] == "no" and x[2] == 95], fm)  # the favorite
+            self.assertTrue([x for x in placed[("G0_nohold", fm)] if x[2] == 1], fm)
+        res = sim.run_event(EVENT, variants=["FAV_only"], model=FakeModel())
+        v = res["variants"]
+        self.assertTrue(v["FAV_only|swp"]["swp_exact"])
+        self.assertEqual(v["FAV_only|swp"]["filler_contracts"], 0.0)
+        for k in ("reward", "contracts", "trading_pnl", "net", "quoted_secs"):
+            self.assertEqual(v["FAV_only|swp"][k], v["FAV_only|cons"][k], k)
+
+    def test_fav_night_quotes_only_its_et_settle_hours_across_dst(self):
+        """FAV_night quotes the events SETTLING 20:00-07:00 ET. Around the
+        2026-11-01 switch (EDT -> EST at 06:00Z) the 07:00 events settle at
+        11:00Z (10/31) and 12:00Z (11/01): both quoted; the 08:00 ones
+        (12:00Z / 13:00Z) are not; the repeated 01:00 (the ticker's first,
+        05:00Z) is."""
+        cases = (("KXTEMPMIAH-26OCT3107", True), ("KXTEMPMIAH-26OCT3108", False),
+                 ("KXTEMPMIAH-26NOV0101", True), ("KXTEMPMIAH-26NOV0107", True),
+                 ("KXTEMPMIAH-26NOV0108", False), ("KXTEMPMIAH-26NOV0121", True))
+        for ev, _ in cases:
+            self._fixture(ev)
+        self.assertEqual(C.parse_event("KXTEMPMIAH-26NOV0107")[1], C.parse_iso("2026-11-01T12:00:00Z"))
+        self.assertEqual(C.parse_event("KXTEMPMIAH-26OCT3108")[1], C.parse_iso("2026-10-31T12:00:00Z"))
+        for ev, quoted in cases:
+            res = sim.run_event(ev, variants=["FAV_only", "FAV_night"], model=FakeModel())
+            v = res["variants"]
+            for fm in sim.FILL_MODELS:
+                fo, fn = v[f"FAV_only|{fm}"], v[f"FAV_night|{fm}"]
+                self.assertGreater(fo["quoted_secs"], 0, (ev, fm))
+                if quoted:
+                    self.assertEqual(fn, fo, (ev, fm))
+                else:
+                    self.assertEqual((fn["quoted_secs"], fn["reward"], fn["contracts"]),
+                                     (0, 0.0, 0.0), (ev, fm))
+            self.assertEqual(res["policies"]["FAV_night"]["quote_hours_et"],
+                             [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])
 
 if __name__ == "__main__":
     unittest.main()

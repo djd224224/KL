@@ -4,7 +4,7 @@ Jack, 2026-10-15: "yes build F, which is a superset of G right?" This followed t
 
 `temp_mm_live.py` quotes Kalshi's hourly Miami temperature markets with the same policy code the shadow replays (`temp_mm_policy.decide`). The shadow's numbers therefore describe the code that trades.
 
-- **Variants:** it runs F by default. `--variant G` (decided strikes only, with the 180 s pad hold since 10/16) or `--variant J` (decided, favorite size 100) switches it, and so does any `temp_mm_policy.VARIANTS` key. `--variant G0` is G without the pad hold.
+- **Variants:** it runs F by default. `--variant G` (decided strikes only, with the 180 s pad hold since 10/16) or `--variant J` (decided, favorite size 100) switches it, and so does any `temp_mm_policy.VARIANTS` key. `--variant G0` is G without the pad hold. `--variant FAV_only` quotes only G's favorite joins (no 1c filler of any kind) and `--variant FAV_night` does the same in the events settling 20:00-07:00 ET (Jack 2026-10-16, "1"; see Quote hours).
 - **Policy switches:** every policy setting is an env var, for example `TMM_Q_LIVE=300` or `TMM_EVENT_WCL_CAP=500`.
 
 **It is DRY by default.** It reads live data, logs `[DRY] would ...` for every create, amend, decrease and cancel, and keeps a dry book. It never sends an order unless started with `--live --subaccount N`.
@@ -66,6 +66,20 @@ Jack, 2026-10-16: "hold the pads for the first 3 minutes of each hour going forw
 | 300 s | $3,378 | $3,546 |
 
 These are other traders' habits over 35 hours, so they can change. The live hour 26OCT1610 is not in these numbers: it had not settled when they were run, and its recording holds the bot's own orders and fills.
+
+## Quote hours (10/16)
+
+Jack, 2026-10-16 ("1"): "ship the fixes + the sweep-aware report column, and add favorite-only and overnight-favorite-only to the shadow". Under the sweep-aware fill model (swp, TEMP_SHADOW.md) every variant that rests 1c fillers loses in expectation, because sweepers take the fillers within seconds, as they took live G's on 10/16. Only favorite joins without fillers are positive (about +$13 an hour, almost all of it in the events settling 20:00-07:00 ET).
+
+**What it does.** The policy key is `quote_hours_et`: a list of ET clock hours, `None` (the default) for every hour.
+- An event is quoted only when the ET hour of its SETTLEMENT is listed. The settlement is `EventInfo.settle_ts`, the ticker's hour: `KXTEMPMIAH-26OCT1607` settles at 07:00 ET, hour 7.
+- Outside the hours `temp_mm_policy.decide()` fails every market's program test (`diag.reason` = `off_hours`), so nothing rests on that event and anything resting there is cancelled on the next decision. The shadow sim applies the same rule, so its numbers describe this behaviour.
+- `FAV_night` = `FAV_only` + `quote_hours_et` `[20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]`. `FAV_only` = live off, decided on, `q_pad` 0, `qual_pads` off, `near_decided_half` off: the favorite joins of G and nothing at 1c.
+- The ET hour is `temp_mm_policy.et_hour`, computed without tz files (the policy does no I/O). US Eastern is EDT from the second Sunday of March 07:00Z to the first Sunday of November 06:00Z. It agrees with `zoneinfo` hour by hour over 2024-2030 (a test). On the 2026-11-01 fall-back, the 07:00 event settles at 12:00Z (EST) and is quoted, while 08:00 (13:00Z) is not. The repeated 01:00 takes the ticker's first occurrence (05:00Z, `temp_shadow_common.parse_event` fold 0). The existing close_time-vs-ticker guard still refuses an event whose API close disagrees with its ticker's hour.
+- `TMM_QUOTE_HOURS_ET="20,21,22,23,0,1,2,3,4,5,6,7"` (commas or spaces) sets it on any variant; `all` or `none` means every hour. Anything that is not a whole hour 0-23 refuses to start (`config error`).
+- Visibility: the start line names the hours. An off-hours event is logged once (`... settles 09:00 ET, outside quote_hours_et [...]: not quoted`). It also gets guard `off_hours` (with the hour), `status.json` `quote_hours_et` plus per event `quote_hour`, and decision samples with `reason: off_hours` and `quote_hour: false`.
+
+`test_temp_mm_live.TestQuoteHours` pins this on the fake clock: no write at all for the 09:00 ET event under FAV_night, the favorites only (no 1c) with the hour listed, a narrower list cancelling what rests, the env parsing, and settle hours from tickers across the Nov 1 switch.
 
 ## What it does
 
@@ -151,6 +165,7 @@ The plan also follows these rules:
 | no model fair for a market (`TMM_REQUIRE_FAIR`) | no quotes there. The policy's book-mid fallback is never used live. |
 | no program known for a market (`TMM_REQUIRE_PROGRAM`) | no quotes there |
 | within `pad_hold_open_s` of the event's open (G: 180 s) | no 1c longshot or qualification pads; favorites, live and near quotes as usual |
+| the event's settle hour (ET) not in `quote_hours_et` (FAV_night: 20-07) | nothing rests on that event; what rests is cancelled (guard `off_hours`, logged once) |
 | within 1 s of the close | no quotes |
 | the API's close_time is not the ticker's hour (a DST fall-back hour?) | that event is not quoted (logged once); the model would price the wrong hour |
 | a market suspect of a missed fill (below) | no new orders there (cancels and cuts still go) |
@@ -228,7 +243,7 @@ Live files go in `C:\Users\jackd\Documents\KL-data\temp-mm\`. A dry run writes t
 | `orders_<UTC day>.jsonl` | `place` / `amend` / `renew` / `decrease` / `cancel` / `gone` / `expired` / `reject` (with Kalshi's error body) / `uncertain` / `adopt` (an uncertain create found resting) / `cancel_elsewhere` (a mis-booked order cancelled where it booked) / `*_error`, with mode, variant, ticker, side, price, size, order and client ids, tag, reason and latency |
 | `fills_<UTC day>.jsonl` | every fill: source ws / rest, side, price, count, fee, order id, trade id, position after |
 | `decisions_<UTC day>.jsonl` | one sample per market per minute (fair, slope, latest station minute, class, rule, book best and reference, desired orders and tags, resting, guards, position, event worst-case loss of the filled positions and `resting_wcl`, the adverse case of what rests, and whether the market is suspect), plus a `pull` / `restore` row at each landing-window edge with the second of the minute |
-| `status.json` | heartbeat every 5 s: mode, variant, overrides, loop p50 / p95 / max, wx source and lag, feed, per event (orders, resting size by tag, P&L, guards, fairs), positions, day P&L, cash, guard / op / deferral counters, REST counts (last minute and total), write backoff and transient failures, suspect markets, uncertain creates, the confirm hold, and the model's sources and history span |
+| `status.json` | heartbeat every 5 s: mode, variant, overrides, `quote_hours_et`, loop p50 / p95 / max, wx source and lag, feed, per event (orders, resting size by tag, P&L, guards, fairs, `quote_hour`), positions, day P&L, cash, guard / op / deferral counters, REST counts (last minute and total), write backoff and transient failures, suspect markets, uncertain creates, the confirm hold, and the model's sources and history span |
 | `summary.jsonl` | one line per ET day: ops, fills, contracts, P&L, halted events |
 | `state.json` | halted events and settlement results, so they survive a restart. Positions and day P&L are rebuilt from the fills logs and the REST fills sweep on start. |
 | `launcher-<date>.log` | the launcher's own log |
@@ -236,13 +251,13 @@ Live files go in `C:\Users\jackd\Documents\KL-data\temp-mm\`. A dry run writes t
 
 ## Comparing with the shadow
 
-The shadow keeps simulating F, G (with the pad hold), G0_nohold and J on the same hours.
+The shadow keeps simulating F, G (with the pad hold), G0_nohold, J, FAV_only and FAV_night on the same hours, under three fill models since 10/16: opt, cons and swp, the sweep-aware model that reproduced G's live hour. The daily report's headline is swp.
 
 **Per hour:** compare `KL-data\temp-shadow\sim\<ET day>\<EVENT>.json`, variant `F_full|cons` and `|opt` (reward, contracts, trading P&L), with the live run:
 - contracts and P&L at settlement come from `fills_<day>.jsonl` and `summary.jsonl`;
 - rewards come from Kalshi's rewards statement (the subaccount's credits).
 
-Live fills should sit between the `cons` and `opt` fill models. Live P&L per contract should track the sim's `markouts`.
+Live fills at prices above 1c should sit between the `cons` and `opt` fill models. Live 1c fills should track `swp` (`filler_contracts`, `sweep_src`): on 26OCT1610 swp predicted 9,271 against 10,006 live, while cons predicted 3,264. Live P&L per contract should track the sim's `markouts`.
 
 **Decision parity:** run the sim's F pass on the same hour with fills off, and compare its desired orders with the executor's `decisions` samples at the same instants: class, price per side, size per side. This was done in the dry smoke run below, using a copy of the recording. On live, expect differences only where:
 - live fills move the risk caps;
@@ -307,7 +322,7 @@ No live write has ever been sent: the bot was only ever run DRY. The request sha
 
 ## Tests
 
-`test_temp_mm_live.py` uses no network. `TestPadHold` pins the 10/16 pad hold: no pad or qualification creates before open + 180 s, both on the first wake after it, no churn afterwards, the event's `open_time` as the start, and no delay to a favorite's move. The harness is a fake exchange (whose cancels and resting reads reach only the named subaccount, as Kalshi's `subaccount` parameter does), fake feed, fake station rows and a fake fair drive `Bot.step()` on a fake clock. The `TestReview*` classes pin each fix of the 10/16 review (named `test_f<N>_…`): unseen fills never re-quoted and halting, Kalshi's fill count in the risk inputs, cancels that cannot reach or do not land, ambiguous creates adopted, refused urgent reprices cancelled, expiry only on renewals, size cuts with a reprice, `--cancel-all` under the lock, dry halts, 429 storms and outages without a halt, confirm holds, GetOrder without a subaccount, 409 not gone, fill prices, batched guard moves, the default-model refusal, history seeding and the 60-min span, the poller cadence, results after a restart, per-event pruning and the settle/close guard. It also covers:
+`test_temp_mm_live.py` uses no network. `TestQuoteHours` pins `quote_hours_et` (FAV_night) on the fake clock. `TestPadHold` pins the 10/16 pad hold: no pad or qualification creates before open + 180 s, both on the first wake after it, no churn afterwards, the event's `open_time` as the start, and no delay to a favorite's move. The harness is a fake exchange (whose cancels and resting reads reach only the named subaccount, as Kalshi's `subaccount` parameter does), fake feed, fake station rows and a fake fair drive `Bot.step()` on a fake clock. The `TestReview*` classes pin each fix of the 10/16 review (named `test_f<N>_…`): unseen fills never re-quoted and halting, Kalshi's fill count in the risk inputs, cancels that cannot reach or do not land, ambiguous creates adopted, refused urgent reprices cancelled, expiry only on renewals, size cuts with a reprice, `--cancel-all` under the lock, dry halts, 429 storms and outages without a halt, confirm holds, GetOrder without a subaccount, 409 not gone, fill prices, batched guard moves, the default-model refusal, history seeding and the 60-min span, the poller cadence, results after a restart, per-event pruning and the settle/close guard. It also covers:
 - the order plan: create, cancel, decrease, increase, amend in place, the crossing fallback, TTL renewal and the size tolerance;
 - dry mode placing nothing;
 - live refused without `--subaccount`;

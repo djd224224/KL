@@ -71,6 +71,17 @@ loop_s = 250 ms and at once on a new station row, a book change or a fill):
                       the pads are new creates (never debounced; paced like
                       any create); 1c pads do not count in the debounce's
                       price key, so they never delay a favorite's move
+  quote hours         policy quote_hours_et (FAV_night: settle hours 20-23,
+                      0-7 ET; Jack 2026-10-16, "1"): an event whose
+                      settlement (EventInfo.settle_ts, the ticker's hour)
+                      falls in an ET hour not listed rests nothing at all --
+                      decide() fails every market's program test (reason
+                      "off_hours"), so anything resting there is cancelled;
+                      the same rule the shadow sim applies. temp_mm_policy.
+                      et_hour is DST-safe (no tz files); logged once per
+                      event, guard "off_hours", status events.*.quote_hour.
+                      TMM_QUOTE_HOURS_ET="20,21,22,23,0,1,2,3,4,5,6,7"
+                      (or "all" / "none" for every hour) overrides it
 
 Risk and safety (TEMP_MM_LIVE.md has every default):
   pos_cap / event_wcl_cap   the policy's pre-trade sizing on FILLED positions
@@ -272,6 +283,21 @@ _CFG_NAMES = {f.name for f in fields(Config)}
 assert not (_CFG_NAMES & set(pol.DEFAULT_POLICY)), "Config / policy env names collide"
 
 
+def parse_hours(raw: Any) -> Optional[List[int]]:
+    """TMM_QUOTE_HOURS_ET: "20,21,0,1" (commas / spaces) -> [20, 21, 0, 1];
+    "", "all", "none", "null" -> None (every hour). ValueError on anything
+    that is not a whole hour 0..23."""
+    s = str(raw).strip().strip("[]").strip()
+    if s.lower() in ("", "all", "none", "null", "any"):
+        return None
+    out = []
+    for part in s.replace(",", " ").split():
+        if not part.isdigit() or not 0 <= int(part) <= 23:
+            raise ValueError(f"TMM_QUOTE_HOURS_ET: {part!r} is not an ET hour 0..23")
+        out.append(int(part))
+    return out
+
+
 def _parse_like(default: Any, raw: str) -> Any:
     s = str(raw).strip()
     if isinstance(default, bool):
@@ -301,7 +327,7 @@ def policy_overrides_from_env(environ: Optional[Dict[str, str]] = None) -> Dict[
         raw = env.get("TMM_" + k.upper())
         if raw is None or str(raw).strip() == "":
             continue
-        out[k] = _parse_like(dv, raw)
+        out[k] = parse_hours(raw) if k == "quote_hours_et" else _parse_like(dv, raw)
     return out
 
 
@@ -2014,6 +2040,7 @@ class Bot:
         self.feed_connects: Optional[int] = None
         self.mailed_notes: Set[str] = set()
         self.settle_logged: Set[str] = set()
+        self.hours_logged: Set[str] = set()       # events logged as outside quote_hours_et
         # pacing
         t0 = clock()
         self.wbucket = Bucket(cfg.write_rate, cfg.write_burst, t0)
@@ -2145,6 +2172,7 @@ class Bot:
                  f"subaccount {self.sub}, policy overrides {self.policy_overrides or '{}'}, "
                  f"q_live {self.P['q_live']}, decided {self.P['decided']}, skew {self.P['skew']}, "
                  f"pos_cap {self.P['pos_cap']}, event_wcl_cap {self.P['event_wcl_cap']}, "
+                 f"quote hours (ET settle) {self.P.get('quote_hours_et') or 'all'}, "
                  f"loss halts ${cfg.event_loss_halt:g} event / ${cfg.daily_loss_halt:g} day, "
                  f"TTL {cfg.order_ttl_s:g}s (pads {cfg.pad_ttl_s:g}s), data {self.dir}"
                  + (f", orders via {getattr(self.ex, 'api_base', '?')}" if self.live else ""), now)
@@ -2614,6 +2642,7 @@ class Bot:
                   self.resting_wcl, self.pad_hold_prev):
             for k in [k for k in d if k not in q]:
                 d.pop(k, None)
+        self.hours_logged &= q
         for e in [e for e, ts in self.traded.items()
                   if (self.events.get(e).close_ts if e in self.events else ts) < now - 3600.0]:
             self.traded.pop(e, None)
@@ -3094,6 +3123,14 @@ class Bot:
                 self.settle_logged.add(ev.event)
                 self.log(f"! {ev.event}: close_time {C.iso(ev.close_ts)} vs the ticker's hour "
                          f"{C.iso(ev.settle_ts)} ({ev.settle_gap_s:+.0f} s): not quoted", now)
+        if not pol.quote_hour_ok(self.P, ev.settle_ts):
+            # quote_hours_et: decide() rests nothing on this event (the
+            # policy's own test, below); named here for the log and status
+            guards["off_hours"] = pol.et_hour(ev.settle_ts)
+            if ev.event not in self.hours_logged:
+                self.hours_logged.add(ev.event)
+                self.log(f"{ev.event}: settles {pol.et_hour(ev.settle_ts):02d}:00 ET, outside "
+                         f"quote_hours_et {self.P.get('quote_hours_et')}: not quoted", now)
         P = self.P_stale if fr.stale else self.P
         states: List[pol.MarketState] = []
         meta: Dict[str, dict] = {}
@@ -3155,7 +3192,8 @@ class Bot:
                 self.marks[t] = f
         lat = float(P["order_latency_s"])
         ctx = pol.EventContext(now=now, close_ts=ev.close_ts, rest_from=now + lat,
-                               rest_until=now + lat + cfg.pull_lead_s, open_ts=ev.open_ts)
+                               rest_until=now + lat + cfg.pull_lead_s, open_ts=ev.open_ts,
+                               settle_ts=ev.settle_ts)
         dec = pol.decide(P, ctx, states)
         self.resting_wcl[ev.event] = dec.resting_wcl
         for g in guards:
@@ -3226,7 +3264,8 @@ class Bot:
             "guards": sorted(set(guards) | set(m["guards"])),
             "pos": [mp.yes_q, mp.no_q, round(mp.cost, 2)],
             "wcl": round(dec.worst_case_loss, 2), "resting_wcl": round(dec.resting_wcl, 2),
-            "pad_hold": dec.pad_hold, "suspect": md.ticker in self.suspect}, now)
+            "pad_hold": dec.pad_hold, "quote_hour": dec.quote_hour,
+            "suspect": md.ticker in self.suspect}, now)
 
     # ---- execution -------------------------------------------------------
     def _execute(self, ops: List[Op], now: float) -> None:
@@ -3848,6 +3887,7 @@ class Bot:
                 "guards": self.guards_now.get(ev.event, {}),
                 "resting_wcl": round(self.resting_wcl.get(ev.event, 0.0), 2),
                 "pad_hold_until": C.iso(ev.open_ts + hold_s) if hold_s > 0 else None,
+                "quote_hour": pol.quote_hour_ok(self.P, ev.settle_ts),
                 "fair": ({t: round(f, 4) for t, f in fr.fairs.items()} if fr else {}),
                 "wx_latest_minute": (C.iso(fr.latest_minute_ms / 1000.0)
                                      if fr and fr.latest_minute_ms else None)}
@@ -3863,6 +3903,7 @@ class Bot:
             "state": state or ("halted" if self.halt_reason else "running"),
             "halt_reason": self.halt_reason, "variant": self.variant,
             "policy_overrides": self.policy_overrides, "subaccount": self.sub, "pid": os.getpid(),
+            "quote_hours_et": self.P.get("quote_hours_et"),
             "started": C.iso(self.started), "now": C.iso(now), "rx": now,
             "loop": {"steps": self.steps, "decisions": self.decides, "p50_ms": q(lat, 0.5),
                      "p95_ms": q(lat, 0.95), "max_ms": q(lat, 1.0),

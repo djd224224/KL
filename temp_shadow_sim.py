@@ -8,13 +8,35 @@ scores, per policy variant and fill model, what the policy would have earned in
 liquidity rewards and won or lost on fills. It never places an order.
 
 Public API (the Interfaces contract):
-    DEFAULT_POLICY, VARIANTS, FILL_MODELS
+    DEFAULT_POLICY, VARIANTS, FILL_MODELS ("opt", "cons", "swp")
     run_event(event_ticker, variants=None, fill_models=FILL_MODELS, model=None,
-              until_ts=None) -> dict          (sim output schema)
+              until_ts=None, draws=None) -> dict          (sim output schema)
     run_day(et_day, variants=None, force=False, workers=None) -> List[dict]
 CLI:
     python temp_shadow_sim.py day --day YYYY-MM-DD [--force] [--workers N]
     python temp_shadow_sim.py event --event EVT [--variants A,B] [--write]
+
+Fill models (Jack 2026-10-16, "1": "ship the fixes + the sweep-aware report
+column"): opt and cons below, and swp = cons plus sweepers
+(temp_shadow_sweep, validated on the live hour 26OCT1610): recorded taker
+clusters at a side's 1c level fill our 1c orders (all of them when the taker
+cleared the level, else price-time priority behind the external 1c size);
+hidden IOC sweeps arrive at the calibrated hazard while we rest alone at 1c
+(Monte Carlo, SWP_DRAWS draws with fixed seeds, the same arrivals for every
+variant); a new 99c bid opposite crosses our 1c. "<variant>|swp" has the opt /
+cons schema (means over the draws) plus draws, net_sd, net_se (the Monte
+Carlo standard error of net), draw_net, filler_contracts, sweep_src,
+haz_events, swp_exact (a variant that never rests a 1c order is exact in one
+draw) and net_cal / net_cal_tlo / net_cal_thi (an ESTIMATE: every fill marked
+at the realized longshot rate of its model bucket given a taker hit a bid at
+that price, temp_shadow_sweep.TailCal; a 10-90% fair keeps the model's own
+value). Hazard: <TEMP_SHADOW_DATA>/model/sweep_hazard.json if present, else
+the repo's temp_shadow_sweep_hazard.json (the 10/16 pre-live fit); tails the
+same with sweep_tails.json / temp_shadow_sweep_tails.json. Recalibrate:
+temp_shadow_sweep.py calibrate, then export --hazard <out>/hazard.json --to
+<TEMP_SHADOW_DATA>/model/sweep_hazard.json (TEMP_SHADOW.md); the cache key
+holds the hazard / tails identities and the draw count, so a new table
+re-sims the window. The output's top-level "swp" block names them.
 
 Mechanics (all times are exchange/epoch seconds; our rx ~ exchange time):
   * Ticks: one per second from open to close. Tick i sits at T_i = sec0+i+0.5,
@@ -70,6 +92,10 @@ Mechanics (all times are exchange/epoch seconds; our rx ~ exchange time):
   * Classes: live = fair 10-90c (P.live); near = 3-10% / 90-97%, quoted as
     live at half size only when P.decided and P.near_decided_half (spec
     "Decided strikes"), labelled "decided" in by_class; the rest decided.
+  * Quote hours (P.quote_hours_et, FAV_night): an event whose settlement's
+    ET hour (temp_mm_policy.quote_hour_ok on the ticker's hour, DST-safe) is
+    not listed rests nothing all hour -- every market fails the program test,
+    the live executor's rule.
   * Pad hold (P.pad_hold_open_s, G since 10/16): a decision whose orders
     would start resting (t + order_latency_s) before the event's open +
     the hold rests no 1c longshot / qualification pads (pol.pad_hold_flag,
@@ -89,10 +115,12 @@ Definitions used in the output beyond the schema text:
                none reach 55 min before open).
   depth3c_median   median over strike-seconds of the mean per-side depth
                    within 3c of that side's best bid (book without us).
-Extra keys (top level): policies, flags, runtime_s, sim_version; coverage adds
-fair_missing_frac, programs_src and wx_rows_lookback. run_day reuses a
-sim file only when it holds every requested variant with the same overrides
-and this SIM_VERSION.
+Extra keys (top level): policies, flags, runtime_s, sim_version, fill_models,
+swp (draws, rec_mode, channels, seed, hazard_id / hazard_src / hazard_built /
+lam_max, tails_id / tails_src); coverage adds fair_missing_frac,
+programs_src and wx_rows_lookback. run_day reuses a sim file only when it
+holds every requested variant x fill model with the same overrides, this
+SIM_VERSION and the same swp configuration (draws, hazard, tails).
 """
 from __future__ import annotations
 
@@ -112,7 +140,7 @@ import temp_shadow_common as C
 import temp_shadow_model as tmodel
 import temp_shadow_scoring as scoring
 
-SIM_VERSION = "5"   # 2: 75-min wx lookback, fair per wx update, relative size
+SIM_VERSION = "6"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # cuts + projected belief, near strikes only with decided,
                     # pre-trade worst-case-loss sizing (10/14 review fixes)
                     # 3: guard buffer from FairModel.slopes (mixture slope);
@@ -125,12 +153,28 @@ SIM_VERSION = "5"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # merged with it: our live orders out of the books and
                     # tape from 10/16 13:00Z), so the 10/16 files simmed
                     # at 4 without it re-sim
+                    # 6: the swp fill model for every variant (Monte Carlo,
+                    # temp_shadow_sweep), FAV_only / FAV_night and
+                    # quote_hours_et (Jack 2026-10-16, "1"); opt / cons
+                    # numbers of the earlier variants unchanged
 
 # The policy lives in temp_mm_policy (the live executor runs the same code);
 # re-exported here for the report and older callers.
 DEFAULT_POLICY = pol.DEFAULT_POLICY
 VARIANTS = pol.VARIANTS
-FILL_MODELS = ("opt", "cons")
+FILL_MODELS = ("opt", "cons", "swp")
+# swp (temp_shadow_sweep): Monte Carlo draws per event. Measured 10/16 on the
+# report task's 2 workers (a 22-event day: 398 s at 6 draws, 485 s at 8): a
+# full re-sim of the report's longest window (10/15-10/23, 200 events, after
+# a SIM_VERSION / grid / swp-table change) takes ~60 min at 6 against the
+# task's 2 h limit (~73 min at 8); TEMP_SHADOW.md "Fill models". The Monte
+# Carlo standard error is in every swp result (net_se).
+SWP_DRAWS = int(os.environ.get("TEMP_SHADOW_SWP_DRAWS", "6") or 6)
+SWP_SEED = "tmm-sweep-1"            # = temp_shadow_sweep.SEED_BASE
+SWP_REC_MODE = "level"              # recorded takers: price-time priority
+SWP_CHANNELS = "abc"                # recorded clusters, hidden sweeps, 99c crossers
+SWP_HAZARD_REPO = os.path.join(C.REPO, "temp_shadow_sweep_hazard.json")
+SWP_TAILS_REPO = os.path.join(C.REPO, "temp_shadow_sweep_tails.json")
 
 TAU_BUCKETS = ("0-5", "5-10", "10-20", "20-40", "40-60")
 # wx rows for [open - 75 min, close]: the model's features use the last 60
@@ -758,6 +802,8 @@ class _Pass:
         self.r_tau = {b: 0.0 for b in TAU_BUCKETS}
         self.max_abs_pos = 0.0
         self.peak_wcl = 0.0
+        # quote_hours_et: the event's settle hour (ET) decides the whole hour
+        self.hours_ok = pol.quote_hour_ok(P, sh.inp.settle_ts)
 
     # -- risk ----------------------------------------------------------
     def _wcl(self) -> Tuple[float, List[int]]:
@@ -796,6 +842,8 @@ class _Pass:
             v = sh.ver[m][idx] if 0 <= idx < n else -1
             pr = sh.progs[m]
             pflag = pol.program_flag(P, a, b, pr["start"], pr["end"], sh.close)
+            if not self.hours_ok:
+                pflag = False           # outside quote_hours_et: nothing rests
             key = (v, fs, wflag, pflag, size_full, self.risk_ver, hold)
             if key == self.last_key[m]:
                 continue
@@ -1082,6 +1130,7 @@ def _resolve_variants(variants) -> Dict[str, dict]:
             raise ValueError(f"variant {name}: unknown policy keys {sorted(bad)}")
         P = dict(DEFAULT_POLICY)
         P.update(ov)
+        pol.check_quote_hours(P)
         if P.get("wcl_resting"):
             # the event-level resting budget needs every market at once; the
             # replay decides per market (cached), so it is not simulated
@@ -1090,28 +1139,178 @@ def _resolve_variants(variants) -> Dict[str, dict]:
     return out
 
 
+# -- swp (temp_shadow_sweep) ---------------------------------------------------
+
+_SWP_CACHE: Dict[str, tuple] = {}
+
+
+def _swp_file(name: str, repo_path: str) -> str:
+    """<TEMP_SHADOW_DATA>/model/<name> when present (a recalibration), else the
+    repo default."""
+    p = os.path.join(C.DATA_ROOT, "model", name)
+    return p if os.path.exists(p) else repo_path
+
+
+def _swp_doc(path: str) -> dict:
+    try:
+        mt = os.path.getmtime(path)
+    except OSError as e:
+        raise ValueError(f"swp table missing: {path} ({e})")
+    hit = _SWP_CACHE.get(path)
+    if hit is not None and hit[0] == mt:
+        return hit[1]
+    doc = C.read_json(path)
+    if not isinstance(doc, dict):
+        raise ValueError(f"cannot read swp table {path}")
+    _SWP_CACHE[path] = (mt, doc)
+    return doc
+
+
+def swp_config(draws: Optional[int] = None) -> dict:
+    """The swp fill model's inputs: hazard (temp_shadow_sweep.Hazard), tails
+    (TailCal) and the identity block written into every sim file / checked by
+    run_day's cache (draws, rec_mode, channels, seed, the two tables' ids)."""
+    import temp_shadow_sweep as SW      # lazy: temp_shadow_sweep imports this module
+    hp = _swp_file("sweep_hazard.json", SWP_HAZARD_REPO)
+    tp = _swp_file("sweep_tails.json", SWP_TAILS_REPO)
+    hz = SW.Hazard(_swp_doc(hp))
+    tc = SW.TailCal(_swp_doc(tp))
+    n = int(SWP_DRAWS if draws is None else draws)
+    if n < 1:
+        raise ValueError("swp draws must be >= 1")
+    ident = {"draws": n, "rec_mode": SWP_REC_MODE, "channels": SWP_CHANNELS, "seed": SWP_SEED,
+             "hazard_id": hz.ident(), "hazard_src": hp, "hazard_built": hz.doc.get("built"),
+             "lam_max": _r(hz.lam_max), "tails_id": tc.ident(), "tails_src": tp,
+             "tails_built": tc.doc.get("built"), "sweep_version": SW.SWEEP_VERSION}
+    return {"hazard": hz, "tails": tc, "ident": ident}
+
+
+_SWP_CACHE_KEYS = ("draws", "rec_mode", "channels", "seed", "hazard_id", "tails_id",
+                   "sweep_version")
+
+
+def _swp_summary(runs: List[dict], exact: bool) -> dict:
+    """Mean over the swp draws in the opt / cons schema, plus the Monte Carlo
+    spread (net_sd, net_se = net_sd / sqrt(draws)) and the sweep extras."""
+    import temp_shadow_sweep as SW
+    n = len(runs)
+    ms = SW.mean_summary(runs)
+    out = {k: ms[k] for k in ("reward", "fills_n", "contracts", "trading_pnl", "fees", "net",
+                              "avg_share", "quoted_secs", "max_abs_pos", "worst_case_loss")}
+    for k in ("by_class", "by_tau", "by_side"):      # means at the opt / cons precision
+        acc: Dict[str, Dict[str, float]] = {}
+        for r in runs:
+            for b, d in (r.get(k) or {}).items():
+                a = acc.setdefault(b, {})
+                for kk, vv in d.items():
+                    a[kk] = a.get(kk, 0.0) + float(vv or 0.0)
+        out[k] = {b: {kk: _r(vv / n) for kk, vv in d.items()} for b, d in acc.items()}
+    faw = {"contracts": 0.0, "pnl": 0.0}
+    mo = {"m60": 0.0, "m300": 0.0}
+    ct = 0.0
+    for r in runs:
+        for k in faw:
+            faw[k] += float((r.get("fills_after_wx") or {}).get(k) or 0.0)
+        c = float(r.get("contracts") or 0.0)
+        ct += c
+        for k in mo:
+            mo[k] += float((r.get("markouts") or {}).get(k) or 0.0) * c
+    out["fills_after_wx"] = {k: _r(v / n) for k, v in faw.items()}
+    out["markouts"] = {k: _r(v / ct if ct else 0.0, 3) for k, v in mo.items()}
+    out["draws"] = n
+    for k in ("net", "reward", "trading_pnl", "contracts", "filler_contracts"):
+        out[f"{k}_sd"] = ms.get(f"{k}_sd")
+    out["net_se"] = _r((ms.get("net_sd") or 0.0) / math.sqrt(n)) if n else None
+    out["draw_net"] = ms.get("draw_net")
+    out["swp_exact"] = bool(exact)
+    for k in ("filler_contracts", "haz_events", "pnl_cal", "net_cal", "net_cal_tlo",
+              "net_cal_thi"):
+        if k in ms:
+            out[k] = ms[k]
+    out["sweep_src"] = ms.get("sweep_src") or {}
+    return out
+
+
+def run_swp(sh, Ps: Dict[str, dict], cfg: dict, screen: bool = True) -> Dict[str, dict]:
+    """name -> the swp summary, over cfg's draws; sh = a SweepShared. Draws
+    are the outer loop and draw k's hidden-sweep candidates depend only on
+    (event, k, seed), so every variant meets the same arrivals (common random
+    numbers). Two exact shortcuts (screen=False runs every draw in full;
+    test_temp_shadow_sim checks they agree):
+      * a variant whose first draw never rested a 1c order: every channel
+        acts on our 1c orders only, so all its draws are that one
+        (swp_exact);
+      * a variant whose first draw accepted no hidden sweep: its 1c
+        trajectory is logged, and a later draw whose candidates would all
+        be rejected along it (temp_shadow_sweep.hazard_hits) is identical
+        to the first; only the draws with a hit are run."""
+    import temp_shadow_sweep as SW
+    hz, tc = cfg["hazard"], cfg["tails"]
+    n = int(cfg["ident"]["draws"])
+    runs: Dict[str, List[dict]] = {name: [] for name in Ps}
+    exact = set()
+    logs: Dict[str, dict] = {}            # name -> draw 0's hazard-free 1c trajectory
+    for k in range(n):
+        todo = [name for name in Ps if name not in exact]
+        cands = SW.hazard_candidates(sh, k, hz.lam_max, SWP_SEED) if todo else []
+        for name, P in Ps.items():
+            if name in exact:
+                runs[name].append(runs[name][0])
+                continue
+            if k > 0 and name in logs and not SW.hazard_hits(sh, hz, logs[name], cands):
+                runs[name].append(runs[name][0])
+                continue
+            vp = SW.VPass(sh, P, "swp", hazard=hz, cands=cands, rec_mode=SWP_REC_MODE,
+                          channels=SWP_CHANNELS, tail_cal=tc if tc else None)
+            if k == 0 and screen:
+                vp.record_expo()
+            runs[name].append(vp.run())
+            if k == 0:
+                if not vp.had_1c:
+                    exact.add(name)
+                elif screen and vp.haz_n == 0:
+                    logs[name] = vp.expo_log
+    return {name: _swp_summary(runs[name], name in exact) for name in Ps}
+
+
 def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=None,
-              until_ts: Optional[float] = None) -> dict:
+              until_ts: Optional[float] = None, draws: Optional[int] = None) -> dict:
     """Simulate one event for every variant x fill model.
 
     variants: None (all of VARIANTS), a list/comma string of VARIANTS names,
     or a dict name -> overrides of DEFAULT_POLICY. until_ts (testing/what-if)
-    stops the timeline there; settlement still uses the final results."""
+    stops the timeline there; settlement still uses the final results.
+    draws: swp Monte Carlo draws (default SWP_DRAWS)."""
     t_start = time.time()
     Ps = _resolve_variants(variants)
+    for fm in fill_models:
+        if fm not in FILL_MODELS:
+            raise ValueError(f"unknown fill model {fm!r}")
     inp = load_event_inputs(event_ticker)
     if model is None:
         model = tmodel.FairModel()
-    sh = _Shared(inp, model, until_ts)
+    swp_cfg = None
+    if "swp" in fill_models:
+        import temp_shadow_sweep as SW
+        swp_cfg = swp_config(draws)
+        # _Shared plus the tape's 1c taker clusters; the books are _Shared's
+        # (live-order subtraction as configured), so opt / cons are unchanged
+        sh = SW.SweepShared(inp, model, until_ts, subtract=scoring.SUBTRACT_LIVE)
+    else:
+        sh = _Shared(inp, model, until_ts)
     react0 = float(DEFAULT_POLICY["react_s"])
     mstats = sh.market_stats()
     meval = sh.model_eval(react0)
-    out_vars = {}
+    det = {}
     for name, P in Ps.items():
         for fm in fill_models:
-            if fm not in FILL_MODELS:
-                raise ValueError(f"unknown fill model {fm!r}")
-            out_vars[f"{name}|{fm}"] = _Pass(sh, P, fm).run()
+            if fm != "swp":
+                det[f"{name}|{fm}"] = _Pass(sh, P, fm).run()
+    swp_out = run_swp(sh, Ps, swp_cfg) if swp_cfg is not None else {}
+    out_vars = {}
+    for name in Ps:
+        for fm in fill_models:
+            out_vars[f"{name}|{fm}"] = swp_out[name] if fm == "swp" else det[f"{name}|{fm}"]
     cov = sh.stream_cov or {}
     gaps = cov.get("gaps", 0)
     recon = cov.get("reconnects", 0)
@@ -1141,6 +1340,8 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
         "policies": {name: (variants[name] if isinstance(variants, dict) else VARIANTS.get(name, {}))
                      for name in Ps},
         "flags": flags,
+        "fill_models": list(fill_models),
+        "swp": dict(swp_cfg["ident"]) if swp_cfg is not None else None,
         "runtime_s": round(time.time() - t_start, 2),
         "sim_version": SIM_VERSION,
     }
@@ -1190,9 +1391,9 @@ def _lower_priority():
         pass
 
 
-def _day_worker(ev: str, variants, out_path: str) -> dict:
+def _day_worker(ev: str, variants, out_path: str, draws: Optional[int] = None) -> dict:
     try:
-        res = run_event(ev, variants=variants)
+        res = run_event(ev, variants=variants, draws=draws)
         C.write_json_atomic(out_path, res)
         return res
     except Exception as e:
@@ -1209,13 +1410,19 @@ def _policy_overrides(variants) -> Dict[str, dict]:
     return json.loads(json.dumps(src, default=str))
 
 
-def _cached_ok(doc, want: Dict[str, dict]) -> bool:
-    """A sim file is reused only if it is settled, from this SIM_VERSION, and
-    holds every requested variant x fill model with the same overrides."""
+def _cached_ok(doc, want: Dict[str, dict], swp_want: Optional[dict] = None) -> bool:
+    """A sim file is reused only if it is settled, from this SIM_VERSION,
+    holds every requested variant x fill model with the same overrides and,
+    with swp_want (swp_config()["ident"]), the same swp draws / rec_mode /
+    channels / seed / hazard and tails tables."""
     if not isinstance(doc, dict) or not doc.get("settled") or doc.get("error"):
         return False
     if str(doc.get("sim_version")) != SIM_VERSION:
         return False
+    if swp_want is not None:
+        sw = doc.get("swp") or {}
+        if any(sw.get(k) != swp_want.get(k) for k in _SWP_CACHE_KEYS):
+            return False
     have = doc.get("variants") or {}
     pol = doc.get("policies") or {}
     for name, ov in want.items():
@@ -1230,20 +1437,22 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
     """Simulate every settled event of an ET day into sim/<day>/<EVENT>.json.
 
     Existing files are loaded and returned unless force, but only if they hold
-    every requested variant (same overrides) from this SIM_VERSION; otherwise
-    the event is re-run (and the file rewritten with the requested set).
+    every requested variant (same overrides) from this SIM_VERSION with the
+    current swp configuration (draws, hazard, tails); otherwise the event is
+    re-run (and the file rewritten with the requested set).
     Unsettled events come back as {"event", "pending": True, "settled": False};
     failures as {"event", "error"}."""
     evs = day_events(et_day)
     out_dir = C.sim_dir(et_day)
     want = _policy_overrides(variants)
+    swp_want = swp_config()["ident"] if "swp" in FILL_MODELS else None
     results: List[dict] = []
     todo = []
     for ev in evs:
         path = os.path.join(out_dir, f"{ev}.json")
         if os.path.exists(path) and not force:
             doc = C.read_json(path)
-            if _cached_ok(doc, want):
+            if _cached_ok(doc, want, swp_want):
                 results.append(doc)
                 continue
         try:
@@ -1257,13 +1466,14 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
         todo.append((ev, path))
     w = DEFAULT_WORKERS if workers is None else int(workers)
     w = max(1, min(MAX_WORKERS, w, len(todo) or 1))
+    draws = swp_want["draws"] if swp_want else None     # the workers' draw count = the cache's
     if w == 1 or len(todo) <= 1:
         for ev, path in todo:
-            results.append(_day_worker(ev, variants, path))
+            results.append(_day_worker(ev, variants, path, draws))
     else:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=w, initializer=_lower_priority) as ex:
-            futs = [ex.submit(_day_worker, ev, variants, path) for ev, path in todo]
+            futs = [ex.submit(_day_worker, ev, variants, path, draws) for ev, path in todo]
             for fu in futs:
                 try:
                     results.append(fu.result())
@@ -1288,8 +1498,9 @@ def _print_event(res: dict) -> None:
     print(f"  {'variant|fill':32s} {'reward':>8s} {'pnl':>9s} {'net':>9s} {'ctr':>8s} "
           f"{'share':>6s} {'m60':>6s}")
     for k, v in res["variants"].items():
+        se = f" +/-{v['net_se']:.2f} (mc se, {v.get('draws')} draws)" if "net_se" in v else ""
         print(f"  {k:32s} {v['reward']:8.2f} {v['trading_pnl']:9.2f} {v['net']:9.2f} "
-              f"{v['contracts']:8.0f} {v['avg_share']:6.3f} {v['markouts']['m60']:6.2f}")
+              f"{v['contracts']:8.0f} {v['avg_share']:6.3f} {v['markouts']['m60']:6.2f}{se}")
 
 
 def main(argv=None) -> int:

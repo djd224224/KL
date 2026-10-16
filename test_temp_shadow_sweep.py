@@ -853,5 +853,56 @@ class TestLiveDirSandbox(unittest.TestCase):
             scoring._LIVE_CACHE.clear()
 
 
+class TestPipelineFiles(unittest.TestCase):
+    """The fit-only files the daily pipeline (temp_shadow_sim's swp) loads:
+    export keeps the hazard's size draws in order, so the id -- and every
+    Monte Carlo draw -- is the full calibration's."""
+
+    def test_repo_defaults_and_export(self):
+        hz_doc = C.read_json(sim.SWP_HAZARD_REPO)
+        tl_doc = C.read_json(sim.SWP_TAILS_REPO)
+        self.assertEqual(SW.Hazard(hz_doc).ident(), "bfb9676a4e92a9d2")     # the 10/16 pre-live fit
+        self.assertEqual(len(hz_doc["events"]), 37)
+        self.assertNotIn("KXTEMPMIAH-26OCT1610", hz_doc["events"])          # the live hour left out
+        self.assertEqual(SW.TailCal(tl_doc).ident(), "46e671fb82353b0b")
+        self.assertTrue(SW.TailCal(tl_doc).cond.get("c1"))
+        # a full calibrate-shaped doc -> the fit-only file: same id, diagnostics dropped
+        full = dict(hz_doc, clusters=[{"x": 1}], recorded={"all": {}}, live={"events": []})
+        fit = SW.hazard_fit_doc(full)
+        self.assertEqual(SW.Hazard(fit).ident(), SW.Hazard(full).ident())
+        self.assertFalse({"clusters", "recorded", "live"} & set(fit))
+        d = tempfile.mkdtemp(prefix="tss_fit_")
+        p = os.path.join(d, "sweep_hazard.json")
+        SW.write_fit_file(p, fit)
+        self.assertEqual(SW.Hazard(C.read_json(p)).ident(), SW.Hazard(full).ident())
+        # re-ordering the size draws changes the fit (they are indexed)
+        shuf = json.loads(json.dumps(fit))
+        shuf["sizes"]["0-5s"] = list(reversed(shuf["sizes"]["0-5s"]))
+        self.assertNotEqual(SW.Hazard(shuf).ident(), SW.Hazard(fit).ident())
+        self.assertEqual(SW.TailCal(SW.tails_fit_doc(tl_doc)).ident(), SW.TailCal(tl_doc).ident())
+        with self.assertRaises(ValueError):
+            SW.hazard_fit_doc({"events": []})
+        # the CLI writes the same file
+        q = os.path.join(d, "via_cli.json")
+        self.assertEqual(SW.main(["export", "--hazard", p, "--to", q]), 0)
+        self.assertEqual(SW.Hazard(C.read_json(q)).ident(), SW.Hazard(fit).ident())
+
+    def test_sim_loads_the_data_root_override(self):
+        cfg = sim.swp_config()
+        self.assertEqual(cfg["ident"]["hazard_src"], sim.SWP_HAZARD_REPO)
+        p = os.path.join(C.DATA_ROOT, "model", "sweep_hazard.json")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        doc = C.read_json(sim.SWP_HAZARD_REPO)
+        doc["hazard"] = dict(doc["hazard"], mult={k: 2 * v for k, v in doc["hazard"]["mult"].items()})
+        SW.write_fit_file(p, doc)
+        try:
+            cfg2 = sim.swp_config()
+            self.assertEqual(cfg2["ident"]["hazard_src"], p)
+            self.assertNotEqual(cfg2["ident"]["hazard_id"], cfg["ident"]["hazard_id"])
+            self.assertAlmostEqual(cfg2["hazard"].lam_max, 2 * cfg["hazard"].lam_max)
+        finally:
+            os.remove(p)
+        self.assertEqual(sim.swp_config()["ident"]["hazard_src"], sim.SWP_HAZARD_REPO)
+
 if __name__ == "__main__":
     unittest.main()

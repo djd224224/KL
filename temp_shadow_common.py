@@ -65,21 +65,29 @@ def data_path(*parts: str) -> str:
     return p
 
 
-def raw_dir(utc_day: str) -> str:
-    """raw/<YYYY-MM-DD>/ (UTC day of the rx stamp)."""
+def raw_dir(utc_day: str, create: bool = True) -> str:
+    """raw/<YYYY-MM-DD>/ (UTC day of the rx stamp), created unless
+    create=False. raw_file / raw_files / iter_raw never create it (lookups)."""
     d = os.path.join(DATA_ROOT, "raw", utc_day)
-    os.makedirs(d, exist_ok=True)
+    if create:
+        os.makedirs(d, exist_ok=True)
     return d
 
 
-def raw_file(stream: str, rx: float) -> str:
-    """raw/<UTC day>/<stream>_<HH>.jsonl for the UTC hour of rx.
+def raw_file(stream: str, rx: float, create: bool = False) -> str:
+    """raw/<UTC day>/<stream>_<HH>.jsonl for the UTC hour of rx -- the PATH
+    only: a lookup creates nothing. A writer creates the folder first: the
+    collector's RawWriter and append_jsonl / write_json_atomic make it, or
+    pass create=True. (Until SIM_VERSION 6 this created raw/<day>/ on every
+    call, so every probe -- the sim's day_events reads 3 h past a day, the
+    sweep's recorded_events, raw_files over any range -- left empty future
+    day folders behind in the recording.)
 
     stream in RAW_STREAMS. The collector appends plain .jsonl and gzips a
     file (-> .jsonl.gz, original removed) once its hour is >= 2h old; readers
     accept both."""
     t = _dt.datetime.fromtimestamp(rx, _dt.timezone.utc)
-    return os.path.join(raw_dir(t.strftime("%Y-%m-%d")),
+    return os.path.join(raw_dir(t.strftime("%Y-%m-%d"), create=create),
                         f"{stream}_{t.strftime('%H')}.jsonl")
 
 
@@ -321,7 +329,7 @@ def iter_jsonl(path: str) -> Iterator[dict]:
 
 def raw_files(stream: str, t0: float, t1: float) -> List[str]:
     """Existing raw files of `stream` whose UTC hour overlaps [t0, t1), in time
-    order (plain or gzipped)."""
+    order (plain or gzipped). Creates no folder."""
     out: List[str] = []
     h = math.floor(t0 / 3600) * 3600
     while h < t1:

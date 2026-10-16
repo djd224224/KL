@@ -560,9 +560,11 @@ class TestDecide(unittest.TestCase):
             hr = pol.risk_headroom(p, [m.yes_pos for m in mk], [m.no_pos for m in mk],
                                    [m.cost for m in mk])
             self.assertEqual(dec.pad_hold, pol.pad_hold_flag(p, dec.rest_from, ctx.open_ts))
+            # quote_hours_et (FAV_night): outside the hours the program test fails
+            self.assertEqual(dec.quote_hour, pol.quote_hour_ok(p, ctx.settle_ts))
             for i, m in enumerate(mk):
                 exp = pol.quote_market(p, pol.BookView(m.book_yes, m.book_no), m.fair, m.slope_c,
-                                       dec.wflag, True, dec.size_full, hr[i], 1000.0,
+                                       dec.wflag, dec.quote_hour, dec.size_full, hr[i], 1000.0,
                                        hold_pads=dec.pad_hold)
                 got = dec.markets[i]
                 self.assertEqual((got.yes, got.no, got.rule), exp, name)
@@ -828,6 +830,137 @@ class TestPadHold(unittest.TestCase):
             name = rng.choice([v for v in sorted(pol.VARIANTS) if v != "G_decided_only"])
             self.assertFalse(pol.decide(P(name), self.ctx(after), mk).pad_hold, name)
 
+
+class TestQuoteHoursAndFav(unittest.TestCase):
+    """Jack 2026-10-16, "1": favorite-only (FAV_only) and overnight-favorite-
+    only (FAV_night = FAV_only quoting the events that SETTLE 20:00-07:00 ET,
+    policy key quote_hours_et) -- the only variants positive in expectation
+    under the sweep-aware fill model."""
+    NIGHT = [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]
+
+    def test_variants(self):
+        fo, fn = P("FAV_only"), P("FAV_night")
+        self.assertEqual(pol.VARIANTS["FAV_only"],
+                         dict(live=False, decided=True, q_pad=0, qual_pads=False,
+                              near_decided_half=False))
+        self.assertEqual(fn, dict(fo, quote_hours_et=self.NIGHT))
+        self.assertIsNone(pol.DEFAULT_POLICY["quote_hours_et"])
+        self.assertEqual([n for n, ov in pol.VARIANTS.items() if ov.get("quote_hours_et")],
+                         ["FAV_night"])
+        for v in pol.VARIANTS:
+            pol._check_policy(P(v))
+        for bad in ([24], [-1], ["7"], [7.0], "20,21", 7, [True]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                pol._check_policy(P(quote_hours_et=bad))
+        pol._check_policy(P(quote_hours_et=[]))           # an empty list: never quote
+        self.assertFalse(pol.quote_hour_ok(P(quote_hours_et=[]), T0))
+
+    def test_et_hour_matches_zoneinfo(self):
+        import datetime as _dt
+        rng = random.Random(5)
+        t0 = _dt.datetime(2024, 1, 1, tzinfo=_dt.timezone.utc).timestamp()
+        pts = [t0 + rng.uniform(0, 7 * 365 * 86400) for _ in range(20000)]
+        # every half hour across the 2026 / 2027 switches
+        for y, mo, d in ((2026, 3, 8), (2026, 11, 1), (2027, 3, 14), (2027, 11, 7)):
+            base = _dt.datetime(y, mo, d, tzinfo=_dt.timezone.utc).timestamp()
+            pts += [base - 86400 + 1800 * i for i in range(144)]
+        for t in pts:
+            self.assertEqual(pol.et_hour(t), C.et_dt(t).hour, C.iso(t))
+
+    def test_dst_boundary_nov_1(self):
+        """2026-11-01: EDT -> EST at 06:00Z. The settle hour comes from the
+        ticker (temp_shadow_common.parse_event) and its ET hour from the
+        policy; a fixed UTC offset would quote the wrong hours on one side of
+        the switch."""
+        fn = P("FAV_night")
+        for day in ("26OCT31", "26NOV01", "26NOV02"):
+            for h in range(24):
+                ev = f"KXTEMPMIAH-{day}{h:02d}"
+                s = C.parse_event(ev)[1]
+                self.assertEqual(pol.et_hour(s), h, ev)
+                self.assertEqual(pol.quote_hour_ok(fn, s), h in self.NIGHT, ev)
+        iso = C.parse_iso
+        # 07:00 is quoted, 08:00 is not -- on both sides of the switch
+        self.assertTrue(pol.quote_hour_ok(fn, iso("2026-10-31T11:00:00Z")))     # 07:00 EDT
+        self.assertFalse(pol.quote_hour_ok(fn, iso("2026-10-31T12:00:00Z")))    # 08:00 EDT
+        self.assertTrue(pol.quote_hour_ok(fn, iso("2026-11-01T12:00:00Z")))     # 07:00 EST
+        self.assertFalse(pol.quote_hour_ok(fn, iso("2026-11-01T13:00:00Z")))    # 08:00 EST
+        # the repeated 01:00 hour: 05:00Z (EDT, the ticker's fold 0) and 06:00Z (EST)
+        self.assertEqual(C.parse_event("KXTEMPMIAH-26NOV0101")[1], iso("2026-11-01T05:00:00Z"))
+        self.assertEqual((pol.et_hour(iso("2026-11-01T05:00:00Z")),
+                          pol.et_hour(iso("2026-11-01T06:00:00Z")),
+                          pol.et_hour(iso("2026-11-01T07:00:00Z"))), (1, 1, 2))
+        # spring forward 2027-03-14: 07:00Z = 03:00 EDT (02:00 does not exist)
+        self.assertEqual(pol.et_hour(iso("2027-03-14T06:59:59Z")), 1)
+        self.assertEqual(pol.et_hour(iso("2027-03-14T07:00:00Z")), 3)
+        self.assertTrue(pol.quote_hour_ok(P(), None))             # no list: always
+        self.assertFalse(pol.quote_hour_ok(fn, None))             # a list and no time: never
+
+    def test_decide_rests_nothing_outside_the_hours(self):
+        import datetime as _dt
+        fn, fo = P("FAV_night"), P("FAV_only")
+        mk = _event()
+        day = C.et_dt(T0).date()
+        for h, quoted in ((21, True), (7, True), (8, False), (19, False)):
+            settle = _dt.datetime(day.year, day.month, day.day, h, tzinfo=C.ET).timestamp()
+            ctx = pol.EventContext(now=T0 + 5.0, close_ts=T0 + 1800.0, settle_ts=settle)
+            d_n, d_o = pol.decide(fn, ctx, mk), pol.decide(fo, ctx, mk)
+            self.assertEqual(d_n.quote_hour, quoted, h)
+            self.assertTrue(d_o.quote_hour)
+            if quoted:
+                self.assertEqual([(m.yes, m.no, m.orders) for m in d_n.markets],
+                                 [(m.yes, m.no, m.orders) for m in d_o.markets], h)
+                self.assertTrue(any(m.orders for m in d_n.markets))
+            else:
+                self.assertTrue(all(not m.yes and not m.no for m in d_n.markets), h)
+                self.assertTrue(all(m.diag["reason"] == "off_hours" for m in d_n.markets))
+                self.assertEqual({m.diag["settle_hour_et"] for m in d_n.markets}, {h})
+                # what rests is cancelled (the ops against resting orders)
+                rest = [pol.MarketState(**dict(vars(m), resting_no={97: 300.0})) for m in mk]
+                ops = pol.decide(fn, ctx, rest).markets[0].ops
+                self.assertEqual([(o.side, o.op, o.price) for o in ops], [("no", "cancel", 97)])
+        # settle_ts defaults to close_ts
+        ctx = pol.EventContext(now=T0 + 5.0, close_ts=T0 + 1800.0)
+        self.assertEqual(ctx.settle_ts, T0 + 1800.0)
+        self.assertEqual(pol.decide(fn, ctx, mk).quote_hour,
+                         pol.et_hour(T0 + 1800.0) in self.NIGHT)
+
+    def test_fav_only_never_rests_a_1c_order(self):
+        """FAV_only = G's favorite joins alone: on any realistic book (the
+        favorite side's bids near the favorite's price), at any fair, no
+        order at 1c -- no longshot pad, no qualification pad, no near-decided
+        quote -- and on a decided strike exactly G0's favorite order."""
+        rng = random.Random(29)
+        fo, g0 = P("FAV_only"), P("G0_nohold")
+        n_fav = 0
+        for _ in range(5000):
+            fx = rng.choice([rng.random(), rng.uniform(0, 0.03), rng.uniform(0.97, 1.0),
+                             rng.uniform(0.03, 0.10), rng.uniform(0.90, 0.97)])
+            fav_yes = fx >= 0.5
+            hi = {rng.randint(85, 98): float(rng.choice([20, 150, 600, 1500]))
+                  for _ in range(rng.randint(1, 3))}
+            lo = {rng.randint(1, 3): float(rng.choice([20, 150, 600, 1500]))
+                  for _ in range(rng.randint(0, 2))}
+            by, bn = (hi, lo) if fav_yes else (lo, hi)
+            if by and bn and max(by) + max(bn) >= 100:
+                continue
+            b = pol.BookView(by, bn)
+            risk = rng.choice([NORISK, (200.0, 900.0, 50.0, 3.0)])
+            args = (b, fx, rng.choice([None, 0.5, 3.0]), rng.random() < 0.3, True,
+                    rng.choice([0, 150, 600]), risk, 1000.0)
+            tags = {}
+            dy, dn, rule = pol.quote_market(fo, *args, tags=tags)
+            self.assertNotIn(1, dy, (fx, by, bn))
+            self.assertNotIn(1, dn, (fx, by, bn))
+            self.assertTrue(all(t == ["fav"] for t in tags.values()), tags)
+            if pol.classify(fx) == "decided" and risk == NORISK:
+                gt = {}
+                gy, gn, _ = pol.quote_market(g0, *args, tags=gt)
+                favs = {k for k, t in gt.items() if "fav" in t}
+                self.assertEqual((dy, dn), ({p: s for p, s in gy.items() if ("yes", p) in favs},
+                                            {p: s for p, s in gn.items() if ("no", p) in favs}))
+            n_fav += bool(dy or dn)
+        self.assertGreater(n_fav, 500)
 
 if __name__ == "__main__":
     unittest.main()

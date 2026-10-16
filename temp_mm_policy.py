@@ -68,6 +68,20 @@ The rules (TEMP_SHADOW.md "Policy and variants"); each has a switch in P:
                                none exceeds it (trim_resting_wcl).
   program_only                 quote only while the market's reward program is
                                active during the orders' resting interval.
+  quote hours [quote_hours_et] Jack 2026-10-16 ("1": favorite-only and
+                               overnight-favorite-only in the shadow): a list
+                               of ET clock hours; an event is quoted only when
+                               the ET hour of its SETTLEMENT (the ticker's
+                               hour, KXTEMPMIAH-26OCT1607 = 07:00 ET) is in
+                               it (quote_hour_ok; et_hour is DST-safe without
+                               tz files: US Eastern, EDT from the second
+                               Sunday of March 07:00Z to the first Sunday of
+                               November 06:00Z). Outside them nothing rests
+                               on any of the event's markets (the program
+                               test fails; reason "off_hours"). None (the
+                               default) = every hour. FAV_night = settle
+                               hours 20-23 and 0-7 (events settling 20:00-
+                               07:00 ET).
   pad hold [pad_hold_open_s]   Jack 2026-10-16: "hold the pads for the first 3
                                minutes of each hour going forward" (live G's
                                first hour: sweepers took 4,659 of its 1c
@@ -92,6 +106,14 @@ G_decided_only (what runs live since 10/16) also holds its 1c pads for the
 first 180 s after the open (pad_hold_open_s); G0_nohold is the G before the
 hold, kept for comparison. F has no hold.
 
+FAV_only / FAV_night (Jack 2026-10-16, "1"): the favorite joins of G with no
+1c filler at all -- no longshot pad (q_pad 0), no qualification pads, no
+near-decided half-size quotes. Under the sweep-aware fill model (swp,
+temp_shadow_sweep) every 1c-filler variant loses (sweepers take the fillers
+within seconds) and only these favorite joins are positive in expectation,
+almost all of it in the events settling 20:00-07:00 ET: FAV_night is
+FAV_only quoted in those settle hours only (quote_hours_et).
+
 API:
   DEFAULT_POLICY, VARIANTS, make_policy(variant=None, **overrides) -> dict
   decide(P, ctx: EventContext, markets: List[MarketState]) -> EventDecision
@@ -101,19 +123,21 @@ API:
   building blocks (the sim calls these directly): BookView, quote_market,
   quote_price, classify, guard_buffer, normal_slope_c, g_tau, live_size,
   overlap_window, window_flag, program_flag, pad_hold_flag, risk_headroom,
-  worst_case_loss,
+  worst_case_loss, et_hour, quote_hour_ok, check_quote_hours,
   scenario_losses, reference_price, best_price, would_cross, external_book.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-POLICY_VERSION = "2"   # 2: pad_hold_open_s (10/16)
+POLICY_VERSION = "3"   # 2: pad_hold_open_s (10/16); 3: quote_hours_et, FAV_only /
+                      # FAV_night (10/16)
 
-DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False, pad_hold_open_s=0.0)
-VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True, pad_hold_open_s=180.0), "G0_nohold": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000)}
+DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False, pad_hold_open_s=0.0, quote_hours_et=None)
+VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True, pad_hold_open_s=180.0), "G0_nohold": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000), "FAV_only": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False), "FAV_night": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False, quote_hours_et=[20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])}
 
 TARGET = 1000.0      # target_size_fp of every KXTEMPMIAH program (10/14)
 DF = 0.5             # discount_factor_bps 5000
@@ -153,6 +177,20 @@ def _check_policy(P: dict) -> None:
         raise ValueError(f"unknown policy keys {sorted(bad)}")
     if P["window_mode"] not in WINDOW_MODES:
         raise ValueError(f"window_mode must be one of {WINDOW_MODES}, not {P['window_mode']!r}")
+    check_quote_hours(P)
+
+
+def check_quote_hours(P: dict) -> None:
+    """quote_hours_et must be None or a list / tuple of whole ET hours 0..23
+    (ValueError otherwise)."""
+    hrs = P.get("quote_hours_et")
+    if hrs is None:
+        return
+    if isinstance(hrs, (str, bytes)) or not isinstance(hrs, (list, tuple)):
+        raise ValueError(f"quote_hours_et must be None or a list of ET hours, not {hrs!r}")
+    for h in hrs:
+        if isinstance(h, bool) or not isinstance(h, int) or not 0 <= h <= 23:
+            raise ValueError(f"quote_hours_et holds {h!r}: ET hours are whole numbers 0..23")
 
 
 # --------------------------------------------------------------------------
@@ -354,6 +392,42 @@ def pad_hold_flag(P: dict, rest_from: float, open_ts: float) -> bool:
     the hourly events when the caller does not know it)."""
     hold = float(P.get("pad_hold_open_s") or 0.0)
     return hold > 0.0 and rest_from < float(open_ts) + hold
+
+
+def _nth_sunday_utc(year: int, month: int, n: int, hour_utc: int) -> float:
+    d = _dt.date(year, month, 1)
+    day = 1 + (6 - d.weekday()) % 7 + 7 * (n - 1)          # weekday(): Monday 0
+    return _dt.datetime(year, month, day, hour_utc, tzinfo=_dt.timezone.utc).timestamp()
+
+
+def et_offset_h(ts: float) -> int:
+    """US Eastern's UTC offset (hours) at epoch ts: -4 (EDT) from the second
+    Sunday of March 07:00Z (02:00 EST) to the first Sunday of November 06:00Z
+    (02:00 EDT), else -5 (EST) -- the US rule since 2007, computed without tz
+    files (the policy does no I/O; temp_shadow_common's zoneinfo agrees, see
+    test_temp_mm_policy)."""
+    y = _dt.datetime.fromtimestamp(float(ts), _dt.timezone.utc).year
+    return -4 if _nth_sunday_utc(y, 3, 2, 7) <= float(ts) < _nth_sunday_utc(y, 11, 1, 6) else -5
+
+
+def et_hour(ts: float) -> int:
+    """The ET clock hour (0..23) at epoch ts, DST-safe. In the November
+    fall-back the repeated 01:00 hour is 1 both times."""
+    t = float(ts) + 3600.0 * et_offset_h(ts)
+    return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).hour
+
+
+def quote_hour_ok(P: dict, settle_ts: Optional[float]) -> bool:
+    """May an event settling at settle_ts be quoted? quote_hours_et None ->
+    always; else the ET hour of the settlement must be listed (an hourly
+    event KXTEMPMIAH-26OCT1607 settles at 07:00 ET: hour 7). No settlement
+    time with a list -> False (fail closed)."""
+    hrs = P.get("quote_hours_et")
+    if hrs is None:
+        return True
+    if settle_ts is None:
+        return False
+    return et_hour(float(settle_ts)) in {int(h) for h in hrs}
 
 
 # --------------------------------------------------------------------------
@@ -750,16 +824,21 @@ class EventContext:
     [rest_from, rest_until): default now + order_latency_s for one second
     (the next decision). The landing window, program and pad-hold tests use
     it. open_ts: the event's market open (the pad hold counts from it);
-    None -> close_ts - 3600 (the hourly events open an hour before close)."""
+    None -> close_ts - 3600 (the hourly events open an hour before close).
+    settle_ts: the event's settlement time (the ticker's hour; quote_hours_et
+    tests its ET hour); None -> close_ts."""
     now: float
     close_ts: float
     rest_from: Optional[float] = None
     rest_until: Optional[float] = None
     open_ts: Optional[float] = None
+    settle_ts: Optional[float] = None
 
     def __post_init__(self):
         if self.open_ts is None:
             self.open_ts = float(self.close_ts) - 3600.0
+        if self.settle_ts is None:
+            self.settle_ts = float(self.close_ts)
 
 
 @dataclass
@@ -801,6 +880,7 @@ class EventDecision:
     resting_wcl: float = 0.0         # dollars: filled + every losing-side desired order filled
                                      # in full, worst scenario (resting_scenario_losses)
     pad_hold: bool = False           # pad_hold_flag: the 1c fillers are held (event open + hold)
+    quote_hour: bool = True          # quote_hour_ok: the settle hour is in quote_hours_et
 
     def by_ticker(self) -> Dict[str, MarketDecision]:
         return {d.ticker: d for d in self.markets}
@@ -819,6 +899,8 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
     wflag = window_flag(P, a, b)
     open_ts = float(ctx.open_ts) if ctx.open_ts is not None else float(ctx.close_ts) - 3600.0
     hold = pad_hold_flag(P, a, open_ts)
+    settle = float(ctx.settle_ts) if ctx.settle_ts is not None else float(ctx.close_ts)
+    hours_ok = quote_hour_ok(P, settle)
     tau = (float(ctx.close_ts) - float(ctx.now)) / 60.0
     size_full = live_size(P, tau)
     yes_q = [float(s.yes_pos) for s in mk]
@@ -828,8 +910,10 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
     wcl, scen = worst_case_loss(yes_q, no_q, cost)
     rows = []
     for m, s in enumerate(mk):
+        # outside quote_hours_et the event quotes nothing: its markets fail
+        # the program test (the sim applies the same rule)
         pflag = program_flag(P, a, b, s.program_start, s.program_end, ctx.close_ts,
-                             s.program_active)
+                             s.program_active) and hours_ok
         book = None
         if s.trusted:
             book = BookView({int(p): float(q) for p, q in (s.book_yes or {}).items()},
@@ -847,6 +931,9 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
                       "slope_src": slope_src}
         dy, dn, rule = quote_market(P, book, fair, slope, wflag, pflag, size_full,
                                     risk[m], float(s.target), tags, diag, hold_pads=hold)
+        if not hours_ok:
+            diag["reason"] = "off_hours"
+            diag["settle_hour_et"] = et_hour(settle)
         rows.append((s, dy, dn, rule, tags, diag))
     if P.get("wcl_resting"):
         dys, dns = [r[1] for r in rows], [r[2] for r in rows]
@@ -868,4 +955,4 @@ def decide(P: dict, ctx: EventContext, markets: Sequence[MarketState]) -> EventD
     return EventDecision(markets=out, tau_min=tau, size_full=size_full, wflag=wflag,
                          rest_from=a, rest_until=b, worst_case_loss=wcl,
                          wcl_scenarios=scen, headroom=risk, resting_wcl=max(0.0, max(rloss)),
-                         pad_hold=hold)
+                         pad_hold=hold, quote_hour=hours_ok)

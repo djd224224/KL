@@ -654,6 +654,59 @@ class RegistryTest(unittest.TestCase):
         w.close_all()
 
 
+class RawLookupNoDirsTest(unittest.TestCase):
+    """temp_shadow_common.raw_file / raw_files / iter_raw are lookups: they
+    never create a folder (they used to make raw/<UTC day>/ for every hour
+    they probed, leaving empty future-day folders in KL-data -- the sim's
+    day_events reads 3 h past its day). Every writer still creates the
+    folder before writing: the collector's RawWriter, append_jsonl /
+    write_json_atomic (what the tests and the backfill use), or
+    raw_file(create=True)."""
+
+    def setUp(self):
+        self.rd = os.path.join(C.DATA_ROOT, "raw")
+
+    def days(self):
+        return set(os.listdir(self.rd)) if os.path.isdir(self.rd) else set()
+
+    def test_lookups_create_nothing(self):
+        before = self.days()
+        t0 = ts("2031-01-05T00:00:00Z")                  # far in the future: nothing there
+        p = C.raw_file("ws", t0 + 7200)
+        self.assertTrue(p.endswith(os.path.join("raw", "2031-01-05", "ws_02.jsonl")))
+        self.assertEqual(C.raw_files("ws", t0, t0 + 9 * 86400), [])
+        self.assertEqual(list(C.iter_raw("meta", t0 - 3 * 3600, t0 + 3 * 86400)), [])
+        self.assertEqual(list(C.iter_raw("wx", t0, t0 + 3600)), [])
+        self.assertEqual(self.days(), before)
+        self.assertFalse(os.path.exists(os.path.dirname(p)))
+        # the same through the sim's day lister (reads 3 h before / 1 h after)
+        import temp_shadow_sim as sim
+        self.assertEqual(sim.day_events("2031-01-07"), [])
+        self.assertEqual(self.days(), before)
+        # raw_dir keeps creating by default (a writer's helper); create=False looks only
+        q = C.raw_dir("2031-02-01", create=False)
+        self.assertFalse(os.path.exists(q))
+
+    def test_writers_still_create_the_folder(self):
+        t1 = ts("2031-03-01T05:30:00Z")
+        w = TC.RawWriter()                               # the collector's write path
+        w.write("wx", {"rx": t1, "a": 1})
+        w.flush()
+        w.close_all()
+        p = C.raw_file("wx", t1)
+        self.assertTrue(os.path.isfile(p))
+        self.assertEqual([r["a"] for r in C.iter_jsonl(p)], [1])
+        self.assertEqual(C.raw_files("wx", t1 - 10, t1 + 10), [p])
+        t2 = ts("2031-03-02T05:30:00Z")                  # append_jsonl (tests, tools)
+        C.append_jsonl(C.raw_file("meta", t2), {"rx": t2, "kind": "poll", "data": {}})
+        self.assertEqual(len(list(C.iter_raw("meta", t2 - 1, t2 + 1))), 1)
+        t3 = ts("2031-03-03T05:30:00Z")                  # an explicit writer
+        p3 = C.raw_file("ws", t3, create=True)
+        self.assertTrue(os.path.isdir(os.path.dirname(p3)))
+        self.assertFalse(os.path.exists(p3))
+        q = C.raw_dir("2031-03-04")
+        self.assertTrue(os.path.isdir(q))
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=1)

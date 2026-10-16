@@ -859,7 +859,8 @@ class TestBooks(StreamCase):
         rows.sort(key=lambda r: r[0])
         by_file = {}
         for rx, m in rows:
-            by_file.setdefault(C.raw_file("ws", rx), []).append(
+            # a writer: raw_file(create=True) makes the folder (lookups never do)
+            by_file.setdefault(C.raw_file("ws", rx, create=True), []).append(
                 json.dumps({"rx": rx, "m": m}, separators=(",", ":")))
         for p, lines in by_file.items():
             with open(p, "a", encoding="utf-8") as f:

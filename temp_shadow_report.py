@@ -9,13 +9,18 @@ earlier day of the cumulative window up to the current SIM_VERSION (run_day
 again: cached files that pass its check are only loaded), reads every
 sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
 
-  1 headline       "Day N of 7"; the best CONS variant by the day's net with
-                   reward / trading / net for the day and per event-hour,
-                   and the best OPT variant beside it
-  2 variants       opt and cons side by side: reward, contracts, trading P&L,
-                   net, avg share, fills within 3 s after a weather update
-  3 breakdowns     the headline variant by ET hour of the event, strike class
-                   (live / decided), tau bucket, side, and its worst 5 events
+  1 headline       "Day N of 7"; the best SWP variant (the sweep-aware fill
+                   model, below) by the day's net with reward / trading / net
+                   for the day and per event-hour, its Monte Carlo standard
+                   error and expected net at calibrated tails, and the best
+                   cons / opt variants beside it
+  2 variants       opt, cons and swp side by side: reward, contracts, trading
+                   P&L, net (swp: +/- its Monte Carlo se, 1c filler contracts,
+                   "expected (calibrated tails)" = net_cal), avg share, fills
+                   within 3 s after a weather update
+  3 breakdowns     the headline variant (swp) by ET hour of the event, strike
+                   class (live / decided), tau bucket, side, and its worst 5
+                   events
   4 market         % of strike-seconds paying without us, % locked at 99,
                    live / decided split, depth within 3c of the touch
   5 model          Brier / log loss of the fair vs the book mid by tau; the
@@ -25,12 +30,12 @@ sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
                    429s, our observation lag (rx - newest station
                    received_at for minutes that just became complete),
                    missing events with the likely reason
-  7 suggestions    a rule engine over the variant pairs (cons fill model):
+  7 suggestions    a rule engine over the variant pairs (swp fill model):
                    window B-A, back vs pull C-B, size D-B ($ per extra
                    contract of q_live), decided E-B and decided strikes
                    alone (G0, the G without the pad hold, else G), the
-                   pad hold G-G0, full F vs best, guard B-H; the opt-cons
-                   fill-model gap; tau-bucket
+                   pad hold G-G0, full F vs best, guard B-H; the fill-model
+                   gap (cons - swp: what sweepers take); tau-bucket
                    losses at or above the current live_stop_min (->
                    live_stop_min); losing ET hours, each hour tested on its
                    own with a Bonferroni bar over 24 hours (-> smaller size
@@ -42,16 +47,27 @@ sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
                    standard error from the per-event spread) and a concrete
                    parameter change; anything under $5/day, under 3 events
                    or within 1 SE of zero is listed as "below noise" instead
-  8 cumulative     per variant since day 1: sum, per-day mean, days positive
+  8 cumulative     per variant since day 1 (swp; cons and opt beside it): sum,
+                   per-day mean, days positive, Monte Carlo se, expected at
+                   calibrated tails
                    (the shadow's partial last day -- SHADOW_UNTIL falls inside
                    it -- counts as its share of 24 event-hours in per-day
                    figures and is left out of days positive)
-  9 week summary   from day 7: GO / NO-GO / EXTEND for the best cons variant
+  9 week summary   from day 7: GO / NO-GO / EXTEND for the best swp variant
                    over FULL days (GO = cumulative net > 0, >= 5 of 7 days
                    positive and a mean > $500/day; NO-GO = negative overall;
                    else EXTEND; the partial last day is shown beside it),
                    its params (temp_shadow_sim.VARIANTS over DEFAULT_POLICY)
                    as the starting config, and the key risks
+
+Fill models (Jack 2026-10-16, "1": "ship the fixes + the sweep-aware report
+column"): opt and cons fill us only from recorded trades; swp (temp_shadow_sim
+since SIM_VERSION 6, temp_shadow_sweep's model) adds the sweepers that took
+live G's 1c fillers within seconds on 10/16 -- the only model that reproduced
+the live hour. The headline, every rule (noise gates unchanged), the
+cumulative days-positive count and the week verdict are judged on swp. Sim
+output from before SIM_VERSION 6 has no swp: the report then falls back to
+cons (and says so); headline_fill() picks the fill model.
 
 Variant letters: the pair rules look variants up by their leading letter
 (exact name "B", or "B" followed by a non-alphanumeric, e.g. "B_pull"); a
@@ -114,8 +130,23 @@ import temp_shadow_common as C
 DAY1 = os.environ.get("TEMP_SHADOW_DAY1", "2026-10-15")   # day 1 of 7
 WEEK_DAYS = 7
 TAU_BUCKETS = ("0-5", "5-10", "10-20", "20-40", "40-60")
-FILLS = ("cons", "opt")
-HEADLINE_FILL = "cons"
+FILLS = ("opt", "cons", "swp")       # column order in the tables
+HEADLINE_FILL = "swp"                # headline, rules, cumulative and verdict ...
+FALLBACK_FILLS = ("swp", "cons", "opt")   # ... else the first one the output has
+FILL_LABEL = {"swp": "swp (sweep-aware)", "cons": "cons", "opt": "opt"}
+SWP_NOTE = ("swp = the sweep-aware fill model (temp_shadow_sweep; it reproduced live G's "
+            "first hour, 26OCT1610, where opt / cons did not): cons fills, plus sweepers "
+            "who take our 1c orders -- recorded 1c taker clusters (all of ours when the "
+            "taker cleared the level), hidden IOC sweeps at the calibrated hazard while we "
+            "rest alone at 1c, and new 99c bids that cross us. Mean of {draws} Monte Carlo "
+            "draws per event, +/- its standard error. The headline, the rules and the "
+            "verdict use swp.")
+CAL_NOTE = ("Expected (calibrated tails) = reward + every swp fill marked at the realized "
+            "longshot rate of its model-probability bucket given a taker hit a bid at that "
+            "price (temp_shadow_sweep_tails.json, 530 settled hours) instead of the hour's "
+            "actual settlement: an ESTIMATE of the expectation, free of the few upsets that "
+            "dominate realized nets; a fill at a 10-90% fair keeps the model's own fair, so "
+            "for live-strike quoting it is circular, not evidence.")
 SEND_SCRIPT = os.path.join(C.REPO, "send_html_email.py")
 EMAIL_ENV = ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD", "ALERT_EMAIL_TO")
 
@@ -288,6 +319,19 @@ def event_hour(event: str, ev: Optional[dict] = None) -> Optional[int]:
     return C.et_dt(ts).hour if ts else None
 
 
+def headline_fill(src) -> str:
+    """The fill model the headline, rules and verdict use: HEADLINE_FILL
+    (swp) when the output has it, else the first of FALLBACK_FILLS present
+    (sim files from before SIM_VERSION 6 have no swp). src: a Window or an
+    agg dict (keys '<variant>|<fill>')."""
+    keys = src.by_key if isinstance(src, Window) else (src or {})
+    have = {split_key(k)[1] for k in keys}
+    for f in (HEADLINE_FILL,) + tuple(x for x in FALLBACK_FILLS if x != HEADLINE_FILL):
+        if f in have:
+            return f
+    return HEADLINE_FILL
+
+
 def resolve_variant(letter: str, names: Sequence[str]) -> Optional[str]:
     """'B' -> 'B' or 'B_pull' (letter then a non-alphanumeric)."""
     if letter in names:
@@ -439,12 +483,17 @@ _SUM_FIELDS = ("reward", "fills_n", "contracts", "trading_pnl", "fees", "net",
 _MAX_FIELDS = ("max_abs_pos", "worst_case_loss")
 
 
+# swp extras (summed when present): 1c filler contracts and the expected net
+# at calibrated tails (net_cal, with its tail-table CI ends)
+_SWP_SUM_FIELDS = ("filler_contracts", "net_cal", "net_cal_tlo", "net_cal_thi")
+
+
 def _new_agg() -> dict:
     a = {f: 0.0 for f in _SUM_FIELDS + _MAX_FIELDS}
     a.update({"n_events": 0, "unsettled": 0, "_sw": 0.0, "_ss": 0.0,
               "avg_share": None, "by_class": {}, "by_tau": {}, "by_side": {},
               "fills_after_wx": {"contracts": 0.0, "pnl": 0.0},
-              "markouts": {}, "_mow": 0.0})
+              "markouts": {}, "_mow": 0.0, "_mcvar": 0.0, "_mc_n": 0, "draws": None})
     return a
 
 
@@ -479,6 +528,14 @@ def agg_variants(events: Sequence[dict]) -> Dict[str, dict]:
                 a[f] += _num(v.get(f))
             for f in _MAX_FIELDS:
                 a[f] = max(a[f], abs(_num(v.get(f))))
+            for f in _SWP_SUM_FIELDS:
+                if _opt_num(v.get(f)) is not None:
+                    a[f] = a.get(f, 0.0) + _num(v.get(f))
+            se = _opt_num(v.get("net_se"))
+            if se is not None:          # Monte Carlo variance of the summed net
+                a["_mcvar"] += se * se
+                a["_mc_n"] += 1
+                a["draws"] = v.get("draws") if a["draws"] in (None, v.get("draws")) else "mixed"
             share = _opt_num(v.get("avg_share"))
             if share is not None:
                 w = _num(v.get("quoted_secs")) if "quoted_secs" in v else (prog or 1.0)
@@ -501,6 +558,7 @@ def agg_variants(events: Sequence[dict]) -> Dict[str, dict]:
         a["avg_share"] = a["_ss"] / a["_sw"] if a["_sw"] > 0 else None
         if a["_mow"] > 0:
             a["markouts"] = {f: x / a["_mow"] for f, x in a["markouts"].items()}
+        a["net_se"] = math.sqrt(a["_mcvar"]) if a["_mc_n"] else None
     return out
 
 
@@ -645,6 +703,15 @@ class Window:
     def total(self, key: str, field: str = "net") -> float:
         return sum(_num(self.day_aggs[d][key].get(field)) for d in self.days_with(key))
 
+    def has(self, key: str, field: str) -> bool:
+        return any(self.day_aggs[d][key].get(field) is not None for d in self.days_with(key))
+
+    def mc_se(self, key: str) -> Optional[float]:
+        """Monte Carlo standard error of total(key) (swp; None otherwise)."""
+        ses = [self.day_aggs[d][key].get("net_se") for d in self.days_with(key)]
+        ses = [x for x in ses if x is not None]
+        return math.sqrt(sum(x * x for x in ses)) if ses else None
+
     def per_day(self, key: str, field: str = "net") -> float:
         n = self.eff_days(self.days_with(key))
         return self.total(key, field) / n if n else 0.0
@@ -775,7 +842,10 @@ def suggest(win: Window, today: str, policy: Policy, market: dict, model: dict,
     then risks, ops, notes; suppressed ones are kept (rendered separately)."""
     out: List[dict] = []
     notes: List[str] = []
-    fill = HEADLINE_FILL
+    fill = headline_fill(win)
+    if fill != HEADLINE_FILL:
+        notes.append(f"No {HEADLINE_FILL} results in the window (sim output from before "
+                     f"SIM_VERSION 6): the rules use the {fill} fill model.")
     names = win.names(fill)
     L = {c: resolve_variant(c, names) for c in "ABCDEFGH"}
     # G0 = G without the 10/16 pad hold (G0_nohold): the decided-only
@@ -952,25 +1022,40 @@ def suggest(win: Window, today: str, policy: Policy, market: dict, model: dict,
                              evidence(label, st),
                              f"{wider}, or drop it ({policy.diff_text(L['B'], L['H'])})",
                              d, gate(st)))
-    # 7 fill-model gap (opt - cons) on the best variant
-    if best and f"{best}|opt" in win.by_key:
-        st = pair_stats(win, k(best), f"{best}|opt", today)
-        cons_pd = win.per_day(k(best))
-        opt_pd = win.per_day(f"{best}|opt")
+    # 7 fill-model gap on the best variant: cons - swp (what the sweepers
+    # take) under swp; opt - cons (the queue assumption) on older output
+    other = "cons" if fill == "swp" else ("opt" if fill == "cons" else None)
+    if best and other and f"{best}|{other}" in win.by_key:
+        st = pair_stats(win, k(best), f"{best}|{other}", today)
+        base_pd = win.per_day(k(best))
+        oth_pd = win.per_day(f"{best}|{other}")
         gap = st["per_day"]
         q = _opt_num(policy.get(best, "q_live"))
         half = f"q_live {q:g} -> {q / 2:g}" if q else "half size"
-        flips = (cons_pd > 0) != (opt_pd > 0) and abs(gap) > 0
-        big = abs(gap) > FILL_GAP_FRAC * abs(cons_pd)
-        why = [] if (flips or big) else [f"gap is under {FILL_GAP_FRAC:.0%} of the cons net"]
+        flips = (base_pd > 0) != (oth_pd > 0) and abs(gap) > 0
+        big = abs(gap) > FILL_GAP_FRAC * abs(base_pd)
+        why = [] if (flips or big) else [f"gap is under {FILL_GAP_FRAC:.0%} of the {fill} net"]
         why += [w for w in gate(st) if "SE" not in w]   # a gap is a range, not a test
-        out.append(_sugg("fillgap", "risk",
-                         f"Fill-model risk on {best}: opt {money(opt_pd)}/day vs cons "
-                         f"{money(cons_pd)}/day",
-                         evidence(f"opt - cons on {best}", st)
-                         + ("; the sign flips with the queue assumption" if flips else ""),
-                         f"go live at {half} first and compare real queue fills against "
-                         f"the sim's cons fills before scaling", gap, why))
+        if fill == "swp":
+            ftc = win.total(f"{best}|swp", "filler_contracts") if win.has(
+                f"{best}|swp", "filler_contracts") else None
+            out.append(_sugg("fillgap", "risk",
+                             f"Sweep risk on {best}: cons {money(oth_pd)}/day vs swp "
+                             f"{money(base_pd)}/day",
+                             evidence(f"cons - swp on {best}", st)
+                             + (f"; swp sweeps {qty(ftc)} 1c filler contracts over the window"
+                                if ftc else "")
+                             + ("; the sign flips with the sweepers" if flips else ""),
+                             f"size live by swp, not cons: start at {half} and compare live "
+                             f"1c fills against the swp sweeps before scaling", gap, why))
+        else:
+            out.append(_sugg("fillgap", "risk",
+                             f"Fill-model risk on {best}: opt {money(oth_pd)}/day vs cons "
+                             f"{money(base_pd)}/day",
+                             evidence(f"opt - cons on {best}", st)
+                             + ("; the sign flips with the queue assumption" if flips else ""),
+                             f"go live at {half} first and compare real queue fills against "
+                             f"the sim's cons fills before scaling", gap, why))
     # 8 tau-bucket losses -> live_stop_min
     if best:
         _tau_rule(win, today, policy, best, out)
@@ -1044,7 +1129,7 @@ def _tau_rule(win: Window, today: str, policy: Policy, best: str, out: List[dict
     quotes no live strikes (live=False)."""
     if policy.get(best, "live") is False:
         return
-    key = f"{best}|{HEADLINE_FILL}"
+    key = f"{best}|{headline_fill(win)}"
     bt = win.agg.get(key, {}).get("by_tau", {})
     nd = win.eff_days(win.days_with(key)) or 1.0
     cur = _opt_num(policy.get(best, "live_stop_min"))
@@ -1109,7 +1194,7 @@ def _hour_rule(win: Window, today: str, policy: Policy, best: str, out: List[dic
     with a Bonferroni bar over 24 hours (HOUR_Z), at least HOUR_MIN_DAYS days
     and a loss on >= HOUR_NEG_FRAC of them. Negative hours that miss the bar
     are listed below noise."""
-    key = f"{best}|{HEADLINE_FILL}"
+    key = f"{best}|{headline_fill(win)}"
     by_h: Dict[int, List[Tuple[str, float]]] = {}
     for e, (d, v, ev) in win.by_key.get(key, {}).items():
         h = event_hour(e, ev)
@@ -1160,13 +1245,22 @@ def _hour_rule(win: Window, today: str, policy: Policy, best: str, out: List[dic
     q = _opt_num(policy.get(best, "q_live"))
     per = ", ".join(f"{h:02d}h {money(sum(x for _, x in by_h[h]) / nd)} (z {zs(h)}, "
                     f"{rows[h][1]:.0%} of {rows[h][2]} days negative)" for h in bad)
+    if policy.get(best, "live") is False:
+        # no live size to halve (decided-only / favorite-only variants): drop
+        # the hours with the policy's own switch, quote_hours_et
+        cur = policy.get(best, "quote_hours_et")
+        keep = [h for h in (cur if isinstance(cur, (list, tuple)) else range(24)) if h not in bad]
+        change = (f"stop quoting those settle hours: quote_hours_et "
+                  f"{_fmt_val(cur) if cur is not None else 'all'} -> {_fmt_val(keep)}")
+    else:
+        change = ("halve size in those hours"
+                  + (f" (q_live {q:g} -> {q / 2:g} there, an hour multiplier of 0.5)" if q else
+                     " (an hour multiplier of 0.5)"))
     out.append(_sugg("hours", "policy",
                      f"{best} loses {usd(st['per_day'])}/day in ET hours "
                      f"{', '.join(f'{h:02d}' for h in bad)}",
                      evidence("losing hours", st) + f"; per hour/day {per}; each hour passed {rule}",
-                     "halve size in those hours"
-                     + (f" (q_live {q:g} -> {q / 2:g} there, an hour multiplier of 0.5)" if q else
-                        " (an hour multiplier of 0.5)"),
+                     change,
                      st["per_day"],
                      # the per-hour test replaces the SE gate (re-testing the
                      # selected hours' values would be circular)
@@ -1190,7 +1284,8 @@ def _window_position_rule(h: dict, policy: Policy, ref: str, L: dict, win: Windo
           "and the informed burst is the 0-2 s after a landing")
     usd_v = 0.0
     if L.get("A") and L.get("B"):
-        st = pair_stats(win, f"{L['A']}|{HEADLINE_FILL}", f"{L['B']}|{HEADLINE_FILL}", today)
+        hf = headline_fill(win)
+        st = pair_stats(win, f"{L['A']}|{hf}", f"{L['B']}|{hf}", today)
         ev += "; " + evidence("window value as configured (B-A)", st)
         usd_v = st["per_day"]
     out.append(_sugg("winpos", "policy",
@@ -1271,7 +1366,7 @@ def collector_settings(path: Optional[str] = None, env=None) -> dict:
 
 
 def _ops_rules(h: dict, win: Window, today: str, best: Optional[str], out: List[dict]) -> None:
-    rew = win.per_day(f"{best}|{HEADLINE_FILL}", "reward") if best else 0.0
+    rew = win.per_day(f"{best}|{headline_fill(win)}", "reward") if best else 0.0
     cfg = h.get("collector_cfg") or collector_settings()
     lo_cur, hi_cur = _num(cfg.get("WX_LO"), 18.0), _num(cfg.get("WX_HI"), 50.0)
     poll = h.get("poll") or {}
@@ -1359,11 +1454,11 @@ def _ops_rules(h: dict, win: Window, today: str, best: Optional[str], out: List[
 
 def week_summary(win: Window, policy: Policy, model: dict,
                  today_health: Optional[dict] = None) -> Optional[dict]:
-    fill = HEADLINE_FILL
+    fill = headline_fill(win)
     best = win.best(fill)
     if not best:
-        return {"verdict": "EXTEND", "best": None,
-                "reason": "no cons results in the window", "risks": [], "config": {}}
+        return {"verdict": "EXTEND", "best": None, "fill": fill,
+                "reason": f"no {fill} results in the window", "risks": [], "config": {}}
     key = f"{best}|{fill}"
     # the verdict is judged on full days: the shadow's partial last day
     # (SHADOW_UNTIL inside it) is reported beside it, not averaged in
@@ -1381,7 +1476,7 @@ def week_summary(win: Window, policy: Policy, model: dict,
                   f"positive on {pos} of {n}")
     elif total < 0:
         verdict = "NO-GO"
-        reason = f"the best cons variant, {best}, lost {money(total)} over {n} days"
+        reason = f"the best {fill} variant, {best}, lost {money(total)} over {n} days"
     else:
         verdict = "EXTEND"
         gaps = []
@@ -1401,7 +1496,21 @@ def week_summary(win: Window, policy: Policy, model: dict,
         reason += (f" (full days only; the partial last day {'; '.join(partial)} is not in "
                    "the verdict)")
     risks = []
-    if f"{best}|opt" in win.agg:
+    if fill == "swp":
+        parts = [f"swp {money(total)}"]
+        se = win.mc_se(key)
+        if se is not None:
+            parts[0] += f" (+/- {usd(se)} Monte Carlo se)"
+        for f in ("cons", "opt"):
+            if f"{best}|{f}" in win.agg:
+                parts.append(f"{f} {money(sum(_num(win.day_aggs[d][f'{best}|{f}']['net']) for d in days if f'{best}|{f}' in win.day_aggs[d]))}")
+        if win.has(key, "net_cal"):
+            parts.append("expected at calibrated tails "
+                         + money(sum(_num(win.day_aggs[d][key].get("net_cal")) for d in days)))
+        risks.append("Fill model: " + ", ".join(parts) + " over the verdict's days: swp adds "
+                     "the sweepers that took live G's 1c fillers; the live 1c fill rate "
+                     "decides how close it is.")
+    elif f"{best}|opt" in win.agg:
         opt_t = win.total(f"{best}|opt")
         gap = opt_t - total
         rel = abs(gap) / abs(total) if total else None
@@ -1424,7 +1533,7 @@ def week_summary(win: Window, policy: Policy, model: dict,
     if today_health and (today_health.get("ws") or {}).get("uptime") is not None:
         risks.append(f"Ops (report day): ws uptime {pct(today_health['ws']['uptime'])}, "
                      f"{(today_health.get('poll') or {}).get('n429', 0)} HTTP 429s.")
-    return {"verdict": verdict, "best": best, "reason": reason, "total": total,
+    return {"verdict": verdict, "best": best, "fill": fill, "reason": reason, "total": total,
             "mean": mean, "days": n, "pos": pos, "need": need, "partial_days": part_days,
             "config": policy.params(best), "overrides": dict(policy.variants.get(best) or {}),
             "policy_err": policy.err, "risks": risks}
@@ -2021,7 +2130,10 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
            "coverage": cov, "health": health, "win": win, "policy": policy,
            "suggestions": sugg, "notes": notes, "sim_summary": sim_summary or {},
            "best_cons": best_variant(agg, "cons"), "best_opt": best_variant(agg, "opt"),
-           "day0_events": 0}
+           "best_swp": best_variant(agg, "swp"), "day0_events": 0}
+    # the headline fill model: swp, else (older sim output) cons
+    ctx["fill"] = fill = headline_fill(win if win.by_key else agg)
+    ctx["best"] = best_variant(agg, fill)
     if day_number(day) >= 1:
         d0 = (_dt.date.fromisoformat(DAY1) - _dt.timedelta(days=1)).isoformat()
         ctx["day0_events"] = len(in_shadow(load_sim_day(d0), rec_start))
@@ -2141,33 +2253,56 @@ def _empty_reason(ctx: dict) -> str:
     return " ".join(reasons) or "No sim output for the day."
 
 
-def _variant_rows(ctx: dict) -> List[List[Any]]:
+def _fill_cols(f: str, agg: Dict[str, dict]) -> List[str]:
+    """Column heads of one fill model's group in the variants table."""
+    cols = ["reward", "contracts", "trading", "net"]
+    if f == "swp":
+        cols += ["+/- mc se", "1c fillers"]
+        if any(split_key(k)[1] == "swp" and a.get("net_cal") is not None for k, a in agg.items()):
+            cols.append("expected (cal. tails)")
+    return cols + ["avg share", "after-wx ct / $"]
+
+
+def _variant_rows(ctx: dict, fills: Sequence[str]) -> List[List[Any]]:
     agg = ctx["agg"]
+    hf = ctx.get("fill") or headline_fill(agg)
     names = sorted({split_key(k)[0] for k in agg},
-                   key=lambda n: -(agg.get(f"{n}|cons") or agg.get(f"{n}|opt") or {}).get("net", 0))
+                   key=lambda n: -(agg.get(f"{n}|{hf}") or agg.get(f"{n}|cons")
+                                   or agg.get(f"{n}|opt") or {}).get("net", 0))
+    best = ctx.get("best")
     rows = []
     for n in names:
-        row: List[Any] = [R(f"<b>{esc(n)}</b>" if n == ctx["best_cons"] else esc(n))]
-        for f in FILLS:
+        row: List[Any] = [R(f"<b>{esc(n)}</b>" if n == best else esc(n))]
+        for f in fills:
+            cols = _fill_cols(f, agg)
             a = agg.get(f"{n}|{f}")
             if not a:
-                row += ["-"] * 6
+                row += ["-"] * len(cols)
                 continue
             faw = a["fills_after_wx"]
-            row += [M(a["reward"]), qty(a["contracts"]), M(a["trading_pnl"]), M(a["net"]),
-                    pct(a["avg_share"]),
+            row += [M(a["reward"]), qty(a["contracts"]), M(a["trading_pnl"]), M(a["net"])]
+            if f == "swp":
+                row.append(usd(a["net_se"]) if a.get("net_se") is not None else "-")
+                row.append(qty(a["filler_contracts"]) if a.get("filler_contracts") is not None
+                           else "-")
+                if "expected (cal. tails)" in cols:
+                    row.append(M(a["net_cal"]) if a.get("net_cal") is not None else "-")
+            row += [pct(a["avg_share"]),
                     R(f"{esc(qty(faw['contracts']))} / {m_html(faw['pnl'])}")]
         rows.append(row)
     return rows
 
 
 def _breakdowns(ctx: dict) -> str:
-    best = ctx["best_cons"]
-    key = f"{best}|cons"
+    best, fill = ctx["best"], ctx["fill"]
+    key = f"{best}|{fill}"
     a = ctx["agg"].get(key)
     if not a:
-        return note("No cons results for the day.")
-    out = [note(f"Variant {best} (cons fills).")]
+        return note(f"No {fill} results for the day.")
+    out = [note(f"Variant {best} ({fill} fills"
+                + (", the sweep-aware model" if fill == "swp" else "")
+                + (f"; means over {a['draws']} Monte Carlo draws" if a.get("draws") else "")
+                + ").")]
     # by ET hour of the event
     hrs: Dict[int, Dict[str, float]] = {}
     for ev in ctx["events"]:
@@ -2229,8 +2364,8 @@ def _breakdowns(ctx: dict) -> str:
 
 def _market_html(ctx: dict) -> str:
     m, cov = ctx["market"], ctx["coverage"]
-    best = ctx["best_cons"]
-    share = (ctx["agg"].get(f"{best}|cons") or {}).get("avg_share") if best else None
+    best = ctx["best"]
+    share = (ctx["agg"].get(f"{best}|{ctx['fill']}") or {}).get("avg_share") if best else None
     rows = [["strike-seconds", qty(m["strike_secs"])],
             ["paying without us", pct(m["paying_frac_without_us"])],
             ["locked at 99 (pays nobody)", pct(m["locked99_frac"])],
@@ -2422,8 +2557,9 @@ def _suggestions_html(ctx: dict) -> str:
                    + "".join(f'<li>{esc(s["title"])} -- {esc(s["why"])}</li>' for s in quiet)
                    + "</ul>")
     out.append(note(f"Gates: >= ${MIN_USD_PER_DAY:.0f}/day, >= {MIN_EVENTS} differing events, "
-                    f"|delta| >= {MIN_Z:g} SE (per-event spread). Pairs use the cons fill model "
-                    "over the cumulative window."))
+                    f"|delta| >= {MIN_Z:g} SE (per-event spread, Monte Carlo noise included). "
+                    f"Pairs use the {ctx.get('fill', HEADLINE_FILL)} fill model over the "
+                    "cumulative window."))
     for n in ctx.get("notes") or []:
         out.append(note(n))
     return "".join(out)
@@ -2433,26 +2569,39 @@ def _cumulative_html(ctx: dict) -> str:
     win: Window = ctx["win"]
     if not win.all_events:
         return note("No sim output in the window yet.")
+    hf = ctx.get("fill") or headline_fill(win)
     names = sorted({split_key(k)[0] for k in win.agg},
-                   key=lambda n: -win.total(f"{n}|cons") if f"{n}|cons" in win.agg else 0)
+                   key=lambda n: -win.total(f"{n}|{hf}") if f"{n}|{hf}" in win.agg else 0)
     show_days = [d for d in win.days if win.days_events[d]][-9:]
-    head = ["variant", "cons sum", "cons /day", "days +", "opt sum", "opt /day"]
+    others = [f for f in FILLS if f != hf and any(split_key(k)[1] == f for k in win.agg)]
+    swp_x = hf == "swp"
+    cal = swp_x and any(win.has(f"{n}|swp", "net_cal") for n in names if f"{n}|swp" in win.agg)
+    head = ["variant", f"{hf} sum", f"{hf} /day", "days +"]
+    head += (["+/- mc se"] if swp_x else []) + (["expected (cal. tails)"] if cal else [])
+    for f in others:
+        head += [f"{f} sum", f"{f} /day"]
     head += [(f"d{day_number(d)}" if day_number(d) >= 1 else d[5:])
              + ("*" if d in win.partial else "") for d in show_days]
     rows = []
     for n in names:
         row: List[Any] = [n]
-        for f in FILLS:
-            key = f"{n}|{f}"
-            if key not in win.agg:
-                row += ["-", "-"] + (["-"] if f == "cons" else [])
-                continue
+        key = f"{n}|{hf}"
+        if key in win.agg:
             dd = win.full_days_with(key) or win.days_with(key)
-            row += [M(win.total(key)), M(win.per_day(key))]
-            if f == "cons":
-                row.append(f"{sum(1 for d in dd if win.day_aggs[d][key]['net'] > 0)}/{len(dd)}")
+            row += [M(win.total(key)), M(win.per_day(key)),
+                    f"{sum(1 for d in dd if win.day_aggs[d][key]['net'] > 0)}/{len(dd)}"]
+            if swp_x:
+                se = win.mc_se(key)
+                row.append(usd(se) if se is not None else "-")
+            if cal:
+                row.append(M(win.total(key, "net_cal")) if win.has(key, "net_cal") else "-")
+        else:
+            row += ["-"] * (3 + (1 if swp_x else 0) + (1 if cal else 0))
+        for f in others:
+            k2 = f"{n}|{f}"
+            row += [M(win.total(k2)), M(win.per_day(k2))] if k2 in win.agg else ["-", "-"]
         for d in show_days:
-            a = win.day_aggs[d].get(f"{n}|cons")
+            a = win.day_aggs[d].get(key)
             row.append(M(a["net"], 0) if a else "-")
         rows.append(row)
     out = [table(head, rows)]
@@ -2462,9 +2611,11 @@ def _cumulative_html(ctx: dict) -> str:
                  f"{_fmt_days(24 * win.weights.get(d, 1.0))} of 24 event-hours): its net is in "
                  "the sums, counts as that fraction of a day in /day, and is left out of "
                  "days + and the week verdict.")
-    out.append(note(f"Window {win.days[0]} .. {win.days[-1]}; day columns are cons net."
+    out.append(note(f"Window {win.days[0]} .. {win.days[-1]}; days + and the day columns are "
+                    f"{hf} net."
                     + (f" Day 0 (partial, {ctx['day0_events']} events) is excluded."
-                       if ctx.get("day0_events") else "") + part))
+                       if ctx.get("day0_events") else "") + part
+                    + (" " + CAL_NOTE if cal else "")))
     return "".join(out)
 
 
@@ -2492,7 +2643,7 @@ def _week_html(ctx: dict) -> str:
 
 def render_html(ctx: dict) -> str:
     day, agg = ctx["day"], ctx["agg"]
-    best, bopt = ctx["best_cons"], ctx["best_opt"]
+    best, fill = ctx["best"], ctx["fill"]
     n_ev = len(ctx["events"])
     parts = [f'<div style="max-width:1000px;">',
              f'<h1 style="font-size:21px;margin:0 0 2px 0;">Temp shadow (KXTEMPMIAH) -- '
@@ -2532,23 +2683,37 @@ def render_html(ctx: dict) -> str:
     # 1 headline
     parts.append(h2("Headline"))
     if best:
-        a = agg[f"{best}|cons"]
+        a = agg[f"{best}|{fill}"]
         n = max(a["n_events"], 1)
         desc = ctx["policy"].desc(best)
+        se = a.get("net_se")
         parts.append(
-            f'<p style="font-size:15px;margin:4px 0;">Best cons variant <b>{esc(best)}</b>'
+            f'<p style="font-size:15px;margin:4px 0;">Best {esc(fill)} variant <b>{esc(best)}</b>'
             + (f' <span style="color:{MUTED};">({esc(desc)})</span>' if desc else "")
-            + f': net <b>{m_html(a["net"])}</b> = reward {m_html(a["reward"])} + trading '
-              f'{m_html(a["trading_pnl"])}'
+            + f': net <b>{m_html(a["net"])}</b>'
+            + (f' (+/- {esc(usd(se))} Monte Carlo se)' if se is not None else "")
+            + f' = reward {m_html(a["reward"])} + trading {m_html(a["trading_pnl"])}'
             + (f' - fees {m_html(a["fees"])}' if abs(a["fees"]) > 0.005 else "")
             + f'.<br>Per event-hour ({a["n_events"]}): net {m_html(a["net"] / n)}, reward '
-              f'{m_html(a["reward"] / n)}, trading {m_html(a["trading_pnl"] / n)}.</p>')
-        if bopt and f"{bopt}|opt" in agg:
-            o = agg[f"{bopt}|opt"]
-            parts.append(note(f"Best opt variant {bopt}: net {money(o['net'])} (reward "
-                              f"{money(o['reward'])}, trading {money(o['trading_pnl'])}). "
-                              "opt = we fill at an equal price ahead of the queue; cons = the "
-                              "queue ahead of us fills first."))
+              f'{m_html(a["reward"] / n)}, trading {m_html(a["trading_pnl"] / n)}.'
+            + (f'<br>Expected (calibrated tails): {m_html(a["net_cal"])} -- an estimate, see '
+               f'the note under Variants.' if a.get("net_cal") is not None else "")
+            + '</p>')
+        if fill == "swp":
+            parts.append(note("Chosen on swp net: the sweep-aware fill model, where sweepers "
+                              "take our 1c orders (see the note under Variants)."))
+        elif fill != HEADLINE_FILL:
+            parts.append(note(f"No {HEADLINE_FILL} results for this window (sim output from "
+                              f"before SIM_VERSION 6): the headline uses {fill}."))
+        for f in ("cons", "opt"):
+            bf = ctx.get(f"best_{f}")
+            if f != fill and bf and f"{bf}|{f}" in agg:
+                o = agg[f"{bf}|{f}"]
+                parts.append(note(f"Best {f} variant {bf}: net {money(o['net'])} (reward "
+                                  f"{money(o['reward'])}, trading {money(o['trading_pnl'])})."
+                                  + (" opt = we fill at an equal price ahead of the queue; "
+                                     "cons = the queue ahead of us fills first." if f == "opt"
+                                     else "")))
         if a["unsettled"]:
             parts.append(note(f"{a['unsettled']} event(s) not settled: their trading P&L is incomplete."))
     else:
@@ -2561,11 +2726,20 @@ def render_html(ctx: dict) -> str:
     # 2 variant table
     parts.append(h2("Variants"))
     if agg:
+        fills = [f for f in FILLS if any(split_key(k)[1] == f for k in agg)]
         top = ("<tr>" + f'<th style="{S_TH}"></th>'
-               + "".join(f'<th colspan="6" style="{S_TH}text-align:center;">{f}</th>' for f in FILLS)
+               + "".join(f'<th colspan="{len(_fill_cols(f, agg))}" style="{S_TH}'
+                         f'text-align:center;">{esc(FILL_LABEL.get(f, f))}</th>' for f in fills)
                + "</tr>")
-        sub = ["reward", "contracts", "trading", "net", "avg share", "after-wx ct / $"]
-        parts.append(table(["variant"] + sub + sub, _variant_rows(ctx), top=top))
+        head = ["variant"] + [c for f in fills for c in _fill_cols(f, agg)]
+        parts.append(table(head, _variant_rows(ctx, fills), top=top))
+        if "swp" in fills:
+            dr = {a.get("draws") for k, a in agg.items() if split_key(k)[1] == "swp"}
+            dr.discard(None)
+            parts.append(note(SWP_NOTE.format(draws=(dr.pop() if len(dr) == 1 else "N"))))
+            if any(split_key(k)[1] == "swp" and a.get("net_cal") is not None
+                   for k, a in agg.items()):
+                parts.append(note(CAL_NOTE))
         descs = [(n, ctx["policy"].desc(n)) for n in sorted({split_key(k)[0] for k in agg})]
         descs = [(n, d) for n, d in descs if d]
         if descs:
@@ -2608,11 +2782,11 @@ def render_html(ctx: dict) -> str:
 
 def subject_line(ctx: dict) -> str:
     day, n = ctx["day"], ctx["day_n"]
-    best = ctx["best_cons"]
+    best, fill = ctx["best"], ctx["fill"]
     if best:
-        a = ctx["agg"][f"{best}|cons"]
-        s = (f"Temp shadow day {n} ({day}): best {best} net {money(a['net'], 0)}/day "
-             f"(reward {money(a['reward'], 0)}, fills {money(a['trading_pnl'], 0)})")
+        a = ctx["agg"][f"{best}|{fill}"]
+        s = (f"Temp shadow day {n} ({day}): best {best} net {money(a['net'], 0)}/day on "
+             f"{fill} (reward {money(a['reward'], 0)}, fills {money(a['trading_pnl'], 0)})")
     else:
         s = f"Temp shadow day {n} ({day}): no sim results"
     if ctx.get("sim_error"):
@@ -2646,11 +2820,19 @@ def render_text(ctx: dict) -> str:
                      f"SIM_VERSION than {ctx.get('sim_version')} ("
                      + ", ".join(f"{d} x{n}" for d, n in sorted(stale.items()))
                      + "): the cumulative figures mix two grids; re-sim those days.")
-    best = ctx["best_cons"]
+    best, fill = ctx["best"], ctx["fill"]
     if best:
-        a = ctx["agg"][f"{best}|cons"]
-        lines.append(f"{best} (cons): reward {money(a['reward'])}, trading {money(a['trading_pnl'])}, "
-                     f"net {money(a['net'])} over {a['n_events']} events.")
+        a = ctx["agg"][f"{best}|{fill}"]
+        se = a.get("net_se")
+        lines.append(f"{best} ({fill}): reward {money(a['reward'])}, trading "
+                     f"{money(a['trading_pnl'])}, net {money(a['net'])}"
+                     + (f" +/- {usd(se)} (Monte Carlo se)" if se is not None else "")
+                     + f" over {a['n_events']} events"
+                     + (f"; expected at calibrated tails {money(a['net_cal'])} (an estimate)"
+                        if a.get("net_cal") is not None else "") + ".")
+        if fill == "swp":
+            lines.append("swp = the sweep-aware fill model (sweepers take our 1c orders); the "
+                         "headline, rules and verdict use it.")
     else:
         lines.append(_empty_reason(ctx))
     act = [s for s in ctx["suggestions"] if not s["suppressed"]][:5]

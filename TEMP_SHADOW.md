@@ -68,7 +68,9 @@ These were verified on 10/14.
 | `temp_shadow_model.py` | Index replica plus the fair-value model (`fit` CLI writes model_params.json). |
 | `temp_shadow_scoring.py` | Reward scoring (an exact port of the IMM rules) plus book reconstruction from the ws stream. |
 | `temp_mm_policy.py` | THE QUOTING POLICY as pure logic (DEFAULT_POLICY, VARIANTS, `decide()` / `quote_market()`, risk sizing, order diff). The sim replays it and the live executor runs it, so shadow numbers describe the code that trades. |
-| `temp_shadow_sim.py` | Replay engine: feeds temp_mm_policy the replayed books, fairs and fills; fill models, reward accrual, settlement P&L. |
+| `temp_shadow_sim.py` | Replay engine: feeds temp_mm_policy the replayed books, fairs and fills; fill models opt / cons / swp, reward accrual, settlement P&L. |
+| `temp_shadow_sweep.py` | The sweep-aware fill model (swp, its `VPass`) that the sim runs for every variant, plus its own tools: hazard `calibrate`, `tails`, `validate` on live hours, `run` / `sens` / `table` studies, `export` of a fit. |
+| `temp_shadow_sweep_hazard.json` / `temp_shadow_sweep_tails.json` | The swp defaults the sim loads: the 10/16 pre-live hazard fit (37 hours, validated on the live hour 26OCT1610) and the realized-tails table behind `net_cal`. `<TEMP_SHADOW_DATA>\model\sweep_hazard.json` / `sweep_tails.json` override them (Recalibrating swp, below). |
 | `temp_mm_live.py` / `run_temp_mm.ps1` | The LIVE executor of the same policy (DRY by default; `--live --subaccount N` is Jack's). It tails this collector's wx stream read-only. Handoff: TEMP_MM_LIVE.md. |
 | `temp_shadow_report.py` | Daily report (HTML email) plus the week summary and rule-based tweak suggestions. |
 | `run_temp_shadow_collector.ps1` / `run_temp_shadow_collector_hidden.vbs`, `run_temp_shadow_report_hidden.vbs`, `register_temp_shadow_collector.ps1`, `register_temp_shadow_report.ps1` | Windows tasks. |
@@ -81,6 +83,7 @@ raw/<UTC day>/{ws,wx,meta}_<HH>.jsonl[.gz]   recording (shapes in temp_shadow_co
 settled/<EVENT>.json                         results, expiration_value, REST trades, official index
 backfill/                                    history pulls (wx/, settled/, iem/, study/)
 model/model_params.json                      fitted model
+model/sweep_hazard.json, sweep_tails.json    optional swp recalibration (else the repo defaults)
 sim/<ET day>/<EVENT>.json                    per-event per-variant results
 reports/<ET day>.html                        daily reports
 collector_status.json, collector.log, HALT   ops
@@ -123,6 +126,7 @@ collector_status.json, collector.log, HALT   ops
 - The single instance is enforced through `collector.lock`, a PID check, and a refusal to start if another live PID holds it (exit 4; the launcher then quits).
 - A restart costs about 20–30 s of recording. Raw data is about 15 MB/hour uncompressed, about 0.6 MB/hour gzipped.
 - `HALT` exits cleanly.
+- Raw-file lookups create no folders (since SIM_VERSION 6, 10/16). `temp_shadow_common.raw_file` / `raw_files` / `iter_raw` only compute paths. Every writer creates its folder first: the collector's `RawWriter`, `append_jsonl` / `write_json_atomic`, or `raw_file(..., create=True)`. Before this, every probe created `raw/<UTC day>/`: the sim's `day_events` reads 3 h past its day, and the sweep's `recorded_events` probed too. That left empty future-day folders in the recording (10/16: `raw/2026-10-06`..`13` and `2026-10-17`..`25`, all empty and safe to delete). The running collector keeps the old module until its next restart. Its writes are unaffected, because `RawWriter` makes the folder itself.
 - Exits at `SHADOW_UNTIL_UTC`.
 - Total REST load is about 0.6 requests/s.
 - Never imports incentive_mm.py.
@@ -175,7 +179,25 @@ The simulator replays one event at a time.
 
 **Risk limits:** per-market position cap, plus a per-event worst-case-loss cap across the nested strikes.
 
-**Fill models:** `opt` and `cons` run as separate passes, because fills change inventory.
+**Fill models:** `opt`, `cons` and `swp` run as separate passes, because fills change inventory. Jack, 2026-10-16 ("1"): "ship the fixes + the sweep-aware report column".
+- `swp` is cons plus the sweepers who take our 1c orders. The model is `temp_shadow_sweep`'s, described under "Fill model swp" below: recorded 1c taker clusters with price-time priority (rec_mode `level`), hidden IOC sweeps at the calibrated hazard while we rest alone at 1c, and new 99c bids that cross us. It is the only model that reproduced live G's first hour (26OCT1610).
+- `run_event` / `run_day` write `"<variant>|swp"` for every variant, with the opt/cons schema holding the means over the draws. They add `draws`, `net_sd`, `net_se` (the Monte Carlo standard error of `net`), `draw_net`, `filler_contracts`, `sweep_src`, `haz_events` and `swp_exact`. They also add `net_cal` / `net_cal_tlo` / `net_cal_thi`: reward plus every fill marked at the realized longshot rate of its model bucket given a taker hit a bid at that price (an ESTIMATE; "Realized tails" below). The top-level `"swp"` block names the draws, seed, rec_mode, channels and the hazard / tails ids and files.
+- **Monte Carlo:** `SWP_DRAWS` = 6 draws per event (env `TEMP_SHADOW_SWP_DRAWS`), with fixed seeds (`tmm-sweep-1`). Draw k's hidden-sweep candidates depend only on (event, k), so every variant meets the same arrivals (common random numbers) and a re-run gives the same numbers. Draw k is also the standalone module's draw k.
+- **Exact shortcuts**, which `test_temp_shadow_sim` checks against running every draw in full:
+  - A variant whose first draw never rests a 1c order is the same in every draw (`swp_exact`: FAV_only, FAV_night).
+  - A variant whose first draw accepts no hidden sweep logs its 1c trajectory, and a later draw is run only if one of its candidates would be accepted along it (`temp_shadow_sweep.hazard_hits`). This covers the live-only variants, whose qualification pads rarely meet the hazard.
+- **Runtime** (measured 10/16 on a copy of the recording, `run_day` at the report task's 2 workers, nothing else running): a 22-event day (10/15) took 398 s at 6 draws and 485 s at 8, against about 70 s for opt / cons alone. 10/16 (18 settled events) took 331 s at 6 draws. That is about 18 s of wall time per event at 6 draws: a 24-event day in about 7.5 minutes, and the longest window (10/15-10/23 = 200 events, re-simmed after a SIM_VERSION, grid or swp-table change) in about 61 minutes, against the task's 2 h limit (8 draws: about 73 minutes). Hence 6 draws. The Monte Carlo se of a 24-event day of a 1c-filler variant is then about $25 (G0_nohold: $33 over the 43 recorded hours); FAV_* have none.
+- **Cache:** `run_day` reuses a sim file only when its swp block matches the current draws, hazard id, tails id, rec_mode, channels, seed and sweep version. A recalibration or a new draw count re-sims the report's whole window, so the cumulative figures never mix tables.
+
+**Recalibrating swp.** The sim loads `<TEMP_SHADOW_DATA>\model\sweep_hazard.json` when it exists, else the repo's `temp_shadow_sweep_hazard.json`. Tails work the same way, with `sweep_tails.json` / `temp_shadow_sweep_tails.json`. To refit on newer hours:
+```
+python temp_shadow_sweep.py --out <dir> calibrate                  # <dir>\hazard.json (+ hazard_prelive.json while live hours exist)
+python temp_shadow_sweep.py --out <dir> validate --live --hazard <dir>\hazard_prelive.json   # check it on the live hours first
+python temp_shadow_sweep.py export --hazard <dir>\hazard.json --to <TEMP_SHADOW_DATA>\model\sweep_hazard.json
+python temp_shadow_sweep.py --out <dir> tails                      # optional
+python temp_shadow_sweep.py export --tails <dir>\tails.json --to <TEMP_SHADOW_DATA>\model\sweep_tails.json
+```
+`export` keeps exactly what `Hazard` / `TailCal` read, in order (the size draws are indexed, so their order is part of the fit). It prints the table's id, which every sim file then records. The next report re-sims its window under the new table, up to about an hour for 9 days at 2 workers. Deleting the file goes back to the repo default.
 
 ### Policy and variants
 
@@ -201,16 +223,18 @@ These are all parameters of one policy, so a tweak is a config change.
 
 **Quoting window:** quote only inside the program window.
 
+**Quote hours** (`quote_hours_et`, added 10/16 for FAV_night). This is a list of ET clock hours, `None` = every hour (the default). An event is quoted only when the ET hour of its SETTLEMENT (the ticker's hour: `KXTEMPMIAH-26OCT1607` settles at 07:00 ET) is listed. Outside them nothing rests on any of its markets: `temp_mm_policy.decide` fails every market's program test (`reason` `off_hours`), and the sim applies the same rule per event. `temp_mm_policy.et_hour` is DST-safe without tz files and matches `zoneinfo` hour by hour over 2024-2030. On the 2026-11-01 fall-back, the 07:00 event (12:00Z, EST) is quoted and 08:00 (13:00Z) is not, and the repeated 01:00 is the ticker's first (05:00Z). The live executor passes the same settle time (TEMP_MM_LIVE.md, Quote hours).
+
 **Pad hold** (`pad_hold_open_s`, added 10/16). Jack, 2026-10-16: "hold the pads for the first 3 minutes of each hour going forward". In live G's first hour (26OCT1610, 13:02Z) sweepers took 4,659 of its 1c fillers within about 45 s of the program opening.
 - While the orders would start resting before the event's open + `pad_hold_open_s`, no 1c longshot pad and no 1c qualification pad rests. Favorite joins, live and near-decided quotes are unaffected (a near quote that sits at 1c stays).
 - The open is the markets' `open_time` (close − 3600 when unknown). The test is `temp_mm_policy.pad_hold_flag` on the orders' resting start (decision time + 0.15 s), the same rule the live executor applies. In the sim the pads are active by open + 180.65 s (the hh:03:00.5 tick, or an earlier station-row decision).
 - Default 0 (off). Only G holds (180 s); `G0_nohold` is the G before the hold, kept for comparison.
 
-**Variant grid:** the grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`). Since 10/16 `G_decided_only` (what runs live) holds its pads for 180 s and `G0_nohold` is the old G. SIM_VERSION 5 makes `run_day` re-sim the older cached files of any day it is asked for; the daily report asks for every day of its cumulative window (day 1 .. the report day), so the first report after a SIM_VERSION or `VARIANTS` change re-sims the whole window (review fix 10/16: before it only the report day re-simmed, so 10/15 stayed at SIM_VERSION 4, where `G_decided_only` had no hold and `G0_nohold` did not exist; the first report run with the fix re-sims it to 5). SIM_VERSION 5 also covers the live-order subtraction from the sweep-aware shadow (merged with it, see below): the 10/16 files simmed at 4 without it re-sim too. The sweep-aware shadow runs the same pair as `G_hold180` (= `G_decided_only`) and `G` (= `G0_nohold`).
+**Variant grid:** the grid is in `temp_mm_policy.VARIANTS` (re-exported as `temp_shadow_sim.VARIANTS`). Two variants were added on 10/16 (Jack: "1", "add favorite-only and overnight-favorite-only to the shadow"). `FAV_only` = live off, decided on, `q_pad` 0, `qual_pads` off, `near_decided_half` off: G's favorite joins and nothing at 1c (the sweep study's "favorite joins only"). `FAV_night` = FAV_only with `quote_hours_et` [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7], i.e. the events settling 20:00-07:00 ET, where the sweep study found almost all of its expectation. Every earlier variant is unchanged: on the recording their opt / cons results are bit-identical to SIM_VERSION 5 (Daily pipeline swp, below). SIM_VERSION 6 (swp for every variant, the two FAV variants) re-sims every cached day the report asks for. Since 10/16 `G_decided_only` (what runs live) holds its pads for 180 s and `G0_nohold` is the old G. SIM_VERSION 5 makes `run_day` re-sim the older cached files of any day it is asked for; the daily report asks for every day of its cumulative window (day 1 .. the report day), so the first report after a SIM_VERSION or `VARIANTS` change re-sims the whole window (review fix 10/16: before it only the report day re-simmed, so 10/15 stayed at SIM_VERSION 4, where `G_decided_only` had no hold and `G0_nohold` did not exist; the first report run with the fix re-sims it to 5). SIM_VERSION 5 also covers the live-order subtraction from the sweep-aware shadow (merged with it, see below): the 10/16 files simmed at 4 without it re-sim too. The sweep-aware shadow runs the same pair as `G_hold180` (= `G_decided_only`) and `G` (= `G0_nohold`).
 
 ## Daily report (08:30 ET, previous ET day, plus cumulative)
 
-**Variant table:** reward, fills, contracts, trading P&L and net per variant, for both `opt` and `cons`. The headline is the best `cons` variant.
+**Variant table:** reward, fills, contracts, trading P&L and net per variant, for `opt`, `cons` and `swp` side by side. The swp group adds the Monte Carlo standard error, the 1c filler contracts swept, and "expected (calibrated tails)" = `net_cal`, with its caveat that it is an estimate and circular for 10-90% fills. A one-line note explains swp. **The headline is the best `swp` variant** ("Chosen on swp net"), with the best cons / opt variants beside it. The email subject says so: `best FAV_night net +$X/day on swp (reward ..., fills ...)`. Sim output from before SIM_VERSION 6 has no swp, and the report then falls back to cons and says so (`headline_fill`).
 
 **Headline-variant breakdowns:** by hour of day, strike class, τ bucket and side, plus worst events.
 
@@ -229,11 +253,13 @@ These are all parameters of one policy, so a tweak is a config change.
 - Our observation lag versus Kalshi's `received_at`.
 - Missing events or hours.
 
-**Suggested tweaks:** rule-based, from the variant deltas and diagnostics. The decided-strikes rule measures decided strikes alone on `G0_nohold` (G without the pad hold) when the window has it, else on G with its hold named. The pad-hold rule pairs `G_decided_only` with `G0_nohold` (G-G0) on the events both ran on.
+**Suggested tweaks:** rule-based, from the variant deltas and diagnostics, compared on **swp**. The noise gates are unchanged; the per-event spread they use now includes the Monte Carlo noise. The fill-model rule is now the sweep gap (cons - swp on the best variant: what sweepers take). The losing-hours rule on a variant without live quotes (G, FAV) proposes dropping those settle hours through `quote_hours_et` instead of halving a live size. The decided-strikes rule measures decided strikes alone on `G0_nohold` (G without the pad hold) when the window has it, else on G with its hold named. The pad-hold rule pairs `G_decided_only` with `G0_nohold` (G-G0) on the events both ran on.
 
 **Sim freshness:** the report re-runs `run_day` for every window day (cached files from the current SIM_VERSION with the current overrides are only loaded). A window file still from an older SIM_VERSION (a `--no-sim` report, a failed re-sim) is flagged at the top of the report and in the subject.
 
-**Week summary:** on and after day 7, with a go/no-go and a recommended starting configuration.
+**Cumulative table:** per variant, the swp sum, per day, days positive, Monte Carlo se and expected-at-calibrated-tails sum, then cons and opt sums. The day columns are swp net.
+
+**Week summary:** on and after day 7, with a go/no-go and a recommended starting configuration. The GO / NO-GO is judged on the best **swp** variant, and its risks line gives swp (+/- Monte Carlo se), cons, opt and the expected-at-calibrated-tails figure.
 
 **Delivery:** emailed via `send_html_email.py` (ALERT_EMAIL_* env). The HTML is kept in reports/.
 
@@ -242,7 +268,7 @@ These are all parameters of one policy, so a tweak is a config change.
 | task | trigger | does |
 |---|---|---|
 | `KL temp-shadow collector` | at logon (+1 min), and every 10 min with IgnoreNew, no time limit | `run_temp_shadow_collector.ps1` restart loop |
-| `KL temp-shadow report` | daily 08:30 ET, StartWhenAvailable, 2 h limit | sim the previous ET day and re-sim any stale window day (a full 8-day re-sim after a grid change takes about 40 min at 2 workers), build the report, email it |
+| `KL temp-shadow report` | daily 08:30 ET, StartWhenAvailable, 2 h limit | sim the previous ET day and re-sim any stale window day, build the report, email it. With swp, a full window re-sim after a SIM_VERSION, grid or swp-table change takes about 7.5 min a day at 6 swp draws and 2 workers, about 61 min for the longest window (10/15-10/23, 200 events; measured 10/16) |
 
 To stop the test:
 - Create `KL-data\temp-shadow\HALT`.
@@ -294,8 +320,9 @@ class FairModel:              # FairModel(params=None) loads MODEL_PARAMS_FILE (
 
 # temp_shadow_sim.py
 DEFAULT_POLICY: dict; VARIANTS: Dict[str, dict]   # each variant = overrides of DEFAULT_POLICY
-FILL_MODELS = ("opt", "cons")
-def run_event(event_ticker, variants=None, fill_models=FILL_MODELS, model=None) -> dict
+FILL_MODELS = ("opt", "cons", "swp")
+def run_event(event_ticker, variants=None, fill_models=FILL_MODELS, model=None,
+              until_ts=None, draws=None) -> dict          # draws: swp Monte Carlo draws (SWP_DRAWS)
 def run_day(et_day: str, variants=None, force=False) -> List[dict]  # writes sim/<day>/<EVENT>.json
 # CLI: python temp_shadow_sim.py day --day YYYY-MM-DD [--force] | event --event EVT
 ```
@@ -324,6 +351,7 @@ def run_day(et_day: str, variants=None, force=False) -> List[dict]  # writes sim
 - `by_tau` buckets are minutes to close at the time of the fill or reward. Model eval samples once a minute per strike.
 - `fills_after_wx` counts fills within 3 s after a weather update changed the replica index.
 - `trading_pnl` is settled P&L of the fills in dollars. `net = reward + trading_pnl - fees`.
+- `"<variant>|swp"` (since SIM_VERSION 6) holds the same keys as means over its Monte Carlo draws, plus `draws`, `net_sd` / `reward_sd` / `trading_pnl_sd` / `contracts_sd` / `filler_contracts_sd`, `net_se` (= net_sd / sqrt(draws)), `draw_net` (per draw), `swp_exact`, `filler_contracts` (1c), `haz_events`, `sweep_src` (`rec` / `haz` / `cross` contracts), `pnl_cal`, and `net_cal` with `net_cal_tlo` / `net_cal_thi`. The file adds `"fill_models"` and `"swp": {"draws", "rec_mode", "channels", "seed", "hazard_id", "hazard_src", "hazard_built", "lam_max", "tails_id", "tails_src", "tails_built", "sweep_version"}`.
 
 ### Verified live formats (collector, 2026-10-15)
 
@@ -507,6 +535,56 @@ Per day, swp net / net_cal:
 - **By ET settle hour, favorite joins only:** +$6 to +$36 per hour from 20:00 to 07:00 ET, +$1-5 from 08:00 to 11:00, about $0-7 from 14:00 to 19:00 (reward about $1/h there). 12:00 and 13:00 hold the upset (-$496) and a +$179 hour.
 - **F's live-strike quoting loses** under opt and cons as well, and its net_cal is circular, so it is not a candidate.
 
+### Daily pipeline swp (SIM_VERSION 6, 2026-10-16)
+
+Jack 2026-10-16 ("1"): "ship the fixes + the sweep-aware report column, and add favorite-only and overnight-favorite-only to the shadow". Since SIM_VERSION 6, `temp_shadow_sim` runs swp for every variant beside opt / cons (Simulator, Fill models). These checks were run on a copy of the recording (raw/, settled/, model/, backfill/calibrations.json and the executor's 10/16 logs, taken 10/16 17:18 ET; KL-data only read). The settled recorded hours are the 43 from 26OCT1421 to 26OCT1617.
+
+**opt / cons unchanged.** Every pre-existing variant's opt and cons result on all 43 hours is identical to the merged tree before swp (SIM_VERSION 5, temp-integrate 88d5f5d): 1,118 variant x fill results, 43,602 values, 0 differences. The shared blocks (coverage, market stats, model eval, results) are identical too.
+
+**swp = the standalone sweep module.** Here the pipeline ran with the sweep study's 38-hour hazard (id 1e6dfe6a65c52a4d, dropped in as `model\sweep_hazard.json` on the copy) at 6 draws, on the study's 39 hours (26OCT1421-1613). For the six variants both grids have, every event's per-draw nets equal the study's first 6 draws exactly: 234 of 234 variant x event pairs. The pairs are G0_nohold = G, G_decided_only = G_hold180, FAV_only = "favorite joins only", I_pads_only = pads_only, J_decided_fav100 = J_fav100 and F_full = F. Against the study's 30-draw means, the 6-draw totals are within Monte Carlo noise:
+
+| variant | pipeline swp, 6 draws | study, first 6 draws | study, 30 draws | difference (Monte Carlo se) | net_cal 6 / 30 draws |
+|---|---|---|---|---|---|
+| G0_nohold (study G) | -805.13 | -805.13 | -763.29 | -41.84 (34.70) | -1,022 / -978 |
+| G_decided_only (G_hold180) | -462.14 | -462.14 | -456.78 | -5.36 (19.72) | -758 / -743 |
+| FAV_only (favorite joins only) | -86.61 | -86.61 | -86.61 | 0 (exact) | +499 / +499 |
+| I_pads_only (pads_only) | -941.94 | -941.94 | -911.87 | -30.06 (31.00) | -1,749 / -1,717 |
+| J_decided_fav100 (J_fav100) | -875.82 | -875.82 | -839.63 | -36.20 (32.67) | -1,423 / -1,385 |
+| F_full (F) | -904.42 | -904.42 | -872.45 | -31.98 (28.74) | +1,442 / +1,491 (circular) |
+
+The se is that of a 6-draw mean against the 30-draw mean of the same draws. The differences share their draws (common random numbers), so they move together.
+
+**The variant table under the shipped defaults** (the 37-hour pre-live hazard, 6 draws, all 43 settled recorded hours, totals in $):
+
+| variant | opt net | cons net | swp reward | swp P&L | swp net | mc se | swp 1c contracts | net_cal (estimate) |
+|---|---|---|---|---|---|---|---|---|
+| H_noguard_pull | +2,020 | +669 | 731 | -179 | **+551** | 11 | 11,253 | (circular) |
+| FAV_night | +682 | +198 | 119 | +80 | **+198** | 0 | 0 | +196 |
+| C_live300_back | -962 | +119 | 396 | -412 | -15 | 51 | 20,236 | (circular) |
+| B_live300_pull | -1,033 | +32 | 274 | -353 | -80 | 11 | 11,108 | (circular) |
+| FAV_only | -192 | -82 | 177 | -259 | -82 | 0 | 0 | **+503** |
+| D_live600_pull | -1,495 | -53 | 395 | -575 | -179 | 2 | 11,485 | (circular) |
+| A_live300_nowin | -1,154 | -231 | 510 | -875 | -365 | 51 | 20,180 | (circular) |
+| G_decided_only | +2,843 | +3,473 | 1,618 | -2,205 | -588 | 22 | 347,156 | -793 |
+| K_full_wcl500 | +2,757 | +3,496 | 1,856 | -2,760 | -904 | 33 | 372,972 | (circular) |
+| G0_nohold | +3,075 | +3,480 | 1,493 | -2,452 | -959 | 33 | 371,806 | -1,090 |
+| E_live300_pull_decided | +2,231 | +3,512 | 1,742 | -2,737 | -995 | 35 | 376,128 | (circular) |
+| F_full | +2,039 | +3,506 | 1,916 | -2,942 | -1,026 | 34 | 377,179 | (circular) |
+| J_decided_fav100 | +2,693 | +2,956 | 1,235 | -2,278 | -1,043 | 30 | 369,609 | -1,504 |
+| L_decided_pad3000 | +3,065 | +3,471 | 1,542 | -2,616 | -1,074 | 35 | 388,223 | -1,168 |
+| I_pads_only | +2,180 | +2,491 | 1,031 | -2,152 | -1,121 | 28 | 367,715 | -1,842 |
+
+net_cal for the variants that quote live strikes keeps the model's own fair on their 10-90% fills: +1,384 to +5,137, which is circular and not evidence (Realized tails, above).
+
+Per ET day, opt / cons / swp net, and swp net_cal:
+- FAV_only: 10/14 (3 hours) +114 / +26 / +26, +26; 10/15 (22) +372 / +93 / +93, +92; 10/16 (18) -678 / -200 / -200, +386.
+- FAV_night: 10/14 +114 / +26 / +26, +26; 10/15 +316 / +77 / +77, +76; 10/16 +251 / +96 / +96, +95.
+- G_decided_only: 10/14 +262 / +176 / -88, -76; 10/15 +1,811 / +1,688 / -852, -495; 10/16 +770 / +1,609 / +353, -221.
+
+**Reading it.**
+- FAV_* never rest a 1c order, so swp = cons for them, exactly and with no Monte Carlo noise. FAV_night is positive on every day: +$9.4 per event-hour realized and +$9.4 at calibrated tails over its 21 hours. FAV_only's daytime hours hold the 26OCT1612 upset (-$496), so it is -$82 realized and +$503 at calibrated tails. The 13:00 hours alone are +$175 of that +$503, and the other daytime hours add about +$2 an hour.
+- Every variant with 1c fillers keeps losing under swp, as in the study. The live-quoting variants without decided strikes (A-D, H) rest qualification pads only, and sweepers take 11,000-20,000 contracts of them. H_noguard_pull is the best realized swp net (+$551), and the report's headline would show it. Its expectation (net_cal) is circular, and the guard rule weighs it against B.
+
 ### Live-order subtraction and the 10/16 shadow numbers
 
 - 26OCT1600 to 1609 (before live) and 26OCT1611 to 1613 (after the HALT) have no live rows. The subtraction is a no-op there. On 1611 all 24 VARIANT x fill entries are identical.
@@ -533,6 +611,7 @@ python temp_shadow_sweep.py run --day 2026-10-14 2026-10-15 2026-10-16 [--draws 
                                 [--rec-mode level|front|size|all] [--hazard-scale X] [--hazard-kind noflash] [--tag T]
 python temp_shadow_sweep.py sens --day ... [--configs h0.5,h1.5,noflash,size,front,join800] [--draws 10]
 python temp_shadow_sweep.py table                            # variant_table.txt/.json incl. sensitivities
+python temp_shadow_sweep.py export --hazard <out>\hazard.json --to <TEMP_SHADOW_DATA>\model\sweep_hazard.json
 ```
 
 `run` and `sens` read `<out>\hazard.json` and `<out>\tails.json` when present, else the built-in `DEFAULT_HAZARD` / `DEFAULT_TAILS` (the 2026-10-16 calibrations). A cached run file is reused only when the draws, rec_mode, channels, policies, fill models, hazard (table, scale and kind), joiners and tails all match. The first pass had two bugs here. `--hazard-scale` never reached the worker, and a recalibrated hazard silently reused old run files.

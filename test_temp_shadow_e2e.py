@@ -48,6 +48,7 @@ from contextlib import redirect_stdout  # noqa: E402
 from io import StringIO   # noqa: E402
 from unittest import mock  # noqa: E402
 
+import temp_mm_policy as pol         # noqa: E402
 import temp_shadow_common as C      # noqa: E402
 import temp_shadow_model as tmodel  # noqa: E402
 import temp_shadow_scoring as scoring  # noqa: E402
@@ -732,7 +733,11 @@ class TestDaySim(unittest.TestCase):
                 self.assertTrue(0.0 <= v["avg_share"] <= 1.0, msg)
                 self.assertLessEqual(v["quoted_secs"], r["market_stats"]["strike_secs"], msg)
                 if v["contracts"] > 0:
-                    self.assertGreaterEqual(v["fills_n"], 1, msg)
+                    # swp: the mean over its Monte Carlo draws (a fill in 1 of 8 = 0.125)
+                    if k.endswith("|swp"):
+                        self.assertGreater(v["fills_n"], 0, msg)
+                    else:
+                        self.assertGreaterEqual(v["fills_n"], 1, msg)
                 self.assertLessEqual(v["fills_after_wx"]["contracts"], v["contracts"] + 1e-6)
                 self.assertLessEqual(v["max_abs_pos"], 1500.0 + 1e-6)
                 self.assertLessEqual(v["worst_case_loss"], 1500.0 + 1e-6)
@@ -756,9 +761,15 @@ class TestDaySim(unittest.TestCase):
                 for name in ("A_live300_nowin", "B_live300_pull", "C_live300_back",
                              "D_live600_pull", "H_noguard_pull"):
                     self.assertEqual(V[f"{name}|{fm}"]["by_class"]["decided"]["reward"], 0.0)
-                # every variant earns something on these two-sided books
+                # every variant earns something on these two-sided books --
+                # except outside its quote hours (FAV_night: settle 20-07 ET)
                 for k, v in V.items():
-                    self.assertGreater(v["reward"], 0.0, k)
+                    P = sim._resolve_variants([k.split("|")[0]])[k.split("|")[0]]
+                    if pol.quote_hour_ok(P, r["settle_ts"]):
+                        self.assertGreater(v["reward"], 0.0, k)
+                    else:
+                        self.assertEqual((v["reward"], v["quoted_secs"], v["contracts"]),
+                                         (0.0, 0, 0.0), k)
             tot = {fm: sum(v["contracts"] for k, v in V.items() if k.endswith("|" + fm))
                    for fm in sim.FILL_MODELS}
             self.assertGreaterEqual(tot["opt"], tot["cons"])

@@ -94,6 +94,17 @@ CLI (outputs go to --out, default env TEMP_SHADOW_SWEEP_OUT or
   python temp_shadow_sweep.py sens --day YYYY-MM-DD [...] [--configs ...] [--draws N]
   python temp_shadow_sweep.py validate [--event EVT ...] [--live] [--hazard H]
   python temp_shadow_sweep.py table [--day ...]       (aggregate run outputs)
+  python temp_shadow_sweep.py export --hazard H | --tails T --to OUT
+                                  (the fit-only file the daily pipeline loads:
+                                  temp_shadow_sim's swp fill model reads
+                                  <TEMP_SHADOW_DATA>/model/sweep_hazard.json /
+                                  sweep_tails.json, else the repo defaults
+                                  temp_shadow_sweep_hazard.json / _tails.json)
+
+The daily pipeline (since SIM_VERSION 6): temp_shadow_sim.run_event runs swp
+for every variant beside opt / cons with this module's VPass (rec_mode level,
+channels abc, seed SEED_BASE, SWP_DRAWS draws, common random numbers across
+variants); a variant that never rests a 1c order is exact in one draw.
 """
 from __future__ import annotations
 
@@ -534,6 +545,40 @@ def compact_hazard(doc: dict, per_bucket: int = 40) -> dict:
     return out
 
 
+HAZARD_FIT_KEYS = ("version", "sweep_version", "built", "events", "hazard", "sizes",
+                   "sizes_all", "hazard_noflash", "sizes_noflash", "sizes_all_noflash")
+
+
+def hazard_fit_doc(doc: dict, source: str = "") -> dict:
+    """A calibrate hazard.json cut to what Hazard reads WITHOUT thinning or
+    re-ordering the size draws (Hazard.take indexes them, so their order is
+    part of the fit): the same Hazard.ident() and the same Monte Carlo draws
+    as the full file, without its diagnostics (clusters, recorded, live).
+    The shape of the repo default temp_shadow_sweep_hazard.json that
+    temp_shadow_sim's swp fill model loads, and of a recalibration dropped
+    at <TEMP_SHADOW_DATA>/model/sweep_hazard.json (`export --hazard`)."""
+    out = {k: doc[k] for k in HAZARD_FIT_KEYS if k in doc}
+    if not out.get("hazard"):
+        raise ValueError("not a calibrate hazard table (no 'hazard' fit)")
+    out["source"] = source or doc.get("source") or (
+        f"calibrate {doc.get('built')} over {len(doc.get('events') or [])} recorded hours")
+    return out
+
+
+def tails_fit_doc(doc: dict, source: str = "") -> dict:
+    """A `tails` tails.json cut to what TailCal reads (compact_tails) plus
+    provenance: the repo default temp_shadow_sweep_tails.json, or a refresh at
+    <TEMP_SHADOW_DATA>/model/sweep_tails.json (`export --tails`)."""
+    out = compact_tails(doc) if doc.get("tables") else {
+        k: doc.get(k) for k in ("built", "events", "strike_minutes", "buckets", "cond")}
+    if not out.get("buckets"):
+        raise ValueError("not a tails table (no buckets)")
+    out["source"] = source or doc.get("source") or (
+        f"tails {doc.get('built')}: {out.get('events')} settled hours, "
+        f"{out.get('strike_minutes')} strike-minutes")
+    return out
+
+
 def load_hazard(path: Optional[str] = None, scale: float = 1.0, kind: str = "base") -> Hazard:
     if path:
         doc = C.read_json(path)
@@ -864,6 +909,9 @@ class VPass(sim._Pass):
         self.prev_v = [-2] * sh.nm
         self.haz_n = 0
         self.haz_checked = 0
+        self.had_1c = False     # swp: a 1c order of ours ever rested (none: every
+                                # draw is this one -- temp_shadow_sim reuses it)
+        self.expo_log: Optional[Dict[tuple, List[tuple]]] = None   # record_expo()
 
     # -- pad hold ----------------------------------------------------------
     def _desired(self, m, t, v, f, gf, wflag, pflag, size_full, risk, hold=False):
@@ -903,6 +951,7 @@ class VPass(sim._Pass):
         o, ep = self.orders[m], self.ep1c[m]
         for side in ("yes", "no"):
             if 1 in o[side]:
+                self.had_1c = True
                 if ep[side] is None:
                     ep[side] = t
             else:
@@ -912,6 +961,27 @@ class VPass(sim._Pass):
         super()._activate(item)
         if self.swp:
             self._ep_update(item[1], item[0])
+            if self.expo_log is not None:
+                self._log_expo(item[0], item[1])
+
+    # -- the 1c trajectory, for screening other draws (hazard_hits) ----------
+    def record_expo(self) -> "VPass":
+        """Log every change of (our resting 1c size, 1c episode start) per
+        (market, side) with its time: everything _on_hazard reads from our
+        own state. With no hidden sweep accepted in this pass, the log is
+        the hazard-free trajectory, and hazard_hits() tells whether another
+        draw's candidates would change it."""
+        self.expo_log = {}
+        return self
+
+    def _log_expo(self, t, m):
+        o, ep = self.orders[m], self.ep1c[m]
+        for side in ("yes", "no"):
+            lots = o[side].get(1)
+            ours = sum(l[0] for l in lots) if lots else 0.0
+            lst = self.expo_log.setdefault((m, side), [])
+            if not lst or lst[-1][1] != ours or lst[-1][2] != ep[side]:
+                lst.append((t, ours, ep[side]))
 
     # -- fills ---------------------------------------------------------------
     def _record_fill(self, ts, m, side, p, q):
@@ -948,6 +1018,8 @@ class VPass(sim._Pass):
         if not book[1]:
             del book[1]
             self.ep1c[m][side] = None
+        if self.expo_log is not None:
+            self._log_expo(ts, m)
         prev, self.src = self.src, src
         try:
             self._record_fill(ts, m, side, 1, got)
@@ -1215,6 +1287,41 @@ class VPass(sim._Pass):
             ex["sweep_detail"] = [(round(ts, 3), sh.tickers[m], side, round(q, 2), src)
                                   for ts, m, side, q, src in self.sweep_fills]
         return ex
+
+
+def hazard_hits(sh: SweepShared, hazard: Hazard, expo_log: Dict[tuple, List[tuple]],
+                cands: Sequence[tuple]) -> bool:
+    """Would any of a draw's hidden-sweep candidates be ACCEPTED along a
+    pass's logged 1c trajectory (VPass.record_expo)? The test is
+    VPass._on_hazard's, on the state the pass had at the candidate's time
+    (every change at or before it: the run loop applies activations, ticks,
+    trades and recorded arrivals up to an extra event's time before it).
+    False -> a pass with these candidates is identical to the logged one,
+    provided the logged pass accepted no hidden sweep itself (rejected
+    candidates have no effect)."""
+    if not expo_log:
+        return False
+    times = {k: [r[0] for r in v] for k, v in expo_log.items()}
+    lam_max = hazard.lam_max
+    for t, m, side, u_acc, _u_size in cands:
+        tl = expo_log.get((m, side))
+        if not tl:
+            continue
+        j = bisect.bisect_right(times[(m, side)], t) - 1
+        if j < 0:
+            continue
+        _t, ours, ep = tl[j]
+        if ours < 1.0 - 1e-9:
+            continue
+        ext = sh.level1(m, side, sh.idx_at(t))
+        if ext is None or ext >= 1.0:
+            continue
+        fp = fav_p_of(side, sh.fair_or_mid(m, t))
+        age = (t - ep) if ep is not None else 0.0
+        lam = hazard.rate(fp, (t - sh.open) / 60.0, age)
+        if lam > 0 and u_acc * lam_max < lam:
+            return True
+    return False
 
 
 def run_swp(sh: SweepShared, P: dict, hazard: Hazard, draws: int,
@@ -1712,9 +1819,10 @@ def recorded_events(days: Optional[Sequence[str]] = None, settled_only: bool = T
     """Settled events whose hour the collector recorded (ws rows exist).
 
     Without days: the ET days of the NON-EMPTY raw/<UTC day> folders, never
-    past today. temp_shadow_common.raw_files creates the folder of every hour
-    it probes, so listing empty future folders and probing their days used to
-    leave one more empty raw/<future day> folder behind on every call."""
+    past today. (temp_shadow_common.raw_files used to create the folder of
+    every hour it probed, so probing the days of empty future folders left
+    one more behind on every call; lookups no longer create folders since
+    SIM_VERSION 6, and empty folders are still skipped here.)"""
     if not days:
         rd = os.path.join(C.DATA_ROOT, "raw")
         today = C.et_day(time.time())
@@ -3042,6 +3150,38 @@ def cmd_tails(a) -> int:
     return 0
 
 
+def write_fit_file(path: str, doc: dict) -> None:
+    """One top-level key per line, compact values (a small, diffable file)."""
+    items = list(doc.items())
+    lines = ["{"] + [f" {json.dumps(k)}: {json.dumps(v, separators=(',', ':'), ensure_ascii=False)}"
+                     + ("," if i < len(items) - 1 else "") for i, (k, v) in enumerate(items)] + ["}"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def cmd_export(a) -> int:
+    """A calibrate hazard.json / a tails.json -> the fit-only file the daily
+    pipeline loads (temp_shadow_sim: <TEMP_SHADOW_DATA>/model/sweep_hazard.json
+    / sweep_tails.json, else the repo defaults)."""
+    if bool(a.hazard) == bool(a.tails):
+        print("export: give exactly one of --hazard / --tails")
+        return 2
+    src = a.hazard or a.tails
+    doc = C.read_json(src)
+    if not isinstance(doc, dict):
+        print(f"cannot read {src}")
+        return 2
+    out = hazard_fit_doc(doc, a.source or "") if a.hazard else tails_fit_doc(doc, a.source or "")
+    ident = Hazard(out).ident() if a.hazard else TailCal(out).ident()
+    to = os.path.abspath(a.to)
+    write_fit_file(to, out)
+    print(f"wrote {to} ({'hazard' if a.hazard else 'tails'} id {ident})")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="sweep-aware hourly-temp shadow")
     ap.add_argument("--out", default=None, help="output dir (default env TEMP_SHADOW_SWEEP_OUT "
@@ -3083,8 +3223,16 @@ def main(argv=None) -> int:
     tl = sub.add_parser("tails")
     tl.add_argument("--step", type=int, default=60)
     tl.add_argument("--workers", type=int, default=2)
+    ex = sub.add_parser("export", help="hazard.json / tails.json -> the fit-only file "
+                                       "temp_shadow_sim loads")
+    ex.add_argument("--hazard", default=None)
+    ex.add_argument("--tails", default=None)
+    ex.add_argument("--to", required=True)
+    ex.add_argument("--source", default=None, help="provenance text stored in the file")
     a = ap.parse_args(argv)
     a.out = a.out or out_dir_default()
+    if a.cmd == "export":
+        return cmd_export(a)
     if a.cmd in ("run", "validate", "sens") and a.hazard is None:
         hp = os.path.join(a.out, "hazard.json")
         a.hazard = hp if os.path.exists(hp) else None
