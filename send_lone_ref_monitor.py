@@ -416,7 +416,7 @@ def tape_check(eps: list, mids: dict) -> dict:
             res["contracts"] += n
             res["usd"] += usd
             res["by_cls"][e["cls"]] += usd
-            res["top"].append((usd, t, e["side"], e["ref"], n))
+            res["top"].append((usd, t, e["side"], e["ref"], n, e["cls"]))
     res["top"].sort()
     res["by_cls"] = dict(res["by_cls"])
     return res
@@ -596,6 +596,7 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
              cls={c: sum(1 for e in eps if e["cls"] == c) for c in
                   ("at the touch", "inside the book", "no snapshot")},
              cost=cost, would_be=tape["usd"], would_be_trades=tape["trades"],
+             would_be_by_cls=dict(tape["by_cls"]),
              tape_done=tape["done"], tape_read=with_tape,
              let_thru_guarded=sum(x[3] or 0.0 for x in g), let_thru_guarded_n=len(g),
              let_thru_skipped=sum(x[3] or 0.0 for x in s), let_thru_skipped_n=len(s))
@@ -617,7 +618,9 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
     d["level"] = level
     return dict(d=d, run=run, level=level, reasons=reasons, store=store,
                 top_flaps=sorted(flaps.items(), key=lambda kv: -kv[1])[:5],
-                top_avoided=tape["top"][:5], jumped=jumped, by_fam=dict(by_fam),
+                top_avoided=[x for x in tape["top"] if x[0] < 0][:5],
+                top_blocked=sorted((x for x in tape["top"] if x[0] > 0), reverse=True)[:5],
+                jumped=jumped, by_fam=dict(by_fam),
                 by_cls=tape["by_cls"])
 
 
@@ -625,7 +628,7 @@ def subject_for(ctx) -> str:
     d = ctx["d"]
     day = datetime.strptime(d["day"], "%Y-%m-%d")
     return (f"IMM lone-ref guard {day:%m/%d}: {usd(d['net'])} "
-            f"(avoided {usd(-d['would_be'])}, reward {usd(-d['cost'])}) | {ctx['level']}")
+            f"(blocking fills {usd(-d['would_be'])}, reward {usd(-d['cost'])}) | {ctx['level']}")
 
 
 def render_text(ctx) -> str:
@@ -633,9 +636,11 @@ def render_text(ctx) -> str:
     a = datetime.fromtimestamp(d["a_ts"], timezone.utc).astimezone(imm.ET)
     b = datetime.fromtimestamp(d["b_ts"], timezone.utc).astimezone(imm.ET)
     per_day = run["net"] / run["days"] if run["days"] > 0 else 0.0
+    blocked = ("would have made" if d["would_be"] > 0 else "would have lost")
+    by_cls = d.get("would_be_by_cls") or {}
     lines = [
-        f"{ctx['level']}: net {usd(d['net'])} = fills avoided {usd(-d['would_be'])} "
-        f"minus reward given up ${d['cost']:,.0f}.",
+        f"{ctx['level']}: net {usd(d['net'])}. The fills its holds blocked {blocked} "
+        f"${abs(d['would_be']):,.0f}, and it gave up ${d['cost']:,.0f} of reward.",
         f"Running since 10/16 12:17 ET: {usd(run['net'])} over {run['days']:.1f} days "
         f"({usd(per_day)}/day; the replay said +${REPLAY_NET_PER_DAY:.0f}/day).",
         "",
@@ -646,10 +651,12 @@ def render_text(ctx) -> str:
         f"At the touch (the bait shape) {d['cls']['at the touch']}, inside the book "
         f"{d['cls']['inside the book']}; most-held side {d['max_flaps_side'] or '-'} "
         f"x{d['max_flaps']}.",
-        f"Fills avoided: {d['would_be_trades']} public trades went through a held price; "
+        f"Blocked fills: {d['would_be_trades']} public trades went through a held price; "
         f"those fills would be {usd(d['would_be'])} at the current mid"
         + (" (tape not read)" if not d.get("tape_read", True) else
-           "" if d["tape_done"] else " (tape read cut short by its time budget)") + ".",
+           "" if d["tape_done"] else " (tape read cut short by its time budget)")
+        + (" -- at the touch " + usd(by_cls.get("at the touch", 0.0)) + ", inside the book "
+           + usd(by_cls.get("inside the book", 0.0)) if by_cls else "") + ".",
         f"Let through: {d['let_thru_guarded_n']} jumped full-rung fills on guarded series "
         f"{usd(d['let_thru_guarded'])}; mention books (not guarded) "
         f"{d['let_thru_skipped_n']} {usd(d['let_thru_skipped'])}.",
@@ -664,8 +671,12 @@ def render_detail(ctx) -> str:
     for f, b in sorted(ctx["by_fam"].items(), key=lambda kv: -kv[1][2]):
         out.append(f"  {f[:30]:30s} {b[0]:4d} holds {b[1] / 60:7.1f} min  ${b[2]:6.2f}")
     out.append("most-held sides: " + ", ".join(f"{k[0]} {k[1]} x{v}" for k, v in ctx["top_flaps"]))
-    out.append("largest would-be fills: " + ", ".join(
-        f"{t} {s} @{r} {n:.0f}ct {usd(u)}" for u, t, s, r, n in ctx["top_avoided"]))
+    out.append("losses its holds avoided: " + (", ".join(
+        f"{t} {s} @{r} {n:.0f}ct {usd(u)} ({c})" for u, t, s, r, n, c in ctx["top_avoided"])
+        or "none"))
+    out.append("profits its holds blocked: " + (", ".join(
+        f"{t} {s} @{r} {n:.0f}ct {usd(u)} ({c})" for u, t, s, r, n, c in ctx["top_blocked"])
+        or "none"))
     for f, jump, guarded, u in ctx["jumped"]:
         ts = datetime.fromtimestamp(f["ts"], timezone.utc)
         out.append(f"  jumped fill {ts:%H:%M:%S}Z {f['ticker']} {f['our_book_side']} "

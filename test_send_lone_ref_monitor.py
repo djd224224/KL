@@ -221,12 +221,16 @@ class TestVerdict(unittest.TestCase):
                           cls={"at the touch": 163, "inside the book": 179, "no snapshot": 0},
                           max_flaps=28, max_flaps_side="KXRAINWKND-26OCT17-NYC bid",
                           would_be_trades=3, tape_done=True, let_thru_guarded_n=0,
+                          would_be_by_cls={"at the touch": -5.0, "inside the book": 25.0},
                           let_thru_guarded=0.0, let_thru_skipped_n=13, let_thru_skipped=-19.0))
         self.assertEqual(lm.subject_for(ctx),
-                         "IMM lone-ref guard 10/16: +$12 (avoided +$20, reward -$8) | OK")
+                         "IMM lone-ref guard 10/16: +$12 (blocking fills +$20, reward -$8) | OK")
         text = lm.render_text(ctx)
-        self.assertTrue(text.startswith("OK: net +$12 = fills avoided +$20 minus reward "
-                                        "given up $8."))
+        self.assertTrue(text.startswith("OK: net +$12. The fills its holds blocked would have "
+                                        "lost $20, and it gave up $8 of reward."))
+        self.assertIn("would be -$20 at the current mid -- at the touch -$5, inside the book +$25", text)
+        ctx["d"]["would_be"] = 21.0
+        self.assertIn("blocked would have made $21", lm.render_text(ctx))
         self.assertIn("Held 342 times on 92 sides of 88 markets", text)
 
 
