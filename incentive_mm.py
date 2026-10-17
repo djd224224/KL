@@ -3720,19 +3720,24 @@ def sweep_escalated_hold(n: int, base_s: float) -> float:
 # non-pad rungs that share their price with at least BACK_OF_LINE_MIN_BEHIND
 # external contracts (the WS book less our own), and an order with at least
 # that many external contracts -- and BACK_OF_LINE_MIN_BEHIND_FRAC of the
-# level's external size -- BEHIND it is amended +1 contract: same price, back
-# of the line, never off the book. Replay 10/12-10/16 (1,758 touch fills
+# level's external size -- BEHIND it is amended +1 contract (same price, back
+# of the line, never off the book) and at once -1 back to its size, which
+# keeps the new place (Jack 2026-10-17: "add this if it's cleaner"): two
+# calls a move, no size drift. Replay 10/12-10/16 (1,758 touch fills
 # against the book snapshots and the public tape): at the back, 17% of the
 # filled contracts would have gone to the line ahead instead, saving $115 of
 # 4h mark-outs in 5 days (~$23/day). Most of the loss came from takers who
 # cleared the whole level (45%) or from the line ahead vanishing just before
 # the hit (25%), which no place in line avoids.
 # Left alone: sub-penny orders (an amend sends whole cents, so it would MOVE
-# them), pads, orders placed or amended this cycle (at the back already),
-# orders with a fill since the cycle's read (their count is not settled), and
-# orders re-queued BACK_OF_LINE_MAX_BUMPS times already (each re-queue adds a
-# contract; the size rule ignores changes under 20%, and the TTL refresh
-# re-places the remaining size). A market the WS feed cannot serve is skipped.
+# them), pads, orders placed or amended this cycle (at the back already), and
+# orders with a fill since the cycle's read (their count is not settled: a
+# stale total could turn the +1 into a cut, which keeps the front place). An
+# order moves at most once per BACK_OF_LINE_COOLDOWN_SECS;
+# BACK_OF_LINE_MAX_BUMPS (0 = no limit, the default since the -1 restore)
+# caps moves per order. A failed restore leaves one extra contract, which
+# the size rule's 20% tolerance bounds. A market the WS feed cannot serve is
+# skipped.
 #    IMM_BACK_OF_LINE=dry -- THE DEFAULT: the line is read and each re-queue
 #                   is LOGGED (back_of_line_<date>.jsonl), nothing amended.
 #    IMM_BACK_OF_LINE=on  -- the amend is sent.
@@ -3745,7 +3750,7 @@ BACK_OF_LINE_MIN_BEHIND = max(1.0, _env_float("IMM_BACK_OF_LINE_MIN_BEHIND", 20.
 BACK_OF_LINE_MIN_BEHIND_FRAC = min(1.0, max(0.0, _env_float(
     "IMM_BACK_OF_LINE_MIN_BEHIND_FRAC", 0.25)))
 BACK_OF_LINE_COOLDOWN_SECS = max(0.0, _env_float("IMM_BACK_OF_LINE_COOLDOWN_SECS", 300.0))
-BACK_OF_LINE_MAX_BUMPS = max(0, _env_int("IMM_BACK_OF_LINE_MAX_BUMPS", 3))
+BACK_OF_LINE_MAX_BUMPS = max(0, _env_int("IMM_BACK_OF_LINE_MAX_BUMPS", 0))
 BACK_OF_LINE_MAX_PER_PASS = max(0, _env_int("IMM_BACK_OF_LINE_MAX_PER_PASS", 100))
 BACK_OF_LINE_CHUNK = max(1, _env_int("IMM_BACK_OF_LINE_CHUNK", 40))
 BACK_OF_LINE_BUDGET_SECS = max(1.0, _env_float("IMM_BACK_OF_LINE_BUDGET_SECS", 8.0))
@@ -17578,8 +17583,8 @@ class IncentiveMarketMaker:
         self._bol_logged: Deque[float] = deque()
         self._bol = {"passes": 0, "candidates": 0, "reads": 0, "read_fails": 0,
                      "no_position": 0, "front": 0, "would_requeue": 0,
-                     "requeued": 0, "amend_fails": 0, "capped": 0,
-                     "budget_stops": 0}
+                     "requeued": 0, "amend_fails": 0, "restored": 0,
+                     "restore_fails": 0, "capped": 0, "budget_stops": 0}
         # our WS fills (exchange time, order id, contracts) and when the cycle
         # last read its resting orders: the view rebuild subtracts the fills
         # that landed after that read, which the read cannot hold
@@ -20175,9 +20180,10 @@ class IncentiveMarketMaker:
         """BACK OF THE LINE (2026-10-17, BACK_OF_LINE): every
         BACK_OF_LINE_EVERY_SECS, read Kalshi's line for our whole-cent rungs
         that share their price with other makers, and send each one with
-        enough of their size BEHIND it to the back with a +1 amend (dry: log
-        it). Runs on the resting view the cycle just built and the WS books;
-        live orders only. Never raises."""
+        enough of their size BEHIND it to the back with a +1 amend, then a -1
+        that keeps it there at its old size (dry: log it). Runs on the
+        resting view the cycle just built and the WS books; live orders only.
+        Never raises."""
         if BACK_OF_LINE == "off" or self._ws is None or not self.live:
             return
         if now_ts - self._bol_last_pass < BACK_OF_LINE_EVERY_SECS:
@@ -20212,7 +20218,8 @@ class IncentiveMarketMaker:
                         continue
                     if now_ts - self._bol_last.get(oid, 0.0) < BACK_OF_LINE_COOLDOWN_SECS:
                         continue
-                    if self._bol_bumps.get(oid, 0) >= BACK_OF_LINE_MAX_BUMPS:
+                    if BACK_OF_LINE_MAX_BUMPS and \
+                            self._bol_bumps.get(oid, 0) >= BACK_OF_LINE_MAX_BUMPS:
                         continue
                     if lv is None:
                         lv = self._ws.book_levels(t) or ({}, {})
@@ -20276,16 +20283,33 @@ class IncentiveMarketMaker:
                 did = False
                 if BACK_OF_LINE == "on":
                     # same price, one more contract: Kalshi re-queues it at
-                    # the back (amend_order_inplace sends filled + this)
+                    # the back (amend_order_inplace sends filled + this)...
+                    rem0 = order_remaining(ro)
                     q = Quote(ticker=t, book_side=o["side"], price_cents=c,
-                              count=int(math.floor(order_remaining(ro) + 1e-9)) + 1)
+                              count=rem0 + 1.0)
                     did = self.amend_order_inplace(ro, q, now_ts,
                                                    reason="back_of_line")
                     rec["ok"] = bool(did)
                     if did:
                         st["requeued"] += 1
                         self._bol_bumps[oid] = self._bol_bumps.get(oid, 0) + 1
-                        o["rem"] = float(q.count)
+                        o["rem"] = rem0 + 1.0
+                        # ...and straight back to its size (Jack 2026-10-17:
+                        # "add this if it's cleaner"): a size cut keeps the
+                        # order's place, now the back, so it ends where it was
+                        # in size and behind the line. The total sent is the
+                        # read's filled + rem0, so a fill landing between the
+                        # two calls still nets exactly one contract off.
+                        q2 = Quote(ticker=t, book_side=o["side"], price_cents=c,
+                                   count=rem0)
+                        back = self.amend_order_inplace(
+                            ro, q2, now_ts, reason="back_of_line_restore")
+                        rec["restored"] = bool(back)
+                        if back:
+                            st["restored"] += 1
+                            o["rem"] = rem0
+                        else:
+                            st["restore_fails"] += 1
                     else:
                         st["amend_fails"] += 1
                 else:
@@ -28572,9 +28596,12 @@ class IncentiveMarketMaker:
                f" -- every {BACK_OF_LINE_EVERY_SECS:g}s, a whole-cent rung with >= "
                f"{BACK_OF_LINE_MIN_BEHIND:g} external contracts (and "
                f"{BACK_OF_LINE_MIN_BEHIND_FRAC:.0%} of its level's) BEHIND it in "
-               f"Kalshi's line is amended +1 contract, which sends it to the back; "
-               f"at most {BACK_OF_LINE_MAX_BUMPS} per order, "
-               f"{BACK_OF_LINE_MAX_PER_PASS} per pass"
+               f"Kalshi's line is amended +1 contract, which sends it to the back, "
+               f"then -1, which keeps it there at its old size; once per "
+               f"{BACK_OF_LINE_COOLDOWN_SECS:g}s per order"
+               + (f", at most {BACK_OF_LINE_MAX_BUMPS} per order"
+                  if BACK_OF_LINE_MAX_BUMPS else "")
+               + f", {BACK_OF_LINE_MAX_PER_PASS} per pass"
                + (" -- LOGGED only (back_of_line_<date>.jsonl), nothing amended"
                   if BACK_OF_LINE == "dry" else "")
                + ("" if WS_MODE in ("on", "shadow") else

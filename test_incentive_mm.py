@@ -29141,7 +29141,7 @@ class TestBackOfLine(unittest.TestCase):
                         ("BACK_OF_LINE_MIN_BEHIND", 20.0),
                         ("BACK_OF_LINE_MIN_BEHIND_FRAC", 0.25),
                         ("BACK_OF_LINE_COOLDOWN_SECS", 300.0),
-                        ("BACK_OF_LINE_MAX_BUMPS", 3), ("BACK_OF_LINE_MAX_PER_PASS", 100),
+                        ("BACK_OF_LINE_MAX_BUMPS", 0), ("BACK_OF_LINE_MAX_PER_PASS", 100),
                         ("BACK_OF_LINE_CHUNK", 40), ("BACK_OF_LINE_BUDGET_SECS", 8.0)):
             p = mock.patch.object(imm, name, v)
             p.start()
@@ -29170,19 +29170,52 @@ class TestBackOfLine(unittest.TestCase):
         self.assertEqual(self.amends, [])
         self.assertEqual((self.bot._bol["would_requeue"], self.bot._bol["requeued"]), (1, 0))
 
-    def test_on_amends_one_more_contract_at_the_same_price(self):
+    def test_on_moves_it_back_with_plus_one_then_restores_the_size(self):
+        """Jack 2026-10-17: "add this if it's cleaner" -- +1 sends it to the
+        back, the -1 right after keeps that place at the old size."""
         with mock.patch.object(imm, "BACK_OF_LINE", "on"):
             self._pass()
-        self.assertEqual(len(self.amends), 1)
-        a = self.amends[0]
-        # filled 5 + 61 resting: one more than the 65 the order holds
-        self.assertEqual((a["order_id"], a["ticker"], a["book_side"], a["yes_price_cents"],
-                          a["total_count"]), ("o1", self.T, "bid", 41, 66.0))
+        self.assertEqual(len(self.amends), 2)
+        up, down = self.amends
+        # filled 5 + 61 resting: one more than the 65 the order holds; then 65
+        self.assertEqual((up["order_id"], up["ticker"], up["book_side"],
+                          up["yes_price_cents"], up["total_count"]),
+                         ("o1", self.T, "bid", 41, 66.0))
+        self.assertEqual((down["order_id"], down["yes_price_cents"], down["total_count"]),
+                         ("o1", 41, 65.0))
+        b = self.bot._bol
         self.assertEqual((self.view_order["rem"], self.bot._bol_bumps["o1"],
-                          self.bot._bol["requeued"]), (61.0, 1, 1))
-        self.assertTrue(self._rows()[0]["ok"])
-        amend_rows = [r for name, r in self.recs if name == "orders" and r.get("kind") == "amend"]
-        self.assertEqual(amend_rows[0]["reason"], "back_of_line")
+                          b["requeued"], b["restored"], b["restore_fails"]),
+                         (60.0, 1, 1, 1, 0))
+        row = self._rows()[0]
+        self.assertEqual((row["ok"], row["restored"]), (True, True))
+        reasons = [r["reason"] for name, r in self.recs
+                   if name == "orders" and r.get("kind") == "amend"]
+        self.assertEqual(reasons, ["back_of_line", "back_of_line_restore"])
+
+    def test_a_fractional_size_comes_back_exactly(self):
+        self.resting[0]["remaining_count"] = 37.5
+        self.view_order["rem"] = 37.5
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        self.assertEqual([a["total_count"] for a in self.amends], [43.5, 42.5])
+        self.assertEqual(self.view_order["rem"], 37.5)
+
+    def test_a_failed_restore_is_counted_and_leaves_the_extra_contract(self):
+        calls = []
+
+        def amend(**kw):
+            calls.append(kw)
+            if len(calls) == 2:
+                raise RuntimeError("timeout")
+            return {}
+        self.bot.client.amend_order = amend
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        b = self.bot._bol
+        self.assertEqual((len(calls), b["requeued"], b["restored"], b["restore_fails"],
+                          self.view_order["rem"], self._rows()[0]["restored"]),
+                         (2, 1, 0, 1, 61.0, False))
 
     def test_an_order_already_at_the_back_stays(self):
         self.ahead = {"o1": 295.0}
@@ -29222,19 +29255,22 @@ class TestBackOfLine(unittest.TestCase):
         self._pass()
         self.assertEqual((self.reads, self._rows()), ([], []))
 
-    def test_cooldown_bump_cap_interval_and_live_only(self):
+    def test_cooldown_interval_optional_cap_and_live_only(self):
+        def later_cycle(dt):
+            # a later cycle: the cycle's own amend map starts empty
+            self.bot._cycle_amended, self.bot._cycle_amended_ct = {}, {}
+            self._pass(dt)
         with mock.patch.object(imm, "BACK_OF_LINE", "on"):
             self._pass()
-            self._pass(30)                      # inside the 60s interval: no pass
-            self._pass(120)                     # inside the 300s cooldown
-            self.assertEqual(len(self.amends), 1)
-            for i in (1, 2, 3):
-                # a later cycle: its read holds the bumped size, and the
-                # cycle's own amend map starts empty
-                self.resting[0]["remaining_count"] = self.view_order["rem"]
-                self.bot._cycle_amended, self.bot._cycle_amended_ct = {}, {}
-                self._pass(400 * i)
-            self.assertEqual(len(self.amends), 3)   # the 4th would pass MAX_BUMPS
+            later_cycle(30)                     # inside the 60s interval: no pass
+            later_cycle(120)                    # inside the 300s cooldown
+            self.assertEqual(len(self.amends), 2)
+            for i in (1, 2, 3, 4):
+                later_cycle(400 * i)            # no move limit by default
+            self.assertEqual((len(self.amends), self.bot._bol_bumps["o1"]), (10, 5))
+            with mock.patch.object(imm, "BACK_OF_LINE_MAX_BUMPS", 5):
+                later_cycle(2000)               # the knob still caps it
+            self.assertEqual(len(self.amends), 10)
         self.bot.live = False
         self.bot._bol_last_pass = 0.0
         n = len(self.reads)
