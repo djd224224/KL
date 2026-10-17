@@ -26467,6 +26467,51 @@ class TestWSNarrowGate(unittest.TestCase):
         self.assertEqual(self.bot._ws_fast["would_cancel_narrow"], 0)
         self.assertTrue(self.bot._ws_wake)
 
+    def test_an_exempt_prefix_stays_dry_when_live(self):
+        # Jack 2026-10-17 "Build it anyway, for protection": the gate is live
+        # for every family; IMM_WS_FAST_EXEMPT keeps a prefix logged but dry
+        ca = "KXAMZNCC-26NOV07-T104"
+        self._gate("on", True, 10.0)
+        p = mock.patch.object(imm, "WS_FAST_EXEMPT", ("KXAMZNCC",))
+        p.start()
+        self.addCleanup(p.stop)
+        self.bot._resting_view = {ca: [{
+            "order_id": "c1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": self.now - 100.0, "pad": False}]}
+        self.feed.books[ca] = self.FAR
+        self.assertEqual(self.bot._ws_fast_check({ca}, self.now, dry=False), 0)
+        self.assertEqual(self.bot._ws_fast_check({ca}, self.now + 1.5, dry=False), 0)
+        self.assertEqual(self.cancelled, [])
+        self.assertEqual(self._ev("narrow")[0]["mode"], "dry")
+        self.assertFalse(self.bot._ws_wake)
+        # ...while the ordinary market beside it is cancelled
+        self.bot._resting_view[self.T] = [{
+            "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": self.now - 100.0, "pad": False}]
+        self._check(self.FAR, 3.0, False)
+        self.assertEqual(self._check(self.FAR, 4.5, False), 1)
+        self.assertEqual(self.cancelled, ["o1"])
+
+    def test_on_by_default_for_every_family(self):
+        self.assertTrue(imm.WS_FAST)
+        self.assertEqual(imm.WS_FAST_EXEMPT, ())
+        for s_ in ("KXAMZNCC", "KXVIDEOGAMESADS", "KXGOOD", "KXLOLTEEMO", "KXRAINWKND"):
+            self.assertFalse(imm.ws_fast_exempt(s_), s_)
+        with mock.patch.object(imm, "WS_FAST_EXEMPT", ("KXRAIN",)):
+            self.assertTrue(imm.ws_fast_exempt("KXRAINWKND"))
+        self.assertIn("WS_FAST_EXEMPT", imm._CONFIG_CODE_KNOBS)
+
+    def test_carbon_arc_is_cancelled_like_any_family(self):
+        ca = "KXVIDEOGAMESADS-26NOV06-T105"
+        self._gate("on", True, 10.0)
+        self.bot._resting_view = {ca: [{
+            "order_id": "c1", "side": "bid", "px": 49.0, "rem": 120.0,
+            "placed": self.now - 100.0, "pad": False}]}
+        self.feed.books[ca] = ({0.26: 500.0, 0.49: 120.0}, {0.49: 1200.0})   # 23c ahead
+        self.bot._ws_fast_check({ca}, self.now, dry=False)
+        self.assertEqual(self.bot._ws_fast_check({ca}, self.now + 1.5, dry=False), 1)
+        self.assertEqual(self.cancelled, ["c1"])
+
     def test_no_gate_keeps_every_flag_live(self):
         self._gate("on", True, 0.0)
         self._check(self.NEAR, 0.0, False)

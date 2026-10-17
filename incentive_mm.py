@@ -3342,12 +3342,14 @@ BLIND_PRESERVE_CYCLES = 3
 #                     trustworthy, REST otherwise; 1 read in 20 is audited
 #                     against REST (WS_AUDIT_EVERY, below). NOT enabled.
 #    IMM_WS_FAST=1 -- (with on) cancel a rung the external touch left strictly
-#                     ahead of the book between cycles. NOT enabled.
+#                     ahead of the book between cycles. THE DEFAULT since
+#                     2026-10-17, behind the narrow gate (WS_FAST_MIN_GAP_C);
+#                     IMM_WS_FAST=0 turns it off.
 WS_MODE = os.environ.get("IMM_WS", "shadow").strip().lower()
 if WS_MODE not in ("off", "shadow", "on"):
     WS_MODE = "off"
 WS_URL = os.environ.get("IMM_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
-WS_FAST = os.environ.get("IMM_WS_FAST", "0") == "1"
+WS_FAST = os.environ.get("IMM_WS_FAST", "1") == "1"
 WS_SUB_CHUNK = _env_int("IMM_WS_SUB_CHUNK", 100)
 # the feed pings every 10s and Kalshi answers every ping, so 20s without a
 # single frame means the connection is dead: books go untrusted
@@ -3452,6 +3454,25 @@ WS_TICK_SECS = max(0.2, _env_float("IMM_WS_TICK_SECS", 1.0))
 # would go -- and counts `would_cancel_narrow`; ws_stale_score.py scores the
 # gated rule from those lines. 0 = no gate (every flag acts).
 WS_FAST_MIN_GAP_C = max(0.0, _env_float("IMM_WS_FAST_MIN_GAP_C", 0.0))
+# LIVE since 2026-10-17 (Jack: "Build it anyway, for protection"), every
+# family. Re-scored at 10c, 10/09 13:30Z-10/17, ~600 cancels/day: outside
+# Carbon Arc 11 fills avoided, +$0.69/day at 5m / +$0.31 at 30m; Carbon Arc
+# 2 fills, +$1.24 / +$2.51 -- the week's biggest avoided loss was a Carbon
+# Arc rung (KXVIDEOGAMESADS bid 120 ct, 23c ahead, -$17 at 30m). The 10/4-
+# 10/8 case for a Carbon Arc exemption (69% of the flags, no hits) did not
+# hold (Jack 2026-10-17: "Why are Carbon arc exceptions? Double check"):
+# its episodes are ordinary (median 8s, most re-priced by the next cycle).
+# IMM_WS_FAST_EXEMPT (series prefixes, default none) keeps a family dry; an
+# exempt rung's episodes are still logged.
+WS_FAST_EXEMPT: Tuple[str, ...] = tuple(
+    x.strip() for x in os.environ.get("IMM_WS_FAST_EXEMPT", "").split(",")
+    if x.strip())
+
+
+def ws_fast_exempt(series: str) -> bool:
+    """Is this series kept DRY under the live fast cancel? (An
+    IMM_WS_FAST_EXEMPT prefix; none by default.)"""
+    return bool(WS_FAST_EXEMPT) and series.startswith(WS_FAST_EXEMPT)
 
 # WEBSOCKET CANDIDATE BOOKS (Jack 2026-10-08: "yes" to "build the
 # WebSocket-fed universe refresh"). With the managed books on the feed, the
@@ -9296,7 +9317,7 @@ _CONFIG_CODE_KNOBS = (
     # ...its linked series and per-series holds (2026-10-15)
     "SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
-    "WS_FAST_MIN_GAP_C", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
+    "WS_FAST_MIN_GAP_C", "WS_FAST_EXEMPT", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
     # hang watchdog: wedge stacks, its handoff, the main-thread network
     # bounds and the candidate REST budget (2026-10-09 audit)
     "CYCLE_HANG_EXIT_SECS", "CYCLE_HANG_DUMP_SECS", "WATCHDOG_HANDOFF",
@@ -19533,6 +19554,7 @@ class IncentiveMarketMaker:
             orders = self._resting_view.get(t)
             if not orders:
                 continue
+            exempt = ws_fast_exempt(series_of(t))      # IMM_WS_FAST_EXEMPT
             lv = ws.book_levels(t)
             if lv is None:
                 continue
@@ -19589,7 +19611,7 @@ class IncentiveMarketMaker:
                 gap = _ws_gap_c(o["side"], o["px"], ext_bid, ext_ask)
                 wide = WS_FAST_MIN_GAP_C <= 0 or (
                     gap is not None and gap >= WS_FAST_MIN_GAP_C - 1e-9)
-                act = not dry and wide
+                act = not dry and wide and not exempt
                 new = self._ws_episode_flag(t, o, now_ts, first, ext_bid,
                                             ext_ask, yes, no, orders, not act,
                                             phase=phase)
@@ -28141,7 +28163,9 @@ class IncentiveMarketMaker:
                    else "between cycles only")
                 + (f"; narrow gate (2026-10-08): only a rung >= "
                    f"{WS_FAST_MIN_GAP_C:g}c ahead of the rest of its side "
-                   + ("is cancelled" if WS_FAST and WS_MODE == "on" else
+                   + ("is cancelled (2026-10-17"
+                      + ("; dry: " + ",".join(WS_FAST_EXEMPT) if WS_FAST_EXEMPT else "")
+                      + ")" if WS_FAST and WS_MODE == "on" else
                       "would be cancelled -- DRY, logged as `narrow`")
                    if WS_FAST_MIN_GAP_C > 0 else ""))
             log(f"WS candidate books (2026-10-08): {WS_CANDIDATES}"
