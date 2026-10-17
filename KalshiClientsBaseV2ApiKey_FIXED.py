@@ -42,6 +42,23 @@ GET_RETRYABLE_STATUSES = (429, 502, 503, 504)
 RATE_LIMIT_MS = max(0.0, float(os.environ.get("KALSHI_RATE_LIMIT_MS", "100")))
 
 
+# Every 429 (Too Many Requests) a client in this process received (2026-10-17,
+# incentive_mm's rate-limit alert reads it): "writes" = POST / DELETE / PUT,
+# each a rejected order write; "reads" = GET, which get() retries.
+RATE_LIMITED = {"writes": 0, "reads": 0, "last_ts": 0.0, "last": ""}
+
+
+def _note_rate_limited(response) -> None:
+    try:
+        req = response.request
+        method = str(getattr(req, "method", "") or "").upper()
+        RATE_LIMITED["reads" if method == "GET" else "writes"] += 1
+        RATE_LIMITED["last_ts"] = time.time()
+        RATE_LIMITED["last"] = f"{method} {str(getattr(req, 'path_url', '') or '').split('?')[0]}"
+    except Exception:
+        pass
+
+
 class KalshiClient:
     """A simple client that allows utils to call authenticated Kalshi API endpoints."""
     def __init__(
@@ -203,6 +220,8 @@ class KalshiClient:
             raise ValueError("RSA sign PSS failed") from e
 
     def raise_if_bad_response(self, response: requests.Response) -> None:
+        if response.status_code == 429:
+            _note_rate_limited(response)
         if response.status_code not in range(200, 299):
             err = HttpError(response.reason, response.status_code)
             try:

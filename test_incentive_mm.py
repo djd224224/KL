@@ -24644,7 +24644,8 @@ class TestWritePacer(unittest.TestCase):
         return imm.WritePacer(rate, clock=lambda: self.t, sleep=sleep)
 
     def test_code_defaults(self):
-        self.assertEqual(_PLACE_RATE_CODE_DEFAULT, 12.0)
+        # 12 -> 24 (Jack 2026-10-17: "Raise to 24/s")
+        self.assertEqual(_PLACE_RATE_CODE_DEFAULT, 24.0)
         for k in ("PLACE_RATE_PER_SEC", "ORDER_REFRESH_JITTER_SECS",
                   "RESTART_REQUEST_MAX_AGE_SECS"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
@@ -29142,7 +29143,8 @@ class TestBackOfLine(unittest.TestCase):
                         ("BACK_OF_LINE_MIN_BEHIND_FRAC", 0.25),
                         ("BACK_OF_LINE_COOLDOWN_SECS", 300.0),
                         ("BACK_OF_LINE_MAX_BUMPS", 0), ("BACK_OF_LINE_MAX_PER_PASS", 100),
-                        ("BACK_OF_LINE_CHUNK", 40), ("BACK_OF_LINE_BUDGET_SECS", 8.0)):
+                        ("BACK_OF_LINE_CHUNK", 40), ("BACK_OF_LINE_BUDGET_SECS", 8.0),
+                        ("PLACE_RATE_PER_SEC", 0.0)):
             p = mock.patch.object(imm, name, v)
             p.start()
             self.addCleanup(p.stop)
@@ -29155,7 +29157,11 @@ class TestBackOfLine(unittest.TestCase):
                          "yes_price": 41, "remaining_count": 60.0, "fill_count": 5.0}]
 
     def _pass(self, dt=0.0):
+        """The cycle's plan, then the between-cycles steps to the end."""
         self.bot._back_of_line_pass(self.resting, self.now + dt)
+        for _ in range(50):
+            if not self.bot._back_of_line_step(self.now + dt, slice_secs=60.0):
+                break
 
     def _rows(self):
         return [r for name, r in self.recs if name == "back_of_line"]
@@ -29294,6 +29300,64 @@ class TestBackOfLine(unittest.TestCase):
             self._pass()
         self.assertEqual(self.reads, [])
 
+    def _second_market(self):
+        """A second market where our 50-lot ask at 60c has 900 external
+        contracts on its level and 20 ahead of us."""
+        t2 = "KXWIDE-99DEC31-B"
+        self.feed.books[t2] = ({}, {0.40: 950.0})          # ask 60c = NO bid 40c
+        o2 = {"order_id": "o2", "side": "ask", "px": 60.0, "rem": 50.0,
+              "placed": self.now - 600, "pad": False}
+        self.bot._resting_view[t2] = [o2]
+        self.resting.append({"order_id": "o2", "ticker": t2, "book_side": "ask",
+                             "yes_price": 60, "remaining_count": 50.0, "fill_count": 0.0})
+        self.ahead["o2"] = 20.0
+        return t2, o2
+
+    def test_the_most_size_behind_goes_first_and_the_cap_holds(self):
+        t2, o2 = self._second_market()                    # 880 behind vs o1's 290
+        with mock.patch.object(imm, "BACK_OF_LINE_MAX_PER_PASS", 1):
+            self._pass()
+        rows = self._rows()
+        self.assertEqual([r["order_id"] for r in rows], ["o2"])
+        self.assertEqual((self.bot._bol["front"], self.bot._bol["capped"]), (2, 1))
+
+    def test_each_move_is_rechecked_just_before_it_goes(self):
+        t2, o2 = self._second_market()
+        orig = self.bot._back_of_line_move
+
+        def meanwhile(m, p, now_ts):
+            # after the line was read, before the first send: a fill books o2
+            # down, and o1's event goes into a sweep hold
+            o2["rem"] = 30.0
+            self.bot._sweep_hold[self.bot._event_of(self.T)] = now_ts + 100
+            return orig(m, p, now_ts)
+        self.bot._back_of_line_move = meanwhile
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
+                mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        self.assertEqual((self.amends, self._rows(), self.bot._bol["stale"]), ([], [], 2))
+
+    def test_the_work_comes_in_slices(self):
+        self.bot._back_of_line_pass(self.resting, self.now)
+        self.assertTrue(self.bot._back_of_line_step(self.now, slice_secs=-1.0))
+        self.assertEqual(self.reads, [])                   # no time: nothing done
+        while self.bot._back_of_line_step(self.now, slice_secs=60.0):
+            pass
+        self.assertEqual((len(self.reads), len(self._rows()), self.bot._bol_plan["done"]),
+                         (1, 1, True))
+
+    def test_the_cycle_only_plans_and_idle_sends(self):
+        self.bot._back_of_line_pass(self.resting, self.now)
+        self.assertEqual((self.reads, self._rows()), ([], []))   # nothing in the cycle
+        self.bot._last_cycle_start = time.time()
+        self.bot._idle(0.6, {})
+        self.assertEqual((len(self.reads), len(self._rows())), (1, 1))
+
+    def test_a_new_plan_replaces_an_unfinished_one(self):
+        self.bot._back_of_line_pass(self.resting, self.now)
+        self.bot._back_of_line_pass(self.resting, self.now + 61)
+        self.assertEqual((self.bot._bol["unfinished"], self.bot._bol["passes"]), (1, 2))
+
     def test_the_client_builds_the_queue_positions_path(self):
         c = _kc.ExchangeClient.__new__(_kc.ExchangeClient)
         c.portfolio_url = "/portfolio"
@@ -29303,6 +29367,92 @@ class TestBackOfLine(unittest.TestCase):
         c.get_queue_positions(event_ticker="EV")
         self.assertEqual(seen, ["/portfolio/orders/queue_positions?market_tickers=A,B",
                                 "/portfolio/orders/queue_positions?event_ticker=EV"])
+
+
+class TestRateLimitWatch(unittest.TestCase):
+    """Jack 2026-10-17: "Raise to 24/s ... Email alert me if rate limit
+    rejections occur" -- any 429 rejection, ours or the crypto bots', sends an
+    urgent `rate_limit` alert."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.alerts = []
+        self.bot.alerter.alert = lambda cat, msg, key="", urgent=True, now_ts=None: \
+            self.alerts.append((cat, msg, key, urgent))
+        self.tmp = tempfile.mkdtemp()
+        self.log = os.path.join(self.tmp, "bnb-max-2026-10-01.log")
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write("2026-10-08 07:07:37Z [BNB-MAX] ! place rejected (HttpError(429 Too "
+                    "Many Requests)): old history, never reported\n")
+        self.counter = {"writes": 0, "reads": 0, "last_ts": 0.0, "last": ""}
+        for name, v in (("RATE_LIMIT_ALERT", True), ("RATE_LIMIT_CHECK_SECS", 120.0),
+                        ("RATE_LIMIT_SCAN_DIRS", (self.tmp,))):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(imm._kalshi_client_mod, "RATE_LIMITED", self.counter)
+        p.start()
+        self.addCleanup(p.stop)
+        self.now = time.time()
+
+    def _look(self, dt):
+        self.bot._rate_limit_watch(self.now + dt)
+
+    def test_quiet_means_no_alert_and_history_is_never_reported(self):
+        self._look(0)
+        self._look(200)
+        self.assertEqual(self.alerts, [])
+
+    def test_our_own_rejected_write_alerts(self):
+        self._look(0)
+        self.counter.update(writes=2, last="POST /portfolio/events/orders")
+        self._look(60)                                   # inside the 2-min interval
+        self.assertEqual(self.alerts, [])
+        self._look(200)
+        cat, msg, key, urgent = self.alerts[0]
+        self.assertEqual((cat, key, urgent), ("rate_limit", "rate_limit", True))
+        self.assertIn("this bot: 2 write(s) rejected (last POST /portfolio/events/orders)", msg)
+        self.assertEqual(self.bot._rl["imm_writes"], 2)
+
+    def test_a_crypto_bot_rejection_in_its_log_alerts(self):
+        self._look(0)                                    # anchors the log at its end
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write("2026-10-17 20:00:01Z [BNB-MAX] ! place rejected (HttpError(429 Too "
+                    "Many Requests)): KXBNBMAXMON-BNB-26OCT31-87000 BID 5x @ 17c\n")
+            f.write("2026-10-17 20:00:02Z [BNB-MAX] placed something fine\n")
+        self._look(200)
+        msg = self.alerts[0][1]
+        self.assertIn(f"{os.path.basename(self.tmp)}/bnb-max-2026-10-01: 1 rejected", msg)
+        self.assertIn("KXBNBMAXMON-BNB-26OCT31-87000", msg)
+        self.assertNotIn("old history", msg)
+        self._look(400)                                  # nothing new since
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_retried_reads_alone_only_log(self):
+        self._look(0)
+        self.counter.update(reads=3)
+        self._look(200)
+        self.assertEqual((self.alerts, self.bot._rl["imm_reads"]), ([], 3))
+
+    def test_off_does_nothing(self):
+        with mock.patch.object(imm, "RATE_LIMIT_ALERT", False):
+            self.counter.update(writes=5)
+            self._look(0)
+            self._look(200)
+        self.assertEqual((self.alerts, self.bot._rl["looks"]), ([], 0))
+
+    def test_the_client_counts_429s_by_kind(self):
+        def resp(method):
+            r = mock.Mock(status_code=429, reason="Too Many Requests", text="{}")
+            r.request = mock.Mock(method=method, path_url="/trade-api/v2/portfolio/events/orders?x=1")
+            return r
+        c = _kc.ExchangeClient.__new__(_kc.ExchangeClient)
+        for m in ("POST", "DELETE", "GET"):
+            with self.assertRaises(_kc.HttpError):
+                c.raise_if_bad_response(resp(m))
+        self.assertEqual((self.counter["writes"], self.counter["reads"], self.counter["last"]),
+                         (2, 1, "GET /trade-api/v2/portfolio/events/orders"))
 
 
 if __name__ == "__main__":

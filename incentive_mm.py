@@ -93,6 +93,7 @@ from cryptography.hazmat.primitives import serialization
 
 import imm_account
 from KalshiClientsBaseV2ApiKey_FIXED import ExchangeClient, HttpError
+import KalshiClientsBaseV2ApiKey_FIXED as _kalshi_client_mod   # its 429 counter
 
 # UNENCODABLE OUTPUT NEVER KILLS A TASK (2026-09-29). Every "KL imm *" email
 # task runs under cmd.exe with stdout redirected to a log file in the
@@ -3158,7 +3159,16 @@ MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 # the burst: more placements per cycle at half the old peak rate. Live only
 # (a dry run never sleeps). Cancels outside the swap pairs (strays, halts,
 # the fail-safe, shutdown) are never paced. 0 = the old unpaced burst.
-PLACE_RATE_PER_SEC = _env_float("IMM_PLACE_RATE_PER_SEC", 12.0)
+# 12 -> 24 (Jack 2026-10-17: "Raise to 24/s ... Email alert me if rate limit
+# rejections occur"). The account is Kalshi's Advanced tier (GET
+# /account/limits: 300 write tokens/s, a 900-token bucket); a place or amend
+# costs 10 tokens, a cancel 2 (GET /account/endpoint_costs). On 10/16 this
+# bot averaged 36 tokens/s, peaking ~130 at the old 12/s pace, and the crypto
+# fleet sharing the key averaged 17; no 429 in the IMM logs 10/13-10/17. At
+# 24/s a wave can take 240 tokens/s, leaving ~60/s plus the bucket for the
+# rest of the fleet. RATE_LIMIT_ALERT emails any 429 rejection, ours or the
+# crypto bots'.
+PLACE_RATE_PER_SEC = _env_float("IMM_PLACE_RATE_PER_SEC", 24.0)
 
 
 class WritePacer:
@@ -3738,6 +3748,16 @@ def sweep_escalated_hold(n: int, base_s: float) -> float:
 # caps moves per order. A failed restore leaves one extra contract, which
 # the size rule's 20% tolerance bounds. A market the WS feed cannot serve is
 # skipped.
+# BETWEEN CYCLES (Jack 2026-10-17: "Raise to 24/s, send it between cycles").
+# The cycle only PLANS (picks the candidates, no API call); the line reads
+# and the moves run in _idle, a 0.3s slice at a time between the feed's
+# events, so they never hold a cycle up. The moves go most external size
+# behind first, each re-checked just before it is sent (same price and size,
+# no fill since the plan's read, event not held by the sweep breaker), on
+# their own WritePacer at PLACE_RATE_PER_SEC (a move = 2 writes). On 10/17
+# about 250 orders a minute qualified and the bot idles ~7s of every ~26s
+# cycle: ~85 moves fit per gap at 24/s. A plan not finished by the next one
+# is replaced (counted `unfinished`).
 #    IMM_BACK_OF_LINE=dry -- THE DEFAULT: the line is read and each re-queue
 #                   is LOGGED (back_of_line_<date>.jsonl), nothing amended.
 #    IMM_BACK_OF_LINE=on  -- the amend is sent.
@@ -8935,6 +8955,27 @@ EVENT_LEVEL_STANDOFF = os.environ.get("IMM_EVENT_STANDOFF", "1") == "1"
 STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
+# RATE-LIMIT ALERT (Jack 2026-10-17: "Raise to 24/s ... Email alert me if
+# rate limit rejections occur"). Every RATE_LIMIT_CHECK_SECS the bot counts
+# the 429s (Too Many Requests) since its last look: its own, from the Kalshi
+# client's RATE_LIMITED counter (writes are rejections; GETs are retried and
+# only reported), and the other bots' on the same key, from the lines their
+# logs gained ("HttpError(429" -- the crypto bots log every rejected write
+# that way) in RATE_LIMIT_SCAN_DIRS (names under STATUS_DIR's parent, or
+# absolute paths; *.log files touched in the last 2 days, read from where
+# they stood at startup). Any rejected write emails an urgent `rate_limit`
+# alert (the Alerter sends one per 6 hours; every look is logged).
+# IMM_RATE_LIMIT_ALERT=0 turns it off.
+RATE_LIMIT_ALERT = os.environ.get("IMM_RATE_LIMIT_ALERT", "1") == "1"
+RATE_LIMIT_CHECK_SECS = max(10.0, _env_float("IMM_RATE_LIMIT_CHECK_SECS", 120.0))
+RATE_LIMIT_SCAN_DIRS: Tuple[str, ...] = tuple(
+    d if os.path.isabs(d) else os.path.join(
+        os.path.dirname(os.path.abspath(STATUS_DIR)), d)
+    for d in (x.strip() for x in os.environ.get(
+        "IMM_RATE_LIMIT_SCAN_DIRS",
+        "crypto-annual,crypto-touch,crypto-touch-weekly,crypto-updown,nfl-snipe,gas-bot").split(","))
+    if d)
+RATE_LIMIT_MAX_READ_BYTES = 8 * 1024 * 1024    # per file per look
 # ONE-SHOT LIVE-CONFIRM RELEASE (Jack 2026-10-05, KXTRUMPMENTION-26OCT05
 # false confirm). event_live_halt has no resume path by design, so lifting
 # a wrong confirm used to mean stopping the bot and hand-editing
@@ -9452,6 +9493,8 @@ _CONFIG_CODE_KNOBS = (
     "BACK_OF_LINE_MIN_BEHIND_FRAC", "BACK_OF_LINE_COOLDOWN_SECS",
     "BACK_OF_LINE_MAX_BUMPS", "BACK_OF_LINE_MAX_PER_PASS", "BACK_OF_LINE_CHUNK",
     "BACK_OF_LINE_BUDGET_SECS",
+    # rate-limit alert (2026-10-17)
+    "RATE_LIMIT_ALERT", "RATE_LIMIT_CHECK_SECS", "RATE_LIMIT_SCAN_DIRS",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
     "WS_FAST_MIN_GAP_C", "WS_FAST_EXEMPT", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
     # hang watchdog: wedge stacks, its handoff, the main-thread network
@@ -17581,10 +17624,22 @@ class IncentiveMarketMaker:
         self._bol_last: Dict[str, float] = {}
         self._bol_last_pass = 0.0
         self._bol_logged: Deque[float] = deque()
+        # the plan the cycle made, worked off between cycles (_idle), and the
+        # moves' own write pacer (PLACE_RATE_PER_SEC, built on first use)
+        self._bol_plan: Optional[dict] = None
+        self._bol_pacer: Optional[WritePacer] = None
+        # rate-limit alert (2026-10-17, RATE_LIMIT_ALERT): the last look, the
+        # client counters it saw, and how far each other bot's log was read
+        self._rl_last = 0.0
+        self._rl_seen = {"writes": 0, "reads": 0}
+        self._rl_offsets: Dict[str, int] = {}
+        self._rl = {"looks": 0, "imm_writes": 0, "imm_reads": 0, "fleet": 0,
+                    "alerts": 0, "last_alert_ts": 0.0, "last": ""}
         self._bol = {"passes": 0, "candidates": 0, "reads": 0, "read_fails": 0,
                      "no_position": 0, "front": 0, "would_requeue": 0,
                      "requeued": 0, "amend_fails": 0, "restored": 0,
-                     "restore_fails": 0, "capped": 0, "budget_stops": 0}
+                     "restore_fails": 0, "capped": 0, "budget_stops": 0,
+                     "steps": 0, "stale": 0, "unfinished": 0}
         # our WS fills (exchange time, order id, contracts) and when the cycle
         # last read its resting orders: the view rebuild subtracts the fills
         # that landed after that read, which the read cannot hold
@@ -20177,13 +20232,14 @@ class IncentiveMarketMaker:
                     self._ws_episode_end(oid, "amend", now_ts, new_px=o["px"])
 
     def _back_of_line_pass(self, resting: List[dict], now_ts: float) -> None:
-        """BACK OF THE LINE (2026-10-17, BACK_OF_LINE): every
-        BACK_OF_LINE_EVERY_SECS, read Kalshi's line for our whole-cent rungs
-        that share their price with other makers, and send each one with
-        enough of their size BEHIND it to the back with a +1 amend, then a -1
-        that keeps it there at its old size (dry: log it). Runs on the
-        resting view the cycle just built and the WS books; live orders only.
-        Never raises."""
+        """BACK OF THE LINE (2026-10-17, BACK_OF_LINE), the PLAN, at the end of
+        a cycle: every BACK_OF_LINE_EVERY_SECS, pick our whole-cent rungs that
+        share their price with at least BACK_OF_LINE_MIN_BEHIND external
+        contracts (the WS book less our own). No API call here: the line reads
+        and the moves run BETWEEN cycles, in _idle (_back_of_line_step; Jack
+        2026-10-17: "send it between cycles"), so they never hold a cycle up.
+        A new plan replaces an unfinished one. Live orders only. Never
+        raises."""
         if BACK_OF_LINE == "off" or self._ws is None or not self.live:
             return
         if now_ts - self._bol_last_pass < BACK_OF_LINE_EVERY_SECS:
@@ -20191,6 +20247,8 @@ class IncentiveMarketMaker:
         self._bol_last_pass = now_ts
         st = self._bol
         try:
+            if self._bol_plan is not None and not self._bol_plan["done"]:
+                st["unfinished"] += 1
             st["passes"] += 1
             view = self._resting_view
             live_ids = {o["order_id"] for lst in view.values() for o in lst}
@@ -20203,7 +20261,7 @@ class IncentiveMarketMaker:
             filled_since = {f_oid for f_ts, f_oid, _n in self._ws_fill_log
                             if f_ts > cut}
             read = {str(o.get("order_id") or ""): o for o in resting}
-            cands: List[Tuple[str, dict, dict, float]] = []
+            cands: List[dict] = []
             for t, lst in view.items():
                 lv: Optional[Tuple[Dict[float, float], Dict[float, float]]] = None
                 for o in lst:
@@ -20230,21 +20288,45 @@ class IncentiveMarketMaker:
                               and abs(float(x["px"]) - px) < 0.005)
                     ext = back_of_line_level(side_lv, at) - own
                     if ext >= BACK_OF_LINE_MIN_BEHIND:
-                        cands.append((t, o, read[oid], ext))
-            if not cands:
-                return
+                        cands.append({"t": t, "oid": oid, "side": o["side"], "c": c,
+                                      "rem": float(o["rem"]), "ext": ext,
+                                      "ro": read[oid]})
             st["candidates"] += len(cands)
-            ahead: Dict[str, float] = {}
-            tickers = sorted({t for t, _o, _r, _e in cands})
-            t0 = time.time()
-            for i in range(0, len(tickers), BACK_OF_LINE_CHUNK):
-                if time.time() - t0 > BACK_OF_LINE_BUDGET_SECS:
-                    st["budget_stops"] += 1
-                    break
+            self._bol_plan = {"at": now_ts, "read_at": self._resting_read_at,
+                              "cands": cands,
+                              "tickers": sorted({x["t"] for x in cands}),
+                              "next_chunk": 0, "ahead": {}, "moves": None,
+                              "next_move": 0, "done": not cands}
+        except Exception as e:
+            log(f"{self.tag} ! back-of-line plan failed: {e}")
+
+    def _back_of_line_step(self, now_ts: float, slice_secs: float = 0.3) -> bool:
+        """BACK OF THE LINE, the SENDS, between cycles (called from _idle): up
+        to `slice_secs` of work on the current plan -- first its queue-position
+        reads (BACK_OF_LINE_CHUNK markets a GET), then its moves, the most
+        external size behind first and at most BACK_OF_LINE_MAX_PER_PASS, each
+        re-checked just before it goes and paced like the cycle's writes
+        (PLACE_RATE_PER_SEC; a move is two writes). True while work remains.
+        Never raises."""
+        p = self._bol_plan
+        if p is None or p["done"]:
+            return False
+        if BACK_OF_LINE == "off" or not self.live:
+            p["done"] = True
+            return False
+        st = self._bol
+        t0 = time.time()
+        try:
+            st["steps"] += 1
+            while p["next_chunk"] < len(p["tickers"]):
+                if time.time() - t0 > slice_secs:
+                    return True
+                i = p["next_chunk"]
+                p["next_chunk"] = i + BACK_OF_LINE_CHUNK
                 self._heartbeat = time.time()
                 try:
                     resp = self.client.get_queue_positions(
-                        market_tickers=",".join(tickers[i:i + BACK_OF_LINE_CHUNK]))
+                        market_tickers=",".join(p["tickers"][i:i + BACK_OF_LINE_CHUNK]))
                     st["reads"] += 1
                 except Exception as e:
                     st["read_fails"] += 1
@@ -20254,79 +20336,203 @@ class IncentiveMarketMaker:
                     continue
                 for q in (resp or {}).get("queue_positions") or []:
                     try:
-                        ahead[str(q.get("order_id") or "")] = \
+                        p["ahead"][str(q.get("order_id") or "")] = \
                             float(q.get("queue_position_fp"))
                     except (TypeError, ValueError):
                         continue
-            done = 0
-            for t, o, ro, ext in cands:
-                oid = o["order_id"]
-                a = ahead.get(oid)
-                if a is None:
-                    st["no_position"] += 1
-                    continue
-                behind = ext - a
-                if behind < max(BACK_OF_LINE_MIN_BEHIND,
-                                BACK_OF_LINE_MIN_BEHIND_FRAC * ext):
-                    continue
-                st["front"] += 1
-                if done >= BACK_OF_LINE_MAX_PER_PASS:
-                    st["capped"] += 1
-                    continue
-                done += 1
-                c = int(round(float(o["px"])))
-                rec = {"ts": round(now_ts, 3), "mode": BACK_OF_LINE, "ticker": t,
-                       "order_id": oid, "side": o["side"], "px": c,
-                       "rem": round(float(o["rem"]), 2), "ahead": round(a, 2),
-                       "ext": round(ext, 2), "behind": round(behind, 2),
-                       "bumps": self._bol_bumps.get(oid, 0)}
-                did = False
-                if BACK_OF_LINE == "on":
-                    # same price, one more contract: Kalshi re-queues it at
-                    # the back (amend_order_inplace sends filled + this)...
-                    rem0 = order_remaining(ro)
-                    q = Quote(ticker=t, book_side=o["side"], price_cents=c,
-                              count=rem0 + 1.0)
-                    did = self.amend_order_inplace(ro, q, now_ts,
-                                                   reason="back_of_line")
-                    rec["ok"] = bool(did)
-                    if did:
-                        st["requeued"] += 1
-                        self._bol_bumps[oid] = self._bol_bumps.get(oid, 0) + 1
-                        o["rem"] = rem0 + 1.0
-                        # ...and straight back to its size (Jack 2026-10-17:
-                        # "add this if it's cleaner"): a size cut keeps the
-                        # order's place, now the back, so it ends where it was
-                        # in size and behind the line. The total sent is the
-                        # read's filled + rem0, so a fill landing between the
-                        # two calls still nets exactly one contract off.
-                        q2 = Quote(ticker=t, book_side=o["side"], price_cents=c,
-                                   count=rem0)
-                        back = self.amend_order_inplace(
-                            ro, q2, now_ts, reason="back_of_line_restore")
-                        rec["restored"] = bool(back)
-                        if back:
-                            st["restored"] += 1
-                            o["rem"] = rem0
-                        else:
-                            st["restore_fails"] += 1
-                    else:
-                        st["amend_fails"] += 1
-                else:
-                    st["would_requeue"] += 1
-                self._bol_last[oid] = now_ts
-                self._sink("back_of_line", rec)
-                while self._bol_logged and self._bol_logged[0] < now_ts - 3600:
-                    self._bol_logged.popleft()
-                if len(self._bol_logged) < 30:
-                    self._bol_logged.append(now_ts)
-                    log(f"{self.tag} back-of-line ({BACK_OF_LINE}): "
-                        f"{'re-queued' if did else 'would re-queue'} {t} "
-                        f"{o['side'].upper()} @ {c}c ({o['rem']:g} left): "
-                        f"{a:g} ahead, {behind:g} of {ext:g} external "
-                        f"contracts behind")
+            if p["moves"] is None:
+                moves = []
+                for m in p["cands"]:
+                    a = p["ahead"].get(m["oid"])
+                    if a is None:
+                        st["no_position"] += 1
+                        continue
+                    behind = m["ext"] - a
+                    if behind < max(BACK_OF_LINE_MIN_BEHIND,
+                                    BACK_OF_LINE_MIN_BEHIND_FRAC * m["ext"]):
+                        continue
+                    moves.append(dict(m, ahead=a, behind=behind))
+                st["front"] += len(moves)
+                # the most protection per call first
+                moves.sort(key=lambda x: -x["behind"])
+                if len(moves) > BACK_OF_LINE_MAX_PER_PASS:
+                    st["capped"] += len(moves) - BACK_OF_LINE_MAX_PER_PASS
+                    moves = moves[:BACK_OF_LINE_MAX_PER_PASS]
+                p["moves"] = moves
+            while p["next_move"] < len(p["moves"]):
+                if time.time() - t0 > slice_secs:
+                    return True
+                m = p["moves"][p["next_move"]]
+                p["next_move"] += 1
+                self._back_of_line_move(m, p, now_ts)
+            p["done"] = True
+            return False
         except Exception as e:
-            log(f"{self.tag} ! back-of-line pass failed: {e}")
+            p["done"] = True
+            log(f"{self.tag} ! back-of-line step failed: {e}")
+            return False
+
+    def _back_of_line_move(self, m: dict, p: dict, now_ts: float) -> None:
+        """One planned move, re-checked first: the order still rests at the
+        planned price and size (no fill since the plan's read, no re-price by
+        a later cycle) and its event is not held by the sweep breaker. Then
+        +1 contract (Kalshi re-queues it at the back) and straight -1 (a size
+        cut keeps that place), or, dry, a logged row."""
+        st = self._bol
+        t, oid, c = m["t"], m["oid"], m["c"]
+        cur = next((x for x in self._resting_view.get(t, ())
+                    if x["order_id"] == oid), None)
+        if cur is None or abs(float(cur["px"]) - c) > 0.005 or \
+                abs(float(cur["rem"]) - m["rem"]) > 1e-6 or \
+                oid in self._cycle_amended or \
+                any(f_oid == oid and f_ts > p["read_at"] + 1.0
+                    for f_ts, f_oid, _n in self._ws_fill_log) or \
+                self.sweep_held(self._event_of(t), now_ts):
+            st["stale"] += 1
+            return
+        rec = {"ts": round(now_ts, 3), "mode": BACK_OF_LINE, "ticker": t,
+               "order_id": oid, "side": m["side"], "px": c,
+               "rem": round(m["rem"], 2), "ahead": round(m["ahead"], 2),
+               "ext": round(m["ext"], 2), "behind": round(m["behind"], 2),
+               "bumps": self._bol_bumps.get(oid, 0),
+               "plan_age_s": round(now_ts - p["at"], 1)}
+        did = False
+        if BACK_OF_LINE == "on":
+            if self._bol_pacer is None:
+                self._bol_pacer = WritePacer(PLACE_RATE_PER_SEC)
+            self._bol_pacer.wait(2)
+            # same price, one more contract: Kalshi re-queues it at the back
+            # (amend_order_inplace sends the read's filled + this)...
+            ro = m["ro"]
+            rem0 = order_remaining(ro)
+            q = Quote(ticker=t, book_side=m["side"], price_cents=c, count=rem0 + 1.0)
+            did = self.amend_order_inplace(ro, q, now_ts, reason="back_of_line")
+            rec["ok"] = bool(did)
+            if did:
+                st["requeued"] += 1
+                self._bol_bumps[oid] = self._bol_bumps.get(oid, 0) + 1
+                cur["rem"] = rem0 + 1.0
+                # ...and straight back to its size (Jack 2026-10-17: "add this
+                # if it's cleaner"): a size cut keeps the order's place, now
+                # the back. The total sent is the read's filled + rem0, so a
+                # fill landing between the two calls still nets one contract.
+                q2 = Quote(ticker=t, book_side=m["side"], price_cents=c, count=rem0)
+                back = self.amend_order_inplace(ro, q2, now_ts,
+                                                reason="back_of_line_restore")
+                rec["restored"] = bool(back)
+                if back:
+                    st["restored"] += 1
+                    cur["rem"] = rem0
+                else:
+                    st["restore_fails"] += 1
+            else:
+                st["amend_fails"] += 1
+        else:
+            st["would_requeue"] += 1
+        self._bol_last[oid] = now_ts
+        self._sink("back_of_line", rec)
+        while self._bol_logged and self._bol_logged[0] < now_ts - 3600:
+            self._bol_logged.popleft()
+        if len(self._bol_logged) < 30:
+            self._bol_logged.append(now_ts)
+            log(f"{self.tag} back-of-line ({BACK_OF_LINE}): "
+                f"{'re-queued' if did else 'would re-queue'} {t} "
+                f"{m['side'].upper()} @ {c}c ({m['rem']:g} left): "
+                f"{m['ahead']:g} ahead, {m['behind']:g} of {m['ext']:g} external "
+                f"contracts behind")
+
+    def _rate_limit_scan_logs(self) -> Dict[str, Tuple[int, str]]:
+        """The other bots' new 429 lines since the last look: {bot: (count,
+        first new line)}. A log first seen starts from its current end (no
+        history); a log that shrank is re-anchored at its end."""
+        found: Dict[str, Tuple[int, str]] = {}
+        cutoff = time.time() - 2 * 86400
+        for d in RATE_LIMIT_SCAN_DIRS:
+            try:
+                names = [n for n in os.listdir(d) if n.endswith(".log")]
+            except OSError:
+                continue
+            for n in names:
+                path = os.path.join(d, n)
+                try:
+                    stt = os.stat(path)
+                except OSError:
+                    continue
+                if stt.st_mtime < cutoff:
+                    continue
+                size = stt.st_size
+                off = self._rl_offsets.get(path)
+                if off is None or size < off:
+                    self._rl_offsets[path] = size
+                    continue
+                if size == off:
+                    continue
+                start = max(off, size - RATE_LIMIT_MAX_READ_BYTES)
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(start)
+                        chunk = f.read(size - start)
+                except OSError:
+                    continue
+                self._rl_offsets[path] = size
+                if b"HttpError(429" not in chunk:
+                    continue
+                lines = [ln for ln in chunk.decode("utf-8", "replace").splitlines()
+                         if "HttpError(429" in ln]
+                bot = f"{os.path.basename(d)}/{n.rsplit('.', 1)[0]}"
+                cnt, ex = found.get(bot, (0, ""))
+                found[bot] = (cnt + len(lines), ex or lines[0][:240])
+        return found
+
+    def _rate_limit_watch(self, now_ts: float) -> None:
+        """RATE-LIMIT ALERT (2026-10-17, RATE_LIMIT_ALERT): count the 429s
+        since the last look -- this bot's, off the Kalshi client's counter,
+        and the other bots', off the lines their logs gained -- and send an
+        urgent `rate_limit` alert (email) when any write was rejected. Never
+        raises."""
+        if not RATE_LIMIT_ALERT or now_ts - self._rl_last < RATE_LIMIT_CHECK_SECS:
+            return
+        self._rl_last = now_ts
+        st = self._rl
+        try:
+            st["looks"] += 1
+            cnt = getattr(_kalshi_client_mod, "RATE_LIMITED", None) or {}
+            w = int(cnt.get("writes", 0)) - self._rl_seen["writes"]
+            r = int(cnt.get("reads", 0)) - self._rl_seen["reads"]
+            self._rl_seen = {"writes": int(cnt.get("writes", 0)),
+                             "reads": int(cnt.get("reads", 0))}
+            # (a log seen for the first time only anchors, so the first look
+            # reports this bot's own 429s since startup and nobody's history)
+            fleet = self._rate_limit_scan_logs()
+            st["imm_writes"] += max(0, w)
+            st["imm_reads"] += max(0, r)
+            n_fleet = sum(c for c, _ex in fleet.values())
+            st["fleet"] += n_fleet
+            if w <= 0 and n_fleet <= 0:
+                if r > 0:
+                    log(f"{self.tag} rate limit: {r} of our reads got a 429 "
+                        f"(retried) in the last {RATE_LIMIT_CHECK_SECS / 60:g} min")
+                return
+            parts = []
+            if w > 0:
+                parts.append(f"this bot: {w} write(s) rejected"
+                             + (f" (last {cnt.get('last')})" if cnt.get("last") else ""))
+            if r > 0:
+                parts.append(f"{r} of its reads got a 429 and were retried")
+            for bot, (c, ex) in sorted(fleet.items()):
+                parts.append(f"{bot}: {c} rejected (e.g. {ex})")
+            msg = (f"Kalshi rate-limit rejections (429 Too Many Requests) in the "
+                   f"last {RATE_LIMIT_CHECK_SECS / 60:g} min -- " + "; ".join(parts)
+                   + f". This bot paces its writes at {PLACE_RATE_PER_SEC:g}/s "
+                     f"(IMM_PLACE_RATE_PER_SEC, raised from 12 on 10/17); lower "
+                     f"it if these keep coming.")
+            st["alerts"] += 1
+            st["last_alert_ts"] = now_ts
+            st["last"] = msg[:500]
+            self.alerter.alert("rate_limit", msg, key="rate_limit", urgent=True,
+                               now_ts=now_ts)
+        except Exception as e:
+            log(f"{self.tag} ! rate-limit watch failed: {e}")
 
     def _idle(self, secs: float, stopping: dict) -> bool:
         """Sleep up to `secs` between cycles. With the WebSocket feed running
@@ -20363,6 +20569,14 @@ class IncentiveMarketMaker:
                 self._ws_wake = False
                 self._ws_fast["wakes"] += 1
                 return True
+            # back of the line (2026-10-17, Jack: "send it between cycles"):
+            # its line reads and moves run here, a slice at a time, so the
+            # feed's events keep their turn between slices
+            plan = self._bol_plan
+            if plan is not None and not plan["done"]:
+                left = end - time.time()
+                if left > 0.05:
+                    self._back_of_line_step(time.time(), min(0.3, left))
         return False
 
     def _get_resting_orders_global(self) -> List[dict]:
@@ -26419,9 +26633,12 @@ class IncentiveMarketMaker:
                 self._build_resting_view(resting, now_ts)
             except Exception as e:
                 log(f"{self.tag} ! WS resting view failed: {e}")
-            # back of the line (2026-10-17): on the view just built
+            # back of the line (2026-10-17): the plan, on the view just built
+            # (its reads and moves run between cycles, in _idle)
             if not fast_only:
                 self._back_of_line_pass(resting, now_ts)
+        # rate-limit alert (2026-10-17): any 429 rejection, ours or the fleet's
+        self._rate_limit_watch(time.time())
         if not fast_only:
             self.state.cycles_today += 1
             self.state.last_markets_line = (
@@ -26886,8 +27103,14 @@ class IncentiveMarketMaker:
                                               1 for s in self._sweep_esc.values()
                                               if s["reset_at"] > now and s["n"] >= 2)})
             # back of the line (2026-10-17, BACK_OF_LINE)
+            plan = self._bol_plan
             out["back_of_line"] = dict(self._bol, mode=BACK_OF_LINE,
-                                       bumped_orders=len(self._bol_bumps))
+                                       bumped_orders=len(self._bol_bumps),
+                                       plan_open=bool(plan and not plan["done"]))
+            # rate-limit alert (2026-10-17, RATE_LIMIT_ALERT)
+            out["rate_limit"] = dict(self._rl, on=RATE_LIMIT_ALERT,
+                                     pace_per_s=PLACE_RATE_PER_SEC,
+                                     logs_watched=len(self._rl_offsets))
             # cycle timing (2026-10-04): the REST book reads IMM_WS=on would
             # serve from the feed, inside each full cycle
             ct = list(self._cycle_times)
@@ -28605,7 +28828,15 @@ class IncentiveMarketMaker:
                + (" -- LOGGED only (back_of_line_<date>.jsonl), nothing amended"
                   if BACK_OF_LINE == "dry" else "")
                + ("" if WS_MODE in ("on", "shadow") else
-                  " (no WS feed: inactive)")))
+                  " (no WS feed: inactive)")
+               + "; planned at the end of a cycle, read and sent BETWEEN cycles"))
+        log(f"write pacing (2026-10-17): {PLACE_RATE_PER_SEC:g} writes/s "
+            f"(IMM_PLACE_RATE_PER_SEC, was 12; account write budget 300 tokens/s "
+            f"at 10 a write); rate-limit alert: "
+            + (f"any 429 rejection -- ours, or new lines in "
+               f"{', '.join(os.path.basename(d) for d in RATE_LIMIT_SCAN_DIRS) or '-'} "
+               f"-- emails a `rate_limit` alert, looked at every "
+               f"{RATE_LIMIT_CHECK_SECS:g}s" if RATE_LIMIT_ALERT else "off"))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "
