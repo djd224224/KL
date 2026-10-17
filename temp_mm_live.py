@@ -82,6 +82,18 @@ loop_s = 250 ms and at once on a new station row, a book change or a fill):
                       event, guard "off_hours", status events.*.quote_hour.
                       TMM_QUOTE_HOURS_ET="20,21,22,23,0,1,2,3,4,5,6,7"
                       (or "all" / "none" for every hour) overrides it
+  market agreement    policy fav_market_min_p (FAV_night_agree: 0.95; Jack
+                      2026-10-17, "1"): a favorite join only when the
+                      market's favorite probability on the EXTERNAL book
+                      (the WS book minus our resting orders; the dry book
+                      is not subtracted) is >= it -- two-sided mid, (best
+                      favorite bid + 1) / 100 when the longshot side is
+                      empty, no join when the favorite side is empty
+                      (temp_mm_policy.market_fav_prob, inside decide(): the
+                      shadow sim's rule). A join the market stops agreeing
+                      with is cancelled at once (a cancel is urgent).
+                      Decision samples log fav_market {side, p, min, ok}.
+                      TMM_FAV_MARKET_MIN_P=0.95 (or "off") overrides it
 
 Risk and safety (TEMP_MM_LIVE.md has every default):
   pos_cap / event_wcl_cap   the policy's pre-trade sizing on FILLED positions
@@ -312,6 +324,20 @@ def parse_hours(raw: Any) -> Optional[List[int]]:
     return out
 
 
+def parse_prob_or_none(raw: Any) -> Optional[float]:
+    """TMM_FAV_MARKET_MIN_P: "0.95" -> 0.95; "off" / "none" / "null" -> None
+    (the agreement rule off). An unset or empty variable never reaches here
+    (the variant's own value stays). ValueError (the bot refuses to start)
+    on anything else; the range (0..1) is temp_mm_policy.check_values'."""
+    s = str(raw).strip()
+    if s.lower() in ("off", "none", "null"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"TMM_FAV_MARKET_MIN_P={s!r}: a probability 0..1, or 'off'") from None
+
+
 def _parse_like(default: Any, raw: str) -> Any:
     s = str(raw).strip()
     if isinstance(default, bool):
@@ -341,7 +367,12 @@ def policy_overrides_from_env(environ: Optional[Dict[str, str]] = None) -> Dict[
         raw = env.get("TMM_" + k.upper())
         if raw is None or str(raw).strip() == "":
             continue
-        out[k] = parse_hours(raw) if k == "quote_hours_et" else _parse_like(dv, raw)
+        if k == "quote_hours_et":
+            out[k] = parse_hours(raw)
+        elif k == "fav_market_min_p":       # default None: _parse_like would keep a string
+            out[k] = parse_prob_or_none(raw)
+        else:
+            out[k] = _parse_like(dv, raw)
     return out
 
 
@@ -3279,6 +3310,7 @@ class Bot:
             "pos": [mp.yes_q, mp.no_q, round(mp.cost, 2)],
             "wcl": round(dec.worst_case_loss, 2), "resting_wcl": round(dec.resting_wcl, 2),
             "pad_hold": dec.pad_hold, "quote_hour": dec.quote_hour,
+            "fav_market": d.get("fav_market"),
             "suspect": md.ticker in self.suspect}, now)
 
     # ---- execution -------------------------------------------------------

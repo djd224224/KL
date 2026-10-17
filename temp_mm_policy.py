@@ -46,6 +46,18 @@ The rules (TEMP_SHADOW.md "Policy and variants"); each has a switch in P:
                                as live at half size [near_decided_half]; that
                                is part of the decided feature (needs decided,
                                not live) and books as class "decided".
+  market agreement [fav_market_min_p]  Jack 2026-10-17 ("1": pre-register the
+                               agreement rule, TEMP_SHADOW.md "Pre-registered
+                               tests", Test B): a favorite join is placed only
+                               when the MARKET also prices the strike as a
+                               favorite -- market_fav_prob() on the external
+                               book at decision time >= fav_market_min_p
+                               (both sides bid: the mid (best favorite bid +
+                               100 - best longshot bid) / 200; the longshot
+                               side empty: (best favorite bid + 1) / 100; the
+                               favorite side empty: no join). None (the
+                               default) = off. FAV_night_agree = FAV_night +
+                               0.95. The model test (fav_min_p) is unchanged.
   qualification pads [qual_pads]  on a market we quote, a 1c order lifting a
                                thin side to target + pad_extra.
   skew [skew]                  live/near quotes with fair in 5-30c or 70-95c:
@@ -122,6 +134,12 @@ within seconds) and only these favorite joins are positive in expectation,
 almost all of it in the events settling 20:00-07:00 ET: FAV_night is
 FAV_only quoted in those settle hours only (quote_hours_et).
 
+FAV_night_agree (Jack 2026-10-17, "1"): FAV_night plus fav_market_min_p 0.95
+-- in both losing night hours of 10/16 (26OCT1621 / 1622) the model held the
+strike at 98-99.7% while the book priced it at 78-94c, and the joins bought
+the market's view. Chosen from those two (in-sample) hours, so it is judged
+only on later data (Test B, ET days 2026-10-18..22).
+
 API:
   DEFAULT_POLICY, VARIANTS, make_policy(variant=None, **overrides) -> dict
   decide(P, ctx: EventContext, markets: List[MarketState]) -> EventDecision
@@ -129,7 +147,7 @@ API:
   resting_scenario_losses, trim_resting_wcl (wcl_resting; decide only -- the
   sim's per-market cache does not apply it and refuses the switch)
   building blocks (the sim calls these directly): BookView, quote_market,
-  quote_price, classify, guard_buffer, normal_slope_c, g_tau, live_size,
+  quote_price, market_fav_prob, classify, guard_buffer, normal_slope_c, g_tau, live_size,
   overlap_window, window_flag, program_flag, pad_hold_flag, risk_headroom,
   worst_case_loss, et_hour, quote_hour_ok, check_quote_hours, check_values,
   scenario_losses, reference_price, best_price, would_cross, external_book.
@@ -141,11 +159,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-POLICY_VERSION = "3"   # 2: pad_hold_open_s (10/16); 3: quote_hours_et, FAV_only /
-                      # FAV_night, fav_min_price_c (10/16)
+POLICY_VERSION = "4"   # 2: pad_hold_open_s (10/16); 3: quote_hours_et, FAV_only /
+                      # FAV_night, fav_min_price_c (10/16); 4: fav_market_min_p,
+                      # FAV_night_agree (10/17)
 
-DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False, pad_hold_open_s=0.0, quote_hours_et=None, fav_min_price_c=0)
-VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True, pad_hold_open_s=180.0), "G0_nohold": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000), "FAV_only": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False, fav_min_price_c=50), "FAV_night": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False, fav_min_price_c=50, quote_hours_et=[20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])}
+DEFAULT_POLICY = dict(live=True, q_live=300, live_tau_full=40.0, live_tau_min_frac=0.3, live_stop_min=3.0, fair_guard=True, guard_min_c=1, guard_k=1.0, window_mode="pull", win_lo=20, win_hi=45, back_ticks=2, decided=False, q_pad=1000, q_fav=300, fav_min_p=0.97, near_decided_half=True, qual_pads=True, pad_extra=50, skew=0.0, pos_cap=1500, event_wcl_cap=1500.0, program_only=True, react_s=0.5, order_latency_s=0.15, maker_fee_per_contract=0.0, wcl_resting=False, pad_hold_open_s=0.0, quote_hours_et=None, fav_min_price_c=0, fav_market_min_p=None)
+VARIANTS = {"A_live300_nowin": dict(window_mode="none"), "B_live300_pull": dict(), "C_live300_back": dict(window_mode="back"), "D_live600_pull": dict(q_live=600), "E_live300_pull_decided": dict(decided=True), "F_full": dict(q_live=600, decided=True, skew=0.3), "G_decided_only": dict(live=False, decided=True, pad_hold_open_s=180.0), "G0_nohold": dict(live=False, decided=True), "H_noguard_pull": dict(fair_guard=False), "I_pads_only": dict(live=False, decided=True, q_fav=0), "J_decided_fav100": dict(live=False, decided=True, q_fav=100), "K_full_wcl500": dict(q_live=600, decided=True, skew=0.3, event_wcl_cap=500.0), "L_decided_pad3000": dict(live=False, decided=True, q_pad=3000), "FAV_only": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False, fav_min_price_c=50), "FAV_night": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False, fav_min_price_c=50, quote_hours_et=[20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]), "FAV_night_agree": dict(live=False, decided=True, q_pad=0, qual_pads=False, near_decided_half=False, fav_min_price_c=50, quote_hours_et=[20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7], fav_market_min_p=0.95)}
 
 TARGET = 1000.0      # target_size_fp of every KXTEMPMIAH program (10/14)
 DF = 0.5             # discount_factor_bps 5000
@@ -190,12 +209,17 @@ def _check_policy(P: dict) -> None:
 
 def check_values(P: dict) -> None:
     """The value checks shared with the sim's variant resolution:
-    quote_hours_et (check_quote_hours) and fav_min_price_c (a whole number of
-    cents 0..99; ValueError otherwise)."""
+    quote_hours_et (check_quote_hours), fav_min_price_c (a whole number of
+    cents 0..99) and fav_market_min_p (None, or a probability 0..1);
+    ValueError otherwise."""
     check_quote_hours(P)
     fm = P.get("fav_min_price_c", 0)
     if isinstance(fm, bool) or not isinstance(fm, int) or not 0 <= fm <= 99:
         raise ValueError(f"fav_min_price_c must be whole cents 0..99, not {fm!r}")
+    mp = P.get("fav_market_min_p")
+    if mp is not None and (isinstance(mp, bool) or not isinstance(mp, (int, float))
+                           or not math.isfinite(float(mp)) or not 0.0 <= float(mp) <= 1.0):
+        raise ValueError(f"fav_market_min_p must be None (off) or a probability 0..1, not {mp!r}")
 
 
 def check_quote_hours(P: dict) -> None:
@@ -299,6 +323,31 @@ class BookView:
             self.mid, self.two_sided = float(100 - self.best_n), False
         else:
             self.mid, self.two_sided = None, False
+
+
+def market_fav_prob(book: BookView, fav_side: str) -> Optional[float]:
+    """The MARKET's probability that `fav_side` ('yes' / 'no') wins, from the
+    external book (our own orders excluded) at decision time -- the
+    definition pre-registered for fav_market_min_p (TEMP_SHADOW.md
+    "Pre-registered tests", Test B):
+      both sides have resting bids: the mid, (best favorite bid + (100 -
+          best longshot bid)) / 200;
+      the longshot side empty (locked or one-sided): (best favorite bid +
+          1) / 100;
+      the favorite side empty: None (no join).
+    Prices are cents in each side's own space; a level is a resting bid
+    when its size is > 0 (BookView's best_y / best_n)."""
+    if fav_side == "yes":
+        fav, ls = book.best_y, book.best_n
+    elif fav_side == "no":
+        fav, ls = book.best_n, book.best_y
+    else:
+        raise ValueError(f"fav_side must be 'yes' or 'no', not {fav_side!r}")
+    if fav is None:
+        return None
+    if ls is None:
+        return (fav + 1) / 100.0
+    return (fav + (100 - ls)) / 200.0
 
 
 # --------------------------------------------------------------------------
@@ -686,7 +735,16 @@ def quote_market(P: dict, book: Optional[BookView], fair: Optional[float],
                 _tag(tags, ls, 1, "pad")
         fav = "no" if yes_long else "yes"
         f_fav = 1.0 - fx if yes_long else fx
-        if f_fav >= float(P["fav_min_p"]) and P["q_fav"] >= 1:
+        mkt_ok = True
+        mmin = P.get("fav_market_min_p")
+        if mmin is not None and f_fav >= float(P["fav_min_p"]) and P["q_fav"] >= 1:
+            # the market must price the strike as a favorite too (Test B's
+            # agreement rule): on the external book, at decision time
+            mp = market_fav_prob(book, fav)
+            mkt_ok = mp is not None and mp + 1e-9 >= float(mmin)
+            if diag is not None:
+                diag["fav_market"] = {"side": fav, "p": mp, "min": float(mmin), "ok": mkt_ok}
+        if f_fav >= float(P["fav_min_p"]) and P["q_fav"] >= 1 and mkt_ok:
             ref = book.ref_n if fav == "no" else book.ref_y
             p = quote_price(P, fav, book, ref, f_fav, buf, False, True)
             floor_c = int(P.get("fav_min_price_c") or 0)

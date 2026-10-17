@@ -2212,5 +2212,88 @@ class TestQuoteHours(unittest.TestCase):
             self.assertEqual(pol.et_hour(info.settle_ts), h, ev)
             self.assertEqual(pol.quote_hour_ok(P, info.settle_ts), ok, ev)
 
+
+class TestMarketAgreement(unittest.TestCase):
+    """Jack 2026-10-17, "1": pre-register the agreement rule. FAV_night_agree
+    = FAV_night + fav_market_min_p 0.95: a favorite join only while the
+    market's favorite probability on the EXTERNAL book (the live book minus
+    our resting orders) is >= 0.95 -- the same temp_mm_policy.decide() rule
+    the shadow sim replays. EVENT settles 09:00 ET, so the tests list hour 9."""
+
+    @staticmethod
+    def writes(calls):
+        return [c for c in calls if c[0] in ("create", "amend", "decrease", "cancel",
+                                             "batch_cancel")]
+
+    def test_variant_and_env(self):
+        self.assertEqual(L.resolve_variant("FAV_night_agree"), "FAV_night_agree")
+        with self.assertRaises(ValueError):
+            L.resolve_variant("FAV")                                   # three FAV_* variants
+        self.assertEqual(L.policy_overrides_from_env({"TMM_FAV_MARKET_MIN_P": "0.95"}),
+                         {"fav_market_min_p": 0.95})
+        for raw in ("off", "OFF", "none", " null "):
+            self.assertEqual(L.policy_overrides_from_env({"TMM_FAV_MARKET_MIN_P": raw}),
+                             {"fav_market_min_p": None})
+        for env in ({}, {"TMM_FAV_MARKET_MIN_P": ""}, {"TMM_FAV_MARKET_MIN_P": "  "}):
+            self.assertEqual(L.policy_overrides_from_env(env), {})
+            self.assertEqual(pol.make_policy("FAV_night_agree",
+                                             **L.policy_overrides_from_env(env))
+                             ["fav_market_min_p"], 0.95)
+        with self.assertRaises(ValueError):
+            L.policy_overrides_from_env({"TMM_FAV_MARKET_MIN_P": "high"})
+        P = pol.make_policy("FAV_night", **L.policy_overrides_from_env(
+            {"TMM_FAV_MARKET_MIN_P": "1.5"}))
+        with self.assertRaises(ValueError):                            # main(): config error
+            pol._check_policy(P)
+        self.assertIsNone(pol.make_policy("FAV_night")["fav_market_min_p"])
+
+    def test_joins_only_while_the_external_book_agrees(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(
+            live=True, variant="FAV_night_agree", pol_over={"quote_hours_et": [9]})
+        self.assertEqual(bot.P["fav_market_min_p"], 0.95)
+        started(bot, clock, t=OPEN + 125.0)
+        # T_HI YES 95 / NO 3 and T_LO NO 95 / YES 3: the market at 0.96 -> joins
+        self.assertEqual(sorted((c[1], c[2], c[3], c[4]) for c in ex.kinds("create")),
+                         [(T_HI, "yes", 95, 300), (T_LO, "no", 95, 300)])
+        samples = [r for r in rows(os.path.join(bot.dir, f"decisions_{L.utc_day(clock.t)}.jsonl"))
+                   if r.get("kind") == "sample" and r.get("ticker") == T_HI]
+        self.assertEqual(samples[0]["fav_market"],
+                         {"side": "yes", "p": 0.96, "min": 0.95, "ok": True})
+        # the market drops to YES 93 / NO 5 (0.94). The LIVE book still holds
+        # our 95 x300 on top (FakeFeed adds it): counted, it would read 0.95
+        # and keep the join; the external book reads 0.94 -> cancelled at once
+        feed.books[T_HI] = ({93: 300.0}, {5: 200.0})
+        n = len(ex.calls)
+        clock.t = OPEN + 126.5
+        bot.step(clock.t)
+        new = self.writes(ex.calls[n:])
+        self.assertTrue(any(c[0] in ("cancel", "batch_cancel") for c in new), new)
+        self.assertNotIn(T_HI, by_market(bot))
+        self.assertEqual(by_market(bot)[T_LO], {"no": {95: 300.0}})
+        # the market agrees again (YES 96 / NO 3: 0.965): a new join
+        feed.books[T_HI] = ({96: 300.0}, {3: 200.0})
+        for dt in (127.0, 128.0, 129.0):
+            clock.t = OPEN + dt
+            bot.step(clock.t)
+        self.assertEqual(by_market(bot)[T_HI], {"yes": {96: 300.0}})
+
+    def test_fav_night_ignores_the_market(self):
+        bot, ex, feed, wx, fair, mails, clock = make_bot(
+            live=True, variant="FAV_night", pol_over={"quote_hours_et": [9]})
+        feed.books[T_HI] = ({93: 300.0}, {5: 200.0})                  # market 0.94
+        started(bot, clock, t=OPEN + 125.0)
+        self.assertIn((T_HI, "yes", 93, 300),
+                      [(c[1], c[2], c[3], c[4]) for c in ex.kinds("create")])
+
+    def test_dry_book_is_the_market(self):
+        # dry: the dry orders never reached the exchange, so the feed's book
+        # is the external book as it stands
+        bot, ex, feed, wx, fair, mails, clock = make_bot(
+            live=False, variant="FAV_night_agree", pol_over={"quote_hours_et": [9]})
+        feed.books[T_HI] = ({94: 300.0}, {4: 200.0})                  # (94 + 96) / 200 = 0.95
+        feed.books[T_LO] = ({8: 200.0}, {90: 300.0})                  # (90 + 92) / 200 = 0.91
+        started(bot, clock, t=OPEN + 125.0)
+        self.assertEqual(by_market(bot), {T_HI: {"yes": {94: 300.0}}})
+
 if __name__ == "__main__":
     unittest.main()

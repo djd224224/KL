@@ -79,8 +79,15 @@ tested live") = swp, plus two channels on our orders at EVERY price >= 2c
       recorded hours; FavHazard = Hazard on that table), taking a recorded
       top-hit size (cleared -> all of ours). Monte Carlo on its own seeded
       stream (FAVHAZ_SEED), common to every variant.
-The daily pipeline (temp_shadow_sim) does NOT run stress (default OFF):
-`run --fill-models opt,cons,swp,stress` and temp_shadow_audit do.
+The daily pipeline (temp_shadow_sim, since SIM_VERSION 7, Jack 2026-10-17:
+"1") runs stress beside opt / cons / swp (the report decides on it); here
+`run --fill-models opt,cons,swp,stress` and temp_shadow_audit run it too.
+VPass.record_fav_expo() logs what channel (e) reads from our own state
+(fav_hazard_hits screens a draw's favorite-taker candidates on it, the way
+hazard_hits screens the 1c ones), and with a tail table every pass reports
+fav_fills: its fills on the favorite side by the side's fair bucket
+(contracts, cost, table-marked P&L) -- the report re-marks them at the
+recorded period's upset rates after favorite-bid hits (fav_hit_summary).
 
 Everything else (fills from other trades, queue rules, the policy, re-pads
 after a fill, pos_cap / event WCL trimming, a capped strike no longer
@@ -1097,6 +1104,7 @@ class VPass(sim._Pass):
         self.had_1c = False     # swp: a 1c order of ours ever rested (none: every
                                 # draw is this one -- temp_shadow_sim reuses it)
         self.expo_log: Optional[Dict[tuple, List[tuple]]] = None   # record_expo()
+        self.fav_log: Optional[Dict[tuple, List[tuple]]] = None    # record_fav_expo()
 
     # -- pad hold ----------------------------------------------------------
     def _desired(self, m, t, v, f, gf, wflag, pflag, size_full, risk, hold=False):
@@ -1148,6 +1156,8 @@ class VPass(sim._Pass):
             self._ep_update(item[1], item[0])
             if self.expo_log is not None:
                 self._log_expo(item[0], item[1])
+        if self.fav_log is not None:
+            self._log_fav(item[0], item[1])
 
     # -- the 1c trajectory, for screening other draws (hazard_hits) ----------
     def record_expo(self) -> "VPass":
@@ -1168,11 +1178,36 @@ class VPass(sim._Pass):
             if not lst or lst[-1][1] != ours or lst[-1][2] != ep[side]:
                 lst.append((t, ours, ep[side]))
 
+    # -- the favorite trajectory, for screening other draws (fav_hazard_hits) --
+    def record_fav_expo(self) -> "VPass":
+        """Log every change of (our best price >= 2c, our size there, the
+        alone-at-top episode) per (market, side) with its time: everything
+        _on_fav_hazard reads from our own state (the episode changes at
+        ticks, the orders at activations and fills). With no hidden
+        favorite taker accepted in this pass, the log is the (e)-free
+        trajectory, and fav_hazard_hits() tells whether another draw's
+        candidates would change it."""
+        self.fav_log = {}
+        return self
+
+    def _log_fav(self, t, m):
+        o, ep = self.orders[m], self.epfav[m]
+        for side in ("yes", "no"):
+            book = o[side]
+            ps = [p for p in book if p >= 2]
+            p = max(ps) if ps else None
+            ours = sum(l[0] for l in book[p]) if p is not None else 0.0
+            lst = self.fav_log.setdefault((m, side), [])
+            if not lst or lst[-1][1:] != (p, ours, ep[side]):
+                lst.append((t, p, ours, ep[side]))
+
     # -- fills ---------------------------------------------------------------
     def _record_fill(self, ts, m, side, p, q):
         super()._record_fill(ts, m, side, p, q)
         if self.src != "trade":
             self.sweep_fills.append((ts, m, side, q, self.src))
+        if self.fav_log is not None:            # every fill path has updated the lots
+            self._log_fav(ts, m)
 
     def _fill_1c(self, ts, m, side, want: Optional[float], src: str,
                  per_lot: Optional[List[float]] = None) -> float:
@@ -1392,6 +1427,8 @@ class VPass(sim._Pass):
                 self.had_fav = True
                 if ep is None or ep[0] != p:
                     self.epfav[m][side] = (p, T)
+            if self.fav_log is not None:
+                self._log_fav(T, m)
 
     def _on_fav_hazard(self, c):
         """(e): a hidden taker hits our favorite lot resting alone at the top
@@ -1541,6 +1578,7 @@ class VPass(sim._Pass):
         pnl_fair = pnl_fair_1c = 0.0
         tc = self.tail_cal
         cal = {"mid": 0.0, "lo": 0.0, "hi": 0.0}
+        favf: Dict[str, List[float]] = {}     # fav bucket -> [contracts, cost $, pnl_cal $]
         for ts, m, side, p, q, cls, f, after in self.fills:
             if p == 1:
                 f1[sh.tickers[m]] += q
@@ -1560,6 +1598,14 @@ class VPass(sim._Pass):
                 # given a taker hit a bid at our price (fill-conditional)
                 for w in cal:
                     cal[w] += q * (tc.p(ps, w, p) - p / 100.0)
+                if ps >= FAV_EDGES[0]:
+                    # a favorite-side fill, by the side's fair bucket: the
+                    # report re-marks these at the recorded period's upset
+                    # rates after favorite-bid hits (the recent regime)
+                    a = favf.setdefault(fav_bucket(ps), [0.0, 0.0, 0.0])
+                    a[0] += q
+                    a[1] += q * p / 100.0
+                    a[2] += q * (tc.p(ps, "mid", p) - p / 100.0)
         ex = {"filler_contracts": _r(sum(f1.values()), 2),
               "pnl_fair": _r(pnl_fair, 4), "pnl_fair_1c": _r(pnl_fair_1c, 4),
               "net_fair": _r(self.reward + pnl_fair, 4),
@@ -1577,7 +1623,10 @@ class VPass(sim._Pass):
                        "pnl_cal_thi": _r(cal["hi"], 4),
                        "net_cal": _r(self.reward + cal["mid"], 4),
                        "net_cal_tlo": _r(self.reward + cal["lo"], 4),
-                       "net_cal_thi": _r(self.reward + cal["hi"], 4)})
+                       "net_cal_thi": _r(self.reward + cal["hi"], 4),
+                       "fav_fills": {b: {"contracts": _r(a[0], 4), "cost": _r(a[1], 4),
+                                         "pnl_cal": _r(a[2], 4)}
+                                     for b, a in sorted(favf.items())}})
         if self.detail:
             ex["fills_detail"] = [(round(ts, 3), sh.tickers[m], side, p, round(q, 2))
                                   for ts, m, side, p, q, cls, f, after in self.fills]
@@ -1619,6 +1668,115 @@ def hazard_hits(sh: SweepShared, hazard: Hazard, expo_log: Dict[tuple, List[tupl
         if lam > 0 and u_acc * lam_max < lam:
             return True
     return False
+
+
+def fav_hazard_hits(sh: SweepShared, fav_hazard: Hazard, fav_log: Dict[tuple, List[tuple]],
+                    fcands: Sequence[tuple]) -> bool:
+    """Would any of a draw's hidden favorite-taker candidates (stress channel
+    (e), fav_candidates) be ACCEPTED along a pass's logged favorite
+    trajectory (VPass.record_fav_expo)? The test is VPass._on_fav_hazard's,
+    on the state the pass had at the candidate's time: the alone-at-top
+    episode of the tick before, our best price >= 2c and our size there
+    (every change at or before it: the run loop applies activations,
+    ticks, trades and earlier extra events up to an extra event's time
+    before it). False -> a pass with these candidates is identical to the
+    logged one, provided the logged pass accepted no hidden favorite taker
+    itself (rejected candidates have no effect)."""
+    if not fav_log:
+        return False
+    times = {k: [r[0] for r in v] for k, v in fav_log.items()}
+    lam_max = fav_hazard.lam_max
+    for t, m, side, u_acc, _u_size in fcands:
+        tl = fav_log.get((m, side))
+        if not tl:
+            continue
+        j = bisect.bisect_right(times[(m, side)], t) - 1
+        if j < 0:
+            continue
+        _t, p, ours, ep = tl[j]
+        if ep is None or p is None or p != ep[0]:
+            continue
+        lv = sh.side_levels(m, side, sh.idx_at(t))          # VPass._fav_top's test
+        if lv is None or lv.get(p, 0.0) >= 1.0:
+            continue
+        if any(q >= 1.0 and pp > p for pp, q in lv.items()):
+            continue
+        f = sh.fair_or_mid(m, t)
+        if f is None:
+            continue
+        fs = f if side == "yes" else 1.0 - f
+        if fs < FAVHAZ_MIN_P:
+            continue
+        lam = fav_hazard.rate(fs, (t - sh.open) / 60.0, t - ep[1])
+        if lam <= 0 or u_acc * lam_max >= lam:
+            continue
+        if ours >= 1.0 - 1e-9:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# Favorite-bid hits and the favorite's outcome (the report's recent regime)
+# --------------------------------------------------------------------------
+
+FAVHIT_PX_MIN = 90       # a favorite-bid print at 90-99c (temp_shadow_audit.CLEAR_PX_MIN)
+
+
+def fav_hit_summary(sh: SweepShared) -> List[list]:
+    """The event's taker clusters that hit a FAVORITE side's bids, with the
+    favorite's outcome -- temp_shadow_audit.fav_clusters_event's rule (the
+    2026-10-17 audit: favorite-bid takers were far more informed in the
+    recorded hours than the 530-hour tail table says): prints on one market /
+    side within CLUSTER_S over the full tape (the replay tape plus the prints
+    that filled our live orders), its best print >= FAVHIT_PX_MIN, the hit
+    side's fair (fair_or_mid at the cluster's first print) >= FAVHAZ_MIN_P.
+    -> [[ticker, fav bucket (FAV_LABELS), clusters, clusters the favorite
+    lost, sum of the model's longshot probability (1 - side fair),
+    contracts, contracts the favorite lost], ...] per (ticker, bucket); only
+    settled strikes. The report pools them over the recorded period
+    (cluster-weighted upset rate per bucket, strike-clustered bootstrap)."""
+    res = sh.inp.results
+    rows = [(ts, m, tk, yc, cnt) for ts, m, tk, yc, cnt in sh.trades]
+    rows += sh._own_prints()
+    rows.sort(key=lambda r: r[0])
+    open_c: Dict[tuple, dict] = {}
+    cl: List[dict] = []
+    for ts, m, taker, yc, cnt in rows:
+        side = "yes" if taker == "no" else "no"
+        px = yc if side == "yes" else 100 - yc
+        c = open_c.get((m, side))
+        if c is None or ts - c["t0"] > CLUSTER_S:
+            c = dict(t0=ts, m=m, side=side, top=px, q=0.0)
+            cl.append(c)
+            open_c[(m, side)] = c
+        c["top"] = max(c["top"], px)
+        c["q"] += cnt
+    acc: Dict[tuple, List[float]] = {}
+    for c in cl:
+        m, side, t0 = c["m"], c["side"], c["t0"]
+        if t0 >= sh.end_t or c["top"] < FAVHIT_PX_MIN:
+            continue
+        r = res.get(sh.tickers[m])
+        if r not in ("yes", "no"):
+            continue
+        f = sh.fair_or_mid(m, t0)
+        if f is None:
+            continue
+        sp = f if side == "yes" else 1.0 - f
+        if sp < FAVHAZ_MIN_P:
+            continue
+        i0 = sh.idx_at(t0)
+        if sh.side_levels(m, side, i0 - 1) is None and sh.side_levels(m, side, i0) is None:
+            continue                         # no trusted book around it (the audit's rule)
+        lost = r != side
+        a = acc.setdefault((sh.tickers[m], fav_bucket(sp)), [0, 0, 0.0, 0.0, 0.0])
+        a[0] += 1
+        a[1] += int(lost)
+        a[2] += 1.0 - sp
+        a[3] += c["q"]
+        a[4] += c["q"] if lost else 0.0
+    return [[tk, b, a[0], a[1], _r(a[2], 6), _r(a[3], 2), _r(a[4], 2)]
+            for (tk, b), a in sorted(acc.items())]
 
 
 def run_swp(sh: SweepShared, P: dict, hazard: Hazard, draws: int,
@@ -1688,7 +1846,8 @@ def mean_summary(runs: List[dict], keep_detail: bool = False) -> dict:
         return {kk: _r(vv / n, 4) for kk, vv in acc.items()}
     for key in ("sweep_src", "pos", "filler_by_strike", "markouts"):
         out[key] = avg_nested(key)
-    for key in ("by_class", "by_tau", "by_side"):
+    for key in ("by_class", "by_tau", "by_side") + (
+            ("fav_fills",) if any("fav_fills" in r for r in runs) else ()):
         acc = {}
         for r in runs:
             for b, d in (r.get(key) or {}).items():

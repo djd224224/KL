@@ -4,7 +4,7 @@ Jack, 2026-10-15: "yes build F, which is a superset of G right?" This followed t
 
 `temp_mm_live.py` quotes Kalshi's hourly Miami temperature markets with the same policy code the shadow replays (`temp_mm_policy.decide`). The shadow's numbers therefore describe the code that trades.
 
-- **Variants:** it runs F by default. `--variant G` (decided strikes only, with the 180 s pad hold since 10/16) or `--variant J` (decided, favorite size 100) switches it, and so does any `temp_mm_policy.VARIANTS` key. `--variant G0` is G without the pad hold. `--variant FAV_only` quotes only G's favorite joins (no 1c filler of any kind, and no favorite join under 50c: `fav_min_price_c`) and `--variant FAV_night` does the same in the events settling 20:00-07:00 ET (Jack 2026-10-16, "1"; see Quote hours).
+- **Variants:** it runs F by default. `--variant G` (decided strikes only, with the 180 s pad hold since 10/16) or `--variant J` (decided, favorite size 100) switches it, and so does any `temp_mm_policy.VARIANTS` key. `--variant G0` is G without the pad hold. `--variant FAV_only` quotes only G's favorite joins (no 1c filler of any kind, and no favorite join under 50c: `fav_min_price_c`) and `--variant FAV_night` does the same in the events settling 20:00-07:00 ET (Jack 2026-10-16, "1"; see Quote hours). `--variant FAV_night_agree` is FAV_night joining only where the market also prices the favorite at 0.95 or more (Jack 2026-10-17, "1"; see Market agreement).
 - **Policy switches:** every policy setting is an env var, for example `TMM_Q_LIVE=300` or `TMM_EVENT_WCL_CAP=500`.
 
 **It is DRY by default.** It reads live data, logs `[DRY] would ...` for every create, amend, decrease and cancel, and keeps a dry book. It never sends an order unless started with `--live --subaccount N`.
@@ -80,6 +80,23 @@ Jack, 2026-10-16 ("1"): "ship the fixes + the sweep-aware report column, and add
 - Visibility: the start line names the hours. An off-hours event is logged once (`... settles 09:00 ET, outside quote_hours_et [...]: not quoted`). It also gets guard `off_hours` (with the hour), `status.json` `quote_hours_et` plus per event `quote_hour`, and decision samples with `reason: off_hours` and `quote_hour: false`.
 
 `test_temp_mm_live.TestQuoteHours` pins this on the fake clock: no write at all for the 09:00 ET event under FAV_night, the favorites only (no 1c) with the hour listed, a narrower list cancelling what rests, the env parsing, and settle hours from tickers across the Nov 1 switch.
+
+## Market agreement (10/17)
+
+Jack, 2026-10-17 ("1"): keep live halted, fix the shadow report, and pre-register the agreement rule (TEMP_SHADOW.md "Pre-registered tests", Test B). In both losing night hours of 10/16 (26OCT1621, 26OCT1622) the model held a strike at 98-99.7% while the book priced it at 78-94c, and FAV_night's joins bought the market's view at the reference. The rule was chosen from those two hours, so it is judged only on ET days 10/18-10/22.
+
+**What it does.** The policy key is `fav_market_min_p`, `None` (off) by default. With it set, a favorite join is placed only when the MARKET also prices the strike as a favorite: `temp_mm_policy.market_fav_prob` on the external book at decision time must be >= it.
+- **Both sides have resting bids:** the mid, (best favorite bid + (100 - best longshot bid)) / 200.
+- **Longshot side empty** (locked or one-sided): (best favorite bid + 1) / 100.
+- **Favorite side empty:** no join.
+- The model condition is unchanged (favorite fair >= `fav_min_p`, 0.97). Only the favorite join is gated: longshot pads, qualification pads and near-decided quotes are not (FAV_* rest none of those anyway).
+- `FAV_night_agree` = `FAV_night` + `fav_market_min_p` 0.95. `--variant FAV_night_agree` runs it; `TMM_FAV_MARKET_MIN_P=0.95` sets it on any variant and `off` (or `none`) turns it off; anything else that is not a probability 0-1 refuses to start (`config error`).
+
+**Identical in the bot and the shadow.** The test runs inside `temp_mm_policy.decide()` on the MarketStates' books, which are the external book: in live mode the WebSocket book minus our resting orders (`external_book`), so our own join never counts as the market's view; in dry mode the dry book is not subtracted (it never reached the exchange), as for every other rule. The shadow sim calls the same `quote_market` on the recorded book. When the market stops agreeing, the next decision drops the join and the plan cancels it at once (a cancel is urgent); when it agrees again, the join is a new create (paced, never debounced). Decision samples carry `fav_market` = `{side, p, min, ok}` whenever the rule was evaluated (the favorite passed the model test), for the hourly live-vs-shadow reconciliation.
+
+**Differences to expect live.** The sim decides on the recording's 1 s book grid; the bot on every WebSocket change. A market sitting near 0.95 flickers across it, so the bot can cancel and re-place where the sim's 1 s grid sees one state, and an order the bot is cancelling can still fill while the cancel is in flight.
+
+`test_temp_mm_policy.TestMarketAgreement` pins the definition, including both books of the 10/16 21:00 and 22:00 losses (in-sample: mechanics only, not evidence); `test_temp_mm_live.TestMarketAgreement` pins the env parsing and the bot on the fake clock (joins only while the external book agrees, our own resting join not counted, a cancel when the market stops agreeing).
 
 ## What it does
 
@@ -166,6 +183,7 @@ The plan also follows these rules:
 | no program known for a market (`TMM_REQUIRE_PROGRAM`) | no quotes there |
 | within `pad_hold_open_s` of the event's open (G: 180 s) | no 1c longshot or qualification pads; favorites, live and near quotes as usual |
 | the event's settle hour (ET) not in `quote_hours_et` (FAV_night: 20-07) | nothing rests on that event; what rests is cancelled (guard `off_hours`, logged once) |
+| `fav_market_min_p` set (FAV_night_agree: 0.95) and the external book prices the favorite below it, or the favorite side is empty | no favorite join on that market; a resting one is cancelled (decision samples: `fav_market`) |
 | within 1 s of the close | no quotes |
 | the API's close_time is not the ticker's hour (a DST fall-back hour?) | that event is not quoted (logged once); the model would price the wrong hour |
 | a market suspect of a missed fill (below) | no new orders there (cancels and cuts still go) |

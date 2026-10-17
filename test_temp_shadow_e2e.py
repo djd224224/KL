@@ -640,8 +640,11 @@ class TestDaySim(unittest.TestCase):
             path = os.path.join(C.DATA_ROOT, "sim", DAY, f"{r['event']}.json")
             self.assertEqual(C.read_json(path)["variants"],
                              json.loads(json.dumps(r["variants"])))
+            # opt / cons / swp for every variant, stress for the STRESS_SCOPE ones
             self.assertEqual(set(r["variants"]),
-                             {f"{v}|{f}" for v in sim.VARIANTS for f in sim.FILL_MODELS})
+                             {f"{v}|{f}" for v in sim.VARIANTS for f in sim.FILL_MODELS}
+                             | {f"{v}|stress" for v in sim.VARIANTS
+                                if sim.in_stress_scope(sim.VARIANTS[v])})
         # a second call reuses the files (same variants, same SIM_VERSION)
         again = sim.run_day(DAY, workers=1)
         self.assertEqual([a["runtime_s"] for a in again], [r["runtime_s"] for r in DAY_RESULTS])
@@ -914,12 +917,13 @@ class TestReport(unittest.TestCase):
         self.assertNotIn("THE SIM FAILED", self.page)
 
     def test_all_sections(self):
-        for h in ("Headline", "Variants", "Breakdown of", "Market structure", "Model",
-                  "Data health", "Suggested tweaks", "Cumulative to date", "Week summary"):
+        for h in ("Headline", "Pre-registered tests", "Variants", "Breakdown of",
+                  "Market structure", "Model", "Data health", "Suggested tweaks",
+                  "Cumulative to date", "Week summary"):
             self.assertIn(f">{h}", self.page, h)
         self.assertIn("Day 7 of 7", self.page)
         self.assertIn("Week verdict:", self.page)
-        self.assertIn(self.ctx["best_cons"], self.page)
+        self.assertIn(self.ctx["best"], self.page)
         for v in sim.VARIANTS:
             self.assertIn(v, self.page)
         self.assertIn("day 7", report.subject_line(self.ctx).lower())
@@ -932,9 +936,15 @@ class TestReport(unittest.TestCase):
                 want = sum(r["variants"][key][f] for r in DAY_RESULTS)
                 self.assertAlmostEqual(agg[key][f], want, places=4, msg=f"{key} {f}")
             self.assertEqual(agg[key]["n_events"], 2)
-        best = self.ctx["best_cons"]
-        self.assertEqual(best, max((k.split("|")[0] for k in agg if k.endswith("|cons")),
-                                   key=lambda n: agg[f"{n}|cons"]["net"]))
+        # the headline ranking: robust stress totals over the window, the
+        # stress-scope variants only, best first; the breakdowns follow its top
+        rank = self.ctx["rank"]
+        self.assertEqual(self.ctx["fill"], "stress")
+        self.assertEqual({r["name"] for r in rank},
+                         {v for v in sim.VARIANTS if sim.in_stress_scope(sim.VARIANTS[v])})
+        rob = [r["robust"] for r in rank]
+        self.assertEqual(rob, sorted(rob, reverse=True))
+        self.assertEqual(self.ctx["best"], (self.ctx["headline"]["pick"] or rank[0])["name"])
         ms = self.ctx["market"]
         w = [r["market_stats"]["strike_secs"] for r in DAY_RESULTS]
         want = sum(r["market_stats"]["locked99_frac"] * x

@@ -9,18 +9,35 @@ earlier day of the cumulative window up to the current SIM_VERSION (run_day
 again: cached files that pass its check are only loaded), reads every
 sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
 
-  1 headline       "Day N of 7"; the best SWP variant (the sweep-aware fill
-                   model, below) by the day's net with reward / trading / net
-                   for the day and per event-hour, its Monte Carlo standard
-                   error and expected net at calibrated tails, and the best
-                   cons / opt variants beside it
-  2 variants       opt, cons and swp side by side: reward, contracts, trading
-                   P&L, net (swp: +/- its Monte Carlo se, 1c filler contracts,
-                   "expected (calibrated tails)" = net_cal), avg share, fills
-                   within 3 s after a weather update
-  3 breakdowns     the headline variant (swp) by ET hour of the event, strike
-                   class (live / decided), tau bucket, side, and its worst 5
-                   events
+  1 headline       "Day N of 7"; the variants ranked on STRESS net over the
+                   cumulative window without each one's best and worst hour
+                   (the "robust total"), beside the plain total, an hour-
+                   bootstrap 90% CI, P(total > 0) and a "noise-dominated" flag
+                   (|best hour| + |worst hour| > |total|). The headline names
+                   the top variant ONLY if its robust total > 0 and P(total >
+                   0) >= 0.8, else "no variant passes" (with the top robust
+                   total for information). No single day's realized net ranks
+                   anything (Jack 2026-10-17, "1": the 10/17 email headlined
+                   I_pads_only's +$1,480 on two upset hours)
+  1b pre-registered tests  Test A (FAV_night, ET days 10/17-10/21) and Test
+                   B (FAV_night_agree, 10/18-10/22) exactly as TEMP_SHADOW.md
+                   "Pre-registered tests" defines them: per-day stress nets,
+                   each criterion met / not met, "in progress (n/5 days)"
+                   until the window completes, then PASS / FAIL; the
+                   calibrated-tails expectation from the tail table AND a
+                   recent-regime figure (the favorite's upset rate after a
+                   favorite-bid hit re-estimated over the recorded period);
+                   the verdict "pilot eligible: <variant>" only on a PASS,
+                   else "NO-GO (no variant passes the pre-registered tests)"
+                   or "in progress"
+  2 variants       opt, cons, swp and stress side by side: reward, contracts,
+                   trading P&L, net (swp / stress: +/- the Monte Carlo se, 1c
+                   filler contracts, "expected (calibrated tails)" = net_cal;
+                   stress: avg share, fills within 3 s after a weather
+                   update), in the ranking's order
+  3 breakdowns     the headline variant (else the top of the ranking) on
+                   stress fills by ET hour of the event, strike class (live /
+                   decided), tau bucket, side, and its worst 5 events
   4 market         % of strike-seconds paying without us, % locked at 99,
                    live / decided split, depth within 3c of the touch
   5 model          Brier / log loss of the fair vs the book mid by tau; the
@@ -47,27 +64,33 @@ sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
                    standard error from the per-event spread) and a concrete
                    parameter change; anything under $5/day, under 3 events
                    or within 1 SE of zero is listed as "below noise" instead
-  8 cumulative     per variant since day 1 (swp; cons and opt beside it): sum,
-                   per-day mean, days positive, Monte Carlo se, expected at
-                   calibrated tails
+  8 cumulative     per variant since day 1 (stress; swp, cons and opt beside
+                   it): robust total, sum, per-day mean, days positive, Monte
+                   Carlo se, expected at calibrated tails
                    (the shadow's partial last day -- SHADOW_UNTIL falls inside
                    it -- counts as its share of 24 event-hours in per-day
                    figures and is left out of days positive)
-  9 week summary   from day 7: GO / NO-GO / EXTEND for the best swp variant
-                   over FULL days (GO = cumulative net > 0, >= 5 of 7 days
-                   positive and a mean > $500/day; NO-GO = negative overall;
-                   else EXTEND; the partial last day is shown beside it),
-                   its params (temp_shadow_sim.VARIANTS over DEFAULT_POLICY)
-                   as the starting config, and the key risks
+  9 week summary   from day 7: the adopted go-live rules instead of the old
+                   GO / NO-GO thresholds -- the pre-registered tests' verdict
+                   ("pilot eligible: <variant>" only on a PASS; then the rule-4
+                   pilot config: 1/3 size, night hours only, $300 daily halt,
+                   hourly live-vs-shadow reconciliation, auto-halt after 2
+                   hours below the shadow's band), and the key risks
 
 Fill models (Jack 2026-10-16, "1": "ship the fixes + the sweep-aware report
 column"): opt and cons fill us only from recorded trades; swp (temp_shadow_sim
 since SIM_VERSION 6, temp_shadow_sweep's model) adds the sweepers that took
 live G's 1c fillers within seconds on 10/16 -- the only model that reproduced
-the live hour. The headline, every rule (noise gates unchanged), the
-cumulative days-positive count and the week verdict are judged on swp. Sim
-output from before SIM_VERSION 6 has no swp: the report then falls back to
-cons (and says so); headline_fill() picks the fill model.
+the live hour. stress (SIM_VERSION 7; Jack 2026-10-17 adopted the go-live
+rules, TEMP_SHADOW.md "Pre-registered tests": "Decisions use the STRESS fill
+model") adds level-clears at every price and hidden favorite takers: the
+headline ranking, the pre-registered tests and the week verdict are judged
+on stress (DECISION_FILL). The tweak rules (noise gates unchanged) still
+compare variants on swp, which every variant has (stress may cover only the
+variants that quote no live strikes: temp_shadow_sim.STRESS_SCOPE).
+headline_fill() picks the rules' fill model (swp, else cons for sim output
+from before SIM_VERSION 6); without stress results the ranking falls back to
+the same model and says so.
 
 Fix pass 10/16 (review of the swp build):
   * "Expected (calibrated tails)" (net_cal) is shown only for variants that
@@ -99,9 +122,11 @@ pad-hold rule and the decided-only baseline use it when present.
 Sim freshness: run_sim re-runs temp_shadow_sim.run_day for every day of the
 cumulative window, not only the report day; run_day reuses a cached file
 only when it is from the current SIM_VERSION with the current variant
-overrides, so a grid change re-sims the window. Files still older than the
-current SIM_VERSION (a --no-sim report, a failed re-sim) are flagged at the
-top of the report.
+overrides, so a grid change re-sims the window. The earlier days go newest
+first (since 10/17: the pre-registered test windows are the most recent
+days, so a budget-deferred re-sim falls on the oldest days). Files still
+older than the current SIM_VERSION (a --no-sim report, a failed re-sim) are
+flagged at the top of the report.
 
 Shadow days: day 1 = TEMP_SHADOW_DAY1 (2026-10-15, the first full ET day);
 day 0 = the partial 10/14. Cumulative figures cover day 1 .. the report day
@@ -134,6 +159,7 @@ import html
 import json
 import math
 import os
+import random
 import re
 import statistics
 import subprocess
@@ -151,10 +177,45 @@ import temp_shadow_common as C
 DAY1 = os.environ.get("TEMP_SHADOW_DAY1", "2026-10-15")   # day 1 of 7
 WEEK_DAYS = 7
 TAU_BUCKETS = ("0-5", "5-10", "10-20", "20-40", "40-60")
-FILLS = ("opt", "cons", "swp")       # column order in the tables
-HEADLINE_FILL = "swp"                # headline, rules, cumulative and verdict ...
+FILLS = ("opt", "cons", "swp", "stress")   # column order in the tables
+HEADLINE_FILL = "swp"                # the tweak rules' fill model ...
 FALLBACK_FILLS = ("swp", "cons", "opt")   # ... else the first one the output has
-FILL_LABEL = {"swp": "swp (sweep-aware)", "cons": "cons", "opt": "opt"}
+DECISION_FILL = "stress"             # the ranking, the pre-registered tests, the verdict
+FILL_LABEL = {"swp": "swp (sweep-aware)", "cons": "cons", "opt": "opt",
+              "stress": "stress (decision model)"}
+STRESS_NOTE = ("stress = swp plus level-clears at every price (a recorded taker that walked "
+               "through or cleared our price takes all of our lots there) and hidden favorite "
+               "takers while our favorite lot rests alone at the top (temp_shadow_sweep, the "
+               "10/17 audit). The adopted go-live rules decide on stress (rule 2): the "
+               "ranking, the pre-registered tests and the week verdict use it; the tweak "
+               "rules still pair variants on swp.")
+# The headline ranking (Jack 2026-10-17, "1"): STRESS net over the window
+# without each variant's best and worst hour; the headline names the top
+# variant only when that robust total is > 0 and P(total > 0) >= this.
+HEADLINE_P_MIN = 0.8
+BOOT_N = 4000                        # hour-bootstrap resamples (fixed seed)
+BOOT_SEED = 20261017
+# TEMP_SHADOW.md "Pre-registered tests" (committed eff9cd3, 2026-10-17 14:57
+# ET, before any hour of the windows). Implemented exactly as written: do
+# not re-tune; a changed rule needs a new pre-registered window.
+PREREG_TESTS = (
+    {"id": "A", "variant": "FAV_night", "why": "rule 3", "start": "2026-10-17",
+     "end": "2026-10-21", "criteria": ("total", "days", "cal"), "info": ("robust", "recent")},
+    {"id": "B", "variant": "FAV_night_agree",
+     "why": "new rule, chosen from the 10/16 21:00 and 22:00 ET losses: judged ONLY on later "
+            "data", "start": "2026-10-18", "end": "2026-10-22",
+     "criteria": ("total", "days", "robust", "cal"), "info": ("recent",),
+     # "judged ONLY on later data": its rule was fitted on hours inside the
+     # report's cumulative window, so the headline never names it on them
+     "judged_from": "2026-10-18"},
+)
+PREREG_DAYS_POS = 4                  # of the 5 window days
+PILOT_RULES = ("1/3 size, night hours only, a $300 daily halt, an hourly live-vs-shadow "
+               "reconciliation, and an auto-halt after 2 consecutive hours below the shadow's "
+               "band (rule 4); scale up only if the pilot earns at least 50% of the shadow's "
+               "prediction (rule 5). A PASS only makes the variant eligible: it does not start "
+               "trading (Jack alone flips dry -> live).")
+RECENT_BOOT_N = 2000
 SWP_NOTE = ("swp = the sweep-aware fill model (temp_shadow_sweep; it reproduced live G's "
             "first hour, 26OCT1610, where opt / cons did not): cons fills, plus sweepers "
             "who take our 1c orders -- recorded 1c taker clusters (all of ours when the "
@@ -200,10 +261,6 @@ HOUR_Z = 2.9
 HOUR_MIN_DAYS = 3
 HOUR_NEG_FRAC = 0.75
 SHORT_DAY_EVENTS = 22      # fewer events than this = a short day
-
-# Week verdict.
-GO_MEAN_USD = 500.0
-GO_DAYS_POS = 5            # of 7 (scaled for a longer window)
 
 # The collector's station-poll settings as the spec wrote them; the live
 # values are read from temp_shadow_collector.py (+ its env overrides).
@@ -760,13 +817,6 @@ class Window:
         if not names:
             return None
         return max(names, key=lambda n: (self.total(f"{n}|{fill}"), n))
-
-
-def best_variant(agg: Dict[str, dict], fill: str) -> Optional[str]:
-    cands = [(a["net"], split_key(k)[0]) for k, a in agg.items() if split_key(k)[1] == fill]
-    if not cands:
-        return None
-    return max(cands)[1]
 
 
 # --------------------------------------------------------------------------
@@ -1487,75 +1537,383 @@ def _ops_rules(h: dict, win: Window, today: str, best: Optional[str], out: List[
 
 
 # --------------------------------------------------------------------------
-# Week summary
+# The headline ranking: robust stress totals (Jack 2026-10-17, "1")
+# --------------------------------------------------------------------------
+
+
+def decision_fill(src) -> str:
+    """The fill model the ranking, the pre-registered tests and the verdict
+    use: DECISION_FILL (stress) when the output has it, else the rules'
+    model (headline_fill: swp, else cons for older sim output)."""
+    keys = src.by_key if isinstance(src, Window) else (src or {})
+    if any(split_key(k)[1] == DECISION_FILL for k in keys):
+        return DECISION_FILL
+    return headline_fill(src)
+
+
+def boot_total(vals: Sequence[float], n: int = BOOT_N, seed: int = BOOT_SEED
+               ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Hour bootstrap of a total (the hours resampled with replacement, a
+    fixed seed so a report is reproducible): (5th percentile, 95th
+    percentile, P(total > 0)); (None, None, None) without hours. The
+    settlement outcomes -- a strike that fails at 98% once in dozens of
+    hours -- dominate this, not the Monte Carlo draws."""
+    v = [float(x) for x in vals]
+    k = len(v)
+    if k == 0:
+        return None, None, None
+    rng = random.Random(seed)
+    tots = sorted(sum(rng.choices(v, k=k)) for _ in range(n))
+    return (tots[int(0.05 * n)], tots[min(n - 1, int(0.95 * n))],
+            sum(1 for t in tots if t > 0) / float(n))
+
+
+def _hours(win: Window, key: str, days: Optional[Sequence[str]] = None
+           ) -> List[Tuple[str, str, dict]]:
+    """(event, day, result) for every window event-hour holding `key`
+    (optionally only those of `days`), in event order."""
+    dd = set(days) if days is not None else None
+    return sorted((e, d, v) for e, (d, v, _ev) in win.by_key.get(key, {}).items()
+                  if dd is None or d in dd)
+
+
+def robust_total(nets: Sequence[float]) -> Optional[float]:
+    """The total without its best and its worst hour (None under 2 hours)."""
+    if len(nets) < 2:
+        return None
+    return sum(nets) - max(nets) - min(nets)
+
+
+def judged_from() -> Dict[str, str]:
+    """variant -> the first ET day it may be judged on: the pre-registered
+    variants whose rule was chosen from hours inside the window ("judged
+    ONLY on later data": FAV_night_agree, from 10/18)."""
+    return {t["variant"]: t["judged_from"] for t in PREREG_TESTS if t.get("judged_from")}
+
+
+def rank_variants(win: Window, policy: Optional[Policy] = None,
+                  fill: Optional[str] = None) -> List[dict]:
+    """Every variant with `fill` results (default decision_fill: stress) in
+    the cumulative window, ranked on the robust total = the total over its
+    event-hours without its best and its worst hour (the hours it rests
+    nothing count $0, as every hour of the window is one of its hours).
+    Beside it: the plain total, the hour-bootstrap 90% CI and P(total > 0),
+    the best / worst hour, "noise" (|best hour| + |worst hour| > |total|),
+    and the expected net at calibrated tails (variants that quote no live
+    strikes only: cal_ok). passes = robust > 0 and P(total > 0) >=
+    HEADLINE_P_MIN, and the variant is not in_sample: a variant pre-registered
+    to be judged ONLY on later data (judged_from) whose window hours include
+    days before that -- its rule was fitted on them (TEMP_SHADOW.md
+    "Pre-registered tests", Test B), so it stays in the table, flagged, and
+    its test decides it."""
+    fill = fill or decision_fill(win)
+    jf = judged_from()
+    rows = []
+    for name in win.names(fill):
+        key = f"{name}|{fill}"
+        hrs = _hours(win, key)
+        nets = [_num(v.get("net")) for _e, _d, v in hrs]
+        if not nets:
+            continue
+        total = sum(nets)
+        bi = max(range(len(nets)), key=lambda i: (nets[i], hrs[i][0]))
+        wi = min(range(len(nets)), key=lambda i: (nets[i], hrs[i][0]))
+        robust = robust_total(nets)
+        lo, hi, ppos = boot_total(nets)
+        cal = None
+        if cal_ok(policy, name) and all(v.get("net_cal") is not None for _e, _d, v in hrs):
+            cal = sum(_num(v.get("net_cal")) for _e, _d, v in hrs)
+        in_sample = name in jf and any(d < jf[name] for _e, d, _v in hrs)
+        rows.append({"name": name, "key": key, "fill": fill, "hours": len(nets),
+                     "in_sample": in_sample, "judged_from": jf.get(name),
+                     "days": len({d for _e, d, _v in hrs}), "total": total, "robust": robust,
+                     "best": nets[bi], "best_event": hrs[bi][0], "worst": nets[wi],
+                     "worst_event": hrs[wi][0], "ci_lo": lo, "ci_hi": hi, "p_pos": ppos,
+                     "noise": abs(nets[bi]) + abs(nets[wi]) > abs(total), "cal": cal,
+                     "passes": (not in_sample and robust is not None and robust > 0
+                                and ppos is not None and ppos >= HEADLINE_P_MIN)})
+    rows.sort(key=lambda r: (r["robust"] if r["robust"] is not None else -math.inf,
+                             r["total"], r["name"]), reverse=True)
+    for i, r in enumerate(rows):
+        r["rank"] = i + 1
+    return rows
+
+
+def headline_pick(rows: Sequence[dict]) -> dict:
+    """{"top": the robust ranking's first eligible row, "pick": the first
+    eligible row that passes (robust > 0 and P(total > 0) >= HEADLINE_P_MIN)
+    or None, "pass": the top row passes, "in_sample": the rows the headline
+    may not name (a variant pre-registered to be judged ONLY on later data,
+    on a window holding the hours its rule was chosen from)}. The headline
+    names the top variant only when it passes; else "no variant passes" --
+    unless a lower-ranked one does, which is then named as such (the top's
+    robust total stays for information)."""
+    elig = [r for r in rows if not r.get("in_sample")]
+    top = elig[0] if elig else None
+    pick = next((r for r in elig if r["passes"]), None)
+    return {"top": top, "pick": pick, "pass": bool(top is not None and pick is top),
+            "fill": top["fill"] if top else (rows[0]["fill"] if rows else None),
+            "in_sample": [r for r in rows if r.get("in_sample")]}
+
+
+def headline_phrase(hl: dict, subject: bool = False) -> str:
+    """The ranking's one-line verdict (the subject's, or the headline's)."""
+    top, pick = hl.get("top"), hl.get("pick")
+    if top is None:
+        if hl.get("in_sample"):
+            return ("no variant passes" if subject else "no variant passes (only variants "
+                    "judged on later data have results)")
+        return "no ranking (no results in the window)"
+    f = hl.get("fill") or DECISION_FILL
+
+    def rob(r):
+        return money(r["robust"], 0) if r["robust"] is not None else "n/a"
+    if hl.get("pass"):
+        return (f"top {top['name']} robust {f} {rob(top)} (P>0 {top['p_pos']:.2f})" if subject
+                else f"{top['name']} passes: robust {f} total {rob(top)}, P(total > 0) "
+                     f"{top['p_pos']:.2f}")
+    if pick is not None:
+        return (f"top robust {top['name']} does not pass; {pick['name']} does (robust "
+                f"{rob(pick)}, P>0 {pick['p_pos']:.2f})")
+    return ("no variant passes" if subject else
+            f"no variant passes (top robust {f} total, for information: {top['name']} "
+            f"{rob(top)}, P(total > 0) {top['p_pos']:.2f})")
+
+
+def in_sample_text(r: dict) -> str:
+    """Why an in-sample ranking row is not in the headline."""
+    rob = money(r["robust"]) if r.get("robust") is not None else "n/a"
+    return (f"{r['name']}: robust {r['fill']} total {rob} (total {money(r['total'])}, P(total > "
+            f"0) {r['p_pos']:.2f}) on the window's hours -- but its rule was chosen from hours "
+            f"inside them (the 10/16 21:00 and 22:00 ET losses): in-sample, not evidence. It is "
+            f"judged ONLY on ET days from {_mmdd(r['judged_from'])} (pre-registered Test B), "
+            f"never in this headline.")
+
+
+# --------------------------------------------------------------------------
+# The pre-registered tests (TEMP_SHADOW.md "Pre-registered tests")
+# --------------------------------------------------------------------------
+
+
+def _date_range(a: str, b: str) -> List[str]:
+    d, end, out = _dt.date.fromisoformat(a), _dt.date.fromisoformat(b), []
+    while d <= end:
+        out.append(d.isoformat())
+        d += _dt.timedelta(days=1)
+    return out
+
+
+def _mmdd(day: str) -> str:
+    return f"{int(day[5:7])}/{int(day[8:10])}"
+
+
+def recent_rates(events: Sequence[dict]) -> dict:
+    """The recent regime: every loaded sim file's fav_hits
+    (temp_shadow_sweep.fav_hit_summary -- taker clusters that hit a favorite
+    side's bids at >= 90c, with the favorite's outcome) pooled over the
+    recorded period, per favorite fair bucket: clusters, the clusters the
+    favorite lost, the upset rate (cluster-weighted, the 10/17 audit's
+    measure), a strike-clustered bootstrap 90% CI and the model's mean
+    longshot probability. {"buckets": {bucket: {...}}, "hours", "first",
+    "last"}; hours = files with fav_hits."""
+    by: Dict[str, List[list]] = {}
+    hours = []
+    for ev in events:
+        fh = ev.get("fav_hits")
+        if not isinstance(fh, list):
+            continue
+        hours.append(str(ev.get("event")))
+        for row in fh:
+            try:
+                tk, b, n, u, sl = row[0], str(row[1]), int(row[2]), int(row[3]), float(row[4])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if n > 0:
+                by.setdefault(b, []).append([f"{ev.get('event')}|{tk}", n, u, sl])
+    out = {}
+    for b, grp in sorted(by.items()):
+        n = sum(g[1] for g in grp)
+        u = sum(g[2] for g in grp)
+        rng = random.Random(BOOT_SEED)
+        rates = []
+        for _ in range(RECENT_BOOT_N):
+            s = [grp[rng.randrange(len(grp))] for _ in grp]
+            nn = sum(g[1] for g in s)
+            rates.append(sum(g[2] for g in s) / nn if nn else 0.0)
+        rates.sort()
+        out[b] = {"clusters": n, "upsets": u, "rate": u / n if n else None,
+                  "ci": (rates[int(0.05 * RECENT_BOOT_N)],
+                         rates[min(RECENT_BOOT_N - 1, int(0.95 * RECENT_BOOT_N))]),
+                  "model": sum(g[3] for g in grp) / n if n else None,
+                  "upset_strikes": sum(1 for g in grp if g[2] > 0)}
+    hs = sorted(hours)
+    first = last = None
+    if hs:
+        p0, p1 = C.parse_event(hs[0]), C.parse_event(hs[-1])
+        first = C.et_day(p0[1]) if p0 else None
+        last = C.et_day(p1[1]) if p1 else None
+    return {"buckets": out, "hours": len(hs), "first": first, "last": last}
+
+
+def recent_cal(results: Sequence[dict], rates: dict) -> Optional[float]:
+    """The calibrated-tails expectation re-marked at the recent regime: per
+    hour net_cal - (the table-marked P&L of its favorite-side fills) +
+    sum over fair buckets of contracts x (1 - the recent upset rate) - cost.
+    A bucket without a recent estimate keeps the table's marks; None when
+    an hour lacks net_cal or fav_fills (older sim files)."""
+    bk = (rates or {}).get("buckets") or {}
+    tot = 0.0
+    for v in results:
+        if v.get("net_cal") is None or not isinstance(v.get("fav_fills"), dict):
+            return None
+        x = _num(v.get("net_cal"))
+        for b, a in v["fav_fills"].items():
+            r = (bk.get(b) or {}).get("rate")
+            if r is None:
+                continue
+            x += -_num(a.get("pnl_cal")) + _num(a.get("contracts")) * (1.0 - r) - _num(a.get("cost"))
+        tot += x
+    return tot
+
+
+def prereg_test(spec: dict, win: Window, day: str, rates: Optional[dict] = None) -> dict:
+    """One pre-registered test on the report's data, exactly as written:
+    the window's per-day STRESS nets of spec's variant (the report's window
+    days up to the report day), each criterion met / not met, and the
+    status: "not started" before the window, "in progress" until the
+    window's last day is reported with every loaded event of its days
+    holding the variant's stress result, then "PASS" (every criterion met)
+    or "FAIL". A window day up to the report day without any event counts
+    $0 (not positive) and is flagged. Criteria: total (> 0), days (>=
+    PREREG_DAYS_POS of 5 positive), robust (the total without the
+    variant's best and worst hour > 0), cal (the calibrated-tails
+    expectation, the tail table's net_cal, > 0); the recent-regime figure
+    (recent_cal) is information."""
+    v = spec["variant"]
+    key = f"{v}|{DECISION_FILL}"
+    wdays = _date_range(spec["start"], spec["end"])
+    rows, results, missing, no_events = [], [], [], []
+    for d in wdays:
+        if d > day:
+            rows.append({"day": d, "future": True})
+            continue
+        evs = win.days_events.get(d, []) if d in win.days_events else []
+        have = [(ev, (ev.get("variants") or {}).get(key)) for ev in evs]
+        res = [r for _ev, r in have if isinstance(r, dict)]
+        miss = [str(ev.get("event")) for ev, r in have if not isinstance(r, dict)]
+        missing += miss
+        if not evs:
+            no_events.append(d)
+        results += res
+        rows.append({"day": d, "future": False, "events": len(res), "missing": len(miss),
+                     "net": sum(_num(r.get("net")) for r in res),
+                     "reward": sum(_num(r.get("reward")) for r in res),
+                     "trading": sum(_num(r.get("trading_pnl")) for r in res),
+                     "contracts": sum(_num(r.get("contracts")) for r in res),
+                     "loaded": len(evs), "partial": 0 < len(evs) < 24})
+    done = [r for r in rows if not r["future"]]
+    nets = [_num(r.get("net")) for r in results]
+    total = sum(r["net"] for r in done)
+    pos = sum(1 for r in done if r["net"] > 0)
+    robust = robust_total(nets)
+    cal = (sum(_num(r.get("net_cal")) for r in results)
+           if results and all(r.get("net_cal") is not None for r in results) else None)
+    rec = recent_cal(results, rates) if (results and rates) else None
+    left = len(wdays) - len(done)
+    crit = {
+        "total": {"label": "the window's total stress net > 0", "value": total,
+                  "met": total > 0},
+        "days": {"label": f"at least {PREREG_DAYS_POS} of the {len(wdays)} days have stress "
+                          "net > 0", "value": pos, "met": pos >= PREREG_DAYS_POS,
+                 "possible": pos + left >= PREREG_DAYS_POS},
+        "robust": {"label": "the total excluding the variant's best and worst hour > 0",
+                   "value": robust, "met": robust is not None and robust > 0},
+        "cal": {"label": "the calibrated-tails expectation > 0", "value": cal,
+                "met": cal is not None and cal > 0},
+    }
+    complete = day >= spec["end"] and len(done) == len(wdays) and not missing
+    if day < spec["start"]:
+        status, text = "not started", f"starts {_mmdd(spec['start'])}"
+    elif not complete:
+        status, text = "in progress", f"in progress ({len(done)}/{len(wdays)} days)"
+        if day >= spec["end"] and missing:
+            text += f"; {len(missing)} event(s) without stress results (waiting for the re-sim)"
+    else:
+        ok = all(crit[c]["met"] for c in spec["criteria"])
+        status = text = "PASS" if ok else "FAIL"
+    return dict(spec, key=key, rows=rows, status=status, text=text, total=total,
+                pos_days=pos, days_done=len(done), n_days=len(wdays), robust=robust, cal=cal,
+                recent=rec, crit=crit, hours=len(nets), missing=missing,
+                no_events=no_events,
+                best=max(nets) if nets else None, worst=min(nets) if nets else None)
+
+
+def prereg_verdict(tests: Sequence[dict]) -> str:
+    """'pilot eligible: <variant>' only when a test PASSes; else 'in
+    progress' while one has not finished; else 'NO-GO (no variant passes
+    the pre-registered tests)'."""
+    passed = [t["variant"] for t in tests if t["status"] == "PASS"]
+    if passed:
+        return "pilot eligible: " + ", ".join(passed)
+    if any(t["status"] in ("in progress", "not started") for t in tests):
+        return "in progress"
+    return "NO-GO (no variant passes the pre-registered tests)"
+
+
+def test_subject(t: dict) -> str:
+    if t["status"] == "not started":
+        return f"Test {t['id']} {t['text']}"
+    if t["status"] == "in progress":
+        return (f"Test {t['id']} in progress {t['days_done']}/{t['n_days']} "
+                f"(stress {money(t['total'], 0)})")
+    return f"Test {t['id']} {t['status']} (stress {money(t['total'], 0)})"
+
+
+# --------------------------------------------------------------------------
+# Week summary (day 7 on): the adopted go-live rules, not GO / NO-GO bars
 # --------------------------------------------------------------------------
 
 
 def week_summary(win: Window, policy: Policy, model: dict,
-                 today_health: Optional[dict] = None) -> Optional[dict]:
-    fill = headline_fill(win)
-    best = win.best(fill)
-    if not best:
-        return {"verdict": "EXTEND", "best": None, "fill": fill,
-                "reason": f"no {fill} results in the window", "risks": [], "config": {}}
-    key = f"{best}|{fill}"
-    # the verdict is judged on full days: the shadow's partial last day
-    # (SHADOW_UNTIL inside it) is reported beside it, not averaged in
-    days = win.full_days_with(key) or win.days_with(key)
-    part_days = [d for d in win.days_with(key) if d not in days]
-    nets = [_num(win.day_aggs[d][key]["net"]) for d in days]
-    total, n = sum(nets), len(nets)
-    mean = total / n if n else 0.0
-    pos = sum(1 for x in nets if x > 0)
-    need = math.ceil(GO_DAYS_POS * n / WEEK_DAYS) if n else GO_DAYS_POS
-    need = max(need, GO_DAYS_POS) if n <= WEEK_DAYS else need
-    if total > 0 and pos >= need and mean > GO_MEAN_USD:
-        verdict = "GO"
-        reason = (f"{best} made {money(total)} over {n} days ({money(mean)}/day), "
-                  f"positive on {pos} of {n}")
-    elif total < 0:
-        verdict = "NO-GO"
-        reason = f"the best {fill} variant, {best}, lost {money(total)} over {n} days"
-    else:
-        verdict = "EXTEND"
-        gaps = []
-        if total <= 0:
-            gaps.append("cumulative net is not positive")
-        if pos < need:
-            gaps.append(f"positive on {pos} of {n} days (GO needs {need})")
-        if mean <= GO_MEAN_USD:
-            gaps.append(f"mean {money(mean)}/day (GO needs > {money(GO_MEAN_USD)})")
-        reason = f"{best} is positive but short of GO: " + "; ".join(gaps)
-    partial = []
-    for d in part_days:
-        a = win.day_aggs[d][key]
-        partial.append(f"{d} ({a['n_events']} events, {_fmt_days(24 * win.weights.get(d, 1.0))} "
-                       f"of 24 event-hours before the shadow ended): {money(a['net'])}")
-    if partial:
-        reason += (f" (full days only; the partial last day {'; '.join(partial)} is not in "
-                   "the verdict)")
+                 today_health: Optional[dict] = None,
+                 tests: Optional[Sequence[dict]] = None,
+                 rank: Optional[Sequence[dict]] = None) -> Optional[dict]:
+    """The week verdict from the adopted go-live rules (Jack 2026-10-17,
+    "Yes. And Assume rewards are paid"): the pre-registered tests decide --
+    "pilot eligible: <variant>" only when a test PASSes (then the rule-4
+    pilot config), "NO-GO (no variant passes the pre-registered tests)"
+    when every test has failed, else "in progress". The old GO / NO-GO /
+    EXTEND thresholds on the best variant's realized net are gone."""
+    tests = list(tests or [])
+    verdict = prereg_verdict(tests)
+    eligible = [t["variant"] for t in tests if t["status"] == "PASS"]
+    reason = "; ".join(f"Test {t['id']} ({t['variant']}, {_mmdd(t['start'])}-"
+                       f"{_mmdd(t['end'])}): {t['text']}, stress {money(t['total'])}"
+                       for t in tests) or "no pre-registered test"
+    best = eligible[0] if eligible else None
+    focus = best or next((t["variant"] for t in tests), None)
     risks = []
-    if fill == "swp":
-        parts = [f"swp {money(total)}"]
-        se = win.mc_se(key)
-        if se is not None:
-            parts[0] += f" (+/- {usd(se)} Monte Carlo se)"
-        for f in ("cons", "opt"):
-            if f"{best}|{f}" in win.agg:
-                parts.append(f"{f} {money(sum(_num(win.day_aggs[d][f'{best}|{f}']['net']) for d in days if f'{best}|{f}' in win.day_aggs[d]))}")
-        if win.has(key, "net_cal") and cal_ok(policy, best):
-            parts.append("expected at calibrated tails "
-                         + money(sum(_num(win.day_aggs[d][key].get("net_cal")) for d in days)))
-        risks.append("Fill model: " + ", ".join(parts) + " over the verdict's days: swp adds "
-                     "the sweepers that took live G's 1c fillers; the live 1c fill rate "
-                     "decides how close it is.")
-    elif f"{best}|opt" in win.agg:
-        opt_t = win.total(f"{best}|opt")
-        gap = opt_t - total
-        rel = abs(gap) / abs(total) if total else None
-        risks.append(f"Fill model: opt {money(opt_t)} vs cons {money(total)} "
-                     f"(gap {money(gap)}" + (f", {rel:.0%} of cons" if rel is not None else "")
-                     + "): the live queue position decides which is closer.")
+    if focus:
+        fill = decision_fill(win)
+        parts = []
+        for f in (fill,) + tuple(x for x in ("swp", "cons", "opt") if x != fill):
+            k = f"{focus}|{f}"
+            if k in win.agg:
+                parts.append(f"{f} {money(win.total(k))}")
+        if parts:
+            risks.append(f"Fill model ({focus}, the cumulative window): " + ", ".join(parts)
+                         + ". stress adds level-clears at every price and hidden favorite "
+                           "takers; on the live hour 26OCT1610 others stepped ahead of our "
+                           "favorite joins three times as often as of other makers' (the "
+                           "10/17 audit), which no fill model replays: live favorite joins "
+                           "would do worse than the shadow.")
+        tt = [t for t in tests if t["variant"] == focus]
+        if tt and tt[0].get("cal") is not None:
+            risks.append(f"Tails ({focus}, its test window): the table-based expectation "
+                         f"{money(tt[0]['cal'])} comes from a calmer period; re-marked at the "
+                         "recorded period's upset rates after favorite-bid hits it is "
+                         + (money(tt[0]["recent"]) if tt[0].get("recent") is not None
+                            else "n/a") + ".")
     if model.get("n"):
         risks.append(f"Model: Brier {model['brier_model']:.4f} vs book mid "
                      f"{model['brier_mid']:.4f} over {model['n']:.0f} strike-minutes"
@@ -1572,9 +1930,10 @@ def week_summary(win: Window, policy: Policy, model: dict,
     if today_health and (today_health.get("ws") or {}).get("uptime") is not None:
         risks.append(f"Ops (report day): ws uptime {pct(today_health['ws']['uptime'])}, "
                      f"{(today_health.get('poll') or {}).get('n429', 0)} HTTP 429s.")
-    return {"verdict": verdict, "best": best, "fill": fill, "reason": reason, "total": total,
-            "mean": mean, "days": n, "pos": pos, "need": need, "partial_days": part_days,
-            "config": policy.params(best), "overrides": dict(policy.variants.get(best) or {}),
+    return {"verdict": verdict, "eligible": eligible, "best": best, "reason": reason,
+            "tests": tests, "pilot": PILOT_RULES if eligible else None,
+            "config": policy.params(best) if best else {},
+            "overrides": dict(policy.variants.get(best) or {}) if best else {},
             "policy_err": policy.err, "risks": risks}
 
 
@@ -2063,6 +2422,9 @@ def _tally(res, into: dict) -> None:
             if r.get("swp_error"):
                 into.setdefault("swp_errors", []).append(
                     (str(r.get("event")), str(r.get("swp_error")).splitlines()[0][:300]))
+            if r.get("stress_error"):
+                into.setdefault("stress_errors", []).append(
+                    (str(r.get("event")), str(r.get("stress_error")).splitlines()[0][:300]))
 
 
 def run_sim(day: str, budget_min: Optional[float] = None) -> Tuple[Optional[str], dict]:
@@ -2083,10 +2445,13 @@ def run_sim(day: str, budget_min: Optional[float] = None) -> Tuple[Optional[str]
     deadline = start + budget_min (RESIM_BUDGET_MIN); events not started by
     then come back deferred (window "deferred": [event]) and keep their
     older files (flagged stale); the next report continues. The report day
-    itself has no deadline. "swp_config_error": swp_config() raised (an
-    unusable repo table): every event is simmed without swp."""
+    itself has no deadline. The earlier days go newest first (10/17: the
+    pre-registered test windows are the latest days; a deferral falls on
+    the oldest). "swp_config_error": swp_config() raised (an unusable repo
+    table): every event is simmed without swp; "stress_config_error" the
+    same for stress."""
     summary: dict = {"ok": 0, "pending": [], "errors": [], "deferred": [],
-                     "swp_config_error": None,
+                     "swp_config_error": None, "stress_config_error": None,
                      "window": {"days": [], "ok": 0, "pending": [], "errors": [],
                                 "deferred": [], "budget_min": None}}
     t0 = time.time()
@@ -2094,11 +2459,17 @@ def run_sim(day: str, budget_min: Optional[float] = None) -> Tuple[Optional[str]
     summary["window"]["budget_min"] = budget_min
     try:
         import temp_shadow_sim as sim   # noqa: WPS433
+        swp_cfg = None
         if "swp" in getattr(sim, "FILL_MODELS", ()):
             try:
-                sim.swp_config()
+                swp_cfg = sim.swp_config()
             except Exception as e:      # noqa: BLE001 -- the sim records it per event
                 summary["swp_config_error"] = f"{type(e).__name__}: {e}"[:400]
+        if hasattr(sim, "stress_config"):
+            try:
+                sim.stress_config(swp_cfg)
+            except Exception as e:      # noqa: BLE001 -- the sim records it per event
+                summary["stress_config_error"] = f"{type(e).__name__}: {e}"[:400]
         res = sim.run_day(day)
     except BaseException as e:          # noqa: BLE001
         if isinstance(e, KeyboardInterrupt):
@@ -2108,7 +2479,7 @@ def run_sim(day: str, budget_min: Optional[float] = None) -> Tuple[Optional[str]
     _tally(res, summary)
     win = summary["window"]
     deadline = t0 + 60.0 * budget_min
-    for d in window_days(day):
+    for d in reversed(window_days(day)):        # newest first: the test windows
         if d == day:
             continue
         win["days"].append(d)
@@ -2249,12 +2620,93 @@ def swp_tables_text(ctx: dict) -> str:
 
 def swp_rejections(ctx: dict) -> List[str]:
     """A model/ override the sim rejected (it used the repo default), or
-    swp_config() raising."""
+    swp_config() / stress_config() raising."""
     cur = ctx.get("swp_current") or {}
     out = [str(cur[k]) for k in ("hazard_rejected", "tails_rejected") if cur.get(k)]
     if cur.get("error"):
         out.append("swp_config() raised: " + str(cur["error"]))
+    st = ctx.get("stress_current") or {}
+    if st.get("fav_hazard_rejected"):
+        out.append(str(st["fav_hazard_rejected"]))
+    if st.get("error"):
+        out.append("stress_config() raised: " + str(st["error"]))
     return out
+
+
+def stress_missing(days_events: Dict[str, List[dict]], day: str,
+                   version: Optional[str]) -> dict:
+    """The loaded events without any stress result (the ranking and the
+    tests are on stress): {"day": [(event, why)], "by_day": {day: n},
+    "total": n, "events": n}. why: the sim file's stress_error (stress
+    failed; opt / cons / swp kept), or an older SIM_VERSION, or no stress
+    run."""
+    out = {"day": [], "by_day": {}, "total": 0, "events": 0}
+    for d, evs in days_events.items():
+        for ev in evs:
+            out["events"] += 1
+            if any(split_key(k)[1] == DECISION_FILL for k in (ev.get("variants") or {})):
+                continue
+            if ev.get("stress_error"):
+                why = "stress failed: " + str(ev["stress_error"]).splitlines()[0][:200]
+            elif version is not None and ev.get("sim_version") is not None \
+                    and str(ev.get("sim_version")) != version:
+                why = f"older sim file (SIM_VERSION {ev.get('sim_version')})"
+            else:
+                why = "no stress in the sim file"
+            out["by_day"][d] = out["by_day"].get(d, 0) + 1
+            out["total"] += 1
+            if d == day:
+                out["day"].append((str(ev.get("event")), why))
+    return out
+
+
+def current_stress_tables(swp_current: Optional[dict] = None) -> Optional[dict]:
+    """temp_shadow_sim.stress_config()'s identity now ({"error": text} when
+    it raises; None when the sim has no stress)."""
+    try:
+        import temp_shadow_sim as sim   # noqa: WPS433 (lazy on purpose)
+    except BaseException as e:          # noqa: BLE001
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return None
+    if not hasattr(sim, "stress_config"):
+        return None
+    try:
+        return dict(sim.stress_config()["ident"])
+    except Exception as e:              # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"[:400]}
+
+
+def stress_text(ctx: dict) -> str:
+    """One line naming the stress table and scope behind the figures."""
+    rows: Dict[tuple, int] = {}
+    scope_vars: Dict[str, set] = {}
+    for evs in (ctx["win"].days_events or {}).values():
+        for ev in evs:
+            st = ev.get("stress")
+            if not isinstance(st, dict):
+                continue
+            k = (st.get("fav_hazard_id"),
+                 _table_kind(st.get("fav_hazard_src"), st.get("fav_hazard_kind")),
+                 st.get("scope"), st.get("draws"))
+            rows[k] = rows.get(k, 0) + 1
+            scope_vars.setdefault(str(st.get("scope")), set()).update(st.get("variants") or [])
+    if not rows:
+        return ""
+    parts = []
+    for (fid, kind, scope, draws), n in sorted(rows.items(), key=lambda x: -x[1]):
+        sc = ("every variant" if scope == "all" else
+              "the variants that quote no live strikes (live=False)" if scope == "nolive"
+              else f"scope {scope}")
+        parts.append(f"favorite-taker table {fid} ({kind}), {draws} draws, stress for {sc}"
+                     + (f" on {n} events" if len(rows) > 1 else ""))
+    s = "stress: " + "; ".join(parts) + "."
+    nolive = scope_vars.get("nolive")
+    if nolive and len(rows) == 1:
+        s += (" The live-quoting variants have opt / cons / swp only (stress there would add "
+              "~40% to the sim's time and the decision rules use none of them; "
+              "temp_shadow_sim.STRESS_SCOPE).")
+    return s
 
 
 def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = False,
@@ -2298,18 +2750,40 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
            "events": events, "agg": agg, "market": market, "model": model,
            "coverage": cov, "health": health, "win": win, "policy": policy,
            "suggestions": sugg, "notes": notes, "sim_summary": sim_summary or {},
-           "best_cons": best_variant(agg, "cons"), "best_opt": best_variant(agg, "opt"),
-           "best_swp": best_variant(agg, "swp"), "day0_events": 0}
-    # the headline fill model: swp, else (older sim output) cons
-    ctx["fill"] = fill = headline_fill(win if win.by_key else agg)
-    ctx["best"] = best_variant(agg, fill)
-    ctx["swp_missing"] = swp_missing(days_events, day, sim_version) if fill == "swp" else None
+           "day0_events": 0}
+    # the rules' fill model (swp, else cons on older output) and the
+    # decision model (stress, else the rules' model)
+    src = win if win.by_key else agg
+    ctx["rules_fill"] = rfill = headline_fill(src)
+    ctx["fill"] = fill = decision_fill(src)
+    # the headline: the robust stress ranking over the cumulative window --
+    # never a single day's realized net
+    ctx["rank"] = rank_variants(win, policy, fill) if win.by_key else []
+    ctx["headline"] = hl = headline_pick(ctx["rank"])
+    # the variant the breakdowns follow: the headline's, else the top of the
+    # ranking (for information), else the day's only fill model's first
+    ctx["best"] = ((hl["pick"] or hl["top"] or {}).get("name")
+                   or (sorted({split_key(k)[0] for k in agg if split_key(k)[1] == fill})
+                       or [None])[0])
+    ctx["swp_missing"] = (swp_missing(days_events, day, sim_version)
+                          if rfill == "swp" else None)
+    ctx["stress_missing"] = (stress_missing(days_events, day, sim_version)
+                             if fill == DECISION_FILL else None)
     ctx["swp_tables"] = swp_tables(days_events)
     ctx["swp_current"] = current_swp_tables()
+    ctx["stress_current"] = current_stress_tables()
+    d0_events: List[dict] = []
     if day_number(day) >= 1:
         d0 = (_dt.date.fromisoformat(DAY1) - _dt.timedelta(days=1)).isoformat()
-        ctx["day0_events"] = len(in_shadow(load_sim_day(d0), rec_start))
-    ctx["week"] = (week_summary(win, policy, agg_model(win.all_events), health)
+        d0_events = in_shadow(load_sim_day(d0), rec_start)
+        ctx["day0_events"] = len(d0_events)
+    # the recent regime: favorite-bid hits over the whole recorded period
+    # (day 0 .. the report day) -> the tests' second calibrated-tails figure
+    ctx["recent"] = recent_rates(d0_events + win.all_events)
+    ctx["tests"] = [prereg_test(s, win, day, ctx["recent"]) for s in PREREG_TESTS]
+    ctx["prereg_verdict"] = prereg_verdict(ctx["tests"])
+    ctx["week"] = (week_summary(win, policy, agg_model(win.all_events), health,
+                                ctx["tests"], ctx["rank"])
                    if day_number(day) >= WEEK_DAYS else None)
     return ctx
 
@@ -2425,43 +2899,63 @@ def _empty_reason(ctx: dict) -> str:
     return " ".join(reasons) or "No sim output for the day."
 
 
-def _fill_cols(f: str, agg: Dict[str, dict]) -> List[str]:
-    """Column heads of one fill model's group in the variants table."""
+def _fill_cols(f: str, agg: Dict[str, dict], primary: Optional[str] = None) -> List[str]:
+    """Column heads of one fill model's group in the variants table: opt /
+    cons the totals; swp / stress add the Monte Carlo se, the 1c fillers and
+    the expected net at calibrated tails; the decision model's group
+    (`primary`, default the last fill model present) adds avg share and the
+    fills after a weather update."""
     cols = ["reward", "contracts", "trading", "net"]
-    if f == "swp":
+    if f in ("swp", DECISION_FILL):
         cols += ["+/- mc se", "1c fillers"]
-        if any(split_key(k)[1] == "swp" and a.get("net_cal") is not None for k, a in agg.items()):
+        if any(split_key(k)[1] == f and a.get("net_cal") is not None for k, a in agg.items()):
             cols.append("expected (cal. tails)")
-    return cols + ["avg share", "after-wx ct / $"]
+    if primary is None:
+        have = [x for x in FILLS if any(split_key(k)[1] == x for k in agg)]
+        primary = have[-1] if have else f
+    return cols + (["avg share", "after-wx ct / $"] if f == primary else [])
+
+
+def _rank_order(ctx: dict, names: Iterable[str]) -> List[str]:
+    """The ranking's order (robust stress total), then the variants without
+    a ranking entry by their cumulative total on the rules' fill model --
+    never the report day's net (Jack 2026-10-17, "1")."""
+    names = set(names)
+    ranked = [r["name"] for r in ctx.get("rank") or [] if r["name"] in names]
+    win = ctx.get("win")
+    rf = ctx.get("rules_fill") or HEADLINE_FILL
+    rest = sorted(names - set(ranked),
+                  key=lambda n: (-(win.total(f"{n}|{rf}") if win is not None
+                                   and f"{n}|{rf}" in win.agg else 0.0), n))
+    return ranked + rest
 
 
 def _variant_rows(ctx: dict, fills: Sequence[str]) -> List[List[Any]]:
     agg = ctx["agg"]
-    hf = ctx.get("fill") or headline_fill(agg)
-    names = sorted({split_key(k)[0] for k in agg},
-                   key=lambda n: -(agg.get(f"{n}|{hf}") or agg.get(f"{n}|cons")
-                                   or agg.get(f"{n}|opt") or {}).get("net", 0))
+    primary = ctx.get("fill") if ctx.get("fill") in fills else (list(fills) or [None])[-1]
+    names = _rank_order(ctx, {split_key(k)[0] for k in agg})
     best = ctx.get("best")
     rows = []
     for n in names:
         row: List[Any] = [R(f"<b>{esc(n)}</b>" if n == best else esc(n))]
         for f in fills:
-            cols = _fill_cols(f, agg)
+            cols = _fill_cols(f, agg, primary)
             a = agg.get(f"{n}|{f}")
             if not a:
                 row += ["-"] * len(cols)
                 continue
             faw = a["fills_after_wx"]
             row += [M(a["reward"]), qty(a["contracts"]), M(a["trading_pnl"]), M(a["net"])]
-            if f == "swp":
+            if f in ("swp", DECISION_FILL):
                 row.append(usd(a["net_se"]) if a.get("net_se") is not None else "-")
                 row.append(qty(a["filler_contracts"]) if a.get("filler_contracts") is not None
                            else "-")
                 if "expected (cal. tails)" in cols:
                     row.append("-" if a.get("net_cal") is None else
                                M(a["net_cal"]) if cal_ok(ctx.get("policy"), n) else CIRCULAR)
-            row += [pct(a["avg_share"]),
-                    R(f"{esc(qty(faw['contracts']))} / {m_html(faw['pnl'])}")]
+            if f == primary:
+                row += [pct(a["avg_share"]),
+                        R(f"{esc(qty(faw['contracts']))} / {m_html(faw['pnl'])}")]
         rows.append(row)
     return rows
 
@@ -2471,11 +2965,16 @@ def _breakdowns(ctx: dict) -> str:
     key = f"{best}|{fill}"
     a = ctx["agg"].get(key)
     if not a:
-        return note(f"No {fill} results for the day.")
+        return note(f"No {fill} results for {best} on the day.")
+    hl = ctx.get("headline") or {}
+    why = ("the headline variant" if (hl.get("pick") or {}).get("name") == best
+           else "the top of the robust ranking, for information: it does not pass"
+           if (hl.get("top") or {}).get("name") == best else "")
     out = [note(f"Variant {best} ({fill} fills"
                 + (", the sweep-aware model" if fill == "swp" else "")
+                + (", the decision model" if fill == DECISION_FILL else "")
                 + (f"; means over {a['draws']} Monte Carlo draws" if a.get("draws") else "")
-                + ").")]
+                + (f"; {why}" if why else "") + "), the report day only.")]
     # by ET hour of the event
     hrs: Dict[int, Dict[str, float]] = {}
     for ev in ctx["events"]:
@@ -2538,7 +3037,8 @@ def _breakdowns(ctx: dict) -> str:
 def _market_html(ctx: dict) -> str:
     m, cov = ctx["market"], ctx["coverage"]
     best = ctx["best"]
-    share = (ctx["agg"].get(f"{best}|{ctx['fill']}") or {}).get("avg_share") if best else None
+    share = ((ctx["agg"].get(f"{best}|{ctx['fill']}") or {}).get("avg_share")
+             if best else None)
     rows = [["strike-seconds", qty(m["strike_secs"])],
             ["paying without us", pct(m["paying_frac_without_us"])],
             ["locked at 99 (pays nobody)", pct(m["locked99_frac"])],
@@ -2731,10 +3231,162 @@ def _suggestions_html(ctx: dict) -> str:
                    + "</ul>")
     out.append(note(f"Gates: >= ${MIN_USD_PER_DAY:.0f}/day, >= {MIN_EVENTS} differing events, "
                     f"|delta| >= {MIN_Z:g} SE (per-event spread, Monte Carlo noise included). "
-                    f"Pairs use the {ctx.get('fill', HEADLINE_FILL)} fill model over the "
-                    "cumulative window."))
+                    f"Pairs use the {ctx.get('rules_fill', HEADLINE_FILL)} fill model over the "
+                    "cumulative window"
+                    + (" (every variant has it; the decisions above use stress, and only a "
+                       "pre-registered test makes a variant eligible for a pilot)"
+                       if ctx.get("fill") == DECISION_FILL else "") + "."))
     for n in ctx.get("notes") or []:
         out.append(note(n))
+    return "".join(out)
+
+
+def _ci_text(r: dict) -> str:
+    if r.get("ci_lo") is None:
+        return "-"
+    return f"{money(r['ci_lo'], 0)} .. {money(r['ci_hi'], 0)}"
+
+
+def _ranking_html(ctx: dict) -> str:
+    """The headline ranking table: robust total first."""
+    rows = ctx.get("rank") or []
+    if not rows:
+        return note("No results to rank in the window yet.")
+    fill = rows[0]["fill"]
+    pol_ = ctx.get("policy")
+    show_cal = any(r.get("cal") is not None for r in rows)
+    head = ["#", "variant", f"robust {fill} total", "total", "90% CI (hours)", "P(total > 0)",
+            "best hour", "worst hour", "noise-dominated", "hours"]
+    head += ["expected (cal. tails)"] if show_cal else []
+    out_rows = []
+    for r in rows:
+        name = esc(r["name"])
+        if r.get("in_sample"):
+            name += (f' <span style="color:{MUTED};">(in-sample: judged only from '
+                     f'{esc(_mmdd(r["judged_from"]))}, Test B)</span>')
+        row: List[Any] = [r["rank"], R(f"<b>{name}</b>" if r["passes"] else name),
+                          M(r["robust"]) if r["robust"] is not None else "-", M(r["total"]),
+                          _ci_text(r), f"{r['p_pos']:.2f}" if r["p_pos"] is not None else "-",
+                          R(f"{m_html(r['best'])} ({esc(r['best_event'][-4:])})"),
+                          R(f"{m_html(r['worst'])} ({esc(r['worst_event'][-4:])})"),
+                          "NOISE" if r["noise"] else "", r["hours"]]
+        if show_cal:
+            row.append(M(r["cal"]) if r.get("cal") is not None else
+                       ("-" if cal_ok(pol_, r["name"]) else CIRCULAR))
+        out_rows.append(row)
+    win = ctx["win"]
+    return (table(head, out_rows, right=[True, False] + [True] * (len(head) - 2))
+            + note(f"Ranked on {fill} net over the cumulative window "
+                   f"({win.days[0]} .. {win.days[-1]}) without each variant's best and worst "
+                   f"event-hour (\"robust total\"; an hour it rests nothing counts $0). The "
+                   f"headline names the top variant only when its robust total > 0 and P(total "
+                   f"> 0) >= {HEADLINE_P_MIN:g} (bold = passes both); 90% CI and P(total > 0) "
+                   f"are a bootstrap over the hours ({BOOT_N} resamples); noise-dominated = "
+                   f"|best hour| + |worst hour| > |total|. Best / worst hour: the event's ET "
+                   f"date and hour (DDHH). No single day's realized net ranks anything."
+                   + (" In-sample rows: a variant pre-registered to be judged ONLY on later data "
+                      "(its rule was chosen from hours inside this window) is listed for "
+                      "information and never named in the headline; its test decides it."
+                      if any(r.get("in_sample") for r in rows) else "")))
+
+
+def _rate_text(b: str, r: dict) -> str:
+    ci = r.get("ci") or (None, None)
+    return (f"{b}: {pct(r.get('rate'), 1)} [{pct(ci[0], 1)}, {pct(ci[1], 1)}] of "
+            f"{r.get('clusters', 0)} hits ({r.get('upset_strikes', 0)} upset strikes), model "
+            f"{pct(r.get('model'), 2)}")
+
+
+def _prereg_html(ctx: dict) -> str:
+    """The pre-registered tests, exactly as TEMP_SHADOW.md defines them."""
+    tests = ctx.get("tests") or []
+    rec = ctx.get("recent") or {}
+    color = (POS if ctx.get("prereg_verdict", "").startswith("pilot eligible") else
+             NEG if ctx.get("prereg_verdict", "").startswith("NO-GO") else "#9a6700")
+    out = [f'<p style="font-size:16px;margin:4px 0;">Pre-registered verdict: '
+           f'<b style="color:{color};">{esc(ctx.get("prereg_verdict"))}</b></p>',
+           note("Adopted go-live rules (Jack 2026-10-17): rewards are assumed paid; decisions "
+                "use the STRESS fill model; a variant passes only on hours AFTER it was "
+                "chosen. Defined in TEMP_SHADOW.md \"Pre-registered tests\" (written before any "
+                "hour of their windows); nothing is re-tuned on window data. " + PILOT_RULES)]
+    for t in tests:
+        sc = {"PASS": POS, "FAIL": NEG}.get(t["status"], "#9a6700")
+        out.append(h3(f"Test {t['id']} -- {t['variant']} ({t['why']}): ET days {t['start']} .. "
+                      f"{t['end']}"))
+        out.append(f'<p style="margin:2px 0 6px 0;">Status: <b style="color:{sc};">'
+                   f'{esc(t["text"])}</b></p>')
+        drows = []
+        for r in t["rows"]:
+            if r["future"]:
+                drows.append([r["day"], "-", "-", "-", "-", "not yet"])
+                continue
+            flag = []
+            if not r["events"] and not r["missing"]:
+                flag.append("no events (counts $0)")
+            if r["missing"]:
+                flag.append(f"{r['missing']} event(s) without stress")
+            if r.get("partial"):
+                flag.append(f"{r['loaded']} of 24 hours loaded")
+            drows.append([r["day"], r["events"], M(r["reward"]), M(r["trading"]), M(r["net"]),
+                          ("yes" if r["net"] > 0 else "no") + (f" ({'; '.join(flag)})"
+                                                               if flag else "")])
+        out.append(table(["ET day", "hours", "reward", "trading", "stress net", "net > 0"],
+                         drows, right=[False, True, True, True, True, False]))
+        so_far = "" if t["status"] in ("PASS", "FAIL") else " (so far)"
+        items = []
+        if t["status"] == "not started":
+            out.append('<ul style="padding-left:20px;margin:4px 0;">'
+                       + "".join(f"<li>{esc(t['crit'][c]['label'])}</li>" for c in t["criteria"])
+                       + "</ul>")
+            out.append(note(f"PASS iff all of the above over ET days {t['start']} .. {t['end']}; "
+                            "nothing is judged before its window starts."))
+            continue
+        for c in t["criteria"]:
+            cr = t["crit"][c]
+            val = cr["value"]
+            if c == "days":
+                vs = f"{val} of {t['days_done']} days so far" if so_far else f"{val} of 5 days"
+                if so_far and not cr["met"]:
+                    vs += "; still possible" if cr.get("possible") else "; no longer possible"
+            else:
+                vs = money(val) if val is not None else "n/a"
+                vs += so_far
+            mark = "met" if cr["met"] else "not met"
+            items.append(f"<li>{esc(cr['label'])}: <b>{esc(vs)}</b> -- "
+                         f"<b style=\"color:{POS if cr['met'] else NEG};\">{mark}</b></li>")
+        info = []
+        if "robust" in t.get("info", ()):
+            rv = t["crit"]["robust"]["value"]
+            info.append(f"<li>for information: the total excluding the best and worst hour "
+                        f"{esc(money(rv) if rv is not None else 'n/a')}{esc(so_far)}</li>")
+        if "recent" in t.get("info", ()):
+            info.append("<li>for information, the calibrated-tails expectation re-marked at the "
+                        "RECENT REGIME (the favorite's upset rate after a favorite-bid hit, "
+                        f"re-estimated over the recorded period): "
+                        f"<b>{esc(money(t['recent']) if t.get('recent') is not None else 'n/a')}"
+                        f"</b>{esc(so_far)}, against the TABLE-BASED figure "
+                        f"{esc(money(t['cal']) if t.get('cal') is not None else 'n/a')} (the "
+                        "530-hour tail table, 26SEP-26OCT14: a calmer period)</li>")
+        out.append('<ul style="padding-left:20px;margin:4px 0;">' + "".join(items + info)
+                   + "</ul>")
+        out.append(note(f"{t['hours']} event-hours of {t['variant']} with stress results in the "
+                        f"window so far (it rests nothing outside its settle hours 20:00-07:00 "
+                        f"ET: those hours count $0); PASS iff every criterion is met once all 5 "
+                        f"days are in. Best / worst hour so far: "
+                        f"{money(t['best']) if t.get('best') is not None else 'n/a'} / "
+                        f"{money(t['worst']) if t.get('worst') is not None else 'n/a'}."))
+    bk = rec.get("buckets") or {}
+    if bk:
+        out.append(note("Recent regime (the tests' second calibrated-tails figure): the "
+                        "favorite's upset rate after a taker hit a favorite side's bids at 90-99c "
+                        f"(cluster-weighted, strike-clustered bootstrap 90% CI), over the "
+                        f"{rec.get('hours')} recorded hours {rec.get('first')} .. "
+                        f"{rec.get('last')}, by the favorite's model fair: "
+                        + "; ".join(_rate_text(b, r) for b, r in bk.items())
+                        + ". Each favorite-side stress fill is re-marked at its bucket's rate "
+                          "instead of the tail table's (the 10/17 audit: favorite-bid takers "
+                          "were far more informed in the recorded hours than in the table's "
+                          "530 hours). It is information, not a criterion."))
     return "".join(out)
 
 
@@ -2742,15 +3394,17 @@ def _cumulative_html(ctx: dict) -> str:
     win: Window = ctx["win"]
     if not win.all_events:
         return note("No sim output in the window yet.")
-    hf = ctx.get("fill") or headline_fill(win)
-    names = sorted({split_key(k)[0] for k in win.agg},
-                   key=lambda n: -win.total(f"{n}|{hf}") if f"{n}|{hf}" in win.agg else 0)
+    hf = ctx.get("fill") or decision_fill(win)
+    names = _rank_order(ctx, {split_key(k)[0] for k in win.agg})
     show_days = [d for d in win.days if win.days_events[d]][-9:]
-    others = [f for f in FILLS if f != hf and any(split_key(k)[1] == f for k in win.agg)]
-    swp_x = hf == "swp"
-    cal = swp_x and any(win.has(f"{n}|swp", "net_cal") for n in names if f"{n}|swp" in win.agg)
-    head = ["variant", f"{hf} sum", f"{hf} /day", "days +"]
-    head += (["+/- mc se"] if swp_x else []) + (["expected (cal. tails)"] if cal else [])
+    others = [f for f in reversed(FILLS) if f != hf and any(split_key(k)[1] == f
+                                                             for k in win.agg)]
+    mc = hf in ("swp", DECISION_FILL)
+    cal = mc and any(win.has(f"{n}|{hf}", "net_cal") for n in names if f"{n}|{hf}" in win.agg)
+    rob = {r["name"]: r for r in ctx.get("rank") or [] if r["fill"] == hf}
+    head = ["variant"] + ([f"{hf} robust"] if rob else []) + [f"{hf} sum", f"{hf} /day",
+                                                              "days +"]
+    head += (["+/- mc se"] if mc else []) + (["expected (cal. tails)"] if cal else [])
     for f in others:
         head += [f"{f} sum", f"{f} /day"]
     head += [(f"d{day_number(d)}" if day_number(d) >= 1 else d[5:])
@@ -2759,11 +3413,14 @@ def _cumulative_html(ctx: dict) -> str:
     for n in names:
         row: List[Any] = [n]
         key = f"{n}|{hf}"
+        if rob:
+            rr = rob.get(n)
+            row.append(M(rr["robust"]) if rr and rr["robust"] is not None else "-")
         if key in win.agg:
             dd = win.full_days_with(key) or win.days_with(key)
             row += [M(win.total(key)), M(win.per_day(key)),
                     f"{sum(1 for d in dd if win.day_aggs[d][key]['net'] > 0)}/{len(dd)}"]
-            if swp_x:
+            if mc:
                 se = win.mc_se(key)
                 row.append(usd(se) if se is not None else "-")
             if cal:
@@ -2771,7 +3428,7 @@ def _cumulative_html(ctx: dict) -> str:
                            M(win.total(key, "net_cal")) if cal_ok(ctx.get("policy"), n)
                            else CIRCULAR)
         else:
-            row += ["-"] * (3 + (1 if swp_x else 0) + (1 if cal else 0))
+            row += ["-"] * (3 + (1 if mc else 0) + (1 if cal else 0))
         for f in others:
             k2 = f"{n}|{f}"
             row += [M(win.total(k2)), M(win.per_day(k2))] if k2 in win.agg else ["-", "-"]
@@ -2785,9 +3442,11 @@ def _cumulative_html(ctx: dict) -> str:
         part += (f" * {d} is partial (the shadow ended inside it; "
                  f"{_fmt_days(24 * win.weights.get(d, 1.0))} of 24 event-hours): its net is in "
                  "the sums, counts as that fraction of a day in /day, and is left out of "
-                 "days + and the week verdict.")
+                 "days +.")
     out.append(note(f"Window {win.days[0]} .. {win.days[-1]}; days + and the day columns are "
-                    f"{hf} net."
+                    f"{hf} net"
+                    + (" (a variant without stress results shows '-' there)"
+                       if hf == DECISION_FILL else "") + "."
                     + (f" Day 0 (partial, {ctx['day0_events']} events) is excluded."
                        if ctx.get("day0_events") else "") + part
                     + (" " + CAL_NOTE if cal else "")))
@@ -2796,20 +3455,28 @@ def _cumulative_html(ctx: dict) -> str:
 
 def _week_html(ctx: dict) -> str:
     w = ctx["week"]
-    color = {"GO": POS, "NO-GO": NEG}.get(w["verdict"], "#9a6700")
+    v = w["verdict"]
+    color = POS if v.startswith("pilot eligible") else NEG if v.startswith("NO-GO") else "#9a6700"
     out = [f'<p style="font-size:20px;margin:6px 0;"><b style="color:{color};">'
-           f'{esc(w["verdict"])}</b></p>', note(w["reason"])]
+           f'{esc(v)}</b></p>',
+           note("From the adopted go-live rules (Jack 2026-10-17): the pre-registered tests "
+                "decide; the old GO / NO-GO thresholds on the best variant's realized net are "
+                "gone. " + w["reason"] + ".")]
     if w.get("best"):
         cfg, ov = w.get("config") or {}, w.get("overrides") or {}
+        out.append(h3(f"Pilot config ({w['best']}, rule 4)"))
+        out.append(note(w.get("pilot") or PILOT_RULES))
         if cfg:
-            out.append(h3(f"Recommended starting config ({w['best']}, DEFAULT_POLICY + overrides)"))
             out.append(table(["param", "value"],
-                             [[R(f"<b>{esc(k)}</b>" if k in ov else esc(k)), _fmt_val(v)]
-                              for k, v in sorted(cfg.items()) if not _skip_key(k)],
+                             [[R(f"<b>{esc(k)}</b>" if k in ov else esc(k)), _fmt_val(v_)]
+                              for k, v_ in sorted(cfg.items()) if not _skip_key(k)],
                              right=[False, False]))
-            out.append(note("Bold = the variant's overrides."))
+            out.append(note("Bold = the variant's overrides; the pilot runs it at 1/3 size "
+                            "(q_fav) in its night hours."))
         else:
             out.append(note(f"Variant params unavailable ({w.get('policy_err') or 'not in VARIANTS'})."))
+    else:
+        out.append(note("No variant is eligible for a live pilot."))
     out.append(h3("Key risks"))
     out.append('<ul style="padding-left:20px;margin:4px 0;">'
                + "".join(f"<li>{esc(r)}</li>" for r in w["risks"]) + "</ul>")
@@ -2866,13 +3533,23 @@ def render_html(ctx: dict) -> str:
                      'other events; opt and cons cover all of them.'
                      + (table(["event (report day)", "why"], [[e, w] for e, w in sm["day"][:12]],
                               right=[False, False]) if sm["day"] else "") + "</div>")
+    stm = ctx.get("stress_missing") or {}
+    if stm.get("total"):
+        parts.append(f'<div style="border:2px solid #9a6700;background:#fff8c5;padding:8px 10px;'
+                     f'margin:8px 0;"><b style="color:#9a6700;">{stm["total"]} of {stm["events"]} '
+                     f'event(s) in the window have no stress results</b> ('
+                     + esc(", ".join(f"{d} x{n}" for d, n in sorted(stm["by_day"].items())))
+                     + '): the ranking and the pre-registered tests cover the other events; a '
+                     'test waits for them before it reports PASS or FAIL.'
+                     + (table(["event (report day)", "why"], [[e, w] for e, w in stm["day"][:12]],
+                              right=[False, False]) if stm["day"] else "") + "</div>")
     rej = swp_rejections(ctx)
     if rej:
         parts.append(f'<div style="border:2px solid {NEG};background:#fff5f5;padding:8px 10px;'
                      f'margin:8px 0;"><b style="color:{NEG};">swp table problem</b> -- '
                      + esc("; ".join(rej))
-                     + '. A rejected model/ override is not used: swp runs on the repo default '
-                     'table. Fix or remove the file (TEMP_SHADOW.md "Fill models").</div>')
+                     + '. A rejected model/ override is not used: swp / stress run on the repo '
+                     'default table. Fix or remove the file (TEMP_SHADOW.md "Fill models").</div>')
     wdef = (ss.get("window") or {}).get("deferred") or []
     if wdef:
         bm = (ss.get("window") or {}).get("budget_min")
@@ -2899,71 +3576,91 @@ def render_html(ctx: dict) -> str:
                      + '): a variant name may hold different settings on those days, so the '
                      'cumulative figures mix the two. Re-sim with <code>python temp_shadow_sim.py '
                      'day --day &lt;day&gt;</code>.</div>')
-    # 1 headline
+    # 1 headline: the robust ranking over the cumulative window
     parts.append(h2("Headline"))
-    if best:
-        a = agg[f"{best}|{fill}"]
-        n = max(a["n_events"], 1)
-        desc = ctx["policy"].desc(best)
-        se = a.get("net_se")
+    hl = ctx.get("headline") or {}
+    phrase = headline_phrase(hl)
+    parts.append(f'<p style="font-size:15px;margin:4px 0;"><b>'
+                 f'{esc(phrase[:1].upper() + phrase[1:])}</b></p>')
+    feat = hl.get("pick") or hl.get("top")
+    if feat:
+        desc = ctx["policy"].desc(feat["name"])
+        lbl = ("Headline variant" if hl.get("pick") is feat and hl.get("pass") else
+               "Passes the bar below the top" if hl.get("pick") is feat else
+               "Top robust total, for information (it does not pass)")
         parts.append(
-            f'<p style="font-size:15px;margin:4px 0;">Best {esc(fill)} variant <b>{esc(best)}</b>'
+            f'<p style="margin:4px 0;">{esc(lbl)}: <b>{esc(feat["name"])}</b>'
             + (f' <span style="color:{MUTED};">({esc(desc)})</span>' if desc else "")
-            + f': net <b>{m_html(a["net"])}</b>'
-            + (f' (+/- {esc(usd(se))} Monte Carlo se)' if se is not None else "")
-            + f' = reward {m_html(a["reward"])} + trading {m_html(a["trading_pnl"])}'
-            + (f' - fees {m_html(a["fees"])}' if abs(a["fees"]) > 0.005 else "")
-            + f'.<br>Per event-hour ({a["n_events"]}): net {m_html(a["net"] / n)}, reward '
-              f'{m_html(a["reward"] / n)}, trading {m_html(a["trading_pnl"] / n)}.'
-            + (f'<br>Expected (calibrated tails): {m_html(a["net_cal"])} -- an estimate, see '
-               f'the note under Variants.' if a.get("net_cal") is not None
-               and cal_ok(ctx.get("policy"), best) else "")
-            + (f'<br>No calibrated-tails expectation: {esc(best)} quotes live strikes, where it '
-               f'would be circular (the note under Variants).' if a.get("net_cal") is not None
-               and not cal_ok(ctx.get("policy"), best) else "")
-            + '</p>')
-        if fill == "swp":
-            parts.append(note("Chosen on swp net: the sweep-aware fill model, where sweepers "
-                              "take our 1c orders (see the note under Variants)."))
-        elif fill != HEADLINE_FILL:
-            parts.append(note(f"No {HEADLINE_FILL} results for this window (sim output from "
-                              f"before SIM_VERSION 6): the headline uses {fill}."))
-        for f in ("cons", "opt"):
-            bf = ctx.get(f"best_{f}")
-            if f != fill and bf and f"{bf}|{f}" in agg:
-                o = agg[f"{bf}|{f}"]
-                parts.append(note(f"Best {f} variant {bf}: net {money(o['net'])} (reward "
-                                  f"{money(o['reward'])}, trading {money(o['trading_pnl'])})."
-                                  + (" opt = we fill at an equal price ahead of the queue; "
-                                     "cons = the queue ahead of us fills first." if f == "opt"
-                                     else "")))
-        if a["unsettled"]:
-            parts.append(note(f"{a['unsettled']} event(s) not settled: their trading P&L is incomplete."))
-    else:
+            + f' -- robust {esc(feat["fill"])} total '
+            + (f'<b>{m_html(feat["robust"])}</b>' if feat["robust"] is not None else "n/a")
+            + f' over {feat["hours"]} event-hours ({feat["days"]} days) = the total '
+              f'{m_html(feat["total"])} without its best hour {m_html(feat["best"])} '
+              f'({esc(feat["best_event"])}) and its worst {m_html(feat["worst"])} '
+              f'({esc(feat["worst_event"])}); 90% CI {esc(_ci_text(feat))}; P(total &gt; 0) '
+            + (f'{feat["p_pos"]:.2f}' if feat["p_pos"] is not None else "n/a")
+            + ("; <b>noise-dominated</b> (|best hour| + |worst hour| &gt; |total|)"
+               if feat["noise"] else "")
+            + (f'; expected (calibrated tails) {m_html(feat["cal"])}'
+               if feat.get("cal") is not None else "")
+            + ("; no calibrated-tails expectation (it quotes live strikes: circular)"
+               if feat.get("cal") is None and not cal_ok(ctx.get("policy"), feat["name"])
+               else "") + '.</p>')
+        if fill != DECISION_FILL:
+            parts.append(note(f"No stress results in the window (sim output from before "
+                              f"SIM_VERSION 7): the ranking uses {fill}."))
+    for r in hl.get("in_sample") or []:
+        parts.append(note(in_sample_text(r)))
+    if best and f"{best}|{fill}" in agg:
+        a = agg[f"{best}|{fill}"]
+        se = a.get("net_se")
+        parts.append(note(f"{best} on the report day ({fill}): net {money(a['net'])}"
+                          + (f" (+/- {usd(se)} Monte Carlo se)" if se is not None else "")
+                          + f" = reward {money(a['reward'])} + trading "
+                            f"{money(a['trading_pnl'])} over {a['n_events']} events. A single "
+                            "day's net ranks nothing."
+                          + (f" {a['unsettled']} event(s) not settled: their trading P&L is "
+                             "incomplete." if a.get("unsettled") else "")))
+    if not ctx["events"]:
         parts.append(f'<p style="font-size:15px;margin:4px 0;"><b>No sim results for {esc(day)}.</b> '
                      f'{esc(_empty_reason(ctx))}</p>')
+    tests = ctx.get("tests") or []
+    if tests:
+        parts.append(f'<p style="margin:4px 0;">Pre-registered tests: <b>'
+                     f'{esc(ctx.get("prereg_verdict"))}</b> -- '
+                     + esc("; ".join(f"Test {t['id']} ({t['variant']}) {t['text']}" for t in tests))
+                     + ' (the section below).</p>')
     if ctx.get("week"):
         w = ctx["week"]
         parts.append(f'<p style="margin:4px 0;">Week verdict: <b>{esc(w["verdict"])}</b> '
                      f'(see the week summary).</p>')
+    parts.append(_ranking_html(ctx))
+    # 1b the pre-registered tests
+    if tests:
+        parts.append(h2("Pre-registered tests"))
+        parts.append(_prereg_html(ctx))
     # 2 variant table
-    parts.append(h2("Variants"))
+    parts.append(h2("Variants (the report day)"))
     if agg:
         fills = [f for f in FILLS if any(split_key(k)[1] == f for k in agg)]
+        primary = fill if fill in fills else (fills or [None])[-1]
         top = ("<tr>" + f'<th style="{S_TH}"></th>'
-               + "".join(f'<th colspan="{len(_fill_cols(f, agg))}" style="{S_TH}'
+               + "".join(f'<th colspan="{len(_fill_cols(f, agg, primary))}" style="{S_TH}'
                          f'text-align:center;">{esc(FILL_LABEL.get(f, f))}</th>' for f in fills)
                + "</tr>")
-        head = ["variant"] + [c for f in fills for c in _fill_cols(f, agg)]
+        head = ["variant"] + [c for f in fills for c in _fill_cols(f, agg, primary)]
         parts.append(table(head, _variant_rows(ctx, fills), top=top))
+        parts.append(note("In the robust ranking's order (bold = the variant the breakdowns "
+                          "follow); the report day's own nets rank nothing."))
         if "swp" in fills:
             dr = {a.get("draws") for k, a in agg.items() if split_key(k)[1] == "swp"}
             dr.discard(None)
             parts.append(note(SWP_NOTE.format(draws=(dr.pop() if len(dr) == 1 else "N"))
                               + (" " + swp_tables_text(ctx) if swp_tables_text(ctx) else "")))
-            if any(split_key(k)[1] == "swp" and a.get("net_cal") is not None
-                   for k, a in agg.items()):
-                parts.append(note(CAL_NOTE))
+        if DECISION_FILL in fills:
+            parts.append(note(STRESS_NOTE + (" " + stress_text(ctx) if stress_text(ctx) else "")))
+        if any(split_key(k)[1] in ("swp", DECISION_FILL) and a.get("net_cal") is not None
+               for k, a in agg.items()):
+            parts.append(note(CAL_NOTE))
         descs = [(n, ctx["policy"].desc(n)) for n in sorted({split_key(k)[0] for k in agg})]
         descs = [(n, d) for n, d in descs if d]
         if descs:
@@ -3005,14 +3702,23 @@ def render_html(ctx: dict) -> str:
 
 
 def subject_line(ctx: dict) -> str:
+    """The email subject: the robust ranking's verdict (never a single
+    day's net), the pre-registered tests' status, the problem flags, and
+    from day 7 the week verdict. E.g. "Temp shadow day 3 (2026-10-17): no
+    variant passes; Test A in progress 1/5 (stress -$X), Test B starts
+    10/18"."""
     day, n = ctx["day"], ctx["day_n"]
-    best, fill = ctx["best"], ctx["fill"]
-    if best:
-        a = ctx["agg"][f"{best}|{fill}"]
-        s = (f"Temp shadow day {n} ({day}): best {best} net {money(a['net'], 0)}/day on "
-             f"{fill} (reward {money(a['reward'], 0)}, fills {money(a['trading_pnl'], 0)})")
+    s = f"Temp shadow day {n} ({day}): "
+    hl = ctx.get("headline") or {}
+    if not ctx.get("events"):
+        s += "no sim results"
+        if hl.get("top"):
+            s += "; " + headline_phrase(hl, subject=True)
     else:
-        s = f"Temp shadow day {n} ({day}): no sim results"
+        s += headline_phrase(hl, subject=True)
+    tests = ctx.get("tests") or []
+    if tests:
+        s += "; " + ", ".join(test_subject(t) for t in tests)
     if ctx.get("sim_error"):
         s += " [SIM FAILED]"
     elif (ctx.get("sim_summary") or {}).get("errors"):
@@ -3025,6 +3731,9 @@ def subject_line(ctx: dict) -> str:
     sm = ctx.get("swp_missing") or {}
     if sm.get("total"):
         s += f" [{sm['total']} events without swp]"
+    stm = ctx.get("stress_missing") or {}
+    if stm.get("total"):
+        s += f" [{stm['total']} events without stress]"
     if swp_rejections(ctx):
         s += " [swp table problem]"
     wdef = ((ctx.get("sim_summary") or {}).get("window") or {}).get("deferred") or []
@@ -3033,6 +3742,38 @@ def subject_line(ctx: dict) -> str:
     if ctx.get("week"):
         s += f" -- week: {ctx['week']['verdict']}"
     return s
+
+
+def _test_text(t: dict) -> List[str]:
+    """A pre-registered test in plain text: status, day nets, criteria."""
+    so_far = "" if t["status"] in ("PASS", "FAIL") else " so far"
+    days = ", ".join(f"{_mmdd(r['day'])} {money(r['net'], 0)}"
+                     + (f" ({r['loaded']} of 24 hours)" if r.get("partial") else "")
+                     for r in t["rows"] if not r["future"]) or "none yet"
+    crit = []
+    for c in t["criteria"]:
+        cr = t["crit"][c]
+        v = cr["value"]
+        vs = (f"{v} of {t['days_done'] if so_far else t['n_days']} days" if c == "days"
+              else money(v) if v is not None else "n/a")
+        crit.append(f"{cr['label']}: {vs}{so_far} -- {'met' if cr['met'] else 'not met'}")
+    if t["status"] == "not started":
+        return [f"Test {t['id']} ({t['variant']}, ET {t['start']} .. {t['end']}): {t['text']}; "
+                "PASS iff all of: " + "; ".join(t["crit"][c]["label"] for c in t["criteria"])]
+    out = [f"Test {t['id']} ({t['variant']}, ET {t['start']} .. {t['end']}): {t['text']}; "
+           f"stress net by day: {days}"]
+    out += ["  - " + x for x in crit]
+    extra = []
+    if "robust" in t.get("info", ()):
+        rv = t["crit"]["robust"]["value"]
+        extra.append(f"total without the best and worst hour {money(rv) if rv is not None else 'n/a'}")
+    if "recent" in t.get("info", ()):
+        extra.append(f"calibrated tails at the recent regime "
+                     f"{money(t['recent']) if t.get('recent') is not None else 'n/a'} vs the "
+                     f"table-based {money(t['cal']) if t.get('cal') is not None else 'n/a'}")
+    if extra:
+        out.append("  - for information: " + "; ".join(extra) + so_far)
+    return out
 
 
 def render_text(ctx: dict) -> str:
@@ -3055,6 +3796,13 @@ def render_text(ctx: dict) -> str:
                      "results (" + ", ".join(f"{d} x{n}" for d, n in sorted(sm["by_day"].items()))
                      + "): swp figures cover the other events"
                      + (f", e.g. {sm['day'][0][0]}: {sm['day'][0][1]}" if sm["day"] else "") + ".")
+    stm = ctx.get("stress_missing") or {}
+    if stm.get("total"):
+        lines.append(f"{stm['total']} of {stm['events']} event(s) in the window have no stress "
+                     "results (" + ", ".join(f"{d} x{n}" for d, n in sorted(stm["by_day"].items()))
+                     + "): the ranking and the tests cover the other events"
+                     + (f", e.g. {stm['day'][0][0]}: {stm['day'][0][1]}" if stm["day"] else "")
+                     + ".")
     for r in swp_rejections(ctx):
         lines.append("SWP TABLE PROBLEM: " + r + " (the repo default table is used).")
     wdef = ((ctx.get("sim_summary") or {}).get("window") or {}).get("deferred") or []
@@ -3067,30 +3815,62 @@ def render_text(ctx: dict) -> str:
                      f"SIM_VERSION than {ctx.get('sim_version')} ("
                      + ", ".join(f"{d} x{n}" for d, n in sorted(stale.items()))
                      + "): the cumulative figures mix two grids; re-sim those days.")
-    best, fill = ctx["best"], ctx["fill"]
-    if best:
-        a = ctx["agg"][f"{best}|{fill}"]
-        se = a.get("net_se")
-        lines.append(f"{best} ({fill}): reward {money(a['reward'])}, trading "
-                     f"{money(a['trading_pnl'])}, net {money(a['net'])}"
-                     + (f" +/- {usd(se)} (Monte Carlo se)" if se is not None else "")
-                     + f" over {a['n_events']} events"
-                     + (f"; expected at calibrated tails {money(a['net_cal'])} (an estimate)"
-                        if a.get("net_cal") is not None and cal_ok(ctx.get("policy"), best)
-                        else "")
-                     + ("; no calibrated-tails expectation (it quotes live strikes: circular)"
-                        if a.get("net_cal") is not None and not cal_ok(ctx.get("policy"), best)
-                        else "") + ".")
-        if fill == "swp":
-            lines.append("swp = the sweep-aware fill model (sweepers take our 1c orders); the "
-                         "headline, rules and verdict use it."
-                         + (" " + swp_tables_text(ctx) if swp_tables_text(ctx) else ""))
+    hl = ctx.get("headline") or {}
+    rank = ctx.get("rank") or []
+    if rank:
+        win = ctx["win"]
+        lines.append(f"Ranking on robust {rank[0]['fill']} totals ({win.days[0]} .. "
+                     f"{win.days[-1]}, each variant's best and worst event-hour left out; the "
+                     f"headline needs robust > 0 and P(total > 0) >= {HEADLINE_P_MIN:g}): "
+                     + headline_phrase(hl) + ".")
+        for r in hl.get("in_sample") or []:
+            lines.append("  (" + in_sample_text(r) + ")")
+        for r in rank[:5]:
+            lines.append(f"  {r['rank']}. {r['name']}"
+                         + (" [in-sample: judged only on later data]" if r.get("in_sample") else "")
+                         + ": robust "
+                         f"{money(r['robust']) if r['robust'] is not None else 'n/a'}, total "
+                         f"{money(r['total'])}, 90% CI {_ci_text(r)}, P(total > 0) "
+                         f"{r['p_pos']:.2f}" + (" [noise-dominated]" if r["noise"] else "")
+                         + (f", expected (calibrated tails) {money(r['cal'])}"
+                            if r.get("cal") is not None else ""))
     else:
         lines.append(_empty_reason(ctx))
+    tests = ctx.get("tests") or []
+    if tests:
+        lines += ["", f"Pre-registered tests: {ctx.get('prereg_verdict')}"]
+        for t in tests:
+            lines += _test_text(t)
+    best, fill = ctx["best"], ctx["fill"]
+    if best and f"{best}|{fill}" in ctx["agg"]:
+        a = ctx["agg"][f"{best}|{fill}"]
+        se = a.get("net_se")
+        lines += ["", f"{best} on the report day ({fill}): reward {money(a['reward'])}, trading "
+                      f"{money(a['trading_pnl'])}, net {money(a['net'])}"
+                      + (f" +/- {usd(se)} (Monte Carlo se)" if se is not None else "")
+                      + f" over {a['n_events']} events"
+                      + (f"; expected at calibrated tails {money(a['net_cal'])} (an estimate)"
+                         if a.get("net_cal") is not None and cal_ok(ctx.get("policy"), best)
+                         else "")
+                      + ("; no calibrated-tails expectation (it quotes live strikes: circular)"
+                         if a.get("net_cal") is not None and not cal_ok(ctx.get("policy"), best)
+                         else "") + "."]
+    if not ctx.get("events") and rank:
+        lines.append(_empty_reason(ctx))
+    notes_ = []
+    if "swp" in {split_key(k)[1] for k in ctx["agg"]} and swp_tables_text(ctx):
+        notes_.append(swp_tables_text(ctx))
+    if fill == DECISION_FILL and stress_text(ctx):
+        notes_.append(stress_text(ctx))
+    if notes_:
+        lines += ["", "stress = swp + level-clears at every price + hidden favorite takers (the "
+                      "decision model); swp = the sweep-aware fill model (sweepers take our 1c "
+                      "orders; the tweak rules pair variants on it). " + " ".join(notes_)]
     act = [s for s in ctx["suggestions"] if not s["suppressed"]][:5]
     if act:
         lines.append("")
-        lines.append("Suggested tweaks:")
+        lines.append("Suggested tweaks (swp pair diagnostics; only a pre-registered test makes "
+                     "a variant eligible):")
         for s in act:
             lines.append(f"- {s['title']}: {s['change']}")
     if ctx.get("week"):
@@ -3172,9 +3952,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"{len(ws.get('pending') or [])} pending, {len(ws.get('errors') or [])} failed, "
                   f"{len(ws.get('deferred') or [])} deferred (budget "
                   f"{ws.get('budget_min')} min), "
-                  f"{len(ws.get('swp_errors') or [])} without swp"
+                  f"{len(ws.get('swp_errors') or [])} without swp, "
+                  f"{len(ws.get('stress_errors') or [])} without stress; report day "
+                  f"{len(summary.get('stress_errors') or [])} without stress"
                   + (f"; swp_config: {summary['swp_config_error']}"
-                     if summary.get("swp_config_error") else ""))
+                     if summary.get("swp_config_error") else "")
+                  + (f"; stress_config: {summary['stress_config_error']}"
+                     if summary.get("stress_config_error") else ""))
     ctx = build_context(day, sim_error=sim_error, sim_ran=not args.no_sim,
                         sim_summary=summary)
     page = render_html(ctx)
@@ -3185,12 +3969,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f.write(page)
     os.replace(tmp, path)
     print(path)
-    # 1 = a sim problem: an event failed, or swp failed for an event (it kept
-    # opt / cons) or for the whole run (swp_config); deferred re-sims are not
+    # 1 = a sim problem: an event failed, or swp / stress failed for an event
+    # (it kept the other fill models) or for the whole run (swp_config /
+    # stress_config); deferred re-sims are not
     ws_ = (summary or {}).get("window") or {}
     rc = 1 if sim_error or (summary and (summary["errors"] or ws_.get("errors")
                                           or summary.get("swp_errors") or ws_.get("swp_errors")
-                                          or summary.get("swp_config_error"))) else 0
+                                          or summary.get("stress_errors")
+                                          or ws_.get("stress_errors")
+                                          or summary.get("swp_config_error")
+                                          or summary.get("stress_config_error"))) else 0
     if rc == 0 and swp_rejections(ctx):      # a model/ override was rejected (repo table used)
         rc = 1
     if args.send:

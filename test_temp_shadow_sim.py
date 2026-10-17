@@ -187,6 +187,14 @@ def write_fixture(event=EVENT, strikes=(K,), books=None, deltas=(), trades=(),
 V_NOWIN = {"T": dict(window_mode="none")}
 
 
+def run_keys(names=None):
+    """The variant x fill-model keys run_event / run_day write: opt / cons /
+    swp for every variant, stress for the STRESS_SCOPE ones."""
+    names = list(sim.VARIANTS) if names is None else list(names)
+    return ({f"{v}|{f}" for v in names for f in sim.FILL_MODELS}
+            | {f"{v}|stress" for v in names if sim.in_stress_scope(sim.VARIANTS[v])})
+
+
 class SimTestBase(unittest.TestCase):
     def setUp(self):
         _wipe()
@@ -470,8 +478,7 @@ class TestReviewFixes(SimTestBase):
         sim.run_day(day, variants=["A_live300_nowin"], workers=1)
         out = sim.run_day(day, workers=1)
         doc = [d for d in out if d["event"] == EVENT][0]
-        self.assertEqual(set(doc["variants"]),
-                         {f"{v}|{f}" for v in sim.VARIANTS for f in sim.FILL_MODELS})
+        self.assertEqual(set(doc["variants"]), run_keys())
         path = os.path.join(C.DATA_ROOT, "sim", day, f"{EVENT}.json")
         m0 = os.path.getmtime(path)
         time.sleep(0.05)
@@ -564,8 +571,7 @@ class TestSchemaAndDay(SimTestBase):
             for k in self.SCHEMA[sect]:
                 self.assertIn(k, res[sect], (sect, k))
         self.assertEqual(set(res["model_eval"]["by_tau"]), set(sim.TAU_BUCKETS))
-        self.assertEqual(set(res["variants"]),
-                         {f"{v}|{f}" for v in sim.VARIANTS for f in sim.FILL_MODELS})
+        self.assertEqual(set(res["variants"]), run_keys())
         for name, v in res["variants"].items():
             for k in self.SCHEMA["variant"]:
                 self.assertIn(k, v, (name, k))
@@ -713,8 +719,8 @@ class TestSwpFillModel(SimTestBase):
         out = sim.run_day(day, workers=1)
         doc = [d for d in out if d["event"] == EVENT][0]
         self.assertEqual(sim.FILL_MODELS, ("opt", "cons", "swp"))
-        self.assertEqual(set(doc["variants"]),
-                         {f"{v}|{f}" for v in sim.VARIANTS for f in sim.FILL_MODELS})
+        self.assertEqual(sim.RUN_FILL_MODELS, ("opt", "cons", "swp", "stress"))
+        self.assertEqual(set(doc["variants"]), run_keys())
         self.assertIn("FAV_only", sim.VARIANTS)
         self.assertIn("FAV_night", sim.VARIANTS)
         sw = doc["swp"]
@@ -1065,6 +1071,238 @@ class TestSwpFixPass(SimTestBase):
         with pool, prio:
             out = sim.run_day(day, workers=2)
         self.assertFalse([r for r in out if r["event"] in evs and not r.get("variants")])
+
+
+NIGHT_EVENT = "KXTEMPMIAH-26OCT1421"          # settles 21:00 ET: FAV_night quotes it
+
+
+class TestStressFillModel(SimTestBase):
+    """Jack 2026-10-17, "1": the adopted go-live rules decide on the STRESS
+    fill model (temp_shadow_sweep: swp + level-clear (d) + hidden favorite
+    takers (e)), so the daily pipeline writes "<variant>|stress" next to opt
+    / cons / swp for the STRESS_SCOPE variants (default: live=False), with
+    swp's draws and seeds and the favorite-taker table's id. The fixture: a
+    decided strike (NO the favorite at 95c) whose favorite level a recorded
+    taker walks through (95 then 94 within a second), plus swp's 1c sweeps."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = (sim.SWP_DRAWS, sim.STRESS_SCOPE, sim.STRESS_FAVHAZ_REPO)
+        sim.SWP_DRAWS = 3
+        sim._SWP_CACHE.clear()
+        self._model_dir = os.path.join(C.DATA_ROOT, "model")
+
+    def tearDown(self):
+        sim.SWP_DRAWS, sim.STRESS_SCOPE, sim.STRESS_FAVHAZ_REPO = self._saved
+        sim._SWP_CACHE.clear()
+        p = os.path.join(self._model_dir, "sweep_favhazard.json")
+        if os.path.exists(p):
+            os.remove(p)
+
+    def _fixture(self, event=EVENT, books=None, walk=True):
+        tk = f"{event}-T{K:.2f}"
+        trades = [(400.25, tk, "no", 1, 60.0), (1500.25, tk, "no", 1, 2000.0),
+                  (2500.25, tk, "no", 2, 40.0)]
+        if walk:      # a taker buys YES at 5c then 6c: NO bids at 95 then 94
+            trades += [(900.25, tk, "yes", 5, 300.0), (900.30, tk, "yes", 6, 50.0)]
+        write_fixture(event=event, temps=lambda m: DROP_C,
+                      books=books or {tk: ({3: 300.0}, {95: 300.0})},
+                      trades=trades, results={tk: "no"}, expiration_value=73.4)
+        return tk
+
+    def test_stress_for_the_scope_in_run_day(self):
+        self._fixture()
+        day = C.et_day(S)
+        out = sim.run_day(day, workers=1)
+        doc = [d for d in out if d["event"] == EVENT][0]
+        self.assertEqual(sim.STRESS_SCOPE, "nolive")
+        nolive = sorted(n for n, ov in sim.VARIANTS.items() if sim.in_stress_scope(ov, "nolive"))
+        self.assertEqual(set(doc["variants"]), run_keys())
+        self.assertEqual(sorted(k.split("|")[0] for k in doc["variants"] if k.endswith("|stress")),
+                         nolive)
+        self.assertIn("FAV_night_agree|stress", doc["variants"])
+        self.assertNotIn("F_full|stress", doc["variants"])
+        self.assertEqual(doc["fill_models"], ["opt", "cons", "swp", "stress"])
+        st = doc["stress"]
+        cfg = sim.stress_config()["ident"]
+        self.assertEqual(st["fav_hazard_id"], cfg["fav_hazard_id"])
+        self.assertEqual(os.path.basename(st["fav_hazard_src"]), "temp_shadow_sweep_favhazard.json")
+        self.assertEqual((st["fav_hazard_kind"], st["scope"], st["draws"], st["seed"],
+                          st["fav_seed"], st["take"], st["hole"]),
+                         ("repo", "nolive", 3, "tmm-sweep-1", "tmm-favhaz-1", "full", False))
+        self.assertEqual(st["variants"], nolive)
+        keys = TestSchemaAndDay.SCHEMA["variant"]
+        for v in nolive:
+            r = doc["variants"][f"{v}|stress"]
+            for k in keys + ["draws", "net_sd", "net_se", "draw_net", "stress_exact",
+                             "filler_contracts", "net_cal", "clear_events", "favhaz_events",
+                             "above1c_contracts", "fav_fills"]:
+                self.assertIn(k, r, (v, k))
+            self.assertEqual(len(r["draw_net"]), 3)
+            self.assertAlmostEqual(r["net"], sum(r["draw_net"]) / 3, places=3)
+            self.assertAlmostEqual(r["net"], r["reward"] + r["trading_pnl"] - r["fees"], places=4)
+        # the walking taker takes FAV_only's whole join under stress (cons /
+        # swp: only the 50 it printed below our price)
+        fs, fw = doc["variants"]["FAV_only|stress"], doc["variants"]["FAV_only|swp"]
+        self.assertGreater(fs["clear_events"], 0)
+        self.assertGreater(fs["contracts"], fw["contracts"])
+        self.assertGreater(fs["above1c_contracts"], 0)
+        # cached while the stress configuration is the same; re-simmed when
+        # the scope changes (stress for every variant)
+        path = os.path.join(C.DATA_ROOT, "sim", day, f"{EVENT}.json")
+        m0 = os.path.getmtime(path)
+        time.sleep(0.05)
+        sim.run_day(day, workers=1)
+        self.assertEqual(os.path.getmtime(path), m0)
+        sim.STRESS_SCOPE = "all"
+        again = [d for d in sim.run_day(day, workers=1) if d["event"] == EVENT][0]
+        self.assertGreater(os.path.getmtime(path), m0)
+        self.assertIn("F_full|stress", again["variants"])
+        self.assertEqual(again["stress"]["scope"], "all")
+        self.assertEqual(again["variants"]["FAV_only|stress"], fs)     # same draws
+        sim.STRESS_SCOPE = "bogus"
+        with self.assertRaises(ValueError):
+            sim.stress_scope()
+
+    def test_stress_shortcuts_are_exact(self):
+        import temp_shadow_sweep as SW
+        self._fixture()
+        inp = sim.load_event_inputs(EVENT)
+        sh = SW.SweepShared(inp, FakeModel(), None)
+        Ps = sim._resolve_variants(None)
+        cfg = sim.swp_config(4)
+        st = sim.stress_config(cfg)
+        fast = sim.run_stress(sh, Ps, cfg, st, screen=True)
+        full = sim.run_stress(sh, Ps, cfg, st, screen=False)
+        for v in Ps:
+            self.assertEqual(json.dumps(fast[v], sort_keys=True),
+                             json.dumps(full[v], sort_keys=True), v)
+        self.assertFalse(fast["G0_nohold"]["stress_exact"])
+
+    def test_stress_matches_the_standalone_sweep(self):
+        # the pipeline's stress = temp_shadow_sweep.run_event_variants (the
+        # 10/17 audit's stress-table) on the same draws: G0_nohold = its "G",
+        # FAV_only = its "FAV_only"
+        import temp_shadow_sweep as SW
+        self._fixture()
+        res = sim.run_event(EVENT, variants=["G0_nohold", "FAV_only"], model=FakeModel())
+        cfg = sim.swp_config()
+        st = sim.stress_config(cfg)
+        alone = SW.run_event_variants(
+            EVENT, {"G": SW.SWEEP_VARIANTS["G"], "FAV_only": SW.SWEEP_VARIANTS["FAV_only"]},
+            draws=3, hazard=cfg["hazard"], model=FakeModel(), fill_models=("stress",),
+            tail=cfg["tails"], fav_hazard=st["fav_hazard"])
+        for mine, theirs in (("G0_nohold", "G"), ("FAV_only", "FAV_only")):
+            a, b = res["variants"][f"{mine}|stress"], alone["variants"][f"{theirs}|stress"]
+            self.assertEqual(a["draw_net"], b["draw_net"], mine)
+            for k in ("net", "reward", "trading_pnl", "contracts", "net_cal", "clear_events",
+                      "favhaz_events", "filler_contracts"):
+                self.assertAlmostEqual(a[k], b[k], places=4, msg=(mine, k))
+        self.assertEqual(res["stress"]["fav_hazard_id"], alone["stress"]["fav_hazard_id"])
+
+    def test_stress_failure_is_contained(self):
+        from unittest import mock
+        self._fixture()
+        vs = ["G0_nohold", "FAV_only"]
+        good = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        with mock.patch.object(sim, "run_stress", side_effect=RuntimeError("boom")):
+            bad = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self.assertEqual(set(bad["variants"]),
+                         {f"{v}|{f}" for v in vs for f in ("opt", "cons", "swp")})
+        self.assertTrue(bad["stress_error"].startswith("stress run failed: RuntimeError: boom"))
+        self.assertNotIn("stress", bad)
+        self.assertEqual(bad["fill_models"], ["opt", "cons", "swp"])
+        for k in bad["variants"]:
+            self.assertEqual(bad["variants"][k], good["variants"][k], k)
+        want = sim._policy_overrides(vs)
+        sw = sim.swp_config()
+        ident, sid = sw["ident"], sim.stress_config(sw)["ident"]
+        self.assertTrue(sim._cached_ok(good, want, ident, False, sid))
+        self.assertFalse(sim._cached_ok(bad, want, ident, False, sid))     # re-simmed next time
+        self.assertTrue(sim._cached_ok(bad, want, ident, False, None, stress_broken=True))
+        # a changed favorite-taker table re-keys the cache
+        self.assertFalse(sim._cached_ok(good, want, ident, False,
+                                        dict(sid, fav_hazard_id="feedfacefeedface")))
+        # stress needs swp: a sweep setup failure costs both
+        with mock.patch.object(sim, "swp_config", side_effect=ValueError("no table")):
+            bad2 = sim.run_event(EVENT, variants=vs, model=FakeModel())
+        self.assertIn("swp setup failed: ValueError: no table", bad2["swp_error"])
+        self.assertIn("stress setup failed: the sweep setup it builds on failed",
+                      bad2["stress_error"])
+        self.assertEqual(set(bad2["variants"]), {f"{v}|{f}" for v in vs for f in ("opt", "cons")})
+
+    def test_a_request_outside_the_scope_needs_no_stress(self):
+        # live-quoting variants only (outside the default scope): no stress
+        # block, and the cached file is reused (it was re-simmed every time)
+        self._fixture()
+        res = sim.run_event(EVENT, variants=["A_live300_nowin"], model=FakeModel())
+        self.assertNotIn("stress", res)
+        self.assertNotIn("stress_error", res)
+        self.assertEqual(res["fill_models"], ["opt", "cons", "swp"])
+        sw = sim.swp_config()
+        self.assertTrue(sim._cached_ok(res, sim._policy_overrides(["A_live300_nowin"]),
+                                       sw["ident"], False, sim.stress_config(sw)["ident"]))
+
+    def test_favhazard_override_is_validated(self):
+        repo = sim.stress_config()["ident"]
+        self.assertEqual((repo["fav_hazard_kind"], repo["fav_hazard_rejected"]), ("repo", None))
+        os.makedirs(self._model_dir, exist_ok=True)
+        p = os.path.join(self._model_dir, "sweep_favhazard.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1}, f)
+        sim._SWP_CACHE.clear()
+        ident = sim.stress_config()["ident"]
+        self.assertEqual((ident["fav_hazard_kind"], ident["fav_hazard_id"]),
+                         ("repo", repo["fav_hazard_id"]))
+        self.assertIn("no 'hazard' fit", ident["fav_hazard_rejected"])
+        with open(sim.STRESS_FAVHAZ_REPO, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["hazard"]["a"] = {fb: {ab: 2.0 * float(r) for ab, r in d.items()}
+                              for fb, d in doc["hazard"]["a"].items()}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        sim._SWP_CACHE.clear()
+        ident = sim.stress_config()["ident"]
+        self.assertEqual(ident["fav_hazard_kind"], "override")
+        self.assertNotEqual(ident["fav_hazard_id"], repo["fav_hazard_id"])
+
+    def test_fav_market_min_p_in_the_sim(self):
+        """FAV_night_agree = FAV_night + fav_market_min_p 0.95 (the market
+        must price the favorite >= 0.95 on the external book). A night
+        event: on a book where the market agrees (NO 95 / YES 3: 0.96) it is
+        FAV_night exactly, under every fill model; where it does not (NO 90
+        / YES 8: 0.91) it rests nothing."""
+        tk = self._fixture(NIGHT_EVENT, walk=False)
+        res = sim.run_event(NIGHT_EVENT, variants=["FAV_night", "FAV_night_agree"],
+                            model=FakeModel())
+        for fm in sim.RUN_FILL_MODELS:
+            a, b = res["variants"][f"FAV_night|{fm}"], res["variants"][f"FAV_night_agree|{fm}"]
+            self.assertGreater(a["quoted_secs"], 0, fm)
+            self.assertEqual(a, b, fm)
+        self.assertEqual(res["policies"]["FAV_night_agree"]["fav_market_min_p"], 0.95)
+        _wipe()
+        self._fixture(NIGHT_EVENT, books={tk: ({8: 300.0}, {90: 300.0})}, walk=False)
+        res = sim.run_event(NIGHT_EVENT, variants=["FAV_night", "FAV_night_agree"],
+                            model=FakeModel())
+        for fm in sim.RUN_FILL_MODELS:
+            a, b = res["variants"][f"FAV_night|{fm}"], res["variants"][f"FAV_night_agree|{fm}"]
+            self.assertGreater(a["quoted_secs"], 0, fm)
+            self.assertEqual((b["quoted_secs"], b["reward"], b["contracts"]), (0, 0.0, 0.0), fm)
+
+    def test_fav_hits_recorded(self):
+        import temp_shadow_sweep as SW
+        tk = self._fixture()
+        res = sim.run_event(EVENT, variants=["FAV_only"], model=FakeModel())
+        rows = res["fav_hits"]
+        # the walking taker hit the NO favorite's bids at 95 (one cluster: 95
+        # and 94 within a second); NO won, so no upset; the 1c sweeps are not
+        # favorite-bid hits
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r[0], tk)
+        self.assertIn(r[1], SW.FAV_LABELS)
+        self.assertEqual((r[2], r[3], r[5], r[6]), (1, 0, 350.0, 0.0))
+        self.assertGreater(r[4], 0.0)                       # the model's longshot probability
 
 if __name__ == "__main__":
     unittest.main()

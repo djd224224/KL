@@ -8,8 +8,9 @@ scores, per policy variant and fill model, what the policy would have earned in
 liquidity rewards and won or lost on fills. It never places an order.
 
 Public API (the Interfaces contract):
-    DEFAULT_POLICY, VARIANTS, FILL_MODELS ("opt", "cons", "swp")
-    run_event(event_ticker, variants=None, fill_models=FILL_MODELS, model=None,
+    DEFAULT_POLICY, VARIANTS, FILL_MODELS ("opt", "cons", "swp": every variant),
+    RUN_FILL_MODELS (+ "stress" for the STRESS_SCOPE variants)
+    run_event(event_ticker, variants=None, fill_models=RUN_FILL_MODELS, model=None,
               until_ts=None, draws=None) -> dict          (sim output schema)
     run_day(et_day, variants=None, force=False, workers=None, deadline=None)
         -> List[dict]
@@ -46,6 +47,32 @@ report flags it). swp is contained (fix pass 10/16): if the sweep path
 raises, the event keeps its opt / cons results, has no "|swp" keys and a
 top-level swp_error, and run_day re-sims it next time (_cached_ok wants
 every fill model).
+
+Fill model stress (SIM_VERSION 7; Jack 2026-10-17, "1": the adopted go-live
+rules decide on it, TEMP_SHADOW.md "Pre-registered tests") = swp plus
+temp_shadow_sweep's level-clear channel (d) on our lots at >= 2c and the
+hidden favorite takers (e): "<variant>|stress" in the swp schema (means over
+the same SWP_DRAWS draws, the 1c hazard candidates on SWP_SEED as in swp,
+the favorite-taker candidates on temp_shadow_sweep.FAVHAZ_SEED -- the audit's
+stress-table draws exactly), plus stress_exact, clear_events, favhaz_events,
+above1c_contracts and fav_fills (favorite-side fills by fair bucket:
+contracts, cost, table-marked P&L). The favorite-taker table is
+<TEMP_SHADOW_DATA>/model/sweep_favhazard.json if usable, else the repo's
+temp_shadow_sweep_favhazard.json (calibrate-fav, 10/17); the top-level
+"stress" block names it (fav_hazard_id ...). Which variants: STRESS_SCOPE
+(env TEMP_SHADOW_STRESS_SCOPE) "all", or "nolive" = the variants that quote
+no live strikes (live=False: G, G0, I, J, L and the FAV family), the only
+ones the decision rules use; the block's "variants" lists them. Contained
+like swp: a failure costs stress only (stress_error, no "|stress" keys; the
+next run_day re-sims). Two exact shortcuts as in swp (checked against
+running every draw): a variant whose first draw rests no 1c order and no
+favorite lot alone at the top is exact in one draw (stress_exact); one whose
+first draw accepted no hidden sweep and no hidden favorite taker re-runs a
+later draw only if one of its candidates would be accepted along the
+logged trajectory (temp_shadow_sweep.hazard_hits / fav_hazard_hits).
+Every event also gets "fav_hits" (temp_shadow_sweep.fav_hit_summary: the
+taker clusters that hit a favorite side's bids at >= 90c, with the
+favorite's outcome) -- the report's recent-regime tail rates.
 
 Mechanics (all times are exchange/epoch seconds; our rx ~ exchange time):
   * Ticks: one per second from open to close. Tick i sits at T_i = sec0+i+0.5,
@@ -126,10 +153,13 @@ Definitions used in the output beyond the schema text:
                    within 3c of that side's best bid (book without us).
 Extra keys (top level): policies, flags, runtime_s, sim_version, fill_models,
 swp (draws, rec_mode, channels, seed, hazard_id / hazard_src / hazard_built /
-lam_max, tails_id / tails_src); coverage adds fair_missing_frac,
-programs_src and wx_rows_lookback. run_day reuses a sim file only when it
-holds every requested variant x fill model with the same overrides, this
-SIM_VERSION and the same swp configuration (draws, hazard, tails).
+lam_max, tails_id / tails_src), stress (draws, seed, fav_seed, fav_hazard_id
+/ _src / _kind / _rejected / _built, fav_lam_max, stress_version, take, hole,
+scope, variants), fav_hits; coverage adds fair_missing_frac, programs_src
+and wx_rows_lookback. run_day reuses a sim file only when it holds every
+requested variant x fill model with the same overrides (stress: the
+variants in STRESS_SCOPE), this SIM_VERSION and the same swp / stress
+configuration (draws, hazard, tails, favorite-taker table, scope).
 """
 from __future__ import annotations
 
@@ -149,7 +179,7 @@ import temp_shadow_common as C
 import temp_shadow_model as tmodel
 import temp_shadow_scoring as scoring
 
-SIM_VERSION = "6"   # 2: 75-min wx lookback, fair per wx update, relative size
+SIM_VERSION = "7"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # cuts + projected belief, near strikes only with decided,
                     # pre-trade worst-case-loss sizing (10/14 review fixes)
                     # 3: guard buffer from FairModel.slopes (mixture slope);
@@ -166,12 +196,25 @@ SIM_VERSION = "6"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # temp_shadow_sweep), FAV_only / FAV_night and
                     # quote_hours_et (Jack 2026-10-16, "1"); opt / cons
                     # numbers of the earlier variants unchanged
+                    # 7: the stress fill model (STRESS_SCOPE variants),
+                    # fav_hits, FAV_night_agree and the policy key
+                    # fav_market_min_p (Jack 2026-10-17, "1"); opt / cons /
+                    # swp numbers of the earlier variants unchanged
 
 # The policy lives in temp_mm_policy (the live executor runs the same code);
 # re-exported here for the report and older callers.
 DEFAULT_POLICY = pol.DEFAULT_POLICY
 VARIANTS = pol.VARIANTS
-FILL_MODELS = ("opt", "cons", "swp")
+STRESS = "stress"
+FILL_MODELS = ("opt", "cons", "swp")      # every variant
+RUN_FILL_MODELS = FILL_MODELS + (STRESS,)   # what run_event / run_day write: stress for
+                                            # the STRESS_SCOPE variants
+# stress for "all" variants or the "nolive" ones (live=False: what the
+# decision rules use); TEMP_SHADOW.md "Daily pipeline stress" has the runtime
+STRESS_SCOPES = ("all", "nolive")
+STRESS_SCOPE = (os.environ.get("TEMP_SHADOW_STRESS_SCOPE") or "nolive").strip().lower()
+STRESS_TAKE, STRESS_HOLE = "full", False     # the audit's base stress model
+STRESS_FAVHAZ_REPO = os.path.join(C.REPO, "temp_shadow_sweep_favhazard.json")
 # swp (temp_shadow_sweep): Monte Carlo draws per event. Measured 10/16 on the
 # report task's 2 workers (a 22-event day: 398 s at 6 draws, 485 s at 8): a
 # full re-sim of the report's longest window (10/15-10/23, 200 events, after
@@ -1254,17 +1297,56 @@ def swp_config(draws: Optional[int] = None) -> dict:
 
 _SWP_CACHE_KEYS = ("draws", "rec_mode", "channels", "seed", "hazard_id", "tails_id",
                    "sweep_version")
+_STRESS_CACHE_KEYS = ("draws", "seed", "fav_seed", "fav_hazard_id", "stress_version", "take",
+                      "hole", "scope")
 
 
-def _swp_summary(runs: List[dict], exact: bool) -> dict:
-    """Mean over the swp draws in the opt / cons schema, plus the Monte Carlo
-    spread (net_sd, net_se = net_sd / sqrt(draws)) and the sweep extras."""
+def stress_scope() -> str:
+    """STRESS_SCOPE, validated ('all' | 'nolive')."""
+    s = str(STRESS_SCOPE).strip().lower()
+    if s not in STRESS_SCOPES:
+        raise ValueError(f"TEMP_SHADOW_STRESS_SCOPE must be one of {STRESS_SCOPES}, not {s!r}")
+    return s
+
+
+def in_stress_scope(P: dict, scope: Optional[str] = None) -> bool:
+    """Does a variant (full policy, or overrides of DEFAULT_POLICY) get the
+    stress fill model? 'all': every variant; 'nolive': live=False only."""
+    scope = stress_scope() if scope is None else scope
+    return scope == "all" or not dict(DEFAULT_POLICY, **(P or {})).get("live")
+
+
+def stress_config(swp_cfg: Optional[dict] = None, draws: Optional[int] = None) -> dict:
+    """The stress fill model's inputs on top of swp_config(): the hidden
+    favorite-taker table (temp_shadow_sweep.Hazard; <TEMP_SHADOW_DATA>/model/
+    sweep_favhazard.json when usable, else the repo's
+    temp_shadow_sweep_favhazard.json) and the identity block written into
+    every sim file / checked by run_day's cache."""
+    import temp_shadow_sweep as SW
+    sw = swp_cfg if swp_cfg is not None else swp_config(draws)
+    fp, fdoc, fkind, frej = _swp_table("sweep_favhazard.json", STRESS_FAVHAZ_REPO,
+                                       check_hazard_doc)
+    fhz = SW.Hazard(fdoc)
+    ident = {"draws": int(sw["ident"]["draws"]), "seed": SWP_SEED, "fav_seed": SW.FAVHAZ_SEED,
+             "fav_hazard_id": fhz.ident(), "fav_hazard_src": fp, "fav_hazard_kind": fkind,
+             "fav_hazard_rejected": frej, "fav_hazard_built": fhz.doc.get("built"),
+             "fav_lam_max": _r(fhz.lam_max), "stress_version": SW.STRESS_VERSION,
+             "take": STRESS_TAKE, "hole": STRESS_HOLE, "scope": stress_scope()}
+    return {"fav_hazard": fhz, "ident": ident}
+
+
+def _swp_summary(runs: List[dict], exact: bool, stress: bool = False) -> dict:
+    """Mean over the swp (or stress) draws in the opt / cons schema, plus the
+    Monte Carlo spread (net_sd, net_se = net_sd / sqrt(draws)) and the sweep
+    extras; stress adds its own (clear_events, favhaz_events,
+    above1c_contracts, fav_fills) and names the shortcut stress_exact."""
     import temp_shadow_sweep as SW
     n = len(runs)
     ms = SW.mean_summary(runs)
     out = {k: ms[k] for k in ("reward", "fills_n", "contracts", "trading_pnl", "fees", "net",
                               "avg_share", "quoted_secs", "max_abs_pos", "worst_case_loss")}
-    for k in ("by_class", "by_tau", "by_side"):      # means at the opt / cons precision
+    for k in ("by_class", "by_tau", "by_side") + (("fav_fills",) if stress else ()):
+        # means at the opt / cons precision
         acc: Dict[str, Dict[str, float]] = {}
         for r in runs:
             for b, d in (r.get(k) or {}).items():
@@ -1289,9 +1371,10 @@ def _swp_summary(runs: List[dict], exact: bool) -> dict:
         out[f"{k}_sd"] = ms.get(f"{k}_sd")
     out["net_se"] = _r((ms.get("net_sd") or 0.0) / math.sqrt(n)) if n else None
     out["draw_net"] = ms.get("draw_net")
-    out["swp_exact"] = bool(exact)
+    out["stress_exact" if stress else "swp_exact"] = bool(exact)
     for k in ("filler_contracts", "haz_events", "pnl_cal", "net_cal", "net_cal_tlo",
-              "net_cal_thi"):
+              "net_cal_thi") + (("clear_events", "favhaz_events", "above1c_contracts")
+                                if stress else ()):
         if k in ms:
             out[k] = ms[k]
     out["sweep_src"] = ms.get("sweep_src") or {}
@@ -1340,7 +1423,58 @@ def run_swp(sh, Ps: Dict[str, dict], cfg: dict, screen: bool = True) -> Dict[str
     return {name: _swp_summary(runs[name], name in exact) for name in Ps}
 
 
-def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=None,
+def run_stress(sh, Ps: Dict[str, dict], swp_cfg: dict, st_cfg: dict,
+               screen: bool = True) -> Dict[str, dict]:
+    """name -> the stress summary over swp_cfg's draws (temp_shadow_sweep
+    VPass fill model 'stress': swp + level-clear (d) + hidden favorite takers
+    (e), the base settings of the 10/17 audit: take 'full', no gap rule).
+    Draw k uses the 1c hazard candidates of swp's draw k (SWP_SEED) and the
+    favorite-taker candidates fav_candidates(sh, k) (FAVHAZ_SEED): common
+    random numbers across variants, and the same draws as
+    temp_shadow_sweep.run_event_variants. Shortcuts (screen=False runs every
+    draw in full; test_temp_shadow_sim checks they agree):
+      * a variant whose first draw rested no 1c order and no favorite lot
+        alone at the top is exact in that draw (stress_exact);
+      * a variant whose first draw accepted no hidden sweep and no hidden
+        favorite taker logs both trajectories; a later draw is run only if
+        one of its candidates would be accepted along them
+        (temp_shadow_sweep.hazard_hits / fav_hazard_hits)."""
+    import temp_shadow_sweep as SW
+    hz, tc, fhz = swp_cfg["hazard"], swp_cfg["tails"], st_cfg["fav_hazard"]
+    n = int(swp_cfg["ident"]["draws"])
+    runs: Dict[str, List[dict]] = {name: [] for name in Ps}
+    exact = set()
+    logs: Dict[str, tuple] = {}          # name -> draw 0's (1c log, favorite log)
+    for k in range(n):
+        todo = [name for name in Ps if name not in exact]
+        cands = SW.hazard_candidates(sh, k, hz.lam_max, SWP_SEED) if todo else []
+        fcands = SW.fav_candidates(sh, k, fhz.lam_max) if todo else []
+        for name, P in Ps.items():
+            if name in exact:
+                runs[name].append(runs[name][0])
+                continue
+            if k > 0 and name in logs:
+                l1, lf = logs[name]
+                if (not SW.hazard_hits(sh, hz, l1, cands)
+                        and not SW.fav_hazard_hits(sh, fhz, lf, fcands)):
+                    runs[name].append(runs[name][0])
+                    continue
+            vp = SW.VPass(sh, P, SW.STRESS, hazard=hz, cands=cands, rec_mode=SWP_REC_MODE,
+                          channels=SWP_CHANNELS, tail_cal=tc if tc else None, fav_hazard=fhz,
+                          fav_cands=fcands, stress_hole=STRESS_HOLE, stress_take=STRESS_TAKE)
+            if k == 0 and screen:
+                vp.record_expo()
+                vp.record_fav_expo()
+            runs[name].append(vp.run())
+            if k == 0:
+                if not vp.had_1c and not vp.had_fav:
+                    exact.add(name)
+                elif screen and vp.haz_n == 0 and vp.favhaz_n == 0:
+                    logs[name] = (vp.expo_log, vp.fav_log)
+    return {name: _swp_summary(runs[name], name in exact, stress=True) for name in Ps}
+
+
+def run_event(event_ticker: str, variants=None, fill_models=RUN_FILL_MODELS, model=None,
               until_ts: Optional[float] = None, draws: Optional[int] = None) -> dict:
     """Simulate one event for every variant x fill model.
 
@@ -1351,15 +1485,16 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
     t_start = time.time()
     Ps = _resolve_variants(variants)
     for fm in fill_models:
-        if fm not in FILL_MODELS:
+        if fm not in RUN_FILL_MODELS:
             raise ValueError(f"unknown fill model {fm!r}")
     inp = load_event_inputs(event_ticker)
     if model is None:
         model = tmodel.FairModel()
-    swp_cfg, swp_err, sh = None, None, None
-    if "swp" in fill_models:
+    swp_cfg, sw_err, sh = None, None, None
+    if "swp" in fill_models or STRESS in fill_models:
         # contained (fix pass 10/16): a failure in the sweep path costs swp
-        # only -- the event keeps opt / cons, with swp_error and no |swp keys
+        # (and stress, which builds on it) only -- the event keeps opt /
+        # cons, with swp_error / stress_error and no |swp / |stress keys
         try:
             import temp_shadow_sweep as SW
             swp_cfg = swp_config(draws)
@@ -1368,7 +1503,19 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
             # cons are unchanged
             sh = SW.SweepShared(inp, model, until_ts, subtract=scoring.SUBTRACT_LIVE)
         except Exception as e:          # noqa: BLE001
-            swp_cfg, sh, swp_err = None, None, _swp_error("setup", e)
+            swp_cfg, sh, sw_err = None, None, _swp_error("setup", e)
+    swp_err = sw_err if "swp" in fill_models else None
+    st_cfg, st_err = None, None
+    if STRESS in fill_models:
+        if swp_cfg is None:
+            st_err = ("stress setup failed: the sweep setup it builds on failed: "
+                      + str(sw_err or "").splitlines()[0][:300] + "\n" + str(sw_err or "")[-1200:])
+        else:
+            try:
+                st_cfg = stress_config(swp_cfg)
+            except Exception as e:      # noqa: BLE001
+                st_err = _swp_error("setup", e, "stress")
+    sweep_sh = sh
     if sh is None:
         sh = _Shared(inp, model, until_ts)
     react0 = float(DEFAULT_POLICY["react_s"])
@@ -1377,19 +1524,44 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
     det = {}
     for name, P in Ps.items():
         for fm in fill_models:
-            if fm != "swp":
+            if fm not in ("swp", STRESS):
                 det[f"{name}|{fm}"] = _Pass(sh, P, fm).run()
     swp_out: Dict[str, dict] = {}
-    if swp_cfg is not None:
+    if swp_cfg is not None and "swp" in fill_models:
         try:
             swp_out = run_swp(sh, Ps, swp_cfg)
         except Exception as e:          # noqa: BLE001
             swp_out, swp_err = {}, _swp_error("run", e)
-    fms = [fm for fm in fill_models if fm != "swp" or swp_out]
+    st_out: Dict[str, dict] = {}
+    st_names: List[str] = []
+    if st_cfg is not None:
+        st_names = [name for name, P in Ps.items() if in_stress_scope(P)]
+        if st_names:
+            try:
+                st_out = run_stress(sh, {n: Ps[n] for n in st_names}, swp_cfg, st_cfg)
+            except Exception as e:      # noqa: BLE001
+                st_out, st_err = {}, _swp_error("run", e, "stress")
+    fav_hits, fh_err = None, None
+    if sweep_sh is not None:
+        # the favorite-bid hits and the favorite's outcome (the report's
+        # recent-regime tail rates); a failure costs this key only
+        try:
+            import temp_shadow_sweep as SW
+            fav_hits = SW.fav_hit_summary(sweep_sh)
+        except Exception as e:          # noqa: BLE001
+            fh_err = f"fav_hits_error:{type(e).__name__}:{str(e)[:120]}"
+    fms = [fm for fm in fill_models
+           if (fm != "swp" or swp_out) and (fm != STRESS or st_out)]
     out_vars = {}
     for name in Ps:
         for fm in fms:
-            out_vars[f"{name}|{fm}"] = swp_out[name] if fm == "swp" else det[f"{name}|{fm}"]
+            if fm == "swp":
+                out_vars[f"{name}|{fm}"] = swp_out[name]
+            elif fm == STRESS:
+                if name in st_out:
+                    out_vars[f"{name}|{fm}"] = st_out[name]
+            else:
+                out_vars[f"{name}|{fm}"] = det[f"{name}|{fm}"]
     cov = sh.stream_cov or {}
     gaps = cov.get("gaps", 0)
     recon = cov.get("reconnects", 0)
@@ -1397,6 +1569,8 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
     prog_secs = max((min(p["end"], sh.close) - max(p["start"], sh.open))
                     for p in sh.progs) if sh.progs else 0.0
     flags = list(inp.flags) + list(sh.flags)
+    if fh_err:
+        flags.append(fh_err)
     if not inp.settled:
         flags.append("unsettled_marked_at_last_mid")
     return {
@@ -1422,16 +1596,19 @@ def run_event(event_ticker: str, variants=None, fill_models=FILL_MODELS, model=N
         "fill_models": fms,
         "swp": dict(swp_cfg["ident"]) if swp_out else None,
         **({"swp_error": swp_err} if swp_err else {}),
+        **({"stress": dict(st_cfg["ident"], variants=sorted(st_out))} if st_out else {}),
+        **({"stress_error": st_err} if st_err and STRESS in fill_models else {}),
+        **({"fav_hits": fav_hits} if fav_hits is not None else {}),
         "runtime_s": round(time.time() - t_start, 2),
         "sim_version": SIM_VERSION,
     }
 
 
-def _swp_error(stage: str, e: BaseException) -> str:
-    """One line plus the traceback's tail: the swp_error written into a sim
-    file whose sweep path raised (the report shows it)."""
+def _swp_error(stage: str, e: BaseException, kind: str = "swp") -> str:
+    """One line plus the traceback's tail: the swp_error / stress_error
+    written into a sim file whose sweep path raised (the report shows it)."""
     tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-    return f"swp {stage} failed: {type(e).__name__}: {e}"[:400] + "\n" + tb[-1200:]
+    return f"{kind} {stage} failed: {type(e).__name__}: {e}"[:400] + "\n" + tb[-1200:]
 
 
 # -- day runner ---------------------------------------------------------------
@@ -1478,7 +1655,11 @@ def _lower_priority():
         pass
 
 
-def _day_worker(ev: str, variants, out_path: str, draws: Optional[int] = None) -> dict:
+def _day_worker(ev: str, variants, out_path: str, draws: Optional[int] = None,
+                scope: Optional[str] = None) -> dict:
+    global STRESS_SCOPE
+    if scope:                    # the parent's stress scope (a spawned worker re-imports)
+        STRESS_SCOPE = scope
     try:
         res = run_event(ev, variants=variants, draws=draws)
         C.write_json_atomic(out_path, res)
@@ -1498,14 +1679,19 @@ def _policy_overrides(variants) -> Dict[str, dict]:
 
 
 def _cached_ok(doc, want: Dict[str, dict], swp_want: Optional[dict] = None,
-               swp_broken: bool = False) -> bool:
+               swp_broken: bool = False, stress_want: Optional[dict] = None,
+               stress_broken: bool = False) -> bool:
     """A sim file is reused only if it is settled, from this SIM_VERSION,
     holds every requested variant x fill model with the same overrides and,
     with swp_want (swp_config()["ident"]), the same swp draws / rec_mode /
     channels / seed / hazard and tails tables. A file whose swp failed
     (swp_error, no |swp keys) is re-simmed -- unless swp_broken (run_day's
     swp_config() raised: a re-sim could not add swp either, so opt / cons
-    suffice)."""
+    suffice). stress the same way: every requested variant in the stress
+    scope needs its |stress result and, with stress_want
+    (stress_config()["ident"]), the same favorite-taker table, draws,
+    seeds, settings and scope; stress_broken (stress_config() raised, or
+    swp is broken: stress builds on it) waives it."""
     if not isinstance(doc, dict) or not doc.get("settled") or doc.get("error"):
         return False
     if str(doc.get("sim_version")) != SIM_VERSION:
@@ -1522,6 +1708,16 @@ def _cached_ok(doc, want: Dict[str, dict], swp_want: Optional[dict] = None,
             return False
         if pol.get(name) != ov:
             return False
+    if STRESS in RUN_FILL_MODELS and not (stress_broken or swp_broken):
+        scope = (stress_want or {}).get("scope") or stress_scope()
+        need = [name for name, ov in want.items() if in_stress_scope(ov, scope)]
+        if need:            # no requested variant in the scope: no stress block to match
+            st = doc.get("stress") or {}
+            if stress_want is not None and any(st.get(k) != stress_want.get(k)
+                                               for k in _STRESS_CACHE_KEYS):
+                return False
+            if any(f"{name}|{STRESS}" not in have for name in need):
+                return False
     return True
 
 
@@ -1542,23 +1738,34 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
     events already running finish.
     swp_config() raising (an unusable repo table) costs swp only: run_event
     writes opt / cons with swp_error, and cached files without swp are
-    reused (a re-sim could not add it)."""
+    reused (a re-sim could not add it). stress_config() raising (an
+    unusable favorite-taker table; or swp broken) costs stress the same
+    way."""
     evs = day_events(et_day)
     out_dir = C.sim_dir(et_day)
     want = _policy_overrides(variants)
-    swp_want, swp_broken = None, False
+    swp_want, swp_broken, swp_cfg = None, False, None
     if "swp" in FILL_MODELS:
         try:
-            swp_want = swp_config()["ident"]
+            swp_cfg = swp_config()
+            swp_want = swp_cfg["ident"]
         except Exception:               # noqa: BLE001 -- run_event records it per event
             swp_broken = True
+    st_want, st_broken = None, False
+    if STRESS in RUN_FILL_MODELS:
+        try:
+            if swp_cfg is None:
+                raise ValueError("stress builds on swp, whose configuration failed")
+            st_want = stress_config(swp_cfg)["ident"]
+        except Exception:               # noqa: BLE001 -- run_event records it per event
+            st_broken = True
     results: List[dict] = []
     todo = []
     for ev in evs:
         path = os.path.join(out_dir, f"{ev}.json")
         if os.path.exists(path) and not force:
             doc = C.read_json(path)
-            if _cached_ok(doc, want, swp_want, swp_broken):
+            if _cached_ok(doc, want, swp_want, swp_broken, st_want, st_broken):
                 results.append(doc)
                 continue
         try:
@@ -1573,6 +1780,7 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
     w = DEFAULT_WORKERS if workers is None else int(workers)
     w = max(1, min(MAX_WORKERS, w, len(todo) or 1))
     draws = swp_want["draws"] if swp_want else None     # the workers' draw count = the cache's
+    scope = st_want["scope"] if st_want else None       # ... and stress scope
     def _deferred(ev: str) -> dict:
         return {"event": ev, "deferred": True, "settled": True}
 
@@ -1581,11 +1789,12 @@ def run_day(et_day: str, variants=None, force=False, workers: Optional[int] = No
             if deadline is not None and time.time() >= deadline:
                 results.append(_deferred(ev))
                 continue
-            results.append(_day_worker(ev, variants, path, draws))
+            results.append(_day_worker(ev, variants, path, draws, scope))
     else:
         from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
         with ProcessPoolExecutor(max_workers=w, initializer=_lower_priority) as ex:
-            futs = {ex.submit(_day_worker, ev, variants, path, draws): ev for ev, path in todo}
+            futs = {ex.submit(_day_worker, ev, variants, path, draws, scope): ev
+                    for ev, path in todo}
             pending = set(futs)
             dl = deadline
             while pending:
@@ -1620,6 +1829,9 @@ def _print_event(res: dict) -> None:
     if res.get("swp_error"):
         print(f"{res['event']}: SWP FAILED (opt / cons kept): "
               + str(res["swp_error"]).splitlines()[0])
+    if res.get("stress_error"):
+        print(f"{res['event']}: STRESS FAILED (opt / cons / swp kept): "
+              + str(res["stress_error"]).splitlines()[0])
     cov = res["coverage"]
     print(f"{res['event']} settled={res['settled']} value={res['settlement_value']} "
           f"book_trusted={cov['book_trusted_frac']} trades={cov['trades']} "

@@ -346,60 +346,126 @@ class TestRuleEngine(unittest.TestCase):
         R.render_html(ctx)     # renders without the letter variants
 
 
+FAV_DEFAULTS = dict(DEFAULT_POLICY, live=True, quote_hours_et=None)
+FAV_VARIANTS = dict(VARIANTS,
+                    FAV_night={"live": False, "decided": True, "q_pad": 0,
+                               "quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]},
+                    FAV_night_agree={"live": False, "decided": True, "q_pad": 0,
+                                     "quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7],
+                                     "fav_market_min_p": 0.95})
+FAV_POLICY = R.Policy(FAV_DEFAULTS, FAV_VARIANTS)
+
+
+def srec(net, cal=None, fav_fills=None, draws=6):
+    """A stress (or swp) result: vrec + the Monte Carlo / tails extras."""
+    r = vrec(net)
+    r.update(draws=draws, net_sd=1.0, net_se=round(1.0 / draws ** 0.5, 6), filler_contracts=0.0,
+             draw_net=[net] * draws, net_cal=net + 1.0 if cal is None else cal,
+             stress_exact=False, fav_fills=fav_fills if fav_fills is not None else {})
+    return r
+
+
+def write_fav_days(day_nets, base=None, hours=range(24), agree=None, fav_hits=None,
+                   missing=()):
+    """Sim files whose events hold FAV_night|stress (and FAV_night_agree|stress)
+    with per-event nets: day_nets {day: net per event or [net per hour]};
+    agree likewise for FAV_night_agree (default = FAV_night's); base adds
+    B_pull|cons / |swp so the window has other variants; missing = events
+    written without any stress result."""
+    for day, nets in day_nets.items():
+        os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+        for i, h in enumerate(hours):
+            ev = event_ticker(day, h)
+            x = nets[i] if isinstance(nets, (list, tuple)) else nets
+            ag = (agree or {}).get(day, x)
+            y = ag[i] if isinstance(ag, (list, tuple)) else ag
+            variants = {"B_pull|cons": vrec(base if base is not None else 1.0),
+                        "B_pull|swp": srec(base if base is not None else 1.0)}
+            if ev not in missing:
+                variants["FAV_night|stress"] = srec(x)
+                variants["FAV_night_agree|stress"] = srec(y)
+                variants["FAV_night|swp"] = srec(x)
+                variants["FAV_night_agree|swp"] = srec(y)
+            rec = erec(ev, variants)
+            if fav_hits is not None:
+                rec["fav_hits"] = fav_hits
+            C.write_json_atomic(os.path.join(DATA, "sim", day, f"{ev}.json"), rec)
+
+
+def days_from(start, n):
+    return [(_dt.date.fromisoformat(start) + _dt.timedelta(days=i)).isoformat()
+            for i in range(n)]
+
+
 class TestWeekSummary(unittest.TestCase):
-    def _win(self, nets):
-        days = {}
-        for i, x in enumerate(nets):
-            day = (_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat()
-            evs = []
-            for h in (9, 10):
-                ev = event_ticker(day, h)
-                evs.append(erec(ev, {"B_pull|cons": vrec(x / 2), "B_pull|opt": vrec(x / 2 + 5),
-                                     "A_base|cons": vrec(x / 2 - 50)}))
-            days[day] = evs
-        return R.Window(days)
+    """Jack 2026-10-17 ("Yes. And Assume rewards are paid" / "1"): the day-7
+    week summary uses the adopted go-live rules -- the pre-registered tests
+    decide -- instead of the old GO / NO-GO / EXTEND thresholds on the best
+    variant's realized net."""
 
-    def _verdict(self, nets):
-        win = self._win(nets)
-        return R.week_summary(win, POLICY, R.agg_model(win.all_events))
-
-    def test_go(self):
-        w = self._verdict([600, 700, 800, 650, 900, -100, 700])
-        self.assertEqual(w["verdict"], "GO")
-        self.assertEqual(w["best"], "B_pull")
-        self.assertEqual(w["pos"], 6)
-        self.assertEqual(w["config"]["q_live"], 500)
-        self.assertTrue(any("Fill model" in r for r in w["risks"]))
-
-    def test_no_go(self):
-        self.assertEqual(self._verdict([-100, -200, 50, -300, 20, -10, -5])["verdict"], "NO-GO")
-
-    def test_extend_low_mean(self):
-        w = self._verdict([300, 200, 400, 300, 200, 100, 300])
-        self.assertEqual(w["verdict"], "EXTEND")
-        self.assertIn("mean", w["reason"])
-
-    def test_extend_too_few_positive_days(self):
-        w = self._verdict([2000, 2000, 2000, 2000, -10, -10, -10])
-        self.assertEqual(w["verdict"], "EXTEND")
-        self.assertIn("4 of 7", w["reason"])
-
-    def test_week_section_rendered_on_day_seven(self):
+    def setUp(self):
         clear_data()
-        rng = random.Random(2)
-        for i in range(7):
-            write_day((_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat(), rng,
-                      hours=range(6))
-        ctx = R.build_context("2026-10-21", policy=POLICY, with_health=False, now=NOW)
-        self.assertIsNotNone(ctx["week"])
+
+    def _ctx(self, day):
+        return R.build_context(day, policy=FAV_POLICY, with_health=False, now=NOW)
+
+    def test_day7_test_a_pass_is_pilot_eligible(self):
+        # 10/15-10/16 (before the windows) lose big: irrelevant to the tests
+        nets = {d: -50.0 for d in days_from("2026-10-15", 2)}
+        nets.update({d: 2.0 for d in days_from("2026-10-17", 5)})
+        write_fav_days(nets)
+        ctx = self._ctx("2026-10-21")
+        w = ctx["week"]
+        self.assertEqual(w["verdict"], "pilot eligible: FAV_night")
+        self.assertEqual(w["eligible"], ["FAV_night"])
+        self.assertEqual(w["best"], "FAV_night")
+        self.assertEqual(w["config"]["quote_hours_et"], [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertIn("1/3 size, night hours only, a $300 daily halt", w["pilot"])
+        self.assertIn("Test A (FAV_night, 10/17-10/21): PASS", w["reason"])
+        self.assertIn("Test B (FAV_night_agree, 10/18-10/22): in progress (4/5 days)", w["reason"])
+        self.assertNotIn("GO_MEAN_USD", dir(R))                 # the old bars are gone
+        self.assertTrue(any(r.startswith("Fill model (FAV_night") for r in w["risks"]))
         page = R.render_html(ctx)
-        self.assertIn("Week summary", page)
-        self.assertIn("Recommended starting config", page)
-        self.assertIn("Day 7 of 7", page)
-        self.assertIn("week:", R.subject_line(ctx))
-        ctx6 = R.build_context("2026-10-20", policy=POLICY, with_health=False, now=NOW)
+        for needle in ("Week summary", "Day 7 of 7", "pilot eligible: FAV_night",
+                       "Pilot config (FAV_night, rule 4)", "the old GO / NO-GO thresholds"):
+            self.assertIn(needle, page)
+        self.assertNotIn("Recommended starting config", page)
+        subj = R.subject_line(ctx)
+        self.assertTrue(subj.endswith("-- week: pilot eligible: FAV_night"), subj)
+        self.assertIn("Test A PASS (stress +$240), Test B in progress 4/5 (stress +$192)", subj)
+        self.assertIn("Week verdict: pilot eligible: FAV_night", R.render_text(ctx))
+        ctx6 = self._ctx("2026-10-20")
         self.assertIsNone(ctx6["week"])
         self.assertNotIn("Week summary", R.render_html(ctx6))
+
+    def test_day7_in_progress_then_no_go(self):
+        nets = {d: (-3.0 if d in ("2026-10-18", "2026-10-19") else 1.0)
+                for d in days_from("2026-10-17", 6)}
+        write_fav_days(nets)                 # 3 of 5 days positive: A and B fail
+        w7 = self._ctx("2026-10-21")["week"]
+        self.assertEqual(w7["verdict"], "in progress")        # B still running
+        self.assertIsNone(w7["best"])
+        page = R.render_html(self._ctx("2026-10-21"))
+        self.assertIn("No variant is eligible for a live pilot.", page)
+        ctx8 = self._ctx("2026-10-22")
+        self.assertEqual(ctx8["week"]["verdict"],
+                         "NO-GO (no variant passes the pre-registered tests)")
+        self.assertEqual([t["status"] for t in ctx8["tests"]], ["FAIL", "FAIL"])
+        self.assertIn("-- week: NO-GO (no variant passes the pre-registered tests)",
+                      R.subject_line(ctx8))
+
+    def test_week_needs_both_tests_finished_for_no_go(self):
+        self.assertEqual(R.prereg_verdict([{"variant": "a", "status": "FAIL"},
+                                           {"variant": "b", "status": "in progress"}]),
+                         "in progress")
+        self.assertEqual(R.prereg_verdict([{"variant": "a", "status": "FAIL"},
+                                           {"variant": "b", "status": "PASS"}]),
+                         "pilot eligible: b")
+        self.assertEqual(R.prereg_verdict([{"variant": "a", "status": "FAIL"},
+                                           {"variant": "b", "status": "FAIL"}]),
+                         "NO-GO (no variant passes the pre-registered tests)")
+        self.assertEqual(R.prereg_verdict([{"variant": "a", "status": "not started"}]),
+                         "in progress")
 
 
 class TestRenderAndHealth(unittest.TestCase):
@@ -412,23 +478,30 @@ class TestRenderAndHealth(unittest.TestCase):
             write_day(day, rng)
         write_day("2026-10-14", rng, hours=range(20, 24))       # partial day 0
         ctx = R.build_context("2026-10-17", policy=POLICY, with_health=True, now=NOW)
-        self.assertEqual(ctx["best_cons"], "D_size")
+        # cons / opt only (older sim output): the ranking falls back to cons
+        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("cons", "cons"))
+        self.assertEqual(ctx["best"], "D_size")
+        self.assertTrue(ctx["headline"]["pass"])
         self.assertEqual(len(ctx["events"]), 24)
         self.assertEqual(ctx["day0_events"], 4)
         page = R.render_html(ctx)
-        for needle in ("Day 3 of 7", "Best cons variant <b>D_size</b>", "Best opt variant",
+        for needle in ("Day 3 of 7", "Headline variant: <b>D_size</b>",
+                       "No stress results in the window", "the ranking uses cons",
+                       "Ranked on cons net", "Pre-registered tests",
                        "By ET hour of the event", "By strike class", "By minutes to close",
                        "By side", "Worst 5 events", "Market structure", "Model",
                        "Data health", "Cumulative to date", "d1", "d3", "Day 0 (partial, 4 events)"):
             self.assertIn(needle, page)
+        self.assertNotIn("Best cons variant", page)          # no single-day ranking
         self.assertNotIn("Week summary", page)
         win = ctx["win"]
         self.assertEqual(win.days, ["2026-10-15", "2026-10-16", "2026-10-17"])
         self.assertEqual(len(win.days_with("D_size|cons")), 3)
         subj = R.subject_line(ctx)
-        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): best D_size net +$"), subj)
-        self.assertIn("reward", subj)
-        self.assertIn("fills", subj)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): top D_size robust cons "
+                                        "+$"), subj)
+        self.assertIn("(P>0 1.00)", subj)
+        self.assertIn("Test A in progress 1/5 (stress $0), Test B starts 10/18", subj)
         # agg sanity: sum over events equals the day's figure
         a = ctx["agg"]["D_size|cons"]
         evs = ctx["events"]
@@ -596,7 +669,8 @@ class TestMain(unittest.TestCase):
         cmd = run.call_args[0][0]
         self.assertEqual(cmd[0], sys.executable)
         self.assertTrue(cmd[1].endswith("send_html_email.py"))
-        self.assertTrue(cmd[2].startswith("Temp shadow day 3 (2026-10-17): best D_size net"))
+        self.assertTrue(cmd[2].startswith("Temp shadow day 3 (2026-10-17): top D_size robust"),
+                        cmd[2])
         self.assertEqual(cmd[3], self.out)
         self.assertIn("D_size", cmd[4])
 
@@ -985,17 +1059,13 @@ class TestPartialLastDay(unittest.TestCase):
     def test_verdict_ignores_partial_last_day(self):
         self._write()
         now = C.parse_iso("2026-10-24T12:30:00Z")
-        w8 = R.build_context("2026-10-22", policy=POLICY, with_health=False, now=now)["week"]
-        self.assertEqual((w8["verdict"], w8["days"], w8["pos"]), ("GO", 8, 8))
-        self.assertAlmostEqual(w8["mean"], 520.0, places=6)
         ctx = R.build_context("2026-10-23", policy=POLICY, with_health=True, now=now)
         w9 = ctx["week"]
-        # before the fix: EXTEND, mean ~$484, 9 days, need 7
-        self.assertEqual(w9["verdict"], "GO")
-        self.assertEqual((w9["days"], w9["pos"], w9["need"]), (8, 8, 6))
-        self.assertAlmostEqual(w9["mean"], 520.0, places=6)
-        self.assertEqual(w9["partial_days"], ["2026-10-23"])
-        self.assertIn("partial last day 2026-10-23 (8 events", w9["reason"])
+        # the week verdict is the pre-registered tests' (their windows end
+        # 10/21 and 10/22, before the partial last day); B_pull alone has no
+        # results for their variants, so they wait
+        self.assertEqual(w9["verdict"], "in progress")
+        self.assertEqual([t["end"] for t in ctx["tests"]], ["2026-10-21", "2026-10-22"])
         win = ctx["win"]
         self.assertEqual(win.partial, {"2026-10-23"})
         self.assertAlmostEqual(win.per_day("B_pull|cons"), 520.0, places=6)   # weighted 8/24
@@ -1291,7 +1361,9 @@ def swp_nets(rng, nets):
     return out
 
 
-def write_day_swp(day, rng, hours=range(24), losing_hours=()):
+def write_day_swp(day, rng, hours=range(24), losing_hours=(), stress=False):
+    """opt / cons / swp (and with stress=True "|stress" = swp - 1 for every
+    variant) per event."""
     os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
     for h in hours:
         ev = event_ticker(day, h)
@@ -1308,6 +1380,12 @@ def write_day_swp(day, rng, hours=range(24), losing_hours=()):
                      filler_contracts=0.0 if n == "G_decidedonly" else 900.0,
                      net_cal=sw[n] + 1.5, swp_exact=n == "G_decidedonly")
             variants[f"{n}|swp"] = r
+            if stress:
+                st = vrec(sw[n] - 1.0)
+                st.update(draws=8, net_sd=2.0, net_se=round(2.0 / 8 ** 0.5, 6),
+                          filler_contracts=0.0 if n == "G_decidedonly" else 950.0,
+                          net_cal=sw[n] + 0.5, stress_exact=False, fav_fills={})
+                variants[f"{n}|stress"] = st
         C.write_json_atomic(os.path.join(DATA, "sim", day, f"{ev}.json"),
                             erec(ev, variants))
 
@@ -1321,45 +1399,53 @@ POLICY_LIVE = R.Policy(dict(DEFAULT_POLICY, live=True),
 
 
 class TestSwpHeadline(unittest.TestCase):
-    """Jack 2026-10-16, "1": the sweep-aware report column. Three fill-model
-    columns; the headline best variant, the rules, the cumulative days + and
-    the week verdict on swp; the subject says swp; net_cal shown as
-    "expected (calibrated tails)" with its caveat."""
+    """Jack 2026-10-16, "1": the sweep-aware report column; since 10/17
+    (Jack: "1") the stress column beside it, the ranking / tests / verdict
+    on stress, the tweak rules still on swp; net_cal shown as "expected
+    (calibrated tails)" with its caveat."""
 
     def setUp(self):
         clear_data()
 
-    def test_three_columns_and_best_on_swp(self):
+    def test_four_columns_and_ranking_on_stress(self):
         rng = random.Random(21)
         for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
-            write_day_swp(day, rng)
+            write_day_swp(day, rng, stress=True)
         ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
-        self.assertEqual(ctx["fill"], "swp")
+        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("stress", "swp"))
         self.assertEqual(ctx["best"], "G_decidedonly")
-        self.assertEqual(ctx["best_swp"], "G_decidedonly")
-        self.assertEqual(ctx["best_cons"], "D_size")               # cons would have said D
+        self.assertTrue(ctx["headline"]["pass"])
+        self.assertEqual(ctx["rank"][0]["name"], "G_decidedonly")
         self.assertEqual(ctx["win"].best("swp"), "G_decidedonly")
+        self.assertNotIn("best_cons", ctx)                          # no single-day ranking
         page = R.render_html(ctx)
-        for needle in ("Best swp variant <b>G_decidedonly</b>", "Monte Carlo se",
-                       "Chosen on swp net", ">opt</th>", ">cons</th>", ">swp (sweep-aware)</th>",
+        for needle in ("Headline variant: <b>G_decidedonly</b>", ">opt</th>", ">cons</th>",
+                       ">swp (sweep-aware)</th>", ">stress (decision model)</th>",
                        "+/- mc se", "1c fillers", "expected (cal. tails)",
                        "swp = the sweep-aware fill model", "Mean of 8 Monte Carlo draws",
+                       "stress = swp plus level-clears at every price",
                        "Expected (calibrated tails) = reward", "an ESTIMATE",
-                       "Best cons variant D_size", "swp sum", "swp /day", "cons sum", "opt sum",
-                       "days + and the day columns are swp net", "Pairs use the swp fill model",
-                       "Variant G_decidedonly (swp fills, the sweep-aware model; means over 8 Monte Carlo"):
+                       "stress robust", "stress sum", "stress /day", "swp sum", "cons sum",
+                       "opt sum", "days + and the day columns are stress net",
+                       "Pairs use the swp fill model", "Ranked on stress net",
+                       "robust stress total", "noise-dominated",
+                       "Variant G_decidedonly (stress fills, the decision model; means over 8 "
+                       "Monte Carlo draws; the headline variant)"):
             self.assertIn(needle, page)
-        # the variants table: one group of columns per fill model, opt / cons / swp
+        # the variants table: one group of columns per fill model, opt / cons / swp / stress
         self.assertLess(page.index(">opt</th>"), page.index(">cons</th>"))
         self.assertLess(page.index(">cons</th>"), page.index(">swp (sweep-aware)</th>"))
+        self.assertLess(page.index(">swp (sweep-aware)</th>"),
+                        page.index(">stress (decision model)</th>"))
         subj = R.subject_line(ctx)
-        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): best G_decidedonly net +$"),
-                        subj)
-        self.assertIn("/day on swp (reward", subj)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): top G_decidedonly "
+                                        "robust stress +$"), subj)
+        self.assertNotIn("/day on", subj)
         txt = R.render_text(ctx)
-        self.assertIn("G_decidedonly (swp)", txt)
+        self.assertIn("G_decidedonly on the report day (stress)", txt)
         self.assertIn("Monte Carlo se", txt)
         self.assertIn("expected at calibrated tails", txt)
+        self.assertIn("Ranking on robust stress totals", txt)
         # aggregates: Monte Carlo se adds in quadrature, net_cal and fillers sum
         a = ctx["agg"]["G_decidedonly|swp"]
         self.assertAlmostEqual(a["net_se"], math.sqrt(24) * 2.0 / math.sqrt(8), places=4)
@@ -1406,34 +1492,37 @@ class TestSwpHeadline(unittest.TestCase):
                          "stop quoting those settle hours: quote_hours_et all -> "
                          + "[" + ",".join(str(h) for h in keep) + "]")
 
-    def test_week_verdict_on_swp(self):
+    def test_week_verdict_without_the_test_variants_waits(self):
+        # a positive swp-best variant (G, ~$24/day) no longer makes a week
+        # verdict: the pre-registered tests decide, and their variants have
+        # no stress results here, so the tests wait ("in progress")
         rng = random.Random(25)
         for i in range(7):
             write_day_swp((_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat(), rng,
                           hours=range(6))
         ctx = R.build_context("2026-10-21", policy=POLICY_LIVE, with_health=False, now=NOW)
         w = ctx["week"]
-        self.assertEqual(w["fill"], "swp")
-        self.assertEqual(w["best"], "G_decidedonly")
-        self.assertEqual(w["verdict"], "EXTEND")      # positive every day, ~$24/day < $500
-        self.assertEqual(w["pos"], 7)
-        self.assertTrue(any(r.startswith("Fill model: swp") and "Monte Carlo se" in r
-                            and "expected at calibrated tails" in r for r in w["risks"]),
-                        w["risks"])
-        self.assertIn("-- week: EXTEND", R.subject_line(ctx))
+        self.assertEqual(w["verdict"], "in progress")
+        self.assertIsNone(w["best"])
+        self.assertEqual(ctx["tests"][0]["status"], "in progress")    # 10/17-10/21 events lack it
+        self.assertEqual(len(ctx["tests"][0]["missing"]), 30)
+        self.assertIn("event(s) without stress results (waiting for the re-sim)",
+                      ctx["tests"][0]["text"])
+        self.assertIn("-- week: in progress", R.subject_line(ctx))
 
     def test_older_output_without_swp_falls_back_to_cons(self):
         rng = random.Random(27)
         write_day("2026-10-15", rng)
         ctx = R.build_context("2026-10-15", policy=POLICY, with_health=False, now=NOW)
-        self.assertEqual(ctx["fill"], "cons")
-        self.assertEqual(ctx["best"], ctx["best_cons"])
+        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("cons", "cons"))
+        self.assertEqual(ctx["best"], ctx["rank"][0]["name"])
         self.assertIn("No swp results in the window", " ".join(ctx["notes"]))
         page = R.render_html(ctx)
-        self.assertIn("Best cons variant", page)
-        self.assertIn("the headline uses cons", page)
+        self.assertIn("No stress results in the window (sim output from before SIM_VERSION 7): "
+                      "the ranking uses cons", page)
         self.assertNotIn(">swp (sweep-aware)</th>", page)
-        self.assertIn("/day on cons (reward", R.subject_line(ctx))
+        self.assertNotIn(">stress (decision model)</th>", page)
+        self.assertIn("robust cons", R.subject_line(ctx))
 
 
 class TestSwpFixPass(unittest.TestCase):
@@ -1469,8 +1558,11 @@ class TestSwpFixPass(unittest.TestCase):
         self.assertFalse(R.cal_ok(POLICY, "G_decidedonly"))         # live unknown -> not shown
         self.assertFalse(R.cal_ok(POLICY_LIVE, "Z_unknown"))
         page = R.render_html(ctx)
-        a = ctx["agg"]["G_decidedonly|swp"]
-        self.assertIn(f"Expected (calibrated tails): {R.m_html(a['net_cal'])}", page)
+        top = ctx["rank"][0]
+        self.assertEqual(top["name"], "G_decidedonly")
+        self.assertAlmostEqual(top["cal"], ctx["win"].total("G_decidedonly|swp", "net_cal"))
+        self.assertIn(f"expected (calibrated tails) {R.m_html(top['cal'])}", page)
+        self.assertTrue(all(r["cal"] is None for r in ctx["rank"][1:]))   # live-quoting: none
         # the variants table and the cumulative table: G's figure, (circular) for the rest
         rows = R._variant_rows(ctx, ["opt", "cons", "swp"])
         g_row = [r for r in rows if "G_decidedonly" in str(r[0])][0]
@@ -1493,24 +1585,13 @@ class TestSwpFixPass(unittest.TestCase):
         ctx = R.build_context("2026-10-17", policy=pol_, with_health=False, now=NOW)
         self.assertEqual(ctx["best"], "G_decidedonly")
         page = R.render_html(ctx)
-        self.assertNotIn("Expected (calibrated tails): ", page)
-        self.assertIn("No calibrated-tails expectation: G_decidedonly quotes live strikes", page)
+        self.assertNotIn("expected (calibrated tails) <span", page)
+        self.assertIn("no calibrated-tails expectation (it quotes live strikes: circular)", page)
+        self.assertIsNone(ctx["rank"][0]["cal"])
         txt = R.render_text(ctx)
         self.assertNotIn("expected at calibrated tails", txt)
         self.assertIn("no calibrated-tails expectation (it quotes live strikes: circular)", txt)
         self.assertEqual(R._cumulative_html(ctx).count(f">{R.CIRCULAR}<"), len(VARIANTS))
-        # the week risks line leaves it out too
-        clear_data()
-        rng = random.Random(25)
-        for i in range(7):
-            write_day_swp((_dt.date(2026, 10, 15) + _dt.timedelta(days=i)).isoformat(), rng,
-                          hours=range(6))
-        w = R.build_context("2026-10-21", policy=pol_, with_health=False, now=NOW)["week"]
-        fm = [r for r in w["risks"] if r.startswith("Fill model: swp")]
-        self.assertEqual(len(fm), 1)
-        self.assertNotIn("calibrated tails", fm[0])
-        w2 = R.build_context("2026-10-21", policy=POLICY_LIVE, with_health=False, now=NOW)["week"]
-        self.assertTrue(any("expected at calibrated tails" in r for r in w2["risks"]))
 
     def test_events_without_swp_are_counted(self):
         self._days(hours=range(6))
@@ -1630,13 +1711,14 @@ class TestSwpFixPass(unittest.TestCase):
             t0 = time.time()
             err, summary = R.run_sim("2026-10-17", budget_min=7.0)
         self.assertIsNone(err)
-        self.assertEqual([c[0] for c in calls], ["2026-10-17", "2026-10-15", "2026-10-16"])
+        # earlier days newest first (10/17: the test windows are the latest days)
+        self.assertEqual([c[0] for c in calls], ["2026-10-17", "2026-10-16", "2026-10-15"])
         self.assertIsNone(calls[0][1])                     # the report day: no deadline
         for _, dl in calls[1:]:
             self.assertAlmostEqual(dl, t0 + 420.0, delta=5.0)
         w = summary["window"]
-        self.assertEqual(w["deferred"], [event_ticker("2026-10-15", 1),
-                                         event_ticker("2026-10-16", 1)])
+        self.assertEqual(w["deferred"], [event_ticker("2026-10-16", 1),
+                                         event_ticker("2026-10-15", 1)])
         self.assertEqual(w["budget_min"], 7.0)
         self.assertEqual(len(w["swp_errors"]), 2)
         self.assertEqual(R.RESIM_BUDGET_MIN, 80.0)
@@ -1667,6 +1749,301 @@ class TestSwpFixPass(unittest.TestCase):
         self.assertEqual(rc_with(ok, deferred), 0)          # a deferral is the budget working
         self.assertEqual(rc_with(swp_bad, ok), 1)           # swp failed (opt / cons kept)
         self.assertEqual(rc_with(ok, swp_bad), 1)
+        stress_bad = [{"event": event_ticker("2026-10-16", 2), "variants": {}, "settled": True,
+                       "stress_error": "stress run failed: X"}]
+        self.assertEqual(rc_with(stress_bad, ok), 1)        # stress failed (the rest kept)
+        self.assertEqual(rc_with(ok, stress_bad), 1)
+
+
+def _ev_rec(day, h, variants, **extra):
+    rec = erec(event_ticker(day, h), variants)
+    rec.update(extra)
+    return rec
+
+
+def _win_from(nets_by_variant, day="2026-10-17", fill="stress"):
+    """A one-day Window whose event h holds name|fill = nets[h]."""
+    n = max(len(v) for v in nets_by_variant.values())
+    evs = []
+    for h in range(n):
+        variants = {f"{name}|{fill}": srec(nets[h]) for name, nets in nets_by_variant.items()
+                    if h < len(nets)}
+        evs.append(_ev_rec(day, h, variants))
+    return R.Window({day: evs})
+
+
+class TestRobustRanking(unittest.TestCase):
+    """Jack 2026-10-17, "1": the 10/17 email headlined "best I_pads_only net
+    +$1,480/day on swp", a fluke of two upset hours. The headline now ranks
+    variants on STRESS net over the cumulative window without each one's
+    best and worst hour, and names the top one only when that robust total
+    is > 0 and P(total > 0) >= 0.8; a single day's net ranks nothing."""
+
+    def test_robust_total_ci_and_flags(self):
+        steady = [5.0] * 20
+        fluke = [-10.0] * 19 + [600.0]                    # one upset hour carries it
+        win = _win_from({"Steady": steady, "Fluke": fluke})
+        rows = R.rank_variants(win, FAV_POLICY)
+        self.assertEqual([r["name"] for r in rows], ["Steady", "Fluke"])
+        s, f = rows
+        self.assertEqual((s["total"], s["robust"], s["hours"]), (100.0, 90.0, 20))
+        self.assertEqual((s["p_pos"], s["noise"], s["passes"]), (1.0, False, True))
+        self.assertEqual((s["ci_lo"], s["ci_hi"]), (100.0, 100.0))
+        self.assertEqual(f["total"], 410.0)                # the plain total ranks it first ...
+        self.assertEqual(f["robust"], 410.0 - 600.0 + 10.0)   # ... the robust total last
+        self.assertEqual((f["best"], f["worst"]), (600.0, -10.0))
+        self.assertTrue(f["noise"])                        # 600 + 10 > 410
+        self.assertFalse(f["passes"])
+        self.assertLess(f["ci_lo"], 0.0)
+        self.assertLess(f["ci_lo"], f["ci_hi"])
+        # reproducible: the bootstrap has a fixed seed
+        self.assertEqual(R.rank_variants(win, FAV_POLICY), rows)
+        self.assertEqual(R.boot_total([]), (None, None, None))
+        self.assertIsNone(R.robust_total([3.0]))
+        self.assertEqual(R.robust_total([3.0, -1.0]), 0.0)
+        hl = R.headline_pick(rows)
+        self.assertTrue(hl["pass"])
+        self.assertIs(hl["pick"], s)
+        self.assertEqual(R.headline_phrase(hl, subject=True),
+                         "top Steady robust stress +$90 (P>0 1.00)")
+
+    def test_no_variant_passes(self):
+        # positive robust total but P(total > 0) < 0.8; and a negative one
+        noisy = [40.0, -35.0, 30.0, -28.0, 25.0, -20.0, 22.0, -30.0, 12.0, 9.0]
+        win = _win_from({"Noisy": noisy, "Loser": [-2.0] * 10})
+        rows = R.rank_variants(win, FAV_POLICY)
+        top = rows[0]
+        self.assertEqual(top["name"], "Noisy")
+        self.assertGreater(top["robust"], 0.0)
+        self.assertLess(top["p_pos"], R.HEADLINE_P_MIN)
+        hl = R.headline_pick(rows)
+        self.assertFalse(hl["pass"])
+        self.assertIsNone(hl["pick"])
+        self.assertEqual(R.headline_phrase(hl, subject=True), "no variant passes")
+        self.assertTrue(R.headline_phrase(hl).startswith(
+            "no variant passes (top robust stress total, for information: Noisy +$"))
+
+    def test_a_lower_rank_that_passes_is_named_as_such(self):
+        hi_var = [60.0, -55.0, 50.0, -45.0, 52.0, -40.0, 45.0, -50.0, 48.0, -20.0]  # P < 0.8
+        steady = [1.0] * 10
+        win = _win_from({"Wild": hi_var, "Steady": steady})
+        rows = R.rank_variants(win, FAV_POLICY)
+        self.assertEqual(rows[0]["name"], "Wild")
+        hl = R.headline_pick(rows)
+        self.assertFalse(hl["pass"])
+        self.assertEqual(hl["pick"]["name"], "Steady")
+        self.assertIn("top robust Wild does not pass; Steady does", R.headline_phrase(hl, True))
+
+    def test_in_sample_variant_is_never_the_headline(self):
+        # FAV_night_agree's rule was chosen from 10/16's hours (pre-registered:
+        # "judged ONLY on later data"): on a window holding days before 10/18
+        # it is listed, flagged, and never named -- even when it would pass
+        clear_data()
+        write_fav_days({d: -1.0 for d in days_from("2026-10-15", 3)},
+                       agree={d: 2.0 for d in days_from("2026-10-15", 3)})
+        ctx = R.build_context("2026-10-17", policy=FAV_POLICY, with_health=False, now=NOW)
+        rows = {r["name"]: r for r in ctx["rank"]}
+        ag = rows["FAV_night_agree"]
+        self.assertEqual(ag["rank"], 1)
+        self.assertGreater(ag["robust"], 0)
+        self.assertEqual(ag["p_pos"], 1.0)
+        self.assertTrue(ag["in_sample"])
+        self.assertEqual(ag["judged_from"], "2026-10-18")
+        self.assertFalse(ag["passes"])
+        self.assertFalse(rows["FAV_night"]["in_sample"])
+        hl = ctx["headline"]
+        self.assertEqual(hl["top"]["name"], "FAV_night")
+        self.assertIsNone(hl["pick"])
+        self.assertEqual([r["name"] for r in hl["in_sample"]], ["FAV_night_agree"])
+        self.assertEqual(ctx["best"], "FAV_night")
+        subj = R.subject_line(ctx)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): no variant passes; "
+                                        "Test A in progress 1/5 (stress -$24), Test B starts "
+                                        "10/18"), subj)
+        page = R.render_html(ctx)
+        self.assertIn("(in-sample: judged only from 10/18, Test B)", page)
+        self.assertIn("in-sample, not evidence", page)
+        self.assertIn("never in this headline", R.render_text(ctx))
+        self.assertEqual(R.judged_from(), {"FAV_night_agree": "2026-10-18"})
+
+    def test_report_day_net_never_ranks_the_headline(self):
+        # the 10/17 case: on the report day "Fluke" wins big (an upset hour);
+        # over the window "Steady" earns every hour. The headline, the subject
+        # and the variants table follow the robust ranking.
+        clear_data()
+        for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
+            os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+            for h in range(24):
+                fl = 1480.0 if (day == "2026-10-17" and h == 4) else -3.0
+                variants = {"Steady|stress": srec(2.0), "Fluke|stress": srec(fl),
+                            "Steady|swp": srec(2.0), "Fluke|swp": srec(fl)}
+                C.write_json_atomic(os.path.join(DATA, "sim", day,
+                                                 f"{event_ticker(day, h)}.json"),
+                                    _ev_rec(day, h, variants))
+        ctx = R.build_context("2026-10-17", policy=FAV_POLICY, with_health=False, now=NOW)
+        self.assertGreater(ctx["agg"]["Fluke|stress"]["net"], ctx["agg"]["Steady|stress"]["net"])
+        self.assertEqual(ctx["best"], "Steady")
+        self.assertEqual([r["name"] for r in ctx["rank"]], ["Steady", "Fluke"])
+        subj = R.subject_line(ctx)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): top Steady robust "
+                                        "stress +$140 (P>0 1.00)"), subj)
+        self.assertNotIn("Fluke", subj)
+        page = R.render_html(ctx)
+        rows = R._variant_rows(ctx, ["swp", "stress"])
+        self.assertIn("Steady", str(rows[0][0]))           # the table in the ranking's order
+        self.assertIn("A single day&#x27;s net ranks nothing", page)
+        fl = [r for r in ctx["rank"] if r["name"] == "Fluke"][0]
+        self.assertTrue(fl["noise"])
+        self.assertIn("NOISE", page)
+
+
+def _fav_hits(rows):
+    return [[f"T{i}", b, n, u, sl, 100.0, 0.0] for i, (b, n, u, sl) in enumerate(rows)]
+
+
+class TestPreregisteredTests(unittest.TestCase):
+    """TEMP_SHADOW.md "Pre-registered tests" (eff9cd3): Test A (FAV_night, ET
+    10/17-10/21: total > 0, >= 4 of 5 days > 0, calibrated tails > 0) and
+    Test B (FAV_night_agree, 10/18-10/22: the same plus the total without
+    its best and worst hour > 0); "in progress (n/5 days)" until the window
+    completes, then PASS / FAIL; the recent-regime figure beside the
+    table-based one."""
+
+    def setUp(self):
+        clear_data()
+
+    def _ctx(self, day):
+        return R.build_context(day, policy=FAV_POLICY, with_health=False, now=NOW)
+
+    def test_definitions_are_the_preregistered_ones(self):
+        a, b = R.PREREG_TESTS
+        self.assertEqual((a["id"], a["variant"], a["start"], a["end"]),
+                         ("A", "FAV_night", "2026-10-17", "2026-10-21"))
+        self.assertEqual(a["criteria"], ("total", "days", "cal"))
+        self.assertIn("robust", a["info"])                 # reported for information
+        self.assertEqual((b["id"], b["variant"], b["start"], b["end"]),
+                         ("B", "FAV_night_agree", "2026-10-18", "2026-10-22"))
+        self.assertEqual(b["criteria"], ("total", "days", "robust", "cal"))
+        self.assertIn("recent", b["info"])
+        self.assertEqual(R.PREREG_DAYS_POS, 4)
+
+    def test_status_progression_and_subject(self):
+        write_fav_days({d: -1.0 for d in days_from("2026-10-15", 3)})
+        before = self._ctx("2026-10-16")
+        self.assertEqual([t["status"] for t in before["tests"]], ["not started"] * 2)
+        self.assertEqual([t["text"] for t in before["tests"]], ["starts 10/17", "starts 10/18"])
+        ctx = self._ctx("2026-10-17")
+        a, b = ctx["tests"]
+        self.assertEqual((a["status"], a["text"]), ("in progress", "in progress (1/5 days)"))
+        self.assertEqual(b["text"], "starts 10/18")
+        self.assertEqual(a["total"], -24.0)
+        self.assertEqual(ctx["prereg_verdict"], "in progress")
+        subj = R.subject_line(ctx)
+        # the task's example: "...: no variant passes; Test A in progress 1/5
+        # (stress -$X), Test B starts 10/18"
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): no variant passes; "
+                                        "Test A in progress 1/5 (stress -$24), Test B starts "
+                                        "10/18"), subj)
+        page = R.render_html(ctx)
+        for needle in ("Pre-registered verdict: ", "in progress (1/5 days)",
+                       "Test A -- FAV_night (rule 3): ET days 2026-10-17 .. 2026-10-21",
+                       "Test B -- FAV_night_agree", "the window&#x27;s total stress net &gt; 0",
+                       "not met", "(so far)", "RECENT REGIME", "TABLE-BASED"):
+            self.assertIn(needle, page)
+
+    def test_pass_fail_on_each_criterion(self):
+        window = days_from("2026-10-17", 6)
+        # A: +24 a day on every day -> PASS; B identical -> PASS
+        write_fav_days({d: 1.0 for d in window})
+        a, b = self._ctx("2026-10-22")["tests"]
+        self.assertEqual((a["status"], b["status"]), ("PASS", "PASS"))
+        self.assertEqual((a["pos_days"], a["days_done"]), (5, 5))
+        self.assertEqual(self._ctx("2026-10-22")["prereg_verdict"],
+                         "pilot eligible: FAV_night, FAV_night_agree")
+        # total > 0 but only 3 of 5 positive days -> FAIL (A and B)
+        clear_data()
+        nets = {d: 10.0 if d in ("2026-10-17", "2026-10-20", "2026-10-21", "2026-10-22") else -0.5
+                for d in window}
+        write_fav_days(nets)
+        a, b = self._ctx("2026-10-22")["tests"]
+        self.assertGreater(a["total"], 0)
+        self.assertEqual(a["pos_days"], 3)
+        self.assertEqual(a["status"], "FAIL")
+        self.assertFalse(a["crit"]["days"]["met"])
+        self.assertEqual(b["pos_days"], 3)
+        self.assertEqual(b["status"], "FAIL")
+        # B only: the robust criterion -- one huge hour carries the window
+        clear_data()
+        agree = {d: ([-20.0] * 23 + [500.0] if d == "2026-10-19" else [0.3] * 24)
+                 for d in window}
+        write_fav_days({d: 1.0 for d in window}, agree=agree)
+        a, b = self._ctx("2026-10-22")["tests"]
+        self.assertEqual(a["status"], "PASS")
+        self.assertGreater(b["total"], 0)
+        self.assertEqual(b["pos_days"], 5)
+        self.assertLess(b["robust"], 0)                    # without its +500 hour
+        self.assertEqual(b["status"], "FAIL")
+        self.assertFalse(b["crit"]["robust"]["met"])
+        # the calibrated-tails criterion: net_cal <= 0 fails even when the
+        # realized nets pass
+        clear_data()
+        for d in window:
+            os.makedirs(os.path.join(DATA, "sim", d), exist_ok=True)
+            for h in range(24):
+                variants = {"FAV_night|stress": srec(1.0, cal=-0.5),
+                            "FAV_night_agree|stress": srec(1.0, cal=0.5)}
+                C.write_json_atomic(os.path.join(DATA, "sim", d, f"{event_ticker(d, h)}.json"),
+                                    _ev_rec(d, h, variants))
+        a, b = self._ctx("2026-10-22")["tests"]
+        self.assertEqual(a["cal"], -0.5 * 24 * 5)
+        self.assertEqual((a["status"], b["status"]), ("FAIL", "PASS"))
+        self.assertEqual(self._ctx("2026-10-22")["prereg_verdict"],
+                         "pilot eligible: FAV_night_agree")
+
+    def test_missing_stress_keeps_it_in_progress(self):
+        window = days_from("2026-10-17", 6)
+        write_fav_days({d: 1.0 for d in window},
+                       missing=(event_ticker("2026-10-19", 5),))
+        ctx = self._ctx("2026-10-22")
+        a, b = ctx["tests"]
+        self.assertEqual(a["status"], "in progress")
+        self.assertEqual(a["missing"], [event_ticker("2026-10-19", 5)])
+        self.assertIn("1 event(s) without stress results (waiting for the re-sim)", a["text"])
+        self.assertEqual(ctx["stress_missing"]["total"], 1)
+        self.assertIn("[1 events without stress]", R.subject_line(ctx))
+        self.assertIn("1 of 144 event(s) in the window have no stress results",
+                      R.render_html(ctx))
+
+    def test_recent_regime_figure(self):
+        # the recorded period's favorite-bid hits: >0.995 lost 2 of 40 (5%),
+        # 0.97-0.99 lost 1 of 20 (5%)
+        hits = _fav_hits([(">0.995", 20, 1, 0.02), (">0.995", 20, 1, 0.02),
+                          ("0.97-0.99", 20, 1, 0.4)])
+        ff = {">0.995": {"contracts": 300.0, "cost": 294.0, "pnl_cal": 5.7},
+              "0.97-0.99": {"contracts": 100.0, "cost": 95.0, "pnl_cal": 3.0}}
+        d = "2026-10-17"
+        os.makedirs(os.path.join(DATA, "sim", d), exist_ok=True)
+        for h in range(2):
+            variants = {"FAV_night|stress": srec(1.0, cal=10.0, fav_fills=ff),
+                        "FAV_night_agree|stress": srec(1.0, cal=10.0)}
+            C.write_json_atomic(os.path.join(DATA, "sim", d, f"{event_ticker(d, h)}.json"),
+                                _ev_rec(d, h, variants, fav_hits=hits if h == 0 else []))
+        ctx = self._ctx(d)
+        rec = ctx["recent"]
+        self.assertEqual(rec["hours"], 2)
+        self.assertAlmostEqual(rec["buckets"][">0.995"]["rate"], 0.05)
+        self.assertAlmostEqual(rec["buckets"]["0.97-0.99"]["rate"], 0.05)
+        self.assertAlmostEqual(rec["buckets"][">0.995"]["model"], 0.04 / 40)
+        a = ctx["tests"][0]
+        # per hour: 10 - 5.7 - 3.0 + 300 x 0.95 - 294 + 100 x 0.95 - 95 = -7.7
+        self.assertAlmostEqual(a["recent"], 2 * (10.0 - 5.7 - 3.0 + 285.0 - 294.0 + 95.0 - 95.0))
+        self.assertAlmostEqual(a["cal"], 20.0)
+        page = R.render_html(ctx)
+        self.assertIn("Recent regime (the tests&#x27; second calibrated-tails figure)", page)
+        self.assertIn("&gt;0.995: 5.0%", page)
+        # without fav_fills (older sim files) the recent figure is n/a
+        self.assertIsNone(R.recent_cal([{"net_cal": 1.0}], rec))
+        self.assertEqual(R.recent_cal([srec(1.0, cal=2.0)], rec), 2.0)   # no favorite fills
 
 if __name__ == "__main__":
     unittest.main()

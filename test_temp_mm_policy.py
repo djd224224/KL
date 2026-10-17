@@ -848,12 +848,12 @@ class TestQuoteHoursAndFav(unittest.TestCase):
         # the favorite floor is FAV_* only: every earlier variant keeps 0
         self.assertEqual(pol.DEFAULT_POLICY["fav_min_price_c"], 0)
         self.assertEqual(sorted(n for n, ov in pol.VARIANTS.items() if "fav_min_price_c" in ov),
-                         ["FAV_night", "FAV_only"])
+                         ["FAV_night", "FAV_night_agree", "FAV_only"])
         for bad in (-1, 100, 50.0, "50", True, None):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 pol._check_policy(P(fav_min_price_c=bad))
         self.assertEqual([n for n, ov in pol.VARIANTS.items() if ov.get("quote_hours_et")],
-                         ["FAV_night"])
+                         ["FAV_night", "FAV_night_agree"])
         for v in pol.VARIANTS:
             pol._check_policy(P(v))
         for bad in ([24], [-1], ["7"], [7.0], "20,21", 7, [True]):
@@ -1007,6 +1007,174 @@ class TestQuoteHoursAndFav(unittest.TestCase):
         dy, dn, _ = pol.quote_market(P("FAV_only"), b2, 0.999, None, False, True, 300,
                                      NORISK, 1000.0)
         self.assertEqual((dy, dn), ({79: 300.0}, {}))
+
+
+class TestMarketAgreement(unittest.TestCase):
+    """Jack 2026-10-17, "1": pre-register the agreement rule (TEMP_SHADOW.md
+    "Pre-registered tests", Test B). fav_market_min_p: a favorite join only
+    when the MARKET's favorite probability on the external book at decision
+    time is >= it -- both sides bid: (best favorite bid + (100 - best
+    longshot bid)) / 200; the longshot side empty: (best favorite bid + 1) /
+    100; the favorite side empty: no join. FAV_night_agree = FAV_night +
+    0.95; the model condition (fav_min_p 0.97) is unchanged."""
+    NIGHT = [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]
+
+    def test_variant_and_default(self):
+        self.assertIsNone(pol.DEFAULT_POLICY["fav_market_min_p"])
+        self.assertEqual(P("FAV_night_agree"), dict(P("FAV_night"), fav_market_min_p=0.95))
+        self.assertEqual(P("FAV_night_agree")["fav_min_p"], 0.97)
+        self.assertEqual([n for n, ov in pol.VARIANTS.items() if "fav_market_min_p" in ov],
+                         ["FAV_night_agree"])
+        for v in pol.VARIANTS:
+            pol._check_policy(P(v))
+        for ok in (None, 0, 0.0, 0.5, 0.95, 1, 1.0):
+            pol._check_policy(P(fav_market_min_p=ok))
+        for bad in (-0.01, 1.01, "0.95", True, float("nan"), float("inf"), [0.95]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                pol._check_policy(P(fav_market_min_p=bad))
+
+    def test_market_fav_prob_definition(self):
+        mp = pol.market_fav_prob
+        # both sides bid: the mid, in the favorite's space
+        self.assertEqual(mp(pol.BookView({96: 300.0}, {3: 50.0}), "yes"), (96 + 97) / 200.0)
+        self.assertEqual(mp(pol.BookView({3: 50.0}, {96: 300.0}), "no"), (96 + 97) / 200.0)
+        # the same book from the other side is the complement
+        b = pol.BookView({90: 10.0, 85: 500.0}, {8: 20.0, 2: 900.0})
+        self.assertAlmostEqual(mp(b, "yes") + mp(b, "no"), 1.0)
+        self.assertEqual(mp(b, "yes"), (90 + 92) / 200.0)        # best bids, any size
+        # the longshot side empty (locked / one-sided): best favorite bid + 1c
+        self.assertEqual(mp(pol.BookView({97: 400.0, 95: 10.0}, {}), "yes"), 0.98)
+        self.assertEqual(mp(pol.BookView({}, {94: 1.0}), "no"), 0.95)
+        self.assertEqual(mp(pol.BookView({99: 5.0}, {}), "yes"), 1.0)
+        # the favorite side empty: None (no join)
+        self.assertIsNone(mp(pol.BookView({}, {3: 100.0}), "yes"))
+        self.assertIsNone(mp(pol.BookView({}, {}), "no"))
+        with self.assertRaises(ValueError):
+            mp(b, "up")
+        # an external book: our own resting orders never count as the market
+        y, n = pol.external_book({97: 300.0, 90: 200.0}, {6: 100.0}, {97: 300.0}, {})
+        self.assertEqual(mp(pol.BookView(y, n), "yes"), (90 + 94) / 200.0)
+
+    def _q(self, variant, book, fair, diag=None, **over):
+        return pol.quote_market(P(variant, **over), book, fair, None, False, True, 300,
+                                NORISK, 1000.0, None, diag)
+
+    def test_join_only_when_the_market_agrees(self):
+        # YES favorite at model 0.99; the boundary 0.95 = (94 + 96) / 200
+        agree = pol.BookView({94: 400.0, 93: 300.0}, {4: 500.0})
+        below = pol.BookView({94: 400.0, 93: 300.0}, {5: 500.0})       # (94 + 95) / 200
+        for b, joins in ((agree, True), (below, False)):
+            d = {}
+            dy, dn, rule = self._q("FAV_night_agree", b, 0.99, d)
+            self.assertEqual((dy, dn, rule), ({94: 300.0} if joins else {}, {}, "decided"))
+            self.assertEqual(d["fav_market"]["ok"], joins)
+            self.assertEqual(d["fav_market"]["side"], "yes")
+            self.assertEqual(d["fav_market"]["min"], 0.95)
+            # FAV_night ignores the market
+            self.assertEqual(self._q("FAV_night", b, 0.99)[:2], ({94: 300.0}, {}))
+        self.assertEqual(pol.market_fav_prob(agree, "yes"), 0.95)
+        self.assertEqual(pol.market_fav_prob(below, "yes"), 0.945)
+        # NO favorite (model YES 0.01): the same rule in the NO space
+        nob = pol.BookView({3: 200.0}, {96: 500.0})                    # (96 + 97) / 200
+        self.assertEqual(self._q("FAV_night_agree", nob, 0.01)[:2], ({}, {96: 300.0}))
+        nob2 = pol.BookView({8: 200.0}, {96: 500.0})                   # (96 + 92) / 200
+        self.assertEqual(self._q("FAV_night_agree", nob2, 0.01)[:2], ({}, {}))
+        # one-sided: favorite bid + 1c
+        self.assertEqual(self._q("FAV_night_agree", pol.BookView({94: 500.0}, {}), 0.99)[:2],
+                         ({94: 300.0}, {}))                            # 0.95
+        self.assertEqual(self._q("FAV_night_agree", pol.BookView({93: 500.0}, {}), 0.99)[:2],
+                         ({}, {}))                                     # 0.94
+        # the favorite side empty: no join (nothing to join anyway)
+        d = {}
+        self.assertEqual(self._q("FAV_night_agree", pol.BookView({}, {2: 50.0}), 0.99, d)[:2],
+                         ({}, {}))
+        self.assertEqual(d["fav_market"], {"side": "yes", "p": None, "min": 0.95, "ok": False})
+        # the model condition is unchanged: a market at 99c does not make a
+        # 0.96 model favorite joinable
+        self.assertEqual(self._q("FAV_night_agree", pol.BookView({98: 500.0}, {1: 9.0}), 0.96)[:2],
+                         ({}, {}))
+        # off (None) or 0: every join FAV_night makes
+        for mn in (None, 0.0):
+            self.assertEqual(self._q("FAV_night", below, 0.99, fav_market_min_p=mn)[:2],
+                             ({94: 300.0}, {}))
+
+    def test_only_the_favorite_join_is_gated(self):
+        # G0 + the rule: the longshot pad, the qualification pads and the
+        # near-decided half-size quotes are not the favorite join
+        b = pol.BookView({90: 400.0}, {8: 300.0})                      # market 0.91
+        tags = {}
+        dy, dn, _ = pol.quote_market(P("G0_nohold", fav_market_min_p=0.95), b, 0.99, None,
+                                     False, True, 300, NORISK, 1000.0, tags)
+        self.assertNotIn(90, dy)                                       # no favorite join
+        self.assertEqual(dn.get(1), 1000.0)                            # the longshot pad stays
+        self.assertNotIn("fav", [t for ts in tags.values() for t in ts])
+        g0 = pol.quote_market(P("G0_nohold"), b, 0.99, None, False, True, 300, NORISK, 1000.0)
+        self.assertEqual(g0[0][90], 300.0)
+        near = pol.quote_market(P("G0_nohold", fav_market_min_p=0.95), b, 0.93, None, False,
+                                True, 300, NORISK, 1000.0)
+        self.assertEqual(near, pol.quote_market(P("G0_nohold"), b, 0.93, None, False, True, 300,
+                                                NORISK, 1000.0))
+
+    def test_default_off_changes_nothing(self):
+        # every pre-existing variant (fav_market_min_p None) quotes exactly as
+        # before the key existed: the key is skipped when None
+        rng = random.Random(41)
+        for _ in range(3000):
+            fx = rng.choice([rng.random(), rng.uniform(0.97, 1.0), rng.uniform(0.0, 0.03)])
+            by = {rng.randint(1, 99): float(rng.choice([1, 50, 300, 900]))
+                  for _ in range(rng.randint(0, 3))}
+            bn = {rng.randint(1, 99): float(rng.choice([1, 50, 300, 900]))
+                  for _ in range(rng.randint(0, 3))}
+            if by and bn and max(by) + max(bn) >= 100:
+                continue
+            b = pol.BookView(by, bn)
+            for v in ("G0_nohold", "FAV_night", "F_full"):
+                base = P(v)
+                legacy = {k: x for k, x in base.items() if k != "fav_market_min_p"}
+                d1, d2 = {}, {}
+                self.assertEqual(pol.quote_market(base, b, fx, 1.0, False, True, 300, NORISK,
+                                                  1000.0, None, d1),
+                                 pol.quote_market(legacy, b, fx, 1.0, False, True, 300, NORISK,
+                                                  1000.0, None, d2))
+                self.assertNotIn("fav_market", d1)
+
+    def test_the_10_16_night_losses_in_sample_mechanics(self):
+        """MECHANICS ONLY, NOT EVIDENCE: the two night hours this rule was
+        chosen from (TEMP_SHADOW.md "Pre-registered tests": Test B is judged
+        only on ET days 2026-10-18..22). The recorded external books (top
+        levels) and model fairs at the sample before FAV_night's first cons
+        fill in each hour (the recording, no live orders then):
+          26OCT1621 T82.99 (settled NO at 82.40): +1607.5 s, model 0.9835,
+              mid 89.5c -> market 0.895;
+          26OCT1622 T78.99 (settled NO at 78.44): +405.5 s, model 0.9942,
+              mid 94.5c -> market 0.945.
+        FAV_night joins YES at the reference (89c / 93c, x300); FAV_night_agree
+        does not. (Over each hour the market stood >= 0.95 in ~16% of the
+        seconds the model held the strike >= 0.97, so the agree variant still
+        joined there at times.)"""
+        cases = (
+            ("26OCT1621-T82.99", 0.9835203276634169,
+             {89: 296.95, 88: 325.0, 85: 8.0, 84: 1.0, 83: 2.0, 80: 1.0},
+             {10: 1338.0, 9: 321.0, 4: 66.0, 3: 3264.0, 2: 230.0, 1: 351.0}, 89, 0.895),
+            ("26OCT1622-T78.99", 0.9942323933391192,
+             {94: 29.0, 93: 1293.65, 92: 206.0, 91: 7.0, 88: 2.0, 81: 200.0},
+             {5: 1771.11, 4: 18.0, 3: 453.0, 2: 1000.0, 1: 250.0}, 93, 0.945))
+        for name, fair, by, bn, ref, mkt in cases:
+            b = pol.BookView(by, bn)
+            self.assertEqual(b.ref_y, ref, name)
+            self.assertAlmostEqual(pol.market_fav_prob(b, "yes"), mkt, places=12, msg=name)
+            self.assertEqual(self._q("FAV_night", b, fair)[:2], ({ref: 300.0}, {}), name)
+            d = {}
+            self.assertEqual(self._q("FAV_night_agree", b, fair, d)[:2], ({}, {}), name)
+            self.assertEqual(d["fav_market"]["ok"], False, name)
+            # decide() (the live executor's entry point) applies the same rule
+            ms = [pol.MarketState(ticker=name, strike=80.99, book_yes=by, book_no=bn, fair=fair,
+                                  program_active=True)]
+            ctx = pol.EventContext(now=T0 + 600.0, close_ts=T0 + 3000.0)
+            self.assertEqual(pol.decide(P("FAV_night", quote_hours_et=None), ctx, ms)
+                             .markets[0].yes, {ref: 300.0}, name)
+            self.assertEqual(pol.decide(P("FAV_night_agree", quote_hours_et=None), ctx, ms)
+                             .markets[0].yes, {}, name)
 
 if __name__ == "__main__":
     unittest.main()
