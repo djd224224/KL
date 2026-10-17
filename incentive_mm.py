@@ -3812,6 +3812,280 @@ def back_of_line_level(levels: Dict[float, float], px_dollars: float) -> float:
             return float(q)
     return 0.0
 
+
+# SAME-UNDERLYING GROUPS (Jack 2026-10-17: "#2 and #4/#5: #2 log-only, plus #4
+# and #5 together as one log-only build. Email report in 3 days", after "On 2,
+# what groupings make sense? They'd need to be tied to same underlying"). A
+# group is the set of events ONE piece of news reprices at once. Tested on the
+# 10/03-10/16 fills (a same-side hit in another event of the group within 10
+# min, vs the same window an hour later): NFL same game 2.1x; Carbon Arc same
+# PANEL 3-5x (card / POS / apps / foot traffic / ads -- the data feed, not the
+# company: one company across panels never got hit together); US general
+# elections 6.5x and state legislatures 4.0x (the national environment); USDA
+# corn yields 4.0x. No signal: rain by city, the straits, attorneys general,
+# YouTube; Vercel and Critics Choice co-hit, but a breaker lost there.
+# risk_group() is the key the cross-event breaker (SWEEP_GROUP) and the group
+# worst-case limit (RISK_LIMITS) share; None = in no group.
+RISK_STATE_LEG_SERIES = frozenset(("KXPAHOUSE", "KXPASEN", "KXTXHOUSE", "KXVAHOUSE"))
+_RISK_NOT_GENERAL = ("JUDGE", "TURNOUT", "EARLYVOTE", "MAILVOTE", "MAILREQ",
+                     "MAILMARGIN", "EXIT", "REFS", "REFERENDUM", "BALLOTMEASURE",
+                     "OUTPERFORM")
+_RISK_EXIT_POLL_RE = re.compile(r"KX(DEM|GOP)[A-Z]*VOTE(RS)?")
+_RISK_NFL_GAME_RE = re.compile(r"\d{2}[A-Z]{3}\d{2}[A-Z]{4,6}")   # 26OCT19DALWSH
+_dash_cache: Dict[str, dict] = {}
+
+
+def dash_cache(name: str) -> dict:
+    """One of the dashboard's Kalshi caches (STATUS_DIR/dashboard/cache/<name>:
+    series_meta.json tags, markets_meta.json strikes, events_meta.json the
+    mutually-exclusive flag), reloaded when its mtime moves; {} when missing.
+    Read-only here: imm_dashboard.py writes them every build."""
+    path = os.path.join(STATUS_DIR, "dashboard", "cache", name)
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}
+    c = _dash_cache.get(name)
+    if c is None or c["mtime"] != mt:
+        try:
+            with open(path, encoding="utf-8") as f:
+                val = json.load(f) or {}
+        except (OSError, ValueError):
+            return (c or {}).get("val", {})
+        c = _dash_cache[name] = {"mtime": mt, "val": val}
+    return c["val"]
+
+
+def risk_group(ticker: str) -> Optional[str]:
+    """The same-underlying group a market belongs to (see above), else None.
+    Mention series never join one (SWEEP_EXEMPT_WORDS: a broadcast's words are
+    not its game's news), nor does a linked series (SWEEP_LINKED_GROUPS: the
+    approval twins have their own link). Elections follow the dashboard's
+    _election_group, so the groups are the ones the 10/17 replay scored."""
+    s = series_of(ticker)
+    if sweep_exempt(s) or len(sweep_linked_series(s)) > 1:
+        return None
+    if s.startswith("KXNFL"):
+        parts = ticker.split("-")
+        if len(parts) >= 3 and _RISK_NFL_GAME_RE.fullmatch(parts[1]):
+            return f"NFL game {parts[1]}"
+        return None
+    cat = ca_category(s)
+    if cat:
+        return f"Carbon Arc {cat}"
+    if s.endswith("CORNYIELD"):
+        return "USDA corn yields"
+    if election_series(s):
+        if s.startswith("KXSTATELEG") or s in RISK_STATE_LEG_SERIES or "SUPERMAJ" in s:
+            return "State legislatures"
+        if any(k in s for k in _RISK_NOT_GENERAL) or s.endswith(("MAYOR", "HOUSE1R")) \
+                or s.startswith(("KXATTYGEN", "KXHOUSE")) \
+                or s in ("KXCAATTORNEYGENERAL", "KXUNDERHARRIS") \
+                or _RISK_EXIT_POLL_RE.fullmatch(s):
+            return None
+        tags = set((((dash_cache("series_meta.json").get("series") or {})
+                     .get(s) or {}).get("t") or ()))
+        if tags & {"Referendums", "International elections", "Foreign Elections"}:
+            return None
+        return "US general elections"
+    return None
+
+
+_risk_group_memo: Dict[str, Optional[str]] = {}
+_risk_group_memo_at = [0.0]
+
+
+def risk_group_of(ticker: str) -> Optional[str]:
+    """risk_group, remembered for 10 minutes (the election and Carbon Arc
+    lists it reads are hot-reloaded files)."""
+    now = time.time()
+    if now - _risk_group_memo_at[0] > 600 or len(_risk_group_memo) > 50000:
+        _risk_group_memo.clear()
+        _risk_group_memo_at[0] = now
+    try:
+        return _risk_group_memo[ticker]
+    except KeyError:
+        g = _risk_group_memo[ticker] = risk_group(ticker)
+        return g
+
+
+# CROSS-EVENT BREAKER (#2 of the 10/17 risk-return review). Two maker fills on
+# the SAME side (both on our bids, or both on our asks) in DIFFERENT events of
+# one risk_group within SWEEP_GROUP_WINDOW_SECS -> that side of every market
+# in the group is held SWEEP_GROUP_HOLD_SECS; the other side keeps quoting (it
+# is the side that buys back). A fill inside a hold neither re-trips nor
+# extends it. Replay 10/03-10/16 on top of the escalating holds (#1): +$55/day
+# -- NFL same game ~$35, Carbon Arc panels ~$28 (about $15 of it the 10/10 ad
+# sweep, since fixed other ways) -- and lumpy; any fill size counted
+# (SWEEP_GROUP_MIN_CT 0; the trip lines carry both sizes, so the report can
+# score a floor). It reads the sweep breaker's WS fills, so it needs
+# IMM_SWEEP_BREAKER on or dry.
+#    IMM_SWEEP_GROUP=dry -- THE DEFAULT: each trip is LOGGED
+#                   (ws_group_<date>.jsonl `trip`: the two fills, the orders
+#                   it would pull, the group side's reward a day) and every
+#                   fill on a held side as `held_fill`; nothing pulled.
+#    IMM_SWEEP_GROUP=on  -- the held side's resting orders are cancelled at
+#                   once (on the fast-cancel budget) and the cycle quotes
+#                   nothing on that side of the group until the hold ends.
+#    IMM_SWEEP_GROUP=off -- nothing.
+SWEEP_GROUP = os.environ.get("IMM_SWEEP_GROUP", "dry").strip().lower()
+if SWEEP_GROUP not in ("off", "dry", "on"):
+    SWEEP_GROUP = "off"
+SWEEP_GROUP_WINDOW_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_WINDOW_MIN", 10.0)) * 60.0
+SWEEP_GROUP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_HOLD_MIN", 30.0)) * 60.0
+SWEEP_GROUP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_GROUP_MIN_CT", 0.0))
+
+
+# DOLLAR WORST-CASE LIMITS + INVENTORY SKEW (#4/#5 of the 10/17 review), DRY.
+# The bot's limits count contracts: 150 a market, and a signed 1,000 an event
+# that nets strikes and outcomes as if they hedged. This measures DOLLARS.
+#   * An EVENT's worst case: the worst P&L to settlement from its marks, by
+#     its structure -- the dashboard's event_worst_case (a strike ladder: the
+#     worst settlement value; a Kalshi mutually exclusive event: the worst
+#     winner; else every market's own worst), on the account's positions and
+#     the dashboard's cached strike / event records.
+#   * A risk_group's (SWEEP_GROUP's groups): the sum of its events'.
+#   * The limits: max(RISK_EVENT_FLOOR, RISK_EVENT_DAYS x the event's reward
+#     a day) and max(RISK_GROUP_FLOOR, RISK_GROUP_DAYS x the group's) -- the
+#     bot's own estimate for the markets it quotes, smoothed over
+#     RISK_REWARD_TAU_SECS.
+# Between cycles (in _idle, RISK_SLICE_SECS at a time, a pass at most every
+# RISK_PASS_EVERY_SECS) it takes each side of each market where our orders
+# rest (pads aside) and asks: if that whole side filled, would the event's
+# worst case get worse? A side that ADDS is
+#   block -- the fill would put the event or the group past its limit (#4:
+#            that side stops adding);
+#   skew  -- the event or group already uses RISK_SKEW_FROM of its limit (#5:
+#            the side shrinks and rests a tick back, keeping about half its
+#            reward);
+# and a side that reduces is always ok. In a group whose YES all point one
+# way (RISK_DIRECTIONAL_GROUPS: a Carbon Arc panel's companies, the corn
+# states) only a side WITH the group's net direction counts against the
+# group, so a short-heavy card book stops card asks, not card bids; the NFL
+# and election groups (a YES there can be either team or party) count every
+# adding side. Each change of a side's state is LOGGED (risk_dry_<date>.jsonl
+# `state`: the worst cases, limits, use, the side's reward a day), with a
+# `pass` summary every RISK_SUMMARY_SECS and a `start` line per run, for the
+# 3-day report. On the 10/17 book the event limit binds on 10 quoted events
+# (~$15/day on their adding sides), the group limit on card spend and US
+# general elections (~$33/day). RISK_EXEMPT (series prefixes) are left out,
+# from the group sums too: deliberate positions, the KXPRESRUN NO-only pilot.
+#    IMM_RISK_LIMITS=dry -- THE DEFAULT (no `on` is built: it reads as dry).
+#    IMM_RISK_LIMITS=off -- nothing.
+RISK_LIMITS = os.environ.get("IMM_RISK_LIMITS", "dry").strip().lower()
+if RISK_LIMITS not in ("off", "dry"):
+    RISK_LIMITS = "dry" if RISK_LIMITS == "on" else "off"
+RISK_EVENT_FLOOR = max(0.0, _env_float("IMM_RISK_EVENT_FLOOR", 150.0))
+RISK_EVENT_DAYS = max(0.0, _env_float("IMM_RISK_EVENT_DAYS", 30.0))
+RISK_GROUP_FLOOR = max(0.0, _env_float("IMM_RISK_GROUP_FLOOR", 750.0))
+RISK_GROUP_DAYS = max(0.0, _env_float("IMM_RISK_GROUP_DAYS", 30.0))
+RISK_SKEW_FROM = min(1.0, max(0.0, _env_float("IMM_RISK_SKEW_FROM", 0.5)))
+RISK_SLICE_SECS = max(0.05, _env_float("IMM_RISK_SLICE_SECS", 0.25))
+RISK_PASS_EVERY_SECS = max(5.0, _env_float("IMM_RISK_PASS_EVERY_SECS", 60.0))
+RISK_SUMMARY_SECS = max(30.0, _env_float("IMM_RISK_SUMMARY_SECS", 300.0))
+RISK_REWARD_TAU_SECS = max(60.0, _env_float("IMM_RISK_REWARD_TAU_H", 6.0) * 3600.0)
+RISK_EXEMPT = tuple(p.strip().upper() for p in os.environ.get(
+    "IMM_RISK_EXEMPT", "KXPRESRUN").split(",") if p.strip())
+RISK_DIRECTIONAL_GROUPS = ("Carbon Arc ", "USDA corn")
+RISK_NUMERIC_STRIKES = frozenset(("greater", "greater_or_equal", "less",
+                                  "less_or_equal", "between"))
+
+
+def risk_market_worst(pos: float, mark: float) -> float:
+    """One market's worst P&L from its mark to settlement (<= 0)."""
+    if abs(pos) < 1e-9:
+        return 0.0
+    return -pos * mark / 100.0 if pos > 0 else pos * (100.0 - mark) / 100.0
+
+
+def risk_strike_pays(st: str, lo, hi, v: float) -> bool:
+    if st == "greater":
+        return v > lo
+    if st == "greater_or_equal":
+        return v >= lo
+    if st == "less":
+        return v < hi
+    if st == "less_or_equal":
+        return v <= hi
+    if st == "between":
+        return lo <= v <= hi
+    return False
+
+
+def _risk_strike_usable(s) -> bool:
+    st, lo, hi = s[0], s[1], s[2]
+    if st in ("greater", "greater_or_equal"):
+        return lo is not None
+    if st in ("less", "less_or_equal"):
+        return hi is not None
+    if st == "between":
+        return lo is not None and hi is not None
+    return False
+
+
+def risk_struct(rec: Optional[dict]):
+    """(strike type, floor, cap, market type) from a markets_meta.json row,
+    or None when the dashboard has not read the market yet."""
+    if not rec or "st" not in rec:
+        return None
+
+    def num(x):
+        try:
+            return None if x is None else float(x)
+        except (TypeError, ValueError):
+            return None
+    return (rec.get("st"), num(rec.get("lo")), num(rec.get("hi")), rec.get("mt") or "binary")
+
+
+def risk_event_worst(holdings, struct, me=None, n_event=None) -> float:
+    """An event's worst P&L from its marks to settlement (<= 0): the
+    dashboard's event_worst_case. `holdings` [(ticker, pos, mark_cents)];
+    `struct` {ticker: risk_struct}; `me` Kalshi's mutually-exclusive flag,
+    `n_event` its market count. Scalar markets never net; a market with no
+    structure read, or an event that is neither a usable strike ladder nor
+    mutually exclusive, counts every market's own worst (conservative)."""
+    gross, live = 0.0, []
+    for t, pos, mk in holdings:
+        if mk is None or abs(pos) < 1e-9:
+            continue
+        w = risk_market_worst(pos, mk)
+        gross += w
+        live.append((t, pos, mk, w))
+    if not live:
+        return 0.0
+    binaries, scalars = [], 0.0
+    for t, pos, mk, w in live:
+        s = struct.get(t)
+        if s is not None and len(s) > 3 and s[3] == "scalar":
+            scalars += w
+        else:
+            binaries.append((t, pos, mk, s))
+    if not binaries or any(s is None for _t, _p, _m, s in binaries):
+        return gross
+
+    def pnl(paid):
+        return sum(pos * ((100.0 if t in paid else 0.0) - mk) / 100.0
+                   for t, pos, mk, _s in binaries)
+
+    if all(s[0] in RISK_NUMERIC_STRIKES and _risk_strike_usable(s)
+           for _t, _p, _m, s in binaries):
+        vals = sorted({x for _t, _p, _m, s in binaries for x in (s[1], s[2])
+                       if x is not None})
+        pts = [vals[0] - 1.0, vals[-1] + 1.0]
+        for x in vals:
+            eps = 1e-6 * max(1.0, abs(x))
+            pts += [x - eps, x, x + eps]
+        worst = min(pnl({t for t, _p, _m, s in binaries
+                         if risk_strike_pays(s[0], s[1], s[2], v)}) for v in pts)
+        return min(worst, 0.0) + scalars
+    if me:
+        names = [t for t, _p, _m, _s in binaries]
+        scen = [pnl({t}) for t in names]
+        if not (n_event and len(names) >= n_event):
+            scen.append(pnl(set()))
+        return min(min(scen), 0.0) + scalars
+    return gross
+
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
 # NOTE 2026-07-11: liquidity programs now exist on some crypto-fleet events
@@ -9525,6 +9799,12 @@ _CONFIG_CODE_KNOBS = (
     "BACK_OF_LINE_BUDGET_SECS",
     # rate-limit alert (2026-10-17)
     "RATE_LIMIT_ALERT", "RATE_LIMIT_CHECK_SECS", "RATE_LIMIT_SCAN_DIRS",
+    # cross-event breaker and the dollar limits + skew, dry (2026-10-17)
+    "SWEEP_GROUP", "SWEEP_GROUP_WINDOW_SECS", "SWEEP_GROUP_HOLD_SECS",
+    "SWEEP_GROUP_MIN_CT", "RISK_LIMITS", "RISK_EVENT_FLOOR", "RISK_EVENT_DAYS",
+    "RISK_GROUP_FLOOR", "RISK_GROUP_DAYS", "RISK_SKEW_FROM", "RISK_SLICE_SECS",
+    "RISK_PASS_EVERY_SECS", "RISK_SUMMARY_SECS", "RISK_REWARD_TAU_SECS",
+    "RISK_EXEMPT",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
     "WS_FAST_MIN_GAP_C", "WS_FAST_EXEMPT", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
     # hang watchdog: wedge stacks, its handoff, the main-thread network
@@ -17668,6 +17948,35 @@ class IncentiveMarketMaker:
         self._rl_offsets: Dict[str, int] = {}
         self._rl = {"looks": 0, "imm_writes": 0, "imm_reads": 0, "fleet": 0,
                     "alerts": 0, "last_alert_ts": 0.0, "last": ""}
+        # cross-event breaker (2026-10-17, SWEEP_GROUP): (group, side) -> the
+        # last fill that could start a trip; -> the trip's window {"at",
+        # "until", "mode"} (dry: the hold `on` would keep, for held_fill
+        # lines); -> a LIVE hold's end, the only thing that keeps a side out
+        self._grp_last: Dict[Tuple[str, str], dict] = {}
+        self._grp_win: Dict[Tuple[str, str], dict] = {}
+        self._grp_hold: Dict[Tuple[str, str], float] = {}
+        self._grp = {"fills": 0, "trips": 0, "trips_live": 0, "held_fills": 0,
+                     "held_ct": 0.0, "cancels": 0, "skipped_budget": 0,
+                     "skipped_writes": 0}
+        # dollar limits + skew (2026-10-17, RISK_LIMITS, dry): the cycle's
+        # account positions, the pass being worked off between cycles (its
+        # event -> tickers map and queue), each event's last worst case and
+        # long / short dollars at risk, the smoothed reward a day per event,
+        # and each (ticker, side)'s logged state (absent = ok)
+        self._risk_positions: Dict[str, float] = {}
+        self._risk_pass: Optional[dict] = None
+        self._risk_queue: Deque[str] = deque()
+        self._risk_ev: Dict[str, dict] = {}
+        self._risk_day: Dict[str, Tuple[float, float]] = {}
+        self._risk_side: Dict[Tuple[str, str], dict] = {}
+        self._risk_primed = False
+        self._risk_last_pass = 0.0
+        self._risk_last_summary = 0.0
+        self._risk_last_msg = ""
+        self._risk = {"passes": 0, "events": 0, "sides": 0, "unmarked": 0,
+                      "transitions": 0, "block_now": 0, "skew_now": 0,
+                      "block_day": 0.0, "skew_day": 0.0, "worst_total": 0.0,
+                      "pass_s": 0.0, "fails": 0}
         self._bol = {"passes": 0, "candidates": 0, "reads": 0, "read_fails": 0,
                      "no_position": 0, "front": 0, "would_requeue": 0,
                      "requeued": 0, "amend_fails": 0, "restored": 0,
@@ -20022,6 +20331,130 @@ class IncentiveMarketMaker:
         return SWEEP_BREAKER == "on" and \
             self._sweep_hold.get(sweep_hold_key(event), 0.0) > now_ts
 
+    def group_held(self, ticker: str, side: str, now_ts: float) -> bool:
+        """True while a LIVE cross-event breaker trip (SWEEP_GROUP on) holds
+        `side` ('bid' / 'ask') of the ticker's risk_group out of quoting."""
+        if SWEEP_GROUP != "on" or not self._grp_hold:
+            return False
+        g = risk_group_of(ticker)
+        return g is not None and self._grp_hold.get((g, side), 0.0) > now_ts
+
+    def _group_note_fill(self, t: str, oid: str, side: str, px: float,
+                         n: float, fts: float, now_ts: float,
+                         trade_id: Any) -> None:
+        """The CROSS-EVENT BREAKER (SWEEP_GROUP) on one of our maker fills,
+        from _sweep_note_fill. A fill on a side inside a trip's window is a
+        `held_fill` line (dry: a fill `on` would not have taken); otherwise a
+        fill on the same side of the group in ANOTHER event within
+        SWEEP_GROUP_WINDOW_SECS of the last trips that side for
+        SWEEP_GROUP_HOLD_SECS -- logged dry, held and pulled on."""
+        g = risk_group_of(t)
+        if g is None or side not in ("bid", "ask"):
+            return
+        st = self._grp
+        st["fills"] += 1
+        ev = self._event_of(t)
+        key = (g, side)
+        win = self._grp_win.get(key)
+        if win is not None and win["until"] > now_ts:
+            st["held_fills"] += 1
+            st["held_ct"] += n
+            self._sink("ws_group", {
+                "ev": "held_fill", "ts": round(now_ts, 3), "mode": win["mode"],
+                "group": g, "side": side, "event": ev, "ticker": t,
+                "order_id": oid, "px": px, "count": n, "fill_ts": fts,
+                "trade_id": trade_id, "trip_ts": win["at"],
+                "since_trip_s": round(now_ts - win["at"], 1)})
+            return
+        if n + 1e-9 < SWEEP_GROUP_MIN_CT:
+            return
+        prev = self._grp_last.get(key)
+        self._grp_last[key] = {"ts": fts, "event": ev, "ticker": t, "count": n,
+                               "px": px, "order_id": oid, "trade_id": trade_id}
+        if prev is None or prev["event"] == ev or \
+                fts - prev["ts"] > SWEEP_GROUP_WINDOW_SECS:
+            return
+        for k_old in [k for k, w in self._grp_win.items()
+                      if w["until"] < now_ts - 3600]:
+            del self._grp_win[k_old]
+        for k_old in [k for k, u in self._grp_hold.items() if u < now_ts - 3600]:
+            del self._grp_hold[k_old]
+        for k_old in [k for k, p in self._grp_last.items() if p["ts"] < fts - 3600]:
+            del self._grp_last[k_old]
+        live = SWEEP_GROUP == "on"
+        mode = "on" if live else "dry"
+        until = now_ts + SWEEP_GROUP_HOLD_SECS
+        self._grp_win[key] = {"at": now_ts, "until": until, "mode": mode}
+        st["trips"] += 1
+        if live:
+            self._grp_hold[key] = until
+            st["trips_live"] += 1
+        # the group's markets we quote, their reward a day (holding one side
+        # gives up about half), and that side's orders -- the cycle's view,
+        # plus what was placed since, which only the ledger holds yet
+        pull: List[Tuple[str, dict]] = []
+        grp_day, n_mkts = 0.0, 0
+        for tk, lst in self._resting_view.items():
+            if risk_group_of(tk) != g:
+                continue
+            n_mkts += 1
+            pnl = self._last_panel.get(tk) or {}
+            grp_day += float(pnl.get("est_frac") or 0.0) * \
+                float(pnl.get("pool_per_day") or 0.0)
+            pull.extend((tk, o) for o in lst
+                        if o["side"] == side and o["rem"] > 0)
+        in_view = {o["order_id"] for _tk, o in pull}
+        for l_oid, led in list(self.state.ledger.items()):
+            l_t = str(led.get("ticker") or "")
+            l_rem = float(led.get("remaining_count") or 0.0)
+            if l_oid in in_view or l_oid in self._cycle_cancelled or l_rem <= 0 \
+                    or str(led.get("book_side") or "") != side or not l_t \
+                    or any(o["order_id"] == l_oid
+                           for o in self._resting_view.get(l_t, ())) \
+                    or risk_group_of(l_t) != g:
+                continue
+            l_px = led.get("yes_price_exact")
+            pull.append((l_t, {"order_id": l_oid, "side": side,
+                               "px": float(l_px) if l_px is not None
+                               else float(led.get("yes_price") or 0),
+                               "rem": l_rem}))
+        self._sink("ws_group", {
+            "ev": "trip", "ts": round(now_ts, 3), "mode": mode, "group": g,
+            "side": side, "hold_s": SWEEP_GROUP_HOLD_SECS,
+            "gap_s": round(fts - prev["ts"], 1),
+            "first": {"event": prev["event"], "ticker": prev["ticker"],
+                      "count": prev["count"], "px": prev["px"],
+                      "fill_ts": prev["ts"], "order_id": prev["order_id"],
+                      "trade_id": prev["trade_id"]},
+            "second": {"event": ev, "ticker": t, "count": n, "px": px,
+                       "fill_ts": fts, "order_id": oid, "trade_id": trade_id},
+            "markets": n_mkts, "group_day": round(grp_day, 2),
+            "side_day": round(grp_day / 2.0, 2),
+            "pull": [[tk, o["order_id"], o["px"], o["rem"]] for tk, o in pull]})
+        log(f"{self.tag} group breaker ({mode}): {g} {side.upper()}s hit in "
+            f"{prev['event']} then {ev} ({fts - prev['ts']:.0f}s apart) -> "
+            f"{'holding' if live else 'would hold'} that side "
+            f"{SWEEP_GROUP_HOLD_SECS / 60:.0f} min: {len(pull)} order(s) on "
+            f"{n_mkts} market(s), ~${grp_day / 2.0:.2f}/day of reward")
+        if not live:
+            return
+        for _tk, o in pull:
+            while self._ws_cancel_times and \
+                    self._ws_cancel_times[0] < now_ts - 60.0:
+                self._ws_cancel_times.popleft()
+            if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
+                st["skipped_budget"] += 1          # the cycle pulls it
+                continue
+            self._ws_cancel_times.append(now_ts)
+            if self.cancel_order(o["order_id"], reason="group_breaker"):
+                self.state.cancelled_today += 1
+                st["cancels"] += 1
+                o["rem"] = 0.0
+                self._ws_suspect.pop(o["order_id"], None)
+                if o["order_id"] in self._ws_flagged:
+                    self._ws_episode_end(o["order_id"], "cancel", now_ts,
+                                         by="group")
+
     def _sweep_note_fill(self, body: dict, now_ts: float) -> None:
         """One of our WS fills. Every maker fill is logged (for the next view
         rebuild) and booked down in the resting view, whatever the mode.
@@ -20080,6 +20513,11 @@ class IncentiveMarketMaker:
                 side = str(led.get("book_side") or "")
                 pxe = led.get("yes_price_exact")
                 px = float(pxe) if pxe is not None else float(led.get("yes_price") or 0)
+            if SWEEP_GROUP != "off":
+                # the cross-event breaker counts every maker fill, partial
+                # or not (2026-10-17)
+                self._group_note_fill(t, oid, side, px, n, fts, now_ts,
+                                      body.get("trade_id"))
             if rem <= 0 or n + 1e-6 < rem or n < SWEEP_MIN_CT:
                 return                                  # partial: no sweep
             ev = self._event_of(t)
@@ -20462,7 +20900,8 @@ class IncentiveMarketMaker:
                 oid in self._cycle_amended or \
                 any(f_oid == oid and f_ts > p["read_at"] + 1.0
                     for f_ts, f_oid, _n in self._ws_fill_log) or \
-                self.sweep_held(self._event_of(t), now_ts):
+                self.sweep_held(self._event_of(t), now_ts) or \
+                self.group_held(t, m["side"], now_ts):
             st["stale"] += 1
             return
         rec = {"ts": round(now_ts, 3), "mode": BACK_OF_LINE, "ticker": t,
@@ -20609,6 +21048,297 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! rate-limit watch failed: {e}")
 
+    # ---- dollar worst-case limits + skew (2026-10-17, RISK_LIMITS, dry) ----
+
+    def _risk_mark(self, t: str) -> Optional[float]:
+        """A market's YES mark (cents) for the dollar limits: the cycle's mark
+        of a held position (state.last_mark), else the mid of the last
+        two-sided external touch the cycle read; None if neither."""
+        mk = self.state.last_mark.get(t)
+        if mk is not None:
+            return float(mk)
+        p = self._last_panel.get(t)
+        if p and p.get("ext_bid") is not None and p.get("ext_ask") is not None:
+            return (float(p["ext_bid"]) + float(p["ext_ask"])) / 2.0
+        return None
+
+    def _risk_market_day(self, t: str) -> float:
+        """The bot's reward estimate a day for a market it has orders on now
+        (0 for one it does not quote)."""
+        if not any(o["rem"] > 0 for o in self._resting_view.get(t, ())):
+            return 0.0
+        p = self._last_panel.get(t) or {}
+        return float(p.get("est_frac") or 0.0) * float(p.get("pool_per_day") or 0.0)
+
+    def _risk_smooth(self, key: str, x: float, now_ts: float) -> float:
+        """`x` smoothed over RISK_REWARD_TAU_SECS (the first look: x)."""
+        old = self._risk_day.get(key)
+        v = x if old is None else old[0] + (x - old[0]) * (
+            1.0 - math.exp(-max(0.0, now_ts - old[1]) / RISK_REWARD_TAU_SECS))
+        self._risk_day[key] = (v, now_ts)
+        return v
+
+    def _risk_step(self, now_ts: float, budget_s: float) -> None:
+        """RISK_LIMITS (dry): work the current pass for up to `budget_s`,
+        starting a new one RISK_PASS_EVERY_SECS after the last began. The
+        run's first pass only reads every event's worst case (so the group
+        sums are whole before any side is judged). Never raises."""
+        if RISK_LIMITS == "off":
+            return
+        try:
+            t0 = time.time()
+            if self._risk_pass is None:
+                if now_ts - self._risk_last_pass < RISK_PASS_EVERY_SECS or \
+                        not (self._risk_positions or self._resting_view):
+                    return
+                self._risk_begin_pass(now_ts)
+            P = self._risk_pass
+            while self._risk_queue and time.time() - t0 < budget_s:
+                self._risk_eval_event(self._risk_queue.popleft(), now_ts)
+            P["secs"] += time.time() - t0
+            if not self._risk_queue:
+                self._risk_end_pass(now_ts)
+        except Exception as e:
+            self._risk["fails"] += 1
+            self._risk_pass = None
+            self._risk_queue.clear()
+            log(f"{self.tag} ! risk limits check failed: {e}")
+
+    def _risk_begin_pass(self, now_ts: float) -> None:
+        """A new pass over every event with a position on the account or an
+        order of ours resting, and each group's sums from its events' last
+        look (an event updates its own share when the pass reaches it)."""
+        self._risk_last_pass = now_ts
+        tickers = {t for t, p in self._risk_positions.items()
+                   if abs(float(p or 0.0)) > 1e-9}
+        tickers |= {t for t, lst in self._resting_view.items()
+                    if any(o["rem"] > 0 for o in lst)}
+        events: Dict[str, List[str]] = {}
+        for t in sorted(tickers):
+            events.setdefault(self._event_of(t), []).append(t)
+        for ev in [e for e in self._risk_ev if e not in events]:
+            del self._risk_ev[ev]
+        for k in [k for k, (_v, ts) in self._risk_day.items()
+                  if ts < now_ts - 86400]:
+            del self._risk_day[k]
+        gsum: Dict[str, Dict[str, float]] = {}
+        for r in self._risk_ev.values():
+            if r["g"] is not None:
+                s = gsum.setdefault(r["g"], {"w0": 0.0, "long": 0.0, "short": 0.0,
+                                             "day": 0.0, "events": 0})
+                for k in ("w0", "long", "short", "day"):
+                    s[k] += r[k]
+                s["events"] += 1
+        self._risk_pass = {"start": now_ts, "events": events, "gsum": gsum,
+                           "seen": set(), "evaluated": 0, "sides": 0,
+                           "unmarked": 0, "secs": 0.0}
+        self._risk_queue = deque(sorted(events))
+
+    def _risk_eval_event(self, ev: str, now_ts: float) -> None:
+        """One event of the pass: its worst case, long / short dollars at
+        risk and reward a day (into the group sums); then, once primed, each
+        side with our orders: the worst case if all of it filled, its state
+        (ok / skew / block) and a `state` line when that changed."""
+        P = self._risk_pass
+        tickers = P["events"].get(ev) or []
+        if not tickers:
+            return
+        exempt = bool(RISK_EXEMPT) and series_of(tickers[0]).startswith(RISK_EXEMPT)
+        g = None if exempt else risk_group_of(tickers[0])
+        mm = dash_cache("markets_meta.json")
+        em = dash_cache("events_meta.json").get(ev) or {}
+        me, n_ev = em.get("me"), em.get("n")
+        struct = {t: risk_struct(mm.get(t)) for t in tickers}
+        marks = {t: self._risk_mark(t) for t in tickers}
+        pos = {t: float(self._risk_positions.get(t, 0.0) or 0.0) for t in tickers}
+        w0 = risk_event_worst([(t, pos[t], marks[t]) for t in tickers],
+                              struct, me, n_ev)
+        long_d = sum(pos[t] * marks[t] / 100.0 for t in tickers
+                     if marks[t] is not None and pos[t] > 1e-9)
+        short_d = sum(-pos[t] * (100.0 - marks[t]) / 100.0 for t in tickers
+                      if marks[t] is not None and pos[t] < -1e-9)
+        P["unmarked"] += sum(1 for t in tickers
+                             if marks[t] is None and abs(pos[t]) > 1e-9)
+        day = self._risk_smooth("ev:" + ev, sum(self._risk_market_day(t)
+                                                for t in tickers), now_ts)
+        new = {"w0": w0, "long": long_d, "short": short_d, "day": day, "g": g,
+               "exempt": exempt}
+        old = self._risk_ev.get(ev)
+        self._risk_ev[ev] = new
+        if g is not None:
+            s = P["gsum"].setdefault(g, {"w0": 0.0, "long": 0.0, "short": 0.0,
+                                         "day": 0.0, "events": 0})
+            same = old is not None and old["g"] == g
+            for k in ("w0", "long", "short", "day"):
+                s[k] += new[k] - (old[k] if same else 0.0)
+            if not same:
+                s["events"] += 1
+        P["evaluated"] += 1
+        if exempt or not self._risk_primed:
+            return
+        lim_e = max(RISK_EVENT_FLOOR, RISK_EVENT_DAYS * day, 0.01)
+        gs = P["gsum"].get(g) if g is not None else None
+        lim_g = max(RISK_GROUP_FLOOR, RISK_GROUP_DAYS * gs["day"], 0.01) if gs else 0.0
+        gdir = ""
+        if gs:
+            gdir = "short" if gs["short"] > gs["long"] + 1e-9 else \
+                ("long" if gs["long"] > gs["short"] + 1e-9 else "")
+        directional = g is not None and g.startswith(RISK_DIRECTIONAL_GROUPS)
+        for t in tickers:
+            lst = self._resting_view.get(t, ())
+            for side in ("bid", "ask"):
+                mine = [o for o in lst if o["side"] == side and o["rem"] > 0
+                        and not o.get("pad")]
+                rest = sum(o["rem"] for o in mine)
+                if rest <= 0:
+                    continue
+                key = (t, side)
+                P["seen"].add(key)
+                if marks[t] is None:
+                    continue                    # unmarked: its state stands
+                d = rest if side == "bid" else -rest
+                w1 = risk_event_worst(
+                    [(x, pos[x] + (d if x == t else 0.0), marks[x]) for x in tickers],
+                    struct, me, n_ev)
+                P["sides"] += 1
+                adds = w1 < w0 - 0.01
+                u0e, u1e = -w0 / lim_e, -w1 / lim_e
+                u0g = u1g = None
+                with_dir = None
+                if adds and gs is not None:
+                    with_dir = (side == "bid" and gdir == "long") or \
+                        (side == "ask" and gdir == "short")
+                    if not directional or with_dir:
+                        u0g = -gs["w0"] / lim_g
+                        u1g = -(gs["w0"] + w1 - w0) / lim_g
+                state, by = "ok", ""
+                if adds:
+                    u1 = max(u1e, u1g if u1g is not None else 0.0)
+                    u0 = max(u0e, u0g if u0g is not None else 0.0)
+                    if u1 > 1.0:
+                        state = "block"
+                        by = "group" if u1g is not None and u1g >= u1e else "event"
+                    elif u0 >= RISK_SKEW_FROM:
+                        state = "skew"
+                        by = "group" if u0g is not None and u0g >= u0e else "event"
+                side_day = 0.5 * self._risk_market_day(t)
+                prev = self._risk_side.get(key)
+                prev_state = prev["state"] if prev else "ok"
+                if state != "ok":
+                    self._risk_side[key] = {
+                        "state": state, "event": ev, "group": g,
+                        "since": prev["since"] if prev and prev_state == state else now_ts,
+                        "side_day": side_day}
+                elif prev is not None:
+                    del self._risk_side[key]
+                if state == prev_state:
+                    continue
+                self._risk["transitions"] += 1
+                pxs = [o["px"] for o in mine]
+                rec = {"ev": "state", "ts": round(now_ts, 3), "ticker": t,
+                       "event": ev, "group": g, "side": side, "state": state,
+                       "prev": prev_state, "by": by,
+                       "px": max(pxs) if side == "bid" else min(pxs),
+                       "rest": rest, "pos": pos[t], "mark": marks[t],
+                       "w0": round(w0, 2), "w1": round(w1, 2),
+                       "lim_e": round(lim_e, 2), "u0e": round(u0e, 3),
+                       "u1e": round(u1e, 3), "side_day": round(side_day, 3),
+                       "ev_day": round(day, 3)}
+                if gs is not None:
+                    rec.update(g_w0=round(gs["w0"], 2), lim_g=round(lim_g, 2),
+                               g_day=round(gs["day"], 3), gdir=gdir,
+                               directional=directional, with_dir=with_dir,
+                               u0g=None if u0g is None else round(u0g, 3),
+                               u1g=None if u1g is None else round(u1g, 3))
+                if state == "block":
+                    # the share of the side that would still fit under the
+                    # limit(s) it breaks -- for scoring a cap in place of a
+                    # block
+                    inc = w0 - w1
+                    fit = (lim_e + w0) / inc if u1e > 1.0 else 1.0
+                    if u1g is not None and u1g > 1.0:
+                        fit = min(fit, (lim_g + gs["w0"]) / inc)
+                    rec["fit"] = round(min(1.0, max(0.0, fit)), 3)
+                if prev is not None:
+                    rec["secs"] = round(now_ts - prev["since"], 1)
+                self._sink("risk_dry", rec)
+
+    def _risk_end_pass(self, now_ts: float) -> None:
+        """Close the pass: the priming pass logs the run's `start` line (and
+        the first judged pass follows at once); afterwards a side that has
+        no orders left ends its state (`none`), the counters update, and a
+        `pass` summary goes out every RISK_SUMMARY_SECS."""
+        P = self._risk_pass
+        self._risk_pass = None
+        if P is None:
+            return
+        st = self._risk
+        if not self._risk_primed:
+            self._risk_primed = True
+            self._risk_last_pass = 0.0
+            self._sink("risk_dry", {
+                "ev": "start", "ts": round(now_ts, 3), "run_id": RUN_ID,
+                "event_floor": RISK_EVENT_FLOOR, "event_days": RISK_EVENT_DAYS,
+                "group_floor": RISK_GROUP_FLOOR, "group_days": RISK_GROUP_DAYS,
+                "skew_from": RISK_SKEW_FROM, "exempt": list(RISK_EXEMPT),
+                "tau_h": RISK_REWARD_TAU_SECS / 3600.0,
+                "directional": list(RISK_DIRECTIONAL_GROUPS),
+                "events": len(P["events"]), "prime_s": round(P["secs"], 2)})
+            return
+        for key in [k for k in self._risk_side if k not in P["seen"]]:
+            prev = self._risk_side.pop(key)
+            st["transitions"] += 1
+            self._sink("risk_dry", {
+                "ev": "state", "ts": round(now_ts, 3), "ticker": key[0],
+                "event": prev["event"], "group": prev["group"], "side": key[1],
+                "state": "none", "prev": prev["state"],
+                "secs": round(now_ts - prev["since"], 1)})
+        blk = [v for v in self._risk_side.values() if v["state"] == "block"]
+        skw = [v for v in self._risk_side.values() if v["state"] == "skew"]
+        live_ev = [r for r in self._risk_ev.values() if not r["exempt"]]
+        st.update(passes=st["passes"] + 1, events=P["evaluated"],
+                  sides=P["sides"], unmarked=P["unmarked"],
+                  block_now=len(blk), skew_now=len(skw),
+                  block_day=round(sum(v["side_day"] for v in blk), 2),
+                  skew_day=round(sum(v["side_day"] for v in skw), 2),
+                  worst_total=round(sum(r["w0"] for r in live_ev), 2),
+                  pass_s=round(P["secs"], 2))
+        if now_ts - self._risk_last_summary < RISK_SUMMARY_SECS:
+            return
+        self._risk_last_summary = now_ts
+        groups = {}
+        for g, s in sorted(P["gsum"].items()):
+            lim = max(RISK_GROUP_FLOOR, RISK_GROUP_DAYS * s["day"])
+            groups[g] = {"worst": round(s["w0"], 2), "limit": round(lim, 2),
+                         "day": round(s["day"], 3), "long": round(s["long"], 2),
+                         "short": round(s["short"], 2), "events": s["events"]}
+        over = []
+        for ev, r in self._risk_ev.items():
+            if r["exempt"]:
+                continue
+            lim = max(RISK_EVENT_FLOOR, RISK_EVENT_DAYS * r["day"])
+            if -r["w0"] >= RISK_SKEW_FROM * lim:
+                over.append([round(-r["w0"] / lim, 3), ev, round(r["w0"], 2),
+                             round(lim, 2)])
+        over.sort(reverse=True)
+        self._sink("risk_dry", {
+            "ev": "pass", "ts": round(now_ts, 3), "secs": round(P["secs"], 2),
+            "events": P["evaluated"], "sides": P["sides"],
+            "unmarked": P["unmarked"], "block": len(blk), "skew": len(skw),
+            "block_day": st["block_day"], "skew_day": st["skew_day"],
+            "worst_total": st["worst_total"],
+            "exempt_worst": round(sum(r["w0"] for r in self._risk_ev.values()
+                                      if r["exempt"]), 2),
+            "groups": groups, "events_over_skew": len(over),
+            "top_events": over[:15]})
+        msg = (f"{len(blk)} side(s) would block (~${st['block_day']:.2f}/day), "
+               f"{len(skw)} would skew (~${st['skew_day']:.2f}/day)")
+        if msg != self._risk_last_msg:
+            self._risk_last_msg = msg
+            log(f"{self.tag} risk limits (dry): {msg}; worst case "
+                f"${-st['worst_total']:,.0f} over {len(live_ev)} events, "
+                f"{len(over)} event(s) past {RISK_SKEW_FROM:.0%} of their limit")
+
     def _idle(self, secs: float, stopping: dict) -> bool:
         """Sleep up to `secs` between cycles. With the WebSocket feed running
         it waits on the feed instead and handles its events as they arrive;
@@ -20652,6 +21382,12 @@ class IncentiveMarketMaker:
                 left = end - time.time()
                 if left > 0.05:
                     self._back_of_line_step(time.time(), min(0.3, left))
+            # the dollar limits' dry check (2026-10-17, RISK_LIMITS): a slice
+            # of its pass, after the feed's events and the line moves
+            elif RISK_LIMITS != "off":
+                left = end - time.time()
+                if left > 0.05:
+                    self._risk_step(time.time(), min(RISK_SLICE_SECS, left))
         return False
 
     def _get_resting_orders_global(self) -> List[dict]:
@@ -26600,6 +27336,11 @@ class IncentiveMarketMaker:
         if SWEEP_BREAKER == "on" and self._sweep_hold:
             desired = [q for q in desired
                        if not self.sweep_held(self._event_of(q.ticker), now_ts)]
+        # ...and the cross-event breaker's held SIDES (on, 2026-10-17, see
+        # SWEEP_GROUP): nothing on that side of the group until the hold ends
+        if SWEEP_GROUP == "on" and self._grp_hold:
+            desired = [q for q in desired
+                       if not self.group_held(q.ticker, q.book_side, now_ts)]
 
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel
@@ -26663,6 +27404,9 @@ class IncentiveMarketMaker:
             if self.sweep_held(self._event_of(q_am.ticker), time.time()):
                 self._sweep["skipped_writes"] += 1
                 continue                   # the breaker pulled it this cycle
+            if self.group_held(q_am.ticker, q_am.book_side, time.time()):
+                self._grp["skipped_writes"] += 1
+                continue                   # the group breaker pulled it
             self.amend_order_inplace(o_am, q_am, now_ts)
         if len(to_amend) > MAX_PLACEMENTS_PER_CYCLE:
             log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
@@ -26712,6 +27456,9 @@ class IncentiveMarketMaker:
             # (its reads and moves run between cycles, in _idle)
             if not fast_only:
                 self._back_of_line_pass(resting, now_ts)
+                # the dollar limits (2026-10-17, dry) judge the account's
+                # positions as this cycle read them, between cycles
+                self._risk_positions = dict(positions)
         # rate-limit alert (2026-10-17): any 429 rejection, ours or the fleet's
         self._rate_limit_watch(time.time())
         if not fast_only:
@@ -26932,19 +27679,22 @@ class IncentiveMarketMaker:
         pacer = WritePacer(PLACE_RATE_PER_SEC if self.live else 0.0)
         for i, q in enumerate(to_place):
             self._ws_cycle_tick()          # the in-cycle stale check / breaker
-            if self.sweep_held(self._event_of(q.ticker), time.time()):
-                # the breaker tripped this event after the cycle's diff:
-                # nothing new goes in before its hold ends, but an order this
-                # placement would have replaced still leaves the book
+            held_sweep = self.sweep_held(self._event_of(q.ticker), time.time())
+            if held_sweep or self.group_held(q.ticker, q.book_side, time.time()):
+                # the breaker (or the group breaker, 2026-10-17) tripped after
+                # the cycle's diff: nothing new goes in before its hold ends,
+                # but an order this placement would have replaced still
+                # leaves the book
                 old_h = replaces.get(i)
                 if old_h is not None:
                     pacer.wait()
-                    if self.cancel_order(old_h, reason="sweep_breaker"):
+                    if self.cancel_order(old_h, reason="sweep_breaker" if held_sweep
+                                         else "group_breaker"):
                         self.state.cancelled_today += 1
                         cancelled_ids.add(old_h)
                     elif old_h in by_id:
                         total_resting += _count(by_id[old_h], 1)   # it still rests
-                self._sweep["skipped_writes"] += 1
+                (self._sweep if held_sweep else self._grp)["skipped_writes"] += 1
                 continue
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
@@ -27177,6 +27927,20 @@ class IncentiveMarketMaker:
                                           "chains_now": sum(
                                               1 for s in self._sweep_esc.values()
                                               if s["reset_at"] > now and s["n"] >= 2)})
+            # the cross-event breaker and the dollar limits (2026-10-17)
+            out["group_breaker"] = dict(
+                self._grp, mode=SWEEP_GROUP,
+                window_min=SWEEP_GROUP_WINDOW_SECS / 60,
+                hold_min=SWEEP_GROUP_HOLD_SECS / 60, min_ct=SWEEP_GROUP_MIN_CT,
+                held_now=sum(1 for u in self._grp_hold.values() if u > now),
+                windows_now=sum(1 for w in self._grp_win.values()
+                                if w["until"] > now))
+            out["risk_limits"] = dict(
+                self._risk, mode=RISK_LIMITS, primed=self._risk_primed,
+                event_limit=[RISK_EVENT_FLOOR, RISK_EVENT_DAYS],
+                group_limit=[RISK_GROUP_FLOOR, RISK_GROUP_DAYS],
+                skew_from=RISK_SKEW_FROM, exempt=list(RISK_EXEMPT),
+                pass_open=self._risk_pass is not None)
             # back of the line (2026-10-17, BACK_OF_LINE)
             plan = self._bol_plan
             out["back_of_line"] = dict(self._bol, mode=BACK_OF_LINE,
@@ -28894,6 +29658,29 @@ class IncentiveMarketMaker:
                   f"{SWEEP_HOLD_SECS:.0f}s" if SWEEP_ESCALATE == "dry" else "")
                + ("" if SWEEP_BREAKER == "on" else
                   f" (the breaker itself is {SWEEP_BREAKER})")))
+        log(f"group breaker (2026-10-17): {SWEEP_GROUP}"
+            + ("" if SWEEP_GROUP == "off" else
+               f" -- maker fills on the same side in two events of one group "
+               f"(NFL game, Carbon Arc panel, US general elections, state "
+               f"legislatures, USDA corn) within "
+               f"{SWEEP_GROUP_WINDOW_SECS / 60:g} min hold that side of the "
+               f"group {SWEEP_GROUP_HOLD_SECS / 60:g} min"
+               + (f" (fills of {SWEEP_GROUP_MIN_CT:g}+)" if SWEEP_GROUP_MIN_CT > 0 else "")
+               + (" -- LOGGED only (ws_group_<date>.jsonl), nothing pulled"
+                  if SWEEP_GROUP == "dry" else "")
+               + ("" if SWEEP_BREAKER != "off" else
+                  " (inactive: it reads the sweep breaker's fills, which is off)")))
+        log(f"dollar limits + skew (2026-10-17): {RISK_LIMITS}"
+            + ("" if RISK_LIMITS == "off" else
+               f" -- a side whose full fill would put its event past "
+               f"max(${RISK_EVENT_FLOOR:g}, {RISK_EVENT_DAYS:g} days of its reward) "
+               f"or its group past max(${RISK_GROUP_FLOOR:g}, {RISK_GROUP_DAYS:g} "
+               f"days) of worst case would block, one in an event or group past "
+               f"{RISK_SKEW_FROM:.0%} of its limit would skew; LOGGED only "
+               f"(risk_dry_<date>.jsonl), judged between cycles; exempt "
+               f"{', '.join(p + '*' for p in RISK_EXEMPT) or '-'}"
+               + ("" if WS_MODE in ("on", "shadow") else
+                  " (no WS feed: inactive)")))
         log(f"back of the line (2026-10-17): {BACK_OF_LINE}"
             + ("" if BACK_OF_LINE == "off" else
                f" -- every {BACK_OF_LINE_EVERY_SECS:g}s, a whole-cent rung with >= "

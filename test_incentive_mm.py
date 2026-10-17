@@ -29574,5 +29574,326 @@ class TestRateLimitWatch(unittest.TestCase):
                          (2, 1, "GET /trade-api/v2/portfolio/events/orders"))
 
 
+class TestRiskGroups(unittest.TestCase):
+    """The same-underlying groups the cross-event breaker and the dollar
+    limits share (Jack 2026-10-17: "On 2, what groupings make sense? They'd
+    need to be tied to same underlying")."""
+
+    def setUp(self):
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+
+    def test_nfl_by_game_never_mentions_or_season_markets(self):
+        g = imm.risk_group
+        self.assertEqual(g("KXNFLLADDERRECYDS-26OCT19DALWSH-DALCLAMB88"),
+                         "NFL game 26OCT19DALWSH")
+        self.assertEqual(g("KXNFLESCALATORRSHYDS-26OCT19DALWSH-WSHBROBINSON24"),
+                         "NFL game 26OCT19DALWSH")
+        self.assertIsNone(g("KXNFLMENTION-26OCT19DALWSH-TOUCHDOWN"))
+        self.assertIsNone(g("KXNFLXAPP-26NOV08-T60"))
+        self.assertIsNone(g("KXNFLMVP-27-JALLEN"))
+
+    def test_carbon_arc_by_panel_corn_and_the_approval_link(self):
+        cats = {"KXAMZNCC": "credit card", "KXAMZNFT": "foot traffic"}
+        with mock.patch.object(imm, "ca_category", lambda s: cats.get(s)):
+            self.assertEqual(imm.risk_group("KXAMZNCC-26NOV07-T104"), "Carbon Arc credit card")
+            self.assertEqual(imm.risk_group("KXAMZNFT-26NOV07-T99"), "Carbon Arc foot traffic")
+        self.assertEqual(imm.risk_group("KXIACORNYIELD-26-T200"), "USDA corn yields")
+        self.assertIsNone(imm.risk_group("KXTRUMPAPPROVE-26OCT20-T44"))
+        self.assertIsNone(imm.risk_group("KXRAINNYCM-26OCT-T3"))
+
+    def test_elections_follow_the_dashboard_groups(self):
+        tags = {"KXSENATEMEG": ["US Elections", "Senate"], "KXBRPRES": ["Foreign Elections"],
+                "KXCAPROP50": ["Referendums"]}
+        cache = {"series": {s: {"t": t} for s, t in tags.items()}}
+        with mock.patch.object(imm, "election_series", lambda s: True), \
+                mock.patch.object(imm, "dash_cache", lambda name: cache):
+            self.assertEqual(imm.risk_group("KXSENATEMEG-26-D"), "US general elections")
+            # no tags read yet: the dashboard calls it general too
+            self.assertEqual(imm.risk_group("KXPRESRUN-28-GNEWSOM"), "US general elections")
+            self.assertEqual(imm.risk_group("KXSTATELEG-NCHOUSE26-D"), "State legislatures")
+            self.assertEqual(imm.risk_group("KXPAHOUSE-26-D"), "State legislatures")
+            for t in ("KXATTYGENTX-26-D", "KXHOUSETX12-26-R", "KXDENTONCOUNTYJUDGE-26-X",
+                      "KXNYCMAYOR-25-X", "KXTURNOUTGA-26-T50", "KXDEMMENVOTE-26-T40",
+                      "KXBRPRES-26-LULA", "KXCAPROP50-25-YES"):
+                self.assertIsNone(imm.risk_group(t), t)
+        with mock.patch.object(imm, "election_series", lambda s: False):
+            self.assertIsNone(imm.risk_group("KXSENATEMEG-26-D"))
+
+
+class TestRiskWorstCase(unittest.TestCase):
+    """An event's worst case to settlement from its marks (the dashboard's
+    event_worst_case, ported for the dollar limits)."""
+
+    def test_a_strike_ladder_nets_by_settlement_value(self):
+        st = {"A": ("greater", 10.0, None, "binary"), "B": ("greater", 20.0, None, "binary")}
+        held = [("A", 10.0, 50.0), ("B", -10.0, 30.0)]   # a call spread
+        # below 10: -5 + 3; 10-20: +5 + 3; above 20: +5 - 7
+        self.assertAlmostEqual(imm.risk_event_worst(held, st), -2.0)
+        # no structure read: every market's own worst
+        self.assertAlmostEqual(imm.risk_event_worst(held, {}), -12.0)
+        self.assertAlmostEqual(imm.risk_event_worst(held, {"A": st["A"]}), -12.0)
+
+    def test_an_exclusive_event_takes_the_worst_winner(self):
+        st = {"A": ("custom", None, None, "binary"), "B": ("custom", None, None, "binary")}
+        held = [("A", 10.0, 30.0), ("B", 10.0, 30.0)]
+        self.assertAlmostEqual(imm.risk_event_worst(held, st, True, 3), -6.0)   # a third wins
+        self.assertAlmostEqual(imm.risk_event_worst(held, st, True, 2), 0.0)    # one of ours wins
+        self.assertAlmostEqual(imm.risk_event_worst(held, st, False, 3), -6.0)  # independent
+
+    def test_unmarked_and_flat_markets_are_left_out(self):
+        self.assertEqual(imm.risk_event_worst([("A", 10.0, None), ("B", 0.0, 50.0)], {}), 0.0)
+
+
+class TestGroupBreaker(unittest.TestCase):
+    """The CROSS-EVENT BREAKER (SWEEP_GROUP, Jack 2026-10-17: "#2 log-only"):
+    maker fills on the same side in two events of one group within 10 min
+    hold that side of the group for 30."""
+    A = "KXNFLLADDERRECYDS-26OCT19DALWSH-DALCLAMB88"
+    B = "KXNFLESCALATORRSHYDS-26OCT19DALWSH-WSHBROBINSON24"
+    C = "KXNFLLADDERRECYDS-26OCT26NYGPHI-NYGMNABERS1"
+    G = "NFL game 26OCT19DALWSH"
+
+    def setUp(self):
+        _clean_persist()
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 120.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "off"), ("SWEEP_GROUP", "dry"),
+                        ("SWEEP_GROUP_WINDOW_SECS", 600.0),
+                        ("SWEEP_GROUP_HOLD_SECS", 1800.0), ("SWEEP_GROUP_MIN_CT", 0.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.bot._resting_view = {
+            t: [{"order_id": f"{t[-6:]}-{s}", "side": s,
+                 "px": 40.0 if s == "bid" else 45.0, "rem": 50.0,
+                 "placed": self.now - 60, "pad": False} for s in ("bid", "ask")]
+            for t in (self.A, self.B, self.C)}
+        self.bot._last_panel = {t: {"est_frac": 0.1, "pool_per_day": 20.0}
+                                for t in (self.A, self.B, self.C)}
+        self.n = 0
+
+    def _fill(self, dt, t, side="bid", count=5.0):
+        """A partial maker fill on our `side` order of `t`, dt s after now."""
+        oid = next(o["order_id"] for o in self.bot._resting_view[t] if o["side"] == side)
+        self.n += 1
+        self.feed.events = [("fill", {"order_id": oid, "market_ticker": t,
+                                      "count_fp": f"{count:.2f}", "is_taker": False,
+                                      "ts_ms": int((self.now + dt) * 1000),
+                                      "trade_id": f"tr{self.n}"})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _lines(self, ev=None):
+        return [r for name, r in self.recs if name == "ws_group" and (ev is None or r["ev"] == ev)]
+
+    def test_dry_logs_the_trip_and_the_held_fills_and_pulls_nothing(self):
+        self._fill(0, self.A)
+        self.assertEqual(self._lines(), [])
+        self._fill(120, self.B)
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["group"], trip["side"], trip["gap_s"]),
+                         ("dry", self.G, "bid", 120.0))
+        self.assertEqual((trip["first"]["ticker"], trip["second"]["ticker"]), (self.A, self.B))
+        self.assertEqual(sorted(p[1] for p in trip["pull"]),
+                         [self.A[-6:] + "-bid", self.B[-6:] + "-bid"])
+        self.assertEqual((trip["markets"], trip["group_day"], trip["side_day"]), (2, 4.0, 2.0))
+        self.assertEqual(self.cancelled, [])
+        self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 121))
+        self._fill(300, self.A)                     # inside the would-be hold
+        held, = self._lines("held_fill")
+        self.assertEqual((held["mode"], held["ticker"], held["since_trip_s"]),
+                         ("dry", self.A, 180.0))
+        self._fill(310, self.A, "ask")              # the other side: one fill, no trip
+        self._fill(320, self.C)                     # another game
+        self.assertEqual((len(self._lines("trip")), len(self._lines("held_fill"))), (1, 1))
+        self.assertEqual((self.bot._grp["trips"], self.bot._grp["held_fills"]), (1, 1))
+
+    def test_same_event_or_too_far_apart_never_trips(self):
+        self._fill(0, self.A)
+        self._fill(60, self.A)                      # the same event
+        self._fill(60 + 601, self.B)                # 601s after A's last fill
+        self.assertEqual(self._lines("trip"), [])
+
+    def test_a_size_floor_skips_small_fills(self):
+        with mock.patch.object(imm, "SWEEP_GROUP_MIN_CT", 10.0):
+            self._fill(0, self.A, count=5.0)
+            self._fill(60, self.B, count=20.0)
+            self.assertEqual(self._lines("trip"), [])
+            self._fill(120, self.A, count=10.0)
+            self.assertEqual(len(self._lines("trip")), 1)
+
+    def test_on_holds_that_side_and_pulls_its_orders(self):
+        with mock.patch.object(imm, "SWEEP_GROUP", "on"):
+            self._fill(0, self.A)
+            self._fill(60, self.B)
+            self.assertEqual(sorted(self.cancelled),
+                             [(self.A[-6:] + "-bid", "group_breaker"),
+                              (self.B[-6:] + "-bid", "group_breaker")])
+            self.assertTrue(self.bot.group_held(self.A, "bid", self.now + 61))
+            self.assertTrue(self.bot.group_held(self.B, "bid", self.now + 61))
+            self.assertFalse(self.bot.group_held(self.A, "ask", self.now + 61))
+            self.assertFalse(self.bot.group_held(self.C, "bid", self.now + 61))
+            self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 60 + 1801))
+            self.assertEqual(self.bot._grp["trips_live"], 1)
+        # dry or off: nothing is ever held
+        self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 61))
+
+    def test_off_does_nothing(self):
+        with mock.patch.object(imm, "SWEEP_GROUP", "off"):
+            self._fill(0, self.A)
+            self._fill(60, self.B)
+        self.assertEqual((self._lines(), self.bot._grp["fills"]), ([], 0))
+
+
+class TestRiskLimits(unittest.TestCase):
+    """DOLLAR WORST-CASE LIMITS + SKEW, dry (RISK_LIMITS, Jack 2026-10-17:
+    "#4 and #5 together as one log-only build"): a side whose full fill would
+    put its event (or group) past its dollar limit would block; one in an
+    event or group past half its limit would skew; a reducing side is ok."""
+    E = "KXFOO-26OCT20"
+    T = E + "-A"
+    U = "KXBAR-26OCT20-A"
+
+    def setUp(self):
+        _clean_persist()
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.groups = {}
+        for name, v in (("RISK_LIMITS", "dry"), ("RISK_EVENT_FLOOR", 150.0),
+                        ("RISK_EVENT_DAYS", 30.0), ("RISK_GROUP_FLOOR", 200.0),
+                        ("RISK_GROUP_DAYS", 30.0), ("RISK_SKEW_FROM", 0.5),
+                        ("RISK_PASS_EVERY_SECS", 60.0), ("RISK_SUMMARY_SECS", 30.0),
+                        ("RISK_EXEMPT", ("KXPRESRUN",)),
+                        ("dash_cache", lambda name: {}),
+                        ("risk_group_of", lambda t: self.groups.get(t))):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        # long 200 YES at 50c: worst $100 of a $150 limit (est $1/day)
+        self.bot._risk_positions = {self.T: 200.0}
+        self.bot.state.last_mark[self.T] = 50.0
+        self.bot._last_panel = {self.T: {"est_frac": 0.1, "pool_per_day": 10.0},
+                                self.U: {"est_frac": 0.1, "pool_per_day": 10.0,
+                                         "ext_bid": 39.0, "ext_ask": 41.0}}
+        self.view(bid=150.0, ask=50.0)
+        self.t = 0.0
+
+    def view(self, bid=0.0, ask=0.0, u_bid=100.0):
+        v = {}
+        for t, side, rem, px in ((self.T, "bid", bid, 49.0), (self.T, "ask", ask, 51.0),
+                                 (self.U, "bid", u_bid, 39.0)):
+            if rem > 0:
+                v.setdefault(t, []).append({"order_id": f"{t}-{side}", "side": side,
+                                            "px": px, "rem": rem, "placed": 0.0,
+                                            "pad": False})
+        self.bot._resting_view = v
+
+    def run_pass(self):
+        """Start (and finish) the next pass: one budget is plenty here."""
+        self.t += 61.0
+        self.bot._risk_step(self.now + self.t, 5.0)
+
+    def states(self):
+        return [(r["ticker"], r["side"], r["prev"], r["state"])
+                for name, r in self.recs if name == "risk_dry" and r["ev"] == "state"]
+
+    def test_prime_then_block_skew_and_none(self):
+        self.run_pass()                                 # the priming pass
+        starts = [r for name, r in self.recs if r["ev"] == "start"]
+        self.assertEqual((len(starts), self.states()), (1, []))
+        self.run_pass()
+        # the bid: +150 -> worst $175 of $150: block; the ask reduces: ok;
+        # KXBAR's bid adds $40 of $150: ok
+        self.assertEqual(self.states(), [(self.T, "bid", "ok", "block")])
+        blk = [r for name, r in self.recs if r.get("state") == "block"][0]
+        self.assertEqual((blk["by"], blk["w0"], blk["w1"], blk["lim_e"], blk["fit"]),
+                         ("event", -100.0, -175.0, 150.0, 0.667))
+        self.assertAlmostEqual(blk["side_day"], 0.5)
+        self.view(bid=50.0, ask=50.0)                   # +50 -> $125: inside, but past half
+        self.run_pass()
+        self.assertEqual(self.states()[-1], (self.T, "bid", "block", "skew"))
+        self.view(ask=50.0)                             # no bid left: its state ends
+        self.run_pass()
+        self.assertEqual(self.states()[-1], (self.T, "bid", "skew", "none"))
+        summ = [r for name, r in self.recs if r["ev"] == "pass"]
+        self.assertEqual([(s["block"], s["skew"]) for s in summ], [(1, 0), (0, 1), (0, 0)])
+        self.assertEqual(self.bot._risk["passes"], 3)
+
+    def test_the_pass_waits_its_interval(self):
+        self.run_pass()
+        self.run_pass()
+        n = len(self.recs)
+        self.bot._risk_step(self.now + self.t + 10.0, 5.0)   # 10s later: no new pass
+        self.assertEqual(len(self.recs), n)
+
+    def test_a_directional_group_counts_only_sides_with_its_direction(self):
+        # a Carbon Arc panel short $150 (300 short at 50c) of a $200 limit,
+        # and a new event with 120 to buy and 120 to sell at 50c
+        X, Y = "KXAAACC-26NOV07-T1", "KXBBBCC-26NOV07-T1"
+        self.groups = {X: "Carbon Arc credit card", Y: "Carbon Arc credit card"}
+        self.bot._risk_positions = {X: -300.0}
+        self.bot.state.last_mark[X] = 50.0
+        self.bot._last_panel = {Y: {"est_frac": 0.0, "pool_per_day": 10.0,
+                                    "ext_bid": 49.0, "ext_ask": 51.0}}
+        self.bot._resting_view = {Y: [
+            {"order_id": "yb", "side": "bid", "px": 49.0, "rem": 120.0, "placed": 0.0, "pad": False},
+            {"order_id": "ya", "side": "ask", "px": 51.0, "rem": 120.0, "placed": 0.0, "pad": False}]}
+        self.run_pass()
+        self.run_pass()
+        # the ask adds $60 short -> $210 of $200: block; the bid (against the
+        # panel's direction) only meets its own event's $150
+        self.assertEqual(self.states(), [(Y, "ask", "ok", "block")])
+        blk = [r for name, r in self.recs if r.get("state") == "block"][0]
+        self.assertEqual((blk["by"], blk["gdir"], blk["with_dir"], blk["u1g"]),
+                         ("group", "short", True, 1.05))
+        # the same book in a group whose YES point both ways: both sides count
+        self.recs.clear()
+        self.groups = {X: "NFL game 26OCT19DALWSH", Y: "NFL game 26OCT19DALWSH"}
+        self.bot._risk_side.clear()
+        self.bot._risk_ev.clear()
+        self.run_pass()
+        self.assertEqual(sorted(self.states()), [(Y, "ask", "ok", "block"),
+                                                 (Y, "bid", "ok", "block")])
+
+    def test_exempt_events_are_left_out_of_everything(self):
+        P = "KXPRESRUN-28-GNEWSOM"
+        self.groups = {P: "US general elections"}
+        self.bot._risk_positions = {P: -2000.0}
+        self.bot.state.last_mark[P] = 10.0
+        self.bot._resting_view = {P: [{"order_id": "p", "side": "ask", "px": 9.0,
+                                       "rem": 500.0, "placed": 0.0, "pad": False}]}
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.states(), [])
+        summ = [r for name, r in self.recs if r["ev"] == "pass"][-1]
+        self.assertEqual((summ["worst_total"], summ["exempt_worst"], summ["groups"]),
+                         (0.0, -1800.0, {}))
+
+    def test_off_and_failures_never_raise(self):
+        with mock.patch.object(imm, "RISK_LIMITS", "off"):
+            self.run_pass()
+            self.run_pass()
+        self.assertEqual(self.recs, [])
+        with mock.patch.object(self.bot, "_risk_eval_event", side_effect=RuntimeError("x")):
+            self.run_pass()
+        self.assertEqual(self.bot._risk["fails"], 1)
+        self.assertIsNone(self.bot._risk_pass)
+
+
 if __name__ == "__main__":
     unittest.main()
