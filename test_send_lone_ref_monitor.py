@@ -222,6 +222,7 @@ class TestVerdict(unittest.TestCase):
                           max_flaps=28, max_flaps_side="KXRAINWKND-26OCT17-NYC bid",
                           would_be_trades=3, tape_done=True, let_thru_guarded_n=0,
                           would_be_by_cls={"at the touch": -5.0, "inside the book": 25.0},
+                          gates={"none": [300, 6.0, -12.0], "carbon arc": [42, 1.6, -8.0]},
                           let_thru_guarded=0.0, let_thru_skipped_n=13, let_thru_skipped=-19.0))
         self.assertEqual(lm.subject_for(ctx),
                          "IMM lone-ref guard 10/16: +$12 (blocking fills +$20, reward -$8) | OK")
@@ -232,6 +233,44 @@ class TestVerdict(unittest.TestCase):
         ctx["d"]["would_be"] = 21.0
         self.assertIn("blocked would have made $21", lm.render_text(ctx))
         self.assertIn("Held 342 times on 92 sides of 88 markets", text)
+
+
+class TestFairGates(unittest.TestCase):
+    """Jack 2026-10-17: "Keep as is but monitor in daily emails" -- the email
+    splits the guard by whether the market has a fair gate."""
+
+    def test_the_bot_s_own_checks_name_the_gate(self):
+        with mock.patch.object(imm, "CA_FAIR_ENABLE", True), \
+                mock.patch.object(imm, "carbon_arc_settled", lambda s: s == "KXAMZNCC"), \
+                mock.patch.object(imm, "rain_wknd_series", lambda s: s == "KXRAINWKND"), \
+                mock.patch.object(imm, "vercel_series", lambda s: s == "KXVERCEL"):
+            self.assertEqual(lm.fair_gate_of("KXAMZNCC"), "carbon arc")
+            self.assertEqual(lm.fair_gate_of("KXRAINWKND"), "rain weekend")
+            self.assertEqual(lm.fair_gate_of("KXVERCEL"), "vercel")
+            self.assertEqual(lm.fair_gate_of("KXLOLTEEMO"), "")
+
+    def test_totals_and_the_watch(self):
+        gate = {"KXAMZNCC": "carbon arc", "KXRAINWKND": "rain weekend"}.get
+        eps = [dict(ticker="KXAMZNCC-1", cost=3.0), dict(ticker="KXLOLTEEMO-Y", cost=1.0),
+               dict(ticker="KXRAINWKND-NYC", cost=0.5)]
+        top = [(35.1, "KXRAINWKND-NYC"), (-6.3, "KXAMZNCC-1"), (-10.0, "KXLOLTEEMO-Y")]
+        g = lm.gate_totals(eps, top, lambda tk: gate(tk.split("-")[0], ""))
+        self.assertEqual(g, {"carbon arc": [1, 3.0, -6.3], "none": [1, 1.0, -10.0],
+                             "rain weekend": [1, 0.5, 35.1]})
+        self.assertAlmostEqual(lm.gate_net(g["rain weekend"]), -35.6)
+        day = dict(mode="on", hours=24.0, let_thru_guarded=0.0, cost=4.5, net=-19.3,
+                   max_flaps=3, max_flaps_side="")
+        lvl, why = lm.verdict(day, dict(days=4.0, net=60.0, gates=g))
+        self.assertEqual(lvl, "WATCH")
+        self.assertTrue(any("fair-gated rain weekend" in r for r in why))
+        self.assertFalse(any("carbon arc" in r for r in why))      # it saved money
+        # not before RUN_MIN_DAYS
+        self.assertFalse(any("fair-gated" in r for r in
+                             lm.verdict(day, dict(days=1.0, net=60.0, gates=g))[1]))
+        line = lm.fair_line(dict(gates=g), dict(gates=g))
+        self.assertTrue(line.startswith("Fair value: markets with a fair gate net -$32 today"))
+        self.assertIn("markets without +$9", line)
+        self.assertIn("Carbon Arc +$3 (+$3 running; replay -$2/day)", line)
 
 
 class TestDryRun(unittest.TestCase):

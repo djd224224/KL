@@ -76,6 +76,18 @@ COST_WATCH_PER_DAY = 35.0
 DAY_NET_WATCH = -10.0
 RUN_NET_PROBLEM = -50.0         # running net once RUN_MIN_DAYS have passed
 RUN_MIN_DAYS = 3
+# FAIR VALUE (Jack 2026-10-17: "Don't we have fair value on rain though? So
+# shouldn't this guard apply where we don't have fair value" -> "Keep as is
+# but monitor in daily emails"). The replay (9/30-10/16, mentions out) had
+# the guard at +$9.56/day on fair-gated markets and +$17.44 on the rest:
+# fair gates leak (OpenRouter share, RT first reviews, weekend rain's wide
+# band). Only Carbon Arc and Vercel lost money, ~-$1.8/day each. The email
+# splits every day and the running totals by gate, names these, and WATCHes
+# a fair-gated family whose running net reaches FAIR_GATE_WATCH.
+FAIR_GATE_WATCH = -25.0
+FAIR_NAMED = ("carbon arc", "vercel", "rain weekend")
+REPLAY_GATE_NET_PER_DAY = {"carbon arc": -1.8, "vercel": -1.8, "rain weekend": 2.7}
+FAIR_NAMED_LABEL = {"carbon arc": "Carbon Arc", "vercel": "Vercel", "rain weekend": "Weekend rain"}
 FLAP_WATCH = 200                # one side held this many times in the day (a storm;
                                 # the inside-the-book ladders flap ~100/day on their own)
 KALSHI = os.environ.get("IMM_LONE_REF_MONITOR_KALSHI",
@@ -508,6 +520,66 @@ def save_store(data: dict) -> None:
     os.replace(tmp, store_path())
 
 
+def fair_gate_of(series: str) -> str:
+    """The fair gate the bot's quote loop runs on this series ('' = none),
+    by the bot's own series checks. Mirrors the gates in
+    IncentiveMarketMaker.run_cycle as of 2026-10-17; a gate added there
+    later reads as no fair value here until it is added below."""
+    t = series + "-X"
+
+    def on(name: str, *args) -> bool:
+        f = getattr(imm, name, None)
+        try:
+            return bool(f(*args)) if f is not None else False
+        except Exception:
+            return False
+
+    checks = (
+        ("carbon arc", getattr(imm, "CA_FAIR_ENABLE", False) and on("carbon_arc_settled", series)),
+        ("openrouter tokens", getattr(imm, "OR_FAIR_ENABLE", False)
+         and series in getattr(imm, "OR_FAIR_SERIES", ())),
+        ("openrouter share", on("share_fair_series", series)),
+        ("rain monthly", on("rain_monthly_series", series)),
+        ("rain period", on("rain_period_gated", t)),
+        ("snow monthly", on("snow_monthly_series", series)),
+        ("cpi", on("cpi_fair_series", series)),
+        ("rain weekend", on("rain_wknd_series", series)),
+        ("rotten tomatoes", on("rt_fair_series", series)),
+        ("gasbuddy", getattr(imm, "GB_FAIR_ENABLE", False) and on("gb_fair_series", series)),
+        ("datacenter", getattr(imm, "DC_GATE_ENABLE", False) and on("datacenter_series", series)),
+        ("quake", on("quake_gated", series)),
+        ("vercel", on("vercel_series", series)),
+        ("yt2", on("yt2_series", series)),
+        ("yt weekly", on("ytw_series", series)),
+        ("yt1", on("yt1_series", series)),
+        ("treasury", on("treasury_gated_series", series)),
+        ("mortgage", on("mort_series", series)),
+        ("pokemon", on("poke_series", series)),
+        ("nfl props", on("nfl_series", series)),
+    )
+    for name, hit in checks:
+        if hit:
+            return name
+    return ""
+
+
+def gate_totals(eps: list, top: list, gate_for) -> dict:
+    """gate ('none' = no fair value) -> [holds, reward given up, blocked-fill $]
+    from the day's holds and its would-be fills ((usd, ticker, ...) rows)."""
+    out: dict = defaultdict(lambda: [0, 0.0, 0.0])
+    for e in eps:
+        g = out[gate_for(e["ticker"]) or "none"]
+        g[0] += 1
+        g[1] += e["cost"]
+    for x in top:
+        out[gate_for(x[1]) or "none"][2] += x[0]
+    return {k: [v[0], round(v[1], 4), round(v[2], 4)] for k, v in out.items()}
+
+
+def gate_net(v) -> float:
+    return -v[2] - v[1]
+
+
 def families() -> dict:
     """series -> family name, from the dashboard data object."""
     try:
@@ -551,6 +623,12 @@ def verdict(day: dict, run: dict) -> tuple:
         flag(1, f"{day['max_flaps_side']} held {day['max_flaps']} times (flapping)")
     if run["days"] >= RUN_MIN_DAYS and run["net"] <= RUN_NET_PROBLEM:
         flag(2, f"running net {usd(run['net'])} over {run['days']:.1f} days")
+    if run["days"] >= RUN_MIN_DAYS:
+        for g, v in sorted((run.get("gates") or {}).items()):
+            if g != "none" and gate_net(v) <= FAIR_GATE_WATCH:
+                flag(1, f"fair-gated {g}: running net {usd(gate_net(v))} over "
+                        f"{run['days']:.1f} days -- the guard costs more than it saves "
+                        f"there; candidate to leave out")
     return LEVELS[level], reasons
 
 
@@ -601,6 +679,15 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
              let_thru_guarded=sum(x[3] or 0.0 for x in g), let_thru_guarded_n=len(g),
              let_thru_skipped=sum(x[3] or 0.0 for x in s), let_thru_skipped_n=len(s))
     d["net"] = -d["would_be"] - d["cost"]
+    gate_cache: dict = {}
+
+    def gate_for(tk: str) -> str:
+        se = tk.split("-")[0]
+        if se not in gate_cache:
+            gate_cache[se] = fair_gate_of(se)
+        return gate_cache[se]
+
+    d["gates"] = gate_totals(eps, tape["top"], gate_for)
     by_fam = defaultdict(lambda: [0, 0.0, 0.0])
     for e in eps:
         b = by_fam[famof(e["ticker"])]
@@ -614,6 +701,14 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
                cost=sum(v["cost"] for v in store.values()),
                avoided=sum(-v["would_be"] for v in store.values()),
                let_thru=sum(v["let_thru_guarded"] for v in store.values()))
+    run_gates: dict = defaultdict(lambda: [0, 0.0, 0.0])
+    for v in store.values():
+        for g, x in (v.get("gates") or {}).items():
+            r = run_gates[g]
+            r[0] += x[0]
+            r[1] += x[1]
+            r[2] += x[2]
+    run["gates"] = {k: list(v) for k, v in run_gates.items()}
     level, reasons = verdict(d, run)
     d["level"] = level
     return dict(d=d, run=run, level=level, reasons=reasons, store=store,
@@ -629,6 +724,25 @@ def subject_for(ctx) -> str:
     day = datetime.strptime(d["day"], "%Y-%m-%d")
     return (f"IMM lone-ref guard {day:%m/%d}: {usd(d['net'])} "
             f"(blocking fills {usd(-d['would_be'])}, reward {usd(-d['cost'])}) | {ctx['level']}")
+
+
+def fair_line(d: dict, run: dict) -> str:
+    """Fair-gated vs no-fair-value markets, today and running, and the named
+    families (Carbon Arc, Vercel, weekend rain) against the replay."""
+    def split(gates):
+        fair = [v for g, v in gates.items() if g != "none"]
+        return (sum(gate_net(v) for v in fair),
+                gate_net(gates.get("none", [0, 0.0, 0.0])))
+
+    gt, rg = d.get("gates") or {}, run.get("gates") or {}
+    f_d, n_d = split(gt)
+    f_r, n_r = split(rg)
+    named = "; ".join(
+        f"{FAIR_NAMED_LABEL[g]} {usd(gate_net(gt.get(g, [0, 0.0, 0.0])))} "
+        f"({usd(gate_net(rg.get(g, [0, 0.0, 0.0])))} running; replay "
+        f"{usd(REPLAY_GATE_NET_PER_DAY[g])}/day)" for g in FAIR_NAMED)
+    return (f"Fair value: markets with a fair gate net {usd(f_d)} today ({usd(f_r)} running), "
+            f"markets without {usd(n_d)} ({usd(n_r)} running). {named}.")
 
 
 def render_text(ctx) -> str:
@@ -657,6 +771,7 @@ def render_text(ctx) -> str:
            "" if d["tape_done"] else " (tape read cut short by its time budget)")
         + (" -- at the touch " + usd(by_cls.get("at the touch", 0.0)) + ", inside the book "
            + usd(by_cls.get("inside the book", 0.0)) if by_cls else "") + ".",
+        fair_line(d, run),
         f"Let through: {d['let_thru_guarded_n']} jumped full-rung fills on guarded series "
         f"{usd(d['let_thru_guarded'])}; mention books (not guarded) "
         f"{d['let_thru_skipped_n']} {usd(d['let_thru_skipped'])}.",
@@ -670,6 +785,11 @@ def render_detail(ctx) -> str:
     out = ["by family: holds, minutes held, reward given up"]
     for f, b in sorted(ctx["by_fam"].items(), key=lambda kv: -kv[1][2]):
         out.append(f"  {f[:30]:30s} {b[0]:4d} holds {b[1] / 60:7.1f} min  ${b[2]:6.2f}")
+    out.append("by fair gate: holds, reward given up, blocked-fill $, net today / running")
+    rg = ctx["run"].get("gates") or {}
+    for g, v in sorted((ctx["d"].get("gates") or {}).items(), key=lambda kv: gate_net(kv[1])):
+        out.append(f"  {g[:20]:20s} {v[0]:5d} holds  ${v[1]:6.2f}  {usd(v[2]):>6s}  "
+                   f"{usd(gate_net(v)):>6s} / {usd(gate_net(rg.get(g, v))):>6s}")
     out.append("most-held sides: " + ", ".join(f"{k[0]} {k[1]} x{v}" for k, v in ctx["top_flaps"]))
     out.append("losses its holds avoided: " + (", ".join(
         f"{t} {s} @{r} {n:.0f}ct {usd(u)} ({c})" for u, t, s, r, n, c in ctx["top_avoided"])
