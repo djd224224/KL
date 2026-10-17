@@ -40,7 +40,7 @@ from imm_fast_cancel_report import ET, load_markouts, markout
 DEFAULT_DIR = r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm"
 GRACE_S = 2.0          # a fill up to 2s after a state ended still counts in it
 ALIVE_S = 600.0        # a run's states end at most 10 min after its last line
-MIN_TRIPS = 10         # fewer trips (or states) than this: too few to call
+MIN_TRIPS = 10         # fewer trips (or marked fills) than this: too few to call
 
 
 def _ts(s):
@@ -111,6 +111,8 @@ class Tally:
 
 
 def money(x):
+    if abs(x) < 0.005:
+        x = 0.0                         # never "$-0.00"
     return f"-${-x:,.2f}" if x < 0 else f"${x:,.2f}"
 
 
@@ -255,12 +257,12 @@ def risk_section(w, rows, fills, marks, days, until):
                    "m4": loss, "m5": sum(s["t"].m5 for s in sp),
                    "hours": sum(s["end"] - s["start"] for s in sp) / 3600.0}
     b, k = res["block"], res["skew"]
-    w(f"**#4 block: {verdict(b['net'], len(b['spells']), 'block spell', 'WORTH BUILDING LIVE')}.** "
+    w(f"**#4 block: {verdict(b['net'], b['marked'], 'marked fill', 'WORTH BUILDING LIVE')}.** "
       f"Net {money(b['net'])} ({money(b['net'] / days)}/day): the blocked "
       f"sides took {plural(b['fills'], 'fill')} that lost {money(-b['m4'])} at 4 hours, "
       f"for {money(b['cost'])} of reward on those sides.")
     w("")
-    w(f"**#5 skew: {verdict(k['net'], len(k['spells']), 'skew spell', 'WORTH BUILDING LIVE')}.** "
+    w(f"**#5 skew: {verdict(k['net'], k['marked'], 'marked fill', 'WORTH BUILDING LIVE')}.** "
       f"Net {money(k['net'])} ({money(k['net'] / days)}/day): the skewed "
       f"sides took {plural(k['fills'], 'fill')} that lost {money(-k['m4'])} at 4 hours "
       f"(half saved a tick back: {money(k['saved'])}), for "

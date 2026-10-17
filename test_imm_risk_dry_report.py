@@ -102,6 +102,9 @@ class TestRiskDryReport(unittest.TestCase):
         self.assertIn("| their 4h mark-out | -$10.00 | -$5.00 |", out)
         self.assertIn("| reward given up | $0.04 | $0.04 |", out)
         self.assertIn("| net | $9.96 | $2.46 |", out)
+        # one marked fill each: too few to call
+        self.assertIn("#4 block: WATCH (only 1 marked fill: too few to call)", out)
+        self.assertIn("| their 5-min mark-out | $0.00 | $0.00 |", out)   # never "$-0.00"
         # the cap keeps half the block's side: half the saving, half the cost
         self.assertIn("about $4.98 net", out)
         self.assertIn("| event: KXA | $0.04 | $0.00 | 1 | -$10.00 |", out)
