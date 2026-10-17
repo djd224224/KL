@@ -47,6 +47,7 @@ imm.ADMIT_SUSTAIN_SECS = 0
 # TestRefreshJitter re-arm them.
 _PLACE_RATE_CODE_DEFAULT = imm.PLACE_RATE_PER_SEC
 _REFRESH_JITTER_CODE_DEFAULT = imm.ORDER_REFRESH_JITTER_SECS
+_WS_TICK_CODE_DEFAULT = imm.WS_TICK_SECS
 imm.PLACE_RATE_PER_SEC = 0.0
 imm.ORDER_REFRESH_JITTER_SECS = 0
 
@@ -24644,7 +24645,8 @@ class TestWritePacer(unittest.TestCase):
         return imm.WritePacer(rate, clock=lambda: self.t, sleep=sleep)
 
     def test_code_defaults(self):
-        self.assertEqual(_PLACE_RATE_CODE_DEFAULT, 12.0)
+        # 12 -> 24 (Jack 2026-10-17: "Raise to 24/s")
+        self.assertEqual(_PLACE_RATE_CODE_DEFAULT, 24.0)
         for k in ("PLACE_RATE_PER_SEC", "ORDER_REFRESH_JITTER_SECS",
                   "RESTART_REQUEST_MAX_AGE_SECS"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
@@ -25607,9 +25609,13 @@ class TestWSStaleEpisodes(unittest.TestCase):
         self.cancelled = []
         self.bot.cancel_order = lambda oid, reason="": \
             self.cancelled.append(oid) or True
-        p = mock.patch.object(imm, "WS_MODE", "shadow")
-        p.start()
-        self.addCleanup(p.stop)
+        # the episode lines only; first sightings (`seen` / `unseen`,
+        # 2026-10-17) have their own tests (TestFasterFastCancel)
+        for name, v in (("WS_MODE", "shadow"), ("WS_SEEN_LOG", False),
+                        ("WS_FAST_CONFIRM_HOLDOUT", 0.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _view(self, oid="o1", side="bid", px=49.0, rem=20.0):
         self.bot._resting_view = {self.T: [{
@@ -26403,6 +26409,12 @@ class TestWSNarrowGate(unittest.TestCase):
         self.bot._resting_view = {self.T: [{
             "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
             "placed": self.now - 100.0, "pad": False}]}
+        # the 1s two-look rule this class was written for; the faster
+        # confirm and its log are TestFasterFastCancel's
+        for name, v in (("WS_SEEN_LOG", False), ("WS_FAST_CONFIRM_SECS", 1.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _gate(self, mode, fast, gap):
         for name, v in (("WS_MODE", mode), ("WS_FAST", fast),
@@ -28982,6 +28994,905 @@ class TestCarbonArcShadow(unittest.TestCase):
         with mock.patch.object(imm, "ca_shadow_proposals", side_effect=ValueError("boom")):
             note(bot, self.meta(), self.BOOK, self.BOOK, 4, 96)      # swallowed
         os.remove(path)
+
+
+class TestSweepEscalation(unittest.TestCase):
+    """Repeat trips on an event hold it longer (SWEEP_ESCALATE, Jack
+    2026-10-17: "Build 1 without approvals, rain, mentions. Shorten the
+    counter to within 30min"): a trip within 30 min of the end of the event's
+    last hold is trip 2 (30 min), then 60 min; 30 min of quoting with no trip
+    starts over."""
+    E = "KXEVT-26OCT05"
+    A, B = E + "-A", E + "-B"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 120.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "dry"),
+                        ("SWEEP_ESCALATE_WINDOW_SECS", 1800.0),
+                        ("SWEEP_ESCALATE_HOLDS", (1800.0, 3600.0)),
+                        ("SWEEP_ESCALATE_EXCLUDE", ("KXTRUMPAPPROVE", "KXAPRPOTUS", "KXRAIN"))):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.n = 0
+
+    def _trip(self, dt, ticker=None):
+        """The bot re-quoted (a fresh order rests on `ticker`), and a fill
+        clears it `dt` seconds after self.now."""
+        t = ticker or self.A
+        self.n += 1
+        oid = f"o{self.n}"
+        self.bot._resting_view = {t: [{"order_id": oid, "side": "bid", "px": 40.0,
+                                       "rem": 20.0, "placed": self.now + dt - 60,
+                                       "pad": False}],
+                                  self.B: [{"order_id": oid + "b", "side": "ask",
+                                            "px": 45.0, "rem": 20.0,
+                                            "placed": self.now + dt - 60,
+                                            "pad": False}]}
+        self.feed.events = [("fill", {"order_id": oid, "market_ticker": t,
+                                      "count_fp": "20.00", "is_taker": False,
+                                      "ts_ms": int((self.now + dt) * 1000),
+                                      "trade_id": "t-" + oid})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _trips(self):
+        return [r for name, r in self.recs if name == "ws_sweep"]
+
+    def test_dry_logs_the_chain_and_every_hold_stays_plain(self):
+        self._trip(0)
+        self._trip(600)                         # 10 min later: trip 2
+        trips = self._trips()
+        self.assertEqual([(t["trip_n"], t["esc_hold_s"], t["hold_s"], t["esc"])
+                          for t in trips],
+                         [(1, 120.0, 120.0, "dry"), (2, 1800.0, 120.0, "dry")])
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 600 + 121))
+        # 15 min after trip 2: inside the 30 min `on` would hold -- shadowed,
+        # and it does not advance the chain
+        self._trip(1500)
+        t3 = self._trips()[-1]
+        self.assertEqual((t3["trip_n"], t3["esc_shadowed"], t3["hold_s"]), (2, True, 120.0))
+        s = self.bot._sweep
+        self.assertEqual((s["esc_2"], s["esc_3"], s["esc_shadowed"], s["esc_live"]),
+                         (1, 0, 1, 0))
+        # after the would-be hold (600 + 1800 = 2400) and within 30 min: trip 3
+        self._trip(2400 + 600)
+        t4 = self._trips()[-1]
+        self.assertEqual((t4["trip_n"], t4["esc_hold_s"], t4["esc_shadowed"]),
+                         (3, 3600.0, False))
+
+    def test_on_holds_trip_2_for_30_min_and_trip_3_for_60(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "on"):
+            self._trip(0)
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 100))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 121))
+            self._trip(600)
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 600 + 1799))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 600 + 1801))
+            # a fill inside the long hold (an order the budget left) is no trip
+            self._trip(600 + 900)
+            self.assertEqual(len(self._trips()), 2)
+            self._trip(2400 + 600)              # 10 min after the hold ended
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 3000 + 3599))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 3000 + 3601))
+        self.assertEqual([(t["trip_n"], t["hold_s"]) for t in self._trips()],
+                         [(1, 120.0), (2, 1800.0), (3, 3600.0)])
+        self.assertEqual(self.bot._sweep["esc_live"], 2)
+
+    def test_thirty_minutes_of_quoting_with_no_trip_starts_over(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "on"):
+            self._trip(0)
+            self._trip(120 + 1801)              # 30 min after the 2-min hold ended
+        self.assertEqual([(t["trip_n"], t["hold_s"]) for t in self._trips()],
+                         [(1, 120.0), (1, 120.0)])
+
+    def test_approval_and_rain_never_escalate(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "on"):
+            for i, t in enumerate(("KXRAIN-26OCT18-NYC", "KXRAINWKND-26OCT18-BOS")):
+                self._trip(i * 10000, ticker=t)
+                self._trip(i * 10000 + 600, ticker=t)
+        trips = self._trips()
+        self.assertEqual([(t["esc"], t["hold_s"]) for t in trips],
+                         [("excluded", 120.0)] * 4)
+        self.assertTrue(imm.sweep_escalate_excluded("KXTRUMPAPPROVE"))
+        self.assertTrue(imm.sweep_escalate_excluded("KXAPRPOTUS"))
+        self.assertTrue(imm.sweep_escalate_excluded("KXRAINNAPAM"))
+        self.assertFalse(imm.sweep_escalate_excluded("KXLOLTOURPENTA"))
+        self.assertEqual(self.bot._sweep_esc, {})
+
+    def test_off_keeps_no_chain(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "off"):
+            self._trip(0)
+            self._trip(600)
+        self.assertEqual([("trip_n" in t, "esc" in t, t["hold_s"]) for t in self._trips()],
+                         [(False, False, 120.0)] * 2)
+        self.assertEqual(self.bot._sweep_esc, {})
+
+    def test_the_escalated_hold_schedule(self):
+        self.assertEqual([imm.sweep_escalated_hold(n, 120.0) for n in (1, 2, 3, 7)],
+                         [120.0, 1800.0, 3600.0, 3600.0])
+        with mock.patch.object(imm, "SWEEP_ESCALATE_HOLDS", ()):
+            self.assertEqual(imm.sweep_escalated_hold(3, 120.0), 120.0)
+        self.assertEqual(imm._parse_minutes_list("30, 60,x,-1"), (1800.0, 3600.0))
+
+
+class TestBackOfLine(unittest.TestCase):
+    """BACK OF THE LINE (Jack 2026-10-17: "Build 7, back of the line."): a
+    whole-cent rung with enough other makers' size BEHIND it at its price is
+    amended +1 contract, which sends it to the back of Kalshi's line."""
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.bot.live = True                     # real orders: the pass reads the line
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.reads = []
+        self.ahead = {"o1": 10.0}
+        self.bot.client.get_queue_positions = lambda **kw: (
+            self.reads.append(kw) or {"queue_positions": [
+                {"order_id": k, "market_ticker": self.T, "queue_position_fp": f"{v:.2f}"}
+                for k, v in self.ahead.items()]})
+        self.amends = []
+        self.bot.client.amend_order = lambda **kw: self.amends.append(kw) or {}
+        for name, v in (("BACK_OF_LINE", "dry"), ("BACK_OF_LINE_EVERY_SECS", 60.0),
+                        ("BACK_OF_LINE_MIN_BEHIND", 20.0),
+                        ("BACK_OF_LINE_MIN_BEHIND_FRAC", 0.25),
+                        ("BACK_OF_LINE_COOLDOWN_SECS", 300.0),
+                        ("BACK_OF_LINE_MAX_BUMPS", 0), ("BACK_OF_LINE_MAX_PER_PASS", 100),
+                        ("BACK_OF_LINE_CHUNK", 40), ("BACK_OF_LINE_BUDGET_SECS", 8.0),
+                        ("PLACE_RATE_PER_SEC", 0.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        # our 60-lot bid at 41c on a 41c level of 360: 300 are other makers'
+        self.feed.books[self.T] = ({0.40: 500.0, 0.41: 360.0}, {0.55: 400.0})
+        self.view_order = {"order_id": "o1", "side": "bid", "px": 41.0, "rem": 60.0,
+                           "placed": self.now - 600, "pad": False}
+        self.bot._resting_view = {self.T: [self.view_order]}
+        self.resting = [{"order_id": "o1", "ticker": self.T, "book_side": "bid",
+                         "yes_price": 41, "remaining_count": 60.0, "fill_count": 5.0}]
+
+    def _pass(self, dt=0.0):
+        """The cycle's plan, then the between-cycles steps to the end."""
+        self.bot._back_of_line_pass(self.resting, self.now + dt)
+        for _ in range(50):
+            if not self.bot._back_of_line_step(self.now + dt, slice_secs=60.0):
+                break
+
+    def _rows(self):
+        return [r for name, r in self.recs if name == "back_of_line"]
+
+    def test_dry_logs_an_order_near_the_front_and_amends_nothing(self):
+        self._pass()
+        self.assertEqual(self.reads, [{"market_tickers": self.T}])
+        r = self._rows()[0]
+        self.assertEqual((r["mode"], r["order_id"], r["side"], r["px"], r["ahead"],
+                          r["ext"], r["behind"]),
+                         ("dry", "o1", "bid", 41, 10.0, 300.0, 290.0))
+        self.assertEqual(self.amends, [])
+        self.assertEqual((self.bot._bol["would_requeue"], self.bot._bol["requeued"]), (1, 0))
+
+    def test_on_moves_it_back_with_plus_one_then_restores_the_size(self):
+        """Jack 2026-10-17: "add this if it's cleaner" -- +1 sends it to the
+        back, the -1 right after keeps that place at the old size."""
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        self.assertEqual(len(self.amends), 2)
+        up, down = self.amends
+        # filled 5 + 61 resting: one more than the 65 the order holds; then 65
+        self.assertEqual((up["order_id"], up["ticker"], up["book_side"],
+                          up["yes_price_cents"], up["total_count"]),
+                         ("o1", self.T, "bid", 41, 66.0))
+        self.assertEqual((down["order_id"], down["yes_price_cents"], down["total_count"]),
+                         ("o1", 41, 65.0))
+        b = self.bot._bol
+        self.assertEqual((self.view_order["rem"], self.bot._bol_bumps["o1"],
+                          b["requeued"], b["restored"], b["restore_fails"]),
+                         (60.0, 1, 1, 1, 0))
+        row = self._rows()[0]
+        self.assertEqual((row["ok"], row["restored"]), (True, True))
+        reasons = [r["reason"] for name, r in self.recs
+                   if name == "orders" and r.get("kind") == "amend"]
+        self.assertEqual(reasons, ["back_of_line", "back_of_line_restore"])
+
+    def test_a_fractional_size_comes_back_exactly(self):
+        self.resting[0]["remaining_count"] = 37.5
+        self.view_order["rem"] = 37.5
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        self.assertEqual([a["total_count"] for a in self.amends], [43.5, 42.5])
+        self.assertEqual(self.view_order["rem"], 37.5)
+
+    def test_a_failed_restore_is_counted_and_leaves_the_extra_contract(self):
+        calls = []
+
+        def amend(**kw):
+            calls.append(kw)
+            if len(calls) == 2:
+                raise RuntimeError("timeout")
+            return {}
+        self.bot.client.amend_order = amend
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        b = self.bot._bol
+        self.assertEqual((len(calls), b["requeued"], b["restored"], b["restore_fails"],
+                          self.view_order["rem"], self._rows()[0]["restored"]),
+                         (2, 1, 0, 1, 61.0, False))
+
+    def test_an_order_already_at_the_back_stays(self):
+        self.ahead = {"o1": 295.0}
+        self._pass()
+        self.assertEqual((self._rows(), self.bot._bol["front"]), ([], 0))
+
+    def test_a_thin_level_is_never_read(self):
+        self.feed.books[self.T] = ({0.41: 70.0}, {})       # 10 external contracts
+        self._pass()
+        self.assertEqual((self.reads, self._rows()), ([], []))
+
+    def test_orders_it_leaves_alone(self):
+        cases = {
+            "sub-penny": dict(px=41.15),
+            "pad": dict(pad=True),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                self.bot._bol_last_pass = 0.0
+                o = dict(self.view_order, **kw)
+                self.bot._resting_view = {self.T: [o]}
+                self._pass()
+                self.assertEqual(self.reads, [], name)
+        self.bot._resting_view = {self.T: [self.view_order]}
+        # placed this cycle (not in the cycle's read)
+        self.bot._bol_last_pass = 0.0
+        self.bot._back_of_line_pass([], self.now)
+        # amended this cycle
+        self.bot._bol_last_pass = 0.0
+        self.bot._cycle_amended = {"o1": 41}
+        self._pass()
+        self.bot._cycle_amended = {}
+        # a WS fill since the cycle's read
+        self.bot._bol_last_pass = 0.0
+        self.bot._resting_read_at = self.now - 30
+        self.bot._ws_fill_log.append((self.now - 5, "o1", 2.0))
+        self._pass()
+        self.assertEqual((self.reads, self._rows()), ([], []))
+
+    def test_cooldown_interval_optional_cap_and_live_only(self):
+        def later_cycle(dt):
+            # a later cycle: the cycle's own amend map starts empty
+            self.bot._cycle_amended, self.bot._cycle_amended_ct = {}, {}
+            self._pass(dt)
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+            later_cycle(30)                     # inside the 60s interval: no pass
+            later_cycle(120)                    # inside the 300s cooldown
+            self.assertEqual(len(self.amends), 2)
+            for i in (1, 2, 3, 4):
+                later_cycle(400 * i)            # no move limit by default
+            self.assertEqual((len(self.amends), self.bot._bol_bumps["o1"]), (10, 5))
+            with mock.patch.object(imm, "BACK_OF_LINE_MAX_BUMPS", 5):
+                later_cycle(2000)               # the knob still caps it
+            self.assertEqual(len(self.amends), 10)
+        self.bot.live = False
+        self.bot._bol_last_pass = 0.0
+        n = len(self.reads)
+        self._pass(5000)
+        self.assertEqual(len(self.reads), n)
+
+    def test_a_failed_read_is_counted_and_never_raises(self):
+        def boom(**kw):
+            raise RuntimeError("503")
+        self.bot.client.get_queue_positions = boom
+        self._pass()
+        self.assertEqual((self.bot._bol["read_fails"], self._rows()), (1, []))
+
+    def test_an_order_the_read_does_not_cover_is_skipped(self):
+        self.ahead = {}
+        self._pass()
+        self.assertEqual((self.bot._bol["no_position"], self._rows()), (1, []))
+
+    def test_off_reads_nothing(self):
+        with mock.patch.object(imm, "BACK_OF_LINE", "off"):
+            self._pass()
+        self.assertEqual(self.reads, [])
+
+    def _second_market(self):
+        """A second market where our 50-lot ask at 60c has 900 external
+        contracts on its level and 20 ahead of us."""
+        t2 = "KXWIDE-99DEC31-B"
+        self.feed.books[t2] = ({}, {0.40: 950.0})          # ask 60c = NO bid 40c
+        o2 = {"order_id": "o2", "side": "ask", "px": 60.0, "rem": 50.0,
+              "placed": self.now - 600, "pad": False}
+        self.bot._resting_view[t2] = [o2]
+        self.resting.append({"order_id": "o2", "ticker": t2, "book_side": "ask",
+                             "yes_price": 60, "remaining_count": 50.0, "fill_count": 0.0})
+        self.ahead["o2"] = 20.0
+        return t2, o2
+
+    def test_the_most_size_behind_goes_first_and_the_cap_holds(self):
+        t2, o2 = self._second_market()                    # 880 behind vs o1's 290
+        with mock.patch.object(imm, "BACK_OF_LINE_MAX_PER_PASS", 1):
+            self._pass()
+        rows = self._rows()
+        self.assertEqual([r["order_id"] for r in rows], ["o2"])
+        self.assertEqual((self.bot._bol["front"], self.bot._bol["capped"]), (2, 1))
+
+    def test_each_move_is_rechecked_just_before_it_goes(self):
+        t2, o2 = self._second_market()
+        orig = self.bot._back_of_line_move
+
+        def meanwhile(m, p, now_ts):
+            # after the line was read, before the first send: a fill books o2
+            # down, and o1's event goes into a sweep hold
+            o2["rem"] = 30.0
+            self.bot._sweep_hold[self.bot._event_of(self.T)] = now_ts + 100
+            return orig(m, p, now_ts)
+        self.bot._back_of_line_move = meanwhile
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
+                mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        self.assertEqual((self.amends, self._rows(), self.bot._bol["stale"]), ([], [], 2))
+
+    def test_the_work_comes_in_slices(self):
+        self.bot._back_of_line_pass(self.resting, self.now)
+        self.assertTrue(self.bot._back_of_line_step(self.now, slice_secs=-1.0))
+        self.assertEqual(self.reads, [])                   # no time: nothing done
+        while self.bot._back_of_line_step(self.now, slice_secs=60.0):
+            pass
+        self.assertEqual((len(self.reads), len(self._rows()), self.bot._bol_plan["done"]),
+                         (1, 1, True))
+
+    def test_the_cycle_only_plans_and_idle_sends(self):
+        self.bot._back_of_line_pass(self.resting, self.now)
+        self.assertEqual((self.reads, self._rows()), ([], []))   # nothing in the cycle
+        self.bot._last_cycle_start = time.time()
+        self.bot._idle(0.6, {})
+        self.assertEqual((len(self.reads), len(self._rows())), (1, 1))
+
+    def test_a_new_plan_replaces_an_unfinished_one(self):
+        self.bot._back_of_line_pass(self.resting, self.now)
+        self.bot._back_of_line_pass(self.resting, self.now + 61)
+        self.assertEqual((self.bot._bol["unfinished"], self.bot._bol["passes"]), (1, 2))
+
+    def test_the_client_builds_the_queue_positions_path(self):
+        c = _kc.ExchangeClient.__new__(_kc.ExchangeClient)
+        c.portfolio_url = "/portfolio"
+        seen = []
+        c.get = lambda path, params={}: seen.append(path) or {}
+        c.get_queue_positions(market_tickers="A,B")
+        c.get_queue_positions(event_ticker="EV")
+        self.assertEqual(seen, ["/portfolio/orders/queue_positions?market_tickers=A,B",
+                                "/portfolio/orders/queue_positions?event_ticker=EV"])
+
+
+class TestFasterFastCancel(unittest.TestCase):
+    """Jack 2026-10-17: "Yes, and email report in 3 days" -- an acting rung
+    (live, >= the narrow gate) is cancelled 0.25s after it is first seen
+    ahead; 20% of episodes keep 1s as a control; every first sighting is
+    logged (`seen`), and every suspect that ends unconfirmed (`unseen`)."""
+    T = "KXGOOD-99DEC31-A"
+    FAR = ({0.35: 500.0, 0.49: 20.0}, {0.49: 1200.0})    # our 49c bid, 14c ahead
+    NEAR = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})   # ... 2c ahead
+    JOINED = ({0.49: 520.0}, {0.49: 1200.0})
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append(oid) or True
+        self.bot._resting_view = {self.T: [{
+            "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": self.now - 100.0, "pad": False}]}
+        for name, v in (("WS_MODE", "on"), ("WS_FAST", True), ("WS_FAST_MIN_GAP_C", 10.0),
+                        ("WS_FAST_CONFIRM_SECS", 0.25), ("WS_FAST_CONFIRM_HOLDOUT", 0.2),
+                        ("WS_SEEN_LOG", True), ("WS_STALE_LOG", True)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _draw(self, x):
+        self.bot._ws_rng = mock.Mock(random=lambda: x)
+
+    def _check(self, book, dt):
+        self.feed.books[self.T] = book
+        return self.bot._ws_fast_check({self.T}, self.now + dt)
+
+    def _evs(self):
+        return [r["ev"] for name, r in self.recs if name == "ws_stale"]
+
+    def _rec(self, ev):
+        return next(r for name, r in self.recs if name == "ws_stale" and r["ev"] == ev)
+
+    def test_the_fast_arm_cancels_a_quarter_second_after_first_sight(self):
+        self._draw(0.9)                                   # fast arm
+        self._check(self.FAR, 0.0)
+        self._check(self.FAR, 0.1)
+        self.assertEqual(self.cancelled, [])
+        self._check(self.FAR, 0.3)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual(self._evs(), ["seen", "flag", "narrow", "cancel"])
+        seen, cancel = self._rec("seen"), self._rec("cancel")
+        self.assertEqual((seen["arm"], seen["acts"], seen["gap_c"], seen["phase"]),
+                         ("fast", True, 14.0, "idle"))
+        self.assertEqual((cancel["by"], cancel["arm"], cancel["seen_s"]), ("fast", "fast", 0.3))
+        self.assertEqual(self._rec("flag")["arm"], "fast")
+
+    def test_the_control_arm_keeps_the_one_second_rule(self):
+        self._draw(0.1)                                   # under 0.2: control
+        self._check(self.FAR, 0.0)
+        self._check(self.FAR, 0.5)
+        self.assertEqual(self.cancelled, [])
+        self._check(self.FAR, 1.1)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual((self._rec("seen")["arm"], self._rec("cancel")["arm"]),
+                         ("control", "control"))
+
+    def test_a_dry_rung_under_the_gap_still_waits_a_second(self):
+        self._draw(0.9)
+        self._check(self.NEAR, 0.0)
+        self._check(self.NEAR, 0.5)
+        self.assertEqual(self._evs(), ["seen"])
+        self.assertFalse(self._rec("seen")["acts"])
+        self._check(self.NEAR, 1.1)
+        self.assertEqual(self._evs(), ["seen", "flag"])
+        self.assertEqual(self.cancelled, [])
+
+    def test_a_flicker_that_ends_unconfirmed_is_logged_unseen(self):
+        self._draw(0.1)                                   # control: 1s to confirm
+        self._check(self.FAR, 0.0)
+        self._check(self.JOINED, 0.4)                     # the line came back
+        self.assertEqual(self._evs(), ["seen", "unseen"])
+        u = self._rec("unseen")
+        self.assertEqual((u["why"], u["arm"], u["secs"]), ("clear", "control", 0.4))
+        self.assertEqual((self.bot._ws_suspect, self.bot._ws_arm), ({}, {}))
+
+    def test_the_cycle_dropping_a_suspect_logs_it_unseen(self):
+        self._draw(0.1)
+        self._check(self.FAR, 0.0)
+        b = self.bot
+        b._cycle_cancelled, b._cycle_amended = set(), {"o1": 45}
+        b._build_resting_view([{"order_id": "o1", "ticker": self.T, "book_side": "bid",
+                                "yes_price": 49, "remaining_count": 20}], self.now + 0.5)
+        self.assertEqual(self._rec("unseen")["why"], "cycle")
+        self.assertEqual((b._ws_suspect, b._ws_arm), ({}, {}))
+
+    def test_the_seen_log_switch(self):
+        with mock.patch.object(imm, "WS_SEEN_LOG", False):
+            self._draw(0.9)
+            self._check(self.FAR, 0.0)
+            self._check(self.FAR, 0.3)
+        self.assertEqual(self._evs(), ["flag", "narrow", "cancel"])
+
+    def test_the_in_cycle_tick_default(self):
+        self.assertEqual(_WS_TICK_CODE_DEFAULT, 0.25)
+
+
+class TestRateLimitWatch(unittest.TestCase):
+    """Jack 2026-10-17: "Raise to 24/s ... Email alert me if rate limit
+    rejections occur" -- any 429 rejection, ours or the crypto bots', sends an
+    urgent `rate_limit` alert."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.alerts = []
+        self.bot.alerter.alert = lambda cat, msg, key="", urgent=True, now_ts=None: \
+            self.alerts.append((cat, msg, key, urgent))
+        self.tmp = tempfile.mkdtemp()
+        self.log = os.path.join(self.tmp, "bnb-max-2026-10-01.log")
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write("2026-10-08 07:07:37Z [BNB-MAX] ! place rejected (HttpError(429 Too "
+                    "Many Requests)): old history, never reported\n")
+        self.counter = {"writes": 0, "reads": 0, "last_ts": 0.0, "last": ""}
+        for name, v in (("RATE_LIMIT_ALERT", True), ("RATE_LIMIT_CHECK_SECS", 120.0),
+                        ("RATE_LIMIT_SCAN_DIRS", (self.tmp,))):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(imm._kalshi_client_mod, "RATE_LIMITED", self.counter)
+        p.start()
+        self.addCleanup(p.stop)
+        self.now = time.time()
+
+    def _look(self, dt):
+        self.bot._rate_limit_watch(self.now + dt)
+
+    def test_quiet_means_no_alert_and_history_is_never_reported(self):
+        self._look(0)
+        self._look(200)
+        self.assertEqual(self.alerts, [])
+
+    def test_our_own_rejected_write_alerts(self):
+        self._look(0)
+        self.counter.update(writes=2, last="POST /portfolio/events/orders")
+        self._look(60)                                   # inside the 2-min interval
+        self.assertEqual(self.alerts, [])
+        self._look(200)
+        cat, msg, key, urgent = self.alerts[0]
+        self.assertEqual((cat, key, urgent), ("rate_limit", "rate_limit", True))
+        self.assertIn("this bot: 2 write(s) rejected (last POST /portfolio/events/orders)", msg)
+        self.assertEqual(self.bot._rl["imm_writes"], 2)
+
+    def test_a_crypto_bot_rejection_in_its_log_alerts(self):
+        self._look(0)                                    # anchors the log at its end
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write("2026-10-17 20:00:01Z [BNB-MAX] ! place rejected (HttpError(429 Too "
+                    "Many Requests)): KXBNBMAXMON-BNB-26OCT31-87000 BID 5x @ 17c\n")
+            f.write("2026-10-17 20:00:02Z [BNB-MAX] placed something fine\n")
+        self._look(200)
+        msg = self.alerts[0][1]
+        self.assertIn(f"{os.path.basename(self.tmp)}/bnb-max-2026-10-01: 1 rejected", msg)
+        self.assertIn("KXBNBMAXMON-BNB-26OCT31-87000", msg)
+        self.assertNotIn("old history", msg)
+        self._look(400)                                  # nothing new since
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_retried_reads_alone_only_log(self):
+        self._look(0)
+        self.counter.update(reads=3)
+        self._look(200)
+        self.assertEqual((self.alerts, self.bot._rl["imm_reads"]), ([], 3))
+
+    def test_off_does_nothing(self):
+        with mock.patch.object(imm, "RATE_LIMIT_ALERT", False):
+            self.counter.update(writes=5)
+            self._look(0)
+            self._look(200)
+        self.assertEqual((self.alerts, self.bot._rl["looks"]), ([], 0))
+
+    def test_the_client_counts_429s_by_kind(self):
+        def resp(method):
+            r = mock.Mock(status_code=429, reason="Too Many Requests", text="{}")
+            r.request = mock.Mock(method=method, path_url="/trade-api/v2/portfolio/events/orders?x=1")
+            return r
+        c = _kc.ExchangeClient.__new__(_kc.ExchangeClient)
+        for m in ("POST", "DELETE", "GET"):
+            with self.assertRaises(_kc.HttpError):
+                c.raise_if_bad_response(resp(m))
+        self.assertEqual((self.counter["writes"], self.counter["reads"], self.counter["last"]),
+                         (2, 1, "GET /trade-api/v2/portfolio/events/orders"))
+
+
+class TestRiskGroups(unittest.TestCase):
+    """The same-underlying groups the cross-event breaker and the dollar
+    limits share (Jack 2026-10-17: "On 2, what groupings make sense? They'd
+    need to be tied to same underlying")."""
+
+    def setUp(self):
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+
+    def test_nfl_by_game_never_mentions_or_season_markets(self):
+        g = imm.risk_group
+        self.assertEqual(g("KXNFLLADDERRECYDS-26OCT19DALWSH-DALCLAMB88"),
+                         "NFL game 26OCT19DALWSH")
+        self.assertEqual(g("KXNFLESCALATORRSHYDS-26OCT19DALWSH-WSHBROBINSON24"),
+                         "NFL game 26OCT19DALWSH")
+        self.assertIsNone(g("KXNFLMENTION-26OCT19DALWSH-TOUCHDOWN"))
+        self.assertIsNone(g("KXNFLXAPP-26NOV08-T60"))
+        self.assertIsNone(g("KXNFLMVP-27-JALLEN"))
+
+    def test_carbon_arc_by_panel_corn_and_the_approval_link(self):
+        cats = {"KXAMZNCC": "credit card", "KXAMZNFT": "foot traffic"}
+        with mock.patch.object(imm, "ca_category", lambda s: cats.get(s)):
+            self.assertEqual(imm.risk_group("KXAMZNCC-26NOV07-T104"), "Carbon Arc credit card")
+            self.assertEqual(imm.risk_group("KXAMZNFT-26NOV07-T99"), "Carbon Arc foot traffic")
+        self.assertEqual(imm.risk_group("KXIACORNYIELD-26-T200"), "USDA corn yields")
+        self.assertIsNone(imm.risk_group("KXTRUMPAPPROVE-26OCT20-T44"))
+        self.assertIsNone(imm.risk_group("KXRAINNYCM-26OCT-T3"))
+
+    def test_elections_follow_the_dashboard_groups(self):
+        tags = {"KXSENATEMEG": ["US Elections", "Senate"], "KXBRPRES": ["Foreign Elections"],
+                "KXCAPROP50": ["Referendums"]}
+        cache = {"series": {s: {"t": t} for s, t in tags.items()}}
+        with mock.patch.object(imm, "election_series", lambda s: True), \
+                mock.patch.object(imm, "dash_cache", lambda name: cache):
+            self.assertEqual(imm.risk_group("KXSENATEMEG-26-D"), "US general elections")
+            # no tags read yet: the dashboard calls it general too
+            self.assertEqual(imm.risk_group("KXPRESRUN-28-GNEWSOM"), "US general elections")
+            self.assertEqual(imm.risk_group("KXSTATELEG-NCHOUSE26-D"), "State legislatures")
+            self.assertEqual(imm.risk_group("KXPAHOUSE-26-D"), "State legislatures")
+            for t in ("KXATTYGENTX-26-D", "KXHOUSETX12-26-R", "KXDENTONCOUNTYJUDGE-26-X",
+                      "KXNYCMAYOR-25-X", "KXTURNOUTGA-26-T50", "KXDEMMENVOTE-26-T40",
+                      "KXBRPRES-26-LULA", "KXCAPROP50-25-YES"):
+                self.assertIsNone(imm.risk_group(t), t)
+        with mock.patch.object(imm, "election_series", lambda s: False):
+            self.assertIsNone(imm.risk_group("KXSENATEMEG-26-D"))
+
+
+class TestRiskWorstCase(unittest.TestCase):
+    """An event's worst case to settlement from its marks (the dashboard's
+    event_worst_case, ported for the dollar limits)."""
+
+    def test_a_strike_ladder_nets_by_settlement_value(self):
+        st = {"A": ("greater", 10.0, None, "binary"), "B": ("greater", 20.0, None, "binary")}
+        held = [("A", 10.0, 50.0), ("B", -10.0, 30.0)]   # a call spread
+        # below 10: -5 + 3; 10-20: +5 + 3; above 20: +5 - 7
+        self.assertAlmostEqual(imm.risk_event_worst(held, st), -2.0)
+        # no structure read: every market's own worst
+        self.assertAlmostEqual(imm.risk_event_worst(held, {}), -12.0)
+        self.assertAlmostEqual(imm.risk_event_worst(held, {"A": st["A"]}), -12.0)
+
+    def test_an_exclusive_event_takes_the_worst_winner(self):
+        st = {"A": ("custom", None, None, "binary"), "B": ("custom", None, None, "binary")}
+        held = [("A", 10.0, 30.0), ("B", 10.0, 30.0)]
+        self.assertAlmostEqual(imm.risk_event_worst(held, st, True, 3), -6.0)   # a third wins
+        self.assertAlmostEqual(imm.risk_event_worst(held, st, True, 2), 0.0)    # one of ours wins
+        self.assertAlmostEqual(imm.risk_event_worst(held, st, False, 3), -6.0)  # independent
+
+    def test_unmarked_and_flat_markets_are_left_out(self):
+        self.assertEqual(imm.risk_event_worst([("A", 10.0, None), ("B", 0.0, 50.0)], {}), 0.0)
+
+
+class TestGroupBreaker(unittest.TestCase):
+    """The CROSS-EVENT BREAKER (SWEEP_GROUP, Jack 2026-10-17: "#2 log-only"):
+    maker fills on the same side in two events of one group within 10 min
+    hold that side of the group for 30."""
+    A = "KXNFLLADDERRECYDS-26OCT19DALWSH-DALCLAMB88"
+    B = "KXNFLESCALATORRSHYDS-26OCT19DALWSH-WSHBROBINSON24"
+    C = "KXNFLLADDERRECYDS-26OCT26NYGPHI-NYGMNABERS1"
+    G = "NFL game 26OCT19DALWSH"
+
+    def setUp(self):
+        _clean_persist()
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 120.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "off"), ("SWEEP_GROUP", "dry"),
+                        ("SWEEP_GROUP_WINDOW_SECS", 600.0),
+                        ("SWEEP_GROUP_HOLD_SECS", 1800.0), ("SWEEP_GROUP_MIN_CT", 0.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.bot._resting_view = {
+            t: [{"order_id": f"{t[-6:]}-{s}", "side": s,
+                 "px": 40.0 if s == "bid" else 45.0, "rem": 50.0,
+                 "placed": self.now - 60, "pad": False} for s in ("bid", "ask")]
+            for t in (self.A, self.B, self.C)}
+        self.bot._last_panel = {t: {"est_frac": 0.1, "pool_per_day": 20.0}
+                                for t in (self.A, self.B, self.C)}
+        self.n = 0
+
+    def _fill(self, dt, t, side="bid", count=5.0):
+        """A partial maker fill on our `side` order of `t`, dt s after now."""
+        oid = next(o["order_id"] for o in self.bot._resting_view[t] if o["side"] == side)
+        self.n += 1
+        self.feed.events = [("fill", {"order_id": oid, "market_ticker": t,
+                                      "count_fp": f"{count:.2f}", "is_taker": False,
+                                      "ts_ms": int((self.now + dt) * 1000),
+                                      "trade_id": f"tr{self.n}"})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _lines(self, ev=None):
+        return [r for name, r in self.recs if name == "ws_group" and (ev is None or r["ev"] == ev)]
+
+    def test_dry_logs_the_trip_and_the_held_fills_and_pulls_nothing(self):
+        self._fill(0, self.A)
+        self.assertEqual(self._lines(), [])
+        self._fill(120, self.B)
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["group"], trip["side"], trip["gap_s"]),
+                         ("dry", self.G, "bid", 120.0))
+        self.assertEqual((trip["first"]["ticker"], trip["second"]["ticker"]), (self.A, self.B))
+        self.assertEqual(sorted(p[1] for p in trip["pull"]),
+                         [self.A[-6:] + "-bid", self.B[-6:] + "-bid"])
+        self.assertEqual((trip["markets"], trip["group_day"], trip["side_day"]), (2, 4.0, 2.0))
+        self.assertEqual(self.cancelled, [])
+        self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 121))
+        self._fill(300, self.A)                     # inside the would-be hold
+        held, = self._lines("held_fill")
+        self.assertEqual((held["mode"], held["ticker"], held["since_trip_s"]),
+                         ("dry", self.A, 180.0))
+        self._fill(310, self.A, "ask")              # the other side: one fill, no trip
+        self._fill(320, self.C)                     # another game
+        self.assertEqual((len(self._lines("trip")), len(self._lines("held_fill"))), (1, 1))
+        self.assertEqual((self.bot._grp["trips"], self.bot._grp["held_fills"]), (1, 1))
+
+    def test_same_event_or_too_far_apart_never_trips(self):
+        self._fill(0, self.A)
+        self._fill(60, self.A)                      # the same event
+        self._fill(60 + 601, self.B)                # 601s after A's last fill
+        self.assertEqual(self._lines("trip"), [])
+
+    def test_a_size_floor_skips_small_fills(self):
+        with mock.patch.object(imm, "SWEEP_GROUP_MIN_CT", 10.0):
+            self._fill(0, self.A, count=5.0)
+            self._fill(60, self.B, count=20.0)
+            self.assertEqual(self._lines("trip"), [])
+            self._fill(120, self.A, count=10.0)
+            self.assertEqual(len(self._lines("trip")), 1)
+
+    def test_on_holds_that_side_and_pulls_its_orders(self):
+        with mock.patch.object(imm, "SWEEP_GROUP", "on"):
+            self._fill(0, self.A)
+            self._fill(60, self.B)
+            self.assertEqual(sorted(self.cancelled),
+                             [(self.A[-6:] + "-bid", "group_breaker"),
+                              (self.B[-6:] + "-bid", "group_breaker")])
+            self.assertTrue(self.bot.group_held(self.A, "bid", self.now + 61))
+            self.assertTrue(self.bot.group_held(self.B, "bid", self.now + 61))
+            self.assertFalse(self.bot.group_held(self.A, "ask", self.now + 61))
+            self.assertFalse(self.bot.group_held(self.C, "bid", self.now + 61))
+            self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 60 + 1801))
+            self.assertEqual(self.bot._grp["trips_live"], 1)
+        # dry or off: nothing is ever held
+        self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 61))
+
+    def test_off_does_nothing(self):
+        with mock.patch.object(imm, "SWEEP_GROUP", "off"):
+            self._fill(0, self.A)
+            self._fill(60, self.B)
+        self.assertEqual((self._lines(), self.bot._grp["fills"]), ([], 0))
+
+
+class TestRiskLimits(unittest.TestCase):
+    """DOLLAR WORST-CASE LIMITS + SKEW, dry (RISK_LIMITS, Jack 2026-10-17:
+    "#4 and #5 together as one log-only build"): a side whose full fill would
+    put its event (or group) past its dollar limit would block; one in an
+    event or group past half its limit would skew; a reducing side is ok."""
+    E = "KXFOO-26OCT20"
+    T = E + "-A"
+    U = "KXBAR-26OCT20-A"
+
+    def setUp(self):
+        _clean_persist()
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.groups = {}
+        for name, v in (("RISK_LIMITS", "dry"), ("RISK_EVENT_FLOOR", 150.0),
+                        ("RISK_EVENT_DAYS", 30.0), ("RISK_GROUP_FLOOR", 200.0),
+                        ("RISK_GROUP_DAYS", 30.0), ("RISK_SKEW_FROM", 0.5),
+                        ("RISK_PASS_EVERY_SECS", 60.0), ("RISK_SUMMARY_SECS", 30.0),
+                        ("RISK_EXEMPT", ("KXPRESRUN",)),
+                        ("dash_cache", lambda name: {}),
+                        ("risk_group_of", lambda t: self.groups.get(t))):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        # long 200 YES at 50c: worst $100 of a $150 limit (est $1/day)
+        self.bot._risk_positions = {self.T: 200.0}
+        self.bot.state.last_mark[self.T] = 50.0
+        self.bot._last_panel = {self.T: {"est_frac": 0.1, "pool_per_day": 10.0},
+                                self.U: {"est_frac": 0.1, "pool_per_day": 10.0,
+                                         "ext_bid": 39.0, "ext_ask": 41.0}}
+        self.view(bid=150.0, ask=50.0)
+        self.t = 0.0
+
+    def view(self, bid=0.0, ask=0.0, u_bid=100.0):
+        v = {}
+        for t, side, rem, px in ((self.T, "bid", bid, 49.0), (self.T, "ask", ask, 51.0),
+                                 (self.U, "bid", u_bid, 39.0)):
+            if rem > 0:
+                v.setdefault(t, []).append({"order_id": f"{t}-{side}", "side": side,
+                                            "px": px, "rem": rem, "placed": 0.0,
+                                            "pad": False})
+        self.bot._resting_view = v
+
+    def run_pass(self):
+        """Start (and finish) the next pass: one budget is plenty here."""
+        self.t += 61.0
+        self.bot._risk_step(self.now + self.t, 5.0)
+
+    def states(self):
+        return [(r["ticker"], r["side"], r["prev"], r["state"])
+                for name, r in self.recs if name == "risk_dry" and r["ev"] == "state"]
+
+    def test_prime_then_block_skew_and_none(self):
+        self.run_pass()                                 # the priming pass
+        starts = [r for name, r in self.recs if r["ev"] == "start"]
+        self.assertEqual((len(starts), self.states()), (1, []))
+        self.run_pass()
+        # the bid: +150 -> worst $175 of $150: block; the ask reduces: ok;
+        # KXBAR's bid adds $40 of $150: ok
+        self.assertEqual(self.states(), [(self.T, "bid", "ok", "block")])
+        blk = [r for name, r in self.recs if r.get("state") == "block"][0]
+        self.assertEqual((blk["by"], blk["w0"], blk["w1"], blk["lim_e"], blk["fit"]),
+                         ("event", -100.0, -175.0, 150.0, 0.667))
+        self.assertAlmostEqual(blk["side_day"], 0.5)
+        self.view(bid=50.0, ask=50.0)                   # +50 -> $125: inside, but past half
+        self.run_pass()
+        self.assertEqual(self.states()[-1], (self.T, "bid", "block", "skew"))
+        self.view(ask=50.0)                             # no bid left: its state ends
+        self.run_pass()
+        self.assertEqual(self.states()[-1], (self.T, "bid", "skew", "none"))
+        summ = [r for name, r in self.recs if r["ev"] == "pass"]
+        self.assertEqual([(s["block"], s["skew"]) for s in summ], [(1, 0), (0, 1), (0, 0)])
+        self.assertEqual(self.bot._risk["passes"], 3)
+
+    def test_the_pass_waits_its_interval(self):
+        self.run_pass()
+        self.run_pass()
+        n = len(self.recs)
+        self.bot._risk_step(self.now + self.t + 10.0, 5.0)   # 10s later: no new pass
+        self.assertEqual(len(self.recs), n)
+
+    def test_a_directional_group_counts_only_sides_with_its_direction(self):
+        # a Carbon Arc panel short $150 (300 short at 50c) of a $200 limit,
+        # and a new event with 120 to buy and 120 to sell at 50c
+        X, Y = "KXAAACC-26NOV07-T1", "KXBBBCC-26NOV07-T1"
+        self.groups = {X: "Carbon Arc credit card", Y: "Carbon Arc credit card"}
+        self.bot._risk_positions = {X: -300.0}
+        self.bot.state.last_mark[X] = 50.0
+        self.bot._last_panel = {Y: {"est_frac": 0.0, "pool_per_day": 10.0,
+                                    "ext_bid": 49.0, "ext_ask": 51.0}}
+        self.bot._resting_view = {Y: [
+            {"order_id": "yb", "side": "bid", "px": 49.0, "rem": 120.0, "placed": 0.0, "pad": False},
+            {"order_id": "ya", "side": "ask", "px": 51.0, "rem": 120.0, "placed": 0.0, "pad": False}]}
+        self.run_pass()
+        self.run_pass()
+        # the ask adds $60 short -> $210 of $200: block; the bid (against the
+        # panel's direction) only meets its own event's $150
+        self.assertEqual(self.states(), [(Y, "ask", "ok", "block")])
+        blk = [r for name, r in self.recs if r.get("state") == "block"][0]
+        self.assertEqual((blk["by"], blk["gdir"], blk["with_dir"], blk["u1g"]),
+                         ("group", "short", True, 1.05))
+        # the same book in a group whose YES point both ways: both sides count
+        self.recs.clear()
+        self.groups = {X: "NFL game 26OCT19DALWSH", Y: "NFL game 26OCT19DALWSH"}
+        self.bot._risk_side.clear()
+        self.bot._risk_ev.clear()
+        self.run_pass()
+        self.assertEqual(sorted(self.states()), [(Y, "ask", "ok", "block"),
+                                                 (Y, "bid", "ok", "block")])
+
+    def test_exempt_events_are_left_out_of_everything(self):
+        P = "KXPRESRUN-28-GNEWSOM"
+        self.groups = {P: "US general elections"}
+        self.bot._risk_positions = {P: -2000.0}
+        self.bot.state.last_mark[P] = 10.0
+        self.bot._resting_view = {P: [{"order_id": "p", "side": "ask", "px": 9.0,
+                                       "rem": 500.0, "placed": 0.0, "pad": False}]}
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.states(), [])
+        summ = [r for name, r in self.recs if r["ev"] == "pass"][-1]
+        self.assertEqual((summ["worst_total"], summ["exempt_worst"], summ["groups"]),
+                         (0.0, -1800.0, {}))
+
+    def test_off_and_failures_never_raise(self):
+        with mock.patch.object(imm, "RISK_LIMITS", "off"):
+            self.run_pass()
+            self.run_pass()
+        self.assertEqual(self.recs, [])
+        with mock.patch.object(self.bot, "_risk_eval_event", side_effect=RuntimeError("x")):
+            self.run_pass()
+        self.assertEqual(self.bot._risk["fails"], 1)
+        self.assertIsNone(self.bot._risk_pass)
 
 
 if __name__ == "__main__":
