@@ -61,7 +61,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -339,14 +339,98 @@ def describe(client, due: List[Tuple[str, dict, float]]) -> None:
             it["title"] = desc
 
 
-def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
-    daily = sum(it["est"] for _, it, _ in due)
+# QUOTED OR NOT (Jack 2026-10-17: '"Dark" email should be clear on if the
+# event isn't quoted vs if it's missing an end date'). A start: item is a
+# mention event with no start time, and the bot still quotes those (to the
+# market's close, behind the live gates): "dark 30.0h" read as unquoted while
+# KXTRUMPMENTIONB-26OCT19 rested on every market. Each line now leads with
+# what the bot is doing -- QUOTED on N of M markets / NOT QUOTED -- read off
+# the IMM dashboard's data object (rebuilt every 10 min), then what is missing.
+def load_quote_state(path: Optional[str] = None) -> Dict[str, dict]:
+    """"ev:<event>" / "ser:<series>" -> {"q": markets with a side quoted, "n":
+    markets, "dec": Counter of the bot's decisions on the unquoted ones,
+    "cutoff": the earliest cutoff (epoch) among the quoted ones}, from the
+    IMM dashboard's data object. {} when it cannot be read."""
+    path = path or os.path.join(imm.STATUS_DIR, "dashboard", "imm_dashboard.html")
+    try:
+        with open(path, encoding="utf-8") as f:
+            html = f.read()
+        i = html.index("const D = ") + len("const D = ")
+        D, _ = json.JSONDecoder().raw_decode(html, i)
+    except (OSError, ValueError) as e:
+        log(f"[WATCH] ! no dashboard quote state ({e!r})")
+        return {}
+    out: Dict[str, dict] = {}
+    for _t, m in (D.get("markets") or {}).items():
+        quoted = ((m.get("cur") or {}).get("q") or 0) > 0
+        for key in ("ev:" + str(m.get("ev") or ""), "ser:" + str(m.get("ser") or "")):
+            st = out.setdefault(key, {"q": 0, "n": 0, "dec": Counter(), "cutoff": None})
+            st["n"] += 1
+            if quoted:
+                st["q"] += 1
+                c = m.get("cutoff")
+                if c and (st["cutoff"] is None or c < st["cutoff"]):
+                    st["cutoff"] = c
+            elif m.get("dec"):
+                st["dec"][m["dec"]] += 1
+    return out
+
+
+def missing_of(key: str, it: dict) -> str:
+    """What the item lacks, in words."""
+    kind = key.partition(":")[0]
+    if kind == "start":
+        return "its start time"
+    if kind == "new":
+        return "a place on the allowlist (a new family: your call)"
+    g = gap_kind(it.get("what") or "")
+    return {"election": "its election day", "award": "its date row"}.get(g, "a config fix")
+
+
+def quote_label(key: str, qs: Optional[Dict[str, dict]]) -> Tuple[str, Optional[dict]]:
+    """("QUOTED on N of M markets" / "NOT QUOTED (...)" / "QUOTE STATE
+    UNKNOWN", the state) for an item, from load_quote_state."""
+    kind, _, tick = key.partition(":")
+    if not qs:
+        return "QUOTE STATE UNKNOWN", None
+    st = qs.get(("ser:" if kind == "new" else "ev:") + tick)
+    if st is None:
+        return "NOT QUOTED (not in the bot's book)", None
+    if st["q"]:
+        return f"QUOTED on {st['q']} of {st['n']} markets", st
+    why = st["dec"].most_common(1)[0][0] if st["dec"] else ""
+    return (f"NOT QUOTED (0 of {st['n']} markets" + (f"; bot: {why}" if why else "") + ")",
+            st)
+
+
+def _fmt_et(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).astimezone(
+            imm.ET).strftime("%b %d %I:%M %p ET")
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
+def alert_body(due: List[Tuple[str, dict, float]],
+               qs: Optional[Dict[str, dict]] = None) -> Tuple[str, str]:
+    labels = {key: quote_label(key, qs) for key, _, _ in due}
+    quoted = [it for key, it, _ in due if labels[key][0].startswith("QUOTED")]
+    unknown = [it for key, it, _ in due if labels[key][0].startswith("QUOTE STATE")]
+    dark = [it for key, it, _ in due if labels[key][0].startswith("NOT QUOTED")]
     whole = sum(it.get("est_total") or 0.0 for _, it, _ in due)
-    subject = (f"IMM watch: {len(due)} dark item(s) worth ~${daily:,.0f}/day"
-               + (f" (~${whole:,.0f} over their programs)" if whole else "")
-               + " need a row or a call")
+    parts = []
+    if dark:
+        parts.append(f"{len(dark)} not quoted (~${sum(i['est'] for i in dark):,.0f}/day)")
+    if quoted:
+        parts.append(f"{len(quoted)} quoted but missing a start time or date "
+                     f"(~${sum(i['est'] for i in quoted):,.0f}/day)")
+    if unknown:
+        parts.append(f"{len(unknown)} quote state unknown "
+                     f"(~${sum(i['est'] for i in unknown):,.0f}/day)")
+    subject = ("IMM watch: " + "; ".join(parts)
+               + (f" (~${whole:,.0f} over their programs)" if whole else ""))
     lines = [subject, ""]
-    for key, it, dark in sorted(due, key=lambda d: -d[1]["est"]):
+    for key, it, dark_s in sorted(due, key=lambda d: -d[1]["est"]):
         src = it.get("est_src") or "pool proxy"
         evs = it.get("est_events") or []
         worth = f"~${it['est']:,.2f}/day"
@@ -354,7 +438,14 @@ def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
             worth += (f", ~${it['est_total']:,.2f} over the rest of its program ("
                       f"{max(e[3] for e in evs):.1f} of {max(e[4] for e in evs):.1f} "
                       f"days, ends {_fmt_end(max(e[5] for e in evs))})")
-        lines.append(f"- {worth} ({src}), dark {dark / 60:.1f}h  {it['what']}")
+        label, st = labels[key]
+        lines.append(f"- {label} -- missing {missing_of(key, it)}. {worth} ({src}); "
+                     f"flagged {dark_s / 60:.1f}h ago  {it['what']}")
+        if st is not None and st["q"] and key.startswith("start:"):
+            lines.append("    quoting now" + (f", until {_fmt_et(st['cutoff'])}" if st["cutoff"]
+                                              else "") +
+                         ", behind the live gates; a start time makes it stop 10 min "
+                         "before the event")
         if it.get("title"):
             lines.append(f"    what it is: {it['title']}")
         if len(evs) > 1:
@@ -363,7 +454,10 @@ def alert_body(due: List[Tuple[str, dict, float]]) -> Tuple[str, str]:
             lines.append(f"    per event: {per}"
                          + (f"; +{len(evs) - 4} more" if len(evs) > 4 else ""))
         lines.append(f"    fix: {it['fix']}")
-    lines += ["", "(est = the bot's own reward estimator, as if the gap were "
+    lines += ["", "(QUOTED / NOT QUOTED = what the bot was doing at the last dashboard "
+                  "build, every 10 min; for a QUOTED item the $ is about what it earns "
+                  "now, and the missing date decides when it stops. "
+                  "est = the bot's own reward estimator, as if the gap were "
                   "fixed: its standard ladder against each market's live book, "
                   "the forward $/day over its size schedule, summed over the "
                   "item's paying markets -- no $1/market floor applied. The "
@@ -1125,7 +1219,7 @@ def main(argv=None) -> int:
             due, state["items"] = due_alerts(state.get("items") or {}, items, time.time())
             if due:
                 describe(client, due)
-                subject, body = alert_body(due)
+                subject, body = alert_body(due, load_quote_state())
                 log("[WATCH] alert:\n" + body)
                 if not args.dry:
                     imm.Alerter("IMM-WATCH", live=True).send_message(body, subject)

@@ -218,11 +218,54 @@ class TestGapAlert(unittest.TestCase):
         self.assertEqual(set(st), {"new:KXNEW"})
 
     def test_alert_body_names_value_age_and_fix(self):
+        qs = {"ev:KXA-26": {"q": 0, "n": 3, "dec": fw.Counter({"payout_floor": 3}),
+                            "cutoff": None}}
         subject, body = fw.alert_body([("gap:KXA-26", {"est": 44.0, "what": "KXA-26: no row",
-                                                       "fix": "add a row"}, 95.0)])
-        self.assertIn("1 dark item(s) worth ~$44/day", subject)
-        self.assertIn("~$44.00/day (pool proxy), dark 1.6h  KXA-26: no row", body)
+                                                       "fix": "add a row"}, 95.0)], qs)
+        self.assertEqual(subject, "IMM watch: 1 not quoted (~$44/day)")
+        self.assertIn("- NOT QUOTED (0 of 3 markets; bot: payout_floor) -- missing a config "
+                      "fix. ~$44.00/day (pool proxy); flagged 1.6h ago  KXA-26: no row", body)
         self.assertIn("fix: add a row", body)
+
+    def test_quoted_vs_not_quoted_and_what_is_missing(self):
+        # Jack 2026-10-17: '"Dark" email should be clear on if the event isn't
+        # quoted vs if it's missing an end date'
+        cut = datetime(2026, 11, 2, 15, 0, tzinfo=timezone.utc).timestamp()
+        qs = {"ev:KXTRUMPMENTIONB-26OCT19": {"q": 25, "n": 25, "dec": fw.Counter(),
+                                             "cutoff": cut},
+              "ev:KXSENGA-26": {"q": 0, "n": 4, "dec": fw.Counter(), "cutoff": None}}
+        due = [("start:KXTRUMPMENTIONB-26OCT19",
+                {"est": 49.86, "what": "KXTRUMPMENTIONB-26OCT19: no start time", "fix": "r"},
+                1800.0),
+               ("gap:KXSENGA-26", {"est": 12.0, "what": "KXSENGA-26: no verified election "
+                                                        "day on file", "fix": "row"}, 60.0),
+               ("new:KXNEW", {"est": 7.0, "what": "KXNEW: newly paying", "fix": "call"}, 60.0)]
+        subject, body = fw.alert_body(due, qs)
+        self.assertEqual(subject, "IMM watch: 2 not quoted (~$19/day); 1 quoted but missing "
+                                  "a start time or date (~$50/day)")
+        self.assertIn("- QUOTED on 25 of 25 markets -- missing its start time. ~$49.86/day", body)
+        self.assertIn("quoting now, until Nov 02 10:00 AM ET, behind the live gates; a start "
+                      "time makes it stop 10 min before the event", body)
+        self.assertIn("- NOT QUOTED (0 of 4 markets) -- missing its election day.", body)
+        self.assertIn("- NOT QUOTED (not in the bot's book) -- missing a place on the allowlist "
+                      "(a new family: your call).", body)
+        self.assertNotIn("dark ", body.split("(QUOTED / NOT QUOTED")[0])
+
+    def test_quote_state_reads_the_dashboard(self):
+        D = {"markets": {
+            "KXE-26-A": {"ev": "KXE-26", "ser": "KXE", "cur": {"q": 2}, "dec": "selected",
+                         "cutoff": 1900000000.0},
+            "KXE-26-B": {"ev": "KXE-26", "ser": "KXE", "cur": {"q": 0}, "dec": "payout_floor",
+                         "cutoff": 1800000000.0}}}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "dash.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("<script>const D = " + json.dumps(D) + ";\n</script>")
+            qs = fw.load_quote_state(path)
+            self.assertEqual((qs["ev:KXE-26"]["q"], qs["ev:KXE-26"]["n"],
+                              qs["ev:KXE-26"]["cutoff"]), (1, 2, 1900000000.0))
+            self.assertEqual(dict(qs["ser:KXE"]["dec"]), {"payout_floor": 1})
+            self.assertEqual(fw.load_quote_state(os.path.join(d, "missing.html")), {})
 
     def test_alert_says_what_each_item_is(self):
         # Jack 2026-10-11: "make sure the description of the event is listed,
@@ -576,7 +619,7 @@ class TestRealEstimates(unittest.TestCase):
         self.assertEqual([e[:3] for e in it["est_events"]],
                          [["KXNEW-26A", 3.0, 6.0], ["KXNEW-26B", 0.75, 1.5]])
         subject, body = fw.alert_body([("new:KXNEW", it, 90.0)])
-        self.assertIn("worth ~$4/day (~$8 over their programs)", subject)
+        self.assertIn("1 quote state unknown (~$4/day) (~$8 over their programs)", subject)
         self.assertIn("~$3.75/day, ~$7.50 over the rest of its program (2.0 of 3.0 days, ends ", body)
         self.assertIn("per event: KXNEW-26A ~$3.00/day = ~$6.00 (2.0d left); "
                       "KXNEW-26B ~$0.75/day = ~$1.50 (2.0d left)", body)
