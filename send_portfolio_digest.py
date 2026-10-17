@@ -41,7 +41,9 @@ dollar deposited plus every dollar withdrawn since the account opened
 (fetch_transfers: /portfolio/deposits and /portfolio/withdrawals, read in
 full each morning), with the same after-rewards estimate. The day change
 leaves deposits and withdrawals out too: it is the day's change in total
-profit. The subject carries both, with the day's trading and reward
+profit, so the day's transfers are the move in the all-time totals the two
+mornings recorded (day_transfers), not the transfers Kalshi dates inside
+the day. The subject carries both, with the day's trading and reward
 credits: "portfolio 2026-10-05: profit +$18.1k (day +$1.1k: trading
 -$0.8k, rewards +$2.4k)".
 
@@ -410,6 +412,27 @@ def sum_transfers(transfers, t0, t1: datetime):
     amts = [a for ts, a in transfers if lo < ts <= t1.timestamp()]
     return (round(sum(a for a in amts if a > 0), 2),
             round(-sum(a for a in amts if a < 0), 2))
+
+
+def day_transfers(transfers, prior, deposited, withdrawn, t0, t1: datetime):
+    """Net $ deposited (+) / withdrawn (-) since the prior morning, for the
+    day change: the move in the all-time totals the two mornings recorded,
+    so the day is exactly the move in total profit. Not the transfers dated
+    t0 < ts <= t1: Kalshi dates a deposit when it is STARTED and leaves it out
+    while pending, so a bank (ACH) deposit that clears days later fell in no
+    day. The $500 started 10/10 cleared overnight 10/15 -> 10/16 and its cash
+    read as reward credits: "day -$0.2k, rewards +$1.2k" where total profit
+    fell $740.68 and Kalshi credited $671.86 (Jack 2026-10-17: "10/16 had
+    profit at $28.6k but only saw -$200 on the day so what explains the $700
+    drop"). A prior morning that recorded no totals falls back to the dated
+    window; None when today's transfer read failed."""
+    if transfers is None or deposited is None or withdrawn is None:
+        return None
+    p_dep, p_wd = (prior or {}).get("deposited"), (prior or {}).get("withdrawn")
+    if p_dep is not None and p_wd is not None:
+        return round((deposited - withdrawn) - (_f(p_dep) - _f(p_wd)), 2)
+    dep, wd = sum_transfers(transfers, t0, t1)
+    return round(dep - wd, 2)
 
 
 def side_value(pos: float, mark, cost: float) -> float:
@@ -954,9 +977,8 @@ def build_portfolio(now_utc: datetime):
             rows.append({"event": ev, "day": day, "realized": realized,
                          "value_d": value_d, "value_now": value_now, "note": note})
         no_trade_cash = round(cash - _f(prior.get("cash")) - trade_cash, 2)
-        if transfers is not None:
-            dep, wd = sum_transfers(transfers, prior_created, now_utc)
-            net_transfers = round(dep - wd, 2)
+        net_transfers = day_transfers(transfers, prior, deposited, withdrawn,
+                                      prior_created, now_utc)
         if subs is not None:
             sub_moves = round(sum(a for ts, a in subs["moves"]
                                   if prior_created.timestamp() < ts <= now_utc.timestamp()), 2)

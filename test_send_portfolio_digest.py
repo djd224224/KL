@@ -642,6 +642,56 @@ class TotalProfitTests(unittest.TestCase):
         self.assertNotIn("all time", text)
         self.assertNotIn("total profit =", html)
 
+    def test_day_transfers_follow_the_recorded_totals_not_kalshi_s_dates(self):
+        # Jack 2026-10-17: "10/16 had profit at $28.6k but only saw -$200 on
+        # the day so what explains the $700 drop". The $500 ACH deposit was
+        # started 10/10 11:52Z and pending until it cleared overnight 10/15 ->
+        # 10/16; once applied, Kalshi dates it 10/10, outside the day window
+        from datetime import datetime, timezone
+        t0 = datetime(2026, 10, 15, 11, 0, 2, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 16, 11, 0, 2, tzinfo=timezone.utc)
+        tr = [(datetime(2026, 10, 10, 11, 52, 8, tzinfo=timezone.utc).timestamp(), 500.0)]
+        self.assertEqual(pf.sum_transfers(tr, t0, t1), (0.0, 0.0))
+        prior = {"deposited": 28000.0, "withdrawn": 0}
+        self.assertEqual(pf.day_transfers(tr, prior, 28500.0, 0.0, t0, t1), 500.0)
+        # a withdrawal counts the same way (net of the deposit)
+        self.assertEqual(pf.day_transfers(tr, prior, 28500.0, 1000.0, t0, t1), -500.0)
+        # a prior morning that recorded no totals: the transfers dated in the window
+        tr2 = tr + [(t0.timestamp() + 60, 2000.0)]
+        self.assertEqual(pf.day_transfers(tr2, {"deposited": None, "withdrawn": None},
+                                          30500.0, 0.0, t0, t1), 2000.0)
+        self.assertEqual(pf.day_transfers(tr2, None, 30500.0, 0.0, t0, t1), 2000.0)
+        # today's transfer read failed: unknown, as before
+        self.assertIsNone(pf.day_transfers(None, prior, None, None, t0, t1))
+
+    def test_the_10_16_email_with_the_late_ach_deposit(self):
+        # The 10/16 email read "day -$0.2k: trading -$1.3k, rewards +$1.2k":
+        # -240.68 = trading -1,328.51 + reward credits +1,171.86 + Kalshi's
+        # pricing vs mid -87.30 + perps +3.27, with the deposit's $500 inside
+        # the credits. With the day's deposits from the recorded totals
+        # (+500.00) the credits are the statement's Oct 16 $671.86 and the day
+        # is total profit's move, 28,556.11 - 29,296.79 = -740.68
+        p = {"today": "2026-10-16", "rows": [_row("KXA-26", value_d=-1328.51)],
+             "first_run": False,
+             "prior": {"equity_kalshi": 56906.86, "perps_equity": 89.93,
+                       "subs_equity": 300.0, "deposited": 28000.0, "withdrawn": 0},
+             "equity_kalshi": 56662.91, "cash": 29590.91,
+             "kalshi_positions_value": 27072.0, "equity": 61670.37,
+             "positions_value": 32079.46, "perps_equity": 93.2, "perps_stale": False,
+             "perps": {"equity": 93.2, "positions": []},
+             "subs_equity": 300.0, "subs_stale": False,
+             "subs": {"accounts": {"1": 300.0}}, "sub_moves": 0.0,
+             "account_value": 57056.11, "unpaid": None,
+             "no_trade_cash": 1797.95, "collateral_d": 626.09, "net_transfers": 500.0,
+             "total_profit": 28556.11, "deposited": 28500.0, "withdrawn": 0.0}
+        subject, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertEqual(subject, "portfolio 2026-10-16: profit +$28.6k "
+                                  "(day -$0.7k: trading -$1.3k, rewards +$0.7k)")
+        self.assertIn("vs yesterday: -740.68  =  trading (at mid) -1,328.51  +  reward "
+                      "credits +671.86  +  Kalshi's pricing vs mid -87.30  +  perpetuals "
+                      "+3.27  +  subaccount 1 +0.00  (excludes deposits/withdrawals "
+                      "+500.00)", text)
+
     def test_signed_usd(self):
         self.assertEqual(pf._signed_usd(13138.5), "+$13,138.50")
         self.assertEqual(pf._signed_usd(-0.5), "-$0.50")
