@@ -144,9 +144,14 @@ def group_section(w, rows, fills, marks, days):
         g = G[r["group"]]
         g["trips"] += 1
         g["cost"] += float(r.get("side_day") or 0.0) * float(r.get("hold_s") or 0.0) / 86400.0
+    seen = set()
     for r in held:
+        tid = str(r.get("trade_id"))
+        if tid in seen:
+            continue                    # the feed sent the same fill twice
+        seen.add(tid)
         g = G[r["group"]]
-        f = by_id.get(str(r.get("trade_id")))
+        f = by_id.get(tid)
         if f is None:
             g["nomatch"] += 1
             continue

@@ -60,9 +60,10 @@ class TestRiskDryReport(unittest.TestCase):
                              "group": "NFL game 26OCT19DALWSH", "side": "bid",
                              "hold_s": 1800.0, "side_day": 2.0})
         fid = self._fill(t + 100, "KXNFLA-26OCT19DALWSH-X", "bid", 100, -10.0, -4.0)
-        self.grp.append({"ev": "held_fill", "ts": t + 100.2, "mode": "dry",
-                         "group": "NFL game 26OCT19DALWSH", "side": "bid",
-                         "trade_id": fid})
+        for dt in (0.2, 0.3):                   # the feed sent the fill twice: counted once
+            self.grp.append({"ev": "held_fill", "ts": t + 100 + dt, "mode": "dry",
+                             "group": "NFL game 26OCT19DALWSH", "side": "bid",
+                             "trade_id": fid})
         out = self._run()
         # $10 lost at 4h kept out, for 2 x 2.0/day x 30 min = $0.08 of reward
         self.assertIn("| NFL game 26OCT19DALWSH | 2 | 1 | 100 | -$10.00 | -$4.00 | $0.08 | $9.92 |", out)
