@@ -681,6 +681,17 @@ class ExchangeClient(KalshiClient):
                 self._normalize_order(o)
         return dictr
 
+    def get_queue_positions(self,
+                            market_tickers:Optional[str]=None,
+                            event_ticker:Optional[str]=None,
+                            subaccount:Optional[int]=None):
+        """GET /portfolio/orders/queue_positions (docs, checked 2026-10-17):
+        {"queue_positions": [{"order_id", "market_ticker",
+        "queue_position_fp"}]} -- the contracts that must match before each
+        resting order gets a fill. `market_tickers` is comma-separated."""
+        query_string = self.query_generation(params={k: v for k,v in locals().items()})
+        return self.get(self.portfolio_url + '/orders/queue_positions' + query_string)
+
     def get_order(self,
                     order_id:str):
         orders_url = self.portfolio_url + '/orders'

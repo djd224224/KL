@@ -3636,6 +3636,129 @@ def sweep_hold_secs(series: str) -> float:
                                     for s in sweep_linked_series(series)
                                     if s in SWEEP_HOLD_BY_SERIES])
 
+
+# ESCALATING HOLDS FOR REPEAT TRIPS (Jack 2026-10-17: "Build 1 without
+# approvals, rain, mentions. Shorten the counter to within 30min instead of
+# your [hour]" -- #1 of the 10/17 risk-return review). A trip holds its event
+# SWEEP_HOLD_SECS (2 min live), then the bot re-quotes the same places, and
+# whoever cleared us, still working the event, clears us again: over
+# 10/03-10/16 the trips that came within an hour of the event's previous one
+# lost $2.3k at 4h mark-outs (on 10/15 the LoL pentakill props tripped 11
+# times in ~35 min behind a bait order). So an event's trips CHAIN: a trip
+# within SWEEP_ESCALATE_WINDOW_SECS of the end of the event's previous hold
+# (30 min of quoting) is its 2nd and holds SWEEP_ESCALATE_HOLDS[0] (30 min);
+# a 3rd or later holds SWEEP_ESCALATE_HOLDS[1] (60 min); 30 min of quoting
+# with no trip starts the count over. Replay 10/03-10/16 with these
+# exclusions (4h mark-outs against the bot's reward estimate): ~21 2nd-trip
+# and ~7 3rd-trip holds a day, fills avoided $724 vs $63 of reward, ~+$47/day
+# -- $405 of it sports, where the 10/15 LoL bait (now also the lone-reference
+# guard's) and one NFL escalator before kickoff carry most of it.
+# Excluded (SWEEP_ESCALATE_EXCLUDE, series prefixes -- their trips keep the
+# plain hold): approval (KXTRUMPAPPROVE, KXAPRPOTUS: -$95 in the replay, its
+# pools make time out expensive; it keeps its linked 10-min hold) and rain
+# (KXRAIN*: the daily event is 33 cities, and a 2nd trip within the hour was
+# in another region 60% of the time). Mention series never trip at all
+# (SWEEP_EXEMPT).
+#    IMM_SWEEP_ESCALATE=dry -- THE DEFAULT: the chain is kept and each trip's
+#                   escalated hold is LOGGED (ws_sweep: trip_n, esc_hold_s,
+#                   and esc_shadowed on a trip the longer hold would have
+#                   prevented -- it does not advance the chain); every hold
+#                   stays SWEEP_HOLD_SECS.
+#    IMM_SWEEP_ESCALATE=on  -- a live trip holds its escalated length.
+#    IMM_SWEEP_ESCALATE=off -- nothing.
+SWEEP_ESCALATE = os.environ.get("IMM_SWEEP_ESCALATE", "dry").strip().lower()
+if SWEEP_ESCALATE not in ("off", "dry", "on"):
+    SWEEP_ESCALATE = "off"
+SWEEP_ESCALATE_WINDOW_SECS = max(
+    0.0, _env_float("IMM_SWEEP_ESCALATE_WINDOW_MIN", 30.0)) * 60.0
+
+
+def _parse_minutes_list(raw: str) -> Tuple[float, ...]:
+    out = []
+    for part in (raw or "").split(","):
+        try:
+            v = float(part)
+        except ValueError:
+            continue
+        if v >= 0:
+            out.append(v * 60.0)
+    return tuple(out)
+
+
+# the 2nd trip's hold, then the 3rd-and-later's, in minutes
+SWEEP_ESCALATE_HOLDS = _parse_minutes_list(
+    os.environ.get("IMM_SWEEP_ESCALATE_HOLDS_MIN", "30,60"))
+SWEEP_ESCALATE_EXCLUDE = tuple(p.strip().upper() for p in os.environ.get(
+    "IMM_SWEEP_ESCALATE_EXCLUDE", "KXTRUMPAPPROVE,KXAPRPOTUS,KXRAIN").split(",")
+    if p.strip())
+
+
+def sweep_escalate_excluded(series: str) -> bool:
+    """A series whose trips never escalate (SWEEP_ESCALATE_EXCLUDE prefixes)."""
+    return any(series.startswith(p) for p in SWEEP_ESCALATE_EXCLUDE)
+
+
+def sweep_escalated_hold(n: int, base_s: float) -> float:
+    """The hold the n-th trip of an event's chain earns: `base_s` for the
+    1st, then SWEEP_ESCALATE_HOLDS (the last entry for every later trip),
+    never under `base_s`."""
+    if n < 2 or not SWEEP_ESCALATE_HOLDS:
+        return base_s
+    return max(base_s, SWEEP_ESCALATE_HOLDS[min(n - 2, len(SWEEP_ESCALATE_HOLDS) - 1)])
+
+
+# BACK OF THE LINE (Jack 2026-10-17: "Build 7, back of the line." -- #7 of the
+# 10/17 risk-return review). Kalshi fills a price level oldest order first,
+# while the liquidity reward is pro-rata on size near the touch, so where we
+# stand in a level's line moves our fills, not our reward. An order at the
+# FRONT of a level with other makers' size behind it is the first thing a
+# small taker hits. Kalshi's docs (checked 10/17): "Increasing size or
+# changing price forfeits queue position and places the order at the back of
+# the queue" (decreasing size or touching only expiry keeps it), and GET
+# /portfolio/orders/queue_positions gives the contracts ahead of each order.
+# So every BACK_OF_LINE_EVERY_SECS the pass reads the line for our whole-cent,
+# non-pad rungs that share their price with at least BACK_OF_LINE_MIN_BEHIND
+# external contracts (the WS book less our own), and an order with at least
+# that many external contracts -- and BACK_OF_LINE_MIN_BEHIND_FRAC of the
+# level's external size -- BEHIND it is amended +1 contract: same price, back
+# of the line, never off the book. Replay 10/12-10/16 (1,758 touch fills
+# against the book snapshots and the public tape): at the back, 17% of the
+# filled contracts would have gone to the line ahead instead, saving $115 of
+# 4h mark-outs in 5 days (~$23/day). Most of the loss came from takers who
+# cleared the whole level (45%) or from the line ahead vanishing just before
+# the hit (25%), which no place in line avoids.
+# Left alone: sub-penny orders (an amend sends whole cents, so it would MOVE
+# them), pads, orders placed or amended this cycle (at the back already),
+# orders with a fill since the cycle's read (their count is not settled), and
+# orders re-queued BACK_OF_LINE_MAX_BUMPS times already (each re-queue adds a
+# contract; the size rule ignores changes under 20%, and the TTL refresh
+# re-places the remaining size). A market the WS feed cannot serve is skipped.
+#    IMM_BACK_OF_LINE=dry -- THE DEFAULT: the line is read and each re-queue
+#                   is LOGGED (back_of_line_<date>.jsonl), nothing amended.
+#    IMM_BACK_OF_LINE=on  -- the amend is sent.
+#    IMM_BACK_OF_LINE=off -- nothing, not even the read.
+BACK_OF_LINE = os.environ.get("IMM_BACK_OF_LINE", "dry").strip().lower()
+if BACK_OF_LINE not in ("off", "dry", "on"):
+    BACK_OF_LINE = "off"
+BACK_OF_LINE_EVERY_SECS = max(5.0, _env_float("IMM_BACK_OF_LINE_EVERY_SECS", 60.0))
+BACK_OF_LINE_MIN_BEHIND = max(1.0, _env_float("IMM_BACK_OF_LINE_MIN_BEHIND", 20.0))
+BACK_OF_LINE_MIN_BEHIND_FRAC = min(1.0, max(0.0, _env_float(
+    "IMM_BACK_OF_LINE_MIN_BEHIND_FRAC", 0.25)))
+BACK_OF_LINE_COOLDOWN_SECS = max(0.0, _env_float("IMM_BACK_OF_LINE_COOLDOWN_SECS", 300.0))
+BACK_OF_LINE_MAX_BUMPS = max(0, _env_int("IMM_BACK_OF_LINE_MAX_BUMPS", 3))
+BACK_OF_LINE_MAX_PER_PASS = max(0, _env_int("IMM_BACK_OF_LINE_MAX_PER_PASS", 100))
+BACK_OF_LINE_CHUNK = max(1, _env_int("IMM_BACK_OF_LINE_CHUNK", 40))
+BACK_OF_LINE_BUDGET_SECS = max(1.0, _env_float("IMM_BACK_OF_LINE_BUDGET_SECS", 8.0))
+
+
+def back_of_line_level(levels: Dict[float, float], px_dollars: float) -> float:
+    """Contracts resting at `px_dollars` in one side of a WS book ({px: qty},
+    dollar keys); 0 when the level is empty."""
+    for p, q in levels.items():
+        if abs(float(p) - px_dollars) < 1e-6:
+            return float(q)
+    return 0.0
+
 # Series other repo bots trade (self-trade / infighting exclusion) + anything
 # broadcast-reactive the user wants out entirely. Prefix match on the ticker.
 # NOTE 2026-07-11: liquidity programs now exist on some crypto-fleet events
@@ -9316,6 +9439,14 @@ _CONFIG_CODE_KNOBS = (
     "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
     # ...its linked series and per-series holds (2026-10-15)
     "SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES",
+    # ...its escalating holds for repeat trips (2026-10-17)
+    "SWEEP_ESCALATE", "SWEEP_ESCALATE_WINDOW_SECS", "SWEEP_ESCALATE_HOLDS",
+    "SWEEP_ESCALATE_EXCLUDE",
+    # back of the line: re-queue behind other makers at our price (2026-10-17)
+    "BACK_OF_LINE", "BACK_OF_LINE_EVERY_SECS", "BACK_OF_LINE_MIN_BEHIND",
+    "BACK_OF_LINE_MIN_BEHIND_FRAC", "BACK_OF_LINE_COOLDOWN_SECS",
+    "BACK_OF_LINE_MAX_BUMPS", "BACK_OF_LINE_MAX_PER_PASS", "BACK_OF_LINE_CHUNK",
+    "BACK_OF_LINE_BUDGET_SECS",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
     "WS_FAST_MIN_GAP_C", "WS_FAST_EXEMPT", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
     # hang watchdog: wedge stacks, its handoff, the main-thread network
@@ -17435,6 +17566,20 @@ class IncentiveMarketMaker:
         # quoting (a control trip must not)
         self._sweep_until: Dict[str, float] = {}
         self._sweep_hold: Dict[str, float] = {}
+        # ...and its escalation chain (2026-10-17, SWEEP_ESCALATE): hold key
+        # -> {"n": trips in the chain, "hold_until": the escalated hold's end
+        # (as `on` would hold it), "reset_at": when the chain starts over}
+        self._sweep_esc: Dict[str, Dict[str, float]] = {}
+        # back of the line (2026-10-17, BACK_OF_LINE): order id -> re-queues
+        # so far / when it was last re-queued (or, dry, logged), the last pass
+        self._bol_bumps: Dict[str, int] = {}
+        self._bol_last: Dict[str, float] = {}
+        self._bol_last_pass = 0.0
+        self._bol_logged: Deque[float] = deque()
+        self._bol = {"passes": 0, "candidates": 0, "reads": 0, "read_fails": 0,
+                     "no_position": 0, "front": 0, "would_requeue": 0,
+                     "requeued": 0, "amend_fails": 0, "capped": 0,
+                     "budget_stops": 0}
         # our WS fills (exchange time, order id, contracts) and when the cycle
         # last read its resting orders: the view rebuild subtracts the fills
         # that landed after that read, which the read cannot hold
@@ -17443,7 +17588,11 @@ class IncentiveMarketMaker:
         self._sweep = {"trips": 0, "trips_live": 0, "trips_control": 0,
                        "cancels": 0, "skipped_budget": 0, "skipped_writes": 0,
                        "fills_seen": 0, "unparsed": 0, "unknown_order": 0,
-                       "exempt": 0}
+                       "exempt": 0,
+                       # escalation (2026-10-17): 2nd / 3rd+ trips of a chain,
+                       # held longer live, and trips a longer hold would have
+                       # kept out (dry)
+                       "esc_2": 0, "esc_3": 0, "esc_live": 0, "esc_shadowed": 0}
         # candidate books on the feed (2026-10-08, WS_CANDIDATES): the
         # candidates the last universe refresh read (the feed carries them
         # beside the managed set last sent), how their books were read, the
@@ -19061,7 +19210,8 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! cancel failed {order_id}: {e}")
             return False
 
-    def amend_order_inplace(self, o: dict, q: Quote, now_ts: float) -> bool:
+    def amend_order_inplace(self, o: dict, q: Quote, now_ts: float,
+                            reason: str = "") -> bool:
         """Reprice/resize a resting order IN PLACE (V2 amend, 2026-08-02
         requote-downtime fix): the rung never leaves the book — no
         cancel->place gap — and the order_id survives, so ownership/fill
@@ -19111,12 +19261,13 @@ class IncentiveMarketMaker:
             self._join_set(oid, q.ticker, q.book_side, q.price_cents, None,
                            float(q.count), o.get("client_order_id"),
                            self.state.order_ages.get(oid))
-            log(f"{self.tag} amended {label}")
+            log(f"{self.tag} amended {label}" + (f" [{reason}]" if reason else ""))
             self._log_order("amend", q.ticker, q.book_side, q.price_cents,
                             q.count, oid, now_ts,
                             prev_price_cents=prev_px, prev_count=prev_ct,
                             filled_before=filled, total_count=total,
-                            quote_is_pad=q.is_pad)
+                            quote_is_pad=q.is_pad,
+                            **({"reason": reason} if reason else {}))
             return True
         except HttpError as e:
             if e.status in (404, 409):
@@ -19816,6 +19967,9 @@ class IncentiveMarketMaker:
             for d in (self._sweep_until, self._sweep_hold):
                 for e_old in [e for e, u in d.items() if u < now_ts - 3600]:
                     del d[e_old]
+            for e_old in [e for e, s in self._sweep_esc.items()
+                          if s["reset_at"] < now_ts - 3600]:
+                del self._sweep_esc[e_old]
             self._sweep_until[key] = now_ts + hold_s
             if sweep_exempt(series_of(t)):
                 # mention families (SWEEP_EXEMPT_WORDS): logged, nothing pulled
@@ -19830,11 +19984,41 @@ class IncentiveMarketMaker:
                     f"{side.upper()} @ {px:g}c filled out ({n:g}) -> mention "
                     f"series, nothing pulled")
                 return
+            # ESCALATING HOLDS (2026-10-17, SWEEP_ESCALATE): this trip's place
+            # in the event's chain, kept the same way dry and on
+            esc_n, esc_hold, shadowed = 1, hold_s, False
+            esc_on = SWEEP_ESCALATE != "off" and \
+                not sweep_escalate_excluded(series_of(t))
+            if esc_on:
+                st = self._sweep_esc.get(key)
+                if st is not None and now_ts < st["hold_until"]:
+                    # only dry (or a control trip) gets here: `on` would still
+                    # be holding the event, so this trip would not happen and
+                    # it does not advance the chain
+                    shadowed = True
+                    esc_n = int(st["n"])
+                    self._sweep["esc_shadowed"] += 1
+                else:
+                    esc_n = int(st["n"]) + 1 if (
+                        st is not None and now_ts <= st["reset_at"]) else 1
+                    esc_hold = sweep_escalated_hold(esc_n, hold_s)
+                    self._sweep_esc[key] = {
+                        "n": esc_n, "hold_until": now_ts + esc_hold,
+                        "reset_at": now_ts + esc_hold + SWEEP_ESCALATE_WINDOW_SECS}
+                    if esc_n == 2:
+                        self._sweep["esc_2"] += 1
+                    elif esc_n >= 3:
+                        self._sweep["esc_3"] += 1
             self._sweep["trips"] += 1
             # on: live, unless drawn into the control (SWEEP_HOLDOUT)
             live = SWEEP_BREAKER == "on" and \
                 not (SWEEP_HOLDOUT > 0 and self._ws_rng.random() < SWEEP_HOLDOUT)
             mode = "on" if live else ("control" if SWEEP_BREAKER == "on" else "dry")
+            base_hold_s = hold_s
+            if live and SWEEP_ESCALATE == "on" and esc_hold > hold_s:
+                hold_s = esc_hold
+                self._sweep_until[key] = now_ts + hold_s
+                self._sweep["esc_live"] += 1
             if live:
                 self._sweep_hold[key] = now_ts + hold_s
                 self._sweep["trips_live"] += 1
@@ -19869,8 +20053,24 @@ class IncentiveMarketMaker:
                          for tk, o in pull]}
             if len(group) > 1:
                 rec["linked"] = list(group)
+            if esc_on:
+                rec.update(trip_n=esc_n, esc_hold_s=esc_hold, esc=SWEEP_ESCALATE,
+                           esc_shadowed=shadowed)
+            elif SWEEP_ESCALATE != "off":
+                rec["esc"] = "excluded"
             self._sink("ws_sweep", rec)
             others = sorted({self._event_of(tk) for tk, _o in pull} - {ev})
+            esc_txt = ""
+            if shadowed:
+                esc_txt = (f"; escalation ({SWEEP_ESCALATE}): inside the longer "
+                           f"hold of trip {esc_n} -- on, no trip here")
+            elif esc_on and esc_n >= 2:
+                esc_txt = (f"; trip {esc_n} within "
+                           f"{SWEEP_ESCALATE_WINDOW_SECS / 60:.0f} min of the last "
+                           f"hold: " + (f"held {hold_s / 60:.0f} min"
+                                        if hold_s > base_hold_s else
+                                        f"escalation {SWEEP_ESCALATE}, would hold "
+                                        f"{esc_hold / 60:.0f} min"))
             log(f"{self.tag} sweep breaker ({mode}): {t} "
                 f"{side.upper()} @ {px:g}c filled out ({n:g}) -> "
                 f"{'pulling' if live else 'would pull'} "
@@ -19878,7 +20078,7 @@ class IncentiveMarketMaker:
                 + (f" + linked {'/'.join(group)}"
                    + (f" ({', '.join(others)})" if others else "")
                    if len(group) > 1 else "")
-                + f" for {hold_s:.0f}s")
+                + f" for {hold_s:.0f}s" + esc_txt)
             if not live:
                 return
             for _tk, o in pull:
@@ -19970,6 +20170,139 @@ class IncentiveMarketMaker:
                         now_ts)
                 elif abs(o["px"] - self._ws_flagged[oid]["px"]) > 1e-9:
                     self._ws_episode_end(oid, "amend", now_ts, new_px=o["px"])
+
+    def _back_of_line_pass(self, resting: List[dict], now_ts: float) -> None:
+        """BACK OF THE LINE (2026-10-17, BACK_OF_LINE): every
+        BACK_OF_LINE_EVERY_SECS, read Kalshi's line for our whole-cent rungs
+        that share their price with other makers, and send each one with
+        enough of their size BEHIND it to the back with a +1 amend (dry: log
+        it). Runs on the resting view the cycle just built and the WS books;
+        live orders only. Never raises."""
+        if BACK_OF_LINE == "off" or self._ws is None or not self.live:
+            return
+        if now_ts - self._bol_last_pass < BACK_OF_LINE_EVERY_SECS:
+            return
+        self._bol_last_pass = now_ts
+        st = self._bol
+        try:
+            st["passes"] += 1
+            view = self._resting_view
+            live_ids = {o["order_id"] for lst in view.values() for o in lst}
+            for d in (self._bol_bumps, self._bol_last):
+                for oid in [k for k in d if k not in live_ids]:
+                    del d[oid]
+            # an order with a fill since the cycle's read has an unsettled
+            # count: the +1 must go on top of filled + remaining exactly
+            cut = self._resting_read_at + 1.0
+            filled_since = {f_oid for f_ts, f_oid, _n in self._ws_fill_log
+                            if f_ts > cut}
+            read = {str(o.get("order_id") or ""): o for o in resting}
+            cands: List[Tuple[str, dict, dict, float]] = []
+            for t, lst in view.items():
+                lv: Optional[Tuple[Dict[float, float], Dict[float, float]]] = None
+                for o in lst:
+                    oid = o["order_id"]
+                    px = float(o["px"])
+                    if o.get("pad") or abs(px - round(px)) > 0.005 or o["rem"] < 1:
+                        continue
+                    # placed this cycle (not in the read) or amended: at the
+                    # back already
+                    if oid not in read or oid in self._cycle_amended or \
+                            oid in filled_since:
+                        continue
+                    if now_ts - self._bol_last.get(oid, 0.0) < BACK_OF_LINE_COOLDOWN_SECS:
+                        continue
+                    if self._bol_bumps.get(oid, 0) >= BACK_OF_LINE_MAX_BUMPS:
+                        continue
+                    if lv is None:
+                        lv = self._ws.book_levels(t) or ({}, {})
+                    c = int(round(px))
+                    side_lv, at = (lv[0], c / 100.0) if o["side"] == "bid" \
+                        else (lv[1], (100 - c) / 100.0)
+                    own = sum(x["rem"] for x in lst if x["side"] == o["side"]
+                              and abs(float(x["px"]) - px) < 0.005)
+                    ext = back_of_line_level(side_lv, at) - own
+                    if ext >= BACK_OF_LINE_MIN_BEHIND:
+                        cands.append((t, o, read[oid], ext))
+            if not cands:
+                return
+            st["candidates"] += len(cands)
+            ahead: Dict[str, float] = {}
+            tickers = sorted({t for t, _o, _r, _e in cands})
+            t0 = time.time()
+            for i in range(0, len(tickers), BACK_OF_LINE_CHUNK):
+                if time.time() - t0 > BACK_OF_LINE_BUDGET_SECS:
+                    st["budget_stops"] += 1
+                    break
+                self._heartbeat = time.time()
+                try:
+                    resp = self.client.get_queue_positions(
+                        market_tickers=",".join(tickers[i:i + BACK_OF_LINE_CHUNK]))
+                    st["reads"] += 1
+                except Exception as e:
+                    st["read_fails"] += 1
+                    if st["read_fails"] <= 3 or st["read_fails"] % 100 == 0:
+                        log(f"{self.tag} ! back-of-line queue read failed "
+                            f"({st['read_fails']}): {e}")
+                    continue
+                for q in (resp or {}).get("queue_positions") or []:
+                    try:
+                        ahead[str(q.get("order_id") or "")] = \
+                            float(q.get("queue_position_fp"))
+                    except (TypeError, ValueError):
+                        continue
+            done = 0
+            for t, o, ro, ext in cands:
+                oid = o["order_id"]
+                a = ahead.get(oid)
+                if a is None:
+                    st["no_position"] += 1
+                    continue
+                behind = ext - a
+                if behind < max(BACK_OF_LINE_MIN_BEHIND,
+                                BACK_OF_LINE_MIN_BEHIND_FRAC * ext):
+                    continue
+                st["front"] += 1
+                if done >= BACK_OF_LINE_MAX_PER_PASS:
+                    st["capped"] += 1
+                    continue
+                done += 1
+                c = int(round(float(o["px"])))
+                rec = {"ts": round(now_ts, 3), "mode": BACK_OF_LINE, "ticker": t,
+                       "order_id": oid, "side": o["side"], "px": c,
+                       "rem": round(float(o["rem"]), 2), "ahead": round(a, 2),
+                       "ext": round(ext, 2), "behind": round(behind, 2),
+                       "bumps": self._bol_bumps.get(oid, 0)}
+                did = False
+                if BACK_OF_LINE == "on":
+                    # same price, one more contract: Kalshi re-queues it at
+                    # the back (amend_order_inplace sends filled + this)
+                    q = Quote(ticker=t, book_side=o["side"], price_cents=c,
+                              count=int(math.floor(order_remaining(ro) + 1e-9)) + 1)
+                    did = self.amend_order_inplace(ro, q, now_ts,
+                                                   reason="back_of_line")
+                    rec["ok"] = bool(did)
+                    if did:
+                        st["requeued"] += 1
+                        self._bol_bumps[oid] = self._bol_bumps.get(oid, 0) + 1
+                        o["rem"] = float(q.count)
+                    else:
+                        st["amend_fails"] += 1
+                else:
+                    st["would_requeue"] += 1
+                self._bol_last[oid] = now_ts
+                self._sink("back_of_line", rec)
+                while self._bol_logged and self._bol_logged[0] < now_ts - 3600:
+                    self._bol_logged.popleft()
+                if len(self._bol_logged) < 30:
+                    self._bol_logged.append(now_ts)
+                    log(f"{self.tag} back-of-line ({BACK_OF_LINE}): "
+                        f"{'re-queued' if did else 'would re-queue'} {t} "
+                        f"{o['side'].upper()} @ {c}c ({o['rem']:g} left): "
+                        f"{a:g} ahead, {behind:g} of {ext:g} external "
+                        f"contracts behind")
+        except Exception as e:
+            log(f"{self.tag} ! back-of-line pass failed: {e}")
 
     def _idle(self, secs: float, stopping: dict) -> bool:
         """Sleep up to `secs` between cycles. With the WebSocket feed running
@@ -26062,6 +26395,9 @@ class IncentiveMarketMaker:
                 self._build_resting_view(resting, now_ts)
             except Exception as e:
                 log(f"{self.tag} ! WS resting view failed: {e}")
+            # back of the line (2026-10-17): on the view just built
+            if not fast_only:
+                self._back_of_line_pass(resting, now_ts)
         if not fast_only:
             self.state.cycles_today += 1
             self.state.last_markets_line = (
@@ -26516,7 +26852,18 @@ class IncentiveMarketMaker:
                                 hold_by_series=dict(SWEEP_HOLD_BY_SERIES),
                                 linked=[list(g) for g in SWEEP_LINKED_GROUPS],
                                 held_now=sum(1 for u in self._sweep_hold.values()
-                                             if u > now))
+                                             if u > now),
+                                # escalating holds (2026-10-17)
+                                escalate={"mode": SWEEP_ESCALATE,
+                                          "window_min": SWEEP_ESCALATE_WINDOW_SECS / 60,
+                                          "holds_min": [h / 60 for h in SWEEP_ESCALATE_HOLDS],
+                                          "exclude": list(SWEEP_ESCALATE_EXCLUDE),
+                                          "chains_now": sum(
+                                              1 for s in self._sweep_esc.values()
+                                              if s["reset_at"] > now and s["n"] >= 2)})
+            # back of the line (2026-10-17, BACK_OF_LINE)
+            out["back_of_line"] = dict(self._bol, mode=BACK_OF_LINE,
+                                       bumped_orders=len(self._bol_bumps))
             # cycle timing (2026-10-04): the REST book reads IMM_WS=on would
             # serve from the feed, inside each full cycle
             ct = list(self._cycle_times)
@@ -28207,6 +28554,31 @@ class IncentiveMarketMaker:
                         f"(the monitoring)" if SWEEP_HOLDOUT > 0 else "")
                      + f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",
                "off": ""}.get(SWEEP_BREAKER, ""))
+        _holds = [f"{h / 60:g}" for h in SWEEP_ESCALATE_HOLDS] or ["-"]
+        log(f"sweep escalation (2026-10-17): {SWEEP_ESCALATE}"
+            + ("" if SWEEP_ESCALATE == "off" else
+               f" -- a trip within {SWEEP_ESCALATE_WINDOW_SECS / 60:g} min of the end "
+               f"of its event's last hold is trip 2 (held {_holds[0]} min), trip "
+               f"3+ is held {_holds[-1]} min; {SWEEP_ESCALATE_WINDOW_SECS / 60:g} min "
+               f"of quoting with no trip starts over; never "
+               f"{', '.join(p + '*' for p in SWEEP_ESCALATE_EXCLUDE) or '-'} "
+               f"(mention series never trip)"
+               + (" -- LOGGED only, every hold stays "
+                  f"{SWEEP_HOLD_SECS:.0f}s" if SWEEP_ESCALATE == "dry" else "")
+               + ("" if SWEEP_BREAKER == "on" else
+                  f" (the breaker itself is {SWEEP_BREAKER})")))
+        log(f"back of the line (2026-10-17): {BACK_OF_LINE}"
+            + ("" if BACK_OF_LINE == "off" else
+               f" -- every {BACK_OF_LINE_EVERY_SECS:g}s, a whole-cent rung with >= "
+               f"{BACK_OF_LINE_MIN_BEHIND:g} external contracts (and "
+               f"{BACK_OF_LINE_MIN_BEHIND_FRAC:.0%} of its level's) BEHIND it in "
+               f"Kalshi's line is amended +1 contract, which sends it to the back; "
+               f"at most {BACK_OF_LINE_MAX_BUMPS} per order, "
+               f"{BACK_OF_LINE_MAX_PER_PASS} per pass"
+               + (" -- LOGGED only (back_of_line_<date>.jsonl), nothing amended"
+                  if BACK_OF_LINE == "dry" else "")
+               + ("" if WS_MODE in ("on", "shadow") else
+                  " (no WS feed: inactive)")))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "

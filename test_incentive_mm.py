@@ -28984,5 +28984,290 @@ class TestCarbonArcShadow(unittest.TestCase):
         os.remove(path)
 
 
+class TestSweepEscalation(unittest.TestCase):
+    """Repeat trips on an event hold it longer (SWEEP_ESCALATE, Jack
+    2026-10-17: "Build 1 without approvals, rain, mentions. Shorten the
+    counter to within 30min"): a trip within 30 min of the end of the event's
+    last hold is trip 2 (30 min), then 60 min; 30 min of quoting with no trip
+    starts over."""
+    E = "KXEVT-26OCT05"
+    A, B = E + "-A", E + "-B"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 120.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "dry"),
+                        ("SWEEP_ESCALATE_WINDOW_SECS", 1800.0),
+                        ("SWEEP_ESCALATE_HOLDS", (1800.0, 3600.0)),
+                        ("SWEEP_ESCALATE_EXCLUDE", ("KXTRUMPAPPROVE", "KXAPRPOTUS", "KXRAIN"))):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.n = 0
+
+    def _trip(self, dt, ticker=None):
+        """The bot re-quoted (a fresh order rests on `ticker`), and a fill
+        clears it `dt` seconds after self.now."""
+        t = ticker or self.A
+        self.n += 1
+        oid = f"o{self.n}"
+        self.bot._resting_view = {t: [{"order_id": oid, "side": "bid", "px": 40.0,
+                                       "rem": 20.0, "placed": self.now + dt - 60,
+                                       "pad": False}],
+                                  self.B: [{"order_id": oid + "b", "side": "ask",
+                                            "px": 45.0, "rem": 20.0,
+                                            "placed": self.now + dt - 60,
+                                            "pad": False}]}
+        self.feed.events = [("fill", {"order_id": oid, "market_ticker": t,
+                                      "count_fp": "20.00", "is_taker": False,
+                                      "ts_ms": int((self.now + dt) * 1000),
+                                      "trade_id": "t-" + oid})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _trips(self):
+        return [r for name, r in self.recs if name == "ws_sweep"]
+
+    def test_dry_logs_the_chain_and_every_hold_stays_plain(self):
+        self._trip(0)
+        self._trip(600)                         # 10 min later: trip 2
+        trips = self._trips()
+        self.assertEqual([(t["trip_n"], t["esc_hold_s"], t["hold_s"], t["esc"])
+                          for t in trips],
+                         [(1, 120.0, 120.0, "dry"), (2, 1800.0, 120.0, "dry")])
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 600 + 121))
+        # 15 min after trip 2: inside the 30 min `on` would hold -- shadowed,
+        # and it does not advance the chain
+        self._trip(1500)
+        t3 = self._trips()[-1]
+        self.assertEqual((t3["trip_n"], t3["esc_shadowed"], t3["hold_s"]), (2, True, 120.0))
+        s = self.bot._sweep
+        self.assertEqual((s["esc_2"], s["esc_3"], s["esc_shadowed"], s["esc_live"]),
+                         (1, 0, 1, 0))
+        # after the would-be hold (600 + 1800 = 2400) and within 30 min: trip 3
+        self._trip(2400 + 600)
+        t4 = self._trips()[-1]
+        self.assertEqual((t4["trip_n"], t4["esc_hold_s"], t4["esc_shadowed"]),
+                         (3, 3600.0, False))
+
+    def test_on_holds_trip_2_for_30_min_and_trip_3_for_60(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "on"):
+            self._trip(0)
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 100))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 121))
+            self._trip(600)
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 600 + 1799))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 600 + 1801))
+            # a fill inside the long hold (an order the budget left) is no trip
+            self._trip(600 + 900)
+            self.assertEqual(len(self._trips()), 2)
+            self._trip(2400 + 600)              # 10 min after the hold ended
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 3000 + 3599))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 3000 + 3601))
+        self.assertEqual([(t["trip_n"], t["hold_s"]) for t in self._trips()],
+                         [(1, 120.0), (2, 1800.0), (3, 3600.0)])
+        self.assertEqual(self.bot._sweep["esc_live"], 2)
+
+    def test_thirty_minutes_of_quoting_with_no_trip_starts_over(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "on"):
+            self._trip(0)
+            self._trip(120 + 1801)              # 30 min after the 2-min hold ended
+        self.assertEqual([(t["trip_n"], t["hold_s"]) for t in self._trips()],
+                         [(1, 120.0), (1, 120.0)])
+
+    def test_approval_and_rain_never_escalate(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "on"):
+            for i, t in enumerate(("KXRAIN-26OCT18-NYC", "KXRAINWKND-26OCT18-BOS")):
+                self._trip(i * 10000, ticker=t)
+                self._trip(i * 10000 + 600, ticker=t)
+        trips = self._trips()
+        self.assertEqual([(t["esc"], t["hold_s"]) for t in trips],
+                         [("excluded", 120.0)] * 4)
+        self.assertTrue(imm.sweep_escalate_excluded("KXTRUMPAPPROVE"))
+        self.assertTrue(imm.sweep_escalate_excluded("KXAPRPOTUS"))
+        self.assertTrue(imm.sweep_escalate_excluded("KXRAINNAPAM"))
+        self.assertFalse(imm.sweep_escalate_excluded("KXLOLTOURPENTA"))
+        self.assertEqual(self.bot._sweep_esc, {})
+
+    def test_off_keeps_no_chain(self):
+        with mock.patch.object(imm, "SWEEP_ESCALATE", "off"):
+            self._trip(0)
+            self._trip(600)
+        self.assertEqual([("trip_n" in t, "esc" in t, t["hold_s"]) for t in self._trips()],
+                         [(False, False, 120.0)] * 2)
+        self.assertEqual(self.bot._sweep_esc, {})
+
+    def test_the_escalated_hold_schedule(self):
+        self.assertEqual([imm.sweep_escalated_hold(n, 120.0) for n in (1, 2, 3, 7)],
+                         [120.0, 1800.0, 3600.0, 3600.0])
+        with mock.patch.object(imm, "SWEEP_ESCALATE_HOLDS", ()):
+            self.assertEqual(imm.sweep_escalated_hold(3, 120.0), 120.0)
+        self.assertEqual(imm._parse_minutes_list("30, 60,x,-1"), (1800.0, 3600.0))
+
+
+class TestBackOfLine(unittest.TestCase):
+    """BACK OF THE LINE (Jack 2026-10-17: "Build 7, back of the line."): a
+    whole-cent rung with enough other makers' size BEHIND it at its price is
+    amended +1 contract, which sends it to the back of Kalshi's line."""
+    T = "KXGOOD-99DEC31-A"
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.bot.live = True                     # real orders: the pass reads the line
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.reads = []
+        self.ahead = {"o1": 10.0}
+        self.bot.client.get_queue_positions = lambda **kw: (
+            self.reads.append(kw) or {"queue_positions": [
+                {"order_id": k, "market_ticker": self.T, "queue_position_fp": f"{v:.2f}"}
+                for k, v in self.ahead.items()]})
+        self.amends = []
+        self.bot.client.amend_order = lambda **kw: self.amends.append(kw) or {}
+        for name, v in (("BACK_OF_LINE", "dry"), ("BACK_OF_LINE_EVERY_SECS", 60.0),
+                        ("BACK_OF_LINE_MIN_BEHIND", 20.0),
+                        ("BACK_OF_LINE_MIN_BEHIND_FRAC", 0.25),
+                        ("BACK_OF_LINE_COOLDOWN_SECS", 300.0),
+                        ("BACK_OF_LINE_MAX_BUMPS", 3), ("BACK_OF_LINE_MAX_PER_PASS", 100),
+                        ("BACK_OF_LINE_CHUNK", 40), ("BACK_OF_LINE_BUDGET_SECS", 8.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        # our 60-lot bid at 41c on a 41c level of 360: 300 are other makers'
+        self.feed.books[self.T] = ({0.40: 500.0, 0.41: 360.0}, {0.55: 400.0})
+        self.view_order = {"order_id": "o1", "side": "bid", "px": 41.0, "rem": 60.0,
+                           "placed": self.now - 600, "pad": False}
+        self.bot._resting_view = {self.T: [self.view_order]}
+        self.resting = [{"order_id": "o1", "ticker": self.T, "book_side": "bid",
+                         "yes_price": 41, "remaining_count": 60.0, "fill_count": 5.0}]
+
+    def _pass(self, dt=0.0):
+        self.bot._back_of_line_pass(self.resting, self.now + dt)
+
+    def _rows(self):
+        return [r for name, r in self.recs if name == "back_of_line"]
+
+    def test_dry_logs_an_order_near_the_front_and_amends_nothing(self):
+        self._pass()
+        self.assertEqual(self.reads, [{"market_tickers": self.T}])
+        r = self._rows()[0]
+        self.assertEqual((r["mode"], r["order_id"], r["side"], r["px"], r["ahead"],
+                          r["ext"], r["behind"]),
+                         ("dry", "o1", "bid", 41, 10.0, 300.0, 290.0))
+        self.assertEqual(self.amends, [])
+        self.assertEqual((self.bot._bol["would_requeue"], self.bot._bol["requeued"]), (1, 0))
+
+    def test_on_amends_one_more_contract_at_the_same_price(self):
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+        self.assertEqual(len(self.amends), 1)
+        a = self.amends[0]
+        # filled 5 + 61 resting: one more than the 65 the order holds
+        self.assertEqual((a["order_id"], a["ticker"], a["book_side"], a["yes_price_cents"],
+                          a["total_count"]), ("o1", self.T, "bid", 41, 66.0))
+        self.assertEqual((self.view_order["rem"], self.bot._bol_bumps["o1"],
+                          self.bot._bol["requeued"]), (61.0, 1, 1))
+        self.assertTrue(self._rows()[0]["ok"])
+        amend_rows = [r for name, r in self.recs if name == "orders" and r.get("kind") == "amend"]
+        self.assertEqual(amend_rows[0]["reason"], "back_of_line")
+
+    def test_an_order_already_at_the_back_stays(self):
+        self.ahead = {"o1": 295.0}
+        self._pass()
+        self.assertEqual((self._rows(), self.bot._bol["front"]), ([], 0))
+
+    def test_a_thin_level_is_never_read(self):
+        self.feed.books[self.T] = ({0.41: 70.0}, {})       # 10 external contracts
+        self._pass()
+        self.assertEqual((self.reads, self._rows()), ([], []))
+
+    def test_orders_it_leaves_alone(self):
+        cases = {
+            "sub-penny": dict(px=41.15),
+            "pad": dict(pad=True),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                self.bot._bol_last_pass = 0.0
+                o = dict(self.view_order, **kw)
+                self.bot._resting_view = {self.T: [o]}
+                self._pass()
+                self.assertEqual(self.reads, [], name)
+        self.bot._resting_view = {self.T: [self.view_order]}
+        # placed this cycle (not in the cycle's read)
+        self.bot._bol_last_pass = 0.0
+        self.bot._back_of_line_pass([], self.now)
+        # amended this cycle
+        self.bot._bol_last_pass = 0.0
+        self.bot._cycle_amended = {"o1": 41}
+        self._pass()
+        self.bot._cycle_amended = {}
+        # a WS fill since the cycle's read
+        self.bot._bol_last_pass = 0.0
+        self.bot._resting_read_at = self.now - 30
+        self.bot._ws_fill_log.append((self.now - 5, "o1", 2.0))
+        self._pass()
+        self.assertEqual((self.reads, self._rows()), ([], []))
+
+    def test_cooldown_bump_cap_interval_and_live_only(self):
+        with mock.patch.object(imm, "BACK_OF_LINE", "on"):
+            self._pass()
+            self._pass(30)                      # inside the 60s interval: no pass
+            self._pass(120)                     # inside the 300s cooldown
+            self.assertEqual(len(self.amends), 1)
+            for i in (1, 2, 3):
+                # a later cycle: its read holds the bumped size, and the
+                # cycle's own amend map starts empty
+                self.resting[0]["remaining_count"] = self.view_order["rem"]
+                self.bot._cycle_amended, self.bot._cycle_amended_ct = {}, {}
+                self._pass(400 * i)
+            self.assertEqual(len(self.amends), 3)   # the 4th would pass MAX_BUMPS
+        self.bot.live = False
+        self.bot._bol_last_pass = 0.0
+        n = len(self.reads)
+        self._pass(5000)
+        self.assertEqual(len(self.reads), n)
+
+    def test_a_failed_read_is_counted_and_never_raises(self):
+        def boom(**kw):
+            raise RuntimeError("503")
+        self.bot.client.get_queue_positions = boom
+        self._pass()
+        self.assertEqual((self.bot._bol["read_fails"], self._rows()), (1, []))
+
+    def test_an_order_the_read_does_not_cover_is_skipped(self):
+        self.ahead = {}
+        self._pass()
+        self.assertEqual((self.bot._bol["no_position"], self._rows()), (1, []))
+
+    def test_off_reads_nothing(self):
+        with mock.patch.object(imm, "BACK_OF_LINE", "off"):
+            self._pass()
+        self.assertEqual(self.reads, [])
+
+    def test_the_client_builds_the_queue_positions_path(self):
+        c = _kc.ExchangeClient.__new__(_kc.ExchangeClient)
+        c.portfolio_url = "/portfolio"
+        seen = []
+        c.get = lambda path, params={}: seen.append(path) or {}
+        c.get_queue_positions(market_tickers="A,B")
+        c.get_queue_positions(event_ticker="EV")
+        self.assertEqual(seen, ["/portfolio/orders/queue_positions?market_tickers=A,B",
+                                "/portfolio/orders/queue_positions?event_ticker=EV"])
+
+
 if __name__ == "__main__":
     unittest.main()
