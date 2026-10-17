@@ -71,6 +71,8 @@ These were verified on 10/14.
 | `temp_shadow_sim.py` | Replay engine: feeds temp_mm_policy the replayed books, fairs and fills; fill models opt / cons / swp, reward accrual, settlement P&L. |
 | `temp_shadow_sweep.py` | The sweep-aware fill model (swp, its `VPass`) that the sim runs for every variant, plus its own tools: hazard `calibrate`, `tails`, `validate` on live hours, `run` / `sens` / `table` studies, `export` of a fit. |
 | `temp_shadow_sweep_hazard.json` / `temp_shadow_sweep_tails.json` | The swp defaults the sim loads: the 10/16 pre-live hazard fit (37 hours, validated on the live hour 26OCT1610) and the realized-tails table behind `net_cal`. `<TEMP_SHADOW_DATA>\model\sweep_hazard.json` / `sweep_tails.json` override them (Recalibrating swp, below). |
+| `temp_shadow_sweep_favhazard.json` | The stress fill model's hidden favorite-taker table (channel (e), `calibrate-fav` over the 62 recorded hours without live orders, 10/17). Not read by the daily pipeline. |
+| `temp_shadow_audit.py` | The 10/17 audit: `audit` (the live executor's actual orders under every fill model), `clears` (favorite-level clears and the upset rate after them), `reaction` (did other makers react to our orders), `stress-table` (the variants under opt / cons / swp / stress). Section "Order-level audit and the stress model", below. |
 | `temp_mm_live.py` / `run_temp_mm.ps1` | The LIVE executor of the same policy (DRY by default; `--live --subaccount N` is Jack's). It tails this collector's wx stream read-only. Handoff: TEMP_MM_LIVE.md. |
 | `temp_shadow_report.py` | Daily report (HTML email) plus the week summary and rule-based tweak suggestions. |
 | `run_temp_shadow_collector.ps1` / `run_temp_shadow_collector_hidden.vbs`, `run_temp_shadow_report_hidden.vbs`, `register_temp_shadow_collector.ps1`, `register_temp_shadow_report.ps1` | Windows tasks. |
@@ -621,3 +623,119 @@ python temp_shadow_sweep.py export --hazard <out>\hazard.json --to <TEMP_SHADOW_
 ```
 
 `run` and `sens` read `<out>\hazard.json` and `<out>\tails.json` when present, else the built-in `DEFAULT_HAZARD` / `DEFAULT_TAILS` (the 2026-10-16 calibrations). A cached run file is reused only when the draws, rec_mode, channels, policies, fill models, hazard (table, scale and kind), joiners and tails all match. The first pass had two bugs here. `--hazard-scale` never reached the worker, and a recalibrated hazard silently reused old run files.
+
+## Order-level audit and the stress model (2026-10-17)
+
+Jack 2026-10-17: "Make sure you don't make same mistake where the shadow trading results actually doesn't hold when it is tested live." The shadow said G made about +$1.8k a day; its one live hour (26OCT1610) lost $96 on about 10,000 1c filler contracts. The replay had assumed the market would not react to our orders: fills came only from recorded trades, made in a market that did not contain our orders. This pass audits the fill models against the live hour with the policy taken out, adds a pessimistic fill model (stress), re-runs the favorite-join variants under it, and checks how other makers reacted to our orders. Code: `temp_shadow_audit.py` (new) and the stress model in `temp_shadow_sweep.py`. The daily pipeline is unchanged: it does not run stress.
+
+### Audit of the live hour on the bot's actual orders (`temp_shadow_audit.py audit`)
+
+The live executor's 186 orders on 26OCT1610 are replayed as fixed trajectories from its orders log: every place / amend / renew / decrease / cancel / gone / expiry at its effective time. The effective time is the logged decision time plus the request latencies of the rows sent before it in the same decision (the hour's first create took 1.13 s, so the first pad rested about 1.2 s after its logged time; the shadow's subtraction uses the logged times). Each fill model then fills those exact orders from the recorded tape, with our orders out of the books and our 21 prints out of the tape, as the shadow does. In each model's world an order keeps its actual lifetime and logged total and fills from its own remaining; an order the market filled out ends at that fill in every world. The queue ahead at a place or price amend is the recorded level at that price just before the logged time (the recording held none of the order yet). Actual fills are timed by their tape prints (exchange time).
+
+Contracts / $ at settlement (30 Monte Carlo draws for the hazard channels):
+
+| class | actual | opt | cons | swp, live tape | swp front | swp joiner-free | stress |
+|---|---|---|---|---|---|---|---|
+| 1c fillers (pad / qual) | 10,006 / -$100.06 | 3,558 / -$35.58 | 2,012 / -$20.12 | 8,775 / -$87.75 | 10,064 / -$100.64 | 4,952 / -$49.52 | 8,775 / -$87.75 |
+| favorite bids 90-99c | 102 / +$4.07 | 28 / +$1.12 | 0 | 0 | 0 | 0 | 0 |
+| near-decided quotes | 0 | 26 / -$0.26 | 0 | 0 | 26 / -$0.26 | 0 | 0 |
+| total | 10,108 / -$95.99 | 3,613 / -$34.73 | 2,012 / -$20.12 | 8,775 / -$87.75 | 10,091 / -$100.91 | 4,952 / -$49.52 | 8,775 / -$87.75 |
+
+- "swp, live tape" is the shadow's swp on this hour as the daily pipeline replays it: its recorded 1c takers include the ones that hit our live orders while other makers sat at 1c beside us (channel (a) alone gives 8,649). Without those takers (swp strict) it predicts 689. Other makers joined the 1c levels our pads opened within seconds (Market reaction, below), so most of our fills look "covered" in this tape.
+- "swp joiner-free" replays the five sides our pads opened with nobody else at 1c and none of their recorded 1c takers: the regime every pre-live hour of the shadow is replayed in. It predicts 4,952 1c contracts (p10-p90 over draws 3,575-6,274), half of what filled. On the orders that actually filled it gives a fill probability of 0.54 (live tape: 0.88).
+- The hidden-sweep hazard over the ACTUAL exposure (the sum of lambda dt over the seconds our live 1c orders rested alone, joiner-free book): 5.39 sweeps expected, 10 came (P(X >= 10) = 0.049), and they took 615 contracts each on average, whole pads. The rate is about 1.9x too low, and the size draw (cleared 58-68%) too small.
+- Timing: the 14 filled 1c orders were first hit 1.4, 3.1, 6.4, 12, 14, 14.8, 17.5, 31, 85, 101, 109, 119, 183 and 314 s after they rested. opt / cons reproduce the times only where a recorded print existed (P(filled) 0.79 / 0.50 on those orders).
+- Favorite bids: one fill, 101.77 contracts on the T86.99 NO bid at 96c (+$4.07). A taker bought YES at 2c, 3c and 4c, clearing the 98 and 97 NO levels and taking 129.77 of the 578 at 96: 28 of others' and then ours. cons / swp / stress put us behind the 278 contracts that rested at 96 when we amended there, so they fill nothing; the live queue had us nearly first (makers re-place constantly, and a steady level size hides it). opt fills 28 (the external print it sees). One fill is not a measurement of the favorite fill model.
+- Near-decided quotes: no fills; opt alone gives 26.
+- Stress = swp on this hour: no recorded taker cleared or walked through a level our favorite orders rested at, and our favorite orders never rested alone at the top.
+
+### Stress fill model (`temp_shadow_sweep.py`, fill model `stress`)
+
+stress = swp plus two channels on our orders at every price of 2c or more (swp leaves those to cons):
+- (d) level-clear: a recorded taker cluster (prints on one market and side within 1 s, the full tape: replay tape plus the prints that filled our live orders) takes ALL of our lots on that side priced better than its worst print (it walked through our price), and all of our lots AT its worst price when it cleared that level (its prints there >= the level before it, ours included). cons fills such lots only after the queue ahead and only up to the prints' counts. A cluster made only of our prints is kept when someone else rested at a price it hit, dropped when we were alone. Sensitivities: `--stress-take size` (a clearing taker takes only up to its own observed size) and `--stress-hole` (a cluster that cleared its worst level also takes our lots in the gap below it, down to the next external level).
+- (e) hidden favorite takers: while our lot on a favorite side (fair >= 0.90) rests alone at the top of that side, takers arrive at the rate at which the best favorite bid gets hit in the recording, a[favorite fair][age of the top level] x mult[minutes since open] (`calibrate-fav`, the 62 recorded hours without live orders: 0.0053 / 0.0030 / 0.0020 / 0.00044 hits per second at fair 0.90-0.97 / 0.97-0.99 / 0.99-0.995 / > 0.995, two to three times higher on a top level under 30 s old, and 2-3x in the last 10 minutes), and take a recorded top-hit size. Monte Carlo on its own seed. It barely acts: FAV's joins rest alone at the top about 0.06% of their resting time.
+
+The appetite of level-clearing takers supports taking our lots whole: of 734 clusters that cleared the top favorite level with another level within 2c below it, 528 (72%) went on into it.
+
+### Favorite-level clears and the upset rate after them (`temp_shadow_audit.py clears`)
+
+Over the 63 recorded hours, a taker hits a favorite bid (side fair >= 0.90, prints at 90-99c) 14.6 / 8.4 / 5.7 / 1.5 times per strike-hour at fair 0.90-0.97 / 0.97-0.99 / 0.99-0.995 / > 0.995, and clears a level (takes its whole worst level or walks through one) in 37-48% of those hits.
+
+Upset rate of the favorite after a favorite-bid hit (cluster-weighted, strike-clustered bootstrap 90% CI), against the model's longshot probability at the time:
+
+| fair bucket | model | recorded hours, all hits | after a clear | after a hit that did not clear | 3 weeks before (REST tape), all hits | walked | single price |
+|---|---|---|---|---|---|---|---|
+| 0.90-0.97 | 5.9% | 5.0% [1.2, 10.0] | 5.0% | 5.0% | 3.2% [2.1, 4.4] | 3.5% | 3.1% |
+| 0.97-0.99 | 1.9% | 4.5% [1.3, 8.6] | 6.4% [1.4, 13.3] | 3.3% [0.8, 6.3] | 1.9% [0.9, 3.1] | 1.4% | 2.1% |
+| 0.99-0.995 | 0.7% | 6.6% [1.6, 13.2] | 9.1% | 5.2% | 1.0% [0.3, 1.9] | 0.5% | 1.2% |
+| > 0.995 | 0.12% | 3.2% [0, 7.2] | 4.3% | 2.1% | 0.25% [0.09, 0.44] | 0.30% | 0.23% |
+
+- Level-clearing sellers are not reliably more informed than other favorite-bid takers: in the recorded hours clears run somewhat higher but every CI overlaps (2-7 upset strikes per bucket); on 492 backfill hours of REST tape, takers that walked through a level were no more informed than single-price takers.
+- Favorite-bid takers as a group WERE informed relative to the model in the recorded hours: 2-25x the model's rate, against about the model's rate in the three weeks before (the far tail about 2x). Ten favorite strikes lost in the 63 recorded hours: 26OCT1511, 1606, 1612, 1615, 1620, 1621, 1622 (two strikes) and 1713 (two strikes).
+- The `net_cal` estimate marks 97-99c fills at the 530-hour table's conditional rates (about the model's), so it reads favorite joins as positive (FAV_night stress +$1,002) while the recorded hours lose. It is not evidence for favorite joins.
+
+### The variants under opt / cons / swp / stress (`temp_shadow_audit.py stress-table`)
+
+All 63 settled recorded hours, 26OCT1421 through 26OCT1713 (ET days 10/14: 3 hours, 10/15: 22, 10/16: 24, 10/17: 14), the repo's hazard and tails tables, 6 draws; net $ (cons = swp for every FAV variant: they rest nothing at 1c):
+
+| variant | opt | cons | swp | stress | stress 90% CI (hours) | P>0 | ex-best | ex-best & worst | stress per day 10/14 / 15 / 16 / 17 |
+|---|---|---|---|---|---|---|---|---|---|
+| FAV_night | -985 | -1,471 | -1,471 | -1,635 | [-4,386, +558] | 0.13 | -1,723 | -546 | +32 / +149 / -1,977 / +161 |
+| FAV_night_q100 | -439 | -515 | -515 | -523 | [-1,428, +197] | 0.13 | -553 | -168 | +12 / +51 / -642 / +56 |
+| FAV_night_p99 | -745 | -672 | -672 | -894 | [-2,520, +341] | 0.15 | -971 | -205 | +24 / +137 / -1,106 / +52 |
+| FAV_only | -2,838 | -2,450 | -2,450 | -3,573 | [-7,451, -227] | 0.03 | -3,789 | -2,320 | +32 / +165 / -2,481 / -1,289 |
+| FAV_q100 | -1,526 | -1,007 | -1,007 | -1,185 | [-2,493, -61] | 0.04 | -1,259 | -755 | +12 / +57 / -814 / -441 |
+| FAV_p99 | -1,595 | -1,097 | -1,097 | -1,634 | [-3,595, +26] | 0.05 | -1,772 | -1,005 | +24 / +143 / -1,224 / -577 |
+| G_decided_only (the live G) | +1,197 | +2,887 | -4,388 | -5,527 | [-10,153, -1,041] | 0.02 | -6,933 | -5,490 | -85 / -790 / -2,636 / -2,016 |
+| G0_nohold | +1,589 | +3,017 | -3,041 | -4,231 | [-8,124, -376] | 0.04 | -5,636 | -4,193 | -122 / -921 / -1,054 / -2,134 |
+
+Stress sensitivities (totals): FAV_night -1,635 base, -1,886 with the gap rule, -1,640 with the size take, -1,635 without (e) (it never acts there). FAV_night_q100 -523 / -603 / -523; FAV_night_p99 -894 / -1,143 / -890; FAV_only -3,573 / -4,014 / -3,554.
+
+- FAV_night is negative under every fill model and every stress sensitivity, and still negative without its best and worst hour (-$546 stress, -$627 cons). The +$198 of the 10/16 fix pass covered 21 night hours through 26OCT1617; the two night hours after it, 26OCT1621 and 26OCT1622 (21:00 and 22:00 ET on 10/16), lost $918 and $898 (cons; $967 and $1,177 stress). The daily report for 10/16 already showed FAV_night at -$1,710 realized.
+- Per night hour: median +$7 (cons) / +$9 (stress), mean -$45 / -$50, sd $220 / $262. Without those two hours +$11 / +$16 an hour. Every FAV variant makes a few dollars in most hours and loses $300-1,500 in the hours when a strike the model held at 98-99.7% fails: 4 of the 63 hours (26OCT1612, 1621, 1622, 1713), 2 of the 33 night hours.
+- In both night losses the model and the market disagreed. 26OCT1621 settled 82.40: the model held T82.99 YES at 98.4-99.7% while the book mid was 78.5-89.5c; FAV bought 1,121 (cons) to 1,200 (stress) contracts at 76-89c, the market's reference, and the strike failed. 26OCT1622 settled 78.44: T78.99 YES at 98-99.7% (model) against an 89.5-94.5c mid, 856-1,200 contracts at 88-93c. A favorite join priced at the market's reference buys the market's view; when the model is the overconfident one it keeps buying.
+- Smaller size (q_fav 100) scales the loss down about in proportion (FAV_night_q100 -$515 cons / -$523 stress); a stricter threshold (fav_min_p 0.99) does not help (-$672 / -$894): the failing strikes were at 98-99.7%.
+- Stress costs FAV_night only $164 more than cons: most stress fills land in normal hours, where the favorite wins and each fill earns 1-3c (stress fills 408 contracts an hour against cons' 258), and the upset hours were already filled heavily under cons.
+- G (with and without the pad hold) loses under swp and stress; its cons profit is the old model's blind spot.
+
+### Market reaction to our live orders (`temp_shadow_audit.py reaction`)
+
+What other makers did after our orders took effect on 26OCT1610 (others' size only: our orders are subtracted), against the same measures after other makers' comparable orders in the 35 hours before (the baseline):
+
+| | within 2 s | 5 s | 12 s | 30 s |
+|---|---|---|---|---|
+| our 1c pads (8 that opened an empty 1c level): others joined (>= 10) | 25% | 50% | 62% | 88% (mean +382) |
+| baseline (181 fresh pads by others on empty longshot levels) | 22% | 32% | 40% | 53% (mean +483) |
+| a new 99c bid opposite our pad (a locker) | 0% | 0% | 0% | 12% (1 of 8) |
+| baseline | 0% | 1% | 2% | 4% |
+| our favorite joins (160 placements and price moves >= 50c): a new external bid above our price | 36% | 42% | 48% | 51% |
+| baseline (3,944 joins of >= 100 at a favorite side's reference) | 11% | 16% | 22% | 30% |
+| our favorite joins: others joined our price (>= 10) | 28% | 32% | 38% | 45% |
+| baseline | 11% | 20% | 28% | 36% |
+| our favorite joins: the size that was at our price fell by half | 16% | 23% | 30% | 40% |
+
+What the shadow cannot see, and the bias:
+- Joiners at our pads: replayed pads rest alone. The shadow therefore credits filler variants with the whole side's 1c reward (overstated) and leaves their sweeps to the hidden-sweep hazard, which is about 1.9x too low (above). Every filler variant is worse than its swp number.
+- Others stepping ahead of our favorite joins, three times the baseline rate within 2 s: a better bid moves the reward reference up (our order at half weight or less until we re-price, debounced 2 s, at the back of the queue) and takes the calm flow first. The shadow keeps FAV at the reference with full weight and its queue place, so it overstates FAV's reward and its normal-hour fills; the clearing sellers of an upset take both orders, so the losses stay. FAV live would do worse than its shadow.
+- Others leaving our price after we joined: undecided. The size that was at our price halved within 2 s after 16% of our joins (40% within 30 s), but the baseline version of that measure is confounded by the baseline joiners' own re-placing, so there is no clean comparison. If the makers ahead of us leave or re-place, we move up the queue, which the cons queue rule cannot see: the one live favorite fill (nearly first in a 578-contract level that cons had us 278 deep in) points that way. More fills than the shadow books, in both the winning and the losing hours.
+- 99c lockers: one in eight pads, rare; swp's crossing channel only sees recorded 99c bids.
+
+### What live evidence would make a shadow result trustworthy
+
+- 1c fillers: none more is needed. The live hour already contradicts opt / cons, and the shadow's swp, in the regime it replays every other hour in, predicts half of the fills that happened. Every filler variant loses under swp and stress.
+- Favorite joins, the fill model: FAV_night fills 975 (opt) / 258 (cons) / 408 (stress) contracts a night hour, with a per-hour coefficient of variation of 1.6-1.8. Auditing every live hour (`temp_shadow_audit.py audit`: the bot's actual orders against each model), about 10 live hours separate opt from cons (3.8x apart) and 50-60 hours separate cons from stress (1.6x apart), at two standard errors, at q_fav 300. At q_fav 100 cons and stress are only 1.28x apart (about 200 hours). The one live favorite fill (102 contracts at 96c, where cons predicted 0) says the queue rule may be too pessimistic; one fill does not decide it.
+- Favorite joins, the P&L: the hourly sd is $220-260 against a median of +$7-9; the mean is set by how often the model is confidently wrong. At q_fav 300 an upset hour costs $900-1,200 against +$11-16 in a normal night hour, so break-even needs at most about one upset hour in 70-100. Live P&L cannot test that in reasonable time (ruling out the observed -$45 an hour takes about 100 hours; establishing +$15 an hour about 1,000). The shadow books those losses without trading (cons already does), so the frequency can be counted there: no FAV upset hour in the next 200 recorded hours would bound it under 1.5% (95%), about break-even; five or more in the next 100 hours would confirm the loss at 95% (the recorded rate, 4 in 63 hours, predicts about 6).
+- So before trusting a favorite-join shadow result: at least about 200 recorded hours with the stress column positive and not flipped by its sensitivities, with the upset-hour frequency counted; then a small audited live run (q_fav 100, its hours only, a loss cap) of at least 50 hours, accepted only if the actual favorite fills fall inside the opt-to-stress range of the audit. A rule that keeps the favorite joins out of hours where the model and the market disagree (both losing night hours) would have to earn that record out of sample: it would be fitted on these four hours.
+
+### Commands
+
+```
+python temp_shadow_audit.py --out <dir> audit --event KXTEMPMIAH-26OCT1610 [--draws 30]   # audit_<EVENT>.txt / .json
+python temp_shadow_audit.py --out <dir> clears [--prints <prints.json>]                   # clears.txt / .json
+python temp_shadow_audit.py --out <dir> reaction --event KXTEMPMIAH-26OCT1610             # reaction_<EVENT>.txt / .json
+python temp_shadow_audit.py --out <dir> stress-table [--day ...] [--variants ...] [--sens hole,size,nofav]
+python temp_shadow_sweep.py --out <dir> run --day ... --fill-models opt,cons,swp,stress [--stress-take size] [--stress-hole] [--no-favhaz]
+python temp_shadow_sweep.py --out <dir> calibrate-fav                                   # favhazard.json (repo copy: temp_shadow_sweep_favhazard.json)
+```
+
+`--out` defaults to `TEMP_SHADOW_AUDIT_OUT`, else `<TEMP_SHADOW_DATA>\audit`. The 2026-10-17 runs used a copy of the recording and the executor's 10/16 logs in the session scratchpad (`TEMP_SHADOW_DATA`, `TEMP_MM_LIVE_DIR`); KL-data was only read.
