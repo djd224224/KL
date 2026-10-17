@@ -122,7 +122,7 @@ def write_day(day, rng, losing_hours=(), opt_mult=None, d_tau=None, hours=range(
 
 
 def clear_data():
-    for sub in ("sim", "raw", "reports", "settled"):
+    for sub in ("sim", "raw", "reports", "settled", "prereg"):
         shutil.rmtree(os.path.join(DATA, sub), ignore_errors=True)
     for f in (C.STATUS_FILE,):
         if os.path.exists(f):
@@ -346,7 +346,7 @@ class TestRuleEngine(unittest.TestCase):
         R.render_html(ctx)     # renders without the letter variants
 
 
-FAV_DEFAULTS = dict(DEFAULT_POLICY, live=True, quote_hours_et=None)
+FAV_DEFAULTS = dict(DEFAULT_POLICY, live=True, quote_hours_et=None, q_fav=300)
 FAV_VARIANTS = dict(VARIANTS,
                     FAV_night={"live": False, "decided": True, "q_pad": 0,
                                "quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]},
@@ -354,6 +354,23 @@ FAV_VARIANTS = dict(VARIANTS,
                                      "quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7],
                                      "fav_market_min_p": 0.95})
 FAV_POLICY = R.Policy(FAV_DEFAULTS, FAV_VARIANTS)
+
+
+def pin_ident(names=None):
+    """The registered rule and model a sim file of the tested variants
+    carries (temp_shadow_sim SIM_VERSION 8 writes these fields): the
+    pre-registered tests count only files that match PREREG_TESTS /
+    PREREG_PIN_MODEL."""
+    pm = R.PREREG_PIN_MODEL
+    tv = {t["variant"]: t for t in R.PREREG_TESTS}
+    names = list(tv) if names is None else list(names)
+    return json.loads(json.dumps({
+        "sim_version": pm["sim_version"],
+        "policies": {n: tv[n]["overrides"] for n in names if n in tv},
+        "policy_full": {n: tv[n]["policy"] for n in names if n in tv},
+        "swp": dict(pm["swp"]),
+        "stress": dict(pm["stress"], scope="nolive", variants=names),
+        "fair_model": {"id": pm["fair_model_id"], "source": "model_params.json"}}))
 
 
 def srec(net, cal=None, fav_fills=None, draws=6):
@@ -366,12 +383,15 @@ def srec(net, cal=None, fav_fills=None, draws=6):
 
 
 def write_fav_days(day_nets, base=None, hours=range(24), agree=None, fav_hits=None,
-                   missing=()):
+                   missing=(), ident=None, extra=None):
     """Sim files whose events hold FAV_night|stress (and FAV_night_agree|stress)
     with per-event nets: day_nets {day: net per event or [net per hour]};
     agree likewise for FAV_night_agree (default = FAV_night's); base adds
     B_pull|cons / |swp so the window has other variants; missing = events
-    written without any stress result."""
+    written without any stress result. Every file carries the registered
+    rule and model (pin_ident); ident(day, hour) -> fields merged over it
+    (an edited rule, an older SIM_VERSION ...); extra {variant: net or
+    {day: net}} adds more variants' stress / swp results."""
     for day, nets in day_nets.items():
         os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
         for i, h in enumerate(hours):
@@ -386,7 +406,14 @@ def write_fav_days(day_nets, base=None, hours=range(24), agree=None, fav_hits=No
                 variants["FAV_night_agree|stress"] = srec(y)
                 variants["FAV_night|swp"] = srec(x)
                 variants["FAV_night_agree|swp"] = srec(y)
+            for name, xn in (extra or {}).items():
+                z = xn.get(day, 0.0) if isinstance(xn, dict) else xn
+                variants[f"{name}|stress"] = srec(z)
+                variants[f"{name}|swp"] = srec(z)
             rec = erec(ev, variants)
+            rec.update(pin_ident())
+            if ident is not None:
+                rec.update(ident(day, h))
             if fav_hits is not None:
                 rec["fav_hits"] = fav_hits
             C.write_json_atomic(os.path.join(DATA, "sim", day, f"{ev}.json"), rec)
@@ -426,14 +453,22 @@ class TestWeekSummary(unittest.TestCase):
         self.assertNotIn("GO_MEAN_USD", dir(R))                 # the old bars are gone
         self.assertTrue(any(r.startswith("Fill model (FAV_night") for r in w["risks"]))
         page = R.render_html(ctx)
+        # rule 4: the pilot runs the variant at 1/3 size
+        self.assertEqual((w["config"]["q_fav"], w["pilot_config"]["q_fav"]), (300, 100))
         for needle in ("Week summary", "Day 7 of 7", "pilot eligible: FAV_night",
-                       "Pilot config (FAV_night, rule 4)", "the old GO / NO-GO thresholds"):
+                       "Pilot config (FAV_night, rule 4: 1/3 size)",
+                       "100 (1/3 of the variant&#x27;s 300)", "q_fav 300 -&gt; 100",
+                       "the old GO / NO-GO thresholds"):
             self.assertIn(needle, page)
         self.assertNotIn("Recommended starting config", page)
         subj = R.subject_line(ctx)
         self.assertTrue(subj.endswith("-- week: pilot eligible: FAV_night"), subj)
-        self.assertIn("Test A PASS (stress +$240), Test B in progress 4/5 (stress +$192)", subj)
-        self.assertIn("Week verdict: pilot eligible: FAV_night", R.render_text(ctx))
+        self.assertIn("Test A PASS (stress +$240; after registration PASS +$210), Test B in "
+                      "progress 4/5 (stress +$192)", subj)
+        txt = R.render_text(ctx)
+        self.assertIn("Week verdict: pilot eligible: FAV_night", txt)
+        self.assertIn("Pilot config (FAV_night, rule 4, 1/3 size): q_fav 100 (the variant's 300)",
+                      txt)
         ctx6 = self._ctx("2026-10-20")
         self.assertIsNone(ctx6["week"])
         self.assertNotIn("Week summary", R.render_html(ctx6))
@@ -478,30 +513,32 @@ class TestRenderAndHealth(unittest.TestCase):
             write_day(day, rng)
         write_day("2026-10-14", rng, hours=range(20, 24))       # partial day 0
         ctx = R.build_context("2026-10-17", policy=POLICY, with_health=True, now=NOW)
-        # cons / opt only (older sim output): the ranking falls back to cons
-        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("cons", "cons"))
-        self.assertEqual(ctx["best"], "D_size")
-        self.assertTrue(ctx["headline"]["pass"])
+        # cons / opt only (older sim output): no stress results, and no
+        # fallback to another fill model (review of 338b4a5)
+        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("stress", "cons"))
+        self.assertIsNone(ctx["best"])
+        self.assertTrue(ctx["headline"]["no_stress"])
         self.assertEqual(len(ctx["events"]), 24)
         self.assertEqual(ctx["day0_events"], 4)
         page = R.render_html(ctx)
-        for needle in ("Day 3 of 7", "Headline variant: <b>D_size</b>",
-                       "No stress results in the window", "the ranking uses cons",
-                       "Ranked on cons net", "Pre-registered tests",
-                       "By ET hour of the event", "By strike class", "By minutes to close",
-                       "By side", "Worst 5 events", "Market structure", "Model",
+        for needle in ("Day 3 of 7", "No variant passes (no stress results)",
+                       "No stress results to rank in the window yet.",
+                       "72 of 72 event(s) in the window have no stress results",
+                       "Pre-registered tests", "Market structure", "Model",
                        "Data health", "Cumulative to date", "d1", "d3", "Day 0 (partial, 4 events)"):
             self.assertIn(needle, page)
         self.assertNotIn("Best cons variant", page)          # no single-day ranking
+        self.assertNotIn("Headline variant", page)
         self.assertNotIn("Week summary", page)
         win = ctx["win"]
         self.assertEqual(win.days, ["2026-10-15", "2026-10-16", "2026-10-17"])
         self.assertEqual(len(win.days_with("D_size|cons")), 3)
         subj = R.subject_line(ctx)
-        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): top D_size robust cons "
-                                        "+$"), subj)
-        self.assertIn("(P>0 1.00)", subj)
-        self.assertIn("Test A in progress 1/5 (stress $0), Test B starts 10/18", subj)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): no variant passes (no "
+                                        "stress results); Test A in progress 1/5 (stress $0; "
+                                        "after registration $0; 24 hours missing), Test B starts "
+                                        "10/18"), subj)
+        self.assertIn("[72 events without stress]", subj)
         # agg sanity: sum over events equals the day's figure
         a = ctx["agg"]["D_size|cons"]
         evs = ctx["events"]
@@ -669,10 +706,11 @@ class TestMain(unittest.TestCase):
         cmd = run.call_args[0][0]
         self.assertEqual(cmd[0], sys.executable)
         self.assertTrue(cmd[1].endswith("send_html_email.py"))
-        self.assertTrue(cmd[2].startswith("Temp shadow day 3 (2026-10-17): top D_size robust"),
-                        cmd[2])
+        # cons / opt only: no stress results, so no variant is named
+        self.assertTrue(cmd[2].startswith("Temp shadow day 3 (2026-10-17): no variant passes (no "
+                                          "stress results)"), cmd[2])
         self.assertEqual(cmd[3], self.out)
-        self.assertIn("D_size", cmd[4])
+        self.assertIn("Headline: no variant passes (no stress results).", cmd[4])
 
     def test_send_failure_exit_2(self):
         bad = subprocess.CompletedProcess([], 1, "", "smtp down")
@@ -1063,9 +1101,10 @@ class TestPartialLastDay(unittest.TestCase):
         w9 = ctx["week"]
         # the week verdict is the pre-registered tests' (their windows end
         # 10/21 and 10/22, before the partial last day); B_pull alone has no
-        # results for their variants, so they wait
-        self.assertEqual(w9["verdict"], "in progress")
-        self.assertEqual([t["end"] for t in ctx["tests"]], ["2026-10-21", "2026-10-22"])
+        # results for their variants: every window hour lacks its stress
+        # result, so both are INCOMPLETE (never PASS)
+        self.assertEqual(w9["verdict"], "undecided (Test A INCOMPLETE; Test B INCOMPLETE)")
+        self.assertEqual([t["last_day"] for t in ctx["tests"]], ["2026-10-21", "2026-10-22"])
         win = ctx["win"]
         self.assertEqual(win.partial, {"2026-10-23"})
         self.assertAlmostEqual(win.per_day("B_pull|cons"), 520.0, places=6)   # weighted 8/24
@@ -1332,6 +1371,29 @@ class TestRealModules(unittest.TestCase):
         import temp_shadow_sim as sim
         self.assertEqual(R.current_sim_version(), str(sim.SIM_VERSION))
 
+    @unittest.skipUnless(_importable("temp_shadow_sim"), "temp_shadow_sim not importable")
+    def test_preregistered_pins_match_the_code(self):
+        # the registered rule and model are what the current code runs: the
+        # tested variants' overrides and full policies, SIM_VERSION, and the
+        # swp / stress identity of the repo tables (this sandbox has no
+        # model/ overrides). The fair model's id needs the production
+        # model_params.json (checked by hand: 4f5fd78c360d8717, 10/14 22:01).
+        import json as _json
+        import temp_shadow_sim as sim
+        pm = R.PREREG_PIN_MODEL
+        self.assertEqual(str(sim.SIM_VERSION), pm["sim_version"])
+        full = _json.loads(_json.dumps(sim._resolve_variants([t["variant"]
+                                                              for t in R.PREREG_TESTS])))
+        for t in R.PREREG_TESTS:
+            self.assertEqual(_json.loads(_json.dumps(sim.VARIANTS[t["variant"]])),
+                             _json.loads(_json.dumps(t["overrides"])), t["id"])
+            self.assertEqual(full[t["variant"]], _json.loads(_json.dumps(t["policy"])), t["id"])
+        sim._SWP_CACHE.clear()
+        swp = sim.swp_config()
+        st = sim.stress_config(swp)
+        self.assertEqual({k: swp["ident"].get(k) for k in pm["swp"]}, pm["swp"])
+        self.assertEqual({k: st["ident"].get(k) for k in pm["stress"]}, pm["stress"])
+
     @unittest.skipUnless(_importable("temp_shadow_model"), "temp_shadow_model not importable")
     def test_real_replica_matches_lattice(self):
         stations = [("KMIA1M", 82.4), ("KOPF1M", 82.4), ("KFLL1M", 80.6), ("KFXE1M", 80.6),
@@ -1430,7 +1492,9 @@ class TestSwpHeadline(unittest.TestCase):
                        "Pairs use the swp fill model", "Ranked on stress net",
                        "robust stress total", "noise-dominated",
                        "Variant G_decidedonly (stress fills, the decision model; means over 8 "
-                       "Monte Carlo draws; the headline variant)"):
+                       "Monte Carlo draws; the headline variant)",
+                       "By ET hour of the event", "By strike class", "By minutes to close",
+                       "By side", "Worst 5 events"):
             self.assertIn(needle, page)
         # the variants table: one group of columns per fill model, opt / cons / swp / stress
         self.assertLess(page.index(">opt</th>"), page.index(">cons</th>"))
@@ -1478,7 +1542,7 @@ class TestSwpHeadline(unittest.TestCase):
     def test_hour_rule_on_a_decided_only_best_names_quote_hours(self):
         rng = random.Random(31)
         for day in ("2026-10-15", "2026-10-16", "2026-10-17"):
-            write_day_swp(day, rng, losing_hours=(2, 3))
+            write_day_swp(day, rng, losing_hours=(2, 3), stress=True)
         pol_ = R.Policy(dict(DEFAULT_POLICY, live=True, quote_hours_et=None),
                         dict(VARIANTS, G_decidedonly={"decided": True, "q_live": 0,
                                                       "live": False}))
@@ -1502,27 +1566,34 @@ class TestSwpHeadline(unittest.TestCase):
                           hours=range(6))
         ctx = R.build_context("2026-10-21", policy=POLICY_LIVE, with_health=False, now=NOW)
         w = ctx["week"]
-        self.assertEqual(w["verdict"], "in progress")
+        # Test A's window is over with every hour missing (00-05 simmed
+        # without its stress result, the rest never recorded): INCOMPLETE;
+        # Test B still runs
+        self.assertEqual(w["verdict"], "in progress (Test A INCOMPLETE)")
         self.assertIsNone(w["best"])
-        self.assertEqual(ctx["tests"][0]["status"], "in progress")    # 10/17-10/21 events lack it
-        self.assertEqual(len(ctx["tests"][0]["missing"]), 30)
-        self.assertIn("event(s) without stress results (waiting for the re-sim)",
-                      ctx["tests"][0]["text"])
-        self.assertIn("-- week: in progress", R.subject_line(ctx))
+        a = ctx["tests"][0]
+        self.assertEqual((a["status"], len(a["missing"])), ("INCOMPLETE", 120))
+        self.assertEqual(sum(1 for _e, why in a["missing"]
+                             if why.startswith("its sim file has no stress result")), 30)
+        self.assertEqual(ctx["tests"][1]["status"], "in progress")
+        self.assertIn("-- week: in progress (Test A INCOMPLETE)", R.subject_line(ctx))
 
-    def test_older_output_without_swp_falls_back_to_cons(self):
+    def test_older_output_without_stress_never_falls_back(self):
+        # the rules fall back to cons on output without swp; the ranking
+        # never leaves stress (review of 338b4a5)
         rng = random.Random(27)
         write_day("2026-10-15", rng)
         ctx = R.build_context("2026-10-15", policy=POLICY, with_health=False, now=NOW)
-        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("cons", "cons"))
-        self.assertEqual(ctx["best"], ctx["rank"][0]["name"])
+        self.assertEqual((ctx["fill"], ctx["rules_fill"], ctx["rank"]), ("stress", "cons", []))
+        self.assertIsNone(ctx["best"])
         self.assertIn("No swp results in the window", " ".join(ctx["notes"]))
         page = R.render_html(ctx)
-        self.assertIn("No stress results in the window (sim output from before SIM_VERSION 7): "
-                      "the ranking uses cons", page)
+        self.assertIn("No variant passes (no stress results)", page)
         self.assertNotIn(">swp (sweep-aware)</th>", page)
         self.assertNotIn(">stress (decision model)</th>", page)
-        self.assertIn("robust cons", R.subject_line(ctx))
+        subj = R.subject_line(ctx)
+        self.assertIn("no variant passes (no stress results)", subj)
+        self.assertNotIn("robust cons", subj)
 
 
 class TestSwpFixPass(unittest.TestCase):
@@ -1545,7 +1616,10 @@ class TestSwpFixPass(unittest.TestCase):
             pass
 
     def _days(self, seed=21, days=("2026-10-15", "2026-10-16", "2026-10-17"), **kw):
+        # with stress: the ranking is on stress only (no swp fallback since
+        # the review of 338b4a5)
         rng = random.Random(seed)
+        kw.setdefault("stress", True)
         for day in days:
             write_day_swp(day, rng, **kw)
 
@@ -1560,7 +1634,7 @@ class TestSwpFixPass(unittest.TestCase):
         page = R.render_html(ctx)
         top = ctx["rank"][0]
         self.assertEqual(top["name"], "G_decidedonly")
-        self.assertAlmostEqual(top["cal"], ctx["win"].total("G_decidedonly|swp", "net_cal"))
+        self.assertAlmostEqual(top["cal"], ctx["win"].total("G_decidedonly|stress", "net_cal"))
         self.assertIn(f"expected (calibrated tails) {R.m_html(top['cal'])}", page)
         self.assertTrue(all(r["cal"] is None for r in ctx["rank"][1:]))   # live-quoting: none
         # the variants table and the cumulative table: G's figure, (circular) for the rest
@@ -1605,7 +1679,7 @@ class TestSwpFixPass(unittest.TestCase):
             doc.update(extra)
             C.write_json_atomic(p, doc)
         ctx = R.build_context("2026-10-17", policy=POLICY_LIVE, with_health=False, now=NOW)
-        self.assertEqual(ctx["fill"], "swp")
+        self.assertEqual((ctx["fill"], ctx["rules_fill"]), ("stress", "swp"))
         sm = ctx["swp_missing"]
         self.assertEqual((sm["total"], sm["events"]), (2, 18))
         self.assertEqual(sm["by_day"], {"2026-10-17": 2})
@@ -1757,19 +1831,24 @@ class TestSwpFixPass(unittest.TestCase):
 
 def _ev_rec(day, h, variants, **extra):
     rec = erec(event_ticker(day, h), variants)
+    rec.update(pin_ident())
     rec.update(extra)
     return rec
 
 
-def _win_from(nets_by_variant, day="2026-10-17", fill="stress"):
-    """A one-day Window whose event h holds name|fill = nets[h]."""
+def _win_from(nets_by_variant, days=("2026-10-16", "2026-10-17"), fill="stress"):
+    """A two-day Window (the headline needs HEADLINE_MIN_DAYS judged days)
+    whose i-th event-hour in settle order holds name|fill = nets[i]: the
+    first half on days[0] from 00:00, the rest on days[1] from 00:00."""
     n = max(len(v) for v in nets_by_variant.values())
-    evs = []
-    for h in range(n):
-        variants = {f"{name}|{fill}": srec(nets[h]) for name, nets in nets_by_variant.items()
-                    if h < len(nets)}
-        evs.append(_ev_rec(day, h, variants))
-    return R.Window({day: evs})
+    half = (n + 1) // 2
+    de = {d: [] for d in days}
+    for i in range(n):
+        d, h = (days[0], i) if i < half else (days[1], i - half)
+        variants = {f"{name}|{fill}": srec(nets[i]) for name, nets in nets_by_variant.items()
+                    if i < len(nets)}
+        de[d].append(_ev_rec(d, h, variants))
+    return R.Window(de)
 
 
 class TestRobustRanking(unittest.TestCase):
@@ -1834,37 +1913,146 @@ class TestRobustRanking(unittest.TestCase):
         self.assertEqual(hl["pick"]["name"], "Steady")
         self.assertIn("top robust Wild does not pass; Steady does", R.headline_phrase(hl, True))
 
-    def test_in_sample_variant_is_never_the_headline(self):
-        # FAV_night_agree's rule was chosen from 10/16's hours (pre-registered:
-        # "judged ONLY on later data"): on a window holding days before 10/18
-        # it is listed, flagged, and never named -- even when it would pass
+    def test_headline_judges_each_variant_after_it_was_chosen(self):
+        # review of 338b4a5: no variant is ranked on the hours it was chosen
+        # from. FAV_night wins its in-sample 10/15-10/16 and loses on 10/17
+        # (Test A's start); FAV_night_agree (chosen from 10/16, judged from
+        # 10/18) has no judged hour yet; G_decided_only (its 180 s hold chosen
+        # 10/16) from 10/17; G0_nohold from the window start
         clear_data()
-        write_fav_days({d: -1.0 for d in days_from("2026-10-15", 3)},
-                       agree={d: 2.0 for d in days_from("2026-10-15", 3)})
+        write_fav_days({"2026-10-15": 5.0, "2026-10-16": 5.0, "2026-10-17": -1.0},
+                       agree={d: 2.0 for d in days_from("2026-10-15", 3)},
+                       extra={"G_decided_only": {"2026-10-15": 9.0, "2026-10-16": 9.0,
+                                                 "2026-10-17": 1.0},
+                              "G0_nohold": 0.2})
         ctx = R.build_context("2026-10-17", policy=FAV_POLICY, with_health=False, now=NOW)
         rows = {r["name"]: r for r in ctx["rank"]}
+        fn = rows["FAV_night"]
+        self.assertEqual((fn["hours"], fn["total"], fn["in_hours"], fn["in_total"]),
+                         (24, -24.0, 48, 240.0))
+        self.assertFalse(fn["passes"])
+        g = rows["G_decided_only"]
+        self.assertEqual((g["hours"], g["total"], g["in_hours"], g["in_total"]),
+                         (24, 24.0, 48, 432.0))
+        g0 = rows["G0_nohold"]
+        self.assertEqual((g0["hours"], g0["in_hours"], g0["judged_from"]), (72, 0, None))
         ag = rows["FAV_night_agree"]
-        self.assertEqual(ag["rank"], 1)
-        self.assertGreater(ag["robust"], 0)
-        self.assertEqual(ag["p_pos"], 1.0)
-        self.assertTrue(ag["in_sample"])
-        self.assertEqual(ag["judged_from"], "2026-10-18")
-        self.assertFalse(ag["passes"])
-        self.assertFalse(rows["FAV_night"]["in_sample"])
+        self.assertEqual((ag["judged"], ag["rank"], ag["in_hours"], ag["in_total"]),
+                         (False, None, 72, 144.0))
+        self.assertEqual(ctx["rank"][-1]["name"], "FAV_night_agree")   # after the ranked ones
+        self.assertEqual([r["name"] for r in ctx["rank"] if r.get("judged")],
+                         ["G_decided_only", "G0_nohold", "FAV_night"])
         hl = ctx["headline"]
-        self.assertEqual(hl["top"]["name"], "FAV_night")
-        self.assertIsNone(hl["pick"])
-        self.assertEqual([r["name"] for r in hl["in_sample"]], ["FAV_night_agree"])
-        self.assertEqual(ctx["best"], "FAV_night")
-        subj = R.subject_line(ctx)
-        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): no variant passes; "
-                                        "Test A in progress 1/5 (stress -$24), Test B starts "
-                                        "10/18"), subj)
+        self.assertEqual(hl["top"]["name"], "G_decided_only")
+        self.assertEqual(sorted(r["name"] for r in hl["in_sample"]),
+                         ["FAV_night", "FAV_night_agree", "G_decided_only"])
+        self.assertNotIn("FAV_night_agree", R.subject_line(ctx))
+        A, B = C.parse_iso("2026-10-17T04:00:00Z"), C.parse_iso("2026-10-18T04:00:00Z")
+        for name, want in (("FAV_night", A), ("FAV_only", A), ("FAV_night_q100", A),
+                           ("FAV_night_agree", B), ("G_decided_only", A), ("G0_nohold", None),
+                           ("I_pads_only", None), ("J_decided_fav100", None)):
+            self.assertEqual(R.judged_from_ts(name), want, name)
         page = R.render_html(ctx)
-        self.assertIn("(in-sample: judged only from 10/18, Test B)", page)
-        self.assertIn("in-sample, not evidence", page)
-        self.assertIn("never in this headline", R.render_text(ctx))
-        self.assertEqual(R.judged_from(), {"FAV_night_agree": "2026-10-18"})
+        for needle in ("judged from", "10/17 00:00 ET", "10/18 00:00 ET", "window start",
+                       "(no judged hour yet)", "in-sample hours (not ranked)", "48 hours, ",
+                       "In-sample hours, before each variant&#x27;s first judged hour",
+                       "FAV_night_agree: 72 hours before 10/18 00:00 ET, stress +$144",
+                       "moving-block bootstrap of 3 consecutive event-hours"):
+            self.assertIn(needle, page)
+        txt = R.render_text(ctx)
+        self.assertIn("not judged yet: FAV_night_agree (from 10/18 00:00 ET)", txt)
+        self.assertIn("in-sample hours, before each variant's first judged hour", txt)
+
+    def test_one_judged_day_is_never_named(self):
+        # no single-day ranking: a variant whose judged hours sit on one ET
+        # day clears robust > 0 and P >= 0.8 here, but is not named
+        self.assertEqual(R.HEADLINE_MIN_DAYS, 2)
+        evs = [_ev_rec("2026-10-17", h, {"OneNight|stress": srec(5.0 if h < 8 else 0.0)})
+               for h in range(19)]
+        rows = R.rank_variants(R.Window({"2026-10-17": evs}), FAV_POLICY)
+        r = rows[0]
+        self.assertEqual((r["days"], r["thin"], r["passes"]), (1, True, False))
+        self.assertGreater(r["robust"], 0)
+        self.assertGreaterEqual(r["p_pos"], R.HEADLINE_P_MIN)
+        hl = R.headline_pick(rows)
+        self.assertEqual((hl["top"]["name"], hl["pick"], hl["pass"]), ("OneNight", None, False))
+        self.assertEqual(R.headline_phrase(hl, subject=True), "no variant passes")
+        self.assertIn("1 judged day: the headline needs 2", R.headline_phrase(hl))
+        # a second judged day makes it eligible
+        two = R.Window({"2026-10-16": [_ev_rec("2026-10-16", 23,
+                                               {"OneNight|stress": srec(5.0)})],
+                        "2026-10-17": evs})
+        r = R.rank_variants(two, FAV_POLICY)[0]
+        self.assertEqual((r["days"], r["thin"], r["passes"]), (2, False, True))
+
+    def test_block_bootstrap_for_clustered_losses(self):
+        # one weather move fails three consecutive hours: blocks of 3 keep
+        # them together, so the spread is wider than the hour bootstrap's
+        nets = [6.0] * 30 + [-100.0] * 3 + [6.0] * 27
+        lo1, hi1, p1 = R.boot_total(nets, block=1)
+        lo3, hi3, p3 = R.boot_total(nets)
+        self.assertEqual(R.BOOT_BLOCK, 3)
+        self.assertGreater(hi3 - lo3, hi1 - lo1)
+        self.assertNotEqual(p1, p3)
+        self.assertEqual(R.boot_total(nets), (lo3, hi3, p3))          # fixed seed
+        self.assertEqual(R.boot_total([5.0] * 7), (35.0, 35.0, 1.0))  # a partial last block
+        self.assertEqual(R.boot_total([2.0, -1.0]), (1.0, 1.0, 1.0))  # fewer hours than a block
+
+    def test_noise_flag_in_the_subject(self):
+        # the named variant is noise-dominated: the subject says so
+        clear_data()
+        for day in days_from("2026-10-15", 3):
+            os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+            for h in range(24):
+                x = 1.0
+                if (day, h) == ("2026-10-16", 21):
+                    x = 120.0
+                if (day, h) == ("2026-10-16", 22):
+                    x = -60.0
+                C.write_json_atomic(os.path.join(DATA, "sim", day, f"{event_ticker(day, h)}.json"),
+                                    _ev_rec(day, h, {"G0_nohold|stress": srec(x),
+                                                     "G0_nohold|swp": srec(x)}))
+        ctx = R.build_context("2026-10-17", policy=FAV_POLICY, with_health=False, now=NOW)
+        r = ctx["rank"][0]
+        self.assertEqual((r["name"], r["total"], r["robust"]), ("G0_nohold", 130.0, 70.0))
+        self.assertTrue(r["noise"] and r["passes"])
+        subj = R.subject_line(ctx)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): top G0_nohold robust "
+                                        f"stress +$70 (P>0 {r['p_pos']:.2f}) [noise-dominated]"),
+                        subj)
+        self.assertIn("noise-dominated (|best hour| + |worst hour| &gt; |total|)",
+                      R.render_html(ctx))
+
+    def test_no_stress_results_never_fall_back(self):
+        # review of 338b4a5: stress failed on every event (swp kept): the
+        # headline never falls back to swp
+        clear_data()
+        for day in days_from("2026-10-15", 3):
+            os.makedirs(os.path.join(DATA, "sim", day), exist_ok=True)
+            for h in range(24):
+                x = 12.0 if h != 3 else 5.0
+                C.write_json_atomic(
+                    os.path.join(DATA, "sim", day, f"{event_ticker(day, h)}.json"),
+                    _ev_rec(day, h, {"I_pads_only|swp": srec(x), "I_pads_only|cons": vrec(x),
+                                     "FAV_night|swp": srec(-1.0)},
+                            stress_error="stress run failed: KeyError: 'x'"))
+        ctx = R.build_context("2026-10-17", policy=FAV_POLICY, with_health=False, now=NOW)
+        self.assertEqual((ctx["fill"], ctx["rules_fill"], ctx["rank"]), ("stress", "swp", []))
+        self.assertIsNone(ctx["best"])
+        self.assertEqual(ctx["stress_missing"]["total"], 72)
+        self.assertEqual(R.headline_phrase(ctx["headline"]),
+                         "no variant passes (no stress results)")
+        subj = R.subject_line(ctx)
+        self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): no variant passes (no "
+                                        "stress results); Test A in progress 1/5"), subj)
+        self.assertIn("[72 events without stress]", subj)
+        a = ctx["tests"][0]
+        self.assertTrue(a["missing"][0][1].startswith("stress failed: stress run failed"))
+        page = R.render_html(ctx)
+        self.assertIn("No variant passes (no stress results)", page)
+        self.assertIn("No stress results to rank in the window yet.", page)
+        self.assertNotIn("Headline variant", page)
+        self.assertIn("Headline: no variant passes (no stress results).", R.render_text(ctx))
 
     def test_report_day_net_never_ranks_the_headline(self):
         # the 10/17 case: on the report day "Fluke" wins big (an upset hour);
@@ -1905,27 +2093,48 @@ class TestPreregisteredTests(unittest.TestCase):
     """TEMP_SHADOW.md "Pre-registered tests" (eff9cd3): Test A (FAV_night, ET
     10/17-10/21: total > 0, >= 4 of 5 days > 0, calibrated tails > 0) and
     Test B (FAV_night_agree, 10/18-10/22: the same plus the total without
-    its best and worst hour > 0); "in progress (n/5 days)" until the window
-    completes, then PASS / FAIL; the recent-regime figure beside the
-    table-based one."""
+    its best and worst hour > 0); the recent-regime figure beside the
+    table-based one. Review of 338b4a5 (Jack 2026-10-17, "1"): Test A's
+    start is one constant and the hours known at registration are labelled,
+    with the verdict shown both ways; a test never completes with an expected
+    hour missing (INCOMPLETE) or before its last hour is due; the registered
+    rule and model are pinned (INVALID otherwise); a completed verdict is
+    frozen."""
 
     def setUp(self):
         clear_data()
 
-    def _ctx(self, day):
-        return R.build_context(day, policy=FAV_POLICY, with_health=False, now=NOW)
+    def _ctx(self, day, now=NOW, **kw):
+        return R.build_context(day, policy=FAV_POLICY, with_health=False, now=now, **kw)
 
     def test_definitions_are_the_preregistered_ones(self):
         a, b = R.PREREG_TESTS
-        self.assertEqual((a["id"], a["variant"], a["start"], a["end"]),
-                         ("A", "FAV_night", "2026-10-17", "2026-10-21"))
+        self.assertEqual((a["id"], a["variant"], a["start"], a["days"]),
+                         ("A", "FAV_night", "2026-10-17T00:00:00-04:00", 5))
+        self.assertEqual(R.test_days(a), days_from("2026-10-17", 5))
         self.assertEqual(a["criteria"], ("total", "days", "cal"))
         self.assertIn("robust", a["info"])                 # reported for information
-        self.assertEqual((b["id"], b["variant"], b["start"], b["end"]),
-                         ("B", "FAV_night_agree", "2026-10-18", "2026-10-22"))
+        self.assertEqual((b["id"], b["variant"], b["start"], b["days"]),
+                         ("B", "FAV_night_agree", "2026-10-18T00:00:00-04:00", 5))
+        self.assertEqual(R.test_days(b), days_from("2026-10-18", 5))
         self.assertEqual(b["criteria"], ("total", "days", "robust", "cal"))
         self.assertIn("recent", b["info"])
         self.assertEqual(R.PREREG_DAYS_POS, 4)
+        self.assertEqual(R.PREREG_REGISTERED_AT, "2026-10-17T14:57:35-04:00")
+        lo, hi = R.test_bounds(a)
+        self.assertEqual((C.iso(lo), C.iso(hi)), ("2026-10-17T04:00:00Z", "2026-10-22T04:00:00Z"))
+        # the registered rules: Test B = Test A's rule plus the agreement gate
+        self.assertEqual(b["overrides"], dict(a["overrides"], fav_market_min_p=0.95))
+        self.assertEqual(b["policy"], dict(a["policy"], fav_market_min_p=0.95))
+        self.assertIsNone(a["policy"]["fav_market_min_p"])
+        self.assertEqual((a["policy"]["q_fav"], a["policy"]["fav_min_p"], a["policy"]["live"]),
+                         (300, 0.97, False))
+        self.assertEqual(R.PREREG_PIN_MODEL["sim_version"], "8")
+        # each test carries its model pin (the swp / stress identity, the fair model)
+        self.assertIs(a["model"], R.PREREG_PIN_MODEL)
+        self.assertIs(b["model"], R.PREREG_PIN_MODEL)
+        self.assertEqual(sorted(R.PREREG_PIN_MODEL),
+                         ["fair_model_id", "sim_version", "stress", "swp"])
 
     def test_status_progression_and_subject(self):
         write_fav_days({d: -1.0 for d in days_from("2026-10-15", 3)})
@@ -1937,29 +2146,48 @@ class TestPreregisteredTests(unittest.TestCase):
         self.assertEqual((a["status"], a["text"]), ("in progress", "in progress (1/5 days)"))
         self.assertEqual(b["text"], "starts 10/18")
         self.assertEqual(a["total"], -24.0)
-        self.assertEqual(ctx["prereg_verdict"], "in progress")
+        # 26OCT1700-1714 settled before the registration commit (14:57:35 ET)
+        self.assertEqual([e for e, _n in a["known"]],
+                         [event_ticker("2026-10-17", h) for h in range(15)])
+        self.assertEqual((a["alt"]["total"], a["alt"]["text"]), (-9.0, "in progress (1/5 days)"))
+        self.assertEqual(a["alt"]["known"], [])
+        self.assertIsNone(b["alt"])
+        self.assertEqual((ctx["prereg_verdict"], ctx["prereg_verdict_alt"]),
+                         ("in progress", "in progress"))
         subj = R.subject_line(ctx)
         # the task's example: "...: no variant passes; Test A in progress 1/5
-        # (stress -$X), Test B starts 10/18"
+        # (stress -$X), Test B starts 10/18" -- with the "after registration"
+        # figure while the registered window holds known hours
         self.assertTrue(subj.startswith("Temp shadow day 3 (2026-10-17): no variant passes; "
-                                        "Test A in progress 1/5 (stress -$24), Test B starts "
-                                        "10/18"), subj)
+                                        "Test A in progress 1/5 (stress -$24; after "
+                                        "registration -$9), Test B starts 10/18"), subj)
         page = R.render_html(ctx)
         for needle in ("Pre-registered verdict: ", "in progress (1/5 days)",
-                       "Test A -- FAV_night (rule 3): ET days 2026-10-17 .. 2026-10-21",
+                       "Test A -- FAV_night (rule 3): ET days 2026-10-17 .. 2026-10-21 (from "
+                       "10/17 00:00 ET)", "As registered: ",
+                       "Excluding the 15 hours known at registration (settled before 2026-10-17 "
+                       "14:57:35 ET (eff9cd3))", "known at registration",
+                       "net after registration", "26OCT1700 -$1.00",
                        "Test B -- FAV_night_agree", "the window&#x27;s total stress net &gt; 0",
-                       "not met", "(so far)", "RECENT REGIME", "TABLE-BASED"):
+                       "not met", "so far", "RECENT REGIME", "table-based",
+                       "excluding known hours"):
             self.assertIn(needle, page)
+        txt = R.render_text(ctx)
+        self.assertIn("Test A (FAV_night, ET 2026-10-17 .. 2026-10-21): as registered in "
+                      "progress (1/5 days); excluding the 15 hours known at registration", txt)
+        self.assertIn("Live reconciliation (rule 4) of the agreement gate: ", txt)
 
     def test_pass_fail_on_each_criterion(self):
         window = days_from("2026-10-17", 6)
         # A: +24 a day on every day -> PASS; B identical -> PASS
         write_fav_days({d: 1.0 for d in window})
-        a, b = self._ctx("2026-10-22")["tests"]
+        ctx = self._ctx("2026-10-22")
+        a, b = ctx["tests"]
         self.assertEqual((a["status"], b["status"]), ("PASS", "PASS"))
-        self.assertEqual((a["pos_days"], a["days_done"]), (5, 5))
-        self.assertEqual(self._ctx("2026-10-22")["prereg_verdict"],
-                         "pilot eligible: FAV_night, FAV_night_agree")
+        self.assertEqual((a["pos_days"], a["days_done"], a["hours"]), (5, 5, 120))
+        self.assertEqual((a["alt"]["status"], a["alt"]["hours"]), ("PASS", 105))
+        self.assertEqual(ctx["prereg_verdict"], "pilot eligible: FAV_night, FAV_night_agree")
+        self.assertEqual(ctx["prereg_verdict_alt"], "pilot eligible: FAV_night, FAV_night_agree")
         # total > 0 but only 3 of 5 positive days -> FAIL (A and B)
         clear_data()
         nets = {d: 10.0 if d in ("2026-10-17", "2026-10-20", "2026-10-21", "2026-10-22") else -0.5
@@ -1994,25 +2222,286 @@ class TestPreregisteredTests(unittest.TestCase):
                             "FAV_night_agree|stress": srec(1.0, cal=0.5)}
                 C.write_json_atomic(os.path.join(DATA, "sim", d, f"{event_ticker(d, h)}.json"),
                                     _ev_rec(d, h, variants))
-        a, b = self._ctx("2026-10-22")["tests"]
-        self.assertEqual(a["cal"], -0.5 * 24 * 5)
-        self.assertEqual((a["status"], b["status"]), ("FAIL", "PASS"))
-        self.assertEqual(self._ctx("2026-10-22")["prereg_verdict"],
-                         "pilot eligible: FAV_night_agree")
-
-    def test_missing_stress_keeps_it_in_progress(self):
-        window = days_from("2026-10-17", 6)
-        write_fav_days({d: 1.0 for d in window},
-                       missing=(event_ticker("2026-10-19", 5),))
         ctx = self._ctx("2026-10-22")
         a, b = ctx["tests"]
-        self.assertEqual(a["status"], "in progress")
-        self.assertEqual(a["missing"], [event_ticker("2026-10-19", 5)])
-        self.assertIn("1 event(s) without stress results (waiting for the re-sim)", a["text"])
-        self.assertEqual(ctx["stress_missing"]["total"], 1)
-        self.assertIn("[1 events without stress]", R.subject_line(ctx))
-        self.assertIn("1 of 144 event(s) in the window have no stress results",
-                      R.render_html(ctx))
+        self.assertEqual(a["cal"], -0.5 * 24 * 5)
+        self.assertEqual((a["status"], b["status"]), ("FAIL", "PASS"))
+        self.assertEqual(ctx["prereg_verdict"], "pilot eligible: FAV_night_agree")
+
+    def test_known_hours_both_verdicts(self):
+        # the hours settled before the registration carry Test A: +40 an hour
+        # in 26OCT1700-1714; every later day +0.5 (its 00:00 hour +2.8, the
+        # rest -0.1) -> PASS as registered, FAIL without the known hours
+        window = days_from("2026-10-17", 6)
+        later = [2.8] + [-0.1] * 23
+        write_fav_days({d: ([40.0] * 15 + [-1.0] * 9 if d == "2026-10-17" else later)
+                        for d in window})
+        ctx = self._ctx("2026-10-22")
+        a, b = ctx["tests"]
+        self.assertEqual(a["status"], "PASS")
+        self.assertAlmostEqual(a["total"], 591.0 + 4 * 0.5)
+        self.assertEqual(len(a["known"]), 15)
+        self.assertEqual(a["alt"]["status"], "FAIL")
+        self.assertAlmostEqual(a["alt"]["total"], -9.0 + 4 * 0.5)
+        self.assertEqual(a["rows"][0]["known"], 15)
+        self.assertAlmostEqual(a["rows"][0]["known_net"], 600.0)
+        self.assertEqual(b["status"], "FAIL")              # robust: without its 2.8 hours
+        self.assertEqual(ctx["prereg_verdict"], "pilot eligible: FAV_night")
+        self.assertEqual(ctx["prereg_verdict_alt"],
+                         "NO-GO (no variant passes the pre-registered tests)")
+        w = ctx["week"]
+        self.assertEqual(w["verdict_after_registration"],
+                         "NO-GO (no variant passes the pre-registered tests)")
+        subj = R.subject_line(ctx)
+        self.assertIn("Test A PASS (stress +$593; after registration FAIL -$7)", subj)
+        self.assertTrue(subj.endswith("-- week: pilot eligible: FAV_night (excluding known "
+                                      "hours: NO-GO (no variant passes the pre-registered "
+                                      "tests))"), subj)
+        page = R.render_html(ctx)
+        for needle in ("As registered: <b", "Excluding the 15 hours known at registration",
+                       "15 hours, ", "26OCT1714 +$40.00",
+                       "excluding the hours known at registration: <b"):
+            self.assertIn(needle, page)
+
+    def test_missing_hours_make_it_incomplete_never_pass(self):
+        # 10/21 21:00-23:00 ET have no sim file (one raised, two never
+        # recorded); 10/19 05:00 has a file without its stress result. The
+        # criteria pass on the hours that are in -- the test still never passes
+        window = days_from("2026-10-17", 6)
+        write_fav_days({d: 1.0 for d in window}, missing=(event_ticker("2026-10-19", 5),))
+        gone = [event_ticker("2026-10-21", h) for h in (21, 22, 23)]
+        for ev in gone:
+            os.remove(os.path.join(DATA, "sim", "2026-10-21", f"{ev}.json"))
+        summary = {"ok": 0, "pending": [], "errors": [], "deferred": [],
+                   "window": {"errors": [(gone[1], "ValueError: boom")], "pending": [],
+                              "deferred": []}}
+        ctx = self._ctx("2026-10-22", sim_summary=summary)
+        a, b = ctx["tests"]
+        self.assertEqual((a["status"], b["status"]), ("INCOMPLETE", "INCOMPLETE"))
+        self.assertTrue(all(a["crit"][c]["met"] for c in a["criteria"]))
+        miss = dict(a["missing"])
+        self.assertEqual(sorted(miss), sorted([event_ticker("2026-10-19", 5)] + gone))
+        self.assertEqual(miss[gone[1]], "the sim raised: ValueError: boom")
+        self.assertEqual(miss[gone[0]], "never seen: the collector was not recording then")
+        self.assertEqual(miss[event_ticker("2026-10-19", 5)],
+                         "its sim file has no stress result for FAV_night (SIM_VERSION 8)")
+        self.assertEqual(a["text"], "INCOMPLETE (4 expected hour(s) without a stress result)")
+        self.assertEqual(ctx["prereg_verdict"], "undecided (Test A INCOMPLETE; Test B INCOMPLETE)")
+        subj = R.subject_line(ctx)
+        self.assertIn("Test A INCOMPLETE (4 hours missing; stress +$116; after registration "
+                      "INCOMPLETE +$101)", subj)
+        page = R.render_html(ctx)
+        self.assertIn("expected hour without a stress result", page)
+        self.assertIn(gone[2], page)
+        self.assertIn("1 expected hour(s) without stress", page)     # the 10/19 row
+        self.assertIn("3 expected hour(s) without stress", page)     # the 10/21 row
+        # before the window is over the same gap only says "so far"
+        a20 = self._ctx("2026-10-20")["tests"][0]
+        self.assertEqual(a20["status"], "in progress")
+        self.assertEqual(a20["text"], "in progress (4/5 days; 1 expected hour(s) without a "
+                                      "stress result so far)")
+        # a settled file without a sim file names the re-sim
+        C.write_json_atomic(C.settled_file(gone[0]), {"event_ticker": gone[0]})
+        a = self._ctx("2026-10-22")["tests"][0]
+        self.assertEqual(dict(a["missing"])[gone[0]], "settled, but no sim file (re-sim the day)")
+
+    def test_never_complete_before_the_last_hour_is_due(self):
+        write_fav_days({d: 1.0 for d in days_from("2026-10-17", 5)})
+        last = C.parse_event(event_ticker("2026-10-21", 23))[1]
+        early = self._ctx("2026-10-21", now=last + R.SETTLE_LAG_S - 60)["tests"][0]
+        self.assertEqual((early["status"], early["text"]), ("in progress", "in progress (5/5 days)"))
+        self.assertEqual(early["hours"], 120)             # every hour simmed, still running
+        done = self._ctx("2026-10-21", now=last + R.SETTLE_LAG_S)["tests"][0]
+        self.assertEqual(done["status"], "PASS")
+        # an hour not due yet and not simmed keeps it running too
+        os.remove(os.path.join(DATA, "sim", "2026-10-21", f"{event_ticker('2026-10-21', 23)}.json"))
+        early = self._ctx("2026-10-21", now=last + R.SETTLE_LAG_S - 60)["tests"][0]
+        self.assertEqual((early["status"], early["rows"][-1]["later"]), ("in progress", 1))
+
+    def test_hours_kalshi_never_listed_are_not_expected(self):
+        window = days_from("2026-10-17", 6)
+        write_fav_days({d: 1.0 for d in window})
+        ev = event_ticker("2026-10-20", 5)
+        os.remove(os.path.join(DATA, "sim", "2026-10-20", f"{ev}.json"))
+        S = C.parse_event(ev)[1]
+        # the recording began before the windows (recording_start)
+        t0 = C.parse_iso("2026-10-14T12:00:00Z")
+        C.append_jsonl(C.raw_file("meta", t0, create=True),
+                       {"rx": t0, "kind": "poll", "data": {"n": 12, "city": "miami"}})
+        # the collector was recording across the hour (a station poll every
+        # minute, market discovery writing rows for the hours around it) and
+        # never saw this one listed
+        for t in range(int(S) - 4 * 3600, int(S) + 2 * 3600, 60):
+            C.append_jsonl(C.raw_file("meta", t, create=True),
+                           {"rx": float(t), "kind": "poll", "data": {"n": 12, "city": "miami"}})
+        for h, t in ((4, S - 3000.0), (6, S + 600.0)):
+            C.append_jsonl(C.raw_file("meta", t, create=True),
+                           {"rx": t, "kind": "markets",
+                            "data": {"event_ticker": event_ticker("2026-10-20", h),
+                                     "markets": []}})
+        ctx = self._ctx("2026-10-22")
+        a, b = ctx["tests"]
+        self.assertEqual((a["not_listed"], b["not_listed"]), ([ev], [ev]))
+        self.assertEqual((a["missing"], a["status"]), ([], "PASS"))
+        self.assertEqual(a["hours"], 119)
+        self.assertIn("Not listed by Kalshi", R.render_html(ctx))
+        # unknown (the collector was not recording then): expected, missing
+        clear_data()
+        write_fav_days({d: 1.0 for d in window})
+        os.remove(os.path.join(DATA, "sim", "2026-10-20", f"{ev}.json"))
+        a = self._ctx("2026-10-22")["tests"][0]
+        self.assertEqual((a["status"], a["not_listed"]), ("INCOMPLETE", []))
+
+    def test_missing_reasons_and_listing(self):
+        ev = event_ticker("2026-10-19", 4)
+        S = C.parse_event(ev)[1]
+        none = {"seen": set(), "mk_rx": [], "poll_min": set()}
+        rec = {"seen": set(), "mk_rx": [S - 3000.0],
+               "poll_min": {int(t // 60) for t in range(int(S) - 4200, int(S), 60)}}
+        self.assertEqual(R._missing_reason(ev, none, {"pending": [ev]}),
+                         "unsettled when the sim ran (the settlement pull was incomplete)")
+        self.assertEqual(R._missing_reason(ev, none, {"window": {"deferred": [ev]}}),
+                         "its re-sim was deferred (the time budget)")
+        self.assertEqual(R._missing_reason(ev, dict(none, seen={ev}), {}),
+                         "listed, but no settled file (the settlement pull failed?)")
+        self.assertEqual(R._missing_reason(ev, none, {}),
+                         "never seen: the collector was not recording then")
+        self.assertEqual(R._missing_reason(ev, dict(rec, mk_rx=[]), {}),
+                         "never seen, with no market discovery rows around it: whether Kalshi "
+                         "listed it is unknown")
+        self.assertIs(R.listed_by_kalshi(ev, rec), False)              # recorded, never seen
+        self.assertIsNone(R.listed_by_kalshi(ev, dict(rec, mk_rx=[])))  # discovery silent
+        self.assertIsNone(R.listed_by_kalshi(ev, none))                 # not recording
+        self.assertIs(R.listed_by_kalshi(ev, dict(none, seen={ev})), True)
+        C.write_json_atomic(C.settled_file(ev), {"event_ticker": ev})
+        self.assertIs(R.listed_by_kalshi(ev, rec), True)               # a settled file
+
+    def test_a_changed_rule_or_model_is_invalid(self):
+        window = days_from("2026-10-17", 6)
+
+        def edited(day, h):
+            # from 10/20: FAV_night_agree's gate edited to 0.5 and another
+            # stress model version in every file
+            if day < "2026-10-20":
+                return {}
+            ident = pin_ident()
+            ident["policies"]["FAV_night_agree"]["fav_market_min_p"] = 0.5
+            ident["policy_full"]["FAV_night_agree"]["fav_market_min_p"] = 0.5
+            ident["stress"]["stress_version"] = "99"
+            return ident
+        write_fav_days({d: 1.0 for d in window}, ident=edited)
+        ctx = self._ctx("2026-10-22")
+        a, b = ctx["tests"]
+        self.assertEqual((a["status"], b["status"]), ("INVALID", "INVALID"))
+        f = {d["field"]: d for d in b["pin_diffs"]}
+        self.assertEqual((f["overrides.fav_market_min_p"]["pinned"],
+                          f["overrides.fav_market_min_p"]["found"]), (0.95, 0.5))
+        self.assertEqual(f["policy.fav_market_min_p"]["found"], 0.5)
+        self.assertEqual((f["stress.stress_version"]["pinned"], f["stress.stress_version"]["found"],
+                          f["stress.stress_version"]["files"], f["stress.stress_version"]["first"]),
+                         ("1", "99", 72, event_ticker("2026-10-20", 0)))
+        self.assertEqual([d["field"] for d in a["pin_diffs"]], ["stress.stress_version"])
+        self.assertEqual(a["text"], "INVALID (rule or model changed)")
+        self.assertEqual(ctx["prereg_verdict"], "undecided (Test A INVALID; Test B INVALID)")
+        subj = R.subject_line(ctx)
+        self.assertIn("Test A INVALID (rule or model changed), Test B INVALID (rule or model "
+                      "changed)", subj)
+        page = R.render_html(ctx)
+        for needle in ("overrides.fav_market_min_p", "stress.stress_version", "window files",
+                       "the test is INVALID and never passes"):
+            self.assertIn(needle, page)
+        self.assertIn("INVALID (rule or model changed): overrides.fav_market_min_p registered "
+                      "0.95, found 0.5", R.render_text(ctx))
+        # a fair-model refit inside the window: the same, on one file
+        clear_data()
+        write_fav_days({d: 1.0 for d in window},
+                       ident=lambda d, h: ({"fair_model": {"id": "0" * 16, "source": "x.json"}}
+                                           if (d, h) == ("2026-10-19", 3) else {}))
+        a, b = self._ctx("2026-10-22")["tests"]
+        self.assertEqual((a["status"], b["status"]), ("INVALID", "INVALID"))
+        self.assertEqual([(d["field"], d["files"]) for d in a["pin_diffs"]], [("fair_model.id", 1)])
+        # a file without the identity (no policies / policy_full): not the
+        # registered rule as far as anyone can tell -> INVALID
+        clear_data()
+        write_fav_days({d: 1.0 for d in window},
+                       ident=lambda d, h: ({"policies": {}, "policy_full": {}}
+                                           if (d, h) == ("2026-10-18", 2) else {}))
+        a = self._ctx("2026-10-22")["tests"][0]
+        self.assertEqual(a["status"], "INVALID")
+        self.assertEqual(sorted(d["field"] for d in a["pin_diffs"]), ["overrides", "policy"])
+
+    def test_older_sim_files_wait_for_their_resim(self):
+        window = days_from("2026-10-17", 6)
+        write_fav_days({d: 1.0 for d in window},
+                       ident=lambda d, h: {"sim_version": "7"} if d == "2026-10-18" else {})
+        a, b = self._ctx("2026-10-22")["tests"]
+        self.assertEqual((a["status"], len(a["missing"]), a["pin_diffs"]), ("INCOMPLETE", 24, []))
+        self.assertEqual(a["missing"][0][1],
+                         "older sim file (SIM_VERSION 7; the tests read 8): re-sim the day")
+        self.assertEqual(a["stale"][0], event_ticker("2026-10-18", 0))
+        # a file of the CURRENT code's version that is not the pinned one:
+        # the model changed (here the pin says 9, the code and the files 8)
+        with mock.patch.dict(R.PREREG_PIN_MODEL, sim_version="9"):
+            a = self._ctx("2026-10-22")["tests"][0]
+        self.assertEqual(a["status"], "INVALID")
+        self.assertIn(("sim_version", "9", "8"),
+                      [(d["field"], d["pinned"], d["found"]) for d in a["pin_diffs"]])
+
+    def test_a_completed_verdict_is_frozen(self):
+        window = days_from("2026-10-17", 6)
+        write_fav_days({d: 1.0 for d in window})
+        self._ctx("2026-10-22")                            # freeze=False writes nothing
+        self.assertFalse(os.path.exists(R.frozen_path("A")))
+        ctx = self._ctx("2026-10-22", freeze=True)
+        self.assertTrue(os.path.exists(R.frozen_path("A")))
+        self.assertTrue(os.path.exists(R.frozen_path("B")))
+        doc = C.read_json(R.frozen_path("A"))
+        self.assertEqual((doc["verdict"]["status"], doc["after_registration"]["status"]),
+                         ("PASS", "PASS"))
+        self.assertEqual(doc["definition"], R.test_definition(R.PREREG_TESTS[0]))
+        self.assertEqual((len(doc["verdict"]["hours"]), doc["verdict"]["total"]), (120, 120.0))
+        self.assertEqual((doc["frozen_at"], doc["report_day"]), ("2026-10-30T12:00:00Z",
+                                                                  "2026-10-22"))
+        self.assertIn("Verdict frozen now", R.render_html(ctx))
+        # later runs show the frozen verdict
+        a = self._ctx("2026-10-22")["tests"][0]
+        self.assertEqual((a["status"], a["text"], a["frozen_diffs"]),
+                         ("PASS", "PASS (frozen 2026-10-30)", []))
+        # a window file changed after the freeze: the frozen verdict stands, flagged
+        p = os.path.join(DATA, "sim", "2026-10-19", f"{event_ticker('2026-10-19', 3)}.json")
+        rec = C.read_json(p)
+        rec["variants"]["FAV_night|stress"]["net"] = -500.0
+        C.write_json_atomic(p, rec)
+        ctx = self._ctx("2026-10-22", freeze=True)
+        a = ctx["tests"][0]
+        self.assertEqual((a["status"], a["recomputed"]["status"]), ("PASS", "FAIL"))
+        self.assertIn("total", a["frozen_diffs"])
+        self.assertEqual(C.read_json(R.frozen_path("A"))["verdict"]["status"], "PASS")
+        self.assertIn("Test A PASS (stress +$120; after registration PASS +$105) [frozen "
+                      "verdict; a recompute differs]", R.subject_line(ctx))
+        self.assertIn("A RECOMPUTE TODAY DIFFERS in", R.render_html(ctx))
+        # another definition (Test A's start moved): the frozen file is not used
+        spec = dict(R.PREREG_TESTS[0], start="2026-10-18T00:00:00-04:00")
+        with mock.patch.object(R, "PREREG_TESTS", (spec, R.PREREG_TESTS[1])):
+            a = self._ctx("2026-10-22")["tests"][0]
+        self.assertIsNone(a["frozen"])
+        self.assertEqual(a["frozen_other"]["status"], "PASS")
+
+    def test_test_a_start_is_one_constant(self):
+        # Jack's pending decision: the stricter window is the one line
+        # "start": "2026-10-18T00:00:00-04:00"
+        window = days_from("2026-10-17", 6)
+        write_fav_days({d: 1.0 for d in window})
+        spec = dict(R.PREREG_TESTS[0], start="2026-10-18T00:00:00-04:00")
+        with mock.patch.object(R, "PREREG_TESTS", (spec, R.PREREG_TESTS[1])):
+            self.assertEqual(R.test_days(spec), days_from("2026-10-18", 5))
+            self.assertEqual(R.judged_from_ts("FAV_only"), C.parse_iso("2026-10-18T04:00:00Z"))
+            ctx = self._ctx("2026-10-22")
+        a = ctx["tests"][0]
+        self.assertEqual((a["first_day"], a["last_day"], a["status"]),
+                         ("2026-10-18", "2026-10-22", "PASS"))
+        self.assertEqual((a["alt"], a["known"], ctx["prereg_verdict_alt"]), (None, [], None))
+        self.assertNotIn("after registration", R.subject_line(ctx))
 
     def test_recent_regime_figure(self):
         # the recorded period's favorite-bid hits: >0.995 lost 2 of 40 (5%),
@@ -2044,6 +2533,22 @@ class TestPreregisteredTests(unittest.TestCase):
         # without fav_fills (older sim files) the recent figure is n/a
         self.assertIsNone(R.recent_cal([{"net_cal": 1.0}], rec))
         self.assertEqual(R.recent_cal([srec(1.0, cal=2.0)], rec), 2.0)   # no favorite fills
+
+    def test_agreement_gate_share_for_the_live_reconciliation(self):
+        window = days_from("2026-10-17", 3)
+        write_fav_days({d: 1.0 for d in window},
+                       ident=lambda d, h: {"fav_gate": {"FAV_night_agree": {
+                           "model_secs": 1000, "gate_secs": 600}}})
+        ctx = self._ctx("2026-10-19")
+        b = ctx["tests"][1]
+        self.assertEqual(b["fav_gate"], {"model_secs": 48000, "gate_secs": 28800, "files": 48})
+        self.assertIsNone(ctx["tests"][0]["fav_gate"])
+        page = R.render_html(ctx)
+        self.assertIn("Agreement gate in the shadow: it let a favorite join through in 60.0% of "
+                      "the 48,000 strike-seconds", page)
+        self.assertIn("fav_market.ok", page)
+        self.assertIn("agreement gate in the shadow: passed 60.0% of 48,000", R.render_text(ctx))
+
 
 if __name__ == "__main__":
     unittest.main()

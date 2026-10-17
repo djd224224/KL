@@ -155,7 +155,10 @@ Extra keys (top level): policies, flags, runtime_s, sim_version, fill_models,
 swp (draws, rec_mode, channels, seed, hazard_id / hazard_src / hazard_built /
 lam_max, tails_id / tails_src), stress (draws, seed, fav_seed, fav_hazard_id
 / _src / _kind / _rejected / _built, fav_lam_max, stress_version, take, hole,
-scope, variants), fav_hits; coverage adds fair_missing_frac, programs_src
+scope, variants), fav_hits, policy_full (every variant's full effective policy),
+fair_model (id = a hash of the fitted params, source), fav_gate (variants with
+fav_market_min_p: model_secs / gate_secs, the agreement gate's pass share);
+coverage adds fair_missing_frac, programs_src
 and wx_rows_lookback. run_day reuses a sim file only when it holds every
 requested variant x fill model with the same overrides (stress: the
 variants in STRESS_SCOPE), this SIM_VERSION and the same swp / stress
@@ -179,7 +182,7 @@ import temp_shadow_common as C
 import temp_shadow_model as tmodel
 import temp_shadow_scoring as scoring
 
-SIM_VERSION = "7"   # 2: 75-min wx lookback, fair per wx update, relative size
+SIM_VERSION = "8"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # cuts + projected belief, near strikes only with decided,
                     # pre-trade worst-case-loss sizing (10/14 review fixes)
                     # 3: guard buffer from FairModel.slopes (mixture slope);
@@ -200,6 +203,11 @@ SIM_VERSION = "7"   # 2: 75-min wx lookback, fair per wx update, relative size
                     # fav_hits, FAV_night_agree and the policy key
                     # fav_market_min_p (Jack 2026-10-17, "1"); opt / cons /
                     # swp numbers of the earlier variants unchanged
+                    # 8: the files name what the pre-registered tests pin
+                    # -- fair_model (the fitted params' id), policy_full
+                    # (every variant's full effective policy) -- and
+                    # fav_gate (the agreement gate's pass share); review of
+                    # 338b4a5 (Jack 2026-10-17: "1"); numbers unchanged
 
 # The policy lives in temp_mm_policy (the live executor runs the same code);
 # re-exported here for the report and older callers.
@@ -1474,6 +1482,70 @@ def run_stress(sh, Ps: Dict[str, dict], swp_cfg: dict, st_cfg: dict,
     return {name: _swp_summary(runs[name], name in exact, stress=True) for name in Ps}
 
 
+def fair_model_identity(model) -> dict:
+    """{"id": a hash of the fitted params the fair model prices with, "source":
+    the params file} -- pinned by the pre-registered tests, so a refit
+    mid-window shows up (a model without params, e.g. a test stand-in: id
+    None)."""
+    import hashlib
+    params = getattr(model, "params", None)
+    if not isinstance(params, dict):
+        return {"id": None, "source": type(model).__name__}
+    blob = json.dumps(params, sort_keys=True, default=str)
+    return {"id": hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16],
+            "source": os.path.basename(str(getattr(model, "params_source", "") or ""))}
+
+
+def fav_gate_secs(sh, P: dict) -> dict:
+    """The agreement gate's pass share for a variant with fav_market_min_p:
+    {"model_secs": program strike-seconds (quote hours, trusted book) where
+    the model alone would join the favorite (decided strike, favorite fair >=
+    fav_min_p, q_fav >= 1), "gate_secs": those where the market also agrees
+    (temp_mm_policy.market_fav_prob >= fav_market_min_p)} -- quote_market's
+    decided-branch tests, on the external (recorded) book at each tick. The
+    live executor logs the same test per decision sample (fav_market), so
+    the two shares can be compared hour by hour: live, the gate sees others
+    stepping ahead of our joins, which the recording never does."""
+    mmin = P.get("fav_market_min_p")
+    out = {"model_secs": 0, "gate_secs": 0}
+    if mmin is None or not P.get("decided") or float(P.get("q_fav") or 0) < 1:
+        return out
+    if not pol.quote_hour_ok(P, sh.inp.settle_ts):
+        return out
+    tick_fs, _ = sh.react_view(float(P["react_s"]))
+    fmin = float(P["fav_min_p"])
+    for i in range(sh.n):
+        T = sh.sec0 + i + 0.5
+        if T >= sh.end_t:
+            break
+        fs = tick_fs[i]
+        for m in range(sh.nm):
+            pr = sh.progs[m]
+            if not (pr["start"] <= T < pr["end"]):
+                continue
+            v = sh.ver[m][i]
+            if v < 0:
+                continue
+            b = sh.vinfo[m][v]
+            f = sh.st_f[fs][m] if fs >= 0 else None
+            fx = f if f is not None else (b.mid / 100.0 if b.mid is not None else None)
+            if fx is None:
+                continue
+            cls = pol.classify(fx)
+            # quote_market's decided branch: not a live strike, and not a
+            # near strike the variant quotes live at half size
+            if cls == "live" or (cls == "near" and P.get("near_decided_half")):
+                continue
+            fav, f_fav = ("no", 1.0 - fx) if fx < 0.5 else ("yes", fx)
+            if f_fav < fmin:
+                continue
+            out["model_secs"] += 1
+            mp = pol.market_fav_prob(b, fav)
+            if mp is not None and mp + 1e-9 >= float(mmin):
+                out["gate_secs"] += 1
+    return out
+
+
 def run_event(event_ticker: str, variants=None, fill_models=RUN_FILL_MODELS, model=None,
               until_ts: Optional[float] = None, draws: Optional[int] = None) -> dict:
     """Simulate one event for every variant x fill model.
@@ -1550,6 +1622,10 @@ def run_event(event_ticker: str, variants=None, fill_models=RUN_FILL_MODELS, mod
             fav_hits = SW.fav_hit_summary(sweep_sh)
         except Exception as e:          # noqa: BLE001
             fh_err = f"fav_hits_error:{type(e).__name__}:{str(e)[:120]}"
+    # the agreement gate's pass share (variants with fav_market_min_p): the
+    # shadow side of the live reconciliation of FAV_night_agree
+    fav_gate = {name: fav_gate_secs(sh, P) for name, P in Ps.items()
+                if P.get("fav_market_min_p") is not None}
     fms = [fm for fm in fill_models
            if (fm != "swp" or swp_out) and (fm != STRESS or st_out)]
     out_vars = {}
@@ -1592,6 +1668,11 @@ def run_event(event_ticker: str, variants=None, fill_models=RUN_FILL_MODELS, mod
         "variants": out_vars,
         "policies": {name: (variants[name] if isinstance(variants, dict) else VARIANTS.get(name, {}))
                      for name in Ps},
+        # what the pre-registered tests pin (temp_shadow_report.PREREG_TESTS):
+        # each variant's FULL effective policy and the fair model's params id
+        "policy_full": json.loads(json.dumps(Ps, default=str)),
+        "fair_model": fair_model_identity(model),
+        **({"fav_gate": fav_gate} if fav_gate else {}),
         "flags": flags,
         "fill_models": fms,
         "swp": dict(swp_cfg["ident"]) if swp_out else None,

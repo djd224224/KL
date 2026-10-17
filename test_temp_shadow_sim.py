@@ -25,6 +25,7 @@ import unittest    # noqa: E402
 import temp_shadow_common as C     # noqa: E402
 import temp_shadow_scoring as scoring  # noqa: E402
 import temp_shadow_sim as sim      # noqa: E402
+import temp_shadow_model as tmodel  # noqa: E402
 
 assert C.DATA_ROOT == os.environ["TEMP_SHADOW_DATA"]
 assert os.path.realpath(C.DATA_ROOT).startswith(os.path.realpath(tempfile.gettempdir()))
@@ -1280,6 +1281,17 @@ class TestStressFillModel(SimTestBase):
             self.assertGreater(a["quoted_secs"], 0, fm)
             self.assertEqual(a, b, fm)
         self.assertEqual(res["policies"]["FAV_night_agree"]["fav_market_min_p"], 0.95)
+        # SIM_VERSION 8: what the pre-registered tests pin, and the gate's
+        # pass share for the live reconciliation (only gated variants)
+        want = json.loads(json.dumps(sim._resolve_variants(["FAV_night", "FAV_night_agree"])))
+        self.assertEqual(res["policy_full"], want)
+        self.assertEqual(res["policy_full"]["FAV_night_agree"]["fav_market_min_p"], 0.95)
+        self.assertIsNone(res["policy_full"]["FAV_night"]["fav_market_min_p"])
+        self.assertEqual(res["fair_model"], {"id": None, "source": "FakeModel"})
+        self.assertEqual(set(res["fav_gate"]), {"FAV_night_agree"})
+        g = res["fav_gate"]["FAV_night_agree"]
+        self.assertGreater(g["model_secs"], 0)
+        self.assertEqual(g["gate_secs"], g["model_secs"])      # the market always agrees
         _wipe()
         self._fixture(NIGHT_EVENT, books={tk: ({8: 300.0}, {90: 300.0})}, walk=False)
         res = sim.run_event(NIGHT_EVENT, variants=["FAV_night", "FAV_night_agree"],
@@ -1288,6 +1300,32 @@ class TestStressFillModel(SimTestBase):
             a, b = res["variants"][f"FAV_night|{fm}"], res["variants"][f"FAV_night_agree|{fm}"]
             self.assertGreater(a["quoted_secs"], 0, fm)
             self.assertEqual((b["quoted_secs"], b["reward"], b["contracts"]), (0, 0.0, 0.0), fm)
+        g = res["fav_gate"]["FAV_night_agree"]
+        self.assertGreater(g["model_secs"], 0)
+        self.assertEqual(g["gate_secs"], 0)                    # the market never agrees
+        # an ungated request writes no fav_gate
+        res = sim.run_event(NIGHT_EVENT, variants=["FAV_night"], model=FakeModel())
+        self.assertNotIn("fav_gate", res)
+        self.assertEqual(set(res["policy_full"]), {"FAV_night"})
+
+    def test_fair_model_identity(self):
+        """The fair model's id hashes its fitted params: a refit (any param)
+        changes it, the same params keep it; a model without params has
+        none."""
+        a = sim.fair_model_identity(tmodel.FairModel(params={"source": "a.json"}))
+        b = sim.fair_model_identity(tmodel.FairModel(params={"source": "b.json"}))
+        self.assertRegex(a["id"], r"^[0-9a-f]{16}$")
+        self.assertEqual(a["id"], sim.fair_model_identity(
+            tmodel.FairModel(params={"source": "a.json"}))["id"])
+        self.assertEqual(a["source"], "a.json")
+        self.assertNotEqual(a["id"], b["id"])            # "source" is one of the params
+        p2 = dict(tmodel.default_params())
+        k = next(k for k, v in p2.items() if isinstance(v, (int, float)) and not isinstance(v, bool))
+        p2[k] = float(p2[k]) + 0.125
+        c = sim.fair_model_identity(tmodel.FairModel(params=dict(p2, source="a.json")))
+        self.assertNotEqual(c["id"], a["id"])
+        self.assertEqual(sim.fair_model_identity(FakeModel()), {"id": None, "source": "FakeModel"})
+        self.assertEqual(sim.SIM_VERSION, "8")
 
     def test_fav_hits_recorded(self):
         import temp_shadow_sweep as SW

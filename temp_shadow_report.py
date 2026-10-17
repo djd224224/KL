@@ -9,33 +9,45 @@ earlier day of the cumulative window up to the current SIM_VERSION (run_day
 again: cached files that pass its check are only loaded), reads every
 sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
 
-  1 headline       "Day N of 7"; the variants ranked on STRESS net over the
-                   cumulative window without each one's best and worst hour
-                   (the "robust total"), beside the plain total, an hour-
-                   bootstrap 90% CI, P(total > 0) and a "noise-dominated" flag
-                   (|best hour| + |worst hour| > |total|). The headline names
-                   the top variant ONLY if its robust total > 0 and P(total >
-                   0) >= 0.8, else "no variant passes" (with the top robust
-                   total for information). No single day's realized net ranks
-                   anything (Jack 2026-10-17, "1": the 10/17 email headlined
-                   I_pads_only's +$1,480 on two upset hours)
-  1b pre-registered tests  Test A (FAV_night, ET days 10/17-10/21) and Test
-                   B (FAV_night_agree, 10/18-10/22) exactly as TEMP_SHADOW.md
-                   "Pre-registered tests" defines them: per-day stress nets,
-                   each criterion met / not met, "in progress (n/5 days)"
-                   until the window completes, then PASS / FAIL; the
-                   calibrated-tails expectation from the tail table AND a
-                   recent-regime figure (the favorite's upset rate after a
-                   favorite-bid hit re-estimated over the recorded period);
-                   the verdict "pilot eligible: <variant>" only on a PASS,
-                   else "NO-GO (no variant passes the pre-registered tests)"
-                   or "in progress"
+  1 headline       "Day N of 7"; the variants ranked on STRESS net over each
+                   one's JUDGED hours (never the hours it was chosen from:
+                   judged_from_ts) without its best and worst hour (the
+                   "robust total"), beside the plain total, a 3-hour block-
+                   bootstrap 90% CI, P(total > 0), a "noise-dominated" flag
+                   (|best hour| + |worst hour| > |total|) and the in-sample
+                   hours for information. The headline names the top variant
+                   ONLY if its robust total > 0, P(total > 0) >= 0.8 and its
+                   judged hours span 2 ET days, else "no variant passes" (with
+                   the top robust total for information); the named
+                   variant's noise flag goes into the subject. Always on stress: no stress results -> "no
+                   variant passes (no stress results)". No single day's
+                   realized net ranks anything (Jack 2026-10-17, "1": the
+                   10/17 email headlined I_pads_only's +$1,480 on two upset
+                   hours)
+  1b pre-registered tests  Test A (FAV_night, 5 ET days from PREREG_TESTS'
+                   start, 10/17 as registered) and Test B (FAV_night_agree,
+                   10/18-10/22) exactly as TEMP_SHADOW.md "Pre-registered
+                   tests" defines them: per-day stress nets over the expected
+                   hours, each criterion met / not met, "in progress (n/5
+                   days)" until the window's last hour is due and every due
+                   hour is in, then PASS / FAIL -- INCOMPLETE when an expected
+                   hour has no stress result, INVALID when a window file ran
+                   another rule or model than the registered one (the pins);
+                   Test A's hours known at registration labelled and its
+                   verdict shown both ways; completed verdicts frozen to
+                   <data root>/prereg/; the calibrated-tails expectation from
+                   the tail table AND a recent-regime figure; the verdict
+                   "pilot eligible: <variant>" only on a PASS, else "NO-GO (no
+                   variant passes the pre-registered tests)", "in progress" or
+                   "undecided"; the agreement gate's shadow pass share for the
+                   live reconciliation
   2 variants       opt, cons, swp and stress side by side: reward, contracts,
                    trading P&L, net (swp / stress: +/- the Monte Carlo se, 1c
                    filler contracts, "expected (calibrated tails)" = net_cal;
                    stress: avg share, fills within 3 s after a weather
                    update), in the ranking's order
-  3 breakdowns     the headline variant (else the top of the ranking) on
+  3 breakdowns     the headline variant (else the top of the ranking; none
+                   without stress results) on
                    stress fills by ET hour of the event, strike class (live /
                    decided), tau bucket, side, and its worst 5 events
   4 market         % of strike-seconds paying without us, % locked at 99,
@@ -73,9 +85,11 @@ sim/<ET day>/<EVENT>.json since the shadow start, and emails one HTML page:
   9 week summary   from day 7: the adopted go-live rules instead of the old
                    GO / NO-GO thresholds -- the pre-registered tests' verdict
                    ("pilot eligible: <variant>" only on a PASS; then the rule-4
-                   pilot config: 1/3 size, night hours only, $300 daily halt,
-                   hourly live-vs-shadow reconciliation, auto-halt after 2
-                   hours below the shadow's band), and the key risks
+                   pilot config -- the registered rule at 1/3 size (q_fav
+                   100), night hours only, $300 daily halt, hourly
+                   live-vs-shadow reconciliation, auto-halt after 2 hours
+                   below the shadow's band), both ways while Test A holds
+                   hours known at registration, and the key risks
 
 Fill models (Jack 2026-10-16, "1": "ship the fixes + the sweep-aware report
 column"): opt and cons fill us only from recorded trades; swp (temp_shadow_sim
@@ -89,8 +103,9 @@ on stress (DECISION_FILL). The tweak rules (noise gates unchanged) still
 compare variants on swp, which every variant has (stress may cover only the
 variants that quote no live strikes: temp_shadow_sim.STRESS_SCOPE).
 headline_fill() picks the rules' fill model (swp, else cons for sim output
-from before SIM_VERSION 6); without stress results the ranking falls back to
-the same model and says so.
+from before SIM_VERSION 6). The ranking never falls back (review of 338b4a5):
+without stress results it is empty and the headline says "no variant passes
+(no stress results)".
 
 Fix pass 10/16 (review of the swp build):
   * "Expected (calibrated tails)" (net_cal) is shown only for variants that
@@ -152,6 +167,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bisect
 import datetime as _dt
 import glob
 import gzip
@@ -189,25 +205,80 @@ STRESS_NOTE = ("stress = swp plus level-clears at every price (a recorded taker 
                "10/17 audit). The adopted go-live rules decide on stress (rule 2): the "
                "ranking, the pre-registered tests and the week verdict use it; the tweak "
                "rules still pair variants on swp.")
-# The headline ranking (Jack 2026-10-17, "1"): STRESS net over the window
-# without each variant's best and worst hour; the headline names the top
-# variant only when that robust total is > 0 and P(total > 0) >= this.
+# The headline ranking (Jack 2026-10-17, "1"): STRESS net over each
+# variant's judged hours (never the hours it was chosen from) without its
+# best and worst hour; the headline names the top variant only when that
+# robust total is > 0 and P(total > 0) >= this.
 HEADLINE_P_MIN = 0.8
-BOOT_N = 4000                        # hour-bootstrap resamples (fixed seed)
+# ... and only when its judged hours span at least this many ET days: no
+# single-day ranking. With per-variant judged hours a variant's window can be
+# one night (FAV_night on the 10/17 report: 19 hours, all >= 0, P = 1.00).
+HEADLINE_MIN_DAYS = 2
+BOOT_N = 4000                        # block-bootstrap resamples (fixed seed)
 BOOT_SEED = 20261017
-# TEMP_SHADOW.md "Pre-registered tests" (committed eff9cd3, 2026-10-17 14:57
-# ET, before any hour of the windows). Implemented exactly as written: do
+BOOT_BLOCK = 3                       # consecutive hours per bootstrap block
+SETTLE_LAG_S = 7200                  # an hour is due 2 h after it settles (expected_events)
+# The headline's first judged hour per variant (judged_from_ts): a tested
+# variant from its test's start, every other FAV_* variant from Test A's,
+# these from theirs, every other variant from the window start.
+# G_decided_only's 180 s pad hold was chosen from 10/16's hours.
+HEADLINE_JUDGED_FROM = {"G_decided_only": "2026-10-17T00:00:00-04:00"}
+# TEMP_SHADOW.md "Pre-registered tests" was committed (eff9cd3) at this
+# time; the 10/17 audit (6e6ebdf, 14:43:57) had published FAV_night's
+# figures for the hours settled by then.
+PREREG_REGISTERED_AT = "2026-10-17T14:57:35-04:00"
+# What a test's numbers must come from (review of 338b4a5): every window sim
+# file of a tested variant must carry this SIM_VERSION, these swp / stress
+# identities (versions, tables, draws, seeds) and this fair model
+# (temp_shadow_sim.fair_model_identity: a hash of the fitted params, model/
+# model_params.json of 10/14 22:01), else the test is "INVALID (rule or
+# model changed)". SIM_VERSION 8 = 7's numbers plus the identity fields.
+# Changing any of these is an amendment to TEMP_SHADOW.md, not an edit.
+PREREG_PIN_MODEL = {
+    "sim_version": "8",
+    "swp": {"sweep_version": "1", "draws": 6, "rec_mode": "level", "channels": "abc",
+            "seed": "tmm-sweep-1", "hazard_id": "bfb9676a4e92a9d2",
+            "tails_id": "46e671fb82353b0b"},
+    "stress": {"stress_version": "1", "draws": 6, "seed": "tmm-sweep-1",
+               "fav_seed": "tmm-favhaz-1", "fav_hazard_id": "cbe48e9d9ea66069",
+               "take": "full", "hole": False},
+    "fair_model_id": "4f5fd78c360d8717",
+}
+# The tested variants' rules as registered: the overrides of eff9cd3 and the
+# full effective policy as of 338b4a5 (POLICY_VERSION 4 only added
+# fav_market_min_p = None, the gate off).
+_FAV_NIGHT_OVERRIDES = {"live": False, "decided": True, "q_pad": 0, "qual_pads": False,
+                        "near_decided_half": False, "fav_min_price_c": 50,
+                        "quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]}
+_FAV_NIGHT_POLICY = {
+    "back_ticks": 2, "decided": True, "event_wcl_cap": 1500.0, "fair_guard": True,
+    "fav_market_min_p": None, "fav_min_p": 0.97, "fav_min_price_c": 50, "guard_k": 1.0,
+    "guard_min_c": 1, "live": False, "live_stop_min": 3.0, "live_tau_full": 40.0,
+    "live_tau_min_frac": 0.3, "maker_fee_per_contract": 0.0, "near_decided_half": False,
+    "order_latency_s": 0.15, "pad_extra": 50, "pad_hold_open_s": 0.0, "pos_cap": 1500,
+    "program_only": True, "q_fav": 300, "q_live": 300, "q_pad": 0, "qual_pads": False,
+    "quote_hours_et": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7], "react_s": 0.5,
+    "skew": 0.0, "wcl_resting": False, "win_hi": 45, "win_lo": 20, "window_mode": "pull"}
+# TEMP_SHADOW.md "Pre-registered tests", implemented exactly as written: do
 # not re-tune; a changed rule needs a new pre-registered window.
 PREREG_TESTS = (
-    {"id": "A", "variant": "FAV_night", "why": "rule 3", "start": "2026-10-17",
-     "end": "2026-10-21", "criteria": ("total", "days", "cal"), "info": ("robust", "recent")},
+    {"id": "A", "variant": "FAV_night", "why": "rule 3",
+     # Test A's window = "days" ET days from "start" (ONE constant). As
+     # registered it starts 10/17 00:00 ET and so holds 26OCT1700-1714, which
+     # settled before the registration: the report labels them and shows the
+     # verdict without them too. The stricter window (Jack's call; then
+     # TEMP_SHADOW.md gets "Amendment 1") is this one line set to
+     # "2026-10-18T00:00:00-04:00".
+     "start": "2026-10-17T00:00:00-04:00",
+     "days": 5, "criteria": ("total", "days", "cal"), "info": ("robust", "recent"),
+     "overrides": _FAV_NIGHT_OVERRIDES, "policy": _FAV_NIGHT_POLICY, "model": PREREG_PIN_MODEL},
     {"id": "B", "variant": "FAV_night_agree",
      "why": "new rule, chosen from the 10/16 21:00 and 22:00 ET losses: judged ONLY on later "
-            "data", "start": "2026-10-18", "end": "2026-10-22",
-     "criteria": ("total", "days", "robust", "cal"), "info": ("recent",),
-     # "judged ONLY on later data": its rule was fitted on hours inside the
-     # report's cumulative window, so the headline never names it on them
-     "judged_from": "2026-10-18"},
+            "data",
+     "start": "2026-10-18T00:00:00-04:00",
+     "days": 5, "criteria": ("total", "days", "robust", "cal"), "info": ("recent",),
+     "overrides": dict(_FAV_NIGHT_OVERRIDES, fav_market_min_p=0.95),
+     "policy": dict(_FAV_NIGHT_POLICY, fav_market_min_p=0.95), "model": PREREG_PIN_MODEL},
 )
 PREREG_DAYS_POS = 4                  # of the 5 window days
 PILOT_RULES = ("1/3 size, night hours only, a $300 daily halt, an hourly live-vs-shadow "
@@ -215,6 +286,17 @@ PILOT_RULES = ("1/3 size, night hours only, a $300 daily halt, an hourly live-vs
                "band (rule 4); scale up only if the pilot earns at least 50% of the shadow's "
                "prediction (rule 5). A PASS only makes the variant eligible: it does not start "
                "trading (Jack alone flips dry -> live).")
+# The hourly live-vs-shadow reconciliation (rule 4) of an agreement-gated
+# variant also compares how often the gate lets a favorite join through.
+GATE_RECON_NOTE = ("Live reconciliation (rule 4) of the agreement gate: compare the share of the "
+                   "model's favorite seconds in which the gate passed -- live, the share of "
+                   "the executor's decision samples whose fav_market.ok is true (temp_mm_live "
+                   "decisions log); in the shadow, fav_gate gate_secs / model_secs per sim "
+                   "file. Live, the gate reads the external book after other makers react to "
+                   "our joins (on 26OCT1610 a better external bid appeared within 2 s after 36% "
+                   "of our favorite joins, against 11% after other makers' joins), which the "
+                   "recording never shows: the live share can differ either way, and a large "
+                   "gap means live would not trade the hours the shadow books.")
 RECENT_BOOT_N = 2000
 SWP_NOTE = ("swp = the sweep-aware fill model (temp_shadow_sweep; it reproduced live G's "
             "first hour, 26OCT1610, where opt / cons did not): cons fills, plus sweepers "
@@ -1541,29 +1623,67 @@ def _ops_rules(h: dict, win: Window, today: str, best: Optional[str], out: List[
 # --------------------------------------------------------------------------
 
 
-def decision_fill(src) -> str:
+def _ts(iso: str) -> float:
+    t = C.parse_iso(iso)
+    if t is None:
+        raise ValueError(f"not an ISO time: {iso!r}")
+    return t
+
+
+def _settle(event: str) -> float:
+    p = C.parse_event(str(event))
+    return p[1] if p else 0.0
+
+
+def _et_hm(ts: float) -> str:
+    """'10/17 14:57 ET'."""
+    d = C.et_dt(ts)
+    return f"{d.month}/{d.day} {d.strftime('%H:%M')} ET"
+
+
+def decision_fill(src=None) -> str:
     """The fill model the ranking, the pre-registered tests and the verdict
-    use: DECISION_FILL (stress) when the output has it, else the rules'
-    model (headline_fill: swp, else cons for older sim output)."""
-    keys = src.by_key if isinstance(src, Window) else (src or {})
-    if any(split_key(k)[1] == DECISION_FILL for k in keys):
-        return DECISION_FILL
-    return headline_fill(src)
+    use: always DECISION_FILL (stress). There is no fallback (review of
+    338b4a5: a swp headline when stress was missing): without stress results
+    the ranking is empty and the headline says "no variant passes (no stress
+    results)"."""
+    return DECISION_FILL
 
 
-def boot_total(vals: Sequence[float], n: int = BOOT_N, seed: int = BOOT_SEED
+def boot_total(vals: Sequence[float], n: int = BOOT_N, seed: int = BOOT_SEED,
+               block: int = BOOT_BLOCK
                ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Hour bootstrap of a total (the hours resampled with replacement, a
-    fixed seed so a report is reproducible): (5th percentile, 95th
-    percentile, P(total > 0)); (None, None, None) without hours. The
-    settlement outcomes -- a strike that fails at 98% once in dozens of
-    hours -- dominate this, not the Monte Carlo draws."""
+    """Moving-block bootstrap of a total over hours given in settle order:
+    ceil(k / block) blocks of `block` consecutive hours drawn with
+    replacement (the last one cut so a resample has k hours), a fixed seed
+    so a report is reproducible -> (5th percentile, 95th percentile, P(total
+    > 0)); (None, None, None) without hours. Blocks of 3 because losses
+    cluster in consecutive hours (one weather move fails the favorites of
+    2-3 events: 26OCT1621 / 1622; review of 338b4a5); block 1 is the plain
+    hour bootstrap. The settlement outcomes dominate this, not the Monte
+    Carlo draws."""
     v = [float(x) for x in vals]
     k = len(v)
     if k == 0:
         return None, None, None
+    L = max(1, min(int(block), k))
+    pre = [0.0]
+    for x in v:
+        pre.append(pre[-1] + x)
+    nb = -(-k // L)
+    last = k - (nb - 1) * L
     rng = random.Random(seed)
-    tots = sorted(sum(rng.choices(v, k=k)) for _ in range(n))
+    hi, hi_last = k - L, k - last
+    tots = []
+    for _ in range(n):
+        t = 0.0
+        for _b in range(nb - 1):
+            s = rng.randint(0, hi)
+            t += pre[s + L] - pre[s]
+        s = rng.randint(0, hi_last)
+        t += pre[s + last] - pre[s]
+        tots.append(t)
+    tots.sort()
     return (tots[int(0.05 * n)], tots[min(n - 1, int(0.95 * n))],
             sum(1 for t in tots if t > 0) / float(n))
 
@@ -1571,10 +1691,10 @@ def boot_total(vals: Sequence[float], n: int = BOOT_N, seed: int = BOOT_SEED
 def _hours(win: Window, key: str, days: Optional[Sequence[str]] = None
            ) -> List[Tuple[str, str, dict]]:
     """(event, day, result) for every window event-hour holding `key`
-    (optionally only those of `days`), in event order."""
+    (optionally only those of `days`), in settle order."""
     dd = set(days) if days is not None else None
-    return sorted((e, d, v) for e, (d, v, _ev) in win.by_key.get(key, {}).items()
-                  if dd is None or d in dd)
+    return sorted(((e, d, v) for e, (d, v, _ev) in win.by_key.get(key, {}).items()
+                   if dd is None or d in dd), key=lambda x: (_settle(x[0]), x[0]))
 
 
 def robust_total(nets: Sequence[float]) -> Optional[float]:
@@ -1584,37 +1704,57 @@ def robust_total(nets: Sequence[float]) -> Optional[float]:
     return sum(nets) - max(nets) - min(nets)
 
 
-def judged_from() -> Dict[str, str]:
-    """variant -> the first ET day it may be judged on: the pre-registered
-    variants whose rule was chosen from hours inside the window ("judged
-    ONLY on later data": FAV_night_agree, from 10/18)."""
-    return {t["variant"]: t["judged_from"] for t in PREREG_TESTS if t.get("judged_from")}
+def judged_from_ts(name: str) -> Optional[float]:
+    """The first settle time the headline may judge `name` on: it never
+    counts the hours a variant was chosen from (review of 338b4a5). A tested
+    variant from its test's start (FAV_night: Test A, FAV_night_agree: Test
+    B); FAV_only and any other FAV_* variant (FAV_night's size / threshold
+    variants) from Test A's start; a HEADLINE_JUDGED_FROM variant from its
+    entry (G_decided_only: 10/17, its 180 s pad hold was chosen 10/16);
+    every other variant from the window start (None)."""
+    starts = {t["variant"]: _ts(t["start"]) for t in PREREG_TESTS}
+    if name in starts:
+        return starts[name]
+    if name.startswith("FAV_"):
+        return starts.get(PREREG_TESTS[0]["variant"])
+    if name in HEADLINE_JUDGED_FROM:
+        return _ts(HEADLINE_JUDGED_FROM[name])
+    return None
 
 
 def rank_variants(win: Window, policy: Optional[Policy] = None,
                   fill: Optional[str] = None) -> List[dict]:
-    """Every variant with `fill` results (default decision_fill: stress) in
-    the cumulative window, ranked on the robust total = the total over its
-    event-hours without its best and its worst hour (the hours it rests
-    nothing count $0, as every hour of the window is one of its hours).
-    Beside it: the plain total, the hour-bootstrap 90% CI and P(total > 0),
-    the best / worst hour, "noise" (|best hour| + |worst hour| > |total|),
-    and the expected net at calibrated tails (variants that quote no live
-    strikes only: cal_ok). passes = robust > 0 and P(total > 0) >=
-    HEADLINE_P_MIN, and the variant is not in_sample: a variant pre-registered
-    to be judged ONLY on later data (judged_from) whose window hours include
-    days before that -- its rule was fitted on them (TEMP_SHADOW.md
-    "Pre-registered tests", Test B), so it stays in the table, flagged, and
-    its test decides it."""
+    """Every variant with stress results in the cumulative window, ranked on
+    its JUDGED hours only, those settling at or after judged_from_ts (the
+    earlier ones are in-sample: shown for information, never ranked): the
+    robust total = the total over those event-hours without the best and the
+    worst hour (hours it rests nothing count $0: every hour is one of its
+    hours). Beside it: the plain total, a 3-hour block bootstrap 90% CI and
+    P(total > 0), the best / worst hour, "noise" (|best hour| + |worst hour|
+    > |total|), the expected net at calibrated tails (variants that quote no
+    live strikes only: cal_ok), and the in-sample hours' count and total.
+    passes = robust > 0, P(total > 0) >= HEADLINE_P_MIN and judged hours on
+    at least HEADLINE_MIN_DAYS ET days ("thin" below that: no single-day
+    ranking). A variant without a judged hour yet comes after the ranked
+    ones ("judged" False)."""
     fill = fill or decision_fill(win)
-    jf = judged_from()
-    rows = []
+    rows, unjudged = [], []
     for name in win.names(fill):
         key = f"{name}|{fill}"
-        hrs = _hours(win, key)
-        nets = [_num(v.get("net")) for _e, _d, v in hrs]
-        if not nets:
+        allh = _hours(win, key)
+        jf = judged_from_ts(name)
+        ins = [h for h in allh if jf is not None and _settle(h[0]) < jf]
+        hrs = [h for h in allh if not (jf is not None and _settle(h[0]) < jf)]
+        base = {"name": name, "key": key, "fill": fill, "judged_from": jf,
+                "in_hours": len(ins),
+                "in_total": sum(_num(v.get("net")) for _e, _d, v in ins)}
+        if not hrs:
+            unjudged.append(dict(base, judged=False, hours=0, days=0, total=0.0, robust=None,
+                                 best=None, best_event=None, worst=None, worst_event=None,
+                                 ci_lo=None, ci_hi=None, p_pos=None, noise=False, cal=None,
+                                 thin=True, passes=False, rank=None))
             continue
+        nets = [_num(v.get("net")) for _e, _d, v in hrs]
         total = sum(nets)
         bi = max(range(len(nets)), key=lambda i: (nets[i], hrs[i][0]))
         wi = min(range(len(nets)), key=lambda i: (nets[i], hrs[i][0]))
@@ -1623,84 +1763,85 @@ def rank_variants(win: Window, policy: Optional[Policy] = None,
         cal = None
         if cal_ok(policy, name) and all(v.get("net_cal") is not None for _e, _d, v in hrs):
             cal = sum(_num(v.get("net_cal")) for _e, _d, v in hrs)
-        in_sample = name in jf and any(d < jf[name] for _e, d, _v in hrs)
-        rows.append({"name": name, "key": key, "fill": fill, "hours": len(nets),
-                     "in_sample": in_sample, "judged_from": jf.get(name),
-                     "days": len({d for _e, d, _v in hrs}), "total": total, "robust": robust,
-                     "best": nets[bi], "best_event": hrs[bi][0], "worst": nets[wi],
-                     "worst_event": hrs[wi][0], "ci_lo": lo, "ci_hi": hi, "p_pos": ppos,
-                     "noise": abs(nets[bi]) + abs(nets[wi]) > abs(total), "cal": cal,
-                     "passes": (not in_sample and robust is not None and robust > 0
-                                and ppos is not None and ppos >= HEADLINE_P_MIN)})
+        rows.append(dict(base, judged=True, hours=len(nets),
+                         days=len({d for _e, d, _v in hrs}), total=total, robust=robust,
+                         best=nets[bi], best_event=hrs[bi][0], worst=nets[wi],
+                         worst_event=hrs[wi][0], ci_lo=lo, ci_hi=hi, p_pos=ppos,
+                         noise=abs(nets[bi]) + abs(nets[wi]) > abs(total), cal=cal,
+                         thin=len({d for _e, d, _v in hrs}) < HEADLINE_MIN_DAYS,
+                         passes=(robust is not None and robust > 0 and ppos is not None
+                                 and ppos >= HEADLINE_P_MIN
+                                 and len({d for _e, d, _v in hrs}) >= HEADLINE_MIN_DAYS)))
     rows.sort(key=lambda r: (r["robust"] if r["robust"] is not None else -math.inf,
                              r["total"], r["name"]), reverse=True)
     for i, r in enumerate(rows):
         r["rank"] = i + 1
-    return rows
+    return rows + sorted(unjudged, key=lambda r: r["name"])
 
 
 def headline_pick(rows: Sequence[dict]) -> dict:
-    """{"top": the robust ranking's first eligible row, "pick": the first
-    eligible row that passes (robust > 0 and P(total > 0) >= HEADLINE_P_MIN)
-    or None, "pass": the top row passes, "in_sample": the rows the headline
-    may not name (a variant pre-registered to be judged ONLY on later data,
-    on a window holding the hours its rule was chosen from)}. The headline
-    names the top variant only when it passes; else "no variant passes" --
-    unless a lower-ranked one does, which is then named as such (the top's
-    robust total stays for information)."""
-    elig = [r for r in rows if not r.get("in_sample")]
+    """{"top": the first judged row, "pick": the first judged row that passes
+    (robust > 0 and P(total > 0) >= HEADLINE_P_MIN) or None, "pass": the top
+    passes, "in_sample": the rows with in-sample hours (shown for
+    information), "not_judged": the rows without a judged hour yet,
+    "no_stress": no stress result in the window}. The headline names the
+    top variant only when it passes; else "no variant passes" -- unless a
+    lower-ranked one does, which is then named as such."""
+    elig = [r for r in rows if r.get("judged")]
     top = elig[0] if elig else None
     pick = next((r for r in elig if r["passes"]), None)
     return {"top": top, "pick": pick, "pass": bool(top is not None and pick is top),
-            "fill": top["fill"] if top else (rows[0]["fill"] if rows else None),
-            "in_sample": [r for r in rows if r.get("in_sample")]}
+            "fill": DECISION_FILL, "no_stress": not rows,
+            "in_sample": [r for r in rows if r.get("in_hours")],
+            "not_judged": [r for r in rows if not r.get("judged")]}
 
 
 def headline_phrase(hl: dict, subject: bool = False) -> str:
-    """The ranking's one-line verdict (the subject's, or the headline's)."""
+    """The ranking's one-line verdict (the subject's, or the headline's);
+    the named variant's noise-dominated flag goes with it."""
     top, pick = hl.get("top"), hl.get("pick")
+    if hl.get("no_stress"):
+        return "no variant passes (no stress results)"
     if top is None:
-        if hl.get("in_sample"):
-            return ("no variant passes" if subject else "no variant passes (only variants "
-                    "judged on later data have results)")
-        return "no ranking (no results in the window)"
+        return ("no variant passes" if subject else "no variant passes (no variant has an "
+                "hour after its first judged hour yet)")
     f = hl.get("fill") or DECISION_FILL
 
     def rob(r):
         return money(r["robust"], 0) if r["robust"] is not None else "n/a"
+
+    def noise(r):
+        if not r["noise"]:
+            return ""
+        return (" [noise-dominated]" if subject else
+                "; noise-dominated (|best hour| + |worst hour| > |total|)")
     if hl.get("pass"):
-        return (f"top {top['name']} robust {f} {rob(top)} (P>0 {top['p_pos']:.2f})" if subject
-                else f"{top['name']} passes: robust {f} total {rob(top)}, P(total > 0) "
-                     f"{top['p_pos']:.2f}")
+        return (f"top {top['name']} robust {f} {rob(top)} (P>0 {top['p_pos']:.2f})" + noise(top)
+                if subject else
+                f"{top['name']} passes: robust {f} total {rob(top)} over {top['hours']} "
+                f"event-hours, P(total > 0) {top['p_pos']:.2f}" + noise(top))
     if pick is not None:
         return (f"top robust {top['name']} does not pass; {pick['name']} does (robust "
-                f"{rob(pick)}, P>0 {pick['p_pos']:.2f})")
+                f"{rob(pick)}, P>0 {pick['p_pos']:.2f})" + noise(pick))
+    thin = (f", {top['days']} judged day{'' if top['days'] == 1 else 's'}: the headline needs "
+            f"{HEADLINE_MIN_DAYS}" if top.get("thin") else "")
     return ("no variant passes" if subject else
             f"no variant passes (top robust {f} total, for information: {top['name']} "
-            f"{rob(top)}, P(total > 0) {top['p_pos']:.2f})")
+            f"{rob(top)}, P(total > 0) {top['p_pos']:.2f}{thin})")
 
 
 def in_sample_text(r: dict) -> str:
-    """Why an in-sample ranking row is not in the headline."""
-    rob = money(r["robust"]) if r.get("robust") is not None else "n/a"
-    return (f"{r['name']}: robust {r['fill']} total {rob} (total {money(r['total'])}, P(total > "
-            f"0) {r['p_pos']:.2f}) on the window's hours -- but its rule was chosen from hours "
-            f"inside them (the 10/16 21:00 and 22:00 ET losses): in-sample, not evidence. It is "
-            f"judged ONLY on ET days from {_mmdd(r['judged_from'])} (pre-registered Test B), "
-            f"never in this headline.")
+    """A variant's in-sample hours (before its first judged hour), for
+    information."""
+    if not r.get("in_hours"):
+        return ""
+    return (f"{r['name']}: {r['in_hours']} hours before {_et_hm(r['judged_from'])}, stress "
+            f"{money(r['in_total'])}")
 
 
 # --------------------------------------------------------------------------
 # The pre-registered tests (TEMP_SHADOW.md "Pre-registered tests")
 # --------------------------------------------------------------------------
-
-
-def _date_range(a: str, b: str) -> List[str]:
-    d, end, out = _dt.date.fromisoformat(a), _dt.date.fromisoformat(b), []
-    while d <= end:
-        out.append(d.isoformat())
-        d += _dt.timedelta(days=1)
-    return out
 
 
 def _mmdd(day: str) -> str:
@@ -1746,12 +1887,10 @@ def recent_rates(events: Sequence[dict]) -> dict:
                          rates[min(RECENT_BOOT_N - 1, int(0.95 * RECENT_BOOT_N))]),
                   "model": sum(g[3] for g in grp) / n if n else None,
                   "upset_strikes": sum(1 for g in grp if g[2] > 0)}
-    hs = sorted(hours)
+    hs = sorted(hours, key=_settle)
     first = last = None
     if hs:
-        p0, p1 = C.parse_event(hs[0]), C.parse_event(hs[-1])
-        first = C.et_day(p0[1]) if p0 else None
-        last = C.et_day(p1[1]) if p1 else None
+        first, last = C.et_day(_settle(hs[0])), C.et_day(_settle(hs[-1]))
     return {"buckets": out, "hours": len(hs), "first": first, "last": last}
 
 
@@ -1776,43 +1915,293 @@ def recent_cal(results: Sequence[dict], rates: dict) -> Optional[float]:
     return tot
 
 
-def prereg_test(spec: dict, win: Window, day: str, rates: Optional[dict] = None) -> dict:
-    """One pre-registered test on the report's data, exactly as written:
-    the window's per-day STRESS nets of spec's variant (the report's window
-    days up to the report day), each criterion met / not met, and the
-    status: "not started" before the window, "in progress" until the
-    window's last day is reported with every loaded event of its days
-    holding the variant's stress result, then "PASS" (every criterion met)
-    or "FAIL". A window day up to the report day without any event counts
-    $0 (not positive) and is flagged. Criteria: total (> 0), days (>=
-    PREREG_DAYS_POS of 5 positive), robust (the total without the
-    variant's best and worst hour > 0), cal (the calibrated-tails
-    expectation, the tail table's net_cal, > 0); the recent-regime figure
-    (recent_cal) is information."""
+def test_days(spec: dict) -> List[str]:
+    """The window's ET days: spec["days"] consecutive days from its start's."""
+    d0 = _dt.date.fromisoformat(C.et_day(_ts(spec["start"])))
+    return [(d0 + _dt.timedelta(days=i)).isoformat() for i in range(int(spec["days"]))]
+
+
+def test_bounds(spec: dict) -> Tuple[float, float]:
+    """(start, end) epoch: the events settling in [start, end) are the
+    window's hours; end = the end of its last ET day."""
+    return _ts(spec["start"]), C.et_day_bounds(test_days(spec)[-1])[1]
+
+
+def window_listing(t0: float, t1: float) -> dict:
+    """One pass over the meta stream around a window: {"seen": the events
+    the collector saw listed, "mk_rx": the rx of every markets row (sorted),
+    "poll_min": the minutes with a station-poll row} -- for whether Kalshi
+    listed an hour the window has no sim file for."""
+    seen, mk, pm = set(), [], set()
+    for rec in _iter_raw("meta", t0 - 4 * 3600, t1 + 3600):
+        rx = _opt_num(rec.get("rx"))
+        if rx is None:
+            continue
+        kind = rec.get("kind")
+        if kind == "markets":
+            ev = (rec.get("data") or {}).get("event_ticker")
+            if ev:
+                seen.add(ev)
+            mk.append(rx)
+        elif kind == "poll":
+            pm.add(int(rx // 60))
+    mk.sort()
+    return {"seen": seen, "mk_rx": mk, "poll_min": pm}
+
+
+def listed_by_kalshi(ev: str, lst: dict) -> Optional[bool]:
+    """Did Kalshi list the hour? True: it has a settled file, or the
+    collector saw its markets. False: the collector was recording across its
+    listing (station polls in >= 80% of the 70 minutes before the
+    settlement, and market discovery writing rows within [S - 3 h, S + 1 h],
+    when every listed hour gets its open / close rows) and never saw it --
+    not listed, so not expected. None: unknown (the collector was not
+    recording then)."""
+    if ev in lst["seen"] or os.path.exists(C.settled_file(ev)):
+        return True
+    cov, alive = _listing_coverage(ev, lst)
+    return False if (cov >= 0.8 and alive) else None
+
+
+def _listing_coverage(ev: str, lst: dict) -> Tuple[float, bool]:
+    """(the share of the 70 minutes before the settlement with a station
+    poll, whether market discovery wrote a row within [S - 3 h, S + 1 h])."""
+    S = _settle(ev)
+    mins = range(int((S - 4200) // 60), int(S // 60))
+    cov = sum(1 for m in mins if m in lst["poll_min"]) / max(1, len(mins))
+    i = bisect.bisect_left(lst["mk_rx"], S - 3 * 3600)
+    return cov, (i < len(lst["mk_rx"]) and lst["mk_rx"][i] <= S + 3600)
+
+
+def _missing_reason(ev: str, lst: dict, sim_summary: Optional[dict]) -> str:
+    """Why an expected hour has no sim file, from run_sim's summary and the
+    data root."""
+    ss = sim_summary or {}
+    ws = ss.get("window") or {}
+    errs = {}
+    for row in list(ss.get("errors") or []) + list(ws.get("errors") or []):
+        try:
+            errs[str(row[0])] = str(row[1])
+        except (TypeError, IndexError):
+            continue
+    pend = set(ss.get("pending") or []) | set(ws.get("pending") or [])
+    dfr = set(ss.get("deferred") or []) | set(ws.get("deferred") or [])
+    if ev in errs:
+        first = errs[ev].strip().splitlines()[0] if errs[ev].strip() else ""
+        return ("the sim raised" + (": " + first if first else ""))[:200]
+    if ev in pend:
+        return "unsettled when the sim ran (the settlement pull was incomplete)"
+    if ev in dfr:
+        return "its re-sim was deferred (the time budget)"
+    if os.path.exists(C.settled_file(ev)):
+        return "settled, but no sim file (re-sim the day)"
+    if ev in lst["seen"]:
+        return "listed, but no settled file (the settlement pull failed?)"
+    cov, _alive = _listing_coverage(ev, lst)
+    if cov < 0.8:
+        return "never seen: the collector was not recording then"
+    return ("never seen, with no market discovery rows around it: whether Kalshi listed it is "
+            "unknown")
+
+
+_ABSENT = "(absent)"
+
+
+def _pin_model(spec: dict) -> dict:
+    """The test's model pin (its "model" entry: PREREG_PIN_MODEL)."""
+    return spec.get("model") or PREREG_PIN_MODEL
+
+
+def _pin_want(spec: dict) -> Dict[str, Any]:
+    """The registered values a window file must carry, by field."""
+    want: Dict[str, Any] = {}
+    for k, x in spec["overrides"].items():
+        want[f"overrides.{k}"] = x
+    for k, x in spec["policy"].items():
+        want[f"policy.{k}"] = x
+    pm = _pin_model(spec)
+    want["sim_version"] = str(pm["sim_version"])
+    for blk in ("swp", "stress"):
+        for k, x in pm[blk].items():
+            want[f"{blk}.{k}"] = x
+    want["fair_model.id"] = pm["fair_model_id"]
+    return json.loads(json.dumps(want))          # tuples -> lists, as in the files
+
+
+def _file_fields(ev: dict, spec: dict, full: bool) -> Dict[str, Any]:
+    """The same fields from a sim file: the variant's overrides (policies)
+    and the swp / stress identity always; with `full` (a file of the pinned
+    SIM_VERSION, or of the current code's) also sim_version, the full
+    effective policy (policy_full) and the fair model's id. A missing block
+    reads as one "(absent)" field."""
+    v = spec["variant"]
+    got: Dict[str, Any] = {}
+    pols = ev.get("policies")
+    ov = pols.get(v) if isinstance(pols, dict) else None
+    if isinstance(ov, dict):
+        for k in set(spec["overrides"]) | set(ov):
+            got[f"overrides.{k}"] = ov.get(k, _ABSENT)
+    else:
+        got["overrides"] = _ABSENT
+    for blk in ("swp", "stress"):
+        b = ev.get(blk)
+        if not isinstance(b, dict):
+            got[blk] = _ABSENT
+            continue
+        for k in _pin_model(spec)[blk]:
+            got[f"{blk}.{k}"] = b.get(k, _ABSENT)
+    if full:
+        got["sim_version"] = (_ABSENT if ev.get("sim_version") is None
+                              else str(ev.get("sim_version")))
+        pfs = ev.get("policy_full")
+        pf = pfs.get(v) if isinstance(pfs, dict) else None
+        if isinstance(pf, dict):
+            for k in set(spec["policy"]) | set(pf):
+                got[f"policy.{k}"] = pf.get(k, _ABSENT)
+        else:
+            got["policy"] = _ABSENT
+        fm = ev.get("fair_model")
+        got["fair_model.id"] = fm.get("id", _ABSENT) if isinstance(fm, dict) else _ABSENT
+    return json.loads(json.dumps(got, default=str))
+
+
+def pin_check(spec: dict, files: Sequence[dict], full: Sequence[bool]) -> List[dict]:
+    """The window files that ran another rule or model than the registered
+    one: [{"field", "pinned", "found", "files": n, "first": event}] per
+    distinct difference (none: the pin holds). Pinned (PREREG_TESTS /
+    PREREG_PIN_MODEL): the variant's overrides and the swp / stress
+    identity on every file; on the files read in full (full[i]) also
+    sim_version, the full effective policy and the fair model."""
+    want = _pin_want(spec)
+    acc: Dict[tuple, dict] = {}
+    for ev, f in zip(files, full):
+        got = _file_fields(ev, spec, f)
+        for k in sorted(got):
+            if k in ("overrides", "policy", "swp", "stress"):      # a whole block missing
+                pinned = ("(the registered rule)" if k in ("overrides", "policy")
+                          else f"(the registered {k} identity)")
+            else:
+                pinned = want.get(k, _ABSENT)
+            if got[k] == pinned:
+                continue
+            d = acc.setdefault((k, json.dumps(got[k], sort_keys=True, default=str)),
+                               {"field": k, "pinned": pinned, "found": got[k], "files": 0,
+                                "first": str(ev.get("event"))})
+            d["files"] += 1
+    return sorted(acc.values(), key=lambda d: (d["field"], -d["files"]))
+
+
+_UNSET = object()
+
+
+def prereg_test(spec: dict, win: Window, day: str, rates: Optional[dict] = None,
+                now: Optional[float] = None, sim_summary: Optional[dict] = None,
+                rec_start: Optional[float] = None, listing: Optional[Callable] = None,
+                start_ts: Optional[float] = None, cur_version: Any = _UNSET) -> dict:
+    """One pre-registered test on the report's data, exactly as written
+    (TEMP_SHADOW.md "Pre-registered tests"; review of 338b4a5):
+    * window: spec["days"] ET days from spec["start"] (ONE constant); its
+      hours = the events settling in [start, end). start_ts (the "after
+      registration" view) moves the start inside the same days.
+    * expected hours: expected_events() per window day (one per ET hour,
+      due SETTLE_LAG_S after its settlement, inside the shadow); an hour
+      Kalshi never listed (listed_by_kalshi False) is not expected.
+    * a window file counts only if it ran the registered rule and model
+      (pin_check). A file of another SIM_VERSION than the pin and the
+      current code's (an older file awaiting its re-sim) is not a result:
+      its hour is missing, unless its rule or tables differ (INVALID).
+    * status: "not started" before its first day; "INVALID (rule or model
+      changed)" when any window file ran another rule or model (never PASS);
+      "in progress (n/5 days)" until the window's last hour is due and
+      every due hour is in; "INCOMPLETE" once it is over with expected hours
+      lacking a stress result (named, with why: never PASS); else PASS
+      (every criterion met) or FAIL.
+    * criteria: total (> 0), days (>= PREREG_DAYS_POS of the days positive),
+      robust (the total without the best and worst hour > 0), cal (the
+      stress net_cal sum > 0); the recent-regime figure is information.
+    The registered view also carries "known": its hours that settled before
+    PREREG_REGISTERED_AT (known at registration), and "alt": the same test
+    without them (start_ts = the registration) when there are any."""
+    now = C.utcnow() if now is None else now
+    if cur_version is _UNSET:
+        cur_version = current_sim_version()
     v = spec["variant"]
     key = f"{v}|{DECISION_FILL}"
-    wdays = _date_range(spec["start"], spec["end"])
-    rows, results, missing, no_events = [], [], [], []
+    reg0, end = test_bounds(spec)
+    start = reg0 if start_ts is None else max(reg0, float(start_ts))
+    wdays = test_days(spec)
+    until = shadow_until()
+    reg_at = _ts(PREREG_REGISTERED_AT)
+    pin_v = str(_pin_model(spec)["sim_version"])
+    cache: Dict[str, dict] = {}
+
+    def lst() -> dict:
+        if "x" not in cache:
+            cache["x"] = listing() if listing else window_listing(reg0, end)
+        return cache["x"]
+
+    def inwin(e: str) -> bool:
+        return start <= _settle(e) < end
+    rows, results, files, full, missing, not_listed, stale = [], [], [], [], [], [], []
+    later_n = 0
     for d in wdays:
         if d > day:
             rows.append({"day": d, "future": True})
             continue
-        evs = win.days_events.get(d, []) if d in win.days_events else []
-        have = [(ev, (ev.get("variants") or {}).get(key)) for ev in evs]
-        res = [r for _ev, r in have if isinstance(r, dict)]
-        miss = [str(ev.get("event")) for ev, r in have if not isinstance(r, dict)]
-        missing += miss
-        if not evs:
-            no_events.append(d)
-        results += res
-        rows.append({"day": d, "future": False, "events": len(res), "missing": len(miss),
-                     "net": sum(_num(r.get("net")) for r in res),
-                     "reward": sum(_num(r.get("reward")) for r in res),
-                     "trading": sum(_num(r.get("trading_pnl")) for r in res),
-                     "contracts": sum(_num(r.get("contracts")) for r in res),
-                     "loaded": len(evs), "partial": 0 < len(evs) < 24})
+        due, later = expected_events(d, now, until=until, rec_start=rec_start)
+        later_set = {e for e in later if inwin(e)}
+        evs = {str(ev.get("event")): ev for ev in (win.days_events.get(d) or [])
+               if inwin(str(ev.get("event")))}
+        res_d, miss_d, nl_d, late_d = [], [], [], 0
+        for e in sorted({x for x in due if inwin(x)} | later_set | set(evs), key=_settle):
+            ev = evs.get(e)
+            r = (ev.get("variants") or {}).get(key) if ev else None
+            if isinstance(r, dict):
+                fv = None if ev.get("sim_version") is None else str(ev.get("sim_version"))
+                if fv != pin_v and fv != cur_version:
+                    # an older file awaiting its re-sim: its rule and tables
+                    # are still checked, its numbers do not count
+                    files.append(ev)
+                    full.append(False)
+                    stale.append(e)
+                    miss_d.append((e, f"older sim file (SIM_VERSION {fv}; the tests read "
+                                      f"{pin_v}): re-sim the day"))
+                    continue
+                res_d.append((e, r))
+                files.append(ev)
+                full.append(True)
+                continue
+            if e in later_set:
+                late_d += 1                   # not due yet: the test is still running
+                continue
+            if ev is None:
+                if listed_by_kalshi(e, lst()) is False:
+                    nl_d.append(e)
+                    continue
+                miss_d.append((e, _missing_reason(e, lst(), sim_summary)))
+            elif ev.get("stress_error"):
+                miss_d.append((e, "stress failed: "
+                               + str(ev["stress_error"]).strip().splitlines()[0][:160]))
+            else:
+                miss_d.append((e, f"its sim file has no {DECISION_FILL} result for {v}"
+                               + (f" (SIM_VERSION {ev.get('sim_version')})"
+                                  if ev.get("sim_version") is not None else "")))
+        later_n += late_d
+        results += [r for _e, r in res_d]
+        missing += miss_d
+        not_listed += nl_d
+        known_d = [(e, _num(r.get("net"))) for e, r in res_d if _settle(e) < reg_at]
+        rows.append({"day": d, "future": False, "events": len(res_d),
+                     "expected": len(res_d) + len(miss_d) + late_d, "missing": len(miss_d),
+                     "not_listed": len(nl_d), "later": late_d,
+                     "net": sum(_num(r.get("net")) for _e, r in res_d),
+                     "reward": sum(_num(r.get("reward")) for _e, r in res_d),
+                     "trading": sum(_num(r.get("trading_pnl")) for _e, r in res_d),
+                     "known": len(known_d), "known_net": sum(n for _e, n in known_d),
+                     "hours": [(e, _num(r.get("net"))) for e, r in res_d]})
     done = [r for r in rows if not r["future"]]
-    nets = [_num(r.get("net")) for r in results]
+    hours = [(e, n) for r in done for e, n in r["hours"]]
+    nets = [n for _e, n in hours]
     total = sum(r["net"] for r in done)
     pos = sum(1 for r in done if r["net"] > 0)
     robust = robust_total(nets)
@@ -1831,47 +2220,187 @@ def prereg_test(spec: dict, win: Window, day: str, rates: Optional[dict] = None)
         "cal": {"label": "the calibrated-tails expectation > 0", "value": cal,
                 "met": cal is not None and cal > 0},
     }
-    complete = day >= spec["end"] and len(done) == len(wdays) and not missing
-    if day < spec["start"]:
-        status, text = "not started", f"starts {_mmdd(spec['start'])}"
-    elif not complete:
-        status, text = "in progress", f"in progress ({len(done)}/{len(wdays)} days)"
-        if day >= spec["end"] and missing:
-            text += f"; {len(missing)} event(s) without stress results (waiting for the re-sim)"
+    bad = pin_check(spec, files, full)
+    last_settle = max([s for _e, s in _day_tickers(wdays[-1])
+                       if s is not None and start <= s < end and s < until] or [start])
+    over = day >= wdays[-1] and last_settle + SETTLE_LAG_S <= now
+    if day < wdays[0]:
+        status, text = "not started", f"starts {_mmdd(wdays[0])}"
+    elif bad:
+        status, text = "INVALID", "INVALID (rule or model changed)"
+    elif not over or later_n:
+        status = "in progress"
+        text = (f"in progress ({len(done)}/{len(wdays)} days"
+                + (f"; {len(missing)} expected hour(s) without a {DECISION_FILL} result so far"
+                   if missing else "") + ")")
+    elif missing:
+        status = "INCOMPLETE"
+        text = (f"INCOMPLETE ({len(missing)} expected hour(s) without a {DECISION_FILL} "
+                "result)")
     else:
         ok = all(crit[c]["met"] for c in spec["criteria"])
         status = text = "PASS" if ok else "FAIL"
-    return dict(spec, key=key, rows=rows, status=status, text=text, total=total,
-                pos_days=pos, days_done=len(done), n_days=len(wdays), robust=robust, cal=cal,
-                recent=rec, crit=crit, hours=len(nets), missing=missing,
-                no_events=no_events,
-                best=max(nets) if nets else None, worst=min(nets) if nets else None)
+    out = dict(spec, key=key, rows=rows, status=status, text=text, total=total,
+               pos_days=pos, days_done=len(done), n_days=len(wdays), robust=robust, cal=cal,
+               recent=rec, crit=crit, hours=len(nets), hour_nets=hours, missing=missing,
+               not_listed=not_listed, stale=stale, pin_diffs=bad, files=len(files),
+               first_day=wdays[0], last_day=wdays[-1], days_list=wdays, start_ts=start,
+               end_ts=end, over=over, best=max(nets) if nets else None,
+               worst=min(nets) if nets else None,
+               known=[(e, n) for e, n in hours if _settle(e) < reg_at],
+               known_n=sum(1 for d in wdays for _e, st in _day_tickers(d)
+                           if st is not None and start <= st < min(reg_at, end)),
+               alt=None,
+               fav_gate=None, frozen=None, frozen_other=None, frozen_diffs=[])
+    gates = [(ev.get("fav_gate") or {}).get(v) for ev, f in zip(files, full) if f]
+    gates = [g for g in gates if isinstance(g, dict)]
+    if gates:
+        out["fav_gate"] = {"model_secs": sum(int(_num(g.get("model_secs"))) for g in gates),
+                           "gate_secs": sum(int(_num(g.get("gate_secs"))) for g in gates),
+                           "files": len(gates)}
+    if start_ts is None and start < reg_at and day >= wdays[0]:
+        # the hours that settled before the registration commit were known
+        # when the test was written: the same test without them, beside it
+        out["alt"] = prereg_test(spec, win, day, rates, now, sim_summary, rec_start,
+                                 listing=lst, start_ts=reg_at, cur_version=cur_version)
+    return out
 
 
-def prereg_verdict(tests: Sequence[dict]) -> str:
-    """'pilot eligible: <variant>' only when a test PASSes; else 'in
-    progress' while one has not finished; else 'NO-GO (no variant passes
-    the pre-registered tests)'."""
-    passed = [t["variant"] for t in tests if t["status"] == "PASS"]
+def prereg_verdict(tests: Sequence[dict], alt: bool = False) -> str:
+    """'pilot eligible: <variant>' only when a test PASSes; 'NO-GO (no
+    variant passes the pre-registered tests)' when every test FAILed; else
+    'in progress' while a test runs, or 'undecided' -- with the INCOMPLETE /
+    INVALID tests named. alt: each test's "after registration" view where it
+    has one (Test A as registered)."""
+    sts = [(t.get("alt") or t) if alt else t for t in tests]
+    passed = [t["variant"] for t, s in zip(tests, sts) if s["status"] == "PASS"]
     if passed:
         return "pilot eligible: " + ", ".join(passed)
-    if any(t["status"] in ("in progress", "not started") for t in tests):
-        return "in progress"
-    return "NO-GO (no variant passes the pre-registered tests)"
+    if sts and all(s["status"] == "FAIL" for s in sts):
+        return "NO-GO (no variant passes the pre-registered tests)"
+    odd = [f"Test {t['id']} {s['status']}" for t, s in zip(tests, sts)
+           if s["status"] in ("INCOMPLETE", "INVALID")]
+    running = any(s["status"] in ("in progress", "not started") for s in sts)
+    return ("in progress" if running else "undecided") + (f" ({'; '.join(odd)})" if odd else "")
 
 
 def test_subject(t: dict) -> str:
+    """A test's part of the email subject (with Test A's "after
+    registration" figure while the registered window holds known hours)."""
+    a = t.get("alt")
+    aft = ""
+    if a:
+        st = a["status"] if a["status"] in ("PASS", "FAIL", "INVALID", "INCOMPLETE") else ""
+        aft = f"; after registration {st + ' ' if st else ''}{money(a['total'], 0)}"
     if t["status"] == "not started":
         return f"Test {t['id']} {t['text']}"
+    if t["status"] == "INVALID":
+        return f"Test {t['id']} INVALID (rule or model changed)"
+    nm = len(t.get("missing") or [])
+    hm = f"{nm} hour{'' if nm == 1 else 's'} missing"
+    if t["status"] == "INCOMPLETE":
+        return f"Test {t['id']} INCOMPLETE ({hm}; stress {money(t['total'], 0)}{aft})"
     if t["status"] == "in progress":
-        return (f"Test {t['id']} in progress {t['days_done']}/{t['n_days']} "
-                f"(stress {money(t['total'], 0)})")
-    return f"Test {t['id']} {t['status']} (stress {money(t['total'], 0)})"
+        return (f"Test {t['id']} in progress {t['days_done']}/{t['n_days']} (stress "
+                f"{money(t['total'], 0)}{aft}" + (f"; {hm}" if nm else "") + ")")
+    return (f"Test {t['id']} {t['status']} (stress {money(t['total'], 0)}{aft})"
+            + (" [frozen verdict; a recompute differs]" if t.get("frozen_diffs") else ""))
+
+
+# --------------------------------------------------------------------------
+# Frozen verdicts (<data root>/prereg/<test>.json)
+# --------------------------------------------------------------------------
+
+
+def test_definition(spec: dict) -> dict:
+    """What a frozen verdict was computed under (a frozen file of another
+    definition is never used): the window, the criteria, the registration
+    time and the pins."""
+    return json.loads(json.dumps({
+        "id": spec["id"], "variant": spec["variant"], "start": spec["start"],
+        "days": spec["days"], "criteria": list(spec["criteria"]),
+        "registered_at": PREREG_REGISTERED_AT, "overrides": spec["overrides"],
+        "policy": spec["policy"], "model": _pin_model(spec)}, default=str))
+
+
+def frozen_path(tid: str) -> str:
+    return os.path.join(C.DATA_ROOT, "prereg", f"{tid}.json")
+
+
+def _verdict_summary(t: dict) -> dict:
+    def r4(x):
+        return None if x is None else round(float(x), 4)
+    return {"status": t["status"], "total": r4(t["total"]), "pos_days": t["pos_days"],
+            "robust": r4(t["robust"]), "cal": r4(t["cal"]), "recent": r4(t.get("recent")),
+            "days": {r["day"]: r4(r["net"]) for r in t["rows"] if not r["future"]},
+            "hours": [[e, r4(n)] for e, n in t["hour_nets"]],
+            "not_listed": list(t.get("not_listed") or []), "files": t.get("files")}
+
+
+def freeze_doc(t: dict, day: str, now: float) -> dict:
+    return {"definition": test_definition(t), "frozen_at": C.iso(now), "report_day": day,
+            "verdict": _verdict_summary(t),
+            "after_registration": _verdict_summary(t["alt"]) if t.get("alt") else None}
+
+
+_CMP_KEYS = ("status", "total", "pos_days", "robust", "cal", "days", "hours")
+
+
+def apply_frozen(t: dict, day: str, now: float, freeze: bool = False) -> None:
+    """A completed test's verdict is frozen once: freeze=True (the report's
+    main run) writes <data root>/prereg/<test>.json the first time the window
+    completes with PASS or FAIL (Test A: both views). Later runs show the
+    frozen verdict and name what a recompute changes ("frozen_diffs";
+    "recomputed" holds the recompute). A frozen file of another definition
+    is named ("frozen_other") and not used. A report for a day before the
+    window's last day (a re-run of an older report) shows the computation
+    as of that day, never the frozen file."""
+    if day < t["last_day"]:
+        return
+    path = frozen_path(t["id"])
+    doc = C.read_json(path) if os.path.exists(path) else None
+    if isinstance(doc, dict):
+        if doc.get("definition") != test_definition(t):
+            t["frozen_other"] = {"path": path, "frozen_at": doc.get("frozen_at"),
+                                 "status": (doc.get("verdict") or {}).get("status")}
+            return
+        t["frozen"] = {"path": path, "frozen_at": doc.get("frozen_at"),
+                       "report_day": doc.get("report_day")}
+        views = [(t, doc.get("verdict") or {})]
+        if t.get("alt") and isinstance(doc.get("after_registration"), dict):
+            views.append((t["alt"], doc["after_registration"]))
+        for view, was in views:
+            now_v = _verdict_summary(view)
+            view["recomputed"] = {"status": view["status"], "text": view["text"],
+                                  "total": view["total"]}
+            view["frozen_diffs"] = [k for k in _CMP_KEYS if was.get(k) != now_v.get(k)]
+            if was.get("status"):
+                view["status"] = was["status"]
+                view["total"] = _num(was.get("total"))
+                view["text"] = f"{was['status']} (frozen {str(doc.get('frozen_at') or '?')[:10]})"
+        t["frozen_diffs"] = sorted(set(t["frozen_diffs"])
+                                   | set((t.get("alt") or {}).get("frozen_diffs") or []))
+        return
+    if freeze and t["status"] in ("PASS", "FAIL") and (
+            not t.get("alt") or t["alt"]["status"] in ("PASS", "FAIL")):
+        C.write_json_atomic(path, freeze_doc(t, day, now))
+        t["frozen"] = {"path": path, "frozen_at": C.iso(now), "report_day": day, "new": True}
 
 
 # --------------------------------------------------------------------------
 # Week summary (day 7 on): the adopted go-live rules, not GO / NO-GO bars
 # --------------------------------------------------------------------------
+
+
+def pilot_policy(params: dict) -> dict:
+    """The rule-4 pilot's policy: the tested variant at 1/3 size (q_fav,
+    q_pad and q_live / 3, whole contracts; caps unchanged)."""
+    out = dict(params)
+    for k in ("q_fav", "q_pad", "q_live"):
+        x = _opt_num(out.get(k))
+        if x:
+            out[k] = int(round(x / 3.0))
+    return out
 
 
 def week_summary(win: Window, policy: Policy, model: dict,
@@ -1881,32 +2410,36 @@ def week_summary(win: Window, policy: Policy, model: dict,
     """The week verdict from the adopted go-live rules (Jack 2026-10-17,
     "Yes. And Assume rewards are paid"): the pre-registered tests decide --
     "pilot eligible: <variant>" only when a test PASSes (then the rule-4
-    pilot config), "NO-GO (no variant passes the pre-registered tests)"
-    when every test has failed, else "in progress". The old GO / NO-GO /
-    EXTEND thresholds on the best variant's realized net are gone."""
+    pilot config at 1/3 size: pilot_config), "NO-GO (no variant passes the
+    pre-registered tests)" when every test has failed, else "in progress" /
+    "undecided". Test A's "after registration" view is beside it. The old GO
+    / NO-GO / EXTEND thresholds on the best variant's realized net are
+    gone."""
     tests = list(tests or [])
     verdict = prereg_verdict(tests)
+    alt_v = prereg_verdict(tests, alt=True) if any(t.get("alt") for t in tests) else None
     eligible = [t["variant"] for t in tests if t["status"] == "PASS"]
-    reason = "; ".join(f"Test {t['id']} ({t['variant']}, {_mmdd(t['start'])}-"
-                       f"{_mmdd(t['end'])}): {t['text']}, stress {money(t['total'])}"
+    reason = "; ".join(f"Test {t['id']} ({t['variant']}, {_mmdd(t['first_day'])}-"
+                       f"{_mmdd(t['last_day'])}): {t['text']}, stress {money(t['total'])}"
+                       + (f" (after registration: {t['alt']['text']}, "
+                          f"{money(t['alt']['total'])})" if t.get("alt") else "")
                        for t in tests) or "no pre-registered test"
     best = eligible[0] if eligible else None
     focus = best or next((t["variant"] for t in tests), None)
     risks = []
     if focus:
-        fill = decision_fill(win)
         parts = []
-        for f in (fill,) + tuple(x for x in ("swp", "cons", "opt") if x != fill):
+        for f in (DECISION_FILL, "swp", "cons", "opt"):
             k = f"{focus}|{f}"
             if k in win.agg:
                 parts.append(f"{f} {money(win.total(k))}")
         if parts:
             risks.append(f"Fill model ({focus}, the cumulative window): " + ", ".join(parts)
                          + ". stress adds level-clears at every price and hidden favorite "
-                           "takers; on the live hour 26OCT1610 others stepped ahead of our "
-                           "favorite joins three times as often as of other makers' (the "
-                           "10/17 audit), which no fill model replays: live favorite joins "
-                           "would do worse than the shadow.")
+                           "takers; on the live hour 26OCT1610 a better external bid appeared "
+                           "within 2 s after 36% of our favorite joins (11% after other "
+                           "makers'), which no fill model replays: live favorite joins would "
+                           "do worse than the shadow.")
         tt = [t for t in tests if t["variant"] == focus]
         if tt and tt[0].get("cal") is not None:
             risks.append(f"Tails ({focus}, its test window): the table-based expectation "
@@ -1930,10 +2463,17 @@ def week_summary(win: Window, policy: Policy, model: dict,
     if today_health and (today_health.get("ws") or {}).get("uptime") is not None:
         risks.append(f"Ops (report day): ws uptime {pct(today_health['ws']['uptime'])}, "
                      f"{(today_health.get('poll') or {}).get('n429', 0)} HTTP 429s.")
-    return {"verdict": verdict, "eligible": eligible, "best": best, "reason": reason,
-            "tests": tests, "pilot": PILOT_RULES if eligible else None,
-            "config": policy.params(best) if best else {},
-            "overrides": dict(policy.variants.get(best) or {}) if best else {},
+    # the pilot runs the rule that passed: the registered policy of the test
+    # (the current grid's only for a variant no test registered)
+    spec = next((t for t in tests if t["variant"] == best), None) if best else None
+    cfg = (dict(spec["policy"]) if spec and spec.get("policy") else
+           policy.params(best) if best else {})
+    ov = (dict(spec["overrides"]) if spec and spec.get("overrides") else
+          dict(policy.variants.get(best) or {}) if best else {})
+    return {"verdict": verdict, "verdict_after_registration": alt_v, "eligible": eligible,
+            "best": best, "reason": reason, "tests": tests,
+            "pilot": PILOT_RULES if eligible else None, "config": cfg,
+            "pilot_config": pilot_policy(cfg) if cfg else {}, "overrides": ov,
             "policy_err": policy.err, "risks": risks}
 
 
@@ -2309,7 +2849,7 @@ def expected_events(day: str, now: float, until: Optional[float] = None,
         if s is not None and ((until is not None and s >= until)
                               or (rec_start is not None and s <= rec_start)):
             continue
-        (due if s is not None and s + 7200 <= now else later).append(ev)
+        (due if s is not None and s + SETTLE_LAG_S <= now else later).append(ev)
     return due, later
 
 
@@ -2711,7 +3251,12 @@ def stress_text(ctx: dict) -> str:
 
 def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = False,
                   policy: Optional[Policy] = None, with_health: bool = True,
-                  now: Optional[float] = None, sim_summary: Optional[dict] = None) -> dict:
+                  now: Optional[float] = None, sim_summary: Optional[dict] = None,
+                  freeze: bool = False) -> dict:
+    """Everything the report renders. freeze=True (main): a pre-registered
+    test whose window completes with PASS / FAIL is frozen to <data root>/
+    prereg/<test>.json (apply_frozen); later reports for the window's last
+    day or after always show a frozen verdict."""
     now = C.utcnow() if now is None else now
     days = window_days(day)
     # events that closed before the recording began are outside the shadow
@@ -2752,7 +3297,7 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
            "suggestions": sugg, "notes": notes, "sim_summary": sim_summary or {},
            "day0_events": 0}
     # the rules' fill model (swp, else cons on older output) and the
-    # decision model (stress, else the rules' model)
+    # decision model (always stress: no fallback to the rules' model)
     src = win if win.by_key else agg
     ctx["rules_fill"] = rfill = headline_fill(src)
     ctx["fill"] = fill = decision_fill(src)
@@ -2767,8 +3312,8 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
                        or [None])[0])
     ctx["swp_missing"] = (swp_missing(days_events, day, sim_version)
                           if rfill == "swp" else None)
-    ctx["stress_missing"] = (stress_missing(days_events, day, sim_version)
-                             if fill == DECISION_FILL else None)
+    # always: the ranking and the tests are on stress, whatever the window has
+    ctx["stress_missing"] = stress_missing(days_events, day, sim_version)
     ctx["swp_tables"] = swp_tables(days_events)
     ctx["swp_current"] = current_swp_tables()
     ctx["stress_current"] = current_stress_tables()
@@ -2780,8 +3325,17 @@ def build_context(day: str, sim_error: Optional[str] = None, sim_ran: bool = Fal
     # the recent regime: favorite-bid hits over the whole recorded period
     # (day 0 .. the report day) -> the tests' second calibrated-tails figure
     ctx["recent"] = recent_rates(d0_events + win.all_events)
-    ctx["tests"] = [prereg_test(s, win, day, ctx["recent"]) for s in PREREG_TESTS]
+    ctx["tests"] = []
+    for spec in PREREG_TESTS:
+        t = prereg_test(spec, win, day, ctx["recent"], now=now, sim_summary=sim_summary,
+                        rec_start=rec_start, cur_version=sim_version)
+        apply_frozen(t, day, now, freeze=freeze)
+        ctx["tests"].append(t)
     ctx["prereg_verdict"] = prereg_verdict(ctx["tests"])
+    # Test A as registered holds hours that settled before the registration:
+    # the verdict without them, beside it (Jack decides which window counts)
+    ctx["prereg_verdict_alt"] = (prereg_verdict(ctx["tests"], alt=True)
+                                 if any(t.get("alt") for t in ctx["tests"]) else None)
     ctx["week"] = (week_summary(win, policy, agg_model(win.all_events), health,
                                 ctx["tests"], ctx["rank"])
                    if day_number(day) >= WEEK_DAYS else None)
@@ -3247,47 +3801,249 @@ def _ci_text(r: dict) -> str:
     return f"{money(r['ci_lo'], 0)} .. {money(r['ci_hi'], 0)}"
 
 
+def _reg_label() -> str:
+    """The registration time as the report prints it."""
+    return C.et_dt(_ts(PREREG_REGISTERED_AT)).strftime("%Y-%m-%d %H:%M:%S") + " ET (eff9cd3)"
+
+
+def _judged_text(r: dict) -> str:
+    return _et_hm(r["judged_from"]) if r.get("judged_from") is not None else "window start"
+
+
+def judged_rule_text() -> str:
+    """Which hours the headline judges each variant on, in words."""
+    a = PREREG_TESTS[0]
+    parts = [f"{a['variant']} and the other FAV_* variants from Test {a['id']}'s start "
+             f"({_et_hm(_ts(a['start']))})"]
+    for t in PREREG_TESTS[1:]:
+        parts.append(f"{t['variant']} from Test {t['id']}'s ({_et_hm(_ts(t['start']))})")
+    for n, s in sorted(HEADLINE_JUDGED_FROM.items()):
+        parts.append(f"{n} from {_et_hm(_ts(s))}")
+    return ", ".join(parts) + ", every other variant from the window start"
+
+
+def _crit_value(t: dict, c: str) -> str:
+    """A criterion's value in one view of a test ("so far" until it is
+    decided)."""
+    cr = t["crit"][c]
+    val = cr["value"]
+    fin = t["status"] in ("PASS", "FAIL")
+    if c == "days":
+        n = t["n_days"] if fin else t["days_done"]
+        s = f"{val} of {n} day{'' if n == 1 else 's'}" + ("" if fin else " so far")
+        if not fin and not cr["met"]:
+            s += "; still possible" if cr.get("possible") else "; no longer possible"
+        return s
+    return (money(val) if val is not None else "n/a") + ("" if fin else " so far")
+
+
+def _met_html(ok: bool) -> str:
+    return f'<b style="color:{POS if ok else NEG};">{"met" if ok else "not met"}</b>'
+
+
+def _test_status_html(label: str, t: dict) -> str:
+    sc = {"PASS": POS, "FAIL": NEG}.get(t["status"], "#9a6700")
+    return (f'<p style="margin:2px 0 4px 0;">{esc(label)}: <b style="color:{sc};">'
+            f'{esc(t["text"])}</b></p>')
+
+
+def _frozen_text(t: dict) -> str:
+    """The frozen-verdict line of a test ('' when nothing is frozen)."""
+    out = []
+    fz = t.get("frozen")
+    if fz and fz.get("new"):
+        out.append(f"Verdict frozen now ({fz['path']}, report day {fz['report_day']}): later "
+                   "reports show it as frozen.")
+    elif fz:
+        rc = t.get("recomputed") or {}
+        out.append(f"Frozen verdict ({fz.get('frozen_at')}, report day {fz.get('report_day')}): "
+                   + ("a recompute today matches it." if not t.get("frozen_diffs") else
+                      f"A RECOMPUTE TODAY DIFFERS in {', '.join(t['frozen_diffs'])} (now: "
+                      f"{rc.get('text')}, stress {money(rc.get('total'))}); the frozen verdict "
+                      "stands -- find out what changed a window file."))
+    fo = t.get("frozen_other")
+    if fo:
+        out.append(f"A frozen verdict of another test definition is on disk ({fo['path']}, "
+                   f"{fo.get('frozen_at')}, {fo.get('status')}): not used.")
+    return " ".join(out)
+
+
+def _pin_table(t: dict) -> str:
+    rows = [[d["field"], _fmt_val(d["pinned"]), _fmt_val(d["found"]), d["files"], d["first"]]
+            for d in t["pin_diffs"][:24]]
+    return (table(["field", "registered", "found", "window files", "first"], rows,
+                  right=[False, False, False, True, False])
+            + note(f"{len(t['pin_diffs'])} difference(s) between the registered rule / model "
+                   "(PREREG_TESTS, PREREG_PIN_MODEL) and the window's sim files: the test is "
+                   "INVALID and never passes. Restore the registered rule and model and re-sim "
+                   "the window, or pre-register a new window (TEMP_SHADOW.md: a changed rule "
+                   "needs one)."))
+
+
+def _prereg_test_html(t: dict) -> str:
+    a = t.get("alt")
+    out = [h3(f"Test {t['id']} -- {t['variant']} ({t['why']}): ET days {t['first_day']} .. "
+              f"{t['last_day']} (from {_et_hm(_ts(t['start']))})")]
+    out.append(_test_status_html("As registered" if a else "Status", t))
+    if a:
+        out.append(_test_status_html(
+            f"Excluding the {t['known_n']} hours known at registration (settled before "
+            f"{_reg_label()})", a))
+    ft = _frozen_text(t)
+    if ft:
+        out.append(note(ft))
+    if t["status"] == "not started":
+        out.append('<ul style="padding-left:20px;margin:4px 0;">'
+                   + "".join(f"<li>{esc(t['crit'][c]['label'])}</li>" for c in t["criteria"])
+                   + "</ul>")
+        out.append(note(f"PASS iff all of the above over ET days {t['first_day']} .. "
+                        f"{t['last_day']}; nothing is judged before its window starts."))
+        return "".join(out)
+    if t["pin_diffs"]:
+        out.append(_pin_table(t))
+    drows = []
+    for r in t["rows"]:
+        ar = next((x for x in a["rows"] if x["day"] == r["day"]), None) if a else None
+        if r["future"]:
+            drows.append([r["day"], "-", "-", "-", "-", "not yet"] + (["", "-"] if a else []))
+            continue
+        flag = []
+        if r["missing"]:
+            flag.append(f"{r['missing']} expected hour(s) without stress")
+        if r["later"]:
+            flag.append(f"{r['later']} not due yet")
+        if r["not_listed"]:
+            flag.append(f"{r['not_listed']} not listed by Kalshi")
+        row = [r["day"], f"{r['events']} / {r['expected']}", M(r["reward"]), M(r["trading"]),
+               M(r["net"]), ("yes" if r["net"] > 0 else "no")
+               + (f" ({'; '.join(flag)})" if flag else "")]
+        if a:
+            row += [R(f"{r['known']} hours, {m_html(r['known_net'])}") if r["known"] else "",
+                    M(ar["net"]) if ar and not ar["future"] else "-"]
+        drows.append(row)
+    head = ["ET day", "hours in / expected", "reward", "trading", "stress net", "net > 0"]
+    if a:
+        head += ["known at registration", "net after registration"]
+    out.append(table(head, drows, right=[False, True, True, True, True, False]
+                     + ([True, True] if a else [])))
+    if t["known"]:
+        out.append(note(f"Known at registration: these {len(t['known'])} hours settled before "
+                        f"{_reg_label()}, when the tests were committed (the 10/17 audit, "
+                        f"6e6ebdf, had published {t['variant']}'s figures for them). They are in "
+                        "the window as registered; the second status and the last column leave "
+                        "them out (Jack decides which window counts): "
+                        + ", ".join(f"{e.split('-', 1)[-1]} {money(n)}" for e, n in t["known"])
+                        + "."))
+    if t["missing"]:
+        out.append(table(["expected hour without a stress result", "why"],
+                         [[e, w] for e, w in t["missing"][:30]], right=[False, False])
+                   + (note(f"... and {len(t['missing']) - 30} more.")
+                      if len(t["missing"]) > 30 else ""))
+    if t["not_listed"]:
+        out.append(note("Not listed by Kalshi (the collector was recording and never saw "
+                        "them: not expected): " + ", ".join(t["not_listed"]) + "."))
+    crow = []
+    for c in t["criteria"]:
+        row = [t["crit"][c]["label"],
+               R(f"{esc(_crit_value(t, c))} -- {_met_html(t['crit'][c]['met'])}")]
+        if a:
+            row.append(R(f"{esc(_crit_value(a, c))} -- {_met_html(a['crit'][c]['met'])}"))
+        crow.append(row)
+    fin = "" if t["status"] in ("PASS", "FAIL") else " so far"
+    if "robust" in t.get("info", ()):
+        row = ["for information: the total excluding the best and worst hour",
+               money(t["robust"]) + fin if t["robust"] is not None else "n/a"]
+        if a:
+            row.append(money(a["robust"]) + fin if a["robust"] is not None else "n/a")
+        crow.append(row)
+    if "recent" in t.get("info", ()):
+        def rec(x):
+            return (f"{money(x['recent']) if x.get('recent') is not None else 'n/a'}{fin} (table-"
+                    f"based {money(x['cal']) if x.get('cal') is not None else 'n/a'})")
+        row = ["for information: the calibrated-tails expectation at the RECENT REGIME (the "
+               "favorite's upset rate after a favorite-bid hit, over the recorded period)",
+               rec(t)]
+        if a:
+            row.append(rec(a))
+        crow.append(row)
+    out.append(table(["criterion", "as registered" if a else "value"]
+                     + (["excluding known hours"] if a else []), crow,
+                     right=[False, False] + ([False] if a else [])))
+    out.append(note(f"{t['hours']} event-hours of {t['variant']} with stress results in the "
+                    "window so far (it rests nothing outside its settle hours 20:00-07:00 ET: "
+                    "those hours count $0). PASS iff every criterion is met once the window's "
+                    "last hour is due (its settlement + 2 h) and every expected hour has a "
+                    "stress result; an expected hour without one makes the test INCOMPLETE, a "
+                    "window file run under another rule or model makes it INVALID (rule or "
+                    "model changed): neither ever passes. Best / worst hour so far: "
+                    f"{money(t['best']) if t.get('best') is not None else 'n/a'} / "
+                    f"{money(t['worst']) if t.get('worst') is not None else 'n/a'}."))
+    g = t.get("fav_gate")
+    if g:
+        share = g["gate_secs"] / g["model_secs"] if g["model_secs"] else None
+        out.append(note(f"Agreement gate in the shadow: it let a favorite join through in "
+                        f"{pct(share)} of the {g['model_secs']:,} strike-seconds where the "
+                        f"model alone would join ({g['files']} window files). "
+                        + GATE_RECON_NOTE))
+    return "".join(out)
+
+
 def _ranking_html(ctx: dict) -> str:
-    """The headline ranking table: robust total first."""
+    """The headline ranking table: robust total first, each variant on its
+    judged hours (its in-sample hours beside it, never ranked)."""
     rows = ctx.get("rank") or []
     if not rows:
-        return note("No results to rank in the window yet.")
+        return note("No stress results to rank in the window yet.")
     fill = rows[0]["fill"]
     pol_ = ctx.get("policy")
     show_cal = any(r.get("cal") is not None for r in rows)
-    head = ["#", "variant", f"robust {fill} total", "total", "90% CI (hours)", "P(total > 0)",
-            "best hour", "worst hour", "noise-dominated", "hours"]
+    show_in = any(r.get("in_hours") for r in rows)
+    head = ["#", "variant", "judged from", f"robust {fill} total", "total",
+            "90% CI (3-h blocks)", "P(total > 0)", "best hour", "worst hour", "noise-dominated",
+            "hours"]
+    head += ["in-sample hours (not ranked)"] if show_in else []
     head += ["expected (cal. tails)"] if show_cal else []
     out_rows = []
     for r in rows:
         name = esc(r["name"])
-        if r.get("in_sample"):
-            name += (f' <span style="color:{MUTED};">(in-sample: judged only from '
-                     f'{esc(_mmdd(r["judged_from"]))}, Test B)</span>')
-        row: List[Any] = [r["rank"], R(f"<b>{name}</b>" if r["passes"] else name),
-                          M(r["robust"]) if r["robust"] is not None else "-", M(r["total"]),
-                          _ci_text(r), f"{r['p_pos']:.2f}" if r["p_pos"] is not None else "-",
-                          R(f"{m_html(r['best'])} ({esc(r['best_event'][-4:])})"),
-                          R(f"{m_html(r['worst'])} ({esc(r['worst_event'][-4:])})"),
-                          "NOISE" if r["noise"] else "", r["hours"]]
+        if not r.get("judged"):
+            row: List[Any] = ["-", R(f'{name} <span style="color:{MUTED};">(no judged hour '
+                                     'yet)</span>'), _judged_text(r), "-", "-", "-", "-", "-",
+                              "-", "", 0]
+        else:
+            if r.get("thin"):
+                name += (f' <span style="color:{MUTED};">({r["days"]} judged day'
+                         f'{"" if r["days"] == 1 else "s"}: not named before '
+                         f'{HEADLINE_MIN_DAYS})</span>')
+            row = [r["rank"], R(f"<b>{name}</b>" if r["passes"] else name), _judged_text(r),
+                   M(r["robust"]) if r["robust"] is not None else "-", M(r["total"]),
+                   _ci_text(r), f"{r['p_pos']:.2f}" if r["p_pos"] is not None else "-",
+                   R(f"{m_html(r['best'])} ({esc(r['best_event'][-4:])})"),
+                   R(f"{m_html(r['worst'])} ({esc(r['worst_event'][-4:])})"),
+                   "NOISE" if r["noise"] else "", r["hours"]]
+        if show_in:
+            row.append(R(f"{r['in_hours']} hours, {m_html(r['in_total'])}")
+                       if r.get("in_hours") else "")
         if show_cal:
             row.append(M(r["cal"]) if r.get("cal") is not None else
                        ("-" if cal_ok(pol_, r["name"]) else CIRCULAR))
         out_rows.append(row)
     win = ctx["win"]
-    return (table(head, out_rows, right=[True, False] + [True] * (len(head) - 2))
-            + note(f"Ranked on {fill} net over the cumulative window "
-                   f"({win.days[0]} .. {win.days[-1]}) without each variant's best and worst "
-                   f"event-hour (\"robust total\"; an hour it rests nothing counts $0). The "
-                   f"headline names the top variant only when its robust total > 0 and P(total "
-                   f"> 0) >= {HEADLINE_P_MIN:g} (bold = passes both); 90% CI and P(total > 0) "
-                   f"are a bootstrap over the hours ({BOOT_N} resamples); noise-dominated = "
-                   f"|best hour| + |worst hour| > |total|. Best / worst hour: the event's ET "
-                   f"date and hour (DDHH). No single day's realized net ranks anything."
-                   + (" In-sample rows: a variant pre-registered to be judged ONLY on later data "
-                      "(its rule was chosen from hours inside this window) is listed for "
-                      "information and never named in the headline; its test decides it."
-                      if any(r.get("in_sample") for r in rows) else "")))
+    return (table(head, out_rows, right=[True, False, False] + [True] * (len(head) - 3))
+            + note(f"Ranked on {fill} net over each variant's judged hours in the cumulative "
+                   f"window ({win.days[0]} .. {win.days[-1]}) without its best and worst "
+                   f"event-hour (\"robust total\"; an hour it rests nothing counts $0). Judged "
+                   f"from = the first settle time a variant is judged on, never the hours it was "
+                   f"chosen from: {judged_rule_text()}; earlier hours are in-sample (shown, "
+                   f"never ranked). The headline names the top variant only when its robust "
+                   f"total > 0, P(total > 0) >= {HEADLINE_P_MIN:g} and its judged hours span at "
+                   f"least {HEADLINE_MIN_DAYS} ET days -- no single-day ranking (bold = "
+                   f"passes); the "
+                   f"90% CI and P(total > 0) are a moving-block bootstrap of {BOOT_BLOCK} "
+                   f"consecutive event-hours ({BOOT_N} resamples: losses cluster in consecutive "
+                   f"hours); noise-dominated = |best hour| + |worst hour| > |total|. Best / "
+                   f"worst hour: the event's ET date and hour (DDHH). No single day's realized "
+                   f"net ranks anything."))
 
 
 def _rate_text(b: str, r: dict) -> str:
@@ -3301,80 +4057,24 @@ def _prereg_html(ctx: dict) -> str:
     """The pre-registered tests, exactly as TEMP_SHADOW.md defines them."""
     tests = ctx.get("tests") or []
     rec = ctx.get("recent") or {}
-    color = (POS if ctx.get("prereg_verdict", "").startswith("pilot eligible") else
-             NEG if ctx.get("prereg_verdict", "").startswith("NO-GO") else "#9a6700")
+    v, va = ctx.get("prereg_verdict") or "", ctx.get("prereg_verdict_alt")
+
+    def col(x):
+        return POS if x.startswith("pilot eligible") else NEG if x.startswith("NO-GO") \
+            else "#9a6700"
     out = [f'<p style="font-size:16px;margin:4px 0;">Pre-registered verdict: '
-           f'<b style="color:{color};">{esc(ctx.get("prereg_verdict"))}</b></p>',
+           f'<b style="color:{col(v)};">{esc(v)}</b>'
+           + (f' (as registered); excluding the hours known at registration: '
+              f'<b style="color:{col(va)};">{esc(va)}</b>' if va else "") + '</p>',
            note("Adopted go-live rules (Jack 2026-10-17): rewards are assumed paid; decisions "
                 "use the STRESS fill model; a variant passes only on hours AFTER it was "
-                "chosen. Defined in TEMP_SHADOW.md \"Pre-registered tests\" (written before any "
-                "hour of their windows); nothing is re-tuned on window data. " + PILOT_RULES)]
+                "chosen. Defined in TEMP_SHADOW.md \"Pre-registered tests\" (committed "
+                f"{_reg_label()}); nothing is re-tuned on window data, and every window sim "
+                "file must carry the registered rule and model (PREREG_PIN_MODEL: SIM_VERSION "
+                f"{PREREG_PIN_MODEL['sim_version']}, the swp / stress tables, draws and seeds, "
+                "the fair model's params). " + PILOT_RULES)]
     for t in tests:
-        sc = {"PASS": POS, "FAIL": NEG}.get(t["status"], "#9a6700")
-        out.append(h3(f"Test {t['id']} -- {t['variant']} ({t['why']}): ET days {t['start']} .. "
-                      f"{t['end']}"))
-        out.append(f'<p style="margin:2px 0 6px 0;">Status: <b style="color:{sc};">'
-                   f'{esc(t["text"])}</b></p>')
-        drows = []
-        for r in t["rows"]:
-            if r["future"]:
-                drows.append([r["day"], "-", "-", "-", "-", "not yet"])
-                continue
-            flag = []
-            if not r["events"] and not r["missing"]:
-                flag.append("no events (counts $0)")
-            if r["missing"]:
-                flag.append(f"{r['missing']} event(s) without stress")
-            if r.get("partial"):
-                flag.append(f"{r['loaded']} of 24 hours loaded")
-            drows.append([r["day"], r["events"], M(r["reward"]), M(r["trading"]), M(r["net"]),
-                          ("yes" if r["net"] > 0 else "no") + (f" ({'; '.join(flag)})"
-                                                               if flag else "")])
-        out.append(table(["ET day", "hours", "reward", "trading", "stress net", "net > 0"],
-                         drows, right=[False, True, True, True, True, False]))
-        so_far = "" if t["status"] in ("PASS", "FAIL") else " (so far)"
-        items = []
-        if t["status"] == "not started":
-            out.append('<ul style="padding-left:20px;margin:4px 0;">'
-                       + "".join(f"<li>{esc(t['crit'][c]['label'])}</li>" for c in t["criteria"])
-                       + "</ul>")
-            out.append(note(f"PASS iff all of the above over ET days {t['start']} .. {t['end']}; "
-                            "nothing is judged before its window starts."))
-            continue
-        for c in t["criteria"]:
-            cr = t["crit"][c]
-            val = cr["value"]
-            if c == "days":
-                vs = f"{val} of {t['days_done']} days so far" if so_far else f"{val} of 5 days"
-                if so_far and not cr["met"]:
-                    vs += "; still possible" if cr.get("possible") else "; no longer possible"
-            else:
-                vs = money(val) if val is not None else "n/a"
-                vs += so_far
-            mark = "met" if cr["met"] else "not met"
-            items.append(f"<li>{esc(cr['label'])}: <b>{esc(vs)}</b> -- "
-                         f"<b style=\"color:{POS if cr['met'] else NEG};\">{mark}</b></li>")
-        info = []
-        if "robust" in t.get("info", ()):
-            rv = t["crit"]["robust"]["value"]
-            info.append(f"<li>for information: the total excluding the best and worst hour "
-                        f"{esc(money(rv) if rv is not None else 'n/a')}{esc(so_far)}</li>")
-        if "recent" in t.get("info", ()):
-            info.append("<li>for information, the calibrated-tails expectation re-marked at the "
-                        "RECENT REGIME (the favorite's upset rate after a favorite-bid hit, "
-                        f"re-estimated over the recorded period): "
-                        f"<b>{esc(money(t['recent']) if t.get('recent') is not None else 'n/a')}"
-                        f"</b>{esc(so_far)}, against the TABLE-BASED figure "
-                        f"{esc(money(t['cal']) if t.get('cal') is not None else 'n/a')} (the "
-                        "530-hour tail table, 26SEP-26OCT14: a calmer period)</li>")
-        out.append('<ul style="padding-left:20px;margin:4px 0;">' + "".join(items + info)
-                   + "</ul>")
-        out.append(note(f"{t['hours']} event-hours of {t['variant']} with stress results in the "
-                        f"window so far (it rests nothing outside its settle hours 20:00-07:00 "
-                        f"ET: those hours count $0); PASS iff every criterion is met once all 5 "
-                        f"days are in. Best / worst hour so far: "
-                        f"{money(t['best']) if t.get('best') is not None else 'n/a'} / "
-                        f"{money(t['worst']) if t.get('worst') is not None else 'n/a'}."))
+        out.append(_prereg_test_html(t))
     bk = rec.get("buckets") or {}
     if bk:
         out.append(note("Recent regime (the tests' second calibrated-tails figure): the "
@@ -3394,7 +4094,12 @@ def _cumulative_html(ctx: dict) -> str:
     win: Window = ctx["win"]
     if not win.all_events:
         return note("No sim output in the window yet.")
+    # the decision model's columns first; a window without any stress result
+    # (older output, stress failed everywhere) shows the rules' model here --
+    # information only: the ranking and the headline never leave stress
     hf = ctx.get("fill") or decision_fill(win)
+    if not any(split_key(k)[1] == hf for k in win.agg):
+        hf = ctx.get("rules_fill") or hf
     names = _rank_order(ctx, {split_key(k)[0] for k in win.agg})
     show_days = [d for d in win.days if win.days_events[d]][-9:]
     others = [f for f in reversed(FILLS) if f != hf and any(split_key(k)[1] == f
@@ -3456,23 +4161,39 @@ def _cumulative_html(ctx: dict) -> str:
 def _week_html(ctx: dict) -> str:
     w = ctx["week"]
     v = w["verdict"]
-    color = POS if v.startswith("pilot eligible") else NEG if v.startswith("NO-GO") else "#9a6700"
-    out = [f'<p style="font-size:20px;margin:6px 0;"><b style="color:{color};">'
-           f'{esc(v)}</b></p>',
-           note("From the adopted go-live rules (Jack 2026-10-17): the pre-registered tests "
-                "decide; the old GO / NO-GO thresholds on the best variant's realized net are "
-                "gone. " + w["reason"] + ".")]
+    va = w.get("verdict_after_registration")
+
+    def col(x):
+        return POS if x.startswith("pilot eligible") else NEG if x.startswith("NO-GO") \
+            else "#9a6700"
+    out = [f'<p style="font-size:20px;margin:6px 0;"><b style="color:{col(v)};">'
+           f'{esc(v)}</b></p>']
+    if va:
+        out.append(f'<p style="margin:2px 0 6px 0;">Excluding the hours known at registration: '
+                   f'<b style="color:{col(va)};">{esc(va)}</b></p>')
+    out.append(note("From the adopted go-live rules (Jack 2026-10-17): the pre-registered tests "
+                    "decide; the old GO / NO-GO thresholds on the best variant's realized net "
+                    "are gone. " + w["reason"] + "."))
     if w.get("best"):
-        cfg, ov = w.get("config") or {}, w.get("overrides") or {}
-        out.append(h3(f"Pilot config ({w['best']}, rule 4)"))
+        cfg, pc, ov = w.get("config") or {}, w.get("pilot_config") or {}, w.get("overrides") or {}
+        out.append(h3(f"Pilot config ({w['best']}, rule 4: 1/3 size)"))
         out.append(note(w.get("pilot") or PILOT_RULES))
-        if cfg:
-            out.append(table(["param", "value"],
-                             [[R(f"<b>{esc(k)}</b>" if k in ov else esc(k)), _fmt_val(v_)]
-                              for k, v_ in sorted(cfg.items()) if not _skip_key(k)],
-                             right=[False, False]))
-            out.append(note("Bold = the variant's overrides; the pilot runs it at 1/3 size "
-                            "(q_fav) in its night hours."))
+        if pc:
+            prow = []
+            for k, v_ in sorted(pc.items()):
+                if _skip_key(k):
+                    continue
+                val = _fmt_val(v_) + (f" (1/3 of the variant's {_fmt_val(cfg.get(k))})"
+                                      if cfg.get(k) != v_ else "")
+                prow.append([R(f"<b>{esc(k)}</b>" if k in ov else esc(k)), val])
+            out.append(table(["param", "pilot value"], prow, right=[False, False]))
+            out.append(note("Bold = the variant's overrides. The pilot runs the tested variant "
+                            f"at 1/3 size (q_fav {_fmt_val(cfg.get('q_fav'))} -> "
+                            f"{_fmt_val(pc.get('q_fav'))}; the caps unchanged) in its night "
+                            "hours, with the $300 daily halt and the hourly live-vs-shadow "
+                            "reconciliation."
+                            + (" " + GATE_RECON_NOTE if pc.get("fav_market_min_p") is not None
+                               else "")))
         else:
             out.append(note(f"Variant params unavailable ({w.get('policy_err') or 'not in VARIANTS'})."))
     else:
@@ -3540,7 +4261,8 @@ def render_html(ctx: dict) -> str:
                      f'event(s) in the window have no stress results</b> ('
                      + esc(", ".join(f"{d} x{n}" for d, n in sorted(stm["by_day"].items())))
                      + '): the ranking and the pre-registered tests cover the other events; a '
-                     'test waits for them before it reports PASS or FAIL.'
+                     'test counts a missing hour of its window as missing: "in progress" until '
+                     'the window is over, then INCOMPLETE (never PASS) until a re-sim fills it.'
                      + (table(["event (report day)", "why"], [[e, w] for e, w in stm["day"][:12]],
                               right=[False, False]) if stm["day"] else "") + "</div>")
     rej = swp_rejections(ctx)
@@ -3593,7 +4315,9 @@ def render_html(ctx: dict) -> str:
             + (f' <span style="color:{MUTED};">({esc(desc)})</span>' if desc else "")
             + f' -- robust {esc(feat["fill"])} total '
             + (f'<b>{m_html(feat["robust"])}</b>' if feat["robust"] is not None else "n/a")
-            + f' over {feat["hours"]} event-hours ({feat["days"]} days) = the total '
+            + f' over {feat["hours"]} event-hours ({feat["days"]} '
+              f'day{"" if feat["days"] == 1 else "s"}, judged from '
+              f'{esc(_judged_text(feat))}) = the total '
               f'{m_html(feat["total"])} without its best hour {m_html(feat["best"])} '
               f'({esc(feat["best_event"])}) and its worst {m_html(feat["worst"])} '
               f'({esc(feat["worst_event"])}); 90% CI {esc(_ci_text(feat))}; P(total &gt; 0) '
@@ -3605,11 +4329,11 @@ def render_html(ctx: dict) -> str:
             + ("; no calibrated-tails expectation (it quotes live strikes: circular)"
                if feat.get("cal") is None and not cal_ok(ctx.get("policy"), feat["name"])
                else "") + '.</p>')
-        if fill != DECISION_FILL:
-            parts.append(note(f"No stress results in the window (sim output from before "
-                              f"SIM_VERSION 7): the ranking uses {fill}."))
-    for r in hl.get("in_sample") or []:
-        parts.append(note(in_sample_text(r)))
+    ins = [in_sample_text(r) for r in hl.get("in_sample") or []]
+    if ins:
+        parts.append(note("In-sample hours, before each variant's first judged hour (the hours "
+                          "it was chosen from, or before its registration; shown for "
+                          "information, never ranked): " + "; ".join(ins) + "."))
     if best and f"{best}|{fill}" in agg:
         a = agg[f"{best}|{fill}"]
         se = a.get("net_se")
@@ -3625,14 +4349,23 @@ def render_html(ctx: dict) -> str:
                      f'{esc(_empty_reason(ctx))}</p>')
     tests = ctx.get("tests") or []
     if tests:
+        va = ctx.get("prereg_verdict_alt")
         parts.append(f'<p style="margin:4px 0;">Pre-registered tests: <b>'
-                     f'{esc(ctx.get("prereg_verdict"))}</b> -- '
-                     + esc("; ".join(f"Test {t['id']} ({t['variant']}) {t['text']}" for t in tests))
+                     f'{esc(ctx.get("prereg_verdict"))}</b>'
+                     + (f' (as registered; excluding the hours known at registration: '
+                        f'<b>{esc(va)}</b>)' if va and va != ctx.get("prereg_verdict") else "")
+                     + ' -- '
+                     + esc("; ".join(f"Test {t['id']} ({t['variant']}) {t['text']}"
+                                     + (f" (after registration: {t['alt']['text']})"
+                                        if t.get("alt") else "") for t in tests))
                      + ' (the section below).</p>')
     if ctx.get("week"):
         w = ctx["week"]
-        parts.append(f'<p style="margin:4px 0;">Week verdict: <b>{esc(w["verdict"])}</b> '
-                     f'(see the week summary).</p>')
+        wa = w.get("verdict_after_registration")
+        parts.append(f'<p style="margin:4px 0;">Week verdict: <b>{esc(w["verdict"])}</b>'
+                     + (f' (excluding the hours known at registration: <b>{esc(wa)}</b>)'
+                        if wa and wa != w["verdict"] else "")
+                     + ' (see the week summary).</p>')
     parts.append(_ranking_html(ctx))
     # 1b the pre-registered tests
     if tests:
@@ -3703,10 +4436,11 @@ def render_html(ctx: dict) -> str:
 
 def subject_line(ctx: dict) -> str:
     """The email subject: the robust ranking's verdict (never a single
-    day's net), the pre-registered tests' status, the problem flags, and
-    from day 7 the week verdict. E.g. "Temp shadow day 3 (2026-10-17): no
-    variant passes; Test A in progress 1/5 (stress -$X), Test B starts
-    10/18"."""
+    day's net; the named variant's noise-dominated flag with it), the
+    pre-registered tests' status (Test A's "after registration" figure
+    beside it), the problem flags, and from day 7 the week verdict. E.g.
+    "Temp shadow day 3 (2026-10-17): no variant passes; Test A in progress
+    1/5 (stress -$X; after registration -$Y), Test B starts 10/18"."""
     day, n = ctx["day"], ctx["day_n"]
     s = f"Temp shadow day {n} ({day}): "
     hl = ctx.get("headline") or {}
@@ -3740,39 +4474,73 @@ def subject_line(ctx: dict) -> str:
     if wdef:
         s += f" [{len(wdef)} re-sims deferred]"
     if ctx.get("week"):
-        s += f" -- week: {ctx['week']['verdict']}"
+        w = ctx["week"]
+        s += f" -- week: {w['verdict']}"
+        va = w.get("verdict_after_registration")
+        if va and va != w["verdict"]:
+            s += f" (excluding known hours: {va})"
     return s
 
 
 def _test_text(t: dict) -> List[str]:
-    """A pre-registered test in plain text: status, day nets, criteria."""
-    so_far = "" if t["status"] in ("PASS", "FAIL") else " so far"
+    """A pre-registered test in plain text: status (both views for Test A),
+    day nets, pin differences, missing hours, criteria."""
+    a = t.get("alt")
+    head = f"Test {t['id']} ({t['variant']}, ET {t['first_day']} .. {t['last_day']}): "
+    if t["status"] == "not started":
+        return [head + f"{t['text']}; PASS iff all of: "
+                + "; ".join(t["crit"][c]["label"] for c in t["criteria"])]
     days = ", ".join(f"{_mmdd(r['day'])} {money(r['net'], 0)}"
-                     + (f" ({r['loaded']} of 24 hours)" if r.get("partial") else "")
+                     + (f" ({r['known']} hours known at registration)" if r.get("known") else "")
                      for r in t["rows"] if not r["future"]) or "none yet"
-    crit = []
+    out = [head + ("as registered " if a else "") + t["text"]
+           + (f"; excluding the {t['known_n']} hours known at registration (settled before "
+              f"{_reg_label()}): {a['text']}" if a else "")
+           + f"; stress net by day: {days}"]
+    ft = _frozen_text(t)
+    if ft:
+        out.append("  - " + ft)
+    if t["pin_diffs"]:
+        out.append("  - INVALID (rule or model changed): "
+                   + "; ".join(f"{d['field']} registered {_fmt_val(d['pinned'])}, found "
+                               f"{_fmt_val(d['found'])} in {d['files']} file(s) (first "
+                               f"{d['first']})" for d in t["pin_diffs"][:6])
+                   + (f"; and {len(t['pin_diffs']) - 6} more" if len(t["pin_diffs"]) > 6
+                      else ""))
+    if t["missing"]:
+        out.append("  - expected hours without a stress result: "
+                   + "; ".join(f"{e} ({w})" for e, w in t["missing"][:8])
+                   + (f"; and {len(t['missing']) - 8} more" if len(t["missing"]) > 8 else ""))
+    if t["not_listed"]:
+        out.append("  - not listed by Kalshi (not expected): " + ", ".join(t["not_listed"]))
+    if t["known"]:
+        out.append(f"  - known at registration ({len(t['known'])} hours): "
+                   + ", ".join(f"{e.split('-', 1)[-1]} {money(n, 0)}" for e, n in t["known"]))
     for c in t["criteria"]:
         cr = t["crit"][c]
-        v = cr["value"]
-        vs = (f"{v} of {t['days_done'] if so_far else t['n_days']} days" if c == "days"
-              else money(v) if v is not None else "n/a")
-        crit.append(f"{cr['label']}: {vs}{so_far} -- {'met' if cr['met'] else 'not met'}")
-    if t["status"] == "not started":
-        return [f"Test {t['id']} ({t['variant']}, ET {t['start']} .. {t['end']}): {t['text']}; "
-                "PASS iff all of: " + "; ".join(t["crit"][c]["label"] for c in t["criteria"])]
-    out = [f"Test {t['id']} ({t['variant']}, ET {t['start']} .. {t['end']}): {t['text']}; "
-           f"stress net by day: {days}"]
-    out += ["  - " + x for x in crit]
+        s = f"  - {cr['label']}: {_crit_value(t, c)} -- {'met' if cr['met'] else 'not met'}"
+        if a:
+            s += (f" | excluding known hours: {_crit_value(a, c)} -- "
+                  f"{'met' if a['crit'][c]['met'] else 'not met'}")
+        out.append(s)
+    fin = "" if t["status"] in ("PASS", "FAIL") else " so far"
     extra = []
     if "robust" in t.get("info", ()):
-        rv = t["crit"]["robust"]["value"]
-        extra.append(f"total without the best and worst hour {money(rv) if rv is not None else 'n/a'}")
+        extra.append(f"total without the best and worst hour "
+                     f"{money(t['robust']) if t['robust'] is not None else 'n/a'}{fin}"
+                     + (f" (excluding known hours "
+                        f"{money(a['robust']) if a['robust'] is not None else 'n/a'})"
+                        if a else ""))
     if "recent" in t.get("info", ()):
         extra.append(f"calibrated tails at the recent regime "
-                     f"{money(t['recent']) if t.get('recent') is not None else 'n/a'} vs the "
-                     f"table-based {money(t['cal']) if t.get('cal') is not None else 'n/a'}")
+                     f"{money(t['recent']) if t.get('recent') is not None else 'n/a'}{fin} vs "
+                     f"the table-based {money(t['cal']) if t.get('cal') is not None else 'n/a'}")
     if extra:
-        out.append("  - for information: " + "; ".join(extra) + so_far)
+        out.append("  - for information: " + "; ".join(extra))
+    g = t.get("fav_gate")
+    if g and g["model_secs"]:
+        out.append(f"  - agreement gate in the shadow: passed {pct(g['gate_secs'] / g['model_secs'])}"
+                   f" of {g['model_secs']:,} model-favorite strike-seconds ({g['files']} files)")
     return out
 
 
@@ -3819,28 +4587,41 @@ def render_text(ctx: dict) -> str:
     rank = ctx.get("rank") or []
     if rank:
         win = ctx["win"]
-        lines.append(f"Ranking on robust {rank[0]['fill']} totals ({win.days[0]} .. "
-                     f"{win.days[-1]}, each variant's best and worst event-hour left out; the "
-                     f"headline needs robust > 0 and P(total > 0) >= {HEADLINE_P_MIN:g}): "
-                     + headline_phrase(hl) + ".")
-        for r in hl.get("in_sample") or []:
-            lines.append("  (" + in_sample_text(r) + ")")
-        for r in rank[:5]:
-            lines.append(f"  {r['rank']}. {r['name']}"
-                         + (" [in-sample: judged only on later data]" if r.get("in_sample") else "")
-                         + ": robust "
-                         f"{money(r['robust']) if r['robust'] is not None else 'n/a'}, total "
+        lines.append(f"Ranking on robust {rank[0]['fill']} totals over each variant's judged hours "
+                     f"({win.days[0]} .. {win.days[-1]}; judged from: {judged_rule_text()}; each "
+                     f"variant's best and worst event-hour left out; the headline needs robust > 0, "
+                     f"P(total > 0) >= {HEADLINE_P_MIN:g} (a {BOOT_BLOCK}-hour block bootstrap) "
+                     f"and {HEADLINE_MIN_DAYS} judged days): " + headline_phrase(hl) + ".")
+        for r in [x for x in rank if x.get("judged")][:5]:
+            lines.append(f"  {r['rank']}. {r['name']} (from {_judged_text(r)}, {r['hours']} hours"
+                         + (f", {r['days']} judged day: not named before {HEADLINE_MIN_DAYS}"
+                            if r.get("thin") else "") + "): "
+                         f"robust {money(r['robust']) if r['robust'] is not None else 'n/a'}, total "
                          f"{money(r['total'])}, 90% CI {_ci_text(r)}, P(total > 0) "
                          f"{r['p_pos']:.2f}" + (" [noise-dominated]" if r["noise"] else "")
                          + (f", expected (calibrated tails) {money(r['cal'])}"
                             if r.get("cal") is not None else ""))
+        nj = [f"{r['name']} (from {_judged_text(r)})" for r in rank if not r.get("judged")]
+        if nj:
+            lines.append("  not judged yet: " + ", ".join(nj))
+        ins = [in_sample_text(r) for r in hl.get("in_sample") or []]
+        if ins:
+            lines.append("  in-sample hours, before each variant's first judged hour (shown for "
+                         "information, never ranked): " + "; ".join(ins))
     else:
-        lines.append(_empty_reason(ctx))
+        lines.append("Headline: " + headline_phrase(hl) + ".")
+        if not ctx.get("events"):
+            lines.append(_empty_reason(ctx))
     tests = ctx.get("tests") or []
     if tests:
-        lines += ["", f"Pre-registered tests: {ctx.get('prereg_verdict')}"]
+        va = ctx.get("prereg_verdict_alt")
+        lines += ["", f"Pre-registered tests: {ctx.get('prereg_verdict')}"
+                  + (f" (as registered; excluding the hours known at registration: {va})"
+                     if va else "")]
         for t in tests:
             lines += _test_text(t)
+        if any((t.get("policy") or {}).get("fav_market_min_p") is not None for t in tests):
+            lines.append(GATE_RECON_NOTE)
     best, fill = ctx["best"], ctx["fill"]
     if best and f"{best}|{fill}" in ctx["agg"]:
         a = ctx["agg"][f"{best}|{fill}"]
@@ -3874,7 +4655,15 @@ def render_text(ctx: dict) -> str:
         for s in act:
             lines.append(f"- {s['title']}: {s['change']}")
     if ctx.get("week"):
-        lines += ["", f"Week verdict: {ctx['week']['verdict']} -- {ctx['week']['reason']}"]
+        w = ctx["week"]
+        wa = w.get("verdict_after_registration")
+        lines += ["", f"Week verdict: {w['verdict']}"
+                  + (f" (excluding the hours known at registration: {wa})"
+                     if wa and wa != w["verdict"] else "") + f" -- {w['reason']}"]
+        if w.get("best") and w.get("pilot_config"):
+            lines.append(f"Pilot config ({w['best']}, rule 4, 1/3 size): q_fav "
+                         f"{_fmt_val(w['pilot_config'].get('q_fav'))} (the variant's "
+                         f"{_fmt_val(w['config'].get('q_fav'))}); " + PILOT_RULES)
     lines += ["", "Full report attached (HTML)."]
     return "\n".join(lines)
 
@@ -3960,7 +4749,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   + (f"; stress_config: {summary['stress_config_error']}"
                      if summary.get("stress_config_error") else ""))
     ctx = build_context(day, sim_error=sim_error, sim_ran=not args.no_sim,
-                        sim_summary=summary)
+                        sim_summary=summary, freeze=True)
+    print(f"[{C.iso(C.utcnow())}] pre-registered tests: {ctx['prereg_verdict']}"
+          + (f" (excluding the hours known at registration: {ctx['prereg_verdict_alt']})"
+             if ctx.get("prereg_verdict_alt") else "") + " -- "
+          + "; ".join(test_subject(t) for t in ctx["tests"]))
     page = render_html(ctx)
     path = args.out or os.path.join(C.report_dir(), f"{day}.html")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)

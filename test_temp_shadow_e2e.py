@@ -952,6 +952,45 @@ class TestReport(unittest.TestCase):
         self.assertAlmostEqual(ms["locked99_frac"], want, places=6)
         self.assertEqual(self.ctx["model"]["n"], sum(r["model_eval"]["n"] for r in DAY_RESULTS))
 
+    def test_preregistered_tests_on_real_sim_files(self):
+        # the real sim's files carry what the tests pin (SIM_VERSION 8:
+        # policies, policy_full, the swp / stress identity, fair_model);
+        # this sandbox's fair model is the defaults, not the registered fit,
+        # so both tests are INVALID -- never PASS
+        evs = self.ctx["events"]
+        self.assertTrue(all(e.get("sim_version") == sim.SIM_VERSION == "8" for e in evs))
+        want = json.loads(json.dumps(sim._resolve_variants(None)))
+        for e in evs:
+            self.assertEqual(e["policy_full"], want)
+            self.assertEqual(e["fair_model"]["id"],
+                             sim.fair_model_identity(tmodel.FairModel())["id"])
+            self.assertIn("FAV_night_agree", e["fav_gate"])
+        sandbox_id = evs[0]["fair_model"]["id"]
+        self.assertNotEqual(sandbox_id, report.PREREG_PIN_MODEL["fair_model_id"])
+        for t in self.ctx["tests"]:
+            self.assertEqual(t["status"], "INVALID", t["id"])
+            self.assertEqual([(d["field"], d["files"]) for d in t["pin_diffs"]],
+                             [("fair_model.id", 2)])
+        # with the sandbox's model as the pin, the rest of the identity holds:
+        # Test A's window is over with hours never recorded -> INCOMPLETE;
+        # Test B (to 10/22) still runs
+        with mock.patch.dict(report.PREREG_PIN_MODEL, fair_model_id=sandbox_id):
+            ctx = report.build_context(DAY, now=self.NOW)
+        for t, st in zip(ctx["tests"], ("INCOMPLETE", "in progress")):
+            self.assertEqual((t["status"], t["pin_diffs"]), (st, []), t["id"])
+            self.assertEqual(t["hours"], 2)                      # E1, E2
+            self.assertTrue(t["missing"])
+        # the hours before the recording began are outside the shadow (not
+        # expected); 13:00 ET was never listed while the collector ran (not
+        # expected); 12:00 and 16:00-23:00 were never seen (missing)
+        a = ctx["tests"][0]
+        self.assertEqual(a["not_listed"], ["KXTEMPMIAH-26OCT2113"])
+        self.assertEqual([e for e, _w in a["missing"]],
+                         ["KXTEMPMIAH-26OCT2112"]
+                         + [f"KXTEMPMIAH-26OCT21{h}" for h in range(16, 24)])
+        self.assertEqual(a["text"], "INCOMPLETE (9 expected hour(s) without a stress result)")
+        self.assertIn("Test A INCOMPLETE (9 hours missing", report.subject_line(ctx))
+
     def test_health_reads_the_recording(self):
         h = self.ctx["health"]
         self.assertTrue(h["started_late"])                   # recording began 11:28 ET
