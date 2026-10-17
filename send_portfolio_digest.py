@@ -668,7 +668,11 @@ def load_prior_snapshot(today_str: str):
 
 HISTORY_COLS = ["date", "cash", "positions_value", "equity",
                 "kalshi_positions_value", "perps_equity", "unpaid_rewards_est",
-                "subs_equity"]
+                "subs_equity", "deposited", "withdrawn"]
+# The first morning whose snapshot records the all-time deposited / withdrawn
+# totals (the total-profit headline, 10/4 pm). History rows written before
+# those columns existed are filled from their morning's snapshot.
+TOTALS_RECORDED_FROM = "2026-10-05"
 
 
 def load_history():
@@ -688,18 +692,34 @@ def load_history():
                 except ValueError:
                     row["kalshi_positions_value"] = ""
                 for k in ("perps_equity", "unpaid_rewards_est",    # 9/28 on
-                          "subs_equity"):                          # 10/9 on
+                          "subs_equity",                           # 10/9 on
+                          "deposited", "withdrawn"):               # 10/17 on
                     try:
                         row[k] = float(r.get(k) or "")
                     except ValueError:
                         row[k] = ""
                 rows.append(row)
+    # Rows from before the deposited / withdrawn columns: their morning's
+    # snapshot recorded the totals that run read (from TOTALS_RECORDED_FROM)
+    for row in rows:
+        if row["date"] < TOTALS_RECORDED_FROM or "" not in (row["deposited"],
+                                                             row["withdrawn"]):
+            continue
+        try:
+            with open(snapshot_path(row["date"]), encoding="utf-8") as f:
+                snap = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if snap.get("deposited") is not None and snap.get("withdrawn") is not None:
+            row["deposited"] = round(_f(snap["deposited"]), 2)
+            row["withdrawn"] = round(_f(snap["withdrawn"]), 2)
     rows.sort(key=lambda r: r["date"])
     return rows
 
 
 def upsert_history(rows, today_str, cash, pos_value, equity, kalshi_pv,
-                   perps_equity=None, unpaid=None, subs_equity=None):
+                   perps_equity=None, unpaid=None, subs_equity=None,
+                   deposited=None, withdrawn=None):
     rows = [r for r in rows if r["date"] != today_str]
     rows.append({"date": today_str, "cash": round(cash, 2),
                  "positions_value": round(pos_value, 2),
@@ -707,7 +727,9 @@ def upsert_history(rows, today_str, cash, pos_value, equity, kalshi_pv,
                  "kalshi_positions_value": round(kalshi_pv, 2),
                  "perps_equity": "" if perps_equity is None else round(perps_equity, 2),
                  "unpaid_rewards_est": "" if unpaid is None else round(unpaid, 2),
-                 "subs_equity": "" if subs_equity is None else round(subs_equity, 2)})
+                 "subs_equity": "" if subs_equity is None else round(subs_equity, 2),
+                 "deposited": "" if deposited is None else round(_f(deposited), 2),
+                 "withdrawn": "" if withdrawn is None else round(_f(withdrawn), 2)})
     rows.sort(key=lambda r: r["date"])
     return rows
 
@@ -1067,12 +1089,22 @@ def profit_series(history, transfers, today=None, today_profit=None):
     morning's account value less every dollar deposited, plus every dollar
     withdrawn, by 7:00 ET (the headline's total profit; `today`'s point is
     `today_profit` exactly), estimated = realized + that morning's
-    unpaid-rewards estimate, None before 9/29 when it was not recorded."""
+    unpaid-rewards estimate, None before 9/29 when it was not recorded.
+
+    The deposits are the totals that morning's own run recorded, where it
+    did (Jack 2026-10-17: "Fix it"). Re-read today, Kalshi dates a deposit
+    when it was started: the $500 ACH begun 10/10 that cleared overnight
+    10/15 -> 10/16 netted out of 10/11-10/15, whose account values never held
+    its cash, and plotted them $500 low. Rows with no recorded totals still
+    net the transfers dated by 7:00 ET."""
     out = []
     for r in history:
         d = datetime.strptime(r["date"], "%Y-%m-%d").date()
         if r["date"] == today and today_profit is not None:
             profit = today_profit
+        elif (isinstance(r.get("deposited"), float)
+              and isinstance(r.get("withdrawn"), float)):
+            profit = round(history_account_value(r) - r["deposited"] + r["withdrawn"], 2)
         else:
             dep, wd = sum_transfers(transfers, None,
                                     ET.localize(datetime(d.year, d.month, d.day, 7)))
@@ -1734,7 +1766,8 @@ def main(argv=None) -> int:
                                      pf["kalshi_positions_value"],
                                      pf.get("perps_equity"),
                                      (pf.get("unpaid") or {}).get("total"),
-                                     pf.get("subs_equity"))
+                                     pf.get("subs_equity"),
+                                     pf.get("deposited"), pf.get("withdrawn"))
     if not (args.test or args.dry_run):
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(snapshot_path(today_str), "w", encoding="utf-8") as f:

@@ -878,6 +878,58 @@ class ProfitChartTests(unittest.TestCase):
                                         "2026-10-10", 23916.81))
         self.assertGreater(os.path.getsize(out), 1000)
 
+    def test_past_mornings_net_the_deposits_their_own_run_recorded(self):
+        # Jack 2026-10-17: "Fix it" -- the chart plotted 10/11-10/15 $500 low.
+        # The $500 ACH started 10/10 11:52Z was pending, cash not credited,
+        # until it cleared overnight 10/15 -> 10/16; re-read now, Kalshi dates
+        # it 10/10. The points must be the totals those mornings' emails printed
+        from datetime import datetime, timezone
+        rows = pf.upsert_history([], "2026-10-14", 31066.14, 28431.25, 59497.39,
+                                 24678.48, 97.3, 2845.05, 300.0, 28000.0, 0)
+        rows = pf.upsert_history(rows, "2026-10-15", 30949.92, 30251.03, 61200.95,
+                                 25956.94, 89.93, 3434.79, 300.0, 28000.0, 0)
+        rows = pf.upsert_history(rows, "2026-10-16", 29590.91, 32079.46, 61670.37,
+                                 27072.0, 93.2, 2606.84, 300.0, 28500.0, 0)
+        ach = datetime(2026, 10, 10, 11, 52, 8, tzinfo=timezone.utc).timestamp()
+        transfers = [(1790000000.0, 28000.0), (ach, 500.0)]
+        pts = pf.profit_series(rows, transfers, today="2026-10-16", today_profit=28556.11)
+        self.assertEqual([p for _, p, _ in pts], [28141.92, 29296.79, 28556.11])
+        # without recorded totals a morning nets the dated transfers: the old
+        # points, $500 low
+        for r in rows:
+            r["deposited"] = r["withdrawn"] = ""
+        pts = pf.profit_series(rows, transfers, today="2026-10-16", today_profit=28556.11)
+        self.assertEqual([p for _, p, _ in pts], [27641.92, 28796.79, 28556.11])
+
+    def test_old_history_rows_take_the_totals_from_their_snapshot(self):
+        import json
+        import os
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        old = (pf.DATA_DIR, pf.HISTORY_CSV)
+        pf.DATA_DIR, pf.HISTORY_CSV = tmp, os.path.join(tmp, "h.csv")
+        try:
+            # a history file from before the columns, and the 10/15 snapshot
+            with open(pf.HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
+                f.write("date,cash,positions_value,equity,kalshi_positions_value,"
+                        "perps_equity,unpaid_rewards_est,subs_equity\n"
+                        "2026-10-04,10379.84,25199.16,35579.0,23588.53,132.12,,\n"
+                        "2026-10-15,30949.92,30251.03,61200.95,25956.94,89.93,"
+                        "3434.79,300.0\n")
+            with open(pf.snapshot_path("2026-10-15"), "w", encoding="utf-8") as f:
+                json.dump({"date": "2026-10-15", "deposited": 28000.0, "withdrawn": 0}, f)
+            back = pf.load_history()
+            # 10/4's snapshot predates the totals: still the dated transfers
+            self.assertEqual((back[0]["deposited"], back[0]["withdrawn"]), ("", ""))
+            self.assertEqual((back[1]["deposited"], back[1]["withdrawn"]), (28000.0, 0.0))
+            # written back with the new columns, they no longer need the snapshot
+            pf.write_history(back)
+            os.remove(pf.snapshot_path("2026-10-15"))
+            again = pf.load_history()
+            self.assertEqual((again[1]["deposited"], again[1]["withdrawn"]), (28000.0, 0.0))
+        finally:
+            pf.DATA_DIR, pf.HISTORY_CSV = old
+
 
 class CollateralTests(unittest.TestCase):
     """Jack 2026-10-09, after the subaccount fix: "still seems wrong. i see
