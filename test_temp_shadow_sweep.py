@@ -653,6 +653,222 @@ class TestHazardRuns(Base):
         self.assertEqual(r["swp"]["hazard_kind"], "noflash")
 
 
+class ConstSlope(ConstModel):
+    """ConstModel with a tiny guard slope: buffer = guard_min_c = 1c, so a
+    favorite join at fair 0.985 is capped at 97c."""
+
+    def slopes(self, snap, settle_ts, strikes):
+        return {k: 0.1 for k in strikes} if snap is not None else {}
+
+
+FAV = SW.resolve_variant(SW.SWEEP_VARIANTS["FAV_only"])[0]
+BOOK_FAV = ({98: 500.0, 97: 1000.0}, {})
+
+
+class TestStressModel(Base):
+    """The 2026-10-17 audit's stress fill model: swp + level-clear (d) at
+    every price >= 2c + hidden favorite takers (e)."""
+
+    def shared_s(self, subtract=True):
+        return SW.shared_for(EVENT, ConstSlope(0.985), subtract=subtract)
+
+    @staticmethod
+    def fav_fills(r):
+        return [(round(ts - OPEN), p, q) for ts, tk, side, p, q in r["fills_detail"] if p >= 2]
+
+    def test_fav_variants_are_the_policy_grid(self):
+        self.assertEqual(FAV, pol.make_policy("FAV_only"))
+        self.assertEqual(SW.resolve_variant(SW.SWEEP_VARIANTS["FAV_night"])[0],
+                         pol.make_policy("FAV_night"))
+        q100 = SW.resolve_variant(SW.SWEEP_VARIANTS["FAV_q100"])[0]
+        p99 = SW.resolve_variant(SW.SWEEP_VARIANTS["FAV_night_p99"])[0]
+        self.assertEqual(q100, dict(FAV, q_fav=100))
+        self.assertEqual(p99, dict(pol.make_policy("FAV_night"), fav_min_p=0.99))
+        for n in SW.STRESS_TABLE_VARIANTS:
+            self.assertIn(n, SW.SWEEP_VARIANTS)
+
+    def test_stress_is_swp_without_clears(self):
+        # only a 1c sweep (the NO side): nothing for (d) to act on
+        write_event(trades=[(600, "yes", 99, 50, "s1")])
+        sh = self.shared_s()
+        a = SW.VPass(sh, G, "swp").run()
+        b = SW.VPass(sh, G, SW.STRESS).run()
+        for k in a:
+            self.assertEqual(a[k], b[k], k)
+        self.assertEqual((b["clear_events"], b["favhaz_events"]), (0, 0))
+
+    def test_level_clear_takes_our_favorite(self):
+        # FAV joins YES 300 at 97 behind 1,000; a seller empties 98 and 97
+        write_event(books=BOOK_FAV, deltas=[(600, "yes", 98, -500), (600, "yes", 97, -1000)],
+                    trades=[(600, "no", 98, 500, "t1"), (600, "no", 97, 1000, "t2")])
+        sh = self.shared_s()
+        self.assertEqual([(c[2], c[3], c[4]) for c in sh.stress_clusters()], [("yes", 97, True)])
+        cons = SW.VPass(sh, FAV, "cons", detail=True).run()
+        self.assertEqual(self.fav_fills(cons), [])            # the 1,000 ahead of us take it
+        st = SW.VPass(sh, FAV, SW.STRESS, detail=True).run()
+        self.assertEqual(self.fav_fills(st), [(600, 97, 300.0)])
+        self.assertEqual(st["sweep_src"], {"clear": 300.0})
+        self.assertEqual(st["clear_events"], 1)
+        self.assertAlmostEqual(st["trading_pnl"], 300 * 0.03, places=6)   # YES won
+
+    def test_size_take(self):
+        # 100 others at 97 (under target/5: FAV joins the best level, 97); a
+        # 100-lot seller clears it: 'full' takes our 300, 'size' its own 100
+        write_event(books=({97: 100.0}, {}), deltas=[(600, "yes", 97, -100)],
+                    trades=[(600, "no", 97, 100, "t1")])
+        sh = self.shared_s()
+        full = SW.VPass(sh, FAV, SW.STRESS, detail=True).run()
+        size = SW.VPass(sh, FAV, SW.STRESS, detail=True, stress_take="size").run()
+        self.assertEqual(self.fav_fills(full), [(600, 97, 300.0)])
+        self.assertEqual(self.fav_fills(size), [(600, 97, 100.0)])
+        with self.assertRaises(ValueError):
+            SW.VPass(sh, FAV, SW.STRESS, stress_take="half")
+        with self.assertRaises(ValueError):
+            SW.VPass(sh, FAV, "swp", stress_take="size")
+
+    def test_walk_through_takes_all(self):
+        books = ({98: 500.0, 97: 1000.0, 96: 400.0}, {})
+        write_event(books=books, deltas=[(600, "yes", 98, -500), (600, "yes", 97, -1000),
+                                         (600, "yes", 96, -50)],
+                    trades=[(600, "no", 98, 500, "t1"), (600, "no", 97, 1000, "t2"),
+                            (600, "no", 96, 50, "t3")])
+        sh = self.shared_s()
+        cons = SW.VPass(sh, FAV, "cons", detail=True).run()
+        self.assertEqual(self.fav_fills(cons), [(600, 97, 50.0)])   # only the 96 print's count
+        st = SW.VPass(sh, FAV, SW.STRESS, detail=True).run()
+        self.assertEqual(self.fav_fills(st), [(600, 97, 300.0)])
+
+    def test_partial_at_our_price_stays_cons(self):
+        write_event(books=BOOK_FAV, deltas=[(600, "yes", 98, -500), (600, "yes", 97, -200)],
+                    trades=[(600, "no", 98, 500, "t1"), (600, "no", 97, 200, "t2")])
+        sh = self.shared_s()
+        self.assertEqual([(c[3], c[4]) for c in sh.stress_clusters()], [(97, False)])
+        st = SW.VPass(sh, FAV, SW.STRESS, detail=True).run()
+        self.assertEqual(self.fav_fills(st), [])
+        self.assertEqual(st["clear_events"], 0)
+
+    def test_gap_rule(self):
+        # nobody at 97: our capped join sits in the gap under 98; a seller
+        # empties 98 and stops
+        write_event(books=({98: 500.0}, {}), deltas=[(600, "yes", 98, -500)],
+                    trades=[(600, "no", 98, 500, "t1")])
+        sh = self.shared_s()
+        self.assertEqual([(c[3], c[4], c[6]) for c in sh.stress_clusters()], [(98, True, 0)])
+        st = SW.VPass(sh, FAV, SW.STRESS, detail=True).run()
+        self.assertEqual(self.fav_fills(st), [])
+        hole = SW.VPass(sh, FAV, SW.STRESS, detail=True, stress_hole=True).run()
+        self.assertEqual(self.fav_fills(hole), [(600, 97, 300.0)])
+        with self.assertRaises(ValueError):
+            SW.VPass(sh, FAV, "swp", stress_hole=True)
+
+    def test_own_print_clusters(self):
+        # live hour: our 300 YES@97 (in the recorded book) is taken alone by
+        # a taker: its cluster is dropped (nobody else was there)
+        write_event(books=({}, {}), deltas=[(100, "yes", 97, 300), (600, "yes", 97, -300)],
+                    trades=[(600, "no", 97, 300, "own1")])
+        write_live(orders=[dict(ts=OPEN + 99.8, kind="place", oid="A", side="yes", price=97,
+                                size=300, expiration_ts=OPEN + 3000, tag="fav")],
+                   fills=[dict(ts=OPEN + 600.05, order_id="A", count=300, price_ours=97,
+                               side_ours="yes", trade_id="own1")])
+        self.assertEqual(self.shared_s().stress_clusters(), [])
+        # with 200 others ahead of us, a 500-lot taker: kept, cleared
+        _wipe()
+        write_event(books=({}, {}), deltas=[(50, "yes", 97, 200), (100, "yes", 97, 300),
+                                            (600, "yes", 97, -500)],
+                    trades=[(600, "no", 97, 200, "x1"), (600, "no", 97, 300, "own1")])
+        write_live(orders=[dict(ts=OPEN + 99.8, kind="place", oid="A", side="yes", price=97,
+                                size=300, expiration_ts=OPEN + 3000, tag="fav")],
+                   fills=[dict(ts=OPEN + 600.05, order_id="A", count=300, price_ours=97,
+                               side_ours="yes", trade_id="own1")])
+        cl = self.shared_s().stress_clusters()
+        self.assertEqual([(c[3], c[4], c[5], c[7]) for c in cl], [(97, True, 500.0, 300.0)])
+
+    def test_hidden_favorite_takers(self):
+        # an empty YES book: FAV's join at 97 rests alone at the top
+        write_event(books=({}, {}))
+        sh = self.shared_s()
+        fav = SW.Hazard(hz_doc(rate=0.05))
+        fc = SW.fav_candidates(sh, 0, fav.lam_max)
+        self.assertEqual(fc, SW.fav_candidates(sh, 0, fav.lam_max))
+        self.assertNotEqual(fc, SW.hazard_candidates(sh, 0, fav.lam_max))   # its own seed
+        vp = SW.VPass(sh, FAV, SW.STRESS, fav_hazard=fav, fav_cands=fc, detail=True)
+        r = vp.run()
+        self.assertTrue(vp.had_fav)
+        self.assertGreater(r["favhaz_events"], 0)
+        self.assertEqual(r["sweep_src"], {"favhaz": 1500.0})          # to pos_cap
+        self.assertTrue(all(p == 97 for _, _, _, p, _ in r["fills_detail"]))
+        self.assertEqual(SW.VPass(sh, FAV, SW.STRESS).run()["favhaz_events"], 0)  # no table
+        # covered: 400 others at 97 -> no hidden takers
+        _wipe()
+        write_event(books=({97: 400.0}, {}))
+        sh = self.shared_s()
+        vp = SW.VPass(sh, FAV, SW.STRESS, fav_hazard=fav,
+                      fav_cands=SW.fav_candidates(sh, 0, fav.lam_max))
+        self.assertEqual(vp.run()["favhaz_events"], 0)
+        self.assertFalse(vp.had_fav)
+
+    def test_calibrate_fav(self):
+        write_event(books=BOOK_FAV, deltas=[(600, "yes", 98, -200)],
+                    trades=[(600, "no", 98, 200, "t1")])
+        row = SW.calibrate_fav_event(EVENT, model=ConstSlope(0.985))
+        self.assertEqual([(c["b"], c["q"], c["cleared"], c["fb"]) for c in row["clusters"]],
+                         [(98, 200.0, False, "0.97-0.99")])
+        secs = sum(row["expo"]["joint"]["0.97-0.99"].values())
+        self.assertGreater(secs, 3500)
+        doc = SW.aggregate_fav([row])
+        self.assertEqual(doc["observed"]["0.97-0.99"]["hits"], 1)
+        h = SW.Hazard(doc)
+        self.assertGreater(h.lam_max, 0.0)
+        self.assertIn("hidden favorite-taker", SW.format_fav_calibration(doc))
+
+    def test_repo_favorite_table(self):
+        h = SW.load_fav_hazard()
+        self.assertGreater(h.lam_max, 0.0)
+        self.assertEqual(h.doc.get("stress_version"), SW.STRESS_VERSION)
+        self.assertEqual(SW.load_fav_hazard(SW.FAVHAZ_REPO).ident(), h.ident())
+
+    def test_run_event_variants_stress(self):
+        write_event(books=BOOK_FAV, deltas=[(600, "yes", 98, -500), (600, "yes", 97, -1000)],
+                    trades=[(600, "no", 98, 500, "t1"), (600, "no", 97, 1000, "t2")])
+        vs = {"FAV_only": SW.SWEEP_VARIANTS["FAV_only"], "G": SW.SWEEP_VARIANTS["G"]}
+        fav = SW.Hazard(hz_doc(rate=0.0001))
+        r = SW.run_event_variants(EVENT, vs, draws=2, hazard=SW.Hazard(hz_doc(rate=0.0)),
+                                  model=ConstSlope(0.985), tail=SW.TailCal({}),
+                                  fill_models=SW.ALL_FILL_MODELS, fav_hazard=fav)
+        for n in vs:
+            for fm in SW.ALL_FILL_MODELS:
+                self.assertIn(f"{n}|{fm}", r["variants"])
+        self.assertTrue(r["variants"]["FAV_only|swp"]["swp_exact"])
+        # after the clear FAV re-joins alone at the top: (e) acts, draws differ
+        self.assertFalse(r["variants"]["FAV_only|stress"]["stress_exact"])
+        self.assertGreaterEqual(r["variants"]["FAV_only|stress"]["above1c_contracts"], 300.0)
+        self.assertEqual(r["stress"]["fav_hazard_id"], fav.ident())
+        off = SW.run_event_variants(EVENT, vs, draws=2, hazard=SW.Hazard(hz_doc(rate=0.0)),
+                                    model=ConstSlope(0.985), tail=SW.TailCal({}),
+                                    fill_models=(SW.STRESS,), fav_off=True)
+        self.assertTrue(off["variants"]["FAV_only|stress"]["stress_exact"])
+        self.assertEqual(off["variants"]["FAV_only|stress"]["above1c_contracts"], 300.0)
+        self.assertIsNone(off["stress"]["fav_hazard_id"])
+        want = {"draws": 2, "rec_mode": "level", "channels": "abc",
+                "hazard_id": SW.Hazard(hz_doc(rate=0.0)).ident(), "join": None, "tail_id": None,
+                "fill_models": list(SW.ALL_FILL_MODELS), "policies": json.loads(json.dumps(vs)),
+                "stress_hole": False, "fav_hazard_id": fav.ident()}
+        r["tail_id"] = None
+        self.assertTrue(SW._reuse_ok(r, want))
+        self.assertFalse(SW._reuse_ok(r, dict(want, stress_hole=True)))
+        self.assertFalse(SW._reuse_ok(r, dict(want, fav_hazard_id="other")))
+
+    def test_variant_table_ex_best_worst(self):
+        res = [{"event": f"E{k}", "settled": True, "et_day": "2026-10-15", "hour_et": k,
+                "variants": {"V|stress": {"net": float(x), "reward": 0.0}}}
+               for k, x in enumerate((10, -50, 30, 5))]
+        t = SW.variant_table(res, boot_n=200)["table"]["V|stress"]
+        self.assertEqual(t["total"]["net"], -5.0)
+        self.assertEqual(t["ex_best"], -35.0)
+        self.assertEqual(t["ex_best_worst"], 15.0)
+        self.assertIn("ex-b&w", SW.format_table({"table": {"V|stress": t}, "by_hour": {}}, ["V"]))
+
+
 class TestFlashCalibration(Base):
     """Review finding 5: flash sweeps get FLASH_EXPO_S of exposure each and a
     cleared flag from the level after them only; a flash-free fit exists."""

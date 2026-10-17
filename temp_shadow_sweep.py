@@ -49,6 +49,39 @@ Fill model swp = cons, plus three sweep channels on our 1c orders:
       would cross our 1c) is a taker that would have hit us first: it fills
       min(ours, the new 99 size). The hazard in (b) counts only sweeps that
       did NOT leave a 99 bid behind, so (b) and (c) do not double count.
+Fill model stress (2026-10-17 audit; Jack: "Make sure you don't make same
+mistake where the shadow trading results actually doesn't hold when it is
+tested live") = swp, plus two channels on our orders at EVERY price >= 2c
+(the favorite joins and near-decided quotes, which swp leaves to cons):
+  (d) level-clear: a recorded taker cluster (prints on one market/side
+      within CLUSTER_S, over the full tape: the replay tape plus the prints
+      that filled our live orders) takes ALL of our resting lots on that
+      side priced better than its worst print (it walked through our
+      price), and all of our lots AT its worst price when it cleared that
+      level (its prints there >= the level before it, ours included).
+      cons fills such lots only after the queue ahead and only up to the
+      prints' counts; an informed seller who empties the favorite-bid level
+      would have taken ours too. A cluster made only of our prints is kept
+      when someone else rested at a price it hit, dropped when we were
+      alone (then (e) must predict it). stress_take "size" (a
+      sensitivity): the taker takes our lots only up to its own observed
+      size (best price first), as if it had that much appetite left;
+      "full" (the default) takes them whole. stress_hole (a sensitivity): a
+      cluster that cleared its worst level also takes our lots in the gap
+      below it, down to the next external level (we were the next level in
+      its path).
+  (e) hidden favorite takers: while our lot on a favorite side (its fair
+      >= FAVHAZ_MIN_P) rests ALONE at the top of that side (no external
+      size at our price, nothing better), takers arrive at the calibrated
+      rate at which the best favorite bid gets hit, a[favorite fair][age
+      of our alone-at-top episode] x mult[minutes since open]
+      (calibrate-fav: top-of-book hits per second of exposure on the
+      recorded hours; FavHazard = Hazard on that table), taking a recorded
+      top-hit size (cleared -> all of ours). Monte Carlo on its own seeded
+      stream (FAVHAZ_SEED), common to every variant.
+The daily pipeline (temp_shadow_sim) does NOT run stress (default OFF):
+`run --fill-models opt,cons,swp,stress` and temp_shadow_audit do.
+
 Everything else (fills from other trades, queue rules, the policy, re-pads
 after a fill, pos_cap / event WCL trimming, a capped strike no longer
 qualifying) is temp_shadow_sim's cons model and temp_mm_policy, unchanged:
@@ -128,6 +161,13 @@ import temp_shadow_sim as sim
 
 SWEEP_VERSION = "1"
 FILL_MODELS = ("opt", "cons", "swp")
+STRESS = "stress"                     # swp + level-clear (d) + hidden favorite takers (e)
+ALL_FILL_MODELS = FILL_MODELS + (STRESS,)
+STRESS_VERSION = "1"
+STRESS_TAKES = ("full", "size")      # (d): our lots whole / up to the taker's own size
+FAVHAZ_MIN_P = 0.90      # (e) acts on our bids whose side's fair is >= this
+FAVHAZ_SEED = "tmm-favhaz-1"
+FAVHAZ_REPO = os.path.join(C.REPO, "temp_shadow_sweep_favhazard.json")
 CLUSTER_S = 1.0          # 1c prints on one (market, side) within 1 s of the
                          # first = one taker order (Kalshi prints one trade per
                          # maker filled, all at the taker's timestamp)
@@ -223,6 +263,27 @@ SWEEP_VARIANTS: Dict[str, dict] = {
     "F_nofill": {"policy": _g(live=True, q_live=600, skew=0.3, q_pad=0, qual_pads=False)},
     "F_live_only": {"policy": _g(live=True, q_live=600, skew=0.3, decided=False)},
 }
+
+# The favorite-join variants (= VARIANTS FAV_only / FAV_night, 10/16) and the
+# 2026-10-17 audit's smaller (q_fav 100) and stricter (fav_min_p 0.99) ones.
+FAV_NIGHT_HOURS = [20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def _fav(**kw) -> dict:
+    return _g(q_pad=0, qual_pads=False, near_decided_half=False, fav_min_price_c=50, **kw)
+
+
+SWEEP_VARIANTS.update({
+    "FAV_only": {"policy": _fav()},
+    "FAV_night": {"policy": _fav(quote_hours_et=list(FAV_NIGHT_HOURS))},
+    "FAV_q100": {"policy": _fav(q_fav=100)},
+    "FAV_night_q100": {"policy": _fav(q_fav=100, quote_hours_et=list(FAV_NIGHT_HOURS))},
+    "FAV_p99": {"policy": _fav(fav_min_p=0.99)},
+    "FAV_night_p99": {"policy": _fav(fav_min_p=0.99, quote_hours_et=list(FAV_NIGHT_HOURS))},
+})
+# the audit's stress table (temp_shadow_audit stress-table, task 3)
+STRESS_TABLE_VARIANTS = ("FAV_only", "FAV_night", "FAV_q100", "FAV_night_q100", "FAV_p99",
+                         "FAV_night_p99", "G_hold180", "G")
 
 
 def resolve_variant(spec: dict) -> Tuple[dict, Optional[float]]:
@@ -594,6 +655,22 @@ def load_hazard(path: Optional[str] = None, scale: float = 1.0, kind: str = "bas
     return Hazard(doc, scale, kind)
 
 
+def load_fav_hazard(path: Optional[str] = None, scale: float = 1.0) -> Hazard:
+    """The stress model's hidden favorite-taker table (channel (e)): `path`,
+    else <out>/favhazard.json (a calibrate-fav run), else the repo's
+    temp_shadow_sweep_favhazard.json. A Hazard: rate(side fair, minutes
+    since open, age of our alone-at-top episode), take(u, ours, age)."""
+    for p in ([path] if path else [os.path.join(out_dir_default(), "favhazard.json"), FAVHAZ_REPO]):
+        if p and os.path.exists(p):
+            doc = C.read_json(p)
+            if not isinstance(doc, dict) or not (doc.get("hazard") or {}).get("a"):
+                raise ValueError(f"not a favorite-hazard table: {p}")
+            return Hazard(doc, scale)
+        if path:
+            raise ValueError(f"cannot read favorite-hazard table {path}")
+    raise ValueError("no favorite-hazard table: run `temp_shadow_sweep.py calibrate-fav`")
+
+
 # --------------------------------------------------------------------------
 # Shared per-event state (temp_shadow_sim._Shared + the stream + sweep prep)
 # --------------------------------------------------------------------------
@@ -615,6 +692,7 @@ class SweepShared(sim._Shared):
         self._strip = dict(strip_1c or {})
         self.stream = None
         self.stripped_arrivals = 0
+        self._stress_cl: Optional[List[tuple]] = None      # stress_clusters(), lazy
         super().__init__(inp, model, until_ts)
         if self._strip:
             self._apply_strip()
@@ -778,6 +856,82 @@ class SweepShared(sim._Shared):
             return info.mid / 100.0
         return None
 
+    def side_levels(self, m: int, side: str, i: int) -> Optional[Dict[int, float]]:
+        """External bid levels of one side at sample i (None = untrusted)."""
+        info = self.info_at_idx(m, i)
+        if info is None:
+            return None
+        return info.by if side == "yes" else info.bn
+
+    # -- the stress model's level-clear clusters (channel (d)) ---------------
+    def stress_clusters(self) -> List[tuple]:
+        """Taker clusters at every price for the stress rule (d), built on
+        first use (the swp / opt / cons passes never pay for it):
+        [(t0 - 1e-6, m, side, w, cleared_w, q, nb, q_own, n_prices, top)]
+        sorted by time. side = the bid side hit; w = the worst bid price it
+        printed at; cleared_w = its prints at w >= the level at w before it
+        (external + ours, max of the samples at and before t0); q = its whole
+        size; nb = the next external level below w (0 = none) for the gap
+        rule; q_own = the part that filled our live orders. Built over the
+        full tape (replay tape + our live prints) like _prep_arrivals; a
+        cluster made only of our prints is dropped when no one else rested
+        at any price it hit (the hidden-taker channel's to predict), and a
+        cluster on an untrusted book is dropped (no level to judge)."""
+        if self._stress_cl is None:
+            self._stress_cl = self._prep_stress_clusters()
+        return self._stress_cl
+
+    def _prep_stress_clusters(self) -> List[tuple]:
+        rows = [(ts, m, tk, yc, cnt, False) for ts, m, tk, yc, cnt in self.trades]
+        rows += [(ts, m, tk, yc, cnt, True) for ts, m, tk, yc, cnt in self._own_prints()]
+        rows.sort(key=lambda r: r[0])
+        lo = getattr(self.stream, "live_own", None)
+        own_tl = lo.timeline(self.sec0, self.sec1) if lo else None
+        cl: List[dict] = []
+        open_c: Dict[tuple, dict] = {}
+        for ts, m, taker, yc, cnt, own in rows:
+            side = "yes" if taker == "no" else "no"
+            px = yc if side == "yes" else 100 - yc
+            c = open_c.get((m, side))
+            if c is None or ts - c["t0"] > CLUSTER_S:
+                c = dict(t0=ts, m=m, side=side, q=0.0, q_own=0.0, n_other=0,
+                         px=defaultdict(float))
+                cl.append(c)
+                open_c[(m, side)] = c
+            c["q"] += cnt
+            c["px"][px] += cnt
+            if own:
+                c["q_own"] += cnt
+            else:
+                c["n_other"] += 1
+        out = []
+        for c in cl:
+            m, side, t0 = c["m"], c["side"], c["t0"]
+            i0 = self.idx_at(t0)
+            lv = [x for x in (self.side_levels(m, side, i0 - 1), self.side_levels(m, side, i0))
+                  if x is not None]
+            if not lv:
+                continue
+            own_lv: Dict[int, float] = defaultdict(float)
+            if own_tl is not None:
+                for ii in (i0 - 1, i0):
+                    if 0 <= ii < len(own_tl):
+                        o = own_tl[ii].get(self.tickers[m])
+                        if o:
+                            for p, q in (o[0] if side == "yes" else o[1]).items():
+                                own_lv[p] = max(own_lv[p], q)
+            prices = sorted(c["px"])
+            ext = {p: max(d.get(p, 0.0) for d in lv) for p in prices}
+            if c["n_other"] == 0 and all(ext[p] < 1.0 for p in prices):
+                continue                     # only we rested where it hit: (e)'s job
+            w = prices[0]
+            cleared = c["px"][w] >= ext[w] + own_lv.get(w, 0.0) - 0.5
+            below = [p for p, s in lv[0].items() if p < w and s >= 1.0]
+            out.append((t0 - 1e-6, m, side, w, bool(cleared), c["q"], max(below) if below else 0,
+                        c["q_own"], len(prices), prices[-1]))
+        out.sort(key=lambda r: r[0])
+        return out
+
 
 def fav_p_of(side: str, f: Optional[float]) -> Optional[float]:
     """P(the side OPPOSITE a `side` bid wins) = the favorite's fair when a
@@ -855,6 +1009,14 @@ def hazard_candidates(sh: SweepShared, draw: int, lam_max: float,
     return out
 
 
+def fav_candidates(sh: SweepShared, draw: int, lam_max: float,
+                   seed: str = FAVHAZ_SEED) -> List[tuple]:
+    """The stress model's hidden favorite-taker candidates (channel (e)):
+    hazard_candidates on its own seed, so they never shift the 1c stream
+    and every variant meets the same arrivals."""
+    return hazard_candidates(sh, draw, lam_max, seed)
+
+
 # --------------------------------------------------------------------------
 # The pass: temp_shadow_sim._Pass + pad hold + the swp fill model
 # --------------------------------------------------------------------------
@@ -873,19 +1035,42 @@ class VPass(sim._Pass):
     (they joined after us, so no queue effect; sweepers took them together
     with ours live, so the sweep channels are unchanged).
     tail_cal: a TailCal -> pnl_cal / net_cal (fills marked at realized
-    longshot rates; tlo / thi at the CI bounds)."""
+    longshot rates; tlo / thi at the CI bounds).
+    fill_model 'stress' = swp (every swp option applies) + the level-clear
+    channel (d) on our lots at >= 2c and the hidden favorite takers (e):
+    fav_hazard (a Hazard from calibrate-fav; None = no (e)) with fav_cands
+    (fav_candidates), stress_hole (the gap rule, a sensitivity),
+    stress_take ('full' | 'size': (d) takes our lots whole, or only up to the
+    cluster's own size).
+    own_arrivals False also drops (d)'s clusters that hit our live orders."""
 
     def __init__(self, sh: SweepShared, P: dict, fill_model: str,
                  hold_pads_s: Optional[float] = None, hazard: Optional[Hazard] = None,
                  cands: Optional[List[tuple]] = None, rec_mode: str = "level",
                  channels: str = "abc", detail: bool = False, own_arrivals: bool = True,
                  join_q: float = 0.0, join_s: float = 5.0,
-                 tail_cal: Optional[TailCal] = None):
-        if fill_model not in FILL_MODELS:
+                 tail_cal: Optional[TailCal] = None, fav_hazard: Optional[Hazard] = None,
+                 fav_cands: Optional[List[tuple]] = None, stress_hole: bool = False,
+                 stress_take: str = "full"):
+        if fill_model not in ALL_FILL_MODELS:
             raise ValueError(f"unknown fill model {fill_model!r}")
-        super().__init__(sh, P, "cons" if fill_model == "swp" else fill_model)
+        super().__init__(sh, P, "cons" if fill_model in ("swp", STRESS) else fill_model)
         self.fm_name = fill_model
-        self.swp = fill_model == "swp"
+        self.stress = fill_model == STRESS
+        self.swp = fill_model in ("swp", STRESS)
+        if (fav_hazard is not None or stress_hole or stress_take != "full") and not self.stress:
+            raise ValueError("fav_hazard / stress_hole / stress_take are stress options")
+        if stress_take not in STRESS_TAKES:
+            raise ValueError(f"stress_take must be one of {STRESS_TAKES}")
+        self.stress_take = stress_take
+        self.fav_hazard = fav_hazard
+        self.fav_cands = fav_cands or []
+        self.stress_hole = bool(stress_hole)
+        self.epfav = [{"yes": None, "no": None} for _ in range(sh.nm)]  # (price, since)
+        self.had_fav = False    # stress: a favorite lot of ours ever rested alone at
+                                # the top (else every (e) draw is this one)
+        self.clear_n = 0
+        self.favhaz_n = 0
         self.hold_until = (sh.open + float(hold_pads_s)) if hold_pads_s else None
         self.P_hold = dict(P, q_pad=0, qual_pads=False) if hold_pads_s else None
         self.hazard = hazard
@@ -993,8 +1178,13 @@ class VPass(sim._Pass):
                  per_lot: Optional[List[float]] = None) -> float:
         """Fill up to `want` (None = all) of our resting 1c orders on `side`,
         front lot first -- or exactly per_lot[k] from lot k."""
+        return self._fill_px(ts, m, side, 1, want, src, per_lot)
+
+    def _fill_px(self, ts, m, side, price: int, want: Optional[float], src: str,
+                 per_lot: Optional[List[float]] = None) -> float:
+        """_fill_1c at any price (the stress channels act on >= 2c too)."""
         book = self.orders[m][side]
-        lots = book.get(1)
+        lots = book.get(price)
         if not lots:
             return 0.0
         got = 0.0
@@ -1014,15 +1204,16 @@ class VPass(sim._Pass):
                 got += q
         if got <= 1e-9:
             return 0.0
-        book[1] = [l for l in lots if l[0] > 1e-9]
-        if not book[1]:
-            del book[1]
-            self.ep1c[m][side] = None
+        book[price] = [l for l in lots if l[0] > 1e-9]
+        if not book[price]:
+            del book[price]
+            if price == 1:
+                self.ep1c[m][side] = None
         if self.expo_log is not None:
             self._log_expo(ts, m)
         prev, self.src = self.src, src
         try:
-            self._record_fill(ts, m, side, 1, got)
+            self._record_fill(ts, m, side, price, got)
         finally:
             self.src = prev
         return got
@@ -1140,6 +1331,96 @@ class VPass(sim._Pass):
                 if new >= 1.0 - 1e-9 and 1 in o[side]:
                     self._fill_1c(T, m, side, new, "cross")
 
+    # -- stress: level-clear (d) and hidden favorite takers (e) ---------------
+    def _on_clear(self, c):
+        """(d): a recorded taker cluster takes ALL of our lots at >= 2c on
+        its side priced better than its worst print w, and those AT w when
+        it cleared that level; with stress_hole also those in the gap below
+        a cleared w down to the next external level nb. 1c lots are channel
+        (a)'s."""
+        t, m, side, w, clr, q, nb = c[0], c[1], c[2], c[3], c[4], c[5], c[6]
+        book = self.orders[m][side]
+        if not book:
+            return
+        hit = False
+        left = float(q) if self.stress_take == "size" else None
+        for p in sorted(book, reverse=True):
+            if p < 2:
+                continue
+            if left is not None and left <= 1e-9:
+                break
+            if p > w or (p == w and clr) or (self.stress_hole and clr and nb < p < w):
+                got = self._fill_px(t, m, side, p, left, "clear")
+                if got > 0:
+                    hit = True
+                    if left is not None:
+                        left -= got
+        if hit:
+            self.clear_n += 1
+
+    def _fav_top(self, m: int, side: str, i: int) -> Optional[int]:
+        """Our best lot price (>= 2c) on a side when it rests ALONE at the top
+        of that side at sample i (no external size there, nothing better),
+        else None."""
+        book = self.orders[m][side]
+        ps = [p for p in book if p >= 2]
+        if not ps:
+            return None
+        p = max(ps)
+        lv = self.sh.side_levels(m, side, i)
+        if lv is None or lv.get(p, 0.0) >= 1.0:
+            return None
+        if any(q >= 1.0 and pp > p for pp, q in lv.items()):
+            return None
+        return p
+
+    def _fav_update(self, i: int, T: float):
+        """Per tick: the age of every alone-at-top episode of our favorite
+        lots (channel (e)'s clock)."""
+        sh = self.sh
+        for m in range(sh.nm):
+            for side in ("yes", "no"):
+                ep = self.epfav[m][side]
+                p = self._fav_top(m, side, i)
+                if p is None:
+                    self.epfav[m][side] = None
+                    continue
+                f = sh.fair_or_mid(m, T)
+                if f is None or (f if side == "yes" else 1.0 - f) < FAVHAZ_MIN_P:
+                    self.epfav[m][side] = None
+                    continue
+                self.had_fav = True
+                if ep is None or ep[0] != p:
+                    self.epfav[m][side] = (p, T)
+
+    def _on_fav_hazard(self, c):
+        """(e): a hidden taker hits our favorite lot resting alone at the top
+        (the episode clock is _fav_update's; the state is re-checked at the
+        candidate's time)."""
+        t, m, side, u_acc, u_size = c
+        ep = self.epfav[m][side]
+        if ep is None:
+            return
+        sh = self.sh
+        p = self._fav_top(m, side, sh.idx_at(t))
+        if p is None or p != ep[0]:
+            return
+        f = sh.fair_or_mid(m, t)
+        if f is None:
+            return
+        fs = f if side == "yes" else 1.0 - f
+        if fs < FAVHAZ_MIN_P:
+            return
+        age = t - ep[1]
+        lam = self.fav_hazard.rate(fs, (t - sh.open) / 60.0, age)
+        if lam <= 0 or u_acc * self.fav_hazard.lam_max >= lam:
+            return
+        ours = sum(l[0] for l in self.orders[m][side].get(p) or [])
+        if ours < 1.0 - 1e-9:
+            return
+        self.favhaz_n += 1
+        self._fill_px(t, m, side, p, self.fav_hazard.take(u_size, ours, age), "favhaz")
+
     # -- reward with joiner dilution (mirrors temp_shadow_sim._Pass._score) ----
     def _phantom(self, m, T, info) -> Tuple[float, float]:
         o, ep = self.orders[m], self.ep1c[m]
@@ -1203,6 +1484,12 @@ class VPass(sim._Pass):
                          if self.own_arrivals or not a[5])
         if self.swp and "b" in self.ch and self.hazard:
             extra.extend((c[0], 1, c) for c in self.cands)
+        favt = self.stress and self.fav_hazard is not None
+        if self.stress:
+            extra.extend((c[0], 2, c) for c in sh.stress_clusters()
+                         if self.own_arrivals or not c[7])
+            if favt:
+                extra.extend((c[0], 3, c) for c in self.fav_cands)
         extra.sort(key=lambda e: (e[0], e[1]))
         nc, k = len(extra), 0
         cross = self.swp and "c" in self.ch
@@ -1216,8 +1503,12 @@ class VPass(sim._Pass):
                     self._activate(pending.popleft())
                 if ek == 0:
                     self._on_arrival(c)
-                else:
+                elif ek == 1:
                     self._on_hazard(c)
+                elif ek == 2:
+                    self._on_clear(c)
+                else:
+                    self._on_fav_hazard(c)
             if hold_t is not None and t >= hold_t:
                 self.last_key = [None] * sh.nm      # re-decide without the hold
                 hold_t = None
@@ -1230,6 +1521,8 @@ class VPass(sim._Pass):
                     self._cross_check(a, t)
                 if clamp:
                     self._clamp_1c(a)
+                if favt:
+                    self._fav_update(a, t)
                 self._score(a, t)
                 self._decide_all(t, a, tick_fs[a], t + 1.0)
             else:
@@ -1275,6 +1568,10 @@ class VPass(sim._Pass):
               "pos": {sh.tickers[m]: _r(self.yes_q[m] - self.no_q[m], 2)
                       for m in range(sh.nm) if self.yes_q[m] or self.no_q[m]},
               "filler_by_strike": {t: _r(v, 2) for t, v in f1.items()}}
+        if self.stress:
+            ex.update({"clear_events": self.clear_n, "favhaz_events": self.favhaz_n,
+                       "above1c_contracts": _r(sum(q for ts, m, side, p, q, *_ in self.fills
+                                                   if p >= 2), 2)})
         if tc is not None:
             ex.update({"pnl_cal": _r(cal["mid"], 4), "pnl_cal_tlo": _r(cal["lo"], 4),
                        "pnl_cal_thi": _r(cal["hi"], 4),
@@ -1328,11 +1625,15 @@ def run_swp(sh: SweepShared, P: dict, hazard: Hazard, draws: int,
             hold_pads_s: Optional[float] = None, rec_mode: str = "level",
             channels: str = "abc", detail: bool = False, seed: str = SEED_BASE,
             cand_cache: Optional[dict] = None, join: Optional[Sequence[float]] = None,
-            tail_cal: Optional[TailCal] = None) -> dict:
+            tail_cal: Optional[TailCal] = None, fill_model: str = "swp",
+            fav_hazard: Optional[Hazard] = None, stress_hole: bool = False,
+            stress_take: str = "full") -> dict:
     """Mean of `draws` swp passes (draw k uses hazard_candidates(sh, k)):
     the mean summary plus per-draw net / reward / pnl / contracts and their
-    standard deviations."""
+    standard deviations. fill_model 'stress' runs the stress passes (draw k
+    adds fav_candidates(sh, k) when fav_hazard is given)."""
     runs = []
+    stress = fill_model == STRESS
     for k in range(int(draws)):
         cands = None
         if "b" in channels:
@@ -1343,17 +1644,22 @@ def run_swp(sh: SweepShared, P: dict, hazard: Hazard, draws: int,
                 cands = hazard_candidates(sh, k, hazard.lam_max, seed)
                 if cand_cache is not None:
                     cand_cache[key] = cands
-        runs.append(VPass(sh, P, "swp", hold_pads_s=hold_pads_s, hazard=hazard, cands=cands,
+        fc = (fav_candidates(sh, k, fav_hazard.lam_max)
+              if stress and fav_hazard is not None else None)
+        runs.append(VPass(sh, P, fill_model, hold_pads_s=hold_pads_s, hazard=hazard, cands=cands,
                           rec_mode=rec_mode, channels=channels, detail=detail,
                           join_q=(join[0] if join else 0.0), join_s=(join[1] if join else 5.0),
-                          tail_cal=tail_cal).run())
+                          tail_cal=tail_cal, fav_hazard=fav_hazard if stress else None,
+                          fav_cands=fc, stress_hole=stress_hole if stress else False,
+                          stress_take=stress_take if stress else "full").run())
     return mean_summary(runs, keep_detail=detail)
 
 
 _NUM_KEYS = ("reward", "fills_n", "contracts", "trading_pnl", "fees", "net", "avg_share",
              "quoted_secs", "max_abs_pos", "worst_case_loss", "filler_contracts", "haz_events",
              "pnl_fair", "pnl_fair_1c", "net_fair", "pnl_cal", "pnl_cal_tlo", "pnl_cal_thi",
-             "net_cal", "net_cal_tlo", "net_cal_thi")
+             "net_cal", "net_cal_tlo", "net_cal_thi", "clear_events", "favhaz_events",
+             "above1c_contracts")
 
 
 def mean_summary(runs: List[dict], keep_detail: bool = False) -> dict:
@@ -1815,6 +2121,110 @@ def aggregate_calibration(rows: List[dict]) -> dict:
             "clusters": allr["clusters"], "live": live}
 
 
+def calibrate_fav_event(event: str, model=None) -> dict:
+    """One event's top-of-book exposure and hits on the FAVORITE sides
+    (stress channel (e)), from the full recording (nothing subtracted):
+    every 1 s sample where a side's fair is >= FAVHAZ_MIN_P and it has a best
+    bid >= 2c counts a second of exposure keyed by the favorite fair bucket,
+    minutes since open and the age of the top-of-book episode (the time
+    since that price became the side's best); a hit = a taker cluster
+    (CLUSTER_S) on that side whose best print is at (or above) the best bid
+    of the sample before it, with its size there and whether it cleared that
+    level. Rows in calibrate_event's shape, so fit_hazard fits them."""
+    sh = shared_for(event, model, subtract=False)
+    tick_fs, _ = sh.react_view(REACT_S)
+    expo = defaultdict(_ddict)
+    ep: Dict[tuple, Optional[tuple]] = {}
+    top: Dict[tuple, List[Optional[tuple]]] = {(m, s): [None] * sh.n for m in range(sh.nm)
+                                               for s in ("yes", "no")}
+    for i in range(sh.n):
+        T = sh.sec0 + i + 0.5
+        if T >= sh.end_t:
+            break
+        fs = tick_fs[i]
+        for m in range(sh.nm):
+            info = sh.info_at_idx(m, i)
+            f = sh.st_f[fs][m] if fs >= 0 else None
+            if f is None and info is not None and info.mid is not None:
+                f = info.mid / 100.0
+            for side in ("yes", "no"):
+                key = (m, side)
+                lv = None if info is None else (info.by if side == "yes" else info.bn)
+                sp = None if f is None else (f if side == "yes" else 1.0 - f)
+                b = max([p for p, q in (lv or {}).items() if q >= 1.0], default=None)
+                if lv is None or sp is None or sp < FAVHAZ_MIN_P or b is None or b < 2:
+                    ep[key] = None
+                    continue
+                if ep.get(key) is None or ep[key][0] != b:
+                    ep[key] = (b, T)
+                top[key][i] = (b, ep[key][1], float(lv.get(b, 0.0)))
+                expo[fav_bucket(sp)][min_bucket((T - sh.open) / 60.0) + "|"
+                                     + _bucket(T - ep[key][1], AGE_EDGES, AGE_LABELS)] += 1.0
+    clusters = []
+    open_c: Dict[tuple, dict] = {}
+    cl: List[dict] = []
+    for ts, m, taker, yc, cnt in sh.trades:
+        side = "yes" if taker == "no" else "no"
+        px = yc if side == "yes" else 100 - yc
+        c = open_c.get((m, side))
+        if c is None or ts - c["t0"] > CLUSTER_S:
+            c = dict(t0=ts, m=m, side=side, px=defaultdict(float))
+            cl.append(c)
+            open_c[(m, side)] = c
+        c["px"][px] += cnt
+    for c in cl:
+        m, side, t0 = c["m"], c["side"], c["t0"]
+        if t0 >= sh.end_t:
+            continue
+        i0 = sh.idx_at(t0)
+        st = top[(m, side)][i0 - 1] if 0 < i0 <= sh.n else None
+        if st is None:
+            continue
+        b, since, lvl = st
+        if max(c["px"]) < b:
+            continue                         # it did not reach the top level
+        f = sh.fair_or_mid(m, t0)
+        if f is None:
+            continue
+        sp = f if side == "yes" else 1.0 - f
+        if sp < FAVHAZ_MIN_P:
+            continue
+        q_b = sum(q for p, q in c["px"].items() if p >= b)
+        clusters.append(dict(t=round(t0, 3), ticker=sh.tickers[m], side=side, b=b,
+                             q=round(q_b, 2), L=round(lvl, 2), cleared=bool(q_b >= lvl - 0.5),
+                             posting=False, fav_p=round(sp, 5), fb=fav_bucket(sp),
+                             mb=min_bucket((t0 - sh.open) / 60.0),
+                             ab=_bucket(t0 - since, AGE_EDGES, AGE_LABELS),
+                             won=(sh.inp.results.get(sh.tickers[m]) == side)
+                             if sh.inp.results.get(sh.tickers[m]) in ("yes", "no") else None))
+    return {"event": event, "live_hour": bool(scoring.load_live_orders(event)),
+            "expo": {"joint": {fb: dict(d) for fb, d in expo.items()}}, "clusters": clusters}
+
+
+def aggregate_fav(rows: List[dict]) -> dict:
+    """calibrate_fav_event rows -> the favorite-hazard table (Hazard's doc
+    shape: hazard a[fav][age] x mult[min], sizes per age bucket, sizes_all)
+    plus the observed rates by bucket."""
+    rows = [r for r in rows if r and not r.get("error")]
+    cl = [c for r in rows for c in r["clusters"]]
+    hz = fit_hazard(rows, cl, flash_expo=False)
+    sizes = {ab: [[c["q"], int(c["cleared"])] for c in cl if c["ab"] == ab] for ab in AGE_LABELS}
+    obs = {}
+    for fb in FAV_LABELS:
+        e = sum(v for r in rows for k, v in (r["expo"]["joint"].get(fb) or {}).items())
+        n = sum(1 for c in cl if c["fb"] == fb)
+        obs[fb] = {"expo_s": round(e, 1), "hits": n, "lam": _r(_rate(n, e), 6),
+                   "cleared_frac": _r(sum(1 for c in cl if c["fb"] == fb and c["cleared"])
+                                      / n, 3) if n else None}
+    return {"version": 1, "stress_version": STRESS_VERSION, "built": C.iso(time.time()),
+            "events": [r["event"] for r in rows], "hazard": hz,
+            "sizes": {ab: v for ab, v in sizes.items() if v},
+            "sizes_all": [[c["q"], int(c["cleared"])] for c in cl] or [[300.0, 1]],
+            "observed": obs,
+            "source": f"calibrate-fav {C.iso(time.time())} over {len(rows)} recorded hours "
+                      f"(top-of-book hits on sides with fair >= {FAVHAZ_MIN_P})"}
+
+
 def recorded_events(days: Optional[Sequence[str]] = None, settled_only: bool = True) -> List[str]:
     """Settled events whose hour the collector recorded (ws rows exist).
 
@@ -1958,12 +2368,19 @@ def run_event_variants(event: str, variants: Optional[Dict[str, dict]] = None,
                        model=None, fill_models: Sequence[str] = FILL_MODELS,
                        rec_mode: str = "level", channels: str = "abc",
                        seed: str = SEED_BASE, join: Optional[Sequence[float]] = None,
-                       tail: Optional[TailCal] = None) -> dict:
+                       tail: Optional[TailCal] = None, fav_hazard: Optional[Hazard] = None,
+                       stress_hole: bool = False, fav_off: bool = False,
+                       stress_take: str = "full") -> dict:
     """Every variant x fill model on one event (live-order subtraction on).
     swp = the mean of `draws` Monte Carlo passes; draws are the outer loop,
     so every variant sees the same hazard arrivals (common random numbers).
+    A variant whose first draw never rests a 1c order (nor, in stress, a
+    favorite lot alone at the top) is exact in that draw (*_exact).
     join = (join_q, join_s) for the joiner-dilution sensitivity (swp only);
-    tail = the TailCal for pnl_cal / net_cal (default: built-in table)."""
+    tail = the TailCal for pnl_cal / net_cal (default: built-in table).
+    stress (fill model 'stress'): fav_hazard = channel (e)'s table (default
+    load_fav_hazard(); fav_off = without (e)), stress_hole = the gap rule,
+    stress_take = (d)'s take ('full' | 'size')."""
     t_start = time.time()
     variants = variants or dict(SWEEP_VARIANTS)
     tail = tail if tail is not None else TailCal()
@@ -1976,22 +2393,51 @@ def run_event_variants(event: str, variants: Optional[Dict[str, dict]] = None,
     specs = {n: resolve_variant(v) for n, v in variants.items()}
     for name, (P, hold) in specs.items():
         for fm in fill_models:
-            if fm != "swp":
+            if fm not in ("swp", STRESS):
                 out["variants"][f"{name}|{fm}"] = VPass(sh, P, fm, hold_pads_s=hold,
                                                         tail_cal=tc).run()
     jq, js = (float(join[0]), float(join[1])) if join else (0.0, 5.0)
-    if "swp" in fill_models:
-        if hazard is None:
-            hazard = load_hazard()
+    if (("swp" in fill_models or STRESS in fill_models) and hazard is None):
+        hazard = load_hazard()
+    if STRESS in fill_models and fav_hazard is None and not fav_off:
+        fav_hazard = load_fav_hazard()
+    if fav_off:
+        fav_hazard = None
+    for fm in ("swp", STRESS):
+        if fm not in fill_models:
+            continue
+        stress = fm == STRESS
         runs = {n: [] for n in specs}
+        exact = set()
         for k in range(int(draws)):
-            cands = hazard_candidates(sh, k, hazard.lam_max, seed) if "b" in channels else None
+            todo = [n for n in specs if n not in exact]
+            cands = (hazard_candidates(sh, k, hazard.lam_max, seed)
+                     if "b" in channels and todo else None)
+            fc = (fav_candidates(sh, k, fav_hazard.lam_max)
+                  if stress and fav_hazard is not None and todo else None)
             for name, (P, hold) in specs.items():
-                runs[name].append(VPass(sh, P, "swp", hold_pads_s=hold, hazard=hazard,
-                                        cands=cands, rec_mode=rec_mode, channels=channels,
-                                        join_q=jq, join_s=js, tail_cal=tc).run())
+                if name in exact:
+                    runs[name].append(runs[name][0])
+                    continue
+                vp = VPass(sh, P, fm, hold_pads_s=hold, hazard=hazard,
+                           cands=cands, rec_mode=rec_mode, channels=channels,
+                           join_q=jq, join_s=js, tail_cal=tc,
+                           fav_hazard=fav_hazard if stress else None, fav_cands=fc,
+                           stress_hole=stress_hole if stress else False,
+                           stress_take=stress_take if stress else "full")
+                runs[name].append(vp.run())
+                if k == 0 and not vp.had_1c and not vp.had_fav:
+                    exact.add(name)
         for name in specs:
-            out["variants"][f"{name}|swp"] = mean_summary(runs[name])
+            ms = mean_summary(runs[name])
+            ms[f"{fm}_exact"] = name in exact
+            out["variants"][f"{name}|{fm}"] = ms
+    if STRESS in fill_models:
+        out["stress"] = {"version": STRESS_VERSION, "hole": bool(stress_hole),
+                         "take": stress_take,
+                         "fav_hazard_id": fav_hazard.ident() if fav_hazard else None,
+                         "fav_hazard_src": (fav_hazard.doc.get("built") if fav_hazard else None),
+                         "fav_lam_max": _r(fav_hazard.lam_max, 6) if fav_hazard else None}
     out["swp"] = {"draws": int(draws), "rec_mode": rec_mode, "channels": channels,
                   "seed": seed, "lam_max": _r(hazard.lam_max, 6) if hazard else None,
                   "hazard_src": (hazard.doc.get("built") if hazard else None),
@@ -2015,9 +2461,13 @@ def _event_job(job: dict) -> dict:
     try:
         hz = Hazard(job["hazard_doc"], job["hazard_scale"], job["hazard_kind"])
         tail = TailCal(job["tail_doc"]) if job.get("tail_doc") is not None else TailCal({})
+        fav = Hazard(job["fav_doc"]) if job.get("fav_doc") else None
         res = run_event_variants(ev, job["variants"], job["draws"], hz,
                                  fill_models=job["fill_models"], rec_mode=job["rec_mode"],
-                                 channels=job["channels"], join=job["join"], tail=tail)
+                                 channels=job["channels"], join=job["join"], tail=tail,
+                                 fav_hazard=fav, stress_hole=bool(job.get("stress_hole")),
+                                 stress_take=job.get("stress_take") or "full",
+                                 fav_off=fav is None)
         if job.get("path"):
             C.write_json_atomic(job["path"], res)
         return res
@@ -2034,12 +2484,19 @@ def runs_dir(out: str, tag: str = "") -> str:
 def _reuse_ok(doc, want: dict) -> bool:
     """A cached run file answers the request only if every input that changes
     its numbers matches: draws, rec_mode, channels, policies, fill models,
-    the hazard (table + scale + kind), the joiner setting, the tail table and
-    the code version (SWEEP_VERSION, and temp_shadow_sim.SIM_VERSION: VPass
+    the hazard (table + scale + kind), the joiner setting, the tail table,
+    with stress its version, gap rule and favorite-hazard table, and the
+    code version (SWEEP_VERSION, and temp_shadow_sim.SIM_VERSION: VPass
     inherits the sim's pass, so a sim change re-runs the cached events)."""
     if not isinstance(doc, dict) or doc.get("error"):
         return False
     sw = doc.get("swp") or {}
+    if STRESS in want["fill_models"]:
+        st = doc.get("stress") or {}
+        if (st.get("version") != STRESS_VERSION or st.get("hole") != want.get("stress_hole")
+                or (st.get("take") or "full") != (want.get("stress_take") or "full")
+                or st.get("fav_hazard_id") != want.get("fav_hazard_id")):
+            return False
     return (sw.get("draws") == want["draws"] and sw.get("rec_mode") == want["rec_mode"]
             and sw.get("channels") == want["channels"]
             and sw.get("hazard_id") == want["hazard_id"]
@@ -2055,19 +2512,29 @@ def run_events(events: Sequence[str], out: str, variants=None, draws: int = DEFA
                hazard: Optional[Hazard] = None, workers: int = 2, rec_mode: str = "level",
                channels: str = "abc", force: bool = False, tag: str = "",
                join: Optional[Sequence[float]] = None, tail: Optional[TailCal] = None,
-               fill_models: Sequence[str] = FILL_MODELS) -> List[dict]:
+               fill_models: Sequence[str] = FILL_MODELS, fav_hazard: Optional[Hazard] = None,
+               stress_hole: bool = False, fav_off: bool = False,
+               stress_take: str = "full") -> List[dict]:
     """run_event_variants over events (settled ones), written to
     runs_dir(out, tag)/<ET day>/<EVENT>.json; an existing file is reused
     only when _reuse_ok (same draws / rec_mode / channels / policies / fill
-    models / hazard identity incl. scale and kind / join / tail table)."""
+    models / hazard identity incl. scale and kind / join / tail table; with
+    stress the gap rule and the favorite-hazard table, load_fav_hazard()
+    unless given or fav_off)."""
     variants = variants or dict(SWEEP_VARIANTS)
     hazard = hazard or load_hazard()
     tail = tail if tail is not None else TailCal()
+    if STRESS in fill_models and fav_hazard is None and not fav_off:
+        fav_hazard = load_fav_hazard()
+    if fav_off:
+        fav_hazard = None
     jl = [float(join[0]), float(join[1])] if join and float(join[0]) else None
     want = {"draws": int(draws), "rec_mode": rec_mode, "channels": channels,
             "hazard_id": hazard.ident(), "join": jl,
             "tail_id": tail.ident() if tail else None, "fill_models": list(fill_models),
-            "policies": json.loads(json.dumps(variants))}
+            "policies": json.loads(json.dumps(variants)), "stress_hole": bool(stress_hole),
+            "stress_take": stress_take,
+            "fav_hazard_id": fav_hazard.ident() if fav_hazard else None}
     todo, results = [], []
     for ev in events:
         S = C.parse_event(ev)[1]
@@ -2081,7 +2548,9 @@ def run_events(events: Sequence[str], out: str, variants=None, draws: int = DEFA
                      "hazard_doc": hazard.doc, "hazard_scale": hazard.scale,
                      "hazard_kind": hazard.kind, "rec_mode": rec_mode, "channels": channels,
                      "join": jl, "tail_doc": tail.doc if tail else None,
-                     "fill_models": list(fill_models), "path": path})
+                     "fill_models": list(fill_models), "path": path,
+                     "fav_doc": fav_hazard.doc if fav_hazard else None,
+                     "stress_hole": bool(stress_hole), "stress_take": stress_take})
     w = max(1, min(MAX_WORKERS, int(workers), len(todo) or 1))
     if w == 1:
         for a in todo:
@@ -2123,7 +2592,7 @@ def sens_hazard(doc: dict, cfg: dict) -> Hazard:
 # --------------------------------------------------------------------------
 
 _TAB_KEYS = ("reward", "contracts", "filler_contracts", "trading_pnl", "net", "pnl_fair",
-             "net_fair", "net_cal", "net_cal_tlo", "net_cal_thi")
+             "net_fair", "net_cal", "net_cal_tlo", "net_cal_thi", "above1c_contracts")
 BOOT_N = 10000
 BOOT_SEED = 20261016
 
@@ -2149,7 +2618,8 @@ def variant_table(results: List[dict], boot_n: int = BOOT_N) -> dict:
     Monte Carlo se of the swp total, "hour_sd": sd of the per-hour nets,
     "boot_p05" / "boot_p95" / "p_pos": bootstrap over hours of the total,
     "ex_best": total minus its best hour, "per_event": {event: net}}},
-    "by_hour": {variant|fm: {ET settle hour: {...}}}}."""
+    "by_hour": {variant|fm: {ET settle hour: {...}}}}; "ex_best_worst" = the
+    total without its best and its worst hour."""
     tab: Dict[str, dict] = {}
     by_hour: Dict[str, dict] = {}
     for r in results:
@@ -2187,6 +2657,8 @@ def variant_table(results: List[dict], boot_n: int = BOOT_N) -> dict:
                     "net_se": round(math.sqrt(t["var"]), 2),
                     "hour_sd": round(sd, 2), "boot_p05": p05, "boot_p95": p95, "p_pos": ppos,
                     "ex_best": round(sum(nets) - max(nets), 2) if nets else None,
+                    "ex_best_worst": (round(sum(nets) - max(nets) - min(nets), 2)
+                                      if len(nets) > 1 else None),
                     "per_event": t["per_event"]}
     hours = {key: {h: {k: round(x, 2) for k, x in dd.items()} for h, dd in sorted(hh.items())}
              for key, hh in by_hour.items()}
@@ -2211,30 +2683,32 @@ def format_table(tab: dict, variants: Sequence[str]) -> str:
     t = tab["table"]
     days = sorted({d for v in t.values() for d in v["days"]})
     lines = []
-    hdr = (f"{'variant':12s} {'fill':4s} " + " ".join(f"{d[5:]:>7s}" for d in days) +
+    nw = max([12] + [len(n) for n in variants])
+    hdr = (f"{'variant':{nw}s} {'fill':6s} " + " ".join(f"{d[5:]:>7s}" for d in days) +
            f" {'reward':>7s} {'1c ctr':>7s} {'pnl':>7s} {'NET':>7s} {'mc_se':>5s} "
-           f"{'90% CI (hours)':>17s} {'P>0':>5s} {'ex-best':>7s} "
+           f"{'90% CI (hours)':>17s} {'P>0':>5s} {'ex-best':>7s} {'ex-b&w':>7s} "
            f"{'net@realized tails':>22s} {'ev':>3s}")
     lines.append(hdr)
     lines.append("  per-day cells: net $. NET = realized settlement; 90% CI / P>0 = bootstrap "
-                 "over hours; ex-best = NET minus its best hour; net@realized tails = fills "
+                 "over hours; ex-best = NET minus its best hour; ex-b&w = NET minus its best "
+                 "and its worst hour; net@realized tails = fills "
                  "marked at the realized longshot rate of their model bucket given a taker hit "
                  "a bid at that price [CI ends] -- fills at a 10-90% fair keep the model's own "
                  "fair, so for live-strike quoting (F*) it is circular, not evidence")
     for name in variants:
-        for fm in FILL_MODELS:
+        for fm in ALL_FILL_MODELS:
             v = t.get(f"{name}|{fm}")
             if not v:
                 continue
             cells = " ".join(f"{v['days'].get(d, {}).get('net', 0.0):7.0f}" for d in days)
             tt = v["total"]
-            se = f"{v['net_se']:5.1f}" if fm == "swp" else "     "
+            se = f"{v['net_se']:5.1f}" if fm in ("swp", STRESS) else "     "
             pp = f"{v['p_pos']:5.2f}" if v.get("p_pos") is not None else "    -"
-            lines.append(f"{name:12s} {fm:4s} {cells} {tt.get('reward', 0):7.0f} "
+            lines.append(f"{name:{nw}s} {fm:6s} {cells} {tt.get('reward', 0):7.0f} "
                          f"{tt.get('filler_contracts', 0):7.0f} {tt.get('trading_pnl', 0):7.0f} "
                          f"{tt.get('net', 0):7.0f} {se} {_ci_cell(v)} {pp} "
-                         f"{(v.get('ex_best') or 0):7.0f} {_cal_cell(tt)} "
-                         f"{int(tt.get('events', 0)):3d}")
+                         f"{(v.get('ex_best') or 0):7.0f} {(v.get('ex_best_worst') or 0):7.0f} "
+                         f"{_cal_cell(tt)} {int(tt.get('events', 0)):3d}")
     return "\n".join(lines)
 
 
@@ -2265,7 +2739,7 @@ def format_day_detail(tab: dict, variants: Sequence[str]) -> str:
     lines = [f"{'variant|fill':18s} {'day':10s} {'ev':>3s} {'reward':>9s} {'1c ctr':>9s} "
              f"{'pnl':>9s} {'net':>9s} {'net_cal':>9s}"]
     for name in variants:
-        for fm in FILL_MODELS:
+        for fm in ALL_FILL_MODELS:
             v = t.get(f"{name}|{fm}")
             if not v:
                 continue
@@ -3014,6 +3488,62 @@ def cmd_calibrate(a) -> int:
     return 0
 
 
+def _fav_job(ev):
+    try:
+        return calibrate_fav_event(ev)
+    except Exception as e:
+        return {"event": ev, "error": f"{type(e).__name__}: {e}",
+                "trace": traceback.format_exc()[-2000:]}
+
+
+def format_fav_calibration(doc: dict) -> str:
+    hz = doc["hazard"]
+    L = [f"hidden favorite-taker table (stress channel (e)) over {len(doc['events'])} hours: "
+         f"top-of-book hits per second on sides with fair >= {FAVHAZ_MIN_P}",
+         f"  {'fav':>10s} {'expo_h':>7s} {'hits':>5s} {'lam/s':>8s} {'clear%':>6s}"]
+    for fb in FAV_LABELS:
+        d = doc["observed"].get(fb) or {}
+        if not d.get("expo_s"):
+            continue
+        L.append(f"  {fb:>10s} {d['expo_s'] / 3600:7.1f} {d['hits']:5d} {(d['lam'] or 0):8.5f} "
+                 f"{100 * (d['cleared_frac'] or 0):6.0f}")
+    L.append("  fitted a[fav][age] (per s): ")
+    for fb in FAV_LABELS[1:]:
+        L.append(f"  {fb:>10s} " + " ".join(f"{ab}={hz['a'][fb][ab]:.4f}" for ab in AGE_LABELS))
+    L.append("  mult: " + " ".join(f"{mb}={x:.2f}" for mb, x in hz["mult"].items()))
+    return "\n".join(L)
+
+
+def cmd_calibrate_fav(a) -> int:
+    """The stress model's hidden favorite-taker table -> <out>/favhazard.json
+    (the hours the live executor traded are left out unless --with-live: the
+    audit tests the table on them)."""
+    evs = a.events or recorded_events(a.days)
+    print(f"calibrating the favorite hazard on {len(evs)} events", flush=True)
+    w = max(1, min(MAX_WORKERS, a.workers))
+    if w == 1:
+        rows = [_fav_job(ev) for ev in evs]
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=w, initializer=_worker_init) as ex:
+            rows = list(ex.map(_fav_job, evs))
+    for r in rows:
+        if r.get("error"):
+            print(f"  {r['event']}: ERROR {r['error']}")
+    use = [r for r in rows if r and not r.get("error") and (a.with_live or not r.get("live_hour"))]
+    doc = aggregate_fav(use)
+    os.makedirs(a.out, exist_ok=True)
+    write_fit_file(os.path.join(a.out, "favhazard.json"), doc)
+    C.write_json_atomic(os.path.join(a.out, "favhazard_clusters.json"),
+                        [c for r in use for c in r["clusters"]])
+    txt = format_fav_calibration(doc)
+    with open(os.path.join(a.out, "favhazard.txt"), "w", encoding="utf-8") as f:
+        f.write(txt + "\n")
+    print(txt)
+    print(f"-> {os.path.join(a.out, 'favhazard.json')} (id {Hazard(doc).ident()})")
+    return 0
+
+
 def _day_settled_events(days: Sequence[str]) -> List[str]:
     evs = []
     for d in days:
@@ -3029,10 +3559,22 @@ def cmd_run(a) -> int:
     evs = _day_settled_events(a.day)
     join = (a.join_q, a.join_s) if a.join_q else None
     fms = tuple(x for x in a.fill_models.split(",") if x)
+    bad = [x for x in fms if x not in ALL_FILL_MODELS]
+    if bad:
+        print(f"unknown fill models {bad}; known {ALL_FILL_MODELS}")
+        return 2
+    fav = None
+    if STRESS in fms and not a.no_favhaz:
+        fav = load_fav_hazard(a.favhazard)
     print(f"{len(evs)} settled recorded events, {len(variants)} variants, {a.draws} swp draws, "
-          f"hazard x{hz.scale} {hz.kind} ({hz.ident()}), tag {a.tag or 'base'}", flush=True)
+          f"hazard x{hz.scale} {hz.kind} ({hz.ident()}), tag {a.tag or 'base'}"
+          + (f", stress (favorite hazard {fav.ident() if fav else 'off'}, gap rule "
+             f"{'on' if a.stress_hole else 'off'}, take {a.stress_take})"
+             if STRESS in fms else ""), flush=True)
     res = run_events(evs, a.out, variants, a.draws, hz, a.workers, a.rec_mode, a.channels,
-                     a.force, tag=a.tag, join=join, tail=tail, fill_models=fms)
+                     a.force, tag=a.tag, join=join, tail=tail, fill_models=fms,
+                     fav_hazard=fav, stress_hole=a.stress_hole, fav_off=fav is None,
+                     stress_take=a.stress_take)
     tab = variant_table(res)
     print(format_table(tab, list(variants)))
     return 1 if any(r.get("error") for r in res) else 0
@@ -3211,13 +3753,31 @@ def main(argv=None) -> int:
             p.add_argument("--tag", default="", help="write runs_<tag> (a sensitivity) instead of runs")
             p.add_argument("--join-q", type=float, default=0.0)
             p.add_argument("--join-s", type=float, default=5.0)
-            p.add_argument("--fill-models", default=",".join(FILL_MODELS))
+            p.add_argument("--fill-models", default=",".join(FILL_MODELS),
+                           help="comma list of " + ",".join(ALL_FILL_MODELS)
+                                + " (stress: not in the daily pipeline)")
+            p.add_argument("--favhazard", default=None,
+                           help="stress channel (e)'s table (default <out>/favhazard.json, "
+                                "else the repo's temp_shadow_sweep_favhazard.json)")
+            p.add_argument("--no-favhaz", action="store_true", help="stress without channel (e)")
+            p.add_argument("--stress-take", default="full", choices=STRESS_TAKES,
+                           help="stress (d): our lots taken whole, or up to the taker's own size")
+            p.add_argument("--stress-hole", action="store_true",
+                           help="stress gap rule: a cleared worst level also takes our lots "
+                                "below it down to the next external level")
         if name == "sens":
             p.add_argument("--configs", default=None, help="comma list of " + ",".join(SENS_CONFIGS))
         if name == "validate":
             p.add_argument("--event", nargs="*", default=None)
             p.add_argument("--live", action="store_true",
                            help="every settled hour the live executor traded")
+    cf = sub.add_parser("calibrate-fav", help="stress channel (e): the hidden favorite-taker "
+                                              "table -> <out>/favhazard.json")
+    cf.add_argument("--events", nargs="*", default=None)
+    cf.add_argument("--days", nargs="*", default=None)
+    cf.add_argument("--workers", type=int, default=2)
+    cf.add_argument("--with-live", action="store_true",
+                    help="keep the hours the live executor traded in the fit")
     t = sub.add_parser("table")
     t.add_argument("--day", nargs="*", default=None)
     tl = sub.add_parser("tails")
@@ -3239,7 +3799,8 @@ def main(argv=None) -> int:
     if a.cmd in ("run", "sens") and a.tails is None:
         tp = os.path.join(a.out, "tails.json")
         a.tails = tp if os.path.exists(tp) else None
-    return {"calibrate": cmd_calibrate, "run": cmd_run, "validate": cmd_validate,
+    return {"calibrate": cmd_calibrate, "calibrate-fav": cmd_calibrate_fav,
+            "run": cmd_run, "validate": cmd_validate,
             "sens": cmd_sens, "table": cmd_table, "tails": cmd_tails}[a.cmd](a)
 
 
