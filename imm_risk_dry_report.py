@@ -118,10 +118,10 @@ def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
-def verdict(net, n, what):
+def verdict(net, n, what, yes="TURN ON"):
     if n < MIN_TRIPS:
         return f"WATCH (only {plural(n, what)}: too few to call)"
-    return "TURN ON" if net > 0 else "KEEP OFF"
+    return yes if net > 0 else "KEEP OFF"
 
 
 # --- #2: the cross-event breaker ------------------------------------------
@@ -250,12 +250,12 @@ def risk_section(w, rows, fills, marks, days, until):
                    "m4": loss, "m5": sum(s["t"].m5 for s in sp),
                    "hours": sum(s["end"] - s["start"] for s in sp) / 3600.0}
     b, k = res["block"], res["skew"]
-    w(f"**#4 block: {verdict(b['net'], len(b['spells']), 'block spell')}.** "
+    w(f"**#4 block: {verdict(b['net'], len(b['spells']), 'block spell', 'WORTH BUILDING LIVE')}.** "
       f"Net {money(b['net'])} ({money(b['net'] / days)}/day): the blocked "
       f"sides took {plural(b['fills'], 'fill')} that lost {money(-b['m4'])} at 4 hours, "
       f"for {money(b['cost'])} of reward on those sides.")
     w("")
-    w(f"**#5 skew: {verdict(k['net'], len(k['spells']), 'skew spell')}.** "
+    w(f"**#5 skew: {verdict(k['net'], len(k['spells']), 'skew spell', 'WORTH BUILDING LIVE')}.** "
       f"Net {money(k['net'])} ({money(k['net'] / days)}/day): the skewed "
       f"sides took {plural(k['fills'], 'fill')} that lost {money(-k['m4'])} at 4 hours "
       f"(half saved a tick back: {money(k['saved'])}), for "
