@@ -739,3 +739,40 @@ python temp_shadow_sweep.py --out <dir> calibrate-fav                           
 ```
 
 `--out` defaults to `TEMP_SHADOW_AUDIT_OUT`, else `<TEMP_SHADOW_DATA>\audit`. The 2026-10-17 runs used a copy of the recording and the executor's 10/16 logs in the session scratchpad (`TEMP_SHADOW_DATA`, `TEMP_MM_LIVE_DIR`); KL-data was only read.
+
+## Pre-registered tests (written 2026-10-17 ~15:00 ET, before any hour of their windows)
+
+Jack 2026-10-17 adopted these go-live rules ("Yes. And Assume rewards are paid"):
+1. Rewards are assumed paid to the account that quotes.
+2. Decisions use the STRESS fill model (temp_shadow_sweep `stress`: swp plus level-clear at every price).
+3. A variant passes only on hours AFTER it was chosen.
+4. Any live pilot runs at 1/3 size, night hours only, with a $300 daily halt, an hourly live-vs-shadow reconciliation, and an auto-halt after 2 consecutive hours below the shadow's band.
+5. Scale up only if the pilot earns at least 50% of the shadow's prediction.
+
+Jack 2026-10-17 then chose "1": keep live halted, fix the report, and pre-register the agreement rule below, to be tested only on future hours.
+
+### Test A — FAV_night (rule 3)
+- **Window:** ET days 2026-10-17 through 2026-10-21 (5 days).
+- **PASS iff all of:**
+  - the window's total stress net is > 0;
+  - at least 4 of the 5 days have stress net > 0;
+  - the calibrated-tails expectation is > 0.
+- The total excluding the best and worst hour is reported for information.
+
+### Test B — FAV_night_agree (new rule; chosen from the 10/16 21:00 and 22:00 ET losses, so it is judged ONLY on later data)
+- **Definition:** FAV_night plus policy key `fav_market_min_p = 0.95`. A favorite join is placed only when the MARKET also prices the strike as a favorite, i.e. market favorite probability ≥ 0.95, computed on the external book at decision time:
+  - **Both sides have resting bids:** mid = (best favorite bid + (100 − best longshot bid)) / 200.
+  - **Longshot side empty (locked or one-sided):** (best favorite bid + 1) / 100.
+  - **Favorite side empty:** no join.
+- The model condition is unchanged: favorite fair ≥ `fav_min_p` 0.97.
+- **Window:** ET days 2026-10-18 through 2026-10-22 (5 days).
+- **PASS iff all of:**
+  - the window's total stress net is > 0;
+  - at least 4 of the 5 days have stress net > 0;
+  - the total excluding the variant's best and worst hour is > 0;
+  - the calibrated-tails expectation is > 0 (reported next to a recent-regime version, because the tail table comes from a calmer period).
+
+### Both tests
+- Nothing is re-tuned on window data. A changed rule needs a new pre-registered window.
+- A PASS only makes the variant eligible for the rule-4 pilot. It does not start trading.
+- The verdicts appear in the daily report: "in progress (n/5 days)" until the window completes, then PASS or FAIL.
