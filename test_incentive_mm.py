@@ -47,6 +47,7 @@ imm.ADMIT_SUSTAIN_SECS = 0
 # TestRefreshJitter re-arm them.
 _PLACE_RATE_CODE_DEFAULT = imm.PLACE_RATE_PER_SEC
 _REFRESH_JITTER_CODE_DEFAULT = imm.ORDER_REFRESH_JITTER_SECS
+_WS_TICK_CODE_DEFAULT = imm.WS_TICK_SECS
 imm.PLACE_RATE_PER_SEC = 0.0
 imm.ORDER_REFRESH_JITTER_SECS = 0
 
@@ -25608,9 +25609,13 @@ class TestWSStaleEpisodes(unittest.TestCase):
         self.cancelled = []
         self.bot.cancel_order = lambda oid, reason="": \
             self.cancelled.append(oid) or True
-        p = mock.patch.object(imm, "WS_MODE", "shadow")
-        p.start()
-        self.addCleanup(p.stop)
+        # the episode lines only; first sightings (`seen` / `unseen`,
+        # 2026-10-17) have their own tests (TestFasterFastCancel)
+        for name, v in (("WS_MODE", "shadow"), ("WS_SEEN_LOG", False),
+                        ("WS_FAST_CONFIRM_HOLDOUT", 0.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _view(self, oid="o1", side="bid", px=49.0, rem=20.0):
         self.bot._resting_view = {self.T: [{
@@ -26404,6 +26409,12 @@ class TestWSNarrowGate(unittest.TestCase):
         self.bot._resting_view = {self.T: [{
             "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
             "placed": self.now - 100.0, "pad": False}]}
+        # the 1s two-look rule this class was written for; the faster
+        # confirm and its log are TestFasterFastCancel's
+        for name, v in (("WS_SEEN_LOG", False), ("WS_FAST_CONFIRM_SECS", 1.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _gate(self, mode, fast, gap):
         for name, v in (("WS_MODE", mode), ("WS_FAST", fast),
@@ -29367,6 +29378,114 @@ class TestBackOfLine(unittest.TestCase):
         c.get_queue_positions(event_ticker="EV")
         self.assertEqual(seen, ["/portfolio/orders/queue_positions?market_tickers=A,B",
                                 "/portfolio/orders/queue_positions?event_ticker=EV"])
+
+
+class TestFasterFastCancel(unittest.TestCase):
+    """Jack 2026-10-17: "Yes, and email report in 3 days" -- an acting rung
+    (live, >= the narrow gate) is cancelled 0.25s after it is first seen
+    ahead; 20% of episodes keep 1s as a control; every first sighting is
+    logged (`seen`), and every suspect that ends unconfirmed (`unseen`)."""
+    T = "KXGOOD-99DEC31-A"
+    FAR = ({0.35: 500.0, 0.49: 20.0}, {0.49: 1200.0})    # our 49c bid, 14c ahead
+    NEAR = ({0.47: 500.0, 0.49: 20.0}, {0.49: 1200.0})   # ... 2c ahead
+    JOINED = ({0.49: 520.0}, {0.49: 1200.0})
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append(oid) or True
+        self.bot._resting_view = {self.T: [{
+            "order_id": "o1", "side": "bid", "px": 49.0, "rem": 20.0,
+            "placed": self.now - 100.0, "pad": False}]}
+        for name, v in (("WS_MODE", "on"), ("WS_FAST", True), ("WS_FAST_MIN_GAP_C", 10.0),
+                        ("WS_FAST_CONFIRM_SECS", 0.25), ("WS_FAST_CONFIRM_HOLDOUT", 0.2),
+                        ("WS_SEEN_LOG", True), ("WS_STALE_LOG", True)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _draw(self, x):
+        self.bot._ws_rng = mock.Mock(random=lambda: x)
+
+    def _check(self, book, dt):
+        self.feed.books[self.T] = book
+        return self.bot._ws_fast_check({self.T}, self.now + dt)
+
+    def _evs(self):
+        return [r["ev"] for name, r in self.recs if name == "ws_stale"]
+
+    def _rec(self, ev):
+        return next(r for name, r in self.recs if name == "ws_stale" and r["ev"] == ev)
+
+    def test_the_fast_arm_cancels_a_quarter_second_after_first_sight(self):
+        self._draw(0.9)                                   # fast arm
+        self._check(self.FAR, 0.0)
+        self._check(self.FAR, 0.1)
+        self.assertEqual(self.cancelled, [])
+        self._check(self.FAR, 0.3)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual(self._evs(), ["seen", "flag", "narrow", "cancel"])
+        seen, cancel = self._rec("seen"), self._rec("cancel")
+        self.assertEqual((seen["arm"], seen["acts"], seen["gap_c"], seen["phase"]),
+                         ("fast", True, 14.0, "idle"))
+        self.assertEqual((cancel["by"], cancel["arm"], cancel["seen_s"]), ("fast", "fast", 0.3))
+        self.assertEqual(self._rec("flag")["arm"], "fast")
+
+    def test_the_control_arm_keeps_the_one_second_rule(self):
+        self._draw(0.1)                                   # under 0.2: control
+        self._check(self.FAR, 0.0)
+        self._check(self.FAR, 0.5)
+        self.assertEqual(self.cancelled, [])
+        self._check(self.FAR, 1.1)
+        self.assertEqual(self.cancelled, ["o1"])
+        self.assertEqual((self._rec("seen")["arm"], self._rec("cancel")["arm"]),
+                         ("control", "control"))
+
+    def test_a_dry_rung_under_the_gap_still_waits_a_second(self):
+        self._draw(0.9)
+        self._check(self.NEAR, 0.0)
+        self._check(self.NEAR, 0.5)
+        self.assertEqual(self._evs(), ["seen"])
+        self.assertFalse(self._rec("seen")["acts"])
+        self._check(self.NEAR, 1.1)
+        self.assertEqual(self._evs(), ["seen", "flag"])
+        self.assertEqual(self.cancelled, [])
+
+    def test_a_flicker_that_ends_unconfirmed_is_logged_unseen(self):
+        self._draw(0.1)                                   # control: 1s to confirm
+        self._check(self.FAR, 0.0)
+        self._check(self.JOINED, 0.4)                     # the line came back
+        self.assertEqual(self._evs(), ["seen", "unseen"])
+        u = self._rec("unseen")
+        self.assertEqual((u["why"], u["arm"], u["secs"]), ("clear", "control", 0.4))
+        self.assertEqual((self.bot._ws_suspect, self.bot._ws_arm), ({}, {}))
+
+    def test_the_cycle_dropping_a_suspect_logs_it_unseen(self):
+        self._draw(0.1)
+        self._check(self.FAR, 0.0)
+        b = self.bot
+        b._cycle_cancelled, b._cycle_amended = set(), {"o1": 45}
+        b._build_resting_view([{"order_id": "o1", "ticker": self.T, "book_side": "bid",
+                                "yes_price": 49, "remaining_count": 20}], self.now + 0.5)
+        self.assertEqual(self._rec("unseen")["why"], "cycle")
+        self.assertEqual((b._ws_suspect, b._ws_arm), ({}, {}))
+
+    def test_the_seen_log_switch(self):
+        with mock.patch.object(imm, "WS_SEEN_LOG", False):
+            self._draw(0.9)
+            self._check(self.FAR, 0.0)
+            self._check(self.FAR, 0.3)
+        self.assertEqual(self._evs(), ["flag", "narrow", "cancel"])
+
+    def test_the_in_cycle_tick_default(self):
+        self.assertEqual(_WS_TICK_CODE_DEFAULT, 0.25)
 
 
 class TestRateLimitWatch(unittest.TestCase):

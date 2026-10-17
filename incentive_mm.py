@@ -3442,7 +3442,28 @@ def _ws_top(levels: Dict[float, float], n: int = 60) -> List[List[float]]:
 # cancel of it reads 404 as done, and an amend of it fails soft, so the next
 # cycle re-places. Episodes carry phase "cycle" / "idle".
 WS_CHECK_IN_CYCLE = os.environ.get("IMM_WS_CHECK_IN_CYCLE", "1") == "1"
-WS_TICK_SECS = max(0.2, _env_float("IMM_WS_TICK_SECS", 1.0))
+# 1.0 -> 0.25 (2026-10-17, the faster fast cancel below): inside a cycle the
+# check looked once a second, so a rung left alone mid-cycle (~70% of the
+# time) waited up to a second just to be SEEN; between cycles it was already
+# 4 a second (WS_IDLE_BATCHES_PER_SEC).
+WS_TICK_SECS = max(0.2, _env_float("IMM_WS_TICK_SECS", 0.25))
+# FASTER FAST CANCEL (Jack 2026-10-17: "Yes, and email report in 3 days", to
+# turning it on with a 20% control and a first-sighting log). A rung had to
+# read ahead on two looks >= 1s apart before the fast cancel acted. Of the
+# 330 fills of 10/12-10/16 where the line at our price emptied (1-9c gaps),
+# only 25 came 1.5s+ after the bot's confirmed flag -- most land inside that
+# second. An ACTING episode (live, at least WS_FAST_MIN_GAP_C ahead, not
+# exempt) in the "fast" arm now needs WS_FAST_CONFIRM_SECS between its two
+# looks; a WS_FAST_CONFIRM_HOLDOUT share of episodes, drawn at first sight,
+# keeps the old 1s as a CONTROL (arm "control"), so the report can net the
+# two. Dry episodes (under the gap) keep 1s, so their flag lines mean what
+# they meant. WS_SEEN_LOG writes every first sighting (ws_stale `seen`, with
+# its arm and gap) and every suspect that ends before it is confirmed
+# (`unseen`, with how long it lasted): the flickers the old rule never logged.
+# imm_fast_cancel_report.py scores it (emailed once, 3 days in).
+WS_FAST_CONFIRM_SECS = max(0.0, _env_float("IMM_WS_FAST_CONFIRM_SECS", 0.25))
+WS_FAST_CONFIRM_HOLDOUT = min(1.0, max(0.0, _env_float("IMM_WS_FAST_CONFIRM_HOLDOUT", 0.2)))
+WS_SEEN_LOG = os.environ.get("IMM_WS_SEEN_LOG", "1") == "1"
 
 # NARROW FAST CANCEL (Jack 2026-10-08: "yes" to a dry run of a fast cancel
 # only for quotes far ahead of the touch). Scored over 10/4-10/8 (86.5h,
@@ -9489,6 +9510,8 @@ _CONFIG_CODE_KNOBS = (
     "WS_AUDIT_TRIP_EXACT", "WS_AUDIT_COOLDOWN_SECS", "WS_STALE_LOG",
     # ...the in-cycle check and the event sweep breaker (2026-10-04)
     "WS_CHECK_IN_CYCLE", "WS_TICK_SECS", "SWEEP_BREAKER", "SWEEP_HOLD_SECS",
+    # ...the faster fast cancel, its control and the first-sighting log (2026-10-17)
+    "WS_FAST_CONFIRM_SECS", "WS_FAST_CONFIRM_HOLDOUT", "WS_SEEN_LOG",
     "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
     # ...its linked series and per-series holds (2026-10-15)
     "SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES",
@@ -17585,6 +17608,9 @@ class IncentiveMarketMaker:
         self._cycle_amended_ct: Dict[str, float] = {}
         self._resting_view: Dict[str, List[dict]] = {}
         self._ws_suspect: Dict[str, float] = {}    # order id -> first seen ahead
+        # faster fast cancel (2026-10-17): order id -> its arm ("fast" /
+        # "control"), drawn when it is first seen ahead and logged (`seen`)
+        self._ws_arm: Dict[str, str] = {}
         # open stale-quote episodes (2026-10-04, WS_STALE_LOG): order id ->
         # the flagged rung (ticker, side, cents, flagged at); `would_cancel`
         # counts episodes, so a rung that clears and goes stale again counts
@@ -19797,7 +19823,7 @@ class IncentiveMarketMaker:
                                  or oid in self._cycle_cancelled):
                     continue      # this cycle acted on it: its entry is stale
                 if o["pad"] or now_ts - o["placed"] < 2.0:
-                    self._ws_suspect.pop(oid, None)
+                    self._ws_suspect_end(oid, now_ts, "young")
                     continue
                 # the view is the cycle's read: an order filled out or pulled
                 # since leaves no size at its price in the book, and there is
@@ -19806,7 +19832,7 @@ class IncentiveMarketMaker:
                 lvl = (yes.get(round(o["px"] / 100.0, 4), 0.0) if o["side"] == "bid"
                        else no.get(round((100.0 - o["px"]) / 100.0, 4), 0.0))
                 if lvl <= 0.01:
-                    self._ws_suspect.pop(oid, None)
+                    self._ws_suspect_end(oid, now_ts, "gone")
                     if oid in self._ws_flagged:
                         self._ws_episode_end(oid, "gone", now_ts)
                     continue
@@ -19815,14 +19841,11 @@ class IncentiveMarketMaker:
                          if o["side"] == "bid"
                          else (ext_ask is None or p < ext_ask - 1e-6))
                 if not ahead:
-                    self._ws_suspect.pop(oid, None)
+                    self._ws_suspect_end(oid, now_ts, "clear")
                     if oid in self._ws_flagged:     # the touch came back
                         self._ws_episode_end(oid, "clear", now_ts,
                                              ext_bid=_ws_cents(ext_bid),
                                              ext_ask=_ws_cents(ext_ask))
-                    continue
-                first = self._ws_suspect.setdefault(oid, now_ts)
-                if now_ts - first < 1.0:
                     continue
                 # the narrow gate (WS_FAST_MIN_GAP_C): only a rung at least
                 # that far ahead is cancelled; the other flags stay dry
@@ -19830,6 +19853,29 @@ class IncentiveMarketMaker:
                 wide = WS_FAST_MIN_GAP_C <= 0 or (
                     gap is not None and gap >= WS_FAST_MIN_GAP_C - 1e-9)
                 act = not dry and wide and not exempt
+                if oid not in self._ws_suspect:
+                    # first seen ahead: draw its arm (2026-10-17) and log it
+                    self._ws_suspect[oid] = now_ts
+                    arm = "control" if (WS_FAST_CONFIRM_HOLDOUT > 0 and
+                                        self._ws_rng.random() < WS_FAST_CONFIRM_HOLDOUT) \
+                        else "fast"
+                    self._ws_arm[oid] = arm
+                    if WS_SEEN_LOG and WS_STALE_LOG:
+                        self._sink("ws_stale", {
+                            "ev": "seen", "ts": round(now_ts, 3), "phase": phase,
+                            "ticker": t, "order_id": oid, "side": o["side"],
+                            "px": o["px"], "rem": o["rem"],
+                            "gap_c": None if gap is None else round(gap, 2),
+                            "acts": act, "arm": arm,
+                            "ext_bid": _ws_cents(ext_bid),
+                            "ext_ask": _ws_cents(ext_ask)})
+                first = self._ws_suspect[oid]
+                # an acting episode in the fast arm confirms after
+                # WS_FAST_CONFIRM_SECS; the control and dry episodes after 1s
+                need = WS_FAST_CONFIRM_SECS if (
+                    act and self._ws_arm.get(oid, "fast") == "fast") else 1.0
+                if now_ts - first < need:
+                    continue
                 new = self._ws_episode_flag(t, o, now_ts, first, ext_bid,
                                             ext_ask, yes, no, orders, not act,
                                             phase=phase)
@@ -19858,18 +19904,34 @@ class IncentiveMarketMaker:
                     continue
                 self._ws_cancel_times.append(now_ts)
                 self._ws_suspect.pop(oid, None)
+                arm = self._ws_arm.pop(oid, None)
                 if self.cancel_order(oid, reason="ws_stale"):
                     self.state.cancelled_today += 1
                     cancels += 1
                     self._ws_fast["cancels"] += 1
                     orders.remove(o)
-                    self._ws_episode_end(oid, "cancel", now_ts, by="fast")
+                    self._ws_episode_end(oid, "cancel", now_ts, by="fast",
+                                         arm=arm, seen_s=round(now_ts - first, 2))
                     log(f"{self.tag} WS fast: cancelled {t} "
                         f"{o['side'].upper()} @ {o['px']:g}c -- the external "
                         f"touch left it ahead (bid {ext_bid}, ask {ext_ask})")
         if cancels:
             self._ws_wake = True
         return cancels
+
+    def _ws_suspect_end(self, oid: str, now_ts: float, why: str) -> None:
+        """A suspect stops reading ahead (`why`: clear / gone / cycle). One
+        that was never confirmed -- a flicker the old 1s rule never logged --
+        gets an `unseen` line with how long it lasted (2026-10-17, the
+        faster fast cancel's report)."""
+        first = self._ws_suspect.pop(oid, None)
+        arm = self._ws_arm.pop(oid, None)
+        if first is None or arm is None or oid in self._ws_flagged:
+            return
+        if WS_SEEN_LOG and WS_STALE_LOG:
+            self._sink("ws_stale", {"ev": "unseen", "ts": round(now_ts, 3),
+                                    "order_id": oid, "why": why, "arm": arm,
+                                    "secs": round(now_ts - first, 2)})
 
     def _ws_episode_flag(self, t: str, o: dict, now_ts: float, first: float,
                          ext_bid: Optional[float], ext_ask: Optional[float],
@@ -19898,6 +19960,7 @@ class IncentiveMarketMaker:
                 "rem": o["rem"],
                 "age_s": round(now_ts - o["placed"], 1) if o["placed"] else None,
                 "ahead_s": round(now_ts - first, 2),
+                "arm": self._ws_arm.get(oid),
                 "ext_bid": _ws_cents(ext_bid), "ext_ask": _ws_cents(ext_ask),
                 "gap_c": None if gap is None else round(gap, 2),
                 "yes": _ws_top(yes), "no": _ws_top(no),
@@ -20223,8 +20286,13 @@ class IncentiveMarketMaker:
         self._ws_recheck_all = True        # the next check looks at all of it
         # an order the cycle amended keeps no first-seen-ahead time from its
         # old price: the two looks start over at the new one
+        for k in [k for k in self._ws_suspect
+                  if k not in seen or k in self._cycle_amended]:
+            self._ws_suspect_end(k, now_ts, "cycle")   # unseen lines, arms (2026-10-17)
         self._ws_suspect = {k: v for k, v in self._ws_suspect.items()
                             if k in seen and k not in self._cycle_amended}
+        self._ws_arm = {k: v for k, v in self._ws_arm.items()
+                        if k in self._ws_suspect or k in self._ws_flagged}
         # the stale-quote episodes this cycle closed: amended to a new price,
         # cancelled, or gone from the book (filled out / expired)
         if self._ws_flagged:
@@ -28769,6 +28837,11 @@ class IncentiveMarketMaker:
                       + ")" if WS_FAST and WS_MODE == "on" else
                       "would be cancelled -- DRY, logged as `narrow`")
                    if WS_FAST_MIN_GAP_C > 0 else ""))
+            log(f"faster fast cancel (2026-10-17): an acting rung is cancelled "
+                f"{WS_FAST_CONFIRM_SECS:g}s after it is first seen ahead (was 1s); "
+                f"{WS_FAST_CONFIRM_HOLDOUT:.0%} of episodes, drawn at first sight, "
+                f"keep 1s as a control; first sightings "
+                + ("logged (ws_stale `seen` / `unseen`)" if WS_SEEN_LOG else "not logged"))
             log(f"WS candidate books (2026-10-08): {WS_CANDIDATES}"
                 + {"shadow": " -- the feed also carries every candidate the "
                              "universe refresh reads; it still reads REST, each "
