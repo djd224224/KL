@@ -3669,14 +3669,17 @@ def sweep_hold_secs(series: str) -> float:
 # (KXRAIN*: the daily event is 33 cities, and a 2nd trip within the hour was
 # in another region 60% of the time). Mention series never trip at all
 # (SWEEP_EXEMPT).
-#    IMM_SWEEP_ESCALATE=dry -- THE DEFAULT: the chain is kept and each trip's
-#                   escalated hold is LOGGED (ws_sweep: trip_n, esc_hold_s,
-#                   and esc_shadowed on a trip the longer hold would have
+#    IMM_SWEEP_ESCALATE=dry -- the chain is kept and each trip's escalated
+#                   hold is LOGGED (ws_sweep: trip_n, esc_hold_s, and
+#                   esc_shadowed on a trip the longer hold would have
 #                   prevented -- it does not advance the chain); every hold
 #                   stays SWEEP_HOLD_SECS.
-#    IMM_SWEEP_ESCALATE=on  -- a live trip holds its escalated length.
+#    IMM_SWEEP_ESCALATE=on  -- THE DEFAULT since 2026-10-17 (Jack: "Turn
+#                   live 1 and 7 if no problems detected"; the dry run
+#                   19:17-20:35Z: 20 trips, 1 escalation, exclusions held, no
+#                   errors): a live trip holds its escalated length.
 #    IMM_SWEEP_ESCALATE=off -- nothing.
-SWEEP_ESCALATE = os.environ.get("IMM_SWEEP_ESCALATE", "dry").strip().lower()
+SWEEP_ESCALATE = os.environ.get("IMM_SWEEP_ESCALATE", "on").strip().lower()
 if SWEEP_ESCALATE not in ("off", "dry", "on"):
     SWEEP_ESCALATE = "off"
 SWEEP_ESCALATE_WINDOW_SECS = max(
@@ -3758,11 +3761,15 @@ def sweep_escalated_hold(n: int, base_s: float) -> float:
 # about 250 orders a minute qualified and the bot idles ~7s of every ~26s
 # cycle: ~85 moves fit per gap at 24/s. A plan not finished by the next one
 # is replaced (counted `unfinished`).
-#    IMM_BACK_OF_LINE=dry -- THE DEFAULT: the line is read and each re-queue
-#                   is LOGGED (back_of_line_<date>.jsonl), nothing amended.
-#    IMM_BACK_OF_LINE=on  -- the amend is sent.
+#    IMM_BACK_OF_LINE=dry -- the line is read and each re-queue is LOGGED
+#                   (back_of_line_<date>.jsonl), nothing amended.
+#    IMM_BACK_OF_LINE=on  -- THE DEFAULT since 2026-10-17 (Jack: "Turn live 1
+#                   and 7 if no problems detected"; the dry run
+#                   19:17-20:35Z: 6,300 logged moves, 0 read failures, 0
+#                   stale, no 429s): the +1 / -1 amends are sent (rows keep
+#                   ok / restored).
 #    IMM_BACK_OF_LINE=off -- nothing, not even the read.
-BACK_OF_LINE = os.environ.get("IMM_BACK_OF_LINE", "dry").strip().lower()
+BACK_OF_LINE = os.environ.get("IMM_BACK_OF_LINE", "on").strip().lower()
 if BACK_OF_LINE not in ("off", "dry", "on"):
     BACK_OF_LINE = "off"
 BACK_OF_LINE_EVERY_SECS = max(5.0, _env_float("IMM_BACK_OF_LINE_EVERY_SECS", 60.0))
