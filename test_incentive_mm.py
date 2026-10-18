@@ -28538,13 +28538,50 @@ class TestLoneReferenceGuard(unittest.TestCase):
                           imm.LONE_REF_JUMP_WINDOW_MIN), (3.0, 20, 60))
         self.assertEqual(imm.LONE_REF_GUARD_MODE, "on")
         for k in ("LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
-                  "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP"):
+                  "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
-        for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB", "KXEARNINGSMENTIONARITZIA",
-                  "KXWORLDNEWSMENTION"):
-            self.assertFalse(imm.lone_ref_series(s), s)
-        for s in ("KXLOLTEEMO", "KXLOLTOURPENTA", "KXGOOD", "KXOPENSHARE"):
-            self.assertTrue(imm.lone_ref_series(s), s)
+        imm._fair_gate_memo.clear()
+        self.addCleanup(imm._fair_gate_memo.clear)
+        with mock.patch.object(imm, "fair_gate_of", lambda s: ""):
+            for s in ("KXTRUMPMENTION", "KXTRUMPMENTIONB", "KXEARNINGSMENTIONARITZIA",
+                      "KXWORLDNEWSMENTION"):
+                self.assertFalse(imm.lone_ref_series(s), s)
+            for s in ("KXLOLTEEMO", "KXLOLTOURPENTA", "KXGOOD", "KXOPENSHARE"):
+                self.assertTrue(imm.lone_ref_series(s), s)
+
+    def test_fair_gated_markets_are_left_out(self):
+        """Jack 2026-10-18: "Build it", to "Take fair-gated markets out of the
+        lone-ref guard?": a fair gate already bounds the quote there."""
+        self.assertTrue(imm.LONE_REF_SKIP_FAIR)
+        imm._fair_gate_memo.clear()
+        self.addCleanup(imm._fair_gate_memo.clear)
+        gates = {"KXRAINWKND": "rain weekend", "KXBIGGESTQUAKE": "quake"}
+        with mock.patch.object(imm, "fair_gate_of", lambda s: gates.get(s, "")):
+            self.assertFalse(imm.lone_ref_series("KXRAINWKND"))
+            self.assertFalse(imm.lone_ref_series("KXBIGGESTQUAKE"))
+            self.assertTrue(imm.lone_ref_series("KXLOLTEEMO"))      # the bait it was built for
+            self.assertTrue(imm.lone_ref_series("KXTRUMPAPPROVE"))
+            imm._fair_gate_memo.clear()
+            with mock.patch.object(imm, "LONE_REF_SKIP_FAIR", False):
+                self.assertTrue(imm.lone_ref_series("KXRAINWKND"))  # the knob puts them back
+                self.assertFalse(imm.lone_ref_series("KXTRUMPMENTION"))
+
+    def test_fair_gate_of_names_the_quote_loop_gate(self):
+        with mock.patch.object(imm, "CA_FAIR_ENABLE", True), \
+                mock.patch.object(imm, "carbon_arc_settled", lambda s: s == "KXAMZNCC"), \
+                mock.patch.object(imm, "rain_wknd_series", lambda s: s == "KXRAINWKND"), \
+                mock.patch.object(imm, "quake_gated", lambda s: s == "KXBIGGESTQUAKE"), \
+                mock.patch.object(imm, "treasury_gated_series", lambda s: s == "KXUST30AD"):
+            self.assertEqual(imm.fair_gate_of("KXAMZNCC"), "carbon arc")
+            self.assertEqual(imm.fair_gate_of("KXRAINWKND"), "rain weekend")
+            self.assertEqual(imm.fair_gate_of("KXBIGGESTQUAKE"), "quake")
+            self.assertEqual(imm.fair_gate_of("KXUST30AD"), "treasury")
+            self.assertEqual(imm.fair_gate_of("KXLOLTEEMO"), "")
+        # a check that raises reads as no gate, and the rest still run
+        with mock.patch.object(imm, "share_fair_series", side_effect=RuntimeError("x")), \
+                mock.patch.object(imm, "vercel_series", lambda s: s == "KXVERCEL"):
+            self.assertEqual(imm.fair_gate_of("KXVERCEL"), "vercel")
+            self.assertEqual(imm.fair_gate_of("KXLOLTEEMO"), "")
 
     def test_rung_history_across_the_window(self):
         class Meta:

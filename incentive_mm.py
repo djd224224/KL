@@ -9768,7 +9768,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_AHEAD_MIN_AHEAD", "JOIN_AHEAD_MIN_TICKS", "JOIN_AHEAD_EXCLUDE",
     # lone-reference guard (2026-10-16)
     "LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
-    "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP",
+    "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -16492,7 +16492,8 @@ def ladder_reference_prices(yes_levels: List[List[float]],
 # A rung that has rested at its price for the whole window is left alone. A
 # side the guard holds out has no rung, so it stays out while the thin top
 # lasts. The mention books (LONE_REF_SKIP) have their own live gates and are
-# not checked.
+# not checked; nor, since 2026-10-18, are markets with a fair gate
+# (LONE_REF_SKIP_FAIR).
 # Measured on 9/30-10/16 (41M book snapshots replayed, the bot's own share
 # model, fills at the dashboard's 4h markout), mention books out:
 #   * these defaults (x3, 20c, 60 min) give up ~$21/day of reward and avoid
@@ -16513,12 +16514,82 @@ LONE_REF_JUMP_WINDOW_MIN = _env_int("IMM_LONE_REF_JUMP_WINDOW_MIN", 60)
 LONE_REF_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_LONE_REF_SKIP", "MENTION").split(",")
     if p.strip())
+# FAIR-GATED MARKETS LEFT OUT (Jack 2026-10-18: "Build it", to "Take
+# fair-gated markets out of the lone-ref guard?"). Where a quote-loop fair
+# gate bounds the quote (fair_gate_of), one lone order cannot pull the side
+# past our own fair value, so a hold there only blocks fills the model wants.
+# Live 10/16-17 the guard netted -$78, all of it fair-gated (weekend rain
+# -$66, quake -$19: fills it blocked that the rain and the missing quake made
+# good); markets with no fair value made +$7.5. In the 17-day replay the
+# fair-gated value was OpenRouter share (+$86; the family is off since 10/09)
+# and Rotten Tomatoes' 10/15 first reviews (+$81; the RT gate stands those
+# aside since 10/16); the other gates netted -$0.26/day at 4h. The replay's
+# no-fair-value markets: +$17.44/day. IMM_LONE_REF_SKIP_FAIR=0 checks the
+# fair-gated markets again.
+LONE_REF_SKIP_FAIR = os.environ.get("IMM_LONE_REF_SKIP_FAIR", "1") == "1"
+
+
+def fair_gate_of(series: str) -> str:
+    """The fair gate the quote loop runs on this series ('' = none): its own
+    series checks, in the quote loop's terms. The lone-ref guard leaves these
+    out (LONE_REF_SKIP_FAIR) and send_lone_ref_monitor.py classes its holds
+    by them. A check that raises reads as no gate."""
+    t = series + "-X"
+    checks = (
+        ("carbon arc", lambda: CA_FAIR_ENABLE and carbon_arc_settled(series)),
+        ("openrouter tokens", lambda: OR_FAIR_ENABLE and series in OR_FAIR_SERIES),
+        ("openrouter share", lambda: share_fair_series(series)),
+        ("rain monthly", lambda: rain_monthly_series(series)),
+        ("rain period", lambda: rain_period_gated(t)),
+        ("snow monthly", lambda: snow_monthly_series(series)),
+        ("cpi", lambda: cpi_fair_series(series)),
+        ("rain weekend", lambda: rain_wknd_series(series)),
+        ("rotten tomatoes", lambda: rt_fair_series(series)),
+        ("gasbuddy", lambda: GB_FAIR_ENABLE and gb_fair_series(series)),
+        ("datacenter", lambda: DC_GATE_ENABLE and datacenter_series(series)),
+        ("quake", lambda: quake_gated(series)),
+        ("vercel", lambda: vercel_series(series)),
+        ("yt2", lambda: yt2_series(series)),
+        ("yt weekly", lambda: ytw_series(series)),
+        ("yt1", lambda: yt1_series(series)),
+        ("treasury", lambda: treasury_gated_series(series)),
+        ("mortgage", lambda: mort_series(series)),
+        ("pokemon", lambda: poke_series(series)),
+        ("nfl props", lambda: nfl_series(series)),
+    )
+    for name, hit in checks:
+        try:
+            if hit():
+                return name
+        except Exception:
+            continue
+    return ""
+
+
+_fair_gate_memo: Dict[str, str] = {}
+_fair_gate_memo_at = [0.0]
+
+
+def fair_gate_cached(series: str) -> str:
+    """fair_gate_of, remembered for 10 minutes (the gates' series lists are
+    hot-reloaded files)."""
+    now = time.time()
+    if now - _fair_gate_memo_at[0] > 600:
+        _fair_gate_memo.clear()
+        _fair_gate_memo_at[0] = now
+    g = _fair_gate_memo.get(series)
+    if g is None:
+        g = _fair_gate_memo[series] = fair_gate_of(series)
+    return g
 
 
 def lone_ref_series(series: str) -> bool:
-    """Is this series checked by the lone-reference guard? (Not the
-    LONE_REF_SKIP name parts: the mention books.)"""
-    return not any(p in series for p in LONE_REF_SKIP)
+    """Is this series checked by the lone-reference guard? Not the
+    LONE_REF_SKIP name parts (the mention books), nor, while
+    LONE_REF_SKIP_FAIR, a series with a quote-loop fair gate."""
+    if any(p in series for p in LONE_REF_SKIP):
+        return False
+    return not (LONE_REF_SKIP_FAIR and fair_gate_cached(series))
 
 
 def lone_reference(ext_levels_best_first: List[Tuple[int, float]], target: float,
@@ -29713,6 +29784,8 @@ class IncentiveMarketMaker:
                + ("stands aside" if LONE_REF_GUARD_MODE == "on"
                   else "is logged, nothing pulled")
                + f"; not checked: {','.join(LONE_REF_SKIP) or 'nothing'}"
+               + (", and markets with a fair gate (2026-10-18)"
+                  if LONE_REF_SKIP_FAIR else "")
                if _lr_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _lr_live else ""))
         log("mid-move breaker: "

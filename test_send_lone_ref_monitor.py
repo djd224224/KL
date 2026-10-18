@@ -209,9 +209,26 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(lm.verdict(self.day(net=-20.0), self.RUN)[0], "WATCH")
         self.assertEqual(lm.verdict(self.day(max_flaps=150), self.RUN)[0], "OK")
         self.assertEqual(lm.verdict(self.day(max_flaps=201), self.RUN)[0], "WATCH")
-        self.assertEqual(lm.verdict(self.day(), dict(days=4.0, net=-60.0))[0], "PROBLEM")
+        with mock.patch.object(imm, "LONE_REF_SKIP_FAIR", False):
+            self.assertEqual(lm.verdict(self.day(), dict(days=4.0, net=-60.0))[0], "PROBLEM")
         # a half day halves the cost bars
         self.assertEqual(lm.verdict(self.day(hours=12.0, cost=20.0), self.RUN)[0], "WATCH")
+
+    def test_with_fair_gated_markets_out_it_judges_the_markets_it_guards(self):
+        """Jack 2026-10-18: "Build it" (fair-gated markets out of the guard):
+        the running verdict reads the no-fair-gate markets only."""
+        self.assertTrue(imm.LONE_REF_SKIP_FAIR)
+        # the old fair-gated losses alone no longer make a PROBLEM...
+        run = dict(days=4.0, net=-60.0, gate_days=3.5, gates={"none": [10, 5.0, -20.0]})
+        self.assertEqual(lm.verdict(self.day(), run)[0], "OK")
+        # ...a loss on the markets it still guards does (none: $50 + $20 = -$70)
+        run["gates"] = {"none": [10, 50.0, 20.0]}
+        lvl, why = lm.verdict(self.day(), run)
+        self.assertEqual(lvl, "PROBLEM")
+        self.assertIn("running net on the markets it guards (no fair gate) -$70 over 3.5 days",
+                      why)
+        run["gate_days"] = 2.0                                  # not before 3 days
+        self.assertEqual(lm.verdict(self.day(), run)[0], "OK")
 
     def test_subject_and_text(self):
         ctx = dict(level="OK", reasons=[], run=dict(days=0.5, net=12.0),
@@ -260,13 +277,17 @@ class TestFairGates(unittest.TestCase):
         self.assertAlmostEqual(lm.gate_net(g["rain weekend"]), -35.6)
         day = dict(mode="on", hours=24.0, let_thru_guarded=0.0, cost=4.5, net=-19.3,
                    max_flaps=3, max_flaps_side="")
-        lvl, why = lm.verdict(day, dict(days=4.0, net=60.0, gates=g))
-        self.assertEqual(lvl, "WATCH")
-        self.assertTrue(any("fair-gated rain weekend" in r for r in why))
-        self.assertFalse(any("carbon arc" in r for r in why))      # it saved money
-        # not before RUN_MIN_DAYS
+        with mock.patch.object(imm, "LONE_REF_SKIP_FAIR", False):
+            lvl, why = lm.verdict(day, dict(days=4.0, net=60.0, gates=g))
+            self.assertEqual(lvl, "WATCH")
+            self.assertTrue(any("fair-gated rain weekend" in r for r in why))
+            self.assertFalse(any("carbon arc" in r for r in why))      # it saved money
+            # not before RUN_MIN_DAYS
+            self.assertFalse(any("fair-gated" in r for r in
+                                 lm.verdict(day, dict(days=1.0, net=60.0, gates=g))[1]))
+        # with fair-gated markets out of the guard (2026-10-18) none is flagged
         self.assertFalse(any("fair-gated" in r for r in
-                             lm.verdict(day, dict(days=1.0, net=60.0, gates=g))[1]))
+                             lm.verdict(day, dict(days=4.0, net=60.0, gates=g))[1]))
         line = lm.fair_line(dict(gates=g), dict(gates=g))
         self.assertTrue(line.startswith("Fair value: markets with a fair gate net -$32 today"))
         self.assertIn("markets without +$9", line)

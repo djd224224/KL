@@ -21,8 +21,11 @@ ONE EMAIL per ET day, ending in OK / WATCH / PROBLEM:
            marked to the current mid
   let thru full-rung maker fills whose rung jumped >= the guard's gap within
            its jump window before the fill, the shape the guard stops, marked
-           to the current mid; mention books (not guarded) listed apart
-  running  totals since the guard went live, against the replay's +$27/day
+           to the current mid; unguarded series (mention books, and since
+           10/18 fair-gated markets) listed apart
+  running  totals since the guard went live, against the replay's +$27/day;
+           since 10/18 (fair-gated markets out) the verdict judges the markets
+           it still guards, against the replay's +$17/day there
 
 SOURCES, all read-only: the bot's day logs (incentive-mm-*.log), the
 book_depth snapshots, fills_ / orders_<UTC date>.jsonl, the dashboard data
@@ -85,6 +88,14 @@ RUN_MIN_DAYS = 3
 # splits every day and the running totals by gate, names these, and WATCHes
 # a fair-gated family whose running net reaches FAIR_GATE_WATCH.
 FAIR_GATE_WATCH = -25.0
+# FAIR-GATED MARKETS LEFT OUT (Jack 2026-10-18: "Build it", to "Take
+# fair-gated markets out of the lone-ref guard?"; incentive_mm
+# LONE_REF_SKIP_FAIR). Live 10/16-17 the guard netted -$78, all fair-gated
+# (weekend rain -$66, quake -$19); markets without a fair gate +$7.5. While
+# the bot skips them, the running verdict judges the markets the guard still
+# covers -- the "none" gate, against the replay's +$17.44/day there -- and no
+# fair-gated family is flagged to leave out (it is out).
+REPLAY_NO_FAIR_NET_PER_DAY = 17.44
 FAIR_NAMED = ("carbon arc", "vercel", "rain weekend")
 REPLAY_GATE_NET_PER_DAY = {"carbon arc": -1.8, "vercel": -1.8, "rain weekend": 2.7}
 FAIR_NAMED_LABEL = {"carbon arc": "Carbon Arc", "vercel": "Vercel", "rain weekend": "Weekend rain"}
@@ -520,11 +531,18 @@ def save_store(data: dict) -> None:
     os.replace(tmp, store_path())
 
 
+def skip_fair() -> bool:
+    """True while the bot leaves fair-gated markets out of the guard."""
+    return bool(getattr(imm, "LONE_REF_SKIP_FAIR", False))
+
+
 def fair_gate_of(series: str) -> str:
     """The fair gate the bot's quote loop runs on this series ('' = none),
-    by the bot's own series checks. Mirrors the gates in
-    IncentiveMarketMaker.run_cycle as of 2026-10-17; a gate added there
-    later reads as no fair value here until it is added below."""
+    by the bot's own series checks: incentive_mm.fair_gate_of (2026-10-18,
+    the list the guard skips), else the copy below of the gates in
+    IncentiveMarketMaker.run_cycle as of 2026-10-17."""
+    if hasattr(imm, "fair_gate_of"):
+        return imm.fair_gate_of(series)
     t = series + "-X"
 
     def on(name: str, *args) -> bool:
@@ -621,9 +639,16 @@ def verdict(day: dict, run: dict) -> tuple:
         flag(1, f"the day's net {usd(day['net'])}: the holds cost more than they avoided")
     if day["max_flaps"] >= FLAP_WATCH:
         flag(1, f"{day['max_flaps_side']} held {day['max_flaps']} times (flapping)")
-    if run["days"] >= RUN_MIN_DAYS and run["net"] <= RUN_NET_PROBLEM:
+    if skip_fair():
+        # fair-gated markets are out of the guard (2026-10-18): judge the
+        # running net on the markets it still covers
+        covered = gate_net((run.get("gates") or {}).get("none", [0, 0.0, 0.0]))
+        if run.get("gate_days", 0.0) >= RUN_MIN_DAYS and covered <= RUN_NET_PROBLEM:
+            flag(2, f"running net on the markets it guards (no fair gate) {usd(covered)} "
+                    f"over {run['gate_days']:.1f} days")
+    elif run["days"] >= RUN_MIN_DAYS and run["net"] <= RUN_NET_PROBLEM:
         flag(2, f"running net {usd(run['net'])} over {run['days']:.1f} days")
-    if run["days"] >= RUN_MIN_DAYS:
+    if run["days"] >= RUN_MIN_DAYS and not skip_fair():
         for g, v in sorted((run.get("gates") or {}).items()):
             if g != "none" and gate_net(v) <= FAIR_GATE_WATCH:
                 flag(1, f"fair-gated {g}: running net {usd(gate_net(v))} over "
@@ -702,6 +727,8 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
                avoided=sum(-v["would_be"] for v in store.values()),
                let_thru=sum(v["let_thru_guarded"] for v in store.values()))
     run_gates: dict = defaultdict(lambda: [0, 0.0, 0.0])
+    # the days the per-gate split covers (it began 10/17)
+    run["gate_days"] = sum(v["hours"] for v in store.values() if v.get("gates")) / 24.0
     for v in store.values():
         for g, x in (v.get("gates") or {}).items():
             r = run_gates[g]
@@ -757,6 +784,16 @@ def render_text(ctx) -> str:
         f"${abs(d['would_be']):,.0f}, and it gave up ${d['cost']:,.0f} of reward.",
         f"Running since 10/16 12:17 ET: {usd(run['net'])} over {run['days']:.1f} days "
         f"({usd(per_day)}/day; the replay said +${REPLAY_NET_PER_DAY:.0f}/day).",
+    ]
+    if skip_fair():
+        covered = gate_net((run.get("gates") or {}).get("none", [0, 0.0, 0.0]))
+        gd = run.get("gate_days", 0.0)
+        lines.append(
+            f"Fair-gated markets left the guard on 10/18. On the markets it still guards "
+            f"(no fair gate): {usd(covered)} over {gd:.1f} days "
+            f"({usd(covered / gd if gd > 0 else 0.0)}/day; the replay said "
+            f"+${REPLAY_NO_FAIR_NET_PER_DAY:.0f}/day).")
+    lines += [
         "",
         f"Window {a:%m/%d %H:%M}-{b:%H:%M} ET. Guard mode: {d['mode'] or 'unknown'}.",
         f"Held {d['holds']} times on {d['sides']} sides of {d['markets']} markets; "
@@ -773,8 +810,9 @@ def render_text(ctx) -> str:
            + usd(by_cls.get("inside the book", 0.0)) if by_cls else "") + ".",
         fair_line(d, run),
         f"Let through: {d['let_thru_guarded_n']} jumped full-rung fills on guarded series "
-        f"{usd(d['let_thru_guarded'])}; mention books (not guarded) "
-        f"{d['let_thru_skipped_n']} {usd(d['let_thru_skipped'])}.",
+        f"{usd(d['let_thru_guarded'])}; not guarded (mention books"
+        + (", fair-gated markets" if skip_fair() else "")
+        + f") {d['let_thru_skipped_n']} {usd(d['let_thru_skipped'])}.",
     ]
     if ctx["reasons"]:
         lines += ["", "NEEDS A LOOK:"] + [f"- {r}" for r in ctx["reasons"]]
@@ -801,7 +839,7 @@ def render_detail(ctx) -> str:
         ts = datetime.fromtimestamp(f["ts"], timezone.utc)
         out.append(f"  jumped fill {ts:%H:%M:%S}Z {f['ticker']} {f['our_book_side']} "
                    f"{f['count']:.0f} @ {f.get('our_price_cents')} (rung moved {jump}c) "
-                   f"{'guarded' if guarded else 'mention book'} "
+                   f"{'guarded' if guarded else 'not guarded'} "
                    + (usd(u) if u is not None else "unmarked"))
     return "\n".join(out)
 
