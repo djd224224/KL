@@ -370,12 +370,33 @@ def _get(path: str, params: dict) -> dict:
     raise RuntimeError(f"429s on {path}")
 
 
+def market_value(m: dict):
+    """YES cents a market is worth now: its settlement once settled, else
+    the mid, the one side there is when the other is empty, or the last
+    trade; None with no price at all. A closed or settled book reads bid 0 /
+    ask 100 whatever the result, so the ask alone is no price: until
+    2026-10-19 this read every such market at 100c -- the 10/18 email's
+    -$50 KXTOKENUSE-26OCT19-T170 "loss avoided" was an ask at 6c on a market
+    that settled NO, a +$3 blocked profit."""
+    sv = m.get("settlement_value_dollars")
+    if sv not in (None, ""):
+        return float(sv) * 100.0
+    if m.get("result") in ("yes", "no"):
+        return 100.0 if m["result"] == "yes" else 0.0
+    b = float(m.get("yes_bid_dollars") or 0) * 100.0
+    a = float(m.get("yes_ask_dollars") or 0) * 100.0
+    if b > 0 and 0 < a < 100:
+        return (b + a) / 2.0
+    if b > 0:
+        return b
+    if 0 < a < 100:
+        return a
+    return float(m.get("last_price_dollars") or 0) * 100.0 or None
+
+
 def mid_now(ticker: str, cache: dict):
     if ticker not in cache:
-        m = _get(f"/markets/{ticker}", {}).get("market") or {}
-        b = float(m.get("yes_bid_dollars") or 0) * 100
-        a = float(m.get("yes_ask_dollars") or 0) * 100
-        cache[ticker] = (b + a) / 2 if b and a else (b or a or None)
+        cache[ticker] = market_value(_get(f"/markets/{ticker}", {}).get("market") or {})
     return cache[ticker]
 
 

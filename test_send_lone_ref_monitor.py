@@ -148,6 +148,32 @@ class TestWouldBeFills(unittest.TestCase):
                                (19.5 - 29) * 0.60 + (40 - 19.5) * 0.30, 6)
 
 
+class TestMarketValue(unittest.TestCase):
+    def test_a_settled_or_closed_book_is_not_the_100c_ask(self):
+        """A closed / settled market reads bid 0 / ask 100 whatever the result:
+        the settlement, else the last trade, never the ask."""
+        settled_no = {"status": "finalized", "result": "no", "yes_bid_dollars": "0.0000",
+                      "yes_ask_dollars": "1.0000", "last_price_dollars": "0.0100",
+                      "settlement_value_dollars": "0.0000"}
+        self.assertEqual(lm.market_value(settled_no), 0.0)
+        self.assertEqual(lm.market_value(dict(settled_no, result="yes",
+                                              settlement_value_dollars="1.0000")), 100.0)
+        closed = {"status": "closed", "result": "", "yes_bid_dollars": "0.0000",
+                  "yes_ask_dollars": "1.0000", "last_price_dollars": "0.0100",
+                  "settlement_value_dollars": None}
+        self.assertEqual(lm.market_value(closed), 1.0)
+        live = {"yes_bid_dollars": "0.6100", "yes_ask_dollars": "0.6200"}
+        self.assertEqual(lm.market_value(live), 61.5)
+        self.assertEqual(lm.market_value({"yes_bid_dollars": "0.9900",
+                                          "yes_ask_dollars": "1.0000"}), 99.0)
+        self.assertIsNone(lm.market_value({"yes_bid_dollars": "0", "yes_ask_dollars": "1.0000"}))
+        with mock.patch.object(lm, "_get", return_value={"market": settled_no}) as g:
+            cache = {}
+            self.assertEqual(lm.mid_now("KXTOKENUSE-26OCT19-T170", cache), 0.0)
+            self.assertEqual(lm.mid_now("KXTOKENUSE-26OCT19-T170", cache), 0.0)
+            self.assertEqual(g.call_count, 1)
+
+
 class TestJumpedFills(unittest.TestCase):
 
     def setUp(self):
