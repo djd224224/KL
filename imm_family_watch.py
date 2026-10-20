@@ -95,6 +95,10 @@ _NOT_VOTE_RE = re.compile(r"\b(rally|rallies|debates?|attends?|endorse\w*|courts
                           r"invalidat\w*|announce\w*|primary|primaries|runoffs?|"
                           r"special election|recall|nominat\w*|resign\w*|impeach\w*|"
                           r"indict\w*|appoint\w*)\b", re.I)
+# what a named vote decides (the 10/09 rule: "who will be minister after the
+# election" takes the vote's day) -- for the watch's quote calls
+_POST_VOTE_RE = re.compile(r"\b(mandate|coalition|form (?:a|the) government|"
+                           r"after the election)\b", re.I)
 
 
 def us_general_vote_ok(series: dict, market: dict) -> Tuple[bool, str]:
@@ -442,15 +446,16 @@ def _fmt_et(ts: float) -> str:
 #      DATED (verified date rows only); research found no vote -> DON'T
 #      QUOTE (non-vote political markets stay out); a new mention family ->
 #      QUOTE WITH CARE (the mention live gates); a new election family ->
-#      QUOTE ONCE DATED.
+#      QUOTE ONCE DATED; a ONE-OFF (Kalshi frequency one_off) news event ->
+#      DON'T QUOTE, not part of the strategy (non-vote markets stay out,
+#      10/08), but a one-off vote, or what a named vote decides -> QUOTE
+#      ONCE DATED.
 #   4. THE TRACK RECORD of the dashboard family it would join over its last
 #      CALL_DAYS full days -- the portfolio email's What-to-do numbers:
 #      its own quoting loses -> NOT YET; the quoting pays but positions it
 #      held lost -> QUOTE WITH CARE; both pay -> QUOTE; nothing like it
 #      trades yet -> YOUR CALL.
-# A one-off news event says so: it can jump at any time, so the toxic-flow
-# halts and its cutoff are its protection. A call is advice: nothing here
-# enrolls or blocks anything.
+# A call is advice: nothing here enrolls or blocks anything.
 CALL_DAYS = 7
 CALL_SKIP_TOTAL = 10.0          # $ left in a new family's program: under this, SKIP
 OWNER_PREFIXES = (
@@ -560,11 +565,27 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     if cat == "Elections":
         return ("QUOTE ONCE DATED", "an election: quote it once its election day is on "
                                     "file (verified date rows only)" + rec_txt)
+    # ONE-OFF NEWS IS NOT THE STRATEGY (Jack 2026-10-19: "Don't suggest quoting
+    # one-off news events. That's not part of my strategy is it?"). The rule
+    # since 10/08 (the Talarico reversal): non-vote political markets stay
+    # out; a vote, or what a named vote decides (10/09: who is minister after
+    # it), is quoted once its day is on file. The 10/19 calls had put six
+    # one-offs (FRANCEEMERGENCY, TRUMPXIPUTIN, STATERENAME, RUSDIESELIMPORT
+    # among them) on the Politics & approval record -- a family that earns on
+    # scheduled, recurring markets.
+    if str(it.get("frequency") or "") == "one_off":
+        title = str(it.get("title") or "")
+        if (_VOTE_RE.search(title) or _POST_VOTE_RE.search(title)) \
+                and not _NOT_VOTE_RE.search(title):
+            return ("QUOTE ONCE DATED", "a one-off vote, or what a named vote decides: "
+                                        "quote it once the vote's day is on file (your "
+                                        "elections rule)")
+        return ("DON'T QUOTE", "a one-off news event -- not part of your strategy: "
+                               "non-vote political and news markets stay out (your 10/08 "
+                               "rule); your families quote scheduled information")
     if not rec:
         return ("YOUR CALL", "no track record: nothing like it trades yet"
                 + (f" in {fam}" if fam else ""))
-    tail = ("; a one-off news event, so it can jump at any time: the toxic-flow halts and "
-            "its cutoff are the protection" if str(it.get("frequency")) == "one_off" else "")
     if rec["quoting"] < 0:
         return ("NOT YET", f"{fam}'s own quoting lost {_usd(rec['quoting'])[1:]} over the "
                            f"last {CALL_DAYS} days (rewards {_usd(rec['rew'])} vs its fills "
@@ -572,8 +593,8 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     if rec["net"] < 0:
         return ("QUOTE WITH CARE", f"{fam}'s quoting pays ({_usd(rec['quoting'])}) but the "
                                    f"positions it held lost ({_usd(rec['carried'])}): quote "
-                                   f"small and watch the inventory" + tail)
-    return ("QUOTE", f"it would join {_record(fam, rec)}" + tail)
+                                   f"small and watch the inventory")
+    return ("QUOTE", f"it would join {_record(fam, rec)}")
 
 
 def model_gap_call(g: dict, track: Dict[str, dict]) -> Tuple[str, str]:

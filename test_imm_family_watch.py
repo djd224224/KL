@@ -757,12 +757,11 @@ class TestQuoteCalls(unittest.TestCase):
         self.assertIn("non-vote political markets stay out", why)
 
     def test_the_family_it_would_join(self):
-        c, why = self.call("new:KXFRANCEEMERGENCY", fam="Politics & approval",
-                           category="Politics", frequency="one_off")
+        c, why = self.call("new:KXBILLSNEW", fam="Politics & approval",
+                           category="Politics", frequency="monthly")
         self.assertEqual(c, "QUOTE")
         self.assertIn("it would join Politics & approval: +$356 over the last 7 days "
                       "after rewards, its quoting +$542", why)
-        self.assertIn("a one-off news event", why)
         c, why = self.call("new:KXNEWCC", fam="Carbon Arc consumer")
         self.assertEqual(c, "QUOTE WITH CARE")
         self.assertIn("the positions it held lost (-$520)", why)
@@ -770,6 +769,34 @@ class TestQuoteCalls(unittest.TestCase):
         self.assertEqual(c, "NOT YET")
         self.assertIn("Sports & awards's own quoting lost $341", why)
         self.assertEqual(self.call("new:KXODD", fam="")[0], "YOUR CALL")
+
+    def test_one_off_news_is_not_the_strategy(self):
+        """Jack 2026-10-19: "Don't suggest quoting one-off news events. That's
+        not part of my strategy is it?" -- a good family record never makes a
+        one-off news event a QUOTE; a one-off vote waits for its date."""
+        for tick, title in (("KXFRANCEEMERGENCY", "France state of emergency (Politics, one_off)"),
+                            ("KXTRUMPXIPUTIN", "Trump, Xi and Putin trilateral meeting "
+                                               "(Politics, one_off)"),
+                            ("KXRUSDIESELIMPORT", "Will Russian diesel be imported into the "
+                                                  "United States? (Politics, one_off)")):
+            c, why = self.call("new:" + tick, fam="Politics & approval", category="Politics",
+                               frequency="one_off", title=title)
+            self.assertEqual(c, "DON'T QUOTE", tick)
+            self.assertIn("not part of your strategy", why)
+        for tick, title in (("KXSWEDENPMVOTE", "Swedish Prime Minister approval vote "
+                                               "(Politics, one_off)"),
+                            ("KXISRFIRSTMANDATE", "Who will get Israel's first mandate to form "
+                                                  "a government? (Politics, one_off)")):
+            c, why = self.call("new:" + tick, fam="Politics & approval", category="Politics",
+                               frequency="one_off", title=title)
+            self.assertEqual(c, "QUOTE ONCE DATED", tick)
+        # a rally is news even with a vote word in it
+        self.assertEqual(self.call("new:KXRALLY", fam="Politics & approval", frequency="one_off",
+                                   title="Will he rally voters before the vote?")[0],
+                         "DON'T QUOTE")
+        # mentions keep their own rule
+        self.assertEqual(self.call("new:KXXMENTION", category="Mentions",
+                                   frequency="one_off")[0], "QUOTE WITH CARE")
 
     def test_track_record_and_the_email(self):
         F = ["rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n",
@@ -790,7 +817,7 @@ class TestQuoteCalls(unittest.TestCase):
         due = [("new:KXHIGHTSDF", {"est": 51.3, "what": "KXHIGHTSDF: newly paying",
                                    "fix": "your call"}, 60.0),
                ("new:KXSTATERENAME", {"est": 12.0, "est_total": 62.7, "category": "Politics",
-                                      "frequency": "one_off", "fix": "your call",
+                                      "frequency": "weekly", "fix": "your call",
                                       "what": "KXSTATERENAME: newly paying"}, 60.0)]
         from unittest import mock
         with mock.patch.object(fw, "family_name",
