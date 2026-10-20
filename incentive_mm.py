@@ -639,6 +639,24 @@ MENTION_NO_CUTOFF_GATE = os.environ.get("IMM_MENTION_NO_CUTOFF_GATE", "1") == "1
 # live unresolved event and clears two refreshes after the last one resolves.
 MENTION_NO_CUTOFF_TTL_SECS = _env_int("IMM_MENTION_NO_CUTOFF_TTL_SECS", 1500)
 _DYNAMIC_DEPTH_GATE: Dict[str, float] = {}   # series -> last marked ts
+# EXEMPT SERIES (Jack 2026-10-19: "Yes", to "Should I exempt
+# KXMAMDANIMENTION from the no-start rule so all 18 words quote again?").
+# Jack took MAMDANI off the live-event gate on 9/05 because it cost reward;
+# this 9/08 class rule put it back unannounced. A Mamdani event closes on the
+# "next NYC Mayor's Office announcement", so it NEVER has a derivable start
+# and the rule held it pads-OFF for good. On 10/19 the relisted
+# KXMAMDANIMENTION-26NOV18 quoted all 18 words overnight while other makers
+# rested 1,400-2,400 YES contracts per word; at ~7:30 ET one pulled ~1,000
+# from each, every YES side fell under the 1,000 target and, with no 1c pad
+# allowed, 17 words read zero_yield. The gate's own stand-down never arms
+# before the ticker date (11/18), so until then the mark only removed the
+# pads. Aug-Sep Mamdani events: $1,372 credited vs -$180 of trading at
+# settle (9/04-9/15). An exempt series is never marked, and a mark persisted
+# from before is ignored. IMM_MENTION_NO_CUTOFF_EXEMPT (comma-separated
+# series) sets the list; "" puts Mamdani back under the rule.
+MENTION_NO_CUTOFF_EXEMPT = frozenset(
+    s.strip().upper() for s in os.environ.get(
+        "IMM_MENTION_NO_CUTOFF_EXEMPT", "KXMAMDANIMENTION").split(",") if s.strip())
 
 
 def mention_cutoff_is_clear(series: str, resolved: Optional[datetime],
@@ -665,7 +683,7 @@ def mark_no_cutoff_mention(series: str, now_ts: float) -> bool:
     """Put `series` on the live-event depth gate for MENTION_NO_CUTOFF_TTL_SECS
     (refreshing an existing mark). Returns True when this is a NEW mark, so
     the caller can log the transition once rather than every refresh."""
-    if not MENTION_NO_CUTOFF_GATE:
+    if not MENTION_NO_CUTOFF_GATE or series in MENTION_NO_CUTOFF_EXEMPT:
         return False
     if series.startswith(tuple(EVENT_DEPTH_GATE_PREFIXES)):
         return False     # already gated statically; don't re-attribute it
@@ -677,7 +695,8 @@ def mark_no_cutoff_mention(series: str, now_ts: float) -> bool:
 def dynamic_depth_gated_series(now_ts: Optional[float] = None) -> Set[str]:
     now_ts = time.time() if now_ts is None else now_ts
     return {s for s, ts in _DYNAMIC_DEPTH_GATE.items()
-            if now_ts - ts <= MENTION_NO_CUTOFF_TTL_SECS}
+            if now_ts - ts <= MENTION_NO_CUTOFF_TTL_SECS
+            and s not in MENTION_NO_CUTOFF_EXEMPT}
 
 
 def series_event_depth_gated(series: str) -> bool:
@@ -685,8 +704,8 @@ def series_event_depth_gated(series: str) -> bool:
         return True
     if MENTION_AUTO_GATE and mention_auto_series(series):
         return True        # the single-event Mentions auto family (2026-10-13)
-    if not MENTION_NO_CUTOFF_GATE:
-        return False
+    if not MENTION_NO_CUTOFF_GATE or series in MENTION_NO_CUTOFF_EXEMPT:
+        return False       # (an exempt series: a persisted mark is ignored)
     ts = _DYNAMIC_DEPTH_GATE.get(series)
     return ts is not None and time.time() - ts <= MENTION_NO_CUTOFF_TTL_SECS
 
@@ -9594,7 +9613,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
-    "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE",
+    "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE", "MENTION_NO_CUTOFF_EXEMPT",
     # ladder family multipliers (2026-09-17): the earnings x1.5 changes every
     # downstream cap through applied_mention_mult, so it belongs in the hash
     "MENTION_SIZE_MULT", "EARNINGS_SIZE_MULT",
@@ -29843,7 +29862,9 @@ class IncentiveMarketMaker:
                 "event with no derivable start joins the live-event depth "
                 "gate for the day — pads OFF, whole event stands down on "
                 "thin depth"
-                + (f"; carried in: {','.join(_carried)}" if _carried else ""))
+                + (f"; carried in: {','.join(_carried)}" if _carried else "")
+                + (f"; exempt (2026-10-19): {','.join(sorted(MENTION_NO_CUTOFF_EXEMPT))}"
+                   if MENTION_NO_CUTOFF_EXEMPT else ""))
         if EVENT_DEPTH_GATE_PREFIXES:
             log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
                 f"— pads OFF; any quotable side < "

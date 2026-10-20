@@ -14271,6 +14271,36 @@ class TestSidesCanQualify(unittest.TestCase):
             imm._DYNAMIC_DEPTH_GATE.update(saved)
             imm.MENTION_NO_CUTOFF_TTL_SECS, imm.MENTION_NO_CUTOFF_GATE = old_ttl, old_knob
 
+    def test_an_exempt_series_keeps_its_pads(self):
+        """Jack 2026-10-19: "Yes", to exempting KXMAMDANIMENTION from the
+        no-start rule: a Mamdani event never has a start, and without pads 17
+        of its 18 words could not reach the 1,000 target."""
+        s = "KXMAMDANIMENTION"
+        self.assertIn(s, imm.MENTION_NO_CUTOFF_EXEMPT)
+        self.assertIn("MENTION_NO_CUTOFF_EXEMPT", imm._CONFIG_CODE_KNOBS)
+        saved = dict(imm._DYNAMIC_DEPTH_GATE)
+        try:
+            imm._DYNAMIC_DEPTH_GATE.clear()
+            with mock.patch.object(imm, "MENTION_NO_CUTOFF_GATE", True):
+                now = time.time()
+                self.assertFalse(imm.mark_no_cutoff_mention(s, now))   # never marked
+                self.assertNotIn(s, imm._DYNAMIC_DEPTH_GATE)
+                # a mark carried in from before the exemption is ignored
+                imm._DYNAMIC_DEPTH_GATE[s] = now
+                self.assertFalse(imm.series_event_depth_gated(s))
+                self.assertTrue(imm.series_pad_to_target(s))
+                self.assertNotIn(s, imm.dynamic_depth_gated_series())
+                # other no-start mention series are still gated
+                self.assertTrue(imm.mark_no_cutoff_mention("KXWORLDNEWSMENTION", now))
+                self.assertTrue(imm.series_event_depth_gated("KXWORLDNEWSMENTION"))
+                # an empty list puts Mamdani back under the rule
+                with mock.patch.object(imm, "MENTION_NO_CUTOFF_EXEMPT", frozenset()):
+                    self.assertTrue(imm.series_event_depth_gated(s))
+                    self.assertFalse(imm.series_pad_to_target(s))
+        finally:
+            imm._DYNAMIC_DEPTH_GATE.clear()
+            imm._DYNAMIC_DEPTH_GATE.update(saved)
+
     def test_no_target_is_never_gated(self):
         self.assertEqual(imm.sides_can_qualify(self.S, 0.0, 0, 0, 40, 44),
                          (True, True))
