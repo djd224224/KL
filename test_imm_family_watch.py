@@ -702,6 +702,125 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestQuoteCalls(unittest.TestCase):
+    """Jack 2026-10-19: "In IMM watch emails, recommend if I should quote the
+    market or not based on my strategies"."""
+
+    TRACK = {"Politics & approval": {"rew": 801.0, "own": -259.0, "carried": -186.0,
+                                     "quoting": 542.0, "net": 356.0},
+             "Carbon Arc consumer": {"rew": 827.0, "own": -456.0, "carried": -520.0,
+                                     "quoting": 371.0, "net": -149.0},
+             "Sports & awards": {"rew": 531.0, "own": -872.0, "carried": -90.0,
+                                 "quoting": -341.0, "net": -431.0}}
+
+    def setUp(self):
+        from unittest import mock
+        self._p = [mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES", ("KXHIGH", "KXLOW-")),
+                   mock.patch.object(imm, "SCAN_EXCLUDE_PREFIXES", ("KXLOWT", "KXHIGH"))]
+        for x in self._p:
+            x.start()
+
+    def tearDown(self):
+        for x in self._p:
+            x.stop()
+
+    def call(self, key, fam="", **it):
+        from unittest import mock
+        it = dict({"est": 9.0, "est_total": 40.0, "what": key.split(":", 1)[1] + ": x",
+                   "fix": "your call"}, **it)
+        with mock.patch.object(fw, "family_name", lambda s, c="": fam):
+            return fw.quote_call(key, it, self.TRACK)
+
+    def test_another_bots_markets_are_never_quoted(self):
+        c, why = self.call("new:KXHIGHTSDF")
+        self.assertEqual(c, "DON'T QUOTE")
+        self.assertIn("high_temp_trading.py (cloud) trades the KXHIGH dailies", why)
+        self.assertIn("self-trade prevention", why)
+        c, why = self.call("new:KXLOWTMIA")                 # scan-excluded, not blocklisted
+        self.assertEqual(c, "DON'T QUOTE")
+        self.assertIn("low_temp_trading.py", why)
+        self.assertEqual(fw.owner_of("KXLOW-26OCT"), ("blocklisted in incentive_mm.py", False))
+        self.assertEqual(fw.owner_of("KXFRANCEEMERGENCY"), ("", False))
+
+    def test_rules_before_the_track_record(self):
+        self.assertEqual(self.call("new:KXTINY", est_total=6.0)[0], "SKIP")
+        self.assertEqual(self.call("new:KXMAMDANIMENTION", category="Mentions")[0],
+                         "QUOTE WITH CARE")
+        self.assertEqual(self.call("new:KXSENNEW", category="Elections")[0],
+                         "QUOTE ONCE DATED")
+        self.assertEqual(self.call("start:KXTRUMPMENTIONB-26OCT19")[0], "KEEP QUOTING")
+        self.assertEqual(self.call("gap:KXSENGA-26", what="KXSENGA-26: no verified "
+                                   "election day on file")[0], "QUOTE ONCE DATED")
+        c, why = self.call("gap:KXRETIREMM-26", fix="research (1 try): judgment -- Not a "
+                           "vote market: resolves on a resignation")
+        self.assertEqual(c, "DON'T QUOTE")
+        self.assertIn("non-vote political markets stay out", why)
+
+    def test_the_family_it_would_join(self):
+        c, why = self.call("new:KXFRANCEEMERGENCY", fam="Politics & approval",
+                           category="Politics", frequency="one_off")
+        self.assertEqual(c, "QUOTE")
+        self.assertIn("it would join Politics & approval: +$356 over the last 7 days "
+                      "after rewards, its quoting +$542", why)
+        self.assertIn("a one-off news event", why)
+        c, why = self.call("new:KXNEWCC", fam="Carbon Arc consumer")
+        self.assertEqual(c, "QUOTE WITH CARE")
+        self.assertIn("the positions it held lost (-$520)", why)
+        c, why = self.call("new:KXNEWSPORT", fam="Sports & awards")
+        self.assertEqual(c, "NOT YET")
+        self.assertIn("Sports & awards's own quoting lost $341", why)
+        self.assertEqual(self.call("new:KXODD", fam="")[0], "YOUR CALL")
+
+    def test_track_record_and_the_email(self):
+        F = ["rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n",
+             "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled", "cr", "cs", "fx"]
+
+        def row(rew, pnl, cr=0.0):
+            r = [0.0] * len(F)
+            r[F.index("rew")], r[F.index("pnl")], r[F.index("cr")] = rew, pnl, cr
+            return r
+        D = {"day_fields": F, "markets": {"KXA-1": {"fam": "Politics & approval"}},
+             "days": {"2026-10-17": {"m": {"KXA-1": row(30.0, -10.0, -4.0)}},
+                      "2026-10-18": {"m": {"KXA-1": row(20.0, 5.0)}},
+                      "2026-10-19": {"m": {"KXA-1": row(999.0, 0.0)}}}}   # today: left out
+        t = fw.family_track(D, "2026-10-19")["Politics & approval"]
+        self.assertEqual((t["rew"], t["own"], t["carried"], t["quoting"], t["net"]),
+                         (50.0, -1.0, -4.0, 49.0, 45.0))
+        self.assertEqual(fw.family_track(None), {})
+        due = [("new:KXHIGHTSDF", {"est": 51.3, "what": "KXHIGHTSDF: newly paying",
+                                   "fix": "your call"}, 60.0),
+               ("new:KXSTATERENAME", {"est": 12.0, "est_total": 62.7, "category": "Politics",
+                                      "frequency": "one_off", "fix": "your call",
+                                      "what": "KXSTATERENAME: newly paying"}, 60.0)]
+        from unittest import mock
+        with mock.patch.object(fw, "family_name",
+                               lambda s, c="": "Politics & approval" if s == "KXSTATERENAME"
+                               else ""):
+            subject, body = fw.alert_body(due, {}, self.TRACK)
+        self.assertTrue(subject.endswith("| QUOTE 1 ~$12/day, DON'T QUOTE 1 ~$51/day"))
+        self.assertIn("\nCalls: QUOTE 1 (~$12/day), DON'T QUOTE 1 (~$51/day)\n", body)
+        self.assertIn("    call: QUOTE -- it would join Politics & approval", body)
+        self.assertIn("    call: DON'T QUOTE -- high_temp_trading.py", body)
+        self.assertLess(body.index("call: DON'T"), body.index("fix: your call"))
+        self.assertIn("(call = advice from your strategies, not an action", body)
+
+    def test_model_coverage_gaps_get_a_call(self):
+        import imm_model_coverage as mcov
+        from unittest import mock
+        shut = mcov._gap("Monthly snow (snow_monthly_fair)", "KXTTNSNOWM-26DEC",
+                         ["KXTTNSNOWM-26DEC-12"], "closed", "no station", "add the city")
+        opn = mcov._gap("Daily rain (rain_fair)", "BNA", ["KXRAIN-26OCT12-BNA"],
+                        "open", "no station", "add a row")
+        with mock.patch.object(fw, "family_name", lambda s, c="": "Politics & approval"):
+            self.assertEqual(fw.model_gap_call(shut, self.TRACK)[0], "QUOTE ONCE MODELED")
+            self.assertEqual(fw.model_gap_call(opn, self.TRACK)[0], "QUOTE WITH CARE")
+            _s, text = mcov.body([(shut["key"], shut, 0.0, True)],
+                                 call=lambda g: fw.model_gap_call(g, self.TRACK))
+        self.assertIn("      call: QUOTE ONCE MODELED -- it sits dark until the model has it",
+                      text)
+        self.assertNotIn("call:", mcov.body([(shut["key"], shut, 0.0, True)])[1])
+
+
 class TestModelCoveragePass(unittest.TestCase):
     """Pass 5 (Jack 2026-10-09: "ensure i get alerted"): gaps are emailed,
     and a failing pass is emailed too -- at most daily -- so it can never go

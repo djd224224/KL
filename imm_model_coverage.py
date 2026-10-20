@@ -490,8 +490,9 @@ def due(state: Dict[str, dict], gaps: Dict[str, dict], now_ts: float,
     return out, new_state
 
 
-def body(items) -> tuple:
-    """(subject, text) for the due gaps."""
+def body(items, call=None) -> tuple:
+    """(subject, text) for the due gaps. `call(gap) -> (call, why)` adds the
+    family watch's quote-or-not advice under each (Jack 2026-10-19)."""
     n_new = sum(1 for _k, _g, _f, is_new in items if is_new)
     n_mk = sum(len(g["markets"]) for _k, g, _f, _n in items)
     subject = (f"IMM-WATCH model coverage: {len(items)} gap(s), {n_mk} market(s)"
@@ -514,6 +515,12 @@ def body(items) -> tuple:
             if mk:
                 lines.append(f"      markets: {mk_txt}")
             lines.append(f"      fix: {g['fix']}")
+            if call is not None:
+                try:
+                    c, why = call(g)
+                    lines.append(f"      call: {c} -- {why}")
+                except Exception:                    # advice never costs the email
+                    pass
         lines.append("")
     lines.append(f"Re-sent every {REALERT_HOURS:g}h while open "
                  "(imm_model_coverage.py, IMM family watch pass 5).")

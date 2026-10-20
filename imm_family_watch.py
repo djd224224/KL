@@ -70,6 +70,7 @@ import incentive_mm as imm
 import imm_earnings_overrides as ieo
 import imm_feed_audit as ifa
 import imm_rows
+import imm_dashboard as dash  # family_of: the dashboard's families (stdlib-only)
 from incentive_mm import log
 
 GAP_ALERT_MIN_DPD = float(os.environ.get("IMM_GAP_ALERT_MIN_DPD", "5"))
@@ -323,6 +324,8 @@ def describe(client, due: List[Tuple[str, dict, float]]) -> None:
         try:
             if kind == "new":
                 s = ieo.series_meta(client, tick)
+                it["category"] = str(s.get("category") or "")
+                it["frequency"] = str(s.get("frequency") or "")
                 desc = str(s.get("title") or "").strip()
                 extra = ", ".join(str(x) for x in (s.get("category"), s.get("frequency")) if x)
                 if desc and extra:
@@ -346,19 +349,32 @@ def describe(client, due: List[Tuple[str, dict, float]]) -> None:
 # KXTRUMPMENTIONB-26OCT19 rested on every market. Each line now leads with
 # what the bot is doing -- QUOTED on N of M markets / NOT QUOTED -- read off
 # the IMM dashboard's data object (rebuilt every 10 min), then what is missing.
-def load_quote_state(path: Optional[str] = None) -> Dict[str, dict]:
-    """"ev:<event>" / "ser:<series>" -> {"q": markets with a side quoted, "n":
-    markets, "dec": Counter of the bot's decisions on the unquoted ones,
-    "cutoff": the earliest cutoff (epoch) among the quoted ones}, from the
-    IMM dashboard's data object. {} when it cannot be read."""
+def load_dashboard(path: Optional[str] = None) -> Optional[dict]:
+    """The IMM dashboard's data object (rebuilt every 10 min), None when it
+    cannot be read."""
     path = path or os.path.join(imm.STATUS_DIR, "dashboard", "imm_dashboard.html")
     try:
         with open(path, encoding="utf-8") as f:
             html = f.read()
         i = html.index("const D = ") + len("const D = ")
         D, _ = json.JSONDecoder().raw_decode(html, i)
+        return D
     except (OSError, ValueError) as e:
-        log(f"[WATCH] ! no dashboard quote state ({e!r})")
+        log(f"[WATCH] ! no dashboard ({e!r})")
+        return None
+
+
+def load_quote_state(path: Optional[str] = None) -> Dict[str, dict]:
+    """"ev:<event>" / "ser:<series>" -> {"q": markets with a side quoted, "n":
+    markets, "dec": Counter of the bot's decisions on the unquoted ones,
+    "cutoff": the earliest cutoff (epoch) among the quoted ones}, from the
+    IMM dashboard's data object. {} when it cannot be read."""
+    return quote_state_of(load_dashboard(path))
+
+
+def quote_state_of(D: Optional[dict]) -> Dict[str, dict]:
+    """load_quote_state's map from an already-read data object."""
+    if not D:
         return {}
     out: Dict[str, dict] = {}
     for _t, m in (D.get("markets") or {}).items():
@@ -411,9 +427,190 @@ def _fmt_et(ts: float) -> str:
         return "?"
 
 
+# QUOTE OR NOT (Jack 2026-10-19: "In IMM watch emails, recommend if I should
+# quote the market or not based on my strategies"). Every item gets a call
+# and its reason -- the first rule that applies:
+#   1. OWNED ELSEWHERE: a series another of Jack's bots trades on this
+#      account (the bot's blocklist, or its scan's exclusions): DON'T QUOTE;
+#      crossing that bot trips same-account self-trade prevention. The 10/19
+#      12:20 ET burst of 48 newly paying KXHIGH / KXLOWT temperature dailies
+#      is this (high_temp_trading.py / low_temp_trading.py).
+#   2. TOO SMALL: a new family worth under CALL_SKIP_TOTAL over the rest of
+#      its program -- SKIP.
+#   3. THE ITEM'S OWN RULE: a mention event quoted without a start time ->
+#      KEEP QUOTING (add the start); an election / award gap -> QUOTE ONCE
+#      DATED (verified date rows only); research found no vote -> DON'T
+#      QUOTE (non-vote political markets stay out); a new mention family ->
+#      QUOTE WITH CARE (the mention live gates); a new election family ->
+#      QUOTE ONCE DATED.
+#   4. THE TRACK RECORD of the dashboard family it would join over its last
+#      CALL_DAYS full days -- the portfolio email's What-to-do numbers:
+#      its own quoting loses -> NOT YET; the quoting pays but positions it
+#      held lost -> QUOTE WITH CARE; both pay -> QUOTE; nothing like it
+#      trades yet -> YOUR CALL.
+# A one-off news event says so: it can jump at any time, so the toxic-flow
+# halts and its cutoff are its protection. A call is advice: nothing here
+# enrolls or blocks anything.
+CALL_DAYS = 7
+CALL_SKIP_TOTAL = 10.0          # $ left in a new family's program: under this, SKIP
+OWNER_PREFIXES = (
+    ("KXHIGH", "high_temp_trading.py (cloud) trades the KXHIGH dailies on this account"),
+    ("KXLOWT", "low_temp_trading.py trades the KXLOWT dailies on this account"),
+    ("KXMLBMENTION", "mlb_trading.py (cloud) trades these on this account"),
+    ("KXNBAMENTION", "nbamention_v4_4.py (cloud) trades these on this account"),
+    ("KXNCAABMENTION", "ncaab_order_script_v42.py (cloud) trades these on this account"),
+)
+CALL_ORDER = ("QUOTE", "QUOTE WITH CARE", "QUOTE ONCE DATED", "QUOTE ONCE MODELED",
+              "KEEP QUOTING", "FIX, THEN QUOTE", "YOUR CALL", "NOT YET", "SKIP",
+              "DON'T QUOTE")
+
+
+def family_track(D: Optional[dict], today: Optional[str] = None) -> Dict[str, dict]:
+    """dashboard family -> {"rew", "own", "carried", "quoting", "net"} over its
+    last CALL_DAYS full ET days: rewards as modelled; own = the day's own
+    fills, carried = the positions it already held, re-marked or settled
+    (the dashboard's cr / cs). {} without a dashboard."""
+    if not D:
+        return {}
+    today = today or datetime.now(timezone.utc).astimezone(imm.ET).date().isoformat()
+    try:
+        ix = {f: i for i, f in enumerate(D["day_fields"])}
+        mk = D.get("markets") or {}
+        out: Dict[str, dict] = {}
+        for d in sorted(x for x in (D.get("days") or {}) if x < today)[-CALL_DAYS:]:
+            for t, v in ((D["days"].get(d) or {}).get("m") or {}).items():
+                fam = (mk.get(t) or {}).get("fam") or "Other"
+                o = out.setdefault(fam, {"rew": 0.0, "own": 0.0, "carried": 0.0})
+                car = float(v[ix["cr"]] or 0.0) + float(v[ix["cs"]] or 0.0)
+                o["rew"] += float(v[ix["rew"]] or 0.0)
+                o["own"] += float(v[ix["pnl"]] or 0.0) - car
+                o["carried"] += car
+        for o in out.values():
+            o["quoting"] = o["rew"] + o["own"]
+            o["net"] = o["quoting"] + o["carried"]
+        return out
+    except (KeyError, TypeError, ValueError, IndexError) as e:
+        log(f"[WATCH] ! no family track record ({e!r})")
+        return {}
+
+
+def owner_of(series: str) -> Tuple[str, bool]:
+    """(why the series is out of the IMM on purpose, whether another of
+    Jack's bots trades it) -- ("", False) when nothing keeps it out: the
+    bot's blocklist and its scan's exclusions, with the owner when known."""
+    s = series or ""
+    named = next((why for p, why in OWNER_PREFIXES if s.startswith(p)), "")
+    if any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ())):
+        return named or "blocklisted in incentive_mm.py", bool(named)
+    if any(s.startswith(p) for p in getattr(imm, "SCAN_EXCLUDE_PREFIXES", ())):
+        return named or "the bot's scan leaves these out on purpose", bool(named)
+    return "", False
+
+
+def family_name(series: str, category: str = "") -> str:
+    """The dashboard family the series would land in ('' = none known)."""
+    try:
+        fam = dash.family_of(series, category)[0] or ""
+    except Exception:
+        return ""
+    return "" if fam == "Other" else fam
+
+
+def _usd(v: float) -> str:
+    return ("-$" if v < 0 else "+$") + f"{abs(v):,.0f}"
+
+
+def _record(fam: str, r: dict) -> str:
+    return (f"{fam}: {_usd(r['net'])} over the last {CALL_DAYS} days after rewards, "
+            f"its quoting {_usd(r['quoting'])}")
+
+
+def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
+    """(call, why) for one alert item, from CALL_ORDER's calls; see above."""
+    kind, _, tick = key.partition(":")
+    series = tick if kind == "new" else imm.series_of(tick)
+    owner, other_bot = owner_of(series)
+    if owner:
+        return ("DON'T QUOTE", f"{owner} -- quoting it would cross that bot (same-account "
+                               f"self-trade prevention cancels its orders); these programs "
+                               f"are that bot's to earn" if other_bot
+                else f"{owner}: kept out on purpose")
+    total = it.get("est_total")
+    if kind == "new" and total is not None and total < CALL_SKIP_TOTAL:
+        return ("SKIP", f"worth ~${total:,.0f} over the rest of its program")
+    cat = str(it.get("category") or "")
+    fam = family_name(series, cat)
+    rec = track.get(fam) if fam else None
+    rec_txt = f" ({_record(fam, rec)})" if rec else ""
+    if kind == "start":
+        return ("KEEP QUOTING", "a mention event quoted behind the live gates; add its "
+                                "start time so it stops 10 min before" + rec_txt)
+    if kind == "gap":
+        if "not a vote market" in str(it.get("fix") or "").lower():
+            return ("DON'T QUOTE", "research found it is not a vote market, and non-vote "
+                                   "political markets stay out")
+        g = gap_kind(it.get("what") or "")
+        if g in ("election", "award"):
+            return ("QUOTE ONCE DATED", f"{'elections' if g == 'election' else 'awards'} "
+                                        f"quote only with a verified date row" + rec_txt)
+        return ("FIX, THEN QUOTE", "a config gap holds it dark" + rec_txt)
+    if cat == "Mentions" or "MENTION" in series:
+        return ("QUOTE WITH CARE", "a mention: quote it under the mention live gates, with "
+                                   "its start time on file" + rec_txt)
+    if cat == "Elections":
+        return ("QUOTE ONCE DATED", "an election: quote it once its election day is on "
+                                    "file (verified date rows only)" + rec_txt)
+    if not rec:
+        return ("YOUR CALL", "no track record: nothing like it trades yet"
+                + (f" in {fam}" if fam else ""))
+    tail = ("; a one-off news event, so it can jump at any time: the toxic-flow halts and "
+            "its cutoff are the protection" if str(it.get("frequency")) == "one_off" else "")
+    if rec["quoting"] < 0:
+        return ("NOT YET", f"{fam}'s own quoting lost {_usd(rec['quoting'])[1:]} over the "
+                           f"last {CALL_DAYS} days (rewards {_usd(rec['rew'])} vs its fills "
+                           f"{_usd(rec['own'])})")
+    if rec["net"] < 0:
+        return ("QUOTE WITH CARE", f"{fam}'s quoting pays ({_usd(rec['quoting'])}) but the "
+                                   f"positions it held lost ({_usd(rec['carried'])}): quote "
+                                   f"small and watch the inventory" + tail)
+    return ("QUOTE", f"it would join {_record(fam, rec)}" + tail)
+
+
+def model_gap_call(g: dict, track: Dict[str, dict]) -> Tuple[str, str]:
+    """(call, why) for a model-coverage gap: FAIL-CLOSED sits dark until the
+    model has it; FAIL-OPEN is quoted now without the model's protection."""
+    mk = g.get("markets") or []
+    fam = family_name(imm.series_of(mk[0])) if mk else ""
+    rec = track.get(fam) if fam else None
+    rec_txt = f" ({_record(fam, rec)})" if rec else ""
+    if str(g.get("fail") or "").lower() == "closed":
+        if rec and rec["quoting"] < 0:
+            return ("NOT YET", f"it sits dark until modeled, and {fam}'s own quoting lost "
+                               f"{_usd(rec['quoting'])[1:]} over the last {CALL_DAYS} days")
+        return ("QUOTE ONCE MODELED", "it sits dark until the model has it: make the fix"
+                + rec_txt)
+    return ("QUOTE WITH CARE", "the bot quotes it now without the model's protection: "
+                               "make the fix, or block it until then" + rec_txt)
+
+
+def calls_line(calls: Dict[str, Tuple[str, str]], est: Dict[str, float]) -> str:
+    """'Calls: QUOTE 2 (~$17/day), DON'T QUOTE 48 (~$507/day)'."""
+    n, usd = Counter(c for c, _ in calls.values()), defaultdict(float)
+    for k, (c, _) in calls.items():
+        usd[c] += est.get(k, 0.0)
+    return "Calls: " + ", ".join(
+        f"{c} {n[c]}" + (f" (~${usd[c]:,.0f}/day)" if usd[c] >= 0.5 else "")
+        for c in CALL_ORDER if n[c])
+
+
 def alert_body(due: List[Tuple[str, dict, float]],
-               qs: Optional[Dict[str, dict]] = None) -> Tuple[str, str]:
+               qs: Optional[Dict[str, dict]] = None,
+               track: Optional[Dict[str, dict]] = None) -> Tuple[str, str]:
+    """(subject, body). With `track` (family_track's map; {} = none read)
+    every item also gets a quote-or-not call and the subject a tally."""
     labels = {key: quote_label(key, qs) for key, _, _ in due}
+    calls = ({key: quote_call(key, it, track) for key, it, _ in due}
+             if track is not None else {})
     quoted = [it for key, it, _ in due if labels[key][0].startswith("QUOTED")]
     unknown = [it for key, it, _ in due if labels[key][0].startswith("QUOTE STATE")]
     dark = [it for key, it, _ in due if labels[key][0].startswith("NOT QUOTED")]
@@ -430,6 +627,10 @@ def alert_body(due: List[Tuple[str, dict, float]],
     subject = ("IMM watch: " + "; ".join(parts)
                + (f" (~${whole:,.0f} over their programs)" if whole else ""))
     lines = [subject, ""]
+    if calls:
+        tally = calls_line(calls, {key: it["est"] for key, it, _ in due})
+        subject += " | " + tally[len("Calls: "):].replace(" (~", " ~").replace("/day)", "/day")
+        lines = [subject, "", tally, ""]
     for key, it, dark_s in sorted(due, key=lambda d: -d[1]["est"]):
         src = it.get("est_src") or "pool proxy"
         evs = it.get("est_events") or []
@@ -453,7 +654,16 @@ def alert_body(due: List[Tuple[str, dict, float]],
                             f"({e[3]:.1f}d left)" for e in evs[:4])
             lines.append(f"    per event: {per}"
                          + (f"; +{len(evs) - 4} more" if len(evs) > 4 else ""))
+        if key in calls:
+            lines.append(f"    call: {calls[key][0]} -- {calls[key][1]}")
         lines.append(f"    fix: {it['fix']}")
+    if calls:
+        lines += ["", f"(call = advice from your strategies, not an action: another of "
+                      f"your bots' markets, a program too small to bother (under "
+                      f"${CALL_SKIP_TOTAL:g} left), a mention / election / award's own "
+                      f"rule, else the last {CALL_DAYS} days of the dashboard family it "
+                      f"would join -- its rewards against its own fills and the "
+                      f"positions it held. Nothing is enrolled or blocked by it.)"]
     lines += ["", "(QUOTED / NOT QUOTED = what the bot was doing at the last dashboard "
                   "build, every 10 min; for a QUOTED item the $ is about what it earns "
                   "now, and the missing date decides when it stops. "
@@ -1110,7 +1320,8 @@ def model_coverage_pass(progs: Dict[str, dict], state: dict, dry: bool,
         due_m, state["model_gaps"] = mcov.due(state.get("model_gaps") or {}, gaps,
                                               now_ts, baseline_once=first)
         if due_m:
-            subject, text = mcov.body(due_m)
+            track = family_track(load_dashboard())
+            subject, text = mcov.body(due_m, call=lambda g: model_gap_call(g, track))
             log("[WATCH] model coverage alert:\n" + text)
             if not dry:
                 imm.Alerter("IMM-WATCH", live=True).send_message(text, subject)
@@ -1219,7 +1430,8 @@ def main(argv=None) -> int:
             due, state["items"] = due_alerts(state.get("items") or {}, items, time.time())
             if due:
                 describe(client, due)
-                subject, body = alert_body(due, load_quote_state())
+                D = load_dashboard()
+                subject, body = alert_body(due, quote_state_of(D), family_track(D))
                 log("[WATCH] alert:\n" + body)
                 if not args.dry:
                     imm.Alerter("IMM-WATCH", live=True).send_message(body, subject)
