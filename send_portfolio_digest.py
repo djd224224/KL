@@ -12,6 +12,15 @@ them (imm_dashboard.family_of, since 2026-10-03; settled and unrealized
 alike, ranked by the size of the move, realized and mark-to-mid split out).
 (The "Settled since yesterday, by series" table was removed 2026-09-29.)
 
+Under the day change, WHAT TO DO (since 2026-10-19, Jack: "share
+recommendations on what I should do based on prior day trading
+performance"): imm_advice() reads the IMM dashboard's per-family days --
+yesterday against the last month, each family's last 7 full days split
+into rewards, its own fills and the positions it already held -- and says
+which families to review and why (the quoting loses: shrink or pause the
+worst events; the inventory loses: hold or trim it), what is working, and
+the week's change. Kill: PF_ADVICE=0.
+
 Then the IMM bot's section (since 2026-10-02, when its own 7:10 email was
 cut): send_imm_digest.py --section-out, run as a child process (imm_section),
 with the dashboard's yesterday / 7-day / 30-day figures; its PICK-OFF WINDOW
@@ -69,9 +78,11 @@ import json
 import os
 import re
 import smtplib
+import statistics
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -1253,10 +1264,252 @@ def _mover_tag(r) -> str:
     return "realized" if realized else "mark"
 
 
-def build_email(pf, history, chart_ok: bool, imm=None):
+# ----------------------------------------------------------------------------
+# What to do (Jack 2026-10-19: "In daily portfolio digest email, share
+# recommendations on what I should do based on prior day trading
+# performance")
+# ----------------------------------------------------------------------------
+# Read off the IMM dashboard's per-market day rows: the IMM bot's own book
+# (the crypto fleets, the weather bot and the snipe bot have their own
+# emails), over the last ADVICE_DAYS full ET days, rewards as modelled. Each
+# family's trading splits into the day's own fills and the positions it
+# already held, re-marked or settled (the dashboard's cr / cs), so a losing
+# family reads one of two ways:
+#   the quoting loses -- its rewards don't cover its own fills: shrink or
+#     pause the worst events;
+#   the inventory loses -- the quoting pays, but positions it already held
+#     moved against it: no quoting change; hold or trim them (Jack's call).
+# It says "review", never "cut": the 10/09 Carbon Arc review found that
+# pruning on a trailing net barely persists. Nothing here scales anything up.
+IMM_DASH_HTML = os.path.join(KL_DIR, "run-logs", "incentive-mm", "dashboard",
+                             "imm_dashboard.html")
+ADVICE_ENABLED = os.environ.get("PF_ADVICE", "1") != "0"
+ADVICE_DAYS = 7
+ADVICE_REVIEW_NET = -100.0     # a family's 7-day net at/below this -> REVIEW
+ADVICE_BAD_DAY = -150.0        # a family's yesterday at/below this, 7 days still up
+ADVICE_KEEP_NET = 100.0        # 7-day net at/above this -> working, keep as is
+ADVICE_BOTTOM_N = 3            # yesterday among the N worst days -> below normal
+ADVICE_TOP_EVENTS = 3
+
+
+def load_imm_dashboard(path: str = IMM_DASH_HTML) -> dict:
+    """The IMM dashboard's data object (its `const D = {...}`)."""
+    with open(path, encoding="utf-8") as f:
+        html = f.read()
+    i = html.index("const D = ") + len("const D = ")
+    data, _ = json.JSONDecoder().raw_decode(html, i)
+    return data
+
+
+def _usd0(v: float) -> str:
+    """+$1,234 / -$12 / $0: whole dollars for the advice lines."""
+    if abs(v) < 0.5:
+        return "$0"
+    return f"{'-' if v < 0 else '+'}${abs(v):,.0f}"
+
+
+def _nth(n: int) -> str:
+    """1st, 2nd, 3rd, 4th, 11th, 21st."""
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def imm_advice(D: dict, today_str: str) -> dict:
+    """{"basis": str, "items": [(tag, text)]} for the What-to-do block, from
+    the dashboard data object (see the comment above). Days before
+    today_str only: the dashboard's last day is the one still running."""
+    ix = {f: i for i, f in enumerate(D["day_fields"])}
+    mk = D.get("markets") or {}
+    all_days = D.get("days") or {}
+    days = sorted(d for d in all_days if d < today_str)
+    if len(days) < 2:
+        raise ValueError(f"only {len(days)} full day(s) on the dashboard")
+    win = days[-ADVICE_DAYS:]
+    prev = days[-2 * ADVICE_DAYS:-ADVICE_DAYS]
+    y = days[-1]
+    daily = {}                                    # day -> [rewards, trading]
+    fam_day = defaultdict(dict)                   # family -> day -> [rew, own, carried]
+    fam_ev = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0.0]))
+    for d in days:
+        tot = [0.0, 0.0]
+        for t, v in ((all_days.get(d) or {}).get("m") or {}).items():
+            rew, pnl = _f(v[ix["rew"]]), _f(v[ix["pnl"]])
+            carried = _f(v[ix["cr"]]) + _f(v[ix["cs"]])
+            tot[0] += rew
+            tot[1] += pnl
+            info = mk.get(t) or {}
+            fam = info.get("fam") or "Other"
+            a = fam_day[fam].setdefault(d, [0.0, 0.0, 0.0])
+            a[0] += rew
+            a[1] += pnl - carried
+            a[2] += carried
+            if d in win:
+                e = fam_ev[fam][info.get("ev") or event_from_ticker(t)]
+                e[0] += rew
+                e[1] += pnl - carried
+                e[2] += carried
+        daily[d] = tot
+
+    def span(fam, ds):
+        out = [0.0, 0.0, 0.0]
+        for d in ds:
+            a = fam_day[fam].get(d)
+            if a:
+                out = [out[0] + a[0], out[1] + a[1], out[2] + a[2]]
+        return out
+
+    fams = {}
+    for fam in fam_day:
+        rew, own, carried = span(fam, win)
+        fams[fam] = dict(rew=rew, own=own, carried=carried, net=rew + own + carried,
+                         quoting=rew + own, prev=sum(span(fam, prev)),
+                         yday=sum(fam_day[fam].get(y, (0.0,))))
+    items = []
+    # 1. yesterday, against the dashboard's other full days
+    y_rew, y_pnl = daily[y]
+    y_net = y_rew + y_pnl
+    rank = 1 + sum(1 for d in days if d != y and sum(daily[d]) < y_net)
+    med = statistics.median(sum(daily[d]) for d in days)
+    review = sorted((f for f, v in fams.items() if v["net"] <= ADVICE_REVIEW_NET),
+                    key=lambda f: fams[f]["net"])
+    ydate = datetime.strptime(y, "%Y-%m-%d")
+    head = (f"Yesterday ({ydate:%a %m/%d}): the IMM netted {_usd0(y_net)} (rewards "
+            f"{_usd0(y_rew)}, trading {_usd0(y_pnl)}) -- ")
+    which = "" if rank == 1 else _nth(rank) + "-"
+    if rank <= ADVICE_BOTTOM_N and y_net < 0:
+        head += (f"below normal, the {which}worst of the last {len(days)} days "
+                 f"(median {_usd0(med)}).")
+    elif rank <= ADVICE_BOTTOM_N and y_net < med:
+        head += (f"positive but weak, the {which}lowest of the last {len(days)} days "
+                 f"(median {_usd0(med)}).")
+    else:
+        head += (f"a normal day ({rank - 1} of the last {len(days)} were worse; "
+                 f"median {_usd0(med)}).")
+    if review:
+        head += " The losses sit in the families below; nothing account-wide to change."
+    items.append(("day", head))
+
+    # 2. the families to review, by kind. An event none of whose markets is
+    # still selected or held is over: nothing left to pause there.
+    live = set()
+    for t, m in mk.items():
+        if m.get("sel") or abs(_f(m.get("pos"))) > 0:
+            live.add(m.get("ev") or event_from_ticker(t))
+
+    def top(fam, key):
+        """(live events, events already over): the worst ADVICE_TOP_EVENTS
+        losers of the family by `key`, as "EVENT -$N"."""
+        evs = [(ev, key(v)) for ev, v in sorted(fam_ev[fam].items(),
+                                               key=lambda kv: key(kv[1]))
+               if key(v) < -0.5][:ADVICE_TOP_EVENTS]
+        fmt = lambda xs: ", ".join(f"{ev} {_usd0(x)}" for ev, x in xs)   # noqa: E731
+        return (fmt([e for e in evs if e[0] in live]),
+                fmt([e for e in evs if e[0] not in live]))
+
+    for fam in review:
+        v = fams[fam]
+        lead = f"REVIEW {fam}: {_usd0(v['net'])} over {len(win)} days."
+        if v["quoting"] < 0:
+            on, over = top(fam, lambda a: a[0] + a[1])
+            text = (f"{lead} The quoting itself loses: rewards {_usd0(v['rew'])} vs its "
+                    f"own fills {_usd0(v['own'])} ({_usd0(v['quoting'])}); positions it "
+                    f"already held {_usd0(v['carried'])}.")
+            if on:
+                text += f" Shrink or pause the worst live events: {on}."
+            if over:
+                text += (f" Already over (nothing to pause): {over}."
+                         + ("" if on else " Watch whether the family recovers."))
+            items.append(("review", text))
+        else:
+            on, over = top(fam, lambda a: a[2])
+            items.append(("review", f"{lead} The quoting pays (rewards {_usd0(v['rew'])} "
+                          f"vs its own fills {_usd0(v['own'])} = {_usd0(v['quoting'])}); "
+                          f"the loss is positions it already held "
+                          f"({_usd0(v['carried'])}): no quoting change -- hold or trim "
+                          f"those positions (your call)"
+                          + (f". Biggest: {on}." if on else ".")))
+
+    # 3. one bad day inside a good week
+    bad_days = []
+    for fam, v in sorted(fams.items(), key=lambda kv: kv[1]["yday"]):
+        if v["yday"] <= ADVICE_BAD_DAY and v["net"] > 0 and fam not in review:
+            bad_days.append(fam)
+            items.append(("ok", f"One bad day, no action: {fam} {_usd0(v['yday'])} "
+                          f"yesterday, {_usd0(v['net'])} over {len(win)} days."))
+    if not review:
+        items.insert(1, ("ok", f"No action: no family lost more than "
+                         f"{_usd0(-ADVICE_REVIEW_NET)[1:]} after rewards over the last "
+                         f"{len(win)} days."))
+
+    # 4. week over week
+    if len(prev) == ADVICE_DAYS:
+        w = [sum(daily[d][k] for d in win) for k in (0, 1)]
+        p = [sum(daily[d][k] for d in prev) for k in (0, 1)]
+        line = (f"Week over week: {_usd0(sum(w))} over the last {len(win)} days vs "
+                f"{_usd0(sum(p))} the {len(prev)} before (rewards {_usd0(w[0] - p[0])}, "
+                f"trading {_usd0(w[1] - p[1])})")
+        drops = sorted((v["net"] - v["prev"], f) for f, v in fams.items()
+                       if v["net"] - v["prev"] < -0.5)[:2]
+        if sum(w) < sum(p) and drops:
+            line += "; the biggest drops: " + ", ".join(f"{f} {_usd0(d)}" for d, f in drops)
+        items.append(("week", line + "."))
+
+    # 5. what is working
+    keep = sorted((f for f, v in fams.items() if v["net"] >= ADVICE_KEEP_NET),
+                  key=lambda f: -fams[f]["net"])[:3]
+    if keep:
+        items.append(("ok", "Working, keep as is: " + ", ".join(
+            f"{f} {_usd0(fams[f]['net'])}" for f in keep) + f" over {len(win)} days."))
+    basis = (f"the IMM bot's book on its dashboard, {len(win)} full ET days "
+             f"{win[0][5:].replace('-', '/')}-{win[-1][5:].replace('-', '/')}, rewards "
+             f"as modelled; trading = its own fills + the positions it already held")
+    gen = _f(D.get("generated"))
+    midnight = ET.localize(datetime.strptime(today_str, "%Y-%m-%d")).timestamp()
+    if gen and gen < midnight:
+        basis += (f"; the dashboard was last built "
+                  f"{datetime.fromtimestamp(gen, ET):%m/%d %H:%M} ET, so yesterday may be "
+                  f"partial")
+    return {"basis": basis, "items": items}
+
+
+def advice_text(advice) -> list:
+    """The What-to-do block, plain text lines."""
+    if advice is None:
+        return []
+    if advice.get("error"):
+        return [f"What to do: unavailable ({advice['error']})", ""]
+    out = [f"What to do ({advice['basis']}):"]
+    out += [f"  - {t}" for _, t in advice["items"]]
+    return out + [""]
+
+
+def advice_html(advice) -> str:
+    if advice is None:
+        return ""
+    if advice.get("error"):
+        return (f'<div style="color:{C_MUTED};margin:8px 0">What to do: unavailable '
+                f'({_esc(advice["error"])})</div>')
+    lis = []
+    for tag, t in advice["items"]:
+        if tag == "review":
+            name, _, rest = t.partition(":")
+            body = f'<b style="color:{C_NEG}">{_esc(name)}:</b>{_esc(rest)}'
+        else:
+            body = _esc(t)
+        lis.append(f'<li style="margin:3px 0">{body}</li>')
+    return (f'<div style="border:1px solid {C_GRID};border-radius:6px;padding:8px 12px;'
+            f'margin:10px 0;background:#fbfbf8">'
+            f'<div style="font-size:15px;font-weight:600">What to do</div>'
+            f'<div style="color:{C_MUTED};font-size:12px">{_esc(advice["basis"])}</div>'
+            f'<ul style="margin:6px 0 2px;padding-left:20px">{"".join(lis)}</ul></div>')
+
+
+def build_email(pf, history, chart_ok: bool, imm=None, advice=None):
     """(subject, text, html). `imm` is imm_section()'s result: the IMM bot's
     section goes after the movers table, and its PICK-OFF flag onto the
-    subject; None leaves the email as it was before 2026-10-02."""
+    subject; None leaves the email as it was before 2026-10-02. `advice` is
+    imm_advice()'s result (or {"error": why}): the What-to-do block, under
+    the day change; None leaves it out."""
     today = pf["today"]
     # The "Settled since yesterday, by series" table is gone (Jack
     # 2026-09-29: "remove 'Settled since yesterday, by series'"); settled
@@ -1441,6 +1694,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
                      + "  +  ".join(f"{k} {v:+,.2f}" for k, v in day_parts)
                      + day_tail + excl_txt)
     lines.append("")
+    lines += advice_text(advice)
     # the risk-controls block under the account summary, as in the html
     # (Jack 2026-10-03: "move the risk controls section right under the
     # chart at the top")
@@ -1540,6 +1794,7 @@ def build_email(pf, history, chart_ok: bool, imm=None):
     if first:
         h.append(f'<div style="color:{C_INK2};margin-bottom:6px">First run — '
                  f'baseline saved; day-over-day starts tomorrow.</div>')
+    h.append(advice_html(advice))
     if chart_ok:
         h.append('<div style="margin:10px 0"><img src="cid:balancechart" '
                  'alt="Daily profit, realized and estimated after rewards" width="760" '
@@ -1785,7 +2040,15 @@ def main(argv=None) -> int:
         if imm.get("error"):
             log(f"! IMM section unavailable: {imm['error']}")
 
-    subject, text, html = build_email(pf, history_preview, chart_ok, imm)
+    advice = None
+    if ADVICE_ENABLED:
+        try:
+            advice = imm_advice(load_imm_dashboard(), today_str)
+        except Exception as e:                    # never holds the email
+            advice = {"error": f"{type(e).__name__}: {e}"}
+            log(f"! what-to-do block unavailable: {e!r}")
+
+    subject, text, html = build_email(pf, history_preview, chart_ok, imm, advice=advice)
     if args.test:
         subject = "[TEST] " + subject
     html_path = os.path.join(LOG_DIR, f"digest_{today_str}.html")

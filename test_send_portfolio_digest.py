@@ -3,6 +3,7 @@
 unrealized) since the last daily update") and the family grouping it leans on.
 
 Rows are what build_portfolio() emits per event: day == realized + value_d."""
+import os
 import unittest
 
 import send_portfolio_digest as pf
@@ -1053,6 +1054,141 @@ class ImmSectionTests(unittest.TestCase):
             pf.LOG_DIR, pf.IMM_SECTION_LOG = old
             import shutil
             shutil.rmtree(d, ignore_errors=True)
+
+
+
+FIELDS = ["rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n",
+          "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled", "cr", "cs", "fx"]
+
+
+def _drow(rew=0.0, pnl=0.0, cr=0.0, cs=0.0):
+    r = [0.0] * len(FIELDS)
+    r[FIELDS.index("rew")], r[FIELDS.index("pnl")] = rew, pnl
+    r[FIELDS.index("cr")], r[FIELDS.index("cs")] = cr, cs
+    r[FIELDS.index("fx")] = 0
+    return r
+
+
+def _dash(bad_week=True, generated=None):
+    """A dashboard data object over 10/05-10/19 (10/19 = today, still running).
+    The prior week every market makes +$50/day. The last 7 full days:
+    Sports & awards' quoting loses (KXSPORT-A live -$20/day, KXSPORT-B over
+    -$25/day); Carbon Arc's quoting pays (+$25/day) but positions it already
+    held lose $45/day; TRUMP mentions makes $40/day; AI & tech makes $40/day
+    and loses $200 on 10/18 alone."""
+    from datetime import date, timedelta
+    markets = {
+        "KXSPORT-A-1": {"fam": "Sports & awards", "ev": "KXSPORT-A", "sel": True, "pos": 10.0},
+        "KXSPORT-B-1": {"fam": "Sports & awards", "ev": "KXSPORT-B", "sel": False, "pos": 0.0},
+        "KXCA-X-1": {"fam": "Carbon Arc consumer", "ev": "KXCA-X", "sel": True, "pos": -50.0},
+        "KXTM-1-A": {"fam": "TRUMP mentions", "ev": "KXTM-1", "sel": True, "pos": 0.0},
+        "KXAI-1-A": {"fam": "AI & tech", "ev": "KXAI-1", "sel": True, "pos": 0.0},
+    }
+    days = {}
+    for k in range(15):
+        d = (date(2026, 10, 5) + timedelta(days=k)).isoformat()
+        if d < "2026-10-12":
+            m = {t: _drow(rew=50.0) for t in markets}
+        elif bad_week:
+            m = {"KXSPORT-A-1": _drow(rew=10.0, pnl=-30.0),
+                 "KXSPORT-B-1": _drow(pnl=-25.0),
+                 "KXCA-X-1": _drow(rew=30.0, pnl=-50.0, cr=-45.0),
+                 "KXTM-1-A": _drow(rew=50.0, pnl=-10.0),
+                 "KXAI-1-A": _drow(rew=40.0, pnl=-200.0 if d == "2026-10-18" else 0.0)}
+        else:
+            m = {"KXTM-1-A": _drow(rew=50.0, pnl=-10.0), "KXAI-1-A": _drow(rew=20.0)}
+        days[d] = {"m": m}
+    return {"day_fields": FIELDS, "days": days, "markets": markets,
+            "generated": generated if generated is not None
+            else pf.ET.localize(pf.datetime(2026, 10, 19, 6, 55)).timestamp()}
+
+
+class AdviceTests(unittest.TestCase):
+    """Jack 2026-10-19: "In daily portfolio digest email, share
+    recommendations on what I should do based on prior day trading
+    performance"."""
+
+    def test_reads_each_family_and_says_what_to_do(self):
+        adv = pf.imm_advice(_dash(), "2026-10-19")
+        items = [t for _, t in adv["items"]]
+        txt = "\n".join(items)
+        # yesterday 10/18: -45 -20 +40 -160 = -185, the worst of 14 full days
+        self.assertTrue(items[0].startswith("Yesterday (Sun 10/18): the IMM netted -$185 "
+                                            "(rewards +$130, trading -$315) -- below "
+                                            "normal, the worst of the last 14 days"))
+        self.assertIn("nothing account-wide to change", items[0])
+        # the quoting loses: shrink or pause the LIVE event; the other is over
+        self.assertIn("REVIEW Sports & awards: -$315 over 7 days. The quoting itself "
+                      "loses: rewards +$70 vs its own fills -$385 (-$315)", txt)
+        self.assertIn("Shrink or pause the worst live events: KXSPORT-A -$140.", txt)
+        self.assertIn("Already over (nothing to pause): KXSPORT-B -$175.", txt)
+        # the quoting pays, old positions lose: no quoting change
+        self.assertIn("REVIEW Carbon Arc consumer: -$140 over 7 days. The quoting pays "
+                      "(rewards +$210 vs its own fills -$35 = +$175); the loss is "
+                      "positions it already held (-$315): no quoting change", txt)
+        self.assertIn("Biggest: KXCA-X -$315.", txt)
+        # worst family first
+        self.assertLess(txt.index("REVIEW Sports"), txt.index("REVIEW Carbon"))
+        self.assertIn("One bad day, no action: AI & tech -$160 yesterday, +$80 over 7 days.",
+                      txt)
+        self.assertIn("Week over week: -$95 over the last 7 days vs +$1,750 the 7 before "
+                      "(rewards -$840, trading -$1,005); the biggest drops: Sports & "
+                      "awards -$1,015, Carbon Arc consumer -$490.", txt)
+        self.assertIn("Working, keep as is: TRUMP mentions +$280 over 7 days.", txt)
+        self.assertNotIn("No action: no family", txt)
+        self.assertIn("7 full ET days 10/12-10/18", adv["basis"])
+        self.assertNotIn("partial", adv["basis"])
+        "\n".join(pf.advice_text(adv)).encode("ascii")    # the task console is cp1252
+        html = pf.advice_html(adv)
+        self.assertIn("REVIEW Sports &amp; awards:</b>", html)
+
+    def test_a_quiet_week_says_no_action(self):
+        adv = pf.imm_advice(_dash(bad_week=False), "2026-10-19")
+        txt = "\n".join(t for _, t in adv["items"])
+        self.assertIn("No action: no family lost more than $100 after rewards over the "
+                      "last 7 days.", txt)
+        self.assertNotIn("REVIEW", txt)
+        # +$60, the lowest of 14 days but a gain: weak, not an alarm
+        self.assertIn("positive but weak, the lowest of the last 14 days (median +$155)",
+                      txt.splitlines()[0])
+        # every day alike: a normal day
+        d = _dash(bad_week=False)
+        for k in d["days"]:
+            d["days"][k]["m"] = {t: _drow(rew=50.0) for t in d["markets"]}
+        first = pf.imm_advice(d, "2026-10-19")["items"][0][1]
+        self.assertIn("a normal day (0 of the last 14 were worse; median +$250)", first)
+
+    def test_a_dashboard_built_before_midnight_is_flagged(self):
+        late = pf.ET.localize(pf.datetime(2026, 10, 18, 23, 40)).timestamp()
+        adv = pf.imm_advice(_dash(generated=late), "2026-10-19")
+        self.assertIn("last built 10/18 23:40 ET, so yesterday may be partial", adv["basis"])
+
+    def test_too_few_days_raise(self):
+        d = _dash()
+        d["days"] = {k: v for k, v in d["days"].items() if k >= "2026-10-18"}
+        with self.assertRaises(ValueError):
+            pf.imm_advice(d, "2026-10-19")
+
+    def test_loads_the_dashboard_data_object(self):
+        import json
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "dash.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("<script>const D = " + json.dumps(_dash()) + ";\n</script>")
+        self.assertEqual(sorted(pf.load_imm_dashboard(path)["markets"])[0], "KXAI-1-A")
+
+    def test_the_block_sits_under_the_day_change(self):
+        p = BuildEmailTests()._pf()
+        adv = pf.imm_advice(_dash(), "2026-10-19")
+        _, text, html = pf.build_email(p, [], chart_ok=True, advice=adv)
+        self.assertLess(text.index("vs yesterday:"), text.index("What to do ("))
+        self.assertLess(text.index("What to do ("), text.index("Biggest movers"))
+        self.assertLess(html.index(">What to do<"), html.index("cid:balancechart"))
+        _, text, html = pf.build_email(p, [], chart_ok=False, advice={"error": "no file"})
+        self.assertIn("What to do: unavailable (no file)", text)
+        self.assertIn("What to do: unavailable (no file)", html)
+        _, text, html = pf.build_email(p, [], chart_ok=False)
+        self.assertNotIn("What to do", text + html)
 
 
 if __name__ == "__main__":
