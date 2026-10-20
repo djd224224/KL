@@ -23086,7 +23086,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the YouTube #1 leader-bid pilot's gate (2026-10-14)
         # + the NBA / WNBA / MLB auto families' live-game / decided
         # stand-aside (2026-10-15)
-        self.assertEqual(len(conts), 47)
+        # + the Mamdani announcement halt / hold (2026-10-19)
+        self.assertEqual(len(conts), 48)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -29639,6 +29640,144 @@ class TestRateLimitWatch(unittest.TestCase):
                 c.raise_if_bad_response(resp(m))
         self.assertEqual((self.counter["writes"], self.counter["reads"], self.counter["last"]),
                          (2, 1, "GET /trade-api/v2/portfolio/events/orders"))
+
+
+class TestMentionAnnounceHalt(unittest.TestCase):
+    """ANNOUNCEMENT HALT (Jack 2026-10-19: "Yes build it"): for a series in
+    MENTION_ANNOUNCE_SERIES the word-jump and fill-burst live triggers are
+    armed at all times, pads stay on and there is no thin-book trigger. The
+    99DEC31 fixture's ticker date is far off, so the live-event gate itself
+    would never be armed here."""
+
+    EV = "KXGOOD-99DEC31"
+    A = "KXGOOD-99DEC31-A"
+    B = "KXGOOD-99DEC31-B"
+
+    def setUp(self):
+        p = mock.patch.object(imm, "MENTION_ANNOUNCE_SERIES", frozenset({"KXGOOD"}))
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(_clean_persist)
+
+    def _bot(self, yes_b=1200, no_b=1200):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        bot.client.programs.append(
+            {"market_ticker": self.B, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": start, "end_date": end})
+        bot.client.markets[self.B] = {
+            "ticker": self.B, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        self._books(bot, yes_b, no_b)
+        return bot
+
+    def _books(self, bot, yes_b=1200, no_b=1200):
+        bot.client.books[self.A] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", "1200"]], "no_dollars": [["0.49", "1200"]]}}
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.49", str(yes_b)]], "no_dollars": [["0.49", str(no_b)]]}}
+
+    def _event_orders(self, bot):
+        return [o for o in bot.state.sim_orders.values()
+                if o["ticker"] in (self.A, self.B)]
+
+    def _cycle(self, bot):
+        bot.state.universe_at = time.time()          # no refresh: quote loop only
+        bot.run_cycle()
+
+    def _fill(self, bot, a, b):
+        """Fills move the bot's own book and the account position together."""
+        bot.pnl.pos[self.A] = bot.client.positions[self.A] = a
+        bot.pnl.pos[self.B] = bot.client.positions[self.B] = b
+
+    def test_defaults(self):
+        with mock.patch.object(imm, "MENTION_ANNOUNCE_SERIES",
+                               frozenset({"KXMAMDANIMENTION"})):
+            self.assertTrue(imm.mention_announce_series("KXMAMDANIMENTION"))
+        self.assertEqual(imm.MENTION_ANNOUNCE_FILL_CT, 100.0)
+        for k in ("MENTION_ANNOUNCE_SERIES", "MENTION_ANNOUNCE_FILL_CT"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        # a series on the live-event gate keeps the gate's own rules
+        with mock.patch.object(imm, "EVENT_DEPTH_GATE_PREFIXES", ("KXGOOD",)):
+            self.assertFalse(imm.mention_announce_series("KXGOOD"))
+        self.assertFalse(imm.mention_announce_series("KXOTHER"))
+
+    def test_a_word_jump_confirms_the_event_live_for_good(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))          # prev_mid seeded ~50
+        self.assertFalse(imm.event_live_gate_armed(self.EV, time.time()))
+        bot.client.books[self.B] = {"orderbook_fp": {
+            "yes_dollars": [["0.98", "150"]], "no_dollars": [["0.01", "300"]]}}
+        self._cycle(bot)
+        self.assertFalse(self._event_orders(bot), "A's quotes go with B's jump")
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertTrue(any(c == "event_live" for c, _m in bot.alerter.today))
+        self._books(bot)                                  # books recover: still down
+        bot.state.event_depth_halt.pop(self.EV, None)
+        self._cycle(bot)
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_live_halt)
+
+    def test_a_thin_book_neither_halts_nor_loses_its_pads(self):
+        bot = self._bot(yes_b=300)
+        self.assertTrue(imm.series_pad_to_target("KXGOOD"))
+        bot.run_cycle()
+        self._cycle(bot)
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self.assertTrue([o for o in bot.state.sim_orders.values()
+                         if o["ticker"] == self.B])
+
+    def test_an_ordinary_fill_is_not_a_burst(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self._fill(bot, 55.0, 0.0)                        # one ~55-lot rung
+        self._cycle(bot)
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self.assertTrue(self._event_orders(bot))
+
+    def test_a_fill_burst_stands_down_then_resumes_once_healthy(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertTrue(self._event_orders(bot))
+        self._fill(bot, 60.0, -50.0)                      # 110 across the event
+        self._cycle(bot)
+        self.assertFalse(self._event_orders(bot))
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertNotIn(self.EV, bot.state.event_live_halt)      # burst 1/2
+        self.assertEqual(bot.state.event_fill_strikes.get(self.EV), 1)
+        self.assertTrue(any(c == "event_fill" for c, _m in bot.alerter.today))
+        # still inside the quiet time: held
+        self._cycle(bot)
+        self.assertIn(self.EV, bot.state.event_depth_halt)
+        self.assertFalse(self._event_orders(bot))
+        # quiet long enough and every market healthy: released, then quotes
+        bot.state.event_depth_halt[self.EV] = \
+            time.time() - imm.EVENT_DEPTH_RESUME_SECS - 5
+        self._cycle(bot)
+        self.assertNotIn(self.EV, bot.state.event_depth_halt)
+        self._cycle(bot)
+        self.assertTrue(self._event_orders(bot))
+
+    def test_a_second_burst_within_the_ttl_confirms_live(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self._fill(bot, 60.0, -50.0)                      # burst 1
+        self._cycle(bot)
+        bot.state.event_depth_halt.pop(self.EV, None)
+        self._cycle(bot)
+        self.assertTrue(self._event_orders(bot))
+        self._fill(bot, 130.0, -100.0)                    # burst 2: 120 more
+        self._cycle(bot)
+        self.assertIn(self.EV, bot.state.event_live_halt)
+        self.assertFalse(self._event_orders(bot))
 
 
 class TestRiskGroups(unittest.TestCase):

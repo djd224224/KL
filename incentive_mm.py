@@ -657,6 +657,39 @@ _DYNAMIC_DEPTH_GATE: Dict[str, float] = {}   # series -> last marked ts
 MENTION_NO_CUTOFF_EXEMPT = frozenset(
     s.strip().upper() for s in os.environ.get(
         "IMM_MENTION_NO_CUTOFF_EXEMPT", "KXMAMDANIMENTION").split(",") if s.strip())
+# ANNOUNCEMENT HALT (Jack 2026-10-19: "Yes build it", to "Should I build an
+# announcement halt for Mamdani? It would keep the word-jump and fill-burst
+# triggers armed at all times and leave the filler on. The thin-book trigger
+# would stay off, and the fill-burst threshold would sit above an ordinary
+# fill."). The live-event gate's triggers arm only from a known start or the
+# ticker date, and a Mamdani event has neither that means anything (it
+# closes on the "next Mayor's Office announcement"; 26NOV18 is the listing's
+# end), so even gated it had no halt -- and 9/05 had taken it off the gate to
+# quote through liveness. For a MENTION_ANNOUNCE_SERIES event, armed at all
+# times and with its pads kept:
+#   * a word jumping out of the series band by EVENT_DEPTH_JUMP_CENTS+ in one
+#     cycle (49c -> 99c: the word got said) confirms the event LIVE --
+#     permanent, the gate's own rule (released only by event_live_clear.txt);
+#   * our own position moving MENTION_ANNOUNCE_FILL_CT+ contracts across the
+#     whole event in one cycle (ours rest ~55 a side, so one ordinary fill
+#     stays under it; a pad dump or several words hit at once does not)
+#     stands the event down, resuming once every market reads healthy for
+#     EVENT_DEPTH_RESUME_SECS; a second burst within
+#     EVENT_FILL_STRIKE_TTL_SECS confirms it LIVE.
+# No thin-book trigger: Mamdani's YES sides rest 440-970 against a 1,000
+# floor, so it would hold the event down for good. A series on the gate
+# itself keeps the gate's rules instead. IMM_MENTION_ANNOUNCE_TRIGGERS
+# (comma-separated series; "" = none) and IMM_MENTION_ANNOUNCE_FILL_CT.
+MENTION_ANNOUNCE_SERIES = frozenset(
+    s.strip().upper() for s in os.environ.get(
+        "IMM_MENTION_ANNOUNCE_TRIGGERS", "KXMAMDANIMENTION").split(",") if s.strip())
+MENTION_ANNOUNCE_FILL_CT = max(1.0, _env_float("IMM_MENTION_ANNOUNCE_FILL_CT", 100.0))
+
+
+def mention_announce_series(series: str) -> bool:
+    """A series under the ANNOUNCEMENT HALT (not one the live-event gate
+    already covers)."""
+    return series in MENTION_ANNOUNCE_SERIES and not series_event_depth_gated(series)
 
 
 def mention_cutoff_is_clear(series: str, resolved: Optional[datetime],
@@ -9614,6 +9647,7 @@ _CONFIG_CODE_KNOBS = (
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE", "MENTION_NO_CUTOFF_EXEMPT",
+    "MENTION_ANNOUNCE_SERIES", "MENTION_ANNOUNCE_FILL_CT",
     # ladder family multipliers (2026-09-17): the earnings x1.5 changes every
     # downstream cap through applied_mention_mult, so it belongs in the hash
     "MENTION_SIZE_MULT", "EARNINGS_SIZE_MULT",
@@ -25705,6 +25739,20 @@ class IncentiveMarketMaker:
             _depth += 1
         # this cycle's book-read REST budget (BOOK_REST_BUDGET_SECS)
         self._book_rest = {"spent": 0.0, "fails": 0, "off": "", "skipped": 0}
+        # ANNOUNCEMENT HALT (2026-10-19, MENTION_ANNOUNCE_SERIES): how far our
+        # own position moved across each such event since its markets were
+        # last quoted -- measured before the loop updates prev_pos -- and the
+        # events whose burst this cycle has already counted
+        announce_moves: Dict[str, float] = {}
+        announce_counted: Set[str] = set()
+        if not fast_only and MENTION_ANNOUNCE_SERIES:
+            for _am in order_of_play:
+                if mention_announce_series(_am.series):
+                    _ap = self.state.prev_pos.get(_am.ticker)
+                    if _ap is not None:
+                        announce_moves[_am.event_ticker] = (
+                            announce_moves.get(_am.event_ticker, 0.0)
+                            + abs(self.pnl.pos.get(_am.ticker, 0.0) - _ap))
         for meta in order_of_play:
             # Fast tick: only fast-lane series are (re)quoted; everything else
             # is untouched this tick (its resting orders are preserved through
@@ -26063,6 +26111,80 @@ class IncentiveMarketMaker:
                         self.state.prev_mid[t] = mid_g
                         self._mark_from_book(t, ext_bid, ext_ask, marked)
                     self._gskip(t, "event_depth_hold", lambda: dict(d_yes=d_yes, d_no=d_no, mid_in_band=mid_in_band, halt_ts=self.state.event_depth_halt.get(ev)), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+
+            # ANNOUNCEMENT HALT (2026-10-19, see MENTION_ANNOUNCE_SERIES): a
+            # word jumping out of band confirms the event LIVE for good; a
+            # fill burst across the event stands it down (resumable; the
+            # second within the strike TTL confirms it). Armed at all times,
+            # pads kept, no thin trigger. Read before the mid-move block below
+            # moves prev_mid on.
+            if mention_announce_series(meta.series):
+                two_a = ext_bid is not None and ext_ask is not None
+                mid_a = (ext_bid + ext_ask) / 2.0 if two_a else None
+                pm_a = self.state.prev_mid.get(t)
+                lo_a, hi_a = series_price_min(meta.series), series_price_max(meta.series)
+                out_a = two_a and not (lo_a <= mid_a <= hi_a)
+                jump_a = (out_a and pm_a is not None and lo_a <= pm_a <= hi_a
+                          and abs(mid_a - pm_a) >= EVENT_DEPTH_JUMP_CENTS)
+                burst_a = (ev not in announce_counted
+                           and announce_moves.get(ev, 0.0) >= MENTION_ANNOUNCE_FILL_CT)
+                tripped_a = False
+                if jump_a and ev not in self.state.event_live_halt:
+                    self.state.event_live_halt[ev] = now_ts
+                    tripped_a = True
+                    self.alerter.alert(
+                        "event_live",
+                        f"{ev}: {t} jumped out of band ({pm_a:.0f}c -> "
+                        f"{mid_a:.0f}c) — announcement, event LIVE; "
+                        f"PERMANENTLY standing down the whole event", key=ev)
+                if burst_a:
+                    announce_counted.add(ev)
+                    last_a = self.state.event_fill_strike_ts.get(ev)
+                    if EVENT_FILL_STRIKE_TTL_SECS > 0 and (
+                            last_a is None
+                            or now_ts - last_a > EVENT_FILL_STRIKE_TTL_SECS):
+                        self.state.event_fill_strikes.pop(ev, None)   # expired
+                    strikes_a = self.state.event_fill_strikes.get(ev, 0) + 1
+                    self.state.event_fill_strikes[ev] = strikes_a
+                    self.state.event_fill_strike_ts[ev] = now_ts
+                    self.state.event_depth_halt[ev] = now_ts
+                    confirmed_a = strikes_a >= EVENT_FILL_HALT_STRIKES
+                    if confirmed_a:
+                        self.state.event_live_halt.setdefault(ev, now_ts)
+                    tripped_a = True
+                    self.alerter.alert(
+                        "event_fill",
+                        f"{ev}: our position moved {announce_moves.get(ev, 0.0):.0f} "
+                        f"contracts across the event in one cycle — announcement? "
+                        f"standing the whole event down "
+                        + ("PERMANENTLY (live confirmed, "
+                           f"burst {strikes_a})" if confirmed_a else
+                           f"(burst {strikes_a}/{EVENT_FILL_HALT_STRIKES}; resumes "
+                           f"after {EVENT_DEPTH_RESUME_SECS // 60} min healthy)"),
+                        key=ev)
+                if tripped_a:
+                    event_depth_thin.add(ev)                 # no resume this cycle
+                    n_cx = 0
+                    for m2 in by_event.get(ev, [meta]):
+                        n_cx += self.cancel_market_orders(m2.ticker, resting)
+                    ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
+                    desired = [q for q in desired if q.ticker not in ev_ticks]
+                    log(f"{self.tag} announcement halt {ev}: "
+                        + (f"{t} jumped {pm_a:.0f}c -> {mid_a:.0f}c" if jump_a
+                           else f"fill burst {announce_moves.get(ev, 0.0):.0f} contracts")
+                        + f"; cancelled {n_cx}")
+                if ev in self.state.event_live_halt or ev in self.state.event_depth_halt:
+                    if not tripped_a:
+                        self.cancel_market_orders(t, resting)
+                        if two_a and not out_a:
+                            # healthy evidence for the resume pass, which needs
+                            # every managed market of the event healthy
+                            event_depth_ok[ev] = event_depth_ok.get(ev, 0) + 1
+                    if two_a:   # keep P&L marks and the jump anchor fresh
+                        self.state.prev_mid[t] = mid_a
+                        self._mark_from_book(t, ext_bid, ext_ask, marked)
+                    self._gskip(t, "announce_halt" if tripped_a else "announce_hold", lambda: dict(jumped=jump_a, burst=burst_a, moved=announce_moves.get(ev, 0.0), mid=mid_a, prev_mid=pm_a, live=ev in self.state.event_live_halt), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
             # A book that WAS two-sided and just lost a side is the classic
@@ -29865,6 +29987,15 @@ class IncentiveMarketMaker:
                 + (f"; carried in: {','.join(_carried)}" if _carried else "")
                 + (f"; exempt (2026-10-19): {','.join(sorted(MENTION_NO_CUTOFF_EXEMPT))}"
                    if MENTION_NO_CUTOFF_EXEMPT else ""))
+        if MENTION_ANNOUNCE_SERIES:
+            log(f"announcement halt (2026-10-19): {','.join(sorted(MENTION_ANNOUNCE_SERIES))}"
+                f" -- armed at all times, pads kept: a word jumping out of band by "
+                f"{EVENT_DEPTH_JUMP_CENTS:g}c+ in one cycle stands the whole event down "
+                f"PERMANENTLY; our position moving {MENTION_ANNOUNCE_FILL_CT:g}+ "
+                f"contracts across the event in one cycle stands it down (resumes "
+                f"after {EVENT_DEPTH_RESUME_SECS // 60} min healthy; a 2nd burst within "
+                f"{EVENT_FILL_STRIKE_TTL_SECS / 60:g} min is permanent); no thin-book "
+                f"trigger")
         if EVENT_DEPTH_GATE_PREFIXES:
             log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
                 f"— pads OFF; any quotable side < "
