@@ -10815,3 +10815,17 @@ BACKTEST (backtest.py; Kalshi's own trade tape; fills optimistic, no queue): at 
 Startup line: "yt1 pilot (KXYTDAILYTOPVIDEOG): SHADOW -- a YES bid on yt_top1_fair's leader only, at most P - 10c while P >= 80%, ...".
 Tests: test_yt_top1_fair.py (8); TestYouTube1Pilot (5); TestGuardSkipSink counts 46 continues.
 To go live: IMM_YT1_MODE=live in run_incentive_mm.ps1's env (or flip the default), then a restart.
+
+### 2026-10-20 02:00Z — Trenton joins the monthly snow fair (Jack: "Fix" the KXTTNSNOWM-26DEC model-coverage gap)
+
+The family watch's model-coverage pass reported KXTTNSNOWM-26DEC FAIL-CLOSED:
+"no station for CLI code None in the writer's station table" -- the rules say
+"total snowfall in Trenton in December 2026", and "Trenton" had no station, so
+all 6 strikes (4-24 in) stood aside. Added TTN to SNOW_STATIONS
+(Trenton-Mercer, NJ_ASOS, US/Eastern; checked live: IEM currents, the KTTN CLI
+= CLITTN from NWS Mount Holly, Dec 2025 month total 8.1") with ACIS history
+from the threaded Trenton Area record TTNthr -- the airport's own snowfall
+starts 1998-03, every 1980s December missing -- and "Trenton" to CITY_CODES.
+Dry run: P(December total > 4/8/12/16/20/24 in) = 35 / 20 / 8 / 1.9 / 0.4 /
+0.06% from 46 Decembers. snow_monthly_fair is imported by the IMM's refresher
+thread: deploy = restart_imm.ps1. Test lists gain Trenton.

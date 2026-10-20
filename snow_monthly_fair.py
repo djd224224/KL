@@ -11,7 +11,8 @@ SNOWOVERTIME; checked on weather.com/kalshi 2026-10-04). The rules name the
 city only ("in Boston"; "in Chicago (O'Hare)"), so CITY_CODES maps the place
 to the dashboard's station: Boston KBOS, Chicago (O'Hare) KORD, Washington
 DC KDCA, Denver KDEN, Detroit KDTW, Milwaukee KMKE, Minneapolis KMSP, New
-York City KNYC, Philadelphia KPHL, Pittsburgh KPIT. An unmapped place, or
+York City KNYC, Philadelphia KPHL, Pittsburgh KPIT (since added: Seattle
+KSEA, Trenton KTTN). An unmapped place, or
 rules naming another month than the ticker, is no station: stood aside.
 
 The fair is the monthly rain gate's, P(month to date + rest > K), on snow:
@@ -100,7 +101,13 @@ for _code, _net, _name, _lat, _lon, _tz, _acis in (
         # Seattle (Jack 2026-10-06: "why isnt KXSEASNOWM-26DEC [quoting]?"):
         # Sea-Tac, checked live that day -- IEM currents WA_ASOS, the KSEA
         # CLI, ACIS snowfall back to 1980
-        ("SEA", "WA_ASOS", "Seattle-Tacoma Intl", 47.4447, -122.3144, "US/Pacific", None)):
+        ("SEA", "WA_ASOS", "Seattle-Tacoma Intl", 47.4447, -122.3144, "US/Pacific", None),
+        # Trenton (Jack 2026-10-19: "Fix" the KXTTNSNOWM-26DEC model gap):
+        # Trenton-Mercer, checked live that day -- IEM currents NJ_ASOS, the
+        # KTTN CLI (CLITTN, NWS Mount Holly; Dec 2025 = 8.1"), and ACIS
+        # snowfall from the threaded Trenton Area record TTNthr: the
+        # airport's own starts 1998-03 (every 1980s December missing)
+        ("TTN", "NJ_ASOS", "Trenton-Mercer", 40.2768, -74.8159, "US/Eastern", "TTNthr")):
     SNOW_STATIONS[_code] = {"icao": f"K{_code}", "iem": _code, "net": _net,
                             "name": _name, "lat": _lat, "lon": _lon, "tz": _tz}
     if _acis:
@@ -111,7 +118,7 @@ CITY_CODES = {"Boston": "BOS", "Chicago (O'Hare)": "ORD", "Chicago (Midway)": "M
               "Washington DC": "DCA", "Washington, DC": "DCA", "Denver": "DEN",
               "Detroit": "DTW", "Milwaukee": "MKE", "Minneapolis": "MSP",
               "New York City": "NYC", "Philadelphia": "PHL", "Pittsburgh": "PIT",
-              "Seattle": "SEA"}
+              "Seattle": "SEA", "Trenton": "TTN"}
 
 _RULES_RE = re.compile(r"\btotal snowfall (?:at|in) (.+?) in ([A-Z][a-z]+) (\d{4})\b")
 _MONTH_NAMES = {n: i for i, n in enumerate(calendar.month_name) if n}

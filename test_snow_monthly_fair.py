@@ -36,7 +36,7 @@ class TestStations(unittest.TestCase):
                             ("Detroit", "DTW"), ("Milwaukee", "MKE"),
                             ("Minneapolis", "MSP"), ("New York City", "NYC"),
                             ("Philadelphia", "PHL"), ("Pittsburgh", "PIT"),
-                            ("Seattle", "SEA")):
+                            ("Seattle", "SEA"), ("Trenton", "TTN")):
             self.assertEqual(smf.station_code(RULES.format(
                 place=place, month="December", k=8), ev), code, place)
         # a bare "Chicago" is two stations; an unknown city; another month
@@ -49,7 +49,7 @@ class TestStations(unittest.TestCase):
 
     def test_station_table(self):
         for code in ("BOS", "ORD", "DCA", "DEN", "DTW", "MKE", "MSP", "NYC", "PHL", "PIT",
-                     "SEA"):
+                     "SEA", "TTN"):
             spec = smf.SNOW_STATIONS[code]
             self.assertEqual(spec["icao"], "K" + code)
             for k in ("iem", "net", "lat", "lon", "tz"):
@@ -57,6 +57,8 @@ class TestStations(unittest.TestCase):
         # Denver's airport snow record starts 2006: history from the
         # threaded Denver Area record, settlement still the airport's CLI
         self.assertEqual(smf.SNOW_STATIONS["DEN"]["acis"], "DENthr")
+        # Trenton's airport snowfall starts 1998: the threaded Trenton Area record
+        self.assertEqual(smf.SNOW_STATIONS["TTN"]["acis"], "TTNthr")
         self.assertNotIn("acis", smf.SNOW_STATIONS["ORD"])
         self.assertEqual(len(smf.SERIES), 10)
 
