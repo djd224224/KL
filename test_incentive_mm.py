@@ -31163,13 +31163,15 @@ class TestReleasePause(unittest.TestCase):
             json.dump({"sources": {
                 "bls_state": {"name": "BLS State", "times_et": ["2026-12-18 10:00", "2026-11-20 10:00"]},
                 "bls_empsit": {"name": "BLS Employment Situation", "times_et": ["2026-11-06 08:30"]}}}, f)
+        self.dir = d
         for p in (mock.patch.object(imm, "RELEASE_CALENDAR_FILE", self.cal),
+                  mock.patch.object(imm, "STATUS_DIR", d),      # the found file, the map
                   mock.patch.object(imm, "RELEASE_PAUSE", True),
                   mock.patch.object(imm, "RELEASE_PAUSE_BEFORE_MIN", 30),
                   mock.patch.object(imm, "RELEASE_PAUSE_AFTER_MIN", 180),
                   mock.patch.dict(imm._SERIES_RELEASE_SOURCES, clear=True),
                   mock.patch.dict(imm._release_warned, clear=True),
-                  mock.patch.dict(imm._release_cal, {"mtime": None, "checked": 0.0, "sources": {}})):
+                  mock.patch.dict(imm._release_cal, {"checked": 0.0, "files": {}, "sources": {}})):
             p.start()
             self.addCleanup(p.stop)
 
@@ -31300,6 +31302,31 @@ class TestReleasePause(unittest.TestCase):
         with mock.patch.object(imm, "log") as lg:
             self.assertIsNone(imm.series_release_window("KXSDCATTLE", self._utc(2027, 1, 29, 15, 0)))
         self.assertTrue(any("nass_cattle has no dates" in c.args[0] for c in lg.call_args_list))
+
+    def test_found_dates_merge_in_and_the_map_is_written(self):   # Jack 10/22: "check daily"
+        found = os.path.join(self.dir, imm.RELEASE_CALENDAR_FOUND_FILE)
+        with open(found, "w", encoding="utf-8") as f:
+            json.dump({"sources": {
+                "bls_state": {"times_et": ["2027-01-22 10:00", "2026-12-18 10:00"]},   # one repeats
+                "nass_cattle": {"name": "USDA NASS Cattle", "times_et": ["2027-01-29 15:00"]}}}, f)
+        cal = imm.load_release_calendar(force=True)
+        self.assertEqual(cal["bls_state"][0], "BLS State")            # the repo file names it
+        self.assertEqual([t.astimezone(imm.ET).strftime("%m-%d") for t in cal["bls_state"][1]],
+                         ["11-20", "12-18", "01-22"])
+        self.assertEqual(len(cal["nass_cattle"][1]), 1)
+        imm.note_release_sources("KXSDCATTLE", {"rules_secondary": (
+            "USDA NASS's Cattle, Including Calves - Inventory estimate for South Dakota")})
+        jan = self._utc(2027, 1, 29, 15, 0)
+        with mock.patch.object(imm, "log"):
+            self.assertEqual(imm.series_release_window("KXSDCATTLE", jan),
+                             ("USDA NASS Cattle", jan))
+        with open(os.path.join(self.dir, imm.RELEASE_PAUSE_MAP_FILE), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["series"], {"KXSDCATTLE": ["nass_cattle"]})
+        with open(found, "w", encoding="utf-8") as f:                # a torn found file
+            f.write("{")
+        os.utime(found, (time.time() + 5, time.time() + 5))
+        with mock.patch.object(imm, "log"):
+            self.assertEqual(imm.load_release_calendar(force=True), cal)   # last good read kept
 
     def test_the_shipped_calendar_has_every_source(self):
         path = os.path.join(os.path.dirname(os.path.abspath(imm.__file__)), "release_calendar.json")

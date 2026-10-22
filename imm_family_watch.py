@@ -43,6 +43,14 @@ threshold". Three passes, each fail-safe on its own:
    center states, the YouTube pilot's artists, non-NFL sports ladders) against
    its model and emails what is not modeled: on first sight, then daily while
    open (a by-design exclusion once). A failing pass is emailed too (daily).
+6. RELEASE CALENDAR (2026-10-22, Jack: "Yes email. Also check daily for new
+   calendar times for any unresolved ones, and check calendars when adding
+   new events to this auto-quoting family") -- imm_release_calendar reads the
+   agencies' schedule pages once a day for every report the release pause
+   uses whose dates run short, adds the dates it finds, and emails a report
+   left with no upcoming date (first sight, then weekly). A series pass 1
+   enrolls into the state statistics family is checked against its rules at
+   once. A failing pass is emailed too (daily).
 
 Imports imm_quote_gaps first: it mirrors the launcher's env (blocklist, allow
 lists, pilots) before incentive_mm is imported, so "allowed" means what the live
@@ -1392,6 +1400,34 @@ def model_coverage_pass(progs: Dict[str, dict], state: dict, dry: bool,
             state["model_pass_err_sent"] = now_ts
 
 
+def release_calendar_pass(client, new_series: List[Tuple[str, str]], state: dict,
+                          dry: bool, summary: List[str]) -> None:
+    """Pass 6 (Jack 2026-10-22): keep the release pause's calendar current
+    (imm_release_calendar.run) and email a report left with no upcoming date;
+    the pass's own failure is emailed too (at most daily)."""
+    import imm_release_calendar as irc
+    now_ts = time.time()
+    try:
+        line, mail = irc.run(client, new_series, state.setdefault("release_cal", {}), dry)
+        if mail:
+            subject, text = mail
+            log("[WATCH] release calendar alert:\n" + text)
+            if not dry:
+                imm.Alerter("IMM-WATCH", live=True).send_message(text, subject)
+        summary.append(line)
+    except Exception as e:                           # noqa: BLE001 - emailed below
+        log(f"[WATCH] ! release calendar pass failed: {e!r}")
+        last = state.get("release_cal_err_sent") or 0
+        if not dry and now_ts - float(last) >= MODEL_PASS_ERR_HOURS * 3600:
+            imm.Alerter("IMM-WATCH", live=True).send_message(
+                f"The IMM family watch's release calendar pass failed: {e!r}\n"
+                f"Until it is fixed, release dates are not being looked up and a "
+                f"report with no upcoming date is NOT being reported. Log: "
+                f"run-logs\\incentive-mm\\family-watch.log",
+                "IMM-WATCH release calendar pass FAILED")
+            state["release_cal_err_sent"] = now_ts
+
+
 def _load_state() -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -1415,6 +1451,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-research", action="store_true")
     ap.add_argument("--no-alert", action="store_true")
     ap.add_argument("--no-model", action="store_true", help="skip pass 5 (model coverage)")
+    ap.add_argument("--no-calendar", action="store_true", help="skip pass 6 (release calendar)")
     ap.add_argument("--check-login", action="store_true",
                     help="test the research login with one tiny run, then exit")
     args = ap.parse_args(argv)
@@ -1423,11 +1460,14 @@ def main(argv=None) -> int:
     t0 = time.time()
     client = ieo.build_client()
     summary = []
+    new_state_series: List[Tuple[str, str]] = []   # for pass 6's calendar check
     if not args.no_enroll:
         try:
             enrolled, review = ieo.enroll_new_series(client, dry=args.dry)
             for s, why, sample in enrolled:
                 log(f"[WATCH] enrolled {s} [{why}] e.g. {sample}")
+            new_state_series = [(s, sample) for s, why, sample in enrolled
+                                if why == ieo.GRADUATE_AUTO_WHY["econstate"]]
             summary.append(f"enrolled {len(enrolled)}")
         except Exception as e:
             log(f"[WATCH] ! enroll pass failed: {e!r}")
@@ -1497,6 +1537,8 @@ def main(argv=None) -> int:
             log(f"[WATCH] ! alert pass failed: {e!r}")
     if not args.no_model:
         model_coverage_pass(progs, state, args.dry, summary)
+    if not args.no_calendar:
+        release_calendar_pass(client, new_state_series, state, args.dry, summary)
     if not args.dry:
         _save_state(state)
     log(f"[WATCH] {', '.join(summary)} ({time.time() - t0:.0f}s"

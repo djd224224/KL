@@ -10953,3 +10953,29 @@ Deploy: incentive_mm.py change, so the sync's code-change restart. Check the sta
   fills over the past month show no release-day cluster: ports -$27, airports -$4, tourism -$25.
 Deploy: incentive_mm.py change, so the sync's code-change restart. Check the startup line "release pause
 (2026-10-22): ... no dates yet: ..." and the "[IMM] release pause: <series> -> <sources>" lines.
+
+## 2026-10-22 ~21:30Z — release calendar keeps itself current (Jack: "Yes email. Also check daily for new calendar times for any unresolved ones, and check calendars when adding new events to this auto-quoting family")
+
+- New imm_release_calendar.py, run by the IMM family watch as pass 6 (every 30 min; the lookup once an ET day):
+  - LOOKUP: each report the live bot maps a series to, whose dates end within 60 days
+    (IMM_RELEASE_CAL_LOOKUP_DAYS), is read off its agency's schedule page: BLS news-release schedules (laus /
+    metro / cew / empsit), NASS Reports by Date (14 month pages), EIA "Next Release Date" (EPM / PSM / NGM / QCR),
+    the STEO schedule, Census permits + population schedules, FHFA's HPI dates. A future date not on the calendar
+    goes to run-logs\incentive-mm\release_calendar_found.json.
+  - A report that just lost its last date (EIA posts the next Electric Power Monthly with this one) is read
+    again that pass before it is emailed.
+  - ALERT: a report in use with no upcoming date is emailed ("IMM-WATCH release calendar: ...") on first
+    sight, then weekly (IMM_RELEASE_CAL_REALERT_HOURS, 168) while open. A failing pass is emailed at most daily.
+  - NEW SERIES: a series pass 1 enrolls into the state statistics family (GRADUATE_AUTO_WHY econstate) is
+    checked against its sample market's rules at once. A report with no upcoming date is looked up then; rules
+    naming no report the pause knows are emailed once (add its report, or leave it: no published schedule).
+    A market read that fails is retried for 6 passes.
+- incentive_mm merges the found file with release_calendar.json (each re-read on its own mtime; an unreadable
+  file keeps its last good read), so the repo file is never edited in the live checkout. The bot writes
+  run-logs\incentive-mm\release_pause_map.json (series -> sources) as series map; the watch reads it to know
+  which reports are in use.
+- First email expected at the first watch run after the restart: 5 reports with no upcoming date (NASS
+  Cattle, Poultry, Catfish; EIA Quarterly Coal Report; Census population).
+- `python imm_release_calendar.py` looks up every report in use now and prints what it reads (no writes).
+Deploy: incentive_mm.py change, so the sync's code-change restart (the map file appears as series map); the
+watch imports the new module on its next run.

@@ -2428,6 +2428,13 @@ RELEASE_CALENDAR_WARN_DAYS = _env_float("IMM_RELEASE_CALENDAR_WARN_DAYS", 35)
 RELEASE_CALENDAR_FILE = os.environ.get(
     "IMM_RELEASE_CALENDAR_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "release_calendar.json"))
+# Dates the IMM family watch reads off the agencies' schedule pages each day
+# (imm_release_calendar; Jack 2026-10-22: "check daily for new calendar times
+# for any unresolved ones") are merged in from STATUS_DIR, so the repo file is
+# never edited in the live checkout. The bot writes its series -> sources map
+# there too, for the watch to know which reports are in use.
+RELEASE_CALENDAR_FOUND_FILE = "release_calendar_found.json"     # in STATUS_DIR
+RELEASE_PAUSE_MAP_FILE = "release_pause_map.json"               # in STATUS_DIR
 # BLS state series ids: SM[SU] + state FIPS (2) + area (5, 00000 = statewide)
 # + industry (8) + data type (2); LA[SU] + ST|MT + the area for LAUS. A state
 # code 00 is national CES, which is not a state statistic.
@@ -2487,7 +2494,7 @@ _AGENCY_RELEASE_RULES = (            # (source, agency or None, the report's wor
 )
 _SUBNATIONAL_RE = re.compile(_US_STATE_RE.pattern + r"|\bCBSA\b|\bmetropolitan\b|\bformation\b")
 _SERIES_RELEASE_SOURCES: Dict[str, Tuple[str, ...]] = {}
-_release_cal: dict = {"mtime": None, "checked": 0.0, "sources": {}}
+_release_cal: dict = {"checked": 0.0, "files": {}, "sources": {}}
 _release_warned: Dict[str, str] = {}             # source -> ET day of its last warning
 
 
@@ -2530,35 +2537,69 @@ def note_release_sources(series: str, market: Optional[dict]) -> None:
     if srcs:
         _SERIES_RELEASE_SOURCES[series] = srcs
         log(f"[IMM] release pause: {series} -> {'+'.join(srcs)}")
+        save_release_pause_map()
+
+
+def release_calendar_found_path() -> str:
+    return os.path.join(STATUS_DIR, RELEASE_CALENDAR_FOUND_FILE)
+
+
+def release_pause_map_path() -> str:
+    return os.path.join(STATUS_DIR, RELEASE_PAUSE_MAP_FILE)
+
+
+def save_release_pause_map() -> None:
+    try:
+        tmp = release_pause_map_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(),
+                       "series": {s: list(v) for s, v in _SERIES_RELEASE_SOURCES.items()}},
+                      f, indent=1, sort_keys=True)
+        os.replace(tmp, release_pause_map_path())
+    except OSError as e:
+        log(f"[IMM] ! {RELEASE_PAUSE_MAP_FILE} write failed: {e}")
 
 
 def load_release_calendar(force: bool = False) -> Dict[str, Tuple[str, List[datetime]]]:
-    """{source: (name, sorted UTC release times)} from RELEASE_CALENDAR_FILE,
-    re-read when its mtime changes (looked at once a minute). An unreadable
-    file keeps the last good read."""
+    """{source: (name, sorted UTC release times)} from RELEASE_CALENDAR_FILE
+    and the watch's found dates (release_calendar_found_path()), each re-read
+    when its mtime changes (looked at once a minute). An unreadable file keeps
+    its last good read."""
     now = time.time()
     if not force and now - _release_cal["checked"] < 60:
         return _release_cal["sources"]
     _release_cal["checked"] = now
-    try:
-        mt = os.path.getmtime(RELEASE_CALENDAR_FILE)
-    except OSError:
-        return _release_cal["sources"]
-    if mt == _release_cal["mtime"]:
-        return _release_cal["sources"]
-    _release_cal["mtime"] = mt
-    try:
-        with open(RELEASE_CALENDAR_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
-        sources = {}
-        for key, rec in (raw.get("sources") or {}).items():
-            times = sorted(ET.localize(datetime.strptime(s, "%Y-%m-%d %H:%M"))
-                           .astimezone(timezone.utc) for s in rec.get("times_et") or [])
-            sources[key] = (str(rec.get("name") or key), times)
-        _release_cal["sources"] = sources
-    except (OSError, ValueError, TypeError, AttributeError) as e:
-        log(f"[IMM] ! release calendar {RELEASE_CALENDAR_FILE} unreadable "
-            f"({type(e).__name__}: {e}) -- keeping the last good read")
+    paths = (RELEASE_CALENDAR_FILE, release_calendar_found_path())
+    changed = False
+    for path in paths:
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            continue
+        prev = _release_cal["files"].get(path)
+        if prev is not None and prev[0] == mt:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+            recs = {}
+            for key, rec in (raw.get("sources") or {}).items():
+                recs[key] = (str(rec.get("name") or key),
+                             [ET.localize(datetime.strptime(s, "%Y-%m-%d %H:%M"))
+                              .astimezone(timezone.utc) for s in rec.get("times_et") or []])
+            _release_cal["files"][path] = (mt, recs)
+            changed = True
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            log(f"[IMM] ! release calendar {path} unreadable "
+                f"({type(e).__name__}: {e}) -- keeping the last good read")
+    if changed:
+        names: Dict[str, str] = {}
+        times: Dict[str, set] = {}
+        for path in paths:                          # the repo file names a source first
+            for key, (name, ts) in (_release_cal["files"].get(path) or (0, {}))[1].items():
+                names.setdefault(key, name)
+                times.setdefault(key, set()).update(ts)
+        _release_cal["sources"] = {k: (names[k], sorted(times[k])) for k in names}
     return _release_cal["sources"]
 
 

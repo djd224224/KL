@@ -904,6 +904,39 @@ class TestModelCoveragePass(unittest.TestCase):
         self.assertEqual(sent[1:], ["IMM-WATCH model coverage pass FAILED"])
 
 
+class TestReleaseCalendarPass(unittest.TestCase):
+    """Pass 6 (Jack 2026-10-22: "Yes email. Also check daily ..."): its email
+    goes out unless dry, and a failing pass is emailed at most daily."""
+
+    def test_the_email_and_a_failing_pass(self):
+        from unittest import mock
+        import imm_release_calendar as irc
+        sent, seen = [], []
+
+        def run(client, new_series, st, dry):
+            seen.append((list(new_series), dry))
+            return "release calendar: 1 report(s) in use", ("IMM-WATCH release calendar: x", "y")
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(irc, "run", run):
+            state, summary = {}, []
+            fw.release_calendar_pass(None, [("KXA", "KXA-27JAN31-T1")], state, True, summary)
+            self.assertEqual(sent, [])                                    # dry: no email
+            fw.release_calendar_pass(None, [], state, False, summary)
+            self.assertEqual(sent, ["IMM-WATCH release calendar: x"])
+            self.assertEqual(seen, [([("KXA", "KXA-27JAN31-T1")], True), ([], False)])
+            self.assertIn("release_cal", state)
+
+        def boom(client, new_series, st, dry):
+            raise RuntimeError("bls.gov changed")
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(irc, "run", boom):
+            fw.release_calendar_pass(None, [], state, False, [])
+            fw.release_calendar_pass(None, [], state, False, [])       # a second failure: no repeat
+        self.assertEqual(sent[1:], ["IMM-WATCH release calendar pass FAILED"])
+
+
 class TestResearchLoginFailure(unittest.TestCase):
     """Jack 2026-10-12: "send an email right away when research fails on a
     login error, instead of waiting until items give up"."""
