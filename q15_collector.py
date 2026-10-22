@@ -448,10 +448,13 @@ class Q15Rest(threading.Thread):
                 now = time.time()
                 if now >= self.next_discovery:
                     s = SERIES[self._disc_i % len(SERIES)]
-                    self._disc_i += 1
-                    self.discover(now, s)
-                    first_pass = self._disc_i < len(SERIES)
-                    self.next_discovery = now + (0.0 if first_pass else DISCOVERY_SECS / len(SERIES))
+                    if self.discover(now, s):
+                        self._disc_i += 1
+                        first_pass = self._disc_i < len(SERIES)
+                        self.next_discovery = now + (0.0 if first_pass
+                                                     else DISCOVERY_SECS / len(SERIES))
+                    else:
+                        self.next_discovery = now + 30.0      # the same series again soon
                 self.pull_opened(now)
                 self.pull_settled(now)
                 if now >= self.next_programs:
@@ -464,16 +467,18 @@ class Q15Rest(threading.Thread):
             if self.coll.stop_evt.wait(5.0):
                 break
 
-    def discover(self, now: float, s: str) -> None:
+    def discover(self, now: float, s: str) -> bool:
         """One series' current and upcoming markets (Kalshi lists them hours
-        ahead)."""
+        ahead); False when the read failed."""
         r = self.client.get("/markets", {"series_ticker": s, "min_close_ts": int(now) - 60,
                                          "limit": 200})
         if not r.ok:
-            return
+            self.stats["discovery_fails"] += 1
+            return False
         for m in r.body.get("markets") or []:
             self._note(m, time.time(), "discover")
         self.stats["discoveries"] += 1
+        return True
 
     def _batch(self, tickers: List[str], why: str) -> List[dict]:
         out = []
