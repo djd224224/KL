@@ -14,12 +14,14 @@ alike, ranked by the size of the move, realized and mark-to-mid split out).
 
 Under the day change, WHAT TO DO (since 2026-10-19, Jack: "share
 recommendations on what I should do based on prior day trading
-performance"): imm_advice() reads the IMM dashboard's per-family days --
-yesterday against the last month, each family's last 7 full days split
-into rewards, its own fills and the positions it already held -- and says
-which families to review and why (the quoting loses: shrink or pause the
-worst events; the inventory loses: hold or trim it), what is working, and
-the week's change. Kill: PF_ADVICE=0.
+performance"; centred on yesterday since 2026-10-22): imm_advice() reads
+the IMM dashboard's per-market days -- yesterday against the last month and
+the last 7 full days, each P&L split into rewards, its own fills (and how
+they lost: picked off, at settlement, or trending) and the positions it
+already held -- and says what moved yesterday, then numbered
+recommendations with their why: PAUSE / SHRINK a series whose quoting loses
+persistently, HOLD / TRIM a family's open losers by what is left to lose,
+NO CHANGE on one bad day, KEEP what works. Kill: PF_ADVICE=0.
 
 Then the IMM bot's section (since 2026-10-02, when its own 7:10 email was
 cut): send_imm_digest.py --section-out, run as a child process (imm_section),
@@ -1430,29 +1432,58 @@ def _mover_tag(r) -> str:
 # ----------------------------------------------------------------------------
 # What to do (Jack 2026-10-19: "In daily portfolio digest email, share
 # recommendations on what I should do based on prior day trading
-# performance")
+# performance"; 2026-10-22: "Clean up this section of daily email. Center it
+# around last day's results (though still contextualize with 7D results).
+# Make it more insightful with clear recommendations and why")
 # ----------------------------------------------------------------------------
 # Read off the IMM dashboard's per-market day rows: the IMM bot's own book
 # (the crypto fleets, the weather bot and the snipe bot have their own
-# emails), over the last ADVICE_DAYS full ET days, rewards as modelled. Each
-# family's trading splits into the day's own fills and the positions it
-# already held, re-marked or settled (the dashboard's cr / cs), so a losing
-# family reads one of two ways:
-#   the quoting loses -- its rewards don't cover its own fills: shrink or
-#     pause the worst events;
-#   the inventory loses -- the quoting pays, but positions it already held
-#     moved against it: no quoting change; hold or trim them (Jack's call).
-# It says "review", never "cut": the 10/09 Carbon Arc review found that
-# pruning on a trailing net barely persists. Nothing here scales anything up.
+# emails), rewards as modelled. Yesterday leads; the last ADVICE_DAYS full ET
+# days are the context each line carries. Every P&L splits three ways:
+#   rewards    what the quoting earned;
+#   own fills  the day's fills, marked to the day's end -- and their
+#              mark-outs say how they lost: within 5 minutes (picked off: the
+#              taker knew first), at the market's settlement that day (the
+#              wrong side of the outcome), or over the hours after (the price
+#              trended through them);
+#   held       positions it already held, re-marked (cr) or settled (cs).
+# The recommendations, each with its why:
+#   PAUSE / SHRINK a series whose quoting (rewards + own fills) loses
+#     persistently -- over the 7 days, on most of them, and again yesterday
+#     -- while it is still quoted. One bad day is never enough (the 10/09
+#     Carbon Arc review: pruning on a trailing net barely persists; the
+#     10/16 LoL bait pick-off was one day and is guarded since).
+#   TRIM an open loser that still has a lot to lose (ADVICE_TRIM_LEFT), in
+#     a family whose held positions cost the week -- to cut risk, Jack's call.
+#   HOLD the rest of those families' open losers, in one line: their
+#     quoting pays and what is left to lose is small next to what is gone,
+#     so selling would lock the loss in and pay the spread.
+#   NO CHANGE on a family's one bad day inside a good week, and on a losing
+#     week whose losses were one-offs (no series losing on most days).
+#   KEEP the families whose rewards beat their fills.
+# Nothing here scales anything up.
 IMM_DASH_HTML = os.path.join(KL_DIR, "run-logs", "incentive-mm", "dashboard",
                              "imm_dashboard.html")
 ADVICE_ENABLED = os.environ.get("PF_ADVICE", "1") != "0"
 ADVICE_DAYS = 7
-ADVICE_REVIEW_NET = -100.0     # a family's 7-day net at/below this -> REVIEW
-ADVICE_BAD_DAY = -150.0        # a family's yesterday at/below this, 7 days still up
-ADVICE_KEEP_NET = 100.0        # 7-day net at/above this -> working, keep as is
+ADVICE_DRIVERS = 3             # families under "What moved it"
+ADVICE_DRIVER_MIN = 25.0       # ... each at least this big yesterday
+ADVICE_PAUSE_7D = -100.0       # a live series' 7-day quoting at/below -> PAUSE
+ADVICE_SHRINK_7D = -40.0       # ... at/below -> SHRINK
+ADVICE_LOSING_DAYS = 4         # ... losing on at least this many of the 7
+ADVICE_MAX_PAUSE = 3
+ADVICE_HELD_7D = -100.0        # a family's held positions at/below -> HOLD / TRIM
+ADVICE_OPEN_MIN = -20.0        # an open position this far under water is named
+ADVICE_TRIM_LEFT = 50.0        # ... down this much already, and as much still
+ADVICE_TRIM_LOST = -50.0       #     to lose -> TRIM (a fresh long-dated short
+                               #     -- KXPRESRUN's -- is not a trim)
+ADVICE_MAX_TRIM = 2
+ADVICE_REVIEW_NET = -100.0     # a family's 7-day net at/below: say why, or act
+ADVICE_BAD_DAY = -100.0        # a family's yesterday at/below, 7 days still up
+ADVICE_KEEP_NET = 100.0        # 7-day net at/above (quoting paying) -> KEEP
 ADVICE_BOTTOM_N = 3            # yesterday among the N worst days -> below normal
-ADVICE_TOP_EVENTS = 3
+ADVICE_PICKOFF_SHARE = 0.5     # a mark-out this share of a fill loss names the cause
+ADVICE_REWARD_DROP = 0.2       # yesterday's rewards this far under the average: say where
 
 
 def load_imm_dashboard(path: str = IMM_DASH_HTML) -> dict:
@@ -1477,11 +1508,97 @@ def _nth(n: int) -> str:
     return f"{n}{suffix}"
 
 
+# a day of a family / series / event: rewards, own fills, held re-marked,
+# held settled, the own fills' 5-minute and 4-hour mark-outs, and the own
+# fills of markets that settled that day
+_PARTS = ("rew", "own", "cr", "cs", "m5", "m4", "own_set")
+
+
+def _zero() -> dict:
+    return dict.fromkeys(_PARTS, 0.0)
+
+
+def _add(a: dict, b: dict) -> dict:
+    return {k: a[k] + b[k] for k in _PARTS}
+
+
+def _net(a: dict) -> float:
+    return a["rew"] + a["own"] + a["cr"] + a["cs"]
+
+
+def _fill_cause(a: dict) -> str:
+    """How the own fills lost, from their mark-outs ("" when they did not,
+    or no one horizon carries it)."""
+    own = a["own"]
+    if own > -0.5:
+        return ""
+    if a["m5"] <= ADVICE_PICKOFF_SHARE * own:
+        return "most of it within 5 minutes of the fills (picked off: the takers knew first)"
+    if a["own_set"] <= ADVICE_PICKOFF_SHARE * own:
+        return "the fills ended on the wrong side of the settlement"
+    if a["m4"] <= ADVICE_PICKOFF_SHARE * own:
+        return "the price trended through the fills over the next hours"
+    return ""
+
+
+def _biggest(evs: dict, key, sign: int):
+    """(event, $) with the largest `key` in the direction of `sign`, or None."""
+    best = None
+    for ev, a in evs.items():
+        v = key(a)
+        if v * sign > 0.5 and (best is None or v * sign > best[1] * sign):
+            best = (ev, v)
+    return best
+
+
+def _why_day(a: dict, evs: dict) -> str:
+    """What made a family's day: its biggest parts in the direction of its
+    net (rewards and own fills read together; a second part only when it is
+    a quarter of the net or more), each named by its biggest event."""
+    sign = -1 if _net(a) < 0 else 1
+    parts = [p for p in (("q", a["rew"] + a["own"]), ("cr", a["cr"]), ("cs", a["cs"]))
+             if p[1] * sign > 0.5]
+    parts.sort(key=lambda p: -abs(p[1]))
+    parts = parts[:1] + [p for p in parts[1:2]
+                         if abs(p[1]) >= max(15.0, 0.25 * abs(_net(a)))]
+    out = []
+    for k, v in parts:
+        if k == "q":
+            ev = _biggest(evs, lambda x: x["rew"] + x["own"], sign)
+            if sign > 0:
+                txt = f"rewards {_usd0(a['rew'])} against fills {_usd0(a['own'])}"
+            else:
+                txt = f"fills {_usd0(a['own'])} against rewards {_usd0(a['rew'])}"
+                cause = _fill_cause(a)
+                if cause:
+                    txt += f" -- {cause}"
+        elif k == "cr":
+            ev = _biggest(evs, lambda x: x["cr"], sign)
+            txt = (f"held positions marked {'down' if sign < 0 else 'up'} {_usd0(v)}")
+        else:
+            ev = _biggest(evs, lambda x: x["cs"], sign)
+            txt = (f"held positions settled {'against us' if sign < 0 else 'our way'} "
+                   f"{_usd0(v)}")
+        out.append(txt + (f" ({ev[0]} {_usd0(ev[1])})" if ev else ""))
+    return "; ".join(out)
+
+
+def _position_line(t: str, m: dict) -> str:
+    pos, avg, mark = _f(m.get("pos")), _f(m.get("avg")), _f(m.get("mark"))
+    side = "bought" if pos > 0 else "sold"
+    return (f"{t} ({abs(pos):,.0f} YES {side} at {avg:.0f}c, now {mark:.0f}c: "
+            f"{_usd0(_f(m.get('u')))}, ${abs(_f(m.get('wc'))):,.0f} left to lose)")
+
+
 def imm_advice(D: dict, today_str: str) -> dict:
-    """{"basis": str, "items": [(tag, text)]} for the What-to-do block, from
-    the dashboard data object (see the comment above). Days before
-    today_str only: the dashboard's last day is the one still running."""
+    """The What-to-do block from the dashboard data object (see the comment
+    above): {"title", "basis", "headline", "drivers": [str], "recs": [(verb,
+    text)], "context": [str]}. Days before today_str only: the dashboard's
+    last day is the one still running."""
     ix = {f: i for i, f in enumerate(D["day_fields"])}
+    fxk = {f: i for i, f in enumerate(D.get("fx_keys") or
+                                      ("fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts",
+                                       "mt", "mt_cts"))}
     mk = D.get("markets") or {}
     all_days = D.get("days") or {}
     days = sorted(d for d in all_days if d < today_str)
@@ -1490,149 +1607,215 @@ def imm_advice(D: dict, today_str: str) -> dict:
     win = days[-ADVICE_DAYS:]
     prev = days[-2 * ADVICE_DAYS:-ADVICE_DAYS]
     y = days[-1]
-    daily = {}                                    # day -> [rewards, trading]
-    fam_day = defaultdict(dict)                   # family -> day -> [rew, own, carried]
-    fam_ev = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0.0]))
+    n = len(win)
+    daily = {}                                              # day -> [rewards, trading]
+    fam_day = defaultdict(lambda: defaultdict(_zero))       # family -> day -> parts
+    ser_day = defaultdict(lambda: defaultdict(_zero))       # series -> day -> parts
+    ev_day = defaultdict(lambda: defaultdict(lambda: defaultdict(_zero)))
+    ser_fam = {}
     for d in days:
         tot = [0.0, 0.0]
         for t, v in ((all_days.get(d) or {}).get("m") or {}).items():
             rew, pnl = _f(v[ix["rew"]]), _f(v[ix["pnl"]])
-            carried = _f(v[ix["cr"]]) + _f(v[ix["cs"]])
+            cr, cs = _f(v[ix["cr"]]), _f(v[ix["cs"]])
+            fx = v[ix["fx"]] if "fx" in ix else 0
+            own = pnl - cr - cs
+            a = {"rew": rew, "own": own, "cr": cr, "cs": cs,
+                 "m5": _f(fx[fxk["m5"]]) if fx else 0.0,
+                 "m4": _f(fx[fxk["m4"]]) if fx else 0.0,
+                 "own_set": own if ("settled" in ix and v[ix["settled"]]) else 0.0}
             tot[0] += rew
             tot[1] += pnl
             info = mk.get(t) or {}
             fam = info.get("fam") or "Other"
-            a = fam_day[fam].setdefault(d, [0.0, 0.0, 0.0])
-            a[0] += rew
-            a[1] += pnl - carried
-            a[2] += carried
-            if d in win:
-                e = fam_ev[fam][info.get("ev") or event_from_ticker(t)]
-                e[0] += rew
-                e[1] += pnl - carried
-                e[2] += carried
+            ser = info.get("ser") or t.split("-", 1)[0]
+            ev = info.get("ev") or event_from_ticker(t)
+            ser_fam.setdefault(ser, fam)
+            fam_day[fam][d] = _add(fam_day[fam][d], a)
+            ser_day[ser][d] = _add(ser_day[ser][d], a)
+            ev_day[fam][d][ev] = _add(ev_day[fam][d][ev], a)
         daily[d] = tot
 
-    def span(fam, ds):
-        out = [0.0, 0.0, 0.0]
+    def span(src, ds):
+        out = _zero()
         for d in ds:
-            a = fam_day[fam].get(d)
-            if a:
-                out = [out[0] + a[0], out[1] + a[1], out[2] + a[2]]
+            if d in src:
+                out = _add(out, src[d])
         return out
 
-    fams = {}
-    for fam in fam_day:
-        rew, own, carried = span(fam, win)
-        fams[fam] = dict(rew=rew, own=own, carried=carried, net=rew + own + carried,
-                         quoting=rew + own, prev=sum(span(fam, prev)),
-                         yday=sum(fam_day[fam].get(y, (0.0,))))
-    items = []
-    # 1. yesterday, against the dashboard's other full days
-    y_rew, y_pnl = daily[y]
-    y_net = y_rew + y_pnl
-    rank = 1 + sum(1 for d in days if d != y and sum(daily[d]) < y_net)
-    med = statistics.median(sum(daily[d]) for d in days)
-    review = sorted((f for f, v in fams.items() if v["net"] <= ADVICE_REVIEW_NET),
-                    key=lambda f: fams[f]["net"])
+    fams = {fam: {"y": span(dd, [y]), "w": span(dd, win), "p": span(dd, prev)}
+            for fam, dd in fam_day.items()}
     ydate = datetime.strptime(y, "%Y-%m-%d")
-    head = (f"Yesterday ({ydate:%a %m/%d}): the IMM netted {_usd0(y_net)} (rewards "
-            f"{_usd0(y_rew)}, trading {_usd0(y_pnl)}) -- ")
-    which = "" if rank == 1 else _nth(rank) + "-"
-    if rank <= ADVICE_BOTTOM_N and y_net < 0:
-        head += (f"below normal, the {which}worst of the last {len(days)} days "
+
+    def why_y(fam):
+        return _why_day(fams[fam]["y"], ev_day[fam].get(y, {}))
+
+    # 1. yesterday, against the dashboard's other full days and the week
+    y_rew, y_trd = daily[y]
+    y_net = y_rew + y_trd
+    worse = sum(1 for d in days if d != y and sum(daily[d]) < y_net)
+    better = sum(1 for d in days if d != y and sum(daily[d]) > y_net)
+    med = statistics.median(sum(daily[d]) for d in days)
+    head = f"Yesterday {_usd0(y_net)}: rewards {_usd0(y_rew)}, trading {_usd0(y_trd)}. "
+    if worse < ADVICE_BOTTOM_N and y_net < 0:
+        which = "" if worse == 0 else _nth(worse + 1) + "-"
+        head += (f"Below normal: the {which}worst of the last {len(days)} days "
                  f"(median {_usd0(med)}).")
-    elif rank <= ADVICE_BOTTOM_N and y_net < med:
-        head += (f"positive but weak, the {which}lowest of the last {len(days)} days "
+    elif y_net < med:
+        head += (f"Below the median: {worse} of the last {len(days)} days were worse "
+                 f"(median {_usd0(med)}).")
+    elif better < ADVICE_BOTTOM_N:
+        head += (f"A strong day: {'none' if better == 0 else f'only {better}'} of the last "
+                 f"{len(days)} days {'was' if better == 1 else 'were'} better "
                  f"(median {_usd0(med)}).")
     else:
-        head += (f"a normal day ({rank - 1} of the last {len(days)} were worse; "
-                 f"median {_usd0(med)}).")
-    if review:
-        head += " The losses sit in the families below; nothing account-wide to change."
-    items.append(("day", head))
+        head += (f"A normal day: {worse} of the last {len(days)} days were worse "
+                 f"(median {_usd0(med)}).")
+    w_tot = sum(sum(daily[d]) for d in win)
+    head += f" Last {n} days {_usd0(w_tot)} ({_usd0(w_tot / n)}/day)"
+    if len(prev) == ADVICE_DAYS:
+        head += f", vs {_usd0(sum(sum(daily[d]) for d in prev))} the {len(prev)} before"
+    head += "."
 
-    # 2. the families to review, by kind. An event none of whose markets is
-    # still selected or held is over: nothing left to pause there.
-    live = set()
-    for t, m in mk.items():
-        if m.get("sel") or abs(_f(m.get("pos"))) > 0:
-            live.add(m.get("ev") or event_from_ticker(t))
-
-    def top(fam, key):
-        """(live events, events already over): the worst ADVICE_TOP_EVENTS
-        losers of the family by `key`, as "EVENT -$N"."""
-        evs = [(ev, key(v)) for ev, v in sorted(fam_ev[fam].items(),
-                                               key=lambda kv: key(kv[1]))
-               if key(v) < -0.5][:ADVICE_TOP_EVENTS]
-        fmt = lambda xs: ", ".join(f"{ev} {_usd0(x)}" for ev, x in xs)   # noqa: E731
-        return (fmt([e for e in evs if e[0] in live]),
-                fmt([e for e in evs if e[0] not in live]))
-
-    for fam in review:
+    # 2. what moved yesterday: the biggest families either way, with the week
+    drivers = []
+    for fam in sorted(fams, key=lambda f: -abs(_net(fams[f]["y"])))[:ADVICE_DRIVERS]:
         v = fams[fam]
-        lead = f"REVIEW {fam}: {_usd0(v['net'])} over {len(win)} days."
-        if v["quoting"] < 0:
-            on, over = top(fam, lambda a: a[0] + a[1])
-            text = (f"{lead} The quoting itself loses: rewards {_usd0(v['rew'])} vs its "
-                    f"own fills {_usd0(v['own'])} ({_usd0(v['quoting'])}); positions it "
-                    f"already held {_usd0(v['carried'])}.")
-            if on:
-                text += f" Shrink or pause the worst live events: {on}."
-            if over:
-                text += (f" Already over (nothing to pause): {over}."
-                         + ("" if on else " Watch whether the family recovers."))
-            items.append(("review", text))
+        if abs(_net(v["y"])) < ADVICE_DRIVER_MIN:
+            continue
+        drivers.append(f"{fam} {_usd0(_net(v['y']))} ({n} days {_usd0(_net(v['w']))}): "
+                       f"{why_y(fam)}.")
+
+    # 3. recommendations
+    live_ser = {m.get("ser") or t.split("-", 1)[0] for t, m in mk.items() if m.get("sel")}
+    recs = []
+    paused = set()
+    cands = []
+    for ser, dd in ser_day.items():
+        if ser not in live_ser:
+            continue
+        w, yy = span(dd, win), span(dd, [y])
+        q7, qy = w["rew"] + w["own"], yy["rew"] + yy["own"]
+        losing = sum(1 for d in win if d in dd and dd[d]["rew"] + dd[d]["own"] < -0.5)
+        if q7 <= ADVICE_SHRINK_7D and qy < -0.5 and losing >= ADVICE_LOSING_DAYS:
+            cands.append((q7, ser, w, qy, losing))
+    for q7, ser, w, qy, losing in sorted(cands, key=lambda c: c[0])[:ADVICE_MAX_PAUSE]:
+        verb = "PAUSE" if q7 <= ADVICE_PAUSE_7D else "SHRINK"
+        cause = _fill_cause(w)
+        recs.append((verb, f"{ser} ({ser_fam.get(ser, 'Other')}). Why: its quoting lost "
+                           f"{_usd0(q7)} over the {n} days -- fills {_usd0(w['own'])} "
+                           f"against rewards {_usd0(w['rew'])} -- losing on {losing} of "
+                           f"them and again yesterday ({_usd0(qy)})"
+                           + (f"; {cause}" if cause else "") + "."))
+        paused.add(ser_fam.get(ser))
+    # held positions that cost the week, in families whose quoting pays
+    held_fams = [f for f in sorted(fams, key=lambda f: fams[f]["w"]["cr"] + fams[f]["w"]["cs"])
+                 if fams[f]["w"]["cr"] + fams[f]["w"]["cs"] <= ADVICE_HELD_7D
+                 and fams[f]["w"]["rew"] + fams[f]["w"]["own"] > 0]
+    opens = sorted(((t, m) for t, m in mk.items()
+                    if m.get("fam") in held_fams and abs(_f(m.get("pos"))) > 0
+                    and _f(m.get("u")) <= ADVICE_OPEN_MIN),
+                   key=lambda tm: _f(tm[1].get("u")))
+    trims = sorted((tm for tm in opens if abs(_f(tm[1].get("wc"))) >= ADVICE_TRIM_LEFT
+                    and _f(tm[1].get("u")) <= ADVICE_TRIM_LOST),
+                   key=lambda tm: _f(tm[1].get("wc")))[:ADVICE_MAX_TRIM]
+    for t, m in trims:
+        fam = m.get("fam")
+        recs.append(("TRIM", f"{t} if you no longer believe it. Why: "
+                             f"${abs(_f(m.get('wc'))):,.0f} is still at risk on a position "
+                             f"already {_usd0(_f(m.get('u')))} ({_position_line(t, m)[len(t) + 2:-1]}), "
+                             f"in {fam}, whose held positions cost "
+                             f"{_usd0(fams[fam]['w']['cr'] + fams[fam]['w']['cs'])} over "
+                             f"{n} days."))
+    trimmed = {t for t, _ in trims}
+    holds = [(t, m) for t, m in opens if t not in trimmed]
+    if held_fams:
+        held_tot = sum(fams[f]["w"]["cr"] + fams[f]["w"]["cs"] for f in held_fams)
+        left = sum(abs(_f(m.get("wc"))) for _, m in holds)
+        txt = (f"the open losers. Why: held positions cost {_usd0(held_tot)} over {n} days ("
+               + ", ".join(f"{f} {_usd0(fams[f]['w']['cr'] + fams[f]['w']['cs'])}"
+                           for f in held_fams)
+               + ") while those families' quoting paid.")
+        if holds:
+            txt += (f" The {len(holds)} still open {'is' if len(holds) == 1 else 'are'} down "
+                    f"{_usd0(sum(_f(m.get('u')) for _, m in holds))} with at most "
+                    f"${left:,.0f} more to lose: selling at the bid would lock that in and "
+                    f"pay the spread. Biggest: {_position_line(*holds[0])}.")
         else:
-            on, over = top(fam, lambda a: a[2])
-            items.append(("review", f"{lead} The quoting pays (rewards {_usd0(v['rew'])} "
-                          f"vs its own fills {_usd0(v['own'])} = {_usd0(v['quoting'])}); "
-                          f"the loss is positions it already held "
-                          f"({_usd0(v['carried'])}): no quoting change -- hold or trim "
-                          f"those positions (your call)"
-                          + (f". Biggest: {on}." if on else ".")))
+            txt += " They have settled or recovered: nothing open to sell."
+        recs.append(("HOLD", txt))
+    for fam in sorted(fams, key=lambda f: _net(fams[f]["y"])):
+        v = fams[fam]
+        if (_net(v["y"]) <= ADVICE_BAD_DAY and _net(v["w"]) > 0
+                and fam not in held_fams and fam not in paused):
+            recs.append(("NO CHANGE", f"{fam}. Why: one bad day ({_usd0(_net(v['y']))}: "
+                                      f"{why_y(fam)}) inside a {_usd0(_net(v['w']))} week."))
+    for fam in sorted(fams, key=lambda f: _net(fams[f]["w"])):
+        v = fams[fam]
+        if _net(v["w"]) > ADVICE_REVIEW_NET or fam in held_fams or fam in paused:
+            continue
+        # a losing week with no series losing day after day: say where it went
+        worst = sorted((_net(span(dd, win)), ser) for ser, dd in ser_day.items()
+                       if ser_fam.get(ser) == fam)
+        worst = [(q, ser) for q, ser in worst if q < -0.5][:2]
+        w = v["w"]
+        txt = (f"{fam}. Why: {_usd0(_net(w))} over {n} days (quoting "
+               f"{_usd0(w['rew'] + w['own'])}, held positions {_usd0(w['cr'] + w['cs'])}), "
+               f"but no series in it is losing day after day")
+        if worst:
+            txt += "; the biggest: " + ", ".join(
+                f"{ser} {_usd0(q)}" + ("" if ser in live_ser else " (over)")
+                for q, ser in worst)
+        if _net(v["y"]) > 0.5:
+            txt += f"; yesterday {_usd0(_net(v['y']))}"
+        recs.append(("NO CHANGE", txt + "."))
+    if not any(verb in ("PAUSE", "SHRINK", "HOLD", "TRIM") for verb, _ in recs):
+        recs.insert(0, ("NO CHANGES", f"Why: no series' quoting lost on most of the last "
+                                      f"{n} days and again yesterday, and no family's held "
+                                      f"positions lost more than "
+                                      f"{_usd0(-ADVICE_HELD_7D)[1:]} while its quoting paid."))
+    noted = {t.split(".", 1)[0] for verb, t in recs if verb == "NO CHANGE"}
+    keep = sorted((f for f, v in fams.items()
+                   if _net(v["w"]) >= ADVICE_KEEP_NET and v["w"]["rew"] + v["w"]["own"] > 0
+                   and f not in paused and f not in held_fams and f not in noted),
+                  key=lambda f: -_net(fams[f]["w"]))[:3]
+    if keep:
+        recs.append(("KEEP", ", ".join(f"{f} {_usd0(_net(fams[f]['w']))}" for f in keep)
+                     + f" over {n} days. Why: their rewards cover their fills."))
 
-    # 3. one bad day inside a good week
-    bad_days = []
-    for fam, v in sorted(fams.items(), key=lambda kv: kv[1]["yday"]):
-        if v["yday"] <= ADVICE_BAD_DAY and v["net"] > 0 and fam not in review:
-            bad_days.append(fam)
-            items.append(("ok", f"One bad day, no action: {fam} {_usd0(v['yday'])} "
-                          f"yesterday, {_usd0(v['net'])} over {len(win)} days."))
-    if not review:
-        items.insert(1, ("ok", f"No action: no family lost more than "
-                         f"{_usd0(-ADVICE_REVIEW_NET)[1:]} after rewards over the last "
-                         f"{len(win)} days."))
-
-    # 4. week over week
+    # 4. context: yesterday's rewards against the week, the week against the one before
+    context = []
+    r_avg = sum(daily[d][0] for d in win) / n
+    if r_avg > 0 and y_rew < (1 - ADVICE_REWARD_DROP) * r_avg:
+        drops = sorted((fams[f]["y"]["rew"] - fams[f]["w"]["rew"] / n, f) for f in fams)
+        drops = [(dv, f) for dv, f in drops if dv < -0.5][:2]
+        context.append(f"Rewards {_usd0(y_rew)} were {100 * (1 - y_rew / r_avg):.0f}% under "
+                       f"the {n}-day average ({_usd0(r_avg)}/day)"
+                       + ("; the biggest drops against each family's average: "
+                          + ", ".join(f"{f} {_usd0(dv)}" for dv, f in drops) if drops else "")
+                       + ".")
     if len(prev) == ADVICE_DAYS:
         w = [sum(daily[d][k] for d in win) for k in (0, 1)]
-        p = [sum(daily[d][k] for d in prev) for k in (0, 1)]
-        line = (f"Week over week: {_usd0(sum(w))} over the last {len(win)} days vs "
-                f"{_usd0(sum(p))} the {len(prev)} before (rewards {_usd0(w[0] - p[0])}, "
-                f"trading {_usd0(w[1] - p[1])})")
-        drops = sorted((v["net"] - v["prev"], f) for f, v in fams.items()
-                       if v["net"] - v["prev"] < -0.5)[:2]
-        if sum(w) < sum(p) and drops:
-            line += "; the biggest drops: " + ", ".join(f"{f} {_usd0(d)}" for d, f in drops)
-        items.append(("week", line + "."))
-
-    # 5. what is working
-    keep = sorted((f for f, v in fams.items() if v["net"] >= ADVICE_KEEP_NET),
-                  key=lambda f: -fams[f]["net"])[:3]
-    if keep:
-        items.append(("ok", "Working, keep as is: " + ", ".join(
-            f"{f} {_usd0(fams[f]['net'])}" for f in keep) + f" over {len(win)} days."))
-    basis = (f"the IMM bot's book on its dashboard, {len(win)} full ET days "
-             f"{win[0][5:].replace('-', '/')}-{win[-1][5:].replace('-', '/')}, rewards "
-             f"as modelled; trading = its own fills + the positions it already held")
+        pv = [sum(daily[d][k] for d in prev) for k in (0, 1)]
+        line = (f"Week over week: {_usd0(sum(w))} vs {_usd0(sum(pv))} (rewards "
+                f"{_usd0(w[0] - pv[0])}, trading {_usd0(w[1] - pv[1])})")
+        moves = sorted((_net(v["w"]) - _net(v["p"]), f) for f, v in fams.items())
+        drops = [(dv, f) for dv, f in moves if dv < -0.5][:2]
+        if sum(w) < sum(pv) and drops:
+            line += "; the biggest drops: " + ", ".join(f"{f} {_usd0(dv)}" for dv, f in drops)
+        context.append(line + ".")
+    basis = (f"the IMM bot's book on its dashboard: yesterday against the {n} full ET days "
+             f"{win[0][5:].replace('-', '/')}-{win[-1][5:].replace('-', '/')}; rewards as "
+             f"modelled; own fills = the day's fills at the day's end, held = positions "
+             f"from earlier days")
     gen = _f(D.get("generated"))
     midnight = ET.localize(datetime.strptime(today_str, "%Y-%m-%d")).timestamp()
     if gen and gen < midnight:
         basis += (f"; the dashboard was last built "
                   f"{datetime.fromtimestamp(gen, ET):%m/%d %H:%M} ET, so yesterday may be "
                   f"partial")
-    return {"basis": basis, "items": items}
+    return {"title": f"What to do -- {ydate:%a %m/%d}", "basis": basis, "headline": head,
+            "drivers": drivers, "recs": recs, "context": context}
 
 
 def advice_text(advice) -> list:
@@ -1641,9 +1824,18 @@ def advice_text(advice) -> list:
         return []
     if advice.get("error"):
         return [f"What to do: unavailable ({advice['error']})", ""]
-    out = [f"What to do ({advice['basis']}):"]
-    out += [f"  - {t}" for _, t in advice["items"]]
+    out = [f"{advice['title']} ({advice['basis']}):", f"  {advice['headline']}"]
+    if advice["drivers"]:
+        out.append("  What moved it:")
+        out += [f"    - {t}" for t in advice["drivers"]]
+    out.append("  Recommendations:")
+    out += [f"    {i}. {verb} {t}" for i, (verb, t) in enumerate(advice["recs"], 1)]
+    out += [f"  {t}" for t in advice["context"]]
     return out + [""]
+
+
+_VERB_COLOR = {"PAUSE": C_NEG, "SHRINK": C_NEG, "TRIM": C_NEG, "HOLD": "#9a6a00",
+               "KEEP": C_POS}
 
 
 def advice_html(advice) -> str:
@@ -1652,19 +1844,27 @@ def advice_html(advice) -> str:
     if advice.get("error"):
         return (f'<div style="color:{C_MUTED};margin:8px 0">What to do: unavailable '
                 f'({_esc(advice["error"])})</div>')
+    sub = 'style="font-size:13px;font-weight:600;margin:8px 0 2px"'
+    out = [f'<div style="border:1px solid {C_GRID};border-radius:6px;padding:8px 12px;'
+           f'margin:10px 0;background:#fbfbf8">'
+           f'<div style="font-size:15px;font-weight:600">{_esc(advice["title"])}</div>'
+           f'<div style="color:{C_MUTED};font-size:12px">{_esc(advice["basis"])}</div>'
+           f'<div style="margin:6px 0">{_esc(advice["headline"])}</div>']
+    if advice["drivers"]:
+        out.append(f'<div {sub}>What moved it</div><ul style="margin:2px 0;padding-left:20px">'
+                   + "".join(f'<li style="margin:3px 0">{_esc(t)}</li>'
+                             for t in advice["drivers"]) + "</ul>")
     lis = []
-    for tag, t in advice["items"]:
-        if tag == "review":
-            name, _, rest = t.partition(":")
-            body = f'<b style="color:{C_NEG}">{_esc(name)}:</b>{_esc(rest)}'
-        else:
-            body = _esc(t)
-        lis.append(f'<li style="margin:3px 0">{body}</li>')
-    return (f'<div style="border:1px solid {C_GRID};border-radius:6px;padding:8px 12px;'
-            f'margin:10px 0;background:#fbfbf8">'
-            f'<div style="font-size:15px;font-weight:600">What to do</div>'
-            f'<div style="color:{C_MUTED};font-size:12px">{_esc(advice["basis"])}</div>'
-            f'<ul style="margin:6px 0 2px;padding-left:20px">{"".join(lis)}</ul></div>')
+    for verb, t in advice["recs"]:
+        color = _VERB_COLOR.get(verb, "#555555")
+        lis.append(f'<li style="margin:4px 0"><b style="color:{color}">{_esc(verb)}</b> '
+                   f'{_esc(t)}</li>')
+    out.append(f'<div {sub}>Recommendations</div>'
+               f'<ol style="margin:2px 0;padding-left:20px">{"".join(lis)}</ol>')
+    if advice["context"]:
+        out.append(f'<div style="color:{C_MUTED};font-size:12px;margin-top:6px">'
+                   + "<br>".join(_esc(t) for t in advice["context"]) + "</div>")
+    return "".join(out) + "</div>"
 
 
 def sub_pnl_by(pf):

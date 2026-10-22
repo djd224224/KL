@@ -1061,28 +1061,42 @@ FIELDS = ["rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n
           "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled", "cr", "cs", "fx"]
 
 
-def _drow(rew=0.0, pnl=0.0, cr=0.0, cs=0.0):
+def _drow(rew=0.0, pnl=0.0, cr=0.0, cs=0.0, m5=0.0, m4=0.0, settled=0):
     r = [0.0] * len(FIELDS)
     r[FIELDS.index("rew")], r[FIELDS.index("pnl")] = rew, pnl
     r[FIELDS.index("cr")], r[FIELDS.index("cs")] = cr, cs
-    r[FIELDS.index("fx")] = 0
+    r[FIELDS.index("settled")] = settled
+    r[FIELDS.index("fx")] = [0.0, 0.0, m5, 0.0, m4, 0.0, 0.0, 0.0] if (m5 or m4) else 0
     return r
 
 
 def _dash(bad_week=True, generated=None):
     """A dashboard data object over 10/05-10/19 (10/19 = today, still running).
-    The prior week every market makes +$50/day. The last 7 full days:
-    Sports & awards' quoting loses (KXSPORT-A live -$20/day, KXSPORT-B over
-    -$25/day); Carbon Arc's quoting pays (+$25/day) but positions it already
-    held lose $45/day; TRUMP mentions makes $40/day; AI & tech makes $40/day
-    and loses $200 on 10/18 alone."""
+    The prior week every market makes +$50/day. The last 7 full days
+    (10/12-10/18), yesterday = 10/18:
+      KXBIG (Sports & awards, live): quoting -$25 every day, the price
+        trending through the fills (4-hour mark-out) -> PAUSE;
+      KXGAS (Gas & diesel, live): quoting -$8 every day, picked off within
+        5 minutes -> SHRINK;
+      KXONE (Esports, over): -$150 on 10/14 only, +$5 rewards a day -> a
+        losing week of one-offs, NO CHANGE;
+      KXCA-X (Carbon Arc consumer): quoting +$25/day, held positions
+        -$45/day; open losers KXCA-X-1 (little left to lose -> HOLD) and
+        KXCA-Y-1 (down $60, $80 still at risk -> TRIM);
+      KXTM (TRUMP mentions): +$40/day -> KEEP;
+      KXAI (AI & tech): +$40/day, but -$200 of fills on 10/18 that settled
+        against us -> one bad day, NO CHANGE."""
     from datetime import date, timedelta
     markets = {
-        "KXSPORT-A-1": {"fam": "Sports & awards", "ev": "KXSPORT-A", "sel": True, "pos": 10.0},
-        "KXSPORT-B-1": {"fam": "Sports & awards", "ev": "KXSPORT-B", "sel": False, "pos": 0.0},
-        "KXCA-X-1": {"fam": "Carbon Arc consumer", "ev": "KXCA-X", "sel": True, "pos": -50.0},
-        "KXTM-1-A": {"fam": "TRUMP mentions", "ev": "KXTM-1", "sel": True, "pos": 0.0},
-        "KXAI-1-A": {"fam": "AI & tech", "ev": "KXAI-1", "sel": True, "pos": 0.0},
+        "KXBIG-1-A": {"fam": "Sports & awards", "ser": "KXBIG", "ev": "KXBIG-1", "sel": True},
+        "KXGAS-1-A": {"fam": "Gas & diesel", "ser": "KXGAS", "ev": "KXGAS-1", "sel": True},
+        "KXONE-1-A": {"fam": "Esports", "ser": "KXONE", "ev": "KXONE-1", "sel": False},
+        "KXCA-X-1": {"fam": "Carbon Arc consumer", "ser": "KXCA", "ev": "KXCA-X", "sel": True,
+                     "pos": -50.0, "avg": 40.0, "mark": 99.0, "u": -60.0, "wc": -5.0},
+        "KXCA-Y-1": {"fam": "Carbon Arc consumer", "ser": "KXCA", "ev": "KXCA-Y", "sel": True,
+                     "pos": 200.0, "avg": 70.0, "mark": 40.0, "u": -60.0, "wc": -80.0},
+        "KXTM-1-A": {"fam": "TRUMP mentions", "ser": "KXTM", "ev": "KXTM-1", "sel": True},
+        "KXAI-1-A": {"fam": "AI & tech", "ser": "KXAI", "ev": "KXAI-1", "sel": True},
     }
     days = {}
     for k in range(15):
@@ -1090,15 +1104,18 @@ def _dash(bad_week=True, generated=None):
         if d < "2026-10-12":
             m = {t: _drow(rew=50.0) for t in markets}
         elif bad_week:
-            m = {"KXSPORT-A-1": _drow(rew=10.0, pnl=-30.0),
-                 "KXSPORT-B-1": _drow(pnl=-25.0),
+            m = {"KXBIG-1-A": _drow(rew=5.0, pnl=-30.0, m4=-30.0),
+                 "KXGAS-1-A": _drow(rew=2.0, pnl=-10.0, m5=-8.0),
+                 "KXONE-1-A": _drow(rew=5.0, pnl=-150.0 if d == "2026-10-14" else 0.0),
                  "KXCA-X-1": _drow(rew=30.0, pnl=-50.0, cr=-45.0),
                  "KXTM-1-A": _drow(rew=50.0, pnl=-10.0),
-                 "KXAI-1-A": _drow(rew=40.0, pnl=-200.0 if d == "2026-10-18" else 0.0)}
+                 "KXAI-1-A": _drow(rew=40.0, pnl=-200.0 if d == "2026-10-18" else 0.0,
+                                   settled="settled NO" if d == "2026-10-18" else 0)}
         else:
             m = {"KXTM-1-A": _drow(rew=50.0, pnl=-10.0), "KXAI-1-A": _drow(rew=20.0)}
         days[d] = {"m": m}
     return {"day_fields": FIELDS, "days": days, "markets": markets,
+            "fx_keys": ["fe", "fe_cts", "m5", "m5_cts", "m4", "m4_cts", "mt", "mt_cts"],
             "generated": generated if generated is not None
             else pf.ET.localize(pf.datetime(2026, 10, 19, 6, 55)).timestamp()}
 
@@ -1106,57 +1123,96 @@ def _dash(bad_week=True, generated=None):
 class AdviceTests(unittest.TestCase):
     """Jack 2026-10-19: "In daily portfolio digest email, share
     recommendations on what I should do based on prior day trading
-    performance"."""
+    performance"; 2026-10-22: "Center it around last day's results (though
+    still contextualize with 7D results). Make it more insightful with clear
+    recommendations and why"."""
 
-    def test_reads_each_family_and_says_what_to_do(self):
+    def test_yesterday_leads_then_what_moved_it(self):
         adv = pf.imm_advice(_dash(), "2026-10-19")
-        items = [t for _, t in adv["items"]]
-        txt = "\n".join(items)
-        # yesterday 10/18: -45 -20 +40 -160 = -185, the worst of 14 full days
-        self.assertTrue(items[0].startswith("Yesterday (Sun 10/18): the IMM netted -$185 "
-                                            "(rewards +$130, trading -$315) -- below "
-                                            "normal, the worst of the last 14 days"))
-        self.assertIn("nothing account-wide to change", items[0])
-        # the quoting loses: shrink or pause the LIVE event; the other is over
-        self.assertIn("REVIEW Sports & awards: -$315 over 7 days. The quoting itself "
-                      "loses: rewards +$70 vs its own fills -$385 (-$315)", txt)
-        self.assertIn("Shrink or pause the worst live events: KXSPORT-A -$140.", txt)
-        self.assertIn("Already over (nothing to pause): KXSPORT-B -$175.", txt)
-        # the quoting pays, old positions lose: no quoting change
-        self.assertIn("REVIEW Carbon Arc consumer: -$140 over 7 days. The quoting pays "
-                      "(rewards +$210 vs its own fills -$35 = +$175); the loss is "
-                      "positions it already held (-$315): no quoting change", txt)
-        self.assertIn("Biggest: KXCA-X -$315.", txt)
-        # worst family first
-        self.assertLess(txt.index("REVIEW Sports"), txt.index("REVIEW Carbon"))
-        self.assertIn("One bad day, no action: AI & tech -$160 yesterday, +$80 over 7 days.",
-                      txt)
-        self.assertIn("Week over week: -$95 over the last 7 days vs +$1,750 the 7 before "
-                      "(rewards -$840, trading -$1,005); the biggest drops: Sports & "
-                      "awards -$1,015, Carbon Arc consumer -$490.", txt)
-        self.assertIn("Working, keep as is: TRUMP mentions +$280 over 7 days.", txt)
-        self.assertNotIn("No action: no family", txt)
+        self.assertEqual(adv["title"], "What to do -- Sun 10/18")
+        # 10/18: rewards 2+5+5+30+50+40, trading -10-30+0-50-10-200
+        self.assertEqual(adv["headline"],
+                         "Yesterday -$168: rewards +$132, trading -$300. Below normal: the "
+                         "worst of the last 14 days (median +$191). Last 7 days -$126 "
+                         "(-$18/day), vs +$2,450 the 7 before.")
+        self.assertEqual(adv["drivers"], [
+            "AI & tech -$160 (7 days +$80): fills -$200 against rewards +$40 -- the fills "
+            "ended on the wrong side of the settlement (KXAI-1 -$160).",
+            "TRUMP mentions +$40 (7 days +$280): rewards +$50 against fills -$10 "
+            "(KXTM-1 +$40).",
+            "Sports & awards -$25 (7 days -$175): fills -$30 against rewards +$5 -- the "
+            "price trended through the fills over the next hours (KXBIG-1 -$25)."])
+
+    def test_recommendations_each_with_their_why(self):
+        recs = pf.imm_advice(_dash(), "2026-10-19")["recs"]
+        self.assertEqual([v for v, _ in recs],
+                         ["PAUSE", "SHRINK", "TRIM", "HOLD", "NO CHANGE", "NO CHANGE", "KEEP"])
+        txt = dict(enumerate(t for _, t in recs))
+        # persistent quoting losses on live series, worst first, with how they lost
+        self.assertEqual(txt[0], "KXBIG (Sports & awards). Why: its quoting lost -$175 over "
+                                 "the 7 days -- fills -$210 against rewards +$35 -- losing "
+                                 "on 7 of them and again yesterday (-$25); the price trended "
+                                 "through the fills over the next hours.")
+        self.assertIn("KXGAS (Gas & diesel). Why: its quoting lost -$56", txt[1])
+        self.assertIn("most of it within 5 minutes of the fills (picked off", txt[1])
+        # inventory: a lot still at risk -> trim; the rest -> hold, why
+        self.assertIn("KXCA-Y-1 if you no longer believe it. Why: $80 is still at risk on a "
+                      "position already -$60 (200 YES bought at 70c, now 40c: -$60, $80 left "
+                      "to lose), in Carbon Arc consumer, whose held positions cost -$315",
+                      txt[2])
+        self.assertIn("held positions cost -$315 over 7 days (Carbon Arc consumer -$315) "
+                      "while those families' quoting paid. The 1 still open is down -$60 "
+                      "with at most $5 more to lose", txt[3])
+        self.assertIn("Biggest: KXCA-X-1 (50 YES sold at 40c, now 99c", txt[3])
+        # one bad day; a losing week of one-offs (the series is over)
+        self.assertIn("AI & tech. Why: one bad day (-$160: fills -$200", txt[4])
+        self.assertIn("inside a +$80 week", txt[4])
+        self.assertEqual(txt[5], "Esports. Why: -$115 over 7 days (quoting -$115, held "
+                                 "positions $0), but no series in it is losing day after "
+                                 "day; the biggest: KXONE -$115 (over); yesterday +$5.")
+        self.assertEqual(txt[6], "TRUMP mentions +$280 over 7 days. Why: their rewards "
+                                 "cover their fills.")
+
+    def test_context_and_basis(self):
+        adv = pf.imm_advice(_dash(), "2026-10-19")
+        self.assertTrue(adv["context"][-1].startswith("Week over week: -$126 vs +$2,450"))
         self.assertIn("7 full ET days 10/12-10/18", adv["basis"])
         self.assertNotIn("partial", adv["basis"])
-        "\n".join(pf.advice_text(adv)).encode("ascii")    # the task console is cp1252
-        html = pf.advice_html(adv)
-        self.assertIn("REVIEW Sports &amp; awards:</b>", html)
+        # yesterday's rewards well under the week's: say where they fell
+        d = _dash()
+        d["days"]["2026-10-18"]["m"]["KXTM-1-A"] = _drow(rew=0.0)
+        ctx = pf.imm_advice(d, "2026-10-19")["context"]
+        self.assertTrue(ctx[0].startswith("Rewards +$82 were "), ctx)
+        self.assertIn("TRUMP mentions -$", ctx[0])
 
-    def test_a_quiet_week_says_no_action(self):
+    def test_renders_as_text_and_html(self):
+        adv = pf.imm_advice(_dash(), "2026-10-19")
+        lines = pf.advice_text(adv)
+        "\n".join(lines).encode("ascii")                  # the task console is cp1252
+        self.assertTrue(lines[0].startswith("What to do -- Sun 10/18 (the IMM bot's book"))
+        self.assertEqual(lines[2], "  What moved it:")
+        self.assertTrue(any(ln.startswith("    1. PAUSE KXBIG (Sports & awards). Why:")
+                            for ln in lines))
+        html = pf.advice_html(adv)
+        self.assertIn(">What to do -- Sun 10/18</div>", html)
+        self.assertIn(f'<b style="color:{pf.C_NEG}">PAUSE</b> KXBIG', html)
+        self.assertIn(f'<b style="color:{pf.C_POS}">KEEP</b>', html)
+        self.assertIn("Sports &amp; awards", html)
+
+    def test_a_quiet_week_says_no_changes(self):
         adv = pf.imm_advice(_dash(bad_week=False), "2026-10-19")
-        txt = "\n".join(t for _, t in adv["items"])
-        self.assertIn("No action: no family lost more than $100 after rewards over the "
-                      "last 7 days.", txt)
-        self.assertNotIn("REVIEW", txt)
-        # +$60, the lowest of 14 days but a gain: weak, not an alarm
-        self.assertIn("positive but weak, the lowest of the last 14 days (median +$155)",
-                      txt.splitlines()[0])
-        # every day alike: a normal day
+        verbs = [v for v, _ in adv["recs"]]
+        self.assertEqual(verbs[0], "NO CHANGES")
+        self.assertNotIn("PAUSE", verbs)
+        # +$60, the lowest of 14 days but a gain: below the median, not an alarm
+        self.assertIn("Below the median: 0 of the last 14 days were worse (median +$205)",
+                      adv["headline"])
+        # every day alike, yesterday included: a normal day
         d = _dash(bad_week=False)
         for k in d["days"]:
             d["days"][k]["m"] = {t: _drow(rew=50.0) for t in d["markets"]}
-        first = pf.imm_advice(d, "2026-10-19")["items"][0][1]
-        self.assertIn("a normal day (0 of the last 14 were worse; median +$250)", first)
+        self.assertIn("A strong day: none of the last 14 days were better",
+                      pf.imm_advice(d, "2026-10-19")["headline"])
 
     def test_a_dashboard_built_before_midnight_is_flagged(self):
         late = pf.ET.localize(pf.datetime(2026, 10, 18, 23, 40)).timestamp()
@@ -1181,9 +1237,9 @@ class AdviceTests(unittest.TestCase):
         p = BuildEmailTests()._pf()
         adv = pf.imm_advice(_dash(), "2026-10-19")
         _, text, html = pf.build_email(p, [], chart_ok=True, advice=adv)
-        self.assertLess(text.index("vs yesterday:"), text.index("What to do ("))
-        self.assertLess(text.index("What to do ("), text.index("Biggest movers"))
-        self.assertLess(html.index(">What to do<"), html.index("cid:balancechart"))
+        self.assertLess(text.index("vs yesterday:"), text.index("What to do -- "))
+        self.assertLess(text.index("What to do -- "), text.index("Biggest movers"))
+        self.assertLess(html.index(">What to do -- "), html.index("cid:balancechart"))
         _, text, html = pf.build_email(p, [], chart_ok=False, advice={"error": "no file"})
         self.assertIn("What to do: unavailable (no file)", text)
         self.assertIn("What to do: unavailable (no file)", html)
