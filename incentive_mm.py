@@ -1758,6 +1758,10 @@ def is_daily_series(series: str) -> bool:
     # ... and Big Sky's resort snowfall (2026-10-13), quoted with no fair
     if series in globals().get("BIGSKY_SERIES", ()) and globals().get("BIGSKY_ENABLE"):
         return True
+    # ... and the ski resorts' season snowfall (2026-10-22), on its gate
+    if series in globals().get("RESORT_SNOW_SERIES", ()) and \
+            globals().get("RESORT_SNOW_ENABLE"):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -10142,6 +10146,10 @@ _CONFIG_CODE_KNOBS = (
     "CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP",
     # the weekend rain gate (2026-10-11); model knobs in rain_wknd_fair.py
     "RAIN_WKND_ENABLE", "RAIN_WKND_TOL_CENTS", "RAIN_WKND_TTL_MIN", "RAIN_WKND_CAP",
+    # the ski-resort snowfall gate (2026-10-22); model knobs in resort_snow_fair.py
+    "RESORT_SNOW_ENABLE", "RESORT_SNOW_TOL_CENTS", "RESORT_SNOW_WEAK_TOL_CENTS",
+    "RESORT_SNOW_TTL_MIN", "RESORT_SNOW_DRY_MIN", "RESORT_SNOW_CAP",
+    "RESORT_SNOW_MAX_POSITION", "RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN",
     # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
     "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
     "RT_FAIR_CAP", "RT_FAIR_BAND",
@@ -12343,6 +12351,87 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 
 
 # ----------------------------------------------------------------------------
+# SKI-RESORT SNOWFALL GATE (Jack 2026-10-22: "Why isn't this quoting" on the
+# watch email's KXBEAVERSNOW -> "No way to fair value price it?" -> "Do it
+# best you can and quote it"). KX<RESORT>SNOW-24DEC26-GT<K>, "the total
+# snowfall recorded at <resort> October 1 through December 24", settle on
+# the resort's own reports, which nobody archives. resort_snow_fair.py
+# borrows each resort's nearest long NOAA snowfall record (ACIS), scaled to
+# the resort's level, with the NWS grid's snowfall forecast at the resort,
+# and ANCHORS every strike to its book: the fair starts at the mid on the
+# strike's first calm read and follows it with a 24h time constant, frozen
+# through storms -- so the fair moves with the proxy's reports and the
+# forecast, and the band catches a book that runs away from them faster
+# (on launch day the model's tails ran 10-14c fatter than the books').
+# The monthly snow gate's checks on that file (weather_fair_gate_reason),
+# failing CLOSED: no fresh fair or no anchor yet, no airport observation,
+# ANY precipitation at the resort's airport -- rain in the valley is snow up
+# the mountain -- and RESORT_SNOW_DRY_MIN after, and a stale proxy
+# (precipitation after its latest report's morning observation, until a
+# later report counts it, or no report in 3 days). A touch more than
+# RESORT_SNOW_TOL_CENTS through the fair caps that side, the snow rule
+# (RESORT_SNOW_WEAK_TOL_CENTS on Mammoth and Stowe, whose proxies are an
+# east-side rain shadow and a valley gauge). Safe-join (rest behind the
+# touch unless the spread is wide), x1 at every hour (is_daily_series),
+# RESORT_SNOW_MAX_POSITION per market, band 5-90c, out 26h before close.
+# 10/22 20:03Z first read: Mammoth, Northstar and Stowe anchored (27
+# strikes); Beaver Creek, Keystone and Park City stood aside -- rain at
+# EGE, LXV and HCR after their proxies' latest reports. Kill switch
+# IMM_RESORT_SNOW_ENABLE=0 (the family goes with the gate); positions ride.
+RESORT_SNOW_ENABLE = os.environ.get("IMM_RESORT_SNOW_ENABLE", "1") == "1"
+RESORT_SNOW_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_ALLOW_RESORT_SNOW_SERIES",
+    "KXBEAVERSNOW,KXKEYSTONESNOW,KXMAMMOTHSNOW,KXNORTHSTARSNOW,KXPARKCSNOW,"
+    "KXSTOWESNOW").split(",") if s.strip())
+RESORT_SNOW_WEAK_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_RESORT_SNOW_WEAK_SERIES", "KXMAMMOTHSNOW,KXSTOWESNOW").split(",") if s.strip())
+RESORT_SNOW_TOL_CENTS = _env_int("IMM_RESORT_SNOW_TOL_CENTS", 10)
+RESORT_SNOW_WEAK_TOL_CENTS = _env_int("IMM_RESORT_SNOW_WEAK_TOL_CENTS", 15)
+RESORT_SNOW_TTL_MIN = _env_int("IMM_RESORT_SNOW_TTL_MIN", 30)
+RESORT_SNOW_REFRESH_SECS = _env_int("IMM_RESORT_SNOW_REFRESH_SECS", 600)
+RESORT_SNOW_DRY_MIN = _env_float("IMM_RESORT_SNOW_DRY_MIN", 60)
+RESORT_SNOW_CAP = os.environ.get("IMM_RESORT_SNOW_CAP", "1") == "1"
+RESORT_SNOW_MAX_POSITION = _env_float("IMM_RESORT_SNOW_MAX_POSITION", 150)
+RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN = _env_int(
+    "IMM_RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN", 1560)
+RESORT_SNOW_FILE = os.environ.get(
+    "IMM_RESORT_SNOW_FILE", os.path.join(STATUS_DIR, "resort_snow_fair.json"))
+_resort_snow_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+if RESORT_SNOW_ENABLE:
+    for _s in RESORT_SNOW_SERIES:
+        SERIES_OVERRIDES[_s] = replace(
+            SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+            price_min_cents=_env_int("IMM_SNOW_PRICE_MIN", 5),
+            price_max_cents=_env_int("IMM_SNOW_PRICE_MAX", 90),
+            cutoff_from_close_min=RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN,
+            max_position=RESORT_SNOW_MAX_POSITION, safe_join=True)
+
+
+def resort_snow_series(series: str) -> bool:
+    return RESORT_SNOW_ENABLE and series in RESORT_SNOW_SERIES
+
+
+def load_resort_snow() -> int:
+    """Hot-reload RESORT_SNOW_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(RESORT_SNOW_FILE, _resort_snow_state, "resort snow")
+
+
+def resort_snow_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                     ext_ask: Optional[float]
+                     ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """snow_monthly_gate's contract on the resort file, at
+    RESORT_SNOW_WEAK_TOL_CENTS for the weak proxies. Fails CLOSED."""
+    tol = (RESORT_SNOW_WEAK_TOL_CENTS if ticker.split("-")[0] in RESORT_SNOW_WEAK_SERIES
+           else RESORT_SNOW_TOL_CENTS)
+    why, inp = weather_fair_gate_reason(
+        _resort_snow_state, ticker, now_ts, ext_bid, ext_ask,
+        tol=tol, ttl_min=RESORT_SNOW_TTL_MIN, dry_min=RESORT_SNOW_DRY_MIN,
+        label="resort snow", wet=("snowing", "snowed"))
+    return _cap_band_breach(why, inp, tol, RESORT_SNOW_CAP)
+
+
+# ----------------------------------------------------------------------------
 # FAIR-FILE GATES WITHOUT A STATION (Jack 2026-10-11: "build the KXRT, CPI,
 # KXRAINWKND models"). A writer prices each market into a file in the rain
 # writer's shape (markets {ticker: {p, event, fetched_at}}, read with its
@@ -12586,7 +12675,10 @@ def fair_file_gate(series: str, ticker: str, now_ts: float,
                    ) -> Optional[Tuple[str, str, dict,
                                        Optional[Tuple[Optional[int], Optional[int]]]]]:
     """(log label, why, inputs, caps) for a market under one of the
-    2026-10-11 fair-file gates, else None."""
+    2026-10-11 fair-file gates or the 2026-10-22 resort snow gate, else
+    None."""
+    if resort_snow_series(series):
+        return ("resort-snow",) + resort_snow_gate(ticker, now_ts, ext_bid, ext_ask)
     if cpi_fair_series(series):
         return ("cpi-fair",) + cpi_fair_gate(ticker, now_ts, ext_bid, ext_ask)
     if rain_wknd_series(series):
@@ -14958,6 +15050,11 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
     if not m:
         return None
     yy, mon, dd = m.groups()
+    if parts[0] in globals().get("RESORT_SNOW_SERIES", ()):
+        # the ski resorts' season snowfall (2026-10-22) writes the window's
+        # last day DDMONYY: KXBEAVERSNOW-24DEC26 is December 24, 2026 -- the
+        # YYMONDD reading (2024-12-26) put every strike past its cutoff
+        yy, dd = dd, yy
     month = _MONTHS.get(mon)
     if month is None:
         return None
@@ -17104,6 +17201,7 @@ def fair_gate_of(series: str) -> str:
         ("rain monthly", lambda: rain_monthly_series(series)),
         ("rain period", lambda: rain_period_gated(t)),
         ("snow monthly", lambda: snow_monthly_series(series)),
+        ("resort snow", lambda: resort_snow_series(series)),
         ("cpi", lambda: cpi_fair_series(series)),
         ("rain weekend", lambda: rain_wknd_series(series)),
         ("rotten tomatoes", lambda: rt_fair_series(series)),
@@ -23010,6 +23108,7 @@ class IncentiveMarketMaker:
             ytw_pilot_ticker(ticker) or \
             snow_monthly_series(series) or \
             bigsky_series(series) or \
+            resort_snow_series(series) or \
             cpi_pilot_active(ticker) or \
             nfl_h2h_series(series) or \
             nfl_auto_entry(series) is not None or \
@@ -23280,6 +23379,7 @@ class IncentiveMarketMaker:
         load_snow_monthly()
         load_cpi_fair()
         load_rain_wknd()
+        load_resort_snow()
         load_rt_fair()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
@@ -27525,7 +27625,8 @@ class IncentiveMarketMaker:
             # same gate on their own file, with the period markets' caps,
             # and so do the 2026-10-11 fair-file gates (fair_file_gate:
             # the CPI pilot, weekend rain, Rotten Tomatoes) without the
-            # station checks.
+            # station checks, and the 2026-10-22 ski-resort snowfall gate
+            # with them.
             rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             rain_period = rain_period_gated(t)
             snow = snow_monthly_series(meta.series)
@@ -30117,6 +30218,40 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_rain_wknd_refresh, daemon=True,
                              name="rain-wknd").start()
+        if RESORT_SNOW_ENABLE and not once:
+            # ski-resort snowfall refresher (2026-10-22): the rain-wknd
+            # refresher's contract on resort_snow_fair.py and
+            # RESORT_SNOW_FILE -- Kalshi's open events and the books the
+            # anchors follow hourly (cached in the file), each resort's
+            # airport observation every pass, its proxy's reports hourly.
+            def _resort_snow_refresh():
+                try:
+                    import resort_snow_fair
+                except Exception as e:
+                    log(f"{self.tag} ! resort-snow refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, RESORT_SNOW_REFRESH_SECS)
+                    try:
+                        ok, miss = resort_snow_fair.write_fair_file(
+                            RESORT_SNOW_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} resort-snow refresh: {ok} events "
+                                f"with a fair"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! resort-snow refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 120)
+                    time.sleep(delay)
+            threading.Thread(target=_resort_snow_refresh, daemon=True,
+                             name="resort-snow").start()
         if RT_FAIR_ENABLE and not once:
             # Rotten Tomatoes fair refresher (2026-10-12): the CPI
             # refresher's contract on rt_fair.py and RT_FAIR_FILE, a pass
@@ -31228,6 +31363,15 @@ class IncentiveMarketMaker:
                 f"after {EVENT_DEPTH_RESUME_SECS // 60} min healthy; a 2nd burst within "
                 f"{EVENT_FILL_STRIKE_TTL_SECS / 60:g} min is permanent); no thin-book "
                 f"trigger")
+        if RESORT_SNOW_ENABLE:
+            log(f"resort snow gate (2026-10-22): {', '.join(sorted(RESORT_SNOW_SERIES))} "
+                f"quoted against resort_snow_fair's book-anchored proxy model -- band "
+                f"{RESORT_SNOW_TOL_CENTS}c ({RESORT_SNOW_WEAK_TOL_CENTS}c on "
+                f"{', '.join(sorted(RESORT_SNOW_WEAK_SERIES))}) caps the side that "
+                f"fights the fair; out while the resort's airport is wet, "
+                f"{RESORT_SNOW_DRY_MIN:g}m after, and until the proxy's next report; "
+                f"safe-join, max {RESORT_SNOW_MAX_POSITION:g} per market, out "
+                f"{RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN // 60}h before close")
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"

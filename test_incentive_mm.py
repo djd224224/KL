@@ -242,6 +242,9 @@ def setUpModule():
     imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
     imm.RT_FAIR_FILE = os.path.join(tmp, "rt_fair.json")
     imm._rt_fair_state.update(mtime=0.0, markets={})
+    # the 2026-10-22 ski-resort snowfall gate (TestResortSnowGate deletes it)
+    imm.RESORT_SNOW_FILE = os.path.join(tmp, "resort_snow_fair.json")
+    imm._resort_snow_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -12446,6 +12449,152 @@ class TestSnowMonthlyGate(unittest.TestCase):
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertIn(self.T, bot.state.selected)                 # sticky
+
+
+class TestResortSnowGate(unittest.TestCase):
+    """resort_snow_fair.json -> load_resort_snow / resort_snow_gate -> the six
+    ski-resort season snowfall series (Jack 2026-10-22: "Do it best you can
+    and quote it"): enrolled on the snow gate's checks, failing closed, out
+    while the resort's airport is wet, a touch through the book-anchored
+    fair caps that side (wider on the weak proxies); safe-join, 150 per
+    market, x1 every hour. Fixture KXBEAVERSNOW-24DEC68-GT80 (DDMONYY like
+    Kalshi's 24DEC26: December 24, 2068, far from any cutoff)."""
+
+    T = "KXBEAVERSNOW-24DEC68-GT80"
+    EV = "KXBEAVERSNOW-24DEC68"
+    WEAK = "KXMAMMOTHSNOW-24DEC68-GT80"
+    SIX = ("KXBEAVERSNOW", "KXKEYSTONESNOW", "KXMAMMOTHSNOW", "KXNORTHSTARSNOW",
+           "KXPARKCSNOW", "KXSTOWESNOW")
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._resort_snow_state.update(mtime=0.0, markets={}, events={})
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        try:
+            os.remove(imm.RESORT_SNOW_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        try:
+            os.remove(imm.RESORT_SNOW_FILE)
+        except FileNotFoundError:
+            pass
+
+    def _write(self, p=0.5, wet=False, last_wet_mins=None, stale_cli=False,
+               stale_why=None, ticker=None):
+        now = datetime.now(timezone.utc)
+        t = ticker or self.T
+        ev = t.rsplit("-", 1)[0]
+        lw = ((now - timedelta(minutes=last_wet_mins)).isoformat()
+              if last_wet_mins is not None else None)
+        with open(imm.RESORT_SNOW_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {t: {"event": ev, "p": p, "p_model": 0.4,
+                                       "boundary": False, "fetched_at": now.isoformat()}},
+                       "event_state": {ev: {
+                           "wet": wet, "last_wet_at": lw, "stale_cli": stale_cli,
+                           "stale_why": stale_why, "mtd": 6.2,
+                           "obs_time": now.isoformat()}}}, f)
+        os.utime(imm.RESORT_SNOW_FILE, (time.time(), time.time() + self._bump))
+        TestResortSnowGate._bump += 1
+        return imm.load_resort_snow()
+
+    def test_family_enrollment_overrides_and_the_ticker_date(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            a = imm.IncentiveMarketMaker._allowed
+            for s in self.SIX:
+                self.assertTrue(imm.resort_snow_series(s), s)
+                self.assertTrue(a(f"{s}-24DEC26-GT80"), s)
+                ov = imm.series_override(s)
+                self.assertEqual((ov.price_min_cents, ov.price_max_cents,
+                                  ov.cutoff_from_close_min, ov.max_position, ov.safe_join),
+                                 (5, 90, 1560, 150, True), s)
+                self.assertTrue(imm.is_daily_series(s), s)
+                self.assertEqual(imm.fair_gate_of(s), "resort snow", s)
+            for s in ("KXVAILSNOW", "KXTSNOWFALLBIGSKYM", "KXCHISNOWM"):
+                self.assertFalse(imm.resort_snow_series(s), s)
+            with mock.patch.object(imm, "RESORT_SNOW_ENABLE", False):
+                self.assertFalse(a("KXBEAVERSNOW-24DEC26-GT80"))
+                self.assertFalse(imm.is_daily_series("KXBEAVERSNOW"))
+                self.assertEqual(imm.fair_gate_of("KXBEAVERSNOW"), "")
+        # Kalshi's 24DEC26 is DDMONYY: December 24, 2026, not 2024-12-26
+        self.assertEqual(imm.parse_event_date("KXBEAVERSNOW-24DEC26"),
+                         imm.ET.localize(datetime(2026, 12, 24)).astimezone(timezone.utc))
+        self.assertEqual(imm.parse_event_date("KXHIGHNY-26OCT22"),
+                         imm.ET.localize(datetime(2026, 10, 22)).astimezone(timezone.utc))
+        self.assertEqual(imm.trade_cutoff_utc("KXBEAVERSNOW-24DEC26", None, None),
+                         imm.ET.localize(datetime(2026, 12, 24)).astimezone(timezone.utc))
+        for k in ("RESORT_SNOW_ENABLE", "RESORT_SNOW_TOL_CENTS", "RESORT_SNOW_WEAK_TOL_CENTS",
+                  "RESORT_SNOW_CAP", "RESORT_SNOW_MAX_POSITION"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        import imm_risk_controls
+        self.assertIn("resort_snow", imm_risk_controls.GATE_GUARDS)
+
+    def test_gate_reasons_tolerances_and_caps(self):
+        g = imm.resort_snow_gate
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, inp["reason"], caps),
+                         ("no resort snow fair for this market", "no_read", None))
+        self._write()
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self.assertEqual(imm.fair_file_gate("KXBEAVERSNOW", self.T, time.time(), 49, 51),
+                         ("resort-snow", "", {}, None))
+        self.assertEqual(g(self.T, time.time() + imm.RESORT_SNOW_TTL_MIN * 60 + 5,
+                           49, 51)[1]["reason"], "stale")
+        self._write(wet=True, last_wet_mins=0)                # rain at the airport
+        self.assertEqual(g(self.T, time.time(), 49, 51)[:2][0], "snowing at the station")
+        self._write(last_wet_mins=20)
+        self.assertEqual(g(self.T, time.time(), 49, 51)[1]["reason"], "drying")
+        self._write(stale_cli=True, stale_why="rain at EGE after DILLON 1 E's report")
+        self.assertEqual(g(self.T, time.time(), 49, 51)[:2],
+                         ("rain at EGE after DILLON 1 E's report", {"reason": "stale_cli"}))
+        # bid 49 > 38 + 10: the bid is capped at 48, the ask keeps the touch
+        self._write(p=0.38)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["bid_bad"]), ("", (48, 28), True))
+        # Mammoth's weak proxy: 15c, so 49 against 38 passes
+        self._write(p=0.38, ticker=self.WEAK)
+        self.assertEqual(g(self.WEAK, time.time(), 49, 51), ("", {}, None))
+        self.assertEqual(g(self.WEAK, time.time(), 54, 56)[2], (53, 23))
+
+    def _bot(self):
+        client = FakeClient()
+        far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _sides(self, bot):
+        return {o["book_side"] for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T}
+
+    def test_quotes_through_the_gate_and_stands_aside_in_rain(self):
+        bot = self._bot()
+        bot.run_cycle()                                       # no file: closed
+        self.assertEqual(self._sides(bot), set())
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self._write()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), {"bid", "ask"})
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        self._write(wet=True, last_wet_mins=0)                # rain at the airport
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot), set())
+        self.assertIn(self.T, bot.state.selected)
 
 
 class TestCpiFairGate(unittest.TestCase):
@@ -24825,13 +24974,14 @@ class TestSignedFairReads(unittest.TestCase):
     def test_every_kalshi_reading_refresher_hands_over_its_reader(self):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
         monthly rain, monthly snow, GasBuddy, daily rain (its city
-        discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11) and
-        Rotten Tomatoes (2026-10-12) refreshers each build a reader with
-        fair_reader() and pass it to their module's write_fair_file (the
-        threads live inside run(), so read its source)."""
+        discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11),
+        Rotten Tomatoes (2026-10-12) and ski-resort snowfall (2026-10-22)
+        refreshers each build a reader with fair_reader() and pass it to
+        their module's write_fair_file (the threads live inside run(), so
+        read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 10)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 11)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -24841,7 +24991,8 @@ class TestSignedFairReads(unittest.TestCase):
                           ("gasbuddy_fair", "GB_FAIR_FILE"),
                           ("cpi_fair", "CPI_FAIR_FILE"),
                           ("rain_wknd_fair", "RAIN_WKND_FILE"),
-                          ("rt_fair", "RT_FAIR_FILE")):
+                          ("rt_fair", "RT_FAIR_FILE"),
+                          ("resort_snow_fair", "RESORT_SNOW_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)

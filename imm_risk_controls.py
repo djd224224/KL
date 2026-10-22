@@ -94,7 +94,9 @@ GATE_GUARDS = ("treasury_yield", "rain_monthly", "rain_period", "snow_monthly", 
                "vercel_fair", "or_fair", "share_fair", "mort_fair", "gb_fair",
                "ca_fair", "dc_count", "poke_fair", "manual_yield",
                # the 2026-10-11 fair-file gates (incentive_mm.fair_file_gate)
-               "cpi_fair", "rt_fair", "rain_wknd")
+               "cpi_fair", "rt_fair", "rain_wknd",
+               # the 2026-10-22 ski-resort snowfall gate, on the same path
+               "resort_snow")
 BLACKOUT_GUARDS = ("cpi_blackout", "aaa_blackout")
 DEPTH_GUARDS = ("event_depth_trip", "event_depth_hold")
 CUTOFF_GUARDS = ("closing", "cutoff_passed", "cutoff_extra")

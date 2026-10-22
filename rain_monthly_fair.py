@@ -422,7 +422,8 @@ def simulate_period(key: str, start: date, end: date, now: datetime,
                     rng: Optional[random.Random] = None,
                     hist: Optional[Dict[str, Optional[float]]] = None,
                     element: str = "quantitativePrecipitation",
-                    kernel_sigma: Optional[float] = None) -> dict:
+                    kernel_sigma: Optional[float] = None,
+                    hist_scale: float = 1.0) -> dict:
     """Monte Carlo of the rest of the period (inches): today's remaining
     hours on the forecast while today is in it; every later day of the
     period from one whole historical window, each forecast-horizon day
@@ -430,7 +431,9 @@ def simulate_period(key: str, start: date, end: date, now: datetime,
     multiplier correlates them), and the window's historical part scaled by
     a mean-one log-normal kernel (PERIOD_KERNEL_SIGMA). The snow gate
     passes its snowfall history, element "snowfallAmount" and its own
-    kernel."""
+    kernel; the resort snow gate a `hist_scale` too, which lifts a proxy
+    station's history to the resort's level (the forecast, read at the
+    resort itself, is not scaled)."""
     rng = rng or random.Random()
     tz = pytz.timezone(rm.STATIONS[key]["tz"])
     today = now.astimezone(tz).date()
@@ -452,6 +455,8 @@ def simulate_period(key: str, start: date, end: date, now: datetime,
     day_fc = [fc_for(d.isoformat()) for d in days]
     fc_idx = [i for i, f in enumerate(day_fc) if f is not None]
     in_fc = set(fc_idx)
+    if hist_scale != 1.0:
+        segs = [[v * hist_scale for v in s] for s in segs]
     base = [sum(v for i, v in enumerate(s) if i not in in_fc) for s in segs]
     sig = PERIOD_KERNEL_SIGMA if kernel_sigma is None else kernel_sigma
     totals = []
