@@ -10066,6 +10066,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
+    "SIDE_MULT_SERIES",                          # Trump B half bids / 1.5x asks (2026-10-22)
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE", "MENTION_NO_CUTOFF_EXEMPT",
     "MENTION_ANNOUNCE_SERIES", "MENTION_ANNOUNCE_FILL_CT",
@@ -13092,12 +13093,48 @@ def quake_ask_renew_due(order: dict, age: float, now_ts: float) -> bool:
     return exp is not None and exp - now_ts <= QUAKE_ASK_RENEW_LEAD_SECS
 
 
+# SIZE BY SIDE PER SERIES (Jack 2026-10-22, after the Trump mentions
+# post-mortem: "Half bids, 1.5x asks on B. Keep main series same. Give me an
+# email report once this test runs"). 9/22-10/22, to settlement: B's YES bids
+# lost 26.7c a contract (-$1,066, against roughly $296 of their reward share)
+# while its asks made +8.0c (+$551); the main series' bids about paid for
+# themselves (-$1,251 against ~$1,168). "SERIES:bid_mult:ask_mult", comma
+# separated; IMM_SIDE_MULT_SERIES= (empty) turns it off. The ladder, the
+# reward estimate and place_with_caps' side cap all carry it; position and
+# event caps still bind unscaled. imm_trumpb_test_report.py scores the test
+# against the main series (one-shot email, 2026-11-05).
+def _side_mult_spec(raw: str) -> Dict[str, Tuple[float, float]]:
+    out: Dict[str, Tuple[float, float]] = {}
+    for part in (raw or "").split(","):
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) != 3 or not bits[0]:
+            continue
+        try:
+            out[bits[0].upper()] = (max(0.0, float(bits[1])), max(0.0, float(bits[2])))
+        except ValueError:
+            continue
+    return out
+
+
+SIDE_MULT_SERIES = _side_mult_spec(os.environ.get("IMM_SIDE_MULT_SERIES",
+                                                  "KXTRUMPMENTIONB:0.5:1.5"))
+
+
+def series_side_mults(series: str) -> Tuple[float, float]:
+    """(bid_mult, ask_mult) every market of the series carries
+    (SIDE_MULT_SERIES); (1.0, 1.0) elsewhere."""
+    return SIDE_MULT_SERIES.get(series, (1.0, 1.0))
+
+
 def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
     """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
-    late-month rule, with asks zeroed for a bid-only family (a quake ask
-    strike keeps its ask side; quake_cap_quotes sizes and floors it) and
-    bids zeroed for a NO-side-only market (no_side_only)."""
+    late-month rule times the series' own side sizes (SIDE_MULT_SERIES), with
+    asks zeroed for a bid-only family (a quake ask strike keeps its ask side;
+    quake_cap_quotes sizes and floors it) and bids zeroed for a NO-side-only
+    market (no_side_only)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
+    sb, sa = series_side_mults(series_of(ticker))
+    bm, am = bm * sb, am * sa
     if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
         am = 0.0
     if no_side_only(ticker):
@@ -27850,8 +27887,10 @@ class IncentiveMarketMaker:
             # from here the ladder is PER SIDE -- no bid rungs and asks at
             # 50% inside the window, the plain ladder on both sides otherwise.
             ca_bm, ca_am = ca_late_month_mults(t, now_utc)
-            lv_bid = scale_levels(lv, ca_bm)
-            lv_ask = scale_levels(lv, ca_am)
+            # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B)
+            ss_bm, ss_am = series_side_mults(meta.series)
+            lv_bid = scale_levels(lv, ca_bm * ss_bm)
+            lv_ask = scale_levels(lv, ca_am * ss_am)
             if series_bid_only(meta.series) and not quake_ask_strike(t):
                 lv_ask = []          # bid-only family (quake gate): no ask rungs
             if no_side_only(t):
@@ -29008,6 +29047,10 @@ class IncentiveMarketMaker:
                 hour_scaled_levels(series, datetime.fromtimestamp(now_ts, tz=timezone.utc)),
                 self._market_size_mult(q.ticker))
             cap_mult = REF_DEPTH_MAX_MULT if LADDER_MODE == "atref" else 1.0
+            # a series sized up on one side (SIDE_MULT_SERIES) brackets that
+            # side's caps by the same factor
+            _ssm = max(1.0, series_side_mults(series)[0 if q.book_side == "bid" else 1])
+            cap_mult *= _ssm
             side_cap = sum(s for _t, s in lv_now) * cap_mult
             # atref collapses the side's WHOLE ladder to one price level by
             # design, so the per-level bracket is the side bracket — the
@@ -29016,7 +29059,7 @@ class IncentiveMarketMaker:
             # lot single rung > max-level 10 and every temp strike was
             # level_cap-blocked overnight.)
             max_level_size = side_cap if LADDER_MODE == "atref" \
-                else max(s for _t, s in lv_now)
+                else max(s for _t, s in lv_now) * _ssm
             # FULL UNWIND: the side that reduces the bot's own position may
             # rest the whole position (the quote loop sized it the same way)
             _ub, _ua = unwind_side_sizes(series, self.pnl.pos.get(q.ticker, 0.0),
@@ -31160,6 +31203,11 @@ class IncentiveMarketMaker:
                 f"after {EVENT_DEPTH_RESUME_SECS // 60} min healthy; a 2nd burst within "
                 f"{EVENT_FILL_STRIKE_TTL_SECS / 60:g} min is permanent); no thin-book "
                 f"trigger")
+        if SIDE_MULT_SERIES:
+            log("side sizes by series (2026-10-22): "
+                + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
+                            for s, (b, a) in sorted(SIDE_MULT_SERIES.items()))
+                + " -- every other series unchanged; report email 2026-11-05")
         if PAD_STICKY:
             log(f"sticky pads (2026-10-22): a resting pad is not pulled or shrunk "
                 f"until the depth outside it reaches {PAD_STICKY_RELEASE_MULT:g}x "

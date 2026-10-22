@@ -8042,6 +8042,29 @@ class TestLoveIslandCycle(unittest.TestCase):
         self.assertEqual(bid_pad[0]["remaining_count"], 1000)  # (1000-215)+300 -> capped at PAD_MAX 1000
         self.assertEqual(ask_pad[0]["remaining_count"], 1000)
 
+    def test_series_side_sizes_scale_each_side_of_the_ladder(self):
+        # Jack 2026-10-22, the Trump B test ("Half bids, 1.5x asks on B"):
+        # SIDE_MULT_SERIES scales the series' bid and ask rungs apart, and
+        # place_with_caps lets the bigger side through
+        def rungs(mults):
+            client, ev = self._client(n_markets=1)
+            with mock.patch.dict(imm.SIDE_MULT_SERIES, mults, clear=True):
+                bot = IncentiveMarketMaker(client=client, live=False)
+                self._use_resolver(bot)
+                bot.run_cycle()
+            t = f"{ev}-M0"
+            mine = [o for o in bot.state.sim_orders.values() if o["ticker"] == t
+                    and o["yes_price"] not in (imm.PAD_BID_CENTS, imm.PAD_ASK_CENTS)]
+            return (sorted(o["remaining_count"] for o in mine if o["book_side"] == "bid"),
+                    sorted(o["remaining_count"] for o in mine if o["book_side"] == "ask"))
+        base_bids, base_asks = rungs({})
+        self.assertEqual(base_bids, [5, 5, 5])
+        self.assertEqual(base_asks, [5, 5, 5])
+        bids, asks = rungs({"KXLOVEISLMENTION": (0.4, 2.0)})
+        self.assertEqual(bids, [2, 2, 2])          # 5 x 0.4, half-up
+        self.assertEqual(asks, [10, 10, 10])       # 5 x 2, past the 1x side cap
+        self.assertEqual(rungs({"KXOTHER": (0.4, 2.0)}), (base_bids, base_asks))
+
     def test_pad_nets_out_own_pad_live_stable(self):
         """With our 1000 pad already resting inside the book, the desired pad
         stays 1000 (not 0) — no self-referential churn."""
@@ -8163,6 +8186,23 @@ class TestStickyPads(unittest.TestCase):
             [Quote("T", "bid", imm.PAD_BID_CENTS, n, is_pad=True)], resting,
             {"p": now - 60}, now)
         self.assertEqual((place, cancel, amend), ([], [], []))
+
+
+class TestSeriesSideMults(unittest.TestCase):
+    """Jack 2026-10-22, after the Trump mentions post-mortem: "Half bids,
+    1.5x asks on B. Keep main series same."""
+
+    def test_trump_b_only(self):
+        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.5, 1.5))
+        self.assertEqual(imm.series_side_mults("KXTRUMPMENTION"), (1.0, 1.0))
+        now = utc(2026, 10, 23, 15, 0)
+        self.assertEqual(imm.side_size_mults("KXTRUMPMENTIONB-26OCT27-SOCI", now), (0.5, 1.5))
+        self.assertEqual(imm.side_size_mults("KXTRUMPMENTION-26OCT27-SOCI", now), (1.0, 1.0))
+
+    def test_spec(self):
+        self.assertEqual(imm._side_mult_spec("kxa:0.5:1.5, KXB:bad:1, :1:1, KXC:0:2, KXD:1"),
+                         {"KXA": (0.5, 1.5), "KXC": (0.0, 2.0)})
+        self.assertEqual(imm._side_mult_spec(""), {})
 
 
 class TestCutoffEnforcement(unittest.TestCase):
