@@ -2405,8 +2405,9 @@ def series_in_blackout(series: str, now_utc: datetime) -> bool:
 # agency republishes every month: KXTNTRANSEMP-27APR30 settles on BLS series
 # SMU47000003133600001's 2026 annual average, so each monthly State Employment
 # and Unemployment release -- and the national Employment Situation that state
-# payrolls track -- moves its fair while our quotes rest. A market whose rules
-# cite a source on RELEASE_CALENDAR_FILE stands fully aside from
+# payrolls track -- moves its fair while our quotes rest; so do the USDA NASS,
+# EIA, Census and FHFA state series on their reports (_AGENCY_RELEASE_RULES).
+# A market whose rules cite a source on RELEASE_CALENDAR_FILE stands fully aside from
 # RELEASE_PAUSE_BEFORE_MIN before each release to RELEASE_PAUSE_AFTER_MIN after,
 # through the blackout path (orders cancelled, the market kept). The sources
 # come from the rules text as markets load (release_sources_from_rules); the
@@ -2447,6 +2448,44 @@ _US_STATE_RE = re.compile(
     r"North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|"
     r"South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|"
     r"Wisconsin|Wyoming|District of Columbia|Puerto Rico)\b|\bin states and selected areas")
+# The other agencies' state statistics (Jack 2026-10-22: "Can you not map
+# these?" -- the USDA, EIA, Census permits and FHFA home-price series): the
+# agency the rules name, the report's own words, and a state, metro or shale
+# play. A national print is left out (KXEIACRUDEW's weekly U.S. crude stocks
+# settle AT their release; its -$47 of fills over the past month came a day
+# or two before one). Around NASS's 10/09 noon Crop Production the corn-yield books
+# took 20 maker fills in the next two hours, -$70 to date (the crop books -$85
+# on 24 fills inside the window); its 10/22 3 PM Milk Production filled the
+# Wisconsin and Vermont asks 5 times from 14:33 to 15:06 ET (-$14). A report
+# whose rules name no agency is matched by EIA's own term for it
+# (KXAKCRUDEOIL's "crude oil field production").
+_NASS_RE = re.compile(r"\bUSDA\b|\bNASS\b|National Agricultural Statistics")
+_EIA_RE = re.compile(r"\bEIA\b|Energy Information Administration")
+_CENSUS_RE = re.compile(r"\bCensus\b")
+_FHFA_RE = re.compile(r"\bFHFA\b|Federal Housing Finance")
+_AGENCY_RELEASE_RULES = (            # (source, agency or None, the report's words)
+    ("nass_crop", _NASS_RE, re.compile(
+        r"\b(?:corn|soybeans?|cotton|wheat|sorghum|peanuts?|potato(?:es)?|maple syrup)\b"
+        r"|Crop Production", re.I)),
+    # "or cattle on feed" in KXMTCATTLE's rules is not the report
+    ("nass_cof", _NASS_RE, re.compile(r"cattle[- ]on[- ]feed (?:report|inventory)", re.I)),
+    ("nass_cattle", _NASS_RE, re.compile(r"cattle and calves|cattle, including calves", re.I)),
+    ("nass_milk", _NASS_RE, re.compile(r"\bmilk production\b", re.I)),
+    ("nass_poultry", _NASS_RE, re.compile(r"\bbroiler", re.I)),
+    ("nass_catfish", _NASS_RE, re.compile(r"\bcatfish\b", re.I)),
+    ("eia_epm", _EIA_RE, re.compile(
+        r"Electric Power Monthly|net electricity generation|electricity net generation"
+        r"|electricity price|price of electricity", re.I)),
+    ("eia_psm", None, re.compile(r"field production of crude oil|crude oil field production", re.I)),
+    ("eia_ngm", _EIA_RE, re.compile(
+        r"marketed natural[- ]gas production|natural gas marketed production", re.I)),
+    ("eia_steo", _EIA_RE, re.compile(r"\bSTEO\b|Short-Term Energy Outlook")),
+    ("eia_qcr", _EIA_RE, re.compile(r"Quarterly Coal Report", re.I)),
+    ("census_bps", _CENSUS_RE, re.compile(r"building permits|housing units authorized", re.I)),
+    ("census_popest", _CENSUS_RE, re.compile(r"population estimate", re.I)),
+    ("fhfa_hpi", _FHFA_RE, re.compile(r"House Price Index|\bHPI\b")),
+)
+_SUBNATIONAL_RE = re.compile(_US_STATE_RE.pattern + r"|\bCBSA\b|\bmetropolitan\b|\bformation\b")
 _SERIES_RELEASE_SOURCES: Dict[str, Tuple[str, ...]] = {}
 _release_cal: dict = {"mtime": None, "checked": 0.0, "sources": {}}
 _release_warned: Dict[str, str] = {}             # source -> ET day of its last warning
@@ -2455,7 +2494,9 @@ _release_warned: Dict[str, str] = {}             # source -> ET day of its last 
 def release_sources_from_rules(text: str) -> Tuple[str, ...]:
     """The release-calendar sources a market's rules tie it to: a statewide
     BLS series -> the State release and the Employment Situation; a metro one
-    adds the Metropolitan release; BLS QCEW -> its quarterly release."""
+    adds the Metropolitan release; BLS QCEW -> its quarterly release; a state
+    statistic from USDA NASS, EIA, Census or FHFA -> that agency's report
+    (_AGENCY_RELEASE_RULES)."""
     out: List[str] = []
     for st, area in _BLS_SM_RE.findall(text or ""):
         if st == "00":
@@ -2472,6 +2513,9 @@ def release_sources_from_rules(text: str) -> Tuple[str, ...]:
     elif not out and _BLS_TEXT_RE.search(text or "") and _BLS_EMPLOY_RE.search(text) \
             and _US_STATE_RE.search(text):
         out += ["bls_state", "bls_empsit"]
+    if _SUBNATIONAL_RE.search(text or ""):
+        out += [src for src, agency, words in _AGENCY_RELEASE_RULES
+                if (agency is None or agency.search(text)) and words.search(text)]
     return tuple(dict.fromkeys(out))
 
 
@@ -30990,6 +31034,8 @@ class IncentiveMarketMaker:
                 f"each release on {os.path.basename(RELEASE_CALENDAR_FILE)} ("
                 + ("; ".join(f"{k} to {v[1][-1].astimezone(ET):%Y-%m-%d}" for k, v in _cal.items() if v[1])
                    or "no dates")
+                + ("; no dates yet: " + ", ".join(k for k, v in _cal.items() if not v[1])
+                   if any(not v[1] for v in _cal.values()) else "")
                 + (f"; next {_nxt[0][1]} {_nxt[0][0].astimezone(ET):%m-%d %H:%M} ET" if _nxt else "")
                 + "); series map from their market rules as they load")
         else:

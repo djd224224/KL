@@ -10924,3 +10924,32 @@ Deploy: incentive_mm.py change, so the sync's code-change restart. Check the sta
   - neither -> YOUR CALL.
 - The dark email is 4 lines an item. Needs is folded into Now, the Calls line is gone (the subject has the tally),
   and items sort by call.
+
+## 2026-10-22 ~20:30Z — release pause covers the USDA, EIA, Census and FHFA state series (Jack: "Can you not map these?")
+
+- release_sources_from_rules maps a state statistic from the other agencies too (_AGENCY_RELEASE_RULES): the agency
+  the rules name + the report's own words + a state, CBSA or shale formation (_SUBNATIONAL_RE). National prints are
+  left out.
+  - USDA NASS: nass_crop (corn / cotton / potato / wheat / maple syrup; Crop Production, noon), nass_cof (Cattle on
+    Feed, 3 PM), nass_cattle (January Cattle), nass_milk (Milk Production, 3 PM), nass_poultry (broilers),
+    nass_catfish.
+  - EIA: eia_epm (Electric Power Monthly: nuclear generation, retail price), eia_psm (crude oil field production,
+    also KXAKCRUDEOIL whose rules name no agency), eia_ngm (marketed gas), eia_steo (KXMARCELLUSGAS's shale
+    series), eia_qcr (Quarterly Coal Report).
+  - Census: census_bps (New Residential Construction 08:30 + Revised Building Permits 08:00 + the May annual),
+    census_popest (KXWVPOP). FHFA: fhfa_hpi (09:00).
+  - Of the 128 state series, 63 now map (41 new). KXEIACRUDEW stays out: its weekly U.S. crude markets settle at
+    the release, and its -$47 of fills over the past month came a day or two before one.
+- Why: NASS's 10/09 noon Crop Production took 24 crop-book fills inside the 8 h / 24 h window, -$85 to date (20 of
+  them in the two hours after noon); the 10/22 3 PM Milk Production took 5 fills on the Wisconsin / Vermont asks
+  14:33-15:06 ET, -$14.
+- Dates in release_calendar.json, from each agency's page; 2027 NASS Crop Production / Cattle on Feed from OMB's
+  2027 PFEI schedule. PSM / NGM follow EIA's stated rule (last business day of the month); EIA posts the day,
+  not the hour, so they carry 10:00.
+- No dates yet (mapped, pause nothing, a daily "has no dates" log warning): nass_cattle (late January),
+  nass_poultry (late April), nass_catfish, eia_qcr (EIA: TBD), census_popest ("December 2026"). Ending soon:
+  eia_epm (EIA posts only the next one; 10/23), nass_milk (12/22; NASS 2027 calendar not posted).
+- The ~30 tourism / port / airport / state-agency series have no published schedules (press releases); their
+  fills over the past month show no release-day cluster: ports -$27, airports -$4, tourism -$25.
+Deploy: incentive_mm.py change, so the sync's code-change restart. Check the startup line "release pause
+(2026-10-22): ... no dates yet: ..." and the "[IMM] release pause: <series> -> <sources>" lines.

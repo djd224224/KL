@@ -31190,6 +31190,77 @@ class TestReleasePause(unittest.TestCase):
         self.assertEqual(again, good)
         self.assertIn("unreadable", lg.call_args.args[0])
 
+    def test_agency_reports_map_from_their_rules(self):   # Jack 10/22: "Can you not map these?"
+        f = imm.release_sources_from_rules
+        cases = {   # the series' own rules wording
+            "If USDA NASS reports that Iowa's corn for grain production for 2026 is above":
+                ("nass_crop",),
+            "If USDA NASS reports that Idaho's potato production for 2026 is above 138.38 million cwt":
+                ("nass_crop",),
+            "If USDA NASS reports that New Hampshire's maple syrup production in 2027 is above":
+                ("nass_crop",),
+            "Nebraska's Cattle on Feed Inventory on 1,000+ Capacity Feedlots as reported in USDA "
+            "NASS's December 2026 Cattle on Feed report": ("nass_cof",),
+            # KXMTCATTLE names cattle on feed only to leave it out
+            "USDA NASS's Cattle, Including Calves - Inventory estimate for Montana as of January 1, "
+            "2027. This includes all cattle and calves and is not limited to beef cows, dairy cows, "
+            "or cattle on feed.": ("nass_cattle",),
+            "Vermont's total milk production for calendar year 2026, as reported by USDA NASS in its "
+            "Milk Production, Disposition, and Income annual report": ("nass_milk",),
+            "If USDA NASS reports that Arkansas broiler production for 2026 is above":
+                ("nass_poultry",),
+            "the Mississippi Foodsize Live Weight Total figure in USDA NASS's Catfish Production report":
+                ("nass_catfish",),
+            "If EIA reports that Illinois utility-scale net electricity generation from nuclear energy":
+                ("eia_epm",),
+            "Rhode Island's Residential value in EIA Electric Power Monthly Table 5.6.B": ("eia_epm",),
+            "If EIA reports that North Dakota's field production of crude oil for calendar year 2026":
+                ("eia_psm",),
+            "If Alaska's total crude oil field production in calendar year 2026 is above":
+                ("eia_psm",),                                       # KXAKCRUDEOIL: no agency named
+            "EIA's Pennsylvania Natural Gas Marketed Production statistic": ("eia_ngm",),
+            "EIA's Marcellus formation dry natural gas production series. EIA publishes the relevant "
+            "shale-production series through its STEO data products.": ("eia_steo",),
+            "the West Virginia Total in Table 2, Coal Production by State, of the first EIA Quarterly "
+            "Coal Report": ("eia_qcr",),
+            "housing units authorized by building permits in the Bozeman, MT CBSA in the Census "
+            "Building Permits Survey": ("census_bps",),
+            "If California's total number of new privately owned housing units authorized by "
+            "building permits ... the first U.S. Census Bureau state-level release": ("census_bps",),
+            "the Vintage 2026 July 1, 2026 resident population estimate for West Virginia published "
+            "by the U.S. Census Bureau Population Estimates Program": ("census_popest",),
+            "the index_sa value for California (CA), year 2026, quarter 4, in the Federal Housing "
+            "Finance Agency's quarterly state Purchase-Only House Price Index dataset": ("fhfa_hpi",),
+        }
+        for text, want in cases.items():
+            self.assertEqual(f(text), want, text)
+        # national prints are not state statistics (KXEIACRUDEW settles at its weekly release)
+        self.assertEqual(f("If U.S. commercial crude oil inventories for the week ending Oct 23, "
+                           "2026 ... reported by the U.S. Energy Information Administration (EIA)"), ())
+        self.assertEqual(f("If USDA NASS reports that U.S. corn for grain production for 2026"), ())
+        self.assertEqual(f("the BLS Quarterly Census of Employment and Wages data for Kentucky"),
+                         ("bls_qcew",))                                  # QCEW is not a Census report
+
+    def test_a_source_without_dates_pauses_nothing(self):
+        imm.note_release_sources("KXSDCATTLE", {"rules_secondary": (
+            "USDA NASS's Cattle, Including Calves - Inventory estimate for South Dakota")})
+        self.assertEqual(imm._SERIES_RELEASE_SOURCES["KXSDCATTLE"], ("nass_cattle",))
+        with mock.patch.object(imm, "log") as lg:
+            self.assertIsNone(imm.series_release_window("KXSDCATTLE", self._utc(2027, 1, 29, 15, 0)))
+        self.assertTrue(any("nass_cattle has no dates" in c.args[0] for c in lg.call_args_list))
+
+    def test_the_shipped_calendar_has_every_source(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(imm.__file__)), "release_calendar.json")
+        with open(path, encoding="utf-8") as fh:
+            srcs = json.load(fh)["sources"]
+        want = ({"bls_state", "bls_metro", "bls_qcew", "bls_empsit"}
+                | {s for s, _agency, _words in imm._AGENCY_RELEASE_RULES})
+        self.assertEqual(want - set(srcs), set())
+        for key, rec in srcs.items():
+            self.assertTrue(rec.get("name"), key)
+            for s in rec["times_et"]:
+                datetime.strptime(s, "%Y-%m-%d %H:%M")
+
 
 if __name__ == "__main__":
     unittest.main()

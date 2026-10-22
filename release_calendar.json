@@ -1,5 +1,5 @@
 {
-  "_comment": "Scheduled data releases for incentive_mm's release pause (Jack 2026-10-22: 'Can you pause state statistics around monthly releases'). Times are ET, 'YYYY-MM-DD HH:MM'. A market whose rules cite a source here stands aside from IMM_RELEASE_PAUSE_BEFORE_MIN before to IMM_RELEASE_PAUSE_AFTER_MIN after each time. The bot re-reads this file when it changes (no restart). BLS posts a year's State and Metro dates late in the year before; past state dates are from the archive (bls.gov/bls/news-release/laus.htm, laus_MMDDYYYY files). Add dates as they are published: the bot logs a warning each day once a source's dates end within IMM_RELEASE_CALENDAR_WARN_DAYS.",
+  "_comment": "Scheduled data releases for incentive_mm's release pause (Jack 2026-10-22: 'Can you pause state statistics around monthly releases', then 'Can you not map these?' for the USDA, EIA, Census and FHFA series). Times are ET, 'YYYY-MM-DD HH:MM'. A market whose rules cite a source here stands aside from IMM_RELEASE_PAUSE_BEFORE_MIN before to IMM_RELEASE_PAUSE_AFTER_MIN after each time. The bot re-reads this file when it changes (no restart). Agencies post next year's dates late in the year (BLS, NASS) or only the next release (EIA's Electric Power Monthly, Quarterly Coal Report; Census population): add dates as they are published. The bot logs a warning each day once a source's dates end within IMM_RELEASE_CALENDAR_WARN_DAYS; a source with no dates maps its series but pauses nothing. Past BLS state dates are from the archive (bls.gov/bls/news-release/laus.htm, laus_MMDDYYYY files). 2027 NASS Crop Production / Cattle on Feed and Census New Residential Construction / BLS Employment Situation dates are on OMB's 2027 Principal Federal Economic Indicators schedule (whitehouse.gov/wp-content/uploads/2026/10/FY2027-PFEI.pdf). EIA posts the day of its monthly reports, not the hour: those carry 10:00.",
   "sources": {
     "bls_state": {
       "name": "BLS State Employment and Unemployment",
@@ -23,6 +23,115 @@
                    "2027-01-08 08:30", "2027-02-05 08:30", "2027-03-05 08:30", "2027-04-02 08:30",
                    "2027-05-07 08:30", "2027-06-04 08:30", "2027-07-02 08:30", "2027-08-06 08:30",
                    "2027-09-03 08:30", "2027-10-08 08:30", "2027-11-05 08:30", "2027-12-03 08:30"]
+    },
+    "nass_crop": {
+      "name": "USDA NASS Crop Production",
+      "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
+      "note": "corn / cotton / potato / wheat forecasts by state Aug-Nov, the Annual Summary in January, maple syrup in June",
+      "times_et": ["2026-09-11 12:00", "2026-10-09 12:00", "2026-11-10 12:00", "2026-12-10 12:00",
+                   "2027-01-12 12:00", "2027-02-10 12:00", "2027-03-10 12:00", "2027-04-09 12:00",
+                   "2027-05-12 12:00", "2027-06-11 12:00", "2027-07-09 12:00", "2027-08-12 12:00",
+                   "2027-09-10 12:00", "2027-10-08 12:00", "2027-11-10 12:00", "2027-12-10 12:00"]
+    },
+    "nass_cof": {
+      "name": "USDA NASS Cattle on Feed",
+      "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
+      "times_et": ["2026-09-18 15:00", "2026-10-23 15:00", "2026-11-20 15:00", "2026-12-18 15:00",
+                   "2027-01-22 15:00", "2027-02-19 15:00", "2027-03-19 15:00", "2027-04-23 15:00",
+                   "2027-05-21 15:00", "2027-06-17 15:00", "2027-07-23 15:00", "2027-08-20 15:00",
+                   "2027-09-17 15:00", "2027-10-22 15:00", "2027-11-19 15:00", "2027-12-17 15:00"]
+    },
+    "nass_milk": {
+      "name": "USDA NASS Milk Production",
+      "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
+      "note": "monthly, 24 states; add the 2027 dates when NASS posts its 2027 calendar, and the Milk Production, Disposition, and Income annual (late April, KXVTMILK settles on it)",
+      "times_et": ["2026-09-22 15:00", "2026-10-22 15:00", "2026-11-20 15:00", "2026-12-22 15:00"]
+    },
+    "nass_cattle": {
+      "name": "USDA NASS Cattle (January 1 inventory)",
+      "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
+      "note": "late January; not on NASS's calendar yet",
+      "times_et": []
+    },
+    "nass_poultry": {
+      "name": "USDA NASS Poultry - Production and Value",
+      "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
+      "note": "annual summary, late April; not on NASS's calendar yet",
+      "times_et": []
+    },
+    "nass_catfish": {
+      "name": "USDA NASS Catfish Production",
+      "url": "https://www.nass.usda.gov/Publications/Calendar/reports_by_date.php",
+      "note": "annual; not on NASS's calendar yet",
+      "times_et": []
+    },
+    "eia_epm": {
+      "name": "EIA Electric Power Monthly",
+      "url": "https://www.eia.gov/electricity/monthly/",
+      "note": "the last week of the month; EIA posts only the next date",
+      "times_et": ["2026-09-24 10:00", "2026-10-23 10:00"]
+    },
+    "eia_psm": {
+      "name": "EIA Petroleum Supply Monthly",
+      "url": "https://www.eia.gov/petroleum/supply/monthly/",
+      "note": "EIA's rule: the last business day of the month (10/30 posted; Kalshi dates the 2026 annual markets 27FEB26)",
+      "times_et": ["2026-10-30 10:00", "2026-11-30 10:00", "2026-12-31 10:00",
+                   "2027-01-29 10:00", "2027-02-26 10:00", "2027-03-31 10:00", "2027-04-30 10:00",
+                   "2027-05-28 10:00", "2027-06-30 10:00", "2027-07-30 10:00", "2027-08-31 10:00",
+                   "2027-09-30 10:00", "2027-10-29 10:00", "2027-11-30 10:00", "2027-12-30 10:00"]
+    },
+    "eia_ngm": {
+      "name": "EIA Natural Gas Monthly",
+      "url": "https://www.eia.gov/naturalgas/monthly/",
+      "note": "EIA's rule: the last business day of the month (10/30 posted)",
+      "times_et": ["2026-10-30 10:00", "2026-11-30 10:00", "2026-12-31 10:00",
+                   "2027-01-29 10:00", "2027-02-26 10:00", "2027-03-31 10:00", "2027-04-30 10:00",
+                   "2027-05-28 10:00", "2027-06-30 10:00", "2027-07-30 10:00", "2027-08-31 10:00",
+                   "2027-09-30 10:00", "2027-10-29 10:00", "2027-11-30 10:00", "2027-12-30 10:00"]
+    },
+    "eia_steo": {
+      "name": "EIA Short-Term Energy Outlook",
+      "url": "https://www.eia.gov/outlooks/steo/release_schedule.php",
+      "note": "carries the shale-play production series (KXMARCELLUSGAS)",
+      "times_et": ["2026-10-06 12:00", "2026-11-10 12:00", "2026-12-08 12:00",
+                   "2027-01-12 12:00", "2027-02-09 12:00", "2027-03-09 12:00", "2027-04-06 12:00",
+                   "2027-05-11 12:00", "2027-06-08 12:00", "2027-07-07 12:00", "2027-08-10 12:00",
+                   "2027-09-08 12:00", "2027-10-13 12:00", "2027-11-09 12:00", "2027-12-07 12:00"]
+    },
+    "eia_qcr": {
+      "name": "EIA Quarterly Coal Report",
+      "url": "https://www.eia.gov/coal/production/quarterly/",
+      "note": "next release TBD on EIA's page (10/01 carried Q2; Q3 due about January, Q4 about April)",
+      "times_et": []
+    },
+    "census_bps": {
+      "name": "Census Building Permits",
+      "url": "https://www.census.gov/construction/bps/schedule.html",
+      "note": "08:30 New Residential Construction (U.S. and regions), 08:00 Revised Building Permits (states, metros) five workdays later, and the annual release on the first workday of May",
+      "times_et": ["2026-10-20 08:30", "2026-10-27 08:00", "2026-11-18 08:30", "2026-11-25 08:00",
+                   "2026-12-17 08:30", "2026-12-23 08:00",
+                   "2027-01-20 08:30", "2027-01-27 08:00", "2027-02-18 08:30", "2027-02-24 08:00",
+                   "2027-03-17 08:30", "2027-03-23 08:00", "2027-04-20 08:30", "2027-04-23 08:00",
+                   "2027-05-03 08:00", "2027-05-18 08:30", "2027-05-25 08:00",
+                   "2027-06-17 08:30", "2027-06-24 08:00", "2027-07-20 08:30", "2027-07-26 08:00",
+                   "2027-08-17 08:30", "2027-08-24 08:00", "2027-09-21 08:30", "2027-09-24 08:00",
+                   "2027-10-19 08:30", "2027-10-26 08:00", "2027-11-17 08:30", "2027-11-24 08:00",
+                   "2027-12-16 08:30", "2027-12-22 08:00"]
+    },
+    "census_popest": {
+      "name": "Census Vintage state population estimates",
+      "url": "https://www.census.gov/programs-surveys/popest/about/schedule.html",
+      "note": "Vintage 2026 national and state totals: 'December 2026', day not posted yet",
+      "times_et": []
+    },
+    "fhfa_hpi": {
+      "name": "FHFA House Price Index",
+      "url": "https://www.fhfa.gov/data/hpi",
+      "note": "state purchase-only indexes in the quarterly releases (11/24, 2/23, ...); the monthly ones carry census divisions",
+      "times_et": ["2026-10-27 09:00", "2026-11-24 09:00", "2026-12-29 09:00",
+                   "2027-01-26 09:00", "2027-02-23 09:00", "2027-03-30 09:00", "2027-04-27 09:00",
+                   "2027-05-25 09:00", "2027-06-29 09:00", "2027-07-27 09:00", "2027-08-31 09:00",
+                   "2027-09-28 09:00", "2027-10-26 09:00", "2027-11-30 09:00", "2027-12-28 09:00"]
     }
   }
 }
