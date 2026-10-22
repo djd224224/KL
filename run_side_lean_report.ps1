@@ -1,6 +1,8 @@
-# Launcher for the one-time family side leans report (Jack 2026-10-22: "Both
-# leans now but 1.5x the winning side and .75 the losing side. And send me
-# email on its performance"), Task Scheduler "KL side-lean-report", once at
+# Launcher for the one-time side-sizing tests report -- the family side leans
+# and the event long-shot cut (Jack 2026-10-22: "Both leans now but 1.5x the
+# winning side and .75 the losing side. And send me email on its
+# performance", then "1, and give me email report"), Task Scheduler
+# "KL side-lean-report", once at
 # 8:15 AM ET Thu 2026-11-05 (two weeks of the leans, after the Trump B report
 # at 8:00), through run_side_lean_report_hidden.vbs so no console window shows.
 #
@@ -26,7 +28,7 @@ $Repo = "C:\Users\jackd\Documents\KL"
 $Python = "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe"
 $UserSite = "C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages"
 $TaskName = "KL side-lean-report"
-$Subject = "IMM family side leans (1.5x winning side, 0.75x losing): 2-week report"
+$Subject = "IMM side tests (family leans + long-shot cut): 2-week report"
 
 $LogDir = Join-Path $Repo "run-logs\side-lean-report"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
@@ -68,10 +70,11 @@ if ($code -ne 0 -or -not $md -or -not (Test-Path $md)) {
     Send-Failure "imm_side_lean_report.py exited $code without a report"
     exit 1
 }
-# the verdicts (first line "# IMM family side leans: ASK KEEP, BID WATCH") lead the subject
+# the verdicts (first line "# IMM side tests: ASK lean KEEP, BID lean WATCH,
+# long-shot cut KEEP") lead the subject
 $first = (Get-Content -Path $md -TotalCount 1)
-if ($first -match 'ASK (KEEP|STOP|WATCH), BID (KEEP|STOP|WATCH)') {
-    $Subject = "IMM side leans: ASK lean $($Matches[1]), BID lean $($Matches[2]) (2 weeks)"
+if ($first -match 'ASK lean (KEEP|STOP|WATCH), BID lean (KEEP|STOP|WATCH), long-shot cut (KEEP|STOP|WATCH)') {
+    $Subject = "IMM side tests: ASK lean $($Matches[1]), BID lean $($Matches[2]), long-shot cut $($Matches[3]) (2 weeks)"
 }
 $html = [System.IO.Path]::ChangeExtension($md, ".html")
 & $Python (Join-Path $Repo "md_report_email.py") $html $Subject $md 2>&1 |
