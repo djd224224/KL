@@ -11,8 +11,10 @@ CC BY 4.0 (c) 2026 Vercel):
       all 19 numeric settlements reproduce exactly from dataset=labs,
       modality=all)
   KXOPENSOURCESHARE   the open-weights share of TOKENS on D (ticker YYMMMDD =
-      D+1, close 14:00Z D+1; reconstructed as the summed token share of the
-      open-weight-only labs, within 0.6 pp of the settled values)
+      D+1, close 14:00Z D+1; read since 2026-10-22 straight off Vercel's
+      weight-class chart, the number the rules name -- see OPEN_SOURCE --
+      with the summed token share of the open-weight-only labs, within
+      ~1 pp of the chart before Reflection's Beam, as the fallback)
 The export shows the RUNNING day D live, and the informed flow trades D off
 it (makers lost ~8c/contract during D), so the bot quotes these ONLY BEFORE
 D: incentive_mm cuts every market at D 00:00Z - IMM_VERCEL_CUTOFF_BEFORE_D_MIN.
@@ -77,7 +79,8 @@ OPEN_WIDEN 1.0 -> 1.5 with it: at 1.0 the open-weights 5-95% band missed
 and dropped: comparable Brier, but 95th percentiles of 50-88% share.
 
 Reads: the 100-day history (~2 MB) once per HISTORY_REFRESH_SECS and at
-each new UTC day, plus a fresh yesterday + today read (~40 KB) every refresh.
+each new UTC day, plus a fresh yesterday + today read (~40 KB) every refresh;
+the weight-class chart the same way (~25 KB, then ~1 KB).
 
 Writes VERCEL_FAIR_FILE: per EVENT ticker (D = today+1 .. today+HORIZON_DAYS,
 4 since 2026-10-05: programs post ~3.3 days before D) the series, D, the
@@ -119,6 +122,25 @@ OPEN_WEIGHT_LABS = ("deepseek", "zai", "moonshotai", "stepfun", "xiaomi", "minim
                     "alibaba", "inclusionai", "nvidia", "tencent", "meituan", "arcee-ai",
                     "baseten", "reflection")
 ALL_SERIES = tuple(LAB_SERIES) + (OPEN_SERIES,)
+# KXOPENSOURCESHARE's own number (Jack 2026-10-22: pasted the meta model-
+# coverage gap, "QUOTE WITH CARE -- ... make the fix, or block it until
+# then"). The rules settle on "the Open Weights percentage in Vercel AI
+# Gateway's Open vs. Closed Token Volume chart", and the leaderboard page
+# reads that chart from WEIGHT_CLASS_URL: per UTC day, the running day
+# included, the open and closed shares of tokens by each model's weight
+# class. The lab sum cannot count a mixed lab (meta's Llama, openai's
+# gpt-oss, google's Gemma) and lags a reclassification (Reflection's Beam ran
+# it ~9 pp low by 10/21); even with reflection in it read 1.5-1.8 pp under
+# the chart on 10/20-22. The chart's 10/20 is 68.34; Kalshi settled 68.3.
+# OPEN_SOURCE "chart" (the default) prices the open series off it, history
+# and running anchor alike, all or nothing per refresh, with the lab sum as
+# the fallback when the chart cannot be read; "labs" restores the lab sum.
+# The running-to-final deltas stay the logger's lab sums (the logger keeps
+# the lab export only).
+WEIGHT_CLASS_URL = "https://vercel.com/api/ai/v5/gateway-model-leaderboard"
+OPEN_SOURCE = os.environ.get("IMM_VERCEL_OPEN_SOURCE", "chart")
+CHART_KEY = ("(weight-class chart)", "tokens")       # its fetch_table entry
+_chart_state: dict = {"source": "labs"}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -250,35 +272,101 @@ def fetch_labs(now: Optional[datetime] = None, timeout: float = 30,
     return tab
 
 
-_hist: dict = {"day": None, "at": 0.0, "tab": None}
+def fetch_weight_class(now: Optional[datetime] = None, timeout: float = 30,
+                       days_back: Optional[int] = None) -> Dict[str, float]:
+    """{date: Open Weights % of TOKENS} from Vercel's weight-class chart over
+    fetch_labs' window, today's RUNNING day included (served max-age=0, so
+    no cache-busting `to` is needed)."""
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    back = max(HISTORY_DAYS, SEASON_DAYS) + 10 if days_back is None else days_back
+    r = requests.get(WEIGHT_CLASS_URL, params={
+        "groupBy": "weightClass", "from": (today - timedelta(days=back)).isoformat(),
+        "to": today.isoformat()}, headers=UA, timeout=timeout)
+    r.raise_for_status()
+    body = r.json()
+    out: Dict[str, float] = {}
+    for x in (body.get("data") if isinstance(body, dict) else body) or []:
+        if not isinstance(x, dict) or x.get("metric") != "tokens":
+            continue
+        try:
+            v = {str(k): float(s) for k, s in x["chef_values"]}
+            out[str(x["day"])[:10]] = 100.0 * v["Open Weights"] / (
+                v["Open Weights"] + v["Closed Weights"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+    if not out:
+        raise RuntimeError("Vercel weight-class chart returned no token rows")
+    return out
+
+
+_hist: dict = {"day": None, "at": 0.0, "tab": None, "chart": None}
 
 
 def fetch_table(now: Optional[datetime] = None, timeout: float = 30
                 ) -> Dict[Tuple[str, str], Dict[str, float]]:
     """The history (re-read at each new UTC day and every
     HISTORY_REFRESH_SECS) with today's block replaced by a fresh
-    yesterday + today read."""
+    yesterday + today read; the weight-class chart under CHART_KEY."""
     now = now or datetime.now(timezone.utc)
     today = now.date()
     if _hist["tab"] is None or _hist["day"] != today \
             or time.time() - _hist["at"] > HISTORY_REFRESH_SECS:
         tab = fetch_labs(now, timeout)
-        _hist.update(tab=tab, day=today, at=time.time())
-        return {k: dict(v) for k, v in tab.items()}
-    fresh = fetch_labs(now, timeout, days_back=1)
-    t_iso = today.isoformat()
-    out = {k: {d: x for d, x in v.items() if d != t_iso} for k, v in _hist["tab"].items()}
-    for k, v in fresh.items():
-        out.setdefault(k, {}).update(v)
+        _hist.update(tab=tab, day=today, at=time.time(), chart=None)
+        out = {k: dict(v) for k, v in tab.items()}
+    else:
+        fresh = fetch_labs(now, timeout, days_back=1)
+        t_iso = today.isoformat()
+        out = {k: {d: x for d, x in v.items() if d != t_iso} for k, v in _hist["tab"].items()}
+        for k, v in fresh.items():
+            out.setdefault(k, {}).update(v)
+    _add_chart(out, now, timeout)
     return out
+
+
+def _add_chart(out: dict, now: datetime, timeout: float) -> None:
+    """The weight-class chart into `out` under CHART_KEY: its full window once
+    per history read, then a fresh yesterday + today over it. A failed read
+    leaves the key out, so the open series falls back to the lab sum for that
+    refresh (never a chart history beside a lab-sum running day)."""
+    if OPEN_SOURCE != "chart":
+        _chart_state["source"] = "labs"
+        return
+    try:
+        if _hist["chart"] is None:
+            _hist["chart"] = fetch_weight_class(now, timeout)
+            chart = dict(_hist["chart"])
+        else:
+            t_iso = now.date().isoformat()
+            chart = {d: v for d, v in _hist["chart"].items() if d != t_iso}
+            chart.update(fetch_weight_class(now, timeout, days_back=1))
+    except Exception as e:                        # noqa: BLE001 - the lab sum stands in
+        _chart_state["source"] = f"labs (chart unreadable: {type(e).__name__})"
+        return
+    out[CHART_KEY] = chart
+    _chart_state["source"] = "chart"
 
 
 def series_values(tab, series: str, dates: List[str]) -> Dict[str, float]:
     if series in LAB_SERIES:
         v = tab.get(LAB_SERIES[series], {})
         return {d: v.get(d, 0.0) for d in dates}
+    if open_source_of(tab, dates) == "chart":
+        return {d: tab[CHART_KEY][d] for d in dates}
     return {d: sum(tab.get((lab, "tokens"), {}).get(d, 0.0) for lab in OPEN_WEIGHT_LABS)
             for d in dates}
+
+
+def open_source_of(tab, dates: List[str]) -> str:
+    """What series_values reads for the open series on `dates`: "chart" when
+    the chart has every one of them, else the lab sum and why."""
+    chart = tab.get(CHART_KEY)
+    if chart:
+        miss = sum(1 for d in dates if d not in chart)
+        return "chart" if not miss else f"labs (the chart lacks {miss} of the days)"
+    src = _chart_state["source"]
+    return src if src.startswith("labs (") else "labs"
 
 
 def block_usable(rows: int, ref_rows: int) -> bool:
@@ -581,12 +669,13 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
     today = now.date()
     last = today - timedelta(days=1)          # latest COMPLETE UTC day
     t_iso, l_iso = today.isoformat(), last.isoformat()
-    dates = sorted({d for v in tab.values() for d in v if d <= l_iso})
+    labs = {k: v for k, v in tab.items() if k != CHART_KEY}     # the export's rows
+    dates = sorted({d for v in labs.values() for d in v if d <= l_iso})
     tau = now.hour * 60 + now.minute + now.second / 60.0
     use_run = RUN_ANCHOR and tau >= RUN_START_MIN
     mode = "run" if use_run else "complete"
-    n_today = sum(1 for v in tab.values() if t_iso in v)
-    n_last = sum(1 for v in tab.values() if l_iso in v)
+    n_today = sum(1 for v in labs.values() if t_iso in v)
+    n_last = sum(1 for v in labs.values() if l_iso in v)
     deltas: Dict[str, List[float]] = {}
     if use_run:
         if not block_usable(n_today, n_last):
@@ -598,10 +687,12 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
             if not any(len(v) >= RUN_MIN_DAYS for v in deltas.values()):
                 mode = "fail:calib"
     entries, missing = {}, 0
+    want = dates + ([t_iso] if mode == "run" else [])    # one source per series
     for s in ALL_SERIES:
-        x = series_values(tab, s, dates)
+        xv = series_values(tab, s, want)
+        x = {d: xv[d] for d in dates}
         widen = OPEN_WIDEN if s == OPEN_SERIES else LAB_WIDEN
-        run_val = series_values(tab, s, [t_iso])[t_iso] if mode == "run" else None
+        run_val = xv[t_iso] if mode == "run" else None
         got = 0
         for k in range(1, HORIZON_DAYS + 1):
             d = today + timedelta(days=k)
@@ -632,6 +723,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
                       "mr_series": sorted(MR_SERIES), "mr_trail_days": MR_TRAIL_DAYS,
                       "sqrt_series": sorted(SQRT_SERIES)},
             "anchor": {"mode": mode, "tau_min": round(tau, 1),
+                       "open_source": open_source_of(tab, want),
                        "rows_today": n_today, "rows_last": n_last,
                        "calib_days": sorted(calib) if calib else [],
                        "delta_n": {s: len(v) for s, v in deltas.items()}},

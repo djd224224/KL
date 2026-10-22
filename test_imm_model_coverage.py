@@ -30,8 +30,10 @@ class TestCoverage(unittest.TestCase):
         self.now = time.time()
         self.rain = os.path.join(self.dir, "rain_fair_values.json")
         self.ca = os.path.join(self.dir, "carbon_arc_fair.json")
+        self.vercel = os.path.join(self.dir, "vercel_fair.json")       # absent: lab sum
         p = [mock.patch.object(imm, "RAIN_FAIR_FILE", self.rain),
-             mock.patch.object(imm, "CA_FAIR_FILE", self.ca)]
+             mock.patch.object(imm, "CA_FAIR_FILE", self.ca),
+             mock.patch.object(imm, "VERCEL_FAIR_FILE", self.vercel)]
         for x in p:
             x.start()
             self.addCleanup(x.stop)
@@ -183,6 +185,26 @@ class TestCoverage(unittest.TestCase):
         self.assertIn(f"{fam}|openlab (>= 0.5% of tokens)", sent)
         self.assertNotIn(f"{fam}|openlab", sent)
         self.assertIn(f"{fam}|openlab", st)                               # still remembered
+
+    def test_vercel_labs_are_quiet_while_the_fair_reads_the_chart(self):
+        # 2026-10-22 (the meta gap): KXOPENSOURCESHARE priced off Vercel's
+        # weight-class chart has no lab list to keep; on the lab sum it reports
+        import vercel_fair as vf
+        d = os.path.join(self.dir, "vercel")
+        os.makedirs(d)
+        with open(os.path.join(d, "export_2026-10-22.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"labs": {"2026-10-22": {
+                "deepseek|tokens": 31.0, "meta|tokens": 0.86}}}) + "\n")
+        progs = {f"{vf.OPEN_SERIES}-26OCT25-T69.1": {}}
+        gw = {"meta": {"open": ["meta/llama-3.3-70b"], "n": 14}}
+        for src, want in (("chart", []), ("labs (chart unreadable: Timeout)",
+                                          ["Vercel open-weight labs (vercel_fair)|meta "
+                                           "(>= 0.5% of tokens)"])):
+            _write(self.vercel, {"anchor": {"mode": "run", "open_source": src}})
+            with mock.patch.object(vf, "INTRADAY_DIR", d), \
+                    mock.patch.object(mc, "_gateway_weights", return_value=gw):
+                gaps = mc.find_gaps(progs, self.now, [mc.check_vercel_labs])
+            self.assertEqual(sorted(gaps), want, src)
 
     def test_by_design_gaps_are_baselined_on_day_one_and_remembered(self):
         once = mc._gap("YT", "ARI", ["X-1"], "closed", "pilot", "admit")

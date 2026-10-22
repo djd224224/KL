@@ -456,29 +456,139 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
 
 
 class TestFetchTable(unittest.TestCase):
+    def setUp(self):
+        vf._hist.update(day=None, at=0.0, tab=None, chart=None)
+        self.addCleanup(vf._hist.update, day=None, at=0.0, tab=None, chart=None)
+        self.addCleanup(vf._chart_state.update, source="labs")
+
     def test_history_once_a_day_then_a_short_fresh_read(self):
-        vf._hist.update(day=None, at=0.0, tab=None)
         now = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)
         long_tab = {("openai", "requests"): {"2026-09-26": 20.0, "2026-09-27": 25.0},
                     ("zai", "tokens"): {"2026-09-27": 3.0}}
         short_tab = {("openai", "requests"): {"2026-09-26": 20.0, "2026-09-27": 26.0}}
-        calls = []
+        calls, chart_calls = [], []
 
         def fake(now_, timeout=30, days_back=None):
             calls.append(days_back)
             return long_tab if days_back is None else short_tab
-        with mock.patch.object(vf, "fetch_labs", side_effect=fake):
+
+        def fake_chart(now_, timeout=30, days_back=None):
+            chart_calls.append(days_back)
+            return ({"2026-09-26": 60.0, "2026-09-27": 61.0} if days_back is None
+                    else {"2026-09-26": 60.5, "2026-09-27": 62.0})
+        with mock.patch.object(vf, "fetch_labs", side_effect=fake), \
+                mock.patch.object(vf, "fetch_weight_class", side_effect=fake_chart):
             t1 = vf.fetch_table(now)
             t2 = vf.fetch_table(now)
             vf._hist["at"] -= vf.HISTORY_REFRESH_SECS + 1
             vf.fetch_table(now)
             vf.fetch_table(now + timedelta(days=1))
         self.assertEqual(calls, [None, 1, None, None])
+        self.assertEqual(chart_calls, [None, 1, None, None])     # the chart in step
         self.assertEqual(t1[("openai", "requests")]["2026-09-27"], 25.0)
         self.assertEqual(t2[("openai", "requests")]["2026-09-27"], 26.0)
         # today's block is exactly the fresh read's: a lab missing from it is gone
         self.assertNotIn("2026-09-27", t2[("zai", "tokens")])
-        vf._hist.update(day=None, at=0.0, tab=None)
+        self.assertEqual(t1[vf.CHART_KEY], {"2026-09-26": 60.0, "2026-09-27": 61.0})
+        self.assertEqual(t2[vf.CHART_KEY], {"2026-09-26": 60.5, "2026-09-27": 62.0})
+
+    def test_an_unreadable_chart_leaves_the_lab_sum(self):
+        # Jack 2026-10-22 (the meta coverage gap): the chart is the default
+        # source; a failed read drops it for the whole refresh
+        now = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)
+        labs = {("zai", "tokens"): {"2026-09-26": 3.0, "2026-09-27": 4.0}}
+        with mock.patch.object(vf, "fetch_labs", return_value=labs), \
+                mock.patch.object(vf, "fetch_weight_class", side_effect=RuntimeError("down")):
+            tab = vf.fetch_table(now)
+        self.assertNotIn(vf.CHART_KEY, tab)
+        self.assertEqual(vf._chart_state["source"], "labs (chart unreadable: RuntimeError)")
+        self.assertEqual(vf.open_source_of(tab, ["2026-09-26"]),
+                         "labs (chart unreadable: RuntimeError)")
+        self.assertEqual(vf.series_values(tab, vf.OPEN_SERIES, ["2026-09-26"]),
+                         {"2026-09-26": 3.0})
+        # IMM_VERCEL_OPEN_SOURCE=labs: no chart read at all
+        with mock.patch.object(vf, "OPEN_SOURCE", "labs"), \
+                mock.patch.object(vf, "fetch_labs", return_value=labs), \
+                mock.patch.object(vf, "fetch_weight_class", side_effect=AssertionError):
+            vf._hist.update(day=None, tab=None, chart=None)
+            self.assertNotIn(vf.CHART_KEY, vf.fetch_table(now))
+        self.assertEqual(vf._chart_state["source"], "labs")
+
+
+class TestWeightClassChart(unittest.TestCase):
+    """KXOPENSOURCESHARE off Vercel's own Open vs. Closed chart (2026-10-22)."""
+
+    def tearDown(self):
+        vf._chart_state.update(source="labs")
+
+    def test_rows_parse_to_the_open_token_share(self):
+        r = mock.Mock()
+        r.json.return_value = [
+            {"day": "2026-10-20T00:00:00.000Z", "metric": "tokens",
+             "chef_values": [["Open Weights", 68.338], ["Closed Weights", 31.662]]},
+            {"day": "2026-10-20T00:00:00.000Z", "metric": "requests",
+             "chef_values": [["Open Weights", 40.0], ["Closed Weights", 60.0]]},
+            {"day": "2026-10-21T00:00:00.000Z", "metric": "tokens",       # not in 100
+             "chef_values": [["Closed Weights", 1.0], ["Open Weights", 3.0]]},
+            {"day": "2026-10-22T00:00:00.000Z", "metric": "tokens", "chef_values": []}]
+        r.raise_for_status.return_value = None
+        now = datetime(2026, 10, 22, 14, 0, tzinfo=timezone.utc)
+        with mock.patch.object(vf.requests, "get", return_value=r) as g:
+            out = vf.fetch_weight_class(now, days_back=1)
+        self.assertEqual(out, {"2026-10-20": 68.338, "2026-10-21": 75.0})
+        self.assertEqual(g.call_args.kwargs["params"],
+                         {"groupBy": "weightClass", "from": "2026-10-21", "to": "2026-10-22"})
+        r.json.return_value = [{"day": "2026-10-20", "metric": "requests",
+                                "chef_values": [["Open Weights", 1.0], ["Closed Weights", 1.0]]}]
+        with mock.patch.object(vf.requests, "get", return_value=r):
+            with self.assertRaises(RuntimeError):
+                vf.fetch_weight_class(now)
+
+    def test_the_open_series_reads_the_chart_all_or_nothing(self):
+        tab = {("deepseek", "tokens"): {"2026-10-20": 30.0, "2026-10-21": 31.0},
+               ("zai", "tokens"): {"2026-10-20": 20.0, "2026-10-21": 21.0},
+               ("openai", "requests"): {"2026-10-20": 22.0, "2026-10-21": 23.0},
+               vf.CHART_KEY: {"2026-10-20": 68.3, "2026-10-21": 68.8}}
+        both = ["2026-10-20", "2026-10-21"]
+        self.assertEqual(vf.series_values(tab, vf.OPEN_SERIES, both),
+                         {"2026-10-20": 68.3, "2026-10-21": 68.8})
+        self.assertEqual(vf.open_source_of(tab, both), "chart")
+        # a day the chart lacks: the lab sum for every day, never a mix
+        self.assertEqual(vf.series_values(tab, vf.OPEN_SERIES, both + ["2026-10-22"]),
+                         {"2026-10-20": 50.0, "2026-10-21": 52.0, "2026-10-22": 0.0})
+        self.assertEqual(vf.open_source_of(tab, both + ["2026-10-22"]),
+                         "labs (the chart lacks 1 of the days)")
+        # the lab series never read it
+        self.assertEqual(vf.series_values(tab, "KXOPENVREQ", both),
+                         {"2026-10-20": 22.0, "2026-10-21": 23.0})
+
+    def test_write_fair_file_prices_the_open_series_off_the_chart(self):
+        tab = {}
+        for s, (lab, met) in vf.LAB_SERIES.items():
+            tab.update(history((lab, met), 80, start=date(2026, 7, 10), base=20.0,
+                               step=lambda i: (i % 5) * 0.3))
+        for lab in vf.OPEN_WEIGHT_LABS[:2]:
+            tab.update(history((lab, "tokens"), 80, start=date(2026, 7, 10), base=30.0,
+                               step=lambda i: (i % 7) * 0.4))
+        lab_sum = vf.series_values(tab, vf.OPEN_SERIES, sorted(tab[("deepseek", "tokens")]))
+        now = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)
+        out = {}
+        for name, extra in (("labs", {}), ("chart", {vf.CHART_KEY: {
+                d: v + 8.0 for d, v in lab_sum.items()}})):
+            path = os.path.join(tempfile.mkdtemp(), "vf.json")
+            with mock.patch.object(vf, "RUN_ANCHOR", False):
+                vf.write_fair_file(path, now=now, tab={**tab, **extra})
+            out[name] = json.load(open(path, encoding="utf-8"))
+        self.assertEqual(out["labs"]["anchor"]["open_source"], "labs")
+        self.assertEqual(out["chart"]["anchor"]["open_source"], "chart")
+        ev = "KXOPENSOURCESHARE-26SEP29"
+        lab_e, chart_e = out["labs"]["entries"][ev], out["chart"]["entries"][ev]
+        self.assertAlmostEqual(chart_e["x_l"], lab_e["x_l"] + 8.0, places=6)
+        self.assertEqual(chart_e["errs"], lab_e["errs"])      # a level shift moves no change
+        self.assertEqual(out["chart"]["entries"]["KXOPENVREQ-28SEP26"],
+                         out["labs"]["entries"]["KXOPENVREQ-28SEP26"])
+        # the chart is not a lab row: the anchor's row counts are the export's
+        self.assertEqual(out["chart"]["anchor"]["rows_last"], out["labs"]["anchor"]["rows_last"])
 
 
 if __name__ == "__main__":

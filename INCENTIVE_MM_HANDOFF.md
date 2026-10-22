@@ -10846,3 +10846,27 @@ and 10/20 settlements that chart began counting Reflection's Beam 1.0 as open. B
 - Study: KL-data/vercel-logger/analysis-2026-10-21/verdict.md.
 Deploy: helper module, so restart_imm.ps1 (plain). Check: vercel_fair.json "model" open_weight_labs ends with
 "reflection", and the KXOPENSOURCESHARE entries' x_l reads ~68.
+
+## 2026-10-22 ~14:55Z — Vercel fair: KXOPENSOURCESHARE off Vercel's weight-class chart (Jack: pasted the meta model-coverage gap, "QUOTE WITH CARE -- ... make the fix, or block it until then")
+
+The rules settle on "the Open Weights percentage in Vercel AI Gateway's Open vs. Closed Token Volume chart". The
+leaderboard page reads it from vercel.com/api/ai/v5/gateway-model-leaderboard?groupBy=weightClass: per UTC day,
+the running day included, served max-age=0.
+- Settled events before Beam, D = 9/26-10/14 (8 days): the chart matches Kalshi within 0.05 pp (mean 0.024). The
+  lab sum missed by 0.39 pp on average, up to 0.9.
+- D = 10/20: chart 68.34, Kalshi 68.3, lab sum 60.7 (before reflection joined).
+- D = 10/18 is the exception: Vercel has since revised that day to count Beam (chart 67.7, settled 62.9).
+- The lab sum cannot count a mixed lab (meta: 5 of its 14 gateway models are tagged open-weights). With reflection
+  in, it still read 1.5-1.8 pp under the chart on 10/20-22.
+vercel_fair.OPEN_SOURCE (IMM_VERCEL_OPEN_SOURCE) defaults to "chart":
+- The open series' history and running anchor both come from the chart, all or nothing per refresh. An
+  unreadable chart, or one missing a day, falls back to the lab sum for that refresh; "labs" restores the lab sum.
+- The chart is read on the same cadence as the export (full window per history read, then yesterday + today).
+- The running-to-final deltas stay the logger's lab sums, because the logger keeps the lab export only.
+- The fair file's anchor.open_source records which source each refresh used.
+- imm_model_coverage.check_vercel_labs reports no lab gaps while the file reads "chart", and reports again on the
+  lab sum.
+Dry run at 14:49Z: x_l 69.41 -> 70.82. The 26OCT25 medians move +1.3-1.4 pp. T73.0 (book 39/41) moves 52c -> 58c,
+so the 15c gate stands its ask aside. Lab series unchanged.
+Deploy: helper modules, so restart_imm.ps1 (plain) after the KL sync. Check: vercel_fair.json anchor.open_source
+"chart", and the KXOPENSOURCESHARE x_l equals today's chart value.

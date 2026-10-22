@@ -462,10 +462,19 @@ def check_vercel_labs(progs: Dict[str, dict], now_ts: float) -> List[dict]:
     (vercel_fair.OPEN_WEIGHT_LABS): a lab that is new to Vercel's export is
     left out of the sum silently. Each one is reported once (on the pass's
     first run the labs already there are recorded without an email), and
-    once more if its token share reaches LAB_REALERT_SHARE."""
+    once more if its token share reaches LAB_REALERT_SHARE. Quiet while the
+    fair reads Vercel's weight-class chart instead (anchor.open_source
+    "chart", 2026-10-22): the chart counts every lab's models, so the list is
+    only the fallback; on the lab sum the reports resume."""
     import glob
     import vercel_fair as vf
     if not any(_series(t) == vf.OPEN_SERIES for t in progs):
+        return []
+    try:
+        src = (_read(imm.VERCEL_FAIR_FILE).get("anchor") or {}).get("open_source")
+    except (OSError, ValueError):
+        src = None
+    if src == "chart":
         return []
     family = "Vercel open-weight labs (vercel_fair)"
     files = sorted(glob.glob(os.path.join(vf.INTRADAY_DIR, "export_*.jsonl")))
