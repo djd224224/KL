@@ -12512,6 +12512,10 @@ class TestResortSnowGate(unittest.TestCase):
                 self.assertEqual((ov.price_min_cents, ov.price_max_cents,
                                   ov.cutoff_from_close_min, ov.max_position, ov.safe_join),
                                  (5, 90, 1560, 150, False), s)
+                # x3 rungs (Jack 2026-10-22: "3x"), the 150 cap literal
+                self.assertEqual(imm.series_levels(s), imm.scale_levels(imm.LEVELS, 3.0), s)
+                self.assertEqual(imm.series_max_position(s), 150, s)
+                self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
                 self.assertTrue(imm.is_daily_series(s), s)
                 self.assertEqual(imm.fair_gate_of(s), "resort snow", s)
             for s in ("KXVAILSNOW", "KXTSNOWFALLBIGSKYM", "KXCHISNOWM"):

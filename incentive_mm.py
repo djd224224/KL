@@ -10194,6 +10194,7 @@ _CONFIG_CODE_KNOBS = (
     "RESORT_SNOW_ENABLE", "RESORT_SNOW_TOL_CENTS", "RESORT_SNOW_WEAK_TOL_CENTS",
     "RESORT_SNOW_TTL_MIN", "RESORT_SNOW_DRY_MIN", "RESORT_SNOW_CAP",
     "RESORT_SNOW_MAX_POSITION", "RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN",
+    "RESORT_SNOW_SIZE_MULT",                     # x3 ladder (Jack 2026-10-22: "3x")
     # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
     "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
     "RT_FAIR_CAP", "RT_FAIR_BAND",
@@ -12416,11 +12417,17 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # RESORT_SNOW_TOL_CENTS through the fair caps that side, the snow rule
 # (RESORT_SNOW_WEAK_TOL_CENTS on Mammoth and Stowe, whose proxies are an
 # east-side rain shadow and a valley gauge). At the touch like the snow
-# monthlies, x1 at every hour (is_daily_series), RESORT_SNOW_MAX_POSITION
-# per market, band 5-90c, out 26h before close. Big Sky's safe-join (2
-# ticks behind, its rule for quoting WITHOUT a fair) was the first cut
-# (1885a05): it read $0.14-0.56 per strike over the program's last 2.3
-# days, and the payout floor (MIN_EST_TOTAL_DOLLARS) dropped 51 of 54.
+# monthlies (1885a05 used Big Sky's safe-join, its rule for quoting
+# WITHOUT a fair; d00f501 moved to the touch, which is what the selection
+# estimate assumes either way), the same size at every hour
+# (is_daily_series), band 5-90c, out 26h before close.
+# x3 LADDER (Jack 2026-10-22: "3x"): at x1 a 20-lot at the touch drew ~1%
+# of each strike's $167/day pool -- $0.14-0.98 a strike over the program's
+# last 2.3 days, so the payout floor (MIN_EST_TOTAL_DOLLARS) dropped 50 of
+# 54 -- so the rung is RESORT_SNOW_SIZE_MULT x the global ladder (60 at the
+# live IMM_LEVELS=0:20) while the per-market cap stays
+# RESORT_SNOW_MAX_POSITION (150; a hand-set ladder and cap stay literal,
+# applied_mention_mult). IMM_RESORT_SNOW_SIZE_MULT=1 reverts.
 # 10/22 20:03Z first read: Mammoth, Northstar and Stowe anchored (27
 # strikes); Beaver Creek, Keystone and Park City stood aside -- rain at
 # EGE, LXV and HCR after their proxies' latest reports. Kill switch
@@ -12439,6 +12446,7 @@ RESORT_SNOW_REFRESH_SECS = _env_int("IMM_RESORT_SNOW_REFRESH_SECS", 600)
 RESORT_SNOW_DRY_MIN = _env_float("IMM_RESORT_SNOW_DRY_MIN", 60)
 RESORT_SNOW_CAP = os.environ.get("IMM_RESORT_SNOW_CAP", "1") == "1"
 RESORT_SNOW_MAX_POSITION = _env_float("IMM_RESORT_SNOW_MAX_POSITION", 150)
+RESORT_SNOW_SIZE_MULT = _env_float("IMM_RESORT_SNOW_SIZE_MULT", 3.0)
 RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN = _env_int(
     "IMM_RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN", 1560)
 RESORT_SNOW_FILE = os.environ.get(
@@ -12452,6 +12460,7 @@ if RESORT_SNOW_ENABLE:
             price_min_cents=_env_int("IMM_SNOW_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_SNOW_PRICE_MAX", 90),
             cutoff_from_close_min=RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN,
+            levels=scale_levels(LEVELS, RESORT_SNOW_SIZE_MULT),
             max_position=RESORT_SNOW_MAX_POSITION)
 
 
@@ -31419,7 +31428,9 @@ class IncentiveMarketMaker:
                 f"{', '.join(sorted(RESORT_SNOW_WEAK_SERIES))}) caps the side that "
                 f"fights the fair; out while the resort's airport is wet, "
                 f"{RESORT_SNOW_DRY_MIN:g}m after, and until the proxy's next report; "
-                f"at the touch, max {RESORT_SNOW_MAX_POSITION:g} per market, out "
+                f"at the touch x{RESORT_SNOW_SIZE_MULT:g} (ladder "
+                f"{scale_levels(LEVELS, RESORT_SNOW_SIZE_MULT)}), max "
+                f"{RESORT_SNOW_MAX_POSITION:g} per market, out "
                 f"{RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN // 60}h before close")
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "
