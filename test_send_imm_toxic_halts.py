@@ -205,9 +205,9 @@ class TestToxicHaltsEmail(unittest.TestCase):
         self.assertIn("Halts: $0.00 -- none had quotes up", text)
         self.assertEqual((s["quotes"], s["forgone_eff"], s["net"]), ([], 0.0, 0.0))
         self.assertIn("none up", text)
-        self.assertIn("Pick-offs: n/a -- none of the 5 is in the fills sink.", text)
-        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: halts $0.00 net, "
-                                              "pick-offs n/a | 1 event, 1 side (5 pick-offs)")
+        self.assertNotIn("Pick-offs:", text)         # no day total (Jack 2026-10-22)
+        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: halts $0.00 net | "
+                                              "1 event, 1 side (5 pick-offs)")
         old = th.build_report(self.day, with_profit=False)
         self.assertNotIn("profit", old)
         self.assertEqual(th.subject_for(old),
@@ -293,8 +293,11 @@ class TestToxicHaltsProfit(unittest.TestCase):
         text.encode("ascii")
         self.assertIn("Halts: net -$1.68 -- the fills they blocked would have made $1.25 "
                       "(65 contracts); reward forgone $0.43.", text)
-        self.assertIn("Pick-offs: -$9.30 now (-$3.70 at the 5-min check) on 3 fills / 60 "
-                      "contracts; 2 not in the fills sink.", text)
+        # the pick-offs' $ stay per market in the table, never as a day total
+        # (Jack 2026-10-22: "Remove the -236$ part of toxic email, it's misleading")
+        self.assertNotIn("Pick-offs:", text)
+        self.assertNotIn("-$9.30", text)
+        self.assertNotIn("-$9.30", html)
         side = next(l for l in text.splitlines() if l.strip().startswith("14:10"))
         for bit in ("25 @ 41 pulled", "-$2.75", "+$2.65", "50->44 30ct -$1.80"):
             self.assertIn(bit, side)
@@ -303,8 +306,8 @@ class TestToxicHaltsProfit(unittest.TestCase):
             self.assertIn(bit, event)
         self.assertIn("50ct -$3.00 at 5 min, -$9.60 now", text)    # most picked-off: mk
         self.assertIn("Halts: net -$1.68", html)
-        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: halts -$1.68 net, "
-                                              "pick-offs -$9.30 | 1 event, 1 side (5 pick-offs)")
+        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: halts -$1.68 net | "
+                                              "1 event, 1 side (5 pick-offs)")
 
     def test_failed_reads_read_n_a_and_never_cost_the_email(self):
         kal = FakeKalshi(fail={self.mk, self.a, self.c})
@@ -316,7 +319,7 @@ class TestToxicHaltsProfit(unittest.TestCase):
         self.assertIn("Halts: n/a -- the Kalshi reads failed.", text)
         self.assertIn("! Some Kalshi reads failed", text)
         self.assertTrue(th.subject_for(ctx).startswith(
-            "IMM toxic halts Mon Sep 28: halts n/a net, pick-offs n/a |"))
+            "IMM toxic halts Mon Sep 28: halts n/a net |"))
 
     def test_seven_day_store(self):
         with mock.patch.object(th, "_get", self.kal):

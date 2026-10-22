@@ -39,8 +39,11 @@ reward it forwent); + means the halt paid:
            saved or cost.
   forgone  the bot's own estimate (what each halt recorded), on the share of
            the halted markets that had quotes as above.
-The pick-offs' own P&L: each fill's contracts (from the fills sink) times
-the move to the 5-minute check, and to the price now.
+The pick-offs' own P&L, per market in the most-picked-off table: each fill's
+contracts (from the fills sink) times the move to the 5-minute check, and to
+the price now. No day total (Jack 2026-10-22: "Remove the -236$ part of
+toxic email, it's misleading"): pick-offs are the fills chosen for having
+gone against us, so their sum reads as a loss on any day.
 
 SOURCES: the bot's own toxic_halts_<UTC date>.jsonl sink (kind = pickoff /
 side_halt / event_halt, written as each one happens), marks_<UTC
@@ -653,22 +656,14 @@ def profit_lines(ctx) -> list:
         L.append(f"  Halts: net {usd(pr['halts_net'])}{part} -- "
                  f"{_blocked_txt(pr['blocked'], pr['blocked_ct'])}; reward forgone "
                  f"{amt(pr['forgone'])}.")
-    if pr["n_picks"] and not pr["n_matched"]:
-        L.append(f"  Pick-offs: n/a -- none of the {pr['n_picks']} is in the fills sink.")
-    elif pr["n_picks"]:
-        miss = pr["n_picks"] - pr["n_matched"]
-        L.append(f"  Pick-offs: {_picks_now(pr)} now ({usd(pr['picks_5m'])} at the "
-                 f"5-min check) on {pr['n_matched']} fills / {pr['pick_ct']:,.0f} contracts"
-                 + (f"; {miss} not in the fills sink" if miss else "")
-                 + (f". Mention books (never halt): {pr['n_exempt']} fills, "
-                    f"{usd(pr['exempt_now'])} now." if pr["n_exempt"] else "."))
+    # no pick-off total here or in the 7-day line (see the docstring): the
+    # most-picked-off table names the markets
     if tr and tr["n_days"]:
         span = (f"{datetime.fromisoformat(tr['first']):%b %d}-"
                 f"{datetime.fromisoformat(tr['last']):%b %d}")
         L.append(f"  Last {TRAIL_DAYS} days ({span}, {tr['n_days']} with data): halts net "
                  f"{usd(tr['halts_net'])} over {tr['n_halts']:.0f} halts (blocked fills "
-                 f"{usd(tr['blocked'])}, reward forgone {amt(tr['forgone'])}); pick-offs "
-                 f"{usd(tr['picks_now'])}"
+                 f"{usd(tr['blocked'])}, reward forgone {amt(tr['forgone'])})"
                  + (f"; {tr['partial']} day(s) partly read" if tr["partial"] else "") + ".")
     if not pr["ok"]:
         L.append("  ! Some Kalshi reads failed: those markets read n/a.")
@@ -676,25 +671,17 @@ def profit_lines(ctx) -> list:
              "forgone. Blocked fills = public trades during the halt at or through the "
              "quotes it pulled (or put back as it ended), capped at their size -- the most "
              "it could have saved or cost. Forgone = the bot's estimate, on the halted "
-             "markets that had quotes up (none up = quiet hours, a cap: no cost). "
-             f"Pick-offs are the fills that went {imm.TOXIC_PICKOFF_CENTS:g}c+ against us, "
-             "so they always read negative at the check; 'now' is how much of that stuck.")
+             "markets that had quotes up (none up = quiet hours, a cap: no cost).")
     return L
-
-
-def _picks_now(pr) -> str:
-    """The pick-offs' $ now; n/a when none of them could be marked."""
-    return usd(pr["picks_now"]) if pr["n_marked"] or not pr["n_picks"] else "n/a"
 
 
 def subject_for(ctx) -> str:
     d = ctx["day"].strftime("%a %b %d")
     pr = ctx.get("profit")
-    picks = (f", {usd(pr['picks_now'])} now" if pr and pr["n_marked"] else "")
     if not ctx["side_rows"] and not ctx["event_rows"]:
-        return f"IMM toxic halts {d}: none ({ctx['n_picks']} pick-off(s){picks})"
-    head = (f"halts {usd(pr['halts_net']) if pr['n_priced'] else 'n/a'} net, "
-            f"pick-offs {_picks_now(pr)} | " if pr else "")
+        return f"IMM toxic halts {d}: none ({ctx['n_picks']} pick-off(s))"
+    head = (f"halts {usd(pr['halts_net']) if pr['n_priced'] else 'n/a'} net | "
+            if pr else "")
     return (f"IMM toxic halts {d}: {head}{len(ctx['event_rows'])} event, "
             f"{len(ctx['side_rows'])} side ({ctx['n_picks']} pick-offs)")
 
