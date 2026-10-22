@@ -1340,5 +1340,44 @@ class MarkBasisTests(unittest.TestCase):
         self.assertNotIn("at mid", text + html)
 
 
+class RefundTests(unittest.TestCase):
+    """Jack 2026-10-22: "Make email movers table treat refunds the same as
+    kalshi ui" -- Kalshi books the collateral it refunds on mutually
+    exclusive positions as cash and shows the positions that much lower."""
+
+    def test_refunds_by_event(self):
+        events = {"RACE": {"exposure": 3.0}, "SOLO": {"exposure": 4.0},
+                  "DONE": {"realized": 1.0, "fees": 0.0}}
+        mkt_pos = {"RACE-A": {"pos": -10, "cost": 2.0}, "RACE-B": {"pos": -10, "cost": 3.0},
+                   "RACE-C": {"pos": -10, "cost": 4.0}, "SOLO-X": {"pos": 5, "cost": 4.0}}
+        ev_of = lambda tk: tk.split("-")[0]
+        # NO on three of a race: 9.00 of market exposure against 3.00 for
+        # the event -> 6.00 refunded; no refund on a lone position
+        self.assertEqual(pf.event_refunds(events, mkt_pos, ev_of), {"RACE": 6.0})
+        self.assertEqual(sum(pf.event_refunds(events, mkt_pos, ev_of).values()),
+                         pf.collateral_returned({k: v for k, v in events.items()
+                                                 if "exposure" in v}, mkt_pos))
+
+    def test_a_row_books_the_refund_like_kalshi(self):
+        # 6.00 refunded since the prior morning (from 2.00): the open value
+        # shows net of it, the cash it brought is realized, the day unchanged
+        self.assertEqual(pf.net_of_refund(1.0, -3.0, 20.0, 6.0, 2.0), (5.0, -7.0, 14.0))
+        # a prior morning without refunds on record: only the open value nets
+        self.assertEqual(pf.net_of_refund(1.0, -3.0, 20.0, 6.0, None), (1.0, -3.0, 14.0))
+        # settled: Kalshi takes the refund back out of the settlement cash
+        self.assertEqual(pf.net_of_refund(10.0, -2.0, 0.0, 0.0, 6.0), (4.0, 4.0, 0.0))
+
+    def test_the_email_reconciles_open_now_to_kalshi(self):
+        p = DayByBotTests()._pf()
+        p["refunds_total"] = 500.0
+        _, text, html = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("(Open now nets out the $500.00 of collateral Kalshi has refunded on "
+                      "mutually exclusive positions, as Kalshi's UI does: every open position "
+                      "comes to $20,000.00 (Kalshi's figure $20,500.00))", text)
+        self.assertIn("Open now nets out the $500.00", html)
+        _, text, _ = pf.build_email(DayByBotTests()._pf(), [], chart_ok=False)
+        self.assertNotIn("Open now nets out", text)
+
+
 if __name__ == "__main__":
     unittest.main()

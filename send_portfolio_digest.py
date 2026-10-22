@@ -310,6 +310,39 @@ def collateral_returned(events, mkt_pos) -> float:
                  - sum(e.get("exposure", 0.0) for e in events.values()), 2)
 
 
+def event_refunds(events, mkt_pos, ev_of) -> dict:
+    """event -> the collateral Kalshi has refunded on its open positions:
+    the event's markets' exposure less the event's own exposure, i.e.
+    collateral_returned event by event (Jack 2026-10-22: "Make email movers
+    table treat refunds the same as kalshi ui"). Markets go to their events
+    by the markets endpoint's event_ticker (ev_of); a ticker-prefix split had
+    read negatives on 10/09. On 10/22 13:53 ET: 101 events, $6,295.95, the
+    account figure to the cent, none negative."""
+    cost = {}
+    for tk, r in mkt_pos.items():
+        ev = ev_of(tk)
+        cost[ev] = cost.get(ev, 0.0) + r["cost"]
+    out = {}
+    for ev, c in cost.items():
+        if ev in events:
+            ref = round(c - _f(events[ev].get("exposure")), 2)
+            if abs(ref) >= 0.005:
+                out[ev] = ref
+    return out
+
+
+def net_of_refund(realized, value_d, value_now, refund_now, refund_prior):
+    """A movers row the way Kalshi books a refund: the open value net of the
+    event's refund (as Kalshi's positions value), the refund's cash in
+    realized as it comes and goes back; the day (realized + value_d) is
+    unchanged. refund_prior None (the prior morning did not record refunds)
+    leaves realized / unrealized as they are and only nets the open value."""
+    if refund_prior is not None:
+        d = refund_now - refund_prior
+        realized, value_d = realized + d, value_d - d
+    return round(realized, 2), round(value_d, 2), round(value_now - refund_now, 2)
+
+
 def fetch_recent_settlements(client, cutoff_utc: datetime):
     """Settlement records newer than cutoff (newest-first API; stop early)."""
     out = []
@@ -983,6 +1016,10 @@ def build_portfolio(now_utc: datetime):
             "pos": pos, "cost": round(cost, 2),
             "mark": None if mid_mark is None else round(mid_mark, 4),
             "last": None if last is None else round(last, 4)}
+    # Kalshi's collateral refunds by event: the movers table nets them out of
+    # the open values as Kalshi's UI does (net_of_refund)
+    refunds = event_refunds(ev_roll, mkt_pos,
+                            lambda tk: tk_event.get(tk) or event_from_ticker(tk))
 
     # Prior events now absent everywhere (no open legs, no settlement trail):
     # can't tell a data gap from an ancient settlement — flag, don't guess.
@@ -1008,6 +1045,8 @@ def build_portfolio(now_utc: datetime):
                             "basis": round(basis, 2)}
         if ev in ev_counted:
             events_today[ev]["counted"] = ev_counted[ev]
+        if ev in refunds:
+            events_today[ev]["refund"] = refunds[ev]
 
     positions_value = round(sum(e["value"] for e in events_today.values()), 2)
     equity = round(cash + positions_value, 2)
@@ -1066,6 +1105,7 @@ def build_portfolio(now_utc: datetime):
                 "account_value": account_value,
                 # every ticker carries its last trade from here on (MARK_BASIS)
                 "lasts_recorded": True, "mark_basis": mark_basis,
+                "refunds_recorded": True,            # events carry "refund"
                 "unpaid_rewards_est": (unpaid or {}).get("total"),
                 "deposited": deposited, "withdrawn": withdrawn,
                 "total_profit": total_profit,
@@ -1104,17 +1144,21 @@ def build_portfolio(now_utc: datetime):
         prior_val = {}
         for tk, (_q, v) in start.items():
             prior_val[ev_map[tk]] = prior_val.get(ev_map[tk], 0.0) + v
+        prior_refunds = bool(prior.get("refunds_recorded"))
         for ev, e in evs.items():
             realized, value_d = round(e["realized"], 2), round(e["value_d"], 2)
             day = round(realized + value_d, 2)
             if abs(day) < 0.005 and abs(realized) < 0.005 and abs(value_d) < 0.005:
                 continue
-            value_now = round(ev_value.get(ev, 0.0), 2)
+            gross_now = round(ev_value.get(ev, 0.0), 2)
+            realized, value_d, value_now = net_of_refund(
+                realized, value_d, gross_now, refunds.get(ev, 0.0),
+                _f((prior_events.get(ev) or {}).get("refund")) if prior_refunds else None)
             if ev in settled_now:
                 note = "settled " + "/".join(sorted(settled_now[ev]))
             elif ev not in prior_names:
                 note = "new"
-            elif abs(value_now) < 0.005 and abs(prior_val.get(ev, 0.0)) >= 0.005:
+            elif abs(gross_now) < 0.005 and abs(prior_val.get(ev, 0.0)) >= 0.005:
                 note = "closed"
             else:
                 note = ""
@@ -1192,6 +1236,7 @@ def build_portfolio(now_utc: datetime):
             "total_profit": total_profit, "transfers": transfers,
             "rows": rows, "snapshot": snapshot, "prior": prior,
             "mark_src": mark_src, "unreadable": unreadable, "mark_basis": mark_basis,
+            "refunds_total": round(sum(refunds.values()), 2),
             "n_settlements": len(settlements),
             "no_trade_cash": no_trade_cash, "net_transfers": net_transfers,
             "replay": replay_info,
@@ -1834,6 +1879,14 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
         by_bot = day_by_bot(pf, imm_events, parts[1], d_perps, subs_pnl)
     pricing = dict(parts or []).get(px_lbl)
     late = rewards is not None and abs(rewards) < 1.0
+    # the movers' open values are net of Kalshi's collateral refunds, as its
+    # UI's positions value (net_of_refund)
+    refunds_total = pf.get("refunds_total")
+    refund_note = ("" if refunds_total is None else
+                   f"Open now nets out the ${refunds_total:,.2f} of collateral Kalshi has "
+                   f"refunded on mutually exclusive positions, as Kalshi's UI does: every "
+                   f"open position comes to ${_f(pf.get('positions_value')) - refunds_total:,.2f} "
+                   f"(Kalshi's figure ${_f(pf.get('kalshi_positions_value')):,.2f})")
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
     # +$18.2k (day +$1.6k, trading -$0.7K)", then "yes add rewards to the
@@ -1933,6 +1986,8 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
             lines.append(f"(reward credits leave out {collat_d:+,.2f} of collateral Kalshi "
                          f"{'released' if collat_d > 0 else 'took back'} on mutually exclusive "
                          f"positions: its valuation moved the other way, so it is not profit)")
+    if refund_note:
+        lines.append(f"({refund_note})")
     if imm is not None:
         lines.append("")
         lines.append(imm.get("text") or
@@ -2103,6 +2158,9 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                      + ('this table at the last trade too (a market that never traded '
                         'at its mid).</div>' if last_basis else
                         'this table at the mid.</div>'))
+        if refund_note:
+            h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:2px 0 0">'
+                     f'{_esc(refund_note)}.</div>')
     else:
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')
