@@ -244,7 +244,7 @@ def setUpModule():
     imm._rt_fair_state.update(mtime=0.0, markets={})
     # the 2026-10-22 ski-resort snowfall gate (TestResortSnowGate deletes it)
     imm.RESORT_SNOW_FILE = os.path.join(tmp, "resort_snow_fair.json")
-    imm._resort_snow_state.update(mtime=0.0, markets={}, events={})
+    imm._resort_snow_state.update(mtime=0.0, markets={}, events={}, mapped={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -12469,7 +12469,7 @@ class TestResortSnowGate(unittest.TestCase):
 
     def setUp(self):
         _clean_persist()
-        imm._resort_snow_state.update(mtime=0.0, markets={}, events={})
+        imm._resort_snow_state.update(mtime=0.0, markets={}, events={}, mapped={})
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
         try:
@@ -12585,6 +12585,54 @@ class TestResortSnowGate(unittest.TestCase):
     def _sides(self, bot):
         return {o["book_side"] for o in bot.state.sim_orders.values()
                 if o["ticker"] == self.T}
+
+    def test_a_new_resort_series_enrolls_once_the_writer_maps_it(self):
+        """Jack 2026-10-22: "Make sure new markets like this family will
+        auto quote" -- a resort-named series the writer has not mapped stays
+        out; once the file lists it in "mapped" it is allowed, cloned from
+        the archetype (x3 ladder, 150 cap), dated DDMONYY, every hour, and
+        gated at the weak band."""
+        s, t = "KXVAILSNOW", "KXVAILSNOW-24DEC68-GT80"
+        self.addCleanup(imm.SERIES_OVERRIDES.pop, s, None)
+        for x in ("KXVAILSNOW", "KXBRECKSNOW"):
+            self.assertTrue(imm.resort_snow_candidate(x), x)
+        for x in ("KXCHISNOWM", "KXSNOWNYM", "KXTSNOWFALLBIGSKYM", "KXSNOWCRABCATCH",
+                  "KXEARNINGSMENTIONSNOW"):                 # Snowflake's call, in the feed
+            self.assertFalse(imm.resort_snow_candidate(x), x)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(imm.IncentiveMarketMaker._allowed(t))
+            self.assertFalse(imm.resort_snow_series(s))
+            self.assertEqual(imm.parse_event_date("KXVAILSNOW-24DEC26"),
+                             imm.ET.localize(datetime(2024, 12, 26)).astimezone(timezone.utc))
+            self._write(p=0.38, ticker=t)
+            with open(imm.RESORT_SNOW_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            data["mapped"] = {s: {"place": "Vail Mountain Resort", "proxy": "DILLON 1 E",
+                                  "iem": "CCU", "auto": True}}
+            with open(imm.RESORT_SNOW_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.utime(imm.RESORT_SNOW_FILE, (time.time(), time.time() + self._bump))
+            TestResortSnowGate._bump += 1
+            imm.load_resort_snow()
+            self.assertTrue(imm.resort_snow_series(s))
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(t))
+        self.assertEqual(imm.parse_event_date("KXVAILSNOW-24DEC26"),
+                         imm.ET.localize(datetime(2026, 12, 24)).astimezone(timezone.utc))
+        self.assertTrue(imm.is_daily_series(s))
+        self.assertEqual(imm.fair_gate_of(s), "resort snow")
+        imm.SERIES_OVERRIDES.pop(s, None)
+        imm.ensure_family_override(s)
+        ov = imm.series_override(s)
+        self.assertEqual((ov.levels, ov.max_position, ov.cutoff_from_close_min,
+                          ov.price_min_cents, ov.price_max_cents),
+                         (imm.scale_levels(imm.LEVELS, 3.0), 150, 1560, 5, 90))
+        # the weak band: 49 against 38 passes at 15c (the six's 10c would cap)
+        self.assertEqual(imm.resort_snow_gate(t, time.time(), 49, 51), ("", {}, None))
+        self.assertEqual(imm.resort_snow_gate(t, time.time(), 54, 56)[2], (53, 23))
+        # the kill switch takes the auto series too
+        with mock.patch.object(imm, "RESORT_SNOW_ENABLE", False):
+            self.assertFalse(imm.resort_snow_series(s))
+            self.assertFalse(imm.resort_snow_candidate(s))
 
     def test_quotes_through_the_gate_and_stands_aside_in_rain(self):
         bot = self._bot()

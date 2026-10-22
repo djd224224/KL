@@ -1759,8 +1759,8 @@ def is_daily_series(series: str) -> bool:
     if series in globals().get("BIGSKY_SERIES", ()) and globals().get("BIGSKY_ENABLE"):
         return True
     # ... and the ski resorts' season snowfall (2026-10-22), on its gate
-    if series in globals().get("RESORT_SNOW_SERIES", ()) and \
-            globals().get("RESORT_SNOW_ENABLE"):
+    _rss = globals().get("resort_snow_series")
+    if _rss is not None and _rss(series):
         return True
     return series in DAILY_SERIES_DYNAMIC
 
@@ -8868,6 +8868,9 @@ FAMILY_OVERRIDE_PARENTS = (
     ("predicate", rain_period_family_series, RAIN_PERIOD_ARCHETYPE),
     # monthly snow (2026-10-04): a KX<CITY>SNOWM beyond the named ten
     ("predicate", snow_monthly_series, SNOW_MONTHLY_ARCHETYPE),
+    # ski-resort season snowfall (2026-10-22): a resort series the writer
+    # mapped after the six (defined further down: called late)
+    ("predicate", lambda s: resort_snow_series(s), "KXBEAVERSNOW"),
     # elections (2026-09-28): a name pattern OR the exact general-election
     # list, so the family is a predicate rather than one regex
     ("predicate", election_series, ELECTION_ARCHETYPE),
@@ -12451,10 +12454,25 @@ RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN = _env_int(
     "IMM_RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN", 1560)
 RESORT_SNOW_FILE = os.environ.get(
     "IMM_RESORT_SNOW_FILE", os.path.join(STATUS_DIR, "resort_snow_fair.json"))
-_resort_snow_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+_resort_snow_state: dict = {"mtime": 0.0, "markets": {}, "events": {}, "mapped": {}}
+# NEW RESORTS AUTO-ENROLL (Jack 2026-10-22: "Make sure new markets like this
+# family will auto quote"). Every program series named like a resort's
+# (RESORT_SNOW_SERIES_RE) goes to the writer (refresh_universe's
+# _resort_series -> extra_series); a resort its KNOWN_RESORTS table names is
+# mapped there -- nearest long ACIS gauge, nearest reporting airport, scale
+# fitted to the book's median -- and listed in the file's "mapped", which
+# enrolls the series here: allowed, the archetype's override (x3 ladder,
+# 150 per market, band, cutoff), the DDMONYY ticker date, every hour, and
+# the gate at RESORT_SNOW_WEAK_TOL_CENTS (an auto-picked gauge is a weak
+# proxy until shown otherwise). Not mapped (an unknown resort, no gauge, no
+# reporting airport) = not enrolled. IMM_RESORT_SNOW_SERIES_RE="" turns the
+# discovery off; the six stay.
+_RESORT_RE_SPEC = os.environ.get("IMM_RESORT_SNOW_SERIES_RE", r"KX[A-Z]{2,20}SNOW")
+RESORT_SNOW_SERIES_RE = re.compile(_RESORT_RE_SPEC) if _RESORT_RE_SPEC else None
+RESORT_SNOW_ARCHETYPE = "KXBEAVERSNOW"
 
 if RESORT_SNOW_ENABLE:
-    for _s in RESORT_SNOW_SERIES:
+    for _s in RESORT_SNOW_SERIES | {RESORT_SNOW_ARCHETYPE}:
         SERIES_OVERRIDES[_s] = replace(
             SERIES_OVERRIDES.get(_s) or SeriesOverride(),
             price_min_cents=_env_int("IMM_SNOW_PRICE_MIN", 5),
@@ -12464,21 +12482,57 @@ if RESORT_SNOW_ENABLE:
             max_position=RESORT_SNOW_MAX_POSITION)
 
 
+def resort_snow_mapped(series: str) -> bool:
+    """One of the six, or a series the writer mapped to a resort (the file's
+    "mapped", read by load_resort_snow) -- whether or not the gate is on."""
+    return series in RESORT_SNOW_SERIES or (
+        RESORT_SNOW_SERIES_RE is not None and series in _resort_snow_state["mapped"])
+
+
 def resort_snow_series(series: str) -> bool:
-    return RESORT_SNOW_ENABLE and series in RESORT_SNOW_SERIES
+    return RESORT_SNOW_ENABLE and resort_snow_mapped(series)
+
+
+def resort_snow_candidate(series: str) -> bool:
+    """A program series the writer should look at: one of the six or any
+    named like a resort's -- not a mention series (KXEARNINGSMENTIONSNOW is
+    Snowflake's earnings call)."""
+    return RESORT_SNOW_ENABLE and (series in RESORT_SNOW_SERIES or bool(
+        RESORT_SNOW_SERIES_RE and RESORT_SNOW_SERIES_RE.fullmatch(series)
+        and "MENTION" not in series))
 
 
 def load_resort_snow() -> int:
-    """Hot-reload RESORT_SNOW_FILE by mtime (the rain loader)."""
-    return _load_weather_fair(RESORT_SNOW_FILE, _resort_snow_state, "resort snow")
+    """Hot-reload RESORT_SNOW_FILE by mtime (the rain loader), and its
+    "mapped" series: {series: auto-mapped?}."""
+    n = _load_weather_fair(RESORT_SNOW_FILE, _resort_snow_state, "resort snow")
+    if n >= 0:
+        try:
+            with open(RESORT_SNOW_FILE, encoding="utf-8") as f:
+                mp = (json.load(f) or {}).get("mapped") or {}
+        except (OSError, ValueError):
+            mp = None
+        if isinstance(mp, dict):
+            new = {str(s): bool((v or {}).get("auto")) for s, v in mp.items()
+                   if isinstance(v, dict)}
+            added = sorted(s for s in new if s not in _resort_snow_state["mapped"]
+                           and s not in RESORT_SNOW_SERIES)
+            if added:
+                log(f"[IMM] resort snow: new resort series mapped -> enrolled: "
+                    f"{', '.join(added)}")
+            _resort_snow_state["mapped"] = new
+    return n
 
 
 def resort_snow_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                      ext_ask: Optional[float]
                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
     """snow_monthly_gate's contract on the resort file, at
-    RESORT_SNOW_WEAK_TOL_CENTS for the weak proxies. Fails CLOSED."""
-    tol = (RESORT_SNOW_WEAK_TOL_CENTS if ticker.split("-")[0] in RESORT_SNOW_WEAK_SERIES
+    RESORT_SNOW_WEAK_TOL_CENTS for the weak proxies and every auto-mapped
+    resort. Fails CLOSED."""
+    s = ticker.split("-")[0]
+    tol = (RESORT_SNOW_WEAK_TOL_CENTS
+           if s in RESORT_SNOW_WEAK_SERIES or s not in RESORT_SNOW_SERIES
            else RESORT_SNOW_TOL_CENTS)
     why, inp = weather_fair_gate_reason(
         _resort_snow_state, ticker, now_ts, ext_bid, ext_ask,
@@ -15106,10 +15160,12 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
     if not m:
         return None
     yy, mon, dd = m.groups()
-    if parts[0] in globals().get("RESORT_SNOW_SERIES", ()):
+    _rsm = globals().get("resort_snow_mapped")
+    if _rsm is not None and _rsm(parts[0]):
         # the ski resorts' season snowfall (2026-10-22) writes the window's
         # last day DDMONYY: KXBEAVERSNOW-24DEC26 is December 24, 2026 -- the
-        # YYMONDD reading (2024-12-26) put every strike past its cutoff
+        # YYMONDD reading (2024-12-26) put every strike past its cutoff.
+        # The six, and every resort series the writer has mapped since.
         yy, dd = dd, yy
     month = _MONTHS.get(mon)
     if month is None:
@@ -18634,6 +18690,7 @@ class IncentiveMarketMaker:
         self._rain_period_series: Set[str] = set()
         # ...and the snow monthlies seen there (snow_monthly_fair.SERIES)
         self._snow_series: Set[str] = set()
+        self._resort_series: Set[str] = set()
         self._gb_fair_stood: Set[str] = set()     # GasBuddy state-gas stand-asides
         self._dc_stood: Set[str] = set()          # data center count stand-asides
         self._quake_stood: Set[str] = set()       # quake gate stand-asides
@@ -23531,6 +23588,13 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} snow-monthly series in the feed: "
                     f"{','.join(sorted(_sn))}")
             self._snow_series = _sn
+            # ...and every resort-named series (2026-10-22): the resort
+            # writer maps a new one, and its "mapped" list enrolls it
+            _rs = {series_of(t) for t in by_market if resort_snow_candidate(series_of(t))}
+            if _rs - self._resort_series:
+                log(f"{self.tag} resort-snow series in the feed: "
+                    f"{','.join(sorted(_rs))}")
+            self._resort_series = _rs
             # Daily-family classification from the live feed (Jack 2026-09-12):
             # feeds hour_size_mult / saturday_size_mult; persisted each refresh.
             _added, _dropped = refresh_daily_series(by_market, now_utc)
@@ -30292,7 +30356,8 @@ class IncentiveMarketMaker:
                     delay = max(60, RESORT_SNOW_REFRESH_SECS)
                     try:
                         ok, miss = resort_snow_fair.write_fair_file(
-                            RESORT_SNOW_FILE, get_json=kalshi_get)
+                            RESORT_SNOW_FILE, get_json=kalshi_get,
+                            extra_series=tuple(sorted(self._resort_series)))
                         if last != (ok, miss):
                             log(f"{self.tag} resort-snow refresh: {ok} events "
                                 f"with a fair"
@@ -31431,7 +31496,10 @@ class IncentiveMarketMaker:
                 f"at the touch x{RESORT_SNOW_SIZE_MULT:g} (ladder "
                 f"{scale_levels(LEVELS, RESORT_SNOW_SIZE_MULT)}), max "
                 f"{RESORT_SNOW_MAX_POSITION:g} per market, out "
-                f"{RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN // 60}h before close")
+                f"{RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN // 60}h before close; "
+                + (f"new {RESORT_SNOW_SERIES_RE.pattern} series auto-enroll once the "
+                   f"writer maps their resort (weak band)" if RESORT_SNOW_SERIES_RE
+                   else "no auto-enrollment"))
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"

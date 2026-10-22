@@ -199,6 +199,93 @@ class TestAnchor(unittest.TestCase):
                          {"A-GT40": 0.5, "A-GT60": 0.5, "A-GT80": 0.5, "A-GT99": 0.5})
 
 
+class TestAutoMap(unittest.TestCase):
+    """New resorts (Jack 2026-10-22: "Make sure new markets like this family
+    will auto quote"): the name table, the gauge and airport picks, the
+    book-median scale fit."""
+
+    def test_lookup_resort_by_name(self):
+        for name, want in (("Vail Mountain Resort", "Vail"), ("Mt. Bachelor", "Mt. Bachelor"),
+                           ("Aspen Snowmass", "Snowmass"), ("Aspen Highlands", "Aspen Highlands"),
+                           ("Taos Ski Valley", "Taos"), ("Brighton Resort", "Brighton"),
+                           ("Northstar California Resort", "Northstar")):
+            self.assertEqual(rsf.lookup_resort(name)["resort"], want, name)
+        # one-word names other areas share match only whole; Canada has no ACIS
+        for name in ("Mt. Brighton", "Powder Ridge", "Whistler Blackcomb", ""):
+            self.assertIsNone(rsf.lookup_resort(name), name)
+        self.assertEqual(rsf.lookup_resort("Vail")["tz"], "US/Mountain")
+
+    def test_acis_sid_prefers_the_coop_id(self):
+        self.assertEqual(rsf._acis_sid(["03005 1", "052281 2", "USC00052281 6"]), "052281")
+        self.assertEqual(rsf._acis_sid(["US1VTCH0004 6", "VTCH0004 10"]), "US1VTCH0004")
+
+    def test_auto_proxy_takes_the_nearest_long_reporting_gauge(self):
+        meta = {"meta": [
+            # nearest, but a 3-year record
+            {"name": "NEW CoCoRaHS", "sids": ["US1COEG9 6"], "ll": [-106.37, 39.62],
+             "valid_daterange": [["2023-09-01", "2026-10-22"]]},
+            # long record, not reporting since September
+            {"name": "OLD COOP", "sids": ["050001 2"], "ll": [-106.30, 39.60],
+             "valid_daterange": [["1950-01-01", "2026-09-30"]]},
+            # long, reporting, a gappy history
+            {"name": "GAPPY", "sids": ["050002 2"], "ll": [-106.25, 39.62],
+             "valid_daterange": [["1990-01-01", "2026-10-21"]]},
+            {"name": "DILLON 1 E", "sids": ["03005 1", "052281 2"], "ll": [-106.04, 39.63],
+             "valid_daterange": [["1893-01-10", "2026-10-21"]]}]}
+        calls = []
+
+        def http(url, post_body=None, tries=3):
+            if url.endswith("StnMeta"):
+                return meta
+            calls.append(post_body["sid"])
+            if post_body["sid"] == "050002":
+                return {"data": [["2020-01-01", "1.0"]]}
+            return {"data": [[k, "0.3"] for k in sorted(history())]}
+        with mock.patch.object(rsf.rm, "http_json", side_effect=http):
+            px = rsf.auto_proxy(39.62, -106.37, NOW)
+        self.assertEqual((px["acis"], px["proxy"]), ("052281", "DILLON 1 E"))
+        self.assertEqual(calls, ["050002", "052281"])           # reporting ones first
+        self.assertGreaterEqual(px["proxy_seasons"], rsf.AUTO_PROXY_MIN_SEASONS)
+        with mock.patch.object(rsf.rm, "http_json", return_value={"meta": []}), \
+                self.assertRaises(ValueError):
+            rsf.auto_proxy(39.62, -106.37, NOW)
+
+    def test_auto_airport_is_the_nearest_reporting_station(self):
+        net = {"features": [
+            {"id": "OLD", "properties": {"archive_end": "2019-01-01"},
+             "geometry": {"coordinates": [-106.37, 39.62]}},
+            {"id": "CCU", "properties": {"archive_end": None},
+             "geometry": {"coordinates": [-106.15, 39.47]}},
+            {"id": "EGE", "properties": {"archive_end": None},
+             "geometry": {"coordinates": [-106.92, 39.64]}}]}
+        with mock.patch.object(rsf.rm, "cached_get_json", return_value=net), \
+                mock.patch.object(rsf, "obs_state", side_effect=lambda spec, now: {
+                    "wet": None if spec["iem"] == "CCU" else False}):
+            sid, network, km = rsf.auto_airport(39.62, -106.37, "CO", NOW)
+        self.assertEqual((sid, network), ("EGE", "CO_ASOS"))       # CCU not reporting
+        self.assertGreater(km, 40)
+
+    def test_book_median(self):
+        strikes = {"A": 60.0, "B": 80.0, "C": 100.0, "D": 120.0}
+        self.assertAlmostEqual(rsf.book_median(
+            strikes, {"A": [77, 79], "B": [57, 58], "C": [32, 33], "D": [16, 17]}), 86.0, 6)
+        # a wide book does not count; a ladder that never crosses 50% gives none
+        self.assertAlmostEqual(rsf.book_median(
+            strikes, {"A": [77, 79], "B": [20, 95], "C": [32, 33]}), 60 + 0.28 / 0.455 * 40, 6)
+        self.assertIsNone(rsf.book_median(strikes, {"A": [77, 79], "B": [57, 58]}))
+
+    def test_fit_scale_puts_the_median_on_the_book(self):
+        def sim(*a, **kw):
+            return {"totals": [10.0 * kw["hist_scale"]] * 20, "n_segments": 1,
+                    "horizon_days": 0}
+        with mock.patch.object(rmf, "simulate_period", side_effect=sim):
+            s = rsf.fit_scale("K", date(2026, 10, 1), date(2026, 12, 24), NOW, {}, 2.0, 60.0)
+            self.assertAlmostEqual(s, 5.0, 3)                       # 2s + 10s = 60
+            with self.assertRaises(ValueError):                     # out of range
+                rsf.fit_scale("K", date(2026, 10, 1), date(2026, 12, 24), NOW, {}, 0.0,
+                              10000.0)
+
+
 class TestWriter(unittest.TestCase):
 
     def setUp(self):
@@ -268,6 +355,80 @@ class TestWriter(unittest.TestCase):
         rsf.write_fair_file(self.path, now=later + timedelta(hours=3), events=self.events,
                             fair_fn=self.fair, obs_fn=self.obs(False))
         self.assertAlmostEqual(self._read()["anchors"][f"{EV}-GT80"]["off"], round(off, 4), 4)
+
+    def test_a_new_resort_is_mapped_once_fitted_and_listed(self):
+        ev = "KXVAILSNOW-24DEC26"
+        events = {ev: {"series": "KXVAILSNOW", "code": "KXVAILSNOW",
+                       "place": "Vail Mountain Resort", "start": "2026-10-01",
+                       "end": "2026-12-24", "strikes": {f"{ev}-GT80": 80.0},
+                       "books": {f"{ev}-GT80": [57, 58]}}}
+        maps, infos = [], []
+        spec = {"place": "Vail Mountain Resort", "tz": "US/Mountain", "iem": "CCU",
+                "net": "CO_ASOS", "proxy": "DILLON 1 E", "acis": "052281", "auto": True}
+
+        def map_fn(code, place, now):
+            maps.append((code, place))
+            return dict(spec)
+
+        def fair(e, info, now):
+            infos.append(info)
+            return dict(self.fair(e, info, now), p={f"{ev}-GT80": 0.5},
+                        fit=info.get("fit") or {"scale": 3.1, "book_median": 85.0})
+        kw = dict(events=events, fair_fn=fair, obs_fn=self.obs(False), map_fn=map_fn)
+        self.assertEqual(rsf.write_fair_file(self.path, now=NOW, **kw), (1, 0))
+        d = self._read()
+        self.assertEqual(maps, [("KXVAILSNOW", "Vail Mountain Resort")])
+        self.assertEqual(infos[0]["spec"]["iem"], "CCU")
+        self.assertIsNone(infos[0]["fit"])
+        self.assertEqual(d["mapped"]["KXVAILSNOW"]["auto"], True)
+        self.assertEqual(d["mapped"]["KXBEAVERSNOW"]["auto"], False)
+        self.assertEqual(d["fits"][ev]["scale"], 3.1)
+        self.assertAlmostEqual(d["markets"][f"{ev}-GT80"]["p"], 0.575, 4)
+        # the next write reuses the map and hands the fit back
+        rsf.write_fair_file(self.path, now=NOW + timedelta(minutes=10), **kw)
+        self.assertEqual(len(maps), 1)
+        self.assertEqual(infos[1]["fit"]["scale"], 3.1)
+
+    def test_an_unmapped_resort_is_listed_and_retried_after_six_hours(self):
+        ev = "KXWHISTLERSNOW-24DEC26"
+        events = {ev: {"series": "KXWHISTLERSNOW", "code": "KXWHISTLERSNOW",
+                       "place": "Whistler Blackcomb", "start": "2026-10-01",
+                       "end": "2026-12-24", "strikes": {f"{ev}-GT80": 80.0}}}
+        maps = []
+
+        def map_fn(code, place, now):
+            maps.append(now)
+            raise ValueError(f"{place!r} is not in KNOWN_RESORTS")
+        kw = dict(events=events, fair_fn=self.fair, obs_fn=self.obs(False), map_fn=map_fn)
+        self.assertEqual(rsf.write_fair_file(self.path, now=NOW, **kw), (0, 1))
+        d = self._read()
+        self.assertNotIn("KXWHISTLERSNOW", d["mapped"])
+        self.assertIn("not in KNOWN_RESORTS", d["unmapped"]["KXWHISTLERSNOW"])
+        self.assertEqual(d["event_state"][ev]["error"], "no resort")
+        rsf.write_fair_file(self.path, now=NOW + timedelta(hours=5), **kw)
+        self.assertEqual(len(maps), 1)
+        rsf.write_fair_file(self.path, now=NOW + timedelta(hours=6, minutes=1), **kw)
+        self.assertEqual(len(maps), 2)
+
+    def test_a_new_series_in_the_feed_is_read_at_once(self):
+        calls = []
+
+        def reader(path, params):
+            calls.append(params["series_ticker"])
+            return {"markets": [market(80)] if params["series_ticker"] == "KXBEAVERSNOW"
+                    else []}
+        kw = dict(fair_fn=self.fair, obs_fn=self.obs(False), get_json=reader)
+        with mock.patch.object(rsf, "SERIES", ("KXBEAVERSNOW",)), \
+                mock.patch.object(rsf.time, "sleep"):
+            rsf.write_fair_file(self.path, now=NOW, **kw)
+            rsf.write_fair_file(self.path, now=NOW + timedelta(minutes=10),
+                                extra_series=("KXBEAVERSNOW",), **kw)
+            self.assertEqual(calls, ["KXBEAVERSNOW"])
+            rsf.write_fair_file(self.path, now=NOW + timedelta(minutes=20),
+                                extra_series=("KXVAILSNOW", "KXCHISNOWM",
+                                              "KXEARNINGSMENTIONSNOW"), **kw)
+            self.assertEqual(calls, ["KXBEAVERSNOW", "KXBEAVERSNOW", "KXVAILSNOW"])
+            self.assertEqual(self._read()["events_series"], ["KXBEAVERSNOW", "KXVAILSNOW"])
 
     def test_cached_events_never_step_and_a_failed_fair_keeps_its_anchors(self):
         calls = []
