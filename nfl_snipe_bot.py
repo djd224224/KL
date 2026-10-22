@@ -32,7 +32,11 @@ have (Keenan Allen out -> Downs' ladder 24 -> 34). A signal is SKIPPED when:
   stale_*       the model or the ESPN roster read is old
   too_late      inside stop_before_kickoff_min (15) of kickoff (ESPN's
                 scoreboard); too_early past max_hours_before (72)
-  cooldown      this bot traded the market in the last cooldown_secs (900)
+  cooldown      this bot traded the market in the last cooldown_secs (900),
+                unless this signal's limit is the last fill's or better for
+                us on the same side (refill, Jack 2026-10-22: "Increase
+                size"): a bid that refills at the price just sold into is
+                sold again at once, up to the caps
 
 RECENT FORM, A SECOND OPINION. The model's mean is a long EWMA (8-game
 half-life, prior seasons at half weight), slow to see a role that grew:
@@ -60,8 +64,11 @@ bottom.
 
 SIZE. The external liquidity inside the limit (our own resting orders
 netted out), capped by max_contracts_order (300) and by the money at risk:
-max_risk_market ($40), max_risk_player ($80), max_risk_total ($250) over
-this bot's open book, and the account's free cash on the market's shard
+max_risk_market ($80), max_risk_player ($160), max_risk_total ($250) over
+this bot's open book (market / player $40 / $80 until Jack 2026-10-22:
+"Increase size" -- its one live trade, 9 of Nico Collins' yards ladder at
+28c on 10/18, took every contract bid over its limit, and the bid that
+refilled 18 s later sat out the cooldown), and the account's free cash on the market's shard
 less cash_floor ($500, left for the IMM). Selling YES at 3c puts 97c a
 contract at risk, so the caps bind long before the book does on cheap
 contracts. At most max_orders_per_scan (3) orders a scan, max_orders_per_day
@@ -175,8 +182,8 @@ class Config:
     min_net_cents: float = 2.0           # per contract vs the fair, after fee
     min_ror: float = 0.03                # net / money at risk per contract
     max_mu_ratio: float = 2.5            # book-implied mean vs the model's
-    max_risk_market: float = 40.0        # dollars at risk, this bot's book
-    max_risk_player: float = 80.0
+    max_risk_market: float = 80.0        # dollars at risk, this bot's book (40 until 10/22)
+    max_risk_player: float = 160.0       # (80 until 10/22)
     max_risk_total: float = 250.0
     max_contracts_order: int = 300
     min_contracts_order: int = 5
@@ -190,6 +197,7 @@ class Config:
     model_mismatch_tol: float = 0.15     # vs the IMM's fair for the market
     recent_games: int = 4                # the recent-form band's window
     cooldown_secs: float = 900.0
+    refill: bool = True                  # the cooldown passes a repeat at the last limit or better
     max_orders_per_scan: int = 3
     max_orders_per_day: int = 40
 
@@ -424,7 +432,7 @@ class SnipeBook:
         self.subaccount = int(subaccount)
         self.d: Dict[str, Any] = {"positions": {}, "cost": {}, "fees": {},
                                   "player": {}, "kickoff": {}, "last_trade": {},
-                                  "fills": [], "closed": [],
+                                  "last_limit": {}, "fills": [], "closed": [],
                                   "day": {"date": "", "orders": 0}}
         try:
             with open(path, encoding="utf-8") as f:
@@ -457,6 +465,17 @@ class SnipeBook:
     def last_trade(self, t: str) -> float:
         return float(self.d["last_trade"].get(t, 0.0))
 
+    def refill_ok(self, t: str, side: str, limit: float) -> bool:
+        """A repeat on market t is no worse than the last fill: the same side
+        at the same limit or one better for us (a sell's higher, a buy's
+        lower). False for a fill booked before limits were kept."""
+        last = self.d["last_limit"].get(t)
+        if not last or last[0] != side:
+            return False
+        if side == "sell":
+            return limit >= float(last[1]) - 1e-9
+        return limit <= float(last[1]) + 1e-9
+
     def orders_today(self, now_ts: float) -> int:
         day = _utc(now_ts).strftime("%Y-%m-%d")
         return int(self.d["day"].get("orders", 0)) if self.d["day"].get("date") == day else 0
@@ -469,7 +488,9 @@ class SnipeBook:
 
     def apply_fill(self, t: str, side: str, n: float, avg_cents: float,
                    fee_dollars: float, player: str, kickoff: Optional[float],
-                   now_ts: float, order_id: str = "", paper: bool = False) -> None:
+                   now_ts: float, order_id: str = "", paper: bool = False,
+                   limit: Optional[float] = None) -> None:
+        """`limit`: the signal's limit, cents (the refill rule's reference)."""
         sign = 1.0 if side == "buy" else -1.0
         self.d["positions"][t] = round(self.pos(t) + sign * n, 4)
         self.d["cost"][t] = round(float(self.d["cost"].get(t, 0.0))
@@ -479,10 +500,13 @@ class SnipeBook:
         if kickoff is not None:
             self.d["kickoff"][t] = kickoff
         self.d["last_trade"][t] = now_ts
+        if limit is not None:
+            self.d["last_limit"][t] = [side, float(limit)]
         self.d["fills"].append({"ts": now_ts, "ticker": t, "side": side, "n": n,
                                 "avg_cents": round(avg_cents, 4),
                                 "fee": round(fee_dollars, 4),
-                                "order_id": order_id, "paper": paper})
+                                "order_id": order_id, "paper": paper,
+                                "limit": limit})
         self.d["fills"] = self.d["fills"][-500:]
         if abs(self.d["positions"][t]) < 1e-9:
             self.d["positions"].pop(t, None)
@@ -501,7 +525,8 @@ class SnipeBook:
                     "cost": self.d["cost"].get(t, 0.0),
                     "fees": self.d["fees"].get(t, 0.0),
                     "player": self.d["player"].get(t), "kickoff": self.d["kickoff"][t]})
-            for k in ("positions", "cost", "fees", "player", "kickoff", "last_trade"):
+            for k in ("positions", "cost", "fees", "player", "kickoff", "last_trade",
+                      "last_limit"):
                 self.d[k].pop(t, None)
         self.d["closed"] = self.d["closed"][-500:]
         return gone
@@ -835,7 +860,8 @@ def skip_reason(sig: Signal, e: dict, snap_ts: float, now_ts: float,
         return "mu_ratio"
     if any(abs(s - imu) <= cfg.sibling_tol * imu for s in siblings.values()):
         return "sibling"
-    if now_ts - book.last_trade(sig.ticker) < cfg.cooldown_secs:
+    if now_ts - book.last_trade(sig.ticker) < cfg.cooldown_secs and not (
+            cfg.refill and book.refill_ok(sig.ticker, sig.side, sig.limit)):
         return "cooldown"
     return ""
 
@@ -1111,7 +1137,7 @@ class Sniper:
             # a PAPER fill at the swept levels, so caps and cooldowns act
             self.book.apply_fill(sig.ticker, sig.side, got, avg,
                                  got * fee_cents(avg) / 100.0, sig.player_key,
-                                 sig.kickoff, now_ts, paper=True)
+                                 sig.kickoff, now_ts, paper=True, limit=sig.limit)
             if cash[shard] is not None:
                 cash[shard] -= got * (risk_per_contract(sig.side, avg)
                                       + fee_cents(avg) / 100.0)
@@ -1138,7 +1164,8 @@ class Sniper:
                                               avg_fill, fee, now_ts)
         if filled > 0:
             self.book.apply_fill(sig.ticker, sig.side, filled, avg_fill, fee,
-                                 sig.player_key, sig.kickoff, now_ts, order_id=oid)
+                                 sig.player_key, sig.kickoff, now_ts, order_id=oid,
+                                 limit=sig.limit)
             if cash[shard] is not None:
                 cash[shard] -= filled * risk_per_contract(sig.side, avg_fill) + fee
             self.log.row("fills", {**row, "order_id": oid, "client_order_id": coid,
@@ -1174,7 +1201,8 @@ class Sniper:
         if filled > 0 and booked == 0:
             primary = SnipeBook(os.path.join(self.log_dir, BOOK_FILE), 0)
             primary.apply_fill(sig.ticker, sig.side, filled, avg_fill, fee,
-                               sig.player_key, sig.kickoff, now_ts, order_id=oid)
+                               sig.player_key, sig.kickoff, now_ts, order_id=oid,
+                               limit=sig.limit)
             primary.save()
         self.log.row("orders", {**row, "order_id": oid, "client_order_id": coid,
                                 "filled": filled, "avg_cents": avg_fill, "fee": fee,

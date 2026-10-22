@@ -25,7 +25,10 @@ T_YDS = "KXNFLESCALATORRECYDS-26OCT04TENBAL-TENTPOLLARD20"
 
 
 def cfg(**kw):
+    # the sizing numbers below were written for the original $40 market /
+    # $80 player caps; TestDefaults pins the live ones (2026-10-22)
     c = sb.Config()
+    c.max_risk_market, c.max_risk_player = 40.0, 80.0
     for k, v in kw.items():
         setattr(c, k, v)
     return c
@@ -282,8 +285,34 @@ class TestSkipReasons(unittest.TestCase):
         self.assertEqual(self.r(sibs={T_ESC: 6.5}), "sibling")          # within 15%
         self.assertEqual(self.r(sibs={T_ESC: 4.0}), "")
         self.book.apply_fill(T, "sell", 10, 34.0, 0.0, "k", KICK, NOW - 60)
-        self.assertEqual(self.r(), "cooldown")
+        self.assertEqual(self.r(), "cooldown")          # no limit kept: no refill
         self.assertEqual(self.r(now=NOW + 1000), "")
+
+    def test_a_refill_at_the_last_limit_or_better_passes_the_cooldown(self):
+        # Jack 2026-10-22, "Increase size": the 29c bid Collins' ladder
+        # refilled 18 s after the sniper sold into it sat out the cooldown
+        s = self.sig()
+        self.book.apply_fill(T, "sell", 10, 34.0, 0.0, "k", KICK, NOW - 60, limit=s.limit)
+        self.assertEqual(self.r(s), "")                                   # same limit
+        self.assertEqual(self.r(self.sig(limit=s.limit + 1)), "")        # higher sell
+        self.assertEqual(self.r(self.sig(limit=s.limit - 1)), "cooldown")   # lower sell
+        self.assertEqual(self.r(self.sig(side="buy")), "cooldown")       # other side
+        self.assertEqual(self.r(s, refill=False), "cooldown")
+        self.book.apply_fill(T, "buy", 10, 20.0, 0.0, "k", KICK, NOW - 30, limit=20.0)
+        self.assertEqual(self.r(self.sig(side="buy", limit=20.0)), "")
+        self.assertEqual(self.r(self.sig(side="buy", limit=19.0)), "")
+        self.assertEqual(self.r(self.sig(side="buy", limit=21.0)), "cooldown")
+        self.book.prune(KICK + 10 ** 6)
+        self.assertEqual(self.book.d["last_limit"], {})
+
+
+class TestDefaults(unittest.TestCase):
+    def test_live_caps_and_refill(self):
+        c = sb.Config()
+        self.assertEqual((c.max_risk_market, c.max_risk_player, c.max_risk_total),
+                         (80.0, 160.0, 250.0))
+        self.assertTrue(c.refill)
+        self.assertFalse(sb.Config.from_env({"SNIPE_REFILL": "0"}).refill)
 
     def test_sibling_means_ignore_wide_books(self):
         entries = {T: entry(), T_ESC: entry(kind="escalator", fair=2.5, lo=1, hi=5)}
@@ -422,9 +451,25 @@ class TestScan(unittest.TestCase):
         self.assertEqual(b.book.pos(T), -CAPPED)
         self.assertTrue(os.path.exists(os.path.join(self.d, sb.PAPER_BOOK_FILE)))
         self.assertFalse(os.path.exists(os.path.join(self.d, sb.BOOK_FILE)))
-        # the next scan: cooldown on the market
+        # the next scan: the same limit is a refill, and the $40 market cap
+        # is what stops it; without the refill rule, the cooldown
         out = b.scan(NOW + 30)
+        self.assertEqual(out["skips"].get("market_cap"), 1)
+        b.cfg.refill = False
+        out = b.scan(NOW + 60)
         self.assertEqual(out["skips"].get("cooldown"), 1)
+
+    def test_a_refill_sells_again_up_to_the_caps(self):
+        # the fake book is not consumed by a paper fill: it reads as the 34c
+        # / 33c bids refilling, so each scan sells the 60 over the limit
+        # again until the market cap ($80 here) leaves too little
+        b, ex = self.bot(max_risk_market=80.0, max_risk_player=160.0)
+        out = b.scan(NOW)
+        self.assertEqual(out["taken"][0]["count"], 60)
+        out = b.scan(NOW + 30)
+        self.assertEqual(len(out["taken"]), 1)
+        self.assertEqual(b.book.pos(T), -60 - out["taken"][0]["count"])
+        self.assertLessEqual(b.book.risk(T), 80.0)
 
     def test_live_sends_one_ioc_and_books_the_fill(self):
         b, ex = self.bot(live=True)
