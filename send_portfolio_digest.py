@@ -679,6 +679,59 @@ def yes_mark(bid: float, ask: float, last: float):
     return _yes_mark_src(bid, ask, last)[0]
 
 
+# THE MARK BASIS (Jack 2026-10-22: "Why not move to last-trade pricing in
+# email, so it's consistent with kalshi UI?" -> "Everything last trade").
+# Open positions are valued at each market's last trade, Kalshi's own
+# valuation (its portfolio_value is the positions at their last trade less
+# the collateral it has handed back), so the trading lines, the movers table
+# and the day by bot add up to the day the Kalshi UI shows, and the
+# reconciling line shrinks to a residual (a market that never traded keeps
+# its mid-rule mark; the reads are seconds apart). The day needs the prior
+# morning's last trades: after a snapshot that did not record them (the
+# mid-basis mornings before 10/23) the day stays on the mid basis, so no
+# event reads the one-time re-pricing as a move. A stale last trade is
+# Kalshi's number too: 10/22 had a 30Y Treasury strike at a 69c print under
+# a 0/10c book. PF_MARK_BASIS=mid restores the mids (yes_mark).
+MARK_BASIS = os.environ.get("PF_MARK_BASIS", "last").strip().lower()
+
+
+def last_marks(tickers, mark_info, mid_marks):
+    """Each open position's YES mark ($) at its market's last trade; the
+    mid-basis mark (mid_marks) where the market has no trade on record."""
+    out = {}
+    for tk in tickers:
+        last = _f((mark_info.get(tk) or {}).get("last"))
+        if last > 0.0:
+            out[tk] = last
+        elif tk in mid_marks:
+            out[tk] = mid_marks[tk]
+    return out
+
+
+def day_basis(prior) -> str:
+    """The day's mark basis: "last" when MARK_BASIS asks for it and the
+    prior snapshot recorded its last trades, else "mid"."""
+    if MARK_BASIS != "last" or not prior or not prior.get("lasts_recorded"):
+        return "mid"
+    return "last"
+
+
+def start_values(prior_tickers, basis: str):
+    """(ticker -> (pos, value) at the prior morning, ticker -> event): each
+    prior position valued on the day's basis (its recorded last trade on
+    "last", its mid-rule mark otherwise; at cost without either)."""
+    start, ev_map = {}, {}
+    for ev, tks in (prior_tickers or {}).items():
+        for tk, r in tks.items():
+            q = _f(r.get("pos"))
+            m = r.get("mark")
+            if basis == "last" and r.get("last") is not None:
+                m = r.get("last")
+            start[tk] = (q, side_value(q, m, _f(r.get("cost"))))
+            ev_map[tk] = ev
+    return start, ev_map
+
+
 def mark_positions(tickers, mark_info, prior_marks):
     """(marks, mark_src): each open position's YES mark ($) off today's
     market read (yes_mark), else the prior snapshot's mark, else None = at
@@ -904,6 +957,11 @@ def build_portfolio(now_utc: datetime):
     # neutral, never a fake loss).
     mark_info = fetch_market_info(client, list(mkt_pos))
     marks, mark_src = mark_positions(mkt_pos, mark_info, prior_marks)
+    # the day's basis (MARK_BASIS): the last trades once the prior morning
+    # recorded them; both marks go into the snapshot either way
+    lasts = last_marks(mkt_pos, mark_info, marks)
+    mark_basis = day_basis(prior)      # (`basis` below is each event's cost)
+    val_marks = lasts if mark_basis == "last" else marks
 
     # Group open value + cost basis by event.
     ev_value, ev_basis, ev_tickers = {}, {}, {}
@@ -911,7 +969,7 @@ def build_portfolio(now_utc: datetime):
     for tk, rec in mkt_pos.items():
         pos, cost = rec["pos"], rec["cost"]
         ev = (mark_info.get(tk) or {}).get("event") or event_from_ticker(tk)
-        mark = marks.get(tk)
+        mark = val_marks.get(tk)
         if mark is None:
             val = cost                     # marked at cost: unrealized 0
         else:
@@ -920,9 +978,11 @@ def build_portfolio(now_utc: datetime):
         tk_event[tk] = ev
         ev_value[ev] = ev_value.get(ev, 0.0) + val
         ev_basis[ev] = ev_basis.get(ev, 0.0) + cost
+        mid_mark, last = marks.get(tk), lasts.get(tk)
         ev_tickers.setdefault(ev, {})[tk] = {
             "pos": pos, "cost": round(cost, 2),
-            "mark": None if mark is None else round(mark, 4)}
+            "mark": None if mid_mark is None else round(mid_mark, 4),
+            "last": None if last is None else round(last, 4)}
 
     # Prior events now absent everywhere (no open legs, no settlement trail):
     # can't tell a data gap from an ancient settlement — flag, don't guess.
@@ -1004,6 +1064,8 @@ def build_portfolio(now_utc: datetime):
                 "subs": None if subs is None else {
                     str(n): v for n, v in subs["accounts"].items()},
                 "account_value": account_value,
+                # every ticker carries its last trade from here on (MARK_BASIS)
+                "lasts_recorded": True, "mark_basis": mark_basis,
                 "unpaid_rewards_est": (unpaid or {}).get("total"),
                 "deposited": deposited, "withdrawn": withdrawn,
                 "total_profit": total_profit,
@@ -1022,12 +1084,7 @@ def build_portfolio(now_utc: datetime):
     sub_moves = sub_moves_by = None
     prior_tickers = (prior or {}).get("tickers")
     if prior and prior_created is not None and prior_tickers:
-        ev_map, start = {}, {}
-        for ev, tks in prior_tickers.items():
-            for tk, r in tks.items():
-                q = _f(r.get("pos"))
-                start[tk] = (q, side_value(q, r.get("mark"), _f(r.get("cost"))))
-                ev_map[tk] = ev
+        start, ev_map = start_values(prior_tickers, mark_basis)
         win_setts = []
         for s in settlements:
             ts = datetime.fromisoformat((s.get("settled_time") or "").replace("Z", "+00:00"))
@@ -1114,8 +1171,10 @@ def build_portfolio(now_utc: datetime):
                          "value_now": t["value"], "note": note})
     rows.sort(key=lambda r: -r["day"])
 
-    log(f"marks: {mark_src} | Kalshi values positions ${kalshi_pv:,.2f} "
-        f"vs our mids ${positions_value:,.2f}"
+    log(f"marks: {mark_src} | basis {mark_basis} | Kalshi values positions ${kalshi_pv:,.2f} "
+        f"(+ ${collat:,.2f} collateral returned) vs our "
+        f"{'last trades' if mark_basis == 'last' else 'mids'} "
+        f"${positions_value:,.2f}"
         + (f" | unreadable: {', '.join(unreadable)}" if unreadable else ""))
     return {"today": today_str, "cash": round(cash, 2),
             "positions_value": positions_value, "equity": equity,
@@ -1132,7 +1191,7 @@ def build_portfolio(now_utc: datetime):
             "unpaid": unpaid, "deposited": deposited, "withdrawn": withdrawn,
             "total_profit": total_profit, "transfers": transfers,
             "rows": rows, "snapshot": snapshot, "prior": prior,
-            "mark_src": mark_src, "unreadable": unreadable,
+            "mark_src": mark_src, "unreadable": unreadable, "mark_basis": mark_basis,
             "n_settlements": len(settlements),
             "no_trade_cash": no_trade_cash, "net_transfers": net_transfers,
             "replay": replay_info,
@@ -1705,6 +1764,15 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     # credits; deposits apart when the transfer reads work), and Kalshi's
     # valuation of the open positions against the mids these rows use.
     movers, mv_tot, (mv_hidden_n, mv_hidden_net) = family_movers(pf["rows"])
+    # the rows' mark basis (MARK_BASIS): on the last trades Kalshi uses, its
+    # valuation and the rows differ only by a residual
+    last_basis = pf.get("mark_basis") == "last"
+    at = "last trade" if last_basis else "mid"
+    trade_lbl = f"trading (at {at})"
+    px_lbl = "valuation residual" if last_basis else "Kalshi's pricing vs mid"
+    px_why = ("Kalshi's value of the positions vs ours, both at last trades: "
+              "a market that never traded sits at its mid" if last_basis else
+              "a gap between two valuations, no bot's")
     ex_what = [w for w, v in (("perpetuals", perps_eq), ("subaccounts", subs_eq))
                if v is not None]
     ex_perps = " ex-" + " & ".join(ex_what) if ex_what else ""
@@ -1723,13 +1791,13 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     rewards = None
     if not first:
         if ntc is None:                 # no replay (legacy prior snapshot)
-            parts = [("trading (at mid)", trading),
-                     ("credits, deposits & Kalshi's pricing vs mid",
+            parts = [(trade_lbl, trading),
+                     (f"credits, deposits & {px_lbl}",
                       round(d_ek - trading, 2))]
         else:
             rewards = round(ntc - (transfers or 0.0) - (moves or 0.0)
                             - (collat_d or 0.0), 2)
-            parts = [("trading (at mid)", trading),
+            parts = [(trade_lbl, trading),
                      ("reward credits" + ("" if transfers is not None else " & deposits")
                       + ("" if moves is not None else " & subaccount moves")
                       + ("" if collat_d is not None else " & Kalshi collateral"), rewards)]
@@ -1737,7 +1805,7 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                 parts.append(("deposits/withdrawals", transfers))
             if moves:
                 parts.append(("subaccount transfers", moves))
-            parts.append(("Kalshi's pricing vs mid",
+            parts.append((px_lbl,
                           round(d_ek - trading - ntc + (collat_d or 0.0), 2)))
 
     # The day figure, in the subject and the body, leaves deposits and
@@ -1764,7 +1832,7 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     by_bot = None
     if BY_BOT_ENABLED and rewards is not None and parts:
         by_bot = day_by_bot(pf, imm_events, parts[1], d_perps, subs_pnl)
-    pricing = dict(parts or []).get("Kalshi's pricing vs mid")
+    pricing = dict(parts or []).get(px_lbl)
     late = rewards is not None and abs(rewards) < 1.0
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
@@ -1811,14 +1879,13 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                      + day_tail + excl_txt)
     if by_bot:
         lines.append("")
-        lines.append("The day by bot (7am yesterday -> 7am today, at mid):")
+        lines.append(f"The day by bot (7am yesterday -> 7am today, at {at}):")
         for b, tot, ps in by_bot:
             lines.append(f"  {b:8s} {tot:>+11,.2f}  =  "
                          + "  +  ".join(f"{k} {v:+,.2f}" for k, v in ps)
                          + (f"  ({LATE_PAYOUT_NOTE})" if b == "IMM" and late else ""))
         if pricing is not None:
-            lines.append(f"  {'Kalshi':8s} {pricing:>+11,.2f}  =  Kalshi's pricing vs mid "
-                         f"(a gap between two valuations, no bot's)")
+            lines.append(f"  {'Kalshi':8s} {pricing:>+11,.2f}  =  {px_lbl} ({px_why})")
         lines.append(f"  {'= day':8s} {d_day:>+11,.2f}")
     elif late:
         lines.append(f"({LATE_PAYOUT_NOTE})")
@@ -1832,7 +1899,7 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
         lines.append(imm["risk_text"])
     lines.append("")
     lines.append(f"Biggest movers since yesterday, by family / event, grouped "
-                 f"as on the IMM dashboard (settled + unrealized; top {len(movers)} of "
+                 f"as on the IMM dashboard (settled + unrealized at {at}; top {len(movers)} of "
                  f"{mv_tot['n_families']} families):")
     lines.append(f"{'FAMILY / EVENT':56s} {'DAY P&L':>9s} {'REALIZED':>9s} "
                  f"{'UNREALIZED':>10s} {'OPEN NOW':>9s}")
@@ -1920,7 +1987,7 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     if by_bot:
         h.append(f'<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
                  f'The day by bot <span style="color:{C_MUTED};font-weight:400;'
-                 f'font-size:13px">7am yesterday &rarr; 7am today, at mid</span></div>')
+                 f'font-size:13px">7am yesterday &rarr; 7am today, at {at}</span></div>')
         h.append('<table style="border-collapse:collapse;font-size:13px;margin-bottom:6px">')
         for b, tot, ps in by_bot:
             made = ' &nbsp;+&nbsp; '.join(f'{_esc(k)} {_pnl_span(v)}' for k, v in ps)
@@ -1932,8 +1999,8 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
         if pricing is not None:
             h.append(f'<tr style="color:{C_MUTED}"><td style="{TDL}">Kalshi</td>'
                      f'<td style="{TD}">{_pnl_span(pricing)}</td>'
-                     f'<td style="{TDL}font-size:12px">Kalshi\'s pricing vs mid (a gap '
-                     f'between two valuations, no bot\'s)</td></tr>')
+                     f'<td style="{TDL}font-size:12px">{_esc(px_lbl)} '
+                     f'({_esc(px_why)})</td></tr>')
         h.append(f'<tr style="background:#f0f0f0;font-weight:700"><td style="{TDL}">Day</td>'
                  f'<td style="{TD}">{_pnl_span(d_day)}</td><td style="{TDL}"></td></tr>')
         h.append('</table>')
@@ -1961,7 +2028,7 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     h.append(f'<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
              f'Biggest movers since yesterday, by family / event'
              f' <span style="color:{C_MUTED};font-weight:400;font-size:13px">'
-             f'grouped as on the IMM dashboard &middot; settled + unrealized '
+             f'grouped as on the IMM dashboard &middot; settled + unrealized at {at} '
              f'&middot; top {len(movers)} of {mv_tot["n_families"]} families</span></div>')
     if movers:
         mono = "font-family:Consolas,Menlo,monospace;font-size:12px"
@@ -2029,10 +2096,13 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                         f'it is not profit)')
                      + ("" if collat_d is not None else
                         ' (today they still hold collateral Kalshi released or took '
-                        'back on mutually exclusive positions, and Kalshi\'s pricing '
-                        'vs mid the opposite: the prior morning did not record it)')
+                        f'back on mutually exclusive positions, and the '
+                        f'{_esc(px_lbl)} the opposite: the prior morning did not record it)')
                      + '; Kalshi values open positions at their last trade, less the '
-                       'collateral it has handed back, this table at the mid.</div>')
+                       'collateral it has handed back, '
+                     + ('this table at the last trade too (a market that never traded '
+                        'at its mid).</div>' if last_basis else
+                        'this table at the mid.</div>'))
     else:
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')

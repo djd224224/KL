@@ -1296,5 +1296,49 @@ class DayByBotTests(unittest.TestCase):
         self.assertIn("+600.00  =  trading -100.00  +  reward credits +700.00\n", text)
 
 
+class MarkBasisTests(unittest.TestCase):
+    """Jack 2026-10-22: "Why not move to last-trade pricing in email, so it's
+    consistent with kalshi UI?" -> "Everything last trade"."""
+
+    def test_last_marks_fall_back_to_the_mid_rule(self):
+        info = {"A": {"last": 0.62}, "B": {"last": 0.0}, "C": {}}
+        self.assertEqual(pf.last_marks(["A", "B", "C"], info, {"A": 0.5, "B": 0.4}),
+                         {"A": 0.62, "B": 0.4})
+
+    def test_the_day_needs_the_prior_mornings_last_trades(self):
+        self.assertEqual(pf.day_basis(None), "mid")
+        self.assertEqual(pf.day_basis({"date": "2026-10-22"}), "mid")   # the switch day
+        self.assertEqual(pf.day_basis({"lasts_recorded": True}), "last")
+        old = pf.MARK_BASIS
+        pf.MARK_BASIS = "mid"
+        try:
+            self.assertEqual(pf.day_basis({"lasts_recorded": True}), "mid")
+        finally:
+            pf.MARK_BASIS = old
+
+    def test_start_values_on_each_basis(self):
+        prior = {"EV-1": {"EV-1-A": {"pos": 10, "cost": 4.0, "mark": 0.5, "last": 0.6},
+                          "EV-1-B": {"pos": -10, "cost": 6.0, "mark": 0.3, "last": None}}}
+        start, ev = pf.start_values(prior, "last")
+        self.assertEqual(start, {"EV-1-A": (10.0, 6.0), "EV-1-B": (-10.0, 7.0)})
+        self.assertEqual(ev, {"EV-1-A": "EV-1", "EV-1-B": "EV-1"})
+        start, _ = pf.start_values(prior, "mid")
+        self.assertEqual(start, {"EV-1-A": (10.0, 5.0), "EV-1-B": (-10.0, 7.0)})
+
+    def test_the_email_says_last_trade(self):
+        p = DayByBotTests()._pf()
+        p["mark_basis"] = "last"
+        _, text, html = pf.build_email(p, [], chart_ok=False,
+                                       imm_events=DayByBotTests.IMM)
+        self.assertIn("vs yesterday: +502.00  =  trading (at last trade) -105.00  +  "
+                      "reward credits +700.00  +  valuation residual -95.00", text)
+        self.assertIn("The day by bot (7am yesterday -> 7am today, at last trade):", text)
+        self.assertIn("=  valuation residual (Kalshi's value of the positions vs ours, "
+                      "both at last trades", text)
+        self.assertIn("settled + unrealized at last trade", text)
+        self.assertIn("this table at the last trade too", html)
+        self.assertNotIn("at mid", text + html)
+
+
 if __name__ == "__main__":
     unittest.main()
