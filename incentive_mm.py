@@ -3250,8 +3250,8 @@ MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 # bot averaged 36 tokens/s, peaking ~130 at the old 12/s pace, and the crypto
 # fleet sharing the key averaged 17; no 429 in the IMM logs 10/13-10/17. At
 # 24/s a wave can take 240 tokens/s, leaving ~60/s plus the bucket for the
-# rest of the fleet. RATE_LIMIT_ALERT emails any 429 rejection, ours or the
-# crypto bots'.
+# rest of the fleet. RATE_LIMIT_ALERT emails any write a 429 rejects, ours or
+# the crypto bots' (their read 429s are logged only, 2026-10-22).
 PLACE_RATE_PER_SEC = _env_float("IMM_PLACE_RATE_PER_SEC", 24.0)
 
 
@@ -9443,6 +9443,167 @@ RATE_LIMIT_SCAN_DIRS: Tuple[str, ...] = tuple(
         "crypto-annual,crypto-touch,crypto-touch-weekly,crypto-updown,nfl-snipe,gas-bot").split(","))
     if d)
 RATE_LIMIT_MAX_READ_BYTES = 8 * 1024 * 1024    # per file per look
+# Rejected WRITES only (Jack 2026-10-22: "Yes", to counting only rejected
+# order writes in the fleet scan). The crypto bots log a rejected write as
+# "! place rejected (HttpError(429 ..." or "! cancel failed <id>:
+# HttpError(429 ...", and a read they skip as "! shard balance read failed
+# (HttpError(429 ...)); cash guard skipped" -- the 10/22 09:23 ET email was
+# one of those. A 429 line this calls a read is logged, never emailed; a
+# shape it does not know counts as a write.
+RATE_LIMIT_READ_LINE = re.compile(
+    r"\b(?:read|fetch|get|load|poll|lookup)\w*\s+(?:failed|error)", re.I)
+# EXCHANGE PAUSE (Jack 2026-10-22: "Yes. But be careful in case and consider
+# if the maintenance pause ever changes", to the pause-aware watchdog).
+# Kalshi pauses trading every Thursday 03:00-05:00 ET (GET /exchange/schedule;
+# /exchange/status then reads trading_active false, overall and on every
+# shard) and refuses each place / amend with 409 {"code":"trading_is_paused"}
+# -- cancels went through for its first ~6 minutes on 10/22, then were
+# refused too. The bot knew nothing of it: ~1,800 placements a cycle for two
+# hours (60,809 refused on 10/22, plus 131 429s; the flood tripped the
+# account's limiter for the crypto bots as well -> rate_limit emails), and
+# the watchdog paged "quoting looks silently dead" (10/08, 10/15, 10/22).
+# Nothing here hard-codes that window. A pause is what Kalshi itself answers,
+# per exchange shard:
+#   enter  a place / amend refused with a pause code (one naming "paused",
+#          or IMM_EXCH_PAUSE_CODES) while GET /exchange/status shows the
+#          market's shard, or the exchange, not trading -- or, the status
+#          unreadable or not agreeing, pause-code refusals across
+#          EXCH_PAUSE_EVENTS events of the shard inside EXCH_PAUSE_PROBE_SECS
+#          (one paused market or event never stops a shard); any other
+#          409/503 only with the status agreeing;
+#   hold   places and amends on the shard are not sent; cancels still go
+#          out, and the cycle's reads, logs and status run as before;
+#   leave  the status shows the shard trading (read every
+#          EXCH_PAUSE_POLL_SECS while paused, unless it never agreed), a
+#          place / amend there is taken, or -- the probe, so a status that
+#          breaks or lags costs at most this -- one write goes out
+#          EXCH_PAUSE_PROBE_SECS after the last refusal;
+#   watchdog  leaves out the markets of paused shards (all of them while the
+#          status shows the whole exchange paused);
+#   email  `exchange_pause`, once a pause, when it has run
+#          EXCH_PAUSE_ALERT_MIN outside Kalshi's published schedule
+#          (/exchange/schedule: standard hours on the ET clock + maintenance
+#          windows, read every 6h) or with the schedule unreadable, or
+#          EXCH_PAUSE_OVERRUN_MIN past the published reopening: a pause that
+#          moves, lengthens or comes unannounced is reported, the usual one
+#          is not.
+# IMM_EXCH_PAUSE=off sends every write as before.
+EXCH_PAUSE_MODE = os.environ.get("IMM_EXCH_PAUSE", "on")
+EXCH_PAUSE_CODES: Tuple[str, ...] = tuple(
+    c.strip() for c in os.environ.get("IMM_EXCH_PAUSE_CODES", "").split(",")
+    if c.strip())
+EXCH_PAUSE_POLL_SECS = max(5.0, _env_float("IMM_EXCH_PAUSE_POLL_SECS", 15.0))
+EXCH_PAUSE_PROBE_SECS = max(10.0, _env_float("IMM_EXCH_PAUSE_PROBE_SECS", 60.0))
+EXCH_PAUSE_EVENTS = max(2, _env_int("IMM_EXCH_PAUSE_EVENTS", 5))
+EXCH_PAUSE_ALERT_MIN = max(1.0, _env_float("IMM_EXCH_PAUSE_ALERT_MIN", 20.0))
+EXCH_PAUSE_OVERRUN_MIN = max(1.0, _env_float("IMM_EXCH_PAUSE_OVERRUN_MIN", 15.0))
+EXCH_SCHEDULE_TTL_SECS = 6 * 3600.0
+EXCH_PAUSE_MERGE_SECS = 120.0     # a pause found again this soon continues
+
+
+def kalshi_error_code(e) -> str:
+    """The "code" of the JSON error body Kalshi sent with an HttpError
+    ("trading_is_paused"), '' when there is none."""
+    body = str(getattr(e, "body", "") or "")
+    try:
+        err = (json.loads(body) or {}).get("error")
+        return str(err.get("code") or "") if isinstance(err, dict) else ""
+    except (ValueError, TypeError, AttributeError):
+        m = re.search(r'"code"\s*:\s*"([^"]+)"', body)
+        return m.group(1) if m else ""
+
+
+def exchange_pause_code(e) -> str:
+    """The code of a refusal that names a trading pause -- any with "paused"
+    in it (trading_is_paused, exchange_is_paused) or one of
+    EXCH_PAUSE_CODES -- else ''."""
+    code = kalshi_error_code(e)
+    return code if ("paused" in code.lower() or code in EXCH_PAUSE_CODES) else ""
+
+
+def exchange_status_paused(js) -> Optional[Set[int]]:
+    """What GET /exchange/status shows not trading: {-1} for the whole
+    exchange (trading_active or exchange_active false overall), else the
+    exchange_index of each shard that is not (empty: all trading). None
+    when the answer cannot be read."""
+    if not isinstance(js, dict) or "trading_active" not in js:
+        return None
+    if js.get("trading_active") is False or js.get("exchange_active") is False:
+        return {-1}
+    out: Set[int] = set()
+    for s in js.get("exchange_index_statuses") or []:
+        try:
+            if s.get("trading_active") is False or s.get("exchange_active") is False:
+                out.add(int(s["exchange_index"]))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                  "saturday", "sunday")
+
+
+def _iso_epoch(s) -> float:
+    return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+
+
+def published_closure(schedule, ts: float) -> Optional[Tuple[float, float]]:
+    """The closure of Kalshi's published schedule (GET /exchange/schedule)
+    covering `ts`: (start, end) epoch seconds of a maintenance window, or of
+    a gap in that day's standard hours (ET clock; a close at or before its
+    open, "00:00", is midnight). None when the schedule has the exchange
+    open at `ts`. Raises ValueError when the schedule cannot be read."""
+    try:
+        sch = (schedule or {}).get("schedule") or schedule or {}
+        for w in sch.get("maintenance_windows") or []:
+            a, b = _iso_epoch(w["start_datetime"]), _iso_epoch(w["end_datetime"])
+            if a <= ts < b:
+                return a, b
+        hours = [h for h in sch.get("standard_hours") or []
+                 if _iso_epoch(h["start_time"]) <= ts < _iso_epoch(h["end_time"])]
+        if not hours:
+            raise ValueError("no standard hours cover this time")
+
+        def sessions(d) -> List[Tuple[float, float]]:
+            out = []
+            base = datetime(d.year, d.month, d.day)
+            for sess in hours[0].get(_WEEKDAY_NAMES[d.weekday()]) or []:
+                oh, om = str(sess["open_time"]).split(":")[:2]
+                ch, cm = str(sess["close_time"]).split(":")[:2]
+                o, c = int(oh) * 60 + int(om), int(ch) * 60 + int(cm)
+                if c <= o:
+                    c += 24 * 60
+                out.append((ET.localize(base + timedelta(minutes=o)).timestamp(),
+                            ET.localize(base + timedelta(minutes=c)).timestamp()))
+            return out
+
+        day = datetime.fromtimestamp(ts, ET).date()
+        today = sessions(day)
+        if any(a <= ts < b for a, b in today):
+            return None
+        start = max([b for _a, b in today if b <= ts], default=ET.localize(
+            datetime(day.year, day.month, day.day)).timestamp())
+        for k in range(8):
+            nxt = sorted(a for a, _b in (today if k == 0 else
+                                         sessions(day + timedelta(days=k)))
+                         if a > ts)
+            if nxt:
+                return start, nxt[0]
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+        raise ValueError(f"schedule unreadable: {e}") from None
+    raise ValueError("schedule unreadable: no open session within a week")
+
+
+def _dur_hm(secs: float) -> str:
+    """5,040 -> '1h24m'; 300 -> '5m'."""
+    m = int(max(0.0, secs) // 60)
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def _et_clock(ts: float, day: bool = False) -> str:
+    """epoch seconds -> '03:00' on the ET clock ('Thu 03:00' with the day)."""
+    return datetime.fromtimestamp(ts, ET).strftime("%a %H:%M" if day else "%H:%M")
 # ONE-SHOT LIVE-CONFIRM RELEASE (Jack 2026-10-05, KXTRUMPMENTION-26OCT05
 # false confirm). event_live_halt has no resume path by design, so lifting
 # a wrong confirm used to mean stopping the bot and hand-editing
@@ -9973,6 +10134,10 @@ _CONFIG_CODE_KNOBS = (
     "BACK_OF_LINE_BUDGET_SECS",
     # rate-limit alert (2026-10-17)
     "RATE_LIMIT_ALERT", "RATE_LIMIT_CHECK_SECS", "RATE_LIMIT_SCAN_DIRS",
+    # exchange pause: Kalshi's own answers hold the writes (2026-10-22)
+    "EXCH_PAUSE_MODE", "EXCH_PAUSE_CODES", "EXCH_PAUSE_POLL_SECS",
+    "EXCH_PAUSE_PROBE_SECS", "EXCH_PAUSE_EVENTS", "EXCH_PAUSE_ALERT_MIN",
+    "EXCH_PAUSE_OVERRUN_MIN",
     # cross-event breaker and the dollar limits + skew, dry (2026-10-17)
     "SWEEP_GROUP", "SWEEP_GROUP_WINDOW_SECS", "SWEEP_GROUP_HOLD_SECS",
     "SWEEP_GROUP_MIN_CT", "RISK_LIMITS", "RISK_EVENT_FLOOR", "RISK_EVENT_DAYS",
@@ -18288,7 +18453,21 @@ class IncentiveMarketMaker:
         self._rl_seen = {"writes": 0, "reads": 0}
         self._rl_offsets: Dict[str, int] = {}
         self._rl = {"looks": 0, "imm_writes": 0, "imm_reads": 0, "fleet": 0,
-                    "alerts": 0, "last_alert_ts": 0.0, "last": ""}
+                    "fleet_reads": 0, "alerts": 0, "last_alert_ts": 0.0, "last": ""}
+        # exchange pause (2026-10-22, EXCH_PAUSE_MODE): shard -> its pause;
+        # the pause each shard last left (a quick return continues it); the
+        # recent pause-code refusals of a shard not paused, (ts, event);
+        # the last /exchange/status read; the last good /exchange/schedule
+        self._xp: Dict[int, dict] = {}
+        self._xp_recent: Dict[int, dict] = {}
+        self._xp_refusals: Dict[int, Deque[Tuple[float, str]]] = {}
+        self._xp_status: Optional[Set[int]] = None
+        self._xp_status_at = 0.0
+        self._xp_sched: Optional[dict] = None
+        self._xp_sched_at = 0.0
+        self._xp_sched_err = ""
+        self._xp_stats = {"pauses": 0, "refused": 0, "held": 0, "probes": 0,
+                          "polls": 0, "poll_fails": 0, "alerts": 0, "last": None}
         # cross-event breaker (2026-10-17, SWEEP_GROUP): (group, side) -> the
         # last fill that could start a trip; -> the trip's window {"at",
         # "until", "mode"} (dry: the hold `on` would keep, for held_fill
@@ -19841,6 +20020,8 @@ class IncentiveMarketMaker:
             self.state.order_ages[oid] = now_ts
             log(f"{self.tag} [DRY] place {label}")
             return True
+        if self._xp and self._xp_hold(q.ticker, time.time()):
+            return False       # its shard is paused (EXCH_PAUSE_MODE): not sent
         try:
             resp = self.client.create_order(
                 ticker=q.ticker, client_order_id=client_order_id,
@@ -19859,6 +20040,8 @@ class IncentiveMarketMaker:
             self._join_set(oid, q.ticker, q.book_side, q.price_cents,
                            q.price_exact, float(q.count), client_order_id, now_ts)
             log(f"{self.tag} placed {label} -> {oid}")
+            if self._xp:
+                self._xp_ok(q.ticker, "place")
             self._log_order("place", q.ticker, q.book_side, q.price_cents,
                             q.count, oid, now_ts,
                             client_order_id=client_order_id,
@@ -19891,6 +20074,7 @@ class IncentiveMarketMaker:
                             quote_is_pad=q.is_pad, error=str(e),
                             error_body=body,
                             http_status=getattr(e, "status", None))
+            self._xp_refused(q.ticker, e, "place")   # a trading pause? (EXCH_PAUSE_MODE)
             return False
         except Exception as e:
             # Ambiguous failure (timeout mid-flight): the order MAY be live but
@@ -20001,6 +20185,8 @@ class IncentiveMarketMaker:
             so["remaining_count"] = float(q.count)
             log(f"{self.tag} [DRY] amend {label}")
             return True
+        if self._xp and self._xp_hold(q.ticker, time.time()):
+            return False       # its shard is paused (EXCH_PAUSE_MODE): not sent
         try:
             self.client.amend_order(
                 order_id=oid, ticker=q.ticker, book_side=q.book_side,
@@ -20024,6 +20210,8 @@ class IncentiveMarketMaker:
                            float(q.count), o.get("client_order_id"),
                            self.state.order_ages.get(oid))
             log(f"{self.tag} amended {label}" + (f" [{reason}]" if reason else ""))
+            if self._xp:
+                self._xp_ok(q.ticker, "amend")
             self._log_order("amend", q.ticker, q.book_side, q.price_cents,
                             q.count, oid, now_ts,
                             prev_price_cents=prev_px, prev_count=prev_ct,
@@ -20032,6 +20220,10 @@ class IncentiveMarketMaker:
                             **({"reason": reason} if reason else {}))
             return True
         except HttpError as e:
+            if self._xp_refused(q.ticker, e, "amend"):
+                # a trading pause (EXCH_PAUSE_MODE), not a dead order: it
+                # still rests, so it stays booked
+                return False
             if e.status in (404, 409):
                 # Order died mid-flight (filled/expired/cancelled): forget it;
                 # the next cycle's diff places fresh.
@@ -21315,11 +21507,13 @@ class IncentiveMarketMaker:
                 f"{m['ahead']:g} ahead, {m['behind']:g} of {m['ext']:g} external "
                 f"contracts behind")
 
-    def _rate_limit_scan_logs(self) -> Dict[str, Tuple[int, str]]:
-        """The other bots' new 429 lines since the last look: {bot: (count,
-        first new line)}. A log first seen starts from its current end (no
-        history); a log that shrank is re-anchored at its end."""
-        found: Dict[str, Tuple[int, str]] = {}
+    def _rate_limit_scan_logs(self) -> Dict[str, Tuple[int, str, int]]:
+        """The other bots' new 429 lines since the last look: {bot: (rejected
+        writes, the first one's line, reads)} -- a line RATE_LIMIT_READ_LINE
+        calls a read is counted apart (2026-10-22). A log first seen starts
+        from its current end (no history); a log that shrank is re-anchored
+        at its end."""
+        found: Dict[str, Tuple[int, str, int]] = {}
         cutoff = time.time() - 2 * 86400
         for d in RATE_LIMIT_SCAN_DIRS:
             try:
@@ -21353,9 +21547,11 @@ class IncentiveMarketMaker:
                     continue
                 lines = [ln for ln in chunk.decode("utf-8", "replace").splitlines()
                          if "HttpError(429" in ln]
+                writes = [ln for ln in lines if not RATE_LIMIT_READ_LINE.search(ln)]
                 bot = f"{os.path.basename(d)}/{n.rsplit('.', 1)[0]}"
-                cnt, ex = found.get(bot, (0, ""))
-                found[bot] = (cnt + len(lines), ex or lines[0][:240])
+                cnt, ex, rd = found.get(bot, (0, "", 0))
+                found[bot] = (cnt + len(writes), ex or (writes[0][:240] if writes else ""),
+                              rd + len(lines) - len(writes))
         return found
 
     def _rate_limit_watch(self, now_ts: float) -> None:
@@ -21380,12 +21576,19 @@ class IncentiveMarketMaker:
             fleet = self._rate_limit_scan_logs()
             st["imm_writes"] += max(0, w)
             st["imm_reads"] += max(0, r)
-            n_fleet = sum(c for c, _ex in fleet.values())
+            n_fleet = sum(c for c, _ex, _rd in fleet.values())
+            fleet_reads = sum(rd for _c, _ex, rd in fleet.values())
             st["fleet"] += n_fleet
+            st["fleet_reads"] += fleet_reads
             if w <= 0 and n_fleet <= 0:
-                if r > 0:
-                    log(f"{self.tag} rate limit: {r} of our reads got a 429 "
-                        f"(retried) in the last {RATE_LIMIT_CHECK_SECS / 60:g} min")
+                if r > 0 or fleet_reads > 0:
+                    log(f"{self.tag} rate limit: "
+                        + " and ".join(x for x in (
+                            f"{r} of our reads (retried)" if r > 0 else "",
+                            f"{fleet_reads} of the other bots' reads"
+                            if fleet_reads > 0 else "") if x)
+                        + f" got a 429 in the last {RATE_LIMIT_CHECK_SECS / 60:g} min "
+                          f"-- reads, so no email")
                 return
             parts = []
             if w > 0:
@@ -21393,8 +21596,9 @@ class IncentiveMarketMaker:
                              + (f" (last {cnt.get('last')})" if cnt.get("last") else ""))
             if r > 0:
                 parts.append(f"{r} of its reads got a 429 and were retried")
-            for bot, (c, ex) in sorted(fleet.items()):
-                parts.append(f"{bot}: {c} rejected (e.g. {ex})")
+            for bot, (c, ex, _rd) in sorted(fleet.items()):
+                if c > 0:
+                    parts.append(f"{bot}: {c} rejected (e.g. {ex})")
             msg = (f"Kalshi rate-limit rejections (429 Too Many Requests) in the "
                    f"last {RATE_LIMIT_CHECK_SECS / 60:g} min -- " + "; ".join(parts)
                    + f". This bot paces its writes at {PLACE_RATE_PER_SEC:g}/s "
@@ -21407,6 +21611,272 @@ class IncentiveMarketMaker:
                                now_ts=now_ts)
         except Exception as e:
             log(f"{self.tag} ! rate-limit watch failed: {e}")
+
+    # ---- exchange pause (2026-10-22, EXCH_PAUSE_MODE) ------------------------
+
+    def _xp_poll(self, now_ts: float, force: bool = False) -> Optional[Set[int]]:
+        """GET /exchange/status: what it shows not trading
+        (exchange_status_paused). Read every EXCH_PAUSE_POLL_SECS while a
+        pause holds, or now when `force`d (a refusal to judge) -- at most
+        every 5s, the last read answering in between. A shard it shows
+        trading again leaves its pause, unless that pause began against the
+        status (by_status false). Returns the read (None: not read, or
+        unreadable). Never raises."""
+        if now_ts - self._xp_status_at < (5.0 if force else EXCH_PAUSE_POLL_SECS):
+            return self._xp_status if force else None
+        if not force and not self._xp:
+            return None
+        self._xp_status_at = now_ts
+        st = self._xp_stats
+        st["polls"] += 1
+        try:
+            paused = exchange_status_paused(self.client.get_exchange_status())
+        except Exception:
+            paused = None
+        self._xp_status = paused
+        if paused is None:
+            st["poll_fails"] += 1
+            return None
+        for s, p in list(self._xp.items()):
+            if -1 in paused or s in paused:
+                p["by_status"] = True      # it agrees: trusted to say when it ends
+            elif p.get("by_status"):
+                self._xp_end(s, now_ts, "Kalshi's status shows it trading")
+        return paused
+
+    def _xp_paused_for(self, ticker: str) -> Optional[dict]:
+        """The pause holding `ticker`'s shard, or None (a market of unknown
+        shard is never held)."""
+        s = self._ticker_shard.get(ticker) if self._xp else None
+        return None if s is None else self._xp.get(s)
+
+    def _xp_waiting(self, ticker: str, now_ts: float) -> bool:
+        """EXCHANGE PAUSE: True when a place / amend for `ticker` must wait --
+        its shard is paused and no probe is due (counted as held). Reads the
+        status on its poll clock. The write loops ask first, so a held write
+        is skipped before it is paced. Never raises."""
+        if not self._xp:
+            return False
+        try:
+            self._xp_poll(now_ts)
+            p = self._xp_paused_for(ticker)
+            if p is None or now_ts - p["last_refusal"] >= EXCH_PAUSE_PROBE_SECS:
+                return False
+            p["held"] += 1
+            self._xp_stats["held"] += 1
+            return True
+        except Exception:
+            return False
+
+    def _xp_hold(self, ticker: str, now_ts: float) -> bool:
+        """EXCHANGE PAUSE, at the send (place_order / amend_order_inplace):
+        True holds the write. When the probe is due this one write goes, and
+        the probe clock restarts."""
+        if self._xp_waiting(ticker, now_ts):
+            return True
+        p = self._xp_paused_for(ticker)
+        if p is not None:
+            p["last_refusal"] = now_ts
+            p["probes"] += 1
+            self._xp_stats["probes"] += 1
+        return False
+
+    def _xp_refused(self, ticker: str, e, kind: str,
+                    now_ts: Optional[float] = None) -> bool:
+        """EXCHANGE PAUSE: judge a place / amend Kalshi refused. True when it
+        is a trading pause and `ticker`'s shard is (now) paused -- a pause
+        code with /exchange/status showing the shard (or the exchange) not
+        trading, or, the status unreadable or not agreeing, pause-code
+        refusals across EXCH_PAUSE_EVENTS events of the shard inside
+        EXCH_PAUSE_PROBE_SECS; any other 409/503 only with the status
+        agreeing. A market of unknown shard never pauses one. Never raises."""
+        if EXCH_PAUSE_MODE != "on" or not self.live:
+            return False
+        try:
+            now_ts = time.time() if now_ts is None else now_ts
+            s = self._ticker_shard.get(ticker)
+            code = exchange_pause_code(e)
+            if s is None or (not code and getattr(e, "status", None) not in (409, 503)):
+                return False
+            p = self._xp.get(s)
+            if p is not None:              # paused already: a probe refused
+                p["last_refusal"] = now_ts
+                p["refused"] += 1
+                self._xp_stats["refused"] += 1
+                return True
+            status = self._xp_poll(now_ts, force=True)
+            agrees = status is not None and (-1 in status or s in status)
+            if not agrees:
+                if not code:
+                    return False
+                q = self._xp_refusals.setdefault(s, deque())
+                q.append((now_ts, self._event_of(ticker)))
+                while q and q[0][0] < now_ts - EXCH_PAUSE_PROBE_SECS:
+                    q.popleft()
+                if len({ev for _t, ev in q}) < EXCH_PAUSE_EVENTS:
+                    return False
+            self._xp_begin(s, ticker, code or kalshi_error_code(e)
+                           or f"HTTP {getattr(e, 'status', '?')}", kind, now_ts,
+                           agrees, status)
+            return True
+        except Exception as ex:
+            log(f"{self.tag} ! exchange-pause check failed: {ex}")
+            return False
+
+    def _xp_begin(self, s: int, ticker: str, code: str, kind: str, now_ts: float,
+                  agrees: bool, status: Optional[Set[int]]) -> None:
+        """A pause begins on shard `s` (one that left it under
+        EXCH_PAUSE_MERGE_SECS ago continues: its start, counts, email)."""
+        last = self._xp_recent.pop(s, None)
+        cont = last is not None and now_ts - last["ended"] < EXCH_PAUSE_MERGE_SECS
+        p = {"since": now_ts, "last_refusal": now_ts, "code": code, "kind": kind,
+             "ticker": ticker, "by_status": agrees, "held": 0, "refused": 1,
+             "probes": 0, "alerted": False, "closure": None}
+        if cont:
+            for k in ("since", "held", "probes", "alerted", "closure"):
+                p[k] = last[k]
+            p["refused"] += last["refused"]
+        else:
+            self._xp_stats["pauses"] += 1
+        self._xp[s] = p
+        self._xp_stats["refused"] += 1
+        self._xp_refusals.pop(s, None)
+        c, err = self._xp_closure(now_ts)
+        log(f"{self.tag} EXCHANGE PAUSE{' (again)' if cont else ''} on shard {s}: "
+            f"Kalshi refused a {kind} on {ticker} ({code}); "
+            + ("/exchange/status shows it not trading" if agrees else
+               f"{EXCH_PAUSE_EVENTS}+ events refused in {EXCH_PAUSE_PROBE_SECS:g}s "
+               f"with its status {'unreadable' if status is None else 'showing it trading'}")
+            + f" -- places and amends there held (cancels still go out); the "
+              f"status read every {EXCH_PAUSE_POLL_SECS:g}s, a probe write every "
+              f"{EXCH_PAUSE_PROBE_SECS:g}s; "
+            + (f"inside Kalshi's published closure {_et_clock(c[0], day=True)}-"
+               f"{_et_clock(c[1])} ET" if c else
+               "NOT in Kalshi's published schedule" if not err else
+               f"Kalshi's schedule unreadable ({err})"))
+
+    def _xp_end(self, s: int, now_ts: float, why: str) -> None:
+        """A pause leaves shard `s`: logged, and sunk to
+        exchange_pauses_<date>.jsonl."""
+        p = self._xp.pop(s, None)
+        if p is None:
+            return
+        self._xp_recent[s] = dict(p, ended=now_ts)
+        last = {"shard": s, "since": p["since"], "ended": now_ts,
+                "secs": round(now_ts - p["since"], 1), "why": why}
+        last.update({k: p[k] for k in ("code", "kind", "ticker", "by_status", "held",
+                                       "refused", "probes", "alerted", "closure")})
+        self._xp_stats["last"] = last
+        log(f"{self.tag} exchange pause over on shard {s}: {why}, after "
+            f"{_dur_hm(now_ts - p['since'])} ({p['held']} writes held, "
+            f"{p['refused']} refused, {p['probes']} probes)")
+        self._sink("exchange_pauses", dict(last))
+
+    def _xp_ok(self, ticker: str, kind: str) -> None:
+        """A place / amend Kalshi took: its shard trades, so a pause there ends."""
+        s = self._ticker_shard.get(ticker)
+        if s is not None and s in self._xp:
+            self._xp_end(s, time.time(), f"Kalshi took a {kind} ({ticker})")
+
+    def _xp_closure(self, ts: float) -> Tuple[Optional[Tuple[float, float]], str]:
+        """(the closure of the cached /exchange/schedule covering ts, or None;
+        '' or why that schedule cannot say)."""
+        if self._xp_sched is None:
+            return None, self._xp_sched_err or "not read yet"
+        try:
+            return published_closure(self._xp_sched, ts), ""
+        except ValueError as e:
+            return None, str(e)
+
+    def _xp_watchdog_view(self, selected, resting):
+        """The selected markets and resting orders the watchdog judges: those
+        on a shard Kalshi has paused left out -- all of them while its status
+        (read during the pause) shows the whole exchange paused."""
+        if not self._xp:
+            return selected, resting
+        st = self._xp_status or set()
+        if -1 in st:
+            return [], []
+        out = set(self._xp) | st
+        return ([t for t in selected if self._ticker_shard.get(t) not in out],
+                [o for o in resting
+                 if self._ticker_shard.get(o.get("ticker", "")) not in out])
+
+    def _xp_check(self, now_ts: float) -> None:
+        """EXCHANGE PAUSE, once a full cycle: refresh Kalshi's published
+        schedule (every EXCH_SCHEDULE_TTL_SECS; 10 min after a failed read
+        while none is in hand), poll the status, log the pauses, and send
+        the `exchange_pause` email, once a pause, when it has run
+        EXCH_PAUSE_ALERT_MIN outside the published schedule (or with it
+        unreadable) or EXCH_PAUSE_OVERRUN_MIN past the published reopening.
+        Never raises."""
+        if EXCH_PAUSE_MODE != "on" or not self.live:
+            return
+        try:
+            age = now_ts - self._xp_sched_at
+            if age >= EXCH_SCHEDULE_TTL_SECS or (self._xp_sched is None and age >= 600):
+                self._xp_sched_at = now_ts
+                try:
+                    js = self.client.get("/exchange/schedule")
+                    published_closure(js, now_ts)            # it reads
+                    self._xp_sched, self._xp_sched_err = js, ""
+                except Exception as e:
+                    self._xp_sched_err = f"{type(e).__name__}: {e}"[:200]
+                    log(f"{self.tag} ! exchange schedule read failed "
+                        f"({self._xp_sched_err})"
+                        + ("; keeping the last one" if self._xp_sched is not None else ""))
+            if not self._xp:
+                return
+            self._xp_poll(now_ts)
+            if not self._xp:
+                return
+            c, err = self._xp_closure(now_ts)
+            parts, due = [], []
+            for s, p in sorted(self._xp.items()):
+                dur = now_ts - p["since"]
+                parts.append(f"shard {s} {_dur_hm(dur)} ({p['code']}; {p['held']} "
+                             f"held, {p['refused']} refused, {p['probes']} probes)")
+                if c is not None:
+                    p["closure"] = list(c)       # a published closure: no email inside it
+                    continue
+                if p["alerted"]:
+                    continue
+                if p["closure"] is not None:
+                    over = now_ts - p["closure"][1]
+                    if over >= EXCH_PAUSE_OVERRUN_MIN * 60:
+                        due.append((p["since"], s, p,
+                                    f"Kalshi's published closure ended at "
+                                    f"{_et_clock(p['closure'][1])} ET, {_dur_hm(over)} ago"))
+                elif dur >= EXCH_PAUSE_ALERT_MIN * 60:
+                    due.append((p["since"], s, p,
+                                "that is outside Kalshi's published schedule "
+                                "(GET /exchange/schedule)" if not err else
+                                f"Kalshi's schedule could not be read ({err})"))
+            if due:
+                # one email for the shards that came due together
+                due.sort(key=lambda x: (x[0], x[1]))
+                since, _s, p0, why = due[0]
+                for _t, _s, p, _w in due:
+                    p["alerted"] = True
+                self._xp_stats["alerts"] += 1
+                shards = ", ".join(str(s) for _t, s, _p, _w in due)
+                self.alerter.alert(
+                    "exchange_pause",
+                    f"Kalshi has refused this bot's orders on shard"
+                    f"{'s' if len(due) > 1 else ''} {shards} for "
+                    f"{_dur_hm(now_ts - since)} (since {_et_clock(since, day=True)} ET: "
+                    f"{p0['code']}), and {why}. The bot holds new orders and "
+                    f"amends there and resumes by itself once Kalshi takes one "
+                    f"again (its status read every {EXCH_PAUSE_POLL_SECS:g}s, a "
+                    f"probe order every {EXCH_PAUSE_PROBE_SECS:g}s). If this "
+                    f"recurs at a new time, Kalshi's maintenance schedule has "
+                    f"changed.", key="exchange_pause", urgent=True, now_ts=now_ts)
+            log(f"{self.tag} exchange pause: " + ", ".join(parts) + "; "
+                + (f"inside Kalshi's published closure to {_et_clock(c[1])} ET" if c
+                   else "outside Kalshi's published schedule" if not err
+                   else f"schedule unreadable ({err})"))
+        except Exception as e:
+            log(f"{self.tag} ! exchange-pause check failed: {e}")
 
     # ---- dollar worst-case limits + skew (2026-10-17, RISK_LIMITS, dry) ----
 
@@ -27996,15 +28466,21 @@ class IncentiveMarketMaker:
         # Watchdog: markets selected but the book nearly empty for several
         # consecutive cycles — the silent-death signature (dead cutoffs,
         # missing overrides, API trouble). Page, don't wait to be noticed.
+        # EXCHANGE PAUSE (2026-10-22): a shard Kalshi has paused cannot rest
+        # orders, so its markets are left out (_xp_watchdog_view).
+        wd_sel, wd_rest = self.state.selected, resting
+        if not fast_only:
+            self._xp_check(time.time())
+            wd_sel, wd_rest = self._xp_watchdog_view(wd_sel, wd_rest)
         if fast_only:
             pass   # watchdog streaks count FULL cycles only (stable semantics)
-        elif (len(self.state.selected) >= WATCHDOG_MIN_SELECTED
-                and len(resting) < WATCHDOG_MIN_RESTING):
+        elif (len(wd_sel) >= WATCHDOG_MIN_SELECTED
+                and len(wd_rest) < WATCHDOG_MIN_RESTING):
             self.state.watchdog_streak += 1
             if self.state.watchdog_streak == WATCHDOG_CYCLES:
                 self.alerter.alert(
-                    "watchdog", f"{len(self.state.selected)} markets selected but "
-                    f"only {len(resting)} orders resting for {WATCHDOG_CYCLES} "
+                    "watchdog", f"{len(wd_sel)} markets selected but "
+                    f"only {len(wd_rest)} orders resting for {WATCHDOG_CYCLES} "
                     f"cycles — quoting looks silently dead (cutoffs? overrides? "
                     f"API?)", key="watchdog")
         else:
@@ -28017,6 +28493,8 @@ class IncentiveMarketMaker:
         # leaves the stale price resting, which is worse than a short wait.
         am_pacer = WritePacer(PLACE_RATE_PER_SEC if self.live else 0.0)
         for o_am, q_am in to_amend[:MAX_PLACEMENTS_PER_CYCLE]:
+            if self._xp_waiting(q_am.ticker, time.time()):
+                continue                   # its shard is paused (EXCH_PAUSE_MODE)
             am_pacer.wait()
             self._ws_cycle_tick()          # the in-cycle stale check / breaker
             if self.sweep_held(self._event_of(q_am.ticker), time.time()):
@@ -28314,6 +28792,14 @@ class IncentiveMarketMaker:
                         total_resting += _count(by_id[old_h], 1)   # it still rests
                 (self._sweep if held_sweep else self._grp)["skipped_writes"] += 1
                 continue
+            if self._xp_waiting(q.ticker, time.time()):
+                # EXCHANGE PAUSE (2026-10-22): Kalshi refuses writes on this
+                # shard -- the placement and any swap it carries wait, and
+                # the order it would replace keeps resting
+                old_x = replaces.get(i)
+                if old_x is not None and old_x in by_id:
+                    total_resting += _count(by_id[old_x], 1)
+                continue
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
                     f"{len(to_place) - i} deferred to next cycle")
@@ -28575,6 +29061,17 @@ class IncentiveMarketMaker:
             out["rate_limit"] = dict(self._rl, on=RATE_LIMIT_ALERT,
                                      pace_per_s=PLACE_RATE_PER_SEC,
                                      logs_watched=len(self._rl_offsets))
+            # exchange pause (2026-10-22, EXCH_PAUSE_MODE)
+            out["exchange_pause"] = dict(
+                self._xp_stats, mode=EXCH_PAUSE_MODE,
+                paused={str(s): {k: p[k] for k in (
+                    "since", "last_refusal", "code", "by_status", "held",
+                    "refused", "probes", "alerted", "closure")}
+                    for s, p in self._xp.items()},
+                status=(sorted(self._xp_status) if self._xp_status is not None
+                        else None),
+                schedule_read=self._xp_sched is not None,
+                schedule_err=self._xp_sched_err)
             # cycle timing (2026-10-04): the REST book reads IMM_WS=on would
             # serve from the feed, inside each full cycle
             ct = list(self._cycle_times)
@@ -30382,10 +30879,26 @@ class IncentiveMarketMaker:
         log(f"write pacing (2026-10-17): {PLACE_RATE_PER_SEC:g} writes/s "
             f"(IMM_PLACE_RATE_PER_SEC, was 12; account write budget 300 tokens/s "
             f"at 10 a write); rate-limit alert: "
-            + (f"any 429 rejection -- ours, or new lines in "
+            + (f"any write rejected with a 429 -- ours, or a new write line in "
                f"{', '.join(os.path.basename(d) for d in RATE_LIMIT_SCAN_DIRS) or '-'} "
-               f"-- emails a `rate_limit` alert, looked at every "
-               f"{RATE_LIMIT_CHECK_SECS:g}s" if RATE_LIMIT_ALERT else "off"))
+               f"(read lines logged only, 2026-10-22) -- emails a `rate_limit` "
+               f"alert, looked at every {RATE_LIMIT_CHECK_SECS:g}s"
+               if RATE_LIMIT_ALERT else "off"))
+        log(f"exchange pause (2026-10-22): {EXCH_PAUSE_MODE}"
+            + (f" -- a place/amend Kalshi refuses as paused (a code naming "
+               f"'paused'" + (f" or {', '.join(EXCH_PAUSE_CODES)}" if EXCH_PAUSE_CODES
+                              else "")
+               + f") while /exchange/status shows its shard not trading (or "
+               f"refusals across {EXCH_PAUSE_EVENTS} events in "
+               f"{EXCH_PAUSE_PROBE_SECS:g}s) holds places and amends on that "
+               f"shard, cancels still sent; it resumes when the status shows the "
+               f"shard trading (read every {EXCH_PAUSE_POLL_SECS:g}s), a write "
+               f"there is taken, or a probe write ({EXCH_PAUSE_PROBE_SECS:g}s "
+               f"after the last refusal) goes through; the watchdog leaves paused "
+               f"shards out; `exchange_pause` email at {EXCH_PAUSE_ALERT_MIN:g}m "
+               f"outside Kalshi's published schedule or {EXCH_PAUSE_OVERRUN_MIN:g}m "
+               f"past its reopening" if EXCH_PAUSE_MODE == "on"
+               else " -- every write sent as before"))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "

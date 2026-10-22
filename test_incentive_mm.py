@@ -29976,6 +29976,43 @@ class TestRateLimitWatch(unittest.TestCase):
         self._look(200)
         self.assertEqual((self.alerts, self.bot._rl["imm_reads"]), ([], 3))
 
+    def test_a_crypto_bot_read_429_only_logs(self):
+        # Jack 2026-10-22: "Yes", to counting only rejected order writes --
+        # the 09:23 ET email that morning was one skipped balance read
+        self._look(0)
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write("2026-10-22 13:22:11Z [XRP-MAX] ! shard balance read failed "
+                    "(HttpError(429 Too Many Requests)); cash guard skipped\n")
+        self._look(200)
+        self.assertEqual((self.alerts, self.bot._rl["fleet"], self.bot._rl["fleet_reads"]),
+                         ([], 0, 1))
+
+    def test_a_write_alongside_reads_alerts_for_the_write_alone(self):
+        self._look(0)
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write("2026-10-22 13:40:44Z [DOGE yr] ! shard balance read failed "
+                    "(HttpError(429 Too Many Requests)); cash guard skipped\n")
+            f.write("2026-10-22 13:40:45Z [DOGE yr] ! cancel failed 0b1c-77: "
+                    "HttpError(429 Too Many Requests)\n")
+        self._look(200)
+        msg = self.alerts[0][1]
+        self.assertIn("bnb-max-2026-10-01: 1 rejected (e.g. 2026-10-22 13:40:45Z [DOGE yr] "
+                      "! cancel failed", msg)
+        self.assertNotIn("balance read", msg)
+
+    def test_which_429_lines_are_reads(self):
+        reads = ("! shard balance read failed (HttpError(429 Too Many Requests)); cash guard skipped",
+                 "! positions fetch error (HttpError(429 Too Many Requests))",
+                 "! get_orders failed: HttpError(429 Too Many Requests)")
+        writes = ("! place rejected (HttpError(429 Too Many Requests)): KXBTCD-26OCT2317 BID 1x @ 39c",
+                  "! cancel failed fbff7124-ed97: HttpError(429 Too Many Requests)",
+                  "! amend failed KXETHD-26OCT23 BID -> 2x @ 41c: HttpError(429 Too Many Requests)",
+                  "! budget order rejected (HttpError(429 Too Many Requests))")
+        for ln in reads:
+            self.assertTrue(imm.RATE_LIMIT_READ_LINE.search(ln), ln)
+        for ln in writes:
+            self.assertFalse(imm.RATE_LIMIT_READ_LINE.search(ln), ln)
+
     def test_off_does_nothing(self):
         with mock.patch.object(imm, "RATE_LIMIT_ALERT", False):
             self.counter.update(writes=5)
@@ -29994,6 +30031,358 @@ class TestRateLimitWatch(unittest.TestCase):
                 c.raise_if_bad_response(resp(m))
         self.assertEqual((self.counter["writes"], self.counter["reads"], self.counter["last"]),
                          (2, 1, "GET /trade-api/v2/portfolio/events/orders"))
+
+
+def _status(paused=(), everything=False, shards=4):
+    """A GET /exchange/status answer: `paused` shards (or all) not trading."""
+    return {"exchange_active": True, "trading_active": not everything,
+            "exchange_index_statuses": [
+                {"exchange_index": i, "exchange_active": True,
+                 "trading_active": not everything and i not in paused}
+                for i in range(shards)]}
+
+
+# Kalshi's published schedule as GET /exchange/schedule served it on
+# 2026-10-22: open around the clock but Thursday 03:00-05:00 ET.
+_SCHEDULE = {"schedule": {"maintenance_windows": [], "standard_hours": [dict(
+    start_time="2024-12-01T00:00:00Z", end_time="2200-12-01T00:00:00Z",
+    thursday=[{"close_time": "03:00", "open_time": "00:00"},
+              {"close_time": "00:00", "open_time": "05:00"}],
+    **{d: [{"close_time": "00:00", "open_time": "00:00"}]
+       for d in ("monday", "tuesday", "wednesday", "friday", "saturday", "sunday")})]}}
+
+
+def _z(*a) -> float:
+    return datetime(*a, tzinfo=timezone.utc).timestamp()
+
+
+def _paused_error(code="trading_is_paused", status=409):
+    e = HttpError("Conflict", status)
+    e.body = '{"error":{"code":"%s","message":"trading is paused"}}' % code
+    return e
+
+
+class _PauseClient(FakeClient):
+    """FakeClient whose writes Kalshi refuses while `refuse` holds an error,
+    with an /exchange/status (`status`: a dict, or an exception to raise)
+    and an /exchange/schedule."""
+
+    def __init__(self):
+        super().__init__()
+        self.refuse = None
+        self.status = _status()
+        self.schedule = _SCHEDULE
+        self.sent = []
+
+    def create_order(self, **kw):
+        self.sent.append(("place", kw["ticker"]))
+        if self.refuse is not None:
+            raise self.refuse
+        return super().create_order(**kw)
+
+    def amend_order(self, **kw):
+        self.sent.append(("amend", kw["ticker"]))
+        if self.refuse is not None:
+            raise self.refuse
+        return {"order": {"order_id": kw["order_id"]}}
+
+    def get_exchange_status(self):
+        self.status_reads = getattr(self, "status_reads", 0) + 1
+        if isinstance(self.status, Exception):
+            raise self.status
+        return self.status
+
+    def get(self, path, params=None):
+        if path == "/exchange/schedule":
+            return self.schedule
+        return super().get(path, params)
+
+
+class TestExchangePause(unittest.TestCase):
+    """Jack 2026-10-22: "Yes. But be careful in case and consider if the
+    maintenance pause ever changes" -- the pause-aware watchdog. Kalshi's
+    Thursday 03:00-05:00 ET pause refused ~60k writes on 10/22 (409
+    trading_is_paused) and the watchdog called it silent death. Kalshi's own
+    answers decide here, never a clock: a place / amend refused as paused
+    while /exchange/status shows the shard not trading holds that shard's
+    places and amends; the status, a taken write or a probe ends it; the
+    watchdog leaves the shard out; and only a pause outside the published
+    schedule, or past its reopening, emails."""
+
+    A, B, C = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B", "KXBTCD-99DEC31-T1"
+
+    def setUp(self):
+        _clean_persist()
+        self.client = _PauseClient()
+        self.bot = IncentiveMarketMaker(client=self.client, live=True)
+        self.alerts = []
+        self.bot.alerter.alert = lambda cat, msg, key="", urgent=True, now_ts=None: \
+            self.alerts.append((cat, msg, key, urgent))
+        for t, s in ((self.A, 0), (self.B, 0), (self.C, 2)):
+            self.bot._note_shard(t, s)
+        for i in range(8):
+            self.bot._note_shard(f"KXEV{i}-99DEC31-X", 0)
+
+    def _place(self, t):
+        return self.bot.place_order(imm.Quote(t, "bid", 40, 10), time.time())
+
+    def _sent(self):
+        return len(self.client.sent)
+
+    def _quiet(self, s, secs):
+        """`secs` pass on shard s's pause clocks (probe and status poll)."""
+        p = self.bot._xp[s]
+        p["last_refusal"] -= secs
+        self.bot._xp_status_at -= secs
+
+    # -- Kalshi's answers --------------------------------------------------
+
+    def test_the_codes_and_the_status_reads(self):
+        self.assertEqual(imm.kalshi_error_code(_paused_error()), "trading_is_paused")
+        self.assertEqual(imm.exchange_pause_code(_paused_error("exchange_is_paused")),
+                         "exchange_is_paused")
+        self.assertEqual(imm.exchange_pause_code(_paused_error("market_closed")), "")
+        with mock.patch.object(imm, "EXCH_PAUSE_CODES", ("exchange_closed",)):
+            self.assertEqual(imm.exchange_pause_code(_paused_error("exchange_closed")),
+                             "exchange_closed")
+        bare = HttpError("Conflict", 409)
+        self.assertEqual((imm.kalshi_error_code(bare), imm.exchange_pause_code(bare)), ("", ""))
+        self.assertEqual(imm.exchange_status_paused(_status(everything=True)), {-1})
+        self.assertEqual(imm.exchange_status_paused(_status()), set())
+        self.assertEqual(imm.exchange_status_paused(_status(paused=(2,))), {2})
+        self.assertIsNone(imm.exchange_status_paused({}))
+        self.assertIsNone(imm.exchange_status_paused("down"))
+
+    def test_the_published_closure_is_on_the_et_clock(self):
+        pc = imm.published_closure
+        # Thu 10/29 (EDT): 03:00-05:00 ET = 07:00-09:00Z
+        self.assertEqual(pc(_SCHEDULE, _z(2026, 10, 29, 7, 30)),
+                         (_z(2026, 10, 29, 7), _z(2026, 10, 29, 9)))
+        self.assertIsNone(pc(_SCHEDULE, _z(2026, 10, 29, 6, 59)))
+        self.assertIsNone(pc(_SCHEDULE, _z(2026, 10, 29, 9)))
+        self.assertIsNone(pc(_SCHEDULE, _z(2026, 10, 28, 7, 30)))    # a Wednesday
+        # Thu 11/05 (EST, after 11/01): the same ET window = 08:00-10:00Z
+        self.assertEqual(pc(_SCHEDULE, _z(2026, 11, 5, 8, 30)),
+                         (_z(2026, 11, 5, 8), _z(2026, 11, 5, 10)))
+        self.assertIsNone(pc(_SCHEDULE, _z(2026, 11, 5, 7, 30)))
+        # a maintenance window Kalshi lists
+        mw = json.loads(json.dumps(_SCHEDULE))
+        mw["schedule"]["maintenance_windows"] = [{
+            "start_datetime": "2026-10-27T14:00:00Z", "end_datetime": "2026-10-27T15:30:00Z"}]
+        self.assertEqual(pc(mw, _z(2026, 10, 27, 15)),
+                         (_z(2026, 10, 27, 14), _z(2026, 10, 27, 15, 30)))
+        for bad in ({}, {"schedule": {"standard_hours": [{"start_time": "x"}]}}, None):
+            with self.assertRaises(ValueError):
+                pc(bad, _z(2026, 10, 29, 7, 30))
+
+    # -- holding the writes ------------------------------------------------
+
+    def test_a_paused_refusal_holds_the_shard_until_the_status_shows_it_trading(self):
+        b, c = self.bot, self.client
+        c.refuse, c.status = _paused_error(), _status(everything=True)
+        self.assertFalse(self._place(self.A))
+        self.assertEqual((self._sent(), set(b._xp), b._xp[0]["by_status"]), (1, {0}, True))
+        self.assertFalse(self._place(self.B))           # held: never sent
+        self.assertEqual(self._sent(), 1)
+        self.assertFalse(self._place(self.C))           # shard 2: sent, refused, paused
+        self.assertEqual((self._sent(), set(b._xp)), (2, {0, 2}))
+        # 10 seconds on: no read yet, still held
+        self._quiet(0, 10)
+        self.assertFalse(self._place(self.B))
+        self.assertEqual(self._sent(), 2)
+        # Kalshi reopens: the next poll ends both, and the write goes
+        c.refuse, c.status = None, _status()
+        self._quiet(0, 10)
+        self.assertTrue(self._place(self.B))
+        self.assertEqual((self._sent(), b._xp), (3, {}))
+        self.assertEqual(b._xp_stats["pauses"], 2)
+        self.assertIn("status shows it trading", b._xp_stats["last"]["why"])
+
+    def test_the_probe_and_a_taken_write_end_a_pause_the_status_cannot_see(self):
+        b, c = self.bot, self.client
+        c.refuse, c.status = _paused_error(), RuntimeError("status down")
+        for i in range(4):                               # 4 events: not yet a pause
+            self.assertFalse(self._place(f"KXEV{i}-99DEC31-X"))
+        self.assertEqual((self._sent(), b._xp), (4, {}))
+        self.assertFalse(self._place("KXEV4-99DEC31-X"))  # the 5th event: shard 0 paused
+        self.assertEqual((set(b._xp), b._xp[0]["by_status"]), ({0}, False))
+        self.assertFalse(self._place(self.A))
+        self.assertEqual(self._sent(), 5)                # held
+        self._quiet(0, 61)                               # a quiet minute: one probe goes
+        self.assertFalse(self._place(self.A))
+        self.assertFalse(self._place(self.B))
+        self.assertEqual((self._sent(), b._xp[0]["probes"], b._xp[0]["refused"]), (6, 1, 2))
+        c.refuse = None
+        self._quiet(0, 61)
+        self.assertTrue(self._place(self.A))             # taken: the pause is over
+        self.assertEqual((self._sent(), b._xp), (7, {}))
+        self.assertIn("Kalshi took a place", b._xp_stats["last"]["why"])
+        self.assertTrue(self._place(self.B))
+
+    def test_a_status_that_never_agreed_does_not_end_the_pause(self):
+        b, c = self.bot, self.client
+        c.refuse, c.status = _paused_error(), _status()  # it says trading throughout
+        for i in range(5):
+            self._place(f"KXEV{i}-99DEC31-X")
+        self.assertEqual(set(b._xp), {0})
+        self._quiet(0, 20)                               # a poll: trading, not trusted
+        self.assertFalse(self._place(self.A))
+        self.assertEqual((set(b._xp), self._sent()), ({0}, 5))
+
+    def test_one_paused_market_or_event_never_stops_a_shard(self):
+        b, c = self.bot, self.client
+        c.refuse = _paused_error()                       # status: all trading
+        for t in (self.A, self.B) * 5:                   # one event, ten refusals
+            self.assertFalse(self._place(t))
+        self.assertEqual((b._xp, self._sent()), ({}, 10))
+        c.refuse = None
+        self.assertTrue(self._place("KXEV0-99DEC31-X"))
+
+    def test_any_other_409_counts_only_with_the_status_agreeing(self):
+        b, c = self.bot, self.client
+        c.refuse = HttpError("Conflict", 409)            # no body, no code
+        self.assertFalse(self._place(self.A))
+        self.assertEqual(b._xp, {})
+        c.status = _status(paused=(0,))
+        b._xp_status_at -= 10
+        self.assertFalse(self._place(self.B))
+        self.assertEqual(set(b._xp), {0})
+        c.refuse = _paused_error("post_only_cross", status=400)
+        self.assertFalse(b._xp_refused(self.C, c.refuse, "place"))   # a 400 is no pause
+
+    def test_an_amend_refused_as_paused_keeps_its_order_booked(self):
+        b, c = self.bot, self.client
+        o = {"order_id": "o1", "ticker": self.A, "fill_count": 0}
+        b.state.ledger["o1"] = {"order_id": "o1", "ticker": self.A, "yes_price": 40}
+        b.state.order_ages["o1"] = time.time() - 60
+        c.refuse, c.status = _paused_error(), _status(everything=True)
+        self.assertFalse(b.amend_order_inplace(o, imm.Quote(self.A, "bid", 41, 10), time.time()))
+        self.assertIn("o1", b.state.ledger)              # still rests: still booked
+        self.assertIn("o1", b.state.order_ages)
+        self.assertEqual(set(b._xp), {0})
+        self.assertFalse(b.amend_order_inplace(o, imm.Quote(self.A, "bid", 42, 10), time.time()))
+        self.assertEqual(self._sent(), 1)                # the second one held
+        # a bare 409 the status does not back is a dead order, as before
+        b._xp.clear()
+        c.refuse, c.status = HttpError("Conflict", 409), _status()
+        b._xp_status_at -= 10
+        self.assertFalse(b.amend_order_inplace(o, imm.Quote(self.A, "bid", 43, 10), time.time()))
+        self.assertNotIn("o1", b.state.ledger)
+
+    def test_cancels_still_go_out(self):
+        self.client.refuse, self.client.status = _paused_error(), _status(everything=True)
+        self._place(self.A)
+        self.assertTrue(self.bot.cancel_order("o9", reason="requote_diff"))
+        self.assertIn("o9", self.client.cancelled)
+
+    def test_off_and_dry_send_every_write(self):
+        self.client.refuse, self.client.status = _paused_error(), _status(everything=True)
+        with mock.patch.object(imm, "EXCH_PAUSE_MODE", "off"):
+            self._place(self.A)
+            self._place(self.B)
+        self.assertEqual((self.bot._xp, self._sent()), ({}, 2))
+        dry = IncentiveMarketMaker(client=self.client, live=False)
+        dry._note_shard(self.A, 0)
+        self.assertFalse(dry._xp_refused(self.A, _paused_error(), "place"))
+
+    # -- the watchdog and the email ----------------------------------------
+
+    def test_the_watchdog_leaves_paused_shards_out(self):
+        b = self.bot
+        sel = {self.A: None, self.B: None, self.C: None, "KXUNSEEN-99DEC31-Z": None}
+        rest = [{"ticker": self.C}, {"ticker": self.A}]
+        self.assertEqual(b._xp_watchdog_view(sel, rest), (sel, rest))
+        b._xp[0] = {"since": time.time()}
+        self.assertEqual(b._xp_watchdog_view(sel, rest),
+                         ([self.C, "KXUNSEEN-99DEC31-Z"], [{"ticker": self.C}]))
+        b._xp_status = {2}
+        self.assertEqual(b._xp_watchdog_view(sel, rest), (["KXUNSEEN-99DEC31-Z"], []))
+        b._xp_status = {-1}
+        self.assertEqual(b._xp_watchdog_view(sel, rest), ([], []))
+
+    def test_a_paused_shard_never_pages_silent_death(self):
+        for paused_shard, pages in ((0, False), (2, True)):
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.state.universe_at = time.time()          # freeze selection
+            for i in range(12):                          # 12 selected, nothing rests
+                t = f"KXGHOST-99DEC31-S{i}"
+                bot.state.selected[t] = _meta(ticker=t, event_ticker="KXGHOST-99DEC31")
+                bot._note_shard(t, 0)
+            bot._xp_begin(paused_shard, "KXGHOST-99DEC31-S0", "trading_is_paused",
+                          "place", time.time(), True, {-1})
+            for _ in range(imm.WATCHDOG_CYCLES):
+                bot.run_cycle()
+            self.assertEqual(any(c == "watchdog" for c, _m in bot.alerter.today), pages,
+                             paused_shard)
+
+    def _pause_at(self, ts, s=0):
+        b = self.bot
+        b._xp_sched, b._xp_sched_at = _SCHEDULE, 4e9    # in hand, no re-read
+        self.client.status = _status(everything=True)
+        b._xp_begin(s, self.A, "trading_is_paused", "place", ts, True, {-1})
+
+    def test_the_thursday_window_never_emails_but_an_overrun_does(self):
+        b = self.bot
+        self._pause_at(_z(2026, 10, 29, 7, 0, 6))
+        for ts in (_z(2026, 10, 29, 7, 30), _z(2026, 10, 29, 8, 59),
+                   _z(2026, 10, 29, 9, 14)):              # 14 min past 05:00 ET
+            b._xp_check(ts)
+        self.assertEqual(self.alerts, [])
+        b._xp_check(_z(2026, 10, 29, 9, 16))
+        cat, msg, key, urgent = self.alerts[0]
+        self.assertEqual((cat, key, urgent), ("exchange_pause", "exchange_pause", True))
+        self.assertIn("published closure ended at 05:00 ET, 16m ago", msg)
+        self.assertIn("on shard 0 for 2h15m (since Thu 03:00 ET", msg)
+        b._xp_check(_z(2026, 10, 29, 9, 30))
+        self.assertEqual(len(self.alerts), 1)            # once a pause
+
+    def test_shards_that_come_due_together_share_one_email(self):
+        b = self.bot
+        self._pause_at(_z(2026, 10, 28, 15, 0, 30), s=2)
+        self._pause_at(_z(2026, 10, 28, 15, 0), s=0)
+        b._xp_check(_z(2026, 10, 28, 15, 21))
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("on shards 0, 2 for 21m (since Wed 11:00 ET", self.alerts[0][1])
+        self.assertTrue(b._xp[0]["alerted"] and b._xp[2]["alerted"])
+
+    def test_a_pause_outside_the_schedule_emails_after_20_minutes(self):
+        b = self.bot
+        self._pause_at(_z(2026, 10, 28, 15, 0))          # a Wednesday afternoon
+        b._xp_check(_z(2026, 10, 28, 15, 19))
+        self.assertEqual(self.alerts, [])
+        b._xp_check(_z(2026, 10, 28, 15, 21))
+        self.assertIn("outside Kalshi's published schedule", self.alerts[0][1])
+        self.assertIn("If this recurs at a new time", self.alerts[0][1])
+
+    def test_an_unreadable_schedule_emails_after_20_minutes(self):
+        b = self.bot
+        self._pause_at(_z(2026, 10, 29, 7, 0, 6))
+        b._xp_sched, b._xp_sched_err = None, "HttpError(503 Service Unavailable)"
+        b._xp_check(_z(2026, 10, 29, 7, 19))
+        self.assertEqual(self.alerts, [])
+        b._xp_check(_z(2026, 10, 29, 7, 21))
+        self.assertIn("schedule could not be read (HttpError(503", self.alerts[0][1])
+
+    def test_a_quick_return_continues_the_same_pause(self):
+        b = self.bot
+        self._pause_at(_z(2026, 10, 28, 15, 0))
+        b._xp_end(0, _z(2026, 10, 28, 15, 10), "Kalshi took a place (x)")
+        b._xp_begin(0, self.A, "trading_is_paused", "place", _z(2026, 10, 28, 15, 11),
+                    True, {-1})
+        self.assertEqual((b._xp[0]["since"], b._xp_stats["pauses"]),
+                         (_z(2026, 10, 28, 15), 1))
+        b._xp_check(_z(2026, 10, 28, 15, 21))            # 21 min of one pause
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_the_schedule_is_read_and_kept(self):
+        b = self.bot
+        b._xp_check(1_800_000_000.0)
+        self.assertIs(b._xp_sched, _SCHEDULE)
+        self.client.schedule = {"oops": 1}               # a bad read keeps the last
+        b._xp_check(1_800_000_000.0 + imm.EXCH_SCHEDULE_TTL_SECS + 1)
+        self.assertIs(b._xp_sched, _SCHEDULE)
+        self.assertIn("schedule unreadable", b._xp_sched_err)
 
 
 class TestTreasuryEarlyBlackout(unittest.TestCase):
