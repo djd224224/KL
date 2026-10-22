@@ -129,7 +129,11 @@ HL_COINS = ("BTC", "ETH", "SOL", "XRP", "HYPE")
 # discovery one series at a time (the first pass back to back), programs
 # (~8 pages) every 7.5 min -- each 15-min program is seen at least once.
 REST_GAP = 3.0
-DISCOVERY_SECS = 600.0           # each series re-read this often (one every 40 s)
+DISCOVERY_SECS = 600.0           # each series re-read this often (one every 100 s)
+DISCOVERY_AHEAD_SECS = 3 * 3600.0
+# a synced edit of this file restarts the recorder (the launcher relaunches
+# it 20 s after a clean exit), so a fix needs no hand kill
+SOURCE_CHECK_SECS = 30.0
 OPEN_PULL_DELAY = 20.0           # a quarter-hour's opened markets, +20 s (strike / rules)
 SETTLE_DELAY, SETTLE_RETRY, SETTLE_WINDOW = 180.0, 120.0, 3600.0
 PROGRAMS_SECS = 450.0
@@ -468,14 +472,19 @@ class Q15Rest(threading.Thread):
                 break
 
     def discover(self, now: float, s: str) -> bool:
-        """One series' current and upcoming markets (Kalshi lists them hours
-        ahead); False when the read failed."""
-        r = self.client.get("/markets", {"series_ticker": s, "min_close_ts": int(now) - 60,
-                                         "limit": 200})
-        if not r.ok:
+        """One series' markets closing in the next DISCOVERY_AHEAD_SECS
+        (Kalshi lists ~40 windows ahead, newest first: an unbounded first
+        page of the crypto race -- 5 coins a window -- held only the far
+        ones, 10/22); False when the read failed."""
+        try:
+            ms = self.client.paginate("/markets", {
+                "series_ticker": s, "min_close_ts": int(now) - 60,
+                "max_close_ts": int(now + DISCOVERY_AHEAD_SECS), "limit": 200},
+                "markets", max_pages=5)
+        except Exception:
             self.stats["discovery_fails"] += 1
             return False
-        for m in r.body.get("markets") or []:
+        for m in ms:
             self._note(m, time.time(), "discover")
         self.stats["discoveries"] += 1
         return True
@@ -623,12 +632,19 @@ class Collector:
         next_flush = next_hb = next_meta = next_px = 0.0
         next_rot = time.time() + 600
         last_hour = int(time.time() // 3600)
+        src_mtime = _source_mtime()
+        next_src = time.time() + SOURCE_CHECK_SECS
         try:
             while True:
                 now = time.time()
                 if os.path.exists(C.HALT_FILE):
                     self.exit_reason, code = "HALT file present", EXIT_DONE
                     break
+                if now >= next_src:
+                    next_src = now + SOURCE_CHECK_SECS
+                    if _source_mtime() != src_mtime:
+                        self.exit_reason, code = "source file changed (synced fix)", EXIT_OK
+                        break
                 if now >= self.until:
                     self.exit_reason, code = f"past Q15_SHADOW_UNTIL {UNTIL}", EXIT_DONE
                     break
@@ -680,6 +696,17 @@ class Collector:
             pass
         self.writer.flush()
         self.writer.close_all()
+
+
+def _source_mtime() -> float:
+    """This file's and its helpers' mtimes, summed (any synced edit shows)."""
+    tot = 0.0
+    for p in (os.path.abspath(__file__), T.__file__, C.__file__, kalshi_ws.__file__):
+        try:
+            tot += os.path.getmtime(p)
+        except OSError:
+            pass
+    return tot
 
 
 def main(argv: Optional[List[str]] = None) -> int:
