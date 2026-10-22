@@ -50,13 +50,18 @@ Benchmarks). The fidelity of a proxy is part of what the test measures
 and Q15_PYTH=1 (with PYTH_API_KEY or KL-data\q15-shadow\pyth_api_key.txt)
 bring the other series back if a key is ever bought.
 
-## Phase 2 (to build during the week)
+## Phase 2: sim + daily report -- built 2026-10-22
 
-1. Model: P(up) = P(S_T >= S_0 | S_t, tau) from the feed (Brownian with a
-   recent realized sigma, heavy tails), per the series' exact settlement rule
-   (FX: Pyth value at close vs at open; Brent / natgas: the 1-minute candle
-   close vs the listed strike, rounded).
-2. Scoring: temp_shadow_scoring's port of the IMM `_side_share` (target 300).
-3. Sim: replay variants (fair-anchored two-sided, favorite joins, night-only)
-   with the stress / sweep-aware fill models from temp_shadow_sweep.
-4. Daily report email + a week verdict on rules registered before the data.
+- q15_sim.py --day <ET day>: one pass over the day's recording -- books from
+  the ws stream, the fair (FX: a driftless walk on Kraken's mid, EWMA sigma;
+  the race: Monte Carlo of the 5 coins' remaining returns), the
+  Q15_PREREG.md variants quoted each second without crossing, rewards via
+  temp_shadow_scoring.score (the IMM's exact scorer) at the program's
+  target, STRESS fills marked to Kalshi's result, Brier of fair vs mid, the
+  FX proxy's call vs Kalshi -> sim/<day>/q15_day.json.
+- q15_report.py [--day] [--no-sim] [--send]: sims yesterday, then yesterday +
+  the running totals since 10/23 + the pre-registered verdict, emailed via
+  send_html_email.py. Task "KL q15-shadow report" (register_q15_report.ps1)
+  daily 08:45 ET, 10/24-10/30.
+- Not built (reported as a gap): the queue fill model -- the STRESS model
+  decides by the pre-registration.
