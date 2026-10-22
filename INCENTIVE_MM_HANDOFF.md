@@ -10979,3 +10979,34 @@ Deploy: incentive_mm.py change, so the sync's code-change restart. Check the sta
 - `python imm_release_calendar.py` looks up every report in use now and prints what it reads (no writes).
 Deploy: incentive_mm.py change, so the sync's code-change restart (the map file appears as series map); the
 watch imports the new module on its next run.
+
+## 2026-10-22 ~22:10Z — base size split test, 1.5x on half the series 10/26-11/08 (Jack: "I want to test increasing base contract size by 1.5x" -> "Split test")
+
+- incentive_mm SIZE_TEST_*: from 00:00 ET Mon 10/26 for 14 days (to 00:00 ET Mon 11/09) the "test" half of the
+  series (first byte of sha256("size15-1026-31:" + series) odd) quotes at x1.5 on the family wire
+  (applied_mention_mult): rungs 20 -> 30, per-market / per-event caps and skew knees together, as the 10/11
+  family x2s that measured reward elasticity 0.51 / fill-loss 0.90. The "control" half is unchanged.
+  - Out of both halves (size_test_arm None): hand-tuned ladders (SeriesOverride levels / max_position: the
+    Trump weeklies, yt2, YouTube weekly, Big Sky snow) and SIZE_TEST_EXCLUDE (KXTRUMPMENTION / -B, their own
+    test to 11/05).
+  - Balance on 10/08-10/21 with the bot's overrides: test 289 series, $485/day rewards, -$322 fills; control
+    269, $489, -$326. Salts were picked for balance (some random splits ran $319 vs $666).
+  - run-logs\incentive-mm\size_test_stop.txt ends it (read once a minute, no restart). IMM_SIZE_TEST_MULT=1 is
+    off; IMM_SIZE_TEST_FROM / _DAYS / _SALT / _EXCLUDE.
+  - Startup line "size split test (2026-10-22): ... waiting to start / LIVE now / STOPPED / ended".
+- imm_size_test_report.py, IMM family watch pass 7 (--no-size-test skips): once an ET day from 06:00 ET, 10/27 on.
+  - Score: per ET day, test half minus control half (dashboard reward estimate + trading P&L), less their gap
+    over the 14 days before 10/26; SE from both periods' daily spread.
+  - STOP RULE: the last 3 test days' net averaging below -$400/day (IMM_SIZE_TEST_STOP_USD) writes the stop
+    file and emails "IMM size test STOPPED".
+  - Day 7 and day 14 emails: KEEP when net is more than 1 SE above zero, STOP when more than 1 SE below, else
+    WATCH.
+- The stop rule offered first was "fills $150/day worse for 3 days". It was changed before the start: fills
+  alone are expected to cost ~$140/day more on the 1.5x half (the price of ~$110/day more rewards), so it
+  would trip on the expected outcome. The placebo showed the noise (below).
+- Noise (placebo, nothing changed, 200 random splits): a 14-day baseline + 14-day test reads +/- $98/day on net
+  and +/- $71/day on rewards (1 SD). A week-swap crossover would be +/- $81 over the same two weeks. The 10/15
+  placebo through the report itself read net -$4 +/- $123, rewards +$83 +/- $42. Expected effect from the 10/11
+  elasticities: rewards ~+$110/day, fills ~-$140, net ~-$30. So the reward lift should show; net will most
+  likely read WATCH unless 1.5x is far better or worse than the elasticities say.
+Deploy: incentive_mm.py change, so the sync's code-change restart; nothing changes in quoting before 10/26.

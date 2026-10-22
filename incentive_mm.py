@@ -67,6 +67,7 @@ import math
 import os
 import fnmatch
 import gzip
+import hashlib
 import random
 import re
 import signal
@@ -2196,6 +2197,76 @@ def mention_size_mult(series: str) -> float:
     return 1.0
 
 
+# BASE SIZE SPLIT TEST (Jack 2026-10-22: "I want to test increasing base
+# contract size by 1.5x" -> "Split test"). For SIZE_TEST_DAYS from 00:00 ET
+# on SIZE_TEST_FROM, a fixed half of the series ("test": the first byte of
+# sha256(SIZE_TEST_SALT:series) is odd) quotes at SIZE_TEST_MULT on the family
+# wire -- rungs, per-market and per-event caps and the skew knees together,
+# the wiring of the 10/11 family x2s that measured reward elasticity 0.51 and
+# fill-loss elasticity 0.90 -- and the other half ("control") stays as it is,
+# so both halves trade the same days. The salt balanced the halves on
+# 10/08-10/21 (rewards $489 vs $496/day, fills -$326 vs -$332). Out of both
+# halves: hand-tuned ladders (applied_mention_mult leaves them literal) and
+# SIZE_TEST_EXCLUDE (the Trump mentions B test). imm_size_test_report (IMM
+# family watch pass 7) scores it daily and writes SIZE_TEST_STOP_FILE (in
+# STATUS_DIR) when its stop rule trips; the file ends the test by hand too,
+# read once a minute. IMM_SIZE_TEST_MULT=1 turns it off.
+SIZE_TEST_MULT = _env_float("IMM_SIZE_TEST_MULT", 1.5)
+SIZE_TEST_FROM = _env_et_day("IMM_SIZE_TEST_FROM", "2026-10-26")
+SIZE_TEST_DAYS = _env_float("IMM_SIZE_TEST_DAYS", 14)
+SIZE_TEST_SALT = os.environ.get("IMM_SIZE_TEST_SALT", "size15-1026-31")
+SIZE_TEST_EXCLUDE = frozenset(
+    s.strip() for s in os.environ.get(
+        "IMM_SIZE_TEST_EXCLUDE", "KXTRUMPMENTION,KXTRUMPMENTIONB").split(",") if s.strip())
+SIZE_TEST_STOP_FILE = "size_test_stop.txt"                     # in STATUS_DIR
+_size_test_stop = {"checked": 0.0, "stopped": False}
+_size_test_cache: Dict[Any, Any] = {}           # the window per knobs, a parity per series
+
+
+def size_test_window() -> Tuple[Optional[float], Optional[float]]:
+    """(start, end) UTC epochs of the size test, (None, None) when off."""
+    key = (SIZE_TEST_FROM, SIZE_TEST_DAYS, SIZE_TEST_MULT)
+    if key not in _size_test_cache:
+        start = _et_day_start_ts(SIZE_TEST_FROM)
+        if start is None or SIZE_TEST_MULT == 1.0 or SIZE_TEST_DAYS <= 0:
+            _size_test_cache[key] = (None, None)
+        else:
+            day = SIZE_TEST_FROM + timedelta(days=int(round(SIZE_TEST_DAYS)))
+            _size_test_cache[key] = (start, _et_day_start_ts(day))
+    return _size_test_cache[key]
+
+
+def size_test_arm(series: str) -> Optional[str]:
+    """"test" / "control" for a series in the size test, None for one out of
+    both halves."""
+    ov = SERIES_OVERRIDES.get(series)
+    if series in SIZE_TEST_EXCLUDE or (ov and (ov.levels or ov.max_position is not None)):
+        return None
+    key = (SIZE_TEST_SALT, series)
+    if key not in _size_test_cache:
+        _size_test_cache[key] = hashlib.sha256(f"{SIZE_TEST_SALT}:{series}".encode()).digest()[0] % 2
+    return "test" if _size_test_cache[key] else "control"
+
+
+def size_test_stopped() -> bool:
+    now = time.time()
+    if now - _size_test_stop["checked"] >= 60:
+        _size_test_stop["checked"] = now
+        _size_test_stop["stopped"] = os.path.exists(os.path.join(STATUS_DIR, SIZE_TEST_STOP_FILE))
+    return _size_test_stop["stopped"]
+
+
+def size_test_mult(series: str, now_ts: Optional[float] = None) -> float:
+    """SIZE_TEST_MULT for a "test" series inside the window, else 1.0."""
+    start, end = size_test_window()
+    if start is None:
+        return 1.0
+    ts = time.time() if now_ts is None else now_ts
+    if not (start <= ts < end) or size_test_arm(series) != "test" or size_test_stopped():
+        return 1.0
+    return SIZE_TEST_MULT
+
+
 def applied_mention_mult(series: str) -> float:
     """The mention multiplier ACTUALLY applied to this series' geometry:
     1.0 for series with a hand-tuned SeriesOverride ladder/cap (Love Island
@@ -2214,7 +2285,8 @@ def applied_mention_mult(series: str) -> float:
     # payout-floor projection, sees the doubled size, as Jack asked.
     if ov and ov.size_mult is not None:
         m *= ov.size_mult
-    return m
+    # ...and the base size split test's half (SIZE_TEST_MULT, 2026-10-26)
+    return m * size_test_mult(series)
 
 
 def hour_scaled_levels(series: str, now_utc: datetime) -> List[Tuple[int, int]]:
@@ -10163,6 +10235,8 @@ _CONFIG_CODE_KNOBS = (
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
     "SIDE_MULT_SERIES",                          # Trump B half bids / 1.5x asks (2026-10-22)
+    "SIZE_TEST_MULT", "SIZE_TEST_FROM", "SIZE_TEST_DAYS",   # base size split test (2026-10-26)
+    "SIZE_TEST_SALT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE", "MENTION_NO_CUTOFF_EXEMPT",
     "MENTION_ANNOUNCE_SERIES", "MENTION_ANNOUNCE_FILL_CT",
@@ -31546,6 +31620,16 @@ class IncentiveMarketMaker:
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
                             for s, (b, a) in sorted(SIDE_MULT_SERIES.items()))
                 + " -- every other series unchanged; report email 2026-11-05")
+        _st0, _st1 = size_test_window()
+        if _st0 is not None:
+            log(f"size split test (2026-10-22): x{SIZE_TEST_MULT:g} on the family wire for the "
+                f"'test' half of the series (sha256 '{SIZE_TEST_SALT}'), "
+                f"{datetime.fromtimestamp(_st0, ET):%m-%d %H:%M} to "
+                f"{datetime.fromtimestamp(_st1, ET):%m-%d %H:%M} ET; out of both halves: "
+                f"hand-tuned ladders, {','.join(sorted(SIZE_TEST_EXCLUDE)) or '-'}"
+                + ("; STOPPED (" + SIZE_TEST_STOP_FILE + ")" if size_test_stopped() else
+                   ("; LIVE now" if _st0 <= time.time() < _st1 else
+                    ("; ended" if time.time() >= _st1 else "; waiting to start"))))
         if PAD_STICKY:
             log(f"sticky pads (2026-10-22): a resting pad is not pulled or shrunk "
                 f"until the depth outside it reaches {PAD_STICKY_RELEASE_MULT:g}x "

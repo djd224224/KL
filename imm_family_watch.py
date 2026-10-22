@@ -51,6 +51,11 @@ threshold". Three passes, each fail-safe on its own:
    left with no upcoming date (first sight, then weekly). A series pass 1
    enrolls into the state statistics family is checked against its rules at
    once. A failing pass is emailed too (daily).
+7. SIZE TEST (2026-10-22, Jack: "Split test") -- imm_size_test_report scores
+   incentive_mm's 1.5x base size split test once an ET day (from 06:00 ET,
+   10/27-11/09): its stop rule writes the bot's stop file, and the day-7 and
+   final emails carry the verdict set in advance. A failing pass is emailed
+   too (daily).
 
 Imports imm_quote_gaps first: it mirrors the launcher's env (blocklist, allow
 lists, pilots) before incentive_mm is imported, so "allowed" means what the live
@@ -1428,6 +1433,38 @@ def release_calendar_pass(client, new_series: List[Tuple[str, str]], state: dict
             state["release_cal_err_sent"] = now_ts
 
 
+def size_test_pass(state: dict, dry: bool, summary: List[str]) -> None:
+    """Pass 7 (Jack 2026-10-22: "Split test"): score the base size split
+    test once an ET day (imm_size_test_report.run) -- its stop rule and its
+    day-7 / final emails; the pass's own failure is emailed too (at most
+    daily)."""
+    import imm_size_test_report as istr
+    now = datetime.now(timezone.utc)
+    st = state.setdefault("size_test", {})
+    if not istr.due(st, now):
+        return
+    try:
+        line, mail = istr.run(load_dashboard(), st, dry, now)
+        if mail:
+            subject, text = mail
+            log("[WATCH] size test:\n" + text)
+            if not dry:
+                imm.Alerter("IMM-WATCH", live=True).send_message(text, subject)
+        if line:
+            summary.append(line)
+    except Exception as e:                           # noqa: BLE001 - emailed below
+        log(f"[WATCH] ! size test pass failed: {e!r}")
+        last = state.get("size_test_err_sent") or 0
+        if not dry and now.timestamp() - float(last) >= MODEL_PASS_ERR_HOURS * 3600:
+            imm.Alerter("IMM-WATCH", live=True).send_message(
+                f"The IMM family watch's size test pass failed: {e!r}\n"
+                f"Until it is fixed the 1.5x split test is NOT scored and its stop rule "
+                f"is NOT enforced (stop it by hand: create run-logs\\incentive-mm\\"
+                f"{imm.SIZE_TEST_STOP_FILE}). Log: run-logs\\incentive-mm\\family-watch.log",
+                "IMM-WATCH size test pass FAILED")
+            state["size_test_err_sent"] = now.timestamp()
+
+
 def _load_state() -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -1452,6 +1489,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-alert", action="store_true")
     ap.add_argument("--no-model", action="store_true", help="skip pass 5 (model coverage)")
     ap.add_argument("--no-calendar", action="store_true", help="skip pass 6 (release calendar)")
+    ap.add_argument("--no-size-test", action="store_true", help="skip pass 7 (size split test)")
     ap.add_argument("--check-login", action="store_true",
                     help="test the research login with one tiny run, then exit")
     args = ap.parse_args(argv)
@@ -1539,6 +1577,8 @@ def main(argv=None) -> int:
         model_coverage_pass(progs, state, args.dry, summary)
     if not args.no_calendar:
         release_calendar_pass(client, new_state_series, state, args.dry, summary)
+    if not args.no_size_test:
+        size_test_pass(state, args.dry, summary)
     if not args.dry:
         _save_state(state)
     log(f"[WATCH] {', '.join(summary)} ({time.time() - t0:.0f}s"

@@ -31341,5 +31341,53 @@ class TestReleasePause(unittest.TestCase):
                 datetime.strptime(s, "%Y-%m-%d %H:%M")
 
 
+class TestSizeSplitTest(unittest.TestCase):
+    """A fixed half of the series at 1.5x for two weeks from 10/26 (Jack
+    2026-10-22: "I want to test increasing base contract size by 1.5x" ->
+    "Split test")."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="imm_size_test_")
+        for p in (mock.patch.object(imm, "STATUS_DIR", self.dir),
+                  mock.patch.dict(imm._size_test_stop, {"checked": 0.0, "stopped": False}),
+                  mock.patch.dict(imm._size_test_cache, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _ts(*a):
+        return imm.ET.localize(datetime(*a)).timestamp()
+
+    def test_the_halves_and_the_window(self):
+        arms = {s: imm.size_test_arm(s) for s in ("KXPAMFGEMP", "KXBOZPERMITS", "KXSUEZWEEKLY",
+                                                   "KXNECORNYIELD", "KXILNUCLEAR", "KXRAIN")}
+        self.assertEqual(set(arms.values()), {"test", "control"})       # both halves present
+        self.assertEqual(arms, {s: imm.size_test_arm(s) for s in arms})  # stable
+        self.assertIsNone(imm.size_test_arm("KXTRUMPMENTIONB"))          # its own test
+        with mock.patch.dict(imm.SERIES_OVERRIDES, {"KXHAND": imm.SeriesOverride(levels=[(0, 5)])}):
+            self.assertIsNone(imm.size_test_arm("KXHAND"))               # a hand-tuned ladder
+        t = next(s for s, a in arms.items() if a == "test")
+        c = next(s for s, a in arms.items() if a == "control")
+        start, end = imm.size_test_window()
+        self.assertEqual((start, end), (self._ts(2026, 10, 26), self._ts(2026, 11, 9)))
+        self.assertEqual(imm.size_test_mult(t, start - 1), 1.0)         # not yet
+        self.assertEqual(imm.size_test_mult(t, start), 1.5)
+        self.assertEqual(imm.size_test_mult(c, start + 3600), 1.0)      # control
+        self.assertEqual(imm.size_test_mult(t, end), 1.0)               # over
+        with mock.patch.object(imm, "SIZE_TEST_MULT", 1.0):
+            self.assertEqual(imm.size_test_window(), (None, None))       # off
+
+    def test_the_test_half_scales_its_geometry_and_the_stop_file_ends_it(self):
+        t = next(s for s in ("KXPAMFGEMP", "KXBOZPERMITS", "KXSUEZWEEKLY", "KXNECORNYIELD")
+                 if imm.size_test_arm(s) == "test")
+        base = imm.MAX_POSITION_CONTRACTS
+        with mock.patch.object(imm.time, "time", return_value=self._ts(2026, 10, 27, 12)):
+            self.assertEqual(imm.applied_mention_mult(t), 1.5)
+            self.assertEqual(imm.series_max_position(t), base * 1.5)    # caps move with the rung
+            open(os.path.join(self.dir, imm.SIZE_TEST_STOP_FILE), "w").close()
+            imm._size_test_stop["checked"] = 0.0
+            self.assertEqual(imm.applied_mention_mult(t), 1.0)          # stopped: back at 1x
+
+
 if __name__ == "__main__":
     unittest.main()

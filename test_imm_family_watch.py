@@ -937,6 +937,46 @@ class TestReleaseCalendarPass(unittest.TestCase):
         self.assertEqual(sent[1:], ["IMM-WATCH release calendar pass FAILED"])
 
 
+class TestSizeTestPass(unittest.TestCase):
+    """Pass 7 (Jack 2026-10-22: "Split test"): it reads the dashboard only when
+    due, emails unless dry, and a failing pass is emailed at most daily."""
+
+    def test_due_email_and_failure(self):
+        from unittest import mock
+        import imm_size_test_report as istr
+        sent, loads = [], []
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(fw, "load_dashboard", lambda path=None: loads.append(1) or {"x": 1}), \
+                mock.patch.object(istr, "due", lambda st, now: False):
+            fw.size_test_pass({}, False, [])
+        self.assertEqual((sent, loads), ([], []))                     # not due: no dashboard read
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(fw, "load_dashboard", lambda path=None: {"x": 1}), \
+                mock.patch.object(istr, "due", lambda st, now: True), \
+                mock.patch.object(istr, "run", lambda D, st, dry, now: ("size test: day 7",
+                                                                        ("IMM size test week 1", "b"))):
+            summary = []
+            fw.size_test_pass({}, True, summary)
+            self.assertEqual(sent, [])                                    # dry
+            fw.size_test_pass({}, False, summary)
+            self.assertEqual(sent, ["IMM size test week 1"])
+            self.assertEqual(summary, ["size test: day 7", "size test: day 7"])
+
+        def boom(D, st, dry, now):
+            raise RuntimeError("dashboard torn")
+        state = {}
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(fw, "load_dashboard", lambda path=None: {"x": 1}), \
+                mock.patch.object(istr, "due", lambda st, now: True), \
+                mock.patch.object(istr, "run", boom):
+            fw.size_test_pass(state, False, [])
+            fw.size_test_pass(state, False, [])                          # no repeat within a day
+        self.assertEqual(sent[1:], ["IMM-WATCH size test pass FAILED"])
+
+
 class TestResearchLoginFailure(unittest.TestCase):
     """Jack 2026-10-12: "send an email right away when research fails on a
     login error, instead of waiting until items give up"."""
