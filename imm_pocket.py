@@ -369,8 +369,16 @@ def main(argv=None):
         print(f"build {data.get('generated_et')}")
         for k, w in data["windows"].items():
             t = w["tot"]
+            # trading = the window's new fills + the inventory carried into it
+            # (marks on positions held from before it, and their settlements):
+            # the split every refresh reply gives (Jack 2026-10-22: "IMM pocket
+            # refresh had carry vs new fills, but that's gone ... Fix it")
+            carry = t["cr"] + t["cs"]
+            split = ("  (trading n/a)" if w.get("pnl_na") else
+                     f"  = new fills {t['pnl'] - carry:+.2f} + carry {carry:+.2f}"
+                     f" (marks {t['cr']:+.2f}, settled {t['cs']:+.2f})")
             print(f"  {k:<9} net {t['net']:+10.2f}  rewards {t['rew']:10.2f}  trading {t['pnl']:+10.2f}"
-                  f"  fills {int(t['fills'])}  families {len(w['fams'])}")
+                  f"{split}  fills {int(t['fills'])}  families {len(w['fams'])}")
     return 0
 
 
