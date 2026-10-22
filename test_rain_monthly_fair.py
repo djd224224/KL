@@ -269,11 +269,19 @@ class TestPeriodShape(unittest.TestCase):
             "dashboard) in Boston in September 26-27, 2026 is strictly greater than 0.5"), "BOS")
         self.assertEqual(rmf.station_code(
             "at New York City (KNYC; NYC on the TWC daily dashboard) in New York City"), "NYC")
+        # KXRAINONT's one-day market (2026-10-21) closes the parenthesis
+        self.assertEqual(rmf.station_code(
+            "If the total precipitation at Ontario International Airport (KONT) in Ontario, "
+            "California in the Feb 27, 2027 reporting day is strictly greater than 0 "
+            "inches, then the market resolves to Yes."), "ONT")
         # the monthlies' CLI code still wins first
         self.assertEqual(rmf.station_code(RULES.format(k=3)), "ORD")
         spec = rmf.CLI_STATIONS["APC"]
         self.assertEqual((spec["icao"], spec["iem"], spec["net"], spec["tz"]),
                          ("KAPC", "APC", "CA_ASOS", "US/Pacific"))
+        spec = rmf.CLI_STATIONS["ONT"]
+        self.assertEqual((spec["icao"], spec["iem"], spec["net"], spec["tz"]),
+                         ("KONT", "ONT", "CA_ASOS", "US/Pacific"))
 
     def test_period_from_the_ticker_day_first(self):
         d = datetime.fromisoformat
@@ -283,6 +291,9 @@ class TestPeriodShape(unittest.TestCase):
                          (d("2026-09-28").date(), d("2026-10-04").date()))
         self.assertEqual(rmf.parse_period("KXRAINNAPAM-01OCT26-31OCT26"),
                          (d("2026-10-01").date(), d("2026-10-31").date()))
+        # a one-day period (KXRAINONT, 2026-10-21)
+        self.assertEqual(rmf.parse_period("KXRAINONT-27FEB27-27FEB27-T0"),
+                         (d("2027-02-27").date(), d("2027-02-27").date()))
         for ev in ("KXRAINCHIM-26OCT", "KXRAINWKND-26OCT10-NYC", "KXRAIN-26OCT05",
                    "KXRAINNAPAM-31MAR27-01NOV26",            # backwards
                    "KXRAINNAPAM-01JAN26-31DEC27",            # past 400 days
@@ -482,6 +493,30 @@ class TestPeriodModel(unittest.TestCase):
         # an unknown station or a period already over: no fair
         self.assertIsNone(rmf.event_fair("E", dict(info, code="XYZ"), NOW))
         self.assertIsNone(rmf.event_fair("E", dict(info, end="2026-09-30"), NOW))
+
+    def test_no_boundary_rung_before_the_period_starts(self):
+        # KXRAINONT's one-day T0 (2026-10-21): a zero to-date sits on the
+        # strike, but before the day nothing is measured, so it quotes; on
+        # the day itself the rung is a boundary rung again
+        info = {"series": "KXRAINONT", "code": "ONT", "start": "2027-02-27",
+                "end": "2027-02-27", "last_wet_at": None,
+                "strikes": {"KXRAINONT-27FEB27-27FEB27-T0": 0.0}}
+
+        def td(key, s, e, now, lw=None, hist=None):
+            return {"obs": 0.0, "through": None, "stale": False, "missing": [],
+                    "pday": None, "notes": [], "in_period": now.date() >= s}
+
+        def sim(key, s, e, now, n_samples=None, rng=None, hist=None):
+            return {"totals": [0.0, 0.0, 0.0, 0.3], "horizon_days": 0, "n_segments": 28}
+        with mock.patch.object(rmf, "period_history", return_value={}), \
+                mock.patch.object(rmf, "period_to_date", side_effect=td), \
+                mock.patch.object(rmf, "simulate_period", side_effect=sim):
+            before = rmf.event_fair("KXRAINONT-27FEB27-27FEB27", info, NOW)
+            on_the_day = rmf.event_fair("KXRAINONT-27FEB27-27FEB27", info,
+                                        datetime(2027, 2, 27, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(before["p"], {"KXRAINONT-27FEB27-27FEB27-T0": 0.25})
+        self.assertEqual(before["boundary"], [])
+        self.assertEqual(on_the_day["boundary"], ["KXRAINONT-27FEB27-27FEB27-T0"])
 
 
 class TestPeriodWriter(unittest.TestCase):

@@ -51,10 +51,11 @@ KXRAINNYCW the week. Same fair, P(to date + rest > K), with three changes:
     never saw 30 inches, which is not a 0% chance. Leave-one-out over those
     seasons, strikes 10-35: Brier 0.1123 raw, 0.1115 at sigma 0.15;
   - rain matters only inside the period: before it starts the event reads
-    dry (no observation needed), so the season quotes through October's
+    dry (no observation needed) and no rung is a boundary rung (the to-date
+    is zero, nothing measured), so the season quotes through October's
     storms, and stands aside in them from November 1.
 Station codes come from the rules: "at CLIORD", "at KAPC", "at NYC in",
-"(KBOS; ...", or a named place (STATION_ALIASES).
+"(KBOS; ...", "(KONT) in", or a named place (STATION_ALIASES).
 
 Standalone:  python rain_monthly_fair.py [--out path] [--period-series S,..]
 """
@@ -138,6 +139,13 @@ for _code, _net, _name, _lat, _lon, _tz in (
 CLI_STATIONS["APC"] = {"icao": "KAPC", "iem": "APC", "net": "CA_ASOS",
                        "name": "Napa County Airport", "lat": 38.2075,
                        "lon": -122.2804, "tz": "US/Pacific"}
+# Ontario, California (2026-10-21, the model-coverage gap on KXRAINONT's
+# one-day "Will it rain in Ontario, California on Feb 27, 2027?"), checked
+# live that day on IEM currents + daily (CA_ASOS), ACIS (record from
+# 1998-05-25, 28 Feb 27ths) and the NWS grid (SGX); coordinates from ACIS
+CLI_STATIONS["ONT"] = {"icao": "KONT", "iem": "ONT", "net": "CA_ASOS",
+                       "name": "Ontario Intl", "lat": 34.0531,
+                       "lon": -117.5769, "tz": "US/Pacific"}
 # rules that name the place rather than a CLI product ("at Central Park, New
 # York City" on KXRAINNYCM)
 STATION_ALIASES = {"Central Park": "NYC"}
@@ -145,9 +153,10 @@ STATION_ALIASES = {"Central Park": "NYC"}
 # METAR present-weather tokens that mean precipitation at or near the station
 _WET_RE = re.compile(r"(RA|DZ|SN|SG|PL|GR|GS|UP|TS|SH)")
 _CLI_RE = re.compile(r"\bat\s+CLI([A-Z]{3})\b")
-# the period rules' station: "(KBOS; BOS on the TWC daily dashboard)", "at
-# KAPC in Napa", "at NYC in New York City"
-_ICAO_PAREN_RE = re.compile(r"\(K([A-Z]{3});")
+# the period rules' station: "(KBOS; BOS on the TWC daily dashboard)",
+# "Ontario International Airport (KONT) in Ontario", "at KAPC in Napa", "at
+# NYC in New York City"
+_ICAO_PAREN_RE = re.compile(r"\(K([A-Z]{3})[;)]")
 _ICAO_RE = re.compile(r"\bat\s+K([A-Z]{3})\b")
 _CODE_RE = re.compile(r"\bat\s+([A-Z]{3})\s+in\b")
 _PERIOD_SEG_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
@@ -165,8 +174,8 @@ def _log(msg: str) -> None:
 
 def station_code(rules: str) -> Optional[str]:
     """The settlement station's code from a market's rules text: "at
-    CLIxxx", "(Kxxx;", "at Kxxx", "at XXX in", else a named place in
-    STATION_ALIASES."""
+    CLIxxx", "(Kxxx;" or "(Kxxx)", "at Kxxx", "at XXX in", else a named
+    place in STATION_ALIASES."""
     for rx in (_CLI_RE, _ICAO_PAREN_RE, _ICAO_RE, _CODE_RE):
         m = rx.search(rules or "")
         if m:
@@ -477,7 +486,8 @@ def period_fair(event: str, info: dict, now: datetime,
         return None
     if spec is None or not info.get("strikes"):
         return None
-    if now.astimezone(pytz.timezone(spec["tz"])).date() > end:
+    today = now.astimezone(pytz.timezone(spec["tz"])).date()
+    if today > end:
         return None
     key = f"TWC{info['code']}"
     rm.STATIONS[key] = dict(spec, series=info.get("series", ""))
@@ -487,9 +497,14 @@ def period_fair(event: str, info: dict, now: datetime,
                           rng=rng or random.Random(), hist=hist)
     strikes = info["strikes"]
     p = rm.price_rungs(td["obs"], sim["totals"], sorted(set(strikes.values())))
+    # before its first day the to-date is zero by definition -- nothing
+    # measured, nothing to round -- so no rung is a boundary rung (else a T0
+    # strike, KXRAINONT's one-day "Will it rain" of 2026-10-21, sits dark
+    # until the day it is measured)
+    boundary = [] if today < start else sorted(
+        t for t, k in strikes.items() if abs(td["obs"] - k) < BOUNDARY_IN)
     return {"p": {t: round(p[k], 4) for t, k in strikes.items()},
-            "boundary": sorted(t for t, k in strikes.items()
-                               if abs(td["obs"] - k) < BOUNDARY_IN),
+            "boundary": boundary,
             "mtd": td["obs"], "cli_mtd": None, "cli_date": td["through"],
             "stale_cli": td["stale"], "pday": td["pday"], "notes": td["notes"],
             "horizon_days": sim["horizon_days"], "n_segments": sim["n_segments"],
