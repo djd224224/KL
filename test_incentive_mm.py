@@ -28665,7 +28665,8 @@ class TestLoneReferenceGuard(unittest.TestCase):
     def test_defaults_and_the_mention_books(self):
         self.assertEqual((imm.LONE_REF_MAX_MULT, imm.LONE_REF_MIN_GAP_C,
                           imm.LONE_REF_JUMP_WINDOW_MIN), (3.0, 20, 60))
-        self.assertEqual(imm.LONE_REF_GUARD_MODE, "on")
+        # dry since 2026-10-22 (Jack: "Build it and put guard on dry mode")
+        self.assertEqual(imm.LONE_REF_GUARD_MODE, "dry")
         for k in ("LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
                   "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
@@ -28784,7 +28785,13 @@ class TestLoneReferenceGuard(unittest.TestCase):
         bot, seen = self._cycles("dry", [self.WIDE, self.BAIT])
         self.assertEqual(seen, [[6], [69]])
         self.assertEqual(bot._lone_ref_held, {(self.T, "bid")})
+        # off: the guard is gone, but the bait-fingerprint stop still reads
+        # the same test (quietly) to pick its candidate fills
         bot, seen = self._cycles("off", [self.WIDE, self.BAIT])
+        self.assertEqual(seen, [[6], [69]])
+        self.assertEqual(bot._lone_ref_held, {(self.T, "bid")})
+        with mock.patch.object(imm, "BAIT_STOP_MODE", "off"):
+            bot, seen = self._cycles("off", [self.WIDE, self.BAIT])
         self.assertEqual(seen, [[6], [69]])
         self.assertEqual(bot._lone_ref_held, set())
 
@@ -28809,6 +28816,187 @@ class TestLoneReferenceGuard(unittest.TestCase):
         with mock.patch.object(imm, "LADDER_MODE", "offsets"):
             bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertEqual(bot._lone_ref_rungs, {})
+
+
+class TestBaitFingerprintStop(unittest.TestCase):
+    """2026-10-22 (Jack: "Build it and put guard on dry mode"): the LoL seller
+    sold exactly our size 14 of 16 times while the order ahead of us was
+    pulled. A whole-rung fill on a side the lone-reference test flags, whose
+    taker on the public tape was exactly our size, stops that side until ET
+    midnight and runs the lone-ref guard ON in its event until then."""
+
+    T = "KXGOOD-99DEC31-A"
+    EV = "KXGOOD-99DEC31"
+    WIDE = [["0.01", "2105"], ["0.06", "2000"]]
+    BAIT = WIDE + [["0.69", "200"]]
+
+    def test_the_fingerprint_on_the_tape(self):
+        ct = "2026-10-16T03:03:17.120Z"
+        ours = {"trade_id": "A", "created_time": ct, "taker_side": "no", "count_fp": "60.00"}
+        # LoL: the seller's whole order was our 60
+        self.assertTrue(imm.bait_fingerprint([ours], "A", 60.0))
+        # real flow: the same taker order traded the 200 ahead of us too
+        ahead = {"trade_id": "B", "created_time": ct, "taker_side": "no", "count_fp": "200.00"}
+        self.assertFalse(imm.bait_fingerprint([ours, ahead], "A", 60.0))
+        # another taker a moment later, or on the other side, is not ours
+        later = {"trade_id": "C", "created_time": "2026-10-16T03:03:18.500Z",
+                 "taker_side": "no", "count_fp": "50"}
+        other = {"trade_id": "D", "created_time": ct, "taker_side": "yes", "count_fp": "9"}
+        self.assertTrue(imm.bait_fingerprint([ours, later, other], "A", 60.0))
+        # our print is not on the tape yet; the legacy integer count
+        self.assertIsNone(imm.bait_fingerprint([later], "A", 60.0))
+        self.assertTrue(imm.bait_fingerprint(
+            [{"trade_id": "A", "created_time": ct, "taker_side": "yes", "count": 30}], "A", 30))
+
+    def test_defaults_scope_and_et_midnight(self):
+        self.assertEqual(imm.BAIT_STOP_MODE, "on")
+        for k in ("BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS",
+                  "BAIT_TAPE_MAX_TRIES"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        # the mention books keep their own gates; fair-gated series are in
+        self.assertFalse(imm.bait_series("KXTRUMPMENTION"))
+        self.assertFalse(imm.bait_series("KXWORLDNEWSMENTION"))
+        for s in ("KXLOLTOURPENTA", "KXTOKENUSE", "KXCPICORE", "KXGOOD"):
+            self.assertTrue(imm.bait_series(s), s)
+        with mock.patch.object(imm, "BAIT_STOP_MODE", "off"):
+            self.assertFalse(imm.bait_series("KXLOLTOURPENTA"))
+        # 23:13 ET on 10/15 (the LoL night, 03:13Z 10/16): out until 04:00Z
+        self.assertEqual(imm.et_day_end_ts(utc(2026, 10, 16, 3, 13).timestamp()),
+                         utc(2026, 10, 16, 4, 0).timestamp())
+        # EST after the clocks change: 05:00Z
+        self.assertEqual(imm.et_day_end_ts(utc(2026, 11, 20, 12, 0).timestamp()),
+                         utc(2026, 11, 21, 5, 0).timestamp())
+
+    def _bot(self, mode="on"):
+        """A bot whose bid on T followed the 200-lot from 6c to 69c (guard
+        dry), so the side is flagged; returns it with its patches running."""
+        _clean_persist()
+        for p in (mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "LONE_REF_GUARD_MODE", "dry"),
+                  mock.patch.object(imm, "BAIT_STOP_MODE", mode),
+                  mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                  mock.patch.object(imm, "LEVELS", [(0, 100)]),
+                  mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 300.0),
+                  mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0)):
+            p.start()
+            self.addCleanup(p.stop)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        for book in (self.WIDE, self.BAIT):
+            self._cycle(bot, book)
+        self.assertEqual(self._bids(bot), [69])
+        self.assertIn((self.T, "bid"), bot._lone_ref_held)
+        return bot
+
+    @staticmethod
+    def _cycle(bot, yes):
+        bot.client.books[TestBaitFingerprintStop.T] = {"orderbook_fp": {
+            "yes_dollars": yes, "no_dollars": [["0.27", "1500"]]}}
+        bot.state.universe_at = time.time()
+        bot.run_cycle()
+
+    def _bids(self, bot, side="bid"):
+        return sorted({o["yes_price"] for o in bot.state.sim_orders.values()
+                       if o["ticker"] == self.T and o["book_side"] == side
+                       and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS})
+
+    def _fill(self, bot, taker_n, n=100.0, join=None):
+        ts = int(time.time()) - 30
+        fill = {"trade_id": "F1", "ticker": self.T, "is_taker": False, "ts": ts}
+        bot._bait_note_fill(fill, self.T, join or ("bid", 69, n, n), n, time.time())
+        tape = [{"trade_id": "F1", "created_time": "x", "taker_side": "no",
+                 "count_fp": str(n)}]
+        if taker_n > n:
+            tape.append({"trade_id": "F2", "created_time": "x", "taker_side": "no",
+                         "count_fp": str(taker_n - n)})
+        bot._bait_read_tape = mock.Mock(return_value=tape)
+        return bot._bait_read_tape
+
+    def test_the_tape_read_sends_the_ticker_once(self):
+        # the client's get_trades repeats `ticker`; Kalshi rejects that
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client = mock.Mock()
+        bot.client.get.return_value = {"trades": [{"trade_id": "A"}]}
+        self.assertEqual(bot._bait_read_tape(self.T, 1000), [{"trade_id": "A"}])
+        bot.client.get.assert_called_once_with("/markets/trades", params={
+            "ticker": self.T, "min_ts": 997, "max_ts": 1003, "limit": 200})
+
+    def test_a_fingerprint_stops_the_side_until_et_midnight(self):
+        bot = self._bot()
+        sunk = []
+        with mock.patch.object(bot, "_sink", lambda name, rec: sunk.append((name, rec))):
+            reads = self._fill(bot, taker_n=100.0)
+            self.assertEqual(len(bot._bait_pending), 1)
+            self._cycle(bot, self.BAIT)
+        reads.assert_called_once()
+        self.assertEqual(reads.call_args.args[0], self.T)
+        now = time.time()
+        end = imm.et_day_end_ts(now)
+        self.assertAlmostEqual(bot.state.bait_side_until[f"{self.T}|bid"], end, delta=1)
+        self.assertAlmostEqual(bot.state.bait_event_until[self.EV], end, delta=1)
+        self.assertTrue(bot.bait_side_stopped(self.T, "bid", now))
+        self.assertFalse(bot.bait_side_stopped(self.T, "ask", now))
+        self.assertEqual(self._bids(bot), [])                 # pulled this cycle
+        self.assertTrue(self._bids(bot, "ask"))               # the ask side quotes on
+        rows = [r for n_, r in sunk if n_ == "bait_stops"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["ticker"], rows[0]["side"], rows[0]["count"]),
+                         (self.T, "bid", 100.0))
+        self.assertEqual(bot._bait["stops"], 1)
+        self.assertEqual(bot._bait_pending, [])
+        # the 200-lot leaves: the side stays out until ET midnight
+        self._cycle(bot, self.WIDE)
+        self.assertEqual(self._bids(bot), [])
+        # ...and a restart keeps the stop
+        bot._save_persist()
+        again = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertTrue(again.bait_side_stopped(self.T, "bid", now))
+        self.assertTrue(again.bait_event_guarded(self.EV, now))
+
+    def test_a_bigger_taker_or_a_partial_or_an_unflagged_side_is_left_alone(self):
+        bot = self._bot()
+        self._fill(bot, taker_n=300.0)                        # real flow: bigger taker
+        self._cycle(bot, self.BAIT)
+        self.assertEqual(bot.state.bait_side_until, {})
+        self.assertEqual(bot._bait["bigger_taker"], 1)
+        self.assertEqual(self._bids(bot), [69])
+        bot._bait_seen.clear()
+        self._fill(bot, taker_n=40.0, n=40.0, join=("bid", 69, 100.0, 100.0))
+        self.assertEqual(bot._bait_pending, [])               # a partial is no sweep
+        bot._lone_ref_held.discard((self.T, "bid"))
+        self._fill(bot, taker_n=100.0)
+        self.assertEqual(bot._bait_pending, [])               # side not flagged
+
+    def test_dry_logs_and_stops_nothing(self):
+        bot = self._bot(mode="dry")
+        sunk = []
+        with mock.patch.object(bot, "_sink", lambda name, rec: sunk.append((name, rec))):
+            self._fill(bot, taker_n=100.0)
+            self._cycle(bot, self.BAIT)
+        self.assertEqual(bot.state.bait_side_until, {})
+        self.assertEqual(bot._bait["fingerprints"], 1)
+        self.assertEqual([r["mode"] for n_, r in sunk if n_ == "bait_stops"], ["dry"])
+        self.assertEqual(self._bids(bot), [69])
+
+    def test_a_missing_print_is_retried_then_dropped(self):
+        bot = self._bot()
+        reads = self._fill(bot, taker_n=100.0)
+        reads.return_value = []
+        for _ in range(imm.BAIT_TAPE_MAX_TRIES):
+            self.assertEqual(len(bot._bait_pending), 1)
+            self._cycle(bot, self.BAIT)
+        self.assertEqual(bot._bait_pending, [])
+        self.assertEqual(reads.call_count, imm.BAIT_TAPE_MAX_TRIES)
+        self.assertEqual(bot.state.bait_side_until, {})
+
+    def test_a_guarded_event_runs_the_guard_on(self):
+        bot = self._bot()
+        bot.state.bait_event_until[self.EV] = time.time() + 3600
+        self._cycle(bot, self.BAIT)
+        self.assertEqual(self._bids(bot), [])                 # the lone top: out
+        self._cycle(bot, self.WIDE)
+        self.assertEqual(self._bids(bot), [6])                # no stop on the side
 
 
 class TestPresRunNoSideOnly(unittest.TestCase):

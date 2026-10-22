@@ -26,6 +26,12 @@ ONE EMAIL per ET day, ending in OK / WATCH / PROBLEM:
   running  totals since the guard went live, against the replay's +$27/day;
            since 10/18 (fair-gated markets out) the verdict judges the markets
            it still guards, against the replay's +$17/day there
+  dry      since 10/22 (Jack: "Build it and put guard on dry mode") nothing is
+           held: the numbers are what "on" would have done, and the verdict
+           only WATCHes when "on" would have paid (SHADOW_ON_WATCH_PER_DAY)
+  bait     the day's bait-fingerprint stops (incentive_mm BAIT_STOP_MODE,
+           10/22): a whole-rung fill on a jumped lone top from a taker of
+           exactly our size stops that side until 00:00 ET
 
 SOURCES, all read-only: the bot's day logs (incentive-mm-*.log), the
 book_depth snapshots, fills_ / orders_<UTC date>.jsonl, the dashboard data
@@ -96,6 +102,15 @@ FAIR_GATE_WATCH = -25.0
 # covers -- the "none" gate, against the replay's +$17.44/day there -- and no
 # fair-gated family is flagged to leave out (it is out).
 REPLAY_NO_FAIR_NET_PER_DAY = 17.44
+# DRY since 2026-10-22 (Jack: "Build it and put guard on dry mode"): nothing is
+# held, so a day's numbers are what "on" would have done (a dry hold is the
+# shorter one: a rung that followed the top clears the jump test once it has
+# rested there all window). The verdict no longer judges the guard's cost or
+# the jumped fills it lets through; it WATCHes when "on" would have paid --
+# SHADOW_ON_WATCH_PER_DAY or more a day over RUN_MIN_DAYS dry days.
+SHADOW_ON_WATCH_PER_DAY = 10.0
+# the bait-fingerprint stop (incentive_mm BAIT_STOP_MODE, 2026-10-22): the
+# stops each day are listed from its bait_stops_<UTC date>.jsonl sink
 FAIR_NAMED = ("carbon arc", "vercel", "rain weekend")
 REPLAY_GATE_NET_PER_DAY = {"carbon arc": -1.8, "vercel": -1.8, "rain weekend": 2.7}
 FAIR_NAMED_LABEL = {"carbon arc": "Carbon Arc", "vercel": "Vercel", "rain weekend": "Weekend rain"}
@@ -646,6 +661,13 @@ def verdict(day: dict, run: dict) -> tuple:
         reasons.append(why)
 
     frac = max(day["hours"] / 24.0, 1e-9)
+    if day["mode"] == "dry":
+        # the guard is a shadow (DRY since 10/22): watch only for "on" paying
+        dd, dn = run.get("dry_days", 0.0), run.get("dry_net", 0.0)
+        if dd >= RUN_MIN_DAYS and dn >= SHADOW_ON_WATCH_PER_DAY * dd:
+            flag(1, f"'on' would have netted {usd(dn)} over {dd:.1f} dry days "
+                    f"({usd(dn / dd)}/day): consider turning the guard back on")
+        return LEVELS[level], reasons
     if day["mode"] != "on":
         flag(2, f"the guard reads {day['mode'] or 'unknown'} in the bot's startup line, not on")
     if day["let_thru_guarded"] <= LET_THRU_PROBLEM:
@@ -757,9 +779,14 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
             r[1] += x[1]
             r[2] += x[2]
     run["gates"] = {k: list(v) for k, v in run_gates.items()}
+    # the dry shadow's own running total (DRY since 10/22)
+    dry = [v for v in store.values() if v.get("mode") == "dry"]
+    run["dry_days"] = sum(v["hours"] for v in dry) / 24.0
+    run["dry_net"] = sum(v["net"] for v in dry)
     level, reasons = verdict(d, run)
     d["level"] = level
     return dict(d=d, run=run, level=level, reasons=reasons, store=store,
+                bait=bait_stops(a_ts, b_ts),
                 top_flaps=sorted(flaps.items(), key=lambda kv: -kv[1])[:5],
                 top_avoided=[x for x in tape["top"] if x[0] < 0][:5],
                 top_blocked=sorted((x for x in tape["top"] if x[0] > 0), reverse=True)[:5],
@@ -767,11 +794,53 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
                 by_cls=tape["by_cls"])
 
 
+def bait_stops(a_ts: float, b_ts: float) -> list:
+    """The bait-fingerprint stops inside the window, oldest first, from the
+    bot's bait_stops_<UTC date>.jsonl sink (none before 10/22)."""
+    out = []
+    for d in utc_dates(a_ts, b_ts):
+        try:
+            with open(os.path.join(imm.STATUS_DIR, f"bait_stops_{d}.jsonl"),
+                      encoding="utf-8") as fh:
+                for ln in fh:
+                    try:
+                        r = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if a_ts <= float(r.get("ts") or 0) < b_ts:
+                        out.append(r)
+        except OSError:
+            continue
+    return sorted(out, key=lambda r: float(r["ts"]))
+
+
+def bait_lines(ctx) -> list:
+    """The day's bait stops, one line each."""
+    rows = ctx.get("bait") or []
+    if not rows:
+        return ["Bait stops (fingerprint): none today."]
+    out = [f"Bait stops (fingerprint): {len(rows)} today -- a whole-rung fill on a "
+           f"jumped lone top, from a taker of exactly our size:"]
+    for r in rows:
+        at = datetime.fromtimestamp(float(r["ts"]), timezone.utc).astimezone(imm.ET)
+        what = ("side out until 00:00 ET, guard ON in " + str(r.get("event") or "")
+                if r.get("mode") == "on" else "dry: nothing stopped")
+        out.append(f"  {at:%H:%M} ET {r['ticker']} {str(r['side']).upper()} "
+                   f"{float(r['count']):g} @ {float(r['px']):g}c -- {what}")
+    return out
+
+
 def subject_for(ctx) -> str:
     d = ctx["d"]
     day = datetime.strptime(d["day"], "%Y-%m-%d")
+    n_bait = len(ctx.get("bait") or [])
+    bait = f" | {n_bait} bait stop{'s' if n_bait != 1 else ''}" if n_bait else ""
+    if d.get("mode") == "dry":
+        return (f"IMM lone-ref guard {day:%m/%d} (dry): 'on' would have netted "
+                f"{usd(d['net'])}{bait} | {ctx['level']}")
     return (f"IMM lone-ref guard {day:%m/%d}: {usd(d['net'])} "
-            f"(blocking fills {usd(-d['would_be'])}, reward {usd(-d['cost'])}) | {ctx['level']}")
+            f"(blocking fills {usd(-d['would_be'])}, reward {usd(-d['cost'])})"
+            f"{bait} | {ctx['level']}")
 
 
 def fair_line(d: dict, run: dict) -> str:
@@ -800,12 +869,27 @@ def render_text(ctx) -> str:
     per_day = run["net"] / run["days"] if run["days"] > 0 else 0.0
     blocked = ("would have made" if d["would_be"] > 0 else "would have lost")
     by_cls = d.get("would_be_by_cls") or {}
-    lines = [
-        f"{ctx['level']}: net {usd(d['net'])}. The fills its holds blocked {blocked} "
-        f"${abs(d['would_be']):,.0f}, and it gave up ${d['cost']:,.0f} of reward.",
-        f"Running since 10/16 12:17 ET: {usd(run['net'])} over {run['days']:.1f} days "
-        f"({usd(per_day)}/day; the replay said +${REPLAY_NET_PER_DAY:.0f}/day).",
-    ]
+    if d.get("mode") == "dry":
+        lines = [
+            f"{ctx['level']}: the guard is DRY since 10/22 -- nothing was held. 'On' "
+            f"would have netted {usd(d['net'])}: the fills it would have blocked "
+            f"{blocked} ${abs(d['would_be']):,.0f}, and it would have given up "
+            f"${d['cost']:,.0f} of reward.",
+            f"Dry so far: 'on' would have netted {usd(run.get('dry_net', 0.0))} over "
+            f"{run.get('dry_days', 0.0):.1f} days (a WATCH at "
+            f"+${SHADOW_ON_WATCH_PER_DAY:.0f}/day over {RUN_MIN_DAYS} days).",
+            f"Running since 10/16 12:17 ET (on, then dry): {usd(run['net'])} over "
+            f"{run['days']:.1f} days ({usd(per_day)}/day; the replay said "
+            f"+${REPLAY_NET_PER_DAY:.0f}/day).",
+        ]
+    else:
+        lines = [
+            f"{ctx['level']}: net {usd(d['net'])}. The fills its holds blocked {blocked} "
+            f"${abs(d['would_be']):,.0f}, and it gave up ${d['cost']:,.0f} of reward.",
+            f"Running since 10/16 12:17 ET: {usd(run['net'])} over {run['days']:.1f} days "
+            f"({usd(per_day)}/day; the replay said +${REPLAY_NET_PER_DAY:.0f}/day).",
+        ]
+    lines += bait_lines(ctx)
     if skip_fair():
         covered = gate_net((run.get("gates") or {}).get("none", [0, 0.0, 0.0]))
         gd = run.get("gate_days", 0.0)

@@ -9879,6 +9879,8 @@ _CONFIG_CODE_KNOBS = (
     # lone-reference guard (2026-10-16)
     "LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
     "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
+    # bait-fingerprint stop (2026-10-22)
+    "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -16620,14 +16622,18 @@ def ladder_reference_prices(yes_levels: List[List[float]],
 #     ~$48/day of fills, net ~+$27/day (+$13/day without 10/16);
 #   * x1.5 gives up ~$7/day for ~+$22/day net;
 #   * every rule WITHOUT the jump test loses (x3 20c: -$18/day).
-# IMM_LONE_REF_GUARD (on since 2026-10-16, Jack: "Ship the lone-reference
-# guard on at x3 / 20c / 60 min with mention books skipped"):
+# IMM_LONE_REF_GUARD (on 2026-10-16, Jack: "Ship the lone-reference guard on
+# at x3 / 20c / 60 min with mention books skipped"; DRY since 2026-10-22,
+# Jack: "Build it and put guard on dry mode" -- live it read -$140 over 5.5
+# days, $103 of it one news fill it kept us out of, against the replay's
+# +$34/day; the bait-fingerprint stop below now covers the LoL repeat):
 #   "on"  stands a tripped side aside: no rungs that cycle, and the requote
 #         cancels the resting ones;
 #   "dry" logs each trip (its rung still follows the top, so dry shows where
 #         trips start, not how long "on" would hold);
 #   "off" skips the check.
-LONE_REF_GUARD_MODE = os.environ.get("IMM_LONE_REF_GUARD", "on").strip().lower()
+# A bait stop turns it ON for the stopped market's event until ET midnight.
+LONE_REF_GUARD_MODE = os.environ.get("IMM_LONE_REF_GUARD", "dry").strip().lower()
 LONE_REF_MAX_MULT = _env_float("IMM_LONE_REF_MAX_MULT", 3.0)
 LONE_REF_MIN_GAP_C = _env_int("IMM_LONE_REF_MIN_GAP_C", 20)
 LONE_REF_JUMP_WINDOW_MIN = _env_int("IMM_LONE_REF_JUMP_WINDOW_MIN", 60)
@@ -16710,6 +16716,74 @@ def lone_ref_series(series: str) -> bool:
     if any(p in series for p in LONE_REF_SKIP):
         return False
     return not (LONE_REF_SKIP_FAIR and fair_gate_cached(series))
+
+
+# BAIT-FINGERPRINT STOP (2026-10-22, Jack: "Build it and put guard on dry
+# mode", after a replay of three fixes for the 10/16 LoL bait). One of our
+# maker fills that took the WHOLE rung on a side the lone-reference test
+# flags (lone_ref_trip: a thin top >= LONE_REF_MIN_GAP_C over the rest of
+# the book that our rung jumped to), where the taker's order on Kalshi's
+# public tape was exactly our size -- the LoL seller sold exactly our size
+# 14 of 16 times while the order ahead of us was pulled -- stops that side
+# of that market until ET midnight, and turns the lone-ref guard ON for the
+# market's event until then whatever LONE_REF_GUARD_MODE says. Real flow
+# trades the order ahead of us first, so its taker is bigger than our rung.
+# Replay 9/30-10/16 (475 thin-top fills, Kalshi's public tape, marked to
+# settlement):
+#   * 28 fingerprints, -$10.45 a fill (whole-rung jumped fills with a bigger
+#     taker: -$4.4); 12 of the 28 were the LoL night;
+#   * a side out for the day after each: 20 sides, 18 later fills prevented
+#     (-$151, LoL -$146) for ~$9 of reward: net +$142 over 17 days;
+#   * the event-wide guard adds ~$46 on the LoL pentakill strikes.
+# Rejected the same day: a 2nd sweep within 30 min -> side out for the day
+# (net -$172: it stopped real repricing), and a 1/4-size taper on jumps (a
+# smaller guard, ~+$25/day against the guard's +$34/day).
+# The tape is read once per candidate -- a whole-rung fill on a flagged side,
+# ~11/day in the replay -- BAIT_TAPE_DELAY_SECS after the fill, retried for
+# BAIT_TAPE_MAX_TRIES cycles while our print is not on it yet. The mention
+# books (BAIT_STOP_SKIP) keep their own live gates and toxic-halt exemption.
+# IMM_BAIT_STOP: "on" (default), "dry" (logged, nothing stopped), "off".
+BAIT_STOP_MODE = os.environ.get("IMM_BAIT_STOP", "on").strip().lower()
+BAIT_STOP_SKIP: Tuple[str, ...] = tuple(
+    p.strip() for p in os.environ.get("IMM_BAIT_STOP_SKIP", "MENTION").split(",")
+    if p.strip())
+BAIT_TAPE_DELAY_SECS = _env_float("IMM_BAIT_TAPE_DELAY_SECS", 5.0)
+BAIT_TAPE_MAX_TRIES = _env_int("IMM_BAIT_TAPE_MAX_TRIES", 6)
+
+
+def bait_series(series: str) -> bool:
+    """Is this series watched by the bait-fingerprint stop? Every series but
+    the BAIT_STOP_SKIP name parts (the mention books), fair-gated ones
+    included (the replay's fingerprints had KXTOKENUSE and CPI fills)."""
+    return BAIT_STOP_MODE in ("on", "dry") and \
+        not any(p in series for p in BAIT_STOP_SKIP)
+
+
+def _trade_count(tr: dict) -> float:
+    raw = tr.get("count_fp")
+    return float(raw if raw not in (None, "") else (tr.get("count") or 0.0))
+
+
+def bait_fingerprint(trades: List[dict], trade_id: str,
+                     count: float) -> Optional[bool]:
+    """The fingerprint on Kalshi's public tape around one of our fills: True
+    when the taker order behind our print `trade_id` was exactly our `count`
+    (the prints with our print's created_time and taker_side sum to it),
+    False when that order was bigger, None when our print is not on the
+    tape (yet)."""
+    ours = next((x for x in trades if str(x.get("trade_id") or "") == trade_id), None)
+    if ours is None:
+        return None
+    ct, side = ours.get("created_time"), ours.get("taker_side")
+    total = sum(_trade_count(x) for x in trades
+                if x.get("created_time") == ct and x.get("taker_side") == side)
+    return abs(total - float(count)) < 0.5
+
+
+def et_day_end_ts(ts: float) -> float:
+    """The epoch of the first ET midnight after `ts`."""
+    d = datetime.fromtimestamp(ts, timezone.utc).astimezone(ET).date()
+    return ET.localize(datetime(d.year, d.month, d.day) + timedelta(days=1)).timestamp()
 
 
 def lone_reference(ext_levels_best_first: List[Tuple[int, float]], target: float,
@@ -17725,6 +17799,11 @@ class BotState:
     # inside the event window; halted events -> until.
     toxic_event_picks: Dict[str, List[list]] = field(default_factory=dict)
     toxic_event_halt_until: Dict[str, float] = field(default_factory=dict)
+    # Bait-fingerprint stop (BAIT_STOP_MODE, 2026-10-22): stopped sides
+    # "ticker|book_side" -> until (ET midnight), and the events whose
+    # lone-ref guard runs ON -> until. Persisted.
+    bait_side_until: Dict[str, float] = field(default_factory=dict)
+    bait_event_until: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
     order_ages: Dict[str, float] = field(default_factory=dict)
@@ -18018,6 +18097,13 @@ class IncentiveMarketMaker:
         self._lone_ref_rungs: Dict[Tuple[str, str],
                                    Deque[Tuple[float, Optional[int]]]] = {}
         self._lone_ref_held: Set[Tuple[str, str]] = set()
+        # bait-fingerprint stop: fills awaiting their tape check, the trade
+        # ids already queued, and the counters for the status file
+        self._bait_pending: List[dict] = []
+        self._bait_seen: Dict[str, float] = {}
+        self._bait = {"candidates": 0, "tape_reads": 0, "tape_fails": 0,
+                      "not_on_tape": 0, "bigger_taker": 0, "fingerprints": 0,
+                      "stops": 0, "last": None}
         self._heartbeat = time.time()      # hang-watchdog liveness marker
         # full cycles this PROCESS completed: the watchdog hands the book over
         # only after the first one (WATCHDOG_HANDOFF)
@@ -18515,10 +18601,11 @@ class IncentiveMarketMaker:
                 # (YT2_FILL_PAUSE_MIN; the WS fill usually got here first)
                 self._yt2_fill_pause_note(tkr, float(self._fill_ts(f) or now_ts),
                                           "fill")
-            self._log_fill(f, tkr, side, action, count, px_cents,
-                           now_ts, pos_before, avg_before)
+            join = self._log_fill(f, tkr, side, action, count, px_cents,
+                                  now_ts, pos_before, avg_before)
             if toxic:
                 self._toxic_note_fill(f, tkr, side, action, px_cents)
+                self._bait_note_fill(f, tkr, join, count, now_ts)
 
     def _log_fill(self, f: dict, tkr: str, side: str, action: str,
                   count: float, px_cents: float, now_ts: float,
@@ -18627,10 +18714,13 @@ class IncentiveMarketMaker:
                 # same version: count >= this means the fill took the rung
                 "our_left_before": left,
             })
+            # the join, for the bait-fingerprint stop's whole-rung test
+            return book_side, our_px, rem, left
         except Exception as e:
             if "fills" not in self._sink_muted:
                 self._sink_muted.add("fills")
                 log(f"{self.tag} ! fill sink failed ({e}); muted for this run")
+        return None
 
     # ---- fills-sink ledger join (FILL_JOIN_*, 2026-10-04) --------------------
 
@@ -19283,6 +19373,13 @@ class IncentiveMarketMaker:
             self.state.toxic_event_halt_until = {
                 str(e): float(v)
                 for e, v in (data.get("toxic_event_halt_until") or {}).items()}
+            # bait-fingerprint stops: a restart keeps the day's stops
+            self.state.bait_side_until = {
+                str(k): float(v)
+                for k, v in (data.get("bait_side_until") or {}).items()}
+            self.state.bait_event_until = {
+                str(e): float(v)
+                for e, v in (data.get("bait_event_until") or {}).items()}
             # the ladder asks' cash switch (SPORTS_LADDER_ASKS_ON_CASH / _OFF_CASH)
             self.state.ladder_asks_on_at = float(data.get("ladder_asks_on_at") or 0.0)
             # Halt continuity (same roll-day only): a restart must NOT hand
@@ -19610,6 +19707,14 @@ class IncentiveMarketMaker:
                            "toxic_event_halt_until": {
                                e: round(v, 1)
                                for e, v in self.state.toxic_event_halt_until.items()
+                               if v > time.time()},
+                           "bait_side_until": {
+                               k: round(v, 1)
+                               for k, v in self.state.bait_side_until.items()
+                               if v > time.time()},
+                           "bait_event_until": {
+                               e: round(v, 1)
+                               for e, v in self.state.bait_event_until.items()
                                if v > time.time()}}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
@@ -23716,15 +23821,22 @@ class IncentiveMarketMaker:
 
     def _lone_ref_check(self, t: str, meta, yes_levels, no_levels, own_in_book,
                         own, ref_bid_px: Optional[int], ref_ask_px: Optional[int],
-                        now_ts: float) -> Tuple[bool, bool]:
+                        now_ts: float, quiet: bool = False,
+                        on: Optional[bool] = None) -> Tuple[bool, bool]:
         """(bid, ask): True for a side the lone-reference guard trips this
         cycle (LONE_REF_GUARD_MODE). The book is netted of `own_in_book`.
         The jump test reads `own`, our resting orders (live or simulated):
         each side's top price is kept as change points over the window
-        (None = no rung). Logs each hold and clear once."""
+        (None = no rung). Logs each hold and clear once, unless `quiet` (a
+        market only the bait-fingerprint stop watches); `on` = the caller
+        stands the tripped side aside (default: LONE_REF_GUARD_MODE "on";
+        True too in an event a bait stop guards)."""
         ext_yes, ext_no = external_levels(yes_levels, no_levels, own_in_book)
         win_start = now_ts - LONE_REF_JUMP_WINDOW_MIN * 60.0
-        tag = "" if LONE_REF_GUARD_MODE == "on" else " (dry)"
+        if on is None:
+            on = LONE_REF_GUARD_MODE == "on"
+        tag = ("" if LONE_REF_GUARD_MODE == "on" else " (bait-stop event)") if on \
+            else " (dry)"
         out: List[bool] = []
         for side, ref_yes, ext in (("bid", ref_bid_px, ext_yes),
                                    ("ask", ref_ask_px, ext_no)):
@@ -23760,17 +23872,135 @@ class IncentiveMarketMaker:
                            f"{LONE_REF_JUMP_WINDOW_MIN}m")
                 else:
                     how = ""
-                log(f"{self.tag} lone-ref guard{tag} {t} {side}: the reference "
-                    f"{yes(trip['ref'])}c rests on {trip['top']:.0f} external "
-                    f"contracts (< {LONE_REF_MAX_MULT:g} x "
-                    f"{meta.target_size / 5.0:.0f}), the rest of the book's is "
-                    f"{yes(trip['rest'])}c{how} -- "
-                    + ("side stood aside" if not tag else "would stand aside"))
+                if not quiet:
+                    log(f"{self.tag} lone-ref guard{tag} {t} {side}: the reference "
+                        f"{yes(trip['ref'])}c rests on {trip['top']:.0f} external "
+                        f"contracts (< {LONE_REF_MAX_MULT:g} x "
+                        f"{meta.target_size / 5.0:.0f}), the rest of the book's is "
+                        f"{yes(trip['rest'])}c{how} -- "
+                        + ("side stood aside" if on else "would stand aside"))
             elif not trip and key in self._lone_ref_held:
                 self._lone_ref_held.discard(key)
-                log(f"{self.tag} lone-ref guard{tag} {t} {side}: clear")
+                if not quiet:
+                    log(f"{self.tag} lone-ref guard{tag} {t} {side}: clear")
             out.append(bool(trip))
         return out[0], out[1]
+
+    # ---- bait-fingerprint stop (2026-10-22, BAIT_STOP_MODE) -----------------
+
+    def bait_side_stopped(self, ticker: str, book_side: str, now_ts: float) -> bool:
+        """True while a bait stop holds `book_side` of `ticker` out."""
+        return BAIT_STOP_MODE == "on" and self.state.bait_side_until.get(
+            self._toxic_key(ticker, book_side), 0.0) > now_ts
+
+    def bait_event_guarded(self, event: str, now_ts: float) -> bool:
+        """True while a bait stop runs the lone-ref guard ON in `event`."""
+        return BAIT_STOP_MODE == "on" and \
+            self.state.bait_event_until.get(event, 0.0) > now_ts
+
+    def _bait_note_fill(self, f: dict, tkr: str, join, count: float,
+                        now_ts: float) -> None:
+        """Queue one of our fills for the bait-fingerprint tape check when it
+        took the whole rung (the fills row's our_left_before, else
+        our_remaining_before) on a side the lone-reference test flags right
+        now. `join` = _log_fill's (book_side, our_px, remaining, left).
+        Never raises."""
+        try:
+            if not join or f.get("is_taker") or not bait_series(series_of(tkr)):
+                return
+            book_side, our_px, rem, left = join
+            whole = left if left is not None else rem
+            if book_side not in ("bid", "ask") or our_px is None or whole is None \
+                    or float(whole) <= 0 or count + 1e-6 < float(whole):
+                return
+            if (tkr, book_side) not in self._lone_ref_held or \
+                    self._is_pad_price(book_side, our_px):
+                return
+            tid = str(f.get("trade_id") or f.get("fill_id") or "")
+            if not tid or tid in self._bait_seen:
+                return
+            self._bait_seen[tid] = now_ts
+            if len(self._bait_seen) > 2000:
+                for k in [k for k, v in self._bait_seen.items() if v < now_ts - 86400]:
+                    del self._bait_seen[k]
+            fts = self._fill_ts(f)
+            self._bait["candidates"] += 1
+            self._bait_pending.append(dict(
+                ticker=tkr, side=book_side, px=float(our_px), n=float(count),
+                trade_id=tid, fill_ts=float(fts) if fts else now_ts, tries=0))
+        except Exception as e:
+            log(f"{self.tag} ! bait note failed: {e}")
+
+    def _bait_check_pending(self, now_ts: float) -> None:
+        """Read Kalshi's public tape for each queued fill BAIT_TAPE_DELAY_SECS
+        after it and stop the side of every fingerprint (_bait_stop). A fill
+        whose print is not on the tape yet, or whose read failed, is retried
+        next cycle, BAIT_TAPE_MAX_TRIES times in all. Never raises."""
+        if not self._bait_pending or self.client is None:
+            return
+        keep: List[dict] = []
+        for c in self._bait_pending:
+            if now_ts - c["fill_ts"] < BAIT_TAPE_DELAY_SECS:
+                keep.append(c)
+                continue
+            fp: Optional[bool] = None
+            try:
+                self._bait["tape_reads"] += 1
+                fp = bait_fingerprint(self._bait_read_tape(c["ticker"], int(c["fill_ts"])),
+                                      c["trade_id"], c["n"])
+                if fp is None:
+                    self._bait["not_on_tape"] += 1
+            except Exception as e:
+                self._bait["tape_fails"] += 1
+                if self._bait["tape_fails"] <= 3:
+                    log(f"{self.tag} ! bait tape read failed for {c['ticker']}: {e}")
+            if fp is None:
+                c["tries"] += 1
+                if c["tries"] < BAIT_TAPE_MAX_TRIES:
+                    keep.append(c)
+                continue
+            if not fp:
+                self._bait["bigger_taker"] += 1
+                continue
+            self._bait["fingerprints"] += 1
+            self._bait_stop(c, now_ts)
+        self._bait_pending = keep
+
+    def _bait_read_tape(self, ticker: str, ts: int) -> List[dict]:
+        """Kalshi's public prints on `ticker` 3s either side of `ts`, one
+        signed read. Not the client's get_trades: that sends `ticker` twice,
+        which Kalshi rejects ("multiple values for single value parameter")."""
+        js = self.client.get("/markets/trades", params={
+            "ticker": ticker, "min_ts": ts - 3, "max_ts": ts + 3, "limit": 200})
+        return (js or {}).get("trades") or []
+
+    def _bait_stop(self, c: dict, now_ts: float) -> None:
+        """A fingerprint: the side out until ET midnight and the event's
+        lone-ref guard ON until then ("on"), or only logged ("dry"). Sinks
+        one bait_stops row either way."""
+        t, side = c["ticker"], c["side"]
+        ev = self._event_of(t)
+        until = et_day_end_ts(now_ts)
+        live = BAIT_STOP_MODE == "on"
+        if live:
+            self.state.bait_side_until[self._toxic_key(t, side)] = until
+            self.state.bait_event_until[ev] = max(
+                until, self.state.bait_event_until.get(ev, 0.0))
+            self._bait["stops"] += 1
+        self._bait["last"] = dict(ts=round(now_ts, 1), ticker=t, side=side,
+                                  px=c["px"], n=c["n"])
+        self._sink("bait_stops", {
+            "ts": round(now_ts, 3), "mode": BAIT_STOP_MODE, "ticker": t,
+            "event": ev, "side": side, "px": c["px"], "count": c["n"],
+            "trade_id": c["trade_id"], "fill_ts": c["fill_ts"], "until": until})
+        log(f"{self.tag} bait stop{'' if live else ' (dry)'}: {t} {side.upper()} "
+            f"@ {c['px']:g}c -- a taker of exactly our {c['n']:g} took the whole "
+            f"rung on a lone top our rung had jumped to; "
+            + (f"that side out until 00:00 ET, and the lone-ref guard ON for "
+               f"{ev} until then" if live else
+               "would stand that side aside until 00:00 ET (dry)"))
+        if live:
+            self._save_persist()
 
     # ---- join ahead of the pile (2026-10-11, JOIN_AHEAD_MODE) --------------
 
@@ -26925,13 +27155,22 @@ class IncentiveMarketMaker:
                 yes_levels, no_levels, meta.target_size)
             # LONE-REFERENCE GUARD (LONE_REF_GUARD_MODE): a side whose
             # reference rests on a thin external top our rung would jump to
-            # stands aside ("on": no rungs this cycle) or is logged ("dry")
-            if (LONE_REF_GUARD_MODE in ("on", "dry") and LADDER_MODE == "atref"
-                    and lone_ref_series(meta.series)):
+            # stands aside ("on": no rungs this cycle) or is logged ("dry").
+            # The bait-fingerprint stop (BAIT_STOP_MODE) reads the same test
+            # on its own series (quietly where the guard does not look), and
+            # an event it stopped a side in runs the guard ON until ET
+            # midnight.
+            lr_guard = (LONE_REF_GUARD_MODE in ("on", "dry")
+                        and lone_ref_series(meta.series))
+            lr_bait = bait_series(meta.series)
+            if LADDER_MODE == "atref" and (lr_guard or lr_bait):
+                lr_on = (lr_guard and LONE_REF_GUARD_MODE == "on") or (
+                    lr_bait and self.bait_event_guarded(meta.event_ticker, now_ts))
                 lr_bid, lr_ask = self._lone_ref_check(
                     t, meta, yes_levels, no_levels, own_in_book, own,
-                    ref_bid_px, ref_ask_px, now_ts)
-                if LONE_REF_GUARD_MODE == "on":
+                    ref_bid_px, ref_ask_px, now_ts,
+                    quiet=not (lr_guard or lr_on), on=lr_on)
+                if lr_on:
                     if lr_bid:
                         lv_bid = []
                     if lr_ask:
@@ -27614,6 +27853,18 @@ class IncentiveMarketMaker:
                        and not self.toxic_event_halted(self._event_of(q.ticker),
                                                        now_ts)]
 
+        # BAIT-FINGERPRINT STOP (2026-10-22, see BAIT_STOP_MODE): read the
+        # tape for the whole-rung fills queued since the last cycle, then
+        # drop each stopped side's quotes -- rungs and pads -- so the diff
+        # cancels whatever of ours rests there until ET midnight (the event's
+        # lone-ref guard turns ON from the next cycle)
+        if BAIT_STOP_MODE in ("on", "dry"):
+            if not fast_only:
+                self._bait_check_pending(now_ts)
+            if self.state.bait_side_until:
+                desired = [q for q in desired
+                           if not self.bait_side_stopped(q.ticker, q.book_side, now_ts)]
+
         # EVENT SWEEP BREAKER (on, 2026-10-04, see SWEEP_BREAKER): an event a
         # sweep tripped quotes nothing until its hold ends, so the diff
         # cancels whatever of ours still rests there
@@ -28197,6 +28448,13 @@ class IncentiveMarketMaker:
                 out["ws"]["feed"] = self._ws.status()
             # the event sweep breaker (2026-10-04, SWEEP_BREAKER)
             now = time.time()
+            # the bait-fingerprint stop (2026-10-22, BAIT_STOP_MODE)
+            out["bait_stop"] = dict(
+                self._bait, mode=BAIT_STOP_MODE, pending=len(self._bait_pending),
+                sides_stopped=sum(1 for u in self.state.bait_side_until.values()
+                                  if u > now),
+                events_guarded=sum(1 for u in self.state.bait_event_until.values()
+                                   if u > now))
             out["sweep"] = dict(self._sweep, mode=SWEEP_BREAKER,
                                 hold_s=SWEEP_HOLD_SECS, holdout=SWEEP_HOLDOUT,
                                 hold_by_series=dict(SWEEP_HOLD_BY_SERIES),
@@ -30011,6 +30269,17 @@ class IncentiveMarketMaker:
                   if LONE_REF_SKIP_FAIR else "")
                if _lr_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _lr_live else ""))
+        _bs_live = BAIT_STOP_MODE in ("on", "dry")
+        log(f"bait-fingerprint stop (2026-10-22): {BAIT_STOP_MODE}"
+            + (" -- a fill that takes our whole rung on a side the lone-reference "
+               "test flags, from a taker of exactly our size on the public tape "
+               f"(read {BAIT_TAPE_DELAY_SECS:g}s after the fill), "
+               + ("stops that side until 00:00 ET and runs the lone-ref guard ON "
+                  "in its event until then" if BAIT_STOP_MODE == "on"
+                  else "is logged, nothing stopped")
+               + f"; not checked: {','.join(BAIT_STOP_SKIP) or 'nothing'}"
+               if _bs_live and LADDER_MODE == "atref"
+               else " (inactive: needs IMM_LADDER_MODE=atref)" if _bs_live else ""))
         log("mid-move breaker: "
             + ("EVERY series (IMM_BREAKERS=1)" if BREAKERS_ENABLED else
                (",".join(sorted(MOVE_BREAKER_SERIES)) + " only (2026-10-09)")

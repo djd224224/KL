@@ -228,7 +228,7 @@ class TestVerdict(unittest.TestCase):
 
     def test_levels(self):
         self.assertEqual(lm.verdict(self.day(), self.RUN)[0], "OK")
-        self.assertEqual(lm.verdict(self.day(mode="dry"), self.RUN)[0], "PROBLEM")
+        self.assertEqual(lm.verdict(self.day(mode="off"), self.RUN)[0], "PROBLEM")
         self.assertEqual(lm.verdict(self.day(let_thru_guarded=-30.0), self.RUN)[0], "WATCH")
         self.assertEqual(lm.verdict(self.day(let_thru_guarded=-120.0), self.RUN)[0], "PROBLEM")
         self.assertEqual(lm.verdict(self.day(cost=40.0), self.RUN)[0], "WATCH")
@@ -239,6 +239,53 @@ class TestVerdict(unittest.TestCase):
             self.assertEqual(lm.verdict(self.day(), dict(days=4.0, net=-60.0))[0], "PROBLEM")
         # a half day halves the cost bars
         self.assertEqual(lm.verdict(self.day(hours=12.0, cost=20.0), self.RUN)[0], "WATCH")
+
+    def test_dry_is_a_shadow_that_watches_for_on_paying(self):
+        """Jack 2026-10-22: "Build it and put guard on dry mode": nothing is
+        held, so neither the cost nor the let-through fills are a problem;
+        it WATCHes once "on" would have paid +$10/day over 3 dry days."""
+        dry = self.day(mode="dry", let_thru_guarded=-150.0, cost=80.0, net=-60.0)
+        self.assertEqual(lm.verdict(dry, self.RUN), ("OK", []))
+        run = dict(days=6.0, net=-100.0, dry_days=3.0, dry_net=45.0)
+        lvl, why = lm.verdict(dry, run)
+        self.assertEqual(lvl, "WATCH")
+        self.assertIn("'on' would have netted +$45 over 3.0 dry days (+$15/day)", why[0])
+        self.assertEqual(lm.verdict(dry, dict(run, dry_net=20.0))[0], "OK")      # under the bar
+        self.assertEqual(lm.verdict(dry, dict(run, dry_days=2.0))[0], "OK")      # too soon
+
+    def test_dry_subject_text_and_the_bait_stops(self):
+        rows = [{"ts": _ts(3, 13), "mode": "on", "ticker": "KXLOLTEEMO-WORLDS26-Y",
+                 "event": "KXLOLTEEMO-WORLDS26", "side": "bid", "px": 66.0, "count": 60.0}]
+        sink = os.path.join(imm.STATUS_DIR, "bait_stops_2026-10-16.jsonl")
+        with open(sink, "w", encoding="utf-8") as f:
+            for r in rows + [dict(rows[0], ts=_ts(3, 13) - 86400 * 3)]:   # one outside
+                f.write(json.dumps(r) + "\n")
+        self.addCleanup(os.remove, sink)
+        got = lm.bait_stops(_ts(0, 0), _ts(23, 59))
+        self.assertEqual([r["ticker"] for r in got], ["KXLOLTEEMO-WORLDS26-Y"])
+        ctx = dict(level="OK", reasons=[], bait=got,
+                   run=dict(days=6.5, net=-128.0, dry_days=1.0, dry_net=12.0),
+                   d=dict(day="2026-10-16", net=12.4, would_be=-20.0, cost=7.6, mode="dry",
+                          a_ts=_ts(0, 0), b_ts=_ts(23, 59), holds=40, sides=9, markets=8,
+                          at_once=2.0, at_once_max=5, median_s=30.0,
+                          cls={"at the touch": 20, "inside the book": 20, "no snapshot": 0},
+                          max_flaps=8, max_flaps_side="KXA-1 bid",
+                          would_be_trades=3, tape_done=True, let_thru_guarded_n=0,
+                          would_be_by_cls={}, gates={"none": [40, 7.6, -20.0]},
+                          let_thru_guarded=0.0, let_thru_skipped_n=0, let_thru_skipped=0.0))
+        self.assertEqual(lm.subject_for(ctx), "IMM lone-ref guard 10/16 (dry): 'on' would "
+                                              "have netted +$12 | 1 bait stop | OK")
+        text = lm.render_text(ctx)
+        self.assertTrue(text.startswith("OK: the guard is DRY since 10/22 -- nothing was held. "
+                                        "'On' would have netted +$12"))
+        self.assertIn("Dry so far: 'on' would have netted +$12 over 1.0 days", text)
+        self.assertIn("Bait stops (fingerprint): 1 today", text)
+        self.assertIn("KXLOLTEEMO-WORLDS26-Y BID 60 @ 66c -- side out until 00:00 ET, guard ON "
+                      "in KXLOLTEEMO-WORLDS26", text)
+        ctx["bait"] = []
+        self.assertIn("Bait stops (fingerprint): none today.", lm.render_text(ctx))
+        self.assertEqual(lm.subject_for(ctx), "IMM lone-ref guard 10/16 (dry): 'on' would "
+                                              "have netted +$12 | OK")
 
     def test_with_fair_gated_markets_out_it_judges_the_markets_it_guards(self):
         """Jack 2026-10-18: "Build it" (fair-gated markets out of the guard):
