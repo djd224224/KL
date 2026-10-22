@@ -1466,6 +1466,9 @@ IMM_DASH_HTML = os.path.join(KL_DIR, "run-logs", "incentive-mm", "dashboard",
                              "imm_dashboard.html")
 ADVICE_ENABLED = os.environ.get("PF_ADVICE", "1") != "0"
 ADVICE_DAYS = 7
+# the longer view every line also carries (Jack 2026-10-22: "Also include L30D
+# for context") -- the dashboard keeps ~30 full days; fewer read as "N days"
+ADVICE_LONG_DAYS = 30
 ADVICE_DRIVERS = 3             # families under "What moved it"
 ADVICE_DRIVER_MIN = 25.0       # ... each at least this big yesterday
 ADVICE_PAUSE_7D = -100.0       # a live series' 7-day quoting at/below -> PAUSE
@@ -1606,8 +1609,9 @@ def imm_advice(D: dict, today_str: str) -> dict:
         raise ValueError(f"only {len(days)} full day(s) on the dashboard")
     win = days[-ADVICE_DAYS:]
     prev = days[-2 * ADVICE_DAYS:-ADVICE_DAYS]
+    long_ = days[-ADVICE_LONG_DAYS:]
     y = days[-1]
-    n = len(win)
+    n, nl = len(win), len(long_)
     daily = {}                                              # day -> [rewards, trading]
     fam_day = defaultdict(lambda: defaultdict(_zero))       # family -> day -> parts
     ser_day = defaultdict(lambda: defaultdict(_zero))       # series -> day -> parts
@@ -1643,8 +1647,14 @@ def imm_advice(D: dict, today_str: str) -> dict:
                 out = _add(out, src[d])
         return out
 
-    fams = {fam: {"y": span(dd, [y]), "w": span(dd, win), "p": span(dd, prev)}
+    fams = {fam: {"y": span(dd, [y]), "w": span(dd, win), "p": span(dd, prev),
+                  "l": span(dd, long_)}
             for fam, dd in fam_day.items()}
+
+    def wl(fam):
+        """"7 days +$X, 30 days +$Y" for a family."""
+        return (f"{n} days {_usd0(_net(fams[fam]['w']))}, "
+                f"{nl} days {_usd0(_net(fams[fam]['l']))}")
     ydate = datetime.strptime(y, "%Y-%m-%d")
 
     def why_y(fam):
@@ -1675,7 +1685,10 @@ def imm_advice(D: dict, today_str: str) -> dict:
     head += f" Last {n} days {_usd0(w_tot)} ({_usd0(w_tot / n)}/day)"
     if len(prev) == ADVICE_DAYS:
         head += f", vs {_usd0(sum(sum(daily[d]) for d in prev))} the {len(prev)} before"
-    head += "."
+    l_rew = sum(daily[d][0] for d in long_)
+    l_trd = sum(daily[d][1] for d in long_)
+    head += (f"; last {nl} days {_usd0(l_rew + l_trd)} ({_usd0((l_rew + l_trd) / nl)}/day: "
+             f"rewards {_usd0(l_rew)}, trading {_usd0(l_trd)}).")
 
     # 2. what moved yesterday: the biggest families either way, with the week
     drivers = []
@@ -1683,8 +1696,7 @@ def imm_advice(D: dict, today_str: str) -> dict:
         v = fams[fam]
         if abs(_net(v["y"])) < ADVICE_DRIVER_MIN:
             continue
-        drivers.append(f"{fam} {_usd0(_net(v['y']))} ({n} days {_usd0(_net(v['w']))}): "
-                       f"{why_y(fam)}.")
+        drivers.append(f"{fam} {_usd0(_net(v['y']))} ({wl(fam)}): {why_y(fam)}.")
 
     # 3. recommendations
     live_ser = {m.get("ser") or t.split("-", 1)[0] for t, m in mk.items() if m.get("sel")}
@@ -1698,14 +1710,15 @@ def imm_advice(D: dict, today_str: str) -> dict:
         q7, qy = w["rew"] + w["own"], yy["rew"] + yy["own"]
         losing = sum(1 for d in win if d in dd and dd[d]["rew"] + dd[d]["own"] < -0.5)
         if q7 <= ADVICE_SHRINK_7D and qy < -0.5 and losing >= ADVICE_LOSING_DAYS:
-            cands.append((q7, ser, w, qy, losing))
-    for q7, ser, w, qy, losing in sorted(cands, key=lambda c: c[0])[:ADVICE_MAX_PAUSE]:
+            ql = span(dd, long_)
+            cands.append((q7, ser, w, qy, losing, ql["rew"] + ql["own"]))
+    for q7, ser, w, qy, losing, ql in sorted(cands, key=lambda c: c[0])[:ADVICE_MAX_PAUSE]:
         verb = "PAUSE" if q7 <= ADVICE_PAUSE_7D else "SHRINK"
         cause = _fill_cause(w)
         recs.append((verb, f"{ser} ({ser_fam.get(ser, 'Other')}). Why: its quoting lost "
-                           f"{_usd0(q7)} over the {n} days -- fills {_usd0(w['own'])} "
-                           f"against rewards {_usd0(w['rew'])} -- losing on {losing} of "
-                           f"them and again yesterday ({_usd0(qy)})"
+                           f"{_usd0(q7)} over the {n} days ({_usd0(ql)} over {nl}) -- fills "
+                           f"{_usd0(w['own'])} against rewards {_usd0(w['rew'])} -- losing "
+                           f"on {losing} of them and again yesterday ({_usd0(qy)})"
                            + (f"; {cause}" if cause else "") + "."))
         paused.add(ser_fam.get(ser))
     # held positions that cost the week, in families whose quoting pays
@@ -1731,11 +1744,12 @@ def imm_advice(D: dict, today_str: str) -> dict:
     holds = [(t, m) for t, m in opens if t not in trimmed]
     if held_fams:
         held_tot = sum(fams[f]["w"]["cr"] + fams[f]["w"]["cs"] for f in held_fams)
+        held_l = sum(fams[f]["l"]["cr"] + fams[f]["l"]["cs"] for f in held_fams)
         left = sum(abs(_f(m.get("wc"))) for _, m in holds)
         txt = (f"the open losers. Why: held positions cost {_usd0(held_tot)} over {n} days ("
                + ", ".join(f"{f} {_usd0(fams[f]['w']['cr'] + fams[f]['w']['cs'])}"
                            for f in held_fams)
-               + ") while those families' quoting paid.")
+               + f"; {_usd0(held_l)} over {nl}) while those families' quoting paid.")
         if holds:
             txt += (f" The {len(holds)} still open {'is' if len(holds) == 1 else 'are'} down "
                     f"{_usd0(sum(_f(m.get('u')) for _, m in holds))} with at most "
@@ -1749,7 +1763,8 @@ def imm_advice(D: dict, today_str: str) -> dict:
         if (_net(v["y"]) <= ADVICE_BAD_DAY and _net(v["w"]) > 0
                 and fam not in held_fams and fam not in paused):
             recs.append(("NO CHANGE", f"{fam}. Why: one bad day ({_usd0(_net(v['y']))}: "
-                                      f"{why_y(fam)}) inside a {_usd0(_net(v['w']))} week."))
+                                      f"{why_y(fam)}) inside a {_usd0(_net(v['w']))} week "
+                                      f"({nl} days {_usd0(_net(v['l']))})."))
     for fam in sorted(fams, key=lambda f: _net(fams[f]["w"])):
         v = fams[fam]
         if _net(v["w"]) > ADVICE_REVIEW_NET or fam in held_fams or fam in paused:
@@ -1766,6 +1781,7 @@ def imm_advice(D: dict, today_str: str) -> dict:
             txt += "; the biggest: " + ", ".join(
                 f"{ser} {_usd0(q)}" + ("" if ser in live_ser else " (over)")
                 for q, ser in worst)
+        txt += f"; {nl} days {_usd0(_net(v['l']))}"
         if _net(v["y"]) > 0.5:
             txt += f"; yesterday {_usd0(_net(v['y']))}"
         recs.append(("NO CHANGE", txt + "."))
@@ -1781,7 +1797,9 @@ def imm_advice(D: dict, today_str: str) -> dict:
                   key=lambda f: -_net(fams[f]["w"]))[:3]
     if keep:
         recs.append(("KEEP", ", ".join(f"{f} {_usd0(_net(fams[f]['w']))}" for f in keep)
-                     + f" over {n} days. Why: their rewards cover their fills."))
+                     + f" over {n} days ({nl} days "
+                     + ", ".join(_usd0(_net(fams[f]["l"])) for f in keep)
+                     + "). Why: their rewards cover their fills."))
 
     # 4. context: yesterday's rewards against the week, the week against the one before
     context = []
@@ -1805,9 +1823,9 @@ def imm_advice(D: dict, today_str: str) -> dict:
             line += "; the biggest drops: " + ", ".join(f"{f} {_usd0(dv)}" for dv, f in drops)
         context.append(line + ".")
     basis = (f"the IMM bot's book on its dashboard: yesterday against the {n} full ET days "
-             f"{win[0][5:].replace('-', '/')}-{win[-1][5:].replace('-', '/')}; rewards as "
-             f"modelled; own fills = the day's fills at the day's end, held = positions "
-             f"from earlier days")
+             f"{win[0][5:].replace('-', '/')}-{win[-1][5:].replace('-', '/')} and the {nl} "
+             f"from {long_[0][5:].replace('-', '/')}; rewards as modelled; own fills = the "
+             f"day's fills at the day's end, held = positions from earlier days")
     gen = _f(D.get("generated"))
     midnight = ET.localize(datetime.strptime(today_str, "%Y-%m-%d")).timestamp()
     if gen and gen < midnight:

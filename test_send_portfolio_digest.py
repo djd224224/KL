@@ -1131,17 +1131,21 @@ class AdviceTests(unittest.TestCase):
         adv = pf.imm_advice(_dash(), "2026-10-19")
         self.assertEqual(adv["title"], "What to do -- Sun 10/18")
         # 10/18: rewards 2+5+5+30+50+40, trading -10-30+0-50-10-200
+        # the long view (Jack 2026-10-22: "Also include L30D for context") is
+        # every full day up to 30 -- 14 on this fixture
         self.assertEqual(adv["headline"],
                          "Yesterday -$168: rewards +$132, trading -$300. Below normal: the "
                          "worst of the last 14 days (median +$191). Last 7 days -$126 "
-                         "(-$18/day), vs +$2,450 the 7 before.")
+                         "(-$18/day), vs +$2,450 the 7 before; last 14 days +$2,324 "
+                         "(+$166/day: rewards +$3,374, trading -$1,050).")
         self.assertEqual(adv["drivers"], [
-            "AI & tech -$160 (7 days +$80): fills -$200 against rewards +$40 -- the fills "
-            "ended on the wrong side of the settlement (KXAI-1 -$160).",
-            "TRUMP mentions +$40 (7 days +$280): rewards +$50 against fills -$10 "
-            "(KXTM-1 +$40).",
-            "Sports & awards -$25 (7 days -$175): fills -$30 against rewards +$5 -- the "
-            "price trended through the fills over the next hours (KXBIG-1 -$25)."])
+            "AI & tech -$160 (7 days +$80, 14 days +$430): fills -$200 against rewards "
+            "+$40 -- the fills ended on the wrong side of the settlement (KXAI-1 -$160).",
+            "TRUMP mentions +$40 (7 days +$280, 14 days +$630): rewards +$50 against "
+            "fills -$10 (KXTM-1 +$40).",
+            "Sports & awards -$25 (7 days -$175, 14 days +$175): fills -$30 against "
+            "rewards +$5 -- the price trended through the fills over the next hours "
+            "(KXBIG-1 -$25)."])
 
     def test_recommendations_each_with_their_why(self):
         recs = pf.imm_advice(_dash(), "2026-10-19")["recs"]
@@ -1150,33 +1154,35 @@ class AdviceTests(unittest.TestCase):
         txt = dict(enumerate(t for _, t in recs))
         # persistent quoting losses on live series, worst first, with how they lost
         self.assertEqual(txt[0], "KXBIG (Sports & awards). Why: its quoting lost -$175 over "
-                                 "the 7 days -- fills -$210 against rewards +$35 -- losing "
-                                 "on 7 of them and again yesterday (-$25); the price trended "
-                                 "through the fills over the next hours.")
-        self.assertIn("KXGAS (Gas & diesel). Why: its quoting lost -$56", txt[1])
+                                 "the 7 days (+$175 over 14) -- fills -$210 against rewards "
+                                 "+$35 -- losing on 7 of them and again yesterday (-$25); the "
+                                 "price trended through the fills over the next hours.")
+        self.assertIn("KXGAS (Gas & diesel). Why: its quoting lost -$56 over the 7 days "
+                      "(+$294 over 14)", txt[1])
         self.assertIn("most of it within 5 minutes of the fills (picked off", txt[1])
         # inventory: a lot still at risk -> trim; the rest -> hold, why
         self.assertIn("KXCA-Y-1 if you no longer believe it. Why: $80 is still at risk on a "
                       "position already -$60 (200 YES bought at 70c, now 40c: -$60, $80 left "
                       "to lose), in Carbon Arc consumer, whose held positions cost -$315",
                       txt[2])
-        self.assertIn("held positions cost -$315 over 7 days (Carbon Arc consumer -$315) "
-                      "while those families' quoting paid. The 1 still open is down -$60 "
-                      "with at most $5 more to lose", txt[3])
+        self.assertIn("held positions cost -$315 over 7 days (Carbon Arc consumer -$315; "
+                      "-$315 over 14) while those families' quoting paid. The 1 still open "
+                      "is down -$60 with at most $5 more to lose", txt[3])
         self.assertIn("Biggest: KXCA-X-1 (50 YES sold at 40c, now 99c", txt[3])
         # one bad day; a losing week of one-offs (the series is over)
         self.assertIn("AI & tech. Why: one bad day (-$160: fills -$200", txt[4])
-        self.assertIn("inside a +$80 week", txt[4])
+        self.assertIn("inside a +$80 week (14 days +$430).", txt[4])
         self.assertEqual(txt[5], "Esports. Why: -$115 over 7 days (quoting -$115, held "
                                  "positions $0), but no series in it is losing day after "
-                                 "day; the biggest: KXONE -$115 (over); yesterday +$5.")
-        self.assertEqual(txt[6], "TRUMP mentions +$280 over 7 days. Why: their rewards "
-                                 "cover their fills.")
+                                 "day; the biggest: KXONE -$115 (over); 14 days +$235; "
+                                 "yesterday +$5.")
+        self.assertEqual(txt[6], "TRUMP mentions +$280 over 7 days (14 days +$630). Why: "
+                                 "their rewards cover their fills.")
 
     def test_context_and_basis(self):
         adv = pf.imm_advice(_dash(), "2026-10-19")
         self.assertTrue(adv["context"][-1].startswith("Week over week: -$126 vs +$2,450"))
-        self.assertIn("7 full ET days 10/12-10/18", adv["basis"])
+        self.assertIn("7 full ET days 10/12-10/18 and the 14 from 10/05", adv["basis"])
         self.assertNotIn("partial", adv["basis"])
         # yesterday's rewards well under the week's: say where they fell
         d = _dash()
