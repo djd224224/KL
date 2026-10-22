@@ -12371,9 +12371,12 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # later report counts it, or no report in 3 days). A touch more than
 # RESORT_SNOW_TOL_CENTS through the fair caps that side, the snow rule
 # (RESORT_SNOW_WEAK_TOL_CENTS on Mammoth and Stowe, whose proxies are an
-# east-side rain shadow and a valley gauge). Safe-join (rest behind the
-# touch unless the spread is wide), x1 at every hour (is_daily_series),
-# RESORT_SNOW_MAX_POSITION per market, band 5-90c, out 26h before close.
+# east-side rain shadow and a valley gauge). At the touch like the snow
+# monthlies, x1 at every hour (is_daily_series), RESORT_SNOW_MAX_POSITION
+# per market, band 5-90c, out 26h before close. Big Sky's safe-join (2
+# ticks behind, its rule for quoting WITHOUT a fair) was the first cut
+# (1885a05): it read $0.14-0.56 per strike over the program's last 2.3
+# days, and the payout floor (MIN_EST_TOTAL_DOLLARS) dropped 51 of 54.
 # 10/22 20:03Z first read: Mammoth, Northstar and Stowe anchored (27
 # strikes); Beaver Creek, Keystone and Park City stood aside -- rain at
 # EGE, LXV and HCR after their proxies' latest reports. Kill switch
@@ -12405,7 +12408,7 @@ if RESORT_SNOW_ENABLE:
             price_min_cents=_env_int("IMM_SNOW_PRICE_MIN", 5),
             price_max_cents=_env_int("IMM_SNOW_PRICE_MAX", 90),
             cutoff_from_close_min=RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN,
-            max_position=RESORT_SNOW_MAX_POSITION, safe_join=True)
+            max_position=RESORT_SNOW_MAX_POSITION)
 
 
 def resort_snow_series(series: str) -> bool:
@@ -31370,7 +31373,7 @@ class IncentiveMarketMaker:
                 f"{', '.join(sorted(RESORT_SNOW_WEAK_SERIES))}) caps the side that "
                 f"fights the fair; out while the resort's airport is wet, "
                 f"{RESORT_SNOW_DRY_MIN:g}m after, and until the proxy's next report; "
-                f"safe-join, max {RESORT_SNOW_MAX_POSITION:g} per market, out "
+                f"at the touch, max {RESORT_SNOW_MAX_POSITION:g} per market, out "
                 f"{RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN // 60}h before close")
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "

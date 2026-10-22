@@ -12456,7 +12456,7 @@ class TestResortSnowGate(unittest.TestCase):
     ski-resort season snowfall series (Jack 2026-10-22: "Do it best you can
     and quote it"): enrolled on the snow gate's checks, failing closed, out
     while the resort's airport is wet, a touch through the book-anchored
-    fair caps that side (wider on the weak proxies); safe-join, 150 per
+    fair caps that side (wider on the weak proxies); at the touch, 150 per
     market, x1 every hour. Fixture KXBEAVERSNOW-24DEC68-GT80 (DDMONYY like
     Kalshi's 24DEC26: December 24, 2068, far from any cutoff)."""
 
@@ -12511,7 +12511,7 @@ class TestResortSnowGate(unittest.TestCase):
                 ov = imm.series_override(s)
                 self.assertEqual((ov.price_min_cents, ov.price_max_cents,
                                   ov.cutoff_from_close_min, ov.max_position, ov.safe_join),
-                                 (5, 90, 1560, 150, True), s)
+                                 (5, 90, 1560, 150, False), s)
                 self.assertTrue(imm.is_daily_series(s), s)
                 self.assertEqual(imm.fair_gate_of(s), "resort snow", s)
             for s in ("KXVAILSNOW", "KXTSNOWFALLBIGSKYM", "KXCHISNOWM"):
