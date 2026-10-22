@@ -18805,6 +18805,28 @@ class BotState:
     last_markets_line: str = ""
 
 
+# GUARDS ACROSS RESTARTS (Jack 2026-10-22: "Make sure other similar guards
+# also survive bot restarts"). A deploy restarts the bot every ~30 minutes on
+# a busy day, and every hold kept only in memory ended there: on 10/22 the
+# Waco rally's first fill-burst strike (18:31 ET) was dropped by the 18:47
+# restart because the event had resumed 45 s before it, so the 18:50 burst
+# read 1/2 instead of confirming the event live. _save_persist now writes,
+# and _load_persist restores, every breaker or hold still running: the
+# per-market fill / mid-move breaker (breaker_until), the bench cooldown, the
+# sweep breaker's holds and escalation chains, the group breaker's holds,
+# fill-burst strikes for their TTL, and the "a fair's read just moved" holds
+# the bot computes itself (Carbon Arc, OpenRouter token use / share, Vercel).
+# Holds read from a file (rt_fair jump_at, the data center changed_at, the
+# Pokemon moved_at, the release calendar) never needed it.
+FAIR_MOVED_KEEP_SECS = 2 * 3600.0     # past the longest refresh hold (CA ads, 60 min)
+
+
+def _fair_hold_states() -> Tuple[Tuple[str, dict], ...]:
+    """(name, state) for each fair whose moved_at hold the bot computes."""
+    return (("ca", _ca_fair_state), ("or", _or_fair_state),
+            ("share", _share_fair_state), ("vercel", _vercel_state))
+
+
 # ----------------------------------------------------------------------------
 # The market maker
 # ----------------------------------------------------------------------------
@@ -20238,6 +20260,11 @@ class IncentiveMarketMaker:
             self.state.bait_event_until = {
                 str(e): float(v)
                 for e, v in (data.get("bait_event_until") or {}).items()}
+            # every other breaker / hold still running (GUARDS ACROSS RESTARTS)
+            try:
+                self._restore_guard_holds(data)
+            except Exception as e:                   # noqa: BLE001 - the rest restores
+                log(f"{self.tag} ! guard holds restore failed ({e!r}); the rest restores")
             # the ladder asks' cash switch (SPORTS_LADDER_ASKS_ON_CASH / _OFF_CASH)
             self.state.ladder_asks_on_at = float(data.get("ladder_asks_on_at") or 0.0)
             # Halt continuity (same roll-day only): a restart must NOT hand
@@ -20337,6 +20364,90 @@ class IncentiveMarketMaker:
         cursor = float(self.state.last_fill_ts or 0)
         anchor = min(now, cursor) if cursor > 0 else now
         return anchor - max(ORDER_ID_KEEP_HOURS * 3600.0, ORDER_TTL_SECS + 7200.0)
+
+    def _strike_kept(self, ev: str) -> bool:
+        """A fill-burst strike the state file keeps: its halt still runs, or
+        it still counts toward the live confirm (EVENT_FILL_STRIKE_TTL_SECS;
+        0 = strikes never expire, kept a week)."""
+        if ev in self.state.event_depth_halt or ev in self.state.event_live_halt:
+            return True
+        ts = self.state.event_fill_strike_ts.get(ev)
+        if ts is None:
+            return False
+        ttl = EVENT_FILL_STRIKE_TTL_SECS if EVENT_FILL_STRIKE_TTL_SECS > 0 else 7 * 86400
+        return time.time() - ts <= ttl
+
+    def _guard_holds_payload(self) -> dict:
+        """The state file's breakers and holds still running (GUARDS ACROSS
+        RESTARTS): {key: until} maps, the sweep escalation chains and the
+        fairs' moved_at holds."""
+        now = time.time()
+
+        def live(d: dict) -> dict:
+            return {str(k): round(float(v), 1) for k, v in d.items() if float(v) > now}
+        return {
+            "breaker_until": live(self.state.breaker_until),
+            "bench_until": live(self.state.bench_until),
+            "sweep_until": live(self._sweep_until),
+            "sweep_hold": live(self._sweep_hold),
+            "sweep_esc": {str(k): {"n": int(s["n"]), "hold_until": round(float(s["hold_until"]), 1),
+                                   "reset_at": round(float(s["reset_at"]), 1)}
+                          for k, s in self._sweep_esc.items() if float(s["reset_at"]) > now},
+            "grp_hold": {"\t".join(k): round(float(v), 1)
+                         for k, v in self._grp_hold.items() if float(v) > now},
+            "fair_moved_at": {name: {str(k): round(float(v), 1)
+                                     for k, v in st["moved_at"].items()
+                                     if now - float(v) < FAIR_MOVED_KEEP_SECS}
+                              for name, st in _fair_hold_states()},
+        }
+
+    def _restore_guard_holds(self, data: dict) -> None:
+        """Put back what _guard_holds_payload saved, skipping what has run
+        out; a bad entry is logged and skipped, never fatal to the restore."""
+        now = time.time()
+        n: Dict[str, int] = {}
+        for name, d in (("breaker_until", self.state.breaker_until),
+                        ("bench_until", self.state.bench_until),
+                        ("sweep_until", self._sweep_until),
+                        ("sweep_hold", self._sweep_hold)):
+            for k, v in (data.get(name) or {}).items():
+                try:
+                    if float(v) > now:
+                        d[str(k)] = max(float(v), float(d.get(str(k), 0.0)))
+                        n[name] = n.get(name, 0) + 1
+                except (TypeError, ValueError):
+                    log(f"{self.tag} ! state file: bad {name} entry {k!r}: {v!r}")
+        for k, s in (data.get("sweep_esc") or {}).items():
+            try:
+                if float(s["reset_at"]) > now:
+                    self._sweep_esc[str(k)] = {"n": int(s["n"]), "hold_until": float(s["hold_until"]),
+                                               "reset_at": float(s["reset_at"])}
+                    n["sweep_esc"] = n.get("sweep_esc", 0) + 1
+            except (KeyError, TypeError, ValueError):
+                log(f"{self.tag} ! state file: bad sweep_esc entry {k!r}: {s!r}")
+        for k, v in (data.get("grp_hold") or {}).items():
+            try:
+                if float(v) > now and "\t" in k:
+                    self._grp_hold[tuple(k.split("\t", 1))] = float(v)
+                    n["grp_hold"] = n.get("grp_hold", 0) + 1
+            except (TypeError, ValueError):
+                log(f"{self.tag} ! state file: bad grp_hold entry {k!r}: {v!r}")
+        moved = data.get("fair_moved_at") or {}
+        for name, st in _fair_hold_states():
+            for k, v in (moved.get(name) or {}).items():
+                try:
+                    if now - float(v) < FAIR_MOVED_KEEP_SECS:
+                        st["moved_at"][str(k)] = max(float(v), float(st["moved_at"].get(str(k), 0.0)))
+                        n[f"{name}_moved"] = n.get(f"{name}_moved", 0) + 1
+                except (TypeError, ValueError):
+                    log(f"{self.tag} ! state file: bad {name} moved_at entry {k!r}: {v!r}")
+        strikes = sum(1 for e in self.state.event_fill_strikes if e not in self.state.event_depth_halt
+                      and e not in self.state.event_live_halt)
+        if strikes:
+            n["fill_strikes_after_resume"] = strikes
+        if n:
+            log(f"{self.tag} restored guards still running across the restart: "
+                + ", ".join(f"{k} {v}" for k, v in sorted(n.items())))
 
     def _save_persist(self) -> bool:
         """Write the state file; True when it was written."""
@@ -20515,18 +20626,18 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.event_live_halt.items()
                                if time.time() - v < 7 * 86400},
-                           # fill-tripwire strikes (pruned with their halts)
+                           # fill-tripwire strikes: while their halt runs AND
+                           # for their TTL after it (a resumed event's strike
+                           # still counts toward the live confirm)
                            "event_fill_strikes": {
                                e: n
                                for e, n in self.state.event_fill_strikes.items()
-                               if e in self.state.event_depth_halt
-                               or e in self.state.event_live_halt},
+                               if self._strike_kept(e)},
                            "event_fill_strike_ts": {
                                e: round(v, 1)
                                for e, v in self.state.event_fill_strike_ts.items()
                                if e in self.state.event_fill_strikes
-                               and (e in self.state.event_depth_halt
-                                    or e in self.state.event_live_halt)},
+                               and self._strike_kept(e)},
                            "event_depth_ignore": {
                                e: sorted(v)
                                for e, v in self.state.event_depth_ignore.items()
@@ -20573,7 +20684,10 @@ class IncentiveMarketMaker:
                            "bait_event_until": {
                                e: round(v, 1)
                                for e, v in self.state.bait_event_until.items()
-                               if v > time.time()}}, f)
+                               if v > time.time()},
+                           # every other breaker / hold still running
+                           # (GUARDS ACROSS RESTARTS)
+                           **self._guard_holds_payload()}, f)
             os.replace(tmp, self.PERSIST_PATH)
             # Journal contents are now in the main file; truncate so a later
             # crash-load doesn't re-merge stale (already-pruned) ids.

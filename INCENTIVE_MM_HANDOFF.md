@@ -11010,3 +11010,26 @@ watch imports the new module on its next run.
   elasticities: rewards ~+$110/day, fills ~-$140, net ~-$30. So the reward lift should show; net will most
   likely read WATCH unless 1.5x is far better or worse than the elasticities say.
 Deploy: incentive_mm.py change, so the sync's code-change restart; nothing changes in quoting before 10/26.
+
+## 2026-10-22 ~23:35Z — guards survive bot restarts (Jack: "Yes. Make sure other similar guards also survive bot restarts")
+
+- The case: KXTRUMPMENTION-26OCT22 (Waco rally) fill-burst strike 1/2 at 18:31 ET, the event resumed 18:46:19,
+  a deploy restart at 18:47:04, then the 18:50 burst read 1/2 again instead of confirming the event live. The
+  state file kept strikes only while their halt ran, so the resumed event's strike died with the old process.
+  No harm that night: the rally's 19:00 start on file had the bot out from 18:50.
+- _save_persist now writes, and _load_persist restores (_restore_guard_holds, its own try: a bad entry is logged
+  and skipped, the rest of the state still restores), every breaker or hold still running:
+  - fill-burst strikes while their halt runs AND for their TTL after (EVENT_FILL_STRIKE_TTL_SECS, 30 min);
+  - breaker_until (the per-market fill-burst / mid-move breaker), bench_until (the zero-share bench);
+  - the sweep breaker's _sweep_until / _sweep_hold and its escalation chains (_sweep_esc, kept to reset_at);
+  - the group breaker's _grp_hold;
+  - the moved_at holds the bot computes for Carbon Arc, OpenRouter token use / share and Vercel (kept 2 h,
+    FAIR_MOVED_KEEP_SECS; the gates apply their own windows).
+- Already survived: toxic side / event halts and picks, event depth / live halts, bait stops, the daily loss
+  halt, the pilots' and per-event NFL / league loss budgets (same roll day), yt2's post-fill pause, admission
+  runs, hopeless bars, ladder asks. File-stamped holds (rt_fair jump_at, the data center changed_at, Pokemon
+  moved_at, news holds from the feeds, the release calendar) never needed it. In memory on purpose: the
+  lone-ref guard (dry), pending bait checks (seconds), streak counters, caches.
+- Startup line "restored guards still running across the restart: <kind> <n>, ...", when any came back. The
+  first restart onto this code restores none of the new kinds: the old process saved without them.
+Deploy: incentive_mm.py change, so the sync's code-change restart.

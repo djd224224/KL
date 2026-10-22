@@ -4441,6 +4441,71 @@ class TestHaltRestartContinuity(unittest.TestCase):
         self.assertGreater(bot.state.halted_until, time.time())
 
 
+class TestGuardsAcrossRestarts(unittest.TestCase):
+    """Every breaker or hold still running survives a restart (Jack
+    2026-10-22: "Make sure other similar guards also survive bot restarts")."""
+
+    def setUp(self):
+        for st in (imm._vercel_state, imm._ca_fair_state, imm._or_fair_state, imm._share_fair_state):
+            p = mock.patch.dict(st["moved_at"], clear=True)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_running_holds_come_back_and_spent_ones_do_not(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        ev = "KXTRUMPMENTION-26OCT22"
+        # the 10/22 case: the first burst's stand-down had resumed, its strike
+        # still inside the 30-minute TTL
+        bot.state.event_fill_strikes.update({ev: 1, "KXOLD-26OCT21": 1})
+        bot.state.event_fill_strike_ts.update({ev: now - 19 * 60, "KXOLD-26OCT21": now - 3 * 3600})
+        bot.state.breaker_until.update({"KXA-26OCT22-T1": now + 600, "KXA-26OCT22-T2": now - 5})
+        bot.state.bench_until["KXB-26OCT22-T1"] = now + 1800
+        bot._sweep_until["KXC-26OCT22"] = now + 900
+        bot._sweep_hold["KXC-26OCT22"] = now + 900
+        bot._sweep_esc["KXC-26OCT22"] = {"n": 2, "hold_until": now + 900, "reset_at": now + 4500}
+        bot._sweep_esc["KXD-26OCT20"] = {"n": 1, "hold_until": now - 9000, "reset_at": now - 100}
+        bot._grp_hold[("shipping", "ask")] = now + 1200
+        imm._vercel_state["moved_at"]["KXOPENSOURCESHARE-26OCT24"] = now - 300
+        imm._ca_fair_state["moved_at"]["KXOLDCA"] = now - 3 * 3600    # long past its hold
+        bot._save_persist()
+        for st in (imm._vercel_state, imm._ca_fair_state):            # a fresh process
+            st["moved_at"].clear()
+        with mock.patch.object(imm, "log") as lg:
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.event_fill_strikes, {ev: 1})
+        self.assertAlmostEqual(bot2.state.event_fill_strike_ts[ev], now - 19 * 60, delta=1)
+        self.assertEqual(set(bot2.state.breaker_until), {"KXA-26OCT22-T1"})
+        self.assertEqual(set(bot2.state.bench_until), {"KXB-26OCT22-T1"})
+        self.assertEqual(set(bot2._sweep_until), {"KXC-26OCT22"})
+        self.assertEqual(set(bot2._sweep_hold), {"KXC-26OCT22"})
+        self.assertEqual(bot2._sweep_esc["KXC-26OCT22"]["n"], 2)
+        self.assertNotIn("KXD-26OCT20", bot2._sweep_esc)
+        self.assertIn(("shipping", "ask"), bot2._grp_hold)
+        self.assertIn("KXOPENSOURCESHARE-26OCT24", imm._vercel_state["moved_at"])
+        self.assertEqual(imm._ca_fair_state["moved_at"], {})
+        msgs = " ".join(str(c.args[0]) for c in lg.call_args_list)
+        self.assertIn("restored guards still running across the restart", msgs)
+        self.assertIn("fill_strikes_after_resume 1", msgs)
+
+    def test_a_bad_guard_entry_does_not_lose_the_rest(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.halted_until = time.time() + 3600
+        bot._save_persist()
+        with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        data["breaker_until"] = {"KXA-26OCT22-T1": "soon"}
+        data["sweep_esc"] = {"KXC-26OCT22": {"n": 2}}
+        with open(bot.PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        with mock.patch.object(imm, "log"):
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot2.state.breaker_until, {})
+        self.assertGreater(bot2.state.halted_until, time.time())      # the halt still restores
+
+
 def _bal(cash: float, positions: float) -> dict:
     """A /portfolio/balance response: cash in dollars, positions in CENTS."""
     return {"balance_dollars": f"{cash:.4f}", "portfolio_value": int(round(positions * 100))}
