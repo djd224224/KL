@@ -624,18 +624,65 @@ def calls_line(calls: Dict[str, Tuple[str, str]], est: Dict[str, float]) -> str:
         for c in CALL_ORDER if n[c])
 
 
+def _now_line(key: str, label: str, st: Optional[dict], dark_s: float) -> str:
+    """The item's "Now:" line: what the bot is doing, in plain words."""
+    hours = f"{dark_s / 60:.0f}h" if dark_s >= 90 else f"{dark_s:.0f} min"
+    if label.startswith("QUOTED") and st is not None:
+        txt = f"quoted on {st['q']} of {st['n']} markets"
+        if st.get("cutoff"):
+            txt += f", until {_fmt_et(st['cutoff'])}"
+        if key.startswith("start:"):
+            txt += " (behind the live gates)"
+        return txt
+    if label.startswith("QUOTE STATE"):
+        return "unknown (the dashboard did not load)"
+    if st is None:
+        return f"not quoted for {hours}: the bot does not have it"
+    why = st["dec"].most_common(1)[0][0].replace("_", " ") if st["dec"] else ""
+    return (f"not quoted for {hours}: none of its {st['n']} markets"
+            + (f" (bot: {why})" if why else ""))
+
+
+def _needs_line(key: str, it: dict) -> str:
+    """The item's "Needs:" line: what is missing, with the gap's own reason."""
+    need = missing_of(key, it).replace(" (a new family: your call)", " (a new family)")
+    msg = str(it.get("what") or "").partition(": ")[2]
+    if key.startswith("gap:") and msg and msg not in need:
+        need += f" ({msg})"
+    if key.startswith("start:"):
+        need += " (with one it stops 10 min before the event)"
+    return need
+
+
+def _worth_line(it: dict) -> str:
+    """The item's "Worth:" line: $/day, and what is left of its program."""
+    evs = it.get("est_events") or []
+    worth = f"~${it['est']:,.2f}/day"
+    if evs and it.get("est_total") is not None:
+        left = max(e[3] for e in evs)
+        worth += (f"; ~${it['est_total']:,.2f} over the {left:.1f} days left "
+                  f"(ends {_fmt_end(max(e[5] for e in evs))})")
+    if not it.get("est_src") or str(it.get("est_src")).startswith("pool proxy"):
+        worth += " (rough: no book read)"
+    return worth
+
+
 def alert_body(due: List[Tuple[str, dict, float]],
                qs: Optional[Dict[str, dict]] = None,
                track: Optional[Dict[str, dict]] = None) -> Tuple[str, str]:
     """(subject, body). With `track` (family_track's map; {} = none read)
-    every item also gets a quote-or-not call and the subject a tally."""
+    every item also gets a quote-or-not call and the subject a tally.
+
+    Easier to read (Jack 2026-10-22: "Improve IMM watch email so it's way
+    easier to read", and remove the two legend paragraphs): each item is its
+    ticker and what it is, then one short labeled line each for the call, what
+    the bot is doing now, what it needs, what it is worth and the fix."""
     labels = {key: quote_label(key, qs) for key, _, _ in due}
     calls = ({key: quote_call(key, it, track) for key, it, _ in due}
              if track is not None else {})
     quoted = [it for key, it, _ in due if labels[key][0].startswith("QUOTED")]
     unknown = [it for key, it, _ in due if labels[key][0].startswith("QUOTE STATE")]
     dark = [it for key, it, _ in due if labels[key][0].startswith("NOT QUOTED")]
-    whole = sum(it.get("est_total") or 0.0 for _, it, _ in due)
     parts = []
     if dark:
         parts.append(f"{len(dark)} not quoted (~${sum(i['est'] for i in dark):,.0f}/day)")
@@ -645,59 +692,30 @@ def alert_body(due: List[Tuple[str, dict, float]],
     if unknown:
         parts.append(f"{len(unknown)} quote state unknown "
                      f"(~${sum(i['est'] for i in unknown):,.0f}/day)")
-    subject = ("IMM watch: " + "; ".join(parts)
-               + (f" (~${whole:,.0f} over their programs)" if whole else ""))
-    lines = [subject, ""]
+    subject = "IMM watch: " + "; ".join(parts)
+    lines = []
     if calls:
         tally = calls_line(calls, {key: it["est"] for key, it, _ in due})
-        subject += " | " + tally[len("Calls: "):].replace(" (~", " ~").replace("/day)", "/day")
-        lines = [subject, "", tally, ""]
+        n = Counter(c for c, _ in calls.values())
+        subject += " | " + ", ".join(f"{c} {n[c]}" for c in CALL_ORDER if n[c])
+        lines = [tally, ""]
     for key, it, dark_s in sorted(due, key=lambda d: -d[1]["est"]):
-        src = it.get("est_src") or "pool proxy"
-        evs = it.get("est_events") or []
-        worth = f"~${it['est']:,.2f}/day"
-        if evs and it.get("est_total") is not None:
-            worth += (f", ~${it['est_total']:,.2f} over the rest of its program ("
-                      f"{max(e[3] for e in evs):.1f} of {max(e[4] for e in evs):.1f} "
-                      f"days, ends {_fmt_end(max(e[5] for e in evs))})")
+        tick = key.partition(":")[2]
         label, st = labels[key]
-        lines.append(f"- {label} -- missing {missing_of(key, it)}. {worth} ({src}); "
-                     f"flagged {dark_s / 60:.1f}h ago  {it['what']}")
-        if st is not None and st["q"] and key.startswith("start:"):
-            lines.append("    quoting now" + (f", until {_fmt_et(st['cutoff'])}" if st["cutoff"]
-                                              else "") +
-                         ", behind the live gates; a start time makes it stop 10 min "
-                         "before the event")
-        if it.get("title"):
-            lines.append(f"    what it is: {it['title']}")
-        if len(evs) > 1:
-            per = "; ".join(f"{e[0]} ~${e[1]:,.2f}/day = ~${e[2]:,.2f} "
-                            f"({e[3]:.1f}d left)" for e in evs[:4])
-            lines.append(f"    per event: {per}"
-                         + (f"; +{len(evs) - 4} more" if len(evs) > 4 else ""))
+        lines.append(tick + (f": {it['title']}" if it.get("title") else ""))
         if key in calls:
-            lines.append(f"    call: {calls[key][0]} -- {calls[key][1]}")
-        lines.append(f"    fix: {it['fix']}")
-    if calls:
-        lines += ["", f"(call = advice from your strategies, not an action: another of "
-                      f"your bots' markets, a program too small to bother (under "
-                      f"${CALL_SKIP_TOTAL:g} left), a mention / election / award's own "
-                      f"rule, else the last {CALL_DAYS} days of the dashboard family it "
-                      f"would join -- its rewards against its own fills and the "
-                      f"positions it held. Nothing is enrolled or blocked by it.)"]
-    lines += ["", "(QUOTED / NOT QUOTED = what the bot was doing at the last dashboard "
-                  "build, every 10 min; for a QUOTED item the $ is about what it earns "
-                  "now, and the missing date decides when it stops. "
-                  "est = the bot's own reward estimator, as if the gap were "
-                  "fixed: its standard ladder against each market's live book, "
-                  "the forward $/day over its size schedule, summed over the "
-                  "item's paying markets -- no $1/market floor applied. The "
-                  "program total is that $/day over the days each market can "
-                  "still accrue (to the program end or its close), per event. "
-                  f"'pool proxy' = pool $/day x {GAP_CAPTURE:.3f} where no book "
-                  f"was read. Threshold ${GAP_ALERT_MIN_DPD:g}/day, dark >= "
-                  f"{GAP_ALERT_AFTER_MIN:g} min)"]
-    return subject, "\n".join(lines)
+            lines.append(f"  Call:   {calls[key][0]}: {calls[key][1]}")
+        lines.append(f"  Now:    {_now_line(key, label, st, dark_s)}")
+        lines.append(f"  Needs:  {_needs_line(key, it)}")
+        lines.append(f"  Worth:  {_worth_line(it)}")
+        evs = it.get("est_events") or []
+        if len(evs) > 1:
+            per = "; ".join(f"{e[0]} ~${e[1]:,.2f}/day (~${e[2]:,.2f} left)"
+                            for e in evs[:4])
+            lines.append(f"  Events: {per}" + (f"; +{len(evs) - 4} more" if len(evs) > 4 else ""))
+        lines.append(f"  Fix:    {it['fix']}")
+        lines.append("")
+    return subject, "\n".join(lines).rstrip() + "\n"
 
 # REAL ESTIMATES (Jack 2026-10-09, of the dark email's "$41/day" for five
 # Israeli minister events -- 102 markets paying $40 each per 2-day program,

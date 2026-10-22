@@ -223,9 +223,13 @@ class TestGapAlert(unittest.TestCase):
         subject, body = fw.alert_body([("gap:KXA-26", {"est": 44.0, "what": "KXA-26: no row",
                                                        "fix": "add a row"}, 95.0)], qs)
         self.assertEqual(subject, "IMM watch: 1 not quoted (~$44/day)")
-        self.assertIn("- NOT QUOTED (0 of 3 markets; bot: payout_floor) -- missing a config "
-                      "fix. ~$44.00/day (pool proxy); flagged 1.6h ago  KXA-26: no row", body)
-        self.assertIn("fix: add a row", body)
+        # Jack 2026-10-22: "Improve IMM watch email so it's way easier to read"
+        self.assertEqual(body, "KXA-26\n"
+                               "  Now:    not quoted for 2h: none of its 3 markets "
+                               "(bot: payout floor)\n"
+                               "  Needs:  a config fix (no row)\n"
+                               "  Worth:  ~$44.00/day (rough: no book read)\n"
+                               "  Fix:    add a row\n")
 
     def test_quoted_vs_not_quoted_and_what_is_missing(self):
         # Jack 2026-10-17: '"Dark" email should be clear on if the event isn't
@@ -243,13 +247,17 @@ class TestGapAlert(unittest.TestCase):
         subject, body = fw.alert_body(due, qs)
         self.assertEqual(subject, "IMM watch: 2 not quoted (~$19/day); 1 quoted but missing "
                                   "a start time or date (~$50/day)")
-        self.assertIn("- QUOTED on 25 of 25 markets -- missing its start time. ~$49.86/day", body)
-        self.assertIn("quoting now, until Nov 02 10:00 AM ET, behind the live gates; a start "
-                      "time makes it stop 10 min before the event", body)
-        self.assertIn("- NOT QUOTED (0 of 4 markets) -- missing its election day.", body)
-        self.assertIn("- NOT QUOTED (not in the bot's book) -- missing a place on the allowlist "
-                      "(a new family: your call).", body)
-        self.assertNotIn("dark ", body.split("(QUOTED / NOT QUOTED")[0])
+        self.assertIn("KXTRUMPMENTIONB-26OCT19\n"
+                      "  Now:    quoted on 25 of 25 markets, until Nov 02 10:00 AM ET "
+                      "(behind the live gates)\n"
+                      "  Needs:  its start time (with one it stops 10 min before the event)\n"
+                      "  Worth:  ~$49.86/day", body)
+        self.assertIn("KXSENGA-26\n  Now:    not quoted for 60 min: none of its 4 markets\n"
+                      "  Needs:  its election day (no verified election day on file)", body)
+        self.assertIn("KXNEW\n  Now:    not quoted for 60 min: the bot does not have it\n"
+                      "  Needs:  a place on the allowlist (a new family)", body)
+        self.assertNotIn("dark ", body)
+        self.assertNotIn("QUOTED / NOT QUOTED =", body)       # the legend is gone
 
     def test_quote_state_reads_the_dashboard(self):
         D = {"markets": {
@@ -284,9 +292,9 @@ class TestGapAlert(unittest.TestCase):
                ("gap:KXB-26", {"est": 9.0, "what": "KXB-26: no row", "fix": "z"}, 30.0)]
         fw.describe(Client(), due)
         _subject, body = fw.alert_body(due)
-        self.assertIn("KXTSAD: newly paying\n    what it is: Daily TSA passenger "
-                      "screenings (Economics, daily)", body)
-        self.assertIn("what it is: Who will win the A primary? -- Nov 3, 2026", body)
+        self.assertIn("KXTSAD: Daily TSA passenger screenings (Economics, daily)\n", body)
+        self.assertIn("KXA-26: Who will win the A primary? -- Nov 3, 2026\n", body)
+        self.assertIn("\nKXB-26\n", body)                    # no description: the ticker alone
         self.assertNotIn("title", due[2][1])            # a failed read: no line
 
 
@@ -619,10 +627,10 @@ class TestRealEstimates(unittest.TestCase):
         self.assertEqual([e[:3] for e in it["est_events"]],
                          [["KXNEW-26A", 3.0, 6.0], ["KXNEW-26B", 0.75, 1.5]])
         subject, body = fw.alert_body([("new:KXNEW", it, 90.0)])
-        self.assertIn("1 quote state unknown (~$4/day) (~$8 over their programs)", subject)
-        self.assertIn("~$3.75/day, ~$7.50 over the rest of its program (2.0 of 3.0 days, ends ", body)
-        self.assertIn("per event: KXNEW-26A ~$3.00/day = ~$6.00 (2.0d left); "
-                      "KXNEW-26B ~$0.75/day = ~$1.50 (2.0d left)", body)
+        self.assertEqual(subject, "IMM watch: 1 quote state unknown (~$4/day)")
+        self.assertIn("  Worth:  ~$3.75/day; ~$7.50 over the 2.0 days left (ends ", body)
+        self.assertIn("  Events: KXNEW-26A ~$3.00/day (~$6.00 left); "
+                      "KXNEW-26B ~$0.75/day (~$1.50 left)", body)
 
     def test_held_and_unpaid_items_are_not_estimated(self):
         progs = self._progs()
@@ -640,11 +648,11 @@ class TestRealEstimates(unittest.TestCase):
                           "what": "A: x", "fix": "f"}, 90.0),
                ("new:KXB", {"est": 6.0, "what": "KXB: y", "fix": "g"}, 60.0)]
         subject, body = fw.alert_body(due)
-        self.assertIn("~$12.50/day, ~$25.00 over the rest of its program (2.0 of 3.0 "
-                      "days, ends Oct 11 03:59Z) (bot estimate, 3 markets, best $5.00/day)", body)
-        self.assertIn("~$6.00/day (pool proxy)", body)
-        self.assertNotIn("per event:", body)               # one event: no breakdown
-        self.assertIn("no $1/market floor", body)
+        self.assertIn("  Worth:  ~$12.50/day; ~$25.00 over the 2.0 days left "
+                      "(ends Oct 11 03:59Z)\n", body)            # the bot's estimate
+        self.assertIn("  Worth:  ~$6.00/day (rough: no book read)\n", body)   # pool proxy
+        self.assertNotIn("Events:", body)                  # one event: no breakdown
+        self.assertNotIn("no $1/market floor", body)       # the legend is gone
 
 
 class TestResearchResilience(unittest.TestCase):
@@ -824,12 +832,12 @@ class TestQuoteCalls(unittest.TestCase):
                                lambda s, c="": "Politics & approval" if s == "KXSTATERENAME"
                                else ""):
             subject, body = fw.alert_body(due, {}, self.TRACK)
-        self.assertTrue(subject.endswith("| QUOTE 1 ~$12/day, DON'T QUOTE 1 ~$51/day"))
-        self.assertIn("\nCalls: QUOTE 1 (~$12/day), DON'T QUOTE 1 (~$51/day)\n", body)
-        self.assertIn("    call: QUOTE -- it would join Politics & approval", body)
-        self.assertIn("    call: DON'T QUOTE -- high_temp_trading.py", body)
-        self.assertLess(body.index("call: DON'T"), body.index("fix: your call"))
-        self.assertIn("(call = advice from your strategies, not an action", body)
+        self.assertTrue(subject.endswith("| QUOTE 1, DON'T QUOTE 1"), subject)
+        self.assertTrue(body.startswith("Calls: QUOTE 1 (~$12/day), DON'T QUOTE 1 (~$51/day)\n"))
+        self.assertIn("  Call:   QUOTE: it would join Politics & approval", body)
+        self.assertIn("  Call:   DON'T QUOTE: high_temp_trading.py", body)
+        self.assertLess(body.index("Call:   DON'T"), body.index("Fix:    your call"))
+        self.assertNotIn("(call = advice from your strategies", body)   # the legend is gone
 
     def test_model_coverage_gaps_get_a_call(self):
         import imm_model_coverage as mcov
