@@ -159,6 +159,10 @@ class TestVerdictAndRunning(_Base):
         d.update(kw)
         return d
 
+    def test_money_format(self):
+        self.assertEqual([br.usd(x) for x in (-0.0, -0.001, 0.004, -1.5, 1234.567)],
+                         ["$0.00", "$0.00", "$0.00", "-$1.50", "$1,234.57"])
+
     def test_levels(self):
         self.assertEqual(br.verdict(self._d(5.0), {"days": 1, "per_day": 5.0})[0], "OK")
         self.assertEqual(br.verdict(self._d(-3.0), {"days": 1, "per_day": -3.0})[0], "WATCH")

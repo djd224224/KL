@@ -420,6 +420,7 @@ def verdict(d: dict, run: dict) -> tuple:
 
 
 def usd(x: float) -> str:
+    x = round(float(x), 2) + 0.0          # no "$-0.00" for a family that changed nothing
     return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
 
 
