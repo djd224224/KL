@@ -99,6 +99,21 @@ _NOT_VOTE_RE = re.compile(r"\b(rally|rallies|debates?|attends?|endorse\w*|courts
 # election" takes the vote's day) -- for the watch's quote calls
 _POST_VOTE_RE = re.compile(r"\b(mandate|coalition|form (?:a|the) government|"
                            r"after the election)\b", re.I)
+# ONE-OFFS BY HOW THE ANSWER ARRIVES (Jack 2026-10-22: "One-off news is ok if
+# it's not easy to be adversely selected against"). Decided or announced by
+# someone -- a pick, a release, a filing, a meeting, a pause -- is known first
+# by insiders; a slow public process -- a bill through a legislature, a
+# repeal, a ruling on a public docket -- moves in the open. Insider words win.
+_ONE_OFF_INSIDER_RE = re.compile(
+    r"\b(announc\w*|appoint\w*|nominat\w*|named?|picks?|hires?|hired|fired?|resign\w*|"
+    r"retire\w*|step(?:s|ping)? down|releas\w*|launch\w*|unveil\w*|debut\w*|"
+    r"headlin\w*|features?|perform\w*|lineup|next team|trade[ds]? to|acquir\w*|"
+    r"merge[rds]?|IPO|sues?|sued|suing|lawsuits?|indict\w*|charged|depos\w*|"
+    r"pause[ds]?|meet\w*|summit|visit\w*|talks|deal|agree\w*|ceasefire|declar\w*|"
+    r"emergenc\w*|who will be|next)\b", re.I)
+_ONE_OFF_PUBLIC_RE = re.compile(
+    r"\b(repeal\w*|bills?|(?-i:Acts?)|legislat\w*|congress\w*|senate|law|statutes?|"
+    r"ratif\w*|supreme court|ruling|regulat\w*|bans?)\b", re.I)
 
 
 def us_general_vote_ok(series: dict, market: dict) -> Tuple[bool, str]:
@@ -446,10 +461,10 @@ def _fmt_et(ts: float) -> str:
 #      DATED (verified date rows only); research found no vote -> DON'T
 #      QUOTE (non-vote political markets stay out); a new mention family ->
 #      QUOTE WITH CARE (the mention live gates); a new election family ->
-#      QUOTE ONCE DATED; a ONE-OFF (Kalshi frequency one_off) news event ->
-#      DON'T QUOTE, not part of the strategy (non-vote markets stay out,
-#      10/08), but a one-off vote, or what a named vote decides -> QUOTE
-#      ONCE DATED.
+#      QUOTE ONCE DATED; a ONE-OFF (Kalshi frequency one_off): a vote, or
+#      what a named vote decides -> QUOTE ONCE DATED; otherwise by how the
+#      answer arrives (10/22) -- someone decides or announces it -> DON'T
+#      QUOTE; a slow public process -> QUOTE WITH CARE; else YOUR CALL.
 #   4. THE TRACK RECORD of the dashboard family it would join over its last
 #      CALL_DAYS full days -- the portfolio email's What-to-do numbers:
 #      its own quoting loses -> NOT YET; the quoting pays but positions it
@@ -548,8 +563,7 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     rec = track.get(fam) if fam else None
     rec_txt = f" ({_record(fam, rec)})" if rec else ""
     if kind == "start":
-        return ("KEEP QUOTING", "a mention event quoted behind the live gates; add its "
-                                "start time so it stops 10 min before" + rec_txt)
+        return ("KEEP QUOTING", "a mention event, quoted behind the live gates" + rec_txt)
     if kind == "gap":
         if "not a vote market" in str(it.get("fix") or "").lower():
             return ("DON'T QUOTE", "research found it is not a vote market, and non-vote "
@@ -565,14 +579,15 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     if cat == "Elections":
         return ("QUOTE ONCE DATED", "an election: quote it once its election day is on "
                                     "file (verified date rows only)" + rec_txt)
-    # ONE-OFF NEWS IS NOT THE STRATEGY (Jack 2026-10-19: "Don't suggest quoting
-    # one-off news events. That's not part of my strategy is it?"). The rule
-    # since 10/08 (the Talarico reversal): non-vote political markets stay
-    # out; a vote, or what a named vote decides (10/09: who is minister after
-    # it), is quoted once its day is on file. The 10/19 calls had put six
-    # one-offs (FRANCEEMERGENCY, TRUMPXIPUTIN, STATERENAME, RUSDIESELIMPORT
-    # among them) on the Politics & approval record -- a family that earns on
-    # scheduled, recurring markets.
+    # ONE-OFFS (Jack 2026-10-22: "One-off news is ok if it's not easy to be
+    # adversely selected against", refining 10/19's "Don't suggest quoting
+    # one-off news events"). A vote, or what a named vote decides (10/09: who
+    # is minister after it), is quoted once its day is on file. Otherwise the
+    # call follows how the answer arrives (_ONE_OFF_INSIDER_RE / _PUBLIC_RE),
+    # read off the title, so it is a first pass: the family record never makes
+    # a one-off a QUOTE (the 10/19 calls had put FRANCEEMERGENCY and
+    # TRUMPXIPUTIN on Politics & approval's record, which earns on scheduled,
+    # recurring markets).
     if str(it.get("frequency") or "") == "one_off":
         title = str(it.get("title") or "")
         if (_VOTE_RE.search(title) or _POST_VOTE_RE.search(title)) \
@@ -580,9 +595,17 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
             return ("QUOTE ONCE DATED", "a one-off vote, or what a named vote decides: "
                                         "quote it once the vote's day is on file (your "
                                         "elections rule)")
-        return ("DON'T QUOTE", "a one-off news event -- not part of your strategy: "
-                               "non-vote political and news markets stay out (your 10/08 "
-                               "rule); your families quote scheduled information")
+        m = _ONE_OFF_INSIDER_RE.search(title)
+        if m:
+            return ("DON'T QUOTE", f"a one-off someone decides or announces "
+                                   f"(\"{m.group(0)}\"): insiders know first")
+        m = _ONE_OFF_PUBLIC_RE.search(title)
+        if m:
+            return ("QUOTE WITH CARE", f"a one-off that moves through a slow public "
+                                       f"process (\"{m.group(0)}\"): hard to be picked "
+                                       f"off; quote small")
+        return ("YOUR CALL", "a one-off: quote it only if the answer can't reach "
+                             "informed traders first")
     if not rec:
         return ("YOUR CALL", "no track record: nothing like it trades yet"
                 + (f" in {fam}" if fam else ""))
@@ -614,43 +637,35 @@ def model_gap_call(g: dict, track: Dict[str, dict]) -> Tuple[str, str]:
                                "make the fix, or block it until then" + rec_txt)
 
 
-def calls_line(calls: Dict[str, Tuple[str, str]], est: Dict[str, float]) -> str:
-    """'Calls: QUOTE 2 (~$17/day), DON'T QUOTE 48 (~$507/day)'."""
-    n, usd = Counter(c for c, _ in calls.values()), defaultdict(float)
-    for k, (c, _) in calls.items():
-        usd[c] += est.get(k, 0.0)
-    return "Calls: " + ", ".join(
-        f"{c} {n[c]}" + (f" (~${usd[c]:,.0f}/day)" if usd[c] >= 0.5 else "")
-        for c in CALL_ORDER if n[c])
-
-
-def _now_line(key: str, label: str, st: Optional[dict], dark_s: float) -> str:
-    """The item's "Now:" line: what the bot is doing, in plain words."""
+def _now_line(key: str, label: str, st: Optional[dict], dark_s: float,
+              it: Optional[dict] = None) -> str:
+    """The item's "Now:" line: what the bot is doing, in plain words, then
+    what it needs (Jack 2026-10-22: "clean up the dark emails to make it more
+    clear and succinct" -- one line, not a separate Needs line)."""
     hours = f"{dark_s / 60:.0f}h" if dark_s >= 90 else f"{dark_s:.0f} min"
+    need = "; needs " + _needs_line(key, it) if it is not None else ""
     if label.startswith("QUOTED") and st is not None:
         txt = f"quoted on {st['q']} of {st['n']} markets"
         if st.get("cutoff"):
-            txt += f", until {_fmt_et(st['cutoff'])}"
-        if key.startswith("start:"):
-            txt += " (behind the live gates)"
-        return txt
+            txt += f" until {_fmt_et(st['cutoff'])}"
+        return txt + (" (live gates)" if key.startswith("start:") else "") + need
     if label.startswith("QUOTE STATE"):
-        return "unknown (the dashboard did not load)"
+        return "unknown (the dashboard did not load)" + need
     if st is None:
-        return f"not quoted for {hours}: the bot does not have it"
+        return f"not quoted for {hours}" + need
     why = st["dec"].most_common(1)[0][0].replace("_", " ") if st["dec"] else ""
-    return (f"not quoted for {hours}: none of its {st['n']} markets"
-            + (f" (bot: {why})" if why else ""))
+    return (f"not quoted for {hours}, 0 of {st['n']} markets"
+            + (f" (bot: {why})" if why else "") + need)
 
 
 def _needs_line(key: str, it: dict) -> str:
-    """The item's "Needs:" line: what is missing, with the gap's own reason."""
+    """What the item is missing, with the gap's own reason."""
     need = missing_of(key, it).replace(" (a new family: your call)", " (a new family)")
     msg = str(it.get("what") or "").partition(": ")[2]
     if key.startswith("gap:") and msg and msg not in need:
         need += f" ({msg})"
     if key.startswith("start:"):
-        need += " (with one it stops 10 min before the event)"
+        need += " (then it stops 10 min before the event)"
     return need
 
 
@@ -685,28 +700,28 @@ def alert_body(due: List[Tuple[str, dict, float]],
     dark = [it for key, it, _ in due if labels[key][0].startswith("NOT QUOTED")]
     parts = []
     if dark:
-        parts.append(f"{len(dark)} not quoted (~${sum(i['est'] for i in dark):,.0f}/day)")
+        parts.append(f"{len(dark)} not quoted ~${sum(i['est'] for i in dark):,.0f}/day")
     if quoted:
-        parts.append(f"{len(quoted)} quoted but missing a start time or date "
-                     f"(~${sum(i['est'] for i in quoted):,.0f}/day)")
+        parts.append(f"{len(quoted)} missing a start or date "
+                     f"~${sum(i['est'] for i in quoted):,.0f}/day")
     if unknown:
-        parts.append(f"{len(unknown)} quote state unknown "
-                     f"(~${sum(i['est'] for i in unknown):,.0f}/day)")
-    subject = "IMM watch: " + "; ".join(parts)
-    lines = []
+        parts.append(f"{len(unknown)} state unknown "
+                     f"~${sum(i['est'] for i in unknown):,.0f}/day")
+    subject = "IMM watch: " + ", ".join(parts)
     if calls:
-        tally = calls_line(calls, {key: it["est"] for key, it, _ in due})
         n = Counter(c for c, _ in calls.values())
         subject += " | " + ", ".join(f"{c} {n[c]}" for c in CALL_ORDER if n[c])
-        lines = [tally, ""]
-    for key, it, dark_s in sorted(due, key=lambda d: -d[1]["est"]):
+    # the calls to act on first (QUOTE ... DON'T QUOTE), the biggest first within one
+    rank = {c: i for i, c in enumerate(CALL_ORDER)}
+    lines = []
+    for key, it, dark_s in sorted(due, key=lambda d: (rank.get((calls.get(d[0]) or ("",))[0], 0),
+                                                      -d[1]["est"])):
         tick = key.partition(":")[2]
         label, st = labels[key]
         lines.append(tick + (f": {it['title']}" if it.get("title") else ""))
         if key in calls:
             lines.append(f"  Call:   {calls[key][0]}: {calls[key][1]}")
-        lines.append(f"  Now:    {_now_line(key, label, st, dark_s)}")
-        lines.append(f"  Needs:  {_needs_line(key, it)}")
+        lines.append(f"  Now:    {_now_line(key, label, st, dark_s, it)}")
         lines.append(f"  Worth:  {_worth_line(it)}")
         evs = it.get("est_events") or []
         if len(evs) > 1:

@@ -6829,7 +6829,8 @@ _DEFAULT_RATES_EXTRA_SERIES = (
 # KXSNOWCRABCATCH (TAC announces ~Oct 6, cutoff Oct 9 -> quotes through
 # it), KXSOCKEYERUN (ADF&G forecast ~Nov 13, cutoff Nov 27 -> same),
 # KXWATECHEMP/KXWAAEROEMP (monthly BLS state prints quoted through for a
-# 6-8mo hold at ~3% ROI), the ad-spend family (safe but ROI <= 1.5%/day —
+# 6-8mo hold at ~3% ROI; re-admitted 2026-10-22 with the release pause --
+# see SCAN_EXCLUDE_PREFIXES), the ad-spend family (safe but ROI <= 1.5%/day —
 # never contends for a slot).
 # Company-KPI set ENROLLED 2026-09-04 (Jack: "yes company-KPI set should
 # be in the scan", REVERSING the day-1 blanket rejection after his release-
@@ -7527,7 +7528,10 @@ SCAN_EXCLUDE_PREFIXES = tuple(p for p in os.environ.get(
     "KXOIL,KXTXERCOT,KXPJM,KXERCOT,KXUSOPENPRICE,KXDDR5,KXTRUFAIDP,"
     # single-report pickoff traps / knowable public tallies found 9/2
     "KXUE,KXISMPMI,KXSKEXPYOY,KXTECHLAYOFF,KXSNOWCRABCATCH,KXSOCKEYERUN,"
-    "KXWATECHEMP,KXWAAEROEMP"
+    # KXWATECHEMP / KXWAAEROEMP re-admitted 2026-10-22 (Jack: "Also do 2,3,4"):
+    # the state-economy auto family takes them, and the release pause stands
+    # them aside around each BLS release -- the 9/02 reason (monthly prints
+    # quoted through) is what that pause covers
     # (the sports-family prefix backup was retired with the category ban,
     # 2026-09-06: a sports series is judged by its settlement source and
     # its ticker date like any other)

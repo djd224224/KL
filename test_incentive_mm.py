@@ -27236,20 +27236,22 @@ class TestGraduateAutoFamilies(unittest.TestCase):
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
             got = {s: w for s, w, _x in enrolled}
+            # KXWATECHEMP: the 9/02 reject, re-admitted 2026-10-22 with the release pause
             self.assertEqual(got, {"KXHORMUZPEAK": ieo.GRADUATE_AUTO_WHY["portwatch"],
                                    "KXNYCASKRENT": ieo.GRADUATE_AUTO_WHY["econstate"],
-                                   "KXPAMFGEMP": ieo.GRADUATE_AUTO_WHY["econstate"]})
+                                   "KXPAMFGEMP": ieo.GRADUATE_AUTO_WHY["econstate"],
+                                   "KXWATECHEMP": ieo.GRADUATE_AUTO_WHY["econstate"]})
             why = {s: w for s, w, _x in review}
             self.assertIn("not a threshold ladder", why["KXHORMUZMAX"])
             self.assertIn("contract SUEZTRAFFIC", why["KXSUEZTRAFFIC"])
             self.assertIn("left behind 10/03", why["KXCTMINWAGE"])
-            self.assertIn("scan exclude prefix", why["KXWATECHEMP"])      # 9/02 reject
             self.assertIn("scan exclude prefix", why["KXTXERCOTPEAK"])    # live grid
             self.assertIn("names no day", why["KXRUSWAGE"])
             self.assertIn("live_source", why["KXGRIDLOAD"])
             with open(imm.graduate_auto_path(), encoding="utf-8") as f:
                 data = json.load(f)["series"]
-            self.assertEqual(sorted(data), ["KXHORMUZPEAK", "KXNYCASKRENT", "KXPAMFGEMP"])
+            self.assertEqual(sorted(data), ["KXHORMUZPEAK", "KXNYCASKRENT", "KXPAMFGEMP",
+                                            "KXWATECHEMP"])
             self.assertEqual(data["KXHORMUZPEAK"]["family"], "portwatch")
             self.assertEqual(data["KXNYCASKRENT"]["contract"], "ECONSTATE")
             imm.load_graduate_auto_series()

@@ -222,12 +222,12 @@ class TestGapAlert(unittest.TestCase):
                             "cutoff": None}}
         subject, body = fw.alert_body([("gap:KXA-26", {"est": 44.0, "what": "KXA-26: no row",
                                                        "fix": "add a row"}, 95.0)], qs)
-        self.assertEqual(subject, "IMM watch: 1 not quoted (~$44/day)")
-        # Jack 2026-10-22: "Improve IMM watch email so it's way easier to read"
+        self.assertEqual(subject, "IMM watch: 1 not quoted ~$44/day")
+        # Jack 2026-10-22: "Improve IMM watch email so it's way easier to read",
+        # then "clean up the dark emails to make it more clear and succinct"
         self.assertEqual(body, "KXA-26\n"
-                               "  Now:    not quoted for 2h: none of its 3 markets "
-                               "(bot: payout floor)\n"
-                               "  Needs:  a config fix (no row)\n"
+                               "  Now:    not quoted for 2h, 0 of 3 markets (bot: payout "
+                               "floor); needs a config fix (no row)\n"
                                "  Worth:  ~$44.00/day (rough: no book read)\n"
                                "  Fix:    add a row\n")
 
@@ -245,17 +245,17 @@ class TestGapAlert(unittest.TestCase):
                                                         "day on file", "fix": "row"}, 60.0),
                ("new:KXNEW", {"est": 7.0, "what": "KXNEW: newly paying", "fix": "call"}, 60.0)]
         subject, body = fw.alert_body(due, qs)
-        self.assertEqual(subject, "IMM watch: 2 not quoted (~$19/day); 1 quoted but missing "
-                                  "a start time or date (~$50/day)")
+        self.assertEqual(subject, "IMM watch: 2 not quoted ~$19/day, 1 missing a start or "
+                                  "date ~$50/day")
         self.assertIn("KXTRUMPMENTIONB-26OCT19\n"
-                      "  Now:    quoted on 25 of 25 markets, until Nov 02 10:00 AM ET "
-                      "(behind the live gates)\n"
-                      "  Needs:  its start time (with one it stops 10 min before the event)\n"
+                      "  Now:    quoted on 25 of 25 markets until Nov 02 10:00 AM ET (live "
+                      "gates); needs its start time (then it stops 10 min before the event)\n"
                       "  Worth:  ~$49.86/day", body)
-        self.assertIn("KXSENGA-26\n  Now:    not quoted for 60 min: none of its 4 markets\n"
-                      "  Needs:  its election day (no verified election day on file)", body)
-        self.assertIn("KXNEW\n  Now:    not quoted for 60 min: the bot does not have it\n"
-                      "  Needs:  a place on the allowlist (a new family)", body)
+        self.assertIn("KXSENGA-26\n  Now:    not quoted for 60 min, 0 of 4 markets; needs its "
+                      "election day (no verified election day on file)\n", body)
+        self.assertIn("KXNEW\n  Now:    not quoted for 60 min; needs a place on the allowlist "
+                      "(a new family)\n", body)
+        self.assertNotIn("Needs:", body)                      # folded into Now (10/22)
         self.assertNotIn("dark ", body)
         self.assertNotIn("QUOTED / NOT QUOTED =", body)       # the legend is gone
 
@@ -627,7 +627,7 @@ class TestRealEstimates(unittest.TestCase):
         self.assertEqual([e[:3] for e in it["est_events"]],
                          [["KXNEW-26A", 3.0, 6.0], ["KXNEW-26B", 0.75, 1.5]])
         subject, body = fw.alert_body([("new:KXNEW", it, 90.0)])
-        self.assertEqual(subject, "IMM watch: 1 quote state unknown (~$4/day)")
+        self.assertEqual(subject, "IMM watch: 1 state unknown ~$4/day")
         self.assertIn("  Worth:  ~$3.75/day; ~$7.50 over the 2.0 days left (ends ", body)
         self.assertIn("  Events: KXNEW-26A ~$3.00/day (~$6.00 left); "
                       "KXNEW-26B ~$0.75/day (~$1.50 left)", body)
@@ -778,19 +778,35 @@ class TestQuoteCalls(unittest.TestCase):
         self.assertIn("Sports & awards's own quoting lost $341", why)
         self.assertEqual(self.call("new:KXODD", fam="")[0], "YOUR CALL")
 
-    def test_one_off_news_is_not_the_strategy(self):
-        """Jack 2026-10-19: "Don't suggest quoting one-off news events. That's
-        not part of my strategy is it?" -- a good family record never makes a
-        one-off news event a QUOTE; a one-off vote waits for its date."""
-        for tick, title in (("KXFRANCEEMERGENCY", "France state of emergency (Politics, one_off)"),
-                            ("KXTRUMPXIPUTIN", "Trump, Xi and Putin trilateral meeting "
-                                               "(Politics, one_off)"),
-                            ("KXRUSDIESELIMPORT", "Will Russian diesel be imported into the "
-                                                  "United States? (Politics, one_off)")):
-            c, why = self.call("new:" + tick, fam="Politics & approval", category="Politics",
-                               frequency="one_off", title=title)
+    def test_one_offs_by_how_the_answer_arrives(self):
+        """Jack 2026-10-22: "One-off news is ok if it's not easy to be adversely
+        selected against" (refining 10/19's "Don't suggest quoting one-off news
+        events") -- someone decides or announces it -> DON'T QUOTE; a slow public
+        process -> QUOTE WITH CARE; neither -> YOUR CALL. A good family record
+        never makes a one-off a QUOTE; a one-off vote waits for its date."""
+        def one_off(tick, title):
+            return self.call("new:" + tick, fam="Politics & approval", category="Politics",
+                             frequency="one_off", title=title)
+        for tick, title in (
+                ("KXOMARDENAT", "Will the U.S. government sue Ilhan Omar to revoke her U.S. "
+                                "citizenship before 2027?"),
+                ("KXTRUMPBBCDEPO", "Will Trump sit for a deposition in his BBC lawsuit?"),
+                ("KXNEXTSTATEFLOCK", "Will another state ban or pause police use of Flock "
+                                     "cameras?"),
+                ("KXNEXTPRESSECPERM", "Who will be Trump's next Press Secretary?"),
+                ("KXTRUMPXIPUTIN", "Trump, Xi and Putin trilateral meeting (Politics, one_off)"),
+                ("KXFRANCEEMERGENCY", "France state of emergency (Politics, one_off)"),
+                ("KXGPT", "When will OpenAI release Astra 6.1?")):
+            c, why = one_off(tick, title)
             self.assertEqual(c, "DON'T QUOTE", tick)
-            self.assertIn("not part of your strategy", why)
+            self.assertIn("insiders know first", why)
+        c, why = one_off("KXONIONACT", "Will the Onion Futures Act be repealed before Jan 1, 2030?")
+        self.assertEqual(c, "QUOTE WITH CARE")
+        self.assertIn("slow public process", why)
+        self.assertEqual(one_off("KXRUSDIESELIMPORT", "Will Russian diesel be imported into the "
+                                 "United States? (Politics, one_off)")[0], "YOUR CALL")
+        self.assertEqual(one_off("KXACTS", "Will there be acts of protest?")[0],
+                         "YOUR CALL")                # lower-case "acts" is not a law
         for tick, title in (("KXSWEDENPMVOTE", "Swedish Prime Minister approval vote "
                                                "(Politics, one_off)"),
                             ("KXISRFIRSTMANDATE", "Who will get Israel's first mandate to form "
@@ -798,10 +814,10 @@ class TestQuoteCalls(unittest.TestCase):
             c, why = self.call("new:" + tick, fam="Politics & approval", category="Politics",
                                frequency="one_off", title=title)
             self.assertEqual(c, "QUOTE ONCE DATED", tick)
-        # a rally is news even with a vote word in it
+        # a rally is not a vote even with a vote word in it: judged as a one-off
         self.assertEqual(self.call("new:KXRALLY", fam="Politics & approval", frequency="one_off",
                                    title="Will he rally voters before the vote?")[0],
-                         "DON'T QUOTE")
+                         "YOUR CALL")
         # mentions keep their own rule
         self.assertEqual(self.call("new:KXXMENTION", category="Mentions",
                                    frequency="one_off")[0], "QUOTE WITH CARE")
@@ -833,10 +849,11 @@ class TestQuoteCalls(unittest.TestCase):
                                else ""):
             subject, body = fw.alert_body(due, {}, self.TRACK)
         self.assertTrue(subject.endswith("| QUOTE 1, DON'T QUOTE 1"), subject)
-        self.assertTrue(body.startswith("Calls: QUOTE 1 (~$12/day), DON'T QUOTE 1 (~$51/day)\n"))
+        self.assertNotIn("Calls:", body)                 # the subject carries the tally (10/22)
         self.assertIn("  Call:   QUOTE: it would join Politics & approval", body)
         self.assertIn("  Call:   DON'T QUOTE: high_temp_trading.py", body)
-        self.assertLess(body.index("Call:   DON'T"), body.index("Fix:    your call"))
+        # the QUOTE comes first though DON'T QUOTE is worth more (act-on order)
+        self.assertLess(body.index("Call:   QUOTE:"), body.index("Call:   DON'T"))
         self.assertNotIn("(call = advice from your strategies", body)   # the legend is gone
 
     def test_model_coverage_gaps_get_a_call(self):

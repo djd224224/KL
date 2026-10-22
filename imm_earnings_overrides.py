@@ -769,8 +769,9 @@ def mention_auto_why_not(client, series: str, sample: str, se: dict) -> str:
 #                print the ticker names; the graduates of the same shape
 #                (state jobs, ports, permits) made money in the scan.
 # Both pass the scan's own screens first -- SCAN_EXCLUDE_PREFIXES (the 9/02
-# rejects KXWATECHEMP / KXWAAEROEMP, the ERCOT / PJM grid feeds, other bots'
-# families) and scan_series_meta_verdict (live-feed settlement sources) --
+# rejects, the ERCOT / PJM grid feeds, other bots' families; KXWATECHEMP /
+# KXWAAEROEMP left it 2026-10-22 with the release pause) and
+# scan_series_meta_verdict (live-feed settlement sources) --
 # and incentive_mm.GRADUATE_AUTO_EXCLUDE (the 10/03 left-behind).
 GRADUATE_AUTO_WHY = {
     "portwatch": "IMF PortWatch source -> strait traffic family (graduate rules)",

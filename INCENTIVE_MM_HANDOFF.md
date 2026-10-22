@@ -10904,3 +10904,23 @@ annual average.
   IMM_RELEASE_CALENDAR_FILE.
 Deploy: incentive_mm.py change, so the sync's code-change restart. Check the startup line "release pause
 (2026-10-22): state statistics stand aside ...".
+
+## 2026-10-22 ~20:00Z — Washington jobs in; one-offs judged by adverse selection (Jack: "Do 2,3,4 and also clean up the dark emails")
+
+- KXWATECHEMP / KXWAAEROEMP leave SCAN_EXCLUDE_PREFIXES. The 9/02 reason was monthly BLS prints quoted through a
+  6-8 month hold, and the release pause above now covers those. The state-economy auto family (the watch's
+  new-series pass) enrolls them at x1, 3 per event; both map bls_state + bls_empsit.
+- KXONIONACT (Onion Futures Act repeal before 2028 / 2029 / 2030) was hand-added to
+  run-logs\incentive-mm\extra_allow_series.json, the only one of the four proposed one-offs whose rules pass Jack's
+  10/22 test ("One-off news is ok if it's not easy to be adversely selected against"). It moves by a public
+  process in Congress.
+- The other three stay out:
+  - KXOMARDENAT: a DOJ suit, a single decision that reporters' sources learn first.
+  - KXTRUMPBBCDEPO: a private deposition, confirmed after the fact.
+  - KXNEXTSTATEFLOCK: a "pause" can come overnight from a governor or police chief.
+- imm_family_watch's quote call for a one-off follows the same test:
+  - someone decides or announces it -> DON'T QUOTE;
+  - a slow public process -> QUOTE WITH CARE;
+  - neither -> YOUR CALL.
+- The dark email is 4 lines an item. Needs is folded into Now, the Calls line is gone (the subject has the tally),
+  and items sort by call.
