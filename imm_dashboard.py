@@ -224,12 +224,33 @@ def iso_ts(s) -> float:
         return 0.0
 
 
+# The bot rewrites imm_state.json and its status file every ~11 s (tmp ->
+# os.replace). On Windows a read that holds the file makes that swap fail:
+# its "! state save failed: [WinError 5] Access is denied" lines land at this
+# task's :x5:56 starts. A read landing inside the swap fails here instead, and
+# would build the page from an empty state. Jack 2026-10-22: "1" = read the
+# bytes and close BEFORE the parse (the file is held for the read alone, not
+# a 4 MB json parse), and retry a locked file before falling back.
+LOAD_TRIES = 5
+LOAD_RETRY_SECS = 0.2
+
+
 def load_json(path: str, default=None):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {} if default is None else default
+    for attempt in range(LOAD_TRIES):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            return json.loads(raw.decode("utf-8"))
+        except PermissionError as e:
+            if attempt < LOAD_TRIES - 1:
+                time.sleep(LOAD_RETRY_SECS)
+                continue
+            log(f"! {os.path.basename(path)} still locked after {LOAD_TRIES} reads "
+                f"({e}); using the default")
+        except (OSError, ValueError):
+            pass
+        break
+    return {} if default is None else default
 
 
 def fx_array(v: dict):

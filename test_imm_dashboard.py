@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 import imm_dashboard as dash
 
@@ -631,6 +632,67 @@ class FillsDedupeTests(unittest.TestCase):
         finally:
             dash.STATUS_DIR = old
             shutil.rmtree(d, ignore_errors=True)
+
+
+class LoadJsonTests(unittest.TestCase):
+    """Jack 2026-10-22 ("1"): the bot's tmp -> os.replace swap of
+    imm_state.json failed whenever this task held the file through a parse."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "imm_state.json")
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"own_pos": {"KXA-1": 3}}, f)
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_the_file_is_closed_before_the_parse(self):
+        handles = []
+        real_open, real_loads = open, json.loads
+
+        def spy_open(*a, **k):
+            handles.append(real_open(*a, **k))
+            return handles[-1]
+
+        def spy_loads(s, *a, **k):
+            self.assertTrue(handles and all(h.closed for h in handles))
+            return real_loads(s, *a, **k)
+        with mock.patch("builtins.open", spy_open), \
+                mock.patch.object(dash.json, "loads", spy_loads):
+            self.assertEqual(dash.load_json(self.path), {"own_pos": {"KXA-1": 3}})
+        # the swap the bot makes right after a read now goes through
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"own_pos": {}}, f)
+        os.replace(tmp, self.path)
+
+    def test_a_locked_file_is_read_again(self):
+        real_open, calls = open, []
+
+        def locked_twice(*a, **k):
+            calls.append(a[0])
+            if len(calls) <= 2:
+                raise PermissionError(13, "Access is denied")
+            return real_open(*a, **k)
+        with mock.patch("builtins.open", locked_twice), \
+                mock.patch.object(dash.time, "sleep") as sl:
+            self.assertEqual(dash.load_json(self.path), {"own_pos": {"KXA-1": 3}})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sl.call_count, 2)
+
+    def test_missing_bad_and_always_locked_files_fall_back(self):
+        with mock.patch.object(dash.time, "sleep") as sl:
+            self.assertEqual(dash.load_json(os.path.join(self.dir, "nope.json"), []), [])
+            bad = os.path.join(self.dir, "bad.json")
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write("{not json")
+            self.assertEqual(dash.load_json(bad), {})
+            self.assertEqual(sl.call_count, 0)                   # no retry for these
+        with mock.patch("builtins.open", side_effect=PermissionError(13, "denied")), \
+                mock.patch.object(dash.time, "sleep") as sl, \
+                mock.patch.object(dash, "log") as lg:
+            self.assertEqual(dash.load_json(self.path, {"d": 1}), {"d": 1})
+        self.assertEqual(sl.call_count, dash.LOAD_TRIES - 1)
+        self.assertIn("still locked", lg.call_args.args[0])
 
 
 class RetimeTests(unittest.TestCase):
