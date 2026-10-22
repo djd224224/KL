@@ -186,6 +186,27 @@ class TestCoverage(unittest.TestCase):
         self.assertNotIn(f"{fam}|openlab", sent)
         self.assertIn(f"{fam}|openlab", st)                               # still remembered
 
+    def test_a_never_read_event_waits_a_pass_before_its_email(self):
+        # 2026-10-22: KXTTNSNOWM-26DEC read [NEW] "never read" from the 10
+        # minutes after a restart before the snow refresher had the feed's cities
+        snow = os.path.join(self.dir, "snow_monthly_fair.json")
+        _write(snow, {"generated_at": datetime.now(timezone.utc).isoformat(),
+                      "events": {"KXBOSSNOWM-26DEC": {}}, "event_state": {}})
+        progs = {"KXTTNSNOWM-26DEC-4": {}, "KXBOSSNOWM-26DEC-10": {}}
+        with mock.patch.object(imm, "SNOW_MONTHLY_FILE", snow), \
+                mock.patch.object(imm, "snow_monthly_series",
+                                  lambda s: s in ("KXTTNSNOWM", "KXBOSSNOWM")):
+            gaps = mc.find_gaps(progs, self.now, [mc.check_snow_monthly])
+        key = "Monthly snow (snow_monthly_fair)|KXTTNSNOWM-26DEC"
+        self.assertEqual(list(gaps), [key])
+        out, st = mc.due({}, gaps, self.now)
+        self.assertEqual(out, [])                                # first sight: held
+        self.assertIn(key, st)
+        out2, _st = mc.due(st, {}, self.now + 1800)               # read by then: no email
+        self.assertEqual(out2, [])
+        out3, _st = mc.due(st, gaps, self.now + 1800)             # still unread a pass later
+        self.assertEqual([(k, n) for k, _g, _f, n in out3], [(key, True)])
+
     def test_vercel_labs_are_quiet_while_the_fair_reads_the_chart(self):
         # 2026-10-22 (the meta gap): KXOPENSOURCESHARE priced off Vercel's
         # weight-class chart has no lab list to keep; on the lab sum it reports

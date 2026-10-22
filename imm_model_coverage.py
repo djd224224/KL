@@ -44,6 +44,14 @@ REALERT_HOURS = float(os.environ.get("IMM_MODEL_GAP_REALERT_HOURS", "24"))
 # a fair file older than this is a gap of its own: its refresher has stopped,
 # so nothing it would add (or alert on) is happening
 FAIR_STALE_HOURS = float(os.environ.get("IMM_MODEL_FAIR_STALE_HOURS", "6"))
+# A "never read this event" gap waits this long after first sight before it
+# is emailed (2026-10-22, Jack pasted a KXTTNSNOWM-26DEC [NEW] three days
+# after its fix): after a restart the rain / snow refreshers write once
+# before the first programs read hands them the feed's cities, so those
+# events sit unread for one refresh (10 min; 04:47:29Z -> 04:57:32Z on
+# 10/22), and a watch pass inside that window reported a closed gap. One
+# pass later a real gap is still open.
+NEVER_READ_SETTLE_SECS = float(os.environ.get("IMM_MODEL_GAP_SETTLE_MIN", "20")) * 60
 
 
 def _read(path: str) -> dict:
@@ -182,8 +190,10 @@ def _weather_events(family: str, path: str, member: Callable[[str], bool],
     for ev, ts in sorted(by_ev.items()):
         st = state.get(ev) or {}
         if ev not in known:
-            out.append(_gap(family, ev, ts, "closed",
-                            "the fair writer has never read this event", fix))
+            g = _gap(family, ev, ts, "closed",
+                     "the fair writer has never read this event", fix)
+            g["settle_secs"] = NEVER_READ_SETTLE_SECS
+            out.append(g)
         elif st.get("error") == "no station":
             out.append(_gap(family, ev, ts, "closed",
                             f"no station for CLI code {st.get('code')!r} in the "
@@ -553,7 +563,8 @@ def due(state: Dict[str, dict], gaps: Dict[str, dict], now_ts: float,
     unadmitted artist) is sent once and remembered ONCE_MEMORY_DAYS after it
     closes, so next week's event of the same artist stays quiet; with
     baseline_once (the pass's first run) today's exclusions are recorded
-    without an email. Any other closed gap leaves the state."""
+    without an email. A gap with "settle_secs" is held that long after first
+    sight (NEVER_READ_SETTLE_SECS). Any other closed gap leaves the state."""
     new_state: Dict[str, dict] = {}
     out = []
     for k, g in sorted(gaps.items()):
@@ -562,6 +573,10 @@ def due(state: Dict[str, dict], gaps: Dict[str, dict], now_ts: float,
         if g.get("once"):
             st["once"] = True
         last = st.get("sent")
+        if last is None and g.get("settle_secs") and \
+                now_ts - float(st.get("first", now_ts)) < float(g["settle_secs"]):
+            new_state[k] = st                        # a restart's window: wait a pass
+            continue
         if last is None and baseline_once and g.get("once"):
             st["sent"] = now_ts                      # known on day one: no email
         elif last is None or (not g.get("once")
