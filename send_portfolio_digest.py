@@ -211,6 +211,54 @@ def family_for(event_ticker: str) -> str:
     return family_and_group(event_ticker)[0]
 
 
+# The day by bot (Jack 2026-10-22: "in the email, clearly show daily only
+# split between IMM vs crypto vs weather vs other"). Each event row of the
+# day goes to the bot that holds it: the IMM when its own book on the
+# dashboard has the event (a position now, or a day row yesterday or today:
+# the dashboard tracks the IMM's own fills only, so its rain, snow and BTC-vs
+# markets stay the IMM's), else the crypto fleets for a crypto asset's
+# series, the weather bots for the temperature dailies, and "other" for the
+# rest (the cloud mention bots, hand trades). Reward credits are the IMM's
+# (Kalshi's liquidity incentives), the perpetuals the crypto side's, and each
+# numbered subaccount its own bot's. Kalshi's pricing vs our mids is a gap
+# between two valuations, no bot's P&L, so it keeps its own line and the
+# lines still add up to the day change.
+BY_BOT_ENABLED = os.environ.get("PF_BY_BOT", "1") != "0"
+BOTS = ("IMM", "Crypto", "Weather", "Other")
+CRYPTO_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE", "ZEC")
+WEATHER_PREFIXES = ("KXHIGH", "KXLOWT", "KXTEMP")   # high_temp / low_temp bots, hourly temps
+SUBACCOUNT_BOTS = {1: "Other",      # nfl_snipe_bot, since 10/09
+                   2: "Weather"}    # the KXTEMPMIAH hourly-temp live test (halted 10/16)
+
+
+def imm_book_events(D, today_str: str):
+    """Event tickers in the IMM bot's own book across the digest's 7am -> 7am
+    window: a position now, or a dashboard day row (own fills, re-marks,
+    settlements, rewards) on the ET day before today_str or on today_str.
+    None without a dashboard."""
+    if not D:
+        return None
+    mk = D.get("markets") or {}
+    days = D.get("days") or {}
+    y = (datetime.strptime(today_str, "%Y-%m-%d").date() - timedelta(days=1)).isoformat()
+    tickers = {t for t, m in mk.items() if abs(_f((m or {}).get("pos"))) > 1e-9}
+    for d in (y, today_str):
+        tickers |= set((days.get(d) or {}).get("m") or {})
+    return {(mk.get(t) or {}).get("ev") or event_from_ticker(t) for t in tickers}
+
+
+def bot_of_event(event_ticker: str, imm_events) -> str:
+    """Which of BOTS a day row belongs to (see BY_BOT_ENABLED above)."""
+    if imm_events and event_ticker in imm_events:
+        return "IMM"
+    series = event_ticker.split("-", 1)[0]
+    if any(series.startswith("KX" + a) for a in CRYPTO_ASSETS):
+        return "Crypto"
+    if series.startswith(WEATHER_PREFIXES):
+        return "Weather"
+    return "Other"
+
+
 # ----------------------------------------------------------------------------
 # Data pulls
 # ----------------------------------------------------------------------------
@@ -328,15 +376,21 @@ def fetch_subaccounts(client):
 
     {"equity": $ over every numbered subaccount (its cash + Kalshi's
     portfolio_value, as the primary), "accounts": {n: $}, "moves": [(ts, $
-    into the primary)]}, None when a read fails."""
+    into the primary)], "moves_by": [(ts, n, $ that left subaccount n)]},
+    None when a read fails."""
     try:
         bals = client.get("/portfolio/subaccounts/balances").get("subaccount_balances") or []
-        moves = []
+        moves, moves_by = [], []
         for t in client.get("/portfolio/subaccounts/transfers").get("transfers") or []:
             amt = _f(t.get("amount_cents")) / 100.0
             src, dst = int(t.get("from_subaccount") or 0), int(t.get("to_subaccount") or 0)
             if (src == 0) != (dst == 0):          # numbered <-> numbered nets to 0
                 moves.append((_f(t.get("created_ts")), amt if dst == 0 else -amt))
+            # per subaccount, for the day by bot: (ts, n, $ that left
+            # subaccount n; - = arrived in it), whichever account sent it
+            for n, a in ((src, amt), (dst, -amt)):
+                if n:
+                    moves_by.append((_f(t.get("created_ts")), n, a))
         accounts = {}
         for n in sorted({int(b.get("subaccount_number") or 0) for b in bals} - {0}):
             b = client.get("/portfolio/balance", params={"subaccount": n})
@@ -346,7 +400,7 @@ def fetch_subaccounts(client):
         log(f"! subaccount read failed: {e!r}")
         return None
     return {"equity": round(sum(accounts.values()), 2), "accounts": accounts,
-            "moves": moves}
+            "moves": moves, "moves_by": moves_by}
 
 
 def estimate_unpaid_rewards(client, now_utc):
@@ -965,7 +1019,7 @@ def build_portfolio(now_utc: datetime):
     # event-rollup diff below is kept only for a prior snapshot without
     # per-market positions (none since 8/14).
     rows, no_trade_cash, net_transfers, replay_info = [], None, None, None
-    sub_moves = None
+    sub_moves = sub_moves_by = None
     prior_tickers = (prior or {}).get("tickers")
     if prior and prior_created is not None and prior_tickers:
         ev_map, start = {}, {}
@@ -1015,6 +1069,10 @@ def build_portfolio(now_utc: datetime):
         if subs is not None:
             sub_moves = round(sum(a for ts, a in subs["moves"]
                                   if prior_created.timestamp() < ts <= now_utc.timestamp()), 2)
+            sub_moves_by = {}
+            for ts, n, a in subs.get("moves_by") or []:
+                if prior_created.timestamp() < ts <= now_utc.timestamp():
+                    sub_moves_by[n] = round(sub_moves_by.get(n, 0.0) + a, 2)
         check = (sum(r["day"] for r in rows) - trade_cash
                  - (sum(v for _, v in tk_end.values()) - sum(v for _, v in start.values())))
         replay_info = {"fills": len(fills), "settlements": len(win_setts),
@@ -1066,6 +1124,7 @@ def build_portfolio(now_utc: datetime):
             "perps_equity": perps_equity, "perps": perps,
             "perps_stale": perps_stale, "subs_equity": subs_equity,
             "subs": subs, "subs_stale": subs_stale, "sub_moves": sub_moves,
+            "sub_moves_by": sub_moves_by,
             "collateral_returned": collat,
             "collateral_d": (None if (prior or {}).get("collateral_returned") is None
                              else round(collat - _f(prior["collateral_returned"]), 2)),
@@ -1504,12 +1563,62 @@ def advice_html(advice) -> str:
             f'<ul style="margin:6px 0 2px;padding-left:20px">{"".join(lis)}</ul></div>')
 
 
-def build_email(pf, history, chart_ok: bool, imm=None, advice=None):
+def sub_pnl_by(pf):
+    """{n: the day's P&L of numbered subaccount n} = its value move plus the
+    cash that left it (a move is no gain or loss). None when either
+    morning's per-account values or today's per-account moves are missing,
+    or the set of subaccounts changed."""
+    before = (pf.get("prior") or {}).get("subs")
+    now = (pf.get("subs") or {}).get("accounts")
+    moves = pf.get("sub_moves_by")
+    if not now or not before or moves is None:
+        return None
+    before = {int(k): _f(v) for k, v in before.items()}
+    if set(before) != set(now):
+        return None
+    return {n: round(_f(v) - before[n] + moves.get(n, 0.0), 2) for n, v in now.items()}
+
+
+def day_by_bot(pf, imm_events, rewards_part, d_perps, subs_pnl):
+    """The day by bot (BY_BOT_ENABLED): [(bot, $, [(label, $), ...])] over
+    BOTS. Each bot's line is its rows' trading at mid plus its own non-trade
+    lines: the reward credits (rewards_part, the split's (label, $)) for the
+    IMM, the perpetuals for crypto, each numbered subaccount for its bot.
+    These plus Kalshi's pricing vs mid make the day change. None without the
+    IMM's book (no dashboard) or the day's replay."""
+    if imm_events is None or rewards_part is None:
+        return None
+    trading = dict.fromkeys(BOTS, 0.0)
+    for r in pf["rows"]:
+        trading[bot_of_event(r["event"], imm_events)] += r["day"]
+    parts = {b: [("trading", round(trading[b], 2))] for b in BOTS}
+    parts["IMM"].append(rewards_part)
+    if d_perps is not None:
+        parts["Crypto"].append(("perpetuals", d_perps))
+    if subs_pnl is not None:
+        by = sub_pnl_by(pf)
+        if by is None:
+            parts["Other"].append(("subaccounts", subs_pnl))
+        else:
+            for n, v in sorted(by.items()):
+                parts[SUBACCOUNT_BOTS.get(n, "Other")].append((f"subaccount {n}", v))
+    return [(b, round(sum(v for _, v in parts[b]), 2), parts[b]) for b in BOTS]
+
+
+# Kalshi's reward batch usually lands before the 7am read (~10:15Z); a day
+# with no credits at all most likely means it came late (10/22, after the
+# Thursday 03:00-05:00 ET maintenance: +$0.00 at 7am, ~+$745 by 13:02 ET)
+LATE_PAYOUT_NOTE = ("no reward payout had landed by 7am; a late one shows in "
+                    "tomorrow's credits")
+
+
+def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=None):
     """(subject, text, html). `imm` is imm_section()'s result: the IMM bot's
     section goes after the movers table, and its PICK-OFF flag onto the
     subject; None leaves the email as it was before 2026-10-02. `advice` is
     imm_advice()'s result (or {"error": why}): the What-to-do block, under
-    the day change; None leaves it out."""
+    the day change; None leaves it out. `imm_events` is imm_book_events():
+    the day-by-bot block under the day change; None leaves it out."""
     today = pf["today"]
     # The "Settled since yesterday, by series" table is gone (Jack
     # 2026-09-29: "remove 'Settled since yesterday, by series'"); settled
@@ -1650,6 +1759,13 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None):
     excl = (([f"deposits/withdrawals {transfers:+,.2f}"] if transfers else [])
             + ([f"subaccount transfers {moves:+,.2f}"] if moves else []))
     excl_txt = f"  (excludes {', '.join(excl)})" if excl else ""
+    # the day by bot: the rows by bot plus each bot's own lines; Kalshi's
+    # pricing vs mid closes it to the day change
+    by_bot = None
+    if BY_BOT_ENABLED and rewards is not None and parts:
+        by_bot = day_by_bot(pf, imm_events, parts[1], d_perps, subs_pnl)
+    pricing = dict(parts or []).get("Kalshi's pricing vs mid")
+    late = rewards is not None and abs(rewards) < 1.0
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
     # +$18.2k (day +$1.6k, trading -$0.7K)", then "yes add rewards to the
@@ -1693,6 +1809,19 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None):
         lines.append(f"vs yesterday: {d_day:+,.2f}  =  "
                      + "  +  ".join(f"{k} {v:+,.2f}" for k, v in day_parts)
                      + day_tail + excl_txt)
+    if by_bot:
+        lines.append("")
+        lines.append("The day by bot (7am yesterday -> 7am today, at mid):")
+        for b, tot, ps in by_bot:
+            lines.append(f"  {b:8s} {tot:>+11,.2f}  =  "
+                         + "  +  ".join(f"{k} {v:+,.2f}" for k, v in ps)
+                         + (f"  ({LATE_PAYOUT_NOTE})" if b == "IMM" and late else ""))
+        if pricing is not None:
+            lines.append(f"  {'Kalshi':8s} {pricing:>+11,.2f}  =  Kalshi's pricing vs mid "
+                         f"(a gap between two valuations, no bot's)")
+        lines.append(f"  {'= day':8s} {d_day:>+11,.2f}")
+    elif late:
+        lines.append(f"({LATE_PAYOUT_NOTE})")
     lines.append("")
     lines += advice_text(advice)
     # the risk-controls block under the account summary, as in the html
@@ -1788,6 +1917,29 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None):
                 + ("" if not excl else
                    f' <span style="color:{C_MUTED}">{excl_txt.strip()}</span>'))
              + '</div>')
+    if by_bot:
+        h.append(f'<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
+                 f'The day by bot <span style="color:{C_MUTED};font-weight:400;'
+                 f'font-size:13px">7am yesterday &rarr; 7am today, at mid</span></div>')
+        h.append('<table style="border-collapse:collapse;font-size:13px;margin-bottom:6px">')
+        for b, tot, ps in by_bot:
+            made = ' &nbsp;+&nbsp; '.join(f'{_esc(k)} {_pnl_span(v)}' for k, v in ps)
+            if b == "IMM" and late:
+                made += f' <span style="color:{C_MUTED}">({_esc(LATE_PAYOUT_NOTE)})</span>'
+            h.append(f'<tr><td style="{TDL}font-weight:700">{b}</td>'
+                     f'<td style="{TD}font-weight:700">{_pnl_span(tot)}</td>'
+                     f'<td style="{TDL}color:{C_INK2};font-size:12px">{made}</td></tr>')
+        if pricing is not None:
+            h.append(f'<tr style="color:{C_MUTED}"><td style="{TDL}">Kalshi</td>'
+                     f'<td style="{TD}">{_pnl_span(pricing)}</td>'
+                     f'<td style="{TDL}font-size:12px">Kalshi\'s pricing vs mid (a gap '
+                     f'between two valuations, no bot\'s)</td></tr>')
+        h.append(f'<tr style="background:#f0f0f0;font-weight:700"><td style="{TDL}">Day</td>'
+                 f'<td style="{TD}">{_pnl_span(d_day)}</td><td style="{TDL}"></td></tr>')
+        h.append('</table>')
+    elif late:
+        h.append(f'<div style="color:{C_MUTED};font-size:12px;margin-bottom:6px">'
+                 f'({_esc(LATE_PAYOUT_NOTE)})</div>')
     if unpaid_note:
         h.append(f'<div style="color:{C_MUTED};font-size:12px;margin-bottom:6px">'
                  f'{unpaid_note}</div>')
@@ -2040,15 +2192,33 @@ def main(argv=None) -> int:
         if imm.get("error"):
             log(f"! IMM section unavailable: {imm['error']}")
 
+    # the IMM dashboard, read once: the What-to-do block and the IMM's book
+    # for the day by bot
+    dash, dash_err = None, None
+    if ADVICE_ENABLED or BY_BOT_ENABLED:
+        try:
+            dash = load_imm_dashboard()
+        except Exception as e:                    # never holds the email
+            dash_err = e
+            log(f"! IMM dashboard unavailable: {e!r}")
     advice = None
     if ADVICE_ENABLED:
         try:
-            advice = imm_advice(load_imm_dashboard(), today_str)
+            if dash_err is not None:
+                raise dash_err
+            advice = imm_advice(dash, today_str)
         except Exception as e:                    # never holds the email
             advice = {"error": f"{type(e).__name__}: {e}"}
             log(f"! what-to-do block unavailable: {e!r}")
+    imm_events = None
+    if BY_BOT_ENABLED and dash is not None:
+        try:
+            imm_events = imm_book_events(dash, today_str)
+        except Exception as e:                    # never holds the email
+            log(f"! day by bot unavailable: {e!r}")
 
-    subject, text, html = build_email(pf, history_preview, chart_ok, imm, advice=advice)
+    subject, text, html = build_email(pf, history_preview, chart_ok, imm, advice=advice,
+                                      imm_events=imm_events)
     if args.test:
         subject = "[TEST] " + subject
     html_path = os.path.join(LOG_DIR, f"digest_{today_str}.html")

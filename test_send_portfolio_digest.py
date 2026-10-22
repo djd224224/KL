@@ -1191,5 +1191,110 @@ class AdviceTests(unittest.TestCase):
         self.assertNotIn("What to do", text + html)
 
 
+class DayByBotTests(unittest.TestCase):
+    """Jack 2026-10-22: "in the email, clearly show daily only split between
+    IMM vs crypto vs weather vs other" -- and, the same morning, "Did
+    incentive rewards not pay out yesterday? Didn't see it in the daily
+    digest email" (the payout landed after the 7am read: credits +0.00)."""
+
+    IMM = {"KXRAIN-26OCT22", "KXBTCVSGOLD-26"}
+
+    def test_each_event_goes_to_its_bot(self):
+        b = pf.bot_of_event
+        self.assertEqual(b("KXRAIN-26OCT22", self.IMM), "IMM")
+        self.assertEqual(b("KXBTCVSGOLD-26", self.IMM), "IMM")      # the IMM's book wins
+        self.assertEqual(b("KXBTCD-26OCT2217", self.IMM), "Crypto")
+        self.assertEqual(b("KXSOLD26-26DEC31", self.IMM), "Crypto")
+        self.assertEqual(b("KXHIGHNY-26OCT22", self.IMM), "Weather")
+        self.assertEqual(b("KXLOWTCHI-26OCT23", self.IMM), "Weather")
+        self.assertEqual(b("KXNBAMENTION-26OCT22LAL", self.IMM), "Other")
+        self.assertEqual(b("KXRAIN-26OCT22", None), "Other")
+
+    def test_the_imm_book_is_its_positions_and_its_day_rows(self):
+        D = {"markets": {"KXRAIN-26OCT22-NYC": {"ev": "KXRAIN-26OCT22", "pos": 0.0},
+                         "KXA-26-X": {"ev": "KXA-26", "pos": -5.0},
+                         "KXB-26-Y": {"ev": "KXB-26", "pos": 0.0},
+                         "KXOLD-26-Z": {"ev": "KXOLD-26", "pos": 0.0}},
+             "days": {"2026-10-20": {"m": {"KXOLD-26-Z": []}},
+                      "2026-10-21": {"m": {"KXRAIN-26OCT22-NYC": []}},
+                      "2026-10-22": {"m": {"KXC-26-W": []}}}}
+        self.assertEqual(pf.imm_book_events(D, "2026-10-22"),
+                         {"KXRAIN-26OCT22", "KXA-26", "KXC-26"})
+        self.assertIsNone(pf.imm_book_events(None, "2026-10-22"))
+
+    def test_subaccount_moves_are_kept_per_account(self):
+        s = pf.fetch_subaccounts(_FakeSubaccountClient())
+        self.assertEqual(s["moves_by"], [(1791509617.0, 1, -300.0), (1791520000.0, 1, 50.0),
+                                         (1791530000.0, 1, 40.0), (1791530000.0, 2, -40.0)])
+
+    def _pf(self, ntc=700.0, moves_by=None):
+        # rows: the IMM's rain -100, a crypto fleet +20, the high-temp bot
+        # -30, a cloud mention bot +5; reward credits = ntc; Kalshi's pricing
+        # vs mid closes the primary's +500 move; perps -4; subaccount 1 +10,
+        # subaccount 2 -4
+        rows = [_row("KXRAIN-26OCT22", value_d=-100.0), _row("KXBTCD-26OCT2217", realized=20.0),
+                _row("KXHIGHNY-26OCT22", realized=-30.0),
+                _row("KXNBAMENTION-26OCT22LAL", value_d=5.0)]
+        prior = {"equity_kalshi": 40000.0, "perps_equity": 100.0, "subs_equity": 1204.0,
+                 "subs": {"1": 300.0, "2": 904.0}}
+        return {"today": "2026-10-22", "rows": rows, "first_run": False, "prior": prior,
+                "equity_kalshi": 40500.0, "cash": 20000.0, "kalshi_positions_value": 20500.0,
+                "equity": 40500.0, "positions_value": 20500.0,
+                "perps_equity": 96.0, "perps_stale": False,
+                "perps": {"equity": 96.0, "positions": []},
+                "subs_equity": 1210.0, "subs_stale": False,
+                "subs": {"accounts": {1: 310.0, 2: 900.0}, "moves": []},
+                "sub_moves": 0.0, "sub_moves_by": {} if moves_by is None else moves_by,
+                "account_value": 41806.0, "unpaid": None,
+                "no_trade_cash": ntc, "net_transfers": 0.0, "collateral_d": 0.0,
+                "total_profit": 13306.0, "deposited": 28500.0, "withdrawn": 0.0}
+
+    def test_the_block_splits_the_day_and_adds_up(self):
+        p = self._pf()
+        _, text, html = pf.build_email(p, [], chart_ok=False, imm_events=self.IMM)
+        self.assertIn("vs yesterday: +502.00", text)
+        self.assertIn("The day by bot (7am yesterday -> 7am today, at mid):", text)
+        self.assertIn("+600.00  =  trading -100.00  +  reward credits +700.00\n", text)
+        self.assertIn("+16.00  =  trading +20.00  +  perpetuals -4.00\n", text)
+        self.assertIn("-34.00  =  trading -30.00  +  subaccount 2 -4.00\n", text)
+        self.assertIn("+15.00  =  trading +5.00  +  subaccount 1 +10.00\n", text)
+        self.assertIn("-95.00  =  Kalshi's pricing vs mid", text)
+        self.assertIn("= day        +502.00", text)
+        # 600 + 16 - 34 + 15 - 95 = 502, the day change
+        self.assertLess(text.index("vs yesterday:"), text.index("The day by bot"))
+        self.assertIn(">The day by bot <", html)
+        self.assertIn(">Weather</td>", html)
+        self.assertNotIn(pf.LATE_PAYOUT_NOTE, text)
+
+    def test_no_reward_credits_says_the_payout_was_late(self):
+        _, text, html = pf.build_email(self._pf(ntc=0.0), [], chart_ok=False,
+                                       imm_events=self.IMM)
+        self.assertIn("+  reward credits +0.00  (" + pf.LATE_PAYOUT_NOTE + ")", text)
+        self.assertIn(pf.LATE_PAYOUT_NOTE, html)
+        # without the dashboard the block is gone but the note stays
+        _, text, _ = pf.build_email(self._pf(ntc=0.0), [], chart_ok=False)
+        self.assertNotIn("The day by bot", text)
+        self.assertIn("(" + pf.LATE_PAYOUT_NOTE + ")", text)
+
+    def test_unknown_per_account_moves_lump_the_subaccounts_into_other(self):
+        p = self._pf()
+        p["sub_moves_by"] = None
+        _, text, _ = pf.build_email(p, [], chart_ok=False, imm_events=self.IMM)
+        self.assertIn("+11.00  =  trading +5.00  +  subaccounts +6.00\n", text)
+        self.assertIn("-30.00  =  trading -30.00\n", text)
+
+    def test_a_move_out_of_a_subaccount_is_no_loss(self):
+        # $50 left subaccount 1 for the primary: it reads 260 not 310, the
+        # primary's no-trade cash is +50 more, and neither is the day
+        p = self._pf(ntc=750.0, moves_by={1: 50.0})
+        p["equity_kalshi"] = 40550.0
+        p["subs"]["accounts"][1] = 260.0
+        p["subs_equity"] = 1160.0
+        p["sub_moves"] = 50.0
+        _, text, _ = pf.build_email(p, [], chart_ok=False, imm_events=self.IMM)
+        self.assertIn("+15.00  =  trading +5.00  +  subaccount 1 +10.00\n", text)
+        self.assertIn("+600.00  =  trading -100.00  +  reward credits +700.00\n", text)
+
+
 if __name__ == "__main__":
     unittest.main()
