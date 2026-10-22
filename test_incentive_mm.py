@@ -19946,9 +19946,28 @@ class TestYouTube2Pilot(unittest.TestCase):
         _clean_persist()
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
+        # the pilot ENDED 2026-10-22 (YT2_ENDED); these tests keep its rules
+        # covered for an IMM_YT2_ENDED=0 revival
+        self._ended_default = imm.YT2_ENDED
+        p = mock.patch.object(imm, "YT2_ENDED", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def test_the_pilot_is_ended_by_default(self):
+        """Jack 2026-10-22: "Yes do it" (end YouTube #2): -$98 over 18 days.
+        Its series are blocked, so nothing quotes; IMM_YT2_ENDED=0 revives."""
+        self.assertTrue(self._ended_default)
+        self.assertIn("YT2_ENDED", imm._CONFIG_CODE_KNOBS)
+        with mock.patch.object(imm, "YT2_ENDED", True):
+            self.assertTrue(IncentiveMarketMaker._blocked(self.T))
+            self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+        self.assertFalse(IncentiveMarketMaker._blocked(self.T))
 
     def _bot(self):
         client = FakeClient()
@@ -29640,6 +29659,30 @@ class TestRateLimitWatch(unittest.TestCase):
                 c.raise_if_bad_response(resp(m))
         self.assertEqual((self.counter["writes"], self.counter["reads"], self.counter["last"]),
                          (2, 1, "GET /trade-api/v2/portfolio/events/orders"))
+
+
+class TestTreasuryEarlyBlackout(unittest.TestCase):
+    """Jack 2026-10-22: "Yes do it" -- keep the 10-year Treasury daily out
+    06:00-07:00 ET on weekdays: its 6 AM fills lost $249 since 9/25 for $10
+    of reward in that hour."""
+
+    def test_the_10y_daily_is_out_6_to_7_et_on_weekdays(self):
+        ov = imm.series_override("KXUST10AD")
+        self.assertEqual(ov.blackout_et, ("06:00", "07:00"))
+        self.assertTrue(ov.blackout_weekdays_only)
+        for k in ("UST_EARLY_BLACKOUT_ET", "UST_EARLY_BLACKOUT_SERIES"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        utc = timezone.utc
+        wed_0630 = datetime(2026, 10, 21, 10, 30, tzinfo=utc)     # 06:30 EDT, a Wednesday
+        self.assertTrue(imm.series_in_blackout("KXUST10AD", wed_0630))
+        self.assertTrue(imm.series_in_blackout("KXUST10AD", datetime(2026, 10, 21, 10, 0, tzinfo=utc)))
+        self.assertFalse(imm.series_in_blackout("KXUST10AD", datetime(2026, 10, 21, 11, 0, tzinfo=utc)))
+        self.assertFalse(imm.series_in_blackout("KXUST10AD", datetime(2026, 10, 21, 9, 59, tzinfo=utc)))
+        # the weekend quotes on (nothing reprices a Monday print at 6 AM Saturday)
+        self.assertFalse(imm.series_in_blackout("KXUST10AD", datetime(2026, 10, 24, 10, 30, tzinfo=utc)))
+        # the other Treasury dailies are untouched
+        for s in ("KXUST2AD", "KXUST5AD", "KXUST7AD", "KXUST30AD"):
+            self.assertFalse(imm.series_in_blackout(s, wed_0630), s)
 
 
 class TestMentionAnnounceHalt(unittest.TestCase):

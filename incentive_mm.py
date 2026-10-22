@@ -8488,6 +8488,28 @@ for _s in os.environ.get(
             blackout_et=tuple(os.environ.get(
                 "IMM_AAA_BLACKOUT_ET", "03:05-04:00").split("-")))
 
+# 10-YEAR TREASURY DAILY OUT 06:00-07:00 ET ON WEEKDAYS (Jack 2026-10-22: "Yes
+# do it", to "End YouTube #2 and keep the 10-year out from 6 to 7 AM ET?").
+# Since 9/25 KXUST10AD lost $201 on its fills, $249 of it in the 6 AM ET hour
+# -- 13 fills / 717 contracts, every such morning a loser (9/30 -$13, 10/01
+# -$88, 10/08 -$96, 10/14 -$7, 10/20 -$0.50, 10/21 -$44), often 135-270-lots
+# -- for $10 of reward in that hour; its other hours made about +$48 on fills
+# and $151 of reward. The other Treasury dailies barely fill and never did at
+# 6 AM. The quote loop's blackout path (series_in_blackout) cancels the
+# series' orders and holds its markets through the window; selection is
+# untouched. In-sample on 13 fills. IMM_UST_EARLY_BLACKOUT_SERIES ("" = none)
+# and IMM_UST_EARLY_BLACKOUT_ET; a series with its own blackout keeps it.
+UST_EARLY_BLACKOUT_ET = tuple(os.environ.get(
+    "IMM_UST_EARLY_BLACKOUT_ET", "06:00-07:00").split("-"))
+UST_EARLY_BLACKOUT_SERIES = tuple(
+    s.strip() for s in os.environ.get(
+        "IMM_UST_EARLY_BLACKOUT_SERIES", "KXUST10AD").split(",") if s.strip())
+for _s in UST_EARLY_BLACKOUT_SERIES:
+    if _s in SERIES_OVERRIDES and not SERIES_OVERRIDES[_s].blackout_et:
+        SERIES_OVERRIDES[_s] = replace(
+            SERIES_OVERRIDES[_s], blackout_et=UST_EARLY_BLACKOUT_ET,
+            blackout_weekdays_only=True)
+
 # GAS TRIAL: 1PM-MIDNIGHT ET (Jack 2026-10-01: "adjust all three to trade
 # 1pm-midnight. and report on results at the 1 week and 2 week marks", then
 # "National + diesel only"). The national gas daily and the diesel daily
@@ -9753,6 +9775,8 @@ _CONFIG_CODE_KNOBS = (
     "YT2_CHART_DAY_CUTOFF", "YT2_CUTOFF_BEFORE_DAY_END_MIN",
     "YT2_MAX_POSITION", "YT2_REF_MULT_CAP", "YT2_EVENT_CAP", "YT2_DAILY_LOSS_LIMIT",
     "YT2_FILL_PAUSE_MIN",         # the fill pause (2026-10-14)
+    "YT2_ENDED",                  # the pilot ended (2026-10-22)
+    "UST_EARLY_BLACKOUT_ET", "UST_EARLY_BLACKOUT_SERIES",   # 10Y 06-07 ET (2026-10-22)
     # YouTube #1 leader-bid pilot (2026-10-14); yt_top1_fair's knobs are
     # its own IMM_YT1_* env vars
     "YT1_MODE", "YT1_EDGE_CENTS", "YT1_MIN_P", "YT1_MAX_POSITION", "YT1_EVENT_CAP",
@@ -13255,6 +13279,16 @@ YT2_DAILY_LOSS_LIMIT = _env_float("IMM_YT2_DAILY_LOSS_LIMIT", 40)
 # minutes a maker fill of ours stands its event aside (see THE 2026-10-14
 # CHANGES); a later fill extends it; 0 = off
 YT2_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_YT2_FILL_PAUSE_MIN", 60))
+# PILOT ENDED (Jack 2026-10-22: "Yes do it", to "End YouTube #2 and keep the
+# 10-year out from 6 to 7 AM ET?"). Over its 18 days (10/05-10/22) the pilot
+# made -$98: $107 of bot-estimated reward against -$205 of trading, negative
+# on 11 days, about -$10/day both before and after THE 2026-10-14 CHANGES (the
+# 60-min fill pause cut its reward to ~$3/day without stopping the losses).
+# While YT2_ENDED its series are BLOCKED (IncentiveMarketMaker._blocked): out
+# of selection at the next refresh, resting orders cancelled with it,
+# positions ride to settlement. IMM_YT2_ENDED=0 brings the pilot back with
+# every rule above.
+YT2_ENDED = os.environ.get("IMM_YT2_ENDED", "1") == "1"
 
 for _s in YT2_SERIES:
     SERIES_OVERRIDES[_s] = replace(
@@ -22053,6 +22087,9 @@ class IncentiveMarketMaker:
                     ticker.rsplit("-", 1)[0] not in BLOCKLIST_WIND_DOWN_EVENTS \
                     and not cpi_pilot_active(ticker):
                 return True
+        # the YouTube #2 pilot, ended 2026-10-22 (YT2_ENDED)
+        if YT2_ENDED and yt2_series(series_of(ticker)):
+            return True
         # Strike-suffix block (MARKET_BLOCK_SUFFIXES, the -NQE leg): only a
         # MARKET ticker has a strike segment -- two dashes or more. Event
         # tickers and the "<series>-X" probe have one and fall through.
@@ -25845,11 +25882,13 @@ class IncentiveMarketMaker:
             if series_in_blackout(meta.series, now_utc):
                 n = self.cancel_market_orders(t, resting)
                 cpi = meta.series in CPI_PILOT_SERIES
+                ust = meta.series in UST_EARLY_BLACKOUT_SERIES   # 10Y 06-07 ET (2026-10-22)
                 if n:
                     log(f"{self.tag} {t}: "
-                        f"{'CPI pilot release blackout' if cpi else 'AAA print blackout'}"
-                        f"; cancelled {n}")
-                self._gskip(t, "cpi_blackout" if cpi else "aaa_blackout", lambda: dict(n_cx=n))
+                        + ("CPI pilot release blackout" if cpi else
+                           "Treasury 06-07 ET blackout" if ust else "AAA print blackout")
+                        + f"; cancelled {n}")
+                self._gskip(t, "cpi_blackout" if cpi else "ust_blackout" if ust else "aaa_blackout", lambda: dict(n_cx=n))
                 continue
             if meta.close_time is not None and \
                     (meta.close_time - now_utc).total_seconds() \
@@ -29630,7 +29669,10 @@ class IncentiveMarketMaker:
                 + f", file {VERCEL_FAIR_FILE}")
         else:
             log("vercel gate: OFF -- the Vercel series are not enrolled")
-        if YT2_ENABLE:
+        if YT2_ENABLE and YT2_ENDED:
+            log(f"yt2 pilot: ENDED 2026-10-22 -- {','.join(sorted(YT2_SERIES))} "
+                f"blocked, positions ride (IMM_YT2_ENDED=0 brings it back)")
+        elif YT2_ENABLE:
             yt2_paused = sum(1 for u in list(self.state.yt2_fill_pause_until.values())
                              if u > time.time())
             log(f"yt2 pilot: {','.join(sorted(YT2_SERIES))} quoted plain to "
@@ -29651,6 +29693,13 @@ class IncentiveMarketMaker:
                        datetime.now(timezone.utc)) else ""))
         else:
             log("yt2 pilot: OFF -- the YouTube #2 series are not enrolled")
+        _ust_bo = [s for s in UST_EARLY_BLACKOUT_SERIES
+                   if (series_override(s) or SeriesOverride()).blackout_et
+                   == UST_EARLY_BLACKOUT_ET]
+        if _ust_bo:
+            log(f"Treasury early blackout (2026-10-22): {','.join(_ust_bo)} out "
+                f"{'-'.join(UST_EARLY_BLACKOUT_ET)} ET on weekdays -- orders "
+                f"cancelled, markets held (its 6 AM fills lost $249 since 9/25)")
         log(f"yt1 pilot ({YT1_SERIES}): {YT1_MODE.upper()}"
             + ("" if YT1_MODE == "off" else
                f" -- a YES bid on yt_top1_fair's leader only, at most P - "
