@@ -111,10 +111,13 @@ OPEN_SERIES = "KXOPENSOURCESHARE"
 # baseten since 2026-10-21, the model-coverage gap: its two gateway models,
 # Elephant-1 and Mammoth-1 (released 10/20), are both tagged open-weights in
 # the gateway's model list (the DeepSeek / Nemotron models it serves count
-# under their own labs)
+# under their own labs); reflection since 2026-10-22: Vercel's chart began
+# counting Beam 1.0 (both its gateway models tagged open-weights) between the
+# D = 10/18 and 10/20 settlements -- 10/20 settled 68.3 vs this sum's 60.7,
+# 66.9 with reflection's 6.1% of tokens; 10/18 settled 62.9 vs 63.4 without it
 OPEN_WEIGHT_LABS = ("deepseek", "zai", "moonshotai", "stepfun", "xiaomi", "minimax",
                     "alibaba", "inclusionai", "nvidia", "tencent", "meituan", "arcee-ai",
-                    "baseten")
+                    "baseten", "reflection")
 ALL_SERIES = tuple(LAB_SERIES) + (OPEN_SERIES,)
 
 

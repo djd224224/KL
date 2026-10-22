@@ -10829,3 +10829,20 @@ starts 1998-03, every 1980s December missing -- and "Trenton" to CITY_CODES.
 Dry run: P(December total > 4/8/12/16/20/24 in) = 35 / 20 / 8 / 1.9 / 0.4 /
 0.06% from 46 Decembers. snow_monthly_fair is imported by the IMM's refresher
 thread: deploy = restart_imm.ps1. Test lists gain Trenton.
+
+## 2026-10-22 ~04:45Z — Vercel fair: reflection joins OPEN_WEIGHT_LABS (Jack: "1" = ship the Reflection fix and restart, after the 10/22 Vercel re-test)
+
+KXOPENSOURCESHARE settles on Vercel's "Open vs. Closed Token Volume" chart, model-level. Between the D = 10/18
+and 10/20 settlements that chart began counting Reflection's Beam 1.0 as open. Both Reflection gateway models
+(reflection/beam, reflection/beam-free) are tagged open-weights in ai-gateway.vercel.sh/v1/models.
+- D = 10/20 settled 68.3 against the lab-sum rebuild's 60.7 (-7.6 pp). Reflection had 6.1% of tokens that day;
+  with it the rebuild reads 66.9.
+- D = 10/18 settled 62.9 against 63.4. With Reflection's 5.0% it would have read 68.4, so it was not counted then.
+- Reflection is 7.4% on 10/21 and 7.9% on the running 10/22 day; the 26OCT23 book prices ~67-68.
+- Dry run at 04:15Z: x_l 60.7 -> 68.6, and the 26OCT25 median 66.1 -> 74.6. The 15c gate then stands T69.1 /
+  T70.1 / T73.0 aside, where the bot rested YES asks at 53 / 45 / 39 that the corrected fair values at 71 / 67 / 56c.
+- Labs whose gateway models are all open-weights but which stay out of the list: poolside, cohere and
+  thinkingmachines, under 0.15% of tokens together.
+- Study: KL-data/vercel-logger/analysis-2026-10-21/verdict.md.
+Deploy: helper module, so restart_imm.ps1 (plain). Check: vercel_fair.json "model" open_weight_labs ends with
+"reflection", and the KXOPENSOURCESHARE entries' x_l reads ~68.
