@@ -2395,6 +2395,152 @@ def series_in_blackout(series: str, now_utc: datetime) -> bool:
     return start <= cur < end if start <= end else (cur >= start or cur < end)
 
 
+# STATE STATISTICS RELEASE PAUSE (Jack 2026-10-22: "Can you pause state
+# statistics around monthly releases"). The ECONSTATE books (the 10/13 auto
+# family, the 10/03 scan graduates) settle months out on a state statistic the
+# agency republishes every month: KXTNTRANSEMP-27APR30 settles on BLS series
+# SMU47000003133600001's 2026 annual average, so each monthly State Employment
+# and Unemployment release -- and the national Employment Situation that state
+# payrolls track -- moves its fair while our quotes rest. A market whose rules
+# cite a source on RELEASE_CALENDAR_FILE stands fully aside from
+# RELEASE_PAUSE_BEFORE_MIN before each release to RELEASE_PAUSE_AFTER_MIN after,
+# through the blackout path (orders cancelled, the market kept). The sources
+# come from the rules text as markets load (release_sources_from_rules); the
+# calendar is the agencies' published times, re-read when the file changes.
+# A source whose dates run out within RELEASE_CALENDAR_WARN_DAYS logs a warning
+# once a day: BLS posts a year's state dates late in the year before.
+# WHY 8 HOURS BEFORE TO 24 AFTER: around the 10/20 State release (10:00 ET)
+# the 22 mapped series took 22 maker fills from 02:49 ET that night to 08:05
+# ET the next morning, -$58 to date (Missouri manufacturing bid 60 @ 75c at
+# 02:49 ET, 51c by 10:15) -- ~40% of their fill losses since 9/24 in one day,
+# against ~-$3/day on the other days. 30 minutes / 3 hours would have kept
+# -$11 of it. Reward forgone: ~9% of the time on ~$0.50/day series.
+# IMM_RELEASE_PAUSE=0 turns it off.
+RELEASE_PAUSE = os.environ.get("IMM_RELEASE_PAUSE", "1") == "1"
+RELEASE_PAUSE_BEFORE_MIN = _env_float("IMM_RELEASE_PAUSE_BEFORE_MIN", 480)
+RELEASE_PAUSE_AFTER_MIN = _env_float("IMM_RELEASE_PAUSE_AFTER_MIN", 1440)
+RELEASE_CALENDAR_WARN_DAYS = _env_float("IMM_RELEASE_CALENDAR_WARN_DAYS", 35)
+RELEASE_CALENDAR_FILE = os.environ.get(
+    "IMM_RELEASE_CALENDAR_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "release_calendar.json"))
+# BLS state series ids: SM[SU] + state FIPS (2) + area (5, 00000 = statewide)
+# + industry (8) + data type (2); LA[SU] + ST|MT + the area for LAUS. A state
+# code 00 is national CES, which is not a state statistic.
+_BLS_SM_RE = re.compile(r"\bSM[SU](\d{2})(\d{5})\d{10}\b")
+_BLS_LA_RE = re.compile(r"\bLA[SU](ST|MT)(\d{2})\d{13}\b")
+# BLS QCEW, quarterly: KXAZSEMIJOBS / KXKYDISTEMP name it, not a series id
+_BLS_QCEW_RE = re.compile(r"\bQCEW\b|Quarterly Census of Employment and Wages", re.I)
+# ...and state payrolls described in words (KXOHMFGEMP "BLS's officially
+# published 2026 annual-average Manufacturing employment for Ohio", KXPAMFGEMP,
+# KXWAAEROEMP): BLS + employment wording + a state, with no id
+_BLS_TEXT_RE = re.compile(r"\bBLS\b|Bureau of Labor Statistics")
+_BLS_EMPLOY_RE = re.compile(r"employ|payroll|\bjobs\b", re.I)
+_US_STATE_RE = re.compile(
+    r"\b(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|"
+    r"Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|"
+    r"Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|"
+    r"Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|"
+    r"North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|"
+    r"South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|"
+    r"Wisconsin|Wyoming|District of Columbia|Puerto Rico)\b|\bin states and selected areas")
+_SERIES_RELEASE_SOURCES: Dict[str, Tuple[str, ...]] = {}
+_release_cal: dict = {"mtime": None, "checked": 0.0, "sources": {}}
+_release_warned: Dict[str, str] = {}             # source -> ET day of its last warning
+
+
+def release_sources_from_rules(text: str) -> Tuple[str, ...]:
+    """The release-calendar sources a market's rules tie it to: a statewide
+    BLS series -> the State release and the Employment Situation; a metro one
+    adds the Metropolitan release; BLS QCEW -> its quarterly release."""
+    out: List[str] = []
+    for st, area in _BLS_SM_RE.findall(text or ""):
+        if st == "00":
+            continue
+        out += (["bls_state", "bls_empsit"] if area == "00000"
+                else ["bls_metro", "bls_state", "bls_empsit"])
+    for kind, st in _BLS_LA_RE.findall(text or ""):
+        if st == "00":
+            continue
+        out += (["bls_state", "bls_empsit"] if kind == "ST"
+                else ["bls_metro", "bls_state", "bls_empsit"])
+    if _BLS_QCEW_RE.search(text or ""):
+        out.append("bls_qcew")
+    elif not out and _BLS_TEXT_RE.search(text or "") and _BLS_EMPLOY_RE.search(text) \
+            and _US_STATE_RE.search(text):
+        out += ["bls_state", "bls_empsit"]
+    return tuple(dict.fromkeys(out))
+
+
+def note_release_sources(series: str, market: Optional[dict]) -> None:
+    """Map `series` to its release sources from a market's rules: the first
+    market whose rules name one sets it (a market without them leaves the
+    series for the next)."""
+    if not RELEASE_PAUSE or series in _SERIES_RELEASE_SOURCES or not isinstance(market, dict):
+        return
+    srcs = release_sources_from_rules(
+        " ".join(str(market.get(k) or "") for k in ("rules_primary", "rules_secondary")))
+    if srcs:
+        _SERIES_RELEASE_SOURCES[series] = srcs
+        log(f"[IMM] release pause: {series} -> {'+'.join(srcs)}")
+
+
+def load_release_calendar(force: bool = False) -> Dict[str, Tuple[str, List[datetime]]]:
+    """{source: (name, sorted UTC release times)} from RELEASE_CALENDAR_FILE,
+    re-read when its mtime changes (looked at once a minute). An unreadable
+    file keeps the last good read."""
+    now = time.time()
+    if not force and now - _release_cal["checked"] < 60:
+        return _release_cal["sources"]
+    _release_cal["checked"] = now
+    try:
+        mt = os.path.getmtime(RELEASE_CALENDAR_FILE)
+    except OSError:
+        return _release_cal["sources"]
+    if mt == _release_cal["mtime"]:
+        return _release_cal["sources"]
+    _release_cal["mtime"] = mt
+    try:
+        with open(RELEASE_CALENDAR_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        sources = {}
+        for key, rec in (raw.get("sources") or {}).items():
+            times = sorted(ET.localize(datetime.strptime(s, "%Y-%m-%d %H:%M"))
+                           .astimezone(timezone.utc) for s in rec.get("times_et") or [])
+            sources[key] = (str(rec.get("name") or key), times)
+        _release_cal["sources"] = sources
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        log(f"[IMM] ! release calendar {RELEASE_CALENDAR_FILE} unreadable "
+            f"({type(e).__name__}: {e}) -- keeping the last good read")
+    return _release_cal["sources"]
+
+
+def series_release_window(series: str, now_utc: datetime) -> Optional[Tuple[str, datetime]]:
+    """(release name, release time UTC) while `series` is inside a release
+    pause, else None."""
+    srcs = _SERIES_RELEASE_SOURCES.get(series) if RELEASE_PAUSE else None
+    if not srcs:
+        return None
+    cal = load_release_calendar()
+    before = timedelta(minutes=RELEASE_PAUSE_BEFORE_MIN)
+    after = timedelta(minutes=RELEASE_PAUSE_AFTER_MIN)
+    hit = None
+    for s in srcs:
+        name, times = cal.get(s, (s, []))
+        last = times[-1] if times else None
+        day = now_utc.astimezone(ET).strftime("%Y-%m-%d")
+        if (last is None or last < now_utc + timedelta(days=RELEASE_CALENDAR_WARN_DAYS)) \
+                and _release_warned.get(s) != day:
+            _release_warned[s] = day
+            log(f"[IMM] ! release calendar: {name} has "
+                + (f"no date after {last.astimezone(ET):%Y-%m-%d}" if last else "no dates")
+                + f" -- add the next ones to {os.path.basename(RELEASE_CALENDAR_FILE)} "
+                  f"(state statistics pause around them)")
+        for t in times:
+            if hit is None and t - before <= now_utc < t + after:
+                hit = (name, t)
+    return hit
+
+
 def series_fast_lane(series: str) -> bool:
     """Membership in the FAST_LANE_SECS mini-cycle set (KXTEMP by default)."""
     ov = SERIES_OVERRIDES.get(series)
@@ -16060,6 +16206,7 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     <Year>" -- gets RELEASE_GUARD_UNKNOWN, a cutoff already in the past: a
     producer that forgets the object stands the market down rather than
     quoting it through the print on the ticker-date fallback."""
+    note_release_sources(series, market)       # the release pause's map (2026-10-22)
     ov = SERIES_OVERRIDES.get(series)
     # NOTE the event-day EXTENDER (event_day_cutoff_et) deliberately does NOT
     # live here — it shifts the ticker-date CANDIDATE inside trade_cutoff_utc,
@@ -26687,6 +26834,16 @@ class IncentiveMarketMaker:
                         + f"; cancelled {n}")
                 self._gskip(t, "cpi_blackout" if cpi else "ust_blackout" if ust else "aaa_blackout", lambda: dict(n_cx=n))
                 continue
+            # STATE STATISTICS RELEASE PAUSE (2026-10-22): the same stand-aside
+            # around each release of the agency the market's rules cite
+            rel = series_release_window(meta.series, now_utc)
+            if rel is not None:
+                n = self.cancel_market_orders(t, resting)
+                if n:
+                    log(f"{self.tag} {t}: release pause ({rel[0]}, "
+                        f"{rel[1].astimezone(ET):%m-%d %H:%M} ET); cancelled {n}")
+                self._gskip(t, "release_pause", lambda: dict(n_cx=n, release=rel[0], at=rel[1].isoformat()))
+                continue
             if meta.close_time is not None and \
                     (meta.close_time - now_utc).total_seconds() \
                     < series_min_hours_to_close(meta.series) * 3600:
@@ -30618,6 +30775,19 @@ class IncentiveMarketMaker:
             log(f"Treasury early blackout (2026-10-22): {','.join(_ust_bo)} out "
                 f"{'-'.join(UST_EARLY_BLACKOUT_ET)} ET on weekdays -- orders "
                 f"cancelled, markets held (its 6 AM fills lost $249 since 9/25)")
+        if RELEASE_PAUSE:
+            _cal = load_release_calendar(force=True)
+            _now = datetime.now(timezone.utc)
+            _nxt = sorted((t, name) for name, ts in _cal.values() for t in ts if t > _now)
+            log(f"release pause (2026-10-22): state statistics stand aside "
+                f"{RELEASE_PAUSE_BEFORE_MIN:g}m before to {RELEASE_PAUSE_AFTER_MIN:g}m after "
+                f"each release on {os.path.basename(RELEASE_CALENDAR_FILE)} ("
+                + ("; ".join(f"{k} to {v[1][-1].astimezone(ET):%Y-%m-%d}" for k, v in _cal.items() if v[1])
+                   or "no dates")
+                + (f"; next {_nxt[0][1]} {_nxt[0][0].astimezone(ET):%m-%d %H:%M} ET" if _nxt else "")
+                + "); series map from their market rules as they load")
+        else:
+            log("release pause: OFF (IMM_RELEASE_PAUSE=0)")
         log(f"yt1 pilot ({YT1_SERIES}): {YT1_MODE.upper()}"
             + ("" if YT1_MODE == "off" else
                f" -- a YES bid on yt_top1_fair's leader only, at most P - "

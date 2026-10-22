@@ -10870,3 +10870,37 @@ Dry run at 14:49Z: x_l 69.41 -> 70.82. The 26OCT25 medians move +1.3-1.4 pp. T73
 so the 15c gate stands its ask aside. Lab series unchanged.
 Deploy: helper modules, so restart_imm.ps1 (plain) after the KL sync. Check: vercel_fair.json anchor.open_source
 "chart", and the KXOPENSOURCESHARE x_l equals today's chart value.
+
+## 2026-10-22 ~19:30Z — state statistics release pause (Jack: "Can you pause state statistics around monthly releases")
+
+The ECONSTATE books (the 10/13 auto family and the 10/03 scan graduates) settle months out on a state statistic
+that is republished every month. For example, KXTNTRANSEMP-27APR30 settles on BLS SMU47000003133600001's 2026
+annual average.
+- New release_calendar.json in the repo: source -> name + ET times. The bot re-reads it when it changes; no restart.
+  - bls_state: BLS State Employment and Unemployment, 10:00 ET.
+  - bls_metro: BLS Metropolitan Area release.
+  - bls_qcew: BLS County Employment and Wages (QCEW), quarterly.
+  - bls_empsit: BLS Employment Situation, 08:30 ET.
+  - Dates are BLS's published ones: state and metro through 12/2026 (BLS hasn't posted 2027), the Employment
+    Situation through 12/2027, QCEW 2026.
+- release_sources_from_rules reads each series' market rules as markets load (apply_series_cutoff_adjustments):
+  - SM[SU] + a state code -> bls_state + bls_empsit; a metro area adds bls_metro.
+  - LA[SU]ST / MT -> the same.
+  - "QCEW" -> bls_qcew.
+  - BLS + employment wording + a state name with no series id (KXOHMFGEMP, KXPAMFGEMP, KXWAAEROEMP)
+    -> bls_state + bls_empsit.
+  - Of the 128 state series checked, 22 map (20 BLS state jobs, 2 QCEW).
+- A mapped market stands aside from RELEASE_PAUSE_BEFORE_MIN (480) before each release to RELEASE_PAUSE_AFTER_MIN
+  (1440) after. It goes through the blackout path: orders cancelled, market kept. Guard skip "release_pause"; log
+  "release pause (<release>, <time> ET); cancelled N".
+- Why so wide: on the 10/20 State release the 22 series took 22 fills from 02:49 ET that night to 08:05 ET the next
+  morning, -$58 to date. That is ~40% of their fill losses since 9/24, against about -$3 on any other day. A
+  30-minute / 3-hour window would have kept -$11 of it.
+- A source whose dates end within RELEASE_CALENDAR_WARN_DAYS (35) logs "! release calendar: ... has no date after
+  ..." once a day. Add BLS's 2027 state / metro / QCEW dates when they post.
+- Not covered yet (no calendar): USDA NASS (11 series), EIA (6), Census permits (4), FHFA HPI (5), and about 30
+  tourism / port / airport / state-agency series.
+- Knobs: IMM_RELEASE_PAUSE=0, IMM_RELEASE_PAUSE_BEFORE_MIN, IMM_RELEASE_PAUSE_AFTER_MIN,
+  IMM_RELEASE_CALENDAR_FILE.
+Deploy: incentive_mm.py change, so the sync's code-change restart. Check the startup line "release pause
+(2026-10-22): state statistics stand aside ...".

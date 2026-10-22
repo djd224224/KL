@@ -23253,7 +23253,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # stand-aside (2026-10-15)
         # + the Mamdani announcement halt / hold (2026-10-19)
         # + the NBA auto families' game members' team-news hold (2026-10-22)
-        self.assertEqual(len(conts), 49)
+        # + the state statistics release pause (2026-10-22)
+        self.assertEqual(len(conts), 50)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -30866,6 +30867,100 @@ class TestRiskLimits(unittest.TestCase):
             self.run_pass()
         self.assertEqual(self.bot._risk["fails"], 1)
         self.assertIsNone(self.bot._risk_pass)
+
+
+class TestReleasePause(unittest.TestCase):
+    """State statistics stand aside around the releases their rules cite
+    (Jack 2026-10-22: "Can you pause state statistics around monthly releases")."""
+
+    TN = ("The Underlying is BLS series SMU47000003133600001, All Employees in "
+          "Transportation Equipment Manufacturing in Tennessee")
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="imm_rel_")
+        self.cal = os.path.join(d, "release_calendar.json")
+        with open(self.cal, "w", encoding="utf-8") as f:
+            json.dump({"sources": {
+                "bls_state": {"name": "BLS State", "times_et": ["2026-12-18 10:00", "2026-11-20 10:00"]},
+                "bls_empsit": {"name": "BLS Employment Situation", "times_et": ["2026-11-06 08:30"]}}}, f)
+        for p in (mock.patch.object(imm, "RELEASE_CALENDAR_FILE", self.cal),
+                  mock.patch.object(imm, "RELEASE_PAUSE", True),
+                  mock.patch.object(imm, "RELEASE_PAUSE_BEFORE_MIN", 30),
+                  mock.patch.object(imm, "RELEASE_PAUSE_AFTER_MIN", 180),
+                  mock.patch.dict(imm._SERIES_RELEASE_SOURCES, clear=True),
+                  mock.patch.dict(imm._release_warned, clear=True),
+                  mock.patch.dict(imm._release_cal, {"mtime": None, "checked": 0.0, "sources": {}})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _utc(self, *a):
+        return imm.ET.localize(datetime(*a)).astimezone(timezone.utc)
+
+    def test_rules_name_the_release(self):
+        f = imm.release_sources_from_rules
+        self.assertEqual(f(self.TN), ("bls_state", "bls_empsit"))
+        self.assertEqual(f("BLS series SMU53426600000000001, Seattle"),       # metro area
+                         ("bls_metro", "bls_state", "bls_empsit"))
+        self.assertEqual(f("BLS series LASST530000000000003"), ("bls_state", "bls_empsit"))
+        self.assertEqual(f("BLS series SMU00000000000000001"), ())          # national CES
+        self.assertEqual(f("Visit Florida's quarterly visitor estimate"), ())
+        self.assertEqual(f(""), ())
+        self.assertEqual(f("as reported by BLS QCEW for NAICS 3344"), ("bls_qcew",))  # KXAZSEMIJOBS
+        self.assertEqual(f("the BLS Quarterly Census of Employment and Wages data for Kentucky"),
+                         ("bls_qcew",))                                          # KXKYDISTEMP
+        # state payrolls described in words, no series id (KXOHMFGEMP, KXWAAEROEMP)
+        self.assertEqual(f("The Underlying is BLS's officially published 2026 annual-average "
+                           "Manufacturing employment for Ohio"), ("bls_state", "bls_empsit"))
+        self.assertEqual(f("All Employees: Aerospace Product and Parts Manufacturing in "
+                           "Washington (NAICS 3364). The officially published BLS annual-average "
+                           "figure will be used"), ("bls_state", "bls_empsit"))
+        self.assertEqual(f("BLS total nonfarm payrolls for the United States"), ())     # national
+        self.assertEqual(f("Florida visitors per Visit Florida"), ())                   # not BLS
+
+    def test_the_window_runs_from_before_to_after(self):        # knobs patched to 30m / 3h
+        imm.note_release_sources("KXTNTRANSEMP", {"rules_secondary": self.TN})
+        t = self._utc(2026, 11, 20, 10, 0)
+        w = imm.series_release_window
+        with mock.patch.object(imm, "log"):
+            self.assertIsNone(w("KXTNTRANSEMP", t - timedelta(minutes=31)))
+            self.assertEqual(w("KXTNTRANSEMP", t - timedelta(minutes=29)), ("BLS State", t))
+            self.assertEqual(w("KXTNTRANSEMP", t + timedelta(minutes=179)), ("BLS State", t))
+            self.assertIsNone(w("KXTNTRANSEMP", t + timedelta(minutes=181)))
+            nat = self._utc(2026, 11, 6, 8, 30)
+            self.assertEqual(w("KXTNTRANSEMP", nat), ("BLS Employment Situation", nat))
+            self.assertIsNone(w("KXNOTMAPPED", t))
+            with mock.patch.object(imm, "RELEASE_PAUSE", False):
+                self.assertIsNone(w("KXTNTRANSEMP", t))
+
+    def test_the_first_market_with_a_source_maps_the_series(self):
+        imm.note_release_sources("KXA", {"rules_secondary": "no series id here"})
+        self.assertNotIn("KXA", imm._SERIES_RELEASE_SOURCES)
+        imm.note_release_sources("KXA", {"rules_secondary": self.TN})
+        imm.note_release_sources("KXA", {"rules_secondary": "BLS series SMU53426600000000001"})
+        self.assertEqual(imm._SERIES_RELEASE_SOURCES["KXA"], ("bls_state", "bls_empsit"))
+        imm.note_release_sources("KXB", None)                               # no market: no-op
+        self.assertNotIn("KXB", imm._SERIES_RELEASE_SOURCES)
+
+    def test_a_calendar_running_out_warns_once_a_day(self):
+        imm.note_release_sources("KXTNTRANSEMP", {"rules_secondary": self.TN})
+        late = self._utc(2026, 12, 1, 12, 0)
+        with mock.patch.object(imm, "log") as lg:
+            imm.series_release_window("KXTNTRANSEMP", late)
+            imm.series_release_window("KXTNTRANSEMP", late + timedelta(hours=1))   # same ET day
+        warns = [c.args[0] for c in lg.call_args_list if "release calendar" in c.args[0]]
+        self.assertEqual(len(warns), 2, warns)          # one per source: state ends 12-18, empsit 11-06
+        self.assertTrue(any("no date after 2026-12-18" in m for m in warns))
+
+    def test_an_unreadable_calendar_keeps_the_last_good_read(self):
+        good = imm.load_release_calendar(force=True)
+        self.assertEqual([t.astimezone(imm.ET).day for t in good["bls_state"][1]], [20, 18])  # sorted
+        with open(self.cal, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        os.utime(self.cal, (time.time() + 5, time.time() + 5))
+        with mock.patch.object(imm, "log") as lg:
+            again = imm.load_release_calendar(force=True)
+        self.assertEqual(again, good)
+        self.assertIn("unreadable", lg.call_args.args[0])
 
 
 if __name__ == "__main__":

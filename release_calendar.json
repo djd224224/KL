@@ -1,0 +1,28 @@
+{
+  "_comment": "Scheduled data releases for incentive_mm's release pause (Jack 2026-10-22: 'Can you pause state statistics around monthly releases'). Times are ET, 'YYYY-MM-DD HH:MM'. A market whose rules cite a source here stands aside from IMM_RELEASE_PAUSE_BEFORE_MIN before to IMM_RELEASE_PAUSE_AFTER_MIN after each time. The bot re-reads this file when it changes (no restart). BLS posts a year's State and Metro dates late in the year before; past state dates are from the archive (bls.gov/bls/news-release/laus.htm, laus_MMDDYYYY files). Add dates as they are published: the bot logs a warning each day once a source's dates end within IMM_RELEASE_CALENDAR_WARN_DAYS.",
+  "sources": {
+    "bls_state": {
+      "name": "BLS State Employment and Unemployment",
+      "url": "https://www.bls.gov/schedule/news_release/laus.htm",
+      "times_et": ["2026-09-18 10:00", "2026-10-20 10:00", "2026-11-20 10:00", "2026-12-18 10:00"]
+    },
+    "bls_metro": {
+      "name": "BLS Metropolitan Area Employment and Unemployment",
+      "url": "https://www.bls.gov/schedule/news_release/metro.htm",
+      "times_et": ["2026-12-02 10:00", "2026-12-30 10:00"]
+    },
+    "bls_qcew": {
+      "name": "BLS County Employment and Wages (QCEW)",
+      "url": "https://www.bls.gov/schedule/2026/home.htm",
+      "times_et": ["2026-08-28 10:00", "2026-12-02 10:00"]
+    },
+    "bls_empsit": {
+      "name": "BLS Employment Situation",
+      "url": "https://www.bls.gov/schedule/news_release/empsit.htm",
+      "times_et": ["2026-10-02 08:30", "2026-11-06 08:30", "2026-12-04 08:30",
+                   "2027-01-08 08:30", "2027-02-05 08:30", "2027-03-05 08:30", "2027-04-02 08:30",
+                   "2027-05-07 08:30", "2027-06-04 08:30", "2027-07-02 08:30", "2027-08-06 08:30",
+                   "2027-09-03 08:30", "2027-10-08 08:30", "2027-11-05 08:30", "2027-12-03 08:30"]
+    }
+  }
+}
