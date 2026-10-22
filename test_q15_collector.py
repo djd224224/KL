@@ -27,6 +27,11 @@ def _m(t, o, c, **kw):
 
 class TestPaths(unittest.TestCase):
 
+    def test_fx_and_the_crypto_race_without_pyth_by_default(self):
+        self.assertEqual(Q.SERIES, ("KXEURUSD15M", "KXGBPUSD15M", "KXUSDJPY15M", "KXAUDUSD15M",
+                                    "KXUSDCAD15M", "KXCRYPTOLEAD15M"))
+        self.assertFalse(Q.PYTH_ON)
+
     def test_the_miami_helpers_point_at_this_test(self):
         self.assertEqual(os.path.abspath(C.DATA_ROOT), os.path.abspath(_TMP))
         self.assertTrue(Q.T.LOG_FILE.startswith(_TMP))

@@ -40,13 +40,15 @@ KL-data\q15-shadow\HALT. Data under KL-data\q15-shadow:
   settle), programs, status.
 - settled/<ticker>.json, collector.log, launcher-<date>.log, collector_status.json.
 
-**Pyth needs a key.** Since 2026-08-26 Hermes refuses unkeyed price reads (HTTP
-401); keys come from a Pyth Terminal account (Jack's to create). Put it in
-PYTH_API_KEY (user env) or KL-data\q15-shadow\pyth_api_key.txt; the recorder
-re-checks every 5 min and never logs it. Until then FX runs on Kraken's mid
-and the race on Hyperliquid's; metals, natgas, Brent and yields have no feed
-(their books and trades are still recorded; Pyth history can be backfilled
-with the key).
+**Scope: FX and the crypto race (Jack 2026-10-22: "It's paid, do FX and
+crypto").** Since 2026-08-26 Pyth's Hermes refuses unkeyed price reads (HTTP
+401) and its keys are paid (app.pyth.com/products), so the recorder covers the
+five FX series and KXCRYPTOLEAD15M, priced off the free proxies: Kraken's FX
+mid (FX settles on Pyth) and Hyperliquid's mids (the race settles on CF
+Benchmarks). The fidelity of a proxy is part of what the test measures
+(Kalshi's own results are recorded to check it against). Q15_SHADOW_SERIES
+and Q15_PYTH=1 (with PYTH_API_KEY or KL-data\q15-shadow\pyth_api_key.txt)
+bring the other series back if a key is ever bought.
 
 ## Phase 2 (to build during the week)
 

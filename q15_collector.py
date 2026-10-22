@@ -4,9 +4,10 @@ r"""Always-on recorder for the 15-minute shadow test (Q15_SHADOW.md; Jack
 week of testing").
 
 Records Kalshi's paying 15-minute "price up in next 15 mins?" markets -- the
-five FX pairs, the 2/5/10/30Y Treasury yields, Brent, natgas, copper,
-platinum, palladium and the crypto race -- together with live prices of
-their underlyings, so a shadow sim can replay quoting policies the way the
+five FX pairs and the crypto race (Jack 2026-10-22: "It's paid, do FX and
+crypto": the other series settle on Pyth, which sells its keys; they can be
+added back with Q15_SHADOW_SERIES and Q15_PYTH=1) -- together with live
+prices of their underlyings, so a shadow sim can replay quoting policies the way the
 hourly-temp test did for KXTEMPMIAH (TEMP_SHADOW.md). READ-ONLY: it GETs and
 subscribes to market data; it never places, amends or cancels an order, and
 never imports incentive_mm.py.
@@ -26,11 +27,10 @@ Threads (each catches everything and keeps going; log -> collector.log):
                    proxy: the FX markets settle on Pyth
            hl      Hyperliquid's public allMids for BTC ETH SOL XRP HYPE -- a
                    proxy: the crypto race settles on CF Benchmarks (paid)
-           pyth    the settlement source itself (FX, metals, natgas, Brent,
-                   copper, yields) over Hermes' SSE stream, once a key is in
-                   PYTH_API_KEY or KL-data\q15-shadow\pyth_api_key.txt --
-                   Hermes refuses unkeyed price reads since 2026-08-26; with
-                   no key the thread waits and re-checks every 5 min
+           pyth    OFF (Q15_PYTH=1 turns it on): the settlement source itself
+                   over Hermes' SSE stream, with a key in PYTH_API_KEY or
+                   KL-data\q15-shadow\pyth_api_key.txt -- Hermes refuses
+                   unkeyed price reads since 2026-08-26, and the keys are paid
   rest   discovery (each series' upcoming markets, every 10 min -- Kalshi
          lists them hours ahead), each quarter-hour's opened markets at
          +20 s (strikes / rules), settlements from close + 3 min (retry every
@@ -51,11 +51,15 @@ import sys
 DATA = os.environ.get("Q15_SHADOW_DATA", r"C:\Users\jackd\Documents\KL-data\q15-shadow")
 START = os.environ.get("Q15_SHADOW_START", "2026-10-22T00:00:00Z")
 UNTIL = os.environ.get("Q15_SHADOW_UNTIL", "2026-10-30T12:00:00Z")
+# FX and the crypto race only (Jack 2026-10-22: "It's paid, do FX and
+# crypto"): Pyth -- the settlement source of FX, the metals, natgas, Brent
+# and the yields -- sells its keys, and only FX and the race have free live
+# proxies (Kraken, Hyperliquid). Q15_SHADOW_SERIES widens the list again.
 SERIES = tuple(s for s in os.environ.get(
     "Q15_SHADOW_SERIES",
     "KXEURUSD15M,KXGBPUSD15M,KXUSDJPY15M,KXAUDUSD15M,KXUSDCAD15M,"
-    "KXBRENT15M,KXNATGAS15M,KXCOPPER15M,KXPLATINUM15M,KXPALLADIUM15M,"
-    "KXCRYPTOLEAD15M,KX2YRRATE15M,KX5YRRATE15M,KX10YRRATE15M,KX30YRRATE15M").split(",") if s)
+    "KXCRYPTOLEAD15M").split(",") if s)
+PYTH_ON = os.environ.get("Q15_PYTH", "0") == "1"      # paid; off unless asked for
 # point temp_shadow_common / temp_shadow_collector at this test's folder
 os.environ["TEMP_SHADOW_DATA"] = DATA
 os.environ["TEMP_SHADOW_SERIES"] = ",".join(SERIES)
@@ -557,8 +561,9 @@ class Collector:
                 "channel": "ticker", "symbol": sorted(KRAKEN_FX), "event_trigger": "bbo"}},
                 parse_kraken, self.px, self.stop_evt, ping={"method": "ping"}),
             WSPriceFeed("hl", HL_WS, {"method": "subscribe", "subscription": {"type": "allMids"}},
-                        parse_hl, self.px, self.stop_evt, ping={"method": "ping"}),
-            PythFeed(self.px, self.stop_evt)]
+                        parse_hl, self.px, self.stop_evt, ping={"method": "ping"})]
+        if PYTH_ON:
+            self.feeds.append(PythFeed(self.px, self.stop_evt))
         self.rest = Q15Rest(self)
         self.exit_reason = ""
 
