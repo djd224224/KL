@@ -21086,10 +21086,11 @@ class TestNflAutoFamilies(unittest.TestCase):
 class _LeagueAutoFixture(unittest.TestCase):
     """NBA / WNBA / MLB families auto-enrolled like the NFL ones (Jack
     2026-10-15: "KXWNBAFINALSMVP should be quoted", then "New NBA, WNBA, MLB
-    families should be auto quoted like elections, nfl, etc"). No team-news
-    feed for these leagues, so a game member stops LEAGUE_AUTO_GAME_BUFFER_MIN
-    before the start; a season member stops while its league plays and, when
-    tied to a round, for good once that round is decided."""
+    families should be auto quoted like elections, nfl, etc"). A game member
+    stops LEAGUE_AUTO_GAME_BUFFER_MIN before the start, and an NBA one also
+    LEAGUE_NEWS_HOLD_MIN after ESPN injury-report news on either team (Jack
+    2026-10-22: "Build it"); a season member stops while its league plays
+    and, when tied to a round, for good once that round is decided."""
 
     START = datetime(2067, 10, 22, 0, 0, tzinfo=timezone.utc)     # 8pm ET 10/21
     GAME_T = "KXNBAPTS-67OCT21LALGSW-LALLJAMES23-25"
@@ -21102,6 +21103,8 @@ class _LeagueAutoFixture(unittest.TestCase):
         members = dict(imm.LEAGUE_AUTO_SERIES)
         state = dict(imm._league_auto_state)
         hours = imm.SERIES_HOUR_MULTS
+        news = dict(imm._league_news_state)
+        imm._league_news_state.clear()
 
         def restore():
             imm.SERIES_OVERRIDES.clear()
@@ -21110,6 +21113,8 @@ class _LeagueAutoFixture(unittest.TestCase):
             imm.LEAGUE_AUTO_SERIES.update(members)
             imm._league_auto_state.clear()
             imm._league_auto_state.update(state)
+            imm._league_news_state.clear()
+            imm._league_news_state.update(news)
             imm.SERIES_HOUR_MULTS = hours
             try:
                 os.remove(imm.league_auto_path())
@@ -21192,6 +21197,18 @@ class _LeagueAutoFixture(unittest.TestCase):
     @staticmethod
     def _sides(bot, t):
         return {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == t}
+
+    @staticmethod
+    def _news(news_at=None, team="LAL", age_s=0.0):
+        """A fresh NBA injury-report read covering GAME_T's LAL @ GSW (ESPN's
+        GS); `news_at` (epoch) stamps news on `team`; `age_s` ages the read."""
+        import league_news
+        teams = [{"id": "13", "abbreviation": "LAL", "location": "LOS ANGELES", "name": "Lakers"},
+                 {"id": "9", "abbreviation": "GS", "location": "GOLDEN STATE", "name": "Warriors"}]
+        snap = league_news.build_snapshot("NBA", {}, teams, now_ts=time.time() - age_s)
+        if news_at is not None:
+            snap["teams"][team].update(news_at=news_at, news="LeBron James Out")
+        imm._league_news_state["NBA"] = snap
 
 class TestLeagueAutoFamilies(_LeagueAutoFixture):
     """The NBA / WNBA / MLB rules (the fixture above)."""
@@ -21343,12 +21360,62 @@ class TestLeagueAutoFamilies(_LeagueAutoFixture):
                                   "buffer_min": 90}})
         self.boards["/nba/"] = {"events": [self._ev("pre", self.START, short="LAL @ GS")]}
         bot = self._bot([self.GAME_T])
+        self._news()                                  # a fresh, quiet injury report
         bot.run_cycle()
         self.assertIn(self.GAME_T, bot.state.selected)
         self.assertEqual(bot.state.selected[self.GAME_T].cutoff,
                          self.START - timedelta(minutes=90))
         self.assertTrue(any("/basketball/nba/scoreboard?dates=20671021" in u for u in self.urls))
         self.assertEqual(self._sides(bot, self.GAME_T), {"bid", "ask"})
+
+    def test_the_nba_team_news_gate(self):
+        now = time.time()
+        self.assertEqual(imm.LEAGUE_NEWS_LEAGUES, ("NBA",))
+        for k in ("LEAGUE_NEWS_LEAGUES", "LEAGUE_NEWS_HOLD_MIN", "LEAGUE_NEWS_REFRESH_SECS",
+                  "LEAGUE_NEWS_TTL_MIN"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        # a league without the feed quotes on its cutoff alone
+        self.assertEqual(imm.league_news_gate(self.GAME_T, "MLB", now), ("", {}))
+        self.assertEqual(imm.league_news_gate(self.GAME_T, "NBA", now)[1]["reason"], "no_read")
+        self._news(news_at=now - 60)
+        why, inp = imm.league_news_gate(self.GAME_T, "NBA", now)
+        self.assertEqual((inp["reason"], inp["team"]), ("news_hold", "LAL"))
+        self.assertEqual(why, "LAL news: LeBron James Out 1m ago (hold 15m)")
+        self._news(news_at=now - 16 * 60)
+        self.assertEqual(imm.league_news_gate(self.GAME_T, "NBA", now), ("", {}))
+        self.assertEqual(imm.league_news_gate("KXNBAPTS-67OCT21ZZZQQQ-X", "NBA", now)[1]["reason"],
+                         "teams")
+        self._news(age_s=11 * 60)
+        self.assertEqual(imm.league_news_gate(self.GAME_T, "NBA", now)[1]["reason"], "stale")
+
+    def test_an_nba_game_member_holds_on_team_news_and_fails_closed(self):
+        """Jack 2026-10-22: "Build it" -- an NBA team-news hold like the NFL's."""
+        self._write({"KXNBAPTS": {"league": "NBA", "kind": "game", "size": "pilot",
+                                  "buffer_min": 90}})
+        self.boards["/nba/"] = {"events": [self._ev("pre", self.START, short="LAL @ GS")]}
+        bot = self._bot([self.GAME_T])
+        ev = "KXNBAPTS-67OCT21LALGSW"
+
+        def cycle():
+            bot.state.universe_at = time.time()                # keep the selection
+            bot.run_cycle()
+            return self._sides(bot, self.GAME_T)
+        bot.run_cycle()                                        # selects; no read yet: closed
+        self.assertIn(self.GAME_T, bot.state.selected)
+        self.assertEqual(self._sides(bot, self.GAME_T), set())
+        self.assertIn(ev, bot._league_news_stood)
+        self._news(news_at=time.time() - 5 * 60)               # Lakers news 5 min ago
+        self.assertEqual(cycle(), set())
+        self._news(news_at=time.time() - 20 * 60)              # past the 15-min hold
+        self.assertEqual(cycle(), {"bid", "ask"})
+        self.assertNotIn(ev, bot._league_news_stood)
+        self._news(news_at=time.time() - 3 * 60, team="GS")    # either team holds it
+        self.assertEqual(cycle(), set())
+        self._news(age_s=11 * 60)                              # a stale read: closed
+        self.assertEqual(cycle(), set())
+        imm._league_news_state.clear()
+        with mock.patch.object(imm, "LEAGUE_NEWS_LEAGUES", ()):   # the knob turns it off
+            self.assertEqual(cycle(), {"bid", "ask"})
 
     def test_a_season_member_holds_on_its_leagues_games_and_its_round(self):
         self._write({"KXWNBAFINALSMVP": {"league": "WNBA", "kind": "season", "size": "pilot",
@@ -23185,7 +23252,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the NBA / WNBA / MLB auto families' live-game / decided
         # stand-aside (2026-10-15)
         # + the Mamdani announcement halt / hold (2026-10-19)
-        self.assertEqual(len(conts), 48)
+        # + the NBA auto families' game members' team-news hold (2026-10-22)
+        self.assertEqual(len(conts), 49)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

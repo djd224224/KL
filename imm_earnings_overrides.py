@@ -1162,8 +1162,10 @@ def league_auto_why(entry: dict) -> str:
                 f"match of its tournament is live (lolesports feed), out for good "
                 f"once its deciding stage is complete, pilot size")
     if entry["kind"] == "game":
+        news = (f", out {imm.LEAGUE_NEWS_HOLD_MIN}m after ESPN injury-report news "
+                f"on either team" if league in imm.LEAGUE_NEWS_LEAGUES else "")
         return (f"{LEAGUE_AUTO_WHY}: one {league} game per event, quoted to "
-                f"{entry['buffer_min']}m before the start, pilot size")
+                f"{entry['buffer_min']}m before the start{news}, pilot size")
     tail = (f", out for good once the {entry['decided_by']} is decided"
             if entry.get("decided_by") else "")
     return (f"{LEAGUE_AUTO_WHY}: {league} season prop, off while any {league} "
@@ -1185,8 +1187,11 @@ def league_auto_notify(additions: dict) -> None:
                          f"min), out for good once its deciding stage is complete")
         elif e["kind"] == "game":
             lines.append(f"    one {e['league']} game per event -- quoted until "
-                         f"{e['buffer_min']} min before the start (no team-news "
-                         f"feed for this league)")
+                         f"{e['buffer_min']} min before the start"
+                         + (f", and out {imm.LEAGUE_NEWS_HOLD_MIN} min after any ESPN "
+                            f"injury-report change on either team"
+                            if e["league"] in imm.LEAGUE_NEWS_LEAGUES
+                            else " (no team-news feed for this league)"))
         else:
             lines.append(f"    season prop -- no cutoff; OFF whenever any {e['league']} "
                          f"game is live (+{imm.LEAGUE_LIVE_COOLDOWN_MIN} min after it ends)"

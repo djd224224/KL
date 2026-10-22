@@ -5686,6 +5686,65 @@ LEAGUE_DECIDED_ROUNDS = frozenset({"NBA Finals", "WNBA Finals", "World Series",
 LEAGUE_AUTO_BUDGET_PREFIX = "LEAGUEAUTO:"
 LEAGUE_AUTO_SERIES: Dict[str, dict] = {}
 _league_auto_state: dict = {"mtime": 0.0, "installed": set()}
+# TEAM-NEWS HOLD for the league auto families' GAME members (Jack 2026-10-22:
+# "Build it", to "Should I build an NBA team-news hold like NFL's?"). An NFL
+# auto game member stands aside NFL_NEWS_HOLD_MIN after team news
+# (nfl_team_news_gate); a league game member had only its pre-start cutoff,
+# and an NBA star ruled out three hours before tip moves every prop of his
+# game. league_news.py reads ESPN's league-wide injury report (one call)
+# every LEAGUE_NEWS_REFRESH_SECS into _league_news_state, each read diffed
+# against the last; league_news_gate holds a game member of a
+# LEAGUE_NEWS_LEAGUES league while either of its teams had a report change
+# -- a status set or changed, or a player cleared -- inside
+# LEAGUE_NEWS_HOLD_MIN, failing CLOSED on a missing or stale read
+# (LEAGUE_NEWS_TTL_MIN) and on a ticker whose two teams it cannot name.
+# 10/22, 38 open KXNBAGAME events: every one named its two teams (Kalshi's
+# GSW / NOP / NYK / SAS / UTA / WAS are ESPN's GS / NO / NY / SA / UTAH /
+# WSH); the report carried 72 players on 26 teams. IMM_LEAGUE_NEWS_LEAGUES=""
+# turns it off (the cutoff alone again).
+LEAGUE_NEWS_LEAGUES: Tuple[str, ...] = tuple(
+    s.strip().upper() for s in os.environ.get("IMM_LEAGUE_NEWS_LEAGUES", "NBA").split(",")
+    if s.strip())
+LEAGUE_NEWS_HOLD_MIN = _env_int("IMM_LEAGUE_NEWS_HOLD_MIN", 15)
+LEAGUE_NEWS_REFRESH_SECS = _env_int("IMM_LEAGUE_NEWS_REFRESH_SECS", 120)
+LEAGUE_NEWS_TTL_MIN = _env_int("IMM_LEAGUE_NEWS_TTL_MIN", 10)
+LEAGUE_NEWS_TEAMS_TTL_SECS = 6 * 3600
+_league_news_state: Dict[str, dict] = {}
+
+
+def league_news_gate(ticker: str, league: str, now_ts: float) -> Tuple[str, dict]:
+    """('', {}) when a league auto GAME member may quote, else (why,
+    guard-skip inputs): the team-news hold above for a LEAGUE_NEWS_LEAGUES
+    league, failing CLOSED; any other league quotes on its cutoff alone."""
+    if league not in LEAGUE_NEWS_LEAGUES:
+        return "", {}
+    snap = _league_news_state.get(league)
+    if snap is None:
+        return f"no {league} injury-report read yet", {"reason": "no_read"}
+    age = now_ts - float(snap.get("ts") or 0.0)
+    if age > LEAGUE_NEWS_TTL_MIN * 60:
+        return (f"{league} injury-report read is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)})
+    try:
+        import league_news as _ln
+        pair = _ln.team_pair(snap, ticker)
+    except Exception as e:                       # noqa: BLE001
+        return (f"team parse failed: {type(e).__name__}",
+                {"reason": "teams", "err": str(e)[:120]})
+    if not pair:
+        return "teams not parsed from the ticker", {"reason": "teams"}
+    for team in pair:
+        ctx = (snap.get("teams") or {}).get(team) or {}
+        nat = ctx.get("news_at")
+        if LEAGUE_NEWS_HOLD_MIN > 0 and nat is not None:
+            nage = now_ts - float(nat)
+            # a stamp a little ahead of our clock still holds; far ahead is junk
+            if -600.0 <= nage < LEAGUE_NEWS_HOLD_MIN * 60:
+                return (f"{team} news: {ctx.get('news')} {max(0.0, nage) / 60:.0f}m "
+                        f"ago (hold {LEAGUE_NEWS_HOLD_MIN}m)",
+                        {"reason": "news_hold", "team": team,
+                         "news": ctx.get("news"), "age_s": round(nage)})
+    return "", {}
 
 
 def league_auto_path() -> str:
@@ -9835,6 +9894,9 @@ _CONFIG_CODE_KNOBS = (
     # NBA / WNBA / MLB auto families (2026-10-15)
     "LEAGUE_AUTO_ENABLE", "LEAGUE_AUTO_GAME_BUFFER_MIN", "LEAGUE_AUTO_SIZE_MULT",
     "LEAGUE_AUTO_DAILY_LOSS_LIMIT", "LEAGUE_LIVE_COOLDOWN_MIN", "LEAGUE_LIVE_TTL_SECS",
+    # ...their game members' team-news hold (2026-10-22)
+    "LEAGUE_NEWS_LEAGUES", "LEAGUE_NEWS_HOLD_MIN", "LEAGUE_NEWS_REFRESH_SECS",
+    "LEAGUE_NEWS_TTL_MIN",
     # hand positions the bot trades beside (2026-10-13)
     "MANUAL_COEXIST_EVENTS",
     # Treasury touch gate (2026-10-01); treasury_fair's knobs ride in its
@@ -18080,6 +18142,8 @@ class IncentiveMarketMaker:
         self._league_decided: Dict[str, Dict[str, str]] = {}
         self._league_final_seen: Dict[str, Dict[str, float]] = {}
         self._league_stood_series: Set[str] = set()
+        # league game members' team-news holds, logged per event (2026-10-22)
+        self._league_news_stood: Set[str] = set()
         # League of Legends (_lol_hold, 2026-10-15): the feed reader (tests swap
         # it), its cache {key: (read_at, data)}, the stages seen complete
         # ("worlds:Swiss", sticky) and when a tournament was last seen live
@@ -27098,6 +27162,25 @@ class IncentiveMarketMaker:
                 if la_key in self._league_stood_series:
                     self._league_stood_series.discard(la_key)
                     log(f"{self.tag} league auto resume {la_key}")
+            # ...and their GAME members' TEAM-NEWS HOLD (Jack 2026-10-22, see
+            # LEAGUE_NEWS_LEAGUES): ESPN's injury report on both teams, held
+            # LEAGUE_NEWS_HOLD_MIN after a change, failing closed. Logged per
+            # event.
+            if league_auto_game(meta.series):
+                ln_why, ln_in = league_news_gate(
+                    t, (league_auto_entry(meta.series) or {}).get("league") or "",
+                    now_ts)
+                ln_key = nfl_auto_event_key(t)
+                if ln_why:
+                    if ln_key not in self._league_news_stood:
+                        self._league_news_stood.add(ln_key)
+                        log(f"{self.tag} league team-news stand-aside {ln_key}: {ln_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "league_team_news", lambda: ln_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+                if ln_key in self._league_news_stood:
+                    self._league_news_stood.discard(ln_key)
+                    log(f"{self.tag} league team-news resume {ln_key}")
             # MLB POSTSEASON MVPs (Jack 2026-10-12: "quote MLB MVPs under a
             # no-quotes-during-games rule", see MLB_MVP_ROUNDS): out while any
             # MLB game is live, and for good once the round is decided.
@@ -29832,6 +29915,53 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_nfl_fair_refresh, daemon=True,
                              name="nfl-fair").start()
+        if LEAGUE_AUTO_ENABLE and LEAGUE_NEWS_LEAGUES and not once:
+            # League team-news refresher (2026-10-22, LEAGUE_NEWS_LEAGUES):
+            # ESPN's injury report for each league every
+            # LEAGUE_NEWS_REFRESH_SECS (its team list every 6 hours) into
+            # _league_news_state, each read diffed against the last; every
+            # change logged once. A failed read keeps the old snapshot, which
+            # ages out of LEAGUE_NEWS_TTL_MIN (the gate fails closed).
+            log(f"league team-news hold (2026-10-22): {','.join(LEAGUE_NEWS_LEAGUES)} "
+                f"game members stand aside {LEAGUE_NEWS_HOLD_MIN}m after an ESPN "
+                f"injury-report change on either team (read every "
+                f"{LEAGUE_NEWS_REFRESH_SECS}s; closed past {LEAGUE_NEWS_TTL_MIN}m "
+                f"without a read)")
+
+            def _league_news_refresh():
+                try:
+                    import league_news
+                except Exception as e:
+                    log(f"{self.tag} ! league-news refresher disabled: {e}")
+                    return
+                teams: Dict[str, Tuple[float, list]] = {}
+                last_err: Dict[str, str] = {}
+                while True:
+                    for lg in LEAGUE_NEWS_LEAGUES:
+                        if lg not in league_news.PATHS:
+                            continue
+                        try:
+                            now = time.time()
+                            tt = teams.get(lg)
+                            if tt is None or not tt[1] or \
+                                    now - tt[0] > LEAGUE_NEWS_TEAMS_TTL_SECS:
+                                tt = teams[lg] = (now, league_news.fetch_teams(lg))
+                            snap = league_news.build_snapshot(
+                                lg, league_news.fetch_injuries(lg), tt[1],
+                                prev=_league_news_state.get(lg), now_ts=now)
+                            _league_news_state[lg] = snap
+                            for c in snap.get("changes") or []:
+                                log(f"{self.tag} {lg} injury report: {c}")
+                            if last_err.pop(lg, None):
+                                log(f"{self.tag} {lg} injury report read again")
+                        except Exception as e:
+                            err = f"{type(e).__name__}: {str(e)[:120]}"
+                            if last_err.get(lg) != err:
+                                log(f"{self.tag} ! {lg} injury report read failed: {err}")
+                            last_err[lg] = err
+                    time.sleep(max(30, LEAGUE_NEWS_REFRESH_SECS))
+            threading.Thread(target=_league_news_refresh, daemon=True,
+                             name="league-news").start()
         if RAIN_FAIR_ENABLE:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
