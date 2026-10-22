@@ -75,6 +75,10 @@ class TestFairModel(unittest.TestCase):
                ("openai", "tokens"): {"2026-09-01": 40.0}}
         x = vf.series_values(tab, "KXOPENSOURCESHARE", ["2026-09-01"])
         self.assertEqual(x["2026-09-01"], 50.0)
+        # baseten's Elephant-1 / Mammoth-1 count as open weights (2026-10-21)
+        tab[("baseten", "tokens")] = {"2026-09-01": 0.5}
+        x = vf.series_values(tab, "KXOPENSOURCESHARE", ["2026-09-01"])
+        self.assertEqual(x["2026-09-01"], 50.5)
 
     def test_write_fair_file_keys_events_by_ticker(self):
         tab = {}

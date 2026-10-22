@@ -107,9 +107,14 @@ LAB_SERIES = {
     "KXANTHVREQ": ("anthropic", "requests"),
 }
 OPEN_SERIES = "KXOPENSOURCESHARE"
-# labs that ship only open-weight models (the deep-dive's reconstruction)
+# labs that ship only open-weight models (the deep-dive's reconstruction);
+# baseten since 2026-10-21, the model-coverage gap: its two gateway models,
+# Elephant-1 and Mammoth-1 (released 10/20), are both tagged open-weights in
+# the gateway's model list (the DeepSeek / Nemotron models it serves count
+# under their own labs)
 OPEN_WEIGHT_LABS = ("deepseek", "zai", "moonshotai", "stepfun", "xiaomi", "minimax",
-                    "alibaba", "inclusionai", "nvidia", "tencent", "meituan", "arcee-ai")
+                    "alibaba", "inclusionai", "nvidia", "tencent", "meituan", "arcee-ai",
+                    "baseten")
 ALL_SERIES = tuple(LAB_SERIES) + (OPEN_SERIES,)
 
 
