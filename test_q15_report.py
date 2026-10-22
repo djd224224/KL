@@ -64,6 +64,7 @@ class TestVerdict(unittest.TestCase):
         days = R.window_days(R.VERDICT_START + timedelta(days=2))
         self.assertEqual(R.verdict("FAIR8_night", days)["level"], "EXTEND")
         self.assertEqual(R.verdict("FAV_night", days)["level"], "NO-GO")    # nets 0: net > 0 fails
+        self.assertEqual(R.verdict("FAIR4", [])["level"], "NO DATA")
 
     def test_the_email(self):
         days = self._week(lambda i: {"FAIR8": 40.0})

@@ -95,10 +95,12 @@ def verdict(vid: str, days: list) -> dict:
               f"90% CI low > ${CI_FLOOR:.0f}": lo > CI_FLOOR,
               "fair beats the mid (Brier)": bf is not None and bm is not None and bf < bm}
     first4 = all(list(checks.values())[:4])
-    if len(nets) >= VERDICT_DAYS and all(checks.values()):
+    if not nets:
+        level = "NO DATA"
+    elif len(nets) >= VERDICT_DAYS and all(checks.values()):
         level = "PILOT ELIGIBLE"
     elif len(nets) < VERDICT_DAYS and first4:
-        level = "EXTEND" if len(nets) else "NO DATA"
+        level = "EXTEND"
     else:
         level = "NO-GO"
     return {"vid": vid, "days": len(nets), "total": total, "robust": robust, "pos": pos,
@@ -130,6 +132,10 @@ def build(day: date) -> tuple:
             lines.append(f"  {v:12s} net {usd(r.get('net', 0)):>10s} = reward {usd(r.get('reward', 0)):>9s}"
                          f" + fills {usd(r.get('pnl', 0)):>10s}  ({r.get('fills', 0)} fills; night "
                          f"{usd(r.get('night', 0))})")
+        unsettled = max((r.get("unsettled", 0) for r in today["variants"].values()), default=0)
+        if unsettled:
+            lines.append(f"  ({unsettled} market(s) not settled yet: their fills count $0 until "
+                         f"Kalshi's result is recorded.)")
         fid = today.get("fidelity") or {}
         if fid.get("n"):
             lines.append(f"  FX proxy (Kraken) up/down call agreed with Kalshi on {fid['agree']} of "
