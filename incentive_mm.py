@@ -10236,6 +10236,8 @@ _CONFIG_CODE_KNOBS = (
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
     "SIDE_MULT_SERIES",                          # Trump B half bids / 1.5x asks (2026-10-22)
     "FAMILY_SIDE_LEANS",                         # family 1.5x / 0.75x side leans (2026-10-22)
+    "LONGSHOT_MULT", "LONGSHOT_BID_BELOW",       # the event long-shot cut (2026-10-22)
+    "LONGSHOT_ASK_FROM", "LONGSHOT_FAMILIES",
     "SIZE_TEST_MULT", "SIZE_TEST_FROM", "SIZE_TEST_DAYS",   # base size split test (2026-10-26)
     "SIZE_TEST_SALT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -13529,15 +13531,60 @@ def series_side_mults(series: str) -> Tuple[float, float]:
     return (1.0, 1.0)
 
 
-def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
+# EVENT LONG-SHOT CUT (Jack 2026-10-22: "1, and give me email report", after
+# the price deep-dive of that day). In the event families -- sports & awards,
+# politics & approval, elections, weather & quakes -- the side that BUYS THE
+# CHEAP CONTRACT lost over 7/11-10/15 (57k settled fills): bids on YES under
+# 30c -4.3c a contract (95% -7.7..-0.7), asks on YES at 70c+ (long the NO
+# under 30c) -7.4c (-12.8..-1.3, every period), while buying the favorite
+# did fine (bids on YES 50c+ +7..+10c since September). So in those families
+# bids rest x LONGSHOT_MULT while the YES mid is under LONGSHOT_BID_BELOW,
+# and asks x LONGSHOT_MULT while it is at LONGSHOT_ASK_FROM or more; the
+# other side and every other price keep their size. Families by
+# series_family (the dashboard's, as the side leans); the mid is the
+# external touches' in the quote loop, the selection's mid in the estimates.
+# IMM_LONGSHOT_MULT=1 turns it off. The 11/05 side-leans email reports it.
+LONGSHOT_MULT = _env_float("IMM_LONGSHOT_MULT", 0.75)
+LONGSHOT_BID_BELOW = _env_float("IMM_LONGSHOT_BID_BELOW", 30.0)
+LONGSHOT_ASK_FROM = _env_float("IMM_LONGSHOT_ASK_FROM", 70.0)
+LONGSHOT_FAMILIES = frozenset(f.strip() for f in os.environ.get(
+    "IMM_LONGSHOT_FAMILIES",
+    "Sports & awards|Politics & approval|Elections|Weather & quakes").split("|")
+    if f.strip())
+
+
+def longshot_side_mults(series: str, yes_mid: Optional[float]) -> Tuple[float, float]:
+    """(bid_mult, ask_mult) of the event long-shot cut at this YES mid
+    (cents); (1.0, 1.0) outside the families, off, or with no mid."""
+    if (LONGSHOT_MULT == 1.0 or yes_mid is None or not LONGSHOT_FAMILIES
+            or series_family(series) not in LONGSHOT_FAMILIES):
+        return (1.0, 1.0)
+    if yes_mid < LONGSHOT_BID_BELOW:
+        return (LONGSHOT_MULT, 1.0)
+    if yes_mid >= LONGSHOT_ASK_FROM:
+        return (1.0, LONGSHOT_MULT)
+    return (1.0, 1.0)
+
+
+def touch_mid(ext_bid: Optional[float], ext_ask: Optional[float]) -> Optional[float]:
+    """The YES mid of the external touches, or the one touch there is."""
+    if ext_bid is not None and ext_ask is not None:
+        return (ext_bid + ext_ask) / 2.0
+    return ext_bid if ext_bid is not None else ext_ask
+
+
+def side_size_mults(ticker: str, now_utc: datetime,
+                    yes_mid: Optional[float] = None) -> Tuple[float, float]:
     """(bid_mult, ask_mult) on this market's ladder right now: the Carbon Arc
-    late-month rule times the series' own side sizes (SIDE_MULT_SERIES), with
+    late-month rule times the series' own side sizes (SIDE_MULT_SERIES, else
+    its family's lean) and, given the YES mid, the event long-shot cut, with
     asks zeroed for a bid-only family (a quake ask strike keeps its ask side;
     quake_cap_quotes sizes and floors it) and bids zeroed for a NO-side-only
     market (no_side_only)."""
     bm, am = ca_late_month_mults(ticker, now_utc)
     sb, sa = series_side_mults(series_of(ticker))
-    bm, am = bm * sb, am * sa
+    lb, la = longshot_side_mults(series_of(ticker), yes_mid)
+    bm, am = bm * sb * lb, am * sa * la
     if series_bid_only(series_of(ticker)) and not quake_ask_strike(ticker):
         am = 0.0
     if no_side_only(ticker):
@@ -24782,7 +24829,7 @@ class IncentiveMarketMaker:
             # atref rests up to 2x the spec size, so an unscaled reservation
             # under-charged the budget up to ~2x on mid-priced deep-ref books
             # (anchor pricing stays — actual rests at/below the anchor cost).
-            _cbm, _cam = side_size_mults(meta.ticker, now_utc)
+            _cbm, _cam = side_size_mults(meta.ticker, now_utc, meta.mid_cents)
             worst = (ladder_collateral_dollars(bid, None, scale_levels(lv, _cbm))
                      * meta.ref_mult_bid
                      + ladder_collateral_dollars(None, ask, scale_levels(lv, _cam))
@@ -26049,7 +26096,7 @@ class IncentiveMarketMaker:
         # so the reward estimate (and the $1 floor projection built on it)
         # see the size the quote loop will actually rest.
         # (side_size_mults: the same rule plus the bid-only quake family)
-        _cbm, _cam = side_size_mults(meta.ticker, _now)
+        _cbm, _cam = side_size_mults(meta.ticker, _now, meta.mid_cents)
         # The band the quote loop quotes a SELECTED market in -- which every
         # candidate is by the time the loop reaches it (ESTIMATE_SIDE_BAND).
         _qlo, _qhi = member_price_band(meta.series, True)
@@ -28442,10 +28489,13 @@ class IncentiveMarketMaker:
             # from here the ladder is PER SIDE -- no bid rungs and asks at
             # 50% inside the window, the plain ladder on both sides otherwise.
             ca_bm, ca_am = ca_late_month_mults(t, now_utc)
-            # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B)
+            # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B;
+            # else the family's lean) and the event long-shot cut at this
+            # book's mid (LONGSHOT_MULT)
             ss_bm, ss_am = series_side_mults(meta.series)
-            lv_bid = scale_levels(lv, ca_bm * ss_bm)
-            lv_ask = scale_levels(lv, ca_am * ss_am)
+            ls_bm, ls_am = longshot_side_mults(meta.series, touch_mid(ext_bid, ext_ask))
+            lv_bid = scale_levels(lv, ca_bm * ss_bm * ls_bm)
+            lv_ask = scale_levels(lv, ca_am * ss_am * ls_am)
             if series_bid_only(meta.series) and not quake_ask_strike(t):
                 lv_ask = []          # bid-only family (quake gate): no ask rungs
             if no_side_only(t):
@@ -31820,6 +31870,11 @@ class IncentiveMarketMaker:
                             for f, (b, a) in sorted(FAMILY_SIDE_LEANS.items()))
                 + " -- families by imm_dashboard.family_of; a series' own side sizes "
                   "win; report email 2026-11-05")
+        if LONGSHOT_MULT != 1.0 and LONGSHOT_FAMILIES:
+            log(f"event long-shot cut (2026-10-22): {', '.join(sorted(LONGSHOT_FAMILIES))} -- "
+                f"bids x{LONGSHOT_MULT:g} while the YES mid is under {LONGSHOT_BID_BELOW:g}c, "
+                f"asks x{LONGSHOT_MULT:g} while it is {LONGSHOT_ASK_FROM:g}c or more; "
+                f"report email 2026-11-05")
         _st0, _st1 = size_test_window()
         if _st0 is not None:
             log(f"size split test (2026-10-22): x{SIZE_TEST_MULT:g} on the family wire for the "

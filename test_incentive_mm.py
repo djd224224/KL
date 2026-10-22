@@ -247,6 +247,9 @@ def setUpModule():
     # mention or an econ print keep their sizes (TestFamilySideLeans turns
     # them on)
     imm.FAMILY_SIDE_LEANS = {}
+    # ...and so is the event long-shot cut, for the same reason
+    # (TestEventLongshotCut turns it on)
+    imm.LONGSHOT_MULT = 1.0
     # the 2026-10-22 ski-resort snowfall gate (TestResortSnowGate deletes it)
     imm.RESORT_SNOW_FILE = os.path.join(tmp, "resort_snow_fair.json")
     imm._resort_snow_state.update(mtime=0.0, markets={}, events={}, mapped={})
@@ -8358,6 +8361,57 @@ class TestFamilySideLeans(unittest.TestCase):
                 self.assertGreater(imm._family_mod_failed, 0)
             # an hour's rest before the next try, even with the module back
             self.assertEqual(real("KXRT"), "")
+
+
+class TestEventLongshotCut(unittest.TestCase):
+    """Jack 2026-10-22: "1, and give me email report" -- in the event
+    families the side that buys the cheap contract rests at 0.75x."""
+
+    FAMS = {"KXNBAGAME": "Sports & awards", "KXSENATE": "Elections",
+            "KXRAIN": "Weather & quakes", "KXRT": "Rotten Tomatoes"}
+
+    def setUp(self):
+        imm._family_cache.clear()
+        self.addCleanup(imm._family_cache.clear)
+        for name, val in (("LONGSHOT_MULT", 0.75), ("FAMILY_SIDE_LEANS", {})):
+            p = mock.patch.object(imm, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(imm, "_dashboard_family",
+                              side_effect=lambda s: self.FAMS.get(s, ""))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_defaults(self):
+        self.assertEqual(imm.LONGSHOT_FAMILIES, frozenset((
+            "Sports & awards", "Politics & approval", "Elections", "Weather & quakes")))
+        self.assertEqual((imm.LONGSHOT_BID_BELOW, imm.LONGSHOT_ASK_FROM), (30.0, 70.0))
+        for k in ("LONGSHOT_MULT", "LONGSHOT_BID_BELOW", "LONGSHOT_ASK_FROM",
+                  "LONGSHOT_FAMILIES"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_the_side_buying_the_cheap_contract_shrinks(self):
+        f = imm.longshot_side_mults
+        self.assertEqual(f("KXNBAGAME", 12.0), (0.75, 1.0))     # cheap YES: bids
+        self.assertEqual(f("KXNBAGAME", 29.5), (0.75, 1.0))
+        self.assertEqual(f("KXNBAGAME", 30.0), (1.0, 1.0))      # the middle: as is
+        self.assertEqual(f("KXSENATE", 69.5), (1.0, 1.0))
+        self.assertEqual(f("KXSENATE", 70.0), (1.0, 0.75))      # cheap NO: asks
+        self.assertEqual(f("KXRAIN", 95.0), (1.0, 0.75))
+        # not an event family, no mid, or off
+        self.assertEqual(f("KXRT", 12.0), (1.0, 1.0))
+        self.assertEqual(f("KXNBAGAME", None), (1.0, 1.0))
+        with mock.patch.object(imm, "LONGSHOT_MULT", 1.0):
+            self.assertEqual(f("KXNBAGAME", 12.0), (1.0, 1.0))
+
+    def test_rides_side_size_mults_with_a_mid(self):
+        now = utc(2026, 10, 23, 15, 0)
+        self.assertEqual(imm.side_size_mults("KXNBAGAME-26OCT23LALGSW-LAL", now, 20.0),
+                         (0.75, 1.0))
+        self.assertEqual(imm.side_size_mults("KXNBAGAME-26OCT23LALGSW-LAL", now), (1.0, 1.0))
+        self.assertEqual(imm.touch_mid(18, 22), 20.0)
+        self.assertEqual(imm.touch_mid(None, 22), 22)
+        self.assertIsNone(imm.touch_mid(None, None))
 
 
 class TestCutoffEnforcement(unittest.TestCase):
