@@ -8086,6 +8086,85 @@ class TestPadQuantity(unittest.TestCase):
         self.assertEqual(imm.pad_quantity(0, 10 ** 9), imm.PAD_MAX_CONTRACTS)
 
 
+class TestStickyPads(unittest.TestCase):
+    """Sticky pads (Jack 2026-10-22: "Sticky pad fix"). From 10/21 another
+    maker added ~600 to both sides of each KXMAMDANIMENTION word whenever our
+    1c pad lifted its YES side past 1,000; the plain resize then read the pad
+    as redundant and pulled it, they left, we re-padded -- a two-cycle loop.
+    A resting pad now stays until the depth outside it reaches
+    PAD_STICKY_RELEASE_MULT x target."""
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=True)
+        self.addCleanup(setattr, imm, "PAD_STICKY", imm.PAD_STICKY)
+        imm.PAD_STICKY = True
+
+    def _bid_pads(self, yes_levels, own, ext_bid=54):
+        pads = self.bot._pad_quotes(
+            "T", [imm.Quote("T", "bid", ext_bid, 57)], yes_levels,
+            [[40, 3000.0]], own, 1000, ext_bid=ext_bid, ext_ask=62)
+        return [p.count for p in pads if p.book_side == "bid"]
+
+    def test_the_mamdani_loop_keeps_the_resting_pad(self):
+        # 576 outside + the other maker's 600 + our 800 pad: the plain resize
+        # reads 1,176 >= 1,000 and pulls the pad; sticky keeps it
+        own = [("bid", imm.PAD_BID_CENTS, 800.0)]
+        self.assertEqual(imm.pad_quantity(1176.0, 1000), 0)
+        self.assertEqual(self._bid_pads([[54, 576.0], [50, 600.0], [1, 800.0]], own),
+                         [800])
+
+    def test_released_once_the_outside_depth_reaches_twice_target(self):
+        own = [("bid", imm.PAD_BID_CENTS, 800.0)]
+        self.assertEqual(self._bid_pads([[54, 1999.0], [1, 800.0]], own), [800])
+        self.assertEqual(self._bid_pads([[54, 2000.0], [1, 800.0]], own), [])
+
+    def test_a_resting_pad_is_not_shrunk(self):
+        # 602 outside wants 700 (gap 398 + 300 slack); the resting 800 stays
+        own = [("bid", imm.PAD_BID_CENTS, 800.0)]
+        self.assertEqual(self._bid_pads([[54, 602.0], [1, 800.0]], own), [800])
+
+    def test_a_resting_pad_still_grows(self):
+        own = [("bid", imm.PAD_BID_CENTS, 400.0)]
+        self.assertEqual(self._bid_pads([[54, 300.0], [1, 400.0]], own), [1000])
+
+    def test_no_resting_pad_sizes_as_before(self):
+        self.assertEqual(self._bid_pads([[54, 1176.0]], []), [])
+        self.assertEqual(self._bid_pads([[54, 576.0]], []), [800])
+
+    def test_a_partly_filled_pad_keeps_what_is_left(self):
+        own = [("bid", imm.PAD_BID_CENTS, 790.37)]
+        self.assertEqual(self._bid_pads([[54, 1176.0], [1, 790.37]], own), [790])
+
+    def test_the_distance_gate_still_pulls_it(self):
+        # a 2c best bid leaves a 1c pad 1 tick behind: no pad is wanted at
+        # all, so the diff cancels the resting one
+        own = [("bid", imm.PAD_BID_CENTS, 800.0)]
+        self.assertEqual(self._bid_pads([[2, 576.0], [1, 800.0]], own, ext_bid=2), [])
+
+    def test_the_ask_side_mirrors(self):
+        pads = self.bot._pad_quotes(
+            "T", [imm.Quote("T", "ask", 62, 57)], [[54, 3000.0]],
+            [[38, 1100.0], [1, 700.0]], [("ask", imm.PAD_ASK_CENTS, 700.0)],
+            1000, ext_bid=54, ext_ask=62)
+        self.assertEqual([p.count for p in pads if p.book_side == "ask"], [700])
+
+    def test_knob_off_restores_the_plain_resize(self):
+        imm.PAD_STICKY = False
+        own = [("bid", imm.PAD_BID_CENTS, 800.0)]
+        self.assertEqual(self._bid_pads([[54, 576.0], [50, 600.0], [1, 800.0]], own), [])
+
+    def test_the_diff_leaves_a_kept_pad_resting(self):
+        now = time.time()
+        own = [("bid", imm.PAD_BID_CENTS, 800.0)]
+        (n,) = self._bid_pads([[54, 576.0], [50, 600.0], [1, 800.0]], own)
+        resting = [_resting("p", "T", "bid", imm.PAD_BID_CENTS, 800.0)]
+        place, cancel, amend = diff_orders(
+            [Quote("T", "bid", imm.PAD_BID_CENTS, n, is_pad=True)], resting,
+            {"p": now - 60}, now)
+        self.assertEqual((place, cancel, amend), ([], [], []))
+
+
 class TestCutoffEnforcement(unittest.TestCase):
     def _bot(self):
         _clean_persist()

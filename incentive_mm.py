@@ -416,6 +416,22 @@ PAD_MIN_TICKS_BEHIND = _env_int("IMM_PAD_MIN_BEHIND", 2)
 # churn between requotes, and damps pad resize churn (hysteresis via
 # rounding). ~$3 collateral per pad at 1c/99c.
 PAD_SLACK_CONTRACTS = _env_int("IMM_PAD_SLACK", 300)
+# STICKY PADS (Jack 2026-10-22: "Sticky pad fix"): a pad already resting is
+# neither pulled nor shrunk until the depth OUTSIDE it reaches
+# PAD_STICKY_RELEASE_MULT x the target; below that the desired pad is the
+# resting one, so the diff leaves it alone. From 00:01Z 10/21 another maker
+# added ~600 to BOTH sides of each KXMAMDANIMENTION word whenever our 1c pad
+# lifted the YES side past 1,000. 576 + 600 >= 1,000 made our pad look
+# redundant, the requote pulled it, they pulled theirs, we re-padded: a
+# two-cycle loop. Pads rested a median 28-31 s (vs ~23 min on 10/20), words
+# read one-sided on ~45% of cycles, and the selector caught them pad-less at
+# est 0 and dropped them as hopeless (148 times on 10/21). Pads cost ~1c
+# collateral a contract, so keeping one longer is cheap. The touch band,
+# ticks-behind and stand-down gates still pull a pad at once (they decide
+# whether a pad is wanted at all; this only sizes one that is).
+# IMM_PAD_STICKY=0 restores the plain resize.
+PAD_STICKY = os.environ.get("IMM_PAD_STICKY", "1") == "1"
+PAD_STICKY_RELEASE_MULT = max(1.0, _env_float("IMM_PAD_STICKY_RELEASE_MULT", 2.0))
 # GLOBAL since 2026-07-29 (Jack: "some quotes are not earning because there
 # are not 1000 orders on that side... fix this systematically — quote how
 # many orders are necessary at the very bottom of the orderbook"): every
@@ -1260,6 +1276,22 @@ def pad_quantity(external_and_touch_depth: float, target: float) -> int:
         return 0
     n = int(math.ceil((gap + PAD_SLACK_CONTRACTS) / PAD_ROUND) * PAD_ROUND)
     return min(n, PAD_MAX_CONTRACTS)
+
+
+def sticky_pad_quantity(basis: float, target: float, resting_pad: float) -> int:
+    """pad_quantity for a side whose own resting pad is `resting_pad`
+    contracts (STICKY PADS, 2026-10-22). While the depth outside our pad
+    (`basis`) is under PAD_STICKY_RELEASE_MULT x target, a smaller want
+    (including 0) keeps the resting pad as it is, so other makers who joined
+    because our pad qualified the side cannot talk it off the book. A bigger
+    want still resizes up. Capped at PAD_MAX_CONTRACTS like any pad."""
+    n = pad_quantity(basis, target)
+    if not PAD_STICKY or resting_pad < 1:
+        return n
+    keep = min(int(round(resting_pad)), PAD_MAX_CONTRACTS)
+    if n < keep and basis < PAD_STICKY_RELEASE_MULT * target:
+        return keep
+    return n
 
 
 def sides_can_qualify(series: str, target: float, depth_yes: float,
@@ -9667,6 +9699,7 @@ _CONFIG_CODE_KNOBS = (
     "MENTION_AUTO", "MENTION_AUTO_EXCLUDE", "MENTION_AUTO_GATE",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
+    "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE", "MENTION_NO_CUTOFF_EXEMPT",
     "MENTION_ANNOUNCE_SERIES", "MENTION_ANNOUNCE_FILL_CT",
@@ -27854,13 +27887,13 @@ class IncentiveMarketMaker:
             # live: book already holds our near-touch, subtract only our pad;
             # dry: sim orders aren't in the book, add this cycle's near-touch.
             basis = (yes_depth - own_pad_bid) if self.live else (yes_depth + nt_bid)
-            n = pad_quantity(basis, target)
+            n = sticky_pad_quantity(basis, target, own_pad_bid)
             if n > 0:
                 pads.append(Quote(ticker, "bid", PAD_BID_CENTS, n, is_pad=True))
         if ask_pad_safe and (nt_ask > 0 or (pad_missing_side and nt_bid > 0)) \
                 and not series_bid_only(series_of(ticker)):
             basis = (no_depth - own_pad_ask) if self.live else (no_depth + nt_ask)
-            n = pad_quantity(basis, target)
+            n = sticky_pad_quantity(basis, target, own_pad_ask)
             if n > 0:
                 pads.append(Quote(ticker, "ask", PAD_ASK_CENTS, n, is_pad=True))
         return pads
@@ -30045,6 +30078,12 @@ class IncentiveMarketMaker:
                 f"after {EVENT_DEPTH_RESUME_SECS // 60} min healthy; a 2nd burst within "
                 f"{EVENT_FILL_STRIKE_TTL_SECS / 60:g} min is permanent); no thin-book "
                 f"trigger")
+        if PAD_STICKY:
+            log(f"sticky pads (2026-10-22): a resting pad is not pulled or shrunk "
+                f"until the depth outside it reaches {PAD_STICKY_RELEASE_MULT:g}x "
+                f"the target (makers who joined because our pad qualified the side "
+                f"no longer make it look redundant); the touch band, ticks-behind "
+                f"and stand-down gates still pull it at once")
         if EVENT_DEPTH_GATE_PREFIXES:
             log(f"live-event depth gate: {','.join(EVENT_DEPTH_GATE_PREFIXES)} "
                 f"— pads OFF; any quotable side < "
