@@ -130,12 +130,59 @@ class TestCoverage(unittest.TestCase):
         os.makedirs(d)
         with open(os.path.join(d, "export_2026-10-10.jsonl"), "w", encoding="utf-8") as f:
             f.write(json.dumps({"labs": {"2026-10-10": {
-                "deepseek|tokens": 9.0, "anthropic|tokens": 20.0, "newlab|tokens": 1.25}}}) + "\n")
+                "deepseek|tokens": 9.0, "anthropic|tokens": 20.0, "newlab|tokens": 0.25}}}) + "\n")
         progs = {f"{vf.OPEN_SERIES}-26OCT13-T64.7": {}}
-        with mock.patch.object(vf, "INTRADAY_DIR", d):
+        with mock.patch.object(vf, "INTRADAY_DIR", d), \
+                mock.patch.object(mc, "_gateway_weights", side_effect=AssertionError):
             gaps = mc.find_gaps(progs, self.now, [mc.check_vercel_labs])
         self.assertEqual(list(gaps), ["Vercel open-weight labs (vercel_fair)|newlab"])
-        self.assertIn("1.25% of tokens", gaps["Vercel open-weight labs (vercel_fair)|newlab"]["why"])
+        self.assertIn("0.25% of tokens", gaps["Vercel open-weight labs (vercel_fair)|newlab"]["why"])
+
+    def test_a_vercel_lab_past_the_share_is_reported_once_more(self):
+        # Reflection (2026-10-22): baselined at 0.002%, it reached 7.4% of
+        # tokens on models Vercel counts as open, and nothing re-alerted
+        import vercel_fair as vf
+        fam = "Vercel open-weight labs (vercel_fair)"
+        d = os.path.join(self.dir, "vercel")
+        os.makedirs(d)
+        with open(os.path.join(d, "export_2026-10-10.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"labs": {
+                "2026-10-09": {"openlab|tokens": 3.0},          # yesterday's peak counts
+                "2026-10-10": {"deepseek|tokens": 9.0, "openlab|tokens": 0.1,
+                               "smalllab|tokens": 0.2, "closedlab|tokens": 6.0,
+                               "mixedlab|tokens": 1.0, "unlisted|tokens": 0.8}}}) + "\n")
+        progs = {f"{vf.OPEN_SERIES}-26OCT13-T64.7": {}}
+        gw = {"openlab": {"open": ["openlab/a", "openlab/b"], "n": 2},
+              "closedlab": {"open": [], "n": 5},
+              "mixedlab": {"open": ["mixedlab/x"], "n": 3}}
+        with mock.patch.object(vf, "INTRADAY_DIR", d), \
+                mock.patch.object(mc, "_gateway_weights", return_value=gw):
+            gaps = mc.find_gaps(progs, self.now, [mc.check_vercel_labs])
+        self.assertEqual(sorted(gaps), [f"{fam}|closedlab",              # all closed: quiet
+                                        f"{fam}|mixedlab (>= 0.5% of tokens)",
+                                        f"{fam}|openlab (>= 0.5% of tokens)",
+                                        f"{fam}|smalllab",
+                                        f"{fam}|unlisted (>= 0.5% of tokens)"])
+        self.assertTrue(all(g["once"] for g in gaps.values()))
+        g = gaps[f"{fam}|openlab (>= 0.5% of tokens)"]
+        self.assertIn("3.00% of tokens (2026-10-09)", g["why"])
+        self.assertIn("all 2 of its gateway models are tagged open-weights", g["why"])
+        self.assertTrue(g["fix"].startswith("add it to vercel_fair.OPEN_WEIGHT_LABS"))
+        self.assertIn("mixed lab", gaps[f"{fam}|mixedlab (>= 0.5% of tokens)"]["fix"])
+        self.assertIn("lists no model of it", gaps[f"{fam}|unlisted (>= 0.5% of tokens)"]["why"])
+        # an unreadable model list alerts unfiltered
+        with mock.patch.object(vf, "INTRADAY_DIR", d), \
+                mock.patch.object(mc, "_gateway_weights", return_value=None):
+            gaps2 = mc.find_gaps(progs, self.now, [mc.check_vercel_labs])
+        self.assertIn("unreadable", gaps2[f"{fam}|closedlab (>= 0.5% of tokens)"]["why"])
+        # the first-sight report was sent long ago; the grown lab's is new
+        state = {f"{fam}|openlab": {"first": self.now - 6 * 86400, "seen": self.now - 1800,
+                                    "sent": self.now - 6 * 86400, "once": True}}
+        out, st = mc.due(state, gaps, self.now)
+        sent = [k for k, _g, _f, _n in out]
+        self.assertIn(f"{fam}|openlab (>= 0.5% of tokens)", sent)
+        self.assertNotIn(f"{fam}|openlab", sent)
+        self.assertIn(f"{fam}|openlab", st)                               # still remembered
 
     def test_by_design_gaps_are_baselined_on_day_one_and_remembered(self):
         once = mc._gap("YT", "ARI", ["X-1"], "closed", "pilot", "admit")

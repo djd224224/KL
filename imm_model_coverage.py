@@ -392,18 +392,85 @@ def check_sports_ladders(progs: Dict[str, dict], now_ts: float) -> List[dict]:
     return out
 
 
+# A lab outside the open sum is reported once on first sight; once its token
+# share reaches LAB_REALERT_SHARE (the larger of the export block's days,
+# yesterday complete and today running) it is reported once more, under its
+# own key (Jack 2026-10-22: "Yes" -- Reflection, baselined at 0.002% on
+# 10/16, carried 7.4% of tokens by 10/21 that Vercel's chart counts as open,
+# and the sum ran ~9 pp low with no alert). A lab whose gateway models are
+# all untagged stays quiet at any share: its tokens are rightly outside the
+# open sum (spacexai's Grok, typesafe-ai's Jev).
+LAB_REALERT_SHARE = float(os.environ.get("IMM_MODEL_GAP_LAB_REALERT_SHARE", "0.5"))
+GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1/models"
+_gateway_cache: Dict[str, Optional[dict]] = {}
+
+
+def _gateway_weights() -> Optional[Dict[str, dict]]:
+    """{lab: {"open": [open-weights model ids], "n": models}} from the AI
+    Gateway's public model list (its owned_by is the export's lab name),
+    read once per process; None when the list cannot be read."""
+    if "labs" not in _gateway_cache:
+        labs: Optional[Dict[str, dict]] = None
+        try:
+            import requests
+            import vercel_fair as vf
+            r = requests.get(GATEWAY_MODELS_URL, headers=vf.UA, timeout=20)
+            r.raise_for_status()
+            labs = {}
+            for m in (r.json() or {}).get("data") or []:
+                e = labs.setdefault(str(m.get("owned_by") or ""), {"open": [], "n": 0})
+                e["n"] += 1
+                if "open-weights" in (m.get("tags") or []):
+                    e["open"].append(str(m.get("id") or ""))
+        except Exception:                            # noqa: BLE001 - alert unfiltered
+            labs = None
+        _gateway_cache["labs"] = labs
+    return _gateway_cache["labs"]
+
+
+def _lab_realert(family: str, lab: str, share: float, day: Optional[str],
+                 markets: List[str]) -> Optional[dict]:
+    """The second report of a lab outside the open sum, at LAB_REALERT_SHARE
+    or more of tokens; None when the gateway lists its models and none is
+    tagged open-weights."""
+    gw = _gateway_weights()
+    info = (gw or {}).get(lab)
+    if info and info["n"] and not info["open"]:
+        return None
+    add = ("add it to vercel_fair.OPEN_WEIGHT_LABS (KXOPENSOURCESHARE's sum), "
+           "then restart_imm.ps1")
+    if not info:
+        tags = ("the gateway model list was unreadable" if gw is None
+                else "the gateway lists no model of it")
+        fix = "if it ships only open-weight models, " + add
+    elif len(info["open"]) == info["n"]:
+        tags = f"all {info['n']} of its gateway models are tagged open-weights"
+        fix = add
+    else:
+        tags = (f"{len(info['open'])} of its {info['n']} gateway models are tagged "
+                f"open-weights ({', '.join(info['open'][:3])})")
+        fix = ("a mixed lab cannot join the lab sum: check KXOPENSOURCESHARE's fair "
+               "against Vercel's weight-class chart (gateway-model-leaderboard"
+               "?groupBy=weightClass) before quoting")
+    return _gap(family, f"{lab} (>= {LAB_REALERT_SHARE:g}% of tokens)", markets, "open",
+                f"lab {lab!r} now carries {share:.2f}% of tokens ({day}) but is not in "
+                f"OPEN_WEIGHT_LABS; {tags}", fix)
+
+
 def check_vercel_labs(progs: Dict[str, dict], now_ts: float) -> List[dict]:
     """KXOPENSOURCESHARE sums a fixed list of open-weight labs
     (vercel_fair.OPEN_WEIGHT_LABS): a lab that is new to Vercel's export is
     left out of the sum silently. Each one is reported once (on the pass's
-    first run the labs already there are recorded without an email)."""
+    first run the labs already there are recorded without an email), and
+    once more if its token share reaches LAB_REALERT_SHARE."""
     import glob
     import vercel_fair as vf
     if not any(_series(t) == vf.OPEN_SERIES for t in progs):
         return []
+    family = "Vercel open-weight labs (vercel_fair)"
     files = sorted(glob.glob(os.path.join(vf.INTRADAY_DIR, "export_*.jsonl")))
     if not files:
-        return [_gap("Vercel open-weight labs (vercel_fair)", "(export files)", [],
+        return [_gap(family, "(export files)", [],
                      "open", f"no vercel-logger export in {vf.INTRADAY_DIR}",
                      "check the vercel-logger task")]
     last = None
@@ -417,16 +484,26 @@ def check_vercel_labs(progs: Dict[str, dict], now_ts: float) -> List[dict]:
     for k, v in (labs_by_day.get(day) or {}).items():
         lab, _, metric = k.partition("|")
         shares[lab] += float(v or 0) if metric == "tokens" else 0.0
+    peak: Dict[str, tuple] = {}                      # lab -> (largest share, its day)
+    for d, block in labs_by_day.items():
+        for k, v in (block or {}).items():
+            lab, _, metric = k.partition("|")
+            if metric == "tokens" and float(v or 0) > peak.get(lab, (-1.0, None))[0]:
+                peak[lab] = (float(v or 0), d)
     known = set(vf.OPEN_WEIGHT_LABS) | {lab for lab, _m in vf.LAB_SERIES.values()}
+    markets = [t for t in progs if _series(t) == vf.OPEN_SERIES][:3]
     out = []
     for lab, sh in sorted(shares.items()):
         if lab in known:
             continue
-        g = _gap("Vercel open-weight labs (vercel_fair)", lab,
-                 [t for t in progs if _series(t) == vf.OPEN_SERIES][:3], "open",
-                 f"lab {lab!r} is in Vercel's export ({sh:.2f}% of tokens on {day}) but not in "
-                 f"OPEN_WEIGHT_LABS", "if it ships only open-weight models, add it "
-                 "to vercel_fair.OPEN_WEIGHT_LABS (KXOPENSOURCESHARE's sum)")
+        top, top_day = peak.get(lab, (sh, day))
+        g = (_lab_realert(family, lab, top, top_day, markets)
+             if top >= LAB_REALERT_SHARE else None)
+        if g is None:
+            g = _gap(family, lab, markets, "open",
+                     f"lab {lab!r} is in Vercel's export ({sh:.2f}% of tokens on {day}) "
+                     f"but not in OPEN_WEIGHT_LABS", "if it ships only open-weight "
+                     "models, add it to vercel_fair.OPEN_WEIGHT_LABS (KXOPENSOURCESHARE's sum)")
         g["once"] = True
         out.append(g)
     return out
