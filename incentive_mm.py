@@ -10235,6 +10235,7 @@ _CONFIG_CODE_KNOBS = (
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
     "SIDE_MULT_SERIES",                          # Trump B half bids / 1.5x asks (2026-10-22)
+    "FAMILY_SIDE_LEANS",                         # family 1.5x / 0.75x side leans (2026-10-22)
     "SIZE_TEST_MULT", "SIZE_TEST_FROM", "SIZE_TEST_DAYS",   # base size split test (2026-10-26)
     "SIZE_TEST_SALT",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
@@ -13443,10 +13444,89 @@ SIDE_MULT_SERIES = _side_mult_spec(os.environ.get("IMM_SIDE_MULT_SERIES",
                                                   "KXTRUMPMENTIONB:0.5:1.5"))
 
 
+# FAMILY SIDE LEANS (Jack 2026-10-22: "Both leans now but 1.5x the winning
+# side and .75 the losing side" + "Also build lean for Econ and rates"),
+# from that day's bids-vs-asks study -- the dashboard's 30 days of fills with
+# their mark-outs, then 57k fills on settled markets 7/11-10/15. Which side
+# loses the fills depends on the family:
+#   the bids, in Rotten Tomatoes (asks +14c a contract at settlement, bids
+#   -19c), the other mentions (asks +10c better), Econ & rates (+16c);
+#   mentions + RT had asks better 13 of 15 weeks;
+#   the asks, in the alt-data trackers -- Commodities & shipping, Company
+#   KPIs, AI & tech, Carbon Arc -- bids better 10 of 12 weeks.
+# Each family rests its winning side at 1.5x and its losing side at 0.75x, on
+# top of every other size rule. The winning side's per-market cap scales
+# with it (place_with_caps); events and positions still bind as before.
+# Families are the dashboard's (imm_dashboard.family_of -- stdlib-only, the
+# study's own -- cached per series FAMILY_LEAN_TTL_SECS), so a family's new
+# series leans the day it is quoted. A series in SIDE_MULT_SERIES keeps its
+# own (KXTRUMPMENTIONB's test). IMM_FAMILY_SIDE_LEANS="" turns them off.
+# imm_side_lean_report.py emails the result (Thu 2026-11-05).
+def _family_lean_spec(raw: str) -> Dict[str, Tuple[float, float]]:
+    """"Family:bid:ask|Family:bid:ask" -> {family: (bid_mult, ask_mult)}."""
+    out: Dict[str, Tuple[float, float]] = {}
+    for part in (raw or "").split("|"):
+        bits = [b.strip() for b in part.rsplit(":", 2)]
+        if len(bits) != 3 or not bits[0]:
+            continue
+        try:
+            out[bits[0]] = (max(0.0, float(bits[1])), max(0.0, float(bits[2])))
+        except ValueError:
+            continue
+    return out
+
+
+_ASK_LEAN, _BID_LEAN = "0.75:1.5", "1.5:0.75"
+_DEFAULT_FAMILY_SIDE_LEANS = (
+    f"Rotten Tomatoes:{_ASK_LEAN}|Other mentions:{_ASK_LEAN}|Econ & rates:{_ASK_LEAN}|"
+    f"Commodities & shipping:{_BID_LEAN}|Company KPIs:{_BID_LEAN}|AI & tech:{_BID_LEAN}|"
+    f"Carbon Arc consumer:{_BID_LEAN}")
+FAMILY_SIDE_LEANS = _family_lean_spec(os.environ.get("IMM_FAMILY_SIDE_LEANS",
+                                                     _DEFAULT_FAMILY_SIDE_LEANS))
+FAMILY_LEAN_TTL_SECS = 6 * 3600
+_family_cache: Dict[str, Tuple[float, str]] = {}
+_family_mod_failed = 0.0           # when importing imm_dashboard last failed
+
+
+def _dashboard_family(series: str) -> str:
+    """imm_dashboard.family_of's family for a series, '' when the module will
+    not import (tried again after an hour) or the lookup raises."""
+    global _family_mod_failed
+    if time.time() - _family_mod_failed < 3600:
+        return ""
+    try:
+        import imm_dashboard
+    except Exception as e:
+        _family_mod_failed = time.time()
+        log(f"[IMM] ! family side leans off for an hour: imm_dashboard: {e}")
+        return ""
+    try:
+        return str(imm_dashboard.family_of(series)[0] or "")
+    except Exception:
+        return ""
+
+
+def series_family(series: str) -> str:
+    """The dashboard family of a series, cached FAMILY_LEAN_TTL_SECS."""
+    now = time.time()
+    hit = _family_cache.get(series)
+    if hit is None or now - hit[0] > FAMILY_LEAN_TTL_SECS:
+        hit = (now, _dashboard_family(series))
+        _family_cache[series] = hit
+    return hit[1]
+
+
 def series_side_mults(series: str) -> Tuple[float, float]:
-    """(bid_mult, ask_mult) every market of the series carries
-    (SIDE_MULT_SERIES); (1.0, 1.0) elsewhere."""
-    return SIDE_MULT_SERIES.get(series, (1.0, 1.0))
+    """(bid_mult, ask_mult) every market of the series carries: its own
+    SIDE_MULT_SERIES entry, else its family's lean (FAMILY_SIDE_LEANS), else
+    (1.0, 1.0)."""
+    if series in SIDE_MULT_SERIES:
+        return SIDE_MULT_SERIES[series]
+    if FAMILY_SIDE_LEANS:
+        lean = FAMILY_SIDE_LEANS.get(series_family(series))
+        if lean is not None:
+            return lean
+    return (1.0, 1.0)
 
 
 def side_size_mults(ticker: str, now_utc: datetime) -> Tuple[float, float]:
@@ -31620,6 +31700,12 @@ class IncentiveMarketMaker:
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
                             for s, (b, a) in sorted(SIDE_MULT_SERIES.items()))
                 + " -- every other series unchanged; report email 2026-11-05")
+        if FAMILY_SIDE_LEANS:
+            log("family side leans (2026-10-22): "
+                + ", ".join(f"{f} bids x{b:g} / asks x{a:g}"
+                            for f, (b, a) in sorted(FAMILY_SIDE_LEANS.items()))
+                + " -- families by imm_dashboard.family_of; a series' own side sizes "
+                  "win; report email 2026-11-05")
         _st0, _st1 = size_test_window()
         if _st0 is not None:
             log(f"size split test (2026-10-22): x{SIZE_TEST_MULT:g} on the family wire for the "

@@ -242,6 +242,11 @@ def setUpModule():
     imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
     imm.RT_FAIR_FILE = os.path.join(tmp, "rt_fair.json")
     imm._rt_fair_state.update(mtime=0.0, markets={})
+    # the 2026-10-22 family side leans size by the dashboard's family of a
+    # series: off module-wide, so fixture series that happen to be RT, a
+    # mention or an econ print keep their sizes (TestFamilySideLeans turns
+    # them on)
+    imm.FAMILY_SIDE_LEANS = {}
     # the 2026-10-22 ski-resort snowfall gate (TestResortSnowGate deletes it)
     imm.RESORT_SNOW_FILE = os.path.join(tmp, "resort_snow_fair.json")
     imm._resort_snow_state.update(mtime=0.0, markets={}, events={}, mapped={})
@@ -8206,6 +8211,88 @@ class TestSeriesSideMults(unittest.TestCase):
         self.assertEqual(imm._side_mult_spec("kxa:0.5:1.5, KXB:bad:1, :1:1, KXC:0:2, KXD:1"),
                          {"KXA": (0.5, 1.5), "KXC": (0.0, 2.0)})
         self.assertEqual(imm._side_mult_spec(""), {})
+
+
+class TestFamilySideLeans(unittest.TestCase):
+    """Jack 2026-10-22, after the bids-vs-asks study: "Both leans now but
+    1.5x the winning side and .75 the losing side" + "Also build lean for
+    Econ and rates"."""
+
+    FAMS = {"KXRT": "Rotten Tomatoes", "KXWCMENTION": "Other mentions",
+            "KXUST10AD": "Econ & rates", "KXSUEZWEEKLY": "Commodities & shipping",
+            "KXLUV": "Company KPIs", "KXOPENSOURCESHARE": "AI & tech",
+            "KXLULUCC": "Carbon Arc consumer", "KXTRUMPMENTIONB": "TRUMP mentions",
+            "KXHIGHNY": "Weather & quakes"}
+
+    def setUp(self):
+        self.real_family = imm._dashboard_family
+        imm._family_cache.clear()
+        self.addCleanup(imm._family_cache.clear)
+        p = mock.patch.object(imm, "FAMILY_SIDE_LEANS",
+                              imm._family_lean_spec(imm._DEFAULT_FAMILY_SIDE_LEANS))
+        p.start()
+        self.addCleanup(p.stop)
+        self.calls = []
+
+        def fam(series):
+            self.calls.append(series)
+            return self.FAMS.get(series, "")
+        p = mock.patch.object(imm, "_dashboard_family", side_effect=fam)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_default_leans(self):
+        self.assertEqual(imm._family_lean_spec(imm._DEFAULT_FAMILY_SIDE_LEANS), {
+            "Rotten Tomatoes": (0.75, 1.5), "Other mentions": (0.75, 1.5),
+            "Econ & rates": (0.75, 1.5), "Commodities & shipping": (1.5, 0.75),
+            "Company KPIs": (1.5, 0.75), "AI & tech": (1.5, 0.75),
+            "Carbon Arc consumer": (1.5, 0.75)})
+        self.assertEqual(imm._family_lean_spec("A & B:0.5:2|bad|C:1:x| :1:1"),
+                         {"A & B": (0.5, 2.0)})
+        self.assertEqual(imm._family_lean_spec(""), {})
+        self.assertIn("FAMILY_SIDE_LEANS", imm._CONFIG_CODE_KNOBS)
+
+    def test_each_family_leans_its_winning_side(self):
+        for s in ("KXRT", "KXWCMENTION", "KXUST10AD"):
+            self.assertEqual(imm.series_side_mults(s), (0.75, 1.5), s)
+        for s in ("KXSUEZWEEKLY", "KXLUV", "KXOPENSOURCESHARE", "KXLULUCC"):
+            self.assertEqual(imm.series_side_mults(s), (1.5, 0.75), s)
+        # no lean for the rest; Trump B keeps its own test's sizes
+        self.assertEqual(imm.series_side_mults("KXHIGHNY"), (1.0, 1.0))
+        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.5, 1.5))
+        now = utc(2026, 10, 23, 15, 0)
+        self.assertEqual(imm.side_size_mults("KXRT-WILD-90", now), (0.75, 1.5))
+        self.assertEqual(imm.side_size_mults("KXSUEZWEEKLY-26OCT25-T40", now), (1.5, 0.75))
+        with mock.patch.object(imm, "FAMILY_SIDE_LEANS", {}):
+            self.assertEqual(imm.series_side_mults("KXRT"), (1.0, 1.0))
+
+    def test_the_family_is_cached(self):
+        imm.series_side_mults("KXRT")
+        imm.series_side_mults("KXRT")
+        self.assertEqual(self.calls, ["KXRT"])
+        imm._family_cache["KXRT"] = (time.time() - imm.FAMILY_LEAN_TTL_SECS - 1, "x")
+        self.assertEqual(imm.series_side_mults("KXRT"), (0.75, 1.5))
+        self.assertEqual(self.calls, ["KXRT", "KXRT"])
+
+    def test_the_real_lookup_and_its_failure(self):
+        import builtins
+        import sys
+        real = self.real_family                     # not the setUp mock
+        with mock.patch.object(imm, "_family_mod_failed", 0.0):
+            self.assertEqual(real("KXWCMENTION"), "Other mentions")
+            self.assertEqual(real("KXRT"), "Rotten Tomatoes")
+            real_import = builtins.__import__
+
+            def no_dash(name, *a, **k):
+                if name == "imm_dashboard":
+                    raise ImportError("gone")
+                return real_import(name, *a, **k)
+            with mock.patch.dict(sys.modules, {"imm_dashboard": None}), \
+                    mock.patch.object(builtins, "__import__", side_effect=no_dash):
+                self.assertEqual(real("KXRT"), "")
+                self.assertGreater(imm._family_mod_failed, 0)
+            # an hour's rest before the next try, even with the module back
+            self.assertEqual(real("KXRT"), "")
 
 
 class TestCutoffEnforcement(unittest.TestCase):
