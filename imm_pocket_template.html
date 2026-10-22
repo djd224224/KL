@@ -284,6 +284,12 @@ function renderHero() {
     const y = M.ystd;
     cmp = '<div class="cmp">At this time yesterday: net ' + money(y.rew + y.pnl) + " (rewards " + fmtUSD(y.rew) + ", trading " + fmtUSD(y.pnl, true) + ")</div>";
   }
+  // trading split: the window's new fills vs the inventory carried in (marks and
+  // settlements on positions held from before it). Jack 2026-10-22: "The link
+  // still doesn't show new vs carry" -- it showed only inside a tapped family.
+  const carry = num(t.cr) + num(t.cs);
+  const nfc = na ? "" : '<div class="cmp">Trading = new fills ' + money(num(t.pnl) - carry) +
+    " + carry " + money(carry) + " (held marks " + money(num(t.cr)) + ", settled " + money(num(t.cs)) + ")</div>";
   $("hero").innerHTML =
     '<div class="lbl">Net · ' + esc(w.desc) + "</div>" +
     '<div class="big ' + (na ? "" : cls(t.net)) + '">' + (na ? "n/a" : fmtUSD(t.net, true)) + "</div>" +
@@ -294,7 +300,7 @@ function renderHero() {
       '<div><div class="k"><i class="key" style="background:var(--s-trade)"></i>Trading P&amp;L</div><div class="v ' + (na ? "" : cls(t.pnl)) + '">' + (na ? "n/a" : fmtUSD(t.pnl, true)) + "</div>" +
         '<div class="s">realized ' + fmtUSD(t.real, true) + " · marks " + fmtUSD(t.du, true) + "</div>" +
         spark(hist.map((r) => r.pnl), css("--s-trade")) + "</div>" +
-    "</div>" + cmp;
+    "</div>" + nfc + cmp;
 }
 
 function niceStep(span, n) {
