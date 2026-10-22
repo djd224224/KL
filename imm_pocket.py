@@ -335,6 +335,47 @@ def build(D, fetch_titles=True):
     return out
 
 
+def _usd(v):
+    return f"{'-' if v < 0 else '+'}${abs(v):,.0f}"
+
+
+def explain(data, wkey="today", n=3):
+    """What moved the window, for the refresh reply (Jack 2026-10-22: "When
+    I ask for refresh, always give me an explanation of the days
+    performance"): the day against a typical full day and against yesterday
+    at this time, its split, then the families that moved it most either way,
+    each with its split and its biggest event."""
+    w = (data.get("windows") or {}).get(wkey)
+    if not w:
+        return []
+    t, titles = w["tot"], data.get("titles") or {}
+    carry = t["cr"] + t["cs"]
+    head = f"net {_usd(t['net'])}"
+    if t.get("typ") is not None:
+        head += f" vs a typical full day {_usd(t['typ'])} (7-day mean)"
+    ys = data.get("ystd") if wkey == "today" else None
+    if ys:
+        head += (f"; yesterday at this time {_usd(ys['rew'] + ys['pnl'])} (rewards "
+                 f"${ys['rew']:,.0f}, trading {_usd(ys['pnl'])})")
+    out = [head]
+    if not w.get("pnl_na"):
+        out.append(f"rewards ${t['rew']:,.0f}, trading {_usd(t['pnl'])} = new fills "
+                   f"{_usd(t['pnl'] - carry)} + carry {_usd(carry)} (marks {_usd(t['cr'])}, "
+                   f"settled {_usd(t['cs'])}); {int(t['fills'])} fills")
+
+    def fam(r):
+        s = (f"{r['name']} {_usd(r['net'])} (rewards ${r['rew']:,.0f}, new fills {_usd(r['nf'])}, "
+             f"carry {_usd(r['cr'] + r['cs'])}, {r['fills']} fills)")
+        ev = max(r.get("ev") or [], key=lambda e: abs(e["net"]), default=None)
+        if ev and abs(ev["net"]) >= 1:
+            s += f"; biggest event {titles.get(ev['e']) or ev['e']} {_usd(ev['net'])}"
+        return s
+    fams = w.get("fams") or []
+    out += ["drag: " + fam(r) for r in sorted(fams, key=lambda r: r["net"])[:n] if r["net"] <= -1]
+    out += ["lift: " + fam(r) for r in sorted(fams, key=lambda r: -r["net"])[:n] if r["net"] >= 1]
+    return out
+
+
 def render(data, template_path):
     with open(template_path, encoding="utf-8") as f:
         tpl = f.read()
@@ -379,6 +420,9 @@ def main(argv=None):
                      f" (marks {t['cr']:+.2f}, settled {t['cs']:+.2f})")
             print(f"  {k:<9} net {t['net']:+10.2f}  rewards {t['rew']:10.2f}  trading {t['pnl']:+10.2f}"
                   f"{split}  fills {int(t['fills'])}  families {len(w['fams'])}")
+        print("explain today (the refresh reply explains the day from these):")
+        for line in explain(data, "today"):
+            print(f"  {line}")
     return 0
 
 

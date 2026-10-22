@@ -438,16 +438,21 @@ function renderFams() {
   const w = M.windows[W], na = w.pnl_na;
   $("sortseg").innerHTML = Object.keys(SORTS).map((k) => '<button type="button" data-s="' + k + '" aria-pressed="' + (k === SORT) + '">' + SORTS[k][0] + "</button>").join("");
   const rows = w.fams.slice().sort(SORTS[SORT][1]);
-  $("famNote").textContent = "Trading P&L = the window's new fills + inventory carried in. Tap a family for its top events, the split, mark-outs and worst case.";
-  let h = '<thead><tr><th scope="col">Family</th><th scope="col">Net</th><th scope="col">Rewards</th><th scope="col">Trading</th></tr></thead><tbody>';
+  // trading in two columns, new fills and carry (Jack 2026-10-22: "I still
+  // don't see the carry vs new fills split in the table"): net = rewards +
+  // new fills + carry, row by row
+  $("famNote").textContent = "Net = rewards + new fills + carry. New fills: the window's own fills, marked to its end or to settlement. Carry: inventory held into the window, re-marked or settled. Tap a family for its top events, mark-outs and worst case.";
+  let h = '<thead><tr><th scope="col">Family</th><th scope="col">Net</th><th scope="col">Rewards</th><th scope="col">New fills</th><th scope="col">Carry</th></tr></thead><tbody>';
+  const cells = (x, nf, carry) => '<td class="net">' + (na ? "n/a" : money(x.net)) + "</td><td>" + fmtUSD(x.rew) +
+    "</td><td>" + (na ? "n/a" : money(nf)) + "</td><td>" + (na ? "n/a" : money(carry)) + "</td>";
   for (const r of rows) {
     const open = OPEN.has(r.name);
     h += '<tr class="frow" tabindex="0" data-f="' + esc(r.name) + '" aria-expanded="' + open + '"><td>' + esc(r.name) + "</td>" +
-      '<td class="net">' + (na ? "n/a" : money(r.net)) + "</td><td>" + fmtUSD(r.rew) + "</td><td>" + (na ? "n/a" : money(r.pnl)) + "</td></tr>";
-    if (open) h += '<tr class="det"><td colspan="4">' + detail(r, w) + "</td></tr>";
+      cells(r, num(r.nf), num(r.cr) + num(r.cs)) + "</tr>";
+    if (open) h += '<tr class="det"><td colspan="5">' + detail(r, w) + "</td></tr>";
   }
-  const t = w.tot;
-  h += '<tr class="tot"><td>All families</td><td class="net">' + (na ? "n/a" : money(t.net)) + "</td><td>" + fmtUSD(t.rew) + "</td><td>" + (na ? "n/a" : money(t.pnl)) + "</td></tr></tbody>";
+  const t = w.tot, tc = num(t.cr) + num(t.cs);
+  h += '<tr class="tot"><td>All families</td>' + cells(t, num(t.pnl) - tc, tc) + "</tr></tbody>";
   $("fams").innerHTML = h;
 }
 
