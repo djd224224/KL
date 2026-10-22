@@ -28619,6 +28619,41 @@ class TestFamilyX2Oct11(unittest.TestCase):
         self.assertEqual(imm.applied_mention_mult(g), 1.0)
 
 
+class TestFamilyX2Oct22(unittest.TestCase):
+    """Jack 2026-10-22: "Only the 2x" -- the eight fill-free open-scan
+    graduates at x2 on the family size_mult wire, keeping the graduate guard
+    set; every other graduate, and KXTRUMPMENTION (offered x1.5, not taken),
+    stays x1."""
+
+    EIGHT = ("KXORBOFHARVEST", "KXKYCOAL", "KXMSCOTTON", "KXNECOF", "KXRIQUAHOG",
+             "KXSCREWWORMCOUNT", "KXKYBOURBONBARRELS", "KXCAFAIRPLAN")
+
+    def test_code_defaults(self):
+        self.assertEqual(imm.SMALL_BOOKS_SIZE_MULT, 2.0)
+        self.assertEqual(sorted(imm.SMALL_BOOKS_X2_SERIES), sorted(self.EIGHT))
+        for s in self.EIGHT:
+            self.assertTrue(imm.scan_graduate_series(s), s)
+
+    def test_each_doubles_with_its_caps_and_keeps_the_guard_set(self):
+        for s in self.EIGHT:
+            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_max_position(s),
+                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+            self.assertEqual(imm.event_cap_contracts(s + "-26OCT"),
+                             2.0 * imm.MAX_EVENT_CONTRACTS, s)
+            self.assertFalse(imm.yield_size_eligible(s), s)     # no x1.5 on top
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertTrue(ov.safe_join, s)
+            self.assertEqual(ov.min_est_per_day, 0.0, s)
+        imm.ensure_family_override("KXKYCOAL")                  # a later clone keeps it
+        self.assertEqual(imm.applied_mention_mult("KXKYCOAL"), 2.0)
+
+    def test_the_rest_stay_x1(self):
+        for s in ("KXKSWHEAT", "KXIACORN", "KXWYCOAL", "KXNERIVISITS",
+                  "KXTRUMPMENTION", "KXTRUMPMENTIONB"):
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+
+
 class TestJoinAhead(unittest.TestCase):
     """Jack 2026-10-11 ("do 1,2,6,8", #8): an at-reference rung may rest a
     level or more ahead of a pile its own size demotes -- never at or ahead

@@ -10243,6 +10243,8 @@ _CONFIG_CODE_KNOBS = (
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",
+    # ...and the eight fill-free graduates x2 (FAMILY_X2_1022)
+    "SMALL_BOOKS_SIZE_MULT", "SMALL_BOOKS_X2_SERIES",
     # join ahead of the pile (2026-10-11)
     "JOIN_AHEAD_MODE", "JOIN_AHEAD_MIN_GAIN", "JOIN_AHEAD_MIN_DAY",
     "JOIN_AHEAD_MIN_AHEAD", "JOIN_AHEAD_MIN_TICKS", "JOIN_AHEAD_EXCLUDE",
@@ -15790,7 +15792,26 @@ FAMILY_X2_1011: Tuple[Tuple[float, Tuple[str, ...]], ...] = (
     (SHIPPING_SIZE_MULT, SHIPPING_X2_SERIES),
     (AIADOPT_SIZE_MULT, tuple(RAMP_AI_SERIES)),
 )
-for _m, _ss in FAMILY_X2_1011:
+# FAMILY x2, 2026-10-22 (Jack: "Only the 2x", to "build both raises, or only
+# the x2 on the eight small books?" -- KXTRUMPMENTION x1.5 was the other, not
+# taken): eight open-scan graduates that barely fill, 0-6 fills each over
+# 9/24-10/21 (dashboard days), so their net is their reward: KXSCREWWORMCOUNT
+# +$42, KXKYBOURBONBARRELS +$35, KXORBOFHARVEST +$34, KXKYCOAL / KXMSCOTTON /
+# KXNECOF +$30, KXRIQUAHOG +$27, KXCAFAIRPLAN +$21. Our share of each book is
+# 1-3% (cycle-log est_frac, 10/22), so x2 should nearly double the ~$6/day
+# they earn at x1. All on shard 0. The FAMILY_X2_1011 wire: the graduate
+# guard set stays, rungs, caps and skew knees scale; the other graduates stay
+# x1. IMM_SMALL_BOOKS_SIZE_MULT=1 reverts, IMM_SMALL_BOOKS_X2_SERIES replaces
+# the list (env => task-level restart).
+SMALL_BOOKS_SIZE_MULT = _env_float("IMM_SMALL_BOOKS_SIZE_MULT", 2.0)
+SMALL_BOOKS_X2_SERIES: Tuple[str, ...] = tuple(s.strip() for s in os.environ.get(
+    "IMM_SMALL_BOOKS_X2_SERIES",
+    "KXORBOFHARVEST,KXKYCOAL,KXMSCOTTON,KXNECOF,KXRIQUAHOG,KXSCREWWORMCOUNT,"
+    "KXKYBOURBONBARRELS,KXCAFAIRPLAN").split(",") if s.strip())
+FAMILY_X2_1022: Tuple[Tuple[float, Tuple[str, ...]], ...] = (
+    (SMALL_BOOKS_SIZE_MULT, SMALL_BOOKS_X2_SERIES),
+)
+for _m, _ss in FAMILY_X2_1011 + FAMILY_X2_1022:
     if _m == 1.0:
         continue
     for _s in _ss:
@@ -31561,6 +31582,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if _x2_1011:
         log(f"[IMM] family size 2026-10-11: KXRT / endorsements / shipping / "
             f"AI adoption -> {'; '.join(_x2_1011)}")
+    if SMALL_BOOKS_SIZE_MULT != 1.0 and SMALL_BOOKS_X2_SERIES:
+        log(f"[IMM] family size 2026-10-22: the fill-free graduates "
+            f"{', '.join(SMALL_BOOKS_X2_SERIES)} -> x{SMALL_BOOKS_SIZE_MULT:g}")
     if JOIN_AHEAD_MODE in ("on", "dry") and LADDER_MODE == "atref":
         log(f"[IMM] join-ahead {JOIN_AHEAD_MODE.upper()}: an at-reference rung may "
             f"rest ahead of a pile when that lifts the side's share >= "
