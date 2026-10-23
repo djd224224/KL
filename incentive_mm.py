@@ -9074,6 +9074,9 @@ EVENT_START_BUFFER_MIN = _env_int("IMM_EVENT_START_BUFFER_MIN", 30)
 # Intel"). Distinct from the 30-min game buffer because a hard scheduled
 # disclosure is a precise instant, not an approximate kickoff.
 OVERRIDE_BUFFER_MIN = _env_int("IMM_OVERRIDE_BUFFER_MIN", 10)
+# Power Slap match winners (hand-enrolled 2026-10-23): out OVERRIDE_BUFFER_MIN
+# before the card's start once it is on file (apply_series_cutoff_adjustments)
+POWERSLAP_SERIES = "KXPOWERSLAPMATCH"
 # Fresh candidates aren't admitted inside this many minutes of a cutoff
 # (pointless entry + placement race); MEMBERS are exempt and quote to the
 # true cutoff — the exchange-side order expiration is the hard stop there.
@@ -16877,6 +16880,19 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     quoting it through the print on the ticker-date fallback."""
     note_release_sources(series, market)       # the release pause's map (2026-10-22)
     ov = SERIES_OVERRIDES.get(series)
+    # POWER SLAP (Jack 2026-10-23: "Powerslap bot should stop before match
+    # start, not at midnight et"). Kalshi gives no start time before a card:
+    # each match's market closes when the match begins (10/23's closed one
+    # by one from 12:40 to 2:29 PM ET; 10/09's stayed open into the next
+    # morning), so the ticker-date midnight was the only stop. With the
+    # card's start on EVENT_START_OVERRIDES (the family watch's research
+    # writes it for every match of the card), the bot quotes match day until
+    # OVERRIDE_BUFFER_MIN before that start -- REPLACING midnight, which is
+    # earlier. With none, midnight stands; the tighteners below still apply.
+    if series == POWERSLAP_SERIES:
+        start = EVENT_START_OVERRIDES.get(event_ticker)
+        if start is not None:
+            cutoff = start - timedelta(minutes=OVERRIDE_BUFFER_MIN)
     # NOTE the event-day EXTENDER (event_day_cutoff_et) deliberately does NOT
     # live here — it shifts the ticker-date CANDIDATE inside trade_cutoff_utc,
     # before min() runs, so an occurrence-based cutoff still wins. Applying it

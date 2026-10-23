@@ -4448,6 +4448,27 @@ class TestHaltRestartContinuity(unittest.TestCase):
         self.assertGreater(bot.state.halted_until, time.time())
 
 
+class TestPowerSlapCutoff(unittest.TestCase):
+    """Power Slap stops before the card starts, not at midnight ET (Jack
+    2026-10-23: "Powerslap bot should stop before match start, not at
+    midnight et")."""
+
+    def test_the_card_start_replaces_midnight_when_on_file(self):
+        ev = "KXPOWERSLAPMATCH-26NOV06AAABBB"
+        midnight = imm.trade_cutoff_utc(ev, None, None)
+        self.assertEqual(midnight, imm.ET.localize(datetime(2026, 11, 6)).astimezone(timezone.utc))
+        start = imm.ET.localize(datetime(2026, 11, 6, 14, 0)).astimezone(timezone.utc)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {ev: start}):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(imm.POWERSLAP_SERIES, ev, midnight),
+                             start - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN))
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, clear=True):     # none on file
+            self.assertEqual(imm.apply_series_cutoff_adjustments(imm.POWERSLAP_SERIES, ev, midnight),
+                             midnight)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {"KXOTHER-26NOV06": start}):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXOTHER", "KXOTHER-26NOV06", midnight), midnight)          # other series: as before
+
+
 class TestGuardsAcrossRestarts(unittest.TestCase):
     """Every breaker or hold still running survives a restart (Jack
     2026-10-22: "Make sure other similar guards also survive bot restarts")."""

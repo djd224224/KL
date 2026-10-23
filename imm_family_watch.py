@@ -579,6 +579,9 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     fam = family_name(series, cat)
     rec = track.get(fam) if fam else None
     rec_txt = f" ({_record(fam, rec)})" if rec else ""
+    if kind == "start" and series == imm.POWERSLAP_SERIES:
+        return ("KEEP QUOTING", "a Power Slap match: quoted to midnight ET of match day "
+                "until its card start is on file, then to 10 min before it" + rec_txt)
     if kind == "start":
         return ("KEEP QUOTING", "a mention event, quoted behind the live gates" + rec_txt)
     if kind == "gap":
@@ -1017,7 +1020,27 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
             data[ev] = iso
         ieo.write_file(data)
         ieo.record_meta(ieo.provenance_batch([], [], [], resolved), data)
+    # POWER SLAP (Jack 2026-10-23: "Powerslap bot should stop before match
+    # start, not at midnight et"): every open match with no start on file
+    # is researched for its card's start; until one is written the bot
+    # stops at midnight ET of match day
+    try:
+        for ev in powerslap_events_needing_start(client):
+            targets[f"start:{ev}"] = {
+                "kind": "powerslap", "event": ev, "series": imm.POWERSLAP_SERIES,
+                "msg": "no card start time (the bot stops at midnight ET of match "
+                       "day until one is on file)"}
+    except Exception as e:                           # noqa: BLE001 - logged, next run retries
+        log(f"[WATCH] ! Power Slap event read failed: {e!r}")
     return targets
+
+
+def powerslap_events_needing_start(client) -> List[str]:
+    """Open Power Slap match events with no start on EVENT_START_OVERRIDES."""
+    resp = client.get("/events", params={"series_ticker": imm.POWERSLAP_SERIES,
+                                         "status": "open", "limit": 200}) or {}
+    return sorted(e["event_ticker"] for e in resp.get("events") or []
+                  if e.get("event_ticker") and e["event_ticker"] not in imm.EVENT_START_OVERRIDES)
 
 
 def research_due(rstate: Dict[str, dict], targets: Dict[str, dict], now_ts: float,
@@ -1062,6 +1085,17 @@ _HOW = {
               "the bot stands down at the start, so late is the costly error)",
               "python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDTHH:MM:00-04:00\"   "
               "(-04:00 through Oct 31 2026, -05:00 from Nov 1 2026)"),
+    # Power Slap (2026-10-23): one card, several match events -- each gets the
+    # card's start, the earliest moment any of its matches can begin
+    "powerslap": ("when the Power Slap CARD this match is on STARTS -- the event's / "
+                  "broadcast's scheduled start in ET (Power Slap's own event page, "
+                  "powerslap.com, the broadcaster's listing, reputable press), NOT this "
+                  "match's own slot; every match of the card gets the same start (if "
+                  "sources give a window or disagree by under an hour, the EARLIEST "
+                  "credible time -- the bot stops 10 minutes before it, so late is the "
+                  "costly error)",
+                  "python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDTHH:MM:00-04:00\"   "
+                  "(-04:00 through Oct 31 2026, -05:00 from Nov 1 2026)"),
 }
 
 
@@ -1305,7 +1339,7 @@ def target_fixed(t: dict) -> bool:
         return imm.election_cutoff_utc(ev) is not None
     if t["kind"] == "award":
         return imm.awards_event_start(ev, None, dates_only=True) is not None
-    if t["kind"] == "start":
+    if t["kind"] in ("start", "powerslap"):
         return ev in imm.EVENT_START_OVERRIDES
     return False
 

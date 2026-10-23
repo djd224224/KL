@@ -11033,3 +11033,22 @@ Deploy: incentive_mm.py change, so the sync's code-change restart; nothing chang
 - Startup line "restored guards still running across the restart: <kind> <n>, ...", when any came back. The
   first restart onto this code restores none of the new kinds: the old process saved without them.
 Deploy: incentive_mm.py change, so the sync's code-change restart.
+
+## 2026-10-23 ~21:15Z — Power Slap stops before the card starts, not at midnight (Jack: "Powerslap bot should stop before match start, not at midnight et")
+
+- KXPOWERSLAPMATCH was hand-enrolled 10/23 (extra_allow_series.json, Jack: "Quote it"). Its tickers carry the
+  match day (26OCT23...), so trade_cutoff_utc put the bot out at 00:00 ET of match day.
+- Kalshi gives no start time before a card. Each match's market closes when the match begins: 10/23's closed one
+  by one from 12:40 to 2:29 PM ET with expected expirations 3-5 PM ET, and 10/09's stayed open into the next
+  morning. So neither close_time nor occurrence is a usable start.
+- apply_series_cutoff_adjustments: for POWERSLAP_SERIES with the card's start on EVENT_START_OVERRIDES, the cutoff
+  is start - OVERRIDE_BUFFER_MIN (10 min), REPLACING midnight. With none on file, midnight stands; the shared
+  tighteners still apply after it, and the reduce-only freeze already keys on the override.
+- imm_family_watch research_targets: every open Power Slap match with no start is a "start:<event>" target of kind
+  "powerslap". _HOW tells research to find the CARD's scheduled start in ET (Power Slap's event page, the
+  broadcaster, press; the earliest credible time) and --set it on every match of the card. target_fixed covers
+  the kind. Research only runs while a program pays (research_due skips $0), highest est first. The quote call
+  reads "KEEP QUOTING: a Power Slap match: quoted to midnight ET of match day until its card start is on file,
+  then to 10 min before it".
+- A start can also be set by hand: python imm_earnings_overrides.py --set EVENT "YYYY-MM-DDTHH:MM:00-04:00".
+Deploy: incentive_mm.py change, so the sync's code-change restart; the watch imports fresh on its next run.

@@ -480,6 +480,31 @@ class TestResearchOnArrival(unittest.TestCase):
             t = fw.research_targets(None, gaps, datetime.now(timezone.utc), dry=True)
         self.assertEqual(sorted(t), ["gap:KXB-26NOV03"])
 
+    def test_power_slap_matches_without_a_start_are_researched(self):
+        # Jack 2026-10-23: "Powerslap bot should stop before match start, not at midnight et"
+        from unittest import mock
+
+        class Client:
+            def get(self, path, params=None):
+                assert path == "/events" and params["series_ticker"] == "KXPOWERSLAPMATCH"
+                return {"events": [{"event_ticker": "KXPOWERSLAPMATCH-26NOV06AAABBB"},
+                                   {"event_ticker": "KXPOWERSLAPMATCH-26NOV06CCCDDD"}]}
+        start = datetime(2026, 11, 6, 23, 0, tzinfo=timezone.utc)
+        with mock.patch.object(fw.ieo, "discover_broadcast_mention_events", lambda c, now: []), \
+                mock.patch.dict(fw.imm.EVENT_START_OVERRIDES,
+                                {"KXPOWERSLAPMATCH-26NOV06CCCDDD": start}):
+            t = fw.research_targets(Client(), {}, datetime.now(timezone.utc), dry=True)
+            self.assertEqual(sorted(t), ["start:KXPOWERSLAPMATCH-26NOV06AAABBB"])
+            tgt = t["start:KXPOWERSLAPMATCH-26NOV06AAABBB"]
+            self.assertEqual(tgt["kind"], "powerslap")
+            self.assertFalse(fw.target_fixed(tgt))
+            self.assertTrue(fw.target_fixed(dict(tgt, event="KXPOWERSLAPMATCH-26NOV06CCCDDD")))
+            self.assertIn("Power Slap CARD", fw.research_prompt([("start:x", tgt, "")]))
+        call, why = fw.quote_call("start:KXPOWERSLAPMATCH-26NOV06AAABBB",
+                                  {"series": "KXPOWERSLAPMATCH"}, {})
+        self.assertEqual(call, "KEEP QUOTING")
+        self.assertIn("Power Slap match", why)
+
     def test_an_election_excluded_series_is_not_researched(self):
         # 10/08 (Jack: "Talarico should not be quoted"): the bot keeps the gap
         # in config_gaps.json until a restart, so research must skip it itself
