@@ -1777,9 +1777,10 @@ class TestScreen(unittest.TestCase):
         # Jack 2026-10-06: "KXCRITICSCOMEDY series should be quoting", then
         # "yes add all critics choice series". The 25 KXCRITICS*-27 series
         # are a prefix FAMILY (like the Oscars) under the awards rule set:
-        # 3 per event, safe-join, out 31 days before the first narrowing --
-        # the crafts' shortlist (conservative Nov 16 -> Oct 16), the Dec 4
-        # nominations for the rest (-> Nov 3); table-only, exact rows
+        # 3 per event, safe-join, out 15 days (31 until 2026-10-23) before
+        # the first narrowing -- the crafts' shortlist (conservative Nov 16
+        # -> Nov 1), the Dec 4 nominations for the rest (-> Nov 19);
+        # table-only, exact rows
         place = {"expected_expiration_time": "2027-12-31T15:00:00Z",
                  "close_time": "2027-12-31T15:00:00Z"}
         crafts = ("CINE", "COST", "EDIT", "HAIR", "PROD", "SCORE", "VIS")
@@ -1806,14 +1807,14 @@ class TestScreen(unittest.TestCase):
                 imm.ensure_family_override(s)
                 ov = imm.series_override(s)
                 self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
-                                 (31.0, True, True), s)
+                                 (15.0, True, True), s)
                 # x2 on the family (Jack 2026-10-07: "2x"), caps with it
                 self.assertEqual(ov.size_mult, 2.0, s)
                 self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
                 self.assertEqual(imm.series_max_position(s),
                                  2.0 * imm.MAX_POSITION_CONTRACTS, s)
-                want = (utc(2026, 10, 16, 5, 0) if s[len("KXCRITICS"):] in crafts
-                        else utc(2026, 11, 3, 5, 0))
+                want = (utc(2026, 11, 1, 5, 0) if s[len("KXCRITICS"):] in crafts
+                        else utc(2026, 11, 19, 5, 0))
                 self.assertEqual(imm.apply_series_cutoff_adjustments(
                     s, f"{s}-27", None, close_time=None, market=place), want, s)
             self.assertEqual(imm.awards_event_start("KXCRITICSCOMEDY-27", place),
@@ -1832,7 +1833,7 @@ class TestScreen(unittest.TestCase):
                              utc(2026, 11, 16, 5, 0))
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXCRITICSSONG", "KXCRITICSSONG-27", None, close_time=None,
-                market=place), utc(2026, 10, 16, 5, 0))
+                market=place), utc(2026, 11, 1, 5, 0))
             self.assertIn("family's earliest date",
                           imm._config_gaps["KXCRITICSSONG-27"]["msg"])
             self.assertIsNone(imm.awards_family_default("KXCRITICSPIC-28"))
@@ -1862,7 +1863,7 @@ class TestScreen(unittest.TestCase):
         # KXCRITICS prefix, but no -27 row matched, so all 33 stood down on
         # "no usable date"; the Grammy nominees are a series per category,
         # never admitted (KXGRAMMY is exact). Both: 3/event, safe-join, out
-        # 31 days before the first narrowing. Market objects as on 10/07.
+        # 15 days before the first narrowing. Market objects as on 10/07.
         ccn = {"occurrence_datetime": "2027-01-03T15:00:00Z",
                "expected_expiration_time": "2027-01-04T15:00:00Z",
                "close_time": "2028-01-03T15:00:00Z"}
@@ -1900,13 +1901,13 @@ class TestScreen(unittest.TestCase):
                 imm.ensure_family_override(s)
                 ov = imm.series_override(s)
                 self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
-                                 (31.0, True, True), s)
+                                 (15.0, True, True), s)
             # the Critics family's x2 rides along on its parent
             self.assertEqual(imm.series_override("KXCRITICSCHOICENOM").size_mult, 2.0)
             for c in crafts + rest:
                 ev = f"KXCRITICSCHOICENOM-{c}27"
-                want = (utc(2026, 10, 16, 5, 0) if c in crafts
-                        else utc(2026, 11, 3, 5, 0))
+                want = (utc(2026, 11, 1, 5, 0) if c in crafts
+                        else utc(2026, 11, 19, 5, 0))
                 self.assertEqual(imm.apply_series_cutoff_adjustments(
                     "KXCRITICSCHOICENOM", ev, None, close_time=None,
                     market=ccn), want, ev)
@@ -1915,7 +1916,7 @@ class TestScreen(unittest.TestCase):
                 # nominations Mon Nov 16 -> out Oct 16, not Kalshi's Nov 2
                 self.assertEqual(imm.apply_series_cutoff_adjustments(
                     s, f"{s}-69", None, close_time=None, market=grn),
-                    utc(2026, 10, 16, 5, 0), s)
+                    utc(2026, 11, 1, 5, 0), s)
                 self.assertNotIn(f"{s}-69", imm._config_gaps, s)
             for ev in evs:
                 imm._release_guard_warned.discard(ev)
@@ -1927,7 +1928,7 @@ class TestScreen(unittest.TestCase):
                              utc(2026, 11, 16, 5, 0))
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXCRITICSCHOICENOM", "KXCRITICSCHOICENOM-SONG27", None,
-                close_time=None, market=ccn), utc(2026, 10, 16, 5, 0))
+                close_time=None, market=ccn), utc(2026, 11, 1, 5, 0))
             self.assertIn("family's earliest date",
                           imm._config_gaps["KXCRITICSCHOICENOM-SONG27"]["msg"])
             self.assertIsNone(imm.awards_family_default("KXCRITICSCHOICENOM-PIC28"))
@@ -1938,7 +1939,7 @@ class TestScreen(unittest.TestCase):
             imm.ensure_family_override("KXGRAMMYNOMBPVA")
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXGRAMMYNOMBPVA", "KXGRAMMYNOMBPVA-69", None, close_time=None,
-                market=grn), utc(2026, 10, 16, 5, 0))
+                market=grn), utc(2026, 11, 1, 5, 0))
             self.assertNotIn("KXGRAMMYNOMBPVA-69", imm._config_gaps)
             # the count ladders get no awards override
             imm.ensure_family_override("KXGRAMMYNOMCOUNTKL")
@@ -1950,7 +1951,7 @@ class TestScreen(unittest.TestCase):
                 imm._release_guard_warned.discard(ev)
                 imm._config_gaps.pop(ev, None)
 
-    def test_award_shows_three_per_event_and_one_month_stand_down(self):
+    def test_award_shows_three_per_event_and_two_week_stand_down(self):
         # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
         # KXOSCAR, KXVMA. max 3 markets per event, and do not quote within
         # 1 month of when the event starts". Market objects as Kalshi served
@@ -1969,7 +1970,7 @@ class TestScreen(unittest.TestCase):
                "expected_expiration_time": "2026-11-19T04:59:00Z"}
         osc = {"expected_expiration_time": "2027-12-31T15:00:00Z",
                "close_time": "2027-12-31T15:00:00Z"}
-        self.assertEqual(imm.AWARDS_PRE_EVENT_DAYS, 31.0)
+        self.assertEqual(imm.AWARDS_PRE_EVENT_DAYS, 15.0)
         # event start: the expiration (day after the announcement / end of
         # the ceremony day); a scheduled occurrence ahead of it wins; a
         # placeholder, a missing object or a table-only series -> None
@@ -2008,15 +2009,16 @@ class TestScreen(unittest.TestCase):
                          (("KXA*-27", utc(2027, 3, 14, 5, 0)),))
         with self.assertRaises(ValueError):
             imm._parse_awards_dates("KXA*-27=March 14")
-        # cutoff = start - 31 days, through the shared tightener (both
+        # cutoff = start - 15 days (2 weeks; 31 until 2026-10-23), through
+        # the shared tightener (both
         # producers and the quote-gaps mirror pass the market object)
         for s, ev, m, want in (
-                ("KXGGNOM", "KXGGNOM-ANI26", gg, utc(2026, 11, 8, 15, 0)),
-                # nominations Nov 16 -> out Oct 16 (was Jan 8 off the show)
-                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2026, 10, 16, 5, 0)),
-                # finalists Oct 6 -> out Sep 5, already past on 9/26
+                ("KXGGNOM", "KXGGNOM-ANI26", gg, utc(2026, 11, 24, 15, 0)),
+                # nominations Nov 16 -> out Nov 1 (was Jan 8 off the show)
+                ("KXGRAMMY", "KXGRAMMY-BAMP69", gr, utc(2026, 11, 1, 5, 0)),
+                # finalists Oct 6 -> out Sep 21, already past on 9/26
                 ("KXNATBOOKAWARDS", "KXNATBOOKAWARDS-FIC26", nba,
-                 utc(2026, 9, 5, 4, 0))):
+                 utc(2026, 9, 21, 4, 0))):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 s, ev, None, close_time=None, market=m), want, s)
             # never loosens an earlier cutoff
@@ -2025,7 +2027,7 @@ class TestScreen(unittest.TestCase):
                 want - timedelta(days=3), s)
         # the VMAs: table-only with no row (nominations landed in early
         # September, day unverified) -> stood down, fail closed -- the
-        # same outcome the ceremony date gave (Sep 27 - 31d is past)
+        # same outcome the ceremony date gave (Sep 27 - 15d is past)
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXVMA", "KXVMA-ALB26", None, close_time=None, market=vma),
             imm.RELEASE_GUARD_UNKNOWN)
@@ -2034,25 +2036,25 @@ class TestScreen(unittest.TestCase):
             "KXGGNOM", "KXGGNOM-ANI26", None, close_time=None, market=None),
             imm.RELEASE_GUARD_UNKNOWN)
         # the Oscar family inherits KXOSCAR's guard set (table-only, 3/event,
-        # safe-join, 31d); KXOSCARMENTION is the mention family's and gets
+        # safe-join, 15d); KXOSCARMENTION is the mention family's and gets
         # neither the override nor the prefix cap
         for s in ("KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARMENTION"):
             imm.SERIES_OVERRIDES.pop(s, None)
         try:
             imm.ensure_family_override("KXOSCARPIC")
             ov = imm.series_override("KXOSCARPIC")
-            self.assertEqual(ov.pre_event_days, 31.0)
+            self.assertEqual(ov.pre_event_days, 15.0)
             self.assertTrue(ov.pre_event_dates_only)
             self.assertTrue(ov.safe_join)
-            # Best Picture: nominations Jan 21 -> out Dec 21; International
-            # Feature: shortlist Dec 15 -> out Nov 14
+            # Best Picture: nominations Jan 21 -> out Jan 6; International
+            # Feature: shortlist Dec 15 -> out Nov 30
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXOSCARPIC", "KXOSCARPIC-27", None, close_time=None,
-                market=osc), utc(2026, 12, 21, 5, 0))
+                market=osc), utc(2027, 1, 6, 5, 0))
             imm.ensure_family_override("KXOSCARINTLFILM")
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXOSCARINTLFILM", "KXOSCARINTLFILM-27", None,
-                close_time=None, market=osc), utc(2026, 11, 14, 5, 0))
+                close_time=None, market=osc), utc(2026, 11, 30, 5, 0))
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXOSCARPIC", "KXOSCARPIC-28", None, close_time=None,
                 market=osc), imm.RELEASE_GUARD_UNKNOWN)
@@ -2066,7 +2068,7 @@ class TestScreen(unittest.TestCase):
         # markets are the nominations -- stays on the API fallback
         for s in ("KXGGNOM", "KXNATBOOKAWARDS", "KXGRAMMY", "KXVMA"):
             ov = imm.series_override(s)
-            self.assertEqual(ov.pre_event_days, 31.0, s)
+            self.assertEqual(ov.pre_event_days, 15.0, s)
             self.assertEqual(ov.pre_event_dates_only, s != "KXGGNOM", s)
             self.assertTrue(ov.safe_join, s)
         # a SAG series filed under the Oscar prefix is blocked, not quoted
@@ -2385,7 +2387,7 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         # Updated 2026-10-12: KXCMA had no cutoff on the premise that Kalshi
         # closes it before the show; its markets now close 2027-11-18, a
         # year after the 60th CMA Awards (Wed Nov 18 2026, 8pm ET). Jack:
-        # "KXCMA move it to the award rules" -- out 31 days before the show
+        # "KXCMA move it to the award rules" -- out 15 days before the show
         # (its nominations came before its markets listed), 3 per event,
         # safe-join, table-only.
         cma = {"close_time": "2027-11-18T15:00:00Z",
@@ -2396,7 +2398,7 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         for ev in ("KXCMA-NAOTY26", "KXCMA-SOTY26"):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXCMA", ev, None, close_time=utc(2027, 11, 18, 15, 0), market=cma),
-                utc(2026, 10, 18, 5, 0), ev)          # Nov 18 00:00 ET - 31d
+                utc(2026, 11, 3, 5, 0), ev)           # Nov 18 00:00 ET - 15d
         # next year's show has no row: stood down (Kalshi's dates are not
         # used), a config gap for the research
         ev27 = "KXCMA-NAOTY27"
@@ -2414,7 +2416,7 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
             imm._config_gaps.pop(ev27, None)
         ov = imm.series_override("KXCMA")
         self.assertEqual((ov.safe_join, ov.pre_event_days, ov.pre_event_dates_only),
-                         (True, 31.0, True))
+                         (True, 15.0, True))
         self.assertIsNone(ov.size_mult)
         self.assertEqual(imm.event_top_n_for("KXCMA"), 3)
         self.assertEqual(imm.event_top_n_for("KXCMAX"), 0)   # exact entry
@@ -27237,12 +27239,12 @@ class TestAwardsByKalshiTag(unittest.TestCase):
         self.assertEqual(imm.event_top_n_for("KXGRAMMYNOM"), 3)
         ov = imm.series_override("KXGRAMMYNOM")
         self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
-                         (31.0, True, True))
+                         (15.0, True, True))
         for ev in ("KXGRAMMYNOM-69BPDGP", "KXGRAMMYNOM-69BDPR"):
             # nominations Mon Nov 16 -> out Oct 16, not Kalshi's Nov 2
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXGRAMMYNOM", ev, None, close_time=None, market=self.GRN),
-                utc(2026, 10, 16, 5, 0), ev)
+                utc(2026, 11, 1, 5, 0), ev)
             self.assertNotIn(ev, imm._config_gaps, ev)
         # the next edition has no row: stood down, a gap for the research
         self.assertEqual(imm.apply_series_cutoff_adjustments(
@@ -27297,13 +27299,13 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             imm.ensure_family_override(s)
             ov = imm.series_override(s)
             self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join,
-                              ov.size_mult), (31.0, True, True, None), s)
+                              ov.size_mult), (15.0, True, True, None), s)
             self.assertEqual(imm.event_top_n_for(s), 3, s)
         # KXGRAMAOTY-69 (the 69th's Album of the Year winner): the Nov 16
         # nominations are its first narrowing -> out Oct 16, not at the show
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXGRAMAOTY", "KXGRAMAOTY-69", None, close_time=None, market=self.AOTY),
-            utc(2026, 10, 16, 5, 0))
+            utc(2026, 11, 1, 5, 0))
         self.assertNotIn("KXGRAMAOTY-69", imm._config_gaps)
         # a show with no row stands down -- Kalshi's dates are not used --
         # and is a gap for the family watch's research

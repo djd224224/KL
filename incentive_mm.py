@@ -15862,9 +15862,12 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #      04:59Z, VMAs 09-28 03:59Z, National Book Awards 11-19 04:59Z) or the
 #      day after the announcement (Golden Globe nominations 12-09 15:00Z).
 #      A Dec 31 expiration is the placeholder shape and reads as unknown.
-# cutoff = start - AWARDS_PRE_EVENT_DAYS. 31 days is "1 month" measured from
-# an end-of-day expiration: the stand-down begins a full month before the
-# event EVENING (30 would land inside it). No usable start ->
+# cutoff = start - AWARDS_PRE_EVENT_DAYS. 15 days is "2 weeks" measured from
+# an end-of-day expiration: the stand-down begins two full weeks before the
+# event EVENING (14 would land inside it). It was 31 days ("1 month", 30
+# landing inside it) until 2026-10-23 (Jack: "award market stop quoting 2
+# weeks before"); the "-> out <date>" notes below were worked at 31 days.
+# No usable start ->
 # RELEASE_GUARD_UNKNOWN (stood down, fail closed, logged once). Applied in
 # apply_series_cutoff_adjustments for both producers and the quote-gaps
 # mirror, never loosening.
@@ -15943,7 +15946,7 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #                       year's KXCMA-*27 waits for a row (its nominations).
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
-AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 31.0)
+AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 15.0)
 AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_SERIES",
