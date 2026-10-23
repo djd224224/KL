@@ -139,6 +139,8 @@ def setUpModule():
     imm.FAMILY_VERDICTS.clear()
     imm._family_verdict_state["mtime"] = 0.0
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
+    # the low-temperature fair (2026-10-23)
+    imm.LOWT_FAIR_FILE = os.path.join(tmp, "lowt_fair.json")
     # The full-depth book log resolves its directory at WRITE time from
     # STATUS_DIR (redirected above) unless IMM_BOOK_LOG_DIR is set; a stray
     # value in the shell would send test books wherever it points.
@@ -16965,9 +16967,15 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
         self.assertEqual(r("KXXRPMAXMON-XRP-26JUL31-140"), "blocked")
         self.assertEqual(r("KXMLBMENTION-26JUL14ALNL-GRAN"), "blocked")
+        # the low-temperature dailies: the IMM's own family while the low
+        # bot stays paused (2026-10-23), else the low bot's (ownership)
+        with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": True}):
+            self.assertEqual(r("KXLOWTSATX-26SEP08-T70"), "allowed")
+        with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
+            self.assertEqual(r("KXLOWTSATX-26SEP08-T70"), "excluded_family")
         # structural exclusions: other repo bots (ownership), live feeds,
         # the 9/2 traps
-        for t in ("KXLOWTSATX-26SEP08-T70", "KXRAINNYC-26SEP03-X",
+        for t in ("KXRAINNYC-26SEP03-X",
                   "KXEURUSD-26SEP08-T1.1", "KXINXU-26SEP08-T6000",
                   "KXBTCD-26AUG0521-T54099.99", "KXETHMAXW-26SEP12-T5000",
                   "KXUE-RUS26SEP-T5", "KXISMPMI-26OCT01-T50",
@@ -23703,7 +23711,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the Mamdani announcement halt / hold (2026-10-19)
         # + the NBA auto families' game members' team-news hold (2026-10-22)
         # + the state statistics release pause (2026-10-22)
-        self.assertEqual(len(conts), 50)
+        # + the low-temperature gate (2026-10-23)
+        self.assertEqual(len(conts), 51)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -25235,13 +25244,13 @@ class TestSignedFairReads(unittest.TestCase):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
         monthly rain, monthly snow, GasBuddy, daily rain (its city
         discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11),
-        Rotten Tomatoes (2026-10-12) and ski-resort snowfall (2026-10-22)
-        refreshers each build a reader with fair_reader() and pass it to
+        Rotten Tomatoes (2026-10-12), ski-resort snowfall (2026-10-22) and
+        low temperature (2026-10-23) refreshers each build a reader with fair_reader() and pass it to
         their module's write_fair_file (the threads live inside run(), so
         read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 11)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 12)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -25252,7 +25261,8 @@ class TestSignedFairReads(unittest.TestCase):
                           ("cpi_fair", "CPI_FAIR_FILE"),
                           ("rain_wknd_fair", "RAIN_WKND_FILE"),
                           ("rt_fair", "RT_FAIR_FILE"),
-                          ("resort_snow_fair", "RESORT_SNOW_FILE")):
+                          ("resort_snow_fair", "RESORT_SNOW_FILE"),
+                          ("lowt_fair", "LOWT_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)
@@ -31595,6 +31605,102 @@ class TestSizeSplitTest(unittest.TestCase):
             open(os.path.join(self.dir, imm.SIZE_TEST_STOP_FILE), "w").close()
             imm._size_test_stop["checked"] = 0.0
             self.assertEqual(imm.applied_mention_mult(t), 1.0)          # stopped: back at 1x
+
+
+class TestLowTempFamily(unittest.TestCase):
+    """Jack 2026-10-23: "Build low temp fair value as part of IMM, only quote
+    the next day never the same day (I should have the bones already as part
+    of the low temp bot)"."""
+
+    T = "KXLOWTEWR-26OCT24-B38.5"
+
+    def setUp(self):
+        self._p = [mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": True}),
+                   mock.patch.dict(imm._lowt_state, {"mtime": 0.0, "events": {}})]
+        for x in self._p:
+            x.start()
+
+    def tearDown(self):
+        for x in self._p:
+            x.stop()
+
+    def _read(self, now_ts, **kw):
+        e = {"ts": now_ts - 600, "mu": 38.3, "b": 1.79, "nws": 38.0, "wu": None,
+             "skip": None, "markets": {self.T: 0.30, "KXLOWTEWR-26OCT24-T38": 0.40}}
+        e.update(kw)
+        imm._lowt_state["events"]["KXLOWTEWR-26OCT24"] = e
+
+    def test_allowed_only_while_the_low_bot_is_paused(self):
+        prev = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertTrue(imm.lowt_series("KXLOWTEWR"))
+            self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+            self.assertFalse(imm.lowt_series("KXLOW"))                 # Lowe's KPI series
+            with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
+                self.assertFalse(imm.lowt_series("KXLOWTEWR"))
+                self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+            with mock.patch.object(imm, "LOWT_ENABLE", False):
+                self.assertFalse(imm.lowt_series("KXLOWTEWR"))
+        finally:
+            imm.ALLOWLIST_ONLY = prev
+        # the flag is the low bot's own pause file, re-checked by the minute
+        with tempfile.TemporaryDirectory() as d:
+            flag = os.path.join(d, "low_temp.paused")
+            with mock.patch.object(imm, "LOWT_OWNER_FLAG", flag):
+                self.assertFalse(imm.lowt_owner_paused(force=True))
+                open(flag, "w").close()
+                self.assertFalse(imm.lowt_owner_paused(now_ts=time.time()))   # cached
+                self.assertTrue(imm.lowt_owner_paused(force=True))
+
+    def test_next_day_only(self):
+        # out at 00:00 ET of the market day: never quoted on the day itself
+        self.assertEqual(imm.trade_cutoff_utc("KXLOWTEWR-26OCT24", None, None),
+                         utc(2026, 10, 24, 4, 0))
+        self.assertEqual(imm.trade_cutoff_utc("KXLOWTLAX-26DEC02", None, None),
+                         utc(2026, 12, 2, 5, 0))                      # EST, still ET midnight
+
+    def test_gate_fails_closed_and_stands_aside_only_far_from_fair(self):
+        now = time.time()
+        g = imm.lowt_gate
+        self.assertEqual(g(self.T, now, 28, 32)[1]["reason"], "no_read")
+        self._read(now, ts=now - (imm.LOWT_FAIR_TTL_MIN * 60 + 5))
+        self.assertEqual(g(self.T, now, 28, 32)[1]["reason"], "stale")
+        self._read(now, skip="late-day drop: x")
+        self.assertEqual(g(self.T, now, 28, 32)[1]["reason"], "skip")
+        self._read(now)
+        self.assertEqual(g("KXLOWTEWR-26OCT24-B40.5", now, 28, 32)[1]["reason"], "no_market")
+        # fair 30c, tol 25c: a touch inside the band quotes, unchanged
+        why, inputs = g(self.T, now, 50, 60)
+        self.assertEqual((why, inputs["fair"]), ("", 30.0))
+        self.assertEqual(g(self.T, now, 55, 60)[0], "")              # bid exactly at fair + tol
+        why, inputs = g(self.T, now, 56, 60)                         # bid touch above fair + tol
+        self.assertEqual((inputs["reason"], inputs["bid_bad"]), ("band", True))
+        why, inputs = g(self.T, now, 1, 4)                           # ask touch under fair - tol
+        self.assertEqual((inputs["reason"], inputs["ask_bad"]), ("band", True))
+
+    def test_the_fair_file_reloads_by_mtime(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "lowt_fair.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"events": {"KXLOWTEWR-26OCT24": {
+                    "fetched_at": "2026-10-23T19:00:00+00:00", "skip": None,
+                    "markets": {self.T: 0.3}},
+                    "KXLOWTX-26OCT24": {"fetched_at": "bad"}}}, f)
+            with mock.patch.object(imm, "LOWT_FAIR_FILE", path):
+                self.assertEqual(imm.load_lowt_fair(), 1)
+                self.assertEqual(imm.load_lowt_fair(), 0)               # unchanged mtime
+            e = imm._lowt_state["events"]["KXLOWTEWR-26OCT24"]
+            self.assertEqual(e["ts"], utc(2026, 10, 23, 19, 0).timestamp())
+
+    def test_breaker_and_one_family_loss_budget(self):
+        self.assertTrue(imm.move_breaker_on("KXLOWTEWR"))
+        self.assertEqual(imm.pilot_budget_key(self.T), imm.LOWT_HALT_KEY)
+        self.assertEqual(imm.pilot_budget_key("KXLOWTSEA-26OCT24-T41"), imm.LOWT_HALT_KEY)
+        self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), imm.LOWT_DAILY_LOSS_LIMIT)
+        self.assertIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
+        for k in ("LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_DAILY_LOSS_LIMIT"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
 
 if __name__ == "__main__":

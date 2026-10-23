@@ -5,8 +5,12 @@ depends on the laptop syncing main, which failed silently (bot still
 quoting 2026-09-02) — this sweeps the orders at the exchange instead.
 
 Runs from .github/workflows/kxlow_pause_enforcer.yml every 30 min while
-low_temp.paused exists on main. Touches ONLY tickers starting with KXLOW —
-never any other bot's orders. Auth mirrors fetch_settlements_csv.py.
+low_temp.paused exists on main. Touches ONLY the low bot's KXLOW<CITY>
+tickers -- never any other bot's orders. Since 2026-10-23 that excludes the
+IMM's: its low-temperature family quotes the KXLOWT dailies while the low
+bot stays paused (client_order_id "imm-..."), and its Lowe's KPI markets
+share the prefix ("KXLOW-..."), which this sweep had been matching. Auth
+mirrors fetch_settlements_csv.py.
 
 Output stays to counts (public Actions logs).
 """
@@ -46,6 +50,8 @@ def main():
     targets = [
         o for o in orders
         if str(o.get("ticker", "")).startswith("KXLOW")
+        and not str(o.get("ticker", "")).startswith("KXLOW-")          # Lowe's
+        and not str(o.get("client_order_id") or "").startswith("imm-")  # the IMM's
         and (o.get("status") in CANCELABLE or (o.get("remaining_count") or 0) > 0)
     ]
     print(f"resting orders total: {len(orders)}; KXLOW targets: {len(targets)}")

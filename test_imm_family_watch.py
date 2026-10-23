@@ -744,9 +744,15 @@ class TestQuoteCalls(unittest.TestCase):
         self.assertEqual(c, "DON'T QUOTE")
         self.assertIn("high_temp_trading.py (cloud) trades the KXHIGH dailies", why)
         self.assertIn("self-trade prevention", why)
-        c, why = self.call("new:KXLOWTMIA")                 # scan-excluded, not blocklisted
-        self.assertEqual(c, "DON'T QUOTE")
-        self.assertIn("low_temp_trading.py", why)
+        from unittest import mock
+        # the low bot running: its KXLOWT dailies (scan-excluded, not blocklisted)
+        with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
+            c, why = self.call("new:KXLOWTMIA")
+            self.assertEqual(c, "DON'T QUOTE")
+            self.assertIn("low_temp_trading.py", why)
+        # ...paused: the IMM's own low-temperature family (2026-10-23)
+        with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": True}):
+            self.assertEqual(fw.owner_of("KXLOWTMIA"), ("", False))
         self.assertEqual(fw.owner_of("KXLOW-26OCT"), ("blocklisted in incentive_mm.py", False))
         self.assertEqual(fw.owner_of("KXFRANCEEMERGENCY"), ("", False))
 

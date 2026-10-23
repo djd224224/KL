@@ -3419,7 +3419,9 @@ MOVE_BREAKER_SERIES = frozenset(s.strip() for s in os.environ.get(
 
 def move_breaker_on(series: str) -> bool:
     """Does the mid-move breaker guard this series?"""
-    return BREAKERS_ENABLED or series in MOVE_BREAKER_SERIES
+    # ... and the low-temperature family's next-day markets (2026-10-23,
+    # LOWT_ENABLE), the next-day rain dailies' protection
+    return BREAKERS_ENABLED or series in MOVE_BREAKER_SERIES or lowt_series(series)
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
@@ -10264,6 +10266,9 @@ _CONFIG_CODE_KNOBS = (
     "MID_MOVE_BREAKER_CENTS", "BREAKER_COOLDOWN_SECS", "EVENT_FILL_HALT_CONTRACTS",
     "EVENT_FILL_HALT_STRIKES", "EVENT_DEPTH_RESUME_SECS", "RAIN_FAIR_ENABLE",
     "RAIN_FAIR_TOL_CENTS", "STICKY_PRICE_MIN", "STICKY_PRICE_MAX",
+    # the low-temperature family (2026-10-23)
+    "LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_FAIR_TTL_MIN",
+    "LOWT_DAILY_LOSS_LIMIT",
     "SCAN_HOPELESS_EXIT", "SCAN_HOPELESS_BAR", "BLIND_PRESERVE_CYCLES",
     # hopeless clock (2026-09-26): 30-minute sustain on the live projection
     "HOPELESS_SUSTAIN_SECS", "MEMBER_PEAK_GUARD", "EST_PEAK_TTL_SECS",
@@ -11479,6 +11484,125 @@ def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
     if now_ts - fetched_ts > RAIN_FAIR_TTL_MIN * 60:
         return None
     return p
+
+
+# ----------------------------------------------------------------------------
+# LOW-TEMPERATURE FAMILY (Jack 2026-10-23: "Build low temp fair value as part
+# of IMM, only quote the next day never the same day (I should have the bones
+# already as part of the low temp bot)"). The KXLOWT<CITY> dailies ("Lowest
+# temperature in <city> on <date>?": four 2F bands and two tails, settled on
+# The Weather Company's reading at the CLI station in the rules) join the book
+# while low_temp_trading.py -- which owned them on this account -- stays
+# paused: no low_temp.paused flag, no family (two of our bots must never
+# cross; the flag is re-checked every LOWT_OWNER_CHECK_SECS).
+#   - NEXT DAY ONLY: the ticker-date rule (trade_cutoff_utc) cuts every
+#     KXLOWT market off at 00:00 ET of its date, the earliest local midnight
+#     of any US station, so the bot quotes from listing (10 AM ET the day
+#     before) to midnight and never on the measurement day. On the public
+#     tape (events 10/19-10/22, 24 series) every maker together made -$223
+#     on the 106k contracts traded the day before, -$2,526 on the 1.18M
+#     traded on the day.
+#   - FAIR: lowt_fair.py, the low bot's forecasts and shape filters under a
+#     Laplace calibrated on its Jul-Aug history; refresher thread
+#     "lowt-fair" every LOWT_FAIR_REFRESH_SECS. The market's own mid beat it
+#     (Brier 0.103 vs 0.112 on 5,562 books, closer at every disagreement
+#     threshold), so it never prices: quotes join the touch as everywhere,
+#     and lowt_gate stands a market aside (both sides, cancel) only when the
+#     touch fights the fair by more than LOWT_FAIR_TOL_CENTS on the adverse
+#     side -- and fails CLOSED with no fresh read, on a shape-filter day (a
+#     late-evening cold drop or a midnight print can set the low while
+#     evening quotes rest), and off the US stations it models.
+#   - The 15c / 30 min mid-move breaker (move_breaker_on), and one daily loss
+#     budget for the family (LOWT_DAILY_LOSS_LIMIT on the pilot-halt
+#     machinery: stood aside to the 5am-CT roll, positions ride).
+# Kill switch IMM_LOWT_ENABLE=0 (an env change: restart_imm.ps1 -Task).
+LOWT_ENABLE = os.environ.get("IMM_LOWT_ENABLE", "1") == "1"
+LOWT_PREFIX = "KXLOWT"
+LOWT_OWNER_FLAG = os.environ.get(
+    "IMM_LOWT_OWNER_FLAG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "low_temp.paused"))
+LOWT_OWNER_CHECK_SECS = 60
+LOWT_FAIR_FILE = os.environ.get(
+    "IMM_LOWT_FAIR_FILE", os.path.join(STATUS_DIR, "lowt_fair.json"))
+LOWT_FAIR_TOL_CENTS = _env_int("IMM_LOWT_FAIR_TOL_CENTS", 25)
+LOWT_FAIR_TTL_MIN = _env_int("IMM_LOWT_FAIR_TTL_MIN", 90)
+LOWT_FAIR_REFRESH_SECS = _env_int("IMM_LOWT_FAIR_REFRESH_SECS", 1800)
+LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 60.0)
+LOWT_HALT_KEY = "LOWT"
+_lowt_state: dict = {"mtime": 0.0, "events": {}}
+_lowt_owner: dict = {"at": 0.0, "paused": False}
+
+
+def lowt_owner_paused(now_ts: Optional[float] = None, force: bool = False) -> bool:
+    """Is low_temp_trading.py paused (its flag file present)? Cached for
+    LOWT_OWNER_CHECK_SECS: _allowed asks for every ticker, every refresh."""
+    now_ts = time.time() if now_ts is None else now_ts
+    if force or now_ts - _lowt_owner["at"] > LOWT_OWNER_CHECK_SECS:
+        _lowt_owner["paused"] = os.path.exists(LOWT_OWNER_FLAG)
+        _lowt_owner["at"] = now_ts
+    return _lowt_owner["paused"]
+
+
+def lowt_series(series: str) -> bool:
+    """A KXLOWT daily, while the family is on and the low bot stays paused."""
+    return (LOWT_ENABLE and series.startswith(LOWT_PREFIX)
+            and lowt_owner_paused())
+
+
+def load_lowt_fair() -> int:
+    """Hot-reload LOWT_FAIR_FILE by mtime into _lowt_state. Returns the
+    number of events loaded on a reload, else 0."""
+    try:
+        mtime = os.path.getmtime(LOWT_FAIR_FILE)
+    except OSError:
+        return 0
+    if mtime == _lowt_state["mtime"]:
+        return 0
+    _lowt_state["mtime"] = mtime
+    try:
+        with open(LOWT_FAIR_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! low-temp fair file unreadable: {e}")
+        return 0
+    fresh: Dict[str, dict] = {}
+    for ev, e in (data.get("events") or {}).items():
+        ts = parse_iso_utc(str((e or {}).get("fetched_at") or ""))
+        if ts is None:
+            continue
+        fresh[str(ev)] = dict(e, ts=ts.timestamp())
+    _lowt_state["events"] = fresh
+    return len(fresh)
+
+
+def lowt_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+              ext_ask: Optional[float]) -> Tuple[str, dict]:
+    """('', inputs) when a KXLOWT market may quote (joining the touch, as
+    everywhere), else (why, guard-skip inputs). Fails CLOSED."""
+    e = _lowt_state["events"].get(ticker.rsplit("-", 1)[0])
+    if e is None:
+        return "no low-temp fair for this event", {"reason": "no_read"}
+    age = now_ts - float(e.get("ts") or 0.0)
+    if age > LOWT_FAIR_TTL_MIN * 60:
+        return (f"low-temp fair is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)})
+    if e.get("skip"):
+        why = str(e["skip"])[:160]
+        return f"no fair: {why}", {"reason": "skip", "why": why}
+    p = (e.get("markets") or {}).get(ticker)
+    if p is None:
+        return "market not in the low-temp read", {"reason": "no_market"}
+    fair = float(p) * 100.0
+    inputs = {"fair": round(fair, 2), "mu": e.get("mu"), "b": e.get("b"),
+              "nws": e.get("nws"), "wu": e.get("wu"), "tol": LOWT_FAIR_TOL_CENTS}
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair,
+                                        LOWT_FAIR_TOL_CENTS)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
+                f"{LOWT_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"low {e.get('mu')}F, scale {e.get('b')}F)",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad))
+    return "", inputs
 
 
 # ----------------------------------------------------------------------------
@@ -14475,6 +14599,9 @@ def pilot_halt_key(series: str) -> Optional[str]:
     # the YouTube #1 leader-bid pilot (2026-10-14): one budget, its series
     if yt1_series(series) and YT1_DAILY_LOSS_LIMIT > 0:
         return series
+    # the low-temperature family (2026-10-23): one budget for every city
+    if lowt_series(series) and LOWT_DAILY_LOSS_LIMIT > 0:
+        return LOWT_HALT_KEY
     return None
 
 
@@ -14510,6 +14637,8 @@ def pilot_halt_limit(key: str) -> float:
         return NFL_H2H_DAILY_LOSS_LIMIT
     if key == YT1_SERIES:
         return YT1_DAILY_LOSS_LIMIT
+    if key == LOWT_HALT_KEY:
+        return LOWT_DAILY_LOSS_LIMIT
     if key.startswith(NFL_AUTO_BUDGET_PREFIX):
         return NFL_AUTO_DAILY_LOSS_LIMIT
     if key.startswith(LEAGUE_AUTO_BUDGET_PREFIX):
@@ -14524,6 +14653,8 @@ def pilot_halt_keys() -> List[str]:
         keys.append(NFL_H2H_HALT_KEY)
     if YT1_ENABLE and YT1_DAILY_LOSS_LIMIT > 0:
         keys.append(YT1_SERIES)
+    if LOWT_ENABLE and LOWT_DAILY_LOSS_LIMIT > 0:
+        keys.append(LOWT_HALT_KEY)
     return keys
 
 
@@ -18974,6 +19105,7 @@ class IncentiveMarketMaker:
         self._yt1_stood: Set[str] = set()         # YouTube #1 pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
+        self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
         self._nfl_stood: Set[str] = set()         # NFL prop gate stand-asides
         # NFL auto season members' live-game check (nfl_live_verdict):
@@ -23581,6 +23713,7 @@ class IncentiveMarketMaker:
             snow_monthly_series(series) or \
             bigsky_series(series) or \
             resort_snow_series(series) or \
+            lowt_series(series) or \
             cpi_pilot_active(ticker) or \
             nfl_h2h_series(series) or \
             nfl_auto_entry(series) is not None or \
@@ -23839,6 +23972,7 @@ class IncentiveMarketMaker:
         load_family_verdicts()
         load_sat_gate()
         load_rain_fair()
+        load_lowt_fair()              # low-temperature fair (2026-10-23)
         _ca_n, _ca_moved = load_ca_fair()
         if _ca_moved:
             log(f"{self.tag} ca-fair reloaded: {_ca_n} series, "
@@ -27988,6 +28122,24 @@ class IncentiveMarketMaker:
                 self._rain_fair_stood.discard(t)
                 log(f"{self.tag} rain-fair resume {t}")
 
+            # LOW-TEMPERATURE GATE (Jack 2026-10-23, see LOWT_ENABLE): a wide
+            # sanity screen on lowt_fair's forecast. Quotes join the touch
+            # unchanged; the market stands aside (both sides, cancel) with no
+            # fresh fair, on a shape-filter day, or when the touch fights the
+            # fair by more than LOWT_FAIR_TOL_CENTS on the adverse side.
+            if lowt_series(meta.series):
+                lt_why, lt_in = lowt_gate(t, now_ts, ext_bid, ext_ask)
+                if lt_why:
+                    if t not in self._lowt_stood:
+                        self._lowt_stood.add(t)
+                        log(f"{self.tag} lowt stand-aside {t}: {lt_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "lowt_fair", lambda: lt_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._lowt_stood:
+                self._lowt_stood.discard(t)
+                log(f"{self.tag} lowt resume {t}")
+
             # CARBON ARC FAIR GATE (Jack 2026-09-26, see CA_FAIR_ENABLE): the
             # rain gate's shape on Carbon Arc's month-to-date read. Quotes
             # still join the touch; a new read parks BOTH sides for the
@@ -30430,6 +30582,30 @@ class IncentiveMarketMaker:
                     time.sleep(max(300, RAIN_FAIR_REFRESH_MIN * 60))
             threading.Thread(target=_rain_fair_refresh, daemon=True,
                              name="rain-fair").start()
+        if LOWT_ENABLE and not once:
+            # Low-temperature fair refresher (2026-10-23): the rain
+            # refresher's contract -- forecasts fetched off the trading
+            # thread, handed to the quote loop only through LOWT_FAIR_FILE.
+            # An import failure leaves no fair, and the gate fails closed.
+            def _lowt_fair_refresh():
+                try:
+                    import lowt_fair
+                except Exception as e:
+                    log(f"{self.tag} ! lowt-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                while True:
+                    try:
+                        ok, skipped, failed = lowt_fair.write_fair_file(
+                            LOWT_FAIR_FILE, get_json=kalshi_get)
+                        log(f"{self.tag} lowt-fair refresh: {ok} events priced, "
+                            f"{skipped} stood aside by the shape filters"
+                            + (f", {failed} stations FAILED" if failed else ""))
+                    except Exception as e:
+                        log(f"{self.tag} ! lowt-fair refresh failed: {e}")
+                    time.sleep(max(300, LOWT_FAIR_REFRESH_SECS))
+            threading.Thread(target=_lowt_fair_refresh, daemon=True,
+                             name="lowt-fair").start()
         if CA_FAIR_ENABLE and not once:
             # Carbon Arc fair refresher (2026-09-26): the rain refresher's
             # contract -- every network call off the trading thread, the
@@ -31461,6 +31637,14 @@ class IncentiveMarketMaker:
             log(f"Treasury early blackout (2026-10-22): {','.join(_ust_bo)} out "
                 f"{'-'.join(UST_EARLY_BLACKOUT_ET)} ET on weekdays -- orders "
                 f"cancelled, markets held (its 6 AM fills lost $249 since 9/25)")
+        if LOWT_ENABLE:
+            log(f"low-temp family (2026-10-23): {LOWT_PREFIX}* next day only (out "
+                f"00:00 ET of the market day); lowt_fair gate tol "
+                f"{LOWT_FAIR_TOL_CENTS}c, fails closed; mid-move breaker; "
+                f"${LOWT_DAILY_LOSS_LIMIT:g}/day family loss halt"
+                + ("" if lowt_owner_paused(force=True) else
+                   " -- OFF while low_temp_trading.py is not paused "
+                   f"({os.path.basename(LOWT_OWNER_FLAG)} missing)"))
         if RELEASE_PAUSE:
             _cal = load_release_calendar(force=True)
             _now = datetime.now(timezone.utc)

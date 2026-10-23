@@ -532,6 +532,10 @@ def owner_of(series: str) -> Tuple[str, bool]:
     Jack's bots trades it) -- ("", False) when nothing keeps it out: the
     bot's blocklist and its scan's exclusions, with the owner when known."""
     s = series or ""
+    # the IMM's own low-temperature family (2026-10-23) quotes the KXLOWT
+    # dailies while low_temp_trading.py stays paused
+    if getattr(imm, "lowt_series", None) and imm.lowt_series(s):
+        return "", False
     named = next((why for p, why in OWNER_PREFIXES if s.startswith(p)), "")
     if any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ())):
         return named or "blocklisted in incentive_mm.py", bool(named)
