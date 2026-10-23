@@ -11513,8 +11513,9 @@ def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
 #     late-evening cold drop or a midnight print can set the low while
 #     evening quotes rest), and off the US stations it models.
 #   - The 15c / 30 min mid-move breaker (move_breaker_on), and one daily loss
-#     budget for the family (LOWT_DAILY_LOSS_LIMIT on the pilot-halt
-#     machinery: stood aside to the 5am-CT roll, positions ride).
+#     budget for the family (LOWT_DAILY_LOSS_LIMIT, $100 -- Jack: "increase
+#     family halt amount to $100" -- on the pilot-halt machinery: stood
+#     aside to the 5am-CT roll, positions ride).
 # Kill switch IMM_LOWT_ENABLE=0 (an env change: restart_imm.ps1 -Task).
 LOWT_ENABLE = os.environ.get("IMM_LOWT_ENABLE", "1") == "1"
 LOWT_PREFIX = "KXLOWT"
@@ -11527,7 +11528,7 @@ LOWT_FAIR_FILE = os.environ.get(
 LOWT_FAIR_TOL_CENTS = _env_int("IMM_LOWT_FAIR_TOL_CENTS", 25)
 LOWT_FAIR_TTL_MIN = _env_int("IMM_LOWT_FAIR_TTL_MIN", 90)
 LOWT_FAIR_REFRESH_SECS = _env_int("IMM_LOWT_FAIR_REFRESH_SECS", 1800)
-LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 60.0)
+LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 100.0)
 LOWT_HALT_KEY = "LOWT"
 _lowt_state: dict = {"mtime": 0.0, "events": {}}
 _lowt_owner: dict = {"at": 0.0, "paused": False}

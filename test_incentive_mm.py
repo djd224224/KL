@@ -31697,7 +31697,8 @@ class TestLowTempFamily(unittest.TestCase):
         self.assertTrue(imm.move_breaker_on("KXLOWTEWR"))
         self.assertEqual(imm.pilot_budget_key(self.T), imm.LOWT_HALT_KEY)
         self.assertEqual(imm.pilot_budget_key("KXLOWTSEA-26OCT24-T41"), imm.LOWT_HALT_KEY)
-        self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), imm.LOWT_DAILY_LOSS_LIMIT)
+        self.assertEqual(imm.LOWT_DAILY_LOSS_LIMIT, 100.0)      # Jack 2026-10-23: "$100"
+        self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), 100.0)
         self.assertIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
         for k in ("LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_DAILY_LOSS_LIMIT"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
