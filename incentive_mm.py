@@ -11697,11 +11697,12 @@ HIGHT_FAIR_TTL_MIN = _env_int("IMM_HIGHT_FAIR_TTL_MIN", 90)
 HIGHT_FAIR_REFRESH_SECS = _env_int("IMM_HIGHT_FAIR_REFRESH_SECS", 1800)
 HIGHT_DAILY_LOSS_LIMIT = _env_float("IMM_HIGHT_DAILY_LOSS_LIMIT", 100.0)
 HIGHT_HALT_KEY = "HIGHT"
-# the family parent's size and band (FAMILY_OVERRIDE_PARENTS): the bot's
-# defaults until Jack sizes it
-HIGHT_SIZE_MULT = _env_float("IMM_HIGHT_SIZE_MULT", 1.0)
-HIGHT_PRICE_MIN = _env_int("IMM_HIGHT_PRICE_MIN", PRICE_MIN_CENTS)
-HIGHT_PRICE_MAX = _env_int("IMM_HIGHT_PRICE_MAX", PRICE_MAX_CENTS)
+# the family parent's size and band (FAMILY_OVERRIDE_PARENTS): x3 and
+# 3-97c, as the low family (Jack 2026-10-23: "3x and 3-97") -- the caps
+# scale with the size (applied_mention_mult)
+HIGHT_SIZE_MULT = _env_float("IMM_HIGHT_SIZE_MULT", 3.0)
+HIGHT_PRICE_MIN = _env_int("IMM_HIGHT_PRICE_MIN", 3)
+HIGHT_PRICE_MAX = _env_int("IMM_HIGHT_PRICE_MAX", 97)
 SERIES_OVERRIDES[HIGHT_PARENT] = SeriesOverride(
     size_mult=HIGHT_SIZE_MULT, price_min_cents=HIGHT_PRICE_MIN,
     price_max_cents=HIGHT_PRICE_MAX)

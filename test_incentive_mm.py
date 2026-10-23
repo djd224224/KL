@@ -31841,8 +31841,12 @@ class TestHighTempFamily(unittest.TestCase):
         try:
             imm.ensure_family_override("KXHIGHTATL")
             ov = imm.series_override("KXHIGHTATL")
+            # Jack 2026-10-23: "3x and 3-97"
             self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
-                             (1.0, imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS))
+                             (3.0, 3, 97))
+            self.assertEqual(imm.member_price_band("KXHIGHTATL", False), (3, 97))
+            self.assertEqual(imm.applied_mention_mult("KXHIGHTATL"),
+                             3.0 * imm.size_test_mult("KXHIGHTATL"))
         finally:
             imm.SERIES_OVERRIDES.pop("KXHIGHTATL", None)
             if saved is not None:
