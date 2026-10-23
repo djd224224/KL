@@ -8961,7 +8961,13 @@ if GAS_TRIAL_BLACKOUT_ET:
 OSCAR_FAMILY_RE = re.compile(r"(?!.*MENTION)KXOSCAR[A-Z0-9]*")
 # Critics Choice (2026-10-06): the same shape on "KXCRITICS"
 CRITICS_FAMILY_RE = re.compile(r"(?!.*MENTION)KXCRITICS[A-Z0-9]*")
+# the low-temperature family's parent (2026-10-23, see LOWT_ENABLE): a key
+# only; its size and price band are set beside the family's other knobs
+LOWT_PARENT = "KXLOWTFAMILY"
 FAMILY_OVERRIDE_PARENTS = (
+    # the low-temperature dailies (2026-10-23): first, so no broader family
+    # rule can claim a KXLOWT city ahead of its own
+    ("predicate", lambda s: lowt_series(s), LOWT_PARENT),
     ("prefix", "KXAAAGASD", "KXAAAGASD"),
     ("pattern", OSCAR_FAMILY_RE, "KXOSCAR"),
     ("pattern", CRITICS_FAMILY_RE, "KXCRITICS"),
@@ -10268,7 +10274,7 @@ _CONFIG_CODE_KNOBS = (
     "RAIN_FAIR_TOL_CENTS", "STICKY_PRICE_MIN", "STICKY_PRICE_MAX",
     # the low-temperature family (2026-10-23)
     "LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_FAIR_TTL_MIN",
-    "LOWT_DAILY_LOSS_LIMIT",
+    "LOWT_DAILY_LOSS_LIMIT", "LOWT_SIZE_MULT", "LOWT_PRICE_MIN", "LOWT_PRICE_MAX",
     "SCAN_HOPELESS_EXIT", "SCAN_HOPELESS_BAR", "BLIND_PRESERVE_CYCLES",
     # hopeless clock (2026-09-26): 30-minute sustain on the live projection
     "HOPELESS_SUSTAIN_SECS", "MEMBER_PEAK_GUARD", "EST_PEAK_TTL_SECS",
@@ -11530,6 +11536,21 @@ LOWT_FAIR_TTL_MIN = _env_int("IMM_LOWT_FAIR_TTL_MIN", 90)
 LOWT_FAIR_REFRESH_SECS = _env_int("IMM_LOWT_FAIR_REFRESH_SECS", 1800)
 LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 100.0)
 LOWT_HALT_KEY = "LOWT"
+# SIZE x3 AND A 3-97c BAND (Jack 2026-10-23: "3x and also extend range to
+# 3-97"). On the first pass only 6 of 144 next-day markets cleared the $1.30
+# payout bar: each pays ~$12/day against ~8,000 contracts already in the
+# scoring range, and a next-day market has at most 14 hours (10 AM listing
+# to midnight ET). The bot's estimate scales with size (x1 15 markets, x3
+# 51 on a full window), and the per-market / per-event caps scale with it
+# (applied_mention_mult). The band replaces 5-90c both for entry (the
+# extreme_mid screen widens to a series' own band) and for every rung.
+# Every KXLOWT city clones the parent (FAMILY_OVERRIDE_PARENTS).
+LOWT_SIZE_MULT = _env_float("IMM_LOWT_SIZE_MULT", 3.0)
+LOWT_PRICE_MIN = _env_int("IMM_LOWT_PRICE_MIN", 3)
+LOWT_PRICE_MAX = _env_int("IMM_LOWT_PRICE_MAX", 97)
+SERIES_OVERRIDES[LOWT_PARENT] = SeriesOverride(
+    size_mult=LOWT_SIZE_MULT, price_min_cents=LOWT_PRICE_MIN,
+    price_max_cents=LOWT_PRICE_MAX)
 _lowt_state: dict = {"mtime": 0.0, "events": {}}
 _lowt_owner: dict = {"at": 0.0, "paused": False}
 
@@ -31642,7 +31663,8 @@ class IncentiveMarketMaker:
             log(f"low-temp family (2026-10-23): {LOWT_PREFIX}* next day only (out "
                 f"00:00 ET of the market day); lowt_fair gate tol "
                 f"{LOWT_FAIR_TOL_CENTS}c, fails closed; mid-move breaker; "
-                f"${LOWT_DAILY_LOSS_LIMIT:g}/day family loss halt"
+                f"${LOWT_DAILY_LOSS_LIMIT:g}/day family loss halt; size "
+                f"x{LOWT_SIZE_MULT:g}, band {LOWT_PRICE_MIN}-{LOWT_PRICE_MAX}c"
                 + ("" if lowt_owner_paused(force=True) else
                    " -- OFF while low_temp_trading.py is not paused "
                    f"({os.path.basename(LOWT_OWNER_FLAG)} missing)"))

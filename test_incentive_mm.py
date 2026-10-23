@@ -31693,6 +31693,31 @@ class TestLowTempFamily(unittest.TestCase):
             e = imm._lowt_state["events"]["KXLOWTEWR-26OCT24"]
             self.assertEqual(e["ts"], utc(2026, 10, 23, 19, 0).timestamp())
 
+    def test_family_size_x3_and_band_3_to_97(self):
+        # Jack 2026-10-23: "3x and also extend range to 3-97"
+        names = ("KXLOWTEWR", "KXLOWTZZZ", "KXLOWTSEA")    # ZZZ: a city listed later
+        saved = {s: imm.SERIES_OVERRIDES.pop(s, None) for s in names}
+        try:
+            for s in names[:2]:
+                imm.ensure_family_override(s)
+                ov = imm.series_override(s)
+                self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
+                                 (3.0, 3, 97), s)
+                self.assertEqual(imm.member_price_band(s, False), (3, 97))
+                self.assertEqual(imm.member_price_band(s, True), (3, 97))
+                self.assertEqual(imm.applied_mention_mult(s), 3.0 * imm.size_test_mult(s))
+            # the low bot running again: no family, no clone
+            with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
+                imm.ensure_family_override("KXLOWTSEA")
+                self.assertIsNone(imm.series_override("KXLOWTSEA"))
+        finally:
+            for s, ov in saved.items():
+                imm.SERIES_OVERRIDES.pop(s, None)
+                if ov is not None:
+                    imm.SERIES_OVERRIDES[s] = ov
+        for k in ("LOWT_SIZE_MULT", "LOWT_PRICE_MIN", "LOWT_PRICE_MAX"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
     def test_breaker_and_one_family_loss_budget(self):
         self.assertTrue(imm.move_breaker_on("KXLOWTEWR"))
         self.assertEqual(imm.pilot_budget_key(self.T), imm.LOWT_HALT_KEY)
