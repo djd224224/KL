@@ -1775,14 +1775,21 @@ def fetch_all_orders(ticker, max_pages=10):
     """Every order on a ticker, following the pagination cursor. A single
     get_orders call returns only the first page, so a resting backlog beyond
     one page would undercount the resting exposure feeding the cap checks
-    below (and leave orders uncancelled in the sweep)."""
+    below (and leave orders uncancelled in the sweep).
+
+    The IMM's orders (client_order_id "imm-...") are left out (2026-10-23,
+    Jack: "Yes build high temp recommendation"): the IMM quotes the NEXT
+    day's KXHIGH markets from listing to 20:45 ET on this same account, and
+    this bot's cancel sweep and resting-cap counts -- the only readers --
+    must never cancel or count them."""
     orders = []
     cursor = None
     for _ in range(max_pages):
         resp = exchange_client.get_orders(ticker=ticker, limit=200, cursor=cursor)
         if not isinstance(resp, dict):
             break
-        orders.extend(resp.get('orders') or [])
+        orders.extend(o for o in (resp.get('orders') or [])
+                      if not str(o.get('client_order_id') or '').startswith('imm-'))
         cursor = resp.get('cursor') or None
         if not cursor:
             break

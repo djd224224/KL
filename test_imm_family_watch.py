@@ -765,10 +765,17 @@ class TestQuoteCalls(unittest.TestCase):
             return fw.quote_call(key, it, self.TRACK)
 
     def test_another_bots_markets_are_never_quoted(self):
-        c, why = self.call("new:KXHIGHTSDF")
-        self.assertEqual(c, "DON'T QUOTE")
-        self.assertIn("high_temp_trading.py (cloud) trades the KXHIGH dailies", why)
-        self.assertIn("self-trade prevention", why)
+        from unittest import mock
+        # the high bot's KXHIGH dailies with the IMM's high-temperature family off
+        with mock.patch.object(imm, "HIGHT_ENABLE", False):
+            c, why = self.call("new:KXHIGHTSDF")
+            self.assertEqual(c, "DON'T QUOTE")
+            self.assertIn("high_temp_trading.py (cloud) trades the KXHIGH dailies", why)
+            self.assertIn("self-trade prevention", why)
+        # ...on (2026-10-23): the family quotes the next day of the series
+        # its fair file models
+        with mock.patch.dict(imm._hight_state, {"series": {"KXHIGHTSDF"}}),                 mock.patch.object(imm, "load_hight_fair", lambda: 0):
+            self.assertEqual(fw.owner_of("KXHIGHTSDF"), ("", False))
         from unittest import mock
         # the low bot running: its KXLOWT dailies (scan-excluded, not blocklisted)
         with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):

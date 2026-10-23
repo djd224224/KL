@@ -141,6 +141,7 @@ def setUpModule():
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
     # the low-temperature fair (2026-10-23)
     imm.LOWT_FAIR_FILE = os.path.join(tmp, "lowt_fair.json")
+    imm.HIGHT_FAIR_FILE = os.path.join(tmp, "hight_fair.json")
     # The full-depth book log resolves its directory at WRITE time from
     # STATUS_DIR (redirected above) unless IMM_BOOK_LOG_DIR is set; a stray
     # value in the shell would send test books wherever it points.
@@ -16985,7 +16986,13 @@ class TestOpenScanTier(unittest.TestCase):
         self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
         self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")   # gas trial ended 10/08
         # blocklist wins over everything (other bots' books)
-        self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
+        # (the KXHIGH dailies: the IMM's own high-temperature family since
+        # 2026-10-23, the high bot's block only with the family off)
+        with mock.patch.dict(imm._hight_state, {"series": {"KXHIGHNY"}}):
+            self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "allowed")
+            with mock.patch.object(imm, "HIGHT_ENABLE", False):
+                self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")
+        self.assertEqual(r("KXHIGHNY-26JUL10-B90"), "blocked")       # no fair file yet
         self.assertEqual(r("KXXRPMAXMON-XRP-26JUL31-140"), "blocked")
         self.assertEqual(r("KXMLBMENTION-26JUL14ALNL-GRAN"), "blocked")
         # the low-temperature dailies: the IMM's own family while the low
@@ -23733,7 +23740,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the NBA auto families' game members' team-news hold (2026-10-22)
         # + the state statistics release pause (2026-10-22)
         # + the low-temperature gate (2026-10-23)
-        self.assertEqual(len(conts), 51)
+        # + the high-temperature gate (2026-10-23)
+        self.assertEqual(len(conts), 52)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -25265,13 +25273,13 @@ class TestSignedFairReads(unittest.TestCase):
         """Wiring guard: the Carbon Arc, OpenRouter token, OpenRouter share,
         monthly rain, monthly snow, GasBuddy, daily rain (its city
         discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11),
-        Rotten Tomatoes (2026-10-12), ski-resort snowfall (2026-10-22) and
-        low temperature (2026-10-23) refreshers each build a reader with fair_reader() and pass it to
+        Rotten Tomatoes (2026-10-12), ski-resort snowfall (2026-10-22), low
+        and high temperature (2026-10-23) refreshers each build a reader with fair_reader() and pass it to
         their module's write_fair_file (the threads live inside run(), so
         read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 12)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 13)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -25283,7 +25291,8 @@ class TestSignedFairReads(unittest.TestCase):
                           ("rain_wknd_fair", "RAIN_WKND_FILE"),
                           ("rt_fair", "RT_FAIR_FILE"),
                           ("resort_snow_fair", "RESORT_SNOW_FILE"),
-                          ("lowt_fair", "LOWT_FAIR_FILE")):
+                          ("lowt_fair", "LOWT_FAIR_FILE"),
+                          ("hight_fair", "HIGHT_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)
@@ -31747,6 +31756,103 @@ class TestLowTempFamily(unittest.TestCase):
         self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), 100.0)
         self.assertIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
         for k in ("LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_DAILY_LOSS_LIMIT"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+
+class TestHighTempFamily(unittest.TestCase):
+    """Jack 2026-10-23: "Investigate building the same thing for high temp
+    IMM. I know there's a separate bot quoting it, is it possible to keep it
+    separate?" -> "Yes build high temp recommendation"."""
+
+    T = "KXHIGHNY-26OCT24-B62.5"
+
+    def setUp(self):
+        self._p = mock.patch.dict(imm._hight_state, {
+            "mtime": 0.0, "events": {},
+            "series": {"KXHIGHNY", "KXHIGHTATL", "KXHIGHTLV"}})
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_the_family_lifts_the_high_bots_block_for_its_markets_only(self):
+        prev = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertIn("KXHIGH", imm.SERIES_BLOCKLIST_PREFIXES)    # the high bot's
+            self.assertTrue(imm.hight_series("KXHIGHTATL"))
+            self.assertFalse(IncentiveMarketMaker._blocked(self.T))
+            self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+            # every other blocklist prefix still blocks, and so does the high
+            # bot's prefix on a KXHIGH series the fair writer did not model
+            self.assertTrue(IncentiveMarketMaker._blocked("KXETHMAXMON-ETH-26OCT31-5000"))
+            self.assertTrue(IncentiveMarketMaker._blocked("KXHIGHCC-26OCT07-T1"))
+            self.assertTrue(IncentiveMarketMaker._blocked("KXHIGH-26SEP11-NYC"))
+            self.assertFalse(imm.hight_series("KXHIGHCC"))
+            with mock.patch.object(imm, "HIGHT_ENABLE", False):
+                self.assertTrue(IncentiveMarketMaker._blocked(self.T))
+                self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        finally:
+            imm.ALLOWLIST_ONLY = prev
+
+    def test_out_at_2045_et_the_evening_before(self):
+        f = imm.apply_series_cutoff_adjustments
+        self.assertEqual(f("KXHIGHNY", "KXHIGHNY-26OCT24", None),
+                         utc(2026, 10, 24, 0, 45))                   # 20:45 EDT Oct 23
+        self.assertEqual(f("KXHIGHTLV", "KXHIGHTLV-26NOV02", None),
+                         utc(2026, 11, 2, 1, 45))                    # 20:45 EST Nov 1
+        # the earlier of the two
+        self.assertEqual(f("KXHIGHNY", "KXHIGHNY-26OCT24", utc(2026, 10, 23, 20, 0)),
+                         utc(2026, 10, 23, 20, 0))
+        self.assertEqual(f("KXHIGHNY", "KXHIGHNY-X", None), imm.RELEASE_GUARD_UNKNOWN)
+        with mock.patch.object(imm, "HIGHT_ENABLE", False):
+            self.assertIsNone(f("KXHIGHNY", "KXHIGHNY-26OCT24", None))
+
+    def test_gate_reads_the_high_temp_file(self):
+        now = time.time()
+        g = imm.hight_gate
+        self.assertEqual(g(self.T, now, 30, 34)[1]["reason"], "no_read")
+        imm._hight_state["events"]["KXHIGHNY-26OCT24"] = {
+            "ts": now - 60, "mu": 62.2, "b": 2.25, "skip": None,
+            "markets": {self.T: 0.33}}
+        self.assertEqual(g(self.T, now, 30, 34), ("", dict(fair=33.0, mu=62.2, b=2.25, nws=None,
+                                                          wu=None, tol=imm.HIGHT_FAIR_TOL_CENTS)))
+        self.assertEqual(g(self.T, now, 60, 64)[1]["reason"], "band")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hight_fair.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"events": {"KXHIGHNY-26OCT25": {
+                    "fetched_at": "2026-10-24T15:00:00+00:00", "markets": {}}}}, fh)
+            # (a file with a series map: only CLI-modelled series join)
+            with open(path + "2", "w", encoding="utf-8") as fh:
+                json.dump({"events": {}, "series": {"KXHIGHNY": "CLINYC",
+                                                    "KXHIGHTEGLL": None}}, fh)
+            with mock.patch.object(imm, "HIGHT_FAIR_FILE", path + "2"):
+                imm.load_hight_fair()
+                self.assertEqual(imm._hight_state["series"], {"KXHIGHNY"})
+                imm._hight_state["mtime"] = 0.0
+            with mock.patch.object(imm, "HIGHT_FAIR_FILE", path):
+                self.assertEqual(imm.load_hight_fair(), 1)
+        self.assertEqual(list(imm._hight_state["events"]), ["KXHIGHNY-26OCT25"])
+        self.assertEqual(imm._hight_state["series"], set())          # the file had no map
+
+    def test_family_override_budget_breaker_knobs(self):
+        saved = imm.SERIES_OVERRIDES.pop("KXHIGHTATL", None)
+        try:
+            imm.ensure_family_override("KXHIGHTATL")
+            ov = imm.series_override("KXHIGHTATL")
+            self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
+                             (1.0, imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS))
+        finally:
+            imm.SERIES_OVERRIDES.pop("KXHIGHTATL", None)
+            if saved is not None:
+                imm.SERIES_OVERRIDES["KXHIGHTATL"] = saved
+        self.assertTrue(imm.move_breaker_on("KXHIGHTATL"))
+        self.assertEqual(imm.pilot_budget_key(self.T), imm.HIGHT_HALT_KEY)
+        self.assertEqual(imm.pilot_halt_limit(imm.HIGHT_HALT_KEY), 100.0)
+        self.assertIn(imm.HIGHT_HALT_KEY, imm.pilot_halt_keys())
+        for k in ("HIGHT_ENABLE", "HIGHT_STOP_BEFORE_MIN", "HIGHT_FAIR_TOL_CENTS",
+                  "HIGHT_DAILY_LOSS_LIMIT", "HIGHT_SIZE_MULT"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
 

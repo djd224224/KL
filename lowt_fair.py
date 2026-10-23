@@ -50,7 +50,7 @@ import re
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import pytz
 import requests
@@ -197,19 +197,25 @@ def shape_skip(prof: dict) -> Optional[str]:
     return None
 
 
-def wu_day_min(js: dict, day: date) -> Optional[float]:
-    """calendarDayTemperatureMin for `day` (midnight-to-midnight local, the
-    settlement day; NOT temperatureMin, the night period that crosses
-    midnight), matched by validTimeLocal rather than by index."""
-    mins, valid = js.get("calendarDayTemperatureMin"), js.get("validTimeLocal")
-    if not isinstance(mins, list) or not isinstance(valid, list):
+def wu_day_value(js: dict, day: date, field: str) -> Optional[float]:
+    """The Weather Company's calendar-day `field` for `day`, matched by
+    validTimeLocal rather than by index."""
+    vals, valid = js.get(field), js.get("validTimeLocal")
+    if not isinstance(vals, list) or not isinstance(valid, list):
         return None
     want = day.isoformat()
     for i, vt in enumerate(valid):
         if isinstance(vt, str) and vt.startswith(want):
-            v = mins[i] if i < len(mins) else None
+            v = vals[i] if i < len(vals) else None
             return float(v) if v is not None else None
     return None
+
+
+def wu_day_min(js: dict, day: date) -> Optional[float]:
+    """calendarDayTemperatureMin for `day` (midnight-to-midnight local, the
+    settlement day; NOT temperatureMin, the night period that crosses
+    midnight)."""
+    return wu_day_value(js, day, "calendarDayTemperatureMin")
 
 
 def event_fair(series: str, nws: Optional[float], wu: Optional[float],
@@ -242,9 +248,23 @@ def event_fair(series: str, nws: Optional[float], wu: Optional[float],
     return out
 
 
-def discover(old: dict, now_ts: float, get_json: Optional[Callable] = None
+class Kind(NamedTuple):
+    """What differs between the daily-low family and the daily-high one
+    (hight_fair.py): the series prefix, the NWS hourly profile, the profile
+    field that is the day's forecast, The Weather Company's field, the
+    event's fair, and the model constants recorded in the file."""
+    prefix: str
+    profile: Callable
+    nws_key: str
+    wu_field: str
+    fair: Callable
+    model: dict
+
+
+def discover(old: dict, now_ts: float, get_json: Optional[Callable] = None,
+             prefix: str = SERIES_PREFIX
              ) -> Tuple[Dict[str, Optional[str]], dict, float, List[str]]:
-    """{series: CLI product or None} for every KXLOWT series, re-read from
+    """{series: CLI product or None} for every `prefix` series, re-read from
     Kalshi's category listing and each series' rules every DISCOVER_SECS;
     else the cached map. Returns (series map, unmapped, discovered_at, errors)."""
     cached = dict(old.get("series") or {})
@@ -254,7 +274,7 @@ def discover(old: dict, now_ts: float, get_json: Optional[Callable] = None
     errors: List[str] = []
     js = _kalshi("/series", {"category": SERIES_CATEGORY}, get_json)
     names = sorted(s["ticker"] for s in js.get("series") or []
-                   if str(s.get("ticker", "")).startswith(SERIES_PREFIX))
+                   if str(s.get("ticker", "")).startswith(prefix))
     smap: Dict[str, Optional[str]] = {}
     unmapped: dict = {}
     for s in names:
@@ -278,12 +298,18 @@ def discover(old: dict, now_ts: float, get_json: Optional[Callable] = None
     return smap, unmapped, now_ts, errors
 
 
+LOW = Kind(SERIES_PREFIX, nws_profile, "day_min", "calendarDayTemperatureMin",
+           event_fair, {"bias_f": BIAS_F, "b_mult": B_MULT, "b_pooled": B_POOLED})
+
+
 def write_fair_file(path: str, get_json: Optional[Callable] = None,
-                    now_utc: Optional[datetime] = None) -> Tuple[int, int, int]:
-    """Refresh every open KXLOWT event dated after its station's local today
-    (the IMM quotes the day before only). An event whose read fails this
-    round keeps its old entry and old fetched_at (the gate's TTL governs).
-    Returns (events priced, events skipped, stations failed)."""
+                    now_utc: Optional[datetime] = None,
+                    kind: Kind = LOW) -> Tuple[int, int, int]:
+    """Refresh every open `kind` event (KXLOWT by default) dated after its
+    station's local today (the IMM quotes the day before only). An event
+    whose read fails this round keeps its old entry and old fetched_at (the
+    gate's TTL governs). Returns (events priced, events skipped, stations
+    failed)."""
     now_utc = now_utc or datetime.now(timezone.utc)
     now_ts = now_utc.timestamp()
     old: dict = {}
@@ -292,7 +318,7 @@ def write_fair_file(path: str, get_json: Optional[Callable] = None,
             old = json.load(f) or {}
     except (OSError, ValueError):
         pass
-    smap, unmapped, disc_at, errors = discover(old, now_ts, get_json)
+    smap, unmapped, disc_at, errors = discover(old, now_ts, get_json, kind.prefix)
     stations: Dict[str, dict] = dict(old.get("stations") or {})
     for row in rain_fair.STATIONS.values():
         stations.setdefault(row["cli"], dict(row))
@@ -341,9 +367,9 @@ def write_fair_file(path: str, get_json: Optional[Callable] = None,
                     errors.append(f"{series} WU: read failed ({type(e).__name__})")
             for ev, mkts in sorted(by_event.items()):
                 d = event_date(ev)
-                prof = nws_profile(periods, st["tz"], d)
-                entry = event_fair(series, prof.get("day_min"), wu_day_min(wu_js, d),
-                                   prof, mkts)
+                prof = kind.profile(periods, st["tz"], d)
+                entry = kind.fair(series, prof.get(kind.nws_key),
+                                  wu_day_value(wu_js, d, kind.wu_field), prof, mkts)
                 entry.update(date=d.isoformat(), series=series, cli=cli,
                              fetched_at=now_utc.isoformat())
                 events[ev] = entry
@@ -361,8 +387,7 @@ def write_fair_file(path: str, get_json: Optional[Callable] = None,
     out = {"generated_at": now_utc.isoformat(), "events": events,
            "stations": stations, "grid_urls": grid_urls, "series": smap,
            "unmapped": unmapped, "discovered_at": disc_at,
-           "errors": errors[:20],
-           "model": {"bias_f": BIAS_F, "b_mult": B_MULT, "b_pooled": B_POOLED}}
+           "errors": errors[:20], "model": kind.model}
     tmp = path + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
