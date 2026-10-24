@@ -2207,7 +2207,8 @@ def mention_size_mult(series: str) -> float:
 # so both halves trade the same days. The salt balanced the halves on
 # 10/08-10/21 (rewards $489 vs $496/day, fills -$326 vs -$332). Out of both
 # halves: hand-tuned ladders (applied_mention_mult leaves them literal) and
-# SIZE_TEST_EXCLUDE (the Trump mentions B test). imm_size_test_report (IMM
+# SIZE_TEST_EXCLUDE (the Trump mentions B test, and KXGENERALMOV: sized x3 by
+# hand on 10/23, see GENMOV_SIZE_MULT). imm_size_test_report (IMM
 # family watch pass 7) scores it daily and writes SIZE_TEST_STOP_FILE (in
 # STATUS_DIR) when its stop rule trips; the file ends the test by hand too,
 # read once a minute. IMM_SIZE_TEST_MULT=1 turns it off.
@@ -2217,7 +2218,8 @@ SIZE_TEST_DAYS = _env_float("IMM_SIZE_TEST_DAYS", 14)
 SIZE_TEST_SALT = os.environ.get("IMM_SIZE_TEST_SALT", "size15-1026-31")
 SIZE_TEST_EXCLUDE = frozenset(
     s.strip() for s in os.environ.get(
-        "IMM_SIZE_TEST_EXCLUDE", "KXTRUMPMENTION,KXTRUMPMENTIONB").split(",") if s.strip())
+        "IMM_SIZE_TEST_EXCLUDE",
+        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV").split(",") if s.strip())
 SIZE_TEST_STOP_FILE = "size_test_stop.txt"                     # in STATUS_DIR
 _size_test_stop = {"checked": 0.0, "stopped": False}
 _size_test_cache: Dict[Any, Any] = {}           # the window per knobs, a parity per series
@@ -8539,6 +8541,28 @@ def no_side_only(ticker: str) -> bool:
     return any(ticker == ev or ticker.startswith(ev + "-")
                for ev in NO_SIDE_ONLY_EVENTS)
 
+# KXGENERALMOV (Jack 2026-10-23: "What multiplier are they at?" -> the family
+# x2 -> "Increase to 3x"). The margin-of-victory races: 11 Senate and 4
+# governor races, 170 markets (a candidate's winning margin in point bands),
+# election-family members dated to Nov 3 2026. At the family x2, 150 of the
+# 170 sat on payout_floor at 00:50Z 10/24 (projections $0.62-1.30, median
+# $0.91, against the $1.30 entry bar).
+#   * x3 IN PLACE OF the family x2, as KXPRESRUN's x6: the election guard set
+#     (1-99c band, no safe-join) at size_mult GENMOV_SIZE_MULT, so rungs
+#     20 -> 60, the per-market cap 150 -> 450 and the per-event cap
+#     1,000 -> 3,000. The hour windows compose on top (evenings 90, weekday
+#     nights 180, Saturday days 120, Saturday nights 360), and the floor
+#     projection walks them as for every family.
+#   * OUT OF THE BASE SIZE SPLIT TEST (SIZE_TEST_EXCLUDE): its hash put the
+#     series in the test half, which would have quoted it x4.5 from 10/26 to
+#     the vote, and it has no baseline there (dated 10/23).
+# IMM_GENMOV_SIZE_MULT=2 puts it back on the family size (env => task-level
+# restart).
+GENMOV_SERIES = "KXGENERALMOV"
+GENMOV_SIZE_MULT = _env_float("IMM_GENMOV_SIZE_MULT", 3.0)
+SERIES_OVERRIDES[GENMOV_SERIES] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
+                                          size_mult=GENMOV_SIZE_MULT)
+
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
 # global ladder and caps. Every member clones it (FAMILY_OVERRIDE_PARENTS).
@@ -10440,6 +10464,7 @@ _CONFIG_CODE_KNOBS = (
     "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
     "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
     "PRESRUN_SIZE_MULT", "NO_SIDE_ONLY_EVENTS",   # KXPRESRUN-28 (2026-10-11)
+    "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",

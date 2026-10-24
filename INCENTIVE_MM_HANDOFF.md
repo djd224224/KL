@@ -11052,3 +11052,22 @@ Deploy: incentive_mm.py change, so the sync's code-change restart.
   then to 10 min before it".
 - A start can also be set by hand: python imm_earnings_overrides.py --set EVENT "YYYY-MM-DDTHH:MM:00-04:00".
 Deploy: incentive_mm.py change, so the sync's code-change restart; the watch imports fresh on its next run.
+
+## 2026-10-24 ~01:15Z — the margin-of-victory races at x3 (Jack: "What multiplier are they at?" -> x2 -> "Increase to 3x")
+
+- KXGENERALMOV: 11 Senate and 4 governor races, 170 markets (a candidate's winning margin in point bands), dated to
+  Nov 3 2026 by research and the 2027-expiry auto-dating (1ba8981). As election-family members they rode the
+  family x2. At 00:50Z 10/24, 150 of 170 sat on payout_floor (projections $0.62-1.30, median $0.91, against the
+  $1.30 entry bar), 13 selected, 7 admit_pending.
+- SERIES_OVERRIDES["KXGENERALMOV"] = the election archetype (1-99c band, no safe-join) at GENMOV_SIZE_MULT 3.0, in
+  place of the x2, as KXPRESRUN's x6. Rungs 20 -> 60, per-market cap 150 -> 450, per-event cap 1,000 -> 3,000; the
+  hour windows compose on top (evenings 90, weekday nights 180, Saturday days 120, Saturday nights 360).
+  ensure_family_override leaves a hand-set override alone.
+- Out of the base size split test: SIZE_TEST_EXCLUDE's default adds KXGENERALMOV. Its hash put it in the test
+  half, which would have quoted it x4.5 from 10/26 to the vote, and it has no baseline (dated 10/23).
+- The floor projection already walks the hour schedule (FLOOR_PROJECTION_SCHEDULE, 9/26): floor_dollars_per_day is
+  the window-weighted mean of the ladder's share at each multiplier the remaining window will carry. E.g. TX P1 at
+  00:50Z Fri: 1.5x 11.6% (Fri evening), 2x 33% (Sat day), 3x 22% (Sat evening), 6x 33% (Sat night) ->
+  $0.95/day x 1.13 days = $1.07. x3 lifts every one of those ladders by half.
+- IMM_GENMOV_SIZE_MULT=2 reverts (env => task-level restart).
+Deploy: incentive_mm.py change, so the sync's code-change restart.

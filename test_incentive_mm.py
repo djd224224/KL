@@ -31637,6 +31637,37 @@ class TestSizeSplitTest(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult(t), 1.0)          # stopped: back at 1x
 
 
+class TestGenMovX3(unittest.TestCase):
+    """The margin-of-victory races at x3 in place of the election family x2
+    (Jack 2026-10-23: "Increase to 3x"), held there through the size test."""
+
+    S = "KXGENERALMOV"
+    EV = "KXGENERALMOV-SENATETX-26"
+
+    def test_x3_on_the_election_guard_set_and_out_of_the_size_test(self):
+        ov = imm.SERIES_OVERRIDES[self.S]
+        el = imm.SERIES_OVERRIDES[imm.ELECTION_ARCHETYPE]
+        self.assertEqual(ov.size_mult, 3.0)
+        self.assertEqual((ov.price_min_cents, ov.price_max_cents, ov.safe_join),
+                         (el.price_min_cents, el.price_max_cents, el.safe_join))
+        self.assertEqual(imm.series_price_min(self.S), 1)
+        self.assertEqual(imm.series_price_max(self.S), 99)
+        # the size test's window: still x3, not the test half's x4.5
+        ts = imm.ET.localize(datetime(2026, 10, 28, 12)).timestamp()
+        with mock.patch.object(imm.time, "time", return_value=ts), \
+                mock.patch.dict(imm._size_test_stop, {"checked": 0.0, "stopped": False}):
+            self.assertIsNone(imm.size_test_arm(self.S))
+            self.assertEqual(imm.applied_mention_mult(self.S), 3.0)
+            self.assertEqual(imm.series_max_position(self.S),
+                             imm.MAX_POSITION_CONTRACTS * 3)
+            self.assertEqual(imm.event_cap_contracts(self.EV),
+                             imm.MAX_EVENT_CONTRACTS * 3)
+        # the family clone leaves the hand-set override alone
+        with mock.patch.object(imm, "log"):
+            imm.ensure_family_override(self.S)
+        self.assertIs(imm.SERIES_OVERRIDES[self.S], ov)
+
+
 class TestLowTempFamily(unittest.TestCase):
     """Jack 2026-10-23: "Build low temp fair value as part of IMM, only quote
     the next day never the same day (I should have the bones already as part
