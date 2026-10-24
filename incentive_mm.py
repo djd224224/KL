@@ -11567,7 +11567,10 @@ LOWT_OWNER_FLAG = os.environ.get(
 LOWT_OWNER_CHECK_SECS = 60
 LOWT_FAIR_FILE = os.environ.get(
     "IMM_LOWT_FAIR_FILE", os.path.join(STATUS_DIR, "lowt_fair.json"))
-LOWT_FAIR_TOL_CENTS = _env_int("IMM_LOWT_FAIR_TOL_CENTS", 25)
+# 40c since 2026-10-24 (Jack: "Yes widen"): at 25c the guard held the
+# likeliest bands, where the market prices tighter than this fair and has
+# been the better forecaster; 40c still stops a book that is wildly off
+LOWT_FAIR_TOL_CENTS = _env_int("IMM_LOWT_FAIR_TOL_CENTS", 40)
 LOWT_FAIR_TTL_MIN = _env_int("IMM_LOWT_FAIR_TTL_MIN", 90)
 LOWT_FAIR_REFRESH_SECS = _env_int("IMM_LOWT_FAIR_REFRESH_SECS", 1800)
 LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 100.0)
@@ -11717,7 +11720,8 @@ HIGHT_PREFIX = "KXHIGH"
 HIGHT_STOP_BEFORE_MIN = _env_int("IMM_HIGHT_STOP_BEFORE_MIN", 195)   # 20:45 ET
 HIGHT_FAIR_FILE = os.environ.get(
     "IMM_HIGHT_FAIR_FILE", os.path.join(STATUS_DIR, "hight_fair.json"))
-HIGHT_FAIR_TOL_CENTS = _env_int("IMM_HIGHT_FAIR_TOL_CENTS", 25)
+# 40c since 2026-10-24, as the low family's (Jack: "Yes widen")
+HIGHT_FAIR_TOL_CENTS = _env_int("IMM_HIGHT_FAIR_TOL_CENTS", 40)
 HIGHT_FAIR_TTL_MIN = _env_int("IMM_HIGHT_FAIR_TTL_MIN", 90)
 HIGHT_FAIR_REFRESH_SECS = _env_int("IMM_HIGHT_FAIR_REFRESH_SECS", 1800)
 HIGHT_DAILY_LOSS_LIMIT = _env_float("IMM_HIGHT_DAILY_LOSS_LIMIT", 100.0)

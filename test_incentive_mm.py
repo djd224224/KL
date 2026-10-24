@@ -31687,7 +31687,7 @@ class TestLowTempFamily(unittest.TestCase):
 
     def _read(self, now_ts, **kw):
         e = {"ts": now_ts - 600, "mu": 38.3, "b": 1.79, "nws": 38.0, "wu": None,
-             "skip": None, "markets": {self.T: 0.30, "KXLOWTEWR-26OCT24-T38": 0.40}}
+             "skip": None, "markets": {self.T: 0.30, "KXLOWTEWR-26OCT24-T38": 0.60}}
         e.update(kw)
         imm._lowt_state["events"]["KXLOWTEWR-26OCT24"] = e
 
@@ -31731,13 +31731,17 @@ class TestLowTempFamily(unittest.TestCase):
         self.assertEqual(g(self.T, now, 28, 32)[1]["reason"], "skip")
         self._read(now)
         self.assertEqual(g("KXLOWTEWR-26OCT24-B40.5", now, 28, 32)[1]["reason"], "no_market")
-        # fair 30c, tol 25c: a touch inside the band quotes, unchanged
+        # fair 30c, tol 40c (Jack 2026-10-24: "Yes widen"): a touch inside the
+        # band quotes, unchanged
+        self.assertEqual(imm.LOWT_FAIR_TOL_CENTS, 40)
         why, inputs = g(self.T, now, 50, 60)
         self.assertEqual((why, inputs["fair"]), ("", 30.0))
-        self.assertEqual(g(self.T, now, 55, 60)[0], "")              # bid exactly at fair + tol
-        why, inputs = g(self.T, now, 56, 60)                         # bid touch above fair + tol
+        self.assertEqual(g(self.T, now, 70, 75)[0], "")              # bid exactly at fair + tol
+        why, inputs = g(self.T, now, 71, 75)                         # bid touch above fair + tol
         self.assertEqual((inputs["reason"], inputs["bid_bad"]), ("band", True))
-        why, inputs = g(self.T, now, 1, 4)                           # ask touch under fair - tol
+        t38 = "KXLOWTEWR-26OCT24-T38"                                # fair 60c
+        self.assertEqual(g(t38, now, 15, 20)[0], "")                 # ask exactly at fair - tol
+        why, inputs = g(t38, now, 15, 19)                            # ask touch under fair - tol
         self.assertEqual((inputs["reason"], inputs["ask_bad"]), ("band", True))
 
     def test_the_fair_file_reloads_by_mtime(self):
@@ -31848,7 +31852,9 @@ class TestHighTempFamily(unittest.TestCase):
             "markets": {self.T: 0.33}}
         self.assertEqual(g(self.T, now, 30, 34), ("", dict(fair=33.0, mu=62.2, b=2.25, nws=None,
                                                           wu=None, tol=imm.HIGHT_FAIR_TOL_CENTS)))
-        self.assertEqual(g(self.T, now, 60, 64)[1]["reason"], "band")
+        self.assertEqual(imm.HIGHT_FAIR_TOL_CENTS, 40)
+        self.assertEqual(g(self.T, now, 73, 76)[0], "")              # bid at fair + 40
+        self.assertEqual(g(self.T, now, 74, 76)[1]["reason"], "band")
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "hight_fair.json")
             with open(path, "w", encoding="utf-8") as fh:
