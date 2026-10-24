@@ -16,6 +16,14 @@ first signal per market, taker fee deducted):
 The losing kind is the move the market makes on NEWS the model does not
 have (Keenan Allen out -> Downs' ladder 24 -> 34). A signal is SKIPPED when:
   injury        the player has any ESPN designation (or is off the roster)
+  missed_game   he has no stats line in one of his team's last 2 games this
+                season (benched, inactive or hurt). nflverse writes no row
+                for a player who records nothing, so neither the model's
+                EWMA nor the recent-form mean ever sees that game: Cam
+                Skattebo's Week 6 benching (no carries, no targets) left his
+                receiving mean at 19.8 yds off Weeks 2-5, and the sniper
+                bought 3,999 of his yards ladder at 2c (8 yds) on 10/24
+                (Jack 2026-10-24: "Yes fix sniper")
   team_news     a contributor on his team changed designation in the last
                 news_skip_hours (1; 12 until Jack 2026-10-09: "move sniper
                 down to 1hr") -- this bot's watch or the IMM's (a
@@ -63,7 +71,10 @@ and (c) worth min_net_cents (2) per contract after Kalshi's taker fee
 bottom.
 
 SIZE. The external liquidity inside the limit (our own resting orders
-netted out), capped by max_contracts_order (300) and by the money at risk:
+netted out), capped by max_contracts_order (300), by max_contracts_market
+(1,000) held in the market either way (Jack 2026-10-24: "Cap max contracts
+at 1k", after the refill took 3,999 of a 2c ladder in 5 minutes for $80 of
+the market cap), and by the money at risk:
 max_risk_market ($80), max_risk_player ($160), max_risk_total ($250) over
 this bot's open book (market / player $40 / $80 until Jack 2026-10-22:
 "Increase size" -- its one live trade, 9 of Nico Collins' yards ladder at
@@ -186,6 +197,7 @@ class Config:
     max_risk_player: float = 160.0       # (80 until 10/22)
     max_risk_total: float = 250.0
     max_contracts_order: int = 300
+    max_contracts_market: int = 1000     # held in one market (Jack 2026-10-24)
     min_contracts_order: int = 5
     cash_floor: float = 500.0            # free cash left on the shard
     stop_before_kickoff_min: float = 15.0
@@ -846,6 +858,8 @@ def skip_reason(sig: Signal, e: dict, snap_ts: float, now_ts: float,
         return "stale_roster"
     if e.get("injury"):
         return "injury"
+    if e.get("missed_games"):
+        return "missed_game"
     na = e.get("news_at")
     if na is not None and now_ts - float(na) < cfg.news_skip_hours * 3600:
         return "team_news"
@@ -864,6 +878,23 @@ def skip_reason(sig: Signal, e: dict, snap_ts: float, now_ts: float,
             cfg.refill and book.refill_ok(sig.ticker, sig.side, sig.limit)):
         return "cooldown"
     return ""
+
+
+def missed_games(index: Any, e: dict, season: Optional[int],
+                 k: int = 2) -> List[str]:
+    """'<season>w<week>' for each of his team's last k games of `season`
+    (the latest season on file when None) in which the player has no stats
+    line; [] when the index carries no team games."""
+    tg = getattr(index, "team_games", None)
+    pid, team = e.get("pid"), e.get("team")
+    if not tg or pid is None or not team:
+        return []
+    games = tg.get(nf.KALSHI_TO_NFLV.get(team, team)) or {}
+    if season is None and games:
+        season = max(s for s, _w in games)
+    keys = sorted(key for key in games if key[0] == season)[-k:]
+    return [f"{s}w{w}" for s, w in keys
+            if not any(r.get("player_id") == pid for r in games[(s, w)])]
 
 
 def espn_team(e: dict) -> Optional[str]:
@@ -904,12 +935,18 @@ def size_order(sig: Signal, limit: float, available: float, book: SnipeBook,
     if cash is not None:
         rooms["cash"] = cash - cfg.cash_floor
     by_risk = min(rooms.values())
-    n = int(min(available, cfg.max_contracts_order,
+    # contracts until the market's position passes max_contracts_market
+    # either way (a buy adds to a long, a sell to a short)
+    pos = book.pos(sig.ticker)
+    by_count = cfg.max_contracts_market - (pos if sig.side == "buy" else -pos)
+    n = int(min(available, cfg.max_contracts_order, max(by_count, 0.0),
                 math.floor(max(by_risk, 0.0) / max(per, 1e-9) + 1e-9)))
     if n >= cfg.min_contracts_order:
         return n, ""
     if available < cfg.min_contracts_order:
         return 0, "thin"
+    if by_count < cfg.min_contracts_order:
+        return 0, "contract_cap"
     return 0, min(rooms, key=rooms.get)
 
 
@@ -1038,6 +1075,8 @@ class Sniper:
         imm_news, imm_fairs = imm_view(IMM_STATUS_FILE, now_ts)
         takes: List[Signal] = []
         index = getattr(self.watch, "index", None)
+        cs = getattr(self.watch, "current_season", None)
+        season = cs(_utc(now_ts)) if callable(cs) else None
         for t, m in markets.items():
             e = entries.get(t)
             if find_signal(t, m, e, cfg) is None:
@@ -1051,6 +1090,9 @@ class Sniper:
                 continue
             sig.recent_mean = rmean
             out["signals"] += 1
+            missed = missed_games(index, e, season)
+            if missed:
+                e = dict(e, missed_games=missed)
             # the later of this watch's and the IMM's news on the team
             et = espn_team(e)
             if et in imm_news and (e.get("news_at") is None
@@ -1577,7 +1619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"sides {cfg.sides}, margin {cfg.band_margin_cents}c past the band, "
             f"min {cfg.min_net_cents}c and {cfg.min_ror:.0%} of risk a contract, "
             f"risk caps ${cfg.max_risk_market:g} market / ${cfg.max_risk_player:g} "
-            f"player / ${cfg.max_risk_total:g} total, cash floor ${cfg.cash_floor:g}"
+            f"player / ${cfg.max_risk_total:g} total, {cfg.max_contracts_market} contracts "
+            f"a market, cash floor ${cfg.cash_floor:g}"
             + (f", orders via {ex.api_base}" if cfg.live else ""))
     while True:
         t0 = time.time()

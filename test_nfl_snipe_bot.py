@@ -276,6 +276,8 @@ class TestSkipReasons(unittest.TestCase):
         self.assertEqual(self.r(e=entry(roster_ts=None)), "stale_roster")
         self.assertEqual(self.r(e=entry(injury="Questionable")), "injury")
         self.assertEqual(self.r(e=entry(injury="not on roster")), "injury")
+        self.assertEqual(self.r(e=entry(missed_games=["2026w6"])), "missed_game")
+        self.assertEqual(self.r(e=entry(missed_games=[])), "")
         self.assertEqual(self.r(e=entry(news_at=NOW - 1800)), "team_news")
         self.assertEqual(self.r(e=entry(news_at=NOW - 3601)), "")   # 1h skip
         self.assertEqual(self.r(imm_fair=20.0), "model_mismatch")   # 15 vs 20
@@ -313,6 +315,9 @@ class TestDefaults(unittest.TestCase):
                          (80.0, 160.0, 250.0))
         self.assertTrue(c.refill)
         self.assertFalse(sb.Config.from_env({"SNIPE_REFILL": "0"}).refill)
+        self.assertEqual(c.max_contracts_market, 1000)          # Jack 2026-10-24
+        self.assertEqual(sb.Config.from_env(
+            {"SNIPE_MAX_CONTRACTS_MARKET": "500"}).max_contracts_market, 500)
 
     def test_sibling_means_ignore_wide_books(self):
         entries = {T: entry(), T_ESC: entry(kind="escalator", fair=2.5, lo=1, hi=5)}
@@ -356,6 +361,62 @@ class TestSizing(unittest.TestCase):
                                cfg(max_risk_market=1000, max_risk_player=41))
         self.assertEqual((n, why), (0, "player_cap"))
 
+    def test_contracts_held_in_a_market_cap_at_1000(self):
+        # Jack 2026-10-24: "Cap max contracts at 1k" -- the refill bought
+        # 3,999 of a 2c ladder inside the $80 market cap
+        big = cfg(max_risk_market=1e6, max_risk_player=1e6, max_risk_total=1e6)
+        self.book.apply_fill(T, "sell", 900, 34.0, 0.0, self.s.player_key, KICK, NOW)
+        n, why = sb.size_order(self.s, 24.0, 5000, self.book, 1e6, big)
+        self.assertEqual((n, why), (100, ""))                 # the short grows to 1,000
+        self.book.apply_fill(T, "sell", 98, 34.0, 0.0, self.s.player_key, KICK, NOW)
+        n, why = sb.size_order(self.s, 24.0, 5000, self.book, 1e6, big)
+        self.assertEqual((n, why), (0, "contract_cap"))       # 2 left: under the minimum
+        buy = sb.Signal(T, "buy", 3.0, 4.0, 1.0, 8.0, 6.0, 12.0, 3.0, 1.0,
+                        player_key=self.s.player_key)
+        n, why = sb.size_order(buy, 4.0, 5000, self.book, 1e6, big)
+        self.assertEqual((n, why), (300, ""))                 # a buy unwinds the short
+        n, why = sb.size_order(buy, 4.0, 5000, self.book, 1e6,
+                               cfg(max_risk_market=1e6, max_risk_player=1e6,
+                                   max_risk_total=1e6, max_contracts_market=0))
+        self.assertEqual((n, why), (300, ""))                 # even a 0 cap lets it unwind
+
+
+class TestMissedGames(unittest.TestCase):
+    """No stats line in one of his team's last 2 games: skipped (Jack
+    2026-10-24, "Yes fix sniper" -- nflverse has no row for Cam Skattebo's
+    Week 6 benching, so his recent mean was Weeks 2-5)."""
+
+    E = {"pid": "00-0040001", "team": "NYG"}
+
+    @staticmethod
+    def row(pid, name, week, season=2026):
+        return {"player_id": pid, "name": name, "position": "RB", "season": season,
+                "week": week, "season_type": "REG", "team": "NYG", "receptions": 1.0,
+                "receiving_yards": 10.0, "rushing_yards": 30.0, "fantasy_points_ppr": 6.0,
+                "targets": 2.0, "carries": 8.0, "attempts": 0.0}
+
+    def idx(self, played, team_weeks=(1, 2, 3, 4, 5, 6)):
+        rows = [self.row("00-0000001", "Tyrone Tracy Jr.", w) for w in team_weeks]
+        rows += [self.row(self.E["pid"], "Cam Skattebo", w) for w in played]
+        return nf.PlayerIndex(rows)
+
+    def test_the_last_two_team_games(self):
+        self.assertEqual(sb.missed_games(self.idx({1, 2, 3, 4, 5}), self.E, 2026), ["2026w6"])
+        self.assertEqual(sb.missed_games(self.idx({1, 2, 3, 4, 6}), self.E, 2026), ["2026w5"])
+        self.assertEqual(sb.missed_games(self.idx({1, 2, 3, 5, 6}), self.E, 2026), [])
+        self.assertEqual(sb.missed_games(self.idx({1, 2, 3, 4}), self.E, 2026),
+                         ["2026w5", "2026w6"])
+        # a bye is no game: the last two the team played
+        self.assertEqual(sb.missed_games(self.idx({3, 4, 5, 7}, (3, 4, 5, 7)), self.E, 2026), [])
+        # the latest season on file when none is given; another season has no games
+        self.assertEqual(sb.missed_games(self.idx({1, 2, 3, 4, 5}), self.E, None), ["2026w6"])
+        self.assertEqual(sb.missed_games(self.idx({1, 2, 3, 4, 5}), self.E, 2027), [])
+
+    def test_nothing_to_check(self):
+        self.assertEqual(sb.missed_games(None, self.E, 2026), [])
+        self.assertEqual(sb.missed_games(FakeIndex({}), self.E, 2026), [])
+        self.assertEqual(sb.missed_games(self.idx({1}), {"team": "NYG"}, 2026), [])
+
 
 # ------------------------------------------------------------- end to end
 
@@ -395,14 +456,15 @@ class FakeExchange:
 
 
 class FakeIndex:
-    def __init__(self, games):
+    def __init__(self, games, team_games=None):
         self.games = games
+        self.team_games = team_games or {}
 
 
 class FakeWatch:
-    def __init__(self, entries, games=None, ts=NOW - 10):
+    def __init__(self, entries, games=None, ts=NOW - 10, team_games=None):
         self.entries, self.ts = entries, ts
-        self.index = FakeIndex(games or {})
+        self.index = FakeIndex(games or {}, team_games)
         self.status_seen, self.status_changed_at = {}, {}
 
     def refresh(self, now_ts=None):
@@ -427,7 +489,7 @@ class TestScan(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def bot(self, live=False, ex=None, entries=None, **c):
+    def bot(self, live=False, ex=None, entries=None, team_games=None, **c):
         entries = entries if entries is not None else {T: entry()}
         ex = ex or FakeExchange(
             {T: market(bid=34, ask=98)},
@@ -435,9 +497,25 @@ class TestScan(unittest.TestCase):
                                                   ["0.1400", "900"]],
                                   "no_dollars": [["0.0200", "500"]]}}})
         games = {entry()["pid"]: [{"receptions": v} for v in (3, 3, 4, 5)]}
-        b = sb.Sniper(cfg(live=live, **c), exchange=ex, watch=FakeWatch(entries, games),
+        b = sb.Sniper(cfg(live=live, **c), exchange=ex,
+                      watch=FakeWatch(entries, games, team_games=team_games),
                       kick=FakeKick(), log_dir=self.d, log=sb.Log(self.d, echo=False))
         return b, ex
+
+    def test_a_player_missing_from_a_recent_team_game_is_skipped(self):
+        pid = entry()["pid"]
+
+        def row(p, w):
+            return {"player_id": p, "season": 2026, "week": w, "team": "MIA"}
+        tg = {"MIA": {(2026, w): [row("00-0000001", w)] + ([row(pid, w)] if w < 6 else [])
+                      for w in (3, 4, 5, 6)}}
+        b, ex = self.bot(team_games=tg)
+        out = b.scan(NOW)
+        self.assertEqual(out["taken"], [])
+        self.assertEqual(out["skips"].get("missed_game"), 1)
+        tg["MIA"][(2026, 6)].append(row(pid, 6))           # he played: tradeable again
+        out = b.scan(NOW + 30)
+        self.assertEqual(len(out["taken"]), 1)
 
     def test_dry_run_books_a_paper_fill_and_sends_nothing(self):
         b, ex = self.bot()
