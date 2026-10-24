@@ -16,7 +16,7 @@ threshold". Three passes, each fail-safe on its own:
 2. DATE -- an election-family event with no row that is a US race of the 2026
    general election (us_general_vote_ok: Kalshi's Elections category, a US tag,
    rules naming 2026 with vote language and no rally / debate / court / primary
-   / runoff / special-election words, expiring Nov 3 2026 - Jan 2027) gets its
+   / runoff / special-election words, expiring Nov 3 2026 - Dec 2027) gets its
    Nov 3 row in election_dates_extra.json: the statute fixes the day (2 U.S.C.
    7 and each state's general-election law). Anything else stays in config
    gaps for pass 3.
@@ -101,7 +101,11 @@ STATE_GRACE_HOURS = float(os.environ.get("IMM_WATCH_STATE_GRACE_H", "6"))
 US_ELECTION_TAGS = frozenset({"US Elections", "Other US Elections"})
 US_GENERAL_2026 = "2026-11-03"
 _US_EXP_LO = datetime(2026, 11, 3, tzinfo=timezone.utc)
-_US_EXP_HI = datetime(2027, 1, 31, 23, 59, tzinfo=timezone.utc)
+# through 2027 (Jack 2026-10-23: "Also trust markets expiring through 2027
+# going forward"): the KXGENERALMOV margin-of-victory races expire
+# 2027-11-03, so all 15 waited on research. A later day only stops the bot
+# earlier than the market's own expiry, the safe direction
+_US_EXP_HI = datetime(2027, 12, 31, 23, 59, tzinfo=timezone.utc)
 _VOTE_RE = re.compile(r"\b(win|wins|won|winner|elected|elections?|seats?|majority|"
                       r"control|votes?)\b", re.I)
 _NOT_VOTE_RE = re.compile(r"\b(rally|rallies|debates?|attends?|endorse\w*|courts?|"
@@ -154,7 +158,7 @@ def us_general_vote_ok(series: dict, market: dict) -> Tuple[bool, str]:
     exp = imm.parse_iso_utc(market.get("expected_expiration_time")
                             or market.get("close_time") or "")
     if exp is None or not (_US_EXP_LO <= exp <= _US_EXP_HI):
-        return False, "expiry outside Nov 3 2026 - Jan 2027"
+        return False, "expiry outside Nov 3 2026 - Dec 2027"
     return True, "US race of the Nov 3 2026 general election"
 
 

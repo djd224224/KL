@@ -51,6 +51,20 @@ class TestUsGeneralRule(unittest.TestCase):
                event="KXHOUSEWINSTATE-NJD", exp="2027-01-04T15:00:00Z"))
         self.assertTrue(ok)
 
+    def test_markets_expiring_through_2027_are_trusted(self):
+        # Jack 2026-10-23: "Also trust markets expiring through 2027 going forward"
+        ok, why = fw.us_general_vote_ok(
+            {"category": "Elections", "tags": ["Senate", "US Elections"]},
+            mk("If the margin of victory for Roger Marshall in the 2026 U.S. Senate election "
+               "in Kansas is within 4% to 6%, then the market resolves to Yes.",
+               event="KXGENERALMOV-SENATEKS-26", exp="2027-11-03T14:00:00Z"))
+        self.assertTrue(ok, why)
+        ok, why = fw.us_general_vote_ok(
+            {"category": "Elections", "tags": ["Senate", "US Elections"]},
+            mk("If the Republicans win the Senate in 2026 ...", exp="2028-01-15T15:00:00Z"))
+        self.assertFalse(ok)
+        self.assertIn("expiry", why)
+
     def test_the_ticker_year_counts_when_the_terms_omit_it(self):
         ok, _ = fw.us_general_vote_ok(
             {"category": "Elections", "tags": ["Local", "US Elections"]},
