@@ -11584,7 +11584,9 @@ LOWT_HALT_KEY = "LOWT"
 # (applied_mention_mult). The band replaces 5-90c both for entry (the
 # extreme_mid screen widens to a series' own band) and for every rung.
 # Every KXLOWT city clones the parent (FAMILY_OVERRIDE_PARENTS).
-LOWT_SIZE_MULT = _env_float("IMM_LOWT_SIZE_MULT", 3.0)
+# x5 since 2026-10-24 (Jack: "5x multiplier"): the markets under the payout
+# bar projected ~45c each before their stop at x3, about a third of $1.30
+LOWT_SIZE_MULT = _env_float("IMM_LOWT_SIZE_MULT", 5.0)
 LOWT_PRICE_MIN = _env_int("IMM_LOWT_PRICE_MIN", 3)
 LOWT_PRICE_MAX = _env_int("IMM_LOWT_PRICE_MAX", 97)
 SERIES_OVERRIDES[LOWT_PARENT] = SeriesOverride(
@@ -11729,7 +11731,8 @@ HIGHT_HALT_KEY = "HIGHT"
 # the family parent's size and band (FAMILY_OVERRIDE_PARENTS): x3 and
 # 3-97c, as the low family (Jack 2026-10-23: "3x and 3-97") -- the caps
 # scale with the size (applied_mention_mult)
-HIGHT_SIZE_MULT = _env_float("IMM_HIGHT_SIZE_MULT", 3.0)
+# x5 since 2026-10-24, as the low family (Jack: "5x multiplier")
+HIGHT_SIZE_MULT = _env_float("IMM_HIGHT_SIZE_MULT", 5.0)
 HIGHT_PRICE_MIN = _env_int("IMM_HIGHT_PRICE_MIN", 3)
 HIGHT_PRICE_MAX = _env_int("IMM_HIGHT_PRICE_MAX", 97)
 SERIES_OVERRIDES[HIGHT_PARENT] = SeriesOverride(

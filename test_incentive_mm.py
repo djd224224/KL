@@ -31759,7 +31759,8 @@ class TestLowTempFamily(unittest.TestCase):
             self.assertEqual(e["ts"], utc(2026, 10, 23, 19, 0).timestamp())
 
     def test_family_size_x3_and_band_3_to_97(self):
-        # Jack 2026-10-23: "3x and also extend range to 3-97"
+        # Jack 2026-10-23: "3x and also extend range to 3-97"; x5 since
+        # 2026-10-24 ("5x multiplier")
         names = ("KXLOWTEWR", "KXLOWTZZZ", "KXLOWTSEA")    # ZZZ: a city listed later
         saved = {s: imm.SERIES_OVERRIDES.pop(s, None) for s in names}
         try:
@@ -31767,10 +31768,10 @@ class TestLowTempFamily(unittest.TestCase):
                 imm.ensure_family_override(s)
                 ov = imm.series_override(s)
                 self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
-                                 (3.0, 3, 97), s)
+                                 (5.0, 3, 97), s)
                 self.assertEqual(imm.member_price_band(s, False), (3, 97))
                 self.assertEqual(imm.member_price_band(s, True), (3, 97))
-                self.assertEqual(imm.applied_mention_mult(s), 3.0 * imm.size_test_mult(s))
+                self.assertEqual(imm.applied_mention_mult(s), 5.0 * imm.size_test_mult(s))
             # the low bot running again: no family, no clone
             with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
                 imm.ensure_family_override("KXLOWTSEA")
@@ -31880,10 +31881,10 @@ class TestHighTempFamily(unittest.TestCase):
             ov = imm.series_override("KXHIGHTATL")
             # Jack 2026-10-23: "3x and 3-97"
             self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
-                             (3.0, 3, 97))
+                             (5.0, 3, 97))
             self.assertEqual(imm.member_price_band("KXHIGHTATL", False), (3, 97))
             self.assertEqual(imm.applied_mention_mult("KXHIGHTATL"),
-                             3.0 * imm.size_test_mult("KXHIGHTATL"))
+                             5.0 * imm.size_test_mult("KXHIGHTATL"))
         finally:
             imm.SERIES_OVERRIDES.pop("KXHIGHTATL", None)
             if saved is not None:
