@@ -8275,6 +8275,35 @@ class TestStickyPads(unittest.TestCase):
         own = [("bid", imm.PAD_BID_CENTS, 800.0)]
         self.assertEqual(self._bid_pads([[2, 576.0], [1, 800.0]], own, ext_bid=2), [])
 
+    def test_temp_pads_hold_through_a_reflexive_maker(self):
+        """Jack 2026-10-25: "Make sure Low and high temp have pads" -- another
+        maker adds ~5,000 to a temperature side whenever our pad lifts it to
+        target and pulls them when ours goes; a temp pad is released only once
+        the outside depth has held the release level for
+        PAD_TEMP_RELEASE_HOLD_SECS."""
+        T = "KXLOWTEWR-26OCT26-T41"
+        own = [("bid", imm.PAD_BID_CENTS, 900.0)]
+
+        def pads(outside, now):
+            with mock.patch.object(imm.time, "time", return_value=now), \
+                    mock.patch.object(imm, "lowt_series", lambda s: s.startswith("KXLOWT")):
+                out = self.bot._pad_quotes(
+                    T, [imm.Quote(T, "bid", 2, 225)], [[15, outside], [1, 900.0]],
+                    [[40, 3000.0]], own, 1000, ext_bid=15, ext_ask=22)
+            return [p.count for p in out if p.book_side == "bid"]
+        t0 = 1_800_000_000.0
+        self.assertEqual(imm.PAD_TEMP_RELEASE_HOLD_SECS, 600.0)
+        self.assertEqual(pads(5641.0, t0), [900])               # their 5,000 arrives: kept
+        self.assertEqual(pads(5641.0, t0 + 599), [900])
+        self.assertEqual(pads(436.0, t0 + 620), [900])          # they pulled: clock clears
+        self.assertEqual(pads(5641.0, t0 + 700), [900])         # back: the clock restarts
+        self.assertEqual(pads(5641.0, t0 + 1300), [])           # held 10 min: released
+        # other families release at once, as before
+        out = self.bot._pad_quotes(
+            "T", [imm.Quote("T", "bid", 54, 57)], [[54, 5641.0], [1, 900.0]],
+            [[40, 3000.0]], own, 1000, ext_bid=54, ext_ask=62)
+        self.assertEqual([p.count for p in out if p.book_side == "bid"], [])
+
     def test_the_ask_side_mirrors(self):
         pads = self.bot._pad_quotes(
             "T", [imm.Quote("T", "ask", 62, 57)], [[54, 3000.0]],

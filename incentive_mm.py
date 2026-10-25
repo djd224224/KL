@@ -11781,6 +11781,30 @@ def hight_series(series: str) -> bool:
             and series in _hight_state["series"])
 
 
+# TEMP PADS HOLD THROUGH A REFLEXIVE MAKER (Jack 2026-10-25: "Make sure Low
+# and high temp have pads", after the coverage alert on KXLOWTEWR-26OCT26-T41:
+# one side qualified for 5 cycles). Another maker adds ~5,000 to a temperature
+# side whenever our 1c pad lifts it to target, and pulls them when ours goes.
+# Past PAD_STICKY_RELEASE_MULT x target (2,000) the sticky rule read their
+# depth as real and released our 900-1,000 pad; they pulled, the side fell
+# to ~450 and qualified nothing until we re-padded, every ~40 s
+# (KXLOWTEWR-26OCT26-T41: 51 pad cancels on 10/25; the two families 1,141).
+# For these families the release also needs the outside depth to have STAYED
+# at the release level for PAD_TEMP_RELEASE_HOLD_SECS (_pad_release_hold);
+# the touch band, ticks-behind and stand-down gates still pull a pad at once.
+# IMM_PAD_TEMP_RELEASE_HOLD_SECS=0 restores the plain sticky release.
+PAD_TEMP_RELEASE_HOLD_SECS = _env_float("IMM_PAD_TEMP_RELEASE_HOLD_SECS", 600.0)
+
+
+def pad_release_hold_secs(series: str) -> float:
+    """How long the depth outside a resting pad must hold the sticky release
+    level before the pad goes: PAD_TEMP_RELEASE_HOLD_SECS for the low- and
+    high-temperature families, 0 (at once) for everything else."""
+    if lowt_series(series) or hight_series(series):
+        return PAD_TEMP_RELEASE_HOLD_SECS
+    return 0.0
+
+
 def hight_stop_utc(event_ticker: str) -> datetime:
     """HIGHT_STOP_BEFORE_MIN before 00:00 ET of the market day (20:45 ET the
     evening before); RELEASE_GUARD_UNKNOWN without a date in the ticker."""
@@ -19276,6 +19300,8 @@ class IncentiveMarketMaker:
         # it persists changed after that save: write_status's save is skipped
         self._cycle_saved = False
         self._est_peak: Dict[str, Tuple[float, float]] = {}   # ticker -> (est_total, ts)
+        # (ticker, side) -> when a resting pad first read releasable (_pad_release_hold)
+        self._pad_release_since: Dict[Tuple[str, str], float] = {}
         # near-cliff SIZE mode (2026-09-26): ticker -> armed ts; sticky until
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
@@ -29901,16 +29927,38 @@ class IncentiveMarketMaker:
             # live: book already holds our near-touch, subtract only our pad;
             # dry: sim orders aren't in the book, add this cycle's near-touch.
             basis = (yes_depth - own_pad_bid) if self.live else (yes_depth + nt_bid)
-            n = sticky_pad_quantity(basis, target, own_pad_bid)
+            n = self._pad_release_hold(ticker, "bid",
+                                       sticky_pad_quantity(basis, target, own_pad_bid),
+                                       own_pad_bid)
             if n > 0:
                 pads.append(Quote(ticker, "bid", PAD_BID_CENTS, n, is_pad=True))
         if ask_pad_safe and (nt_ask > 0 or (pad_missing_side and nt_bid > 0)) \
                 and not series_bid_only(series_of(ticker)):
             basis = (no_depth - own_pad_ask) if self.live else (no_depth + nt_ask)
-            n = sticky_pad_quantity(basis, target, own_pad_ask)
+            n = self._pad_release_hold(ticker, "ask",
+                                       sticky_pad_quantity(basis, target, own_pad_ask),
+                                       own_pad_ask)
             if n > 0:
                 pads.append(Quote(ticker, "ask", PAD_ASK_CENTS, n, is_pad=True))
         return pads
+
+    def _pad_release_hold(self, ticker: str, side: str, n: int,
+                          resting_pad: float) -> int:
+        """`n` (the sticky size), unless that would shrink or release a
+        resting pad of a family with a pad_release_hold_secs whose outside
+        depth has sat at the release level for less than that long: then the
+        resting pad stays (TEMP PADS HOLD, 2026-10-25). The clock starts on
+        the first cycle that would release it and clears on any cycle that
+        would not."""
+        hold = pad_release_hold_secs(series_of(ticker))
+        key = (ticker, side)
+        keep = min(int(round(resting_pad)), PAD_MAX_CONTRACTS)
+        if hold <= 0 or keep < 1 or n >= keep:
+            self._pad_release_since.pop(key, None)
+            return n
+        now = time.time()
+        since = self._pad_release_since.setdefault(key, now)
+        return keep if now - since < hold else n
 
     @staticmethod
     def _identical_quote(o: dict, q: Quote) -> bool:
