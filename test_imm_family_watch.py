@@ -874,6 +874,33 @@ class TestQuoteCalls(unittest.TestCase):
         self.assertEqual(self.call("new:KXXMENTION", category="Mentions",
                                    frequency="one_off")[0], "QUOTE WITH CARE")
 
+    def test_custom_series_get_the_insider_test(self):
+        """Jack 2026-10-25: "Yes fix" -- KXNFLNEXTTEAM ("Player Next Team",
+        Kalshi frequency custom) had been called QUOTE on its family's record;
+        a custom title without an insider word keeps the record's call."""
+        def custom(tick, title):
+            return self.call("new:" + tick, fam="Politics & approval", category="Sports",
+                             frequency="custom", title=title)
+        for tick, title in (("KXNFLNEXTTEAM", "Player Next Team (Sports, custom)"),
+                            ("KXMICHCOACH", "Michigan Next Coach (Sports, custom)"),
+                            ("KXARODGRETIRE", "Aaron Rodgers Retire (Sports, custom)"),
+                            ("KXWNBADRAFT5", "WNBA Draft 5th Pick (Sports, custom)")):
+            c, why = custom(tick, title)
+            self.assertEqual(c, "DON'T QUOTE", tick)
+            self.assertIn("insiders know first", why)
+        self.assertIn('"Next Team"', custom("KXNFLNEXTTEAM", "Player Next Team")[1])
+        # stat and title-only words, and a closing "next", keep the record's call
+        for tick, title in (("KXNFLFFHIGHSCORE", "Fantasy Football Highest Scoring "
+                                                 "Performance (Sports, custom)"),
+                            ("KXMCBLADESOFFIRE", "Blades of Fire Metacritic score"),
+                            ("KXNEXTWIN", "Will golfer win this tournament next? "
+                                          "(Sports, custom)"),
+                            ("KXPOWERSLAPMATCH", "Power Slap match (Sports, custom)")):
+            self.assertEqual(custom(tick, title)[0], "QUOTE", tick)
+        self.assertEqual(fw.custom_insider_word("Player Next Team (Sports, custom)"),
+                         "Next Team")
+        self.assertIsNone(fw.custom_insider_word("Power Slap match"))
+
     def test_track_record_and_the_email(self):
         F = ["rew", "pnl", "real", "du", "xfer", "fills", "cts", "usd", "mk", "mk_n",
              "mk_cts", "rest", "pos0", "pos1", "mk0", "mk1", "settled", "cr", "cs", "fx"]

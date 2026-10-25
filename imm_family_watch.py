@@ -571,6 +571,23 @@ def _record(fam: str, r: dict) -> str:
             f"its quoting {_usd(r['quoting'])}")
 
 
+def custom_insider_word(title: str) -> Optional[str]:
+    """The first _ONE_OFF_INSIDER_RE word in a custom series' title, or None.
+    describe()'s " (Sports, custom)" tail is dropped first. Skipped there: the
+    words that also name stat or title-only markets ("Highest Scoring
+    Performance", "Blades of Fire") and a closing "next" ("win this
+    tournament next?") -- 3 of the 419 custom titles the test hit on 10/25."""
+    t = re.sub(r"\s*\([^()]*\)\s*$", "", title)
+    for m in _ONE_OFF_INSIDER_RE.finditer(t):
+        w = m.group(0).lower()
+        if w.startswith("perform") or w in ("feature", "features", "fire"):
+            continue
+        if w == "next" and not t[m.end():].strip(" ?!.").strip():
+            continue
+        return m.group(0)
+    return None
+
+
 def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     """(call, why) for one alert item, from CALL_ORDER's calls; see above."""
     kind, _, tick = key.partition(":")
@@ -635,6 +652,16 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
                                        f"off; quote small")
         return ("YOUR CALL", "a one-off: quote it only if the answer can't reach "
                              "informed traders first")
+    # CUSTOM series get the insider test too (Jack 2026-10-25: "Yes fix", after
+    # KXNFLNEXTTEAM -- "Player Next Team (Sports, custom)", trades and signings
+    # -- was called QUOTE on Sports & awards' record). Kalshi's "custom" label
+    # also covers most recurring sports and stat markets, so only the insider
+    # words apply here: without one the family record decides, as before.
+    if str(it.get("frequency") or "") == "custom":
+        w = custom_insider_word(str(it.get("title") or ""))
+        if w:
+            return ("DON'T QUOTE", f"someone decides or announces it (\"{w}\"): insiders "
+                                   f"know first")
     if not rec:
         return ("YOUR CALL", "no track record: nothing like it trades yet"
                 + (f" in {fam}" if fam else ""))
