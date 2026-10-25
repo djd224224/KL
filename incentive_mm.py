@@ -4552,6 +4552,13 @@ _CUT_AAA_SERIES = ("KXAAAGASMAXM", "KXAAAGASMINM")
 # monthly KXAAAGASM and the diesel annuals. Standard semantics; the
 # trial's blackout hours and the GasBuddy refresher stay in code.
 _CUT_GAS_TRIAL_SERIES = ("KXAAAGASD", "KXDIESELD")
+# AAA MONTHLY CUT (Jack 2026-10-25: "Cut KXAAAGASM", on the portfolio email's
+# SHRINK line: its quoting lost -$91 over the 7 days and -$83 over 30 --
+# fills -$106 against rewards +$15, down on all 7 days, the price trending
+# through the fills). Exact series (the dash): the state monthly KXAAAGASMTX
+# stays, and MINM / MAXM have been cut since 10/03. Standard semantics: the
+# open KXAAAGASM-26OCT31 position rides to settlement.
+_CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
 # OPENROUTER SHARE FAMILY OFF (Jack 2026-10-09: "yes do both", after "is it
 # still underperforming after the latest changes around breaks and control
 # measures?"). The ten KX<AUTHOR>SHARE series (_DEFAULT_OR_SHARE_SERIES)
@@ -4608,6 +4615,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_KPI_SERIES + _CUT_FOOD_SERIES + _CUT_AAA_SERIES]
     # the gas trial's national + diesel dailies (2026-10-08, above)
     + [f"{_s}-" for _s in _CUT_GAS_TRIAL_SERIES]
+    # the national AAA monthly (2026-10-25, above)
+    + [f"{_s}-" for _s in _CUT_AAA_MONTHLY_SERIES]
     # the OpenRouter share family (2026-10-09, above)
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]

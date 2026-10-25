@@ -93,8 +93,11 @@ class CutSeriesTests(unittest.TestCase):
                   "KXDGCC-26NOV07-T100",                # KXDG
                   "KXLOWCC-26NOV07-T100",               # KXLOW
                   "KXBKFT-26NOV08-T100", "KXYUMTBFT-26NOV08-T95",
-                  "KXAAAGASM-26OCT31-T3.1", "KXAAAGASMTX-26OCT31-T3"):
+                  "KXAAAGASMTX-26OCT31-T3"):
             self.assertFalse(M._blocked(t), t)
+        # KXAAAGASM itself (MINM / MAXM's neighbour) is cut on its own since
+        # 2026-10-25 (Jack: "Cut KXAAAGASM")
+        self.assertTrue(M._blocked("KXAAAGASM-26OCT31-T3.1"))
 
 
 if __name__ == "__main__":

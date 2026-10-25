@@ -3107,11 +3107,12 @@ class TestAllowlist(unittest.TestCase):
 
     def test_econ_series(self):
         a = IncentiveMarketMaker._allowed
-        for t in ("KXAAAGASW-26JUL27-4.040",
-                  "KXAAAGASM-26JUL31-3.10", "KXNHSALES-26JUL24-T620000",
+        for t in ("KXAAAGASW-26JUL27-4.040", "KXNHSALES-26JUL24-T620000",
                   # diesel enrolled 2026-08-02 evening under re-entry guards
                   "KXDIESELW-26AUG09-T5.30"):
             self.assertTrue(a(t), t)
+        # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM")
+        self.assertFalse(a("KXAAAGASM-26JUL31-3.10"))
         # the gas trial ended 2026-10-08 (Jack: "block both"): the national
         # and diesel dailies are blocked by name, the entries kept
         for t in ("KXAAAGASD-26JUL23-4.150", "KXDIESELD-26AUG03-T5.350"):
@@ -4829,11 +4830,11 @@ class TestSeriesAutoEnroll(unittest.TestCase):
             self.assertEqual(imm.scan_universe_reason(t), "blocked", t)
         finally:
             imm.ALLOWLIST_ONLY = prev_only
-        # the monthly is deliberately KEPT; the national daily was too, until
-        # the gas trial ended 2026-10-08 -- blocked by NAME, not by pattern
-        for keep in ("KXAAAGASM-26SEP30-4.20",):
-            self.assertFalse(IncentiveMarketMaker._blocked(keep), keep)
-            self.assertTrue(IncentiveMarketMaker._allowed(keep), keep)
+        # the monthly and the national daily were deliberately KEPT, until
+        # the gas trial ended 2026-10-08 (the daily) and Jack cut the monthly
+        # 2026-10-25 -- both blocked by NAME, not by pattern
+        self.assertFalse(imm.series_pattern_blocked("KXAAAGASM"))
+        self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASM-26SEP30-4.20"))
         self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASD-26SEP02-3.1500"))
         # the monthly max / min pair is not pattern-blocked either: it was
         # cut BY NAME on 2026-10-03 (test_imm_scan_graduates)
@@ -16985,6 +16986,11 @@ class TestOpenScanTier(unittest.TestCase):
                          "allowed" if imm.GB_STATE_QUOTE else "blocked")
         self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
         self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")   # gas trial ended 10/08
+        # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM");
+        # the state monthly is a different series
+        self.assertEqual(r("KXAAAGASM-26OCT31-3.10"), "blocked")
+        self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASM-26OCT31-3.10"))
+        self.assertFalse(IncentiveMarketMaker._blocked("KXAAAGASMTX-26OCT31-2.80"))
         # blocklist wins over everything (other bots' books)
         # (the KXHIGH dailies: the IMM's own high-temperature family since
         # 2026-10-23, the high bot's block only with the family off)
