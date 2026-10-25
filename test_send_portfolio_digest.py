@@ -153,9 +153,11 @@ class BuildEmailTests(unittest.TestCase):
         # tags explain the move
         self.assertIn("mark", text)
         self.assertIn("settled yes", html)
-        # residual line reconciles to the account-value change: -500.00 on
+        # the account-value bridge under the table is cut (Jack 2026-10-25:
+        # "Cut out"); the "vs yesterday" line keeps the split: -500.00 on
         # Kalshi's valuation vs -225.09 of trading in the table -> -274.91
-        self.assertIn("account value moved -500.00", text)
+        self.assertNotIn("account value", text.split("Biggest movers", 1)[1])
+        self.assertNotIn("Account value", html.split("Biggest movers", 1)[1])
         self.assertIn("-274.91", text)
         # the settled table is gone (Jack 2026-09-29); settled events stay in
         # the movers table, tagged
@@ -171,8 +173,6 @@ class BuildEmailTests(unittest.TestCase):
         subject, text, html = pf.build_email(p, [], chart_ok=False)
         self.assertIn("vs yesterday: -500.00  =  trading (at mid) -225.09  +  "
                       "reward credits +100.00  +  Kalshi's pricing vs mid -374.91", text)
-        self.assertIn("(account value moved -500.00 = this table -225.09  +  "
-                      "reward credits +100.00  +  Kalshi's pricing vs mid -374.91)", text)
         self.assertIn("(day -$0.5k: trading -$0.2k, rewards +$0.1k)", subject)
         self.assertNotIn("settled", subject)
         self.assertIn("reward credits", html)
@@ -184,9 +184,6 @@ class BuildEmailTests(unittest.TestCase):
         self.assertIn("vs yesterday: -750.00  =  trading (at mid) -225.09  +  reward credits "
                       "-150.00  +  Kalshi's pricing vs mid -374.91  (excludes "
                       "deposits/withdrawals +250.00)", text)
-        self.assertIn("(account value moved -500.00 = this table -225.09  +  reward credits "
-                      "-150.00  +  deposits/withdrawals +250.00  +  Kalshi's pricing vs mid "
-                      "-374.91)", text)
         self.assertIn("(excludes deposits/withdrawals +250.00)", html)
         self.assertIn("(day -$0.8k: trading -$0.2k, rewards -$0.1k)", subject)
         # transfers unreadable: one lumped line, still exact, and the day
@@ -462,9 +459,8 @@ class PerpsAndRewardsTests(unittest.TestCase):
         self.assertIn("vs yesterday: -475.05", text)
         self.assertIn("perpetuals +24.95", text)
         self.assertIn("day -$0.5k", subject)
-        # the movers residual stays on event contracts, where the table lives
-        self.assertIn("account value ex-perpetuals moved -500.00", text)
-        self.assertIn("-274.91", text)
+        # the movers residual (event contracts only) was cut 2026-10-25
+        self.assertNotIn("account value ex-perpetuals moved", text)
 
     def test_first_morning_with_perps_keeps_the_day_change_like_for_like(self):
         _, text, _ = pf.build_email(self._pf(prior_perps=None), [], chart_ok=False)
@@ -590,7 +586,6 @@ class TotalProfitTests(unittest.TestCase):
                       "+100.00  +  Kalshi's pricing vs mid -374.91  +  perpetuals +24.95  "
                       "(excludes deposits/withdrawals +5,000.00)", text)
         self.assertIn(f'day change <span style="color:{pf.C_NEG}">-475.05</span>', html)
-        self.assertIn("account value ex-perpetuals moved +4,500.00", text)
         # the IMM's pick-off flag still rides on the end
         subject, _, _ = pf.build_email(p, [], chart_ok=False,
                                        imm={"text": "T", "html": "H",
@@ -785,11 +780,7 @@ class SubaccountTests(unittest.TestCase):
         self.assertIn("vs yesterday: +412.35  =  trading (at mid) -551.18  +  reward "
                       "credits +353.24  +  Kalshi's pricing vs mid +610.95  +  perpetuals "
                       "-0.66  (excludes subaccount transfers -300.00)", text)
-        self.assertIn("(account value ex-perpetuals & subaccounts moved +113.01 = this "
-                      "table -551.18  +  reward credits +353.24  +  subaccount transfers "
-                      "-300.00  +  Kalshi's pricing vs mid +610.95)", text)
         self.assertIn("subaccount 1 <b>$300.00</b>", html)
-        self.assertIn("Account value ex-perpetuals &amp; subaccounts moved", html)
         self.assertIn("(excludes subaccount transfers -300.00)", html)
 
     def test_next_morning_the_subaccount_is_in_the_day_change(self):
@@ -964,18 +955,14 @@ class CollateralTests(unittest.TestCase):
         self.assertIn("vs yesterday: +412.35  =  trading (at mid) -551.18  +  reward "
                       "credits +803.24  +  Kalshi's pricing vs mid +160.95  +  perpetuals "
                       "-0.66  (excludes subaccount transfers -300.00)", text)
-        self.assertIn("(reward credits leave out -450.00 of collateral Kalshi took back on "
-                      "mutually exclusive positions: its valuation moved the other way, so "
-                      "it is not profit)", text)
         self.assertIn("rewards +$0.8k", subject)
-        self.assertIn("of collateral Kalshi took back on mutually exclusive positions", html)
-        self.assertIn("Kalshi values open positions at their last trade, less the "
-                      "collateral it has handed back", html)
+        # the footnote that explained it is cut (Jack 2026-10-25: "Cut out")
+        self.assertNotIn("collateral Kalshi took back", text + html)
 
     def test_a_release_is_not_a_reward(self):
         _, text, _ = pf.build_email(self._pf(200.0), [], chart_ok=False)
         self.assertIn("reward credits +153.24", text)
-        self.assertIn("leave out +200.00 of collateral Kalshi released", text)
+        self.assertIn("Kalshi's pricing vs mid +810.95", text)
 
     def test_unrecorded_prior_lumps_and_says_so(self):
         # the first morning after the change: the prior snapshot has no
@@ -983,7 +970,7 @@ class CollateralTests(unittest.TestCase):
         subject, text, html = pf.build_email(self._pf(None), [], chart_ok=False)
         self.assertIn("reward credits & Kalshi collateral +353.24", text)
         self.assertIn("rewards & collateral +$0.4k", subject)
-        self.assertIn("the prior morning did not record it", html)
+        self.assertIn("reward credits &amp; Kalshi collateral", html)
 
 
 class ImmSectionTests(unittest.TestCase):
@@ -1307,14 +1294,20 @@ class AdviceTests(unittest.TestCase):
                          ["PAUSE", "SHRINK", "TRIM", "HOLD", "NO CHANGE", "NO CHANGE",
                           "DOUBLE DOWN", "KEEP"])
         txt = dict(enumerate(t for _, t in recs))
-        # persistent quoting losses on live series, worst first, with how they lost
+        # persistent quoting losses on live series, worst first, with how they
+        # lost -- and the month's say: these months paid on rewards that have
+        # since faded (+$50/day the week before), so they are no defence
         self.assertEqual(txt[0], "KXBIG (Sports & awards). Why: its quoting lost -$175 over "
-                                 "the 7 days (+$175 over 14) -- fills -$210 against rewards "
-                                 "+$35 -- losing on 7 of them and again yesterday (-$25); the "
-                                 "price trended through the fills over the next hours.")
-        self.assertIn("KXGAS (Gas & diesel). Why: its quoting lost -$56 over the 7 days "
-                      "(+$294 over 14)", txt[1])
+                                 "the 7 days -- fills -$210 against rewards +$35 -- losing on 7 "
+                                 "of them and again yesterday (-$25); the price trended through "
+                                 "the fills over the next hours. Its 14 days paid (+$175 over "
+                                 "14, losing on 7 of the 14 days it traded), but on rewards "
+                                 "since faded to +$5/day from +$28/day: no defence.")
+        self.assertIn("KXGAS (Gas & diesel). Why: its quoting lost -$56 over the 7 days", txt[1])
         self.assertIn("most of it within 5 minutes of the fills (picked off", txt[1])
+        self.assertIn("Its 14 days paid (+$294 over 14, losing on 7 of the 14 days it "
+                      "traded), but on rewards since faded to +$2/day from +$26/day: no "
+                      "defence.", txt[1])
         # inventory: a lot still at risk -> trim; the rest -> hold, why
         self.assertIn("KXCA-Y-1 if you no longer believe it. Why: $80 is still at risk on a "
                       "position already -$60 (200 YES bought at 70c, now 40c: -$60, $80 left "
@@ -1334,12 +1327,12 @@ class AdviceTests(unittest.TestCase):
         # a line earning every day with light fills: x1.5 by the size study
         # (Jack 2026-10-25: "give suggestions on where to double down")
         self.assertEqual(txt[6], "KXTM, TRUMP mentions: x1.5. Why: its quoting was up on 7 of "
-                                 "the 7 days (+$280, net +$280) and it made +$630 over 14, "
-                                 "earning on 14 of them. Its fills and held positions came to "
-                                 "-$70 over the 7 days and -$70 over 14, against rewards +$350 "
-                                 "and +$700: light enough that x1.5 adds about +$7 a day "
-                                 "earning at either pace (the 10/11 size study: rewards +23%, "
-                                 "fill losses +44%).")
+                                 "the 7 days (+$280, net +$280) and on 14 of 14 earning days "
+                                 "over the 14 (+$630, net +$630). Its fills and held positions "
+                                 "came to -$70 over the 7 days and -$70 over 14, against "
+                                 "rewards +$350 and +$700: light enough that x1.5 adds about "
+                                 "+$7 a day earning at either pace (the 10/11 size study: "
+                                 "rewards +23%, fill losses +44%).")
         self.assertEqual(txt[7], "TRUMP mentions +$280 over 7 days (14 days +$630). Why: "
                                  "their rewards cover their fills.")
 
@@ -1559,7 +1552,7 @@ class AdviceLinesTests(unittest.TestCase):
                          ("WATCH", -7, -29, 48))
         self.assertEqual(mlb["why"], "ALCS MVP Winner (not quoted now) -$60: fills -$80 against "
                                      "rewards +$20; the markets still quoted +$31 (held "
-                                     "positions -$10, quoting +$41)")
+                                     "positions -$10, quoting +$41); still +$48 over 14 days")
         # Red Rocks: its group's line, named by its biggest event
         rr = rows["Sports & venues (KXVENUEPERFORM)"]
         self.assertEqual((rr["call"], rr["why"]),
@@ -1593,7 +1586,8 @@ class AdviceLinesTests(unittest.TestCase):
         self.assertIn("  Sports & awards: -$30 / -$189 / +$972", txt)
         self.assertIn("    - MLB (3 series): -$7 / -$29 / +$48. WATCH: ALCS MVP Winner (not "
                       "quoted now) -$60: fills -$80 against rewards +$20; the markets still "
-                      "quoted +$31 (held positions -$10, quoting +$41).", txt)
+                      "quoted +$31 (held positions -$10, quoting +$41); still +$48 over 14 "
+                      "days.", txt)
         self.assertIn("    - 1 smaller line: $0 / +$1 / +$3", txt)
         html = pf.advice_lines_html(adv)
         self.assertIn(">Every line</div>", html)
@@ -1614,6 +1608,104 @@ class AdviceLinesTests(unittest.TestCase):
         self.assertTrue(text.rstrip().endswith("+$12 / +$36 / +$36. NEW: from Fri 10/16: rewards "
                                                "+$36, fills $0: earning, the rewards cover the "
                                                "fills."), text[-300:])
+
+
+class AdviceMonthTests(unittest.TestCase):
+    """Jack 2026-10-25: "Make sure shrink/double down decisions are also
+    contemplating 30D of data not just 7"."""
+
+    def setUp(self):
+        from unittest import mock
+        p = mock.patch.object(pf, "load_event_titles", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def _with(d, t, ser, fam, before, week, yesterday=None):
+        """A live market `t` of `ser` / `fam` in _dash() `d`: `before` =
+        (rew, pnl) a day 10/05-10/11, `week` = (rew, pnl) a day 10/12-10/18,
+        `yesterday` = (rew, pnl) on 10/18 when it differs."""
+        d["markets"][t] = {"fam": fam, "ser": ser, "ev": t.rsplit("-", 1)[0], "sel": True}
+        for day, v in d["days"].items():
+            if day == "2026-10-19":
+                continue
+            rew, pnl = before if day < "2026-10-12" else week
+            if day == "2026-10-18" and yesterday:
+                rew, pnl = yesterday
+            v["m"][t] = _drow(rew=rew, pnl=pnl)
+
+    @staticmethod
+    def _lines(recs, start):
+        return [(v, t) for v, t in recs if t.startswith(start)]
+
+    def test_a_paying_month_takes_the_cut_a_step_down(self):
+        # +$30/day the week before, -$15/day this week, the rewards steady:
+        # PAUSE by the week, SHRINK with the month
+        d = _dash(bad_week=False)
+        self._with(d, "KXPAY-1-A", "KXPAY", "Econ & rates", (30.0, 0.0), (30.0, -45.0))
+        (v, t), = self._lines(pf.imm_advice(d, "2026-10-19")["recs"], "KXPAY (")
+        self.assertEqual(v, "SHRINK")
+        self.assertTrue(t.endswith("But its 14 days still pay (+$105 over 14, losing on 7 of "
+                                   "the 14 days it traded), its rewards at their pace: "
+                                   "shrink, not pause."), t)
+        # a smaller loss: SHRINK by the week, NO CHANGE with the month
+        d = _dash(bad_week=False)
+        self._with(d, "KXPAY-1-A", "KXPAY", "Econ & rates", (30.0, 0.0), (30.0, -38.0))
+        recs = pf.imm_advice(d, "2026-10-19")["recs"]
+        (v, t), = self._lines(recs, "KXPAY (")
+        self.assertEqual(v, "NO CHANGE")
+        self.assertTrue(t.endswith("a bad week in a paying month, no change yet."), t)
+        self.assertNotIn("SHRINK", [v for v, _ in recs])
+
+    def test_a_losing_month_agrees(self):
+        d = _dash(bad_week=False)
+        self._with(d, "KXLOSE-1-A", "KXLOSE", "Econ & rates", (5.0, -10.0), (5.0, -15.0))
+        (v, t), = self._lines(pf.imm_advice(d, "2026-10-19")["recs"], "KXLOSE (")
+        self.assertEqual(v, "SHRINK")
+        self.assertTrue(t.endswith("The 14 days agree: -$105 over 14, losing on 14 of the 14 "
+                                   "days it traded."), t)
+
+    def test_a_family_the_month_talks_down_has_its_series_judged_one_by_one(self):
+        # two series losing the week in a family whose month pays; KXM2 did
+        # not lose yesterday, the family's week stands in for that
+        d = _dash(bad_week=False)
+        self._with(d, "KXM1-1-A", "KXM1", "Other mentions", (40.0, 0.0), (40.0, -64.0))
+        self._with(d, "KXM2-1-A", "KXM2", "Other mentions", (40.0, 0.0), (40.0, -64.0),
+                   yesterday=(40.0, 0.0))
+        recs = pf.imm_advice(d, "2026-10-19")["recs"]
+        self.assertEqual(self._lines(recs, "the Other mentions family"), [(
+            "NO CHANGE", "the Other mentions family. Why: its quoting lost -$272 over the 7 "
+                         "days -- fills -$832 against rewards +$560 -- losing on 6 of them; "
+                         "yesterday +$16. But its 14 days still pay (+$288 over 14, losing on "
+                         "6 of the 14 days it traded), its rewards at their pace: a bad week "
+                         "in a paying month, no change yet. Its series are judged one by one "
+                         "instead.")])
+        (v1, t1), = self._lines(recs, "KXM1 (")
+        (v2, t2), = self._lines(recs, "KXM2 (")
+        self.assertEqual((v1, v2), ("SHRINK", "SHRINK"))
+        self.assertIn("losing on 7 of them and again yesterday (-$24).", t1)
+        self.assertIn("losing on 6 of them (yesterday +$40), as its family lost the week.", t2)
+        self.assertTrue(t2.endswith("shrink, not pause."), t2)
+        # the cuts come first, the family's note with the other NO CHANGE lines
+        verbs = [v for v, _ in recs]
+        self.assertLess(verbs.index("SHRINK"), verbs.index("NO CHANGE"))
+
+    def test_double_down_needs_most_of_the_month_up(self):
+        def dd(d):
+            return [t for v, t in pf.imm_advice(d, "2026-10-19")["recs"]
+                    if v == "DOUBLE DOWN" and t.startswith("KXTM,")]
+        # the week before: small losing days -> up on 7 of 14: no
+        d = _dash(bad_week=False)
+        for day, v in d["days"].items():
+            if day < "2026-10-12":
+                v["m"]["KXTM-1-A"] = _drow(rew=2.0, pnl=-3.0)
+        self.assertEqual(dd(d), [])
+        # the same days a dollar up: 14 of 14
+        for day, v in d["days"].items():
+            if day < "2026-10-12":
+                v["m"]["KXTM-1-A"] = _drow(rew=2.0, pnl=-1.0)
+        (t,), = [dd(d)]
+        self.assertIn("and on 14 of 14 earning days over the 14 (+$287, net +$287)", t)
 
 
 class DayByBotTests(unittest.TestCase):
@@ -1761,7 +1853,6 @@ class MarkBasisTests(unittest.TestCase):
         self.assertIn("=  valuation residual (Kalshi's value of the positions vs ours, "
                       "both at last trades", text)
         self.assertIn("settled + unrealized at last trade", text)
-        self.assertIn("this table at the last trade too", html)
         self.assertNotIn("at mid", text + html)
 
 
@@ -1792,16 +1883,14 @@ class RefundTests(unittest.TestCase):
         # settled: Kalshi takes the refund back out of the settlement cash
         self.assertEqual(pf.net_of_refund(10.0, -2.0, 0.0, 0.0, 6.0), (4.0, 4.0, 0.0))
 
-    def test_the_email_reconciles_open_now_to_kalshi(self):
+    def test_the_refund_footnote_is_cut(self):
+        # Jack 2026-10-25: "Cut out" the "Open now nets out ..." note; the
+        # open values themselves stay net of the refunds (above)
         p = DayByBotTests()._pf()
         p["refunds_total"] = 500.0
         _, text, html = pf.build_email(p, [], chart_ok=False)
-        self.assertIn("(Open now nets out the $500.00 of collateral Kalshi has refunded on "
-                      "mutually exclusive positions, as Kalshi's UI does: every open position "
-                      "comes to $20,000.00 (Kalshi's figure $20,500.00))", text)
-        self.assertIn("Open now nets out the $500.00", html)
-        _, text, _ = pf.build_email(DayByBotTests()._pf(), [], chart_ok=False)
-        self.assertNotIn("Open now nets out", text)
+        self.assertNotIn("Open now nets out", text + html)
+        self.assertNotIn("Reward credits = cash that came in", html)
 
 
 if __name__ == "__main__":

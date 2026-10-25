@@ -288,6 +288,7 @@ CREDITS_PATH = os.path.join(STATUS_DIR, "reward_credits.csv")
 # Credits arrive 1-2 days after the liquidity that earned them (measured lag:
 # median 1.3d, p90 1.7d, max 3.0d), so a ledger more than this many days
 # behind is genuinely missing money rather than merely waiting on settlement.
+# send_opportunistic_imm reads it; the section's own reminder was cut 2026-10-25.
 LEDGER_STALE_DAYS = int(os.environ.get("IMM_LEDGER_STALE_DAYS", "4"))
 # IMM_REWARDS_CREDITED / IMM_REWARDS_CREDITED_MTD are GONE (2026-08-04). They
 # were hand-set account-level statement totals; nothing reads them now that the
@@ -348,43 +349,28 @@ def status_summary(status: dict) -> dict:
 
 
 def health_line(status: dict, ss: dict, dash_note: str = "") -> str:
+    """The section's foot: "" while the bot is alive and not halted (Jack
+    2026-10-25: "Cut out" the all-clear line and its reward-ledger reminder;
+    send_opportunistic_imm still minds the ledger's age), else what is wrong.
+    `dash_note` (a late dashboard) rides along with a real problem; alone,
+    the P&L table above already says it."""
     now = datetime.now(timezone.utc)
-    problems = [dash_note] if dash_note else []
     try:
         age = (now - datetime.strptime(status.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ")
                .replace(tzinfo=timezone.utc)).total_seconds() / 60.0
     except ValueError:
         age = float("inf")
     alive = age <= STALE_AFTER_MINUTES
+    problems = []
     if not alive:
         problems.append(f"HEARTBEAT STALE ({status.get('updated_at', '?')})")
     if _f(status.get("halted_until")) > time.time():
         problems.append("DAILY-LOSS HALT active")
-    standoff = status.get("manual_standoff") or []
-    # A credit ledger that stops being refreshed reports a shrinking fraction
-    # of reality while still LOOKING authoritative — the one failure mode of
-    # moving lifetime reward onto the statement. Say so out loud.
-    rows, _cal = load_credit_ledger()
-    if rows:
-        latest = max(d for d, _e, _a in rows)
-        try:
-            lag = (now.astimezone(ET).date()
-                   - datetime.strptime(latest, "%Y-%m-%d").date()).days
-        except ValueError:
-            lag = 0
-        if lag > LEDGER_STALE_DAYS:
-            problems.append(
-                f"REWARD LEDGER STALE ({lag}d; last credit {latest}) — paste a "
-                f"fresh statement through imm_reward_recon.py --statement")
-    else:
-        problems.append("NO REWARD LEDGER — lifetime reward is the bot estimate")
+    if not problems:
+        return ""
     line = f"Bot: {'alive' if alive else 'DOWN'}, mode {status.get('mode', '?')}, " \
            f"{int(ss['errors'])} errors in last summary"
-    if standoff:
-        line += f" | {len(standoff)} market(s) yielded to manual/other bots"
-    if problems:
-        line += " | " + "; ".join(problems)
-    return line
+    return line + " | " + "; ".join(([dash_note] if dash_note else []) + problems)
 
 
 import imm_risk_controls as risk                                    # noqa: E402
@@ -1409,11 +1395,6 @@ DASH_DIR = os.environ.get("IMM_DASH_DIR", os.path.join(STATUS_DIR, "dashboard"))
 DASH_SUMMARY_PATH = os.path.join(DASH_DIR, "imm_dashboard_summary.json")
 DASH_SUMMARY_STALE_MIN = 45
 DAILY_TABLE_DAYS = 30           # "show Daily P&L (raw) going back 1 month" (Jack 2026-10-02)
-DAILY_NOTE = ("RAW = the dashboard's trading P&L: the bot's own book marked to "
-              "market (realized + the change in open marks + settlements) per ET "
-              "calendar day, n/a where the dashboard's position log does not "
-              "reach; REWARD = its modeled rewards, accrual per ET day before "
-              "Kalshi's $1-per-market floor")
 
 
 def load_dashboard_summary(path=None) -> dict:
@@ -1583,18 +1564,18 @@ def build_digest(now_utc: datetime):
         L.append("  (no days: " + (dw["note"] or "the dashboard summary has none") + ")")
     if tot_note:
         L.append("  (" + tot_note + ")")
-    L.append("  (" + DAILY_NOTE + ")")
-    L.append("  (REWARD is accrual-dated and does NOT line up with a credit "
-             "date — Kalshi pays at each program's period end, 1-2 days later)")
-    L.extend(_calibration_caveat_text())
-    L.append("")
-    L.append("")
-    L.extend(_cutoff_audit_text(audit))
+    # Out since 2026-10-25 (Jack: "Cut out"): the RAW / REWARD definitions,
+    # the REWARD-verification note and the cutoff audit's table. The audit
+    # still raises the banner above when a live override disagrees with
+    # Kalshi's date; _cutoff_audit_text / _html and _calibration_caveat_*
+    # stay for a look by hand.
     _perr = imm_pickoff.error_text(pick)
     if _perr:
+        L.append("")
         L.append(_perr)
-    L.append("")
-    L.append(health)
+    if health:
+        L.append("")
+        L.append(health)
     text = "\n".join(L)
     # The risk-controls block is returned on its own (Jack 2026-10-03: "move
     # the risk controls section right under the chart at the top"): the
@@ -1669,19 +1650,15 @@ def build_digest(now_utc: datetime):
     if not dw["daily"]:
         h.append('<div style="color:#c0392b;font-size:12px">No days: {}.</div>'.format(
             dw["note"] or "the dashboard summary has none"))
-    h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}{}. REWARD is '
-             'accrual-dated, so it does NOT line up with a credit date &mdash; '
-             'Kalshi pays at each program\'s period end, 1&ndash;2 days later.'
-             '</div>'.format(tot_note + ". " if tot_note else "", DAILY_NOTE))
-    h.append(_calibration_caveat_html())
-
-    h.append(_cutoff_audit_html(audit))
+    if tot_note:
+        h.append('<div style="color:#888;font-size:12px;margin-top:4px">{}.</div>'
+                 .format(tot_note))
     if _perr:
         h.append('<div style="color:#888;font-size:11px;margin-top:4px">{}'
                  '</div>'.format(imm_pickoff._esc(_perr)))
-
-    h.append('<div style="color:#777;font-size:12px;margin-top:12px;'
-             'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
+    if health:
+        h.append('<div style="color:#c0392b;font-size:12px;font-weight:600;margin-top:12px;'
+                 'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
     h.append("</div>")
     risk_html = risk.html(risk_rows, risk_ev, ET, capacity_note(), TD, TDL)
     return text, "".join(h), risk_text, risk_html

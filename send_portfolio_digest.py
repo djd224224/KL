@@ -1464,6 +1464,12 @@ def _mover_tag(r) -> str:
 #     lost ADVICE_EVENT_Y or more yesterday, by its own 7 days: losing over
 #     them -> pause or shrink it; up over them -> one bad day, no change.
 #     Events are named by Kalshi's title (the dashboard's title caches).
+#   Each of those cuts then hears the 30 days (Jack 2026-10-25: "Make sure
+#     shrink/double down decisions are also contemplating 30D of data not
+#     just 7"): a month whose quoting still pays, its rewards still at the
+#     month's pace, takes the cut a step down (PAUSE to SHRINK, SHRINK to
+#     NO CHANGE: a bad week in a paying month); a month paid by rewards
+#     since faded is no defence; a losing month agrees, and the line says so.
 #   TRIM an open loser that still has a lot to lose (ADVICE_TRIM_LEFT), in
 #     a family whose held positions cost the week -- to cut risk, Jack's call.
 #   HOLD the rest of those families' open losers, in one line: their
@@ -1472,8 +1478,9 @@ def _mover_tag(r) -> str:
 #   NO CHANGE on a family's one bad day inside a good week, and on a losing
 #     week whose losses were one-offs (no series losing on most days).
 #   DOUBLE DOWN (x1.5) on a LINE (below) that earns day after day with fills
-#     light next to its rewards: up on ADVICE_DD_UP_DAYS of the 7 days, up
-#     over the 30, and adding ADVICE_DD_GAIN a day or more by the 10/11 size
+#     light next to its rewards: up on ADVICE_DD_UP_DAYS of the 7 days and on
+#     ADVICE_DD_UP_SHARE_30 of the days it earned over the 30, up over both,
+#     and adding ADVICE_DD_GAIN a day or more at both paces by the 10/11 size
 #     study's response (rewards ~ size^0.51, fill losses ~ size^0.90; held
 #     positions count with the fills, and only as losses).
 #   KEEP the families whose rewards beat their fills.
@@ -1553,8 +1560,13 @@ ADVICE_DD_GAIN = 3.0           # ... when that adds this much a day or more,
 ADVICE_DD_30D = 150.0          #   its 30-day net is at/above,
 ADVICE_DD_7D = 25.0            #   its 7-day quoting at/above, up on
 ADVICE_DD_UP_DAYS = 5          #   this many of the 7 days,
-ADVICE_DD_ACTIVE = 14          #   and it earned on this many of the 30
+ADVICE_DD_ACTIVE = 14          #   it earned on this many of the 30,
+ADVICE_DD_UP_SHARE_30 = 0.6    #   its quoting up on this share of those, and up over them
 ADVICE_MAX_DD = 3
+# the 30 days' say on a cut the 7 days call for: a month whose quoting pays
+# takes the cut a step down while the week's rewards run at least this share
+# of the month's pace (below it, the month was paid by a program since gone)
+ADVICE_MONTH_REW_SHARE = 0.5
 ADVICE_NEW_EVENT = 25.0        # a new event of a running series: |net| or rewards at/above,
 ADVICE_ROUTINE = 4             #   its series listing fewer events than this in the 30 days
 ADVICE_MAX_NEW = 8
@@ -1912,6 +1924,37 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
     paused = set()
     flag_verb = {}                    # series -> PAUSE / SHRINK named below (EVERY LINE)
     flag_ev = {}                      # event -> PAUSE / SHRINK named below
+    month_notes = []                  # cuts the 30 days talked down to NO CHANGE
+    month_fams = set()                # ... their families (no other NO CHANGE line)
+    fam_week = set()                  # losing series of a family the month talked down
+
+    def month(verb, dd):
+        """The 30 days' say on a cut the 7 days call for (Jack 2026-10-25:
+        "Make sure shrink/double down decisions are also contemplating 30D
+        of data not just 7"): (verb, why). A month whose quoting still pays,
+        on rewards still coming at its pace, takes the cut a step down --
+        PAUSE to SHRINK, SHRINK to NO CHANGE; a month that paid on rewards
+        since faded is no defence (the program that paid it is gone); a
+        losing month agrees. Nothing to add for something no older than
+        the week."""
+        l, w = span(dd, long_), span(dd, win)
+        act = [d for d in long_ if d in dd and abs(dd[d]["rew"]) + abs(dd[d]["own"]) > 0.5]
+        if not act or act[0] >= win[0]:
+            return verb, ""
+        q30 = l["rew"] + l["own"]
+        lose = sum(1 for d in act if dd[d]["rew"] + dd[d]["own"] < -0.5)
+        days_txt = (f"{_usd0(q30)} over {nl}, losing on {lose} of the {len(act)} days "
+                    f"it traded")
+        if q30 <= 0.5:
+            return verb, f"The {nl} days agree: {days_txt}."
+        pace7, pace30 = w["rew"] / n, l["rew"] / nl
+        if pace7 < ADVICE_MONTH_REW_SHARE * pace30:
+            return verb, (f"Its {nl} days paid ({days_txt}), but on rewards since faded to "
+                          f"{_usd0(pace7)}/day from {_usd0(pace30)}/day: no defence.")
+        step = {"PAUSE": "SHRINK", "SHRINK": "NO CHANGE"}[verb]
+        return step, (f"But its {nl} days still pay ({days_txt}), its rewards at their "
+                      f"pace: " + ("shrink, not pause." if step == "SHRINK" else
+                                   "a bad week in a paying month, no change yet."))
     # 3a. families whose quoting loses on most days: shrink the family
     fcands = []
     for fam, dd in fam_day.items():
@@ -1927,23 +1970,30 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         # (one alone is the series rule's, which names it more sharply; a
         # decided one -- the ALCS MVP -- is no problem to shrink)
         if q7 <= ADVICE_FAMILY_SHRINK_7D and losing >= ADVICE_LOSING_DAYS and len(worst) >= 2:
-            ql = span(dd, long_)
-            fcands.append((q7, fam, w, yy["rew"] + yy["own"], losing, ql["rew"] + ql["own"],
-                           worst[:2]))
-    for q7, fam, w, qy, losing, ql, worst in sorted(fcands, key=lambda c: c[0])[:ADVICE_MAX_FAMILIES]:
+            fcands.append((q7, fam, w, yy["rew"] + yy["own"], losing, worst[:2]))
+    for q7, fam, w, qy, losing, worst in sorted(fcands, key=lambda c: c[0])[:ADVICE_MAX_FAMILIES]:
+        verb, why30 = month("SHRINK", fam_day[fam])
         cause = _fill_cause(w)
+        txt = (f"the {fam} family. Why: its quoting lost {_usd0(q7)} over the {n} days "
+               f"-- fills {_usd0(w['own'])} against rewards {_usd0(w['rew'])} -- losing on "
+               f"{losing} of them; yesterday {_usd0(qy)}" + (f"; {cause}" if cause else "")
+               + "." + (f" {why30}" if why30 else ""))
+        if verb == "NO CHANGE":
+            # the month pays: no family-wide cut; its losing series are
+            # judged one by one, the family's week standing in for "again
+            # yesterday" (a mention series fills in bursts, around its events)
+            month_notes.append((verb, txt + " Its series are judged one by one instead."))
+            month_fams.add(fam)
+            fam_week.update(s for _, s in worst)
+            continue
         bad_y = sorted((a["rew"] + a["own"], e) for e, a in ev_day[fam].get(y, {}).items()
                        if e in live_ev and a["rew"] + a["own"] < -0.5)[:2]
-        txt = (f"the {fam} family. Why: its quoting lost {_usd0(q7)} over the {n} days "
-               f"({_usd0(ql)} over {nl}) -- fills {_usd0(w['own'])} against rewards "
-               f"{_usd0(w['rew'])} -- losing on {losing} of them; yesterday {_usd0(qy)}"
-               + (f"; {cause}" if cause else "") + ".")
         if worst:
             txt += " Its worst series: " + ", ".join(f"{s} {_usd0(q)}" for q, s in worst) + "."
         if bad_y:
             txt += (" Still quoted and down yesterday: "
                     + ", ".join(f"{evlabel(e)} {_usd0(q)}" for q, e in bad_y) + ".")
-        recs.append(("SHRINK", txt))
+        recs.append((verb, txt))
         paused.add(fam)
         flag_verb.update((s, "SHRINK") for _, s in worst)
     # 3b. series whose quoting loses on most days and again yesterday
@@ -1955,17 +2005,23 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         w, yy = span(dd, win), span(dd, [y])
         q7, qy = w["rew"] + w["own"], yy["rew"] + yy["own"]
         losing = sum(1 for d in win if d in dd and dd[d]["rew"] + dd[d]["own"] < -0.5)
-        if q7 <= ADVICE_SHRINK_7D and qy < -0.5 and losing >= ADVICE_LOSING_DAYS:
-            ql = span(dd, long_)
-            cands.append((q7, ser, w, qy, losing, ql["rew"] + ql["own"]))
-    for q7, ser, w, qy, losing, ql in sorted(cands, key=lambda c: c[0])[:ADVICE_MAX_PAUSE]:
-        verb = "PAUSE" if q7 <= ADVICE_PAUSE_7D else "SHRINK"
+        if (q7 <= ADVICE_SHRINK_7D and (qy < -0.5 or ser in fam_week)
+                and losing >= ADVICE_LOSING_DAYS):
+            cands.append((q7, ser, w, qy, losing))
+    for q7, ser, w, qy, losing in sorted(cands, key=lambda c: c[0])[:ADVICE_MAX_PAUSE]:
+        verb, why30 = month("PAUSE" if q7 <= ADVICE_PAUSE_7D else "SHRINK", ser_day[ser])
         cause = _fill_cause(w)
-        recs.append((verb, f"{ser} ({ser_fam.get(ser, 'Other')}). Why: its quoting lost "
-                           f"{_usd0(q7)} over the {n} days ({_usd0(ql)} over {nl}) -- fills "
-                           f"{_usd0(w['own'])} against rewards {_usd0(w['rew'])} -- losing "
-                           f"on {losing} of them and again yesterday ({_usd0(qy)})"
-                           + (f"; {cause}" if cause else "") + "."))
+        txt = (f"{ser} ({ser_fam.get(ser, 'Other')}). Why: its quoting lost {_usd0(q7)} over "
+               f"the {n} days -- fills {_usd0(w['own'])} against rewards {_usd0(w['rew'])} "
+               f"-- losing on {losing} of them"
+               + (f" and again yesterday ({_usd0(qy)})" if qy < -0.5 else
+                  f" (yesterday {_usd0(qy)}), as its family lost the week")
+               + (f"; {cause}" if cause else "") + "." + (f" {why30}" if why30 else ""))
+        if verb == "NO CHANGE":
+            month_notes.append((verb, txt))
+            month_fams.add(ser_fam.get(ser))
+            continue
+        recs.append((verb, txt))
         paused.add(ser_fam.get(ser))
         flagged_ser.add(ser)
         flag_verb[ser] = verb
@@ -2003,8 +2059,11 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         if verb == "NO CHANGE":
             txt += f" -- but it is {_usd0(q7)} over its {n} days: one bad day."
         else:
-            txt += f" -- and {_usd0(q7)} over its {n} days, still quoted."
-            flag_ev[e] = verb
+            verb, why30 = month(verb, ev_all[e])
+            txt += (f" -- and {_usd0(q7)} over its {n} days, still quoted."
+                    + (f" {why30}" if why30 else ""))
+            if verb != "NO CHANGE":
+                flag_ev[e] = verb
         recs.append((verb, txt))
     # held positions that cost the week, in families whose quoting pays
     held_fams = [f for f in sorted(fams, key=lambda f: fams[f]["w"]["cr"] + fams[f]["w"]["cs"])
@@ -2045,16 +2104,18 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         else:
             txt += " They have settled or recovered: nothing open to sell."
         recs.append(("HOLD", txt))
+    recs += month_notes
     for fam in sorted(fams, key=lambda f: _net(fams[f]["y"])):
         v = fams[fam]
         if (_net(v["y"]) <= ADVICE_BAD_DAY and _net(v["w"]) > 0
-                and fam not in held_fams and fam not in paused):
+                and fam not in held_fams and fam not in paused and fam not in month_fams):
             recs.append(("NO CHANGE", f"{fam}. Why: one bad day ({_usd0(_net(v['y']))}: "
                                       f"{why_y(fam)}) inside a {_usd0(_net(v['w']))} week "
                                       f"({nl} days {_usd0(_net(v['l']))})."))
     for fam in sorted(fams, key=lambda f: _net(fams[f]["w"])):
         v = fams[fam]
-        if _net(v["w"]) > ADVICE_REVIEW_NET or fam in held_fams or fam in paused:
+        if (_net(v["w"]) > ADVICE_REVIEW_NET or fam in held_fams or fam in paused
+                or fam in month_fams):
             continue
         # a losing week with no series losing day after day: say where it went
         worst = sorted((_net(span(dd, win)), ser) for ser, dd in ser_day.items()
@@ -2123,8 +2184,9 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
                 or line_evs[key] & set(flag_ev)):
             continue
         w, l = span(ld, win), span(ld, long_)
-        q7 = w["rew"] + w["own"]
+        q7, q30 = w["rew"] + w["own"], l["rew"] + l["own"]
         up = sum(1 for d in win if d in ld and ld[d]["rew"] + ld[d]["own"] > 0.5)
+        up30 = sum(1 for d in long_ if d in ld and ld[d]["rew"] + ld[d]["own"] > 0.5)
         active = sum(1 for d in long_ if d in ld and ld[d]["rew"] > 0.5)
         active7 = sum(1 for d in win if d in ld and ld[d]["rew"] > 0.5)
         tr7, tr30 = w["own"] + w["cr"] + w["cs"], l["own"] + l["cr"] + l["cs"]
@@ -2135,16 +2197,20 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         # is no reason to size up.
         gain = min((r_up * w["rew"] + f_up * min(0.0, tr7)) / max(1, active7),
                    (r_up * l["rew"] + f_up * min(0.0, tr30)) / max(1, active))
+        # the 30 days as well as the 7 (Jack 2026-10-25): up on most of the
+        # days it earned, its quoting up over them, and the gain at their pace
         if (active >= ADVICE_DD_ACTIVE and _net(l) >= ADVICE_DD_30D and _net(w) >= 0
-                and q7 >= ADVICE_DD_7D and up >= ADVICE_DD_UP_DAYS and gain >= ADVICE_DD_GAIN):
-            dd_cands.append((gain, key, w, l, q7, up, active, tr7, tr30))
+                and q7 >= ADVICE_DD_7D and up >= ADVICE_DD_UP_DAYS and gain >= ADVICE_DD_GAIN
+                and q30 > 0 and up30 >= ADVICE_DD_UP_SHARE_30 * active):
+            dd_cands.append((gain, key, w, l, q7, q30, up, up30, active, tr7, tr30))
     dd_cands.sort(key=lambda c: (-c[0], c[1]))
     dd_recs = []
-    for gain, key, w, l, q7, up, active, tr7, tr30 in dd_cands[:ADVICE_MAX_DD]:
+    for gain, key, w, l, q7, q30, up, up30, active, tr7, tr30 in dd_cands[:ADVICE_MAX_DD]:
         dd_recs.append((key, ("DOUBLE DOWN", (
             f"{lname(key)}, {key[0]}: x{ADVICE_DD_MULT:g}. Why: its quoting was up on {up} of "
-            f"the {n} days ({_usd0(q7)}, net {_usd0(_net(w))}) and it made {_usd0(_net(l))} "
-            f"over {nl}, earning on {active} of them. Its fills and held positions came to "
+            f"the {n} days ({_usd0(q7)}, net {_usd0(_net(w))}) and on {up30} of {active} "
+            f"earning days over the {nl} ({_usd0(q30)}, net {_usd0(_net(l))}). Its fills and "
+            f"held positions came to "
             f"{_usd0(tr7)} over the {n} days and {_usd0(tr30)} over {nl}, against rewards "
             f"{_usd0(w['rew'])} and {_usd0(l['rew'])}: light enough that x{ADVICE_DD_MULT:g} "
             f"adds about {_usd0(gain)} a day earning at either pace (the 10/11 size study: "
@@ -2273,14 +2339,14 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
     def line_call1(key, w, l):                 # a quoted line by its P&L
         if _net(w) < -0.5:
             u = pick(key, win, -1)
-            if u is None:
-                return "WATCH", _parts_phrase(w)
-            txt = phrase(u, key)
-            if not u[1]:                     # the drag stopped: what the running part did
+            txt = phrase(u, key) if u else _parts_phrase(w)
+            if u and not u[1]:               # the drag stopped: what the running part did
                 la = _zero()
                 for e in line_evs[key] & live_ev_now:
                     la = _add(la, span(ev_all.get(e, {}), win))
                 txt += f"; the markets still quoted {_usd0(_net(la))} ({_parts_phrase(la)})"
+            if _net(l) > 0.5:                # a down week inside an up month
+                txt += f"; still {_usd0(_net(l))} over {nl} days"
             return "WATCH", txt
         if _net(l) < -0.5:
             u = pick(key, long_, -1)
@@ -2631,9 +2697,6 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     px_why = ("Kalshi's value of the positions vs ours, both at last trades: "
               "a market that never traded sits at its mid" if last_basis else
               "a gap between two valuations, no bot's")
-    ex_what = [w for w, v in (("perpetuals", perps_eq), ("subaccounts", subs_eq))
-               if v is not None]
-    ex_perps = " ex-" + " & ".join(ex_what) if ex_what else ""
     trading = mv_tot["day"]
     parts = None                        # [(label, $)] summing to d_ek exactly
     transfers = None if first else pf.get("net_transfers")
@@ -2692,14 +2755,6 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
         by_bot = day_by_bot(pf, imm_events, parts[1], d_perps, subs_pnl)
     pricing = dict(parts or []).get(px_lbl)
     late = rewards is not None and abs(rewards) < 1.0
-    # the movers' open values are net of Kalshi's collateral refunds, as its
-    # UI's positions value (net_of_refund)
-    refunds_total = pf.get("refunds_total")
-    refund_note = ("" if refunds_total is None else
-                   f"Open now nets out the ${refunds_total:,.2f} of collateral Kalshi has "
-                   f"refunded on mutually exclusive positions, as Kalshi's UI does: every "
-                   f"open position comes to ${_f(pf.get('positions_value')) - refunds_total:,.2f} "
-                   f"(Kalshi's figure ${_f(pf.get('kalshi_positions_value')):,.2f})")
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
     # +$18.2k (day +$1.6k, trading -$0.7K)", then "yes add rewards to the
@@ -2791,16 +2846,8 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                  f"  ({mv_tot['n_events']} events)")
     if not movers:
         lines.append("(nothing moved since the prior morning)")
-    if parts is not None:
-        lines.append(f"(account value{ex_perps} moved {d_ek:+,.2f} = this table "
-                     f"{trading:+,.2f}"
-                     + "".join(f"  +  {k} {v:+,.2f}" for k, v in parts[1:]) + ")")
-        if collat_d:
-            lines.append(f"(reward credits leave out {collat_d:+,.2f} of collateral Kalshi "
-                         f"{'released' if collat_d > 0 else 'took back'} on mutually exclusive "
-                         f"positions: its valuation moved the other way, so it is not profit)")
-    if refund_note:
-        lines.append(f"({refund_note})")
+    # the account-value bridge and the refund note under the table are gone
+    # (Jack 2026-10-25: "Cut out"): the "vs yesterday" line carries the split
     if imm is not None:
         lines.append("")
         lines.append(imm.get("text") or
@@ -2953,32 +3000,6 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                  f'<td style="{TDL}font-weight:400;color:{C_INK2}">'
                  f'{mv_tot["n_events"]} events</td></tr>')
         h.append('</table>')
-        if parts is not None:
-            h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:4px 0 0">'
-                     f'Account value{ex_perps.replace("&", "&amp;")} moved '
-                     f'{_pnl_span(d_ek)} = this table '
-                     f'{_pnl_span(trading)}'
-                     + "".join(f' &nbsp;+&nbsp; {k.replace("&", "&amp;")} {_pnl_span(v)}'
-                               for k, v in parts[1:])
-                     + '. Reward credits = cash that came in with no trade or '
-                       'settlement behind it'
-                     + ("" if not collat_d else
-                        f', less {_pnl_span(collat_d)} of collateral Kalshi '
-                        f'{"released" if collat_d > 0 else "took back"} on mutually '
-                        f'exclusive positions (its valuation moved the other way, so '
-                        f'it is not profit)')
-                     + ("" if collat_d is not None else
-                        ' (today they still hold collateral Kalshi released or took '
-                        f'back on mutually exclusive positions, and the '
-                        f'{_esc(px_lbl)} the opposite: the prior morning did not record it)')
-                     + '; Kalshi values open positions at their last trade, less the '
-                       'collateral it has handed back, '
-                     + ('this table at the last trade too (a market that never traded '
-                        'at its mid).</div>' if last_basis else
-                        'this table at the mid.</div>'))
-        if refund_note:
-            h.append(f'<div style="color:{C_MUTED};font-size:12px;margin:2px 0 0">'
-                     f'{_esc(refund_note)}.</div>')
     else:
         h.append(f'<div style="color:{C_INK2}">Nothing moved since the prior '
                  f'morning.</div>')

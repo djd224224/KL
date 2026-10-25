@@ -270,6 +270,31 @@ class DashboardWindowsTests(_DigestTest):
         self.assertIn("TOTAL = the 26 of 30 days with a RAW", text)
         # the health line hears about a late dashboard
         self.assertEqual(stubs["health_line"].call_args[0][2], "")
+        # Jack 2026-10-25: "Cut out" the RAW / REWARD definitions, the
+        # REWARD-verification note and the cutoff audit's table
+        for gone in ("RAW = the dashboard's trading P&L", "accrual-dated"):
+            self.assertNotIn(gone, text + html)
+        for stub in ("_cutoff_audit_text", "_cutoff_audit_html",
+                     "_calibration_caveat_text", "_calibration_caveat_html"):
+            stubs[stub].assert_not_called()
+
+    def test_the_foot_speaks_only_when_the_bot_is_in_trouble(self):
+        # Jack 2026-10-25: "Cut out" the all-clear line and its reward-ledger
+        # reminder; a down or halted bot still says so
+        import time
+        sd = self.sd
+        fresh = {"updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "mode": "LIVE"}
+        ss = {"errors": 0}
+        self.assertEqual(sd.health_line(fresh, ss), "")
+        self.assertEqual(sd.health_line(fresh, ss, "dashboard built 60 min ago"), "")
+        stale = dict(fresh, updated_at="2026-10-01T00:00:00Z")
+        line = sd.health_line(stale, ss, "dashboard built 60 min ago")
+        self.assertEqual(line, "Bot: DOWN, mode LIVE, 0 errors in last summary | dashboard "
+                               "built 60 min ago; HEARTBEAT STALE (2026-10-01T00:00:00Z)")
+        halted = dict(fresh, halted_until=time.time() + 600)
+        self.assertEqual(sd.health_line(halted, ss), "Bot: alive, mode LIVE, 0 errors in "
+                                                     "last summary | DAILY-LOSS HALT active")
 
 
 class SectionTests(_DigestTest):
