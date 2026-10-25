@@ -26776,6 +26776,23 @@ class TestSweepBreaker(unittest.TestCase):
         self.assertEqual(self.cancelled, [])          # dry: nothing pulled
         self.assertFalse(self.bot.sweep_held(self.E, self.now))
 
+    def test_a_held_event_is_exempt_from_the_coverage_alert(self):
+        # Jack 2026-10-25: "Stop alert" -- KXGOOGVREQ-28OCT26-T11P9 paged
+        # inside the 120 s hold a sweep of its sibling put on the event
+        self.assertFalse(self.bot.coverage_exempt(self.B, self.now))
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
+            self.bot._sweep_hold[imm.sweep_hold_key(self.E)] = self.now + 120
+            self.assertTrue(self.bot.coverage_exempt(self.B, self.now))      # a sibling
+            self.assertFalse(self.bot.coverage_exempt(self.C, self.now))     # another event
+            self.assertFalse(self.bot.coverage_exempt(self.B, self.now + 121))   # hold over
+        with mock.patch.object(imm, "SWEEP_GROUP", "on"), \
+                mock.patch.object(imm, "risk_group_of", lambda t: "G"):
+            self.bot._grp_hold[("G", "ask")] = self.now + 60
+            self.assertTrue(self.bot.coverage_exempt(self.C, self.now))      # either side
+            self.assertFalse(self.bot.coverage_exempt(self.C, self.now + 61))
+        with mock.patch.object(self.bot, "toxic_market_halted", lambda t, ts: True):
+            self.assertTrue(self.bot.coverage_exempt(self.C, self.now))
+
     def test_a_partial_fill_books_down_and_the_rest_trips(self):
         self._fill("o1", 8)
         self.assertEqual((self._trips(), self.bot._resting_view[self.A][0]["rem"]),

@@ -22119,6 +22119,17 @@ class IncentiveMarketMaker:
         g = risk_group_of(ticker)
         return g is not None and self._grp_hold.get((g, side), 0.0) > now_ts
 
+    def coverage_exempt(self, ticker: str, now_ts: float) -> bool:
+        """A market the coverage alert neither counts nor pages: one the
+        toxic-flow halt, the sweep breaker (its event) or the group breaker
+        (either side) stands down on purpose (Jack 2026-10-25: "Stop alert",
+        after KXGOOGVREQ-28OCT26-T11P9 paged inside the 120 s hold a sweep of
+        its sibling T11P4 put on the event)."""
+        return (self.toxic_market_halted(ticker, now_ts)
+                or self.sweep_held(self._event_of(ticker), now_ts)
+                or self.group_held(ticker, "bid", now_ts)
+                or self.group_held(ticker, "ask", now_ts))
+
     def _group_note_fill(self, t: str, oid: str, side: str, px: float,
                          n: float, fts: float, now_ts: float,
                          trade_id: Any) -> None:
@@ -29272,10 +29283,11 @@ class IncentiveMarketMaker:
             # N consecutive FULL cycles (pads should make this ~impossible).
             # (A side or event stood down by the toxic-flow halt is one-sided
             # or dark ON PURPOSE -- if our pad was what lifted a side to
-            # target, it stops qualifying -- so it neither counts nor pages.)
+            # target, it stops qualifying -- so it neither counts nor pages;
+            # nor does one the sweep or group breaker holds: coverage_exempt.)
             if not fast_only and t in self.state.selected and mq \
                     and pad_band_ok(meta.series, ext_bid, ext_ask) \
-                    and not self.toxic_market_halted(t, now_ts):
+                    and not self.coverage_exempt(t, now_ts):
                 if sides < 2:
                     streak = self.state.coverage_zero_streak.get(t, 0) + 1
                     self.state.coverage_zero_streak[t] = streak
