@@ -1125,7 +1125,84 @@ class AdviceTests(unittest.TestCase):
     recommendations on what I should do based on prior day trading
     performance"; 2026-10-22: "Center it around last day's results (though
     still contextualize with 7D results). Make it more insightful with clear
-    recommendations and why"."""
+    recommendations and why"; 2026-10-25: "Make sure daily email suggestions
+    comb through both specific events and families"."""
+
+    def setUp(self):
+        from unittest import mock
+        self.real_titles = pf.load_event_titles     # the real cache reader
+        p = mock.patch.object(pf, "load_event_titles", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_families_and_specific_events(self):
+        d = _dash()
+        # a family losing on two series at once -> one family line (its
+        # series' own lines folded in); a live event that lost yesterday
+        # -> its own line, by its title
+        for t, ser in (("KXM1-1-A", "KXM1"), ("KXM2-1-A", "KXM2")):
+            d["markets"][t] = {"fam": "Other mentions", "ser": ser, "ev": t[:-2], "sel": True}
+        d["markets"]["KXTM-2-A"] = {"fam": "TRUMP mentions", "ser": "KXTM", "ev": "KXTM-2",
+                                    "sel": True}
+        for k, v in d["days"].items():
+            if k >= "2026-10-12":
+                v["m"]["KXM1-1-A"] = _drow(pnl=-12.0, m5=-10.0)
+                v["m"]["KXM2-1-A"] = _drow(pnl=-12.0, m5=-10.0)
+        d["days"]["2026-10-18"]["m"]["KXTM-2-A"] = _drow(rew=5.0, pnl=-45.0, m5=-30.0)
+        adv = pf.imm_advice(d, "2026-10-19",
+                            titles={"KXTM-2": "What will Trump say on Sunday?"})
+        recs = adv["recs"]
+        fam = [t for v, t in recs if t.startswith("the Other mentions family")]
+        self.assertEqual(len(fam), 1)
+        self.assertIn("its quoting lost -$168 over the 7 days", fam[0])
+        self.assertIn("losing on 7 of them", fam[0])
+        self.assertIn("Its worst series: KXM1 -$84, KXM2 -$84.", fam[0])
+        self.assertIn("Still quoted and down yesterday: KXM1-1 -$12, KXM2-1 -$12.", fam[0])
+        self.assertFalse([t for v, t in recs if t.startswith(("KXM1 (", "KXM2 ("))])
+        ev = [(v, t) for v, t in recs if t.startswith("the event ")]
+        self.assertEqual(ev, [("SHRINK", "the event What will Trump say on Sunday? (KXTM-2), "
+                                         "TRUMP mentions. Why: its quoting lost -$40 yesterday "
+                                         "-- fills -$45 against rewards +$5; most of it within 5 "
+                                         "minutes of the fills (picked off: the takers knew "
+                                         "first) -- and -$40 over its 7 days, still quoted.")])
+        # the series rule still has its own (KXBIG, KXGAS); the families
+        # come first, then the series, then the events
+        verbs = [v for v, _ in recs]
+        self.assertEqual(verbs[:4], ["SHRINK", "PAUSE", "SHRINK", "SHRINK"])
+        # one losing series alone is the series rule's, not a family line
+        self.assertFalse([t for v, t in recs if t.startswith("the Sports & awards family")])
+        # an event up over its week: one bad day, unless its family's own
+        # one-bad-day line already says so
+        d["days"]["2026-10-17"]["m"]["KXTM-2-A"] = _drow(rew=100.0)
+        recs = pf.imm_advice(d, "2026-10-19", titles={})["recs"]
+        self.assertIn(("NO CHANGE", "the event KXTM-2, TRUMP mentions. Why: its quoting lost "
+                                    "-$40 yesterday -- fills -$45 against rewards +$5; most of it "
+                                    "within 5 minutes of the fills (picked off: the takers knew "
+                                    "first) -- but it is +$60 over its 7 days: one bad day."),
+                      recs)
+        self.assertFalse([t for v, t in recs if t.startswith("the event KXAI-1")])
+
+    def test_event_titles(self):
+        import json
+        import tempfile
+        self.assertEqual(pf._ascii("The Mongoose · Rotten Tomatoes score"),
+                         "The Mongoose - Rotten Tomatoes score")
+        self.assertEqual(pf._ascii("Flávio Bolsonaro – runoff"), "Flavio Bolsonaro - runoff")
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "cache"))
+        with open(os.path.join(tmp, "cache", "event_titles.json"), "w", encoding="utf-8") as f:
+            json.dump({"KXA-1": "A · one", "KXB-1": ""}, f)
+        with open(os.path.join(tmp, "cache", "pocket_event_titles.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"KXA-1": "ignored", "KXB-1": "Bee"}, f)
+        self.assertEqual(self.real_titles(os.path.join(tmp, "imm_dashboard.html")),
+                         {"KXA-1": "A - one", "KXB-1": "Bee"})
+        self.assertEqual(self.real_titles(os.path.join(tmp, "nowhere", "x.html")), {})
+        # the drivers and the position lines carry the titles
+        adv = pf.imm_advice(_dash(), "2026-10-19", titles={"KXAI-1": "AI index", "KXCA-X": "Ad spend"})
+        self.assertIn("(AI index -$160)", adv["drivers"][0])
+        self.assertIn("Biggest: KXCA-X-1 -- Ad spend (50 YES sold at 40c",
+                      [t for v, t in adv["recs"] if v == "HOLD"][0])
 
     def test_yesterday_leads_then_what_moved_it(self):
         adv = pf.imm_advice(_dash(), "2026-10-19")
