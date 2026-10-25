@@ -31667,6 +31667,14 @@ class TestGenMovX3(unittest.TestCase):
             imm.ensure_family_override(self.S)
         self.assertIs(imm.SERIES_OVERRIDES[self.S], ov)
 
+    def test_presrun_stays_x6_through_the_size_test(self):
+        # Jack 2026-10-25 ("Take it out"): its hash put it in the test half
+        ts = imm.ET.localize(datetime(2026, 10, 28, 12)).timestamp()
+        with mock.patch.object(imm.time, "time", return_value=ts), \
+                mock.patch.dict(imm._size_test_stop, {"checked": 0.0, "stopped": False}):
+            self.assertIsNone(imm.size_test_arm("KXPRESRUN"))
+            self.assertEqual(imm.applied_mention_mult("KXPRESRUN"), 6.0)
+
 
 class TestLowTempFamily(unittest.TestCase):
     """Jack 2026-10-23: "Build low temp fair value as part of IMM, only quote
@@ -31786,11 +31794,16 @@ class TestLowTempFamily(unittest.TestCase):
 
     def test_breaker_and_one_family_loss_budget(self):
         self.assertTrue(imm.move_breaker_on("KXLOWTEWR"))
-        self.assertEqual(imm.pilot_budget_key(self.T), imm.LOWT_HALT_KEY)
-        self.assertEqual(imm.pilot_budget_key("KXLOWTSEA-26OCT24-T41"), imm.LOWT_HALT_KEY)
-        self.assertEqual(imm.LOWT_DAILY_LOSS_LIMIT, 100.0)      # Jack 2026-10-23: "$100"
-        self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), 100.0)
-        self.assertIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
+        # off since 2026-10-25 (Jack: "remove the $100 cap on temps")
+        self.assertEqual(imm.LOWT_DAILY_LOSS_LIMIT, 0.0)
+        self.assertIsNone(imm.pilot_budget_key(self.T))
+        self.assertNotIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
+        with mock.patch.object(imm, "LOWT_DAILY_LOSS_LIMIT", 100.0):   # $100 from 10/23
+            self.assertEqual(imm.pilot_budget_key(self.T), imm.LOWT_HALT_KEY)
+            self.assertEqual(imm.pilot_budget_key("KXLOWTSEA-26OCT24-T41"),
+                             imm.LOWT_HALT_KEY)
+            self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), 100.0)
+            self.assertIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
         for k in ("LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_DAILY_LOSS_LIMIT"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
@@ -31890,9 +31903,14 @@ class TestHighTempFamily(unittest.TestCase):
             if saved is not None:
                 imm.SERIES_OVERRIDES["KXHIGHTATL"] = saved
         self.assertTrue(imm.move_breaker_on("KXHIGHTATL"))
-        self.assertEqual(imm.pilot_budget_key(self.T), imm.HIGHT_HALT_KEY)
-        self.assertEqual(imm.pilot_halt_limit(imm.HIGHT_HALT_KEY), 100.0)
-        self.assertIn(imm.HIGHT_HALT_KEY, imm.pilot_halt_keys())
+        # the family loss budget: off since 2026-10-25, as the low family's
+        self.assertEqual(imm.HIGHT_DAILY_LOSS_LIMIT, 0.0)
+        self.assertIsNone(imm.pilot_budget_key(self.T))
+        self.assertNotIn(imm.HIGHT_HALT_KEY, imm.pilot_halt_keys())
+        with mock.patch.object(imm, "HIGHT_DAILY_LOSS_LIMIT", 100.0):
+            self.assertEqual(imm.pilot_budget_key(self.T), imm.HIGHT_HALT_KEY)
+            self.assertEqual(imm.pilot_halt_limit(imm.HIGHT_HALT_KEY), 100.0)
+            self.assertIn(imm.HIGHT_HALT_KEY, imm.pilot_halt_keys())
         for k in ("HIGHT_ENABLE", "HIGHT_STOP_BEFORE_MIN", "HIGHT_FAIR_TOL_CENTS",
                   "HIGHT_DAILY_LOSS_LIMIT", "HIGHT_SIZE_MULT"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)

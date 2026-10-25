@@ -2207,8 +2207,10 @@ def mention_size_mult(series: str) -> float:
 # so both halves trade the same days. The salt balanced the halves on
 # 10/08-10/21 (rewards $489 vs $496/day, fills -$326 vs -$332). Out of both
 # halves: hand-tuned ladders (applied_mention_mult leaves them literal) and
-# SIZE_TEST_EXCLUDE (the Trump mentions B test, and KXGENERALMOV: sized x3 by
-# hand on 10/23, see GENMOV_SIZE_MULT). imm_size_test_report (IMM
+# SIZE_TEST_EXCLUDE (the Trump mentions B test; KXGENERALMOV, sized x3 by
+# hand on 10/23, see GENMOV_SIZE_MULT; KXPRESRUN, whose hand-set x6 the test
+# half would have made x9 -- Jack 2026-10-25: "Take it out").
+# imm_size_test_report (IMM
 # family watch pass 7) scores it daily and writes SIZE_TEST_STOP_FILE (in
 # STATUS_DIR) when its stop rule trips; the file ends the test by hand too,
 # read once a minute. IMM_SIZE_TEST_MULT=1 turns it off.
@@ -2219,7 +2221,7 @@ SIZE_TEST_SALT = os.environ.get("IMM_SIZE_TEST_SALT", "size15-1026-31")
 SIZE_TEST_EXCLUDE = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_SIZE_TEST_EXCLUDE",
-        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV").split(",") if s.strip())
+        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN").split(",") if s.strip())
 SIZE_TEST_STOP_FILE = "size_test_stop.txt"                     # in STATUS_DIR
 _size_test_stop = {"checked": 0.0, "stopped": False}
 _size_test_cache: Dict[Any, Any] = {}           # the window per knobs, a parity per series
@@ -11554,10 +11556,13 @@ def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
 #     side -- and fails CLOSED with no fresh read, on a shape-filter day (a
 #     late-evening cold drop or a midnight print can set the low while
 #     evening quotes rest), and off the US stations it models.
-#   - The 15c / 30 min mid-move breaker (move_breaker_on), and one daily loss
-#     budget for the family (LOWT_DAILY_LOSS_LIMIT, $100 -- Jack: "increase
-#     family halt amount to $100" -- on the pilot-halt machinery: stood
-#     aside to the 5am-CT roll, positions ride).
+#   - The 15c / 30 min mid-move breaker (move_breaker_on). The family's daily
+#     loss budget (LOWT_DAILY_LOSS_LIMIT, $100 from 10/23 -- Jack: "increase
+#     family halt amount to $100" -- on the pilot-halt machinery: stood aside
+#     to the 5am-CT roll, positions ride) is OFF since 2026-10-25 (Jack:
+#     "remove the $100 cap on temps", after it stood the family aside at
+#     -$103 that day); the bot-wide daily loss limit still applies, and a
+#     value > 0 brings the budget back.
 # Kill switch IMM_LOWT_ENABLE=0 (an env change: restart_imm.ps1 -Task).
 LOWT_ENABLE = os.environ.get("IMM_LOWT_ENABLE", "1") == "1"
 LOWT_PREFIX = "KXLOWT"
@@ -11573,7 +11578,7 @@ LOWT_FAIR_FILE = os.environ.get(
 LOWT_FAIR_TOL_CENTS = _env_int("IMM_LOWT_FAIR_TOL_CENTS", 40)
 LOWT_FAIR_TTL_MIN = _env_int("IMM_LOWT_FAIR_TTL_MIN", 90)
 LOWT_FAIR_REFRESH_SECS = _env_int("IMM_LOWT_FAIR_REFRESH_SECS", 1800)
-LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 100.0)
+LOWT_DAILY_LOSS_LIMIT = _env_float("IMM_LOWT_DAILY_LOSS_LIMIT", 0.0)
 LOWT_HALT_KEY = "LOWT"
 # SIZE x3 AND A 3-97c BAND (Jack 2026-10-23: "3x and also extend range to
 # 3-97"). On the first pass only 6 of 144 next-day markets cleared the $1.30
@@ -11713,7 +11718,9 @@ def lowt_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 #   - On the tape (events 10/19-10/22, 24 series) every maker together made
 #     +$1,379 on the 337k contracts traded the day before until 21:00 ET and
 #     -$753 on 21:00-24:00 (the high bot's evening window).
-#   - The mid-move breaker and one daily loss budget (HIGHT_DAILY_LOSS_LIMIT).
+#   - The mid-move breaker. The daily loss budget (HIGHT_DAILY_LOSS_LIMIT,
+#     $100 from 10/23) is OFF since 2026-10-25, as the low family's (Jack:
+#     "remove the $100 cap on temps").
 #   - The "KXHIGH" ownership block (SERIES_BLOCKLIST_PREFIXES) stands aside
 #     for the family's markets only (_blocked).
 # Kill switch IMM_HIGHT_ENABLE=0 (an env change: restart_imm.ps1 -Task).
@@ -11726,7 +11733,7 @@ HIGHT_FAIR_FILE = os.environ.get(
 HIGHT_FAIR_TOL_CENTS = _env_int("IMM_HIGHT_FAIR_TOL_CENTS", 40)
 HIGHT_FAIR_TTL_MIN = _env_int("IMM_HIGHT_FAIR_TTL_MIN", 90)
 HIGHT_FAIR_REFRESH_SECS = _env_int("IMM_HIGHT_FAIR_REFRESH_SECS", 1800)
-HIGHT_DAILY_LOSS_LIMIT = _env_float("IMM_HIGHT_DAILY_LOSS_LIMIT", 100.0)
+HIGHT_DAILY_LOSS_LIMIT = _env_float("IMM_HIGHT_DAILY_LOSS_LIMIT", 0.0)
 HIGHT_HALT_KEY = "HIGHT"
 # the family parent's size and band (FAMILY_OVERRIDE_PARENTS): x3 and
 # 3-97c, as the low family (Jack 2026-10-23: "3x and 3-97") -- the caps
