@@ -433,6 +433,29 @@ PAD_SLACK_CONTRACTS = _env_int("IMM_PAD_SLACK", 300)
 # IMM_PAD_STICKY=0 restores the plain resize.
 PAD_STICKY = os.environ.get("IMM_PAD_STICKY", "1") == "1"
 PAD_STICKY_RELEASE_MULT = max(1.0, _env_float("IMM_PAD_STICKY_RELEASE_MULT", 2.0))
+# PADS HOLD THROUGH A REFLEXIVE MAKER (Jack 2026-10-25: "Make sure Low and high
+# temp have pads", after the coverage alert on KXLOWTEWR-26OCT26-T41 -- one
+# side qualified for 5 cycles -- then "Yes extend" to every padded family).
+# Another maker adds ~5,000 to a temperature side whenever our 1c pad lifts it
+# to target, and pulls them when ours goes. Past PAD_STICKY_RELEASE_MULT x
+# target (2,000) the sticky rule read their depth as real and released our
+# 900-1,000 pad; they pulled, the side fell to ~450 and qualified nothing
+# until we re-padded, every ~40 s (KXLOWTEWR-26OCT26-T41: 51 pad cancels on
+# 10/25; the temp families 1,141, every other family 1,144 -- each
+# KXMAMDANIMENTION word ~57, KXATTYGENCT-26-D 58). So a release also needs
+# the outside depth to have STAYED at the release level for
+# PAD_RELEASE_HOLD_SECS (_pad_release_hold). On the temps from 21:47Z 10/25
+# (10593ed): one-sided full cycles 0.38% -> 0.05% low, 0.05% -> 0% high in
+# the first 20 minutes. The touch band, ticks-behind and stand-down gates
+# still pull a pad at once. IMM_PAD_RELEASE_HOLD_SECS=0 restores the plain
+# sticky release.
+PAD_RELEASE_HOLD_SECS = _env_float("IMM_PAD_RELEASE_HOLD_SECS", 600.0)
+
+
+def pad_release_hold_secs(series: str) -> float:
+    """How long the depth outside a resting pad must hold the sticky release
+    level before the pad goes (PAD_RELEASE_HOLD_SECS, every padded family)."""
+    return PAD_RELEASE_HOLD_SECS
 # GLOBAL since 2026-07-29 (Jack: "some quotes are not earning because there
 # are not 1000 orders on that side... fix this systematically — quote how
 # many orders are necessary at the very bottom of the orderbook"): every
@@ -10297,6 +10320,7 @@ _CONFIG_CODE_KNOBS = (
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
+    "PAD_RELEASE_HOLD_SECS",                     # ...held 10 min (2026-10-25)
     "SIDE_MULT_SERIES",                          # Trump B half bids / 1.5x asks (2026-10-22)
     "FAMILY_SIDE_LEANS",                         # family 1.5x / 0.75x side leans (2026-10-22)
     "LONGSHOT_MULT", "LONGSHOT_BID_BELOW",       # the event long-shot cut (2026-10-22)
@@ -11779,30 +11803,6 @@ def hight_series(series: str) -> bool:
     refresh) -> no family: fails closed."""
     return (HIGHT_ENABLE and series.startswith(HIGHT_PREFIX)
             and series in _hight_state["series"])
-
-
-# TEMP PADS HOLD THROUGH A REFLEXIVE MAKER (Jack 2026-10-25: "Make sure Low
-# and high temp have pads", after the coverage alert on KXLOWTEWR-26OCT26-T41:
-# one side qualified for 5 cycles). Another maker adds ~5,000 to a temperature
-# side whenever our 1c pad lifts it to target, and pulls them when ours goes.
-# Past PAD_STICKY_RELEASE_MULT x target (2,000) the sticky rule read their
-# depth as real and released our 900-1,000 pad; they pulled, the side fell
-# to ~450 and qualified nothing until we re-padded, every ~40 s
-# (KXLOWTEWR-26OCT26-T41: 51 pad cancels on 10/25; the two families 1,141).
-# For these families the release also needs the outside depth to have STAYED
-# at the release level for PAD_TEMP_RELEASE_HOLD_SECS (_pad_release_hold);
-# the touch band, ticks-behind and stand-down gates still pull a pad at once.
-# IMM_PAD_TEMP_RELEASE_HOLD_SECS=0 restores the plain sticky release.
-PAD_TEMP_RELEASE_HOLD_SECS = _env_float("IMM_PAD_TEMP_RELEASE_HOLD_SECS", 600.0)
-
-
-def pad_release_hold_secs(series: str) -> float:
-    """How long the depth outside a resting pad must hold the sticky release
-    level before the pad goes: PAD_TEMP_RELEASE_HOLD_SECS for the low- and
-    high-temperature families, 0 (at once) for everything else."""
-    if lowt_series(series) or hight_series(series):
-        return PAD_TEMP_RELEASE_HOLD_SECS
-    return 0.0
 
 
 def hight_stop_utc(event_ticker: str) -> datetime:
@@ -29945,15 +29945,14 @@ class IncentiveMarketMaker:
     def _pad_release_hold(self, ticker: str, side: str, n: int,
                           resting_pad: float) -> int:
         """`n` (the sticky size), unless that would shrink or release a
-        resting pad of a family with a pad_release_hold_secs whose outside
-        depth has sat at the release level for less than that long: then the
-        resting pad stays (TEMP PADS HOLD, 2026-10-25). The clock starts on
-        the first cycle that would release it and clears on any cycle that
-        would not."""
+        resting pad whose outside depth has sat at the release level for less
+        than pad_release_hold_secs: then the resting pad stays (PADS HOLD,
+        2026-10-25). The clock starts on the first cycle that would release it
+        and clears on any cycle that would not."""
         hold = pad_release_hold_secs(series_of(ticker))
         key = (ticker, side)
         keep = min(int(round(resting_pad)), PAD_MAX_CONTRACTS)
-        if hold <= 0 or keep < 1 or n >= keep:
+        if hold <= 0 or not PAD_STICKY or keep < 1 or n >= keep:
             self._pad_release_since.pop(key, None)
             return n
         now = time.time()
