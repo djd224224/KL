@@ -2209,7 +2209,8 @@ def mention_size_mult(series: str) -> float:
 # halves: hand-tuned ladders (applied_mention_mult leaves them literal) and
 # SIZE_TEST_EXCLUDE (the Trump mentions B test; KXGENERALMOV, sized x3 by
 # hand on 10/23, see GENMOV_SIZE_MULT; KXPRESRUN, whose hand-set x6 the test
-# half would have made x9 -- Jack 2026-10-25: "Take it out").
+# half would have made x9 -- Jack 2026-10-25: "Take it out"; KXAPRPOTUS,
+# resized x3 -> x5 by hand the day before the start, see APRPOTUS_SIZE_MULT).
 # imm_size_test_report (IMM
 # family watch pass 7) scores it daily and writes SIZE_TEST_STOP_FILE (in
 # STATUS_DIR) when its stop rule trips; the file ends the test by hand too,
@@ -2221,7 +2222,8 @@ SIZE_TEST_SALT = os.environ.get("IMM_SIZE_TEST_SALT", "size15-1026-31")
 SIZE_TEST_EXCLUDE = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_SIZE_TEST_EXCLUDE",
-        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN").split(",") if s.strip())
+        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN,KXAPRPOTUS"
+    ).split(",") if s.strip())
 SIZE_TEST_STOP_FILE = "size_test_stop.txt"                     # in STATUS_DIR
 _size_test_stop = {"checked": 0.0, "stopped": False}
 _size_test_cache: Dict[Any, Any] = {}           # the window per knobs, a parity per series
@@ -8866,8 +8868,19 @@ SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
     size_mult=_env_float("IMM_TRUMPAPPROVE_SIZE_MULT", 3.0))
 # KXAPRPOTUS, the same RCP number read at 11:00 AM ET (Jack 2026-10-01:
 # "yes, same rules as KXTRUMPAPPROVE"): the same override on the same knobs,
-# so the twins move together.
-SERIES_OVERRIDES["KXAPRPOTUS"] = SERIES_OVERRIDES["KXTRUMPAPPROVE"]
+# so the twins moved together -- until its own size:
+# x5 (Jack 2026-10-25: "Run KXAEPOTUS at 5x", on the portfolio email's
+# DOUBLE DOWN x1.5 line: up on 5 of the 7 days, +$296 net over the 7 and
+# +$671 over 30, rewards +$832 against fills and held positions -$161 over
+# the 30). The twin's override at APRPOTUS_SIZE_MULT, so rungs 20 -> 100, the
+# per-market cap 750 and the per-event cap 5,000; it keeps the evening x1.5
+# and the Saturday step, and no quiet hours (QUIET_HOURS_OFF_SERIES). The
+# daily KXTRUMPAPPROVE stays x3. Out of the size test (SIZE_TEST_EXCLUDE):
+# a hand resize inside its control half would move that half's baseline.
+# IMM_APRPOTUS_SIZE_MULT=3 puts it back on the twin's size.
+APRPOTUS_SIZE_MULT = _env_float("IMM_APRPOTUS_SIZE_MULT", 5.0)
+SERIES_OVERRIDES["KXAPRPOTUS"] = replace(SERIES_OVERRIDES["KXTRUMPAPPROVE"],
+                                         size_mult=APRPOTUS_SIZE_MULT)
 
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
@@ -10475,6 +10488,7 @@ _CONFIG_CODE_KNOBS = (
     "ELECTION_DATES", "ELECTION_OCC_BACK_HOURS",
     "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
     "PRESRUN_SIZE_MULT", "NO_SIDE_ONLY_EVENTS",   # KXPRESRUN-28 (2026-10-11)
+    "APRPOTUS_SIZE_MULT",         # the weekly RCP approval x5 (2026-10-25)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",

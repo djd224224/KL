@@ -2487,9 +2487,16 @@ class TestTrumpApproveAllowlist(unittest.TestCase):
             self.assertTrue(a(t), t)
         self.assertIn("KXAPRPOTUS", imm.ALLOW_SERIES)
         self.assertFalse(a("KXAPRPOTUSX-26OCT02-38.3"))         # exact series
-        self.assertIs(imm.SERIES_OVERRIDES["KXAPRPOTUS"],
-                      imm.SERIES_OVERRIDES["KXTRUMPAPPROVE"])  # same knobs
-        self.assertEqual(imm.applied_mention_mult("KXAPRPOTUS"), 3.0)
+        # the twin's knobs, its own size since 2026-10-25 (Jack: "Run
+        # KXAEPOTUS at 5x"): x5 where the daily stays x3
+        ov, tw = imm.SERIES_OVERRIDES["KXAPRPOTUS"], imm.SERIES_OVERRIDES["KXTRUMPAPPROVE"]
+        self.assertEqual(ov.event_day_cutoff_et, tw.event_day_cutoff_et)
+        self.assertEqual((ov.size_mult, tw.size_mult), (5.0, 3.0))
+        self.assertEqual(imm.applied_mention_mult("KXAPRPOTUS"), 5.0)
+        self.assertEqual(imm.applied_mention_mult("KXTRUMPAPPROVE"), 3.0)
+        self.assertEqual(imm.series_max_position("KXAPRPOTUS"),
+                         imm.MAX_POSITION_CONTRACTS * 5)
+        self.assertIsNone(imm.size_test_arm("KXAPRPOTUS"))       # out of the size test
         self.assertEqual(imm.event_top_n_for("KXAPRPOTUS"), 0)
         U = timezone.utc
         # the live shapes: occurrence at the 11:00 ET read (15:00Z), an
