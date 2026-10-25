@@ -2977,6 +2977,13 @@ _DEFAULT_SCAN_GRADUATE_SERIES = (
     "KXMOMFGEMP,KXWYUNEMPLOW,KXNJPHARMAEMP,KXWVPOP,KXREMITSENT,KXSCTRANSEMP,"
     "KXWIMFGEMP,KXWALLSTBONUS,KXCFNAI,KXALVEHICLEPROD,KXSAGDPQOQ,KXUSRETAIL,"
     "KXMASCIENRDEMP,KXMIAUTOEMP,KXDECREDITJOBS,"
+    # KXSOFTWAREUNEMP added 2026-10-25 (Jack, on the watch's item: "Enroll
+    # this too"): BLS's 2027 annual-average unemployment rate for software
+    # developers (CPS Table 25b, first published ~Jan 2028), one event of 9
+    # strikes -- a slow public statistic like the jobs graduates, so their
+    # guard set: safe-join, 3 strikes an event, and the 28JAN01 ticker's
+    # midnight-ET exit before the release.
+    "KXSOFTWAREUNEMP,"
     # travel and visits
     "KXNJGOLFVISITCOUNT,KXNERIVISITS,KXNJONTIME,KXNVVISIT,KXORLHOTELDEMAND,"
     "KXNYCSUBWAY,KXNHASKIVISITS,"
@@ -10410,6 +10417,9 @@ _CONFIG_CODE_KNOBS = (
     "RESORT_SNOW_TTL_MIN", "RESORT_SNOW_DRY_MIN", "RESORT_SNOW_CAP",
     "RESORT_SNOW_MAX_POSITION", "RESORT_SNOW_CUTOFF_FROM_CLOSE_MIN",
     "RESORT_SNOW_SIZE_MULT",                     # x3 ladder (Jack 2026-10-22: "3x")
+    # the Broadway weekly attendance gate (2026-10-25); model knobs in bway_fair.py
+    "BWAY_FAIR_ENABLE", "BWAY_FAIR_TOL_CENTS", "BWAY_FAIR_TTL_MIN", "BWAY_FAIR_CAP",
+    "BWAY_FAIR_MAX_POSITION",
     # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
     "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
     "RT_FAIR_CAP", "RT_FAIR_BAND",
@@ -13243,13 +13253,68 @@ def rt_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                              "RT", RT_FAIR_CAP)
 
 
+# BROADWAY WEEKLY ATTENDANCE GATE (Jack 2026-10-25: "Can you build a fair
+# value for this?" on the watch's KXBWAYATTENDANCEW, then "Yes enroll it").
+# KXBWAYATTENDANCEW-<YYMONDD>-A<K>: is the Broadway League's Total
+# Attendance for the Monday-Sunday week ending that Sunday above K?
+# bway_fair.py forecasts the week bottom-up from the League's per-show
+# grosses -- each running show's usual performances at its last week's
+# attendance per performance, scaled by the same calendar week's drift in
+# past seasons; new shows from the League's opening-night calendar at
+# their theatre's seats; closings out -- and prices each strike off a
+# lognormal at the backtest's error (3.7% one week ahead, 4.0% two). The
+# League posts a week the Monday after it, after the market closes, so the
+# risk is a better forecaster, not a leak. The gate is the fair-file
+# contract (simple_fair_gate): no fresh fair, no quote; a touch more than
+# BWAY_FAIR_TOL_CENTS through the fair caps that side. At x1 -- the global
+# ladder, BWAY_FAIR_MAX_POSITION a market (the live cap; set here, it also
+# keeps the series out of the base-size split test) -- and the day-dated
+# ticker's midnight-ET rule takes each week out as its Sunday starts. The
+# series is allowed only through this gate: IMM_BWAY_FAIR_ENABLE=0 takes it
+# out; positions ride.
+BWAY_FAIR_ENABLE = os.environ.get("IMM_BWAY_FAIR_ENABLE", "1") == "1"
+BWAY_FAIR_SERIES = frozenset(("KXBWAYATTENDANCEW",))
+BWAY_FAIR_TOL_CENTS = _env_int("IMM_BWAY_FAIR_TOL_CENTS", 10)
+BWAY_FAIR_TTL_MIN = _env_int("IMM_BWAY_FAIR_TTL_MIN", 180)
+BWAY_FAIR_REFRESH_SECS = _env_int("IMM_BWAY_FAIR_REFRESH_SECS", 1800)
+BWAY_FAIR_CAP = os.environ.get("IMM_BWAY_FAIR_CAP", "1") == "1"
+BWAY_FAIR_MAX_POSITION = _env_float("IMM_BWAY_FAIR_MAX_POSITION", 150)
+BWAY_FAIR_FILE = os.environ.get(
+    "IMM_BWAY_FAIR_FILE", os.path.join(STATUS_DIR, "bway_fair.json"))
+_bway_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+if BWAY_FAIR_ENABLE:
+    for _s in BWAY_FAIR_SERIES:
+        SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+                                       max_position=BWAY_FAIR_MAX_POSITION)
+
+
+def bway_fair_series(series: str) -> bool:
+    return BWAY_FAIR_ENABLE and series in BWAY_FAIR_SERIES
+
+
+def load_bway_fair() -> int:
+    """Hot-reload BWAY_FAIR_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(BWAY_FAIR_FILE, _bway_fair_state, "Broadway")
+
+
+def bway_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                   ext_ask: Optional[float]
+                   ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    return simple_fair_gate(_bway_fair_state, ticker, now_ts, ext_bid, ext_ask,
+                            tol=BWAY_FAIR_TOL_CENTS, ttl_min=BWAY_FAIR_TTL_MIN,
+                            label="Broadway", cap=BWAY_FAIR_CAP)
+
+
 def fair_file_gate(series: str, ticker: str, now_ts: float,
                    ext_bid: Optional[float], ext_ask: Optional[float]
                    ) -> Optional[Tuple[str, str, dict,
                                        Optional[Tuple[Optional[int], Optional[int]]]]]:
     """(log label, why, inputs, caps) for a market under one of the
-    2026-10-11 fair-file gates or the 2026-10-22 resort snow gate, else
-    None."""
+    2026-10-11 fair-file gates, the 2026-10-22 resort snow gate or the
+    2026-10-25 Broadway gate, else None."""
+    if bway_fair_series(series):
+        return ("bway-fair",) + bway_fair_gate(ticker, now_ts, ext_bid, ext_ask)
     if resort_snow_series(series):
         return ("resort-snow",) + resort_snow_gate(ticker, now_ts, ext_bid, ext_ask)
     if cpi_fair_series(series):
@@ -17938,6 +18003,7 @@ def fair_gate_of(series: str) -> str:
         ("rain period", lambda: rain_period_gated(t)),
         ("snow monthly", lambda: snow_monthly_series(series)),
         ("resort snow", lambda: resort_snow_series(series)),
+        ("broadway", lambda: bway_fair_series(series)),
         ("cpi", lambda: cpi_fair_series(series)),
         ("rain weekend", lambda: rain_wknd_series(series)),
         ("rotten tomatoes", lambda: rt_fair_series(series)),
@@ -23969,6 +24035,7 @@ class IncentiveMarketMaker:
             snow_monthly_series(series) or \
             bigsky_series(series) or \
             resort_snow_series(series) or \
+            bway_fair_series(series) or \
             lowt_series(series) or \
             hight_series(series) or \
             cpi_pilot_active(ticker) or \
@@ -24244,6 +24311,7 @@ class IncentiveMarketMaker:
         load_cpi_fair()
         load_rain_wknd()
         load_resort_snow()
+        load_bway_fair()              # Broadway weekly attendance (2026-10-25)
         load_rt_fair()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
@@ -31226,6 +31294,40 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_resort_snow_refresh, daemon=True,
                              name="resort-snow").start()
+        if BWAY_FAIR_ENABLE and not once:
+            # Broadway attendance refresher (2026-10-25): the rain-wknd
+            # refresher's contract on bway_fair.py and BWAY_FAIR_FILE -- the
+            # League's grosses page every 30 min (a newly posted week joins
+            # the file's memory), its opening-night calendar every 6h,
+            # Kalshi's open events hourly.
+            def _bway_fair_refresh():
+                try:
+                    import bway_fair
+                except Exception as e:
+                    log(f"{self.tag} ! bway-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, BWAY_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = bway_fair.write_fair_file(
+                            BWAY_FAIR_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} bway-fair refresh: {ok} markets "
+                                f"with a fair"
+                                + (f", {miss} events without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! bway-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_bway_fair_refresh, daemon=True,
+                             name="bway-fair").start()
         if RT_FAIR_ENABLE and not once:
             # Rotten Tomatoes fair refresher (2026-10-12): the CPI
             # refresher's contract on rt_fair.py and RT_FAIR_FILE, a pass
@@ -32371,6 +32473,13 @@ class IncentiveMarketMaker:
                 + (f"new {RESORT_SNOW_SERIES_RE.pattern} series auto-enroll once the "
                    f"writer maps their resort (weak band)" if RESORT_SNOW_SERIES_RE
                    else "no auto-enrollment"))
+        if BWAY_FAIR_ENABLE:
+            log(f"Broadway gate (2026-10-25): {', '.join(sorted(BWAY_FAIR_SERIES))} "
+                f"quoted against bway_fair's per-show weekly forecast -- band "
+                f"{BWAY_FAIR_TOL_CENTS}c caps the side that fights the fair, no fresh "
+                f"fair ({BWAY_FAIR_TTL_MIN}m) no quote; x1, max "
+                f"{BWAY_FAIR_MAX_POSITION:g} per market, out as each week's Sunday "
+                f"starts (its ticker date)")
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"

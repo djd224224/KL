@@ -1,0 +1,2026 @@
+{
+ "about": "bway_fair.py seed (2026-10-25): the Broadway League's per-show weekly grosses 9/2021-10/2026, pulled through its grosses search; drift = the median per-performance change of continuing shows per week (post-reopening seasons, from 2022-06); seats = median attend/perf/capacity by theatre",
+ "drift": {
+  "2022-06-05": -0.04157,
+  "2022-06-12": 0.05338,
+  "2022-06-19": 0.00989,
+  "2022-06-26": 0.00907,
+  "2022-07-03": -0.0069,
+  "2022-07-10": -0.03569,
+  "2022-07-17": 0.04458,
+  "2022-07-24": 0.02323,
+  "2022-07-31": 0.00304,
+  "2022-08-07": -0.00028,
+  "2022-08-14": -0.00606,
+  "2022-08-21": 0.01319,
+  "2022-08-28": -0.05939,
+  "2022-09-04": 0.05287,
+  "2022-09-11": 0.01092,
+  "2022-09-18": 0.01085,
+  "2022-09-25": 0.00854,
+  "2022-10-02": -0.01646,
+  "2022-10-09": 0.04475,
+  "2022-10-16": 0.00054,
+  "2022-10-23": -0.00041,
+  "2022-10-30": -0.05761,
+  "2022-11-06": 0.01136,
+  "2022-11-13": 0.05383,
+  "2022-11-20": -0.05326,
+  "2022-11-27": -0.00295,
+  "2022-12-04": -0.00321,
+  "2022-12-11": 0.05552,
+  "2022-12-18": -0.01216,
+  "2022-12-25": -0.00617,
+  "2023-01-01": 0.07081,
+  "2023-01-08": -0.00574,
+  "2023-01-15": -0.0037,
+  "2023-01-22": 0.00313,
+  "2023-01-29": -0.00189,
+  "2023-02-05": -0.01472,
+  "2023-02-12": 0.02096,
+  "2023-02-19": -0.01315,
+  "2023-02-26": 0.00919,
+  "2023-03-05": -0.06358,
+  "2023-03-12": 0.04249,
+  "2023-03-19": 0.03004,
+  "2023-03-26": -0.0087,
+  "2023-04-02": -0.00053,
+  "2023-04-09": 0.00363,
+  "2023-04-16": -0.02493,
+  "2023-04-23": -0.02155,
+  "2023-04-30": -0.00236,
+  "2023-05-07": -0.03945,
+  "2023-05-14": 0.00755,
+  "2023-05-21": 0.0532,
+  "2023-05-28": -0.01495,
+  "2023-06-04": -0.04616,
+  "2023-06-11": 0.03155,
+  "2023-06-18": 0.00933,
+  "2023-06-25": 0.00046,
+  "2023-07-02": -0.00208,
+  "2023-07-09": -0.03071,
+  "2023-07-16": 0.01,
+  "2023-07-23": 0.01086,
+  "2023-07-30": 0.00598,
+  "2023-08-06": -0.00252,
+  "2023-08-13": -0.00833,
+  "2023-08-20": -0.02789,
+  "2023-08-27": 0.00444,
+  "2023-09-03": 0.05634,
+  "2023-09-10": -0.03473,
+  "2023-09-17": 0.02356,
+  "2023-09-24": -0.09654,
+  "2023-10-01": -0.00206,
+  "2023-10-08": 0.06297,
+  "2023-10-15": 0.0,
+  "2023-10-22": 0.0,
+  "2023-10-29": -0.03276,
+  "2023-11-05": -0.00832,
+  "2023-11-12": 0.05767,
+  "2023-11-19": -0.05054,
+  "2023-11-26": 0.07753,
+  "2023-12-03": -0.02799,
+  "2023-12-10": 0.02833,
+  "2023-12-17": 0.00337,
+  "2023-12-24": 0.00068,
+  "2023-12-31": 0.03977,
+  "2024-01-07": -0.01649,
+  "2024-01-14": -0.011,
+  "2024-01-21": -0.03359,
+  "2024-01-28": 0.03478,
+  "2024-02-04": 0.00529,
+  "2024-02-11": -0.07624,
+  "2024-02-18": 0.06122,
+  "2024-02-25": 0.00181,
+  "2024-03-03": -0.05588,
+  "2024-03-10": 0.04309,
+  "2024-03-17": 0.02403,
+  "2024-03-24": -0.00784,
+  "2024-03-31": 0.0233,
+  "2024-04-07": -0.02489,
+  "2024-04-14": -0.02414,
+  "2024-04-21": 0.00158,
+  "2024-04-28": 0.0,
+  "2024-05-05": -0.02481,
+  "2024-05-12": 0.02448,
+  "2024-05-19": 0.00716,
+  "2024-05-26": 0.00012,
+  "2024-06-02": -0.05226,
+  "2024-06-09": 0.02039,
+  "2024-06-16": 0.00512,
+  "2024-06-23": 0.01992,
+  "2024-06-30": -0.0046,
+  "2024-07-07": 0.00379,
+  "2024-07-14": -0.01695,
+  "2024-07-21": 0.00209,
+  "2024-07-28": 0.01738,
+  "2024-08-04": -0.00885,
+  "2024-08-11": -0.00191,
+  "2024-08-18": -0.00542,
+  "2024-08-25": -0.00514,
+  "2024-09-01": 0.03237,
+  "2024-09-08": -0.03426,
+  "2024-09-15": 0.03086,
+  "2024-09-22": -0.09961,
+  "2024-09-29": 0.01775,
+  "2024-10-06": 0.00045,
+  "2024-10-13": 0.05265,
+  "2024-10-20": -0.00293,
+  "2024-10-27": -0.02532,
+  "2024-11-03": -0.01054,
+  "2024-11-10": 0.05064,
+  "2024-11-17": -0.02041,
+  "2024-11-24": -0.00966,
+  "2024-12-01": 0.01565,
+  "2024-12-08": 0.00378,
+  "2024-12-15": 0.02046,
+  "2024-12-22": -0.00163,
+  "2024-12-29": 0.03075,
+  "2025-01-05": -0.00131,
+  "2025-01-12": -0.01483,
+  "2025-01-19": -0.00012,
+  "2025-01-26": 0.0,
+  "2025-02-02": 0.02299,
+  "2025-02-09": -0.0069,
+  "2025-02-16": -0.01592,
+  "2025-02-23": 0.01441,
+  "2025-03-02": -0.05039,
+  "2025-03-09": 0.03182,
+  "2025-03-16": 0.01953,
+  "2025-03-23": 0.00158,
+  "2025-03-30": -0.00767,
+  "2025-04-06": -0.02231,
+  "2025-04-13": -0.00288,
+  "2025-04-20": 0.03013,
+  "2025-04-27": -0.02473,
+  "2025-05-04": -0.02509,
+  "2025-05-11": 0.00266,
+  "2025-05-18": 0.00089,
+  "2025-05-25": 0.02616,
+  "2025-06-01": -0.01777,
+  "2025-06-08": -0.00314,
+  "2025-06-15": 0.00529,
+  "2025-06-22": 0.03851,
+  "2025-06-29": -0.01084,
+  "2025-07-06": 0.01465,
+  "2025-07-13": -0.00608,
+  "2025-07-20": 0.01285,
+  "2025-07-27": -0.00112,
+  "2025-08-03": -0.01198,
+  "2025-08-10": -0.00013,
+  "2025-08-17": -0.03,
+  "2025-08-24": 0.00703,
+  "2025-08-31": 0.00253,
+  "2025-09-07": -0.08419,
+  "2025-09-14": 0.10703,
+  "2025-09-21": 0.02565,
+  "2025-09-28": -0.03101,
+  "2025-10-05": -0.00272,
+  "2025-10-12": 0.03675,
+  "2025-10-19": -0.00409,
+  "2025-10-26": -0.0155,
+  "2025-11-02": -0.04058,
+  "2025-11-09": 0.05301,
+  "2025-11-16": -0.02338,
+  "2025-11-23": -0.00991,
+  "2025-11-30": 0.03412,
+  "2025-12-07": -0.01787,
+  "2025-12-14": 0.02019,
+  "2025-12-21": 0.00619,
+  "2025-12-28": 0.01261,
+  "2026-01-04": 0.02138,
+  "2026-01-11": -0.05743,
+  "2026-01-18": -0.0017,
+  "2026-01-25": -0.0239,
+  "2026-02-01": 0.01619,
+  "2026-02-08": 0.01152,
+  "2026-02-15": 0.02922,
+  "2026-02-22": -0.01542,
+  "2026-03-01": -0.10206,
+  "2026-03-08": 0.01598,
+  "2026-03-15": 0.03174,
+  "2026-03-22": 0.03032,
+  "2026-03-29": -0.03068,
+  "2026-04-05": 0.00278,
+  "2026-04-12": -0.00478,
+  "2026-04-19": -0.05442,
+  "2026-04-26": 0.01915,
+  "2026-05-03": -0.02609,
+  "2026-05-10": 0.01013,
+  "2026-05-17": -0.00472,
+  "2026-05-24": 0.02937,
+  "2026-05-31": -0.02759,
+  "2026-06-07": -0.00119,
+  "2026-06-14": -0.04116,
+  "2026-06-21": 0.02954,
+  "2026-06-28": -0.00487,
+  "2026-07-05": 0.00083,
+  "2026-07-12": 0.03095,
+  "2026-07-19": -0.01657,
+  "2026-07-26": 0.0817,
+  "2026-08-02": -0.00029,
+  "2026-08-09": -0.01314,
+  "2026-08-16": -0.03225,
+  "2026-08-23": -0.0083,
+  "2026-08-30": 0.00672,
+  "2026-09-06": 0.03201,
+  "2026-09-13": -0.01767,
+  "2026-09-20": 0.05006,
+  "2026-09-27": -0.06462,
+  "2026-10-04": 0.01862,
+  "2026-10-11": 0.04297,
+  "2026-10-18": 0.00112
+ },
+ "seats": {
+  "Al Hirschfeld": 1301,
+  "Ambassador": 1081,
+  "American Airlines": 725,
+  "August Wilson": 1214,
+  "Belasco": 977,
+  "Booth": 772,
+  "Broadhurst": 1154,
+  "Broadway": 1483,
+  "Brooks Atkinson": 1031,
+  "Circle In The Square": 692,
+  "Ethel Barrymore": 1043,
+  "Eugene O'Neill": 1066,
+  "Friedman": 638,
+  "Gershwin": 1864,
+  "Golden": 792,
+  "Hayes": 581,
+  "Helen Hayes": 584,
+  "Hudson": 969,
+  "Imperial": 1406,
+  "Jacobs": 1025,
+  "James Earl Jones": 1064,
+  "Lena Horne": 1031,
+  "Longacre": 1051,
+  "Lunt-Fontanne": 1492,
+  "Lyceum": 895,
+  "Lyric": 1621,
+  "Majestic": 1601,
+  "Marquis": 1597,
+  "Minskoff": 1697,
+  "Music Box": 987,
+  "Nederlander": 1172,
+  "Neil Simon": 1387,
+  "New Amsterdam": 1728,
+  "Palace": 1640,
+  "Richard Rodgers": 1324,
+  "Schoenfeld": 1045,
+  "Shubert": 1452,
+  "St. James": 1599,
+  "Stephen Sondheim": 1027,
+  "Studio 54": 988,
+  "Todd Haimes": 730,
+  "Vivian Beaumont": 1053,
+  "Walter Kerr": 918,
+  "Winter Garden": 1486
+ },
+ "weeks": {
+  "2026-08-30": [
+   {
+    "attend": 6996,
+    "cap": 85.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 11417,
+    "cap": 83.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 7842,
+    "cap": 93.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 6821,
+    "cap": 79.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7283,
+    "cap": 99.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10619,
+    "cap": 100.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 11490,
+    "cap": 89.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5581,
+    "cap": 101.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 6573,
+    "cap": 84.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 10848,
+    "cap": 98.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 10458,
+    "cap": 101.0,
+    "n": 8,
+    "show": "MOULIN ROUGE! THE MUSICAL",
+    "sid": "520640",
+    "theatre": "Al Hirschfeld"
+   },
+   {
+    "attend": 7148,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 5767,
+    "cap": 91.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 9386,
+    "cap": 99.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8521,
+    "cap": 92.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 5357,
+    "cap": 65.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 8332,
+    "cap": 65.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 7897,
+    "cap": 93.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 9161,
+    "cap": 77.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 12557,
+    "cap": 93.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 10966,
+    "cap": 83.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 7238,
+    "cap": 88.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7581,
+    "cap": 96.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 9636,
+    "cap": 90.0,
+    "n": 8,
+    "show": "TITAN\u00cdQUE",
+    "sid": "545248",
+    "theatre": "St. James"
+   },
+   {
+    "attend": 5400,
+    "cap": 64.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 12992,
+    "cap": 90.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-09-06": [
+   {
+    "attend": 7423,
+    "cap": 90.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 12339,
+    "cap": 89.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 7821,
+    "cap": 93.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 7583,
+    "cap": 88.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7285,
+    "cap": 99.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10686,
+    "cap": 101.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 12352,
+    "cap": 95.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5551,
+    "cap": 101.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 6899,
+    "cap": 89.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 10947,
+    "cap": 99.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 7160,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 6047,
+    "cap": 96.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 9236,
+    "cap": 98.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8749,
+    "cap": 95.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 5629,
+    "cap": 68.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 8603,
+    "cap": 67.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 8109,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 10016,
+    "cap": 84.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 13374,
+    "cap": 99.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 11521,
+    "cap": 87.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 7210,
+    "cap": 88.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7834,
+    "cap": 99.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 9831,
+    "cap": 92.0,
+    "n": 8,
+    "show": "TITAN\u00cdQUE",
+    "sid": "545248",
+    "theatre": "St. James"
+   },
+   {
+    "attend": 5769,
+    "cap": 69.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 12862,
+    "cap": 89.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-09-13": [
+   {
+    "attend": 6847,
+    "cap": 83.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 12452,
+    "cap": 90.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 7776,
+    "cap": 93.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 8661,
+    "cap": 100.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7198,
+    "cap": 98.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10334,
+    "cap": 98.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 12621,
+    "cap": 97.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5511,
+    "cap": 100.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 6559,
+    "cap": 84.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 10344,
+    "cap": 93.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 6969,
+    "cap": 97.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 5697,
+    "cap": 90.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 9409,
+    "cap": 100.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8160,
+    "cap": 88.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 4408,
+    "cap": 98.0,
+    "n": 7,
+    "show": "SCHOOL GIRLS; OR, THE AFRICAN MEAN GIRLS PLAY",
+    "sid": "546665",
+    "theatre": "Friedman"
+   },
+   {
+    "attend": 6161,
+    "cap": 75.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 9621,
+    "cap": 75.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 7967,
+    "cap": 93.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 9732,
+    "cap": 82.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 12884,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 10698,
+    "cap": 83.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 6587,
+    "cap": 80.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7553,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 9994,
+    "cap": 93.0,
+    "n": 8,
+    "show": "TITAN\u00cdQUE",
+    "sid": "545248",
+    "theatre": "St. James"
+   },
+   {
+    "attend": 5847,
+    "cap": 70.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 13931,
+    "cap": 96.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-09-20": [
+   {
+    "attend": 7739,
+    "cap": 94.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 13201,
+    "cap": 96.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 8414,
+    "cap": 100.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 8757,
+    "cap": 101.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7301,
+    "cap": 99.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10656,
+    "cap": 101.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 11646,
+    "cap": 90.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5547,
+    "cap": 100.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 7226,
+    "cap": 93.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 10683,
+    "cap": 96.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 7132,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 6160,
+    "cap": 97.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 9452,
+    "cap": 100.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 9154,
+    "cap": 99.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 4456,
+    "cap": 99.0,
+    "n": 7,
+    "show": "SCHOOL GIRLS; OR, THE AFRICAN MEAN GIRLS PLAY",
+    "sid": "546665",
+    "theatre": "Friedman"
+   },
+   {
+    "attend": 7046,
+    "cap": 85.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 10778,
+    "cap": 85.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 8376,
+    "cap": 98.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 10892,
+    "cap": 92.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 12926,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 11215,
+    "cap": 87.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 7410,
+    "cap": 90.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7829,
+    "cap": 99.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 10587,
+    "cap": 99.0,
+    "n": 8,
+    "show": "TITAN\u00cdQUE",
+    "sid": "545248",
+    "theatre": "St. James"
+   },
+   {
+    "attend": 7056,
+    "cap": 84.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 14398,
+    "cap": 100.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-09-27": [
+   {
+    "attend": 7275,
+    "cap": 89.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 12673,
+    "cap": 92.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 7924,
+    "cap": 94.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 8209,
+    "cap": 95.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7140,
+    "cap": 97.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10713,
+    "cap": 101.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 12148,
+    "cap": 94.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5028,
+    "cap": 91.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 6128,
+    "cap": 79.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 10433,
+    "cap": 94.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 7143,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 5482,
+    "cap": 87.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 9116,
+    "cap": 96.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8469,
+    "cap": 91.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 4815,
+    "cap": 94.0,
+    "n": 8,
+    "show": "SCHOOL GIRLS; OR, THE AFRICAN MEAN GIRLS PLAY",
+    "sid": "546665",
+    "theatre": "Friedman"
+   },
+   {
+    "attend": 4900,
+    "cap": 59.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 8782,
+    "cap": 69.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 8062,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 9312,
+    "cap": 78.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 2067,
+    "cap": 94.0,
+    "n": 3,
+    "show": "THE IMAGINARY INVALID 2026",
+    "sid": "547555",
+    "theatre": "Todd Haimes"
+   },
+   {
+    "attend": 12632,
+    "cap": 93.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 10429,
+    "cap": 88.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 5997,
+    "cap": 73.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 6596,
+    "cap": 83.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 5244,
+    "cap": 63.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 12477,
+    "cap": 86.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-10-04": [
+   {
+    "attend": 7393,
+    "cap": 90.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 5368,
+    "cap": 83.0,
+    "n": 5,
+    "show": "860",
+    "sid": "547321",
+    "theatre": "Imperial"
+   },
+   {
+    "attend": 12168,
+    "cap": 88.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 7891,
+    "cap": 94.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 8429,
+    "cap": 98.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7236,
+    "cap": 99.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10743,
+    "cap": 101.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 12512,
+    "cap": 96.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5279,
+    "cap": 96.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 6155,
+    "cap": 79.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 10900,
+    "cap": 98.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 6680,
+    "cap": 93.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 5715,
+    "cap": 90.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 6818,
+    "cap": 100.0,
+    "n": 7,
+    "show": "OTHER DESERT CITIES 2026",
+    "sid": "547027",
+    "theatre": "Hudson"
+   },
+   {
+    "attend": 9233,
+    "cap": 98.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8777,
+    "cap": 95.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 4961,
+    "cap": 96.0,
+    "n": 8,
+    "show": "SCHOOL GIRLS; OR, THE AFRICAN MEAN GIRLS PLAY",
+    "sid": "546665",
+    "theatre": "Friedman"
+   },
+   {
+    "attend": 5666,
+    "cap": 69.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 8712,
+    "cap": 68.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 8011,
+    "cap": 94.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 9487,
+    "cap": 80.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 4710,
+    "cap": 92.0,
+    "n": 7,
+    "show": "THE IMAGINARY INVALID 2026",
+    "sid": "547555",
+    "theatre": "Todd Haimes"
+   },
+   {
+    "attend": 11101,
+    "cap": 94.0,
+    "n": 7,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 10554,
+    "cap": 89.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 6404,
+    "cap": 78.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7322,
+    "cap": 92.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 5416,
+    "cap": 65.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 12749,
+    "cap": 88.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-10-11": [
+   {
+    "attend": 7583,
+    "cap": 92.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 7512,
+    "cap": 92.0,
+    "n": 7,
+    "show": "860",
+    "sid": "547321",
+    "theatre": "Imperial"
+   },
+   {
+    "attend": 3309,
+    "cap": 100.0,
+    "n": 3,
+    "show": "A FEW GOOD MEN 2026",
+    "sid": "547369",
+    "theatre": "Vivian Beaumont"
+   },
+   {
+    "attend": 12684,
+    "cap": 92.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 8264,
+    "cap": 98.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 8738,
+    "cap": 101.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7347,
+    "cap": 100.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10750,
+    "cap": 101.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 12855,
+    "cap": 99.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5616,
+    "cap": 102.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 7212,
+    "cap": 93.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 11048,
+    "cap": 100.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 7149,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 6084,
+    "cap": 96.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 7792,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OTHER DESERT CITIES 2026",
+    "sid": "547027",
+    "theatre": "Hudson"
+   },
+   {
+    "attend": 9141,
+    "cap": 97.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8685,
+    "cap": 94.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 4979,
+    "cap": 97.0,
+    "n": 8,
+    "show": "SCHOOL GIRLS; OR, THE AFRICAN MEAN GIRLS PLAY",
+    "sid": "546665",
+    "theatre": "Friedman"
+   },
+   {
+    "attend": 7156,
+    "cap": 87.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 9133,
+    "cap": 79.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 8258,
+    "cap": 97.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 11284,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 5260,
+    "cap": 90.0,
+    "n": 8,
+    "show": "THE IMAGINARY INVALID 2026",
+    "sid": "547555",
+    "theatre": "Todd Haimes"
+   },
+   {
+    "attend": 13263,
+    "cap": 98.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 11533,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 7784,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7492,
+    "cap": 95.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 6552,
+    "cap": 78.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 14033,
+    "cap": 97.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ],
+  "2026-10-18": [
+   {
+    "attend": 7894,
+    "cap": 96.0,
+    "n": 8,
+    "show": "& JULIET",
+    "sid": "534962",
+    "theatre": "Stephen Sondheim"
+   },
+   {
+    "attend": 8074,
+    "cap": 98.0,
+    "n": 7,
+    "show": "860",
+    "sid": "547321",
+    "theatre": "Imperial"
+   },
+   {
+    "attend": 7721,
+    "cap": 100.0,
+    "n": 7,
+    "show": "A FEW GOOD MEN 2026",
+    "sid": "547369",
+    "theatre": "Vivian Beaumont"
+   },
+   {
+    "attend": 12666,
+    "cap": 92.0,
+    "n": 8,
+    "show": "ALADDIN",
+    "sid": "495244",
+    "theatre": "New Amsterdam"
+   },
+   {
+    "attend": 8255,
+    "cap": 98.0,
+    "n": 8,
+    "show": "BUENA VISTA SOCIAL CLUB",
+    "sid": "540360",
+    "theatre": "Schoenfeld"
+   },
+   {
+    "attend": 8752,
+    "cap": 101.0,
+    "n": 8,
+    "show": "CHICAGO",
+    "sid": "4804",
+    "theatre": "Ambassador"
+   },
+   {
+    "attend": 7373,
+    "cap": 100.0,
+    "n": 8,
+    "show": "HADESTOWN",
+    "sid": "520711",
+    "theatre": "Walter Kerr"
+   },
+   {
+    "attend": 10729,
+    "cap": 101.0,
+    "n": 8,
+    "show": "HAMILTON",
+    "sid": "499521",
+    "theatre": "Richard Rodgers"
+   },
+   {
+    "attend": 12586,
+    "cap": 97.0,
+    "n": 8,
+    "show": "HARRY POTTER AND THE CURSED CHILD",
+    "sid": "514844",
+    "theatre": "Lyric"
+   },
+   {
+    "attend": 5675,
+    "cap": 103.0,
+    "n": 8,
+    "show": "JUST IN TIME",
+    "sid": "540608",
+    "theatre": "Circle In The Square"
+   },
+   {
+    "attend": 7016,
+    "cap": 90.0,
+    "n": 8,
+    "show": "MAYBE HAPPY ENDING",
+    "sid": "539781",
+    "theatre": "Belasco"
+   },
+   {
+    "attend": 11055,
+    "cap": 100.0,
+    "n": 8,
+    "show": "MJ",
+    "sid": "524797",
+    "theatre": "Neil Simon"
+   },
+   {
+    "attend": 7140,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OH, MARY!",
+    "sid": "539578",
+    "theatre": "Lyceum"
+   },
+   {
+    "attend": 6267,
+    "cap": 99.0,
+    "n": 8,
+    "show": "OPERATION MINCEMEAT: A NEW MUSICAL",
+    "sid": "540518",
+    "theatre": "Golden"
+   },
+   {
+    "attend": 7792,
+    "cap": 100.0,
+    "n": 8,
+    "show": "OTHER DESERT CITIES 2026",
+    "sid": "547027",
+    "theatre": "Hudson"
+   },
+   {
+    "attend": 9312,
+    "cap": 99.0,
+    "n": 8,
+    "show": "PARANORMAL ACTIVITY",
+    "sid": "546939",
+    "theatre": "August Wilson"
+   },
+   {
+    "attend": 8596,
+    "cap": 93.0,
+    "n": 8,
+    "show": "SCHMIGADOON!",
+    "sid": "544008",
+    "theatre": "Nederlander"
+   },
+   {
+    "attend": 4950,
+    "cap": 96.0,
+    "n": 8,
+    "show": "SCHOOL GIRLS; OR, THE AFRICAN MEAN GIRLS PLAY",
+    "sid": "546665",
+    "theatre": "Friedman"
+   },
+   {
+    "attend": 7050,
+    "cap": 85.0,
+    "n": 8,
+    "show": "SIX: THE MUSICAL",
+    "sid": "523485",
+    "theatre": "Lena Horne"
+   },
+   {
+    "attend": 9494,
+    "cap": 74.0,
+    "n": 8,
+    "show": "STRANGER THINGS: THE FIRST SHADOW",
+    "sid": "540113",
+    "theatre": "Marquis"
+   },
+   {
+    "attend": 8349,
+    "cap": 98.0,
+    "n": 8,
+    "show": "THE BOOK OF MORMON",
+    "sid": "488721",
+    "theatre": "Eugene O'Neill"
+   },
+   {
+    "attend": 11030,
+    "cap": 93.0,
+    "n": 8,
+    "show": "THE GREAT GATSBY",
+    "sid": "538662",
+    "theatre": "Broadway"
+   },
+   {
+    "attend": 5293,
+    "cap": 90.0,
+    "n": 8,
+    "show": "THE IMAGINARY INVALID 2026",
+    "sid": "547555",
+    "theatre": "Todd Haimes"
+   },
+   {
+    "attend": 12819,
+    "cap": 94.0,
+    "n": 8,
+    "show": "THE LION KING",
+    "sid": "4761",
+    "theatre": "Minskoff"
+   },
+   {
+    "attend": 12040,
+    "cap": 94.0,
+    "n": 8,
+    "show": "THE LOST BOYS",
+    "sid": "544063",
+    "theatre": "Palace"
+   },
+   {
+    "attend": 7928,
+    "cap": 97.0,
+    "n": 8,
+    "show": "THE OUTSIDERS",
+    "sid": "537824",
+    "theatre": "Jacobs"
+   },
+   {
+    "attend": 7636,
+    "cap": 96.0,
+    "n": 8,
+    "show": "THE ROCKY HORROR SHOW 2026",
+    "sid": "544011",
+    "theatre": "Studio 54"
+   },
+   {
+    "attend": 6747,
+    "cap": 81.0,
+    "n": 8,
+    "show": "TWO STRANGERS (CARRY A CAKE ACROSS NEW YORK)",
+    "sid": "543518",
+    "theatre": "Longacre"
+   },
+   {
+    "attend": 5222,
+    "cap": 100.0,
+    "n": 5,
+    "show": "WANTED",
+    "sid": "546156",
+    "theatre": "James Earl Jones"
+   },
+   {
+    "attend": 13703,
+    "cap": 95.0,
+    "n": 8,
+    "show": "WICKED",
+    "sid": "13485",
+    "theatre": "Gershwin"
+   }
+  ]
+ }
+}

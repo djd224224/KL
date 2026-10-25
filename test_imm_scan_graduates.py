@@ -13,12 +13,13 @@ M = imm.IncentiveMarketMaker
 class ScanGraduateTests(unittest.TestCase):
 
     def test_graduates_are_allowed_and_not_blocked(self):
-        self.assertEqual(len(imm.SCAN_GRADUATE_SERIES), 83)
+        # the 83 of 10/03, and KXSOFTWAREUNEMP (Jack 2026-10-25: "Enroll this too")
+        self.assertEqual(len(imm.SCAN_GRADUATE_SERIES), 84)
         for s in sorted(imm.SCAN_GRADUATE_SERIES):
             self.assertTrue(M._allowed(f"{s}-X"), s)
             self.assertFalse(M._blocked(f"{s}-X"), s)
         for s in ("KXTRUMPENDORSEMENTS", "KXSUEZWEEKLY", "KXORBOFHARVEST",
-                  "KXCFNAI", "KXNYCSUBWAY", "KXWYCOAL", "KXOER"):
+                  "KXCFNAI", "KXNYCSUBWAY", "KXWYCOAL", "KXOER", "KXSOFTWAREUNEMP"):
             self.assertTrue(imm.scan_graduate_series(s), s)
 
     def test_the_scan_losers_stay_out_of_the_normal_book(self):

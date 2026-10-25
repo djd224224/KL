@@ -256,6 +256,9 @@ def setUpModule():
     # the 2026-10-22 ski-resort snowfall gate (TestResortSnowGate deletes it)
     imm.RESORT_SNOW_FILE = os.path.join(tmp, "resort_snow_fair.json")
     imm._resort_snow_state.update(mtime=0.0, markets={}, events={}, mapped={})
+    # the 2026-10-25 Broadway gate (TestBwayFairGate deletes it)
+    imm.BWAY_FAIR_FILE = os.path.join(tmp, "bway_fair.json")
+    imm._bway_fair_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -12919,6 +12922,84 @@ class TestResortSnowGate(unittest.TestCase):
         self.assertIn(self.T, bot.state.selected)
 
 
+class TestBwayFairGate(unittest.TestCase):
+    """bway_fair.json -> load_bway_fair / bway_fair_gate -> KXBWAYATTENDANCEW,
+    Broadway's weekly attendance (Jack 2026-10-25: "Yes enroll it"):
+    allowed only through the gate, failing closed, a touch more than 10c
+    through the fair caps that side; x1 at the live 150 cap, out of the
+    base-size split test; out as each week's Sunday starts (its ticker
+    date). And KXSOFTWAREUNEMP ("Enroll this too") joins the jobs graduates."""
+
+    T = "KXBWAYATTENDANCEW-26NOV01-A260000"
+    _bump = 1
+
+    def setUp(self):
+        imm._bway_fair_state.update(mtime=0.0, markets={}, events={})
+        try:
+            os.remove(imm.BWAY_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        try:
+            os.remove(imm.BWAY_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+
+    def _write(self, p=0.62, at=None):
+        at = at or datetime.now(timezone.utc)
+        with open(imm.BWAY_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": "KXBWAYATTENDANCEW-26NOV01", "p": p,
+                                            "fetched_at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                            "strike": 260000}}}, f)
+        os.utime(imm.BWAY_FAIR_FILE, (time.time(), time.time() + self._bump))
+        TestBwayFairGate._bump += 1
+        return imm.load_bway_fair()
+
+    def test_enrollment_size_and_cutoff(self):
+        s = "KXBWAYATTENDANCEW"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            a = imm.IncentiveMarketMaker._allowed
+            self.assertTrue(imm.bway_fair_series(s))
+            self.assertTrue(a(self.T))
+            self.assertEqual(imm.fair_gate_of(s), "broadway")
+            with mock.patch.object(imm, "BWAY_FAIR_ENABLE", False):
+                self.assertFalse(a(self.T))
+                self.assertEqual(imm.fair_gate_of(s), "")
+            # Jack 2026-10-25: "Enroll this too" -- a jobs graduate
+            self.assertTrue(a("KXSOFTWAREUNEMP-28JAN01-T3.0"))
+            self.assertTrue(imm.scan_graduate_series("KXSOFTWAREUNEMP"))
+        self.assertEqual(imm.series_max_position(s), 150)
+        self.assertEqual(imm.series_levels(s), imm.LEVELS)              # x1
+        self.assertIsNone(imm.size_test_arm(s))                         # out of the split test
+        self.assertEqual(imm.trade_cutoff_utc("KXBWAYATTENDANCEW-26NOV01", None, None),
+                         imm.ET.localize(datetime(2026, 11, 1)).astimezone(timezone.utc))
+        for k in ("BWAY_FAIR_ENABLE", "BWAY_FAIR_TOL_CENTS", "BWAY_FAIR_TTL_MIN",
+                  "BWAY_FAIR_CAP", "BWAY_FAIR_MAX_POSITION"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        import imm_risk_controls
+        self.assertIn("bway_fair", imm_risk_controls.GATE_GUARDS)
+
+    def test_gate_fails_closed_and_caps_the_side_through_the_fair(self):
+        g = imm.bway_fair_gate
+        why, inp, caps = g(self.T, time.time(), 55, 70)
+        self.assertEqual((why, inp["reason"], caps),
+                         ("no Broadway fair for this market", "no_read", None))
+        self.assertEqual(self._write(), 1)
+        self.assertEqual(g(self.T, time.time(), 55, 70), ("", {}, None))
+        self.assertEqual(imm.fair_file_gate("KXBWAYATTENDANCEW", self.T, time.time(), 55, 70),
+                         ("bway-fair", "", {}, None))
+        self.assertEqual(g(self.T, time.time() + imm.BWAY_FAIR_TTL_MIN * 60 + 5,
+                           55, 70)[1]["reason"], "stale")
+        # a wide 2c / 96c book fights nothing: joined
+        self.assertEqual(g(self.T, time.time(), 2, 96), ("", {}, None))
+        # a bid at 75 pays over 62 + 10: capped at 72 (the ask floor 52)
+        why, inp, caps = g(self.T, time.time(), 75, 80)
+        self.assertEqual((why, inp["reason"], inp["bid_bad"], caps), ("", "band", True, (72, 52)))
+        # an ask at 50 sells under 62 - 10
+        self.assertTrue(g(self.T, time.time(), 40, 50)[1]["ask_bad"])
+
+
 class TestCpiFairGate(unittest.TestCase):
     """cpi_fair.json -> load_cpi_fair / cpi_fair_gate -> the CPI pilot's core
     markets (Jack 2026-10-11: "build the KXRT, CPI, KXRAINWKND models"): the
@@ -25317,12 +25398,13 @@ class TestSignedFairReads(unittest.TestCase):
         monthly rain, monthly snow, GasBuddy, daily rain (its city
         discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11),
         Rotten Tomatoes (2026-10-12), ski-resort snowfall (2026-10-22), low
-        and high temperature (2026-10-23) refreshers each build a reader with fair_reader() and pass it to
-        their module's write_fair_file (the threads live inside run(), so
-        read its source)."""
+        and high temperature (2026-10-23) and Broadway attendance
+        (2026-10-25) refreshers each build a reader with fair_reader() and
+        pass it to their module's write_fair_file (the threads live inside
+        run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 13)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 14)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -25335,7 +25417,8 @@ class TestSignedFairReads(unittest.TestCase):
                           ("rt_fair", "RT_FAIR_FILE"),
                           ("resort_snow_fair", "RESORT_SNOW_FILE"),
                           ("lowt_fair", "LOWT_FAIR_FILE"),
-                          ("hight_fair", "HIGHT_FAIR_FILE")):
+                          ("hight_fair", "HIGHT_FAIR_FILE"),
+                          ("bway_fair", "BWAY_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)

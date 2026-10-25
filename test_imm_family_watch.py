@@ -951,8 +951,77 @@ class TestQuoteCalls(unittest.TestCase):
                       text)
         self.assertNotIn("call:", mcov.body([(shut["key"], shut, 0.0, True)])[1])
 
+    def test_calls_weigh_the_last_30_days(self):
+        """Jack 2026-10-25: "going forward consider the last 30 days as well
+        when making calls" -- on KXSOFTWAREUNEMP, called NOT YET for Econ &
+        rates' -$47 week though its month's quoting made +$588."""
+        from unittest import mock
 
-class TestModelCoveragePass(unittest.TestCase):
+        def call(rec):
+            with mock.patch.object(fw, "family_name", lambda s, c="": "Econ & rates"):
+                return fw.quote_call("new:KXSOFTWAREUNEMP",
+                                     {"est": 7.2, "est_total": 45.3, "frequency": "annual",
+                                      "what": "x", "fix": "your call"},
+                                     {"Econ & rates": rec})
+        week = {"rew": 309.0, "own": -356.0, "carried": -166.0, "quoting": -47.0,
+                "net": -213.0, "days30": 30}
+        # a losing week in a paying month, its rewards at the month's pace
+        c, why = call(dict(week, rew30=1200.0, own30=-612.0, carried30=-275.0,
+                           quoting30=588.0, net30=313.0))
+        self.assertEqual(c, "QUOTE WITH CARE")
+        self.assertEqual(why, "Econ & rates's own quoting lost $47 over the last 7 days "
+                              "(rewards +$309 vs its fills -$356), but made +$588 over 30 "
+                              "with its rewards at their pace: a bad week in a paying month "
+                              "-- quote small")
+        # ...a month paid by rewards since faded: no defence
+        c, why = call(dict(week, rew30=3000.0, own30=-2412.0, carried30=0.0,
+                           quoting30=588.0, net30=588.0))
+        self.assertEqual(c, "NOT YET")
+        self.assertIn("its 30 days paid +$588, but on rewards since faded to +$44/day "
+                      "from +$100/day", why)
+        # ...a losing month agrees
+        c, why = call(dict(week, rew30=900.0, own30=-1000.0, carried30=0.0,
+                           quoting30=-100.0, net30=-100.0))
+        self.assertEqual(c, "NOT YET")
+        self.assertTrue(why.endswith("and $100 over 30"), why)
+        # a paying week in a losing month: with care, not QUOTE
+        good = dict(week, own=-200.0, quoting=109.0, net=50.0)
+        c, why = call(dict(good, rew30=900.0, own30=-1000.0, carried30=0.0,
+                           quoting30=-100.0, net30=-100.0))
+        self.assertEqual(c, "QUOTE WITH CARE")
+        self.assertIn("a good week in a losing month", why)
+        # both pay: QUOTE, the month named
+        c, why = call(dict(good, rew30=1200.0, own30=-600.0, carried30=0.0,
+                           quoting30=600.0, net30=600.0))
+        self.assertEqual(c, "QUOTE")
+        self.assertIn("; 30 days +$600, its quoting +$600", why)
+        # a closed model gap waits only on a losing week the month does not make up
+        import imm_model_coverage as mcov
+        shut = mcov._gap("Monthly snow (snow_monthly_fair)", "KXTTNSNOWM-26DEC",
+                         ["KXTTNSNOWM-26DEC-12"], "closed", "no station", "add the city")
+        with mock.patch.object(fw, "family_name", lambda s, c="": "Econ & rates"):
+            paying = {"Econ & rates": dict(week, rew30=1200.0, own30=-612.0,
+                                           carried30=0.0, quoting30=588.0, net30=588.0)}
+            losing = {"Econ & rates": dict(week, rew30=900.0, own30=-1000.0,
+                                           carried30=0.0, quoting30=-100.0, net30=-100.0)}
+            self.assertEqual(fw.model_gap_call(shut, paying)[0], "QUOTE ONCE MODELED")
+            self.assertEqual(fw.model_gap_call(shut, losing)[0], "NOT YET")
+
+    def test_the_track_carries_the_month(self):
+        F = ["rew", "pnl", "cr", "cs"]
+
+        def row(rew, pnl):
+            return [rew, pnl, 0.0, 0.0]
+        days = {f"2026-09-{d:02d}": {"m": {"KXA-1": row(10.0, -2.0)}} for d in range(20, 31)}
+        days.update({f"2026-10-{d:02d}": {"m": {"KXA-1": row(10.0, -2.0)}}
+                     for d in range(1, 19)})
+        days["2026-09-21"]["m"]["KXB-1"] = row(5.0, 0.0)       # quiet for the last 7 days
+        D = {"day_fields": F, "markets": {"KXA-1": {"fam": "Elections"},
+                                          "KXB-1": {"fam": "Company KPIs"}}, "days": days}
+        t = fw.family_track(D, "2026-10-19")
+        self.assertEqual(set(t), {"Elections"})              # a family seen this week only
+        e = t["Elections"]
+        self.assertEqual((e["quoting"], e["quoting30"], e["days30"]), (56.0, 232.0, 29))
     """Pass 5 (Jack 2026-10-09: "ensure i get alerted"): gaps are emailed,
     and a failing pass is emailed too -- at most daily -- so it can never go
     quiet."""

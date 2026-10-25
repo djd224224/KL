@@ -486,9 +486,17 @@ def _fmt_et(ts: float) -> str:
 #      CALL_DAYS full days -- the portfolio email's What-to-do numbers:
 #      its own quoting loses -> NOT YET; the quoting pays but positions it
 #      held lost -> QUOTE WITH CARE; both pay -> QUOTE; nothing like it
-#      trades yet -> YOUR CALL.
+#      trades yet -> YOUR CALL. Each call also weighs the last
+#      CALL_LONG_DAYS (Jack 2026-10-25: "going forward consider the last 30
+#      days as well when making calls", the email's rule): a losing week in
+#      a month whose quoting pays, its rewards still at the month's pace, is
+#      QUOTE WITH CARE, not NOT YET (a month paid by rewards since faded is
+#      no defence); a paying week in a losing month is QUOTE WITH CARE, not
+#      QUOTE.
 # A call is advice: nothing here enrolls or blocks anything.
 CALL_DAYS = 7
+CALL_LONG_DAYS = 30
+CALL_MONTH_REW_SHARE = 0.5      # the week's reward pace >= this share of the month's
 CALL_SKIP_TOTAL = 10.0          # $ left in a new family's program: under this, SKIP
 OWNER_PREFIXES = (
     ("KXHIGH", "high_temp_trading.py (cloud) trades the KXHIGH dailies on this account"),
@@ -506,26 +514,43 @@ def family_track(D: Optional[dict], today: Optional[str] = None) -> Dict[str, di
     """dashboard family -> {"rew", "own", "carried", "quoting", "net"} over its
     last CALL_DAYS full ET days: rewards as modelled; own = the day's own
     fills, carried = the positions it already held, re-marked or settled
-    (the dashboard's cr / cs). {} without a dashboard."""
+    (the dashboard's cr / cs) -- and the same over the last CALL_LONG_DAYS
+    as "rew30", "own30", "carried30", "quoting30", "net30" ("days30" of
+    them). Only the families with a row in the CALL_DAYS. {} without a
+    dashboard."""
     if not D:
         return {}
     today = today or datetime.now(timezone.utc).astimezone(imm.ET).date().isoformat()
     try:
         ix = {f: i for i, f in enumerate(D["day_fields"])}
         mk = D.get("markets") or {}
+        days = sorted(x for x in (D.get("days") or {}) if x < today)
+        week, month = set(days[-CALL_DAYS:]), days[-CALL_LONG_DAYS:]
         out: Dict[str, dict] = {}
-        for d in sorted(x for x in (D.get("days") or {}) if x < today)[-CALL_DAYS:]:
+        for d in month:
             for t, v in ((D["days"].get(d) or {}).get("m") or {}).items():
                 fam = (mk.get(t) or {}).get("fam") or "Other"
-                o = out.setdefault(fam, {"rew": 0.0, "own": 0.0, "carried": 0.0})
+                o = out.setdefault(fam, {"rew": 0.0, "own": 0.0, "carried": 0.0,
+                                         "rew30": 0.0, "own30": 0.0, "carried30": 0.0,
+                                         "seen": False})
                 car = float(v[ix["cr"]] or 0.0) + float(v[ix["cs"]] or 0.0)
-                o["rew"] += float(v[ix["rew"]] or 0.0)
-                o["own"] += float(v[ix["pnl"]] or 0.0) - car
-                o["carried"] += car
+                rew = float(v[ix["rew"]] or 0.0)
+                own = float(v[ix["pnl"]] or 0.0) - car
+                o["rew30"] += rew
+                o["own30"] += own
+                o["carried30"] += car
+                if d in week:
+                    o["rew"] += rew
+                    o["own"] += own
+                    o["carried"] += car
+                    o["seen"] = True
         for o in out.values():
             o["quoting"] = o["rew"] + o["own"]
             o["net"] = o["quoting"] + o["carried"]
-        return out
+            o["quoting30"] = o["rew30"] + o["own30"]
+            o["net30"] = o["quoting30"] + o["carried30"]
+            o["days30"] = len(month)
+        return {f: o for f, o in out.items() if o.pop("seen")}
     except (KeyError, TypeError, ValueError, IndexError) as e:
         log(f"[WATCH] ! no family track record ({e!r})")
         return {}
@@ -568,7 +593,29 @@ def _usd(v: float) -> str:
 
 def _record(fam: str, r: dict) -> str:
     return (f"{fam}: {_usd(r['net'])} over the last {CALL_DAYS} days after rewards, "
-            f"its quoting {_usd(r['quoting'])}")
+            f"its quoting {_usd(r['quoting'])}" + _month(r))
+
+
+def _month(r: dict) -> str:
+    """"; 30 days +$X, its quoting +$Y" when the record has its month."""
+    if r.get("quoting30") is None:
+        return ""
+    return (f"; {r.get('days30', CALL_LONG_DAYS)} days {_usd(r['net30'])}, its quoting "
+            f"{_usd(r['quoting30'])}")
+
+
+def month_says(r: dict) -> str:
+    """What the last CALL_LONG_DAYS say about a losing week (the record's
+    7-day quoting < 0): "pays" -- the month's quoting pays and the week's
+    rewards still run at CALL_MONTH_REW_SHARE of its pace or more; "faded"
+    -- it pays, but on rewards that have since fallen off; "agrees" -- it
+    loses too, or there is no month on record."""
+    q30 = r.get("quoting30")
+    if q30 is None or q30 <= 0:
+        return "agrees"
+    pace7 = r["rew"] / CALL_DAYS
+    pace30 = r.get("rew30", 0.0) / max(1, r.get("days30") or CALL_LONG_DAYS)
+    return "pays" if pace7 >= CALL_MONTH_REW_SHARE * pace30 else "faded"
 
 
 def custom_insider_word(title: str) -> Optional[str]:
@@ -665,14 +712,30 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     if not rec:
         return ("YOUR CALL", "no track record: nothing like it trades yet"
                 + (f" in {fam}" if fam else ""))
+    week = (f"{fam}'s own quoting lost {_usd(rec['quoting'])[1:]} over the last "
+            f"{CALL_DAYS} days (rewards {_usd(rec['rew'])} vs its fills {_usd(rec['own'])})")
+    days30 = rec.get("days30", CALL_LONG_DAYS)
     if rec["quoting"] < 0:
-        return ("NOT YET", f"{fam}'s own quoting lost {_usd(rec['quoting'])[1:]} over the "
-                           f"last {CALL_DAYS} days (rewards {_usd(rec['rew'])} vs its fills "
-                           f"{_usd(rec['own'])})")
+        m = month_says(rec)
+        if m == "pays":
+            return ("QUOTE WITH CARE", f"{week}, but made {_usd(rec['quoting30'])} over "
+                                       f"{days30} with its rewards at their pace: a bad week "
+                                       f"in a paying month -- quote small")
+        if m == "faded":
+            return ("NOT YET", f"{week}; its {days30} days paid {_usd(rec['quoting30'])}, but "
+                               f"on rewards since faded to {_usd(rec['rew'] / CALL_DAYS)}/day "
+                               f"from {_usd(rec['rew30'] / max(1, days30))}/day")
+        return ("NOT YET", week + (f" and {_usd(rec['quoting30'])[1:]} over {days30}"
+                                   if rec.get("quoting30") is not None else ""))
     if rec["net"] < 0:
         return ("QUOTE WITH CARE", f"{fam}'s quoting pays ({_usd(rec['quoting'])}) but the "
                                    f"positions it held lost ({_usd(rec['carried'])}): quote "
-                                   f"small and watch the inventory")
+                                   f"small and watch the inventory" + _month(rec))
+    if rec.get("quoting30") is not None and rec["quoting30"] < 0:
+        return ("QUOTE WITH CARE", f"{fam}'s quoting made {_usd(rec['quoting'])} over the "
+                                   f"last {CALL_DAYS} days but lost "
+                                   f"{_usd(rec['quoting30'])[1:]} over {days30}: a good week "
+                                   f"in a losing month -- quote small")
     return ("QUOTE", f"it would join {_record(fam, rec)}")
 
 
@@ -684,9 +747,11 @@ def model_gap_call(g: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     rec = track.get(fam) if fam else None
     rec_txt = f" ({_record(fam, rec)})" if rec else ""
     if str(g.get("fail") or "").lower() == "closed":
-        if rec and rec["quoting"] < 0:
+        # a losing week the month makes up (month_says) does not hold it back
+        if rec and rec["quoting"] < 0 and month_says(rec) != "pays":
             return ("NOT YET", f"it sits dark until modeled, and {fam}'s own quoting lost "
-                               f"{_usd(rec['quoting'])[1:]} over the last {CALL_DAYS} days")
+                               f"{_usd(rec['quoting'])[1:]} over the last {CALL_DAYS} days"
+                               + _month(rec))
         return ("QUOTE ONCE MODELED", "it sits dark until the model has it: make the fix"
                 + rec_txt)
     return ("QUOTE WITH CARE", "the bot quotes it now without the model's protection: "
