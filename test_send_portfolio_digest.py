@@ -1120,6 +1120,75 @@ def _dash(bad_week=True, generated=None):
             else pf.ET.localize(pf.datetime(2026, 10, 19, 6, 55)).timestamp()}
 
 
+LINE_TITLES = {"KXVENUEPERFORM-REDROCKS28JAN01": "Who Will Perform at Red Rocks in 2027?",
+               "KXMLBALCSMVP-26": "ALCS MVP Winner",
+               "KXHIGHAA-26OCT19": "Highest temperature in Aa on Oct 19, 2026?",
+               "KXHIGHBB-26OCT19": "Highest temperature in Bb on Oct 19, 2026?",
+               "KXHIGHCC-26OCT19": "Highest temperature in Cc on Oct 19, 2026?",
+               "KXTM-9": "What will Trump say at the rally?"}
+
+
+def _lines_dash():
+    """_dash() plus the lines below the family (Jack 2026-10-25: "How about
+    mlb, red rocks, etc? ... where to double down ... new
+    families/series/events"), all in the 14 full days 10/05-10/18:
+      MLB (Sports & awards): the ALCS MVP quoted 10/05-10/15, its fills
+        -$40 on 10/13 and 10/14, then decided (not quoted); the World Series
+        MVP +$6/day, -$10 held on 10/18; KXMLBSERIESHR new on 10/17.
+      Sports & venues: Red Rocks +$3/day rewards, -$1/day fills; Gillette
+        held +$20 on 10/10, not quoted.
+      Highest temperature in Aa / Bb / Cc: three series new on 10/16, +$4/day
+        each -> one new line.
+      KXTM-9: a new event of the running KXTM, +$30/day from 10/16.
+      KXNFLLADDERREC (Sports ladders): +$100/day to 10/11, +$1 on 10/12,
+        then nothing quoted -> IDLE.
+      KXFADE (Other prints): +$20/day rewards to 10/11, +$1/day since ->
+        rewards faded.
+      KXTINY (Other prints): +$0.20/day -> one of the smaller lines."""
+    d = _dash()
+    mk = d["markets"]
+    sp = {"fam": "Sports & awards", "grp": "Sports & venues"}
+    mk["KXMLBALCSMVP-26-X"] = dict(sp, ser="KXMLBALCSMVP", ev="KXMLBALCSMVP-26", sel=False)
+    mk["KXMLBWSMVP-26-Y"] = dict(sp, ser="KXMLBWSMVP", ev="KXMLBWSMVP-26", sel=True)
+    mk["KXMLBSERIESHR-26-P"] = dict(sp, ser="KXMLBSERIESHR", ev="KXMLBSERIESHR-26", sel=True)
+    mk["KXVENUEPERFORM-REDROCKS28JAN01-A"] = dict(sp, ser="KXVENUEPERFORM",
+                                                  ev="KXVENUEPERFORM-REDROCKS28JAN01", sel=True)
+    mk["KXVENUEPERFORM-GILLETTE27JAN01-A"] = dict(sp, ser="KXVENUEPERFORM",
+                                                  ev="KXVENUEPERFORM-GILLETTE27JAN01", sel=False)
+    for c in ("AA", "BB", "CC"):
+        mk[f"KXHIGH{c}-26OCT19-B70"] = {"fam": "Weather & quakes", "grp": f"KXHIGH{c}",
+                                        "ser": f"KXHIGH{c}", "ev": f"KXHIGH{c}-26OCT19",
+                                        "sel": True}
+    mk["KXTM-9-A"] = {"fam": "TRUMP mentions", "ser": "KXTM", "ev": "KXTM-9", "sel": True}
+    mk["KXNFLLADDERREC-1-A"] = {"fam": "Sports & awards", "grp": "Sports ladders",
+                                "ser": "KXNFLLADDERREC", "ev": "KXNFLLADDERREC-1", "sel": False}
+    mk["KXFADE-1-A"] = {"fam": "Other prints", "ser": "KXFADE", "ev": "KXFADE-1", "sel": True}
+    mk["KXTINY-1-A"] = {"fam": "Other prints", "ser": "KXTINY", "ev": "KXTINY-1", "sel": True}
+    for day, v in d["days"].items():
+        if day == "2026-10-19":
+            continue
+        m = v["m"]
+        if day <= "2026-10-15":
+            m["KXMLBALCSMVP-26-X"] = _drow(rew=5.0, pnl=-40.0 if day in ("2026-10-13",
+                                                                         "2026-10-14") else 0.0)
+        m["KXMLBWSMVP-26-Y"] = _drow(rew=6.0, pnl=-10.0 if day == "2026-10-18" else 0.0,
+                                     cr=-10.0 if day == "2026-10-18" else 0.0)
+        if day >= "2026-10-17":
+            m["KXMLBSERIESHR-26-P"] = _drow(rew=2.0, pnl=-5.0 if day == "2026-10-18" else 0.0)
+        m["KXVENUEPERFORM-REDROCKS28JAN01-A"] = _drow(rew=3.0, pnl=-1.0)
+        if day == "2026-10-10":
+            m["KXVENUEPERFORM-GILLETTE27JAN01-A"] = _drow(pnl=20.0, cr=20.0)
+        if day >= "2026-10-16":
+            for c in ("AA", "BB", "CC"):
+                m[f"KXHIGH{c}-26OCT19-B70"] = _drow(rew=4.0)
+            m["KXTM-9-A"] = _drow(rew=30.0)
+        if day <= "2026-10-12":
+            m["KXNFLLADDERREC-1-A"] = _drow(rew=100.0 if day < "2026-10-12" else 1.0)
+        m["KXFADE-1-A"] = _drow(rew=20.0 if day < "2026-10-12" else 1.0)
+        m["KXTINY-1-A"] = _drow(rew=0.2)
+    return d
+
+
 class AdviceTests(unittest.TestCase):
     """Jack 2026-10-19: "In daily portfolio digest email, share
     recommendations on what I should do based on prior day trading
@@ -1171,6 +1240,14 @@ class AdviceTests(unittest.TestCase):
         self.assertEqual(verbs[:4], ["SHRINK", "PAUSE", "SHRINK", "SHRINK"])
         # one losing series alone is the series rule's, not a family line
         self.assertFalse([t for v, t in recs if t.startswith("the Sports & awards family")])
+        # the shrunk event is noted on its line, which keeps its own call and
+        # is not doubled while one of its events is cut
+        row = [r for f in adv["lines"] for r in f["rows"]
+               if r["name"] == "KXTM -- What will Trump say on Sunday?"][0]
+        self.assertEqual(row["call"], "KEEP")
+        self.assertTrue(row["why"].endswith("; SHRINK the event What will Trump say on Sunday? "
+                                            "(see the recommendations)"), row["why"])
+        self.assertNotIn("DOUBLE DOWN", verbs)
         # an event up over its week: one bad day, unless its family's own
         # one-bad-day line already says so
         d["days"]["2026-10-17"]["m"]["KXTM-2-A"] = _drow(rew=100.0)
@@ -1227,7 +1304,8 @@ class AdviceTests(unittest.TestCase):
     def test_recommendations_each_with_their_why(self):
         recs = pf.imm_advice(_dash(), "2026-10-19")["recs"]
         self.assertEqual([v for v, _ in recs],
-                         ["PAUSE", "SHRINK", "TRIM", "HOLD", "NO CHANGE", "NO CHANGE", "KEEP"])
+                         ["PAUSE", "SHRINK", "TRIM", "HOLD", "NO CHANGE", "NO CHANGE",
+                          "DOUBLE DOWN", "KEEP"])
         txt = dict(enumerate(t for _, t in recs))
         # persistent quoting losses on live series, worst first, with how they lost
         self.assertEqual(txt[0], "KXBIG (Sports & awards). Why: its quoting lost -$175 over "
@@ -1253,12 +1331,32 @@ class AdviceTests(unittest.TestCase):
                                  "positions $0), but no series in it is losing day after "
                                  "day; the biggest: KXONE -$115 (over); 14 days +$235; "
                                  "yesterday +$5.")
-        self.assertEqual(txt[6], "TRUMP mentions +$280 over 7 days (14 days +$630). Why: "
+        # a line earning every day with light fills: x1.5 by the size study
+        # (Jack 2026-10-25: "give suggestions on where to double down")
+        self.assertEqual(txt[6], "KXTM, TRUMP mentions: x1.5. Why: its quoting was up on 7 of "
+                                 "the 7 days (+$280, net +$280) and it made +$630 over 14, "
+                                 "earning on 14 of them. Its fills and held positions came to "
+                                 "-$70 over the 7 days and -$70 over 14, against rewards +$350 "
+                                 "and +$700: light enough that x1.5 adds about +$7 a day "
+                                 "earning at either pace (the 10/11 size study: rewards +23%, "
+                                 "fill losses +44%).")
+        self.assertEqual(txt[7], "TRUMP mentions +$280 over 7 days (14 days +$630). Why: "
                                  "their rewards cover their fills.")
 
     def test_context_and_basis(self):
         adv = pf.imm_advice(_dash(), "2026-10-19")
-        self.assertTrue(adv["context"][-1].startswith("Week over week: -$126 vs +$2,450"))
+        self.assertTrue(adv["context"][-2].startswith("Week over week: -$126 vs +$2,450"))
+        # a DOUBLE DOWN names the size tests still running...
+        self.assertEqual(adv["context"][-1],
+                         "Before doubling down: the base-size split test runs half the series "
+                         "at x1.5 from 10/26 to 11/08 and will measure x1.5 book-wide; the side "
+                         "leans and the long-shot cut report on 11/05.")
+        # ... each through its last day
+        ctx = pf.imm_advice(_dash(), "2026-11-06")["context"]
+        self.assertIn("Before doubling down: the base-size split test runs half the series "
+                      "at x1.5 from 10/26 to 11/08 and will measure x1.5 book-wide.", ctx)
+        ctx = pf.imm_advice(_dash(), "2026-11-09")["context"]
+        self.assertFalse([t for t in ctx if t.startswith("Before doubling down")])
         self.assertIn("7 full ET days 10/12-10/18 and the 14 from 10/05", adv["basis"])
         self.assertNotIn("partial", adv["basis"])
         # yesterday's rewards well under the week's: say where they fell
@@ -1285,8 +1383,22 @@ class AdviceTests(unittest.TestCase):
     def test_a_quiet_week_says_no_changes(self):
         adv = pf.imm_advice(_dash(bad_week=False), "2026-10-19")
         verbs = [v for v, _ in adv["recs"]]
-        self.assertEqual(verbs[0], "NO CHANGES")
+        # nothing to cut, two lines to double down
+        self.assertEqual(verbs, ["NO CUTS", "DOUBLE DOWN", "DOUBLE DOWN", "KEEP"])
         self.assertNotIn("PAUSE", verbs)
+        # fills that would grow faster than the rewards: no double down,
+        # and the block says the bar was looked at
+        d = _dash(bad_week=False)
+        for k, v in d["days"].items():
+            if k >= "2026-10-12":
+                v["m"] = {"KXTM-1-A": _drow(rew=50.0, pnl=-30.0), "KXAI-1-A": _drow(rew=20.0,
+                                                                                   pnl=-15.0)}
+        adv2 = pf.imm_advice(d, "2026-10-19")
+        self.assertEqual([v for v, _ in adv2["recs"]][:1], ["NO CHANGES"])
+        self.assertNotIn("DOUBLE DOWN", [v for v, _ in adv2["recs"]])
+        self.assertIn("Double down: no line clears the bar today. Size pays only where fills "
+                      "stay light next to the rewards (fill losses grow about 0.90 per unit of "
+                      "size, rewards 0.51).", adv2["context"])
         # +$60, the lowest of 14 days but a gain: below the median, not an alarm
         self.assertIn("Below the median: 0 of the last 14 days were worse (median +$205)",
                       adv["headline"])
@@ -1328,6 +1440,180 @@ class AdviceTests(unittest.TestCase):
         self.assertIn("What to do: unavailable (no file)", html)
         _, text, html = pf.build_email(p, [], chart_ok=False)
         self.assertNotIn("What to do", text + html)
+
+
+class AdviceLinesTests(unittest.TestCase):
+    """Below the family (Jack 2026-10-25: "How about mlb, red rocks, etc?
+    Also give suggestions on where to double down. Also explicitly callout
+    performance of any new families/series/events that were added")."""
+
+    def setUp(self):
+        from unittest import mock
+        p = mock.patch.object(pf, "load_event_titles", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_lines_are_leagues_groups_or_series(self):
+        fam = dict.fromkeys(("KXMLBALCSMVP", "KXMLBWSMVP", "KXNFLLADDERREC", "KXNFLPASSYDSH2H",
+                             "KXVENUEPERFORM", "KXLOLAWARD"), "Sports & awards")
+        fam.update(dict.fromkeys(("KXHIGHAA", "KXHIGHBB", "KXHIGHCC", "KXLOWTAA", "KXLOWTBB"),
+                                 "Weather & quakes"))
+        fam.update({"KXCPI": "Econ & rates", "KXNFLXAPP": "Carbon Arc consumer"})
+        grp = {"KXMLBALCSMVP": "Sports & venues", "KXMLBWSMVP": "Sports & venues",
+               "KXNFLLADDERREC": "Sports ladders", "KXNFLPASSYDSH2H": "Sports & venues",
+               "KXVENUEPERFORM": "Sports & venues", "KXLOLAWARD": "KXLOLAWARD",
+               "KXCPI": "CPI & inflation", "KXNFLXAPP": "*APP app charts"}
+        title = {f"KXHIGH{c}": f"Highest temperature in {c.title()} on Oct 19, 2026?"
+                 for c in ("AA", "BB", "CC")}
+        title.update({f"KXLOWT{c}": f"Lowest temperature in {c.title()} on Oct 19, 2026?"
+                      for c in ("AA", "BB")})
+        out = pf.advice_lines(fam, grp, title)
+        sp = "Sports & awards"
+        self.assertEqual([out[s] for s in ("KXMLBALCSMVP", "KXMLBWSMVP", "KXNFLPASSYDSH2H",
+                                           "KXLOLAWARD", "KXNFLLADDERREC", "KXVENUEPERFORM")],
+                         [(sp, "MLB"), (sp, "MLB"), (sp, "NFL"), (sp, "LoL"),
+                          (sp, "Sports ladders"), (sp, "Sports & venues")])
+        # a league is a Sports & awards one: Netflix app downloads are Carbon Arc's
+        self.assertEqual(out["KXNFLXAPP"], ("Carbon Arc consumer", "*APP app charts"))
+        self.assertEqual(out["KXCPI"], ("Econ & rates", "CPI & inflation"))
+        # three single series whose titles open alike make one line; two do not
+        self.assertEqual({out[f"KXHIGH{c}"] for c in ("AA", "BB", "CC")},
+                         {("Weather & quakes", "Highest temperature in ...")})
+        self.assertEqual(out["KXLOWTAA"], ("Weather & quakes", "KXLOWTAA"))
+
+    def test_common_title(self):
+        ct = pf._common_title
+        self.assertEqual(ct(["Trump's approval rating on Oct 30, 2026?",
+                             "Trump's approval rating on Oct 23, 2026?"]), "Trump's approval rating")
+        self.assertEqual(ct(["Trump Truth Social posts this week? (10/18-10/24)",
+                             "Trump Truth Social posts this week? (10/11-10/17)"]),
+                         "Trump Truth Social posts this week?")
+        self.assertEqual(ct(["What will Trump say during his rally in Waco, Texas?",
+                             "What will Trump say during his roundtable?"]), "What will Trump say")
+        self.assertEqual(ct(["Wicker - Rotten Tomatoes score",
+                             "The Mongoose - Rotten Tomatoes score"]), "")
+        self.assertEqual(ct(["Will it rain in Ontario?", "Will it snow in Ontario?"]), "")
+        self.assertEqual(ct(["ALCS MVP Winner", ""]), "ALCS MVP Winner")
+        self.assertEqual(ct([]), "")
+
+    def test_double_down_needs_light_fills_at_both_paces(self):
+        dd = [t for v, t in pf.imm_advice(_dash(), "2026-10-19")["recs"] if v == "DOUBLE DOWN"]
+        self.assertEqual(len(dd), 1)
+        self.assertTrue(dd[0].startswith("KXTM, TRUMP mentions: x1.5."))
+        # fills this week heavy enough that x1.5 grows them faster than the
+        # rewards: no, though the line is up every day and the month passes
+        d = _dash()
+        for k in ("2026-10-16", "2026-10-17", "2026-10-18"):
+            d["days"][k]["m"]["KXTM-1-A"] = _drow(rew=50.0, pnl=-45.0)
+        self.assertNotIn("DOUBLE DOWN", [v for v, _ in pf.imm_advice(d, "2026-10-19")["recs"]])
+        # rewards faded this week: last month's pace is no reason
+        d = _dash()
+        for k, v in d["days"].items():
+            if "2026-10-12" <= k <= "2026-10-18":
+                v["m"]["KXTM-1-A"] = _drow(rew=8.0)
+        self.assertNotIn("DOUBLE DOWN", [v for v, _ in pf.imm_advice(d, "2026-10-19")["recs"]])
+        # not quoted now and not earning yesterday: no
+        d = _dash()
+        d["markets"]["KXTM-1-A"]["sel"] = False
+        d["days"]["2026-10-18"]["m"]["KXTM-1-A"] = _drow()
+        self.assertNotIn("DOUBLE DOWN", [v for v, _ in pf.imm_advice(d, "2026-10-19")["recs"]])
+
+    def test_new_this_week(self):
+        adv = pf.imm_advice(_lines_dash(), "2026-10-19", titles=LINE_TITLES)
+        self.assertEqual(adv["new_head"], "4 series first seen Mon 10/12-Sun 10/18 (1 new line): "
+                                          "+$35 so far (rewards +$40, fills -$5, held $0).")
+        self.assertEqual(adv["new"], [
+            "Highest temperature in ... (3 series), Weather & quakes, from Fri 10/16: +$36 so "
+            "far -- rewards +$36, fills $0: earning, the rewards cover the fills; yesterday +$12.",
+            "the event What will Trump say at the rally? (KXTM-9), TRUMP mentions / KXTM, from "
+            "Fri 10/16: +$90 so far -- rewards +$90, fills $0: earning, the rewards cover the "
+            "fills.",
+            "KXMLBSERIESHR, Sports & awards / MLB, from Sat 10/17: -$1 so far -- rewards +$4, "
+            "fills -$5: the fills outrun the rewards."])
+        # past the cap: the rest in one line
+        from unittest import mock
+        with mock.patch.object(pf, "ADVICE_MAX_NEW", 2):
+            new = pf.imm_advice(_lines_dash(), "2026-10-19", titles=LINE_TITLES)["new"]
+        self.assertEqual(new[2], "1 more, together -$1 (rewards +$4, fills -$5: the fills "
+                                 "outrun the rewards).")
+        # a series listing events week after week: its new one is routine
+        d = _lines_dash()
+        for k in range(3):
+            d["markets"][f"KXTM-{k + 5}-A"] = {"fam": "TRUMP mentions", "ser": "KXTM",
+                                               "ev": f"KXTM-{k + 5}", "sel": False}
+            d["days"][f"2026-10-0{k + 5}"]["m"][f"KXTM-{k + 5}-A"] = _drow(rew=1.0)
+        new = pf.imm_advice(d, "2026-10-19", titles=LINE_TITLES)["new"]
+        self.assertFalse([t for t in new if "KXTM-9" in t])
+        # nothing new: no section
+        adv = pf.imm_advice(_dash(), "2026-10-19")
+        self.assertEqual((adv["new"], adv["new_head"]), ([], ""))
+        self.assertNotIn("New this week", "\n".join(pf.advice_text(adv)))
+
+    def test_every_line_has_a_call_and_its_why(self):
+        adv = pf.imm_advice(_lines_dash(), "2026-10-19", titles=LINE_TITLES)
+        fams = {f["fam"]: f for f in adv["lines"]}
+        rows = {r["name"]: r for f in adv["lines"] for r in f["rows"]}
+        # MLB: down on the week, but the loss was the ALCS MVP, not quoted now
+        mlb = rows["MLB (3 series)"]
+        self.assertEqual((mlb["call"], round(mlb["y"]), round(mlb["w"]), round(mlb["l"])),
+                         ("WATCH", -7, -29, 48))
+        self.assertEqual(mlb["why"], "ALCS MVP Winner (not quoted now) -$60: fills -$80 against "
+                                     "rewards +$20; the markets still quoted +$31 (held "
+                                     "positions -$10, quoting +$41)")
+        # Red Rocks: its group's line, named by its biggest event
+        rr = rows["Sports & venues (KXVENUEPERFORM)"]
+        self.assertEqual((rr["call"], rr["why"]),
+                         ("KEEP", "rewards +$42 against fills -$14 over 14 days; biggest: Who "
+                                  "Will Perform at Red Rocks in 2027? +$14: fills -$7 against "
+                                  "rewards +$21"))
+        self.assertEqual((rows["Sports ladders (KXNFLLADDERREC)"]["call"],
+                          rows["Sports ladders (KXNFLLADDERREC)"]["why"]),
+                         ("IDLE", "nothing quoted now, last earned Mon 10/12; fills $0 against "
+                                  "rewards +$1"))
+        self.assertEqual(rows["KXFADE"]["call"], "WATCH")
+        self.assertTrue(rows["KXFADE"]["why"].startswith(
+            "rewards faded to +$1/day over the 7 days from +$10/day over 14; "))
+        # the recommendations' calls carry over
+        self.assertEqual(rows["KXTM -- What will Trump say at the rally?"]["call"], "DOUBLE DOWN")
+        self.assertEqual(rows["KXBIG"]["call"], "PAUSE")
+        self.assertEqual(rows["Highest temperature in ... (3 series)"]["call"], "NEW")
+        # a family's lines add up to it; the small ones in one row
+        sports = fams["Sports & awards"]
+        self.assertEqual((round(sports["y"]), round(sports["w"]), round(sports["l"])),
+                         (-30, -189, 972))
+        self.assertEqual(fams["Other prints"]["rest"][0], 1)
+        self.assertEqual([f["fam"] for f in adv["lines"]], sorted(fams))
+
+    def test_every_line_renders_last_in_the_email(self):
+        adv = pf.imm_advice(_lines_dash(), "2026-10-19", titles=LINE_TITLES)
+        txt = pf.advice_lines_text(adv)
+        "\n".join(txt).encode("ascii")                    # the task console is cp1252
+        self.assertEqual(txt[0], "Every line, yesterday / 7 days / 14 days (the IMM book; "
+                                 "What to do's calls):")
+        self.assertIn("  Sports & awards: -$30 / -$189 / +$972", txt)
+        self.assertIn("    - MLB (3 series): -$7 / -$29 / +$48. WATCH: ALCS MVP Winner (not "
+                      "quoted now) -$60: fills -$80 against rewards +$20; the markets still "
+                      "quoted +$31 (held positions -$10, quoting +$41).", txt)
+        self.assertIn("    - 1 smaller line: $0 / +$1 / +$3", txt)
+        html = pf.advice_lines_html(adv)
+        self.assertIn(">Every line</div>", html)
+        self.assertIn(f'<b style="color:{pf.C_POS}">DOUBLE DOWN</b>', html)
+        self.assertIn("Sports &amp; venues (KXVENUEPERFORM)", html)
+        self.assertIn(">14 days</th>", html)
+        self.assertEqual(pf.advice_lines_html({"error": "x"}), "")
+        self.assertEqual(pf.advice_lines_text(None), [])
+        block = pf.advice_html(adv)
+        self.assertIn(">New this week</div>", block)
+        self.assertIn("Every line (MLB, Red Rocks, ...): at the end of this email.", block)
+        # the email ends with it, after the movers
+        p = BuildEmailTests()._pf()
+        _, text, html = pf.build_email(p, [], chart_ok=True, advice=adv)
+        self.assertIn("  New this week: 4 series first seen", text)
+        self.assertGreater(text.index("Every line, yesterday"), text.index("Biggest movers"))
+        self.assertGreater(html.index(">Every line</div>"), html.index("Biggest movers"))
+        self.assertTrue(text.rstrip().endswith("+$12 / +$36 / +$36. NEW: from Fri 10/16: rewards "
+                                               "+$36, fills $0: earning, the rewards cover the "
+                                               "fills."), text[-300:])
 
 
 class DayByBotTests(unittest.TestCase):
