@@ -9067,25 +9067,40 @@ if GAS_TRIAL_BLACKOUT_ET:
 #     contracts, makers -$138 to +$25.3k on trading (27 strikes still
 #     undecided at the close, bounded both ways) against ~$88k of pool;
 #     decided strikes 16-24 ET +$6.6k on 847k contracts.
-# So the family quotes PLAIN (no GasBuddy gate: the market out-forecasts it)
-# and under five stops of its own:
+# SMALL FIRST (Jack 2026-10-26: "Run a smaller test first, not 51 markets
+# that are correlated" -> "Don't you want the least traded states / the most
+# profitable per resting contract" -> "Yes rank at 10am and push"): five
+# states, ASTEST_GAS_STATES -- the best by the bot's own reward per resting
+# contract against day-one fill risk, one per fuel region so one national
+# move does not hit them all. Not the national: the most traded (515k
+# contracts on day one) and the October trial's loser. (The 51-state first
+# cut never quoted: astest_stop.txt held it from 01:20 ET 10/26.) The rule,
+# fixed at 08:15 ET before the final read: day-one volume at or under the
+# median state's (18k contracts), day-one makers no worse than -3c a
+# contract, then the best net reward per resting contract one per region.
+# The 10:11 ET read (official day one: 51 states 1.19M contracts, makers
+# +$10.0k on trading) picked CT 11.5c/ct/day (6.7k day one), MS 10.3c
+# (4.0k), NY 8.6c (5.6k), TN 7.7c (12.2k), UT 7.2c (14.0k); est $104/day
+# at the test's settings across their 33 live strikes.
+# The family quotes PLAIN (no GasBuddy gate: the market out-forecasts it)
+# under six stops of its own:
 #   1. window ASTEST_GAS_WINDOW_ET (16:00-24:00 ET): the rest of the day is a
 #      blackout (series_in_blackout: the quote loop cancels and holds)
 #   2. size: the global ladder at x1 inside the window -- the 2026-08-04
 #      4pm-1am halving (SERIES_HOUR_MULTS) is lifted for the family, since at
 #      half size few strikes would clear the $1-per-period payout floor over
-#      an 8h window -- and a net cap of ASTEST_GAS_MAX_POSITION per market. A
+#      an 8h window -- and a net cap of ASTEST_GAS_MAX_POSITION (50) per market. A
 #      hand cap is literal (applied_mention_mult) and takes the family out
 #      of both halves of the base-size split test (size_test_arm).
-#   3. family daily loss halt ASTEST_GAS_DAILY_LOSS (pilot budget
+#   3. family daily loss halt ASTEST_GAS_DAILY_LOSS ($100; pilot budget
 #      ASTEST_GAS_HALT_KEY): out until the 5am-CT roll, positions ride
 #   4. fill pause: a maker fill of ours stands its EVENT aside for
 #      ASTEST_GAS_FILL_PAUSE_MIN (a moving print walks through the strikes),
-#      and a net cap of ASTEST_GAS_EVENT_CAP per event (the global 1,000
-#      would let one state carry ten strikes' caps)
+#      and a net cap of ASTEST_GAS_EVENT_CAP (150) per event (the global
+#      1,000 would let one state carry twenty strikes' caps)
 #   5. family burst breaker: the states move together on the national
 #      price, so one informed sweep can hit every state at once -- our maker
-#      fills across the whole family reaching ASTEST_GAS_BURST_CONTRACTS
+#      fills across the whole family reaching ASTEST_GAS_BURST_CONTRACTS (100)
 #      inside ASTEST_GAS_BURST_WINDOW_MIN stand EVERY gas event aside
 #      ASTEST_GAS_BURST_PAUSE_MIN, with an email
 #   6. stop file STATUS_DIR/ASTEST_STOP_FILE (read once a minute): present ->
@@ -9095,24 +9110,21 @@ if GAS_TRIAL_BLACKOUT_ET:
 # kill: the gas dailies are blocked exactly as before.
 ASTEST_ENABLE = os.environ.get("IMM_ASTEST_ENABLE", "1") == "1"
 ASTEST_STOP_FILE = "astest_stop.txt"                            # in STATUS_DIR
-ASTEST_GAS_RE = re.compile(os.environ.get(
-    "IMM_ASTEST_GAS_RE", r"KXAAAGASD(?:[A-Z][A-Z])?"))
+ASTEST_GAS_STATES = tuple(s.strip().upper() for s in os.environ.get(
+    "IMM_ASTEST_GAS_STATES", "CT,MS,NY,TN,UT").split(",") if s.strip())
+ASTEST_GAS_SERIES = frozenset(f"KXAAAGASD{s}" for s in ASTEST_GAS_STATES)
 ASTEST_GAS_WINDOW_ET = tuple(os.environ.get(
     "IMM_ASTEST_GAS_WINDOW_ET", "16:00-24:00").split("-"))
-ASTEST_GAS_MAX_POSITION = _env_float("IMM_ASTEST_GAS_MAX_POSITION", 100.0)
-ASTEST_GAS_DAILY_LOSS = _env_float("IMM_ASTEST_GAS_DAILY_LOSS", 300.0)
+ASTEST_GAS_MAX_POSITION = _env_float("IMM_ASTEST_GAS_MAX_POSITION", 50.0)
+ASTEST_GAS_DAILY_LOSS = _env_float("IMM_ASTEST_GAS_DAILY_LOSS", 100.0)
 ASTEST_GAS_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_ASTEST_GAS_FILL_PAUSE_MIN", 15.0))
-ASTEST_GAS_EVENT_CAP = _env_float("IMM_ASTEST_GAS_EVENT_CAP", 300.0)
-ASTEST_GAS_BURST_CONTRACTS = _env_float("IMM_ASTEST_GAS_BURST_CONTRACTS", 300.0)
+ASTEST_GAS_EVENT_CAP = _env_float("IMM_ASTEST_GAS_EVENT_CAP", 150.0)
+ASTEST_GAS_BURST_CONTRACTS = _env_float("IMM_ASTEST_GAS_BURST_CONTRACTS", 100.0)
 ASTEST_GAS_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_GAS_BURST_WINDOW_MIN", 15.0)
 ASTEST_GAS_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_GAS_BURST_PAUSE_MIN", 30.0)
 ASTEST_GAS_HALT_KEY = "ASTEST:GAS"
 # the family-wide entry in the fill-pause map (event tickers never start "*")
 ASTEST_GAS_FAMILY_KEY = "*GAS"
-# the blocks the family stands aside: the gas trial's national cut (a
-# SERIES_BLOCKLIST_PREFIXES entry) -- the state pattern block is skipped
-# for members in _blocked
-_ASTEST_GAS_UNBLOCK = ("KXAAAGASD-",)
 _astest_stop = {"checked": 0.0, "stopped": False}
 
 
@@ -9125,11 +9137,16 @@ def astest_stopped() -> bool:
     return _astest_stop["stopped"]
 
 
+def astest_gas_member(series: str) -> bool:
+    """A state in ASTEST_GAS_STATES while the test is on -- membership alone,
+    the stop file aside, so the override hook stamps the test's stops on a
+    member whether or not the test is stopped when it is cloned."""
+    return ASTEST_ENABLE and series in ASTEST_GAS_SERIES
+
+
 def astest_gas_series(series: str) -> bool:
-    """The AS test's gas family: the national AAA daily and the two-letter
-    state dailies, while the test is on and not stopped."""
-    return (ASTEST_ENABLE and ASTEST_GAS_RE.fullmatch(series or "") is not None
-            and not astest_stopped())
+    """The AS test's gas family: its states, while not stopped."""
+    return astest_gas_member(series) and not astest_stopped()
 
 
 def astest_blackout(window: Tuple[str, str]) -> Tuple[str, str]:
@@ -9138,14 +9155,6 @@ def astest_blackout(window: Tuple[str, str]) -> Tuple[str, str]:
     start, end = window
     return ("00:00" if end == "24:00" else end, start)
 
-
-# The national override carries the family's stops; the states clone it
-# (FAMILY_OVERRIDE_PARENTS' KXAAAGASD prefix rule, at refresh).
-if ASTEST_ENABLE and "KXAAAGASD" in SERIES_OVERRIDES:
-    SERIES_OVERRIDES["KXAAAGASD"] = replace(
-        SERIES_OVERRIDES["KXAAAGASD"],
-        blackout_et=astest_blackout(ASTEST_GAS_WINDOW_ET),
-        max_position=ASTEST_GAS_MAX_POSITION)
 
 
 # ---- family guard inheritance (Jack 2026-09-01 "fix this going forward",
@@ -9264,6 +9273,11 @@ def ensure_family_override(series: str) -> None:
             # $2/day rate floor (Jack 2026-09-27: "drop the $2/day floor"):
             # the $1-per-period payout floor still decides entry.
             ov = replace(ov, min_est_per_day=GB_STATE_MIN_RATE)
+        if parent == "KXAAAGASD" and astest_gas_member(series):
+            # the opportunistic AS test's states (2026-10-26): the test's
+            # window and net cap on top of the state guard set
+            ov = replace(ov, blackout_et=astest_blackout(ASTEST_GAS_WINDOW_ET),
+                         max_position=ASTEST_GAS_MAX_POSITION)
         if parent == "KXNFLLADDERREC" and nfl_ffpts_series(series):
             # NFL fantasy ladders stop at the inactive list, not kickoff - 30
             # (Jack 2026-10-04, see NFL_FFPTS_START_BUFFER_MIN)
@@ -10578,7 +10592,8 @@ _CONFIG_CODE_KNOBS = (
     # the 1pm-midnight gas trial (2026-10-01)
     "GB_STATE_QUOTE", "GAS_TRIAL_SERIES", "GAS_TRIAL_BLACKOUT_ET",
     # the opportunistic AS test's gas family (2026-10-25)
-    "ASTEST_ENABLE", "ASTEST_GAS_WINDOW_ET", "ASTEST_GAS_MAX_POSITION",
+    "ASTEST_ENABLE", "ASTEST_GAS_STATES", "ASTEST_GAS_WINDOW_ET",
+    "ASTEST_GAS_MAX_POSITION",
     "ASTEST_GAS_DAILY_LOSS", "ASTEST_GAS_FILL_PAUSE_MIN", "ASTEST_GAS_EVENT_CAP",
     "ASTEST_GAS_BURST_CONTRACTS", "ASTEST_GAS_BURST_WINDOW_MIN",
     "ASTEST_GAS_BURST_PAUSE_MIN",
@@ -24509,11 +24524,9 @@ class IncentiveMarketMaker:
             # the IMM's own high-temperature family (2026-10-23): the "KXHIGH"
             # ownership block stands aside for its markets
             prefixes = tuple(p for p in prefixes if p != HIGHT_PREFIX)
-        # the opportunistic AS test's gas dailies (2026-10-25): the gas
-        # trial's national cut and the state pattern block stand aside
+        # the opportunistic AS test's states (2026-10-26): the state pattern
+        # block stands aside for its members
         astest = astest_gas_series(series_of(ticker))
-        if astest:
-            prefixes = tuple(p for p in prefixes if p not in _ASTEST_GAS_UNBLOCK)
         if any(ticker.startswith(p) for p in prefixes) \
                 or (series_pattern_blocked(series_of(ticker)) and not astest) \
                 or event_pattern_blocked(ticker):
@@ -32753,12 +32766,16 @@ class IncentiveMarketMaker:
                 f"${HIGHT_DAILY_LOSS_LIMIT:g}/day family loss halt; size "
                 f"x{HIGHT_SIZE_MULT:g}, band {HIGHT_PRICE_MIN}-{HIGHT_PRICE_MAX}c")
         if ASTEST_ENABLE:
-            log(f"opportunistic AS test (2026-10-25): AAA gas dailies (national + "
-                f"the state dailies, {ASTEST_GAS_RE.pattern}) quoted plain "
+            log(f"opportunistic AS test (2026-10-26): AAA gas dailies of "
+                f"{','.join(ASTEST_GAS_STATES)} quoted plain "
                 f"{'-'.join(ASTEST_GAS_WINDOW_ET)} ET only, x1 (no 4pm halving), "
-                f"net cap {ASTEST_GAS_MAX_POSITION:g}/market; "
+                f"net cap {ASTEST_GAS_MAX_POSITION:g}/market "
+                f"{ASTEST_GAS_EVENT_CAP:g}/event; "
                 f"${ASTEST_GAS_DAILY_LOSS:g}/day family loss halt; "
-                f"{ASTEST_GAS_FILL_PAUSE_MIN:g}m event pause after our fills"
+                f"{ASTEST_GAS_FILL_PAUSE_MIN:g}m event pause after our fills; "
+                f"burst {ASTEST_GAS_BURST_CONTRACTS:g} ct/"
+                f"{ASTEST_GAS_BURST_WINDOW_MIN:g}m -> all out "
+                f"{ASTEST_GAS_BURST_PAUSE_MIN:g}m"
                 + (f"; STOPPED ({ASTEST_STOP_FILE})" if astest_stopped() else
                    f"; stop file {ASTEST_STOP_FILE}"))
         if RELEASE_PAUSE:
