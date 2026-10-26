@@ -268,6 +268,112 @@ def settled_ev(eid, mag, t, net="us"):
     return dict(usgs_ev(eid, mag, t, net=net), updated=t + 600)
 
 
+class TestAftershockTerm(unittest.TestCase):
+    """The raise-only Reasenberg-Jones term (Jack 2026-10-26: "Yes build and
+    then go live and monitor it", on the 10/15-16 backtest)."""
+
+    M77 = usgs_ev("us77", 7.7, DAY - 6 * H)
+
+    @staticmethod
+    def watch(now, catalog=None, cat_age=60, usgs=()):
+        w = _watch(now, usgs=usgs)
+        if catalog is not None:
+            w.update_as_catalog(list(catalog), now - cat_age)
+        return w
+
+    def test_background_table_and_the_omori_integral(self):
+        for k, lam in zip(q.KS, q.LAM_BG):
+            self.assertAlmostEqual(q.lam_bg_eff(k), lam, places=9)
+            self.assertLess(lam, q.lam_eff(k))     # the table minus the mean aftershock share
+        p, c = q.AS_P, q.AS_C
+        self.assertAlmostEqual(q._omori(0.0, 1.0), ((1 + c) ** (1 - p) - c ** (1 - p)) / (1 - p))
+        self.assertEqual(q._omori(2.0, 1.0), 0.0)                 # an empty window
+
+    def test_no_sources_leaves_the_table_cap(self):
+        now = DAY + 12 * H
+        table = q.p_yes(6.0, DAY, now, q.GFZ_LAG_H)
+        for w in (self.watch(now), self.watch(now, catalog=[])):  # never read / empty
+            v = w.verdict(6.0, DAY, now)
+            self.assertEqual(v["cap_c"], math.floor(table * 100 - 1))
+            self.assertEqual(v["fair"], v["fair_table"])
+        self.assertIsNone(self.watch(now).verdict(6.0, DAY, now)["fair_as"])
+        quiet = self.watch(now, catalog=[]).verdict(6.0, DAY, now)
+        self.assertLess(quiet["fair_as"], quiet["fair_table"])     # raise-only: the table prices
+
+    def test_a_big_quake_raises_the_cap_and_decays(self):
+        now = DAY + 1 * H
+        v = self.watch(now, catalog=[self.M77]).verdict(5.8, DAY, now)
+        start = now - q.GFZ_LAG_H * H
+        n = q.aftershock_n(5.8, start, DAY + 86400, now, [(self.M77["time"], 7.7)])
+        want = 1 - math.exp(-(q.lam_bg_eff(5.8) * (DAY + 86400 - start) / 86400 + n))
+        self.assertAlmostEqual(v["fair_as"], round(want * 100, 2))
+        self.assertGreater(v["fair"], v["fair_table"] + 10)       # ~+13 points 7 h after
+        self.assertEqual(v["fair"], v["fair_as"])
+        self.assertEqual(v["cap_c"], math.floor(want * 100 - 1))
+        later = DAY + 7 * 86400 + H                                # a week on: t^-1.08
+        v7 = self.watch(later, catalog=[self.M77]).verdict(5.8, DAY + 7 * 86400, later)
+        self.assertLess(v7["fair_as"] - v7["fair_table"], v["fair_as"] - v["fair_table"])
+        # a source counts only AS_SRC_LAG_H after its origin, and for AS_WINDOW_D
+        just = usgs_ev("us78", 7.7, now - 0.1 * H)
+        self.assertEqual(q.aftershock_n(5.8, start, DAY + 86400, now,
+                                        [(just["time"], 7.7)]), 0.0)
+        old = DAY - 400 * 86400
+        self.assertEqual(q.aftershock_n(5.8, start, DAY + 86400, now, [(old, 8.5)]), 0.0)
+
+    def test_a_stale_catalog_falls_back_to_the_table(self):
+        now = DAY + 1 * H
+        v = self.watch(now, catalog=[self.M77],
+                       cat_age=q.AS_STALE_SECS + 1).verdict(5.8, DAY, now)
+        self.assertIsNone(v["fair_as"])
+        self.assertEqual(v["fair"], v["fair_table"])
+
+    def test_shadow_logs_without_pricing_and_off_skips_it(self):
+        now = DAY + 1 * H
+        with mock.patch.object(q, "AS_MODE", "shadow"):
+            v = self.watch(now, catalog=[self.M77]).verdict(5.8, DAY, now)
+            self.assertGreater(v["fair_as"], v["fair_table"])
+            self.assertEqual(v["fair"], v["fair_table"])
+        with mock.patch.object(q, "AS_MODE", "off"):
+            v = self.watch(now, catalog=[self.M77]).verdict(5.8, DAY, now)
+            self.assertIsNone(v["fair_as"])
+            self.assertEqual(v["fair"], v["fair_table"])
+
+    def test_the_live_feed_adds_confirmed_quakes_only(self):
+        now = DAY + 3 * H
+        settled = settled_ev("us65", 6.5, DAY + 1 * H)             # NEIC's, settled
+        fresh = usgs_ev("us66", 6.5, DAY + 2.9 * H)                # just in, unconfirmed
+        base = self.watch(now, catalog=[]).verdict(6.6, DAY, now)["fair_as"]
+        on = self.watch(now, catalog=[], usgs=[settled]).verdict(6.6, DAY, now)
+        off = self.watch(now, catalog=[], usgs=[fresh]).verdict(6.6, DAY, now)
+        self.assertGreater(on["fair_as"], base)
+        self.assertEqual(off["fair_as"], base)
+        w = self.watch(now, catalog=[usgs_ev("small", 5.4, DAY - H), self.M77])
+        self.assertEqual(list(w.as_catalog), ["us77"])             # under AS_MMIN dropped
+
+    def test_one_quake_under_two_ids_counts_once(self):
+        # ComCat's 10/24 Bonin M7.0: pt26297050 and pt26298050, same second
+        now = DAY + 1 * H
+        t = DAY - 30 * H
+        twin = [usgs_ev("pt1", 7.0, t, net="pt"), usgs_ev("pt2", 7.0, t, net="pt")]
+        one = self.watch(now, catalog=twin[:1]).verdict(6.0, DAY, now)["fair_as"]
+        two = self.watch(now, catalog=twin).verdict(6.0, DAY, now)["fair_as"]
+        self.assertEqual(one, two)
+        self.assertEqual(q.dedup_sources([(t, 7.0), (t + 30, 7.2), (t + 600, 6.0)]),
+                         [(t, 7.2), (t + 600, 6.0)])
+
+    def test_the_ask_floor_and_the_status_file(self):
+        now = DAY + 1 * H
+        w = self.watch(now, catalog=[self.M77])
+        a = w.ask_verdict(6.6, DAY, now)
+        v = w.verdict(6.6, DAY, now)
+        if a["ok"]:
+            self.assertGreaterEqual(a["floor_c"], math.ceil(v["fair_as"] + q.ASK_MARGIN_CENTS))
+        st = w.snapshot(now)["aftershock"]
+        self.assertEqual((st["mode"], st["catalog_events"], st["sources"]), ("raise", 1, 1))
+        self.assertGreater(st["n_as_6"], 0)
+        self.assertGreater(st["fairs"]["5.8"][1], st["fairs"]["5.8"][0])
+
+
 class TestAskVerdict(unittest.TestCase):
     """QuakeWatch.ask_verdict: when a far-strike YES ask may rest, and how low
     (Jack 2026-10-11: "yes GFZ-triggered cancel", "yes start at the far

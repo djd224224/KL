@@ -10440,6 +10440,7 @@ _CONFIG_CODE_KNOBS = (
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
     # (freeze, lags, staleness) ride in its status file's "knobs" block
     "QUAKE_ENABLE", "QUAKE_SERIES", "QUAKE_MARGIN_CENTS", "QUAKE_USGS_POLL_SECS",
+    "QUAKE_AS_CATALOG_SECS",      # the aftershock term's catalog (2026-10-26)
     "QUAKE_GFZ_POLL_SECS", "QUAKE_CUTOFF_FROM_CLOSE_MIN", "QUAKE_SIZE_MULT",
     # ...its far-strike asks (2026-10-11); the ask verdict's knobs ride in the
     # same status-file "knobs" block
@@ -13662,6 +13663,11 @@ QUAKE_USGS_POLL_SECS = _env_float("IMM_QUAKE_USGS_POLL_SECS", 15)
 # 20 -> 10s (Jack 2026-10-11: "poll GFZ every 10s instead of 20s, or add the
 # faster EMSC feed" -> "implement"): GFZ is the far-strike asks' trigger
 QUAKE_GFZ_POLL_SECS = _env_float("IMM_QUAKE_GFZ_POLL_SECS", 10)
+# the aftershock term's source catalog (usgs_quake_fair.AS_MODE, Jack
+# 2026-10-26: "Yes build and then go live"): ComCat's M5.5+ year, re-read
+# every QUAKE_AS_CATALOG_SECS (~500-600 events, ~300 KB); the live feed's
+# confirmed quakes join it between reads
+QUAKE_AS_CATALOG_SECS = _env_float("IMM_QUAKE_AS_CATALOG_SECS", 900)
 # ...and EMSC's realtime push feed as a third trigger, read on its own thread
 # (_quake_emsc_loop; usgs_quake_fair.EMSC_MIN_MAG): an accelerator for the
 # asks only. Pinged every QUAKE_EMSC_PING_SECS; a connection silent (not even
@@ -31515,8 +31521,8 @@ class IncentiveMarketMaker:
                     # EMSC's push feed, the asks' third trigger (2026-10-11)
                     threading.Thread(target=self._quake_emsc_loop, args=(watch,),
                                      daemon=True, name="quake-emsc").start()
-                due_u = due_g = due_s = 0.0
-                last = {"usgs": None, "gfz": None}
+                due_u = due_g = due_s = due_a = 0.0
+                last = {"usgs": None, "gfz": None, "catalog": None}
                 seen_det: Set[str] = set()
 
                 def _read(src, fn):
@@ -31545,6 +31551,17 @@ class IncentiveMarketMaker:
                         due_g = now + max(5.0, QUAKE_GFZ_POLL_SECS)
                         polled |= _read("gfz", lambda: watch.update_gfz(
                             uqf.fetch_gfz(), time.time()))
+                    if now >= due_a and uqf.AS_MODE in ("shadow", "raise"):
+                        # the aftershock term's year of sources (2026-10-26):
+                        # a failed read keeps the last list, which goes stale
+                        # after uqf.AS_STALE_SECS (the table again)
+                        due_a = now + max(120.0, QUAKE_AS_CATALOG_SECS)
+                        first = watch.as_ok is None
+                        if _read("catalog", lambda: watch.update_as_catalog(
+                                uqf.fetch_as_catalog(), time.time())) and first:
+                            log(f"{self.tag} quake aftershock term ({uqf.AS_MODE}): "
+                                f"{len(watch.as_catalog)} M{uqf.AS_MMIN:g}+ sources "
+                                f"over {uqf.AS_WINDOW_D:g} days, a={uqf.AS_A:g}")
                     if polled:
                         # one line per NEW detection (the per-market hold
                         # lines follow from the quote loop)
@@ -32045,6 +32062,16 @@ class IncentiveMarketMaker:
                 f"{QUAKE_USGS_POLL_SECS:g}s + GFZ every {QUAKE_GFZ_POLL_SECS:g}s, "
                 f"hold on a new quake until NEIC confirms, cutoff close-"
                 f"{QUAKE_CUTOFF_FROM_CLOSE_MIN}m, status {QUAKE_STATUS_FILE}")
+            try:
+                import usgs_quake_fair as _uqf
+                log(f"quake aftershock term: {_uqf.AS_MODE} (raise = bids priced "
+                    f"off max(table, Reasenberg-Jones a={_uqf.AS_A:g} b={_uqf.AS_B:g} "
+                    f"p={_uqf.AS_P:g} c={_uqf.AS_C:g}) over M{_uqf.AS_MMIN:g}+ "
+                    f"quakes of the last {_uqf.AS_WINDOW_D:g} days; catalog every "
+                    f"{QUAKE_AS_CATALOG_SECS:g}s, the table again after "
+                    f"{_uqf.AS_STALE_SECS:g}s stale)")
+            except Exception:
+                pass
             if QUAKE_ASK_STRIKES:
                 log(f"quake far-strike asks: strikes "
                     f"{','.join(f'{k:g}' for k in sorted(QUAKE_ASK_STRIKES))}, <= "

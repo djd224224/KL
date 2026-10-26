@@ -27,6 +27,8 @@ qualifying quake that is not on the feed yet: the rest of the day PLUS the
 unpublished tail (USGS publishes a median 17.4 min after origin for M5.5+,
 GFZ a median 5.3 min), clipped to the day. Before 00:00Z it is the whole day.
 The live ladder sat within 1c of this model on 5.6-6.4 on 9/27.
+Since 2026-10-26 the bids price max(that fair, an aftershock fair) -- a
+Reasenberg-Jones term over the last year's M5.5+ quakes (AS_MODE, raise-only).
 
 Feeds (both official, polled from incentive_mm's refresher thread):
   USGS  earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson
@@ -143,11 +145,60 @@ ASK_COOLOFF_MIN = _env_float("IMM_QUAKE_ASK_COOLOFF_MIN", 30)
 # their origin.
 EMSC_MIN_MAG = _env_float("IMM_QUAKE_EMSC_MIN_MAG", 4.8)
 EMSC_KEEP_MIN = _env_float("IMM_QUAKE_EMSC_KEEP_MIN", 180)
+# THE AFTERSHOCK TERM, RAISE-ONLY (Jack 2026-10-26: "Yes build and then go live
+# and monitor it", on the 10/15-16 backtest, quake_aftershock/REPORT.md in the
+# side-session notes). Since ~10/08 other makers have bid YES 3-16c over the
+# 10-year table on every strike after each big quake (10/26: two M7.0 Bonin,
+# an M7.0 China, an M6.9 Vanuatu in four days), so our fair - 1c bids sat
+# outside the scored walk and earned $0. The backtest's Reasenberg-Jones term
+#     N = 10^(a + b(Ms - K)) * integral of (t + c)^-p over the rest of the day
+# summed over every M >= AS_MMIN quake of the last AS_WINDOW_D days
+# (aftershocks are sources too), each counted AS_SRC_LAG_H after its origin,
+# on a background LAM_BG re-solved so the 10-year mean still matches the
+# table: fair_as = 1 - exp(-(lam_bg(K) * w + N)). Fitted 1990-2016, tested
+# 2016-2026: +342 nats over the table (P(gain) 97%), the gain on post-big-quake
+# days, where the table under-forecasts 5.8-6.0 by ~10-30 points. Used RAISE-
+# ONLY -- the bid's fair is max(table, aftershock), so quiet days are exactly
+# as before (a full swap cost ~$9/day there) -- it put our cap at the reward
+# reference on 37% of 10/10-10/15's live strike-hours instead of 14%: about
+# +$4.8/day in that sequence at 120 lots, ~$0.5/day over 2016-2026, fills at
+# the raised cap still +0.6 to +3.4c of edge. A catalog older than
+# AS_STALE_SECS (or none yet) falls back to the table: never fails upward.
+# IMM_QUAKE_AFTERSHOCK = off | shadow (computed and logged, not used) | raise.
+AS_MODE = os.environ.get("IMM_QUAKE_AFTERSHOCK", "raise").strip().lower()
+AS_B = 0.9                       # alpha = b: the textbook form
+AS_P = 1.08
+AS_C = 0.05                      # days
+AS_MMIN = _env_float("IMM_QUAKE_AS_MMIN", 5.5)
+AS_WINDOW_D = _env_float("IMM_QUAKE_AS_WINDOW_D", 365.0)
+AS_SRC_LAG_H = _env_float("IMM_QUAKE_AS_SRC_LAG_H", 0.3)
+AS_STALE_SECS = _env_float("IMM_QUAKE_AS_STALE_SECS", 3 * 3600)
+# one quake under two catalog ids counts once: sources whose origins sit
+# within AS_DEDUP_SECS merge, the larger magnitude kept (ComCat listed the
+# 10/24 02:09:00Z Bonin M7.0 as pt26297050 AND pt26298050 -- same second,
+# place and depth -- which would double its term)
+AS_DEDUP_SECS = _env_float("IMM_QUAKE_AS_DEDUP_SECS", 60)
+# lam_bg per strike (KS order), solved with the term on over 2016-09-27 ..
+# 2026-09-26 -- one table per validated a (the report's section 6): -2.35 the
+# fit, -2.55 the cautious end. IMM_QUAKE_AS_A picks one; any other value
+# falls back to -2.35.
+LAM_BG_BY_A = {
+    -2.35: (1.9657, 1.1973, 0.7375, 0.4578, 0.2857, 0.1716,
+            0.1088, 0.0699, 0.0484, 0.0289),
+    -2.55: (2.0482, 1.2536, 0.7756, 0.4834, 0.3029, 0.1832,
+            0.1165, 0.0750, 0.0519, 0.0312)}
+AS_A = _env_float("IMM_QUAKE_AS_A", -2.35)
+if AS_A not in LAM_BG_BY_A:
+    AS_A = -2.35
+LAM_BG = LAM_BG_BY_A[AS_A]
+# the year of source quakes: USGS ComCat's FDSN event service
+AS_CATALOG_URL = os.environ.get(
+    "IMM_QUAKE_AS_CATALOG_URL", "https://earthquake.usgs.gov/fdsnws/event/1/query")
 
 
-def lam_eff(k: float) -> Optional[float]:
-    """Effective daily rate of days reaching magnitude k: exact at the table
-    strikes, log-linear between them, the end segment's slope for up to
+def _loglin(k: float, lams) -> Optional[float]:
+    """A daily rate at magnitude k off a per-strike table (KS order): exact at
+    the strikes, log-linear between them, the end segment's slope for up to
     EXTRAP_MAG past either end, None beyond (no model)."""
     try:
         k = float(k)
@@ -155,7 +206,6 @@ def lam_eff(k: float) -> Optional[float]:
         return None
     if not math.isfinite(k):
         return None
-    lams = [-math.log(1.0 - p) for p in P_DAY]
     if k < KS[0] - EXTRAP_MAG - 1e-9 or k > KS[-1] + EXTRAP_MAG + 1e-9:
         return None
     if k <= KS[0]:
@@ -170,6 +220,18 @@ def lam_eff(k: float) -> Optional[float]:
     return math.exp(y0 + (y1 - y0) * (k - x0) / (x1 - x0))
 
 
+def lam_eff(k: float) -> Optional[float]:
+    """Effective daily rate of days reaching magnitude k, off the table
+    (_loglin over P_DAY)."""
+    return _loglin(k, [-math.log(1.0 - p) for p in P_DAY])
+
+
+def lam_bg_eff(k: float) -> Optional[float]:
+    """The aftershock model's background rate at magnitude k (_loglin over
+    LAM_BG)."""
+    return _loglin(k, LAM_BG)
+
+
 def p_yes(k: float, day_start_ts: float, now_ts: float,
           lag_h: float) -> Optional[float]:
     """P(the UTC day [day_start, day_start+24h) reaches magnitude k), given
@@ -181,6 +243,61 @@ def p_yes(k: float, day_start_ts: float, now_ts: float,
     start = max(day_start_ts, now_ts - max(0.0, lag_h) * 3600.0)
     w_h = max(0.0, day_end - start) / 3600.0
     return 1.0 - math.exp(-lam * min(w_h, 24.0) / 24.0)
+
+
+def _omori(t1: float, t2: float) -> float:
+    """Integral of (t + AS_C)^-AS_P dt over [t1, t2], t in days (t1, t2 >= 0)."""
+    t1 = max(0.0, t1)
+    t2 = max(t1, t2)
+    if abs(AS_P - 1.0) < 1e-9:
+        return math.log((t2 + AS_C) / (t1 + AS_C))
+    return ((t2 + AS_C) ** (1.0 - AS_P) - (t1 + AS_C) ** (1.0 - AS_P)) / (1.0 - AS_P)
+
+
+def dedup_sources(sources: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Sources with origins within AS_DEDUP_SECS of the previous one kept are
+    one quake: the larger magnitude stays (time-sorted)."""
+    out: List[Tuple[float, float]] = []
+    for ts, m in sorted(sources):
+        if out and ts - out[-1][0] <= AS_DEDUP_SECS:
+            if m > out[-1][1]:
+                out[-1] = (out[-1][0], m)
+            continue
+        out.append((ts, m))
+    return out
+
+
+def aftershock_n(k: float, start_ts: float, end_ts: float, now_ts: float,
+                 sources: List[Tuple[float, float]]) -> float:
+    """Expected count of M >= k quakes in [start, end) from the sources
+    [(origin epoch, magnitude)]: 10^(a + b(M - k)) times the Omori integral,
+    a source counted AS_SRC_LAG_H after its origin and at most AS_WINDOW_D
+    old."""
+    n = 0.0
+    for ts, m in sources:
+        if ts > now_ts - AS_SRC_LAG_H * 3600.0 \
+                or start_ts - ts > AS_WINDOW_D * 86400.0:
+            continue
+        n += 10.0 ** (AS_A + AS_B * (m - k)) * _omori(
+            (start_ts - ts) / 86400.0, (end_ts - ts) / 86400.0)
+    return n
+
+
+def p_yes_as(k: float, day_start_ts: float, now_ts: float, lag_h: float,
+             sources: Optional[List[Tuple[float, float]]]
+             ) -> Tuple[Optional[float], Optional[float]]:
+    """(table fair, aftershock fair) for strike k over the rest of the UTC day
+    plus the unpublished tail, as p_yes; the aftershock fair is None without a
+    source list or a background rate."""
+    base = p_yes(k, day_start_ts, now_ts, lag_h)
+    lam = lam_bg_eff(k)
+    if base is None or lam is None or sources is None:
+        return base, None
+    day_end = day_start_ts + 86400.0
+    start = max(day_start_ts, now_ts - max(0.0, lag_h) * 3600.0)
+    w = min(max(0.0, day_end - start) / 86400.0, 1.0)
+    n = aftershock_n(k, start, day_end, now_ts, sources)
+    return base, 1.0 - math.exp(-(lam * w + n))
 
 
 def _iso_ts(s: str) -> Optional[float]:
@@ -279,6 +396,21 @@ def fetch_usgs(timeout: float = HTTP_TIMEOUT) -> Tuple[Optional[float], List[dic
     return parse_usgs(r.json())
 
 
+def fetch_as_catalog(now_ts: Optional[float] = None,
+                     timeout: float = 60.0) -> List[dict]:
+    """The aftershock term's sources: every ComCat earthquake of M >=
+    AS_MMIN in the last AS_WINDOW_D days (~500-600 events), parse_usgs's
+    shape."""
+    now_ts = time.time() if now_ts is None else now_ts
+    start = datetime.fromtimestamp(now_ts - AS_WINDOW_D * 86400.0, timezone.utc)
+    r = requests.get(AS_CATALOG_URL, params={
+        "format": "geojson", "eventtype": "earthquake", "minmagnitude": AS_MMIN,
+        "starttime": start.strftime("%Y-%m-%dT%H:%M:%S"), "orderby": "time"},
+        headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    r.raise_for_status()
+    return parse_usgs(r.json())[1]
+
+
 def fetch_gfz(now_ts: Optional[float] = None,
               timeout: float = HTTP_TIMEOUT) -> List[dict]:
     now_ts = time.time() if now_ts is None else now_ts
@@ -306,6 +438,9 @@ class QuakeWatch:
         self.gfz_ok: Optional[float] = None        # last successful GFZ read
         self.emsc: Dict[str, dict] = {}
         self.emsc_ok: Optional[float] = None       # last EMSC frame (or pong)
+        # the aftershock term's year of sources: id -> (origin, magnitude)
+        self.as_catalog: Dict[str, Tuple[float, float]] = {}
+        self.as_ok: Optional[float] = None         # last successful catalog read
         self.created = time.time()
 
     # -- updates -----------------------------------------------------------
@@ -383,6 +518,13 @@ class QuakeWatch:
         with self._lock:
             self.emsc_ok = now_ts
 
+    def update_as_catalog(self, events: List[dict], now_ts: float) -> None:
+        """A fresh read of the aftershock sources (fetch_as_catalog)."""
+        with self._lock:
+            self.as_catalog = {e["id"]: (e["time"], e["mag"]) for e in events
+                               if e["mag"] >= AS_MMIN - 1e-9}
+            self.as_ok = now_ts
+
     # -- reads (callers hold the lock) --------------------------------------
     def _usgs_fresh(self, now_ts: float) -> bool:
         if self.usgs_ok is None or now_ts - self.usgs_ok > USGS_STALE_SECS:
@@ -427,6 +569,33 @@ class QuakeWatch:
         never later than FIRST_SEEN_MAX_LAG_MIN after the quake's origin (a
         restart re-sees every detection as new)."""
         return min(e["first_seen"], e["time"] + FIRST_SEEN_MAX_LAG_MIN * 60)
+
+    def _as_sources(self, now_ts: float) -> Optional[List[Tuple[float, float]]]:
+        """The aftershock term's sources, or None (the term is off) while the
+        catalog is missing or older than AS_STALE_SECS: the catalog plus the
+        live feed's NEIC-confirmed M >= AS_MMIN quakes (the feed's magnitude
+        wins for a quake in both; an unconfirmed one already holds the book)."""
+        if self.as_ok is None or now_ts - self.as_ok > AS_STALE_SECS:
+            return None
+        src = dict(self.as_catalog)
+        for e in self.usgs.values():
+            if e["mag"] >= AS_MMIN - 1e-9 and self._confirmed(e, now_ts):
+                src[e["id"]] = (e["time"], e["mag"])
+        return dedup_sources(list(src.values()))
+
+    def _fairs(self, k: float, day_start_ts: float, now_ts: float,
+               lag_h: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """(fair used, table fair, aftershock fair): the used one is the
+        table's, or with AS_MODE raise the higher of the two (raise-only)."""
+        if AS_MODE in ("shadow", "raise"):
+            table, adj = p_yes_as(k, day_start_ts, now_ts, lag_h,
+                                  self._as_sources(now_ts))
+        else:
+            table, adj = p_yes(k, day_start_ts, now_ts, lag_h), None
+        use = table
+        if AS_MODE == "raise" and table is not None and adj is not None:
+            use = max(table, adj)
+        return use, table, adj
 
     def _match_usgs(self, t: float) -> Optional[dict]:
         best, gap = None, None
@@ -477,12 +646,14 @@ class QuakeWatch:
                         "quake": top["id"]}
             gfz_fresh = self._gfz_fresh(now_ts)
             lag = GFZ_LAG_H if gfz_fresh else USGS_LAG_H
-            fair = p_yes(k, day_start_ts, now_ts, lag)
+            fair, f_table, f_as = self._fairs(k, day_start_ts, now_ts, lag)
             if fair is None:
                 return {"action": "stand", "why": f"no rate model for M{k:g}",
                         "reason": "no_model"}
             cap_c = int(math.floor(fair * 100.0 - margin_cents + 1e-9))
             base = {"fair": round(fair * 100.0, 2), "cap_c": cap_c,
+                    "fair_table": round(f_table * 100.0, 2),
+                    "fair_as": None if f_as is None else round(f_as * 100.0, 2),
                     "lag_h": lag, "gfz_fresh": gfz_fresh,
                     "day_max": None if top is None else top["mag"]}
             if cap_c < 1:
@@ -548,7 +719,8 @@ class QuakeWatch:
                     if now_ts - e["time"] <= news and not self._confirmed(cp, now_ts):
                         return off("pending", f"{tag} not confirmed by NEIC yet",
                                    quake=e["id"], mag=e["mag"], src=src)
-            fair = p_yes(k, day_start_ts, now_ts, GFZ_LAG_H)
+            # floored at the fair the bids use (raise-only: never under it)
+            fair = self._fairs(k, day_start_ts, now_ts, GFZ_LAG_H)[0]
             if fair is None:
                 return off("no_model", f"no rate model for M{k:g}")
             floor_c = max(1, int(math.ceil(fair * 100.0 + margin - 1e-9)))
@@ -569,7 +741,23 @@ class QuakeWatch:
             day0 = math.floor(now_ts / 86400.0) * 86400.0
             top = self._day_max(day0)
             det = self._open_detections(now_ts)
+            src = self._as_sources(now_ts)
+            as_fairs = {}
+            for k in (5.8, 6.0, 6.2, 6.6):
+                t_f, a_f = p_yes_as(k, day0, now_ts, GFZ_LAG_H, src)
+                as_fairs[f"{k:g}"] = [None if t_f is None else round(t_f * 100.0, 2),
+                                      None if a_f is None else round(a_f * 100.0, 2)]
             return {
+                "aftershock": {
+                    "mode": AS_MODE, "a": AS_A,
+                    "catalog_events": len(self.as_catalog),
+                    "catalog_age_s": (None if self.as_ok is None
+                                      else round(now_ts - self.as_ok)),
+                    "sources": None if src is None else len(src),
+                    "n_as_6": (None if src is None else round(aftershock_n(
+                        6.0, now_ts, day0 + 86400.0, now_ts, src), 4)),
+                    # strike -> [table fair, aftershock fair], cents, now
+                    "fairs": as_fairs},
                 "at": datetime.fromtimestamp(now_ts, timezone.utc).isoformat(),
                 "usgs_ok_age_s": None if self.usgs_ok is None else round(now_ts - self.usgs_ok),
                 "usgs_generated_age_s": (None if self.usgs_generated is None
@@ -598,7 +786,12 @@ class QuakeWatch:
                           "ask_daymax_gap_mag": ASK_DAYMAX_GAP_MAG,
                           "ask_cooloff_min": ASK_COOLOFF_MIN,
                           "emsc_min_mag": EMSC_MIN_MAG,
-                          "emsc_keep_min": EMSC_KEEP_MIN},
+                          "emsc_keep_min": EMSC_KEEP_MIN,
+                          "as_mode": AS_MODE, "as_a": AS_A, "as_b": AS_B,
+                          "as_p": AS_P, "as_c": AS_C, "as_mmin": AS_MMIN,
+                          "as_window_d": AS_WINDOW_D,
+                          "as_src_lag_h": AS_SRC_LAG_H,
+                          "as_stale_secs": AS_STALE_SECS},
             }
 
 
