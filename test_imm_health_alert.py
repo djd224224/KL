@@ -277,6 +277,7 @@ class TestShardCash(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="imm_shard_cash_")
         self.cash = {0: 28000.0, 1: 0.0, 2: 235.0, 3: 0.0}
         self.events = {"KXMLBWSMVP-26": 3, "KXMLBALCSMVP-26": 3, "KXGOOD-99DEC31": 0}
+        self.markets = {}                # market ticker -> shard (the fallback read)
         self.reads, self.sent, self.state = [], [], {}
         self.down = False
         self.t = datetime(2026, 10, 15, 3, 0, tzinfo=timezone.utc).timestamp()
@@ -297,6 +298,8 @@ class TestShardCash(unittest.TestCase):
                                           for n, v in self.cash.items()]}
         if path.startswith("/events/"):
             return {"event": {"exchange_index": self.events[path.split("/")[2]]}}
+        if path.startswith("/markets/"):
+            return {"market": {"exchange_index": self.markets[path.split("/")[2]]}}
         raise AssertionError(f"unexpected read {path}")
 
     def run_check(self, hours=0.0):
@@ -350,6 +353,25 @@ class TestShardCash(unittest.TestCase):
         self.run_check(hours=ha.SHARD_REALERT_HOURS)
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(self.reads.count("/events/KXMLBWSMVP-26"), 1)
+
+    def test_a_four_part_ticker_falls_back_to_the_market_read(self):
+        """2026-10-26: the orders log's event_ticker for a four-part ticker
+        is the bot's own grouping, not Kalshi's event, so the event read
+        404'd and the email said "an unknown shard". The market's own record
+        names the shard."""
+        t = "KXMLBSERIESHR-26TBMILWS-TBBWILLIAMSON15-1"
+        self.cash[3] = 348.96
+        self.markets[t] = 3
+        self.run_check()
+        self.write([self.reject(t, "KXMLBSERIESHR",
+                                '{"error":{"code":"insufficient_balance",'
+                                '"message":"insufficient balance"}}')] * 12)
+        self.run_check(hours=5 / 60)
+        self.assertEqual(len(self.sent), 1)
+        subj, _body = self.sent[0]
+        self.assertIn("shard 3", subj)
+        self.assertNotIn("unknown", subj)
+        self.assertEqual(self.reads.count(f"/markets/{t}"), 1)          # cached
 
     def test_funding_the_shard_sends_the_all_clear(self):
         self.run_check()

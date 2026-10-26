@@ -358,16 +358,27 @@ def new_cash_refusals(sc: dict, status_dir: str, today: str) -> list:
     return rows
 
 
-def _event_shard(sc: dict, event: str, get):
-    """The event's exchange shard (cached in state), None when unreadable."""
+def _event_shard(sc: dict, event: str, get, ticker: str = ""):
+    """The event's exchange shard (cached in state), None when unreadable.
+    The orders log's event_ticker is the bot's own grouping, which for a
+    four-part ticker is not Kalshi's event: KXMLBSERIESHR-26TBMILWS-
+    TBBWILLIAMSON15-1 logs KXMLBSERIESHR-26TBMILWS-TBBWILLIAMSON15, the event
+    is KXMLBSERIESHR-26TBMILWS, and the read 404'd into "an unknown shard"
+    (2026-10-26). A failed event read falls back to the market's own record,
+    which carries exchange_index too."""
     cache = sc.setdefault("event_shard", {})
     if event in cache:
         return cache[event]
-    try:
-        ev = (get(f"/events/{event}") or {}).get("event") or {}
-        shard = int(ev["exchange_index"])
-    except Exception as e:
-        log(f"[IMM-HEALTH] ! shard lookup failed for {event}: {e!r}")
+    shard, errs = None, []
+    reads = [(f"/events/{event}", "event")] + ([(f"/markets/{ticker}", "market")] if ticker else [])
+    for path, key in reads:
+        try:
+            shard = int(((get(path) or {}).get(key) or {})["exchange_index"])
+            break
+        except Exception as e:
+            errs.append(f"{path}: {e!r}")
+    if shard is None:
+        log(f"[IMM-HEALTH] ! shard lookup failed for {event}: {'; '.join(errs)}")
         return None
     cache[event] = shard
     for k in list(cache)[:-300]:         # bounded, oldest first
@@ -452,7 +463,7 @@ def check_shard_cash(alerter, state: dict, now: str, get=None,
         refused = {}                     # shard (None = unknown) -> {series: n}
         for r in new_cash_refusals(sc, status_dir, today):
             ev = r.get("event_ticker") or str(r.get("ticker", "")).rsplit("-", 1)[0]
-            n = _event_shard(sc, ev, get) if ev else None
+            n = _event_shard(sc, ev, get, str(r.get("ticker") or "")) if ev else None
             per = refused.setdefault(n, {})
             s = r.get("series") or "?"
             per[s] = per.get(s, 0) + 1
