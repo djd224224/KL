@@ -187,6 +187,8 @@ def _weather_events(family: str, path: str, member: Callable[[str], bool],
                      [t for ts in by_ev.values() for t in ts])
     state = data.get("event_state") or {}
     known = set(data.get("events") or {}) | set(state)
+    # rain_monthly_fair's auto-mapping failures (2026-10-26): what failed
+    unmapped = data.get("unmapped") or {}
     for ev, ts in sorted(by_ev.items()):
         st = state.get(ev) or {}
         if ev not in known:
@@ -195,9 +197,11 @@ def _weather_events(family: str, path: str, member: Callable[[str], bool],
             g["settle_secs"] = NEVER_READ_SETTLE_SECS
             out.append(g)
         elif st.get("error") == "no station":
+            why = (unmapped.get(str(st.get("code"))) or {}).get("why")
             out.append(_gap(family, ev, ts, "closed",
                             f"no station for CLI code {st.get('code')!r} in the "
-                            f"writer's station table", fix))
+                            f"writer's station table"
+                            + (f" (auto-mapping failed: {why})" if why else ""), fix))
     return out
 
 
@@ -208,8 +212,10 @@ def check_rain_monthly(progs: Dict[str, dict], now_ts: float) -> List[dict]:
         "Monthly / period rain (rain_monthly_fair)", imm.RAIN_MONTHLY_FILE,
         lambda t: imm.rain_monthly_series(_series(t)) or imm.rain_period_gated(t),
         progs, now_ts,
-        "add the CLI code to rain_monthly_fair.CLI_STATIONS (IEM network, "
-        "ACIS id, coordinates, zone; check all three feeds) and restart")
+        "the writer auto-maps a new CLI code when the NWS record, IEM currents, "
+        "IEM's CLI and ACIS all check out (retried every 6h); when one cannot, "
+        "add a hand row to rain_monthly_fair.CLI_STATIONS (IEM network, ACIS "
+        "id, coordinates, zone) and restart")
 
 
 def check_snow_monthly(progs: Dict[str, dict], now_ts: float) -> List[dict]:

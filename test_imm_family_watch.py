@@ -801,6 +801,11 @@ class TestQuoteCalls(unittest.TestCase):
             self.assertEqual(fw.owner_of("KXLOWTMIA"), ("", False))
         self.assertEqual(fw.owner_of("KXLOW-26OCT"), ("blocklisted in incentive_mm.py", False))
         self.assertEqual(fw.owner_of("KXFRANCEEMERGENCY"), ("", False))
+        # a monthly rain city is the family's, named or not (2026-10-26, Jack:
+        # "Enroll and prevent this issue in the future") -- not "kept out on
+        # purpose" off the scan's KXRAIN exclusion
+        for s in ("KXRAINATLM", "KXRAINPHXM"):
+            self.assertEqual(fw.owner_of(s), ("", False), s)
 
     def test_rules_before_the_track_record(self):
         self.assertEqual(self.call("new:KXTINY", est_total=6.0)[0], "SKIP")

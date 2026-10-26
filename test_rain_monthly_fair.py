@@ -261,6 +261,113 @@ def napa_market(ev, k, a="November 1, 2026", b="March 31, 2027"):
             "rules_secondary": NAPA_RULES2.format(a=a, b=b)}
 
 
+class TestAutoStations(unittest.TestCase):
+    """A station no row maps is resolved and checked like the hand rows (Jack
+    2026-10-26: "Enroll and prevent this issue in the future"): NWS record,
+    IEM currents, IEM CLI and ACIS, or no fair and a retry later."""
+
+    NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rmf_auto_")
+        self.path = os.path.join(self.tmp, "fair.json")
+        rmf.AUTO_STATIONS.clear()
+
+    def tearDown(self):
+        rmf.AUTO_STATIONS.clear()
+
+    def feeds(self, ob_age_h=1, cli_age_d=1, record_from="1933-07-01",
+              county="https://api.weather.gov/zones/county/AZC013"):
+        now = self.NOW
+
+        def get(url, tries=3):
+            if "api.weather.gov/stations/KPHX" in url:
+                return {"properties": {"timeZone": "America/Phoenix", "name": "Phoenix",
+                                       "county": county}}
+            if "api/1/currents.json" in url:
+                self.assertIn("network=AZ_ASOS", url)
+                t = (now - timedelta(hours=ob_age_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                return {"data": [{"utc_valid": t}]}
+            if "json/cli.py" in url:
+                return {"results": [{"valid": (now - timedelta(days=cli_age_d)).date().isoformat()}]}
+            if "StnMeta" in url:
+                return {"meta": [{"name": "PHOENIX AIRPORT", "ll": [-112.00365, 33.4278],
+                                  "valid_daterange": [[record_from, "2026-10-25"]]}]}
+            raise RuntimeError(f"unexpected {url}")
+        return get
+
+    def test_a_station_passing_every_check(self):
+        row = rmf.resolve_station("PHX", self.NOW, get=self.feeds())
+        self.assertEqual((row["icao"], row["iem"], row["net"], row["tz"], row["auto"]),
+                         ("KPHX", "PHX", "AZ_ASOS", "America/Phoenix", True))
+        self.assertEqual((row["lat"], row["lon"]), (33.4278, -112.00365))   # ACIS's
+
+    def test_each_failing_check_says_which(self):
+        for kw, word in ((dict(ob_age_h=12), "IEM observation"),
+                         (dict(cli_age_d=30), "CLI"),
+                         (dict(record_from="2015-01-01"), "ACIS"),
+                         (dict(county=""), "zone")):
+            with self.assertRaises(RuntimeError) as cm:
+                rmf.resolve_station("PHX", self.NOW, get=self.feeds(**kw))
+            self.assertIn(word, str(cm.exception), kw)
+
+    def test_the_writer_maps_a_new_code_and_retries_a_failure(self):
+        events = {"KXRAINPHXM-26NOV": {"series": "KXRAINPHXM", "code": "PHX",
+                                       "strikes": {"KXRAINPHXM-26NOV-1": 1.0}},
+                  "KXRAINQQQM-26NOV": {"series": "KXRAINQQQM", "code": "QQQ",
+                                       "strikes": {"KXRAINQQQM-26NOV-1": 1.0}}}
+        calls = []
+
+        def resolve(code, now):
+            calls.append(code)
+            if code == "QQQ":
+                raise RuntimeError("KQQQ: 404")
+            return dict(rmf.resolve_station(code, now, get=self.feeds()))
+
+        def write(now):
+            return rmf.write_fair_file(
+                self.path, now=now, events=events, resolve_fn=resolve,
+                fair_fn=lambda ev, info, n: {"p": {t: 0.5 for t in info["strikes"]},
+                                             "boundary": [], "mtd": 0.0, "cli_mtd": 0.0,
+                                             "cli_date": None, "stale_cli": False,
+                                             "pday": 0.0, "notes": [],
+                                             "horizon_days": 30, "n_segments": 40},
+                obs_fn=lambda spec, n: {"wet": False, "obs_time": None, "phour": 0.0,
+                                        "wx": ""})
+        self.assertEqual(write(self.NOW), (1, 1))
+        with open(self.path, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d["auto_stations"]["PHX"]["net"], "AZ_ASOS")
+        self.assertIn("KXRAINPHXM-26NOV-1", d["markets"])
+        self.assertEqual(d["event_state"]["KXRAINQQQM-26NOV"]["error"], "no station")
+        self.assertIn("404", d["unmapped"]["QQQ"]["why"])
+        self.assertEqual(sorted(calls), ["PHX", "QQQ"])
+        # an hour on: PHX comes from the file, QQQ waits out its retry
+        self.assertEqual(write(self.NOW + timedelta(hours=1)), (1, 1))
+        self.assertEqual(sorted(calls), ["PHX", "QQQ"])
+        # past AUTO_RETRY_SECS: QQQ is tried again
+        write(self.NOW + timedelta(seconds=rmf.AUTO_RETRY_SECS + 60))
+        self.assertEqual(sorted(calls), ["PHX", "QQQ", "QQQ"])
+        # a hand row always wins over an auto one
+        self.assertIs(rmf.station_spec("ORD"), rmf.CLI_STATIONS["ORD"])
+
+    def test_extra_monthly_series_are_read(self):
+        s = rmf.all_series(period_series=["KXRAINNYCW"], monthly_series=["KXRAINPHXM"])
+        self.assertEqual(s[:len(rmf.SERIES)], tuple(rmf.SERIES))
+        self.assertEqual(s[len(rmf.SERIES)], "KXRAINPHXM")
+        self.assertEqual(s[-1], "KXRAINNYCW")
+        seen = []
+
+        def reader(path, params):
+            seen.append(params["series_ticker"])
+            if params["series_ticker"] == "KXRAINPHXM":
+                return {"markets": [dict(market("KXRAINPHXM-26NOV", 2, code="PHX"))]}
+            return {"markets": []}
+        ev = rmf.fetch_events(reader, monthly_series=["KXRAINPHXM"])
+        self.assertIn("KXRAINPHXM", seen)
+        self.assertEqual(ev["KXRAINPHXM-26NOV"]["code"], "PHX")
+
+
 class TestPeriodShape(unittest.TestCase):
 
     def test_station_codes_of_the_period_rules(self):

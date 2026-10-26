@@ -12214,6 +12214,86 @@ class TestNoLivePathUnderTest(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class TestRainMonthlyNewCities(unittest.TestCase):
+    """A KXRAIN<CITY>M beyond the named list (Jack 2026-10-26: "Enroll and
+    prevent this issue in the future", after six November cities sat dark):
+    it enrolls by name, clones the named members' guard set, reaches the
+    writer through the programs feed and quotes only through the same
+    fail-closed gate. Fixture KXRAINPHXM-68DEC-3 on TestRainMonthlyGate's
+    fixtures."""
+
+    T = "KXRAINPHXM-68DEC-3"
+    EV = "KXRAINPHXM-68DEC"
+    _bump = 1
+
+    def setUp(self):
+        TestRainMonthlyGate.setUp(self)
+        self._saved_ov = imm.SERIES_OVERRIDES.pop("KXRAINPHXM", None)
+
+    def tearDown(self):
+        TestRainMonthlyGate.tearDown(self)
+        imm.SERIES_OVERRIDES.pop("KXRAINPHXM", None)
+        if self._saved_ov is not None:
+            imm.SERIES_OVERRIDES["KXRAINPHXM"] = self._saved_ov
+
+    def _write(self, **kw):
+        return TestRainMonthlyGate._write(self, **kw)
+
+    def _bot(self):
+        return TestRainMonthlyGate._bot(self)
+
+    def _quotes(self, bot):
+        return TestRainMonthlyGate._quotes(self, bot)
+
+    def test_a_new_city_enrolls_by_name_and_quotes_through_the_gate(self):
+        s = "KXRAINPHXM"
+        self.assertNotIn(s, imm.RAIN_MONTHLY_SERIES)
+        self.assertTrue(imm.rain_monthly_auto(s))
+        self.assertTrue(imm.rain_monthly_series(s))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(self.T))
+            # a period-shaped ticker is not a monthly one (its own family)
+            self.assertFalse(imm.rain_monthly_auto(s)
+                             and not imm.rain_period_ticker(f"{s}-01NOV26-30NOV26-T2"))
+        bot = self._bot()
+        bot.run_cycle()                                       # no fair yet: closed
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self.assertEqual(bot._rain_monthly_extra, {s})        # handed to the writer
+        self.assertIs(imm.SERIES_OVERRIDES[s],
+                      imm.SERIES_OVERRIDES[imm.RAIN_MONTHLY_ARCHETYPE])
+        self._write(p=0.5)
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        self.assertTrue(self._quotes(bot))
+
+    def test_the_name_rule_and_what_it_leaves_alone(self):
+        for s in ("KXRAINLASM", "KXRAINPHLM", "KXRAINSACM", "KXRAINSLCM"):
+            self.assertTrue(imm.rain_monthly_auto(s), s)
+        # KXRAINSACM also fits the rainstorm-span name (KXRAINS + 3): the
+        # monthly clone comes first
+        saved = imm.SERIES_OVERRIDES.pop("KXRAINSACM", None)
+        try:
+            imm.ensure_family_override("KXRAINSACM")
+            self.assertIs(imm.SERIES_OVERRIDES["KXRAINSACM"],
+                          imm.SERIES_OVERRIDES[imm.RAIN_MONTHLY_ARCHETYPE])
+        finally:
+            imm.SERIES_OVERRIDES.pop("KXRAINSACM", None)
+            if saved is not None:
+                imm.SERIES_OVERRIDES["KXRAINSACM"] = saved
+        # the period archetype, the spans, the dailies, the weekend and the
+        # named cities are not "beyond the list"
+        for s in ("KXRAINNAPAM", "KXRAINSBOS", "KXRAIN", "KXRAINWKND", "KXRAINNYCW",
+                  "KXRAINATLM", "KXRAINCHIM"):
+            self.assertFalse(imm.rain_monthly_auto(s), s)
+        self.assertFalse(imm.rain_monthly_series("KXRAINNAPAM"))
+        with mock.patch.object(imm, "RAIN_MONTHLY_SERIES_RE", None):
+            self.assertFalse(imm.rain_monthly_auto("KXRAINPHXM"))
+        import inspect
+        self.assertIn("monthly_series=sorted(self._rain_monthly_extra)",
+                      inspect.getsource(imm.IncentiveMarketMaker.run))
+
+
 class TestRainMonthlyGate(unittest.TestCase):
     """rain_monthly_fair.json -> load_rain_monthly/rain_monthly_gate_reason
     -> the stand-aside on KXRAINCHIM / KXRAINAUSM (Jack 2026-10-01: "quote

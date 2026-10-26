@@ -570,6 +570,12 @@ def owner_of(series: str) -> Tuple[str, bool]:
         imm.load_hight_fair()           # its membership is the fair file's series
         if imm.hight_series(s):
             return "", False
+    # the monthly rain family claims every KXRAIN<CITY>M by name since
+    # 2026-10-26 (Jack: "Enroll and prevent this issue in the future", after
+    # six new cities were called "kept out on purpose" off the scan's KXRAIN
+    # exclusion): a city still dark is a station or model gap, not an owner
+    if getattr(imm, "rain_monthly_series", None) and imm.rain_monthly_series(s):
+        return "", False
     named = next((why for p, why in OWNER_PREFIXES if s.startswith(p)), "")
     if any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ())):
         return named or "blocklisted in incentive_mm.py", bool(named)

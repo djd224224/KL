@@ -6876,6 +6876,8 @@ _DEFAULT_RAIN_MONTHLY_SERIES = (
     # the six Kalshi listed for November (2026-10-26; their stations
     # verified in rain_monthly_fair.CLI_STATIONS)
     "KXRAINATLM,KXRAINBOSM,KXRAINDCM,KXRAININDM,KXRAINMINM,KXRAINNOLAM")
+# the guard set a city beyond the list clones (rain_monthly_auto, 2026-10-26)
+RAIN_MONTHLY_ARCHETYPE = "KXRAINAUSM"
 # MONTHLY SNOW (Jack 2026-10-04: "build the snow feed"). KX<CITY>SNOWM settle
 # on The Weather Company's snowfall dashboard = the NWS climate report's
 # daily snowfall at the city's station, summed over the month. The ten in
@@ -9190,6 +9192,10 @@ FAMILY_OVERRIDE_PARENTS = (
     ("family_suffix", "POS", "KXDRPEPPERPOS"),
     # regex kind (2026-09-24): the sports ladder / escalator families
     ("pattern", SPORTS_LADDER_LEAGUE_RE, "KXNFLLADDERREC"),
+    # monthly rain cities beyond the named list (2026-10-26, see
+    # rain_monthly_auto): BEFORE the rainstorm regex, which also matches a
+    # KXRAINS??M monthly name (KXRAINSEAM's shape)
+    ("predicate", lambda s: rain_monthly_auto(s), RAIN_MONTHLY_ARCHETYPE),
     # rainstorm spans (2026-09-24 pm): KXRAINS<CITY>, archetype KXRAINSBOS.
     # The name regex also matches the KXRAINS*M monthlies, but only a
     # series that passed _allowed (the two-date ticker shape) reaches here.
@@ -12791,8 +12797,35 @@ for _s in RAIN_MONTHLY_SERIES:
         size_mult=RAIN_MONTHLY_SIZE_MULT)
 
 
+# NEW MONTHLY CITIES ENROLL THEMSELVES (Jack 2026-10-26: "Enroll and prevent
+# this issue in the future", after KXRAINATLM, KXRAINBOSM, KXRAINDCM,
+# KXRAININDM, KXRAINMINM and KXRAINNOLAM sat dark for a day: the family was
+# a hand list, and the watch read them as "kept out on purpose" off the
+# scan's KXRAIN exclusion). Any KXRAIN<CITY>M (RAIN_MONTHLY_SERIES_RE) is a
+# member like the named ones -- allowed (its month-shaped tickers; a period
+# or span ticker keeps its own family), the named members' guard set cloned
+# from RAIN_MONTHLY_ARCHETYPE (band, x2, out 22:00 ET the day before the
+# month's last day), quoted only through this fail-closed gate -- and the
+# programs feed hands it to the writer (refresh_universe's
+# _rain_monthly_extra), which auto-maps the station its rules name with the
+# hand rows' checks (rain_monthly_fair AUTO-MAPPED STATIONS); a station that
+# fails them leaves its events without a fair, stood aside, and the watch's
+# model-coverage pass reports it. KXRAINNAPAM is the period family's
+# archetype, not a monthly. IMM_RAIN_MONTHLY_SERIES_RE="" turns the rule off.
+_RAIN_MONTHLY_RE_SPEC = os.environ.get("IMM_RAIN_MONTHLY_SERIES_RE", r"KXRAIN[A-Z]{2,5}M")
+RAIN_MONTHLY_SERIES_RE = re.compile(_RAIN_MONTHLY_RE_SPEC) if _RAIN_MONTHLY_RE_SPEC else None
+
+
+def rain_monthly_auto(series: str) -> bool:
+    """A monthly rain city by name, beyond the named list."""
+    return (RAIN_MONTHLY_ENABLE and series not in RAIN_MONTHLY_SERIES
+            and bool(RAIN_MONTHLY_SERIES_RE and RAIN_MONTHLY_SERIES_RE.fullmatch(series))
+            and series != RAIN_PERIOD_ARCHETYPE and not rain_period_member(series))
+
+
 def rain_monthly_series(series: str) -> bool:
-    return RAIN_MONTHLY_ENABLE and series in RAIN_MONTHLY_SERIES
+    return RAIN_MONTHLY_ENABLE and (series in RAIN_MONTHLY_SERIES
+                                    or rain_monthly_auto(series))
 
 
 def load_rain_monthly() -> int:
@@ -19796,6 +19829,7 @@ class IncentiveMarketMaker:
         # KXRAIN period series seen in the programs feed (the writer prices
         # them beside its own list, rain_monthly_fair.PERIOD_SERIES)
         self._rain_period_series: Set[str] = set()
+        self._rain_monthly_extra: Set[str] = set()
         # ...and the snow monthlies seen there (snow_monthly_fair.SERIES)
         self._snow_series: Set[str] = set()
         self._resort_series: Set[str] = set()
@@ -24509,6 +24543,7 @@ class IncentiveMarketMaker:
             datacenter_series(series) or \
             rainstorm_span_allowed(ticker) or \
             rain_period_gated(ticker) or \
+            (rain_monthly_auto(series) and not rain_period_ticker(ticker)) or \
             ytw_pilot_ticker(ticker) or \
             snow_monthly_series(series) or \
             bigsky_series(series) or \
@@ -24883,6 +24918,14 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} rain-period series in the feed: "
                     f"{','.join(sorted(_rp))}")
             self._rain_period_series = _rp
+            # ...and the monthly rain cities beyond the named list
+            # (2026-10-26), the same way: the writer prices and auto-maps them
+            _rmx = {series_of(t) for t in by_market
+                    if rain_monthly_auto(series_of(t)) and not rain_period_ticker(t)}
+            if _rmx - self._rain_monthly_extra:
+                log(f"{self.tag} rain-monthly cities beyond the list in the feed: "
+                    f"{','.join(sorted(_rmx))}")
+            self._rain_monthly_extra = _rmx
             # ...and the snow monthlies (2026-10-04), the same way
             _sn = {series_of(t) for t in by_market if snow_monthly_series(series_of(t))}
             if _sn - self._snow_series:
@@ -31642,7 +31685,8 @@ class IncentiveMarketMaker:
                         ok, miss = rain_monthly_fair.write_fair_file(
                             RAIN_MONTHLY_FILE, get_json=kalshi_get,
                             period_series=(sorted(self._rain_period_series)
-                                           if RAIN_PERIOD_ENABLE else ()))
+                                           if RAIN_PERIOD_ENABLE else ()),
+                            monthly_series=sorted(self._rain_monthly_extra))
                         if last != (ok, miss):
                             log(f"{self.tag} rain-monthly refresh: {ok} events "
                                 f"with a fair"

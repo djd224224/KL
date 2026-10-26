@@ -203,6 +203,86 @@ def station_code(rules: str) -> Optional[str]:
     return None
 
 
+# AUTO-MAPPED STATIONS (Jack 2026-10-26: "Enroll and prevent this issue in
+# the future", after six November cities sat dark for want of hand rows). A
+# code an open event's rules name that has no CLI_STATIONS row is resolved
+# and checked the way the hand rows were (10/01, 10/26): the NWS station
+# record (K + code: name, time zone, and the state from its county zone --
+# KDCA's is VAC013, so VA_ASOS), then IEM currents ({state}_ASOS, an
+# observation within AUTO_OBS_MAX_AGE_HOURS), IEM's CLI (K + code, a report
+# within AUTO_CLI_MAX_AGE_DAYS) and ACIS (a precipitation record of
+# AUTO_MIN_RECORD_YEARS or more, still current; coordinates from ACIS like
+# the hand rows). A pass is kept in the file's "auto_stations"; a failure goes
+# to "unmapped" with what failed and is tried again after AUTO_RETRY_SECS --
+# its events get no fair meanwhile (the gate stands them aside), never a
+# guessed station. The hand rows always win.
+AUTO_OBS_MAX_AGE_HOURS = 6
+AUTO_CLI_MAX_AGE_DAYS = 10
+AUTO_MIN_RECORD_YEARS = 20
+AUTO_RETRY_SECS = 6 * 3600
+AUTO_STATIONS: Dict[str, dict] = {}       # code -> row, the file's, each write
+_ZONE_RE = re.compile(r"([A-Z]{2})[CZ]\d{3}")
+
+
+def station_spec(code: Optional[str]) -> Optional[dict]:
+    """The station row for a code: the hand rows, then the auto-mapped."""
+    if not code:
+        return None
+    return CLI_STATIONS.get(code) or AUTO_STATIONS.get(code)
+
+
+def resolve_station(code: str, now: datetime, get: Callable = rm.http_json) -> dict:
+    """An auto row for the station `code` names, or RuntimeError saying which
+    check failed (see AUTO-MAPPED STATIONS)."""
+    sid = f"K{code}"
+    props = (get(f"https://api.weather.gov/stations/{sid}", tries=2)
+             .get("properties") or {})
+    tz = str(props.get("timeZone") or "")
+    try:
+        pytz.timezone(tz)
+    except pytz.UnknownTimeZoneError:
+        raise RuntimeError(f"{sid}: NWS gives no usable time zone ({tz!r})")
+    zone = str(props.get("county") or props.get("forecast") or "").rstrip("/").rsplit("/", 1)[-1]
+    m = _ZONE_RE.fullmatch(zone)
+    if not m:
+        raise RuntimeError(f"{sid}: no state in the NWS zone {zone!r}")
+    net = f"{m.group(1)}_ASOS"
+    row = (get(f"https://mesonet.agron.iastate.edu/api/1/currents.json"
+               f"?station={code}&network={net}", tries=2).get("data") or [{}])[0]
+    try:
+        ob = datetime.fromisoformat(str(row.get("utc_valid") or "").replace("Z", "+00:00"))
+    except ValueError:
+        ob = None
+    if ob is None or (now - ob).total_seconds() > AUTO_OBS_MAX_AGE_HOURS * 3600:
+        raise RuntimeError(f"{code}: no IEM observation on {net} within "
+                           f"{AUTO_OBS_MAX_AGE_HOURS}h ({row.get('utc_valid')!r})")
+    cli = get(f"https://mesonet.agron.iastate.edu/json/cli.py?station={sid}"
+              f"&year={now.year}", tries=2).get("results") or []
+    days = sorted(str(r.get("valid") or "") for r in cli if r.get("valid"))
+    if not days or days[-1] < (now - timedelta(days=AUTO_CLI_MAX_AGE_DAYS)).date().isoformat():
+        raise RuntimeError(f"{sid}: no IEM CLI report within {AUTO_CLI_MAX_AGE_DAYS} days "
+                           f"(last {days[-1] if days else None})")
+    meta = (get(f"https://data.rcc-acis.org/StnMeta?sids={sid}&meta=name,ll,valid_daterange"
+                f"&elems=pcpn", tries=2).get("meta") or [{}])[0]
+    rng = ((meta.get("valid_daterange") or [[]])[0] or [None, None])
+    try:
+        first, last = date.fromisoformat(rng[0]), date.fromisoformat(rng[1])
+    except (TypeError, ValueError, IndexError):
+        raise RuntimeError(f"{sid}: no ACIS precipitation record ({rng!r})")
+    if (now.date() - first).days < AUTO_MIN_RECORD_YEARS * 365 or \
+            (now.date() - last).days > AUTO_CLI_MAX_AGE_DAYS:
+        raise RuntimeError(f"{sid}: ACIS precipitation record {first}..{last} is too short "
+                           f"or not current")
+    lon, lat = (meta.get("ll") or [None, None])[:2]
+    if lat is None or lon is None:
+        raise RuntimeError(f"{sid}: ACIS gives no coordinates")
+    return {"icao": sid, "iem": code, "net": net,
+            "name": str(meta.get("name") or props.get("name") or sid),
+            "lat": round(float(lat), 5), "lon": round(float(lon), 5), "tz": tz,
+            "auto": True, "checked_at": now.isoformat(),
+            "record": [first.isoformat(), last.isoformat()]}
+
+
 def parse_period(event: str) -> Optional[Tuple[date, date]]:
     """KXRAINNAPAM-01NOV26-31MAR27 -> (2026-11-01, 2027-03-31): the event's
     two day segments, DDMONYY, both days inclusive. None for any other
@@ -257,24 +337,28 @@ def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
     return {}
 
 
-def all_series(period_series: Iterable[str] = ()) -> Tuple[str, ...]:
-    """The monthly SERIES, then PERIOD_SERIES and any extra period series,
-    each once."""
+def all_series(period_series: Iterable[str] = (),
+               monthly_series: Iterable[str] = ()) -> Tuple[str, ...]:
+    """The monthly SERIES and any extra monthly series (a city the bot's
+    programs feed shows that is not on the list yet), then PERIOD_SERIES and
+    any extra period series, each once."""
     out: List[str] = []
-    for s in tuple(SERIES) + tuple(PERIOD_SERIES) + tuple(period_series or ()):
+    for s in (tuple(SERIES) + tuple(monthly_series or ()) + tuple(PERIOD_SERIES)
+              + tuple(period_series or ())):
         if s and s not in out:
             out.append(s)
     return tuple(out)
 
 
 def fetch_events(get_json: Optional[Callable] = None,
-                 period_series: Iterable[str] = ()) -> Dict[str, dict]:
+                 period_series: Iterable[str] = (),
+                 monthly_series: Iterable[str] = ()) -> Dict[str, dict]:
     """Open rain-total events: event -> {"series", "code", "strikes":
     {ticker: K}}, plus "start"/"end" (ISO days) on a period event. The code
     comes from the rules; an event whose markets disagree on it, or whose
     rules name another period than its ticker, gets no code (stood aside)."""
     out: Dict[str, dict] = {}
-    for s in all_series(period_series):
+    for s in all_series(period_series, monthly_series):
         js = _signed_or_public(get_json, {"series_ticker": s, "status": "open", "limit": 200})
         for m in js.get("markets") or []:
             ev = str(m.get("event_ticker") or "")
@@ -500,7 +584,7 @@ def period_fair(event: str, info: dict, now: datetime,
                 rng: Optional[random.Random] = None) -> Optional[dict]:
     """event_fair for a period event (info carries "start"/"end"); None
     when the station is unknown or the period is over."""
-    spec = CLI_STATIONS.get(info.get("code") or "")
+    spec = station_spec(info.get("code"))
     try:
         start = date.fromisoformat(str(info["start"]))
         end = date.fromisoformat(str(info["end"]))
@@ -542,7 +626,7 @@ def event_fair(event: str, info: dict, now: datetime,
     if info.get("start"):
         return period_fair(event, info, now, n_samples=n_samples, rng=rng)
     code = info.get("code")
-    spec = CLI_STATIONS.get(code or "")
+    spec = station_spec(code)
     ym = rm.parse_event_month(event)
     if spec is None or ym is None or not info.get("strikes"):
         return None
@@ -580,19 +664,23 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     events: Optional[Dict[str, dict]] = None,
                     fair_fn: Callable = event_fair,
                     obs_fn: Callable = obs_state,
-                    period_series: Iterable[str] = ()) -> Tuple[int, int]:
+                    period_series: Iterable[str] = (),
+                    monthly_series: Iterable[str] = (),
+                    resolve_fn: Callable = resolve_station) -> Tuple[int, int]:
     """Build and atomically write the fair file. Returns (events with a
     fair, events without one). Kalshi's open events are re-read hourly, and
-    at once when `period_series` names a series the cached read lacks; a
-    failed read reuses the previous file's. The last wet observation per
-    event survives across writes (the DRY_MIN cool-down). A period event
-    before its first day reads dry without an observation."""
+    at once when `period_series` or `monthly_series` names a series the
+    cached read lacks; a failed read reuses the previous file's. A station
+    no row maps is auto-mapped (resolve_fn, see AUTO-MAPPED STATIONS). The
+    last wet observation per event survives across writes (the DRY_MIN
+    cool-down). A period event before its first day reads dry without an
+    observation."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
     ev_cache = old.get("events") or {}
     events_at = old.get("events_at")
-    want = all_series(period_series)
+    want = all_series(period_series, monthly_series)
     have = old.get("events_series")
     if events is None:
         # a file from before the period families (no events_series) is
@@ -603,7 +691,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             want = tuple(have)
         else:
             try:
-                events = fetch_events(get_json, period_series)
+                events = fetch_events(get_json, period_series, monthly_series)
                 events_at = ts
             except Exception as e:
                 if not ev_cache:
@@ -612,12 +700,33 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                      f"reusing {len(ev_cache)} cached")
                 events = ev_cache
                 want = tuple(have) if have is not None else want
+    # the auto-mapped stations: the file's, plus any code an open event names
+    # that no row maps (a failure is retried after AUTO_RETRY_SECS)
+    AUTO_STATIONS.clear()
+    AUTO_STATIONS.update({c: v for c, v in (old.get("auto_stations") or {}).items()
+                          if isinstance(v, dict)})
+    unmapped: Dict[str, dict] = dict(old.get("unmapped") or {})
+    for code in sorted({str(i.get("code")) for i in events.values() if i.get("code")}):
+        if station_spec(code) is not None:
+            unmapped.pop(code, None)
+            continue
+        if ts - float((unmapped.get(code) or {}).get("at") or 0) < AUTO_RETRY_SECS:
+            continue
+        try:
+            AUTO_STATIONS[code] = resolve_fn(code, now)
+            unmapped.pop(code, None)
+            _log(f"station {code} auto-mapped: {AUTO_STATIONS[code]['name']} "
+                 f"({AUTO_STATIONS[code]['net']}, {AUTO_STATIONS[code]['tz']})")
+        except Exception as e:
+            unmapped[code] = {"at": ts, "why": f"{type(e).__name__}: {str(e)[:160]}"}
+            _log(f"! station {code} unmapped, its events stand aside: "
+                 f"{unmapped[code]['why']}")
     old_ev = old.get("event_state") or {}
     markets: Dict[str, dict] = {}
     state: Dict[str, dict] = {}
     missing: List[str] = []
     for ev, info in sorted(events.items()):
-        spec = CLI_STATIONS.get(info.get("code") or "")
+        spec = station_spec(info.get("code"))
         st = {"code": info.get("code"), "fetched_at": now.isoformat(),
               "last_wet_at": (old_ev.get(ev) or {}).get("last_wet_at")}
         before = False
@@ -659,6 +768,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         json.dump({"generated_at": now.isoformat(), "markets": markets,
                    "event_state": state, "missing": missing, "events": events,
                    "events_at": events_at, "events_series": list(want),
+                   "auto_stations": dict(AUTO_STATIONS), "unmapped": unmapped,
                    "model": {"samples": N_SAMPLES, "obs_max_age_min": OBS_MAX_AGE_MIN,
                              "boundary_in": BOUNDARY_IN,
                              "forecast_weight": rm.FORECAST_WEIGHT,
@@ -675,9 +785,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", default=os.path.join(STATUS_DIR, "rain_monthly_fair.json"))
     ap.add_argument("--period-series", default="",
                     help="extra period-total series, comma separated")
+    ap.add_argument("--monthly-series", default="",
+                    help="extra monthly series, comma separated")
     args = ap.parse_args(argv)
     ok, miss = write_fair_file(args.out, period_series=[
-        s.strip() for s in args.period_series.split(",") if s.strip()])
+        s.strip() for s in args.period_series.split(",") if s.strip()], monthly_series=[
+        s.strip() for s in args.monthly_series.split(",") if s.strip()])
     _log(f"{ok} events with a fair, {miss} without -> {args.out}")
     return 0
 

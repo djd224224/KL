@@ -207,6 +207,21 @@ class TestCoverage(unittest.TestCase):
         out3, _st = mc.due(st, gaps, self.now + 1800)             # still unread a pass later
         self.assertEqual([(k, n) for k, _g, _f, n in out3], [(key, True)])
 
+    def test_a_new_rain_city_whose_station_failed_says_what_failed(self):
+        # 2026-10-26 (Jack: "Enroll and prevent this issue in the future"): a
+        # KXRAIN<CITY>M beyond the named list is a member by name, and the
+        # writer's auto-mapping failure rides into the gap
+        rain = os.path.join(self.dir, "rain_monthly_fair.json")
+        _write(rain, {"generated_at": datetime.now(timezone.utc).isoformat(),
+                      "events": {"KXRAINQQQM-26NOV": {}},
+                      "event_state": {"KXRAINQQQM-26NOV": {"code": "QQQ",
+                                                           "error": "no station"}},
+                      "unmapped": {"QQQ": {"at": self.now, "why": "RuntimeError: KQQQ: 404"}}})
+        with mock.patch.object(imm, "RAIN_MONTHLY_FILE", rain):
+            gaps = mc.find_gaps({"KXRAINQQQM-26NOV-2": {}}, self.now, [mc.check_rain_monthly])
+        g = gaps["Monthly / period rain (rain_monthly_fair)|KXRAINQQQM-26NOV"]
+        self.assertIn("auto-mapping failed: RuntimeError: KQQQ: 404", g["why"])
+
     def test_vercel_labs_are_quiet_while_the_fair_reads_the_chart(self):
         # 2026-10-22 (the meta gap): KXOPENSOURCESHARE priced off Vercel's
         # weight-class chart has no lab list to keep; on the lab sum it reports
