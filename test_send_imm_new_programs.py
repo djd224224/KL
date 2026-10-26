@@ -42,6 +42,7 @@ def setUpModule():
     imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
     np.SEEN_PATH = os.path.join(tmp, "imm_new_programs_seen.json")
     np.STATE_PATH = os.path.join(tmp, "imm_state.json")
+    np.dash.STATUS_DIR = tmp          # the selection snapshot the estimates read
     # Fixture series are not in the production allowlist; allowlist policy has
     # its own tests below that patch _allowed/_blocked explicitly.
     imm.ALLOWLIST_ONLY = False
@@ -96,7 +97,7 @@ def clear_files():
         if os.path.exists(p):
             os.remove(p)
     for name in os.listdir(imm.STATUS_DIR):
-        if name.startswith("imm_new_programs_sent_"):
+        if name.startswith(("imm_new_programs_sent_", "selection_snapshot_")):
             os.remove(os.path.join(imm.STATUS_DIR, name))
     gaps_cache = getattr(np.gaps, "_TITLE_CACHE", None)
     if isinstance(gaps_cache, dict):
@@ -532,6 +533,9 @@ class Rendering(unittest.TestCase):
             text, html, _s, _e, _seen, _c = run_report(rows)
         # $300 + $200 + $100 over a ~1.08d window -> the TOTAL must be all 3
         self.assertIn("and 1 smaller event(s)", text)
+        # the full table, past the top table (which has its own TOTAL)
+        text = text.split("PROGRAM WINDOW (ET)", 1)[1]
+        html = html.split("PROGRAM WINDOW (ET)", 1)[1]
         total_line = [ln for ln in text.splitlines() if ln.startswith("TOTAL")][0]
         self.assertIn("600.00", total_line)          # pool$ across all three
         self.assertIn("R0-26SEP20", html)
@@ -578,6 +582,119 @@ class Rendering(unittest.TestCase):
                      NOW + timedelta(days=1))]
         text, _html, _s, _e, _seen, _c = run_report(rows)
         text.encode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# The top table: quoted fraction and the bot's own estimates
+# ---------------------------------------------------------------------------
+
+def write_state(selected):
+    with open(np.STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"selected_tickers": sorted(selected)}, f)
+
+
+def write_snapshot(rows, ts=NOW - timedelta(minutes=40)):
+    """One hourly selection_snapshot block: every row at one ts."""
+    path = os.path.join(imm.STATUS_DIR, f"selection_snapshot_{ts:%Y-%m-%d}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps({"ts": ts.isoformat(), "decision": "selected",
+                                **r}) + "\n")
+
+
+def snap(ticker, est_day, proj):
+    return {"ticker": ticker, "est_dollars_per_day": est_day,
+            "projected_total": proj}
+
+
+class TopTable(unittest.TestCase):
+    """Jack 2026-10-25: "show a table at the top, of new events in the past
+    day, which are quoting, what fraction of the markets within an event are
+    quoted, and estimated earnings"."""
+
+    def setUp(self):
+        clear_files()
+
+    def tearDown(self):
+        clear_files()
+
+    def _rows(self):
+        start, end = NOW - timedelta(hours=2), NOW + timedelta(days=1)
+        return [prog("KXQ-26SEP20-T1", start, end, reward=100000),
+                prog("KXQ-26SEP20-T2", start, end, reward=100000),
+                prog("KXQ-26SEP20-T3", start, end, reward=100000),
+                # the biggest pool, not quoted: first in the full table only
+                prog("KXN-26SEP20-T1", start, end, reward=5000000)]
+
+    def _line(self, text, start):
+        return [ln for ln in text.splitlines() if ln.startswith(start)][0]
+
+    def test_estimate_sums_the_quoted_markets_only(self):
+        rec = {"tickers": {"KXQ-26SEP20-T1", "KXQ-26SEP20-T2", "KXQ-26SEP20-T3"}}
+        est = {t: snap(t, d, p) for t, d, p in (("KXQ-26SEP20-T1", 2.5, 4.0),
+                                                 ("KXQ-26SEP20-T2", 1.5, 3.0),
+                                                 ("KXQ-26SEP20-T3", 9.0, 9.0))}
+        out = np.quote_summary(rec, {"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"}, est)
+        self.assertEqual(out, {"n_quoted": 2, "est_day": 4.0, "est_total": 7.0,
+                               "est_missing": 0})
+
+    def test_table_is_at_the_top_with_quoting_events_first(self):
+        write_state({"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"})
+        write_snapshot([snap("KXQ-26SEP20-T1", 2.5, 4.0),
+                        snap("KXQ-26SEP20-T2", 1.5, 3.0),
+                        snap("KXQ-26SEP20-T3", 9.0, 9.0)])   # not quoted
+        text, html, _s, _e, _seen, _c = run_report(self._rows())
+        self.assertLess(text.index("QUOTING AND ESTIMATED EARNINGS"),
+                        text.index("of new pool"))          # above the headline
+        top = text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1]
+        for cell in ("2/3 67%", "4.00", "7.00", "yes"):
+            self.assertIn(cell, self._line(top, "Q-26SEP20"))
+        self.assertIn("0/1 0%", self._line(top, "N-26SEP20"))
+        self.assertLess(top.index("Q-26SEP20"), top.index("N-26SEP20"))
+        for cell in ("2 new events", "2/4 50%", "4.00", "7.00", "1 quoting"):
+            self.assertIn(cell, self._line(top, "TOTAL"))
+        self.assertIn("9/13 6:50am ET selection snapshot", text)
+        self.assertLess(html.index("Quoting and estimated earnings"),
+                        html.index("PROGRAM WINDOW (ET)"))
+        text.encode("ascii")
+
+    def test_quoted_market_newer_than_the_snapshot_marks_the_sum(self):
+        write_state({"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"})
+        write_snapshot([snap("KXQ-26SEP20-T1", 2.5, 4.0)])
+        text, *_rest = run_report(self._rows())
+        line = self._line(text, "Q-26SEP20")
+        self.assertIn("2.50+", line)
+        self.assertIn("4.00+", line)
+        self.assertIn("newer than the snapshot", text)
+
+    def test_no_snapshot_says_so_and_the_email_still_builds(self):
+        write_state({"KXQ-26SEP20-T1"})
+        text, *_rest = run_report(self._rows())
+        self.assertIn("no selection snapshot found", text)
+        line = self._line(text, "Q-26SEP20")
+        self.assertIn("1/3 33%", line)
+        self.assertIn("n/a", line)
+
+    def test_stale_snapshot_is_flagged(self):
+        write_state({"KXQ-26SEP20-T1"})
+        write_snapshot([snap("KXQ-26SEP20-T1", 2.5, 4.0)],
+                       ts=NOW - timedelta(hours=5))
+        text, *_rest = run_report(self._rows())
+        self.assertIn("STALE, 5h old", text)
+
+    def test_total_covers_every_new_event_when_rows_are_capped(self):
+        write_state({"KXQ-26SEP20-T1"})
+        write_snapshot([snap("KXQ-26SEP20-T1", 2.5, 4.0)])
+        with mock.patch.object(np, "SUMMARY_ROWS", 1):
+            text, *_rest = run_report(self._rows())
+        top = text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1].split(
+            "of new pool", 1)[0]
+        self.assertIn("Q-26SEP20", top)
+        self.assertNotIn("N-26SEP20", top)
+        self.assertIn("and 1 more new event(s), none quoting", top)
+        total = self._line(top, "TOTAL")
+        self.assertIn("2 new events", total)
+        self.assertIn("1/4 25%", total)
 
 
 # ---------------------------------------------------------------------------

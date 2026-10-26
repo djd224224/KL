@@ -3,14 +3,22 @@ r"""send_imm_new_programs.py — the daily "new incentive programs" email
 (Jack 2026-09-13: "new daily morning email, table of all the new incentive
 rewards events that started in the past day").
 
-WHAT IT IS: one table, one row per EVENT whose liquidity-incentive programs
-STARTED inside the window (normally the 24h since yesterday's email) —
-what the event is in plain English, how many markets carry programs, the
-pool in $/day and in total-period $, the program window in ET, the target
-depth, and what the bot is doing about it (quoting / allowed / blocked /
-not allowlisted, plus a cutoff flag when the bot provably cannot earn the
-pool). Sorted biggest pool first, TOTAL row across EVERY new event (not
-just the rows shown).
+WHAT IT IS: two tables, one row per EVENT whose liquidity-incentive
+programs STARTED inside the window (normally the 24h since yesterday's
+email):
+  * at the top (Jack 2026-10-25: "show a table at the top, of new events in
+    the past day, which are quoting, what fraction of the markets within an
+    event are quoted, and estimated earnings"): whether the bot quotes the
+    event, how many of its program markets it quotes, and the bot's own
+    estimate for those markets ($/day now, and $ to its stop) from its
+    newest hourly selection snapshot. Quoting events first, biggest
+    estimate first;
+  * then the full table: what the event is in plain English, how many
+    markets carry programs, the pool in $/day and in total-period $, the
+    program window in ET, the target depth, and what the bot is doing about
+    it (quoting / allowed / blocked / not allowlisted, plus a cutoff flag
+    when the bot provably cannot earn the pool). Sorted biggest pool first.
+Both carry a TOTAL row across EVERY new event (not just the rows shown).
 
 WHY IT EXISTS: reward supply is the bot's raw material and it moves before
 P&L does, but nothing in the morning lineup reports the SUPPLY SIDE. The
@@ -65,6 +73,8 @@ GET /trade-api/v2/incentive_programs; `period_reward` is CENTI-CENTS
 Allowlist verdicts come from the bot's own IncentiveMarketMaker._allowed /
 _blocked with the extra-allow and finecon extension files hot-loaded, and
 "quoting" is selected_tickers from the bot's persisted imm_state.json.
+The estimates are the bot's own selection_snapshot rows (every candidate it
+scored, hourly; imm_dashboard.read_last_snapshot reads the file tail only).
 Config parity with the live bot comes from importing imm_quote_gaps FIRST,
 which mirrors run_incentive_mm.ps1's $ProbeEnv into the environment before
 incentive_mm's module-level config is read (it logs "[GAPS] mirrored N
@@ -105,6 +115,7 @@ from html import escape as _esc
 import imm_quote_gaps as gaps
 import incentive_mm as imm
 from incentive_mm import log
+import imm_dashboard as dash  # read_last_snapshot: the bot's estimates (stdlib-only)
 
 SEEN_PATH = os.path.join(imm.STATUS_DIR, "imm_new_programs_seen.json")
 STATE_PATH = os.path.join(imm.STATUS_DIR, "imm_state.json")
@@ -119,6 +130,12 @@ MAX_LOOKBACK_HOURS = float(os.environ.get("IMM_NEWPROG_MAX_LOOKBACK_HOURS", "168
 # the printed rows are capped, and the overflow is stated with its pool.
 MAX_ROWS = int(os.environ.get("IMM_NEWPROG_MAX_ROWS", "75"))
 MAX_LATE_ROWS = int(os.environ.get("IMM_NEWPROG_MAX_LATE_ROWS", "10"))
+# The top table is the phone-sized read: every quoting event leads, then the
+# biggest pools, and the full table below still lists every event.
+SUMMARY_ROWS = int(os.environ.get("IMM_NEWPROG_SUMMARY_ROWS", "30"))
+# The selection snapshot is hourly; older than this, the bot was likely down
+# and the estimates say so.
+EST_STALE_HOURS = float(os.environ.get("IMM_NEWPROG_EST_STALE_HOURS", "2"))
 # A series absent from the feed this long and back again is a RELIT family —
 # the 2026-08-15 KXTEMPMIAH class, worth flagging as loudly as a new one.
 RELIT_DAYS = float(os.environ.get("IMM_NEWPROG_RELIT_DAYS", "7"))
@@ -414,6 +431,45 @@ def bot_status(rec: dict, quoted: set, resolver, now: datetime) -> str:
     return f"{label} - {flag}" if flag else label
 
 
+def load_estimates():
+    """({ticker: snapshot row}, the block's time or None): the bot's newest
+    hourly selection snapshot, every candidate it scored with its modelled
+    yield. A missing or unreadable snapshot costs the estimate columns, never
+    the email."""
+    try:
+        rows, ts = dash.read_last_snapshot()
+    except Exception as e:
+        log(f"! selection snapshot unreadable ({e!r}); no estimates today")
+        return {}, None
+    if not rows or not ts:
+        return {}, None
+    return ({r["ticker"]: r for r in rows if r.get("ticker")},
+            datetime.fromtimestamp(ts, timezone.utc))
+
+
+def quote_summary(rec: dict, quoted: set, est: dict) -> dict:
+    """The top table's numbers for one event: how many of its program markets
+    the bot quotes, and the bot's own estimate summed over THOSE markets --
+    est_dollars_per_day (its modelled share of the pool at its current size)
+    and projected_total (banked this period + the day-size rate over the
+    quotable time left to its stop: the number the payout bar tests).
+
+    est_missing counts quoted markets the snapshot has no row for (picked up
+    after it), so a partial sum is marked as one, not shown as the whole."""
+    q = [t for t in rec["tickers"] if t in quoted]
+    day = total = 0.0
+    missing = 0
+    for t in q:
+        row = est.get(t)
+        if row is None:
+            missing += 1
+            continue
+        day += float(row.get("est_dollars_per_day") or 0.0)
+        total += float(row.get("projected_total") or 0.0)
+    return {"n_quoted": len(q), "est_day": day, "est_total": total,
+            "est_missing": missing}
+
+
 # ----------------------------------------------------------------------------
 # Rendering
 # ----------------------------------------------------------------------------
@@ -519,8 +575,16 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
                 series_relit[s] = dark_days
 
     quoted = set(load_json(STATE_PATH).get("selected_tickers") or [])
+    est, est_at = load_estimates()
+    for rec in new_recs + late_recs:
+        rec.update(quote_summary(rec, quoted, est))
     resolver = imm.EventStartResolver()
-    enrich_titles(client, new_recs[:MAX_ROWS] + late_recs[:MAX_LATE_ROWS])
+    # Titles go to the top table's quoting rows first (small pools, so the
+    # biggest-pool-first budget would leave them as bare tickers), then the
+    # full table's rows.
+    enrich_titles(client, [r for r in new_recs if r["n_quoted"]]
+                  + [r for r in new_recs[:MAX_ROWS] if not r["n_quoted"]]
+                  + late_recs[:MAX_LATE_ROWS])
     for rec in new_recs + late_recs:
         rec.setdefault("what", gaps.describe_event(rec["event"]))
         rec["bot"] = bot_status(rec, quoted, resolver, now_utc)
@@ -546,7 +610,7 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
         "prev_events": int(seen.get("feed_events") or 0),
         "series_new": series_new, "series_relit": series_relit,
         "series_pool": series_pool, "skipped_types": skipped_types,
-        "banner": banner, "statuses": statuses,
+        "banner": banner, "statuses": statuses, "est_at": est_at,
     }
     text = render_text(ctx)
     html = render_html(ctx)
@@ -637,6 +701,130 @@ def _footer_lines(ctx) -> list:
     return out
 
 
+# The top table (Jack 2026-10-25, see the module docstring). QUOTING is last
+# and left-aligned for the reason BOT is below, and wide enough that a "no"
+# carries the BOT cell's reason whole, so the top table reads on its own.
+_SUM_COLS = (("EVENT", 26, "<"), ("WHAT IT IS", 26, "<"), ("QUOTED", 12, ">"),
+             ("EST $/DAY", 9, ">"), ("EST $", 10, ">"), ("QUOTING", 36, "<"))
+
+
+def _summary_rows(new) -> tuple:
+    """(shown, rest): quoting events first, biggest estimate first, then the
+    rest in the full table's order (pool $/day)."""
+    quoting = sorted((r for r in new if r["n_quoted"]),
+                     key=lambda r: (-r["est_total"], -r["est_day"], r["event"]))
+    order = quoting + [r for r in new if not r["n_quoted"]]
+    return order[:SUMMARY_ROWS], order[SUMMARY_ROWS:]
+
+
+def _est_cell(value, n_quoted, n_missing) -> str:
+    """"-" with nothing quoted, "n/a" when no quoted market has an estimate,
+    and a trailing "+" when only some do (the sum is then a floor)."""
+    if not n_quoted:
+        return "-"
+    if n_missing >= n_quoted:
+        return "n/a"
+    return f"{value:,.2f}" + ("+" if n_missing else "")
+
+
+def _frac(k, n) -> str:
+    return f"{k}/{n} {100.0 * k / n:.0f}%" if n else "-"
+
+
+def _summary_cells(rec) -> tuple:
+    q, miss = rec["n_quoted"], rec["est_missing"]
+    return (_short(rec["event"]), rec.get("what", ""),
+            _frac(q, len(rec["tickers"])),
+            _est_cell(rec["est_day"], q, miss),
+            _est_cell(rec["est_total"], q, miss),
+            "yes" if q else rec.get("bot", ""))
+
+
+def _summary_total(rows) -> tuple:
+    q = sum(r["n_quoted"] for r in rows)
+    miss = sum(r["est_missing"] for r in rows)
+    return ("TOTAL", f"{len(rows)} new event{'' if len(rows) == 1 else 's'}",
+            _frac(q, sum(len(r["tickers"]) for r in rows)),
+            _est_cell(sum(r["est_day"] for r in rows), q, miss),
+            _est_cell(sum(r["est_total"] for r in rows), q, miss),
+            f"{sum(1 for r in rows if r['n_quoted'])} quoting")
+
+
+def _summary_notes(ctx, rest) -> tuple:
+    """(where the estimates come from, the lines under the top table)."""
+    at = ctx["est_at"]
+    if at is None:
+        src = "no selection snapshot found: estimates n/a"
+    else:
+        src = f"estimates: the bot's own model at its {_et(at)} ET selection snapshot"
+        age_h = (ctx["now"] - at).total_seconds() / 3600.0
+        if age_h > EST_STALE_HOURS:
+            src += f" - STALE, {age_h:.0f}h old (was the bot down?)"
+    notes = []
+    if rest:
+        n_q = sum(1 for r in rest if r["n_quoted"])
+        notes.append(f"... and {len(rest)} more new event(s), {n_q or 'none'} "
+                     f"quoting - TOTAL covers all of them")
+    notes.append("EST $/DAY = the bot's modelled reward on the markets it "
+                 "quotes; EST $ = banked this period + that rate at day size "
+                 "over the quotable time left to its stop (the payout bar's "
+                 "projection).")
+    if any(r["est_missing"] for r in ctx["new"]):
+        notes.append("+ / n/a = some / all of the event's quoted markets are "
+                     "newer than the snapshot, so their estimate is not in "
+                     "the sum.")
+    return src, notes
+
+
+def _summary_text(ctx) -> list:
+    shown, rest = _summary_rows(ctx["new"])
+    src, notes = _summary_notes(ctx, rest)
+    head = "  ".join(f"{name:{align}{width}}" for name, width, align in _SUM_COLS)
+    lines = [f"QUOTING AND ESTIMATED EARNINGS ({src})", head.rstrip()]
+    for cells in [_summary_cells(r) for r in shown] + [_summary_total(ctx["new"])]:
+        lines.append("  ".join(
+            f"{_clip(c, w):{align}{w}}" for c, (_n, w, align) in zip(cells, _SUM_COLS)
+        ).rstrip())
+    return lines + notes
+
+
+def _summary_html(ctx) -> str:
+    shown, rest = _summary_rows(ctx["new"])
+    src, notes = _summary_notes(ctx, rest)
+    mono = 'font-family:Consolas,Menlo,monospace'
+    h = ['<div style="font-size:15px;font-weight:600;margin:10px 0 2px">Quoting '
+         'and estimated earnings <span style="color:#888;font-weight:400;'
+         'font-size:12px">&mdash; {}</span></div>'.format(_esc(src)),
+         '<table style="border-collapse:collapse;margin:4px 0;font-size:13px">',
+         '<tr style="background:#f0f0f0;font-weight:600">' + "".join(
+             '<td style="{}">{}</td>'.format(TDL if align == "<" else TD, _esc(name))
+             for name, _w, align in _SUM_COLS) + '</tr>']
+    for i, rec in enumerate(shown):
+        ev, what, frac, day, total, quoting = _summary_cells(rec)
+        q_style = TDL + ("color:#1e8449;font-weight:600;" if rec["n_quoted"]
+                         else "color:#888;")
+        h.append('<tr style="background:{bg}">'
+                 '<td style="{tdl}"><span style="{mono}">{ev}</span></td>'
+                 '<td style="{tdl}">{what}</td><td style="{td}">{frac}</td>'
+                 '<td style="{td};font-weight:700">{day}</td>'
+                 '<td style="{td}">{total}</td>'
+                 '<td style="{q_style}">{quoting}</td></tr>'.format(
+                     bg="#fafafa" if i % 2 else "#fff", tdl=TDL, td=TD,
+                     mono=mono, ev=_esc(ev), what=_esc(_clip(what, 60)),
+                     frac=frac, day=day, total=total, q_style=q_style,
+                     quoting=_esc(quoting)))
+    ev, what, frac, day, total, quoting = _summary_total(ctx["new"])
+    h.append('<tr style="background:#f0f0f0;font-weight:700">'
+             '<td style="{tdl}">{ev}</td><td style="{tdl}">{what}</td>'
+             '<td style="{td}">{frac}</td><td style="{td}">{day}</td>'
+             '<td style="{td}">{total}</td><td style="{tdl}">{quoting}</td>'
+             '</tr></table>'.format(tdl=TDL, td=TD, ev=ev, what=what, frac=frac,
+                                    day=day, total=total, quoting=quoting))
+    h.append('<div style="color:#888;font-size:12px;margin:2px 0 8px">{}</div>'
+             .format("<br>".join(_esc(n) for n in notes)))
+    return "".join(h)
+
+
 # BOT is last and left-aligned, so its padding costs nothing once the line is
 # rstripped; the fixed part of a row is ~117 chars, in line with the 7:20
 # quote-gaps table. The HTML table is the one to read — this is the fallback.
@@ -678,6 +866,8 @@ def render_text(ctx) -> str:
            f"{ctx['window_why']})", ""]
     if ctx["banner"]:
         out += ["!! " + ctx["banner"], ""]
+    if ctx["new"]:
+        out += _summary_text(ctx) + [""]
     out += _headline(ctx) + [""]
     if ctx["new"]:
         shown = ctx["new"][:MAX_ROWS]
@@ -762,6 +952,8 @@ def render_html(ctx) -> str:
         h.append('<div style="background:#fdecea;border-left:4px solid #c0392b;'
                  'color:#8e2b21;padding:8px 10px;margin:8px 0;font-weight:600">'
                  '{}</div>'.format(_esc(ctx["banner"])))
+    if ctx["new"]:
+        h.append(_summary_html(ctx))
     head = _headline(ctx)
     h.append('<div style="font-size:20px;font-weight:800;margin:6px 0 2px">{}</div>'
              .format(_esc(head[0])))
