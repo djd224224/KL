@@ -11,7 +11,8 @@ email):
     event are quoted, and estimated earnings"): whether the bot quotes the
     event, how many of its program markets it quotes, and the bot's own
     estimate for those markets ($/day now, and $ to its stop) from its
-    newest hourly selection snapshot. Quoting events first, biggest
+    newest hourly selection snapshot. Every new event is a row (Jack
+    2026-10-25: "Show full list in table"), quoting events first, biggest
     estimate first;
   * then the full table: what the event is in plain English, how many
     markets carry programs, the pool in $/day and in total-period $, the
@@ -130,9 +131,6 @@ MAX_LOOKBACK_HOURS = float(os.environ.get("IMM_NEWPROG_MAX_LOOKBACK_HOURS", "168
 # the printed rows are capped, and the overflow is stated with its pool.
 MAX_ROWS = int(os.environ.get("IMM_NEWPROG_MAX_ROWS", "75"))
 MAX_LATE_ROWS = int(os.environ.get("IMM_NEWPROG_MAX_LATE_ROWS", "10"))
-# The top table is the phone-sized read: every quoting event leads, then the
-# biggest pools, and the full table below still lists every event.
-SUMMARY_ROWS = int(os.environ.get("IMM_NEWPROG_SUMMARY_ROWS", "30"))
 # The selection snapshot is hourly; older than this, the bot was likely down
 # and the estimates say so.
 EST_STALE_HOURS = float(os.environ.get("IMM_NEWPROG_EST_STALE_HOURS", "2"))
@@ -708,13 +706,12 @@ _SUM_COLS = (("EVENT", 26, "<"), ("WHAT IT IS", 26, "<"), ("QUOTED", 12, ">"),
              ("EST $/DAY", 9, ">"), ("EST $", 10, ">"), ("QUOTING", 36, "<"))
 
 
-def _summary_rows(new) -> tuple:
-    """(shown, rest): quoting events first, biggest estimate first, then the
+def _summary_order(new) -> list:
+    """Every new event: quoting ones first, biggest estimate first, then the
     rest in the full table's order (pool $/day)."""
     quoting = sorted((r for r in new if r["n_quoted"]),
                      key=lambda r: (-r["est_total"], -r["est_day"], r["event"]))
-    order = quoting + [r for r in new if not r["n_quoted"]]
-    return order[:SUMMARY_ROWS], order[SUMMARY_ROWS:]
+    return quoting + [r for r in new if not r["n_quoted"]]
 
 
 def _est_cell(value, n_quoted, n_missing) -> str:
@@ -750,7 +747,7 @@ def _summary_total(rows) -> tuple:
             f"{sum(1 for r in rows if r['n_quoted'])} quoting")
 
 
-def _summary_notes(ctx, rest) -> tuple:
+def _summary_notes(ctx) -> tuple:
     """(where the estimates come from, the lines under the top table)."""
     at = ctx["est_at"]
     if at is None:
@@ -760,15 +757,10 @@ def _summary_notes(ctx, rest) -> tuple:
         age_h = (ctx["now"] - at).total_seconds() / 3600.0
         if age_h > EST_STALE_HOURS:
             src += f" - STALE, {age_h:.0f}h old (was the bot down?)"
-    notes = []
-    if rest:
-        n_q = sum(1 for r in rest if r["n_quoted"])
-        notes.append(f"... and {len(rest)} more new event(s), {n_q or 'none'} "
-                     f"quoting - TOTAL covers all of them")
-    notes.append("EST $/DAY = the bot's modelled reward on the markets it "
-                 "quotes; EST $ = banked this period + that rate at day size "
-                 "over the quotable time left to its stop (the payout bar's "
-                 "projection).")
+    notes = ["EST $/DAY = the bot's modelled reward on the markets it "
+             "quotes; EST $ = banked this period + that rate at day size "
+             "over the quotable time left to its stop (the payout bar's "
+             "projection)."]
     if any(r["est_missing"] for r in ctx["new"]):
         notes.append("+ / n/a = some / all of the event's quoted markets are "
                      "newer than the snapshot, so their estimate is not in "
@@ -777,11 +769,11 @@ def _summary_notes(ctx, rest) -> tuple:
 
 
 def _summary_text(ctx) -> list:
-    shown, rest = _summary_rows(ctx["new"])
-    src, notes = _summary_notes(ctx, rest)
+    src, notes = _summary_notes(ctx)
     head = "  ".join(f"{name:{align}{width}}" for name, width, align in _SUM_COLS)
     lines = [f"QUOTING AND ESTIMATED EARNINGS ({src})", head.rstrip()]
-    for cells in [_summary_cells(r) for r in shown] + [_summary_total(ctx["new"])]:
+    rows = [_summary_cells(r) for r in _summary_order(ctx["new"])]
+    for cells in rows + [_summary_total(ctx["new"])]:
         lines.append("  ".join(
             f"{_clip(c, w):{align}{w}}" for c, (_n, w, align) in zip(cells, _SUM_COLS)
         ).rstrip())
@@ -789,37 +781,37 @@ def _summary_text(ctx) -> list:
 
 
 def _summary_html(ctx) -> str:
-    shown, rest = _summary_rows(ctx["new"])
-    src, notes = _summary_notes(ctx, rest)
-    mono = 'font-family:Consolas,Menlo,monospace'
+    """Every new event is a row -- ~160 on a heavy day -- so the markup is
+    lean: cellpadding and align attributes instead of per-cell styles, and
+    stripes instead of cell borders. At the full table's ~840 bytes a row,
+    this table alone would cross Gmail's ~102 KB clip on such a day; at
+    ~300 a row it stays clear of it."""
+    src, notes = _summary_notes(ctx)
+    right = ' align="right"'
     h = ['<div style="font-size:15px;font-weight:600;margin:10px 0 2px">Quoting '
          'and estimated earnings <span style="color:#888;font-weight:400;'
          'font-size:12px">&mdash; {}</span></div>'.format(_esc(src)),
-         '<table style="border-collapse:collapse;margin:4px 0;font-size:13px">',
+         '<table cellpadding="5" cellspacing="0" style="border-collapse:collapse;'
+         'margin:4px 0;font-size:13px">',
          '<tr style="background:#f0f0f0;font-weight:600">' + "".join(
-             '<td style="{}">{}</td>'.format(TDL if align == "<" else TD, _esc(name))
+             '<td{}>{}</td>'.format("" if align == "<" else right, _esc(name))
              for name, _w, align in _SUM_COLS) + '</tr>']
-    for i, rec in enumerate(shown):
+    for i, rec in enumerate(_summary_order(ctx["new"])):
         ev, what, frac, day, total, quoting = _summary_cells(rec)
-        q_style = TDL + ("color:#1e8449;font-weight:600;" if rec["n_quoted"]
-                         else "color:#888;")
-        h.append('<tr style="background:{bg}">'
-                 '<td style="{tdl}"><span style="{mono}">{ev}</span></td>'
-                 '<td style="{tdl}">{what}</td><td style="{td}">{frac}</td>'
-                 '<td style="{td};font-weight:700">{day}</td>'
-                 '<td style="{td}">{total}</td>'
-                 '<td style="{q_style}">{quoting}</td></tr>'.format(
-                     bg="#fafafa" if i % 2 else "#fff", tdl=TDL, td=TD,
-                     mono=mono, ev=_esc(ev), what=_esc(_clip(what, 60)),
-                     frac=frac, day=day, total=total, q_style=q_style,
-                     quoting=_esc(quoting)))
+        quoting = ('<b style="color:#1e8449">yes</b>' if rec["n_quoted"] else
+                   '<span style="color:#888">{}</span>'.format(_esc(quoting)))
+        h.append('<tr{bg}><td style="font-family:Consolas,monospace">{ev}</td>'
+                 '<td>{what}</td><td{r}>{frac}</td><td{r}><b>{day}</b></td>'
+                 '<td{r}>{total}</td><td>{quoting}</td></tr>'.format(
+                     bg=' style="background:#f6f6f6"' if i % 2 else "", r=right,
+                     ev=_esc(ev), what=_esc(_clip(what, 60)), frac=frac,
+                     day=day, total=total, quoting=quoting))
     ev, what, frac, day, total, quoting = _summary_total(ctx["new"])
-    h.append('<tr style="background:#f0f0f0;font-weight:700">'
-             '<td style="{tdl}">{ev}</td><td style="{tdl}">{what}</td>'
-             '<td style="{td}">{frac}</td><td style="{td}">{day}</td>'
-             '<td style="{td}">{total}</td><td style="{tdl}">{quoting}</td>'
-             '</tr></table>'.format(tdl=TDL, td=TD, ev=ev, what=what, frac=frac,
-                                    day=day, total=total, quoting=quoting))
+    h.append('<tr style="background:#f0f0f0;font-weight:700"><td>{ev}</td>'
+             '<td>{what}</td><td{r}>{frac}</td><td{r}>{day}</td>'
+             '<td{r}>{total}</td><td>{quoting}</td></tr></table>'.format(
+                 r=right, ev=ev, what=what, frac=frac, day=day, total=total,
+                 quoting=quoting))
     h.append('<div style="color:#888;font-size:12px;margin:2px 0 8px">{}</div>'
              .format("<br>".join(_esc(n) for n in notes)))
     return "".join(h)

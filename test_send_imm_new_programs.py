@@ -682,19 +682,24 @@ class TopTable(unittest.TestCase):
         text, *_rest = run_report(self._rows())
         self.assertIn("STALE, 5h old", text)
 
-    def test_total_covers_every_new_event_when_rows_are_capped(self):
+    def test_every_new_event_is_listed_past_the_full_tables_cap(self):
+        """Jack 2026-10-25: "Show full list in table" -- the top table is not
+        capped, even where the full table below is."""
         write_state({"KXQ-26SEP20-T1"})
         write_snapshot([snap("KXQ-26SEP20-T1", 2.5, 4.0)])
-        with mock.patch.object(np, "SUMMARY_ROWS", 1):
-            text, *_rest = run_report(self._rows())
+        with mock.patch.object(np, "MAX_ROWS", 1):
+            text, html, *_rest = run_report(self._rows())
         top = text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1].split(
             "of new pool", 1)[0]
         self.assertIn("Q-26SEP20", top)
-        self.assertNotIn("N-26SEP20", top)
-        self.assertIn("and 1 more new event(s), none quoting", top)
+        self.assertIn("N-26SEP20", top)
+        self.assertIn("and 1 smaller event(s)", text)     # the full table's cap
         total = self._line(top, "TOTAL")
         self.assertIn("2 new events", total)
         self.assertIn("1/4 25%", total)
+        top_html = html.split("PROGRAM WINDOW (ET)", 1)[0]
+        self.assertIn("Q-26SEP20", top_html)
+        self.assertIn("N-26SEP20", top_html)
 
 
 # ---------------------------------------------------------------------------
