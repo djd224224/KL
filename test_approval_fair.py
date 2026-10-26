@@ -347,11 +347,12 @@ class TestFile(Offline):
         self.assertEqual((ok, js["rcp"]["value"]), (9, 40.5))
         self.assertEqual(js["history"][-1], ["2026-10-26T02:06:00Z", 40.5])
 
-    def test_a_released_poll_holds_the_daily_until_rcp_enters_it(self):
-        """The daily stands aside (no fair) while a sponsor's poll is out and
-        not in RCP's table; the weekly stays priced; an RCP entry for that
-        pollster ends the hold."""
-        out_at = NOW - timedelta(hours=1)
+    def test_a_released_poll_holds_the_daily_for_an_hour(self):
+        """The daily stands aside (no fair) for HOLD_H after a sponsor's poll
+        comes out, whether or not RCP enters it meanwhile (Jack 2026-10-26:
+        "Just hold for 1 hour regardless if it's added to RCP or not"); the
+        weekly stays priced."""
+        out_at = NOW - timedelta(minutes=30)
         news = [{"ts": out_at.timestamp(), "source": "CNN", "link": "https://x",
                  "title": "Trump approval hits a new low: CNN poll - CNN"}]
         weekly = {f"{WEEKLY}-B38.5": {"event": WEEKLY, "series": "KXAPRPOTUS", "lo": 384,
@@ -364,9 +365,10 @@ class TestFile(Offline):
         js = self.read()
         self.assertEqual((ok, miss), (1, 1))                     # the weekly only
         self.assertIn("release hold: CNN", js["event_fair"][DAILY]["why"])
+        self.assertIn("(held 1 h)", js["event_fair"][DAILY]["why"])
         self.assertEqual([h["key"] for h in js["release_holds"]], ["CNN"])
         self.assertIn(f"{WEEKLY}-B38.5", js["markets"])
-        # RCP enters CNN's poll: the hold ends and the daily is priced again
+        # RCP enters CNN's poll 35 min after its release: the daily stays out
         cnn = {"id": "170001", "type": "poll", "pollster": "CNN",
                "data_start_date": "2026/10/22", "data_end_date": "2026/10/24",
                "updated": cms(NOW + timedelta(minutes=5)),
@@ -378,44 +380,79 @@ class TestFile(Offline):
                                                             etag='W/"cnn"')),
                                        markets=mk, get_news=lambda: news)
         js = self.read()
+        self.assertEqual((ok, [h["key"] for h in js["release_holds"]]), (1, ["CNN"]))
+        # an hour after the release the hold ends and the daily is priced again
+        end = out_at + timedelta(hours=af.HOLD_H, minutes=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, _ = af.write_fair_file(self.path, now=end, get_text=Getter(None),
+                                       markets=mk, get_news=lambda: news)
+        js = self.read()
         self.assertEqual(ok, 10)
         self.assertEqual(js["release_holds"], [])
-        self.assertEqual(js["release_log"][-1]["how"], "entered")
-        # the same headline seen again does not hold twice
+        self.assertEqual(js["release_log"][-1]["how"], "time")
+        # a follow-up CNN headline on the same poll does not hold again
+        again = [{"ts": end.timestamp(), "source": "CNN", "link": "",
+                  "title": "Trump approval hits a new low: CNN poll - CNN"}]
         with contextlib.redirect_stdout(io.StringIO()):
-            af.write_fair_file(self.path, now=later + timedelta(minutes=6),
-                               get_text=Getter(None), markets=mk, get_news=lambda: news)
-        self.assertEqual(self.read()["release_holds"], [])
+            ok, _ = af.write_fair_file(self.path, now=end + timedelta(minutes=6),
+                                       get_text=Getter(None), markets=mk, get_news=lambda: again)
+        self.assertEqual((ok, self.read()["release_holds"]), (10, []))
 
-    def test_a_hold_ends_after_hold_max_and_old_news_is_skipped(self):
-        news = [{"ts": (NOW - timedelta(minutes=30)).timestamp(), "source": "CNBC",
-                 "link": "", "title": "Trump's approval slips: CNBC survey - CNBC"}]
+    def test_a_hold_ends_an_hour_after_the_release_and_old_news_is_skipped(self):
+        out_at = NOW - timedelta(minutes=30)
+        fox = "Fox News poll: Trump approval at 41% - Fox News"
+        self.assertEqual(af.match_release("Fox News", fox), "FOX News")
+        news = [{"ts": out_at.timestamp(), "source": "CNBC",
+                 "link": "", "title": "Trump's approval slips: CNBC survey - CNBC"},
+                {"ts": (NOW - timedelta(minutes=70)).timestamp(), "source": "Fox News",
+                 "link": "", "title": fox}]
         with contextlib.redirect_stdout(io.StringIO()):
             self.write(Getter(text(feed())))                     # no news yet (Offline)
             af.write_fair_file(self.path, now=NOW + timedelta(minutes=6), get_text=Getter(None),
                                markets=daily_markets(), get_news=lambda: news)
+        # Fox's headline is over an hour old when first read: its hour is over
         self.assertEqual([h["key"] for h in self.read()["release_holds"]], ["CNBC"])
-        end = NOW + timedelta(hours=af.HOLD_MAX_H, minutes=1)
+        end = out_at + timedelta(hours=af.HOLD_H, minutes=1)
         with contextlib.redirect_stdout(io.StringIO()):
-            af.write_fair_file(self.path, now=end, get_text=Getter(text(feed(now=end))),
-                               markets=daily_markets(read_at="2026-10-27T17:00:00Z"),
-                               get_news=lambda: news)
+            ok, _ = af.write_fair_file(self.path, now=end, get_text=Getter(text(feed(now=end))),
+                                       markets=daily_markets(), get_news=lambda: news)
         js = self.read()
-        self.assertEqual((js["release_holds"], js["release_log"][-1]["how"]), ([], "max"))
+        self.assertEqual((ok, js["release_holds"], js["release_log"][-1]["how"]), (9, [], "time"))
 
     def test_coverage_of_an_entered_poll_does_not_hold(self):
-        # RCP entered CNN 10 h before the headline: the article is about it
+        # RCP entered CNN 11 h before the headline: the article is about that poll
         cnn = {"id": "170001", "type": "poll", "pollster": "CNN",
                "data_start_date": "2026/10/22", "data_end_date": "2026/10/24",
                "updated": cms(NOW - timedelta(hours=11)),
                "candidate": [{"name": "Approve", "value": "35"}]}
-        news = [{"ts": (NOW - timedelta(hours=1)).timestamp(), "source": "CNN", "link": "",
+        news = [{"ts": (NOW - timedelta(minutes=20)).timestamp(), "source": "CNN", "link": "",
                  "title": "What the new CNN poll says about Trump - CNN"}]
         with contextlib.redirect_stdout(io.StringIO()):
             ok, _ = af.write_fair_file(self.path, now=NOW,
                                        get_text=Getter(text(feed(extra=[cnn]))),
                                        markets=daily_markets(), get_news=lambda: news)
         self.assertEqual((ok, self.read()["release_holds"]), (9, []))
+
+    def test_a_poll_rcp_enters_at_once_still_holds_its_hour(self):
+        # an entry 10 min after the headline, or 80 min before it (the search
+        # lags some releases), is this poll: it does not cut the hour short
+        for entered in (NOW - timedelta(minutes=10), NOW - timedelta(minutes=100)):
+            with self.subTest(entered=entered):
+                if os.path.exists(self.path):
+                    os.remove(self.path)
+                cnn = {"id": "170001", "type": "poll", "pollster": "CNN",
+                       "data_start_date": "2026/10/22", "data_end_date": "2026/10/24",
+                       "updated": cms(entered),
+                       "candidate": [{"name": "Approve", "value": "35"}]}
+                news = [{"ts": (NOW - timedelta(minutes=20)).timestamp(), "source": "CNN",
+                         "link": "", "title": "Trump approval hits a new low: CNN poll - CNN"}]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ok, miss = af.write_fair_file(self.path, now=NOW,
+                                                  get_text=Getter(text(feed(extra=[cnn]))),
+                                                  markets=daily_markets(),
+                                                  get_news=lambda: news)
+                self.assertEqual((ok, miss), (0, 1))
+                self.assertEqual([h["key"] for h in self.read()["release_holds"]], ["CNN"])
 
     def test_a_past_read_time_is_not_priced(self):
         mk = daily_markets(read_at="2026-10-25T17:00:00Z", event="KXTRUMPAPPROVE-26OCT25")

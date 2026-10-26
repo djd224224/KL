@@ -91,8 +91,8 @@ RELEASED, NOT YET ENTERED (2026-10-26): polls out but not in RCP's table
   are not priced -- RCP's latest-polls pages sit behind the same DataDome,
   pollsters publish on their own sites at their own hours, and Wikipedia's
   tables trail by hours; that is where the market beats this model. The
-  daily instead STANDS ASIDE while a one-off national poll is out and not
-  entered (RELEASE_HOLD_ENABLE: Google News headlines, see the knobs).
+  daily instead STANDS ASIDE for an hour after a one-off national poll comes
+  out (RELEASE_HOLD_ENABLE: Google News headlines, see the knobs).
 
 Standalone dry run:  python approval_fair.py [--out path] [--now ISO]
 """
@@ -162,23 +162,27 @@ for _k, _p in ((1, 0.2213), (2, 0.0784), (3, 0.0434), (4, 0.0240), (5, 0.0133),
 # NEWS_MAX_AGE_H from a sponsor's own outlet (NEWS_OUTLETS) with a singular
 # "poll"/"survey" and Trump/approval, or from any outlet naming a sponsor
 # right before "poll"/"survey" (_SPONSOR_PHRASE_RE), and no state race
-# (_STATE_RE), starts a hold on that pollster -- unless RCP already entered
-# it within ENTERED_RECENT_H of the headline (coverage of an entered poll) or
-# it was held in the last REHOLD_GAP_H. A hold withholds every HOLD_SERIES
-# fair, so the bot's gate stands the daily aside (no fair, no quote), until
-# RCP's table shows an entry for that pollster created after the headline
-# (less HOLD_ENTRY_SLACK_H) or HOLD_MAX_H pass. Replayed on 10/19-10/25:
-# CNN (6.5 h before RCP), CNBC (3.4 h), FT (3.4 h) and NYT/Siena (1.7 h)
-# caught; CBS and Echelon missed (no own-poll headline in the search).
-# IMM_APPROVE_RELEASE_HOLD=0 turns it off.
+# (_STATE_RE), starts a hold on that pollster -- unless RCP had entered an
+# earlier poll of it in the ENTERED_RECENT_H before the headline (coverage of
+# an entered poll) or it was held in the last REHOLD_GAP_H. A hold withholds
+# every HOLD_SERIES fair, so the bot's gate stands the daily aside (no fair,
+# no quote), for HOLD_H from the headline's publish time, whether or not RCP
+# enters the poll meanwhile (Jack 2026-10-26: "Just hold for 1 hour regardless
+# if it's added to RCP or not"). By time since release, the daily's fills
+# while such a poll was pending lost -10c a contract in the first 30 min and
+# -30c in the next 30 (8/28-10/25); replayed against the rewards a hold gives
+# up (~$3.1/h), a 1 h hold netted ~+$4.7/day, a 12 h one ~+$3.3. Replayed on
+# 10/19-10/25: CNN, CNBC, FT and NYT/Siena caught; CBS and Echelon missed (no
+# own-poll headline in the search). The first live hold: a 36% Fox News poll
+# (06:26Z 10/26). IMM_APPROVE_RELEASE_HOLD=0 turns it off.
 RELEASE_HOLD_ENABLE = os.environ.get("IMM_APPROVE_RELEASE_HOLD", "1") == "1"
 HOLD_SERIES = ("KXTRUMPAPPROVE",)       # the gated daily; the weekly stays priced
 NEWS_URL = "https://news.google.com/rss/search"
 NEWS_QUERIES = ("Trump approval poll", "new poll Trump", "Trump poll survey")
-NEWS_EVERY_SECS = 300
-NEWS_MAX_AGE_H = 12.0
-HOLD_MAX_H = 12.0
-HOLD_ENTRY_SLACK_H = 2.0
+NEWS_EVERY_SECS = 120                   # the fair file's own cadence
+HOLD_H = 1.0
+NEWS_MAX_AGE_H = HOLD_H                 # an older headline's hold is already over
+HOLD_ENTRY_SLACK_H = 2.0                # an RCP entry this close before it is this poll
 ENTERED_RECENT_H = 72.0
 REHOLD_GAP_H = 24.0
 ENTRY_KEEP_DAYS = 14                    # RCP entries kept in the rcp state
@@ -763,25 +767,26 @@ def fetch_news(timeout: float = 20.0) -> List[dict]:
 def _release_holds(old: dict, now: datetime, rcp: dict,
                    get_news: Optional[Callable]) -> Tuple[List[dict], List[dict], float]:
     """(active holds, recent hold log, news tried at) -- see RELEASE_HOLD_ENABLE.
-    Ends holds whose poll RCP entered or that ran HOLD_MAX_H, then (at most
-    every NEWS_EVERY_SECS) reads the news for new ones."""
+    Ends holds HOLD_H after their headline, then (at most every
+    NEWS_EVERY_SECS) reads the news for new ones."""
     ts = now.timestamp()
     holds = list(old.get("release_holds") or [])
     hlog = list(old.get("release_log") or [])
     tried = float(old.get("news_tried_at") or 0.0)
     entries = rcp.get("entries") or []
 
-    def entered(key: str, since: float) -> bool:
+    def entered_before(key: str, t: float) -> bool:
+        """RCP entered an EARLIER poll of this sponsor: in the
+        ENTERED_RECENT_H before t, more than HOLD_ENTRY_SLACK_H before it."""
         names = set(SPONSORS.get(key, (key,)))
-        return any(e[1] >= since for e in entries if e[0] in names)
+        return any(t - ENTERED_RECENT_H * 3600 <= e[1] < t - HOLD_ENTRY_SLACK_H * 3600
+                   for e in entries if e[0] in names)
 
     keep = []
     for h in holds:
-        how = ("entered" if entered(h["key"], h["published"] - HOLD_ENTRY_SLACK_H * 3600)
-               else "max" if ts - h["published"] >= HOLD_MAX_H * 3600 else None)
-        if how:
-            hlog.append(dict(h, ended=_iso(now), how=how))
-            _log(f"release hold OFF: {h['key']} ({'RCP entered it' if how == 'entered' else f'{HOLD_MAX_H:g} h without an RCP entry'})")
+        if ts - h["published"] >= HOLD_H * 3600:
+            hlog.append(dict(h, ended=_iso(now), how="time"))
+            _log(f"release hold OFF: {h['key']} ({HOLD_H:g} h after its release)")
         else:
             keep.append(h)
     holds = keep
@@ -797,7 +802,7 @@ def _release_holds(old: dict, now: datetime, rcp: dict,
                 continue
             key = match_release(it.get("source", ""), it.get("title", ""))
             if key is None or any(h["key"] == key for h in holds) \
-                    or entered(key, it["ts"] - ENTERED_RECENT_H * 3600) \
+                    or entered_before(key, it["ts"]) \
                     or any(x["key"] == key and x["published"] >= it["ts"] - REHOLD_GAP_H * 3600
                            for x in hlog):
                 continue
@@ -806,10 +811,9 @@ def _release_holds(old: dict, now: datetime, rcp: dict,
                  "seen_at": _iso(now), "source": it.get("source", ""),
                  "title": it.get("title", "")[:200], "link": it.get("link", "")[:400]}
             holds.append(h)
-            _log(f"release hold ON: {key} poll out, not in RCP's table yet -- "
-                 f"\"{h['title'][:100]}\" ({h['source']}, {h['published_at']}); "
-                 f"{', '.join(HOLD_SERIES)} stands aside until RCP enters it "
-                 f"(at most {HOLD_MAX_H:g} h)")
+            _log(f"release hold ON: {key} poll out -- \"{h['title'][:100]}\" "
+                 f"({h['source']}, {h['published_at']}); {', '.join(HOLD_SERIES)} "
+                 f"stands aside until {HOLD_H:g} h after it")
     cut = ts - 7 * 86400
     return holds, [x for x in hlog if x["published"] >= cut][-50:], tried
 
@@ -830,7 +834,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     rcp, history, fault, tried = _read_feed(old, now, get_text)
     holds, hold_log, news_tried = _release_holds(old, now, rcp, get_news)
     hold_why = ("release hold: " + "; ".join(
-        f"{h['key']} poll out {h['published_at']}, not in RCP's table yet" for h in holds)
+        f"{h['key']} poll out {h['published_at']} (held {HOLD_H:g} h)" for h in holds)
                 if holds else None)
     history = [h for h in history
                if (_parse_iso(h[0]) or now) >= now - timedelta(days=HISTORY_DAYS)][-500:]

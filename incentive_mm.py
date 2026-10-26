@@ -13479,13 +13479,14 @@ def bway_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # (Jack 2026-10-25: "Turn it on", on the report's question). A feed that stops
 # answering stands the daily aside after APPROVE_FAIR_TTL_MIN (no fair, no
 # quote); IMM_APPROVE_FAIR_ENABLE=0 returns it to plain quoting.
-# RELEASED-BUT-NOT-ENTERED HOLD (Jack 2026-10-26: "Build it"): approval_fair
-# withholds the daily's fairs -- so this gate stands it aside, no fair no quote
-# -- while a one-off national poll is out (a Google News headline from the
-# sponsor) and not yet in RCP's table, until RCP enters it or 12 h pass.
-# Fills made while such a poll was pending lost -3.7c a contract on the daily
-# (8/28-10/25, -$691) against -1.0c otherwise. The module's RELEASE_HOLD_*
-# knobs; IMM_APPROVE_RELEASE_HOLD=0 turns the hold off.
+# RELEASE HOLD (Jack 2026-10-26: "Build it"; "Just hold for 1 hour regardless
+# if it's added to RCP or not"): approval_fair withholds the daily's fairs --
+# so this gate stands it aside, no fair no quote -- for 1 h (its HOLD_H) after
+# a one-off national poll comes out (a Google News headline from the sponsor),
+# whether or not RCP enters it meanwhile. Fills made while such a poll was
+# pending lost -3.7c a contract on the daily (8/28-10/25, -$691) against -1.0c
+# otherwise; -10c in its first 30 min, -30c in the next 30. The module's
+# RELEASE_HOLD_* knobs; IMM_APPROVE_RELEASE_HOLD=0 turns the hold off.
 APPROVE_FAIR_ENABLE = os.environ.get("IMM_APPROVE_FAIR_ENABLE", "1") == "1"
 APPROVE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_APPROVE_FAIR_SERIES", "KXTRUMPAPPROVE").split(",") if s.strip())
