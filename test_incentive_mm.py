@@ -13091,9 +13091,9 @@ class TestOct26FairGates(unittest.TestCase):
                 self.assertEqual(imm.fair_gate_of(s), name)
                 self.assertIn(label.replace("-", "_"), imm_risk_controls.GATE_GUARDS)
 
-    def test_approval_waits_for_jack_and_leaves_the_weekly_ungated(self):
-        # off by default: reading RCP's file is Jack's call
-        self.assertFalse(imm.APPROVE_FAIR_ENABLE)
+    def test_approval_is_on_for_the_daily_and_leaves_the_weekly_ungated(self):
+        # on (Jack 2026-10-25: "Turn it on"), the daily only
+        self.assertTrue(imm.APPROVE_FAIR_ENABLE)
         self.assertEqual(imm.APPROVE_FAIR_SERIES, frozenset({"KXTRUMPAPPROVE"}))
         with mock.patch.object(imm, "APPROVE_FAIR_ENABLE", True):
             self.assertEqual(imm.fair_gate_of("KXTRUMPAPPROVE"), "rcp approval")

@@ -13349,9 +13349,11 @@ def bway_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # current value while it stayed put -- at ~4% of each side's quoting hours
 # (~$90 of reward). The weekly KXAPRPOTUS is priced but NOT gated: the fills
 # a band would have held there won (+$227 at 15c, +$58 at 35c).
-# OFF by default (IMM_APPROVE_FAIR_ENABLE=1 turns it on): reading RCP's file
-# while its site turns bots away is Jack's call.
-APPROVE_FAIR_ENABLE = os.environ.get("IMM_APPROVE_FAIR_ENABLE", "0") == "1"
+# Reading RCP's file while its site turns bots away was Jack's call: ON
+# (Jack 2026-10-25: "Turn it on", on the report's question). A feed that stops
+# answering stands the daily aside after APPROVE_FAIR_TTL_MIN (no fair, no
+# quote); IMM_APPROVE_FAIR_ENABLE=0 returns it to plain quoting.
+APPROVE_FAIR_ENABLE = os.environ.get("IMM_APPROVE_FAIR_ENABLE", "1") == "1"
 APPROVE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_APPROVE_FAIR_SERIES", "KXTRUMPAPPROVE").split(",") if s.strip())
 APPROVE_FAIR_TOL_CENTS = _env_int("IMM_APPROVE_FAIR_TOL_CENTS", 15)
