@@ -12285,11 +12285,14 @@ class TestRainMonthlyGate(unittest.TestCase):
     ALL = ("KXRAINAUSM", "KXRAINCHIM", "KXRAINCLLM", "KXRAINCMHM", "KXRAINDALM",
            "KXRAINDENM", "KXRAINHOUM", "KXRAINLAXM", "KXRAINLEXM", "KXRAINMIAM",
            "KXRAINMKEM", "KXRAINNYCM", "KXRAINPVDM", "KXRAINSEAM", "KXRAINSFOM",
-           "KXRAINSTPM")
+           "KXRAINSTPM",
+           "KXRAINATLM", "KXRAINBOSM", "KXRAINDCM", "KXRAININDM", "KXRAINMINM",
+           "KXRAINNOLAM")
 
     def test_every_city_allowlisted_with_the_day_before_cutoff(self):
         # the two Jack named, then "yes add all the cities": the sixteen
-        # KXRAIN<CITY>M series in the catalog on 2026-10-01
+        # KXRAIN<CITY>M series in the catalog on 2026-10-01, and the six
+        # Kalshi listed for November (2026-10-26)
         self.assertEqual(imm.RAIN_MONTHLY_SERIES, frozenset(self.ALL))
         for s in self.ALL:
             self.assertIn(s, imm.ALLOW_SERIES, s)

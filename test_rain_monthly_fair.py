@@ -48,12 +48,16 @@ class TestStations(unittest.TestCase):
         # every code the October rules name (2026-10-01, "add all the
         # cities"), plus Central Park for KXRAINNYCM
         for code in ("AUS", "ORD", "CLL", "CMH", "DFW", "DEN", "HOU", "LAX", "LEX",
-                     "MIA", "MKE", "PVD", "SEA", "SFO", "SPG", "NYC"):
+                     "MIA", "MKE", "PVD", "SEA", "SFO", "SPG", "NYC",
+                     # the six November cities (2026-10-26)
+                     "ATL", "BOS", "DCA", "IND", "MSP", "MSY"):
             self.assertIn(code, rmf.CLI_STATIONS, code)
             self.assertEqual(rmf.CLI_STATIONS[code]["icao"], "K" + code, code)
         self.assertEqual(rmf.CLI_STATIONS["LAX"]["tz"], "US/Pacific")
         self.assertEqual(rmf.CLI_STATIONS["CLL"]["net"], "TX_ASOS")
-        self.assertEqual(len(rmf.SERIES), 16)
+        self.assertEqual(rmf.CLI_STATIONS["DCA"]["net"], "VA_ASOS")
+        self.assertEqual(rmf.CLI_STATIONS["MSY"]["tz"], "US/Central")
+        self.assertEqual(len(rmf.SERIES), 22)
 
     def test_events_from_the_signed_reader(self):
         books = {"KXRAINCHIM": [market("KXRAINCHIM-26OCT", 3), market("KXRAINCHIM-26OCT", 4),

@@ -970,7 +970,9 @@ for _s in os.environ.get(
         # the monthly cities Kalshi added since July (2026-10-01, with the
         # monthly gate's "add all the cities")
         "KXRAINCLLM,KXRAINCMHM,KXRAINLAXM,KXRAINLEXM,KXRAINMKEM,KXRAINPVDM,"
-        "KXRAINSFOM").split(","):
+        "KXRAINSFOM,"
+        # ...and the six listed for November (2026-10-26)
+        "KXRAINATLM,KXRAINBOSM,KXRAINDCM,KXRAININDM,KXRAINMINM,KXRAINNOLAM").split(","):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             # IMM_RAIN_LEVELS (e.g. "0:3", Jack 2026-07-28: rain re-entry at
@@ -6868,7 +6870,10 @@ _RAIN_MONTHLY_LIVE = os.environ.get("IMM_RAIN_MONTHLY_ENABLE", "1") == "1"
 _DEFAULT_RAIN_MONTHLY_SERIES = (
     "KXRAINAUSM,KXRAINCHIM,KXRAINCLLM,KXRAINCMHM,KXRAINDALM,KXRAINDENM,"
     "KXRAINHOUM,KXRAINLAXM,KXRAINLEXM,KXRAINMIAM,KXRAINMKEM,KXRAINNYCM,"
-    "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM")
+    "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM,"
+    # the six Kalshi listed for November (2026-10-26; their stations
+    # verified in rain_monthly_fair.CLI_STATIONS)
+    "KXRAINATLM,KXRAINBOSM,KXRAINDCM,KXRAININDM,KXRAINMINM,KXRAINNOLAM")
 # MONTHLY SNOW (Jack 2026-10-04: "build the snow feed"). KX<CITY>SNOWM settle
 # on The Weather Company's snowfall dashboard = the NWS climate report's
 # daily snowfall at the city's station, summed over the month. The ten in

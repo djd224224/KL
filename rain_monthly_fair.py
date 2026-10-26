@@ -92,7 +92,9 @@ KALSHI_MARKETS_URL = os.environ.get(
     "https://api.elections.kalshi.com/trade-api/v2/markets")
 ALL_SERIES = ("KXRAINAUSM,KXRAINCHIM,KXRAINCLLM,KXRAINCMHM,KXRAINDALM,KXRAINDENM,"
               "KXRAINHOUM,KXRAINLAXM,KXRAINLEXM,KXRAINMIAM,KXRAINMKEM,KXRAINNYCM,"
-              "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM")
+              "KXRAINPVDM,KXRAINSEAM,KXRAINSFOM,KXRAINSTPM,"
+              # the six Kalshi listed for November (2026-10-26)
+              "KXRAINATLM,KXRAINBOSM,KXRAINDCM,KXRAININDM,KXRAINMINM,KXRAINNOLAM")
 SERIES = tuple(s.strip() for s in os.environ.get(
     "IMM_RAIN_MONTHLY_SERIES", ALL_SERIES).split(",") if s.strip())
 # period-total series priced on every write; incentive_mm adds any other
@@ -131,6 +133,21 @@ for _code, _net, _name, _lat, _lon, _tz in (
         ("MKE", "WI_ASOS", "Milwaukee Mitchell", 42.947, -87.897, "US/Central"),
         ("PVD", "RI_ASOS", "Providence T.F. Green", 41.722, -71.433, "US/Eastern"),
         ("SFO", "CA_ASOS", "San Francisco Intl", 37.619, -122.375, "US/Pacific")):
+    CLI_STATIONS[_code] = {"icao": f"K{_code}", "iem": _code, "net": _net,
+                           "name": _name, "lat": _lat, "lon": _lon, "tz": _tz}
+# the six cities Kalshi listed for November (2026-10-26: Atlanta, Boston,
+# Washington DC, Indianapolis, Minneapolis, New Orleans), the codes their
+# November rules name, checked live that day the same way -- IEM currents
+# ({state}_ASOS; DCA files under VA_ASOS), IEM's CLI (K + code, all of
+# September-October) and ACIS (pcpn records from 1928-1946) -- coordinates
+# from ACIS
+for _code, _net, _name, _lat, _lon, _tz in (
+        ("ATL", "GA_ASOS", "Atlanta Hartsfield-Jackson", 33.62972, -84.44224, "US/Eastern"),
+        ("BOS", "MA_ASOS", "Boston Logan", 42.36057, -71.00975, "US/Eastern"),
+        ("DCA", "VA_ASOS", "Washington Reagan National", 38.84721, -77.03454, "US/Eastern"),
+        ("IND", "IN_ASOS", "Indianapolis Intl", 39.72515, -86.2816, "US/Eastern"),
+        ("MSP", "MN_ASOS", "Minneapolis-St. Paul Intl", 44.88523, -93.23133, "US/Central"),
+        ("MSY", "LA_ASOS", "New Orleans Armstrong", 29.99755, -90.27772, "US/Central")):
     CLI_STATIONS[_code] = {"icao": f"K{_code}", "iem": _code, "net": _net,
                            "name": _name, "lat": _lat, "lon": _lon, "tz": _tz}
 # the period-total stations (2026-10-04), checked live that day on IEM
