@@ -8,12 +8,16 @@ programs STARTED inside the window (normally the 24h since yesterday's
 email):
   * at the top (Jack 2026-10-25: "show a table at the top, of new events in
     the past day, which are quoting, what fraction of the markets within an
-    event are quoted, and estimated earnings"): whether the bot quotes the
-    event, how many of its program markets it quotes, and the bot's own
-    estimate for those markets ($/day now, and $ to its stop) from its
-    newest hourly selection snapshot. Every new event is a row (Jack
-    2026-10-25: "Show full list in table"), quoting events first, biggest
-    estimate first;
+    event are quoted, and estimated earnings"): the event's whole pool, how
+    many of its program markets the bot quoted at any point in the window
+    and what that earned by its own model (its hourly selection snapshots:
+    Jack 2026-10-26, "total pool ... If they were quoted previously should
+    show that, and the est earned amount and fraction of markets quoted" --
+    the next-day temperature families stop before this email reads), and
+    for the markets quoted now its estimate ($/day now, and $ to its stop)
+    from the newest snapshot. Every new event is a row (Jack 2026-10-25:
+    "Show full list in table"): quoting now first, biggest estimate first,
+    then quoted earlier, biggest earnings first;
   * then the full table: what the event is in plain English, how many
     markets carry programs, the pool in $/day and in total-period $, the
     program window in ET, the target depth, and what the bot is doing about
@@ -102,6 +106,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -134,6 +139,10 @@ MAX_LATE_ROWS = int(os.environ.get("IMM_NEWPROG_MAX_LATE_ROWS", "10"))
 # The selection snapshot is hourly; older than this, the bot was likely down
 # and the estimates say so.
 EST_STALE_HOURS = float(os.environ.get("IMM_NEWPROG_EST_STALE_HOURS", "2"))
+# The quote history (load_quote_history): a selected market's modelled rate
+# counts until the next snapshot block, at most this long -- a longer gap is
+# the bot down, not quoting.
+HIST_GAP_HOURS = float(os.environ.get("IMM_NEWPROG_HIST_GAP_HOURS", "2"))
 # A series absent from the feed this long and back again is a RELIT family —
 # the 2026-08-15 KXTEMPMIAH class, worth flagging as loudly as a new one.
 RELIT_DAYS = float(os.environ.get("IMM_NEWPROG_RELIT_DAYS", "7"))
@@ -418,6 +427,11 @@ def bot_status(rec: dict, quoted: set, resolver, now: datetime) -> str:
     n_allowed = sum(1 for t in tickers if imm.IncentiveMarketMaker._allowed(t))
     if n_quoted:
         label = f"quoting {n_quoted}/{len(tickers)}"
+    elif rec.get("n_ever"):
+        # quoted earlier in the window and stopped (a next-day family past its
+        # stop, a same-day block, a pool the bot gave up on): say so before
+        # the allowlist verdict, which on such a day reads "blocked"
+        label = f"quoted earlier {rec['n_ever']}/{len(tickers)}"
     elif n_allowed == 0:
         blocked = any(imm.IncentiveMarketMaker._blocked(t) for t in tickers)
         return "blocked (config)" if blocked else "not allowlisted"
@@ -445,7 +459,76 @@ def load_estimates():
             datetime.fromtimestamp(ts, timezone.utc))
 
 
-def quote_summary(rec: dict, quoted: set, est: dict) -> dict:
+_SNAP_TS_RE = re.compile(r'"ts": "([^"]+)"')
+_SNAP_TICKER_RE = re.compile(r'"ticker": "([^"]+)"')
+
+
+def load_quote_history(recs, since: datetime, now: datetime) -> dict:
+    """{ticker: (quoted at all, est earned $, end of its last quoted stretch)}
+    for the program markets of `recs`, from every selection_snapshot block
+    since `since` (Jack 2026-10-26: "why isn't earthquake and high / low temp
+    shown as quoting? If they were quoted previously should show that, and
+    the est earned amount and fraction of markets quoted" -- the next-day
+    temperature families quote the day before and stop by the event day,
+    long before this email reads selected_tickers).
+
+    A market is quoted in a block whose decision is "selected"; its
+    est_dollars_per_day then accrues until the next block, at most
+    HIST_GAP_HOURS. The bot's own "banked" is not used: it stayed 0 on the
+    KXLOWT markets of 10/25 while they were selected at ~$6/day. A file that
+    cannot be read costs the history, never the email."""
+    want = {t for r in recs for t in r["tickers"]}
+    if not want:
+        return {}
+    try:
+        files = dash.day_files("selection_snapshot", "jsonl",
+                               (since - timedelta(days=1)).strftime("%Y-%m-%d"))
+    except Exception as e:
+        log(f"! selection snapshots not listed ({e!r}); no quote history today")
+        return {}
+    blocks, seen = set(), {}
+    for _day, path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = _SNAP_TS_RE.search(line)
+                    if not m:
+                        continue
+                    blocks.add(m.group(1))
+                    t = _SNAP_TICKER_RE.search(line)
+                    if not t or t.group(1) not in want:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    seen.setdefault(row["ticker"], {})[m.group(1)] = (
+                        row.get("decision") == "selected",
+                        float(row.get("est_dollars_per_day") or 0.0))
+        except OSError as e:
+            log(f"! {os.path.basename(path)} unreadable ({e!r}); quote history partial")
+    when = {}
+    for s in blocks:
+        dt = imm.parse_iso_utc(s)
+        if dt is not None and since <= dt <= now:
+            when[s] = dt
+    order = sorted(when, key=when.get)
+    gap = timedelta(hours=HIST_GAP_HOURS)
+    out = {}
+    for ticker, rows in seen.items():
+        ever, earned, last = False, 0.0, None
+        for i, s in enumerate(order):
+            r = rows.get(s)
+            if not r or not r[0]:
+                continue
+            end = min(when[order[i + 1]] if i + 1 < len(order) else now, when[s] + gap)
+            earned += r[1] * (end - when[s]).total_seconds() / 86400.0
+            ever, last = True, end
+        out[ticker] = (ever, earned, last)
+    return out
+
+
+def quote_summary(rec: dict, quoted: set, est: dict, hist=None) -> dict:
     """The top table's numbers for one event: how many of its program markets
     the bot quotes, and the bot's own estimate summed over THOSE markets --
     est_dollars_per_day (its modelled share of the pool at its current size)
@@ -453,7 +536,10 @@ def quote_summary(rec: dict, quoted: set, est: dict) -> dict:
     quotable time left to its stop: the number the payout bar tests).
 
     est_missing counts quoted markets the snapshot has no row for (picked up
-    after it), so a partial sum is marked as one, not shown as the whole."""
+    after it), so a partial sum is marked as one, not shown as the whole.
+    n_ever / est_earned / last_quoted come from load_quote_history: the
+    markets quoted at any point in the window (now included), the modelled
+    reward while they were, and when the last quoted stretch ended."""
     q = [t for t in rec["tickers"] if t in quoted]
     day = total = 0.0
     missing = 0
@@ -464,8 +550,15 @@ def quote_summary(rec: dict, quoted: set, est: dict) -> dict:
             continue
         day += float(row.get("est_dollars_per_day") or 0.0)
         total += float(row.get("projected_total") or 0.0)
+    hist = hist or {}
+    h = [hist[t] for t in rec["tickers"] if t in hist]
+    lasts = [x[2] for x in h if x[2] is not None]
     return {"n_quoted": len(q), "est_day": day, "est_total": total,
-            "est_missing": missing}
+            "est_missing": missing,
+            "n_ever": sum(1 for t in rec["tickers"]
+                          if t in quoted or (t in hist and hist[t][0])),
+            "est_earned": sum(x[1] for x in h),
+            "last_quoted": max(lasts) if lasts else None}
 
 
 # ----------------------------------------------------------------------------
@@ -574,14 +667,15 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
 
     quoted = set(load_json(STATE_PATH).get("selected_tickers") or [])
     est, est_at = load_estimates()
+    hist = load_quote_history(new_recs + late_recs, window_start, now_utc)
     for rec in new_recs + late_recs:
-        rec.update(quote_summary(rec, quoted, est))
+        rec.update(quote_summary(rec, quoted, est, hist))
     resolver = imm.EventStartResolver()
     # Titles go to the top table's quoting rows first (small pools, so the
     # biggest-pool-first budget would leave them as bare tickers), then the
     # full table's rows.
-    enrich_titles(client, [r for r in new_recs if r["n_quoted"]]
-                  + [r for r in new_recs[:MAX_ROWS] if not r["n_quoted"]]
+    enrich_titles(client, [r for r in new_recs if r["n_ever"]]
+                  + [r for r in new_recs[:MAX_ROWS] if not r["n_ever"]]
                   + late_recs[:MAX_LATE_ROWS])
     for rec in new_recs + late_recs:
         rec.setdefault("what", gaps.describe_event(rec["event"]))
@@ -629,6 +723,7 @@ def _headline(ctx) -> list:
     allowed = [r for r in new if not r["bot"].startswith(("not allowlisted",
                                                           "blocked"))]
     quoting = [r for r in new if r["bot"].startswith("quoting")]
+    earlier = [r for r in new if r["bot"].startswith("quoted earlier")]
     # POOL and RATE are different questions and the two diverge hard on short
     # programs — four $20 hourly markets are $80 of pool at a $1,920/day rate.
     # Lead with the money actually on the table, then the rate the table is
@@ -643,6 +738,10 @@ def _headline(ctx) -> list:
             f"${sum(r['pool_day'] for r in allowed):,.2f}/day - "
             f"already quoting: {len(quoting)} event(s), "
             f"${sum(r['pool_day'] for r in quoting):,.2f}/day")
+    if earlier:
+        lines.append(
+            f"  quoted earlier, not now: {len(earlier)} event(s), "
+            f"est earned ${sum(r.get('est_earned', 0.0) for r in earlier):,.2f}")
     dead = [r for r in new if "UNEARNABLE" in r["bot"] or "cutoff passed" in r["bot"]]
     if dead:
         lines.append(f"  unearnable at the bot's cutoff: {len(dead)} event(s), "
@@ -702,16 +801,20 @@ def _footer_lines(ctx) -> list:
 # The top table (Jack 2026-10-25, see the module docstring). QUOTING is last
 # and left-aligned for the reason BOT is below, and wide enough that a "no"
 # carries the BOT cell's reason whole, so the top table reads on its own.
-_SUM_COLS = (("EVENT", 26, "<"), ("WHAT IT IS", 26, "<"), ("QUOTED", 12, ">"),
-             ("EST $/DAY", 9, ">"), ("EST $", 10, ">"), ("QUOTING", 36, "<"))
+_SUM_COLS = (("EVENT", 26, "<"), ("WHAT IT IS", 26, "<"), ("POOL $", 9, ">"),
+             ("QUOTED", 12, ">"), ("EST EARNED", 10, ">"), ("EST $/DAY", 9, ">"),
+             ("EST $", 10, ">"), ("QUOTING", 36, "<"))
 
 
 def _summary_order(new) -> list:
     """Every new event: quoting ones first, biggest estimate first, then the
-    rest in the full table's order (pool $/day)."""
+    ones quoted earlier in the window (biggest estimated earnings first),
+    then the rest in the full table's order (pool $/day)."""
     quoting = sorted((r for r in new if r["n_quoted"]),
                      key=lambda r: (-r["est_total"], -r["est_day"], r["event"]))
-    return quoting + [r for r in new if not r["n_quoted"]]
+    earlier = sorted((r for r in new if not r["n_quoted"] and r.get("n_ever")),
+                     key=lambda r: (-r.get("est_earned", 0.0), r["event"]))
+    return quoting + earlier + [r for r in new if not r["n_quoted"] and not r.get("n_ever")]
 
 
 def _est_cell(value, n_quoted, n_missing) -> str:
@@ -728,23 +831,41 @@ def _frac(k, n) -> str:
     return f"{k}/{n} {100.0 * k / n:.0f}%" if n else "-"
 
 
+def _quoting_cell(rec) -> str:
+    """"yes" now; "earlier, to <when>" when only the window's snapshots show
+    it quoted; else the BOT cell's reason."""
+    if rec["n_quoted"]:
+        return "yes"
+    if rec.get("n_ever"):
+        last = rec.get("last_quoted")
+        return "earlier" + (f", to {_et(last)}" if last else "")
+    return rec.get("bot", "")
+
+
 def _summary_cells(rec) -> tuple:
     q, miss = rec["n_quoted"], rec["est_missing"]
-    return (_short(rec["event"]), rec.get("what", ""),
-            _frac(q, len(rec["tickers"])),
+    ever = rec.get("n_ever", q)
+    return (_short(rec["event"]), rec.get("what", ""), f"{rec['pool_total']:,.0f}",
+            _frac(ever, len(rec["tickers"])),
+            f"{rec.get('est_earned', 0.0):,.2f}" if ever else "-",
             _est_cell(rec["est_day"], q, miss),
             _est_cell(rec["est_total"], q, miss),
-            "yes" if q else rec.get("bot", ""))
+            _quoting_cell(rec))
 
 
 def _summary_total(rows) -> tuple:
     q = sum(r["n_quoted"] for r in rows)
+    ever = sum(r.get("n_ever", r["n_quoted"]) for r in rows)
     miss = sum(r["est_missing"] for r in rows)
+    n_earlier = sum(1 for r in rows if not r["n_quoted"] and r.get("n_ever"))
     return ("TOTAL", f"{len(rows)} new event{'' if len(rows) == 1 else 's'}",
-            _frac(q, sum(len(r["tickers"]) for r in rows)),
+            f"{sum(r['pool_total'] for r in rows):,.0f}",
+            _frac(ever, sum(len(r["tickers"]) for r in rows)),
+            f"{sum(r.get('est_earned', 0.0) for r in rows):,.2f}" if ever else "-",
             _est_cell(sum(r["est_day"] for r in rows), q, miss),
             _est_cell(sum(r["est_total"] for r in rows), q, miss),
-            f"{sum(1 for r in rows if r['n_quoted'])} quoting")
+            f"{sum(1 for r in rows if r['n_quoted'])} quoting"
+            + (f", {n_earlier} earlier" if n_earlier else ""))
 
 
 def _summary_notes(ctx) -> tuple:
@@ -757,8 +878,14 @@ def _summary_notes(ctx) -> tuple:
         age_h = (ctx["now"] - at).total_seconds() / 3600.0
         if age_h > EST_STALE_HOURS:
             src += f" - STALE, {age_h:.0f}h old (was the bot down?)"
-    notes = ["EST $/DAY = the bot's modelled reward on the markets it "
-             "quotes; EST $ = banked this period + that rate at day size "
+    notes = ["POOL $ = the event's whole program pool. QUOTED = its program "
+             "markets the bot quoted at any point since the window opened "
+             "(its hourly snapshots, and now); EST EARNED = the bot's "
+             "modelled $/day on each while it was quoted, times the time "
+             "quoted. 'earlier, to <time>' = quoted then, not now (a "
+             "next-day family past its stop, a same-day block).",
+             "EST $/DAY = the bot's modelled reward on the markets it "
+             "quotes now; EST $ = banked this period + that rate at day size "
              "over the quotable time left to its stop (the payout bar's "
              "projection)."]
     if any(r["est_missing"] for r in ctx["new"]):
@@ -797,21 +924,23 @@ def _summary_html(ctx) -> str:
              '<td{}>{}</td>'.format("" if align == "<" else right, _esc(name))
              for name, _w, align in _SUM_COLS) + '</tr>']
     for i, rec in enumerate(_summary_order(ctx["new"])):
-        ev, what, frac, day, total, quoting = _summary_cells(rec)
+        ev, what, pool, frac, earned, day, total, quoting = _summary_cells(rec)
         quoting = ('<b style="color:#1e8449">yes</b>' if rec["n_quoted"] else
+                   '<span style="color:#9a6700">{}</span>'.format(_esc(quoting))
+                   if rec.get("n_ever") else
                    '<span style="color:#888">{}</span>'.format(_esc(quoting)))
         h.append('<tr{bg}><td style="font-family:Consolas,monospace">{ev}</td>'
-                 '<td>{what}</td><td{r}>{frac}</td><td{r}><b>{day}</b></td>'
-                 '<td{r}>{total}</td><td>{quoting}</td></tr>'.format(
+                 '<td>{what}</td><td{r}>{pool}</td><td{r}>{frac}</td><td{r}>{earned}</td>'
+                 '<td{r}><b>{day}</b></td><td{r}>{total}</td><td>{quoting}</td></tr>'.format(
                      bg=' style="background:#f6f6f6"' if i % 2 else "", r=right,
-                     ev=_esc(ev), what=_esc(_clip(what, 60)), frac=frac,
-                     day=day, total=total, quoting=quoting))
-    ev, what, frac, day, total, quoting = _summary_total(ctx["new"])
+                     ev=_esc(ev), what=_esc(_clip(what, 60)), pool=pool, frac=frac,
+                     earned=earned, day=day, total=total, quoting=quoting))
+    ev, what, pool, frac, earned, day, total, quoting = _summary_total(ctx["new"])
     h.append('<tr style="background:#f0f0f0;font-weight:700"><td>{ev}</td>'
-             '<td>{what}</td><td{r}>{frac}</td><td{r}>{day}</td>'
-             '<td{r}>{total}</td><td>{quoting}</td></tr></table>'.format(
-                 r=right, ev=ev, what=what, frac=frac, day=day, total=total,
-                 quoting=quoting))
+             '<td>{what}</td><td{r}>{pool}</td><td{r}>{frac}</td><td{r}>{earned}</td>'
+             '<td{r}>{day}</td><td{r}>{total}</td><td>{quoting}</td></tr></table>'.format(
+                 r=right, ev=ev, what=what, pool=pool, frac=frac, earned=earned,
+                 day=day, total=total, quoting=quoting))
     h.append('<div style="color:#888;font-size:12px;margin:2px 0 8px">{}</div>'
              .format("<br>".join(_esc(n) for n in notes)))
     return "".join(h)

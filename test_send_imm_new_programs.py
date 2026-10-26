@@ -602,9 +602,9 @@ def write_snapshot(rows, ts=NOW - timedelta(minutes=40)):
                                 **r}) + "\n")
 
 
-def snap(ticker, est_day, proj):
+def snap(ticker, est_day, proj, decision="selected"):
     return {"ticker": ticker, "est_dollars_per_day": est_day,
-            "projected_total": proj}
+            "projected_total": proj, "decision": decision}
 
 
 class TopTable(unittest.TestCase):
@@ -636,22 +636,26 @@ class TopTable(unittest.TestCase):
                                                  ("KXQ-26SEP20-T3", 9.0, 9.0))}
         out = np.quote_summary(rec, {"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"}, est)
         self.assertEqual(out, {"n_quoted": 2, "est_day": 4.0, "est_total": 7.0,
-                               "est_missing": 0})
+                               "est_missing": 0, "n_ever": 2, "est_earned": 0.0,
+                               "last_quoted": None})
 
     def test_table_is_at_the_top_with_quoting_events_first(self):
         write_state({"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"})
         write_snapshot([snap("KXQ-26SEP20-T1", 2.5, 4.0),
                         snap("KXQ-26SEP20-T2", 1.5, 3.0),
-                        snap("KXQ-26SEP20-T3", 9.0, 9.0)])   # not quoted
+                        snap("KXQ-26SEP20-T3", 9.0, 9.0, "zero_yield")])   # not quoted
         text, html, _s, _e, _seen, _c = run_report(self._rows())
         self.assertLess(text.index("QUOTING AND ESTIMATED EARNINGS"),
                         text.index("of new pool"))          # above the headline
         top = text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1]
-        for cell in ("2/3 67%", "4.00", "7.00", "yes"):
+        # pool $30; quoted 40 min at $4/day between them: $0.11 earned so far
+        for cell in (" 30 ", "2/3 67%", "0.11", "4.00", "7.00", "yes"):
             self.assertIn(cell, self._line(top, "Q-26SEP20"))
-        self.assertIn("0/1 0%", self._line(top, "N-26SEP20"))
+        for cell in (" 500 ", "0/1 0%"):
+            self.assertIn(cell, self._line(top, "N-26SEP20"))
         self.assertLess(top.index("Q-26SEP20"), top.index("N-26SEP20"))
-        for cell in ("2 new events", "2/4 50%", "4.00", "7.00", "1 quoting"):
+        for cell in ("2 new events", " 530 ", "2/4 50%", "0.11", "4.00", "7.00",
+                     "1 quoting"):
             self.assertIn(cell, self._line(top, "TOTAL"))
         self.assertIn("9/13 6:50am ET selection snapshot", text)
         self.assertLess(html.index("Quoting and estimated earnings"),
@@ -681,6 +685,46 @@ class TopTable(unittest.TestCase):
                        ts=NOW - timedelta(hours=5))
         text, *_rest = run_report(self._rows())
         self.assertIn("STALE, 5h old", text)
+
+    def test_an_event_quoted_earlier_shows_its_history(self):
+        """Jack 2026-10-26: "why isn't earthquake and high / low temp shown as
+        quoting? If they were quoted previously should show that, and the est
+        earned amount and fraction of markets quoted"."""
+        write_state(set())                                   # nothing quoted now
+        write_snapshot([snap("KXQ-26SEP20-T1", 2.4, 1.0),
+                        snap("KXQ-26SEP20-T2", 1.0, 1.0, "zero_yield")],
+                       ts=NOW - timedelta(hours=3))
+        write_snapshot([snap("KXQ-26SEP20-T1", 0.0, 0.0, "cutoff"),
+                        snap("KXQ-26SEP20-T2", 0.0, 0.0, "cutoff")],
+                       ts=NOW - timedelta(hours=2))
+        text, html, *_rest = run_report(self._rows())
+        top = text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1]
+        line = self._line(top, "Q-26SEP20")
+        # T1 quoted 1 h at $2.40/day, to the 5:30am ET block that cut it off
+        for cell in ("1/3 33%", "0.10", "earlier, to 9/13 5:30am"):
+            self.assertIn(cell, line)
+        self.assertLess(top.index("Q-26SEP20"), top.index("N-26SEP20"))
+        self.assertIn("0 quoting, 1 earlier", self._line(top, "TOTAL"))
+        self.assertIn("quoted earlier, not now: 1 event(s), est earned $0.10", text)
+        self.assertIn("quoted earlier 1/3", text)            # the full table's BOT cell
+        self.assertIn("earlier, to 9/13 5:30am", html)
+
+    def test_an_outage_caps_a_quoted_stretch(self):
+        # selected 6 h ago, next block 5 h later: the bot was down, so the rate
+        # counts for HIST_GAP_HOURS, not the whole gap
+        hist = None
+        write_snapshot([snap("KXQ-26SEP20-T1", 2.4, 1.0)], ts=NOW - timedelta(hours=6))
+        write_snapshot([snap("KXQ-26SEP20-T1", 0.0, 0.0, "cutoff")],
+                       ts=NOW - timedelta(hours=1))
+        rec = {"tickers": {"KXQ-26SEP20-T1"}}
+        hist = np.load_quote_history([rec], NOW - timedelta(hours=24), NOW)
+        ever, earned, last = hist["KXQ-26SEP20-T1"]
+        self.assertTrue(ever)
+        self.assertAlmostEqual(earned, 2.4 * 2 / 24)
+        self.assertEqual(last, NOW - timedelta(hours=4))
+        # a block before the window does not count
+        hist = np.load_quote_history([rec], NOW - timedelta(hours=5), NOW)
+        self.assertEqual(hist["KXQ-26SEP20-T1"][:2], (False, 0.0))
 
     def test_every_new_event_is_listed_past_the_full_tables_cap(self):
         """Jack 2026-10-25: "Show full list in table" -- the top table is not
