@@ -12926,9 +12926,10 @@ class TestBwayFairGate(unittest.TestCase):
     """bway_fair.json -> load_bway_fair / bway_fair_gate -> KXBWAYATTENDANCEW,
     Broadway's weekly attendance (Jack 2026-10-25: "Yes enroll it"):
     allowed only through the gate, failing closed, a touch more than 10c
-    through the fair caps that side; x1 at the live 150 cap, out of the
-    base-size split test; out as each week's Sunday starts (its ticker
-    date). And KXSOFTWAREUNEMP ("Enroll this too") joins the jobs graduates."""
+    through the fair caps that side; x3 rungs ("X3") at the live 150 cap,
+    out of the base-size split test; out as each week's Sunday starts (its
+    ticker date). And KXSOFTWAREUNEMP ("Enroll this too") joins the jobs
+    graduates."""
 
     T = "KXBWAYATTENDANCEW-26NOV01-A260000"
     _bump = 1
@@ -12969,13 +12970,16 @@ class TestBwayFairGate(unittest.TestCase):
             # Jack 2026-10-25: "Enroll this too" -- a jobs graduate
             self.assertTrue(a("KXSOFTWAREUNEMP-28JAN01-T3.0"))
             self.assertTrue(imm.scan_graduate_series("KXSOFTWAREUNEMP"))
+        # x3 rungs, the 150 cap literal, as the resort snowfall series (Jack
+        # 2026-10-25: "X3")
         self.assertEqual(imm.series_max_position(s), 150)
-        self.assertEqual(imm.series_levels(s), imm.LEVELS)              # x1
+        self.assertEqual(imm.series_levels(s), imm.scale_levels(imm.LEVELS, 3.0))
+        self.assertEqual(imm.applied_mention_mult(s), 1.0)
         self.assertIsNone(imm.size_test_arm(s))                         # out of the split test
         self.assertEqual(imm.trade_cutoff_utc("KXBWAYATTENDANCEW-26NOV01", None, None),
                          imm.ET.localize(datetime(2026, 11, 1)).astimezone(timezone.utc))
         for k in ("BWAY_FAIR_ENABLE", "BWAY_FAIR_TOL_CENTS", "BWAY_FAIR_TTL_MIN",
-                  "BWAY_FAIR_CAP", "BWAY_FAIR_MAX_POSITION"):
+                  "BWAY_FAIR_CAP", "BWAY_FAIR_MAX_POSITION", "BWAY_FAIR_SIZE_MULT"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
         import imm_risk_controls
         self.assertIn("bway_fair", imm_risk_controls.GATE_GUARDS)

@@ -45,6 +45,27 @@ class ScanGraduateTests(unittest.TestCase):
         for s in sorted(imm.SCAN_GRADUATE_SERIES):
             self.assertFalse(imm.yield_size_eligible(s), s)
 
+    def test_software_unemployment_rests_x3_at_the_cap(self):
+        # Jack 2026-10-25: "X3", sized as the resort snowfall series: x3 rungs
+        # and the 150 cap, both literal (so out of the base-size split test),
+        # on the graduate guard set without the archetype's shipping x2
+        s = "KXSOFTWAREUNEMP"
+        arch = imm.SERIES_OVERRIDES[imm.SCAN_GRADUATE_ARCHETYPE]
+        x3 = imm.scale_levels(imm.SCAN_LEVELS or imm.LEVELS, 3.0)
+        self.assertEqual(imm.SERIES_OVERRIDES[s],
+                         dataclasses.replace(arch, size_mult=None, levels=x3,
+                                             max_position=150))
+        self.assertEqual(imm.series_levels(s), x3)
+        self.assertEqual(imm.series_max_position(s), 150)
+        self.assertEqual(imm.applied_mention_mult(s), 1.0)
+        self.assertIsNone(imm.size_test_arm(s))
+        self.assertTrue(imm.SERIES_OVERRIDES[s].safe_join)
+        self.assertEqual(imm.event_top_n_for(s), 3)
+        for k in ("SOFTWAREUNEMP_SIZE_MULT", "SOFTWAREUNEMP_MAX_POSITION"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        # the other graduates keep the global ladder
+        self.assertEqual(imm.series_levels("KXCFNAI"), imm.SCAN_LEVELS or imm.LEVELS)
+
     def test_members_clone_the_scan_guard_set(self):
         arch = imm.SERIES_OVERRIDES[imm.SCAN_GRADUATE_ARCHETYPE]
         self.assertTrue(arch.safe_join)

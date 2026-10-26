@@ -10420,6 +10420,7 @@ _CONFIG_CODE_KNOBS = (
     # the Broadway weekly attendance gate (2026-10-25); model knobs in bway_fair.py
     "BWAY_FAIR_ENABLE", "BWAY_FAIR_TOL_CENTS", "BWAY_FAIR_TTL_MIN", "BWAY_FAIR_CAP",
     "BWAY_FAIR_MAX_POSITION",
+    "BWAY_FAIR_SIZE_MULT",                       # x3 ladder (Jack 2026-10-25: "X3")
     # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
     "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
     "RT_FAIR_CAP", "RT_FAIR_BAND",
@@ -10529,6 +10530,8 @@ _CONFIG_CODE_KNOBS = (
     "SHIPPING_X2_SERIES",
     # ...and the eight fill-free graduates x2 (FAMILY_X2_1022)
     "SMALL_BOOKS_SIZE_MULT", "SMALL_BOOKS_X2_SERIES",
+    # ...and KXSOFTWAREUNEMP's x3 ladder at the 150 cap (2026-10-25)
+    "SOFTWAREUNEMP_SIZE_MULT", "SOFTWAREUNEMP_MAX_POSITION",
     # join ahead of the pile (2026-10-11)
     "JOIN_AHEAD_MODE", "JOIN_AHEAD_MIN_GAIN", "JOIN_AHEAD_MIN_DAY",
     "JOIN_AHEAD_MIN_AHEAD", "JOIN_AHEAD_MIN_TICKS", "JOIN_AHEAD_EXCLUDE",
@@ -13266,12 +13269,19 @@ def rt_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # League posts a week the Monday after it, after the market closes, so the
 # risk is a better forecaster, not a leak. The gate is the fair-file
 # contract (simple_fair_gate): no fresh fair, no quote; a touch more than
-# BWAY_FAIR_TOL_CENTS through the fair caps that side. At x1 -- the global
-# ladder, BWAY_FAIR_MAX_POSITION a market (the live cap; set here, it also
-# keeps the series out of the base-size split test) -- and the day-dated
-# ticker's midnight-ET rule takes each week out as its Sunday starts. The
-# series is allowed only through this gate: IMM_BWAY_FAIR_ENABLE=0 takes it
-# out; positions ride.
+# BWAY_FAIR_TOL_CENTS through the fair caps that side. BWAY_FAIR_MAX_POSITION
+# a market (the live cap; set here, it also keeps the series out of the
+# base-size split test), and the day-dated ticker's midnight-ET rule takes
+# each week out as its Sunday starts. The series is allowed only through
+# this gate: IMM_BWAY_FAIR_ENABLE=0 takes it out; positions ride.
+# x3 LADDER (Jack 2026-10-25: "X3", on "tripling the size, as we did for the
+# ski resorts"): at x1 each strike's ~$21/day pool sat behind 12-24k
+# contracts of other quotes, ~1% of it ours -- $0.14-0.21/day a strike, so
+# the payout floor (MIN_EST_TOTAL_DOLLARS) dropped 13 of 15 of the Nov 1
+# week (1 admitted, 1 extreme mid) -- so the rung is BWAY_FAIR_SIZE_MULT x
+# the global ladder (60 at the live IMM_LEVELS=0:20) while the per-market
+# cap stays BWAY_FAIR_MAX_POSITION, as the resort snowfall rungs
+# (RESORT_SNOW_SIZE_MULT). IMM_BWAY_FAIR_SIZE_MULT=1 reverts.
 BWAY_FAIR_ENABLE = os.environ.get("IMM_BWAY_FAIR_ENABLE", "1") == "1"
 BWAY_FAIR_SERIES = frozenset(("KXBWAYATTENDANCEW",))
 BWAY_FAIR_TOL_CENTS = _env_int("IMM_BWAY_FAIR_TOL_CENTS", 10)
@@ -13279,6 +13289,7 @@ BWAY_FAIR_TTL_MIN = _env_int("IMM_BWAY_FAIR_TTL_MIN", 180)
 BWAY_FAIR_REFRESH_SECS = _env_int("IMM_BWAY_FAIR_REFRESH_SECS", 1800)
 BWAY_FAIR_CAP = os.environ.get("IMM_BWAY_FAIR_CAP", "1") == "1"
 BWAY_FAIR_MAX_POSITION = _env_float("IMM_BWAY_FAIR_MAX_POSITION", 150)
+BWAY_FAIR_SIZE_MULT = _env_float("IMM_BWAY_FAIR_SIZE_MULT", 3.0)
 BWAY_FAIR_FILE = os.environ.get(
     "IMM_BWAY_FAIR_FILE", os.path.join(STATUS_DIR, "bway_fair.json"))
 _bway_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
@@ -13286,6 +13297,7 @@ _bway_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
 if BWAY_FAIR_ENABLE:
     for _s in BWAY_FAIR_SERIES:
         SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+                                       levels=scale_levels(LEVELS, BWAY_FAIR_SIZE_MULT),
                                        max_position=BWAY_FAIR_MAX_POSITION)
 
 
@@ -16700,6 +16712,27 @@ for _m, _ss in FAMILY_X2_1011 + FAMILY_X2_1022:
         if _base is None and scan_graduate_series(_s):
             _base = SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE]
         SERIES_OVERRIDES[_s] = replace(_base or SeriesOverride(), size_mult=_m)
+
+# KXSOFTWAREUNEMP x3 LADDER (Jack 2026-10-25: "X3", the day it was enrolled,
+# on "tripling the size, as we did for the ski resorts"): at x1 its nine
+# strikes' ~$21/day pools sat behind ~12k contracts of other quotes, ~1% of
+# each ours -- $0.21/day a strike, so the payout floor dropped 7 of 9 (2
+# admitted). Sized as the resort snowfall rungs (RESORT_SNOW_SIZE_MULT), not
+# on the family wire: the rung is SOFTWAREUNEMP_SIZE_MULT x the graduates'
+# ladder (60 at the live IMM_LEVELS=0:20) and the per-market cap stays
+# SOFTWAREUNEMP_MAX_POSITION (150, the live cap), both literal
+# (applied_mention_mult) -- which also keeps it out of the base-size split
+# test. The graduate guard set stays (safe-join, no rate bar, 3 strikes an
+# event, the 28JAN01 midnight-ET exit); the archetype's own shipping x2 does
+# not come along. IMM_SOFTWAREUNEMP_SIZE_MULT=1 reverts to the plain graduate.
+SOFTWAREUNEMP_SIZE_MULT = _env_float("IMM_SOFTWAREUNEMP_SIZE_MULT", 3.0)
+SOFTWAREUNEMP_MAX_POSITION = _env_float("IMM_SOFTWAREUNEMP_MAX_POSITION", 150)
+if SOFTWAREUNEMP_SIZE_MULT != 1.0 and scan_graduate_series("KXSOFTWAREUNEMP"):
+    SERIES_OVERRIDES["KXSOFTWAREUNEMP"] = replace(
+        SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE], size_mult=None,
+        levels=scale_levels(SCAN_LEVELS or LEVELS, SOFTWAREUNEMP_SIZE_MULT),
+        max_position=(SCAN_MAX_POSITION if SCAN_MAX_POSITION is not None
+                      else SOFTWAREUNEMP_MAX_POSITION))
 
 
 # ELECTION DAY (Jack 2026-09-28: "quote until election day", see
@@ -32489,9 +32522,15 @@ class IncentiveMarketMaker:
             log(f"Broadway gate (2026-10-25): {', '.join(sorted(BWAY_FAIR_SERIES))} "
                 f"quoted against bway_fair's per-show weekly forecast -- band "
                 f"{BWAY_FAIR_TOL_CENTS}c caps the side that fights the fair, no fresh "
-                f"fair ({BWAY_FAIR_TTL_MIN}m) no quote; x1, max "
+                f"fair ({BWAY_FAIR_TTL_MIN}m) no quote; x{BWAY_FAIR_SIZE_MULT:g} (ladder "
+                f"{scale_levels(LEVELS, BWAY_FAIR_SIZE_MULT)}), max "
                 f"{BWAY_FAIR_MAX_POSITION:g} per market, out as each week's Sunday "
                 f"starts (its ticker date)")
+        if SOFTWAREUNEMP_SIZE_MULT != 1.0 and scan_graduate_series("KXSOFTWAREUNEMP"):
+            log(f"KXSOFTWAREUNEMP (2026-10-25): the jobs graduates' guard set at "
+                f"x{SOFTWAREUNEMP_SIZE_MULT:g} (ladder "
+                f"{series_levels('KXSOFTWAREUNEMP')}), max "
+                f"{series_max_position('KXSOFTWAREUNEMP'):g} per market")
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
