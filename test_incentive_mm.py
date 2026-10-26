@@ -3150,10 +3150,14 @@ class TestAllowlist(unittest.TestCase):
         # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM")
         self.assertFalse(a("KXAAAGASM-26JUL31-3.10"))
         # the gas trial ended 2026-10-08 (Jack: "block both"): the national
-        # and diesel dailies are blocked by name, the entries kept
-        for t in ("KXAAAGASD-26JUL23-4.150", "KXDIESELD-26AUG03-T5.350"):
-            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
-            self.assertFalse(a(t), t)
+        # and diesel dailies are blocked by name, the entries kept -- and the
+        # national is back only under the opportunistic AS test (2026-10-25)
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            for t in ("KXAAAGASD-26JUL23-4.150", "KXDIESELD-26AUG03-T5.350"):
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+                self.assertFalse(a(t), t)
+        self.assertTrue(a("KXAAAGASD-26JUL23-4.150"))
+        self.assertTrue(IncentiveMarketMaker._blocked("KXDIESELD-26AUG03-T5.350"))
         # KXUSGASCPI (US gasoline CPI) is still an econ allow entry, but it
         # is a CPI print: the 2026-09-24 CPI pattern block wins over the
         # allowlist (Jack "blocklist CPI markets"); the entry is kept for a
@@ -4856,10 +4860,14 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                 t = f"KXAAAGASD{st}-26SEP02-3.1500"
                 # 2026-10-01 (the gas trial): blocked again by default,
                 # GasBuddy logging on; IMM_GB_STATE_QUOTE=1 re-gates them
-                self.assertEqual(IncentiveMarketMaker._blocked(t),
-                                 not imm.GB_STATE_QUOTE, t)
-                self.assertEqual(IncentiveMarketMaker._allowed(t),
-                                 imm.GB_STATE_QUOTE, t)
+                # (and the opportunistic AS test, 2026-10-25, lifts the
+                # pattern for its members: TestOpportunisticAsTestGas)
+                with mock.patch.object(imm, "ASTEST_ENABLE", False):
+                    self.assertEqual(IncentiveMarketMaker._blocked(t),
+                                     not imm.GB_STATE_QUOTE, t)
+                    self.assertEqual(IncentiveMarketMaker._allowed(t),
+                                     imm.GB_STATE_QUOTE, t)
+                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
             t = "KXAAAGASDNYC-26SEP02-3.1500"          # not a state shape
             self.assertTrue(IncentiveMarketMaker._blocked(t), t)
             self.assertFalse(IncentiveMarketMaker._allowed(t), t)
@@ -4871,7 +4879,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # 2026-10-25 -- both blocked by NAME, not by pattern
         self.assertFalse(imm.series_pattern_blocked("KXAAAGASM"))
         self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASM-26SEP30-4.20"))
-        self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASD-26SEP02-3.1500"))
+        # (the daily is back under the opportunistic AS test, 2026-10-25)
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            self.assertTrue(IncentiveMarketMaker._blocked("KXAAAGASD-26SEP02-3.1500"))
         # the monthly max / min pair is not pattern-blocked either: it was
         # cut BY NAME on 2026-10-03 (test_imm_scan_graduates)
         for s in ("KXAAAGASMINM", "KXAAAGASMAXM"):
@@ -7119,12 +7129,16 @@ class TestStickySelection(unittest.TestCase):
         # and diesel DAILIES quote 13:00 ET to the close; their no-quote
         # window 00:00-13:00 ET contains the print blackout
         self.assertEqual(imm.GAS_TRIAL_SERIES, ("KXAAAGASD", "KXDIESELD"))
-        for s in ("KXAAAGASD", "KXDIESELD"):
+        # (2026-10-25, the opportunistic AS test: the national gas daily's
+        # window is the test's, 16:00 ET to the close -- it too contains the
+        # print blackout)
+        for s, start in (("KXDIESELD", "13:00"),
+                         ("KXAAAGASD", "16:00" if imm.ASTEST_ENABLE else "13:00")):
             self.assertEqual(imm.series_override(s).blackout_et,
-                             ("00:00", "13:00"), s)
+                             ("00:00", start), s)
             for hh, mm in ((0, 0), (3, 18), (8, 0), (12, 59)):
                 self.assertTrue(imm.series_in_blackout(s, at(hh, mm)), (s, hh, mm))
-            for hh, mm in ((13, 0), (18, 30), (23, 59)):
+            for hh, mm in ((16, 0), (18, 30), (23, 59)):
                 self.assertFalse(imm.series_in_blackout(s, at(hh, mm)), (s, hh, mm))
         # KXDIESELW keeps its $0 rate floor: the blackout must not have
         # clobbered the series override it was merged into
@@ -11418,9 +11432,12 @@ class TestDailySeries(unittest.TestCase):
         for daily in ("KXNEWGASD", "KXAAAGASD", "KXRAIN", "KXTEMPMIAH"):
             self.assertEqual(imm.hour_size_mult(daily, at_4am), 1.0, daily)
             self.assertEqual(imm.hour_size_mult(daily, at_9am), 1.0, daily)
-        # a daily's own per-series window still wins
+        # a daily's own per-series window still wins (the AAA gas dailies are
+        # x1 at every hour under the opportunistic AS test, 2026-10-25)
         self.assertEqual(imm.hour_size_mult("KXNEWGASD", at_8pm), 0.5)
-        self.assertEqual(imm.hour_size_mult("KXAAAGASD", at_8pm), 0.5)
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            self.assertEqual(imm.hour_size_mult("KXAAAGASD", at_8pm), 0.5)
+        self.assertEqual(imm.hour_size_mult("KXAAAGASD", at_8pm), 1.0)
 
     def test_saturday_mult_skips_daily_families(self):
         imm.SAT_SIZE_MULT = 1.5
@@ -13761,8 +13778,11 @@ class TestGasBuddyFairGate(unittest.TestCase):
         # its tests fail by wall clock 13 hours a day (found 10/01 09:05 ET,
         # identically on main 6e5f58c). patch.dict also drops the clone the
         # cycle adds.
+        # The opportunistic AS test (2026-10-25) quotes the gas dailies plain;
+        # this class is the gate's, so it runs with the test off.
         import dataclasses
-        for p in (mock.patch.object(imm, "GB_STATE_QUOTE", True),
+        for p in (mock.patch.object(imm, "ASTEST_ENABLE", False),
+                  mock.patch.object(imm, "GB_STATE_QUOTE", True),
                   mock.patch.object(imm, "SERIES_BLOCK_PATTERNS", tuple(
                       imm.re.compile(x) for x in
                       imm._series_block_default(True).split(",") if x)),
@@ -15640,6 +15660,11 @@ class TestPerSeriesHourMultiplier(unittest.TestCase):
         imm.SERIES_HOUR_MULTS = imm._parse_series_hour_mults(
             "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:16-1:0.5,"
             "KXTRUEV:17-1:0.5")
+        # the opportunistic AS test (2026-10-25) lifts the gas halving for
+        # its members (TestOpportunisticAsTestGas); this class is the rule's
+        p = mock.patch.object(imm, "ASTEST_ENABLE", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved
@@ -17268,11 +17293,16 @@ class TestOpenScanTier(unittest.TestCase):
         # scan universe either (the de-allowlist-only route would have made
         # this None = scan candidate). Since 2026-09-27 they are normal-book
         # members behind the GasBuddy gate -- still never scan universe.
-        # (2026-10-01, the gas trial: blocked again unless IMM_GB_STATE_QUOTE=1)
+        # (2026-10-01, the gas trial: blocked again unless IMM_GB_STATE_QUOTE=1;
+        # 2026-10-25, the opportunistic AS test: national + states back)
+        astest = imm.ASTEST_ENABLE
         self.assertEqual(r("KXAAAGASDTX-26SEP08-4.14"),
-                         "allowed" if imm.GB_STATE_QUOTE else "blocked")
+                         "allowed" if (imm.GB_STATE_QUOTE or astest) else "blocked")
         self.assertEqual(r("KXAAAGASDNYC-26SEP08-4.14"), "blocked")
-        self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")   # gas trial ended 10/08
+        self.assertEqual(r("KXAAAGASD-26SEP08-4.14"),              # trial ended 10/08
+                         "allowed" if astest else "blocked")
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            self.assertEqual(r("KXAAAGASD-26SEP08-4.14"), "blocked")
         # the national AAA monthly, cut 2026-10-25 (Jack: "Cut KXAAAGASM");
         # the state monthly is a different series
         self.assertEqual(r("KXAAAGASM-26OCT31-3.10"), "blocked")
@@ -24034,7 +24064,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the state statistics release pause (2026-10-22)
         # + the low-temperature gate (2026-10-23)
         # + the high-temperature gate (2026-10-23)
-        self.assertEqual(len(conts), 52)
+        # + the opportunistic AS test's fill pause (2026-10-25)
+        self.assertEqual(len(conts), 53)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -32229,6 +32260,216 @@ class TestHighTempFamily(unittest.TestCase):
             self.assertIn(imm.HIGHT_HALT_KEY, imm.pilot_halt_keys())
         for k in ("HIGHT_ENABLE", "HIGHT_STOP_BEFORE_MIN", "HIGHT_FAIR_TOL_CENTS",
                   "HIGHT_DAILY_LOSS_LIMIT", "HIGHT_SIZE_MULT"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+
+class TestOpportunisticAsTestGas(unittest.TestCase):
+    """Jack 2026-10-25: "Build Opportunistic test of adversely selectable
+    markets, but where the rewards are high enough + risk controls to where
+    it could be profitable". First family: the AAA gas dailies, relaunched
+    that day at $2,553/day a series. Fixture event KXAAAGASDTX-68DEC05 (far
+    from any cutoff)."""
+
+    T = "KXAAAGASDTX-68DEC05-3.7000"
+    EV = "KXAAAGASDTX-68DEC05"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        for p in (mock.patch.dict(imm._astest_stop, {"checked": 0.0, "stopped": False}),
+                  mock.patch.dict(imm.SERIES_OVERRIDES)):
+            p.start()
+            self.addCleanup(p.stop)
+        stop = os.path.join(imm.STATUS_DIR, imm.ASTEST_STOP_FILE)
+        self.addCleanup(lambda: os.path.exists(stop) and os.remove(stop))
+
+    def test_the_family_lifts_the_gas_blocks_for_the_dailies_only(self):
+        prev = imm.ALLOWLIST_ONLY
+        try:
+            imm.ALLOWLIST_ONLY = True
+            self.assertIn("KXAAAGASD-", imm.SERIES_BLOCKLIST_PREFIXES)     # the trial's cut
+            for t in (self.T, "KXAAAGASD-68DEC05-3.1000"):
+                self.assertTrue(imm.astest_gas_series(imm.series_of(t)), t)
+                self.assertFalse(IncentiveMarketMaker._blocked(t), t)
+                self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+            # a longer suffix, the diesel daily and the gas monthly stay out
+            for t in ("KXAAAGASDTXX-68DEC05-3.7", "KXDIESELD-68DEC05-3.7",
+                      "KXAAAGASM-68DEC31-3.1"):
+                self.assertFalse(imm.astest_gas_series(imm.series_of(t)), t)
+                self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            # the kill switch: blocked exactly as before
+            with mock.patch.object(imm, "ASTEST_ENABLE", False):
+                for t in (self.T, "KXAAAGASD-68DEC05-3.1000"):
+                    self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+            # the stop file, read once a minute, blocks them too
+            with open(os.path.join(imm.STATUS_DIR, imm.ASTEST_STOP_FILE), "w") as fh:
+                fh.write("stop")
+            self.assertFalse(IncentiveMarketMaker._blocked(self.T))     # cached
+            imm._astest_stop["checked"] = 0.0
+            self.assertTrue(imm.astest_stopped())
+            self.assertTrue(IncentiveMarketMaker._blocked(self.T))
+            self.assertIsNone(imm.pilot_budget_key(self.T))
+        finally:
+            imm.ALLOWLIST_ONLY = prev
+
+    def test_window_cap_x1_and_out_of_the_size_test(self):
+        self.assertEqual(imm.astest_blackout(("16:00", "24:00")), ("00:00", "16:00"))
+        self.assertEqual(imm.astest_blackout(("10:00", "22:00")), ("22:00", "10:00"))
+        self.assertEqual(imm.ASTEST_GAS_WINDOW_ET, ("16:00", "24:00"))
+        ov = imm.SERIES_OVERRIDES["KXAAAGASD"]
+        self.assertEqual(ov.blackout_et, ("00:00", "16:00"))
+        self.assertEqual(ov.max_position, 100.0)
+        # the states clone the national's stops at refresh
+        imm.SERIES_OVERRIDES.pop("KXAAAGASDTX", None)
+        imm.ensure_family_override("KXAAAGASDTX")
+        st = imm.SERIES_OVERRIDES["KXAAAGASDTX"]
+        self.assertEqual((st.blackout_et, st.max_position), (("00:00", "16:00"), 100.0))
+        # (EDT: ET = UTC-4)
+        for now, out in ((utc(2026, 10, 27, 12, 0), True),           # 08:00 ET
+                         (utc(2026, 10, 27, 19, 59), True),          # 15:59 ET
+                         (utc(2026, 10, 27, 20, 0), False),          # 16:00 ET
+                         (utc(2026, 10, 28, 3, 59), False)):         # 23:59 ET
+            self.assertEqual(imm.series_in_blackout("KXAAAGASDTX", now), out, now)
+        # x1 in the window: the 4pm-1am gas halving is lifted for the family
+        # (the diesel daily keeps its own)
+        evening = utc(2026, 10, 27, 21, 0)                             # 17:00 ET
+        with mock.patch.object(imm, "SERIES_HOUR_MULTS",
+                               imm._parse_series_hour_mults("KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5")):
+            self.assertEqual(imm.hour_size_mult("KXAAAGASDTX", evening), 1.0)
+            self.assertEqual(imm.hour_size_mult("KXDIESELD", evening), 0.5)
+            with mock.patch.object(imm, "ASTEST_ENABLE", False):
+                self.assertEqual(imm.hour_size_mult("KXAAAGASDTX", evening), 0.5)
+        # a hand cap: literal, and out of both halves of the base-size test
+        self.assertEqual(imm.applied_mention_mult("KXAAAGASDTX"), 1.0)
+        self.assertIsNone(imm.size_test_arm("KXAAAGASDTX"))
+        self.assertIsNone(imm.size_test_arm("KXAAAGASD"))
+
+    def test_family_loss_budget(self):
+        self.assertEqual(imm.ASTEST_GAS_DAILY_LOSS, 300.0)
+        self.assertEqual(imm.pilot_budget_key(self.T), imm.ASTEST_GAS_HALT_KEY)
+        self.assertEqual(imm.pilot_budget_key("KXAAAGASD-68DEC05-3.1000"),
+                         imm.ASTEST_GAS_HALT_KEY)
+        self.assertEqual(imm.pilot_halt_limit(imm.ASTEST_GAS_HALT_KEY), 300.0)
+        self.assertIn(imm.ASTEST_GAS_HALT_KEY, imm.pilot_halt_keys())
+        self.assertIsNone(imm.pilot_budget_key("KXAAAGASM-68DEC31-3.1"))
+        with mock.patch.object(imm, "ASTEST_GAS_DAILY_LOSS", 0.0):
+            self.assertIsNone(imm.pilot_budget_key(self.T))
+            self.assertNotIn(imm.ASTEST_GAS_HALT_KEY, imm.pilot_halt_keys())
+        for k in ("ASTEST_ENABLE", "ASTEST_GAS_WINDOW_ET", "ASTEST_GAS_MAX_POSITION",
+                  "ASTEST_GAS_DAILY_LOSS", "ASTEST_GAS_FILL_PAUSE_MIN"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+                                                 "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_quoted_plain_in_the_window_and_a_fill_pauses_the_event(self):
+        # inside the window (the clock is the test's), with no GasBuddy read:
+        # the family skips the gate that would stand a state daily aside
+        self.assertTrue(imm.gb_fair_series("KXAAAGASDTX"))
+        with mock.patch.object(imm, "series_in_blackout", lambda s, n: False):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot), [])
+            self.assertNotIn(self.T, bot._guard_now)
+            # our maker fill stands the whole event aside the pause
+            now = time.time()
+            self.assertEqual(imm.ASTEST_GAS_FILL_PAUSE_MIN, 15.0)
+            bot._sweep_note_fill({"order_id": "o-ws", "market_ticker": self.T,
+                                  "count_fp": "3.00", "ts_ms": int(now * 1000),
+                                  "is_taker": False}, now)
+            self.assertAlmostEqual(bot.state.astest_fill_pause_until[self.EV],
+                                   now + 900, delta=1)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertEqual(bot._guard_now[self.T]["guard"], "astest_fill_pause")
+            # it survives a restart
+            bot._save_persist()
+            bot2 = IncentiveMarketMaker(client=bot.client, live=False)
+            self.assertAlmostEqual(bot2.state.astest_fill_pause_until[self.EV],
+                                   now + 900, delta=1)
+            # over: quoting resumes
+            bot.state.astest_fill_pause_until[self.EV] = now - 1
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot), [])
+        # outside the window the blackout holds it
+        with mock.patch.object(imm, "series_in_blackout", lambda s, n: True):
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+
+    def test_only_our_maker_fills_start_the_pause(self):
+        bot = self._bot()
+        now = time.time()
+        # a taker fill and another family's fill start nothing
+        bot._sweep_note_fill({"order_id": "o-1", "market_ticker": self.T,
+                              "count_fp": "3.00", "ts_ms": int(now * 1000),
+                              "is_taker": True}, now)
+        bot._astest_fill_pause_note("KXAAAGASM-68DEC31-3.1", now, "fill")
+        self.assertEqual(bot.state.astest_fill_pause_until, {})
+        # the cycle's read: a later fill extends, an older one never shortens
+        bot._astest_fill_pause_note(self.T, now, "fill")
+        bot._astest_fill_pause_note(self.T, now + 60, "fill")
+        bot._astest_fill_pause_note(self.T, now - 600, "fill")
+        self.assertAlmostEqual(bot.state.astest_fill_pause_until[self.EV],
+                               now + 60 + 900, delta=1)
+        bot.state.astest_fill_pause_until.clear()
+        with mock.patch.object(imm, "ASTEST_GAS_FILL_PAUSE_MIN", 0.0):
+            bot._astest_fill_pause_note(self.T, now, "fill")
+        self.assertEqual(bot.state.astest_fill_pause_until, {})
+
+    def test_event_cap_and_the_family_burst_breaker(self):
+        # the states move together on the national price: one sweep can hit
+        # every state at once, so our fills across the family are budgeted
+        self.assertEqual(imm.event_cap_contracts(self.EV), 300.0)
+        self.assertEqual(imm.event_cap_contracts("KXAAAGASD-68DEC05"), 300.0)
+        bot = self._bot()
+        now = time.time()
+        fam = imm.ASTEST_GAS_FAMILY_KEY
+        with mock.patch.object(bot.alerter, "alert") as al:
+            bot._astest_fill_pause_note(self.T, now - 1000, "fill", count=250)   # outside 15m
+            bot._astest_fill_pause_note(self.T, now, "fill", count=200)
+            # the WS note carries no count: never counted twice
+            bot._astest_fill_pause_note("KXAAAGASDCA-68DEC05-4.5000", now, "WS fill")
+            self.assertNotIn(fam, bot.state.astest_fill_pause_until)
+            al.assert_not_called()
+            # another state's fill takes the family to the bar
+            bot._astest_fill_pause_note("KXAAAGASDCA-68DEC05-4.5000", now, "fill", count=100)
+            self.assertAlmostEqual(bot.state.astest_fill_pause_until[fam], now + 1800, delta=2)
+            al.assert_called_once()
+            self.assertEqual(al.call_args[0][0], "astest_burst")
+        # every gas event stands aside, this one included
+        with mock.patch.object(imm, "series_in_blackout", lambda s, n: False):
+            bot.state.astest_fill_pause_until.pop(self.EV, None)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertEqual(bot._guard_now[self.T]["guard"], "astest_fill_pause")
+            self.assertTrue(bot._guard_now[self.T]["inputs"]["family"])
+        with mock.patch.object(imm, "ASTEST_GAS_BURST_CONTRACTS", 0.0):
+            bot.state.astest_fill_pause_until.clear()
+            bot._astest_fill_pause_note(self.T, now, "fill", count=10_000)
+            self.assertNotIn(fam, bot.state.astest_fill_pause_until)
+        for k in ("ASTEST_GAS_EVENT_CAP", "ASTEST_GAS_BURST_CONTRACTS",
+                  "ASTEST_GAS_BURST_WINDOW_MIN", "ASTEST_GAS_BURST_PAUSE_MIN"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
 

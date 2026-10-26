@@ -1636,6 +1636,11 @@ def quiet_daily_member(series: str) -> bool:
 def _hour_window_mult(series: str, now_utc: datetime) -> float:
     """The hour-of-day part of hour_size_mult(): 1.0 outside configured
     windows and for excluded series prefixes."""
+    # the opportunistic AS test's gas dailies (2026-10-25, ASTEST_ENABLE): x1
+    # at every hour -- the family's own quote window does the timing, and
+    # the 4pm-1am gas halving would starve it under the payout floor
+    if astest_gas_series(series):
+        return 1.0
     et = now_utc.astimezone(ET)
     hour = et.hour
     # A per-series rule wins ONLY for the hours it actually names. Returning
@@ -2803,6 +2808,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the YouTube #2 pilot (2026-10-05): YT2_EVENT_CAP net per event
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return globals()["YT2_EVENT_CAP"]
+    # the opportunistic AS test's gas dailies (2026-10-25)
+    if astest_gas_series(series):
+        return ASTEST_GAS_EVENT_CAP
     # the YouTube #1 leader-bid pilot (2026-10-14): YT1_EVENT_CAP net per event
     if series == globals().get("YT1_SERIES") and globals().get("YT1_ENABLE"):
         return globals()["YT1_EVENT_CAP"]
@@ -9023,6 +9031,113 @@ if GAS_TRIAL_BLACKOUT_ET:
                 SERIES_OVERRIDES[_s],
                 blackout_et=tuple(GAS_TRIAL_BLACKOUT_ET.split("-")))
 
+# ----------------------------------------------------------------------------
+# OPPORTUNISTIC AS TEST (Jack 2026-10-25: "Build Opportunistic test of
+# adversely selectable markets, but where the rewards are high enough + risk
+# controls to where it could be profitable"). A live test tier for families
+# the book keeps out because informed flow picks makers off, admitted where
+# the public tape says the program pool more than pays for that, under stops
+# of their own.
+# FIRST FAMILY -- THE AAA GAS DAILIES. Kalshi relaunched them 2026-10-25: the
+# national KXAAAGASD and 51 two-letter state dailies KXAAAGASD<ST>, 17
+# half-cent strikes each, trading 08:00-23:59 ET the day before AAA's print,
+# at $2,553/day a series ($1,700 an event) -- ~$133k/day, 43% of every
+# program on the exchange that night. The history is adverse selection: the
+# states were blocked 9/14 at -10c/ct, the GasBuddy gate lost to the market's
+# own price (10/01, GB_STATE_QUOTE), and the 1pm-midnight national + diesel
+# trial lost -$71 against $15 credited (10/01-10/08, _CUT_GAS_TRIAL_SERIES).
+# The pay PER MARKET is no higher now: ~$150/day a strike then and now (the
+# cycle logs, 8/25-10/05; a few September states $300). What is new is the
+# breadth -- 52 series x 17 strikes, against the 17 series quoted on 9/12.
+# The public tape (makers' P&L to
+# settlement; session scratchpad astest/):
+#   national, the 7 days to 10/25: 3.8M contracts, makers +$50.7k -- one
+#     +$50k day, about flat without it. By ET hour 08-14 -$22.5k, 16-23
+#     +$20.8k.
+#   day one of the relaunch (the 26OCT26 events, 52 series): 1.70M
+#     contracts, makers -$138 to +$25.3k on trading (27 strikes still
+#     undecided at the close, bounded both ways) against ~$88k of pool;
+#     decided strikes 16-24 ET +$6.6k on 847k contracts.
+# So the family quotes PLAIN (no GasBuddy gate: the market out-forecasts it)
+# and under five stops of its own:
+#   1. window ASTEST_GAS_WINDOW_ET (16:00-24:00 ET): the rest of the day is a
+#      blackout (series_in_blackout: the quote loop cancels and holds)
+#   2. size: the global ladder at x1 inside the window -- the 2026-08-04
+#      4pm-1am halving (SERIES_HOUR_MULTS) is lifted for the family, since at
+#      half size few strikes would clear the $1-per-period payout floor over
+#      an 8h window -- and a net cap of ASTEST_GAS_MAX_POSITION per market. A
+#      hand cap is literal (applied_mention_mult) and takes the family out
+#      of both halves of the base-size split test (size_test_arm).
+#   3. family daily loss halt ASTEST_GAS_DAILY_LOSS (pilot budget
+#      ASTEST_GAS_HALT_KEY): out until the 5am-CT roll, positions ride
+#   4. fill pause: a maker fill of ours stands its EVENT aside for
+#      ASTEST_GAS_FILL_PAUSE_MIN (a moving print walks through the strikes),
+#      and a net cap of ASTEST_GAS_EVENT_CAP per event (the global 1,000
+#      would let one state carry ten strikes' caps)
+#   5. family burst breaker: the states move together on the national
+#      price, so one informed sweep can hit every state at once -- our maker
+#      fills across the whole family reaching ASTEST_GAS_BURST_CONTRACTS
+#      inside ASTEST_GAS_BURST_WINDOW_MIN stand EVERY gas event aside
+#      ASTEST_GAS_BURST_PAUSE_MIN, with an email
+#   6. stop file STATUS_DIR/ASTEST_STOP_FILE (read once a minute): present ->
+#      the family is blocked again, resting orders cancelled next cycle
+# plus everything bot-wide (move and sweep breakers, fast cancel, toxic
+# halts, the daily loss limit). IMM_ASTEST_ENABLE=0 is the restart-level
+# kill: the gas dailies are blocked exactly as before.
+ASTEST_ENABLE = os.environ.get("IMM_ASTEST_ENABLE", "1") == "1"
+ASTEST_STOP_FILE = "astest_stop.txt"                            # in STATUS_DIR
+ASTEST_GAS_RE = re.compile(os.environ.get(
+    "IMM_ASTEST_GAS_RE", r"KXAAAGASD(?:[A-Z][A-Z])?"))
+ASTEST_GAS_WINDOW_ET = tuple(os.environ.get(
+    "IMM_ASTEST_GAS_WINDOW_ET", "16:00-24:00").split("-"))
+ASTEST_GAS_MAX_POSITION = _env_float("IMM_ASTEST_GAS_MAX_POSITION", 100.0)
+ASTEST_GAS_DAILY_LOSS = _env_float("IMM_ASTEST_GAS_DAILY_LOSS", 300.0)
+ASTEST_GAS_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_ASTEST_GAS_FILL_PAUSE_MIN", 15.0))
+ASTEST_GAS_EVENT_CAP = _env_float("IMM_ASTEST_GAS_EVENT_CAP", 300.0)
+ASTEST_GAS_BURST_CONTRACTS = _env_float("IMM_ASTEST_GAS_BURST_CONTRACTS", 300.0)
+ASTEST_GAS_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_GAS_BURST_WINDOW_MIN", 15.0)
+ASTEST_GAS_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_GAS_BURST_PAUSE_MIN", 30.0)
+ASTEST_GAS_HALT_KEY = "ASTEST:GAS"
+# the family-wide entry in the fill-pause map (event tickers never start "*")
+ASTEST_GAS_FAMILY_KEY = "*GAS"
+# the blocks the family stands aside: the gas trial's national cut (a
+# SERIES_BLOCKLIST_PREFIXES entry) -- the state pattern block is skipped
+# for members in _blocked
+_ASTEST_GAS_UNBLOCK = ("KXAAAGASD-",)
+_astest_stop = {"checked": 0.0, "stopped": False}
+
+
+def astest_stopped() -> bool:
+    """The AS test's stop file, read at most once a minute."""
+    now = time.time()
+    if now - _astest_stop["checked"] >= 60:
+        _astest_stop["checked"] = now
+        _astest_stop["stopped"] = os.path.exists(os.path.join(STATUS_DIR, ASTEST_STOP_FILE))
+    return _astest_stop["stopped"]
+
+
+def astest_gas_series(series: str) -> bool:
+    """The AS test's gas family: the national AAA daily and the two-letter
+    state dailies, while the test is on and not stopped."""
+    return (ASTEST_ENABLE and ASTEST_GAS_RE.fullmatch(series or "") is not None
+            and not astest_stopped())
+
+
+def astest_blackout(window: Tuple[str, str]) -> Tuple[str, str]:
+    """A quote window [start, end) ET as the blackout series_in_blackout
+    reads -- its complement: ("16:00", "24:00") -> ("00:00", "16:00")."""
+    start, end = window
+    return ("00:00" if end == "24:00" else end, start)
+
+
+# The national override carries the family's stops; the states clone it
+# (FAMILY_OVERRIDE_PARENTS' KXAAAGASD prefix rule, at refresh).
+if ASTEST_ENABLE and "KXAAAGASD" in SERIES_OVERRIDES:
+    SERIES_OVERRIDES["KXAAAGASD"] = replace(
+        SERIES_OVERRIDES["KXAAAGASD"],
+        blackout_et=astest_blackout(ASTEST_GAS_WINDOW_ET),
+        max_position=ASTEST_GAS_MAX_POSITION)
+
 
 # ---- family guard inheritance (Jack 2026-09-01 "fix this going forward",
 # after Kalshi lit five new state gas dailies + 12 new *APP series overnight
@@ -10449,6 +10564,11 @@ _CONFIG_CODE_KNOBS = (
     "GB_STATE_MIN_RATE", "GB_DIESEL_ENABLE", "GB_NATGAS_ENABLE",
     # the 1pm-midnight gas trial (2026-10-01)
     "GB_STATE_QUOTE", "GAS_TRIAL_SERIES", "GAS_TRIAL_BLACKOUT_ET",
+    # the opportunistic AS test's gas family (2026-10-25)
+    "ASTEST_ENABLE", "ASTEST_GAS_WINDOW_ET", "ASTEST_GAS_MAX_POSITION",
+    "ASTEST_GAS_DAILY_LOSS", "ASTEST_GAS_FILL_PAUSE_MIN", "ASTEST_GAS_EVENT_CAP",
+    "ASTEST_GAS_BURST_CONTRACTS", "ASTEST_GAS_BURST_WINDOW_MIN",
+    "ASTEST_GAS_BURST_PAUSE_MIN",
     # the three fair refreshers' Kalshi reads signed (2026-09-27)
     "FAIR_SIGNED_READS",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
@@ -15103,6 +15223,9 @@ def pilot_halt_key(series: str) -> Optional[str]:
         return LOWT_HALT_KEY
     if hight_series(series) and HIGHT_DAILY_LOSS_LIMIT > 0:
         return HIGHT_HALT_KEY
+    # the opportunistic AS test's gas dailies (2026-10-25): one budget
+    if astest_gas_series(series) and ASTEST_GAS_DAILY_LOSS > 0:
+        return ASTEST_GAS_HALT_KEY
     return None
 
 
@@ -15142,6 +15265,8 @@ def pilot_halt_limit(key: str) -> float:
         return LOWT_DAILY_LOSS_LIMIT
     if key == HIGHT_HALT_KEY:
         return HIGHT_DAILY_LOSS_LIMIT
+    if key == ASTEST_GAS_HALT_KEY:
+        return ASTEST_GAS_DAILY_LOSS
     if key.startswith(NFL_AUTO_BUDGET_PREFIX):
         return NFL_AUTO_DAILY_LOSS_LIMIT
     if key.startswith(LEAGUE_AUTO_BUDGET_PREFIX):
@@ -15160,6 +15285,8 @@ def pilot_halt_keys() -> List[str]:
         keys.append(LOWT_HALT_KEY)
     if HIGHT_ENABLE and HIGHT_DAILY_LOSS_LIMIT > 0:
         keys.append(HIGHT_HALT_KEY)
+    if ASTEST_ENABLE and ASTEST_GAS_DAILY_LOSS > 0:
+        keys.append(ASTEST_GAS_HALT_KEY)
     return keys
 
 
@@ -19463,6 +19590,9 @@ class BotState:
     # its fill pause (2026-10-14, YT2_FILL_PAUSE_MIN): event -> unix time
     # the event stays aside until; persisted, so a restart keeps it
     yt2_fill_pause_until: Dict[str, float] = field(default_factory=dict)
+    # the opportunistic AS test's fill pause (2026-10-25,
+    # ASTEST_GAS_FILL_PAUSE_MIN): event -> unix time it stays aside until
+    astest_fill_pause_until: Dict[str, float] = field(default_factory=dict)
     # YouTube weekly pilot daily loss halt (2026-10-06, YTW_DAILY_LOSS_LIMIT)
     ytw_halt_day: str = ""
     ytw_pnl_baseline: Optional[float] = None   # NOT persisted
@@ -20217,6 +20347,11 @@ class IncentiveMarketMaker:
                 # (YT2_FILL_PAUSE_MIN; the WS fill usually got here first)
                 self._yt2_fill_pause_note(tkr, float(self._fill_ts(f) or now_ts),
                                           "fill")
+            if not f.get("is_taker") and astest_gas_series(series_of(tkr)):
+                # a fill on the AS test's gas family: stand its event aside
+                # (ASTEST_GAS_FILL_PAUSE_MIN; the WS fill usually got here first)
+                self._astest_fill_pause_note(tkr, float(self._fill_ts(f) or now_ts),
+                                             "fill", count=count)
             join = self._log_fill(f, tkr, side, action, count, px_cents,
                                   now_ts, pos_before, avg_before)
             if toxic:
@@ -20921,6 +21056,9 @@ class IncentiveMarketMaker:
             self.state.yt2_fill_pause_until = {
                 str(e): float(v)
                 for e, v in (data.get("yt2_fill_pause_until") or {}).items()}
+            self.state.astest_fill_pause_until = {
+                str(e): float(v)
+                for e, v in (data.get("astest_fill_pause_until") or {}).items()}
             self.state.ytw_halt_day = str(data.get("ytw_halt_day") or "")
             self.state.twk_halt_day = {
                 str(k): str(v) for k, v in (data.get("twk_halt_day") or {}).items()}
@@ -21342,6 +21480,10 @@ class IncentiveMarketMaker:
                            "yt2_fill_pause_until": {
                                e: round(v, 1)
                                for e, v in list(self.state.yt2_fill_pause_until.items())
+                               if v > time.time()},
+                           "astest_fill_pause_until": {
+                               e: round(v, 1)
+                               for e, v in list(self.state.astest_fill_pause_until.items())
                                if v > time.time()},
                            "ytw_halt_day": self.state.ytw_halt_day,
                            "ytw_pnl_carry": round(self.state.ytw_pnl_today_last, 2),
@@ -22524,6 +22666,10 @@ class IncentiveMarketMaker:
                 # a fill on the YouTube #2 pilot: stand its event aside
                 # (YT2_FILL_PAUSE_MIN; the cycle's fill read notes it too)
                 self._yt2_fill_pause_note(t, fts, "WS fill")
+            if maker and astest_gas_series(series_of(t)):
+                # a fill on the AS test's gas family: stand its event aside
+                # (ASTEST_GAS_FILL_PAUSE_MIN; the cycle's fill read notes it too)
+                self._astest_fill_pause_note(t, fts, "WS fill")
             if SWEEP_BREAKER == "off":
                 return
             self._sweep["fills_seen"] += 1
@@ -23961,6 +24107,58 @@ class IncentiveMarketMaker:
         except Exception as e:
             log(f"{self.tag} ! yt2 fill pause failed: {e}")
 
+    def _astest_fill_pause_note(self, ticker: str, fill_ts: float,
+                                src: str, count: float = 0.0) -> None:
+        """A maker fill of ours on the AS test's gas family (src: 'WS fill' /
+        'fill'): its whole event stays aside until ASTEST_GAS_FILL_PAUSE_MIN
+        after the fill -- a print that moves walks through the half-cent
+        strikes -- and a later fill extends it. The yt2 pause's scheme. A
+        fill older than the pause (a startup reconcile) starts nothing.
+        `count` feeds the family burst breaker (ASTEST_GAS_BURST_CONTRACTS):
+        only the cycle's fill read passes it, so a fill the WS feed saw
+        first is not counted twice. Never raises."""
+        try:
+            if not astest_gas_series(series_of(ticker)):
+                return
+            now_ts = time.time()
+            fts = float(fill_ts or now_ts)
+            pauses = self.state.astest_fill_pause_until  # (the WS and trading threads)
+            for e_old in [e for e, u in list(pauses.items()) if u < now_ts]:
+                pauses.pop(e_old, None)
+            until = fts + ASTEST_GAS_FILL_PAUSE_MIN * 60
+            ev = self._event_of(ticker)
+            prev = pauses.get(ev, 0.0)
+            if ASTEST_GAS_FILL_PAUSE_MIN > 0 and until > now_ts and until > prev:
+                pauses[ev] = until
+                log(f"{self.tag} astest fill pause {ev}: our fill on {ticker} ({src}) "
+                    f"-> the event stays aside until "
+                    f"{datetime.fromtimestamp(until, timezone.utc):%H:%M:%SZ}"
+                    + (" (extended)" if prev > now_ts else ""))
+            if count <= 0 or ASTEST_GAS_BURST_CONTRACTS <= 0:
+                return
+            burst = getattr(self, "_astest_burst", None)
+            if burst is None:
+                burst = self._astest_burst = []
+            burst.append((fts, float(count)))
+            since = now_ts - ASTEST_GAS_BURST_WINDOW_MIN * 60
+            burst[:] = [(t_, n_) for t_, n_ in burst if t_ >= since]
+            total = sum(n_ for _t, n_ in burst)
+            f_until = now_ts + ASTEST_GAS_BURST_PAUSE_MIN * 60
+            if total >= ASTEST_GAS_BURST_CONTRACTS \
+                    and pauses.get(ASTEST_GAS_FAMILY_KEY, 0.0) <= now_ts:
+                pauses[ASTEST_GAS_FAMILY_KEY] = f_until
+                burst.clear()
+                self.alerter.alert(
+                    "astest_burst",
+                    f"opportunistic AS test: our gas fills reached {total:g} "
+                    f"contracts in {ASTEST_GAS_BURST_WINDOW_MIN:g} min (bar "
+                    f"{ASTEST_GAS_BURST_CONTRACTS:g}, last {ticker}) -- every gas "
+                    f"event stands aside until "
+                    f"{datetime.fromtimestamp(f_until, ET):%H:%M} ET; positions ride",
+                    key="astest_burst")
+        except Exception as e:
+            log(f"{self.tag} ! astest fill pause failed: {e}")
+
     def _quake_resting_asks(self) -> List[Tuple[str, str, float]]:
         """[(ticker, order_id, yes price)] for every resting ask of ours on a
         quake market: the ledger (every order this process placed or adopted;
@@ -24228,8 +24426,13 @@ class IncentiveMarketMaker:
             # the IMM's own high-temperature family (2026-10-23): the "KXHIGH"
             # ownership block stands aside for its markets
             prefixes = tuple(p for p in prefixes if p != HIGHT_PREFIX)
+        # the opportunistic AS test's gas dailies (2026-10-25): the gas
+        # trial's national cut and the state pattern block stand aside
+        astest = astest_gas_series(series_of(ticker))
+        if astest:
+            prefixes = tuple(p for p in prefixes if p not in _ASTEST_GAS_UNBLOCK)
         if any(ticker.startswith(p) for p in prefixes) \
-                or series_pattern_blocked(series_of(ticker)) \
+                or (series_pattern_blocked(series_of(ticker)) and not astest) \
                 or event_pattern_blocked(ticker):
             # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
             # exception to a prefix block. Accept the market ticker or the
@@ -27428,8 +27631,10 @@ class IncentiveMarketMaker:
         # GasBuddy state gas (2026-09-27): with no fresh read the gate stands
         # the market aside every cycle, so it must not hold one of the
         # MAX_MARKETS slots -- all of Monday (the Tuesday print is not
-        # modelled), and any GasBuddy / Kalshi-anchor outage.
-        if GB_FAIR_ENABLE and gb_fair_series(meta.series):
+        # modelled), and any GasBuddy / Kalshi-anchor outage. (The AS test's
+        # gas dailies quote plain, 2026-10-25: ASTEST_ENABLE.)
+        if GB_FAIR_ENABLE and gb_fair_series(meta.series) \
+                and not astest_gas_series(meta.series):
             if not gb_has_read(meta.event_ticker, now_ts):
                 return "gb_no_read"
             # ...and a strike whose listed touch the gate rejects right now
@@ -28891,7 +29096,9 @@ class IncentiveMarketMaker:
             # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
             # the same stand-aside on GasBuddy's live state averages, failing
             # CLOSED -- the state dailies are quoted only against the feed.
-            if GB_FAIR_ENABLE and gb_fair_series(meta.series):
+            # The AS test's gas dailies quote plain (2026-10-25, ASTEST_ENABLE).
+            if GB_FAIR_ENABLE and gb_fair_series(meta.series) \
+                    and not astest_gas_series(meta.series):
                 gb_why, gb_in = gb_gate_reason(t, now_ts, ext_bid, ext_ask)
                 if gb_why:
                     if t not in self._gb_fair_stood:
@@ -29000,6 +29207,19 @@ class IncentiveMarketMaker:
                            "left_s": round(yt2_until - now_ts)}
                 self._gskip(t, "yt2_fill_pause", lambda: yt2_pin, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
+            # OPPORTUNISTIC AS TEST FILL PAUSE (Jack 2026-10-25, see
+            # ASTEST_GAS_FILL_PAUSE_MIN): a fill of ours stood the event aside.
+            # ...or the family burst breaker stood every gas event aside
+            if astest_gas_series(meta.series):
+                _ap = self.state.astest_fill_pause_until
+                as_until = max(_ap.get(meta.event_ticker, 0.0),
+                               _ap.get(ASTEST_GAS_FAMILY_KEY, 0.0))
+                if as_until > now_ts:
+                    self.cancel_market_orders(t, resting)
+                    as_pin = {"until": round(as_until, 1), "left_s": round(as_until - now_ts),
+                              "family": _ap.get(ASTEST_GAS_FAMILY_KEY, 0.0) > now_ts}
+                    self._gskip(t, "astest_fill_pause", lambda: as_pin, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
 
             # YOUTUBE WEEKLY PILOT (Jack 2026-10-06, see YTW_ENABLE): its own
             # family loss halt, then the realtime fair gate (fails closed).
@@ -32439,6 +32659,15 @@ class IncentiveMarketMaker:
                 f"{HIGHT_FAIR_TOL_CENTS}c, fails closed; mid-move breaker; "
                 f"${HIGHT_DAILY_LOSS_LIMIT:g}/day family loss halt; size "
                 f"x{HIGHT_SIZE_MULT:g}, band {HIGHT_PRICE_MIN}-{HIGHT_PRICE_MAX}c")
+        if ASTEST_ENABLE:
+            log(f"opportunistic AS test (2026-10-25): AAA gas dailies (national + "
+                f"the state dailies, {ASTEST_GAS_RE.pattern}) quoted plain "
+                f"{'-'.join(ASTEST_GAS_WINDOW_ET)} ET only, x1 (no 4pm halving), "
+                f"net cap {ASTEST_GAS_MAX_POSITION:g}/market; "
+                f"${ASTEST_GAS_DAILY_LOSS:g}/day family loss halt; "
+                f"{ASTEST_GAS_FILL_PAUSE_MIN:g}m event pause after our fills"
+                + (f"; STOPPED ({ASTEST_STOP_FILE})" if astest_stopped() else
+                   f"; stop file {ASTEST_STOP_FILE}"))
         if RELEASE_PAUSE:
             _cal = load_release_calendar(force=True)
             _now = datetime.now(timezone.utc)
