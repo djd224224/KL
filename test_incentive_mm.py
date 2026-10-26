@@ -259,6 +259,13 @@ def setUpModule():
     # the 2026-10-25 Broadway gate (TestBwayFairGate deletes it)
     imm.BWAY_FAIR_FILE = os.path.join(tmp, "bway_fair.json")
     imm._bway_fair_state.update(mtime=0.0, markets={}, events={})
+    # the 2026-10-26 RCP approval, Trump mention and ERCOT peak gates
+    imm.APPROVE_FAIR_FILE = os.path.join(tmp, "approval_fair.json")
+    imm._approve_fair_state.update(mtime=0.0, markets={}, events={})
+    imm.TMENTION_FAIR_FILE = os.path.join(tmp, "trump_mention_fair.json")
+    imm._tmention_fair_state.update(mtime=0.0, markets={}, events={})
+    imm.ERCOT_FAIR_FILE = os.path.join(tmp, "ercot_fair.json")
+    imm._ercot_fair_state.update(mtime=0.0, markets={}, events={})
     # Fixture series (KXGOOD, KXWIDE, ...) aren't in the production allowlist;
     # universe policy has its own dedicated tests.
     imm.ALLOWLIST_ONLY = False
@@ -13004,6 +13011,133 @@ class TestBwayFairGate(unittest.TestCase):
         self.assertTrue(g(self.T, time.time(), 40, 50)[1]["ask_bad"])
 
 
+class TestOct26FairGates(unittest.TestCase):
+    """approval_fair.json / trump_mention_fair.json / ercot_fair.json -> the
+    2026-10-26 fair-file gates (Jack 2026-10-25: "Build the approval fair,
+    trump mention fair (weight near-term more heavily), and ERCOT"): each
+    stands a market aside without a fresh fair, joins a book inside its band
+    and caps the side whose touch is more than its TOL through the fair. The
+    approval twins and the mention series keep their own allowlist entries;
+    KXTXERCOTPEAKD is allowed only through its gate, at x1 at the 150 cap
+    and out at its event-day cutoff."""
+
+    # (series, ticker, file, state, loader, gate, label, tol, ttl,
+    #  fair_gate_of, kill switch)
+    CASES = (
+        ("KXTRUMPAPPROVE", "KXTRUMPAPPROVE-26OCT27-E43.2", "APPROVE_FAIR_FILE",
+         "_approve_fair_state", "load_approve_fair", "approve_fair_gate", "approve-fair",
+         "APPROVE_FAIR_TOL_CENTS", "APPROVE_FAIR_TTL_MIN", "rcp approval",
+         "APPROVE_FAIR_ENABLE"),
+        ("KXTRUMPMENTION", "KXTRUMPMENTION-26OCT27-TARI", "TMENTION_FAIR_FILE",
+         "_tmention_fair_state", "load_tmention_fair", "tmention_fair_gate", "tmention-fair",
+         "TMENTION_FAIR_TOL_CENTS", "TMENTION_FAIR_TTL_MIN", "trump mention",
+         "TMENTION_FAIR_ENABLE"),
+        ("KXTRUMPMENTIONB", "KXTRUMPMENTIONB-26OCT27-TARI", "TMENTION_FAIR_FILE",
+         "_tmention_fair_state", "load_tmention_fair", "tmention_fair_gate", "tmention-fair",
+         "TMENTION_FAIR_TOL_CENTS", "TMENTION_FAIR_TTL_MIN", "trump mention",
+         "TMENTION_FAIR_ENABLE"),
+        ("KXTXERCOTPEAKD", "KXTXERCOTPEAKD-26OCT27-T60000", "ERCOT_FAIR_FILE",
+         "_ercot_fair_state", "load_ercot_fair", "ercot_fair_gate", "ercot-fair",
+         "ERCOT_FAIR_TOL_CENTS", "ERCOT_FAIR_TTL_MIN", "ercot peak", "ERCOT_FAIR_ENABLE"),
+    )
+    _bump = 1
+
+    def _reset(self, file_attr, state_attr):
+        getattr(imm, state_attr).update(mtime=0.0, markets={}, events={})
+        try:
+            os.remove(getattr(imm, file_attr))
+        except FileNotFoundError:
+            pass
+
+    def setUp(self):
+        for c in self.CASES:
+            self._reset(c[2], c[3])
+
+    def tearDown(self):
+        self.setUp()
+
+    def _write(self, file_attr, loader, ticker, p=0.50, at=None):
+        at = at or datetime.now(timezone.utc)
+        path = getattr(imm, file_attr)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"markets": {ticker: {"event": ticker.rsplit("-", 1)[0], "p": p,
+                                            "fetched_at": at.strftime("%Y-%m-%dT%H:%M:%SZ")}}}, f)
+        os.utime(path, (time.time(), time.time() + TestOct26FairGates._bump))
+        TestOct26FairGates._bump += 1
+        return getattr(imm, loader)()
+
+    def test_each_gate_fails_closed_joins_and_caps(self):
+        import imm_risk_controls
+        for (s, t, fa, sa, loader, gate, label, tol_a, ttl_a, name, on) in self.CASES:
+            with self.subTest(series=s), mock.patch.object(imm, on, True):
+                self._reset(fa, sa)
+                g = getattr(imm, gate)
+                tol = getattr(imm, tol_a)
+                self.assertEqual(g(t, time.time(), 45, 55)[1]["reason"], "no_read")
+                self.assertEqual(self._write(fa, loader, t), 1)
+                self.assertEqual(g(t, time.time(), 45, 55), ("", {}, None))
+                self.assertEqual(imm.fair_file_gate(s, t, time.time(), 45, 55),
+                                 (label, "", {}, None))
+                self.assertEqual(g(t, time.time() + getattr(imm, ttl_a) * 60 + 5,
+                                   45, 55)[1]["reason"], "stale")
+                # a bid paying over 50 + tol is capped at 50 + tol
+                why, inp, caps = g(t, time.time(), 50 + tol + 2, 50 + tol + 5)
+                self.assertEqual((why, inp["reason"], inp["bid_bad"]), ("", "band", True))
+                self.assertEqual(caps[0], 50 + tol)
+                # an ask selling under 50 - tol is floored at 50 - tol
+                why, inp, caps = g(t, time.time(), 50 - tol - 5, 50 - tol - 2)
+                self.assertTrue(inp["ask_bad"])
+                self.assertEqual(caps[1], 50 - tol)
+                self.assertEqual(imm.fair_gate_of(s), name)
+                self.assertIn(label.replace("-", "_"), imm_risk_controls.GATE_GUARDS)
+
+    def test_approval_waits_for_jack_and_leaves_the_weekly_ungated(self):
+        # off by default: reading RCP's file is Jack's call
+        self.assertFalse(imm.APPROVE_FAIR_ENABLE)
+        self.assertEqual(imm.APPROVE_FAIR_SERIES, frozenset({"KXTRUMPAPPROVE"}))
+        with mock.patch.object(imm, "APPROVE_FAIR_ENABLE", True):
+            self.assertEqual(imm.fair_gate_of("KXTRUMPAPPROVE"), "rcp approval")
+            # the weekly twin is priced but not gated (its held fills won)
+            self.assertIsNone(imm.fair_file_gate("KXAPRPOTUS", "KXAPRPOTUS-26OCT30-43.0",
+                                                 time.time(), 45, 55))
+            self.assertEqual(imm.fair_gate_of("KXAPRPOTUS"), "")
+
+    def test_kill_switches_and_knobs(self):
+        for on, s in (("APPROVE_FAIR_ENABLE", "KXTRUMPAPPROVE"),
+                      ("TMENTION_FAIR_ENABLE", "KXTRUMPMENTION"),
+                      ("ERCOT_FAIR_ENABLE", "KXTXERCOTPEAKD")):
+            with mock.patch.object(imm, on, False):
+                self.assertIsNone(imm.fair_file_gate(s, s + "-26OCT27-X", time.time(), 45, 55))
+                self.assertEqual(imm.fair_gate_of(s), "")
+        for k in ("APPROVE_FAIR_ENABLE", "APPROVE_FAIR_TOL_CENTS", "APPROVE_FAIR_TTL_MIN",
+                  "APPROVE_FAIR_CAP", "TMENTION_FAIR_ENABLE", "TMENTION_FAIR_TOL_CENTS",
+                  "TMENTION_FAIR_TTL_MIN", "TMENTION_FAIR_CAP", "ERCOT_FAIR_ENABLE",
+                  "ERCOT_FAIR_TOL_CENTS", "ERCOT_FAIR_TTL_MIN", "ERCOT_FAIR_CAP",
+                  "ERCOT_FAIR_MAX_POSITION", "ERCOT_FAIR_STOP_HOUR_CT"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_ercot_is_allowed_only_through_its_gate_at_x1_to_its_cutoff(self):
+        s, t = "KXTXERCOTPEAKD", "KXTXERCOTPEAKD-26OCT27-T60000"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(t))
+            with mock.patch.object(imm, "ERCOT_FAIR_ENABLE", False):
+                self.assertFalse(imm.IncentiveMarketMaker._allowed(t))
+            # the approval twins and the mention series were allowed before
+            for x in ("KXTRUMPAPPROVE-26OCT27-E43.2", "KXAPRPOTUS-26OCT30-43.0"):
+                self.assertTrue(imm.IncentiveMarketMaker._allowed(x), x)
+        self.assertEqual(imm.series_max_position(s), 150)
+        self.assertEqual(imm.series_levels(s), imm.LEVELS)              # x1
+        self.assertIsNone(imm.size_test_arm(s))                         # out of the split test
+        # the ticker date is the day AFTER the demand day: 26OCT27 is Oct 26's
+        # load, out at 10:00 CT (11:00 ET) that day, not at midnight after it
+        self.assertEqual(imm.ERCOT_FAIR_STOP_HOUR_CT, 10)
+        self.assertEqual(imm.trade_cutoff_utc("KXTXERCOTPEAKD-26OCT27", None, None),
+                         imm.ET.localize(datetime(2026, 10, 26, 11)).astimezone(timezone.utc))
+        # ...and across the fall-back night (Nov 1 2026) it still lands at 11:00 ET
+        self.assertEqual(imm.trade_cutoff_utc("KXTXERCOTPEAKD-26NOV02", None, None),
+                         imm.ET.localize(datetime(2026, 11, 1, 11)).astimezone(timezone.utc))
+
+
 class TestCpiFairGate(unittest.TestCase):
     """cpi_fair.json -> load_cpi_fair / cpi_fair_gate -> the CPI pilot's core
     markets (Jack 2026-10-11: "build the KXRT, CPI, KXRAINWKND models"): the
@@ -25402,13 +25536,13 @@ class TestSignedFairReads(unittest.TestCase):
         monthly rain, monthly snow, GasBuddy, daily rain (its city
         discovery, 2026-10-09), CPI pilot and weekend rain (2026-10-11),
         Rotten Tomatoes (2026-10-12), ski-resort snowfall (2026-10-22), low
-        and high temperature (2026-10-23) and Broadway attendance
-        (2026-10-25) refreshers each build a reader with fair_reader() and
-        pass it to their module's write_fair_file (the threads live inside
-        run(), so read its source)."""
+        and high temperature (2026-10-23), Broadway attendance (2026-10-25),
+        RCP approval, Trump mention and ERCOT peak (2026-10-26) refreshers
+        each build a reader with fair_reader() and pass it to their module's
+        write_fair_file (the threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 14)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 17)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -25422,7 +25556,10 @@ class TestSignedFairReads(unittest.TestCase):
                           ("resort_snow_fair", "RESORT_SNOW_FILE"),
                           ("lowt_fair", "LOWT_FAIR_FILE"),
                           ("hight_fair", "HIGHT_FAIR_FILE"),
-                          ("bway_fair", "BWAY_FAIR_FILE")):
+                          ("bway_fair", "BWAY_FAIR_FILE"),
+                          ("approval_fair", "APPROVE_FAIR_FILE"),
+                          ("trump_mention_fair", "TMENTION_FAIR_FILE"),
+                          ("ercot_fair", "ERCOT_FAIR_FILE")):
             i = src.index(f"{mod}.write_fair_file(")
             call = src[i:src.index(")", i) + 1]
             self.assertIn(path, call)

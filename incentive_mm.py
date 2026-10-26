@@ -10421,6 +10421,14 @@ _CONFIG_CODE_KNOBS = (
     "BWAY_FAIR_ENABLE", "BWAY_FAIR_TOL_CENTS", "BWAY_FAIR_TTL_MIN", "BWAY_FAIR_CAP",
     "BWAY_FAIR_MAX_POSITION",
     "BWAY_FAIR_SIZE_MULT",                       # x3 ladder (Jack 2026-10-25: "X3")
+    # the RCP approval, Trump mention and ERCOT peak gates (2026-10-26); model
+    # knobs in approval_fair.py, trump_mention_fair.py and ercot_fair.py
+    "APPROVE_FAIR_ENABLE", "APPROVE_FAIR_TOL_CENTS", "APPROVE_FAIR_TTL_MIN",
+    "APPROVE_FAIR_CAP",
+    "TMENTION_FAIR_ENABLE", "TMENTION_FAIR_TOL_CENTS", "TMENTION_FAIR_TTL_MIN",
+    "TMENTION_FAIR_CAP",
+    "ERCOT_FAIR_ENABLE", "ERCOT_FAIR_TOL_CENTS", "ERCOT_FAIR_TTL_MIN", "ERCOT_FAIR_CAP",
+    "ERCOT_FAIR_MAX_POSITION", "ERCOT_FAIR_STOP_HOUR_CT",
     # the Rotten Tomatoes gate (2026-10-12); model knobs in rt_fair.py
     "RT_FAIR_ENABLE", "RT_FAIR_TOL_CENTS", "RT_FAIR_TTL_MIN", "RT_FAIR_HOLD_MIN",
     "RT_FAIR_CAP", "RT_FAIR_BAND",
@@ -13319,13 +13327,191 @@ def bway_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                             label="Broadway", cap=BWAY_FAIR_CAP)
 
 
+# RCP APPROVAL GATE (Jack 2026-10-25: "Build the approval fair").
+# approval_fair.py prices every bucket of the daily KXTRUMPAPPROVE (the RCP
+# Average Approve at 1:00 PM ET) from the Average now and the edits RCP may
+# make before the read: the Average moves only when RCP's editors touch the
+# poll list (no edit between two settled 1 PM reads -> no change, 9 of 9),
+# so V(T) = V(now) + one move per editing session, the sessions' odds per ET
+# hour slot from the feed's own CMS stamps over 8 weeks (~2.2 a weekday) and
+# the move sizes fitted on 191 settled pairs (0: 21%, +-0.1: 44%, +-0.2:
+# 16%, +-0.3: 9%). The DATA: the settlement page answers scripts with a
+# DataDome challenge, so the module reads the page's own poll-table file on
+# orig.realclearpolitics.com (robots.txt allows it; a request that says what
+# it is gets HTTP 200), conditionally, at most every 90 s, and trusts a read
+# only when the Average is the mean of its in-average polls; a settlement
+# that disagrees with what it read stops every fair. The market forecasts
+# better (Brier 0.079 vs 0.085, 46 events), so this is a band, not a price:
+# on our 30 days of daily fills a touch 15c through the fair held 92 of the
+# 1,313 fills with an exact value, which lost $766 to settlement (13 of 29
+# events; bootstrap 90% -$1,879..+$137), or 158 of 1,768 with the rest
+# interpolated, -$1,394 (-$2,579..-$358) -- mostly asks on the bucket AT the
+# current value while it stayed put -- at ~4% of each side's quoting hours
+# (~$90 of reward). The weekly KXAPRPOTUS is priced but NOT gated: the fills
+# a band would have held there won (+$227 at 15c, +$58 at 35c).
+# OFF by default (IMM_APPROVE_FAIR_ENABLE=1 turns it on): reading RCP's file
+# while its site turns bots away is Jack's call.
+APPROVE_FAIR_ENABLE = os.environ.get("IMM_APPROVE_FAIR_ENABLE", "0") == "1"
+APPROVE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_APPROVE_FAIR_SERIES", "KXTRUMPAPPROVE").split(",") if s.strip())
+APPROVE_FAIR_TOL_CENTS = _env_int("IMM_APPROVE_FAIR_TOL_CENTS", 15)
+APPROVE_FAIR_TTL_MIN = _env_int("IMM_APPROVE_FAIR_TTL_MIN", 15)
+APPROVE_FAIR_REFRESH_SECS = _env_int("IMM_APPROVE_FAIR_REFRESH_SECS", 120)
+APPROVE_FAIR_CAP = os.environ.get("IMM_APPROVE_FAIR_CAP", "1") == "1"
+APPROVE_FAIR_FILE = os.environ.get(
+    "IMM_APPROVE_FAIR_FILE", os.path.join(STATUS_DIR, "approval_fair.json"))
+_approve_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+
+def approve_fair_series(series: str) -> bool:
+    return APPROVE_FAIR_ENABLE and series in APPROVE_FAIR_SERIES
+
+
+def load_approve_fair() -> int:
+    """Hot-reload APPROVE_FAIR_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(APPROVE_FAIR_FILE, _approve_fair_state, "RCP approval")
+
+
+def approve_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                      ext_ask: Optional[float]
+                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    return simple_fair_gate(_approve_fair_state, ticker, now_ts, ext_bid, ext_ask,
+                            tol=APPROVE_FAIR_TOL_CENTS, ttl_min=APPROVE_FAIR_TTL_MIN,
+                            label="RCP approval", cap=APPROVE_FAIR_CAP)
+
+
+# TRUMP MENTION GATE (Jack 2026-10-25: "trump mention fair (weight near-term
+# more heavily)").
+# trump_mention_fair.py prices each word of an open event, before it
+# starts, from Kalshi's own settled history of both series (366 events,
+# 10,013 words since 4/2025, Kalshi's matching rules already applied): a
+# two-level Beta-binomial on recency weights -- the word's record at this
+# event type (rally, telerally, interview, presser, bilateral, ...) halving
+# every 30 days, shrunk to the type's base rate plus the word's overall lift
+# halving every 60 -- the half-lives that scored best walk-forward (log loss
+# 0.624 vs 0.636 without decay; rallies 0.529 vs 0.551). It is a worse
+# forecaster than the book (Brier 0.194 vs the mid's 0.147 at start - 30
+# min: it can't see a venue or a riff that started last week), so the gate
+# is a WIDE band: a touch more than TMENTION_FAIR_TOL_CENTS through the fair
+# caps that side. On our 2,628 fills 9/26-10/25 (fair as of each fill):
+# 15c held 218 of 748 YES bids at -13.4c a contract vs -5.6c kept and 273
+# of 1,880 asks at -15.7c vs +2.1c -- -$2,011 of fills held (-$1,445 on
+# settled events; 22 of 30 events helped) for ~$420 of the 30 days'
+# $2,760 reward; 10c -$2,402 / ~$580, 20c -$1,759 / ~$295. Words never
+# listed price at the type's base rate. An event under way or over has no
+# fair (the live latch has it anyway); fetched_at is the older of the
+# hourly settled-history read and the 10-minute open-event read, so a
+# failing feed stands the family aside after TMENTION_FAIR_TTL_MIN. The B
+# series' side test (half bids / 1.5x asks, ceb14fa, its 11/05 report)
+# keeps running under the gate. IMM_TMENTION_FAIR_ENABLE=0 turns it off.
+TMENTION_FAIR_ENABLE = os.environ.get("IMM_TMENTION_FAIR_ENABLE", "1") == "1"
+TMENTION_FAIR_SERIES = frozenset(("KXTRUMPMENTION", "KXTRUMPMENTIONB"))
+TMENTION_FAIR_TOL_CENTS = _env_int("IMM_TMENTION_FAIR_TOL_CENTS", 15)
+TMENTION_FAIR_TTL_MIN = _env_int("IMM_TMENTION_FAIR_TTL_MIN", 180)
+TMENTION_FAIR_REFRESH_SECS = _env_int("IMM_TMENTION_FAIR_REFRESH_SECS", 600)
+TMENTION_FAIR_CAP = os.environ.get("IMM_TMENTION_FAIR_CAP", "1") == "1"
+TMENTION_FAIR_FILE = os.environ.get(
+    "IMM_TMENTION_FAIR_FILE", os.path.join(STATUS_DIR, "trump_mention_fair.json"))
+_tmention_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+
+def tmention_fair_series(series: str) -> bool:
+    return TMENTION_FAIR_ENABLE and series in TMENTION_FAIR_SERIES
+
+
+def load_tmention_fair() -> int:
+    """Hot-reload TMENTION_FAIR_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(TMENTION_FAIR_FILE, _tmention_fair_state, "Trump mention")
+
+
+def tmention_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                       ext_ask: Optional[float]
+                       ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    return simple_fair_gate(_tmention_fair_state, ticker, now_ts, ext_bid, ext_ask,
+                            tol=TMENTION_FAIR_TOL_CENTS, ttl_min=TMENTION_FAIR_TTL_MIN,
+                            label="Trump mention", cap=TMENTION_FAIR_CAP)
+
+
+# ERCOT DAILY PEAK GATE (Jack 2026-10-25: "Build ... ERCOT").
+# KXTXERCOTPEAKD-<D+1>-T<K>: is the highest hourly total system load ERCOT
+# reports for day D (NP6-346-CD, posted ~05:50 CT on D+1) above K MW? 19
+# strikes 500 MW apart, $50 a strike a day ($950/day); an event lists at
+# 23:55 CT on D-1 and closes 24h later -- the TICKER DATE IS THE DAY AFTER
+# THE DEMAND DAY. The 9/02 scan rejected it as realtime grid data: once
+# the day's load shows, takers know more than a resting quote (their
+# markout to settlement on 5-95c trades: +1.8c a contract 00-10h CT, -0.9c
+# 10-12h, +3.7c 12-14h, +8.7c 14-17h, 58 settled days). So it is quoted
+# only while the peak is a forecast: ercot_fair.py reads ERCOT's public
+# dashboard feed (system-wide-demand.json: the latest hourly forecast run,
+# the day-ahead and each finished hour's actual -- the settling numbers to
+# 0.01 MW), prices each strike off log(rest-of-day forecast peak) - 0.4%
+# with a Student-t (4 dof) scale of 1.42% widened by the day's swing from
+# D-1's peak (fit on 1,209 days of ERCOT's forecast vs actual), and writes
+# no fair past the earliest of 10:00 CT, 6h before the forecast peak hour,
+# or the realized load reaching 97% of what is left of the forecast. On the
+# live run's 7 settled days the fair matched the mid's Brier at every hour
+# 01:00-10:00 (0.033-0.057 vs 0.034-0.055; the mid only pulls away after
+# 15:00). The bot adds its own hard stop, ERCOT_FAIR_STOP_HOUR_CT on the
+# demand day: the day-dated midnight-ET rule keys off the ticker date, which
+# would have quoted all of D, peak included, so the event-day extender
+# reaches BACK from the ticker date's midnight (10:00 CT = 11:00 ET = 13h
+# before it). The gate is the fair-file contract at ERCOT_FAIR_TOL_CENTS,
+# x1, ERCOT_FAIR_MAX_POSITION a market (which keeps it out of the base-size
+# split test). Expected ~$5-20/day at x1 (morning spreads 13-15c, 5-7
+# two-sided strikes an hour; the share is unmeasured). Allowed only through
+# this gate: IMM_ERCOT_FAIR_ENABLE=0 takes it out; positions ride.
+ERCOT_FAIR_ENABLE = os.environ.get("IMM_ERCOT_FAIR_ENABLE", "1") == "1"
+ERCOT_FAIR_SERIES = frozenset(("KXTXERCOTPEAKD",))
+ERCOT_FAIR_TOL_CENTS = _env_int("IMM_ERCOT_FAIR_TOL_CENTS", 12)
+ERCOT_FAIR_TTL_MIN = _env_int("IMM_ERCOT_FAIR_TTL_MIN", 30)
+ERCOT_FAIR_REFRESH_SECS = _env_int("IMM_ERCOT_FAIR_REFRESH_SECS", 300)
+ERCOT_FAIR_CAP = os.environ.get("IMM_ERCOT_FAIR_CAP", "1") == "1"
+ERCOT_FAIR_MAX_POSITION = _env_float("IMM_ERCOT_FAIR_MAX_POSITION", 150)
+ERCOT_FAIR_STOP_HOUR_CT = _env_int("IMM_ERCOT_FAIR_STOP_HOUR_CT", 10)
+ERCOT_FAIR_FILE = os.environ.get(
+    "IMM_ERCOT_FAIR_FILE", os.path.join(STATUS_DIR, "ercot_fair.json"))
+_ercot_fair_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+
+if ERCOT_FAIR_ENABLE:
+    for _s in ERCOT_FAIR_SERIES:
+        SERIES_OVERRIDES[_s] = replace(
+            SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+            max_position=ERCOT_FAIR_MAX_POSITION,
+            # CT is ET - 1 all year; the ticker date is D + 1
+            event_day_cutoff_et=(ERCOT_FAIR_STOP_HOUR_CT + 1 - 24, 0))
+
+
+def ercot_fair_series(series: str) -> bool:
+    return ERCOT_FAIR_ENABLE and series in ERCOT_FAIR_SERIES
+
+
+def load_ercot_fair() -> int:
+    """Hot-reload ERCOT_FAIR_FILE by mtime (the rain loader)."""
+    return _load_weather_fair(ERCOT_FAIR_FILE, _ercot_fair_state, "ERCOT peak")
+
+
+def ercot_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                    ext_ask: Optional[float]
+                    ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    return simple_fair_gate(_ercot_fair_state, ticker, now_ts, ext_bid, ext_ask,
+                            tol=ERCOT_FAIR_TOL_CENTS, ttl_min=ERCOT_FAIR_TTL_MIN,
+                            label="ERCOT peak", cap=ERCOT_FAIR_CAP)
+
+
 def fair_file_gate(series: str, ticker: str, now_ts: float,
                    ext_bid: Optional[float], ext_ask: Optional[float]
                    ) -> Optional[Tuple[str, str, dict,
                                        Optional[Tuple[Optional[int], Optional[int]]]]]:
     """(log label, why, inputs, caps) for a market under one of the
-    2026-10-11 fair-file gates, the 2026-10-22 resort snow gate or the
-    2026-10-25 Broadway gate, else None."""
+    2026-10-11 fair-file gates, the 2026-10-22 resort snow gate, the
+    2026-10-25 Broadway gate or the 2026-10-26 RCP approval, Trump mention
+    and ERCOT peak gates, else None."""
+    if approve_fair_series(series):
+        return ("approve-fair",) + approve_fair_gate(ticker, now_ts, ext_bid, ext_ask)
+    if tmention_fair_series(series):
+        return ("tmention-fair",) + tmention_fair_gate(ticker, now_ts, ext_bid, ext_ask)
+    if ercot_fair_series(series):
+        return ("ercot-fair",) + ercot_fair_gate(ticker, now_ts, ext_bid, ext_ask)
     if bway_fair_series(series):
         return ("bway-fair",) + bway_fair_gate(ticker, now_ts, ext_bid, ext_ask)
     if resort_snow_series(series):
@@ -18043,6 +18229,9 @@ def fair_gate_of(series: str) -> str:
         ("snow monthly", lambda: snow_monthly_series(series)),
         ("resort snow", lambda: resort_snow_series(series)),
         ("broadway", lambda: bway_fair_series(series)),
+        ("rcp approval", lambda: approve_fair_series(series)),
+        ("trump mention", lambda: tmention_fair_series(series)),
+        ("ercot peak", lambda: ercot_fair_series(series)),
         ("cpi", lambda: cpi_fair_series(series)),
         ("rain weekend", lambda: rain_wknd_series(series)),
         ("rotten tomatoes", lambda: rt_fair_series(series)),
@@ -24086,6 +24275,7 @@ class IncentiveMarketMaker:
             bigsky_series(series) or \
             resort_snow_series(series) or \
             bway_fair_series(series) or \
+            ercot_fair_series(series) or \
             lowt_series(series) or \
             hight_series(series) or \
             cpi_pilot_active(ticker) or \
@@ -24362,6 +24552,9 @@ class IncentiveMarketMaker:
         load_rain_wknd()
         load_resort_snow()
         load_bway_fair()              # Broadway weekly attendance (2026-10-25)
+        load_approve_fair()           # RCP approval (2026-10-26)
+        load_tmention_fair()          # Trump mention base rates (2026-10-26)
+        load_ercot_fair()             # ERCOT daily peak (2026-10-26)
         load_rt_fair()
         _sh_n, _sh_moved = load_share_fair()
         if _sh_moved:
@@ -31379,6 +31572,99 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_bway_fair_refresh, daemon=True,
                              name="bway-fair").start()
+        if APPROVE_FAIR_ENABLE and not once:
+            # RCP approval refresher (2026-10-26): the Broadway refresher's
+            # contract on approval_fair.py and APPROVE_FAIR_FILE.
+            def _approve_fair_refresh():
+                try:
+                    import approval_fair
+                except Exception as e:
+                    log(f"{self.tag} ! approve-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, APPROVE_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = approval_fair.write_fair_file(
+                            APPROVE_FAIR_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} approve-fair refresh: {ok} markets "
+                                f"with a fair"
+                                + (f", {miss} events without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! approve-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_approve_fair_refresh, daemon=True,
+                             name="approve-fair").start()
+        if TMENTION_FAIR_ENABLE and not once:
+            # Trump mention refresher (2026-10-26): the Broadway refresher's
+            # contract on trump_mention_fair.py and TMENTION_FAIR_FILE.
+            def _tmention_fair_refresh():
+                try:
+                    import trump_mention_fair
+                except Exception as e:
+                    log(f"{self.tag} ! tmention-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, TMENTION_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = trump_mention_fair.write_fair_file(
+                            TMENTION_FAIR_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} tmention-fair refresh: {ok} markets "
+                                f"with a fair"
+                                + (f", {miss} events without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! tmention-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_tmention_fair_refresh, daemon=True,
+                             name="tmention-fair").start()
+        if ERCOT_FAIR_ENABLE and not once:
+            # ERCOT daily peak refresher (2026-10-26): the Broadway
+            # refresher's contract on ercot_fair.py and ERCOT_FAIR_FILE.
+            def _ercot_fair_refresh():
+                try:
+                    import ercot_fair
+                except Exception as e:
+                    log(f"{self.tag} ! ercot-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, ERCOT_FAIR_REFRESH_SECS)
+                    try:
+                        ok, miss = ercot_fair.write_fair_file(
+                            ERCOT_FAIR_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} ercot-fair refresh: {ok} markets "
+                                f"with a fair"
+                                + (f", {miss} events without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! ercot-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_ercot_fair_refresh, daemon=True,
+                             name="ercot-fair").start()
         if RT_FAIR_ENABLE and not once:
             # Rotten Tomatoes fair refresher (2026-10-12): the CPI
             # refresher's contract on rt_fair.py and RT_FAIR_FILE, a pass
@@ -32558,6 +32844,22 @@ class IncentiveMarketMaker:
                 f"x{SOFTWAREUNEMP_SIZE_MULT:g} (ladder "
                 f"{series_levels('KXSOFTWAREUNEMP')}), max "
                 f"{series_max_position('KXSOFTWAREUNEMP'):g} per market")
+        for on, ss, what, tol, ttl in (
+                (APPROVE_FAIR_ENABLE, APPROVE_FAIR_SERIES, "approval_fair's RCP read",
+                 APPROVE_FAIR_TOL_CENTS, APPROVE_FAIR_TTL_MIN),
+                (TMENTION_FAIR_ENABLE, TMENTION_FAIR_SERIES,
+                 "trump_mention_fair's recency-weighted base rates",
+                 TMENTION_FAIR_TOL_CENTS, TMENTION_FAIR_TTL_MIN),
+                (ERCOT_FAIR_ENABLE, ERCOT_FAIR_SERIES, "ercot_fair's load forecast",
+                 ERCOT_FAIR_TOL_CENTS, ERCOT_FAIR_TTL_MIN)):
+            if on:
+                log(f"fair gate (2026-10-26): {', '.join(sorted(ss))} quoted against "
+                    f"{what} -- band {tol}c caps the side that fights the fair, no "
+                    f"fresh fair ({ttl}m) no quote")
+        if ERCOT_FAIR_ENABLE:
+            log(f"ERCOT peak (2026-10-26): x1, max {ERCOT_FAIR_MAX_POSITION:g} per "
+                f"market, out by {ERCOT_FAIR_STOP_HOUR_CT:02d}:00 CT on the demand day "
+                f"(the ticker's day before), sooner at ercot_fair's own window")
         if SIDE_MULT_SERIES:
             log("side sizes by series (2026-10-22): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
