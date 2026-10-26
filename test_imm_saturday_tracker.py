@@ -193,14 +193,36 @@ class GateEvaluateTests(unittest.TestCase):
         self.assertTrue(all(c["ok"] is None for c in g["checks"] if c["saturday"] in ("2026-09-19", "pooled")))
         self.assertEqual(sat.evaluate_gate(_week(), _utc(2026, 9, 21, 4, 0), "2026-09-20", 1.5)["status"], "PASS")
 
-    def test_g1_a_block_below_its_weekdays_fails(self):
-        # day block rent 100/590k = 16.9 -> net 16.9 - 6.8*3.2 = -4.8 < weekday 11.4
-        g = sat.evaluate_gate(_week(sat_day=dict(ct_h=590_000, rent_usd=100, fills=4_000, mark=-3.2, hm=1.49)),
-                              DONE, "2026-09-20", 1.5)
+    def test_d1_judges_each_level_in_dollars_against_the_one_below(self):
+        # Jack 2026-10-26: "Yes switch" -- the 9/19 x1.5 week is the
+        # reference (Saturday rent 550 vs 350 a weekday = 1.571x, mark-out
+        # -115.4 vs -220 = 0.5245x); a x2 Saturday earning pro rata
+        # (rent 734, mark-out -152.8) beats its x1.5 counterfactual (550 /
+        # -115.4) by +146.6
+        g = sat.evaluate_gate(_x2(1), AFTER_X2, "2026-10-18", 1.5)
+        self.assertEqual(g["status"], "PASS", g["reason"])
+        d1 = [c for c in g["checks"] if c["check"].startswith("D1")]
+        self.assertEqual([(c["saturday"], c["check"], c["ok"]) for c in d1],
+                         [("2026-10-03", "D1 dollars vs x1.5", True)])   # the lowest level has nothing below it
+        self.assertAlmostEqual(d1[0]["value"], 146.6, delta=0.2)
+        self.assertEqual(len(g["dollars"]), 1)
+        self.assertAlmostEqual(g["dollars"][0]["d_rent"], 184.0, delta=0.2)
+        # no G1 any more: a per-contract rate falls whenever the size rises
+        self.assertFalse(any(c["check"].startswith("G1") for c in g["checks"]))
+        # the same size earning what x1.5 did nets $0: not a loss
+        g = sat.evaluate_gate(_x2(1, **X2_DILUTED), AFTER_X2, "2026-10-18", 1.5)
+        self.assertEqual(g["status"], "PASS", g["reason"])
+        # a x2 Saturday that made less than x1.5 would have fails
+        bad = dict(sat_quiet=dict(ct_h=800_000, rent_usd=387, fills=2_400, mark=0.7),
+                   sat_day=dict(ct_h=787_000, rent_usd=100, fills=5_300, mark=-3.2, hm=1.98))
+        g = sat.evaluate_gate(_x2(1, **bad), AFTER_X2, "2026-10-18", 1.5)
         self.assertEqual(g["status"], "FAIL")
-        self.assertIn(("2026-09-19", "G1 net vs weekdays", "day"), self._failed(g))
-        self.assertNotIn(("2026-09-19", "G1 net vs weekdays", "quiet"), self._failed(g))
-        self.assertIn("G1 net vs weekdays", g["reason"])
+        self.assertEqual(self._failed(g), {("2026-10-03", "D1 dollars vs x1.5", "boosted")})
+        self.assertIn("D1 dollars vs x1.5", g["reason"])
+        self.assertIn("-$100 against x1.5", g["reason"])
+        text = "\n".join(sat.gate_text(g, False))
+        text.encode("cp1252")
+        self.assertIn("2026-10-03 x2 vs x1.5: rent $487 vs $550", text)
 
     def test_g2_a_saturday_that_nets_negative_fails_even_above_weak_weekdays(self):
         rows = _week(sat_quiet=dict(ct_h=600_000, rent_usd=10, fills=1_800, mark=-9.0),
@@ -212,7 +234,7 @@ class GateEvaluateTests(unittest.TestCase):
         worse = _week(sat_quiet=dict(ct_h=600_000, rent_usd=900, fills=1_800, mark=-6.5),
                       sat_day=dict(ct_h=590_000, rent_usd=900, fills=4_000, mark=-6.5, hm=1.49))
         g = sat.evaluate_gate(worse, DONE, "2026-09-20", 1.5)
-        self.assertEqual(self._failed(g), {("2026-09-19", "G3 mark-out", "boosted")})   # rent keeps G1/G2 green
+        self.assertEqual(self._failed(g), {("2026-09-19", "G3 mark-out", "boosted")})   # rent keeps G2 green
         ok = _week(sat_quiet=dict(ct_h=600_000, rent_usd=900, fills=1_800, mark=-5.5),
                    sat_day=dict(ct_h=590_000, rent_usd=900, fills=4_000, mark=-5.5, hm=1.49))
         self.assertEqual(sat.evaluate_gate(ok, DONE, "2026-09-20", 1.5)["status"], "PASS")   # within 2c
@@ -239,13 +261,14 @@ class GateEvaluateTests(unittest.TestCase):
         self.assertEqual((g["status"], g["saturdays"]), ("PENDING", []))
 
     def test_every_boosted_saturday_must_pass(self):
-        both = pd.concat([_week(), _week(sat_date="2026-09-26",
-                                         weekdays=("2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25"),
-                                         sat_day=dict(ct_h=590_000, rent_usd=100, fills=4_000, mark=-3.2, hm=1.49))])
-        g = sat.evaluate_gate(both, _utc(2026, 9, 28, 11, 40), "2026-09-27", 1.5)
-        self.assertEqual(g["saturdays"], ["2026-09-19", "2026-09-26"])
+        bad = dict(sat_quiet=dict(ct_h=800_000, rent_usd=387, fills=2_400, mark=0.7),
+                   sat_day=dict(ct_h=787_000, rent_usd=100, fills=5_300, mark=-3.2, hm=1.98))
+        rows = pd.concat([_x2(1), _week(sat_date=X2_WEEKS[1][0], weekdays=X2_WEEKS[1][1], **bad)],
+                         ignore_index=True)
+        g = sat.evaluate_gate(rows, AFTER_X2, "2026-10-18", 1.5)
+        self.assertEqual(g["saturdays"], ["2026-09-19", "2026-10-03", "2026-10-10"])
         self.assertEqual(g["status"], "FAIL")
-        self.assertEqual({c[0] for c in self._failed(g)}, {"2026-09-26"})
+        self.assertEqual({c[0] for c in self._failed(g)}, {"2026-10-10"})
 
     def test_empty_window(self):
         self.assertEqual(sat.evaluate_gate(pd.DataFrame(), DONE, "2026-09-20", 1.5)["status"], "PENDING")
@@ -298,7 +321,9 @@ class StepUpWatchTests(unittest.TestCase):
         self.assertEqual(st["status"], "RAISE", st["reason"])
         self.assertEqual(st["saturdays"], ["2026-10-03", "2026-10-10", "2026-10-17"])
         self.assertEqual((st["prev_mult"], st["next_mult"]), (1.5, 2.5))
-        self.assertAlmostEqual(st["rent_keep"], 1.0, delta=0.02)
+        self.assertAlmostEqual(st["d_net"], 3 * 146.6, delta=0.6)        # D1 in dollars over x1.5
+        self.assertEqual(len(st["dollars"]), 3)
+        self.assertIn("made +$440 together against x1.5", st["reason"])
         self.assertIn("x2.5 is worth trying", st["reason"])
         self.assertIn("IMM_SAT_SIZE_MULT_GATED=2.5", sat.stepup_how(st))
         self.assertEqual(sat.stepup_subject(st), " - step-up: x2.5 worth trying")
@@ -306,9 +331,9 @@ class StepUpWatchTests(unittest.TestCase):
     def test_hold_when_the_extra_size_earns_nothing(self):
         st = sat.evaluate_stepup(_x2(**X2_DILUTED), AFTER_X2, "2026-10-18", 1.5, 2.0)
         self.assertEqual(st["status"], "HOLD", st["reason"])
-        self.assertAlmostEqual(st["rent_keep"], 0.75, delta=0.02)        # x1.5/x2: zero marginal rent
-        self.assertIn("crowding its own share", st["reason"])
-        self.assertTrue(all(c["ok"] is not False for c in st["checks"]))  # G1-G4 still pass
+        self.assertAlmostEqual(st["d_net"], 0.0, delta=0.01)              # x2 made what x1.5 would have
+        self.assertIn("the step bought nothing", st["reason"])
+        self.assertTrue(all(c["ok"] is not False for c in st["checks"]))  # nothing lost either
         self.assertEqual(sat.stepup_how(st), "")
 
     def test_degraded_on_any_failed_x2_check_even_early(self):
@@ -316,7 +341,8 @@ class StepUpWatchTests(unittest.TestCase):
                    sat_day=dict(ct_h=787_000, rent_usd=100, fills=5_300, mark=-3.2, hm=1.98))
         st = sat.evaluate_stepup(_x2(1, **bad), AFTER_X2, "2026-10-18", 1.5, 2.0)
         self.assertEqual(st["status"], "DEGRADED")
-        self.assertIn("G1 net vs weekdays", st["reason"])
+        self.assertIn("D1 dollars vs x1.5", st["reason"])
+        self.assertIn("-$100 against x1.5", st["reason"])
         self.assertIn('"verdict": "FAIL"', sat.stepup_how(st))
         self.assertEqual(sat.stepup_subject(st), " - x2 DEGRADED: consider x1.5")
 
@@ -647,8 +673,14 @@ class GateRenderTests(unittest.TestCase):
     def test_html_section(self):
         html = sat.render_html(_frame(), "2026-09-20", self.gate)
         self.assertIn("2× gate", html)
-        self.assertIn("G1 net vs weekdays", html)
+        self.assertIn("G2 net positive", html)
+        self.assertIn("Judged in dollars (D1", html)
         self.assertIn(">PASS<", html)
+        # a level with one below it gets the dollars table
+        html = sat.render_html(_frame(), "2026-10-18", sat.evaluate_gate(_x2(1), AFTER_X2, "2026-10-18", 1.5))
+        self.assertIn("In dollars (D1)", html)
+        self.assertIn("×2 vs ×1.5", html)
+        self.assertIn("+$147", html)
 
     def test_pending_rows_render_a_dash(self):
         g = sat.evaluate_gate(_week(sat_day=dict(ct_h=590_000, rent_usd=260, fills=4_000, mark=float("nan"),

@@ -51,15 +51,17 @@ no-send preview of the email).
 
 2x gate (Jack 2026-09-26: "2x next saturday if today + prior saturdays show
 no sign of edge degradation"): every run also scores the boosted Saturdays
-(evaluate_gate, G1-G4); the SCHEDULED run writes the bot's verdict file
-STATUS_DIR/sat_mult_gate.json once, and --gate-rewrite rewrites it by hand.
+(evaluate_gate: D1 in dollars against the level below -- since 2026-10-26,
+in place of G1's per-contract rate -- and G2-G4); the SCHEDULED run writes
+the bot's verdict file STATUS_DIR/sat_mult_gate.json once, and
+--gate-rewrite rewrites it by hand.
 
 Step-up watch (Jack 2026-09-28, after the 2x PASS: "keep an eye on if i
 should increase it even further, after a few saturdays at 2x"): REPORT ONLY.
-While a step-up is in force, the Saturdays that ran at it get the same G1-G4
-plus a dilution test (rent per resting contract vs the level below), and the
-email says WATCHING / RAISE / HOLD / DEGRADED (evaluate_stepup; the verdict
-rides in the subject).
+While a step-up is in force, the Saturdays that ran at it get the same
+checks, D1 against the level below in dollars, and the email says WATCHING
+/ RAISE / HOLD / DEGRADED (evaluate_stepup; the verdict rides in the
+subject).
 Credentials: ALERT_EMAIL_FROM /
 ALERT_EMAIL_PASSWORD from the
 environment, falling back to HKCU\\Environment like the other IMM reports.
@@ -491,9 +493,10 @@ def _derive(a: pd.DataFrame) -> pd.DataFrame:
 # (that week's regime: listing waves, blocklists), or every weekday in the
 # window when its own week has fewer than two. Signs of degradation, any
 # one of which fails the gate:
-#   G1 net vs weekdays  a boosted block earns less per resting contract-hour
-#                       than the same block on its weekdays (the Saturday
-#                       premium is gone there);
+#   D1 dollars          (since 2026-10-26, in place of G1's net per resting
+#                       contract-hour against the weekdays, a rate that falls
+#                       whenever the size rises) the Saturday made less than
+#                       the level below would have that day (dollar_checks);
 #   G2 net positive     the Saturday's boosted hours net <= 0;
 #   G3 mark-out         its fills mark out more than GATE_MARKOUT_TOL_C per
 #                       contract worse than its weekdays' fills over the same
@@ -669,12 +672,104 @@ def _nan_none(v):
     return None if _isnan(v) else round(float(v), 4)
 
 
+# D1, THE GATE IN DOLLARS (Jack 2026-10-26: "Yes switch", on "switch the
+# Saturday tracker's test to dollars"). G1 judged each boosted block's net per
+# 1,000 resting contract-hours against its weekdays, and that rate falls
+# whenever the size rises even while the dollars rise (the 10/11 multiplier
+# study's lesson), so it failed every x2 Saturday on a per-contract rate. D1
+# judges what the step itself bought: each Saturday at a level against what
+# the level below would have made that day -- the level-below Saturdays'
+# Saturday/weekday ratios of modelled rent and of 24h mark-out dollars (each
+# Saturday's boosted blocks against the same blocks per weekday of its own
+# week), applied to this Saturday's own weekdays (difference in differences,
+# the 10/12 dollar comparison). D1 passes when rent + mark-out beat that
+# counterfactual. A level with nothing below it in the window (the first
+# boosted level) is not judged by D1.
+D1_MIN_WEEKDAY_COST = 1.0       # $ of weekday mark-out cost below which the cost ratio falls back to rent's
+D1_TOL_USD = 0.5                # a Saturday within this of the level below has not lost (rounding)
+
+
+def _mo_usd(r) -> float:
+    """24h mark-out dollars of a gate_blocks row or pooled sums (signed:
+    negative = the fills lost)."""
+    n = float(r["mk_n"])
+    return float(r["fills"]) * float(r["mk_w"]) / n / 100.0 if n > 0 else 0.0
+
+
+def _usd(v: float) -> str:
+    """Signed dollars, ASCII (the text part goes to a cp1252 console)."""
+    return f"{'+' if v >= 0 else '-'}${abs(v):,.0f}"
+
+
+def saturday_usd(blocks: pd.DataFrame, sat: str):
+    """One Saturday's boosted blocks in dollars -- modelled rent and the 24h
+    mark-out of its fills -- and the same blocks per weekday of its own week:
+    {"rent", "mo", "w_rent", "w_mo"}; None without a boosted block or two
+    same-week weekdays to stand against."""
+    sb = blocks[blocks["et_date"] == sat]
+    bl = [r for _, r in sb.iterrows()
+          if (sat, BLOCK_START[r["block"]]) >= GATE_KNOB_LIVE and float(r["ct_h"]) > 0]
+    if not bl:
+        return None
+    d = datetime.strptime(sat, "%Y-%m-%d")
+    week = {(d - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(1, 6)}
+    wk = blocks[(blocks["day_type"] == "Weekday") & blocks["et_date"].isin(week)
+                & blocks["block"].isin([r["block"] for r in bl])]
+    n = wk["et_date"].nunique()
+    if n < 2:
+        return None
+    return dict(rent=sum(float(r["rent_usd"]) for r in bl), mo=sum(_mo_usd(r) for r in bl),
+                w_rent=float(wk["rent_usd"].sum()) / n,
+                w_mo=sum(_mo_usd(r) for _, r in wk.iterrows()) / n)
+
+
+def dollar_checks(blocks: pd.DataFrame, sats: list, ref_sats: list, ref_mult: float, mult: float):
+    """D1 for each of `sats` (run at x`mult`) against x`ref_mult`, from
+    `ref_sats`' Saturday/weekday ratios. Returns (rows, checks, pooled):
+    rows = per Saturday {saturday, mult, ref_mult, rent, mo, cf_rent, cf_mo,
+    d_rent, d_mo, d_net, ratio_rent, ratio_mo}; pooled = the summed d_* (None
+    when nothing could be judged)."""
+    name = f"D1 dollars vs x{ref_mult:g}"
+    refs = [u for u in (saturday_usd(blocks, s) for s in ref_sats) if u]
+    rows, checks = [], []
+    if not refs:
+        for s in sats:
+            checks.append(dict(saturday=s, check=name, block="boosted", ok=None, value=None, threshold=0.0,
+                               detail=f"no x{ref_mult:g} Saturday with its own weekdays to compare against"))
+        return rows, checks, None
+    rr = sum(u["rent"] for u in refs) / max(sum(u["w_rent"] for u in refs), 1e-9)
+    w_cost = sum(u["w_mo"] for u in refs)
+    rm = sum(u["mo"] for u in refs) / w_cost if w_cost <= -D1_MIN_WEEKDAY_COST else rr
+    pooled = dict(d_rent=0.0, d_mo=0.0, d_net=0.0)
+    for s in sats:
+        u = saturday_usd(blocks, s)
+        if u is None:
+            checks.append(dict(saturday=s, check=name, block="boosted", ok=None, value=None, threshold=0.0,
+                               detail="no same-week weekdays to compare against"))
+            continue
+        cf_r, cf_m = rr * u["w_rent"], rm * u["w_mo"]
+        d_r, d_m = u["rent"] - cf_r, u["mo"] - cf_m
+        d = d_r + d_m
+        for k, v in (("d_rent", d_r), ("d_mo", d_m), ("d_net", d)):
+            pooled[k] += v
+        rows.append(dict(saturday=s, mult=mult, ref_mult=ref_mult, rent=u["rent"], mo=u["mo"],
+                         cf_rent=cf_r, cf_mo=cf_m, d_rent=d_r, d_mo=d_m, d_net=d, ratio_rent=rr, ratio_mo=rm))
+        checks.append(dict(saturday=s, check=name, block="boosted", ok=d >= -D1_TOL_USD, value=round(d, 2),
+                           threshold=0.0,
+                           detail=(f"x{mult:g} made {_usd(d)} against x{ref_mult:g}: rent ${u['rent']:,.0f} vs "
+                                   f"${cf_r:,.0f}, mark-out {_usd(u['mo'])} vs {_usd(cf_m)} (the x{ref_mult:g} "
+                                   f"Saturdays ran {rr:.2f}x / {rm:.2f}x their weekdays)")))
+    return rows, checks, (pooled if rows else None)
+
+
 def evaluate_gate(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base_mult: float) -> dict:
     """Score every boosted Saturday in `blocks` (gate_blocks output). Returns
-    {"status": PASS|FAIL|PENDING, "reason", "saturdays", "rows", "checks"}:
-    rows = one per (Saturday, boosted block) with the Saturday and anchor
-    rates; checks = one per test with ok True/False (None = not judged)."""
-    out = {"status": "PENDING", "reason": "", "saturdays": [], "rows": [], "checks": []}
+    {"status": PASS|FAIL|PENDING, "reason", "saturdays", "rows", "checks",
+    "dollars"}: rows = one per (Saturday, boosted block) with the Saturday and
+    anchor rates (shown, no longer judged: G1 became D1 on 2026-10-26);
+    dollars = D1's per-Saturday rows; checks = one per test with ok
+    True/False (None = not judged)."""
+    out = {"status": "PENDING", "reason": "", "saturdays": [], "rows": [], "checks": [], "dollars": []}
     if blocks is None or blocks.empty:
         out["reason"] = "no cycle-log rows in the window"
         return out
@@ -706,11 +801,6 @@ def evaluate_gate(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base
             am = block_metrics(_pool(ab)) if not ab.empty else block_metrics({c: 0.0 for c in _SUMS})
             out["rows"].append(dict(saturday=sat, block=b, hours=int(sb.loc[b, "hours"]), anchor=anchor_kind,
                                     anchor_dates=anchor_dates, sat=sm, wk=am))
-            ok = (not _isnan(sm["net_k"])) and (not _isnan(am["net_k"])) and sm["net_k"] >= am["net_k"]
-            out["checks"].append(dict(saturday=sat, check="G1 net vs weekdays", block=b, ok=ok,
-                                      value=_nan_none(sm["net_k"]), threshold=_nan_none(am["net_k"]),
-                                      detail=f"{block_label(b, sat)}: net {_g(sm['net_k'], '{:.1f}')} vs weekdays "
-                                             f"{_g(am['net_k'], '{:.1f}')} c per 1k resting ct-h ({anchor_kind})"))
             for c in _SUMS:
                 sat_sum[c] += float(sb.loc[b, c])
                 anc_sum[c] += float(ab[c].sum()) if not ab.empty else 0.0
@@ -747,6 +837,15 @@ def evaluate_gate(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base
                   f"{net_fill:+.2f}c ({pooled['settled_cts']:,.0f} of {pooled['fills']:,.0f} contracts settled)")
     out["checks"].append(dict(saturday="pooled", check="G4 settled", block="boosted", ok=ok,
                               value=_nan_none(net_fill), threshold=0.0, detail=detail))
+    # D1: every level against the one below it in the window
+    lv = {s: _level(m) for s, m in saturday_day_mults(blocks).items() if not _isnan(m)}
+    levels = sorted({lv[s] for s in out["saturdays"] if s in lv})
+    for i, L in enumerate(levels[1:], start=1):
+        ref = [s for s in out["saturdays"] if lv.get(s) == levels[i - 1]]
+        rows, checks, _p = dollar_checks(blocks, [s for s in out["saturdays"] if lv.get(s) == L],
+                                         ref, levels[i - 1], L)
+        out["dollars"] += rows
+        out["checks"] += checks
     if immature:
         for c in out["checks"]:                     # an immature Saturday is not judged yet
             if c["saturday"] in immature or c["saturday"] == "pooled":
@@ -849,27 +948,23 @@ def write_gate_verdict(gate: dict, now_utc: datetime, through_et: str, base_mult
 # at 2x"). REPORT ONLY -- nothing here moves the bot's multiplier. While the
 # gated step-up is in force, every run scores the Saturdays that actually ran
 # at it (day-block cycle-log hour_mult at or above the midpoint between the
-# base x1.5 and the step-up) with the gate's own G1-G4 against their own
-# weeks' weekdays, plus one test the gate does not have:
-#   DILUTION  rent per resting contract-hour, Saturday over its weekdays,
-#             pooled over the step-up Saturdays, divided by the same ratio
-#             over the base (x1.5) Saturdays. 1.0 = the extra size earned pro
-#             rata; base/step-up (0.75 at x1.5 -> x2) = it earned nothing.
-#             Under STEP_MIN_RENT_KEEP (0.85: a rent elasticity of ~0.44,
-#             against the ~0.2 break-even of the 9/26 analysis) the size is
-#             crowding its own share.
+# base x1.5 and the step-up) with the gate's own G2-G4 against their own
+# weeks' weekdays, and D1 in dollars against the level below (dollar_checks:
+# what the step-up Saturdays made over what the x1.5 Saturdays' ratios to
+# their weekdays say x1.5 would have; it replaced, 2026-10-26, a DILUTION
+# test of rent per resting contract-hour, which falls whenever size rises).
 # Verdicts: OFF (no step-up in force), WATCHING (fewer than
 # STEP_MIN_SATURDAYS judged step-up Saturdays, none failing), PENDING (the
 # newest not yet a day + 24h old), DEGRADED (a step-up Saturday failed a
-# check: consider the base back), HOLD (all pass but the size is diluting,
-# or nothing to compare against), RAISE (STEP_MIN_SATURDAYS pass G1-G4 and
-# the dilution test: the next rung, +STEP_NEXT_DELTA, is worth trying). At
-# x2.5 the Saturday quiet hours (0-9 ET x2) run x5, where TOTAL_SIZE_MULT_CAP
-# leaves no deep-reference boost.
+# check, D1 included: consider the base back), HOLD (all pass but together
+# they made nothing over the level below, or nothing to compare against),
+# RAISE (STEP_MIN_SATURDAYS pass and made money over the level below: the
+# next rung, +STEP_NEXT_DELTA, is worth trying). The Saturday mult stacks on
+# the quiet hours (0-8 ET x3 since 10/05: x6 at x2, x7.5 at x2.5, x9 at x3);
+# TOTAL_SIZE_MULT_CAP trims only the deep-reference boost, never that.
 # ---------------------------------------------------------------------------
 
 STEP_MIN_SATURDAYS = 3
-STEP_MIN_RENT_KEEP = 0.85
 STEP_NEXT_DELTA = 0.5
 STEP_RULE = ('Jack 2026-09-28: "keep an eye on if i should increase it even further, '
              'after a few saturdays at 2x"')
@@ -890,35 +985,18 @@ def _level(m: float) -> float:
     return round(float(m) * 4.0) / 4.0
 
 
-def _rent_ratio(rows: list) -> float:
-    """Pooled rent per resting ct-h of the Saturdays' boosted blocks over the
-    same blocks on their anchor weekdays (NaN when either side is empty)."""
-    s_r = s_c = w_r = w_c = 0.0
-    for r in rows:
-        s, w = r["sat"], r["wk"]
-        if s["ct_h"] > 0 and not _isnan(s["rent_k"]):
-            s_r += s["rent_k"] * s["ct_h"]
-            s_c += s["ct_h"]
-        if w["ct_h"] > 0 and not _isnan(w["rent_k"]):
-            w_r += w["rent_k"] * w["ct_h"]
-            w_c += w["ct_h"]
-    if s_c <= 0 or w_c <= 0 or w_r <= 0:
-        return float("nan")
-    return (s_r / s_c) / (w_r / w_c)
-
-
 def evaluate_stepup(blocks: pd.DataFrame, now_utc: datetime, through_et: str, base_mult: float,
                     cur_mult: float) -> dict:
     """The step-up watch over gate_blocks-shaped rows: {"status", "reason",
     "base_mult" (the ungated Saturday knob), "cur_mult" (the step-up in
     force), "prev_mult" (the level it is compared with: the highest below it
     that ran), "next_mult", "saturdays" (judged at cur), "mature",
-    "prev_saturdays", "rows", "checks", "ratio_cur", "ratio_prev",
-    "rent_keep"}."""
+    "prev_saturdays", "rows", "checks", "dollars" (D1's per-Saturday rows),
+    "d_net" / "d_rent" / "d_mo" (pooled over them, None when not judged)}."""
     out = dict(status="OFF", reason="", base_mult=base_mult, cur_mult=cur_mult, prev_mult=base_mult,
                next_mult=round(cur_mult + STEP_NEXT_DELTA, 2) if cur_mult else 0.0,
                saturdays=[], mature=[], prev_saturdays=[], rows=[], checks=[],
-               ratio_cur=None, ratio_prev=None, rent_keep=None)
+               dollars=[], d_net=None, d_rent=None, d_mo=None)
     if not cur_mult or cur_mult <= base_mult:
         out["reason"] = "no step-up in force"
         return out
@@ -936,15 +1014,25 @@ def evaluate_stepup(blocks: pd.DataFrame, now_utc: datetime, through_et: str, ba
     none = dict(status="PENDING", reason="", saturdays=[], rows=[], checks=[])
     g = evaluate_gate(only(cur_sats), now_utc, through_et, 1.0) if cur_sats else none
     gp = evaluate_gate(only(prev_sats), now_utc, through_et, 1.0) if prev_sats else none
-    out.update(saturdays=list(g["saturdays"]), rows=g["rows"], checks=g["checks"],
+    out.update(saturdays=list(g["saturdays"]), rows=g["rows"], checks=list(g["checks"]),
                prev_saturdays=list(gp["saturdays"]))
     out["mature"] = [s for s in g["saturdays"] if now_utc >= _saturday_end_utc(s) + timedelta(hours=24)]
-    rc, rp = _rent_ratio(g["rows"]), _rent_ratio(gp["rows"])
-    keep = rc / rp if not (_isnan(rc) or _isnan(rp)) and rp > 0 else float("nan")
-    out.update(ratio_cur=_nan_none(rc), ratio_prev=_nan_none(rp), rent_keep=_nan_none(keep))
+    # D1, the step in dollars (2026-10-26; it replaced the per-contract
+    # dilution test): each Saturday at the step-up against what the level
+    # below would have made that day
+    d_rows, d_checks, pooled = dollar_checks(blocks, out["saturdays"], out["prev_saturdays"], prev_lv, cur_lv)
+    for c in d_checks:                              # an immature Saturday is not judged yet
+        if c["saturday"] not in out["mature"]:
+            c["ok"] = None
+            c["detail"] += " - pending (mark-outs incomplete)"
+    out["checks"] += d_checks
+    out["dollars"] = d_rows
+    out["d_net"] = _nan_none(pooled["d_net"]) if pooled else None
+    out["d_rent"] = _nan_none(pooled["d_rent"]) if pooled else None
+    out["d_mo"] = _nan_none(pooled["d_mo"]) if pooled else None
     x, xp, xn = f"x{cur_mult:g}", f"x{prev_lv:g}", f"x{out['next_mult']:g}"
     n, need = len(out["mature"]), STEP_MIN_SATURDAYS
-    failed = [c for c in g["checks"] if c["ok"] is False]
+    failed = [c for c in out["checks"] if c["ok"] is False]
     if not g["saturdays"]:
         out["status"], out["reason"] = "WATCHING", f"no Saturday at {x} yet"
     elif failed:
@@ -957,17 +1045,17 @@ def evaluate_stepup(blocks: pd.DataFrame, now_utc: datetime, through_et: str, ba
                          + (f"; {g['reason']}" if g["status"] == "PENDING" and g.get("reason") else ""))
     elif g["status"] == "PENDING":
         out["status"], out["reason"] = "PENDING", g["reason"]
-    elif _isnan(keep):
+    elif out["d_net"] is None:
         out["status"] = "HOLD"
-        out["reason"] = f"{n} Saturdays at {x} pass G1-G4, but no {xp} Saturday ran to measure dilution against"
-    elif keep < STEP_MIN_RENT_KEEP:
+        out["reason"] = f"{n} Saturdays at {x} pass G2-G4, but no {xp} Saturday ran to measure the step in dollars"
+    elif out["d_net"] <= D1_TOL_USD:
         out["status"] = "HOLD"
-        out["reason"] = (f"{n} Saturdays at {x} pass G1-G4, but rent per resting contract kept only {keep:.2f} of "
-                         f"the {xp} Saturdays' (bar {STEP_MIN_RENT_KEEP:g}): the extra size is crowding its own share")
+        out["reason"] = (f"{n} Saturdays at {x} pass, but together they made {_usd(out['d_net'])} against {xp}: "
+                         f"the step bought nothing")
     else:
         out["status"] = "RAISE"
-        out["reason"] = (f"{n} Saturdays at {x} pass G1-G4 and rent per resting contract kept {keep:.2f} of the "
-                         f"{xp} Saturdays' (bar {STEP_MIN_RENT_KEEP:g}): {xn} is worth trying")
+        out["reason"] = (f"{n} Saturdays at {x} pass G2-G4 and made {_usd(out['d_net'])} together against {xp} "
+                         f"(rent {_usd(out['d_rent'])}, mark-out {_usd(out['d_mo'])}): {xn} is worth trying")
     return out
 
 
@@ -1001,11 +1089,13 @@ def gate_text(gate: dict, written: bool) -> list:
                      f"Sat net {_g(s['net_k'])} rent {_g(s['rent_k'], '{:6.1f}')} fills/1k {_g(s['fills_k'], '{:5.2f}')} "
                      f"mark {_g(s['mark'], '{:+6.2f}')}  |  weekdays net {_g(w['net_k'])} rent {_g(w['rent_k'], '{:6.1f}')} "
                      f"fills/1k {_g(w['fills_k'], '{:5.2f}')} mark {_g(w['mark'], '{:+6.2f}')}  [{r['anchor']}]")
+    lines += dollars_text(gate.get("dollars") or [])
     for c in gate.get("checks", []):
         mark = "ok  " if c["ok"] is True else ("FAIL" if c["ok"] is False else "n/a ")
         lines.append(f"  [{mark}] {c['saturday']} {c['check']}: {c['detail']}")
-    lines.append("  (net = modelled rent - mark-out cost, cents per 1,000 resting contract-hours; mark = 24h mid, else "
-                 "settlement, else the last logged mid inside 24h, cents per filled contract)")
+    lines.append("  (net = modelled rent - mark-out cost, cents per 1,000 resting contract-hours, shown for context "
+                 "and no longer judged -- D1 judges dollars; mark = 24h mid, else settlement, else the last logged "
+                 "mid inside 24h, cents per filled contract)")
     fams = gate.get("families") or []
     if fams:
         lines.append(f"  who moved it, {fams[0]['saturday']} boosted hours by family (Sat | anchor weekdays, same hours):")
@@ -1018,6 +1108,20 @@ def gate_text(gate: dict, written: bool) -> list:
     return lines
 
 
+def dollars_text(rows: list, total=None) -> list:
+    """ASCII lines for D1's per-Saturday dollars (cp1252 console)."""
+    if not rows:
+        return []
+    out = ["  in dollars (D1: each Saturday against what the level below would have made that day):"]
+    for r in rows:
+        out.append(f"    {r['saturday']} x{r['mult']:g} vs x{r['ref_mult']:g}: rent ${r['rent']:,.0f} vs "
+                   f"${r['cf_rent']:,.0f} ({_usd(r['d_rent'])}), mark-out {_usd(r['mo'])} vs {_usd(r['cf_mo'])} "
+                   f"({_usd(r['d_mo'])}) = {_usd(r['d_net'])}")
+    if total is not None:
+        out.append(f"    together {_usd(total)}")
+    return out
+
+
 def stepup_text(st: dict) -> list:
     """ASCII lines for the step-up watch (cp1252 console)."""
     if not st or st.get("status") == "OFF":
@@ -1026,11 +1130,7 @@ def stepup_text(st: dict) -> list:
     lines.append(f"status: {st['status']}" + (f" - {st['reason']}" if st.get("reason") else ""))
     lines.append(f"  Saturdays at x{st['cur_mult']:g}: {', '.join(st['saturdays']) or 'none yet'}"
                  f"  |  at x{st['prev_mult']:g} (the comparison): {', '.join(st['prev_saturdays']) or 'none'}")
-    rc, rb, k = st.get("ratio_cur"), st.get("ratio_prev"), st.get("rent_keep")
-    f2 = lambda v: "-" if v is None else f"{v:.2f}"
-    lines.append(f"  rent per resting ct-h, Saturday / its weekdays: x{st['cur_mult']:g} {f2(rc)} | "
-                 f"x{st['prev_mult']:g} {f2(rb)} -> kept {f2(k)} (bar {STEP_MIN_RENT_KEEP:g}; "
-                 f"{st['prev_mult'] / st['cur_mult']:.2f} = the extra size earned nothing)")
+    lines += dollars_text(st.get("dollars") or [], st.get("d_net"))
     for r in st.get("rows", []):
         s, w = r["sat"], r["wk"]
         lines.append(f"  {r['saturday']} {block_label(r['block'], r['saturday']):8} ({r['hours']}h)  "
@@ -1322,9 +1422,11 @@ def _gate_html(gate: dict, written: bool) -> str:
     weekday anchor, then every check."""
     colour = {"PASS": "#0a7a2f", "FAIL": "#c0392b"}.get(gate["status"], "#b36b00")
     h = ['<div style="font-size:15px;font-weight:600;margin-top:6px">2× gate</div>',
-         f'<div style="color:{_MUTED};margin:2px 0 4px">{_esc(GATE_RULE)}. Net = modelled rent − 24h mark-out '
-         f'cost, ¢ per 1,000 resting contract-hours; each boosted block against the same block on its own '
-         f'week\'s weekdays.</div>',
+         f'<div style="color:{_MUTED};margin:2px 0 4px">{_esc(GATE_RULE)}. Judged in dollars (D1, since '
+         f'2026-10-26): each Saturday against what the level below would have made that day, from the '
+         f'level-below Saturdays\' rent and 24h mark-out against their own weekdays. The per-block rates '
+         f'(net = modelled rent − 24h mark-out cost, ¢ per 1,000 resting contract-hours, against the same '
+         f'block on its own week\'s weekdays) are shown for context; they fall whenever size rises.</div>',
          f'<div style="margin:2px 0 6px"><span style="color:{colour};font-weight:600">{_esc(gate["status"])}</span>'
          + (" — verdict written this run" if written else "")
          + (f' <span style="color:{_MUTED}">— {_esc(gate["reason"])}</span>' if gate.get("reason") else "")
@@ -1346,6 +1448,9 @@ def _gate_html(gate: dict, written: bool) -> str:
                      f'<td style="{_TDL};color:{_MUTED}">{_esc(r["anchor"])}</td>']
             rows.append((f"background:{_SAT_BG}", cells))
         h.append(_html_table(head, rows))
+    if gate.get("dollars"):
+        h.append(f'<div style="font-size:14px;font-weight:600">In dollars (D1)</div>')
+        h.append(_dollars_html(gate["dollars"]))
     if gate.get("checks"):
         rows = []
         for c in gate["checks"]:
@@ -1374,6 +1479,22 @@ def _gate_html(gate: dict, written: bool) -> str:
     return "".join(h)
 
 
+def _dollars_html(rows: list) -> str:
+    """D1's per-Saturday dollars as a table."""
+    head = [("Saturday", True), ("Level", True), ("Rent $", False), ("Rent at the level below $", False),
+            ("Mark-out $", False), ("Mark-out at the level below $", False), ("Made over the level below", False)]
+    out = []
+    for r in rows:
+        col = "#0a7a2f" if r["d_net"] >= 0 else "#c0392b"
+        out.append((f"background:{_SAT_BG}", [
+            f'<td style="{_TDL}">{r["saturday"]}</td>',
+            f'<td style="{_TDL}">×{r["mult"]:g} vs ×{r["ref_mult"]:g}</td>',
+            f'<td style="{_TD}">{r["rent"]:,.0f}</td>', f'<td style="{_TD}">{r["cf_rent"]:,.0f}</td>',
+            f'<td style="{_TD}">{_esc(_usd(r["mo"]))}</td>', f'<td style="{_TD}">{_esc(_usd(r["cf_mo"]))}</td>',
+            f'<td style="{_TD};font-weight:600;color:{col}">{_esc(_usd(r["d_net"]))}</td>']))
+    return _html_table(head, out)
+
+
 def _stepup_html(st: dict) -> str:
     """The step-up watch: verdict, the dilution ratio, the step-up Saturdays'
     blocks against their weekdays, every check, and how to act."""
@@ -1384,22 +1505,23 @@ def _stepup_html(st: dict) -> str:
     x, xb, xn = f"×{st['cur_mult']:g}", f"×{st['prev_mult']:g}", f"×{st['next_mult']:g}"
     h = [f'<div style="font-size:15px;font-weight:600;margin-top:10px">Step-up watch: {x} → {xn}?</div>',
          f'<div style="color:{_MUTED};margin:2px 0 4px">{_esc(STEP_RULE)}. Report only — the bot\'s multiplier '
-         f'never moves on this. Each Saturday at {x} gets the 2× gate\'s checks against its own weekdays; after '
-         f'{STEP_MIN_SATURDAYS} of them, RAISE also needs rent per resting contract to hold at ≥ '
-         f'{STEP_MIN_RENT_KEEP:g} of the {xb} Saturdays\' (Saturday ÷ its weekdays).</div>',
+         f'never moves on this. Each Saturday at {x} gets the 2× gate\'s checks against its own weekdays, and '
+         f'D1 in dollars against what {xb} would have made that day; after {STEP_MIN_SATURDAYS} of them, RAISE '
+         f'needs them to have made money together over {xb}.</div>',
          f'<div style="margin:2px 0 6px"><span style="color:{colour};font-weight:600">{_esc(st["status"])}</span>'
          + (f' <span style="color:{_MUTED}">— {_esc(st["reason"])}</span>' if st.get("reason") else "") + "</div>"]
+    d = st.get("d_net")
     kv = [(f"Saturdays at {x}", ", ".join(st["saturdays"]) or "none yet"),
           (f"Saturdays at {xb} (comparison)", ", ".join(st["prev_saturdays"]) or "none"),
-          ("Rent per resting ct-h, Saturday ÷ weekdays",
-           f"{x} {num(st.get('ratio_cur'), '{:.2f}')} · {xb} {num(st.get('ratio_prev'), '{:.2f}')} → kept "
-           f"{num(st.get('rent_keep'), '{:.2f}')} (bar {STEP_MIN_RENT_KEEP:g}; "
-           f"{st['prev_mult'] / st['cur_mult']:.2f} = the extra size earned nothing)")]
+          (f"Made over {xb}, together", "not judged yet" if d is None else
+           f"{_usd(d)} (rent {_usd(st['d_rent'])}, mark-out {_usd(st['d_mo'])})")]
     h.append('<table style="border-collapse:collapse;margin:4px 0 10px">')
     for label, value in kv:
         h.append(f'<tr><td style="{_TDL};color:{_MUTED}">{_esc(label)}</td>'
-                 f'<td style="{_TDL};white-space:normal">{value if label.startswith("Rent") else _esc(value)}</td></tr>')
+                 f'<td style="{_TDL};white-space:normal">{_esc(value)}</td></tr>')
     h.append("</table>")
+    if st.get("dollars"):
+        h.append(_dollars_html(st["dollars"]))
     if st.get("rows"):
         head = [("Saturday", True), ("Block", True), ("Hours", False), ("Sat net", False), ("Weekday net", False),
                 ("Sat rent", False), ("Weekday rent", False), ("Sat mark-out ¢", False), ("Weekday mark-out ¢", False)]
