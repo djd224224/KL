@@ -20722,15 +20722,21 @@ class TestVercelPreDGate(unittest.TestCase):
         # Jack 2026-10-09: "i think intent was to double all vercel markets
         # not just this one" (KXANTHVREQ alone since 10/08) -> every Vercel
         # series x2 on the global geometry: rungs and caps scale together,
-        # and the yield x1.5 no longer stacks on top
-        self.assertEqual(imm.VERCEL_SIZE_MULT, 2.0)
+        # and the yield x1.5 no longer stacks on top. x3 since 2026-10-26
+        # (Jack: "1.5x RT and Vercel, as the morning daily email suggested"),
+        # out of both halves of the base-size split test with KXRT (its test
+        # half would have run x4.5)
+        self.assertEqual(imm.VERCEL_SIZE_MULT, 3.0)
         self.assertEqual(len(imm.VERCEL_SERIES), 8)
         for s in imm.VERCEL_SERIES:
-            self.assertEqual(imm.series_override(s).size_mult, 2.0, s)
-            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            self.assertEqual(imm.series_override(s).size_mult, 3.0, s)
+            self.assertEqual(imm.applied_mention_mult(s), 3.0, s)
             self.assertEqual(imm.series_max_position(s),
-                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+                             3.0 * imm.MAX_POSITION_CONTRACTS, s)
             self.assertFalse(imm.yield_size_eligible(s), s)
+            self.assertIn(s, imm.SIZE_TEST_EXCLUDE, s)
+            self.assertIsNone(imm.size_test_arm(s), s)
+        self.assertIsNone(imm.size_test_arm("KXRT"))
         self.assertEqual(imm.applied_mention_mult("KXGOOD"), 1.0)
 
     def test_enrolled_with_a_pre_d_cutoff(self):
@@ -29382,23 +29388,26 @@ class TestFamilyX2Oct11(unittest.TestCase):
                 + list(imm.RAMP_AI_SERIES))
 
     def test_code_defaults(self):
+        # KXRT x3 since 2026-10-26 (Jack: "1.5x RT and Vercel, as the
+        # morning daily email suggested")
         self.assertEqual((imm.RT_SIZE_MULT, imm.ENDORSE_SIZE_MULT,
                           imm.SHIPPING_SIZE_MULT, imm.AIADOPT_SIZE_MULT),
-                         (2.0, 2.0, 2.0, 2.0))
+                         (3.0, 2.0, 2.0, 2.0))
         self.assertEqual(len(imm.SHIPPING_X2_SERIES), 9)
         self.assertIn("KXOPENADOPT", imm.RAMP_AI_SERIES)
 
     def test_every_member_doubles_with_its_caps(self):
         for s in self.targets():
-            self.assertEqual(imm.applied_mention_mult(s), 2.0, s)
+            m = 3.0 if s == "KXRT" else 2.0                    # KXRT x3 since 10/26
+            self.assertEqual(imm.applied_mention_mult(s), m, s)
             self.assertEqual(imm.series_max_position(s),
-                             2.0 * imm.MAX_POSITION_CONTRACTS, s)
+                             m * imm.MAX_POSITION_CONTRACTS, s)
             self.assertEqual(imm.event_cap_contracts(s + "-26OCT"),
-                             2.0 * imm.MAX_EVENT_CONTRACTS, s)
+                             m * imm.MAX_EVENT_CONTRACTS, s)
             self.assertFalse(imm.yield_size_eligible(s), s)    # no x1.5 on top
         base = imm.series_levels("KXRT")
         self.assertEqual(imm.base_scaled_levels("KXRT"),
-                         [(t, int(sz * 2 + 0.5)) for t, sz in base])
+                         [(t, int(sz * 3 + 0.5)) for t, sz in base])
         self.assertEqual(imm.applied_mention_mult("KXRTTV"), 1.0)   # not asked for
 
     def test_graduates_keep_the_guard_set(self):

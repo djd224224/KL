@@ -2246,7 +2246,9 @@ def mention_size_mult(series: str) -> float:
 # SIZE_TEST_EXCLUDE (the Trump mentions B test; KXGENERALMOV, sized x3 by
 # hand on 10/23, see GENMOV_SIZE_MULT; KXPRESRUN, whose hand-set x6 the test
 # half would have made x9 -- Jack 2026-10-25: "Take it out"; KXAPRPOTUS,
-# resized x3 -> x5 by hand the day before the start, see APRPOTUS_SIZE_MULT).
+# resized x3 -> x5 by hand the day before the start, see APRPOTUS_SIZE_MULT;
+# KXRT and the Vercel family, x2 -> x3 on its first day, added where their
+# sizes are set).
 # imm_size_test_report (IMM
 # family watch pass 7) scores it daily and writes SIZE_TEST_STOP_FILE (in
 # STATUS_DIR) when its stop rule trips; the file ends the test by hand too,
@@ -14733,7 +14735,11 @@ for _s in VERCEL_SERIES:
 # multiplier), so its markets go x1.5 -> x2. The pre-D cutoff and the fair
 # gate are unchanged. IMM_VERCEL_SIZE_MULT=1 reverts (env => task-level
 # restart). Re-score on the D=10/12 and 10/14 events.
-VERCEL_SIZE_MULT = _env_float("IMM_VERCEL_SIZE_MULT", 2.0)
+# x3 since 2026-10-26 (Jack: "1.5x RT and Vercel, as the morning daily email
+# suggested" -- its DOUBLE DOWN: up on 7 of 7 days, +$224 over the 7 and
+# +$807 over 30 days' earning days, fills light enough for ~+$4/day at x1.5).
+# Out of both halves of the base-size split test (SIZE_TEST_EXCLUDE, below).
+VERCEL_SIZE_MULT = _env_float("IMM_VERCEL_SIZE_MULT", 3.0)
 for _s in VERCEL_SERIES:
     SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES[_s],
                                    size_mult=VERCEL_SIZE_MULT)
@@ -17011,7 +17017,10 @@ SERIES_OVERRIDES["KXGRAMMYNOM"] = replace(SERIES_OVERRIDES["KXGRAMMYNOM"],
 #   * The shipping list is the nine series that were measured. A new strait
 #     or port series comes in at x1 until it is added here.
 # One knob per family; 1 reverts it (env => task-level restart).
-RT_SIZE_MULT = _env_float("IMM_RT_SIZE_MULT", 2.0)
+# KXRT x3 since 2026-10-26 (Jack: "1.5x RT and Vercel, as the morning daily
+# email suggested" -- up on 7 of 7 days, +$234 over the 7 and +$915 over 30
+# days' earning days, ~+$3/day at x1.5); out of the size test, below.
+RT_SIZE_MULT = _env_float("IMM_RT_SIZE_MULT", 3.0)
 ENDORSE_SIZE_MULT = _env_float("IMM_ENDORSE_SIZE_MULT", 2.0)
 SHIPPING_SIZE_MULT = _env_float("IMM_SHIPPING_SIZE_MULT", 2.0)
 AIADOPT_SIZE_MULT = _env_float("IMM_AIADOPT_SIZE_MULT", 2.0)
@@ -17026,6 +17035,11 @@ FAMILY_X2_1011: Tuple[Tuple[float, Tuple[str, ...]], ...] = (
     (SHIPPING_SIZE_MULT, SHIPPING_X2_SERIES),
     (AIADOPT_SIZE_MULT, tuple(RAMP_AI_SERIES)),
 )
+# Out of both halves of the base-size split test: KXRT and the Vercel family
+# were resized by hand on its first day (2026-10-26, x2 -> x3) -- the
+# KXAPRPOTUS precedent; in its test half (KXANTHVREQ, KXOPENSOURCESHARE,
+# KXOPENVSPEND) x3 would have run x4.5.
+SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | VERCEL_SERIES | {"KXRT"}
 # FAMILY x2, 2026-10-22 (Jack: "Only the 2x", to "build both raises, or only
 # the x2 on the eight small books?" -- KXTRUMPMENTION x1.5 was the other, not
 # taken): eight open-scan graduates that barely fill, 0-6 fills each over
