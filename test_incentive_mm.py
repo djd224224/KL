@@ -104,12 +104,25 @@ _QUIET_DAILY_SERIES_CODE_DEFAULT = imm.QUIET_DAILY_SERIES
 # ...and the approval series kept OFF them (2026-10-11)
 _QUIET_HOURS_OFF_CODE_DEFAULT = imm.QUIET_HOURS_OFF_SERIES
 _QUIET_RAIN_PERIOD_CODE_DEFAULT = imm.QUIET_RAIN_PERIOD
+# the base size split test runs 10/26-11/09 ET by the WALL CLOCK: inside it
+# every series of its test half reads x1.5 in any test that pins a family
+# size (34 of them on 10/26). setUpModule parks it in the far future (and
+# tearDownModule restores it for the other suites); TestSizeSplitTest puts
+# the real start back.
+_SIZE_TEST_FROM_CODE_DEFAULT = imm.SIZE_TEST_FROM
+
+
+def tearDownModule():
+    imm.SIZE_TEST_FROM = _SIZE_TEST_FROM_CODE_DEFAULT
+    imm._size_test_cache.clear()
 
 
 def setUpModule():
     """Sandbox all file side effects (HALT file, persisted state, status
     heartbeat) away from the production run-logs directory — a test must
     never delete a deliberately-placed live HALT file or pollute live state."""
+    imm.SIZE_TEST_FROM = _SIZE_TEST_FROM_CODE_DEFAULT.replace(year=2099)
+    imm._size_test_cache.clear()
     tmp = tempfile.mkdtemp(prefix="imm_test_")
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
@@ -11261,6 +11274,18 @@ class TestDailySeries(unittest.TestCase):
                   "KXTRUMPMENTION", "KXEARNINGSMENTIONHD", "KXAMZNCC", "KXFOO"):
             self.assertFalse(imm.is_daily_series(s), s)
         self.assertEqual(self._excl, ("KXAAAGAS", "KXDIESEL"))   # module default
+        # the quakes take the boosts though the feed reads them daily (Jack
+        # 2026-10-26: "Yes give boost")
+        self.assertEqual(self._exempt, ("KXBIGGESTQUAKE",))       # module default
+        imm.DAILY_SERIES_DYNAMIC["KXBIGGESTQUAKE"] = {"p75_h": 27.8}
+        self.assertFalse(imm.is_daily_series("KXBIGGESTQUAKE"))
+        imm.HOUR_SIZE_MULTS = {h: 3.0 for h in range(9)}
+        imm.SAT_SIZE_MULT = 2.0
+        with mock.patch.object(imm, "gated_sat_mult", lambda d: None):
+            self.assertEqual(imm.hour_size_mult("KXBIGGESTQUAKE",
+                                                utc(2026, 10, 27, 7, 0)), 3.0)   # 03 ET
+            self.assertEqual(imm.hour_size_mult("KXBIGGESTQUAKE",
+                                                utc(2026, 10, 31, 16, 0)), 2.0)  # Sat noon
         imm.DAILY_EXEMPT_PREFIXES = ("KXRAINWKND",)
         self.assertFalse(imm.is_daily_series("KXRAINWKND"))
         self.assertTrue(imm.is_daily_series("KXRAIN"))
@@ -31881,6 +31906,7 @@ class TestSizeSplitTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="imm_size_test_")
         for p in (mock.patch.object(imm, "STATUS_DIR", self.dir),
+                  mock.patch.object(imm, "SIZE_TEST_FROM", _SIZE_TEST_FROM_CODE_DEFAULT),
                   mock.patch.dict(imm._size_test_stop, {"checked": 0.0, "stopped": False}),
                   mock.patch.dict(imm._size_test_cache, clear=True)):
             p.start()

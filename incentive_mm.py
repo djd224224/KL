@@ -1741,8 +1741,14 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
 # via SAT_MULT_EXCLUDE, as decided that morning.
 DAILY_PREFIXES = tuple(p for p in os.environ.get(
     "IMM_DAILY_PREFIXES", "KXAAAGASD,KXDIESELD,KXRAIN,KXTEMP").split(",") if p)
+# KXBIGGESTQUAKE is exempt (Jack 2026-10-26: "Yes give boost"): its x4 of
+# 10/07 was planned as x6 in the evening and x12 in the quiet hours, but the
+# feed classifier read its one-UTC-day events as daily and it rested x1 at
+# every hour. A quake is not informed by a coming print overnight, and the
+# family is bid-only and capped at the fair, so it takes the global hour
+# windows and the Saturday step again.
 DAILY_EXEMPT_PREFIXES = tuple(
-    p for p in os.environ.get("IMM_DAILY_EXEMPT", "").split(",") if p)
+    p for p in os.environ.get("IMM_DAILY_EXEMPT", "KXBIGGESTQUAKE").split(",") if p)
 DAILY_MAX_HOURS = _env_float("IMM_DAILY_MAX_HOURS", 48.0)
 DAILY_DROP_HOURS = _env_float("IMM_DAILY_DROP_HOURS", 72.0)
 DAILY_MAX_HORIZON_HOURS = _env_float("IMM_DAILY_MAX_HORIZON_HOURS", 72.0)
@@ -13866,9 +13872,10 @@ QUAKE_EMSC_PING_SECS = _env_float("IMM_QUAKE_EMSC_PING_SECS", 15)
 QUAKE_EMSC_DEAD_SECS = _env_float("IMM_QUAKE_EMSC_DEAD_SECS", 60)
 QUAKE_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_QUAKE_CUTOFF_FROM_CLOSE_MIN", 10)
 # x3 -> x4 (Jack 2026-10-07: "increase KXBIGGESTQUAKE to 4x"). Not a daily
-# series, so the hour windows still compose on top: x4 by day, x6 in the
-# 18-21 ET evening window, x12 in the 0-8 ET quiet hours (the per-market cap
-# scales to 400).
+# series (DAILY_EXEMPT_PREFIXES since 2026-10-26: the feed classifier had
+# made it daily, x1 at every hour), so the hour windows compose on top: x4 by
+# day, x6 in the 18-23 ET evening window, x12 in the 0-8 ET quiet hours, and
+# the Saturday step (the per-market cap scales with the x4).
 QUAKE_SIZE_MULT = _env_float("IMM_QUAKE_SIZE_MULT", 4.0)
 # HOLD RENEWAL (Jack 2026-09-28, "yes" to renewing held bids): a hold leaves
 # the resting bids exactly as they are, but every IMM order carries an
