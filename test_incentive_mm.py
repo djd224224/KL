@@ -155,6 +155,12 @@ def setUpModule():
     # the low-temperature fair (2026-10-23)
     imm.LOWT_FAIR_FILE = os.path.join(tmp, "lowt_fair.json")
     imm.HIGHT_FAIR_FILE = os.path.join(tmp, "hight_fair.json")
+    # The base-size split test runs on the wall clock from 2026-10-26 00:00
+    # ET: from then on its "test" half read x1.5 in every family-multiplier
+    # test (Grammy x2 -> x3 ...). Pinned stopped for the module, cached far
+    # ahead so the stop file is never re-read; TestSizeSplitTest re-arms it
+    # in its own setUp and drives its clock by hand.
+    imm._size_test_stop.update(checked=float("inf"), stopped=True)
     # The full-depth book log resolves its directory at WRITE time from
     # STATUS_DIR (redirected above) unless IMM_BOOK_LOG_DIR is set; a stray
     # value in the shell would send test books wherever it points.

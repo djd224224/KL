@@ -10,6 +10,15 @@ import incentive_mm as imm
 M = imm.IncentiveMarketMaker
 
 
+def setUpModule():
+    # The base-size split test runs on the wall clock from 2026-10-26 00:00
+    # ET; its "test" half would read x1.5 in the size assertions here.
+    # Pinned stopped (cached far ahead, so the stop file is never re-read).
+    p = mock.patch.dict(imm._size_test_stop, {"checked": float("inf"), "stopped": True})
+    p.start()
+    unittest.addModuleCleanup(p.stop)
+
+
 class ScanGraduateTests(unittest.TestCase):
 
     def test_graduates_are_allowed_and_not_blocked(self):
