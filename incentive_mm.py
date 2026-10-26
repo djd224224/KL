@@ -10558,7 +10558,7 @@ _CONFIG_CODE_KNOBS = (
     # the RCP approval, Trump mention and ERCOT peak gates (2026-10-26); model
     # knobs in approval_fair.py, trump_mention_fair.py and ercot_fair.py
     "APPROVE_FAIR_ENABLE", "APPROVE_FAIR_TOL_CENTS", "APPROVE_FAIR_TTL_MIN",
-    "APPROVE_FAIR_CAP",
+    "APPROVE_FAIR_CAP", "APPROVE_FAIR_NIGHT_TOL_CENTS", "APPROVE_FAIR_NIGHT_END_ET",
     "TMENTION_FAIR_ENABLE", "TMENTION_FAIR_TOL_CENTS", "TMENTION_FAIR_TTL_MIN",
     "TMENTION_FAIR_CAP",
     "ERCOT_FAIR_ENABLE", "ERCOT_FAIR_TOL_CENTS", "ERCOT_FAIR_TTL_MIN", "ERCOT_FAIR_CAP",
@@ -13527,10 +13527,24 @@ def bway_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # pending lost -3.7c a contract on the daily (8/28-10/25, -$691) against -1.0c
 # otherwise; -10c in its first 30 min, -30c in the next 30. The module's
 # RELEASE_HOLD_* knobs; IMM_APPROVE_RELEASE_HOLD=0 turns the hold off.
+# OVERNIGHT BAND (Jack 2026-10-26: "Yes", to "Set the daily's band to 5c
+# overnight only, with no multiplier change?"): APPROVE_FAIR_NIGHT_TOL_CENTS
+# from 00:00 ET to APPROVE_FAIR_NIGHT_END_ET, APPROVE_FAIR_TOL_CENTS the rest
+# of the day. RCP does not edit overnight, so the model's fair is at its best
+# there. The 9/27-10/25 replay of every pinnable fill (the RCP Average from
+# Kalshi's exact 1 PM reads and archived RCP pages), net of the reward a
+# capped side gives up: overnight 5c beat 15c in each period (+$82 to 10/06,
+# +$191 in the x9 week, +$151 10/11-10/25; ~+$14 a night outside the x9
+# week) -- fills 5-15c through the fair lost ~20c a contract in each. By day
+# a tighter band lost (5c -$176 vs 15c -$96 outside the x9 week: the market
+# knows the edits and polls the model does not), evenings were a wash.
+# IMM_APPROVE_FAIR_NIGHT_END_ET=0 drops the overnight band.
 APPROVE_FAIR_ENABLE = os.environ.get("IMM_APPROVE_FAIR_ENABLE", "1") == "1"
 APPROVE_FAIR_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_APPROVE_FAIR_SERIES", "KXTRUMPAPPROVE").split(",") if s.strip())
 APPROVE_FAIR_TOL_CENTS = _env_int("IMM_APPROVE_FAIR_TOL_CENTS", 15)
+APPROVE_FAIR_NIGHT_TOL_CENTS = _env_int("IMM_APPROVE_FAIR_NIGHT_TOL_CENTS", 5)
+APPROVE_FAIR_NIGHT_END_ET = _env_int("IMM_APPROVE_FAIR_NIGHT_END_ET", 9)
 APPROVE_FAIR_TTL_MIN = _env_int("IMM_APPROVE_FAIR_TTL_MIN", 15)
 APPROVE_FAIR_REFRESH_SECS = _env_int("IMM_APPROVE_FAIR_REFRESH_SECS", 120)
 APPROVE_FAIR_CAP = os.environ.get("IMM_APPROVE_FAIR_CAP", "1") == "1"
@@ -13548,11 +13562,19 @@ def load_approve_fair() -> int:
     return _load_weather_fair(APPROVE_FAIR_FILE, _approve_fair_state, "RCP approval")
 
 
+def approve_fair_tol(now_ts: float) -> int:
+    """The band in force: APPROVE_FAIR_NIGHT_TOL_CENTS from 00:00 ET to
+    APPROVE_FAIR_NIGHT_END_ET, else APPROVE_FAIR_TOL_CENTS."""
+    if datetime.fromtimestamp(now_ts, ET).hour < APPROVE_FAIR_NIGHT_END_ET:
+        return APPROVE_FAIR_NIGHT_TOL_CENTS
+    return APPROVE_FAIR_TOL_CENTS
+
+
 def approve_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                       ext_ask: Optional[float]
                       ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
     return simple_fair_gate(_approve_fair_state, ticker, now_ts, ext_bid, ext_ask,
-                            tol=APPROVE_FAIR_TOL_CENTS, ttl_min=APPROVE_FAIR_TTL_MIN,
+                            tol=approve_fair_tol(now_ts), ttl_min=APPROVE_FAIR_TTL_MIN,
                             label="RCP approval", cap=APPROVE_FAIR_CAP)
 
 
@@ -33153,17 +33175,20 @@ class IncentiveMarketMaker:
                 f"x{SOFTWAREUNEMP_SIZE_MULT:g} (ladder "
                 f"{series_levels('KXSOFTWAREUNEMP')}), max "
                 f"{series_max_position('KXSOFTWAREUNEMP'):g} per market")
+        approve_band = f"{APPROVE_FAIR_TOL_CENTS}c" + (
+            f" ({APPROVE_FAIR_NIGHT_TOL_CENTS}c 00:00-{APPROVE_FAIR_NIGHT_END_ET:02d}:00 ET)"
+            if APPROVE_FAIR_NIGHT_END_ET > 0 else "")
         for on, ss, what, tol, ttl in (
                 (APPROVE_FAIR_ENABLE, APPROVE_FAIR_SERIES, "approval_fair's RCP read",
-                 APPROVE_FAIR_TOL_CENTS, APPROVE_FAIR_TTL_MIN),
+                 approve_band, APPROVE_FAIR_TTL_MIN),
                 (TMENTION_FAIR_ENABLE, TMENTION_FAIR_SERIES,
                  "trump_mention_fair's recency-weighted base rates",
-                 TMENTION_FAIR_TOL_CENTS, TMENTION_FAIR_TTL_MIN),
+                 f"{TMENTION_FAIR_TOL_CENTS}c", TMENTION_FAIR_TTL_MIN),
                 (ERCOT_FAIR_ENABLE, ERCOT_FAIR_SERIES, "ercot_fair's load forecast",
-                 ERCOT_FAIR_TOL_CENTS, ERCOT_FAIR_TTL_MIN)):
+                 f"{ERCOT_FAIR_TOL_CENTS}c", ERCOT_FAIR_TTL_MIN)):
             if on:
                 log(f"fair gate (2026-10-26): {', '.join(sorted(ss))} quoted against "
-                    f"{what} -- band {tol}c caps the side that fights the fair, no "
+                    f"{what} -- band {tol} caps the side that fights the fair, no "
                     f"fresh fair ({ttl}m) no quote")
         if ERCOT_FAIR_ENABLE:
             log(f"ERCOT peak (2026-10-26): x1, max {ERCOT_FAIR_MAX_POSITION:g} per "

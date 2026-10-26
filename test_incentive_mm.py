@@ -13200,7 +13200,10 @@ class TestOct26FairGates(unittest.TestCase):
     def test_each_gate_fails_closed_joins_and_caps(self):
         import imm_risk_controls
         for (s, t, fa, sa, loader, gate, label, tol_a, ttl_a, name, on) in self.CASES:
-            with self.subTest(series=s), mock.patch.object(imm, on, True):
+            # the daytime band whatever the hour (the approval overnight band
+            # has its own test below)
+            with self.subTest(series=s), mock.patch.object(imm, on, True), \
+                    mock.patch.object(imm, "APPROVE_FAIR_NIGHT_END_ET", 0):
                 self._reset(fa, sa)
                 g = getattr(imm, gate)
                 tol = getattr(imm, tol_a)
@@ -13233,6 +13236,30 @@ class TestOct26FairGates(unittest.TestCase):
                                                  time.time(), 45, 55))
             self.assertEqual(imm.fair_gate_of("KXAPRPOTUS"), "")
 
+    def test_approval_band_is_5c_overnight_and_15c_by_day(self):
+        # Jack 2026-10-26: "Yes", to 5c from 00:00 to 09:00 ET, 15c the rest
+        self.assertEqual((imm.APPROVE_FAIR_NIGHT_TOL_CENTS, imm.APPROVE_FAIR_NIGHT_END_ET,
+                          imm.APPROVE_FAIR_TOL_CENTS), (5, 9, 15))
+        t = "KXTRUMPAPPROVE-26OCT27-E43.2"
+        night = datetime(2026, 10, 27, 7, 30, tzinfo=timezone.utc)      # 03:30 ET
+        dawn = datetime(2026, 10, 27, 12, 59, tzinfo=timezone.utc)      # 08:59 ET
+        day = datetime(2026, 10, 27, 13, 0, tzinfo=timezone.utc)        # 09:00 ET
+        self.assertEqual([imm.approve_fair_tol(x.timestamp()) for x in (night, dawn, day)],
+                         [5, 5, 15])
+        with mock.patch.object(imm, "APPROVE_FAIR_ENABLE", True):
+            # a bid 8c over a 50c fair: capped at 55 overnight, joined by day
+            self._write("APPROVE_FAIR_FILE", "load_approve_fair", t, at=night)
+            why, inp, caps = imm.approve_fair_gate(t, night.timestamp(), 58, 62)
+            self.assertEqual((why, inp["reason"], inp["bid_bad"], caps[0]), ("", "band", True, 55))
+            # an ask 8c under it is floored at 45
+            why, inp, caps = imm.approve_fair_gate(t, night.timestamp(), 38, 42)
+            self.assertEqual((inp["ask_bad"], caps[1]), (True, 45))
+            self._write("APPROVE_FAIR_FILE", "load_approve_fair", t, at=day)
+            self.assertEqual(imm.approve_fair_gate(t, day.timestamp(), 58, 62), ("", {}, None))
+        # IMM_APPROVE_FAIR_NIGHT_END_ET=0 drops the overnight band
+        with mock.patch.object(imm, "APPROVE_FAIR_NIGHT_END_ET", 0):
+            self.assertEqual(imm.approve_fair_tol(night.timestamp()), 15)
+
     def test_kill_switches_and_knobs(self):
         for on, s in (("APPROVE_FAIR_ENABLE", "KXTRUMPAPPROVE"),
                       ("TMENTION_FAIR_ENABLE", "KXTRUMPMENTION"),
@@ -13241,7 +13268,8 @@ class TestOct26FairGates(unittest.TestCase):
                 self.assertIsNone(imm.fair_file_gate(s, s + "-26OCT27-X", time.time(), 45, 55))
                 self.assertEqual(imm.fair_gate_of(s), "")
         for k in ("APPROVE_FAIR_ENABLE", "APPROVE_FAIR_TOL_CENTS", "APPROVE_FAIR_TTL_MIN",
-                  "APPROVE_FAIR_CAP", "TMENTION_FAIR_ENABLE", "TMENTION_FAIR_TOL_CENTS",
+                  "APPROVE_FAIR_CAP", "APPROVE_FAIR_NIGHT_TOL_CENTS", "APPROVE_FAIR_NIGHT_END_ET",
+                  "TMENTION_FAIR_ENABLE", "TMENTION_FAIR_TOL_CENTS",
                   "TMENTION_FAIR_TTL_MIN", "TMENTION_FAIR_CAP", "ERCOT_FAIR_ENABLE",
                   "ERCOT_FAIR_TOL_CENTS", "ERCOT_FAIR_TTL_MIN", "ERCOT_FAIR_CAP",
                   "ERCOT_FAIR_MAX_POSITION", "ERCOT_FAIR_STOP_HOUR_CT"):
