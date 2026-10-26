@@ -87,14 +87,17 @@ GATE (incentive_mm APPROVE_FAIR_*): KXTRUMPAPPROVE only, TOL 15c, TTL 15
   fresh; the feed is read at most every RCP_MIN_READ_SECS whatever the
   cadence). KXAPRPOTUS is priced here but not gated: the fills a band would
   have blocked won.
-NOT BUILT: polls released but not yet entered by RCP. No single reliable
-  public source: RCP's latest-polls pages sit behind the same DataDome,
+RELEASED, NOT YET ENTERED (2026-10-26): polls out but not in RCP's table
+  are not priced -- RCP's latest-polls pages sit behind the same DataDome,
   pollsters publish on their own sites at their own hours, and Wikipedia's
-  tables trail by hours. That is where the market beats this model.
+  tables trail by hours; that is where the market beats this model. The
+  daily instead STANDS ASIDE while a one-off national poll is out and not
+  entered (RELEASE_HOLD_ENABLE: Google News headlines, see the knobs).
 
 Standalone dry run:  python approval_fair.py [--out path] [--now ISO]
 """
 import argparse
+import html
 import json
 import math
 import os
@@ -103,6 +106,7 @@ import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -145,6 +149,112 @@ JUMP: Dict[int, float] = {0: 0.2119}
 for _k, _p in ((1, 0.2213), (2, 0.0784), (3, 0.0434), (4, 0.0240), (5, 0.0133),
                (6, 0.0074), (7, 0.0041), (8, 0.0023)):
     JUMP[_k] = JUMP[-_k] = _p
+
+# ---- RELEASED-BUT-NOT-ENTERED HOLD (Jack 2026-10-26: "Build it") -------------
+# The 10/26 measurement (approval fills 8/28-10/25 to settlement, release
+# times from the pollsters' own pages): fills made while a poll that moves the
+# mean was out but not yet in RCP's table lost -$817 in 59 days, -3.7c a
+# contract on the daily against -1.0c otherwise -- ~29% of contracts, most of
+# the fill loss -- and $965 of it on one-off media polls (CBS, CNN, Fox,
+# NYT/Siena, CNBC, FT, ...) published 1.7-6.5 h before RCP entered them; the
+# regulars (Rasmussen, Economist/YouGov, Reuters/Ipsos) cost ~nothing. Google
+# News' RSS search is read every NEWS_EVERY_SECS: a headline published inside
+# NEWS_MAX_AGE_H from a sponsor's own outlet (NEWS_OUTLETS) with a singular
+# "poll"/"survey" and Trump/approval, or from any outlet naming a sponsor
+# right before "poll"/"survey" (_SPONSOR_PHRASE_RE), and no state race
+# (_STATE_RE), starts a hold on that pollster -- unless RCP already entered
+# it within ENTERED_RECENT_H of the headline (coverage of an entered poll) or
+# it was held in the last REHOLD_GAP_H. A hold withholds every HOLD_SERIES
+# fair, so the bot's gate stands the daily aside (no fair, no quote), until
+# RCP's table shows an entry for that pollster created after the headline
+# (less HOLD_ENTRY_SLACK_H) or HOLD_MAX_H pass. Replayed on 10/19-10/25:
+# CNN (6.5 h before RCP), CNBC (3.4 h), FT (3.4 h) and NYT/Siena (1.7 h)
+# caught; CBS and Echelon missed (no own-poll headline in the search).
+# IMM_APPROVE_RELEASE_HOLD=0 turns it off.
+RELEASE_HOLD_ENABLE = os.environ.get("IMM_APPROVE_RELEASE_HOLD", "1") == "1"
+HOLD_SERIES = ("KXTRUMPAPPROVE",)       # the gated daily; the weekly stays priced
+NEWS_URL = "https://news.google.com/rss/search"
+NEWS_QUERIES = ("Trump approval poll", "new poll Trump", "Trump poll survey")
+NEWS_EVERY_SECS = 300
+NEWS_MAX_AGE_H = 12.0
+HOLD_MAX_H = 12.0
+HOLD_ENTRY_SLACK_H = 2.0
+ENTERED_RECENT_H = 72.0
+REHOLD_GAP_H = 24.0
+ENTRY_KEEP_DAYS = 14                    # RCP entries kept in the rcp state
+# sponsor -> its names in RCP's table (the stars and &amp; stripped)
+SPONSORS: Dict[str, Tuple[str, ...]] = {
+    "CNN": ("CNN",), "CBS News": ("CBS News",), "FOX News": ("FOX News",),
+    "NBC News": ("NBC News", "NBC News Decision Desk"),
+    "NY Times/Siena": ("NY Times/Siena",), "ABC/Wash Post/Ipsos": ("ABC/Wash Post/Ipsos",),
+    "Quinnipiac": ("Quinnipiac",), "NPR/PBS/Marist": ("NPR/PBS/Marist",),
+    "Emerson": ("Emerson",), "AP/NORC": ("AP/NORC",), "Pew Research": ("Pew Research",),
+    "Harvard-Harris": ("Harvard-Harris",), "Echelon Insights": ("Echelon Insights",),
+    "Gallup": ("Gallup",), "Wall Street Journal": ("Wall Street Journal",),
+    "CNBC": ("CNBC",), "Financial Times": ("Financial Times",),
+    "Marquette": ("Marquette",), "Monmouth": ("Monmouth",)}
+# Google News source name -> sponsor (its own poll, on its own outlet)
+NEWS_OUTLETS = {
+    "CNN": "CNN", "CBS News": "CBS News", "Fox News": "FOX News", "NBC News": "NBC News",
+    "The New York Times": "NY Times/Siena", "Siena Poll": "NY Times/Siena",
+    "The Washington Post": "ABC/Wash Post/Ipsos", "ABC News": "ABC/Wash Post/Ipsos",
+    "The Wall Street Journal": "Wall Street Journal", "CNBC": "CNBC",
+    "Financial Times": "Financial Times", "AP News": "AP/NORC", "www.ap.org": "AP/NORC",
+    "Quinnipiac University": "Quinnipiac", "Quinnipiac University Poll": "Quinnipiac",
+    "Marist Poll": "NPR/PBS/Marist", "NPR": "NPR/PBS/Marist",
+    "Emerson College Polling": "Emerson", "Pew Research Center": "Pew Research",
+    "Gallup": "Gallup", "Gallup News": "Gallup", "Marquette Law School Poll": "Marquette",
+    "Monmouth University": "Monmouth", "Echelon Insights": "Echelon Insights"}
+_SPONSOR_PHRASES = (
+    (r"\bCNN\b", "CNN"), (r"\bCBS(?: News)?\b", "CBS News"), (r"\bFox News\b", "FOX News"),
+    (r"\bNBC(?: News)?\b", "NBC News"), (r"\b(?:New York )?Times[/ -]Siena\b", "NY Times/Siena"),
+    (r"\b(?:Post[- ]ABC(?:[- ]Ipsos)?|ABC(?: News)?[/ -](?:Washington )?Post(?:[- ]Ipsos)?)\b",
+     "ABC/Wash Post/Ipsos"),
+    (r"\bQuinnipiac(?: University)?\b", "Quinnipiac"), (r"\b(?:NPR[/ -]PBS[/ -])?Marist\b",
+                                                         "NPR/PBS/Marist"),
+    (r"\bEmerson(?: College)?\b", "Emerson"), (r"\bAP[- ]NORC\b", "AP/NORC"),
+    (r"\bPew(?: Research(?: Center)?)?\b", "Pew Research"),
+    (r"\bHarvard(?: CAPS)?[/ -]Harris\b", "Harvard-Harris"),
+    (r"\bEchelon(?: Insights)?\b", "Echelon Insights"), (r"\bGallup\b", "Gallup"),
+    (r"\b(?:WSJ|Wall Street Journal)\b", "Wall Street Journal"), (r"\bCNBC\b", "CNBC"),
+    (r"\b(?:FT|Financial Times)\b", "Financial Times"),
+    (r"\bMarquette(?: Law School)?\b", "Marquette"), (r"\bMonmouth(?: University)?\b", "Monmouth"))
+_SPONSOR_PHRASE_RE = [(re.compile(p + r"(?:[ -](?:national|new|latest))?[ -](?:poll|survey)\b", re.I), k)
+                      for p, k in _SPONSOR_PHRASES]
+_POLL_WORD_RE = re.compile(r"\b(?:poll|survey)\b", re.I)
+_TRUMP_RE = re.compile(r"\b(?:Trump|approv\w*|president\w*)\b", re.I)
+_STATE_RE = re.compile(
+    r"\b(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|"
+    r"Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|"
+    r"Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|"
+    r"New Hampshire|New Jersey|New Mexico|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|"
+    r"Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|"
+    r"Virginia|West Virginia|Wisconsin|Wyoming|statewide|"
+    r"state-by-state|Senate race|governor'?s race|House race|district)\b"
+    r"|\b(?:N\.J|N\.C|Ga|Pa)\.", re.I)
+
+
+def canon_pollster(name: str) -> str:
+    """An RCP pollster name without its footnote stars and HTML entities."""
+    return (name or "").replace("&amp;", "&").replace("*", "").strip()
+
+
+def match_release(source: str, title: str) -> Optional[str]:
+    """The sponsor (a SPONSORS key) whose new national poll this headline
+    announces, or None. The headline is the title less its " - Source" tail."""
+    head = title or ""
+    if source and head.endswith(" - " + source):
+        head = head[: -len(source) - 3]
+    if _STATE_RE.search(head) or not _TRUMP_RE.search(head):
+        return None
+    for rx, key in _SPONSOR_PHRASE_RE:
+        if rx.search(head):
+            return key
+    own = NEWS_OUTLETS.get((source or "").strip())
+    if own and _POLL_WORD_RE.search(head):
+        return own
+    return None
+
 
 _EVENT_DATE_RE = re.compile(r"-(\d{2}[A-Z]{3}\d{2})(?:-|$)")
 _RULE_TIME_RE = re.compile(
@@ -307,12 +417,26 @@ def parse_feed(js, now: Optional[datetime] = None) -> dict:
     if len(recent) < MIN_SESSIONS:
         raise FeedError(f"only {len(recent)} dated editing sessions in {RATE_WEEKS} weeks")
     newest = max((up for _, up in entries), default=None)
+    # each poll's entry (creation) time, as session_times reads it, kept by
+    # pollster for the release hold: [pollster, created epoch]
+    names = {}
+    for r in block:
+        try:
+            names[int(r.get("id"))] = canon_pollster(str(r.get("pollster") or ""))
+        except (TypeError, ValueError):
+            pass
+    made: List[list] = []
+    low = math.inf
+    for pid, up in sorted(entries, reverse=True):
+        low = min(low, up)
+        if low >= now_ts - ENTRY_KEEP_DAYS * 86400 and pid in names:
+            made.append([names[pid], round(low)])
     return {"value": value, "dates": str(rows[i0].get("date") or ""),
             "build": str((js.get("moduleInfo") or {}).get("lastBuildDate") or ""),
             "n_in": len(polls_in), "mean_in": round(mean_in, 4), "polls_in": polls_in,
             "n_polls": len(block),
             "newest_update": _iso(datetime.fromtimestamp(newest, timezone.utc)) if newest else None,
-            "sessions": [round(t) for t in recent]}
+            "sessions": [round(t) for t in recent], "entries": made}
 
 
 def _http_get(url: str, headers: Optional[dict] = None) -> Tuple[Optional[str], dict]:
@@ -582,7 +706,7 @@ def _read_feed(old: dict, now: datetime, get_text: Optional[Callable]
     prev = rcp.get("value")
     v = parsed["value"]
     rcp.update({k: parsed[k] for k in ("dates", "build", "n_in", "mean_in", "n_polls",
-                                       "newest_update", "polls_in", "sessions")})
+                                       "newest_update", "polls_in", "sessions", "entries")})
     rcp["read_at"] = _iso(now)
     rcp["etag"], rcp["last_modified"] = hdr.get("etag"), hdr.get("last_modified")
     big = prev is not None and abs(v - float(prev)) > MAX_STEP + 1e-9
@@ -599,10 +723,102 @@ def _read_feed(old: dict, now: datetime, get_text: Optional[Callable]
     return rcp, history, None, tried
 
 
+def parse_news(xml: str) -> List[dict]:
+    """Google News RSS items: [{"ts", "source", "title", "link"}]."""
+    out = []
+    for it in re.findall(r"<item>(.*?)</item>", xml or "", re.S):
+        t = re.search(r"<title>(.*?)</title>", it, re.S)
+        d = re.search(r"<pubDate>(.*?)</pubDate>", it, re.S)
+        s = re.search(r"<source[^>]*>(.*?)</source>", it, re.S)
+        lk = re.search(r"<link>(.*?)</link>", it, re.S)
+        try:
+            ts = parsedate_to_datetime(d.group(1).strip()).timestamp() if d else None
+        except (TypeError, ValueError):
+            ts = None
+        if t is None or ts is None:
+            continue
+        out.append({"ts": ts, "title": html.unescape(t.group(1).strip()),
+                    "source": html.unescape(s.group(1).strip()) if s else "",
+                    "link": lk.group(1).strip() if lk else ""})
+    return out
+
+
+def fetch_news(timeout: float = 20.0) -> List[dict]:
+    """The last day's Google News items for NEWS_QUERIES, one per headline."""
+    seen, out = set(), []
+    for q in NEWS_QUERIES:
+        r = requests.get(NEWS_URL, params={"q": f"{q} when:1d", "hl": "en-US", "gl": "US",
+                                           "ceid": "US:en"},
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; " + USER_AGENT + ")"},
+                         timeout=timeout)
+        r.raise_for_status()
+        for it in parse_news(r.text):
+            key = (it["title"], it["source"])
+            if key not in seen:
+                seen.add(key)
+                out.append(it)
+    return out
+
+
+def _release_holds(old: dict, now: datetime, rcp: dict,
+                   get_news: Optional[Callable]) -> Tuple[List[dict], List[dict], float]:
+    """(active holds, recent hold log, news tried at) -- see RELEASE_HOLD_ENABLE.
+    Ends holds whose poll RCP entered or that ran HOLD_MAX_H, then (at most
+    every NEWS_EVERY_SECS) reads the news for new ones."""
+    ts = now.timestamp()
+    holds = list(old.get("release_holds") or [])
+    hlog = list(old.get("release_log") or [])
+    tried = float(old.get("news_tried_at") or 0.0)
+    entries = rcp.get("entries") or []
+
+    def entered(key: str, since: float) -> bool:
+        names = set(SPONSORS.get(key, (key,)))
+        return any(e[1] >= since for e in entries if e[0] in names)
+
+    keep = []
+    for h in holds:
+        how = ("entered" if entered(h["key"], h["published"] - HOLD_ENTRY_SLACK_H * 3600)
+               else "max" if ts - h["published"] >= HOLD_MAX_H * 3600 else None)
+        if how:
+            hlog.append(dict(h, ended=_iso(now), how=how))
+            _log(f"release hold OFF: {h['key']} ({'RCP entered it' if how == 'entered' else f'{HOLD_MAX_H:g} h without an RCP entry'})")
+        else:
+            keep.append(h)
+    holds = keep
+    if RELEASE_HOLD_ENABLE and ts - tried >= NEWS_EVERY_SECS:
+        tried = ts
+        try:
+            items = (get_news or fetch_news)()
+        except Exception as e:
+            _log(f"! news read failed ({type(e).__name__}: {str(e)[:80]}); no new release holds")
+            items = []
+        for it in sorted(items, key=lambda x: x["ts"]):
+            if not (ts - NEWS_MAX_AGE_H * 3600 <= it["ts"] <= ts + 600):
+                continue
+            key = match_release(it.get("source", ""), it.get("title", ""))
+            if key is None or any(h["key"] == key for h in holds) \
+                    or entered(key, it["ts"] - ENTERED_RECENT_H * 3600) \
+                    or any(x["key"] == key and x["published"] >= it["ts"] - REHOLD_GAP_H * 3600
+                           for x in hlog):
+                continue
+            h = {"key": key, "published": it["ts"],
+                 "published_at": _iso(datetime.fromtimestamp(it["ts"], timezone.utc)),
+                 "seen_at": _iso(now), "source": it.get("source", ""),
+                 "title": it.get("title", "")[:200], "link": it.get("link", "")[:400]}
+            holds.append(h)
+            _log(f"release hold ON: {key} poll out, not in RCP's table yet -- "
+                 f"\"{h['title'][:100]}\" ({h['source']}, {h['published_at']}); "
+                 f"{', '.join(HOLD_SERIES)} stands aside until RCP enters it "
+                 f"(at most {HOLD_MAX_H:g} h)")
+    cut = ts - 7 * 86400
+    return holds, [x for x in hlog if x["published"] >= cut][-50:], tried
+
+
 def write_fair_file(path: str, now: Optional[datetime] = None,
                     get_json: Optional[Callable] = None,
                     get_text: Optional[Callable] = None,
-                    markets: Optional[Dict[str, dict]] = None) -> Tuple[int, int]:
+                    markets: Optional[Dict[str, dict]] = None,
+                    get_news: Optional[Callable] = None) -> Tuple[int, int]:
     """One pass: read the RCP feed (conditional, at most every
     RCP_MIN_READ_SECS), Kalshi's open markets (every MARKETS_TTL_SECS; a
     failed read reuses the cache), run the settlement cross-check, price
@@ -612,6 +828,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     ts = now.timestamp()
     old = _read_json(path)
     rcp, history, fault, tried = _read_feed(old, now, get_text)
+    holds, hold_log, news_tried = _release_holds(old, now, rcp, get_news)
+    hold_why = ("release hold: " + "; ".join(
+        f"{h['key']} poll out {h['published_at']}, not in RCP's table yet" for h in holds)
+                if holds else None)
     history = [h for h in history
                if (_parse_iso(h[0]) or now) >= now - timedelta(days=HISTORY_DAYS)][-500:]
 
@@ -701,6 +921,9 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         if why:
             event_fair.setdefault(ev, {"why": why})
             continue
+        if hold_why and m.get("series") in HOLD_SERIES:
+            event_fair.setdefault(ev, {"why": hold_why})
+            continue
         if ev not in pmfs:
             cnt = session_count_pmf(probs, now, rt)
             pmfs[ev] = delta_pmf(cnt)
@@ -720,6 +943,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                "event_fair": event_fair, "fault": fault, "rcp": rcp, "rcp_tried_at": tried,
                "history": history, "settle_reads": settle_reads, "xcheck": xcheck,
                "open_markets": markets, "markets_at": markets_at,
+               "release_holds": holds, "release_log": hold_log, "news_tried_at": news_tried,
                "model": {"jump": {str(k): v for k, v in sorted(JUMP.items())},
                          "rate_weeks": RATE_WEEKS, "slot_prior": SLOT_PRIOR,
                          "bg_per_hour": BG_PER_HOUR}}

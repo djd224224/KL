@@ -106,6 +106,10 @@ class Offline(unittest.TestCase):
         p = mock.patch.object(af.requests, "get", side_effect=AssertionError("network used"))
         p.start()
         self.addCleanup(p.stop)
+        # no headlines unless a test hands some in (get_news)
+        n = mock.patch.object(af, "fetch_news", return_value=[])
+        n.start()
+        self.addCleanup(n.stop)
 
 
 class TestFeed(Offline):
@@ -242,6 +246,39 @@ class TestModel(Offline):
                                places=9)
 
 
+class TestReleaseMatch(unittest.TestCase):
+    """Which headlines announce a sponsor's new national poll (Jack
+    2026-10-26: "Build it", the released-but-not-entered hold)."""
+
+    def test_the_10_19_to_25_headlines(self):
+        m = af.match_release
+        self.assertEqual(m("CNN", "Trump's approval rating hits a new low as midterms enter "
+                                  "final stretch: CNN poll - CNN"), "CNN")
+        self.assertEqual(m("CNBC", "Trump's approval rating on economy hits all-time low as "
+                                   "midterm looms: CNBC survey - CNBC"), "CNBC")
+        self.assertEqual(m("Financial Times", "US voters worried about corruption under "
+                                              "Trump — FT poll - Financial Times"),
+                         "Financial Times")
+        self.assertEqual(m("The New York Times", "Trump Approval Hits New Low Two Weeks "
+                                                 "Before Midterms, Poll Finds"),
+                         "NY Times/Siena")                      # its own poll, own outlet
+        self.assertEqual(m("www.ap.org", "Frustrated with Trump, voters overwhelmingly want "
+                                         "change in Washington, an AP-NORC poll finds"),
+                         "AP/NORC")
+        # not a new national poll
+        self.assertIsNone(m("The Independent", "Trump's tumbling poll numbers leave CNN "
+                                               "data guru stunned"))
+        self.assertIsNone(m("ROI-NJ", "Stockton poll: Most N.J. voters disapprove of "
+                                      "President Trump's job performance"))
+        self.assertIsNone(m("CBS News", "Breaking down new poll showing tight Senate race "
+                                        "in Texas"))
+        self.assertIsNone(m("CBS News", "Polls show Latino voters moving away from "
+                                        "President Trump"))         # plural: others' polls
+        self.assertIsNone(m("Newsweek", "Trump's Approval Rating Hits Record Low in 2 New "
+                                        "Polls Days Before Midterms"))
+        self.assertIsNone(m("Silver Bulletin", "How popular is Donald Trump?"))
+
+
 class TestFile(Offline):
 
     def setUp(self):
@@ -309,6 +346,76 @@ class TestFile(Offline):
         js = self.read()
         self.assertEqual((ok, js["rcp"]["value"]), (9, 40.5))
         self.assertEqual(js["history"][-1], ["2026-10-26T02:06:00Z", 40.5])
+
+    def test_a_released_poll_holds_the_daily_until_rcp_enters_it(self):
+        """The daily stands aside (no fair) while a sponsor's poll is out and
+        not in RCP's table; the weekly stays priced; an RCP entry for that
+        pollster ends the hold."""
+        out_at = NOW - timedelta(hours=1)
+        news = [{"ts": out_at.timestamp(), "source": "CNN", "link": "https://x",
+                 "title": "Trump approval hits a new low: CNN poll - CNN"}]
+        weekly = {f"{WEEKLY}-B38.5": {"event": WEEKLY, "series": "KXAPRPOTUS", "lo": 384,
+                                      "hi": 386, "read_at": "2026-10-30T15:00:00Z",
+                                      "bid": 30.0, "ask": 34.0}}
+        mk = dict(daily_markets(), **weekly)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, miss = af.write_fair_file(self.path, now=NOW, get_text=Getter(text(feed())),
+                                          markets=mk, get_news=lambda: news)
+        js = self.read()
+        self.assertEqual((ok, miss), (1, 1))                     # the weekly only
+        self.assertIn("release hold: CNN", js["event_fair"][DAILY]["why"])
+        self.assertEqual([h["key"] for h in js["release_holds"]], ["CNN"])
+        self.assertIn(f"{WEEKLY}-B38.5", js["markets"])
+        # RCP enters CNN's poll: the hold ends and the daily is priced again
+        cnn = {"id": "170001", "type": "poll", "pollster": "CNN",
+               "data_start_date": "2026/10/22", "data_end_date": "2026/10/24",
+               "updated": cms(NOW + timedelta(minutes=5)),
+               "candidate": [{"name": "Approve", "value": "35"}]}
+        later = NOW + timedelta(minutes=10)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, _ = af.write_fair_file(self.path, now=later,
+                                       get_text=Getter(text(feed(now=later, extra=[cnn]),
+                                                            etag='W/"cnn"')),
+                                       markets=mk, get_news=lambda: news)
+        js = self.read()
+        self.assertEqual(ok, 10)
+        self.assertEqual(js["release_holds"], [])
+        self.assertEqual(js["release_log"][-1]["how"], "entered")
+        # the same headline seen again does not hold twice
+        with contextlib.redirect_stdout(io.StringIO()):
+            af.write_fair_file(self.path, now=later + timedelta(minutes=6),
+                               get_text=Getter(None), markets=mk, get_news=lambda: news)
+        self.assertEqual(self.read()["release_holds"], [])
+
+    def test_a_hold_ends_after_hold_max_and_old_news_is_skipped(self):
+        news = [{"ts": (NOW - timedelta(minutes=30)).timestamp(), "source": "CNBC",
+                 "link": "", "title": "Trump's approval slips: CNBC survey - CNBC"}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.write(Getter(text(feed())))                     # no news yet (Offline)
+            af.write_fair_file(self.path, now=NOW + timedelta(minutes=6), get_text=Getter(None),
+                               markets=daily_markets(), get_news=lambda: news)
+        self.assertEqual([h["key"] for h in self.read()["release_holds"]], ["CNBC"])
+        end = NOW + timedelta(hours=af.HOLD_MAX_H, minutes=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            af.write_fair_file(self.path, now=end, get_text=Getter(text(feed(now=end))),
+                               markets=daily_markets(read_at="2026-10-27T17:00:00Z"),
+                               get_news=lambda: news)
+        js = self.read()
+        self.assertEqual((js["release_holds"], js["release_log"][-1]["how"]), ([], "max"))
+
+    def test_coverage_of_an_entered_poll_does_not_hold(self):
+        # RCP entered CNN 10 h before the headline: the article is about it
+        cnn = {"id": "170001", "type": "poll", "pollster": "CNN",
+               "data_start_date": "2026/10/22", "data_end_date": "2026/10/24",
+               "updated": cms(NOW - timedelta(hours=11)),
+               "candidate": [{"name": "Approve", "value": "35"}]}
+        news = [{"ts": (NOW - timedelta(hours=1)).timestamp(), "source": "CNN", "link": "",
+                 "title": "What the new CNN poll says about Trump - CNN"}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, _ = af.write_fair_file(self.path, now=NOW,
+                                       get_text=Getter(text(feed(extra=[cnn]))),
+                                       markets=daily_markets(), get_news=lambda: news)
+        self.assertEqual((ok, self.read()["release_holds"]), (9, []))
 
     def test_a_past_read_time_is_not_priced(self):
         mk = daily_markets(read_at="2026-10-25T17:00:00Z", event="KXTRUMPAPPROVE-26OCT25")
