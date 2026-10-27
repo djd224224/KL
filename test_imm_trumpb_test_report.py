@@ -52,6 +52,21 @@ class TrumpBReportTests(unittest.TestCase):
         self.assertEqual(r.windows(D, self.TODAY),
                          (["2026-10-19", "2026-10-20"], ["2026-10-23", "2026-10-24"]))
 
+    def test_the_test_ends_when_both_series_are_sized_alike(self):
+        # Jack 2026-10-27: the main series' bids halved ("do 1 and 3"), B's
+        # asks back to 1x ("Trump mentions B -- 1x asks instead of 1.5")
+        D = dash()
+        for d in ("2026-10-26", "2026-10-27", "2026-10-28", "2026-11-04"):
+            D["days"][d] = {"m": {}}
+        self.assertEqual(r.END_DAY, "2026-10-27")
+        self.assertEqual(r.windows(D, "2026-11-05")[1],
+                         ["2026-10-23", "2026-10-24", "2026-10-26"])
+        # a fill on or after END_DAY is no test fill
+        D["fills"].append({"ts": ts("2026-10-28"), "t": f"{B}-26OCT27-W", "side": "ask",
+                           "n": 1000, "mtc": -90.0})
+        by = r.summarize(D, "2026-11-05")["by"]
+        self.assertEqual(by[B]["test"]["ask_ct"], 2 * 3 * 40)            # the fixture's two days
+
     def test_keep(self):
         # B's quoting net 0 -> +10 a day, the main series flat; asks +5c
         v, why = r.verdict(r.summarize(dash(), self.TODAY)["by"])

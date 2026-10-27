@@ -2,12 +2,15 @@
 """The Trump mentions B test report (Jack 2026-10-22: "Half bids, 1.5x asks
 on B. Keep main series same. Give me an email report once this test runs").
 
-KXTRUMPMENTIONB quotes bids at half size and asks at 1.5x since the bot's
+KXTRUMPMENTIONB quoted bids at half size and asks at 1.5x from the bot's
 SIDE_MULT_SERIES deploy on 10/22 (ceb14fa); KXTRUMPMENTION, the control,
 kept its sizes. The report reads the IMM dashboard's data object (its `const
 D`: the IMM's own per-market day rows and its fills with mark-outs, 31 days
 back) and compares each series' full ET days before the switch (to 10/21)
-with the test's (from 10/23; 10/22 was the switch day):
+with the test's (10/23 to 10/26; 10/22 was the switch day). The test ends
+10/26: from 10/27 both series quote half-size bids and 1x asks (Jack
+2026-10-27: "do 1 and 3" -- halving the main series' bids -- then "Trump
+mentions B -- 1x asks instead of 1.5"), so there is no control after it:
 
   quoting net a day = rewards (modelled) + the day's own fills; carry (the
   positions already held, re-marked or settled) is shown apart.
@@ -20,6 +23,8 @@ Verdict, set before the test ran (the change against the control, both a day):
   STOP   B fell behind the main series and its asks lost: back to 1x / 1x
          (IMM_SIDE_MULT_SERIES= and a restart).
   WATCH  anything else, or too few B fills or events to call.
+Since 10/27 the verdict only scores the 10/23-10/26 test: the sizes it would
+act on are already gone (both series at half bids, 1x asks).
 
 Writes run-logs/incentive-mm/trumpb_test_report_<ET date>.md and prints its
 path. Read-only: no Kalshi call, nothing in the bot touched.
@@ -36,6 +41,7 @@ DASH = r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm\dashboard\imm_dashboa
 OUT_DIR = r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm"
 SERIES = ("KXTRUMPMENTIONB", "KXTRUMPMENTION")     # the test, the control
 SWITCH_DAY = "2026-10-22"                           # ET day of the deploy: left out
+END_DAY = "2026-10-27"            # both series sized alike from this ET day: it and after left out
 MIN_FILL_CT = 100        # fewer B contracts on a side in the test: too few to call
 MIN_EVENTS = 3           # fewer B events with test fills: too few to call
 ET = timezone(timedelta(hours=-4))
@@ -57,9 +63,10 @@ def et_day(ts: float) -> str:
 
 def windows(D: dict, today: str):
     """(before days, test days): full ET days in the dashboard, the switch
-    day and today (not over) left out."""
+    day, END_DAY on and today (not over) left out."""
     days = sorted(d for d in (D.get("days") or {}) if d < today)
-    return ([d for d in days if d < SWITCH_DAY], [d for d in days if d > SWITCH_DAY])
+    return ([d for d in days if d < SWITCH_DAY],
+            [d for d in days if SWITCH_DAY < d < END_DAY])
 
 
 def summarize(D: dict, today: str) -> dict:
@@ -139,10 +146,13 @@ def report(D: dict, today: str) -> str:
     rng = lambda ds: f"{md_(ds[0])} to {md_(ds[-1])} ({len(ds)} days)" if ds else "none"
     lines = [f"# Trump mentions B test: {v}", "",
              f"**{v}**: {why}.", "",
-             "KXTRUMPMENTIONB quotes bids at half size and asks at 1.5x since 10/22 "
+             "KXTRUMPMENTIONB quoted bids at half size and asks at 1.5x from 10/22 "
              "(Jack: \"Half bids, 1.5x asks on B. Keep main series same\"); "
-             "KXTRUMPMENTION kept its sizes and is the control.", "",
-             f"Before {rng(before)}; test {rng(test)}; 10/22, the switch day, is left out.", "",
+             "KXTRUMPMENTION kept its sizes and was the control.", "",
+             f"Before {rng(before)}; test {rng(test)}; 10/22, the switch day, is left out. "
+             "The test ends 10/26: from 10/27 both series quote half-size bids and 1x asks "
+             "(Jack: \"Trump mentions B -- 1x asks instead of 1.5\"), so the main series "
+             "is no control after it.", "",
              "| $ a day | B before | B test | main before | main test |",
              "|---|---|---|---|---|"]
     rows = (("rewards", "rew"), ("own fills", "own"), ("carry", "carry"))
@@ -168,8 +178,10 @@ def report(D: dict, today: str) -> str:
               "Rewards are the IMM's model (its dashboard), fills its own, each scored to "
               "settlement or, for an event still open, to its mark now. KEEP needs B's "
               "quoting net to beat the main series' change and B's asks to stay "
-              "profitable; STOP is both failing; anything else is WATCH. To revert: "
-              "IMM_SIDE_MULT_SERIES= (empty) and restart_imm.ps1 -Task."]
+              "profitable; STOP is both failing; anything else is WATCH. Both series "
+              "have quoted half-size bids and 1x asks since 10/27 (incentive_mm "
+              "SIDE_MULT_SERIES); IMM_SIDE_MULT_SERIES= (empty) and restart_imm.ps1 -Task "
+              "put both back at 1x / 1x."]
     return "\n".join(lines) + "\n"
 
 

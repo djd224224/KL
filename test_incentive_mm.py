@@ -8365,14 +8365,18 @@ class TestStickyPads(unittest.TestCase):
 
 class TestSeriesSideMults(unittest.TestCase):
     """Jack 2026-10-22, after the Trump mentions post-mortem: "Half bids,
-    1.5x asks on B. Keep main series same."""
+    1.5x asks on B. Keep main series same." -> 2026-10-27: "do 1 and 3"
+    (3: halve the main series' YES bids), then "Trump mentions B -- 1x asks
+    instead of 1.5"."""
 
-    def test_trump_b_only(self):
-        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.5, 1.5))
-        self.assertEqual(imm.series_side_mults("KXTRUMPMENTION"), (1.0, 1.0))
-        now = utc(2026, 10, 23, 15, 0)
-        self.assertEqual(imm.side_size_mults("KXTRUMPMENTIONB-26OCT27-SOCI", now), (0.5, 1.5))
-        self.assertEqual(imm.side_size_mults("KXTRUMPMENTION-26OCT27-SOCI", now), (1.0, 1.0))
+    def test_both_trump_series_half_bids_1x_asks(self):
+        for s in ("KXTRUMPMENTIONB", "KXTRUMPMENTION"):
+            self.assertEqual(imm.series_side_mults(s), (0.5, 1.0), s)
+        now = utc(2026, 10, 28, 15, 0)
+        self.assertEqual(imm.side_size_mults("KXTRUMPMENTIONB-26OCT29-SOCI", now), (0.5, 1.0))
+        self.assertEqual(imm.side_size_mults("KXTRUMPMENTION-26OCT29-SOCI", now), (0.5, 1.0))
+        # no other series sized by side on its own
+        self.assertEqual(set(imm.SIDE_MULT_SERIES), {"KXTRUMPMENTIONB", "KXTRUMPMENTION"})
 
     def test_spec(self):
         self.assertEqual(imm._side_mult_spec("kxa:0.5:1.5, KXB:bad:1, :1:1, KXC:0:2, KXD:1"),
@@ -8424,9 +8428,10 @@ class TestFamilySideLeans(unittest.TestCase):
             self.assertEqual(imm.series_side_mults(s), (0.75, 1.5), s)
         for s in ("KXSUEZWEEKLY", "KXLUV", "KXOPENSOURCESHARE", "KXLULUCC"):
             self.assertEqual(imm.series_side_mults(s), (1.5, 0.75), s)
-        # no lean for the rest; Trump B keeps its own test's sizes
+        # no lean for the rest; Trump B keeps its own sizes (half bids, 1x
+        # asks since 2026-10-27)
         self.assertEqual(imm.series_side_mults("KXHIGHNY"), (1.0, 1.0))
-        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.5, 1.5))
+        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.5, 1.0))
         now = utc(2026, 10, 23, 15, 0)
         self.assertEqual(imm.side_size_mults("KXRT-WILD-90", now), (0.75, 1.5))
         self.assertEqual(imm.side_size_mults("KXSUEZWEEKLY-26OCT25-T40", now), (1.5, 0.75))
@@ -32178,6 +32183,29 @@ class TestSizeSplitTest(unittest.TestCase):
             imm._size_test_stop["checked"] = 0.0
             self.assertEqual(imm.applied_mention_mult(t), 1.0)          # stopped: back at 1x
 
+    def test_the_temperature_families_are_out_of_both_halves(self):
+        # Jack 2026-10-27: "do 1 and 3" (1: "take the temperature markets out
+        # of the size test"): their hand-set x5 ran x7.5 in the test half
+        test_half = ("KXHIGHTDC", "KXHIGHTHOU", "KXHIGHAUS", "KXLOWTLV", "KXLOWTSEA")
+        with mock.patch.object(imm, "SIZE_TEST_EXCLUDE_PREFIXES", ()):
+            self.assertEqual({imm.size_test_arm(s) for s in test_half}, {"test"})
+        for s in test_half + ("KXHIGHTSATX", "KXLOWTMIA", "KXHIGHZZZ", "KXLOWTZZZ"):
+            self.assertIsNone(imm.size_test_arm(s), s)
+        self.assertEqual(imm.SIZE_TEST_EXCLUDE_PREFIXES, ("KXHIGH", "KXLOWT"))
+        self.assertIn("SIZE_TEST_EXCLUDE_PREFIXES", imm._CONFIG_CODE_KNOBS)
+        saved = imm.SERIES_OVERRIDES.pop("KXLOWTLV", None)
+        try:
+            with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": True}), \
+                    mock.patch.object(imm.time, "time", return_value=self._ts(2026, 10, 28, 12)):
+                imm.ensure_family_override("KXLOWTLV")
+                self.assertEqual(imm.applied_mention_mult("KXLOWTLV"), imm.LOWT_SIZE_MULT)
+                self.assertEqual(imm.series_max_position("KXLOWTLV"),
+                                 imm.MAX_POSITION_CONTRACTS * imm.LOWT_SIZE_MULT)
+        finally:
+            imm.SERIES_OVERRIDES.pop("KXLOWTLV", None)
+            if saved is not None:
+                imm.SERIES_OVERRIDES["KXLOWTLV"] = saved
+
 
 class TestGenMovX3(unittest.TestCase):
     """The margin-of-victory races at x3 in place of the election family x2
@@ -32321,7 +32349,8 @@ class TestLowTempFamily(unittest.TestCase):
                                  (5.0, 3, 97), s)
                 self.assertEqual(imm.member_price_band(s, False), (3, 97))
                 self.assertEqual(imm.member_price_band(s, True), (3, 97))
-                self.assertEqual(imm.applied_mention_mult(s), 5.0 * imm.size_test_mult(s))
+                self.assertIsNone(imm.size_test_arm(s))                 # out of the size test
+                self.assertEqual(imm.applied_mention_mult(s), 5.0)
             # the low bot running again: no family, no clone
             with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
                 imm.ensure_family_override("KXLOWTSEA")
@@ -32438,8 +32467,8 @@ class TestHighTempFamily(unittest.TestCase):
             self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
                              (5.0, 3, 97))
             self.assertEqual(imm.member_price_band("KXHIGHTATL", False), (3, 97))
-            self.assertEqual(imm.applied_mention_mult("KXHIGHTATL"),
-                             5.0 * imm.size_test_mult("KXHIGHTATL"))
+            self.assertIsNone(imm.size_test_arm("KXHIGHTATL"))          # out of the size test
+            self.assertEqual(imm.applied_mention_mult("KXHIGHTATL"), 5.0)
         finally:
             imm.SERIES_OVERRIDES.pop("KXHIGHTATL", None)
             if saved is not None:

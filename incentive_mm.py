@@ -2248,7 +2248,13 @@ def mention_size_mult(series: str) -> float:
 # half would have made x9 -- Jack 2026-10-25: "Take it out"; KXAPRPOTUS,
 # resized x3 -> x5 by hand the day before the start, see APRPOTUS_SIZE_MULT;
 # KXRT and the Vercel family, x2 -> x3 on its first day, added where their
-# sizes are set).
+# sizes are set) and every series under SIZE_TEST_EXCLUDE_PREFIXES: the
+# temperature families (KXHIGH*, KXLOWT*), sized x5 by hand on 10/24, two
+# days before the start. Their override carries only size_mult, so the test
+# half -- 20 of the 48 cities -- ran x7.5; and with no pre-test baseline
+# (they started 10/23) their settlement swings, about +-$300 a day, were only
+# noise in the score (Jack 2026-10-27: "do 1 and 3", 1 = "take the
+# temperature markets out of the size test").
 # imm_size_test_report (IMM
 # family watch pass 7) scores it daily and writes SIZE_TEST_STOP_FILE (in
 # STATUS_DIR) when its stop rule trips; the file ends the test by hand too,
@@ -2262,6 +2268,9 @@ SIZE_TEST_EXCLUDE = frozenset(
         "IMM_SIZE_TEST_EXCLUDE",
         "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN,KXAPRPOTUS"
     ).split(",") if s.strip())
+SIZE_TEST_EXCLUDE_PREFIXES = tuple(
+    p.strip() for p in os.environ.get(
+        "IMM_SIZE_TEST_EXCLUDE_PREFIXES", "KXHIGH,KXLOWT").split(",") if p.strip())
 SIZE_TEST_STOP_FILE = "size_test_stop.txt"                     # in STATUS_DIR
 _size_test_stop = {"checked": 0.0, "stopped": False}
 _size_test_cache: Dict[Any, Any] = {}           # the window per knobs, a parity per series
@@ -2284,7 +2293,8 @@ def size_test_arm(series: str) -> Optional[str]:
     """"test" / "control" for a series in the size test, None for one out of
     both halves."""
     ov = SERIES_OVERRIDES.get(series)
-    if series in SIZE_TEST_EXCLUDE or (ov and (ov.levels or ov.max_position is not None)):
+    if (series in SIZE_TEST_EXCLUDE or series.startswith(SIZE_TEST_EXCLUDE_PREFIXES)
+            or (ov and (ov.levels or ov.max_position is not None))):
         return None
     key = (SIZE_TEST_SALT, series)
     if key not in _size_test_cache:
@@ -10514,7 +10524,7 @@ _CONFIG_CODE_KNOBS = (
     "LONGSHOT_MULT", "LONGSHOT_BID_BELOW",       # the event long-shot cut (2026-10-22)
     "LONGSHOT_ASK_FROM", "LONGSHOT_FAMILIES",
     "SIZE_TEST_MULT", "SIZE_TEST_FROM", "SIZE_TEST_DAYS",   # base size split test (2026-10-26)
-    "SIZE_TEST_SALT",
+    "SIZE_TEST_SALT", "SIZE_TEST_EXCLUDE_PREFIXES",
     "EVENT_TOP_N", "EVENT_TOP_N_STICKY", "EVENT_TOP_N_TWO_SIDED",
     "EVENT_TOP_N_LIFETIME", "MENTION_NO_CUTOFF_GATE", "MENTION_NO_CUTOFF_EXEMPT",
     "MENTION_ANNOUNCE_SERIES", "MENTION_ANNOUNCE_FILL_CT",
@@ -14292,6 +14302,15 @@ def quake_ask_renew_due(order: dict, age: float, now_ts: float) -> bool:
 # reward estimate and place_with_caps' side cap all carry it; position and
 # event caps still bind unscaled. imm_trumpb_test_report.py scores the test
 # against the main series (one-shot email, 2026-11-05).
+# Since 2026-10-27 BOTH series rest half-size bids and 1x asks (Jack: "do 1
+# and 3", 3 = "halve the YES bids on the main Trump mentions series", then
+# "Trump mentions B -- 1x asks instead of 1.5"). From the dashboard's fills
+# to settlement: the main series' YES bids lost -$1,665 since 9/27 (-7.0c a
+# contract on 23.8k) and -$764 from 10/22 evening to 10/27 (-10.3c on 7.4k)
+# while its asks made +$67 on 35.3k; B's 1.5x asks lost -6.7c a contract
+# over the same days (-$105 on 1.6k), and B came to -$440 over the 14 days
+# to 10/27 (rewards $558, trading -$998). With the two series sized alike,
+# the B report's test ends 10/26 (its END_DAY).
 def _side_mult_spec(raw: str) -> Dict[str, Tuple[float, float]]:
     out: Dict[str, Tuple[float, float]] = {}
     for part in (raw or "").split(","):
@@ -14306,7 +14325,7 @@ def _side_mult_spec(raw: str) -> Dict[str, Tuple[float, float]]:
 
 
 SIDE_MULT_SERIES = _side_mult_spec(os.environ.get("IMM_SIDE_MULT_SERIES",
-                                                  "KXTRUMPMENTIONB:0.5:1.5"))
+                                                  "KXTRUMPMENTIONB:0.5:1,KXTRUMPMENTION:0.5:1"))
 
 
 # FAMILY SIDE LEANS (Jack 2026-10-22: "Both leans now but 1.5x the winning
@@ -33330,7 +33349,7 @@ class IncentiveMarketMaker:
                 f"market, out by {ERCOT_FAIR_STOP_HOUR_CT:02d}:00 CT on the demand day "
                 f"(the ticker's day before), sooner at ercot_fair's own window")
         if SIDE_MULT_SERIES:
-            log("side sizes by series (2026-10-22): "
+            log("side sizes by series (2026-10-22, both Trump mention series 2026-10-27): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
                             for s, (b, a) in sorted(SIDE_MULT_SERIES.items()))
                 + " -- every other series unchanged; report email 2026-11-05")
@@ -33351,7 +33370,9 @@ class IncentiveMarketMaker:
                 f"'test' half of the series (sha256 '{SIZE_TEST_SALT}'), "
                 f"{datetime.fromtimestamp(_st0, ET):%m-%d %H:%M} to "
                 f"{datetime.fromtimestamp(_st1, ET):%m-%d %H:%M} ET; out of both halves: "
-                f"hand-tuned ladders, {','.join(sorted(SIZE_TEST_EXCLUDE)) or '-'}"
+                f"hand-tuned ladders, "
+                + "".join(f"{p}*, " for p in SIZE_TEST_EXCLUDE_PREFIXES)
+                + f"{','.join(sorted(SIZE_TEST_EXCLUDE)) or '-'}"
                 + ("; STOPPED (" + SIZE_TEST_STOP_FILE + ")" if size_test_stopped() else
                    ("; LIVE now" if _st0 <= time.time() < _st1 else
                     ("; ended" if time.time() >= _st1 else "; waiting to start"))))
