@@ -18,6 +18,13 @@ once an ET day after RUN_HOUR_ET (yesterday is then complete):
 - Emails at day 7 and day 14 (the end) with the verdict set in advance: KEEP
   when the net difference is more than one standard error above zero, STOP
   when more than one below, WATCH between (run longer to tell).
+- SATURDAYS on their own (Jack 2026-10-26, after "Keep 2x for now" on
+  Saturdays: "Add a Saturday split to the size-test report so 10/31 and 11/07
+  show the x3 test half against the x2 control half in dollars"): the test's
+  x1.5 rides on top of the Saturday multiplier, so on the long-dated series
+  (the ones the Saturday mult sizes) the test half runs x3 against the
+  control's x2. saturday_split scores those Saturdays the same way, against
+  the pre-test SATURDAYS' gap, with each half's own dollars beside it.
 
   python imm_size_test_report.py      # print the score so far (no email, no stop file)
 """
@@ -43,9 +50,10 @@ def _day(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def arm_days(D: dict) -> Dict[str, Dict[str, List[float]]]:
+def arm_days(D: dict, member=None) -> Dict[str, Dict[str, List[float]]]:
     """{ET day: {arm: [rewards, trading P&L, series seen]}} over the
-    dashboard's complete days ("ok"), for the two halves."""
+    dashboard's complete days ("ok"), for the two halves -- only the series
+    `member(series)` accepts, when given."""
     F = {k: j for j, k in enumerate(D.get("day_fields") or [])}
     out: Dict[str, Dict[str, List[float]]] = {}
     for d, rec in sorted((D.get("days") or {}).items()):
@@ -54,6 +62,8 @@ def arm_days(D: dict) -> Dict[str, Dict[str, List[float]]]:
         arms = {"test": [0.0, 0.0, set()], "control": [0.0, 0.0, set()]}
         for t, r in (rec.get("m") or {}).items():
             s = t.split("-")[0]
+            if member is not None and not member(s):
+                continue
             a = imm.size_test_arm(s)
             if a in arms:
                 arms[a][0] += r[F["rew"]]
@@ -96,6 +106,79 @@ def score(D: dict, today_et: date) -> Optional[dict]:
         out[a] = {"base": b, "test": p, "series": max(rows[d][a][2] for d in test_days)}
     last = out["net"]["daily"][-STOP_RUN_DAYS:]
     out["stop_avg"] = statistics.mean(last) if len(last) == STOP_RUN_DAYS else None
+    out["sat"] = saturday_split(D, test_days, base_days)
+    return out
+
+
+def saturday_mult(d: str) -> float:
+    """The Saturday multiplier the bot ran on ET date `d`: the gated step-up
+    when the tracker's verdict covers it, else SAT_SIZE_MULT."""
+    return imm.gated_sat_mult(_day(d)) or imm.SAT_SIZE_MULT
+
+
+def saturday_split(D: dict, test_days: List[str], base_days: List[str]) -> Optional[dict]:
+    """The test's Saturdays on the long-dated series only (the Saturday
+    multiplier sizes them, so the test half runs SIZE_TEST_MULT x it): test
+    half minus control half, less the same gap over the pre-test Saturdays,
+    per Saturday for rewards / P&L / net, each half's own dollars, and each
+    half's Saturday change against its pre-test Saturdays. None until a test
+    Saturday is complete (or with no pre-test Saturday)."""
+    sats = [d for d in test_days if _day(d).weekday() == 5]
+    pre = [d for d in base_days if _day(d).weekday() == 5]
+    if not sats or not pre:
+        return None
+    for load in ("load_sat_gate", "load_daily_series_file"):
+        try:
+            getattr(imm, load)()
+        except Exception:
+            pass
+    rows = arm_days(D, member=lambda s: not imm.is_daily_series(s))
+    out = {"saturdays": sats, "base_saturdays": pre,
+           "mults": {d: (saturday_mult(d) * imm.SIZE_TEST_MULT, saturday_mult(d)) for d in sats},
+           "halves": {d: {a: rows[d][a][:2] for a in ("test", "control")} for d in sats},
+           "base_halves": {a: [statistics.mean(rows[d][a][k] for d in pre) for k in (0, 1)]
+                           for a in ("test", "control")}}
+    for name, k in (("rew", 0), ("pnl", 1), ("net", 2)):
+        base = statistics.mean(_gap(rows, pre, k))
+        did = [x - base for x in _gap(rows, sats, k)]
+        out[name] = {"base_gap": base, "daily": did, "total": sum(did)}
+    for a in ("test", "control"):
+        out.setdefault("now_halves", {})[a] = [statistics.mean(rows[d][a][k] for d in sats) for k in (0, 1)]
+    return out
+
+
+def _sat_lift(sp: dict, k: int) -> Optional[float]:
+    """The test half's Saturday change against its pre-test Saturdays,
+    relative to the control half's (the Saturday version of _lift)."""
+    t0, c0 = sp["base_halves"]["test"][k], sp["base_halves"]["control"][k]
+    t1, c1 = sp["now_halves"]["test"][k], sp["now_halves"]["control"][k]
+    try:
+        return (t1 / t0) / (c1 / c0) - 1.0
+    except ZeroDivisionError:
+        return None
+
+
+def saturday_lines(sp: Optional[dict]) -> List[str]:
+    """The email's Saturday section (ASCII), or [] before a test Saturday."""
+    if not sp:
+        return []
+    t_m, c_m = sp["mults"][sp["saturdays"][0]]
+    out = [f"Saturdays, long-dated series (the test half at x{t_m:g} = Saturday x{c_m:g} x {imm.SIZE_TEST_MULT:g}, "
+           f"the control at x{c_m:g}): test minus control, less their gap on the pre-test Saturdays "
+           f"({', '.join(d[5:] for d in sp['base_saturdays'])}):"]
+    for i, d in enumerate(sp["saturdays"]):
+        h = sp["halves"][d]
+        out.append(f"  {d[5:]}  rewards {_usd(sp['rew']['daily'][i])}, fills {_usd(sp['pnl']['daily'][i])}, "
+                   f"net {_usd(sp['net']['daily'][i])}   (test half rewards ${h['test'][0]:,.0f} / fills "
+                   f"{_usd(h['test'][1])}; control ${h['control'][0]:,.0f} / {_usd(h['control'][1])})")
+    lr, lp = _sat_lift(sp, 0), _sat_lift(sp, 1)
+    step = t_m / c_m
+    el = lambda x: f" (elasticity {math.log(1 + x) / math.log(step):.2f})" \
+        if x is not None and x > -1 and step > 1 else ""
+    out.append(f"  Together: net {_usd(sp['net']['total'])}"
+               + (f"; the x{t_m:g} half's Saturday rewards {lr * 100:+.0f}%{el(lr)}, fill P&L "
+                  f"{lp * 100:+.0f}%{el(lp)} against x{c_m:g}" if lr is not None and lp is not None else "")
+               + ". Positive = the extra Saturday size paid.")
     return out
 
 
@@ -158,6 +241,7 @@ def body(sc: dict, kind: str) -> Tuple[str, str]:
         "Day by day, net: " + ", ".join(f"{d[5:]} {_usd(x)}" for d, x in
                                        zip(sc["test_days"], net["daily"])),
         "",
+        *(saturday_lines(sc.get("sat")) + ([""] if sc.get("sat") else [])),
         "Rewards are the dashboard's reward estimate; fills are trading P&L marked to each "
         "day's close. imm_size_test_report.py, IMM family watch pass 7.",
     ]

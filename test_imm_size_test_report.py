@@ -64,6 +64,36 @@ class TestSizeTestReport(unittest.TestCase):
         self.assertIn("rewards +20% (size elasticity 0.45)", text)
         self.assertIsNone(r.score(dashboard(self.days(0)), date(2026, 10, 26)))   # no test day yet
 
+    def test_saturdays_split_out_the_x3_half_in_dollars(self):
+        # Jack 2026-10-26: "Add a Saturday split to the size-test report so
+        # 10/31 and 11/07 show the x3 test half against the x2 control half
+        # in dollars"
+        days = self.days(7)
+        days["2026-10-31"].update({s: (25.0, -9.0) for s in self.test})     # the x3 Saturday
+        with mock.patch.object(imm, "SAT_SIZE_MULT", 2.0):
+            sc = r.score(dashboard(days), date(2026, 11, 2))
+            sp = sc["sat"]
+            self.assertEqual(sp["saturdays"], ["2026-10-31"])
+            self.assertEqual(sp["base_saturdays"], ["2026-10-17", "2026-10-24"])
+            self.assertEqual(sp["mults"]["2026-10-31"], (3.0, 2.0))
+            self.assertAlmostEqual(sp["rew"]["daily"][0], 3 * 15.0)        # 25 vs 10 a series, pre gap 0
+            self.assertAlmostEqual(sp["pnl"]["daily"][0], 3 * -4.0)        # -9 vs -5
+            self.assertAlmostEqual(sp["net"]["total"], 33.0)
+            subject, text = r.body(sc, "WEEK 1")
+            text.encode("cp1252")
+            self.assertIn("Saturdays, long-dated series (the test half at x3 = Saturday x2 x 1.5, "
+                          "the control at x2)", text)
+            self.assertIn("10-31  rewards +$45, fills -$12, net +$33", text)
+            self.assertIn("(test half rewards $75 / fills -$27; control $30 / -$15)", text)
+            self.assertIn("Saturday rewards +150% (elasticity 2.26)", text)
+        # a daily series is not sized by the Saturday mult: out of the split
+        with mock.patch.object(imm, "is_daily_series", lambda s: s in self.test):
+            self.assertEqual(r.score(dashboard(days), date(2026, 11, 2))["sat"]["rew"]["daily"], [0.0])
+        # before a test Saturday: no section
+        sc = r.score(dashboard(self.days(4)), date(2026, 10, 30))
+        self.assertIsNone(sc["sat"])
+        self.assertNotIn("Saturdays, long-dated", r.body(sc, "WEEK 1")[1])
+
     def test_week_one_then_final_emails_once_each(self):
         st = {}
         D = dashboard(self.days(7))
