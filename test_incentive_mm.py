@@ -8210,6 +8210,24 @@ class TestLoveIslandCycle(unittest.TestCase):
         self.assertEqual(asks, [10, 10, 10])       # 5 x 2, past the 1x side cap
         self.assertEqual(rungs({"KXOTHER": (0.4, 2.0)}), (base_bids, base_asks))
 
+    def test_a_side_cut_reaches_the_orders_where_the_event_share_binds(self):
+        # 2026-10-27: on a wide Trump mention event the per-market share of
+        # the event's room set the bids (~39 a word), so halving the ladder
+        # alone left them at their old size; the cut now scales the room too
+        def bids(mults):
+            client, ev = self._client(n_markets=4)
+            with mock.patch.dict(imm.SIDE_MULT_SERIES, mults, clear=True), \
+                    mock.patch.object(imm, "event_cap_contracts", return_value=20.0):
+                bot = IncentiveMarketMaker(client=client, live=False)
+                self._use_resolver(bot)
+                bot.run_cycle()
+            return sum(o["remaining_count"] for o in bot.state.sim_orders.values()
+                       if o["book_side"] == "bid"
+                       and o["yes_price"] not in (imm.PAD_BID_CENTS, imm.PAD_ASK_CENTS))
+        self.assertEqual(bids({}), 20)                                   # the event's room, 5 a market
+        self.assertEqual(bids({"KXLOVEISLMENTION": (0.5, 1.0)}), 10)     # half of it
+        self.assertEqual(bids({"KXLOVEISLMENTION": (1.0, 1.5)}), 20)     # a raise: room unscaled
+
     def test_pad_nets_out_own_pad_live_stable(self):
         """With our 1000 pad already resting inside the book, the desired pad
         stays 1000 (not 0) — no self-referential churn."""
@@ -8377,6 +8395,13 @@ class TestSeriesSideMults(unittest.TestCase):
         self.assertEqual(imm.side_size_mults("KXTRUMPMENTION-26OCT29-SOCI", now), (0.5, 1.0))
         # no other series sized by side on its own
         self.assertEqual(set(imm.SIDE_MULT_SERIES), {"KXTRUMPMENTIONB", "KXTRUMPMENTION"})
+
+    def test_the_cut_scales_the_room_and_a_raise_does_not(self):
+        self.assertEqual(imm.side_cut_room("KXTRUMPMENTION", 40.0, 30.0), (20.0, 30.0))
+        self.assertEqual(imm.side_cut_room("KXTRUMPMENTIONB", -8.0, 30.0), (-4.0, 30.0))
+        self.assertEqual(imm.side_cut_room("KXOTHER", 40.0, 30.0), (40.0, 30.0))
+        with mock.patch.dict(imm.SIDE_MULT_SERIES, {"KXA": (0.5, 1.5)}, clear=True):
+            self.assertEqual(imm.side_cut_room("KXA", 40.0, 30.0), (20.0, 30.0))
 
     def test_spec(self):
         self.assertEqual(imm._side_mult_spec("kxa:0.5:1.5, KXB:bad:1, :1:1, KXC:0:2, KXD:1"),

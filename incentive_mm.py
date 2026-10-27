@@ -14299,8 +14299,11 @@ def quake_ask_renew_due(order: dict, age: float, now_ts: float) -> bool:
 # while its asks made +8.0c (+$551); the main series' bids about paid for
 # themselves (-$1,251 against ~$1,168). "SERIES:bid_mult:ask_mult", comma
 # separated; IMM_SIDE_MULT_SERIES= (empty) turns it off. The ladder, the
-# reward estimate and place_with_caps' side cap all carry it; position and
-# event caps still bind unscaled. imm_trumpb_test_report.py scores the test
+# reward estimate and place_with_caps' side cap all carry it; a raise leaves
+# the position and event caps unscaled, and a cut (under 1) scales the side's
+# position and event room as well (side_cut_room, 2026-10-27: the event share
+# had bound before the ladder, so the main series' first half-bid deploy
+# left its bids at ~38). imm_trumpb_test_report.py scores the test
 # against the main series (one-shot email, 2026-11-05).
 # Since 2026-10-27 BOTH series rest half-size bids and 1x asks (Jack: "do 1
 # and 3", 3 = "halve the YES bids on the main Trump mentions series", then
@@ -14326,6 +14329,16 @@ def _side_mult_spec(raw: str) -> Dict[str, Tuple[float, float]]:
 
 SIDE_MULT_SERIES = _side_mult_spec(os.environ.get("IMM_SIDE_MULT_SERIES",
                                                   "KXTRUMPMENTIONB:0.5:1,KXTRUMPMENTION:0.5:1"))
+
+
+def side_cut_room(series: str, room_buy: float, room_sell: float) -> Tuple[float, float]:
+    """(buy, sell) room after the series' own side cut: a SIDE_MULT_SERIES
+    multiplier under 1 scales that side's room (a market's position room,
+    an event's room); one at or above 1 leaves it alone -- caps still bind
+    unscaled for a side sized up (the B test's 1.5x asks)."""
+    bm, am = SIDE_MULT_SERIES.get(series, (1.0, 1.0))
+    return (room_buy * bm if bm < 1.0 else room_buy,
+            room_sell * am if am < 1.0 else room_sell)
 
 
 # FAMILY SIDE LEANS (Jack 2026-10-22: "Both leans now but 1.5x the winning
@@ -28413,6 +28426,15 @@ class IncentiveMarketMaker:
             event_net.setdefault(ev, 0.0)
         event_room_buy = {e: event_cap_contracts(e) - n for e, n in event_net.items()}
         event_room_sell = {e: event_cap_contracts(e) + n for e, n in event_net.items()}
+        # A series' own side cut (SIDE_MULT_SERIES under 1) cuts that side's
+        # event room by the same factor, as the quote loop cuts its position
+        # room (side_cut_room): on a wide event the per-market share binds
+        # before the ladder -- ~39 a word on a 35-word KXTRUMPMENTION event,
+        # where the ladder's own cut left the bids at their old size
+        # (2026-10-27, both Trump mention series at half bids).
+        for e in event_room_buy:
+            event_room_buy[e], event_room_sell[e] = side_cut_room(
+                series_of(e), event_room_buy[e], event_room_sell[e])
         # Orders preserved on blind markets never enter `desired`, so charge
         # their resting size against the event budget up front — otherwise
         # sibling markets would hand out the room those orders may consume.
@@ -29744,8 +29766,13 @@ class IncentiveMarketMaker:
             unwind_ask = unwind_ask if lv_ask else 0
             side_max_bid = max(side_max_bid, unwind_bid)
             side_max_ask = max(side_max_ask, unwind_ask)
-            room_buy = min(maxpos - cap_pos, share_buy, side_max_bid)
-            room_sell = min(maxpos + cap_pos, share_sell, side_max_ask)
+            # (a series' own side cut scales the position room too, so the
+            # side rests the cut share of whichever bound binds: the ladder
+            # and the event share carry it already)
+            pos_room_buy, pos_room_sell = side_cut_room(
+                meta.series, maxpos - cap_pos, maxpos + cap_pos)
+            room_buy = min(pos_room_buy, share_buy, side_max_bid)
+            room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
             room_buy = skewed_side_room(room_buy, cap_pos, accumulating=cap_pos > 0,
                                         side_max=side_max_bid,
