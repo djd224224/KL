@@ -515,6 +515,20 @@ class BotColumn(unittest.TestCase):
                         start=datetime(2026, 9, 12, 14, 0, tzinfo=timezone.utc))
         self.assertEqual(np.cutoff_flag(rec, imm.EventStartResolver(), NOW), "")
 
+    def test_an_election_day_program_is_a_stand_down_not_unearnable(self):
+        """Mirror of imm_feed_audit (2026-10-27): the verified voting day is
+        the cutoff -- Israel's, 00:00 Jerusalem = 22:00Z 10/26 -- so a program
+        Kalshi funds on it reads "cutoff passed", never UNEARNABLE."""
+        rec = self._rec(event="KXISRAELTURNOUT-26OCT27",
+                        tickers=("KXISRAELTURNOUT-26OCT27-70",),
+                        start=datetime(2026, 10, 27, 4, 47, tzinfo=timezone.utc))
+        res = imm.EventStartResolver()
+        self.assertEqual(np.cutoff_flag(
+            rec, res, datetime(2026, 10, 27, 10, 46, tzinfo=timezone.utc)),
+            "cutoff passed")
+        self.assertEqual(np.cutoff_flag(
+            rec, res, datetime(2026, 10, 26, 21, 0, tzinfo=timezone.utc)), "")
+
 
 # ---------------------------------------------------------------------------
 # Rendering

@@ -86,6 +86,61 @@ class TestUnearnableIsASeriesVerdict(unittest.TestCase):
         self.assertIn("UNEARNABLE", next(l for l in a["miss_lines"] if l.startswith(ev)))
 
 
+class TestElectionsUseTheVerifiedVotingDay(unittest.TestCase):
+    """Jack 2026-10-27: "Yes, fix the feed audit to use the bot's election
+    cutoff for election-family series" -- Kalshi funded Israel's markets on
+    the voting day, after the bot's 00:00-Jerusalem stand-down, and the
+    audit paged them UNEARNABLE off a midnight-ET ticker date."""
+
+    START = datetime(2026, 10, 27, 4, 47, tzinfo=timezone.utc)
+
+    def _audit(self, progs):
+        with mock.patch.object(imm, "EventStartResolver", _NoResolver):
+            return fa.run_audit(progs=progs)
+
+    def _line(self, a, ev):
+        return next(l for l in a["miss_lines"] if l.startswith(ev + " "))
+
+    def test_a_voting_day_program_is_a_stand_down_not_unearnable(self):
+        # code row: KXISRAELTURNOUT-26OCT27* = 2026-10-27 @Asia/Jerusalem
+        ev = "KXISRAELTURNOUT-26OCT27"
+        a = self._audit({f"{ev}-70": _prog(self.START)})
+        self.assertEqual(a["unearnable"], set())
+        self.assertEqual(self._line(a, ev), f"{ev} (1 mkts, KXISRAELTURNOUT): "
+                                            f"cutoff passed (10-26 22:00Z election day)")
+
+    def test_the_ticker_date_neither_pre_drops_nor_dates_the_event(self):
+        # KXISRKNESSETCOUNT-26AUG28 read PRE-DROPPED + UNEARNABLE and
+        # KXISRAELGOVT-28JAN01 was missing; both rows date the Oct 27 vote
+        rows = list(imm._parse_election_dates(
+            "KXISRAELTURNOUT-26AUG28*=2026-10-27@Asia/Jerusalem,"
+            "KXISRAELTURNOUT-28JAN01*=2026-10-27@Asia/Jerusalem"))
+        with mock.patch.object(imm, "ELECTION_DATES_EXTRA", rows):
+            a = self._audit({"KXISRAELTURNOUT-26AUG28-70": _prog(self.START),
+                             "KXISRAELTURNOUT-28JAN01-70": _prog(self.START)})
+        self.assertEqual(a["unearnable"], set())
+        for ev in ("KXISRAELTURNOUT-26AUG28", "KXISRAELTURNOUT-28JAN01"):
+            self.assertEqual(self._line(a, ev),
+                             f"{ev} (1 mkts, KXISRAELTURNOUT): "
+                             f"cutoff passed (10-26 22:00Z election day)")
+
+    def test_an_undated_election_reads_as_the_fail_closed_stand_down(self):
+        ev = "KXSPAINMOV-27JAN10"           # in the family, no row for it
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(imm, "ELECTION_DATES_EXTRA", []):
+            self.assertIsNone(imm.election_cutoff_utc(ev))
+            a = self._audit({f"{ev}-A": _prog(now - timedelta(hours=1))})
+        self.assertEqual(a["unearnable"], set())
+        self.assertIn("no verified election day", self._line(a, ev))
+
+    def test_a_hand_start_still_pulls_the_cutoff_earlier(self):
+        ev = "KXISRAELTURNOUT-26OCT27"
+        hand = datetime(2026, 10, 26, 18, 0, tzinfo=timezone.utc)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {ev: hand}):
+            a = self._audit({f"{ev}-70": _prog(self.START)})
+        self.assertIn("cutoff passed (10-26 17:50Z election day)", self._line(a, ev))
+
+
 class TestAbsentSkipsBlockedFamilies(unittest.TestCase):
 
     def test_a_blocked_family_losing_its_programs_is_not_a_miss(self):

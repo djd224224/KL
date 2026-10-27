@@ -390,13 +390,23 @@ def cutoff_flag(rec: dict, resolver, now: datetime) -> str:
     event's real cutoff comes from its expiration, not its ticker date. Only
     the midnight-ET FALLBACK cutoff can make a program UNEARNABLE — a
     RESOLVED cutoff that precedes a program period is a deliberate
-    stand-down (the earnings call-time rule), not a miss."""
+    stand-down (the earnings call-time rule), not a miss; so is an election
+    event's verified voting day (2026-10-27)."""
     series = rec["series"]
     override = imm.series_override(series)
     if override is not None and override.cutoff_from_close_min is not None:
         return ""
     if any(series.endswith(suf) for suf in imm.ALLOW_SERIES_SUFFIXES):
         return ""
+    if imm.election_series(series):
+        # no verified row is a config gap the family watch dates, not a dead
+        # pool: no flag
+        cutoff = imm.election_cutoff_utc(rec["event"])
+        hand = imm.EVENT_START_OVERRIDES.get(rec["event"])
+        if cutoff is not None and hand is not None:
+            cutoff = min(cutoff,
+                         hand - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN))
+        return "cutoff passed" if cutoff is not None and cutoff <= now else ""
     try:
         resolved = resolver.resolve(series, rec["event"])
     except Exception:

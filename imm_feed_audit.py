@@ -138,22 +138,40 @@ def run_audit(client=None, progs=None) -> dict:
         # replicate refresh_universe's ticker pre-filter
         mention_family = any(series.endswith(suf)
                              for suf in imm.ALLOW_SERIES_SUFFIXES)
+        # ELECTIONS (Jack 2026-10-27: "Yes, fix the feed audit to use the
+        # bot's election cutoff for election-family series"): the bot dates
+        # the family from its verified ELECTION_DATES row only -- never the
+        # ticker string or the resolver -- and stands it down at the start of
+        # the voting day (apply_series_cutoff_adjustments). On Israel's voting
+        # day Kalshi funded 98 markets from 04:45Z, after the 22:00Z cutoff
+        # (00:00 Jerusalem): read as midnight ET off the ticker date, 17
+        # series paged UNEARNABLE with the IMM_TEMP_SERIES advice, and the
+        # vote's 28JAN01 / 26NOV03 / undated events were missing altogether.
+        election = imm.election_series(series)
         pre_exempt = (series.startswith(imm._EARNINGS_PREFIX)
                       or ev_t in imm.EVENT_START_OVERRIDES
                       or series in imm.SCHEDULE_RESOLVED_SERIES
                       # 2026-08-14 listing-date fix: mention-family tickers
                       # always hydrate; trade_cutoff_utc decides from the
                       # market's expiration (not knowable from the feed here)
-                      or mention_family)
+                      or mention_family
+                      or election)
         td = imm.parse_event_date(t0)
         if not pre_exempt and td is not None and now >= td + timedelta(hours=24):
             status.append("PRE-DROPPED(24h ticker rule)")
-        resolved = res.resolve(series, ev_t)
+        resolved = None if election else res.resolve(series, ev_t)
         # An undated earnings call uses the bot's own fallback (ticker date
         # minus EARNINGS_UNDATED_LEAD_DAYS, 2026-09-27), which needs no
         # expiration -- so the feed alone reproduces it exactly.
         earnings = series.startswith(imm._EARNINGS_PREFIX)
-        if resolved is not None:
+        if election:
+            # no row -> None: the bot stands the event down (fail closed)
+            cutoff = imm.election_cutoff_utc(ev_t)
+            hand = imm.EVENT_START_OVERRIDES.get(ev_t)
+            if cutoff is not None and hand is not None:
+                cutoff = min(cutoff,
+                             hand - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN))
+        elif resolved is not None:
             cutoff = resolved - timedelta(minutes=imm.EVENT_START_BUFFER_MIN)
         elif earnings:
             cutoff = imm.trade_cutoff_utc(ev_t, None, None)
@@ -165,10 +183,19 @@ def run_audit(client=None, progs=None) -> dict:
         # deliberate stand-down (earnings call-time rule), not a miss — and
         # mention-family events keep their softer listing-date message below.
         pstart = imm.parse_iso_utc((progs.get(t0) or {}).get("start_date", ""))
+        if election:
+            # The voting-day stand-down is deliberate (Jack 2026-09-28: "quote
+            # until election day"), so a program after it is never UNEARNABLE.
+            if cutoff is None:
+                status.append("no verified election day -- stood down (fail "
+                              "closed) until a checked row is added")
+            elif cutoff <= now:
+                status.append(f"cutoff passed ({cutoff:%m-%d %H:%MZ} "
+                              f"election day)")
         # Undated earnings events are NOT "unearnable": the overrides task
         # dates them (and its ACTION email lists the ones it cannot), and the
         # close-anchored diagnosis below would send the reader the wrong way.
-        if earnings and resolved is None:
+        elif earnings and resolved is None:
             if cutoff is not None and cutoff <= now:
                 status.append(
                     f"undated earnings call -- stood down {cutoff:%m-%d %H:%MZ} "
