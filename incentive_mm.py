@@ -10076,6 +10076,39 @@ def exchange_pause_code(e) -> str:
     return code if ("paused" in code.lower() or code in EXCH_PAUSE_CODES) else ""
 
 
+# SHARD CASH PAUSE (Jack 2026-10-27: "Yes: when a shard refuses orders for
+# cash, pause placing on that shard for a few minutes instead of retrying every
+# cycle"). Cash is per shard, and Kalshi refuses a create the shard cannot fund:
+# 400 insufficient_balance (cash short of this order) or 404
+# insufficient_shard_balance (none at all). Resting orders reserve nothing, so
+# an order only has to be fundable when it is placed. On 10/27 shard 3 ran down
+# to $36 under the World Series props and the bot sent 22,015 such creates that
+# day, up to 7,164 an hour, each one a write slot the pacer spent. After a cash
+# refusal, a NEW order on that shard costing at least what the refused one did
+# (every new order there after a 404) waits SHARD_CASH_PAUSE_SECS: the
+# placement is skipped and any order it would replace keeps resting. A cheaper
+# one still goes, since the cash may fund it, and one refused lowers the bar.
+# Amends and cancels go as before. The pause runs from its first refusal, so
+# the whole set is retried every SHARD_CASH_PAUSE_SECS; a market of unknown
+# shard pauses alone. IMM_SHARD_CASH_PAUSE_SECS=0 turns it off.
+SHARD_CASH_PAUSE_SECS = max(0.0, _env_float("IMM_SHARD_CASH_PAUSE_SECS", 300.0))
+SHARD_CASH_CODES = ("insufficient_balance", "insufficient_shard_balance")
+
+
+def shard_cash_code(e) -> str:
+    """The code when Kalshi refused a create for cash (SHARD_CASH_CODES),
+    else ''."""
+    code = kalshi_error_code(e)
+    return code if code in SHARD_CASH_CODES else ""
+
+
+def quote_cost_dollars(q) -> float:
+    """What a new order needs in cash: its count at the YES price for a bid,
+    at the NO price (100 - YES) for an ask."""
+    px = q.price_exact if q.price_exact is not None else float(q.price_cents)
+    return float(q.count) * (px if q.book_side == "bid" else 100.0 - px) / 100.0
+
+
 def exchange_status_paused(js) -> Optional[Set[int]]:
     """What GET /exchange/status shows not trading: {-1} for the whole
     exchange (trading_active or exchange_active false overall), else the
@@ -10733,6 +10766,8 @@ _CONFIG_CODE_KNOBS = (
     "BACK_OF_LINE_BUDGET_SECS",
     # rate-limit alert (2026-10-17)
     "RATE_LIMIT_ALERT", "RATE_LIMIT_CHECK_SECS", "RATE_LIMIT_SCAN_DIRS",
+    # shard cash pause: a cash refusal holds that shard's costlier creates (2026-10-27)
+    "SHARD_CASH_PAUSE_SECS",
     # exchange pause: Kalshi's own answers hold the writes (2026-10-22)
     "EXCH_PAUSE_MODE", "EXCH_PAUSE_CODES", "EXCH_PAUSE_POLL_SECS",
     "EXCH_PAUSE_PROBE_SECS", "EXCH_PAUSE_EVENTS", "EXCH_PAUSE_ALERT_MIN",
@@ -20069,6 +20104,10 @@ class IncentiveMarketMaker:
         self._xp_sched_err = ""
         self._xp_stats = {"pauses": 0, "refused": 0, "held": 0, "probes": 0,
                           "polls": 0, "poll_fails": 0, "alerts": 0, "last": None}
+        # SHARD CASH PAUSE (2026-10-27): shard (or ("market", ticker) when its
+        # shard is unknown) -> {until, ceiling $, held, refused, label}
+        self._cash_pause: Dict[object, dict] = {}
+        self._cash_stats = {"pauses": 0, "refused": 0, "held": 0}
         # cross-event breaker (2026-10-17, SWEEP_GROUP): (group, side) -> the
         # last fill that could start a trip; -> the trip's window {"at",
         # "until", "mode"} (dry: the hold `on` would keep, for held_fill
@@ -21727,6 +21766,8 @@ class IncentiveMarketMaker:
             return True
         if self._xp and self._xp_hold(q.ticker, time.time()):
             return False       # its shard is paused (EXCH_PAUSE_MODE): not sent
+        if self._cash_pause and self._cash_waiting(q, time.time()):
+            return False       # its shard just refused one this costly for cash
         try:
             resp = self.client.create_order(
                 ticker=q.ticker, client_order_id=client_order_id,
@@ -21780,6 +21821,7 @@ class IncentiveMarketMaker:
                             error_body=body,
                             http_status=getattr(e, "status", None))
             self._xp_refused(q.ticker, e, "place")   # a trading pause? (EXCH_PAUSE_MODE)
+            self._cash_refused(q, e, time.time())    # short of cash? (SHARD_CASH_PAUSE)
             return False
         except Exception as e:
             # Ambiguous failure (timeout mid-flight): the order MAY be live but
@@ -23384,6 +23426,67 @@ class IncentiveMarketMaker:
                 return False
             p["held"] += 1
             self._xp_stats["held"] += 1
+            return True
+        except Exception:
+            return False
+
+    def _cash_key(self, ticker: str):
+        s = self._ticker_shard.get(ticker)
+        return s if s is not None else ("market", ticker)
+
+    def _cash_waiting(self, q, now_ts: float) -> bool:
+        """SHARD CASH PAUSE: True when the new order `q` waits -- its shard
+        refused one at least this costly for cash less than
+        SHARD_CASH_PAUSE_SECS ago (counted as held). A pause past its time
+        ends here. Never raises."""
+        if not self._cash_pause:
+            return False
+        try:
+            key = self._cash_key(q.ticker)
+            p = self._cash_pause.get(key)
+            if p is None:
+                return False
+            if now_ts >= p["until"]:
+                self._cash_pause.pop(key, None)
+                log(f"{self.tag} shard cash pause over: {p['label']} -- {p['held']} "
+                    f"new order(s) held, {p['refused']} refused; trying again")
+                return False
+            if quote_cost_dollars(q) >= p["ceiling"] - 1e-9:
+                p["held"] += 1
+                self._cash_stats["held"] += 1
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _cash_refused(self, q, e, now_ts: float) -> bool:
+        """SHARD CASH PAUSE: a create Kalshi refused for cash starts its
+        shard's pause, or lowers the bar of the one running. True when it was
+        a cash refusal. Never raises."""
+        if SHARD_CASH_PAUSE_SECS <= 0 or not self.live:
+            return False
+        try:
+            code = shard_cash_code(e)
+            if not code:
+                return False
+            key = self._cash_key(q.ticker)
+            cost = quote_cost_dollars(q)
+            bar = 0.0 if code == "insufficient_shard_balance" else cost
+            self._cash_stats["refused"] += 1
+            p = self._cash_pause.get(key)
+            if p is not None and now_ts < p["until"]:
+                p["refused"] += 1
+                p["ceiling"] = min(p["ceiling"], bar)
+                return True
+            label = (f"shard {key}" if isinstance(key, int)
+                     else f"{q.ticker} (shard unknown)")
+            self._cash_pause[key] = {"until": now_ts + SHARD_CASH_PAUSE_SECS,
+                                     "ceiling": bar, "held": 0, "refused": 1,
+                                     "label": label}
+            self._cash_stats["pauses"] += 1
+            log(f"{self.tag} shard cash pause: {label} refused a ${cost:,.2f} "
+                f"{q.book_side} on {q.ticker} ({code}); new orders there costing "
+                f"${bar:,.2f}+ wait {SHARD_CASH_PAUSE_SECS / 60:g} min")
             return True
         except Exception:
             return False
@@ -30695,6 +30798,14 @@ class IncentiveMarketMaker:
                 if old_x is not None and old_x in by_id:
                     total_resting += _count(by_id[old_x], 1)
                 continue
+            if self._cash_pause and self._cash_waiting(q, time.time()):
+                # SHARD CASH PAUSE (2026-10-27): the shard just refused an order
+                # this costly for cash -- the placement and any swap it carries
+                # wait, and the order it would replace keeps resting
+                old_c = replaces.get(i)
+                if old_c is not None and old_c in by_id:
+                    total_resting += _count(by_id[old_c], 1)
+                continue
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
                     f"{len(to_place) - i} deferred to next cycle")
@@ -33074,6 +33185,13 @@ class IncentiveMarketMaker:
                f"outside Kalshi's published schedule or {EXCH_PAUSE_OVERRUN_MIN:g}m "
                f"past its reopening" if EXCH_PAUSE_MODE == "on"
                else " -- every write sent as before"))
+        log("shard cash pause (2026-10-27): "
+            + (f"on -- a create a shard refuses for cash (insufficient_balance / "
+               f"insufficient_shard_balance) holds that shard's new orders "
+               f"costing as much or more (all of them after a 404) for "
+               f"{SHARD_CASH_PAUSE_SECS / 60:g} min, cheaper ones still sent; "
+               f"amends and cancels as before" if SHARD_CASH_PAUSE_SECS > 0
+               else "off -- every create sent as before"))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "

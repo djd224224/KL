@@ -31079,6 +31079,95 @@ class _PauseClient(FakeClient):
         return super().get(path, params)
 
 
+def _cash_error(code="insufficient_balance", status=400):
+    e = HttpError("Bad Request", status)
+    e.body = '{"error":{"code":"%s","message":"insufficient balance"}}' % code
+    return e
+
+
+class TestShardCashPause(unittest.TestCase):
+    """Jack 2026-10-27: "Yes: when a shard refuses orders for cash, pause
+    placing on that shard for a few minutes instead of retrying every cycle"
+    -- shard 3 refused 22,015 creates that day, up to 7,164 an hour."""
+
+    A, B = "KXMLBSERIESHR-99DEC31-A-1", "KXMLBSERIESHR-99DEC31-B-1"
+    C, U = "KXGOOD-99DEC31-A", "KXODD-99DEC31-X"
+
+    def setUp(self):
+        _clean_persist()
+        self.client = _PauseClient()
+        self.bot = IncentiveMarketMaker(client=self.client, live=True)
+        for t, s in ((self.A, 3), (self.B, 3), (self.C, 0)):
+            self.bot._note_shard(t, s)
+
+    def _place(self, t, side="ask", px=14, n=405):
+        return self.bot.place_order(imm.Quote(t, side, px, n), time.time())
+
+    def _sent(self):
+        return len(self.client.sent)
+
+    def test_the_codes_and_the_cost(self):
+        self.assertEqual(imm.shard_cash_code(_cash_error()), "insufficient_balance")
+        self.assertEqual(imm.shard_cash_code(_cash_error("insufficient_shard_balance", 404)),
+                         "insufficient_shard_balance")
+        self.assertEqual(imm.shard_cash_code(_paused_error()), "")
+        self.assertEqual(imm.shard_cash_code(HttpError("Bad Request", 400)), "")
+        # an ask at 14c buys NO at 86c: 405 of them need $348.30; a 10-lot bid at 40c, $4
+        self.assertAlmostEqual(imm.quote_cost_dollars(imm.Quote(self.A, "ask", 14, 405)), 348.30)
+        self.assertAlmostEqual(imm.quote_cost_dollars(imm.Quote(self.A, "bid", 40, 10)), 4.0)
+
+    def test_a_cash_refusal_holds_the_shards_costlier_creates(self):
+        self.client.refuse = _cash_error()
+        self.assertFalse(self._place(self.A))                      # sent, refused: $348.30
+        self.assertEqual(self._sent(), 1)
+        self.client.refuse = None
+        self.assertFalse(self._place(self.B))                      # same shard and cost: held
+        self.assertFalse(self._place(self.B, n=500))               # costlier: held
+        self.assertEqual(self._sent(), 1)
+        self.assertTrue(self._place(self.B, "bid", 40, 10))        # $4 may fit: sent
+        self.assertTrue(self._place(self.C))                       # shard 0: sent
+        self.assertEqual(self._sent(), 3)
+        p = self.bot._cash_pause[3]
+        self.assertEqual((p["held"], p["refused"], round(p["ceiling"], 2)), (2, 1, 348.3))
+        # a cheaper refusal lowers the bar
+        self.client.refuse = _cash_error()
+        self.assertFalse(self._place(self.B, "bid", 40, 100))      # $40, refused
+        self.assertEqual(round(self.bot._cash_pause[3]["ceiling"], 2), 40.0)
+        self.client.refuse = None
+        self.assertFalse(self._place(self.B, "bid", 40, 100))      # $40 now held
+        self.assertTrue(self._place(self.B, "bid", 40, 10))        # $4 still goes
+        # SHARD_CASH_PAUSE_SECS on, the whole set is tried again
+        self.bot._cash_pause[3]["until"] = time.time() - 1
+        self.assertTrue(self._place(self.A))
+        self.assertNotIn(3, self.bot._cash_pause)
+
+    def test_an_unfunded_shard_holds_every_create(self):
+        self.client.refuse = _cash_error("insufficient_shard_balance", 404)
+        self.assertFalse(self._place(self.A, "bid", 1, 1))         # one cent, refused
+        self.client.refuse = None
+        n = self._sent()
+        self.assertFalse(self._place(self.B, "bid", 1, 1))         # held
+        self.assertEqual(self._sent(), n)
+
+    def test_a_market_of_unknown_shard_pauses_alone(self):
+        self.client.refuse = _cash_error()
+        self.assertFalse(self._place(self.U))
+        self.client.refuse = None
+        self.assertFalse(self._place(self.U))                      # held
+        self.assertTrue(self._place(self.A))                       # shard 3 untouched
+        self.assertIn(("market", self.U), self.bot._cash_pause)
+
+    def test_other_refusals_and_the_knob_leave_it_off(self):
+        self.client.refuse = _paused_error("market_closed", 400)
+        self._place(self.A)
+        self.assertEqual(self.bot._cash_pause, {})
+        with mock.patch.object(imm, "SHARD_CASH_PAUSE_SECS", 0.0):
+            self.client.refuse = _cash_error()
+            self._place(self.A)
+            self.assertEqual(self.bot._cash_pause, {})
+        self.assertIn("SHARD_CASH_PAUSE_SECS", imm._CONFIG_CODE_KNOBS)
+
+
 class TestExchangePause(unittest.TestCase):
     """Jack 2026-10-22: "Yes. But be careful in case and consider if the
     maintenance pause ever changes" -- the pause-aware watchdog. Kalshi's
