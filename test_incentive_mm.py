@@ -32742,5 +32742,240 @@ class TestOpportunisticAsTestGas(unittest.TestCase):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
 
+class TestOpportunisticAsTestBillboardVoteHub(unittest.TestCase):
+    """Jack 2026-10-27: "build billboard and votehub" -- the AS test's second
+    and third families, KXBBSINGLE and KXVHGCB, on the gas family's stops with
+    a stop file and budgets each. Fixture events far from any cutoff: the
+    Billboard chart dated 2068-12-05 (its tracking week ends 2068-11-27), the
+    VoteHub read of 2068-12-05."""
+
+    BB = "KXBBSINGLE-68DEC05ALL-1T2"
+    BB_EV = "KXBBSINGLE-68DEC05ALL"
+    VH = "KXVHGCB-68DEC05-E8.4"
+    VH_EV = "KXVHGCB-68DEC05"
+    GAS = f"KXAAAGASD{imm.ASTEST_GAS_STATES[0]}-68DEC05-3.7000"
+
+    def setUp(self):
+        _clean_persist()
+        for p in (mock.patch.dict(imm._astest_stop, {"checked": 0.0, "stopped": False}),
+                  mock.patch.dict(imm._astest_family_stop["BB"], {"checked": 0.0, "stopped": False}),
+                  mock.patch.dict(imm._astest_family_stop["VH"], {"checked": 0.0, "stopped": False}),
+                  mock.patch.object(imm, "ALLOWLIST_ONLY", True)):
+            p.start()
+            self.addCleanup(p.stop)
+        for f in (imm.ASTEST_STOP_FILE, imm.ASTEST_BB_STOP_FILE, imm.ASTEST_VH_STOP_FILE):
+            stop = os.path.join(imm.STATUS_DIR, f)
+            self.addCleanup(lambda s=stop: os.path.exists(s) and os.remove(s))
+
+    def _stop(self, fname):
+        with open(os.path.join(imm.STATUS_DIR, fname), "w") as fh:
+            fh.write("stop")
+        for st in (imm._astest_stop, imm._astest_family_stop["BB"],
+                   imm._astest_family_stop["VH"]):
+            st["checked"] = 0.0
+
+    def test_admitted_while_live_and_each_family_stops_alone(self):
+        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH"))
+        self.assertEqual(imm.ASTEST_BB_SERIES, {"KXBBSINGLE"})
+        self.assertEqual(imm.ASTEST_VH_SERIES, {"KXVHGCB"})
+        self.assertEqual(imm.astest_family("KXBBSINGLE"), "BB")
+        self.assertEqual(imm.astest_family("KXVHGCB"), "VH")
+        self.assertEqual(imm.astest_family(imm.series_of(self.GAS)), "GAS")
+        for t in (self.BB, self.VH):
+            self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+        # a look-alike stays out
+        for t in ("KXBBSINGLES-68DEC05ALL-1T2", "KXVHGCBX-68DEC05-E8.4",
+                  "KXGENERICBALLOTVOTEHUBX-68DEC05-T8.4"):
+            self.assertIsNone(imm.astest_family(imm.series_of(t)), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        # the gas family's stop file stops gas only
+        self._stop(imm.ASTEST_STOP_FILE)
+        self.assertIsNone(imm.astest_family(imm.series_of(self.GAS)))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.BB))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.VH))
+        # Billboard's stops Billboard only -- its member stays a member
+        self._stop(imm.ASTEST_BB_STOP_FILE)
+        self.assertIsNone(imm.astest_family("KXBBSINGLE"))
+        self.assertEqual(imm.astest_member_family("KXBBSINGLE"), "BB")
+        self.assertFalse(IncentiveMarketMaker._allowed(self.BB))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.VH))
+        self.assertIsNone(imm.pilot_budget_key(self.BB))
+        self._stop(imm.ASTEST_VH_STOP_FILE)
+        self.assertFalse(IncentiveMarketMaker._allowed(self.VH))
+        # the kill switches: all AS test families, or one
+        for f in (imm.ASTEST_BB_STOP_FILE, imm.ASTEST_VH_STOP_FILE):
+            os.remove(os.path.join(imm.STATUS_DIR, f))
+        for st in (imm._astest_family_stop["BB"], imm._astest_family_stop["VH"]):
+            st["checked"] = 0.0
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            self.assertFalse(IncentiveMarketMaker._allowed(self.BB))
+            self.assertFalse(IncentiveMarketMaker._allowed(self.VH))
+            self.assertNotIn(imm.ASTEST_BB_HALT_KEY, imm.pilot_halt_keys())
+        with mock.patch.object(imm, "ASTEST_BB_ENABLE", False):
+            self.assertFalse(IncentiveMarketMaker._allowed(self.BB))
+            self.assertTrue(IncentiveMarketMaker._allowed(self.VH))
+            self.assertNotIn(imm.ASTEST_BB_HALT_KEY, imm.pilot_halt_keys())
+            self.assertIn(imm.ASTEST_VH_HALT_KEY, imm.pilot_halt_keys())
+
+    def test_x3_literal_sizes_at_every_hour_and_out_of_the_size_test(self):
+        # x3 of the gas family's sizes, literal: rungs, caps and burst bar
+        saturday_night = utc(2068, 12, 1, 7, 0)              # Sat 02:00 ET
+        self.assertEqual(saturday_night.astimezone(imm.ET).weekday(), 5)
+        for fam, s, ev in (("BB", "KXBBSINGLE", self.BB_EV), ("VH", "KXVHGCB", self.VH_EV)):
+            self.assertEqual(imm.astest_knob(fam, "SIZE_MULT"), 3.0)
+            self.assertEqual(imm.series_levels(s), imm.scale_levels(imm.LEVELS, 3.0), s)
+            self.assertEqual(imm.series_max_position(s), 150.0, s)
+            self.assertEqual(imm.event_cap_contracts(ev), 450.0, s)
+            self.assertEqual(imm.astest_knob(fam, "BURST_CONTRACTS"), 300.0)
+            self.assertEqual(imm.astest_knob(fam, "DAILY_LOSS"), 100.0)
+            # x1 by the clock: no quiet-hours, evening, Saturday or yield size
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertEqual(imm.hour_size_mult(s, saturday_night), 1.0, s)
+            self.assertFalse(imm.yield_size_eligible(s), s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            self.assertIsNone(imm.size_test_arm(s), s)
+        # at x1 the global ladder itself
+        with mock.patch.object(imm, "ASTEST_BB_SIZE_MULT", 1.0):
+            self.assertIsNone(imm._astest_levels("BB"))
+        # stopped, the family's event cap goes (the hand sizes stay code)
+        self._stop(imm.ASTEST_BB_STOP_FILE)
+        self.assertNotEqual(imm.event_cap_contracts(self.BB_EV), 450.0)
+
+    def test_votehub_quotes_overnight_only_and_leaves_at_5am_on_the_read_day(self):
+        self.assertEqual(imm.ASTEST_VH_WINDOW_ET, ("20:00", "05:00"))
+        ov = imm.SERIES_OVERRIDES["KXVHGCB"]
+        self.assertEqual(ov.blackout_et, ("05:00", "20:00"))
+        self.assertEqual(ov.event_day_cutoff_et, (5, 0))
+        # (EDT: ET = UTC-4)
+        for now, shut in ((utc(2026, 10, 27, 14, 1), True),            # 10:01 ET listing
+                          (utc(2026, 10, 27, 23, 59), True),           # 19:59 ET
+                          (utc(2026, 10, 28, 0, 0), False),            # 20:00 ET
+                          (utc(2026, 10, 28, 8, 59), False),           # 04:59 ET
+                          (utc(2026, 10, 28, 9, 0), True)):            # 05:00 ET
+            self.assertEqual(imm.series_in_blackout("KXVHGCB", now), shut, now)
+        # each event: out at 05:00 ET on its read day (the 17:05 ET read is
+        # Kalshi's occurrence one minute after its close: no earlier candidate)
+        ev = "KXVHGCB-26OCT28"
+        occ, exp = utc(2026, 10, 28, 21, 4), utc(2026, 10, 28, 21, 5)
+        cut = imm.apply_series_cutoff_adjustments(
+            "KXVHGCB", ev, trade_cutoff_utc(ev, occ, exp), occ)
+        self.assertEqual(cut, utc(2026, 10, 28, 9, 0))
+        # Billboard has no window: every hour to its cutoff
+        self.assertFalse(imm.series_in_blackout("KXBBSINGLE", utc(2026, 10, 27, 16, 0)))
+
+    def test_billboard_out_when_the_tracking_week_ends(self):
+        # chart dated Sat Nov 7 2026: tracking week Fri Oct 23 - Thu Oct 29,
+        # out 8 days before the chart date's midnight (05:00Z Nov 7, EST) =
+        # 05:00Z Fri Oct 30 (01:00 EDT -- the DST change adds the hour)
+        self.assertEqual(imm.ASTEST_BB_CUTOFF_DAYS, 8.0)
+        self.assertEqual(imm.SERIES_OVERRIDES["KXBBSINGLE"].cutoff_before_event_min, 8 * 1440)
+        ev = "KXBBSINGLE-26NOV07HOU"
+        close = utc(2026, 11, 2, 15, 0)
+        base = trade_cutoff_utc(ev, None, close)
+        cut = imm.apply_series_cutoff_adjustments("KXBBSINGLE", ev, base, close)
+        self.assertEqual(cut, utc(2026, 10, 30, 5, 0))
+        # a December chart: out Nov 27 -- after its program ends anyway
+        ev2 = "KXBBSINGLE-26DEC05ALL"
+        close2 = utc(2026, 11, 30, 15, 0)
+        cut2 = imm.apply_series_cutoff_adjustments(
+            "KXBBSINGLE", ev2, trade_cutoff_utc(ev2, None, close2), close2)
+        self.assertEqual(cut2, utc(2026, 11, 27, 5, 0))
+
+    def test_family_loss_budgets(self):
+        self.assertEqual(imm.pilot_budget_key(self.BB), imm.ASTEST_BB_HALT_KEY)
+        self.assertEqual(imm.pilot_budget_key(self.VH), imm.ASTEST_VH_HALT_KEY)
+        self.assertEqual(imm.pilot_budget_key(self.GAS), imm.ASTEST_GAS_HALT_KEY)
+        for k in (imm.ASTEST_BB_HALT_KEY, imm.ASTEST_VH_HALT_KEY):
+            self.assertEqual(imm.pilot_halt_limit(k), 100.0)
+            self.assertIn(k, imm.pilot_halt_keys())
+        with mock.patch.object(imm, "ASTEST_VH_DAILY_LOSS", 0.0):
+            self.assertIsNone(imm.pilot_budget_key(self.VH))
+            self.assertNotIn(imm.ASTEST_VH_HALT_KEY, imm.pilot_halt_keys())
+            self.assertEqual(imm.pilot_budget_key(self.BB), imm.ASTEST_BB_HALT_KEY)
+        for k in ("ASTEST_BB_ENABLE", "ASTEST_BB_CUTOFF_DAYS", "ASTEST_BB_SIZE_MULT",
+                  "ASTEST_BB_MAX_POSITION", "ASTEST_BB_DAILY_LOSS", "ASTEST_VH_ENABLE",
+                  "ASTEST_VH_WINDOW_ET", "ASTEST_VH_SIZE_MULT", "ASTEST_VH_MAX_POSITION",
+                  "ASTEST_VH_DAILY_LOSS", "ASTEST_VH_BURST_CONTRACTS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def _bot(self, ticker, event, close):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": ticker, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[ticker] = {
+            "ticker": ticker, "event_ticker": event, "status": "active",
+            "close_time": close.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+            "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[ticker] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    @staticmethod
+    def _quotes(bot, ticker):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == ticker)
+
+    def test_quoted_and_a_fill_pauses_the_event(self):
+        # (inside VoteHub's window: the clock is the test's)
+        for t, ev, close in ((self.BB, self.BB_EV, utc(2068, 11, 30, 15, 0)),
+                             (self.VH, self.VH_EV, utc(2068, 12, 5, 22, 4))):
+            p = mock.patch.object(imm, "series_in_blackout", lambda s, n: False)
+            p.start()
+            self.addCleanup(p.stop)
+            bot = self._bot(t, ev, close)
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot, t), [], t)
+            now = time.time()
+            bot._sweep_note_fill({"order_id": "o-ws", "market_ticker": t,
+                                  "count_fp": "3.00", "ts_ms": int(now * 1000),
+                                  "is_taker": False}, now)
+            self.assertAlmostEqual(bot.state.astest_fill_pause_until[ev], now + 900, delta=1)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot, t), [], t)
+            self.assertEqual(bot._guard_now[t]["guard"], "astest_fill_pause")
+            bot.state.astest_fill_pause_until[ev] = now - 1
+            bot.run_cycle()
+            self.assertNotEqual(self._quotes(bot, t), [], t)
+
+    def test_burst_breakers_count_each_family_alone(self):
+        bot = self._bot(self.BB, self.BB_EV, utc(2068, 11, 30, 15, 0))
+        now = time.time()
+        pauses = bot.state.astest_fill_pause_until
+        other_bb = "KXBBSINGLE-68DEC12ALL-1T2"
+        bar = imm.ASTEST_BB_BURST_CONTRACTS
+        with mock.patch.object(bot.alerter, "alert") as al:
+            # just under each bar on gas and VoteHub: neither family trips,
+            # and neither counts toward Billboard's
+            bot._astest_fill_pause_note(self.GAS, now, "fill",
+                                        count=imm.ASTEST_GAS_BURST_CONTRACTS - 1)
+            bot._astest_fill_pause_note(self.VH, now, "fill",
+                                        count=imm.ASTEST_VH_BURST_CONTRACTS - 1)
+            bot._astest_fill_pause_note(self.BB, now, "fill", count=bar - 40)
+            for k in ("*GAS", "*VH", "*BB"):
+                self.assertNotIn(k, pauses)
+            al.assert_not_called()
+            # another Billboard event takes Billboard to its bar
+            bot._astest_fill_pause_note(other_bb, now, "fill", count=40)
+            self.assertAlmostEqual(pauses["*BB"], now + 1800, delta=2)
+            self.assertNotIn("*GAS", pauses)
+            self.assertNotIn("*VH", pauses)
+            al.assert_called_once()
+            self.assertEqual(al.call_args[0][0], "astest_burst")
+            self.assertEqual(al.call_args[1]["key"], "astest_burst:BB")
+            self.assertIn("Billboard", al.call_args[0][1])
+        # every Billboard event stands aside, this one included
+        pauses.pop(self.BB_EV, None)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot, self.BB), [])
+        self.assertEqual(bot._guard_now[self.BB]["guard"], "astest_fill_pause")
+        self.assertTrue(bot._guard_now[self.BB]["inputs"]["family"])
+
+
 if __name__ == "__main__":
     unittest.main()

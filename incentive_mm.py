@@ -1799,6 +1799,10 @@ def is_daily_series(series: str) -> bool:
     _rss = globals().get("resort_snow_series")
     if _rss is not None and _rss(series):
         return True
+    # ... and the AS test's Billboard and VoteHub families (2026-10-27)
+    _asn = globals().get("astest_new_series")
+    if _asn is not None and _asn(series):
+        return True
     return series in DAILY_SERIES_DYNAMIC
 
 
@@ -2822,9 +2826,11 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the YouTube #2 pilot (2026-10-05): YT2_EVENT_CAP net per event
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return globals()["YT2_EVENT_CAP"]
-    # the opportunistic AS test's gas dailies (2026-10-25)
-    if astest_gas_series(series):
-        return ASTEST_GAS_EVENT_CAP
+    # the opportunistic AS test's families (gas 2026-10-25; Billboard and
+    # VoteHub 2026-10-27)
+    _asf = astest_family(series)
+    if _asf is not None:
+        return astest_knob(_asf, "EVENT_CAP")
     # the YouTube #1 leader-bid pilot (2026-10-14): YT1_EVENT_CAP net per event
     if series == globals().get("YT1_SERIES") and globals().get("YT1_ENABLE"):
         return globals()["YT1_EVENT_CAP"]
@@ -9166,6 +9172,180 @@ def astest_blackout(window: Tuple[str, str]) -> Tuple[str, str]:
     return ("00:00" if end == "24:00" else end, start)
 
 
+# ---- FAMILIES 2 AND 3: BILLBOARD AND VOTEHUB (Jack 2026-10-27: "build
+# billboard and votehub", after the 10/27 scan of the unquoted paying
+# programs -- the pool per contract traded against makers' P&L per contract
+# on the public tape; session scratchpad astest2/ and bbvh/). Exact series,
+# admitted by _allowed while live. Each family runs the gas family's stops,
+# with its own stop file, loss budget, fill pause and burst breaker, at a
+# literal size ASTEST_<F>_SIZE_MULT (x3) of the gas family's -- at x1 the
+# bot's own estimator put Billboard at $4.66/day (its books rest 15-50k
+# contracts a bucket) and a VoteHub bucket at ~$0.75 a night, under Kalshi's
+# $1 minimum; x3 read $12.41/day and ~$17/night (10/27 21:53Z, est_sized.py)
+# -- and quotes it at every hour of its window (is_daily_series: no
+# quiet-hours, evening, Saturday or yield size, no join-ahead):
+#   the global ladder's rungs x ASTEST_<F>_SIZE_MULT (20 -> 60 live) and a
+#     net cap ASTEST_<F>_MAX_POSITION (50 x 3 = 150) per market -- hand
+#     sizes, so out of both halves of the base-size split test and the skew
+#     knees stay 30/60 -- and ASTEST_<F>_EVENT_CAP (150 x 3 = 450) per event;
+#     a $ASTEST_<F>_DAILY_LOSS (100) family loss halt (budget ASTEST:<F>);
+#     our maker fill stands its event aside ASTEST_<F>_FILL_PAUSE_MIN (15);
+#     ASTEST_<F>_BURST_CONTRACTS (100 x 3 = 300) of our fills inside
+#     ASTEST_<F>_BURST_WINDOW_MIN (15) stand the whole family aside
+#     ASTEST_<F>_BURST_PAUSE_MIN (30), with an email; and the stop file
+#     ASTEST_<F>_STOP_FILE in STATUS_DIR (read once a minute) takes the
+#     family back out -- unselected at the next universe refresh, positions
+#     ride. IMM_ASTEST_ENABLE=0 (all three families) or IMM_ASTEST_<F>_ENABLE=0
+#     is the restart-level kill.
+# BILLBOARD -- KXBBSINGLE-<YYMONDD><SONG>-<lo>T<hi>: where a song ranks on
+#   the Hot 100 chart dated <Saturday YYMONDD>, eleven rank buckets (1-2,
+#   3-4, 5-6, 7-10, 11-15, 16-20, 21-30, 31-40, 41-50, 51-74, 75-100).
+#   Billboard's tracking week runs Friday to Thursday, ending 8 days before
+#   the chart's date; the top 10 lands the Monday after (Kalshi settled the
+#   Oct 31 chart's top-10 songs Mon 10/26 ~15:10 ET), the full chart Tuesday,
+#   and Kalshi closes each event before that Monday. Programs on 10/27: seven
+#   songs, $1,100 an event ($1,320 Thriller) over 10/26 to Sat 10/31 23:59 ET
+#   -- Thriller and Housewife on the Nov 7 chart, All I Want for Christmas Is
+#   You on the five charts Dec 5 to Jan 2. Public tape over the whole lives of
+#   the first two settled events (the Oct 31 chart: Housewife 1-2,
+#   expectations 3-4): makers +$9.1k on 200k contracts -- +12.9c a contract
+#   before the tracking week (39k), +2.5c during it (158k), +1.3c after it
+#   (2.6k: the books sit near 0/100 once the week's streams are public). The
+#   family is OUT from the end of the tracking week (cutoff_before_event_min
+#   ASTEST_BB_CUTOFF_DAYS 8 before the chart date's midnight; Nov 7's events
+#   leave Fri 10/30 01:00 ET -- the DST change adds the hour), when every
+#   input to the chart is in.
+# VOTEHUB -- KXVHGCB-<YYMONDD>-<U|E|A><x.x>: VoteHub's 2026 generic-ballot
+#   margin (D-R, time-weighted) at exactly 5:05 PM ET on the ticker date, nine
+#   0.1-point buckets (below X, X ... X+0.6, above X+0.6); listed 10:01 ET the
+#   day before, closes 17:04 ET; $900 an event (~$100 a bucket) over its ~31h.
+#   The KXTRUMPAPPROVE shape -- a public polling average that steps when a
+#   poll lands -- with no feed to gate on: VoteHub's public API
+#   (api.votehub.com/polls) stops at 10/09 while the margin kept moving.
+#   Public tape over 28 settled events (9/30-10/27, 952k contracts): makers
+#   -$20.2k against ~$25k of pool at today's $900 an event. The day before
+#   the read lost 6.8c a contract (140k; 25-75c trades -15.3c: the polls land
+#   in business hours), the read day 1.3c (811k, mostly at 0-10/90-100c),
+#   06:00-07:00 ET alone 26c -- and 20:00-05:00 ET MADE 1.9c (82k; up on 12
+#   of 28 nights, 10/15's +$1.2k most of it). So the family quotes only
+#   20:00-05:00 ET, ASTEST_VH_WINDOW_ET (blackout_et, every day), and each
+#   event is out at 05:00 ET on its read day (event_day_cutoff_et): one
+#   overnight per event, the one before its read.
+ASTEST_FAMILIES = ("BB", "VH")       # the gas family keeps its own wiring above
+ASTEST_BB_ENABLE = os.environ.get("IMM_ASTEST_BB_ENABLE", "1") == "1"
+ASTEST_BB_SERIES = frozenset(
+    s.strip() for s in os.environ.get("IMM_ASTEST_BB_SERIES", "KXBBSINGLE").split(",")
+    if s.strip())
+ASTEST_BB_STOP_FILE = "astest_bb_stop.txt"                      # in STATUS_DIR
+ASTEST_BB_LABEL = "Billboard"
+ASTEST_BB_CUTOFF_DAYS = _env_float("IMM_ASTEST_BB_CUTOFF_DAYS", 8.0)
+ASTEST_BB_SIZE_MULT = max(0.0, _env_float("IMM_ASTEST_BB_SIZE_MULT", 3.0))
+ASTEST_BB_MAX_POSITION = _env_float("IMM_ASTEST_BB_MAX_POSITION", 50.0 * ASTEST_BB_SIZE_MULT)
+ASTEST_BB_EVENT_CAP = _env_float("IMM_ASTEST_BB_EVENT_CAP", 150.0 * ASTEST_BB_SIZE_MULT)
+ASTEST_BB_DAILY_LOSS = _env_float("IMM_ASTEST_BB_DAILY_LOSS", 100.0)
+ASTEST_BB_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_ASTEST_BB_FILL_PAUSE_MIN", 15.0))
+ASTEST_BB_BURST_CONTRACTS = _env_float("IMM_ASTEST_BB_BURST_CONTRACTS",
+                                       100.0 * ASTEST_BB_SIZE_MULT)
+ASTEST_BB_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_BB_BURST_WINDOW_MIN", 15.0)
+ASTEST_BB_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_BB_BURST_PAUSE_MIN", 30.0)
+ASTEST_BB_HALT_KEY = "ASTEST:BB"
+ASTEST_BB_FAMILY_KEY = "*BB"
+ASTEST_VH_ENABLE = os.environ.get("IMM_ASTEST_VH_ENABLE", "1") == "1"
+ASTEST_VH_SERIES = frozenset(
+    s.strip() for s in os.environ.get("IMM_ASTEST_VH_SERIES", "KXVHGCB").split(",")
+    if s.strip())
+ASTEST_VH_STOP_FILE = "astest_vh_stop.txt"                      # in STATUS_DIR
+ASTEST_VH_LABEL = "VoteHub"
+ASTEST_VH_WINDOW_ET = tuple(os.environ.get(
+    "IMM_ASTEST_VH_WINDOW_ET", "20:00-05:00").split("-"))
+ASTEST_VH_SIZE_MULT = max(0.0, _env_float("IMM_ASTEST_VH_SIZE_MULT", 3.0))
+ASTEST_VH_MAX_POSITION = _env_float("IMM_ASTEST_VH_MAX_POSITION", 50.0 * ASTEST_VH_SIZE_MULT)
+ASTEST_VH_EVENT_CAP = _env_float("IMM_ASTEST_VH_EVENT_CAP", 150.0 * ASTEST_VH_SIZE_MULT)
+ASTEST_VH_DAILY_LOSS = _env_float("IMM_ASTEST_VH_DAILY_LOSS", 100.0)
+ASTEST_VH_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_ASTEST_VH_FILL_PAUSE_MIN", 15.0))
+ASTEST_VH_BURST_CONTRACTS = _env_float("IMM_ASTEST_VH_BURST_CONTRACTS",
+                                       100.0 * ASTEST_VH_SIZE_MULT)
+ASTEST_VH_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_VH_BURST_WINDOW_MIN", 15.0)
+ASTEST_VH_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_VH_BURST_PAUSE_MIN", 30.0)
+ASTEST_VH_HALT_KEY = "ASTEST:VH"
+ASTEST_VH_FAMILY_KEY = "*VH"
+# the startup line's account of each family's window
+ASTEST_WINDOW_NOTE = {
+    "BB": f"out {ASTEST_BB_CUTOFF_DAYS:g} days before the chart date (its tracking week's end)",
+    "VH": (f"{'-'.join(ASTEST_VH_WINDOW_ET)} ET only, out at "
+           f"{ASTEST_VH_WINDOW_ET[1]} ET on the read day")}
+_astest_family_stop: Dict[str, Dict[str, Any]] = {
+    f: {"checked": 0.0, "stopped": False} for f in ASTEST_FAMILIES}
+
+
+def astest_knob(family: str, name: str):
+    """ASTEST_<family>_<name> ("GAS", "BB", "VH"), read at call time so a
+    patched module constant takes effect: astest_knob("BB", "EVENT_CAP")."""
+    return globals()[f"ASTEST_{family}_{name}"]
+
+
+def astest_family_stopped(family: str) -> bool:
+    """A new family's stop file (ASTEST_<F>_STOP_FILE), read at most once a
+    minute; the gas family's is astest_stopped()."""
+    if family == "GAS":
+        return astest_stopped()
+    st = _astest_family_stop[family]
+    now = time.time()
+    if now - st["checked"] >= 60:
+        st["checked"] = now
+        st["stopped"] = os.path.exists(os.path.join(STATUS_DIR, astest_knob(family, "STOP_FILE")))
+    return st["stopped"]
+
+
+def astest_member_family(series: str) -> Optional[str]:
+    """"BB" / "VH" for a series of a new family while it is on -- membership
+    alone, the stop file aside (the gas family: astest_gas_member). On the
+    budget and cap paths for every ticker, so plain lookups."""
+    if not ASTEST_ENABLE:
+        return None
+    if ASTEST_BB_ENABLE and series in ASTEST_BB_SERIES:
+        return "BB"
+    if ASTEST_VH_ENABLE and series in ASTEST_VH_SERIES:
+        return "VH"
+    return None
+
+
+def astest_family(series: str) -> Optional[str]:
+    """The live AS-test family of `series` -- "GAS", "BB" or "VH" -- or None
+    (not a member, the family switched off, or its stop file present)."""
+    if astest_gas_series(series):
+        return "GAS"
+    fam = astest_member_family(series)
+    return fam if fam is not None and not astest_family_stopped(fam) else None
+
+
+def astest_new_series(series: str) -> bool:
+    """A live member of the Billboard or VoteHub family: allowed into the book
+    (_allowed) and quoted x1 at every hour (is_daily_series)."""
+    fam = astest_family(series)
+    return fam is not None and fam != "GAS"
+
+
+def _astest_levels(family: str) -> Optional[List[Tuple[int, int]]]:
+    """The family's literal ladder: the global rungs x ASTEST_<F>_SIZE_MULT
+    (None at x1 -- the global ladder itself)."""
+    m = astest_knob(family, "SIZE_MULT")
+    return None if m == 1.0 else scale_levels(LEVELS, m)
+
+
+SERIES_OVERRIDES.update({
+    s: SeriesOverride(levels=_astest_levels("BB"), max_position=ASTEST_BB_MAX_POSITION,
+                      cutoff_before_event_min=(int(round(ASTEST_BB_CUTOFF_DAYS * 1440))
+                                               if ASTEST_BB_CUTOFF_DAYS > 0 else None))
+    for s in ASTEST_BB_SERIES})
+SERIES_OVERRIDES.update({
+    s: SeriesOverride(levels=_astest_levels("VH"), max_position=ASTEST_VH_MAX_POSITION,
+                      blackout_et=astest_blackout(ASTEST_VH_WINDOW_ET),
+                      event_day_cutoff_et=tuple(
+                          int(x) for x in ASTEST_VH_WINDOW_ET[1].split(":")))
+    for s in ASTEST_VH_SERIES})
+
+
 
 # ---- family guard inheritance (Jack 2026-09-01 "fix this going forward",
 # after Kalshi lit five new state gas dailies + 12 new *APP series overnight
@@ -10640,6 +10820,17 @@ _CONFIG_CODE_KNOBS = (
     "ASTEST_GAS_DAILY_LOSS", "ASTEST_GAS_FILL_PAUSE_MIN", "ASTEST_GAS_EVENT_CAP",
     "ASTEST_GAS_BURST_CONTRACTS", "ASTEST_GAS_BURST_WINDOW_MIN",
     "ASTEST_GAS_BURST_PAUSE_MIN",
+    # ...its Billboard and VoteHub families (2026-10-27)
+    "ASTEST_BB_ENABLE", "ASTEST_BB_SERIES", "ASTEST_BB_CUTOFF_DAYS",
+    "ASTEST_BB_SIZE_MULT",
+    "ASTEST_BB_MAX_POSITION", "ASTEST_BB_EVENT_CAP", "ASTEST_BB_DAILY_LOSS",
+    "ASTEST_BB_FILL_PAUSE_MIN", "ASTEST_BB_BURST_CONTRACTS",
+    "ASTEST_BB_BURST_WINDOW_MIN", "ASTEST_BB_BURST_PAUSE_MIN",
+    "ASTEST_VH_ENABLE", "ASTEST_VH_SERIES", "ASTEST_VH_WINDOW_ET",
+    "ASTEST_VH_SIZE_MULT",
+    "ASTEST_VH_MAX_POSITION", "ASTEST_VH_EVENT_CAP", "ASTEST_VH_DAILY_LOSS",
+    "ASTEST_VH_FILL_PAUSE_MIN", "ASTEST_VH_BURST_CONTRACTS",
+    "ASTEST_VH_BURST_WINDOW_MIN", "ASTEST_VH_BURST_PAUSE_MIN",
     # the three fair refreshers' Kalshi reads signed (2026-09-27)
     "FAIR_SIGNED_READS",
     # USGS earthquake bid-only gate (2026-09-27); usgs_quake_fair's own knobs
@@ -15379,9 +15570,11 @@ def pilot_halt_key(series: str) -> Optional[str]:
         return LOWT_HALT_KEY
     if hight_series(series) and HIGHT_DAILY_LOSS_LIMIT > 0:
         return HIGHT_HALT_KEY
-    # the opportunistic AS test's gas dailies (2026-10-25): one budget
-    if astest_gas_series(series) and ASTEST_GAS_DAILY_LOSS > 0:
-        return ASTEST_GAS_HALT_KEY
+    # the opportunistic AS test's families (gas 2026-10-25; Billboard and
+    # VoteHub 2026-10-27): one budget each
+    _asf = astest_family(series)
+    if _asf is not None and astest_knob(_asf, "DAILY_LOSS") > 0:
+        return astest_knob(_asf, "HALT_KEY")
     return None
 
 
@@ -15423,6 +15616,9 @@ def pilot_halt_limit(key: str) -> float:
         return HIGHT_DAILY_LOSS_LIMIT
     if key == ASTEST_GAS_HALT_KEY:
         return ASTEST_GAS_DAILY_LOSS
+    for _f in ASTEST_FAMILIES:
+        if key == astest_knob(_f, "HALT_KEY"):
+            return astest_knob(_f, "DAILY_LOSS")
     if key.startswith(NFL_AUTO_BUDGET_PREFIX):
         return NFL_AUTO_DAILY_LOSS_LIMIT
     if key.startswith(LEAGUE_AUTO_BUDGET_PREFIX):
@@ -15443,6 +15639,9 @@ def pilot_halt_keys() -> List[str]:
         keys.append(HIGHT_HALT_KEY)
     if ASTEST_ENABLE and ASTEST_GAS_DAILY_LOSS > 0:
         keys.append(ASTEST_GAS_HALT_KEY)
+    for _f in ASTEST_FAMILIES:
+        if ASTEST_ENABLE and astest_knob(_f, "ENABLE") and astest_knob(_f, "DAILY_LOSS") > 0:
+            keys.append(astest_knob(_f, "HALT_KEY"))
     return keys
 
 
@@ -20516,9 +20715,9 @@ class IncentiveMarketMaker:
                 # (YT2_FILL_PAUSE_MIN; the WS fill usually got here first)
                 self._yt2_fill_pause_note(tkr, float(self._fill_ts(f) or now_ts),
                                           "fill")
-            if not f.get("is_taker") and astest_gas_series(series_of(tkr)):
-                # a fill on the AS test's gas family: stand its event aside
-                # (ASTEST_GAS_FILL_PAUSE_MIN; the WS fill usually got here first)
+            if not f.get("is_taker") and astest_family(series_of(tkr)) is not None:
+                # a fill on an AS test family: stand its event aside
+                # (ASTEST_<F>_FILL_PAUSE_MIN; the WS fill usually got here first)
                 self._astest_fill_pause_note(tkr, float(self._fill_ts(f) or now_ts),
                                              "fill", count=count)
             join = self._log_fill(f, tkr, side, action, count, px_cents,
@@ -22838,9 +23037,9 @@ class IncentiveMarketMaker:
                 # a fill on the YouTube #2 pilot: stand its event aside
                 # (YT2_FILL_PAUSE_MIN; the cycle's fill read notes it too)
                 self._yt2_fill_pause_note(t, fts, "WS fill")
-            if maker and astest_gas_series(series_of(t)):
-                # a fill on the AS test's gas family: stand its event aside
-                # (ASTEST_GAS_FILL_PAUSE_MIN; the cycle's fill read notes it too)
+            if maker and astest_family(series_of(t)) is not None:
+                # a fill on an AS test family: stand its event aside
+                # (ASTEST_<F>_FILL_PAUSE_MIN; the cycle's fill read notes it too)
                 self._astest_fill_pause_note(t, fts, "WS fill")
             if SWEEP_BREAKER == "off":
                 return
@@ -24342,53 +24541,60 @@ class IncentiveMarketMaker:
 
     def _astest_fill_pause_note(self, ticker: str, fill_ts: float,
                                 src: str, count: float = 0.0) -> None:
-        """A maker fill of ours on the AS test's gas family (src: 'WS fill' /
-        'fill'): its whole event stays aside until ASTEST_GAS_FILL_PAUSE_MIN
-        after the fill -- a print that moves walks through the half-cent
-        strikes -- and a later fill extends it. The yt2 pause's scheme. A
-        fill older than the pause (a startup reconcile) starts nothing.
-        `count` feeds the family burst breaker (ASTEST_GAS_BURST_CONTRACTS):
-        only the cycle's fill read passes it, so a fill the WS feed saw
-        first is not counted twice. Never raises."""
+        """A maker fill of ours on an AS test family (astest_family: gas,
+        Billboard, VoteHub; src: 'WS fill' / 'fill'): its whole event stays
+        aside until ASTEST_<F>_FILL_PAUSE_MIN after the fill -- a print that
+        moves walks through the strikes -- and a later fill extends it. The
+        yt2 pause's scheme. A fill older than the pause (a startup reconcile)
+        starts nothing. `count` feeds the family's burst breaker
+        (ASTEST_<F>_BURST_CONTRACTS, one tally per family): only the cycle's
+        fill read passes it, so a fill the WS feed saw first is not counted
+        twice. Never raises."""
         try:
-            if not astest_gas_series(series_of(ticker)):
+            fam = astest_family(series_of(ticker))
+            if fam is None:
                 return
+            pause_min = astest_knob(fam, "FILL_PAUSE_MIN")
             now_ts = time.time()
             fts = float(fill_ts or now_ts)
             pauses = self.state.astest_fill_pause_until  # (the WS and trading threads)
             for e_old in [e for e, u in list(pauses.items()) if u < now_ts]:
                 pauses.pop(e_old, None)
-            until = fts + ASTEST_GAS_FILL_PAUSE_MIN * 60
+            until = fts + pause_min * 60
             ev = self._event_of(ticker)
             prev = pauses.get(ev, 0.0)
-            if ASTEST_GAS_FILL_PAUSE_MIN > 0 and until > now_ts and until > prev:
+            if pause_min > 0 and until > now_ts and until > prev:
                 pauses[ev] = until
                 log(f"{self.tag} astest fill pause {ev}: our fill on {ticker} ({src}) "
                     f"-> the event stays aside until "
                     f"{datetime.fromtimestamp(until, timezone.utc):%H:%M:%SZ}"
                     + (" (extended)" if prev > now_ts else ""))
-            if count <= 0 or ASTEST_GAS_BURST_CONTRACTS <= 0:
+            bar = astest_knob(fam, "BURST_CONTRACTS")
+            if count <= 0 or bar <= 0:
                 return
-            burst = getattr(self, "_astest_burst", None)
-            if burst is None:
-                burst = self._astest_burst = []
+            bursts = getattr(self, "_astest_bursts", None)
+            if bursts is None:
+                bursts = self._astest_bursts = {}
+            burst = bursts.setdefault(fam, [])
             burst.append((fts, float(count)))
-            since = now_ts - ASTEST_GAS_BURST_WINDOW_MIN * 60
+            window_min = astest_knob(fam, "BURST_WINDOW_MIN")
+            since = now_ts - window_min * 60
             burst[:] = [(t_, n_) for t_, n_ in burst if t_ >= since]
             total = sum(n_ for _t, n_ in burst)
-            f_until = now_ts + ASTEST_GAS_BURST_PAUSE_MIN * 60
-            if total >= ASTEST_GAS_BURST_CONTRACTS \
-                    and pauses.get(ASTEST_GAS_FAMILY_KEY, 0.0) <= now_ts:
-                pauses[ASTEST_GAS_FAMILY_KEY] = f_until
+            f_until = now_ts + astest_knob(fam, "BURST_PAUSE_MIN") * 60
+            fam_key = astest_knob(fam, "FAMILY_KEY")
+            if total >= bar and pauses.get(fam_key, 0.0) <= now_ts:
+                pauses[fam_key] = f_until
                 burst.clear()
+                what = "gas" if fam == "GAS" else astest_knob(fam, "LABEL")
                 self.alerter.alert(
                     "astest_burst",
-                    f"opportunistic AS test: our gas fills reached {total:g} "
-                    f"contracts in {ASTEST_GAS_BURST_WINDOW_MIN:g} min (bar "
-                    f"{ASTEST_GAS_BURST_CONTRACTS:g}, last {ticker}) -- every gas "
+                    f"opportunistic AS test: our {what} fills reached {total:g} "
+                    f"contracts in {window_min:g} min (bar "
+                    f"{bar:g}, last {ticker}) -- every {what} "
                     f"event stands aside until "
                     f"{datetime.fromtimestamp(f_until, ET):%H:%M} ET; positions ride",
-                    key="astest_burst")
+                    key="astest_burst" if fam == "GAS" else f"astest_burst:{fam}")
         except Exception as e:
             log(f"{self.tag} ! astest fill pause failed: {e}")
 
@@ -24694,7 +24900,8 @@ class IncentiveMarketMaker:
         escalator regexes, ALLOW_SERIES_PATTERNS; the election family,
         election_series; the awards by Kalshi tag, awards_extra_series; the
         graduate families by Kalshi metadata, graduate_auto_series; the
-        single-event mentions by Kalshi category, mention_auto_series)
+        single-event mentions by Kalshi category, mention_auto_series; the AS
+        test's Billboard and VoteHub families while live, astest_new_series)
         unless ALLOWLIST_ONLY is off."""
         if cls._blocked(ticker):
             return False
@@ -24730,6 +24937,7 @@ class IncentiveMarketMaker:
             mlb_mvp_series(series) or \
             graduate_auto_series(series) or \
             mention_auto_series(series) or \
+            astest_new_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -29458,15 +29666,17 @@ class IncentiveMarketMaker:
                 continue
             # OPPORTUNISTIC AS TEST FILL PAUSE (Jack 2026-10-25, see
             # ASTEST_GAS_FILL_PAUSE_MIN): a fill of ours stood the event aside.
-            # ...or the family burst breaker stood every gas event aside
-            if astest_gas_series(meta.series):
+            # ...or the family burst breaker stood every event of the family
+            # aside (gas; Billboard and VoteHub since 2026-10-27)
+            _asf = astest_family(meta.series)
+            if _asf is not None:
                 _ap = self.state.astest_fill_pause_until
-                as_until = max(_ap.get(meta.event_ticker, 0.0),
-                               _ap.get(ASTEST_GAS_FAMILY_KEY, 0.0))
+                _afk = astest_knob(_asf, "FAMILY_KEY")
+                as_until = max(_ap.get(meta.event_ticker, 0.0), _ap.get(_afk, 0.0))
                 if as_until > now_ts:
                     self.cancel_market_orders(t, resting)
                     as_pin = {"until": round(as_until, 1), "left_s": round(as_until - now_ts),
-                              "family": _ap.get(ASTEST_GAS_FAMILY_KEY, 0.0) > now_ts}
+                              "family": _ap.get(_afk, 0.0) > now_ts}
                     self._gskip(t, "astest_fill_pause", lambda: as_pin, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
 
@@ -32935,6 +33145,22 @@ class IncentiveMarketMaker:
                 f"{ASTEST_GAS_BURST_PAUSE_MIN:g}m"
                 + (f"; STOPPED ({ASTEST_STOP_FILE})" if astest_stopped() else
                    f"; stop file {ASTEST_STOP_FILE}"))
+        for _f in ASTEST_FAMILIES:
+            if not (ASTEST_ENABLE and astest_knob(_f, "ENABLE")):
+                continue
+            _stop = astest_knob(_f, "STOP_FILE")
+            log(f"opportunistic AS test (2026-10-27): {astest_knob(_f, 'LABEL')} "
+                f"{','.join(sorted(astest_knob(_f, 'SERIES')))} quoted plain, x1 at "
+                f"every hour, {ASTEST_WINDOW_NOTE[_f]}; net cap "
+                f"{astest_knob(_f, 'MAX_POSITION'):g}/market "
+                f"{astest_knob(_f, 'EVENT_CAP'):g}/event; "
+                f"${astest_knob(_f, 'DAILY_LOSS'):g}/day family loss halt; "
+                f"{astest_knob(_f, 'FILL_PAUSE_MIN'):g}m event pause after our fills; "
+                f"burst {astest_knob(_f, 'BURST_CONTRACTS'):g} ct/"
+                f"{astest_knob(_f, 'BURST_WINDOW_MIN'):g}m -> all out "
+                f"{astest_knob(_f, 'BURST_PAUSE_MIN'):g}m"
+                + (f"; STOPPED ({_stop})" if astest_family_stopped(_f) else
+                   f"; stop file {_stop}"))
         if RELEASE_PAUSE:
             _cal = load_release_calendar(force=True)
             _now = datetime.now(timezone.utc)
