@@ -9,6 +9,7 @@ series whose live event is earnable, while a series with no earnable event
 not "LEFT the feed".
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -139,6 +140,48 @@ class TestElectionsUseTheVerifiedVotingDay(unittest.TestCase):
         with mock.patch.dict(imm.EVENT_START_OVERRIDES, {ev: hand}):
             a = self._audit({f"{ev}-70": _prog(self.START)})
         self.assertIn("cutoff passed (10-26 17:50Z election day)", self._line(a, ev))
+
+
+class _OverridesFirst(_NoResolver):
+    """The real resolver's first step: a start on file wins."""
+
+    def resolve(self, series, event_ticker):
+        return imm.EVENT_START_OVERRIDES.get(event_ticker)
+
+
+class TestTheOverridesFileDatesEvents(unittest.TestCase):
+    """Jack 2026-10-27: "Yes, fix the feed audit's false UNEARNABLE on
+    KXTRUMPMENTIONB here" -- the bot merges event_start_overrides.json at
+    every refresh, and the audit read a file-dated event on its ticker date."""
+
+    def setUp(self):
+        self.assertNotIn("run-logs", imm.EVENT_OVERRIDES_FILE)    # the sandbox
+        self.addCleanup(lambda: os.path.exists(imm.EVENT_OVERRIDES_FILE)
+                        and os.remove(imm.EVENT_OVERRIDES_FILE))
+
+    def test_a_start_on_file_dates_the_event(self):
+        now = datetime.now(timezone.utc)
+        day = now.astimezone(imm.ET).date()
+        ev = f"KXTRUMPMENTIONB-{_seg(day)}"
+        with open(imm.EVENT_OVERRIDES_FILE, "w", encoding="utf-8") as f:
+            json.dump({ev: (now + timedelta(hours=3)).replace(microsecond=0)
+                       .isoformat()}, f)
+        # the program starts after the ticker date's midnight ET, as Kalshi's
+        # 10:00 ET period on the 10/27 event did
+        midnight = imm.ET.localize(datetime(day.year, day.month, day.day))
+        progs = {f"{ev}-CHIN": _prog((midnight + timedelta(hours=1))
+                                     .astimezone(timezone.utc))}
+        # live, the series is allowed through a hot-loaded file
+        real_allowed = imm.IncentiveMarketMaker._allowed
+        with mock.patch.object(imm.IncentiveMarketMaker, "_allowed", staticmethod(
+                    lambda t: t.startswith("KXTRUMPMENTIONB-") or real_allowed(t))), \
+                mock.patch.dict(imm.EVENT_START_OVERRIDES), \
+                mock.patch.dict(imm._file_override_state,
+                                {"mtime": 0.0, "keys": set()}), \
+                mock.patch.object(imm, "EventStartResolver", _OverridesFirst):
+            a = fa.run_audit(progs=progs)
+        self.assertEqual(a["unearnable"], set())
+        self.assertEqual([l for l in a["miss_lines"] if l.startswith(ev)], [])
 
 
 class TestAbsentSkipsBlockedFamilies(unittest.TestCase):

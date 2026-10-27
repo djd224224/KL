@@ -103,6 +103,15 @@ def run_audit(client=None, progs=None) -> dict:
     # families (KXRAIN!) read as not-allowed: skipped by the misses loop AND
     # false-positived in the not-allowed footer (caught 2026-08-22).
     imm.load_extra_allow_series()
+    # Same for event_start_overrides.json, the Trump-mention starts and the
+    # earnings call / release times the bot merges at every refresh (Jack
+    # 2026-10-27: "Yes, fix the feed audit's false UNEARNABLE on
+    # KXTRUMPMENTIONB here"). Without it the CLI read KXTRUMPMENTIONB-26OCT27
+    # (15:00 ET on file, quoted all day) on its midnight-ET ticker date and
+    # flagged it UNEARNABLE; the overrides task merges the file when it
+    # starts, but not the times it writes later in the same run. Merged by
+    # mtime, never written.
+    imm.load_file_event_overrides()
 
     by_event = defaultdict(list)
     for t in progs:
