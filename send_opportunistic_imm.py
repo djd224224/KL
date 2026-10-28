@@ -11,6 +11,11 @@ The "opportunistic" book is TWO tiers:
             with 15 slots and 5 to scan all markets"): every other live-
             program market, machine-screened for adverse selection
             (incentive_mm SCAN_*; membership persisted as scan_members)
+  picks     since 2026-10-27, the AS test's DAILY PICKS (Jack: "pick 5
+            distinct events each day, optimizing for likelihood of
+            profitability ... and add it to the opportunistic daily report
+            email"): the events imm_astest_picks.py picked, every one it ever
+            picked (astest_picks_history.jsonl) -- see load_picks
 CARBON ARC IS OUT (Jack 2026-10-04: "email should only have finecon and open
 scan, remove carbon arc"). Every Carbon Arc-settled market is excluded from
 every table, the headline, the subject and the credited footer, whatever
@@ -324,10 +329,12 @@ def excluded_carbon_arc(ticker_or_event: str) -> bool:
     return is_family(ticker_or_event)
 
 
-def tier_of(ticker_or_event: str, fin, scan_set) -> str:
-    """"finecon" | "scan" | None — which opportunistic tier owns this market
-    (or event), or None for everything this email leaves out: the rest of
-    the normal book and, since 2026-10-04, every Carbon Arc-settled market.
+def tier_of(ticker_or_event: str, fin, scan_set, picks=frozenset()) -> str:
+    """"finecon" | "scan" | "picks" | None — which opportunistic tier owns
+    this market (or event), or None for everything this email leaves out: the
+    rest of the normal book and, since 2026-10-04, every Carbon Arc-settled
+    market. `picks` is every EVENT the AS test's daily picks ever named
+    (load_picks); a market belongs by its event.
 
     MODULE LEVEL ON PURPOSE. This lived as a closure inside build_report
     until 2026-09-11, and that is exactly how 30 *CC series left the email
@@ -356,7 +363,112 @@ def tier_of(ticker_or_event: str, fin, scan_set) -> str:
         return "finecon"
     if ticker_or_event in scan_set:
         return "scan"
+    if picks and (ticker_or_event in picks or _event_of(ticker_or_event) in picks):
+        return "picks"
     return None
+
+
+# ---- THE AS TEST'S DAILY PICKS (Jack 2026-10-27: "Turn back on opportunistic
+# bot but now pick 5 distinct events each day, optimizing for likelihood of
+# profitability, even better if fair value can be built, quote it at 1x size,
+# and add it to the opportunistic daily report email"). A third tier: every
+# event imm_astest_picks.py ever picked (its history file, so a settled pick
+# stays in the CUMULATIVE table), with the picks in force listed beside the
+# picker's own numbers -- the likelihood of profit, the net it expects, the
+# reward and fill cost behind it, and whether a fair value can be built.
+PICKS_PATH = os.path.join(imm.STATUS_DIR, getattr(imm, "ASTEST_PICK_FILE",
+                                                  "astest_picks.json"))
+PICKS_HISTORY_PATH = os.path.join(imm.STATUS_DIR, "astest_picks_history.jsonl")
+PICK_COUNT = 5
+
+
+def load_picks() -> tuple:
+    """(the picks file now, or {}; every event any run ever picked)."""
+    doc = load_json(PICKS_PATH) or {}
+    ever = {str(p.get("event")) for p in doc.get("picks") or [] if p.get("event")}
+    try:
+        with open(PICKS_HISTORY_PATH, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ever.update(str(e) for e in json.loads(line).get("picks") or [] if e)
+                except (ValueError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return doc, ever
+
+
+def picks_status(doc: dict, now_utc) -> str:
+    """The tier line: how many picks are in force, from which run, and
+    whether the bot is reading them (the stop file, a lapsed file)."""
+    gen = imm.parse_iso_utc(str(doc.get("generated_at") or ""))
+    if gen is None:
+        return "no picks file yet (imm_astest_picks.py runs daily)"
+    age_h = (now_utc - gen).total_seconds() / 3600.0
+    n = len(doc.get("picks") or [])
+    out = (f"{n}/{PICK_COUNT} picks from the {gen.astimezone(imm.ET):%b %d %H:%M} ET run, "
+           f"x1 (net cap {getattr(imm, 'ASTEST_PICK_MAX_POSITION', 50):g}/market "
+           f"{getattr(imm, 'ASTEST_PICK_EVENT_CAP', 150):g}/event, "
+           f"${getattr(imm, 'ASTEST_PICK_DAILY_LOSS', 100):g}/day loss halt)")
+    if age_h > getattr(imm, "ASTEST_PICK_MAX_AGE_H", 30.0):
+        out += f", LAPSED (the file is {age_h:.0f}h old; the bot quotes none)"
+    stop = getattr(imm, "ASTEST_PICK_STOP_FILE", "astest_pick_stop.txt")
+    if os.path.exists(os.path.join(imm.STATUS_DIR, stop)):
+        out += f", STOPPED ({stop})"
+    c = doc.get("considered") or {}
+    if c:
+        out += (f"; {c.get('eligible', 0)} eligible of {c.get('scored', 0)} scored, "
+                f"{c.get('events', 0)} screened events")
+    return out
+
+
+def _pick_line(p: dict) -> str:
+    return (f"{_short_event(str(p.get('event'))):26} P(profit) {_f(p.get('p_profit')):.0%} "
+            f"over {p.get('n_hist', 0)} past events, est net ${_f(p.get('net_mean')):+.2f} "
+            f"(reward ${_f(p.get('reward')):.2f} on {p.get('n_markets', 0)} mkts, "
+            f"~{_f(p.get('fills')):.0f} fills at {_f(p.get('cost_c')):.1f}c), fair "
+            f"{p.get('fair') or 'none'}"
+            + (f" ({p['fair_source']})" if p.get("fair_source") else "")
+            + (f", {p['window_et']} ET" if p.get("window_et") else "")
+            + f" -- {str(p.get('title') or '')[:70]}")
+
+
+def picks_detail(doc: dict) -> tuple:
+    """(text lines, html) listing the picks in force and the best events the
+    run did not pick, each with the picker's numbers."""
+    picks = doc.get("picks") or []
+    seen = {p.get("event") for p in picks}
+    rest = [p for p in doc.get("ranked") or [] if p.get("event") not in seen][:3]
+    model = doc.get("model") or {}
+    how = (f"fills priced at {_f(model.get('as_mult', 3)):g}x the tape's maker loss a "
+           f"contract (at least {_f(model.get('as_floor_c', 1)):g}c) over the last "
+           f"{model.get('hist_events', 5)} settled events; a pick needs "
+           f"P(profit) >= {_f(model.get('min_p_profit', 0.6)):.0%} and est net >= "
+           f"${_f(model.get('min_net', 0.5)):.2f} over its day")
+    # "- " ahead of each line: parse_last_sent_body reads a bare event name in
+    # the first 27 characters as a table row, and a listed pick is not one
+    L = ["Picks in force:" if picks else "Picks in force: none."]
+    L += ["  - " + _pick_line(p) for p in picks]
+    if rest:
+        L.append("Next best, not picked:")
+        L += ["  - " + _pick_line(p) + ("" if p.get("eligible") else " [not eligible]")
+              for p in rest]
+    L.append(f"({how}.)")
+    h = ['<div style="color:#555;font-size:13px;margin:4px 0">']
+    h.append("<b>Picks in force:</b>" + ("" if picks else " none."))
+    for p in picks:
+        h.append(f"<br>&nbsp;&nbsp;{_esc(_pick_line(p))}")
+    if rest:
+        h.append("<br><b>Next best, not picked:</b>")
+        for p in rest:
+            h.append(f"<br>&nbsp;&nbsp;{_esc(_pick_line(p))}"
+                     + ("" if p.get("eligible") else " [not eligible]"))
+    h.append(f'<br><span style="color:#999;font-size:11px">({_esc(how)}.)</span></div>')
+    return L, "".join(h)
+
+
+def _esc(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---- DURABLE HISTORY (Jack 2026-09-11 "not just active, but also
@@ -858,6 +970,8 @@ def build_report(now_utc):
             f"falls back to the live book")
         hist = {"scan_events": set(), "realized": {}, "first_day": ""}
     scan_ever = scan_events | hist["scan_events"]
+    # the AS test's daily picks (2026-10-27): every event ever picked
+    picks_doc, picks_ever = load_picks()
 
     def _tier(t):
         """Ticker -> tier for the BOOK. scan_book, not scan_members: a market
@@ -866,10 +980,10 @@ def build_report(now_utc):
         scan_members alone would drop it (scan_book = members + everything
         still carrying our inventory). The SLOT count below stays on true
         membership so the tier line cannot inflate."""
-        return tier_of(t, fin, scan_book)
+        return tier_of(t, fin, scan_book, picks_ever)
 
     def _event_tier(ev):
-        return tier_of(ev, fin, scan_ever)
+        return tier_of(ev, fin, scan_ever, picks_ever)
 
     def _is_opp_event(ev):
         return _event_tier(ev) is not None
@@ -964,6 +1078,7 @@ def build_report(now_utc):
     rows.sort(key=lambda r: -r["net"])
     fin_rows = [r for r in rows if r["tier"] == "finecon"]
     scan_rows = [r for r in rows if r["tier"] == "scan"]
+    pick_rows = [r for r in rows if r["tier"] == "picks"]
 
     tot = tier_totals(rows)
     tot_earn, tot_pnl, tot_net, tot_mkts = (tot["earn"], tot["pnl"],
@@ -1016,7 +1131,8 @@ def build_report(now_utc):
         b["realized"] += realized_by_event.get(ev, 0.0)
         b["mtm"] += cum_mtm.get(ev, 0.0)
     cum_rows = []
-    for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN")):
+    for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN"),
+                      ("picks", "DAILY PICKS")):
         b = cum_by_tier.get(key)
         if not b:
             continue
@@ -1075,7 +1191,11 @@ def build_report(now_utc):
          + (", HALTED today (loss budget)" if scan_halted else "")
          + (f", {scan_evicted} event(s) evicted" if scan_evicted else ""),
          scan_rows),
+        ("DAILY PICKS", "the AS test's distinct events a day, the likeliest "
+         "to profit, quoted x1 (imm_astest_picks.py)",
+         picks_status(picks_doc, now_utc), pick_rows),
     ]
+    picks_text, picks_html = picks_detail(picks_doc)
 
     # Deliberately does NOT put the estimate and the credited figure side by
     # side as if they were addends — they are two scopes on one stream (see
@@ -1120,6 +1240,8 @@ def build_report(now_utc):
             L.extend(text_table(trows, new_events))
         else:
             L.append(f"No {name.lower()} events quoted right now.")
+        if name == "DAILY PICKS":
+            L.extend(picks_text)
         L.append("")
     if cum_rows:
         L.append("CUMULATIVE — CREDITED and REALIZED cover every event each "
@@ -1201,6 +1323,8 @@ def build_report(now_utc):
         else:
             h.append(f'<div style="color:#666;font-size:13px">No '
                      f'{name.lower()} events quoted right now.</div>')
+        if name == "DAILY PICKS":
+            h.append(picks_html)
     if cum_rows:
         h.append('<div style="font-size:15px;font-weight:600;margin:18px 0 2px">'
                  'Cumulative <span style="color:#888;font-weight:400">&mdash; '

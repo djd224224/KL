@@ -128,5 +128,78 @@ class TestRenderingMarksOnlyNewRows(unittest.TestCase):
         self.assertEqual(row[:27].strip(), "*NEWONE-26OCT01")
 
 
+class TestDailyPicksTier(unittest.TestCase):
+    """Jack 2026-10-27: "... quote it at 1x size, and add it to the
+    opportunistic daily report email" -- the AS test's daily picks as a third
+    tier, membership by every event ever picked."""
+
+    DOC = {"generated_at": "2026-10-28T14:30:00Z",
+           "considered": {"eligible": 2, "scored": 9, "events": 70},
+           "model": {"as_mult": 3.0, "as_floor_c": 1.0, "hist_events": 5,
+                     "min_p_profit": 0.6, "min_net": 0.5},
+           "picks": [{"event": "KXPICKA-26OCT30", "p_profit": 0.8, "n_hist": 5,
+                      "net_mean": 2.5, "reward": 3.1, "n_markets": 2, "fills": 12,
+                      "cost_c": 4.5, "fair": "buildable", "fair_source": "eia.gov",
+                      "title": "Will A be above 5?"}],
+           "ranked": [{"event": "KXPICKA-26OCT30"},
+                      {"event": "KXPICKB-26OCT30", "p_profit": 0.4, "n_hist": 5,
+                       "net_mean": -1.0, "eligible": False, "title": "B"}]}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="opp_picks_")
+        self._old = (so.PICKS_PATH, so.PICKS_HISTORY_PATH)
+        so.PICKS_PATH = os.path.join(self.tmp, "astest_picks.json")
+        so.PICKS_HISTORY_PATH = os.path.join(self.tmp, "astest_picks_history.jsonl")
+
+    def tearDown(self):
+        so.PICKS_PATH, so.PICKS_HISTORY_PATH = self._old
+
+    def test_every_event_ever_picked_is_the_tiers_markets_by_event(self):
+        with open(so.PICKS_PATH, "w", encoding="utf-8") as f:
+            json.dump(self.DOC, f)
+        with open(so.PICKS_HISTORY_PATH, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"picks": ["KXOLDPICK-26OCT20"]}) + "\nnot json\n")
+        doc, ever = so.load_picks()
+        self.assertEqual(doc["generated_at"], self.DOC["generated_at"])
+        self.assertEqual(ever, {"KXPICKA-26OCT30", "KXOLDPICK-26OCT20"})
+        self.assertEqual(so.tier_of("KXPICKA-26OCT30-T5", set(), set(), ever), "picks")
+        self.assertEqual(so.tier_of("KXOLDPICK-26OCT20", set(), set(), ever), "picks")
+        self.assertIsNone(so.tier_of("KXPICKA-26NOV06-T5", set(), set(), ever))
+        self.assertIsNone(so.tier_of("KXPICKA-26OCT30-T5", set(), set()))
+        # finecon and the scan keep their own rows
+        self.assertEqual(so.tier_of("KXPICKA-26OCT30-T5", {"KXPICKA"}, set(), ever),
+                         "finecon")
+
+    def test_no_files_no_picks(self):
+        self.assertEqual(so.load_picks(), ({}, set()))
+        now = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
+        self.assertIn("no picks file yet", so.picks_status({}, now))
+
+    def test_the_tier_line_and_the_picks_listed_with_the_pickers_numbers(self):
+        now = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
+        line = so.picks_status(self.DOC, now)
+        self.assertIn("1/5 picks from the Oct 28 10:30 ET run", line)
+        self.assertIn("2 eligible of 9 scored", line)
+        self.assertNotIn("LAPSED", line)
+        self.assertIn("LAPSED", so.picks_status(
+            self.DOC, datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc)))
+        text, html = so.picks_detail(self.DOC)
+        body = "\n".join(text)
+        self.assertIn("PICKA-26OCT30", body)
+        self.assertIn("P(profit) 80% over 5 past events, est net $+2.50", body)
+        self.assertIn("fair buildable (eia.gov)", body)
+        self.assertIn("Next best, not picked:", body)
+        self.assertIn("PICKB-26OCT30", body)
+        self.assertIn("[not eligible]", body)
+        self.assertIn("3x the tape's maker loss", body)
+        self.assertIn("PICKA-26OCT30", html)
+        # a listed pick is not a table row for the new-since-last-email read
+        log = ("2026-10-29 11:25:01Z opportunistic body:\n" + body
+               + "\n2026-10-29 11:25:02Z opportunistic send: ok\n")
+        self.assertEqual(so.parse_last_sent_body(log)[1], set())
+        self.assertEqual(so.picks_detail({})[0], ["Picks in force: none.",
+                                                  so.picks_detail({})[0][-1]])
+
+
 if __name__ == "__main__":
     unittest.main()

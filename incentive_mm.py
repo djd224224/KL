@@ -1640,8 +1640,9 @@ def _hour_window_mult(series: str, now_utc: datetime) -> float:
     windows and for excluded series prefixes."""
     # the opportunistic AS test's gas dailies (2026-10-25, ASTEST_ENABLE): x1
     # at every hour -- the family's own quote window does the timing, and
-    # the 4pm-1am gas halving would starve it under the payout floor
-    if astest_gas_series(series):
+    # the 4pm-1am gas halving would starve it under the payout floor. The
+    # daily picks (2026-10-27) are x1 at every hour too, gas or not.
+    if astest_gas_series(series) or astest_member_family(series) == "PICK":
         return 1.0
     et = now_utc.astimezone(ET)
     hour = et.hour
@@ -9231,7 +9232,7 @@ def astest_blackout(window: Tuple[str, str]) -> Tuple[str, str]:
 #   20:00-05:00 ET, ASTEST_VH_WINDOW_ET (blackout_et, every day), and each
 #   event is out at 05:00 ET on its read day (event_day_cutoff_et): one
 #   overnight per event, the one before its read.
-ASTEST_FAMILIES = ("BB", "VH")       # the gas family keeps its own wiring above
+ASTEST_FAMILIES = ("BB", "VH", "PICK")  # the gas family keeps its own wiring above
 ASTEST_BB_ENABLE = os.environ.get("IMM_ASTEST_BB_ENABLE", "1") == "1"
 ASTEST_BB_SERIES = frozenset(
     s.strip() for s in os.environ.get("IMM_ASTEST_BB_SERIES", "KXBBSINGLE").split(",")
@@ -9269,11 +9270,63 @@ ASTEST_VH_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_VH_BURST_WINDOW_MIN", 15.0)
 ASTEST_VH_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_VH_BURST_PAUSE_MIN", 30.0)
 ASTEST_VH_HALT_KEY = "ASTEST:VH"
 ASTEST_VH_FAMILY_KEY = "*VH"
+# ---- FAMILY 4: THE DAILY PICKS (Jack 2026-10-27: "Turn back on opportunistic
+# bot but now pick 5 distinct events each day, optimizing for likelihood of
+# profitability, even better if fair value can be built, quote it at 1x size,
+# and add it to the opportunistic daily report email"). The five fixed gas
+# states stay stopped (astest_stop.txt). In their place imm_astest_picks.py
+# ranks, once a day, every paying event the book does not otherwise quote --
+# the bot's own x1 reward estimate against what our fills would have cost on
+# the public tape of the series' last settled events -- and writes
+# ASTEST_PICK_FILE: up to five events, one per series and one per shared
+# driver (the gas states move together), the likeliest to profit first and a
+# fair value breaking ties. load_astest_picks() reads it at each universe
+# refresh:
+#   - the picked EVENT is allowed (_allowed, astest_pick_event_ok), never the
+#     rest of its series;
+#   - a gas-state pick (KXAAAGASD<ST>) lifts the state-pattern block for that
+#     event alone, takes the national's guard set (ensure_family_override)
+#     and quotes plain, as the gas family did (astest_plain_gas);
+#   - x1 literal: the global ladder at every hour (no quiet-hours, Saturday or
+#     yield size: _hour_window_mult, is_daily_series), a net cap of
+#     ASTEST_PICK_MAX_POSITION (50) per market and ASTEST_PICK_EVENT_CAP (150)
+#     per event -- a hand cap, so out of the base-size split test;
+#   - the quote window the picker names for a pick (the gas states'
+#     16:00-24:00 ET) becomes its series' blackout_et;
+#   - the gas family's stops: a $ASTEST_PICK_DAILY_LOSS (100) family loss
+#     halt (budget ASTEST:PICK), a 15-min event pause after our fill, a burst
+#     breaker (100 ct of our fills in 15 min -> every pick aside 30 min, with
+#     an email) and the stop file ASTEST_PICK_STOP_FILE;
+#   - a file older than ASTEST_PICK_MAX_AGE_H (30) is ignored, so the picks
+#     lapse if the daily run stops (fail closed); a dropped pick leaves at the
+#     next refresh and its positions ride.
+ASTEST_PICK_ENABLE = os.environ.get("IMM_ASTEST_PICK_ENABLE", "1") == "1"
+ASTEST_PICK_FILE = "astest_picks.json"                          # in STATUS_DIR
+ASTEST_PICK_STOP_FILE = "astest_pick_stop.txt"                  # in STATUS_DIR
+ASTEST_PICK_LABEL = "Daily picks"
+ASTEST_PICK_MAX_AGE_H = _env_float("IMM_ASTEST_PICK_MAX_AGE_H", 30.0)
+ASTEST_PICK_SIZE_MULT = 1.0                                     # x1 literal
+ASTEST_PICK_MAX_POSITION = _env_float("IMM_ASTEST_PICK_MAX_POSITION", 50.0)
+ASTEST_PICK_EVENT_CAP = _env_float("IMM_ASTEST_PICK_EVENT_CAP", 150.0)
+ASTEST_PICK_DAILY_LOSS = _env_float("IMM_ASTEST_PICK_DAILY_LOSS", 100.0)
+ASTEST_PICK_FILL_PAUSE_MIN = max(0.0, _env_float("IMM_ASTEST_PICK_FILL_PAUSE_MIN", 15.0))
+ASTEST_PICK_BURST_CONTRACTS = _env_float("IMM_ASTEST_PICK_BURST_CONTRACTS", 100.0)
+ASTEST_PICK_BURST_WINDOW_MIN = _env_float("IMM_ASTEST_PICK_BURST_WINDOW_MIN", 15.0)
+ASTEST_PICK_BURST_PAUSE_MIN = _env_float("IMM_ASTEST_PICK_BURST_PAUSE_MIN", 30.0)
+ASTEST_PICK_HALT_KEY = "ASTEST:PICK"
+ASTEST_PICK_FAMILY_KEY = "*PICK"
+# the picks in force (load_astest_picks): series -> its picked event, and the
+# series set the family hooks read
+ASTEST_PICK_EVENTS: Dict[str, str] = {}
+ASTEST_PICK_SERIES: frozenset = frozenset()
+_ASTEST_GAS_STATE_RE = re.compile(r"KXAAAGASD[A-Z][A-Z]")
 # the startup line's account of each family's window
 ASTEST_WINDOW_NOTE = {
     "BB": f"out {ASTEST_BB_CUTOFF_DAYS:g} days before the chart date (its tracking week's end)",
     "VH": (f"{'-'.join(ASTEST_VH_WINDOW_ET)} ET only, out at "
-           f"{ASTEST_VH_WINDOW_ET[1]} ET on the read day")}
+           f"{ASTEST_VH_WINDOW_ET[1]} ET on the read day"),
+    "PICK": (f"the events in {ASTEST_PICK_FILE} (imm_astest_picks.py, daily; "
+             f"lapse after {ASTEST_PICK_MAX_AGE_H:g}h)")}
 _astest_family_stop: Dict[str, Dict[str, Any]] = {
     f: {"checked": 0.0, "stopped": False} for f in ASTEST_FAMILIES}
 
@@ -9298,21 +9351,25 @@ def astest_family_stopped(family: str) -> bool:
 
 
 def astest_member_family(series: str) -> Optional[str]:
-    """"BB" / "VH" for a series of a new family while it is on -- membership
-    alone, the stop file aside (the gas family: astest_gas_member). On the
-    budget and cap paths for every ticker, so plain lookups."""
+    """"BB" / "VH" / "PICK" for a series of a new family while it is on --
+    membership alone, the stop file aside (the gas family:
+    astest_gas_member). On the budget and cap paths for every ticker, so
+    plain lookups."""
     if not ASTEST_ENABLE:
         return None
     if ASTEST_BB_ENABLE and series in ASTEST_BB_SERIES:
         return "BB"
     if ASTEST_VH_ENABLE and series in ASTEST_VH_SERIES:
         return "VH"
+    if ASTEST_PICK_ENABLE and series in ASTEST_PICK_SERIES:
+        return "PICK"
     return None
 
 
 def astest_family(series: str) -> Optional[str]:
-    """The live AS-test family of `series` -- "GAS", "BB" or "VH" -- or None
-    (not a member, the family switched off, or its stop file present)."""
+    """The live AS-test family of `series` -- "GAS", "BB", "VH" or "PICK" --
+    or None (not a member, the family switched off, or its stop file
+    present)."""
     if astest_gas_series(series):
         return "GAS"
     fam = astest_member_family(series)
@@ -9320,8 +9377,9 @@ def astest_family(series: str) -> Optional[str]:
 
 
 def astest_new_series(series: str) -> bool:
-    """A live member of the Billboard or VoteHub family: allowed into the book
-    (_allowed) and quoted x1 at every hour (is_daily_series)."""
+    """A live member of the Billboard, VoteHub or daily-pick family: allowed
+    into the book (_allowed; a pick's event only, astest_pick_event_ok) and
+    quoted x1 at every hour (is_daily_series)."""
     fam = astest_family(series)
     return fam is not None and fam != "GAS"
 
@@ -9344,6 +9402,119 @@ SERIES_OVERRIDES.update({
                       event_day_cutoff_et=tuple(
                           int(x) for x in ASTEST_VH_WINDOW_ET[1].split(":")))
     for s in ASTEST_VH_SERIES})
+
+
+def astest_pick_event_ok(ticker: str) -> bool:
+    """A daily pick admits its EVENT, never its series: False for a market (or
+    event) of a picked series outside the picked event, True otherwise."""
+    ev = ASTEST_PICK_EVENTS.get(series_of(ticker))
+    if ev is None:
+        return True
+    return ticker == ev or ticker.startswith(ev + "-")
+
+
+def astest_pick_gas_ticker(ticker: str) -> bool:
+    """A market (or the event) of a gas-state daily pick while the picks are
+    live: the one ticker the state-pattern block stands aside for (_blocked)."""
+    series = series_of(ticker)
+    return (_ASTEST_GAS_STATE_RE.fullmatch(series) is not None
+            and astest_family(series) == "PICK" and astest_pick_event_ok(ticker))
+
+
+def astest_plain_gas(series: str) -> bool:
+    """A gas state the AS test quotes plain, without the GasBuddy gate: a live
+    gas-family member, or a gas-state daily pick."""
+    return astest_gas_series(series) or (
+        _ASTEST_GAS_STATE_RE.fullmatch(series) is not None
+        and astest_family(series) == "PICK")
+
+
+# series -> its SERIES_OVERRIDES entry before it became a pick (None = none),
+# restored when it leaves the picks
+_ASTEST_PICK_PRIOR: Dict[str, Optional[SeriesOverride]] = {}
+
+
+def _astest_pick_window(raw) -> Optional[Tuple[str, str]]:
+    """A pick's "window_et" ("16:00-24:00") -> ("16:00", "24:00"); None when
+    absent or malformed (no window: every hour)."""
+    parts = str(raw or "").strip().split("-")
+    if len(parts) != 2 or not all(re.fullmatch(r"\d\d:\d\d", p) for p in parts):
+        return None
+    return parts[0], parts[1]
+
+
+def _astest_pick_overlay(series: str, window: Optional[Tuple[str, str]]) -> None:
+    """Stamp a pick's x1 guard set on its series: the series' own family
+    guards first (ensure_family_override -- a gas state takes the national's),
+    then the global ladder, the pick's net cap and its quote window."""
+    if series not in _ASTEST_PICK_PRIOR:
+        ensure_family_override(series)
+        _ASTEST_PICK_PRIOR[series] = SERIES_OVERRIDES.get(series)
+    ov = replace(_ASTEST_PICK_PRIOR[series] or SeriesOverride(),
+                 levels=_astest_levels("PICK"),
+                 max_position=ASTEST_PICK_MAX_POSITION)
+    if window is not None:
+        ov = replace(ov, blackout_et=astest_blackout(window))
+    SERIES_OVERRIDES[series] = ov
+
+
+def load_astest_picks(now_utc: Optional[datetime] = None) -> int:
+    """Read ASTEST_PICK_FILE (imm_astest_picks.py) into ASTEST_PICK_EVENTS /
+    ASTEST_PICK_SERIES, stamping each pick's guard set on its series
+    (_astest_pick_overlay) and handing a series that left the picks its prior
+    override back. Called at each universe refresh. A missing, unreadable or
+    stale (older than ASTEST_PICK_MAX_AGE_H) file means NO picks -- fail
+    closed -- and a blocklisted, frozen or excluded series is refused
+    whatever the file says (a gas state's pattern block aside). Returns the
+    number of picks in force."""
+    global ASTEST_PICK_EVENTS, ASTEST_PICK_SERIES
+    now = now_utc or datetime.now(timezone.utc)
+    picks: Dict[str, str] = {}
+    windows: Dict[str, Optional[Tuple[str, str]]] = {}
+    note = ""
+    if ASTEST_ENABLE and ASTEST_PICK_ENABLE:
+        try:
+            with open(os.path.join(STATUS_DIR, ASTEST_PICK_FILE), encoding="utf-8") as f:
+                data = json.load(f)
+            gen = parse_iso_utc(str(data.get("generated_at") or ""))
+            if gen is None or (now - gen).total_seconds() > ASTEST_PICK_MAX_AGE_H * 3600:
+                note = f"stale ({data.get('generated_at')})"
+            else:
+                for p in data.get("picks") or []:
+                    ev = str((p or {}).get("event") or "").strip().upper()
+                    series = series_of(ev)
+                    if "-" not in ev or series in picks:
+                        continue
+                    gas = _ASTEST_GAS_STATE_RE.fullmatch(series) is not None
+                    if (any(ev.startswith(x) for x in SERIES_BLOCKLIST_PREFIXES)
+                            or series in FREEZE_SERIES
+                            or any(series.startswith(x) for x in SCAN_EXCLUDE_PREFIXES)
+                            or (series_pattern_blocked(series) and not gas)
+                            or astest_member_family(series) in ("BB", "VH")):
+                        log(f"[IMM] ! astest pick {ev} refused: the series is "
+                            f"blocked, frozen, excluded or another AS family's")
+                        continue
+                    picks[series] = ev
+                    windows[series] = _astest_pick_window((p or {}).get("window_et"))
+        except FileNotFoundError:
+            note = "no file"
+        except Exception as e:                              # noqa: BLE001
+            note = f"unreadable ({e!r})"
+    for s in [s for s in _ASTEST_PICK_PRIOR if s not in picks]:
+        prior = _ASTEST_PICK_PRIOR.pop(s)
+        if prior is None:
+            SERIES_OVERRIDES.pop(s, None)
+        else:
+            SERIES_OVERRIDES[s] = prior
+    for s, ev in picks.items():
+        _astest_pick_overlay(s, windows[s])
+    if picks != ASTEST_PICK_EVENTS:
+        log(f"[IMM] astest picks: {len(picks)} in force"
+            + (f": {', '.join(sorted(picks.values()))}" if picks else
+               (f" ({note})" if note else "")))
+    ASTEST_PICK_EVENTS = dict(picks)
+    ASTEST_PICK_SERIES = frozenset(picks)
+    return len(picks)
 
 
 
@@ -10820,6 +10991,11 @@ _CONFIG_CODE_KNOBS = (
     "ASTEST_GAS_DAILY_LOSS", "ASTEST_GAS_FILL_PAUSE_MIN", "ASTEST_GAS_EVENT_CAP",
     "ASTEST_GAS_BURST_CONTRACTS", "ASTEST_GAS_BURST_WINDOW_MIN",
     "ASTEST_GAS_BURST_PAUSE_MIN",
+    # ...its daily picks (2026-10-27; the picks themselves are the file's)
+    "ASTEST_PICK_ENABLE", "ASTEST_PICK_MAX_AGE_H", "ASTEST_PICK_MAX_POSITION",
+    "ASTEST_PICK_EVENT_CAP", "ASTEST_PICK_DAILY_LOSS", "ASTEST_PICK_FILL_PAUSE_MIN",
+    "ASTEST_PICK_BURST_CONTRACTS", "ASTEST_PICK_BURST_WINDOW_MIN",
+    "ASTEST_PICK_BURST_PAUSE_MIN",
     # ...its Billboard and VoteHub families (2026-10-27)
     "ASTEST_BB_ENABLE", "ASTEST_BB_SERIES", "ASTEST_BB_CUTOFF_DAYS",
     "ASTEST_BB_SIZE_MULT",
@@ -24866,8 +25042,9 @@ class IncentiveMarketMaker:
             # ownership block stands aside for its markets
             prefixes = tuple(p for p in prefixes if p != HIGHT_PREFIX)
         # the opportunistic AS test's states (2026-10-26): the state pattern
-        # block stands aside for its members
-        astest = astest_gas_series(series_of(ticker))
+        # block stands aside for its members -- and for a gas-state daily
+        # pick's event (2026-10-27, astest_pick_gas_ticker)
+        astest = astest_gas_series(series_of(ticker)) or astest_pick_gas_ticker(ticker)
         if any(ticker.startswith(p) for p in prefixes) \
                 or (series_pattern_blocked(series_of(ticker)) and not astest) \
                 or event_pattern_blocked(ticker):
@@ -24937,7 +25114,7 @@ class IncentiveMarketMaker:
             mlb_mvp_series(series) or \
             graduate_auto_series(series) or \
             mention_auto_series(series) or \
-            astest_new_series(series) or \
+            (astest_new_series(series) and astest_pick_event_ok(ticker)) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -25176,6 +25353,7 @@ class IncentiveMarketMaker:
         # no restart needed.
         load_file_event_overrides()
         load_extra_allow_series()
+        load_astest_picks(now_utc)    # the AS test's daily picks (2026-10-27)
         load_finecon_extra_series()
         load_election_extra_series()
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
@@ -28080,9 +28258,10 @@ class IncentiveMarketMaker:
         # the market aside every cycle, so it must not hold one of the
         # MAX_MARKETS slots -- all of Monday (the Tuesday print is not
         # modelled), and any GasBuddy / Kalshi-anchor outage. (The AS test's
-        # gas dailies quote plain, 2026-10-25: ASTEST_ENABLE.)
+        # gas dailies quote plain, 2026-10-25: ASTEST_ENABLE; so do its
+        # gas-state daily picks, 2026-10-27.)
         if GB_FAIR_ENABLE and gb_fair_series(meta.series) \
-                and not astest_gas_series(meta.series):
+                and not astest_plain_gas(meta.series):
             if not gb_has_read(meta.event_ticker, now_ts):
                 return "gb_no_read"
             # ...and a strike whose listed touch the gate rejects right now
@@ -29553,9 +29732,10 @@ class IncentiveMarketMaker:
             # GASBUDDY STATE-GAS GATE (Jack 2026-09-27, see GB_FAIR_ENABLE):
             # the same stand-aside on GasBuddy's live state averages, failing
             # CLOSED -- the state dailies are quoted only against the feed.
-            # The AS test's gas dailies quote plain (2026-10-25, ASTEST_ENABLE).
+            # The AS test's gas dailies quote plain (2026-10-25, ASTEST_ENABLE),
+            # and so do its gas-state daily picks (2026-10-27).
             if GB_FAIR_ENABLE and gb_fair_series(meta.series) \
-                    and not astest_gas_series(meta.series):
+                    and not astest_plain_gas(meta.series):
                 gb_why, gb_in = gb_gate_reason(t, now_ts, ext_bid, ext_ask)
                 if gb_why:
                     if t not in self._gb_fair_stood:
@@ -33145,6 +33325,7 @@ class IncentiveMarketMaker:
                 f"{ASTEST_GAS_BURST_PAUSE_MIN:g}m"
                 + (f"; STOPPED ({ASTEST_STOP_FILE})" if astest_stopped() else
                    f"; stop file {ASTEST_STOP_FILE}"))
+        load_astest_picks()        # the daily picks' line lists them
         for _f in ASTEST_FAMILIES:
             if not (ASTEST_ENABLE and astest_knob(_f, "ENABLE")):
                 continue

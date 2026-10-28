@@ -112,6 +112,10 @@ def run_audit(client=None, progs=None) -> dict:
     # starts, but not the times it writes later in the same run. Merged by
     # mtime, never written.
     imm.load_file_event_overrides()
+    # ...and the AS test's daily picks (astest_picks.json, 2026-10-27): a
+    # picked event is allowed in the bot, so it must not read as a new family
+    if hasattr(imm, "load_astest_picks"):
+        imm.load_astest_picks()
     # ...and the central-bank family (FINECON_SERIES_PREFIXES, "KXCBD"),
     # which the bot admits from the live programs feed at every refresh
     # (finecon_expand_family, in memory only). Without it every bank past

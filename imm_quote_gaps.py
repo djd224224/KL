@@ -451,10 +451,12 @@ def classify_and_estimate(client, bot, now_utc: datetime):
     standard ladder would earn there (bounded book reads)."""
     now_ts = now_utc.timestamp()
     # Same hot-reload the bot does each refresh: overrides + auto-enrolled
-    # series + rain fairs.
+    # series + rain fairs + the AS test's daily picks (2026-10-27).
     imm.load_file_event_overrides()
     imm.load_extra_allow_series()
     imm.load_rain_fair()
+    if hasattr(imm, "load_astest_picks"):
+        imm.load_astest_picks()
 
     state = load_json(STATE_PATH)
     status = load_json(STATUS_PATH)

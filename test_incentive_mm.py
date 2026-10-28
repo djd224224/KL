@@ -32775,7 +32775,7 @@ class TestOpportunisticAsTestBillboardVoteHub(unittest.TestCase):
             st["checked"] = 0.0
 
     def test_admitted_while_live_and_each_family_stops_alone(self):
-        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH"))
+        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH", "PICK"))
         self.assertEqual(imm.ASTEST_BB_SERIES, {"KXBBSINGLE"})
         self.assertEqual(imm.ASTEST_VH_SERIES, {"KXVHGCB"})
         self.assertEqual(imm.astest_family("KXBBSINGLE"), "BB")
@@ -32975,6 +32975,186 @@ class TestOpportunisticAsTestBillboardVoteHub(unittest.TestCase):
         self.assertEqual(self._quotes(bot, self.BB), [])
         self.assertEqual(bot._guard_now[self.BB]["guard"], "astest_fill_pause")
         self.assertTrue(bot._guard_now[self.BB]["inputs"]["family"])
+
+
+class TestOpportunisticAsTestDailyPicks(unittest.TestCase):
+    """Jack 2026-10-27: "Turn back on opportunistic bot but now pick 5
+    distinct events each day, optimizing for likelihood of profitability,
+    even better if fair value can be built, quote it at 1x size, and add it
+    to the opportunistic daily report email" -- the AS test's fourth family,
+    the events imm_astest_picks.py writes to ASTEST_PICK_FILE. Fixture events
+    far from any cutoff (2068, EST)."""
+
+    EV = "KXPICKTEST-68DEC05"
+    T = "KXPICKTEST-68DEC05-T5"
+    OTHER = "KXPICKTEST-68DEC12-T5"          # the same series, not picked
+    GAS_EV = "KXAAAGASDOR-68DEC05"
+    GAS = "KXAAAGASDOR-68DEC05-3.7000"
+
+    def setUp(self):
+        _clean_persist()
+        for p in (mock.patch.dict(imm._astest_family_stop["PICK"],
+                                  {"checked": 0.0, "stopped": False}),
+                  mock.patch.dict(imm.SERIES_OVERRIDES),
+                  mock.patch.object(imm, "ALLOWLIST_ONLY", True),
+                  mock.patch.object(imm, "ASTEST_PICK_EVENTS", {}),
+                  mock.patch.object(imm, "ASTEST_PICK_SERIES", frozenset()),
+                  mock.patch.dict(imm._ASTEST_PICK_PRIOR, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        for s in ("KXPICKTEST", "KXAAAGASDOR"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+        for f in (imm.ASTEST_PICK_FILE, imm.ASTEST_PICK_STOP_FILE):
+            path = os.path.join(imm.STATUS_DIR, f)
+            self.addCleanup(lambda s=path: os.path.exists(s) and os.remove(s))
+
+    def _write(self, picks, age_h=0.0):
+        gen = datetime.now(timezone.utc) - timedelta(hours=age_h)
+        with open(os.path.join(imm.STATUS_DIR, imm.ASTEST_PICK_FILE), "w") as fh:
+            json.dump({"generated_at": gen.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "picks": picks}, fh)
+
+    def _stop(self):
+        with open(os.path.join(imm.STATUS_DIR, imm.ASTEST_PICK_STOP_FILE), "w") as fh:
+            fh.write("stop")
+        imm._astest_family_stop["PICK"]["checked"] = 0.0
+
+    def test_the_file_admits_each_picked_event_alone(self):
+        self.assertEqual(imm.ASTEST_FAMILIES, ("BB", "VH", "PICK"))
+        self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        self.assertTrue(IncentiveMarketMaker._blocked(self.GAS))
+        self._write([{"event": self.EV},
+                     {"event": self.GAS_EV, "window_et": "16:00-24:00"}])
+        self.assertEqual(imm.load_astest_picks(), 2)
+        self.assertEqual(imm.ASTEST_PICK_EVENTS,
+                         {"KXPICKTEST": self.EV, "KXAAAGASDOR": self.GAS_EV})
+        self.assertEqual(imm.astest_family("KXPICKTEST"), "PICK")
+        self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.EV))
+        # never the rest of its series
+        self.assertFalse(IncentiveMarketMaker._allowed(self.OTHER))
+        # the gas pick: its event alone lifts the state block, quoted plain
+        self.assertFalse(IncentiveMarketMaker._blocked(self.GAS))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.GAS))
+        self.assertTrue(imm.astest_plain_gas("KXAAAGASDOR"))
+        for t in ("KXAAAGASDOR-68DEC06-3.7000", "KXAAAGASDWA-68DEC05-3.7000",
+                  "KXAAAGASD-68DEC05-3.1000"):
+            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
+        self.assertIsNone(imm.astest_family("KXPICKTESTX"))
+        self.assertEqual(imm.pilot_budget_key(self.T), imm.ASTEST_PICK_HALT_KEY)
+        # the stop file takes every pick back out; membership stays
+        self._stop()
+        self.assertIsNone(imm.astest_family("KXPICKTEST"))
+        self.assertEqual(imm.astest_member_family("KXPICKTEST"), "PICK")
+        self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        self.assertTrue(IncentiveMarketMaker._blocked(self.GAS))
+        self.assertFalse(imm.astest_plain_gas("KXAAAGASDOR"))
+        self.assertIsNone(imm.pilot_budget_key(self.T))
+
+    def test_stale_missing_refused_or_doubled_picks(self):
+        self.assertEqual(imm.load_astest_picks(), 0)                     # no file
+        self._write([{"event": self.EV}], age_h=imm.ASTEST_PICK_MAX_AGE_H + 1)
+        self.assertEqual(imm.load_astest_picks(), 0)                     # lapsed
+        self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        # one event a series; a blocked, excluded or other AS family's
+        # series is refused whatever the file says
+        self._write([{"event": self.EV}, {"event": "KXPICKTEST-68DEC12"},
+                     {"event": "KXBTCD-68DEC05"}, {"event": "KXTEMPNYCH-68DEC05"},
+                     {"event": "KXBBSINGLE-68DEC05ALL"}, {"event": ""}, {"x": 1}])
+        self.assertEqual(imm.load_astest_picks(), 1)
+        self.assertEqual(imm.ASTEST_PICK_EVENTS, {"KXPICKTEST": self.EV})
+        # an unreadable file is no picks
+        with open(os.path.join(imm.STATUS_DIR, imm.ASTEST_PICK_FILE), "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(imm.load_astest_picks(), 0)
+        self.assertIsNone(imm.astest_family("KXPICKTEST"))
+        # the kill switches
+        self._write([{"event": self.EV}])
+        with mock.patch.object(imm, "ASTEST_PICK_ENABLE", False):
+            self.assertEqual(imm.load_astest_picks(), 0)
+            self.assertNotIn(imm.ASTEST_PICK_HALT_KEY, imm.pilot_halt_keys())
+        with mock.patch.object(imm, "ASTEST_ENABLE", False):
+            self.assertEqual(imm.load_astest_picks(), 0)
+
+    def test_x1_literal_at_every_hour_with_the_picks_caps_and_window(self):
+        self._write([{"event": self.EV},
+                     {"event": self.GAS_EV, "window_et": "16:00-24:00"}])
+        imm.load_astest_picks()
+        saturday_night = utc(2068, 12, 1, 7, 0)              # 02:00 ET
+        evening = utc(2068, 12, 4, 1, 0)                     # 20:00 ET
+        for s, ev in (("KXPICKTEST", self.EV), ("KXAAAGASDOR", self.GAS_EV)):
+            self.assertEqual(imm.series_levels(s), imm.LEVELS, s)
+            self.assertEqual(imm.series_max_position(s), 50.0, s)
+            self.assertEqual(imm.event_cap_contracts(ev), 150.0, s)
+            # x1 by the clock: no quiet-hours, gas-evening, Saturday or yield size
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertEqual(imm.hour_size_mult(s, saturday_night), 1.0, s)
+            self.assertEqual(imm.hour_size_mult(s, evening), 1.0, s)
+            self.assertFalse(imm.yield_size_eligible(s), s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            self.assertIsNone(imm.size_test_arm(s), s)
+        # the gas pick quotes 16:00-24:00 ET only, on the national's guards
+        self.assertEqual(imm.SERIES_OVERRIDES["KXAAAGASDOR"].blackout_et, ("00:00", "16:00"))
+        self.assertTrue(imm.series_in_blackout("KXAAAGASDOR", utc(2068, 12, 4, 15, 0)))
+        self.assertFalse(imm.series_in_blackout("KXAAAGASDOR", utc(2068, 12, 4, 22, 0)))
+        self.assertFalse(imm.series_in_blackout("KXPICKTEST", utc(2068, 12, 4, 15, 0)))
+        self.assertEqual(imm.pilot_halt_limit(imm.ASTEST_PICK_HALT_KEY), 100.0)
+        self.assertIn(imm.ASTEST_PICK_HALT_KEY, imm.pilot_halt_keys())
+        # a pick that leaves gets its series' prior override back
+        self._write([{"event": self.GAS_EV, "window_et": "16:00-24:00"}])
+        imm.load_astest_picks()
+        self.assertNotIn("KXPICKTEST", imm.SERIES_OVERRIDES)
+        self.assertIsNone(imm.astest_family("KXPICKTEST"))
+        self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+        for k in ("ASTEST_PICK_ENABLE", "ASTEST_PICK_MAX_AGE_H", "ASTEST_PICK_MAX_POSITION",
+                  "ASTEST_PICK_EVENT_CAP", "ASTEST_PICK_DAILY_LOSS",
+                  "ASTEST_PICK_BURST_CONTRACTS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def _bot(self):
+        client = FakeClient()
+        close = utc(2068, 12, 5, 4, 0)
+        for t, ev in ((self.T, self.EV), (self.OTHER, "KXPICKTEST-68DEC12")):
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": ev, "status": "active",
+                "close_time": close.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
+                "volume_fp": "500.00"}
+            lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+                  ["0.48", "400"], ["0.49", "300"]]
+            client.books[t] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    @staticmethod
+    def _quotes(bot, ticker):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == ticker)
+
+    def test_a_pick_is_quoted_at_x1_and_a_fill_pauses_its_event(self):
+        self._write([{"event": self.EV}])
+        bot = self._bot()
+        bot.run_cycle()
+        q = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        self.assertNotEqual(q, [])
+        self.assertEqual(self._quotes(bot, self.OTHER), [])          # not picked
+        self.assertTrue(all(o["remaining_count"] <= imm.ASTEST_PICK_MAX_POSITION for o in q), q)
+        now = time.time()
+        bot._sweep_note_fill({"order_id": "o-ws", "market_ticker": self.T,
+                              "count_fp": "3.00", "ts_ms": int(now * 1000),
+                              "is_taker": False}, now)
+        self.assertAlmostEqual(bot.state.astest_fill_pause_until[self.EV], now + 900, delta=1)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot, self.T), [])
+        self.assertEqual(bot._guard_now[self.T]["guard"], "astest_fill_pause")
+        bot.state.astest_fill_pause_until[self.EV] = now - 1
+        bot.run_cycle()
+        self.assertNotEqual(self._quotes(bot, self.T), [])
 
 
 if __name__ == "__main__":
