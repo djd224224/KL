@@ -45,7 +45,11 @@ old event-rollup diff (positions endpoint realized + settlement lifetime
 totals) double-counted events traded both ways that then settled.
 
 Account value = cash + Kalshi's valuation of the open event contracts +
-the perpetual-futures account's equity (the margin API, Jack 2026-09-28).
+the perpetual-futures account's equity (the margin API, Jack 2026-09-28) +
+the numbered subaccounts (10/9 on). The subaccounts are API-only, so the
+Kalshi app shows the account value less them; the headline gives that
+figure beside it (Jack 2026-10-28: "app shows 58.5k across main account and
+perps", the email $59.6k).
 The headline also carries, in parentheses, an ESTIMATE of the value once the
 liquidity rewards already earned are paid out (imm_reward_recon.
 unpaid_estimate: accrual in program periods still running or ended since
@@ -2630,14 +2634,19 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     moves = None if first else pf.get("sub_moves", 0.0)
     subs_pnl = None if d_subs is None else round(d_subs + (moves or 0.0), 2)
     d_equity = None if first else round(d_ek + (d_perps or 0.0) + (d_subs or 0.0), 2)
+    # Kalshi's numbered subaccounts are API-only ("not yet supported in the
+    # Kalshi web or mobile app", docs.kalshi.com/getting_started/subaccounts),
+    # so the app's figure is the main account plus the perps: the headline
+    # gives it beside the account value (Jack 2026-10-28: "app shows 58.5k
+    # across main account and perps", the email $59.6k).
     if subs_eq is None:
         subs_note = ""
-    elif pf.get("subs_stale"):
-        subs_note = " (yesterday's value: today's read failed)"
-    elif not first and prior_subs is None:
-        subs_note = " (first counted today, so not in the day change)"
     else:
-        subs_note = ""
+        why = ("yesterday's value: today's read failed" if pf.get("subs_stale")
+               else "first counted today, so not in the day change"
+               if not first and prior_subs is None else "")
+        subs_note = " (API-only, not in the app" + (f"; {why}" if why else "") + ")"
+    app_value = None if subs_eq is None else round(ek + (perps_eq or 0.0), 2)
     accts = (pf.get("subs") or {}).get("accounts") or {}
     subs_label = (f"subaccount {next(iter(accts))}" if len(accts) == 1
                   else "subaccounts")
@@ -2780,7 +2789,9 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
 
     # ---- plain text ---------------------------------------------------------
     lines = [f"Kalshi portfolio — {today} (7am ET)", ""]
-    lines.append(f"Account value ${acct:,.2f}{after_txt}")
+    lines.append(f"Account value ${acct:,.2f}{after_txt}"
+                 + ("" if app_value is None else
+                    f"  ·  Kalshi app ${app_value:,.2f} (without the subaccounts)"))
     lines.append(f"  =  cash ${pf['cash']:,.2f}  +  open positions "
                  f"${pf['kalshi_positions_value']:,.2f}"
                  + ("" if perps_eq is None else
@@ -2869,6 +2880,10 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
              + ("" if unpaid_total is None else
                 f' <span style="font-size:15px;font-weight:600;color:{C_INK2}">'
                 f'(est. ${acct + unpaid_total:,.2f} after rewards are paid out)</span>')
+             + ("" if app_value is None else
+                f' <span style="font-size:15px;font-weight:600;color:{C_INK2}">'
+                f'&nbsp;&middot;&nbsp; Kalshi app ${app_value:,.2f} '
+                f'(without the subaccounts)</span>')
              + '</div>')
     if profit is None:
         h.append(f'<div style="font-size:15px;color:{C_INK2};margin:0 0 4px">'

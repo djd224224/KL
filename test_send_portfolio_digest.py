@@ -773,9 +773,10 @@ class SubaccountTests(unittest.TestCase):
         subject, text, html = pf.build_email(self._pf(), [], chart_ok=False)
         self.assertEqual(subject, "portfolio 2026-10-09: profit +$24.7k "
                                   "(day +$0.4k: trading -$0.6k, rewards +$0.4k)")
-        self.assertIn("Account value $40,708.03\n", text)
-        self.assertIn("perpetuals $120.27  +  subaccount 1 $300.00 (first counted today, "
-                      "so not in the day change)", text)
+        self.assertIn("Account value $40,708.03  ·  Kalshi app $40,408.03 "
+                      "(without the subaccounts)\n", text)
+        self.assertIn("perpetuals $120.27  +  subaccount 1 $300.00 (API-only, not in the "
+                      "app; first counted today, so not in the day change)", text)
         self.assertIn("Total profit +$24,708.03", text)
         self.assertIn("vs yesterday: +412.35  =  trading (at mid) -551.18  +  reward "
                       "credits +353.24  +  Kalshi's pricing vs mid +610.95  +  perpetuals "
@@ -808,7 +809,24 @@ class SubaccountTests(unittest.TestCase):
         subject, text, _ = pf.build_email(p, [], chart_ok=False)
         self.assertIn("reward credits & subaccount moves +53.24", text)
         self.assertIn("rewards & subaccount moves +$0.1k", subject)
-        self.assertIn("subaccounts $300.00 (yesterday's value: today's read failed)", text)
+        self.assertIn("subaccounts $300.00 (API-only, not in the app; yesterday's value: "
+                      "today's read failed)", text)
+
+    def test_headline_gives_the_kalshi_apps_figure(self):
+        # Jack 2026-10-28: "app shows 58.5k across main account and perps"
+        # against the email's $59.6k: the subaccounts are API-only, so the
+        # app's figure is the account value less them
+        p = self._pf(prior_subs=300.0, subs=312.25, moves=0.0, ntc=353.24, ek=40587.76)
+        _, text, html = pf.build_email(p, [], chart_ok=False)
+        self.assertIn("Account value $41,020.28  ·  Kalshi app $40,708.03 "
+                      "(without the subaccounts)\n", text)
+        self.assertIn("subaccount 1 $312.25 (API-only, not in the app)\n", text)
+        self.assertIn("Kalshi app $40,708.03 (without the subaccounts)", html)
+        self.assertLess(html.index("Account value"), html.index("Kalshi app"))
+        self.assertLess(html.index("Kalshi app"), html.index("Total profit"))
+        # no subaccounts: the app shows the account value itself
+        _, text, html = pf.build_email(PerpsAndRewardsTests._pf(self), [], chart_ok=False)
+        self.assertNotIn("Kalshi app", text + html)
 
     def test_history_and_chart_carry_the_subaccounts(self):
         import os
