@@ -325,10 +325,13 @@ def hold_researched(items: Dict[str, dict], targets: Dict[str, dict], state: dic
     cap; and anything dark ALERT_STALE_HOURS is alerted regardless."""
     rstate = state.get("research") or {}
     seen = state.get("items") or {}
+    # a lapsed term-end row's stand-down gap is researched as its re-check
+    recheck = {f"gap:{t['event']}": k for k, t in targets.items() if t.get("kind") == "recheck"}
     for key, it in items.items():
-        if key not in targets:
+        rkey = key if key in targets else recheck.get(key)
+        if rkey is None:
             continue
-        r = rstate.get(key) or {}
+        r = rstate.get(rkey) or {}
         n = int(r.get("attempts") or 0)
         gave_up = (r.get("status") == "judgment"
                    or (r.get("status") == "unresolved" and n >= 2)
@@ -1021,6 +1024,15 @@ RESEARCH_BACKOFF_H = (2.0, 4.0, 8.0)        # after attempt 1, 2, 3+
 # row landed) is a failed run, not "not published yet": retry sooner
 RESEARCH_ERROR_RETRY_H = float(os.environ.get("IMM_WATCH_RESEARCH_ERROR_RETRY_H", "0.5"))
 RESEARCH_MAX_ATTEMPTS = int(os.environ.get("IMM_WATCH_RESEARCH_ATTEMPTS", "6"))
+# TERM-END RE-CHECKS (Jack 2026-10-28: "date it to term end as a rule"). A
+# term-end row -- a vote not yet called, quoted to its term end
+# (imm.election_term_end) -- stands imm.ELECTION_TERM_END_RECHECK_DAYS from
+# its check. From TERM_END_REFRESH_DAYS it is a research target of its own
+# ("recheck:<event>:<checked day>", fresh tries each cycle), so a row whose
+# vote is still not called is re-stamped before it lapses, and a called
+# vote's day replaces it. Its event's stand-down gap, once it lapses, is
+# not a second target.
+TERM_END_REFRESH_DAYS = float(os.environ.get("IMM_WATCH_TERM_END_REFRESH_DAYS", "5"))
 # alert on a researchable item only once research gave up on it (a judgment
 # call, or unresolved twice) -- or when it has simply been dark this long
 ALERT_STALE_HOURS = float(os.environ.get("IMM_GAP_ALERT_STALE_HOURS", "6"))
@@ -1106,10 +1118,26 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
     imm.load_file_event_overrides()       # a --set since import is not a target
     for ev, g in sorted(live_gaps(gaps).items()):   # nor a fixed / excluded gap
         kind = gap_kind(g.get("msg") or "")
+        if kind == "election" and imm.election_term_end_row(ev) is not None:
+            continue                     # its term-end re-check (below) covers it
         if kind:
             targets[f"gap:{ev}"] = {"kind": kind, "event": ev,
                                     "series": g.get("series") or imm.series_of(ev),
                                     "msg": g.get("msg") or ""}
+    # the term-end rows due a re-check (live_gaps has just re-read the rows)
+    stored = {r.get("glob"): r for r in imm_rows.load_rows("election")}
+    for glob_s, _when, day, _zone, checked in tuple(imm.ELECTION_TERM_ENDS):
+        if now.timestamp() - checked < TERM_END_REFRESH_DAYS * 86400:
+            continue
+        stamp = datetime.fromtimestamp(checked, timezone.utc).strftime("%Y-%m-%d")
+        zone = (stored.get(glob_s) or {}).get("zone") or ""
+        targets[f"recheck:{glob_s}:{stamp}"] = {
+            "kind": "recheck", "event": glob_s, "series": imm.series_of(glob_s),
+            "checked": checked, "day": str(day),
+            "zone_arg": f" --zone {zone}" if zone else "",
+            "msg": (f"quoting to its term end {day} -- no vote was called when "
+                    f"last checked ({stamp}); out once "
+                    f"{imm.ELECTION_TERM_END_RECHECK_DAYS:g} days pass unchecked")}
     resolved = []
     for ev, series in ieo.discover_broadcast_mention_events(client, now):
         if ev in imm.EVENT_START_OVERRIDES:
@@ -1180,7 +1208,16 @@ _HOW = {
     "election": ("the VOTING DAY", "python imm_rows.py election add {ev} YYYY-MM-DD "
                  "[--zone IANA/Zone] --source \"...\" --source \"...\" --by family-watch-research "
                  "--note \"what the vote is\"   (--zone only for a jurisdiction EAST of US "
-                 "Eastern time, e.g. Asia/Jerusalem, Europe/Madrid)"),
+                 "Eastern time, e.g. Asia/Jerusalem, Europe/Madrid; add --term-end for a "
+                 "vote not yet called -- see the rules)"),
+    # a term-end row's re-check (2026-10-28): has its vote been called since?
+    "recheck": ("whether its vote has been CALLED or SCHEDULED since the last check "
+                "(a dissolution, a writ, an announced date)",
+                "called: python imm_rows.py election add {ev} YYYY-MM-DD [--zone IANA/Zone] "
+                "--source \"...\" --source \"...\" --by family-watch-research --note \"the "
+                "vote\"   |   not called yet: python imm_rows.py election add {ev} "
+                "{day}{zone} --term-end --source \"...\" --source \"...\" --by "
+                "family-watch-research --note \"no vote called as of <today>\""),
     "award": ("the FIRST narrowing of the field for that edition (nominations, "
               "shortlist or finalists announcement -- not the ceremony)",
               "python imm_rows.py award add {ev} YYYY-MM-DD --source \"...\" "
@@ -1232,8 +1269,27 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "decides: who becomes prime minister or a minister, or forms the "
         "government, after that election -- its day is the information "
         "event. A rally, debate, court case, retirement, or an appointment "
-        "or announcement that hinges on no scheduled vote is NOT a vote: "
-        "write nothing, status judgment.",
+        "or announcement that no vote decides is NOT a vote: write nothing, "
+        "status judgment.",
+        # 2026-10-28 (Jack, of KXJAPANHOUSE-30FEB07 -- "Next Japanese general
+        # election winner?", dark because no vote was called: "date it to
+        # term end as a rule")
+        "- An election target whose vote is NOT called or scheduled yet (a "
+        "'next general election', 'next leader' or snap-election market with "
+        "no date set) takes its TERM END instead: the day by which the vote "
+        "must happen under the rules in force -- the sitting term's end (a "
+        "parliament's term counted from its last election), a default date "
+        "set in law, the contract's own deadline ('before Jan 1, 2028'), or "
+        "Kalshi's own date for the event (the ticker date / occurrence in the "
+        "lookup), whichever is EARLIEST. Write it with the election command "
+        "plus --term-end; the sources show the term rule or deadline and that "
+        "no vote has been called. The bot quotes to that day and re-checks "
+        "weekly.",
+        "- A recheck target already quotes to its term end: look for news "
+        "that its vote has since been called or scheduled. Called: write the "
+        "voting day (no --term-end). Not called yet: write the same term-end "
+        "row again with the command shown (it re-stamps the check). Two "
+        "sources either way.",
         "- The only commands you may run are the ones shown, plus "
         "`python imm_rows.py election lookup EVENT` (read-only: Kalshi's own "
         "wording). If a command prints REFUSED, do not work around it.",
@@ -1245,7 +1301,7 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         lines += [f"{i}. KEY {key} -- {t['kind']}: find {what}.",
                   f"   bot says: {t['msg']}",
                   f"   Kalshi: {ctx}",
-                  f"   write with: {cmd.format(ev=t['event'])}"]
+                  f"   write with: {cmd.format(ev=t['event'], day=t.get('day', ''), zone=t.get('zone_arg', ''))}"]
     lines += [
         "",
         "Finish with ONE line, nothing after it:",
@@ -1444,6 +1500,12 @@ def target_fixed(t: dict) -> bool:
     ev = t["event"]
     if t["kind"] == "election":
         return imm.election_cutoff_utc(ev) is not None
+    if t["kind"] == "recheck":
+        # re-stamped since the target was made, or a voting day replaced it
+        row = imm.election_term_end_row(ev)
+        if row is None:
+            return imm.election_cutoff_utc(ev) is not None
+        return row[4] > float(t.get("checked") or 0.0)
     if t["kind"] == "award":
         return imm.awards_event_start(ev, None, dates_only=True) is not None
     if t["kind"] in ("start", "powerslap"):

@@ -17331,7 +17331,9 @@ AWARDS_EVENT_DATES = _parse_awards_dates(os.environ.get(
 # ceremonies, rain, etc. dont want to manually catch this going fwd" -> "yes
 # build all 5"). Dated rows the code tables lack live in two files beside the
 # state, {"rows": [{"glob", "date", "zone" (elections), "sources", "by", "at",
-# "note"}]}, written by imm_rows.py (the gap-fixer routine and hand fixes: two
+# "note"}]} ("term_end" and "checked" too on an election row for a vote not
+# yet called: election_term_end), written by imm_rows.py (the gap-fixer
+# routine and hand fixes: two
 # different sources a row) and by imm_family_watch.py's US-general rule. Re-read
 # by mtime at import and every universe refresh, so a fix lands in one refresh
 # with no deploy. The code tables are checked first and win on an event both
@@ -17344,6 +17346,9 @@ AWARDS_DATES_EXTRA_FILE = "awards_dates_extra.json"         # in STATUS_DIR
 # wildcard (the old pattern took a catch-all "KX*")
 ROWS_GLOB_RE = re.compile(r"[A-Z][A-Z0-9]{2,}[A-Z0-9*?\[\]-]*")
 ELECTION_DATES_EXTRA: List[Tuple[str, datetime, Any, Any]] = []
+# the election rows marked "term_end" (a vote not yet called, see
+# election_term_end): (glob, cutoff, day, zone, checked epoch)
+ELECTION_TERM_ENDS: List[Tuple[str, datetime, Any, Any, float]] = []
 AWARDS_DATES_EXTRA: List[Tuple[str, datetime]] = []
 _rows_extra_state: Dict[str, float] = {}
 
@@ -17621,7 +17626,8 @@ if SOFTWAREUNEMP_SIZE_MULT != 1.0 and scan_graduate_series("KXSOFTWAREUNEMP"):
 # a European / Asian vote stops at its own midnight and a Pacific / Alaskan /
 # Hawaiian one at ET midnight. Two-round and multi-day votes carry their FIRST
 # voting day. No row -> stood down (fail closed, logged once): a newly listed
-# county, city or country stays dark until its date is checked and added.
+# county, city or country stays dark until its date is checked and added --
+# or, for a vote not yet called, its TERM END (election_term_end, 2026-10-28).
 # Applied in apply_series_cutoff_adjustments, which REPLACES the incoming
 # Kalshi-derived cutoff for the family (both producers and the quote-gaps
 # mirror); the ticker-date pre-filter skips the family for the same reason.
@@ -17846,6 +17852,8 @@ _ELECTION_DATES_DEFAULT = ",".join((
     # Punjab (India) assembly: NO ROW on purpose -- unscheduled (the ECI has
     # announced nothing; the term ends 2027-03-16; Kalshi's 27FEB20 is the
     # 2022 poll date copied forward), so it stays dark until the schedule.
+    # (Since 2026-10-28 an unscheduled vote takes a hot term-end row instead,
+    # election_term_end -- here Kalshi's earlier 27FEB20.)
     # Taiwan local elections: Sat 2026-11-28, polls 8am-4pm (CEC decision
     # 2025-10-31, via the Taipei / Tainan city notices).
     "KXTAIPEIMAYOR-26NOV28*=2026-11-28@Asia/Taipei",
@@ -17900,21 +17908,32 @@ ELECTION_DATES = _parse_election_dates(os.environ.get(
 
 def load_election_dates_extra() -> int:
     """Re-read ELECTION_DATES_EXTRA_FILE when it changed. Returns how many
-    rows changed (0 when unchanged)."""
+    rows changed (0 when unchanged). A row marked "term_end" goes to
+    ELECTION_TERM_ENDS with its "checked" stamp (else its "at"), not to the
+    voting-day rows."""
     rows = _rows_file(election_dates_extra_path())
     if rows is None:
         return 0
-    fresh = []
+    fresh, term = [], []
     for r in rows:
         spec = _row_spec(r, with_zone=True)
         try:
-            fresh += list(_parse_election_dates(spec)) if spec else []
+            parsed = list(_parse_election_dates(spec)) if spec else []
         except ValueError as e:
             log(f"[IMM] ! election dates extra: {e}")
-    changed = len(set(fresh) ^ set(ELECTION_DATES_EXTRA))
+            continue
+        if r.get("term_end"):
+            checked = parse_iso_utc(str(r.get("checked") or r.get("at") or ""))
+            term += [p + ((checked.timestamp() if checked else 0.0),) for p in parsed]
+        else:
+            fresh += parsed
+    changed = (len(set(fresh) ^ set(ELECTION_DATES_EXTRA))
+               + len(set(term) ^ set(ELECTION_TERM_ENDS)))
     ELECTION_DATES_EXTRA[:] = fresh
+    ELECTION_TERM_ENDS[:] = term
     if changed:
-        log(f"[IMM] election dates extra: {len(fresh)} row(s) ({changed} changed)")
+        log(f"[IMM] election dates extra: {len(fresh)} row(s)"
+            + (f" + {len(term)} term-end" if term else "") + f" ({changed} changed)")
     return changed
 
 
@@ -17923,18 +17942,9 @@ ELECTION_OCC_BACK_HOURS = 6
 _election_disagree_warned: Set[str] = set()
 
 
-def election_cutoff_utc(event_ticker: str,
-                        market: Optional[dict] = None) -> Optional[datetime]:
-    """The verified start of an election event's voting day (as UTC) from
-    ELECTION_DATES, or None when the table has no row (the caller stands the
-    market down). Kalshi's own dates are never used; when the ticker date or
-    the occurrence's day is EARLIER than the verified day it is logged once,
-    so a stale row shows up."""
-    for glob_s, when, day, zone in tuple(ELECTION_DATES) + tuple(ELECTION_DATES_EXTRA):
-        if fnmatch.fnmatchcase(event_ticker, glob_s):
-            break
-    else:
-        return None
+def _kalshi_vote_days(event_ticker: str, market: Optional[dict], zone) -> list:
+    """Kalshi's own days for an election event's vote -- the ticker date and
+    the occurrence's day in the vote's zone. Only ever compared."""
     kalshi = []
     td = parse_event_date(event_ticker)
     if td is not None:
@@ -17947,7 +17957,83 @@ def election_cutoff_utc(event_ticker: str,
         # still counts for the voting day
         kalshi.append((occ - timedelta(hours=ELECTION_OCC_BACK_HOURS))
                       .astimezone(zone).date())
-    early = [k for k in kalshi if k < day and (k.month, k.day) != (12, 31)]
+    return kalshi
+
+
+# TERM END (Jack 2026-10-28, of KXJAPANHOUSE-30FEB07 -- "Next Japanese general
+# election winner?", 7 parties at $115 a market, dark for want of a voting
+# day -- "date it to term end as a rule"). A vote nobody has called yet (a
+# "next general election" or "next leader" market, a snap election not yet
+# triggered) has no voting day to verify, so it used to stay dark like
+# Punjab. It now quotes to its TERM END: a hot row (imm_rows.py election add
+# ... --term-end, two sources like every row) on the day by which the vote
+# must happen under the rules in force -- the sitting term's end (Japan's
+# House: four years from the 2026-02-08 election, so 2030-02-07), a default
+# date set in law, the contract's own deadline, or Kalshi's own date for the
+# event, whichever is earliest. The row stands
+# ELECTION_TERM_END_RECHECK_DAYS from its "checked" stamp; the family watch
+# re-checks it from TERM_END_REFRESH_DAYS and either re-stamps it (no vote
+# yet) or replaces it with the voting day once one is called. Past its
+# re-check, or once Kalshi dates the vote EARLIER than the row (the
+# occurrence moved: a vote may have been called), the event stands down
+# (fail closed) until research looks again. The re-check is the safety: a
+# Japanese vote comes 16-24 days after a dissolution in practice (40 at most,
+# Constitution art. 54), so a weekly look sees it a week or more before
+# voting day. Any voting-day row, code or hot, wins over a term-end row.
+# IMM_ELECTION_TERM_END_RECHECK_DAYS=0 stands every term-end row down.
+ELECTION_TERM_END_RECHECK_DAYS = _env_float("IMM_ELECTION_TERM_END_RECHECK_DAYS", 7.0)
+_election_term_end_noted: Dict[str, str] = {}
+
+
+def election_term_end_row(event_ticker: str) -> Optional[Tuple[str, datetime, Any, Any, float]]:
+    """The first ELECTION_TERM_ENDS row whose glob matches, else None."""
+    return next((r for r in tuple(ELECTION_TERM_ENDS)
+                 if fnmatch.fnmatchcase(event_ticker, r[0])), None)
+
+
+def election_term_end(event_ticker: str, market: Optional[dict] = None,
+                      now_ts: Optional[float] = None) -> Tuple[Optional[datetime], str]:
+    """(cutoff, "") when a standing term-end row dates the event; (None, why)
+    when its row is past its re-check or Kalshi now dates the vote earlier;
+    (None, "") with no term-end row."""
+    row = election_term_end_row(event_ticker)
+    if row is None:
+        return None, ""
+    _glob, when, day, zone, checked = row
+    stamp = datetime.fromtimestamp(checked, timezone.utc).strftime("%Y-%m-%d")
+    now_ts = time.time() if now_ts is None else now_ts
+    if now_ts - checked > ELECTION_TERM_END_RECHECK_DAYS * 86400:
+        return None, (f"its term-end row {day} was last checked {stamp}, over "
+                      f"{ELECTION_TERM_END_RECHECK_DAYS:g} days ago: a vote may "
+                      f"have been called")
+    early = [k for k in _kalshi_vote_days(event_ticker, market, zone)
+             if k < day and (k.month, k.day) != (12, 31)]
+    if early:
+        return None, (f"Kalshi now dates the vote {min(early)}, before its "
+                      f"term-end row {day}: a vote may have been called")
+    note = f"{day} checked {stamp}"
+    if _election_term_end_noted.get(event_ticker) != note:
+        _election_term_end_noted[event_ticker] = note
+        log(f"[IMM] {event_ticker}: no vote called yet -- quoting to its term "
+            f"end {day} (checked {stamp})")
+    return when, ""
+
+
+def election_cutoff_utc(event_ticker: str,
+                        market: Optional[dict] = None) -> Optional[datetime]:
+    """The verified start of an election event's voting day (as UTC) from
+    ELECTION_DATES, else a standing TERM-END row's (election_term_end), else
+    None (the caller stands the market down). Kalshi's own dates are never
+    used; when the ticker date or the occurrence's day is EARLIER than the
+    verified day it is logged once, so a stale row shows up (a term-end row
+    stands down on it instead)."""
+    for glob_s, when, day, zone in tuple(ELECTION_DATES) + tuple(ELECTION_DATES_EXTRA):
+        if fnmatch.fnmatchcase(event_ticker, glob_s):
+            break
+    else:
+        return election_term_end(event_ticker, market)[0]
+    early = [k for k in _kalshi_vote_days(event_ticker, market, zone)
+             if k < day and (k.month, k.day) != (12, 31)]
     if early and event_ticker not in _election_disagree_warned:
         _election_disagree_warned.add(event_ticker)
         log(f"[IMM] ! {event_ticker}: Kalshi dates the vote {min(early)} but "
@@ -18171,13 +18257,18 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         # event_start_overrides entry may still pull it earlier. Keyed on the
         # family, not its inherited override, so a producer that runs before
         # the inheritance (orphan restore) applies it too. No verified row ->
-        # stood down (fail closed), logged once.
+        # stood down (fail closed), logged once; a vote not yet called quotes
+        # to its term end (election_term_end), and the gap says why one that
+        # has a term-end row is out.
         eday = election_cutoff_utc(event_ticker, market)
         if eday is None:
             eday = RELEASE_GUARD_UNKNOWN
+            why = election_term_end(event_ticker, market)[1]
             _config_gap(series, event_ticker,
                         f"{event_ticker} has no verified "
-                        f"election day in ELECTION_DATES -- standing it down "
+                        f"election day in ELECTION_DATES"
+                        + (f" ({why})" if why else "") +
+                        " -- standing it down "
                         f"(fail closed) until a checked row is added")
         hand = EVENT_START_OVERRIDES.get(event_ticker)
         if hand is not None:

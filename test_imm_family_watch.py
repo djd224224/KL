@@ -6,8 +6,10 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import imm_family_watch as fw
 import imm_rows
@@ -362,6 +364,108 @@ class TestEventMap(unittest.TestCase):
         self.assertEqual(len(reads), 1)
         self.assertEqual(fw.event_key("KXSENGOPLEADRUN-26-27JAN01-JTHU"), "KXSENGOPLEADRUN-26")
         self.assertEqual(fw.event_key("KXHURCAT-26ISAIAS-T3"), "KXHURCAT-26ISAIAS")
+
+
+class TestTermEnd(unittest.TestCase):
+    """Jack 2026-10-28, of KXJAPANHOUSE-30FEB07 ("Next Japanese general
+    election winner?", dark because no vote was called): "date it to term
+    end as a rule"."""
+
+    EV = "KXJAPANHOUSE-30FEB07"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="term_end_")
+        self._saved = imm.STATUS_DIR
+        imm.STATUS_DIR = self.tmp
+        self.addCleanup(lambda: (setattr(imm, "STATUS_DIR", self._saved),
+                                 shutil.rmtree(self.tmp, ignore_errors=True)))
+        for lst in (imm.ELECTION_DATES_EXTRA, imm.ELECTION_TERM_ENDS):
+            self.addCleanup(lst.__setitem__, slice(None), list(lst))
+            lst[:] = []
+
+    def reload(self):
+        imm._rows_extra_state.pop(imm.election_dates_extra_path(), None)
+        imm.load_election_dates_extra()
+
+    def add(self, day="2030-02-07", term_end=True, zone="Asia/Tokyo"):
+        out = imm_rows.add_row("election", self.EV, day, ["src one", "src two"],
+                               zone=zone, by="test", term_end=term_end)
+        self.reload()
+        return out
+
+    def age(self, days):
+        rows = imm_rows.load_rows("election")
+        rows[0]["checked"] = (datetime.now(timezone.utc)
+                              - timedelta(days=days)).isoformat(timespec="seconds")
+        imm_rows.save_rows("election", rows)
+        self.reload()
+
+    def test_a_term_end_row_dates_the_vote_until_called(self):
+        ok, msg = self.add()
+        self.assertTrue(ok, msg)
+        self.assertEqual(msg, f"election row {self.EV} = 2030-02-07 @Asia/Tokyo (term end)")
+        row = imm_rows.load_rows("election")[0]
+        self.assertEqual((row["term_end"], row["checked"]), (True, row["at"]))
+        self.assertEqual(imm.election_cutoff_utc(self.EV),
+                         datetime(2030, 2, 6, 15, 0, tzinfo=timezone.utc))
+        # the same row again re-stamps its check and keeps when it was added
+        self.age(6.0)
+        before = imm_rows.load_rows("election")[0]
+        ok, msg = self.add()
+        self.assertTrue(msg.endswith("(term end, re-checked)"), msg)
+        after = imm_rows.load_rows("election")[0]
+        self.assertGreater(after["checked"], before["checked"])
+        self.assertEqual(after["at"], before["at"])
+        # a different term end needs replace; term ends are election rows only
+        self.assertFalse(self.add(day="2030-02-08")[0])
+        self.assertIn("--term-end is for election rows only", imm_rows.validate(
+            "award", "KXOSCARPIC-28", "2028-01-20", "", ["a", "b"], term_end=True))
+        # the vote is called: its voting day replaces the term end outright...
+        ok, msg = self.add(day="2027-05-16", term_end=False)
+        self.assertTrue(ok, msg)
+        self.assertEqual(imm.ELECTION_TERM_ENDS, [])
+        self.assertEqual(imm.election_cutoff_utc(self.EV),
+                         datetime(2027, 5, 15, 15, 0, tzinfo=timezone.utc))
+        # ...but a term end never silently replaces a voting day
+        self.assertFalse(self.add()[0])
+
+    def test_research_rechecks_a_row_before_it_lapses(self):
+        self.add()
+        now = datetime.now(timezone.utc)
+        gaps = {self.EV: {"series": "KXJAPANHOUSE",
+                          "msg": f"{self.EV} has no verified election day in ELECTION_DATES "
+                                 "(its term-end row 2030-02-07 was last checked ...)"}}
+        with mock.patch.object(fw.ieo, "discover_broadcast_mention_events", lambda c, now: []):
+            self.assertEqual(fw.research_targets(None, {}, now, dry=True), {})   # fresh
+            self.age(5.5)                                  # due a re-check, still quoting
+            t = fw.research_targets(None, {}, now, dry=True)
+            key = f"recheck:{self.EV}:{(now - timedelta(days=5.5)):%Y-%m-%d}"
+            self.assertEqual(sorted(t), [key])
+            self.age(7.5)                                  # lapsed: the bot's gap is back
+            self.assertIsNone(imm.election_cutoff_utc(self.EV))
+            t = fw.research_targets(None, gaps, now, dry=True)
+        key = f"recheck:{self.EV}:{(now - timedelta(days=7.5)):%Y-%m-%d}"
+        self.assertEqual(sorted(t), [key])                 # the gap is no second target
+        tgt = t[key]
+        p = fw.research_prompt([(key, tgt, "")])
+        self.assertIn(f"KEY {key} -- recheck: find whether its vote has been CALLED", p)
+        self.assertIn(f"python imm_rows.py election add {self.EV} 2030-02-07 --zone "
+                      "Asia/Tokyo --term-end", p)
+        self.assertIn("takes its TERM END instead", p)
+        # its gap is held while research works on the re-check
+        items = {f"gap:{self.EV}": {"est": 30.0, "what": "w", "fix": "f"}}
+        state = {"research": {key: {"attempts": 1, "status": "unresolved", "note": "n"}},
+                 "items": {f"gap:{self.EV}": {"first": time.time()}}}
+        fw.hold_researched(items, t, state, time.time())
+        self.assertTrue(items[f"gap:{self.EV}"]["hold"])
+        # done once re-stamped, or once a voting day replaced it
+        self.assertFalse(fw.target_fixed(tgt))
+        self.add()
+        self.assertTrue(fw.target_fixed(tgt))
+        self.age(8.0)
+        self.assertFalse(fw.target_fixed(tgt))
+        self.add(day="2027-05-16", term_end=False)
+        self.assertTrue(fw.target_fixed(tgt))
 
 
 class TestResearchOnArrival(unittest.TestCase):

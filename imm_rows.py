@@ -19,6 +19,16 @@ code table already covers is refused (the code row wins at lookup; fix it there)
   python imm_rows.py election list
   python imm_rows.py award remove KXCRITICSCHOICENOM-SONG27
   python imm_rows.py election lookup KXSTATELEG-TXSENA26   # read-only Kalshi wording
+
+TERM END (Jack 2026-10-28: "date it to term end as a rule"): a vote nobody has
+called yet takes --term-end -- the day by which it must happen (the sitting
+term's end, a default date in law, the contract's deadline or Kalshi's own
+date, the earliest). The row gets a "checked" stamp; the bot quotes to it for
+incentive_mm.ELECTION_TERM_END_RECHECK_DAYS from that stamp, the family
+watch's research re-checks it weekly, adding the same row again re-stamps it,
+and a voting-day add replaces it once the vote is called:
+  python imm_rows.py election add KXJAPANHOUSE-30FEB07 2030-02-07 --zone Asia/Tokyo \\
+      --term-end --source ... --source ...
 """
 
 import argparse
@@ -60,10 +70,13 @@ def _code_table(kind: str) -> List[str]:
     return [r[0] for r in (imm.ELECTION_DATES if kind == "election" else imm.AWARDS_EVENT_DATES)]
 
 
-def validate(kind: str, glob: str, day: str, zone: str, sources: List[str]) -> str:
+def validate(kind: str, glob: str, day: str, zone: str, sources: List[str],
+             term_end: bool = False) -> str:
     """'' when the row is acceptable, else why not."""
     if kind not in KINDS:
         return f"kind must be one of {KINDS}"
+    if term_end and kind != "election":
+        return "--term-end is for election rows only"
     if not imm.ROWS_GLOB_RE.fullmatch(glob or ""):
         return (f"bad event glob {glob!r} (a series name of 3+ letters/digits, "
                 f"then letters/digits/-/*?[])")
@@ -87,25 +100,42 @@ def validate(kind: str, glob: str, day: str, zone: str, sources: List[str]) -> s
 
 
 def add_row(kind: str, glob: str, day: str, sources: List[str], zone: str = "",
-            by: str = "", note: str = "", replace: bool = False) -> Tuple[bool, str]:
-    """Validate and write one row. (ok, message)."""
-    why = validate(kind, glob, day, zone, sources)
+            by: str = "", note: str = "", replace: bool = False,
+            term_end: bool = False) -> Tuple[bool, str]:
+    """Validate and write one row. (ok, message). The same term-end row again
+    re-stamps its "checked"; a voting-day row replaces a term-end one (the
+    vote was called) without `replace`."""
+    why = validate(kind, glob, day, zone, sources, term_end)
     if why:
         return False, why
     rows = load_rows(kind)
     old = [r for r in rows if r.get("glob") == glob]
+    restamp = False
     if old and not replace:
-        if old[0].get("date") == day and (old[0].get("zone") or "") == (zone or ""):
-            return True, f"{glob} already = {day} (unchanged)"
-        return False, f"{glob} already has a row ({old[0].get('date')}); pass replace to change it"
+        was_term = bool(old[0].get("term_end"))
+        if old[0].get("date") == day and (old[0].get("zone") or "") == (zone or "") \
+                and was_term == term_end:
+            if not term_end:
+                return True, f"{glob} already = {day} (unchanged)"
+            restamp = True
+        elif not (was_term and not term_end):
+            return False, (f"{glob} already has a row ({old[0].get('date')}"
+                           + (", term end" if was_term else "")
+                           + "); pass replace to change it")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     row = {"glob": glob, "date": day, "sources": [s.strip() for s in sources if s.strip()],
-           "by": by or "hand", "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+           "by": by or "hand", "at": (old[0].get("at") or now) if restamp else now}
     if zone:
         row["zone"] = zone
     if note:
         row["note"] = note
+    if term_end:
+        row["term_end"] = True
+        row["checked"] = now
     save_rows(kind, [r for r in rows if r.get("glob") != glob] + [row])
-    return True, f"{kind} row {glob} = {day}" + (f" @{zone}" if zone else "")
+    return True, (f"{kind} row {glob} = {day}" + (f" @{zone}" if zone else "")
+                  + ((" (term end, re-checked)" if restamp else " (term end)")
+                     if term_end else ""))
 
 
 def remove_row(kind: str, glob: str) -> Tuple[bool, str]:
@@ -151,6 +181,9 @@ def main(argv=None) -> int:
     a.add_argument("--by", default="hand")
     a.add_argument("--note", default="")
     a.add_argument("--replace", action="store_true")
+    a.add_argument("--term-end", action="store_true",
+                   help="election only: a vote not yet called, dated to its term end "
+                        "(re-adding the same row re-stamps its check)")
     r = sub.add_parser("remove")
     r.add_argument("glob")
     sub.add_parser("list")
@@ -164,13 +197,15 @@ def main(argv=None) -> int:
         for row in load_rows(args.kind):
             print(f"{row.get('glob')} = {row.get('date')}"
                   + (f" @{row['zone']}" if row.get("zone") else "")
+                  + (f" (term end, checked {row.get('checked')})" if row.get("term_end") else "")
                   + f"  [{row.get('by')}, {row.get('at')}]  " + " | ".join(row.get("sources") or []))
         return 0
     if args.cmd == "remove":
         ok, msg = remove_row(args.kind, args.glob)
     else:
         ok, msg = add_row(args.kind, args.glob, args.date, args.source, zone=args.zone,
-                          by=args.by, note=args.note, replace=args.replace)
+                          by=args.by, note=args.note, replace=args.replace,
+                          term_end=args.term_end)
     print(("OK: " if ok else "REFUSED: ") + msg)
     return 0 if ok else 1
 

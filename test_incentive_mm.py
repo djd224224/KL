@@ -28391,6 +28391,79 @@ class TestMentionAutoFamily(unittest.TestCase):
             wh.assert_not_called()
 
 
+class TestElectionTermEnd(unittest.TestCase):
+    """Jack 2026-10-28, of KXJAPANHOUSE-30FEB07 ("Next Japanese general
+    election winner?", dark because no vote was called): "date it to term
+    end as a rule"."""
+
+    EV = "KXJAPANHOUSE-30FEB07"
+    TERM = utc(2030, 2, 6, 15, 0)                  # 00:00 Tokyo on Feb 7
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="imm_term_end_")
+        for p in (mock.patch.object(imm, "STATUS_DIR", self.tmp),
+                  mock.patch.object(imm, "election_series", lambda s: s == "KXJAPANHOUSE"),
+                  mock.patch.dict(imm._config_gaps, clear=True),
+                  mock.patch.object(imm, "_write_config_gaps", lambda: None)):
+            p.start()
+            self.addCleanup(p.stop)
+        for lst in (imm.ELECTION_DATES_EXTRA, imm.ELECTION_TERM_ENDS):
+            self.addCleanup(lst.__setitem__, slice(None), list(lst))
+            lst[:] = []
+        self.addCleanup(imm._release_guard_warned.discard, self.EV)
+
+    def write(self, checked_days_ago, term_end=True, day="2030-02-07"):
+        at = (datetime.now(timezone.utc)
+              - timedelta(days=checked_days_ago)).isoformat(timespec="seconds")
+        row = {"glob": self.EV, "date": day, "zone": "Asia/Tokyo",
+               "sources": ["a", "b"], "by": "test", "at": at}
+        if term_end:
+            row.update(term_end=True, checked=at)
+        with open(imm.election_dates_extra_path(), "w", encoding="utf-8") as f:
+            json.dump({"rows": [row]}, f)
+        imm._rows_extra_state.pop(imm.election_dates_extra_path(), None)
+        imm.load_election_dates_extra()
+        imm._release_guard_warned.discard(self.EV)
+
+    def cutoff(self, occ="2030-02-07T14:00:00Z"):
+        return imm.apply_series_cutoff_adjustments(
+            "KXJAPANHOUSE", self.EV, None, None, {"occurrence_datetime": occ})
+
+    def test_quotes_to_the_term_end_until_its_check_lapses(self):
+        self.write(1)
+        self.assertEqual(len(imm.ELECTION_TERM_ENDS), 1)
+        self.assertEqual(imm.ELECTION_DATES_EXTRA, [])
+        # Kalshi's own date for it (the term's last day) is no earlier
+        self.assertEqual(self.cutoff(), self.TERM)
+        self.assertEqual(imm._config_gaps, {})
+        self.write(6.9)
+        self.assertEqual(self.cutoff(), self.TERM)
+        self.write(7.1)                                       # unchecked a week: out
+        self.assertEqual(self.cutoff(), imm.RELEASE_GUARD_UNKNOWN)
+        msg = imm._config_gaps[self.EV]["msg"]
+        self.assertIn("no verified election day in ELECTION_DATES (its term-end row "
+                      "2030-02-07 was last checked", msg)
+        self.assertIn("over 7 days ago: a vote may have been called", msg)
+        with mock.patch.object(imm, "ELECTION_TERM_END_RECHECK_DAYS", 0.0):
+            self.write(0.01)
+            self.assertIsNone(imm.election_cutoff_utc(self.EV))
+
+    def test_an_earlier_kalshi_date_stands_it_down_and_a_voting_day_wins(self):
+        self.write(1)
+        self.assertEqual(self.cutoff(occ="2027-05-16T11:00:00Z"), imm.RELEASE_GUARD_UNKNOWN)
+        self.assertIn("Kalshi now dates the vote 2027-05-16, before its term-end row "
+                      "2030-02-07", imm._config_gaps[self.EV]["msg"])
+        # the vote is called: a voting-day row (here hot, plain) takes over
+        self.write(1, term_end=False, day="2027-05-16")
+        self.assertEqual(imm.ELECTION_TERM_ENDS, [])
+        self.assertEqual(self.cutoff(occ="2027-05-16T11:00:00Z"), utc(2027, 5, 15, 15, 0))
+        # ...and a code-table row beats a hot term-end one
+        self.write(1)
+        with mock.patch.object(imm, "ELECTION_DATES", imm._parse_election_dates(
+                f"{self.EV}*=2027-05-16@Asia/Tokyo")):
+            self.assertEqual(imm.election_cutoff_utc(self.EV), utc(2027, 5, 15, 15, 0))
+
+
 class TestElectionBatch20261005(unittest.TestCase):
     """Jack 2026-10-05: "add all of them including sweden and uk. also
     create a rule in the new-series pass for Kalshi's Elections category"."""
