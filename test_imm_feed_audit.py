@@ -184,6 +184,26 @@ class TestTheOverridesFileDatesEvents(unittest.TestCase):
         self.assertEqual([l for l in a["miss_lines"] if l.startswith(ev)], [])
 
 
+class TestCentralBanksAreAdmittedFromTheFeed(unittest.TestCase):
+    """Jack 2026-10-27: "do 1 and 2" (1: the family watch, built on this
+    audit, called KXCBDCOLOMBIA "a new family" while the bot -- which admits
+    every KXCBD* bank from the programs feed -- quoted 3 of its markets)."""
+
+    def test_a_bank_in_the_feed_is_allowed_not_a_new_family(self):
+        t = "KXCBDCOLOMBIA-26DEC18-H25"
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(imm, "FINECON_SERIES", set(imm.FINECON_SERIES)), \
+                mock.patch.object(imm, "FINECON_FAMILY", set(imm.FINECON_FAMILY)), \
+                mock.patch.dict(imm.SERIES_OVERRIDES), \
+                mock.patch.object(imm, "EventStartResolver", _NoResolver):
+            self.assertFalse(imm.IncentiveMarketMaker._allowed(t))
+            a = fa.run_audit(progs={t: _prog(now - timedelta(hours=1))})
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(t))
+        self.assertNotIn("KXCBDCOLOMBIA", a["not_allowed"])
+        # close-anchored like the hand-listed banks: not judged off the feed
+        self.assertEqual([l for l in a["miss_lines"] if l.startswith("KXCBDCOLOMBIA")], [])
+
+
 class TestAbsentSkipsBlockedFamilies(unittest.TestCase):
 
     def test_a_blocked_family_losing_its_programs_is_not_a_miss(self):

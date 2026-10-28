@@ -112,6 +112,14 @@ def run_audit(client=None, progs=None) -> dict:
     # starts, but not the times it writes later in the same run. Merged by
     # mtime, never written.
     imm.load_file_event_overrides()
+    # ...and the central-bank family (FINECON_SERIES_PREFIXES, "KXCBD"),
+    # which the bot admits from the live programs feed at every refresh
+    # (finecon_expand_family, in memory only). Without it every bank past
+    # the hand-listed two read as not-allowed, and the family watch built on
+    # this audit flagged KXCBDCOLOMBIA / KXCBDTHAILAND / KXCBDCHILE as "a new
+    # family" while the bot quoted 3 markets of each (Jack 2026-10-27: "do 1
+    # and 2", 1 = fix the watch's false new-family flag on central banks).
+    imm.finecon_expand_family(progs)
 
     by_event = defaultdict(list)
     for t in progs:
