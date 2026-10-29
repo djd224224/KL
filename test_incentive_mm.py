@@ -29850,6 +29850,31 @@ class TestComplementLead(unittest.TestCase):
                                       1000.0, 0.5, hold_bid=26)
         self.assertEqual((lb[0], la), (26, None))
 
+    def test_an_outbid_side_stays_low_across_a_restart_and_a_drop_out(self):
+        # Jack 2026-10-29 "Stay low": the copier sat alone at 66c over our
+        # 21c lead. A bot that forgot the lead (restart, or D dropped and
+        # re-estimated) read it fresh: no lead above 66c under the 69c cap,
+        # so the at-reference rung joined the copier. The hold file keeps it.
+        d_yes = [[1, 1001], [2, 2004], [3, 2], [15, 583], [66, 593]]
+        meta = self._meta(self.D)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(imm, "STATUS_DIR", tmp), \
+                mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot._ws = self._feed(d_yes, self.D_NO, self.R_YES, self.R_NO)
+            bot._comp_pairs = {self.D: self.R, self.R: self.D}
+            self.assertEqual(bot._comp_lead(meta, d_yes, self.D_NO), (None, None))
+            bot._note_comp_hold(self.D, 21, None, time.time())
+            bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self.assertEqual(bot2._comp_holds[self.D][:2], [21, None])
+            bot2._ws, bot2._comp_pairs = bot._ws, bot._comp_pairs
+            self.assertEqual(bot2._comp_lead(meta, d_yes, self.D_NO)[0], (21, 69, 15))
+            # a lapsed entry is forgotten
+            bot2._comp_holds[self.D][2] = time.time() - imm.COMP_HOLD_TTL_SECS - 1
+            self.assertEqual(bot2._comp_lead(meta, d_yes, self.D_NO), (None, None))
+
     def test_scope(self):
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
                 mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):

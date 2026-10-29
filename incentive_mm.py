@@ -11113,7 +11113,7 @@ _CONFIG_CODE_KNOBS = (
     "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
-    "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH",
+    "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -19491,6 +19491,14 @@ COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
 # event reads per universe refresh
 COMP_PAIR_TTL_SECS = _env_float("IMM_COMP_PAIR_TTL_H", 12.0) * 3600.0
 COMP_PAIR_READS_PER_REFRESH = _env_int("IMM_COMP_PAIR_READS", 80)
+# Where each side last led, kept in STATUS_DIR (Jack 2026-10-29: "Stay low").
+# After the Wisconsin D lead walked back to 21c the copier sat on alone at
+# 66c. A side that forgot its lead -- a restart, or the market dropping out
+# and coming back -- read the book fresh and its at-reference rung joined the
+# copier up there. The remembered price is the hold comp_side_lead keeps:
+# never up, not past an order above it. An entry lapses after the TTL.
+COMP_HOLD_FILE = "comp_lead_holds.json"
+COMP_HOLD_TTL_SECS = _env_float("IMM_COMP_HOLD_TTL_H", 168.0) * 3600.0
 
 
 def comp_lead_series(series: str) -> bool:
@@ -20618,6 +20626,8 @@ class IncentiveMarketMaker:
         self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
+        # ticker -> [bid, ask, at]: where its sides last led (COMP_HOLD_FILE)
+        self._comp_holds: Dict[str, list] = self._load_comp_holds()
         # (ticker, side) -> change points (ts, own-space price or None) of
         # where our rung rested, for the lone-reference guard's jump test;
         # and the sides it holds right now
@@ -27228,11 +27238,49 @@ class IncentiveMarketMaker:
         own_t = self._comp_own.get(twin, []) if self.live else []
         if own_t:
             ty, tn = external_levels(ty, tn, own_t)
-        # where its sides lead now: a leading side never moves up
-        held = self._comp_lead_px.get(meta.ticker) or (None, None, 0)
+        # where its sides lead now, else where they last led (COMP_HOLD_FILE):
+        # a leading side never moves up
+        held = self._comp_lead_px.get(meta.ticker)
+        if held is None:
+            h = self._comp_holds.get(meta.ticker)
+            if h is not None and time.time() - float(h[2]) < COMP_HOLD_TTL_SECS:
+                held = (h[0], h[1], 0)
+        held = held or (None, None, 0)
         return comp_lead_prices(yes_ext, no_ext, ty, tn,
                                 meta.target_size, meta.discount_factor,
                                 hold_bid=held[0], hold_ask=held[1])
+
+    def _load_comp_holds(self) -> Dict[str, list]:
+        """COMP_HOLD_FILE's entries ({} when absent or unreadable)."""
+        try:
+            with open(os.path.join(STATUS_DIR, COMP_HOLD_FILE), encoding="utf-8") as f:
+                d = json.load(f)
+            return {str(k): list(v) for k, v in (d.get("holds") or {}).items()
+                    if isinstance(v, list) and len(v) == 3}
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    def _note_comp_hold(self, t: str, bid: Optional[int], ask: Optional[int],
+                        now_ts: float) -> None:
+        """Remember where `t`'s sides lead (COMP_HOLD_FILE): written when it
+        changes, lapsed entries dropped. Never raises."""
+        old = self._comp_holds.get(t)
+        if old is not None and old[0] == bid and old[1] == ask:
+            return
+        self._comp_holds[t] = [bid, ask, now_ts]
+        self._comp_holds = {k: v for k, v in self._comp_holds.items()
+                            if now_ts - float(v[2]) < COMP_HOLD_TTL_SECS}
+        path = os.path.join(STATUS_DIR, COMP_HOLD_FILE)
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"updated": datetime.now(timezone.utc).isoformat(),
+                           "holds": self._comp_holds}, f, indent=1, sort_keys=True)
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            if not getattr(self, "_comp_hold_err_logged", False):
+                self._comp_hold_err_logged = True
+                log(f"{self.tag} ! {COMP_HOLD_FILE} write failed ({e}); the "
+                    f"holds stay in memory (logged once)")
 
     def _comp_lead_note(self, t: str, lead_b, lead_a, n: int) -> None:
         """Log each side's complement lead when it starts, stops or moves
@@ -30694,6 +30742,8 @@ class IncentiveMarketMaker:
             if lead_on_b or lead_on_a:
                 self._comp_lead_px[t] = (lead_b[0] if lead_on_b else None,
                                          lead_a[0] if lead_on_a else None, lead_n)
+                self._note_comp_hold(t, self._comp_lead_px[t][0],
+                                     self._comp_lead_px[t][1], now_ts)
             else:
                 self._comp_lead_px.pop(t, None)
 
