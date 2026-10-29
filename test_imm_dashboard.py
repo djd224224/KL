@@ -898,6 +898,49 @@ class FillDayTests(unittest.TestCase):
         self.assertEqual(sorted(out["mult"]), ["2026-09-12"])
 
 
+class SeriesSizeTests(unittest.TestCase):
+    """Each series' size for the portfolio email's DOUBLE DOWN (Jack
+    2026-10-29: "i had already 1.5x'ed these. is the daily email saying i
+    should double down again?")."""
+
+    def test_sizes_follow_the_bot_rules(self):
+        class FakeImm:
+            LEVELS = [(0, 20)]
+            overrides = {"KXRT": 3.0}                      # a family size
+            ladders = {"KXLAD": 15}                        # a hand ladder, x1
+            parents = {"KXHIGHNY": "KXHIGHFAMILY"}         # a member, cloned at refresh
+            loaded = []
+
+            @classmethod
+            def load_hight_fair(cls):
+                cls.loaded.append("high")
+
+            @classmethod
+            def ensure_family_override(cls, s):
+                if s in cls.parents:
+                    cls.overrides[s] = 5.0
+
+            @classmethod
+            def series_side_max(cls, s):
+                return cls.ladders.get(s, 20)
+
+            @classmethod
+            def applied_mention_mult(cls, s):
+                if s == "KXBAD":
+                    raise KeyError(s)
+                return cls.overrides.get(s, 1.0) * cls.size_test_mult(s)
+
+            @staticmethod
+            def size_test_mult(s):
+                return 1.5 if s == "KXTEST" else 1.0
+
+        out = dash.series_sizes(FakeImm, {"KXRT", "KXLAD", "KXHIGHNY", "KXTEST", "KXBAD"})
+        self.assertEqual(out, {"KXHIGHNY": [5.0, 1.0], "KXLAD": [0.75, 1.0], "KXRT": [3.0, 1.0],
+                               "KXTEST": [1.5, 1.5]})
+        self.assertEqual(FakeImm.loaded, ["high"])         # the temp members, before the clone
+        self.assertEqual(dash.series_sizes(None, {"KXRT"}), {})
+
+
 class RenderTests(unittest.TestCase):
     def test_data_cannot_close_the_script_tag(self):
         page = dash.render({"x": "</script><script>alert(1)</script>", "timing": {}})

@@ -1628,6 +1628,73 @@ class AdviceLinesTests(unittest.TestCase):
                                                "fills."), text[-300:])
 
 
+class AdviceResizeTests(unittest.TestCase):
+    """Jack 2026-10-29: "i had already 1.5x'ed these. is the daily email
+    saying i should double down again?" -- a line just sized up is not
+    doubled again on numbers from the old size."""
+
+    def setUp(self):
+        from unittest import mock
+        p = mock.patch.object(pf, "load_event_titles", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_history_keeps_the_day_a_size_went_up(self):
+        seed = pf.size_history({"KXRT": [3.0, 1.0], "KXAPRPOTUS": [4.0, 1.0],
+                                "KXA": [1.5, 1.5]}, {}, "2026-10-30")
+        # the 10/25-26 size-ups from before the file, while the size reads the same
+        self.assertEqual(seed["KXRT"], {"x": 3.0, "up": "2026-10-26", "was": 2.0})
+        self.assertEqual(seed["KXAPRPOTUS"], {"x": 4.0})          # moved since: no seed
+        self.assertEqual(seed["KXA"], {"x": 1.0})                 # the size test's part is out
+        h = pf.size_history({"KXRT": [3.0, 1.0], "KXA": [3.0, 1.5]}, seed, "2026-11-02")
+        self.assertEqual(h["KXRT"], seed["KXRT"])                 # the same size: kept
+        self.assertEqual(h["KXA"], {"x": 2.0, "up": "2026-11-02", "was": 1.0})
+        self.assertEqual(h["KXAPRPOTUS"], {"x": 4.0})             # not read today: kept
+        # the size test's end is no resize; a size cut ends the size-up
+        self.assertEqual(pf.size_history({"KXA": [2.0, 1.0]}, h, "2026-11-09")["KXA"], h["KXA"])
+        self.assertEqual(pf.size_history({"KXA": [1.0, 1.0]}, h, "2026-11-04")["KXA"],
+                         {"x": 1.0})
+        # the file round-trips; a missing one reads empty
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "series_sizes.json")
+        pf.write_size_history(h, path)
+        self.assertEqual(pf.load_size_history(path), h)
+        self.assertEqual(pf.load_size_history(path + ".missing"), {})
+
+    def test_no_double_down_on_a_line_just_sized_up(self):
+        d = _dash(bad_week=False)                 # KXTM and KXAI both clear the bar
+        d["sizes"] = {"KXTM": [3.0, 1.0], "KXAI": [1.0, 1.0]}
+        hist = {"KXTM": {"x": 3.0, "up": "2026-10-12", "was": 2.0}, "KXAI": {"x": 1.0}}
+        adv = pf.imm_advice(d, "2026-10-19", sizes=hist)
+        dd = [t for v, t in adv["recs"] if v == "DOUBLE DOWN"]
+        self.assertEqual(len(dd), 1)
+        # a DOUBLE DOWN names the size now and after
+        self.assertTrue(dd[0].startswith("KXAI, AI & tech: x1.5 (x1 -> x1.5). Why: "), dd[0])
+        self.assertIn("Already sized up, so no DOUBLE DOWN yet: KXTM x2 -> x3 on Mon 10/12 "
+                      "(judged again from Mon 10/26). A size-up runs 14 days at its new size "
+                      "before it is judged again.", adv["context"])
+        rows = {r["name"]: r for f in adv["lines"] for r in f["rows"]}
+        self.assertEqual(rows["KXTM"]["call"], "KEEP")
+        self.assertTrue(rows["KXTM"]["why"].endswith("; sized up x2 -> x3 on Mon 10/12"))
+        # 14 days at the new size: judged again, from x3
+        hist["KXTM"]["up"] = "2026-10-05"
+        dd = [t for v, t in pf.imm_advice(d, "2026-10-19", sizes=hist)["recs"]
+              if v == "DOUBLE DOWN"]
+        self.assertTrue(any(t.startswith("KXTM, TRUMP mentions: x1.5 (x3 -> x4.5). Why: ")
+                            for t in dd), dd)
+
+    def test_no_double_down_in_the_size_tests_half(self):
+        d = _dash(bad_week=False)
+        d["sizes"] = {"KXTM": [1.5, 1.5], "KXAI": [3.0, 1.5]}
+        adv = pf.imm_advice(d, "2026-10-19")      # no history: the dashboard's sizes alone
+        self.assertNotIn("DOUBLE DOWN", [v for v, _ in adv["recs"]])
+        held = [c for c in adv["context"] if c.startswith("Already sized up")]
+        self.assertEqual(held, ["Already sized up, so no DOUBLE DOWN yet: KXTM (in the size "
+                                "test's x1.5 half); KXAI (in the size test's x1.5 half)."])
+        # the lines cleared the bar, so the block does not say none did
+        self.assertFalse([c for c in adv["context"] if c.startswith("Double down: no line")])
+
+
 class AdviceMonthTests(unittest.TestCase):
     """Jack 2026-10-25: "Make sure shrink/double down decisions are also
     contemplating 30D of data not just 7"."""

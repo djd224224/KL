@@ -22,7 +22,8 @@ already held -- and says what moved yesterday, then numbered
 recommendations with their why: SHRINK a family, PAUSE / SHRINK a series
 or a specific event whose quoting loses persistently, HOLD / TRIM a
 family's open losers by what is left to lose, NO CHANGE on one bad day,
-DOUBLE DOWN (x1.5) on a line that earns with light fills, KEEP what works;
+DOUBLE DOWN (x1.5) on a line that earns with light fills and was not just
+sized up (since 2026-10-29), KEEP what works;
 then what is NEW THIS WEEK (lines, series and events first seen) and, at
 the end of the email, EVERY LINE (MLB, Red Rocks, ...: a league, a group
 or a series) with its call (since 2026-10-25). Kill: PF_ADVICE=0.
@@ -1486,7 +1487,16 @@ def _mover_tag(r) -> str:
 #     ADVICE_DD_UP_SHARE_30 of the days it earned over the 30, up over both,
 #     and adding ADVICE_DD_GAIN a day or more at both paces by the 10/11 size
 #     study's response (rewards ~ size^0.51, fill losses ~ size^0.90; held
-#     positions count with the fills, and only as losses).
+#     positions count with the fills, and only as losses). Not on a line
+#     sized up in the last ADVICE_DD_RESIZE_DAYS, nor on one in the size
+#     test's x1.5 half (Jack 2026-10-29: "i had already 1.5x'ed these. is the
+#     daily email saying i should double down again?" -- the 10/29 email
+#     named KXRT, Vercel and KXAPRPOTUS again three days after he took them
+#     x2 -> x3 and x3 -> x5, on 30 days 27 of which ran at the old size): a
+#     context line names them and the day they are judged again. A DOUBLE
+#     DOWN names the line's size now and after (x3 -> x4.5). Sizes: the
+#     dashboard's D.sizes (the bot's ladder x its family multiplier);
+#     series_sizes.json keeps the day each series last went up.
 #   KEEP the families whose rewards beat their fills.
 # Below the family (Jack 2026-10-25: "How about mlb, red rocks, etc? Also give
 # suggestions on where to double down. Also explicitly callout performance
@@ -1567,6 +1577,17 @@ ADVICE_DD_UP_DAYS = 5          #   this many of the 7 days,
 ADVICE_DD_ACTIVE = 14          #   it earned on this many of the 30,
 ADVICE_DD_UP_SHARE_30 = 0.6    #   its quoting up on this share of those, and up over them
 ADVICE_MAX_DD = 3
+ADVICE_DD_RESIZE_DAYS = 14     # ... and not within this many days of a size-up
+ADVICE_MAX_DD_HELD = 5         # sized-up lines named in the context line
+# the size-ups from before series_sizes.json kept them: series -> (ET day it
+# went live, size before, size after), used only while the dashboard reads
+# that size after
+_VERCEL_SERIES = ("KXOPENVSPEND", "KXMOONVSPEND", "KXANTHVSPEND", "KXGOOGVREQ", "KXOPENVREQ",
+                  "KXDEEPVREQ", "KXANTHVREQ", "KXOPENSOURCESHARE")
+ADVICE_SIZE_SEED = {"KXAPRPOTUS": ("2026-10-25", 3.0, 5.0),                # 49519da
+                    "KXRT": ("2026-10-26", 2.0, 3.0),                      # 3a64752
+                    **dict.fromkeys(_VERCEL_SERIES, ("2026-10-26", 2.0, 3.0))}
+SIZE_HISTORY_PATH = os.path.join(LOG_DIR, "series_sizes.json")
 # the 30 days' say on a cut the 7 days call for: a month whose quoting pays
 # takes the cut a step down while the week's rewards run at least this share
 # of the month's pace (below it, the month was paid by a program since gone)
@@ -1588,6 +1609,47 @@ def load_imm_dashboard(path: str = IMM_DASH_HTML) -> dict:
     i = html.index("const D = ") + len("const D = ")
     data, _ = json.JSONDecoder().raw_decode(html, i)
     return data
+
+
+def size_history(sizes: dict, old: dict, today_str: str) -> dict:
+    """Each series' size after today's read: {series: {"x": its size outside
+    the size test, "up": the ET day it last went up, "was": the size
+    before}}. `sizes`: the dashboard's D.sizes, {series: [size now, the size
+    test's part]}; a series it leaves out keeps its entry. A series new to
+    the history takes ADVICE_SIZE_SEED's day while it reads the seed's size."""
+    out = dict(old)
+    for s, v in (sizes or {}).items():
+        x = round(_f(v[0]) / (_f(v[1]) or 1.0), 3)
+        prev = old.get(s)
+        if prev is None:
+            seed = ADVICE_SIZE_SEED.get(s)
+            out[s] = ({"x": x, "up": seed[0], "was": seed[1]}
+                      if seed and abs(seed[2] - x) < 0.01 else {"x": x})
+        elif x > _f(prev.get("x")) * 1.01:
+            out[s] = {"x": x, "up": today_str, "was": _f(prev.get("x"))}
+        elif x < _f(prev.get("x")) * 0.99:
+            out[s] = {"x": x}                       # sized down: not a size-up any more
+    return out
+
+
+def load_size_history(path: str = SIZE_HISTORY_PATH) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_size_history(hist: dict, path: str = SIZE_HISTORY_PATH) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(hist, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _xg(v: float) -> str:
+    """A size multiplier: 3, 4.5, 0.75."""
+    return f"{round(v, 2):g}"
 
 
 def _usd0(v: float) -> str:
@@ -1800,15 +1862,19 @@ def _early_read(a: dict) -> str:
     return f"{parts}: earning, the rewards cover the fills"
 
 
-def imm_advice(D: dict, today_str: str, titles=None) -> dict:
+def imm_advice(D: dict, today_str: str, titles=None, sizes=None) -> dict:
     """The What-to-do block from the dashboard data object (see the comment
     above): {"title", "basis", "headline", "drivers": [str], "recs": [(verb,
     text)], "context": [str], "new_head": str, "new": [str], "lines":
     [{"fam", "y", "w", "l", "rows": [{"name", "y", "w", "l", "call",
     "why"}], "rest": (n, y, w, l) or None}]}. Days before today_str only:
     the dashboard's last day is the one still running. `titles`: {event:
-    title}, read from the dashboard's caches when None."""
+    title}, read from the dashboard's caches when None. `sizes`:
+    size_history()'s result; None reads the dashboard's sizes with no history
+    but ADVICE_SIZE_SEED."""
     titles = load_event_titles() if titles is None else titles
+    dsz = D.get("sizes") or {}                    # series -> [size now, the size test's part]
+    hist = size_history(dsz, {}, today_str) if sizes is None else sizes
 
     def evname(e):
         return titles.get(e) or e
@@ -2208,10 +2274,44 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
                 and q30 > 0 and up30 >= ADVICE_DD_UP_SHARE_30 * active):
             dd_cands.append((gain, key, w, l, q7, q30, up, up30, active, tr7, tr30))
     dd_cands.sort(key=lambda c: (-c[0], c[1]))
+
+    def fmt(d):
+        return f"{datetime.strptime(d, '%Y-%m-%d'):%a %m/%d}"
+
+    def sized_up(key):
+        """A line's latest size-up inside ADVICE_DD_RESIZE_DAYS: (ET day,
+        size before, size after), or None."""
+        t0 = datetime.strptime(today_str, "%Y-%m-%d")
+        ups = [(h["up"], _f(h.get("was")), _f(h.get("x")))
+               for h in (hist.get(s) or {} for s in line_sers[key])
+               if h.get("up") and (t0 - datetime.strptime(h["up"], "%Y-%m-%d")).days
+               < ADVICE_DD_RESIZE_DAYS]
+        return max(ups) if ups else None
+
+    def size_now(key):
+        """(the line's size now, whether a series of it is in the size
+        test's half), or (None, False) when the dashboard gave no sizes."""
+        ss = [s for s in line_sers[key] if s in dsz]
+        if not ss:
+            return None, False
+        return max(_f(dsz[s][0]) for s in ss), any(_f(dsz[s][1]) > 1.0 for s in ss)
+    picked, dd_held = [], []
+    for c in dd_cands:
+        su = sized_up(c[1])
+        now, in_test = size_now(c[1])
+        if su:                        # its numbers ran mostly at the old size
+            again = datetime.strptime(su[0], "%Y-%m-%d") + timedelta(days=ADVICE_DD_RESIZE_DAYS)
+            dd_held.append((True, f"{lname(c[1])} x{_xg(su[1])} -> x{_xg(su[2])} on "
+                                  f"{fmt(su[0])} (judged again from {again:%a %m/%d})"))
+        elif in_test:                 # the size test sizes it up already
+            dd_held.append((False, f"{lname(c[1])} (in the size test's x1.5 half)"))
+        elif len(picked) < ADVICE_MAX_DD:
+            picked.append((c, now))
     dd_recs = []
-    for gain, key, w, l, q7, q30, up, up30, active, tr7, tr30 in dd_cands[:ADVICE_MAX_DD]:
+    for (gain, key, w, l, q7, q30, up, up30, active, tr7, tr30), now in picked:
+        to = f" (x{_xg(now)} -> x{_xg(now * ADVICE_DD_MULT)})" if now else ""
         dd_recs.append((key, ("DOUBLE DOWN", (
-            f"{lname(key)}, {key[0]}: x{ADVICE_DD_MULT:g}. Why: its quoting was up on {up} of "
+            f"{lname(key)}, {key[0]}: x{ADVICE_DD_MULT:g}{to}. Why: its quoting was up on {up} of "
             f"the {n} days ({_usd0(q7)}, net {_usd0(_net(w))}) and on {up30} of {active} "
             f"earning days over the {nl} ({_usd0(q30)}, net {_usd0(_net(l))}). Its fills and "
             f"held positions came to "
@@ -2236,9 +2336,6 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
                      + f" over {n} days ({nl} days "
                      + ", ".join(_usd0(_net(fams[f]["l"])) for f in keep)
                      + "). Why: their rewards cover their fills."))
-
-    def fmt(d):
-        return f"{datetime.strptime(d, '%Y-%m-%d'):%a %m/%d}"
 
     # 4. new this week: lines and series first seen in the 7 days, and new
     # events of series that list few (a daily or weekly series' are routine)
@@ -2316,6 +2413,9 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         if flagged and call not in ("PAUSE", "SHRINK"):
             why += "; " + ", ".join(f"{v} the event {_short(titles.get(e) or e, 44)}"
                                     for v, e in flagged) + " (see the recommendations)"
+        su = sized_up(key)
+        if su:
+            why += f"; sized up x{_xg(su[1])} -> x{_xg(su[2])} on {fmt(su[0])}"
         return call, why
 
     def line_call0(key, w, l):
@@ -2408,10 +2508,17 @@ def imm_advice(D: dict, today_str: str, titles=None) -> dict:
         if sum(w) < sum(pv) and drops:
             line += "; the biggest drops: " + ", ".join(f"{f} {_usd0(dv)}" for dv, f in drops)
         context.append(line + ".")
+    if dd_held:
+        more = len(dd_held) - ADVICE_MAX_DD_HELD
+        context.append("Already sized up, so no DOUBLE DOWN yet: "
+                       + "; ".join(t for _, t in dd_held[:ADVICE_MAX_DD_HELD])
+                       + (f"; and {more} more" if more > 0 else "") + "."
+                       + (f" A size-up runs {ADVICE_DD_RESIZE_DAYS} days at its new size before "
+                          f"it is judged again." if any(c[0] for c in dd_held) else ""))
     tests = [txt for end, txt in ADVICE_SIZE_TESTS if today_str <= end]
     if dd_recs and tests:
         context.append("Before doubling down: " + "; ".join(tests) + ".")
-    if not dd_recs:
+    if not dd_recs and not dd_held:
         context.append(f"Double down: no line clears the bar today. Size pays only where fills "
                        f"stay light next to the rewards (fill losses grow about "
                        f"{ADVICE_DD_FILL_ELAST:.2f} per unit of size, rewards "
@@ -3189,7 +3296,14 @@ def main(argv=None) -> int:
         try:
             if dash_err is not None:
                 raise dash_err
-            advice = imm_advice(dash, today_str)
+            # each series' size: the day it last went up (real runs keep it)
+            sizes = size_history(dash.get("sizes") or {}, load_size_history(), today_str)
+            if dash.get("sizes") and not (args.test or args.dry_run):
+                try:
+                    write_size_history(sizes)
+                except OSError as e:              # tomorrow reads today's sizes again
+                    log(f"! series sizes not saved: {e!r}")
+            advice = imm_advice(dash, today_str, sizes=sizes)
         except Exception as e:                    # never holds the email
             advice = {"error": f"{type(e).__name__}: {e}"}
             log(f"! what-to-do block unavailable: {e!r}")

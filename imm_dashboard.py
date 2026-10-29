@@ -714,6 +714,39 @@ def long_dated_hour_mults(imm, et_day) -> list:
     return [round((g[h] if h in g else ev.get(h, 1.0)) * sat, 2) for h in range(24)]
 
 
+# Each series' size now, for the portfolio email's DOUBLE DOWN (Jack
+# 2026-10-29: "i had already 1.5x'ed these. is the daily email saying i should
+# double down again?"): its ladder a side times the family multiplier the bot
+# applies (incentive_mm.applied_mention_mult: family, mention and the size
+# test), over the default ladder -- KXRT reads 3. The hour, evening and
+# Saturday multipliers are left out: they move by the clock, not by a resize.
+# A family member (a KXHIGH city, a card-spend series, an election) takes its
+# parent's size only once cloned, as the bot's refresh does, so each series
+# is cloned first; the temperature families' members come from their fair
+# files.
+def series_sizes(imm, series) -> dict:
+    """{series: [size multiplier now, the size test's part of it]} off the
+    bot's own functions, or {} when the bot did not import."""
+    if imm is None:
+        return {}
+    for load in ("load_lowt_fair", "load_hight_fair"):
+        try:
+            getattr(imm, load, lambda: None)()
+        except Exception:
+            pass
+    clone = getattr(imm, "ensure_family_override", lambda s: None)
+    base = float(sum(s for _t, s in imm.LEVELS)) or 1.0
+    out = {}
+    for s in sorted(series):
+        try:
+            clone(s)
+            out[s] = [round(imm.series_side_max(s) * imm.applied_mention_mult(s) / base, 3),
+                      round(imm.size_test_mult(s), 3)]
+        except Exception:                       # one series must not cost the rest
+            continue
+    return out
+
+
 def fill_day_payload(rest, fam_of, h0: int, h1: int, now: float, mult_of=None) -> dict:
     """Hourly context for the "Fills through the day" section.
 
@@ -3409,6 +3442,7 @@ class Builder:
             "days": days, "day_fields": list(DAY_FIELDS), "fx_keys": list(FX_KEYS),
             "fcurves": fcurves, "changes": changes, "realize": realize, "proj": proj,
             "struct_cover": self._struct_cover(held),
+            "sizes": series_sizes(_imm_mod, {m["ser"] for m in markets.values()}),
             "fills": fills_out, "fday": fday, "halts": halts, "health": health, "opp": opp,
             "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
                        "avg": round(e["avg"], 2), "mark": round(e["mark"], 2),
