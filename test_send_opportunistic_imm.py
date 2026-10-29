@@ -201,5 +201,54 @@ class TestDailyPicksTier(unittest.TestCase):
                                                   so.picks_detail({})[0][-1]])
 
 
+class TestAsTestTier(unittest.TestCase):
+    """Jack 2026-10-28: "i thought my new opportunitisc bot events e.g.
+    votehub would be in my opportunistic morning email?" -- the AS test's
+    named families as a tier of their own, by the bot's series sets."""
+
+    NOW = datetime(2026, 10, 29, 11, 25, tzinfo=timezone.utc)
+
+    def test_the_named_families_are_the_tiers_markets(self):
+        for t, fam in (("KXVHGCB-26OCT29-E8.1", "VH"), ("KXVHGCB-26OCT29", "VH"),
+                       ("KXBBSINGLE-26NOV07THRILLER-16T20", "BB"),
+                       ("KXAAAGASDMS-26OCT27-3.825", "GAS"),
+                       ("KXAAAGASDMS-26OCT27", "GAS")):
+            self.assertEqual(so.astest_family_of(t), fam, t)
+            self.assertEqual(so.tier_of(t, set(), set()), "astest", t)
+        # the same state under the normal book before 9/14, a state outside
+        # the test, the national and the rest of the book are not the test's
+        for t in ("KXAAAGASDMS-26SEP14-3.1", "KXAAAGASDCA-26OCT27-4.5",
+                  "KXAAAGASD-26OCT27-3.1", "KXTRUMPMENTION-26OCT29-WALL"):
+            self.assertIsNone(so.astest_family_of(t), t)
+            self.assertIsNone(so.tier_of(t, set(), set()), t)
+        # a gas state the daily picks name is the picks' own; finecon first
+        self.assertEqual(so.tier_of("KXAAAGASDCT-26OCT30-4.2", set(), set(),
+                                    {"KXAAAGASDCT-26OCT30"}), "picks")
+        self.assertEqual(so.tier_of("KXVHGCB-26OCT29-E8.1", {"KXVHGCB"}, set()),
+                         "finecon")
+
+    def test_the_tier_line_says_which_families_the_bot_is_quoting(self):
+        tmp = tempfile.mkdtemp(prefix="opp_astest_")
+        line = so.astest_status({}, self.NOW, tmp)
+        self.assertIn("Billboard KXBBSINGLE x3 (150/market, 450/event, $100/day "
+                      "loss halt; out 8 days before the chart date", line)
+        self.assertIn("VoteHub KXVHGCB x3 (150/market, 450/event, $100/day loss "
+                      "halt; 20:00-05:00 ET only, out at 05:00 ET on the read day): ON",
+                      line)
+        self.assertIn("gas states CT/MS/NY/TN/UT x1 (50/market, 150/event, "
+                      "$100/day loss halt; 16:00-24:00 ET): ON", line)
+        # a stop file and a loss halt for the roll day (STATUS_DIR is the
+        # temp dir here, never the live run-logs)
+        with open(os.path.join(tmp, "astest_stop.txt"), "w", encoding="utf-8") as f:
+            f.write("stopped\n")
+        state = {"twk_halt_day": {"ASTEST:VH": so.imm._halt_day_key(self.NOW),
+                                  "ASTEST:BB": "2026-10-27"}}
+        line = so.astest_status(state, self.NOW, tmp)
+        self.assertIn("16:00-24:00 ET): STOPPED since", line)
+        self.assertIn("(astest_stop.txt)", line)
+        self.assertIn("on the read day): HALTED today (loss budget)", line)
+        self.assertIn("(its tracking week's end)): ON", line)
+
+
 if __name__ == "__main__":
     unittest.main()

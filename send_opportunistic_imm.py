@@ -3,7 +3,7 @@ r"""send_opportunistic_imm.py — the daily "Opportunistic IMM" email
 (Jack 2026-09-05: "add daily email called 'opportunistic IMM' showing a
 table of the events quoted, earning est, P&L, and net").
 
-The "opportunistic" book is TWO tiers:
+The "opportunistic" book is FOUR tiers:
   finecon   the hand-curated Finance/Economics quiet-print families
             (incentive_mm.FINECON_SERIES) — top-N-by-ROI group walk,
             quote-to-completion, daily over-cap openings
@@ -11,6 +11,11 @@ The "opportunistic" book is TWO tiers:
             with 15 slots and 5 to scan all markets"): every other live-
             program market, machine-screened for adverse selection
             (incentive_mm SCAN_*; membership persisted as scan_members)
+  astest    since 2026-10-28, the AS test's named families (Jack: "i thought
+            my new opportunitisc bot events e.g. votehub would be in my
+            opportunistic morning email?"): Billboard ranks (KXBBSINGLE), the
+            VoteHub generic ballot (KXVHGCB) and the gas states' test events
+            -- see astest_family_of
   picks     since 2026-10-27, the AS test's DAILY PICKS (Jack: "pick 5
             distinct events each day, optimizing for likelihood of
             profitability ... and add it to the opportunistic daily report
@@ -330,11 +335,13 @@ def excluded_carbon_arc(ticker_or_event: str) -> bool:
 
 
 def tier_of(ticker_or_event: str, fin, scan_set, picks=frozenset()) -> str:
-    """"finecon" | "scan" | "picks" | None — which opportunistic tier owns
-    this market (or event), or None for everything this email leaves out: the
-    rest of the normal book and, since 2026-10-04, every Carbon Arc-settled
-    market. `picks` is every EVENT the AS test's daily picks ever named
-    (load_picks); a market belongs by its event.
+    """"finecon" | "scan" | "picks" | "astest" | None — which opportunistic
+    tier owns this market (or event), or None for everything this email
+    leaves out: the rest of the normal book and, since 2026-10-04, every
+    Carbon Arc-settled market. `picks` is every EVENT the AS test's daily
+    picks ever named (load_picks); a market belongs by its event. The AS
+    test's named families are series rules (astest_family_of), checked after
+    the picks so a gas state the picks name stays the picks' own.
 
     MODULE LEVEL ON PURPOSE. This lived as a closure inside build_report
     until 2026-09-11, and that is exactly how 30 *CC series left the email
@@ -365,6 +372,8 @@ def tier_of(ticker_or_event: str, fin, scan_set, picks=frozenset()) -> str:
         return "scan"
     if picks and (ticker_or_event in picks or _event_of(ticker_or_event) in picks):
         return "picks"
+    if astest_family_of(ticker_or_event):
+        return "astest"
     return None
 
 
@@ -469,6 +478,79 @@ def picks_detail(doc: dict) -> tuple:
 
 def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---- THE AS TEST'S NAMED FAMILIES (Jack 2026-10-28: "i thought my new
+# opportunitisc bot events e.g. votehub would be in my opportunistic morning
+# email?"). incentive_mm admits them by name (_allowed, astest_new_series)
+# at their own sizes and stops -- Billboard and VoteHub live since 10/28
+# 00:16Z at x3, the five gas states quoted on 10/26 and stopped 10/27
+# (astest_stop.txt) -- outside finecon and the scan, so tier_of left every
+# one of their events out of this email. Membership is the bot's own series
+# sets, read whatever the switches and stop files say, so a stopped family's
+# events stay its own. The gas states count from the test's first events
+# (26OCT27) only: the normal book quoted the same states until 9/14, and
+# those credits are not the test's.
+ASTEST_GAS_FIRST_DAY = "2026-10-27"
+
+
+def _astest_knob(fam: str, name: str, default=None):
+    return getattr(imm, f"ASTEST_{fam}_{name}", default)
+
+
+def astest_family_of(ticker_or_event: str):
+    """"BB" | "VH" | "GAS" | None -- the AS test family of a market (or
+    event)."""
+    series = ticker_or_event.split("-")[0]
+    if series in _astest_knob("BB", "SERIES", ()):
+        return "BB"
+    if series in _astest_knob("VH", "SERIES", ()):
+        return "VH"
+    if series in _astest_knob("GAS", "SERIES", ()):
+        d = imm.parse_event_date(ticker_or_event)
+        if d is not None and d.astimezone(imm.ET).date().isoformat() >= ASTEST_GAS_FIRST_DAY:
+            return "GAS"
+    return None
+
+
+def astest_status(state: dict, now_utc, status_dir=None) -> str:
+    """The tier line: each family's size, caps and window, and whether the bot
+    is quoting it -- switched off, its stop file present (since when), or its
+    loss budget halted for the roll day."""
+    status_dir = status_dir or imm.STATUS_DIR
+    day = imm._halt_day_key(now_utc)
+    halted = state.get("twk_halt_day") or {}
+    enabled = getattr(imm, "ASTEST_ENABLE", False)
+    parts = []
+    for fam in ("BB", "VH", "GAS"):
+        if fam == "GAS":
+            what = "gas states " + "/".join(getattr(imm, "ASTEST_GAS_STATES", ()))
+            w = _astest_knob(fam, "WINDOW_ET", ())
+            window = "-".join(w) + " ET" if w else ""
+            on = enabled
+            stop = getattr(imm, "ASTEST_STOP_FILE", "astest_stop.txt")
+        else:
+            what = (f"{_astest_knob(fam, 'LABEL', fam)} "
+                    + ", ".join(sorted(_astest_knob(fam, "SERIES", ()))))
+            window = (getattr(imm, "ASTEST_WINDOW_NOTE", None) or {}).get(fam, "")
+            on = enabled and _astest_knob(fam, "ENABLE", False)
+            stop = _astest_knob(fam, "STOP_FILE", "")
+        stop_path = os.path.join(status_dir, stop) if stop else ""
+        if not on:
+            now_txt = "OFF"
+        elif stop_path and os.path.exists(stop_path):
+            since = datetime.fromtimestamp(os.path.getmtime(stop_path), timezone.utc)
+            now_txt = f"STOPPED since {since.astimezone(imm.ET):%b %d} ({stop})"
+        elif halted.get(_astest_knob(fam, "HALT_KEY")) == day:
+            now_txt = "HALTED today (loss budget)"
+        else:
+            now_txt = "ON"
+        parts.append(f"{what} x{_f(_astest_knob(fam, 'SIZE_MULT', 1.0)):g} "
+                     f"({_f(_astest_knob(fam, 'MAX_POSITION')):g}/market, "
+                     f"{_f(_astest_knob(fam, 'EVENT_CAP')):g}/event, "
+                     f"${_f(_astest_knob(fam, 'DAILY_LOSS')):g}/day loss halt"
+                     + (f"; {window}" if window else "") + f"): {now_txt}")
+    return "; ".join(parts)
 
 
 # ---- DURABLE HISTORY (Jack 2026-09-11 "not just active, but also
@@ -1079,6 +1161,7 @@ def build_report(now_utc):
     fin_rows = [r for r in rows if r["tier"] == "finecon"]
     scan_rows = [r for r in rows if r["tier"] == "scan"]
     pick_rows = [r for r in rows if r["tier"] == "picks"]
+    astest_rows = [r for r in rows if r["tier"] == "astest"]
 
     tot = tier_totals(rows)
     tot_earn, tot_pnl, tot_net, tot_mkts = (tot["earn"], tot["pnl"],
@@ -1123,6 +1206,12 @@ def build_report(now_utc):
         tier = _event_tier(ev)
         if not tier:
             continue
+        if tier == "astest":
+            # one row per family: each family is read on its own (Billboard
+            # after its program week, VoteHub after a week of nights), and
+            # a VoteHub event lives one night, so the cumulative row is
+            # where its results stay
+            tier = f"astest:{astest_family_of(ev)}"
         b = cum_by_tier.setdefault(tier, {"events": 0, "cred": 0.0, "est": 0.0,
                                           "realized": 0.0, "mtm": 0.0})
         b["events"] += 1
@@ -1132,7 +1221,8 @@ def build_report(now_utc):
         b["mtm"] += cum_mtm.get(ev, 0.0)
     cum_rows = []
     for key, name in (("finecon", "FINECON"), ("scan", "OPEN SCAN"),
-                      ("picks", "DAILY PICKS")):
+                      ("astest:BB", "AS: BILLBOARD"), ("astest:VH", "AS: VOTEHUB"),
+                      ("astest:GAS", "AS: GAS STATES"), ("picks", "DAILY PICKS")):
         b = cum_by_tier.get(key)
         if not b:
             continue
@@ -1191,6 +1281,9 @@ def build_report(now_utc):
          + (", HALTED today (loss budget)" if scan_halted else "")
          + (f", {scan_evicted} event(s) evicted" if scan_evicted else ""),
          scan_rows),
+        ("AS TEST", "the opportunistic AS test's named families: Billboard "
+         "Hot 100 ranks, the VoteHub generic ballot, the gas states",
+         astest_status(state, now_utc), astest_rows),
         ("DAILY PICKS", "the AS test's distinct events a day, the likeliest "
          "to profit, quoted x1 (imm_astest_picks.py)",
          picks_status(picks_doc, now_utc), pick_rows),
