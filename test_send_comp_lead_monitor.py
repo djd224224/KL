@@ -59,6 +59,9 @@ class TestLeads(unittest.TestCase):
             "2026-10-29 10:02:00Z [IMM] comp lead: 125 mutually exclusive event(s) "
             "grouped, 78 of them two-market (125 event read(s) this refresh)\n",
             lead("05:00:00", d=30, tk="KXLATE-1"),           # after the window
+            # a fought lead held at the cap (Jack 2026-10-29 "2.")
+            "2026-10-29 11:00:00Z [IMM] comp lead KXK-30-KMIN ask: 200 @ 43c, held at the "
+            "cap, behind its own 41c; its 11 siblings' books imply 38c\n",
         ]
         p = cm.parse_leads(lines, a, b)
         self.assertEqual(p["groups"], (125, 78))
@@ -73,6 +76,7 @@ class TestLeads(unittest.TestCase):
         self.assertEqual(k["pxs"], [57])                     # the 02:00Z one is before the day
         self.assertTrue(d["leading_at_end"])
         self.assertNotIn(("KXLATE-1", "ask"), p["leads"])
+        self.assertEqual(p["leads"][("KXK-30-KMIN", "ask")]["px"], 43)
 
     def test_lead_fills_need_the_side_the_price_and_a_maker(self):
         leads = {("KXK-30-JDON", "ask"): {"spans": [[_ts(5), _ts(9)]], "px": 60}}

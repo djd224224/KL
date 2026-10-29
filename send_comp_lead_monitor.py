@@ -61,7 +61,8 @@ LEVELS = ("OK", "WATCH", "PROBLEM")
 
 _LEAD = re.compile(
     r"^(\S+ \S+)Z \[IMM\] comp lead( \(dry\))? (\S+) (bid|ask): (\d+) @ (\d+)c, "
-    r"ahead of its own (\d+)c; (.+?) (?:implies|imply) (-?\d+)c")
+    r"(?:ahead of|held at the cap, (?:with|behind)) its own (\d+)c; (.+?) "
+    r"(?:implies|imply) (-?\d+)c")
 _OFF = re.compile(r"^(\S+ \S+)Z \[IMM\] comp lead(?: \(dry\))? (\S+) (bid|ask): off -- ")
 _GROUPS = re.compile(r"^(\S+ \S+)Z \[IMM\] comp lead: (\d+) mutually exclusive "
                      r"event\(s\) grouped, (\d+) of them two-market")

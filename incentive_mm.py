@@ -19483,15 +19483,21 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
 #   * the rung rests at least target/5 (room permitting) inside the band,
 #     never crosses the market's own other side, and every other side guard
 #     still applies;
-#   * a leading side never moves UP: on 10/29 01:28Z a 1,000-lot joined the D
-#     lead at each price and re-leading 7-8c ahead of it walked the bid
-#     26c -> 56c in a minute for the same ~1/6 of the side. An order that
-#     only joins it at its price leaves it free to move down (3c+) where the
-#     book below allows; an order that steps AHEAD of it ends the lead, and
-#     the side falls back to plain at-reference placement, joining that order
-#     where it rests ("actually dont stay low"). Where each side last led is
-#     kept in STATUS_DIR (COMP_HOLD_FILE), so neither a restart nor a
-#     drop-out and return reads the book fresh and leads past such an order.
+#   * a leading side does not chase an order that only JOINS it at its price:
+#     on 10/29 01:28Z a 1,000-lot joined the D lead at each price and
+#     re-leading 7-8c ahead of it walked the bid 26c -> 56c in a minute for
+#     the same ~1/6 of the side. Joined, it stays, or moves down (3c+) where
+#     the book below allows;
+#   * an order that steps AHEAD of it is fought (Jack 2026-10-29, "2.", after
+#     the Korea wall owner put 4,400+ lots 1c in front of all 8 Korea leads
+#     within 15s): the side leads again ahead of the whole book, at the
+#     cheapest price there that takes the share, else as far as the cap
+#     lets it; an order at or past the cap is not passed, and the rung rests
+#     at the cap with it or behind it. COMP_LEAD_MARGIN_C (5c since then)
+#     keeps every lead that far inside what the siblings imply, so a filled
+#     lead still hedges for more than COMP_HEDGE_EDGE_C. Where each side last
+#     led is kept in STATUS_DIR (COMP_HOLD_FILE), so a restart or a drop-out
+#     and return picks the fight up where it was.
 # HEDGE (COMP_HEDGE_MODE): when a leading rung fills, the bot sells (an ask
 # filled) or buys (a bid filled) the same count on every sibling with
 # immediate-or-cancel limit orders, each at the price its sibling's book fills
@@ -19509,7 +19515,7 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
 # without sending them, off disables.
 COMP_LEAD_MODE = os.environ.get("IMM_COMP_LEAD", "on").strip().lower()
 COMP_LEAD_SHARE = _env_float("IMM_COMP_LEAD_SHARE", 0.95)
-COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 1))
+COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 5))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
     if p.strip())
@@ -19567,10 +19573,12 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     own external best), or None. `own_levels`: the market's external side;
     `ref`: the reference its siblings imply, in the same space. A side that
     cannot reach the target with the lead in it does not lead.
-    `hold`: the price the side already leads at. It never moves up: an order
-    resting AHEAD of it ends the lead (None: plain placement joins that
-    order), and otherwise it moves down when the book below lets a price 3c+
-    lower take the share; a hold above the cap leads afresh."""
+    `hold`: the price the side already leads at. An order resting AHEAD of
+    it is fought: the side leads again at the cheapest price ahead of the
+    whole book that takes the share, else at the cap, and an order at or
+    past the cap leaves the rung at the cap. Otherwise (joined, or alone) it
+    stays, or moves down when the book below lets a price 3c+ lower take the
+    share; a hold above the cap leads afresh."""
     n = comp_lead_size(target)
     if n <= 0:
         return None
@@ -19585,11 +19593,20 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
                 return px
         return None
 
+    def qualifies(px: int) -> bool:
+        lv: Dict[int, float] = dict(own)
+        lv[px] = lv.get(px, 0.0) + float(n)
+        return _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
+                           {px: float(n)}, target, df)[1]
+
     if hold is not None and hold <= cap:
         below = [(p, q) for p, q in own if p < hold]
         at_or_above = [(p, q) for p, q in own if p >= hold]
         if any(p > hold for p, _q in at_or_above):
-            return None
+            # fought: ahead of the whole book, never past the cap
+            best = own[0][0]
+            px = cap if best >= cap else (cheapest(own) or cap)
+            return (px, cap, best) if qualifies(px) else None
         held = sorted(at_or_above + [(hold, float(n))], key=lambda kv: -kv[0])
         if not _side_share(held + below, {hold: float(n)}, target, df)[1]:
             return None
@@ -27416,8 +27433,12 @@ class IncentiveMarketMaker:
             _p, cap, best = lead
             implied = (cap + COMP_LEAD_MARGIN_C if side == "bid"
                        else cap - COMP_LEAD_MARGIN_C)
-            log(f"{self.tag} comp lead{dry} {t} {side}: {n} @ {px}c, ahead of its "
-                f"own {best}c; {who} {verb} {implied}c")
+            ahead = (px > best) if side == "bid" else (px < best)
+            where = (f"ahead of its own {best}c" if ahead else
+                     f"held at the cap, {'with' if px == best else 'behind'} its own "
+                     f"{best}c")
+            log(f"{self.tag} comp lead{dry} {t} {side}: {n} @ {px}c, {where}; "
+                f"{who} {verb} {implied}c")
 
     # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
 

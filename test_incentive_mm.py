@@ -29786,7 +29786,7 @@ class TestComplementLead(unittest.TestCase):
         # least as tight on their own books: no lead.
         lb, la = imm.comp_lead_prices(self.D_YES, self.D_NO, self.R_YES, self.R_NO,
                                       1000.0, 0.5)
-        self.assertEqual((lb, la), ((26, 69, 16), None))
+        self.assertEqual((lb, la), ((26, 65, 16), None))
         self.assertEqual(imm.comp_lead_prices(self.R_YES, self.R_NO, self.D_YES,
                                               self.D_NO, 1000.0, 0.5), (None, None))
         # about half the pool against ~1% at the reference behind the wall
@@ -29799,6 +29799,7 @@ class TestComplementLead(unittest.TestCase):
         self.assertAlmostEqual(with_lead, 0.491, places=3)
         self.assertLess(at_ref, 0.01)
 
+    @mock.patch.object(imm, "COMP_LEAD_MARGIN_C", 1)
     def test_cap_margin_crossing_and_thin_sides(self):
         own = [[40, 5000.0]]
         twin_no = [[46, 300.0]]             # implies a 46c bid: cap 45c
@@ -29821,41 +29822,46 @@ class TestComplementLead(unittest.TestCase):
         self.assertEqual(imm.comp_lead_prices(yes, no, [], [[70, 3000.0]],
                                               1000.0, 0.5), (None, None))
 
-    def test_a_leading_side_never_moves_up(self):
+    def test_a_joiner_does_not_walk_a_lead_up_and_one_ahead_is_fought(self):
         # 10/29 01:28Z: a 1,000-lot joined the D lead at each price and the
-        # fresh rule re-led 7-8c ahead of it, 26c -> 56c in a minute
+        # fresh rule re-led 7-8c ahead of it, 26c -> 56c in a minute; R's 30c
+        # offer implies 70c, so the cap (5c inside) is 65c
         wall = [[15, 13238.0], [16, 21.0]]
         joined = wall + [[26, 1000.0]]
         r_no = self.R_NO
         self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5)[0], 33)   # fresh: chases
         self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5, hold=26),
-                         (26, 69, 16))                                          # held: stays
-        # stepped ahead of (an order at 30c): not chased -- the lead ends and
-        # plain placement joins that order (Jack 10/29: "actually dont stay low")
-        self.assertIsNone(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
-                                             hold=26))
+                         (26, 65, 16))                                          # joined: stays
         # a joiner at a price the chase reached does not pin it there: back
         # down to the cheapest price ahead of the book below (it may follow)
         self.assertEqual(imm.comp_side_lead(wall + [[56, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=56), (26, 69, 16))
-        # uncontested, the wall below gone: down to the new cheapest price,
-        # but not for a move under 3c
+                                            hold=56), (26, 65, 16))
+        # Jack 2026-10-29 "2.": an order stepped AHEAD (1,000 at 30c) is
+        # fought -- 7c ahead of it takes the share again -- but never past the
+        # cap: one at the cap is joined there, one past it rests behind it
+        self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
+                                            hold=26), (37, 65, 30))
+        self.assertEqual(imm.comp_side_lead(wall + [[65, 1000.0]], r_no, 1000.0, 0.5,
+                                            hold=26), (65, 65, 65))
+        self.assertEqual(imm.comp_side_lead(wall + [[67, 1000.0]], r_no, 1000.0, 0.5,
+                                            hold=26), (65, 65, 67))
+        # alone, the wall below gone: down to the new cheapest price, but not
+        # for a move under 3c
         thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
         self.assertEqual(imm.comp_side_lead(thin, r_no, 1000.0, 0.5, hold=26)[0], 18)
         self.assertEqual(imm.comp_side_lead(wall, r_no, 1000.0, 0.5, hold=27)[0], 27)
-        # a hold above the cap leads afresh (R's offer gone up: cap 39c)
+        # a hold above the cap leads afresh (R's offer gone up: cap 35c)
         self.assertEqual(imm.comp_side_lead(wall, [[40, 3000.0]], 1000.0, 0.5,
-                                            hold=56), (26, 39, 16))
+                                            hold=56), (26, 35, 16))
         # the pair: holds are YES cents on both sides
         lb, la = imm.comp_lead_prices(joined, self.D_NO, self.R_YES, self.R_NO,
                                       1000.0, 0.5, hold_bid=26)
         self.assertEqual((lb[0], la), (26, None))
 
-    def test_an_outbid_lead_joins_and_is_not_chased_after_a_restart(self):
-        # Jack 2026-10-29 "actually dont stay low": an order resting ahead of
-        # the lead ends it (plain placement joins that order). The hold file
-        # keeps a restarted bot -- or a market that dropped out and came back
-        # -- from reading the book fresh and leading 7c past that order.
+    def test_an_outbid_lead_fights_after_a_restart_too(self):
+        # the hold file keeps a restarted bot -- or a market that dropped out
+        # and came back -- fighting from where it led: past the 1,000-lot at
+        # 30c that stepped ahead of the 21c lead, to 37c
         copier = [[1, 1001], [2, 2004], [15, 583], [30, 1000]]
         meta = self._meta(self.D)
         with tempfile.TemporaryDirectory() as tmp, \
@@ -29867,16 +29873,15 @@ class TestComplementLead(unittest.TestCase):
             bot._ws = self._feed(copier, self.D_NO, self.R_YES, self.R_NO)
             bot._comp_groups = {self.D: (self.D, self.R), self.R: (self.D, self.R)}
             bot._comp_pairs = {self.D: self.R, self.R: self.D}
-            self.assertEqual(bot._comp_lead(meta, copier, self.D_NO)[0][0], 37)   # fresh: past it
             bot._note_comp_hold(self.D, 21, None, time.time())
             bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
             self.assertEqual(bot2._comp_holds[self.D][:2], [21, None])
             bot2._ws = bot._ws
             bot2._comp_groups, bot2._comp_pairs = bot._comp_groups, bot._comp_pairs
-            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO), (None, None))
-            # a lapsed entry is forgotten
+            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
+            # a lapsed entry is forgotten: a fresh read leads there as well
             bot2._comp_holds[self.D][2] = time.time() - imm.COMP_HOLD_TTL_SECS - 1
-            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0][0], 37)
+            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
 
     def test_the_sell_side_leads_in_a_many_market_event(self):
         # KXKOREAPRES-30MAR27-JDON at 10/29 01:20Z: offered only at 71c behind
@@ -29888,7 +29893,12 @@ class TestComplementLead(unittest.TestCase):
         jdon_no = [[1, 2006], [2, 100], [3, 3348], [4, 48], [15, 1000], [27, 1], [29, 15904]]
         sibs = [([[b, 5000.0]], [[29, 15000.0]]) for b in (10, 10, 11, 4, 4, 4, 3, 4, 2, 6, 4)]
         lb, la = imm.comp_lead_group(jdon_yes, jdon_no, sibs, 1000.0, 0.5, bid_ok=True)
-        self.assertEqual((lb, la), (None, (60, 39, 71)))
+        self.assertEqual((lb, la), (None, (60, 43, 71)))
+        # the wall owner stepped 1c ahead (4,472 at 56c, NO 44): fought, 9
+        # ticks ahead of it at 47c, inside the 43c cap
+        jdon_no2 = jdon_no[:5] + [[33, 3432], [44, 4472]]
+        self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no2, sibs, 1000.0, 0.5,
+                                             hold_ask=57), (None, (47, 43, 56)))
         # a sibling too thin to reach 200 sets no reference: no lead
         thin = sibs[:-1] + [([[4, 150.0]], [[29, 15000.0]])]
         self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no, thin, 1000.0, 0.5),
