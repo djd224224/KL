@@ -29832,10 +29832,13 @@ class TestComplementLead(unittest.TestCase):
         self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5)[0], 33)   # fresh: chases
         self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5, hold=26),
                          (26, 65, 16))                                          # joined: stays
-        # a joiner at a price the chase reached does not pin it there: back
-        # down to the cheapest price ahead of the book below (it may follow)
+        # an order sharing the lead's price keeps it there: backing off would
+        # hand it the front (03:55Z 10/29, KMIN flapped 43c <-> 63c every 15s
+        # against a 3,040-lot on the 43c stop)
         self.assertEqual(imm.comp_side_lead(wall + [[56, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=56), (26, 65, 16))
+                                            hold=56), (56, 65, 16))
+        self.assertEqual(imm.comp_side_lead(wall + [[65, 3040.0]], r_no, 1000.0, 0.5,
+                                            hold=65), (65, 65, 16))
         # Jack 2026-10-29 "2.": an order stepped AHEAD (1,000 at 30c) is
         # fought -- 7c ahead of it takes the share again -- but never past the
         # cap: one at the cap is joined there, one past it rests behind it

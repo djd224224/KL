@@ -19486,8 +19486,8 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
 #   * a leading side does not chase an order that only JOINS it at its price:
 #     on 10/29 01:28Z a 1,000-lot joined the D lead at each price and
 #     re-leading 7-8c ahead of it walked the bid 26c -> 56c in a minute for
-#     the same ~1/6 of the side. Joined, it stays, or moves down (3c+) where
-#     the book below allows;
+#     the same ~1/6 of the side. Joined, it stays and shares the front;
+#     alone, it may move down (3c+) where the book below allows;
 #   * an order that steps AHEAD of it is fought (Jack 2026-10-29, "2.", after
 #     the Korea wall owner put 4,400+ lots 1c in front of all 8 Korea leads
 #     within 15s): the side leads again ahead of the whole book, at the
@@ -19576,9 +19576,10 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     `hold`: the price the side already leads at. An order resting AHEAD of
     it is fought: the side leads again at the cheapest price ahead of the
     whole book that takes the share, else at the cap, and an order at or
-    past the cap leaves the rung at the cap. Otherwise (joined, or alone) it
-    stays, or moves down when the book below lets a price 3c+ lower take the
-    share; a hold above the cap leads afresh."""
+    past the cap leaves the rung at the cap. An order sharing its price
+    leaves it where it is; alone, it stays, or moves down when the book
+    below lets a price 3c+ lower take the share; a hold above the cap leads
+    afresh."""
     n = comp_lead_size(target)
     if n <= 0:
         return None
@@ -19610,6 +19611,12 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
         held = sorted(at_or_above + [(hold, float(n))], key=lambda kv: -kv[0])
         if not _side_share(held + below, {hold: float(n)}, target, df)[1]:
             return None
+        if at_or_above:
+            # an order sharing our price: stay and share the front. Backing
+            # off hands it the front (10/29 03:55Z: a 3,040-lot sat on the
+            # 43c stop of KXKOREAPRES-30MAR27-KMIN, and backing off to 63c
+            # then fighting back flapped the rung every 15s)
+            return hold, cap, (below[0][0] if below else 0)
         px = cheapest(below)
         if px is not None and px <= hold - 3:
             return px, cap, (below[0][0] if below else 0)
