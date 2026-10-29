@@ -293,7 +293,7 @@ table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-
 
 /* ---------- drivers ---------- */
 #moHeat { overflow-x: auto; }
-.drvtw table.t { min-width: 1240px; }
+.drvtw table.t { min-width: 1700px; }
 .drvtw table.t th, .drvtw table.t td { padding: 5px 7px; }
 .drvtw table.t th:first-child, .drvtw table.t td:first-child {
   position: sticky; left: 0; z-index: 1; background: var(--bg); min-width: 250px; max-width: 380px;
@@ -522,6 +522,7 @@ footer { color: var(--muted); font-size: 12px; }
         <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk. Kalshi fees are not deducted; the IMM digest's fee total runs $0–0.60 a day.</p>
         <p class="explain"><b>P&amp;L explain</b> (Drivers). Trading P&amp;L splits exactly into three parts. <i>Carry: marks</i> is the position held at the window's start, re-marked from its start mark to its end mark (or to its last mark before it left the book). <i>Carry: settled</i> is that start position in a market Kalshi settled during the window, from its start mark to the settlement. <i>New fills</i> is the rest: the window's own fills, marked to the window's end or to the settlement.</p>
         <p class="explain"><b>Mark-outs</b> cover maker fills only (no pads, no taker fills). They are per contract and signed for our side. <i>At fill</i> is the edge: the fill price against the mid of the external book the bot read the cycle before the fill (none on a book 50¢+ wide). <i>5m</i>, <i>30m</i> and <i>4h</i> use the first 5-minute position snapshot at least that long after the fill; a mark must land within 5 minutes for 5m and within 15 minutes otherwise, so a fill that closed the position has none. <i>To date</i> uses Kalshi's settlement, else the bot's mark while it holds the market, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule. <i>Coverage</i> is rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow.</p>
+        <p class="explain"><b>Last 7 days</b> and <b>Last 30 days</b> (Drivers) add up the rewards and trading P&amp;L of the 7 and 30 ET days through the window's last day: today so far on a live window, that day on a past one. Rewards follow the basis picked above the table. <i>Per day</i> divides by the days covered, today by its hours so far. The page keeps 30 days, so a past day's 30 days count only the ones it has (the header's tooltip says how many). The total row covers the whole book, including families with nothing in the window.</p>
         <p class="explain"><b>Exp. net/day</b> is a model: the rewards the bot's estimator gives the quotes resting now, plus the family's average trading P&amp;L per day over the last 7 days. <b>Typical day</b> is the family's mean net per complete ET day over the 7 and 30 days before the window. The σ mark flags a window 1.5+ standard deviations from that mean, pro-rated to the window's length.</p>
         <p class="explain"><b>Worst case</b> is the loss from today's marks to settlement if everything goes against the book. It is netted inside an event: across its strikes when every market prices the same number (greater / less / between), and across names when Kalshi marks the event mutually exclusive. Mention words and anything whose structure has not been read count in full. Summed across events, it assumes every event goes wrong at once. On a past day it is the book at that day's close.</p>
         <p class="explain"><b>Paid rate</b> is what Kalshi credited per dollar of modeled reward on settled events (imm_reward_recon's calibration). The <i>raw</i> basis covers the $1 per-market-per-period floor and the model error together. The older <i>floored</i> basis covers the model error only. Account credits include other bots quoting the same markets, which can push a family above 1×.</p>
@@ -1254,6 +1255,64 @@ function zOf(x) {
   return (x.netA - t.m30 * days) / (t.sd * Math.sqrt(days));
 }
 
+/* the last 7 and 30 days (Jack 2026-10-28: "add section on the right of the
+   family/event/market table that has L7D and L30D stats"): rewards and trading
+   summed from the per-day market rows over the N ET days through the window's
+   last day, today so far on a live window */
+const SPANS = [7, 30];
+const SPANC = {};
+function isoBack(iso, k) { const d = new Date(iso + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() - k); return d.toISOString().slice(0, 10); }
+function spanData(n) {
+  const end = eodIso() || DAYS[DAYS.length - 1], key = end + "|" + n;
+  if (SPANC[key]) return SPANC[key];
+  const iR = DF.indexOf("rew"), iP = DF.indexOf("pnl");
+  const o = { n, end, first: isoBack(end, n - 1), days: 0, pdays: 0, len: 0, m: {}, e: {}, f: {} };
+  const add = (map, k, r, p) => { const a = map[k] || (map[k] = [0, 0]); a[0] += r; a[1] += p; };
+  for (let k = n - 1; k >= 0; k--) {
+    const d = D.days[isoBack(end, k)];
+    if (!d) continue;
+    o.days++; o.len += (d.e - d.s) / 86400;
+    if (d.ok) o.pdays++;
+    for (const t in d.m) {
+      const m = D.markets[t];
+      if (!m) continue;
+      const r = num(d.m[t][iR]), p = d.ok ? num(d.m[t][iP]) : 0;
+      add(o.m, t, r, p); add(o.e, m.ev, r, p); add(o.f, m.fam, r, p);
+    }
+  }
+  return (SPANC[key] = o);
+}
+/* a market's ("m"), event's ("e") or family's ("f") spans: {7: {r, p, net, len}, 30: ...},
+   rewards on the page's basis */
+function spanOf(kind, key, fam) {
+  const out = {};
+  for (const n of SPANS) {
+    const o = spanData(n), a = o[kind][key] || [0, 0], r = rewAdj(fam, a[0]);
+    out[n] = { r, p: a[1], net: r + a[1], len: o.len };
+  }
+  return out;
+}
+function spanSum(list) {
+  const out = {};
+  for (const n of SPANS) {
+    const s = { r: 0, p: 0, net: 0, len: spanData(n).len };
+    for (const x of list) { s.r += x[n].r; s.p += x[n].p; s.net += x[n].net; }
+    out[n] = s;
+  }
+  return out;
+}
+function spanHead(n) {
+  const o = spanData(n), a = new Date(o.first + "T12:00:00Z"), b = new Date(o.end + "T12:00:00Z");
+  const fa = ETD.format(a), fb = ETD.format(b);
+  const lab = "Last " + n + " days · " + (o.first.slice(0, 7) === o.end.slice(0, 7) ? fa + "–" + fb.split(" ")[1] : fa + " – " + fb) +
+    (o.days < n ? " · " + o.days + " in the data" : "");
+  const live = D.days[o.end] && D.days[o.end].e >= D.generated - 1;
+  let tip = "the " + n + " ET days " + fa + " – " + fb + (live ? ", today through " + tET(D.generated) + " ET" : "");
+  if (o.days < n) tip += "; the page keeps " + DAYS.length + " days, so " + o.days + " of them are here";
+  if (o.pdays < o.days) tip += "; trading P&L on " + o.pdays + " of them";
+  return [lab, tip];
+}
+
 /* a family's (null = the book's) cumulative rewards / trading through the window, hourly */
 function famCurve(fam) {
   const src = isDay(W) ? (D.days[W.slice(2)] || {}).fc : (D.fcurves || {})[W];
@@ -1419,6 +1478,20 @@ function drvCols(eod, na) {
       v: (x) => (x.estNow || x.npos || x.q1 + x.q2) ? x.exp : null, fmt: (x) => (x.estNow || x.npos || x.q1 + x.q2) ? money(x.exp) : dash },
     { k: "wc", g: 4, label: "Worst case", dir: 1, title: "loss to settlement from today's marks if everything goes against the book, netted inside each event",
       v: (x) => x.wc ? x.wc : null, fmt: wcCell });
+  const spanCell = (v, f) => Math.abs(v) >= 0.005 ? f(v) : dash;
+  for (const n of SPANS) {
+    const g = n === 7 ? 5 : 6, k = "l" + n, thru = " over the " + n + " ET days through " + day(spanData(n).end);
+    cols.push(
+      { k: k + "r", g, sep: 1, label: paid ? "Rewards*" : "Rewards", dir: -1,
+        title: (paid ? "modeled rewards × the family's paid rate" : "modeled rewards, before Kalshi's $1-per-market-per-period floor") + thru,
+        v: (x) => x.sp ? x.sp[n].r : null, fmt: (x) => x.sp ? spanCell(x.sp[n].r, fmtUSD) : dash },
+      { k: k + "p", g, label: "Trading", dir: 1, title: "trading P&L" + thru + ": realized plus the change in open marks, day by day",
+        v: (x) => x.sp ? x.sp[n].p : null, fmt: (x) => x.sp ? spanCell(x.sp[n].p, money) : dash },
+      { k: k + "n", g, label: paid ? "Net*" : "Net", dir: 1, title: "rewards + trading" + thru + "; per day below (today counts by its hours so far)",
+        v: (x) => x.sp ? x.sp[n].net : null,
+        fmt: (x) => x.sp && Math.abs(x.sp[n].net) >= 0.005 ? "<b>" + money(x.sp[n].net) + "</b>" +
+          (x.sp[n].len > 0 ? '<span class="sub2n">' + fmtUSD(x.sp[n].net / x.sp[n].len, { sign: true }) + "/day</span>" : "") : dash });
+  }
   return cols;
 }
 
@@ -1463,6 +1536,7 @@ function renderDrivers() {
     derive(f, f.name);
     f.typ = baseline(f.name, w);
     f.z = zOf(f);
+    f.sp = spanOf("f", f.name, f.name);
     f.curve = famCurve(f.name);
     f.shape = shapeOf(f.curve);
     f.chg = f.curve ? changesIn(w, f.name) : [];
@@ -1480,8 +1554,9 @@ function renderDrivers() {
   const ncol = cols.length + 1;
   // header: groups, then sortable columns
   const groups = [[1, esc(w.label)], [2, "Flow"], [3, "vs typical"], [4, eod ? "Book at the close" : "Book now"]];
+  SPANS.forEach((n, i) => { const sh = spanHead(n); groups.push([5 + i, esc(sh[0]), sh[1]]); });
   let h = '<table class="t drv"><thead><tr class="grp"><th></th>';
-  for (const [g, lab] of groups) h += '<th colspan="' + cols.filter((c) => c.g === g).length + '" class="' + (g > 1 ? "gs" : "") + '"><span>' + lab + "</span></th>";
+  for (const [g, lab, tip] of groups) h += '<th colspan="' + cols.filter((c) => c.g === g).length + '" class="' + (g > 1 ? "gs" : "") + '"' + (tip ? ' title="' + esc(tip) + '"' : "") + "><span>" + lab + "</span></th>";
   h += "</tr><tr><th>Family / event / market</th>";
   for (const c of cols) {
     const on = !c.nosort && drvSort.k === c.k;
@@ -1506,7 +1581,7 @@ function renderDrivers() {
     shown.push(f);
     h += row(0, fKey, esc(f.name) + ' <span class="muted small">' + evs.length + (evs.length === 1 ? " event" : " events") + "</span>", whyFam(f, top, hb, w, eod), f);
     if (!(openRows.has(fKey) || (Q && !famMatch))) continue;
-    evMatch.forEach((e) => derive(e, f.name));
+    evMatch.forEach((e) => { derive(e, f.name); e.sp = spanOf("e", e.name, f.name); });
     evMatch.sort(sorter);
     const lim = TSTATE[fKey] || 40;
     evMatch.slice(0, lim).forEach((e) => {
@@ -1524,6 +1599,7 @@ function renderDrivers() {
         x.wcg = x.wc;
         x._q = m.cur && m.cur.q ? (m.cur.q === 2 ? "2-sided" : (m.cur.bid_ct > 0 ? "bid" : "ask")) : (m.guard ? '<span class="muted">' + esc(m.guard) + "</span>" : '<span class="muted">—</span>');
         x._m = m;
+        x.sp = spanOf("m", m.t, f.name);
         return derive(x, f.name);
       });
       ms.sort(sorter);
@@ -1541,6 +1617,12 @@ function renderDrivers() {
   for (const f of shown) for (const k of add) t[k] = num(t[k]) + num(f[k]);
   t.nf = t.pnl - t.cr - t.cs; t.netA = t.rewA + t.pnl; t.cov = t.nf < -0.005 ? t.rewA / -t.nf : null; t.exp = t.estA + t.pnl7 / days7();
   if (!Q) { t.typ = baseline(null, w); t.z = zOf(t); t.curve = famCurve(null); t.shape = shapeOf(t.curve); t.chg = []; t.name = ""; }
+  // the last 7 / 30 days of the whole book (a family can have them with nothing
+  // in the window), of the families shown under a filter
+  const inTable = new Set(shown.map((f) => f.name));
+  const offFams = Q ? [] : Object.keys(spanData(Math.max(...SPANS)).f).filter((fm) => !inTable.has(fm))
+    .map((fm) => ({ name: fm, sp: spanOf("f", fm, fm) }));
+  t.sp = spanSum(shown.concat(offFams).map((f) => f.sp));
   h += '<tr class="tot"><td>' + (Q ? "Shown" : "All families") + "</td>";
   for (const c of cols) h += '<td class="num' + (c.sep ? " gs" : "") + (c.cls ? " " + c.cls : "") + '"' + (c.k === "shape" && t.shape ? ' data-fam=""' : "") + ">" + c.fmt(t) + "</td>";
   h += "</tr></tbody></table>";
@@ -1589,7 +1671,10 @@ function renderDrivers() {
   // footnote: coverage of the worst case, the paid-rate basis
   const sc = D.struct_cover || {}, R = D.realize || {};
   const all = changesIn(w);
+  const offN = Math.max(...SPANS), off = offFams.filter((f) => Math.abs(f.sp[offN].net) >= 0.5).sort((a, b) => Math.abs(b.sp[offN].net) - Math.abs(a.sp[offN].net));
   $("drvFoot").innerHTML = "Mark-outs and coverage use maker fills (no pads, no taker fills). " +
+    (off.length ? "The last-" + SPANS.join("/") + "-day totals include " + off.length + (off.length > 1 ? " families" : " family") + " with nothing in this window: " +
+      off.slice(0, 4).map((f) => esc(f.name) + " " + fmtUSD(f.sp[offN].net, { sign: true })).join(", ") + (off.length > 4 ? " and " + (off.length - 4) + " more" : "") + " over " + offN + " days. " : "") +
     (eod ? "Book columns show the book at that day's close. " : "Worst case nets " + fmtNum(sc.known || 0) + " of " + fmtNum(sc.held || 0) + " open positions with Kalshi's strike structure; the rest count in full. ") +
     (R.basis ? "Paid rate: credited ÷ modeled on settled events (" + (R.basis === "raw" ? "raw estimate: floor and model error" : "floored estimate: model error only; the raw basis arrives with the next imm_reward_recon run") + (R.generated_at ? ", calibration of " + esc(String(R.generated_at).slice(0, 10)) : "") + "). " : "") +
     (all.length ? all.length + " code or config change" + (all.length > 1 ? "s" : "") + " landed in this window (ticks on the shape lines when a change names the family). " : "") +
