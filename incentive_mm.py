@@ -19496,18 +19496,21 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
 #     lets it; an order at or past the cap is not passed, and the rung rests
 #     at the cap with it or behind it. COMP_LEAD_MARGIN_C (5c since then)
 #     keeps every lead that far inside what the siblings imply, so a filled
-#     lead still hedges for more than COMP_HEDGE_EDGE_C. Where each side last
+#     lead still hedges at a profit after taker fees (COMP_HEDGE_LEAD_EDGE_C;
+#     ~+1c on Korea, whose 11 legs cost ~4c a contract). Where each side last
 #     led is kept in STATUS_DIR (COMP_HOLD_FILE), so a restart or a drop-out
 #     and return picks the fight up where it was.
-# HEDGE (COMP_HEDGE_MODE): when a leading rung fills, the bot sells (an ask
-# filled) or buys (a bid filled) the same count on every sibling with
-# immediate-or-cancel limit orders, each at the price its sibling's book fills
-# that count at, while the whole set still clears COMP_HEDGE_EDGE_C per set:
-# the lead's price plus the siblings' sells over 100 (the set pays at most
-# 100), or 100 over the lead's price plus the siblings' buys (the pair pays
-# 100 but for a tie). What does not fill is retried each cycle on the same
-# test; open jobs are kept in STATUS_DIR (COMP_HEDGE_FILE) across restarts
-# and give up after COMP_HEDGE_MAX_AGE_SECS. Rows: comp_hedge_<date>.jsonl.
+# HEDGE (COMP_HEDGE_MODE): when a leading rung fills, the bot locks it
+# (lock_plan, since 2026-10-29 for every fill: PROFIT LOCK below) with
+# immediate-or-cancel limit orders on the siblings -- selling YES on them,
+# best bids first, after an ask filled; buying the twin after a bid filled
+# -- once the floor clears COMP_HEDGE_LEAD_EDGE_C a contract after taker
+# fees: the lead's price plus the siblings' net sales over 100 (the set pays
+# at most 100), or the twin's 100 over the lead's price and its cost (the
+# pair pays 100 but for a tie). What does not fill is retried each cycle on
+# the same test; open jobs are kept in STATUS_DIR (COMP_HEDGE_FILE) across
+# restarts and give up after COMP_HEDGE_MAX_AGE_SECS. Rows:
+# comp_hedge_<date>.jsonl.
 # The WS fast cancel judges a leading rung against the touch its siblings
 # imply as well as its own, and re-checks it whenever a sibling's book moves;
 # with any sibling's book off the feed there is no lead.
@@ -19528,6 +19531,9 @@ COMP_HOLD_FILE = "comp_lead_holds.json"
 COMP_HOLD_TTL_SECS = _env_float("IMM_COMP_HOLD_TTL_H", 168.0) * 3600.0
 COMP_HEDGE_MODE = os.environ.get("IMM_COMP_HEDGE", "on").strip().lower()
 COMP_HEDGE_EDGE_C = _env_float("IMM_COMP_HEDGE_EDGE_C", 2.0)
+# ...a LEAD's fill locks at any floor after taker fees: the 5c margin is
+# before fees, and selling Korea's 11 siblings costs ~4c a contract in them
+COMP_HEDGE_LEAD_EDGE_C = _env_float("IMM_COMP_HEDGE_LEAD_EDGE_C", 0.0)
 COMP_HEDGE_FILE = "comp_hedge_jobs.json"
 COMP_HEDGE_MAX_AGE_SECS = _env_float("IMM_COMP_HEDGE_MAX_AGE_H", 48.0) * 3600.0
 # A market with a side leading takes a per-market position cap of at least
@@ -19536,6 +19542,19 @@ COMP_HEDGE_MAX_AGE_SECS = _env_float("IMM_COMP_HEDGE_MAX_AGE_H", 48.0) * 3600.0
 # The first Golden Globes leads rested 150 (the 150 series cap) and 75 (a
 # ~1/13 share of the event cap), short of the 200 the reference needs.
 COMP_LEAD_MAX_POSITION = _env_float("IMM_COMP_LEAD_MAX_POSITION", 400.0)
+# PROFIT LOCK ON EVERY FILL (Jack 2026-10-29: "1 and 2"): ANY maker fill that
+# opens or adds to a position in a mutually exclusive event (a sale; a buy only
+# in a two-market election pair) or on a threshold ladder (either side) is
+# locked with lock_plan once the hedge clears COMP_HEDGE_EDGE_C after fees. A
+# lead's fill waits up to COMP_HEDGE_MAX_AGE_SECS for its lock (IMM_COMP_HEDGE
+# governs it), any other fill LOCK_WATCH_SECS (IMM_LOCK), and an unlocked
+# fill rides on as ordinary inventory. IMM_LOCK=dry logs the locks it would
+# send, off disables. Ladders (ladder_order) group by the same event reads,
+# and their strikes lead like the complement lead: a strike's ask off the
+# easier strikes' offers, its bid off the harder strikes' bids, both sides in
+# any family (the hedge needs no winner: ladder_lead_group).
+LOCK_MODE = os.environ.get("IMM_LOCK", "on").strip().lower()
+LOCK_WATCH_SECS = _env_float("IMM_LOCK_WATCH_MIN", 10.0) * 60.0
 
 
 def comp_lead_series(series: str) -> bool:
@@ -19683,6 +19702,45 @@ def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]]
                            hold_bid=hold_bid, hold_ask=hold_ask, bid_ok=True)
 
 
+def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
+                      easier: List[Tuple[List[List[float]], List[List[float]]]],
+                      harder: List[Tuple[List[List[float]], List[List[float]]]],
+                      target: float, df: float,
+                      hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
+                      ) -> Tuple[Optional[Tuple[int, int, int]],
+                                 Optional[Tuple[int, int, int]]]:
+    """(bid lead, ask lead) for one strike of a threshold ladder (ladder_order)
+    from the other strikes' books, every book EXTERNAL; `easier` / `harder`:
+    each easier / harder strike's (YES levels, NO levels). A strike settles
+    YES only where every easier one does, so it is worth no more than an
+    easier strike is offered at -- the easier strikes' NO bids, each walked to
+    target/5, give the ask side's reference (NO space, the highest) -- and no
+    less than a harder strike is bid at (the bid side's: the highest harder
+    YES-bid reference). Both sides lead, in any family: a fill hedges on the
+    strike that priced it whatever settles (lock_plan ladder_ask /
+    ladder_bid). Holds, caps and guards as comp_lead_group."""
+    lb = ln = None
+    if target > 0:
+        refs = [r for r in (side_reference_level(levels_desc(hy), target)
+                            for hy, _hn in harder) if r is not None]
+        if refs:
+            lb = comp_side_lead_ref(yes_levels, max(refs), target, df, hold=hold_bid)
+        refs = [r for r in (side_reference_level(levels_desc(en), target)
+                            for _ey, en in easier) if r is not None]
+        if refs:
+            ln = comp_side_lead_ref(no_levels, max(refs), target, df,
+                                    hold=None if hold_ask is None else 100 - hold_ask)
+    la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
+    eb, ea = external_best(yes_levels, no_levels)
+    if lb is not None and ea is not None and lb[0] >= ea:
+        lb = None
+    if la is not None and eb is not None and la[0] <= eb:
+        la = None
+    if lb is not None and la is not None and lb[0] >= la[0]:
+        lb = la = None
+    return lb, la
+
+
 def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
     """The price (that side's own space, best first) at which `levels` fill
     `count` contracts -- the worst price an immediate order of that size
@@ -19693,6 +19751,149 @@ def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
         if cum >= count - 1e-9:
             return px
     return None
+
+
+# PROFIT LOCK (Jack 2026-10-29: "1 and 2" -- "Hedge every fill that locks a
+# profit" and "Threshold-ladder leads, hedged on the neighboring strike"). A
+# maker fill on a market its event prices twice is hedged with immediate-or-
+# cancel orders on the markets that price it, but only when the hedge locks
+# at least COMP_HEDGE_EDGE_C a contract after Kalshi's taker fees, whatever
+# settles. Four kinds:
+#   me_ask      an ask filled in a mutually exclusive event: sell YES on its
+#               siblings. At most one market wins, so the set owes at most 100:
+#               floor = price + the siblings' net proceeds - 100, and any
+#               sibling sold (up to the fill's count on each) raises it.
+#   pair_bid    a bid filled in a two-market election pair: buy YES on the
+#               twin (a tie, both NO, is the risk the bid lead already takes):
+#               floor = 100 x twin bought - price - cost.
+#   ladder_ask  an ask filled on a threshold strike: buy YES on EASIER strikes
+#               of the ladder, which settle YES whenever it does:
+#               floor = price - cost - 100 x the count left uncovered.
+#   ladder_bid  a bid filled on a strike: sell YES on HARDER strikes, which
+#               settle YES only when it does: floor = proceeds - price.
+# The plan takes the best prices first (highest bids, cheapest asks) and stops
+# once the floor clears the edge: it trades no more than the lock needs and
+# keeps the upside of the markets it leaves alone.
+LOCK_FEE_RATE = _env_float("IMM_LOCK_FEE_RATE", 0.07)
+# kind -> (legs SELL YES, each leg capped at the count (else the legs' total),
+#          the fill was an ask)
+LOCK_KINDS: Dict[str, Tuple[bool, bool, bool]] = {
+    "me_ask": (True, True, True),
+    "pair_bid": (False, False, False),
+    "ladder_ask": (False, False, True),
+    "ladder_bid": (True, False, False),
+}
+
+
+def taker_fee_cents(px: float, count: float, mult: float = 1.0) -> float:
+    """Kalshi's taker fee on one order, in cents: LOCK_FEE_RATE x C x P x
+    (1 - P) dollars (P in dollars), rounded up to the cent."""
+    if count <= 0:
+        return 0.0
+    p = min(max(px / 100.0, 0.0), 1.0)
+    return float(math.ceil(LOCK_FEE_RATE * 100.0 * mult * count * p * (1.0 - p) - 1e-9))
+
+
+def lock_plan(kind: str, price: float, count: float,
+              books: Dict[str, List[Tuple[int, float]]],
+              done: Optional[Dict[str, Tuple[float, float, float]]] = None,
+              edge_c: float = 2.0, fee_mult: float = 1.0
+              ) -> Tuple[float, Dict[str, Tuple[int, int]]]:
+    """(floor a contract in cents, {leg: (worst price, contracts)}) to lock a
+    `kind` fill of `count` at `price` (YES cents). `books`: each leg market's
+    EXTERNAL levels the legs trade into, best first in YES cents -- its YES
+    bids for SELL legs, its YES asks (100 - NO bids) for BUY legs. `done`:
+    what each leg already traded, (contracts, YES-cent value, fees in cents).
+    The floor counts `done` and the plan; an empty plan means the floor
+    already clears `edge_c`, or (floor under it) no plan on these books
+    does."""
+    sell, each, ask = LOCK_KINDS[kind]
+    n = float(count)
+    if n <= 0:
+        return 0.0, {}
+    base = (price - 100.0) * n if ask else -price * n
+    used: Dict[str, float] = {}
+    for s, (q, v, fee) in (done or {}).items():
+        base += (v - fee) if sell else (100.0 * q - v - fee)
+        used[s] = used.get(s, 0.0) + q
+    need = edge_c * n
+    if base >= need - 1e-9:
+        return base / n, {}
+    rate = LOCK_FEE_RATE * 100.0 * fee_mult
+    cands: List[Tuple[float, str, int, float]] = []
+    for s, lv in books.items():
+        for px, q in lv:
+            p = px / 100.0
+            g = (px if sell else 100.0 - px) - rate * p * (1.0 - p)
+            if g > 0 and q >= 1:
+                cands.append((g, s, int(px), float(q)))
+    cands.sort(key=lambda c: (-c[0], c[1]))
+    plan_q: Dict[str, int] = {}
+    plan_v: Dict[str, float] = {}
+    plan_f: Dict[str, float] = {}
+    plan_px: Dict[str, int] = {}
+
+    def floor_now() -> float:
+        f = base
+        for s, q in plan_q.items():
+            fee = float(math.ceil(plan_f[s] - 1e-9))
+            f += (plan_v[s] - fee) if sell else (100.0 * q - plan_v[s] - fee)
+        return f
+
+    left_total = n - sum(used.values())
+    for g, s, px, q in cands:
+        avail = int(q)
+        while avail >= 1:
+            room = ((n - used.get(s, 0.0) - plan_q.get(s, 0)) if each
+                    else (left_total - sum(plan_q.values())))
+            k = min(avail, int(math.floor(room + 1e-9)),
+                    max(1, int(math.ceil((need - floor_now()) / g - 1e-9))))
+            if k < 1:
+                break
+            p = px / 100.0
+            plan_q[s] = plan_q.get(s, 0) + k
+            plan_v[s] = plan_v.get(s, 0.0) + k * px
+            plan_f[s] = plan_f.get(s, 0.0) + rate * k * p * (1.0 - p)
+            plan_px[s] = px
+            avail -= k
+            if floor_now() >= need - 1e-9:
+                return floor_now() / n, {t: (plan_px[t], plan_q[t]) for t in plan_q}
+        if not each and sum(plan_q.values()) >= left_total - 1e-9:
+            break
+    return floor_now() / n, {}
+
+
+def ladder_order(markets: List[dict]) -> Optional[Tuple[str, ...]]:
+    """An event's markets ordered from the EASIEST strike to the HARDEST when
+    they form one threshold ladder -- every market "above X" (strike_type
+    greater / greater_or_equal, a higher floor_strike harder) or every one
+    "below X" (less / less_or_equal, a lower cap_strike harder), the strikes
+    all distinct, each market's ticker suffix and YES subtitle naming its
+    number -- else None. One market per city or team at a shared strike
+    (KXRAINWKND: 35 cities, all "above 0") is not a ladder."""
+    if len(markets) < 2:
+        return None
+    st = {str(m.get("strike_type") or "").lower() for m in markets}
+    if st <= {"greater", "greater_or_equal"}:
+        key, harder_low = "floor_strike", False
+    elif st <= {"less", "less_or_equal"}:
+        key, harder_low = "cap_strike", True
+    else:
+        return None
+    ks: List[Tuple[float, str]] = []
+    for m in markets:
+        t = str(m.get("ticker") or "")
+        sub = str(m.get("yes_sub_title") or m.get("subtitle") or "")
+        if not re.search(r"\d", t.rsplit("-", 1)[-1]) or not re.search(r"\d", sub):
+            return None
+        try:
+            ks.append((float(m.get(key)), t))
+        except (TypeError, ValueError):
+            return None
+    if len({k for k, _t in ks}) != len(ks):
+        return None
+    ks.sort(reverse=harder_low)
+    return tuple(t for _k, t in ks)
 
 
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
@@ -20718,6 +20919,11 @@ class IncentiveMarketMaker:
         self._comp_events: Dict[str, Tuple[float, Optional[Tuple[str, ...]]]] = {}
         self._comp_groups: Dict[str, Tuple[str, ...]] = {}   # ticker -> its event's markets
         self._comp_pairs: Dict[str, str] = {}                # two-market groups: the twin
+        # threshold ladders (ladder_order), read with the same event reads:
+        # event -> its strikes easiest first (None: not a ladder), and ticker
+        # -> its event's ladder
+        self._ladder_events: Dict[str, Optional[Tuple[str, ...]]] = {}
+        self._ladders: Dict[str, Tuple[str, ...]] = {}
         self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
@@ -21265,9 +21471,12 @@ class IncentiveMarketMaker:
             if toxic:
                 self._toxic_note_fill(f, tkr, side, action, px_cents)
                 self._bait_note_fill(f, tkr, join, count, now_ts)
-            # a filled complement lead is hedged on its siblings; a hedge
-            # leg's fill credits its job (COMP_HEDGE_MODE)
-            self._comp_hedge_on_fill(f, tkr, side, action, count, px_cents, now_ts)
+            # a fill that opens a position in a linked event is locked if
+            # its hedge clears the edge; a lock leg's fill credits its job
+            # (COMP_HEDGE_MODE for a lead's fill, LOCK_MODE for any other)
+            self._comp_hedge_on_fill(f, tkr, side, action, count, px_cents, now_ts,
+                                     pos_before=pos_before,
+                                     pos_after=self.pnl.pos.get(tkr, 0.0))
 
     def _log_fill(self, f: dict, tkr: str, side: str, action: str,
                   count: float, px_cents: float, now_ts: float,
@@ -23180,6 +23389,8 @@ class IncentiveMarketMaker:
         # re-checks it (COMP_LEAD_MODE)
         check |= {s for d in dirty for s in self._comp_groups.get(d, ())
                   if s != d and s in self._comp_lead_px}
+        check |= {s for d in dirty for s in self._ladders.get(d, ())
+                  if s != d and s in self._comp_lead_px}
 
         def _own_by_px(lst) -> Tuple[Dict[float, float], Dict[float, float]]:
             oy: Dict[float, float] = {}
@@ -23233,6 +23444,31 @@ class IncentiveMarketMaker:
                                 ext_bid = imp if ext_bid is None else max(ext_bid, imp)
                     if lead_px[1] is not None:
                         imp_ask = round(1.0 - sum(best_yes), 4)
+                        ext_ask = imp_ask if ext_ask is None else min(ext_ask, imp_ask)
+            lad = self._ladders.get(t) if lead_px is not None and not grp else None
+            if lad:
+                # a ladder strike: the harder strikes' best bids are our bid's
+                # touch too, the easier strikes' best offers our ask's (a strike
+                # off the feed is left out)
+                i = lad.index(t)
+                for s in (lad[i + 1:] if lead_px[0] is not None else ()):
+                    b = ws.book_levels(s)
+                    if b is None:
+                        continue
+                    so_yes, _so_no = _own_by_px(self._resting_view.get(s) or [])
+                    imp = max((p for p, q in b[0].items()
+                               if q - so_yes.get(p, 0.0) > 0.01), default=None)
+                    if imp is not None:
+                        ext_bid = imp if ext_bid is None else max(ext_bid, imp)
+                for s in (lad[:i] if lead_px[1] is not None else ()):
+                    b = ws.book_levels(s)
+                    if b is None:
+                        continue
+                    _so_yes, so_no = _own_by_px(self._resting_view.get(s) or [])
+                    nb = max((p for p, q in b[1].items()
+                              if q - so_no.get(p, 0.0) > 0.01), default=None)
+                    if nb is not None:
+                        imp_ask = round(1.0 - nb, 4)
                         ext_ask = imp_ask if ext_ask is None else min(ext_ask, imp_ask)
             for o in list(orders):
                 oid = o["order_id"]
@@ -26384,8 +26620,9 @@ class IncentiveMarketMaker:
         self._ws_cand_subscribe(
             [m.ticker for m in screened
              if m.event_ticker not in self.state.event_live_halt]
-            # ...with every complement group's siblings (COMP_LEAD_MODE)
-            + sorted(set(self._comp_groups)))
+            # ...with every complement group's siblings and ladder's strikes
+            # (COMP_LEAD_MODE)
+            + sorted(set(self._comp_groups) | set(self._ladders)))
         # ...and its REST reads are budgeted (CAND_REST_BUDGET_SECS), from
         # after the feed's warm-up wait
         self._cand_rest = {"t0": time.monotonic(), "fails": 0, "off": ""}
@@ -27332,9 +27569,12 @@ class IncentiveMarketMaker:
             tickers = tuple(sorted(str(x.get("ticker") or "") for x in mk))
             open_ = all(str(x.get("status") or "").lower() in ("active", "open")
                         for x in mk)
-            ok = (bool(e.get("mutually_exclusive")) and len(tickers) >= 2
-                  and cands <= set(tickers) and open_)
+            me = bool(e.get("mutually_exclusive"))
+            ok = me and len(tickers) >= 2 and cands <= set(tickers) and open_
             self._comp_events[ev] = (now_ts, tickers if ok else None)
+            # ...or a threshold ladder: every strike open, one underlying
+            lad = None if me or not open_ or not cands <= set(tickers) else ladder_order(mk)
+            self._ladder_events[ev] = lad
         groups: Dict[str, Tuple[str, ...]] = {}
         for _ev, (_at, grp) in self._comp_events.items():
             if grp is not None:
@@ -27342,13 +27582,40 @@ class IncentiveMarketMaker:
                     groups[t] = grp
         pairs = {t: (g[1] if g[0] == t else g[0]) for t, g in groups.items()
                  if len(g) == 2}
-        if set(groups) != set(self._comp_groups):
+        ladders = {t: lad for lad in self._ladder_events.values() if lad for t in lad}
+        if set(groups) != set(self._comp_groups) or set(ladders) != set(self._ladders):
             n_ev = len({g for g in groups.values()})
+            n_lad = len({g for g in ladders.values()})
             log(f"{self.tag} comp lead: {n_ev} mutually exclusive event(s) grouped, "
                 f"{len(pairs) // 2} of them two-market ({reads} event read(s) "
-                f"this refresh)")
+                f"this refresh); {n_lad} threshold ladder(s)")
         self._comp_groups = groups
         self._comp_pairs = pairs
+        self._ladders = ladders
+
+    def _comp_linked(self, t: str) -> bool:
+        """Does another market's book price `t` (a mutually exclusive group
+        or a threshold ladder)?"""
+        return t in self._comp_groups or t in self._ladders
+
+    def _comp_books(self, tickers) -> List[Tuple[str, List[List[float]], List[List[float]]]]:
+        """Each of `tickers`' EXTERNAL books on the WS feed, as (ticker, YES
+        levels, NO levels); a market off the feed is left out."""
+        ws = self._ws
+        out = []
+        for s in tickers:
+            try:
+                ob = ws.book_fp(s) if ws is not None else None
+            except Exception:
+                ob = None
+            if ob is None:
+                continue
+            sy, sn = orderbook_levels(ob)
+            own_s = self._comp_own.get(s, []) if self.live else []
+            if own_s:
+                sy, sn = external_levels(sy, sn, own_s)
+            out.append((s, sy, sn))
+        return out
 
     def _comp_sib_books(self, t: str
                         ) -> Optional[List[Tuple[str, List[List[float]], List[List[float]]]]]:
@@ -27382,21 +27649,32 @@ class IncentiveMarketMaker:
         """This market's (bid lead, ask lead) off its siblings' WS books
         (comp_lead_group; `yes_ext` / `no_ext` = its own EXTERNAL book):
         (None, None) without a group, outside the scope, on a sub-penny book
-        or when the feed cannot serve every sibling's book."""
-        if meta.ticker not in self._comp_groups or not comp_lead_series(meta.series) \
+        or when the feed cannot serve every sibling's book. A threshold
+        ladder's strike leads off the other strikes' books (ladder_lead_group;
+        a strike off the feed is left out)."""
+        t = meta.ticker
+        if not self._comp_linked(t) or not comp_lead_series(meta.series) \
                 or meta.price_step < 0.01:
-            return None, None
-        sibs = self._comp_sib_books(meta.ticker)
-        if sibs is None:
             return None, None
         # where its sides lead now, else where they last led (COMP_HOLD_FILE):
         # a leading side never moves up
-        held = self._comp_lead_px.get(meta.ticker)
+        held = self._comp_lead_px.get(t)
         if held is None:
-            h = self._comp_holds.get(meta.ticker)
+            h = self._comp_holds.get(t)
             if h is not None and time.time() - float(h[2]) < COMP_HOLD_TTL_SECS:
                 held = (h[0], h[1], 0)
         held = held or (None, None, 0)
+        if t not in self._comp_groups:
+            lad = self._ladders[t]
+            i = lad.index(t)
+            easier = [(sy, sn) for _s, sy, sn in self._comp_books(lad[:i])]
+            harder = [(sy, sn) for _s, sy, sn in self._comp_books(lad[i + 1:])]
+            return ladder_lead_group(yes_ext, no_ext, easier, harder,
+                                     meta.target_size, meta.discount_factor,
+                                     hold_bid=held[0], hold_ask=held[1])
+        sibs = self._comp_sib_books(t)
+        if sibs is None:
+            return None, None
         return comp_lead_group(yes_ext, no_ext, [(sy, sn) for _s, sy, sn in sibs],
                                meta.target_size, meta.discount_factor,
                                hold_bid=held[0], hold_ask=held[1],
@@ -27442,6 +27720,9 @@ class IncentiveMarketMaker:
         who, verb = ((f"{self._comp_pairs[t]}'s book", "implies") if t in self._comp_pairs
                      else (f"its {max(len(grp) - 1, 0)} siblings' books", "imply"))
         for side, lead in (("bid", lead_b), ("ask", lead_a)):
+            if not grp and t in self._ladders:
+                who, verb = (("its harder strikes' books", "imply") if side == "bid"
+                             else ("its easier strikes' books", "imply"))
             key = (t, side)
             px = None if lead is None else lead[0]
             prev = self._comp_lead_noted.get(key)
@@ -27489,27 +27770,68 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} ! {COMP_HEDGE_FILE} write failed ({e}); the "
                     f"jobs stay in memory (logged once)")
 
+    def _lock_kind(self, t: str, side: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
+        """(lock_plan kind, its leg markets) for one of OUR fills on `t`'s
+        `side` ("bid": we bought YES, "ask": we sold it), or None: in a
+        mutually exclusive event a sale locks on the siblings, a buy only in
+        a two-market election pair (on the twin); on a threshold ladder a
+        sale locks on the easier strikes, a buy on the harder ones."""
+        grp = self._comp_groups.get(t)
+        if grp:
+            sibs = tuple(s for s in grp if s != t)
+            if side == "ask":
+                return "me_ask", sibs
+            if len(grp) == 2 and comp_bid_lead_series(series_of(t)):
+                return "pair_bid", sibs
+            return None
+        lad = self._ladders.get(t)
+        if lad and t in lad:
+            i = lad.index(t)
+            if side == "ask" and i > 0:
+                return "ladder_ask", lad[:i]
+            if side == "bid" and i < len(lad) - 1:
+                return "ladder_bid", lad[i + 1:]
+        return None
+
     def _comp_hedge_on_fill(self, f: dict, tkr: str, side: str, action: str,
-                            count: float, px_cents: float, now_ts: float) -> None:
-        """One of OUR fills: a hedge leg's credits its job; a maker fill on a
-        leading side (at the price it leads at now, or last led at) opens
-        a job to hedge it on every sibling. Never raises."""
+                            count: float, px_cents: float, now_ts: float,
+                            pos_before: Optional[float] = None,
+                            pos_after: Optional[float] = None) -> None:
+        """One of OUR fills: a hedge leg's credits its job; a maker fill that
+        opens or adds to a position (pos_before -> pos_after; unknown: the
+        whole fill) opens a lock job (_lock_kind) for what it opened -- a
+        lead's fill (at the price its side leads at now, led at in the last
+        10 minutes, or last led at) under COMP_HEDGE_MODE for up to
+        COMP_HEDGE_MAX_AGE_SECS, any other under LOCK_MODE for
+        LOCK_WATCH_SECS. Never raises."""
         try:
             oid = str(f.get("order_id") or "")
             for j in self._comp_hedges:
-                for s, leg in j["legs"].items():
-                    if s == tkr and oid and oid in leg.get("oids", ()):
-                        leg["filled"] = float(leg.get("filled", 0.0)) + count
-                        leg["value"] = float(leg.get("value", 0.0)) + count * px_cents
-                        self._sink("comp_hedge", {
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "kind": "leg_fill", "job": j["id"], "ticker": tkr,
-                            "count": count, "px": px_cents, "order_id": oid})
-                        self._save_comp_hedges()
-                        return
-            if COMP_HEDGE_MODE not in ("on", "dry") or f.get("is_taker"):
+                lg = j["legs"].get(tkr)
+                if lg is not None and oid and oid in lg.get("oids", ()):
+                    lg["filled"] = float(lg.get("filled", 0.0)) + count
+                    lg["value"] = float(lg.get("value", 0.0)) + count * px_cents
+                    lg["fee"] = float(lg.get("fee", 0.0)) + taker_fee_cents(px_cents, count)
+                    self._sink("comp_hedge", {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "kind": "leg_fill", "job": j["id"], "ticker": tkr,
+                        "count": count, "px": px_cents, "order_id": oid})
+                    self._save_comp_hedges()
+                    return
+            if f.get("is_taker"):
                 return
             book_side = "bid" if (side == "yes") == (action == "buy") else "ask"
+            # only what the fill opened is locked: one that cuts a position
+            # realizes it instead
+            if pos_before is None or pos_after is None:
+                opened = count
+            elif book_side == "ask":
+                opened = max(0.0, -pos_after) - max(0.0, -pos_before)
+            else:
+                opened = max(0.0, pos_after) - max(0.0, pos_before)
+            n = math.floor(opened + 1e-9)
+            if n < 1:
+                return
             i = 0 if book_side == "bid" else 1
             lead = self._comp_lead_px.get(tkr)
             # the side's lead price now, any it led at in the last 10 minutes
@@ -27521,151 +27843,189 @@ class IncentiveMarketMaker:
             h = self._comp_holds.get(tkr)
             if h is not None and h[i] is not None:
                 prices.add(h[i])
-            if not any(abs(px_cents - float(p_)) <= 0.5 for p_ in prices):
+            on_lead = any(abs(px_cents - float(p_)) <= 0.5 for p_ in prices)
+            mode = COMP_HEDGE_MODE if on_lead else LOCK_MODE
+            if mode not in ("on", "dry"):
                 return
-            grp = self._comp_groups.get(tkr) or ()
-            sibs = [s for s in grp if s != tkr]
+            lk = self._lock_kind(tkr, book_side)
+            # a lead's fill booked before the groups are read (the startup
+            # reconcile) waits for its group; any other needs one now
+            if lk is None and (not on_lead or self._comp_linked(tkr)):
+                return
             job = {"id": f"{tkr}-{book_side}-{oid[:8] or 'x'}-{int(now_ts)}",
                    "event": "-".join(tkr.split("-")[:-1]) or tkr,
-                   "ticker": tkr, "side": book_side, "price": float(px_cents),
-                   "count": float(count), "at": now_ts, "tries": 0,
-                   "legs": {s: {"filled": 0.0, "value": 0.0, "oids": [],
-                                "sent_at": 0.0} for s in sibs}}
-            if not sibs:
-                # a fill booked before the groups are read (the startup
-                # reconcile): its legs are filled in once its group is known
+                   "ticker": tkr, "side": book_side, "kind": lk[0] if lk else None,
+                   "lead": on_lead, "mode": mode, "price": float(px_cents),
+                   "count": float(n), "at": now_ts,
+                   "until": now_ts + (COMP_HEDGE_MAX_AGE_SECS if on_lead else LOCK_WATCH_SECS),
+                   "tries": 0, "legs": {}, "best": None}
+            if lk is None:
                 job["need_group"] = True
             self._comp_hedges.append(job)
             self._save_comp_hedges()
-            what = "sell" if book_side == "ask" else "buy"
-            log(f"{self.tag} comp hedge: {tkr} {book_side.upper()} filled {count:g} @ "
-                f"{px_cents:g}c on its lead -- will {what} {count:g} on each of "
-                + (f"{len(sibs)} sibling(s)" if sibs else "its siblings once its group is read")
-                + (" (dry)" if COMP_HEDGE_MODE != "on" else ""))
+            if on_lead:
+                log(f"{self.tag} comp hedge: {tkr} {book_side.upper()} filled {n:g} @ "
+                    f"{px_cents:g}c on its lead -- will lock it on "
+                    + (f"{len(lk[1])} {'sibling' if lk[0] in ('me_ask', 'pair_bid') else 'strike'}(s)"
+                       if lk else "its siblings once its group is read")
+                    + (" (dry)" if mode != "on" else ""))
             self._sink("comp_hedge", {
                 "ts": datetime.now(timezone.utc).isoformat(), "kind": "open",
-                "job": job["id"], "ticker": tkr, "side": book_side,
-                "count": count, "px": px_cents, "siblings": sibs})
+                "job": job["id"], "ticker": tkr, "side": book_side, "lock": job["kind"],
+                "lead": on_lead, "count": float(n), "px": px_cents,
+                "legs": list(lk[1]) if lk else []})
         except Exception as e:
             log(f"{self.tag} ! comp hedge fill note failed ({type(e).__name__}: {e})")
 
     def _comp_hedge_run(self, now_ts: float) -> None:
-        """Work the open hedge jobs (COMP_HEDGE_MODE): for each, price what is
-        left of every leg at the depth its sibling's book fills it, and when
-        the whole set still clears COMP_HEDGE_EDGE_C send each leg as an
-        immediate-or-cancel limit at that price. A leg sent in the last 60s
-        waits for its fills to be read. Done, expired and dry jobs are
-        logged and dropped. Never raises."""
+        """Work the open lock jobs: price each on its leg markets' books
+        (lock_plan, the legs' fills so far counted) and send the plan's legs
+        as immediate-or-cancel limits once it clears COMP_HEDGE_EDGE_C a
+        contract; a leg sent in the last 60s waits for its fills to be read.
+        A job none of whose legs has traded locks only what its market still
+        holds in its direction (the oldest job first) and is dropped when the
+        bot has unwound it or its watch (`until`) runs out; one with legs
+        traded works until it locks or COMP_HEDGE_MAX_AGE_SECS. Locked, lapsed
+        and dry jobs are logged and dropped. Never raises."""
         if not self._comp_hedges:
             return
         changed = False
         keep: List[dict] = []
-        for j in self._comp_hedges:
+        held_left: Dict[Tuple[str, str], float] = {}
+        for j in sorted(self._comp_hedges, key=lambda x: float(x.get("at", 0.0))):
             try:
-                q, p, side = float(j["count"]), float(j["price"]), j["side"]
-                if j.get("need_group"):
-                    grp = self._comp_groups.get(j["ticker"]) or ()
-                    if grp:
-                        j["legs"] = {s: {"filled": 0.0, "value": 0.0, "oids": [],
-                                         "sent_at": 0.0} for s in grp if s != j["ticker"]}
-                        j["need_group"] = False
+                t, side, p = j["ticker"], j["side"], float(j["price"])
+                # (a job saved before the every-fill locks is a lead's)
+                lead = j.get("lead", True) is not False
+                if not j.get("kind"):
+                    # a pre-lock job (side only) or one waiting for its group
+                    lk = self._lock_kind(t, side)
+                    if lk is not None:
+                        j["kind"], j["need_group"] = lk[0], False
                         changed = True
+                kind = j.get("kind")
+                lk = self._lock_kind(t, side) if kind else None
+                leg_tickers = lk[1] if (lk and lk[0] == kind) else tuple(j["legs"])
                 legs = j["legs"]
-                rem = {s: max(0.0, q - float(lg.get("filled", 0.0)))
-                       for s, lg in legs.items()}
-                if legs and all(r < 0.5 for r in rem.values()):
-                    avg = sum(float(lg.get("value", 0.0)) for lg in legs.values()) / q
-                    edge = (p + avg - 100.0) if side == "ask" else (100.0 - p - avg)
-                    log(f"{self.tag} comp hedge: {j['ticker']} {side} {q:g} @ {p:g}c "
-                        f"hedged on {len(legs)} sibling(s), {edge:+.1f}c a set locked")
+                q = float(j["count"])
+                done = {s: (float(lg.get("filled", 0.0)), float(lg.get("value", 0.0)),
+                            float(lg.get("fee", 0.0)))
+                        for s, lg in legs.items() if float(lg.get("filled", 0.0)) > 0}
+                age = now_ts - float(j.get("at", now_ts))
+                edge = COMP_HEDGE_LEAD_EDGE_C if lead else COMP_HEDGE_EDGE_C
+                if kind and done:
+                    f_done, _pl = lock_plan(kind, p, q, {}, done, edge_c=edge)
+                    if f_done >= edge - 1e-9:
+                        what = ", ".join(f"{s} {d[0]:g}" for s, d in sorted(done.items()))
+                        log(f"{self.tag} comp hedge: {t} {side} {q:g} @ {p:g}c locked "
+                            f"{f_done:+.1f}c a contract ({kind}: {what})")
+                        self._sink("comp_hedge", {
+                            "ts": datetime.now(timezone.utc).isoformat(), "kind": "done",
+                            "job": j["id"], "ticker": t, "lock": kind,
+                            "lead": lead, "edge_c": round(f_done, 2),
+                            "count": q, "legs": {s: d[0] for s, d in done.items()}})
+                        if lead:
+                            self.alerter.alert(
+                                "comp_hedge", f"{t}: lead {side} filled {q:g} @ {p:g}c, "
+                                f"locked {f_done:+.1f}c a contract on {len(done)} market(s)",
+                                key=j["id"], urgent=False)
+                        changed = True
+                        continue
+                if not done and now_ts > float(j.get("until", float(j.get("at", now_ts))
+                                                    + COMP_HEDGE_MAX_AGE_SECS)):
+                    # its watch is over with nothing traded: ordinary inventory
                     self._sink("comp_hedge", {
-                        "ts": datetime.now(timezone.utc).isoformat(), "kind": "done",
-                        "job": j["id"], "edge_c": round(edge, 2), "count": q})
-                    self.alerter.alert(
-                        "comp_hedge", f"{j['ticker']}: lead {side} filled {q:g} @ "
-                        f"{p:g}c, hedged on {len(legs)} sibling(s) for "
-                        f"{edge:+.1f}c a set", key=j["id"], urgent=False)
+                        "ts": datetime.now(timezone.utc).isoformat(), "kind": "nolock",
+                        "job": j["id"], "ticker": t, "lock": kind,
+                        "lead": lead, "count": q, "best_c": j.get("best")})
+                    if lead:
+                        log(f"{self.tag} ! comp hedge: {j['id']} gave up after "
+                            f"{COMP_HEDGE_MAX_AGE_SECS / 3600:g}h without a lock (best "
+                            f"{j.get('best')}c a contract)")
+                        self.alerter.alert(
+                            "comp_hedge", f"{t}: lead fill {q:g} @ {p:g}c never locked "
+                            f"in {COMP_HEDGE_MAX_AGE_SECS / 3600:g}h", key=j["id"], urgent=True)
                     changed = True
                     continue
-                if now_ts - float(j.get("at", now_ts)) > COMP_HEDGE_MAX_AGE_SECS:
+                if done and age > COMP_HEDGE_MAX_AGE_SECS:
                     log(f"{self.tag} ! comp hedge: {j['id']} gave up after "
-                        f"{COMP_HEDGE_MAX_AGE_SECS / 3600:g}h with "
-                        + ", ".join(f"{s} {r:g}" for s, r in rem.items() if r >= 0.5)
-                        + " unhedged")
+                        f"{COMP_HEDGE_MAX_AGE_SECS / 3600:g}h with legs "
+                        + ", ".join(f"{s} {d[0]:g}" for s, d in sorted(done.items()))
+                        + " traded and no lock")
                     self._sink("comp_hedge", {
                         "ts": datetime.now(timezone.utc).isoformat(), "kind": "expired",
-                        "job": j["id"], "unhedged": rem})
+                        "job": j["id"], "ticker": t, "lock": kind,
+                        "legs": {s: d[0] for s, d in done.items()}})
                     self.alerter.alert(
-                        "comp_hedge", f"{j['ticker']}: hedge gave up with "
-                        + ", ".join(f"{s} {r:g}" for s, r in rem.items() if r >= 0.5)
-                        + " unhedged", key=j["id"], urgent=True)
+                        "comp_hedge", f"{t}: lock gave up with legs "
+                        + ", ".join(f"{s} {d[0]:g}" for s, d in sorted(done.items()))
+                        + " traded", key=j["id"], urgent=True)
                     changed = True
                     continue
                 keep.append(j)
-                if not legs or any(now_ts - float(lg.get("sent_at", 0.0)) < 60.0
-                                   and rem[s] >= 0.5 for s, lg in legs.items()):
+                if not kind or any(now_ts - float(lg.get("sent_at", 0.0)) < 60.0
+                                   for lg in legs.values()):
                     continue
-                # price every leg's remainder on its sibling's book
-                plan: Dict[str, int] = {}
-                for s, r in rem.items():
-                    if r < 0.5:
+                if not done:
+                    # what the market still holds this way, oldest job first
+                    pos = self.pnl.pos.get(t, 0.0)
+                    left = held_left.setdefault(
+                        (t, side), max(0.0, -pos) if side == "ask" else max(0.0, pos))
+                    cnt = float(min(q, math.floor(left + 1e-9)))
+                    held_left[(t, side)] = left - cnt
+                    if cnt < 1:
+                        self._sink("comp_hedge", {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "kind": "unwound", "job": j["id"], "ticker": t, "count": q})
+                        keep.remove(j)
+                        changed = True
                         continue
-                    try:
-                        ob = self._ws.book_fp(s) if self._ws is not None else None
-                    except Exception:
-                        ob = None
-                    if ob is None:
-                        plan = {}
-                        break
-                    sy, sn = orderbook_levels(ob)
-                    own_s = self._comp_own.get(s, []) if self.live else []
-                    if own_s:
-                        sy, sn = external_levels(sy, sn, own_s)
-                    if side == "ask":
-                        px = comp_fill_price(sy, r)              # sell YES into the bids
-                    else:
-                        nf = comp_fill_price(sn, r)              # buy YES from the asks
-                        px = None if nf is None else 100 - nf
-                    if px is None:
-                        plan = {}
-                        break
-                    plan[s] = px
+                    if cnt < q:
+                        j["count"] = q = cnt
+                        changed = True
+                # price the plan on the leg markets' books
+                sell = LOCK_KINDS[kind][0]
+                books: Dict[str, List[Tuple[int, float]]] = {}
+                for s, sy, sn in self._comp_books(leg_tickers):
+                    books[s] = (levels_desc(sy) if sell
+                                else [(100 - px, qq) for px, qq in levels_desc(sn)])
+                floor, plan = lock_plan(kind, p, q, books, done, edge_c=edge)
+                if j.get("best") is None or floor > float(j["best"]) + 0.05:
+                    j["best"] = round(floor, 2)
                 if not plan:
-                    continue
-                avg = sum((float(lg.get("value", 0.0)) + rem[s] * plan.get(s, 0)) / q
-                          for s, lg in legs.items())
-                edge = (p + avg - 100.0) if side == "ask" else (100.0 - p - avg)
-                if edge < COMP_HEDGE_EDGE_C:
                     if not j.get("waiting"):
                         j["waiting"] = True
                         changed = True
-                        log(f"{self.tag} comp hedge: {j['id']} waits -- the siblings' "
-                            f"books now leave {edge:+.1f}c a set, under "
-                            f"{COMP_HEDGE_EDGE_C:g}c")
+                        if lead:
+                            log(f"{self.tag} comp hedge: {j['id']} waits -- the books now "
+                                f"leave {floor:+.1f}c a contract, under {edge:g}c")
                     continue
                 j["waiting"] = False
                 j["tries"] = int(j.get("tries", 0)) + 1
-                book_side = "ask" if side == "ask" else "bid"
-                if COMP_HEDGE_MODE != "on":
+                leg_side = "ask" if sell else "bid"
+                what = ", ".join(f"{s} {n} @ {px}c" for s, (px, n) in sorted(plan.items()))
+                if (j.get("mode") or COMP_HEDGE_MODE) != "on":
                     # dry: the legs it would send, once, and the job is dropped
-                    for s, px in plan.items():
-                        self._comp_hedge_send(s, book_side, px,
-                                              int(math.floor(rem[s] + 1e-9)), j, now_ts)
-                    log(f"{self.tag} comp hedge (dry): {j['id']} would lock "
-                        f"{edge:+.1f}c a set; dropped")
+                    for s, (px, n) in plan.items():
+                        legs.setdefault(s, {"filled": 0.0, "value": 0.0, "fee": 0.0,
+                                            "oids": [], "sent_at": 0.0})
+                        self._comp_hedge_send(s, leg_side, px, n, j, now_ts)
+                    log(f"{self.tag} comp hedge (dry): {j['id']} would lock {floor:+.1f}c "
+                        f"a contract ({kind}: {what}); dropped")
                     keep.remove(j)
                     changed = True
                     continue
-                for s, px in plan.items():
-                    n = int(math.floor(rem[s] + 1e-9))
-                    if n <= 0:
-                        continue
-                    oid = self._comp_hedge_send(s, book_side, px, n, j, now_ts)
+                log(f"{self.tag} comp hedge: {t} {side} {q:g} @ {p:g}c -- locking "
+                    f"{floor:+.1f}c a contract ({kind}: {what})")
+                for s, (px, n) in plan.items():
+                    lg = legs.setdefault(s, {"filled": 0.0, "value": 0.0, "fee": 0.0,
+                                             "oids": [], "sent_at": 0.0})
+                    oid = self._comp_hedge_send(s, leg_side, px, n, j, now_ts)
                     # a refused leg (short cash on the shard, say) waits 10
                     # minutes, not one
-                    legs[s]["sent_at"] = now_ts if (oid or not self.live) else now_ts + 540.0
+                    lg["sent_at"] = now_ts if (oid or not self.live) else now_ts + 540.0
                     if oid:
-                        legs[s].setdefault("oids", []).append(oid)
+                        lg.setdefault("oids", []).append(oid)
                 changed = True
             except Exception as e:
                 keep.append(j)
@@ -27677,22 +28037,24 @@ class IncentiveMarketMaker:
 
     def _comp_hedge_send(self, ticker: str, book_side: str, px: int, count: int,
                          job: dict, now_ts: float) -> Optional[str]:
-        """Send one hedge leg: an immediate-or-cancel limit order (not
+        """Send one lock leg: an immediate-or-cancel limit order (not
         post-only) to buy (bid) or sell (ask) `count` YES at `px` or better.
-        Its fills are ours (our_order_ids). Dry run and IMM_COMP_HEDGE=dry
-        only log; a dry run credits the leg in full. Returns the order id."""
+        Its fills are ours (our_order_ids). A job in dry mode only logs; a dry
+        run credits the leg in full. Returns the order id."""
         what = "buy" if book_side == "bid" else "sell"
         label = f"{ticker} {what} {count} YES @ {px}c (IOC)"
         row = {"ts": datetime.now(timezone.utc).isoformat(), "kind": "send",
                "job": job["id"], "ticker": ticker, "side": book_side,
                "px": px, "count": count}
-        if COMP_HEDGE_MODE != "on" or not self.live:
+        live_mode = (job.get("mode") or COMP_HEDGE_MODE) == "on"
+        if not live_mode or not self.live:
             log(f"{self.tag} [DRY] comp hedge {label}")
             self._sink("comp_hedge", dict(row, dry=True))
-            if not self.live and COMP_HEDGE_MODE == "on":
+            if not self.live and live_mode:
                 leg = job["legs"][ticker]
                 leg["filled"] = float(leg.get("filled", 0.0)) + count
                 leg["value"] = float(leg.get("value", 0.0)) + count * px
+                leg["fee"] = float(leg.get("fee", 0.0)) + taker_fee_cents(px, count)
             return None
         client_order_id = f"{CLIENT_ORDER_PREFIX}-{RUN_ID}-h{uuid.uuid4().hex[:11]}"
         if book_side == "bid":
@@ -28467,7 +28829,7 @@ class IncentiveMarketMaker:
         # the floor projection (COMP_LEAD_MODE on only)
         _leads: Tuple[Optional[Tuple[int, int, int]],
                       Optional[Tuple[int, int, int]]] = (None, None)
-        if COMP_LEAD_MODE == "on" and meta.ticker in self._comp_groups:
+        if COMP_LEAD_MODE == "on" and self._comp_linked(meta.ticker):
             _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_live)
                                if (self.live and own_live) else (yes_levels, no_levels))
             _leads = self._comp_lead(meta, _lx_yes, _lx_no)
@@ -31017,7 +31379,7 @@ class IncentiveMarketMaker:
             # cap or outside the band the loop places at-ref rungs in
             lead_b = lead_a = None
             lead_n = comp_lead_size(meta.target_size)
-            if (t in self._comp_groups and not reduce_only
+            if (self._comp_linked(t) and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None
                     and poke_caps is None and nfl_caps is None
                     and ca_caps is None and rain_caps is None):

@@ -12,18 +12,27 @@ fills is hedged with immediate-or-cancel limit orders on every sibling while
 the whole set still locks COMP_HEDGE_EDGE_C a set; an order resting ahead of a
 lead ends it and the side joins that order.
 
+Since 2026-10-29 (Jack: "1 and 2") every maker fill that opens a position
+in such an event, or on a threshold ladder ("above X" strikes of one
+number), is locked the same way once the hedge clears 2c a contract after
+taker fees (a lead's fill: any floor), and ladder strikes lead off their
+neighbours' books.
+
 ONE EMAIL per ET day (the day before), ending in OK / WATCH / PROBLEM:
   leads    every side that led, at what price against its own best and the
-           price its siblings imply, for how long; the sides leading at the
-           day's end
+           price its siblings (or a ladder's easier / harder strikes) imply,
+           for how long; the sides leading at the day's end
   fills    our maker fills at a lead's price: count, contracts, dollars
-  hedges   jobs opened, legs sent and filled, sets locked and their edge,
-           jobs given up, sends Kalshi refused; jobs still open now
+  hedges   lead jobs opened, legs sent and filled, fills locked and their
+           floor, jobs given up, sends Kalshi refused; jobs still open now
+  locks    every other fill watched for a lock: locked (and the dollars),
+           unwound by the bot first, or ridden on as inventory
   estimate the bot's own reward estimate now for the markets that led
            (its hourly selection snapshot; Kalshi pays ~1.15x it on average)
-  verdict  PROBLEM: a job gave up, a send was refused, or a job has had
-           unhedged legs for over HEDGE_STUCK_SECS; WATCH: a lead fill
-           opened no job, or a job is open; OK otherwise
+  verdict  PROBLEM: a job gave up with legs traded, a lead fill never
+           locked, a send was refused, or a job has been part-hedged for
+           over HEDGE_STUCK_SECS; WATCH: a lead fill opened no job, or a lead
+           job is open; OK otherwise
 
 SOURCES, read-only: the bot's day logs (incentive-mm-*.log), fills_ /
 comp_hedge_ / selection_snapshot_<UTC date>.jsonl and comp_hedge_jobs.json.
@@ -56,7 +65,7 @@ import incentive_mm as imm  # noqa: E402
 from incentive_mm import log  # noqa: E402
 
 LOOKBACK_SECS = 6 * 3600        # day-log read starts this far before the window
-HEDGE_STUCK_SECS = 3600         # an open job with unhedged legs this old is a PROBLEM
+HEDGE_STUCK_SECS = 3600         # an open job part-hedged this long is a PROBLEM
 LEVELS = ("OK", "WATCH", "PROBLEM")
 
 _LEAD = re.compile(
@@ -206,27 +215,48 @@ def lead_fills(fills: list, leads: dict) -> list:
 
 
 def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
-    """The day's hedge rows (comp_hedge_<date>.jsonl) and the open jobs now."""
-    opened = [r for r in rows if r.get("kind") == "open"]
-    done = [r for r in rows if r.get("kind") == "done"]
+    """The day's lock rows (comp_hedge_<date>.jsonl) and the open jobs now. A
+    row without a `lead` flag predates the every-fill locks: a lead's."""
+    def is_lead(r):
+        return r.get("lead", True) is not False
+    opened = [r for r in rows if r.get("kind") == "open" and is_lead(r)]
+    done = [r for r in rows if r.get("kind") == "done" and is_lead(r)]
     expired = [r for r in rows if r.get("kind") == "expired"]
+    never = [r for r in rows if r.get("kind") == "nolock" and is_lead(r)]
     sends = [r for r in rows if r.get("kind") == "send" and not r.get("dry")]
     refused = [r for r in sends if r.get("error")]
     leg_fills = [r for r in rows if r.get("kind") == "leg_fill"]
     locked = sum(float(r.get("edge_c") or 0.0) * float(r.get("count") or 0.0) / 100.0
                  for r in done)
+    # every other fill watched for a lock
+    l_open = [r for r in rows if r.get("kind") == "open" and not is_lead(r)]
+    l_done = [r for r in rows if r.get("kind") == "done" and not is_lead(r)]
+    l_none = [r for r in rows if r.get("kind") == "nolock" and not is_lead(r)]
+    l_unwound = [r for r in rows if r.get("kind") == "unwound"]
+    l_locked = sum(float(r.get("edge_c") or 0.0) * float(r.get("count") or 0.0) / 100.0
+                   for r in l_done)
+    by_kind: dict = defaultdict(lambda: [0, 0])
+    for r in l_open:
+        by_kind[r.get("lock") or "?"][0] += 1
+    for r in l_done:
+        by_kind[r.get("lock") or "?"][1] += 1
     open_now = []
     for j in jobs:
         q = float(j.get("count") or 0.0)
-        rem = {s: max(0.0, q - float(lg.get("filled", 0.0)))
-               for s, lg in (j.get("legs") or {}).items()}
+        lead = j.get("lead", True) is not False
+        traded = {s: float(lg.get("filled", 0.0)) for s, lg in (j.get("legs") or {}).items()
+                  if float(lg.get("filled", 0.0)) >= 0.5}
+        if not lead and not traded:
+            continue          # a fill still in its lock watch: nothing to report
         open_now.append(dict(id=j.get("id"), ticker=j.get("ticker"), side=j.get("side"),
-                             count=q, price=j.get("price"),
+                             kind=j.get("kind"), lead=lead, count=q, price=j.get("price"),
                              age_s=now_ts - float(j.get("at") or now_ts),
-                             unhedged={s: r for s, r in rem.items() if r >= 0.5},
+                             traded=traded, best=j.get("best"),
                              waiting=bool(j.get("waiting"))))
-    return dict(opened=opened, done=done, expired=expired, sends=sends,
-                refused=refused, leg_fills=leg_fills, locked=locked, open_now=open_now)
+    return dict(opened=opened, done=done, expired=expired, never=never, sends=sends,
+                refused=refused, leg_fills=leg_fills, locked=locked, open_now=open_now,
+                locks=dict(opened=l_open, done=l_done, none=l_none, unwound=l_unwound,
+                           locked=l_locked, by_kind=dict(by_kind)))
 
 
 def latest_estimates(tickers: set, a_ts: float, b_ts: float) -> dict:
@@ -258,12 +288,14 @@ def verdict(ctx: dict) -> tuple:
 
     h = ctx["hedges"]
     if h["expired"]:
-        flag(2, f"{len(h['expired'])} hedge job(s) gave up with legs unhedged")
+        flag(2, f"{len(h['expired'])} lock job(s) gave up with legs traded and no lock")
+    if h["never"]:
+        flag(2, f"{len(h['never'])} lead fill(s) never locked")
     if h["refused"]:
         flag(2, f"Kalshi refused {len(h['refused'])} hedge order(s)")
-    stuck = [j for j in h["open_now"] if j["unhedged"] and j["age_s"] >= HEDGE_STUCK_SECS]
+    stuck = [j for j in h["open_now"] if j["traded"] and j["age_s"] >= HEDGE_STUCK_SECS]
     if stuck:
-        flag(2, f"{len(stuck)} hedge job(s) unhedged for over "
+        flag(2, f"{len(stuck)} lock job(s) part-hedged for over "
                 f"{HEDGE_STUCK_SECS // 60} min")
     if len(ctx["fills"]) > len(h["opened"]):
         flag(1, f"{len(ctx['fills'])} lead fill(s) but {len(h['opened'])} hedge job(s) "
@@ -297,8 +329,11 @@ def subject_for(ctx) -> str:
     day = datetime.strptime(ctx["day"], "%Y-%m-%d")
     n_led = len(ctx["leads"])
     h = ctx["hedges"]
+    lk = h["locks"]
     return (f"IMM complement lead {day:%m/%d}: {n_led} side{'s' if n_led != 1 else ''} led, "
             f"{len(ctx['fills'])} lead fill{'s' if len(ctx['fills']) != 1 else ''}, "
+            f"{len(lk['done'])} other fill{'s' if len(lk['done']) != 1 else ''} locked "
+            f"({usd(lk['locked'])}), "
             f"{len(h['done'])} hedged ({usd(h['locked'])} locked) | {ctx['level']}")
 
 
@@ -319,8 +354,11 @@ def render_text(ctx) -> str:
         moved = (f", moved {min(pxs)}-{max(pxs)}c" if pxs and min(pxs) != max(pxs) else "")
         est = ctx["est"].get(t)
         est_s = f"; est now ${est[0]:.2f}/day ({100 * est[1]:.0f}% of pool)" if est else ""
+        who = v.get("who") or ""
+        by = ("easier strikes imply" if "easier strikes" in who else
+              "harder strikes imply" if "harder strikes" in who else "siblings imply")
         out.append(f"  {t} {side}: {v.get('size', 200)} @ {v['px']}c, own best "
-                   f"{v['best']}c, siblings imply {v['implied']}c; led {hrs:.1f}h{moved}"
+                   f"{v['best']}c, {by} {v['implied']}c; led {hrs:.1f}h{moved}"
                    + (" (dry)" if v.get("dry") else "")
                    + ("" if v["leading_at_end"] else ", ended") + est_s)
     fills = ctx["fills"]
@@ -330,28 +368,41 @@ def render_text(ctx) -> str:
         what = "sold" if f["side"] == "ask" else "bought"
         out.append(f"  {when:%H:%M} ET {f['ticker']} {what} {f['count']:g} @ {f['px']:g}c")
     h = ctx["hedges"]
-    out += ["", f"HEDGES: {len(h['opened'])} job(s) opened, {len(h['sends'])} order(s) "
-                f"sent, {len(h['leg_fills'])} leg fill(s), {len(h['done'])} set(s) locked "
-                f"({usd(h['locked'])}), {len(h['expired'])} given up, "
-                f"{len(h['refused'])} refused."]
+    out += ["", f"HEDGES (lead fills): {len(h['opened'])} job(s) opened, {len(h['sends'])} "
+                f"order(s) sent, {len(h['leg_fills'])} leg fill(s), {len(h['done'])} "
+                f"locked ({usd(h['locked'])}), {len(h['expired']) + len(h['never'])} given "
+                f"up, {len(h['refused'])} refused."]
     for r in h["done"]:
-        out.append(f"  locked {r.get('job')}: {float(r.get('count') or 0):g} sets at "
-                   f"{float(r.get('edge_c') or 0):+.1f}c a set")
+        out.append(f"  locked {r.get('job')}: {float(r.get('count') or 0):g} at "
+                   f"{float(r.get('edge_c') or 0):+.1f}c a contract")
     for r in h["refused"]:
         out.append(f"  refused {r.get('ticker')} {r.get('side')} {r.get('count')} @ "
                    f"{r.get('px')}c: {r.get('error_body') or r.get('error')}")
     for j in h["open_now"]:
-        un = ", ".join(f"{s} {r:g}" for s, r in j["unhedged"].items()) or "none"
+        tr = ", ".join(f"{s} {q:g}" for s, q in j["traded"].items()) or "none"
+        best = j.get("best")
         out.append(f"  open {j['id']}: {j['age_s'] / 60:.0f} min old"
-                   + (", waiting for the siblings' books" if j["waiting"] else "")
-                   + f"; unhedged: {un}")
+                   + (f", best floor {float(best):+.1f}c a contract" if best is not None else "")
+                   + (", waiting for the legs' books" if j["waiting"] else "")
+                   + f"; legs traded: {tr}")
+    lk = h["locks"]
+    out += ["", f"LOCKS (every other fill that opened a position in a linked event): "
+                f"{len(lk['opened'])} watched, {len(lk['done'])} locked "
+                f"({usd(lk['locked'])}), {len(lk['unwound'])} unwound first, "
+                f"{len(lk['none'])} rode on as inventory."]
+    for kind, (n_open, n_done) in sorted(lk["by_kind"].items()):
+        out.append(f"  {kind}: {n_done} of {n_open} locked")
+    for r in lk["done"]:
+        legs = ", ".join(f"{s} {float(q):g}" for s, q in (r.get("legs") or {}).items())
+        out.append(f"  locked {r.get('ticker')} {float(r.get('count') or 0):g} at "
+                   f"{float(r.get('edge_c') or 0):+.1f}c a contract ({r.get('lock')}: {legs})")
     tot = sum(v[0] for v in ctx["est"].values())
     out += ["", f"ESTIMATE: the markets that led are estimated at ${tot:.2f}/day now "
                 f"(the bot's share model; Kalshi pays ~1.15x it on average)."]
     out += ["", f"VERDICT: {ctx['level']}"] + [f"  - {r}" for r in ctx["reasons"]]
     out += ["", "Switches (run_incentive_mm.ps1, then restart_imm.ps1 -Task): "
                 "IMM_COMP_LEAD=dry|off stops placing leads; IMM_COMP_HEDGE=dry|off stops "
-                "the hedge orders."]
+                "the lead fills' hedge orders; IMM_LOCK=dry|off the other fills' locks."]
     return "\n".join(out)
 
 

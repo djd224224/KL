@@ -116,6 +116,36 @@ class TestHedgesAndVerdict(unittest.TestCase):
         young = dict(stuck, at=_ts(11, 50))
         self.assertEqual(self._ctx(jobs=[young])["level"], "WATCH")
         self.assertEqual(self._ctx(fills=[{"ticker": "A"}])["level"], "WATCH")  # no job
+        # a lead fill that never locked is a PROBLEM; another fill that did not
+        # lock just rides on, and one still in its watch is not reported
+        self.assertEqual(self._ctx(rows=[{"kind": "nolock", "job": "j", "lead": True}])["level"],
+                         "PROBLEM")
+        self.assertEqual(self._ctx(rows=[{"kind": "nolock", "job": "j", "lead": False}])["level"],
+                         "OK")
+        watching = {"id": "j", "count": 20, "at": _ts(11, 58), "lead": False, "legs": {}}
+        self.assertEqual(self._ctx(jobs=[watching])["level"], "OK")
+
+    def test_the_other_fills_locks(self):
+        rows = [{"kind": "open", "job": "a", "lock": "me_ask", "lead": False},
+                {"kind": "open", "job": "b", "lock": "ladder_bid", "lead": False},
+                {"kind": "open", "job": "c", "lock": "ladder_bid", "lead": False},
+                {"kind": "done", "job": "b", "ticker": "KXR-26NOV-4", "lock": "ladder_bid",
+                 "lead": False, "edge_c": 2.03, "count": 30, "legs": {"KXR-26NOV-5": 29}},
+                {"kind": "nolock", "job": "a", "lead": False},
+                {"kind": "unwound", "job": "c"}]
+        ctx = self._ctx(rows=rows)
+        lk = ctx["hedges"]["locks"]
+        self.assertEqual((len(lk["opened"]), len(lk["done"]), len(lk["none"]),
+                          len(lk["unwound"])), (3, 1, 1, 1))
+        self.assertAlmostEqual(lk["locked"], 0.609)
+        self.assertEqual(ctx["level"], "OK")
+        text = cm.render_text(dict(ctx, est={}))
+        self.assertIn("3 watched, 1 locked (+$0.61), 1 unwound first, 1 rode on as inventory",
+                      text)
+        self.assertIn("ladder_bid: 1 of 2 locked", text)
+        self.assertIn("locked KXR-26NOV-4 30 at +2.0c a contract (ladder_bid: KXR-26NOV-5 29)",
+                      text)
+        self.assertIn("1 other fill locked (+$0.61)", cm.subject_for(ctx))
 
     def test_the_report_renders_from_files(self):
         day = date(2026, 10, 29)
@@ -136,7 +166,7 @@ class TestHedgesAndVerdict(unittest.TestCase):
         self.assertEqual(ctx["level"], "OK")
         self.assertIn("KXK-30-JDON ask: 200 @ 60c, own best 71c, siblings imply 38c", text)
         self.assertIn("LEAD FILLS: 1", text)
-        self.assertIn("1 set(s) locked (+$44.00)", text)
+        self.assertIn("1 locked (+$44.00)", text)
         self.assertTrue(text.isascii())
 
 
