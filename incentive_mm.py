@@ -19528,8 +19528,10 @@ def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]]
     up (10/29 01:28Z: a 1,000-lot joined the Wisconsin D lead at each price,
     and re-leading 7-8c ahead of it walked the bid 26c -> 56c in a minute
     for the same 1/6 share). Held, it stays put while anything external rests
-    at or above it, and moves down only when nothing does and the book below
-    lets a price 3c+ lower take the share; above the cap it leads afresh."""
+    ABOVE it (stepped ahead of: not chased), and otherwise moves down when the
+    book below lets a price 3c+ lower take the share -- an order that only
+    JOINED it at its price does not pin it high, it is free to follow us
+    down; above the cap it leads afresh."""
     n = comp_lead_size(target)
     if n <= 0:
         return None
@@ -19553,7 +19555,7 @@ def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]]
         held = sorted(at_or_above + [(hold, float(n))], key=lambda kv: -kv[0])
         if not _side_share(held + below, {hold: float(n)}, target, df)[1]:
             return None
-        if not at_or_above:
+        if not any(p > hold for p, _q in at_or_above):
             px = cheapest(below)
             if px is not None and px <= hold - 3:
                 return px, cap, (below[0][0] if below else 0)

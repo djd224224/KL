@@ -29833,6 +29833,10 @@ class TestComplementLead(unittest.TestCase):
         # stepped ahead of (an order at 30c): still held, not chased
         self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
                                             hold=26)[0], 26)
+        # a joiner at a price the chase reached does not pin it there: back
+        # down to the cheapest price ahead of the book below (it may follow)
+        self.assertEqual(imm.comp_side_lead(wall + [[56, 1000.0]], r_no, 1000.0, 0.5,
+                                            hold=56), (26, 69, 16))
         # uncontested, the wall below gone: down to the new cheapest price,
         # but not for a move under 3c
         thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
