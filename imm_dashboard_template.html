@@ -293,7 +293,7 @@ table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-
 
 /* ---------- drivers ---------- */
 #moHeat { overflow-x: auto; }
-.drvtw table.t { min-width: 1700px; }
+.drvtw table.t { min-width: 1920px; }
 .drvtw table.t th, .drvtw table.t td { padding: 5px 7px; }
 .drvtw table.t th:first-child, .drvtw table.t td:first-child {
   position: sticky; left: 0; z-index: 1; background: var(--bg); min-width: 250px; max-width: 380px;
@@ -309,7 +309,7 @@ table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-
 .sig.dn { background: var(--chip-crit); }
 .sig.upx { background: var(--chip-good); }
 svg.sparkc { display: block; margin-left: auto; overflow: visible; }
-td.shape { cursor: default; }
+td.shape, td.spk { cursor: default; }
 .bridge-note { font-size: 12px; color: var(--ink-2); margin-top: 4px; }
 /* mark-out heatmap: diverging blue (made money) / red (lost) around a gray midpoint */
 table.hm { width: 100%; border-collapse: separate; border-spacing: 2px; font-size: 12.5px; }
@@ -522,7 +522,7 @@ footer { color: var(--muted); font-size: 12px; }
         <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk. Kalshi fees are not deducted; the IMM digest's fee total runs $0–0.60 a day.</p>
         <p class="explain"><b>P&amp;L explain</b> (Drivers). Trading P&amp;L splits exactly into three parts. <i>Carry: marks</i> is the position held at the window's start, re-marked from its start mark to its end mark (or to its last mark before it left the book). <i>Carry: settled</i> is that start position in a market Kalshi settled during the window, from its start mark to the settlement. <i>New fills</i> is the rest: the window's own fills, marked to the window's end or to the settlement.</p>
         <p class="explain"><b>Mark-outs</b> cover maker fills only (no pads, no taker fills). They are per contract and signed for our side. <i>At fill</i> is the edge: the fill price against the mid of the external book the bot read the cycle before the fill (none on a book 50¢+ wide). <i>5m</i>, <i>30m</i> and <i>4h</i> use the first 5-minute position snapshot at least that long after the fill; a mark must land within 5 minutes for 5m and within 15 minutes otherwise, so a fill that closed the position has none. <i>To date</i> uses Kalshi's settlement, else the bot's mark while it holds the market, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule. <i>Coverage</i> is rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow.</p>
-        <p class="explain"><b>Last 7 days</b> and <b>Last 30 days</b> (Drivers) add up the rewards and trading P&amp;L of the 7 and 30 ET days through the window's last day: today so far on a live window, that day on a past one. Rewards follow the basis picked above the table. <i>Per day</i> divides by the days covered, today by its hours so far. The page keeps 30 days, so a past day's 30 days count only the ones it has (the header's tooltip says how many). The total row covers the whole book, including families with nothing in the window.</p>
+        <p class="explain"><b>Last 7 days</b> and <b>Last 30 days</b> (Drivers) add up the rewards and trading P&amp;L of the 7 and 30 ET days through the window's last day: today so far on a live window, that day on a past one. Rewards follow the basis picked above the table. <i>Per day</i> divides by the days covered, today by its hours so far. <i>Shape</i> is the cumulative net, day by day from 0 at the span's start; hover it for a day's net, rewards and trading. The page keeps 30 days, so a past day's 30 days count only the ones it has (the header's tooltip says how many). The total row covers the whole book, including families with nothing in the window.</p>
         <p class="explain"><b>Exp. net/day</b> is a model: the rewards the bot's estimator gives the quotes resting now, plus the family's average trading P&amp;L per day over the last 7 days. <b>Typical day</b> is the family's mean net per complete ET day over the 7 and 30 days before the window. The σ mark flags a window 1.5+ standard deviations from that mean, pro-rated to the window's length.</p>
         <p class="explain"><b>Worst case</b> is the loss from today's marks to settlement if everything goes against the book. It is netted inside an event: across its strikes when every market prices the same number (greater / less / between), and across names when Kalshi marks the event mutually exclusive. Mention words and anything whose structure has not been read count in full. Summed across events, it assumes every event goes wrong at once. On a past day it is the book at that day's close.</p>
         <p class="explain"><b>Paid rate</b> is what Kalshi credited per dollar of modeled reward on settled events (imm_reward_recon's calibration). The <i>raw</i> basis covers the $1 per-market-per-period floor and the model error together. The older <i>floored</i> basis covers the model error only. Account credits include other bots quoting the same markets, which can push a family above 1×.</p>
@@ -1176,6 +1176,7 @@ let drvH = HZL[store("imm.drvH")] ? store("imm.drvH") : "mk";
 let rewBasis = store("imm.rewBasis") === "paid" ? "paid" : "model";
 let drvSort = (() => { try { const s = JSON.parse(store("imm.drvSort2") || "null"); return s && s.k ? s : null; } catch (e) { return null; } })() || { k: "net", dir: 1 };
 let DRV_LAST = { fams: [], tot: null };
+let SPK = {};                       // the rows' 7- and 30-day spans by row key ("tot" = the total), for the sparkline tips
 const WCH = { strikes: "netted across the event's strikes", exclusive: "netted: one name wins (Kalshi: mutually exclusive)",
   independent: "independent markets, not netted", unknown: "structure not read yet, not netted", mixed: "partly netted", flat: "" };
 
@@ -1266,44 +1267,61 @@ function spanData(n) {
   const end = eodIso() || DAYS[DAYS.length - 1], key = end + "|" + n;
   if (SPANC[key]) return SPANC[key];
   const iR = DF.indexOf("rew"), iP = DF.indexOf("pnl");
-  const o = { n, end, first: isoBack(end, n - 1), days: 0, pdays: 0, len: 0, m: {}, e: {}, f: {} };
+  // the span's sums (m, e, f) and, day by day for the sparklines, the days it
+  // has (isos) with each one's event (de) and family (df) totals
+  const o = { n, end, first: isoBack(end, n - 1), days: 0, pdays: 0, len: 0, m: {}, e: {}, f: {}, isos: [], de: [], df: [] };
   const add = (map, k, r, p) => { const a = map[k] || (map[k] = [0, 0]); a[0] += r; a[1] += p; };
   for (let k = n - 1; k >= 0; k--) {
-    const d = D.days[isoBack(end, k)];
+    const iso = isoBack(end, k), d = D.days[iso];
     if (!d) continue;
     o.days++; o.len += (d.e - d.s) / 86400;
     if (d.ok) o.pdays++;
+    const de = {}, df = {};
     for (const t in d.m) {
       const m = D.markets[t];
       if (!m) continue;
       const r = num(d.m[t][iR]), p = d.ok ? num(d.m[t][iP]) : 0;
       add(o.m, t, r, p); add(o.e, m.ev, r, p); add(o.f, m.fam, r, p);
+      add(de, m.ev, r, p); add(df, m.fam, r, p);
     }
+    o.isos.push(iso); o.de.push(de); o.df.push(df);
   }
   return (SPANC[key] = o);
 }
-/* a market's ("m"), event's ("e") or family's ("f") spans: {7: {r, p, net, len}, 30: ...},
-   rewards on the page's basis */
+/* a market's ("m"), event's ("e") or family's ("f") spans: {7: {r, p, net, len, rs, ps}, 30: ...},
+   rs / ps = each day's rewards / trading; rewards on the page's basis */
 function spanOf(kind, key, fam) {
   const out = {};
   for (const n of SPANS) {
-    const o = spanData(n), a = o[kind][key] || [0, 0], r = rewAdj(fam, a[0]);
-    out[n] = { r, p: a[1], net: r + a[1], len: o.len };
+    const o = spanData(n), a = o[kind][key] || [0, 0], r = rewAdj(fam, a[0]), rs = [], ps = [];
+    o.isos.forEach((iso, i) => {
+      let v = [0, 0];
+      if (kind === "m") {
+        const d = D.days[iso], row = d.m[key];
+        if (row) v = [num(row[DF.indexOf("rew")]), d.ok ? num(row[DF.indexOf("pnl")]) : 0];
+      } else v = (kind === "e" ? o.de : o.df)[i][key] || v;
+      rs.push(rewAdj(fam, v[0])); ps.push(v[1]);
+    });
+    out[n] = { r, p: a[1], net: r + a[1], len: o.len, rs, ps };
   }
   return out;
 }
 function spanSum(list) {
   const out = {};
   for (const n of SPANS) {
-    const s = { r: 0, p: 0, net: 0, len: spanData(n).len };
-    for (const x of list) { s.r += x[n].r; s.p += x[n].p; s.net += x[n].net; }
+    const o = spanData(n), L = o.isos.length;
+    const s = { r: 0, p: 0, net: 0, len: o.len, rs: new Array(L).fill(0), ps: new Array(L).fill(0) };
+    for (const x of list) {
+      s.r += x[n].r; s.p += x[n].p; s.net += x[n].net;
+      for (let i = 0; i < L; i++) { s.rs[i] += x[n].rs[i]; s.ps[i] += x[n].ps[i]; }
+    }
     out[n] = s;
   }
   return out;
 }
+function isoShort(iso) { return ETD.format(new Date(iso + "T12:00:00Z")); }
 function spanHead(n) {
-  const o = spanData(n), a = new Date(o.first + "T12:00:00Z"), b = new Date(o.end + "T12:00:00Z");
-  const fa = ETD.format(a), fb = ETD.format(b);
+  const o = spanData(n), fa = isoShort(o.first), fb = isoShort(o.end);
   const lab = "Last " + n + " days · " + (o.first.slice(0, 7) === o.end.slice(0, 7) ? fa + "–" + fb.split(" ")[1] : fa + " – " + fb) +
     (o.days < n ? " · " + o.days + " in the data" : "");
   const live = D.days[o.end] && D.days[o.end].e >= D.generated - 1;
@@ -1311,6 +1329,27 @@ function spanHead(n) {
   if (o.days < n) tip += "; the page keeps " + DAYS.length + " days, so " + o.days + " of them are here";
   if (o.pdays < o.days) tip += "; trading P&L on " + o.pdays + " of them";
   return [lab, tip];
+}
+/* a span's sparkline (Jack 2026-10-28: "add sparklines for 7D and 30D showing
+   of Net, like what's in daily"): the cumulative net, day by day, from 0 at the
+   span's start, drawn like the window's Shape */
+function spanCum(s) { const c = [0]; s.rs.forEach((r, i) => c.push(c[i] + r + s.ps[i])); return c; }
+function spanGeom(c) {
+  const W0 = 96, H = 24, N = c.length - 1;
+  let lo = Math.min(...c), hi = Math.max(...c);
+  if (hi === lo) hi = lo + 1;
+  return { W0, H, N, X: (j) => 1 + (W0 - 6) * j / N, Y: (v) => 3 + (H - 6) * (1 - (v - lo) / (hi - lo)) };
+}
+function spanSpark(s, n) {
+  if (!s || s.rs.length < 2 || !s.rs.some((r, i) => Math.abs(r + s.ps[i]) >= 0.005)) return "";
+  const c = spanCum(s), g = spanGeom(c), col = css("--s-net");
+  let d = "";
+  c.forEach((v, j) => { d += (j ? "L" : "M") + g.X(j).toFixed(1) + " " + g.Y(v).toFixed(1); });
+  return '<svg class="sparkc spk" data-n="' + n + '" viewBox="0 0 ' + g.W0 + " " + g.H + '" width="' + g.W0 + '" height="' + g.H + '" aria-hidden="true">' +
+    '<line x1="0" x2="' + g.W0 + '" y1="' + g.Y(0).toFixed(1) + '" y2="' + g.Y(0).toFixed(1) + '" stroke="' + css("--axis") + '" stroke-width="1"/>' +
+    '<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>' +
+    '<circle cx="' + g.X(g.N).toFixed(1) + '" cy="' + g.Y(c[g.N]).toFixed(1) + '" r="2.4" fill="' + col + '"/>' +
+    '<circle class="hd" r="3" fill="none" stroke="' + col + '" stroke-width="1.5" visibility="hidden"/></svg>';
 }
 
 /* a family's (null = the book's) cumulative rewards / trading through the window, hourly */
@@ -1490,7 +1529,9 @@ function drvCols(eod, na) {
       { k: k + "n", g, label: paid ? "Net*" : "Net", dir: 1, title: "rewards + trading" + thru + "; per day below (today counts by its hours so far)",
         v: (x) => x.sp ? x.sp[n].net : null,
         fmt: (x) => x.sp && Math.abs(x.sp[n].net) >= 0.005 ? "<b>" + money(x.sp[n].net) + "</b>" +
-          (x.sp[n].len > 0 ? '<span class="sub2n">' + fmtUSD(x.sp[n].net / x.sp[n].len, { sign: true }) + "/day</span>" : "") : dash });
+          (x.sp[n].len > 0 ? '<span class="sub2n">' + fmtUSD(x.sp[n].net / x.sp[n].len, { sign: true }) + "/day</span>" : "") : dash },
+      { k: k + "s", g, label: "Shape", nosort: 1, cls: "spk", title: "cumulative net" + thru + ", day by day; hover a day for its numbers",
+        fmt: (x) => x.sp ? spanSpark(x.sp[n], n) : "" });
   }
   return cols;
 }
@@ -1564,8 +1605,10 @@ function renderDrivers() {
       (on ? '<span class="arr">' + (drvSort.dir > 0 ? "▲" : "▼") + "</span>" : "") + "</th>";
   }
   h += "</tr></thead><tbody>";
+  SPK = {};
   const row = (lvl, key, label, why, x) => {
     const open = openRows.has(key);
+    if (x.sp) SPK[key] = x.sp;
     const caret = lvl < 2 ? '<span class="car' + (open ? " open" : "") + '">▶</span>' : "";
     let r = '<tr class="l' + lvl + ' click" data-key="' + esc(key) + '" data-lvl="' + lvl + '"><td>' + caret + label + (why ? '<div class="why">' + why + "</div>" : "") + "</td>";
     for (const c of cols) r += '<td class="num' + (c.sep ? " gs" : "") + (c.cls ? " " + c.cls : "") + '"' + (c.k === "shape" && x.shape ? ' data-fam="' + esc(x.name || "") + '"' : "") + ">" + c.fmt(x) + "</td>";
@@ -1623,6 +1666,7 @@ function renderDrivers() {
   const offFams = Q ? [] : Object.keys(spanData(Math.max(...SPANS)).f).filter((fm) => !inTable.has(fm))
     .map((fm) => ({ name: fm, sp: spanOf("f", fm, fm) }));
   t.sp = spanSum(shown.concat(offFams).map((f) => f.sp));
+  SPK.tot = t.sp;
   h += '<tr class="tot"><td>' + (Q ? "Shown" : "All families") + "</td>";
   for (const c of cols) h += '<td class="num' + (c.sep ? " gs" : "") + (c.cls ? " " + c.cls : "") + '"' + (c.k === "shape" && t.shape ? ' data-fam=""' : "") + ">" + c.fmt(t) + "</td>";
   h += "</tr></tbody></table>";
@@ -1659,6 +1703,32 @@ function renderDrivers() {
       showTip(e, (f.name || "All families") + " · " + w.desc, rows.concat(f.chg && f.chg.length ? changeTipRows(f.chg) : []));
     });
     td.addEventListener("pointerleave", hideTip);
+  });
+  // the 7- and 30-day sparklines: the day under the pointer
+  host.querySelectorAll("svg.spk").forEach((sv) => {
+    const tr = sv.closest("tr"), key = tr.dataset.key || "", n = +sv.dataset.n;
+    const s = (SPK[key || "tot"] || {})[n];
+    if (!s) return;
+    const o = spanData(n), c = spanCum(s), g = spanGeom(c), hd = sv.querySelector(".hd");
+    const who = key ? key.slice(2) : (Q ? "Shown" : "All families");
+    const dn = (i) => s.rs[i] + s.ps[i];
+    const dl = (i) => isoShort(o.isos[i]) + (D.days[o.isos[i]].e >= D.generated - 1 ? " (so far)" : "");
+    let best = 0, worst = 0;
+    for (let i = 1; i < g.N; i++) { if (dn(i) > dn(best)) best = i; if (dn(i) < dn(worst)) worst = i; }
+    sv.addEventListener("pointermove", (e) => {
+      const rc = sv.getBoundingClientRect();
+      const j = Math.min(g.N, Math.max(1, Math.round(((e.clientX - rc.left) / rc.width * g.W0 - 1) / (g.W0 - 6) * g.N)));
+      const i = j - 1, iso = o.isos[i], live = D.days[iso].e >= D.generated - 1;
+      hd.setAttribute("cx", g.X(j).toFixed(1)); hd.setAttribute("cy", g.Y(c[j]).toFixed(1)); hd.setAttribute("visibility", "visible");
+      showTip(e, who + " · " + day(iso) + (live ? " so far" : ""), [
+        { name: "Net that day", value: fmtUSD(dn(i), { sign: true }), color: css("--s-net"), line: true },
+        { name: rewBasis === "paid" ? "Rewards at the paid rate" : "Modeled rewards", value: fmtUSD(s.rs[i]) },
+        { name: "Trading", value: fmtUSD(s.ps[i], { sign: true }) },
+        { name: "Net " + isoShort(o.isos[0]) + (i ? " – " + isoShort(iso) : ""), value: fmtUSD(c[j], { sign: true }) },
+        { block: "Best day " + dl(best) + " " + fmtUSD(dn(best), { sign: true }) + " · worst " + dl(worst) + " " + fmtUSD(dn(worst), { sign: true }), muted: true },
+      ]);
+    });
+    sv.addEventListener("pointerleave", () => { hideTip(); hd.setAttribute("visibility", "hidden"); });
   });
   host.querySelectorAll(".chg[data-chg]").forEach((sp) => {
     const f = byName[sp.dataset.chg];
