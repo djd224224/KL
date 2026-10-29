@@ -30091,7 +30091,7 @@ class TestComplementLead(unittest.TestCase):
         feed.books[self.R] = (dollars(r_yes), dollars(r_no))
         return feed
 
-    def _cycle(self, mode):
+    def _cycle(self, mode, max_pos=150.0, max_event=1000.0, lead_cap=None):
         _clean_persist()
         D, R = self.D, self.R
 
@@ -30132,8 +30132,10 @@ class TestComplementLead(unittest.TestCase):
                 mock.patch.object(imm, "ELECTION_DATES", imm._parse_election_dates(
                     f"{self.EV}*=2099-12-31")), \
                 mock.patch.object(imm, "LEVELS", [(0, 20)]), \
-                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0), \
-                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", max_pos), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", max_event), \
+                mock.patch.object(imm, "COMP_LEAD_MAX_POSITION",
+                                  imm.COMP_LEAD_MAX_POSITION if lead_cap is None else lead_cap), \
                 mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
                 mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
             bot = IncentiveMarketMaker(client=_PairClient(), live=False)
@@ -30142,6 +30144,7 @@ class TestComplementLead(unittest.TestCase):
             with mock.patch.object(imm, "log", lines.append):
                 bot.run_cycle()
                 bot.state.universe_at = time.time()
+                bot.run_cycle()
                 bot.run_cycle()
         rungs = {(o["ticker"], o["book_side"]): (o["yes_price"], int(o["remaining_count"]))
                  for o in bot.state.sim_orders.values()
@@ -30159,6 +30162,18 @@ class TestComplementLead(unittest.TestCase):
         self.assertTrue(any("comp lead KXFOOLEG-99DEC31-D bid: 200 @ 26c, ahead of its "
                             "own 16c; KXFOOLEG-99DEC31-R's book implies 70c" in s
                             for s in lines), lines)
+
+    def test_a_leading_market_takes_a_400_cap_and_first_call_on_its_event(self):
+        # Jack 2026-10-29: "For these type of markets, increase position
+        # limits to 400" -- the first Golden Globes leads rested 150 (series
+        # cap) and 75 (an event-cap share). A 100 series cap (50 x the
+        # family x2) and an event cap split two ways both fall short of the
+        # 200 lead; the leading market's cap is 400 and, from its second
+        # cycle on, it takes the event's room first.
+        _bot, rungs, _l = self._cycle("on", max_pos=50.0, max_event=100.0)
+        self.assertEqual(rungs[(self.D, "bid")], (26, 200))
+        _bot, rungs, _l = self._cycle("on", max_pos=50.0, max_event=100.0, lead_cap=0.0)
+        self.assertLess(rungs[(self.D, "bid")][1], 200)           # the plain caps bind
 
     def test_dry_logs_and_rests_at_the_reference(self):
         bot, rungs, lines = self._cycle("dry")

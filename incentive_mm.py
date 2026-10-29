@@ -11115,6 +11115,7 @@ _CONFIG_CODE_KNOBS = (
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
+    "COMP_LEAD_MAX_POSITION",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -19522,6 +19523,12 @@ COMP_HEDGE_MODE = os.environ.get("IMM_COMP_HEDGE", "on").strip().lower()
 COMP_HEDGE_EDGE_C = _env_float("IMM_COMP_HEDGE_EDGE_C", 2.0)
 COMP_HEDGE_FILE = "comp_hedge_jobs.json"
 COMP_HEDGE_MAX_AGE_SECS = _env_float("IMM_COMP_HEDGE_MAX_AGE_H", 48.0) * 3600.0
+# A market with a side leading takes a per-market position cap of at least
+# this, and first call on its event's room once it has led a cycle (Jack
+# 2026-10-29: "For these type of markets, increase position limits to 400").
+# The first Golden Globes leads rested 150 (the 150 series cap) and 75 (a
+# ~1/13 share of the event cap), short of the 200 the reference needs.
+COMP_LEAD_MAX_POSITION = _env_float("IMM_COMP_LEAD_MAX_POSITION", 400.0)
 
 
 def comp_lead_series(series: str) -> bool:
@@ -28511,6 +28518,8 @@ class IncentiveMarketMaker:
                     or ea <= series_price_max(meta.series))
             lb, la = leads
             _cap = int(series_max_position(meta.series))
+            if lb is not None or la is not None:    # a leading market's cap
+                _cap = max(_cap, int(COMP_LEAD_MAX_POSITION))
 
             def _lead_room(sm: int) -> int:
                 return max(sm, _lead_n) if _cap <= 0 else min(max(sm, _lead_n), _cap)
@@ -29784,7 +29793,8 @@ class IncentiveMarketMaker:
             event_markets_left[ev] = n_left - 1
             # a near-cliff market may take the event's WHOLE remaining room
             # for its (boosted) ladder; everyone else splits what is left
-            split = 1 if self._room_priority(meta) else n_left
+            # ...and so may a market that led last cycle (COMP_LEAD_MAX_POSITION)
+            split = 1 if (self._room_priority(meta) or t in self._comp_lead_px) else n_left
             share_buy = max(event_room_buy.get(ev, event_cap_contracts(ev)), 0.0) / split
             share_sell = max(event_room_sell.get(ev, event_cap_contracts(ev)), 0.0) / split
 
@@ -31026,6 +31036,8 @@ class IncentiveMarketMaker:
             if lead_a is not None and lv_ask:
                 side_max_ask = max(side_max_ask, lead_n)
             maxpos = series_max_position(meta.series)
+            if lead_b is not None or lead_a is not None:
+                maxpos = max(maxpos, COMP_LEAD_MAX_POSITION)   # a leading market's cap
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             # (MANUAL_COEXIST_EVENTS too: the user's positions there are his)
