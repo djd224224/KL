@@ -12355,7 +12355,7 @@ class TestRainMonthlyGate(unittest.TestCase):
         TestRainMonthlyGate._bump += 1
         return imm.load_rain_monthly()
 
-    def _bot(self):
+    def _bot(self, yes_lv=None):
         client = FakeClient()
         now = datetime.now(timezone.utc)
         far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -12372,7 +12372,7 @@ class TestRainMonthlyGate(unittest.TestCase):
             "volume_fp": "500.00"}
         lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
               ["0.48", "400"], ["0.49", "300"]]
-        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv,
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": yes_lv or lv,
                                                  "no_dollars": lv}}
         return IncentiveMarketMaker(client=client, live=False)
 
@@ -12380,6 +12380,117 @@ class TestRainMonthlyGate(unittest.TestCase):
         return sorted((o["book_side"], o["yes_price"])
                       for o in bot.state.sim_orders.values()
                       if o["ticker"] == self.T)
+
+    def test_a_band_breach_quotes_the_other_side_alone(self):
+        # Jack 2026-10-29: "Yes sell only, as long as it is above payout
+        # threshold" -- bids over fair + 10c leave the asks alone, offers
+        # under fair - 10c the bids; inside the tolerance both sides
+        g = imm.rain_monthly_gate
+        self._write(p=0.5)
+        self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
+        self._write(p=0.30)                                       # bid 49 > 30 + 10
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["side_out"]), ("", (40, 20), "bid"))
+        self._write(p=0.70)                                       # ask 51 < 70 - 10
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertEqual((why, caps, inp["side_out"]), ("", (80, 60), "ask"))
+        # every other stand-aside still parks both sides
+        self._write(p=0.30, wet=True, last_wet_mins=0)
+        why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertTrue(why)
+        self.assertEqual((inp["reason"], caps), ("raining", None))
+        # the knob off: a breach parks both sides again
+        self._write(p=0.30)
+        with mock.patch.object(imm, "RAIN_MONTHLY_ONE_SIDE", False):
+            why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertTrue(why)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+        self.assertIn("RAIN_MONTHLY_ONE_SIDE", imm._CONFIG_CODE_KNOBS)
+        # the selection probe's view: the side out, for a monthly only
+        self.assertEqual(imm.rain_monthly_side_out(
+            "KXRAINCHIM", self.T, time.time(), 49, 51), "bid")
+        self.assertIsNone(imm.rain_monthly_side_out(
+            "KXRAINCHIM", self.T, time.time(), 39, 51))           # no breach
+        self.assertIsNone(imm.rain_monthly_side_out(
+            "KXFOO", self.T, time.time(), 49, 51))
+
+    def test_sells_only_even_where_a_capped_bid_would_earn(self):
+        # 300 bid at 49 in front (under the 1,000 target), 900 at 30 behind:
+        # a bid capped at fair + 10 = 40c would still earn (the period rule
+        # rests it, TestRainPeriodGate) -- the monthly rests no bid at all
+        bot = self._bot(yes_lv=[["0.30", "900"], ["0.49", "300"]])
+        self._write(p=0.30)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("ask", 51), q)
+        self.assertEqual({s for s, _ in q}, {"ask"}, q)
+        self.assertIn(self.T, bot._rain_period_capped)
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        # back inside the tolerance: both sides at the touch again
+        self._write(p=0.45)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertIn(("ask", 51), q)
+        self.assertNotIn(self.T, bot._rain_period_capped)
+        # offers under fair - 10: buy only
+        self._write(p=0.70)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("bid", 49), q)
+        self.assertEqual({s for s, _ in q}, {"bid"}, q)
+
+    def test_a_thin_side_out_keeps_its_depth_pad(self):
+        # 300 bid contracts under the 1,000 target: the rungless bid side is
+        # padded at 1c so the asks' snapshot counts; no bid rung rests
+        bot = self._bot(yes_lv=[["0.49", "300"]])
+        self._write(p=0.30)
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertIn(("ask", 51), q)
+        self.assertEqual([p for s, p in q if s == "bid"], [imm.PAD_BID_CENTS], q)
+
+    def test_the_one_side_rests_only_above_the_payout_floor(self):
+        bot = self._bot()
+        self._write(p=0.30)
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"ask"})
+        # a projection under the $1 floor starts the hopeless clock: the one
+        # side stands aside at once (no 30-minute dip allowance)
+        bot.state.hopeless_since[self.T] = time.time()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        self.assertIn(self.T, bot.state.selected)                 # still a member
+        # back above the bar (the clock cleared): the ask rests again
+        bot.state.hopeless_since.pop(self.T)
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"ask"})
+        self.assertNotIn(self.T, bot._rain_monthly_stood)
+        # a two-sided monthly keeps every member's dip allowance
+        self._write(p=0.5)
+        bot.state.hopeless_since[self.T] = time.time()
+        bot.run_cycle()
+        self.assertIn(("bid", 49), self._quotes(bot))
+
+    def test_the_estimate_counts_the_one_side_alone(self):
+        # the selection's probe rests what the loop would -- on a breach the
+        # ask alone -- so the reward estimate and the $1 floor projection
+        # judged on it are that side's share
+        bot = self._bot()
+        self._write(p=0.5)
+        bot.run_cycle()
+        meta = bot.state.selected[self.T]
+        bot._estimate_candidate_yield(meta, [])
+        both, floor_both = meta.est_frac, meta.floor_dollars_per_day
+        self.assertGreater(both, 0.0)
+        self._write(p=0.30)
+        bot._estimate_candidate_yield(meta, [])
+        self.assertAlmostEqual(meta.est_frac, both / 2, places=6)
+        self.assertAlmostEqual(meta.floor_dollars_per_day, floor_both / 2, places=6)
+        with mock.patch.object(imm, "RAIN_MONTHLY_ONE_SIDE", False):
+            bot._estimate_candidate_yield(meta, [])
+        self.assertAlmostEqual(meta.est_frac, both, places=6)
 
     ALL = ("KXRAINAUSM", "KXRAINCHIM", "KXRAINCLLM", "KXRAINCMHM", "KXRAINDALM",
            "KXRAINDENM", "KXRAINHOUM", "KXRAINLAXM", "KXRAINLEXM", "KXRAINMIAM",

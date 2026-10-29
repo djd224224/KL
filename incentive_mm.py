@@ -10944,6 +10944,7 @@ _CONFIG_CODE_KNOBS = (
     # monthly rain gate (2026-10-01); model knobs ride in its file's "model"
     "RAIN_MONTHLY_ENABLE", "RAIN_MONTHLY_TOL_CENTS", "RAIN_MONTHLY_TTL_MIN",
     "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
+    "RAIN_MONTHLY_ONE_SIDE",
     # period rain totals (2026-10-04) on the same file and gate
     "RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP",
     "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN", "RAIN_PERIOD_SIZE_MULT",
@@ -13203,7 +13204,8 @@ def share_gate_reason(ticker: str, now_ts: float,
 #   - the event's last CLI is stale (rain_monthly.STALE_CLI_HOURS),
 #   - its strike sits within the writer's BOUNDARY_IN of the month-to-date,
 #   - its touch fights the fair on the adverse side by more than
-#     RAIN_MONTHLY_TOL_CENTS.
+#     RAIN_MONTHLY_TOL_CENTS -- since 2026-10-29 only that side: the other
+#     quotes alone while it clears the payout floor (RAIN_MONTHLY_ONE_SIDE).
 # Size and band stay the rain family's (5-90c, global ladder, the KXRAIN
 # evening halving); no per-event cap. Kill switch IMM_RAIN_MONTHLY_ENABLE=0.
 RAIN_MONTHLY_ENABLE = _RAIN_MONTHLY_LIVE
@@ -13416,6 +13418,59 @@ def _cap_band_breach(why: str, inp: dict, tol: float, cap: bool
     if caps == (None, None):
         return why, inp, None
     return "", dict(inp, why=why, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+# MONTHLY RAIN ONE SIDE (Jack 2026-10-29: "Yes sell only, as long as it is
+# above payout threshold"). A band breach parked BOTH sides of a monthly: on
+# 10/29 eight November strikes sat dark on bids over fair + 10c --
+# KXRAINPHILM-26NOV-5 / -7 bid 23c / 13c on fairs of 11c / 2c, KXRAINDCM-6,
+# KXRAINDTWM-2/3/4, KXRAINTTNM-3/5 -- ~$1.4/day of rewards on the two-sided
+# estimate. Now the side whose touch fights the fair rests no rung at all
+# (not even capped at fair + tol as the period markets' RAIN_PERIOD_CAP
+# does: a capped bid that still earns buys what the model calls 10c dear)
+# and the other side joins the touch, resting only while the scored walk
+# reaches it (drop_unearning_sides) -- sell only on a bid breach, buy only
+# on an ask breach. A member still pads the rungless side at 1c where its
+# book is under the target (a one-sided snapshot pays nobody). ABOVE THE
+# PAYOUT FLOOR: the selection's probe sees the same one side
+# (rain_monthly_side_out), so the reward estimate and the floor projection
+# count that side alone, and the side rests only while the market has no
+# hopeless clock running (state.hopeless_since: a projection under the
+# PAYOUT_FLOOR_DOLLARS bar starts it, ADMIT_SUSTAIN_SECS back above clears
+# it) -- no 30-minute dip allowance; it stands aside meanwhile.
+# IMM_RAIN_MONTHLY_ONE_SIDE=0 parks both sides again.
+RAIN_MONTHLY_ONE_SIDE = os.environ.get("IMM_RAIN_MONTHLY_ONE_SIDE", "1") == "1"
+
+
+def rain_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                      ext_ask: Optional[float]
+                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """rain_monthly_gate_reason with a band breach turned into one side
+    (RAIN_MONTHLY_ONE_SIDE): ('', {}, None) to quote at the touch; ('',
+    inputs, caps) when inputs' `side_out` -- the side that fights the fair
+    -- rests no rung (the caps are the period markets' and never move the
+    other side); else (why, guard-skip inputs, None): stand aside."""
+    why, inp = rain_monthly_gate_reason(ticker, now_ts, ext_bid, ext_ask)
+    why, inp, caps = _cap_band_breach(why, inp, RAIN_MONTHLY_TOL_CENTS,
+                                      RAIN_MONTHLY_ONE_SIDE)
+    if caps is not None:
+        inp = dict(inp, side_out="bid" if inp["bid_bad"] else "ask")
+    return why, inp, caps
+
+
+def rain_monthly_side_out(series: str, ticker: str, now_ts: float,
+                          ext_bid: Optional[float], ext_ask: Optional[float]
+                          ) -> Optional[str]:
+    """The side a monthly rain market quotes without right now (its
+    rain_monthly_gate side_out) when the quote loop's monthly branch takes
+    it -- no fair-file, snow or period gate first -- else None: the
+    selection probe's view of the one-side rule."""
+    if (not rain_monthly_series(series) or snow_monthly_series(series)
+            or rain_period_gated(ticker)
+            or fair_file_gate(series, ticker, now_ts, ext_bid, ext_ask) is not None):
+        return None
+    _why, inp, caps = rain_monthly_gate(ticker, now_ts, ext_bid, ext_ask)
+    return inp.get("side_out") if caps is not None else None
 
 
 # ----------------------------------------------------------------------------
@@ -29112,6 +29167,17 @@ class IncentiveMarketMaker:
                     out, yes_levels, no_levels,
                     own_live if self.live else [],
                     meta.target_size, meta.discount_factor)
+            # monthly rain one side (RAIN_MONTHLY_ONE_SIDE): on a band breach
+            # the loop rests only the side that does not fight the fair, so
+            # the estimate -- and the payout floor judged on it -- counts
+            # that side alone, and only while it earns
+            _rso = rain_monthly_side_out(meta.series, meta.ticker,
+                                         _now.timestamp(), eb, ea)
+            if _rso is not None:
+                out = drop_unearning_sides(
+                    [q for q in out if q.book_side != _rso],
+                    yes_levels, no_levels, own_live if self.live else [],
+                    meta.target_size, meta.discount_factor)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -31071,7 +31137,9 @@ class IncentiveMarketMaker:
 
             # MONTHLY RAIN GATE (Jack 2026-10-01, see RAIN_MONTHLY_ENABLE): the
             # daily rain gate's stand-aside on the monthly model, failing
-            # CLOSED, and out while it rains at the station. The period
+            # CLOSED, and out while it rains at the station; a band breach
+            # quotes the side that does not fight the fair alone, while the
+            # market clears the payout floor (RAIN_MONTHLY_ONE_SIDE). The period
             # totals (2026-10-04, RAIN_PERIOD_ENABLE) ride the same gate on
             # the same file; a band breach there caps the side that fights
             # the fair -- rain_caps, applied last below, where only a side
@@ -31083,6 +31151,7 @@ class IncentiveMarketMaker:
             # station checks, and the 2026-10-22 ski-resort snowfall gate
             # with them.
             rain_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            rain_side_out: Optional[str] = None
             rain_period = rain_period_gated(t)
             snow = snow_monthly_series(meta.series)
             ffg = fair_file_gate(meta.series, t, now_ts, ext_bid, ext_ask)
@@ -31098,7 +31167,16 @@ class IncentiveMarketMaker:
                     rm_why, rm_in, rain_caps = rain_period_gate(
                         t, now_ts, ext_bid, ext_ask)
                 else:
-                    rm_why, rm_in = rain_monthly_gate_reason(t, now_ts, ext_bid, ext_ask)
+                    rm_why, rm_in, rain_caps = rain_monthly_gate(
+                        t, now_ts, ext_bid, ext_ask)
+                    if rain_caps is not None:
+                        rain_side_out = rm_in["side_out"]
+                        if t in self.state.hopeless_since:
+                            # the one side rests only above the payout floor
+                            rm_why = (f"{rm_in['why']}; one side projects under "
+                                      f"the ${PAYOUT_FLOOR_DOLLARS:.2f} payout floor")
+                            rm_in = dict(rm_in, reason="payout_floor")
+                            rain_caps = rain_side_out = None
                 if rm_why:
                     if t not in self._rain_monthly_stood:
                         self._rain_monthly_stood.add(t)
@@ -31109,7 +31187,10 @@ class IncentiveMarketMaker:
                 if rain_caps is not None and t not in self._rain_period_capped:
                     self._rain_period_capped.add(t)
                     log(f"{self.tag} {wx} capped {t}: {rm_in['why']}; "
-                        + (f"bids capped at {rain_caps[0]}c" if rm_in.get("bid_bad")
+                        + (f"{rain_side_out}s out, "
+                           f"{'sell' if rain_side_out == 'bid' else 'buy'} only"
+                           if rain_side_out else
+                           f"bids capped at {rain_caps[0]}c" if rm_in.get("bid_bad")
                            else f"asks floored at {rain_caps[1]}c")
                         + ", resting only while it earns")
             if rain_caps is None and t in self._rain_period_capped:
@@ -31700,6 +31781,11 @@ class IncentiveMarketMaker:
             # the #1 leader-bid pilot: every bid rung at most its cap, no ask
             if yt1_cap is not None:
                 mq = quake_cap_quotes(mq, yt1_cap)
+            # monthly rain one side (RAIN_MONTHLY_ONE_SIDE): the side that
+            # fights the fair rests no rung -- dropped before the pads, so a
+            # member pads it for depth like any rungless side
+            if rain_side_out is not None:
+                mq = [q for q in mq if q.book_side != rain_side_out]
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -34659,7 +34745,10 @@ class IncentiveMarketMaker:
             log("share-fair gate: OFF -- OpenRouter share series not enrolled")
         if RAIN_MONTHLY_ENABLE:
             log(f"rain-monthly gate: {','.join(sorted(RAIN_MONTHLY_SERIES))} "
-                f"fail-closed at-touch, tol {RAIN_MONTHLY_TOL_CENTS}c, out while "
+                f"fail-closed at-touch, tol {RAIN_MONTHLY_TOL_CENTS}c ("
+                + ("a breach quotes the other side alone, above the payout floor"
+                   if RAIN_MONTHLY_ONE_SIDE else "a breach parks both sides")
+                + f"), out while "
                 f"it rains at the station + {RAIN_MONTHLY_DRY_MIN:g}m, cutoff "
                 f"close-{RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN}m, ttl "
                 f"{RAIN_MONTHLY_TTL_MIN}m, refresh {RAIN_MONTHLY_REFRESH_SECS}s, "
