@@ -11111,6 +11111,9 @@ _CONFIG_CODE_KNOBS = (
     # lone-reference guard (2026-10-16)
     "LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
     "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
+    # two-market complement lead (2026-10-28)
+    "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
+    "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -19441,6 +19444,125 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
                 base_ahead=ahead(base_px), gain_day=gain_day)
 
 
+# TWO-MARKET COMPLEMENT LEAD (Jack 2026-10-28: "in examples like this, you can
+# infer the implied price from the other side since it's a 2 sided market.
+# KXSTATELEG-WIASSEMBLY26-R. so you can be more confident to place a larger
+# order at front of the line and take up the 200 shares"). An event Kalshi
+# marks mutually exclusive with exactly two markets prices each market twice:
+# on its own book and on its twin's, since YES on one is NO on the other (a
+# tie, where both settle NO, is the gap). A NO bid on the twin at q is a YES
+# bid here at q, and a YES bid there at p is a YES ask here at 100 - p.
+# On 10/28 23:30Z the Wisconsin Assembly D book was 16c x 74c over walls of
+# 13,238 YES at 15c and 13,550 NO at 11c, while R's book (2,863 offered at
+# 30c) priced D at 70c bid. D's own bid side was a lowball wall 55c under
+# where anyone would sell D. At-reference placement sat behind that wall with
+# ~1% of the side, and D projected $0.79-0.86 for the final pre-election
+# period, under the $1 payout, so it stood down.
+# Under the program rules the first target/5 contracts from the best price
+# score full weight and the rest decays 0.5 per tick, so ONE rung of
+# target/5 (200 of a 1,000 target) ahead of the wall becomes the reference
+# and takes nearly the whole side: half the market's pool.
+# Per side, on the EXTERNAL books (our own orders netted out of both):
+#   * the twin's implied reference (cumulative target/5, the walk
+#     ladder_reference_prices uses) less COMP_LEAD_MARGIN_C is the CAP: a
+#     side never leads past the price the twin's depth backs;
+#   * a side leads only where that cap is ahead of its own external best,
+#     at the LOWEST price ahead of it where a target/5 rung takes
+#     COMP_LEAD_SHARE of the side's score (_side_share). The reward is the
+#     same anywhere far enough above the wall, and the cheapest such price is
+#     the furthest from the fair the twin implies (D: 26c, 44c under 70c);
+#   * the rung rests at least target/5 (room permitting) inside the band,
+#     never crosses the market's own other side, and every other side guard
+#     still applies.
+# The WS fast cancel judges a leading rung against the touch the twin
+# implies as well as the market's own, and re-checks it whenever the twin's
+# book moves; with no twin book on the feed there is no lead.
+# Scope: the election family (comp_lead_series), whose two-way races (state
+# chambers D/R, attorneys general, House control) are the pairs Kalshi
+# lists. IMM_COMP_LEAD_SKIP drops series prefixes; IMM_COMP_LEAD=dry logs the
+# leads without placing them; off disables.
+COMP_LEAD_MODE = os.environ.get("IMM_COMP_LEAD", "on").strip().lower()
+COMP_LEAD_SHARE = _env_float("IMM_COMP_LEAD_SHARE", 0.95)
+COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 1))
+COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
+    p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
+    if p.strip())
+# Kalshi's event record pairs the markets: re-read every TTL, at most READS
+# event reads per universe refresh
+COMP_PAIR_TTL_SECS = _env_float("IMM_COMP_PAIR_TTL_H", 12.0) * 3600.0
+COMP_PAIR_READS_PER_REFRESH = _env_int("IMM_COMP_PAIR_READS", 80)
+
+
+def comp_lead_series(series: str) -> bool:
+    """May this series' markets lead off their twin's book at all?"""
+    if COMP_LEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
+        return False
+    return election_series(series) and not series.startswith(COMP_LEAD_SKIP)
+
+
+def comp_lead_size(target: float) -> int:
+    """The leading rung's size: target/5, the reward reference's depth."""
+    return int(math.ceil(target / 5.0)) if target > 0 else 0
+
+
+def comp_lead_band_ok(px: int, band: Optional[Tuple[int, int]], series: str) -> bool:
+    """Is a lead price inside the envelope build_side_ladder gives at-ref
+    rungs (the caller band, else the series band, bounded by the deep floor
+    and the sticky cap)? build_side_ladder never clamps a rung to its own
+    anchor's side, so a lead outside it does not lead."""
+    pmin, pmax = band if band is not None else (series_price_min(series),
+                                                series_price_max(series))
+    return max(pmin, RUNG_DEEP_FLOOR) <= px <= min(pmax, STICKY_PRICE_MAX)
+
+
+def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]],
+                   target: float, df: float) -> Optional[Tuple[int, int, int]]:
+    """ONE side's lead in that side's own price space (YES cents for the bid
+    side, NO cents for the ask side; higher = more aggressive): (price, cap,
+    own external best), or None. `own_levels`: the market's external side;
+    `twin_levels`: the twin's levels that price it (the twin's NO bids for our
+    bid side, its YES bids for our ask side). A side that cannot reach the
+    target with the lead in it does not lead."""
+    n = comp_lead_size(target)
+    if n <= 0:
+        return None
+    ref = side_reference_level(levels_desc(twin_levels), target)
+    if ref is None:
+        return None
+    cap = min(ref - COMP_LEAD_MARGIN_C, 99)
+    own = levels_desc(own_levels)
+    best = own[0][0] if own else 0
+    if cap <= best:
+        return None
+    for px in range(best + 1, cap + 1):
+        s, ok = _side_share([(px, float(n))] + own, {px: float(n)}, target, df)
+        if ok and s >= COMP_LEAD_SHARE:
+            return px, cap, best
+    return None
+
+
+def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]],
+                     twin_yes: List[List[float]], twin_no: List[List[float]],
+                     target: float, df: float
+                     ) -> Tuple[Optional[Tuple[int, int, int]],
+                                Optional[Tuple[int, int, int]]]:
+    """(bid lead, ask lead) for a market from its twin's book, both books
+    EXTERNAL: each None or (price, cap, own external best) in YES cents, the
+    ask's in YES-ask cents. A lead never crosses the market's own other side,
+    and two leads that would cross each other both stand down."""
+    lb = comp_side_lead(yes_levels, twin_no, target, df)
+    ln = comp_side_lead(no_levels, twin_yes, target, df)
+    la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
+    eb, ea = external_best(yes_levels, no_levels)
+    if lb is not None and ea is not None and lb[0] >= ea:
+        lb = None
+    if la is not None and eb is not None and la[0] <= eb:
+        la = None
+    if lb is not None and la is not None and lb[0] >= la[0]:
+        lb = la = None
+    return lb, la
+
+
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
                       opposite_best: Optional[int], room: float,
                       levels: Optional[List[Tuple[int, int]]] = None,
@@ -20454,6 +20576,18 @@ class IncentiveMarketMaker:
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
         self._join_ahead_state: Dict[Tuple[str, str], int] = {}
+        # TWO-MARKET COMPLEMENT LEAD (COMP_LEAD_MODE): event -> (read at, its
+        # (ticker, ticker) pair or None) from Kalshi's event record; ticker ->
+        # its twin, both ways; the latest own orders by ticker (netted out of
+        # a twin's book); ticker -> the (bid, ask) YES prices its leading
+        # rungs rest at and their size (the WS fast cancel judges those
+        # against the twin, the placement caps allow the size); (ticker,
+        # side) -> the lead price last logged
+        self._comp_events: Dict[str, Tuple[float, Optional[Tuple[str, str]]]] = {}
+        self._comp_pairs: Dict[str, str] = {}
+        self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
+        self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
+        self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
         # (ticker, side) -> change points (ts, own-space price or None) of
         # where our rung rested, for the lone-reference guard's jump test;
         # and the sides it holds right now
@@ -22900,6 +23034,23 @@ class IncentiveMarketMaker:
         phase = "cycle" if in_cycle else "idle"
         check = set(dirty) | {o_t for o_t, lst in self._resting_view.items()
                               if any(o["order_id"] in self._ws_suspect for o in lst)}
+        # a complement lead is judged on its twin's book too, so a move there
+        # re-checks it (COMP_LEAD_MODE)
+        check |= {self._comp_pairs[d] for d in dirty
+                  if d in self._comp_pairs and self._comp_pairs[d] in self._comp_lead_px}
+
+        def _own_by_px(lst) -> Tuple[Dict[float, float], Dict[float, float]]:
+            oy: Dict[float, float] = {}
+            on: Dict[float, float] = {}
+            for o in lst:
+                if o["side"] == "bid":
+                    k = round(o["px"] / 100.0, 4)
+                    oy[k] = oy.get(k, 0.0) + o["rem"]
+                else:
+                    k = round((100.0 - o["px"]) / 100.0, 4)
+                    on[k] = on.get(k, 0.0) + o["rem"]
+            return oy, on
+
         for t in sorted(check):
             orders = self._resting_view.get(t)
             if not orders:
@@ -22909,20 +23060,35 @@ class IncentiveMarketMaker:
             if lv is None:
                 continue
             yes, no = lv
-            own_yes: Dict[float, float] = {}
-            own_no: Dict[float, float] = {}
-            for o in orders:
-                if o["side"] == "bid":
-                    k = round(o["px"] / 100.0, 4)
-                    own_yes[k] = own_yes.get(k, 0.0) + o["rem"]
-                else:
-                    k = round((100.0 - o["px"]) / 100.0, 4)
-                    own_no[k] = own_no.get(k, 0.0) + o["rem"]
+            own_yes, own_no = _own_by_px(orders)
             ext_bid = max((p for p, q in yes.items()
                            if q - own_yes.get(p, 0.0) > 0.01), default=None)
             ext_no = max((p for p, q in no.items()
                           if q - own_no.get(p, 0.0) > 0.01), default=None)
             ext_ask = None if ext_no is None else round(1.0 - ext_no, 4)
+            # TWO-MARKET COMPLEMENT LEAD: a leading side's touch is the better
+            # of its own and the one its twin's book implies (the twin's NO
+            # bids price our bids, its YES bids our asks), our orders on the
+            # twin netted out; with no twin book it is its own alone, so a
+            # lead the twin no longer backs reads ahead like any stale rung
+            lead_px = self._comp_lead_px.get(t)
+            twin = self._comp_pairs.get(t)
+            if lead_px is not None and twin is not None:
+                tlv = ws.book_levels(twin)
+                if tlv is not None:
+                    t_yes, t_no = tlv
+                    tw_yes, tw_no = _own_by_px(self._resting_view.get(twin) or [])
+                    if lead_px[0] is not None:
+                        imp = max((p for p, q in t_no.items()
+                                   if q - tw_no.get(p, 0.0) > 0.01), default=None)
+                        if imp is not None:
+                            ext_bid = imp if ext_bid is None else max(ext_bid, imp)
+                    if lead_px[1] is not None:
+                        imp = max((p for p, q in t_yes.items()
+                                   if q - tw_yes.get(p, 0.0) > 0.01), default=None)
+                        if imp is not None:
+                            imp_ask = round(1.0 - imp, 4)
+                            ext_ask = imp_ask if ext_ask is None else min(ext_ask, imp_ask)
             for o in list(orders):
                 oid = o["order_id"]
                 if in_cycle and (oid in self._cycle_amended
@@ -26047,6 +26213,11 @@ class IncentiveMarketMaker:
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (o.get("book_side", "bid"), int(o.get("yes_price", 0)),
                      float(o.get("remaining_count", 0))))
+        # two-market twins for the complement lead, and the own orders a
+        # twin's book is read without (COMP_LEAD_MODE)
+        self._comp_own = own_by_ticker
+        if COMP_LEAD_MODE in ("on", "dry"):
+            self._refresh_comp_pairs(metas, now_ts)
         self._prune_near_cliff_boost()
         self._prune_yield_boost()
         # the books pass 2 reads go on the WebSocket feed (WS_CANDIDATES)
@@ -26958,6 +27129,101 @@ class IncentiveMarketMaker:
 
     # ---- join ahead of the pile (2026-10-11, JOIN_AHEAD_MODE) --------------
 
+    def _refresh_comp_pairs(self, metas: List["MarketMeta"], now_ts: float) -> None:
+        """Pair the two markets of every two-market, mutually exclusive event
+        in the complement-lead scope (COMP_LEAD_MODE) from Kalshi's event
+        record: an event with exactly two candidates is read when unread or
+        older than COMP_PAIR_TTL_SECS, at most COMP_PAIR_READS_PER_REFRESH a
+        refresh; a failed read leaves the event unpaired until the next try.
+        Never raises."""
+        by_ev: Dict[str, Set[str]] = {}
+        for m in metas:
+            if comp_lead_series(m.series):
+                by_ev.setdefault(m.event_ticker, set()).add(m.ticker)
+        reads = 0
+        for ev in sorted(by_ev):
+            pair_t = tuple(sorted(by_ev[ev]))
+            if len(pair_t) != 2:
+                continue
+            hit = self._comp_events.get(ev)
+            if hit is not None and now_ts - hit[0] < COMP_PAIR_TTL_SECS:
+                continue
+            if reads >= COMP_PAIR_READS_PER_REFRESH:
+                break
+            reads += 1
+            try:
+                js = self.client.get(f"/events/{ev}",
+                                     params={"with_nested_markets": "true"}) or {}
+            except Exception as e:
+                if not getattr(self, "_comp_read_err_logged", False):
+                    self._comp_read_err_logged = True
+                    log(f"{self.tag} ! comp lead: event read {ev} failed ({e!r}); "
+                        f"it stays unpaired until the next try (logged once)")
+                continue
+            e = js.get("event") or {}
+            mk = e.get("markets") or js.get("markets") or []
+            tickers = tuple(sorted(str(x.get("ticker") or "") for x in mk))
+            open_ = all(str(x.get("status") or "").lower() in ("active", "open")
+                        for x in mk)
+            ok = bool(e.get("mutually_exclusive")) and tickers == pair_t and open_
+            self._comp_events[ev] = (now_ts, pair_t if ok else None)
+        pairs: Dict[str, str] = {}
+        for _ev, (_at, pair) in self._comp_events.items():
+            if pair is not None:
+                pairs[pair[0]], pairs[pair[1]] = pair[1], pair[0]
+        if set(pairs) != set(self._comp_pairs):
+            log(f"{self.tag} comp lead: {len(pairs) // 2} two-market event(s) "
+                f"paired ({reads} event read(s) this refresh)")
+        self._comp_pairs = pairs
+
+    def _comp_lead(self, meta, yes_ext: List[List[float]], no_ext: List[List[float]]
+                   ) -> Tuple[Optional[Tuple[int, int, int]],
+                              Optional[Tuple[int, int, int]]]:
+        """This market's (bid lead, ask lead) off its twin's WS book
+        (comp_lead_prices; `yes_ext` / `no_ext` = its own EXTERNAL book):
+        (None, None) without a twin, outside the scope, on a sub-penny book
+        or when the feed cannot serve the twin's book."""
+        twin = self._comp_pairs.get(meta.ticker)
+        ws = self._ws
+        if twin is None or ws is None or not comp_lead_series(meta.series) \
+                or meta.price_step < 0.01:
+            return None, None
+        try:
+            ob = ws.book_fp(twin)
+        except Exception:
+            ob = None
+        if ob is None:
+            return None, None
+        ty, tn = orderbook_levels(ob)
+        own_t = self._comp_own.get(twin, []) if self.live else []
+        if own_t:
+            ty, tn = external_levels(ty, tn, own_t)
+        return comp_lead_prices(yes_ext, no_ext, ty, tn,
+                                meta.target_size, meta.discount_factor)
+
+    def _comp_lead_note(self, t: str, lead_b, lead_a, n: int) -> None:
+        """Log each side's complement lead when it starts, stops or moves
+        3c or more (COMP_LEAD_MODE dry says so)."""
+        dry = "" if COMP_LEAD_MODE == "on" else " (dry)"
+        twin = self._comp_pairs.get(t, "its twin")
+        for side, lead in (("bid", lead_b), ("ask", lead_a)):
+            key = (t, side)
+            px = None if lead is None else lead[0]
+            prev = self._comp_lead_noted.get(key)
+            if px == prev or (px is not None and prev is not None
+                              and abs(px - prev) < 3):
+                continue
+            self._comp_lead_noted[key] = px
+            if px is None:
+                log(f"{self.tag} comp lead{dry} {t} {side}: off -- {twin}'s book "
+                    f"no longer prices it ahead of its own")
+                continue
+            _p, cap, best = lead
+            implied = (cap + COMP_LEAD_MARGIN_C if side == "bid"
+                       else cap - COMP_LEAD_MARGIN_C)
+            log(f"{self.tag} comp lead{dry} {t} {side}: {n} @ {px}c, ahead of its "
+                f"own {best}c; {twin}'s book implies {implied}c")
+
     def _join_ahead(self, t: str, meta, yes_levels, no_levels, own_in_book,
                     ext_bid: Optional[int], ext_ask: Optional[int],
                     ref_bid_px: Optional[int], ref_ask_px: Optional[int],
@@ -27701,6 +27967,17 @@ class IncentiveMarketMaker:
             meta.yield_per_contract = 0.0
             return True              # readable, just worth nothing
         rb, ra = ladder_reference_prices(yes_levels, no_levels, meta.target_size)
+        # TWO-MARKET COMPLEMENT LEAD: the leads the quote loop would rest, read
+        # off the EXTERNAL book (an incumbent's own orders netted out) and the
+        # twin's; they price the probe ladder below, and so the estimate and
+        # the floor projection (COMP_LEAD_MODE on only)
+        _leads: Tuple[Optional[Tuple[int, int, int]],
+                      Optional[Tuple[int, int, int]]] = (None, None)
+        if COMP_LEAD_MODE == "on" and meta.ticker in self._comp_pairs:
+            _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_live)
+                               if (self.live and own_live) else (yes_levels, no_levels))
+            _leads = self._comp_lead(meta, _lx_yes, _lx_no)
+        _lead_n = comp_lead_size(meta.target_size)
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
         # collateral reservation) inherit the cap through these meta fields
         _hm = hour_size_mult(meta.series, datetime.now(timezone.utc))
@@ -27747,7 +28024,9 @@ class IncentiveMarketMaker:
                           rmb: float, rma: float,
                           eb: Optional[int], ea: Optional[int],
                           rpb: Optional[int], rpa: Optional[int],
-                          sides: Optional[Tuple[float, float]] = None
+                          sides: Optional[Tuple[float, float]] = None,
+                          leads: Tuple[Optional[Tuple[int, int, int]],
+                                       Optional[Tuple[int, int, int]]] = (None, None)
                           ) -> List[Quote]:
             """The buildable ladder at hour multiplier `hm` on rung sizes
             `lv`, per-side reference multipliers `rmb` / `rma`, external
@@ -27757,7 +28036,9 @@ class IncentiveMarketMaker:
             floor projection (FLOOR_PROJECTION_BASE_SIZE, 2026-09-25).
             `sides` = the (bid, ask) side multipliers, default the live
             side_size_mults; the floor projection passes each window
-            piece's own (FLOOR_PROJECTION_SIDES)."""
+            piece's own (FLOOR_PROJECTION_SIDES). `leads` = the (bid, ask)
+            complement leads (comp_lead_prices): a leading side rests one
+            rung of at least target/5 at its lead price, as the loop does."""
             sbm, sam = (_cbm, _cam) if sides is None else sides
             lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
             smb, sma = clamp_side_max_to_position_cap(
@@ -27785,14 +28066,34 @@ class IncentiveMarketMaker:
                 ask_ok = ea is not None and (
                     (LADDER_MODE == "atref" and rpa is not None)
                     or ea <= series_price_max(meta.series))
+            lb, la = leads
+            _cap = int(series_max_position(meta.series))
+
+            def _lead_room(sm: int) -> int:
+                return max(sm, _lead_n) if _cap <= 0 else min(max(sm, _lead_n), _cap)
+
             if bid_ok:
-                out += build_side_ladder(meta.ticker, "bid", eb, ea,
-                                         smb, levels=lvb, ref_px=rpb,
-                                         band=band, hour_mult=hm)
+                if (lb is not None and sum(s for _t, s in lvb) > 0
+                        and comp_lead_band_ok(lb[0], band, meta.series)):
+                    out += build_side_ladder(meta.ticker, "bid", lb[0], ea,
+                                             _lead_room(smb), levels=lvb,
+                                             ref_px=lb[0], band=band,
+                                             hour_mult=hm, min_total=_lead_n)
+                else:
+                    out += build_side_ladder(meta.ticker, "bid", eb, ea,
+                                             smb, levels=lvb, ref_px=rpb,
+                                             band=band, hour_mult=hm)
             if ask_ok:
-                out += build_side_ladder(meta.ticker, "ask", ea, eb,
-                                         sma, levels=lva, ref_px=rpa,
-                                         band=band, hour_mult=hm)
+                if (la is not None and sum(s for _t, s in lva) > 0
+                        and comp_lead_band_ok(la[0], band, meta.series)):
+                    out += build_side_ladder(meta.ticker, "ask", la[0], eb,
+                                             _lead_room(sma), levels=lva,
+                                             ref_px=la[0], band=band,
+                                             hour_mult=hm, min_total=_lead_n)
+                else:
+                    out += build_side_ladder(meta.ticker, "ask", ea, eb,
+                                             sma, levels=lva, ref_px=rpa,
+                                             band=band, hour_mult=hm)
             if (SUBPENNY_JOIN and meta.price_step < 0.01
                     and sports_ladder_league(meta.series) is not None):
                 # the loop's sub-cent edge rungs (subcent_edge_quotes)
@@ -27865,7 +28166,7 @@ class IncentiveMarketMaker:
             return overlay
 
         _probe = _probe_ladder(_hm, _lv, meta.ref_mult_bid, meta.ref_mult_ask,
-                               ext_b, ext_a, rb, ra)
+                               ext_b, ext_a, rb, ra, leads=_leads)
         # Sides that will actually REST. This must replicate the quote
         # loop's PER-SIDE TOP-IN-BAND gate (Jack 2026-08-03, CHIH T69.99):
         # "a side whose OWN touch is outside the band stands down alone —
@@ -27983,7 +28284,7 @@ class IncentiveMarketMaker:
                         m, scale_levels(scaled_levels_at(meta.series, m), _msm),
                         capped_ref_mult(xb, xrb, "bid", hour_mult=m, series=meta.series),
                         capped_ref_mult(xa, xra, "ask", hour_mult=m, series=meta.series),
-                        xb, xa, xrb, xra, sides=(bm, am))
+                        xb, xa, xrb, xra, sides=(bm, am), leads=_leads)
                     if not q_m:
                         return 0.0
                     return estimate_reward_share(
@@ -28861,12 +29162,18 @@ class IncentiveMarketMaker:
         # orders from THIS exchange read (a reference; the dict is rebuilt
         # every cycle and never mutated after this loop)
         self._book_own_exch = own_exact_by_ticker if self.live else {}
+        # a complement lead reads its twin's book without our own orders there
+        # (COMP_LEAD_MODE): this cycle's exchange read
+        self._comp_own = own_by_ticker if self.live else {}
         # Events the user is trading by hand THIS cycle (foreign orders now
         # fresh). The per-market loop below yields every market of these.
         manual_evts = self.manual_events(positions)
 
         # Cancel resting orders on markets we no longer manage at all.
         managed_set = set(managed)
+        # (a market no longer managed has no complement lead left to judge)
+        self._comp_lead_px = {k: v for k, v in self._comp_lead_px.items()
+                              if k in managed_set}
         stray = [o for o in resting if o.get("ticker") not in managed_set]
         for o in stray:
             if self.cancel_order(o.get("order_id", ""),
@@ -30204,6 +30511,29 @@ class IncentiveMarketMaker:
             # capped so hour x ref <= TOTAL_SIZE_MULT_CAP
             ref_bid_px, ref_ask_px = ladder_reference_prices(
                 yes_levels, no_levels, meta.target_size)
+            # TWO-MARKET COMPLEMENT LEAD (COMP_LEAD_MODE): a side its twin's
+            # book prices well ahead of its own rests one rung of at least
+            # target/5 at its lead price (comp_lead_prices) instead of at its
+            # reference -- never on a reduce-only market, under a fair gate's
+            # cap or outside the band the loop places at-ref rungs in
+            lead_b = lead_a = None
+            lead_n = comp_lead_size(meta.target_size)
+            if (t in self._comp_pairs and not reduce_only
+                    and quake_cap is None and yt1_cap is None and mort_caps is None
+                    and poke_caps is None and nfl_caps is None
+                    and ca_caps is None and rain_caps is None):
+                _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_in_book)
+                                   if own_in_book else (yes_levels, no_levels))
+                lead_b, lead_a = self._comp_lead(meta, _lx_yes, _lx_no)
+                if lead_b is not None and not (bid_in_band and comp_lead_band_ok(
+                        lead_b[0], (rung_lo, pmax_s), meta.series)):
+                    lead_b = None
+                if lead_a is not None and not (ask_in_band and comp_lead_band_ok(
+                        lead_a[0], (rung_lo, pmax_s), meta.series)):
+                    lead_a = None
+                self._comp_lead_note(t, lead_b, lead_a, lead_n)
+                if COMP_LEAD_MODE != "on":
+                    lead_b = lead_a = None
             # LONE-REFERENCE GUARD (LONE_REF_GUARD_MODE): a side whose
             # reference rests on a thin external top our rung would jump to
             # stands aside ("on": no rungs this cycle) or is logged ("dry").
@@ -30234,6 +30564,11 @@ class IncentiveMarketMaker:
                                      capped_ref_mult(ext_ask, ref_ask_px, "ask",
                                                      hour_mult=hm,
                                                      series=meta.series)))
+            # a leading side may rest target/5 (the caps and skew below bind)
+            if lead_b is not None and lv_bid:
+                side_max_bid = max(side_max_bid, lead_n)
+            if lead_a is not None and lv_ask:
+                side_max_ask = max(side_max_ask, lead_n)
             maxpos = series_max_position(meta.series)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
@@ -30303,6 +30638,21 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} ! join-ahead failed on {t} ({e!r}); "
                             f"plain reference placement (logged once)")
 
+            # a leading side rests at its lead price, anchored there (the
+            # anchor caps an at-ref rung) and at least target/5
+            lead_on_b = lead_b is not None and bool(lv_bid)
+            lead_on_a = lead_a is not None and bool(lv_ask)
+            anc_bid, anc_ask = ext_bid, ext_ask
+            if lead_on_b:
+                pl_bid_px = anc_bid = lead_b[0]
+            if lead_on_a:
+                pl_ask_px = anc_ask = lead_a[0]
+            if lead_on_b or lead_on_a:
+                self._comp_lead_px[t] = (lead_b[0] if lead_on_b else None,
+                                         lead_a[0] if lead_on_a else None, lead_n)
+            else:
+                self._comp_lead_px.pop(t, None)
+
             mq: List[Quote] = []
             # atref: placement no longer follows the touch, so a touch
             # outside the band must not kill the side (see build_side_ladder).
@@ -30311,18 +30661,22 @@ class IncentiveMarketMaker:
                 px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
                     or ext_bid >= pmin_s
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "bid", ext_bid, ext_ask, room_buy,
+                    mq.extend(build_side_ladder(t, "bid", anc_bid, ext_ask, room_buy,
                                                 levels=lv_bid, ref_px=pl_bid_px,
                                                 band=(rung_lo, pmax_s),
-                                                hour_mult=hm, min_total=unwind_bid))
+                                                hour_mult=hm,
+                                                min_total=max(unwind_bid, lead_n
+                                                              if lead_on_b else 0)))
             if ext_ask is not None and room_sell > 0 and ask_in_band:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "ask", ext_ask, ext_bid, room_sell,
+                    mq.extend(build_side_ladder(t, "ask", anc_ask, ext_bid, room_sell,
                                                 levels=lv_ask, ref_px=pl_ask_px,
                                                 band=(rung_lo, pmax_s),
-                                                hour_mult=hm, min_total=unwind_ask))
+                                                hour_mult=hm,
+                                                min_total=max(unwind_ask, lead_n
+                                                              if lead_on_a else 0)))
 
             # quake gate: every bid rung at most the fair cap; asks only on an
             # ask strike whose ask may rest, at the floor or above
@@ -31404,6 +31758,12 @@ class IncentiveMarketMaker:
             _u = _ub if q.book_side == "bid" else _ua
             side_cap = max(side_cap, _u)
             max_level_size = max(max_level_size, _u)
+            # a complement lead rests target/5 at its lead price (the quote
+            # loop sized it so: COMP_LEAD_MODE)
+            _cl = self._comp_lead_px.get(q.ticker)
+            if _cl is not None and _cl[0 if q.book_side == "bid" else 1] == q.price_cents:
+                side_cap = max(side_cap, _cl[2])
+                max_level_size = max(max_level_size, _cl[2])
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)

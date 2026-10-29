@@ -29762,6 +29762,280 @@ class TestJoinAhead(unittest.TestCase):
         self.assertEqual(bot._join_ahead_state, {})                       # off: no state
 
 
+class TestComplementLead(unittest.TestCase):
+    """Jack 2026-10-28: "in examples like this, you can infer the implied price
+    from the other side since it's a 2 sided market ... so you can be more
+    confident to place a larger order at front of the line and take up the
+    200 shares". A two-market, mutually exclusive event's twin prices each
+    side; a side its twin prices well ahead of its own book rests one rung of
+    target/5 at the cheapest price that takes COMP_LEAD_SHARE of the side,
+    never past the twin's implied reference less the margin."""
+
+    # KXSTATELEG-WIASSEMBLY26 at 10/29 00:15Z, cents (orderbook_levels order)
+    D_YES = [[1, 1052], [2, 2008], [3, 1], [15, 13238], [16, 21]]
+    D_NO = [[3, 3369], [11, 13550], [12, 20], [13, 1], [25, 6.03], [26, 1]]
+    R_YES = [[7, 285], [11, 4147], [12, 20], [13, 1], [14, 15], [15, 4]]
+    R_NO = [[25, 213], [32, 1815], [33, 978], [34, 1], [70, 2863], [71, 3]]
+    EV = "KXFOOLEG-99DEC31"
+    D, R = "KXFOOLEG-99DEC31-D", "KXFOOLEG-99DEC31-R"
+
+    def test_wisconsin_assembly_books(self):
+        # D's bid side: R's 2,863 offered at 30c back a 70c bid, so the cap is
+        # 69c; 200 at 26c takes 96.9% of the side over the 13,238 at 15c
+        # (25c would take 93.9%). D's ask side and both of R's sides are at
+        # least as tight on their own books: no lead.
+        lb, la = imm.comp_lead_prices(self.D_YES, self.D_NO, self.R_YES, self.R_NO,
+                                      1000.0, 0.5)
+        self.assertEqual((lb, la), ((26, 69, 16), None))
+        self.assertEqual(imm.comp_lead_prices(self.R_YES, self.R_NO, self.D_YES,
+                                              self.D_NO, 1000.0, 0.5), (None, None))
+        # about half the pool against ~1% at the reference behind the wall
+        with_lead = imm.estimate_reward_share(
+            self.D_YES, self.D_NO, [("bid", 26, 200.0), ("ask", 89, 180.0)],
+            1000.0, 0.5, own_in_book=False)[0]
+        at_ref = imm.estimate_reward_share(
+            self.D_YES, self.D_NO, [("bid", 15, 75.0), ("ask", 89, 180.0)],
+            1000.0, 0.5, own_in_book=False)[0]
+        self.assertAlmostEqual(with_lead, 0.491, places=3)
+        self.assertLess(at_ref, 0.01)
+
+    def test_cap_margin_crossing_and_thin_sides(self):
+        own = [[40, 5000.0]]
+        twin_no = [[46, 300.0]]             # implies a 46c bid: cap 45c
+        # at the 45c cap the 5,000 at 40c still scores 0.5^5 x 5,000 = 156,
+        # leaving 200 / 356 = 56% -- under 95% all the way: no lead
+        self.assertIsNone(imm.comp_side_lead(own, twin_no, 1000.0, 0.5))
+        with mock.patch.object(imm, "COMP_LEAD_SHARE", 0.5):
+            self.assertEqual(imm.comp_side_lead(own, twin_no, 1000.0, 0.5),
+                             (45, 45, 40))
+        with mock.patch.object(imm, "COMP_LEAD_SHARE", 0.5), \
+                mock.patch.object(imm, "COMP_LEAD_MARGIN_C", 2):
+            self.assertIsNone(imm.comp_side_lead(own, twin_no, 1000.0, 0.5))
+        # a twin that never reaches target/5 sets no cap; an own side that
+        # cannot reach the target even with the lead in it does not lead
+        self.assertIsNone(imm.comp_side_lead(own, [[70, 150.0]], 1000.0, 0.5))
+        self.assertIsNone(imm.comp_side_lead([[15, 300.0]], [[70, 3000.0]], 1000.0, 0.5))
+        # a lead at or through the market's own other side stands down
+        yes = [[15, 13000.0]]
+        no = [[78, 5000.0]]                  # own ask 22c
+        self.assertEqual(imm.comp_lead_prices(yes, no, [], [[70, 3000.0]],
+                                              1000.0, 0.5), (None, None))
+
+    def test_scope(self):
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
+            self.assertTrue(imm.comp_lead_series("KXFOOLEG"))
+            self.assertFalse(imm.comp_lead_series("KXGOOD"))
+            with mock.patch.object(imm, "COMP_LEAD_SKIP", ("KXFOO",)):
+                self.assertFalse(imm.comp_lead_series("KXFOOLEG"))
+            for mode, want in (("dry", True), ("off", False)):
+                with mock.patch.object(imm, "COMP_LEAD_MODE", mode):
+                    self.assertEqual(imm.comp_lead_series("KXFOOLEG"), want)
+        with mock.patch.object(imm, "LADDER_MODE", "offsets"), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
+            self.assertFalse(imm.comp_lead_series("KXFOOLEG"))
+
+    def _meta(self, t, series="KXFOOLEG"):
+        return imm.MarketMeta(ticker=t, event_ticker="-".join(t.split("-")[:2]),
+                              series=series, dollars_per_day=100.0, program_end=None,
+                              target_size=1000.0, discount_factor=0.5, cutoff=None,
+                              close_time=datetime.now(timezone.utc) + timedelta(days=2),
+                              mid_cents=45.0, spread_cents=58, volume=3000.0)
+
+    def _event_client(self, events):
+        reads = []
+
+        class _C:
+            def get(self_, path, params=None):
+                reads.append(path)
+                ev = path.rsplit("/", 1)[1]
+                if ev not in events:
+                    raise RuntimeError("404")
+                return events[ev]
+        return _C(), reads
+
+    def test_pairs_come_from_the_event_record(self):
+        def rec(me, *tickers, status="active"):
+            return {"event": {"mutually_exclusive": me, "markets": [
+                {"ticker": t, "status": status} for t in tickers]}}
+        client, reads = self._event_client({
+            self.EV: rec(True, self.D, self.R),
+            "KXFOOLEG-99DEC30": rec(False, "KXFOOLEG-99DEC30-A", "KXFOOLEG-99DEC30-B"),
+            "KXFOOLEG-99DEC29": rec(True, "KXFOOLEG-99DEC29-A", "KXFOOLEG-99DEC29-B",
+                                    "KXFOOLEG-99DEC29-C")})
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=client, live=False)
+        metas = [self._meta(t) for t in (
+            self.D, self.R, "KXFOOLEG-99DEC30-A", "KXFOOLEG-99DEC30-B",
+            "KXFOOLEG-99DEC29-A", "KXFOOLEG-99DEC29-B",      # 3 listed, 2 in programs
+            "KXFOOLEG-99DEC28-A")]                           # one candidate: never read
+        metas += [self._meta(t, series="KXGOOD")             # not in scope
+                  for t in ("KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B")]
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
+            bot._refresh_comp_pairs(metas, 1000.0)
+            self.assertEqual(bot._comp_pairs, {self.D: self.R, self.R: self.D})
+            self.assertEqual(sorted(reads), ["/events/KXFOOLEG-99DEC29",
+                                             "/events/KXFOOLEG-99DEC30",
+                                             "/events/" + self.EV])
+            # inside the TTL nothing is read again; after it, everything is
+            bot._refresh_comp_pairs(metas, 1000.0 + imm.COMP_PAIR_TTL_SECS - 1)
+            self.assertEqual(len(reads), 3)
+            bot._refresh_comp_pairs(metas, 1000.0 + imm.COMP_PAIR_TTL_SECS + 1)
+            self.assertEqual(len(reads), 6)
+            # a market that closed early (accelerated determination) unpairs
+            client2, _r = self._event_client({self.EV: rec(True, self.D, self.R,
+                                                           status="closed")})
+            bot.client = client2
+            bot._refresh_comp_pairs(metas, 1000.0 + 3 * imm.COMP_PAIR_TTL_SECS)
+            self.assertEqual(bot._comp_pairs, {})
+
+    def _feed(self, d_yes, d_no, r_yes, r_no):
+        feed = _FakeFeed()
+
+        def dollars(levels):
+            return {round(px / 100.0, 4): float(q) for px, q in levels}
+        feed.books[self.D] = (dollars(d_yes), dollars(d_no))
+        feed.books[self.R] = (dollars(r_yes), dollars(r_no))
+        return feed
+
+    def _cycle(self, mode):
+        _clean_persist()
+        D, R = self.D, self.R
+
+        class _PairClient(FakeClient):
+            def __init__(self_):
+                super().__init__()
+                now = datetime.now(timezone.utc)
+                start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self_.programs = [
+                    {"market_ticker": t, "incentive_type": "liquidity",
+                     "period_reward": 7000000, "target_size_fp": "1000.00",
+                     "discount_factor_bps": 5000, "paid_out": False,
+                     "start_date": start, "end_date": end} for t in (D, R)]
+                self_.markets = {t: {
+                    "ticker": t, "event_ticker": self.EV, "status": "active",
+                    "close_time": far, "yes_bid_dollars": bid, "yes_ask_dollars": ask,
+                    "volume_fp": "3000.00"} for t, bid, ask in (
+                        (D, "0.1600", "0.7400"), (R, "0.1500", "0.2900"))}
+
+                def fp(yes, no):
+                    return {"orderbook_fp": {
+                        "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in yes],
+                        "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in no]}}
+                self_.books = {D: fp(self.D_YES, self.D_NO), R: fp(self.R_YES, self.R_NO)}
+
+            def get(self_, path, params=None):
+                if path == f"/events/{self.EV}":
+                    return {"event": {"mutually_exclusive": True, "markets": [
+                        {"ticker": D, "status": "active"},
+                        {"ticker": R, "status": "active"}]}}
+                return super().get(path, params)
+
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "COMP_LEAD_MODE", mode), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}), \
+                mock.patch.object(imm, "ELECTION_DATES", imm._parse_election_dates(
+                    f"{self.EV}*=2099-12-31")), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=_PairClient(), live=False)
+            bot._ws = self._feed(self.D_YES, self.D_NO, self.R_YES, self.R_NO)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+        rungs = {(o["ticker"], o["book_side"]): (o["yes_price"], int(o["remaining_count"]))
+                 for o in bot.state.sim_orders.values()
+                 if imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+        return bot, rungs, lines
+
+    def test_quote_loop_leads_d_with_200_and_leaves_r_alone(self):
+        bot, rungs, lines = self._cycle("on")
+        self.assertIn(self.D, bot.state.selected)
+        self.assertEqual(rungs[(self.D, "bid")], (26, 200))
+        self.assertEqual(rungs[(self.D, "ask")][0], 89)          # its own reference
+        self.assertEqual(rungs[(self.R, "bid")][0], 11)
+        self.assertEqual(rungs[(self.R, "ask")][0], 30)
+        self.assertEqual(bot._comp_lead_px, {self.D: (26, None, 200)})
+        self.assertTrue(any("comp lead KXFOOLEG-99DEC31-D bid: 200 @ 26c, ahead of its "
+                            "own 16c; KXFOOLEG-99DEC31-R's book implies 70c" in s
+                            for s in lines), lines)
+
+    def test_dry_logs_and_rests_at_the_reference(self):
+        bot, rungs, lines = self._cycle("dry")
+        self.assertNotIn((self.D, "bid"), {k for k, v in rungs.items() if v[0] == 26})
+        self.assertEqual(bot._comp_lead_px, {})
+        self.assertTrue(any("comp lead (dry) KXFOOLEG-99DEC31-D bid" in s for s in lines))
+
+    def test_fast_cancel_judges_a_lead_on_its_twin(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        cancelled = []
+        bot.cancel_order = lambda oid, reason="": cancelled.append(oid) or True
+        bot._comp_pairs = {self.D: self.R, self.R: self.D}
+        bot._comp_lead_px = {self.D: (26, None, 200)}
+        bot._resting_view = {self.D: [{"order_id": "lead", "side": "bid", "px": 26.0,
+                                       "rem": 200.0, "placed": now - 100, "pad": False}]}
+        d_yes = self.D_YES + [[26, 200]]           # our lead is in D's book
+        with mock.patch.object(imm, "WS_MODE", "on"), \
+                mock.patch.object(imm, "WS_FAST", True), \
+                mock.patch.object(imm, "WS_FAST_MIN_GAP_C", 10.0), \
+                mock.patch.object(imm, "WS_FAST_CONFIRM_HOLDOUT", 0.0):
+            # R's 30c offer implies a 70c bid: the lead is 44c under it
+            bot._ws = self._feed(d_yes, self.D_NO, self.R_YES, self.R_NO)
+            self.assertEqual(bot._ws_fast_check({self.R}, now), 0)
+            self.assertEqual(bot._ws_fast_check({self.R}, now + 2), 0)
+            self.assertEqual(cancelled, [])
+            # R's offers pulled down to 66c+ (implies 34c): still under it
+            bot._ws = self._feed(d_yes, self.D_NO, self.R_YES,
+                                 [[25, 213], [32, 1815], [33, 978], [34, 1]])
+            self.assertEqual(bot._ws_fast_check({self.R}, now + 4), 0)
+            self.assertEqual(bot._ws_fast_check({self.R}, now + 6), 0)
+            # no R book on the feed: D's own 16c is the touch, 10c behind the
+            # lead -- the stale-rung cancel takes it (a move on R re-checks D)
+            feed = self._feed(d_yes, self.D_NO, self.R_YES, self.R_NO)
+            del feed.books[self.R]
+            bot._ws = feed
+            bot._ws_fast_check({self.R}, now + 8)
+            bot._ws_fast_check(set(), now + 10)
+            self.assertEqual(cancelled, ["lead"])
+
+    def test_estimate_scores_the_lead(self):
+        _clean_persist()
+        D, R = self.D, self.R
+
+        class _BookClient(FakeClient):
+            def get_orderbook(self_, ticker, depth=None):
+                yes, no = (self.D_YES, self.D_NO) if ticker == D else (self.R_YES, self.R_NO)
+                return {"orderbook_fp": {
+                    "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in yes],
+                    "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in no]}}
+
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]):
+            bot = IncentiveMarketMaker(client=_BookClient(), live=False)
+            bot._ws = self._feed(self.D_YES, self.D_NO, self.R_YES, self.R_NO)
+            meta = self._meta(D)
+            bot._estimate_candidate_yield(meta, [])
+            plain = meta.est_frac
+            bot._comp_pairs = {D: R, R: D}
+            bot._estimate_candidate_yield(meta, [])
+            self.assertLess(plain, 0.02)
+            self.assertGreater(meta.est_frac, 0.45)
+            with mock.patch.object(imm, "COMP_LEAD_MODE", "dry"):
+                bot._estimate_candidate_yield(meta, [])
+                self.assertAlmostEqual(meta.est_frac, plain)
+
+
 class TestLoneReferenceGuard(unittest.TestCase):
     """2026-10-16, after the LoL Worlds props were baited: one target/5 order
     inside a wide spread IS the at-reference price, so a 200-lot walked our
