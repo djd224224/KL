@@ -29821,6 +29821,31 @@ class TestComplementLead(unittest.TestCase):
         self.assertEqual(imm.comp_lead_prices(yes, no, [], [[70, 3000.0]],
                                               1000.0, 0.5), (None, None))
 
+    def test_a_leading_side_never_moves_up(self):
+        # 10/29 01:28Z: a 1,000-lot joined the D lead at each price and the
+        # fresh rule re-led 7-8c ahead of it, 26c -> 56c in a minute
+        wall = [[15, 13238.0], [16, 21.0]]
+        joined = wall + [[26, 1000.0]]
+        r_no = self.R_NO
+        self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5)[0], 33)   # fresh: chases
+        self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5, hold=26),
+                         (26, 69, 16))                                          # held: stays
+        # stepped ahead of (an order at 30c): still held, not chased
+        self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
+                                            hold=26)[0], 26)
+        # uncontested, the wall below gone: down to the new cheapest price,
+        # but not for a move under 3c
+        thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
+        self.assertEqual(imm.comp_side_lead(thin, r_no, 1000.0, 0.5, hold=26)[0], 18)
+        self.assertEqual(imm.comp_side_lead(wall, r_no, 1000.0, 0.5, hold=27)[0], 27)
+        # a hold above the cap leads afresh (R's offer gone up: cap 39c)
+        self.assertEqual(imm.comp_side_lead(wall, [[40, 3000.0]], 1000.0, 0.5,
+                                            hold=56), (26, 39, 16))
+        # the pair: holds are YES cents on both sides
+        lb, la = imm.comp_lead_prices(joined, self.D_NO, self.R_YES, self.R_NO,
+                                      1000.0, 0.5, hold_bid=26)
+        self.assertEqual((lb[0], la), (26, None))
+
     def test_scope(self):
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
                 mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):

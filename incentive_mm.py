@@ -19516,13 +19516,20 @@ def comp_lead_band_ok(px: int, band: Optional[Tuple[int, int]], series: str) -> 
 
 
 def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]],
-                   target: float, df: float) -> Optional[Tuple[int, int, int]]:
+                   target: float, df: float,
+                   hold: Optional[int] = None) -> Optional[Tuple[int, int, int]]:
     """ONE side's lead in that side's own price space (YES cents for the bid
     side, NO cents for the ask side; higher = more aggressive): (price, cap,
     own external best), or None. `own_levels`: the market's external side;
     `twin_levels`: the twin's levels that price it (the twin's NO bids for our
     bid side, its YES bids for our ask side). A side that cannot reach the
-    target with the lead in it does not lead."""
+    target with the lead in it does not lead.
+    `hold`: the price the side already leads at. A leading side NEVER moves
+    up (10/29 01:28Z: a 1,000-lot joined the Wisconsin D lead at each price,
+    and re-leading 7-8c ahead of it walked the bid 26c -> 56c in a minute
+    for the same 1/6 share). Held, it stays put while anything external rests
+    at or above it, and moves down only when nothing does and the book below
+    lets a price 3c+ lower take the share; above the cap it leads afresh."""
     n = comp_lead_size(target)
     if n <= 0:
         return None
@@ -19531,27 +19538,48 @@ def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]]
         return None
     cap = min(ref - COMP_LEAD_MARGIN_C, 99)
     own = levels_desc(own_levels)
+
+    def cheapest(levels: List[Tuple[int, float]]) -> Optional[int]:
+        top = levels[0][0] if levels else 0
+        for px in range(top + 1, cap + 1):
+            s, ok = _side_share([(px, float(n))] + levels, {px: float(n)}, target, df)
+            if ok and s >= COMP_LEAD_SHARE:
+                return px
+        return None
+
+    if hold is not None and hold <= cap:
+        below = [(p, q) for p, q in own if p < hold]
+        at_or_above = [(p, q) for p, q in own if p >= hold]
+        held = sorted(at_or_above + [(hold, float(n))], key=lambda kv: -kv[0])
+        if not _side_share(held + below, {hold: float(n)}, target, df)[1]:
+            return None
+        if not at_or_above:
+            px = cheapest(below)
+            if px is not None and px <= hold - 3:
+                return px, cap, (below[0][0] if below else 0)
+        return hold, cap, (below[0][0] if below else 0)
     best = own[0][0] if own else 0
     if cap <= best:
         return None
-    for px in range(best + 1, cap + 1):
-        s, ok = _side_share([(px, float(n))] + own, {px: float(n)}, target, df)
-        if ok and s >= COMP_LEAD_SHARE:
-            return px, cap, best
-    return None
+    px = cheapest(own)
+    return None if px is None else (px, cap, best)
 
 
 def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]],
                      twin_yes: List[List[float]], twin_no: List[List[float]],
-                     target: float, df: float
+                     target: float, df: float,
+                     hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
                      ) -> Tuple[Optional[Tuple[int, int, int]],
                                 Optional[Tuple[int, int, int]]]:
     """(bid lead, ask lead) for a market from its twin's book, both books
     EXTERNAL: each None or (price, cap, own external best) in YES cents, the
-    ask's in YES-ask cents. A lead never crosses the market's own other side,
-    and two leads that would cross each other both stand down."""
-    lb = comp_side_lead(yes_levels, twin_no, target, df)
-    ln = comp_side_lead(no_levels, twin_yes, target, df)
+    ask's in YES-ask cents. `hold_bid` / `hold_ask` (YES cents): where a side
+    already leads (comp_side_lead never moves it up). A lead never crosses
+    the market's own other side, and two leads that would cross each other
+    both stand down."""
+    lb = comp_side_lead(yes_levels, twin_no, target, df, hold=hold_bid)
+    ln = comp_side_lead(no_levels, twin_yes, target, df,
+                        hold=None if hold_ask is None else 100 - hold_ask)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
     eb, ea = external_best(yes_levels, no_levels)
     if lb is not None and ea is not None and lb[0] >= ea:
@@ -27198,8 +27226,11 @@ class IncentiveMarketMaker:
         own_t = self._comp_own.get(twin, []) if self.live else []
         if own_t:
             ty, tn = external_levels(ty, tn, own_t)
+        # where its sides lead now: a leading side never moves up
+        held = self._comp_lead_px.get(meta.ticker) or (None, None, 0)
         return comp_lead_prices(yes_ext, no_ext, ty, tn,
-                                meta.target_size, meta.discount_factor)
+                                meta.target_size, meta.discount_factor,
+                                hold_bid=held[0], hold_ask=held[1])
 
     def _comp_lead_note(self, t: str, lead_b, lead_a, n: int) -> None:
         """Log each side's complement lead when it starts, stops or moves
@@ -30524,6 +30555,17 @@ class IncentiveMarketMaker:
                     and ca_caps is None and rain_caps is None):
                 _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_in_book)
                                    if own_in_book else (yes_levels, no_levels))
+                if t not in self._comp_lead_px and own_in_book:
+                    # after a restart: a resting rung of exactly the lead size
+                    # is where that side leads (it must not move up either)
+                    _hb = max((px for s, px, r in own_in_book if s == "bid"
+                               and abs(r - lead_n) < 0.5 and px > PAD_BID_CENTS),
+                              default=None)
+                    _ha = min((px for s, px, r in own_in_book if s == "ask"
+                               and abs(r - lead_n) < 0.5 and px < PAD_ASK_CENTS),
+                              default=None)
+                    if _hb is not None or _ha is not None:
+                        self._comp_lead_px[t] = (_hb, _ha, lead_n)
                 lead_b, lead_a = self._comp_lead(meta, _lx_yes, _lx_no)
                 if lead_b is not None and not (bid_in_band and comp_lead_band_ok(
                         lead_b[0], (rung_lo, pmax_s), meta.series)):
