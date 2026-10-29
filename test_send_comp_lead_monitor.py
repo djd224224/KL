@@ -69,6 +69,8 @@ class TestLeads(unittest.TestCase):
         d = p["leads"][("KXW-26-D", "bid")]
         self.assertEqual(d["spans"], [[_ts(9), _ts(10)], [_ts(10, 1), b]])
         self.assertEqual((d["px"], d["best"], d["implied"]), (21, 15, 70))
+        self.assertEqual(d["pxs"], [26, 21])                 # the prices it moved through
+        self.assertEqual(k["pxs"], [57])                     # the 02:00Z one is before the day
         self.assertTrue(d["leading_at_end"])
         self.assertNotIn(("KXLATE-1", "ask"), p["leads"])
 

@@ -150,9 +150,11 @@ def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
             if ts >= b_ts:
                 continue
             key = (m.group(3), m.group(4))
-            ld = leads.setdefault(key, {"spans": [], "open": None})
+            ld = leads.setdefault(key, {"spans": [], "open": None, "pxs": []})
             if ld["open"] is None:
                 ld["open"] = ts
+            if a_ts <= ts:
+                ld["pxs"].append(int(m.group(6)))
             ld.update(px=int(m.group(6)), best=int(m.group(7)), who=m.group(8),
                       implied=int(m.group(9)), dry=bool(m.group(2)), size=int(m.group(5)))
             continue
@@ -312,10 +314,12 @@ def render_text(ctx) -> str:
                 f"{len(now_leading)} leading at the day's end."]
     for (t, side), v in sorted(leads.items(), key=lambda kv: kv[0]):
         hrs = sum(e - s for s, e in v["spans"]) / 3600.0
+        pxs = v.get("pxs") or []
+        moved = (f", moved {min(pxs)}-{max(pxs)}c" if pxs and min(pxs) != max(pxs) else "")
         est = ctx["est"].get(t)
         est_s = f"; est now ${est[0]:.2f}/day ({100 * est[1]:.0f}% of pool)" if est else ""
         out.append(f"  {t} {side}: {v.get('size', 200)} @ {v['px']}c, own best "
-                   f"{v['best']}c, siblings imply {v['implied']}c; led {hrs:.1f}h"
+                   f"{v['best']}c, siblings imply {v['implied']}c; led {hrs:.1f}h{moved}"
                    + (" (dry)" if v.get("dry") else "")
                    + ("" if v["leading_at_end"] else ", ended") + est_s)
     fills = ctx["fills"]
