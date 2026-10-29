@@ -910,6 +910,11 @@ class SeriesSizeTests(unittest.TestCase):
             ladders = {"KXLAD": 15}                        # a hand ladder, x1
             parents = {"KXHIGHNY": "KXHIGHFAMILY"}         # a member, cloned at refresh
             loaded = []
+            logged = []
+
+            @classmethod
+            def log(cls, msg):
+                cls.logged.append(msg)
 
             @classmethod
             def load_hight_fair(cls):
@@ -919,6 +924,7 @@ class SeriesSizeTests(unittest.TestCase):
             def ensure_family_override(cls, s):
                 if s in cls.parents:
                     cls.overrides[s] = 5.0
+                    FakeImm.log(f"[IMM] {s}: family override inherited")   # the module's global
 
             @classmethod
             def series_side_max(cls, s):
@@ -938,6 +944,10 @@ class SeriesSizeTests(unittest.TestCase):
         self.assertEqual(out, {"KXHIGHNY": [5.0, 1.0], "KXLAD": [0.75, 1.0], "KXRT": [3.0, 1.0],
                                "KXTEST": [1.5, 1.5]})
         self.assertEqual(FakeImm.loaded, ["high"])         # the temp members, before the clone
+        # the clones log nothing on the page's log; the bot's log is back after
+        self.assertEqual(FakeImm.logged, [])
+        FakeImm.log("after")
+        self.assertEqual(FakeImm.logged, ["after"])
         self.assertEqual(dash.series_sizes(None, {"KXRT"}), {})
 
 

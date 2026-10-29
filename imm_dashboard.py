@@ -723,7 +723,9 @@ def long_dated_hour_mults(imm, et_day) -> list:
 # A family member (a KXHIGH city, a card-spend series, an election) takes its
 # parent's size only once cloned, as the bot's refresh does, so each series
 # is cloned first; the temperature families' members come from their fair
-# files.
+# files. The clones' "family override inherited" lines are the bot's to log,
+# not the page's: ~300 a build every 10 minutes cut the 2 MB task log to a
+# few hours, so the bot's log is muted while they run.
 def series_sizes(imm, series) -> dict:
     """{series: [size multiplier now, the size test's part of it]} off the
     bot's own functions, or {} when the bot did not import."""
@@ -737,13 +739,20 @@ def series_sizes(imm, series) -> dict:
     clone = getattr(imm, "ensure_family_override", lambda s: None)
     base = float(sum(s for _t, s in imm.LEVELS)) or 1.0
     out = {}
-    for s in sorted(series):
-        try:
-            clone(s)
-            out[s] = [round(imm.series_side_max(s) * imm.applied_mention_mult(s) / base, 3),
-                      round(imm.size_test_mult(s), 3)]
-        except Exception:                       # one series must not cost the rest
-            continue
+    bot_log = getattr(imm, "log", None)
+    if bot_log is not None:
+        imm.log = lambda *a, **k: None
+    try:
+        for s in sorted(series):
+            try:
+                clone(s)
+                out[s] = [round(imm.series_side_max(s) * imm.applied_mention_mult(s) / base, 3),
+                          round(imm.size_test_mult(s), 3)]
+            except Exception:                   # one series must not cost the rest
+                continue
+    finally:
+        if bot_log is not None:
+            imm.log = bot_log
     return out
 
 
