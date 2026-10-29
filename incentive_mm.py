@@ -10944,7 +10944,7 @@ _CONFIG_CODE_KNOBS = (
     # monthly rain gate (2026-10-01); model knobs ride in its file's "model"
     "RAIN_MONTHLY_ENABLE", "RAIN_MONTHLY_TOL_CENTS", "RAIN_MONTHLY_TTL_MIN",
     "RAIN_MONTHLY_DRY_MIN", "RAIN_MONTHLY_CUTOFF_FROM_CLOSE_MIN",
-    "RAIN_MONTHLY_ONE_SIDE",
+    "RAIN_MONTHLY_ONE_SIDE", "RAIN_MONTHLY_BUY_ONLY",
     # period rain totals (2026-10-04) on the same file and gate
     "RAIN_PERIOD_ENABLE", "RAIN_PERIOD_TOL_CENTS", "RAIN_PERIOD_CAP",
     "RAIN_PERIOD_CUTOFF_FROM_CLOSE_MIN", "RAIN_PERIOD_SIZE_MULT",
@@ -13204,8 +13204,9 @@ def share_gate_reason(ticker: str, now_ts: float,
 #   - the event's last CLI is stale (rain_monthly.STALE_CLI_HOURS),
 #   - its strike sits within the writer's BOUNDARY_IN of the month-to-date,
 #   - its touch fights the fair on the adverse side by more than
-#     RAIN_MONTHLY_TOL_CENTS -- since 2026-10-29 only that side: the other
-#     quotes alone while it clears the payout floor (RAIN_MONTHLY_ONE_SIDE).
+#     RAIN_MONTHLY_TOL_CENTS -- since 2026-10-29, on the bid side, only the
+#     bids: the asks quote alone while they clear the payout floor
+#     (RAIN_MONTHLY_ONE_SIDE).
 # Size and band stay the rain family's (5-90c, global ladder, the KXRAIN
 # evening halving); no per-event cap. Kill switch IMM_RAIN_MONTHLY_ENABLE=0.
 RAIN_MONTHLY_ENABLE = _RAIN_MONTHLY_LIVE
@@ -13429,8 +13430,11 @@ def _cap_band_breach(why: str, inp: dict, tol: float, cap: bool
 # (not even capped at fair + tol as the period markets' RAIN_PERIOD_CAP
 # does: a capped bid that still earns buys what the model calls 10c dear)
 # and the other side joins the touch, resting only while the scored walk
-# reaches it (drop_unearning_sides) -- sell only on a bid breach, buy only
-# on an ask breach. A member still pads the rungless side at 1c where its
+# reaches it (drop_unearning_sides): sell only on a bid breach. An ask
+# breach (offers under fair - tol) still parks both sides -- Jack approved
+# selling; buying only is RAIN_MONTHLY_BUY_ONLY, off (at the 23:47Z restart
+# that was KXRAINSGFM-26NOV-4..7 and KXRAINWPBM-26NOV-1, bid 5-81c under
+# fairs of 24-93c). A member still pads the rungless side at 1c where its
 # book is under the target (a one-sided snapshot pays nobody). ABOVE THE
 # PAYOUT FLOOR: the selection's probe sees the same one side
 # (rain_monthly_side_out), so the reward estimate and the floor projection
@@ -13440,6 +13444,7 @@ def _cap_band_breach(why: str, inp: dict, tol: float, cap: bool
 # it) -- no 30-minute dip allowance; it stands aside meanwhile.
 # IMM_RAIN_MONTHLY_ONE_SIDE=0 parks both sides again.
 RAIN_MONTHLY_ONE_SIDE = os.environ.get("IMM_RAIN_MONTHLY_ONE_SIDE", "1") == "1"
+RAIN_MONTHLY_BUY_ONLY = os.environ.get("IMM_RAIN_MONTHLY_BUY_ONLY", "0") == "1"
 
 
 def rain_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
@@ -13449,8 +13454,11 @@ def rain_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     (RAIN_MONTHLY_ONE_SIDE): ('', {}, None) to quote at the touch; ('',
     inputs, caps) when inputs' `side_out` -- the side that fights the fair
     -- rests no rung (the caps are the period markets' and never move the
-    other side); else (why, guard-skip inputs, None): stand aside."""
+    other side); else (why, guard-skip inputs, None): stand aside, as an
+    ask breach does unless RAIN_MONTHLY_BUY_ONLY."""
     why, inp = rain_monthly_gate_reason(ticker, now_ts, ext_bid, ext_ask)
+    if inp.get("reason") == "band" and inp.get("ask_bad") and not RAIN_MONTHLY_BUY_ONLY:
+        return why, inp, None
     why, inp, caps = _cap_band_breach(why, inp, RAIN_MONTHLY_TOL_CENTS,
                                       RAIN_MONTHLY_ONE_SIDE)
     if caps is not None:
@@ -31137,9 +31145,9 @@ class IncentiveMarketMaker:
 
             # MONTHLY RAIN GATE (Jack 2026-10-01, see RAIN_MONTHLY_ENABLE): the
             # daily rain gate's stand-aside on the monthly model, failing
-            # CLOSED, and out while it rains at the station; a band breach
-            # quotes the side that does not fight the fair alone, while the
-            # market clears the payout floor (RAIN_MONTHLY_ONE_SIDE). The period
+            # CLOSED, and out while it rains at the station; bids over the
+            # fair + tol leave the asks quoting alone, while the market
+            # clears the payout floor (RAIN_MONTHLY_ONE_SIDE). The period
             # totals (2026-10-04, RAIN_PERIOD_ENABLE) ride the same gate on
             # the same file; a band breach there caps the side that fights
             # the fair -- rain_caps, applied last below, where only a side
@@ -34746,7 +34754,9 @@ class IncentiveMarketMaker:
         if RAIN_MONTHLY_ENABLE:
             log(f"rain-monthly gate: {','.join(sorted(RAIN_MONTHLY_SERIES))} "
                 f"fail-closed at-touch, tol {RAIN_MONTHLY_TOL_CENTS}c ("
-                + ("a breach quotes the other side alone, above the payout floor"
+                + (("a breach quotes the other side alone, above the payout floor"
+                    if RAIN_MONTHLY_BUY_ONLY else "a bid breach sells only, above the "
+                    "payout floor; an ask breach parks both sides")
                    if RAIN_MONTHLY_ONE_SIDE else "a breach parks both sides")
                 + f"), out while "
                 f"it rains at the station + {RAIN_MONTHLY_DRY_MIN:g}m, cutoff "

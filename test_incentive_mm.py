@@ -12383,8 +12383,9 @@ class TestRainMonthlyGate(unittest.TestCase):
 
     def test_a_band_breach_quotes_the_other_side_alone(self):
         # Jack 2026-10-29: "Yes sell only, as long as it is above payout
-        # threshold" -- bids over fair + 10c leave the asks alone, offers
-        # under fair - 10c the bids; inside the tolerance both sides
+        # threshold" -- bids over fair + 10c leave the asks alone; offers
+        # under fair - 10c still park both sides (buying only is
+        # RAIN_MONTHLY_BUY_ONLY); inside the tolerance both sides quote
         g = imm.rain_monthly_gate
         self._write(p=0.5)
         self.assertEqual(g(self.T, time.time(), 49, 51), ("", {}, None))
@@ -12393,7 +12394,12 @@ class TestRainMonthlyGate(unittest.TestCase):
         self.assertEqual((why, caps, inp["side_out"]), ("", (40, 20), "bid"))
         self._write(p=0.70)                                       # ask 51 < 70 - 10
         why, inp, caps = g(self.T, time.time(), 49, 51)
+        self.assertTrue(why)
+        self.assertEqual((inp["reason"], inp["ask_bad"], caps), ("band", True, None))
+        with mock.patch.object(imm, "RAIN_MONTHLY_BUY_ONLY", True):
+            why, inp, caps = g(self.T, time.time(), 49, 51)
         self.assertEqual((why, caps, inp["side_out"]), ("", (80, 60), "ask"))
+        self.assertIn("RAIN_MONTHLY_BUY_ONLY", imm._CONFIG_CODE_KNOBS)
         # every other stand-aside still parks both sides
         self._write(p=0.30, wet=True, last_wet_mins=0)
         why, inp, caps = g(self.T, time.time(), 49, 51)
@@ -12433,9 +12439,14 @@ class TestRainMonthlyGate(unittest.TestCase):
         self.assertIn(("bid", 49), q)
         self.assertIn(("ask", 51), q)
         self.assertNotIn(self.T, bot._rain_period_capped)
-        # offers under fair - 10: buy only
+        # offers under fair - 10: parked, both sides -- buying only waits
+        # for RAIN_MONTHLY_BUY_ONLY
         self._write(p=0.70)
         bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._rain_monthly_stood)
+        with mock.patch.object(imm, "RAIN_MONTHLY_BUY_ONLY", True):
+            bot.run_cycle()
         q = self._quotes(bot)
         self.assertIn(("bid", 49), q)
         self.assertEqual({s for s, _ in q}, {"bid"}, q)
