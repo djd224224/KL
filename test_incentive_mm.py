@@ -29830,9 +29830,10 @@ class TestComplementLead(unittest.TestCase):
         self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5)[0], 33)   # fresh: chases
         self.assertEqual(imm.comp_side_lead(joined, r_no, 1000.0, 0.5, hold=26),
                          (26, 69, 16))                                          # held: stays
-        # stepped ahead of (an order at 30c): still held, not chased
-        self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=26)[0], 26)
+        # stepped ahead of (an order at 30c): not chased -- the lead ends and
+        # plain placement joins that order (Jack 10/29: "actually dont stay low")
+        self.assertIsNone(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
+                                             hold=26))
         # a joiner at a price the chase reached does not pin it there: back
         # down to the cheapest price ahead of the book below (it may follow)
         self.assertEqual(imm.comp_side_lead(wall + [[56, 1000.0]], r_no, 1000.0, 0.5,
@@ -29850,12 +29851,12 @@ class TestComplementLead(unittest.TestCase):
                                       1000.0, 0.5, hold_bid=26)
         self.assertEqual((lb[0], la), (26, None))
 
-    def test_an_outbid_side_stays_low_across_a_restart_and_a_drop_out(self):
-        # Jack 2026-10-29 "Stay low": the copier sat alone at 66c over our
-        # 21c lead. A bot that forgot the lead (restart, or D dropped and
-        # re-estimated) read it fresh: no lead above 66c under the 69c cap,
-        # so the at-reference rung joined the copier. The hold file keeps it.
-        d_yes = [[1, 1001], [2, 2004], [3, 2], [15, 583], [66, 593]]
+    def test_an_outbid_lead_joins_and_is_not_chased_after_a_restart(self):
+        # Jack 2026-10-29 "actually dont stay low": an order resting ahead of
+        # the lead ends it (plain placement joins that order). The hold file
+        # keeps a restarted bot -- or a market that dropped out and came back
+        # -- from reading the book fresh and leading 7c past that order.
+        copier = [[1, 1001], [2, 2004], [15, 583], [30, 1000]]
         meta = self._meta(self.D)
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(imm, "STATUS_DIR", tmp), \
@@ -29863,23 +29864,149 @@ class TestComplementLead(unittest.TestCase):
                 mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
             _clean_persist()
             bot = IncentiveMarketMaker(client=FakeClient(), live=False)
-            bot._ws = self._feed(d_yes, self.D_NO, self.R_YES, self.R_NO)
+            bot._ws = self._feed(copier, self.D_NO, self.R_YES, self.R_NO)
+            bot._comp_groups = {self.D: (self.D, self.R), self.R: (self.D, self.R)}
             bot._comp_pairs = {self.D: self.R, self.R: self.D}
-            self.assertEqual(bot._comp_lead(meta, d_yes, self.D_NO), (None, None))
+            self.assertEqual(bot._comp_lead(meta, copier, self.D_NO)[0][0], 37)   # fresh: past it
             bot._note_comp_hold(self.D, 21, None, time.time())
             bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
             self.assertEqual(bot2._comp_holds[self.D][:2], [21, None])
-            bot2._ws, bot2._comp_pairs = bot._ws, bot._comp_pairs
-            self.assertEqual(bot2._comp_lead(meta, d_yes, self.D_NO)[0], (21, 69, 15))
+            bot2._ws = bot._ws
+            bot2._comp_groups, bot2._comp_pairs = bot._comp_groups, bot._comp_pairs
+            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO), (None, None))
             # a lapsed entry is forgotten
             bot2._comp_holds[self.D][2] = time.time() - imm.COMP_HOLD_TTL_SECS - 1
-            self.assertEqual(bot2._comp_lead(meta, d_yes, self.D_NO), (None, None))
+            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0][0], 37)
+
+    def test_the_sell_side_leads_in_a_many_market_event(self):
+        # KXKOREAPRES-30MAR27-JDON at 10/29 01:20Z: offered only at 71c behind
+        # 15,904, while the other 11 candidates are bid 62c between them (each
+        # walked to 200) -- it cannot be worth more than 38c. 200 at 60c, 11
+        # ticks ahead of the wall, takes ~97% of the ask side. No bid lead
+        # with 11 siblings (its floor is 100 - their asks).
+        jdon_yes = [[1, 2020], [2, 144], [5, 1000], [9, 4609]]
+        jdon_no = [[1, 2006], [2, 100], [3, 3348], [4, 48], [15, 1000], [27, 1], [29, 15904]]
+        sibs = [([[b, 5000.0]], [[29, 15000.0]]) for b in (10, 10, 11, 4, 4, 4, 3, 4, 2, 6, 4)]
+        lb, la = imm.comp_lead_group(jdon_yes, jdon_no, sibs, 1000.0, 0.5, bid_ok=True)
+        self.assertEqual((lb, la), (None, (60, 39, 71)))
+        # a sibling too thin to reach 200 sets no reference: no lead
+        thin = sibs[:-1] + [([[4, 150.0]], [[29, 15000.0]])]
+        self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no, thin, 1000.0, 0.5),
+                         (None, None))
+        # outside elections too (the sell side, any family)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            self.assertTrue(imm.comp_lead_series("KXGGWINNER"))
+            self.assertFalse(imm.comp_bid_lead_series("KXGGWINNER"))
+
+    def _hedge_bot(self, tmp, books):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        feed = _FakeFeed()
+        for t, (yes, no) in books.items():
+            feed.books[t] = ({round(px / 100.0, 4): float(q) for px, q in yes},
+                             {round(px / 100.0, 4): float(q) for px, q in no})
+        bot._ws = feed
+        grp = tuple(sorted(books))
+        bot._comp_groups = {t: grp for t in grp}
+        return bot
+
+    def _fill(self, t, side, action, count, px, oid="lead1", taker=False):
+        return {"order_id": oid, "ticker": t, "side": side, "action": action,
+                "count_fp": f"{count:.2f}", "yes_price_dollars": f"{px / 100:.4f}",
+                "is_taker": taker, "created_time": "2026-10-29T02:00:00Z"}
+
+    def test_a_filled_ask_lead_is_hedged_on_every_sibling(self):
+        # we sold 200 A at 60c; B and C are bid 20c and 25c (200+ deep each):
+        # selling 200 of each locks 60 + 20 + 25 - 100 = +5c a set
+        a, b, c = "KXFOOW-99DEC31-A", "KXFOOW-99DEC31-B", "KXFOOW-99DEC31-C"
+        books = {a: ([[5, 3000]], [[29, 15000]]),
+                 b: ([[18, 100], [20, 300]], [[60, 3000]]),
+                 c: ([[25, 900]], [[60, 3000]])}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(imm, "STATUS_DIR", tmp):
+            bot = self._hedge_bot(tmp, books)
+            bot._comp_lead_px[a] = (None, 60, 200)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot._book_fill(self._fill(a, "yes", "sell", 200, 60), 1000.0)
+                self.assertEqual(len(bot._comp_hedges), 1)
+                job = bot._comp_hedges[0]
+                self.assertEqual((job["side"], job["count"], sorted(job["legs"])),
+                                 ("ask", 200.0, [b, c]))
+                # persisted for a restart
+                self.assertEqual(len(IncentiveMarketMaker(
+                    client=FakeClient(), live=False)._comp_hedges), 1)
+                bot._comp_hedge_run(1001.0)          # dry run: sent, credited in full
+                self.assertTrue(any("comp hedge KXFOOW-99DEC31-B sell 200 YES @ 20c (IOC)"
+                                    in x for x in lines), lines)
+                self.assertTrue(any("KXFOOW-99DEC31-C sell 200 YES @ 25c" in x for x in lines))
+                bot._comp_hedge_run(1062.0)          # every leg full: done
+            self.assertEqual(bot._comp_hedges, [])
+            self.assertTrue(any("hedged on 2 sibling(s), +5.0c a set locked" in x
+                                for x in lines), lines)
+            # a taker fill, a fill away from the lead price, or a side not
+            # leading opens nothing
+            for f in (self._fill(a, "yes", "sell", 50, 60, taker=True),
+                      self._fill(a, "yes", "sell", 50, 61),
+                      self._fill(a, "yes", "buy", 50, 60)):
+                bot._book_fill(f, 1100.0)
+            self.assertEqual(bot._comp_hedges, [])
+
+    def test_a_hedge_waits_while_the_set_no_longer_clears(self):
+        a, b, c = "KXFOOW-99DEC31-A", "KXFOOW-99DEC31-B", "KXFOOW-99DEC31-C"
+        books = {a: ([[5, 3000]], [[29, 15000]]),
+                 b: ([[10, 300]], [[60, 3000]]),       # 60 + 10 + 25 = 95: a loss
+                 c: ([[25, 900]], [[60, 3000]])}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(imm, "STATUS_DIR", tmp):
+            bot = self._hedge_bot(tmp, books)
+            bot._comp_lead_px[a] = (None, 60, 200)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot._book_fill(self._fill(a, "yes", "sell", 200, 60), 1000.0)
+                bot._comp_hedge_run(1001.0)
+                bot._comp_hedge_run(1100.0)
+            job = bot._comp_hedges[0]
+            self.assertTrue(job["waiting"])
+            self.assertEqual([lg["filled"] for lg in job["legs"].values()], [0.0, 0.0])
+            self.assertEqual(sum("waits" in x for x in lines), 1)          # logged once
+            # the bids come back: it goes
+            bot._ws.books[b] = ({0.20: 300.0}, {0.60: 3000.0})
+            with mock.patch.object(imm, "log", lines.append):
+                bot._comp_hedge_run(1200.0)
+            self.assertEqual([lg["filled"] for lg in job["legs"].values()], [200.0, 200.0])
+            # ...and a job past its age gives up, unhedged legs named
+            bot._comp_hedges = [dict(job, at=0.0, legs={b: dict(job["legs"][b], filled=0.0)})]
+            with mock.patch.object(imm, "log", lines.append):
+                bot._comp_hedge_run(imm.COMP_HEDGE_MAX_AGE_SECS + 10.0)
+            self.assertEqual(bot._comp_hedges, [])
+            self.assertTrue(any("gave up" in x for x in lines))
+
+    def test_a_filled_bid_lead_buys_the_twin(self):
+        # the Wisconsin pair: we bought 200 D at 26c; R is offered at 30c
+        # (2,863): buying 200 R locks 100 - 26 - 30 = +44c a set (a tie aside)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(imm, "STATUS_DIR", tmp):
+            bot = self._hedge_bot(tmp, {self.D: (self.D_YES, self.D_NO),
+                                        self.R: (self.R_YES, self.R_NO)})
+            bot._comp_lead_px[self.D] = (26, None, 200)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot._book_fill(self._fill(self.D, "yes", "buy", 200, 26), 1000.0)
+                bot._comp_hedge_run(1001.0)
+                bot._comp_hedge_run(1062.0)
+            self.assertTrue(any("KXFOOLEG-99DEC31-R buy 200 YES @ 30c (IOC)" in x
+                                for x in lines), lines)
+            self.assertTrue(any("+44.0c a set locked" in x for x in lines), lines)
 
     def test_scope(self):
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
                 mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
             self.assertTrue(imm.comp_lead_series("KXFOOLEG"))
-            self.assertFalse(imm.comp_lead_series("KXGOOD"))
+            # the sell side leads in any family; the bid side in elections only
+            self.assertTrue(imm.comp_lead_series("KXGOOD"))
+            self.assertTrue(imm.comp_bid_lead_series("KXFOOLEG"))
+            self.assertFalse(imm.comp_bid_lead_series("KXGOOD"))
             with mock.patch.object(imm, "COMP_LEAD_SKIP", ("KXFOO",)):
                 self.assertFalse(imm.comp_lead_series("KXFOOLEG"))
             for mode, want in (("dry", True), ("off", False)):
@@ -29908,41 +30035,52 @@ class TestComplementLead(unittest.TestCase):
                 return events[ev]
         return _C(), reads
 
-    def test_pairs_come_from_the_event_record(self):
+    def test_groups_come_from_the_event_record(self):
         def rec(me, *tickers, status="active"):
             return {"event": {"mutually_exclusive": me, "markets": [
                 {"ticker": t, "status": status} for t in tickers]}}
+        dec29 = ("KXFOOLEG-99DEC29-A", "KXFOOLEG-99DEC29-B", "KXFOOLEG-99DEC29-C")
         client, reads = self._event_client({
             self.EV: rec(True, self.D, self.R),
             "KXFOOLEG-99DEC30": rec(False, "KXFOOLEG-99DEC30-A", "KXFOOLEG-99DEC30-B"),
-            "KXFOOLEG-99DEC29": rec(True, "KXFOOLEG-99DEC29-A", "KXFOOLEG-99DEC29-B",
-                                    "KXFOOLEG-99DEC29-C")})
+            "KXFOOLEG-99DEC29": rec(True, *dec29)})
         _clean_persist()
         bot = IncentiveMarketMaker(client=client, live=False)
         metas = [self._meta(t) for t in (
             self.D, self.R, "KXFOOLEG-99DEC30-A", "KXFOOLEG-99DEC30-B",
             "KXFOOLEG-99DEC29-A", "KXFOOLEG-99DEC29-B",      # 3 listed, 2 in programs
             "KXFOOLEG-99DEC28-A")]                           # one candidate: never read
-        metas += [self._meta(t, series="KXGOOD")             # not in scope
+        metas += [self._meta(t, series="KXGOOD")             # any family: read (fails)
                   for t in ("KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B")]
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
                 mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
             bot._refresh_comp_pairs(metas, 1000.0)
             self.assertEqual(bot._comp_pairs, {self.D: self.R, self.R: self.D})
+            # the 3-market event is a group of all three (one sibling outside
+            # the programs); the non-exclusive one is not
+            self.assertEqual(bot._comp_groups["KXFOOLEG-99DEC29-A"], dec29)
+            self.assertEqual(bot._comp_groups["KXFOOLEG-99DEC29-C"], dec29)
+            self.assertNotIn("KXFOOLEG-99DEC30-A", bot._comp_groups)
             self.assertEqual(sorted(reads), ["/events/KXFOOLEG-99DEC29",
                                              "/events/KXFOOLEG-99DEC30",
-                                             "/events/" + self.EV])
-            # inside the TTL nothing is read again; after it, everything is
-            bot._refresh_comp_pairs(metas, 1000.0 + imm.COMP_PAIR_TTL_SECS - 1)
-            self.assertEqual(len(reads), 3)
+                                             "/events/" + self.EV,
+                                             "/events/KXGOOD-99DEC31"])
+            # nothing is read again inside the TTL (a failed read waits 10 min)
+            bot._refresh_comp_pairs(metas, 1000.0 + 300)
+            self.assertEqual(len(reads), 4)
+            bot._refresh_comp_pairs(metas, 1000.0 + 700)
+            self.assertEqual(reads[-1], "/events/KXGOOD-99DEC31")
+            self.assertEqual(len(reads), 5)
             bot._refresh_comp_pairs(metas, 1000.0 + imm.COMP_PAIR_TTL_SECS + 1)
-            self.assertEqual(len(reads), 6)
-            # a market that closed early (accelerated determination) unpairs
+            self.assertEqual(len(reads), 9)
+            # a market that closed early (accelerated determination) ungroups
+            # it; a read that fails keeps the group it had
             client2, _r = self._event_client({self.EV: rec(True, self.D, self.R,
                                                            status="closed")})
             bot.client = client2
             bot._refresh_comp_pairs(metas, 1000.0 + 3 * imm.COMP_PAIR_TTL_SECS)
             self.assertEqual(bot._comp_pairs, {})
+            self.assertEqual(bot._comp_groups["KXFOOLEG-99DEC29-A"], dec29)
 
     def _feed(self, d_yes, d_no, r_yes, r_no):
         feed = _FakeFeed()
@@ -30034,6 +30172,7 @@ class TestComplementLead(unittest.TestCase):
         now = time.time()
         cancelled = []
         bot.cancel_order = lambda oid, reason="": cancelled.append(oid) or True
+        bot._comp_groups = {self.D: (self.D, self.R), self.R: (self.D, self.R)}
         bot._comp_pairs = {self.D: self.R, self.R: self.D}
         bot._comp_lead_px = {self.D: (26, None, 200)}
         bot._resting_view = {self.D: [{"order_id": "lead", "side": "bid", "px": 26.0,
@@ -30081,6 +30220,7 @@ class TestComplementLead(unittest.TestCase):
             meta = self._meta(D)
             bot._estimate_candidate_yield(meta, [])
             plain = meta.est_frac
+            bot._comp_groups = {D: (D, R), R: (D, R)}
             bot._comp_pairs = {D: R, R: D}
             bot._estimate_candidate_yield(meta, [])
             self.assertLess(plain, 0.02)

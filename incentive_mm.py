@@ -11114,6 +11114,7 @@ _CONFIG_CODE_KNOBS = (
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
+    "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -19444,68 +19445,96 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
                 base_ahead=ahead(base_px), gain_day=gain_day)
 
 
-# TWO-MARKET COMPLEMENT LEAD (Jack 2026-10-28: "in examples like this, you can
-# infer the implied price from the other side since it's a 2 sided market.
+# COMPLEMENT LEAD (Jack 2026-10-28: "in examples like this, you can infer the
+# implied price from the other side since it's a 2 sided market.
 # KXSTATELEG-WIASSEMBLY26-R. so you can be more confident to place a larger
-# order at front of the line and take up the 200 shares"). An event Kalshi
-# marks mutually exclusive with exactly two markets prices each market twice:
-# on its own book and on its twin's, since YES on one is NO on the other (a
-# tie, where both settle NO, is the gap). A NO bid on the twin at q is a YES
-# bid here at q, and a YES bid there at p is a YES ask here at 100 - p.
+# order at front of the line and take up the 200 shares"; 2026-10-29: "do
+# option 1. if bought, should place limit orders on the others to hedge it
+# out. and actually dont stay low"). In an event Kalshi marks mutually
+# exclusive at most one market settles YES, so every market is priced twice:
+# on its own book, and by its siblings' books.
+#   * SELL side, any such event in any family: a market cannot be worth more
+#     than 100 minus what its siblings are bid, so the siblings' YES bids, each
+#     walked to target/5, cap its YES ask: 100 - their summed references. That
+#     holds even if none of the listed markets wins.
+#   * BUY side, two-market election pairs only (comp_bid_lead_series): YES on
+#     one is NO on the other but for a tie (both settle NO), so the twin's NO
+#     bids are YES bids here. With more markets the floor (100 - the
+#     siblings' asks) needs one of them to win for certain, and it is useless
+#     anyway: Korea's comes out at -539c.
 # On 10/28 23:30Z the Wisconsin Assembly D book was 16c x 74c over walls of
 # 13,238 YES at 15c and 13,550 NO at 11c, while R's book (2,863 offered at
-# 30c) priced D at 70c bid. D's own bid side was a lowball wall 55c under
-# where anyone would sell D. At-reference placement sat behind that wall with
-# ~1% of the side, and D projected $0.79-0.86 for the final pre-election
-# period, under the $1 payout, so it stood down.
-# Under the program rules the first target/5 contracts from the best price
-# score full weight and the rest decays 0.5 per tick, so ONE rung of
-# target/5 (200 of a 1,000 target) ahead of the wall becomes the reference
-# and takes nearly the whole side: half the market's pool.
-# Per side, on the EXTERNAL books (our own orders netted out of both):
-#   * the twin's implied reference (cumulative target/5, the walk
-#     ladder_reference_prices uses) less COMP_LEAD_MARGIN_C is the CAP: a
-#     side never leads past the price the twin's depth backs;
-#   * a side leads only where that cap is ahead of its own external best,
-#     at the LOWEST price ahead of it where a target/5 rung takes
+# 30c) priced D at 70c bid: D's own bid side was a lowball wall 55c under
+# where anyone would sell D, at-reference placement sat behind it with ~1% of
+# the side, and D projected under the $1 payout and stood down. Under the
+# program rules the first target/5 contracts from the best price score full
+# weight and the rest decays 0.5 per tick, so ONE rung of target/5 (200 of a
+# 1,000 target) ahead of a wall becomes the reference and takes nearly the
+# whole side: half the market's pool.
+# Per side, on EXTERNAL books (our own orders netted out of all of them):
+#   * the implied reference less COMP_LEAD_MARGIN_C is the CAP: a side never
+#     leads past the price its siblings' depth backs;
+#   * a side leads only where that cap is ahead of its own external best, at
+#     the LOWEST price ahead of it where a target/5 rung takes
 #     COMP_LEAD_SHARE of the side's score (_side_share). The reward is the
 #     same anywhere far enough above the wall, and the cheapest such price is
-#     the furthest from the fair the twin implies (D: 26c, 44c under 70c);
+#     the furthest from the fair the siblings imply (D: 26c, 44c under 70c);
 #   * the rung rests at least target/5 (room permitting) inside the band,
 #     never crosses the market's own other side, and every other side guard
-#     still applies.
-# The WS fast cancel judges a leading rung against the touch the twin
-# implies as well as the market's own, and re-checks it whenever the twin's
-# book moves; with no twin book on the feed there is no lead.
-# Scope: the election family (comp_lead_series), whose two-way races (state
-# chambers D/R, attorneys general, House control) are the pairs Kalshi
-# lists. IMM_COMP_LEAD_SKIP drops series prefixes; IMM_COMP_LEAD=dry logs the
-# leads without placing them; off disables.
+#     still applies;
+#   * a leading side never moves UP: on 10/29 01:28Z a 1,000-lot joined the D
+#     lead at each price and re-leading 7-8c ahead of it walked the bid
+#     26c -> 56c in a minute for the same ~1/6 of the side. An order that
+#     only joins it at its price leaves it free to move down (3c+) where the
+#     book below allows; an order that steps AHEAD of it ends the lead, and
+#     the side falls back to plain at-reference placement, joining that order
+#     where it rests ("actually dont stay low"). Where each side last led is
+#     kept in STATUS_DIR (COMP_HOLD_FILE), so neither a restart nor a
+#     drop-out and return reads the book fresh and leads past such an order.
+# HEDGE (COMP_HEDGE_MODE): when a leading rung fills, the bot sells (an ask
+# filled) or buys (a bid filled) the same count on every sibling with
+# immediate-or-cancel limit orders, each at the price its sibling's book fills
+# that count at, while the whole set still clears COMP_HEDGE_EDGE_C per set:
+# the lead's price plus the siblings' sells over 100 (the set pays at most
+# 100), or 100 over the lead's price plus the siblings' buys (the pair pays
+# 100 but for a tie). What does not fill is retried each cycle on the same
+# test; open jobs are kept in STATUS_DIR (COMP_HEDGE_FILE) across restarts
+# and give up after COMP_HEDGE_MAX_AGE_SECS. Rows: comp_hedge_<date>.jsonl.
+# The WS fast cancel judges a leading rung against the touch its siblings
+# imply as well as its own, and re-checks it whenever a sibling's book moves;
+# with any sibling's book off the feed there is no lead.
+# IMM_COMP_LEAD_SKIP drops series prefixes; IMM_COMP_LEAD=dry logs the leads
+# without placing them, off disables; IMM_COMP_HEDGE=dry logs the hedges
+# without sending them, off disables.
 COMP_LEAD_MODE = os.environ.get("IMM_COMP_LEAD", "on").strip().lower()
 COMP_LEAD_SHARE = _env_float("IMM_COMP_LEAD_SHARE", 0.95)
 COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 1))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
     if p.strip())
-# Kalshi's event record pairs the markets: re-read every TTL, at most READS
+# Kalshi's event record groups the markets: re-read every TTL, at most READS
 # event reads per universe refresh
 COMP_PAIR_TTL_SECS = _env_float("IMM_COMP_PAIR_TTL_H", 12.0) * 3600.0
-COMP_PAIR_READS_PER_REFRESH = _env_int("IMM_COMP_PAIR_READS", 80)
-# Where each side last led, kept in STATUS_DIR (Jack 2026-10-29: "Stay low").
-# After the Wisconsin D lead walked back to 21c the copier sat on alone at
-# 66c. A side that forgot its lead -- a restart, or the market dropping out
-# and coming back -- read the book fresh and its at-reference rung joined the
-# copier up there. The remembered price is the hold comp_side_lead keeps:
-# never up, not past an order above it. An entry lapses after the TTL.
+COMP_PAIR_READS_PER_REFRESH = _env_int("IMM_COMP_PAIR_READS", 300)
 COMP_HOLD_FILE = "comp_lead_holds.json"
 COMP_HOLD_TTL_SECS = _env_float("IMM_COMP_HOLD_TTL_H", 168.0) * 3600.0
+COMP_HEDGE_MODE = os.environ.get("IMM_COMP_HEDGE", "on").strip().lower()
+COMP_HEDGE_EDGE_C = _env_float("IMM_COMP_HEDGE_EDGE_C", 2.0)
+COMP_HEDGE_FILE = "comp_hedge_jobs.json"
+COMP_HEDGE_MAX_AGE_SECS = _env_float("IMM_COMP_HEDGE_MAX_AGE_H", 48.0) * 3600.0
 
 
 def comp_lead_series(series: str) -> bool:
-    """May this series' markets lead off their twin's book at all?"""
+    """May this series' markets lead off their siblings' books at all? (The
+    sell side, any family since 2026-10-29.)"""
     if COMP_LEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
         return False
-    return election_series(series) and not series.startswith(COMP_LEAD_SKIP)
+    return not series.startswith(COMP_LEAD_SKIP)
+
+
+def comp_bid_lead_series(series: str) -> bool:
+    """...and may its bid side lead (a two-market election pair's only)?"""
+    return comp_lead_series(series) and election_series(series)
 
 
 def comp_lead_size(target: float) -> int:
@@ -19523,28 +19552,20 @@ def comp_lead_band_ok(px: int, band: Optional[Tuple[int, int]], series: str) -> 
     return max(pmin, RUNG_DEEP_FLOOR) <= px <= min(pmax, STICKY_PRICE_MAX)
 
 
-def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]],
-                   target: float, df: float,
-                   hold: Optional[int] = None) -> Optional[Tuple[int, int, int]]:
+def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
+                       df: float, hold: Optional[int] = None
+                       ) -> Optional[Tuple[int, int, int]]:
     """ONE side's lead in that side's own price space (YES cents for the bid
     side, NO cents for the ask side; higher = more aggressive): (price, cap,
     own external best), or None. `own_levels`: the market's external side;
-    `twin_levels`: the twin's levels that price it (the twin's NO bids for our
-    bid side, its YES bids for our ask side). A side that cannot reach the
-    target with the lead in it does not lead.
-    `hold`: the price the side already leads at. A leading side NEVER moves
-    up (10/29 01:28Z: a 1,000-lot joined the Wisconsin D lead at each price,
-    and re-leading 7-8c ahead of it walked the bid 26c -> 56c in a minute
-    for the same 1/6 share). Held, it stays put while anything external rests
-    ABOVE it (stepped ahead of: not chased), and otherwise moves down when the
-    book below lets a price 3c+ lower take the share -- an order that only
-    JOINED it at its price does not pin it high, it is free to follow us
-    down; above the cap it leads afresh."""
+    `ref`: the reference its siblings imply, in the same space. A side that
+    cannot reach the target with the lead in it does not lead.
+    `hold`: the price the side already leads at. It never moves up: an order
+    resting AHEAD of it ends the lead (None: plain placement joins that
+    order), and otherwise it moves down when the book below lets a price 3c+
+    lower take the share; a hold above the cap leads afresh."""
     n = comp_lead_size(target)
     if n <= 0:
-        return None
-    ref = side_reference_level(levels_desc(twin_levels), target)
-    if ref is None:
         return None
     cap = min(ref - COMP_LEAD_MARGIN_C, 99)
     own = levels_desc(own_levels)
@@ -19560,13 +19581,14 @@ def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]]
     if hold is not None and hold <= cap:
         below = [(p, q) for p, q in own if p < hold]
         at_or_above = [(p, q) for p, q in own if p >= hold]
+        if any(p > hold for p, _q in at_or_above):
+            return None
         held = sorted(at_or_above + [(hold, float(n))], key=lambda kv: -kv[0])
         if not _side_share(held + below, {hold: float(n)}, target, df)[1]:
             return None
-        if not any(p > hold for p, _q in at_or_above):
-            px = cheapest(below)
-            if px is not None and px <= hold - 3:
-                return px, cap, (below[0][0] if below else 0)
+        px = cheapest(below)
+        if px is not None and px <= hold - 3:
+            return px, cap, (below[0][0] if below else 0)
         return hold, cap, (below[0][0] if below else 0)
     best = own[0][0] if own else 0
     if cap <= best:
@@ -19575,21 +19597,38 @@ def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]]
     return None if px is None else (px, cap, best)
 
 
-def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]],
-                     twin_yes: List[List[float]], twin_no: List[List[float]],
-                     target: float, df: float,
-                     hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
-                     ) -> Tuple[Optional[Tuple[int, int, int]],
-                                Optional[Tuple[int, int, int]]]:
-    """(bid lead, ask lead) for a market from its twin's book, both books
-    EXTERNAL: each None or (price, cap, own external best) in YES cents, the
-    ask's in YES-ask cents. `hold_bid` / `hold_ask` (YES cents): where a side
-    already leads (comp_side_lead never moves it up). A lead never crosses
-    the market's own other side, and two leads that would cross each other
-    both stand down."""
-    lb = comp_side_lead(yes_levels, twin_no, target, df, hold=hold_bid)
-    ln = comp_side_lead(no_levels, twin_yes, target, df,
-                        hold=None if hold_ask is None else 100 - hold_ask)
+def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]],
+                   target: float, df: float,
+                   hold: Optional[int] = None) -> Optional[Tuple[int, int, int]]:
+    """comp_side_lead_ref for a two-market pair: `twin_levels` are the twin's
+    levels that price this side (its NO bids for our bid side, its YES bids
+    for our ask side), walked to target/5."""
+    ref = side_reference_level(levels_desc(twin_levels), target) if target > 0 else None
+    return None if ref is None else comp_side_lead_ref(own_levels, ref, target, df, hold)
+
+
+def comp_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
+                    sibs: List[Tuple[List[List[float]], List[List[float]]]],
+                    target: float, df: float,
+                    hold_bid: Optional[int] = None, hold_ask: Optional[int] = None,
+                    bid_ok: bool = False
+                    ) -> Tuple[Optional[Tuple[int, int, int]],
+                               Optional[Tuple[int, int, int]]]:
+    """(bid lead, ask lead) for a market from its siblings' books, every book
+    EXTERNAL; `sibs` = each sibling's (YES levels, NO levels). Each lead is
+    None or (price, cap, own external best) in YES cents, the ask's in
+    YES-ask cents. The ask side's reference (NO space) is the sum of the
+    siblings' YES-bid references; the bid side leads only with `bid_ok` and
+    exactly one sibling, off that twin's NO bids. `hold_bid` / `hold_ask`
+    (YES cents): where a side already leads. A lead never crosses the
+    market's own other side, and two leads that would cross both stand down."""
+    lb = ln = None
+    if bid_ok and len(sibs) == 1:
+        lb = comp_side_lead(yes_levels, sibs[0][1], target, df, hold=hold_bid)
+    refs = [side_reference_level(levels_desc(sy), target) for sy, _sn in sibs]
+    if sibs and target > 0 and all(r is not None for r in refs):
+        ln = comp_side_lead_ref(no_levels, sum(refs), target, df,
+                                hold=None if hold_ask is None else 100 - hold_ask)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
     eb, ea = external_best(yes_levels, no_levels)
     if lb is not None and ea is not None and lb[0] >= ea:
@@ -19599,6 +19638,29 @@ def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]]
     if lb is not None and la is not None and lb[0] >= la[0]:
         lb = la = None
     return lb, la
+
+
+def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]],
+                     twin_yes: List[List[float]], twin_no: List[List[float]],
+                     target: float, df: float,
+                     hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
+                     ) -> Tuple[Optional[Tuple[int, int, int]],
+                                Optional[Tuple[int, int, int]]]:
+    """comp_lead_group for a two-market election pair (both sides lead)."""
+    return comp_lead_group(yes_levels, no_levels, [(twin_yes, twin_no)], target, df,
+                           hold_bid=hold_bid, hold_ask=hold_ask, bid_ok=True)
+
+
+def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
+    """The price (that side's own space, best first) at which `levels` fill
+    `count` contracts -- the worst price an immediate order of that size
+    reaches -- or None when the side holds fewer."""
+    cum = 0.0
+    for px, q in levels_desc(levels):
+        cum += q
+        if cum >= count - 1e-9:
+            return px
+    return None
 
 
 def build_side_ladder(ticker: str, book_side: str, anchor: int,
@@ -20621,13 +20683,18 @@ class IncentiveMarketMaker:
         # rungs rest at and their size (the WS fast cancel judges those
         # against the twin, the placement caps allow the size); (ticker,
         # side) -> the lead price last logged
-        self._comp_events: Dict[str, Tuple[float, Optional[Tuple[str, str]]]] = {}
-        self._comp_pairs: Dict[str, str] = {}
+        self._comp_events: Dict[str, Tuple[float, Optional[Tuple[str, ...]]]] = {}
+        self._comp_groups: Dict[str, Tuple[str, ...]] = {}   # ticker -> its event's markets
+        self._comp_pairs: Dict[str, str] = {}                # two-market groups: the twin
         self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
         # ticker -> [bid, ask, at]: where its sides last led (COMP_HOLD_FILE)
         self._comp_holds: Dict[str, list] = self._load_comp_holds()
+        # open hedge jobs (COMP_HEDGE_FILE): a filled lead, its siblings' legs
+        self._comp_hedges: List[dict] = self._load_comp_hedges()
+        # (ticker, side) -> {lead price: last cycle it led there}
+        self._comp_lead_seen: Dict[Tuple[str, str], Dict[int, float]] = {}
         # (ticker, side) -> change points (ts, own-space price or None) of
         # where our rung rested, for the lone-reference guard's jump test;
         # and the sides it holds right now
@@ -21166,6 +21233,9 @@ class IncentiveMarketMaker:
             if toxic:
                 self._toxic_note_fill(f, tkr, side, action, px_cents)
                 self._bait_note_fill(f, tkr, join, count, now_ts)
+            # a filled complement lead is hedged on its siblings; a hedge
+            # leg's fill credits its job (COMP_HEDGE_MODE)
+            self._comp_hedge_on_fill(f, tkr, side, action, count, px_cents, now_ts)
 
     def _log_fill(self, f: dict, tkr: str, side: str, action: str,
                   count: float, px_cents: float, now_ts: float,
@@ -23076,8 +23146,8 @@ class IncentiveMarketMaker:
                               if any(o["order_id"] in self._ws_suspect for o in lst)}
         # a complement lead is judged on its twin's book too, so a move there
         # re-checks it (COMP_LEAD_MODE)
-        check |= {self._comp_pairs[d] for d in dirty
-                  if d in self._comp_pairs and self._comp_pairs[d] in self._comp_lead_px}
+        check |= {s for d in dirty for s in self._comp_groups.get(d, ())
+                  if s != d and s in self._comp_lead_px}
 
         def _own_by_px(lst) -> Tuple[Dict[float, float], Dict[float, float]]:
             oy: Dict[float, float] = {}
@@ -23106,29 +23176,32 @@ class IncentiveMarketMaker:
             ext_no = max((p for p, q in no.items()
                           if q - own_no.get(p, 0.0) > 0.01), default=None)
             ext_ask = None if ext_no is None else round(1.0 - ext_no, 4)
-            # TWO-MARKET COMPLEMENT LEAD: a leading side's touch is the better
-            # of its own and the one its twin's book implies (the twin's NO
-            # bids price our bids, its YES bids our asks), our orders on the
-            # twin netted out; with no twin book it is its own alone, so a
-            # lead the twin no longer backs reads ahead like any stale rung
+            # COMPLEMENT LEAD: a leading side's touch is the better of its own
+            # and the one its siblings' books imply -- 100 less their best YES
+            # bids for our ask, the twin's best NO bid for our bid -- our own
+            # orders there netted out; with any sibling's book off the feed it
+            # is its own alone, so a lead they no longer back reads ahead like
+            # any stale rung
             lead_px = self._comp_lead_px.get(t)
-            twin = self._comp_pairs.get(t)
-            if lead_px is not None and twin is not None:
-                tlv = ws.book_levels(twin)
-                if tlv is not None:
-                    t_yes, t_no = tlv
-                    tw_yes, tw_no = _own_by_px(self._resting_view.get(twin) or [])
-                    if lead_px[0] is not None:
-                        imp = max((p for p, q in t_no.items()
-                                   if q - tw_no.get(p, 0.0) > 0.01), default=None)
-                        if imp is not None:
-                            ext_bid = imp if ext_bid is None else max(ext_bid, imp)
+            grp = self._comp_groups.get(t)
+            if lead_px is not None and grp:
+                sibs = [s for s in grp if s != t]
+                slv = [ws.book_levels(s) for s in sibs]
+                if all(b is not None for b in slv):
+                    best_yes = []
+                    for s, (s_yes, s_no) in zip(sibs, slv):
+                        so_yes, so_no = _own_by_px(self._resting_view.get(s) or [])
+                        best_yes.append(max((p for p, q in s_yes.items()
+                                             if q - so_yes.get(p, 0.0) > 0.01),
+                                            default=0.0))
+                        if lead_px[0] is not None and len(sibs) == 1:
+                            imp = max((p for p, q in s_no.items()
+                                       if q - so_no.get(p, 0.0) > 0.01), default=None)
+                            if imp is not None:
+                                ext_bid = imp if ext_bid is None else max(ext_bid, imp)
                     if lead_px[1] is not None:
-                        imp = max((p for p, q in t_yes.items()
-                                   if q - tw_yes.get(p, 0.0) > 0.01), default=None)
-                        if imp is not None:
-                            imp_ask = round(1.0 - imp, 4)
-                            ext_ask = imp_ask if ext_ask is None else min(ext_ask, imp_ask)
+                        imp_ask = round(1.0 - sum(best_yes), 4)
+                        ext_ask = imp_ask if ext_ask is None else min(ext_ask, imp_ask)
             for o in list(orders):
                 oid = o["order_id"]
                 if in_cycle and (oid in self._cycle_amended
@@ -26261,8 +26334,11 @@ class IncentiveMarketMaker:
         self._prune_near_cliff_boost()
         self._prune_yield_boost()
         # the books pass 2 reads go on the WebSocket feed (WS_CANDIDATES)
-        self._ws_cand_subscribe(m.ticker for m in screened
-                                if m.event_ticker not in self.state.event_live_halt)
+        self._ws_cand_subscribe(
+            [m.ticker for m in screened
+             if m.event_ticker not in self.state.event_live_halt]
+            # ...with every complement group's siblings (COMP_LEAD_MODE)
+            + sorted(set(self._comp_groups)))
         # ...and its REST reads are budgeted (CAND_REST_BUDGET_SECS), from
         # after the feed's warm-up wait
         self._cand_rest = {"t0": time.monotonic(), "fails": 0, "off": ""}
@@ -27170,20 +27246,21 @@ class IncentiveMarketMaker:
     # ---- join ahead of the pile (2026-10-11, JOIN_AHEAD_MODE) --------------
 
     def _refresh_comp_pairs(self, metas: List["MarketMeta"], now_ts: float) -> None:
-        """Pair the two markets of every two-market, mutually exclusive event
-        in the complement-lead scope (COMP_LEAD_MODE) from Kalshi's event
-        record: an event with exactly two candidates is read when unread or
-        older than COMP_PAIR_TTL_SECS, at most COMP_PAIR_READS_PER_REFRESH a
-        refresh; a failed read leaves the event unpaired until the next try.
-        Never raises."""
+        """Group the markets of every mutually exclusive event in the
+        complement-lead scope (COMP_LEAD_MODE) from Kalshi's event record:
+        an event with two or more candidates is read when unread or older than
+        COMP_PAIR_TTL_SECS, at most COMP_PAIR_READS_PER_REFRESH a refresh. A
+        group is EVERY market of the event (siblings outside the programs
+        too), and only while all of them are open; a failed read leaves the
+        event ungrouped until the next try. Never raises."""
         by_ev: Dict[str, Set[str]] = {}
         for m in metas:
             if comp_lead_series(m.series):
                 by_ev.setdefault(m.event_ticker, set()).add(m.ticker)
         reads = 0
         for ev in sorted(by_ev):
-            pair_t = tuple(sorted(by_ev[ev]))
-            if len(pair_t) != 2:
+            cands = by_ev[ev]
+            if len(cands) < 2:
                 continue
             hit = self._comp_events.get(ev)
             if hit is not None and now_ts - hit[0] < COMP_PAIR_TTL_SECS:
@@ -27198,46 +27275,73 @@ class IncentiveMarketMaker:
                 if not getattr(self, "_comp_read_err_logged", False):
                     self._comp_read_err_logged = True
                     log(f"{self.tag} ! comp lead: event read {ev} failed ({e!r}); "
-                        f"it stays unpaired until the next try (logged once)")
+                        f"retried in 10 min, keeping what it had (logged once)")
+                # retried in 10 minutes; a group it had stands meanwhile
+                self._comp_events[ev] = (now_ts - COMP_PAIR_TTL_SECS + 600.0,
+                                         hit[1] if hit is not None else None)
                 continue
             e = js.get("event") or {}
             mk = e.get("markets") or js.get("markets") or []
             tickers = tuple(sorted(str(x.get("ticker") or "") for x in mk))
             open_ = all(str(x.get("status") or "").lower() in ("active", "open")
                         for x in mk)
-            ok = bool(e.get("mutually_exclusive")) and tickers == pair_t and open_
-            self._comp_events[ev] = (now_ts, pair_t if ok else None)
-        pairs: Dict[str, str] = {}
-        for _ev, (_at, pair) in self._comp_events.items():
-            if pair is not None:
-                pairs[pair[0]], pairs[pair[1]] = pair[1], pair[0]
-        if set(pairs) != set(self._comp_pairs):
-            log(f"{self.tag} comp lead: {len(pairs) // 2} two-market event(s) "
-                f"paired ({reads} event read(s) this refresh)")
+            ok = (bool(e.get("mutually_exclusive")) and len(tickers) >= 2
+                  and cands <= set(tickers) and open_)
+            self._comp_events[ev] = (now_ts, tickers if ok else None)
+        groups: Dict[str, Tuple[str, ...]] = {}
+        for _ev, (_at, grp) in self._comp_events.items():
+            if grp is not None:
+                for t in grp:
+                    groups[t] = grp
+        pairs = {t: (g[1] if g[0] == t else g[0]) for t, g in groups.items()
+                 if len(g) == 2}
+        if set(groups) != set(self._comp_groups):
+            n_ev = len({g for g in groups.values()})
+            log(f"{self.tag} comp lead: {n_ev} mutually exclusive event(s) grouped, "
+                f"{len(pairs) // 2} of them two-market ({reads} event read(s) "
+                f"this refresh)")
+        self._comp_groups = groups
         self._comp_pairs = pairs
+
+    def _comp_sib_books(self, t: str
+                        ) -> Optional[List[Tuple[str, List[List[float]], List[List[float]]]]]:
+        """Each of `t`'s siblings' EXTERNAL book from the WS feed, as
+        (ticker, YES levels, NO levels); None when `t` has no group or any
+        sibling's book is off the feed."""
+        grp = self._comp_groups.get(t)
+        ws = self._ws
+        if not grp or ws is None:
+            return None
+        out = []
+        for s in grp:
+            if s == t:
+                continue
+            try:
+                ob = ws.book_fp(s)
+            except Exception:
+                ob = None
+            if ob is None:
+                return None
+            sy, sn = orderbook_levels(ob)
+            own_s = self._comp_own.get(s, []) if self.live else []
+            if own_s:
+                sy, sn = external_levels(sy, sn, own_s)
+            out.append((s, sy, sn))
+        return out or None
 
     def _comp_lead(self, meta, yes_ext: List[List[float]], no_ext: List[List[float]]
                    ) -> Tuple[Optional[Tuple[int, int, int]],
                               Optional[Tuple[int, int, int]]]:
-        """This market's (bid lead, ask lead) off its twin's WS book
-        (comp_lead_prices; `yes_ext` / `no_ext` = its own EXTERNAL book):
-        (None, None) without a twin, outside the scope, on a sub-penny book
-        or when the feed cannot serve the twin's book."""
-        twin = self._comp_pairs.get(meta.ticker)
-        ws = self._ws
-        if twin is None or ws is None or not comp_lead_series(meta.series) \
+        """This market's (bid lead, ask lead) off its siblings' WS books
+        (comp_lead_group; `yes_ext` / `no_ext` = its own EXTERNAL book):
+        (None, None) without a group, outside the scope, on a sub-penny book
+        or when the feed cannot serve every sibling's book."""
+        if meta.ticker not in self._comp_groups or not comp_lead_series(meta.series) \
                 or meta.price_step < 0.01:
             return None, None
-        try:
-            ob = ws.book_fp(twin)
-        except Exception:
-            ob = None
-        if ob is None:
+        sibs = self._comp_sib_books(meta.ticker)
+        if sibs is None:
             return None, None
-        ty, tn = orderbook_levels(ob)
-        own_t = self._comp_own.get(twin, []) if self.live else []
-        if own_t:
-            ty, tn = external_levels(ty, tn, own_t)
         # where its sides lead now, else where they last led (COMP_HOLD_FILE):
         # a leading side never moves up
         held = self._comp_lead_px.get(meta.ticker)
@@ -27246,9 +27350,10 @@ class IncentiveMarketMaker:
             if h is not None and time.time() - float(h[2]) < COMP_HOLD_TTL_SECS:
                 held = (h[0], h[1], 0)
         held = held or (None, None, 0)
-        return comp_lead_prices(yes_ext, no_ext, ty, tn,
-                                meta.target_size, meta.discount_factor,
-                                hold_bid=held[0], hold_ask=held[1])
+        return comp_lead_group(yes_ext, no_ext, [(sy, sn) for _s, sy, sn in sibs],
+                               meta.target_size, meta.discount_factor,
+                               hold_bid=held[0], hold_ask=held[1],
+                               bid_ok=comp_bid_lead_series(meta.series))
 
     def _load_comp_holds(self) -> Dict[str, list]:
         """COMP_HOLD_FILE's entries ({} when absent or unreadable)."""
@@ -27286,7 +27391,9 @@ class IncentiveMarketMaker:
         """Log each side's complement lead when it starts, stops or moves
         3c or more (COMP_LEAD_MODE dry says so)."""
         dry = "" if COMP_LEAD_MODE == "on" else " (dry)"
-        twin = self._comp_pairs.get(t, "its twin")
+        grp = self._comp_groups.get(t) or ()
+        who, verb = ((f"{self._comp_pairs[t]}'s book", "implies") if t in self._comp_pairs
+                     else (f"its {max(len(grp) - 1, 0)} siblings' books", "imply"))
         for side, lead in (("bid", lead_b), ("ask", lead_a)):
             key = (t, side)
             px = None if lead is None else lead[0]
@@ -27296,14 +27403,269 @@ class IncentiveMarketMaker:
                 continue
             self._comp_lead_noted[key] = px
             if px is None:
-                log(f"{self.tag} comp lead{dry} {t} {side}: off -- {twin}'s book "
-                    f"no longer prices it ahead of its own")
+                log(f"{self.tag} comp lead{dry} {t} {side}: off -- {who} no longer "
+                    f"put it ahead of its own, or an order stepped ahead of it")
                 continue
             _p, cap, best = lead
             implied = (cap + COMP_LEAD_MARGIN_C if side == "bid"
                        else cap - COMP_LEAD_MARGIN_C)
             log(f"{self.tag} comp lead{dry} {t} {side}: {n} @ {px}c, ahead of its "
-                f"own {best}c; {twin}'s book implies {implied}c")
+                f"own {best}c; {who} {verb} {implied}c")
+
+    # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
+
+    def _load_comp_hedges(self) -> List[dict]:
+        """COMP_HEDGE_FILE's open jobs ([] when absent or unreadable)."""
+        try:
+            with open(os.path.join(STATUS_DIR, COMP_HEDGE_FILE), encoding="utf-8") as f:
+                d = json.load(f)
+            return [j for j in (d.get("jobs") or []) if isinstance(j, dict)
+                    and isinstance(j.get("legs"), dict)]
+        except (OSError, ValueError, AttributeError):
+            return []
+
+    def _save_comp_hedges(self) -> None:
+        """Write the open jobs (COMP_HEDGE_FILE). Never raises."""
+        path = os.path.join(STATUS_DIR, COMP_HEDGE_FILE)
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"updated": datetime.now(timezone.utc).isoformat(),
+                           "jobs": self._comp_hedges}, f, indent=1, sort_keys=True)
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            if not getattr(self, "_comp_hedge_err_logged", False):
+                self._comp_hedge_err_logged = True
+                log(f"{self.tag} ! {COMP_HEDGE_FILE} write failed ({e}); the "
+                    f"jobs stay in memory (logged once)")
+
+    def _comp_hedge_on_fill(self, f: dict, tkr: str, side: str, action: str,
+                            count: float, px_cents: float, now_ts: float) -> None:
+        """One of OUR fills: a hedge leg's credits its job; a maker fill on a
+        leading side (at the price it leads at now, or last led at) opens
+        a job to hedge it on every sibling. Never raises."""
+        try:
+            oid = str(f.get("order_id") or "")
+            for j in self._comp_hedges:
+                for s, leg in j["legs"].items():
+                    if s == tkr and oid and oid in leg.get("oids", ()):
+                        leg["filled"] = float(leg.get("filled", 0.0)) + count
+                        leg["value"] = float(leg.get("value", 0.0)) + count * px_cents
+                        self._sink("comp_hedge", {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "kind": "leg_fill", "job": j["id"], "ticker": tkr,
+                            "count": count, "px": px_cents, "order_id": oid})
+                        self._save_comp_hedges()
+                        return
+            if COMP_HEDGE_MODE not in ("on", "dry") or f.get("is_taker"):
+                return
+            book_side = "bid" if (side == "yes") == (action == "buy") else "ask"
+            i = 0 if book_side == "bid" else 1
+            lead = self._comp_lead_px.get(tkr)
+            # the side's lead price now, any it led at in the last 10 minutes
+            # (the rung may have moved since it filled), or where it last led
+            prices = set(p_ for p_, at in self._comp_lead_seen.get((tkr, book_side), {}).items()
+                         if now_ts - at <= 600.0)
+            if lead is not None and lead[i] is not None:
+                prices.add(lead[i])
+            h = self._comp_holds.get(tkr)
+            if h is not None and h[i] is not None:
+                prices.add(h[i])
+            if not any(abs(px_cents - float(p_)) <= 0.5 for p_ in prices):
+                return
+            grp = self._comp_groups.get(tkr) or ()
+            sibs = [s for s in grp if s != tkr]
+            job = {"id": f"{tkr}-{book_side}-{oid[:8] or 'x'}-{int(now_ts)}",
+                   "event": "-".join(tkr.split("-")[:-1]) or tkr,
+                   "ticker": tkr, "side": book_side, "price": float(px_cents),
+                   "count": float(count), "at": now_ts, "tries": 0,
+                   "legs": {s: {"filled": 0.0, "value": 0.0, "oids": [],
+                                "sent_at": 0.0} for s in sibs}}
+            if not sibs:
+                # a fill booked before the groups are read (the startup
+                # reconcile): its legs are filled in once its group is known
+                job["need_group"] = True
+            self._comp_hedges.append(job)
+            self._save_comp_hedges()
+            what = "sell" if book_side == "ask" else "buy"
+            log(f"{self.tag} comp hedge: {tkr} {book_side.upper()} filled {count:g} @ "
+                f"{px_cents:g}c on its lead -- will {what} {count:g} on each of "
+                + (f"{len(sibs)} sibling(s)" if sibs else "its siblings once its group is read")
+                + (" (dry)" if COMP_HEDGE_MODE != "on" else ""))
+            self._sink("comp_hedge", {
+                "ts": datetime.now(timezone.utc).isoformat(), "kind": "open",
+                "job": job["id"], "ticker": tkr, "side": book_side,
+                "count": count, "px": px_cents, "siblings": sibs})
+        except Exception as e:
+            log(f"{self.tag} ! comp hedge fill note failed ({type(e).__name__}: {e})")
+
+    def _comp_hedge_run(self, now_ts: float) -> None:
+        """Work the open hedge jobs (COMP_HEDGE_MODE): for each, price what is
+        left of every leg at the depth its sibling's book fills it, and when
+        the whole set still clears COMP_HEDGE_EDGE_C send each leg as an
+        immediate-or-cancel limit at that price. A leg sent in the last 60s
+        waits for its fills to be read. Done, expired and dry jobs are
+        logged and dropped. Never raises."""
+        if not self._comp_hedges:
+            return
+        changed = False
+        keep: List[dict] = []
+        for j in self._comp_hedges:
+            try:
+                q, p, side = float(j["count"]), float(j["price"]), j["side"]
+                if j.get("need_group"):
+                    grp = self._comp_groups.get(j["ticker"]) or ()
+                    if grp:
+                        j["legs"] = {s: {"filled": 0.0, "value": 0.0, "oids": [],
+                                         "sent_at": 0.0} for s in grp if s != j["ticker"]}
+                        j["need_group"] = False
+                        changed = True
+                legs = j["legs"]
+                rem = {s: max(0.0, q - float(lg.get("filled", 0.0)))
+                       for s, lg in legs.items()}
+                if legs and all(r < 0.5 for r in rem.values()):
+                    avg = sum(float(lg.get("value", 0.0)) for lg in legs.values()) / q
+                    edge = (p + avg - 100.0) if side == "ask" else (100.0 - p - avg)
+                    log(f"{self.tag} comp hedge: {j['ticker']} {side} {q:g} @ {p:g}c "
+                        f"hedged on {len(legs)} sibling(s), {edge:+.1f}c a set locked")
+                    self._sink("comp_hedge", {
+                        "ts": datetime.now(timezone.utc).isoformat(), "kind": "done",
+                        "job": j["id"], "edge_c": round(edge, 2), "count": q})
+                    self.alerter.alert(
+                        "comp_hedge", f"{j['ticker']}: lead {side} filled {q:g} @ "
+                        f"{p:g}c, hedged on {len(legs)} sibling(s) for "
+                        f"{edge:+.1f}c a set", key=j["id"], urgent=False)
+                    changed = True
+                    continue
+                if now_ts - float(j.get("at", now_ts)) > COMP_HEDGE_MAX_AGE_SECS:
+                    log(f"{self.tag} ! comp hedge: {j['id']} gave up after "
+                        f"{COMP_HEDGE_MAX_AGE_SECS / 3600:g}h with "
+                        + ", ".join(f"{s} {r:g}" for s, r in rem.items() if r >= 0.5)
+                        + " unhedged")
+                    self._sink("comp_hedge", {
+                        "ts": datetime.now(timezone.utc).isoformat(), "kind": "expired",
+                        "job": j["id"], "unhedged": rem})
+                    self.alerter.alert(
+                        "comp_hedge", f"{j['ticker']}: hedge gave up with "
+                        + ", ".join(f"{s} {r:g}" for s, r in rem.items() if r >= 0.5)
+                        + " unhedged", key=j["id"], urgent=True)
+                    changed = True
+                    continue
+                keep.append(j)
+                if not legs or any(now_ts - float(lg.get("sent_at", 0.0)) < 60.0
+                                   and rem[s] >= 0.5 for s, lg in legs.items()):
+                    continue
+                # price every leg's remainder on its sibling's book
+                plan: Dict[str, int] = {}
+                for s, r in rem.items():
+                    if r < 0.5:
+                        continue
+                    try:
+                        ob = self._ws.book_fp(s) if self._ws is not None else None
+                    except Exception:
+                        ob = None
+                    if ob is None:
+                        plan = {}
+                        break
+                    sy, sn = orderbook_levels(ob)
+                    own_s = self._comp_own.get(s, []) if self.live else []
+                    if own_s:
+                        sy, sn = external_levels(sy, sn, own_s)
+                    if side == "ask":
+                        px = comp_fill_price(sy, r)              # sell YES into the bids
+                    else:
+                        nf = comp_fill_price(sn, r)              # buy YES from the asks
+                        px = None if nf is None else 100 - nf
+                    if px is None:
+                        plan = {}
+                        break
+                    plan[s] = px
+                if not plan:
+                    continue
+                avg = sum((float(lg.get("value", 0.0)) + rem[s] * plan.get(s, 0)) / q
+                          for s, lg in legs.items())
+                edge = (p + avg - 100.0) if side == "ask" else (100.0 - p - avg)
+                if edge < COMP_HEDGE_EDGE_C:
+                    if not j.get("waiting"):
+                        j["waiting"] = True
+                        changed = True
+                        log(f"{self.tag} comp hedge: {j['id']} waits -- the siblings' "
+                            f"books now leave {edge:+.1f}c a set, under "
+                            f"{COMP_HEDGE_EDGE_C:g}c")
+                    continue
+                j["waiting"] = False
+                j["tries"] = int(j.get("tries", 0)) + 1
+                book_side = "ask" if side == "ask" else "bid"
+                if COMP_HEDGE_MODE != "on":
+                    # dry: the legs it would send, once, and the job is dropped
+                    for s, px in plan.items():
+                        self._comp_hedge_send(s, book_side, px,
+                                              int(math.floor(rem[s] + 1e-9)), j, now_ts)
+                    log(f"{self.tag} comp hedge (dry): {j['id']} would lock "
+                        f"{edge:+.1f}c a set; dropped")
+                    keep.remove(j)
+                    changed = True
+                    continue
+                for s, px in plan.items():
+                    n = int(math.floor(rem[s] + 1e-9))
+                    if n <= 0:
+                        continue
+                    oid = self._comp_hedge_send(s, book_side, px, n, j, now_ts)
+                    # a refused leg (short cash on the shard, say) waits 10
+                    # minutes, not one
+                    legs[s]["sent_at"] = now_ts if (oid or not self.live) else now_ts + 540.0
+                    if oid:
+                        legs[s].setdefault("oids", []).append(oid)
+                changed = True
+            except Exception as e:
+                keep.append(j)
+                log(f"{self.tag} ! comp hedge job {j.get('id')} failed "
+                    f"({type(e).__name__}: {e}); kept")
+        self._comp_hedges = keep
+        if changed:
+            self._save_comp_hedges()
+
+    def _comp_hedge_send(self, ticker: str, book_side: str, px: int, count: int,
+                         job: dict, now_ts: float) -> Optional[str]:
+        """Send one hedge leg: an immediate-or-cancel limit order (not
+        post-only) to buy (bid) or sell (ask) `count` YES at `px` or better.
+        Its fills are ours (our_order_ids). Dry run and IMM_COMP_HEDGE=dry
+        only log; a dry run credits the leg in full. Returns the order id."""
+        what = "buy" if book_side == "bid" else "sell"
+        label = f"{ticker} {what} {count} YES @ {px}c (IOC)"
+        row = {"ts": datetime.now(timezone.utc).isoformat(), "kind": "send",
+               "job": job["id"], "ticker": ticker, "side": book_side,
+               "px": px, "count": count}
+        if COMP_HEDGE_MODE != "on" or not self.live:
+            log(f"{self.tag} [DRY] comp hedge {label}")
+            self._sink("comp_hedge", dict(row, dry=True))
+            if not self.live and COMP_HEDGE_MODE == "on":
+                leg = job["legs"][ticker]
+                leg["filled"] = float(leg.get("filled", 0.0)) + count
+                leg["value"] = float(leg.get("value", 0.0)) + count * px
+            return None
+        client_order_id = f"{CLIENT_ORDER_PREFIX}-{RUN_ID}-h{uuid.uuid4().hex[:11]}"
+        if book_side == "bid":
+            kwargs = dict(side="yes", action="buy", yes_price=px)
+        else:
+            kwargs = dict(side="no", action="buy", no_price=100 - px)
+        try:
+            resp = self.client.create_order(
+                ticker=ticker, client_order_id=client_order_id, count=count,
+                type="limit", post_only=False, time_in_force="immediate_or_cancel",
+                self_trade_prevention_type=STP_TYPE, **kwargs)
+            oid = (resp.get("order") or {}).get("order_id") or resp.get("order_id", "")
+            if oid:
+                self.state.our_order_ids[oid] = now_ts   # its fills are ours
+                self._journal_order_id(oid, now_ts)
+            log(f"{self.tag} comp hedge {label} -> {oid}")
+            self._sink("comp_hedge", dict(row, order_id=oid))
+            return oid or None
+        except Exception as e:
+            body = str(getattr(e, "body", "") or "")[:300]
+            log(f"{self.tag} ! comp hedge rejected ({e}){' ' + body if body else ''}: "
+                f"{label}")
+            self._sink("comp_hedge", dict(row, error=str(e), error_body=body))
+            return None
 
     def _join_ahead(self, t: str, meta, yes_levels, no_levels, own_in_book,
                     ext_bid: Optional[int], ext_ask: Optional[int],
@@ -28054,7 +28416,7 @@ class IncentiveMarketMaker:
         # the floor projection (COMP_LEAD_MODE on only)
         _leads: Tuple[Optional[Tuple[int, int, int]],
                       Optional[Tuple[int, int, int]]] = (None, None)
-        if COMP_LEAD_MODE == "on" and meta.ticker in self._comp_pairs:
+        if COMP_LEAD_MODE == "on" and meta.ticker in self._comp_groups:
             _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_live)
                                if (self.live and own_live) else (yes_levels, no_levels))
             _leads = self._comp_lead(meta, _lx_yes, _lx_no)
@@ -29103,6 +29465,8 @@ class IncentiveMarketMaker:
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
         self._join_prune(now_ts)
+        # hedge the filled complement leads on their siblings (COMP_HEDGE_MODE)
+        self._comp_hedge_run(now_ts)
         # WebSocket feed events since the last look (2026-10-03): drained so
         # they do not pile up; never a cycle error
         try:
@@ -30599,7 +30963,7 @@ class IncentiveMarketMaker:
             # cap or outside the band the loop places at-ref rungs in
             lead_b = lead_a = None
             lead_n = comp_lead_size(meta.target_size)
-            if (t in self._comp_pairs and not reduce_only
+            if (t in self._comp_groups and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None
                     and poke_caps is None and nfl_caps is None
                     and ca_caps is None and rain_caps is None):
@@ -30744,6 +31108,13 @@ class IncentiveMarketMaker:
                                          lead_a[0] if lead_on_a else None, lead_n)
                 self._note_comp_hold(t, self._comp_lead_px[t][0],
                                      self._comp_lead_px[t][1], now_ts)
+                for _sd, _px in (("bid", self._comp_lead_px[t][0]),
+                                 ("ask", self._comp_lead_px[t][1])):
+                    if _px is not None:      # a fill read later still matches it
+                        _seen = self._comp_lead_seen.setdefault((t, _sd), {})
+                        _seen[_px] = now_ts
+                        for _old in [k for k, at in _seen.items() if now_ts - at > 600.0]:
+                            _seen.pop(_old, None)
             else:
                 self._comp_lead_px.pop(t, None)
 
