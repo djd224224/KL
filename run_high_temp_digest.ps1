@@ -22,6 +22,9 @@
 #     written with estimates.
 #  3. claude -p writes run-logs\high-temp\<D>.html in its own worktree,
 #     $Wt (detached at origin/main), never in KL, the live bot's checkout.
+#     Its P&L numbers come from high_temp_digest_pnl.py: this bot's fills
+#     only, valued fill by fill, with the IMM's KXHIGH fills on the same
+#     account on one line of their own (2026-10-28).
 #  4. This script, not Claude, checks the file, updates latest.html, commits
 #     the two files and pushes to origin/main. "KL sync-kl-main" brings them
 #     into KL at :15/:45.
@@ -195,19 +198,22 @@ OVERRIDES
 
 3. No git and no browser: skip the SKILL.md sections "Commit and push" and "Open the dashboard". Run no git command that changes anything (add, commit, push, pull, fetch, merge, rebase, checkout, switch, reset, restore, stash, clean). The launcher checks your file, commits and pushes it, and emails it.
 
-4. P&L basis: BigQuery's KXHIGH views book every NO fill at the YES price. In KXHIGH_fills_enriched, price_paid_dollars, fill_cost_dollars and model_edge_at_fill are wrong for NO fills; in KXHIGH_settlements_clean, total_cost_dollars and pnl_dollars are wrong. Use Kalshi's basis everywhere:
-   - Settled market: P&L = revenue_dollars - yes_total_cost_dollars - no_total_cost_dollars - fee_cost_dollars, and cost = yes_total_cost_dollars + no_total_cost_dollars (KXHIGH_settlements_clean). A market is a win when its P&L > 0.
-   - Fills: the price paid is raw_no_price_dollars for side = 'no' and raw_yes_price_dollars for side = 'yes', in KXHIGH_fills_clean (fills_enriched does not have them; join on fill_id for its forecast columns). Cost = filled_count x that price.
-   - Do not report model_edge_at_fill for NO fills.
-   - Pending markets: estimate with the SKILL.md band formula, on this cost.
-   - Check: for 2026-10-02 this basis gives -97.13 on 430.02 deployed, 9W/11L.
-   Put one data-note banner under the header with the recorded figure (sum of pnl_dollars on sum of total_cost_dollars) next to Kalshi's, as run-logs/high-temp/2026-10-02.html does.
+4. P&L: first run, in your working directory:
+     python high_temp_digest_pnl.py --date {D}
+   It prints every P&L figure this digest needs. Copy its numbers for every P&L, cost, contract count, avg price, W/L and settled/est. mark, in the KPI bar, the City Results table, the narrative and the last line. Do not work them out from KXHIGH_fills_enriched or KXHIGH_settlements_clean: those views book NO fills at the YES price, and a settlement record's revenue leaves out the $1 Kalshi pays when a YES and a NO in one market net out before settlement.
+   - It counts THIS bot's fills only: those whose order is in KXHIGH_orders. Since 2026-10-24 the IMM market-making bot also quotes next-day KXHIGH markets on the same Kalshi account. Its fills are in KXHIGH_fills_clean with no KXHIGH_orders row. They are not this bot's trades and not an orders-log gap, so never flag them as one. Leave them out of the KPI bar, the City Results table, the W/L and the narrative's P&L.
+   - Show the IMM's fills once: the helper's "IMM market making on the same account" line, verbatim, as one muted line directly under the KPI bar.
+   - Fills the helper lists as unattributed (in neither KXHIGH_orders nor the IMM's fill log) may be a real orders-log gap or a manual trade: name them in the Overall Summary, with their markets and dollars. If it prints a WARNING, put that in the Overall Summary too.
+   - Each fill is valued by how its market settled: contracts x (payout - price paid) - fee, at Kalshi's raw price for its side. A market is a win when this bot's P&L there is > 0. A market not settled yet is estimated from KXHIGH_cli_readings and shows "est." in the helper's output; mark it (est.) in the digest.
+   - The helper reads the IMM's fill log in C:\Users\jackd\Documents\KL\run-logs\incentive-mm, read-only. You still never touch KL yourself.
+   - Do not report model_edge_at_fill for NO fills (it is inverted).
+   - Check: for 2026-10-02 the helper gives -$97.13 on $430.02, 9W/11L.
+   Put one data-note banner under the header: "P&L is per fill: contracts x (payout - price paid) - fees, at Kalshi's fill prices. The IMM's market making on the same account is left out: it has one line of its own below." Do not show BigQuery's recorded pnl_dollars.
 
 5. Data status: {LOADNOTE}
 
-6. Final message: one short paragraph, as the SKILL.md asks. Then, as the very last line, exactly:
-DIGEST_SUMMARY: <P&L on Kalshi's basis> on <capital deployed>, <W>W/<L>L, <settled | partly settled | estimated>
-For example: DIGEST_SUMMARY: -$97.13 on $430.02, 9W/11L, settled
+6. Final message: one short paragraph, as the SKILL.md asks. Then, as the very last line, the helper's DIGEST_SUMMARY line exactly as it printed it, for example:
+DIGEST_SUMMARY: -$97.13 on $430.02, 9W/11L, settled
 '@
 
 # Writes, checks, commits and pushes one day's digest. Throws when no good
@@ -238,6 +244,19 @@ function Invoke-Digest([datetime]$Day, [string]$LoadNote) {
     }
     $m = [regex]::Matches($res.Out, '(?m)^\s*DIGEST_SUMMARY:\s*(.+?)\s*$')
     $summary = if ($m.Count) { $m[$m.Count - 1].Groups[1].Value } else { "" }
+    # The subject's numbers come from the P&L helper itself, not Claude's copy
+    # of them (the 10/27 subject carried IMM fills: Jack 2026-10-28, "is this
+    # real -1400?"). Claude's line is the fallback.
+    $hp = @(& $Python (Join-Path $Wt "high_temp_digest_pnl.py") --date $ds --summary-line 2>&1 | ForEach-Object { "$_" })
+    $hm = [regex]::Match(($hp -join "`n"), '(?m)^DIGEST_SUMMARY:\s*(.+?)\s*$')
+    if ($hm.Success) {
+        if ($summary -and $summary -ne $hm.Groups[1].Value) {
+            Log "${ds}: Claude's summary '$summary' differs from the helper's '$($hm.Groups[1].Value)'; the subject uses the helper's"
+        }
+        $summary = $hm.Groups[1].Value
+    } else {
+        Log "! ${ds}: high_temp_digest_pnl.py gave no summary line, so the subject uses Claude's: $($hp -join ' | ')"
+    }
 
     # latest.html follows the newest dated digest, so a backfill leaves it alone
     $paths = @($rel)
