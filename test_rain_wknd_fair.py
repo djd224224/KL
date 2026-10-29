@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from unittest import mock
 
 import rain_wknd_fair as r
 
@@ -114,6 +115,11 @@ class TestWrite(unittest.TestCase):
             "KXRAINWKND-26OCT10": {"sat": "2026-10-10", "markets": {
                 "KXRAINWKND-26OCT10-NYC": {"code": "NYC", "span": None}}}}
         self.calls = []
+        # XYZ stays unmapped here, and no test reaches the network to map it
+        p = mock.patch.object(r, "resolve_station",
+                              side_effect=RuntimeError("KXYZ: not a station (test)"))
+        p.start()
+        self.addCleanup(p.stop)
 
     def nbe(self, sid):
         self.calls.append(sid)
@@ -193,6 +199,131 @@ class TestWrite(unittest.TestCase):
             r.write_fair_file(self.path, now=self.NOW + timedelta(minutes=m),
                               get_json=get_json, nbe_fn=self.nbe)
         self.assertEqual(len(n), 4)
+
+
+class TestStations(unittest.TestCase):
+    """Jack 2026-10-29: "Yes, map them" (the 11 cities Kalshi added without a
+    row here) and "also automatically map any future cities"."""
+    NOW = datetime(2026, 10, 15, 6, tzinfo=UTC)
+    RUN = datetime(2026, 10, 15, 0, tzinfo=UTC)
+
+    def test_the_eleven_cities_of_26oct24_are_mapped(self):
+        want = {"ABQ": ("KABQ", 7), "CMH": ("KCMH", 5), "DTW": ("KDTW", 5),
+                "IND": ("KIND", 5), "LEX": ("KLEX", 5), "MKE": ("KMKE", 6),
+                "PIT": ("KPIT", 5), "PVD": ("KPVD", 5), "SGF": ("KSGF", 6),
+                "STL": ("KSTL", 6), "TPA": ("KTPA", 5)}
+        self.assertEqual({c: r.STATIONS[c] for c in want}, want)
+        self.assertEqual(len(r.STATIONS), 35)
+
+    def test_lst_hours_takes_daylight_time_out(self):
+        summer, winter = datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 1, 15, tzinfo=UTC)
+        for tz, h in (("America/New_York", 5), ("America/Indiana/Indianapolis", 5),
+                      ("America/Detroit", 5), ("America/Chicago", 6),
+                      ("America/Denver", 7), ("America/Phoenix", 7),
+                      ("America/Los_Angeles", 8), ("Pacific/Honolulu", 10)):
+            self.assertEqual((r.lst_hours(tz, summer), r.lst_hours(tz, winter)), (h, h), tz)
+        for bad in ("Mars/Olympus", "America/St_Johns"):        # unknown / off the hour
+            with self.assertRaises(RuntimeError):
+                r.lst_hours(bad, summer)
+
+    def _get(self, tz="America/Chicago", last_cli="2026-10-14", nws=None):
+        def get(url, params=None):
+            if "weather.gov" in url:
+                if nws is not None:
+                    raise nws
+                return {"properties": {"timeZone": tz, "name": "Xyz Intl"}}
+            return {"results": [{"valid": "2026-10-01"}, {"valid": last_cli}]}
+        return get
+
+    def nbe(self, sid):
+        return self.RUN, periods(self.RUN, [0.3] * 20)
+
+    def test_resolve_station_checks_what_the_model_needs(self):
+        row = r.resolve_station("XYZ", self.NOW, get=self._get(), nbe_fn=self.nbe)
+        self.assertEqual({k: row[k] for k in ("icao", "lst", "tz", "name", "auto")},
+                         {"icao": "KXYZ", "lst": 6, "tz": "America/Chicago",
+                          "name": "Xyz Intl", "auto": True})
+        cases = (
+            (dict(get=self._get(tz="")), "no time zone"),
+            (dict(get=self._get(last_cli="2026-09-30")), "no IEM CLI report"),
+            (dict(get=self._get(), nbe_fn=lambda sid: (self.RUN, periods(self.RUN, [0.3] * 3))),
+             "no NBE run"),
+            (dict(get=self._get(), nbe_fn=lambda sid: (
+                self.RUN - timedelta(hours=40), periods(self.RUN, [0.3] * 20))), "over 30h old"))
+        for kw, msg in cases:
+            kw.setdefault("nbe_fn", self.nbe)
+            with self.assertRaises(RuntimeError) as cm:
+                r.resolve_station("XYZ", self.NOW, **kw)
+            self.assertIn(msg, str(cm.exception))
+        with self.assertRaises(ConnectionError):                 # the caller records it
+            r.resolve_station("XYZ", self.NOW, get=self._get(nws=ConnectionError("down")),
+                              nbe_fn=self.nbe)
+
+    def _events(self, code="XYZ"):
+        span = ["2026-10-17", "2026-10-18"]
+        return {"KXRAINWKND-26OCT17": {"sat": "2026-10-17", "markets": {
+            "KXRAINWKND-26OCT17-NYC": {"code": "NYC", "span": span},
+            "KXRAINWKND-26OCT17-XXX": {"code": code, "span": span}}}}
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_a_new_city_is_mapped_once_and_priced(self):
+        path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
+        seen = []
+        def resolve(code, now):
+            seen.append(code)
+            return {"icao": f"K{code}", "lst": 6, "tz": "America/Chicago",
+                    "name": "Xyz Intl", "auto": True, "checked_at": now.isoformat()}
+        ok, miss = r.write_fair_file(path, now=self.NOW, events=self._events(),
+                                     nbe_fn=self.nbe, resolve_fn=resolve)
+        self.assertEqual((ok, miss, seen), (2, 0, ["XYZ"]))       # NYC is a hand row
+        d = self._read(path)
+        self.assertEqual(d["markets"]["KXRAINWKND-26OCT17-XXX"]["station"], "KXYZ")
+        self.assertEqual(d["auto_stations"]["XYZ"]["lst"], 6)
+        self.assertEqual(d["unmapped"], {})
+        # kept in the file: the next pass prices it without asking again
+        ok, _ = r.write_fair_file(path, now=self.NOW + timedelta(minutes=30),
+                                  events=self._events(), nbe_fn=self.nbe, resolve_fn=resolve)
+        self.assertEqual((ok, seen), (2, ["XYZ"]))
+
+    def test_a_failed_mapping_stands_aside_and_is_retried_after_six_hours(self):
+        path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
+        tries = []
+        def down(code, now):
+            tries.append(now)
+            raise RuntimeError("KXYZ: no IEM CLI report within 10 days (last None)")
+        ok, miss = r.write_fair_file(path, now=self.NOW, events=self._events(),
+                                     nbe_fn=self.nbe, resolve_fn=down)
+        self.assertEqual((ok, miss), (1, 1))
+        d = self._read(path)
+        self.assertEqual(d["missing"]["KXRAINWKND-26OCT17-XXX"],
+                         "unmapped station XYZ (RuntimeError: KXYZ: no IEM CLI report "
+                         "within 10 days (last None))")
+        self.assertEqual(d["unmapped"]["XYZ"]["at"], self.NOW.timestamp())
+        r.write_fair_file(path, now=self.NOW + timedelta(hours=5), events=self._events(),
+                          nbe_fn=self.nbe, resolve_fn=down)
+        self.assertEqual(len(tries), 1)                          # not yet
+        ok, _ = r.write_fair_file(
+            path, now=self.NOW + timedelta(hours=6, minutes=1), events=self._events(),
+            nbe_fn=self.nbe,
+            resolve_fn=lambda code, now: {"icao": "KXYZ", "lst": 5, "tz": "America/New_York",
+                                          "name": "Xyz", "auto": True,
+                                          "checked_at": now.isoformat()})
+        self.assertEqual(ok, 2)
+        self.assertEqual(self._read(path)["unmapped"], {})
+
+    def test_a_hand_row_wins_over_an_auto_row(self):
+        path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"auto_stations": {"NYC": {"icao": "KLGA", "lst": 5}}}, f)
+        never = mock.Mock(side_effect=AssertionError("a hand code is never resolved"))
+        r.write_fair_file(path, now=self.NOW, events=self._events(code="NYC"),
+                          nbe_fn=self.nbe, resolve_fn=never)
+        self.assertEqual(self._read(path)["markets"]["KXRAINWKND-26OCT17-NYC"]["station"],
+                         "KNYC")
+        never.assert_not_called()
 
 
 if __name__ == "__main__":

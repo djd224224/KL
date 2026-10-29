@@ -29,9 +29,10 @@ city's base rate. On the 7 settled Kalshi weekends at the same hours: model
 0.089, the market mid 0.113 (the mid overprices YES in the 10-50c range).
 A period set covering less than 3.9 of the window's 4 half-days, a run older
 than NBE_MAX_AGE_HOURS, a lead beyond MAX_LEAD_HOURS (the fit stops at 5.5
-days; Kalshi lists each weekend Monday 09:10Z, ~122-137 hours out), an
-unmapped station, rules naming any window but the ticker's Saturday-Sunday,
-or a weekend already started gets no fair (the gate stands aside). An
+days; Kalshi lists each weekend Monday 09:10Z, ~122-137 hours out), a
+station neither in STATIONS nor auto-mapped (AUTO-MAPPED STATIONS), rules
+naming any window but the ticker's Saturday-Sunday, or a weekend already
+started gets no fair (the gate stands aside). An
 older run is not a worse input than its lead says: the lead is measured
 from the run, so a run the IEM is late with is read as the longer forecast
 it is.
@@ -52,6 +53,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
+import pytz
 import requests
 
 STATUS_DIR = os.environ.get(
@@ -63,17 +65,42 @@ NBE_URL = os.environ.get("IMM_RAIN_WKND_NBE_URL",
                          "https://mesonet.agron.iastate.edu/api/1/mos.json")
 # the rules' CLI code -> (NBM station, local standard time offset from UTC,
 # hours). Palm Beach's CLI is CLIDJT (the renamed airport); the NBM station
-# list still calls it KPBI. College Station's rules say "at CLL".
+# list still calls it KPBI. College Station's rules say "at CLL". The second
+# row of each offset is the 11 cities Kalshi had added by 26OCT24, which sat
+# without a fair until 2026-10-29 (Jack: "Yes, map them"; each checked
+# against its rules' CLI code, the NWS station's time zone and a current
+# NBE run). The fit carries to them: on the 26 weekends of May-Oct 2026
+# (00Z/12Z runs, ACIS outcomes) the 11 score Brier skill 0.41 inside 24h
+# to 0.14 at 4-6 days over each city's base rate, the 24 above 0.42 to
+# 0.18; mean p 0.55 vs 0.56 observed; per city they sit inside the 24's
+# spread (ABQ and LEX near zero skill, as LAS, DJT, SFO and DEN are).
 STATIONS: Dict[str, Tuple[str, int]] = {
     "ATL": ("KATL", 5), "BOS": ("KBOS", 5), "DCA": ("KDCA", 5), "EWR": ("KEWR", 5),
     "MIA": ("KMIA", 5), "NYC": ("KNYC", 5), "PHL": ("KPHL", 5), "TTN": ("KTTN", 5),
     "DJT": ("KPBI", 5),
+    "CMH": ("KCMH", 5), "DTW": ("KDTW", 5), "IND": ("KIND", 5), "LEX": ("KLEX", 5),
+    "PIT": ("KPIT", 5), "PVD": ("KPVD", 5), "TPA": ("KTPA", 5),
     "AUS": ("KAUS", 6), "ORD": ("KORD", 6), "CLL": ("KCLL", 6), "DFW": ("KDFW", 6),
     "HOU": ("KHOU", 6), "MSP": ("KMSP", 6), "MSY": ("KMSY", 6), "OKC": ("KOKC", 6),
     "SAT": ("KSAT", 6),
+    "MKE": ("KMKE", 6), "SGF": ("KSGF", 6), "STL": ("KSTL", 6),
     "DEN": ("KDEN", 7), "PHX": ("KPHX", 7),
+    "ABQ": ("KABQ", 7),
     "LAX": ("KLAX", 8), "LAS": ("KLAS", 8), "SEA": ("KSEA", 8), "SFO": ("KSFO", 8),
 }
+# AUTO-MAPPED STATIONS (Jack 2026-10-29: "also automatically map any future
+# cities"). A code an open market's rules name that no STATIONS row maps is
+# resolved and checked as the 11 above were: the NWS station record for K +
+# code (its time zone gives the local standard offset), IEM's CLI for it (a
+# report within AUTO_CLI_MAX_AGE_DAYS: the settlement source exists) and a
+# current NBE run of MIN_PERIODS rows. A pass is kept in the file's
+# "auto_stations"; a failure goes to "unmapped" with what failed and is tried
+# again after AUTO_RETRY_SECS -- its markets get no fair meanwhile (the gate
+# stands them aside), never a guessed station. The hand rows always win.
+NWS_STATION_URL = "https://api.weather.gov/stations/{sid}"
+IEM_CLI_URL = "https://mesonet.agron.iastate.edu/json/cli.py"
+AUTO_CLI_MAX_AGE_DAYS = 10
+AUTO_RETRY_SECS = 6 * 3600
 W = 0.85
 # (lead upper bound, hours) -> logistic recalibration (a, b)
 RECAL = ((24, -0.06, 1.12), (48, 0.01, 1.11), (72, 0.17, 1.12),
@@ -247,6 +274,54 @@ def station_run(sid: str, cache: dict, nbe_fn: Callable
     return (rt, per), err
 
 
+def _get_json(url: str, params: Optional[dict] = None) -> dict:
+    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT,
+                     headers={"User-Agent": USER_AGENT})
+    r.raise_for_status()
+    return r.json() or {}
+
+
+def lst_hours(tz: str, now: datetime) -> int:
+    """Hours local standard time runs behind UTC in the IANA zone `tz`
+    (America/Denver -> 7, daylight time taken out), or RuntimeError for an
+    unknown zone or one off the whole hour."""
+    try:
+        loc = now.astimezone(pytz.timezone(tz))
+    except pytz.UnknownTimeZoneError:
+        raise RuntimeError(f"unknown time zone {tz!r}")
+    hours = -(loc.utcoffset() - loc.dst()).total_seconds() / 3600.0
+    if hours != int(hours):
+        raise RuntimeError(f"time zone {tz} is off the whole hour ({hours:g}h)")
+    return int(hours)
+
+
+def resolve_station(code: str, now: datetime, get: Callable = _get_json,
+                    nbe_fn: Optional[Callable] = None) -> dict:
+    """An auto row ({'icao', 'lst', 'tz', 'name', ...}) for the station the
+    rules' `code` names, or RuntimeError saying which check failed (see
+    AUTO-MAPPED STATIONS)."""
+    sid = f"K{code}"
+    props = get(NWS_STATION_URL.format(sid=sid)).get("properties") or {}
+    tz = str(props.get("timeZone") or "")
+    if not tz:
+        raise RuntimeError(f"{sid}: NWS gives no time zone")
+    lst = lst_hours(tz, now)
+    cli = get(IEM_CLI_URL, {"station": sid, "year": now.year}).get("results") or []
+    days = sorted(str(x.get("valid") or "") for x in cli if x.get("valid"))
+    if not days or days[-1] < (now - timedelta(days=AUTO_CLI_MAX_AGE_DAYS)).date().isoformat():
+        raise RuntimeError(f"{sid}: no IEM CLI report within {AUTO_CLI_MAX_AGE_DAYS} days "
+                           f"(last {days[-1] if days else None})")
+    rt, per = (nbe_fn or fetch_nbe)(sid)
+    if rt is None or len(per) < MIN_PERIODS:
+        raise RuntimeError(f"{sid}: no NBE run of {MIN_PERIODS}+ periods "
+                           f"(run {rt}, {len(per)} periods)")
+    if (now - rt).total_seconds() / 3600.0 > NBE_MAX_AGE_HOURS:
+        raise RuntimeError(f"{sid}: its latest NBE run ({rt:%Y-%m-%d %H}Z) is over "
+                           f"{NBE_MAX_AGE_HOURS:g}h old")
+    return {"icao": sid, "lst": lst, "tz": tz, "name": str(props.get("name") or sid),
+            "auto": True, "checked_at": now.isoformat()}
+
+
 def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
     if get_json is not None:
         try:
@@ -299,14 +374,16 @@ def _read_json(path: str) -> dict:
 def write_fair_file(path: str, now: Optional[datetime] = None,
                     get_json: Optional[Callable] = None,
                     events: Optional[Dict[str, dict]] = None,
-                    nbe_fn: Callable = fetch_nbe) -> Tuple[int, int]:
+                    nbe_fn: Callable = fetch_nbe,
+                    resolve_fn: Optional[Callable] = None) -> Tuple[int, int]:
     """Build and atomically write the weekend-rain fair file; returns
     (markets with a fair, open markets without one). Kalshi's open events
     are re-read hourly, and every pass while none is open (the Monday gap
     between a weekend's close and the next listing); a failed read reuses
     the cache. Each station's NBE run is read every pass, and a failed read
     falls back to the file's copy of the run (still subject to
-    NBE_MAX_AGE_HOURS)."""
+    NBE_MAX_AGE_HOURS). A code no STATIONS row maps is auto-mapped
+    (resolve_fn, default resolve_station; see AUTO-MAPPED STATIONS)."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
@@ -324,6 +401,29 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                 if not ev_cache:
                     raise
                 events = ev_cache
+    # the auto-mapped stations: the file's, plus any code an open market
+    # names that no row maps (a failure is retried after AUTO_RETRY_SECS)
+    auto = {c: v for c, v in (old.get("auto_stations") or {}).items()
+            if isinstance(v, dict) and v.get("icao") and v.get("lst") is not None}
+    unmapped: Dict[str, dict] = dict(old.get("unmapped") or {})
+    resolve = resolve_fn or resolve_station
+    codes = {str(mk.get("code")) for e in events.values()
+             for mk in (e.get("markets") or {}).values() if mk.get("code")}
+    for code in sorted(codes):
+        if code in STATIONS or code in auto:
+            unmapped.pop(code, None)
+            continue
+        if ts - float((unmapped.get(code) or {}).get("at") or 0) < AUTO_RETRY_SECS:
+            continue
+        try:
+            auto[code] = resolve(code, now)
+            unmapped.pop(code, None)
+            _log(f"station {code} auto-mapped: {auto[code]['name']} ({auto[code]['icao']}, "
+                 f"{auto[code]['tz']}, standard time UTC-{auto[code]['lst']})")
+        except Exception as ex:
+            unmapped[code] = {"at": ts, "why": f"{type(ex).__name__}: {str(ex)[:160]}"}
+            _log(f"! station {code} unmapped, its markets stand aside: "
+                 f"{unmapped[code]['why']}")
     stamp = now.isoformat()
     nbe: Dict[str, Tuple[Optional[datetime], list]] = {}
     failed: Dict[str, str] = {}
@@ -334,8 +434,11 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         for t, mk in sorted(e["markets"].items()):
             code, span = mk.get("code"), mk.get("span")
             st = STATIONS.get(code or "")
+            if st is None and code in auto:
+                st = (auto[code]["icao"], int(auto[code]["lst"]))
             if st is None:
-                missing[t] = f"unmapped station {code}"
+                why = (unmapped.get(code or "") or {}).get("why")
+                missing[t] = f"unmapped station {code}" + (f" ({why})" if why else "")
                 continue
             if span and span != [sat.isoformat(), (sat + timedelta(days=1)).isoformat()]:
                 missing[t] = f"rules window {span[0]}..{span[1]} is not the weekend"
@@ -367,6 +470,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             for sid, (rt, per) in sorted(nbe.items()) if rt is not None}
     payload = {"generated_at": stamp, "events_at": events_at, "open_events": events,
                "markets": markets, "missing": missing, "nbe": runs,
+               "auto_stations": auto, "unmapped": unmapped,
                "model": {"w": W, "recal": RECAL, "min_coverage": MIN_COVERAGE,
                          "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS}}
     tmp = path + ".tmp"
