@@ -111,6 +111,9 @@ class TestHedgesAndVerdict(unittest.TestCase):
                          "PROBLEM")
         self.assertEqual(self._ctx(rows=[{"kind": "send", "error": "400"}])["level"],
                          "PROBLEM")
+        # a post-only leg refused as a cross is priced again: not a problem
+        self.assertEqual(self._ctx(rows=[{"kind": "send", "error": "400",
+                                          "error_body": "post only cross"}])["level"], "OK")
         stuck = {"id": "j", "count": 200, "at": _ts(10), "legs": {"B": {"filled": 50}}}
         self.assertEqual(self._ctx(jobs=[stuck])["level"], "PROBLEM")
         young = dict(stuck, at=_ts(11, 50))

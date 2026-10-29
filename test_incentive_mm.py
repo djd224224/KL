@@ -29929,11 +29929,11 @@ class TestComplementLead(unittest.TestCase):
                 "is_taker": taker, "created_time": "2026-10-29T02:00:00Z"}
 
     def test_a_filled_ask_lead_is_locked_on_its_siblings(self):
-        # we sold 200 A at 60c on its lead; B and C are bid 20c and 25c: the
-        # lock sells the best bids first (C's 25c, then B's 20c) only until the
-        # floor clears COMP_HEDGE_LEAD_EDGE_C (0c) after taker fees -- 200 C
-        # and 173 B, keeping B's upside; selling all of both locks only 2.6c
-        # (5c before fees)
+        # we sold 200 A at 60c on its lead; B and C are bid 20c and 25c. Maker
+        # legs only (Jack 2026-10-29: "Don't be a taker, only maker"): each
+        # rests 1c over its market's best bid -- C at 26c, then B at 21c --
+        # sized just until the floor clears COMP_HEDGE_LEAD_EDGE_C (0c) after
+        # Kalshi's maker fee: 200 C and 139 B, keeping B's upside
         a, b, c = "KXFOOW-99DEC31-A", "KXFOOW-99DEC31-B", "KXFOOW-99DEC31-C"
         books = {a: ([[5, 3000]], [[29, 15000]]),
                  b: ([[18, 100], [20, 300]], [[60, 3000]]),
@@ -29951,13 +29951,14 @@ class TestComplementLead(unittest.TestCase):
                 # persisted for a restart
                 self.assertEqual(len(IncentiveMarketMaker(
                     client=FakeClient(), live=False)._comp_hedges), 1)
-                bot._comp_hedge_run(1001.0)          # dry run: sent, credited in full
-                self.assertTrue(any("comp hedge KXFOOW-99DEC31-C sell 200 YES @ 25c (IOC)"
+                bot._comp_hedge_run(1001.0)          # dry run: rested, credited in full
+                self.assertTrue(any("comp hedge KXFOOW-99DEC31-C sell 200 YES @ 26c (maker)"
                                     in x for x in lines), lines)
-                self.assertTrue(any("KXFOOW-99DEC31-B sell 173 YES @ 20c" in x for x in lines))
+                self.assertTrue(any("KXFOOW-99DEC31-B sell 139 YES @ 21c (maker)" in x
+                                    for x in lines))
                 bot._comp_hedge_run(1062.0)          # the floor clears: locked
             self.assertEqual(bot._comp_hedges, [])
-            self.assertTrue(any("locked +0.0c a contract (me_ask: KXFOOW-99DEC31-B 173, "
+            self.assertTrue(any("locked +0.1c a contract (me_ask: KXFOOW-99DEC31-B 139, "
                                 "KXFOOW-99DEC31-C 200)" in x for x in lines), lines)
             # a taker fill, or a buy that only cuts the short, opens nothing
             for f in (self._fill(a, "yes", "sell", 50, 60, taker=True),
@@ -29968,7 +29969,7 @@ class TestComplementLead(unittest.TestCase):
     def test_a_hedge_waits_while_the_set_no_longer_clears(self):
         a, b, c = "KXFOOW-99DEC31-A", "KXFOOW-99DEC31-B", "KXFOOW-99DEC31-C"
         books = {a: ([[5, 3000]], [[29, 15000]]),
-                 b: ([[10, 300]], [[60, 3000]]),       # 60 + 10 + 25 = 95: a loss
+                 b: ([[10, 300]], [[60, 3000]]),       # 60 + 11 + 26 = 97: a loss
                  c: ([[25, 900]], [[60, 3000]])}
         with tempfile.TemporaryDirectory() as tmp,                 mock.patch.object(imm, "STATUS_DIR", tmp):
             bot = self._hedge_bot(tmp, books)
@@ -29982,20 +29983,20 @@ class TestComplementLead(unittest.TestCase):
             self.assertTrue(job["waiting"])
             self.assertEqual(job["legs"], {})                               # nothing sent
             self.assertEqual(sum("waits" in x for x in lines), 1)          # logged once
-            self.assertAlmostEqual(job["best"], -6.9, places=1)
+            self.assertAlmostEqual(job["best"], -3.5, places=1)
             # the bids come back: it goes
             bot._ws.books[b] = ({0.20: 300.0}, {0.60: 3000.0})
             with mock.patch.object(imm, "log", lines.append):
                 bot._comp_hedge_run(1200.0)
             self.assertEqual({s: lg["filled"] for s, lg in job["legs"].items()},
-                             {b: 173.0, c: 200.0})
+                             {b: 139.0, c: 200.0})
             # a job past its age with a leg traded and no lock gives up...
             bot._comp_hedges = [dict(job, at=0.0, legs={b: dict(
                 job["legs"][b], filled=50.0, value=1000.0, fee=10.0, sent_at=0.0)})]
             with mock.patch.object(imm, "log", lines.append):
                 bot._comp_hedge_run(imm.COMP_HEDGE_MAX_AGE_SECS + 10.0)
             self.assertEqual(bot._comp_hedges, [])
-            self.assertTrue(any("gave up" in x and "traded and no lock" in x for x in lines))
+            self.assertTrue(any("gave up" in x and "filled and no lock" in x for x in lines))
             # ...and so does a lead fill nothing locked in that time
             bot._comp_hedges = [dict(job, at=0.0, until=100.0, legs={})]
             with mock.patch.object(imm, "log", lines.append):
@@ -30004,9 +30005,10 @@ class TestComplementLead(unittest.TestCase):
             self.assertTrue(any("without a lock" in x for x in lines))
 
     def test_a_filled_bid_lead_buys_the_twin(self):
-        # the Wisconsin pair: we bought 200 D at 26c; R is offered at 29-30c:
-        # 76 R lock the floor (R winning pays 7,600 for 5,200 + 2,277 + fees)
-        # and D winning keeps the rest (a tie aside)
+        # the Wisconsin pair: we bought 200 D at 26c; R is offered at 29c, so
+        # the maker leg bids 28c: 73 R lock the floor (R winning pays 7,300
+        # for 5,200 + 2,044 + the maker fee) and D winning keeps the rest (a
+        # tie aside)
         with tempfile.TemporaryDirectory() as tmp,                 mock.patch.object(imm, "STATUS_DIR", tmp),                 mock.patch.object(imm, "LADDER_MODE", "atref"),                 mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}):
             bot = self._hedge_bot(tmp, {self.D: (self.D_YES, self.D_NO),
                                         self.R: (self.R_YES, self.R_NO)})
@@ -30016,9 +30018,9 @@ class TestComplementLead(unittest.TestCase):
                 bot._book_fill(self._fill(self.D, "yes", "buy", 200, 26), 1000.0)
                 bot._comp_hedge_run(1001.0)
                 bot._comp_hedge_run(1062.0)
-            self.assertTrue(any("KXFOOLEG-99DEC31-R buy 76 YES @ 30c (IOC)" in x
+            self.assertTrue(any("KXFOOLEG-99DEC31-R buy 73 YES @ 28c (maker)" in x
                                 for x in lines), lines)
-            self.assertTrue(any("locked +0.0c a contract (pair_bid: KXFOOLEG-99DEC31-R 76)"
+            self.assertTrue(any("locked +0.1c a contract (pair_bid: KXFOOLEG-99DEC31-R 73)"
                                 in x for x in lines), lines)
 
     def test_scope(self):
@@ -30113,7 +30115,7 @@ class TestComplementLead(unittest.TestCase):
         feed.books[self.R] = (dollars(r_yes), dollars(r_no))
         return feed
 
-    def _cycle(self, mode, max_pos=150.0, max_event=1000.0, lead_cap=None):
+    def _cycle(self, mode, max_pos=150.0, max_event=1000.0, lead_cap=None, prep=None):
         _clean_persist()
         D, R = self.D, self.R
 
@@ -30162,6 +30164,8 @@ class TestComplementLead(unittest.TestCase):
                 mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
             bot = IncentiveMarketMaker(client=_PairClient(), live=False)
             bot._ws = self._feed(self.D_YES, self.D_NO, self.R_YES, self.R_NO)
+            if prep is not None:
+                prep(bot)
             lines = []
             with mock.patch.object(imm, "log", lines.append):
                 bot.run_cycle()
@@ -30196,6 +30200,31 @@ class TestComplementLead(unittest.TestCase):
         self.assertEqual(rungs[(self.D, "bid")], (26, 200))
         _bot, rungs, _l = self._cycle("on", max_pos=50.0, max_event=100.0, lead_cap=0.0)
         self.assertLess(rungs[(self.D, "bid")][1], 200)           # the plain caps bind
+
+    def test_the_quote_cycle_leaves_lock_legs_alone(self):
+        # a lock leg resting on a market the bot does not quote (a sibling
+        # outside the programs) is neither swept as a stray nor diffed away;
+        # the cycle hands it to the lock engine, whose job keeps it
+        leg_t = "KXFOOLEG-99DEC31-X"
+
+        def prep(bot):
+            bot.state.sim_orders["sim-lock"] = {
+                "order_id": "sim-lock", "ticker": leg_t, "book_side": "ask",
+                "yes_price": 40, "remaining_count": 50.0, "yes_price_exact": None,
+                "status": "resting", "client_order_id": "imm-0123abcd-h0123456789a",
+                "expire_at": time.time() + 3600}
+            bot._comp_hedges = [{"id": "j", "ticker": self.D, "side": "ask",
+                                 "kind": "me_ask", "lead": True, "price": 60.0,
+                                 "count": 50.0, "at": time.time(),
+                                 "until": time.time() + 3600, "legs": {leg_t: {
+                                     "filled": 0.0, "value": 0.0, "fee": 0.0,
+                                     "oid": "sim-lock", "oids": ["sim-lock"],
+                                     "sent_at": time.time()}}}]
+        bot, _rungs, _lines = self._cycle("on", prep=prep)
+        self.assertIn("sim-lock", bot.state.sim_orders)
+        self.assertIn("sim-lock", bot._lock_resting)
+        self.assertFalse(imm.lock_leg_order({"client_order_id": "imm-0123abcd-0123456789ab"}))
+        self.assertFalse(imm.lock_leg_order({"client_order_id": "manual-h1"}))
 
     def test_dry_logs_and_rests_at_the_reference(self):
         bot, rungs, lines = self._cycle("dry")
@@ -30448,8 +30477,8 @@ class TestProfitLock(unittest.TestCase):
 
     def test_any_fill_that_opens_a_position_is_locked(self):
         # an ordinary ask fill (no lead): sold 20 A at 30c while B is bid 50c
-        # and C 30c -- 30 + 50 + 30 = 110: sell 20 B and 17 C for +2.5c a
-        # contract after fees
+        # and C 30c -- maker legs 1c over those bids, 20 B at 51c and 15 C at
+        # 31c, lock +3.5c a contract after the maker fee
         grp = (self.A, self.B, self.C)
         books = {self.A: ([[5, 3000]], [[69, 15000]]), self.B: ([[50, 500]], [[45, 500]]),
                  self.C: ([[30, 500]], [[65, 500]])}
@@ -30465,9 +30494,10 @@ class TestProfitLock(unittest.TestCase):
                 bot._comp_hedge_run(1001.0)
                 bot._comp_hedge_run(1062.0)
             self.assertEqual(bot._comp_hedges, [])
-            self.assertTrue(any("locking +2.5c a contract (me_ask: KXFOOW-99DEC31-B 20 @ 50c, "
-                                "KXFOOW-99DEC31-C 17 @ 30c)" in x for x in lines), lines)
-            self.assertTrue(any("locked +2.5c a contract" in x for x in lines), lines)
+            self.assertTrue(any("resting maker legs for +3.5c a contract (me_ask: "
+                                "KXFOOW-99DEC31-B 20 @ 51c, KXFOOW-99DEC31-C 15 @ 31c)" in x
+                                for x in lines), lines)
+            self.assertTrue(any("locked +3.5c a contract" in x for x in lines), lines)
             # nothing locks on these books: the job watches LOCK_WATCH_SECS,
             # quietly, then the fill rides as inventory
             bot._ws.books[self.B] = ({0.40: 500.0}, {0.45: 500.0})
@@ -30496,15 +30526,89 @@ class TestProfitLock(unittest.TestCase):
                 bot._book_fill(self._fill(self.A, "yes", "sell", 20, 30, oid="f4"), 4000.0)
                 bot._comp_hedge_run(4001.0)
             self.assertEqual(bot._comp_hedges, [])
-            self.assertTrue(any("(dry)" in x and "would lock +2.5c" in x for x in lines), lines)
+            self.assertTrue(any("(dry)" in x and "would rest legs for +3.5c" in x
+                                for x in lines), lines)
             with mock.patch.object(imm, "LOCK_MODE", "off"):
                 bot._book_fill(self._fill(self.A, "yes", "sell", 20, 30, oid="f5"), 5000.0)
             self.assertEqual(bot._comp_hedges, [])
 
+    def test_lock_legs_rest_as_maker_orders_and_end_with_the_lock(self):
+        # Jack 2026-10-29: "Don't be a taker, only maker" -- every leg is a
+        # post-only limit that rests; its fills are a hedge's (no new job);
+        # the lock cancels what still rests, routed by market
+        grp = (self.A, self.B, self.C)
+        books = {self.A: ([[5, 3000]], [[69, 15000]]), self.B: ([[50, 500]], [[45, 500]]),
+                 self.C: ([[30, 500]], [[65, 500]])}
+        sent, cancels = [], []
+
+        class _Live(FakeClient):
+            n = 0
+
+            def create_order(self_, **kw):
+                sent.append(kw)
+                _Live.n += 1
+                return {"order": {"order_id": f"o{_Live.n}"}}
+
+            def cancel_order(self_, oid, **kw):
+                cancels.append((oid, kw.get("market_ticker")))
+                return {}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(imm, "STATUS_DIR", tmp):
+            bot = self._bot(tmp, books, groups={t: grp for t in grp})
+            bot.client, bot.live = _Live(), True
+            bot._lock_resting = {}                      # one exchange read in
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot._book_fill(self._fill(self.A, "yes", "sell", 20, 30), 1000.0)
+                bot._comp_hedge_run(1001.0)
+                self.assertEqual(len(sent), 2)
+                for kw in sent:
+                    self.assertTrue(kw["post_only"])
+                    self.assertNotIn("time_in_force", kw)
+                    self.assertTrue(imm.lock_leg_order(kw))
+                    self.assertLessEqual(kw["expiration_ts"], 1001 + imm.LOCK_LEG_TTL_SECS)
+                self.assertEqual({(kw["ticker"], kw["no_price"], kw["count"]) for kw in sent},
+                                 {(self.B, 49, 20), (self.C, 69, 15)})   # sell YES 51c, 31c
+                # the next read shows both resting: they work, nothing new
+                bot._lock_resting = {"o1": {"order_id": "o1", "ticker": self.B},
+                                     "o2": {"order_id": "o2", "ticker": self.C}}
+                bot._comp_hedge_run(1100.0)
+                self.assertEqual(len(sent), 2)
+                # both fill (maker fills): credited, no job of their own
+                bot._book_fill(dict(self._fill(self.B, "no", "buy", 20, 51, oid="o1")), 1150.0)
+                bot._book_fill(dict(self._fill(self.C, "no", "buy", 15, 31, oid="o2")), 1150.0)
+                self.assertEqual(len(bot._comp_hedges), 1)
+                bot._comp_hedge_run(1200.0)
+            self.assertEqual(bot._comp_hedges, [])
+            self.assertTrue(any("locked +3.5c a contract" in x for x in lines), lines)
+            # the read still listing them, the lock cancels both, by market
+            self.assertEqual(sorted(cancels), [("o1", self.B), ("o2", self.C)])
+            # a leg no open job owns (a past run's) is cancelled as well
+            bot._lock_resting = {"o9": {"order_id": "o9", "ticker": self.C}}
+            with mock.patch.object(imm, "log", lines.append):
+                bot._comp_hedge_run(1300.0)
+            self.assertIn(("o9", self.C), cancels)
+            # a fill that never locks: its legs rest out the watch, then go
+            sent.clear()
+            cancels.clear()
+            bot._ws.books[self.B] = ({0.40: 500.0}, {0.45: 500.0})
+            bot._ws.books[self.C] = ({0.30: 500.0, 0.29: 5.0}, {0.65: 500.0})
+            with mock.patch.object(imm, "COMP_HEDGE_EDGE_C", 1.0), \
+                    mock.patch.object(imm, "log", lines.append):
+                bot._book_fill(self._fill(self.A, "yes", "sell", 20, 30, oid="f7"), 2000.0)
+                bot._comp_hedge_run(2001.0)
+                self.assertEqual(len(sent), 2)
+                bot._lock_resting = {"o3": {"order_id": "o3", "ticker": self.B},
+                                     "o4": {"order_id": "o4", "ticker": self.C}}
+                bot._comp_hedge_run(2000.0 + imm.LOCK_WATCH_SECS + 1)
+            self.assertEqual(bot._comp_hedges, [])
+            self.assertEqual(sorted(cancels), [("o3", self.B), ("o4", self.C)])
+
     def test_a_ladder_fill_locks_on_the_next_strike(self):
         # Philadelphia November rain, 10/29: "above 4 inches" bid 19c under
-        # "above 5 inches" bid 23c. Our 30 bought at 19c sell 29 of the harder
-        # strike at 23c: +2.0c a contract whatever falls
+        # "above 5 inches" bid 23c. Our 30 bought at 19c rest a sale of 27 of
+        # the harder strike at 24c (1c over its bid): +2.3c a contract
+        # whatever falls
         l4, l5 = "KXFOOR-99NOV-4", "KXFOOR-99NOV-5"
         lad = (l4, l5)
         books = {l4: ([[19, 3000]], [[62, 3000]]), l5: ([[23, 500]], [[76, 500]])}
@@ -30518,9 +30622,9 @@ class TestProfitLock(unittest.TestCase):
                 bot._comp_hedge_run(1062.0)
                 # the hardest strike's buy has no harder strike: no job
                 bot._book_fill(self._fill(l5, "yes", "buy", 30, 23, oid="f2"), 1100.0)
-            self.assertTrue(any("KXFOOR-99NOV-5 sell 29 YES @ 23c (IOC)" in x for x in lines),
-                            lines)
-            self.assertTrue(any("locked +2.0c a contract (ladder_bid: KXFOOR-99NOV-5 29)" in x
+            self.assertTrue(any("KXFOOR-99NOV-5 sell 27 YES @ 24c (maker)" in x
+                                for x in lines), lines)
+            self.assertTrue(any("locked +2.3c a contract (ladder_bid: KXFOOR-99NOV-5 27)" in x
                                 for x in lines), lines)
             self.assertEqual(bot._comp_hedges, [])
 

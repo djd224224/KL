@@ -8,15 +8,16 @@ event Kalshi marks mutually exclusive, a side whose own book sits far behind
 the price its sibling markets imply LEADS with one rung of target/5 (200) at
 the cheapest price that takes ~95% of that side's reward score -- the sell
 side in any family, the buy side in two-market election pairs. A lead that
-fills is hedged with immediate-or-cancel limit orders on every sibling while
-the whole set still locks COMP_HEDGE_EDGE_C a set; an order resting ahead of a
-lead ends it and the side joins that order.
+fills is hedged on its siblings once the set locks a profit; an order resting
+ahead of a lead is fought to a 5c stop.
 
 Since 2026-10-29 (Jack: "1 and 2") every maker fill that opens a position
 in such an event, or on a threshold ladder ("above X" strikes of one
 number), is locked the same way once the hedge clears 2c a contract after
-taker fees (a lead's fill: any floor), and ladder strikes lead off their
-neighbours' books.
+fees (a lead's fill: any floor), and ladder strikes lead off their
+neighbours' books. The hedge legs are resting MAKER orders only (Jack:
+"Don't be a taker, only maker"), cancelled once the lock completes or the
+job ends.
 
 ONE EMAIL per ET day (the day before), ending in OK / WATCH / PROBLEM:
   leads    every side that led, at what price against its own best and the
@@ -224,7 +225,11 @@ def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
     expired = [r for r in rows if r.get("kind") == "expired"]
     never = [r for r in rows if r.get("kind") == "nolock" and is_lead(r)]
     sends = [r for r in rows if r.get("kind") == "send" and not r.get("dry")]
-    refused = [r for r in sends if r.get("error")]
+    # a post-only leg the book moved into is refused as a cross: routine,
+    # the leg is priced again; anything else Kalshi refuses is a problem
+    refused = [r for r in sends if r.get("error")
+               and "cross" not in str(r.get("error_body") or r.get("error")).lower()]
+    crossed = [r for r in sends if r.get("error") and r not in refused]
     leg_fills = [r for r in rows if r.get("kind") == "leg_fill"]
     locked = sum(float(r.get("edge_c") or 0.0) * float(r.get("count") or 0.0) / 100.0
                  for r in done)
@@ -254,7 +259,8 @@ def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
                              traded=traded, best=j.get("best"),
                              waiting=bool(j.get("waiting"))))
     return dict(opened=opened, done=done, expired=expired, never=never, sends=sends,
-                refused=refused, leg_fills=leg_fills, locked=locked, open_now=open_now,
+                refused=refused, crossed=crossed, leg_fills=leg_fills, locked=locked,
+                open_now=open_now,
                 locks=dict(opened=l_open, done=l_done, none=l_none, unwound=l_unwound,
                            locked=l_locked, by_kind=dict(by_kind)))
 
@@ -369,7 +375,8 @@ def render_text(ctx) -> str:
         out.append(f"  {when:%H:%M} ET {f['ticker']} {what} {f['count']:g} @ {f['px']:g}c")
     h = ctx["hedges"]
     out += ["", f"HEDGES (lead fills): {len(h['opened'])} job(s) opened, {len(h['sends'])} "
-                f"order(s) sent, {len(h['leg_fills'])} leg fill(s), {len(h['done'])} "
+                f"maker leg(s) rested ({len(h['crossed'])} refused as a cross), "
+                f"{len(h['leg_fills'])} leg fill(s), {len(h['done'])} "
                 f"locked ({usd(h['locked'])}), {len(h['expired']) + len(h['never'])} given "
                 f"up, {len(h['refused'])} refused."]
     for r in h["done"]:
