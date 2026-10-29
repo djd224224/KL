@@ -31985,6 +31985,24 @@ class TestExchangePause(unittest.TestCase):
             self.assertEqual(any(c == "watchdog" for c, _m in bot.alerter.today), pages,
                              paused_shard)
 
+    def test_a_paused_shard_is_exempt_from_the_coverage_alert(self):
+        # Jack 2026-10-29: "Yes, ship it" -- the 10/29 Thursday pause paged
+        # KXMAMDANIMENTION-26NOV18-AFFO, KXANTHVSPEND-30OCT26-T34P1 and 11 more
+        b, now = self.bot, time.time()
+        self.assertFalse(b.coverage_exempt(self.A, now))
+        b._xp[0] = {"since": now}
+        self.assertTrue(b.coverage_exempt(self.A, now))
+        self.assertTrue(b.coverage_exempt(self.B, now))
+        self.assertFalse(b.coverage_exempt(self.C, now))                 # shard 2 trades
+        self.assertFalse(b.coverage_exempt("KXUNSEEN-99DEC31-Z", now))   # shard unknown
+        b._xp_status = {2}
+        self.assertTrue(b.coverage_exempt(self.C, now))
+        b._xp_status = {-1}
+        self.assertTrue(b.coverage_exempt("KXUNSEEN-99DEC31-Z", now))    # the whole exchange
+        b._xp.clear()                                                    # the pause is over
+        self.assertFalse(b.coverage_exempt(self.A, now))
+        self.assertFalse(b.coverage_exempt("KXUNSEEN-99DEC31-Z", now))
+
     def _pause_at(self, ts, s=0):
         b = self.bot
         b._xp_sched, b._xp_sched_at = _SCHEDULE, 4e9    # in hand, no re-read

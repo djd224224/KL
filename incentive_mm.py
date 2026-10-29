@@ -10395,7 +10395,8 @@ RATE_LIMIT_READ_LINE = re.compile(
 #          breaks or lags costs at most this -- one write goes out
 #          EXCH_PAUSE_PROBE_SECS after the last refusal;
 #   watchdog  leaves out the markets of paused shards (all of them while the
-#          status shows the whole exchange paused);
+#          status shows the whole exchange paused), and so does the coverage
+#          alert (2026-10-29: the 10/29 pause paged 13 markets);
 #   email  `exchange_pause`, once a pause, when it has run
 #          EXCH_PAUSE_ALERT_MIN outside Kalshi's published schedule
 #          (/exchange/schedule: standard hours on the ET clock + maintenance
@@ -23451,11 +23452,16 @@ class IncentiveMarketMaker:
         toxic-flow halt, the sweep breaker (its event) or the group breaker
         (either side) stands down on purpose (Jack 2026-10-25: "Stop alert",
         after KXGOOGVREQ-28OCT26-T11P9 paged inside the 120 s hold a sweep of
-        its sibling T11P4 put on the event)."""
+        its sibling T11P4 put on the event). Nor one on a shard Kalshi has
+        paused (_xp_shard_paused): its pads and amends are held, so a side
+        another maker thins can't be topped back up (Jack 2026-10-29: "Yes,
+        ship it" -- the 10/29 Thursday pause paged 13 markets 07:05-07:38Z,
+        10/22's 17, every one two-sided again from the 09:00Z reopen)."""
         return (self.toxic_market_halted(ticker, now_ts)
                 or self.sweep_held(self._event_of(ticker), now_ts)
                 or self.group_held(ticker, "bid", now_ts)
-                or self.group_held(ticker, "ask", now_ts))
+                or self.group_held(ticker, "ask", now_ts)
+                or self._xp_shard_paused(ticker))
 
     def _group_note_fill(self, t: str, oid: str, side: str, px: float,
                          n: float, fts: float, now_ts: float,
@@ -24432,6 +24438,16 @@ class IncentiveMarketMaker:
         return ([t for t in selected if self._ticker_shard.get(t) not in out],
                 [o for o in resting
                  if self._ticker_shard.get(o.get("ticker", "")) not in out])
+
+    def _xp_shard_paused(self, ticker: str) -> bool:
+        """True for a market _xp_watchdog_view leaves out: its shard held by
+        a pause or shown paused by the status read during one -- every market
+        while that status shows the whole exchange paused. The coverage alert
+        asks this (coverage_exempt)."""
+        if not self._xp:
+            return False
+        st = self._xp_status or set()
+        return -1 in st or self._ticker_shard.get(ticker) in (set(self._xp) | st)
 
     def _xp_check(self, now_ts: float) -> None:
         """EXCHANGE PAUSE, once a full cycle: refresh Kalshi's published
@@ -31339,7 +31355,8 @@ class IncentiveMarketMaker:
             # (A side or event stood down by the toxic-flow halt is one-sided
             # or dark ON PURPOSE -- if our pad was what lifted a side to
             # target, it stops qualifying -- so it neither counts nor pages;
-            # nor does one the sweep or group breaker holds: coverage_exempt.)
+            # nor does one the sweep or group breaker holds, or one on a shard
+            # Kalshi has paused: coverage_exempt.)
             if not fast_only and t in self.state.selected and mq \
                     and pad_band_ok(meta.series, ext_bid, ext_ask) \
                     and not self.coverage_exempt(t, now_ts):
@@ -34589,9 +34606,9 @@ class IncentiveMarketMaker:
                f"shard, cancels still sent; it resumes when the status shows the "
                f"shard trading (read every {EXCH_PAUSE_POLL_SECS:g}s), a write "
                f"there is taken, or a probe write ({EXCH_PAUSE_PROBE_SECS:g}s "
-               f"after the last refusal) goes through; the watchdog leaves paused "
-               f"shards out; `exchange_pause` email at {EXCH_PAUSE_ALERT_MIN:g}m "
-               f"outside Kalshi's published schedule or {EXCH_PAUSE_OVERRUN_MIN:g}m "
+               f"after the last refusal) goes through; the watchdog and the "
+               f"coverage alert leave paused shards out; `exchange_pause` email "
+               f"at {EXCH_PAUSE_ALERT_MIN:g}m outside Kalshi's published schedule or {EXCH_PAUSE_OVERRUN_MIN:g}m "
                f"past its reopening" if EXCH_PAUSE_MODE == "on"
                else " -- every write sent as before"))
         log("shard cash pause (2026-10-27): "
