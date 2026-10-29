@@ -18,7 +18,8 @@ ONE EMAIL per ET day, ending in OK / WATCH / PROBLEM:
            with the bot's own share model (incentive_mm._side_share)
   avoided  every public Kalshi trade that went through a held side's price
            during the hold, our would-be fill capped at that pre-hold size,
-           marked to the current mid
+           marked to the current mid; a DRY hold holds nothing, so there it is
+           our own fills inside the hold (the tape is shown as an upper bound)
   let thru full-rung maker fills whose rung jumped >= the guard's gap within
            its jump window before the fill, the shape the guard stops, marked
            to the current mid; unguarded series (mention books, and since
@@ -47,6 +48,7 @@ USAGE:
   python send_lone_ref_monitor.py --test            # send now, ignore the marker
   python send_lone_ref_monitor.py --day 2026-10-16  # a specific ET day
   python send_lone_ref_monitor.py --no-tape         # skip the Kalshi pulls
+  python send_lone_ref_monitor.py --day 2026-10-22 --store-only   # re-score a day, no email
 Scheduled daily as "KL imm lone-ref" (register_imm_lone_ref.ps1), 07:50 ET.
 Sends every morning, so a silent day is distinguishable from a broken task.
 All console output is ASCII (the task console is cp1252).
@@ -109,6 +111,12 @@ REPLAY_NO_FAIR_NET_PER_DAY = 17.44
 # the jumped fills it lets through; it WATCHes when "on" would have paid --
 # SHADOW_ON_WATCH_PER_DAY or more a day over RUN_MIN_DAYS dry days.
 SHADOW_ON_WATCH_PER_DAY = 10.0
+# A dry hold leaves our rung at the reference, so what "on" would have
+# avoided is our own fills inside the hold (own_fills), not every public
+# trade through the price: the tape also counts trades that went to the lone
+# order ahead of us in the queue, or after our rung was filled out. 10/28 read
+# +$78 on the tape, +$21 on our fills (one KXVHGCB-26OCT28-E8.3 60 @ 37);
+# 10/22-10/28 +$91 vs -$38 (Jack 2026-10-29: "Yes, switch it").
 # the bait-fingerprint stop (incentive_mm BAIT_STOP_MODE, 2026-10-22): the
 # stops each day are listed from its bait_stops_<UTC date>.jsonl sink
 FAIR_NAMED = ("carbon arc", "vercel", "rain weekend")
@@ -200,7 +208,8 @@ def parse_episodes(lines, a_ts: float, b_ts: float) -> tuple:
                 open_[key] = dict(ticker=key[0], side=key[1], start=t, ref=int(m.group(4)),
                                   top=int(m.group(5)), rest=int(m.group(6)),
                                   fresh=m.group(7) == "no rung there before",
-                                  jump=int(m.group(8)) if m.group(8) else None)
+                                  jump=int(m.group(8)) if m.group(8) else None,
+                                  dry=" lone-ref guard (dry) " in line)
             continue
         m = _CLEAR.match(line)
         if m:
@@ -481,14 +490,8 @@ def tape_check(eps: list, mids: dict) -> dict:
     return res
 
 
-# ---- fills the guard let through ------------------------------------------------
-
-def jumped_fills(a_ts: float, b_ts: float, mids: dict, with_marks: bool = True) -> list:
-    """Full-rung maker fills in [a_ts, b_ts) whose rung moved toward the touch
-    by >= imm.LONE_REF_MIN_GAP_C within imm.LONE_REF_JUMP_WINDOW_MIN before
-    the fill: the shape the guard is meant to stop. Each is
-    (fill row, jump c, guarded?, $ vs mid now or None)."""
-    win = imm.LONE_REF_JUMP_WINDOW_MIN * 60.0
+def maker_fills(a_ts: float, b_ts: float) -> list:
+    """Our maker fills in [a_ts, b_ts) (pads out), from fills_<UTC date>.jsonl."""
     fills = []
     for d in utc_dates(a_ts, b_ts):
         path = os.path.join(imm.STATUS_DIR, f"fills_{d}.jsonl")
@@ -503,6 +506,55 @@ def jumped_fills(a_ts: float, b_ts: float, mids: dict, with_marks: bool = True) 
                 if (a_ts <= f.get("ts", 0) < b_ts and not f.get("is_taker")
                         and not f.get("is_pad") and f.get("our_book_side")):
                     fills.append(f)
+    return fills
+
+
+def own_fills(eps: list, a_ts: float, b_ts: float, mids: dict, with_marks: bool = True) -> dict:
+    """What dry holds would have avoided: our own maker fills that landed on a
+    side while it was held, marked to the current mid. A dry hold leaves our
+    rung at the reference, so these are exactly the fills "on" would have
+    stood aside from. Same shape as tape_check; a top row's price is our
+    fill's (YES cents)."""
+    by_key = defaultdict(list)
+    for e in eps:
+        by_key[(e["ticker"], e["side"])].append(e)
+    res = dict(trades=0, contracts=0.0, usd=0.0, by_cls=defaultdict(float), top=[], done=True)
+    for f in maker_fills(a_ts, b_ts):
+        side = f["our_book_side"]
+        e = next((e for e in by_key.get((f["ticker"], side), ())
+                  if e["start"] <= f["ts"] < e["end"]), None)
+        if e is None:
+            continue
+        px = f.get("our_price_cents") or round(f.get("yes_price_cents") or 0)
+        n = float(f.get("count") or 0.0)
+        pnl = 0.0
+        if with_marks:
+            try:
+                m = mid_now(f["ticker"], mids)
+            except Exception as ex:                 # one market never costs the email
+                log(f"lone-ref monitor: mid read failed for {f['ticker']}: {ex!r}")
+                m = None
+            if m is not None:
+                pnl = ((m - px) if side == "bid" else (px - m)) * n / 100.0
+        res["trades"] += 1
+        res["contracts"] += n
+        res["usd"] += pnl
+        res["by_cls"][e["cls"]] += pnl
+        res["top"].append((pnl, f["ticker"], side, px, n, e["cls"]))
+    res["top"].sort()
+    res["by_cls"] = dict(res["by_cls"])
+    return res
+
+
+# ---- fills the guard let through ------------------------------------------------
+
+def jumped_fills(a_ts: float, b_ts: float, mids: dict, with_marks: bool = True) -> list:
+    """Full-rung maker fills in [a_ts, b_ts) whose rung moved toward the touch
+    by >= imm.LONE_REF_MIN_GAP_C within imm.LONE_REF_JUMP_WINDOW_MIN before
+    the fill: the shape the guard is meant to stop. Each is
+    (fill row, jump c, guarded?, $ vs mid now or None)."""
+    win = imm.LONE_REF_JUMP_WINDOW_MIN * 60.0
+    fills = maker_fills(a_ts, b_ts)
     if not fills:
         return []
     tickers = {f["ticker"] for f in fills}
@@ -716,8 +768,18 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
         e["dur"] = e["end"] - e["start"]
     score_holds(eps, a_ts, b_ts)
     mids: dict = {}
-    tape = (tape_check(eps, mids) if with_tape and eps else
-            dict(trades=0, contracts=0.0, usd=0.0, by_cls={}, top=[], done=True))
+    empty = dict(trades=0, contracts=0.0, usd=0.0, by_cls={}, top=[], done=True)
+    on_eps = [e for e in eps if not e.get("dry")]
+    dry_eps = [e for e in eps if e.get("dry")]
+    # a held side: every public trade through its price; a dry hold: our own
+    # fills there, with the tape through its price kept as the upper bound
+    tape = tape_check(on_eps, mids) if with_tape and on_eps else empty
+    upper = tape_check(dry_eps, mids) if with_tape and dry_eps else empty
+    own = own_fills(dry_eps, a_ts, b_ts, mids, with_marks=with_tape) if dry_eps else empty
+    blocked = dict(trades=tape["trades"] + own["trades"], usd=tape["usd"] + own["usd"],
+                   by_cls={c: tape["by_cls"].get(c, 0.0) + own["by_cls"].get(c, 0.0)
+                           for c in set(tape["by_cls"]) | set(own["by_cls"])},
+                   top=sorted(tape["top"] + own["top"]), done=tape["done"] and upper["done"])
     jumped = jumped_fills(a_ts, b_ts, mids, with_marks=with_tape)
     fam = families()
     famof = lambda t: fam.get(t.split("-")[0]) or t.split("-")[0]
@@ -741,12 +803,14 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
              max_flaps=worst[1], max_flaps_side=" ".join(worst[0]).strip(),
              cls={c: sum(1 for e in eps if e["cls"] == c) for c in
                   ("at the touch", "inside the book", "no snapshot")},
-             cost=cost, would_be=tape["usd"], would_be_trades=tape["trades"],
-             would_be_by_cls=dict(tape["by_cls"]),
-             tape_done=tape["done"], tape_read=with_tape,
+             cost=cost, would_be=blocked["usd"], would_be_trades=blocked["trades"],
+             would_be_by_cls=dict(blocked["by_cls"]), own_fills=own["trades"],
+             tape_upper=upper["usd"], tape_upper_trades=upper["trades"],
+             tape_done=blocked["done"], tape_read=with_tape,
              let_thru_guarded=sum(x[3] or 0.0 for x in g), let_thru_guarded_n=len(g),
              let_thru_skipped=sum(x[3] or 0.0 for x in s), let_thru_skipped_n=len(s))
     d["net"] = -d["would_be"] - d["cost"]
+    d["net_tape"] = -(tape["usd"] + upper["usd"]) - d["cost"]     # the pre-10/29 measure
     gate_cache: dict = {}
 
     def gate_for(tk: str) -> str:
@@ -755,7 +819,7 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
             gate_cache[se] = fair_gate_of(se)
         return gate_cache[se]
 
-    d["gates"] = gate_totals(eps, tape["top"], gate_for)
+    d["gates"] = gate_totals(eps, blocked["top"], gate_for)
     by_fam = defaultdict(lambda: [0, 0.0, 0.0])
     for e in eps:
         b = by_fam[famof(e["ticker"])]
@@ -783,15 +847,16 @@ def build_report(day, with_tape: bool = True, now=None) -> dict:
     dry = [v for v in store.values() if v.get("mode") == "dry"]
     run["dry_days"] = sum(v["hours"] for v in dry) / 24.0
     run["dry_net"] = sum(v["net"] for v in dry)
+    run["dry_net_tape"] = sum(v.get("net_tape", v["net"]) for v in dry)
     level, reasons = verdict(d, run)
     d["level"] = level
     return dict(d=d, run=run, level=level, reasons=reasons, store=store,
                 bait=bait_stops(a_ts, b_ts),
                 top_flaps=sorted(flaps.items(), key=lambda kv: -kv[1])[:5],
-                top_avoided=[x for x in tape["top"] if x[0] < 0][:5],
-                top_blocked=sorted((x for x in tape["top"] if x[0] > 0), reverse=True)[:5],
+                top_avoided=[x for x in blocked["top"] if x[0] < 0][:5],
+                top_blocked=sorted((x for x in blocked["top"] if x[0] > 0), reverse=True)[:5],
                 jumped=jumped, by_fam=dict(by_fam),
-                by_cls=tape["by_cls"])
+                by_cls=blocked["by_cls"])
 
 
 def bait_stops(a_ts: float, b_ts: float) -> list:
@@ -872,11 +937,12 @@ def render_text(ctx) -> str:
     if d.get("mode") == "dry":
         lines = [
             f"{ctx['level']}: the guard is DRY since 10/22 -- nothing was held. 'On' "
-            f"would have netted {usd(d['net'])}: the fills it would have blocked "
-            f"{blocked} ${abs(d['would_be']):,.0f}, and it would have given up "
-            f"${d['cost']:,.0f} of reward.",
+            f"would have netted {usd(d['net'])}: our fills inside its would-be holds "
+            f"{'made' if d['would_be'] > 0 else 'lost'} ${abs(d['would_be']):,.0f}, and it "
+            f"would have given up ${d['cost']:,.0f} of reward.",
             f"Dry so far: 'on' would have netted {usd(run.get('dry_net', 0.0))} over "
-            f"{run.get('dry_days', 0.0):.1f} days (a WATCH at "
+            f"{run.get('dry_days', 0.0):.1f} days on our own fills (the public tape's upper "
+            f"bound {usd(run.get('dry_net_tape', run.get('dry_net', 0.0)))}; a WATCH at "
             f"+${SHADOW_ON_WATCH_PER_DAY:.0f}/day over {RUN_MIN_DAYS} days).",
             f"Running since 10/16 12:17 ET (on, then dry): {usd(run['net'])} over "
             f"{run['days']:.1f} days ({usd(per_day)}/day; the replay said "
@@ -898,6 +964,25 @@ def render_text(ctx) -> str:
             f"(no fair gate): {usd(covered)} over {gd:.1f} days "
             f"({usd(covered / gd if gd > 0 else 0.0)}/day; the replay said "
             f"+${REPLAY_NO_FAIR_NET_PER_DAY:.0f}/day).")
+    tape_note = (" (tape not read)" if not d.get("tape_read", True) else
+                 "" if d["tape_done"] else " (tape read cut short by its time budget)")
+    cls_note = (" -- at the touch " + usd(by_cls.get("at the touch", 0.0)) + ", inside the book "
+                + usd(by_cls.get("inside the book", 0.0)) if by_cls else "")
+    if d.get("mode") == "dry":
+        n_own = d.get("own_fills", 0)
+        n_on = d["would_be_trades"] - n_own        # holds from before a switch to dry
+        fills_line = (
+            f"Blocked fills: {n_own} of our fills landed on a side while 'on' would have "
+            f"held it" + (f", plus {n_on} public trades through a price it really held"
+                          if n_on else "")
+            + f"; {usd(d['would_be'])} at the current mid{cls_note}. The public tape through "
+            f"the would-be held prices (every trade, ours or not: an upper bound) read "
+            f"{d.get('tape_upper_trades', 0)} trades, {usd(d.get('tape_upper', 0.0))}"
+            f"{tape_note}.")
+    else:
+        fills_line = (f"Blocked fills: {d['would_be_trades']} public trades went through a "
+                      f"held price; those fills would be {usd(d['would_be'])} at the current "
+                      f"mid{tape_note}{cls_note}.")
     lines += [
         "",
         f"Window {a:%m/%d %H:%M}-{b:%H:%M} ET. Guard mode: {d['mode'] or 'unknown'}.",
@@ -907,12 +992,7 @@ def render_text(ctx) -> str:
         f"At the touch (the bait shape) {d['cls']['at the touch']}, inside the book "
         f"{d['cls']['inside the book']}; most-held side {d['max_flaps_side'] or '-'} "
         f"x{d['max_flaps']}.",
-        f"Blocked fills: {d['would_be_trades']} public trades went through a held price; "
-        f"those fills would be {usd(d['would_be'])} at the current mid"
-        + (" (tape not read)" if not d.get("tape_read", True) else
-           "" if d["tape_done"] else " (tape read cut short by its time budget)")
-        + (" -- at the touch " + usd(by_cls.get("at the touch", 0.0)) + ", inside the book "
-           + usd(by_cls.get("inside the book", 0.0)) if by_cls else "") + ".",
+        fills_line,
         fair_line(d, run),
         f"Let through: {d['let_thru_guarded_n']} jumped full-rung fills on guarded series "
         f"{usd(d['let_thru_guarded'])}; not guarded (mention books"
@@ -959,6 +1039,9 @@ def main(argv=None) -> int:
     ap.add_argument("--day", help="ET day to report (YYYY-MM-DD); default yesterday")
     ap.add_argument("--no-tape", action="store_true",
                     help="skip the Kalshi public reads (no avoided fills, no marks)")
+    ap.add_argument("--store-only", action="store_true",
+                    help="build the day and write it to lone_ref_monitor.json (a re-score); "
+                         "no email, no marker")
     args = ap.parse_args(argv)
     low_priority()
 
@@ -967,7 +1050,7 @@ def main(argv=None) -> int:
     day = (datetime.strptime(args.day, "%Y-%m-%d").date() if args.day
            else today_et - timedelta(days=1))
     marker = os.path.join(imm.STATUS_DIR, f"imm_lone_ref_monitor_sent_{today_et}.marker")
-    if not (args.test or args.dry or args.day) and os.path.exists(marker):
+    if not (args.test or args.dry or args.day or args.store_only) and os.path.exists(marker):
         log(f"lone-ref email already sent for {today_et}; exiting")
         return 0
     ctx = build_report(day, with_tape=not args.no_tape, now=now_utc)
@@ -979,6 +1062,8 @@ def main(argv=None) -> int:
         save_store(ctx["store"])
     except OSError as e:
         log(f"! lone_ref_monitor.json not written ({e!r})")
+    if args.store_only:
+        return 0
     attempts = 1 if args.test else 8
     alerter = imm.Alerter("IMM-LONEREF", live=True)
     if not alerter.enabled:

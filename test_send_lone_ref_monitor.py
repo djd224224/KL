@@ -69,6 +69,7 @@ class TestEpisodes(unittest.TestCase):
                          (_ts(16, 20), _ts(16, 21), 69, 6, 63))
         self.assertEqual((b["end"], b["fresh"], b["jump"]), (_ts(16, 40), True, None))   # restart
         self.assertEqual((c["start"], c["end"]), (_ts(16, 50), _ts(16, 55)))           # clipped
+        self.assertEqual([e["dry"] for e in eps], [False, False, True])
 
     def test_a_hold_from_before_the_window_is_clipped(self):
         eps, _m = lm.parse_episodes([hold("15:00:00"), clear("16:30:00")],
@@ -174,6 +175,52 @@ class TestMarketValue(unittest.TestCase):
             self.assertEqual(g.call_count, 1)
 
 
+class TestOwnFills(unittest.TestCase):
+    """Jack 2026-10-29: "Yes, switch it": a dry hold leaves our rung at the
+    reference, so "on" would have avoided our own fills there -- not the
+    public trades that went to the lone order ahead of us (10/28: tape -$79,
+    our one fill KXVHGCB-26OCT28-E8.3 60 @ 37 -$22)."""
+
+    def setUp(self):
+        rows = [
+            dict(ts=_ts(4, 35, 48, d=20), ticker="KXVHGCB-1", our_book_side="bid",
+                 our_price_cents=37, yes_price_cents=37.0, count=60.0, is_taker=False,
+                 is_pad=False),                                  # inside the bid's hold
+            dict(ts=_ts(4, 36, d=20), ticker="KXVHGCB-1", our_book_side="ask",
+                 our_price_cents=40, yes_price_cents=40.0, count=10.0, is_taker=False,
+                 is_pad=False),                                  # the other side: not held
+            dict(ts=_ts(5, 0, d=20), ticker="KXVHGCB-1", our_book_side="bid",
+                 our_price_cents=37, yes_price_cents=37.0, count=20.0, is_taker=False,
+                 is_pad=False),                                  # after the hold
+            dict(ts=_ts(4, 40, d=20), ticker="KXVHGCB-1", our_book_side="bid",
+                 our_price_cents=37, yes_price_cents=37.0, count=5.0, is_taker=True,
+                 is_pad=False),                                  # our taker order
+            dict(ts=_ts(4, 41, d=20), ticker="KXHOU-1", our_book_side="ask",
+                 our_price_cents=33, yes_price_cents=33.0, count=30.0, is_taker=False,
+                 is_pad=False),                                  # inside the ask's hold
+        ]
+        self.path = os.path.join(imm.STATUS_DIR, "fills_2026-10-20.jsonl")
+        with open(self.path, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        self.addCleanup(os.remove, self.path)
+
+    def test_our_fills_inside_a_dry_hold_marked_to_now(self):
+        eps = [dict(ticker="KXVHGCB-1", side="bid", start=_ts(4, 35, d=20),
+                    end=_ts(4, 51, d=20), ref=37, cls="inside the book"),
+               dict(ticker="KXHOU-1", side="ask", start=_ts(4, 30, d=20),
+                    end=_ts(4, 45, d=20), ref=33, cls="at the touch")]
+        mids = {"KXVHGCB-1": 0.0, "KXHOU-1": 37.5}                   # no network
+        got = lm.own_fills(eps, _ts(0, d=20), _ts(23, d=20), mids)
+        self.assertEqual(got["trades"], 2)
+        self.assertEqual(got["contracts"], 90.0)
+        self.assertAlmostEqual(got["usd"], -22.20 + (33 - 37.5) * 0.30, 6)
+        self.assertEqual(got["top"][0][:5], (-22.2, "KXVHGCB-1", "bid", 37, 60.0))
+        self.assertAlmostEqual(got["by_cls"]["at the touch"], -1.35, 6)
+        unmarked = lm.own_fills(eps, _ts(0, d=20), _ts(23, d=20), {}, with_marks=False)
+        self.assertEqual((unmarked["trades"], unmarked["usd"]), (2, 0.0))
+
+
 class TestJumpedFills(unittest.TestCase):
 
     def setUp(self):
@@ -264,21 +311,33 @@ class TestVerdict(unittest.TestCase):
         got = lm.bait_stops(_ts(0, 0), _ts(23, 59))
         self.assertEqual([r["ticker"] for r in got], ["KXLOLTEEMO-WORLDS26-Y"])
         ctx = dict(level="OK", reasons=[], bait=got,
-                   run=dict(days=6.5, net=-128.0, dry_days=1.0, dry_net=12.0),
+                   run=dict(days=6.5, net=-128.0, dry_days=1.0, dry_net=12.0,
+                            dry_net_tape=71.0),
                    d=dict(day="2026-10-16", net=12.4, would_be=-20.0, cost=7.6, mode="dry",
                           a_ts=_ts(0, 0), b_ts=_ts(23, 59), holds=40, sides=9, markets=8,
                           at_once=2.0, at_once_max=5, median_s=30.0,
                           cls={"at the touch": 20, "inside the book": 20, "no snapshot": 0},
                           max_flaps=8, max_flaps_side="KXA-1 bid",
-                          would_be_trades=3, tape_done=True, let_thru_guarded_n=0,
+                          would_be_trades=1, own_fills=1, tape_upper=-79.0,
+                          tape_upper_trades=8, tape_done=True, let_thru_guarded_n=0,
                           would_be_by_cls={}, gates={"none": [40, 7.6, -20.0]},
                           let_thru_guarded=0.0, let_thru_skipped_n=0, let_thru_skipped=0.0))
         self.assertEqual(lm.subject_for(ctx), "IMM lone-ref guard 10/16 (dry): 'on' would "
                                               "have netted +$12 | 1 bait stop | OK")
         text = lm.render_text(ctx)
         self.assertTrue(text.startswith("OK: the guard is DRY since 10/22 -- nothing was held. "
-                                        "'On' would have netted +$12"))
-        self.assertIn("Dry so far: 'on' would have netted +$12 over 1.0 days", text)
+                                        "'On' would have netted +$12: our fills inside its "
+                                        "would-be holds lost $20"))
+        self.assertIn("Dry so far: 'on' would have netted +$12 over 1.0 days on our own fills "
+                      "(the public tape's upper bound +$71;", text)
+        self.assertIn("Blocked fills: 1 of our fills landed on a side while 'on' would have "
+                      "held it; -$20 at the current mid. The public tape through the would-be "
+                      "held prices (every trade, ours or not: an upper bound) read 8 trades, "
+                      "-$79.", text)
+        ctx["d"]["would_be_trades"] = 3                     # 2 from holds before a switch to dry
+        self.assertIn("held it, plus 2 public trades through a price it really held; -$20",
+                      lm.render_text(ctx))
+        ctx["d"]["would_be_trades"] = 1
         self.assertIn("Bait stops (fingerprint): 1 today", text)
         self.assertIn("KXLOLTEEMO-WORLDS26-Y BID 60 @ 66c -- side out until 00:00 ET, guard ON "
                       "in KXLOLTEEMO-WORLDS26", text)
@@ -373,6 +432,14 @@ class TestDryRun(unittest.TestCase):
         with mock.patch.object(lm, "_get", side_effect=AssertionError("network")):
             self.assertEqual(lm.main(["--dry", "--no-tape", "--day", "2026-10-16"]), 0)
         self.assertFalse(os.path.exists(lm.store_path()))          # --dry writes nothing
+
+    def test_store_only_writes_the_day_and_sends_nothing(self):
+        self.addCleanup(lambda: os.path.exists(lm.store_path()) and os.remove(lm.store_path()))
+        with mock.patch.object(lm, "_get", side_effect=AssertionError("network")), \
+                mock.patch.object(imm, "Alerter", side_effect=AssertionError("send")):
+            self.assertEqual(lm.main(["--store-only", "--no-tape", "--day", "2026-10-16"]), 0)
+        with open(lm.store_path(), encoding="utf-8") as f:
+            self.assertIn("2026-10-16", json.load(f))
 
 
 if __name__ == "__main__":
