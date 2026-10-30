@@ -375,23 +375,165 @@ ORDER BY created_time DESC
 LIMIT 15
 """
 
-SQL_DAILY_PNL = f"""
--- Settled P&L per event_date over the last 30 days. Drives the History
--- modal so the user can see whether the bot's been making or losing
--- money over time without leaving the dashboard.
+# Settled P&L per event_date for the History modal, so the user can see
+# whether the bot's been making or losing money over time. Two sources,
+# split at the first day the IMM (incentive_mm.py) quoted next-day KXHIGH
+# markets on this same Kalshi account (Jack 2026-10-29: "PnL history in
+# this is wrong" -- it showed +$1,474 / +$1,934 / +$1,173 for 10/26-28,
+# when this bot made +$32.99 / +$20.04 / -$2.08):
+#   - before it, Kalshi's own settlement records: revenue - YES cost - NO
+#     cost - fees, every day on record. settlements_clean.pnl_dollars and
+#     total_cost_dollars book each NO fill at the YES price (10/20: -$155
+#     against -$92.45), and the old 30-day window left older days
+#     "unsettled";
+#   - from it, this bot's own fills (client_order_id set: the order is in
+#     KXHIGH_orders), each valued at settlement at Kalshi's raw price for
+#     its side, as high_temp_digest_pnl.py does. The account's records now
+#     mix in the IMM's fills, and Kalshi's revenue leaves out the $1 it pays
+#     at once on a YES/NO pair that nets (the IMM buys both sides).
+# Both agree to the cent on every day before the IMM (10/02: -$97.13 on
+# $430.02). KXHIGH_fills only holds Kalshi's last ~2 months of fills, so
+# the fills days are kept in GCS (PNL_STORE_OBJECT) once computed.
+IMM_ERA_FROM = "2026-10-24"
+
+SQL_DAILY_PNL_SETTLED = f"""
 SELECT
   event_date,
-  COUNT(*)                                                      AS n_markets,
-  COUNTIF(pnl_dollars > 0)                                       AS n_wins,
-  ROUND(SUM(total_cost_dollars), 2)                              AS total_cost,
-  ROUND(SUM(pnl_dollars), 2)                                     AS pnl,
-  ROUND(SAFE_DIVIDE(SUM(pnl_dollars), SUM(total_cost_dollars)) * 100, 1) AS roi_pct
-FROM `{PROJECT}.{DATASET}.KXHIGH_settlements_clean`
-WHERE event_date >= DATE_SUB(CURRENT_DATE("America/New_York"), INTERVAL 30 DAY)
-  AND event_date <  CURRENT_DATE("America/New_York")
+  COUNT(*)              AS n_markets,
+  COUNTIF(pnl > 0)      AS n_wins,
+  ROUND(SUM(cost), 2)   AS total_cost,
+  ROUND(SUM(pnl), 2)    AS pnl
+FROM (
+  SELECT event_date,
+         IFNULL(yes_total_cost_dollars, 0) + IFNULL(no_total_cost_dollars, 0) AS cost,
+         IFNULL(revenue_dollars, 0) - IFNULL(yes_total_cost_dollars, 0)
+           - IFNULL(no_total_cost_dollars, 0) - IFNULL(fee_cost_dollars, 0)    AS pnl
+  FROM `{PROJECT}.{DATASET}.KXHIGH_settlements_clean`
+  WHERE event_date < DATE "{IMM_ERA_FROM}"
+    AND LOWER(result) IN ('yes', 'no')
+)
+WHERE cost > 0
 GROUP BY event_date
-ORDER BY event_date DESC
 """
+
+SQL_DAILY_PNL_BOT_FILLS = f"""
+WITH fills AS (
+  SELECT event_date, market_ticker, side, action,
+         SAFE_CAST(filled_count AS FLOAT64)                                       AS n,
+         SAFE_CAST(IF(side = 'yes', raw_yes_price_dollars, raw_no_price_dollars) AS FLOAT64) AS px,
+         IFNULL(SAFE_CAST(fee_cost_dollars AS FLOAT64), 0)                        AS fee
+  FROM `{PROJECT}.{DATASET}.KXHIGH_fills_clean`
+  WHERE event_date >= DATE "{IMM_ERA_FROM}"
+    AND event_date <  CURRENT_DATE("America/New_York")
+    AND TRIM(IFNULL(client_order_id, '')) != ''
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY fill_id ORDER BY fill_ts DESC) = 1
+),
+results AS (
+  SELECT market_ticker, LOGICAL_OR(LOWER(result) = 'yes') AS yes_won
+  FROM `{PROJECT}.{DATASET}.KXHIGH_settlements_clean`
+  WHERE LOWER(result) IN ('yes', 'no')
+  GROUP BY market_ticker
+),
+per_market AS (
+  -- contracts x (payout - price) - fee; a sell counts the other way round
+  SELECT f.event_date, f.market_ticker,
+         SUM(IF(f.action = 'sell', 0, f.n * f.px))                              AS cost,
+         SUM(IF(f.action = 'sell', -1, 1) * f.n
+             * (IF((f.side = 'yes') = r.yes_won, 1, 0) - f.px) - f.fee)         AS pnl
+  FROM fills f JOIN results r USING (market_ticker)
+  GROUP BY f.event_date, f.market_ticker
+)
+SELECT
+  event_date,
+  COUNT(*)              AS n_markets,
+  COUNTIF(pnl > 0)      AS n_wins,
+  ROUND(SUM(cost), 2)   AS total_cost,
+  ROUND(SUM(pnl), 2)    AS pnl,
+  -- the first day KXHIGH_fills still holds; Kalshi's window may cut it part-way
+  (SELECT MIN(event_date) FROM `{PROJECT}.{DATASET}.KXHIGH_fills_clean`) AS window_from
+FROM per_market
+GROUP BY event_date
+"""
+
+PNL_STORE_OBJECT = os.environ.get("KXHIGH_PNL_STORE_OBJECT", "pnl_history.json")
+_PNL_COLS = ["event_date", "n_markets", "n_wins", "total_cost", "pnl"]
+
+
+def _pnl_row(r) -> dict:
+    return {"n_markets": int(r["n_markets"]), "n_wins": int(r["n_wins"]),
+            "total_cost": round(float(r["total_cost"]), 2), "pnl": round(float(r["pnl"]), 2)}
+
+
+def merge_daily_pnl(settled: pd.DataFrame, bot_fills: pd.DataFrame,
+                    stored: dict) -> tuple[pd.DataFrame, dict]:
+    """(History rows, newest first; the fills days to keep in GCS).
+
+    Days before IMM_ERA_FROM come from `settled`. A fills day is taken
+    fresh, except the first day KXHIGH_fills still holds when a stored copy
+    exists (the window may have cut it); a stored day the fills no longer
+    hold stays as stored, so the kept days only ever grow."""
+    rows: dict[str, dict] = {}
+    if settled is not None and not settled.empty:
+        for _, r in settled.iterrows():
+            d = str(r["event_date"])
+            if d < IMM_ERA_FROM:
+                rows[d] = _pnl_row(r)
+    keep = {d: dict(v) for d, v in (stored or {}).items() if d >= IMM_ERA_FROM}
+    if bot_fills is not None and not bot_fills.empty:
+        window_from = str(bot_fills["window_from"].iloc[0])
+        for _, r in bot_fills.iterrows():
+            d = str(r["event_date"])
+            if d >= IMM_ERA_FROM and (d > window_from or d not in keep):
+                keep[d] = _pnl_row(r)
+    rows.update(keep)
+    df = pd.DataFrame([{"event_date": d, **v} for d, v in sorted(rows.items(), reverse=True)],
+                      columns=_PNL_COLS)
+    return df, keep
+
+
+def _read_pnl_store() -> dict | None:
+    """The fills days kept in GCS: {} when there are none yet, None when the
+    read fails (then nothing is written back, so no kept day is lost)."""
+    try:
+        from google.cloud import storage
+        blob = storage.Client(project=PROJECT).bucket(PUBLIC_BUCKET).blob(PNL_STORE_OBJECT)
+        if not blob.exists():
+            return {}
+        days = json.loads(blob.download_as_text())
+        return days if isinstance(days, dict) else None
+    except Exception as e:
+        print(f"  P&L store read failed (non-fatal): {e}", flush=True)
+        return None
+
+
+def _write_pnl_store(days: dict) -> None:
+    if not PUBLISH_DEFAULT:
+        return
+    try:
+        from google.cloud import storage
+        blob = storage.Client(project=PROJECT).bucket(PUBLIC_BUCKET).blob(PNL_STORE_OBJECT)
+        blob.cache_control = "no-store"
+        blob.upload_from_string(json.dumps(days, indent=1, sort_keys=True),
+                                content_type="application/json")
+    except Exception as e:
+        print(f"  P&L store write failed (non-fatal): {e}", flush=True)
+
+
+def load_daily_pnl() -> pd.DataFrame:
+    """The History modal's settled P&L per event_date (see IMM_ERA_FROM)."""
+    frames = {}
+    for key, sql in (("settled", SQL_DAILY_PNL_SETTLED), ("bot fills", SQL_DAILY_PNL_BOT_FILLS)):
+        try:
+            frames[key] = _q(sql)
+        except Exception as e:
+            print(f"  daily P&L from {key} unavailable ({type(e).__name__}); "
+                  f"the History shows the rest", flush=True)
+            frames[key] = pd.DataFrame()
+    stored = _read_pnl_store()
+    df, keep = merge_daily_pnl(frames["settled"], frames["bot fills"], stored or {})
+    if stored is not None and keep != stored:
+        _write_pnl_store(keep)
+    return df
 
 SQL_SETTLED_PNL_PER_MARKET = f"""
 -- Per-market realized P&L for markets that settled in the last 2 ET
@@ -539,10 +681,7 @@ def load() -> dict:
         out["fill_rate"] = _q(SQL_TODAY_FILL_RATE)
     except Exception:
         out["fill_rate"] = pd.DataFrame()
-    try:
-        out["daily_pnl"] = _q(SQL_DAILY_PNL)
-    except Exception:
-        out["daily_pnl"] = pd.DataFrame()
+    out["daily_pnl"] = load_daily_pnl()
     try:
         out["settled_pnl"] = _q(SQL_SETTLED_PNL_PER_MARKET)
     except Exception as e:
@@ -2588,8 +2727,8 @@ document.addEventListener('keydown', (e) => {
 def _render_history_modal(daily_pnl: pd.DataFrame) -> tuple[str, str]:
     """Build the History modal: list of past dashboard snapshots stored at
     `archive/{YYYY-MM-DD}.html` in GCS. Each entry links to the full
-    archived dashboard for that day, plus the day's settled P&L if we
-    have it from `KXHIGH_settlements_clean`.
+    archived dashboard for that day, plus this bot's settled P&L for the
+    day if we have it (load_daily_pnl).
 
     The archive grows by one entry per ET-day going forward (each build
     overwrites today's file — the final write at end-of-day is the
@@ -2619,6 +2758,7 @@ def _render_history_modal(daily_pnl: pd.DataFrame) -> tuple[str, str]:
         )
     else:
         rows = []
+        _, et_yesterday = _et_today_yesterday()
         for d in archive_dates:
             url = f"https://storage.googleapis.com/{PUBLIC_BUCKET}/archive/{d}.html"
             stats = pnl_by_date.get(d)
@@ -2635,7 +2775,9 @@ def _render_history_modal(daily_pnl: pd.DataFrame) -> tuple[str, str]:
                     f'<td>{stats["wins"]}/{stats["n"]} · {wr:.0f}%</td>'
                 )
             else:
-                stats_cell = '<td colspan="5" class="muted">unsettled</td>'
+                # an older day with no row had no settled fills of this bot's
+                stats_cell = ('<td colspan="5" class="muted">'
+                              + ("unsettled" if d >= et_yesterday else "no fills") + '</td>')
             rows.append(
                 f'<tr><td><a href="{url}" target="_blank" '
                 f'style="color:var(--blue);text-decoration:none">{d} ▸</a></td>'
@@ -2644,8 +2786,10 @@ def _render_history_modal(daily_pnl: pd.DataFrame) -> tuple[str, str]:
         body = (
             '<div style="font-size:11px;color:var(--ink-dim);margin-bottom:8px">'
             'Each link opens the full dashboard as it was at end of that day '
-            '(or latest snapshot, if today). Settled P&amp;L numbers join in '
-            'from <code>KXHIGH_settlements_clean</code> the day after.'
+            '(or latest snapshot, if today). Settled P&amp;L joins in the day '
+            'after: this bot\'s own fills, each at Kalshi\'s price for its side. '
+            'From 10/24 the IMM\'s KXHIGH market making on the same account is '
+            'left out (it is in the IMM\'s own P&amp;L).'
             '</div>'
             '<table class="detail">'
             '<tr><th>date</th><th>markets</th><th>cost</th><th>P&amp;L</th>'
