@@ -128,8 +128,29 @@ button { font: inherit; color: inherit; }
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
 }
-.bar-in { max-width: 1480px; margin: 0 auto; padding: 10px 16px 0; display: flex; flex-direction: column; gap: 8px; }
+.bar-in { max-width: 1480px; margin: 0 auto; padding: 10px 16px 0; display: flex; gap: 14px; align-items: flex-start; }
+.bar-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 .bar-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* the whole account, top right (Jack 2026-10-29: "i expect it to be at the top right of the command center in a small box") */
+.acctbox {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; padding: 5px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+  color: var(--ink); font-size: 12.5px; line-height: 1.35; white-space: nowrap;
+}
+.acctbox[hidden] { display: none; }
+.acctbox:hover { text-decoration: none; border-color: var(--ink-2); }
+.acctbox .abv { font-size: 15px; font-weight: 600; }
+.acctbox .abk { color: var(--ink-2); }
+.nav-row { display: flex; align-items: center; gap: 12px; }
+.nav-row .nav { flex: 1 1 auto; min-width: 0; }
+/* the box takes ~290px of the controls' row: below ~1350px the as-of note wraps to two lines so the row still fits */
+@media (min-width: 1101px) and (max-width: 1350px) { .bar-row .asof { white-space: normal; max-width: 150px; line-height: 1.25; } }
+@media (max-width: 1100px) {
+  .bar-in { flex-wrap: wrap; row-gap: 6px; }
+  .acctbox { order: -1; width: 100%; flex-direction: row; flex-wrap: wrap; column-gap: 14px; margin: 0; padding: 3px 10px; }
+  main section { scroll-margin-top: 150px; }
+}
+@media (max-width: 640px) { .acctbox { display: none; } .nav-row { flex-wrap: wrap; } }
 .brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 .brand h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; white-space: nowrap; }
 .asof { color: var(--ink-2); font-size: 12.5px; white-space: nowrap; }
@@ -387,14 +408,15 @@ footer { color: var(--muted); font-size: 12px; }
 
 <header class="bar">
   <div class="bar-in">
+    <div class="bar-main">
     <div class="bar-row">
       <div class="brand"><h1>IMM Command Center</h1><span id="live" class="pill"><span class="dot"></span><span id="liveTxt">Live</span></span></div>
       <span id="asof" class="asof"></span>
       <span class="grow"></span>
       <div class="seg" id="winSeg" role="group" aria-label="Time window"></div>
       <div class="daypick" id="dayPick" aria-label="Any day in the history"></div>
-      <input id="q" class="search" type="search" placeholder="Filter ticker, event, family" aria-label="Filter">
     </div>
+    <div class="nav-row">
     <nav class="nav" id="nav">
       <a href="#drivers">Drivers</a>
       <a href="#movers">Movers</a>
@@ -406,6 +428,10 @@ footer { color: var(--muted); font-size: 12px; }
       <a href="#history">History</a>
       <a href="#health">Health<span class="badge" id="bHealth" hidden></span></a>
     </nav>
+    <input id="q" class="search" type="search" placeholder="Filter ticker, event, family" aria-label="Filter">
+    </div>
+    </div>
+    <a class="acctbox" id="acctBox" href="#health" hidden></a>
   </div>
 </header>
 
@@ -2715,6 +2741,25 @@ function acctSum(list, k) {
   if (!cs.length) return null;
   return { v: cs.reduce((t, x) => t + x[1].v, 0), tip: cs.map((x) => day(x[0]) + " " + fmtUSD(x[1].v, { sign: true, dp: 2 })).join("\n") };
 }
+function renderAcctBox(S, L, why) {
+  // the small box at the top right: the account, its move since 7am and the
+  // three bots besides the IMM (the IMM, the Kalshi line and the email days
+  // are in the Health tab's table, a click away)
+  const at = L ? "since " + dtET(L.since) : "7am " + dET(S.since) + " to " + dET(S.until);
+  const usd = (c) => c ? '<span class="' + cls(c.v, 0.5) + '">' + fmtUSD(c.v, { sign: true, dp: 0 }) + "</span>" : '<span class="muted">—</span>';
+  const dd = acctCell(S, "day");
+  const box = $("acctBox");
+  box.innerHTML = '<div><span class="abk">Account</span> <b class="abv">' + fmtUSD(S.value, { dp: 0 }) + "</b>" +
+    (dd ? " " + usd(dd) + ' <span class="abk">' + esc(at) + "</span>" : "") + "</div>" +
+    "<div>" + ["Crypto", "Weather", "Other"].map((b) => b + " " + usd(acctCell(S, b))).join(" · ") + "</div>";
+  const lines = ACCT_ROWS.map(([k, lbl]) => [lbl, acctCell(S, k)]).filter((x) => x[1]);
+  box.title = "Account value " + fmtUSD(S.value, { dp: 2 }) + (S.app != null ? " (Kalshi app " + fmtUSD(S.app, { dp: 2 }) + ", no subaccounts)" : "") +
+    " · total profit " + fmtUSD(S.profit, { sign: true }) + "\n" + (L ? "Since " + dtET(L.since) : at) + ": " +
+    lines.map((x) => x[0] + " " + fmtUSD(x[1].v, { sign: true, dp: 2 })).join(", ") +
+    (dd ? " = " + fmtUSD(dd.v, { sign: true, dp: 2 }) : "") + "\n" + (L ? "read " + dtET(L.until) : "the 7am email's") +
+    (why ? " · " + why : "") + "\nClick for the full split (Health)";
+  box.hidden = false;
+}
 function renderAccount() {
   const a = D.acct || {}, L = a.live, E = a.email || [], last = E.length ? E[E.length - 1] : null;
   const S = L || last;              // the account figures: live, else the last email's
@@ -2723,8 +2768,10 @@ function renderAccount() {
     $("acctStats").innerHTML = '<div class="small muted">No account read yet' + (why ? ": " + esc(why) : "") + "</div>";
     $("acctBots").innerHTML = "";
     $("acctNote").textContent = "";
+    $("acctBox").hidden = true;
     return;
   }
+  renderAcctBox(S, L, why);
   const at = L ? a.at || L.until : S.until;
   $("acctNote").textContent = (L ? "live, read " : "the 7am email's, ") + dtET(at) + (why ? " · " + why : "") +
     (L && L.warn ? " · " + L.warn.map((w) => w.replace(/^!\s*/, "")).join("; ") : "");
