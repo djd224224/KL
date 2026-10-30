@@ -21073,6 +21073,86 @@ class TestVercelPreDGate(unittest.TestCase):
         self.assertEqual(self._quotes(bot), [])
         self.assertIn(self.T, bot._vercel_stood)
 
+    def test_an_ask_breach_quotes_the_bid_alone(self):
+        # Jack 2026-10-30: "Bid-only on breach", "but only if exceeds payout
+        # threshold" -- offers under fair - 15c leave the bid alone; bids over
+        # fair + 15c still stand aside; inside the tolerance both sides quote
+        g = lambda: imm.vercel_gate(self.T, time.time(), 49, 51, self.CLOSE)
+        so = lambda s="KXOPENVREQ": imm.vercel_side_out(s, self.T, time.time(), 49, 51,
+                                                        self.CLOSE)
+        self._write()                                         # fair 40c agrees
+        self.assertEqual(g(), ("", {}))
+        self.assertIsNone(so())
+        self._write(x_l=21.0)                                 # fair 80c: ask 51 < 65
+        why, inp = g()
+        self.assertEqual((why, inp["reason"], inp["side_out"]), ("", "band", "ask"))
+        self.assertIn("ask side", inp["why"])
+        self.assertEqual(so(), "ask")
+        self.assertIsNone(so("KXFOO"))
+        with mock.patch.object(imm, "VERCEL_BID_ONLY", False):
+            why, inp = g()
+        self.assertTrue(why)
+        self.assertEqual(inp["reason"], "band")
+        self.assertIn("VERCEL_BID_ONLY", imm._CONFIG_CODE_KNOBS)
+        self._write(x_l=19.5)                                 # fair 20c: bid 49 > 35
+        why, inp = g()
+        self.assertTrue(why)
+        self.assertEqual((inp["reason"], inp["bid_bad"]), ("band", True))
+        self.assertIsNone(so())
+
+    def test_the_bid_rests_alone_only_above_the_payout_floor(self):
+        bot = self._bot()
+        self._write()
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"bid", "ask"})
+        self._write(x_l=21.0)                                 # an ask breach
+        bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertEqual({s for s, _ in q}, {"bid"}, q)       # safe-join, behind the touch
+        self.assertIn(self.T, bot._vercel_bid_only)
+        self.assertNotIn(self.T, bot._vercel_stood)
+        # a projection under the $1 floor starts the hopeless clock: the bid
+        # alone stands aside at once (no 30-minute dip allowance)
+        bot.state.hopeless_since[self.T] = time.time()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._vercel_stood)
+        self.assertIn(self.T, bot.state.selected)            # still a member
+        bot.state.hopeless_since.pop(self.T)                  # back above the bar
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"bid"})
+        self.assertNotIn(self.T, bot._vercel_stood)
+        # back inside the tolerance: both sides again
+        self._write()
+        bot.run_cycle()
+        self.assertEqual({s for s, _ in self._quotes(bot)}, {"bid", "ask"})
+        self.assertNotIn(self.T, bot._vercel_bid_only)
+        # bids over fair + 15c: both sides still stand aside
+        self._write(x_l=19.5)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._vercel_stood)
+
+    def test_the_estimate_counts_the_bid_alone(self):
+        # the selection's probe rests what the loop would -- on an ask breach
+        # the bid alone -- so the reward estimate and the $1 floor projection
+        # judged on it are that side's share
+        with mock.patch.object(imm, "FAMILY_SIDE_LEANS", {}):
+            bot = self._bot()
+            self._write()
+            bot.run_cycle()
+            meta = bot.state.selected[self.T]
+            bot._estimate_candidate_yield(meta, [])
+            both, floor_both = meta.est_frac, meta.floor_dollars_per_day
+            self.assertGreater(both, 0.0)
+            self._write(x_l=21.0)
+            bot._estimate_candidate_yield(meta, [])
+            self.assertAlmostEqual(meta.est_frac, both / 2, places=6)
+            self.assertAlmostEqual(meta.floor_dollars_per_day, floor_both / 2, places=6)
+            with mock.patch.object(imm, "VERCEL_BID_ONLY", False):
+                bot._estimate_candidate_yield(meta, [])
+            self.assertAlmostEqual(meta.est_frac, both, places=6)
+
 
 
 class TestYouTube2Pilot(unittest.TestCase):

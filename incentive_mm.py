@@ -11031,6 +11031,7 @@ _CONFIG_CODE_KNOBS = (
     # fair file's "model" block
     "VERCEL_ENABLE", "VERCEL_SERIES", "VERCEL_CUTOFF_BEFORE_D_MIN",
     "VERCEL_FAIR_TOL_CENTS", "VERCEL_FAIR_MIN_P", "VERCEL_FAIR_TTL_MIN",
+    "VERCEL_BID_ONLY",                           # bid only on an ask breach (2026-10-30)
     "VERCEL_FAIR_HOLD_MIN", "VERCEL_FAIR_REFRESH_SECS",
     "VERCEL_RUN_TTL_MIN", "VERCEL_RUN_ANCHOR",
     "VERCEL_SIZE_MULT",           # the family x2 (2026-10-09)
@@ -15450,6 +15451,50 @@ def vercel_gate_reason(ticker: str, now_ts: float,
                  "tol": VERCEL_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad})
     return "", {}
+
+
+# VERCEL BID ONLY ON AN ASK BREACH (Jack 2026-10-30: "Bid-only on breach",
+# "but only if exceeds payout threshold"). Offers more than
+# VERCEL_FAIR_TOL_CENTS under the fair stood the whole strike aside, and it
+# flickered at the edge: KXOPENSOURCESHARE-26NOV02-T70.2 (book 14x64 vs fair
+# 79c -- Nov 1 is a Sunday, when the open-weights share runs ~+5.6 pp over
+# the days before) went out 01:18Z, in 01:23, out 01:28, in 01:33Z, and
+# T72.9 likewise (9x55 vs 71c), each selected at ~$1.8/day. Now the ask
+# side rests no rung -- selling YES that cheap is what the gate stops --
+# and the bid joins the touch, under fair - tol, resting only while the
+# scored walk reaches it: monthly rain's one-side rule on the buying side.
+# ABOVE THE PAYOUT FLOOR: the selection's probe sees the same one side
+# (vercel_side_out), so the reward estimate and the floor projection count
+# the bid alone, and it rests only while the market has no hopeless clock
+# running (state.hopeless_since: a projection under PAYOUT_FLOOR_DOLLARS
+# starts it, ADMIT_SUSTAIN_SECS back above clears it); it stands aside
+# meanwhile. A bid breach still stands aside. IMM_VERCEL_BID_ONLY=0 stands
+# both sides aside again.
+VERCEL_BID_ONLY = os.environ.get("IMM_VERCEL_BID_ONLY", "1") == "1"
+
+
+def vercel_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                ext_ask: Optional[float], close_time: Optional[datetime] = None
+                ) -> Tuple[str, dict]:
+    """vercel_gate_reason with an ask breach turned into bid only
+    (VERCEL_BID_ONLY): ('', {}) to quote both sides; ('', inputs) when
+    inputs' `side_out` ("ask") rests no rung; else (why, guard-skip inputs):
+    stand aside."""
+    why, inp = vercel_gate_reason(ticker, now_ts, ext_bid, ext_ask, close_time)
+    if (why and VERCEL_BID_ONLY and inp.get("reason") == "band"
+            and inp.get("ask_bad") and not inp.get("bid_bad")):
+        return "", dict(inp, why=why, side_out="ask")
+    return why, inp
+
+
+def vercel_side_out(series: str, ticker: str, now_ts: float,
+                    ext_bid: Optional[float], ext_ask: Optional[float],
+                    close_time: Optional[datetime] = None) -> Optional[str]:
+    """The side a Vercel market quotes without right now (vercel_gate's
+    side_out), else None: the selection probe's view of the bid-only rule."""
+    if not vercel_series(series):
+        return None
+    return vercel_gate(ticker, now_ts, ext_bid, ext_ask, close_time)[1].get("side_out")
 
 
 # ----------------------------------------------------------------------------
@@ -21057,6 +21102,8 @@ class IncentiveMarketMaker:
         # the pull runs on the quake refresher AND the EMSC reader thread
         self._quake_ask_lock = threading.Lock()
         self._vercel_stood: Set[str] = set()      # Vercel pre-D gate stand-asides
+        self._vercel_bid_only: Set[str] = set()   # ...quoting the bid alone
+        self._vercel_unearning: Dict[str, Set[str]] = {}  # ...its bid not earning
         self._ytw_stood: Set[str] = set()         # YouTube weekly pilot stand-asides
         self._yt1_stood: Set[str] = set()         # YouTube #1 pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
@@ -29318,8 +29365,11 @@ class IncentiveMarketMaker:
             # the loop rests only the side that does not fight the fair, so
             # the estimate -- and the payout floor judged on it -- counts
             # that side alone, and only while it earns
-            _rso = rain_monthly_side_out(meta.series, meta.ticker,
-                                         _now.timestamp(), eb, ea)
+            _rso = (rain_monthly_side_out(meta.series, meta.ticker,
+                                          _now.timestamp(), eb, ea)
+                    # ...and the Vercel bid only on an ask breach (VERCEL_BID_ONLY)
+                    or vercel_side_out(meta.series, meta.ticker, _now.timestamp(),
+                                       eb, ea, meta.close_time))
             if _rso is not None:
                 out = drop_unearning_sides(
                     [q for q in out if q.book_side != _rso],
@@ -31428,10 +31478,21 @@ class IncentiveMarketMaker:
 
             # VERCEL PRE-D GATE (Jack 2026-09-27, see VERCEL_ENABLE): quoted
             # only before the measured day and only where the book agrees with
-            # the pre-D fair; fails CLOSED without a fresh read.
+            # the pre-D fair; fails CLOSED without a fresh read. Offers under
+            # fair - tol leave the bid quoting alone, while the market clears
+            # the payout floor (VERCEL_BID_ONLY).
+            vc_side_out: Optional[str] = None
             if vercel_series(meta.series):
-                vc_why, vc_in = vercel_gate_reason(t, now_ts, ext_bid, ext_ask,
-                                                   meta.close_time)
+                vc_why, vc_in = vercel_gate(t, now_ts, ext_bid, ext_ask,
+                                            meta.close_time)
+                if not vc_why and vc_in.get("side_out"):
+                    if t in self.state.hopeless_since:
+                        # the bid alone rests only above the payout floor
+                        vc_why = (f"{vc_in['why']}; the bid alone projects under "
+                                  f"the ${PAYOUT_FLOOR_DOLLARS:.2f} payout floor")
+                        vc_in = dict(vc_in, reason="payout_floor")
+                    else:
+                        vc_side_out = vc_in["side_out"]
                 if vc_why:
                     if t not in self._vercel_stood:
                         self._vercel_stood.add(t)
@@ -31439,6 +31500,14 @@ class IncentiveMarketMaker:
                     self.cancel_market_orders(t, resting)
                     self._gskip(t, "vercel_fair", lambda: vc_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                     continue
+                if vc_side_out is not None and t not in self._vercel_bid_only:
+                    self._vercel_bid_only.add(t)
+                    log(f"{self.tag} vercel bid only {t}: {vc_in['why']}; asks "
+                        f"out, the bid resting only while it earns")
+            if vc_side_out is None and t in self._vercel_bid_only:
+                self._vercel_bid_only.discard(t)
+                self._vercel_unearning.pop(t, None)
+                log(f"{self.tag} vercel two-sided {t}")
             if t in self._vercel_stood:
                 self._vercel_stood.discard(t)
                 log(f"{self.tag} vercel resume {t}")
@@ -31937,6 +32006,9 @@ class IncentiveMarketMaker:
             # member pads it for depth like any rungless side
             if rain_side_out is not None:
                 mq = [q for q in mq if q.book_side != rain_side_out]
+            # Vercel bid only (VERCEL_BID_ONLY): the same, for the asks
+            if vc_side_out is not None:
+                mq = [q for q in mq if q.book_side != vc_side_out]
 
             # Depth padding: on a side we're actually quoting whose total depth
             # is below the reward target, add throwaway contracts at the 1c/99c
@@ -32054,6 +32126,27 @@ class IncentiveMarketMaker:
                             f"the scored walk after the caps {rain_caps} "
                             f"(book {ext_bid}x{ext_ask}) -- not resting them")
                     self._rain_period_unearning[t] = _r_dropped
+            # Vercel bid only (VERCEL_BID_ONLY): the bid rests only while the
+            # scored walk still reaches it
+            if vc_side_out is not None:
+                _v_before = {q.book_side for q in mq if not q.is_pad}
+                if meta.price_step < 0.01:
+                    _ey, _en = orderbook_exact_levels(ob)
+                    mq = drop_unearning_sides(
+                        mq, _ey, _en,
+                        own_exact_by_ticker.get(t, []) if self.live else [],
+                        meta.target_size, meta.discount_factor)
+                else:
+                    mq = drop_unearning_sides(mq, yes_levels, no_levels,
+                                              own_in_book, meta.target_size,
+                                              meta.discount_factor)
+                _v_dropped = _v_before - {q.book_side for q in mq if not q.is_pad}
+                if _v_dropped != self._vercel_unearning.get(t, set()):
+                    if _v_dropped:
+                        log(f"{self.tag} vercel not earning {t}: the bid is out "
+                            f"of the scored walk (book {ext_bid}x{ext_ask}) -- "
+                            f"not resting it")
+                    self._vercel_unearning[t] = _v_dropped
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -34962,7 +35055,11 @@ class IncentiveMarketMaker:
             log(f"vercel gate: {','.join(sorted(VERCEL_SERIES))} PRE-D only, "
                 f"size x{VERCEL_SIZE_MULT:g}, "
                 f"fail-closed, out {VERCEL_CUTOFF_BEFORE_D_MIN}m before the "
-                f"measured day, tol {VERCEL_FAIR_TOL_CENTS}c, decided outside "
+                f"measured day, tol {VERCEL_FAIR_TOL_CENTS}c ("
+                + ("an ask breach quotes the bid alone, above the payout floor; "
+                   "a bid breach stands aside" if VERCEL_BID_ONLY
+                   else "a breach stands aside")
+                + f"), decided outside "
                 f"{VERCEL_FAIR_MIN_P * 100:g}-{100 - VERCEL_FAIR_MIN_P * 100:g}c, "
                 f"ttl {VERCEL_FAIR_TTL_MIN}m, hold {VERCEL_FAIR_HOLD_MIN:g}m, "
                 f"refresh {VERCEL_FAIR_REFRESH_SECS}s, anchor "
