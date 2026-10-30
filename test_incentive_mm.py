@@ -4507,6 +4507,48 @@ class TestPowerSlapCutoff(unittest.TestCase):
                 "KXOTHER", "KXOTHER-26NOV06", midnight), midnight)          # other series: as before
 
 
+class TestMarathonFamily(unittest.TestCase):
+    """Kalshi's road races quote by name (Jack 2026-10-30: "why isnt
+    KXMARATHON-NYC26 quoting? marathon shaped family should auto-quote"),
+    and only to 10 min before their field's start: the tickers carry no date
+    and Kalshi's occurrence is the night after the race."""
+
+    def test_every_road_race_series_is_admitted_but_not_the_game(self):
+        # this module runs with the allowlist off: pin it on, as the bot runs
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True), \
+                mock.patch.object(imm, "EXTRA_ALLOW_SERIES", set()):
+            for s in ("KXMARATHON", "KXMARATHONUSAWIN", "KXMARATHONTOPUSA", "KXMARATHONTIME",
+                      "KXMARATHONCOURSEREC", "KXMARATHONRECEUR"):
+                self.assertTrue(imm.marathon_series(s), s)
+                self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-NYC26-X"), s)
+            self.assertFalse(imm.marathon_series("KXMCMARATHON"))  # a video game's Metacritic score
+            self.assertFalse(IncentiveMarketMaker._allowed("KXMCMARATHON-26-80"))
+            with mock.patch.object(imm, "MARATHON_ENABLE", False):
+                self.assertFalse(imm.marathon_series("KXMARATHON"))
+                self.assertFalse(IncentiveMarketMaker._allowed("KXMARATHON-NYC26-BKIP"))
+
+    def test_out_before_the_start_on_file_and_stood_down_without_one(self):
+        ev = "KXMARATHON-NYC26"
+        occ = exp = datetime(2026, 11, 2, 3, 0, tzinfo=timezone.utc)      # Kalshi's, after the race
+        self.assertIsNone(imm.trade_cutoff_utc(ev, occ, exp))            # nothing else stops it
+        start = imm.ET.localize(datetime(2026, 11, 1, 9, 5)).astimezone(timezone.utc)
+        want = start - timedelta(minutes=imm.OVERRIDE_BUFFER_MIN)
+        with mock.patch.dict(imm.EVENT_START_OVERRIDES, {ev: start}):
+            # the orphan-restore producer (no resolver) and the universe's (start - 10 already)
+            self.assertEqual(imm.apply_series_cutoff_adjustments("KXMARATHON", ev, None), want)
+            self.assertEqual(imm.apply_series_cutoff_adjustments("KXMARATHON", ev, want), want)
+        imm._release_guard_warned.discard(ev)
+        imm._config_gaps.pop(ev, None)
+        try:
+            with mock.patch.dict(imm.EVENT_START_OVERRIDES, clear=True):
+                self.assertEqual(imm.apply_series_cutoff_adjustments("KXMARATHON", ev, None),
+                                 imm.RELEASE_GUARD_UNKNOWN)               # stood down
+            self.assertIn("no race start on file", imm._config_gaps[ev]["msg"])
+        finally:
+            imm._release_guard_warned.discard(ev)
+            imm._config_gaps.pop(ev, None)
+
+
 class TestGuardsAcrossRestarts(unittest.TestCase):
     """Every breaker or hold still running survives a restart (Jack
     2026-10-22: "Make sure other similar guards also survive bot restarts")."""

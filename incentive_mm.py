@@ -9674,6 +9674,29 @@ OVERRIDE_BUFFER_MIN = _env_int("IMM_OVERRIDE_BUFFER_MIN", 10)
 # Power Slap match winners (hand-enrolled 2026-10-23): out OVERRIDE_BUFFER_MIN
 # before the card's start once it is on file (apply_series_cutoff_adjustments)
 POWERSLAP_SERIES = "KXPOWERSLAPMATCH"
+# MARATHONS (Jack 2026-10-30: "why isnt KXMARATHON-NYC26 quoting? marathon
+# shaped family should auto-quote"). Kalshi names every road-race series
+# KXMARATHON*: the winner, American to win, top American, fastest time,
+# course record and European record (Sports, tag "Other", frequency custom);
+# a new one joins with its first liquidity program, admitted from the feed
+# like any allowlisted series. KXMCMARATHON is a video game's Metacritic
+# score and does not match. The race is the information event and its
+# tickers carry no date -- Kalshi's occurrence is the night after the race
+# (KXMARATHON-NYC26: 11/02 03:00Z for an 11/01 morning start) -- so nothing
+# else would stop the bot before the gun: an event is out
+# OVERRIDE_BUFFER_MIN before its division's start on EVENT_START_OVERRIDES,
+# and with none on file it is stood down (fail closed) on a config gap the
+# family watch's research fills (its kind "marathon"). Base size, no family
+# multiplier. IMM_MARATHON_ENABLE=0 takes the family out (an env change: a
+# task restart).
+MARATHON_PREFIX = "KXMARATHON"
+MARATHON_ENABLE = os.environ.get("IMM_MARATHON_ENABLE", "1") == "1"
+
+
+def marathon_series(series: str) -> bool:
+    """A road-race series of the marathon family (MARATHON_PREFIX)."""
+    return MARATHON_ENABLE and series.startswith(MARATHON_PREFIX)
+
 # Fresh candidates aren't admitted inside this many minutes of a cutoff
 # (pointless entry + placement race); MEMBERS are exempt and quote to the
 # true cutoff — the exchange-side order expiration is the hard stop there.
@@ -18279,6 +18302,22 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         start = EVENT_START_OVERRIDES.get(event_ticker)
         if start is not None:
             cutoff = start - timedelta(minutes=OVERRIDE_BUFFER_MIN)
+    # MARATHONS (2026-10-30, see MARATHON_PREFIX): out before the division's
+    # start on file -- here as well as in the resolver, since the orphan-
+    # restore producer never asks the resolver -- and with none on file,
+    # stood down.
+    if marathon_series(series):
+        start = EVENT_START_OVERRIDES.get(event_ticker)
+        if start is None:
+            cutoff = RELEASE_GUARD_UNKNOWN
+            _config_gap(series, event_ticker,
+                        f"{event_ticker} has no race start on file "
+                        f"(EVENT_START_OVERRIDES) -- standing it down (fail closed) "
+                        f"until research or imm_earnings_overrides.py --set adds "
+                        f"its division's start")
+        else:
+            early = start - timedelta(minutes=OVERRIDE_BUFFER_MIN)
+            cutoff = early if cutoff is None else min(cutoff, early)
     # NOTE the event-day EXTENDER (event_day_cutoff_et) deliberately does NOT
     # live here — it shifts the ticker-date CANDIDATE inside trade_cutoff_utc,
     # before min() runs, so an occurrence-based cutoff still wins. Applying it
@@ -25977,8 +26016,9 @@ class IncentiveMarketMaker:
         election_series; the awards by Kalshi tag, awards_extra_series; the
         graduate families by Kalshi metadata, graduate_auto_series; the
         single-event mentions by Kalshi category, mention_auto_series; the AS
-        test's Billboard and VoteHub families while live, astest_new_series)
-        unless ALLOWLIST_ONLY is off."""
+        test's Billboard and VoteHub families while live, astest_new_series;
+        the road races by name, marathon_series) unless ALLOWLIST_ONLY is
+        off."""
         if cls._blocked(ticker):
             return False
         if not ALLOWLIST_ONLY:
@@ -26014,6 +26054,7 @@ class IncentiveMarketMaker:
             graduate_auto_series(series) or \
             mention_auto_series(series) or \
             (astest_new_series(series) and astest_pick_event_ok(ticker)) or \
+            marathon_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:

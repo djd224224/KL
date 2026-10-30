@@ -623,6 +623,37 @@ class TestResearchOnArrival(unittest.TestCase):
         self.assertEqual(call, "KEEP QUOTING")
         self.assertIn("Power Slap match", why)
 
+    def test_a_marathon_with_no_start_on_file_is_researched(self):
+        # Jack 2026-10-30: "marathon shaped family should auto-quote" -- the bot
+        # stands a race with no start on file down on a config gap, and
+        # research writes the start of the event's field
+        from unittest import mock
+        msg = ("{ev} has no race start on file (EVENT_START_OVERRIDES) -- standing it "
+               "down (fail closed) until research or imm_earnings_overrides.py --set adds "
+               "its division's start")
+        gaps = {ev: {"series": "KXMARATHON", "msg": msg.format(ev=ev)}
+                for ev in ("KXMARATHON-NYC26", "KXMARATHON-NYCWOMENS26")}
+        self.assertEqual(fw.gap_kind(gaps["KXMARATHON-NYC26"]["msg"]), "marathon")
+        start = datetime(2026, 11, 1, 13, 35, tzinfo=timezone.utc)
+        with mock.patch.object(fw.ieo, "discover_broadcast_mention_events", lambda c, now: []), \
+                mock.patch.object(fw.imm, "load_file_event_overrides", lambda: 0), \
+                mock.patch.dict(fw.imm.EVENT_START_OVERRIDES, {"KXMARATHON-NYCWOMENS26": start}):
+            self.assertEqual(sorted(fw.live_gaps(gaps)), ["KXMARATHON-NYC26"])   # women's written since
+            t = fw.research_targets(None, gaps, datetime.now(timezone.utc), dry=True)
+            self.assertEqual(sorted(t), ["gap:KXMARATHON-NYC26"])
+            tgt = t["gap:KXMARATHON-NYC26"]
+            self.assertEqual(tgt["kind"], "marathon")
+            self.assertFalse(fw.target_fixed(tgt))
+            self.assertTrue(fw.target_fixed(dict(tgt, event="KXMARATHON-NYCWOMENS26")))
+            prompt = fw.research_prompt([("gap:KXMARATHON-NYC26", tgt, "")])
+            self.assertIn("the professional/elite start of that division", prompt)
+            self.assertIn('imm_earnings_overrides.py --set KXMARATHON-NYC26 "YYYY-MM-DDTHH:MM:00-04:00"',
+                          prompt)
+        call, why = fw.quote_call("gap:KXMARATHON-NYC26",
+                                  {"series": "KXMARATHON", "what": gaps["KXMARATHON-NYC26"]["msg"]}, {})
+        self.assertEqual(call, "QUOTE ONCE DATED")
+        self.assertIn("a marathon event", why)
+
     def test_an_election_excluded_series_is_not_researched(self):
         # 10/08 (Jack: "Talarico should not be quoted"): the bot keeps the gap
         # in config_gaps.json until a restart, so research must skip it itself

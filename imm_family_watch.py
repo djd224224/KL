@@ -674,6 +674,9 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
         if g in ("election", "award"):
             return ("QUOTE ONCE DATED", f"{'elections' if g == 'election' else 'awards'} "
                                         f"quote only with a verified date row" + rec_txt)
+        if g == "marathon":
+            return ("QUOTE ONCE DATED", "a marathon event: quoted to 10 min before its "
+                                        "field's start once research puts it on file" + rec_txt)
         return ("FIX, THEN QUOTE", "a config gap holds it dark" + rec_txt)
     if cat == "Mentions" or "MENTION" in series:
         return ("QUOTE WITH CARE", "a mention: quote it under the mention live gates, with "
@@ -1077,13 +1080,16 @@ RESEARCH_TOKEN_REMIND_DAYS = 7.0
 
 
 def gap_kind(msg: str) -> str:
-    """'election' / 'award' for the config gaps a researched row fixes, else
-    '' (a ticker shape, a release guard -- code, not research)."""
+    """'election' / 'award' for the config gaps a researched row fixes,
+    'marathon' for a race with no start on file, else '' (a ticker shape, a
+    release guard -- code, not research)."""
     m = msg or ""
     if "election day" in m:
         return "election"
     if "hand-table row" in m or "no usable date" in m:
         return "award"
+    if "no race start on file" in m:
+        return "marathon"
     return ""
 
 
@@ -1093,9 +1099,11 @@ def live_gaps(gaps: dict) -> dict:
     already covers (the dating pass, research, a hand fix -- the bot drops it
     at its next refresh, 2026-10-09), and a series carved out of the election
     family (2026-10-08, Jack on KXPUBLICTALARICO: "should not be quoted"; it
-    is never dated). Both research and the alert read this."""
+    is never dated). A marathon gap a start written since covers is dropped
+    the same way (2026-10-30). Both research and the alert read this."""
     imm.load_election_dates_extra()
     imm.load_awards_dates_extra()
+    imm.load_file_event_overrides()
     out = {}
     for ev, g in (gaps or {}).items():
         kind = gap_kind(g.get("msg") or "")
@@ -1105,6 +1113,8 @@ def live_gaps(gaps: dict) -> dict:
                 (g.get("series") or imm.series_of(ev)) in imm.ELECTION_EXCLUDE:
             continue
         if kind == "award" and imm.awards_event_start(ev, None, dates_only=True) is not None:
+            continue
+        if kind == "marathon" and ev in imm.EVENT_START_OVERRIDES:
             continue
         out[ev] = g
     return out
@@ -1240,6 +1250,19 @@ _HOW = {
                   "costly error)",
                   "python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDTHH:MM:00-04:00\"   "
                   "(-04:00 through Oct 31 2026, -05:00 from Nov 1 2026)"),
+    # a marathon event (2026-10-30, Jack: "marathon shaped family should
+    # auto-quote"): the gun of the field its markets are about
+    "marathon": ("when the RACE this event's markets are about STARTS for their field -- "
+                 "the professional/elite start of that division (the women's for a "
+                 "women's or female event, the men's for a men's, male or open "
+                 "event) in the organizer's official race-day schedule or media "
+                 "guide, the broadcaster's listing, or reputable press; NOT the "
+                 "wheelchair or mass-wave starts (if sources give a window or "
+                 "disagree by under an hour, the EARLIEST credible time -- the bot "
+                 "stops 10 minutes before it, so late is the costly error)",
+                 "python imm_earnings_overrides.py --set {ev} \"YYYY-MM-DDTHH:MM:00-04:00\"   "
+                 "(the start with its UTC offset: ET is -04:00 through Oct 31 2026 and "
+                 "-05:00 from Nov 1 2026; a race abroad may use its own offset)"),
 }
 
 
@@ -1508,7 +1531,7 @@ def target_fixed(t: dict) -> bool:
         return row[4] > float(t.get("checked") or 0.0)
     if t["kind"] == "award":
         return imm.awards_event_start(ev, None, dates_only=True) is not None
-    if t["kind"] in ("start", "powerslap"):
+    if t["kind"] in ("start", "powerslap", "marathon"):
         return ev in imm.EVENT_START_OVERRIDES
     return False
 
