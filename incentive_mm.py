@@ -2497,6 +2497,20 @@ def near_cliff_ok(accrued: float, projected_total: float) -> bool:
     return projected_total >= PAYOUT_FLOOR_DOLLARS - NEAR_CLIFF_DOLLARS
 
 
+def near_cliff_secure_ok(accrued: float, projected_total: float) -> bool:
+    """The secure line (NEAR_CLIFF_SECURE_DOLLARS, 2026-10-30): True when this
+    period's banked accrual is over NEAR_CLIFF_BOOST_MIN_BANKED but still under
+    the PAYOUT_FLOOR_DOLLARS cliff, and the projected total (banked + remaining
+    window) clears the cliff by less than the secure line -- the band where
+    Kalshi's own count still often falls short of $1. Off outside the cliff
+    regime and when the line is at or under the cliff."""
+    if NEAR_CLIFF_SECURE_DOLLARS <= PAYOUT_FLOOR_DOLLARS or not EXIT_FLOOR_IS_PAYOUT:
+        return False
+    if not NEAR_CLIFF_BOOST_MIN_BANKED < accrued < PAYOUT_FLOOR_DOLLARS:
+        return False
+    return PAYOUT_FLOOR_DOLLARS <= projected_total < NEAR_CLIFF_SECURE_DOLLARS
+
+
 def series_atref_price_tol(series: str) -> int:
     """Per-series at-ref requote hysteresis (ticks), else the global
     ATREF_PRICE_TOL_TICKS (read at call time so env/test patches apply)."""
@@ -10077,6 +10091,26 @@ NEAR_CLIFF_SIZE_MULT = _env_float("IMM_NEAR_CLIFF_SIZE_MULT", 1.5)
 # quote-to-completion verdict is unaffected: a near-cliff market with
 # $0.50 or less banked keeps quoting at plain size.
 NEAR_CLIFF_BOOST_MIN_BANKED = _env_float("IMM_NEAR_CLIFF_BOOST_MIN_BANKED", 0.50)
+# ...and a SECURE LINE above the cliff (Jack 2026-10-30, "do it"). The
+# bot's estimate is not Kalshi's count: on 392 market-periods 9/13-10/27
+# whose credit rows pin the one market near the line, Kalshi paid 24% at
+# an estimated $0.95-1.00, 77% at $1.00-1.05, 88% at $1.05-1.10 and 94%+
+# from $1.10 (50% at $0.98). Of the 941 members 9/26-10/30 that had
+# banked over $0.50 and projected $1.00-1.10 at plain size -- called safe,
+# so never boosted -- 21% finished under $1.00 and 28% at $1.00-1.10. A
+# x1.5 ladder from that reading to a banked $1.10 measured +$153 of
+# expected credit for -$154 of extra fills (the x1.25 reward / x1.37
+# resting lift the size mode actually gets): even money, with more of the
+# credit landing. So a MEMBER that has banked more than
+# NEAR_CLIFF_BOOST_MIN_BANKED but not yet the cliff, and projects
+# (banked + remaining) to at least the cliff but under this line
+# (near_cliff_secure_ok), takes the near-cliff size mode too -- sticky the
+# same way -- until its banked accrual reaches THIS line. A market armed
+# UNDER the cliff by the near-cliff verdict still stops at the cliff:
+# carrying those on to $1.10 measured -$73 over the same 34 days (crossed
+# markets finished at a median $1.37 -- they were mostly safe already).
+# A value at or under PAYOUT_FLOOR_DOLLARS switches the line off.
+NEAR_CLIFF_SECURE_DOLLARS = _env_float("IMM_NEAR_CLIFF_SECURE_DOLLARS", 1.10)
 # YIELD SIZE MODE (Jack 2026-10-02, "1 and 2 for monday", from the multiplier
 # review): from 00:00 ET 2026-10-05 a market whose modelled reward per resting
 # contract (meta.yield_per_contract, $/contract/day -- the estimator's own
@@ -10920,6 +10954,8 @@ _CONFIG_CODE_KNOBS = (
     # near-cliff quote-to-completion + size mode (2026-09-26)
     "NEAR_CLIFF_DOLLARS", "NEAR_CLIFF_MIN_BANKED_FRAC", "NEAR_CLIFF_SIZE_MULT",
     "NEAR_CLIFF_BOOST_MIN_BANKED",
+    # ...and its secure line above the cliff (2026-10-30)
+    "NEAR_CLIFF_SECURE_DOLLARS",
     # decision-input logging (2026-09-26): the thresholds the logged inputs
     # are compared against, so a guard_skips / floor row can be read against
     # the rule that was actually in force (HOPELESS_SUSTAIN_SECS and
@@ -21312,6 +21348,9 @@ class IncentiveMarketMaker:
         # near-cliff SIZE mode (2026-09-26): ticker -> armed ts; sticky until
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
+        # ...ticker -> the banked $ that ends it, for one armed on the secure
+        # line (NEAR_CLIFF_SECURE_DOLLARS); absent = the cliff
+        self._near_cliff_stop: Dict[str, float] = {}
         self._near_cliff_noted: Dict[str, float] = {}   # ticker -> ts of the last verdict log
         # event -> the trimmed pool window end last logged (trimmed_pool_rate)
         self._trimmed_pool_noted: Dict[str, datetime] = {}
@@ -26332,8 +26371,9 @@ class IncentiveMarketMaker:
 
     def _near_cliff_size_mult(self, ticker: str) -> float:
         """NEAR_CLIFF_SIZE_MULT while `ticker` is in near-cliff mode (armed by
-        the floor verdict, sticky until the banked accrual crosses the cliff
-        or the market leaves the selection), else 1.0."""
+        the floor verdict or the secure line, sticky until the banked accrual
+        reaches its stop -- the cliff, or the secure line -- or the market
+        leaves the selection), else 1.0."""
         if NEAR_CLIFF_SIZE_MULT <= 0 or NEAR_CLIFF_SIZE_MULT == 1.0:
             return 1.0
         if ticker not in self._near_cliff_boost:
@@ -26382,15 +26422,21 @@ class IncentiveMarketMaker:
             del self._yield_boost[t]
 
     def _prune_near_cliff_boost(self) -> None:
-        """End near-cliff mode for markets that crossed the cliff (banked >=
-        PAYOUT_FLOOR_DOLLARS this period) or left the selection. Runs at the
-        top of the refresh's yield pass, before the estimator reads it."""
+        """End near-cliff mode for markets that reached their stop (banked >=
+        PAYOUT_FLOOR_DOLLARS this period, or NEAR_CLIFF_SECURE_DOLLARS for one
+        armed on the secure line) or left the selection. Runs at the top of
+        the refresh's yield pass, before the estimator reads it."""
         for t in list(self._near_cliff_boost):
             banked = self.period_accrued(t)
-            crossed = banked >= PAYOUT_FLOOR_DOLLARS
+            stop = self._near_cliff_stop.get(t, PAYOUT_FLOOR_DOLLARS)
+            crossed = banked >= stop
             if crossed or t not in self.state.selected:
                 del self._near_cliff_boost[t]
-                if crossed:
+                self._near_cliff_stop.pop(t, None)
+                if crossed and stop > PAYOUT_FLOOR_DOLLARS:
+                    log(f"{self.tag} near-cliff: {t} reached the ${stop:.2f} secure "
+                        f"line (banked ${banked:.2f}); ladder back to normal size")
+                elif crossed:
                     log(f"{self.tag} near-cliff: {t} crossed the cliff (banked "
                         f"${banked:.2f}); ladder back to normal size")
 
@@ -27214,6 +27260,7 @@ class IncentiveMarketMaker:
                         and accrued > NEAR_CLIFF_BOOST_MIN_BANKED \
                         and NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0:
                     self._near_cliff_boost[meta.ticker] = now_ts
+                    self._near_cliff_stop.pop(meta.ticker, None)    # stops at the cliff
                     armed = True
                 if meta.ticker not in self._near_cliff_noted or armed:
                     self._near_cliff_noted[meta.ticker] = now_ts
@@ -27226,6 +27273,20 @@ class IncentiveMarketMaker:
                            else f" at plain size (banked <= ${NEAR_CLIFF_BOOST_MIN_BANKED:.2f})"
                            if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0
                            else ""))
+            # SECURE LINE (Jack 2026-10-30, see NEAR_CLIFF_SECURE_DOLLARS): a
+            # member whose projection clears the cliff by less than the line
+            # takes the same size mode, held until its banked reaches the line
+            elif meta.ticker in prev_selected \
+                    and meta.ticker not in self._near_cliff_boost \
+                    and NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0 \
+                    and near_cliff_secure_ok(accrued, projected_total):
+                self._near_cliff_boost[meta.ticker] = now_ts
+                self._near_cliff_stop[meta.ticker] = NEAR_CLIFF_SECURE_DOLLARS
+                log(f"{self.tag} near-cliff: {meta.ticker} banked ${accrued:.2f} "
+                    f"+ projected ${max(est_total, proj_peak):.2f} = "
+                    f"${projected_total:.2f}, under the ${NEAR_CLIFF_SECURE_DOLLARS:.2f} "
+                    f"secure line; x{self._near_cliff_size_mult(meta.ticker):g} size "
+                    f"until banked reaches it")
             meta.near_cliff_boost = meta.ticker in self._near_cliff_boost
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
@@ -27258,6 +27319,8 @@ class IncentiveMarketMaker:
                         "reaches_min_raw": projected_total >= floor_bar,
                         "reaches_min": reaches_min,
                         "near_cliff_armed_ts": self._near_cliff_boost.get(meta.ticker),
+                        # the banked $ that ends it (secure line), else None = the cliff
+                        "near_cliff_stop": self._near_cliff_stop.get(meta.ticker),
                         "hopeless_since": self.state.hopeless_since.get(meta.ticker),
                         "sub_bar_secs": round(sub_bar_secs),
                         # the admission clock (2026-09-27): held-above time
@@ -36486,11 +36549,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                                      if KEEP_ACCRUAL_WHILE_PROGRAMMED
                                      else "pruned with known_tickers")
         + ("; near-cliff: banked >= %g of the cliff and projected within $%.2f "
-           "under it quotes to completion%s"
+           "under it quotes to completion%s%s"
            % (NEAR_CLIFF_MIN_BANKED_FRAC, NEAR_CLIFF_DOLLARS,
               (" at x%g size until it crosses (banked > $%.2f only)"
                % (NEAR_CLIFF_SIZE_MULT, NEAR_CLIFF_BOOST_MIN_BANKED))
-              if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0 else "")
+              if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0 else "",
+              ("; a member projected from the cliff to $%.2f takes that size until "
+               "banked reaches $%.2f" % (NEAR_CLIFF_SECURE_DOLLARS, NEAR_CLIFF_SECURE_DOLLARS))
+              if NEAR_CLIFF_SIZE_MULT > 0 and NEAR_CLIFF_SIZE_MULT != 1.0
+              and NEAR_CLIFF_SECURE_DOLLARS > PAYOUT_FLOOR_DOLLARS else "")
            if NEAR_CLIFF_DOLLARS > 0 and EXIT_FLOOR_IS_PAYOUT else "; near-cliff off"))
     _n_daily = load_daily_series_file()
     log(f"[IMM] daily-family exclusion (no global hour window, no Saturday "

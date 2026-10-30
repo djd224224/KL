@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for incentive_mm.py — run: python -m unittest test_incentive_mm"""
 
+import contextlib
 import csv
 import glob
 import json
@@ -20048,6 +20049,122 @@ class TestNearCliffQuoteToCompletion(unittest.TestCase):
                 self.assertNotIn(self.T, bot.state.selected)
         finally:
             imm.MIN_EST_TOTAL_DOLLARS, imm.PAYOUT_FLOOR_DOLLARS = old
+
+
+class TestNearCliffSecureLine(unittest.TestCase):
+    """Jack 2026-10-30, "do it": a member that has banked over $0.50 but not
+    yet the $1.00 cliff and projects to clear it by less than the $1.10
+    secure line rests the x1.5 near-cliff ladder until its banked reaches
+    $1.10 -- Kalshi paid only 77% of market-periods the bot estimated at
+    $1.00-1.05 and 88% at $1.05-1.10. A market the near-cliff verdict armed
+    under the cliff still stops at the cliff. Same 1e9 scale as
+    TestNearCliffQuoteToCompletion: the real projection is then a few
+    dollars on top of the banked amount."""
+
+    T = "KXGOOD-99DEC31-A"
+
+    def _period_key(self, bot):
+        return imm.parse_iso_utc(bot.client.programs[0]["start_date"]).isoformat()
+
+    def _sizes(self, bot):
+        return {int(o["remaining_count"]) for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T and 1 < o["yes_price"] < 99}
+
+    def _member(self):
+        """Selected at the real scale on its own estimate, before any banking."""
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        return bot
+
+    def _refresh(self, bot, banked):
+        bot.state.accrued_est[self.T] = banked
+        bot.state.period_start[self.T] = self._period_key(bot)
+        bot.state.universe_at = 0.0
+        bot.run_cycle()
+
+    def _scaled(self):
+        stack = contextlib.ExitStack()
+        for name, v in (("PAYOUT_FLOOR_DOLLARS", 1e9), ("MIN_EST_TOTAL_DOLLARS", 2e9),
+                        ("NEAR_CLIFF_DOLLARS", 0.15e9), ("NEAR_CLIFF_SECURE_DOLLARS", 1.1e9)):
+            stack.enter_context(mock.patch.object(imm, name, v))
+        return stack
+
+    def test_the_rule(self):
+        self.assertEqual(imm.NEAR_CLIFF_SECURE_DOLLARS, 1.10)
+        self.assertTrue(imm.near_cliff_secure_ok(0.70, 1.05))
+        self.assertTrue(imm.near_cliff_secure_ok(0.70, 1.00))     # the cliff is in
+        self.assertFalse(imm.near_cliff_secure_ok(0.70, 1.10))    # the line is out
+        self.assertFalse(imm.near_cliff_secure_ok(0.70, 0.99))    # under the cliff: the verdict's
+        self.assertFalse(imm.near_cliff_secure_ok(0.50, 1.05))    # the banked gate, strict
+        self.assertFalse(imm.near_cliff_secure_ok(1.00, 1.05))    # already over the cliff
+        with mock.patch.object(imm, "NEAR_CLIFF_SECURE_DOLLARS", 1.00):
+            self.assertFalse(imm.near_cliff_secure_ok(0.70, 1.00))
+        with mock.patch.object(imm, "EXIT_FLOOR_IS_PAYOUT", False):
+            self.assertFalse(imm.near_cliff_secure_ok(0.70, 1.05))
+
+    def test_a_member_just_over_the_cliff_rests_x15_to_the_line(self):
+        plain = self._sizes(self._member())
+        self.assertTrue(plain)
+        bot = self._member()
+        with self._scaled():
+            # a cent under the cliff, so the projection clears it by dollars
+            self._refresh(bot, 1e9 - 0.01)
+            self.assertIn(self.T, bot.state.selected)
+            self.assertFalse(bot.state.selected[self.T].near_cliff)
+            self.assertIn(self.T, bot._near_cliff_boost)
+            self.assertEqual(bot._near_cliff_stop[self.T], 1.1e9)
+            self.assertTrue(bot.state.selected[self.T].near_cliff_boost)
+            self.assertEqual(self._sizes(bot), {int(c * 1.5 + 0.5) for c in plain})
+            # over the cliff, under the line: still x1.5
+            self._refresh(bot, 1.05e9)
+            self.assertIn(self.T, bot._near_cliff_boost)
+            self.assertEqual(self._sizes(bot), {int(c * 1.5 + 0.5) for c in plain})
+            # the line reached: plain size again, and nothing re-arms it
+            self._refresh(bot, 1.12e9)
+            self.assertIn(self.T, bot.state.selected)
+            self.assertNotIn(self.T, bot._near_cliff_boost)
+            self.assertNotIn(self.T, bot._near_cliff_stop)
+            self.assertEqual(self._sizes(bot), plain)
+
+    def test_a_near_cliff_arm_still_stops_at_the_cliff(self):
+        with self._scaled():
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self._refresh(bot, 0.90e9)                    # under the cliff: the verdict arms it
+            self.assertTrue(bot.state.selected[self.T].near_cliff)
+            self.assertIn(self.T, bot._near_cliff_boost)
+            self.assertNotIn(self.T, bot._near_cliff_stop)
+            self._refresh(bot, 1.05e9)                    # crossed the cliff, under the line
+            self.assertIn(self.T, bot.state.selected)
+            self.assertNotIn(self.T, bot._near_cliff_boost)
+
+    def test_off_switch_gate_and_size_knob(self):
+        cases = (("NEAR_CLIFF_SECURE_DOLLARS", 1e9),           # the line at the cliff: off
+                 ("NEAR_CLIFF_BOOST_MIN_BANKED", 1e9 - 0.005),  # banked under the gate
+                 ("NEAR_CLIFF_SIZE_MULT", 1.0))                 # no size mode at all
+        for name, v in cases:
+            with self.subTest(name):
+                bot = self._member()
+                with self._scaled(), mock.patch.object(imm, name, v):
+                    self._refresh(bot, 1e9 - 0.01)
+                    self.assertIn(self.T, bot.state.selected)
+                    self.assertNotIn(self.T, bot._near_cliff_boost)
+                    self.assertNotIn(self.T, bot._near_cliff_stop)
+
+    def test_only_a_member_arms(self):
+        # a re-entrant reading the same numbers is admitted on the cliff bar
+        # but rests plain size until it is a member
+        with self._scaled():
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            self._refresh(bot, 1e9 - 0.01)
+            if self.T in bot.state.selected:
+                self.assertNotIn(self.T, bot._near_cliff_boost)
+            self._refresh(bot, 1e9 - 0.01)
+            self.assertIn(self.T, bot.state.selected)
+            self.assertIn(self.T, bot._near_cliff_boost)
 
 
 class TestFloorProjectionFollowsSchedule(unittest.TestCase):
