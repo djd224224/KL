@@ -18732,6 +18732,26 @@ def bulk_mark_cents(m: dict,
     return touch_mark_cents(bid, ask, market_cents(m, "last_price"))
 
 
+def last_trade_cents(m: dict) -> Optional[float]:
+    """A market object's last trade in cents, exact as Kalshi reports it
+    (sub-penny kept: the portfolio email values a position at
+    last_price_dollars as is), or None for a market that never traded
+    (Kalshi reports 0)."""
+    c = None
+    v = m.get("last_price_dollars")
+    if v is not None:
+        try:
+            c = round(float(v) * 100.0, 4)
+        except (TypeError, ValueError):
+            c = None
+    if c is None and m.get("last_price") is not None:
+        try:
+            c = float(m["last_price"])
+        except (TypeError, ValueError):
+            c = None
+    return c if c is not None and 0.0 < c <= 100.0 else None
+
+
 # Market statuses at which Kalshi has paid a settlement out ("settled" is the
 # older API's name for "finalized").
 SETTLED_STATUSES = ("finalized", "settled")
@@ -21211,6 +21231,13 @@ class IncentiveMarketMaker:
         self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
         self._cycle_hdr_ok = False                 # cycle-log header checked once
         self._marks_at = 0.0                       # 5-min mark series throttle
+        # Each held market's last trade (exact cents) and when it was read:
+        # the 5-minute mark series records it beside the mark, so the
+        # dashboard values positions at Kalshi's last trade as the portfolio
+        # email does (Jack 2026-10-29: "have the dash price open positions at
+        # last traded, instead of Valued at the mid to be consistent")
+        self._last_trade: Dict[str, float] = {}
+        self._last_trade_at: Dict[str, float] = {}
         self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
         self._selection_snap_at = 0.0              # hourly full-candidate dump
         self._inventory_snap_day = ""              # daily open-book snapshot
@@ -29698,6 +29725,32 @@ class IncentiveMarketMaker:
                 mk = bulk_mark_cents(m, ext_touch.get(t))
                 if mk is not None:
                     self.state.last_mark[t] = mk
+                self._note_last_trade(t, m)
+
+    def _note_last_trade(self, t: str, m: dict) -> None:
+        """Keep a market read's last trade for the mark series (a market
+        that never traded keeps none)."""
+        lc = last_trade_cents(m)
+        if lc is not None:
+            self._last_trade[t] = lc
+        self._last_trade_at[t] = time.time()
+
+    def _read_last_trades(self, held: List[str], now_ts: float) -> None:
+        """The last trade of every held market for the 5-minute mark series:
+        _refresh_marks has just read the ones it marks off a bulk read, so
+        this reads the rest -- those marked off their own book this cycle,
+        whose order book carries no last trade -- 50 a call. A failed read
+        keeps the last trades already known."""
+        todo = [t for t in held if now_ts - self._last_trade_at.get(t, 0.0) > 60.0]
+        for i in range(0, len(todo), 50):
+            chunk = todo[i:i + 50]
+            try:
+                resp = self.client.get_markets(tickers=",".join(chunk), limit=len(chunk))
+            except Exception as e:
+                log(f"{self.tag} ! last-trade read failed ({e}); known last trades stand")
+                return
+            for m in (resp.get("markets") or []):
+                self._note_last_trade(m.get("ticker", ""), m)
 
     def _live_event_slots(self, ev: str, entry: dict,
                           unquotable_now: Set[str]) -> List[str]:
@@ -32411,17 +32464,24 @@ class IncentiveMarketMaker:
         if now_ts - self._marks_at >= 300:
             self._marks_at = now_ts
             try:
-                for tkr, p in self.pnl.pos.items():
-                    if abs(p) <= 1e-9:
-                        continue
+                held = [t for t, p in self.pnl.pos.items() if abs(p) > 1e-9]
+                self._read_last_trades(held, now_ts)
+                for tkr in held:
                     self._sink("marks", {
                         "ts": now_utc.isoformat(), "ticker": tkr,
                         "series": series_of(tkr),
                         "event_ticker": self._event_of(tkr),
-                        "pos": p, "avg_cents": self.pnl.avg.get(tkr, 0.0),
+                        "pos": self.pnl.pos[tkr], "avg_cents": self.pnl.avg.get(tkr, 0.0),
                         "mark_cents": self.state.last_mark.get(tkr),
+                        # Kalshi's last trade (None: never traded), the
+                        # dashboard's valuation since 2026-10-30
+                        "last_cents": self._last_trade.get(tkr),
                         "realized_dollars": self.pnl.realized.get(tkr, 0.0),
                     })
+                for t in [t for t in self._last_trade_at if t not in self.pnl.pos
+                          or abs(self.pnl.pos[t]) <= 1e-9]:
+                    self._last_trade.pop(t, None)
+                    self._last_trade_at.pop(t, None)
             except Exception as e:
                 if "marks" not in self._sink_muted:
                     self._sink_muted.add("marks")

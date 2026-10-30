@@ -134,6 +134,11 @@ def verify(b: "dash.Builder", key: str) -> bool:
         per[t] -= p * (m_ if m_ is not None else a) / 100.0
     for t, (p, a, m_) in s1[1].items():
         per[t] += pos.get(t, 0.0) * (m_ if m_ is not None else a) / 100.0
+    # the snapshots value positions at Kalshi's last trade from 2026-10-30:
+    # a window spanning that change leaves the change of basis out, as the
+    # dashboard does (Builder.rebase_in)
+    for t, (r, _g) in b.rebase_in(s0[0], s1[0]).items():
+        per[t] -= r
     for t, v in cash.items():
         per[t] += v
     for t, v in payout.items():

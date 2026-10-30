@@ -1030,6 +1030,96 @@ class AccountCardTests(unittest.TestCase):
         self.assertEqual(a["since"], _ts("2026-10-29T11:00:02Z"))
 
 
+class LastTradeBasisTests(unittest.TestCase):
+    """Jack 2026-10-29: "have the dash price open positions at last traded,
+    instead of Valued at the mid to be consistent" -- a position is valued at
+    Kalshi's last trade once the snapshots carry it, the change of basis is
+    no P&L, and the mark-outs stay on the bot's mark."""
+
+    NOW = _ts("2026-10-30T20:00:00Z")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = (dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR)
+        dash.STATUS_DIR = self.dir
+        dash.DASH_DIR = os.path.join(self.dir, "dashboard")
+        dash.CACHE_DIR = os.path.join(dash.DASH_DIR, "cache")
+        for d in ("2026-10-29", "2026-10-30"):
+            with open(os.path.join(self.dir, f"cycle_log_{d}.csv"), "w", encoding="utf-8",
+                      newline="") as f:
+                f.write(",".join(dash._CYCLE_FIELDS) + "\n")
+                for ts in (f"{d}T04:00:00Z", f"{d}T04:00:30Z"):
+                    f.write(",".join(str(x) for x in CycleParseTests._row(
+                        ts, "KXA-1", 0.1, 864, 10, 10, 50, 52)) + "\n")
+        # held 10 @ 40 all day on a 50c mid; the bot starts recording the last
+        # trade at 12:03Z (60), which then moves to 65
+        self._marks("2026-10-30", [("03:58", 50), ("04:03", 50), ("11:58", 50),
+                                   ("12:03", 50, 60), ("16:03", 51, 65), ("19:58", 52, 65)])
+        fill = {"ts": _ts("2026-10-30T11:30:00Z"), "fill_id": "f1", "ticker": "KXA-1",
+                "event_ticker": "KXA", "side": "yes", "action": "buy", "count": 1,
+                "yes_price_cents": 48, "is_taker": False, "our_book_side": "bid",
+                "is_pad": False, "pos_before": 10, "pos_after": 11}
+        with open(os.path.join(self.dir, "fills_2026-10-30.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(fill) + "\n")
+        with open(os.path.join(self.dir, "imm_state.json"), "w", encoding="utf-8") as f:
+            json.dump({"selected_tickers": ["KXA-1"], "own_pos": {"KXA-1": 10},
+                       "own_avg": {"KXA-1": 40}}, f)
+        with open(os.path.join(self.dir, "status_incentive_mm.json"), "w", encoding="utf-8") as f:
+            json.dump({"updated_at": "2026-10-30T19:59:00Z", "mode": "LIVE"}, f)
+
+    def tearDown(self):
+        dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _marks(self, day, snaps):
+        with open(os.path.join(self.dir, f"marks_{day}.jsonl"), "w", encoding="utf-8") as f:
+            for s in snaps:
+                r = {"ts": f"{day}T{s[0]}:00+00:00", "ticker": "KXA-1", "series": "KXA",
+                     "event_ticker": "KXA", "pos": 10, "avg_cents": 40, "mark_cents": s[1],
+                     "realized_dollars": 0.0}
+                if len(s) > 2:
+                    r["last_cents"] = s[2]
+                f.write(json.dumps(r) + "\n")
+
+    def test_the_parser_values_at_the_last_trade_and_finds_the_switch(self):
+        q = {"k": ("KXA-1", _ts("2026-10-30T12:00:00Z"), 900)}
+        val = dash.parse_marks_file(os.path.join(self.dir, "marks_2026-10-30.jsonl"),
+                                    keep_hours=True, queries=q)
+        self.assertEqual(val["last"][1]["KXA-1"][2], 65.0)
+        self.assertEqual(val["last_mids"], {"KXA-1": 52.0})
+        self.assertEqual(val["switch"], (_ts("2026-10-30T12:03:00Z"), {"KXA-1": (1.0, 10.0)}))
+        self.assertEqual(val["lastkey"][:2], (False, True))
+        self.assertEqual(q["k"][1], 50.0)                # the mark-out reads the mark
+
+    def test_the_switch_is_no_pnl_and_the_last_trade_is_the_value(self):
+        b = dash.Builder(self.NOW, api=False, api_force=False)
+        m = b.build()
+        self.assertEqual(m["last_from"], round(_ts("2026-10-30T12:03:00Z")))
+        a = m["markets"]["KXA-1"]
+        self.assertEqual(a["mark"], 65.0)
+        self.assertAlmostEqual(a["u"], 10 * (65 - 40) / 100, places=6)
+        # today: 50 -> 50 on the mark before the switch, 60 -> 65 after it; the
+        # switch's 50 -> 60 (+$1.00) is the change of basis, no P&L
+        w = a["w"]["today"]
+        self.assertAlmostEqual(w["pnl"], 10 * (65 - 60) / 100, places=6)
+        self.assertAlmostEqual(m["curves"]["today"][-1][2], 0.5, places=2)
+        day = next(r for r in m["history"] if r["d"] == "2026-10-30")
+        self.assertAlmostEqual(day["pnl"], 0.5, places=2)
+        # the mark-outs stay on the bot's mark: bought 1 @ 48, mark 50 at 12:03
+        self.assertAlmostEqual(w["mk"], 1 * (50 - 48) / 100, places=6)
+        self.assertEqual(b.now_values["KXA-1"], (52.0, "held"))
+
+    def test_a_switch_between_two_files_is_found(self):
+        self._marks("2026-10-29", [("04:03", 50), ("23:58", 50)])
+        self._marks("2026-10-30", [("00:03", 50, 60), ("19:58", 52, 65)])
+        b = dash.Builder(self.NOW, api=False, api_force=False)
+        b.load()
+        self.assertEqual(b.switch, (_ts("2026-10-30T00:03:00Z"), {"KXA-1": (1.0, 10.0)}))
+        # a window from before it to after it leaves the +$1.00 out
+        mk, _e = b.window_markets(_ts("2026-10-29T20:00:00Z"), self.NOW)
+        self.assertAlmostEqual(mk["KXA-1"]["pnl"], 0.5, places=6)
+
+
 class RenderTests(unittest.TestCase):
     def test_data_cannot_close_the_script_tag(self):
         page = dash.render({"x": "</script><script>alert(1)</script>", "timing": {}})
