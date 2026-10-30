@@ -8385,20 +8385,22 @@ class TestSeriesSideMults(unittest.TestCase):
     """Jack 2026-10-22, after the Trump mentions post-mortem: "Half bids,
     1.5x asks on B. Keep main series same." -> 2026-10-27: "do 1 and 3"
     (3: halve the main series' YES bids), then "Trump mentions B -- 1x asks
-    instead of 1.5"."""
+    instead of 1.5" -> 2026-10-29: "Dial down trumpmention and trumpmentionb
+    by 50%"."""
 
-    def test_both_trump_series_half_bids_1x_asks(self):
+    def test_both_trump_series_quarter_bids_half_asks(self):
         for s in ("KXTRUMPMENTIONB", "KXTRUMPMENTION"):
-            self.assertEqual(imm.series_side_mults(s), (0.5, 1.0), s)
+            self.assertEqual(imm.series_side_mults(s), (0.25, 0.5), s)
         now = utc(2026, 10, 28, 15, 0)
-        self.assertEqual(imm.side_size_mults("KXTRUMPMENTIONB-26OCT29-SOCI", now), (0.5, 1.0))
-        self.assertEqual(imm.side_size_mults("KXTRUMPMENTION-26OCT29-SOCI", now), (0.5, 1.0))
+        self.assertEqual(imm.side_size_mults("KXTRUMPMENTIONB-26OCT29-SOCI", now), (0.25, 0.5))
+        self.assertEqual(imm.side_size_mults("KXTRUMPMENTION-26OCT29-SOCI", now), (0.25, 0.5))
         # no other series sized by side on its own
         self.assertEqual(set(imm.SIDE_MULT_SERIES), {"KXTRUMPMENTIONB", "KXTRUMPMENTION"})
 
     def test_the_cut_scales_the_room_and_a_raise_does_not(self):
-        self.assertEqual(imm.side_cut_room("KXTRUMPMENTION", 40.0, 30.0), (20.0, 30.0))
-        self.assertEqual(imm.side_cut_room("KXTRUMPMENTIONB", -8.0, 30.0), (-4.0, 30.0))
+        # both sides now cut: bids x0.25, asks x0.5
+        self.assertEqual(imm.side_cut_room("KXTRUMPMENTION", 40.0, 30.0), (10.0, 15.0))
+        self.assertEqual(imm.side_cut_room("KXTRUMPMENTIONB", -8.0, 30.0), (-2.0, 15.0))
         self.assertEqual(imm.side_cut_room("KXOTHER", 40.0, 30.0), (40.0, 30.0))
         with mock.patch.dict(imm.SIDE_MULT_SERIES, {"KXA": (0.5, 1.5)}, clear=True):
             self.assertEqual(imm.side_cut_room("KXA", 40.0, 30.0), (20.0, 30.0))
@@ -8453,10 +8455,10 @@ class TestFamilySideLeans(unittest.TestCase):
             self.assertEqual(imm.series_side_mults(s), (0.75, 1.5), s)
         for s in ("KXSUEZWEEKLY", "KXLUV", "KXOPENSOURCESHARE", "KXLULUCC"):
             self.assertEqual(imm.series_side_mults(s), (1.5, 0.75), s)
-        # no lean for the rest; Trump B keeps its own sizes (half bids, 1x
-        # asks since 2026-10-27)
+        # no lean for the rest; Trump B keeps its own sizes (quarter bids,
+        # half asks since 2026-10-29)
         self.assertEqual(imm.series_side_mults("KXHIGHNY"), (1.0, 1.0))
-        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.5, 1.0))
+        self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.25, 0.5))
         now = utc(2026, 10, 23, 15, 0)
         self.assertEqual(imm.side_size_mults("KXRT-WILD-90", now), (0.75, 1.5))
         self.assertEqual(imm.side_size_mults("KXSUEZWEEKLY-26OCT25-T40", now), (1.5, 0.75))

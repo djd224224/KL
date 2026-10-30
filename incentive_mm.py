@@ -10871,7 +10871,7 @@ _CONFIG_CODE_KNOBS = (
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
     "PAD_RELEASE_HOLD_SECS",                     # ...held 10 min (2026-10-25)
-    "SIDE_MULT_SERIES",                          # Trump B half bids / 1.5x asks (2026-10-22)
+    "SIDE_MULT_SERIES",                          # Trump mentions side sizes (2026-10-22/27/29)
     "FAMILY_SIDE_LEANS",                         # family 1.5x / 0.75x side leans (2026-10-22)
     "LONGSHOT_MULT", "LONGSHOT_BID_BELOW",       # the event long-shot cut (2026-10-22)
     "LONGSHOT_ASK_FROM", "LONGSHOT_FAMILIES",
@@ -14750,6 +14750,11 @@ def quake_ask_renew_due(order: dict, age: float, now_ts: float) -> bool:
 # over the same days (-$105 on 1.6k), and B came to -$440 over the 14 days
 # to 10/27 (rewards $558, trading -$998). With the two series sized alike,
 # the B report's test ends 10/26 (its END_DAY).
+# Since 2026-10-29 both series rest half of that: quarter-size bids and
+# half-size asks (Jack: "Dial down trumpmention and trumpmentionb by 50%"),
+# so the asks' room is cut too (side_cut_room). That day the family stood at
+# -$65 by 7:25 PM ET: new fills -$208 against $33 of rewards, -$90 of it on
+# the Dubuque, Iowa rally.
 def _side_mult_spec(raw: str) -> Dict[str, Tuple[float, float]]:
     out: Dict[str, Tuple[float, float]] = {}
     for part in (raw or "").split(","):
@@ -14764,7 +14769,7 @@ def _side_mult_spec(raw: str) -> Dict[str, Tuple[float, float]]:
 
 
 SIDE_MULT_SERIES = _side_mult_spec(os.environ.get("IMM_SIDE_MULT_SERIES",
-                                                  "KXTRUMPMENTIONB:0.5:1,KXTRUMPMENTION:0.5:1"))
+                                                  "KXTRUMPMENTIONB:0.25:0.5,KXTRUMPMENTION:0.25:0.5"))
 
 
 def side_cut_room(series: str, room_buy: float, room_sell: float) -> Tuple[float, float]:
@@ -35349,7 +35354,8 @@ class IncentiveMarketMaker:
                 f"market, out by {ERCOT_FAIR_STOP_HOUR_CT:02d}:00 CT on the demand day "
                 f"(the ticker's day before), sooner at ercot_fair's own window")
         if SIDE_MULT_SERIES:
-            log("side sizes by series (2026-10-22, both Trump mention series 2026-10-27): "
+            log("side sizes by series (2026-10-22, both Trump mention series 2026-10-27, "
+                "halved 2026-10-29): "
                 + ", ".join(f"{s} bids x{b:g} / asks x{a:g}"
                             for s, (b, a) in sorted(SIDE_MULT_SERIES.items()))
                 + " -- every other series unchanged; report email 2026-11-05")
