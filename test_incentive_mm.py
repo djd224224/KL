@@ -30228,6 +30228,26 @@ class TestComplementLead(unittest.TestCase):
                                       1000.0, 0.5, hold_bid=26)
         self.assertEqual((lb[0], la), (26, None))
 
+    def test_a_few_lots_ahead_are_not_fought(self):
+        # Jack 2026-10-30: "Yes, do it" (COMP_LEAD_HOLD_SMALL). 3 lots a tick
+        # over the 26c lead leave the reference at 26c, both at full weight:
+        # the lead keeps 95.5% of its side, and jumping them to 28c only gave
+        # 2c away. 10 lots take it to 92.4% (with what the 15c wall still
+        # scores), and those are fought
+        wall = [[15, 13238.0], [16, 21.0]]
+        r_no = self.R_NO
+        self.assertEqual(imm.comp_side_lead(wall + [[27, 3.0]], r_no, 1000.0, 0.5,
+                                            hold=26), (26, 65, 16))
+        self.assertEqual(imm.comp_side_lead(wall + [[27, 10.0]], r_no, 1000.0, 0.5,
+                                            hold=26), (28, 65, 27))
+        # beside a copier on its price, any order ahead costs the share
+        self.assertEqual(imm.comp_side_lead(wall + [[26, 1000.0], [27, 3.0]], r_no,
+                                            1000.0, 0.5, hold=26), (33, 65, 27))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SMALL", False):      # the old rule
+            self.assertEqual(imm.comp_side_lead(wall + [[27, 3.0]], r_no, 1000.0, 0.5,
+                                                hold=26), (28, 65, 27))
+        self.assertIn("COMP_LEAD_HOLD_SMALL", imm._CONFIG_CODE_KNOBS)
+
     def test_an_outbid_lead_fights_after_a_restart_too(self):
         # the hold file keeps a restarted bot -- or a market that dropped out
         # and came back -- fighting from where it led: past the 1,000-lot at
@@ -31125,6 +31145,21 @@ class TestVercelFairLead(unittest.TestCase):
                 rungs.setdefault(o["book_side"], []).append(
                     (o["yes_price"], int(o["remaining_count"])))
         return rungs
+
+    def test_a_few_lots_over_a_fair_lead_are_not_fought(self):
+        # T19.8's own 36c bid sat under 3 at 37c on 10/30. On its 17c lead:
+        # 3 at 18c leave it its share, so it stays (the old rule went to 19c);
+        # likewise 3 NO at 24c (YES 76c) a tick under its 77c offer
+        holds = dict(hold_bid=17, hold_ask=77)
+        self.assertEqual(imm.fair_lead_group(self.YES + [[18, 3]], self.NO, 40.7,
+                                             1000.0, 0.5, **holds),
+                         ((17, 35, 7), (77, 46, 87)))
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO + [[24, 3]], 40.7,
+                                             1000.0, 0.5, **holds),
+                         ((17, 35, 7), (77, 46, 87)))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SMALL", False):
+            self.assertEqual(imm.fair_lead_group(self.YES + [[18, 3]], self.NO, 40.7,
+                                                 1000.0, 0.5, **holds)[0], (19, 35, 18))
 
     def test_the_quote_loop_leads_both_walls_with_200(self):
         bot, rungs, lines = self._cycle()

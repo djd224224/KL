@@ -11181,6 +11181,7 @@ _CONFIG_CODE_KNOBS = (
     "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
+    "COMP_LEAD_HOLD_SMALL",       # a few lots ahead are not fought (2026-10-30)
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
@@ -19737,6 +19738,19 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
 # without sending them, off disables.
 COMP_LEAD_MODE = os.environ.get("IMM_COMP_LEAD", "on").strip().lower()
 COMP_LEAD_SHARE = _env_float("IMM_COMP_LEAD_SHARE", 0.95)
+# A FEW LOTS AHEAD (Jack 2026-10-30: "Yes, do it", on "Should leads stop
+# fighting small orders that step ahead of them?"). A lead fought ANY order
+# resting ahead of it. Kalshi scores every order at or above the reference
+# (where the side first reaches target/5) at full weight, so 3 lots a tick
+# over a 200 leave the lead ~98% of its side (KXOPENVREQ-02NOV26-T19.8's
+# 36c bid sat under 3 at 37c), and jumping them only gave edge away: the
+# cheapest price ahead of the whole book is a tick or more nearer the model.
+# Now an order ahead is fought only where the lead's share where it rests
+# falls under COMP_LEAD_SHARE: a handful of lots over a 200 at most, fewer
+# the more the wall below still scores (over a 13,238-lot wall 11 ticks
+# down, 3 lots are held and 10 fought), and any order ahead beside a copier
+# sharing its price. 0 fights every order ahead.
+COMP_LEAD_HOLD_SMALL = os.environ.get("IMM_COMP_LEAD_HOLD_SMALL", "1") == "1"
 COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 5))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
@@ -19824,9 +19838,10 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     the same space; the cap is `margin` (default COMP_LEAD_MARGIN_C) inside
     it. A side that cannot reach the target with the lead in it does not lead.
     `hold`: the price the side already leads at. An order resting AHEAD of
-    it is fought: the side leads again at the cheapest price ahead of the
-    whole book that takes the share, else at the cap, and an order at or
-    past the cap leaves the rung at the cap. An order sharing its price
+    it is fought where it costs the lead its share (COMP_LEAD_HOLD_SMALL:
+    a few lots a tick over it do not): the side leads again at the cheapest
+    price ahead of the whole book that takes the share, else at the cap, and
+    an order at or past the cap leaves the rung at the cap. An order sharing its price
     leaves it where it is; alone, it stays, or moves down when the book
     below lets a price 3c+ lower take the share; a hold above the cap leads
     afresh."""
@@ -19844,16 +19859,26 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
                 return px
         return None
 
-    def qualifies(px: int) -> bool:
+    def share_at(px: int) -> Tuple[float, bool]:
         lv: Dict[int, float] = dict(own)
         lv[px] = lv.get(px, 0.0) + float(n)
         return _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
-                           {px: float(n)}, target, df)[1]
+                           {px: float(n)}, target, df)
+
+    def qualifies(px: int) -> bool:
+        return share_at(px)[1]
+
+    def keeps_share(px: int) -> bool:
+        s, ok = share_at(px)
+        return ok and s >= COMP_LEAD_SHARE
 
     if hold is not None and hold <= cap:
         below = [(p, q) for p, q in own if p < hold]
         at_or_above = [(p, q) for p, q in own if p >= hold]
-        if any(p > hold for p, _q in at_or_above):
+        # (COMP_LEAD_HOLD_SMALL: an order ahead that leaves the lead its
+        # share where it rests -- a few lots a tick over it -- is not fought)
+        if any(p > hold for p, _q in at_or_above) and not (
+                COMP_LEAD_HOLD_SMALL and keeps_share(hold)):
             # fought: ahead of the whole book, never past the cap
             best = own[0][0]
             px = cap if best >= cap else (cheapest(own) or cap)
