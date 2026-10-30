@@ -201,6 +201,60 @@ FROM `{PROJECT}.{DATASET}.KXHIGH_positions_log` p, latest_poll lp
 WHERE p.polled_at = lp.ts
 """
 
+SQL_BOT_POSITIONS = f"""
+-- This bot's own inventory per market, from its own fills (orders it
+-- logged in KXHIGH_orders): the cards' position, cost, fees and, once the
+-- market settles, its realized P&L -- contracts x (payout - price) - fee
+-- at Kalshi's raw price for the side. /portfolio/positions and
+-- settlements_clean are the whole account's, and since 10/24 the IMM holds
+-- next-day KXHIGH positions on it too: 10/28's settled cards carried
+-- $1,760 of the IMM's cost on 19 of 27 markets beside this bot's $100
+-- (Jack 2026-10-29: "Yes, fix cards"). KXHIGH_fills is the nightly full
+-- load; KXHIGH_fills_live (every tick, append-only) adds the fills since
+-- -- it held every fill of the 14 days to 10/29.
+WITH bot_orders AS (
+  SELECT DISTINCT kalshi_order_id AS order_id
+  FROM `{PROJECT}.{DATASET}.KXHIGH_orders`
+  WHERE kalshi_order_id IS NOT NULL
+),
+fills AS (
+  SELECT fill_id, order_id, market_ticker, side, action,
+         SAFE_CAST(count_fp AS FLOAT64)            AS n,
+         SAFE_CAST(yes_price_dollars AS FLOAT64)   AS yp,
+         SAFE_CAST(no_price_dollars AS FLOAT64)    AS np,
+         IFNULL(SAFE_CAST(fee_cost AS FLOAT64), 0) AS fee,
+         1 AS src
+  FROM `{PROJECT}.{DATASET}.KXHIGH_fills`
+  UNION ALL
+  SELECT fill_id, order_id, market_ticker, side, action, count_fp,
+         yes_price_dollars, no_price_dollars, 0, 2
+  FROM `{PROJECT}.{DATASET}.KXHIGH_fills_live`
+  WHERE polled_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+),
+bot AS (
+  SELECT f.*, IF(f.side = 'yes', f.yp, f.np) AS px
+  FROM fills f JOIN bot_orders USING (order_id)
+  WHERE TRUE
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY fill_id ORDER BY src) = 1
+),
+results AS (
+  SELECT market_ticker, LOGICAL_OR(LOWER(result) = 'yes') AS yes_won
+  FROM `{PROJECT}.{DATASET}.KXHIGH_settlements_clean`
+  WHERE LOWER(result) IN ('yes', 'no')
+  GROUP BY market_ticker
+)
+SELECT
+  b.market_ticker,
+  SUM(IF(b.side = 'yes', 1, -1) * IF(b.action = 'sell', -1, 1) * b.n)   AS bot_position,
+  SUM(IF(b.action = 'sell', 0, b.n * b.px))                              AS bot_cost,
+  SUM(b.fee)                                                             AS bot_fees,
+  IF(LOGICAL_OR(r.yes_won IS NULL), NULL,
+     SUM(IF(b.action = 'sell', -1, 1) * b.n
+         * (IF((b.side = 'yes') = r.yes_won, 1, 0) - b.px) - b.fee))     AS bot_settled_pnl
+FROM bot b LEFT JOIN results r USING (market_ticker)
+GROUP BY b.market_ticker
+"""
+
 SQL_TODAY_ORDERS_DETAIL = f"""
 -- Per-order detail for markets that are currently open (event_date is
 -- today or tomorrow ET). Scoping by event_date — instead of order
@@ -665,6 +719,13 @@ def load() -> dict:
         print(f"  KXHIGH_positions_log unavailable yet ({type(e).__name__}); using stale snapshot positions")
         out["positions"] = pd.DataFrame()
     try:
+        out["bot_positions"] = _q(SQL_BOT_POSITIONS)
+    except Exception as e:
+        # None, not empty: an empty frame means this bot holds nothing
+        print(f"  this bot's own positions unavailable ({type(e).__name__}); "
+              f"cards fall back to the whole account's", flush=True)
+        out["bot_positions"] = None
+    try:
         out["peak_obs"] = _q(SQL_TODAY_PEAK_OBS)
     except Exception:
         out["peak_obs"] = pd.DataFrame()
@@ -806,13 +867,17 @@ def per_city_view(
     orders_detail: pd.DataFrame | None = None,
     cli: pd.DataFrame | None = None,
     settled_pnl: pd.DataFrame | None = None,
+    bot_positions: pd.DataFrame | None = None,
 ) -> list[dict]:
     """Collapse per-market rows into per-(city, forecast_date) cards.
 
-    `positions` is the latest row per market from `KXHIGH_positions_log`.
-    When present it supersedes the trading-bot's snapshot.position field
-    (which is unsigned and stale between trading runs); the live positions
-    log is signed (negative = NO inventory) and refreshed every cron tick.
+    `bot_positions` (SQL_BOT_POSITIONS) is this bot's own inventory per
+    market from its own fills: position, cost, fees, and realized P&L once
+    the market settles. When it loaded (an empty frame = holds nothing) it
+    drives every position and P&L number on the cards. Only when that query
+    failed do they fall back to `positions`, the latest row per market from
+    `KXHIGH_positions_log` -- the whole account's, the IMM's KXHIGH inventory
+    included -- with settlements_clean for closed markets.
     """
     if snapshot.empty:
         return []
@@ -830,7 +895,17 @@ def per_city_view(
     # bid/offer columns.
     if "position" in snap.columns:
         snap = snap.rename(columns={"position": "snap_position"})
-    if positions is not None and not positions.empty:
+    own = bot_positions is not None
+    if own:
+        bp = bot_positions.reindex(columns=["market_ticker", "bot_position", "bot_cost",
+                                            "bot_fees", "bot_settled_pnl"])
+        snap = snap.merge(bp, on="market_ticker", how="left")
+        snap["position"] = snap["bot_position"].fillna(0.0)
+        for col in ("market_exposure_dollars", "realized_pnl_dollars",
+                    "total_traded_dollars", "fees_paid_dollars",
+                    "resting_orders_count"):
+            snap[col] = None
+    elif positions is not None and not positions.empty:
         pos = positions[[
             "market_ticker", "position",
             "market_exposure_dollars", "realized_pnl_dollars",
@@ -1015,27 +1090,39 @@ def per_city_view(
             # Same for cost_basis: prefer live exposure for open positions,
             # fall back to settlement's total_cost for closed ones so the
             # archive page shows real cost+P&L on yesterday's settled markets.
-            live_realized = r.get("realized_pnl_dollars")
-            settled_pnl_val = r.get("settled_pnl_dollars")
-            realized_pnl = (
-                float(live_realized) if pd.notna(live_realized) and float(live_realized) != 0
-                else float(settled_pnl_val) if pd.notna(settled_pnl_val)
-                else None
-            )
-            live_exposure = r.get("market_exposure_dollars")
-            settled_cost = r.get("settled_cost_dollars")
-            exposure_dollars = (
-                float(live_exposure) if pd.notna(live_exposure)
-                else float(settled_cost) if pd.notna(settled_cost)
-                else None
-            )
-            live_fees = r.get("fees_paid_dollars")
-            settled_fees = r.get("settled_fees_dollars")
-            fees_paid_dollars = (
-                float(live_fees) if pd.notna(live_fees)
-                else float(settled_fees) if pd.notna(settled_fees)
-                else None
-            )
+            if own:
+                # this bot's own fills only; `closed` once its market settled
+                # (the fills keep the position, so no open P&L on top)
+                def _f(col):
+                    v = r.get(col)
+                    return float(v) if pd.notna(v) else None
+                realized_pnl = _f("bot_settled_pnl")
+                exposure_dollars = _f("bot_cost")
+                fees_paid_dollars = _f("bot_fees")
+                closed = realized_pnl is not None
+            else:
+                live_realized = r.get("realized_pnl_dollars")
+                settled_pnl_val = r.get("settled_pnl_dollars")
+                realized_pnl = (
+                    float(live_realized) if pd.notna(live_realized) and float(live_realized) != 0
+                    else float(settled_pnl_val) if pd.notna(settled_pnl_val)
+                    else None
+                )
+                live_exposure = r.get("market_exposure_dollars")
+                settled_cost = r.get("settled_cost_dollars")
+                exposure_dollars = (
+                    float(live_exposure) if pd.notna(live_exposure)
+                    else float(settled_cost) if pd.notna(settled_cost)
+                    else None
+                )
+                live_fees = r.get("fees_paid_dollars")
+                settled_fees = r.get("settled_fees_dollars")
+                fees_paid_dollars = (
+                    float(live_fees) if pd.notna(live_fees)
+                    else float(settled_fees) if pd.notna(settled_fees)
+                    else None
+                )
+                closed = False
             settled_result_val = r.get("settled_result")
             buckets.append({
                 "label": r["bucket_label"],
@@ -1066,6 +1153,7 @@ def per_city_view(
                 # `settled_result` ('YES'/'NO') is set once Kalshi settles —
                 # downstream renderers can show a "settled" tag in archive views.
                 "settled_result": str(settled_result_val) if pd.notna(settled_result_val) else None,
+                "closed": closed,
             })
 
         # best |edge| with two-sided market (otherwise meaningless)
@@ -1078,7 +1166,10 @@ def per_city_view(
         #   - buckets that have SETTLED (closed positions, no longer in
         #     portfolio but their cost+P&L should still tally toward the
         #     day's totals on yesterday's archive view).
-        positions = [b for b in buckets if b["position"] or b.get("settled_result")]
+        # From this bot's own fills a settled bucket keeps its position, and
+        # a market only the IMM traded is not one of them.
+        positions = [b for b in buckets
+                     if b["position"] or (not own and b.get("settled_result"))]
 
         # Mark-to-market current value per bucket.
         #
@@ -1096,7 +1187,7 @@ def per_city_view(
             cost = b.get("exposure_dollars")  # this is Kalshi's cost-basis field
             fees = b.get("fees_paid_dollars") or 0
             yes_mid = b.get("market_p")
-            if pos and cost is not None and yes_mid is not None:
+            if pos and cost is not None and yes_mid is not None and not b.get("closed"):
                 side_mid = (1.0 - yes_mid) if pos < 0 else yes_mid
                 current_value = abs(pos) * side_mid
                 b["current_value"] = current_value
@@ -1907,6 +1998,7 @@ def render(data: dict, forecast_date_filter: str | None = None) -> str:
         data.get("orders_detail"),
         cli=data.get("cli"),
         settled_pnl=data.get("settled_pnl"),
+        bot_positions=data.get("bot_positions"),
     )
     if forecast_date_filter is not None:
         # Archive build: keep ONLY the requested date.
@@ -2159,7 +2251,7 @@ def render(data: dict, forecast_date_filter: str | None = None) -> str:
                 pos = p["position"]
                 side = "NO" if pos < 0 else "YES"
                 qty = abs(pos)
-                pnl = p.get("open_pnl")
+                pnl = p.get("realized_pnl") if p.get("closed") else p.get("open_pnl")
                 if pnl is not None and abs(pnl) >= 0.01:
                     pnl_cls = "pnl-pos" if pnl > 0 else "pnl-neg"
                     pnl_chip = f' <span class="{pnl_cls}">${pnl:+.0f}</span>'
@@ -3390,7 +3482,7 @@ def main() -> Path:
     print("loading bigquery state...", flush=True)
     data = load()
     for k, df in data.items():
-        print(f"  {k}: {len(df)} rows", flush=True)
+        print(f"  {k}: {'unavailable' if df is None else f'{len(df)} rows'}", flush=True)
 
     # Live page: all cards (today + tomorrow + any not-yet-settled
     # yesterday). This is what the GCS index.html serves.
