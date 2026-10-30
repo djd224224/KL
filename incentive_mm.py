@@ -2845,6 +2845,12 @@ def event_cap_contracts(event_ticker: str) -> float:
     # (2026-10-15): the ladders' / escalators' event cap
     if nfl_auto_entry(series) is not None or league_auto_entry(series) is not None:
         return MAX_EVENT_CONTRACTS * applied_mention_mult("KXNFLLADDERREC")
+    # a family that leads off its fair (2026-10-29, FAIR LEAD): room for the
+    # leads, which take first call on it, beside the other markets' rungs
+    if globals().get("FAIR_LEAD_MODE") == "on" \
+            and series in globals().get("FAIR_LEAD_SERIES", ()):
+        return max(globals()["FAIR_LEAD_EVENT_CAP"],
+                   MAX_EVENT_CONTRACTS * applied_mention_mult(series))
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
 # Selection reserves worst-case (full two-sided ladder at the touch) collateral
@@ -11118,6 +11124,9 @@ _CONFIG_CODE_KNOBS = (
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
+    # fair lead (2026-10-29)
+    "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
+    "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -19663,13 +19672,15 @@ def comp_lead_band_ok(px: int, band: Optional[Tuple[int, int]], series: str) -> 
 
 
 def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
-                       df: float, hold: Optional[int] = None
+                       df: float, hold: Optional[int] = None,
+                       margin: Optional[int] = None
                        ) -> Optional[Tuple[int, int, int]]:
     """ONE side's lead in that side's own price space (YES cents for the bid
     side, NO cents for the ask side; higher = more aggressive): (price, cap,
     own external best), or None. `own_levels`: the market's external side;
-    `ref`: the reference its siblings imply, in the same space. A side that
-    cannot reach the target with the lead in it does not lead.
+    `ref`: the reference its siblings imply (or a model fair: FAIR LEAD), in
+    the same space; the cap is `margin` (default COMP_LEAD_MARGIN_C) inside
+    it. A side that cannot reach the target with the lead in it does not lead.
     `hold`: the price the side already leads at. An order resting AHEAD of
     it is fought: the side leads again at the cheapest price ahead of the
     whole book that takes the share, else at the cap, and an order at or
@@ -19680,7 +19691,7 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     n = comp_lead_size(target)
     if n <= 0:
         return None
-    cap = min(ref - COMP_LEAD_MARGIN_C, 99)
+    cap = min(ref - (COMP_LEAD_MARGIN_C if margin is None else margin), 99)
     own = levels_desc(own_levels)
 
     def cheapest(levels: List[Tuple[int, float]]) -> Optional[int]:
@@ -19816,6 +19827,91 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
     if lb is not None and la is not None and lb[0] >= la[0]:
         lb = la = None
     return lb, la
+
+
+# FAIR LEAD (Jack 2026-10-29: "Instead of just standing down due to being
+# under payout bar, since I have a fair we should be willing to come in above
+# the wall with up to 200 contracts"; then "10c" from the fair and an event
+# cap of 2,000). The complement lead off our own model's price instead of a
+# sibling's book: on a family with a fair (FAIR_LEAD_SERIES, weekend rain's
+# rain_wknd_fair.py), a side whose own touch is a thin order ahead of a wall
+# leads with one rung of target/5 (200 of a 1,000 target) at the cheapest
+# price ahead of its external best that takes COMP_LEAD_SHARE of the side --
+# the bid never above the fair less FAIR_LEAD_MARGIN_C, the ask never below
+# the fair plus it (fair_lead_group; comp_side_lead_ref's holds, fight and
+# guards). The estimate prices the lead, so a market that projected under
+# the payout bar with an at-reference rung behind the wall is admitted when
+# the lead clears it. On the 10/29 14:30Z books (26OCT31): at 10c, 5 bids
+# and 1 ask led (ABQ, CMH, IND, LEX, SGF; CLL), each market ~$8/day of a
+# $16.4/day pool before anyone reacts, against ~$10/day for the 35 markets
+# as they quoted. Unlike the complement lead nothing hedges a fill (the
+# cities are separate markets): a leading market's position cap is
+# FAIR_LEAD_MAX_POSITION, so one full fill stops that side, and the family's
+# event cap is FAIR_LEAD_EVENT_CAP (event_cap_contracts) -- leads take
+# first call on the event's room, and at 1,000 five of them would have
+# pushed every other city's bids out. A stale or missing fair leads nothing
+# (the family's gate stands the market aside anyway). Logs: `fair lead <t>
+# bid: 200 @ 54c, ahead of its own 52c; the weekend rain fair implies 69c`.
+# IMM_FAIR_LEAD=dry logs the leads without placing them, off disables.
+FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
+FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
+    {s.strip() for s in os.environ.get("IMM_FAIR_LEAD_SERIES", "KXRAINWKND").split(",")
+     if s.strip()}))
+FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 10))
+FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
+FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
+
+
+def fair_lead_series(series: str) -> bool:
+    """May this series' markets lead off a model fair (FAIR LEAD)?"""
+    return (FAIR_LEAD_MODE in ("on", "dry") and LADDER_MODE == "atref"
+            and series in FAIR_LEAD_SERIES)
+
+
+def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+    """The fair (YES cents) `ticker` leads off, or None: weekend rain's
+    (rain_wknd_fair.py) while its gate would still read it fresh."""
+    if not fair_lead_series(series):
+        return None
+    if rain_wknd_series(series):
+        e = _rain_wknd_state["markets"].get(ticker)
+        if e is None or now_ts - e["ts"] > RAIN_WKND_TTL_MIN * 60:
+            return None
+        return float(e["p"]) * 100.0
+    return None
+
+
+def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
+                    fair_c: float, target: float, df: float,
+                    hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
+                    ) -> Tuple[Optional[Tuple[int, int, int]],
+                               Optional[Tuple[int, int, int]]]:
+    """(bid lead, ask lead) for a market off its model fair `fair_c` (YES
+    cents), every book EXTERNAL. The bid side's reference is the fair rounded
+    down, the ask side's (NO space) 100 less the fair rounded up, so each
+    side leads at least FAIR_LEAD_MARGIN_C inside the fair. Holds, caps and
+    guards as comp_lead_group."""
+    lb = ln = None
+    if target > 0:
+        lb = comp_side_lead_ref(yes_levels, int(math.floor(fair_c)), target, df,
+                                hold=hold_bid, margin=FAIR_LEAD_MARGIN_C)
+        ln = comp_side_lead_ref(no_levels, 100 - int(math.ceil(fair_c)), target, df,
+                                hold=None if hold_ask is None else 100 - hold_ask,
+                                margin=FAIR_LEAD_MARGIN_C)
+    la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
+    eb, ea = external_best(yes_levels, no_levels)
+    if lb is not None and ea is not None and lb[0] >= ea:
+        lb = None
+    if la is not None and eb is not None and la[0] <= eb:
+        la = None
+    if lb is not None and la is not None and lb[0] >= la[0]:
+        lb = la = None
+    return lb, la
+
+
+def lead_mode(src: Optional[str]) -> str:
+    """The on/dry/off switch for a lead from `src` ("comp" or "fair")."""
+    return FAIR_LEAD_MODE if src == "fair" else COMP_LEAD_MODE
 
 
 def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
@@ -27689,6 +27785,16 @@ class IncentiveMarketMaker:
         or a threshold ladder)?"""
         return t in self._comp_groups or t in self._ladders
 
+    def _lead_source(self, meta) -> Optional[str]:
+        """Where `meta`'s leads would come from: "comp" (other markets' books:
+        the complement lead), "fair" (its fresh model fair: FAIR LEAD) or
+        None. Each mode's own switch applies (lead_mode)."""
+        if self._comp_linked(meta.ticker) and comp_lead_series(meta.series):
+            return "comp"
+        if fair_lead_fair_c(meta.ticker, meta.series, time.time()) is not None:
+            return "fair"
+        return None
+
     def _comp_books(self, tickers) -> List[Tuple[str, List[List[float]], List[List[float]]]]:
         """Each of `tickers`' EXTERNAL books on the WS feed, as (ticker, YES
         levels, NO levels); a market off the feed is left out."""
@@ -27742,10 +27848,11 @@ class IncentiveMarketMaker:
         (None, None) without a group, outside the scope, on a sub-penny book
         or when the feed cannot serve every sibling's book. A threshold
         ladder's strike leads off the other strikes' books (ladder_lead_group;
-        a strike off the feed is left out)."""
+        a strike off the feed is left out). A market no other book prices
+        leads off its fresh model fair (fair_lead_group, FAIR LEAD)."""
         t = meta.ticker
-        if not self._comp_linked(t) or not comp_lead_series(meta.series) \
-                or meta.price_step < 0.01:
+        src = self._lead_source(meta)
+        if src is None or meta.price_step < 0.01:
             return None, None
         # where its sides lead now, else where they last led (COMP_HOLD_FILE):
         # a leading side never moves up
@@ -27755,6 +27862,13 @@ class IncentiveMarketMaker:
             if h is not None and time.time() - float(h[2]) < COMP_HOLD_TTL_SECS:
                 held = (h[0], h[1], 0)
         held = held or (None, None, 0)
+        if src == "fair":
+            fair_c = fair_lead_fair_c(t, meta.series, time.time())
+            if fair_c is None:
+                return None, None
+            return fair_lead_group(yes_ext, no_ext, fair_c,
+                                   meta.target_size, meta.discount_factor,
+                                   hold_bid=held[0], hold_ask=held[1])
         if t not in self._comp_groups:
             lad = self._ladders[t]
             i = lad.index(t)
@@ -27803,15 +27917,22 @@ class IncentiveMarketMaker:
                 log(f"{self.tag} ! {COMP_HOLD_FILE} write failed ({e}); the "
                     f"holds stay in memory (logged once)")
 
-    def _comp_lead_note(self, t: str, lead_b, lead_a, n: int) -> None:
-        """Log each side's complement lead when it starts, stops or moves
-        3c or more (COMP_LEAD_MODE dry says so)."""
-        dry = "" if COMP_LEAD_MODE == "on" else " (dry)"
+    def _comp_lead_note(self, t: str, lead_b, lead_a, n: int,
+                        src: str = "comp") -> None:
+        """Log each side's complement lead -- or, `src` "fair", its fair lead
+        -- when it starts, stops or moves 3c or more (the mode's dry says
+        so)."""
+        dry = "" if lead_mode(src) == "on" else " (dry)"
+        kind, margin = ("fair", FAIR_LEAD_MARGIN_C) if src == "fair" \
+            else ("comp", COMP_LEAD_MARGIN_C)
         grp = self._comp_groups.get(t) or ()
         who, verb = ((f"{self._comp_pairs[t]}'s book", "implies") if t in self._comp_pairs
                      else (f"its {max(len(grp) - 1, 0)} siblings' books", "imply"))
+        if src == "fair":
+            who, verb = (("the weekend rain fair" if rain_wknd_series(series_of(t))
+                          else "its model fair"), "implies")
         for side, lead in (("bid", lead_b), ("ask", lead_a)):
-            if not grp and t in self._ladders:
+            if src != "fair" and not grp and t in self._ladders:
                 who, verb = (("its harder strikes' books", "imply") if side == "bid"
                              else ("its easier strikes' books", "imply"))
             key = (t, side)
@@ -27822,17 +27943,17 @@ class IncentiveMarketMaker:
                 continue
             self._comp_lead_noted[key] = px
             if px is None:
-                log(f"{self.tag} comp lead{dry} {t} {side}: off -- {who} no longer "
-                    f"put it ahead of its own, or an order stepped ahead of it")
+                log(f"{self.tag} {kind} lead{dry} {t} {side}: off -- {who} no longer "
+                    f"put{'s' if src == 'fair' else ''} it ahead of its own, or "
+                    f"an order stepped ahead of it")
                 continue
             _p, cap, best = lead
-            implied = (cap + COMP_LEAD_MARGIN_C if side == "bid"
-                       else cap - COMP_LEAD_MARGIN_C)
+            implied = cap + margin if side == "bid" else cap - margin
             ahead = (px > best) if side == "bid" else (px < best)
             where = (f"ahead of its own {best}c" if ahead else
                      f"held at the cap, {'with' if px == best else 'behind'} its own "
                      f"{best}c")
-            log(f"{self.tag} comp lead{dry} {t} {side}: {n} @ {px}c, {where}; "
+            log(f"{self.tag} {kind} lead{dry} {t} {side}: {n} @ {px}c, {where}; "
                 f"{who} {verb} {implied}c")
 
     # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
@@ -27941,8 +28062,10 @@ class IncentiveMarketMaker:
                 return
             lk = self._lock_kind(tkr, book_side)
             # a lead's fill booked before the groups are read (the startup
-            # reconcile) waits for its group; any other needs one now
-            if lk is None and (not on_lead or self._comp_linked(tkr)):
+            # reconcile) waits for its group; any other needs one now -- and a
+            # FAIR lead's has none to wait for (its family is never grouped)
+            if lk is None and (not on_lead or self._comp_linked(tkr)
+                               or series_of(tkr) in FAIR_LEAD_SERIES):
                 return
             job = {"id": f"{tkr}-{book_side}-{oid[:8] or 'x'}-{int(now_ts)}",
                    "event": "-".join(tkr.split("-")[:-1]) or tkr,
@@ -29017,11 +29140,14 @@ class IncentiveMarketMaker:
         rb, ra = ladder_reference_prices(yes_levels, no_levels, meta.target_size)
         # TWO-MARKET COMPLEMENT LEAD: the leads the quote loop would rest, read
         # off the EXTERNAL book (an incumbent's own orders netted out) and the
-        # twin's; they price the probe ladder below, and so the estimate and
-        # the floor projection (COMP_LEAD_MODE on only)
+        # twin's -- or off the market's model fair (FAIR LEAD); they price the
+        # probe ladder below, and so the estimate and the floor projection
+        # (each mode on only): a market under the payout bar behind its wall
+        # is admitted when its lead clears it
         _leads: Tuple[Optional[Tuple[int, int, int]],
                       Optional[Tuple[int, int, int]]] = (None, None)
-        if COMP_LEAD_MODE == "on" and self._comp_linked(meta.ticker):
+        _lsrc = self._lead_source(meta)
+        if _lsrc is not None and lead_mode(_lsrc) == "on":
             _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_live)
                                if (self.live and own_live) else (yes_levels, no_levels))
             _leads = self._comp_lead(meta, _lx_yes, _lx_no)
@@ -29117,7 +29243,8 @@ class IncentiveMarketMaker:
             lb, la = leads
             _cap = int(series_max_position(meta.series))
             if lb is not None or la is not None:    # a leading market's cap
-                _cap = max(_cap, int(COMP_LEAD_MAX_POSITION))
+                _cap = max(_cap, int(FAIR_LEAD_MAX_POSITION if _lsrc == "fair"
+                                     else COMP_LEAD_MAX_POSITION))
 
             def _lead_room(sm: int) -> int:
                 return max(sm, _lead_n) if _cap <= 0 else min(max(sm, _lead_n), _cap)
@@ -31602,13 +31729,16 @@ class IncentiveMarketMaker:
             # book prices well ahead of its own rests one rung of at least
             # target/5 at its lead price (comp_lead_prices) instead of at its
             # reference -- never on a reduce-only market, under a fair gate's
-            # cap or outside the band the loop places at-ref rungs in
+            # cap or outside the band the loop places at-ref rungs in. A FAIR
+            # lead (FAIR LEAD) rests at least FAIR_LEAD_MARGIN_C inside its
+            # fair, so inside whatever its own family's gate caps a side to
             lead_b = lead_a = None
             lead_n = comp_lead_size(meta.target_size)
-            if (self._comp_linked(t) and not reduce_only
+            lead_src = self._lead_source(meta)
+            if (lead_src is not None and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None
                     and poke_caps is None and nfl_caps is None
-                    and ca_caps is None and rain_caps is None):
+                    and ca_caps is None and (rain_caps is None or lead_src == "fair")):
                 _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_in_book)
                                    if own_in_book else (yes_levels, no_levels))
                 if t not in self._comp_lead_px and own_in_book:
@@ -31629,8 +31759,8 @@ class IncentiveMarketMaker:
                 if lead_a is not None and not (ask_in_band and comp_lead_band_ok(
                         lead_a[0], (rung_lo, pmax_s), meta.series)):
                     lead_a = None
-                self._comp_lead_note(t, lead_b, lead_a, lead_n)
-                if COMP_LEAD_MODE != "on":
+                self._comp_lead_note(t, lead_b, lead_a, lead_n, src=lead_src)
+                if lead_mode(lead_src) != "on":
                     lead_b = lead_a = None
             # LONE-REFERENCE GUARD (LONE_REF_GUARD_MODE): a side whose
             # reference rests on a thin external top our rung would jump to
@@ -31668,8 +31798,9 @@ class IncentiveMarketMaker:
             if lead_a is not None and lv_ask:
                 side_max_ask = max(side_max_ask, lead_n)
             maxpos = series_max_position(meta.series)
-            if lead_b is not None or lead_a is not None:
-                maxpos = max(maxpos, COMP_LEAD_MAX_POSITION)   # a leading market's cap
+            if lead_b is not None or lead_a is not None:       # a leading market's cap
+                maxpos = max(maxpos, FAIR_LEAD_MAX_POSITION if lead_src == "fair"
+                             else COMP_LEAD_MAX_POSITION)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             # (MANUAL_COEXIST_EVENTS too: the user's positions there are his)
@@ -35216,6 +35347,17 @@ class IncentiveMarketMaker:
                f"{SHARD_CASH_PAUSE_SECS / 60:g} min, cheaper ones still sent; "
                f"amends and cancels as before" if SHARD_CASH_PAUSE_SECS > 0
                else "off -- every create sent as before"))
+        log(f"fair lead (2026-10-29): {FAIR_LEAD_MODE}"
+            + (f" -- {', '.join(FAIR_LEAD_SERIES) or 'no series'}: a side whose touch "
+               f"sits ahead of a wall leads with target/5 at the cheapest price "
+               f"taking {COMP_LEAD_SHARE:.0%} of the side, at least "
+               f"{FAIR_LEAD_MARGIN_C}c inside the model fair (fought to that cap, "
+               f"never chased up), priced into the estimate so a market under the "
+               f"payout bar is admitted on it; a leading market's position cap "
+               f"{FAIR_LEAD_MAX_POSITION:g}, the family's event cap "
+               f"{FAIR_LEAD_EVENT_CAP:g}; no hedge"
+               + (" (dry: logged, not placed)" if FAIR_LEAD_MODE == "dry" else "")
+               if FAIR_LEAD_MODE in ("on", "dry") else ""))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "

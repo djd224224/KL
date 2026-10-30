@@ -19,6 +19,13 @@ neighbours' books. The hedge legs are resting MAKER orders only (Jack:
 "Don't be a taker, only maker"), cancelled once the lock completes or the
 job ends.
 
+Since 2026-10-29 (Jack: "since I have a fair we should be willing to come in
+above the wall with up to 200 contracts") weekend rain's sides also lead off
+its MODEL FAIR (incentive_mm FAIR_LEAD_MODE): 200 at the cheapest price that
+takes ~95% of the side, at least 10c inside the fair. Those log `fair lead`
+lines, get their own section, and their fills ride as inventory (nothing
+hedges a city's market), so they never count toward the hedge verdict.
+
 ONE EMAIL per ET day (the day before), ending in OK / WATCH / PROBLEM:
   leads    every side that led, at what price against its own best and the
            price its siblings (or a ladder's easier / harder strikes) imply,
@@ -70,10 +77,11 @@ HEDGE_STUCK_SECS = 3600         # an open job part-hedged this long is a PROBLEM
 LEVELS = ("OK", "WATCH", "PROBLEM")
 
 _LEAD = re.compile(
-    r"^(\S+ \S+)Z \[IMM\] comp lead( \(dry\))? (\S+) (bid|ask): (\d+) @ (\d+)c, "
+    r"^(\S+ \S+)Z \[IMM\] (comp|fair) lead( \(dry\))? (\S+) (bid|ask): (\d+) @ (\d+)c, "
     r"(?:ahead of|held at the cap, (?:with|behind)) its own (\d+)c; (.+?) "
     r"(?:implies|imply) (-?\d+)c")
-_OFF = re.compile(r"^(\S+ \S+)Z \[IMM\] comp lead(?: \(dry\))? (\S+) (bid|ask): off -- ")
+_OFF = re.compile(r"^(\S+ \S+)Z \[IMM\] (?:comp|fair) lead(?: \(dry\))? (\S+) (bid|ask): "
+                  r"off -- ")
 _GROUPS = re.compile(r"^(\S+ \S+)Z \[IMM\] comp lead: (\d+) mutually exclusive "
                      r"event\(s\) grouped, (\d+) of them two-market")
 _BANNER = re.compile(r"^(\S+ \S+)Z === incentive_mm")
@@ -150,8 +158,9 @@ def row_ts(r: dict) -> float:
 
 def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
     """{(ticker, side): {"spans": [[start, end], ...], "px", "best", "implied",
-    "who", "dry", "open"}} for the window from the day-log lines. A restart
-    banner closes every open lead (a new process logs its leads afresh)."""
+    "who", "dry", "open", "kind"}} for the window from the day-log lines
+    (kind "comp" or "fair"). A restart banner closes every open lead (a new
+    process logs its leads afresh)."""
     leads: dict = {}
     groups = None
     for line in lines:
@@ -160,14 +169,15 @@ def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
             ts = _ts(m.group(1))
             if ts >= b_ts:
                 continue
-            key = (m.group(3), m.group(4))
+            key = (m.group(4), m.group(5))
             ld = leads.setdefault(key, {"spans": [], "open": None, "pxs": []})
             if ld["open"] is None:
                 ld["open"] = ts
             if a_ts <= ts:
-                ld["pxs"].append(int(m.group(6)))
-            ld.update(px=int(m.group(6)), best=int(m.group(7)), who=m.group(8),
-                      implied=int(m.group(9)), dry=bool(m.group(2)), size=int(m.group(5)))
+                ld["pxs"].append(int(m.group(7)))
+            ld.update(px=int(m.group(7)), best=int(m.group(8)), who=m.group(9),
+                      implied=int(m.group(10)), dry=bool(m.group(3)), size=int(m.group(6)),
+                      kind=m.group(2))
             continue
         m = _OFF.match(line) or _BANNER.match(line)
         if m:
@@ -211,7 +221,8 @@ def lead_fills(fills: list, leads: dict) -> list:
         if any(s - 60 <= ts <= e + 600 for s, e in ld["spans"]) and px is not None \
                 and abs(float(px) - ld["px"]) <= 0.5:
             out.append(dict(ticker=f.get("ticker"), side=side, ts=ts,
-                            count=float(f.get("count") or 0), px=float(px)))
+                            count=float(f.get("count") or 0), px=float(px),
+                            kind=ld.get("kind", "comp")))
     return out
 
 
@@ -303,8 +314,10 @@ def verdict(ctx: dict) -> tuple:
     if stuck:
         flag(2, f"{len(stuck)} lock job(s) part-hedged for over "
                 f"{HEDGE_STUCK_SECS // 60} min")
-    if len(ctx["fills"]) > len(h["opened"]):
-        flag(1, f"{len(ctx['fills'])} lead fill(s) but {len(h['opened'])} hedge job(s) "
+    # (a FAIR lead's fill has nothing to hedge on: never counted here)
+    comp_fills = [f for f in ctx["fills"] if f.get("kind", "comp") == "comp"]
+    if len(comp_fills) > len(h["opened"]):
+        flag(1, f"{len(comp_fills)} lead fill(s) but {len(h['opened'])} hedge job(s) "
                 f"opened")
     young = [j for j in h["open_now"] if j not in stuck]
     if young:
@@ -331,16 +344,28 @@ def build_report(day, now=None) -> dict:
     return ctx
 
 
+def _split(ctx) -> tuple:
+    """(complement leads, fair leads, complement-lead fills, fair-lead fills)."""
+    comp = {k: v for k, v in ctx["leads"].items() if v.get("kind", "comp") == "comp"}
+    fair = {k: v for k, v in ctx["leads"].items() if v.get("kind") == "fair"}
+    cf = [f for f in ctx["fills"] if f.get("kind", "comp") == "comp"]
+    ff = [f for f in ctx["fills"] if f.get("kind") == "fair"]
+    return comp, fair, cf, ff
+
+
 def subject_for(ctx) -> str:
     day = datetime.strptime(ctx["day"], "%Y-%m-%d")
-    n_led = len(ctx["leads"])
+    comp, fair, cf, ff = _split(ctx)
+    n_led = len(comp)
     h = ctx["hedges"]
     lk = h["locks"]
+    fair_s = (f", {len(fair)} fair-led ({len(ff)} fill{'s' if len(ff) != 1 else ''})"
+              if fair else "")
     return (f"IMM complement lead {day:%m/%d}: {n_led} side{'s' if n_led != 1 else ''} led, "
-            f"{len(ctx['fills'])} lead fill{'s' if len(ctx['fills']) != 1 else ''}, "
+            f"{len(cf)} lead fill{'s' if len(cf) != 1 else ''}, "
             f"{len(lk['done'])} other fill{'s' if len(lk['done']) != 1 else ''} locked "
             f"({usd(lk['locked'])}), "
-            f"{len(h['done'])} hedged ({usd(h['locked'])} locked) | {ctx['level']}")
+            f"{len(h['done'])} hedged ({usd(h['locked'])} locked){fair_s} | {ctx['level']}")
 
 
 def render_text(ctx) -> str:
@@ -350,7 +375,7 @@ def render_text(ctx) -> str:
     if g:
         out.append(f"Groups: {g[0]} mutually exclusive events read, {g[1]} of them "
                    f"two-market.")
-    leads = ctx["leads"]
+    leads, fair, fills, fair_fills = _split(ctx)
     now_leading = [k for k, v in leads.items() if v["leading_at_end"]]
     out += ["", f"LEADS: {len(leads)} side(s) led during the day; "
                 f"{len(now_leading)} leading at the day's end."]
@@ -367,12 +392,34 @@ def render_text(ctx) -> str:
                    f"{v['best']}c, {by} {v['implied']}c; led {hrs:.1f}h{moved}"
                    + (" (dry)" if v.get("dry") else "")
                    + ("" if v["leading_at_end"] else ", ended") + est_s)
-    fills = ctx["fills"]
     out += ["", f"LEAD FILLS: {len(fills)}"]
     for f in fills:
         when = datetime.fromtimestamp(f["ts"], timezone.utc).astimezone(imm.ET)
         what = "sold" if f["side"] == "ask" else "bought"
         out.append(f"  {when:%H:%M} ET {f['ticker']} {what} {f['count']:g} @ {f['px']:g}c")
+    if fair or fair_fills:
+        fair_end = [k for k, v in fair.items() if v["leading_at_end"]]
+        out += ["", f"FAIR LEADS (off our model's fair, at least 10c inside it): "
+                    f"{len(fair)} side(s) led during the day; {len(fair_end)} leading at "
+                    f"the day's end."]
+        for (t, side), v in sorted(fair.items(), key=lambda kv: kv[0]):
+            hrs = sum(e - s for s, e in v["spans"]) / 3600.0
+            pxs = v.get("pxs") or []
+            moved = (f", moved {min(pxs)}-{max(pxs)}c" if pxs and min(pxs) != max(pxs)
+                     else "")
+            est = ctx["est"].get(t)
+            est_s = f"; est now ${est[0]:.2f}/day ({100 * est[1]:.0f}% of pool)" if est else ""
+            out.append(f"  {t} {side}: {v.get('size', 200)} @ {v['px']}c, own best "
+                       f"{v['best']}c, fair {v['implied']}c; led {hrs:.1f}h{moved}"
+                       + (" (dry)" if v.get("dry") else "")
+                       + ("" if v["leading_at_end"] else ", ended") + est_s)
+        out.append(f"  fills: {len(fair_fills)} (inventory to settlement: nothing hedges "
+                   f"a city's market)")
+        for f in fair_fills:
+            when = datetime.fromtimestamp(f["ts"], timezone.utc).astimezone(imm.ET)
+            what = "sold" if f["side"] == "ask" else "bought"
+            out.append(f"  {when:%H:%M} ET {f['ticker']} {what} {f['count']:g} @ "
+                       f"{f['px']:g}c")
     h = ctx["hedges"]
     out += ["", f"HEDGES (lead fills): {len(h['opened'])} job(s) opened, {len(h['sends'])} "
                 f"maker leg(s) rested ({len(h['crossed'])} refused as a cross), "
@@ -409,7 +456,8 @@ def render_text(ctx) -> str:
     out += ["", f"VERDICT: {ctx['level']}"] + [f"  - {r}" for r in ctx["reasons"]]
     out += ["", "Switches (run_incentive_mm.ps1, then restart_imm.ps1 -Task): "
                 "IMM_COMP_LEAD=dry|off stops placing leads; IMM_COMP_HEDGE=dry|off stops "
-                "the lead fills' hedge orders; IMM_LOCK=dry|off the other fills' locks."]
+                "the lead fills' hedge orders; IMM_LOCK=dry|off the other fills' locks; "
+                "IMM_FAIR_LEAD=dry|off the fair leads."]
     return "\n".join(out)
 
 

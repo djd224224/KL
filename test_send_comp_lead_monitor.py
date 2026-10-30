@@ -173,5 +173,49 @@ class TestHedgesAndVerdict(unittest.TestCase):
         self.assertTrue(text.isascii())
 
 
+def fair_lead(t, tk="KXRAINWKND-26OCT31-SGF", side="bid", px=54, best=48, fair=69, d=29):
+    return (f"2026-10-{d} {t}Z [IMM] fair lead {tk} {side}: 200 @ {px}c, ahead of its "
+            f"own {best}c; the weekend rain fair implies {fair}c\n")
+
+
+class TestFairLeads(unittest.TestCase):
+    """Weekend rain's sides lead off the model fair since 2026-10-29 (Jack:
+    "since I have a fair we should be willing to come in above the wall with
+    up to 200 contracts"): their own section, and a fill rides as inventory,
+    so it never asks for a hedge job."""
+
+    def test_fair_leads_parse_report_apart_and_never_watch(self):
+        a, b = cm.day_window(date(2026, 10, 29))
+        lines = [fair_lead("06:00:00"),
+                 "2026-10-29 08:00:00Z [IMM] fair lead KXRAINWKND-26OCT31-SGF bid: off -- "
+                 "the weekend rain fair no longer puts it ahead of its own, or an order "
+                 "stepped ahead of it\n",
+                 lead("09:00:00")]
+        p = cm.parse_leads(lines, a, b)
+        f = p["leads"][("KXRAINWKND-26OCT31-SGF", "bid")]
+        self.assertEqual((f["kind"], f["px"], f["best"], f["implied"]), ("fair", 54, 48, 69))
+        self.assertEqual(f["spans"], [[_ts(6), _ts(8)]])
+        self.assertEqual(p["leads"][("KXK-30-JDON", "ask")]["kind"], "comp")
+        fills = cm.lead_fills([{"ticker": "KXRAINWKND-26OCT31-SGF", "side": "yes",
+                                "action": "buy", "count": 200.0, "is_taker": False,
+                                "yes_price_cents": 54, "ts": _ts(7)}], p["leads"])
+        self.assertEqual([x["kind"] for x in fills], ["fair"])
+        h = cm.hedge_summary([], [], _ts(12))
+        ctx = dict(day="2026-10-29", leads=p["leads"], groups=None, fills=fills,
+                   hedges=h, est={})
+        ctx["level"], ctx["reasons"] = cm.verdict(ctx)
+        self.assertEqual(ctx["level"], "OK")                 # no hedge job is expected
+        self.assertIn("1 side led, 0 lead fills", cm.subject_for(ctx))
+        self.assertIn("1 fair-led (1 fill) | OK", cm.subject_for(ctx))
+        text = cm.render_text(ctx)
+        self.assertIn("LEADS: 1 side(s) led during the day", text)
+        self.assertIn("FAIR LEADS (off our model's fair, at least 10c inside it): 1 side(s)",
+                      text)
+        self.assertIn("KXRAINWKND-26OCT31-SGF bid: 200 @ 54c, own best 48c, fair 69c; "
+                      "led 2.0h, ended", text)
+        self.assertIn("KXRAINWKND-26OCT31-SGF bought 200 @ 54c", text)
+        self.assertTrue(text.isascii())
+
+
 if __name__ == "__main__":
     unittest.main()

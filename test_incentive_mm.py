@@ -30420,6 +30420,225 @@ class TestComplementLead(unittest.TestCase):
                 self.assertAlmostEqual(meta.est_frac, plain)
 
 
+class TestFairLead(unittest.TestCase):
+    """Jack 2026-10-29: "Instead of just standing down due to being under
+    payout bar, since I have a fair we should be willing to come in above the
+    wall with up to 200 contracts" -- then "10c" from the fair and a 2,000
+    event cap. FAIR LEAD: a weekend-rain side whose own touch is a thin order
+    ahead of a wall leads with target/5 at the cheapest price that takes
+    COMP_LEAD_SHARE of the side, at least FAIR_LEAD_MARGIN_C inside the model
+    fair. Fixture: KXRAINWKND-26OCT31-SGF's book at 10/29 14:30Z, on a far
+    Saturday (68OCT13) like TestRainWkndGate's."""
+
+    T = "KXRAINWKND-68OCT13-SGF"
+    EV = "KXRAINWKND-68OCT13"
+    # cents, orderbook_levels order: 13 bid at 48c ahead of 3,169 at 45c;
+    # 10 offered at 60c (NO 40c) ahead of 674 at 79c (NO 21c)
+    YES = [[3, 10], [5, 12], [8, 16], [41, 17], [45, 3169], [46, 20], [47, 14], [48, 13]]
+    NO = [[1, 3002], [2, 51], [3, 25], [21, 674], [31, 1], [39, 4], [40, 10]]
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
+        try:
+            os.remove(imm.RAIN_WKND_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, p=0.694, age_secs=0):
+        at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        with open(imm.RAIN_WKND_FILE, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"event": self.EV, "p": p,
+                                            "fetched_at": at.isoformat()}}}, f)
+        os.utime(imm.RAIN_WKND_FILE, (time.time(), time.time() + TestFairLead._bump))
+        TestFairLead._bump += 1
+        return imm.load_rain_wknd()
+
+    def _book(self):
+        return {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+
+    def test_sgf_leads_its_bid_ten_cents_inside_the_fair(self):
+        # 200 at 54c takes 96.8% of the bid side over the 3,169 at 45c (53c
+        # would take 93.9%); the 69.4c fair rounds down to 69c, so the cap is
+        # 59c. The ask side's cap (80c) is behind its own 60c touch.
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 69.4, 1000.0, 0.5),
+                         ((54, 59, 48), None))
+        # the margin binds: a 63.9c fair caps the bid at 53c, short of the
+        # share; at 64c the lead sits on its cap; at 5c it would lead again
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 63.9, 1000.0, 0.5),
+                         (None, None))
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 64.0, 1000.0, 0.5),
+                         ((54, 54, 48), None))
+        with mock.patch.object(imm, "FAIR_LEAD_MARGIN_C", 5):
+            self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 63.9, 1000.0, 0.5),
+                             ((54, 58, 48), None))
+        # half the pool against ~3% at the reference behind the wall
+        lead = imm.estimate_reward_share(self.YES, self.NO, [("bid", 54, 200.0),
+                                                             ("ask", 60, 40.0)],
+                                         1000.0, 0.5, own_in_book=False)[0]
+        ref = imm.estimate_reward_share(self.YES, self.NO, [("bid", 45, 40.0),
+                                                            ("ask", 60, 40.0)],
+                                        1000.0, 0.5, own_in_book=False)[0]
+        self.assertAlmostEqual(lead, 0.512, places=3)
+        self.assertLess(ref, 0.04)
+
+    def test_the_ask_side_and_a_lead_that_would_cross(self):
+        # 15 offered at 64c (NO 36c) ahead of 4,000 at 70c: 200 at 61c takes
+        # 95%+ of the side. The ask's fair rounds UP, so a 51c fair caps it at
+        # 61c and anything above 51c leads nothing.
+        yes, no = [[50, 3000.0]], [[30, 4000.0], [36, 15.0]]
+        self.assertEqual(imm.fair_lead_group(yes, no, 46.0, 1000.0, 0.5),
+                         (None, (61, 56, 64)))
+        self.assertEqual(imm.fair_lead_group(yes, no, 51.0, 1000.0, 0.5),
+                         (None, (61, 61, 64)))
+        self.assertEqual(imm.fair_lead_group(yes, no, 51.2, 1000.0, 0.5), (None, None))
+        # a 1c spread leaves no price ahead that does not cross
+        self.assertEqual(imm.fair_lead_group([[60, 5000.0]], [[39, 5000.0]], 72.0,
+                                             1000.0, 0.5), (None, None))
+
+    def test_the_fair_the_switches_and_the_event_cap(self):
+        now = time.time()
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXRAINWKND", now))   # no file
+        self._write()
+        self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXRAINWKND", now), 69.4)
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXRAIN", now))
+        with mock.patch.object(imm, "FAIR_LEAD_MODE", "dry"):
+            self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXRAINWKND", now), 69.4)
+            self.assertEqual((imm.lead_mode("fair"), imm.lead_mode("comp")),
+                             ("dry", imm.COMP_LEAD_MODE))
+        with mock.patch.object(imm, "FAIR_LEAD_MODE", "off"):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXRAINWKND", now))
+        with mock.patch.object(imm, "LADDER_MODE", "offsets"):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXRAINWKND", now))
+        self._write(age_secs=imm.RAIN_WKND_TTL_MIN * 60 + 5)                  # stale
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXRAINWKND", time.time()))
+        with mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0):
+            self.assertEqual(imm.event_cap_contracts(self.EV), 2000.0)
+            with mock.patch.object(imm, "FAIR_LEAD_MODE", "dry"):
+                self.assertEqual(imm.event_cap_contracts(self.EV), 1000.0)
+        for k in ("FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
+                  "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def _cycle(self, mode="on", max_pos=150.0, max_event=1000.0, lead_cap=None,
+               event_cap=None, p=0.694):
+        _clean_persist()
+        self._write(p=p)
+        client = FakeClient()
+        far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4800",
+            "yes_ask_dollars": "0.6000", "volume_fp": "150.00"}
+        client.books[self.T] = self._book()
+        with mock.patch.object(imm, "FAIR_LEAD_MODE", mode), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", max_pos), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", max_event), \
+                mock.patch.object(imm, "FAIR_LEAD_MAX_POSITION",
+                                  imm.FAIR_LEAD_MAX_POSITION if lead_cap is None else lead_cap), \
+                mock.patch.object(imm, "FAIR_LEAD_EVENT_CAP",
+                                  imm.FAIR_LEAD_EVENT_CAP if event_cap is None else event_cap), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {o["book_side"]: (o["yes_price"], int(o["remaining_count"]))
+                 for o in bot.state.sim_orders.values()
+                 if o["ticker"] == self.T
+                 and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+        return bot, rungs, lines
+
+    def test_the_quote_loop_leads_with_200(self):
+        bot, rungs, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(rungs["bid"], (54, 200))
+        self.assertEqual(bot._comp_lead_px, {self.T: (54, None, 200)})
+        self.assertTrue(any("fair lead KXRAINWKND-68OCT13-SGF bid: 200 @ 54c, ahead of "
+                            "its own 48c; the weekend rain fair implies 69c" in s
+                            for s in lines), lines)
+        self.assertFalse(any("comp lead" in s and self.T in s for s in lines))
+
+    def test_a_leading_market_takes_a_200_cap_and_the_events_room(self):
+        # a 50 series cap and a 100 event cap both fall short of the lead: the
+        # leading market's cap is 200, the family's event cap 2,000
+        _b, rungs, _l = self._cycle(max_pos=50.0, max_event=100.0)
+        self.assertEqual(rungs["bid"], (54, 200))
+        _b, rungs, _l = self._cycle(max_pos=50.0, max_event=100.0, lead_cap=0.0)
+        self.assertLess(rungs["bid"][1], 200)                    # the series cap binds
+        _b, rungs, _l = self._cycle(max_pos=50.0, max_event=100.0, event_cap=0.0)
+        self.assertLess(rungs["bid"][1], 200)                    # the event cap binds
+
+    def test_dry_logs_the_lead_and_rests_at_the_reference(self):
+        bot, rungs, lines = self._cycle(mode="dry")
+        self.assertNotEqual(rungs.get("bid", (None, 0))[0], 54)
+        self.assertEqual(bot._comp_lead_px, {})
+        self.assertTrue(any("fair lead (dry) KXRAINWKND-68OCT13-SGF bid: 200 @ 54c" in s
+                            for s in lines), lines)
+
+    def test_the_estimate_scores_the_lead(self):
+        self._write()
+        book = self._book()
+
+        class _BookClient(FakeClient):
+            def get_orderbook(self_, ticker, depth=None):
+                return book
+
+        bot = IncentiveMarketMaker(client=_BookClient(), live=False)
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXRAINWKND",
+                              dollars_per_day=16.4, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None,
+                              close_time=datetime.now(timezone.utc) + timedelta(days=2),
+                              mid_cents=54.0, spread_cents=12, volume=150.0)
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]):
+            with mock.patch.object(imm, "FAIR_LEAD_MODE", "dry"):
+                bot._estimate_candidate_yield(meta, [])
+                plain = meta.est_frac
+            bot._estimate_candidate_yield(meta, [])
+        self.assertLess(plain, 0.05)
+        self.assertGreater(meta.est_frac, 0.45)
+
+    def test_a_fair_lead_fill_opens_no_hedge_job(self):
+        # nothing prices a city's market but our fair: a lead's fill rides as
+        # inventory (before this guard it opened a job waiting for a group
+        # that never comes, given up with an urgent alert after 48h)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(imm, "STATUS_DIR", tmp):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot._comp_lead_px[self.T] = (54, None, 200)
+            fill = {"order_id": "lead1", "is_taker": False}
+            bot._comp_hedge_on_fill(fill, self.T, "yes", "buy", 200.0, 54.0, time.time(),
+                                    pos_before=0.0, pos_after=200.0)
+            self.assertEqual(bot._comp_hedges, [])
+            with mock.patch.object(imm, "FAIR_LEAD_SERIES", ()):
+                bot._comp_hedge_on_fill(fill, self.T, "yes", "buy", 200.0, 54.0,
+                                        time.time(), pos_before=0.0, pos_after=200.0)
+            self.assertEqual([j.get("need_group") for j in bot._comp_hedges], [True])
+
+
 class TestProfitLock(unittest.TestCase):
     """Jack 2026-10-29: "1 and 2" -- hedge every fill that locks a profit
     (lock_plan, after Kalshi's taker fees) and threshold-ladder leads hedged
