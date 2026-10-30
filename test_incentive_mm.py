@@ -30901,6 +30901,39 @@ class TestFairClose(unittest.TestCase):
               [25, 15.83], [36, 2], [37, 2], [47, 135.31], [48, 3]]
         self.assertEqual(g(yes, no, 52.8, 200.0, 1000.0, 0.5), (None, (53, 200)))
 
+    def test_a_tick_past_the_model_where_it_earns_more_and_still_profits(self):
+        # Jack 2026-10-30: "its ok to come above the model slightly, if it
+        # means earning more rewards and still making a profit. e.g.
+        # Springfield can bid 58 instead of 57". Short 200 sold at 73c, a
+        # 57.6c fair: 215 bid from 58c up puts the reference at 58c, so 57c
+        # rests a tick behind it at half weight and 58c at full
+        g = imm.fair_close_group
+        yes = [[46, 3000.0], [58, 180.0], [60, 20.0], [70, 10.0], [81, 5.0]]
+        no = [[1, 5000.0], [18, 30.0]]
+        self.assertEqual(g(yes, no, 57.6, -200.0, 1000.0, 0.5, avg_c=73.0),
+                         ((58, 200), None))
+        # no entry, no profit (sold at 58c), or the knob at 0: the model's 57c
+        self.assertEqual(g(yes, no, 57.6, -200.0, 1000.0, 0.5), ((57, 200), None))
+        self.assertEqual(g(yes, no, 57.6, -200.0, 1000.0, 0.5, avg_c=58.0),
+                         ((57, 200), None))
+        with mock.patch.object(imm, "FAIR_CLOSE_OVER_C", 0):
+            self.assertEqual(g(yes, no, 57.6, -200.0, 1000.0, 0.5, avg_c=73.0),
+                             ((57, 200), None))
+        # never further than FAIR_CLOSE_OVER_C, though each tick up earns more
+        self.assertEqual(imm.FAIR_CLOSE_OVER_C, 1)
+        with mock.patch.object(imm, "FAIR_CLOSE_OVER_C", 2):
+            self.assertEqual(g(yes, no, 57.6, -200.0, 1000.0, 0.5, avg_c=73.0),
+                             ((59, 200), None))
+        # where a tick up earns no more (ahead of the book at full weight) it
+        # stays at the model's price
+        self.assertEqual(g([[40, 5000.0]], [[50, 3000.0]], 45.0, -50.0, 1000.0, 0.5,
+                           avg_c=60.0), ((45, 50), None))
+        # a long: IND bought at 54c -- 52c would sell at a loss, so the 53c
+        # ask stays (and on the 55x56 book it rests a tick inside, at 56c)
+        self.assertEqual(g([[30, 3000.0], [55, 5.0]], [[1, 5000.0], [44, 20.0]],
+                           52.6, 200.0, 1000.0, 0.5, avg_c=54.0), (None, (56, 200)))
+        self.assertIn("FAIR_CLOSE_OVER_C", imm._CONFIG_CODE_KNOBS)
+
     def test_stl_bids_at_the_model_not_in_the_wall(self):
         # 14:48Z: "shuld be higher, not resting with a wall" -- 169 at the 21c
         # reference under a 72.1c fair; at 72c it sits behind 14 bid at 73-75c

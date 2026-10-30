@@ -11154,7 +11154,7 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
     "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
     # fair close (2026-10-30)
-    "FAIR_CLOSE_MODE",
+    "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -20080,6 +20080,17 @@ def lead_mode(src: Optional[str]) -> str:
 # the weekend rain fair's 41.4c (book 39x42)`. IMM_FAIR_CLOSE=dry logs the
 # closes and quotes as before, off disables all of it.
 FAIR_CLOSE_MODE = os.environ.get("IMM_FAIR_CLOSE", "on").strip().lower()
+# ...and a little past the model (Jack 2026-10-30: "its ok to come above the
+# model slightly, if it means earning more rewards and still making a
+# profit. e.g. Springfield can bid 58 instead of 57"): the closing rung may
+# rest up to FAIR_CLOSE_OVER_C past the model's own price where that earns a
+# strictly larger share of its side -- a tick up typically lifts it from a
+# tick behind the reference to the reference, doubling its weight -- and
+# still closes the position at a profit over its average entry
+# (PnlTracker.avg) after the maker fee on both fills (LOCK_MAKER_FEE_MULT of
+# the taker's). Each further tick up keeps lifting the share once the rung
+# sets the reference itself, so the cap is what keeps it slight. 0 disables.
+FAIR_CLOSE_OVER_C = max(0, _env_int("IMM_FAIR_CLOSE_OVER_C", 1))
 
 
 def fair_close_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
@@ -20096,7 +20107,8 @@ def fair_close_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float
 
 
 def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]],
-                     fair_c: float, pos: float, target: float, df: float
+                     fair_c: float, pos: float, target: float, df: float,
+                     avg_c: Optional[float] = None
                      ) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
     """(bid close, ask close) for a market holding `pos` YES contracts (a
     short is negative) off its model fair `fair_c` (YES cents), every book
@@ -20106,7 +20118,10 @@ def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]]
     the fair rounded down for a bid, up for an ask -- or a tick inside the
     other side's external best where that is nearer, and only where it
     earns: its side reaches the target with the rung in it, and the other
-    side reaches it too (a snapshot counts only then). Else (None, None)."""
+    side reaches it too (a snapshot counts only then). With the position's
+    average entry `avg_c` (YES cents) it may rest up to FAIR_CLOSE_OVER_C
+    past the model where that earns a strictly larger share and still closes
+    at a profit after the maker fee on both fills. Else (None, None)."""
     n = int(min(abs(pos), FAIR_LEAD_MAX_POSITION))
     if n < 1 or target <= 0:
         return None, None
@@ -20115,17 +20130,34 @@ def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]]
     # cents for the ask; higher = more aggressive)
     own = levels_desc(yes_levels if short else no_levels)
     other = levels_desc(no_levels if short else yes_levels)
-    px = int(math.floor(fair_c)) if short else 100 - int(math.ceil(fair_c))
-    if other:                         # never cross: under the other side's best
-        px = min(px, 100 - other[0][0] - 1)
-    if px < 1:
+    if sum(q for _p, q in other) < target:
         return None, None
-    lv = dict(own)
-    lv[px] = lv.get(px, 0.0) + float(n)
-    share, ok = _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
-                            {px: float(n)}, target, df)
-    if not ok or share <= 0 or sum(q for _p, q in other) < target:
+    px0 = int(math.floor(fair_c)) if short else 100 - int(math.ceil(fair_c))
+    cands = [px0]
+    if avg_c is not None:
+        # a little past the model, while the close still beats the entry
+        for k in range(1, FAIR_CLOSE_OVER_C + 1):
+            yes_px = px0 + k if short else 100 - (px0 + k)
+            gain = (avg_c - yes_px) if short else (yes_px - avg_c)
+            fees = (taker_fee_cents(avg_c, n, LOCK_MAKER_FEE_MULT)
+                    + taker_fee_cents(yes_px, n, LOCK_MAKER_FEE_MULT)) / n
+            if gain - fees > 0:
+                cands.append(px0 + k)
+    top = 100 - other[0][0] - 1 if other else 99   # never cross the other side
+    best: Optional[Tuple[int, float]] = None
+    for px in cands:
+        px = min(px, top)
+        if px < 1:
+            continue
+        lv = dict(own)
+        lv[px] = lv.get(px, 0.0) + float(n)
+        share, ok = _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
+                                {px: float(n)}, target, df)
+        if ok and share > 0 and (best is None or share > best[1] + 1e-9):
+            best = (px, share)
+    if best is None:
         return None, None
+    px = best[0]
     return ((px, n), None) if short else (None, (100 - px, n))
 
 
@@ -28219,7 +28251,8 @@ class IncentiveMarketMaker:
                 f"{FAIR_LEAD_MAX_GAP_C}c of the {fair_c:.1f}c fair -- leads allowed")
 
     def _fair_close_note(self, t: str, close_b, close_a, pos: float, fair_c: float,
-                         yes_ext: List[List[float]], no_ext: List[List[float]]) -> None:
+                         yes_ext: List[List[float]], no_ext: List[List[float]],
+                         avg_c: Optional[float] = None) -> None:
         """Log the closing rung (FAIR CLOSE) when it starts, stops or moves 3c
         or more (dry says so)."""
         dry = "" if FAIR_CLOSE_MODE == "on" else " (dry)"
@@ -28237,8 +28270,13 @@ class IncentiveMarketMaker:
                 f"as near the {fair_c:.1f}c fair, or that price would cross or not "
                 f"earn (book {eb}x{ea}); {what} rests at the side's own price")
             return
+        model = int(math.floor(fair_c)) if pos < 0 else int(math.ceil(fair_c))
+        past = (px - model) if pos < 0 else (model - px)
+        extra = (f", {past}c past the model for a larger reward share, still "
+                 f"{(avg_c - px) if pos < 0 else (px - avg_c):+.1f}c a contract over "
+                 f"the {avg_c:.1f}c entry" if past > 0 and avg_c is not None else "")
         log(f"{self.tag} fair close{dry} {t} {side}: {rung[1]} @ {px}c, closing {what} "
-            f"at the weekend rain fair's {fair_c:.1f}c (book {eb}x{ea})")
+            f"at the weekend rain fair's {fair_c:.1f}c (book {eb}x{ea}){extra}")
 
     # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
 
@@ -32091,9 +32129,12 @@ class IncentiveMarketMaker:
             if _cfair is not None:
                 _cx_yes, _cx_no = (external_levels(yes_levels, no_levels, own_in_book)
                                    if own_in_book else (yes_levels, no_levels))
+                _cavg = (self.pnl.avg.get(t) if abs(own_pos) >= 1
+                         and (own_pos < 0) == (_cpos < 0) else None)
                 close_b, close_a = fair_close_group(_cx_yes, _cx_no, _cfair, _cpos,
                                                     meta.target_size,
-                                                    meta.discount_factor)
+                                                    meta.discount_factor,
+                                                    avg_c=_cavg)
                 if close_b is not None and not (bid_in_band and comp_lead_band_ok(
                         close_b[0], (rung_lo, pmax_s), meta.series)):
                     close_b = None
@@ -32276,7 +32317,7 @@ class IncentiveMarketMaker:
             if _cfair is not None:
                 self._fair_close_note(t, close_b if close_on_b else None,
                                       close_a if close_on_a else None, _cpos,
-                                      _cfair, _cx_yes, _cx_no)
+                                      _cfair, _cx_yes, _cx_no, avg_c=_cavg)
             if FAIR_CLOSE_MODE != "on":
                 close_on_b = close_on_a = False
             if close_on_b or close_on_a:
