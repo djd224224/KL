@@ -20043,20 +20043,28 @@ def lead_mode(src: Optional[str]) -> str:
 # 200 contracts sit higher instead of parking next to the wall"). On a
 # FAIR_LEAD_SERIES market holding a position, the side that reduces it now
 # rests the whole position (up to FAIR_LEAD_MAX_POSITION) with first call on
-# the event's room, as FULL UNWIND does on the NFL ladders, and that closing
-# rung sits ONE TICK AHEAD of its side's external best (fair_close_group)
-# while that price is still on our side of the fair -- a bid at or under it,
-# an ask at or over it -- crosses nothing and earns: its side reaches the
-# target with the rung in it, and so does the other side. Otherwise the
-# whole position rests at the side's own price, where the family gate's cap
-# and its not-earning drop still apply; a lead already ahead of the book
-# keeps its price. The rest of the side's ladder keeps its own price. A
-# joiner at the closing price is stepped over the next cycle, never past the
-# fair, and back-of-line leaves the closing rung at the front. The estimate
-# still prices the side's own rung. Logs: `fair close <t> bid: 185 @ 42c, a
-# tick ahead of 41c, closing a short of 185; the weekend rain fair implies
-# 44.8c`. IMM_FAIR_CLOSE=dry logs the closes and quotes as before, off
-# disables both.
+# the event's room, as FULL UNWIND does on the NFL ladders. The closing rung
+# rests AT THE MODEL'S OWN PRICE (fair_close_group) -- the fair rounded down
+# for a bid, up for an ask, a tick inside the other side's external best
+# where that is nearer -- when that is more aggressive than where the side
+# would rest (its reference, a lead) and only where it earns: its side
+# reaches the target with the rung in it, and so does the other side. It
+# first sat one tick ahead of the side's best within the fair (af13f59);
+# Jack 10/30 after a look at the books: "KXRAINWKND-26OCT31-SFO should be at
+# 41 not 40" (fair 41.4c), "KXRAINWKND-26OCT31-STL shuld be higher, not
+# resting with a wall" (169 at the 21c reference, fair 72.1c), "KXRAINWKND-
+# 26OCT31-IND shouldnt be resting alone, it should be deeper" (alone at its
+# 58c lead floor while 135 rested at the fair's 53c). Otherwise the whole
+# position rests at the side's own price, where the family gate's cap and
+# its not-earning drop still apply. The rest of the side's ladder keeps its
+# own price, and back-of-line leaves the closing rung at the front. A market
+# holding a position stays SELECTED (fair_close_hold) past the payout floor,
+# the hopeless exit, the budget and any non-fatal screen, as quote_all does
+# ("KXRAINWKND-26OCT31-SGF should quote": short 200, it left at 14:37Z as
+# hopeless and its bid went with it). The estimate still prices the side's
+# own rung. Logs: `fair close <t> bid: 185 @ 41c, closing a short of 185 at
+# the weekend rain fair's 41.4c (book 39x42)`. IMM_FAIR_CLOSE=dry logs the
+# closes and quotes as before, off disables all of it.
 FAIR_CLOSE_MODE = os.environ.get("IMM_FAIR_CLOSE", "on").strip().lower()
 
 
@@ -20080,12 +20088,11 @@ def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]]
     short is negative) off its model fair `fair_c` (YES cents), every book
     EXTERNAL: the side that reduces `pos` -- the bid for a short, the ask for
     a long -- as (YES price, contracts), the other side None. The rung is the
-    whole position up to FAIR_LEAD_MAX_POSITION, one tick ahead of that
-    side's external best, and only while that price is on our side of the
-    fair (a bid at or under it, an ask at or over it), does not cross the
-    other side's external best and earns: its side reaches the target with
-    the rung in it, and the other side reaches it too (a snapshot counts only
-    then). Else (None, None)."""
+    whole position up to FAIR_LEAD_MAX_POSITION at the model's own price --
+    the fair rounded down for a bid, up for an ask -- or a tick inside the
+    other side's external best where that is nearer, and only where it
+    earns: its side reaches the target with the rung in it, and the other
+    side reaches it too (a snapshot counts only then). Else (None, None)."""
     n = int(min(abs(pos), FAIR_LEAD_MAX_POSITION))
     if n < 1 or target <= 0:
         return None, None
@@ -20094,17 +20101,25 @@ def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]]
     # cents for the ask; higher = more aggressive)
     own = levels_desc(yes_levels if short else no_levels)
     other = levels_desc(no_levels if short else yes_levels)
-    if not own:
+    px = int(math.floor(fair_c)) if short else 100 - int(math.ceil(fair_c))
+    if other:                         # never cross: under the other side's best
+        px = min(px, 100 - other[0][0] - 1)
+    if px < 1:
         return None, None
-    px = own[0][0] + 1
-    cap = int(math.floor(fair_c)) if short else 100 - int(math.ceil(fair_c))
-    cross = 100 - other[0][0] if other else 100    # the other side's best, here
-    if px > cap or px >= cross:
-        return None, None
-    share, ok = _side_share([(px, float(n))] + own, {px: float(n)}, target, df)
+    lv = dict(own)
+    lv[px] = lv.get(px, 0.0) + float(n)
+    share, ok = _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
+                            {px: float(n)}, target, df)
     if not ok or share <= 0 or sum(q for _p, q in other) < target:
         return None, None
     return ((px, n), None) if short else (None, (100 - px, n))
+
+
+def fair_close_hold(series: str, pos: float) -> bool:
+    """FAIR CLOSE keeps a FAIR_LEAD_SERIES market the bot holds a position in
+    selected -- past the payout floor, the hopeless exit, the budget and a
+    non-fatal screen, as quote_all does -- so its closing rung keeps resting."""
+    return FAIR_CLOSE_MODE == "on" and series in FAIR_LEAD_SERIES and abs(pos) >= 1
 
 
 def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
@@ -26980,7 +26995,8 @@ class IncentiveMarketMaker:
                 continue
             reason = self._screen(meta, now_utc,
                                   member=t in prev_selected)
-            if (reason and t in prev_selected
+            if (reason and (t in prev_selected
+                            or fair_close_hold(meta.series, self.pnl.pos.get(t, 0.0)))
                     and reason not in STICKY_DEATH_REASONS):
                 # Sticky: ride out transient quality states on a market we
                 # already started quoting (see STICKY_DEATH_REASONS note).
@@ -27023,8 +27039,10 @@ class IncentiveMarketMaker:
         ranked: List[MarketMeta] = []
         for meta in screened:
             quote_all = (series_override(meta.series) or SeriesOverride()).quote_all
+            # FAIR CLOSE: a fair-lead market holding a position stays selected
+            fc_hold = fair_close_hold(meta.series, self.pnl.pos.get(meta.ticker, 0.0))
             if not self._estimate_candidate_yield(meta, own_by_ticker.get(meta.ticker, [])):
-                if meta.ticker in prev_selected:
+                if meta.ticker in prev_selected or fc_hold:
                     ranked.append(meta)   # sticky: transient book-read failure
                     screen_waived[meta.ticker] = "book_unreadable"
                 else:
@@ -27150,6 +27168,7 @@ class IncentiveMarketMaker:
                             accrued, est_total, proj_peak, qdays), 4),
                         "new_event": meta.event_ticker not in prev_events,
                         "exempt": ("quote_all" if quote_all else
+                                   "fair_close" if fc_hold else
                                    "force" if meta.event_ticker in FORCE_EVENTS else
                                    "curated" if curated_event(meta.event_ticker,
                                                               meta.series, now_utc) else
@@ -27158,9 +27177,10 @@ class IncentiveMarketMaker:
                     }
                 except Exception:
                     pass
-            if quote_all:
+            if quote_all or fc_hold:
                 # user wants EVERY market of the event (2026-07-12): exempt
-                # from floors, the hopeless exit and the yield ranking.
+                # from floors, the hopeless exit and the yield ranking (and a
+                # fair-lead market holding a position: FAIR CLOSE)
                 ranked.append(meta)
             elif meta.series in NO_NEW_SERIES \
                     and meta.ticker not in prev_selected:
@@ -27451,7 +27471,8 @@ class IncentiveMarketMaker:
                 selected_events.add(meta.event_ticker)
         forced = [m for m in ranked
                   if m.ticker not in selected
-                  and (series_override(m.series) or SeriesOverride()).quote_all]
+                  and ((series_override(m.series) or SeriesOverride()).quote_all
+                       or fair_close_hold(m.series, self.pnl.pos.get(m.ticker, 0.0)))]
         for meta in forced:
             collateral += market_cost(meta)
             selected[meta.ticker] = meta
@@ -28196,15 +28217,14 @@ class IncentiveMarketMaker:
             return
         self._fair_close_noted[key] = px
         what = f"a short of {-pos:g}" if pos < 0 else f"a long of {pos:g}"
+        eb, ea = external_best(yes_ext, no_ext)
         if rung is None:
-            log(f"{self.tag} fair close{dry} {t} {side}: off -- a tick ahead of the "
-                f"book would pass the {fair_c:.1f}c fair, cross or not earn; {what} "
-                f"rests at the side's own price")
+            log(f"{self.tag} fair close{dry} {t} {side}: off -- the side already rests "
+                f"as near the {fair_c:.1f}c fair, or that price would cross or not "
+                f"earn (book {eb}x{ea}); {what} rests at the side's own price")
             return
-        best = (levels_desc(yes_ext)[0][0] if pos < 0
-                else 100 - levels_desc(no_ext)[0][0])
-        log(f"{self.tag} fair close{dry} {t} {side}: {rung[1]} @ {px}c, a tick ahead "
-            f"of {best}c, closing {what}; the weekend rain fair implies {fair_c:.1f}c")
+        log(f"{self.tag} fair close{dry} {t} {side}: {rung[1]} @ {px}c, closing {what} "
+            f"at the weekend rain fair's {fair_c:.1f}c (book {eb}x{ea})")
 
     # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
 
@@ -32037,9 +32057,9 @@ class IncentiveMarketMaker:
                 if lead_mode(lead_src) != "on":
                     lead_b = lead_a = None
             # FAIR CLOSE (FAIR_CLOSE_MODE): a fair-lead market holding a
-            # position rests the whole of it on the side that reduces it, a
-            # tick ahead of that side's book while that is on our side of the
-            # fair and earns (fair_close_group), else at the side's own price
+            # position rests the whole of it on the side that reduces it, at
+            # the model's own price where that earns (fair_close_group) and
+            # beats where the side rests, else at the side's own price
             close_b = close_a = None
             close_n = 0
             _cpos = own_pos if coexist else pos
@@ -32058,12 +32078,8 @@ class IncentiveMarketMaker:
                 if close_a is not None and not (ask_in_band and comp_lead_band_ok(
                         close_a[0], (rung_lo, pmax_s), meta.series)):
                     close_a = None
-                self._fair_close_note(t, close_b, close_a, _cpos, _cfair,
-                                      _cx_yes, _cx_no)
                 if FAIR_CLOSE_MODE == "on":
                     close_n = int(min(abs(_cpos), FAIR_LEAD_MAX_POSITION))
-                else:
-                    close_b = close_a = None
             # LONE-REFERENCE GUARD (LONE_REF_GUARD_MODE): a side whose
             # reference rests on a thin external top our rung would jump to
             # stands aside ("on": no rungs this cycle) or is logged ("dry").
@@ -32204,15 +32220,23 @@ class IncentiveMarketMaker:
                             _seen.pop(_old, None)
             else:
                 self._comp_lead_px.pop(t, None)
-            # FAIR CLOSE: the closing rung rests a tick ahead of the book unless
-            # a lead on that side is at least as far ahead; it never crosses
-            # our own other side
+            # FAIR CLOSE: the closing rung rests at the model's price only where
+            # that beats where the side rests (its reference or anchor, a
+            # lead); it never crosses our own other side
+            _ub = [x for x in (anc_bid, pl_bid_px) if x is not None]
+            _ua = [x for x in (anc_ask, pl_ask_px) if x is not None]
             close_on_b = (close_b is not None and bool(lv_bid)
-                          and not (lead_on_b and lead_b[0] >= close_b[0])
+                          and (not _ub or close_b[0] > min(_ub))
                           and not (lead_on_a and close_b[0] >= lead_a[0]))
             close_on_a = (close_a is not None and bool(lv_ask)
-                          and not (lead_on_a and lead_a[0] <= close_a[0])
+                          and (not _ua or close_a[0] < max(_ua))
                           and not (lead_on_b and close_a[0] <= lead_b[0]))
+            if _cfair is not None:
+                self._fair_close_note(t, close_b if close_on_b else None,
+                                      close_a if close_on_a else None, _cpos,
+                                      _cfair, _cx_yes, _cx_no)
+            if FAIR_CLOSE_MODE != "on":
+                close_on_b = close_on_a = False
             if close_on_b or close_on_a:
                 self._fair_close_px[t] = (("bid", close_b[0]) if close_on_b
                                           else ("ask", close_a[0]))

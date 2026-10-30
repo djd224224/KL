@@ -30861,7 +30861,8 @@ class TestFairClose(unittest.TestCase):
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
 
-    def test_sfo_bids_its_whole_short_a_tick_ahead(self):
+    def test_sfo_bids_its_whole_short_at_the_model(self):
+        # the 44.76c fair's 44c would cross the 43c offer: a tick inside it
         g = imm.fair_close_group
         self.assertEqual(g(self.SFO_YES, self.SFO_NO, 44.76, -185.0, 1000.0, 0.5),
                          ((42, 185), None))
@@ -30872,32 +30873,52 @@ class TestFairClose(unittest.TestCase):
                          ((42, 1), None))
         self.assertEqual(g(self.SFO_YES, self.SFO_NO, 44.76, -0.4, 1000.0, 0.5),
                          (None, None))
-        # the bid stays at or under the fair: a 42.0c fair still takes 42c,
-        # a 41.9c one leaves no price a tick ahead
+        # "should be at 41 not 40": a 41.4c fair bids 41c, 41.9c too, 42.0c 42c
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 41.4, -185.0, 1000.0, 0.5),
+                         ((41, 185), None))
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 41.9, -185.0, 1000.0, 0.5),
+                         ((41, 185), None))
         self.assertEqual(g(self.SFO_YES, self.SFO_NO, 42.0, -185.0, 1000.0, 0.5),
                          ((42, 185), None))
-        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 41.9, -185.0, 1000.0, 0.5),
+        # under 2,951 bid from 33c up, a 30c bid would earn nothing
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 30.0, -185.0, 1000.0, 0.5),
                          (None, None))
 
-    def test_ind_offers_its_long_ahead_of_the_63c_offer(self):
+    def test_ind_offers_its_long_at_the_model(self):
         g = imm.fair_close_group
-        # 62c, ahead of 46 at 63c and 66 at 64c, 2.7c over the 59.3c fair
+        # the 59.3c fair rounds up to 60c, ahead of 46 at 63c and 66 at 64c
         self.assertEqual(g(self.IND_YES, self.IND_NO, 59.3, 200.0, 1000.0, 0.5),
-                         (None, (62, 200)))
-        # the ask stays at or over the fair, rounded up: 62.0 takes 62c, 62.5 not
+                         (None, (60, 200)))
         self.assertEqual(g(self.IND_YES, self.IND_NO, 62.0, 200.0, 1000.0, 0.5),
                          (None, (62, 200)))
         self.assertEqual(g(self.IND_YES, self.IND_NO, 62.5, 200.0, 1000.0, 0.5),
-                         (None, None))
+                         (None, (63, 200)))                  # beside the 46 at 63c
+        # 14:48Z: "shouldnt be resting alone, it should be deeper" -- the 52.8c
+        # fair's 53c sits in the 135 offered there, not alone at the 58c floor
+        yes = [[8, 17], [11, 4.13], [16, 5], [26, 8], [30, 2430.38], [31, 20],
+               [32, 15], [33, 4.71], [34, 2.76], [35, 1]]
+        no = [[1, 1000], [2, 118], [3, 25], [4, 58], [5, 49], [15, 0.76],
+              [25, 15.83], [36, 2], [37, 2], [47, 135.31], [48, 3]]
+        self.assertEqual(g(yes, no, 52.8, 200.0, 1000.0, 0.5), (None, (53, 200)))
+
+    def test_stl_bids_at_the_model_not_in_the_wall(self):
+        # 14:48Z: "shuld be higher, not resting with a wall" -- 169 at the 21c
+        # reference under a 72.1c fair; at 72c it sits behind 14 bid at 73-75c
+        yes = [[21, 1200], [27, 26], [28, 36], [29, 14], [30, 12.61], [39, 17], [51, 8],
+               [62, 28], [73, 10], [74, 3], [75, 1]]
+        no = [[1, 7804.7], [3, 25], [4, 14], [5, 8], [11, 6], [12, 1]]
+        self.assertEqual(imm.fair_close_group(yes, no, 72.1, -169.0, 1000.0, 0.5),
+                         ((72, 169), None))
 
     def test_atl_a_cross_and_a_rung_that_would_not_earn(self):
         g = imm.fair_close_group
-        # ATL: 43c is 23c over the 19.55c fair (and would cross the 43c offer)
+        # ATL: the 19.55c fair's 19c, under 724 bid, leaves its side short of
+        # the 1,000 target
         self.assertEqual(g(self.ATL_YES, self.ATL_NO, 19.55, -200.0, 1000.0, 0.5),
                          (None, None))
-        # a 1c spread: a tick ahead crosses, whatever the fair
+        # a 1c spread: a 70c fair joins the 60c bid, never the 61c offer
         self.assertEqual(g([[60, 5000.0]], [[39, 5000.0]], 70.0, -100.0, 1000.0, 0.5),
-                         (None, None))
+                         ((60, 100), None))
         # earning: its side must reach the target with the rung in it...
         self.assertEqual(g([[40, 100.0]], [[50, 5000.0]], 60.0, -50.0, 1000.0, 0.5),
                          (None, None))
@@ -30905,8 +30926,8 @@ class TestFairClose(unittest.TestCase):
         self.assertEqual(g([[40, 5000.0]], [[50, 300.0]], 60.0, -50.0, 1000.0, 0.5),
                          (None, None))
         self.assertEqual(g([[40, 5000.0]], [[50, 3000.0]], 60.0, -50.0, 1000.0, 0.5),
-                         ((41, 50), None))
-        # an empty closing side has nothing to sit ahead of
+                         ((49, 50), None))
+        # alone on an empty side, it reaches no target
         self.assertEqual(g([], [[50, 3000.0]], 60.0, -50.0, 1000.0, 0.5), (None, None))
 
     def test_the_switch_and_the_fair(self):
@@ -30922,14 +30943,14 @@ class TestFairClose(unittest.TestCase):
             self.T, "KXRAINWKND", now + imm.RAIN_WKND_TTL_MIN * 60 + 5))   # stale
         self.assertIn("FAIR_CLOSE_MODE", imm._CONFIG_CODE_KNOBS)
 
-    def _cycle(self, pos, p, mode="on"):
+    def _cycle(self, pos, p, mode="on", reward=7000000):
         _clean_persist()
         TestFairLead._write(self, p=p)
         client = FakeClient()
         far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         client.programs.append(
             {"market_ticker": self.T, "incentive_type": "liquidity",
-             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "period_reward": reward, "target_size_fp": "1000.00",
              "discount_factor_bps": 5000, "paid_out": False,
              "start_date": client.programs[0]["start_date"],
              "end_date": client.programs[0]["end_date"]})
@@ -30959,37 +30980,57 @@ class TestFairClose(unittest.TestCase):
                        and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
         return bot, rungs, lines
 
-    def test_the_loop_closes_a_short_a_tick_ahead_of_the_48c_bid(self):
+    def test_the_loop_closes_a_short_at_the_model(self):
         # SGF's 10/29 book, a 52c fair: no bid lead (its cap 47c is behind the
-        # 48c touch), so the whole short of 150 bids at 49c
+        # 48c touch), so the whole short of 150 bids at 52c
         bot, rungs, lines = self._cycle(-150.0, 0.52)
         self.assertIn(self.T, bot.state.selected)
-        self.assertEqual([r for r in rungs if r[0] == "bid"], [("bid", 49, 150)])
-        self.assertEqual(bot._fair_close_px, {self.T: ("bid", 49)})
-        self.assertTrue(any("fair close KXRAINWKND-68OCT13-SGF bid: 150 @ 49c, a tick "
-                            "ahead of 48c, closing a short of 150; the weekend rain "
-                            "fair implies 52.0c" in s for s in lines), lines)
+        self.assertEqual([r for r in rungs if r[0] == "bid"], [("bid", 52, 150)])
+        self.assertEqual(bot._fair_close_px, {self.T: ("bid", 52)})
+        self.assertTrue(any("fair close KXRAINWKND-68OCT13-SGF bid: 150 @ 52c, closing "
+                            "a short of 150 at the weekend rain fair's 52.0c (book "
+                            "48x60)" in s for s in lines), lines)
 
-    def test_a_small_short_closes_ahead_and_the_ladder_keeps_its_reference(self):
+    def test_a_small_short_closes_at_the_model_and_the_ladder_keeps_its_reference(self):
         bot, rungs, _l = self._cycle(-10.0, 0.52)
         bids = [r for r in rungs if r[0] == "bid"]
-        self.assertEqual(bids[-1], ("bid", 49, 10))              # the closing rung
+        self.assertEqual(bids[-1], ("bid", 52, 10))              # the closing rung
         self.assertEqual(len(bids), 2)
         self.assertEqual(bids[0][1], 45)                         # the rest, at the ref
 
-    def test_past_the_fair_the_whole_short_rests_at_the_reference(self):
-        # a 47c fair: 49c would bid over the model, so the 150 rests at 45c
-        bot, rungs, lines = self._cycle(-150.0, 0.47)
+    def test_under_the_touch_the_close_still_rests_at_the_model(self):
+        # a 47c fair: 47c, behind the 48c touch but over the 45c reference
+        bot, rungs, _l = self._cycle(-150.0, 0.47)
+        self.assertEqual([r for r in rungs if r[0] == "bid"], [("bid", 47, 150)])
+        self.assertEqual(bot._fair_close_px, {self.T: ("bid", 47)})
+
+    def test_where_the_side_rests_nearer_the_whole_short_stays_there(self):
+        # a 44c fair: the 45c reference already beats the model's 44c
+        bot, rungs, lines = self._cycle(-150.0, 0.44)
         self.assertEqual([r for r in rungs if r[0] == "bid"], [("bid", 45, 150)])
         self.assertEqual(bot._fair_close_px, {})
         self.assertFalse(any("fair close" in s and "@" in s for s in lines), lines)
 
-    def test_the_loop_closes_a_long_with_a_tick_ahead_ask(self):
+    def test_the_loop_closes_a_long_at_the_model(self):
         # a 57c fair: no ask lead (its 62c floor is behind the 60c offer); the
-        # long of 150 offers at 59c, and the bid side has no room left
+        # long of 150 offers at 57c, and the bid side has no room left
         bot, rungs, _l = self._cycle(150.0, 0.57)
-        self.assertEqual(rungs, [("ask", 59, 150)])
-        self.assertEqual(bot._fair_close_px, {self.T: ("ask", 59)})
+        self.assertEqual(rungs, [("ask", 57, 150)])
+        self.assertEqual(bot._fair_close_px, {self.T: ("ask", 57)})
+
+    def test_a_market_holding_a_position_stays_selected(self):
+        # "KXRAINWKND-26OCT31-SGF should quote": short 200, it left at 14:37Z
+        # as hopeless and its bid went with it. A pool far under the payout bar
+        # keeps a flat market out; a position keeps it in, closing.
+        bot, rungs, _l = self._cycle(0.0, 0.52, reward=100)
+        self.assertNotIn(self.T, bot.state.selected)
+        bot, rungs, _l = self._cycle(-150.0, 0.52, reward=100)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertIn(("bid", 52, 150), rungs)
+        with mock.patch.object(imm, "FAIR_CLOSE_MODE", "off"):
+            self.assertFalse(imm.fair_close_hold("KXRAINWKND", -150.0))
+        self.assertFalse(imm.fair_close_hold("KXRAIN", -150.0))
+        self.assertFalse(imm.fair_close_hold("KXRAINWKND", 0.5))
 
     def test_the_backstop_takes_the_closing_rung_beside_the_old_rung(self):
         # 10/30 14:19:45Z: LEX's 16 ahead of the book was "blocked at 60/60" --
@@ -31014,7 +31055,7 @@ class TestFairClose(unittest.TestCase):
             self.assertEqual(len(bids), 1, mode)
             self.assertEqual(bids[0][1], 45, mode)
             self.assertLess(bids[0][2], 150, mode)
-            self.assertEqual(any("fair close (dry) KXRAINWKND-68OCT13-SGF bid: 150 @ 49c"
+            self.assertEqual(any("fair close (dry) KXRAINWKND-68OCT13-SGF bid: 150 @ 52c"
                                  in s for s in lines), mode == "dry", mode)
 
 
