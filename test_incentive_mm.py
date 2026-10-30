@@ -31095,6 +31095,60 @@ class TestVercelFairLead(unittest.TestCase):
         # far ahead of the 87c wall
         self.assertEqual(imm.fair_close_group(self.YES, self.NO, 40.0, 200.0, 1000.0, 0.5),
                          (None, (40, 200)))
+        # its log names the family's model (10/30 18:50Z read "the weekend
+        # rain fair's 76.1c" on KXOPENSOURCESHARE-26NOV02-T70.2)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot._fair_close_note(self.T, (40, 200), None, -202.0, 40.2, self.YES, self.NO)
+        self.assertTrue(any("closing a short of 202 at the Vercel fair's 40.2c (book 7x87)"
+                            in s for s in lines), lines)
+
+    def test_the_fast_cancel_reads_a_lead_inside_the_model_as_not_stale(self):
+        # 10/30 18:50-19:02Z: KXOPENSOURCESHARE-26NOV02-T70.2's closing bid at
+        # its 76c model sat 15c over a 61c bid and was cancelled 43 times; the
+        # 02NOV26 leads sit 10c over their walls, the fast cancel's own gap
+        self._write()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        feed = _FakeFeed()
+        bot._ws = feed
+        cancelled = []
+        bot.cancel_order = lambda oid, reason="": cancelled.append(oid) or True
+        for name, v in (("WS_MODE", "on"), ("WS_FAST", True), ("WS_FAST_MIN_GAP_C", 10.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        now = time.time()
+        # our bid 200 @ 17c over 6,837 at 7c, our ask 200 @ 77c under 87c
+        feed.books[self.T] = ({0.07: 6837.0, 0.17: 200.0}, {0.13: 6490.0, 0.23: 200.0})
+
+        def view():
+            bot._resting_view = {self.T: [
+                {"order_id": "lb", "side": "bid", "px": 17.0, "rem": 200.0,
+                 "placed": now - 100.0, "pad": False},
+                {"order_id": "la", "side": "ask", "px": 77.0, "rem": 200.0,
+                 "placed": now - 100.0, "pad": False}]}
+        view()
+        bot._comp_lead_px[self.T] = (17, 77, 200)
+        self.assertEqual(bot._fair_model_rungs(self.T, now), {("bid", 17), ("ask", 77)})
+        self.assertEqual(bot._ws_fast_check({self.T}, now), 0)
+        self.assertEqual(bot._ws_fast_check({self.T}, now + 1.5), 0)
+        self.assertEqual(cancelled, [])
+        # a closing rung at the 40c model counts, one past FAIR_CLOSE_OVER_C not
+        bot._comp_lead_px.clear()
+        bot._fair_close_px[self.T] = ("bid", 41)
+        self.assertEqual(bot._fair_model_rungs(self.T, now), {("bid", 41)})
+        bot._fair_close_px[self.T] = ("bid", 42)
+        self.assertEqual(bot._fair_model_rungs(self.T, now), set())
+        bot._fair_close_px.clear()
+        # without a readable fair (a new anchor's hold) the same leads are stale
+        bot._comp_lead_px[self.T] = (17, 77, 200)
+        imm._vercel_state["moved_at"][self.EV] = now
+        self.assertEqual(bot._fair_model_rungs(self.T, now), set())
+        view()
+        self.assertEqual(bot._ws_fast_check({self.T}, now), 0)
+        self.assertEqual(bot._ws_fast_check(set(), now + 1.5), 2)
+        self.assertEqual(sorted(cancelled), ["la", "lb"])
 
 
 class TestFairClose(unittest.TestCase):

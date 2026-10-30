@@ -20017,7 +20017,10 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # out of band (a 1c bid, a 99c offer) still does not lead. With the leads
 # come the family's FAIR CLOSE, its held-position selection and LEAD
 # INVENTORY below. On the 17:50Z books the lead took ~97% of each side it
-# led. IMM_FAIR_LEAD_SERIES=KXRAINWKND takes the family out.
+# led. A lead 10c over a wall, or a close at the model's price, is ahead of
+# its book on purpose, so the WS fast cancel judges those rungs against the
+# model (_fair_model_rungs), as it judges a complement lead against its
+# siblings. IMM_FAIR_LEAD_SERIES=KXRAINWKND takes the family out.
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get(
@@ -20077,6 +20080,15 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
     if vercel_series(series):
         return vercel_fair_c(ticker, now_ts)
     return None
+
+
+def fair_model_label(series: str) -> str:
+    """How the logs name a fair-lead family's model."""
+    if rain_wknd_series(series):
+        return "the weekend rain fair"
+    if vercel_series(series):
+        return "the Vercel fair"
+    return "its model fair"
 
 
 def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
@@ -23952,6 +23964,7 @@ class IncentiveMarketMaker:
             if not orders:
                 continue
             exempt = ws_fast_exempt(series_of(t))      # IMM_WS_FAST_EXEMPT
+            model_rungs = self._fair_model_rungs(t, now_ts)
             lv = ws.book_levels(t)
             if lv is None:
                 continue
@@ -24036,6 +24049,8 @@ class IncentiveMarketMaker:
                 ahead = ((ext_bid is None or p > ext_bid + 1e-6)
                          if o["side"] == "bid"
                          else (ext_ask is None or p < ext_ask - 1e-6))
+                if ahead and (o["side"], int(round(o["px"]))) in model_rungs:
+                    ahead = False        # a fair lead / close inside its model
                 if not ahead:
                     self._ws_suspect_end(oid, now_ts, "clear")
                     if oid in self._ws_flagged:     # the touch came back
@@ -24114,6 +24129,34 @@ class IncentiveMarketMaker:
         if cancels:
             self._ws_wake = True
         return cancels
+
+    def _fair_model_rungs(self, t: str, now_ts: float) -> Set[Tuple[str, int]]:
+        """(side, price) of `t`'s FAIR LEAD and FAIR CLOSE rungs while they
+        sit on our side of its fresh model fair (at most FAIR_CLOSE_OVER_C
+        past it). They rest ahead of the book on purpose -- a lead 10c over
+        a walled Vercel book (KXOPENVREQ-02NOV26-T19.8's bid 200 @ 17c over
+        6,837 at 7c), a close at the model's 76c on a 61x77 book
+        (KXOPENSOURCESHARE-26NOV02-T70.2, cancelled 43 times in its first 12
+        minutes on 10/30, re-placed each cycle) -- so, as a complement lead's
+        siblings are part of its touch, the model is part of theirs: the WS
+        fast cancel reads them stale only once they are past it."""
+        lead = self._comp_lead_px.get(t)
+        close = self._fair_close_px.get(t)
+        if lead is None and close is None:
+            return set()
+        series = series_of(t)
+        fair = fair_model_c(t, series, now_ts)
+        if fair is None:
+            return set()
+        cands: List[Tuple[str, Optional[int]]] = []
+        if lead is not None and fair_lead_fair_c(t, series, now_ts) is not None:
+            cands += [("bid", lead[0]), ("ask", lead[1])]
+        if close is not None:
+            cands.append((close[0], close[1]))
+        hi = int(math.floor(fair)) + FAIR_CLOSE_OVER_C     # a bid at or under it
+        lo = int(math.ceil(fair)) - FAIR_CLOSE_OVER_C      # an ask at or over it
+        return {(s, int(px)) for s, px in cands
+                if px is not None and (px <= hi if s == "bid" else px >= lo)}
 
     def _ws_suspect_end(self, oid: str, now_ts: float, why: str) -> None:
         """A suspect stops reading ahead (`why`: clear / gone / cycle). One
@@ -28324,9 +28367,7 @@ class IncentiveMarketMaker:
         who, verb = ((f"{self._comp_pairs[t]}'s book", "implies") if t in self._comp_pairs
                      else (f"its {max(len(grp) - 1, 0)} siblings' books", "imply"))
         if src == "fair":
-            who, verb = (("the weekend rain fair" if rain_wknd_series(series_of(t))
-                          else "the Vercel fair" if vercel_series(series_of(t))
-                          else "its model fair"), "implies")
+            who, verb = fair_model_label(series_of(t)), "implies"
         for side, lead in (("bid", lead_b), ("ask", lead_a)):
             if src != "fair" and not grp and t in self._ladders:
                 who, verb = (("its harder strikes' books", "imply") if side == "bid"
@@ -28398,7 +28439,7 @@ class IncentiveMarketMaker:
                  f"{(avg_c - px) if pos < 0 else (px - avg_c):+.1f}c a contract over "
                  f"the {avg_c:.1f}c entry" if past > 0 and avg_c is not None else "")
         log(f"{self.tag} fair close{dry} {t} {side}: {rung[1]} @ {px}c, closing {what} "
-            f"at the weekend rain fair's {fair_c:.1f}c (book {eb}x{ea}){extra}")
+            f"at {fair_model_label(series_of(t))}'s {fair_c:.1f}c (book {eb}x{ea}){extra}")
 
     # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
 
@@ -35985,7 +36026,9 @@ class IncentiveMarketMaker:
                f"never chased up), priced into the estimate so a market under the "
                f"payout bar is admitted on it; a leading market's position cap "
                f"{FAIR_LEAD_MAX_POSITION:g}, the family's event cap "
-               f"{FAIR_LEAD_EVENT_CAP:g}; no hedge"
+               f"{FAIR_LEAD_EVENT_CAP:g}; no hedge but a ladder strike's own lock; "
+               f"the WS fast cancel reads a lead or close on our side of the "
+               f"model as not stale"
                + (f"; no lead while the book's touch sits more than "
                   f"{FAIR_LEAD_MAX_GAP_C}c past the fair" if FAIR_LEAD_MAX_GAP_C
                   else "")
