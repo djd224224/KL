@@ -675,15 +675,35 @@ def profit_lines(ctx) -> list:
     return L
 
 
+def halted_markets(ctx) -> int:
+    """How many markets the day's halts took off: each side-halted market
+    once, plus every halted event's markets (once an event)."""
+    by_ev: dict = {}
+    for r in ctx["event_rows"]:
+        by_ev[r["event"]] = max(by_ev.get(r["event"], 0), int(r.get("halted") or 0))
+    return len({r["ticker"] for r in ctx["side_rows"]}) + sum(by_ev.values())
+
+
 def subject_for(ctx) -> str:
+    """How many markets were halted, the reward that gave up, and the halts'
+    net P&L impact (Jack 2026-10-30: "toxic halts email title should say how
+    many markets were halted, and how much rewards were given up, and the net
+    PnL impact of that"); the day's pick-offs last."""
     d = ctx["day"].strftime("%a %b %d")
     pr = ctx.get("profit")
+    n_p = ctx["n_picks"]
+    picks = f"{n_p} pick-off{'s' if n_p != 1 else ''}"
     if not ctx["side_rows"] and not ctx["event_rows"]:
-        return f"IMM toxic halts {d}: none ({ctx['n_picks']} pick-off(s))"
-    head = (f"halts {usd(pr['halts_net']) if pr['n_priced'] else 'n/a'} net | "
-            if pr else "")
-    return (f"IMM toxic halts {d}: {head}{len(ctx['event_rows'])} event, "
-            f"{len(ctx['side_rows'])} side ({ctx['n_picks']} pick-offs)")
+        return f"IMM toxic halts {d}: no market halted ({picks})"
+    n_m = halted_markets(ctx)
+    n_h = len(ctx["side_rows"]) + len(ctx["event_rows"])
+    head = (f"IMM toxic halts {d}: {n_m} market{'s' if n_m != 1 else ''} halted "
+            f"({n_h} halt{'s' if n_h != 1 else ''})")
+    if not pr:
+        return f"{head}, est reward given up {amt(ctx['forgone'])} | {picks}"
+    priced = bool(pr["n_priced"])
+    return (f"{head}, reward given up {amt(pr['forgone']) if priced else 'n/a'}, "
+            f"net P&L {usd(pr['halts_net']) if priced else 'n/a'} | {picks}")
 
 
 def _rule_lines() -> list:

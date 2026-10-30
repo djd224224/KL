@@ -206,12 +206,16 @@ class TestToxicHaltsEmail(unittest.TestCase):
         self.assertEqual((s["quotes"], s["forgone_eff"], s["net"]), ([], 0.0, 0.0))
         self.assertIn("none up", text)
         self.assertNotIn("Pick-offs:", text)         # no day total (Jack 2026-10-22)
-        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: halts $0.00 net | "
-                                              "1 event, 1 side (5 pick-offs)")
+        # (Jack 2026-10-30: the title says how many markets were halted, the
+        # reward given up and the net P&L impact: the event's 3 markets + 1 side)
+        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: 4 markets halted "
+                                              "(2 halts), reward given up $0.00, net P&L "
+                                              "$0.00 | 5 pick-offs")
         old = th.build_report(self.day, with_profit=False)
         self.assertNotIn("profit", old)
         self.assertEqual(th.subject_for(old),
-                         "IMM toxic halts Mon Sep 28: 1 event, 1 side (5 pick-offs)")
+                         "IMM toxic halts Mon Sep 28: 4 markets halted (2 halts), est "
+                         "reward given up $0.60 | 5 pick-offs")
         self.assertNotIn("PROFIT", th.render_text(old))
 
     def test_exempt_mention_pick_offs_are_tagged(self):
@@ -240,7 +244,8 @@ class TestToxicHaltsEmail(unittest.TestCase):
         self.assertIn("Nothing was halted.", text)
         self.assertIn("No toxic_halts sink file", text)
         self.assertIn("Halts: none, so no profit or cost.", text)
-        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Sun Sep 20: none (0 pick-off(s))")
+        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Sun Sep 20: no market halted "
+                                              "(0 pick-offs)")
 
     def test_dry_run_sends_nothing(self):
         with mock.patch.object(imm.Alerter, "send_message") as send:
@@ -306,8 +311,9 @@ class TestToxicHaltsProfit(unittest.TestCase):
             self.assertIn(bit, event)
         self.assertIn("50ct -$3.00 at 5 min, -$9.60 now", text)    # most picked-off: mk
         self.assertIn("Halts: net -$1.68", html)
-        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: halts -$1.68 net | "
-                                              "1 event, 1 side (5 pick-offs)")
+        self.assertEqual(th.subject_for(ctx), "IMM toxic halts Mon Sep 28: 4 markets halted "
+                                              "(2 halts), reward given up $0.43, net P&L "
+                                              "-$1.68 | 5 pick-offs")
 
     def test_failed_reads_read_n_a_and_never_cost_the_email(self):
         kal = FakeKalshi(fail={self.mk, self.a, self.c})
@@ -319,7 +325,8 @@ class TestToxicHaltsProfit(unittest.TestCase):
         self.assertIn("Halts: n/a -- the Kalshi reads failed.", text)
         self.assertIn("! Some Kalshi reads failed", text)
         self.assertTrue(th.subject_for(ctx).startswith(
-            "IMM toxic halts Mon Sep 28: halts n/a net |"))
+            "IMM toxic halts Mon Sep 28: 4 markets halted (2 halts), reward given up n/a, "
+            "net P&L n/a |"))
 
     def test_seven_day_store(self):
         with mock.patch.object(th, "_get", self.kal):
