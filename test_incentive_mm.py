@@ -31013,9 +31013,11 @@ class TestFairClose(unittest.TestCase):
 
     def test_the_loop_closes_a_long_at_the_model(self):
         # a 57c fair: no ask lead (its 62c floor is behind the 60c offer); the
-        # long of 150 offers at 57c, and the bid side has no room left
+        # long of 150 offers at 57c, and the bid keeps its normal rung at the
+        # 45c reference (FAIR_LEAD_INV_QUOTE)
         bot, rungs, _l = self._cycle(150.0, 0.57)
-        self.assertEqual(rungs, [("ask", 57, 150)])
+        self.assertIn(("ask", 57, 150), rungs)
+        self.assertEqual([r[1] for r in rungs if r[0] == "bid"], [45])
         self.assertEqual(bot._fair_close_px, {self.T: ("ask", 57)})
 
     def test_a_market_holding_a_position_stays_selected(self):
@@ -31047,6 +31049,40 @@ class TestFairClose(unittest.TestCase):
         self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 0)
         bot._fair_close_px[t] = ("bid", 32)
         self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 1)
+
+    def test_the_side_a_position_adds_to_still_quotes_its_normal_rung(self):
+        # Jack 2026-10-30: "just because a 200 position on one side, doesnt
+        # mean that side has to stop quoting. can still quote that side
+        # normally". Long 200 at a 52c fair: the ask closes at 52c and the bid
+        # keeps its normal rung at the 45c reference
+        _b, rungs, _l = self._cycle(200.0, 0.52)
+        self.assertIn(("ask", 52, 200), rungs)
+        bids = [r for r in rungs if r[0] == "bid"]
+        self.assertEqual(len(bids), 1)
+        self.assertEqual(bids[0][1], 45)
+        self.assertLess(bids[0][2], 100)                 # the normal rung, not a lead
+        # short 200: the ask that would lead at 59c has spent its 200, so it
+        # offers its normal rung at the reference instead (79c)
+        bot, rungs, lines = self._cycle(-200.0, 0.52)
+        self.assertIn(("bid", 52, 200), rungs)
+        asks = [r for r in rungs if r[0] == "ask"]
+        self.assertEqual([a[1] for a in asks], [79])
+        self.assertEqual(bot._comp_lead_px, {})
+        self.assertFalse(any("fair lead KXRAINWKND-68OCT13-SGF ask: 200 @" in s
+                             for s in lines), lines)
+        with mock.patch.object(imm, "FAIR_LEAD_INV_QUOTE", False):
+            _b, rungs, _l = self._cycle(200.0, 0.52)
+            self.assertEqual([r for r in rungs if r[0] == "bid"], [])
+
+    def test_a_lead_rests_only_the_rest_of_its_200(self):
+        # a 69.4c fair leads the bid at 54c: long 50, it rests 150; long 200,
+        # the lead is spent and the bid rests its normal rung at 45c
+        _b, rungs, _l = self._cycle(50.0, 0.694)
+        self.assertIn(("bid", 54, 150), rungs)
+        _b, rungs, _l = self._cycle(200.0, 0.694)
+        bids = [r for r in rungs if r[0] == "bid"]
+        self.assertEqual(len(bids), 1)
+        self.assertEqual(bids[0][1], 45)
 
     def test_off_and_dry_quote_the_normal_rung(self):
         for mode in ("off", "dry"):

@@ -11152,6 +11152,7 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
     "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
+    "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE",
     # bait-fingerprint stop (2026-10-22)
@@ -19975,6 +19976,19 @@ FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
 # 81x83 sits more than 10c past the 44.9c fair -- no lead until it is back
 # inside`, and the same when it is. 0 disables.
 FAIR_LEAD_MAX_GAP_C = max(0, _env_int("IMM_FAIR_LEAD_MAX_GAP_C", 10))
+# LEAD INVENTORY QUOTES ON (Jack 2026-10-30: "just because a 200 position on
+# one side, doesnt mean that side has to stop quoting. can still quote that
+# side normally"). FAIR_LEAD_MAX_POSITION stops the LEAD: a side whose
+# position already holds it leads no more. The side keeps its normal rung:
+# with no lead on it, the side a fair-lead market's position adds to is
+# judged by the series' own cap (MAX_POSITION_CONTRACTS) and skew
+# (SKEW_SOFT/HARD_CONTRACTS) on the position BEYOND FAIR_LEAD_MAX_POSITION
+# only -- at most ~200 + 60 a city before the skew pulls it. Until then a
+# filled 200 (IND long, SGF/ATL short) stopped that side outright: the
+# leading market's cap left it no room, and the 60 skew pulled it, or a
+# partly filled lead (STL short 169), at 60. A lead still on its side rests
+# the rest of its own 200, unskewed. 0 restores that.
+FAIR_LEAD_INV_QUOTE = os.environ.get("IMM_FAIR_LEAD_INV_QUOTE", "1") == "1"
 
 
 def fair_lead_series(series: str) -> bool:
@@ -32053,6 +32067,14 @@ class IncentiveMarketMaker:
                 if lead_a is not None and not (ask_in_band and comp_lead_band_ok(
                         lead_a[0], (rung_lo, pmax_s), meta.series)):
                     lead_a = None
+                # (FAIR_LEAD_INV_QUOTE: a side already holding the lead's
+                # position cap leads no more; it quotes its normal rung)
+                if lead_src == "fair" and FAIR_LEAD_INV_QUOTE:
+                    _lp = own_pos if coexist else pos
+                    if _lp >= FAIR_LEAD_MAX_POSITION:
+                        lead_b = None
+                    if _lp <= -FAIR_LEAD_MAX_POSITION:
+                        lead_a = None
                 self._comp_lead_note(t, lead_b, lead_a, lead_n, src=lead_src)
                 if lead_mode(lead_src) != "on":
                     lead_b = lead_a = None
@@ -32146,14 +32168,34 @@ class IncentiveMarketMaker:
             # and the event share carry it already)
             pos_room_buy, pos_room_sell = side_cut_room(
                 meta.series, maxpos - cap_pos, maxpos + cap_pos)
+            # LEAD INVENTORY (FAIR_LEAD_INV_QUOTE): the side a fair-lead
+            # market's position adds to, with no lead on it, quotes its normal
+            # rung as if the first FAIR_LEAD_MAX_POSITION of the position were
+            # not there -- the series' own cap and skew judge the excess only
+            skew_b = skew_a = cap_pos
+            if FAIR_LEAD_INV_QUOTE and meta.series in FAIR_LEAD_SERIES:
+                _xs = cap_pos - max(-FAIR_LEAD_MAX_POSITION,
+                                    min(FAIR_LEAD_MAX_POSITION, cap_pos))
+                _base = series_max_position(meta.series)
+                # (a lead still on that side rests the rest of its own cap)
+                if cap_pos >= 1:
+                    skew_b = _xs
+                    if lead_b is None:
+                        pos_room_buy = side_cut_room(meta.series, _base - _xs,
+                                                     _base + _xs)[0]
+                if cap_pos <= -1:
+                    skew_a = _xs
+                    if lead_a is None:
+                        pos_room_sell = side_cut_room(meta.series, _base - _xs,
+                                                      _base + _xs)[1]
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
-            room_buy = skewed_side_room(room_buy, cap_pos, accumulating=cap_pos > 0,
+            room_buy = skewed_side_room(room_buy, skew_b, accumulating=skew_b > 0,
                                         side_max=side_max_bid,
                                         soft=SKEW_SOFT_CONTRACTS * fam_m,
                                         hard=SKEW_HARD_CONTRACTS * fam_m)
-            room_sell = skewed_side_room(room_sell, cap_pos, accumulating=cap_pos < 0,
+            room_sell = skewed_side_room(room_sell, skew_a, accumulating=skew_a < 0,
                                          side_max=side_max_ask,
                                          soft=SKEW_SOFT_CONTRACTS * fam_m,
                                          hard=SKEW_HARD_CONTRACTS * fam_m)
