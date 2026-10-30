@@ -11151,6 +11151,7 @@ _CONFIG_CODE_KNOBS = (
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
+    "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE",
     # bait-fingerprint stop (2026-10-22)
@@ -19958,6 +19959,22 @@ FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
+# DISAGREEMENT GUARD (Jack 2026-10-30: "yes stop new leads where the book is
+# that far from the model", on the 13:55Z books: Springfield 81x83 against a
+# 45c fair, St. Louis 78x82 against 59c, Atlanta 42x43 against 17c). No fair
+# lead, on either side, while the book's external touch sits more than
+# FAIR_LEAD_MAX_GAP_C past the fair -- a bid over the fair plus it or an ask
+# under the fair less it, the weekend gate's own band test (fair_gate_breach,
+# RAIN_WKND_TOL_CENTS 10) -- so a lead resting there steps back too, and the
+# estimate stops counting it. A wide book around the model still leads
+# (SGF's 48x60 against 69c). The fills that hurt on 10/30 (AUS 03:24Z, STL
+# 05:39Z, ATL 05:59Z, SGF 08:12Z, IND 11:39Z) came with the book's mid 1-6c
+# from the fair and the move after it, so this stops the next lead into a
+# market that has already left the model, not those. The closing rung (FAIR
+# CLOSE) is no lead and rests regardless. Logs `fair lead guard <t>: book
+# 81x83 sits more than 10c past the 44.9c fair -- no lead until it is back
+# inside`, and the same when it is. 0 disables.
+FAIR_LEAD_MAX_GAP_C = max(0, _env_int("IMM_FAIR_LEAD_MAX_GAP_C", 10))
 
 
 def fair_lead_series(series: str) -> bool:
@@ -19988,8 +20005,12 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
     cents), every book EXTERNAL. The bid side's reference is the fair rounded
     down, the ask side's (NO space) 100 less the fair rounded up, so each
     side leads at least FAIR_LEAD_MARGIN_C inside the fair. Holds, caps and
-    guards as comp_lead_group."""
+    guards as comp_lead_group; neither side leads while the book's touch sits
+    more than FAIR_LEAD_MAX_GAP_C past the fair (the disagreement guard)."""
     lb = ln = None
+    eb, ea = external_best(yes_levels, no_levels)
+    if FAIR_LEAD_MAX_GAP_C and any(fair_gate_breach(eb, ea, fair_c, FAIR_LEAD_MAX_GAP_C)):
+        return None, None
     if target > 0:
         lb = comp_side_lead_ref(yes_levels, int(math.floor(fair_c)), target, df,
                                 hold=hold_bid, margin=FAIR_LEAD_MARGIN_C)
@@ -19997,7 +20018,6 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
                                 hold=None if hold_ask is None else 100 - hold_ask,
                                 margin=FAIR_LEAD_MARGIN_C)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
-    eb, ea = external_best(yes_levels, no_levels)
     if lb is not None and ea is not None and lb[0] >= ea:
         lb = None
     if la is not None and eb is not None and la[0] <= eb:
@@ -21286,6 +21306,8 @@ class IncentiveMarketMaker:
         # and ticker -> (side, YES price) of the closing rung it rests now
         self._fair_close_noted: Dict[Tuple[str, str], Optional[int]] = {}
         self._fair_close_px: Dict[str, Tuple[str, int]] = {}
+        # ticker -> the disagreement guard holds its fair leads back (logged)
+        self._fair_gap_held: Dict[str, bool] = {}
         # ticker -> [bid, ask, at]: where its sides last led (COMP_HOLD_FILE)
         self._comp_holds: Dict[str, list] = self._load_comp_holds()
         # open hedge jobs (COMP_HEDGE_FILE): a filled lead, its siblings' legs
@@ -28050,6 +28072,7 @@ class IncentiveMarketMaker:
             fair_c = fair_lead_fair_c(t, meta.series, time.time())
             if fair_c is None:
                 return None, None
+            self._fair_gap_note(t, yes_ext, no_ext, fair_c)
             return fair_lead_group(yes_ext, no_ext, fair_c,
                                    meta.target_size, meta.discount_factor,
                                    hold_bid=held[0], hold_ask=held[1])
@@ -28139,6 +28162,26 @@ class IncentiveMarketMaker:
                      f"{best}c")
             log(f"{self.tag} {kind} lead{dry} {t} {side}: {n} @ {px}c, {where}; "
                 f"{who} {verb} {implied}c")
+
+    def _fair_gap_note(self, t: str, yes_ext: List[List[float]],
+                       no_ext: List[List[float]], fair_c: float) -> None:
+        """Log the disagreement guard (FAIR_LEAD_MAX_GAP_C) when it starts or
+        stops holding `t`'s fair leads back."""
+        if not FAIR_LEAD_MAX_GAP_C:
+            return
+        eb, ea = external_best(yes_ext, no_ext)
+        held = any(fair_gate_breach(eb, ea, fair_c, FAIR_LEAD_MAX_GAP_C))
+        if held == self._fair_gap_held.get(t, False):
+            return
+        self._fair_gap_held[t] = held
+        dry = "" if lead_mode("fair") == "on" else " (dry)"
+        if held:
+            log(f"{self.tag} fair lead guard{dry} {t}: book {eb}x{ea} sits more than "
+                f"{FAIR_LEAD_MAX_GAP_C}c past the {fair_c:.1f}c fair -- no lead until "
+                f"it is back inside")
+        else:
+            log(f"{self.tag} fair lead guard{dry} {t}: book {eb}x{ea} back within "
+                f"{FAIR_LEAD_MAX_GAP_C}c of the {fair_c:.1f}c fair -- leads allowed")
 
     def _fair_close_note(self, t: str, close_b, close_a, pos: float, fair_c: float,
                          yes_ext: List[List[float]], no_ext: List[List[float]]) -> None:
@@ -35692,6 +35735,9 @@ class IncentiveMarketMaker:
                f"payout bar is admitted on it; a leading market's position cap "
                f"{FAIR_LEAD_MAX_POSITION:g}, the family's event cap "
                f"{FAIR_LEAD_EVENT_CAP:g}; no hedge"
+               + (f"; no lead while the book's touch sits more than "
+                  f"{FAIR_LEAD_MAX_GAP_C}c past the fair" if FAIR_LEAD_MAX_GAP_C
+                  else "")
                + (" (dry: logged, not placed)" if FAIR_LEAD_MODE == "dry" else "")
                if FAIR_LEAD_MODE in ("on", "dry") else ""))
         log(f"fair close (2026-10-30): {FAIR_CLOSE_MODE}"

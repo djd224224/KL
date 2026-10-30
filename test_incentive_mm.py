@@ -30654,6 +30654,35 @@ class TestFairLead(unittest.TestCase):
                          (None, (61, 57, 64)))
         self.assertEqual(imm.fair_lead_group(yes, no, 56.5, 1000.0, 0.5), (None, None))
 
+    def test_the_disagreement_guard(self):
+        # Jack 2026-10-30: "yes stop new leads where the book is that far from
+        # the model". A book bid at 70c, offered at 85c behind 20 at 85c: off a
+        # 45c fair the ask would lead at 81c, but the bid sits 25c over the fair
+        yes, no = [[70, 3000.0]], [[10, 3000.0], [15, 20.0]]
+        self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5), (None, None))
+        with mock.patch.object(imm, "FAIR_LEAD_MAX_GAP_C", 0):
+            self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5),
+                             (None, (81, 50, 85)))
+        with mock.patch.object(imm, "FAIR_LEAD_MAX_GAP_C", 30):        # 70 < 45 + 30
+            self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5),
+                             (None, (81, 50, 85)))
+        # an ask under the fair by more than 10c stops the bid lead: SGF's 60c
+        # offer against a 71c fair; at 70c the offer is exactly 10c under
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 71.0, 1000.0, 0.5),
+                         (None, None))
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 70.0, 1000.0, 0.5),
+                         ((54, 65, 48), None))
+        self.assertEqual(imm.FAIR_LEAD_MAX_GAP_C, 10)
+        self.assertIn("FAIR_LEAD_MAX_GAP_C", imm._CONFIG_CODE_KNOBS)
+
+    def test_the_guard_holds_the_loop_back_and_says_so(self):
+        bot, rungs, lines = self._cycle(p=0.71)
+        self.assertNotEqual(rungs.get("bid", (None, 0))[0], 54)
+        self.assertEqual(bot._comp_lead_px, {})
+        self.assertTrue(any("fair lead guard KXRAINWKND-68OCT13-SGF: book 48x60 sits "
+                            "more than 10c past the 71.0c fair -- no lead until it is "
+                            "back inside" in s for s in lines), lines)
+
     def test_the_fair_the_switches_and_the_event_cap(self):
         now = time.time()
         self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXRAINWKND", now))   # no file
