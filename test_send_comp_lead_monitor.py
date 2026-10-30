@@ -209,7 +209,7 @@ class TestFairLeads(unittest.TestCase):
         self.assertIn("1 fair-led (1 fill) | OK", cm.subject_for(ctx))
         text = cm.render_text(ctx)
         self.assertIn("LEADS: 1 side(s) led during the day", text)
-        self.assertIn("FAIR LEADS (off our model's fair, at least 10c inside it): 1 side(s)",
+        self.assertIn(f"FAIR LEADS (off our model's fair, at least {imm.FAIR_LEAD_MARGIN_C}c inside it): 1 side(s)",
                       text)
         self.assertIn("KXRAINWKND-26OCT31-SGF bid: 200 @ 54c, own best 48c, fair 69c; "
                       "led 2.0h, ended", text)

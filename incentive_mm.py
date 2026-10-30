@@ -19832,7 +19832,10 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # FAIR LEAD (Jack 2026-10-29: "Instead of just standing down due to being
 # under payout bar, since I have a fair we should be willing to come in above
 # the wall with up to 200 contracts"; then "10c" from the fair and an event
-# cap of 2,000). The complement lead off our own model's price instead of a
+# cap of 2,000; 2026-10-30: "be willing to go to 5c of the model if
+# necessary" -- FAIR_LEAD_MARGIN_C 10 -> 5, after the first live cycle led
+# 4 of the 12 cities under the bar). The complement lead off our own model's
+# price instead of a
 # sibling's book: on a family with a fair (FAIR_LEAD_SERIES, weekend rain's
 # rain_wknd_fair.py), a side whose own touch is a thin order ahead of a wall
 # leads with one rung of target/5 (200 of a 1,000 target) at the cheapest
@@ -19841,8 +19844,12 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # the fair plus it (fair_lead_group; comp_side_lead_ref's holds, fight and
 # guards). The estimate prices the lead, so a market that projected under
 # the payout bar with an at-reference rung behind the wall is admitted when
-# the lead clears it. On the 10/29 14:30Z books (26OCT31): at 10c, 5 bids
-# and 1 ask led (ABQ, CMH, IND, LEX, SGF; CLL), each market ~$8/day of a
+# the lead clears it. The margin is a cap, not a target: the lead stays at
+# the cheapest price that wins the side, so it nears the model only where
+# the wall forces it there, and an order stepping ahead is fought no
+# further than the cap. On the 10/29 14:30Z books (26OCT31): at 10c, 5 bids
+# and 1 ask led (ABQ, CMH, IND, LEX, SGF; CLL; at 5c, 9 sides, ~$80/day
+# before reactions), each market ~$8/day of a
 # $16.4/day pool before anyone reacts, against ~$10/day for the 35 markets
 # as they quoted. Unlike the complement lead nothing hedges a fill (the
 # cities are separate markets): a leading market's position cap is
@@ -19857,7 +19864,7 @@ FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get("IMM_FAIR_LEAD_SERIES", "KXRAINWKND").split(",")
      if s.strip()}))
-FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 10))
+FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
 

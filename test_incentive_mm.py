@@ -30470,6 +30470,7 @@ class TestFairLead(unittest.TestCase):
             "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
             "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
 
+    @mock.patch.object(imm, "FAIR_LEAD_MARGIN_C", 10)       # the 10/29 margin
     def test_sgf_leads_its_bid_ten_cents_inside_the_fair(self):
         # 200 at 54c takes 96.8% of the bid side over the 3,169 at 45c (53c
         # would take 93.9%); the 69.4c fair rounds down to 69c, so the cap is
@@ -30495,6 +30496,7 @@ class TestFairLead(unittest.TestCase):
         self.assertAlmostEqual(lead, 0.512, places=3)
         self.assertLess(ref, 0.04)
 
+    @mock.patch.object(imm, "FAIR_LEAD_MARGIN_C", 10)       # the 10/29 margin
     def test_the_ask_side_and_a_lead_that_would_cross(self):
         # 15 offered at 64c (NO 36c) ahead of 4,000 at 70c: 200 at 61c takes
         # 95%+ of the side. The ask's fair rounds UP, so a 51c fair caps it at
@@ -30508,6 +30510,27 @@ class TestFairLead(unittest.TestCase):
         # a 1c spread leaves no price ahead that does not cross
         self.assertEqual(imm.fair_lead_group([[60, 5000.0]], [[39, 5000.0]], 72.0,
                                              1000.0, 0.5), (None, None))
+
+    def test_the_default_margin_is_five_cents_and_used_only_if_needed(self):
+        # Jack 2026-10-30: "be willing to go to 5c of the model if
+        # necessary". The cap moves to the fair less 5c; the lead itself
+        # stays at the cheapest price that wins the side.
+        self.assertEqual(imm.FAIR_LEAD_MARGIN_C, 5)
+        # a 69.4c fair: still 54c, not the new 64c cap
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 69.4, 1000.0, 0.5),
+                         ((54, 64, 48), None))
+        # a 63.9c fair led nothing at 10c (cap 53c): at 5c it leads at 54c
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 63.9, 1000.0, 0.5),
+                         ((54, 58, 48), None))
+        # a 58.9c fair caps the bid at 53c, short of the 54c that wins it
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 58.9, 1000.0, 0.5),
+                         (None, None))
+        # the ask: a 51.2c fair led nothing at 10c (floor 62c); at 5c the
+        # floor is 57c and 61c leads; a 56.5c fair floors it at 62c again
+        yes, no = [[50, 3000.0]], [[30, 4000.0], [36, 15.0]]
+        self.assertEqual(imm.fair_lead_group(yes, no, 51.2, 1000.0, 0.5),
+                         (None, (61, 57, 64)))
+        self.assertEqual(imm.fair_lead_group(yes, no, 56.5, 1000.0, 0.5), (None, None))
 
     def test_the_fair_the_switches_and_the_event_cap(self):
         now = time.time()

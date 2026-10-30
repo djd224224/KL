@@ -22,7 +22,9 @@ job ends.
 Since 2026-10-29 (Jack: "since I have a fair we should be willing to come in
 above the wall with up to 200 contracts") weekend rain's sides also lead off
 its MODEL FAIR (incentive_mm FAIR_LEAD_MODE): 200 at the cheapest price that
-takes ~95% of the side, at least 10c inside the fair. Those log `fair lead`
+takes ~95% of the side, at least FAIR_LEAD_MARGIN_C inside the fair (10c,
+then 5c from 2026-10-30: "be willing to go to 5c of the model if
+necessary"). Those log `fair lead`
 lines, get their own section, and their fills ride as inventory (nothing
 hedges a city's market), so they never count toward the hedge verdict.
 
@@ -399,7 +401,8 @@ def render_text(ctx) -> str:
         out.append(f"  {when:%H:%M} ET {f['ticker']} {what} {f['count']:g} @ {f['px']:g}c")
     if fair or fair_fills:
         fair_end = [k for k, v in fair.items() if v["leading_at_end"]]
-        out += ["", f"FAIR LEADS (off our model's fair, at least 10c inside it): "
+        out += ["", f"FAIR LEADS (off our model's fair, at least "
+                    f"{imm.FAIR_LEAD_MARGIN_C}c inside it): "
                     f"{len(fair)} side(s) led during the day; {len(fair_end)} leading at "
                     f"the day's end."]
         for (t, side), v in sorted(fair.items(), key=lambda kv: kv[0]):
