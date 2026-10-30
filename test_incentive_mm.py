@@ -30784,6 +30784,195 @@ class TestFairLead(unittest.TestCase):
             self.assertEqual([j.get("need_group") for j in bot._comp_hedges], [True])
 
 
+class TestFairClose(unittest.TestCase):
+    """Jack 2026-10-30: "ship and sit ahead, but only if it earns rewards" --
+    after the weekend leads filled (SFO short 185, ATL short 200, IND long
+    200) and a city no longer leading closed with its normal rung only. FAIR
+    CLOSE: a fair-lead market holding a position rests the whole of it (up to
+    FAIR_LEAD_MAX_POSITION) on the side that reduces it, first call on the
+    event's room, a tick ahead of that side's book while that price is on our
+    side of the fair and earns, else at the side's own price."""
+
+    # the 26OCT31 books at 10/30 13:21Z, cents, external. SFO: 1 bid at 41c
+    # down to the 33c wall, offers from 43c (NO 57c); fair 44.76c
+    SFO_YES = [[20, 16.03], [21, 15], [23, 8], [26, 50], [33, 2806.19], [34, 79],
+               [35, 16], [36, 25], [37, 10.25], [39, 5], [40, 8.63], [41, 1]]
+    SFO_NO = [[25, 36.82], [34, 1949.13], [35, 79], [36, 5], [37, 50], [38, 15],
+              [42, 7.63], [48, 3], [49, 1], [50, 3], [51, 1], [57, 5.01]]
+    # IND: bids to 33c; 46 offered at 63c, 66 at 64c, 655 more at 65c
+    IND_YES = [[25, 50], [26, 8], [29, 15], [30, 2404.38], [31, 20], [32, 4.71],
+               [33, 1]]
+    IND_NO = [[1, 1000], [2, 30], [3, 92], [4, 54], [25, 15.83], [32, 2],
+              [35, 655.06], [36, 66], [37, 46]]
+    # ATL: 427 bid at 42c, 6 offered at 43c; fair 19.55c
+    ATL_YES = [[20, 146], [21, 52], [25, 36.19], [30, 5], [32, 13.64], [35, 35],
+               [41, 9], [42, 427.2]]
+    ATL_NO = [[1, 1015.6], [7, 8227.13], [8, 250], [10, 194], [11, 39],
+              [15, 96.11], [52, 50], [57, 6]]
+
+    T, EV = TestFairLead.T, TestFairLead.EV
+    YES, NO = TestFairLead.YES, TestFairLead.NO      # SGF's 10/29 book
+
+    def setUp(self):
+        _clean_persist()
+        imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
+        try:
+            os.remove(imm.RAIN_WKND_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "FAIR_CLOSE_MODE", "on")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def test_sfo_bids_its_whole_short_a_tick_ahead(self):
+        g = imm.fair_close_group
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 44.76, -185.0, 1000.0, 0.5),
+                         ((42, 185), None))
+        # never more than FAIR_LEAD_MAX_POSITION; a single contract closes too
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 44.76, -250.0, 1000.0, 0.5),
+                         ((42, 200), None))
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 44.76, -1.0, 1000.0, 0.5),
+                         ((42, 1), None))
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 44.76, -0.4, 1000.0, 0.5),
+                         (None, None))
+        # the bid stays at or under the fair: a 42.0c fair still takes 42c,
+        # a 41.9c one leaves no price a tick ahead
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 42.0, -185.0, 1000.0, 0.5),
+                         ((42, 185), None))
+        self.assertEqual(g(self.SFO_YES, self.SFO_NO, 41.9, -185.0, 1000.0, 0.5),
+                         (None, None))
+
+    def test_ind_offers_its_long_ahead_of_the_63c_offer(self):
+        g = imm.fair_close_group
+        # 62c, ahead of 46 at 63c and 66 at 64c, 2.7c over the 59.3c fair
+        self.assertEqual(g(self.IND_YES, self.IND_NO, 59.3, 200.0, 1000.0, 0.5),
+                         (None, (62, 200)))
+        # the ask stays at or over the fair, rounded up: 62.0 takes 62c, 62.5 not
+        self.assertEqual(g(self.IND_YES, self.IND_NO, 62.0, 200.0, 1000.0, 0.5),
+                         (None, (62, 200)))
+        self.assertEqual(g(self.IND_YES, self.IND_NO, 62.5, 200.0, 1000.0, 0.5),
+                         (None, None))
+
+    def test_atl_a_cross_and_a_rung_that_would_not_earn(self):
+        g = imm.fair_close_group
+        # ATL: 43c is 23c over the 19.55c fair (and would cross the 43c offer)
+        self.assertEqual(g(self.ATL_YES, self.ATL_NO, 19.55, -200.0, 1000.0, 0.5),
+                         (None, None))
+        # a 1c spread: a tick ahead crosses, whatever the fair
+        self.assertEqual(g([[60, 5000.0]], [[39, 5000.0]], 70.0, -100.0, 1000.0, 0.5),
+                         (None, None))
+        # earning: its side must reach the target with the rung in it...
+        self.assertEqual(g([[40, 100.0]], [[50, 5000.0]], 60.0, -50.0, 1000.0, 0.5),
+                         (None, None))
+        # ...and so must the other side, or no snapshot counts
+        self.assertEqual(g([[40, 5000.0]], [[50, 300.0]], 60.0, -50.0, 1000.0, 0.5),
+                         (None, None))
+        self.assertEqual(g([[40, 5000.0]], [[50, 3000.0]], 60.0, -50.0, 1000.0, 0.5),
+                         ((41, 50), None))
+        # an empty closing side has nothing to sit ahead of
+        self.assertEqual(g([], [[50, 3000.0]], 60.0, -50.0, 1000.0, 0.5), (None, None))
+
+    def test_the_switch_and_the_fair(self):
+        TestFairLead._write(self, p=0.52)
+        now = time.time()
+        self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXRAINWKND", now), 52.0)
+        self.assertIsNone(imm.fair_close_fair_c(self.T, "KXRAIN", now))
+        with mock.patch.object(imm, "FAIR_LEAD_MODE", "off"):         # its own switch
+            self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXRAINWKND", now), 52.0)
+        with mock.patch.object(imm, "FAIR_CLOSE_MODE", "off"):
+            self.assertIsNone(imm.fair_close_fair_c(self.T, "KXRAINWKND", now))
+        self.assertIsNone(imm.fair_close_fair_c(
+            self.T, "KXRAINWKND", now + imm.RAIN_WKND_TTL_MIN * 60 + 5))   # stale
+        self.assertIn("FAIR_CLOSE_MODE", imm._CONFIG_CODE_KNOBS)
+
+    def _cycle(self, pos, p, mode="on"):
+        _clean_persist()
+        TestFairLead._write(self, p=p)
+        client = FakeClient()
+        far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": far, "yes_bid_dollars": "0.4800",
+            "yes_ask_dollars": "0.6000", "volume_fp": "150.00"}
+        client.books[self.T] = TestFairLead._book(self)
+        client.positions[self.T] = pos
+        with mock.patch.object(imm, "FAIR_CLOSE_MODE", mode), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.pnl.pos[self.T] = pos                    # ours, not manual
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                       for o in bot.state.sim_orders.values()
+                       if o["ticker"] == self.T
+                       and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+        return bot, rungs, lines
+
+    def test_the_loop_closes_a_short_a_tick_ahead_of_the_48c_bid(self):
+        # SGF's 10/29 book, a 52c fair: no bid lead (its cap 47c is behind the
+        # 48c touch), so the whole short of 150 bids at 49c
+        bot, rungs, lines = self._cycle(-150.0, 0.52)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual([r for r in rungs if r[0] == "bid"], [("bid", 49, 150)])
+        self.assertEqual(bot._fair_close_px, {self.T: ("bid", 49)})
+        self.assertTrue(any("fair close KXRAINWKND-68OCT13-SGF bid: 150 @ 49c, a tick "
+                            "ahead of 48c, closing a short of 150; the weekend rain "
+                            "fair implies 52.0c" in s for s in lines), lines)
+
+    def test_a_small_short_closes_ahead_and_the_ladder_keeps_its_reference(self):
+        bot, rungs, _l = self._cycle(-10.0, 0.52)
+        bids = [r for r in rungs if r[0] == "bid"]
+        self.assertEqual(bids[-1], ("bid", 49, 10))              # the closing rung
+        self.assertEqual(len(bids), 2)
+        self.assertEqual(bids[0][1], 45)                         # the rest, at the ref
+
+    def test_past_the_fair_the_whole_short_rests_at_the_reference(self):
+        # a 47c fair: 49c would bid over the model, so the 150 rests at 45c
+        bot, rungs, lines = self._cycle(-150.0, 0.47)
+        self.assertEqual([r for r in rungs if r[0] == "bid"], [("bid", 45, 150)])
+        self.assertEqual(bot._fair_close_px, {})
+        self.assertFalse(any("fair close" in s and "@" in s for s in lines), lines)
+
+    def test_the_loop_closes_a_long_with_a_tick_ahead_ask(self):
+        # a 57c fair: no ask lead (its 62c floor is behind the 60c offer); the
+        # long of 150 offers at 59c, and the bid side has no room left
+        bot, rungs, _l = self._cycle(150.0, 0.57)
+        self.assertEqual(rungs, [("ask", 59, 150)])
+        self.assertEqual(bot._fair_close_px, {self.T: ("ask", 59)})
+
+    def test_off_and_dry_quote_the_normal_rung(self):
+        for mode in ("off", "dry"):
+            _b, rungs, lines = self._cycle(-150.0, 0.52, mode=mode)
+            bids = [r for r in rungs if r[0] == "bid"]
+            self.assertEqual(len(bids), 1, mode)
+            self.assertEqual(bids[0][1], 45, mode)
+            self.assertLess(bids[0][2], 150, mode)
+            self.assertEqual(any("fair close (dry) KXRAINWKND-68OCT13-SGF bid: 150 @ 49c"
+                                 in s for s in lines), mode == "dry", mode)
+
+
 class TestProfitLock(unittest.TestCase):
     """Jack 2026-10-29: "1 and 2" -- hedge every fill that locks a profit
     (lock_plan, after Kalshi's taker fees) and threshold-ladder leads hedged

@@ -11151,6 +11151,8 @@ _CONFIG_CODE_KNOBS = (
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
+    # fair close (2026-10-30)
+    "FAIR_CLOSE_MODE",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -20010,6 +20012,81 @@ def lead_mode(src: Optional[str]) -> str:
     return FAIR_LEAD_MODE if src == "fair" else COMP_LEAD_MODE
 
 
+# FAIR CLOSE (Jack 2026-10-30: "ship and sit ahead, but only if it earns
+# rewards"). By 13:20Z the weekend leads had filled six cities (SFO short 185
+# after selling 200 at 62c, ATL short 200 at 37c, IND long 200 at 54c, SGF,
+# STL, AUS), and a city no longer leading closed its position with its
+# normal rung only: ATL bid 25 and SFO 60 against shorts of 200 and 185 ("why
+# is only 25 quoted and not 200 to offset the 200 short position"), the
+# ladder's size and the event's room split across ~35 cities, while IND's
+# 200 sat at its 65c floor behind 46 at 63c and 66 at 64c ("why doesnt the
+# 200 contracts sit higher instead of parking next to the wall"). On a
+# FAIR_LEAD_SERIES market holding a position, the side that reduces it now
+# rests the whole position (up to FAIR_LEAD_MAX_POSITION) with first call on
+# the event's room, as FULL UNWIND does on the NFL ladders, and that closing
+# rung sits ONE TICK AHEAD of its side's external best (fair_close_group)
+# while that price is still on our side of the fair -- a bid at or under it,
+# an ask at or over it -- crosses nothing and earns: its side reaches the
+# target with the rung in it, and so does the other side. Otherwise the
+# whole position rests at the side's own price, where the family gate's cap
+# and its not-earning drop still apply; a lead already ahead of the book
+# keeps its price. The rest of the side's ladder keeps its own price. A
+# joiner at the closing price is stepped over the next cycle, never past the
+# fair, and back-of-line leaves the closing rung at the front. The estimate
+# still prices the side's own rung. Logs: `fair close <t> bid: 185 @ 42c, a
+# tick ahead of 41c, closing a short of 185; the weekend rain fair implies
+# 44.8c`. IMM_FAIR_CLOSE=dry logs the closes and quotes as before, off
+# disables both.
+FAIR_CLOSE_MODE = os.environ.get("IMM_FAIR_CLOSE", "on").strip().lower()
+
+
+def fair_close_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+    """The fair (YES cents) a FAIR_LEAD_SERIES market closes off, or None:
+    weekend rain's while its gate would still read it fresh, under
+    FAIR_CLOSE_MODE's own switch (a lead switched off still closes)."""
+    if (FAIR_CLOSE_MODE not in ("on", "dry") or LADDER_MODE != "atref"
+            or series not in FAIR_LEAD_SERIES or not rain_wknd_series(series)):
+        return None
+    e = _rain_wknd_state["markets"].get(ticker)
+    if e is None or now_ts - e["ts"] > RAIN_WKND_TTL_MIN * 60:
+        return None
+    return float(e["p"]) * 100.0
+
+
+def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]],
+                     fair_c: float, pos: float, target: float, df: float
+                     ) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    """(bid close, ask close) for a market holding `pos` YES contracts (a
+    short is negative) off its model fair `fair_c` (YES cents), every book
+    EXTERNAL: the side that reduces `pos` -- the bid for a short, the ask for
+    a long -- as (YES price, contracts), the other side None. The rung is the
+    whole position up to FAIR_LEAD_MAX_POSITION, one tick ahead of that
+    side's external best, and only while that price is on our side of the
+    fair (a bid at or under it, an ask at or over it), does not cross the
+    other side's external best and earns: its side reaches the target with
+    the rung in it, and the other side reaches it too (a snapshot counts only
+    then). Else (None, None)."""
+    n = int(min(abs(pos), FAIR_LEAD_MAX_POSITION))
+    if n < 1 or target <= 0:
+        return None, None
+    short = pos < 0
+    # the closing side in its own price space (YES cents for the bid, NO
+    # cents for the ask; higher = more aggressive)
+    own = levels_desc(yes_levels if short else no_levels)
+    other = levels_desc(no_levels if short else yes_levels)
+    if not own:
+        return None, None
+    px = own[0][0] + 1
+    cap = int(math.floor(fair_c)) if short else 100 - int(math.ceil(fair_c))
+    cross = 100 - other[0][0] if other else 100    # the other side's best, here
+    if px > cap or px >= cross:
+        return None, None
+    share, ok = _side_share([(px, float(n))] + own, {px: float(n)}, target, df)
+    if not ok or share <= 0 or sum(q for _p, q in other) < target:
+        return None, None
+    return ((px, n), None) if short else (None, (100 - px, n))
+
+
 def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
     """The price (that side's own space, best first) at which `levels` fill
     `count` contracts -- the worst price an immediate order of that size
@@ -21205,6 +21282,10 @@ class IncentiveMarketMaker:
         self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
+        # FAIR CLOSE: (ticker, side) -> the closing rung's last logged price,
+        # and ticker -> (side, YES price) of the closing rung it rests now
+        self._fair_close_noted: Dict[Tuple[str, str], Optional[int]] = {}
+        self._fair_close_px: Dict[str, Tuple[str, int]] = {}
         # ticker -> [bid, ask, at]: where its sides last led (COMP_HOLD_FILE)
         self._comp_holds: Dict[str, list] = self._load_comp_holds()
         # open hedge jobs (COMP_HEDGE_FILE): a filled lead, its siblings' legs
@@ -24440,6 +24521,9 @@ class IncentiveMarketMaker:
                         continue
                     if BACK_OF_LINE_MAX_BUMPS and \
                             self._bol_bumps.get(oid, 0) >= BACK_OF_LINE_MAX_BUMPS:
+                        continue
+                    # FAIR CLOSE: the closing rung wants the front of its line
+                    if self._fair_close_px.get(t) == (o["side"], int(round(px))):
                         continue
                     if lv is None:
                         lv = self._ws.book_levels(t) or ({}, {})
@@ -28056,6 +28140,29 @@ class IncentiveMarketMaker:
             log(f"{self.tag} {kind} lead{dry} {t} {side}: {n} @ {px}c, {where}; "
                 f"{who} {verb} {implied}c")
 
+    def _fair_close_note(self, t: str, close_b, close_a, pos: float, fair_c: float,
+                         yes_ext: List[List[float]], no_ext: List[List[float]]) -> None:
+        """Log the closing rung (FAIR CLOSE) when it starts, stops or moves 3c
+        or more (dry says so)."""
+        dry = "" if FAIR_CLOSE_MODE == "on" else " (dry)"
+        side, rung = ("bid", close_b) if pos < 0 else ("ask", close_a)
+        key = (t, side)
+        px = None if rung is None else rung[0]
+        prev = self._fair_close_noted.get(key)
+        if px == prev or (px is not None and prev is not None and abs(px - prev) < 3):
+            return
+        self._fair_close_noted[key] = px
+        what = f"a short of {-pos:g}" if pos < 0 else f"a long of {pos:g}"
+        if rung is None:
+            log(f"{self.tag} fair close{dry} {t} {side}: off -- a tick ahead of the "
+                f"book would pass the {fair_c:.1f}c fair, cross or not earn; {what} "
+                f"rests at the side's own price")
+            return
+        best = (levels_desc(yes_ext)[0][0] if pos < 0
+                else 100 - levels_desc(no_ext)[0][0])
+        log(f"{self.tag} fair close{dry} {t} {side}: {rung[1]} @ {px}c, a tick ahead "
+            f"of {best}c, closing {what}; the weekend rain fair implies {fair_c:.1f}c")
+
     # ---- COMPLEMENT HEDGE (COMP_HEDGE_MODE) ---------------------------------
 
     def _load_comp_hedges(self) -> List[dict]:
@@ -30475,6 +30582,8 @@ class IncentiveMarketMaker:
         # (a market no longer managed has no complement lead left to judge)
         self._comp_lead_px = {k: v for k, v in self._comp_lead_px.items()
                               if k in managed_set}
+        self._fair_close_px = {k: v for k, v in self._fair_close_px.items()
+                               if k in managed_set}
         stray = [o for o in resting if o.get("ticker") not in managed_set]
         for o in stray:
             if self.cancel_order(o.get("order_id", ""),
@@ -31884,6 +31993,34 @@ class IncentiveMarketMaker:
                 self._comp_lead_note(t, lead_b, lead_a, lead_n, src=lead_src)
                 if lead_mode(lead_src) != "on":
                     lead_b = lead_a = None
+            # FAIR CLOSE (FAIR_CLOSE_MODE): a fair-lead market holding a
+            # position rests the whole of it on the side that reduces it, a
+            # tick ahead of that side's book while that is on our side of the
+            # fair and earns (fair_close_group), else at the side's own price
+            close_b = close_a = None
+            close_n = 0
+            _cpos = own_pos if coexist else pos
+            _cfair = (fair_close_fair_c(t, meta.series, now_ts)
+                      if abs(_cpos) >= 1 and not reduce_only
+                      and meta.price_step >= 0.01 else None)
+            if _cfair is not None:
+                _cx_yes, _cx_no = (external_levels(yes_levels, no_levels, own_in_book)
+                                   if own_in_book else (yes_levels, no_levels))
+                close_b, close_a = fair_close_group(_cx_yes, _cx_no, _cfair, _cpos,
+                                                    meta.target_size,
+                                                    meta.discount_factor)
+                if close_b is not None and not (bid_in_band and comp_lead_band_ok(
+                        close_b[0], (rung_lo, pmax_s), meta.series)):
+                    close_b = None
+                if close_a is not None and not (ask_in_band and comp_lead_band_ok(
+                        close_a[0], (rung_lo, pmax_s), meta.series)):
+                    close_a = None
+                self._fair_close_note(t, close_b, close_a, _cpos, _cfair,
+                                      _cx_yes, _cx_no)
+                if FAIR_CLOSE_MODE == "on":
+                    close_n = int(min(abs(_cpos), FAIR_LEAD_MAX_POSITION))
+                else:
+                    close_b = close_a = None
             # LONE-REFERENCE GUARD (LONE_REF_GUARD_MODE): a side whose
             # reference rests on a thin external top our rung would jump to
             # stands aside ("on": no rungs this cycle) or is logged ("dry").
@@ -31935,6 +32072,16 @@ class IncentiveMarketMaker:
             unwind_ask = unwind_ask if lv_ask else 0
             side_max_bid = max(side_max_bid, unwind_bid)
             side_max_ask = max(side_max_ask, unwind_ask)
+            # FAIR CLOSE: the closing side's bound is the whole position (up
+            # to FAIR_LEAD_MAX_POSITION), with first call on the event's room
+            if close_n and cap_pos < 0 and lv_bid:
+                unwind_bid = max(unwind_bid, close_n)
+                side_max_bid = max(side_max_bid, close_n)
+                share_buy = max(share_buy, event_room_buy.get(ev, event_cap_contracts(ev)))
+            if close_n and cap_pos > 0 and lv_ask:
+                unwind_ask = max(unwind_ask, close_n)
+                side_max_ask = max(side_max_ask, close_n)
+                share_sell = max(share_sell, event_room_sell.get(ev, event_cap_contracts(ev)))
             # (a series' own side cut scales the position room too, so the
             # side rests the cut share of whichever bound binds: the ladder
             # and the event share carry it already)
@@ -32014,6 +32161,20 @@ class IncentiveMarketMaker:
                             _seen.pop(_old, None)
             else:
                 self._comp_lead_px.pop(t, None)
+            # FAIR CLOSE: the closing rung rests a tick ahead of the book unless
+            # a lead on that side is at least as far ahead; it never crosses
+            # our own other side
+            close_on_b = (close_b is not None and bool(lv_bid)
+                          and not (lead_on_b and lead_b[0] >= close_b[0])
+                          and not (lead_on_a and close_b[0] >= lead_a[0]))
+            close_on_a = (close_a is not None and bool(lv_ask)
+                          and not (lead_on_a and lead_a[0] <= close_a[0])
+                          and not (lead_on_b and close_a[0] <= lead_b[0]))
+            if close_on_b or close_on_a:
+                self._fair_close_px[t] = (("bid", close_b[0]) if close_on_b
+                                          else ("ask", close_a[0]))
+            else:
+                self._fair_close_px.pop(t, None)
 
             mq: List[Quote] = []
             # atref: placement no longer follows the touch, so a touch
@@ -32023,22 +32184,38 @@ class IncentiveMarketMaker:
                 px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
                     or ext_bid >= pmin_s
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "bid", anc_bid, ext_ask, room_buy,
-                                                levels=lv_bid, ref_px=pl_bid_px,
-                                                band=(rung_lo, pmax_s),
-                                                hour_mult=hm,
-                                                min_total=max(unwind_bid, lead_n
-                                                              if lead_on_b else 0)))
+                    rest_b = int(room_buy)
+                    if close_on_b:
+                        n_c = min(close_b[1], rest_b)
+                        mq.extend(build_side_ladder(t, "bid", close_b[0], ext_ask, n_c,
+                                                    levels=lv_bid, ref_px=close_b[0],
+                                                    band=(rung_lo, pmax_s),
+                                                    hour_mult=hm, min_total=n_c))
+                        rest_b -= n_c
+                    if rest_b > 0:
+                        mq.extend(build_side_ladder(
+                            t, "bid", anc_bid, ext_ask, rest_b, levels=lv_bid,
+                            ref_px=pl_bid_px, band=(rung_lo, pmax_s), hour_mult=hm,
+                            min_total=max(0 if close_on_b else unwind_bid,
+                                          lead_n if lead_on_b else 0)))
             if ext_ask is not None and room_sell > 0 and ask_in_band:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
                 if px_ok:
-                    mq.extend(build_side_ladder(t, "ask", anc_ask, ext_bid, room_sell,
-                                                levels=lv_ask, ref_px=pl_ask_px,
-                                                band=(rung_lo, pmax_s),
-                                                hour_mult=hm,
-                                                min_total=max(unwind_ask, lead_n
-                                                              if lead_on_a else 0)))
+                    rest_a = int(room_sell)
+                    if close_on_a:
+                        n_c = min(close_a[1], rest_a)
+                        mq.extend(build_side_ladder(t, "ask", close_a[0], ext_bid, n_c,
+                                                    levels=lv_ask, ref_px=close_a[0],
+                                                    band=(rung_lo, pmax_s),
+                                                    hour_mult=hm, min_total=n_c))
+                        rest_a -= n_c
+                    if rest_a > 0:
+                        mq.extend(build_side_ladder(
+                            t, "ask", anc_ask, ext_bid, rest_a, levels=lv_ask,
+                            ref_px=pl_ask_px, band=(rung_lo, pmax_s), hour_mult=hm,
+                            min_total=max(0 if close_on_a else unwind_ask,
+                                          lead_n if lead_on_a else 0)))
 
             # quake gate: every bid rung at most the fair cap; asks only on an
             # ask strike whose ask may rest, at the floor or above
@@ -33156,6 +33333,14 @@ class IncentiveMarketMaker:
             if _cl is not None and _cl[0 if q.book_side == "bid" else 1] == q.price_cents:
                 side_cap = max(side_cap, _cl[2])
                 max_level_size = max(max_level_size, _cl[2])
+            # FAIR CLOSE: the side that reduces a fair-lead market's position
+            # may rest the whole of it (the quote loop sized it so)
+            _fp = self.pnl.pos.get(q.ticker, 0.0)
+            if (FAIR_CLOSE_MODE == "on" and series in FAIR_LEAD_SERIES
+                    and abs(_fp) >= 1 and (_fp < 0) == (q.book_side == "bid")):
+                _fc = min(abs(_fp), FAIR_LEAD_MAX_POSITION)
+                side_cap = max(side_cap, _fc)
+                max_level_size = max(max_level_size, _fc)
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
@@ -35509,6 +35694,15 @@ class IncentiveMarketMaker:
                f"{FAIR_LEAD_EVENT_CAP:g}; no hedge"
                + (" (dry: logged, not placed)" if FAIR_LEAD_MODE == "dry" else "")
                if FAIR_LEAD_MODE in ("on", "dry") else ""))
+        log(f"fair close (2026-10-30): {FAIR_CLOSE_MODE}"
+            + (f" -- {', '.join(FAIR_LEAD_SERIES) or 'no series'}: a market holding "
+               f"a position rests the whole of it (up to {FAIR_LEAD_MAX_POSITION:g}) "
+               f"on the side that reduces it, first call on the event's room, a "
+               f"tick ahead of that side's book while that is on our side of the "
+               f"fair and earns, else at the side's own price"
+               + (" (dry: logged, quoted as before)" if FAIR_CLOSE_MODE == "dry"
+                  else "")
+               if FAIR_CLOSE_MODE in ("on", "dry") else ""))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "
