@@ -20161,6 +20161,25 @@ def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]]
     return ((px, n), None) if short else (None, (100 - px, n))
 
 
+def fair_close_mark(book_side: str, lead_px: Optional[int],
+                    yes_ext: List[List[float]], no_ext: List[List[float]],
+                    target: float) -> Optional[int]:
+    """Where `book_side` would rest without its closing rung (FAIR CLOSE): its
+    lead's price while it leads, else the nearer of its external best and
+    its reference (the lower for a bid, the higher for an ask, YES cents) --
+    read off the book WITHOUT our own orders, or a 200-lot resting at its own
+    level would set the mark itself. None when the side has neither."""
+    if lead_px is not None:
+        return lead_px
+    eb, ea = external_best(yes_ext, no_ext)
+    rb, ra = ladder_reference_prices(yes_ext, no_ext, target)
+    if book_side == "bid":
+        xs = [x for x in (eb, rb) if x is not None]
+        return min(xs) if xs else None
+    xs = [x for x in (ea, ra) if x is not None]
+    return max(xs) if xs else None
+
+
 def fair_close_hold(series: str, pos: float) -> bool:
     """FAIR CLOSE keeps a FAIR_LEAD_SERIES market the bot holds a position in
     selected -- past the payout floor, the hopeless exit, the budget and a
@@ -32304,16 +32323,29 @@ class IncentiveMarketMaker:
             else:
                 self._comp_lead_px.pop(t, None)
             # FAIR CLOSE: the closing rung rests at the model's price only where
-            # that beats where the side rests (its reference or anchor, a
-            # lead); it never crosses our own other side
-            _ub = [x for x in (anc_bid, pl_bid_px) if x is not None]
-            _ua = [x for x in (anc_ask, pl_ask_px) if x is not None]
+            # that beats where the side would rest without it (fair_close_mark:
+            # its lead, else its external best and reference, off the book
+            # WITHOUT our orders -- 10/30 16:18Z: SGF's 200 at 58c set its own
+            # mark a cycle after it rested and read as "already as near"); it
+            # never crosses our own other side. The reducing side's own rung
+            # rests at that mark too, so a big closing order never holds its
+            # side where it stands once the model moves.
+            _mb = _ma = None
+            if _cfair is not None:
+                _mb = fair_close_mark("bid", lead_b[0] if lead_on_b else None,
+                                      _cx_yes, _cx_no, meta.target_size)
+                _ma = fair_close_mark("ask", lead_a[0] if lead_on_a else None,
+                                      _cx_yes, _cx_no, meta.target_size)
             close_on_b = (close_b is not None and bool(lv_bid)
-                          and (not _ub or close_b[0] > min(_ub))
+                          and (_mb is None or close_b[0] > _mb)
                           and not (lead_on_a and close_b[0] >= lead_a[0]))
             close_on_a = (close_a is not None and bool(lv_ask)
-                          and (not _ua or close_a[0] < max(_ua))
+                          and (_ma is None or close_a[0] < _ma)
                           and not (lead_on_b and close_a[0] <= lead_b[0]))
+            if close_n and cap_pos < 0 and _mb is not None:
+                pl_bid_px = _mb
+            if close_n and cap_pos > 0 and _ma is not None:
+                pl_ask_px = _ma
             if _cfair is not None:
                 self._fair_close_note(t, close_b if close_on_b else None,
                                       close_a if close_on_a else None, _cpos,

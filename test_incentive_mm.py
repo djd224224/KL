@@ -30934,6 +30934,21 @@ class TestFairClose(unittest.TestCase):
                            52.6, 200.0, 1000.0, 0.5, avg_c=54.0), (None, (56, 200)))
         self.assertIn("FAIR_CLOSE_OVER_C", imm._CONFIG_CODE_KNOBS)
 
+    def test_the_mark_is_read_without_our_own_orders(self):
+        # 10/30 16:18Z: SGF's 200 at 58c, resting, set the reference itself and
+        # its close read as "already as near" the next cycle. The mark is off
+        # the EXTERNAL book: the lead's price while leading, else the nearer
+        # of the best and the reference
+        m = imm.fair_close_mark
+        yes = [[46, 3000.0], [60, 20.0], [70, 10.0], [81, 5.0]]
+        no = [[1, 5000.0], [18, 30.0]]
+        self.assertEqual(m("bid", None, yes, no, 1000.0), 46)
+        self.assertEqual(m("bid", 54, yes, no, 1000.0), 54)
+        self.assertEqual(m("ask", None, yes, no, 1000.0), 99)      # the 1c NO wall
+        # the same book with our 200 at 58c inside it would mark 58c
+        self.assertEqual(m("bid", None, yes + [[58, 200.0]], no, 1000.0), 58)
+        self.assertIsNone(m("bid", None, [], no, 1000.0))
+
     def test_stl_bids_at_the_model_not_in_the_wall(self):
         # 14:48Z: "shuld be higher, not resting with a wall" -- 169 at the 21c
         # reference under a 72.1c fair; at 72c it sits behind 14 bid at 73-75c
