@@ -1388,26 +1388,11 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
          edges   {et_midnight_ts: (snap_ts, book)} -- first snapshot of each ET day
          fine    [(snap_ts, book)] every snapshot at or after fine_from, oldest
                  first (the Movers' short windows)
-         switch  (snap_ts, rebase) of the first snapshot valued at the last
-                 trade that follows one valued at the mark, else None
-         lastkey (first snapshot valued at the last trade?, newest one?,
-                 the first snapshot's rebase)
-         last_mids {ticker: the bot's own mark} of the newest snapshot
-    A position is valued at Kalshi's last trade when its row carries one
-    (last_cents, 2026-10-30 on), as the portfolio email values it, else at
-    the bot's own mark (mark_cents: the external mid, or the last trade
-    clamped inside a wide or one-sided book): "mark" in a book is that value.
-    A rebase is {ticker: ($ value at the last trade less $ at the mark,
-    cents of last trade less mark or None)}: what the change of basis alone
-    moves, kept out of every P&L that spans it (Builder.rebase_in).
     `queries` {key: (ticker, target_ts[, max_lag])} is answered in place with
-    the bot's own mark of the first snapshot at or after target_ts (within
-    max_lag, default MARKOUT_MAX_LAG): the fill mark-outs, which measure the
-    book moving against a fill and stay on the mark. They are resolved while
-    the rows are in memory."""
+    the first snapshot mark at or after target_ts (within max_lag, default
+    MARKOUT_MAX_LAG): the fill mark-outs, resolved while the rows are in
+    memory."""
     snaps = defaultdict(dict)
-    mids = defaultdict(dict)        # the bot's own marks, for the mark-outs
-    on_last = set()                 # snapshots whose rows carry last_cents
     for r in iter_jsonl(path):
         ts = iso_ts(r.get("ts"))
         t = r.get("ticker")
@@ -1417,30 +1402,8 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
         if abs(pos) <= 1e-9:
             continue
         mk = r.get("mark_cents")
-        mk = float(mk) if mk is not None else None
-        val = mk
-        if "last_cents" in r:
-            on_last.add(ts)
-            if r["last_cents"] is not None:
-                val = float(r["last_cents"])
-        snaps[ts][t] = (pos, _f(r.get("avg_cents")), val)
-        mids[ts][t] = mk
+        snaps[ts][t] = (pos, _f(r.get("avg_cents")), (float(mk) if mk is not None else None))
     order = sorted(snaps)
-
-    def rebase(ts):
-        out = {}
-        for t, (pos, avg, val) in snaps[ts].items():
-            mk = mids[ts].get(t)
-            if val == mk:
-                continue
-            u_val = pos * (val - avg) / 100.0 if val is not None else 0.0
-            u_mk = pos * (mk - avg) / 100.0 if mk is not None else 0.0
-            out[t] = (round(u_val - u_mk, 4), (val - mk) if None not in (val, mk) else None)
-        return out
-    switch = next(((b, rebase(b)) for a, b in zip(order, order[1:])
-                   if b in on_last and a not in on_last), None)
-    lastkey = ((order[0] in on_last, order[-1] in on_last,
-                rebase(order[0]) if order[0] in on_last else {}) if order else None)
     totals, hours = [], {}
     for ts in order:
         book = snaps[ts]
@@ -1481,7 +1444,8 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
         for key, q in queries.items():
             want[q[0]].append((q[1], q[2] if len(q) > 2 else MARKOUT_MAX_LAG, key))
         for t, lst in want.items():
-            series = [(ts, mids[ts][t]) for ts in order if mids[ts].get(t) is not None]
+            series = [(ts, snaps[ts][t][2]) for ts in order if t in snaps[ts]
+                      and snaps[ts][t][2] is not None]
             if not series:
                 continue
             stamps = [s[0] for s in series]
@@ -1492,9 +1456,7 @@ def parse_marks_file(path: str, keep_hours: bool, queries=None, max_ts: float = 
     fine = ([(ts, snaps[ts]) for ts in order if ts >= fine_from]
             if fine_from is not None else [])
     return {"totals": totals, "hours": hours if keep_hours else {}, "last": last,
-            "first": first, "gone": gone, "came": came, "edges": edges, "fine": fine,
-            "switch": switch, "lastkey": lastkey,
-            "last_mids": dict(mids[order[-1]]) if order else {}}
+            "first": first, "gone": gone, "came": came, "edges": edges, "fine": fine}
 
 
 # ----------------------------------------------------------------------------
@@ -2157,10 +2119,6 @@ class Builder:
         self.fine_snaps = []             # [(ts, book)] every snapshot since fine_from
         fine_from = self.now - FINE_SPAN
         self.gone, self.came = [], []    # position exits / entries between snapshots
-        # the first snapshot valued at Kalshi's last trade (parse_marks_file):
-        # (ts, rebase), and the newest snapshot's own marks (the mark-outs)
-        self.switch, self.last_mids = None, {}
-        prev_on_last = None              # the previous file's newest snapshot was?
         prev_last = None
         files = day_files("marks", "jsonl", self.first_day)
         live_path = files[-1][1] if files else None
@@ -2225,23 +2183,11 @@ class Builder:
                 for t in pb:
                     if t not in pa:
                         self.came.append((t, first[0]))
-            lk = val.get("lastkey")      # absent from files cached before 10/30
-            if self.switch is None:
-                if val.get("switch"):
-                    self.switch = val["switch"]
-                elif lk and lk[0] and prev_on_last is False:
-                    self.switch = (first[0], lk[2])     # the change fell between two files
-            if lk:
-                prev_on_last = lk[1]
-            elif val["last"][0]:
-                prev_on_last = False
             if val["last"][0]:
                 prev_last = val["last"]
             if path == live_path or val["last"][0] > self.last_snap[0]:
                 if val["last"][0] >= self.last_snap[0]:
                     self.last_snap = val["last"]
-                    self.last_mids = val.get("last_mids") or {
-                        t: v[2] for t, v in val["last"][1].items()}
         cache.prune(keep_names)
         cache.save()
         # a query no file answered (the bot was down for its whole day) is
@@ -2641,9 +2587,6 @@ class Builder:
         rec = getattr(self, "mrec", None) or {}
         traded = {f["t"] for f in self.fills}
         book = self.last_snap[1]
-        # a mark-out stays on the bot's own mark: the book's value is the
-        # last trade since 2026-10-30
-        mids = getattr(self, "last_mids", None) or {}
         for t in traded:
             if t in out:
                 continue
@@ -2652,9 +2595,8 @@ class Builder:
                 out[t] = (float(r["v"]), "settled")
                 continue
             b = book.get(t)
-            mk = mids.get(t, b[2]) if b else None
-            if mk is not None:
-                out[t] = (float(mk), "held")
+            if b and b[2] is not None:
+                out[t] = (float(b[2]), "held")
                 continue
             c = self.last_cycle.get(t)
             if c:
@@ -2694,16 +2636,6 @@ class Builder:
     def book_u(book) -> dict:
         return {t: (pos * (mk - avg) / 100.0 if mk is not None else 0.0)
                 for t, (pos, avg, mk) in book.items()}
-
-    def rebase_in(self, e0: float, e1: float) -> dict:
-        """The switch's rebase {ticker: ($, cents)} when a P&L from snapshot
-        e0 to snapshot e1 spans the first snapshot valued at Kalshi's last
-        trade (e0 before it, e1 at or after it), else {}. Added to the start
-        value, it keeps the change of basis out of that P&L: the part before
-        the switch is measured at the bot's marks, the part after at the
-        last trades."""
-        sw = getattr(self, "switch", None)
-        return sw[1] if sw and e0 < sw[0] <= e1 else {}
 
     def total_u_at(self, t: float):
         """(snap_ts, total unrealized) of the first snapshot at/after t."""
@@ -2806,10 +2738,6 @@ class Builder:
                 m[t]["u1"] = u
                 p, a, mk = s1[1][t]
                 m[t]["pos1"], m[t]["avg1"], m[t]["mk1"] = p, a, mk
-        for t, (r, g) in self.rebase_in(e0, e1).items():
-            m[t]["u0"] += r
-            if g is not None and m[t].get("mk0") is not None:
-                m[t]["mk0"] += g
         for ts, t, _ev, d in self.realized:
             if e0 <= ts < e1:
                 m[t]["real"] += d
@@ -3085,8 +3013,6 @@ class Builder:
         if base is None:
             return []
         e0, u0 = base
-        sw = getattr(self, "switch", None)
-        r_sw = sum(r for r, _g in sw[1].values()) if sw and e0 < sw[0] else 0.0
         events = [(ts, d) for ts, _t, _e, d in self.realized if ts >= e0]
         events += [(e["ts"], e["amount"]) for e in self.exits if e["ts"] >= e0]
         events.sort()
@@ -3111,8 +3037,7 @@ class Builder:
             if tt > h_end * 3600:
                 hour_len = max(1.0, min(self.now, (h_end + 1) * 3600.0) - h_end * 3600.0)
                 rew += rew_h.get(h_end, 0.0) * min(1.0, (tt - h_end * 3600.0) / hour_len)
-            pts.append([round(tt), round(rew, 2),
-                        round(cum_real + ut - u0 - (r_sw if r_sw and et >= sw[0] else 0.0), 2)])
+            pts.append([round(tt), round(rew, 2), round(cum_real + ut - u0, 2)])
             if tt >= w1:
                 break
             t += step
@@ -3164,12 +3089,6 @@ class Builder:
         u0 = defaultdict(float)
         for tk, u in self.book_u(s0[1]).items():
             u0[fam(tk)] += u
-        sw = getattr(self, "switch", None)
-        r_fam = defaultdict(float)       # the switch's rebase per family (rebase_in)
-        if sw and s0[0] < sw[0]:
-            for tk, (r, _g) in sw[1].items():
-                r_fam[fam(tk)] += r
-        last_edge = s0[0]
         out = defaultdict(lambda: {"r": [], "p": []})
         cum, ei, last_u = defaultdict(float), 0, dict(u0)
         h0, h_last = int(w0 // 3600), int(math.ceil(w1 / 3600.0))
@@ -3184,8 +3103,6 @@ class Builder:
                 for tk, u in self.book_u(snap[1]).items():
                     uk[fam(tk)] += u
                 last_u = uk
-                last_edge = snap[0]
-            past_switch = bool(r_fam) and last_edge >= sw[0]
             stop = edge if edge is not None else x
             while ei < len(events) and events[ei][0] < stop:
                 cum[events[ei][1]] += events[ei][2]
@@ -3197,8 +3114,7 @@ class Builder:
                     racc[f_] += lst[rptr[f_]][1]
                     rptr[f_] += 1
                 out[f_]["r"].append(round(racc[f_], 2))
-                out[f_]["p"].append(round(cum[f_] + last_u.get(f_, 0.0) - u0.get(f_, 0.0)
-                                          - (r_fam.get(f_, 0.0) if past_switch else 0.0), 2))
+                out[f_]["p"].append(round(cum[f_] + last_u.get(f_, 0.0) - u0.get(f_, 0.0), 2))
         keep = {f_: v for f_, v in out.items() if any(v["r"]) or any(v["p"])}
         return {"x": [round(x) for x in xs], "f": keep}
 
@@ -3290,8 +3206,7 @@ class Builder:
                     ex = self.exits_in(u0[0], u1[0])
                     real += sum(e["amount"] for e in ex if e["realized"])
                     xf = sum(e["amount"] for e in ex if not e["realized"])
-                    pnl = real + xf + u1[1] - u0[1] - sum(
-                        r for r, _g in self.rebase_in(u0[0], u1[0]).values())
+                    pnl = real + xf + u1[1] - u0[1]
                     row["pnl"] = round(pnl, 2)
                     row["real"] = round(real, 2)
                     row["net"] = round(rew + pnl, 2)     # from the unrounded parts
@@ -3608,9 +3523,6 @@ class Builder:
         t0 = time.time()
         model["acct"] = self._account(model)
         self._t("account", t0)
-        # positions are valued at Kalshi's last trade from this snapshot on
-        # (parse_marks_file), at the bot's own marks before it
-        model["last_from"] = round(self.switch[0]) if self.switch else None
         return model
 
     def _account(self, model):
@@ -3736,9 +3648,6 @@ class Builder:
                 real_by_t[e["t"]].append((e["ts"], e["amount"]))
         for t in real_by_t:
             real_by_t[t].sort()
-        # the switch's rebase (rebase_in) for paths that start before it
-        sw = getattr(self, "switch", None)
-        rb = sw[1] if sw and self.hour_snaps[hours[0]][0] < sw[0] else {}
         for t in pick:
             P, R, K, Q = [], [], [], []
             cum_real = 0.0
@@ -3746,7 +3655,6 @@ class Builder:
             rl = real_by_t.get(t, [])
             hs = self.hourly.get(t, {})
             cum_rew = 0.0
-            r_t = (rb.get(t) or (0.0, None))[0]
             for h in hours:
                 ts, hb = self.hour_snaps[h]
                 while ri < len(rl) and rl[ri][0] < ts:
@@ -3754,8 +3662,6 @@ class Builder:
                     ri += 1
                 v = hb.get(t)
                 u = v[0] * (v[2] - v[1]) / 100.0 if (v and v[2] is not None) else 0.0
-                if r_t and ts >= sw[0]:
-                    u -= r_t
                 cum_rew += hs.get(h - 1, 0.0)
                 P.append(round(cum_real + u, 2))
                 R.append(round(cum_rew, 2))
