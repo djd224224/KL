@@ -104,7 +104,7 @@ class TestHedgesAndVerdict(unittest.TestCase):
                         fills=[{"ticker": "A"}])
         self.assertEqual(ctx["level"], "OK")
         self.assertAlmostEqual(ctx["hedges"]["locked"], 44.0)
-        self.assertIn("1 hedged (+$44.00 locked) | OK", cm.subject_for(ctx))
+        self.assertIn("locks +$44.00, net +$44.00 | OK", cm.subject_for(ctx))
 
     def test_problems_and_watches(self):
         self.assertEqual(self._ctx(rows=[{"kind": "expired", "job": "j"}])["level"],
@@ -148,7 +148,7 @@ class TestHedgesAndVerdict(unittest.TestCase):
         self.assertIn("ladder_bid: 1 of 2 locked", text)
         self.assertIn("locked KXR-26NOV-4 30 at +2.0c a contract (ladder_bid: KXR-26NOV-5 29)",
                       text)
-        self.assertIn("1 other fill locked (+$0.61)", cm.subject_for(ctx))
+        self.assertIn("locks +$0.61, net +$0.61 | OK", cm.subject_for(ctx))
 
     def test_the_report_renders_from_files(self):
         day = date(2026, 10, 29)
@@ -168,8 +168,8 @@ class TestHedgesAndVerdict(unittest.TestCase):
         text = cm.render_text(ctx)
         self.assertEqual(ctx["level"], "OK")
         self.assertIn("KXK-30-JDON ask: 200 @ 60c, own best 71c, siblings imply 38c", text)
-        self.assertIn("LEAD FILLS: 1", text)
-        self.assertIn("1 locked (+$44.00)", text)
+        self.assertIn("the 1 fill at a lead is worth +$0.00 now; locks completed +$44.00", text)
+        self.assertIn("1 fill (200 contracts) +$0.00 now, 1 with no mark", text)
         self.assertTrue(text.isascii())
 
 
@@ -205,16 +205,104 @@ class TestFairLeads(unittest.TestCase):
                    hedges=h, est={})
         ctx["level"], ctx["reasons"] = cm.verdict(ctx)
         self.assertEqual(ctx["level"], "OK")                 # no hedge job is expected
-        self.assertIn("1 side led, 0 lead fills", cm.subject_for(ctx))
-        self.assertIn("1 fair-led (1 fill) | OK", cm.subject_for(ctx))
+        self.assertEqual(cm.subject_for(ctx), "IMM leads 10/29: earned $0.00 while leading, "
+                                              "1 lead fill +$0.00 now, net +$0.00 | OK")
         text = cm.render_text(ctx)
-        self.assertIn("LEADS: 1 side(s) led during the day", text)
-        self.assertIn(f"FAIR LEADS (off our model's fair, at least {imm.FAIR_LEAD_MARGIN_C}c inside it): 1 side(s)",
-                      text)
+        self.assertIn("  complement  1 side on 1 market (from 05:00 ET)", text)
+        self.assertIn("  fair        1 side on 1 market (from 02:00 ET): $0.00 while leading; "
+                      "1 fill (200 contracts) +$0.00 now, 1 with no mark", text)
+        self.assertIn(f"ALL FAIR LEADS by event, at least {imm.FAIR_LEAD_MARGIN_C}c inside "
+                      f"the fair", text)
+        self.assertIn("NEEDS A LOOK: nothing.", text)
         self.assertIn("KXRAINWKND-26OCT31-SGF bid: 200 @ 54c, own best 48c, fair 69c; "
                       "led 2.0h, ended", text)
         self.assertIn("KXRAINWKND-26OCT31-SGF bought 200 @ 54c", text)
         self.assertTrue(text.isascii())
+
+
+class TestMoney(unittest.TestCase):
+    """The email leads with the money (Jack 2026-10-30: "clean up this email
+    and make it clear the takeaway"): the reward each market accrued while it
+    led, the lead fills marked to now, the locks, and their net."""
+
+    def test_reward_while_leading_is_pro_rata_by_hour_and_counted_once(self):
+        h0 = _ts(10)
+        leads = {("T1", "bid"): {"spans": [[h0 + 1800, h0 + 5400]]},
+                 ("T1", "ask"): {"spans": [[h0 + 3600, h0 + 5400]]},   # inside the bid's
+                 ("T2", "ask"): {"spans": [[h0, h0 + 600]]}}
+        hourly = {"T1": {int(h0 // 3600): 1.0, int(h0 // 3600) + 1: 2.0},
+                  "T2": {int(h0 // 3600): 6.0}}
+        r = cm.lead_rewards(leads, hourly)
+        self.assertAlmostEqual(r["T1"], 0.5 * 1.0 + 0.5 * 2.0)   # half of each hour
+        self.assertAlmostEqual(r["T2"], 1.0)                     # 10 of 60 minutes
+        self.assertEqual(cm.lead_rewards(leads, {})["T1"], 0.0)
+
+    def test_the_cache_marks_and_settlements_are_read(self):
+        d = imm.STATUS_DIR
+        a, b = cm.day_window(date(2026, 10, 29))
+        hour = int(a // 3600) + 2
+        with open(os.path.join(d, cm.HOURLY_CACHE_FILE), "w", encoding="utf-8") as f:
+            json.dump({"cycle_log_2026-10-29.csv": {"sig": "x", "markets": {
+                "T1": {str(hour): 0.75}}}}, f)
+        hourly, covered = cm.load_hourly(a, b)
+        self.assertEqual((hourly["T1"][hour], covered), (0.75, (hour + 1) * 3600.0))
+        with open(os.path.join(d, "marks_2026-10-30.jsonl"), "w", encoding="utf-8") as f:
+            for t, m in (("T1", 50.0), ("T2", 30.0), ("T1", 55.0)):
+                f.write(json.dumps({"ticker": t, "mark_cents": m}) + "\n")
+        with open(os.path.join(d, "settlements_2026-10-30.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ticker": "T2", "result": "yes", "ts": _ts(1, d=30)}) + "\n")
+        marks = cm.load_marks(a, _ts(12, d=30))
+        self.assertEqual((marks["T1"], marks["T2"]), (55.0, 100.0))   # latest; settled
+        fills = cm.value_fills([dict(ticker="T1", side="bid", count=100.0, px=40.0),
+                                dict(ticker="T2", side="ask", count=10.0, px=60.0),
+                                dict(ticker="T9", side="bid", count=5.0, px=10.0)], marks)
+        self.assertEqual([f["usd"] for f in fills], [15.0, -4.0, None])
+
+    def test_the_takeaway_nets_reward_fills_and_locks_without_double_counting(self):
+        leads = {("T1", "bid"): {"spans": [[_ts(6), _ts(9)]], "kind": "comp", "px": 40,
+                                 "best": 35, "implied": 50, "who": "T2's book",
+                                 "leading_at_end": False},
+                 ("W1", "ask"): {"spans": [[_ts(6), _ts(7)]], "kind": "fair", "px": 62,
+                                 "best": 59, "implied": 57, "leading_at_end": True}}
+        fills = [dict(ticker="T1", side="bid", count=100.0, px=40.0, kind="comp", ts=_ts(7),
+                      mark=45.0, usd=5.0),
+                 dict(ticker="W1", side="ask", count=200.0, px=62.0, kind="fair", ts=_ts(8),
+                      mark=42.0, usd=40.0)]
+        h = cm.hedge_summary([{"kind": "open", "job": "j1"},
+                              {"kind": "done", "job": "j1", "ticker": "T1", "side": "bid",
+                               "edge_c": 3.0, "count": 100}], [], _ts(12))
+        ctx = dict(day="2026-10-29", leads=leads, groups=None, fills=fills, hedges=h, est={},
+                   rewards={"T1": 1.25, "W1": 0.25}, now="2026-10-30T12:00:00+00:00")
+        ctx["level"], ctx["reasons"] = cm.verdict(ctx)
+        T = cm.totals(ctx)
+        # T1's fill is locked: its +3c a contract counts once, in the locks
+        self.assertEqual((T["comp"]["fills_usd"], T["fair"]["fills_usd"], T["locks"]),
+                         (0.0, 40.0, 3.0))
+        self.assertAlmostEqual(T["net"], 1.25 + 0.25 + 40.0 + 3.0)
+        self.assertEqual(cm.subject_for(ctx), "IMM leads 10/29: earned $1.50 while leading, "
+                                              "2 lead fills +$40.00 now, locks +$3.00, "
+                                              "net +$44.50 | OK")
+        text = cm.render_text(ctx)
+        self.assertIn("TAKEAWAY: leading earned about $1.50; the 2 fills at a lead are worth "
+                      "+$40.00 now; locks completed +$3.00. Net about +$44.50.", text)
+        self.assertIn("$  1.25  T1 bid 40c (complement, led 3.0h)", text)
+        self.assertIn("W1 sold 200 @ 62c, now 42c: +$40.00  (fair: rides to settlement", text)
+        self.assertIn("T1 bought 100 @ 40c, now 45c: +$5.00  (complement: locked", text)
+
+    def test_a_stuck_lock_names_its_market_and_what_is_left(self):
+        job = {"id": "KXA-1-ask-x", "ticker": "KXA-1", "side": "ask", "count": 12.0,
+               "price": 53.0, "at": _ts(9), "until": _ts(9, 10), "best": 2.1,
+               "waiting": True, "legs": {"KXA-2": {"filled": 12.0}}}
+        h = cm.hedge_summary([], [job], _ts(12))
+        ctx = dict(day="2026-10-29", leads={}, groups=None, fills=[], hedges=h, est={},
+                   now=datetime.fromtimestamp(_ts(12), timezone.utc).isoformat())
+        level, reasons = cm.verdict(ctx)
+        ctx.update(level=level, reasons=reasons)
+        self.assertEqual(level, "PROBLEM")
+        self.assertIn("KXA-1: the lock on a fill (sold 12 @ 53c) has been half done for 3h -- "
+                      "12 of KXA-2 traded, the other legs not; best floor +2.1c a contract; "
+                      "its legs' books are off the feed; its watch ended", reasons[0])
+        self.assertTrue(cm.subject_for(ctx).endswith("| PROBLEM: 1 lock half done 3h"))
 
 
 if __name__ == "__main__":
