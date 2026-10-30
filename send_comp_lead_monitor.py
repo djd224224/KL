@@ -27,6 +27,9 @@ then 5c from 2026-10-30: "be willing to go to 5c of the model if
 necessary"). Those log `fair lead`
 lines, get their own section, and their fills ride as inventory (nothing
 hedges a city's market), so they never count toward the hedge verdict.
+Since 2026-10-30 (Jack: "Yes, extend it") the Vercel family leads off its
+fair the same way; a Vercel strike's fill is a ladder strike's, so it opens
+a lock job off the other strikes like any lead fill there.
 
 ONE EMAIL per ET day (the day before), THE TAKEAWAY FIRST (Jack 2026-10-30:
 "really $0 for complement lead? clean up this email and make it clear the
@@ -706,7 +709,7 @@ def render_text(ctx) -> str:
     lk = h["locks"]
     nf = T["comp"]["fills"] + T["fair"]["fills"]
     out = [f"Leads, {day:%a %m/%d} (ET day) -- complement leads price off other markets' "
-           f"books, fair leads off our weekend-rain model", ""]
+           f"books, fair leads off our models (weekend rain, Vercel)", ""]
     # THE TAKEAWAY: the money, then what (if anything) needs doing
     rew_all = T["comp"]["reward"] + T["fair"]["reward"]
     fills_all = T["comp"]["fills_usd"] + T["fair"]["fills_usd"]

@@ -14030,9 +14030,11 @@ class TestOpenRouterShareFairGate(unittest.TestCase):
                 self.assertFalse(imm.yield_size_eligible(s), s)
                 self.assertEqual(imm.event_cap_contracts(f"{s}-26OCT05"), imm.SHARE_EVENT_CAP)
         self.assertEqual(imm.SHARE_EVENT_CAP, 100)
-        # Vercel's open-weights series is not this family
+        # Vercel's open-weights series is not this family (a fair-lead family
+        # since 2026-10-30: the larger of its leads' room and its own)
         self.assertEqual(imm.event_cap_contracts("KXOPENSOURCESHARE-26OCT05"),
-                         imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXOPENSOURCESHARE"))
+                         max(imm.FAIR_LEAD_EVENT_CAP, imm.MAX_EVENT_CONTRACTS
+                             * imm.applied_mention_mult("KXOPENSOURCESHARE")))
         self.assertIn("SHARE_EVENT_CAP", imm._CONFIG_CODE_KNOBS)
         # the cap binds the quote loop: an event net long past it bids no
         # strike and still offers (a small cap here keeps the per-market
@@ -30811,6 +30813,171 @@ class TestFairLead(unittest.TestCase):
                 bot._comp_hedge_on_fill(fill, self.T, "yes", "buy", 200.0, 54.0,
                                         time.time(), pos_before=0.0, pos_after=200.0)
             self.assertEqual([j.get("need_group") for j in bot._comp_hedges], [True])
+
+
+class TestVercelFairLead(unittest.TestCase):
+    """Jack 2026-10-30: "Yes, extend it" -- FAIR LEAD on the Vercel family,
+    after "why isnt KXOPENVREQ-02NOV26 quoting": fifteen minutes after the
+    02NOV26 cohort listed, every strike had one wall a side far from the
+    model, and 61 of its 63 strikes stood down under the payout bar.
+    Fixture: KXOPENVREQ-02NOV26-T19.8's 17:50Z book on TestVercelPreDGate's
+    far event (D = 2068-12-05), whose fair reads 40c at T20."""
+
+    T = "KXOPENVREQ-05DEC68-T20"
+    EV = "KXOPENVREQ-05DEC68"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+    # 6,837 YES at 7c and 6,490 NO at 13c (YES 87c), a few 1-3c crumbs
+    YES = [[1, 1], [2, 100], [7, 6837]]
+    NO = [[1, 1], [2, 100], [3, 1], [13, 6490]]
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+        try:
+            os.remove(imm.VERCEL_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, age_secs=0.0):
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        entry = {"x_l": 20.0, "errs": [-1.0, -0.5, 0.0, 0.5, 1.0] * 12,
+                 "last": "2068-12-03", "d": "2068-12-05", "h": 2, "n": 60,
+                 "series": "KXOPENVREQ", "fetched_at": fetched}
+        with open(imm.VERCEL_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": {self.EV: entry}}, f)
+        os.utime(imm.VERCEL_FAIR_FILE,
+                 (time.time(), time.time() + TestVercelFairLead._bump))
+        TestVercelFairLead._bump += 1
+        return imm.load_vercel_fair()
+
+    def test_the_family_leads_and_closes_off_the_fair_its_gate_reads(self):
+        for s in imm.VERCEL_SERIES:
+            self.assertIn(s, imm.FAIR_LEAD_SERIES, s)
+            self.assertTrue(imm.fair_lead_series(s), s)
+        self.assertIn("KXRAINWKND", imm.FAIR_LEAD_SERIES)
+        now = time.time()
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXOPENVREQ", now))   # no read
+        self._write()
+        self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXOPENVREQ", now), 40.0)
+        self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXOPENVREQ", now), 40.0)
+        # nothing where the gate stands the strike aside: decided, stale, the
+        # measured day near, a new anchor's hold
+        self.assertIsNone(imm.fair_lead_fair_c(f"{self.EV}-T30", "KXOPENVREQ", now))
+        self.assertIsNone(imm.fair_lead_fair_c(
+            self.T, "KXOPENVREQ", now + imm.VERCEL_FAIR_TTL_MIN * 60 + 10))
+        d0 = datetime(2068, 12, 5, tzinfo=timezone.utc).timestamp()
+        self.assertIsNone(imm.fair_lead_fair_c(
+            self.T, "KXOPENVREQ", d0 - imm.VERCEL_CUTOFF_BEFORE_D_MIN * 60))
+        imm._vercel_state["moved_at"][self.EV] = now
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXOPENVREQ", now))
+        self.assertIsNone(imm.fair_close_fair_c(self.T, "KXOPENVREQ", now))
+        imm._vercel_state["moved_at"].clear()
+        # IMM_FAIR_LEAD_SERIES=KXRAINWKND takes the family out of both
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXRAINWKND",)):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXOPENVREQ", now))
+            self.assertIsNone(imm.fair_close_fair_c(self.T, "KXOPENVREQ", now))
+        # the lead's switch leaves the close on; the family's own takes both
+        with mock.patch.object(imm, "FAIR_LEAD_MODE", "off"):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXOPENVREQ", now))
+            self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXOPENVREQ", now), 40.0)
+        with mock.patch.object(imm, "VERCEL_ENABLE", False):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXOPENVREQ", now))
+            self.assertIsNone(imm.fair_close_fair_c(self.T, "KXOPENVREQ", now))
+
+    def test_a_ladder_strike_leads_off_the_model_not_its_strikes(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        lad = [f"{self.EV}-T19", self.T, f"{self.EV}-T21"]
+        bot._ladders = {t: lad for t in lad}
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXOPENVREQ",
+                              dollars_per_day=11.42, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None, close_time=self.CLOSE,
+                              mid_cents=47.0, spread_cents=80, volume=0.0)
+        self.assertEqual(bot._lead_source(meta), "comp")          # no fair read yet
+        self._write()
+        self.assertEqual(bot._lead_source(meta), "fair")
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXRAINWKND",)):
+            self.assertEqual(bot._lead_source(meta), "comp")
+
+    def test_t19_8s_walls_lead_both_sides(self):
+        # 200 at 17c takes 96.8% of the bid side over the 6,837 at 7c (16c
+        # would take 93.7%); the 40.7c fair caps the bid at 35c. The ask: 200
+        # at 77c (NO 23c) takes 96.9% over the 6,490 at NO 13c, floor 46c
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 40.7, 1000.0, 0.5),
+                         ((17, 35, 7), (77, 46, 87)))
+        lead = imm.estimate_reward_share(self.YES, self.NO, [("bid", 17, 200.0),
+                                                             ("ask", 77, 200.0)],
+                                         1000.0, 0.5, own_in_book=False)[0]
+        joined = imm.estimate_reward_share(self.YES, self.NO, [("bid", 7, 60.0),
+                                                               ("ask", 87, 60.0)],
+                                           1000.0, 0.5, own_in_book=False)[0]
+        self.assertAlmostEqual(lead, 0.968, places=3)
+        self.assertLess(joined, 0.01)
+
+    def _cycle(self):
+        _clean_persist()
+        self._write()
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.0700", "yes_ask_dollars": "0.8700",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {}
+        for o in bot.state.sim_orders.values():
+            if (o["ticker"] == self.T
+                    and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS):
+                rungs.setdefault(o["book_side"], []).append(
+                    (o["yes_price"], int(o["remaining_count"])))
+        return bot, rungs, lines
+
+    def test_the_quote_loop_leads_both_walls_with_200(self):
+        bot, rungs, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertIn((17, 200), rungs.get("bid", []), rungs)
+        self.assertIn((77, 200), rungs.get("ask", []), rungs)
+        self.assertEqual(bot._comp_lead_px, {self.T: (17, 77, 200)})
+        for side, px, own in (("bid", 17, 7), ("ask", 77, 87)):
+            self.assertTrue(any(f"fair lead {self.T} {side}: 200 @ {px}c, ahead of its "
+                                f"own {own}c; the Vercel fair implies 40c" in s
+                                for s in lines), lines)
+
+    def test_a_held_position_closes_at_the_vercel_fair(self):
+        self.assertTrue(imm.fair_close_hold("KXOPENVREQ", 200.0))
+        self.assertFalse(imm.fair_close_hold("KXOPENVREQ", 0.0))
+        # long 200 off the 17c lead: the close offers it at the 40c model,
+        # far ahead of the 87c wall
+        self.assertEqual(imm.fair_close_group(self.YES, self.NO, 40.0, 200.0, 1000.0, 0.5),
+                         (None, (40, 200)))
 
 
 class TestFairClose(unittest.TestCase):

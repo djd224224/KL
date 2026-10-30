@@ -15529,6 +15529,18 @@ def vercel_side_out(series: str, ticker: str, now_ts: float,
     return vercel_gate(ticker, now_ts, ext_bid, ext_ask, close_time)[1].get("side_out")
 
 
+def vercel_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """`ticker`'s Vercel fair (YES cents) while the family's gate reads it --
+    a fresh read, no new-anchor hold, before the measured day, not decided --
+    else None: FAIR LEAD's view of the family (the gate's book tests apart)."""
+    if vercel_gate_reason(ticker, now_ts, None, None)[0]:
+        return None
+    ev, _, ks = ticker.rpartition("-")
+    m = _VERCEL_STRIKE_RE.match(ks)
+    return vercel_fair_p(_vercel_state["entries"][ev],
+                         float(f"{m.group(1)}.{m.group(2) or 0}")) * 100.0
+
+
 # ----------------------------------------------------------------------------
 # YOUTUBE #2 TOP-VIDEO PILOT (Jack 2026-10-05: "go ship the youtube #2
 # pilot"). KXYTTOPVIDEOG2D / KXYTTOPVIDEO2D-<YYMMMDD>-<video>: "Will <video>
@@ -19953,9 +19965,27 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # (the family's gate stands the market aside anyway). Logs: `fair lead <t>
 # bid: 200 @ 54c, ahead of its own 52c; the weekend rain fair implies 69c`.
 # IMM_FAIR_LEAD=dry logs the leads without placing them, off disables.
+# THE VERCEL FAMILY TOO (Jack 2026-10-30: "Yes, extend it", after "why isnt
+# KXOPENVREQ-02NOV26 quoting"). Fifteen minutes after the 02NOV26 cohort
+# listed at 16:55Z, every strike of the seven lab series had one wall a side
+# far from the model: KXOPENVREQ-02NOV26-T19.8 had 6,837 YES at 7c and 6,490
+# NO at 13c against a 40.7c fair, and T20.9-T24.7 ~48,000 YES at 1c. A rung
+# joining them earned $0.02-0.15/day of a strike's $11.42/day pool, so 61 of
+# the 63 strikes stood down under the payout bar; the 30OCT26 cohort's walls
+# had taken a day or two to build. The family's fair is vercel_fair's, read
+# as its gate reads it (vercel_fair_c: fresh, no new-anchor hold, before the
+# measured day, not decided), and it leads on a ladder too: a market with a
+# readable model fair takes its leads off the model, not off its strikes'
+# books (_lead_source), which priced nothing there. The disagreement guard
+# (10c) is inside the family's own 15c band, and a side whose own touch is
+# out of band (a 1c bid, a 99c offer) still does not lead. With the leads
+# come the family's FAIR CLOSE, its held-position selection and LEAD
+# INVENTORY below. On the 17:50Z books the lead took ~97% of each side it
+# led. IMM_FAIR_LEAD_SERIES=KXRAINWKND takes the family out.
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
-    {s.strip() for s in os.environ.get("IMM_FAIR_LEAD_SERIES", "KXRAINWKND").split(",")
+    {s.strip() for s in os.environ.get(
+        "IMM_FAIR_LEAD_SERIES", ",".join(["KXRAINWKND"] + sorted(VERCEL_SERIES))).split(",")
      if s.strip()}))
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
@@ -19997,17 +20027,27 @@ def fair_lead_series(series: str) -> bool:
             and series in FAIR_LEAD_SERIES)
 
 
-def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
-    """The fair (YES cents) `ticker` leads off, or None: weekend rain's
-    (rain_wknd_fair.py) while its gate would still read it fresh."""
-    if not fair_lead_series(series):
+def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+    """A FAIR_LEAD_SERIES market's model fair (YES cents) while its family's
+    gate would still read it, else None: weekend rain's (rain_wknd_fair.py)
+    or the Vercel family's (vercel_fair_c)."""
+    if series not in FAIR_LEAD_SERIES:
         return None
     if rain_wknd_series(series):
         e = _rain_wknd_state["markets"].get(ticker)
         if e is None or now_ts - e["ts"] > RAIN_WKND_TTL_MIN * 60:
             return None
         return float(e["p"]) * 100.0
+    if vercel_series(series):
+        return vercel_fair_c(ticker, now_ts)
     return None
+
+
+def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
+    """The fair (YES cents) `ticker` leads off, or None (fair_model_c)."""
+    if not fair_lead_series(series):
+        return None
+    return fair_model_c(ticker, series, now_ts)
 
 
 def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
@@ -20095,15 +20135,11 @@ FAIR_CLOSE_OVER_C = max(0, _env_int("IMM_FAIR_CLOSE_OVER_C", 1))
 
 def fair_close_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
     """The fair (YES cents) a FAIR_LEAD_SERIES market closes off, or None:
-    weekend rain's while its gate would still read it fresh, under
+    its family's while its gate would still read it (fair_model_c), under
     FAIR_CLOSE_MODE's own switch (a lead switched off still closes)."""
-    if (FAIR_CLOSE_MODE not in ("on", "dry") or LADDER_MODE != "atref"
-            or series not in FAIR_LEAD_SERIES or not rain_wknd_series(series)):
+    if FAIR_CLOSE_MODE not in ("on", "dry") or LADDER_MODE != "atref":
         return None
-    e = _rain_wknd_state["markets"].get(ticker)
-    if e is None or now_ts - e["ts"] > RAIN_WKND_TTL_MIN * 60:
-        return None
-    return float(e["p"]) * 100.0
+    return fair_model_c(ticker, series, now_ts)
 
 
 def fair_close_group(yes_levels: List[List[float]], no_levels: List[List[float]],
@@ -28078,13 +28114,15 @@ class IncentiveMarketMaker:
         return t in self._comp_groups or t in self._ladders
 
     def _lead_source(self, meta) -> Optional[str]:
-        """Where `meta`'s leads would come from: "comp" (other markets' books:
-        the complement lead), "fair" (its fresh model fair: FAIR LEAD) or
-        None. Each mode's own switch applies (lead_mode)."""
-        if self._comp_linked(meta.ticker) and comp_lead_series(meta.series):
-            return "comp"
+        """Where `meta`'s leads would come from: "fair" (its fresh model fair:
+        FAIR LEAD -- first, so a Vercel ladder strike leads off the model,
+        not off its strikes' walls), "comp" (other markets' books: the
+        complement lead) or None. Each mode's own switch applies
+        (lead_mode)."""
         if fair_lead_fair_c(meta.ticker, meta.series, time.time()) is not None:
             return "fair"
+        if self._comp_linked(meta.ticker) and comp_lead_series(meta.series):
+            return "comp"
         return None
 
     def _comp_books(self, tickers) -> List[Tuple[str, List[List[float]], List[List[float]]]]:
@@ -28140,8 +28178,9 @@ class IncentiveMarketMaker:
         (None, None) without a group, outside the scope, on a sub-penny book
         or when the feed cannot serve every sibling's book. A threshold
         ladder's strike leads off the other strikes' books (ladder_lead_group;
-        a strike off the feed is left out). A market no other book prices
-        leads off its fresh model fair (fair_lead_group, FAIR LEAD)."""
+        a strike off the feed is left out). A market with a fresh model fair
+        leads off it instead (fair_lead_group, FAIR LEAD), a Vercel ladder
+        strike included."""
         t = meta.ticker
         src = self._lead_source(meta)
         if src is None or meta.price_step < 0.01:
@@ -28223,6 +28262,7 @@ class IncentiveMarketMaker:
                      else (f"its {max(len(grp) - 1, 0)} siblings' books", "imply"))
         if src == "fair":
             who, verb = (("the weekend rain fair" if rain_wknd_series(series_of(t))
+                          else "the Vercel fair" if vercel_series(series_of(t))
                           else "its model fair"), "implies")
         for side, lead in (("bid", lead_b), ("ask", lead_a)):
             if src != "fair" and not grp and t in self._ladders:
@@ -28404,7 +28444,8 @@ class IncentiveMarketMaker:
             lk = self._lock_kind(tkr, book_side)
             # a lead's fill booked before the groups are read (the startup
             # reconcile) waits for its group; any other needs one now -- and a
-            # FAIR lead's has none to wait for (its family is never grouped)
+            # FAIR lead's has none to wait for (weekend rain is never grouped;
+            # a Vercel strike's fill locks off its ladder like any other)
             if lk is None and (not on_lead or self._comp_linked(tkr)
                                or series_of(tkr) in FAIR_LEAD_SERIES):
                 return
