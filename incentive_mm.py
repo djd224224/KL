@@ -11189,6 +11189,7 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
     "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
     "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
+    "FAIR_LEAD_PAST_BAND",        # leads past the band, ahead of the touch (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
     # bait-fingerprint stop (2026-10-22)

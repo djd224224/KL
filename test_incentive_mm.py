@@ -31302,6 +31302,7 @@ class TestVercelFairLead(unittest.TestCase):
         self.assertEqual((on.quotable_sides, off.quotable_sides), (2, 1))
         self.assertAlmostEqual(on.est_frac, 0.965, places=3)
         self.assertAlmostEqual(off.est_frac, 0.479, places=3)
+        self.assertIn("FAIR_LEAD_PAST_BAND", imm._CONFIG_CODE_KNOBS)
 
 
 class TestFairClose(unittest.TestCase):
