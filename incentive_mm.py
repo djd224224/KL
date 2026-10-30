@@ -32227,38 +32227,40 @@ class IncentiveMarketMaker:
                 px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
                     or ext_bid >= pmin_s
                 if px_ok:
-                    rest_b = int(room_buy)
-                    if close_on_b:
-                        n_c = min(close_b[1], rest_b)
-                        mq.extend(build_side_ladder(t, "bid", close_b[0], ext_ask, n_c,
-                                                    levels=lv_bid, ref_px=close_b[0],
-                                                    band=(rung_lo, pmax_s),
-                                                    hour_mult=hm, min_total=n_c))
-                        rest_b -= n_c
+                    n_c = min(close_b[1], int(room_buy)) if close_on_b else 0
+                    rest_b = int(room_buy) - n_c
+                    # the side's own rung first: the diff then resizes an old
+                    # rung into it and places the closing rung beside it
                     if rest_b > 0:
                         mq.extend(build_side_ladder(
                             t, "bid", anc_bid, ext_ask, rest_b, levels=lv_bid,
                             ref_px=pl_bid_px, band=(rung_lo, pmax_s), hour_mult=hm,
                             min_total=max(0 if close_on_b else unwind_bid,
                                           lead_n if lead_on_b else 0)))
+                    if n_c:
+                        mq.extend(build_side_ladder(t, "bid", close_b[0], ext_ask, n_c,
+                                                    levels=lv_bid, ref_px=close_b[0],
+                                                    band=(rung_lo, pmax_s),
+                                                    hour_mult=hm, min_total=n_c))
             if ext_ask is not None and room_sell > 0 and ask_in_band:
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
                 if px_ok:
-                    rest_a = int(room_sell)
-                    if close_on_a:
-                        n_c = min(close_a[1], rest_a)
-                        mq.extend(build_side_ladder(t, "ask", close_a[0], ext_bid, n_c,
-                                                    levels=lv_ask, ref_px=close_a[0],
-                                                    band=(rung_lo, pmax_s),
-                                                    hour_mult=hm, min_total=n_c))
-                        rest_a -= n_c
+                    n_c = min(close_a[1], int(room_sell)) if close_on_a else 0
+                    rest_a = int(room_sell) - n_c
+                    # the side's own rung first: the diff then resizes an old
+                    # rung into it and places the closing rung beside it
                     if rest_a > 0:
                         mq.extend(build_side_ladder(
                             t, "ask", anc_ask, ext_bid, rest_a, levels=lv_ask,
                             ref_px=pl_ask_px, band=(rung_lo, pmax_s), hour_mult=hm,
                             min_total=max(0 if close_on_a else unwind_ask,
                                           lead_n if lead_on_a else 0)))
+                    if n_c:
+                        mq.extend(build_side_ladder(t, "ask", close_a[0], ext_bid, n_c,
+                                                    levels=lv_ask, ref_px=close_a[0],
+                                                    band=(rung_lo, pmax_s),
+                                                    hour_mult=hm, min_total=n_c))
 
             # quake gate: every bid rung at most the fair cap; asks only on an
             # ask strike whose ask may rest, at the floor or above
@@ -33377,12 +33379,18 @@ class IncentiveMarketMaker:
                 side_cap = max(side_cap, _cl[2])
                 max_level_size = max(max_level_size, _cl[2])
             # FAIR CLOSE: the side that reduces a fair-lead market's position
-            # may rest the whole of it (the quote loop sized it so)
+            # may rest the whole of it (the quote loop sized it so), and with
+            # a closing rung ahead of the book its own ladder beside it -- an
+            # old rung the diff is resizing still counts at its old size here
+            # (10/30 14:19:45Z: LEX's 16 ahead "blocked at 60/60")
             _fp = self.pnl.pos.get(q.ticker, 0.0)
             if (FAIR_CLOSE_MODE == "on" and series in FAIR_LEAD_SERIES
                     and abs(_fp) >= 1 and (_fp < 0) == (q.book_side == "bid")):
                 _fc = min(abs(_fp), FAIR_LEAD_MAX_POSITION)
-                side_cap = max(side_cap, _fc)
+                if self._fair_close_px.get(q.ticker, ("",))[0] == q.book_side:
+                    side_cap += _fc
+                else:
+                    side_cap = max(side_cap, _fc)
                 max_level_size = max(max_level_size, _fc)
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)

@@ -30991,6 +30991,22 @@ class TestFairClose(unittest.TestCase):
         self.assertEqual(rungs, [("ask", 59, 150)])
         self.assertEqual(bot._fair_close_px, {self.T: ("ask", 59)})
 
+    def test_the_backstop_takes_the_closing_rung_beside_the_old_rung(self):
+        # 10/30 14:19:45Z: LEX's 16 ahead of the book was "blocked at 60/60" --
+        # the side's old rung still counted at its full size while the diff
+        # resized it, and the cap allowed the larger of the two, not both
+        bot = IncentiveMarketMaker(client=None, live=False)
+        t = "KXRAINWKND-68OCT13-LEX"
+        bot.pnl.pos[t] = -16.0
+        lv = imm.scale_levels(imm.hour_scaled_levels("KXRAINWKND", datetime.now(timezone.utc)),
+                              bot._market_size_mult(t))
+        cap = sum(s for _t, s in lv) * imm.REF_DEPTH_MAX_MULT *             max(1.0, imm.series_side_mults("KXRAINWKND")[0])
+        resting = [_resting("a", t, "bid", 29, cap)]
+        q = Quote(t, "bid", 32, 16)
+        self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 0)
+        bot._fair_close_px[t] = ("bid", 32)
+        self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 1)
+
     def test_off_and_dry_quote_the_normal_rung(self):
         for mode in ("off", "dry"):
             _b, rungs, lines = self._cycle(-150.0, 0.52, mode=mode)
