@@ -7,6 +7,8 @@ unrealized), a settlement, a manual offset treated as a transfer, and a fill's
 30-minute mark-out."""
 
 import ast
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -949,6 +951,83 @@ class SeriesSizeTests(unittest.TestCase):
         FakeImm.log("after")
         self.assertEqual(FakeImm.logged, ["after"])
         self.assertEqual(dash.series_sizes(None, {"KXRT"}), {})
+
+
+class AccountCardTests(unittest.TestCase):
+    """Jack 2026-10-29: "in imm_dashboard.html#health also show a small view
+    of total account value, and net from crypto, weather, and other (similar
+    to the daily portfolio digest email)" -- the portfolio email's own read,
+    live, beside the days each morning's email kept."""
+
+    NOW = _ts("2026-10-29T23:30:00Z")          # 7:30 PM ET
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self._old = (dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR)
+        dash.STATUS_DIR = os.path.join(self.root, "incentive-mm")
+        dash.DASH_DIR = os.path.join(dash.STATUS_DIR, "dashboard")
+        dash.CACHE_DIR = os.path.join(dash.DASH_DIR, "cache")
+        os.makedirs(dash.CACHE_DIR)
+        os.makedirs(os.path.join(self.root, "portfolio-digest"))
+
+    def tearDown(self):
+        dash.STATUS_DIR, dash.DASH_DIR, dash.CACHE_DIR = self._old
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_without_kalshi_reads_the_card_has_the_emails_days(self):
+        store = {f"2026-10-{d}": {"day": float(d), "bots": []} for d in range(20, 30)}
+        with open(os.path.join(self.root, "portfolio-digest", "day_by_bot.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(store, f)
+        a = dash.Builder(self.NOW, api=False, api_force=False)._account({})
+        self.assertIsNone(a["live"])
+        self.assertTrue(a["off"])
+        self.assertEqual([e["date"] for e in a["email"]], [f"2026-10-{d}" for d in range(23, 30)])
+        self.assertEqual(a["email"][-1]["day"], 29.0)
+        os.remove(os.path.join(self.root, "portfolio-digest", "day_by_bot.json"))
+        self.assertEqual(dash.Builder(self.NOW, api=False, api_force=False)._account({})["email"], [])
+
+    @staticmethod
+    def _pf():
+        def row(ev, day):
+            return {"event": ev, "day": day, "realized": day, "value_d": 0.0,
+                    "value_now": 0.0, "note": ""}
+        # since 7am: the IMM's rain -100, a crypto fleet +20, the high-temp bot
+        # -30, a mention bot +5; perps -4, subaccount 1 +10, subaccount 2 -4
+        return {"today": "2026-10-29", "first_run": False, "mark_basis": "last",
+                "rows": [row("KXRAIN-26OCT29", -100.0), row("KXBTCD-26OCT2917", 20.0),
+                         row("KXHIGHNY-26OCT29", -30.0), row("KXNBAMENTION-26OCT29LAL", 5.0)],
+                "prior": {"equity_kalshi": 40000.0, "perps_equity": 100.0, "subs_equity": 1204.0,
+                          "subs": {"1": 300.0, "2": 904.0}, "created_utc": "2026-10-29T11:00:02Z"},
+                "equity_kalshi": 40500.0, "cash": 20000.0, "kalshi_positions_value": 20500.0,
+                "perps_equity": 96.0, "perps": {"equity": 96.0, "positions": []},
+                "subs_equity": 1210.0, "subs": {"accounts": {1: 310.0, 2: 900.0}, "moves": []},
+                "sub_moves": 0.0, "sub_moves_by": {}, "account_value": 41806.0, "unpaid": None,
+                "no_trade_cash": 0.0, "net_transfers": 0.0, "collateral_d": 0.0,
+                "total_profit": 13306.0, "snapshot": {"created_utc": "2026-10-29T23:30:00Z"}}
+
+    def test_the_live_read_is_the_digests_own(self):
+        import send_portfolio_digest as spd
+        calls = []
+
+        def build(now_utc, prior_before=None, with_unpaid=True):
+            calls.append((prior_before, with_unpaid))
+            print("2026-10-29 23:30:01Z positions: 4 unsettled events")
+            print("2026-10-29 23:30:02Z ! perps balance read failed: HTTP 503")
+            return self._pf()
+
+        D = {"markets": {"KXRAIN-26OCT29-NYC": {"ev": "KXRAIN-26OCT29", "pos": 3.0}}, "days": {}}
+        out = io.StringIO()
+        with mock.patch.object(spd, "build_portfolio", build), \
+                mock.patch.object(spd, "_SERIES_CATS", {}), contextlib.redirect_stdout(out):
+            a = dash.account_now(D, self.NOW)
+        self.assertEqual(out.getvalue(), "")            # the digest's log stays out
+        self.assertEqual(calls, [("2026-10-30", False)])  # from this morning's snapshot, no scan
+        self.assertEqual(a["warn"], ["! perps balance read failed: HTTP 503"])
+        self.assertEqual([b[:2] for b in a["bots"]],
+                         [["IMM", -100.0], ["Crypto", 16.0], ["Weather", -34.0], ["Other", 15.0]])
+        self.assertEqual((a["day"], a["resid"], a["value"], a["app"]), (502.0, 605.0, 41806.0, 40596.0))
+        self.assertEqual(a["since"], _ts("2026-10-29T11:00:02Z"))
 
 
 class RenderTests(unittest.TestCase):

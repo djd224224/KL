@@ -3,8 +3,12 @@
 unrealized) since the last daily update") and the family grouping it leans on.
 
 Rows are what build_portfolio() emits per event: day == realized + value_d."""
+import json
 import os
+import shutil
+import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 import send_portfolio_digest as pf
 
@@ -1896,6 +1900,66 @@ class DayByBotTests(unittest.TestCase):
         _, text, _ = pf.build_email(p, [], chart_ok=False, imm_events=self.IMM)
         self.assertIn("+15.00  =  trading +5.00  +  subaccount 1 +10.00\n", text)
         self.assertIn("+600.00  =  trading -100.00  +  reward credits +700.00\n", text)
+
+
+class AccountCardTests(unittest.TestCase):
+    """Jack 2026-10-29: "in imm_dashboard.html#health also show a small view
+    of total account value, and net from crypto, weather, and other (similar
+    to the daily portfolio digest email)" -- the dashboard reads the email's
+    own numbers: day_split, account_summary, and each morning's kept day."""
+
+    def _pf(self):
+        p = DayByBotTests._pf(self)
+        p["prior"]["created_utc"] = "2026-10-22T11:00:02Z"
+        p["snapshot"] = {"created_utc": "2026-10-23T11:00:03Z"}
+        return p
+
+    def test_the_split_is_the_emails_numbers(self):
+        s = pf.day_split(self._pf(), DayByBotTests.IMM)
+        self.assertEqual(s["d_day"], 502.0)
+        self.assertEqual([(b, tot) for b, tot, _ in s["by_bot"]],
+                         [("IMM", 600.0), ("Crypto", 16.0), ("Weather", -34.0), ("Other", 15.0)])
+        self.assertEqual(s["pricing"], -95.0)
+        self.assertEqual(s["parts"][1], ("reward credits", 700.0))
+        self.assertFalse(s["late"])
+        # what build_email prints is the same split
+        _, text, _ = pf.build_email(self._pf(), [], chart_ok=False, imm_events=DayByBotTests.IMM)
+        self.assertIn("vs yesterday: +502.00", text)
+
+    def test_the_summary_is_json_and_adds_up_to_the_day(self):
+        p = self._pf()
+        a = pf.account_summary(p, pf.day_split(p, DayByBotTests.IMM))
+        self.assertEqual(json.loads(json.dumps(a)), a)
+        self.assertEqual((a["value"], a["app"], a["profit"]), (41806.0, 40596.0, 13306.0))
+        self.assertEqual(a["since"], 1792666802.0)          # 2026-10-22 11:00:02Z
+        self.assertEqual(a["until"] - a["since"], 86401.0)
+        self.assertAlmostEqual(sum(b[1] for b in a["bots"]) + a["resid"], a["day"], places=6)
+        self.assertEqual(a["bots"][1], ["Crypto", 16.0, [["trading", 20.0], ["perpetuals", -4.0]]])
+
+    def test_a_first_run_has_no_day(self):
+        p = self._pf()
+        p["first_run"], p["prior"] = True, None
+        a = pf.account_summary(p, pf.day_split(p, DayByBotTests.IMM))
+        self.assertIsNone(a["day"])
+        self.assertEqual(a["bots"], [])
+        self.assertIsNone(a["since"])
+
+    def test_the_store_keeps_the_newest_mornings(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "day_by_bot.json")
+            for i in range(pf.DAY_BY_BOT_KEEP + 2):
+                day = (datetime(2026, 9, 1) + timedelta(days=i)).strftime("%Y-%m-%d")
+                pf.record_day_by_bot(day, {"day": float(i)}, path=path)
+            pf.record_day_by_bot("2026-09-05", {"day": -1.0}, path=path)   # a rerun overwrites
+            with open(path, encoding="utf-8") as f:
+                store = json.load(f)
+            self.assertEqual(len(store), pf.DAY_BY_BOT_KEEP)
+            self.assertNotIn("2026-09-02", store)
+            self.assertEqual(store["2026-09-05"], {"day": -1.0})
+            self.assertEqual(list(store), sorted(store))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class MarkBasisTests(unittest.TestCase):

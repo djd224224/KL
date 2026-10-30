@@ -117,6 +117,13 @@ HISTORY_DAYS = int(os.environ.get("IMM_DASH_HISTORY_DAYS", "30"))
 DETAIL_DAYS = 8           # per-market hourly detail kept this far back
 API_TTL_MIN = float(os.environ.get("IMM_DASH_API_TTL_MIN", "60"))
 PROGRAMS_TTL_MIN = float(os.environ.get("IMM_DASH_PROGRAMS_TTL_MIN", "30"))
+# The whole account on the Health tab (Jack 2026-10-29: "also show a small
+# view of total account value, and net from crypto, weather, and other
+# (similar to the daily portfolio digest email)"): a live read each build
+# (account_now, ~55 Kalshi reads), beside the days the 7am email keeps
+ACCOUNT_TTL_MIN = float(os.environ.get("IMM_DASH_ACCOUNT_TTL_MIN", "8"))
+DAY_BY_BOT_FILE = os.path.join("..", "portfolio-digest", "day_by_bot.json")  # under STATUS_DIR
+ACCOUNT_EMAIL_DAYS = 7
 HEARTBEAT_STALE_MIN = 30
 MARKOUT_SECS = 1800       # fill mark-out horizon (the toxic backtest's 30m)
 MARKOUT_MAX_LAG = 900     # the mark used must land within 15 min of it
@@ -1947,6 +1954,31 @@ def fetch_pickoff(gaps, imm, now_utc):
     return {"rows": rows, "checked": res.get("checked", 0), "error": res.get("error")}
 
 
+def account_now(D: dict, now: float) -> dict:
+    """The whole account now, read the way the 7am portfolio email reads it
+    (send_portfolio_digest.build_portfolio -> day_split -> account_summary):
+    the account value, total profit, and the day by bot since the newest 7am
+    snapshot -- this morning's, or yesterday's before the email has run. D
+    is this build's model: the IMM's own book (imm_book_events). No
+    unpaid-rewards scan. The digest's log lines stay out of the task log;
+    its "!" lines come back as "warn"."""
+    import contextlib
+    import io
+    import send_portfolio_digest as spd
+    now_utc = datetime.fromtimestamp(now, timezone.utc)
+    today = now_utc.astimezone(ET).date()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pf = spd.build_portfolio(now_utc, prior_before=(today + timedelta(days=1)).isoformat(),
+                                 with_unpaid=False)
+        out = spd.account_summary(pf, spd.day_split(pf, spd.imm_book_events(D, today.isoformat())))
+    warn = [m for m in (ln.split("Z ", 1)[-1] for ln in buf.getvalue().splitlines())
+            if m.startswith("!")]
+    if warn:
+        out["warn"] = warn[:5]
+    return out
+
+
 # ----------------------------------------------------------------------------
 # The model
 # ----------------------------------------------------------------------------
@@ -3488,7 +3520,26 @@ class Builder:
             "snapshot_ts": self.snapshot_ts,
             "timing": self.timing, "warnings": self.warnings,
         }
+        t0 = time.time()
+        model["acct"] = self._account(model)
+        self._t("account", t0)
         return model
+
+    def _account(self, model):
+        """D.acct, the Health tab's account card: "live" = account_now
+        (cached ACCOUNT_TTL_MIN; a failed read serves the last one with "err";
+        "off" in a --no-api build), "at" its read time, and "email" = the
+        last ACCOUNT_EMAIL_DAYS mornings' days as the 7am email kept them,
+        oldest first."""
+        store = load_json(os.path.join(STATUS_DIR, DAY_BY_BOT_FILE), {}) or {}
+        out = {"live": None, "at": None, "err": None, "off": not self.api,
+               "email": [dict(v, date=d) for d, v in sorted(store.items())[-ACCOUNT_EMAIL_DAYS:]]}
+        if not self.api:
+            return out
+        val, at, err = _api_cached("account", ACCOUNT_TTL_MIN, self.api_force,
+                                   lambda: account_now(model, time.time()))
+        out.update(live=val, at=at or None, err=err)
+        return out
 
     def _decision_mix(self):
         """{family: {decision: [markets, modelled $/day]}} over the newest

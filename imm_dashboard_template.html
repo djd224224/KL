@@ -508,7 +508,11 @@ footer { color: var(--muted); font-size: 12px; }
   </section>
 
   <section id="health">
-    <div class="shead"><h2>Bot health</h2><span class="note">Heartbeat, cycle cadence, restarts, data freshness and the morning email lineup.</span></div>
+    <div class="shead"><h2>Bot health</h2><span class="note">The whole account and each bot's net, then heartbeat, cycle cadence, restarts, data freshness and the morning email lineup.</span></div>
+    <div class="grid2">
+      <div><div class="sub-h">Account<span class="note" id="acctNote"></span></div><div class="statgrid" id="acctStats"></div></div>
+      <div><div class="sub-h">Net by bot<span class="note">split as the 7am portfolio email splits the day</span></div><div class="tw" id="acctBots"></div></div>
+    </div>
     <div class="statgrid" id="healthStats"></div>
     <div class="grid2">
       <div><div class="sub-h">Morning lineup (today)</div><div class="tw" id="lineup"></div></div>
@@ -517,6 +521,7 @@ footer { color: var(--muted); font-size: 12px; }
     <div class="grid2">
       <div><div class="sub-h">Data freshness</div><div class="tw" id="sinks"></div></div>
       <div><div class="sub-h">How the numbers are built</div>
+        <p class="explain"><b>Account</b> is the 7am portfolio email's read of the whole Kalshi account (every bot and hand trade), made live each build: account value = cash + Kalshi's valuation of the open positions + the perpetuals account + the numbered subaccounts (API-only, so the Kalshi app shows the account less them); total profit = account value less every deposit, plus every withdrawal. <b>Net by bot</b> splits the change since the newest 7am snapshot as the email does: each event's trading at Kalshi's last trade goes to the bot that holds it (the IMM when this page's book has it, else crypto by asset, weather for the temperature dailies, else other), plus each bot's own cash lines: reward credits to the IMM, perps to crypto, subaccount 1 (NFL sniper) to other and 2 (hourly temps) to weather. <i>Kalshi</i> is the gap between Kalshi's valuation and the rows', no bot's. So the IMM line is cash and last trades, not this page's modeled rewards and mid marks. The email columns are each morning's email, 7am to 7am.</p>
         <p class="explain"><b>Modeled rewards</b> integrate the bot's own reward estimate (est_frac × pool $/day) over every gap between full cycles, capped at 15 minutes, from the cycle logs. It is a model and sits before Kalshi's $1-per-market-per-period floor; credits land 1–2 days after a period ends and show up in the history as <i>credited</i>.</p>
         <p class="explain"><b>Trading P&amp;L</b> is mark-to-market on the bot's own book: realized in the window (closing fills and settlements) plus the change in open positions valued at mid (the last trade when a book is empty), from the 5-minute position snapshots. Exits the bot does not book itself are valued at Kalshi's actual settlement: scalar settlements (sports ladders and escalators, which the bot logs as "manual offsets") and positions that leave its book with no record. Only an exit Kalshi has not settled counts as a transfer at its last mark. Audited 9/29 against a replay of Kalshi's own fills and settlement results: equal to the cent for 9/16, 9/22, 9/27, 9/28, 9/29 and the 7-day window.</p>
         <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk. Kalshi fees are not deducted; the IMM digest's fee total runs $0–0.60 a day.</p>
@@ -2678,8 +2683,81 @@ function renderHistory() {
   ], hs.slice().reverse(), { limit: 31, rowAttr: (r, i) => ' class="click' + (r.d === selDay ? " sel" : "") + '" data-i="' + i + '"', onRow: openDay, totalRow: { d: "Last 7 days", rew: fmtUSD(sum("rew", t7)), cred: fmtUSD(sum("cred", t7)), real: money(sum("real", t7.filter((r) => r.real != null))), pnl: money(sum("pnl", t7.filter((r) => r.pnl != null))), net: "<b>" + money(sum("net", t7.filter((r) => r.net != null))) + "</b>", fills: fmtNum(sum("fills", t7)), cts: fmtNum(sum("cts", t7)) } });
 }
 
+/* ======================= account (every bot) ======================= */
+// The whole account, read the way the 7am portfolio email reads it (Jack
+// 2026-10-29: "also show a small view of total account value, and net from
+// crypto, weather, and other (similar to the daily portfolio digest email)"):
+// live since the newest 7am snapshot, beside the email's own days.
+const ACCT_ROWS = [
+  ["IMM", "IMM", "its book's events at last trade, plus Kalshi's reward credits: account cash, not this page's modeled rewards"],
+  ["Crypto", "Crypto", "crypto series the IMM does not hold, plus the perpetuals account"],
+  ["Weather", "Weather", "KXHIGH / KXLOWT / KXTEMP events the IMM does not hold, plus subaccount 2 (hourly temps)"],
+  ["Other", "Other", "everything else (mention bots, hand trades), plus subaccount 1 (NFL sniper)"],
+  ["resid", "Kalshi", "Kalshi's value of the open positions vs the rows' last trades: no bot's"],
+];
+function acctCell(s, k, late) {
+  // {v, tip} for line k of an account summary (a bot, "resid" or "day"), or null
+  if (!s || s.day == null) return null;
+  if (k === "day") {
+    const ex = [];
+    if (s.transfers) ex.push("deposits/withdrawals " + fmtUSD(s.transfers, { sign: true, dp: 2 }));
+    if (s.moves) ex.push("subaccount transfers " + fmtUSD(s.moves, { sign: true, dp: 2 }));
+    return { v: s.day, tip: "the account's change less deposits and withdrawals" + (ex.length ? " (excludes " + ex.join(", ") + ")" : "") };
+  }
+  if (k === "resid") return s.resid == null ? null : { v: s.resid, tip: s.resid_lbl || "" };
+  const r = (s.bots || []).find((x) => x[0] === k);
+  if (!r) return null;
+  return { v: r[1], tip: r[2].map((p) => p[0] + " " + fmtUSD(p[1], { sign: true, dp: 2 })).join(" + ") +
+    (late && k === "IMM" && s.late ? " (no reward payout had landed by 7am)" : "") };
+}
+function acctSum(list, k) {
+  const cs = list.map((s) => [s.date, acctCell(s, k)]).filter((x) => x[1]);
+  if (!cs.length) return null;
+  return { v: cs.reduce((t, x) => t + x[1].v, 0), tip: cs.map((x) => day(x[0]) + " " + fmtUSD(x[1].v, { sign: true, dp: 2 })).join("\n") };
+}
+function renderAccount() {
+  const a = D.acct || {}, L = a.live, E = a.email || [], last = E.length ? E[E.length - 1] : null;
+  const S = L || last;              // the account figures: live, else the last email's
+  const why = a.off ? "live read off (--no-api build)" : a.err ? "live read failed: " + a.err : "";
+  if (!S) {
+    $("acctStats").innerHTML = '<div class="small muted">No account read yet' + (why ? ": " + esc(why) : "") + "</div>";
+    $("acctBots").innerHTML = "";
+    $("acctNote").textContent = "";
+    return;
+  }
+  const at = L ? a.at || L.until : S.until;
+  $("acctNote").textContent = (L ? "live, read " : "the 7am email's, ") + dtET(at) + (why ? " · " + why : "") +
+    (L && L.warn ? " · " + L.warn.map((w) => w.replace(/^!\s*/, "")).join("; ") : "");
+  const made = "cash " + fmtUSD(S.cash, { dp: 2 }) + " + open positions " + fmtUSD(S.positions, { dp: 2 }) + " (Kalshi's valuation)" +
+    (S.perps != null ? " + perpetuals " + fmtUSD(S.perps, { dp: 2 }) : "") +
+    (S.subs != null ? " + subaccounts " + fmtUSD(S.subs, { dp: 2 }) + " (API-only)" : "");
+  const stats = [
+    { k: "Account value", v: fmtUSD(S.value), s: S.app != null ? "Kalshi app " + fmtUSD(S.app) + ": no subaccounts" : "cash + positions + perps", tip: made },
+    { k: "Total profit", v: fmtUSD(S.profit, { sign: true }), s: "all time, deposits left out", c: cls(S.profit || 0) },
+  ];
+  $("acctStats").innerHTML = stats.map((s) => '<div class="card stat" title="' + esc(s.tip || "") + '"><div class="k">' + esc(s.k) + '</div><div class="v ' + (s.c || "") + '">' + esc(s.v) + '</div><div class="s">' + esc(s.s) + "</div></div>").join("");
+  const cell = (c) => c ? '<span title="' + esc(c.tip) + '">' + money(c.v) + "</span>" : '<span class="muted">—</span>';
+  const wk = E.slice(-7);
+  const cols = [{ k: "lbl", label: "", nosort: true, fmt: (r) => '<span title="' + esc(r.tip) + '"' + (r.k === "resid" ? ' class="ink2">' : "><b>") + esc(r.lbl) + (r.k === "resid" ? "</span>" : "</b></span>") }];
+  const tot = { lbl: "Total" };
+  if (L) {
+    cols.push({ k: "live", label: "Since " + dtET(L.since), num: true, nosort: true, title: "the newest 7am snapshot to the live read, " + dtET(L.until), fmt: (r) => cell(acctCell(L, r.k)) });
+    tot.live = cell(acctCell(L, "day"));
+  }
+  if (last) {
+    cols.push({ k: "em", label: "Email " + dET(last.until), num: true, nosort: true, title: "7am " + dET(last.since) + " to 7am " + dET(last.until) + ", as that morning's email split it", fmt: (r) => cell(acctCell(last, r.k, true)) });
+    tot.em = cell(acctCell(last, "day"));
+  }
+  if (wk.length > 1) {
+    cols.push({ k: "wk", label: wk.length + " days", num: true, nosort: true, title: "the last " + wk.length + " emails' days added up, " + day(wk[0].date) + " to " + day(wk[wk.length - 1].date), fmt: (r) => cell(acctSum(wk, r.k)) });
+    tot.wk = cell(acctSum(wk, "day"));
+  }
+  table($("acctBots"), cols, ACCT_ROWS.map(([k, lbl, tip]) => ({ k, lbl, tip })), { limit: 10, totalRow: tot });
+}
+
 /* ======================= health ======================= */
 function renderHealth() {
+  renderAccount();
   const h = D.health, b = D.bot, now = Date.now() / 1000;
   const stats = [
     { k: "Heartbeat", v: h.updated_at ? ago(h.updated_at) : "—", s: (h.mode || "") + (h.stale ? " · STALE" : ""), bad: h.stale },

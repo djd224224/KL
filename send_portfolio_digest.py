@@ -74,6 +74,10 @@ State lives in portfolio_daily\:
 Snapshots/history are written on the real morning run (at build time, so a
 failed send still baselines tomorrow's diff); --test and --dry-run never
 write them. First ever run has no baseline and reports P&L to date instead.
+The real run also keeps the morning's account and day by bot in
+run-logs\portfolio-digest\day_by_bot.json (since 2026-10-30) for the IMM
+dashboard's Health tab, which reads the account live the same way
+(build_portfolio from this morning's snapshot, day_split, account_summary).
 
 Idempotent via a sent-marker in run-logs\portfolio-digest\. Same
 Modern-Standby retry loops as send_daily_digest.py (task can fire mid-sleep
@@ -908,8 +912,13 @@ def write_history(rows):
 # Portfolio build
 # ----------------------------------------------------------------------------
 
-def build_portfolio(now_utc: datetime):
-    """Returns a dict with everything the email needs (and the snapshot)."""
+def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bool = True):
+    """Returns a dict with everything the email needs (and the snapshot).
+    The day runs from the newest snapshot dated before prior_before (default
+    today: the email's 7am yesterday -> 7am today). The IMM dashboard's live
+    read passes tomorrow, so its day starts at this morning's snapshot, and
+    with_unpaid=False: the unpaid-rewards estimate scans the day's cycle logs
+    (~6 minutes on 10/29)."""
     today_str = str(now_utc.astimezone(ET).date())
     client = build_client()
 
@@ -921,7 +930,7 @@ def build_portfolio(now_utc: datetime):
     log(f"collateral Kalshi has returned on open positions: ${collat:,.2f}")
     cutoff = now_utc - timedelta(hours=LOOKBACK_H)
     settlements = fetch_recent_settlements(client, cutoff)
-    prior = load_prior_snapshot(today_str)
+    prior = load_prior_snapshot(prior_before or today_str)
     prior_events = dict((prior or {}).get("events") or {})
     prior_marks = dict((prior or {}).get("marks") or {})
 
@@ -1086,7 +1095,7 @@ def build_portfolio(now_utc: datetime):
     equity_kalshi = round(cash + kalshi_pv, 2)
     account_value = round(equity_kalshi + (perps_equity or 0.0)
                           + (subs_equity or 0.0), 2)
-    unpaid = estimate_unpaid_rewards(client, now_utc)
+    unpaid = estimate_unpaid_rewards(client, now_utc) if with_unpaid else None
 
     # Total profit (Jack 2026-10-04: "at the top also show total profit,
     # excluding deposits/withdrawals"): the account value less every dollar
@@ -2706,17 +2715,16 @@ LATE_PAYOUT_NOTE = ("no reward payout had landed by 7am; a late one shows in "
                     "tomorrow's credits")
 
 
-def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=None):
-    """(subject, text, html). `imm` is imm_section()'s result: the IMM bot's
-    section goes after the movers table, and its PICK-OFF flag onto the
-    subject; None leaves the email as it was before 2026-10-02. `advice` is
-    imm_advice()'s result (or {"error": why}): the What-to-do block, under
-    the day change; None leaves it out. `imm_events` is imm_book_events():
-    the day-by-bot block under the day change; None leaves it out."""
-    today = pf["today"]
-    # The "Settled since yesterday, by series" table is gone (Jack
-    # 2026-09-29: "remove 'Settled since yesterday, by series'"); settled
-    # events stay in the movers table, tagged "settled".
+def day_split(pf, imm_events=None) -> dict:
+    """The day change and its parts, the numbers build_email states, kept
+    apart so the IMM dashboard's account card reads the same ones (Jack
+    2026-10-29: "also show a small view of total account value, and net from
+    crypto, weather, and other (similar to the daily portfolio digest
+    email)"). Every figure is None on a first run. d_day is the day (the
+    account's move less deposits and withdrawals); parts [(label, $)] split
+    the primary's move (d_ek); pricing is its valuation line (px_lbl);
+    by_bot is day_by_bot's, with imm_events and the replay; late says no
+    reward credits came in at all; app_value is the Kalshi app's figure."""
     first = pf["first_run"]
     prior = pf["prior"] or {}
     # Account value on Kalshi's own valuation (cash + their portfolio_value)
@@ -2724,7 +2732,6 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     # like with like: perps enter it once both mornings have a value.
     ek = pf["equity_kalshi"]
     perps_eq = pf.get("perps_equity")
-    acct = pf.get("account_value", ek)
     d_ek = None if first else round(
         ek - _f(prior.get("equity_kalshi") or prior.get("equity")), 2)
     prior_perps = prior.get("perps_equity")
@@ -2746,6 +2753,146 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     # so the app's figure is the main account plus the perps: the headline
     # gives it beside the account value (Jack 2026-10-28: "app shows 58.5k
     # across main account and perps", the email $59.6k).
+    app_value = None if subs_eq is None else round(ek + (perps_eq or 0.0), 2)
+
+    # The day change splits exactly into the movers table's trading, the cash
+    # that came in with no trade or settlement behind it (reward credits;
+    # deposits apart when the transfer reads work), and Kalshi's valuation of
+    # the open positions against the marks the rows use: on the last trades
+    # Kalshi uses (MARK_BASIS), the two differ only by a residual.
+    last_basis = pf.get("mark_basis") == "last"
+    at = "last trade" if last_basis else "mid"
+    trade_lbl = f"trading (at {at})"
+    px_lbl = "valuation residual" if last_basis else "Kalshi's pricing vs mid"
+    trading = family_movers(pf["rows"])[1]["day"]
+    parts = None                        # [(label, $)] summing to d_ek exactly
+    transfers = None if first else pf.get("net_transfers")
+    ntc = None if first else pf.get("no_trade_cash")
+    # The day's change in collateral Kalshi has returned early (+ = released,
+    # - = taken back): cash with no fill or settlement behind it, and Kalshi's
+    # valuation moves the other way by the same amount, so it is neither a
+    # reward nor P&L and drops out of the split: the reward credits are the
+    # no-trade cash less it, and Kalshi's pricing vs mid compares Kalshi's
+    # last-trade prices with our mids without it (it held -collat_d before
+    # 10/10). None = the prior morning did not record it.
+    collat_d = None if first else pf.get("collateral_d", 0.0)
+    rewards = None
+    if not first:
+        if ntc is None:                 # no replay (legacy prior snapshot)
+            parts = [(trade_lbl, trading),
+                     (f"credits, deposits & {px_lbl}",
+                      round(d_ek - trading, 2))]
+        else:
+            rewards = round(ntc - (transfers or 0.0) - (moves or 0.0)
+                            - (collat_d or 0.0), 2)
+            parts = [(trade_lbl, trading),
+                     ("reward credits" + ("" if transfers is not None else " & deposits")
+                      + ("" if moves is not None else " & subaccount moves")
+                      + ("" if collat_d is not None else " & Kalshi collateral"), rewards)]
+            if transfers:
+                parts.append(("deposits/withdrawals", transfers))
+            if moves:
+                parts.append(("subaccount transfers", moves))
+            parts.append((px_lbl,
+                          round(d_ek - trading - ntc + (collat_d or 0.0), 2)))
+
+    # The day figure, in the subject and the body, leaves deposits and
+    # withdrawals out (Jack 2026-10-04: "make the day figure exclude
+    # deposits"): it is the day's change in total profit. Unread transfers
+    # stay in it, and the subject says so. Cash moved to a subaccount is
+    # still the account's: with the subaccounts in the day change it nets
+    # out there; without them (their first morning) it is taken back out.
+    d_day = None if first else round(
+        d_equity - (transfers or 0.0) - ((moves or 0.0) if d_subs is None else 0.0), 2)
+    # the day by bot: the rows by bot plus each bot's own lines; Kalshi's
+    # pricing vs mid closes it to the day change
+    by_bot = None
+    if BY_BOT_ENABLED and rewards is not None and parts:
+        by_bot = day_by_bot(pf, imm_events, parts[1], d_perps, subs_pnl)
+    return {"d_ek": d_ek, "d_perps": d_perps, "d_subs": d_subs, "moves": moves,
+            "subs_pnl": subs_pnl, "d_equity": d_equity, "app_value": app_value,
+            "at": at, "trade_lbl": trade_lbl, "px_lbl": px_lbl, "trading": trading,
+            "transfers": transfers, "ntc": ntc, "collat_d": collat_d,
+            "rewards": rewards, "parts": parts, "d_day": d_day, "by_bot": by_bot,
+            "pricing": dict(parts or []).get(px_lbl),
+            "late": rewards is not None and abs(rewards) < 1.0}
+
+
+def _utc_ts(s):
+    """A snapshot's created_utc as epoch seconds (None if unreadable)."""
+    try:
+        return datetime.strptime(s or "", "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def account_summary(pf, split) -> dict:
+    """The IMM dashboard's account card, JSON-ready: the account value and
+    its parts, the Kalshi app's figure, total profit, and day_split's day by
+    bot over pf's window (since / until: the prior snapshot's time and this
+    read's). The dashboard makes one live each build; each morning's email
+    keeps its own (record_day_by_bot)."""
+    prior = pf.get("prior") or {}
+    return {"since": _utc_ts(prior.get("created_utc")),
+            "until": _utc_ts((pf.get("snapshot") or {}).get("created_utc")),
+            "value": pf.get("account_value"), "app": split["app_value"],
+            "profit": pf.get("total_profit"), "cash": pf.get("cash"),
+            "positions": pf.get("kalshi_positions_value"),
+            "perps": pf.get("perps_equity"), "subs": pf.get("subs_equity"),
+            "unpaid": (pf.get("unpaid") or {}).get("total"),
+            "day": split["d_day"], "basis": split["at"],
+            "bots": [[b, tot, [[k, v] for k, v in ps]] for b, tot, ps in split["by_bot"] or []],
+            "resid": split["pricing"], "resid_lbl": split["px_lbl"],
+            "transfers": split["transfers"], "moves": split["moves"],
+            "late": split["late"]}
+
+
+DAY_BY_BOT_PATH = os.path.join(LOG_DIR, "day_by_bot.json")
+DAY_BY_BOT_KEEP = 60                # mornings kept
+
+
+def record_day_by_bot(day: str, summary: dict, path: str = DAY_BY_BOT_PATH) -> None:
+    """Keeps a morning's account_summary under its date (real runs only):
+    the dashboard's email-day columns read the file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            store = json.load(f)
+    except (OSError, ValueError):
+        store = {}
+    store[day] = summary
+    store = dict(sorted(store.items())[-DAY_BY_BOT_KEEP:])
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=None):
+    """(subject, text, html). `imm` is imm_section()'s result: the IMM bot's
+    section goes after the movers table, and its PICK-OFF flag onto the
+    subject; None leaves the email as it was before 2026-10-02. `advice` is
+    imm_advice()'s result (or {"error": why}): the What-to-do block, under
+    the day change; None leaves it out. `imm_events` is imm_book_events():
+    the day-by-bot block under the day change; None leaves it out."""
+    today = pf["today"]
+    # The "Settled since yesterday, by series" table is gone (Jack
+    # 2026-09-29: "remove 'Settled since yesterday, by series'"); settled
+    # events stay in the movers table, tagged "settled".
+    first = pf["first_run"]
+    prior = pf["prior"] or {}
+    # the day change and its parts (day_split)
+    split = day_split(pf, imm_events)
+    (d_perps, moves, subs_pnl, app_value, at, px_lbl, trading, transfers, collat_d,
+     rewards, parts, d_day, by_bot, pricing, late) = (split[k] for k in (
+         "d_perps", "moves", "subs_pnl", "app_value", "at", "px_lbl", "trading",
+         "transfers", "collat_d", "rewards", "parts", "d_day", "by_bot", "pricing",
+         "late"))
+    ek = pf["equity_kalshi"]
+    perps_eq = pf.get("perps_equity")
+    acct = pf.get("account_value", ek)
+    prior_perps = prior.get("perps_equity")
+    subs_eq = pf.get("subs_equity")
+    prior_subs = prior.get("subs_equity")
     if subs_eq is None:
         subs_note = ""
     else:
@@ -2753,7 +2900,6 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                else "first counted today, so not in the day change"
                if not first and prior_subs is None else "")
         subs_note = " (API-only, not in the app" + (f"; {why}" if why else "") + ")"
-    app_value = None if subs_eq is None else round(ek + (perps_eq or 0.0), 2)
     accts = (pf.get("subs") or {}).get("accounts") or {}
     subs_label = (f"subaccount {next(iter(accts))}" if len(accts) == 1
                   else "subaccounts")
@@ -2804,55 +2950,9 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     # credits; deposits apart when the transfer reads work), and Kalshi's
     # valuation of the open positions against the mids these rows use.
     movers, mv_tot, (mv_hidden_n, mv_hidden_net) = family_movers(pf["rows"])
-    # the rows' mark basis (MARK_BASIS): on the last trades Kalshi uses, its
-    # valuation and the rows differ only by a residual
-    last_basis = pf.get("mark_basis") == "last"
-    at = "last trade" if last_basis else "mid"
-    trade_lbl = f"trading (at {at})"
-    px_lbl = "valuation residual" if last_basis else "Kalshi's pricing vs mid"
     px_why = ("Kalshi's value of the positions vs ours, both at last trades: "
-              "a market that never traded sits at its mid" if last_basis else
+              "a market that never traded sits at its mid" if at == "last trade" else
               "a gap between two valuations, no bot's")
-    trading = mv_tot["day"]
-    parts = None                        # [(label, $)] summing to d_ek exactly
-    transfers = None if first else pf.get("net_transfers")
-    ntc = None if first else pf.get("no_trade_cash")
-    # The day's change in collateral Kalshi has returned early (+ = released,
-    # - = taken back): cash with no fill or settlement behind it, and Kalshi's
-    # valuation moves the other way by the same amount, so it is neither a
-    # reward nor P&L and drops out of the split: the reward credits are the
-    # no-trade cash less it, and Kalshi's pricing vs mid compares Kalshi's
-    # last-trade prices with our mids without it (it held -collat_d before
-    # 10/10). None = the prior morning did not record it.
-    collat_d = None if first else pf.get("collateral_d", 0.0)
-    rewards = None
-    if not first:
-        if ntc is None:                 # no replay (legacy prior snapshot)
-            parts = [(trade_lbl, trading),
-                     (f"credits, deposits & {px_lbl}",
-                      round(d_ek - trading, 2))]
-        else:
-            rewards = round(ntc - (transfers or 0.0) - (moves or 0.0)
-                            - (collat_d or 0.0), 2)
-            parts = [(trade_lbl, trading),
-                     ("reward credits" + ("" if transfers is not None else " & deposits")
-                      + ("" if moves is not None else " & subaccount moves")
-                      + ("" if collat_d is not None else " & Kalshi collateral"), rewards)]
-            if transfers:
-                parts.append(("deposits/withdrawals", transfers))
-            if moves:
-                parts.append(("subaccount transfers", moves))
-            parts.append((px_lbl,
-                          round(d_ek - trading - ntc + (collat_d or 0.0), 2)))
-
-    # The day figure, in the subject and the body, leaves deposits and
-    # withdrawals out (Jack 2026-10-04: "make the day figure exclude
-    # deposits"): it is the day's change in total profit. Unread transfers
-    # stay in it, and the subject says so. Cash moved to a subaccount is
-    # still the account's: with the subaccounts in the day change it nets
-    # out there; without them (their first morning) it is taken back out.
-    d_day = None if first else round(
-        d_equity - (transfers or 0.0) - ((moves or 0.0) if d_subs is None else 0.0), 2)
     day_parts = [(k, v) for k, v in parts or []
                  if k not in ("deposits/withdrawals", "subaccount transfers")]
     day_tail = (("" if d_perps is None else f"  +  perpetuals {d_perps:+,.2f}")
@@ -2864,13 +2964,6 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     excl = (([f"deposits/withdrawals {transfers:+,.2f}"] if transfers else [])
             + ([f"subaccount transfers {moves:+,.2f}"] if moves else []))
     excl_txt = f"  (excludes {', '.join(excl)})" if excl else ""
-    # the day by bot: the rows by bot plus each bot's own lines; Kalshi's
-    # pricing vs mid closes it to the day change
-    by_bot = None
-    if BY_BOT_ENABLED and rewards is not None and parts:
-        by_bot = day_by_bot(pf, imm_events, parts[1], d_perps, subs_pnl)
-    pricing = dict(parts or []).get(px_lbl)
-    late = rewards is not None and abs(rewards) < 1.0
 
     # Jack 2026-10-04: "shorten like this: portfolio 2026-10-04: profit
     # +$18.2k (day +$1.6k, trading -$0.7K)", then "yes add rewards to the
@@ -3316,6 +3409,11 @@ def main(argv=None) -> int:
 
     subject, text, html = build_email(pf, history_preview, chart_ok, imm, advice=advice,
                                       imm_events=imm_events)
+    if not (args.test or args.dry_run):
+        try:        # the IMM dashboard's account card shows each morning's day
+            record_day_by_bot(today_str, account_summary(pf, day_split(pf, imm_events)))
+        except Exception as e:                    # never holds the email
+            log(f"! day by bot not kept for the dashboard: {e!r}")
     if args.test:
         subject = "[TEST] " + subject
     html_path = os.path.join(LOG_DIR, f"digest_{today_str}.html")
