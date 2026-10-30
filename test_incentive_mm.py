@@ -24563,7 +24563,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the low-temperature gate (2026-10-23)
         # + the high-temperature gate (2026-10-23)
         # + the opportunistic AS test's fill pause (2026-10-25)
-        self.assertEqual(len(conts), 53)
+        # + band_both_out again below a fair-lead market's leads, where no
+        # fair lead or close rests past the band (2026-10-30)
+        self.assertEqual(len(conts), 54)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -30931,6 +30933,29 @@ class TestFairLead(unittest.TestCase):
                                         time.time(), pos_before=0.0, pos_after=200.0)
             self.assertEqual([j.get("need_group") for j in bot._comp_hedges], [True])
 
+    def test_past_the_band_never_behind_a_near_decided_touch(self):
+        # FAIR_LEAD_PAST_BAND rests a lead past the band only ahead of the
+        # touch, between the wall and the model. KXRAINWKND-26OCT31-ABQ at
+        # 10/30 20:50Z: 95x96 against a 98.5% fair, and a lead held from
+        # earlier sits at its 93c cap behind the 95c bid -- 200 bought there
+        # risks 93c a contract for 7c, the knife the band exists to dodge
+        yes, no = [[90, 3000.0], [95, 50.0]], [[4, 3000.0]]
+        self.assertEqual(imm.fair_lead_group(yes, no, 98.5, 1000.0, 0.5, hold_bid=93),
+                         ((93, 93, 95), None))
+        self.assertFalse(imm.past_band_ahead("bid", 93, 95))
+        self.assertTrue(imm.past_band_ahead("bid", 14, 1))       # over a 1c wall
+        self.assertTrue(imm.past_band_ahead("ask", 86, 99))      # under a 99c offer
+        self.assertFalse(imm.past_band_ahead("ask", 6, 1))       # a 1% fair, 1c offer
+        self.assertFalse(imm.past_band_ahead("bid", 14, None))
+        path = os.path.join(imm.STATUS_DIR, imm.COMP_HOLD_FILE)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"holds": {self.T: [93, None, time.time()]}}, f)
+        self.YES, self.NO = yes, no
+        bot, rungs, _l = self._cycle(p=0.985)
+        self.assertEqual(rungs, {})
+        self.assertNotIn(self.T, bot.state.selected)
+
 
 class TestVercelFairLead(unittest.TestCase):
     """Jack 2026-10-30: "Yes, extend it" -- FAIR LEAD on the Vercel family,
@@ -30962,9 +30987,19 @@ class TestVercelFairLead(unittest.TestCase):
                   mock.patch.object(imm, "FAIR_LEAD_MODE", "on")):
             p.start()
             self.addCleanup(p.stop)
+        self._drop_holds()
+        self.addCleanup(self._drop_holds)
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    @staticmethod
+    def _drop_holds():
+        """Each bot leads afresh: no hold another left in COMP_HOLD_FILE."""
+        try:
+            os.remove(os.path.join(imm.STATUS_DIR, imm.COMP_HOLD_FILE))
+        except FileNotFoundError:
+            pass
 
     def _write(self, age_secs=0.0):
         fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
@@ -31041,8 +31076,13 @@ class TestVercelFairLead(unittest.TestCase):
         self.assertAlmostEqual(lead, 0.968, places=3)
         self.assertLess(joined, 0.01)
 
-    def _cycle(self):
+    def _cycle(self, yes=None, no=None, pos=0.0, **patches):
+        """Three cycles on the book `yes` / `no` (default T19.8's), holding
+        `pos`, under `patches` (module names -> values): (bot, rungs, log)."""
+        yes = self.YES if yes is None else yes
+        no = self.NO if no is None else no
         _clean_persist()
+        self._drop_holds()
         self._write()
         client = FakeClient()
         client.programs.append(
@@ -31054,28 +31094,37 @@ class TestVercelFairLead(unittest.TestCase):
         client.markets[self.T] = {
             "ticker": self.T, "event_ticker": self.EV, "status": "active",
             "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "yes_bid_dollars": "0.0700", "yes_ask_dollars": "0.8700",
+            "yes_bid_dollars": f"{max(px for px, _q in yes) / 100:.4f}",
+            "yes_ask_dollars": f"{(100 - max(px for px, _q in no)) / 100:.4f}",
             "volume_fp": "0.00"}
         client.books[self.T] = {"orderbook_fp": {
-            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
-            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
-        with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
-                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
-                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in yes],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in no]}}
+        if pos:
+            client.positions[self.T] = pos
+        with contextlib.ExitStack() as st:
+            for name, v in dict({"LEVELS": [(0, 20)], "MAX_JOIN_SPREAD_CENTS": 99,
+                                 "JOIN_AHEAD_MODE": "off"}, **patches).items():
+                st.enter_context(mock.patch.object(imm, name, v))
             bot = IncentiveMarketMaker(client=client, live=False)
+            if pos:
+                bot.pnl.pos[self.T] = pos                    # ours, not manual
             lines = []
             with mock.patch.object(imm, "log", lines.append):
                 bot.run_cycle()
                 bot.state.universe_at = time.time()
                 bot.run_cycle()
                 bot.run_cycle()
+        return bot, self._rungs(bot), lines
+
+    def _rungs(self, bot):
         rungs = {}
         for o in bot.state.sim_orders.values():
             if (o["ticker"] == self.T
                     and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS):
                 rungs.setdefault(o["book_side"], []).append(
                     (o["yes_price"], int(o["remaining_count"])))
-        return bot, rungs, lines
+        return rungs
 
     def test_the_quote_loop_leads_both_walls_with_200(self):
         bot, rungs, lines = self._cycle()
@@ -31149,6 +31198,110 @@ class TestVercelFairLead(unittest.TestCase):
         self.assertEqual(bot._ws_fast_check({self.T}, now), 0)
         self.assertEqual(bot._ws_fast_check(set(), now + 1.5), 2)
         self.assertEqual(sorted(cancelled), ["la", "lb"])
+
+    # PAST THE BAND (Jack 2026-10-30: "Yes, relax it"). KXOPENVREQ-02NOV26-
+    # T20.9's 20:36Z book: 48,376 YES at 1c, its bid touch under the 5-93c
+    # band, and 4,476 NO at 25c (YES 75c) over crumbs
+    YES_1C = [[1, 48376]]
+    NO_1C = [[3, 1], [4, 2512], [25, 4476]]
+    # T17.9's shape at 19:22Z, both touches out (3x99): 48 YES at 3c over
+    # 2,126 at 2c, 48,375 NO at 1c
+    YES_3X99 = [[2, 2126], [3, 48]]
+    NO_3X99 = [[1, 48375]]
+
+    def test_past_the_band_a_1c_wall_side_leads(self):
+        # 200 at 14c takes 96% of the bid side over the 48,376 at 1c (the 40c
+        # fair caps it at 35c); the ask leads at 66c over the 75c wall
+        self.assertEqual(imm.fair_lead_group(self.YES_1C, self.NO_1C, 40.0, 1000.0, 0.5),
+                         ((14, 35, 1), (66, 45, 75)))
+        bot, rungs, lines = self._cycle(self.YES_1C, self.NO_1C)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(rungs, {"bid": [(14, 200)], "ask": [(66, 200)]})
+        self.assertEqual(bot._comp_lead_px, {self.T: (14, 66, 200)})
+        self.assertTrue(any(f"fair lead {self.T} bid: 200 @ 14c, ahead of its own 1c"
+                            in s for s in lines), lines)
+        # IMM_FAIR_LEAD_PAST_BAND=0: the 1c side stands down, the ask leads
+        _b, rungs, _l = self._cycle(self.YES_1C, self.NO_1C, FAIR_LEAD_PAST_BAND=False)
+        self.assertEqual(rungs, {"ask": [(66, 200)]})
+
+    def test_past_the_band_a_3x99_book_leads_both_sides(self):
+        self.assertEqual(imm.fair_lead_group(self.YES_3X99, self.NO_3X99, 40.0, 1000.0, 0.5),
+                         ((10, 35, 3), (86, 45, 99)))
+        bot, rungs, _l = self._cycle(self.YES_3X99, self.NO_3X99)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(rungs, {"bid": [(10, 200)], "ask": [(86, 200)]})
+        # with the band, nothing could rest: no side scores, never selected
+        bot, rungs, _l = self._cycle(self.YES_3X99, self.NO_3X99, FAIR_LEAD_PAST_BAND=False)
+        self.assertEqual(rungs, {})
+        self.assertNotIn(self.T, bot.state.selected)
+
+    def test_an_out_of_band_side_without_a_lead_rests_nothing(self):
+        # a 30c margin caps the bid at 10c, short of the 14c it takes to lead
+        # the 1c wall: no rung joins that out-of-band touch either. (Its ask
+        # floor, 70c, is past the 66c lead too: the in-band ask quotes its
+        # normal rung at the 75c touch.)
+        _b, rungs, _l = self._cycle(self.YES_1C, self.NO_1C, FAIR_LEAD_MARGIN_C=30)
+        self.assertEqual(rungs, {"ask": [(75, 60)]})
+        # a member whose 3x99 book no lead fits any more stands down whole
+        bot, rungs, _l = self._cycle(self.YES_3X99, self.NO_3X99)
+        self.assertEqual(rungs, {"bid": [(10, 200)], "ask": [(86, 200)]})
+        with contextlib.ExitStack() as st:
+            for name, v in (("LEVELS", [(0, 20)]), ("MAX_JOIN_SPREAD_CENTS", 99),
+                            ("JOIN_AHEAD_MODE", "off"), ("FAIR_LEAD_MARGIN_C", 50)):
+                st.enter_context(mock.patch.object(imm, name, v))
+            gskip = st.enter_context(mock.patch.object(bot, "_gskip", wraps=bot._gskip))
+            st.enter_context(mock.patch.object(imm, "log", lambda *_a: None))
+            bot.state.universe_at = time.time()          # no refresh: stays selected
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(self._rungs(bot), {})
+        self.assertIn("band_both_out", [c.args[1] for c in gskip.call_args_list
+                                        if c.args[0] == self.T])
+        self.assertEqual(bot._comp_lead_px, {})
+
+    def test_a_close_rests_past_the_band(self):
+        # long 200 off the 10c bid lead on the 3x99 book: the close offers it
+        # at the 40c model over the 99c touch; the bid side, its lead's 200
+        # held, rests nothing at its 3c touch
+        bot, rungs, lines = self._cycle(self.YES_3X99, self.NO_3X99, pos=200.0,
+                                        FAIR_CLOSE_MODE="on")
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(rungs, {"ask": [(40, 200)]})
+        self.assertEqual(bot._fair_close_px, {self.T: ("ask", 40)})
+        # with the band, neither side rests: the long cannot close at all
+        bot, rungs, _l = self._cycle(self.YES_3X99, self.NO_3X99, pos=200.0,
+                                     FAIR_CLOSE_MODE="on", FAIR_LEAD_PAST_BAND=False)
+        self.assertEqual(rungs, {})
+
+    def _estimate(self, yes, no, past=True):
+        """One selection read of the book `yes` / `no`: the meta it scored."""
+        _clean_persist()
+        self._drop_holds()
+        self._write()
+        fc = FakeClient()
+        fc.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in yes],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in no]}}
+        bot = IncentiveMarketMaker(client=fc, live=False)
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXOPENVREQ",
+                              dollars_per_day=11.42,
+                              program_end=datetime.now(timezone.utc) + timedelta(days=1),
+                              target_size=1000.0, discount_factor=0.5, cutoff=None,
+                              close_time=self.CLOSE)
+        with mock.patch.object(imm, "FAIR_LEAD_PAST_BAND", past):
+            self.assertTrue(bot._estimate_candidate_yield(meta, []))
+        return meta
+
+    def test_the_estimate_counts_a_lead_past_the_band(self):
+        on, off = (self._estimate(self.YES_3X99, self.NO_3X99, past)
+                   for past in (True, False))
+        self.assertEqual((on.quotable_sides, off.quotable_sides), (2, 0))
+        self.assertAlmostEqual(on.est_frac, 0.965, places=3)
+        self.assertEqual(off.est_dollars_per_day, 0.0)
+        on, off = (self._estimate(self.YES_1C, self.NO_1C, past) for past in (True, False))
+        self.assertEqual((on.quotable_sides, off.quotable_sides), (2, 1))
+        self.assertAlmostEqual(on.est_frac, 0.965, places=3)
+        self.assertAlmostEqual(off.est_frac, 0.479, places=3)
 
 
 class TestFairClose(unittest.TestCase):

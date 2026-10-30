@@ -20058,6 +20058,34 @@ FAIR_LEAD_MAX_GAP_C = max(0, _env_int("IMM_FAIR_LEAD_MAX_GAP_C", 10))
 # partly filled lead (STL short 169), at 60. A lead still on its side rests
 # the rest of its own 200, unskewed. 0 restores that.
 FAIR_LEAD_INV_QUOTE = os.environ.get("IMM_FAIR_LEAD_INV_QUOTE", "1") == "1"
+# PAST THE BAND (Jack 2026-10-30: "Yes, relax it", on "Let fair leads rest
+# where the wall sits outside the 5-93c band?"). The per-side top-in-band
+# test stands a side down whose own external touch is outside the band
+# (member_price_band, 5-93), and a market with both sides out stands down
+# whole (band_both_out). A fair lead or close prices off the model, not the
+# touch: at least FAIR_LEAD_MARGIN_C inside a fair the family's gate still
+# reads (a decided Vercel strike, <5% or >95%, reads none), and inside the
+# band itself (comp_lead_band_ok). On the 02NOV26 Vercel cohort the walls
+# sat at 1c YES (KXOPENVREQ T20.9-T24.7, ~48,000 each) and 99c (T17.9's
+# 3x99), and 43 of 126 sides could lead nowhere else. Now a side of a
+# fair-lead market whose touch is out of band rests its fair lead (one
+# target/5 rung, no more) or its fair close while that rung stands AHEAD of
+# the touch, between the wall and the model (past_band_ahead); its normal
+# rungs still stand down, and a market where neither side can rest one
+# still stands down whole. A near-decided touch keeps the band: behind it a
+# lead is a deep-in-the-money bet (KXRAINWKND-26OCT31-ABQ's 95x96 against a
+# 98.5% fair would have bid 200 at 93c). The estimate and quotable_sides
+# count those sides the same way. 0 restores the band.
+FAIR_LEAD_PAST_BAND = os.environ.get("IMM_FAIR_LEAD_PAST_BAND", "1") == "1"
+
+
+def past_band_ahead(side: str, px: int, best: Optional[int]) -> bool:
+    """Does a fair lead or close at `px` (YES cents) stand ahead of its side's
+    out-of-band external touch `best` -- over a 1c bid wall, under a 99c
+    offer (FAIR_LEAD_PAST_BAND)?"""
+    if best is None:
+        return False
+    return px > best if side == "bid" else px < best
 
 
 def fair_lead_series(series: str) -> bool:
@@ -29680,6 +29708,10 @@ class IncentiveMarketMaker:
             return (eb is not None and _qlo <= eb <= _qhi,
                     ea is not None and _qlo <= ea <= _qhi)
 
+        def _fair_past_band() -> bool:
+            """May a side out of band rest its fair lead (FAIR_LEAD_PAST_BAND)?"""
+            return FAIR_LEAD_PAST_BAND and _lsrc == "fair"
+
         def _probe_ladder(hm: float, lv: List[Tuple[int, int]],
                           rmb: float, rma: float,
                           eb: Optional[int], ea: Optional[int],
@@ -29735,23 +29767,30 @@ class IncentiveMarketMaker:
             def _lead_room(sm: int) -> int:
                 return max(sm, _lead_n) if _cap <= 0 else min(max(sm, _lead_n), _cap)
 
-            if bid_ok:
-                if (lb is not None and sum(s for _t, s in lvb) > 0
-                        and comp_lead_band_ok(lb[0], band, meta.series)):
+            lead_bok = (lb is not None and sum(s for _t, s in lvb) > 0
+                        and comp_lead_band_ok(lb[0], band, meta.series))
+            lead_aok = (la is not None and sum(s for _t, s in lva) > 0
+                        and comp_lead_band_ok(la[0], band, meta.series))
+            # the loop's FAIR_LEAD_PAST_BAND: a side out of band rests its
+            # fair lead alone, ahead of its touch, at the lead's own target/5
+            past = ESTIMATE_SIDE_BAND and _fair_past_band()
+            if bid_ok or (past and lead_bok and past_band_ahead("bid", lb[0], eb)):
+                if lead_bok:
                     out += build_side_ladder(meta.ticker, "bid", lb[0], ea,
-                                             _lead_room(smb), levels=lvb,
-                                             ref_px=lb[0], band=band,
+                                             _lead_room(smb) if bid_ok
+                                             else min(_lead_room(smb), _lead_n),
+                                             levels=lvb, ref_px=lb[0], band=band,
                                              hour_mult=hm, min_total=_lead_n)
                 else:
                     out += build_side_ladder(meta.ticker, "bid", eb, ea,
                                              smb, levels=lvb, ref_px=rpb,
                                              band=band, hour_mult=hm)
-            if ask_ok:
-                if (la is not None and sum(s for _t, s in lva) > 0
-                        and comp_lead_band_ok(la[0], band, meta.series)):
+            if ask_ok or (past and lead_aok and past_band_ahead("ask", la[0], ea)):
+                if lead_aok:
                     out += build_side_ladder(meta.ticker, "ask", la[0], eb,
-                                             _lead_room(sma), levels=lva,
-                                             ref_px=la[0], band=band,
+                                             _lead_room(sma) if ask_ok
+                                             else min(_lead_room(sma), _lead_n),
+                                             levels=lva, ref_px=la[0], band=band,
                                              hour_mult=hm, min_total=_lead_n)
                 else:
                     out += build_side_ladder(meta.ticker, "ask", ea, eb,
@@ -29864,7 +29903,14 @@ class IncentiveMarketMaker:
             # challenger too, since the loop places it once admitted
             _qb, _qa = (external_best(yes_levels, no_levels, own_live)
                         if (self.live and own_live) else (ext_b, ext_a))
-            meta.quotable_sides = sum(_sides_in_band(_qb, _qa))
+            # (a side out of band counts while its fair lead may rest ahead
+            # of it: FAIR_LEAD_PAST_BAND, as the probe builds it)
+            meta.quotable_sides = sum(
+                ok or (_fair_past_band() and ld is not None
+                       and comp_lead_band_ok(ld[0], (_qlo, _qhi), meta.series)
+                       and past_band_ahead(sd, ld[0], best))
+                for ok, ld, sd, best in zip(_sides_in_band(_qb, _qa), _leads,
+                                            ("bid", "ask"), (_qb, _qa)))
             if (SUBPENNY_JOIN and meta.price_step < 0.01
                     and sports_ladder_league(meta.series) is not None):
                 _yx, _nx = orderbook_exact_levels(ob)
@@ -31549,7 +31595,13 @@ class IncentiveMarketMaker:
             # stands the whole market down.
             bid_in_band = ext_bid is None or pmin_s <= ext_bid <= pmax_s
             ask_in_band = ext_ask is None or pmin_s <= ext_ask <= pmax_s
-            if not bid_in_band and not ask_in_band:
+            # (FAIR_LEAD_PAST_BAND: a market whose model fair its gate still
+            # reads goes on to its fair leads and closes, which may rest on a
+            # side out of band; it stands down below if neither side has one)
+            fair_past = (FAIR_LEAD_PAST_BAND and not (bid_in_band and ask_in_band)
+                         and (fair_lead_fair_c(t, meta.series, now_ts) is not None
+                              or fair_close_fair_c(t, meta.series, now_ts) is not None))
+            if not bid_in_band and not ask_in_band and not fair_past:
                 self.cancel_market_orders(t, resting)
                 self._gskip(t, "band_both_out", lambda: dict(lo=pmin_s, hi=pmax_s, member=t in self.state.selected), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
@@ -32263,11 +32315,16 @@ class IncentiveMarketMaker:
                     if _hb is not None or _ha is not None:
                         self._comp_lead_px[t] = (_hb, _ha, lead_n)
                 lead_b, lead_a = self._comp_lead(meta, _lx_yes, _lx_no)
-                if lead_b is not None and not (bid_in_band and comp_lead_band_ok(
-                        lead_b[0], (rung_lo, pmax_s), meta.series)):
+                # (a fair lead may rest ahead of its side's out-of-band touch:
+                # FAIR_LEAD_PAST_BAND; the lead's own price never is)
+                _lpast = fair_past and lead_src == "fair"
+                if lead_b is not None and not (
+                        (bid_in_band or (_lpast and past_band_ahead("bid", lead_b[0], ext_bid)))
+                        and comp_lead_band_ok(lead_b[0], (rung_lo, pmax_s), meta.series)):
                     lead_b = None
-                if lead_a is not None and not (ask_in_band and comp_lead_band_ok(
-                        lead_a[0], (rung_lo, pmax_s), meta.series)):
+                if lead_a is not None and not (
+                        (ask_in_band or (_lpast and past_band_ahead("ask", lead_a[0], ext_ask)))
+                        and comp_lead_band_ok(lead_a[0], (rung_lo, pmax_s), meta.series)):
                     lead_a = None
                 # (FAIR_LEAD_INV_QUOTE: a side already holding the lead's
                 # position cap leads no more; it quotes its normal rung)
@@ -32299,11 +32356,13 @@ class IncentiveMarketMaker:
                                                     meta.target_size,
                                                     meta.discount_factor,
                                                     avg_c=_cavg)
-                if close_b is not None and not (bid_in_band and comp_lead_band_ok(
-                        close_b[0], (rung_lo, pmax_s), meta.series)):
+                if close_b is not None and not (
+                        (bid_in_band or (fair_past and past_band_ahead("bid", close_b[0], ext_bid)))
+                        and comp_lead_band_ok(close_b[0], (rung_lo, pmax_s), meta.series)):
                     close_b = None
-                if close_a is not None and not (ask_in_band and comp_lead_band_ok(
-                        close_a[0], (rung_lo, pmax_s), meta.series)):
+                if close_a is not None and not (
+                        (ask_in_band or (fair_past and past_band_ahead("ask", close_a[0], ext_ask)))
+                        and comp_lead_band_ok(close_a[0], (rung_lo, pmax_s), meta.series)):
                     close_a = None
                 if FAIR_CLOSE_MODE == "on":
                     close_n = int(min(abs(_cpos), FAIR_LEAD_MAX_POSITION))
@@ -32502,17 +32561,29 @@ class IncentiveMarketMaker:
                                           else ("ask", close_a[0]))
             else:
                 self._fair_close_px.pop(t, None)
+            if not bid_in_band and not ask_in_band and not (
+                    lead_on_b or lead_on_a or close_on_b or close_on_a):
+                # past the band only with a fair lead or close to rest
+                # (FAIR_LEAD_PAST_BAND): neither side has one this cycle
+                self.cancel_market_orders(t, resting)
+                self._gskip(t, "band_both_out", lambda: dict(lo=pmin_s, hi=pmax_s, member=t in self.state.selected), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                continue
 
             mq: List[Quote] = []
             # atref: placement no longer follows the touch, so a touch
             # outside the band must not kill the side (see build_side_ladder).
             # pmin_s/pmax_s carry the member-widened band (2-98 for sticky).
-            if ext_bid is not None and room_buy > 0 and bid_in_band:
+            # A side out of band rests only its fair lead and close
+            # (FAIR_LEAD_PAST_BAND), the lead at its own target/5.
+            if ext_bid is not None and room_buy > 0 and (bid_in_band or lead_on_b
+                                                         or close_on_b):
                 px_ok = (LADDER_MODE == "atref" and ref_bid_px is not None) \
                     or ext_bid >= pmin_s
                 if px_ok:
                     n_c = min(close_b[1], int(room_buy)) if close_on_b else 0
                     rest_b = int(room_buy) - n_c
+                    if not bid_in_band:
+                        rest_b = min(rest_b, lead_n) if lead_on_b else 0
                     # the side's own rung first: the diff then resizes an old
                     # rung into it and places the closing rung beside it
                     if rest_b > 0:
@@ -32526,12 +32597,15 @@ class IncentiveMarketMaker:
                                                     levels=lv_bid, ref_px=close_b[0],
                                                     band=(rung_lo, pmax_s),
                                                     hour_mult=hm, min_total=n_c))
-            if ext_ask is not None and room_sell > 0 and ask_in_band:
+            if ext_ask is not None and room_sell > 0 and (ask_in_band or lead_on_a
+                                                          or close_on_a):
                 px_ok = (LADDER_MODE == "atref" and ref_ask_px is not None) \
                     or ext_ask <= pmax_s
                 if px_ok:
                     n_c = min(close_a[1], int(room_sell)) if close_on_a else 0
                     rest_a = int(room_sell) - n_c
+                    if not ask_in_band:
+                        rest_a = min(rest_a, lead_n) if lead_on_a else 0
                     # the side's own rung first: the diff then resizes an old
                     # rung into it and places the closing rung beside it
                     if rest_a > 0:
