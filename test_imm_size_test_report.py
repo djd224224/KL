@@ -94,6 +94,73 @@ class TestSizeTestReport(unittest.TestCase):
         self.assertIsNone(sc["sat"])
         self.assertNotIn("Saturdays, long-dated", r.body(sc, "WEEK 1")[1])
 
+    def hourly_and_fills(self, n_test):
+        """The reward recon's hourly cache and the data object's fills over the
+        14 baseline days and n_test test days: every series earns $1 at 03:00
+        ET, $2 at 14:00 and $0.50 at 23:00 (the hour that marks a day covered),
+        and fills 50 contracts at 04:01 at a 4h mark-out of -10c; on test days
+        the test half earns $3 at 03:00 and fills 100 contracts."""
+        cache, fills = {}, []
+        start = date(2026, 10, 26)
+        at = lambda d, h: imm.ET.localize(datetime(d.year, d.month, d.day, h)).timestamp()
+        for k in range(-14, n_test):
+            d = start + timedelta(days=k)
+            mk = cache.setdefault(f"cycle_log_{d.isoformat()}.csv", {"sig": "", "markets": {}})["markets"]
+            for s in self.test + self.ctrl:
+                up = k >= 0 and s in self.test
+                t = f"{s}-26DEC31-T1"
+                mk[t] = {str(int(at(d, 3) // 3600)): 3.0 if up else 1.0,
+                         str(int(at(d, 14) // 3600)): 2.0,
+                         str(int(at(d, 23) // 3600)): 0.5}
+                fills.append({"ts": at(d, 4) + 60, "t": t, "side": "bid", "px": 40.0,
+                              "n": 100.0 if up else 50.0, "pad": False, "taker": False, "m4c": -10.0})
+        return cache, fills
+
+    def test_hour_blocks_split_out_where_the_extra_size_paid(self):
+        # Jack 2026-10-29: "Size-test hour split" -- the test's x1.5 read per
+        # ET hour block, the evidence for a time-of-day multiplier
+        D = dashboard(self.days(7))
+        cache, fills = self.hourly_and_fills(7)
+        t0 = fills[-1]["ts"]
+        D["fills"] = fills + [
+            {"ts": t0, "t": f"{self.test[0]}-26DEC31-T1", "side": "ask", "px": 50.0, "n": 900.0,
+             "pad": True, "taker": False, "m4c": -40.0},                       # a pad: left out
+            {"ts": t0, "t": f"{self.test[0]}-26DEC31-T1", "side": "ask", "px": 50.0, "n": 900.0,
+             "pad": False, "taker": False}]                                    # no 4h mark yet
+        sc = r.score(D, date(2026, 11, 2))
+        hs = r.hour_split(D, cache, sc["test_days"], sc["base_days"])
+        self.assertEqual((len(hs["days"]), len(hs["base_days"]), hs["skipped"]), (7, 14, 1))
+        q = hs["blocks"]["00-08"]
+        self.assertAlmostEqual(q["rew"]["mean"], 3 * 2.0)              # $3 vs $1 at 03:00, 3 series
+        self.assertAlmostEqual(q["pnl"]["mean"], 3 * -5.0)             # 100 vs 50 contracts at -10c
+        self.assertAlmostEqual(q["net"]["mean"], -9.0)
+        self.assertAlmostEqual(q["rew_lift"], 2.0)
+        self.assertAlmostEqual(q["cts_lift"], 1.0)
+        self.assertAlmostEqual(hs["blocks"]["13-17"]["rew"]["mean"], 0.0)
+        self.assertIsNone(hs["blocks"]["13-17"]["cts_lift"])          # nothing filled there
+        day8 = imm.ET.localize(datetime(2026, 11, 2, 7, 0)).astimezone(timezone.utc)
+        with mock.patch.object(r, "load_hourly_cache", return_value=cache):
+            _line, mail = r.run(D, {}, True, day8)
+        text = mail[1]
+        text.encode("cp1252")
+        self.assertIn("By ET hour block, per day, test minus control less their pre-test gap "
+                      "(7 test days and 14 before that the hourly reward cache covers)", text)
+        self.assertIn("(1 fills with no 4h mark left out):", text)
+        self.assertIn("  00-08  rewards +$6, fills -$15, net -$9 (+/- $0); size elasticity of "
+                      "rewards 2.71, of contracts filled 1.71", text)
+        self.assertIn("  13-17  rewards +$0, fills +$0, net +$0 (+/- $0); size elasticity of "
+                      "rewards 0.00, of contracts filled -", text)
+        # a day the cache does not cover through 23:00 ET drops out
+        h23 = str(int(imm.ET.localize(datetime(2026, 11, 1, 23)).timestamp() // 3600))
+        for by_h in cache["cycle_log_2026-11-01.csv"]["markets"].values():
+            del by_h[h23]
+        self.assertEqual(r.hour_split(D, cache, sc["test_days"], sc["base_days"])["days"][-1], "2026-10-31")
+        # no cache (the temp STATUS_DIR has none): the email goes out without the section
+        self.assertIsNone(r.load_hourly_cache())
+        _line, mail = r.run(D, {}, True, day8)
+        self.assertNotIn("By ET hour block", mail[1])
+        self.assertIn("week 1", mail[0])
+
     def test_week_one_then_final_emails_once_each(self):
         st = {}
         D = dashboard(self.days(7))

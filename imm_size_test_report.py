@@ -25,6 +25,14 @@ once an ET day after RUN_HOUR_ET (yesterday is then complete):
   (the ones the Saturday mult sizes) the test half runs x3 against the
   control's x2. saturday_split scores those Saturdays the same way, against
   the pre-test SATURDAYS' gap, with each half's own dollars beside it.
+- ET HOUR BLOCKS on their own (Jack 2026-10-29: "Size-test hour split", after
+  the family x hour study found the quiet hours best for nearly every family
+  but the test's first 3 days' extra x1.5 there buying fills as fast as
+  rewards): hour_split scores each of HOUR_BLOCKS the same way, rewards from
+  the reward recon's hourly model, fills at their 4h mark-out in the block
+  they filled in, with each block's size elasticity of rewards and of
+  contracts filled -- the read for a time-of-day multiplier. Only the emails
+  (and the print below) compute it: the hourly cache is a 25 MB read.
 
   python imm_size_test_report.py      # print the score so far (no email, no stop file)
 """
@@ -44,6 +52,10 @@ STOP_USD = float(os.environ.get("IMM_SIZE_TEST_STOP_USD", "400"))
 STOP_RUN_DAYS = 3
 RUN_HOUR_ET = 6
 REPORT_DAYS = (7, 14)
+# ET hour blocks of the hour split: the quiet hours (x3 on long-dated
+# series), the morning, the afternoon, the evening (x1.5)
+HOUR_BLOCKS = (("00-08", 0, 8), ("09-12", 9, 12), ("13-17", 13, 17), ("18-23", 18, 23))
+HOURLY_CACHE_FILE = "reward_est_hourly_cache.json"    # in STATUS_DIR (imm_reward_recon)
 
 
 def _day(s: str) -> date:
@@ -182,6 +194,145 @@ def saturday_lines(sp: Optional[dict]) -> List[str]:
     return out
 
 
+def _hour_block(h: int) -> str:
+    return next(b for b, lo, hi in HOUR_BLOCKS if lo <= h <= hi)
+
+
+def load_hourly_cache(path: Optional[str] = None) -> Optional[dict]:
+    """imm_reward_recon's hourly cache -- {cycle-log file: {"markets":
+    {ticker: {UTC hour index: modelled reward $}}}} -- or None unreadable."""
+    try:
+        with open(path or os.path.join(imm.STATUS_DIR, HOURLY_CACHE_FILE), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def hour_split(D: dict, hourly: Optional[dict], test_days: List[str],
+               base_days: List[str]) -> Optional[dict]:
+    """The test by ET hour block (HOUR_BLOCKS): per block, test half minus
+    control half, less the same gap over the pre-test days, a day, for
+    rewards (`hourly`, the reward recon's model per market per UTC hour),
+    fills (the data object's maker fills at their 4h mark-out "m4c", charged
+    to the block they filled in: the one horizon every fill of both periods
+    has, where the daily score marks to each day's close) and net, with one
+    standard error; and the test half's rewards and contracts filled in the
+    block against its baseline, relative to the control's (_lift's ratio).
+    Only days the cache covers through 23:00 ET count. None without the
+    cache, a covered test day or half the baseline covered."""
+    if not hourly or not test_days:
+        return None
+    want = set(test_days) | set(base_days)
+    lo = (_day(min(want)) - timedelta(days=1)).isoformat()
+    hi = (_day(max(want)) + timedelta(days=1)).isoformat()
+    arm_of: Dict[str, Optional[str]] = {}
+    hours: Dict[int, Tuple[str, int]] = {}
+
+    def arm(t: str) -> Optional[str]:
+        s = t.split("-")[0]
+        if s not in arm_of:
+            arm_of[s] = imm.size_test_arm(s)
+        return arm_of[s]
+
+    def et_hour(ts: float) -> Tuple[str, int]:
+        e = datetime.fromtimestamp(ts, timezone.utc).astimezone(imm.ET)
+        return f"{e:%Y-%m-%d}", e.hour
+
+    rew: Dict[Tuple[str, str, str], float] = {}
+    late = set()                                     # days the cache has a 23:00 ET hour of
+    for fname, blob in hourly.items():
+        fd = fname[10:20]                            # cycle_log_<date>.csv
+        if fd and not lo <= fd <= hi:
+            continue
+        for t, by_h in ((blob or {}).get("markets") or {}).items():
+            a = arm(t)
+            for h, v in by_h.items():
+                h = int(h)
+                if h not in hours:
+                    hours[h] = et_hour(h * 3600)
+                d, hr = hours[h]
+                if d not in want:
+                    continue
+                if hr == 23:
+                    late.add(d)
+                if a in ("test", "control"):
+                    k = (d, _hour_block(hr), a)
+                    rew[k] = rew.get(k, 0.0) + float(v)
+    test = [d for d in test_days if d in late]
+    base = [d for d in base_days if d in late]
+    if not test or len(base) < BASELINE_DAYS // 2:
+        return None
+    fil: Dict[Tuple[str, str, str], float] = {}
+    cts: Dict[Tuple[str, str, str], float] = {}
+    skipped = 0
+    for f in D.get("fills") or []:
+        if f.get("pad") or f.get("taker"):
+            continue
+        a = arm(f["t"])
+        if a not in ("test", "control"):
+            continue
+        d, hr = et_hour(f["ts"])
+        if d not in want:
+            continue
+        if f.get("m4c") is None:
+            skipped += 1
+            continue
+        k = (d, _hour_block(hr), a)
+        fil[k] = fil.get(k, 0.0) + f["m4c"] * f["n"] / 100.0
+        cts[k] = cts.get(k, 0.0) + f["n"]
+    net = {k: rew.get(k, 0.0) + fil.get(k, 0.0) for k in set(rew) | set(fil)}
+
+    def did(src, b):
+        pre = [src.get((d, b, "test"), 0.0) - src.get((d, b, "control"), 0.0) for d in base]
+        post = [src.get((d, b, "test"), 0.0) - src.get((d, b, "control"), 0.0) for d in test]
+        se = math.sqrt((statistics.pvariance(post) / len(post) if len(post) > 1 else 0.0)
+                       + (statistics.pvariance(pre) / len(pre) if len(pre) > 1 else 0.0))
+        return {"mean": statistics.mean(post) - statistics.mean(pre), "se": se}
+
+    def lift(src, b):
+        m = lambda days, a: statistics.mean(src.get((d, b, a), 0.0) for d in days)
+        try:
+            return (m(test, "test") / m(base, "test")) / (m(test, "control") / m(base, "control")) - 1.0
+        except ZeroDivisionError:
+            return None
+
+    return {"days": test, "base_days": base, "skipped": skipped,
+            "blocks": {b: {"rew": did(rew, b), "pnl": did(fil, b), "net": did(net, b),
+                           "rew_lift": lift(rew, b), "cts_lift": lift(cts, b)}
+                       for b, _lo, _hi in HOUR_BLOCKS}}
+
+
+def hour_lines(hs: Optional[dict]) -> List[str]:
+    """The email's hour-block section (ASCII), or [] without one."""
+    if not hs:
+        return []
+    mult = imm.SIZE_TEST_MULT
+    el = lambda x: f"{math.log(1 + x) / math.log(mult):.2f}" \
+        if x is not None and x > -1 and mult > 1 else "-"
+    out = [f"By ET hour block, per day, test minus control less their pre-test gap ({len(hs['days'])} test "
+           f"days and {len(hs['base_days'])} before that the hourly reward cache covers). Rewards are the "
+           f"recon's hourly model; fills are each new fill's 4h mark-out, in the block it filled in, "
+           f"without the carried book's re-marks, so the blocks need not add up to the fills above"
+           + (f" ({hs['skipped']} fills with no 4h mark left out)" if hs["skipped"] else "") + ":"]
+    for b, _lo, _hi in HOUR_BLOCKS:
+        x = hs["blocks"][b]
+        out.append(f"  {b}  rewards {_usd(x['rew']['mean'])}, fills {_usd(x['pnl']['mean'])}, "
+                   f"net {_usd(x['net']['mean'])} (+/- ${x['net']['se']:,.0f}); size elasticity of "
+                   f"rewards {el(x['rew_lift'])}, of contracts filled {el(x['cts_lift'])}")
+    out.append("  Positive net = the extra size paid in those hours: the read for a time-of-day "
+               "multiplier (long-dated series already run x3 in 00-08 and x1.5 in 18-23).")
+    return out
+
+
+def _hours(D: dict, sc: dict) -> Optional[dict]:
+    """hour_split for an email; None when it can't be read (the email goes
+    out without the section)."""
+    try:
+        return hour_split(D, load_hourly_cache(), sc["test_days"], sc["base_days"])
+    except Exception:
+        return None
+
+
 def verdict(sc: dict) -> str:
     m, se = sc["net"]["mean"], sc["net"]["se"]
     if m - se > 0:
@@ -242,6 +393,7 @@ def body(sc: dict, kind: str) -> Tuple[str, str]:
                                        zip(sc["test_days"], net["daily"])),
         "",
         *(saturday_lines(sc.get("sat")) + ([""] if sc.get("sat") else [])),
+        *(hour_lines(sc.get("hours")) + ([""] if sc.get("hours") else [])),
         "Rewards are the dashboard's reward estimate; fills are trading P&L marked to each "
         "day's close. imm_size_test_report.py, IMM family watch pass 7.",
     ]
@@ -286,6 +438,7 @@ def run(D: Optional[dict], st: dict, dry: bool, now: Optional[datetime] = None
                 f.write(f"{now.isoformat()} stop rule: the last {STOP_RUN_DAYS} days' net "
                         f"difference averaged {_usd(sc['stop_avg'])}/day\n")
             sent["stop"] = now.timestamp()
+        sc["hours"] = _hours(D, sc)
         return line + ", STOP RULE TRIPPED", body(sc, "STOPPED")
     for k in reversed(REPORT_DAYS):                  # a late first run sends the latest one
         key = "final" if k == REPORT_DAYS[-1] else f"day{k}"
@@ -294,6 +447,7 @@ def run(D: Optional[dict], st: dict, dry: bool, now: Optional[datetime] = None
                 sent[key] = now.timestamp()
                 if key == "final":
                     sent.update({f"day{j}": now.timestamp() for j in REPORT_DAYS[:-1]})
+            sc["hours"] = _hours(D, sc)
             return line, body(sc, "FINAL" if key == "final" else "WEEK 1")
     return line, None
 
@@ -310,6 +464,7 @@ def main(argv=None) -> int:
               + (f" (starts {datetime.fromtimestamp(start, imm.ET):%Y-%m-%d %H:%M} ET)" if start else
                  " (off)"))
         return 0
+    sc["hours"] = _hours(D, sc)
     subject, text = body(sc, "FINAL" if len(sc["test_days"]) >= REPORT_DAYS[-1] else "WEEK 1")
     print(subject)
     print(text)
