@@ -30,7 +30,10 @@ THE MODEL (each piece validated in that folder; MODELLED):
     stable chart/API ratio on all three clean day-pairs).
   ratio r = the median of chart(L) / API(L) over the last RATIO_N (3) days L
     with a known print (the chart history in CHART_FILE, extended by every
-    print Kalshi reveals and this module matches to its day). Its error: the recent CV plus
+    print Kalshi reveals and this module matches to its day, and -- since
+    Kalshi stopped revealing day prints with the 26OCT11 week -- by each
+    settled week's max as the print of its biggest API day,
+    backfill_settled_prints). Its error: the recent CV plus
     RATIO_DRIFT_PER_DAY x days from L (Drake's and The Weeknd's ratios fell
     ~1%/day 9/28 -> 10/02).
   Each day of the week:
@@ -45,7 +48,10 @@ THE MODEL (each piece validated in that folder; MODELLED):
               chart-equivalent series (last HISTORY_DAYS), x FUTURE_WIDEN
   A complete day more than PUBLISHED_AFTER_H after its UTC end with no revealed
   print has printed below every strike still open (a print above one closes it
-  YES), so its draws are capped at the lowest open strike.
+  YES), so its draws are capped at the lowest open strike -- only while Kalshi
+  closes crossed strikes early (EARLY_CLOSE_CAP, off since 2026-10-30: from
+  the 26OCT11 week every strike closes at the event's close, so the cap would
+  hold every older day under the lowest strike).
   P(YES) = P(max(revealed max, every day's draw) > K) over N_SIM joint draws
   (one shared ratio error, independent per-day noise).
   HOLD (the print-snipe guard): a strike within HOLD_WIDTHS local ladder
@@ -128,6 +134,22 @@ HOLD_RECENT_H = _env_float("IMM_YTW_HOLD_RECENT_H", 50)
 PUBLISHED_AFTER_H = _env_float("IMM_YTW_PUBLISHED_AFTER_H", 50)
 PRINT_MATCH_TOL = 0.12           # |log(print / nowcast)| to accept a day match
 PRINT_LAG_H = (18.0, 72.0)       # a revealed print lands this long after its day's UTC end
+# SETTLED WEEKS (Jack 2026-10-30: "Yes, fix it"). Through the 26OCT04 week
+# Kalshi closed a crossed strike YES early with the exact print as its
+# expiration_value ('22796251'), which match_prints turned into day prints.
+# From the 26OCT11 week every strike closes at the event's close and settles
+# with 'Yes'/'No' or the week's max ('19.7M', '7251561'), so no print was
+# matched after the 10/06 seed, the ratio aged out of RATIO_MAX_AGE_DAYS on
+# 10/17-18 and every pilot event went without a fair ("0 events with a fair",
+# the gate's no_read) -- ~$3.2/day of reward estimate dark 10/23-29. A
+# settled week's max (its value, else the YES/NO strike bracket when it is
+# narrow) is written to the chart as the print of the week's biggest API day:
+# on the weeks to 10/25 that gives The Weeknd 1.72/1.64/1.61 and Drake
+# 1.40/1.71/1.69 against seed ratios of ~1.7 (KATSEYE 0.89/1.15/1.02, noisy).
+SETTLED_WEEKS_BACK = 3           # settled weeks looked up per artist
+BRACKET_MAX_REL = 0.08           # widest YES/NO bracket taken, relative to its midpoint
+SETTLED_RETRY_SECS = 3600        # a week that gave nothing is asked again after this
+EARLY_CLOSE_CAP = os.environ.get("IMM_YTW_EARLY_CLOSE_CAP", "0") == "1"
 # pooled intraday API profile (cumulative share of the window's views after k h)
 PROFILE = [(0, 0.0), (3, 0.146), (6, 0.31), (9, 0.462), (12, 0.592), (15, 0.696),
            (18, 0.794), (21, 0.892), (24, 1.0)]
@@ -357,6 +379,97 @@ def ratios(videos, chart_a: Dict[str, int], today: date) -> Dict[date, float]:
     return out
 
 
+_VIEWS_RE = re.compile(r"^\s*([\d,]+(?:\.\d+)?)\s*([KkMm]?)\s*$")
+_settled_tried: Dict[str, float] = {}   # event -> when a lookup last gave nothing
+
+
+def parse_views(v) -> Optional[float]:
+    """Kalshi's expiration_value as views: '19.7M', '7251561', '7,251,561',
+    '950K'; None for 'Yes' / 'No' / empty."""
+    m = _VIEWS_RE.match(str(v if v is not None else ""))
+    if not m:
+        return None
+    try:
+        x = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return x * {"": 1.0, "k": 1e3, "m": 1e6}[m.group(2).lower()]
+
+
+def settled_week_max(markets: List[dict]) -> Optional[Tuple[float, str]]:
+    """(the week's max views, how) from a SETTLED event's markets: Kalshi's
+    value where a market carries one, else the midpoint of the highest YES
+    and lowest NO strikes when that bracket is within BRACKET_MAX_REL; None
+    while any strike is unsettled or the week gives neither."""
+    if not markets or any(m.get("result") not in ("yes", "no") for m in markets):
+        return None
+    for m in markets:
+        x = parse_views(m.get("expiration_value"))
+        if x is not None and x > 0:
+            return x, "value"
+
+    def k(m):
+        f = m.get("floor_strike")
+        return float(f) if f not in (None, "") else strike_views(strike_key(m.get("ticker", "")) or "")
+    yes = [k(m) for m in markets if m.get("result") == "yes" and k(m)]
+    no = [k(m) for m in markets if m.get("result") == "no" and k(m)]
+    if not yes or not no or max(yes) >= min(no):
+        return None
+    lo, hi = max(yes), min(no)
+    mid = (lo + hi) / 2.0
+    if (hi - lo) / mid > BRACKET_MAX_REL:
+        return None
+    return mid, f"bracket {lo / 1e6:g}-{hi / 1e6:g}M"
+
+
+def week_print_day(videos, week_end: date) -> Optional[date]:
+    """The day of the week ending `week_end` with the most API views (where
+    its max printed), or None when the snapshots cover under 5 of its days."""
+    api = {}
+    for i in range(7):
+        d = week_end - timedelta(days=6 - i)
+        A = api_window(videos, *window_bounds(d))
+        if A and A > 0:
+            api[d] = A
+    return max(api, key=api.get) if len(api) >= 5 else None
+
+
+def backfill_settled_prints(chart: Dict[str, Dict[str, int]], series, event_markets: Callable,
+                            now: datetime) -> bool:
+    """Write each recent settled week's max (settled_week_max) into `chart`
+    as the print of its biggest API day, for a week the chart has no print
+    in; True when a print was added. A week that gives nothing (unsettled, a
+    one-sided bracket, a failed read) is asked again after SETTLED_RETRY_SECS."""
+    added = False
+    now_ts = now.timestamp()
+    today = now.date()
+    last_end = today - timedelta(days=(today.weekday() + 1) % 7)     # the last Sunday
+    months = {v: k for k, v in _MON.items()}
+    for code, artist in ARTISTS.items():
+        for i in range(SETTLED_WEEKS_BACK):
+            end = last_end - timedelta(days=7 * i)
+            if (today - end).days > RATIO_MAX_AGE_DAYS + 6:
+                continue                          # none of its days could set the ratio
+            have = chart.get(artist, {})
+            if any((end - timedelta(days=j)).isoformat() in have for j in range(7)):
+                continue
+            ev = f"{SERIES}-{code}{end:%y}{months[end.month]}{end:%d}"
+            if now_ts - _settled_tried.get(ev, -1e18) < SETTLED_RETRY_SECS:
+                continue
+            try:
+                got = settled_week_max(event_markets(ev))
+            except Exception:
+                got = None
+            d = week_print_day(series.get(artist, {}), end) if got else None
+            if got is None or d is None:
+                _settled_tried[ev] = now_ts
+                continue
+            chart.setdefault(artist, {})[d.isoformat()] = int(round(got[0]))
+            _settled_tried.pop(ev, None)
+            added = True
+    return added
+
+
 # ---------------------------------------------------------------------------
 # the week
 
@@ -436,7 +549,9 @@ def simulate(days: List[date], in_week: set, est: Dict[date, list], m_pub: float
                 v = e[1]
             elif e[0] in ("complete", "partial"):
                 v = e[1] * math.exp(z_r * e[3] + rng.gauss(0.0, e[2]))
-                if e[0] == "complete" and d in in_week and k_min_open is not None                         and now_ts - day0(d + timedelta(days=1)) > PUBLISHED_AFTER_H * 3600:
+                if EARLY_CLOSE_CAP and e[0] == "complete" and d in in_week \
+                        and k_min_open is not None \
+                        and now_ts - day0(d + timedelta(days=1)) > PUBLISHED_AFTER_H * 3600:
                     v = min(v, k_min_open)        # printed below every open strike
             else:
                 if prev_v is None:
@@ -622,7 +737,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None, reads: Optional[T
             pe = parse_event(ev)
             if pe and pe[0] in ARTISTS:
                 evs.append((ev, pe[0]))
-        added = False
+        # the settled weeks' maxes keep the ratio current (SETTLED_WEEKS_BACK)
+        added = backfill_settled_prints(chart, series, event_markets, now)
         for ev, code in evs:
             artist = ARTISTS[code]
             try:

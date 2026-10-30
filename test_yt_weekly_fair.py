@@ -54,6 +54,7 @@ class Base(unittest.TestCase):
         self.chart = os.path.join(self.dir, "chart.json")
         self.out = os.path.join(self.dir, "fair.json")
         yf.reset_snapshots()
+        yf._settled_tried.clear()
         write_snaps(self.snap, datetime(2026, 9, 20, tzinfo=timezone.utc),
                     NOW - timedelta(minutes=30))
         write_chart(self.chart)
@@ -200,12 +201,25 @@ class TestEventFair(Base):
 
     def test_old_unprinted_days_are_capped_at_the_lowest_open_strike(self):
         # only 10/05 is old enough (> 50h) to have printed: with every strike
-        # far above it, a capped 10/05 adds nothing and the fair falls
+        # far above it, a capped 10/05 adds nothing and the fair falls -- while
+        # Kalshi closed crossed strikes early (EARLY_CLOSE_CAP)
+        ms = markets(strikes=(7.4, 7.6))
+        with mock.patch.object(yf, "EARLY_CLOSE_CAP", True):
+            e, _ = self.fair(ms)
+            with mock.patch.object(yf, "PUBLISHED_AFTER_H", 1e9):
+                e2, _ = self.fair(ms)
+        self.assertLessEqual(e["strikes"]["7.6M"]["p"], e2["strikes"]["7.6M"]["p"])
+
+    def test_no_early_close_cap_by_default(self):
+        # Jack 2026-10-30: from the 26OCT11 week every strike closes at the
+        # event's close, so an old day with no revealed print is not capped
+        # (the cap would hold it under the lowest strike)
+        self.assertFalse(yf.EARLY_CLOSE_CAP)
         ms = markets(strikes=(7.4, 7.6))
         e, _ = self.fair(ms)
         with mock.patch.object(yf, "PUBLISHED_AFTER_H", 1e9):
             e2, _ = self.fair(ms)
-        self.assertLessEqual(e["strikes"]["7.6M"]["p"], e2["strikes"]["7.6M"]["p"])
+        self.assertEqual(e["strikes"]["7.6M"]["p"], e2["strikes"]["7.6M"]["p"])
 
     def test_fails_closed(self):
         # no ratio: the chart history is older than RATIO_MAX_AGE_DAYS
@@ -232,6 +246,56 @@ class TestWriteFairFile(Base):
         self.assertEqual(list(data["entries"]), [EV])          # ARI is not a pilot artist
         self.assertIn("fetched_at", data["entries"][EV])
         self.assertEqual(yf.load_chart(self.chart)["KATSEYE"]["2026-10-05"], 7_600_000)
+
+    def test_a_settled_weeks_max_keeps_the_ratio(self):
+        # Jack 2026-10-30: "Yes, fix it" -- Kalshi stopped revealing day prints
+        # with the 26OCT11 week, the chart aged out and every event went
+        # without a fair; the last settled week's max ("7.3M") becomes the
+        # print of its biggest API day and the fair is back
+        write_chart(self.chart, upto=date(2026, 9, 10))          # no ratio left
+        calls = []
+        settled = [{"ticker": f"KXYTVIEWSW-KAT26OCT04-{k:.1f}M", "floor_strike": k * 1e6,
+                    "status": "finalized", "result": "yes" if k < 7.3 else "no",
+                    "expiration_value": "7.3M"} for k in (6.5, 7.0, 7.5)]
+
+        def event_markets(ev):
+            calls.append(ev)
+            return markets() if ev == EV else settled if ev == "KXYTVIEWSW-KAT26OCT04" else []
+        reads = (lambda: [EV], event_markets)
+        n, miss, status = yf.write_fair_file(self.out, now=NOW, reads=reads,
+                                             snap_path=self.snap, chart_path=self.chart)
+        self.assertEqual((n, miss, status), (1, 0, "ok"))
+        chart = yf.load_chart(self.chart)["KATSEYE"]
+        self.assertEqual(chart["2026-09-28"], 7_300_000)      # equal API days: the first
+        with open(self.out, encoding="utf-8") as f:
+            e = json.load(f)["entries"][EV]
+        self.assertAlmostEqual(e["ratio"], 7.3 / 7.2, places=3)
+        self.assertEqual(sorted(set(calls) - {EV}), ["KXYTVIEWSW-KAT26OCT04",
+                                                      "KXYTVIEWSW-KAT26SEP20",
+                                                      "KXYTVIEWSW-KAT26SEP27"])
+        # ten minutes on: the week with a print is not asked again, and the two
+        # that gave nothing wait out SETTLED_RETRY_SECS
+        calls.clear()
+        yf.write_fair_file(self.out, now=NOW + timedelta(minutes=10), reads=reads,
+                           snap_path=self.snap, chart_path=self.chart)
+        self.assertEqual(set(calls), {EV})
+
+    def test_settled_week_max(self):
+        def mk(results, value=None, ks=(19.0, 20.0, 21.0)):
+            return [{"ticker": f"X-{k:.1f}M", "floor_strike": k * 1e6, "result": r,
+                     "expiration_value": value if value is not None else r.capitalize()}
+                    for k, r in zip(ks, results)]
+        self.assertEqual(yf.settled_week_max(mk(("yes", "no", "no"), "19.7M")), (19_700_000, "value"))
+        self.assertEqual(yf.settled_week_max(mk(("yes", "yes", "yes"), "7251561"))[0], 7_251_561)
+        # 'Yes' / 'No' only: the bracket's midpoint, when it is narrow
+        self.assertEqual(yf.settled_week_max(mk(("yes", "no", "no"))), (19_500_000, "bracket 19-20M"))
+        self.assertIsNone(yf.settled_week_max(mk(("yes", "no"), ks=(10.0, 20.0))))   # too wide
+        self.assertIsNone(yf.settled_week_max(mk(("yes", "yes", "yes"))))            # one-sided
+        self.assertIsNone(yf.settled_week_max(mk(("yes", "", "no"))))                # unsettled
+        self.assertIsNone(yf.settled_week_max([]))
+        for v, x in (("19.7M", 19.7e6), ("7,251,561", 7251561), ("950K", 950e3), ("Yes", None),
+                     ("", None), (None, None), ("12.5", 12.5)):
+            self.assertEqual(yf.parse_views(v), x, v)
 
     def test_stale_snapshots_write_nothing(self):
         later = NOW + timedelta(seconds=yf.API_STALE_SECS + 3600)
