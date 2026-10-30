@@ -289,20 +289,102 @@ class TestMoney(unittest.TestCase):
         self.assertIn("W1 sold 200 @ 62c, now 42c: +$40.00  (fair: rides to settlement", text)
         self.assertIn("T1 bought 100 @ 40c, now 45c: +$5.00  (complement: locked", text)
 
-    def test_a_stuck_lock_names_its_market_and_what_is_left(self):
-        job = {"id": "KXA-1-ask-x", "ticker": "KXA-1", "side": "ask", "count": 12.0,
-               "price": 53.0, "at": _ts(9), "until": _ts(9, 10), "best": 2.1,
-               "waiting": True, "legs": {"KXA-2": {"filled": 12.0}}}
+    def test_a_stuck_lock_names_its_market_what_is_left_and_its_dollars(self):
+        # 10/29's: sold 12 @ 53c on KXAPRPOTUS, 12 of one sibling sold @ 25c
+        job = {"id": "KXA-1-ask-x", "ticker": "KXA-1", "side": "ask", "kind": "me_ask",
+               "count": 12.0, "price": 53.0, "at": _ts(9), "until": _ts(9, 10), "best": 2.1,
+               "waiting": True,
+               "legs": {"KXA-2": {"filled": 12.0, "value": 300.0, "fee": 4.0},
+                        "KXA-3": {"filled": 0.0, "value": 0.0, "fee": 0.0}}}
+        ctx = self._ctx(job)
+        # (Jack 2026-10-30: "Yes, size-aware") -- it can lose $2.68 at worst:
+        # a WATCH, not a PROBLEM
+        self.assertEqual(ctx["level"], "WATCH")
+        self.assertIn("KXA-1: the lock on a fill (sold 12 @ 53c) has been half done for 3h -- "
+                      "12 of KXA-2 traded, the other legs not; as it stands -$2.68 at worst, "
+                      "+$9.32 at best; a full lock priced at up to +2.1c a contract; its legs' "
+                      "books are off the feed; its watch ended", ctx["reasons"][0])
+        self.assertTrue(cm.subject_for(ctx).endswith(
+            "| WATCH: 1 lock half done 3h (worst -$2.68)"))
+        self.assertIn("(a lock left half done is a PROBLEM when it can lose $10 or more as it "
+                      "stands, a WATCH under that)", cm.render_text(ctx))
+        # the same lock on 200 contracts can lose $44.66: a PROBLEM
+        big = dict(job, count=200.0,
+                   legs={"KXA-2": {"filled": 200.0, "value": 5000.0, "fee": 66.0}})
+        ctx = self._ctx(big)
+        self.assertEqual(ctx["level"], "PROBLEM")
+        self.assertIn("as it stands -$44.66 at worst, +$155.34 at best", ctx["reasons"][0])
+        self.assertTrue(cm.subject_for(ctx).endswith(
+            "| PROBLEM: 1 lock half done 3h (worst -$44.66)"))
+        # one it cannot price (its legs' value unknown) stays a PROBLEM
+        ctx = self._ctx(dict(job, legs={"KXA-2": {"filled": 12.0}}))
+        self.assertEqual(ctx["level"], "PROBLEM")
+        self.assertIn("its dollars could not be priced", ctx["reasons"][0])
+        self.assertTrue(cm.subject_for(ctx).endswith("| PROBLEM: 1 lock half done 3h"))
+
+    def _ctx(self, job):
         h = cm.hedge_summary([], [job], _ts(12))
         ctx = dict(day="2026-10-29", leads={}, groups=None, fills=[], hedges=h, est={},
                    now=datetime.fromtimestamp(_ts(12), timezone.utc).isoformat())
-        level, reasons = cm.verdict(ctx)
-        ctx.update(level=level, reasons=reasons)
-        self.assertEqual(level, "PROBLEM")
-        self.assertIn("KXA-1: the lock on a fill (sold 12 @ 53c) has been half done for 3h -- "
-                      "12 of KXA-2 traded, the other legs not; best floor +2.1c a contract; "
-                      "its legs' books are off the feed; its watch ended", reasons[0])
-        self.assertTrue(cm.subject_for(ctx).endswith("| PROBLEM: 1 lock half done 3h"))
+        ctx["level"], ctx["reasons"] = cm.verdict(ctx)
+        return ctx
+
+    def test_each_lock_kind_is_priced_as_the_bot_floors_it(self):
+        # (kind, price, count, legs) -> (worst, best) in dollars
+        cases = [
+            # sold 12 @ 53c, 12 of a sibling sold @ 25c: at most one wins
+            (("me_ask", 53, 12, {"B": (12, 300, 4)}), (-2.68, 9.32)),
+            # bought 100 @ 40c, 60 of the twin bought @ 55c
+            (("pair_bid", 40, 100, {"B": (60, 3300, 5)}), (-13.05, 26.95)),
+            # sold 100 @ 60c, 40 of an easier strike bought @ 30c
+            (("ladder_ask", 60, 100, {"B": (40, 1200, 3)}), (-12.03, 87.97)),
+            # bought 100 @ 40c, 70 of a harder strike sold @ 30c
+            (("ladder_bid", 40, 100, {"B": (70, 2100, 3)}), (-19.03, 80.97)),
+        ]
+        for args, (worst, best) in cases:
+            got = cm.lock_outcomes(*args)
+            self.assertAlmostEqual(got[0], worst, places=6, msg=args[0])
+            self.assertAlmostEqual(got[1], best, places=6, msg=args[0])
+            # the worst case is the bot's own lock floor for the whole fill
+            kind, px, q, legs = args
+            self.assertAlmostEqual(imm.lock_plan(kind, px, q, {}, legs)[0] * q / 100.0, worst,
+                                   places=6, msg=kind)
+        self.assertIsNone(cm.lock_outcomes(None, 50, 10, {}))
+
+    def test_a_lock_that_gave_up_is_priced_from_its_rows(self):
+        d = imm.STATUS_DIR
+        job = f"KXA-1-ask-abcd1234-{int(_ts(9, d=18))}"
+        with open(os.path.join(d, "comp_hedge_2026-10-18.jsonl"), "w", encoding="utf-8") as f:
+            for r in ({"ts": "2026-10-18T09:00:00+00:00", "kind": "open", "job": job,
+                       "ticker": "KXA-1", "side": "ask", "lock": "me_ask", "lead": False,
+                       "count": 12.0, "px": 53.0, "legs": ["KXA-2", "KXA-3"]},
+                      {"ts": "2026-10-18T09:30:00+00:00", "kind": "leg_fill", "job": job,
+                       "ticker": "KXA-2", "count": 5.0, "px": 25.0, "order_id": "o1"},
+                      {"ts": "2026-10-18T09:40:00+00:00", "kind": "leg_fill", "job": "other",
+                       "ticker": "KXA-2", "count": 50.0, "px": 25.0, "order_id": "o9"},
+                      {"ts": "2026-10-18T10:00:00+00:00", "kind": "leg_fill", "job": job,
+                       "ticker": "KXA-2", "count": 7.0, "px": 25.0, "order_id": "o2"}):
+                f.write(json.dumps(r) + "\n")
+        with open(os.path.join(d, "comp_hedge_2026-10-20.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2026-10-20T09:00:30+00:00", "kind": "expired",
+                                "job": job, "ticker": "KXA-1", "lock": "me_ask",
+                                "legs": {"KXA-2": 12.0}}) + "\n")
+        # 12 sold @ 25c in two fills, each booked the bot's maker fee (2c + 3c)
+        fee = (imm.taker_fee_cents(25, 5, imm.LOCK_MAKER_FEE_MULT)
+               + imm.taker_fee_cents(25, 7, imm.LOCK_MAKER_FEE_MULT))
+        worst, best = cm.gave_up_outcome({"ts": "2026-10-20T09:00:30+00:00", "job": job,
+                                          "lock": "me_ask"})
+        self.assertAlmostEqual(worst, (53 * 12 + 300 - fee - 1200) / 100.0)
+        self.assertAlmostEqual(best, (53 * 12 + 300 - fee) / 100.0)
+        self.assertIsNone(cm.gave_up_outcome({"ts": "2026-10-20T09:00:30+00:00", "job": "j"}))
+        ctx = cm.build_report(date(2026, 10, 20),
+                              now=datetime(2026, 10, 21, 11, 55, tzinfo=timezone.utc))
+        self.assertEqual(ctx["level"], "WATCH")
+        self.assertIn("KXA-1: its lock gave up with legs traded and no full lock -- the traded "
+                      f"legs now ride as inventory; as it stands {cm.usd(worst)} at worst, "
+                      f"{cm.usd(best)} at best", ctx["reasons"][0])
+        self.assertTrue(cm.subject_for(ctx).endswith(
+            f"| WATCH: 1 lock gave up (worst {cm.usd(worst)})"))
 
 
 if __name__ == "__main__":

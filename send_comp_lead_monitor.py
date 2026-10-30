@@ -39,10 +39,14 @@ while leading had earned ~$15 and its fills were up ~$38):
               hourly estimate over the lead spans, imm_reward_recon's cache;
               Kalshi pays ~1.15x it), the fills at a lead marked to now
   needs a look  each verdict reason, naming the market and what is left
-              (PROBLEM: a lock gave up with legs traded, a lead fill never
-              locked, Kalshi refused a hedge order, or a lock has been half
-              done for over HEDGE_STUCK_SECS; WATCH: a complement-lead fill
-              opened no lock job, or a lock job is still working)
+              (PROBLEM: a lead fill never locked, Kalshi refused a hedge
+              order, or a lock that gave up with legs traded or has been half
+              done for over HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD ($10)
+              or more as it stands; WATCH: such a lock that can lose less, a
+              complement-lead fill that opened no lock job, or a lock job
+              still working). Each such lock shows its worst and best case in
+              dollars over how its markets can settle (Jack 2026-10-30: "Yes,
+              size-aware" -- 10/29's 12-contract lock read PROBLEM at -$2.68)
   top earners the markets that earned most while leading
   fills       every fill at a lead's price, marked to the bot's latest mark
               or the settlement, and what became of it (locked, a lock job
@@ -85,7 +89,9 @@ import incentive_mm as imm  # noqa: E402
 from incentive_mm import log  # noqa: E402
 
 LOOKBACK_SECS = 6 * 3600        # day-log read starts this far before the window
-HEDGE_STUCK_SECS = 3600         # an open job part-hedged this long is a PROBLEM
+HEDGE_STUCK_SECS = 3600         # an open job part-hedged this long needs a look...
+LOCK_PROBLEM_USD = 10.0         # ...a PROBLEM when it can lose this much as it stands (or
+                                # cannot be priced), else a WATCH; a lock that gave up too
 LEVELS = ("OK", "WATCH", "PROBLEM")
 HOURLY_CACHE_FILE = "reward_est_hourly_cache.json"   # in STATUS_DIR (imm_reward_recon)
 MARKS_TAIL_BYTES = 4_000_000    # the newest marks file's tail: every position's last mark
@@ -243,6 +249,37 @@ def lead_fills(fills: list, leads: dict) -> list:
     return out
 
 
+def lock_outcomes(kind, price, count, legs):
+    """(worst, best) dollars, over how its markets can settle, of a lock's
+    fill (`count` at `price`, YES cents) plus the legs it has traded so far
+    (`legs` {ticker: (contracts, YES-cent value, fees in cents)}); the worst
+    is the bot's lock floor for the whole fill (incentive_mm lock_plan). None
+    for a lock kind it cannot price."""
+    q, px = float(count or 0.0), float(price or 0.0)
+    n = [float(c) for c, _v, _f in legs.values()]
+    val = sum(float(v) for _c, v, _f in legs.values())
+    fee = sum(float(f) for _c, _v, f in legs.values())
+    if kind == "me_ask":
+        # sold YES here and on siblings: at most one of them wins
+        got = px * q + val - fee
+        worst, best = got - 100.0 * max([q] + n), got
+    elif kind == "pair_bid":
+        # bought YES here and on the twin: one of the two wins (a tie aside)
+        cost = px * q + val + fee
+        worst, best = 100.0 * min(q, sum(n)) - cost, 100.0 * max(q, sum(n)) - cost
+    elif kind == "ladder_ask":
+        # sold YES here, bought it on easier strikes (YES whenever this is)
+        got = px * q - val - fee
+        worst, best = got - 100.0 * max(0.0, q - sum(n)), got + 100.0 * sum(n)
+    elif kind == "ladder_bid":
+        # bought YES here, sold it on harder strikes (YES only when this is)
+        got = val - px * q - fee
+        worst, best = got + min(0.0, 100.0 * (q - sum(n))), got + 100.0 * q
+    else:
+        return None
+    return worst / 100.0, best / 100.0
+
+
 def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
     """The day's lock rows (comp_hedge_<date>.jsonl) and the open jobs now. A
     row without a `lead` flag predates the every-fill locks: a lead's."""
@@ -281,16 +318,52 @@ def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
                   if float(lg.get("filled", 0.0)) >= 0.5}
         if not lead and not traded:
             continue          # a fill still in its lock watch: nothing to report
+        # what it stands to make or lose with the legs traded so far
+        legs = {s: lg for s, lg in (j.get("legs") or {}).items()
+                if float(lg.get("filled", 0.0)) > 0}
+        outcome = (lock_outcomes(j.get("kind"), j.get("price"), q,
+                                 {s: (lg["filled"], lg["value"], lg.get("fee", 0.0))
+                                  for s, lg in legs.items()})
+                   if all("value" in lg for lg in legs.values()) else None)
         open_now.append(dict(id=j.get("id"), ticker=j.get("ticker"), side=j.get("side"),
                              kind=j.get("kind"), lead=lead, count=q, price=j.get("price"),
                              age_s=now_ts - float(j.get("at") or now_ts),
-                             traded=traded, best=j.get("best"),
+                             traded=traded, best=j.get("best"), outcome=outcome,
                              waiting=bool(j.get("waiting")), until=j.get("until")))
     return dict(opened=opened, done=done, expired=expired, never=never, sends=sends,
                 refused=refused, crossed=crossed, leg_fills=leg_fills, locked=locked,
                 open_now=open_now,
                 locks=dict(opened=l_open, done=l_done, none=l_none, unwound=l_unwound,
                            locked=l_locked, by_kind=dict(by_kind)))
+
+
+def gave_up_outcome(r: dict):
+    """lock_outcomes of a lock that gave up (an `expired` row, which keeps no
+    prices), rebuilt from its job's rows: the fill from its `open` row, the
+    legs from its `leg_fill` rows with the fee the bot books on each. A job's
+    id ends with the epoch second it opened. None when its open row is not
+    found. (A job cut to what its market still held before any leg traded
+    is priced at its opening count: its worst case reads deeper.)"""
+    try:
+        at = float(str(r.get("job")).rsplit("-", 1)[-1])
+    except ValueError:
+        return None
+    opened, legs = None, {}
+    for x in jsonl_rows("comp_hedge", at - 60, row_ts(r) or time.time()):
+        if x.get("job") != r.get("job"):
+            continue
+        if x.get("kind") == "open":
+            opened = x
+        elif x.get("kind") == "leg_fill":
+            n, px = float(x.get("count") or 0.0), float(x.get("px") or 0.0)
+            c, v, f = legs.get(x.get("ticker"), (0.0, 0.0, 0.0))
+            legs[x.get("ticker")] = (c + n, v + n * px, f + imm.taker_fee_cents(
+                px, n, imm.LOCK_MAKER_FEE_MULT))
+    if opened is None:
+        return None
+    # (a job opened before its event's group was read gets its kind later)
+    return lock_outcomes(r.get("lock") or opened.get("lock"), opened.get("px"),
+                         opened.get("count"), legs)
 
 
 def latest_estimates(tickers: set, a_ts: float, b_ts: float) -> dict:
@@ -426,12 +499,32 @@ def _until(j: dict, ctx: dict) -> str:
     return f"; its watch ended {_et(until)}, so it stays open only for the legs it has traded"
 
 
+def _stuck(h: dict) -> list:
+    """The open lock jobs half done (a leg traded) for over HEDGE_STUCK_SECS."""
+    return [j for j in h["open_now"] if j["traded"] and j["age_s"] >= HEDGE_STUCK_SECS]
+
+
+def _lock_level(outcome) -> int:
+    """A half-done or given-up lock: PROBLEM (2) when, as it stands, it can
+    lose LOCK_PROBLEM_USD or more, or it cannot be priced; WATCH (1) under
+    that (Jack 2026-10-30: "Yes, size-aware")."""
+    return 2 if outcome is None or outcome[0] <= -LOCK_PROBLEM_USD else 1
+
+
+def _sized(outcome) -> str:
+    if outcome is None:
+        return "; its dollars could not be priced"
+    return f"; as it stands {usd(outcome[0])} at worst, {usd(outcome[1])} at best"
+
+
 def verdict(ctx: dict) -> tuple:
     """(level, reasons): what needs a look, each reason naming the market and
-    what is left. PROBLEM: a lock gave up with legs traded, a lead fill never
-    locked, Kalshi refused a hedge order, or a lock has been half done for
-    over HEDGE_STUCK_SECS; WATCH: a complement-lead fill opened no lock job,
-    or a lock job is still working; OK otherwise."""
+    what is left. PROBLEM: a lead fill never locked, Kalshi refused a hedge
+    order, or a lock that gave up with legs traded or has been half done for
+    over HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD or more as it stands (or
+    cannot be priced); WATCH: such a lock that can lose less, a
+    complement-lead fill that opened no lock job, or a lock job still
+    working; OK otherwise."""
     reasons, level = [], 0
 
     def flag(lv, why):
@@ -441,8 +534,10 @@ def verdict(ctx: dict) -> tuple:
 
     h = ctx["hedges"]
     for r in h["expired"]:
-        flag(2, f"{r.get('ticker') or r.get('job')}: its lock gave up with legs traded and no "
-                f"full lock -- the traded legs now ride as inventory")
+        oc = r.get("outcome")
+        flag(_lock_level(oc), f"{r.get('ticker') or r.get('job')}: its lock gave up with legs "
+                              f"traded and no full lock -- the traded legs now ride as "
+                              f"inventory" + _sized(oc))
     if h["never"]:
         flag(2, f"{len(h['never'])} lead fill(s) were never locked: " + ", ".join(
             sorted({str(r.get("ticker") or r.get("job")) for r in h["never"]})))
@@ -451,17 +546,20 @@ def verdict(ctx: dict) -> tuple:
         flag(2, f"Kalshi refused {len(h['refused'])} hedge order(s) (first: "
                 f"{r0.get('ticker')} {r0.get('side')} {r0.get('count')} @ {r0.get('px')}c: "
                 f"{r0.get('error_body') or r0.get('error')})")
-    stuck = [j for j in h["open_now"] if j["traded"] and j["age_s"] >= HEDGE_STUCK_SECS]
+    stuck = _stuck(h)
     for j in stuck:
         legs = ", ".join(f"{q:g} of {s}" for s, q in j["traded"].items())
         what = "sold" if j.get("side") == "ask" else "bought"
         best = j.get("best")
-        flag(2, f"{j.get('ticker')}: the lock on a fill ({what} {float(j.get('count') or 0):g} @ "
-                f"{float(j.get('price') or 0):g}c) has been half done for {_age(j['age_s'])} -- "
-                f"{legs} traded, the other legs not"
-                + (f"; best floor {float(best):+.1f}c a contract" if best is not None else "")
-                + ("; its legs' books are off the feed" if j.get("waiting") else "")
-                + _until(j, ctx))
+        oc = j.get("outcome")
+        flag(_lock_level(oc),
+             f"{j.get('ticker')}: the lock on a fill ({what} {float(j.get('count') or 0):g} @ "
+             f"{float(j.get('price') or 0):g}c) has been half done for {_age(j['age_s'])} -- "
+             f"{legs} traded, the other legs not" + _sized(oc)
+             + (f"; a full lock priced at up to {float(best):+.1f}c a contract"
+                if best is not None else "")
+             + ("; its legs' books are off the feed" if j.get("waiting") else "")
+             + _until(j, ctx))
     # (a FAIR lead's fill has nothing to hedge on: never counted here)
     comp_fills = [f for f in ctx["fills"] if f.get("kind", "comp") == "comp"]
     if len(comp_fills) > len(h["opened"]):
@@ -477,17 +575,22 @@ def verdict(ctx: dict) -> tuple:
 def _short(ctx) -> str:
     """The verdict in a few words, for the subject."""
     h = ctx["hedges"]
-    stuck = [j for j in h["open_now"] if j["traded"] and j["age_s"] >= HEDGE_STUCK_SECS]
+    stuck = _stuck(h)
     young = [j for j in h["open_now"] if j not in stuck]
     bits = []
+
+    def worst(locks) -> str:
+        known = [x["outcome"][0] for x in locks if x.get("outcome") is not None]
+        return f" (worst {usd(sum(known))})" if known else ""
     if h["expired"]:
-        bits.append(f"{len(h['expired'])} lock gave up")
+        bits.append(f"{len(h['expired'])} lock gave up" + worst(h["expired"]))
     if h["never"]:
         bits.append(f"{len(h['never'])} lead fill never locked")
     if h["refused"]:
         bits.append(f"{len(h['refused'])} hedge order refused")
     if stuck:
-        bits.append(f"{len(stuck)} lock half done {_age(max(j['age_s'] for j in stuck))}")
+        bits.append(f"{len(stuck)} lock half done {_age(max(j['age_s'] for j in stuck))}"
+                    + worst(stuck))
     if young and not bits:
         bits.append(f"{len(young)} lock job working")
     return ", ".join(bits)
@@ -505,6 +608,8 @@ def build_report(day, now=None) -> dict:
     fills = lead_fills(list(jsonl_rows("fills", a_ts, b_ts)), leads)
     rows = [r for r in jsonl_rows("comp_hedge", a_ts, b_ts) if a_ts <= row_ts(r) < b_ts]
     hedges = hedge_summary(rows, load_jobs(), now.timestamp())
+    for r in hedges["expired"]:
+        r["outcome"] = gave_up_outcome(r)
     est = latest_estimates({t for t, _s in leads}, a_ts, b_ts)
     hourly, covered = load_hourly(a_ts, b_ts)
     value_fills(fills, load_marks(a_ts, now.timestamp()))
@@ -632,6 +737,9 @@ def render_text(ctx) -> str:
     out += ["", f"NEEDS A LOOK ({ctx['level']}):" if ctx["reasons"]
             else "NEEDS A LOOK: nothing."]
     out += [f"  - {r}" for r in ctx["reasons"]]
+    if h["expired"] or _stuck(h):
+        out.append(f"  (a lock left half done is a PROBLEM when it can lose "
+                   f"${LOCK_PROBLEM_USD:,.0f} or more as it stands, a WATCH under that)")
     # where the reward came from
     earners = sorted(((v, t) for t, v in rew.items() if v > 0), reverse=True)
     if earners:
