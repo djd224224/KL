@@ -21,6 +21,38 @@ def periods(run: datetime, ps):
     return [(run + timedelta(hours=12 * (i + 1)), p) for i, p in enumerate(ps)]
 
 
+_NET = []
+REAL_FETCH_NBS_HOURLY = r.fetch_nbs_hourly      # the reader itself, for its tests
+
+
+def setUpModule():
+    """No test reaches the network for the composite's short-range sources:
+    a test that wants them passes nbs_fn / nbs_hourly_fn itself."""
+    for name in ("fetch_nbs", "fetch_nbs_hourly"):
+        p = mock.patch.object(r, name, side_effect=RuntimeError("no network in tests"))
+        p.start()
+        _NET.append(p)
+
+
+def tearDownModule():
+    for p in _NET:
+        p.stop()
+
+
+# KATL's block of NOAA's 10/29 13Z NBS bulletin (blend_nbstx.t13z), rows the
+# parser reads plus two it skips
+KATL_13Z = """\
+ KATL    NBM V5.0 NBS GUIDANCE    10/29/2026  1300 UTC
+ DT /OCT  29/OCT  30                /OCT  31                /NOV   1
+ UTC  18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+ FHR  05 08 11 14 17 20 23 26 29 32 35 38 41 44 47 50 53 56 59 62 65 68 71
+ TMP  74 76 66 61 58 56 55 68 77 78 68 63 62 61 61 66 71 71 66 63 61 58 57
+ P06         0     0     0     0     0     0     0     0     2     9    14
+ P12                     0           0           0           2          16
+ SLV  78 81 82 83 83 82 83 84 84 84 85 85 86 86 87 92 88 91 96 99 97100100
+"""
+
+
 class TestParsing(unittest.TestCase):
     def test_station_and_window_from_the_rules(self):
         self.assertEqual(r.station_code(RULES.format(code="DJT")), "DJT")
@@ -324,6 +356,215 @@ class TestStations(unittest.TestCase):
         self.assertEqual(self._read(path)["markets"]["KXRAINWKND-26OCT17-NYC"]["station"],
                          "KNYC")
         never.assert_not_called()
+
+
+class TestNbsBulletin(unittest.TestCase):
+    """NOAA's hourly NBS text bulletin (THE COMPOSITE, Jack 2026-10-30:
+    "incorporate both hourly and 6 hours for a composite")."""
+
+    def test_a_block_reads_its_12_hour_pops_by_forecast_hour(self):
+        rt, per = r.parse_nbs_block(KATL_13Z)
+        self.assertEqual(rt, datetime(2026, 10, 29, 13, tzinfo=UTC))
+        self.assertEqual(per, [(datetime(2026, 10, 30, 12, tzinfo=UTC), 0.0),
+                               (datetime(2026, 10, 31, 0, tzinfo=UTC), 0.0),
+                               (datetime(2026, 10, 31, 12, tzinfo=UTC), 0.0),
+                               (datetime(2026, 11, 1, 0, tzinfo=UTC), 0.02),
+                               (datetime(2026, 11, 1, 12, tzinfo=UTC), 0.16)])
+        # a one-digit month is space-padded (" 9/24/2026"); no P12 row reads
+        # nothing; anything else is no block at all
+        sep = KATL_13Z.replace("10/29/2026  1300", " 9/24/2026  1100")
+        self.assertEqual(r.parse_nbs_block(sep)[0], datetime(2026, 9, 24, 11, tzinfo=UTC))
+        bare = "\n".join(ln for ln in KATL_13Z.splitlines() if not ln.startswith(" P12"))
+        self.assertEqual(r.parse_nbs_block(bare)[1], [])
+        self.assertEqual(r.parse_nbs_block("not a bulletin"), (None, []))
+        self.assertEqual(r.parse_nbs_block(""), (None, []))
+
+    def _bulletin(self, cyc: datetime, stations=("KATL", "KSEA"), filler=3):
+        hh = f"{cyc:%m/%d/%Y  %H}00"
+        out = [" 1\n", " " * 74 + "\n"]
+        for i in range(filler):                                   # other stations
+            out.append(KATL_13Z.replace("KATL", f"X{i:03d}").replace("10/29/2026  1300", hh))
+        for s in stations:
+            out.append(KATL_13Z.replace("KATL", s).replace("10/29/2026  1300", hh))
+        return "".join(out).encode("ascii")
+
+    class _Http:
+        """S3 stand-in: `files` maps cycle -> bytes; counts the reads."""
+
+        def __init__(self, files):
+            self.files, self.heads, self.ranges, self.wholes = files, 0, 0, 0
+
+        def _cycle(self, url):
+            seg = url.split("/blend.")[1]
+            return datetime.strptime(seg[:8] + seg[9:11], "%Y%m%d%H").replace(tzinfo=UTC)
+
+        def head(self, url, headers=None, timeout=None):
+            self.heads += 1
+            data = self.files.get(self._cycle(url))
+            return mock.Mock(status_code=200 if data is not None else 404,
+                             headers={"Content-Length": str(len(data or b""))})
+
+        def get(self, url, headers=None, timeout=None, stream=False):
+            data = self.files[self._cycle(url)]
+            rng = (headers or {}).get("Range")
+            if rng:
+                self.ranges += 1
+                a, b = (int(x) for x in rng.split("=")[1].split("-"))
+                return mock.Mock(status_code=206, content=data[a:b + 1])
+            self.wholes += 1
+            resp = mock.Mock(status_code=200)
+            resp.iter_content = lambda n: (data[i:i + n] for i in range(0, len(data), n))
+            return resp
+
+    def test_the_newest_posted_cycle_by_range_once_its_layout_is_known(self):
+        now = datetime(2026, 10, 30, 14, 20, tzinfo=UTC)
+        c13, c12 = datetime(2026, 10, 30, 13, tzinfo=UTC), datetime(2026, 10, 30, 12, tzinfo=UTC)
+        http = self._Http({c12: self._bulletin(c12), c13: self._bulletin(c13)})
+        with mock.patch.object(r, "NBS_HOURLY_MAX_BPS", 0):
+            cyc, got, idx, how = REAL_FETCH_NBS_HOURLY(["KATL", "KSEA", "KZZZ"], now, {}, http=http)
+        # 13Z is the newest posted (14Z is not); the first read is whole and
+        # indexes the layout, KZZZ noted absent
+        self.assertEqual((cyc, sorted(got), http.wholes, http.ranges), (c13, ["KATL", "KSEA"], 1, 0))
+        self.assertIn("whole file", how)
+        lay = idx["sizes"][str(len(http.files[c13]))]
+        self.assertEqual(lay["absent"], ["KZZZ"])
+        self.assertEqual(got["KATL"][0], c13)
+        # the fixture is restamped 10/30 13Z: its 71-hour column ends 11/02 12Z
+        self.assertEqual(got["KATL"][1][-1], (datetime(2026, 11, 2, 12, tzinfo=UTC), 0.16))
+        # the next cycle, same layout: two byte ranges, no whole file
+        c14 = datetime(2026, 10, 30, 14, tzinfo=UTC)
+        http.files[c14] = self._bulletin(c14)
+        cyc, got, idx, how = REAL_FETCH_NBS_HOURLY(["KATL", "KSEA", "KZZZ"],
+                                                now + timedelta(hours=1), idx, http=http)
+        self.assertEqual((cyc, how, http.wholes, http.ranges), (c14, "by range", 1, 2))
+        self.assertEqual(got["KSEA"][0], c14)
+
+    def test_a_new_or_shifted_layout_is_read_whole_and_nothing_posted_is_none(self):
+        now = datetime(2026, 10, 30, 14, 20, tzinfo=UTC)
+        c13 = datetime(2026, 10, 30, 13, tzinfo=UTC)
+        http = self._Http({c13: self._bulletin(c13)})
+        with mock.patch.object(r, "NBS_HOURLY_MAX_BPS", 0):
+            _c, _g, idx, _h = REAL_FETCH_NBS_HOURLY(["KATL"], now, {}, http=http)
+            # a cycle with one more station ahead of ours: a new size, read whole
+            c14 = datetime(2026, 10, 30, 14, tzinfo=UTC)
+            http.files[c14] = self._bulletin(c14, filler=4)
+            cyc, got, idx, how = REAL_FETCH_NBS_HOURLY(["KATL"], now + timedelta(hours=1), idx,
+                                                    http=http)
+            self.assertEqual((cyc, http.wholes, len(idx["sizes"])), (c14, 2, 2))
+            # same size as 13Z's but the stations reordered: the range reads
+            # another station's block, so the file is read whole again
+            c15 = datetime(2026, 10, 30, 15, tzinfo=UTC)
+            http.files[c15] = self._bulletin(c15, stations=("KSEA", "KATL"))
+            self.assertEqual(len(http.files[c15]), len(http.files[c13]))
+            cyc, got, idx, how = REAL_FETCH_NBS_HOURLY(["KATL"], now + timedelta(hours=2), idx,
+                                                    http=http)
+            self.assertEqual((cyc, http.wholes, got["KATL"][0]), (c15, 3, c15))
+        # nothing posted inside the lookback
+        cyc, got, idx2, how = REAL_FETCH_NBS_HOURLY(["KATL"], now + timedelta(days=2), idx,
+                                                 http=http)
+        self.assertEqual((cyc, got), (None, {}))
+        self.assertIn("no cycle posted", how)
+
+
+class TestComposite(unittest.TestCase):
+    """THE COMPOSITE: NBS_W_HOURLY x the newest hourly cycle + the rest x the
+    newest 6-hourly one on the periods both reach, either alone where only it
+    does, the NBE for the rest; the lead off the freshest run used."""
+    NOW = datetime(2026, 10, 15, 14, 30, tzinfo=UTC)
+    E_RUN = datetime(2026, 10, 15, 12, tzinfo=UTC)       # the NBE's newest
+    S_RUN = datetime(2026, 10, 15, 12, tzinfo=UTC)       # the IEM's 6-hourly
+    H_RUN = datetime(2026, 10, 15, 13, tzinfo=UTC)       # NOAA's hourly
+    T = "KXRAINWKND-26OCT17-NYC"
+
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
+        self.events = {"KXRAINWKND-26OCT17": {"sat": "2026-10-17", "markets": {
+            self.T: {"code": "NYC", "span": ["2026-10-17", "2026-10-18"]}}}}
+        self.calls = {"E": 0, "S": 0, "H": 0}
+
+    def ep(self):
+        return periods(self.E_RUN, [0.3] * 20)
+
+    def sp(self):
+        return periods(self.S_RUN, [0.6] * 6)            # to 10/18 12Z
+
+    def hp(self):
+        return periods(self.S_RUN, [0.2] * 7)            # one period further
+
+    def e(self, sid):
+        self.calls["E"] += 1
+        return self.E_RUN, self.ep()
+
+    def s(self, sid):
+        self.calls["S"] += 1
+        return self.S_RUN, self.sp()
+
+    def h(self, sids, now, index):
+        self.calls["H"] += 1
+        return self.H_RUN, {sid: (self.H_RUN, self.hp()) for sid in sids}, {"sizes": {}}, "x"
+
+    def _write(self, now=None, **kw):
+        fns = dict(nbe_fn=self.e, nbs_fn=self.s, nbs_hourly_fn=self.h)
+        fns.update(kw)
+        r.write_fair_file(self.path, now=now or self.NOW, events=self.events, **fns)
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _expect(self, merged, rt, lag):
+        return r.market_fair(sorted(merged.items()), rt, SAT, 5, lag_hours=lag)["p"]
+
+    def test_hourly_and_6_hourly_blend_where_both_reach(self):
+        d = self._write()
+        m = d["markets"][self.T]
+        sp, hp = dict(self.sp()), dict(self.hp())
+        merged = dict(self.ep())
+        for ft in set(sp) | set(hp):
+            merged[ft] = (0.75 * hp[ft] + 0.25 * sp[ft]) if ft in sp and ft in hp else hp[ft]
+        self.assertEqual(r.NBS_W_HOURLY, 0.75)                 # the backtested weight
+        self.assertAlmostEqual(m["p"], self._expect(merged, self.H_RUN, 1.0), places=4)
+        self.assertEqual((m["src"], m["run"]), ("H+S+E", self.H_RUN.isoformat()))
+        self.assertEqual(m["runs"], {"E": self.E_RUN.isoformat(), "S": self.S_RUN.isoformat(),
+                                     "H": self.H_RUN.isoformat()})
+        self.assertEqual(d["nbs_hourly"]["cycle"], self.H_RUN.isoformat())
+        # all weight on the hourly cycle: the 6-hourly run adds nothing it covers
+        with mock.patch.object(r, "NBS_W_HOURLY", 1.0):
+            m1 = self._write(now=self.NOW + timedelta(minutes=1))["markets"][self.T]
+        only_h = dict(self.ep())
+        only_h.update(hp)
+        self.assertAlmostEqual(m1["p"], self._expect(only_h, self.H_RUN, 1.0), places=4)
+
+    def test_a_source_that_fails_or_ages_out_leaves_the_composite(self):
+        def down(*a, **k):
+            raise ConnectionError("down")
+        m = self._write(nbs_fn=down, nbs_hourly_fn=down)["markets"][self.T]
+        self.assertEqual(m["src"], "E")
+        self.assertAlmostEqual(m["p"], r.market_fair(self.ep(), self.E_RUN, SAT, 5)["p"],
+                               places=4)
+        # an hourly cycle older than NBS_HOURLY_MAX_AGE_HOURS drops out, the
+        # 6-hourly run stays
+        old = self.H_RUN - timedelta(hours=7)
+        old_h = lambda sids, now, idx: (old, {s: (old, self.hp()) for s in sids}, {}, "x")
+        os.remove(self.path)
+        self.assertEqual(self._write(nbs_hourly_fn=old_h)["markets"][self.T]["src"], "S+E")
+        with mock.patch.object(r, "NBS_ENABLE", False),                 mock.patch.object(r, "NBS_HOURLY_ENABLE", False):
+            os.remove(self.path)
+            self.assertEqual(self._write()["markets"][self.T]["src"], "E")
+
+    def test_the_iem_and_noaa_are_read_only_when_a_newer_run_is_due(self):
+        self._write()
+        self.assertEqual(self.calls, {"E": 1, "S": 1, "H": 1})
+        # 15 minutes on: nothing newer is due anywhere -- every source cached
+        self._write(now=self.NOW + timedelta(minutes=15))
+        self.assertEqual(self.calls, {"E": 1, "S": 1, "H": 1})
+        # 15:00Z: the 14Z hourly cycle is due (13Z + 1h + its ~1h posting)
+        self._write(now=datetime(2026, 10, 15, 15, 0, tzinfo=UTC))
+        self.assertEqual(self.calls, {"E": 1, "S": 1, "H": 2})
+        # 19:01Z: the IEM's 18Z 6-hourly run (12Z + 6h, an hour on)
+        self._write(now=datetime(2026, 10, 15, 19, 1, tzinfo=UTC))
+        self.assertEqual(self.calls["S"], 2)
+        # 01:01Z next day: the NBE's 00Z run (12Z + 12h, an hour on)
+        self._write(now=datetime(2026, 10, 16, 1, 1, tzinfo=UTC))
+        self.assertEqual(self.calls["E"], 2)
 
 
 if __name__ == "__main__":

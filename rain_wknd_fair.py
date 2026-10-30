@@ -16,7 +16,9 @@ The bot quotes the family only before the weekend (out at 00:00 ET Saturday),
 so this is a forecast model, no observation layer: the National Blend of
 Models' station guidance (NBE, via the Iowa Environmental Mesonet's public
 api/1/mos.json -- the IEM the rain monthlies already read), its 12-hour
-probabilities of >= 0.01 in (p12, valid for the 12 hours ending at ftime).
+probabilities of >= 0.01 in (p12, valid for the 12 hours ending at ftime) --
+since 2026-10-30 a composite with the Blend's short-range NBS, hourly from
+NOAA and 6-hourly from the IEM, wherever it reaches (THE COMPOSITE below).
 Over the 12-hour periods overlapping the window [Sat 00:00, Mon 00:00) local
 standard time, with overlap fractions f_i:
     L     = sum f_i * ln(1 - p_i)
@@ -110,6 +112,46 @@ MIN_PERIODS = 10             # a run read back with fewer rows is a failed read
 NBE_LAG_HOURS = 3.0          # a run is usable ~3h after its nominal time
 NBE_MAX_AGE_HOURS = float(os.environ.get("IMM_RAIN_WKND_NBE_MAX_AGE_HOURS", "30"))
 MAX_LEAD_HOURS = float(os.environ.get("IMM_RAIN_WKND_MAX_LEAD_HOURS", "144"))
+# THE COMPOSITE (Jack 2026-10-30: "incorporate both hourly and 6 hours for a
+# composite"). The NBE above is issued twice a day (00Z/12Z, at the IEM ~1-2h
+# later), so a fair could lag the forecast by 14 hours. The Blend's
+# short-range text guidance (NBS: 12-hour PoPs, ending 00Z/12Z, to ~72 hours
+# out) is issued EVERY HOUR -- NOAA's blend_nbstx bulletins, on AWS
+# (noaa-nbm-grib2-pds) ~57 min after the cycle -- and the IEM carries its
+# 00/06/12/18Z cycles. Every 12-hour period the NBS covers takes
+# NBS_W_HOURLY x the newest hourly cycle + (1 - NBS_W_HOURLY) x the newest
+# 6-hourly one (either alone where only it reaches), the NBE the rest of the
+# window, and the lead is measured from the freshest run used. A source that
+# fails or ages out (NBS_HOURLY_MAX_AGE_HOURS, NBS_MAX_AGE_HOURS) drops out
+# of the composite and the others carry on; nothing short-range at all is
+# the NBE fair as before. The IEM's runs are read only once a newer one is
+# due (NBE every 12h, NBS every 6h), so the 15-minute refresh costs the IEM
+# fewer reads than the 30-minute one did.
+# THE WEIGHT, backtested 10/30 on 2,730 station-times (the 35 stations x 26
+# weekends of May-Oct 2026 x Thu 12Z / Fri 00Z / Fri 12Z; the hourly cycle an
+# hour before each time, from AWS's archive; ACIS outcomes), Brier:
+#   NBE alone (the fair to now) 0.1248, 6-hourly + NBE 0.1225, hourly + NBE
+#   0.1212; composite at w 0.25 / 0.5 / 0.75 / 1: 0.1216 / 0.1212 / 0.1211 /
+#   0.1212.
+# w 0.75 beats the NBE by 0.0037 (95% weekend-bootstrap CI 0.0018-0.0061,
+# 19 of 26 weekends) and the 6-hourly hybrid by 0.0015 (0.0001-0.0029); it
+# ties the hourly alone (+0.0001, CI -0.0003..+0.0005) and keeps the
+# 6-hourly run in the blend for the hours NOAA's feed is late or down.
+NBS_ENABLE = os.environ.get("IMM_RAIN_WKND_NBS", "1") == "1"
+NBS_HOURLY_ENABLE = os.environ.get("IMM_RAIN_WKND_NBS_HOURLY", "1") == "1"
+NBS_HOURLY_URL = os.environ.get("IMM_RAIN_WKND_NBS_HOURLY_URL",
+                                "https://noaa-nbm-grib2-pds.s3.amazonaws.com")
+NBS_W_HOURLY = float(os.environ.get("IMM_RAIN_WKND_NBS_W_HOURLY", "0.75"))
+NBS_LAG_HOURS = 2.0          # the IEM posts a 6-hourly cycle ~1.5-2h after it
+NBS_HOURLY_LAG_HOURS = 1.0   # NOAA posts an hourly cycle ~57 min after it
+NBS_MAX_AGE_HOURS = 12.0     # an older 6-hourly run leaves the composite
+NBS_HOURLY_MAX_AGE_HOURS = 6.0
+NBS_MIN_PERIODS = 4          # NBS's ~72 hours hold 5-6 twelve-hour PoPs
+NBS_HOURLY_LOOKBACK = 4      # cycles back searched for the newest posted one
+NBS_HOURLY_SIZES = 6         # file layouts (by size) the byte-range index keeps
+NBS_HOURLY_MAX_BPS = float(os.environ.get("IMM_RAIN_WKND_NBS_MAX_BPS", "2000000"))
+NBE_EVERY_HOURS = 12.0       # how often a new run is due (from its last one)
+NBS_EVERY_HOURS = 6.0
 EVENTS_TTL_SECS = 3600
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
@@ -193,12 +235,14 @@ def weekend_p(periods: List[Tuple[datetime, float]], ws: datetime, we: datetime
 
 
 def market_fair(periods: List[Tuple[datetime, float]], runtime: datetime,
-                sat: date, lst_hours: int) -> Optional[dict]:
+                sat: date, lst_hours: int,
+                lag_hours: float = NBE_LAG_HOURS) -> Optional[dict]:
     """{'p', 'p_raw', 'lead_h', 'coverage'} for one city's weekend, else None
     (a weekend that has started, a lead past the fit, or periods that do not
-    cover it)."""
+    cover it). The lead runs from `runtime` + `lag_hours` (the composite's:
+    its freshest run's)."""
     ws, we = window(sat, lst_hours)
-    lead = (ws - (runtime + timedelta(hours=NBE_LAG_HOURS))).total_seconds() / 3600.0
+    lead = (ws - (runtime + timedelta(hours=lag_hours))).total_seconds() / 3600.0
     if lead < 0 or lead > MAX_LEAD_HOURS:
         return None
     r = weekend_p(periods, ws, we)
@@ -218,7 +262,8 @@ def _ts(s: str) -> Optional[datetime]:
 
 
 def parse_nbe(payload: dict) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
-    """(latest runtime, [(ftime, p12)]) from IEM api/1/mos.json (NBE)."""
+    """(latest runtime, [(ftime, p12)]) from IEM api/1/mos.json (NBE or NBS:
+    the same rows)."""
     rows = (payload or {}).get("data") or []
     runs: Dict[datetime, List[Tuple[datetime, float]]] = {}
     for r in rows:
@@ -235,11 +280,148 @@ def parse_nbe(payload: dict) -> Tuple[Optional[datetime], List[Tuple[datetime, f
     return rt, sorted(runs[rt])
 
 
-def fetch_nbe(station: str) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
-    r = requests.get(NBE_URL, params={"station": station, "model": "NBE"},
-                     timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+IEM_GAP_SECS = 0.5     # between our IEM reads (its limiter refuses a burst)
+_iem_last = [0.0]
+
+
+def _iem_mos(station: str, model: str) -> dict:
+    wait = _iem_last[0] + IEM_GAP_SECS - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        r = requests.get(NBE_URL, params={"station": station, "model": model},
+                         timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+    finally:
+        _iem_last[0] = time.monotonic()
     r.raise_for_status()
-    return parse_nbe(r.json())
+    return r.json()
+
+
+def fetch_nbe(station: str) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
+    return parse_nbe(_iem_mos(station, "NBE"))
+
+
+def fetch_nbs(station: str) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
+    """The IEM's latest 6-hourly NBS run for `station` (THE COMPOSITE)."""
+    return parse_nbe(_iem_mos(station, "NBS"))
+
+
+# (the bulletin pads a one-digit month or day with a space: " 9/24/2026")
+_NBS_HDR = r"^ (\S+)\s+NBM V[\d.]+ NBS GUIDANCE\s+(\d{1,2})/\s*(\d{1,2})/(\d{4})\s+(\d\d)00 UTC"
+_NBS_HDR_RE = re.compile(_NBS_HDR)
+_NBS_HDR_BYTES_RE = re.compile(_NBS_HDR.encode("ascii"), re.M)
+
+
+def parse_nbs_block(block: str) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
+    """(runtime, [(ftime, p12)]) from one station's block of NOAA's NBS text
+    bulletin: a header naming the station and cycle, then rows of a 5-char
+    label (" FHR ") and fixed 3-char fields -- FHR gives each column's hours
+    after the run, P12 the 12-hour PoP (percent) ending there."""
+    lines = (block or "").splitlines()
+    m = _NBS_HDR_RE.match(lines[0]) if lines else None
+    if not m:
+        return None, []
+    rt = datetime(int(m.group(4)), int(m.group(2)), int(m.group(3)), int(m.group(5)),
+                  tzinfo=timezone.utc)
+    rows = {ln[1:4]: ln for ln in lines[1:] if len(ln) > 4}
+    fhr, p12 = rows.get("FHR"), rows.get("P12")
+    if fhr is None or p12 is None:
+        return rt, []
+    out = []
+    for i in range((len(fhr) - 5) // 3):
+        h = fhr[5 + 3 * i: 8 + 3 * i].strip()
+        v = p12[5 + 3 * i: 8 + 3 * i].strip()
+        if h.isdigit() and v.isdigit():
+            out.append((rt + timedelta(hours=int(h)), float(v) / 100.0))
+    return rt, out
+
+
+def nbs_blocks(data: bytes, sids) -> Dict[str, Tuple[int, int, str]]:
+    """{station: (offset, length, text)} for `sids` in a whole NBS bulletin."""
+    hdr = list(_NBS_HDR_BYTES_RE.finditer(data))
+    want = set(sids)
+    out = {}
+    for i, m in enumerate(hdr):
+        sid = m.group(1).decode("ascii", "replace")
+        if sid in want:
+            end = hdr[i + 1].start() if i + 1 < len(hdr) else len(data)
+            out[sid] = (m.start(), end - m.start(),
+                        data[m.start():end].decode("ascii", "replace"))
+    return out
+
+
+def _download(http, url: str, hdrs: dict) -> bytes:
+    """A whole file, read at most NBS_HOURLY_MAX_BPS (a ~30 MB bulletin
+    must not crowd the bots' own connection)."""
+    r = http.get(url, headers=hdrs, timeout=max(HTTP_TIMEOUT, 120), stream=True)
+    r.raise_for_status()
+    buf = bytearray()
+    t0 = time.monotonic()
+    for chunk in r.iter_content(65536):
+        buf += chunk
+        if NBS_HOURLY_MAX_BPS > 0:
+            ahead = len(buf) / NBS_HOURLY_MAX_BPS - (time.monotonic() - t0)
+            if ahead > 0:
+                time.sleep(ahead)
+    return bytes(buf)
+
+
+def fetch_nbs_hourly(sids, now: datetime, index: dict, http=requests
+                     ) -> Tuple[Optional[datetime], Dict[str, Tuple[datetime, list]], dict, str]:
+    """(cycle, {station: (runtime, periods)}, index, how) from the newest
+    hourly NBS bulletin NOAA has posted (this hour's cycle -- posted in its
+    last minutes -- back to NBS_HOURLY_LOOKBACK hours). `index` ({'sizes':
+    {size: {'offsets': {sid: [off,
+    len]}, 'absent': [sid]}}}) is where each station's block sat in the last
+    whole file of each size, and which were not in it (the off-hour cycles
+    share one layout, the 00/06/12/18Z ones another): a file of a known size
+    is read by byte range, every block checked to be its station's for this
+    cycle; a new size, a station that layout never looked for, or a block
+    that is not its station's is read whole once (_download) and that size's
+    layout rebuilt -- the last NBS_HOURLY_SIZES are kept. (None, {}, index,
+    why) when none is posted."""
+    base = now.replace(minute=0, second=0, microsecond=0)
+    hdrs = {"User-Agent": USER_AGENT}
+    sizes = dict((index or {}).get("sizes") or {})
+    for back in range(0, NBS_HOURLY_LOOKBACK + 1):
+        cyc = base - timedelta(hours=back)
+        url = (f"{NBS_HOURLY_URL}/blend.{cyc:%Y%m%d}/{cyc:%H}/text/"
+               f"blend_nbstx.t{cyc:%H}z")
+        h = http.head(url, headers=hdrs, timeout=HTTP_TIMEOUT)
+        if h.status_code != 200:
+            continue
+        size = str(int(h.headers.get("Content-Length") or 0))
+        got: Dict[str, Tuple[datetime, list]] = {}
+        lay = sizes.get(size) or {}
+        offs = lay.get("offsets") or {}
+        absent = set(lay.get("absent") or ())
+        need = [s for s in sids if s not in absent]
+        if offs and need and all(s in offs for s in need):
+            for sid in need:
+                off, ln = offs[sid]
+                r = http.get(url, headers=dict(hdrs, Range=f"bytes={off}-{off + ln - 1}"),
+                             timeout=HTTP_TIMEOUT)
+                txt = r.content.decode("ascii", "replace") if r.status_code == 206 else ""
+                rt, per = parse_nbs_block(txt)
+                if not txt.startswith(f" {sid} ") or rt != cyc:
+                    got = {}
+                    break
+                got[sid] = (rt, per)
+            if len(got) == len(need):
+                return cyc, got, {"sizes": sizes}, "by range"
+        blocks = nbs_blocks(_download(http, url, hdrs), sids)
+        sizes.pop(size, None)
+        sizes[size] = {"offsets": {s: [o, ln] for s, (o, ln, _t) in blocks.items()},
+                       "absent": sorted(set(sids) - set(blocks))}
+        while len(sizes) > NBS_HOURLY_SIZES:
+            sizes.pop(next(iter(sizes)))
+        for sid, (_o, _l, txt) in blocks.items():
+            rt, per = parse_nbs_block(txt)
+            if rt == cyc:
+                got[sid] = (rt, per)
+        return cyc, got, {"sizes": sizes}, "whole file (its layout indexed)"
+    return None, {}, {"sizes": sizes}, ("no cycle posted in the last %d hours"
+                                        % NBS_HOURLY_LOOKBACK)
 
 
 def _cached_nbe(c: dict) -> Tuple[Optional[datetime], List[Tuple[datetime, float]]]:
@@ -256,14 +438,15 @@ def _cached_nbe(c: dict) -> Tuple[Optional[datetime], List[Tuple[datetime, float
     return (rt, sorted(per)) if rt is not None and per else (None, [])
 
 
-def station_run(sid: str, cache: dict, nbe_fn: Callable
+def station_run(sid: str, cache: dict, nbe_fn: Callable,
+                min_periods: int = MIN_PERIODS
                 ) -> Tuple[Tuple[Optional[datetime], list], Optional[str]]:
     """(the newer of the station's fresh read and the file's copy, the read's
-    error or None). A run with fewer than MIN_PERIODS rows is a failed read."""
+    error or None). A run with fewer than `min_periods` rows is a failed read."""
     err = None
     try:
         rt, per = nbe_fn(sid)
-        if rt is None or len(per) < MIN_PERIODS:
+        if rt is None or len(per) < min_periods:
             raise ValueError(f"run {rt} with {len(per)} periods")
     except Exception as ex:
         rt, per = None, []
@@ -272,6 +455,18 @@ def station_run(sid: str, cache: dict, nbe_fn: Callable
     if crt is not None and (rt is None or crt > rt):
         return (crt, cper), err
     return (rt, per), err
+
+
+def due_run(sid: str, cache: dict, fn: Callable, now: datetime, every_h: float,
+            min_periods: int = MIN_PERIODS
+            ) -> Tuple[Tuple[Optional[datetime], list], Optional[str]]:
+    """station_run, but the IEM is asked only once a newer run is due: an
+    hour past the file's run + `every_h`, then each pass until it shows."""
+    crt, cper = _cached_nbe(cache.get(sid) or {})
+    if crt is not None and len(cper) >= min_periods \
+            and now < crt + timedelta(hours=every_h + 1.0):
+        return (crt, cper), None
+    return station_run(sid, cache, fn, min_periods)
 
 
 def _get_json(url: str, params: Optional[dict] = None) -> dict:
@@ -375,15 +570,19 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     get_json: Optional[Callable] = None,
                     events: Optional[Dict[str, dict]] = None,
                     nbe_fn: Callable = fetch_nbe,
-                    resolve_fn: Optional[Callable] = None) -> Tuple[int, int]:
+                    resolve_fn: Optional[Callable] = None,
+                    nbs_fn: Optional[Callable] = None,
+                    nbs_hourly_fn: Optional[Callable] = None) -> Tuple[int, int]:
     """Build and atomically write the weekend-rain fair file; returns
     (markets with a fair, open markets without one). Kalshi's open events
     are re-read hourly, and every pass while none is open (the Monday gap
     between a weekend's close and the next listing); a failed read reuses
-    the cache. Each station's NBE run is read every pass, and a failed read
-    falls back to the file's copy of the run (still subject to
-    NBE_MAX_AGE_HOURS). A code no STATIONS row maps is auto-mapped
-    (resolve_fn, default resolve_station; see AUTO-MAPPED STATIONS)."""
+    the cache. Each station's NBE and 6-hourly NBS runs are read once a newer
+    one is due (due_run), the newest hourly NBS cycle once NOAA has posted it
+    (nbs_hourly_fn, default fetch_nbs_hourly), and a failed read falls back to
+    the file's copy (still subject to each source's age limit): THE
+    COMPOSITE. A code no STATIONS row maps is auto-mapped (resolve_fn,
+    default resolve_station; see AUTO-MAPPED STATIONS)."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
@@ -425,10 +624,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             _log(f"! station {code} unmapped, its markets stand aside: "
                  f"{unmapped[code]['why']}")
     stamp = now.isoformat()
-    nbe: Dict[str, Tuple[Optional[datetime], list]] = {}
-    failed: Dict[str, str] = {}
     markets: Dict[str, dict] = {}
     missing: Dict[str, str] = {}
+    # 1. the markets to price, and the stations they need
+    todo: List[Tuple[str, str, date, str, int]] = []
     for ev, e in events.items():
         sat = date.fromisoformat(e["sat"])
         for t, mk in sorted(e["markets"].items()):
@@ -447,32 +646,105 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
             if now >= window(sat, lst)[0]:
                 missing[t] = "weekend started"
                 continue
-            if sid not in nbe:
-                nbe[sid], err = station_run(sid, nbe_cache, nbe_fn)
-                if err:
-                    failed[sid] = err
-            rt, periods = nbe[sid]
-            if rt is None or (ts - rt.timestamp()) / 3600.0 > NBE_MAX_AGE_HOURS:
-                missing[t] = "no fresh NBE run"
-                continue
-            f = market_fair(periods, rt, sat, lst)
-            if f is None:
-                missing[t] = "lead past the fit or periods short of the weekend"
-                continue
-            markets[t] = dict(f, event=ev, station=sid, run=rt.isoformat(),
-                              fetched_at=stamp)
+            todo.append((t, ev, sat, sid, lst))
+    sids = sorted({sid for _t, _e, _s, sid, _l in todo})
+    # 2. each source once per station: the NBE and the 6-hourly NBS from the
+    # IEM when a newer run is due, the newest hourly NBS cycle from NOAA
+    nbe: Dict[str, Tuple[Optional[datetime], list]] = {}
+    nbs: Dict[str, Tuple[Optional[datetime], list]] = {}
+    failed: Dict[str, str] = {}
+    nbs_failed: Dict[str, str] = {}
+    nbs_cache = old.get("nbs") or {}
+    for sid in sids:
+        nbe[sid], err = due_run(sid, nbe_cache, nbe_fn, now, NBE_EVERY_HOURS)
+        if err:
+            failed[sid] = err
+        if NBS_ENABLE:
+            nbs[sid], err = due_run(sid, nbs_cache, nbs_fn or fetch_nbs, now,
+                                    NBS_EVERY_HOURS, NBS_MIN_PERIODS)
+            if err:
+                nbs_failed[sid] = err
+    hourly_old = old.get("nbs_hourly") or {}
+    h_cycle = _ts(str(hourly_old.get("cycle") or ""))
+    h_index = hourly_old.get("index") or {}
+    h_runs: Dict[str, Tuple[Optional[datetime], list]] = {
+        sid: _cached_nbe(c) for sid, c in (hourly_old.get("runs") or {}).items()}
+    h_searched = set(hourly_old.get("searched") or ())
+    if NBS_HOURLY_ENABLE and sids and (
+            h_cycle is None or now >= h_cycle + timedelta(hours=1 + NBS_HOURLY_LAG_HOURS)
+            or any(sid not in h_runs and sid not in h_searched for sid in sids)):
+        try:
+            cyc, got, h_index, how = (nbs_hourly_fn or fetch_nbs_hourly)(sids, now, h_index)
+            if cyc is not None and (h_cycle is None or cyc > h_cycle
+                                    or any(s not in h_runs for s in got)):
+                h_cycle, h_runs = cyc, got
+                h_searched = set(sids)
+                _log(f"NBS hourly cycle {cyc:%Y-%m-%d %H}Z: {len(got)} of {len(sids)} "
+                     f"station(s), {how}")
+        except Exception as ex:
+            _log(f"NBS hourly read failed ({type(ex).__name__}: {str(ex)[:120]}); "
+                 f"the file's cycle stands in while young enough")
+    # 3. each market's composite: the NBS periods (hourly and 6-hourly blended
+    # where both reach), the NBE for the rest, the lead off the freshest run
+    for t, ev, sat, sid, lst in todo:
+        srcs = []
+        e_rt, e_per = nbe.get(sid) or (None, [])
+        if e_rt is not None and (ts - e_rt.timestamp()) / 3600.0 <= NBE_MAX_AGE_HOURS:
+            srcs.append(("E", e_rt, NBE_LAG_HOURS, dict(e_per)))
+        s_rt, s_per = nbs.get(sid) or (None, [])
+        if s_rt is not None and len(s_per) >= NBS_MIN_PERIODS \
+                and (ts - s_rt.timestamp()) / 3600.0 <= NBS_MAX_AGE_HOURS:
+            srcs.append(("S", s_rt, NBS_LAG_HOURS, dict(s_per)))
+        h_rt, h_per = h_runs.get(sid) or (None, [])
+        if NBS_HOURLY_ENABLE and h_rt is not None and len(h_per) >= NBS_MIN_PERIODS \
+                and (ts - h_rt.timestamp()) / 3600.0 <= NBS_HOURLY_MAX_AGE_HOURS:
+            srcs.append(("H", h_rt, NBS_HOURLY_LAG_HOURS, dict(h_per)))
+        if not srcs:
+            missing[t] = "no fresh NBE run"
+            continue
+        by = {k: per for k, _rt, _lag, per in srcs}
+        merged = dict(by.get("E") or {})
+        hd, sd = by.get("H") or {}, by.get("S") or {}
+        for ft in set(hd) | set(sd):
+            if ft in hd and ft in sd:
+                merged[ft] = NBS_W_HOURLY * hd[ft] + (1.0 - NBS_W_HOURLY) * sd[ft]
+            else:
+                merged[ft] = hd[ft] if ft in hd else sd[ft]
+        # the freshest run: the newest runtime (a tie, the one posted soonest)
+        _k, f_rt, f_lag, _p = max(srcs, key=lambda s: (s[1], -s[2]))
+        f = market_fair(sorted(merged.items()), f_rt, sat, lst, lag_hours=f_lag)
+        if f is None:
+            missing[t] = ("lead past the fit or periods short of the weekend" if "E" in by
+                          else "no fresh NBE run, and the NBS alone does not cover the weekend")
+            continue
+        markets[t] = dict(f, event=ev, station=sid, run=f_rt.isoformat(),
+                          fetched_at=stamp, src="+".join(k for k in ("H", "S", "E") if k in by),
+                          runs={k: rt.isoformat() for k, rt, _lag, _p in srcs})
     if failed:
         sid, err = sorted(failed.items())[0]
         _log(f"NBE read failed for {len(failed)} station(s) ({sid}: {err}); "
              "the file's runs stand in while young enough")
-    runs = {sid: {"run": rt.isoformat(),
-                  "periods": [[ft.isoformat(), p] for ft, p in per]}
-            for sid, (rt, per) in sorted(nbe.items()) if rt is not None}
+    if nbs_failed:
+        sid, err = sorted(nbs_failed.items())[0]
+        _log(f"NBS (6-hourly) read failed for {len(nbs_failed)} station(s) ({sid}: {err}); "
+             "the file's runs stand in while young enough")
+
+    def _runs(d):
+        return {sid: {"run": rt.isoformat(),
+                      "periods": [[ft.isoformat(), p] for ft, p in per]}
+                for sid, (rt, per) in sorted(d.items()) if rt is not None}
     payload = {"generated_at": stamp, "events_at": events_at, "open_events": events,
-               "markets": markets, "missing": missing, "nbe": runs,
+               "markets": markets, "missing": missing, "nbe": _runs(nbe),
+               "nbs": _runs(nbs),
+               "nbs_hourly": {"cycle": h_cycle.isoformat() if h_cycle else None,
+                              "index": h_index, "runs": _runs(h_runs),
+                              "searched": sorted(h_searched)},
                "auto_stations": auto, "unmapped": unmapped,
                "model": {"w": W, "recal": RECAL, "min_coverage": MIN_COVERAGE,
-                         "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS}}
+                         "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS,
+                         "nbs_w_hourly": NBS_W_HOURLY,
+                         "nbs_max_age_h": NBS_MAX_AGE_HOURS,
+                         "nbs_hourly_max_age_h": NBS_HOURLY_MAX_AGE_HOURS}}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=1)

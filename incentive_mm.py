@@ -13795,7 +13795,12 @@ RAIN_WKND_ENABLE = os.environ.get("IMM_RAIN_WKND_ENABLE", "1") == "1"
 RAIN_WKND_SERIES = frozenset(("KXRAINWKND",))
 RAIN_WKND_TOL_CENTS = _env_int("IMM_RAIN_WKND_TOL_CENTS", 10)
 RAIN_WKND_TTL_MIN = _env_int("IMM_RAIN_WKND_TTL_MIN", 240)
-RAIN_WKND_REFRESH_SECS = _env_int("IMM_RAIN_WKND_REFRESH_SECS", 1800)
+# every 15 minutes since the hourly NBS composite (2026-10-30, Jack:
+# "incorporate both hourly and 6 hours for a composite"): a new hourly cycle
+# reaches the fair within ~15 minutes of NOAA posting it, and the IEM's runs
+# are read only when a newer one is due, so the IEM sees fewer reads than at
+# 30 minutes
+RAIN_WKND_REFRESH_SECS = _env_int("IMM_RAIN_WKND_REFRESH_SECS", 900)
 RAIN_WKND_CAP = os.environ.get("IMM_RAIN_WKND_CAP", "1") == "1"
 RAIN_WKND_FILE = os.environ.get(
     "IMM_RAIN_WKND_FILE", os.path.join(STATUS_DIR, "rain_wknd_fair.json"))
@@ -34211,9 +34216,10 @@ class IncentiveMarketMaker:
         if RAIN_WKND_ENABLE and not once:
             # weekend rain fair refresher (2026-10-11): the CPI refresher's
             # contract on rain_wknd_fair.py and RAIN_WKND_FILE -- Kalshi's
-            # open events hourly (cached in the file), every mapped
-            # station's latest NBE run each pass (a failed read reuses the
-            # file's copy while the run is young enough).
+            # open events hourly (cached in the file), each mapped station's
+            # NBE and 6-hourly NBS runs once a newer one is due, the newest
+            # hourly NBS cycle (THE COMPOSITE, 2026-10-30; a failed read
+            # reuses the file's copy while the run is young enough).
             def _rain_wknd_refresh():
                 try:
                     import rain_wknd_fair
