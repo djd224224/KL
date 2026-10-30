@@ -40,5 +40,33 @@ class TestExplain(unittest.TestCase):
         self.assertEqual(ip.explain({"windows": {}}), [])
 
 
+class TestAccount(unittest.TestCase):
+    """Jack 2026-10-29: "Make sure IMM pocket refresh also has the account
+    box" -- the dashboard's live account read, else the last 7am email."""
+
+    LIVE = {"since": 1793271602.0, "until": 1793326590.0, "value": 60647.68, "app": 59520.0,
+            "profit": 32147.68, "day": 603.39, "resid": -1.97,
+            "bots": [["IMM", -206.5, [["trading", -206.5]]], ["Crypto", 688.57, []],
+                     ["Weather", 105.13, []], ["Other", 18.16, []]]}
+
+    def test_the_live_read_and_its_line(self):
+        a = ip.account({"acct": {"live": self.LIVE, "at": 1793326600.0, "err": None, "email": []}})
+        self.assertTrue(a["live"])
+        self.assertEqual(a["bots"], {"IMM": -206.5, "Crypto": 688.57, "Weather": 105.13, "Other": 18.16})
+        self.assertEqual((a["value"], a["day"], a["at"]), (60647.68, 603.39, 1793326600.0))
+        self.assertEqual(ip.account_line(a), "account $60,648, +$603 since Thu 07:00 AM".replace(" 07", " 7")
+                         + ": crypto +$689, weather +$105, other +$18, IMM -$206")
+
+    def test_without_a_live_read_the_last_email_day(self):
+        em = dict(self.LIVE, date="2026-10-29")
+        a = ip.account({"acct": {"live": None, "at": None, "err": "boom", "email": [dict(em, day=1.0), em]}})
+        self.assertFalse(a["live"])
+        self.assertEqual((a["day"], a["at"]), (603.39, 1793326590.0))
+        self.assertIn("(the 7am email's day)", ip.account_line(a))
+        self.assertIsNone(ip.account({"acct": {"live": None, "email": []}}))
+        self.assertIsNone(ip.account({}))
+        self.assertIsNone(ip.account_line(None))
+
+
 if __name__ == "__main__":
     unittest.main()

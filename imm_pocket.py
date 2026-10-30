@@ -5,7 +5,8 @@ enough to publish to claude.ai and read on a phone.
 Reads the model the 10-minute build embeds in imm_dashboard.html (const D)
 and adds it up exactly as the page does (aggregate / addM / derive /
 baseline in imm_dashboard_template.html): per window, the hero, the tiles,
-the cumulative curve and one row per family. Writes imm_pocket.json and
+the cumulative curve and one row per family; and, as the dashboard's header
+box, the whole account (account()). Writes imm_pocket.json and
 imm_pocket.html (imm_pocket_template.html with the data embedded) beside the
 dashboard.
 
@@ -26,6 +27,13 @@ import sys
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+except Exception:                               # pragma: no cover
+    ET = timezone(timedelta(hours=-4))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DASH_DIR = os.path.join(HERE, "run-logs", "incentive-mm", "dashboard")
@@ -232,6 +240,42 @@ def event_titles(evs, fetch=True):
     return out
 
 
+def account(D):
+    """The account box, as the dashboard's header shows it (Jack 2026-10-29:
+    "Make sure IMM pocket refresh also has the account box"): from the
+    build's live account read (D.acct, the portfolio email's own numbers),
+    the account value and its move since the newest 7am snapshot, split by
+    bot; with no live read, the last 7am email's day. None without either
+    (a build from before 2026-10-30)."""
+    a = D.get("acct") or {}
+    s, live = a.get("live"), True
+    if not s:
+        em = a.get("email") or []
+        s, live = (em[-1] if em else None), False
+    if not s or s.get("value") is None:
+        return None
+    return {"live": live, "at": a.get("at") if live else s.get("until"),
+            "since": s.get("since"), "until": s.get("until"), "value": s.get("value"),
+            "app": s.get("app"), "profit": s.get("profit"), "day": s.get("day"),
+            "bots": {b[0]: round(num(b[1]), 2) for b in s.get("bots") or []},
+            "resid": s.get("resid"), "err": a.get("err")}
+
+
+def account_line(ac):
+    """The account for the refresh reply: value, then the move since 7am by bot."""
+    if not ac:
+        return None
+    since = ("" if not ac.get("since") else
+             datetime.fromtimestamp(ac["since"], ET).strftime(" since %a %I:%M %p").replace(" 0", " "))
+    bots = ac.get("bots") or {}
+    out = f"account ${num(ac['value']):,.0f}"
+    if ac.get("day") is not None:
+        out += (f", {_usd(num(ac['day']))}{since}" + (" (the 7am email's day)" if not ac["live"] else "")
+                + ": " + ", ".join(f"{b.lower() if b != 'IMM' else b} {_usd(num(bots.get(b)))}"
+                                   for b in ("Crypto", "Weather", "Other", "IMM") if b in bots))
+    return out
+
+
 def build(D, fetch_titles=True):
     gen = D["generated"]
     FD = fam_daily(D)
@@ -332,6 +376,7 @@ def build(D, fetch_titles=True):
         if best:
             out["ystd"] = {"rew": round(num(best[1]), 2), "pnl": round(num(best[2]), 2)}
     out["titles"] = event_titles(shown, fetch=fetch_titles)
+    out["acct"] = account(D)
     return out
 
 
@@ -408,6 +453,7 @@ def main(argv=None):
     print(msg)
     if a.summary:
         print(f"build {data.get('generated_et')}")
+        print(f"  {account_line(data.get('acct')) or 'account n/a (no account read in this build)'}")
         for k, w in data["windows"].items():
             t = w["tot"]
             # trading = the window's new fills + the inventory carried into it
