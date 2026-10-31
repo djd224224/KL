@@ -81,6 +81,11 @@ imm.SAT_QUIET_HOUR_MULT = 0.0
 # arms it explicitly.
 _SAT_CAP_CODE_DEFAULT = (imm.SAT_MAX_POSITION, imm.SAT_MAX_POSITION_FROM)
 imm.SAT_MAX_POSITION = 0.0
+# ...and the weekday-night deep-book cap (2026-10-30), so a suite run on a
+# weekday night sizes deep books as at any other hour.
+# TestWeekdayNightDeepBookCap arms it explicitly.
+_NIGHT_CAP_CODE_DEFAULT = imm.NIGHT_TOTAL_SIZE_MULT_CAP
+imm.NIGHT_TOTAL_SIZE_MULT_CAP = 0.0
 # ...and the NFL player-prop gate (2026-10-03), default ON and fail-closed:
 # no refresher thread runs under test, so every NFL ladder / escalator would
 # stand aside and the ladder fixtures (sub-penny join, full unwind, the
@@ -11393,6 +11398,102 @@ class TestSaturdayPositionCap(unittest.TestCase):
         imm.SAT_MAX_POSITION, imm.MAX_POSITION_CONTRACTS = 200.0, 150.0
         imm.SAT_MAX_POSITION_FROM = None
         self.assertEqual(imm.default_max_position(sat), 150.0)
+
+
+class TestWeekdayNightDeepBookCap(unittest.TestCase):
+    """Jack 2026-10-30: "Raise it" (the 5x deep-book limit on weekday
+    nights): in the global window's quiet hours of a Mon-Fri ET morning, a
+    series at the window's own x3 takes NIGHT_TOTAL_SIZE_MULT_CAP (20/3), so
+    a deep book's 60 rests up to 133 instead of 100."""
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "NIGHT_TOTAL_SIZE_MULT_CAP", "TOTAL_SIZE_MULT_CAP", "REF_DEPTH_SLOPE",
+            "REF_DEPTH_MAX_MULT", "LADDER_MODE", "HOUR_SIZE_MULTS",
+            "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM", "EVENING_SIZE_MULTS",
+            "EVENING_SIZE_MULT_FROM", "SAT_SIZE_MULT", "SAT_SIZE_MULT_GATED",
+            "SAT_QUIET_HOUR_MULT", "SAT_QUIET_HOUR_MULT_FROM", "QUIET_DAILY_SERIES",
+            "QUIET_HOURS_OFF_SERIES", "HOUR_MULT_EXCLUDE", "SPORTS_LADDER_HOUR_MULT")}
+        self._gate = dict(imm.SAT_GATE_STATE)
+        imm.NIGHT_TOTAL_SIZE_MULT_CAP = _NIGHT_CAP_CODE_DEFAULT
+        imm.TOTAL_SIZE_MULT_CAP = 5.0
+        imm.REF_DEPTH_SLOPE, imm.REF_DEPTH_MAX_MULT = 0.25, 3.0
+        imm.LADDER_MODE = "atref"
+        # the launcher's window and Saturday, the code's evening window
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.EVENING_SIZE_MULTS = dict(_EVENING_CODE_DEFAULT[0])
+        imm.EVENING_SIZE_MULT_FROM = _EVENING_CODE_DEFAULT[1]
+        imm.SAT_SIZE_MULT, imm.SAT_SIZE_MULT_GATED = 2.0, 0.0
+        imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
+        imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM = _SAT_AM_CODE_DEFAULT
+        imm.HOUR_MULT_EXCLUDE = ("KXTEMP",)
+        imm.SPORTS_LADDER_HOUR_MULT = 4.0                  # the live flat value
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+        imm.SAT_GATE_STATE.clear()
+        imm.SAT_GATE_STATE.update(self._gate)
+
+    et = staticmethod(TestSaturdayMorningX4.et)
+
+    def deep(self, s, when):
+        """A bid 8 ticks behind its anchor (ref mult 3.0), at `when`'s own
+        hour multiplier."""
+        return imm.capped_ref_mult(50, 42, "bid", hour_mult=imm.hour_size_mult(s, when),
+                                   series=s, now_utc=when)
+
+    def test_code_default(self):
+        self.assertAlmostEqual(_NIGHT_CAP_CODE_DEFAULT, 20 / 3)
+
+    def test_a_deep_book_rests_133_on_a_weekday_night(self):
+        s, tue = "KXGOOD", self.et(2026, 11, 3, 3)
+        self.assertEqual(imm.hour_size_mult(s, tue), 3.0)
+        # by depth: 3 ticks 1.75 -> 105, 4 ticks 2.0 -> 120, 5+ held at 2.22 -> 133
+        for ref, want in ((47, 105), (46, 120), (45, 133), (42, 133)):
+            with self.subTest(ref=ref):
+                m = imm.capped_ref_mult(50, ref, "bid", hour_mult=3.0, series=s, now_utc=tue)
+                self.assertEqual(int(round(60 * m)), want)
+        # the first and last minute of a weekday's quiet hours (EST from 11/01)
+        for when in ((2026, 11, 2, 0, 0), (2026, 11, 6, 8, 59)):
+            with self.subTest(when=when):
+                self.assertAlmostEqual(self.deep(s, self.et(*when)), 20 / 9)
+
+    def test_every_other_hour_keeps_x5(self):
+        s = "KXGOOD"
+        for when, hm, want in (((2026, 11, 6, 9, 0), 1.0, 3.0),     # Fri day
+                               ((2026, 11, 2, 19, 0), 1.5, 3.0),    # Mon evening
+                               ((2026, 11, 1, 3, 0), 3.0, 5 / 3),   # Sunday morning
+                               ((2026, 11, 8, 3, 0), 3.0, 5 / 3),
+                               ((2026, 10, 31, 3, 0), 8.0, 1.0)):   # Saturday x8
+            with self.subTest(when=when):
+                w = self.et(*when)
+                self.assertEqual(imm.hour_size_mult(s, w), hm)
+                self.assertAlmostEqual(self.deep(s, w), want)
+
+    def test_who_takes_it(self):
+        tue, cap = self.et(2026, 11, 3, 3), imm.total_size_mult_cap
+        imm.QUIET_DAILY_SERIES = frozenset({"KXQDAILY"})
+        imm.QUIET_HOURS_OFF_SERIES = frozenset({"KXQUIETOFF"})
+        with mock.patch.object(imm, "is_daily_series", lambda s: s in ("KXQDAILY", "KXPDAILY")):
+            self.assertAlmostEqual(cap("KXGOOD", tue), 20 / 3)
+            self.assertAlmostEqual(cap("KXQDAILY", tue), 20 / 3)   # a daily on the quiet hours
+            self.assertEqual(cap("KXPDAILY", tue), 5.0)            # other dailies: no night step
+            self.assertEqual(cap("KXQUIETOFF", tue), 5.0)
+        self.assertEqual(cap("KXTEMPNYCH", tue), 5.0)              # an excluded prefix
+        self.assertEqual(cap(None, tue), 5.0)
+        with mock.patch.object(imm, "sports_ladder_league",
+                               lambda s: "NFL" if s == "KXLADDERTEST" else None):
+            self.assertEqual(cap("KXLADDERTEST", tue), 5.0)        # its flat x4, not the step
+
+    def test_off_switches(self):
+        tue = self.et(2026, 11, 3, 3)
+        imm.NIGHT_TOTAL_SIZE_MULT_CAP = 0.0
+        self.assertAlmostEqual(self.deep("KXGOOD", tue), 5 / 3)
+        imm.NIGHT_TOTAL_SIZE_MULT_CAP, imm.TOTAL_SIZE_MULT_CAP = 20 / 3, 0.0
+        self.assertEqual(self.deep("KXGOOD", tue), 3.0)            # no total cap at all
 
 
 class TestSaturdayGatedStepUp(unittest.TestCase):

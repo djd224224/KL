@@ -182,6 +182,36 @@ REF_DEPTH_MAX_MULT = _env_float("IMM_REF_DEPTH_MAX_MULT", 3.0)
 # the REF contribution only (never below 1.0), via capped_ref_mult at every
 # sizing site (ladder total, estimator meta, live side rooms). 0 = off.
 TOTAL_SIZE_MULT_CAP = _env_float("IMM_TOTAL_SIZE_MULT_CAP", 5.0)
+# WEEKDAY-NIGHT DEEP-BOOK CAP (Jack 2026-10-30: "Raise it", to "Loosen the 5x
+# deep-book limit on weekday nights?"). At the overnight x3 the cap above
+# holds the deep-reference size to x1.67, so a deep book's 20 lots rest at
+# most 100 a side at night instead of up to 180. In the global window's
+# quiet hours of a weekday (Mon-Fri ET) morning, a series resting at the
+# window's own step -- not the sports ladders' flat value, a per-series
+# window, a daily or a quiet-hours-off series -- takes this cap instead:
+# 20/3, so a deep book rests up to 133 (60 x 2.22, from 5 ticks behind the
+# touch; 105 at 3 ticks, 120 at 4). Saturday's x8 is past either cap (the
+# deep-reference size is x1 there) and Sunday morning keeps x5.
+# IMM_NIGHT_TOTAL_SIZE_MULT_CAP=0 turns it off.
+NIGHT_TOTAL_SIZE_MULT_CAP = _env_float("IMM_NIGHT_TOTAL_SIZE_MULT_CAP", 20.0 / 3.0)
+
+
+def total_size_mult_cap(series: Optional[str],
+                        now_utc: Optional[datetime] = None) -> float:
+    """TOTAL_SIZE_MULT_CAP, or NIGHT_TOTAL_SIZE_MULT_CAP while `series`
+    rests at the global window's quiet-hours step on a weekday (Mon-Fri ET)
+    morning. Only ever raises the cap; an off (<= 0) cap stays off."""
+    if series is None or TOTAL_SIZE_MULT_CAP <= 0 \
+            or NIGHT_TOTAL_SIZE_MULT_CAP <= TOTAL_SIZE_MULT_CAP:
+        return TOTAL_SIZE_MULT_CAP
+    now_utc = now_utc or datetime.now(timezone.utc)
+    et = now_utc.astimezone(ET)
+    if et.weekday() > 4 or et.hour >= 12:
+        return TOTAL_SIZE_MULT_CAP
+    step = global_hour_mults(et.date()).get(et.hour, 1.0)
+    if step <= 1.0 or _hour_window_mult(series, now_utc) != step:
+        return TOTAL_SIZE_MULT_CAP
+    return NIGHT_TOTAL_SIZE_MULT_CAP
 # Requote hysteresis for atref rungs (2026-08-02 audit): full weight is flat
 # across the band, so churn on 1-tick touch/ref wiggles buys nothing.
 # 1 -> 0 (Jack 2026-08-03: "sticky quotes that dont adjust the quote by 1c is
@@ -224,18 +254,22 @@ def ref_depth_mult(anchor: Optional[int], ref_px: Optional[int],
 
 def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
                     book_side: str, hour_mult: float = 1.0,
-                    series: Optional[str] = None) -> float:
+                    series: Optional[str] = None,
+                    now_utc: Optional[datetime] = None) -> float:
     """ref_depth_mult with the TOTAL-multiplier cap applied: hour_mult (the
     factor already baked into the hour-scaled ladder) x the returned ref
-    mult never exceeds TOTAL_SIZE_MULT_CAP. Trims the ref contribution only
-    — never below 1.0, so an hour mult alone can still exceed the cap by
-    deliberate env choice. THE single accessor for every sizing site.
+    mult never exceeds TOTAL_SIZE_MULT_CAP (NIGHT_TOTAL_SIZE_MULT_CAP on a
+    weekday night: total_size_mult_cap at `now_utc`, default now). Trims the
+    ref contribution only — never below 1.0, so an hour mult alone can still
+    exceed the cap by deliberate env choice. THE single accessor for every
+    sizing site.
     `series` (2026-09-05): open-scan members cap the deep-reference lever
     at SCAN_REF_MULT_CAP — an unmeasured family gets the structural safety
     argument for deeper rungs, not the full 3x size that goes with it."""
     m = ref_depth_mult(anchor, ref_px, book_side)
-    if TOTAL_SIZE_MULT_CAP > 0 and hour_mult > 0:
-        m = min(m, max(1.0, TOTAL_SIZE_MULT_CAP / hour_mult))
+    cap = total_size_mult_cap(series, now_utc)
+    if cap > 0 and hour_mult > 0:
+        m = min(m, max(1.0, cap / hour_mult))
     if series is not None and SCAN_REF_MULT_CAP > 0 \
             and series in SCAN_GUARDED_SERIES:
         m = min(m, max(1.0, SCAN_REF_MULT_CAP))
@@ -11236,6 +11270,8 @@ _CONFIG_CODE_KNOBS = (
     "SAT_QUIET_HOUR_MULT", "SAT_QUIET_HOUR_MULT_FROM",
     # ...and the per-market cap at SAT_MAX_POSITION on Saturdays (2026-10-30)
     "SAT_MAX_POSITION", "SAT_MAX_POSITION_FROM",
+    # ...and the weekday-night deep-book cap (2026-10-30)
+    "NIGHT_TOTAL_SIZE_MULT_CAP",
     # evening window + yield size mode (2026-10-05, code defaults)
     "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "YIELD_SIZE_MULT",
     "YIELD_SIZE_MULT_FROM", "YIELD_SIZE_MIN", "YIELD_SIZE_EXIT_FRAC",
@@ -32866,11 +32902,13 @@ class IncentiveMarketMaker:
             side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
-                                                     series=meta.series)))
+                                                     series=meta.series,
+                                                     now_utc=now_utc)))
             side_max_ask = int(round(sum(s for _t, s in lv_ask) *
                                      capped_ref_mult(ext_ask, ref_ask_px, "ask",
                                                      hour_mult=hm,
-                                                     series=meta.series)))
+                                                     series=meta.series,
+                                                     now_utc=now_utc)))
             # a leading side may rest target/5 (the caps and skew below bind)
             if lead_b is not None and lv_bid:
                 side_max_bid = max(side_max_bid, lead_n)
@@ -37199,6 +37237,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"Saturdays (ET, all day) from {SAT_MAX_POSITION_FROM.isoformat()}, "
             f"{MAX_POSITION_CONTRACTS:g} otherwise -- times the family multiplier; "
             f"hand-set caps unchanged (now {default_max_position():g})")
+    if NIGHT_TOTAL_SIZE_MULT_CAP > TOTAL_SIZE_MULT_CAP > 0:
+        log(f"[IMM] weekday-night deep-book cap: hour x deep-reference size up to "
+            f"x{NIGHT_TOTAL_SIZE_MULT_CAP:.3g} in the global window's quiet hours, "
+            f"Mon-Fri ET, for series at the window's own step "
+            f"(x{TOTAL_SIZE_MULT_CAP:g} otherwise)")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):
