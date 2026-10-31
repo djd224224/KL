@@ -29,7 +29,9 @@ lines, get their own section, and their fills ride as inventory (nothing
 hedges a city's market), so they never count toward the hedge verdict.
 Since 2026-10-30 (Jack: "Yes, extend it") the Vercel family leads off its
 fair the same way; a Vercel strike's fill is a ladder strike's, so it opens
-a lock job off the other strikes like any lead fill there.
+a lock job off the other strikes like any lead fill there. So does the
+OpenRouter weekly (KXTOKENUSE, Jack: "Yes, add it"), whose leads log `off`
+for OpenRouter's 00:00Z publish and come back once the new day is read.
 
 ONE EMAIL per ET day (the day before), THE TAKEAWAY FIRST (Jack 2026-10-30:
 "really $0 for complement lead? clean up this email and make it clear the
@@ -709,7 +711,7 @@ def render_text(ctx) -> str:
     lk = h["locks"]
     nf = T["comp"]["fills"] + T["fair"]["fills"]
     out = [f"Leads, {day:%a %m/%d} (ET day) -- complement leads price off other markets' "
-           f"books, fair leads off our models (weekend rain, Vercel)", ""]
+           f"books, fair leads off our models (weekend rain, Vercel, OpenRouter weekly)", ""]
     # THE TAKEAWAY: the money, then what (if anything) needs doing
     rew_all = T["comp"]["reward"] + T["fair"]["reward"]
     fills_all = T["comp"]["fills_usd"] + T["fair"]["fills_usd"]

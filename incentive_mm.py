@@ -11372,6 +11372,7 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
     "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
     "FAIR_LEAD_PAST_BAND",        # leads past the band, ahead of the touch (2026-10-30)
+    "OR_LEAD_BLACKOUT", "OR_LEAD_BLACKOUT_PRE_MIN",   # the OpenRouter publish (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
     # weather shapes (2026-10-30): the per-city rain dailies, the cold thresholds
@@ -13222,8 +13223,37 @@ OR_FAIR_SIGMA_LO_FRAC = _env_float("IMM_OR_FAIR_SIGMA_LO_FRAC", 0.5)
 OR_FAIR_REFRESH_HOLD_MIN = _env_float("IMM_OR_FAIR_REFRESH_HOLD_MIN", 10)
 OR_FAIR_FILE = os.environ.get(
     "IMM_OR_FAIR_FILE", os.path.join(STATUS_DIR, "openrouter_fair.json"))
-# event -> entry; event -> epoch its read last moved (refresh hold)
-_or_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}}
+# event -> entry; event -> epoch its read last moved (refresh hold); the
+# feed's latest published day (OR_LEAD_BLACKOUT)
+_or_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}, "last_day": ""}
+# FAIR LEAD ON THE WEEKLY (Jack 2026-10-30: "Yes, add it", on "Add the
+# OpenRouter weekly ladder to the fair lead, standing down around the 00:00Z
+# publish?"). KXTOKENUSE's fair is OpenRouter's own daily totals -- the
+# number the week settles on -- so its strikes lead off it as the Vercel
+# family's do (FAIR_LEAD_SERIES; or_fair_c: the gate's read with its stale /
+# complete / new-day hold tests, the point fair at the measured sigma). On
+# the 10/31 00:00Z books, with 5 of the week's 7 days in (199.1T +- 6.5T),
+# 6 strikes would lead a bid -- T187-T190 at 84-86c against fairs of 92-97c,
+# T194 / T196 at 36c / 34c against 78c / 68c -- ~$25 -> ~$101/day of the
+# ladder's ~$341/day before anyone reacts. The monthly (KXTOKENUSEM) stays
+# out: with no day of its window in, its fair is a run-rate forecast
+# (976.6T +- 231T for 11/02-29).
+# THE PUBLISH STAND-DOWN. OpenRouter posts the day that ended 1-10 minutes
+# after 00:00Z (the first new-day read 10/16-10/31: 00:01-00:10Z), and the
+# fast poll reads it within OR_FAIR_FAST_SECS. Until then a lead at the
+# front, within 5c of yesterday's fair, is the first order a taker holding
+# the new number hits. So no lead of either kind -- the ladder lead would
+# take over from the fair one -- rests on a FAIR_LEAD_SERIES OpenRouter
+# market from OR_LEAD_BLACKOUT_PRE_MIN before 00:00Z until the feed carries
+# the day that ended (last_day), and then the gate's new-day hold stands the
+# market aside for OR_FAIR_REFRESH_HOLD_MIN. A late or failed post keeps the
+# leads down. The rungs behind the walls quote as before, a FAIR CLOSE
+# steps back to its side's own price, and the estimate still prices the
+# lead (the 00:00Z selection refresh falls inside the window).
+# IMM_OR_LEAD_BLACKOUT=0 drops the stand-down; IMM_FAIR_LEAD_SERIES without
+# KXTOKENUSE takes the weekly out.
+OR_LEAD_BLACKOUT = os.environ.get("IMM_OR_LEAD_BLACKOUT", "1") == "1"
+OR_LEAD_BLACKOUT_PRE_MIN = max(0.0, _env_float("IMM_OR_LEAD_BLACKOUT_PRE_MIN", 5.0))
 
 
 def load_or_fair() -> Tuple[int, int]:
@@ -13265,6 +13295,7 @@ def load_or_fair() -> Tuple[int, int]:
         for ev in moved:
             _or_fair_state["moved_at"][ev] = now_ts
     _or_fair_state["entries"] = fresh
+    _or_fair_state["last_day"] = str(data.get("last_day") or "")
     return len(fresh), len(moved)
 
 
@@ -13304,6 +13335,34 @@ def or_gate_reason(ticker: str, now_ts: float,
                  "tol": OR_FAIR_TOL_CENTS, "bid_bad": bid_bad,
                  "ask_bad": ask_bad})
     return "", {}
+
+
+def or_fair_series(series: str) -> bool:
+    return OR_FAIR_ENABLE and series in OR_FAIR_SERIES
+
+
+def or_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """`ticker`'s OpenRouter fair (YES cents) while the family's gate reads
+    it -- a fresh read, the window not complete, no new-day hold -- else
+    None: FAIR LEAD's view of the family (the gate's book tests apart), P(the
+    window's total > K) at the read's measured sigma."""
+    if or_gate_reason(ticker, now_ts, None, None)[0]:
+        return None
+    e = _or_fair_state["entries"][ticker.rsplit("-", 1)[0]]
+    k = float(_CA_STRIKE_RE.search(ticker).group(1))
+    return _p_above(k, e["mu"], max(1e-9, e["sigma"])) * 100.0
+
+
+def or_publish_blackout(now_ts: float) -> bool:
+    """OpenRouter's publish window (OR_LEAD_BLACKOUT): from
+    OR_LEAD_BLACKOUT_PRE_MIN before 00:00Z until the feed's latest day is
+    the one that ended at the last 00:00Z. A read naming no day is in it."""
+    if not OR_LEAD_BLACKOUT:
+        return False
+    if now_ts % 86400.0 >= 86400.0 - OR_LEAD_BLACKOUT_PRE_MIN * 60.0:
+        return True
+    ended = time.strftime("%Y-%m-%d", time.gmtime(now_ts - 86400.0))
+    return (_or_fair_state.get("last_day") or "") < ended
 
 
 # ----------------------------------------------------------------------------
@@ -20304,10 +20363,14 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # its book on purpose, so the WS fast cancel judges those rungs against the
 # model (_fair_model_rungs), as it judges a complement lead against its
 # siblings. IMM_FAIR_LEAD_SERIES=KXRAINWKND takes the family out.
+# THE OPENROUTER WEEKLY TOO (Jack 2026-10-30: "Yes, add it"): KXTOKENUSE
+# leads off OpenRouter's own daily totals (or_fair_c), with no lead of
+# either kind around the 00:00Z publish (OR_LEAD_BLACKOUT, at the gate).
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get(
-        "IMM_FAIR_LEAD_SERIES", ",".join(["KXRAINWKND"] + sorted(VERCEL_SERIES))).split(",")
+        "IMM_FAIR_LEAD_SERIES",
+        ",".join(["KXRAINWKND", "KXTOKENUSE"] + sorted(VERCEL_SERIES))).split(",")
      if s.strip()}))
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
@@ -20379,8 +20442,9 @@ def fair_lead_series(series: str) -> bool:
 
 def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
     """A FAIR_LEAD_SERIES market's model fair (YES cents) while its family's
-    gate would still read it, else None: weekend rain's (rain_wknd_fair.py)
-    or the Vercel family's (vercel_fair_c)."""
+    gate would still read it, else None: weekend rain's (rain_wknd_fair.py),
+    the Vercel family's (vercel_fair_c) or the OpenRouter weekly's
+    (or_fair_c)."""
     if series not in FAIR_LEAD_SERIES:
         return None
     if rain_wknd_series(series):
@@ -20390,7 +20454,16 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
         return float(e["p"]) * 100.0
     if vercel_series(series):
         return vercel_fair_c(ticker, now_ts)
+    if or_fair_series(series):
+        return or_fair_c(ticker, now_ts)
     return None
+
+
+def fair_lead_blackout(series: str, now_ts: float) -> bool:
+    """Do a FAIR_LEAD_SERIES market's leads -- fair or ladder -- and its
+    model-priced close stand down for its feed's publish (OR_LEAD_BLACKOUT)?"""
+    return (series in FAIR_LEAD_SERIES and or_fair_series(series)
+            and or_publish_blackout(now_ts))
 
 
 def fair_model_label(series: str) -> str:
@@ -20399,6 +20472,8 @@ def fair_model_label(series: str) -> str:
         return "the weekend rain fair"
     if vercel_series(series):
         return "the Vercel fair"
+    if or_fair_series(series):
+        return "the OpenRouter fair"
     return "its model fair"
 
 
@@ -24457,7 +24532,7 @@ class IncentiveMarketMaker:
             return set()
         series = series_of(t)
         fair = fair_model_c(t, series, now_ts)
-        if fair is None:
+        if fair is None or fair_lead_blackout(series, now_ts):
             return set()
         cands: List[Tuple[str, Optional[int]]] = []
         if lead is not None and fair_lead_fair_c(t, series, now_ts) is not None:
@@ -28706,6 +28781,19 @@ class IncentiveMarketMaker:
             log(f"{self.tag} {kind} lead{dry} {t} {side}: {n} @ {px}c, {where}; "
                 f"{who} {verb} {implied}c")
 
+    def _lead_blackout_note(self, t: str, src: str) -> None:
+        """Log each side of `t` still noted as leading as off for its feed's
+        publish (OR_LEAD_BLACKOUT), once; its next lead logs afresh."""
+        dry = "" if lead_mode(src) == "on" else " (dry)"
+        kind = "fair" if src == "fair" else "comp"
+        for side in ("bid", "ask"):
+            if self._comp_lead_noted.get((t, side)) is None:
+                continue
+            self._comp_lead_noted[(t, side)] = None
+            log(f"{self.tag} {kind} lead{dry} {t} {side}: off -- OpenRouter's daily "
+                f"publish: no lead from {OR_LEAD_BLACKOUT_PRE_MIN:g} min before 00:00Z "
+                f"until the feed carries the day that ended")
+
     def _fair_gap_note(self, t: str, yes_ext: List[List[float]],
                        no_ext: List[List[float]], fair_c: float) -> None:
         """Log the disagreement guard (FAIR_LEAD_MAX_GAP_C) when it starts or
@@ -32585,6 +32673,11 @@ class IncentiveMarketMaker:
             lead_b = lead_a = None
             lead_n = comp_lead_size(meta.target_size)
             lead_src = self._lead_source(meta)
+            # (no lead of either kind across its feed's publish: OR_LEAD_BLACKOUT)
+            _pub_out = fair_lead_blackout(meta.series, now_ts)
+            if lead_src is not None and _pub_out:
+                self._lead_blackout_note(t, lead_src)
+                lead_src = None
             if (lead_src is not None and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None
                     and poke_caps is None and nfl_caps is None
@@ -32633,7 +32726,7 @@ class IncentiveMarketMaker:
             close_n = 0
             _cpos = own_pos if coexist else pos
             _cfair = (fair_close_fair_c(t, meta.series, now_ts)
-                      if abs(_cpos) >= 1 and not reduce_only
+                      if abs(_cpos) >= 1 and not reduce_only and not _pub_out
                       and meta.price_step >= 0.01 else None)
             if _cfair is not None:
                 _cx_yes, _cx_no = (external_levels(yes_levels, no_levels, own_in_book)
@@ -36401,6 +36494,11 @@ class IncentiveMarketMaker:
                f"model as not stale"
                + (f"; no lead while the book's touch sits more than "
                   f"{FAIR_LEAD_MAX_GAP_C}c past the fair" if FAIR_LEAD_MAX_GAP_C
+                  else "")
+               + (f"; OpenRouter's leads (fair or ladder) and model-priced closes "
+                  f"stand down from {OR_LEAD_BLACKOUT_PRE_MIN:g} min before 00:00Z "
+                  f"until its feed carries the day that ended"
+                  if OR_LEAD_BLACKOUT and any(or_fair_series(s) for s in FAIR_LEAD_SERIES)
                   else "")
                + (" (dry: logged, not placed)" if FAIR_LEAD_MODE == "dry" else "")
                if FAIR_LEAD_MODE in ("on", "dry") else ""))

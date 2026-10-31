@@ -171,7 +171,7 @@ def setUpModule():
     imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={})
     # the OpenRouter token-usage fair file (2026-09-27), same reason
     imm.OR_FAIR_FILE = os.path.join(tmp, "openrouter_fair.json")
-    imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={})
+    imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={}, last_day="")
     # the GasBuddy state-gas fair file (2026-09-27), same reason
     imm.GB_FAIR_FILE = os.path.join(tmp, "gasbuddy_fair.json")
     imm._gb_fair_state.update(mtime=0.0, entries={})
@@ -31564,6 +31564,208 @@ class TestVercelFairLead(unittest.TestCase):
         self.assertAlmostEqual(on.est_frac, 0.965, places=3)
         self.assertAlmostEqual(off.est_frac, 0.479, places=3)
         self.assertIn("FAIR_LEAD_PAST_BAND", imm._CONFIG_CODE_KNOBS)
+
+
+class TestOpenRouterFairLead(unittest.TestCase):
+    """Jack 2026-10-30: "Yes, add it", on "Add the OpenRouter weekly ladder to
+    the fair lead, standing down around the 00:00Z publish?". Fixture: the
+    10/31 00:00Z read of KXTOKENUSE-26NOV02 (5 of 7 days in, 199.1T +-
+    6.48T) on TestOpenRouterFairGate's far event; T190 reads 92.0c, and its
+    book is a 3-lot 80c bid over a 5,000 wall at 60c, offered at 92c."""
+
+    T = "KXTOKENUSE-68DEC04-T190"
+    EV = "KXTOKENUSE-68DEC04"
+    YES = [[60, 5000], [80, 3]]
+    NO = [[8, 5000]]
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._or_fair_state.update(mtime=0.0, entries={}, moved_at={}, last_day="")
+        try:
+            os.remove(imm.OR_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  # the window's pre-midnight minutes never ride the test clock
+                  mock.patch.object(imm, "OR_LEAD_BLACKOUT_PRE_MIN", 0.0)):
+            p.start()
+            self.addCleanup(p.stop)
+        TestVercelFairLead._drop_holds()
+        self.addCleanup(TestVercelFairLead._drop_holds)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    @staticmethod
+    def _ended(now_ts=None):
+        """The UTC day that ended at the last 00:00Z."""
+        return time.strftime("%Y-%m-%d", time.gmtime((now_ts or time.time()) - 86400.0))
+
+    def _write(self, last_day=None, complete=False, age_secs=0.0, ev=None):
+        fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
+        with open(imm.OR_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"last_day": self._ended() if last_day is None else last_day,
+                       "entries": {ev or self.EV: {
+                           "mu": 199.1, "sigma": 6.48, "known": 5, "complete": complete,
+                           "fetched_at": fetched}}}, f)
+        os.utime(imm.OR_FAIR_FILE, (time.time(), time.time() + TestOpenRouterFairLead._bump))
+        TestOpenRouterFairLead._bump += 1
+        return imm.load_or_fair()
+
+    def test_the_weekly_leads_off_the_feed_and_the_monthly_does_not(self):
+        self.assertIn("KXTOKENUSE", imm.FAIR_LEAD_SERIES)
+        self.assertNotIn("KXTOKENUSEM", imm.FAIR_LEAD_SERIES)
+        self.assertTrue(imm.fair_lead_series("KXTOKENUSE"))
+        self.assertFalse(imm.fair_lead_series("KXTOKENUSEM"))
+        self.assertEqual(imm.fair_model_label("KXTOKENUSE"), "the OpenRouter fair")
+        now = time.time()
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXTOKENUSE", now))   # no read
+        self._write()
+        self.assertEqual(imm._or_fair_state["last_day"], self._ended())
+        self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXTOKENUSE", now), 92.0, places=1)
+        self.assertAlmostEqual(imm.fair_close_fair_c(self.T, "KXTOKENUSE", now), 92.0, places=1)
+        self.assertAlmostEqual(imm.fair_lead_fair_c(f"{self.EV}-T196", "KXTOKENUSE", now),
+                               68.4, places=1)
+        # nothing where the gate stands the market aside: stale, the new
+        # day's hold, a complete window, the feed off
+        self.assertIsNone(imm.fair_lead_fair_c(
+            self.T, "KXTOKENUSE", now + imm.OR_FAIR_TTL_MIN * 60 + 10))
+        imm._or_fair_state["moved_at"][self.EV] = now
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXTOKENUSE", now))
+        imm._or_fair_state["moved_at"].clear()
+        with mock.patch.object(imm, "OR_FAIR_ENABLE", False):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXTOKENUSE", now))
+        self._write(complete=True)
+        self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXTOKENUSE", now))
+        # the monthly has a read and still leads nothing off it
+        self._write(ev="KXTOKENUSEM-68DEC31")
+        self.assertIsNone(imm.fair_lead_fair_c("KXTOKENUSEM-68DEC31-T190", "KXTOKENUSEM", now))
+        self.assertIsNone(imm.fair_close_fair_c("KXTOKENUSEM-68DEC31-T190", "KXTOKENUSEM", now))
+        # IMM_FAIR_LEAD_SERIES without it takes the weekly out
+        self._write()
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXRAINWKND",)):
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXTOKENUSE", now))
+
+    def test_the_stand_down_runs_from_before_midnight_until_the_day_is_in(self):
+        day = datetime(2068, 12, 3, tzinfo=timezone.utc).timestamp()
+        at = lambda h, m, s=0: day + h * 3600 + m * 60 + s       # noqa: E731
+        imm._or_fair_state["last_day"] = "2068-12-02"
+        with mock.patch.object(imm, "OR_LEAD_BLACKOUT_PRE_MIN", 5.0):
+            self.assertFalse(imm.or_publish_blackout(at(12, 0)))
+            self.assertFalse(imm.or_publish_blackout(at(23, 54, 59)))
+            self.assertTrue(imm.or_publish_blackout(at(23, 55)))
+            # past midnight the day that ended (12/03) is not in yet
+            self.assertTrue(imm.or_publish_blackout(at(24, 7)))
+            self.assertTrue(imm.or_publish_blackout(at(27, 0)))         # a late post
+            imm._or_fair_state["last_day"] = "2068-12-03"
+            self.assertFalse(imm.or_publish_blackout(at(24, 8)))
+            self.assertTrue(imm.fair_lead_blackout("KXTOKENUSE", at(47, 56)))
+            # only the weekly: the monthly and the other fair-lead families never
+            for s in ("KXTOKENUSEM", "KXOPENVREQ", "KXRAINWKND"):
+                self.assertFalse(imm.fair_lead_blackout(s, at(47, 56)), s)
+            imm._or_fair_state["last_day"] = ""                 # a read naming no day
+            self.assertTrue(imm.or_publish_blackout(at(12, 0)))
+            with mock.patch.object(imm, "OR_LEAD_BLACKOUT", False):
+                self.assertFalse(imm.or_publish_blackout(at(23, 58)))
+                self.assertFalse(imm.fair_lead_blackout("KXTOKENUSE", at(23, 58)))
+        for k in ("OR_LEAD_BLACKOUT", "OR_LEAD_BLACKOUT_PRE_MIN"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def test_t190_leads_its_bid_ahead_of_the_3_lots(self):
+        # 200 at 81c takes ~99% of the bid over the 5,000 at 60c; the 91.99c
+        # fair caps it at 86c. No offer leads: one at 97c or more is behind
+        # the 92c ask
+        fair = imm._p_above(190.0, 199.1, 6.48) * 100.0
+        self.assertAlmostEqual(fair, 91.99, places=2)
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, fair, 1000.0, 0.5),
+                         ((81, 86, 80), None))
+
+    def _cycle(self, pos=0.0, bot=None, cycles=3):
+        """`cycles` cycles on T190's book, holding `pos`: (bot, rungs, log)."""
+        if bot is None:
+            _clean_persist()
+            TestVercelFairLead._drop_holds()
+            self._write()
+            client = FakeClient()
+            far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            client.programs.append(
+                {"market_ticker": self.T, "incentive_type": "liquidity",
+                 "period_reward": 7000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[self.T] = {
+                "ticker": self.T, "event_ticker": self.EV, "status": "active",
+                "close_time": far, "yes_bid_dollars": "0.8000",
+                "yes_ask_dollars": "0.9200", "volume_fp": "0.00"}
+            client.books[self.T] = {"orderbook_fp": {
+                "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
+                "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+            if pos:
+                client.positions[self.T] = pos
+        lines = []
+        with contextlib.ExitStack() as st:
+            for name, v in {"LEVELS": [(0, 20)], "MAX_JOIN_SPREAD_CENTS": 99,
+                            "JOIN_AHEAD_MODE": "off"}.items():
+                st.enter_context(mock.patch.object(imm, name, v))
+            if bot is None:
+                bot = IncentiveMarketMaker(client=client, live=False)
+                if pos:
+                    bot.pnl.pos[self.T] = pos
+            with mock.patch.object(imm, "log", lines.append):
+                for i in range(cycles):
+                    bot.run_cycle()
+                    bot.state.universe_at = time.time()
+        return bot, TestVercelFairLead._rungs(self, bot), lines
+
+    def test_the_quote_loop_leads_and_stands_down_for_the_publish(self):
+        bot, rungs, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertIn((81, 200), rungs.get("bid", []), rungs)
+        self.assertTrue(any(f"fair lead {self.T} bid: 200 @ 81c, ahead of its own 80c; "
+                            f"the OpenRouter fair implies 91c" in s for s in lines), lines)
+        # 00:00Z, the day that ended not yet read: the lead goes, the rungs
+        # behind the wall stay, and the log says why
+        imm._or_fair_state["last_day"] = "2000-01-01"
+        bot, rungs, lines = self._cycle(bot=bot, cycles=1)
+        self.assertEqual([px for px, _n in rungs.get("bid", [])], [60], rungs)
+        self.assertNotIn(self.T, bot._comp_lead_px)
+        self.assertTrue(any(f"fair lead {self.T} bid: off -- OpenRouter's daily publish"
+                            in s for s in lines), lines)
+        # ...and the ladder lead does not take over while it lasts
+        with mock.patch.object(IncentiveMarketMaker, "_lead_source", return_value="comp"), \
+                mock.patch.object(IncentiveMarketMaker, "_comp_lead",
+                                  return_value=((81, 86, 80), None)):
+            bot, rungs, _l = self._cycle(bot=bot, cycles=1)
+        self.assertNotIn((81, 200), rungs.get("bid", []), rungs)
+        # the new day in: the lead is back, and logs again
+        imm._or_fair_state["last_day"] = self._ended()
+        bot, rungs, lines = self._cycle(bot=bot, cycles=1)
+        self.assertIn((81, 200), rungs.get("bid", []), rungs)
+        self.assertTrue(any(f"fair lead {self.T} bid: 200 @ 81c" in s for s in lines), lines)
+
+    def test_a_held_short_closes_at_the_model_outside_the_window_only(self):
+        # short 150 (T183's shape on 10/31: sold at 91c, fair 99c): the close
+        # bids it back at the 91c model, a tick under the 92c offer
+        bot, rungs, _l = self._cycle(pos=-150.0)
+        self.assertIn((91, 150), rungs.get("bid", []), rungs)
+        imm._or_fair_state["last_day"] = ""
+        bot, rungs, _l = self._cycle(bot=bot, cycles=1)
+        self.assertNotIn((91, 150), rungs.get("bid", []), rungs)
+
+    def test_the_fast_cancel_reads_the_lead_as_stale_in_the_window(self):
+        self._write()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot._comp_lead_px[self.T] = (81, None, 200)
+        self.assertEqual(bot._fair_model_rungs(self.T, now), {("bid", 81)})
+        imm._or_fair_state["last_day"] = ""
+        self.assertEqual(bot._fair_model_rungs(self.T, now), set())
 
 
 class TestFairClose(unittest.TestCase):
