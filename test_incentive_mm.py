@@ -11476,36 +11476,38 @@ class TestShippingSizeAndBand(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult("KXBALTPORTTEU"), 2.25)
             self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.5)
 
-    def test_the_weeklies_nights_keep_the_old_size(self):
-        """Jack 2026-10-31: "yes hold their nights at the old size" -- 00-08
-        ET the four strait weeklies run without the step; ports and Hormuz
-        peak keep it."""
+    def test_the_nights_keep_the_old_size(self):
+        """Jack 2026-10-31: "yes hold their nights at the old size" (the
+        weeklies), then "Hold those too" (Hormuz peak and the ports): ET hours
+        0-8, the global window's overnight, every shipping series runs
+        without the step."""
         def ts(h, m=0):
             return imm.ET.localize(datetime(2026, 11, 2, h, m)).timestamp()   # a Monday
-        self.assertEqual(set(_NIGHT_HOLD_CODE_DEFAULT), set(self.MEASURED[:4]))
+        self.assertEqual(set(_NIGHT_HOLD_CODE_DEFAULT),
+                         set(self.MEASURED + self.BY_METADATA))
         self.assertEqual(imm.SHIPPING_NIGHT_HOLD_ET, (0, 8))
         patcher = mock.patch.object(imm, "SHIPPING_NIGHT_HOLD_SERIES",
                                     _NIGHT_HOLD_CODE_DEFAULT)
         patcher.start()
         self.addCleanup(patcher.stop)
         step = imm.shipping_night_step
-        for s in self.MEASURED[:4]:
+        for s in self.MEASURED + self.BY_METADATA:
             self.assertEqual(step(s, ts(0)), 1.5, s)
-            self.assertEqual(step(s, ts(7, 59)), 1.5, s)
-            self.assertEqual(step(s, ts(8)), 1.0, s)
+            self.assertEqual(step(s, ts(8, 59)), 1.5, s)
+            self.assertEqual(step(s, ts(9)), 1.0, s)
             self.assertEqual(step(s, ts(23, 59)), 1.0, s)
-        for s in self.MEASURED[4:] + self.BY_METADATA:
-            self.assertEqual(step(s, ts(3)), 1.0, s)
+        self.assertEqual(step("KXTRUMPENDORSEMENTS", ts(3)), 1.0)   # not shipping
         with mock.patch.object(imm, "size_test_mult", lambda s, now_ts=None: 1.0):
             with mock.patch.object(imm.time, "time", return_value=ts(3)):
                 self.assertEqual(imm.applied_mention_mult("KXSUEZWEEKLY"), 2.0)
                 self.assertEqual(imm.applied_mention_mult("KXPANAMAWEEKLY"), 2.0)
-                self.assertEqual(imm.applied_mention_mult("KXMOBILETEU"), 3.0)
-                self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.5)
+                self.assertEqual(imm.applied_mention_mult("KXMOBILETEU"), 2.0)
+                self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.0)
                 self.assertEqual(imm.series_max_position("KXSUEZWEEKLY"),
                                  2.0 * imm.MAX_POSITION_CONTRACTS)
             with mock.patch.object(imm.time, "time", return_value=ts(12)):
                 self.assertEqual(imm.applied_mention_mult("KXSUEZWEEKLY"), 3.0)
+                self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.5)
                 self.assertEqual(imm.series_max_position("KXSUEZWEEKLY"),
                                  3.0 * imm.MAX_POSITION_CONTRACTS)
 
