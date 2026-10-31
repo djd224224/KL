@@ -107,7 +107,7 @@ class TestHedgesAndVerdict(unittest.TestCase):
                         fills=[{"ticker": "A"}])
         self.assertEqual(ctx["level"], "OK")
         self.assertAlmostEqual(ctx["hedges"]["locked"], 44.0)
-        self.assertIn("locks +$44.00, net +$44.00 | OK", cm.subject_for(ctx))
+        self.assertIn("net +$44 (rewards $0, 1 fill $0, hedges +$44) | OK", cm.subject_for(ctx))
 
     def test_problems_and_watches(self):
         self.assertEqual(self._ctx(rows=[{"kind": "expired", "job": "j"}])["level"],
@@ -119,8 +119,13 @@ class TestHedgesAndVerdict(unittest.TestCase):
                                           "error_body": "post only cross"}])["level"], "OK")
         stuck = {"id": "j", "count": 200, "at": _ts(10), "legs": {"B": {"filled": 50}}}
         self.assertEqual(self._ctx(jobs=[stuck])["level"], "PROBLEM")
-        young = dict(stuck, at=_ts(11, 50))
-        self.assertEqual(self._ctx(jobs=[young])["level"], "WATCH")
+        # a job in flight (a leg filled under an hour ago) risks nothing past its
+        # fill: a note, not a WATCH (Jack 2026-10-31: "make it succinct and clearer")
+        young = dict(stuck, at=_ts(11, 50), ticker="KXB-1")
+        ctx = self._ctx(jobs=[young])
+        self.assertEqual(ctx["level"], "OK")
+        self.assertEqual(cm.notes(ctx), ["1 hedge still working (1 with a leg filled); the "
+                                         "oldest KXB-1, 10 min"])
         self.assertEqual(self._ctx(fills=[{"ticker": "A"}])["level"], "WATCH")  # no job
         # a lead fill that never locked is a PROBLEM; another fill that did not
         # lock just rides on, and one still in its watch is not reported
@@ -146,12 +151,12 @@ class TestHedgesAndVerdict(unittest.TestCase):
         self.assertAlmostEqual(lk["locked"], 0.609)
         self.assertEqual(ctx["level"], "OK")
         text = cm.render_text(dict(ctx, est={}))
-        self.assertIn("3 watched, 1 locked (+$0.61), 1 unwound first, 1 rode on as inventory",
+        self.assertIn("3 checked, 1 hedged (+$0.61), 1 unwound first, 1 left as inventory",
                       text)
-        self.assertIn("ladder_bid: 1 of 2 locked", text)
-        self.assertIn("locked KXR-26NOV-4 30 at +2.0c a contract (ladder_bid: KXR-26NOV-5 29)",
+        self.assertIn("  by kind: ladder_bid 1 of 2, me_ask 0 of 1", text)
+        self.assertIn("hedged KXR-26NOV-4 30 at +2.0c a contract (ladder_bid: KXR-26NOV-5 29)",
                       text)
-        self.assertIn("locks +$0.61, net +$0.61 | OK", cm.subject_for(ctx))
+        self.assertIn("net +$1 (rewards $0, no fills, hedges +$1) | OK", cm.subject_for(ctx))
 
     def test_the_report_renders_from_files(self):
         day = date(2026, 10, 29)
@@ -171,8 +176,12 @@ class TestHedgesAndVerdict(unittest.TestCase):
         text = cm.render_text(ctx)
         self.assertEqual(ctx["level"], "OK")
         self.assertIn("KXK-30-JDON ask: 200 @ 60c, own best 71c, siblings imply 38c", text)
-        self.assertIn("the 1 fill at a lead is worth +$0.00 now; locks completed +$44.00", text)
-        self.assertIn("1 fill (200 contracts) +$0.00 now, 1 with no mark", text)
+        self.assertIn("NET +$44.00\n", text)
+        self.assertIn("+$0.00  1 fill on leads, valued at the latest marks\n", text)
+        self.assertIn("+$44.00  hedges completed", text)
+        self.assertIn("1 fill (200 contracts) +$0.00, 1 with no price yet", text)
+        self.assertIn("no price  KXK-30-JDON sold 200 @ 60c at 03:00 ET, no price yet  "
+                      "(complement: no hedge)", text)
         self.assertTrue(text.isascii())
 
 
@@ -208,18 +217,20 @@ class TestFairLeads(unittest.TestCase):
                    hedges=h, est={})
         ctx["level"], ctx["reasons"] = cm.verdict(ctx)
         self.assertEqual(ctx["level"], "OK")                 # no hedge job is expected
-        self.assertEqual(cm.subject_for(ctx), "IMM leads 10/29: earned $0.00 while leading, "
-                                              "1 lead fill +$0.00 now, net +$0.00 | OK")
+        self.assertEqual(cm.subject_for(ctx), "IMM leads 10/29: net $0 (rewards $0, 1 fill $0) "
+                                              "| OK")
         text = cm.render_text(ctx)
-        self.assertIn("  complement  1 side on 1 market (from 05:00 ET)", text)
-        self.assertIn("  fair        1 side on 1 market (from 02:00 ET): $0.00 while leading; "
-                      "1 fill (200 contracts) +$0.00 now, 1 with no mark", text)
-        self.assertIn(f"ALL FAIR LEADS by event, at least {imm.FAIR_LEAD_MARGIN_C}c inside "
-                      f"the fair", text)
+        self.assertIn("  complement  1 side on 1 market (from 05:00 ET): rewards +$0.00; no fills",
+                      text)
+        self.assertIn("  fair        1 side on 1 market (from 02:00 ET): rewards +$0.00; 1 fill "
+                      "(200 contracts) +$0.00, 1 with no price yet", text)
+        self.assertIn(f"FAIR LEADS BY EVENT (top 1 of 1 by reward, at least "
+                      f"{imm.FAIR_LEAD_MARGIN_C}c inside the fair", text)
         self.assertIn("NEEDS A LOOK: nothing.", text)
         self.assertIn("KXRAINWKND-26OCT31-SGF bid: 200 @ 54c, own best 48c, fair 69c; "
                       "led 2.0h, ended", text)
-        self.assertIn("KXRAINWKND-26OCT31-SGF bought 200 @ 54c", text)
+        self.assertIn("no price  KXRAINWKND-26OCT31-SGF bought 200 @ 54c at 03:00 ET, no price "
+                      "yet  (fair: rides to settlement)", text)
         self.assertTrue(text.isascii())
 
 
@@ -282,15 +293,22 @@ class TestMoney(unittest.TestCase):
         self.assertEqual((T["comp"]["fills_usd"], T["fair"]["fills_usd"], T["locks"]),
                          (0.0, 40.0, 3.0))
         self.assertAlmostEqual(T["net"], 1.25 + 0.25 + 40.0 + 3.0)
-        self.assertEqual(cm.subject_for(ctx), "IMM leads 10/29: earned $1.50 while leading, "
-                                              "2 lead fills +$40.00 now, locks +$3.00, "
-                                              "net +$44.50 | OK")
+        # (Jack 2026-10-31: "make it succinct and clearer") the subject in whole
+        # dollars, half up; the email opens on the same sum, line by line
+        self.assertEqual(cm.subject_for(ctx), "IMM leads 10/29: net +$45 (rewards +$2, 2 fills "
+                                              "+$40, hedges +$3) | OK")
         text = cm.render_text(ctx)
-        self.assertIn("TAKEAWAY: leading earned about $1.50; the 2 fills at a lead are worth "
-                      "+$40.00 now; locks completed +$3.00. Net about +$44.50.", text)
+        self.assertIn("NET +$44.50\n"
+                      "     +$1.50  rewards on the led markets during their lead hours", text)
+        self.assertIn("    +$40.00  2 fills on leads, valued at the latest marks (a hedged one counts "
+                      "in the hedges)\n"
+                      "             biggest: W1 sold 200 @ 62c at 04:00 ET, now 42c: +$40.00\n"
+                      "     +$3.00  hedges completed", text)
         self.assertIn("$  1.25  T1 bid 40c (complement, led 3.0h)", text)
-        self.assertIn("W1 sold 200 @ 62c, now 42c: +$40.00  (fair: rides to settlement", text)
-        self.assertIn("T1 bought 100 @ 40c, now 45c: +$5.00  (complement: locked", text)
+        self.assertIn("    +$40.00  W1 sold 200 @ 62c at 04:00 ET, now 42c  (fair: rides to "
+                      "settlement)\n"
+                      "     +$5.00  T1 bought 100 @ 40c at 03:00 ET, now 45c  (complement: "
+                      "hedged, counted in the hedges)", text)
 
     def test_a_stuck_lock_names_its_market_what_is_left_and_its_dollars(self):
         # 10/29's: sold 12 @ 53c on KXAPRPOTUS, 12 of one sibling sold @ 25c
@@ -303,27 +321,59 @@ class TestMoney(unittest.TestCase):
         # (Jack 2026-10-30: "Yes, size-aware") -- it can lose $2.68 at worst:
         # a WATCH, not a PROBLEM
         self.assertEqual(ctx["level"], "WATCH")
-        self.assertIn("KXA-1: the lock on a fill (sold 12 @ 53c) has been half done for 3h -- "
-                      "12 of KXA-2 traded, the other legs not; as it stands -$2.68 at worst, "
-                      "+$9.32 at best; a full lock priced at up to +2.1c a contract; its legs' "
+        self.assertIn("KXA-1: a hedge half done for 3h -- we sold 12 @ 53c and 12 of KXA-2 "
+                      "filled, the other legs not; worst case -$2.68, best +$9.32; its legs' "
                       "books are off the feed; its watch ended", ctx["reasons"][0])
         self.assertTrue(cm.subject_for(ctx).endswith(
-            "| WATCH: 1 lock half done 3h (worst -$2.68)"))
-        self.assertIn("(a lock left half done is a PROBLEM when it can lose $10 or more as it "
+            "| WATCH: 1 hedge half done 3h (worst -$3)"))
+        self.assertIn("(a half-done hedge is a PROBLEM when it can lose $10 or more as it "
                       "stands, a WATCH under that)", cm.render_text(ctx))
         # the same lock on 200 contracts can lose $44.66: a PROBLEM
         big = dict(job, count=200.0,
                    legs={"KXA-2": {"filled": 200.0, "value": 5000.0, "fee": 66.0}})
         ctx = self._ctx(big)
         self.assertEqual(ctx["level"], "PROBLEM")
-        self.assertIn("as it stands -$44.66 at worst, +$155.34 at best", ctx["reasons"][0])
+        self.assertIn("worst case -$44.66, best +$155.34", ctx["reasons"][0])
         self.assertTrue(cm.subject_for(ctx).endswith(
-            "| PROBLEM: 1 lock half done 3h (worst -$44.66)"))
+            "| PROBLEM: 1 hedge half done 3h (worst -$45)"))
         # one it cannot price (its legs' value unknown) stays a PROBLEM
         ctx = self._ctx(dict(job, legs={"KXA-2": {"filled": 12.0}}))
         self.assertEqual(ctx["level"], "PROBLEM")
         self.assertIn("its dollars could not be priced", ctx["reasons"][0])
-        self.assertTrue(cm.subject_for(ctx).endswith("| PROBLEM: 1 lock half done 3h"))
+        self.assertTrue(cm.subject_for(ctx).endswith("| PROBLEM: 1 hedge half done 3h"))
+
+    def test_a_half_done_lock_whose_markets_settled_is_final_not_a_watch(self):
+        # Jack 2026-10-31 ("make it succinct and clearer"): 10/30's email called
+        # 10/29's KXAPRPOTUS lock half done for 44h, worst -$2.68, though its
+        # markets had settled on 10/30 at that worst case (38.4 YES, 38.7 NO)
+        job = {"id": "KXA-1-ask-x", "ticker": "KXA-1", "side": "ask", "kind": "me_ask",
+               "count": 12.0, "price": 53.0, "at": _ts(9), "until": _ts(9, 10), "lead": False,
+               "legs": {"KXA-2": {"filled": 12.0, "value": 300.0, "fee": 4.0},
+                        "KXA-3": {"filled": 0.0, "value": 0.0, "fee": 0.0}}}
+
+        def report(results):
+            with tempfile.TemporaryDirectory() as d, mock.patch.object(imm, "STATUS_DIR", d):
+                with open(os.path.join(d, imm.COMP_HEDGE_FILE), "w", encoding="utf-8") as f:
+                    json.dump({"jobs": [job]}, f)
+                with open(os.path.join(d, "settlements_2026-10-30.jsonl"), "w",
+                          encoding="utf-8") as f:
+                    for t, res in results.items():
+                        f.write(json.dumps({"ticker": t, "result": res,
+                                            "ts": "2026-10-30T16:12:02+00:00"}) + "\n")
+                return cm.build_report(date(2026, 10, 30),
+                                       now=datetime(2026, 10, 31, 11, 55, tzinfo=timezone.utc))
+        ctx = report({"KXA-1": "yes", "KXA-2": "no"})
+        self.assertEqual((ctx["level"], ctx["reasons"]), ("OK", []))
+        self.assertEqual(cm.notes(ctx), ["KXA-1: its half-done hedge settled at -$2.68, its "
+                                         "worst case"])
+        self.assertTrue(cm.subject_for(ctx).endswith("| OK"))
+        self.assertIn("NEEDS A LOOK: nothing.\n"
+                      "  FYI: KXA-1: its half-done hedge settled at -$2.68, its worst case",
+                      cm.render_text(ctx))
+        # while one of its markets is open it is still half done: a WATCH
+        ctx = report({"KXA-1": "yes"})
+        self.assertEqual(ctx["level"], "WATCH")
+        self.assertIn("KXA-1: a hedge half done for 51h", ctx["reasons"][0])
 
     def _ctx(self, job):
         h = cm.hedge_summary([], [job], _ts(12))
@@ -353,6 +403,20 @@ class TestMoney(unittest.TestCase):
             self.assertAlmostEqual(imm.lock_plan(kind, px, q, {}, legs)[0] * q / 100.0, worst,
                                    places=6, msg=kind)
         self.assertIsNone(cm.lock_outcomes(None, 50, 10, {}))
+        # once all of its markets settle, a lock lands on one of those cases
+        for (kind, px, q, legs), results, want in (
+                (("me_ask", 53, 12, {"B": (12, 300, 4)}), {"A": 100.0, "B": 0.0}, -2.68),
+                (("me_ask", 53, 12, {"B": (12, 300, 4)}), {"A": 0.0, "B": 0.0}, 9.32),
+                (("pair_bid", 40, 100, {"B": (60, 3300, 5)}), {"A": 0.0, "B": 100.0}, -13.05),
+                (("ladder_ask", 60, 100, {"B": (40, 1200, 3)}), {"A": 100.0, "B": 100.0},
+                 -12.03),
+                (("ladder_bid", 40, 100, {"B": (70, 2100, 3)}), {"A": 0.0, "B": 0.0}, -19.03),
+                (("ladder_bid", 40, 100, {"B": (70, 2100, 3)}), {"A": 100.0, "B": 0.0}, 80.97)):
+            self.assertAlmostEqual(cm.settled_outcome(kind, "A", px, q, legs, results), want,
+                                   places=6, msg=(kind, results))
+        # ...and has no final dollars while one of them is open
+        self.assertIsNone(cm.settled_outcome("me_ask", "A", 53, 12, {"B": (12, 300, 4)},
+                                             {"A": 100.0}))
 
     def test_a_lock_that_gave_up_is_priced_from_its_rows(self):
         d = imm.STATUS_DIR
@@ -383,11 +447,11 @@ class TestMoney(unittest.TestCase):
         ctx = cm.build_report(date(2026, 10, 20),
                               now=datetime(2026, 10, 21, 11, 55, tzinfo=timezone.utc))
         self.assertEqual(ctx["level"], "WATCH")
-        self.assertIn("KXA-1: its lock gave up with legs traded and no full lock -- the traded "
-                      f"legs now ride as inventory; as it stands {cm.usd(worst)} at worst, "
-                      f"{cm.usd(best)} at best", ctx["reasons"][0])
+        self.assertIn("KXA-1: its hedge gave up half done -- the filled legs now ride as "
+                      f"inventory; worst case {cm.usd(worst)}, best {cm.usd(best)}",
+                      ctx["reasons"][0])
         self.assertTrue(cm.subject_for(ctx).endswith(
-            f"| WATCH: 1 lock gave up (worst {cm.usd(worst)})"))
+            f"| WATCH: 1 hedge gave up half done (worst {cm.usd0(worst)})"))
 
 
 WALL = [(15, 13238.0), (16, 21.0)]
@@ -506,20 +570,19 @@ class TestOrdersAhead(unittest.TestCase):
                    ahead=res)
         ctx["level"], ctx["reasons"] = cm.verdict(ctx)
         text = cm.render_text(ctx)
-        self.assertIn("ORDERS AHEAD OF LEADS (each cycle's book with our orders; a lead holds "
-                      "while it keeps 50% of its side where it rests", text)
-        self.assertIn("  3 times a lead had an order resting ahead of it, on 1 lead side", text)
-        self.assertIn("  held 1: the lead stayed and kept a median 84% of its side (lowest 84%), "
-                      "a median 31 lots ahead", text)
-        self.assertIn("  fought 1: it kept under 50% (a median 300 lots ahead) and re-led a "
-                      "median 6c nearer the model (6c in all)", text)
-        self.assertIn("  chased 1: it moved up while it still kept 50% or more (a median 31 lots "
-                      "ahead) and re-led a median 2c nearer the model (2c in all); all of them "
-                      "before the half-side hold went live", text)
+        self.assertIn("ORDERS IN FRONT OF A LEAD: 3 times, on 1 lead side (one spell at one lead "
+                      "price, however the orders in front came and went)\n"
+                      "  rule: a lead stays put while it keeps 50% of its side, and moves up "
+                      "toward the model below that", text)
+        self.assertIn("  held 1: stayed put, kept a median 84% of its side (lowest 84%), a median "
+                      "31 lots in front", text)
+        self.assertIn("  fought 1: kept under 50%, moved up a median 6c toward the model (6c in "
+                      "all; a median 300 lots in front)", text)
+        self.assertIn("  chased 1: moved up though it kept 50% or more, a median 2c toward the "
+                      "model (2c in all; a median 31 lots in front); all of them before the rule "
+                      "went live", text)
         self.assertIn(f"    {T50} bid (complement): 3 -- held 1 (84%-84%), fought 1, chased 1",
                       text)
-        self.assertIn("  ahead       3 times a lead had an order resting ahead of it: held 1 "
-                      "(kept a median 84% of the side), fought 1, chased 1", text)
         self.assertTrue(text.isascii())
         # since the half-side hold, a chase is not expected: the line says none
         ctx["ahead"] = dict(res, events=[e for e in res["events"] if e["moved"] != 2])
@@ -529,7 +592,7 @@ class TestOrdersAhead(unittest.TestCase):
         ctx["ahead"] = {"events": [], "files": 0, "rows": 0, "error": "OSError('x')"}
         self.assertIn("  not read: OSError('x')", cm.render_text(ctx))
         del ctx["ahead"]
-        self.assertNotIn("ORDERS AHEAD", cm.render_text(ctx))
+        self.assertNotIn("ORDERS IN FRONT", cm.render_text(ctx))
 
 
 if __name__ == "__main__":

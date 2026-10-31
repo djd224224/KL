@@ -34,44 +34,49 @@ a lock job off the other strikes like any lead fill there. So does the
 OpenRouter weekly (KXTOKENUSE, Jack: "Yes, add it"), whose leads log `off`
 for OpenRouter's 00:00Z publish and come back once the new day is read.
 
-ONE EMAIL per ET day (the day before), THE TAKEAWAY FIRST (Jack 2026-10-30:
-"really $0 for complement lead? clean up this email and make it clear the
-takeaway" -- the old subject carried only the locks' dollars, $0 that day,
-while leading had earned ~$15 and its fills were up ~$38):
-  subject     earned $X while leading, N lead fills $Y now, locks $Z, net,
-              then the verdict and, if not OK, its reason in a few words
-  takeaway    the same per kind (complement / fair): sides and markets led,
-              the reward the markets accrued while leading (the bot's own
-              hourly estimate over the lead spans, imm_reward_recon's cache;
-              Kalshi pays ~1.15x it), the fills at a lead marked to now
+ONE EMAIL per ET day (the day before), the money first, in plain words
+(Jack 2026-10-30: "clean up this email and make it clear the takeaway";
+2026-10-31: "make it succinct and clearer"):
+  subject     "IMM leads MM/DD: net +$N (rewards +$R, K fills +$F[, hedges
+              +$H]) | VERDICT[: the reason in a few words]", whole dollars
+  a lead      what it is, in one sentence
+  NET         one sum: the reward the led markets accrued during their lead
+              hours (the bot's own hourly estimate over the lead spans,
+              imm_reward_recon's cache; Kalshi pays ~1.15x it) + the fills
+              at a lead at the latest marks (the biggest named) + the
+              completed locks ("hedges" in the email)
   needs a look  each verdict reason, naming the market and what is left
               (PROBLEM: a lead fill never locked, Kalshi refused a hedge
               order, or a lock that gave up with legs traded or has been half
               done for over HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD ($10)
-              or more as it stands; WATCH: such a lock that can lose less, a
-              complement-lead fill that opened no lock job, or a lock job
-              still working). Each such lock shows its worst and best case in
-              dollars over how its markets can settle (Jack 2026-10-30: "Yes,
-              size-aware" -- 10/29's 12-contract lock read PROBLEM at -$2.68)
+              or more as it stands (Jack 2026-10-30: "Yes, size-aware" --
+              10/29's 12-contract lock read PROBLEM at -$2.68); WATCH: such a
+              lock that can lose less, or a complement-lead fill that opened
+              no lock job). Then FYI lines: a half-done lock whose markets
+              have all settled, at its final dollars (10/30's WATCH named one
+              that had settled the day before), and the lock jobs in flight
+              (those read WATCH most days until 2026-10-31)
+  by source   complement / fair: sides and markets led, reward, fills
+  fills       every fill at a lead (partial fills at one price as one),
+              biggest first, at the bot's latest mark or the settlement, and
+              what became of it (hedged, a hedge resting, none; a fair
+              lead's rides to settlement)
   top earners the markets that earned most while leading
-  orders ahead  (Jack 2026-10-30: "Daily email report on leads", after "Hold
-              at one half") every time an order rested AHEAD of a resting
-              lead, off the bot's own book_depth rows (each cycle's book with
-              our resting orders): what the lead kept of its side where it
-              rested (the bot's _side_share, at the last cycle before it
-              acted) and what the bot did -- held (it kept half its side and
-              stayed), fought (under half: it re-led nearer the model), chased
-              (it moved up while it still kept half: the old 95% bar's habit,
-              none expected since c06a4f7), stayed under half (the order sat
-              at or past the lead's cap), moved down, stopped resting; then
-              the sides most orders stood ahead of. The takeaway gets a line.
-  fills       every fill at a lead's price, marked to the bot's latest mark
-              or the settlement, and what became of it (locked, a lock job
-              open, no lock; a fair lead's rides to settlement)
-  locks       every other fill watched for a lock: locked (and the dollars),
-              unwound by the bot first, or ridden on as inventory
-  counts, then every lead by event (those that led LIST_MIN_HOURS or
-              earned LIST_MIN_USD; one line an event)
+  orders in front of a lead  (Jack 2026-10-30: "Daily email report on
+              leads", after "Hold at one half") every time an order rested
+              AHEAD of a resting lead, off the bot's own book_depth rows (each
+              cycle's book with our resting orders): what the lead kept of its
+              side where it rested (the bot's _side_share, at the last cycle
+              before it acted) and what the bot did -- held (it kept half its
+              side and stayed), fought (under half: it re-led nearer the
+              model), chased (it moved up while it still kept half: the old
+              95% bar's habit, none expected since c06a4f7), stayed under half
+              (the order sat at or past the lead's cap), moved down, stopped
+              resting; then the sides most orders stood ahead of
+  hedges on other fills  every other fill watched for a lock: locked (and
+              the dollars), unwound by the bot first, or left as inventory
+  counts, then the top LIST_TOP leads by event of each kind (those that
+              led LIST_MIN_HOURS or earned LIST_MIN_USD; one line an event)
 
 SOURCES, read-only: the bot's day logs (incentive-mm-*.log), fills_ /
 comp_hedge_ / selection_snapshot_ / settlements_<UTC date>.jsonl,
@@ -115,13 +120,16 @@ HEDGE_STUCK_SECS = 3600         # an open job part-hedged this long needs a look
 LOCK_PROBLEM_USD = 10.0         # ...a PROBLEM when it can lose this much as it stands (or
                                 # cannot be priced), else a WATCH; a lock that gave up too
 LEVELS = ("OK", "WATCH", "PROBLEM")
+SETTLE_LOOKBACK_SECS = 2 * 86400    # settlements read this far before the day: a lock
+                                # job lives 48h, its markets may settle the day before
 HOURLY_CACHE_FILE = "reward_est_hourly_cache.json"   # in STATUS_DIR (imm_reward_recon)
 MARKS_TAIL_BYTES = 4_000_000    # the newest marks file's tail: every position's last mark
-TOP_EARNERS = 10
-LIST_MIN_HOURS = 0.5            # ALL LEADS lists a lead that led this long...
+TOP_EARNERS = 5                 # TOP EARNERS lists this many markets
+LIST_MIN_HOURS = 0.5            # LEADS BY EVENT lists a lead that led this long...
 LIST_MIN_USD = 0.05             # ...or earned this much while leading
+LIST_TOP = 3                    # ...the top this many events of each kind, by reward
 BOOK_DEPTH_SUBDIR = "book_depth"    # in STATUS_DIR: the bot's book_depth sink
-AHEAD_LIST = 8                  # ORDERS AHEAD lists the sides most orders stood ahead of
+AHEAD_LIST = 3                  # ORDERS IN FRONT lists the sides most orders stood ahead of
 LEAD_GAP_SECS = 600             # lead spans this close count as one (a restart's handover:
                                 # the banner ends them, the rung rests on until relogged)
 # c06a4f7 live (Jack 2026-10-30: "Hold at one half"): before it a lead fought
@@ -313,6 +321,27 @@ def lock_outcomes(kind, price, count, legs):
     return worst / 100.0, best / 100.0
 
 
+# the fill's and the legs' YES side in each lock kind: +1 bought, -1 sold
+_LOCK_SIGNS = {"me_ask": (-1, -1), "pair_bid": (1, 1), "ladder_ask": (-1, 1),
+               "ladder_bid": (1, -1)}
+
+
+def settled_outcome(kind, ticker, price, count, legs, results):
+    """Dollars a lock's fill (`count` at `price` on `ticker`) plus the legs it
+    traded (lock_outcomes' `legs`) came to once all of their markets settled
+    (`results` {ticker: 100 or 0 YES cents}), fees off: one of
+    lock_outcomes' cases, now final. None while any of them is open, or for
+    a kind it cannot price."""
+    signs = _LOCK_SIGNS.get(kind)
+    if signs is None or ticker not in results or any(t not in results for t in legs):
+        return None
+    f, g = signs
+    cents = f * float(count or 0.0) * (results[ticker] - float(price or 0.0))
+    for t, (n, v, fee) in legs.items():
+        cents += g * (float(n) * results[t] - float(v)) - float(fee)
+    return cents / 100.0
+
+
 def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
     """The day's lock rows (comp_hedge_<date>.jsonl) and the open jobs now. A
     row without a `lead` flag predates the every-fill locks: a lead's."""
@@ -354,14 +383,15 @@ def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
         # what it stands to make or lose with the legs traded so far
         legs = {s: lg for s, lg in (j.get("legs") or {}).items()
                 if float(lg.get("filled", 0.0)) > 0}
-        outcome = (lock_outcomes(j.get("kind"), j.get("price"), q,
-                                 {s: (lg["filled"], lg["value"], lg.get("fee", 0.0))
-                                  for s, lg in legs.items()})
-                   if all("value" in lg for lg in legs.values()) else None)
+        priced = ({s: (lg["filled"], lg["value"], lg.get("fee", 0.0))
+                   for s, lg in legs.items()}
+                  if all("value" in lg for lg in legs.values()) else None)
+        outcome = (lock_outcomes(j.get("kind"), j.get("price"), q, priced)
+                   if priced is not None else None)
         open_now.append(dict(id=j.get("id"), ticker=j.get("ticker"), side=j.get("side"),
                              kind=j.get("kind"), lead=lead, count=q, price=j.get("price"),
                              age_s=now_ts - float(j.get("at") or now_ts),
-                             traded=traded, best=j.get("best"), outcome=outcome,
+                             traded=traded, best=j.get("best"), outcome=outcome, legs=priced,
                              waiting=bool(j.get("waiting")), until=j.get("until")))
     return dict(opened=opened, done=done, expired=expired, never=never, sends=sends,
                 refused=refused, crossed=crossed, leg_fills=leg_fills, locked=locked,
@@ -370,13 +400,13 @@ def hedge_summary(rows: list, jobs: list, now_ts: float) -> dict:
                            locked=l_locked, by_kind=dict(by_kind)))
 
 
-def gave_up_outcome(r: dict):
-    """lock_outcomes of a lock that gave up (an `expired` row, which keeps no
-    prices), rebuilt from its job's rows: the fill from its `open` row, the
-    legs from its `leg_fill` rows with the fee the bot books on each. A job's
-    id ends with the epoch second it opened. None when its open row is not
-    found. (A job cut to what its market still held before any leg traded
-    is priced at its opening count: its worst case reads deeper.)"""
+def gave_up_lock(r: dict):
+    """(kind, ticker, price, count, legs) of a lock that gave up (an
+    `expired` row, which keeps no prices), rebuilt from its job's rows: the
+    fill from its `open` row, the legs ({ticker: (contracts, YES-cent value,
+    fees in cents)}) from its `leg_fill` rows with the fee the bot books on
+    each. A job's id ends with the epoch second it opened. None when its open
+    row is not found."""
     try:
         at = float(str(r.get("job")).rsplit("-", 1)[-1])
     except ValueError:
@@ -395,8 +425,17 @@ def gave_up_outcome(r: dict):
     if opened is None:
         return None
     # (a job opened before its event's group was read gets its kind later)
-    return lock_outcomes(r.get("lock") or opened.get("lock"), opened.get("px"),
-                         opened.get("count"), legs)
+    return (r.get("lock") or opened.get("lock"), opened.get("ticker") or r.get("ticker"),
+            opened.get("px"), opened.get("count"), legs)
+
+
+def gave_up_outcome(r: dict):
+    """lock_outcomes of a lock that gave up, rebuilt by gave_up_lock; None
+    when its open row is not found. (A job cut to what its market still held
+    before any leg traded is priced at its opening count: its worst case
+    reads deeper.)"""
+    g = gave_up_lock(r)
+    return None if g is None else lock_outcomes(g[0], g[2], g[3], g[4])
 
 
 def latest_estimates(tickers: set, a_ts: float, b_ts: float) -> dict:
@@ -493,6 +532,13 @@ def load_marks(a_ts: float, now_ts: float) -> dict:
                 continue
             if r.get("ticker") and r.get("mark_cents") is not None:
                 out[r["ticker"]] = float(r["mark_cents"])
+    out.update(load_results(a_ts, now_ts))
+    return out
+
+
+def load_results(a_ts: float, now_ts: float) -> dict:
+    """{ticker: 100.0 or 0.0}: every market settled from a_ts to now."""
+    out = {}
     for r in jsonl_rows("settlements", a_ts, now_ts):
         if r.get("result") in ("yes", "no"):
             out[r.get("ticker")] = 100.0 if r["result"] == "yes" else 0.0
@@ -720,8 +766,29 @@ def _until(j: dict, ctx: dict) -> str:
 
 
 def _stuck(h: dict) -> list:
-    """The open lock jobs half done (a leg traded) for over HEDGE_STUCK_SECS."""
-    return [j for j in h["open_now"] if j["traded"] and j["age_s"] >= HEDGE_STUCK_SECS]
+    """The open lock jobs half done (a leg traded) for over HEDGE_STUCK_SECS
+    whose markets have not all settled."""
+    return [j for j in h["open_now"] if j["traded"] and j["age_s"] >= HEDGE_STUCK_SECS
+            and j.get("settled") is None]
+
+
+def _gave_up(h: dict) -> list:
+    """The locks that gave up with legs traded whose markets have not all
+    settled."""
+    return [r for r in h["expired"] if r.get("settled") is None]
+
+
+def _working(h: dict) -> list:
+    """The open lock jobs still in flight: not stuck, their markets open."""
+    stuck = _stuck(h)
+    return [j for j in h["open_now"] if j not in stuck and j.get("settled") is None]
+
+
+def _settled_locks(h: dict) -> list:
+    """The half-done locks -- given up or still open -- whose markets have
+    all settled: their dollars are final, nothing is left to watch."""
+    return ([dict(r, gave_up=True) for r in h["expired"] if r.get("settled") is not None]
+            + [j for j in h["open_now"] if j["traded"] and j.get("settled") is not None])
 
 
 def _lock_level(outcome) -> int:
@@ -734,7 +801,16 @@ def _lock_level(outcome) -> int:
 def _sized(outcome) -> str:
     if outcome is None:
         return "; its dollars could not be priced"
-    return f"; as it stands {usd(outcome[0])} at worst, {usd(outcome[1])} at best"
+    return f"; worst case {usd(outcome[0])}, best {usd(outcome[1])}"
+
+
+def _case(x: float, outcome) -> str:
+    """Which end of its range a settled lock came to, if either."""
+    if outcome is not None and abs(x - outcome[0]) < 0.005:
+        return ", its worst case"
+    if outcome is not None and abs(x - outcome[1]) < 0.005:
+        return ", its best case"
+    return ""
 
 
 def verdict(ctx: dict) -> tuple:
@@ -742,9 +818,12 @@ def verdict(ctx: dict) -> tuple:
     what is left. PROBLEM: a lead fill never locked, Kalshi refused a hedge
     order, or a lock that gave up with legs traded or has been half done for
     over HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD or more as it stands (or
-    cannot be priced); WATCH: such a lock that can lose less, a
-    complement-lead fill that opened no lock job, or a lock job still
-    working; OK otherwise."""
+    cannot be priced); WATCH: such a lock that can lose less, or a
+    complement-lead fill that opened no lock job; OK otherwise. A half-done
+    lock whose markets have all settled is final, and a lock job in flight
+    risks nothing past its fill: notes() lists both (Jack 2026-10-31: "make
+    it succinct and clearer" -- 10/30's WATCH was a lock whose markets had
+    settled the day before, and the jobs in flight read WATCH most days)."""
     reasons, level = [], 0
 
     def flag(lv, why):
@@ -753,71 +832,88 @@ def verdict(ctx: dict) -> tuple:
         reasons.append(why)
 
     h = ctx["hedges"]
-    for r in h["expired"]:
+    for r in _gave_up(h):
         oc = r.get("outcome")
-        flag(_lock_level(oc), f"{r.get('ticker') or r.get('job')}: its lock gave up with legs "
-                              f"traded and no full lock -- the traded legs now ride as "
-                              f"inventory" + _sized(oc))
+        flag(_lock_level(oc), f"{r.get('ticker') or r.get('job')}: its hedge gave up half done "
+                              f"-- the filled legs now ride as inventory" + _sized(oc))
     if h["never"]:
-        flag(2, f"{len(h['never'])} lead fill(s) were never locked: " + ", ".join(
+        flag(2, f"{len(h['never'])} lead fill(s) were never hedged: " + ", ".join(
             sorted({str(r.get("ticker") or r.get("job")) for r in h["never"]})))
     if h["refused"]:
         r0 = h["refused"][0]
         flag(2, f"Kalshi refused {len(h['refused'])} hedge order(s) (first: "
                 f"{r0.get('ticker')} {r0.get('side')} {r0.get('count')} @ {r0.get('px')}c: "
                 f"{r0.get('error_body') or r0.get('error')})")
-    stuck = _stuck(h)
-    for j in stuck:
+    for j in _stuck(h):
         legs = ", ".join(f"{q:g} of {s}" for s, q in j["traded"].items())
         what = "sold" if j.get("side") == "ask" else "bought"
-        best = j.get("best")
         oc = j.get("outcome")
         flag(_lock_level(oc),
-             f"{j.get('ticker')}: the lock on a fill ({what} {float(j.get('count') or 0):g} @ "
-             f"{float(j.get('price') or 0):g}c) has been half done for {_age(j['age_s'])} -- "
-             f"{legs} traded, the other legs not" + _sized(oc)
-             + (f"; a full lock priced at up to {float(best):+.1f}c a contract"
-                if best is not None else "")
+             f"{j.get('ticker')}: a hedge half done for {_age(j['age_s'])} -- we {what} "
+             f"{float(j.get('count') or 0):g} @ {float(j.get('price') or 0):g}c and {legs} "
+             f"filled, the other legs not" + _sized(oc)
              + ("; its legs' books are off the feed" if j.get("waiting") else "")
              + _until(j, ctx))
     # (a FAIR lead's fill has nothing to hedge on: never counted here)
     comp_fills = [f for f in ctx["fills"] if f.get("kind", "comp") == "comp"]
     if len(comp_fills) > len(h["opened"]):
-        flag(1, f"{len(comp_fills)} complement-lead fill(s) but only {len(h['opened'])} lock "
+        flag(1, f"{len(comp_fills)} complement-lead fill(s) but only {len(h['opened'])} hedge "
                 f"job(s) opened")
-    young = [j for j in h["open_now"] if j not in stuck]
-    if young:
-        flag(1, f"{len(young)} lock job(s) still working, none of their legs traded yet: "
-                + ", ".join(f"{j.get('ticker')} ({_age(j['age_s'])} old)" for j in young))
     return LEVELS[level], reasons
+
+
+def notes(ctx: dict) -> list:
+    """The FYI lines under NEEDS A LOOK: each half-done lock whose markets
+    have all settled, at its final dollars, then the lock jobs in flight."""
+    h = ctx["hedges"]
+    out = [f"{x.get('ticker') or x.get('job')}: its half-done hedge settled at "
+           f"{usd(x['settled'])}{_case(x['settled'], x.get('outcome'))}"
+           + (", after it gave up" if x.get("gave_up") else "") for x in _settled_locks(h)]
+    work = _working(h)
+    if work:
+        old = max(work, key=lambda j: j["age_s"])
+        part = sum(1 for j in work if j["traded"])
+        out.append(f"{len(work)} hedge{'s' if len(work) != 1 else ''} still working"
+                   + (f" ({part} with a leg filled)" if part else ", nothing filled yet")
+                   + f"; the oldest {old.get('ticker')}, {_age(old['age_s'])}")
+    return out
 
 
 def _short(ctx) -> str:
     """The verdict in a few words, for the subject."""
     h = ctx["hedges"]
-    stuck = _stuck(h)
-    young = [j for j in h["open_now"] if j not in stuck]
     bits = []
+
+    def n_(n: int, what: str) -> str:
+        return f"{n} {what}{'s' if n != 1 else ''}"
 
     def worst(locks) -> str:
         known = [x["outcome"][0] for x in locks if x.get("outcome") is not None]
-        return f" (worst {usd(sum(known))})" if known else ""
-    if h["expired"]:
-        bits.append(f"{len(h['expired'])} lock gave up" + worst(h["expired"]))
+        return f" (worst {usd0(sum(known))})" if known else ""
+    gave, stuck = _gave_up(h), _stuck(h)
+    if gave:
+        bits.append(f"{n_(len(gave), 'hedge')} gave up half done" + worst(gave))
     if h["never"]:
-        bits.append(f"{len(h['never'])} lead fill never locked")
+        bits.append(f"{n_(len(h['never']), 'lead fill')} never hedged")
     if h["refused"]:
-        bits.append(f"{len(h['refused'])} hedge order refused")
+        bits.append(f"{n_(len(h['refused']), 'hedge order')} refused")
     if stuck:
-        bits.append(f"{len(stuck)} lock half done {_age(max(j['age_s'] for j in stuck))}"
-                    + worst(stuck))
-    if young and not bits:
-        bits.append(f"{len(young)} lock job working")
+        bits.append(f"{n_(len(stuck), 'hedge')} half done "
+                    f"{_age(max(j['age_s'] for j in stuck))}" + worst(stuck))
+    comp = sum(1 for f in ctx["fills"] if f.get("kind", "comp") == "comp")
+    if comp > len(h["opened"]):
+        bits.append(f"{n_(comp - len(h['opened']), 'complement-lead fill')} without a hedge job")
     return ", ".join(bits)
 
 
 def usd(x: float) -> str:
     return ("-$" if x < 0 else "+$") + f"{abs(x):,.2f}"
+
+
+def usd0(x: float) -> str:
+    """Whole dollars, half up, for the subject."""
+    n = int(abs(x) + 0.5)
+    return "$0" if n == 0 else ("-$" if x < 0 else "+$") + f"{n:,}"
 
 
 def build_report(day, now=None) -> dict:
@@ -828,8 +924,18 @@ def build_report(day, now=None) -> dict:
     fills = lead_fills(list(jsonl_rows("fills", a_ts, b_ts)), leads)
     rows = [r for r in jsonl_rows("comp_hedge", a_ts, b_ts) if a_ts <= row_ts(r) < b_ts]
     hedges = hedge_summary(rows, load_jobs(), now.timestamp())
+    # a half-done lock whose markets have all settled is final: its dollars,
+    # not a worst case (10/30's email still called 10/29's KXAPRPOTUS lock
+    # half done, a day after its markets settled at that worst case)
+    results = load_results(a_ts - SETTLE_LOOKBACK_SECS, now.timestamp())
     for r in hedges["expired"]:
-        r["outcome"] = gave_up_outcome(r)
+        g = gave_up_lock(r)
+        r["outcome"] = None if g is None else lock_outcomes(g[0], g[2], g[3], g[4])
+        r["settled"] = None if g is None else settled_outcome(*g, results)
+    for j in hedges["open_now"]:
+        j["settled"] = (None if j.get("legs") is None else
+                        settled_outcome(j["kind"], j["ticker"], j["price"], j["count"],
+                                        j["legs"], results))
     est = latest_estimates({t for t, _s in leads}, a_ts, b_ts)
     hourly, covered = load_hourly(a_ts, b_ts)
     value_fills(fills, load_marks(a_ts, now.timestamp()))
@@ -895,16 +1001,20 @@ def totals(ctx) -> dict:
 
 
 def subject_for(ctx) -> str:
+    """The day's sum in whole dollars, then the verdict (Jack 2026-10-31:
+    "make it succinct and clearer"): "IMM leads 10/30: net +$35 (rewards
+    +$78, 10 fills -$43) | OK"."""
     day = datetime.strptime(ctx["day"], "%Y-%m-%d")
     T = totals(ctx)
-    rew = T["comp"]["reward"] + T["fair"]["reward"]
-    fills = T["comp"]["fills_usd"] + T["fair"]["fills_usd"]
     nf = T["comp"]["fills"] + T["fair"]["fills"]
+    parts = [f"rewards {usd0(T['comp']['reward'] + T['fair']['reward'])}",
+             f"{nf} fill{'s' if nf != 1 else ''} "
+             f"{usd0(T['comp']['fills_usd'] + T['fair']['fills_usd'])}" if nf else "no fills"]
+    if T["locks"]:
+        parts.append(f"hedges {usd0(T['locks'])}")
     short = _short(ctx) if ctx["level"] != "OK" else ""
-    return (f"IMM leads {day:%m/%d}: earned ${rew:,.2f} while leading, "
-            f"{nf} lead fill{'s' if nf != 1 else ''} {usd(fills)} now"
-            + (f", locks {usd(T['locks'])}" if T["locks"] else "")
-            + f", net {usd(T['net'])} | {ctx['level']}" + (f": {short}" if short else ""))
+    return (f"IMM leads {day:%m/%d}: net {usd0(T['net'])} ({', '.join(parts)}) | "
+            f"{ctx['level']}" + (f": {short}" if short else ""))
 
 
 def _lead_line(t: str, side: str, v: dict, reward=None) -> str:
@@ -928,78 +1038,63 @@ def _decided(ev: list) -> list:
     return [e for e in ev if e["outcome"] != "gone"]
 
 
-def _ahead_takeaway(ctx):
-    """The takeaway's line on orders ahead of leads, or None."""
-    ev = _decided((ctx.get("ahead") or {}).get("events") or [])
-    if not ev:
-        return None
-    S = ahead_summary(ev, hold_bar())
-    return (f"  {'ahead':<10s}  {len(ev)} time{'s' if len(ev) != 1 else ''} a lead had an order "
-            f"resting ahead of it: held {len(S['held'])}"
-            + (f" (kept a median {_med([e['kept'] for e in S['held']]):.0%} of the side)"
-               if S["held"] else "")
-            + f", fought {len(S['fought'])}, chased {len(S['chased'])}")
-
-
 def _ahead_lines(ctx) -> list:
-    """ORDERS AHEAD OF LEADS: what the bot did about each order that rested
-    ahead of a lead, against the hold rule, then the sides most were ahead of."""
+    """ORDERS IN FRONT OF A LEAD: what the bot did about each order that
+    rested ahead of a lead, against the hold rule, then the sides most were
+    ahead of."""
     ah = ctx.get("ahead")
     if ah is None or not ctx["leads"]:
         return []
     bar = hold_bar()
-    rule = (f"a lead holds while it keeps {bar:.0%} of its side where it rests and fights to "
-            f"its cap below that -- Jack 10/30: \"Hold at one half\"" if bar <= 1.0
-            else "every order ahead is fought (IMM_COMP_LEAD_HOLD_SMALL=0)")
-    head = f"ORDERS AHEAD OF LEADS (each cycle's book with our orders; {rule})"
+    head = "ORDERS IN FRONT OF A LEAD"
     if ah.get("error"):
         return ["", head, f"  not read: {ah['error']}"]
     gone = len(ah.get("events") or []) - len(_decided(ah.get("events") or []))
     ev = _decided(ah.get("events") or [])
     if not ev:
-        return ["", head, f"  none: no order rested ahead of a lead ({ah.get('rows', 0):,} books "
-                          f"of leading markets in {ah.get('files', 0)} book_depth file(s)"
-                          + (f"; {gone} spell(s) ended with the lead standing down" if gone
-                             else "") + ")"]
+        return ["", f"{head}: none ({ah.get('rows', 0):,} books of leading markets in "
+                    f"{ah.get('files', 0)} book_depth file(s)"
+                    + (f"; {gone} spell(s) ended with the lead off" if gone else "") + ")"]
     S = ahead_summary(ev, bar)
     sides = {(e["t"], e["side"]) for e in ev}
-    out = ["", head, f"  {len(ev)} time{'s' if len(ev) != 1 else ''} a lead had an order resting "
-                     f"ahead of it, on {len(sides)} lead side{'s' if len(sides) != 1 else ''} (one "
-                     f"spell at one lead price, however the orders ahead came and went):"]
+    out = ["", f"{head}: {len(ev)} time{'s' if len(ev) != 1 else ''}, on {len(sides)} lead "
+               f"side{'s' if len(sides) != 1 else ''} (one spell at one lead price, however the "
+               f"orders in front came and went)",
+           (f"  rule: a lead stays put while it keeps {bar:.0%} of its side, and moves up toward "
+            f"the model below that (Jack 10/30: \"Hold at one half\")" if bar <= 1.0
+            else "  rule: every order in front is fought (IMM_COMP_LEAD_HOLD_SMALL=0)")]
     if S["held"]:
         kept = [e["kept"] for e in S["held"]]
-        out.append(f"  held {len(S['held'])}: the lead stayed and kept a median {_med(kept):.0%} "
-                   f"of its side (lowest {min(kept):.0%}), a median "
-                   f"{_med([e['ahead'] for e in S['held']]):,.0f} lots ahead")
-    for k, what in (("fought", f"it kept under {bar:.0%}"),
-                    ("chased", f"it moved up while it still kept {bar:.0%} or more")):
+        out.append(f"  held {len(S['held'])}: stayed put, kept a median {_med(kept):.0%} of its "
+                   f"side (lowest {min(kept):.0%}), a median "
+                   f"{_med([e['ahead'] for e in S['held']]):,.0f} lots in front")
+    for k in ("fought", "chased"):
         g = S[k]
-        if not g and k == "fought":
+        if not g:
+            if k == "chased":
+                out.append(f"  chased 0: none moved up while it kept {bar:.0%} of its side")
             continue
-        line = f"  {k} {len(g)}"
-        if g:
-            walked = [e["moved"] for e in g]
-            before = sum(1 for e in g if e["ts"] < HOLD_HALF_SINCE)
-            line += (f": {what} (a median {_med([e['ahead'] for e in g]):,.0f} lots ahead) and "
-                     f"re-led a median {_med(walked):.0f}c nearer the model ({sum(walked)}c in all)"
-                     + (f"; {'all' if before == len(g) else before} of them before the "
-                        f"half-side hold went live at {_et(HOLD_HALF_SINCE)[4:]} 10/30"
-                        if k == "chased" and before else ""))
-        else:
-            line += f": none moved up while it kept {bar:.0%} of its side"
-        out.append(line)
+        walked = [e["moved"] for e in g]
+        before = sum(1 for e in g if e["ts"] < HOLD_HALF_SINCE)
+        what = (f"kept under {bar:.0%}, moved up" if k == "fought"
+                else f"moved up though it kept {bar:.0%} or more,")
+        out.append(f"  {k} {len(g)}: {what} a median {_med(walked):.0f}c toward the model "
+                   f"({sum(walked)}c in all; a median {_med([e['ahead'] for e in g]):,.0f} lots "
+                   f"in front)"
+                   + (f"; {'all' if before == len(g) else before} of them before the rule went "
+                      f"live ({_et(HOLD_HALF_SINCE)[4:]} 10/30)" if k == "chased" and before
+                      else ""))
     if S["under"]:
-        out.append(f"  stayed under {bar:.0%} {len(S['under'])}: the order sat at or past the "
-                   f"lead's cap, or left within a cycle")
+        out.append(f"  under {bar:.0%} {len(S['under'])}: stayed put -- the order in front sat at "
+                   f"or past the lead's cap, or left within a cycle")
     if S["down"] or gone:
-        out.append(f"  moved down {len(S['down'])}; and {gone} more spell"
-                   f"{'s' if gone != 1 else ''} ended with the lead standing down (a gate hold, "
-                   f"an off, a cap taking it below its own rungs), left out above")
+        out.append(f"  moved down {len(S['down'])}; {gone} more ended with the lead off (a gate "
+                   f"hold, an off, a cap below its own rungs), left out above")
     by_side: dict = defaultdict(list)
     for e in ev:
         by_side[(e["t"], e["side"])].append(e)
     top = sorted(by_side.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:AHEAD_LIST]
-    out.append(f"  most orders ahead ({len(top)} of {len(by_side)} sides):")
+    out.append(f"  most often ({len(top)} of {len(by_side)} sides):")
     for (t, side), g in top:
         s = ahead_summary(g, bar)
         held = [e["kept"] for e in s["held"]]
@@ -1010,23 +1105,88 @@ def _ahead_lines(ctx) -> list:
     return out
 
 
+def _merged_fills(fills: list) -> list:
+    """The fills at a lead with the partial fills at one lead price (market,
+    side, price) as one: counts and dollars summed, the first and last times."""
+    out: dict = {}
+    for f in sorted(fills, key=lambda x: x["ts"]):
+        k = (f["ticker"], f["side"], f["px"])
+        m = out.get(k)
+        if m is None:
+            out[k] = dict(f, last=f["ts"])
+            continue
+        m.update(count=m["count"] + f["count"], last=f["ts"],
+                 usd=(None if m.get("usd") is None or f.get("usd") is None
+                      else m["usd"] + f["usd"]))
+    return list(out.values())
+
+
+def _fill_what(f: dict) -> str:
+    """"<ticker> bought 200 @ 49c at 15:19-15:21 ET, now 16.5c"."""
+    a, b = (f"{datetime.fromtimestamp(x, timezone.utc).astimezone(imm.ET):%H:%M}"
+            for x in (f["ts"], f.get("last", f["ts"])))
+    return (f"{f['ticker']} {'sold' if f['side'] == 'ask' else 'bought'} {f['count']:g} @ "
+            f"{f['px']:g}c at {a}{'' if b == a else '-' + b} ET, "
+            + ("no price yet" if f.get("mark") is None else f"now {f['mark']:g}c"))
+
+
+def _fill_hedge(f: dict, locked: set, open_t: set) -> str:
+    """What became of a fill at a lead: its hedge, or that it rides."""
+    kind = "fair" if f.get("kind") == "fair" else "complement"
+    if (f["ticker"], f["side"]) in locked:
+        return f"{kind}: hedged, counted in the hedges"
+    if f["ticker"] in open_t:
+        return f"{kind}: hedge resting"
+    return f"{kind}: rides to settlement" if kind == "fair" else f"{kind}: no hedge"
+
+
 def render_text(ctx) -> str:
+    """The email (Jack 2026-10-31: "make it succinct and clearer"): what a
+    lead is in a sentence, the day's money as one sum with its biggest fill,
+    what needs a look, then the details."""
     day = datetime.strptime(ctx["day"], "%Y-%m-%d")
     T = totals(ctx)
     rew = ctx.get("rewards") or {}
     comp, fair, _cfills, _ffills = _split(ctx)
     h = ctx["hedges"]
     lk = h["locks"]
+    locked = _locked_sides(ctx)
+    open_t = {j.get("ticker") for j in h["open_now"]}
+    fills = _merged_fills(ctx["fills"])
     nf = T["comp"]["fills"] + T["fair"]["fills"]
-    out = [f"Leads, {day:%a %m/%d} (ET day) -- complement leads price off other markets' "
-           f"books, fair leads off our models (weekend rain, Vercel, OpenRouter weekly)", ""]
-    # THE TAKEAWAY: the money, then what (if anything) needs doing
-    rew_all = T["comp"]["reward"] + T["fair"]["reward"]
-    fills_all = T["comp"]["fills_usd"] + T["fair"]["fills_usd"]
-    lock_s = (f"locks completed {usd(T['locks'])}" if T["locks"] else "no lock completed")
-    out.append(f"TAKEAWAY: leading earned about ${rew_all:,.2f}; the {nf} fill"
-               f"{'s' if nf != 1 else ''} at a lead {'is' if nf == 1 else 'are'} worth "
-               f"{usd(fills_all)} now; {lock_s}. Net about {usd(T['net'])}.")
+    out = [f"IMM leads, {day:%a %m/%d} (ET day)",
+           "A lead is a 200-lot order the bot puts at the front of a market's line, priced off "
+           "our model (\"fair\": weekend rain, Vercel, OpenRouter weekly) or off the other "
+           "markets in its event (\"complement\"). Being first in line earns most of that "
+           "side's reward; the risk is getting filled.", ""]
+    # THE MONEY, as one sum
+    hedged = any((f["ticker"], f["side"]) in locked for f in fills)
+    out += [f"NET {usd(T['net'])}",
+            f"  {usd(T['comp']['reward'] + T['fair']['reward']):>9s}  rewards on the led "
+            f"markets during their lead hours (the bot's estimate; Kalshi pays ~1.15x it)",
+            f"  {usd(T['comp']['fills_usd'] + T['fair']['fills_usd']):>9s}  {nf} fill"
+            f"{'s' if nf != 1 else ''} on leads, valued at the latest marks"
+            + (" (a hedged one counts in the hedges)" if hedged else "")]
+    priced = [f for f in fills if f.get("usd") is not None]
+    if len(fills) > 1 and priced:
+        b = max(priced, key=lambda f: abs(f["usd"]))
+        out.append(f"  {'':9s}  biggest: {_fill_what(b)}: {usd(b['usd'])}")
+    if T["locks"]:
+        out.append(f"  {usd(T['locks']):>9s}  hedges completed")
+    cov = ctx.get("covered_until")
+    if cov is not None and cov < float(ctx.get("window_end") or 0):
+        out.append(f"  (rewards counted through {_et(cov)[4:]} only, where the bot's hourly "
+                   f"cache stops)")
+    # what needs a look, then what is only worth knowing
+    out += ["", f"NEEDS A LOOK ({ctx['level']}):" if ctx["reasons"]
+            else "NEEDS A LOOK: nothing."]
+    out += [f"  - {r}" for r in ctx["reasons"]]
+    if _gave_up(h) or _stuck(h):
+        out.append(f"  (a half-done hedge is a PROBLEM when it can lose "
+                   f"${LOCK_PROBLEM_USD:,.0f} or more as it stands, a WATCH under that)")
+    out += [f"  FYI: {n}" for n in notes(ctx)]
+    # the details: by source, each fill, where the reward came from
+    src = []
     for kind, label in (("comp", "complement"), ("fair", "fair")):
         k = T[kind]
         if not (k["sides"] or k["fills"]):
@@ -1034,29 +1194,22 @@ def render_text(ctx) -> str:
         since = ""
         if k["first"] is not None and k["first"] > day_window(day)[0] + 3600:
             since = f" (from {_et(k['first'])[4:]})"
-        unm = f", {k['unmarked']} with no mark" if k["unmarked"] else ""
-        out.append(f"  {label:<10s}  {k['sides']} side{'s' if k['sides'] != 1 else ''} on "
-                   f"{k['markets']} market{'s' if k['markets'] != 1 else ''}{since}: "
-                   f"${k['reward']:,.2f} while leading; {k['fills']} fill"
-                   f"{'s' if k['fills'] != 1 else ''} ({k['contracts']:,.0f} contracts) "
-                   f"{usd(k['fills_usd'])} now{unm}")
-    ahead = _ahead_takeaway(ctx)
-    if ahead:
-        out.append(ahead)
-    note = ("  (reward = the bot's own estimate over the hours each market led -- Kalshi "
-            "pays ~1.15x it; fills marked to the bot's latest mark or the settlement, not "
-            "yet realized")
-    cov = ctx.get("covered_until")
-    if cov is not None and cov < float(ctx.get("window_end") or 0):
-        note += f"; reward counted through {_et(cov)[4:]} only, where the hourly cache stops"
-    out.append(note + ")")
-    out += ["", f"NEEDS A LOOK ({ctx['level']}):" if ctx["reasons"]
-            else "NEEDS A LOOK: nothing."]
-    out += [f"  - {r}" for r in ctx["reasons"]]
-    if h["expired"] or _stuck(h):
-        out.append(f"  (a lock left half done is a PROBLEM when it can lose "
-                   f"${LOCK_PROBLEM_USD:,.0f} or more as it stands, a WATCH under that)")
-    # where the reward came from
+        n = k["fills"]
+        unm = f", {k['unmarked']} with no price yet" if k["unmarked"] else ""
+        src.append(f"  {label:<10s}  {k['sides']} side{'s' if k['sides'] != 1 else ''} on "
+                   f"{k['markets']} market{'s' if k['markets'] != 1 else ''}{since}: rewards "
+                   f"{usd(k['reward'])}; "
+                   + (f"{n} fill{'s' if n != 1 else ''} ({k['contracts']:,.0f} contracts) "
+                      f"{usd(k['fills_usd'])}{unm}" if n else "no fills"))
+    if src:
+        out += ["", "BY SOURCE"] + src
+    if fills:
+        out += ["", "FILLS ON LEADS (biggest first, valued at the latest marks; partial fills at one "
+                    "price as one)"]
+        for f in sorted(fills, key=lambda x: (x.get("usd") is None, -abs(x.get("usd") or 0.0),
+                                              x["ts"])):
+            val = "no price" if f.get("usd") is None else usd(f["usd"])
+            out.append(f"  {val:>9s}  {_fill_what(f)}  ({_fill_hedge(f, locked, open_t)})")
     earners = sorted(((v, t) for t, v in rew.items() if v > 0), reverse=True)
     if earners:
         sides_of: dict = defaultdict(list)
@@ -1070,69 +1223,49 @@ def render_text(ctx) -> str:
             what = " + ".join(f"{s} {x['px']}c" for s, x in sorted(sv, key=lambda p: p[0]))
             hrs = sum(e - s for s, e in _union([sp for _s, x in sv for sp in x["spans"]])) / 3600
             out.append(f"  ${v:6.2f}  {t} {what} ({kind}, led {hrs:.1f}h)")
-    # the orders that stood ahead of a lead, and what the bot did about each
+    # the orders that stood in front of a lead, and what the bot did about each
     out += _ahead_lines(ctx)
-    # the fills, each with what it is worth now
-    if ctx["fills"]:
-        locked = _locked_sides(ctx)
-        open_t = {j.get("ticker") for j in h["open_now"]}
-        out += ["", "FILLS AT A LEAD (marked to now)"]
-        for f in sorted(ctx["fills"], key=lambda x: x["ts"]):
-            when = datetime.fromtimestamp(f["ts"], timezone.utc).astimezone(imm.ET)
-            what = "sold" if f["side"] == "ask" else "bought"
-            if f.get("kind") == "fair":
-                why = "fair: rides to settlement, nothing hedges a city's market"
-            elif (f["ticker"], f["side"]) in locked:
-                why = "complement: locked (its dollars are in the locks)"
-            elif f["ticker"] in open_t:
-                why = "complement: lock job still open"
-            else:
-                why = "complement: no lock"
-            val = ("no mark" if f.get("usd") is None else
-                   f"now {f['mark']:g}c: {usd(f['usd'])}")
-            out.append(f"  {when:%H:%M} ET  {f['ticker']} {what} {f['count']:g} @ "
-                       f"{f['px']:g}c, {val}  ({why})")
-    out += ["", f"LOCKS ON OTHER FILLS: {len(lk['opened'])} watched, {len(lk['done'])} locked "
+    out += ["", f"HEDGES ON OTHER FILLS: {len(lk['opened'])} checked, {len(lk['done'])} hedged "
                 f"({usd(lk['locked'])}), {len(lk['unwound'])} unwound first, "
-                f"{len(lk['none'])} rode on as inventory -- a lock needs "
-                f"{imm.COMP_HEDGE_EDGE_C:g}c a contract after fees."]
-    for kind, (n_open, n_done) in sorted(lk["by_kind"].items()):
-        out.append(f"  {kind}: {n_done} of {n_open} locked")
+                f"{len(lk['none'])} left as inventory -- a hedge needs "
+                f"{imm.COMP_HEDGE_EDGE_C:g}c a contract after fees"]
+    if lk["by_kind"]:
+        out.append("  by kind: " + ", ".join(f"{kind} {n_done} of {n_open}" for kind, (
+            n_open, n_done) in sorted(lk["by_kind"].items())))
     for r in lk["done"]:
         legs = ", ".join(f"{s} {float(q):g}" for s, q in (r.get("legs") or {}).items())
-        out.append(f"  locked {r.get('ticker')} {float(r.get('count') or 0):g} at "
+        out.append(f"  hedged {r.get('ticker')} {float(r.get('count') or 0):g} at "
                    f"{float(r.get('edge_c') or 0):+.1f}c a contract ({r.get('lock')}: {legs})")
     for r in h["done"]:
-        out.append(f"  locked lead {r.get('job')}: {float(r.get('count') or 0):g} at "
+        out.append(f"  hedged lead {r.get('job')}: {float(r.get('count') or 0):g} at "
                    f"{float(r.get('edge_c') or 0):+.1f}c a contract")
     g = ctx["groups"]
     out += ["", "COUNTS: complement " + f"{T['comp']['sides']} sides led "
                 f"({T['comp']['at_end']} at the day's end)"
                 + (f", {g[0]} mutually exclusive events read ({g[1]} two-market)" if g else "")
                 + f"; fair {T['fair']['sides']} sides ({T['fair']['at_end']} at the end); "
-                f"lead lock jobs {len(h['opened'])} opened, {len(h['sends'])} maker legs rested, "
-                f"{len(h['leg_fills'])} leg fill(s), {len(h['refused'])} refused."]
+                f"lead hedge jobs {len(h['opened'])} opened, {len(h['sends'])} maker legs "
+                f"rested, {len(h['leg_fills'])} leg fill(s), {len(h['refused'])} refused."]
 
-    # every lead, for reference: one line an event (a lone market's in full),
-    # the ones that led a while or earned
+    # the top leads by event, for reference: one line an event (a lone
+    # market's in full), of those that led a while or earned
     for label, note, group in (("COMPLEMENT", "", comp),
                                ("FAIR", f", at least {imm.FAIR_LEAD_MARGIN_C}c inside the fair",
                                 fair)):
-        if not group:
-            continue
         keep = {k: v for k, v in group.items()
                 if sum(e - s for s, e in v["spans"]) / 3600.0 >= LIST_MIN_HOURS
                 or rew.get(k[0], 0.0) >= LIST_MIN_USD}
-        dropped = len(group) - len(keep)
         by_ev: dict = defaultdict(list)
         for (t, side), v in keep.items():
             by_ev["-".join(t.split("-")[:-1]) or t].append((t, side, v))
-        out += ["", f"ALL {label} LEADS by event{note} (led {LIST_MIN_HOURS * 60:.0f} min+ "
-                    f"or earned ${LIST_MIN_USD:.2f}+"
-                    + (f"; {dropped} shorter one{'s' if dropped != 1 else ''} left out" if dropped
-                       else "") + ")"]
-        for ev, items in sorted(by_ev.items(), key=lambda kv: -sum(rew.get(t, 0.0) for t in
-                                                                   {x[0] for x in kv[1]})):
+        evs = sorted(by_ev.items(), key=lambda kv: -sum(rew.get(t, 0.0) for t in
+                                                       {x[0] for x in kv[1]}))
+        if not evs:
+            continue
+        out += ["", f"{label} LEADS BY EVENT (top {min(LIST_TOP, len(evs))} of {len(evs)} by "
+                    f"reward{note}; led {LIST_MIN_HOURS * 60:.0f} min+ or earned "
+                    f"${LIST_MIN_USD:.2f}+)"]
+        for ev, items in evs[:LIST_TOP]:
             if len(items) == 1:
                 t, side, v = items[0]
                 out.append(f"  {_lead_line(t, side, v, rew.get(t))}")
