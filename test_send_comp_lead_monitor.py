@@ -196,6 +196,16 @@ class TestFairLeads(unittest.TestCase):
     up to 200 contracts"): their own section, and a fill rides as inventory,
     so it never asks for a hedge job."""
 
+    def test_the_email_names_the_families_led_now_or_on_the_day(self):
+        # the OpenRouter weekly left the bot's list 2026-10-31 (Jack: "Pull
+        # it back"); 10/31's email still names it, its leads ran that day
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXOPENVREQ", "KXRAINWKND")):
+            self.assertEqual(cm._fair_names({}), "weekend rain, Vercel")
+            self.assertEqual(cm._fair_names({("KXTOKENUSE-26NOV02-T197", "bid"): {}}),
+                             "weekend rain, Vercel, OpenRouter weekly")
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", ()):
+            self.assertEqual(cm._fair_names({}), "none")
+
     def test_fair_leads_parse_report_apart_and_never_watch(self):
         a, b = cm.day_window(date(2026, 10, 29))
         lines = [fair_lead("06:00:00"),

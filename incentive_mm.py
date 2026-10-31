@@ -13363,8 +13363,9 @@ _or_fair_state: dict = {"mtime": 0.0, "entries": {}, "moved_at": {}, "last_day":
 # leads down. The rungs behind the walls quote as before, a FAIR CLOSE
 # steps back to its side's own price, and the estimate still prices the
 # lead (the 00:00Z selection refresh falls inside the window).
-# IMM_OR_LEAD_BLACKOUT=0 drops the stand-down; IMM_FAIR_LEAD_SERIES without
-# KXTOKENUSE takes the weekly out.
+# IMM_OR_LEAD_BLACKOUT=0 drops the stand-down. The weekly is out of the
+# default FAIR_LEAD_SERIES since 2026-10-31 (Jack: "Pull it back"; see FAIR
+# LEAD); IMM_FAIR_LEAD_SERIES naming it puts it back.
 OR_LEAD_BLACKOUT = os.environ.get("IMM_OR_LEAD_BLACKOUT", "1") == "1"
 OR_LEAD_BLACKOUT_PRE_MIN = max(0.0, _env_float("IMM_OR_LEAD_BLACKOUT_PRE_MIN", 5.0))
 
@@ -20494,11 +20495,21 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # THE OPENROUTER WEEKLY TOO (Jack 2026-10-30: "Yes, add it"): KXTOKENUSE
 # leads off OpenRouter's own daily totals (or_fair_c), with no lead of
 # either kind around the 00:00Z publish (OR_LEAD_BLACKOUT, at the gate).
+# PULLED BACK (Jack 2026-10-31: "Pull it back"). On its first morning one
+# seller took the T194 bid lead (299 @ 73c) and, five minutes later, the
+# T197-T200 ones in a single second (300 each @ 51/40/35/25c): 1,499 YES for
+# $671, marked -$198 by 14:15 ET, for ~$35/day more of the event's rewards.
+# The read had 199.0T +- 6.5T with the weekend to go and the book sat near
+# 195T; replayed on the vintages, its Saturday misses ran -1.8 / +10.5 /
+# +1.5T (the weeks of 10/05-10/19) and its Wednesday ones +24.9 / -18.3T, so
+# a lead 5c inside the fair stands where a 10T miss moves a middle strike
+# 30c+. The default list leaves it out; the code stays, and
+# IMM_FAIR_LEAD_SERIES naming it puts it back.
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get(
         "IMM_FAIR_LEAD_SERIES",
-        ",".join(["KXRAINWKND", "KXTOKENUSE"] + sorted(VERCEL_SERIES))).split(",")
+        ",".join(["KXRAINWKND"] + sorted(VERCEL_SERIES))).split(",")
      if s.strip()}))
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)

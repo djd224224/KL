@@ -31938,7 +31938,9 @@ class TestOpenRouterFairLead(unittest.TestCase):
     the fair lead, standing down around the 00:00Z publish?". Fixture: the
     10/31 00:00Z read of KXTOKENUSE-26NOV02 (5 of 7 days in, 199.1T +-
     6.48T) on TestOpenRouterFairGate's far event; T190 reads 92.0c, and its
-    book is a 3-lot 80c bid over a 5,000 wall at 60c, offered at 92c."""
+    book is a 3-lot 80c bid over a 5,000 wall at 60c, offered at 92c. Out of
+    the default list since 2026-10-31 (Jack: "Pull it back"): setUp puts it
+    back, as IMM_FAIR_LEAD_SERIES naming it would."""
 
     T = "KXTOKENUSE-68DEC04-T190"
     EV = "KXTOKENUSE-68DEC04"
@@ -31955,9 +31957,12 @@ class TestOpenRouterFairLead(unittest.TestCase):
             pass
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
+        self.default_series = imm.FAIR_LEAD_SERIES
         for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
                   mock.patch.object(imm, "LADDER_MODE", "atref"),
                   mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "FAIR_LEAD_SERIES", tuple(sorted(
+                      set(imm.FAIR_LEAD_SERIES) | {"KXTOKENUSE"}))),
                   # the window's pre-midnight minutes never ride the test clock
                   mock.patch.object(imm, "OR_LEAD_BLACKOUT_PRE_MIN", 0.0)):
             p.start()
@@ -32124,6 +32129,21 @@ class TestOpenRouterFairLead(unittest.TestCase):
         imm._or_fair_state["last_day"] = ""
         bot, rungs, _l = self._cycle(bot=bot, cycles=1)
         self.assertNotIn((91, 150), rungs.get("bid", []), rungs)
+
+    def test_the_default_list_leaves_the_weekly_out(self):
+        # Jack 2026-10-31: "Pull it back" -- weekend rain and Vercel lead on
+        self.assertNotIn("KXTOKENUSE", self.default_series)
+        self.assertIn("KXRAINWKND", self.default_series)
+        self.assertLessEqual(set(imm.VERCEL_SERIES), set(self.default_series))
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", self.default_series):
+            self.assertFalse(imm.fair_lead_series("KXTOKENUSE"))
+            # the quote loop leads nothing on the weekly, and a held short
+            # no longer closes at the model
+            _bot, rungs, lines = self._cycle()
+            self.assertNotIn((81, 200), rungs.get("bid", []), rungs)
+            self.assertFalse(any(f"fair lead {self.T}" in s for s in lines), lines)
+            _bot, rungs, _l = self._cycle(pos=-150.0)
+            self.assertNotIn((91, 150), rungs.get("bid", []), rungs)
 
     def test_the_fast_cancel_reads_the_lead_as_stale_in_the_window(self):
         self._write()

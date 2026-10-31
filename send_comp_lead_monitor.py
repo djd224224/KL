@@ -32,7 +32,9 @@ Since 2026-10-30 (Jack: "Yes, extend it") the Vercel family leads off its
 fair the same way; a Vercel strike's fill is a ladder strike's, so it opens
 a lock job off the other strikes like any lead fill there. So does the
 OpenRouter weekly (KXTOKENUSE, Jack: "Yes, add it"), whose leads log `off`
-for OpenRouter's 00:00Z publish and come back once the new day is read.
+for OpenRouter's 00:00Z publish and come back once the new day is read --
+out of the bot's list since 2026-10-31 (Jack: "Pull it back"), so the
+email names the families the bot leads now and any that led on the day.
 
 ONE EMAIL per ET day (the day before), the money first, in plain words
 (Jack 2026-10-30: "clean up this email and make it clear the takeaway";
@@ -959,6 +961,17 @@ def _split(ctx) -> tuple:
     return comp, fair, cf, ff
 
 
+def _fair_names(fair: dict) -> str:
+    """The fair-lead families as the email names them: the ones the bot
+    leads now (imm.FAIR_LEAD_SERIES) and any that led on the day (`fair`,
+    keyed by (ticker, side))."""
+    s = set(imm.FAIR_LEAD_SERIES) | {t.split("-")[0] for t, _side in fair}
+    names = [n for n, hit in (("weekend rain", "KXRAINWKND" in s),
+                              ("Vercel", bool(s & set(imm.VERCEL_SERIES))),
+                              ("OpenRouter weekly", "KXTOKENUSE" in s)) if hit]
+    return ", ".join(names) or "none"
+
+
 def _locked_sides(ctx) -> set:
     """(ticker, side) of the lead fills whose lock completed: their dollars
     are the lock's, not the fill's mark."""
@@ -1156,7 +1169,7 @@ def render_text(ctx) -> str:
     nf = T["comp"]["fills"] + T["fair"]["fills"]
     out = [f"IMM leads, {day:%a %m/%d} (ET day)",
            "A lead is a 200-lot order the bot puts at the front of a market's line, priced off "
-           "our model (\"fair\": weekend rain, Vercel, OpenRouter weekly) or off the other "
+           f"our model (\"fair\": {_fair_names(fair)}) or off the other "
            "markets in its event (\"complement\"). Being first in line earns most of that "
            "side's reward; the risk is getting filled.", ""]
     # THE MONEY, as one sum
