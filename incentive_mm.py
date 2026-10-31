@@ -2599,14 +2599,17 @@ def series_max_position(series: str, now_utc: Optional[datetime] = None,
 
 def series_price_min(series: str) -> int:
     ov = SERIES_OVERRIDES.get(series)
-    return ov.price_min_cents if (ov and ov.price_min_cents is not None) \
-        else PRICE_MIN_CENTS
+    if ov and ov.price_min_cents is not None:
+        return ov.price_min_cents
+    # the shipping family's band, by name (2026-10-31, SHIPPING_PRICE_MIN)
+    return SHIPPING_PRICE_MIN if series in SHIPPING_STEP_SERIES else PRICE_MIN_CENTS
 
 
 def series_price_max(series: str) -> int:
     ov = SERIES_OVERRIDES.get(series)
-    return ov.price_max_cents if (ov and ov.price_max_cents is not None) \
-        else PRICE_MAX_CENTS
+    if ov and ov.price_max_cents is not None:
+        return ov.price_max_cents
+    return SHIPPING_PRICE_MAX if series in SHIPPING_STEP_SERIES else PRICE_MAX_CENTS
 
 
 def series_min_hours_to_close(series: str) -> float:
@@ -11279,9 +11282,10 @@ _CONFIG_CODE_KNOBS = (
     "CPI_PILOT_EVENTS", "CPI_PILOT_FAMILIES", "CPI_PILOT_UNTIL", "CPI_PILOT_BLACKOUT_ET",
     "CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS",
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
-    # shipping 5 strikes an event, ports x1.5 at 3-97c (2026-10-31)
+    # shipping 5 strikes an event, x1.5 at 3-97c (2026-10-31)
     "SHIPPING_EVENT_TOP_N", "SHIPPING_EVENT_TOP_N_SERIES",
-    "PORT_SIZE_STEP", "PORT_PRICE_MIN", "PORT_PRICE_MAX", "PORT_SERIES",
+    "SHIPPING_SIZE_STEP", "SHIPPING_PRICE_MIN", "SHIPPING_PRICE_MAX",
+    "SHIPPING_STEP_SERIES",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
     "AWARDS_TABLE_ONLY_SERIES",
     # awards by Kalshi tag (2026-10-12)
@@ -18342,40 +18346,46 @@ for _m, _ss in FAMILY_X2_1011 + FAMILY_X2_1022:
             _base = SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE]
         SERIES_OVERRIDES[_s] = replace(_base or SeriesOverride(), size_mult=_m)
 
-# PORTS x1.5 AND 3-97c (Jack 2026-10-31: "what multiplier is ports on right
-# now? increase it by 1.5x, and expand range to 3-97c"). The port container
-# (TEU) series rode the shipping x2 (KXBALTPORTTEU, a graduate by Kalshi
-# metadata, x1); each now takes PORT_SIZE_STEP on top of its own: the five
-# measured ports x2 -> x3 and KXBALTPORTTEU x1 -> x1.5, on the family wire
-# (rungs, per-market and per-event caps and skew knees together). They keep
-# their base-size test halves, so the test half (NY/NJ, Savannah, South
-# Carolina, Baltimore) still runs x1.5 on top: x4.5 / x2.25. Their band
-# widens from 5-90c (93c once quoting) to PORT_PRICE_MIN-MAX, entry and
-# members alike: on 10/31 10 of the 12 port strikes the mid screen kept out
-# (mids 93.5-95.5c and 4.5c) come inside it, and still have to clear the
-# payout floor. Each keeps the graduates' guard set (safe-join, no rate bar,
-# the ticker day's midnight-ET exit). The strait weeklies keep x2 and 5-90c.
-# IMM_PORT_SIZE_STEP=1, IMM_PORT_PRICE_MIN=5 / IMM_PORT_PRICE_MAX=90 revert
-# (env => task-level restart).
-PORT_SIZE_STEP = _env_float("IMM_PORT_SIZE_STEP", 1.5)
-PORT_PRICE_MIN = _env_int("IMM_PORT_PRICE_MIN", 3)
-PORT_PRICE_MAX = _env_int("IMM_PORT_PRICE_MAX", 97)
-PORT_SERIES: Tuple[str, ...] = tuple(s.strip() for s in os.environ.get(
-    "IMM_PORT_SERIES",
-    "KXVAPORTTEU,KXNYNJPORTTEU,KXMOBILETEU,KXSAVTEU,KXSCPORTTEU,KXBALTPORTTEU"
-).split(",") if s.strip())
-for _s in PORT_SERIES:
+# SHIPPING x1.5 AND 3-97c (Jack 2026-10-31: "what multiplier is ports on
+# right now? increase it by 1.5x, and expand range to 3-97c", then "strait
+# weeklies should have the same new behavior as ports"). Each series of the
+# shipping family -- SHIPPING_EVENT_TOP_N_SERIES: the four strait weeklies,
+# KXHORMUZPEAK and the six port container (TEU) series -- takes
+# SHIPPING_SIZE_STEP on top of its own family size: the nine measured series
+# x2 -> x3 (SHIPPING_X2_SERIES) and the two graduates by Kalshi metadata,
+# KXHORMUZPEAK and KXBALTPORTTEU, x1 -> x1.5. It rides the family wire, so
+# rungs, per-market and per-event caps and skew knees scale together. They
+# keep their base-size test halves, so the test half (Suez, Bab el-Mandeb,
+# Hormuz weekly, NY/NJ, Savannah, South Carolina, Baltimore) still runs x1.5
+# on top: x4.5 / x2.25. Their band widens from 5-90c (93c once quoting) to
+# SHIPPING_PRICE_MIN-MAX for entry and members alike. It is read by name in
+# series_price_min/max, not set on the override: KXSUEZWEEKLY's override is
+# also the scan graduates' archetype, which every other graduate clones
+# (ensure_family_override drops only its size). On 10/31 most far strikes
+# the mid screen kept out were walls (135,850 YES at 2c on Panama T205,
+# 91,950 at 4c on Hormuz peak T8); the ones now inside the band still have to
+# clear the payout floor. The graduates' guard set stays (safe-join, no rate
+# bar, the ticker day's midnight-ET exit), and the four weeklies stay off the
+# global quiet hours (QUIET_HOURS_OFF_SERIES). IMM_SHIPPING_SIZE_STEP=1 and
+# IMM_SHIPPING_PRICE_MIN=5 / IMM_SHIPPING_PRICE_MAX=90 revert (env =>
+# task-level restart).
+SHIPPING_SIZE_STEP = _env_float("IMM_SHIPPING_SIZE_STEP", 1.5)
+SHIPPING_PRICE_MIN = _env_int("IMM_SHIPPING_PRICE_MIN", 3)
+SHIPPING_PRICE_MAX = _env_int("IMM_SHIPPING_PRICE_MAX", 97)
+SHIPPING_STEP_SERIES: Tuple[str, ...] = tuple(sorted({
+    s.strip() for s in os.environ.get(
+        "IMM_SHIPPING_STEP_SERIES", ",".join(SHIPPING_EVENT_TOP_N_SERIES)).split(",")
+    if s.strip()}))
+for _s in SHIPPING_STEP_SERIES if SHIPPING_SIZE_STEP != 1.0 else ():
     _base = SERIES_OVERRIDES.get(_s)
     if _base is None:
         # not sized above: a scan graduate clones the archetype's guard set
-        # (never its own x2), a graduate by metadata the members' parent
+        # (never its own size), a graduate by metadata the members' parent
         _base = (replace(SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE], size_mult=None)
                  if scan_graduate_series(_s)
                  else SERIES_OVERRIDES[GRADUATE_AUTO_PARENT])
-    _m = (_base.size_mult or 1.0) * PORT_SIZE_STEP
     SERIES_OVERRIDES[_s] = replace(
-        _base, size_mult=(_m if _m != 1.0 else _base.size_mult),
-        price_min_cents=PORT_PRICE_MIN, price_max_cents=PORT_PRICE_MAX)
+        _base, size_mult=(_base.size_mult or 1.0) * SHIPPING_SIZE_STEP)
 
 # KXSOFTWAREUNEMP x3 LADDER (Jack 2026-10-25: "X3", the day it was enrolled,
 # on "tripling the size, as we did for the ski resorts"): at x1 its nine
@@ -37448,9 +37458,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] shipping strikes per event: {_scaled_top_n(_ship_n)} (graduates "
             f"{_scaled_top_n(SCAN_GRADUATE_EVENT_TOP_N)}): "
             f"{','.join(SHIPPING_EVENT_TOP_N_SERIES)}")
-    if PORT_SERIES:
-        log(f"[IMM] ports x{PORT_SIZE_STEP:g}, band {PORT_PRICE_MIN}-{PORT_PRICE_MAX}c: "
-            + ", ".join(f"{_s} x{applied_mention_mult(_s):g}" for _s in PORT_SERIES)
+    if SHIPPING_STEP_SERIES:
+        log(f"[IMM] shipping x{SHIPPING_SIZE_STEP:g}, band "
+            f"{SHIPPING_PRICE_MIN}-{SHIPPING_PRICE_MAX}c: "
+            + ", ".join(f"{_s} x{applied_mention_mult(_s):g}" for _s in SHIPPING_STEP_SERIES)
             + " (family x size-test half, now)")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}

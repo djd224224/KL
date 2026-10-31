@@ -11401,44 +11401,63 @@ class TestSaturdayPositionCap(unittest.TestCase):
         self.assertEqual(imm.default_max_position(sat), 150.0)
 
 
-class TestPortsSizeAndBand(unittest.TestCase):
+class TestShippingSizeAndBand(unittest.TestCase):
     """Jack 2026-10-31: "what multiplier is ports on right now? increase it by
-    1.5x, and expand range to 3-97c". Each port container series takes x1.5
-    on its own family size and a 3-97c band; the strait weeklies keep theirs."""
+    1.5x, and expand range to 3-97c", then "strait weeklies should have the
+    same new behavior as ports". Each shipping series takes x1.5 on its own
+    family size and a 3-97c band; no other graduate does."""
 
-    PORTS = ("KXVAPORTTEU", "KXNYNJPORTTEU", "KXMOBILETEU", "KXSAVTEU",
-             "KXSCPORTTEU")
-    STRAITS = ("KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY", "KXHORMUZWEEKLY",
-               "KXPANAMAWEEKLY")
+    MEASURED = ("KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY", "KXHORMUZWEEKLY",
+                "KXPANAMAWEEKLY", "KXVAPORTTEU", "KXNYNJPORTTEU", "KXMOBILETEU",
+                "KXSAVTEU", "KXSCPORTTEU")
+    BY_METADATA = ("KXHORMUZPEAK", "KXBALTPORTTEU")
 
     def _m(self, series, mid):
         return _meta(ticker=f"{series}-99DEC31-T1", event_ticker=f"{series}-99DEC31",
                      series=series, mid_cents=mid, spread_cents=1)
 
-    def test_each_port_is_1_5x_its_old_family_size(self):
-        for s in self.PORTS:
-            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 3.0, s)      # x2 -> x3
-        self.assertEqual(imm.SERIES_OVERRIDES["KXBALTPORTTEU"].size_mult, 1.5)  # x1 -> x1.5
+    def test_each_is_1_5x_its_old_family_size(self):
+        self.assertEqual(set(imm.SHIPPING_STEP_SERIES),
+                         set(self.MEASURED + self.BY_METADATA))
+        for s in self.MEASURED:
+            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 3.0, s)   # x2 -> x3
+        for s in self.BY_METADATA:
+            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 1.5, s)   # x1 -> x1.5
 
-    def test_the_strait_weeklies_keep_x2_and_5_to_90(self):
-        for s in self.STRAITS:
-            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 2.0, s)
-            self.assertEqual(imm.member_price_band(s, False), (5, 90), s)
-            self.assertEqual(imm.member_price_band(s, True), (5, 93), s)
-
-    def test_ports_quote_3_to_97_fresh_and_quoting(self):
-        for s in self.PORTS + ("KXBALTPORTTEU",):
+    def test_all_quote_3_to_97_fresh_and_quoting(self):
+        for s in self.MEASURED + self.BY_METADATA:
             self.assertEqual(imm.member_price_band(s, False), (3, 97), s)
             self.assertEqual(imm.member_price_band(s, True), (3, 97), s)
 
-    def test_ports_keep_the_graduates_guard_set(self):
-        for s in self.PORTS + ("KXBALTPORTTEU",):
+    def test_other_graduates_keep_their_size_and_5_to_90(self):
+        """KXSUEZWEEKLY's override is the archetype every other graduate
+        clones: neither its band nor its size may reach them."""
+        overrides = dict(imm.SERIES_OVERRIDES)
+
+        def reset():
+            imm.SERIES_OVERRIDES.clear()
+            imm.SERIES_OVERRIDES.update(overrides)
+        self.addCleanup(reset)
+        for s in ("KXMOMFGEMP", "KXIACORN"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+            imm.ensure_family_override(s)                 # clones KXSUEZWEEKLY
+            self.assertIsNone(imm.SERIES_OVERRIDES[s].size_mult, s)
+            self.assertEqual(imm.member_price_band(s, False), (5, 90), s)
+            self.assertEqual(imm.member_price_band(s, True), (5, 93), s)
+        self.assertEqual(imm.SERIES_OVERRIDES["KXTRUMPENDORSEMENTS"].size_mult, 2.0)
+        self.assertEqual(imm.member_price_band("KXTRUMPENDORSEMENTS", False), (5, 90))
+        self.assertIsNone(imm.SERIES_OVERRIDES[imm.GRADUATE_AUTO_PARENT].size_mult)
+
+    def test_they_keep_the_graduates_guard_set(self):
+        for s in self.MEASURED + self.BY_METADATA:
             ov = imm.SERIES_OVERRIDES[s]
             self.assertTrue(ov.safe_join, s)
             self.assertEqual(ov.min_est_per_day, 0.0, s)
             # the family wire, not a literal ladder or cap
             self.assertIsNone(ov.levels, s)
             self.assertIsNone(ov.max_position, s)
+        for s in self.MEASURED[:4]:                       # the weeklies' nights stay x1
+            self.assertIn(s, imm.QUIET_HOURS_OFF_SERIES)
 
     def test_the_family_wire_scales_and_the_size_test_half_stays(self):
         with mock.patch.object(imm, "size_test_mult",
@@ -11448,17 +11467,21 @@ class TestPortsSizeAndBand(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult("KXMOBILETEU"), 3.0)
             self.assertEqual(imm.size_test_arm("KXNYNJPORTTEU"), "test")
             self.assertEqual(imm.applied_mention_mult("KXNYNJPORTTEU"), 4.5)
+            self.assertEqual(imm.applied_mention_mult("KXSUEZWEEKLY"), 4.5)
+            self.assertEqual(imm.applied_mention_mult("KXPANAMAWEEKLY"), 3.0)
             self.assertEqual(imm.applied_mention_mult("KXBALTPORTTEU"), 2.25)
+            self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.5)
 
-    def test_the_mid_screen_takes_a_port_strike_at_95c(self):
+    def test_the_mid_screen_takes_a_shipping_strike_at_95c(self):
         bot = IncentiveMarketMaker(client=None, live=False)
         now = datetime.now(timezone.utc)
-        for mid in (3.0, 4.5, 95.5, 97.0):
-            self.assertIsNone(bot._screen(self._m("KXMOBILETEU", mid), now), mid)
-        for mid in (2.5, 97.5):
-            self.assertEqual(bot._screen(self._m("KXMOBILETEU", mid), now),
-                             "extreme_mid", mid)
-        self.assertEqual(bot._screen(self._m("KXPANAMAWEEKLY", 95.5), now),
+        for s in ("KXMOBILETEU", "KXPANAMAWEEKLY"):
+            for mid in (3.0, 4.5, 95.5, 97.0):
+                self.assertIsNone(bot._screen(self._m(s, mid), now), (s, mid))
+            for mid in (2.5, 97.5):
+                self.assertEqual(bot._screen(self._m(s, mid), now),
+                                 "extreme_mid", (s, mid))
+        self.assertEqual(bot._screen(self._m("KXTRUMPENDORSEMENTS", 95.5), now),
                          "extreme_mid")
 
 
@@ -29074,7 +29097,8 @@ class TestGraduateAutoFamilies(unittest.TestCase):
             self.assertTrue(a("KXNYCASKRENT-27JAN31-T4500"))
             self.assertFalse(a("KXCTMINWAGE-27JUL30-T16"))
         arch = imm.SERIES_OVERRIDES[imm.SCAN_GRADUATE_ARCHETYPE]
-        self.assertEqual(arch.size_mult, imm.SHIPPING_SIZE_MULT)    # KXSUEZWEEKLY x2
+        # KXSUEZWEEKLY x2, x3 since the shipping step (2026-10-31)
+        self.assertEqual(arch.size_mult, imm.SHIPPING_SIZE_MULT * imm.SHIPPING_SIZE_STEP)
         for s in ("KXHORMUZPEAK", "KXNYCASKRENT"):
             # the graduates' 3 an event; KXHORMUZPEAK the shipping family's 5
             # (Jack 2026-10-31: "Raise to 5")
@@ -30576,8 +30600,8 @@ class TestFamilyX2Oct11(unittest.TestCase):
 
     def test_every_member_doubles_with_its_caps(self):
         for s in self.targets():
-            # KXRT x3 since 10/26; the ports x2 -> x3 since 10/31 (PORT_SIZE_STEP)
-            m = 3.0 if s == "KXRT" or s in imm.PORT_SERIES else 2.0
+            # KXRT x3 since 10/26; shipping x2 -> x3 since 10/31 (SHIPPING_SIZE_STEP)
+            m = 3.0 if s == "KXRT" or s in imm.SHIPPING_STEP_SERIES else 2.0
             self.assertEqual(imm.applied_mention_mult(s), m, s)
             self.assertEqual(imm.series_max_position(s),
                              m * imm.MAX_POSITION_CONTRACTS, s)
