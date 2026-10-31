@@ -48,5 +48,60 @@ class EventTopNMultTests(unittest.TestCase):
         self.assertEqual(len(ranked) - len(cut2), 6)
 
 
+class ShippingEventTopNTests(unittest.TestCase):
+    """Jack 2026-10-31 "Raise to 5": the strait weeklies, KXHORMUZPEAK and the
+    port TEU series quote 5 strikes an event; every other graduate keeps the
+    scan's 3."""
+
+    SHIPPING = ("KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY", "KXHORMUZWEEKLY",
+                "KXPANAMAWEEKLY", "KXHORMUZPEAK", "KXVAPORTTEU", "KXNYNJPORTTEU",
+                "KXMOBILETEU", "KXSAVTEU", "KXSCPORTTEU", "KXBALTPORTTEU")
+
+    def test_the_shipping_family_takes_five(self):
+        self.assertEqual(imm.SHIPPING_EVENT_TOP_N, 5)
+        for s in self.SHIPPING:
+            self.assertEqual(imm.event_top_n_for(s), 5, s)
+
+    def test_every_other_graduate_keeps_three(self):
+        for s in ("KXTRUMPENDORSEMENTS", "KXORBOFHARVEST", "KXMOMFGEMP",
+                  "KXSOFTWAREUNEMP"):
+            self.assertTrue(imm.scan_graduate_series(s), s)
+            self.assertEqual(imm.event_top_n_for(s), 3, s)
+
+    def test_one_entry_per_series(self):
+        """event_top_n_for takes the first match, so a second entry for the
+        same series would make the order decide."""
+        pats = [p for p, _n in imm.EVENT_TOP_N]
+        self.assertEqual(len(pats), len(set(pats)))
+
+    def test_a_raise_only(self):
+        f = imm.shipping_event_top_n
+        self.assertEqual(f(5, 3), 5)
+        self.assertEqual(f(0, 3), 3)          # off: back on the graduates' 3
+        self.assertEqual(f(3, 3), 3)
+        self.assertEqual(f(2, 3), 3)          # never below the graduates
+        self.assertEqual(f(5, 6), 6)
+        self.assertEqual(f(5, 0), 0)          # uncapped graduates stay uncapped
+
+    def test_scaled_with_every_other_cap(self):
+        with mock.patch.object(imm, "EVENT_TOP_N_MULT", 2.0):
+            self.assertEqual(imm.event_top_n_for("KXPANAMAWEEKLY"), 10)
+            self.assertEqual(imm.event_top_n_for("KXTRUMPENDORSEMENTS"), 6)
+
+    def test_the_cut_keeps_five_strikes_of_a_strait_week(self):
+        def meta(i):
+            t = f"KXPANAMAWEEKLY-26NOV01-T{170 + 5 * i}"
+            return imm.MarketMeta(
+                ticker=t, event_ticker="KXPANAMAWEEKLY-26NOV01",
+                series="KXPANAMAWEEKLY", dollars_per_day=100.0,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=1.0 + i,
+                est_exposure_dollars=10.0, est_collateral_dollars=0.0)
+        strikes = [meta(i) for i in range(8)]
+        cut = imm.event_top_n_cut(strikes, incumbent=set())
+        self.assertEqual(len(strikes) - len(cut), 5)
+        self.assertEqual(cut, {m.ticker for m in strikes[:3]})   # lowest ROI out
+
+
 if __name__ == "__main__":
     unittest.main()

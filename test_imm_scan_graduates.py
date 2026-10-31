@@ -46,9 +46,11 @@ class ScanGraduateTests(unittest.TestCase):
         self.assertTrue(M._allowed("KXEOWEEK-X"))
 
     def test_three_strikes_per_event_like_the_scan(self):
+        # ...but the shipping family's 5 (Jack 2026-10-31: "Raise to 5")
         self.assertEqual(imm.SCAN_GRADUATE_EVENT_TOP_N, imm.SCAN_EVENT_TOP_N)
         for s in sorted(imm.SCAN_GRADUATE_SERIES):
-            self.assertEqual(imm.event_top_n_for(s), 3, s)
+            self.assertEqual(imm.event_top_n_for(s),
+                             5 if s in imm.SHIPPING_EVENT_TOP_N_SERIES else 3, s)
 
     def test_no_yield_size_mode(self):
         for s in sorted(imm.SCAN_GRADUATE_SERIES):

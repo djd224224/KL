@@ -3262,9 +3262,50 @@ SCAN_GRADUATE_SERIES = frozenset(
                                       _DEFAULT_SCAN_GRADUATE_SERIES).split(",")
     if s.strip())
 SCAN_GRADUATE_EVENT_TOP_N = _env_int("IMM_SCAN_GRADUATE_EVENT_TOP_N", 3)
+# SHIPPING: 5 strikes per event (Jack 2026-10-31: "Raise to 5", on "Raise the
+# shipping family's limit from 3 to 5 strikes per event?"). The four strait
+# weeklies, KXHORMUZPEAK (a graduate by Kalshi metadata) and the six port
+# container (TEU) series took the graduates' 3. On the 10/24-31 hourly
+# selection snapshots the 3 held back ~$21/day of estimated reward across
+# them (Bab el-Mandeb $9.6, Hormuz weekly $4.2, Suez $2.4, Panama $2.2, ports
+# $2.6, Hormuz peak $0.4); on 10/31 KXPANAMAWEEKLY-26NOV01-T180 (est $19/day)
+# and T200 ($9/day) sat out as event_top_n behind T185/T190/T195. A strait
+# event's far strikes stay out on the mid band, so 5 is about every quotable
+# strike. A raise only: below the graduates' cap the series keep theirs. The
+# per-event net cap (MAX_EVENT_CONTRACTS x the family size) still bounds the
+# inventory riding on the one weekly number. Exact names: a new strait or port
+# series keeps 3 until it is added. IMM_SHIPPING_EVENT_TOP_N=0 puts them back
+# on 3.
+SHIPPING_EVENT_TOP_N = _env_int("IMM_SHIPPING_EVENT_TOP_N", 5)
+SHIPPING_EVENT_TOP_N_SERIES: Tuple[str, ...] = tuple(sorted({
+    s.strip() for s in os.environ.get(
+        "IMM_SHIPPING_EVENT_TOP_N_SERIES",
+        "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY,"
+        "KXHORMUZPEAK,"
+        "KXVAPORTTEU,KXNYNJPORTTEU,KXMOBILETEU,KXSAVTEU,KXSCPORTTEU,"
+        "KXBALTPORTTEU").split(",") if s.strip()}))
+
+
+def shipping_event_top_n(ship_n: int, graduate_n: int) -> int:
+    """The shipping series' strikes per event: `ship_n` while it raises the
+    graduates' cap, else the graduates' own (0 = uncapped stays uncapped)."""
+    return ship_n if ship_n > graduate_n > 0 else graduate_n
+
+
+# Each shipping series has ONE exact entry (event_top_n_for takes the first
+# match): 5, or the graduates' 3 when the raise is off -- so KXHORMUZPEAK and
+# KXBALTPORTTEU keep a cap even when their own override is no longer the
+# graduate parent's (graduate_auto_rules).
+_SHIPPING_EVENT_TOP_N_SPEC = (
+    "," + ",".join(
+        f"={_s}:{shipping_event_top_n(SHIPPING_EVENT_TOP_N, SCAN_GRADUATE_EVENT_TOP_N)}"
+        for _s in SHIPPING_EVENT_TOP_N_SERIES)
+    if shipping_event_top_n(SHIPPING_EVENT_TOP_N, SCAN_GRADUATE_EVENT_TOP_N) > 0
+    and SHIPPING_EVENT_TOP_N_SERIES else "")
 _SCAN_GRADUATE_EVENT_TOP_N_SPEC = (
     "," + ",".join(f"={_s}:{SCAN_GRADUATE_EVENT_TOP_N}"
-                   for _s in sorted(SCAN_GRADUATE_SERIES))
+                   for _s in sorted(SCAN_GRADUATE_SERIES.difference(
+                       SHIPPING_EVENT_TOP_N_SERIES)))
     if SCAN_GRADUATE_EVENT_TOP_N > 0 and SCAN_GRADUATE_SERIES else "")
 
 
@@ -3322,6 +3363,7 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 + _CA_FAMILY_EVENT_TOP_N_SPEC
                                                 + _RAMP_EVENT_TOP_N_SPEC
                                                 + _SHARE_EVENT_TOP_N_SPEC
+                                                + _SHIPPING_EVENT_TOP_N_SPEC
                                                 + _SCAN_GRADUATE_EVENT_TOP_N_SPEC))
 # Scales EVERY per-event cap above (event_top_n_for); 0 entries stay
 # uncapped. A multiplier rather than a launcher copy of the spec, so a family
@@ -11230,6 +11272,9 @@ _CONFIG_CODE_KNOBS = (
     "CPI_PILOT_EVENTS", "CPI_PILOT_FAMILIES", "CPI_PILOT_UNTIL", "CPI_PILOT_BLACKOUT_ET",
     "CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS",
     "AUCTION_DATE_SERIES", "EVENT_TOP_N",
+    # shipping 5 strikes an event, ports x1.5 at 3-97c (2026-10-31)
+    "SHIPPING_EVENT_TOP_N", "SHIPPING_EVENT_TOP_N_SERIES",
+    "PORT_SIZE_STEP", "PORT_PRICE_MIN", "PORT_PRICE_MAX", "PORT_SERIES",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
     "AWARDS_TABLE_ONLY_SERIES",
     # awards by Kalshi tag (2026-10-12)
@@ -18232,6 +18277,41 @@ for _m, _ss in FAMILY_X2_1011 + FAMILY_X2_1022:
         if _base is None and scan_graduate_series(_s):
             _base = SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE]
         SERIES_OVERRIDES[_s] = replace(_base or SeriesOverride(), size_mult=_m)
+
+# PORTS x1.5 AND 3-97c (Jack 2026-10-31: "what multiplier is ports on right
+# now? increase it by 1.5x, and expand range to 3-97c"). The port container
+# (TEU) series rode the shipping x2 (KXBALTPORTTEU, a graduate by Kalshi
+# metadata, x1); each now takes PORT_SIZE_STEP on top of its own: the five
+# measured ports x2 -> x3 and KXBALTPORTTEU x1 -> x1.5, on the family wire
+# (rungs, per-market and per-event caps and skew knees together). They keep
+# their base-size test halves, so the test half (NY/NJ, Savannah, South
+# Carolina, Baltimore) still runs x1.5 on top: x4.5 / x2.25. Their band
+# widens from 5-90c (93c once quoting) to PORT_PRICE_MIN-MAX, entry and
+# members alike: on 10/31 10 of the 12 port strikes the mid screen kept out
+# (mids 93.5-95.5c and 4.5c) come inside it, and still have to clear the
+# payout floor. Each keeps the graduates' guard set (safe-join, no rate bar,
+# the ticker day's midnight-ET exit). The strait weeklies keep x2 and 5-90c.
+# IMM_PORT_SIZE_STEP=1, IMM_PORT_PRICE_MIN=5 / IMM_PORT_PRICE_MAX=90 revert
+# (env => task-level restart).
+PORT_SIZE_STEP = _env_float("IMM_PORT_SIZE_STEP", 1.5)
+PORT_PRICE_MIN = _env_int("IMM_PORT_PRICE_MIN", 3)
+PORT_PRICE_MAX = _env_int("IMM_PORT_PRICE_MAX", 97)
+PORT_SERIES: Tuple[str, ...] = tuple(s.strip() for s in os.environ.get(
+    "IMM_PORT_SERIES",
+    "KXVAPORTTEU,KXNYNJPORTTEU,KXMOBILETEU,KXSAVTEU,KXSCPORTTEU,KXBALTPORTTEU"
+).split(",") if s.strip())
+for _s in PORT_SERIES:
+    _base = SERIES_OVERRIDES.get(_s)
+    if _base is None:
+        # not sized above: a scan graduate clones the archetype's guard set
+        # (never its own x2), a graduate by metadata the members' parent
+        _base = (replace(SERIES_OVERRIDES[SCAN_GRADUATE_ARCHETYPE], size_mult=None)
+                 if scan_graduate_series(_s)
+                 else SERIES_OVERRIDES[GRADUATE_AUTO_PARENT])
+    _m = (_base.size_mult or 1.0) * PORT_SIZE_STEP
+    SERIES_OVERRIDES[_s] = replace(
+        _base, size_mult=(_m if _m != 1.0 else _base.size_mult),
+        price_min_cents=PORT_PRICE_MIN, price_max_cents=PORT_PRICE_MAX)
 
 # KXSOFTWAREUNEMP x3 LADDER (Jack 2026-10-25: "X3", the day it was enrolled,
 # on "tripling the size, as we did for the ski resorts"): at x1 its nine
@@ -37284,6 +37364,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"x{NIGHT_TOTAL_SIZE_MULT_CAP:.3g} in the global window's quiet hours, "
             f"Mon-Fri ET, for series at the window's own step "
             f"(x{TOTAL_SIZE_MULT_CAP:g} otherwise)")
+    _ship_n = shipping_event_top_n(SHIPPING_EVENT_TOP_N, SCAN_GRADUATE_EVENT_TOP_N)
+    if _ship_n != SCAN_GRADUATE_EVENT_TOP_N and SHIPPING_EVENT_TOP_N_SERIES:
+        log(f"[IMM] shipping strikes per event: {_scaled_top_n(_ship_n)} (graduates "
+            f"{_scaled_top_n(SCAN_GRADUATE_EVENT_TOP_N)}): "
+            f"{','.join(SHIPPING_EVENT_TOP_N_SERIES)}")
+    if PORT_SERIES:
+        log(f"[IMM] ports x{PORT_SIZE_STEP:g}, band {PORT_PRICE_MIN}-{PORT_PRICE_MAX}c: "
+            + ", ".join(f"{_s} x{applied_mention_mult(_s):g}" for _s in PORT_SERIES)
+            + " (family x size-test half, now)")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):

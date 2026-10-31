@@ -11401,6 +11401,67 @@ class TestSaturdayPositionCap(unittest.TestCase):
         self.assertEqual(imm.default_max_position(sat), 150.0)
 
 
+class TestPortsSizeAndBand(unittest.TestCase):
+    """Jack 2026-10-31: "what multiplier is ports on right now? increase it by
+    1.5x, and expand range to 3-97c". Each port container series takes x1.5
+    on its own family size and a 3-97c band; the strait weeklies keep theirs."""
+
+    PORTS = ("KXVAPORTTEU", "KXNYNJPORTTEU", "KXMOBILETEU", "KXSAVTEU",
+             "KXSCPORTTEU")
+    STRAITS = ("KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY", "KXHORMUZWEEKLY",
+               "KXPANAMAWEEKLY")
+
+    def _m(self, series, mid):
+        return _meta(ticker=f"{series}-99DEC31-T1", event_ticker=f"{series}-99DEC31",
+                     series=series, mid_cents=mid, spread_cents=1)
+
+    def test_each_port_is_1_5x_its_old_family_size(self):
+        for s in self.PORTS:
+            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 3.0, s)      # x2 -> x3
+        self.assertEqual(imm.SERIES_OVERRIDES["KXBALTPORTTEU"].size_mult, 1.5)  # x1 -> x1.5
+
+    def test_the_strait_weeklies_keep_x2_and_5_to_90(self):
+        for s in self.STRAITS:
+            self.assertEqual(imm.SERIES_OVERRIDES[s].size_mult, 2.0, s)
+            self.assertEqual(imm.member_price_band(s, False), (5, 90), s)
+            self.assertEqual(imm.member_price_band(s, True), (5, 93), s)
+
+    def test_ports_quote_3_to_97_fresh_and_quoting(self):
+        for s in self.PORTS + ("KXBALTPORTTEU",):
+            self.assertEqual(imm.member_price_band(s, False), (3, 97), s)
+            self.assertEqual(imm.member_price_band(s, True), (3, 97), s)
+
+    def test_ports_keep_the_graduates_guard_set(self):
+        for s in self.PORTS + ("KXBALTPORTTEU",):
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertTrue(ov.safe_join, s)
+            self.assertEqual(ov.min_est_per_day, 0.0, s)
+            # the family wire, not a literal ladder or cap
+            self.assertIsNone(ov.levels, s)
+            self.assertIsNone(ov.max_position, s)
+
+    def test_the_family_wire_scales_and_the_size_test_half_stays(self):
+        with mock.patch.object(imm, "size_test_mult",
+                               lambda s, now_ts=None:
+                               1.5 if imm.size_test_arm(s) == "test" else 1.0):
+            self.assertEqual(imm.size_test_arm("KXMOBILETEU"), "control")
+            self.assertEqual(imm.applied_mention_mult("KXMOBILETEU"), 3.0)
+            self.assertEqual(imm.size_test_arm("KXNYNJPORTTEU"), "test")
+            self.assertEqual(imm.applied_mention_mult("KXNYNJPORTTEU"), 4.5)
+            self.assertEqual(imm.applied_mention_mult("KXBALTPORTTEU"), 2.25)
+
+    def test_the_mid_screen_takes_a_port_strike_at_95c(self):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        now = datetime.now(timezone.utc)
+        for mid in (3.0, 4.5, 95.5, 97.0):
+            self.assertIsNone(bot._screen(self._m("KXMOBILETEU", mid), now), mid)
+        for mid in (2.5, 97.5):
+            self.assertEqual(bot._screen(self._m("KXMOBILETEU", mid), now),
+                             "extreme_mid", mid)
+        self.assertEqual(bot._screen(self._m("KXPANAMAWEEKLY", 95.5), now),
+                         "extreme_mid")
+
+
 class TestWeekdayNightDeepBookCap(unittest.TestCase):
     """Jack 2026-10-30: "Raise it" (the 5x deep-book limit on weekday
     nights): in the global window's quiet hours of a Mon-Fri ET morning, a
@@ -29015,15 +29076,18 @@ class TestGraduateAutoFamilies(unittest.TestCase):
         arch = imm.SERIES_OVERRIDES[imm.SCAN_GRADUATE_ARCHETYPE]
         self.assertEqual(arch.size_mult, imm.SHIPPING_SIZE_MULT)    # KXSUEZWEEKLY x2
         for s in ("KXHORMUZPEAK", "KXNYCASKRENT"):
+            # the graduates' 3 an event; KXHORMUZPEAK the shipping family's 5
+            # (Jack 2026-10-31: "Raise to 5")
+            n = 5 if s in imm.SHIPPING_EVENT_TOP_N_SERIES else 3
             imm.SERIES_OVERRIDES.pop(s, None)
-            self.assertEqual(imm.event_top_n_for(s), 3, s)          # before inheriting
+            self.assertEqual(imm.event_top_n_for(s), n, s)          # before inheriting
             imm.ensure_family_override(s)
             ov = imm.series_override(s)
             # the graduates' guard set, never the archetype's family size
             self.assertEqual(ov, dataclasses.replace(arch, size_mult=None), s)
             self.assertTrue(ov.safe_join, s)
             self.assertEqual(ov.min_est_per_day, 0.0, s)
-            self.assertEqual(imm.event_top_n_for(s), 3, s)
+            self.assertEqual(imm.event_top_n_for(s), n, s)
         # the settling print is guarded the graduates' way: the ticker day
         self.assertEqual(imm.trade_cutoff_utc("KXHORMUZPEAK-26OCT18", None, None),
                          utc(2026, 10, 18, 4, 0))
@@ -29031,7 +29095,9 @@ class TestGraduateAutoFamilies(unittest.TestCase):
         with mock.patch.object(imm, "GRADUATE_AUTO", False), \
                 mock.patch.object(imm, "ALLOWLIST_ONLY", True):     # the kill switch
             self.assertFalse(a("KXHORMUZPEAK-26OCT18-T10"))
-            self.assertEqual(imm.event_top_n_for("KXHORMUZPEAK"), 0)
+            self.assertEqual(imm.event_top_n_for("KXNYCASKRENT"), 0)
+            # a named shipping cap stays, on a series no longer admitted
+            self.assertEqual(imm.event_top_n_for("KXHORMUZPEAK"), 5)
 
     def test_a_code_family_in_the_file_keeps_its_own_rules(self):
         mc = imm.SERIES_OVERRIDES["KXMC"]
@@ -30510,7 +30576,8 @@ class TestFamilyX2Oct11(unittest.TestCase):
 
     def test_every_member_doubles_with_its_caps(self):
         for s in self.targets():
-            m = 3.0 if s == "KXRT" else 2.0                    # KXRT x3 since 10/26
+            # KXRT x3 since 10/26; the ports x2 -> x3 since 10/31 (PORT_SIZE_STEP)
+            m = 3.0 if s == "KXRT" or s in imm.PORT_SERIES else 2.0
             self.assertEqual(imm.applied_mention_mult(s), m, s)
             self.assertEqual(imm.series_max_position(s),
                              m * imm.MAX_POSITION_CONTRACTS, s)
