@@ -24935,9 +24935,16 @@ class TestWeatherShapes1030(unittest.TestCase):
         imm.ensure_family_override("KXSJCLOWT")
         ov = imm.series_override("KXSJCLOWT")
         self.assertTrue(ov.safe_join)
-        self.assertEqual(ov.max_position, 150)
-        self.assertIsNone(ov.size_mult)
-        self.assertTrue(imm.is_daily_series("KXSJCLOWT"))         # x1 at every hour
+        # x3 (Jack 2026-10-30: "yes 3x"): the rungs and the per-market cap
+        # together -- no max_position of its own, which applied_mention_mult
+        # would read as hand-tuned and keep at x1 -- out of the size test
+        self.assertIsNone(ov.max_position)
+        self.assertEqual(ov.size_mult, 3.0)
+        self.assertIsNone(imm.size_test_arm("KXSJCLOWT"))
+        self.assertEqual(imm.applied_mention_mult("KXSJCLOWT"), 3.0)
+        self.assertEqual(imm.series_max_position("KXSJCLOWT"),
+                         imm.MAX_POSITION_CONTRACTS * 3)
+        self.assertTrue(imm.is_daily_series("KXSJCLOWT"))         # no hour mults
 
     def test_the_period_end_reads_either_way_round(self):
         self.assertEqual(imm.temp_threshold_last_day("KXSJCLOWT-26DEC31"), date(2026, 12, 31))

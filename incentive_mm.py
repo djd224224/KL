@@ -2387,6 +2387,10 @@ def size_test_arm(series: str) -> Optional[str]:
     if (series in SIZE_TEST_EXCLUDE or series.startswith(SIZE_TEST_EXCLUDE_PREFIXES)
             or (ov and (ov.levels or ov.max_position is not None))):
         return None
+    # the monthly cold thresholds, sized x3 by hand (2026-10-30)
+    _tts = globals().get("temp_threshold_series")
+    if _tts is not None and _tts(series):
+        return None
     key = (SIZE_TEST_SALT, series)
     if key not in _size_test_cache:
         _size_test_cache[key] = hashlib.sha256(f"{SIZE_TEST_SALT}:{series}".encode()).digest()[0] % 2
@@ -7094,8 +7098,14 @@ def bigsky_cutoff(event_ticker: str) -> datetime:
 # unknowable -- out at 00:00 ET TEMP_THRESHOLD_STOP_DAYS (7) before the
 # period's first day (the 26DEC31 event on Nov 24, before forecasts reach
 # December, and never inside the period, where one cold hour settles it);
-# safe-join placement (join, never lead), x1 at every hour
-# (is_daily_series), TEMP_THRESHOLD_MAX_POSITION 150 a market. The first day
+# safe-join placement (join, never lead), at TEMP_THRESHOLD_SIZE_MULT x3 at
+# every hour (is_daily_series) -- Jack 2026-10-30: "yes 3x", after x1
+# projected $0.78 to the program's end against the $1.30 payout bar on
+# KXSJCLOWT's 27,000-deep book (a 0.74% share of $14.37/day). The size_mult
+# wire scales the rungs and the per-market cap together (150 -> 450), so the
+# override sets no max_position of its own (applied_mention_mult reads one
+# as hand-tuned and keeps x1), and the family sits out of the base-size
+# split test (size_test_arm), so x3 is literal. The first day
 # comes from the market's rules ("within December 1, 2026 through ..."),
 # else the first of the month the ticker's date ends; neither -> stood down
 # (fail closed). A family rule by name, KX<CITY>LOWT (KXLOWT<CITY> is the
@@ -7104,11 +7114,11 @@ def bigsky_cutoff(event_ticker: str) -> datetime:
 TEMP_THRESHOLD_ENABLE = os.environ.get("IMM_TEMP_THRESHOLD_ENABLE", "1") == "1"
 TEMP_THRESHOLD_RE = re.compile(r"KX[A-Z]{2,5}LOWT")
 TEMP_THRESHOLD_STOP_DAYS = _env_float("IMM_TEMP_THRESHOLD_STOP_DAYS", 7.0)
-TEMP_THRESHOLD_MAX_POSITION = _env_float("IMM_TEMP_THRESHOLD_MAX_POSITION", 150)
+TEMP_THRESHOLD_SIZE_MULT = _env_float("IMM_TEMP_THRESHOLD_SIZE_MULT", 3.0)
 TEMP_THRESHOLD_PARENT = "KXTEMPTHRESHOLDFAMILY"     # a key only
 if TEMP_THRESHOLD_ENABLE:
     SERIES_OVERRIDES[TEMP_THRESHOLD_PARENT] = SeriesOverride(
-        max_position=TEMP_THRESHOLD_MAX_POSITION, safe_join=True)
+        safe_join=True, size_mult=TEMP_THRESHOLD_SIZE_MULT)
 _TEMP_THRESHOLD_RULES_RE = re.compile(
     r"within ([A-Za-z]+) (\d{1,2}), (\d{4}) through")
 _TEMP_THRESHOLD_SEG_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
@@ -11377,7 +11387,7 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
     # weather shapes (2026-10-30): the per-city rain dailies, the cold thresholds
     "_RAIN_DAILY_CITY_RE_SPEC", "TEMP_THRESHOLD_ENABLE", "TEMP_THRESHOLD_STOP_DAYS",
-    "TEMP_THRESHOLD_MAX_POSITION",
+    "TEMP_THRESHOLD_SIZE_MULT",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -35949,13 +35959,13 @@ class IncentiveMarketMaker:
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
                 f"refresh {RAIN_FAIR_REFRESH_MIN}m, file {RAIN_FAIR_FILE}")
         if RAIN_DAILY_CITY_RE is not None:
-            log(f"rain dailies by city (2026-10-30): {_RAIN_DAILY_CITY_RE_SPEC}-<YYMMDD> "
+            log(f"rain dailies by city (2026-10-30): {_RAIN_DAILY_CITY_RE_SPEC}-<YYMMDD|DDMONYY> "
                 f"on {RAIN_DAILY_CITY_PARENT}'s guard set, the rain-fair gate (next "
                 f"day exempt), the curated next-day tier and the move breaker")
         if TEMP_THRESHOLD_ENABLE:
-            log(f"cold thresholds (2026-10-30): KX<CITY>LOWT safe-join, x1, cap "
-                f"{TEMP_THRESHOLD_MAX_POSITION:g}, out {TEMP_THRESHOLD_STOP_DAYS:g}d "
-                f"before the period's first day")
+            log(f"cold thresholds (2026-10-30): KX<CITY>LOWT safe-join, "
+                f"x{TEMP_THRESHOLD_SIZE_MULT:g} (cap {MAX_POSITION_CONTRACTS * TEMP_THRESHOLD_SIZE_MULT:g}), "
+                f"out {TEMP_THRESHOLD_STOP_DAYS:g}d before the period's first day")
         if CA_FAIR_ENABLE:
             log(f"ca-fair gate: Carbon Arc-settled at-touch, tol "
                 f"{CA_FAIR_TOL_CENTS}c, band sigma x{CA_FAIR_SIGMA_LO_FRAC:g}-1, "
