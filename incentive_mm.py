@@ -34146,11 +34146,18 @@ class IncentiveMarketMaker:
                 hour_scaled_levels(series, datetime.fromtimestamp(now_ts, tz=timezone.utc)),
                 self._market_size_mult(q.ticker))
             cap_mult = REF_DEPTH_MAX_MULT if LADDER_MODE == "atref" else 1.0
-            # a series sized up on one side (SIDE_MULT_SERIES) brackets that
-            # side's caps by the same factor
+            # a series sized up on one side (SIDE_MULT_SERIES, or its family's
+            # lean) brackets that side's caps by the same factor -- applied to
+            # the rungs as the quote loop applies it, scaled and rounded per
+            # rung BEFORE the depth multiplier (Jack 2026-10-30: "Yes"). The
+            # unrounded product sat under what the loop builds: a 45-lot
+            # evening rung (x1.5 window x the size test's x1.5) on a 1.5 bid
+            # lean is 67.5 -> 68 there, x3 = 204, against 45 x 3 x 1.5 = 202.5
+            # here, so KXRIRESPOWER-27FEB28-T29.0's bid was refused every
+            # cycle from 6 PM ET (679 side_cap alerts on 10/30)
             _ssm = max(1.0, series_side_mults(series)[0 if q.book_side == "bid" else 1])
-            cap_mult *= _ssm
-            side_cap = sum(s for _t, s in lv_now) * cap_mult
+            lv_side = scale_levels(lv_now, _ssm)
+            side_cap = sum(s for _t, s in lv_side) * cap_mult
             # atref collapses the side's WHOLE ladder to one price level by
             # design, so the per-level bracket is the side bracket — the
             # per-rung max only applies to offsets-shaped ladders. (2026-08-02:
@@ -34158,7 +34165,7 @@ class IncentiveMarketMaker:
             # lot single rung > max-level 10 and every temp strike was
             # level_cap-blocked overnight.)
             max_level_size = side_cap if LADDER_MODE == "atref" \
-                else max(s for _t, s in lv_now) * _ssm
+                else max(s for _t, s in lv_side)
             # FULL UNWIND: the side that reduces the bot's own position may
             # rest the whole position (the quote loop sized it the same way)
             _ub, _ua = unwind_side_sizes(series, self.pnl.pos.get(q.ticker, 0.0),

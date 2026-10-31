@@ -3462,6 +3462,26 @@ class TestPlaceWithCaps(unittest.TestCase):
                                           set(), self.now)
         self.assertEqual(placed, 0)
 
+    def test_side_cap_rounds_the_lean_as_the_quote_loop_does(self):
+        # Jack 2026-10-30 ("Yes"): KXRIRESPOWER-27FEB28-T29.0's evening rung
+        # of 45 on a 1.5 bid lean is 67.5 -> 68 in the quote loop, x3 at a
+        # deep reference = 204; the cap read 45 x 3 x 1.5 = 202.5 and refused
+        # it every cycle from 6 PM ET (679 side_cap alerts)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "REF_DEPTH_MAX_MULT", 3.0), \
+                mock.patch.dict(imm.SIDE_MULT_SERIES, {"KXCAPT": (1.5, 0.75)}), \
+                mock.patch.object(imm, "hour_scaled_levels", lambda s, now: [(0, 45)]):
+            self.assertEqual(self.bot.place_with_caps(
+                [Quote("KXCAPT-27FEB28-T29", "bid", 80, 204)], [], set(), self.now), 1)
+            # ...the cap still binds just past it
+            self.assertEqual(self.bot.place_with_caps(
+                [Quote("KXCAPT-27FEB28-T30", "bid", 80, 205)], [], set(), self.now), 0)
+            # ...and a lean under 1 leaves the side at the plain ladder's 135
+            self.assertEqual(self.bot.place_with_caps(
+                [Quote("KXCAPT-27FEB28-T31", "ask", 90, 135)], [], set(), self.now), 1)
+            self.assertEqual(self.bot.place_with_caps(
+                [Quote("KXCAPT-27FEB28-T32", "ask", 90, 136)], [], set(), self.now), 0)
+
     def test_side_cap_ignores_cancelled(self):
         resting = [_resting("a", "T", "bid", 49, imm.SIDE_MAX_CONTRACTS)]
         placed = self.bot.place_with_caps([Quote("T", "bid", 48, 5)], resting,
