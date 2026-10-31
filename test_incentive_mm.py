@@ -10,7 +10,7 @@ import tempfile
 import time
 import dataclasses
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 import imm_account
@@ -11531,6 +11531,7 @@ class TestRainFairAnchor(unittest.TestCase):
     (date parses via %y%b%d like production dailies; %y maps 99->1999)."""
 
     T = "KXRAIN-68DEC31-SEA"
+    EV = "KXRAIN-68DEC31"
 
     def setUp(self):
         _clean_persist()
@@ -11582,7 +11583,7 @@ class TestRainFairAnchor(unittest.TestCase):
              "start_date": client.programs[0]["start_date"],
              "end_date": client.programs[0]["end_date"]})
         client.markets[self.T] = {
-            "ticker": self.T, "event_ticker": "KXRAIN-68DEC31",
+            "ticker": self.T, "event_ticker": self.EV,
             "status": "active", "close_time": far,
             "yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100",
             "volume_fp": "500.00"}
@@ -11666,6 +11667,45 @@ class TestRainFairAnchor(unittest.TestCase):
             self.assertEqual(self._rain_quotes(bot), self.PLAIN_JOIN)
         finally:
             imm.RAIN_FAIR_ENABLE = old
+
+
+class TestRainDailyCityGate(TestRainFairAnchor):
+    """Jack 2026-10-30 ("make sure these shapes are auto-quoted in weather
+    families"): a per-city daily, KXRAIND<CITY>-<YYMMDD>-0, is admitted,
+    takes KXRAIN's guard set and meets the rain-fair gate exactly as a KXRAIN
+    daily -- every TestRainFairAnchor case re-run on KXRAINDSEA-681231-0 --
+    except that a divergent book takes no directional position (KXRAIN's)."""
+
+    T = "KXRAINDSEA-681231-0"
+    EV = "KXRAINDSEA-681231"
+
+    def setUp(self):
+        # first, so the snapshot holds the real KXRAIN entry: the family
+        # clone made in the refresh leaves with the test
+        p = mock.patch.dict(imm.SERIES_OVERRIDES)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.dict(imm._RAIN_DAILY_STATION, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        super().setUp()
+        imm._RAIN_DAILY_STATION["KXRAINDSEA"] = "SEA"     # as its rules name it
+
+    def _bot(self):
+        bot = super()._bot()
+        bot.client.markets[self.T]["rules_primary"] = (
+            "If the total precipitation at Seattle-Tacoma (KSEA) in Seattle on "
+            "Dec 31, 2068 is strictly greater than 0 inches, then the market "
+            "resolves to Yes.")
+        return bot
+
+    def test_a_divergent_book_takes_no_directional_position(self):
+        self._write_fair(0.30)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot._rain_fair_stood)
+        self.assertEqual(dict(bot.state.rain_dir_done), {})
+        self.assertIs(imm.SERIES_OVERRIDES["KXRAINDSEA"], imm.SERIES_OVERRIDES["KXRAIN"])
 
 
 class TestCarbonArcFairGate(unittest.TestCase):
@@ -24775,6 +24815,192 @@ class TestBigSkySnowfall(unittest.TestCase):
                 self.assertLessEqual(o["yes_price"], 21)
             else:
                 self.assertGreaterEqual(o["yes_price"], 34)
+
+
+class TestWeatherShapes1030(unittest.TestCase):
+    """Jack 2026-10-30: "small dollar amounts, but make sure these shapes are
+    auto-quoted in weather families", on KXSJCLOWT-26DEC31, KXRAINDNYC-261101
+    and KXRAINDNYC-261031. The per-city rain dailies join the daily rain
+    family (TestRainDailyCityGate runs them through the fair gate); the
+    monthly cold thresholds take Big Sky's no-fair rule."""
+
+    def setUp(self):
+        p = mock.patch.dict(imm.SERIES_OVERRIDES)     # family clones, per test
+        p.start()
+        self.addCleanup(p.stop)
+
+    # ---- the per-city rain dailies ---------------------------------------
+    def test_per_city_rain_dailies_by_name_and_shape(self):
+        for ser in ("KXRAINDNYC", "KXRAINDSATX", "KXRAINDDC", "KXRAINDPARIS"):
+            self.assertTrue(imm.rain_daily_city_series(ser), ser)
+        # the monthlies sharing the prefix, the bare and the old series
+        for ser in ("KXRAINDCM", "KXRAINDTWM", "KXRAINDALM", "KXRAINDENM",
+                    "KXRAIND", "KXRAINDC", "KXRAIN", "KXRAINWKND"):
+            self.assertFalse(imm.rain_daily_city_series(ser), ser)
+        self.assertEqual(imm.rain_daily_city_date("KXRAINDNYC-261031-0"), date(2026, 10, 31))
+        self.assertEqual(imm.rain_daily_city_date("KXRAINDNYC-261101"), date(2026, 11, 1))
+        # ...and day first, the other way Kalshi writes it (live 10/30)
+        self.assertEqual(imm.rain_daily_city_date("KXRAINDAUS-14FEB27-0"), date(2027, 2, 14))
+        self.assertEqual(imm.rain_daily_city_date("KXRAINDPIT-21NOV26-0"), date(2026, 11, 21))
+        self.assertEqual(imm.parse_event_date("KXRAINDCLL-27NOV26"),          # not 2027-11-26
+                         imm.ET.localize(datetime(2026, 11, 27)).astimezone(timezone.utc))
+        self.assertIsNone(imm.rain_daily_city_date("KXRAINDNYC-261399-0"))     # no such day
+        self.assertIsNone(imm.rain_daily_city_date("KXRAINDCM-26NOV-1"))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):   # the module runs it off
+            allowed = imm.IncentiveMarketMaker._allowed
+            self.assertTrue(allowed("KXRAINDNYC-261031-0"))
+            self.assertTrue(allowed("KXRAINDNYC-261101-0"))
+            self.assertTrue(allowed("KXRAINDCHI-261105-0"))            # any city
+            self.assertTrue(allowed("KXRAINDAUS-14FEB27-0"))
+            self.assertTrue(allowed("KXRAINDCM-26NOV-1"))               # still a monthly
+            with mock.patch.object(imm, "RAIN_DAILY_CITY_RE", None):    # the switch
+                self.assertFalse(allowed("KXRAINDNYC-261031-0"))
+
+    NYC_RULES = {"rules_primary": "If the total precipitation at Central Park (KNYC) in "
+                 "New York City on Oct 31, 2026 is strictly greater than 0 inches, "
+                 "then the market resolves to Yes."}
+
+    def test_a_per_city_daily_quotes_on_kxrains_rules(self):
+        p = mock.patch.dict(imm._RAIN_DAILY_STATION, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        imm.ensure_family_override("KXRAINDNYC")
+        imm.ensure_family_override("KXRAINDTWM")
+        self.assertIs(imm.SERIES_OVERRIDES["KXRAINDNYC"], imm.SERIES_OVERRIDES["KXRAIN"])
+        self.assertIs(imm.SERIES_OVERRIDES["KXRAINDTWM"],             # the monthly's
+                      imm.SERIES_OVERRIDES[imm.RAIN_MONTHLY_ARCHETYPE])
+        ov = imm.series_override("KXRAINDNYC")
+        self.assertEqual(ov.size_mult, imm.RAIN_DAILY_SIZE_MULT)
+        self.assertEqual((ov.price_min_cents, ov.price_max_cents), (5, 90))
+        # out at 22:00 ET the day before the rain day
+        self.assertEqual(imm.parse_event_date("KXRAINDNYC-261031"),
+                         imm.ET.localize(datetime(2026, 10, 31)).astimezone(timezone.utc))
+        cut = imm.apply_series_cutoff_adjustments(
+            "KXRAINDNYC", "KXRAINDNYC-261031",
+            imm.trade_cutoff_utc("KXRAINDNYC-261031", None, None), market=self.NYC_RULES)
+        self.assertEqual(cut, imm.ET.localize(datetime(2026, 10, 30, 22)).astimezone(timezone.utc))
+        self.assertEqual(imm._RAIN_DAILY_STATION, {"KXRAINDNYC": "NYC"})
+        # the station stays on file for a producer whose market says less
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINDNYC", "KXRAINDNYC-261031", None, market={}), cut)
+        # rules naming no US station stand it down: Paris (LFPG), whose rain
+        # day starts before the 22:00 ET stop
+        paris = {"rules_primary": "If the total precipitation at Paris-Charles de "
+                 "Gaulle (LFPG) in Paris on Sep 3, 2027 is strictly greater than 0 inches"}
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINDPARIS", "KXRAINDPARIS-03SEP27", None, market=paris),
+            imm.RELEASE_GUARD_UNKNOWN)
+        self.assertTrue(imm.move_breaker_on("KXRAINDNYC"))
+        self.assertFalse(imm.move_breaker_on("KXRAINDCM"))
+        self.assertTrue(imm.is_daily_series("KXRAINDNYC"))
+
+    def test_the_next_day_event_is_curated_past_the_floors(self):
+        evening = utc(2026, 10, 31, 0, 30)          # 8:30 PM ET Oct 30
+        self.assertTrue(imm.rain_fair_exempt("KXRAINDNYC-261031", evening))
+        self.assertTrue(imm.curated_event("KXRAINDNYC-261031", "KXRAINDNYC", evening))
+        self.assertFalse(imm.curated_event("KXRAINDNYC-261101", "KXRAINDNYC", evening))
+        after = utc(2026, 10, 31, 4, 30)            # 12:30 AM ET Oct 31
+        self.assertTrue(imm.curated_event("KXRAINDNYC-261101", "KXRAINDNYC", after))
+        self.assertFalse(imm.curated_event("KXRAINDCM-26NOV", "KXRAINDCM", after))
+
+    def test_the_fair_reads_the_station_its_rules_name(self):
+        now = time.time()
+        with mock.patch.dict(imm._rain_fair_state, {"cli_keys": None, "fair": {
+                ("2026-11-01", "NYC"): (0.31, now),
+                ("2026-11-01", "TAM"): (0.12, now),
+                ("2026-11-01", "HOU"): (0.55, now),
+                ("2026-11-01", "HOB"): (0.44, now)}}), \
+                mock.patch.dict(imm._RAIN_DAILY_STATION, {
+                    "KXRAINDNYC": "NYC", "KXRAINDTPA": "TPA", "KXRAINDHOU": "HOU"},
+                    clear=True):
+            self.assertAlmostEqual(imm.rain_fair_p("KXRAINDNYC-261101-0", now), 0.31)
+            # Tampa's CLITPA row is the writer's "TAM"
+            self.assertAlmostEqual(imm.rain_fair_p("KXRAINDTPA-261101-0", now), 0.12)
+            # KXRAINDHOU settles at Hobby (KHOU): its row, never KXRAIN HOU's IAH
+            self.assertAlmostEqual(imm.rain_fair_p("KXRAINDHOU-261101-0", now), 0.44)
+            self.assertIsNone(imm.rain_fair_p("KXRAINDCHI-261101-0", now))   # no station on file
+            self.assertIsNone(imm.rain_fair_p("KXRAINDNYC-261102-0", now))   # no fair that day
+
+    # ---- the monthly cold thresholds -------------------------------------
+    def test_cold_thresholds_by_name_on_big_skys_rules(self):
+        for ser in ("KXSJCLOWT", "KXMSNLOWT"):
+            self.assertTrue(imm.temp_threshold_series(ser), ser)
+        for ser in ("KXLOWTNYC", "KXLOWT", "KXHIGHTNYC", "KXRAINDNYC"):
+            self.assertFalse(imm.temp_threshold_series(ser), ser)
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(imm.IncentiveMarketMaker._allowed("KXSJCLOWT-26DEC31-40"))
+            self.assertTrue(imm.IncentiveMarketMaker._allowed("KXMSNLOWT-31OCT26-30"))
+            with mock.patch.object(imm, "TEMP_THRESHOLD_ENABLE", False):    # the switch
+                self.assertFalse(imm.IncentiveMarketMaker._allowed("KXSJCLOWT-26DEC31-40"))
+        imm.ensure_family_override("KXSJCLOWT")
+        ov = imm.series_override("KXSJCLOWT")
+        self.assertTrue(ov.safe_join)
+        self.assertEqual(ov.max_position, 150)
+        self.assertIsNone(ov.size_mult)
+        self.assertTrue(imm.is_daily_series("KXSJCLOWT"))         # x1 at every hour
+
+    def test_the_period_end_reads_either_way_round(self):
+        self.assertEqual(imm.temp_threshold_last_day("KXSJCLOWT-26DEC31"), date(2026, 12, 31))
+        self.assertEqual(imm.temp_threshold_last_day("KXMSNLOWT-31OCT26"), date(2026, 10, 31))
+        self.assertEqual(imm.temp_threshold_last_day("KXSJCLOWT-27FEB28"), date(2027, 2, 28))
+        self.assertIsNone(imm.temp_threshold_last_day("KXSJCLOWT-26DEC26"))   # no month end
+        self.assertIsNone(imm.temp_threshold_last_day("KXSJCLOWT-26DEC"))
+        self.assertEqual(imm.parse_event_date("KXMSNLOWT-31OCT26"),          # not 2031
+                         imm.ET.localize(datetime(2026, 10, 31)).astimezone(timezone.utc))
+        self.assertIsNone(imm.parse_event_date("KXSJCLOWT-26DEC26"))
+
+    def test_out_seven_days_before_the_period(self):
+        nov24 = imm.ET.localize(datetime(2026, 11, 24)).astimezone(timezone.utc)
+        ev = "KXSJCLOWT-26DEC31"
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXSJCLOWT", ev, imm.trade_cutoff_utc(ev, None, None)), nov24)
+        rules = {"rules_primary": "If any hourly temperature value reported for KSJC in "
+                 "San Jose within December 1, 2026 through December 31, 2026 is strictly "
+                 "less than 40 degrees Fahrenheit, then the market resolves to Yes."}
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXSJCLOWT", ev, None, market=rules), nov24)
+        # the rules win over the ticker: a period they start mid-month
+        mid = {"rules_primary": "... within November 15, 2026 through December 14, 2026 ..."}
+        self.assertEqual(imm.temp_threshold_cutoff(ev, mid),
+                         imm.ET.localize(datetime(2026, 11, 8)).astimezone(timezone.utc))
+        # an unreadable period stands it down
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXSJCLOWT", "KXSJCLOWT-26DEC26", None), imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_refresh_selects_and_quotes_a_cold_threshold(self):
+        """End to end on the dry bot, the KXSJCLOWT shape two months out: it
+        is admitted, selected and joins the 79x86 touch without leading."""
+        sd = tempfile.mkdtemp(prefix="imm_ct_")
+        p = mock.patch.object(imm, "STATUS_DIR", sd)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(_clean_persist)
+        _clean_persist()
+        now = datetime.now(timezone.utc)
+        mon = (now + timedelta(days=62)).astimezone(imm.ET).date()
+        last = (mon.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        ev = f"KXSJCLOWT-{last:%y}{last:%b}{last:%d}".upper()
+        t = f"{ev}-40"
+        client = FakeClient()
+        client.programs = [dict(client.programs[0], market_ticker=t)]
+        client.markets = {t: {
+            "ticker": t, "event_ticker": ev, "status": "active",
+            "close_time": (now + timedelta(days=100)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.7900", "yes_ask_dollars": "0.8600",
+            "volume_fp": "6475.00"}}
+        client.books = {t: {"orderbook_fp": {
+            "yes_dollars": [["0.78", "500"], ["0.79", "600"]],
+            "no_dollars": [["0.14", "1200"]]}}}               # ext ask = 86
+        bot = IncentiveMarketMaker(client=client, live=False)
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)
+        placed = [o for o in bot.state.sim_orders.values() if o["ticker"] == t]
+        self.assertTrue(placed)
+        for o in placed:                          # safe-join: never leads the touch
+            if o["book_side"] == "bid":
+                self.assertLessEqual(o["yes_price"], 79)
+            else:
+                self.assertGreaterEqual(o["yes_price"], 86)
 
 
 class TestTrimmedPoolRate(unittest.TestCase):

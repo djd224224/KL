@@ -29,7 +29,12 @@ class TestStations(unittest.TestCase):
                      "PVD", "SGF", "STL", "TAM", "TTN"):
             self.assertIn(city, rf.STATIONS)
         self.assertEqual(rf.STATIONS["TAM"]["cli"], "CLITPA")        # Tampa settles on TPA
-        self.assertEqual(len(rf.STATIONS), 33)
+        # ...and the three stations of the per-city dailies no KXRAIN city
+        # used (2026-10-30): KXRAINDHOU settles at Hobby, not IAH
+        self.assertEqual({c: rf.STATIONS[c]["cli"] for c in ("HOB", "DTW", "SAN")},
+                         {"HOB": "CLIHOU", "DTW": "CLIDTW", "SAN": "CLISAN"})
+        self.assertEqual(rf.STATIONS["HOU"]["cli"], "CLIIAH")
+        self.assertEqual(len(rf.STATIONS), 36)
 
 
 class TestAutoStations(unittest.TestCase):

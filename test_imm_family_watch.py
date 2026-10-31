@@ -941,6 +941,9 @@ class TestQuoteCalls(unittest.TestCase):
         # purpose" off the scan's KXRAIN exclusion
         for s in ("KXRAINATLM", "KXRAINPHXM"):
             self.assertEqual(fw.owner_of(s), ("", False), s)
+        # ...and so is a per-city rain daily (2026-10-30, KXRAIND<CITY>)
+        for s in ("KXRAINDNYC", "KXRAINDCHI"):
+            self.assertEqual(fw.owner_of(s), ("", False), s)
 
     def test_rules_before_the_track_record(self):
         self.assertEqual(self.call("new:KXTINY", est_total=6.0)[0], "SKIP")

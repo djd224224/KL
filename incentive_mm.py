@@ -1159,6 +1159,88 @@ def rain_period_family_series(series: str) -> bool:
         and not RAINSTORM_SERIES_RE.fullmatch(series)
 
 
+# DAILY RAIN, ONE SERIES PER CITY (Jack 2026-10-30: "small dollar amounts,
+# but make sure these shapes are auto-quoted in weather families", on
+# KXRAINDNYC-261031 / KXRAINDNYC-261101). Kalshi's last daily KXRAIN event
+# was KXRAIN-26OCT28 (a program every day through 10/27); daily rain now
+# lists one series per city, KXRAIND<CITY>-<YYMMDD>-0 = "Rain in New York
+# City on Oct 31, 2026?": total precipitation at the station the rules name
+# (Central Park, KNYC) strictly over 0 inches that day -- a KXRAIN-<date>-
+# <CITY> market's question, on the RAINGLOBALPERIOD contract. 22 US cities
+# and Paris in the catalog on 10/30, most dated weeks or months out (the
+# days people plan around: KXRAINDNYC-261101 is the marathon,
+# KXRAINDNOLA-270209 Mardi Gras); programs so far only on NYC ($10-20 a
+# market, $3-7/day). A FAMILY rule on the ticker shape: a KXRAIND<CITY> name
+# AND a day, which Kalshi writes two ways -- YYMMDD (KXRAINDNYC-261031) or
+# day-first DDMONYY (KXRAINDAUS-14FEB27, KXRAINDPIT-21NOV26; the period
+# family's order, and the only reading that puts 14FEB27 in the future) --
+# so the monthlies sharing the prefix (KXRAINDCM-26NOV, KXRAINDTWM,
+# KXRAINDALM, KXRAINDENM: KXRAIN<CITY>M) stay out. A member takes the
+# dailies' rule set: KXRAIN's guard set (x2, the 5-90c band, out at 22:00
+# ET the day before the rain day; RAIN_DAILY_CITY_PARENT), the NWS fair
+# gate (rain_fair_p, on the station its rules name -- KXRAINDHOU settles at
+# Hobby, not KXRAIN HOU's IAH; the next-day event exempt), the curated
+# next-day tier (past the payout floor and the hopeless exit, which
+# programs this small would otherwise never clear), the 15c/30m move
+# breaker and the 19-01 ET halving (KXRAIN prefix). It quotes only once a
+# market's rules name a US station, "(Kxxx)": Paris (LFPG) stands down, its
+# rain day starting before the 22:00 ET stop. Not the directional take,
+# which stays KXRAIN's own. IMM_RAIN_DAILY_CITY_RE="" turns it off.
+_RAIN_DAILY_CITY_RE_SPEC = os.environ.get("IMM_RAIN_DAILY_CITY_RE", r"KXRAIND[A-Z]{2,5}")
+RAIN_DAILY_CITY_RE = re.compile(_RAIN_DAILY_CITY_RE_SPEC) if _RAIN_DAILY_CITY_RE_SPEC else None
+RAIN_DAILY_CITY_PARENT = "KXRAIN"
+# a monthly's name (KXRAINDCM = KXRAIN + DC + M), never a daily city's
+_RAIN_MONTHLY_NAME_RE = re.compile(r"KXRAIN[A-Z]{2,5}M")
+_YYMMDD_SEG_RE = re.compile(r"\d{6}")
+_DDMONYY_SEG_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
+# the station each one's rules name ("at Central Park (KNYC)"), as the
+# cutoff producers see the market: series -> "NYC" (note_rain_daily_station)
+_RAIN_DAILY_STATION: Dict[str, str] = {}
+_RAIN_DAILY_STATION_RE = re.compile(r"\(K([A-Z0-9]{3})\)")
+
+
+def rain_daily_city_series(series: str) -> bool:
+    """A KXRAIND<CITY> daily rain series by name (KXRAINDNYC), not a monthly
+    sharing the prefix (KXRAINDCM, KXRAINDTWM)."""
+    return bool(RAIN_DAILY_CITY_RE and RAIN_DAILY_CITY_RE.fullmatch(series)
+                and not _RAIN_MONTHLY_NAME_RE.fullmatch(series))
+
+
+def rain_daily_city_date(ticker: str) -> Optional[date]:
+    """The rain day of a KXRAIND<CITY> market or event ticker, either form:
+    KXRAINDNYC-261031-0 -> 2026-10-31, KXRAINDAUS-14FEB27-0 -> 2027-02-14;
+    None off the shape."""
+    parts = ticker.split("-")
+    if len(parts) < 2 or not rain_daily_city_series(parts[0]):
+        return None
+    try:
+        if _YYMMDD_SEG_RE.fullmatch(parts[1]):
+            return datetime.strptime(parts[1], "%y%m%d").date()
+        m = _DDMONYY_SEG_RE.fullmatch(parts[1])
+        month = _MONTHS.get(m.group(2)) if m else None
+        if month is not None:
+            return date(2000 + int(m.group(3)), month, int(m.group(1)))
+    except ValueError:
+        pass
+    return None
+
+
+def rain_daily_city_ticker(ticker: str) -> bool:
+    """_allowed's test: a per-city daily's name and its day."""
+    return rain_daily_city_date(ticker) is not None
+
+
+def note_rain_daily_station(series: str, market: Optional[dict]) -> Optional[str]:
+    """The US station a per-city daily's rules name, "(KNYC)" -> "NYC", noted
+    from `market` when it names one; else the one on file, or None."""
+    if isinstance(market, dict):
+        hit = _RAIN_DAILY_STATION_RE.search(str(market.get("rules_primary") or ""))
+        if hit and _RAIN_DAILY_STATION.get(series) != hit.group(1):
+            _RAIN_DAILY_STATION[series] = hit.group(1)
+            log(f"[IMM] rain daily {series}: station K{hit.group(1)}, from its rules")
+    return _RAIN_DAILY_STATION.get(series)
+
+
 SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE] = SeriesOverride(
     price_min_cents=_env_int("IMM_RAIN_PRICE_MIN", 5),
     price_max_cents=_env_int("IMM_RAIN_PRICE_MAX", 90),
@@ -1795,6 +1877,10 @@ def is_daily_series(series: str) -> bool:
         return True
     # ... and Big Sky's resort snowfall (2026-10-13), quoted with no fair
     if series in globals().get("BIGSKY_SERIES", ()) and globals().get("BIGSKY_ENABLE"):
+        return True
+    # ... and the monthly cold thresholds (2026-10-30), quoted the same way
+    _tts = globals().get("temp_threshold_series")
+    if _tts is not None and _tts(series):
         return True
     # ... and the ski resorts' season snowfall (2026-10-22), on its gate
     _rss = globals().get("resort_snow_series")
@@ -3512,9 +3598,11 @@ def move_breaker_on(series: str) -> bool:
     """Does the mid-move breaker guard this series?"""
     # ... and the low- and high-temperature families' next-day markets
     # (2026-10-23, LOWT_ENABLE / HIGHT_ENABLE), the next-day rain dailies'
-    # protection
+    # protection -- and the per-city rain dailies (2026-10-30) wherever
+    # KXRAIN's own entry stands
     return (BREAKERS_ENABLED or series in MOVE_BREAKER_SERIES
-            or lowt_series(series) or hight_series(series))
+            or lowt_series(series) or hight_series(series)
+            or ("KXRAIN" in MOVE_BREAKER_SERIES and rain_daily_city_series(series)))
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
@@ -6990,6 +7078,93 @@ def bigsky_cutoff(event_ticker: str) -> datetime:
     first_et = first.astimezone(ET).replace(tzinfo=None)
     return ET.localize(first_et - timedelta(days=BIGSKY_STOP_DAYS)) \
         .astimezone(timezone.utc)
+
+
+# MONTHLY COLD THRESHOLDS (Jack 2026-10-30: "small dollar amounts, but make
+# sure these shapes are auto-quoted in weather families", on
+# KXSJCLOWT-26DEC31). KX<CITY>LOWT-<date>-<strike> = "Will the temperature
+# in San Jose (SJC Airport) drop below 40F in December 2026?": YES if any
+# hourly temperature The Weather Company reports for the station within the
+# period (the month, per the rules) is strictly under the strike, and the
+# market closes early when one is (TEMPTHRESHOLD contract). Two series on
+# 10/30: KXSJCLOWT (event 26DEC31, the period's last day as YYMONDD; $90 a
+# week since 9/19, $14.37/day now on a 79x86 book) and KXMSNLOWT (31OCT26,
+# DDMONYY). No model prices it, so it takes Big Sky's rule (Jack
+# 2026-10-13: "safe-join, out before Dec"): quoted only while its month is
+# unknowable -- out at 00:00 ET TEMP_THRESHOLD_STOP_DAYS (7) before the
+# period's first day (the 26DEC31 event on Nov 24, before forecasts reach
+# December, and never inside the period, where one cold hour settles it);
+# safe-join placement (join, never lead), x1 at every hour
+# (is_daily_series), TEMP_THRESHOLD_MAX_POSITION 150 a market. The first day
+# comes from the market's rules ("within December 1, 2026 through ..."),
+# else the first of the month the ticker's date ends; neither -> stood down
+# (fail closed). A family rule by name, KX<CITY>LOWT (KXLOWT<CITY> is the
+# daily low family). Kill switch IMM_TEMP_THRESHOLD_ENABLE=0; positions
+# ride.
+TEMP_THRESHOLD_ENABLE = os.environ.get("IMM_TEMP_THRESHOLD_ENABLE", "1") == "1"
+TEMP_THRESHOLD_RE = re.compile(r"KX[A-Z]{2,5}LOWT")
+TEMP_THRESHOLD_STOP_DAYS = _env_float("IMM_TEMP_THRESHOLD_STOP_DAYS", 7.0)
+TEMP_THRESHOLD_MAX_POSITION = _env_float("IMM_TEMP_THRESHOLD_MAX_POSITION", 150)
+TEMP_THRESHOLD_PARENT = "KXTEMPTHRESHOLDFAMILY"     # a key only
+if TEMP_THRESHOLD_ENABLE:
+    SERIES_OVERRIDES[TEMP_THRESHOLD_PARENT] = SeriesOverride(
+        max_position=TEMP_THRESHOLD_MAX_POSITION, safe_join=True)
+_TEMP_THRESHOLD_RULES_RE = re.compile(
+    r"within ([A-Za-z]+) (\d{1,2}), (\d{4}) through")
+_TEMP_THRESHOLD_SEG_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
+
+
+def temp_threshold_series(series: str) -> bool:
+    """A monthly cold-threshold series by name (KXSJCLOWT, KXMSNLOWT)."""
+    return (TEMP_THRESHOLD_ENABLE and not series.startswith("KXLOWT")
+            and bool(TEMP_THRESHOLD_RE.fullmatch(series)))
+
+
+def temp_threshold_last_day(event_ticker: str) -> Optional[date]:
+    """The period's last day in the ticker, which Kalshi writes either way
+    round: KXSJCLOWT-26DEC31 (YYMONDD), KXMSNLOWT-31OCT26 (DDMONYY). The
+    reading that ends its month wins; both or neither -> None."""
+    parts = event_ticker.split("-")
+    m = _TEMP_THRESHOLD_SEG_RE.fullmatch(parts[1]) if len(parts) >= 2 else None
+    month = _MONTHS.get(m.group(2)) if m else None
+    if month is None:
+        return None
+    ends = set()
+    for yy, dd in ((m.group(1), m.group(3)), (m.group(3), m.group(1))):
+        try:
+            d = date(2000 + int(yy), month, int(dd))
+        except ValueError:
+            continue
+        if (d + timedelta(days=1)).month != d.month:
+            ends.add(d)
+    return ends.pop() if len(ends) == 1 else None
+
+
+def temp_threshold_first_day(event_ticker: str,
+                             market: Optional[dict] = None) -> Optional[date]:
+    """The period's first day: the rules' "within <Month> <d>, <yyyy>
+    through", else the first of the month the ticker's last day ends."""
+    for key in ("rules_primary", "rules_secondary"):
+        hit = _TEMP_THRESHOLD_RULES_RE.search(str((market or {}).get(key) or ""))
+        if hit:
+            try:
+                return date(int(hit.group(3)), _MONTHS[hit.group(1)[:3].upper()],
+                            int(hit.group(2)))
+            except (KeyError, ValueError):
+                pass
+    last = temp_threshold_last_day(event_ticker)
+    return last.replace(day=1) if last is not None else None
+
+
+def temp_threshold_cutoff(event_ticker: str, market: Optional[dict] = None) -> datetime:
+    """00:00 ET TEMP_THRESHOLD_STOP_DAYS before the period's first day
+    ('KXSJCLOWT-26DEC31' -> 2026-11-24 00:00 ET), or RELEASE_GUARD_UNKNOWN
+    (stand down) when neither the rules nor the ticker give it."""
+    first = temp_threshold_first_day(event_ticker, market)
+    if first is None:
+        return RELEASE_GUARD_UNKNOWN
+    return ET.localize(datetime(first.year, first.month, first.day)
+                       - timedelta(days=TEMP_THRESHOLD_STOP_DAYS)).astimezone(timezone.utc)
 # POKEMON (Jack 2026-10-03: "yes build the gate to quote all pokemon events").
 # KXPOKEMON -- one "Up or Down" market per item per month on Collectr's
 # ungraded price, $55/day per market from 10/3 -- is enrolled here only with
@@ -9570,6 +9745,8 @@ FAMILY_OVERRIDE_PARENTS = (
     # broader family rule can claim a city ahead of its own
     ("predicate", lambda s: lowt_series(s), LOWT_PARENT),
     ("predicate", lambda s: hight_series(s), HIGHT_PARENT),
+    # the monthly cold thresholds (2026-10-30), see TEMP_THRESHOLD_ENABLE
+    ("predicate", lambda s: temp_threshold_series(s), TEMP_THRESHOLD_PARENT),
     ("prefix", "KXAAAGASD", "KXAAAGASD"),
     ("pattern", OSCAR_FAMILY_RE, "KXOSCAR"),
     ("pattern", CRITICS_FAMILY_RE, "KXCRITICS"),
@@ -9586,6 +9763,10 @@ FAMILY_OVERRIDE_PARENTS = (
     # rain_monthly_auto): BEFORE the rainstorm regex, which also matches a
     # KXRAINS??M monthly name (KXRAINSEAM's shape)
     ("predicate", lambda s: rain_monthly_auto(s), RAIN_MONTHLY_ARCHETYPE),
+    # the per-city rain dailies (2026-10-30, see rain_daily_city_series):
+    # KXRAIN's own guard set. After the monthlies, whose KXRAIND?M names it
+    # never claims, and before the period rule, which takes any KXRAIN series
+    ("predicate", lambda s: rain_daily_city_series(s), RAIN_DAILY_CITY_PARENT),
     # rainstorm spans (2026-09-24 pm): KXRAINS<CITY>, archetype KXRAINSBOS.
     # The name regex also matches the KXRAINS*M monthlies, but only a
     # series that passed _allowed (the two-date ticker shape) reaches here.
@@ -11193,6 +11374,9 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_PAST_BAND",        # leads past the band, ahead of the touch (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
+    # weather shapes (2026-10-30): the per-city rain dailies, the cold thresholds
+    "_RAIN_DAILY_CITY_RE_SPEC", "TEMP_THRESHOLD_ENABLE", "TEMP_THRESHOLD_STOP_DAYS",
+    "TEMP_THRESHOLD_MAX_POSITION",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -12156,6 +12340,9 @@ def rain_fair_exempt(event_ticker: str, now_utc: datetime) -> bool:
     if event_ticker in RAIN_FAIR_EXEMPT_EVENTS:
         return True
     nxt = now_utc.astimezone(ET) + timedelta(days=1)
+    rd = rain_daily_city_date(event_ticker)
+    if rd is not None:                     # a per-city daily (2026-10-30)
+        return rd == nxt.date()
     return event_ticker == \
         f"{RAIN_FAIR_SERIES}-{nxt.strftime('%y%b%d').upper()}"
 
@@ -12167,8 +12354,9 @@ def curated_event(event_ticker: str, series: str, now_utc: datetime) -> bool:
     supplies the CUTOFF and nothing else; override events face the same
     floors, ladders and exits as everything else. (Supersedes the 7/24
     floor bypass and the 7/28 hopeless exemption for override events; the
-    rain half keeps the 7/29 JUL30-NYC lesson.)"""
-    return (series == RAIN_FAIR_SERIES
+    rain half keeps the 7/29 JUL30-NYC lesson.) Since 2026-10-30 each
+    per-city daily's next-day event too (KXRAINDNYC-261031 on Oct 30 ET)."""
+    return ((series == RAIN_FAIR_SERIES or rain_daily_city_series(series))
             and rain_fair_exempt(event_ticker, now_utc))
 RAIN_FAIR_TOL_CENTS = _env_int("IMM_RAIN_FAIR_TOL_CENTS", 10)
 RAIN_FAIR_TTL_MIN = _env_int("IMM_RAIN_FAIR_TTL_MIN", 240)
@@ -12224,21 +12412,61 @@ def load_rain_fair() -> int:
             except (KeyError, TypeError, ValueError):
                 continue
     _rain_fair_state["fair"] = fresh
+    _rain_fair_state["cli_keys"] = _rain_fair_cli_keys(data.get("auto_stations") or {})
     log(f"[IMM] rain fair values reloaded: {len(fresh)} station-days")
     return len(fresh)
 
 
-def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
-    """Fair P(YES) for a KXRAIN daily ticker (KXRAIN-26JUL29-SEA), or None
-    when unavailable/stale — None must degrade to plain band quoting."""
-    parts = ticker.split("-")
-    if len(parts) != 3 or parts[0] != RAIN_FAIR_SERIES:
-        return None
+def _rain_fair_cli_keys(auto_rows: dict) -> Dict[str, str]:
+    """{station code: the writer's key} over rain_fair.STATIONS (first, so
+    a seed row wins) and its auto-modeled rows: "TPA" -> "TAM" (CLITPA)."""
+    rows: List[Tuple[str, dict]] = []
     try:
-        date_iso = datetime.strptime(parts[1], "%y%b%d").date().isoformat()
-    except ValueError:
+        import rain_fair as _rf
+        rows += list(_rf.STATIONS.items())
+    except Exception:
+        pass
+    rows += list((auto_rows or {}).items())
+    out: Dict[str, str] = {}
+    for key, row in rows:
+        cli = str((row or {}).get("cli") or "") if isinstance(row, dict) else ""
+        if len(cli) == 6 and cli.startswith("CLI"):
+            out.setdefault(cli[3:], key)
+    return out
+
+
+def rain_fair_station_key(code: Optional[str]) -> Optional[str]:
+    """The writer's key for a station code (the per-city dailies' "(Kxxx)"),
+    None when it prices no such station."""
+    if not code:
         return None
-    entry = _rain_fair_state["fair"].get((date_iso, parts[2]))
+    keys = _rain_fair_state.get("cli_keys")
+    if keys is None:
+        keys = _rain_fair_state["cli_keys"] = _rain_fair_cli_keys({})
+    return keys.get(code)
+
+
+def rain_fair_p(ticker: str, now_ts: float) -> Optional[float]:
+    """Fair P(YES) for a KXRAIN daily ticker (KXRAIN-26JUL29-SEA) or a
+    per-city daily's (KXRAINDNYC-261031-0: the writer's row for the station
+    its rules name, never the KXRAIN city of the same code), or None when
+    unavailable/stale — None must degrade to plain band quoting."""
+    parts = ticker.split("-")
+    rd = rain_daily_city_date(ticker)
+    if rd is not None:
+        city = rain_fair_station_key(_RAIN_DAILY_STATION.get(parts[0]))
+        if city is None:
+            return None
+        key = (rd.isoformat(), city)
+    else:
+        if len(parts) != 3 or parts[0] != RAIN_FAIR_SERIES:
+            return None
+        try:
+            date_iso = datetime.strptime(parts[1], "%y%b%d").date().isoformat()
+        except ValueError:
+            return None
+        key = (date_iso, parts[2])
+    entry = _rain_fair_state["fair"].get(key)
     if entry is None:
         return None
     p, fetched_ts = entry
@@ -16899,6 +17127,15 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
     if per is not None:
         return ET.localize(datetime(per[0].year, per[0].month, per[0].day)) \
             .astimezone(timezone.utc)
+    # the per-city rain dailies' YYMMDD (KXRAINDNYC-261031) and the cold
+    # thresholds' period end, written either way round (2026-10-30)
+    day = rain_daily_city_date(event_ticker)
+    if day is None and temp_threshold_series(event_ticker.split("-")[0]):
+        day = temp_threshold_last_day(event_ticker)
+        if day is None:
+            return None
+    if day is not None:
+        return ET.localize(datetime(day.year, day.month, day.day)).astimezone(timezone.utc)
     parts = event_ticker.split("-")
     if len(parts) < 2:
         return None
@@ -18401,6 +18638,26 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
             _config_gap(series, event_ticker,
                         f"Big Sky stop needs the month in {event_ticker} "
                         f"(<YYMON>) -- standing it down (fail closed)")
+        cutoff = stop if cutoff is None else min(cutoff, stop)
+    if rain_daily_city_series(series) and note_rain_daily_station(series, market) is None:
+        # PER-CITY RAIN DAILIES (2026-10-30): quoted only once a market's
+        # rules name a US station, "(Kxxx)" -- off the NWS map (Paris, LFPG)
+        # the 22:00 ET stop falls inside the rain day itself
+        if isinstance(market, dict):
+            _config_gap(series, event_ticker,
+                        f"{event_ticker}'s rules name no US station (Kxxx) -- "
+                        f"a per-city rain daily stands down (fail closed)")
+        cutoff = RELEASE_GUARD_UNKNOWN
+    if temp_threshold_series(series):
+        # MONTHLY COLD THRESHOLDS (2026-10-30): out TEMP_THRESHOLD_STOP_DAYS
+        # before the period's first day; unreadable -> stood down (fail
+        # closed), logged once
+        stop = temp_threshold_cutoff(event_ticker, market)
+        if stop == RELEASE_GUARD_UNKNOWN:
+            _config_gap(series, event_ticker,
+                        f"cold-threshold stop needs the period's first day in "
+                        f"{event_ticker}'s rules or ticker -- standing it down "
+                        f"(fail closed)")
         cutoff = stop if cutoff is None else min(cutoff, stop)
     first = same_day_first_start(event_ticker) if same_day_speaker(series) else None
     if first is not None:
@@ -26398,6 +26655,8 @@ class IncentiveMarketMaker:
             ytw_pilot_ticker(ticker) or \
             snow_monthly_series(series) or \
             bigsky_series(series) or \
+            temp_threshold_series(series) or \
+            rain_daily_city_ticker(ticker) or \
             resort_snow_series(series) or \
             bway_fair_series(series) or \
             ercot_fair_series(series) or \
@@ -31680,7 +31939,8 @@ class IncentiveMarketMaker:
             # market, so quoting auto-resumes when book and forecast agree
             # again. Missing/stale fair (TTL in rain_fair_p) -> gate open ->
             # plain band behavior.
-            if RAIN_FAIR_ENABLE and meta.series == RAIN_FAIR_SERIES \
+            if RAIN_FAIR_ENABLE and (meta.series == RAIN_FAIR_SERIES
+                                     or rain_daily_city_series(meta.series)) \
                     and not rain_fair_exempt(meta.event_ticker, now_utc):
                 p_fair = rain_fair_p(t, now_ts)
                 if p_fair is not None:
@@ -31699,8 +31959,10 @@ class IncentiveMarketMaker:
                         # divergent book = the systematic directional entry
                         # (Jack 2026-07-28); manual-standoff markets never
                         # reach here, so his own bets are never crossed.
-                        self.rain_directional_take(
-                            t, ext_bid, ext_ask, fair_c, bid_bad, ask_bad, now_ts)
+                        # KXRAIN's own: not the per-city dailies (2026-10-30)
+                        if meta.series == RAIN_FAIR_SERIES:
+                            self.rain_directional_take(
+                                t, ext_bid, ext_ask, fair_c, bid_bad, ask_bad, now_ts)
                         self._gskip(t, "rain_fair", lambda: dict(fair=round(fair_c, 2), tol=RAIN_FAIR_TOL_CENTS, bid_bad=bid_bad, ask_bad=ask_bad), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                         continue
             if t in self._rain_fair_stood:
@@ -35593,6 +35855,14 @@ class IncentiveMarketMaker:
             log(f"rain-fair gate: {RAIN_FAIR_SERIES} at-touch, tol "
                 f"{RAIN_FAIR_TOL_CENTS}c, ttl {RAIN_FAIR_TTL_MIN}m, "
                 f"refresh {RAIN_FAIR_REFRESH_MIN}m, file {RAIN_FAIR_FILE}")
+        if RAIN_DAILY_CITY_RE is not None:
+            log(f"rain dailies by city (2026-10-30): {_RAIN_DAILY_CITY_RE_SPEC}-<YYMMDD> "
+                f"on {RAIN_DAILY_CITY_PARENT}'s guard set, the rain-fair gate (next "
+                f"day exempt), the curated next-day tier and the move breaker")
+        if TEMP_THRESHOLD_ENABLE:
+            log(f"cold thresholds (2026-10-30): KX<CITY>LOWT safe-join, x1, cap "
+                f"{TEMP_THRESHOLD_MAX_POSITION:g}, out {TEMP_THRESHOLD_STOP_DAYS:g}d "
+                f"before the period's first day")
         if CA_FAIR_ENABLE:
             log(f"ca-fair gate: Carbon Arc-settled at-touch, tol "
                 f"{CA_FAIR_TOL_CENTS}c, band sigma x{CA_FAIR_SIGMA_LO_FRAC:g}-1, "

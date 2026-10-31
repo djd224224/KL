@@ -601,7 +601,9 @@ def family_of(series: str, category: str = ""):
     if re.fullmatch(r"KX[A-Z]{2,6}SNOWM", s):
         return "Weather & quakes", "Snow monthlies"
     if s.startswith("KXRAIN"):
-        return "Weather & quakes", ("Rain dailies" if s == "KXRAIN" else
+        daily = s == "KXRAIN" or (re.fullmatch(r"KXRAIND[A-Z]{2,5}", s) is not None
+                                  and re.fullmatch(r"KXRAIN[A-Z]{2,5}M", s) is None)
+        return "Weather & quakes", ("Rain dailies" if daily else
                                     "Weekend rain" if s.startswith("KXRAINWKND") else "Rain spans")
     if s.startswith("KXTEMP"):
         return "Weather & quakes", "Hourly temp"

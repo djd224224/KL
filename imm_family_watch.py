@@ -579,6 +579,9 @@ def owner_of(series: str) -> Tuple[str, bool]:
     # exclusion): a city still dark is a station or model gap, not an owner
     if getattr(imm, "rain_monthly_series", None) and imm.rain_monthly_series(s):
         return "", False
+    # ... and so does the daily family every KXRAIND<CITY> (2026-10-30)
+    if getattr(imm, "rain_daily_city_series", None) and imm.rain_daily_city_series(s):
+        return "", False
     named = next((why for p, why in OWNER_PREFIXES if s.startswith(p)), "")
     if any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ())):
         return named or "blocklisted in incentive_mm.py", bool(named)

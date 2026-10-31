@@ -94,6 +94,13 @@ STATIONS: Dict[str, dict] = {
     "STL":  {"cli": "CLISTL", "name": "St. Louis Lambert",     "lat": 38.753, "lon": -90.374, "tz": "America/Chicago"},
     "TAM":  {"cli": "CLITPA", "name": "Tampa Intl",            "lat": 27.961, "lon": -82.540, "tz": "America/New_York"},
     "TTN":  {"cli": "CLITTN", "name": "Trenton-Mercer",        "lat": 40.276, "lon": -74.816, "tz": "America/New_York"},
+    # added 2026-10-30: the stations of the per-city dailies (KXRAIND<CITY>)
+    # that no KXRAIN city used -- KXRAINDHOU settles at Hobby, not IAH -- keyed
+    # by their own codes; incentive_mm finds a row by its CLI product. Rows
+    # from the NWS station records (api.weather.gov/stations/K...)
+    "HOB":  {"cli": "CLIHOU", "name": "Houston Hobby",         "lat": 29.637, "lon": -95.282, "tz": "America/Chicago"},
+    "DTW":  {"cli": "CLIDTW", "name": "Detroit Metro",         "lat": 42.231, "lon": -83.331, "tz": "America/Detroit"},
+    "SAN":  {"cli": "CLISAN", "name": "San Diego Intl",        "lat": 32.734, "lon": -117.183, "tz": "America/Los_Angeles"},
 }
 
 HOURLY_EXP = float(os.environ.get("RAIN_FAIR_HOURLY_EXP", "0.5"))
