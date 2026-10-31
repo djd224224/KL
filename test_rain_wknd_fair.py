@@ -27,11 +27,16 @@ REAL_FETCH_NBS_HOURLY = r.fetch_nbs_hourly      # the reader itself, for its tes
 
 def setUpModule():
     """No test reaches the network for the composite's short-range sources:
-    a test that wants them passes nbs_fn / nbs_hourly_fn itself."""
+    a test that wants them passes nbs_fn / nbs_hourly_fn itself. Nor for
+    Kalshi: a get_json fake that refuses a read would fall back to a public
+    one."""
     for name in ("fetch_nbs", "fetch_nbs_hourly"):
         p = mock.patch.object(r, name, side_effect=RuntimeError("no network in tests"))
         p.start()
         _NET.append(p)
+    p = mock.patch.object(r.requests, "get", side_effect=RuntimeError("no network in tests"))
+    p.start()
+    _NET.append(p)
 
 
 def tearDownModule():
@@ -281,6 +286,8 @@ class TestWrite(unittest.TestCase):
                                "event_ticker": "KXRAINWKND-26OCT17",
                                "rules_primary": RULES.format(code="NYC")}]}
         def get_json(path, params):
+            if path == "/series":                             # the weather category
+                return {"series": []}
             if params["series_ticker"] != "KXRAINWKND":      # the one-day series
                 return {"markets": []}
             n.append(1)
@@ -298,6 +305,108 @@ class TestWrite(unittest.TestCase):
             r.write_fair_file(self.path, now=self.NOW + timedelta(minutes=m),
                               get_json=get_json, nbe_fn=self.nbe)
         self.assertEqual(len(n), 4)
+
+
+class TestAutoDaySeries(unittest.TestCase):
+    """Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP', etc are
+    always considered for auto-quoting as part of these families"."""
+
+    NOW = datetime(2026, 11, 23, 12, tzinfo=UTC)
+    ONE = ("If the total precipitation at {name} (K{code}) in {name} in November 26, "
+           "2026 is strictly greater than 0 inches, then the market resolves to Yes.")
+
+    def market(self, t, rules):
+        return {"ticker": t, "event_ticker": t.rsplit("-", 1)[0], "rules_primary": rules}
+
+    def turkey(self):
+        return [self.market("KXRAINTURKEY-26NOV26-NYC", self.ONE.format(name="NYC", code="NYC")),
+                self.market("KXRAINTURKEY-26NOV26-BOS", self.ONE.format(name="Boston", code="BOS"))]
+
+    def test_the_contract_is_a_market_per_city_rain_over_named_days(self):
+        got, why = r.classify_day_markets(self.turkey())
+        self.assertEqual((got, why), ({"events": {"KXRAINTURKEY-26NOV26": ["2026-11-26", 1]},
+                                       "sample": "KXRAINTURKEY-26NOV26-NYC"}, ""))
+        # a weekend-style span of the CLI form
+        got, _ = r.classify_day_markets([self.market("KXRAINXMAS-26DEC25-ATL",
+                                                     RULES.format(code="ATL"))])
+        self.assertEqual(got["events"], {"KXRAINXMAS-26DEC25": ["2026-10-17", 2]})
+        # not the contract: a threshold, a strike or a day ticker, a month,
+        # four days, nothing open
+        for ms, bit in (
+                ([self.market("KXRAINT-26NOV26-NYC", self.ONE.format(name="NYC", code="NYC")
+                              .replace("than 0 inches", "than 0.5 inches"))], "strictly"),
+                ([self.market("KXRAINT-26NOV26-T0", self.ONE.format(name="NYC", code="NYC"))],
+                 "per city"),
+                ([self.market("KXRAINDNYC-261126-0", self.ONE.format(name="NYC", code="NYC"))],
+                 "per city"),
+                ([self.market("KXRAINT-26NOV-NYC", "If the total precipitation at NYC (KNYC) "
+                              "in November 2026 is strictly greater than 0 inches")], "no day"),
+                ([self.market("KXRAINT-26NOV26-NYC", RULES.format(code="NYC").replace(
+                    "October 18, 2026", "October 20, 2026"))], "4-day"),
+                ([], "no open market")):
+            got, why = r.classify_day_markets(ms)
+            self.assertIsNone(got)
+            self.assertIn(bit, why)
+
+    def fake(self, by_series, calls):
+        def get_json(path, params):
+            calls.append((path, params.get("series_ticker") or params.get("category")))
+            if path == "/series":
+                return {"series": [{"ticker": s} for s in
+                                   ("KXRAINTURKEY", "KXRAINWKND", "KXRAINATLM", "KXRAINDNYC",
+                                    "KXSNOWNYCM", "KXRAINELECTION")]}
+            return {"markets": by_series.get(params["series_ticker"], [])}
+        return get_json
+
+    def test_discovery_reads_the_unclaimed_rain_series_and_caches_them(self):
+        calls = []
+        by = {"KXRAINTURKEY": self.turkey(),
+              "KXRAINDNYC": [self.market("KXRAINDNYC-261126-0",
+                                         self.ONE.format(name="NYC", code="NYC"))]}
+        get = self.fake(by, calls)
+        skip = lambda s: s == "KXRAINATLM"                       # the bot's monthly
+        ts = self.NOW.timestamp()
+        found, rej, at = r.discover_day_series({}, ts, get, skip)
+        self.assertEqual(set(found), {"KXRAINTURKEY"})
+        self.assertIn("per city", rej["KXRAINDNYC"]["why"])
+        self.assertEqual(at, ts)
+        # the category, then only the unclaimed rain series: not the weekend,
+        # the named day series, the monthly the bot owns, or a snow one
+        self.assertEqual(calls, [("/series", "Climate and Weather"),
+                                 ("/markets", "KXRAINDNYC"), ("/markets", "KXRAINTURKEY")])
+        old = {"day_series": found, "day_rejected": rej, "day_discovered_at": at}
+        calls.clear()
+        self.assertEqual(r.discover_day_series(old, ts + 60, get, skip)[0], found)
+        self.assertEqual(calls, [])                                # inside the hour
+        r.discover_day_series(old, ts + r.DAY_DISCOVER_SECS + 1, get, skip)
+        self.assertEqual(calls, [("/series", "Climate and Weather")])   # verdicts kept
+        calls.clear()
+        r.discover_day_series(old, ts + r.DAY_RETRY_SECS + 1, get, skip)
+        self.assertEqual(len(calls), 3)                            # and read again
+        with mock.patch.object(r, "AUTO_DAY_ENABLE", False):
+            self.assertEqual(r.discover_day_series(old, ts + 1e6, get, skip)[0], {})
+
+    def test_a_new_series_is_priced_on_its_rules_window_in_the_same_pass(self):
+        path = os.path.join(tempfile.mkdtemp(), "rain_wknd_fair.json")
+        calls = []
+        get = self.fake({"KXRAINTURKEY": self.turkey()}, calls)
+        run = datetime(2026, 11, 23, 0, tzinfo=UTC)
+        nbe = lambda sid: (run, periods(run, [0.3] * 20))
+        # a fresh events cache from before the series listed
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"open_events": {"KXRAINWKND-26NOV21": {"sat": "2026-11-21",
+                                                              "markets": {}}},
+                       "events_at": self.NOW.timestamp() - 60}, f)
+        ok, _miss = r.write_fair_file(path, now=self.NOW, get_json=get, nbe_fn=nbe)
+        self.assertEqual(ok, 2)
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(set(d["day_series"]), {"KXRAINTURKEY"})
+        self.assertEqual(d["open_events"]["KXRAINTURKEY-26NOV26"]["sat"], "2026-11-26")
+        m = d["markets"]["KXRAINTURKEY-26NOV26-BOS"]
+        self.assertEqual((m["station"], m["coverage"]), ("KBOS", 2.0))
+        one = r.market_fair(periods(run, [0.3] * 20), run, date(2026, 11, 26), 5, days=1)
+        self.assertEqual(m["p"], one["p"])
 
 
 class TestStations(unittest.TestCase):

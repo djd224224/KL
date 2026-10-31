@@ -116,6 +116,10 @@ def run_audit(client=None, progs=None) -> dict:
     # picked event is allowed in the bot, so it must not read as a new family
     if hasattr(imm, "load_astest_picks"):
         imm.load_astest_picks()
+    # ...and the rain-day series the weekend writer found on their contract
+    # (rain_wknd_fair.json's "day_series", 2026-10-31): the bot allows them
+    if hasattr(imm, "load_rain_wknd"):
+        imm.load_rain_wknd()
     # ...and the central-bank family (FINECON_SERIES_PREFIXES, "KXCBD"),
     # which the bot admits from the live programs feed at every refresh
     # (finecon_expand_family, in memory only). Without it every bank past

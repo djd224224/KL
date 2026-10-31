@@ -2471,6 +2471,10 @@ def size_test_arm(series: str) -> Optional[str]:
     _tts = globals().get("temp_threshold_series")
     if _tts is not None and _tts(series):
         return None
+    # ...and the rain-day series, quoted as the weekend family is (2026-10-31)
+    _rds = globals().get("rain_day_series")
+    if _rds is not None and _rds(series):
+        return None
     key = (SIZE_TEST_SALT, series)
     if key not in _size_test_cache:
         _size_test_cache[key] = hashlib.sha256(f"{SIZE_TEST_SALT}:{series}".encode()).digest()[0] % 2
@@ -3067,7 +3071,7 @@ def event_cap_contracts(event_ticker: str) -> float:
     # a family that leads off its fair (2026-10-29, FAIR LEAD): room for the
     # leads, which take first call on it, beside the other markets' rungs
     if globals().get("FAIR_LEAD_MODE") == "on" \
-            and series in globals().get("FAIR_LEAD_SERIES", ()):
+            and globals().get("in_fair_lead_series", lambda s: False)(series):
         return max(globals()["FAIR_LEAD_EVENT_CAP"],
                    MAX_EVENT_CONTRACTS * applied_mention_mult(series))
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
@@ -3764,7 +3768,10 @@ def move_breaker_on(series: str) -> bool:
     # KXRAIN's own entry stands
     return (BREAKERS_ENABLED or series in MOVE_BREAKER_SERIES
             or lowt_series(series) or hight_series(series)
-            or ("KXRAIN" in MOVE_BREAKER_SERIES and rain_daily_city_series(series)))
+            or ("KXRAIN" in MOVE_BREAKER_SERIES and rain_daily_city_series(series))
+            # ... and every rain-day series where the weekend family's stands
+            or ("KXRAINWKND" in MOVE_BREAKER_SERIES
+                and globals().get("rain_day_series", lambda s: False)(series)))
 SKEW_SOFT_CONTRACTS = _env_float("IMM_SKEW_SOFT", 30)   # halve accumulating side
 SKEW_HARD_CONTRACTS = _env_float("IMM_SKEW_HARD", 60)   # pull accumulating side
 REDUCE_ONLY_MIN_CONTRACTS = _env_float("IMM_REDUCE_ONLY_MIN", 5)
@@ -14337,23 +14344,69 @@ RAIN_WKND_REFRESH_SECS = _env_int("IMM_RAIN_WKND_REFRESH_SECS", 900)
 RAIN_WKND_CAP = os.environ.get("IMM_RAIN_WKND_CAP", "1") == "1"
 RAIN_WKND_FILE = os.environ.get(
     "IMM_RAIN_WKND_FILE", os.path.join(STATUS_DIR, "rain_wknd_fair.json"))
-_rain_wknd_state: dict = {"mtime": 0.0, "markets": {}, "events": {}}
+_rain_wknd_state: dict = {"mtime": 0.0, "markets": {}, "events": {},
+                          "day_series": {}, "open_events": {}}
+# AUTO DAY SERIES (Jack 2026-10-31: "make sure new markets with 'RAIN',
+# 'TEMP', etc are always considered for auto-quoting as part of these
+# families"). The weekend writer lists Kalshi's weather category hourly and
+# reads any rain series no family claims (rain_wknd_fair.discover_day_series):
+# one with this family's contract -- a market per city, any rain at a named
+# station over a named day or a span of up to 3 days -- lands in its file's
+# "day_series" and joins here as KXRAINELECTION did by hand: allowed, the
+# weekend override, the gate and its fair, the fair lead and the move breaker
+# while the weekend family has them, out of the size test, and its cutoff at
+# 00:00 ET of its window's first day as the writer read it from the rules.
+# IMM_RAIN_DAY_AUTO=0 keeps only the named RAIN_DAY_SERIES.
+RAIN_DAY_AUTO = os.environ.get("IMM_RAIN_DAY_AUTO", "1") == "1"
+
+
+def rain_day_series(series: str) -> bool:
+    """A one-day / span rain series: RAIN_DAY_SERIES by name, or one the
+    weekend writer found on its contract (AUTO DAY SERIES)."""
+    return series in RAIN_DAY_SERIES or (
+        RAIN_DAY_AUTO and series in _rain_wknd_state["day_series"])
 
 
 def rain_wknd_series(series: str) -> bool:
-    return RAIN_WKND_ENABLE and series in RAIN_WKND_SERIES
+    return RAIN_WKND_ENABLE and (series in RAIN_WKND_SERIES or rain_day_series(series))
 
 
 def load_rain_wknd() -> int:
-    """Hot-reload RAIN_WKND_FILE by mtime (the rain loader)."""
-    return _load_weather_fair(RAIN_WKND_FILE, _rain_wknd_state, "weekend rain")
+    """Hot-reload RAIN_WKND_FILE by mtime (the rain loader), with its auto day
+    series and its open events' windows (AUTO DAY SERIES)."""
+    n = _load_weather_fair(RAIN_WKND_FILE, _rain_wknd_state, "weekend rain")
+    if n >= 0:
+        _load_rain_day_meta()
+    return n
+
+
+def _load_rain_day_meta() -> None:
+    """The writer's "day_series" and "open_events" into _rain_wknd_state; a
+    series new to the list takes the weekend family's override."""
+    try:
+        with open(RAIN_WKND_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return
+    auto = {str(s): v for s, v in (data.get("day_series") or {}).items()
+            if isinstance(v, dict)} if RAIN_DAY_AUTO else {}
+    for s in sorted(set(auto) - set(_rain_wknd_state["day_series"])):
+        if s not in SERIES_OVERRIDES and "KXRAINWKND" in SERIES_OVERRIDES:
+            SERIES_OVERRIDES[s] = SERIES_OVERRIDES["KXRAINWKND"]
+        log(f"[IMM] rain day {s}: joins the weekend family on its contract "
+            f"(e.g. {auto[s].get('sample')})")
+    _rain_wknd_state["day_series"] = auto
+    _rain_wknd_state["open_events"] = {
+        str(ev): {"sat": e.get("sat"), "days": e.get("days")}
+        for ev, e in (data.get("open_events") or {}).items() if isinstance(e, dict)}
 
 
 def rain_wknd_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                    ext_ask: Optional[float]
                    ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
-    label = ("election-day rain" if ticker.split("-")[0] in RAIN_DAY_SERIES
-             else "weekend rain")
+    s = ticker.split("-")[0]
+    label = ("election-day rain" if s in RAIN_DAY_SERIES
+             else "rain-day" if rain_day_series(s) else "weekend rain")
     return simple_fair_gate(_rain_wknd_state, ticker, now_ts, ext_bid, ext_ask,
                             tol=RAIN_WKND_TOL_CENTS, ttl_min=RAIN_WKND_TTL_MIN,
                             label=label, cap=RAIN_WKND_CAP)
@@ -17396,6 +17449,17 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
         # the election-day rain (2026-10-31) writes its day first too:
         # KXRAINELECTION-03NOV26 is November 3, 2026, not 2003-11-26
         yy, dd = dd, yy
+    _rds = globals().get("rain_day_series")
+    if _rds is not None and _rds(parts[0]):
+        # a rain-day series' window starts on the day the weekend writer read
+        # from its rules (AUTO DAY SERIES): a new series may write its date
+        # either way round
+        _ev = _rain_wknd_state["open_events"].get("-".join(parts[:2])) or {}
+        try:
+            _d = date.fromisoformat(str(_ev.get("sat") or ""))
+            return ET.localize(datetime(_d.year, _d.month, _d.day)).astimezone(timezone.utc)
+        except ValueError:
+            pass
     month = _MONTHS.get(mon)
     if month is None:
         return None
@@ -20683,10 +20747,17 @@ def past_band_ahead(side: str, px: int, best: Optional[int]) -> bool:
     return px > best if side == "bid" else px < best
 
 
+def in_fair_lead_series(series: str) -> bool:
+    """FAIR_LEAD_SERIES, with any rain-day series while the weekend family
+    is in it (AUTO DAY SERIES: it takes the weekend family's kit)."""
+    return series in FAIR_LEAD_SERIES or (
+        "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series))
+
+
 def fair_lead_series(series: str) -> bool:
     """May this series' markets lead off a model fair (FAIR LEAD)?"""
     return (FAIR_LEAD_MODE in ("on", "dry") and LADDER_MODE == "atref"
-            and series in FAIR_LEAD_SERIES)
+            and in_fair_lead_series(series))
 
 
 def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
@@ -20694,7 +20765,7 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
     gate would still read it, else None: weekend rain's (rain_wknd_fair.py),
     the Vercel family's (vercel_fair_c) or the OpenRouter weekly's
     (or_fair_c)."""
-    if series not in FAIR_LEAD_SERIES:
+    if not in_fair_lead_series(series):
         return None
     if rain_wknd_series(series):
         e = _rain_wknd_state["markets"].get(ticker)
@@ -20711,7 +20782,7 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
 def fair_lead_blackout(series: str, now_ts: float) -> bool:
     """Do a FAIR_LEAD_SERIES market's leads -- fair or ladder -- and its
     model-priced close stand down for its feed's publish (OR_LEAD_BLACKOUT)?"""
-    return (series in FAIR_LEAD_SERIES and or_fair_series(series)
+    return (in_fair_lead_series(series) and or_fair_series(series)
             and or_publish_blackout(now_ts))
 
 
@@ -20719,6 +20790,7 @@ def fair_model_label(series: str) -> str:
     """How the logs name a fair-lead family's model."""
     if rain_wknd_series(series):
         return ("the election-day rain fair" if series in RAIN_DAY_SERIES
+                else "the rain-day fair" if rain_day_series(series)
                 else "the weekend rain fair")
     if vercel_series(series):
         return "the Vercel fair"
@@ -20904,7 +20976,7 @@ def fair_close_hold(series: str, pos: float) -> bool:
     """FAIR CLOSE keeps a FAIR_LEAD_SERIES market the bot holds a position in
     selected -- past the payout floor, the hopeless exit, the budget and a
     non-fatal screen, as quote_all does -- so its closing rung keeps resting."""
-    return FAIR_CLOSE_MODE == "on" and series in FAIR_LEAD_SERIES and abs(pos) >= 1
+    return FAIR_CLOSE_MODE == "on" and in_fair_lead_series(series) and abs(pos) >= 1
 
 
 def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
@@ -26982,6 +27054,7 @@ class IncentiveMarketMaker:
             bigsky_series(series) or \
             temp_threshold_series(series) or \
             rain_daily_city_ticker(ticker) or \
+            rain_day_series(series) or \
             resort_snow_series(series) or \
             bway_fair_series(series) or \
             ercot_fair_series(series) or \
@@ -29202,7 +29275,7 @@ class IncentiveMarketMaker:
             # FAIR lead's has none to wait for (weekend rain is never grouped;
             # a Vercel strike's fill locks off its ladder like any other)
             if lk is None and (not on_lead or self._comp_linked(tkr)
-                               or series_of(tkr) in FAIR_LEAD_SERIES):
+                               or in_fair_lead_series(series_of(tkr))):
                 return
             job = {"id": f"{tkr}-{book_side}-{oid[:8] or 'x'}-{int(now_ts)}",
                    "event": "-".join(tkr.split("-")[:-1]) or tkr,
@@ -33072,7 +33145,7 @@ class IncentiveMarketMaker:
             # rung as if the first FAIR_LEAD_MAX_POSITION of the position were
             # not there -- the series' own cap and skew judge the excess only
             skew_b = skew_a = cap_pos
-            if FAIR_LEAD_INV_QUOTE and meta.series in FAIR_LEAD_SERIES:
+            if FAIR_LEAD_INV_QUOTE and in_fair_lead_series(meta.series):
                 _xs = cap_pos - max(-FAIR_LEAD_MAX_POSITION,
                                     min(FAIR_LEAD_MAX_POSITION, cap_pos))
                 _base = series_max_position(meta.series, now_utc)
@@ -34384,7 +34457,7 @@ class IncentiveMarketMaker:
             # old rung the diff is resizing still counts at its old size here
             # (10/30 14:19:45Z: LEX's 16 ahead "blocked at 60/60")
             _fp = self.pnl.pos.get(q.ticker, 0.0)
-            if (FAIR_CLOSE_MODE == "on" and series in FAIR_LEAD_SERIES
+            if (FAIR_CLOSE_MODE == "on" and in_fair_lead_series(series)
                     and abs(_fp) >= 1 and (_fp < 0) == (q.book_side == "bid")):
                 _fc = min(abs(_fp), FAIR_LEAD_MAX_POSITION)
                 if self._fair_close_px.get(q.ticker, ("",))[0] == q.book_side:
@@ -35448,8 +35521,14 @@ class IncentiveMarketMaker:
                 while True:
                     delay = max(60, RAIN_WKND_REFRESH_SECS)
                     try:
+                        # the bot's other rain families stay theirs (AUTO
+                        # DAY SERIES reads only the rain series none claims)
                         ok, miss = rain_wknd_fair.write_fair_file(
-                            RAIN_WKND_FILE, get_json=kalshi_get)
+                            RAIN_WKND_FILE, get_json=kalshi_get,
+                            skip=lambda s: (rain_daily_city_series(s)
+                                            or rain_monthly_series(s)
+                                            or rain_period_member(s)
+                                            or bool(_RAIN_MONTHLY_NAME_RE.fullmatch(s))))
                         if last != (ok, miss):
                             log(f"{self.tag} rain-wknd refresh: {ok} markets "
                                 f"with a fair"

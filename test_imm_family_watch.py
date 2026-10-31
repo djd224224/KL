@@ -207,6 +207,21 @@ class TestGapAlert(unittest.TestCase):
         self.assertAlmostEqual(items["gap:KXA-26"]["est"], 2000 * fw.GAP_CAPTURE, places=2)
         self.assertAlmostEqual(items["new:KXNEW"]["est"], 900 * fw.GAP_CAPTURE, places=2)
 
+    def test_a_new_weather_series_is_sent_whatever_its_estimate(self):
+        # Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP', etc are
+        # always considered for auto-quoting as part of these families"
+        items = fw.gap_items(self.PROGS, {}, {"KXRAINTURKEY": 10.0, "KXTEMPNYCH": 10.0,
+                                              "KXNEWTHING": 10.0}, set())
+        self.assertTrue(items["new:KXRAINTURKEY"]["always"])
+        self.assertTrue(items["new:KXTEMPNYCH"]["always"])
+        self.assertNotIn("always", items["new:KXNEWTHING"])
+        t = 1_800_000_000.0
+        _due, st = fw.due_alerts({}, items, t)
+        due, st = fw.due_alerts(st, items, t + 31 * 60)
+        self.assertEqual(sorted(k for k, _, _ in due), ["new:KXRAINTURKEY", "new:KXTEMPNYCH"])
+        due, st = fw.due_alerts(st, items, t + 25 * 3600)
+        self.assertEqual(due, [])                                     # once, as new: is
+
     def test_due_after_30_min_over_5_dollars_once_then_daily(self):
         items = {"gap:KXA-26": {"est": 44.0, "what": "a", "fix": "f"},
                  "gap:KXB-26": {"est": 0.22, "what": "b", "fix": "f"},

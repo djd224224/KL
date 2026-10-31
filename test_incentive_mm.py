@@ -32037,6 +32037,40 @@ class TestRainDayFamily(unittest.TestCase):
             self.assertEqual(imm.rain_wknd_gate("KXRAINELECTION-03NOV26-NYC",
                                                 time.time(), 20, 30), ("", {}, None))
 
+    def test_a_rain_day_series_the_writer_found_joins_with_the_same_kit(self):
+        # Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP', etc are
+        # always considered for auto-quoting as part of these families"
+        s = "KXRAINTURKEY"
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "rain_wknd_fair.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"markets": {}, "day_series": {s: {"sample": f"{s}-26NOV26-NYC"}},
+                       "open_events": {f"{s}-26NOV26": {"sat": "2026-11-26", "days": 1}}}, f)
+        self.addCleanup(imm.SERIES_OVERRIDES.pop, s, None)
+        with mock.patch.object(imm, "RAIN_WKND_FILE", path), \
+                mock.patch.dict(imm._rain_wknd_state, {"mtime": 0.0, "day_series": {},
+                                                       "open_events": {}}):
+            self.assertFalse(imm.rain_day_series(s))
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                imm.load_rain_wknd()
+            self.assertTrue(any(f"rain day {s}: joins" in x for x in lines), lines)
+            self.assertTrue(imm.rain_day_series(s))
+            self.assertIs(imm.SERIES_OVERRIDES[s], imm.SERIES_OVERRIDES["KXRAINWKND"])
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(f"{s}-26NOV26-NYC"))
+            self.assertTrue(imm.rain_wknd_series(s))
+            self.assertTrue(imm.in_fair_lead_series(s))
+            self.assertTrue(imm.move_breaker_on(s))
+            self.assertIsNone(imm.size_test_arm(s))
+            self.assertEqual(imm.fair_model_label(s), "the rain-day fair")
+            # its cutoff day is the writer's, read from its rules
+            self.assertEqual(imm.parse_event_date(f"{s}-26NOV26"),
+                             datetime(2026, 11, 26, 5, tzinfo=timezone.utc))
+            # IMM_RAIN_DAY_AUTO=0: only the named series
+            with mock.patch.object(imm, "RAIN_DAY_AUTO", False):
+                self.assertFalse(imm.rain_day_series(s))
+                self.assertFalse(imm.in_fair_lead_series(s))
+
 
 class TestOpenRouterFairLead(unittest.TestCase):
     """Jack 2026-10-30: "Yes, add it", on "Add the OpenRouter weekly ladder to

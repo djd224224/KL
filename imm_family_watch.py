@@ -99,6 +99,10 @@ STATE_FILE = os.path.join(imm.STATUS_DIR, "family_watch_state.json")
 STATE_GRACE_HOURS = float(os.environ.get("IMM_WATCH_STATE_GRACE_H", "6"))
 
 US_ELECTION_TAGS = frozenset({"US Elections", "Other US Elections"})
+# a weather series by name (gap_items: sent on first sight, whatever its
+# estimate, 2026-10-31); KX...HIGH / LOW alone name too many other things
+WEATHER_NAME_RE = re.compile(r"RAIN|TEMP|SNOW|HURR|STORM|TORNADO|HAIL|FROST|FREEZE|"
+                             r"PRECIP|WEATHER|HEAT|LOWT|HIGHT")
 US_GENERAL_2026 = "2026-11-03"
 _US_EXP_LO = datetime(2026, 11, 3, tzinfo=timezone.utc)
 # through 2027 (Jack 2026-10-23: "Also trust markets expiring through 2027
@@ -280,6 +284,17 @@ def gap_items(progs: Dict[str, dict], gaps: dict, not_allowed: Dict[str, float],
             "est": round(dpd * GAP_CAPTURE, 2),
             "what": f"{s}: newly paying (${dpd:,.0f}/day pool) and not on the allowlist",
             "fix": "your call: enroll the family, or leave it out"}
+        if WEATHER_NAME_RE.search(s):
+            # Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP',
+            # etc are always considered for auto-quoting as part of these
+            # families". A rain series of the weekend / election-day
+            # contract joins by itself within the hour (the weekend writer's
+            # AUTO DAY SERIES); any other weather series no family takes is
+            # sent on first sight, whatever its estimate.
+            items[f"new:{s}"].update(
+                always=True,
+                fix="a weather series no family takes: your call (enroll it into "
+                    "a weather family, or leave it out)")
     return items
 
 
@@ -304,7 +319,8 @@ def due_alerts(state_items: Dict[str, dict], items: Dict[str, dict], now_ts: flo
         alerted = prev.get("alerted")
         rec = {"first": first, "alerted": alerted, "est": it["est"], "seen": now_ts}
         dark_min = (now_ts - first) / 60.0
-        if not it.get("hold") and it["est"] >= min_dpd and dark_min >= after_min and (
+        if not it.get("hold") and (it["est"] >= min_dpd or it.get("always")) \
+                and dark_min >= after_min and (
                 alerted is None or (not key.startswith("new:")
                                     and now_ts - float(alerted) >= realert_hours * 3600)):
             due.append((key, it, dark_min))
@@ -582,6 +598,11 @@ def owner_of(series: str) -> Tuple[str, bool]:
     # ... and so does the daily family every KXRAIND<CITY> (2026-10-30)
     if getattr(imm, "rain_daily_city_series", None) and imm.rain_daily_city_series(s):
         return "", False
+    # ... and the weekend family every rain-day series (2026-10-31)
+    if getattr(imm, "rain_day_series", None):
+        imm.load_rain_wknd()            # its auto members are the fair file's
+        if imm.rain_day_series(s):
+            return "", False
     named = next((why for p, why in OWNER_PREFIXES if s.startswith(p)), "")
     if any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ())):
         return named or "blocklisted in incentive_mm.py", bool(named)

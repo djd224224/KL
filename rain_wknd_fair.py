@@ -49,6 +49,19 @@ table (fit on weekends, untested on single days), 1.9 of the 2 half-days
 covered, out once the day starts. DAY_SERIES names them (the bot's
 IMM_RAIN_DAY_SERIES).
 
+AUTO DAY SERIES (Jack 2026-10-31: "make sure new markets with 'RAIN', 'TEMP',
+etc are always considered for auto-quoting as part of these families"). Every
+DAY_DISCOVER_SECS Kalshi's weather category is listed, and a series named for
+rain that no family claims (not SERIES, KXRAIN, a DAY_SERIES, or what the
+bot's `skip` owns) is read on its open markets. It joins the family when they
+are this contract (classify_day_markets): one market per city (a ticker
+ending in a city code), "total precipitation at <station> (Kxxx)" or "at
+CLIxxx", "strictly greater than 0 inches", over a named day or a span of up to
+MAX_SPAN_DAYS. Its window comes from the rules, not the ticker (whose date
+Kalshi writes either way round). The file's "day_series" names it for the
+bot; a series that is not the contract waits DAY_RETRY_SECS before it is read
+again ("day_rejected", with why).
+
 Writes RAIN_WKND_FILE for incentive_mm: markets {ticker: {p, event,
 fetched_at, ...}} (the loader's shape) plus per-event info.
 
@@ -165,6 +178,11 @@ NBS_HOURLY_MAX_BPS = float(os.environ.get("IMM_RAIN_WKND_NBS_MAX_BPS", "2000000"
 NBE_EVERY_HOURS = 12.0       # how often a new run is due (from its last one)
 NBS_EVERY_HOURS = 6.0
 EVENTS_TTL_SECS = 3600
+SERIES_CATEGORY = "Climate and Weather"
+AUTO_DAY_ENABLE = os.environ.get("IMM_RAIN_DAY_AUTO", "1") == "1"
+DAY_DISCOVER_SECS = EVENTS_TTL_SECS
+DAY_RETRY_SECS = 6 * 3600
+MAX_SPAN_DAYS = 3
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
 _MON = {m: i + 1 for i, m in enumerate(
@@ -173,6 +191,8 @@ _CODE_RE = re.compile(r"\bat (?:CLI)?([A-Z]{3})\b")
 _SPAN_RE = re.compile(r"within ([A-Z][a-z]+ \d{1,2}, \d{4}) through ([A-Z][a-z]+ \d{1,2}, \d{4})")
 _ICAO_RE = re.compile(r"\(K([A-Z]{3})\)")
 _DAY_RE = re.compile(r"\bin ([A-Z][a-z]+ \d{1,2}, \d{4}) is\b")
+_CITY_SEG_RE = re.compile(r"[A-Z]{2,5}")
+_ZERO_RE = re.compile(r"total precipitation\b.*\bstrictly greater than 0 inches", re.I)
 
 
 def _log(msg: str) -> None:
@@ -552,16 +572,18 @@ def resolve_station(code: str, now: datetime, get: Callable = _get_json,
             "auto": True, "checked_at": now.isoformat()}
 
 
-def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
+def _signed_or_public(get_json: Optional[Callable], params: dict,
+                      path: str = "/markets") -> dict:
     if get_json is not None:
         try:
-            js = get_json("/markets", dict(params))
+            js = get_json(path, dict(params))
             if isinstance(js, dict):
                 return js
         except Exception:
             pass
+    url = KALSHI_MARKETS_URL.rsplit("/markets", 1)[0] + path
     for attempt in range(3):
-        r = requests.get(KALSHI_MARKETS_URL, params=params, timeout=HTTP_TIMEOUT,
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT,
                          headers={"User-Agent": USER_AGENT})
         if (r.status_code == 429 or r.status_code >= 500) and attempt < 2:
             time.sleep(3 * (attempt + 1) ** 2)
@@ -571,24 +593,101 @@ def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
     return {}
 
 
-def fetch_events(get_json: Optional[Callable] = None) -> Dict[str, dict]:
-    """Open weekend events and the one-day series' (DAY_SERIES): event ->
-    {'sat': the window's first day (ISO), 'days': 2 or 1, 'markets': {ticker:
-    {'code': CLI code or None, 'span': [first, last] ISO days from the
-    rules, or None}}}."""
+def classify_day_markets(markets: List[dict]) -> Tuple[Optional[dict], str]:
+    """({'events': {event: [first ISO day, days]}, 'sample': ticker}, '') when
+    a series' open markets are the one-day / span contract (AUTO DAY
+    SERIES), else (None, why)."""
+    if not markets:
+        return None, "no open market"
+    events: Dict[str, list] = {}
+    for m in markets:
+        t, ev = str(m.get("ticker") or ""), str(m.get("event_ticker") or "")
+        rules = str(m.get("rules_primary") or "")
+        if not ev or not t.startswith(ev + "-") \
+                or not _CITY_SEG_RE.fullmatch(t[len(ev) + 1:]):
+            return None, f"{t}: not one market per city"
+        if not _ZERO_RE.search(rules):
+            return None, f"{t}: not 'total precipitation ... strictly greater than 0 inches'"
+        span = rules_span(rules)
+        if station_code(rules) is None or span is None:
+            return None, f"{t}: its rules name no station or no day"
+        days = (span[1] - span[0]).days + 1
+        if not 1 <= days <= MAX_SPAN_DAYS:
+            return None, f"{t}: a {days}-day window"
+        if events.setdefault(ev, [span[0].isoformat(), days]) != [span[0].isoformat(), days]:
+            return None, f"{ev}: its markets name different windows"
+    return {"events": events, "sample": str(markets[0].get("ticker") or "")}, ""
+
+
+def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] = None,
+                        skip: Optional[Callable[[str], bool]] = None
+                        ) -> Tuple[Dict[str, dict], Dict[str, dict], float]:
+    """(day series {series: {'events', 'sample', 'at'}}, rejected {series:
+    {'at', 'why'}}, listed at): the file's until DAY_DISCOVER_SECS has passed,
+    then Kalshi's weather category re-listed and each unclaimed rain series
+    read again once its last verdict is DAY_RETRY_SECS old (AUTO DAY
+    SERIES). A series whose read fails keeps its last verdict."""
+    found = dict(old.get("day_series") or {})
+    rejected = dict(old.get("day_rejected") or {})
+    at = float(old.get("day_discovered_at") or 0.0)
+    if not AUTO_DAY_ENABLE:
+        return {}, rejected, at
+    if now_ts - at < DAY_DISCOVER_SECS:
+        return found, rejected, at
+    js = _signed_or_public(get_json, {"category": SERIES_CATEGORY}, path="/series")
+    names = sorted({str(s.get("ticker") or "") for s in js.get("series") or []})
     out: Dict[str, dict] = {}
-    for series in (SERIES,) + DAY_SERIES:
-        days = 2 if series == SERIES else 1
+    for s in names:
+        if "RAIN" not in s or s in (SERIES, "KXRAIN") + DAY_SERIES or (skip and skip(s)):
+            continue
+        last = found.get(s) or rejected.get(s) or {}
+        if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS:
+            if s in found:
+                out[s] = found[s]
+            continue
+        try:
+            mj = _signed_or_public(get_json, {"series_ticker": s, "status": "open",
+                                              "limit": 200})
+        except Exception:
+            if s in found:
+                out[s] = found[s]
+            continue
+        got, why = classify_day_markets(mj.get("markets") or [])
+        if got is None:
+            rejected[s] = {"at": now_ts, "why": why}
+            continue
+        rejected.pop(s, None)
+        out[s] = dict(got, at=now_ts)
+        if s not in found:
+            _log(f"day series {s} joins the family: {len(got['events'])} event(s), "
+                 f"e.g. {got['sample']}")
+    return out, rejected, now_ts
+
+
+def fetch_events(get_json: Optional[Callable] = None,
+                 day_series: Optional[Dict[str, dict]] = None) -> Dict[str, dict]:
+    """Open weekend events, the one-day series' (DAY_SERIES) and the auto
+    day series' (`day_series`, AUTO DAY SERIES): event -> {'sat': the
+    window's first day (ISO), 'days': its length, 'markets': {ticker:
+    {'code': CLI code or None, 'span': [first, last] ISO days from the
+    rules, or None}}}. An auto series' window is its rules'."""
+    out: Dict[str, dict] = {}
+    for series in (SERIES,) + DAY_SERIES + tuple(sorted(day_series or ())):
         js = _signed_or_public(get_json, {"series_ticker": series, "status": "open",
                                           "limit": 200})
         for m in js.get("markets") or []:
             ev = str(m.get("event_ticker") or "")
             t = str(m.get("ticker") or "")
-            first = event_saturday(ev) if days == 2 else event_day(ev)
-            if not ev.startswith(series + "-") or not t or first is None:
-                continue
             rules = str(m.get("rules_primary") or "")
             span = rules_span(rules)
+            if series == SERIES:
+                first, days = event_saturday(ev), 2
+            elif series in DAY_SERIES:
+                first, days = event_day(ev), 1
+            else:
+                first, days = (span[0], (span[1] - span[0]).days + 1) if span else (None, 0)
+            if not ev.startswith(series + "-") or not t or first is None:
+                continue
             e = out.setdefault(ev, {"sat": first.isoformat(), "days": days, "markets": {}})
             e["markets"][t] = {"code": station_code(rules),
                                "span": [d.isoformat() for d in span] if span else None}
@@ -610,7 +709,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     nbe_fn: Callable = fetch_nbe,
                     resolve_fn: Optional[Callable] = None,
                     nbs_fn: Optional[Callable] = None,
-                    nbs_hourly_fn: Optional[Callable] = None) -> Tuple[int, int]:
+                    nbs_hourly_fn: Optional[Callable] = None,
+                    skip: Optional[Callable[[str], bool]] = None) -> Tuple[int, int]:
     """Build and atomically write the weekend-rain fair file; returns
     (markets with a fair, open markets without one). Kalshi's open events
     are re-read hourly, and every pass while none is open (the Monday gap
@@ -620,19 +720,31 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     (nbs_hourly_fn, default fetch_nbs_hourly), and a failed read falls back to
     the file's copy (still subject to each source's age limit): THE
     COMPOSITE. A code no STATIONS row maps is auto-mapped (resolve_fn,
-    default resolve_station; see AUTO-MAPPED STATIONS)."""
+    default resolve_station; see AUTO-MAPPED STATIONS). A rain series no
+    family claims joins on its contract (AUTO DAY SERIES; `skip`: the
+    bot's own rain families); a pass that lists the category re-reads the
+    events."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
     nbe_cache = old.get("nbe") or {}
     ev_cache = old.get("open_events") or {}
     events_at = float(old.get("events_at") or 0.0)
+    day_series, day_rejected, day_at = dict(old.get("day_series") or {}), \
+        dict(old.get("day_rejected") or {}), float(old.get("day_discovered_at") or 0.0)
+    listed = False
     if events is None:
-        if ev_cache and ts - events_at < EVENTS_TTL_SECS:
+        try:
+            day_series, day_rejected, day_at = discover_day_series(old, ts, get_json, skip)
+            listed = day_at == ts
+        except Exception as ex:
+            _log(f"weather category read failed ({type(ex).__name__}: {str(ex)[:120]}); "
+                 f"the file's day series stand")
+        if ev_cache and ts - events_at < EVENTS_TTL_SECS and not listed:
             events = ev_cache
         else:
             try:
-                events = fetch_events(get_json)
+                events = fetch_events(get_json, day_series)
                 events_at = ts
             except Exception:
                 if not ev_cache:
@@ -781,6 +893,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                               "index": h_index, "runs": _runs(h_runs),
                               "searched": sorted(h_searched)},
                "auto_stations": auto, "unmapped": unmapped,
+               "day_series": day_series, "day_rejected": day_rejected,
+               "day_discovered_at": day_at,
                "model": {"w": W, "recal": RECAL, "min_coverage": MIN_COVERAGE,
                          "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS,
                          "nbs_w_hourly": NBS_W_HOURLY,

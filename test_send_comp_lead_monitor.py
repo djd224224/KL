@@ -208,6 +208,9 @@ class TestFairLeads(unittest.TestCase):
         # the election-day rain joined 2026-10-31
         with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXRAINELECTION", "KXRAINWKND")):
             self.assertEqual(cm._fair_names({}), "weekend rain, election-day rain")
+            # ...and a rain-day series the weekend writer found itself
+            self.assertEqual(cm._fair_names({("KXRAINTURKEY-26NOV26-NYC", "bid"): {}}),
+                             "weekend rain, election-day rain, rain-day")
 
     def test_fair_leads_parse_report_apart_and_never_watch(self):
         a, b = cm.day_window(date(2026, 10, 29))

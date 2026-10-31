@@ -968,6 +968,9 @@ def _fair_names(fair: dict) -> str:
     s = set(imm.FAIR_LEAD_SERIES) | {t.split("-")[0] for t, _side in fair}
     names = [n for n, hit in (("weekend rain", "KXRAINWKND" in s),
                               ("election-day rain", bool(s & set(imm.RAIN_DAY_SERIES))),
+                              ("rain-day", any(x.startswith("KXRAIN") and x not in (
+                                  "KXRAIN", "KXRAINWKND") and x not in imm.RAIN_DAY_SERIES
+                                               for x in s)),
                               ("Vercel", bool(s & set(imm.VERCEL_SERIES))),
                               ("OpenRouter weekly", "KXTOKENUSE" in s)) if hit]
     return ", ".join(names) or "none"
