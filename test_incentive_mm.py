@@ -71,6 +71,11 @@ _YIELD_CODE_DEFAULT = (imm.YIELD_SIZE_MULT, imm.YIELD_SIZE_MULT_FROM, imm.YIELD_
                        imm.YIELD_SIZE_EXIT_FRAC)
 imm.EVENING_SIZE_MULTS = {}
 imm.YIELD_SIZE_MULT = 1.0
+# ...and Saturday morning's quiet hours at x4 (a dated code default of
+# 2026-10-30, on a window the suite only sets by hand). TestSaturdayMorningX4
+# arms it explicitly.
+_SAT_AM_CODE_DEFAULT = (imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM)
+imm.SAT_QUIET_HOUR_MULT = 0.0
 # ...and the NFL player-prop gate (2026-10-03), default ON and fail-closed:
 # no refresher thread runs under test, so every NFL ladder / escalator would
 # stand aside and the ladder fixtures (sub-penny join, full unwind, the
@@ -11180,6 +11185,102 @@ class TestSaturdaySizeMult(unittest.TestCase):
         self.assertLessEqual(
             3.0 * imm.capped_ref_mult(50, 40, "bid", hour_mult=3.0),
             max(3.0, imm.TOTAL_SIZE_MULT_CAP))
+
+
+class TestSaturdayMorningX4(unittest.TestCase):
+    """Jack 2026-10-30: "raise multiplier to 4x on overnight / saturday AM,
+    instead of the usual 3x" -> "Saturday AM only": the global window's
+    morning hours take SAT_QUIET_HOUR_MULT on Saturdays from 2026-10-31, the
+    Saturday multiplier on top; every other morning keeps x3. 10/31 is a
+    Saturday in EDT, 11/07 one in EST (DST ends 11/01)."""
+
+    def setUp(self):
+        self._saved = {k: getattr(imm, k) for k in (
+            "SAT_QUIET_HOUR_MULT", "SAT_QUIET_HOUR_MULT_FROM", "HOUR_SIZE_MULTS",
+            "HOUR_SIZE_MULTS_NEXT", "HOUR_SIZE_MULT_FROM", "EVENING_SIZE_MULTS",
+            "EVENING_SIZE_MULT_FROM", "SAT_SIZE_MULT", "SAT_SIZE_MULT_GATED",
+            "QUIET_DAILY_SERIES", "QUIET_HOURS_OFF_SERIES", "HOUR_MULT_EXCLUDE")}
+        self._gate = dict(imm.SAT_GATE_STATE)
+        # the launcher's window and Saturday, the code's evening window
+        imm.HOUR_SIZE_MULTS = imm._parse_hour_mults("0-9:2.0")
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0")
+        imm.HOUR_SIZE_MULT_FROM = datetime(2026, 10, 5).date()
+        imm.EVENING_SIZE_MULTS = dict(_EVENING_CODE_DEFAULT[0])
+        imm.EVENING_SIZE_MULT_FROM = _EVENING_CODE_DEFAULT[1]
+        imm.SAT_SIZE_MULT = 2.0
+        imm.SAT_SIZE_MULT_GATED = 0.0
+        imm.SAT_GATE_STATE.update(mtime=0.0, verdict="", mult=0.0, effective_from=None)
+        imm.HOUR_MULT_EXCLUDE = ("KXTEMP",)
+        imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM = _SAT_AM_CODE_DEFAULT
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(imm, k, v)
+        imm.SAT_GATE_STATE.clear()
+        imm.SAT_GATE_STATE.update(self._gate)
+
+    @staticmethod
+    def et(y, mo, d, h, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_code_default(self):
+        self.assertEqual(_SAT_AM_CODE_DEFAULT, (4.0, datetime(2026, 10, 31).date()))
+
+    def test_saturday_morning_runs_x4_under_the_saturday_step(self):
+        s = "KXGOOD"
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 30, 23, 59)), 1.5)   # Fri evening
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 31, 0)), 8.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 31, 8, 59)), 8.0)
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 31, 9)), 2.0)        # Sat day
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 10, 31, 18)), 3.0)       # Sat evening
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 11, 1, 3)), 3.0)         # Sun: x3
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 11, 3, 3)), 3.0)         # Tue: x3
+        self.assertEqual(imm.hour_size_mult(s, self.et(2026, 11, 7, 3)), 8.0)         # EST
+        # 20 lots -> 160 a side, the ladder's own rounding
+        self.assertEqual(imm.hour_scaled_levels(s, self.et(2026, 10, 31, 3)),
+                         [(t, int(sz * 8 + 0.5)) for t, sz in imm.series_levels(s)])
+        # a Saturday morning: 9h at x8, then 9h x2 and 6h x3
+        prof = dict(imm.size_mult_profile(s, self.et(2026, 10, 31, 0), 1.0))
+        self.assertAlmostEqual(prof[8.0], 9 / 24, places=9)
+        self.assertAlmostEqual(prof[2.0], 9 / 24, places=9)
+        self.assertAlmostEqual(prof[3.0], 6 / 24, places=9)
+
+    def test_past_saturdays_keep_their_window(self):
+        self.assertEqual(imm.global_hour_mults(datetime(2026, 10, 24).date()),
+                         imm.HOUR_SIZE_MULTS_NEXT)
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 24, 3)), 6.0)
+        self.assertEqual(imm.global_hour_mults(datetime(2026, 10, 31).date()),
+                         {h: 4.0 for h in range(9)})
+
+    def test_who_takes_it(self):
+        sat_3am = self.et(2026, 10, 31, 3)
+        imm.QUIET_DAILY_SERIES = frozenset({"KXQDAILY"})
+        imm.QUIET_HOURS_OFF_SERIES = frozenset({"KXQUIETOFF"})
+        with mock.patch.object(imm, "is_daily_series", lambda s: s in ("KXQDAILY", "KXPDAILY")):
+            # a daily that keeps the quiet hours: x4, never the Saturday step
+            self.assertEqual(imm.hour_size_mult("KXQDAILY", sat_3am), 4.0)
+            self.assertEqual(imm.hour_size_mult("KXPDAILY", sat_3am), 1.0)       # other dailies
+            # off the quiet hours: the Saturday step only
+            self.assertEqual(imm.hour_size_mult("KXQUIETOFF", sat_3am), 2.0)
+        self.assertEqual(imm.hour_size_mult("KXTEMPNYCH", sat_3am), 1.0)          # daily floor
+        # the sports ladders keep their own flat value
+        with mock.patch.object(imm, "SPORTS_LADDER_HOUR_MULT", 5.0):
+            self.assertEqual(imm._hour_window_mult("KXNFLLADDERREC", sat_3am), 5.0)
+
+    def test_only_the_morning_hours_of_the_window(self):
+        imm.HOUR_SIZE_MULTS_NEXT = imm._parse_hour_mults("0-8:3.0,19:2.0")
+        self.assertEqual(imm.global_hour_mults(datetime(2026, 10, 31).date()),
+                         {**{h: 4.0 for h in range(9)}, 19: 2.0})
+
+    def test_off_switch(self):
+        for mult, frm in ((0.0, datetime(2026, 10, 31).date()), (4.0, None)):
+            with self.subTest(mult=mult, frm=frm):
+                imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM = mult, frm
+                self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 31, 3)), 6.0)
+        # no global window at all: nothing to raise
+        imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM = _SAT_AM_CODE_DEFAULT
+        imm.HOUR_SIZE_MULTS, imm.HOUR_SIZE_MULTS_NEXT = {}, {}
+        self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 31, 3)), 2.0)
 
 
 class TestSaturdayGatedStepUp(unittest.TestCase):

@@ -1528,16 +1528,43 @@ def _et_day_start_ts(day) -> Optional[float]:
 HOUR_SIZE_MULTS_NEXT = _parse_hour_mults(os.environ.get("IMM_HOUR_SIZE_MULT_NEXT", ""))
 HOUR_SIZE_MULT_FROM = _env_et_day("IMM_HOUR_SIZE_MULT_FROM")
 
+# SATURDAY MORNING x4 (Jack 2026-10-30: "raise multiplier to 4x on overnight /
+# saturday AM, instead of the usual 3x", then "Saturday AM only"). On a
+# Saturday ET day from SAT_QUIET_HOUR_MULT_FROM on, the global window's
+# morning hours (0-8 ET, the quiet hours) take SAT_QUIET_HOUR_MULT instead of
+# their own x3; weekday and Sunday mornings keep x3. The Saturday multiplier
+# still multiplies on top in hour_size_mult, so a long-dated series rests x8
+# there (was x6): 160 lots on the launcher's 20, which the 150 per-market cap
+# trims to 150 a side (clamp_side_max_to_position_cap), the size test's half
+# x12 (240, trimmed to its 225 cap). TOTAL_SIZE_MULT_CAP leaves the deep-
+# reference size at x1 at both x6 and x8 (5/6 and 5/8 are under 1), so the
+# raise reaches deep books in full up to the per-market cap. Daily series that
+# keep the quiet hours (QUIET_DAILY_SERIES, period rain) go x3 -> x4 without
+# the Saturday step; QUIET_HOURS_OFF_SERIES, the sports ladders' flat value
+# and the per-series windows are untouched. Inside global_hour_mults, so the
+# floor projection's hour walk, imm_saturday_tracker's blocks and the
+# dashboard read the same x4; dated so past Saturdays keep the window they
+# ran. IMM_SAT_QUIET_HOUR_MULT=0 = off (the window's own value).
+SAT_QUIET_HOUR_MULT = _env_float("IMM_SAT_QUIET_HOUR_MULT", 4.0)
+SAT_QUIET_HOUR_MULT_FROM = _env_et_day("IMM_SAT_QUIET_HOUR_MULT_FROM", "2026-10-31")
+
 
 def global_hour_mults(et_day) -> Dict[int, float]:
     """The GLOBAL ET-hour window {hour: mult} in force on ET calendar day
     `et_day`: IMM_HOUR_SIZE_MULT_NEXT from IMM_HOUR_SIZE_MULT_FROM on, else
-    IMM_HOUR_SIZE_MULT. Per-series windows, exclusions and the Saturday
-    multiplier are applied on top by _hour_window_mult / hour_size_mult."""
+    IMM_HOUR_SIZE_MULT -- with its morning hours at SAT_QUIET_HOUR_MULT on a
+    Saturday from SAT_QUIET_HOUR_MULT_FROM on. Per-series windows, exclusions
+    and the Saturday multiplier are applied on top by _hour_window_mult /
+    hour_size_mult."""
     if HOUR_SIZE_MULTS_NEXT and HOUR_SIZE_MULT_FROM is not None \
             and et_day >= HOUR_SIZE_MULT_FROM:
-        return HOUR_SIZE_MULTS_NEXT
-    return HOUR_SIZE_MULTS
+        mults = HOUR_SIZE_MULTS_NEXT
+    else:
+        mults = HOUR_SIZE_MULTS
+    if mults and SAT_QUIET_HOUR_MULT > 0 and et_day.weekday() == 5 \
+            and SAT_QUIET_HOUR_MULT_FROM is not None and et_day >= SAT_QUIET_HOUR_MULT_FROM:
+        return {h: (SAT_QUIET_HOUR_MULT if h < 12 else m) for h, m in mults.items()}
+    return mults
 
 
 # EVENING WINDOW (Jack 2026-10-02, "1 and 2 for monday", from the multiplier
@@ -11170,6 +11197,8 @@ _CONFIG_CODE_KNOBS = (
     # gated Saturday step-up (2026-09-26); the verdict itself is a runtime
     # file, so the cycle log's hour_mult is where a PASS shows
     "SAT_SIZE_MULT_GATED",
+    # ...and Saturday morning's quiet hours at x4 (2026-10-30)
+    "SAT_QUIET_HOUR_MULT", "SAT_QUIET_HOUR_MULT_FROM",
     # evening window + yield size mode (2026-10-05, code defaults)
     "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "YIELD_SIZE_MULT",
     "YIELD_SIZE_MULT_FROM", "YIELD_SIZE_MIN", "YIELD_SIZE_EXIT_FRAC",
@@ -37094,6 +37123,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             + (f"; extra excluded prefixes: {','.join(SAT_MULT_EXCLUDE)}"
                if SAT_MULT_EXCLUDE else ""))
         log(f"[IMM] Saturday gate: {sat_gate_summary()}")
+    if SAT_QUIET_HOUR_MULT > 0 and SAT_QUIET_HOUR_MULT_FROM is not None:
+        log(f"[IMM] Saturday morning: the global window's AM hours at "
+            f"x{SAT_QUIET_HOUR_MULT:g} from {SAT_QUIET_HOUR_MULT_FROM.isoformat()} "
+            f"(other mornings keep theirs; the Saturday multiplier on top for "
+            f"long-dated series)")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):
