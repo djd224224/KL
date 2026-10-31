@@ -39,6 +39,16 @@ older run is not a worse input than its lead says: the lead is measured
 from the run, so a run the IEM is late with is read as the longer forecast
 it is.
 
+ONE-DAY MARKETS (Jack 2026-10-31: "KXRAINELECTION should be quoted", "in
+same way as weekend rain family"): KXRAINELECTION-03NOV26-<CODE> ("If the
+total precipitation at San Diego (KSAN) in San Diego in November 3, 2026 is
+strictly greater than 0 inches", the same Weather Company source; the
+ticker writes its day FIRST) is priced the same way over its one climate day,
+[00:00, 24:00) local standard time: its two half-days, the same W and lead
+table (fit on weekends, untested on single days), 1.9 of the 2 half-days
+covered, out once the day starts. DAY_SERIES names them (the bot's
+IMM_RAIN_DAY_SERIES).
+
 Writes RAIN_WKND_FILE for incentive_mm: markets {ticker: {p, event,
 fetched_at, ...}} (the loader's shape) plus per-event info.
 
@@ -61,6 +71,8 @@ import requests
 STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 SERIES = "KXRAINWKND"
+DAY_SERIES = tuple(s.strip() for s in os.environ.get(
+    "IMM_RAIN_DAY_SERIES", "KXRAINELECTION").split(",") if s.strip())
 KALSHI_MARKETS_URL = os.environ.get(
     "IMM_RAIN_WKND_MARKETS_URL", "https://api.elections.kalshi.com/trade-api/v2/markets")
 NBE_URL = os.environ.get("IMM_RAIN_WKND_NBE_URL",
@@ -107,7 +119,7 @@ W = 0.85
 # (lead upper bound, hours) -> logistic recalibration (a, b)
 RECAL = ((24, -0.06, 1.12), (48, 0.01, 1.11), (72, 0.17, 1.12),
          (96, 0.24, 1.08), (1e9, 0.20, 1.10))
-MIN_COVERAGE = 3.9           # of the window's 4 half-days
+MIN_COVERAGE = 3.9           # of the window's 4 half-days (a one-day window: 1.9 of 2)
 MIN_PERIODS = 10             # a run read back with fewer rows is a failed read
 NBE_LAG_HOURS = 3.0          # a run is usable ~3h after its nominal time
 NBE_MAX_AGE_HOURS = float(os.environ.get("IMM_RAIN_WKND_NBE_MAX_AGE_HOURS", "30"))
@@ -159,6 +171,8 @@ _MON = {m: i + 1 for i, m in enumerate(
     "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split())}
 _CODE_RE = re.compile(r"\bat (?:CLI)?([A-Z]{3})\b")
 _SPAN_RE = re.compile(r"within ([A-Z][a-z]+ \d{1,2}, \d{4}) through ([A-Z][a-z]+ \d{1,2}, \d{4})")
+_ICAO_RE = re.compile(r"\(K([A-Z]{3})\)")
+_DAY_RE = re.compile(r"\bin ([A-Z][a-z]+ \d{1,2}, \d{4}) is\b")
 
 
 def _log(msg: str) -> None:
@@ -167,19 +181,25 @@ def _log(msg: str) -> None:
 
 
 def station_code(rules: str) -> Optional[str]:
-    """'... at CLIDJT in West Palm Beach ...' -> 'DJT'; 'at CLL' -> 'CLL'."""
-    m = _CODE_RE.search(rules or "")
+    """'... at CLIDJT in West Palm Beach ...' -> 'DJT'; 'at CLL' -> 'CLL';
+    a one-day market's 'at West Palm Beach (KDJT) ...' -> 'DJT'."""
+    m = _CODE_RE.search(rules or "") or _ICAO_RE.search(rules or "")
     return m.group(1) if m else None
 
 
 def rules_span(rules: str) -> Optional[Tuple[date, date]]:
     """'... on any day within October 10, 2026 through October 11, 2026 ...'
-    -> (date(2026, 10, 10), date(2026, 10, 11)), else None."""
+    -> (date(2026, 10, 10), date(2026, 10, 11)); a one-day market's '... in
+    November 3, 2026 is ...' -> that day twice; else None."""
     m = _SPAN_RE.search(rules or "")
-    if not m:
+    days = m.groups() if m else None
+    if days is None:
+        m = _DAY_RE.search(rules or "")
+        days = (m.group(1), m.group(1)) if m else None
+    if days is None:
         return None
     try:
-        a, b = (datetime.strptime(x, "%B %d, %Y").date() for x in m.groups())
+        a, b = (datetime.strptime(x, "%B %d, %Y").date() for x in days)
     except ValueError:
         return None
     return a, b
@@ -198,10 +218,24 @@ def event_saturday(event_ticker: str) -> Optional[date]:
     return d if d.weekday() == 5 else None
 
 
-def window(sat: date, lst_hours: int) -> Tuple[datetime, datetime]:
-    """[Sat 00:00, Mon 00:00) local standard time, in UTC."""
+def event_day(event_ticker: str) -> Optional[date]:
+    """A one-day series' ticker day, written first: 'KXRAINELECTION-03NOV26'
+    -> date(2026, 11, 3)."""
+    parts = (event_ticker or "").split("-")
+    if len(parts) < 2 or len(parts[1]) != 7:
+        return None
+    seg = parts[1]
+    try:
+        return date(2000 + int(seg[5:7]), _MON[seg[2:5]], int(seg[:2]))
+    except (KeyError, ValueError):
+        return None
+
+
+def window(sat: date, lst_hours: int, days: int = 2) -> Tuple[datetime, datetime]:
+    """[Sat 00:00, Mon 00:00) local standard time, in UTC; `days` from `sat`
+    for a one-day market (its [00:00, 24:00))."""
     s = datetime(sat.year, sat.month, sat.day, tzinfo=timezone.utc) + timedelta(hours=lst_hours)
-    return s, s + timedelta(hours=48)
+    return s, s + timedelta(hours=24 * days)
 
 
 def _logit(p: float) -> float:
@@ -226,7 +260,8 @@ def weekend_p(periods: List[Tuple[datetime, float]], ws: datetime, we: datetime
         if ov > 0:
             pers.append((ov, p))
     cov = sum(f for f, _ in pers)
-    if not pers or cov < MIN_COVERAGE:
+    half_days = round((we - ws).total_seconds() / 43200.0)
+    if not pers or cov < MIN_COVERAGE - (4 - half_days):
         return None
     lp = sum(f * math.log(max(1.0 - min(p, 0.995), 1e-6)) for f, p in pers)
     big = [p for f, p in pers if f >= 0.5]
@@ -236,12 +271,12 @@ def weekend_p(periods: List[Tuple[datetime, float]], ws: datetime, we: datetime
 
 def market_fair(periods: List[Tuple[datetime, float]], runtime: datetime,
                 sat: date, lst_hours: int,
-                lag_hours: float = NBE_LAG_HOURS) -> Optional[dict]:
-    """{'p', 'p_raw', 'lead_h', 'coverage'} for one city's weekend, else None
-    (a weekend that has started, a lead past the fit, or periods that do not
-    cover it). The lead runs from `runtime` + `lag_hours` (the composite's:
-    its freshest run's)."""
-    ws, we = window(sat, lst_hours)
+                lag_hours: float = NBE_LAG_HOURS, days: int = 2) -> Optional[dict]:
+    """{'p', 'p_raw', 'lead_h', 'coverage'} for one city's weekend (or its
+    one day: `days`), else None (a window that has started, a lead past the
+    fit, or periods that do not cover it). The lead runs from `runtime` +
+    `lag_hours` (the composite's: its freshest run's)."""
+    ws, we = window(sat, lst_hours, days)
     lead = (ws - (runtime + timedelta(hours=lag_hours))).total_seconds() / 3600.0
     if lead < 0 or lead > MAX_LEAD_HOURS:
         return None
@@ -537,23 +572,26 @@ def _signed_or_public(get_json: Optional[Callable], params: dict) -> dict:
 
 
 def fetch_events(get_json: Optional[Callable] = None) -> Dict[str, dict]:
-    """Open weekend events: event -> {'sat': ISO date, 'markets': {ticker:
+    """Open weekend events and the one-day series' (DAY_SERIES): event ->
+    {'sat': the window's first day (ISO), 'days': 2 or 1, 'markets': {ticker:
     {'code': CLI code or None, 'span': [first, last] ISO days from the
     rules, or None}}}."""
     out: Dict[str, dict] = {}
-    js = _signed_or_public(get_json, {"series_ticker": SERIES, "status": "open",
-                                      "limit": 200})
-    for m in js.get("markets") or []:
-        ev = str(m.get("event_ticker") or "")
-        t = str(m.get("ticker") or "")
-        sat = event_saturday(ev)
-        if not ev or not t or sat is None:
-            continue
-        rules = str(m.get("rules_primary") or "")
-        span = rules_span(rules)
-        e = out.setdefault(ev, {"sat": sat.isoformat(), "markets": {}})
-        e["markets"][t] = {"code": station_code(rules),
-                           "span": [d.isoformat() for d in span] if span else None}
+    for series in (SERIES,) + DAY_SERIES:
+        days = 2 if series == SERIES else 1
+        js = _signed_or_public(get_json, {"series_ticker": series, "status": "open",
+                                          "limit": 200})
+        for m in js.get("markets") or []:
+            ev = str(m.get("event_ticker") or "")
+            t = str(m.get("ticker") or "")
+            first = event_saturday(ev) if days == 2 else event_day(ev)
+            if not ev.startswith(series + "-") or not t or first is None:
+                continue
+            rules = str(m.get("rules_primary") or "")
+            span = rules_span(rules)
+            e = out.setdefault(ev, {"sat": first.isoformat(), "days": days, "markets": {}})
+            e["markets"][t] = {"code": station_code(rules),
+                               "span": [d.isoformat() for d in span] if span else None}
     return out
 
 
@@ -627,9 +665,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     markets: Dict[str, dict] = {}
     missing: Dict[str, str] = {}
     # 1. the markets to price, and the stations they need
-    todo: List[Tuple[str, str, date, str, int]] = []
+    todo: List[Tuple[str, str, date, str, int, int]] = []
     for ev, e in events.items():
         sat = date.fromisoformat(e["sat"])
+        days = int(e.get("days") or 2)
         for t, mk in sorted(e["markets"].items()):
             code, span = mk.get("code"), mk.get("span")
             st = STATIONS.get(code or "")
@@ -639,15 +678,16 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                 why = (unmapped.get(code or "") or {}).get("why")
                 missing[t] = f"unmapped station {code}" + (f" ({why})" if why else "")
                 continue
-            if span and span != [sat.isoformat(), (sat + timedelta(days=1)).isoformat()]:
-                missing[t] = f"rules window {span[0]}..{span[1]} is not the weekend"
+            if span and span != [sat.isoformat(), (sat + timedelta(days=days - 1)).isoformat()]:
+                missing[t] = (f"rules window {span[0]}..{span[1]} is not the "
+                              + ("weekend" if days == 2 else "ticker's day"))
                 continue
             sid, lst = st
-            if now >= window(sat, lst)[0]:
-                missing[t] = "weekend started"
+            if now >= window(sat, lst, days)[0]:
+                missing[t] = "weekend started" if days == 2 else "the day started"
                 continue
-            todo.append((t, ev, sat, sid, lst))
-    sids = sorted({sid for _t, _e, _s, sid, _l in todo})
+            todo.append((t, ev, sat, sid, lst, days))
+    sids = sorted({sid for _t, _e, _s, sid, _l, _d in todo})
     # 2. each source once per station: the NBE and the 6-hourly NBS from the
     # IEM when a newer run is due, the newest hourly NBS cycle from NOAA
     nbe: Dict[str, Tuple[Optional[datetime], list]] = {}
@@ -686,7 +726,7 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                  f"the file's cycle stands in while young enough")
     # 3. each market's composite: the NBS periods (hourly and 6-hourly blended
     # where both reach), the NBE for the rest, the lead off the freshest run
-    for t, ev, sat, sid, lst in todo:
+    for t, ev, sat, sid, lst, days in todo:
         srcs = []
         e_rt, e_per = nbe.get(sid) or (None, [])
         if e_rt is not None and (ts - e_rt.timestamp()) / 3600.0 <= NBE_MAX_AGE_HOURS:
@@ -712,10 +752,11 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                 merged[ft] = hd[ft] if ft in hd else sd[ft]
         # the freshest run: the newest runtime (a tie, the one posted soonest)
         _k, f_rt, f_lag, _p = max(srcs, key=lambda s: (s[1], -s[2]))
-        f = market_fair(sorted(merged.items()), f_rt, sat, lst, lag_hours=f_lag)
+        f = market_fair(sorted(merged.items()), f_rt, sat, lst, lag_hours=f_lag, days=days)
         if f is None:
-            missing[t] = ("lead past the fit or periods short of the weekend" if "E" in by
-                          else "no fresh NBE run, and the NBS alone does not cover the weekend")
+            span = "the weekend" if days == 2 else "the day"
+            missing[t] = (f"lead past the fit or periods short of {span}" if "E" in by
+                          else f"no fresh NBE run, and the NBS alone does not cover {span}")
             continue
         markets[t] = dict(f, event=ev, station=sid, run=f_rt.isoformat(),
                           fetched_at=stamp, src="+".join(k for k in ("H", "S", "E") if k in by),

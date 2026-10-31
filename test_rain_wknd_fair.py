@@ -63,6 +63,26 @@ class TestParsing(unittest.TestCase):
                          (date(2026, 10, 17), date(2026, 10, 18)))
         self.assertIsNone(r.rules_span("within soon through later"))
 
+    def test_a_one_day_markets_station_day_and_window(self):
+        # Jack 2026-10-31: "KXRAINELECTION should be quoted", "in same way as
+        # weekend rain family"
+        rules = ("If the total precipitation at {name} (K{code}) in {city} in "
+                 "November 3, 2026 is strictly greater than 0 inches, then the "
+                 "market resolves to Yes.")
+        sd = rules.format(name="San Diego", code="SAN", city="San Diego")
+        self.assertEqual(r.station_code(sd), "SAN")
+        self.assertEqual(r.station_code(rules.format(name="Houston (Hobby)", code="HOU",
+                                                     city="Houston")), "HOU")
+        self.assertEqual(r.rules_span(sd), (date(2026, 11, 3), date(2026, 11, 3)))
+        # the ticker's day comes first
+        self.assertEqual(r.event_day("KXRAINELECTION-03NOV26"), date(2026, 11, 3))
+        self.assertIsNone(r.event_day("KXRAINELECTION-3NOV26"))
+        self.assertIsNone(r.event_day("KXRAINELECTION-03XYZ26"))
+        # one climate day, local standard time
+        self.assertEqual(r.window(date(2026, 11, 3), 5, 1),
+                         (datetime(2026, 11, 3, 5, tzinfo=UTC),
+                          datetime(2026, 11, 4, 5, tzinfo=UTC)))
+
     def test_event_saturday(self):
         self.assertEqual(r.event_saturday("KXRAINWKND-26OCT17"), SAT)
         self.assertIsNone(r.event_saturday("KXRAINWKND-26OCT18"))     # a Sunday
@@ -205,10 +225,55 @@ class TestWrite(unittest.TestCase):
             seen.append((path, params["series_ticker"], params["status"]))
             return js
         ev = r.fetch_events(get_json)
-        self.assertEqual(seen, [("/markets", "KXRAINWKND", "open")])
+        self.assertEqual(seen, [("/markets", "KXRAINWKND", "open"),
+                                ("/markets", "KXRAINELECTION", "open")])
         self.assertEqual(list(ev), ["KXRAINWKND-26OCT17"])       # not a Saturday: out
         self.assertEqual(ev["KXRAINWKND-26OCT17"]["markets"]["KXRAINWKND-26OCT17-WPB"],
                          {"code": "DJT", "span": ["2026-10-17", "2026-10-18"]})
+        self.assertEqual(ev["KXRAINWKND-26OCT17"]["days"], 2)
+
+    def test_fetch_events_reads_the_one_day_series_too(self):
+        rules = ("If the total precipitation at Houston (Hobby) (KHOU) in Houston in "
+                 "November 3, 2026 is strictly greater than 0 inches, then the market "
+                 "resolves to Yes.")
+        by = {"KXRAINWKND": {"markets": []},
+              "KXRAINELECTION": {"markets": [
+                  {"ticker": "KXRAINELECTION-03NOV26-HOU",
+                   "event_ticker": "KXRAINELECTION-03NOV26", "rules_primary": rules}]}}
+        ev = r.fetch_events(lambda path, params: by[params["series_ticker"]])
+        self.assertEqual(ev, {"KXRAINELECTION-03NOV26": {
+            "sat": "2026-11-03", "days": 1, "markets": {"KXRAINELECTION-03NOV26-HOU": {
+                "code": "HOU", "span": ["2026-11-03", "2026-11-03"]}}}})
+
+    def test_a_one_day_market_prices_its_day_and_stops_at_its_start(self):
+        now, run = datetime(2026, 11, 1, 6, tzinfo=UTC), datetime(2026, 11, 1, 0, tzinfo=UTC)
+        day = ["2026-11-03", "2026-11-03"]
+        events = {"KXRAINELECTION-03NOV26": {"sat": "2026-11-03", "days": 1, "markets": {
+            "KXRAINELECTION-03NOV26-NYC": {"code": "NYC", "span": day},
+            "KXRAINELECTION-03NOV26-HOU": {"code": "HOU", "span": day},
+            "KXRAINELECTION-03NOV26-BAD": {"code": "BOS",
+                                           "span": ["2026-11-03", "2026-11-04"]}}}}
+        nbe = lambda sid: (run, periods(run, [0.3] * 20))
+        ok, miss = r.write_fair_file(self.path, now=now, events=events, nbe_fn=nbe)
+        self.assertEqual((ok, miss), (2, 1))
+        with open(self.path, encoding="utf-8") as f:
+            d = json.load(f)
+        m = d["markets"]["KXRAINELECTION-03NOV26-NYC"]
+        one = r.market_fair(periods(run, [0.3] * 20), run, date(2026, 11, 3), 5, days=1)
+        self.assertEqual((m["p"], m["coverage"], m["station"]), (one["p"], 2.0, "KNYC"))
+        # a day of 30% half-days is drier than a weekend of them
+        two = r.market_fair(periods(run, [0.3] * 20), run, date(2026, 11, 3), 5)
+        self.assertLess(one["p"], two["p"])
+        self.assertIn("not the ticker's day", d["missing"]["KXRAINELECTION-03NOV26-BAD"])
+        # out from 00:00 local standard time on the day: New York at 05:00Z,
+        # Houston (UTC-6) an hour later
+        run2 = datetime(2026, 11, 3, 0, tzinfo=UTC)
+        r.write_fair_file(self.path, now=datetime(2026, 11, 3, 5, 30, tzinfo=UTC),
+                          events=events, nbe_fn=lambda sid: (run2, periods(run2, [0.3] * 20)))
+        with open(self.path, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d["missing"]["KXRAINELECTION-03NOV26-NYC"], "the day started")
+        self.assertIn("KXRAINELECTION-03NOV26-HOU", d["markets"])
 
     def test_events_are_cached_for_an_hour_unless_none_are_open(self):
         n = []
@@ -216,6 +281,8 @@ class TestWrite(unittest.TestCase):
                                "event_ticker": "KXRAINWKND-26OCT17",
                                "rules_primary": RULES.format(code="NYC")}]}
         def get_json(path, params):
+            if params["series_ticker"] != "KXRAINWKND":      # the one-day series
+                return {"markets": []}
             n.append(1)
             return listed
         r.write_fair_file(self.path, now=self.NOW, get_json=get_json, nbe_fn=self.nbe)

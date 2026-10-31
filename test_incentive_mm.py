@@ -4161,8 +4161,9 @@ class TestDryRunCycle(unittest.TestCase):
         # with IMM_BREAKERS off (the fixture series stands in for rain here)
         self.assertFalse(imm.BREAKERS_ENABLED)
         self.assertEqual(imm.MOVE_BREAKER_SERIES,
-                         frozenset({"KXRAIN", "KXRAINWKND"}))
+                         frozenset({"KXRAIN", "KXRAINWKND", "KXRAINELECTION"}))
         self.assertTrue(imm.move_breaker_on("KXRAINWKND"))
+        self.assertTrue(imm.move_breaker_on("KXRAINELECTION"))      # 2026-10-31
         self.assertFalse(imm.move_breaker_on("KXRAINNYCM"))     # not the monthlies
         self.assertFalse(imm.move_breaker_on("KXGOOD"))
         bot = self._bot()
@@ -31931,6 +31932,43 @@ class TestVercelFairLead(unittest.TestCase):
         self.assertAlmostEqual(on.est_frac, 0.965, places=3)
         self.assertAlmostEqual(off.est_frac, 0.479, places=3)
         self.assertIn("FAIR_LEAD_PAST_BAND", imm._CONFIG_CODE_KNOBS)
+
+
+class TestRainDayFamily(unittest.TestCase):
+    """Jack 2026-10-31: "KXRAINELECTION should be quoted", "in same way as
+    weekend rain family"."""
+
+    def test_the_election_day_rain_takes_the_weekend_familys_kit(self):
+        s = "KXRAINELECTION"
+        self.assertIn(s, imm.RAIN_DAY_SERIES)
+        self.assertIn(s, imm.ALLOW_SERIES)
+        # its day first: 03NOV26 is November 3, 2026 (00:00 EST = 05:00Z), not
+        # 2003-11-26; the weekend's YYMONDD reading is untouched
+        self.assertEqual(imm.parse_event_date("KXRAINELECTION-03NOV26"),
+                         datetime(2026, 11, 3, 5, tzinfo=timezone.utc))
+        self.assertEqual(imm.parse_event_date("KXRAINWKND-26OCT31"),
+                         datetime(2026, 10, 31, 4, tzinfo=timezone.utc))
+        ov, wk = imm.SERIES_OVERRIDES[s], imm.SERIES_OVERRIDES["KXRAINWKND"]
+        self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents,
+                          ov.cutoff_before_event_min),
+                         (wk.size_mult, wk.price_min_cents, wk.price_max_cents,
+                          wk.cutoff_before_event_min))
+        self.assertTrue(imm.rain_wknd_series(s))
+        self.assertIn(s, imm.FAIR_LEAD_SERIES)
+        self.assertIn(s, imm.MOVE_BREAKER_SERIES)
+        self.assertIsNone(imm.size_test_arm(s))
+        self.assertEqual(imm.size_test_arm("KXRAINWKND"), "control")
+        self.assertEqual(imm.fair_model_label(s), "the election-day rain fair")
+        self.assertEqual(imm.fair_model_label("KXRAINWKND"), "the weekend rain fair")
+        # the weekend gate reads its markets from the same file, fail closed
+        with mock.patch.dict(imm._rain_wknd_state["markets"], {}, clear=True):
+            why, _inp, caps = imm.rain_wknd_gate("KXRAINELECTION-03NOV26-NYC",
+                                                 time.time(), 20, 30)
+            self.assertEqual((why, caps), ("no election-day rain fair for this market", None))
+            imm._rain_wknd_state["markets"]["KXRAINELECTION-03NOV26-NYC"] = {
+                "p": 0.25, "ts": time.time()}
+            self.assertEqual(imm.rain_wknd_gate("KXRAINELECTION-03NOV26-NYC",
+                                                time.time(), 20, 30), ("", {}, None))
 
 
 class TestOpenRouterFairLead(unittest.TestCase):

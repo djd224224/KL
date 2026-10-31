@@ -1050,7 +1050,23 @@ for _s in os.environ.get(
 # in the three days since the x2. The other rain families stay x2. Its
 # gate since 2026-10-11: RAIN_WKND_ENABLE (the NBM's weekend probability).
 RAINWKND_SIZE_MULT = _env_float("IMM_RAINWKND_SIZE_MULT", 1.0)     # 2026-10-09
-for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(","):
+# ELECTION-DAY RAIN (Jack 2026-10-31: "KXRAINELECTION should be quoted", "in
+# same way as weekend rain family"). KXRAINELECTION-03NOV26-<CODE>, "Will it
+# rain in <city> on Election Day?": total precipitation at the station the
+# rules name ("San Diego (KSAN)") on November 3, 2026 strictly over 0 (a
+# trace is 0), on the weekend contract's Weather Company source. 49 cities
+# listed 10/29 with a $100 liquidity program each (target 1,000, 10/31 17:00Z
+# to 11/04 04:59Z) on bare books: 1-4c bids under 25-60c offers, or 30-70c
+# bids under 98-99c. The weekend family's kit, one day long: this override
+# (x1, 5-90c, out at 00:00 ET of the ticker day), the NBM fair and its 10c
+# band (rain_wknd_fair.py prices the day), the fair lead, the move breaker,
+# and out of the size test (the weekend family sits in its control half).
+# The ticker writes the day FIRST: 03NOV26 is November 3, 2026, which the
+# YYMONDD reading made 2003-11-26, past its cutoff (parse_event_date).
+# IMM_RAIN_DAY_SERIES="" takes the family out.
+RAIN_DAY_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_RAIN_DAY_SERIES", "KXRAINELECTION").split(",") if s.strip())
+for _s in os.environ.get("IMM_RAINWKND_SERIES", "KXRAINWKND").split(",") + sorted(RAIN_DAY_SERIES):
     if _s.strip():
         SERIES_OVERRIDES[_s.strip()] = SeriesOverride(
             size_mult=RAINWKND_SIZE_MULT,
@@ -2420,6 +2436,9 @@ SIZE_TEST_EXCLUDE = frozenset(
         "IMM_SIZE_TEST_EXCLUDE",
         "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN,KXAPRPOTUS"
     ).split(",") if s.strip())
+# the election-day rain (2026-10-31): a three-day event joining mid-test,
+# quoted as the weekend family is (its control half: x1)
+SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | RAIN_DAY_SERIES
 SIZE_TEST_EXCLUDE_PREFIXES = tuple(
     p.strip() for p in os.environ.get(
         "IMM_SIZE_TEST_EXCLUDE_PREFIXES", "KXHIGH,KXLOWT").split(",") if p.strip())
@@ -3691,7 +3710,8 @@ BREAKERS_ENABLED = os.environ.get("IMM_BREAKERS", "0") == "1"
 # daily summary only). IMM_MOVE_BREAKER_SERIES: exact series, comma-
 # separated; empty = none (IMM_BREAKERS=1 still turns it on everywhere).
 MOVE_BREAKER_SERIES = frozenset(s.strip() for s in os.environ.get(
-    "IMM_MOVE_BREAKER_SERIES", "KXRAIN,KXRAINWKND").split(",") if s.strip())
+    "IMM_MOVE_BREAKER_SERIES",
+    ",".join(["KXRAIN", "KXRAINWKND", *sorted(RAIN_DAY_SERIES)])).split(",") if s.strip())
 
 
 def move_breaker_on(series: str) -> bool:
@@ -6938,7 +6958,8 @@ register_close_cutoff_days(CPI_PILOT_CUTOFF_BEFORE_CLOSE_DAYS,
 # recon fix can move the contested strike 30-40c, and the band, safe-join
 # and the toxic-halt / sweep breakers are what stand between it and a
 # pick-off.
-_DEFAULT_WEATHER_SERIES = "KXRAINWKND,KXHURCAT"
+# ELECTION-DAY RAIN (2026-10-31): RAIN_DAY_SERIES, beside the weekend family.
+_DEFAULT_WEATHER_SERIES = ",".join(["KXRAINWKND", *sorted(RAIN_DAY_SERIES), "KXHURCAT"])
 # SPORTS series allowed IN CODE (Jack 2026-09-11 pm: "allowlist
 # KXMLBPLAYOFFS into IMM", then "allowlist KXMLBSEASONGAMES"). First sports
 # entries in the normal book -- the 9/6 open-scan category lift already
@@ -14258,7 +14279,8 @@ def cpi_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # weekend at 00:00 ET Saturday as before, and the move breaker stays.
 # IMM_RAIN_WKND_ENABLE=0 turns the gate off (the family quotes as before).
 RAIN_WKND_ENABLE = os.environ.get("IMM_RAIN_WKND_ENABLE", "1") == "1"
-RAIN_WKND_SERIES = frozenset(("KXRAINWKND",))
+# with the election-day rain (2026-10-31), its one day priced the same way
+RAIN_WKND_SERIES = frozenset(("KXRAINWKND",)) | RAIN_DAY_SERIES
 RAIN_WKND_TOL_CENTS = _env_int("IMM_RAIN_WKND_TOL_CENTS", 10)
 RAIN_WKND_TTL_MIN = _env_int("IMM_RAIN_WKND_TTL_MIN", 240)
 # every 15 minutes since the hourly NBS composite (2026-10-30, Jack:
@@ -14285,9 +14307,11 @@ def load_rain_wknd() -> int:
 def rain_wknd_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                    ext_ask: Optional[float]
                    ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    label = ("election-day rain" if ticker.split("-")[0] in RAIN_DAY_SERIES
+             else "weekend rain")
     return simple_fair_gate(_rain_wknd_state, ticker, now_ts, ext_bid, ext_ask,
                             tol=RAIN_WKND_TOL_CENTS, ttl_min=RAIN_WKND_TTL_MIN,
-                            label="weekend rain", cap=RAIN_WKND_CAP)
+                            label=label, cap=RAIN_WKND_CAP)
 
 
 # ROTTEN TOMATOES FAIR GATE (Jack 2026-10-11, the build above; 2026-10-12
@@ -17322,6 +17346,10 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
         # last day DDMONYY: KXBEAVERSNOW-24DEC26 is December 24, 2026 -- the
         # YYMONDD reading (2024-12-26) put every strike past its cutoff.
         # The six, and every resort series the writer has mapped since.
+        yy, dd = dd, yy
+    if parts[0] in RAIN_DAY_SERIES:
+        # the election-day rain (2026-10-31) writes its day first too:
+        # KXRAINELECTION-03NOV26 is November 3, 2026, not 2003-11-26
         yy, dd = dd, yy
     month = _MONTHS.get(mon)
     if month is None:
@@ -20505,11 +20533,13 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # a lead 5c inside the fair stands where a 10T miss moves a middle strike
 # 30c+. The default list leaves it out; the code stays, and
 # IMM_FAIR_LEAD_SERIES naming it puts it back.
+# THE ELECTION-DAY RAIN (Jack 2026-10-31: "in same way as weekend rain
+# family"): RAIN_DAY_SERIES leads off the weekend writer's fair for its day.
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get(
         "IMM_FAIR_LEAD_SERIES",
-        ",".join(["KXRAINWKND"] + sorted(VERCEL_SERIES))).split(",")
+        ",".join(["KXRAINWKND", *sorted(RAIN_DAY_SERIES)] + sorted(VERCEL_SERIES))).split(",")
      if s.strip()}))
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
@@ -20608,7 +20638,8 @@ def fair_lead_blackout(series: str, now_ts: float) -> bool:
 def fair_model_label(series: str) -> str:
     """How the logs name a fair-lead family's model."""
     if rain_wknd_series(series):
-        return "the weekend rain fair"
+        return ("the election-day rain fair" if series in RAIN_DAY_SERIES
+                else "the weekend rain fair")
     if vercel_series(series):
         return "the Vercel fair"
     if or_fair_series(series):
