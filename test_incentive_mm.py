@@ -31517,7 +31517,12 @@ class TestFairLead(unittest.TestCase):
         # the model". A book bid at 70c, offered at 85c behind 20 at 85c: off a
         # 45c fair the ask would lead at 81c, but the bid sits 25c over the fair
         yes, no = [[70, 3000.0]], [[10, 3000.0], [15, 20.0]]
-        self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5), (None, None))
+        # relaxed (Jack 2026-10-31: "relax"): the 81c offer sits 11c over the
+        # 70c bid as well as 36c over the fair, so it rests; whole, nothing
+        self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5),
+                         (None, (81, 50, 85)))
+        with mock.patch.object(imm, "FAIR_LEAD_GUARD_INSIDE", False):
+            self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5), (None, None))
         with mock.patch.object(imm, "FAIR_LEAD_MAX_GAP_C", 0):
             self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5),
                              (None, (81, 50, 85)))
@@ -31525,7 +31530,9 @@ class TestFairLead(unittest.TestCase):
             self.assertEqual(imm.fair_lead_group(yes, no, 45.0, 1000.0, 0.5),
                              (None, (81, 50, 85)))
         # an ask under the fair by more than 10c stops the bid lead: SGF's 60c
-        # offer against a 71c fair; at 70c the offer is exactly 10c under
+        # offer against a 71c fair (its 54c bid lead is within 10c of that
+        # offer, so the relaxed guard keeps it out too); at 70c the offer is
+        # exactly 10c under
         self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 71.0, 1000.0, 0.5),
                          (None, None))
         self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 70.0, 1000.0, 0.5),
@@ -31533,13 +31540,37 @@ class TestFairLead(unittest.TestCase):
         self.assertEqual(imm.FAIR_LEAD_MAX_GAP_C, 10)
         self.assertIn("FAIR_LEAD_MAX_GAP_C", imm._CONFIG_CODE_KNOBS)
 
+    def test_the_relaxed_guard_on_the_four_election_day_books(self):
+        # Jack 2026-10-31: "relax". The four KXRAINELECTION-03NOV26 books the
+        # guard held at 20:07Z (each side's top levels; a leading side whole):
+        # each now leads at a price 10c+ inside both its fair and the book
+        aus = ([[1, 1000.0], [2, 3000.0], [4, 32600.0]], [[3, 1.0], [54, 10.0], [55, 335.0]])
+        gnv = ([[2, 3000.0], [3, 56.0], [51, 2581.0]], [[1, 81470.0]])
+        msy = ([[1, 1000.0], [2, 51970.0]], [[3, 1.0], [40, 10.0], [41, 365.0]])
+        okc = ([[1, 3000.0], [2, 9880.0]], [[3, 1.0], [44, 10.0], [45, 603.0]])
+        for (yes, no), fair, want in ((aus, 88.4, ((16, 83, 4), None)),     # under 45c
+                                      (gnv, 37.3, (None, (86, 43, 99))),    # over 51c
+                                      (msy, 70.9, ((15, 65, 2), None)),     # under 59c
+                                      (okc, 77.3, ((12, 72, 2), None))):    # under 55c
+            self.assertEqual(imm.fair_lead_group(yes, no, fair, 1000.0, 0.5), want)
+            with mock.patch.object(imm, "FAIR_LEAD_GUARD_INSIDE", False):
+                self.assertEqual(imm.fair_lead_group(yes, no, fair, 1000.0, 0.5),
+                                 (None, None))
+        self.assertIn("FAIR_LEAD_GUARD_INSIDE", imm._CONFIG_CODE_KNOBS)
+
     def test_the_guard_holds_the_loop_back_and_says_so(self):
         bot, rungs, lines = self._cycle(p=0.71)
         self.assertNotEqual(rungs.get("bid", (None, 0))[0], 54)
         self.assertEqual(bot._comp_lead_px, {})
+        # (relaxed 2026-10-31: the 54c bid lead is within 10c of the 60c
+        # offer, so it stays out; the line says what may still lead)
         self.assertTrue(any("fair lead guard KXRAINWKND-68OCT13-SGF: book 48x60 sits "
-                            "more than 10c past the 71.0c fair -- no lead until it is "
-                            "back inside" in s for s in lines), lines)
+                            "more than 10c past the 71.0c fair -- a lead only 10c "
+                            "inside the book's far touch until it is back inside"
+                            in s for s in lines), lines)
+        with mock.patch.object(imm, "FAIR_LEAD_GUARD_INSIDE", False):
+            _bot, _rungs, lines = self._cycle(p=0.71)
+        self.assertTrue(any("-- no lead until it is back inside" in s for s in lines), lines)
 
     def test_the_fair_the_switches_and_the_event_cap(self):
         now = time.time()

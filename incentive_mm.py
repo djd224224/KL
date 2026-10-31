@@ -11561,6 +11561,7 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
     "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
+    "FAIR_LEAD_GUARD_INSIDE",     # ...relaxed for leads inside the book too (2026-10-31)
     "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
     "FAIR_LEAD_PAST_BAND",        # leads past the band, ahead of the touch (2026-10-30)
     "OR_LEAD_BLACKOUT", "OR_LEAD_BLACKOUT_PRE_MIN",   # the OpenRouter publish (2026-10-30)
@@ -20745,7 +20746,19 @@ FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
 # CLOSE) is no lead and rests regardless. Logs `fair lead guard <t>: book
 # 81x83 sits more than 10c past the 44.9c fair -- no lead until it is back
 # inside`, and the same when it is. 0 disables.
+# RELAXED (Jack 2026-10-31: "relax", to "Do you want the guard relaxed so a
+# lead can still rest when its price sits well inside both the model and the
+# book?"). While the guard holds, a side still leads when its price is ALSO
+# FAIR_LEAD_MAX_GAP_C inside the book's far touch -- a bid that far under the
+# best offer, an offer that far over the best bid -- so it trades only at a
+# price both the model (FAIR_LEAD_MARGIN_C) and the book call cheap. On the
+# 20:07Z election-day rain books that is KXRAINELECTION-03NOV26-AUS's bid
+# under a 45c offer against an 88c fair, OKC's and MSY's bids, GNV's offer
+# over a 51c bid against a 37c fair; a lead near the book (SGF's 54c bid
+# under a 60c offer, a 71c fair) stays out. IMM_FAIR_LEAD_GUARD_INSIDE=0 holds
+# both sides again.
 FAIR_LEAD_MAX_GAP_C = max(0, _env_int("IMM_FAIR_LEAD_MAX_GAP_C", 10))
+FAIR_LEAD_GUARD_INSIDE = os.environ.get("IMM_FAIR_LEAD_GUARD_INSIDE", "1") == "1"
 # LEAD INVENTORY QUOTES ON (Jack 2026-10-30: "just because a 200 position on
 # one side, doesnt mean that side has to stop quoting. can still quote that
 # side normally"). FAIR_LEAD_MAX_POSITION stops the LEAD: a side whose
@@ -20857,11 +20870,15 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
     cents), every book EXTERNAL. The bid side's reference is the fair rounded
     down, the ask side's (NO space) 100 less the fair rounded up, so each
     side leads at least FAIR_LEAD_MARGIN_C inside the fair. Holds, caps and
-    guards as comp_lead_group; neither side leads while the book's touch sits
-    more than FAIR_LEAD_MAX_GAP_C past the fair (the disagreement guard)."""
+    guards as comp_lead_group; while the book's touch sits more than
+    FAIR_LEAD_MAX_GAP_C past the fair (the disagreement guard) a side leads
+    only that far inside the book's far touch too (FAIR_LEAD_GUARD_INSIDE),
+    else neither does."""
     lb = ln = None
     eb, ea = external_best(yes_levels, no_levels)
-    if FAIR_LEAD_MAX_GAP_C and any(fair_gate_breach(eb, ea, fair_c, FAIR_LEAD_MAX_GAP_C)):
+    held = bool(FAIR_LEAD_MAX_GAP_C) and any(
+        fair_gate_breach(eb, ea, fair_c, FAIR_LEAD_MAX_GAP_C))
+    if held and not FAIR_LEAD_GUARD_INSIDE:
         return None, None
     if target > 0:
         lb = comp_side_lead_ref(yes_levels, int(math.floor(fair_c)), target, df,
@@ -20876,6 +20893,12 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
         la = None
     if lb is not None and la is not None and lb[0] >= la[0]:
         lb = la = None
+    if held:
+        # the guard, relaxed: only a lead well inside the book's far touch
+        if lb is not None and (ea is None or lb[0] > ea - FAIR_LEAD_MAX_GAP_C):
+            lb = None
+        if la is not None and (eb is None or la[0] < eb + FAIR_LEAD_MAX_GAP_C):
+            la = None
     return lb, la
 
 
@@ -29173,8 +29196,10 @@ class IncentiveMarketMaker:
         dry = "" if lead_mode("fair") == "on" else " (dry)"
         if held:
             log(f"{self.tag} fair lead guard{dry} {t}: book {eb}x{ea} sits more than "
-                f"{FAIR_LEAD_MAX_GAP_C}c past the {fair_c:.1f}c fair -- no lead until "
-                f"it is back inside")
+                f"{FAIR_LEAD_MAX_GAP_C}c past the {fair_c:.1f}c fair -- "
+                + (f"a lead only {FAIR_LEAD_MAX_GAP_C}c inside the book's far touch "
+                   f"until it is back inside" if FAIR_LEAD_GUARD_INSIDE
+                   else "no lead until it is back inside"))
         else:
             log(f"{self.tag} fair lead guard{dry} {t}: book {eb}x{ea} back within "
                 f"{FAIR_LEAD_MAX_GAP_C}c of the {fair_c:.1f}c fair -- leads allowed")
