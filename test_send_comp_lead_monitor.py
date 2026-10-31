@@ -7,15 +7,18 @@ Run: python -m unittest test_send_comp_lead_monitor
 
 Worth testing: leads read off the day log (moves, ends, restarts, the window
 clip), lead fills matched to a lead's side and price, the hedge rows and the
-open jobs, and the verdict rules.
+open jobs, the verdict rules, and the orders resting ahead of leads off the
+book_depth rows (Jack 2026-10-30: "Daily email report on leads").
 """
 
+import gzip
 import json
 import os
 import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import send_comp_lead_monitor as cm                                  # noqa: E402
@@ -385,6 +388,148 @@ class TestMoney(unittest.TestCase):
                       f"{cm.usd(best)} at best", ctx["reasons"][0])
         self.assertTrue(cm.subject_for(ctx).endswith(
             f"| WATCH: 1 lock gave up (worst {cm.usd(worst)})"))
+
+
+WALL = [(15, 13238.0), (16, 21.0)]
+T50 = "KXFOO-26NOV02-T50"
+
+
+def book(ts, ours=None, ahead=(), source="managed", tk=T50, side="bid"):
+    """One book_depth row as the bot writes it (compact JSON, dollars): the
+    lead side holds the 13,238-lot wall, our rung `ours` (price, size) and
+    the external orders `ahead` [(price, size)], in that side's own cents."""
+    lv = dict(WALL)
+    for p, q in ([ours] if ours else []) + list(ahead):
+        lv[p] = lv.get(p, 0.0) + q
+    levels = [[f"{p / 100:.4f}", f"{q:.2f}"] for p, q in sorted(lv.items())]
+    own = [[float(ours[0]), float(ours[1])]] if ours else []
+    return json.dumps({
+        "ts": round(ts, 3), "cycle_ts": "", "ticker": tk, "source": source, "fast": False,
+        "unit": "dollars", "yes": levels if side == "bid" else [],
+        "no": levels if side == "ask" else [],
+        "own_yes_cents": own if side == "bid" else [], "own_no_cents": own if side == "ask" else [],
+        "own_src": "resting_read", "target": 1000.0, "discount": 0.5, "pool_per_day": 10.0,
+        "run_id": "r", "config_hash": "c"}, separators=(",", ":"))
+
+
+def write_book(d, name, rows, tail=b""):
+    os.makedirs(os.path.join(d, "book_depth"), exist_ok=True)
+    with open(os.path.join(d, "book_depth", name), "wb") as f:
+        f.write(gzip.compress(("\n".join(rows) + "\n").encode()) + tail)
+
+
+def lead50(t, px=26, d=29):
+    return lead(t, tk=T50, side="bid", px=px, best=16, implied=70,
+                who="its harder strikes' books", verb="imply", d=d)
+
+
+class TestOrdersAhead(unittest.TestCase):
+    """Jack 2026-10-30: "Daily email report on leads", after "Hold at one
+    half": every spell an order rested ahead of a lead, off the bot's own
+    book_depth rows, with what the lead kept of its side and what the bot did."""
+
+    def _run(self, lines, files):
+        a, b = cm.day_window(date(2026, 10, 29))
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(imm, "STATUS_DIR", d):
+            for name, rows, *tail in files:
+                write_book(d, name, rows, *tail)
+            leads = cm.parse_leads(lines, a, b)["leads"]
+            return leads, cm.orders_ahead(leads, a, b)
+
+    def test_spells_are_held_fought_chased_or_stood_down(self):
+        lines = [lead50("05:00:00"),
+                 lead50("05:01:40", px=32),          # the fight's note, in the row's second
+                 "2026-10-29 05:04:00Z [IMM] comp lead KXFOO-26NOV02-T50 bid: off -- its "
+                 "harder strikes' books no longer put it ahead of its own, or an order "
+                 "stepped ahead of it\n"]
+        rows = [book(_ts(5, 0, 20), (26, 200)),                       # alone: no spell
+                book(_ts(5, 0, 40), (26, 200), [(27, 31)]),           # a 31-lot jumper
+                book(_ts(5, 1, 0), (26, 200), [(27, 31)]),
+                book(_ts(5, 1, 0), (40, 999), [(41, 5)], source="candidate"),   # not the loop's
+                book(_ts(5, 1, 20), (26, 200)),                       # it left: HELD
+                book(_ts(5, 1, 40), (26, 200), [(27, 300)]),          # 300 move the reference
+                book(_ts(5, 2, 0), (32, 200), [(27, 300)]),           # FOUGHT +6
+                book(_ts(5, 2, 20), (32, 200), [(33, 31)]),
+                book(_ts(5, 2, 40), (34, 200)),                       # CHASED +2 (no note)
+                book(_ts(5, 3, 20), (34, 160), [(35, 31)]),           # a cap trims the lead
+                book(_ts(5, 3, 40), (34, 120), [(35, 31)]),           # ...any size at its price
+                book(_ts(5, 4, 20), (34, 120), [(35, 31)]),           # off: stood down
+                book(_ts(5, 4, 40), (34, 120), [(35, 31)], tk="KXOTHER-1")]
+        leads, res = self._run(lines, [("book_depth_2026-10-29_r1.jsonl.gz", rows)])
+        ev = sorted(res["events"], key=lambda e: e["ts"])
+        self.assertEqual([(e["outcome"], e["top"], e["moved"]) for e in ev],
+                         [("held", 26, 0), ("fought", 26, 6), ("fought", 32, 2),
+                          ("gone", 34, None)])
+        self.assertAlmostEqual(ev[0]["kept"], 200 / (231 + 21 / 2 ** 10 + 13238 / 2 ** 11), 4)
+        self.assertEqual(ev[0]["ahead"], 31)
+        self.assertLess(ev[1]["kept"], 0.5)
+        self.assertGreater(ev[2]["kept"], 0.5)
+        self.assertEqual(res["rows"], 11)                    # the loop's rows of T50 only
+        S = cm.ahead_summary(ev, 0.5)
+        self.assertEqual({k: len(v) for k, v in S.items()},
+                         dict(held=1, fought=1, chased=1, under=0, down=0, gone=1))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.95):     # the old bar
+            self.assertEqual(cm.hold_bar(), 0.95)
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SMALL", False):
+            self.assertGreater(cm.hold_bar(), 1.0)
+
+    def test_files_read_in_run_order_and_a_restart_does_not_end_a_spell(self):
+        lines = [lead50("05:00:00"),
+                 "2026-10-29 05:05:00Z === incentive_mm_v1.2 run=b mode=LIVE config=y ===\n",
+                 lead50("05:06:00")]
+        run_a = [book(_ts(5, 4, 0), (26, 200)), book(_ts(5, 4, 40), (26, 200), [(27, 31)])]
+        part = [book(_ts(5, 4, 50), (26, 200), [(27, 31)])]
+        run_b = [book(_ts(5, 5, 30), (26, 200), [(27, 31)]),     # handed over, not yet re-noted
+                 book(_ts(5, 6, 20), (26, 200), [(27, 31)]),
+                 book(_ts(5, 6, 40), (26, 200))]
+        # "aaaa" (the later run) sorts first by name; a truncated tail member is
+        # what a hard kill leaves
+        _leads, res = self._run(lines, [
+            ("book_depth_2026-10-29_bbbb.jsonl.gz", run_a, b"\x1f\x8b\x08\x00broken"),
+            ("book_depth_2026-10-29_bbbb.p1.jsonl.gz", part),
+            ("book_depth_2026-10-29_aaaa.jsonl.gz", run_b)])
+        self.assertEqual([(e["outcome"], e["ts"], e["last"]) for e in res["events"]],
+                         [("held", _ts(5, 4, 40), _ts(5, 6, 20))])
+        self.assertEqual((res["files"], res["rows"]), (3, 6))
+
+    def test_the_section_and_the_takeaway(self):
+        lines = [lead50("05:00:00"), lead50("05:01:40", px=32)]
+        rows = [book(_ts(5, 0, 40), (26, 200), [(27, 31)]),
+                book(_ts(5, 1, 20), (26, 200)),
+                book(_ts(5, 1, 40), (26, 200), [(27, 300)]),
+                book(_ts(5, 2, 0), (32, 200), [(27, 300)]),
+                book(_ts(5, 2, 20), (32, 200), [(33, 31)]),
+                book(_ts(5, 2, 40), (34, 200))]
+        leads, res = self._run(lines, [("book_depth_2026-10-29_r1.jsonl.gz", rows)])
+        h = cm.hedge_summary([], [], _ts(12))
+        ctx = dict(day="2026-10-29", leads=leads, groups=None, fills=[], hedges=h, est={},
+                   ahead=res)
+        ctx["level"], ctx["reasons"] = cm.verdict(ctx)
+        text = cm.render_text(ctx)
+        self.assertIn("ORDERS AHEAD OF LEADS (each cycle's book with our orders; a lead holds "
+                      "while it keeps 50% of its side where it rests", text)
+        self.assertIn("  3 times a lead had an order resting ahead of it, on 1 lead side", text)
+        self.assertIn("  held 1: the lead stayed and kept a median 84% of its side (lowest 84%), "
+                      "a median 31 lots ahead", text)
+        self.assertIn("  fought 1: it kept under 50% (a median 300 lots ahead) and re-led a "
+                      "median 6c nearer the model (6c in all)", text)
+        self.assertIn("  chased 1: it moved up while it still kept 50% or more (a median 31 lots "
+                      "ahead) and re-led a median 2c nearer the model (2c in all); all of them "
+                      "before the half-side hold went live", text)
+        self.assertIn(f"    {T50} bid (complement): 3 -- held 1 (84%-84%), fought 1, chased 1",
+                      text)
+        self.assertIn("  ahead       3 times a lead had an order resting ahead of it: held 1 "
+                      "(kept a median 84% of the side), fought 1, chased 1", text)
+        self.assertTrue(text.isascii())
+        # since the half-side hold, a chase is not expected: the line says none
+        ctx["ahead"] = dict(res, events=[e for e in res["events"] if e["moved"] != 2])
+        self.assertIn("  chased 0: none moved up while it kept 50% of its side",
+                      cm.render_text(ctx))
+        # a scan that failed says so; a report built without one has no section
+        ctx["ahead"] = {"events": [], "files": 0, "rows": 0, "error": "OSError('x')"}
+        self.assertIn("  not read: OSError('x')", cm.render_text(ctx))
+        del ctx["ahead"]
+        self.assertNotIn("ORDERS AHEAD", cm.render_text(ctx))
 
 
 if __name__ == "__main__":

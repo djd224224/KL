@@ -54,6 +54,17 @@ while leading had earned ~$15 and its fills were up ~$38):
               dollars over how its markets can settle (Jack 2026-10-30: "Yes,
               size-aware" -- 10/29's 12-contract lock read PROBLEM at -$2.68)
   top earners the markets that earned most while leading
+  orders ahead  (Jack 2026-10-30: "Daily email report on leads", after "Hold
+              at one half") every time an order rested AHEAD of a resting
+              lead, off the bot's own book_depth rows (each cycle's book with
+              our resting orders): what the lead kept of its side where it
+              rested (the bot's _side_share, at the last cycle before it
+              acted) and what the bot did -- held (it kept half its side and
+              stayed), fought (under half: it re-led nearer the model), chased
+              (it moved up while it still kept half: the old 95% bar's habit,
+              none expected since c06a4f7), stayed under half (the order sat
+              at or past the lead's cap), moved down, stopped resting; then
+              the sides most orders stood ahead of. The takeaway gets a line.
   fills       every fill at a lead's price, marked to the bot's latest mark
               or the settlement, and what became of it (locked, a lock job
               open, no lock; a fair lead's rides to settlement)
@@ -64,8 +75,10 @@ while leading had earned ~$15 and its fills were up ~$38):
 
 SOURCES, read-only: the bot's day logs (incentive-mm-*.log), fills_ /
 comp_hedge_ / selection_snapshot_ / settlements_<UTC date>.jsonl,
-comp_hedge_jobs.json, reward_est_hourly_cache.json and the newest
-marks_<date>.jsonl's tail. No Kalshi reads, no orders. Imports
+comp_hedge_jobs.json, reward_est_hourly_cache.json, the newest
+marks_<date>.jsonl's tail and book_depth/book_depth_<UTC date>_<run>.jsonl.gz
+(a day's is ~0.5 GB, scanned as bytes in ~1-2 min). No Kalshi reads, no
+orders. Imports
 imm_quote_gaps first, like the other morning emails, so the launcher env and
 the alert credentials apply.
 
@@ -81,11 +94,14 @@ All console output is ASCII (the task console is cp1252).
 import argparse
 import ctypes
 import glob
+import gzip
 import json
 import os
 import re
+import statistics
 import sys
 import time
+import zlib
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -104,6 +120,13 @@ MARKS_TAIL_BYTES = 4_000_000    # the newest marks file's tail: every position's
 TOP_EARNERS = 10
 LIST_MIN_HOURS = 0.5            # ALL LEADS lists a lead that led this long...
 LIST_MIN_USD = 0.05             # ...or earned this much while leading
+BOOK_DEPTH_SUBDIR = "book_depth"    # in STATUS_DIR: the bot's book_depth sink
+AHEAD_LIST = 8                  # ORDERS AHEAD lists the sides most orders stood ahead of
+LEAD_GAP_SECS = 600             # lead spans this close count as one (a restart's handover:
+                                # the banner ends them, the rung rests on until relogged)
+# c06a4f7 live (Jack 2026-10-30: "Hold at one half"): before it a lead fought
+# any order that cost it 5% of its side
+HOLD_HALF_SINCE = datetime(2026, 10, 31, 3, 6, 46, tzinfo=timezone.utc).timestamp()
 
 _LEAD = re.compile(
     r"^(\S+ \S+)Z \[IMM\] (comp|fair) lead( \(dry\))? (\S+) (bid|ask): (\d+) @ (\d+)c, "
@@ -187,9 +210,10 @@ def row_ts(r: dict) -> float:
 
 def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
     """{(ticker, side): {"spans": [[start, end], ...], "px", "best", "implied",
-    "who", "dry", "open", "kind"}} for the window from the day-log lines
-    (kind "comp" or "fair"). A restart banner closes every open lead (a new
-    process logs its leads afresh)."""
+    "who", "dry", "open", "kind", "notes"}} for the window from the day-log
+    lines (kind "comp" or "fair"; "notes" [(ts, YES cents or None for off)],
+    lookback included, oldest first). A restart banner closes every open lead
+    (a new process logs its leads afresh)."""
     leads: dict = {}
     groups = None
     for line in lines:
@@ -199,9 +223,10 @@ def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
             if ts >= b_ts:
                 continue
             key = (m.group(4), m.group(5))
-            ld = leads.setdefault(key, {"spans": [], "open": None, "pxs": []})
+            ld = leads.setdefault(key, {"spans": [], "open": None, "pxs": [], "notes": []})
             if ld["open"] is None:
                 ld["open"] = ts
+            ld["notes"].append((ts, int(m.group(7))))
             if a_ts <= ts:
                 ld["pxs"].append(int(m.group(7)))
             ld.update(px=int(m.group(7)), best=int(m.group(8)), who=m.group(9),
@@ -217,6 +242,8 @@ def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
                     else [k for k, v in leads.items() if v["open"] is not None])
             for key in keys:
                 ld = leads.get(key)
+                if ld and m.re is _OFF:
+                    ld["notes"].append((ts, None))
                 if ld and ld["open"] is not None:
                     ld["spans"].append([ld["open"], ts])
                     ld["open"] = None
@@ -413,10 +440,11 @@ def load_hourly(a_ts: float, b_ts: float) -> tuple:
     return out, (None if last is None else (last + 1) * 3600.0)
 
 
-def _union(spans) -> list:
+def _union(spans, gap: float = 0.0) -> list:
+    """Spans merged where they overlap, or come within `gap` seconds."""
     out: list = []
     for s, e in sorted(spans):
-        if out and s <= out[-1][1]:
+        if out and s <= out[-1][1] + gap:
             out[-1][1] = max(out[-1][1], e)
         else:
             out.append([s, e])
@@ -480,6 +508,192 @@ def value_fills(fills: list, marks: dict) -> list:
         f["usd"] = (None if m is None else
                     (m - f["px"]) * f["count"] / 100.0 * (1 if f["side"] == "bid" else -1))
     return fills
+
+
+def _book_files(a_ts: float, b_ts: float) -> list:
+    """The book_depth files that can hold the window, oldest first. Each is
+    one run's rows of one UTC date (or a part of them) in time order, and runs
+    never overlap, so read in this order the rows come in time order."""
+    found = []
+    for d in utc_dates(a_ts, b_ts):
+        for p in glob.glob(os.path.join(imm.STATUS_DIR, BOOK_DEPTH_SUBDIR,
+                                        f"book_depth_{d}_*.jsonl.gz")):
+            try:
+                with gzip.open(p, "rb") as g:
+                    first = row_ts(json.loads(g.readline()))
+            except (OSError, EOFError, ValueError, zlib.error):
+                continue
+            found.append((first, p))
+    return [p for _first, p in sorted(found)]
+
+
+def _managed_rows(paths: list, tickers: set, a_ts: float, b_ts: float):
+    """The quote loop's books ("managed": each cycle's book with our resting
+    orders as read that cycle) of `tickers` (bytes) inside the window, in
+    time order. Lines are matched as bytes before any JSON is parsed: a
+    day is ~5 GB of rows, a few percent of them a leading market's."""
+    for p in paths:
+        try:
+            with gzip.open(p, "rb") as g:
+                for line in g:
+                    if b'"source":"managed"' not in line:
+                        continue
+                    i = line.find(b'"ticker":"')
+                    if i < 0 or line[i + 10:line.find(b'"', i + 10)] not in tickers:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    ts = row_ts(r)
+                    if ts >= b_ts:
+                        break
+                    if ts >= a_ts:
+                        yield r
+        except (OSError, EOFError, zlib.error):
+            continue                    # a run's truncated tail: what was read stands
+
+
+def _side_book(r: dict, side: str):
+    """One side of a book row in that side's own price space (YES cents for
+    the bid side, NO cents for the ask side; higher = more aggressive):
+    (levels best first with ours in them, our top price, our size there, the
+    best external price or None, external lots resting ahead of our top), or
+    None with no order of ours on that side."""
+    key, okey = ("yes", "own_yes_cents") if side == "bid" else ("no", "own_no_cents")
+    own: dict = defaultdict(float)
+    for p, q in r.get(okey) or []:
+        own[int(round(float(p)))] += float(q)
+    if not own:
+        return None
+    scale = 100.0 if r.get("unit", "dollars") == "dollars" else 1.0
+    lv: dict = defaultdict(float)
+    for p, q in r.get(key) or []:
+        lv[int(round(float(p) * scale))] += float(q)
+    for p, q in own.items():              # a book read a beat before our order shows
+        lv[p] = max(lv[p], q)
+    ext = {p: q - own.get(p, 0.0) for p, q in lv.items() if q - own.get(p, 0.0) > 0.5}
+    top = max(own)
+    return (sorted(lv.items(), key=lambda kv: -kv[0]), top, own[top],
+            max(ext, default=None), sum(q for p, q in ext.items() if p > top))
+
+
+def orders_ahead(leads: dict, a_ts: float, b_ts: float) -> dict:
+    """Every spell an order rested AHEAD of a resting lead in the window, off
+    the bot's own book_depth rows: what the lead kept of its side where it
+    rested (the bot's _side_share at the last cycle before the spell ended:
+    what the bot acted on; "low" its lowest) and how the spell ended --
+    "held" (the lead stayed until nothing was ahead, or the rows end),
+    "fought" (it moved up), "down" (it moved down), "gone" (it stopped
+    resting, or the side stopped leading). A spell is one lead price with
+    orders ahead of it, however they come and go. A lead is the side's top
+    rung while the day log has the side leading (spans LEAD_GAP_SECS apart
+    as one): over half of target/5 to open a spell (a position or event cap
+    trims some), any size at the spell's price after; a cycle that read no
+    order of ours on the side is skipped. {"events": [...], "files": n,
+    "rows": n}."""
+    spans = {k: _union(v["spans"], LEAD_GAP_SECS) for k, v in leads.items()}
+    notes = {k: v.get("notes") or [] for k, v in leads.items()}
+    seen: dict = defaultdict(int)               # how far into each side's notes
+    tickers = {t.encode() for t, _side in spans}
+    files = _book_files(a_ts, b_ts) if tickers else []
+    events: list = []
+    open_: dict = {}
+    rows = 0
+
+    def close(key, outcome, moved=None):
+        e = open_.pop(key, None)
+        if e is not None:
+            e.update(outcome=outcome, moved=moved)
+            events.append(e)
+
+    def noted(key, ts):
+        """The side's lead price (YES cents) in its latest note before the row
+        at `ts`, or None (off). A note logs a move of 3c+, so the lead is
+        within 2c. The bot logs a cycle's row, then decides and notes, and a
+        note's time is to the second: a row reads the notes a second or
+        more before it, never its own cycle's."""
+        ns, i = notes[key], seen[key]
+        while i < len(ns) and ns[i][0] <= ts - 1.0:
+            i += 1
+        seen[key] = i
+        return ns[i - 1][1] if i else None
+
+    for r in _managed_rows(files, tickers, a_ts, b_ts):
+        rows += 1
+        t, ts = r.get("ticker"), row_ts(r)
+        target = float(r.get("target") or 0.0)
+        n = imm.comp_lead_size(target)
+        for side in ("bid", "ask"):
+            key = (t, side)
+            if key not in spans:
+                continue
+            px = noted(key, ts)
+            if px is None or not any(s <= ts < e for s, e in spans[key]):
+                close(key, "gone")
+                continue
+            v = _side_book(r, side)
+            if v is None:
+                continue                        # no order of ours read there this cycle
+            levels, top, qty, best, ahead = v
+            lead_like = (n > 0 and n / 2.0 < qty <= n + 0.5
+                         and abs(top - (px if side == "bid" else 100 - px)) <= 2)
+            e = open_.get(key)
+            if e is not None and top != e["top"]:
+                if lead_like:
+                    close(key, "fought" if top > e["top"] else "down", top - e["top"])
+                else:
+                    close(key, "gone")          # the lead is no longer the top rung
+                e = None
+            if e is None and not lead_like:
+                continue
+            if best is None or best <= top:
+                close(key, "held", 0)           # nothing ahead now: the lead stayed
+                continue
+            kept = imm._side_share(levels, {top: qty}, target,
+                                   float(r.get("discount") or 0.5))[0]
+            if e is None:
+                open_[key] = dict(t=t, side=side, kind=leads[key].get("kind", "comp"),
+                                  ts=ts, last=ts, top=top, best=best, ahead=ahead,
+                                  kept=kept, low=kept)
+            else:
+                e.update(last=ts, best=best, ahead=ahead, kept=kept, low=min(e["low"], kept))
+    for key in list(open_):
+        close(key, "held", 0)                   # still ahead where the rows end
+    return {"events": events, "files": len(files), "rows": rows}
+
+
+def hold_bar() -> float:
+    """The share a lead holds at behind an order ahead (the bot's rule)."""
+    if not imm.COMP_LEAD_HOLD_SMALL:
+        return 1.01
+    return min(imm.COMP_LEAD_HOLD_SHARE, imm.COMP_LEAD_SHARE)
+
+
+def ahead_summary(ev: list, bar: float) -> dict:
+    """The events by what the bot did, against the hold rule: "held" (kept
+    the bar or more and stayed), "fought" (kept under it and moved up),
+    "chased" (moved up while it kept the bar -- the old 95% habit), "under"
+    (kept under it and stayed: the order sat at or past the lead's cap, or
+    left within a cycle), "down", "gone"."""
+    out: dict = {k: [] for k in ("held", "fought", "chased", "under", "down", "gone")}
+    for e in ev:
+        if e["outcome"] == "held":
+            out["held" if e["kept"] >= bar else "under"].append(e)
+        elif e["outcome"] == "fought":
+            out["chased" if e["kept"] >= bar else "fought"].append(e)
+        else:
+            out[e["outcome"]].append(e)
+    return out
+
+
+def _px_yes(e: dict, px: int) -> int:
+    """A side-space price as the YES cents the lead lines use."""
+    return px if e["side"] == "bid" else 100 - px
+
+
+def _med(xs) -> float:
+    return statistics.median(xs) if xs else 0.0
 
 
 def _age(secs: float) -> str:
@@ -622,6 +836,10 @@ def build_report(day, now=None) -> dict:
     ctx = dict(day=day.isoformat(), leads=leads, groups=parsed["groups"], fills=fills,
                hedges=hedges, est=est, now=now.isoformat(),
                rewards=lead_rewards(leads, hourly), covered_until=covered, window_end=b_ts)
+    try:
+        ctx["ahead"] = orders_ahead(leads, a_ts, b_ts)
+    except Exception as e:                  # the rest of the email still goes out
+        ctx["ahead"] = {"events": [], "files": 0, "rows": 0, "error": repr(e)}
     ctx["level"], ctx["reasons"] = verdict(ctx)
     return ctx
 
@@ -703,6 +921,95 @@ def _lead_line(t: str, side: str, v: dict, reward=None) -> str:
             + (f"; ${reward:.2f} while leading" if reward is not None else ""))
 
 
+def _decided(ev: list) -> list:
+    """The spells the bot saw through -- not those its lead left (a gate
+    hold, an off, a cap taking it below its own rungs): those say nothing
+    about holding or fighting."""
+    return [e for e in ev if e["outcome"] != "gone"]
+
+
+def _ahead_takeaway(ctx):
+    """The takeaway's line on orders ahead of leads, or None."""
+    ev = _decided((ctx.get("ahead") or {}).get("events") or [])
+    if not ev:
+        return None
+    S = ahead_summary(ev, hold_bar())
+    return (f"  {'ahead':<10s}  {len(ev)} time{'s' if len(ev) != 1 else ''} a lead had an order "
+            f"resting ahead of it: held {len(S['held'])}"
+            + (f" (kept a median {_med([e['kept'] for e in S['held']]):.0%} of the side)"
+               if S["held"] else "")
+            + f", fought {len(S['fought'])}, chased {len(S['chased'])}")
+
+
+def _ahead_lines(ctx) -> list:
+    """ORDERS AHEAD OF LEADS: what the bot did about each order that rested
+    ahead of a lead, against the hold rule, then the sides most were ahead of."""
+    ah = ctx.get("ahead")
+    if ah is None or not ctx["leads"]:
+        return []
+    bar = hold_bar()
+    rule = (f"a lead holds while it keeps {bar:.0%} of its side where it rests and fights to "
+            f"its cap below that -- Jack 10/30: \"Hold at one half\"" if bar <= 1.0
+            else "every order ahead is fought (IMM_COMP_LEAD_HOLD_SMALL=0)")
+    head = f"ORDERS AHEAD OF LEADS (each cycle's book with our orders; {rule})"
+    if ah.get("error"):
+        return ["", head, f"  not read: {ah['error']}"]
+    gone = len(ah.get("events") or []) - len(_decided(ah.get("events") or []))
+    ev = _decided(ah.get("events") or [])
+    if not ev:
+        return ["", head, f"  none: no order rested ahead of a lead ({ah.get('rows', 0):,} books "
+                          f"of leading markets in {ah.get('files', 0)} book_depth file(s)"
+                          + (f"; {gone} spell(s) ended with the lead standing down" if gone
+                             else "") + ")"]
+    S = ahead_summary(ev, bar)
+    sides = {(e["t"], e["side"]) for e in ev}
+    out = ["", head, f"  {len(ev)} time{'s' if len(ev) != 1 else ''} a lead had an order resting "
+                     f"ahead of it, on {len(sides)} lead side{'s' if len(sides) != 1 else ''} (one "
+                     f"spell at one lead price, however the orders ahead came and went):"]
+    if S["held"]:
+        kept = [e["kept"] for e in S["held"]]
+        out.append(f"  held {len(S['held'])}: the lead stayed and kept a median {_med(kept):.0%} "
+                   f"of its side (lowest {min(kept):.0%}), a median "
+                   f"{_med([e['ahead'] for e in S['held']]):,.0f} lots ahead")
+    for k, what in (("fought", f"it kept under {bar:.0%}"),
+                    ("chased", f"it moved up while it still kept {bar:.0%} or more")):
+        g = S[k]
+        if not g and k == "fought":
+            continue
+        line = f"  {k} {len(g)}"
+        if g:
+            walked = [e["moved"] for e in g]
+            before = sum(1 for e in g if e["ts"] < HOLD_HALF_SINCE)
+            line += (f": {what} (a median {_med([e['ahead'] for e in g]):,.0f} lots ahead) and "
+                     f"re-led a median {_med(walked):.0f}c nearer the model ({sum(walked)}c in all)"
+                     + (f"; {'all' if before == len(g) else before} of them before the "
+                        f"half-side hold went live at {_et(HOLD_HALF_SINCE)[4:]} 10/30"
+                        if k == "chased" and before else ""))
+        else:
+            line += f": none moved up while it kept {bar:.0%} of its side"
+        out.append(line)
+    if S["under"]:
+        out.append(f"  stayed under {bar:.0%} {len(S['under'])}: the order sat at or past the "
+                   f"lead's cap, or left within a cycle")
+    if S["down"] or gone:
+        out.append(f"  moved down {len(S['down'])}; and {gone} more spell"
+                   f"{'s' if gone != 1 else ''} ended with the lead standing down (a gate hold, "
+                   f"an off, a cap taking it below its own rungs), left out above")
+    by_side: dict = defaultdict(list)
+    for e in ev:
+        by_side[(e["t"], e["side"])].append(e)
+    top = sorted(by_side.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:AHEAD_LIST]
+    out.append(f"  most orders ahead ({len(top)} of {len(by_side)} sides):")
+    for (t, side), g in top:
+        s = ahead_summary(g, bar)
+        held = [e["kept"] for e in s["held"]]
+        parts = [f"held {len(held)}" + (f" ({min(held):.0%}-{max(held):.0%})" if held else "")]
+        parts += [f"{k} {len(s[k])}" for k in ("fought", "chased", "under", "down") if s[k]]
+        kind = "fair" if g[0]["kind"] == "fair" else "complement"
+        out.append(f"    {t} {side} ({kind}): {len(g)} -- {', '.join(parts)}")
+    return out
+
+
 def render_text(ctx) -> str:
     day = datetime.strptime(ctx["day"], "%Y-%m-%d")
     T = totals(ctx)
@@ -733,6 +1040,9 @@ def render_text(ctx) -> str:
                    f"${k['reward']:,.2f} while leading; {k['fills']} fill"
                    f"{'s' if k['fills'] != 1 else ''} ({k['contracts']:,.0f} contracts) "
                    f"{usd(k['fills_usd'])} now{unm}")
+    ahead = _ahead_takeaway(ctx)
+    if ahead:
+        out.append(ahead)
     note = ("  (reward = the bot's own estimate over the hours each market led -- Kalshi "
             "pays ~1.15x it; fills marked to the bot's latest mark or the settlement, not "
             "yet realized")
@@ -760,6 +1070,8 @@ def render_text(ctx) -> str:
             what = " + ".join(f"{s} {x['px']}c" for s, x in sorted(sv, key=lambda p: p[0]))
             hrs = sum(e - s for s, e in _union([sp for _s, x in sv for sp in x["spans"]])) / 3600
             out.append(f"  ${v:6.2f}  {t} {what} ({kind}, led {hrs:.1f}h)")
+    # the orders that stood ahead of a lead, and what the bot did about each
+    out += _ahead_lines(ctx)
     # the fills, each with what it is worth now
     if ctx["fills"]:
         locked = _locked_sides(ctx)
