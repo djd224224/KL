@@ -9,7 +9,8 @@ the price its sibling markets imply LEADS with one rung of target/5 (200) at
 the cheapest price that takes ~95% of that side's reward score -- the sell
 side in any family, the buy side in two-market election pairs. A lead that
 fills is hedged on its siblings once the set locks a profit; an order resting
-ahead of a lead is fought to a 5c stop.
+ahead of a lead is fought to a 5c stop, since 2026-10-30 only once it leaves
+the lead under half of its side (Jack: "Hold at one half").
 
 Since 2026-10-29 (Jack: "1 and 2") every maker fill that opens a position
 in such an event, or on a threshold ladder ("above X" strikes of one

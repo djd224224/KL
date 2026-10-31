@@ -11402,6 +11402,7 @@ _CONFIG_CODE_KNOBS = (
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_LEAD_HOLD_SMALL",       # a few lots ahead are not fought (2026-10-30)
+    "COMP_LEAD_HOLD_SHARE",       # ...while the lead keeps half its side (2026-10-30)
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
@@ -20101,11 +20102,24 @@ COMP_LEAD_SHARE = _env_float("IMM_COMP_LEAD_SHARE", 0.95)
 # 36c bid sat under 3 at 37c), and jumping them only gave edge away: the
 # cheapest price ahead of the whole book is a tick or more nearer the model.
 # Now an order ahead is fought only where the lead's share where it rests
-# falls under COMP_LEAD_SHARE: a handful of lots over a 200 at most, fewer
-# the more the wall below still scores (over a 13,238-lot wall 11 ticks
-# down, 3 lots are held and 10 fought), and any order ahead beside a copier
-# sharing its price. 0 fights every order ahead.
+# falls under COMP_LEAD_HOLD_SHARE (HALF THE SIDE, below; at first
+# COMP_LEAD_SHARE, a handful of lots: over a 13,238-lot wall 11 ticks down,
+# 3 lots were held and 10 fought). 0 fights every order ahead.
 COMP_LEAD_HOLD_SMALL = os.environ.get("IMM_COMP_LEAD_HOLD_SMALL", "1") == "1"
+# HALF THE SIDE (Jack 2026-10-30: "Hold at one half", on "Hold leads while
+# they keep two-thirds of their side, and chase only below that?"). At
+# COMP_LEAD_SHARE a lead still chased orders that left it most of its side:
+# N < target/5 lots ahead keep the reference at the lead's price, so the
+# lead keeps ~200/(200+N) of the side, and KXTOKENUSE-26NOV02-T194's bid kept
+# 73-75% under a 31-lot jumper yet chased it 40c -> 64c (its cap 73c) for the
+# same share. From 10/30 21:40Z to 10/31 01:28Z, 46 chases came while the
+# lead kept half its side or more, each walking it 3-6c toward the model.
+# Now a lead holds while it keeps COMP_LEAD_HOLD_SHARE of its side where it
+# rests -- up to ~190 lots ahead of a 200, fewer beside a copier on its price
+# or over a wall that still scores -- and an order of target/5 or more,
+# which moves the reference past the lead (a third of the side at most), is
+# fought as before. Never above COMP_LEAD_SHARE; 0.95 restores the old bar.
+COMP_LEAD_HOLD_SHARE = _env_float("IMM_COMP_LEAD_HOLD_SHARE", 0.5)
 COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 5))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
@@ -20193,8 +20207,9 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     the same space; the cap is `margin` (default COMP_LEAD_MARGIN_C) inside
     it. A side that cannot reach the target with the lead in it does not lead.
     `hold`: the price the side already leads at. An order resting AHEAD of
-    it is fought where it costs the lead its share (COMP_LEAD_HOLD_SMALL:
-    a few lots a tick over it do not): the side leads again at the cheapest
+    it is fought where the lead keeps under COMP_LEAD_HOLD_SHARE of its side
+    there (COMP_LEAD_HOLD_SMALL; under target/5 lots ahead, a lone lead keeps
+    most of it): the side leads again at the cheapest
     price ahead of the whole book that takes the share, else at the cap, and
     an order at or past the cap leaves the rung at the cap. An order sharing its price
     leaves it where it is; alone, it stays, or moves down when the book
@@ -20225,13 +20240,14 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
 
     def keeps_share(px: int) -> bool:
         s, ok = share_at(px)
-        return ok and s >= COMP_LEAD_SHARE
+        return ok and s >= min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE)
 
     if hold is not None and hold <= cap:
         below = [(p, q) for p, q in own if p < hold]
         at_or_above = [(p, q) for p, q in own if p >= hold]
-        # (COMP_LEAD_HOLD_SMALL: an order ahead that leaves the lead its
-        # share where it rests -- a few lots a tick over it -- is not fought)
+        # (COMP_LEAD_HOLD_SMALL: an order ahead that leaves the lead
+        # COMP_LEAD_HOLD_SHARE of its side where it rests -- up to ~190 lots
+        # over a 200 -- is not fought)
         if any(p > hold for p, _q in at_or_above) and not (
                 COMP_LEAD_HOLD_SMALL and keeps_share(hold)):
             # fought: ahead of the whole book, never past the cap
@@ -36524,8 +36540,12 @@ class IncentiveMarketMaker:
             + (f" -- {', '.join(FAIR_LEAD_SERIES) or 'no series'}: a side whose touch "
                f"sits ahead of a wall leads with target/5 at the cheapest price "
                f"taking {COMP_LEAD_SHARE:.0%} of the side, at least "
-               f"{FAIR_LEAD_MARGIN_C}c inside the model fair (fought to that cap, "
-               f"never chased up), priced into the estimate so a market under the "
+               f"{FAIR_LEAD_MARGIN_C}c inside the model fair (fought to that cap"
+               + (f" only where an order ahead leaves it under "
+                  f"{min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE):.0%} of the side, "
+                  f"as every lead is" if COMP_LEAD_HOLD_SMALL
+                  else " by any order ahead")
+               + f"; never chased up), priced into the estimate so a market under the "
                f"payout bar is admitted on it; a leading market's position cap "
                f"{FAIR_LEAD_MAX_POSITION:g}, the family's event cap "
                f"{FAIR_LEAD_EVENT_CAP:g}; no hedge but a ladder strike's own lock; "
