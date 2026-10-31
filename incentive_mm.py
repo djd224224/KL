@@ -2530,10 +2530,11 @@ def size_mult_profile(series: str, start_utc: datetime,
     return sorted((m, w / total) for m, w in weights.items())
 
 
-def series_max_position(series: str) -> float:
+def series_max_position(series: str, now_utc: Optional[datetime] = None,
+                        peak: bool = False) -> float:
     ov = SERIES_OVERRIDES.get(series)
     base = ov.max_position if (ov and ov.max_position is not None) \
-        else MAX_POSITION_CONTRACTS
+        else default_max_position(now_utc, peak)
     # commensurate with the mention ladder multiplier (Jack 2026-07-28);
     # 1.0 for hand-tuned override series via applied_mention_mult
     return base * applied_mention_mult(series)
@@ -2941,6 +2942,40 @@ def series_of(ticker: str) -> str:
 
 MAX_POSITION_CONTRACTS = _env_float("IMM_MAX_POSITION", 100)   # per market (user spec)
 MAX_EVENT_CONTRACTS = _env_float("IMM_MAX_EVENT", 500)         # net per event (user spec)
+# SATURDAY POSITION CAP (Jack 2026-10-30: "Raise it to 200 for Saturday
+# including overnight, otherwise keep it normal"). Saturday morning's x8
+# (c717704) rests 160 a side on the launcher's 20 lots, and the per-market cap
+# (IMM_MAX_POSITION 150) trimmed it to 150 -- the per-market x1.5 boosts
+# (near-cliff, yield, a side lean's winning side) with it. On a Saturday (the
+# ET calendar day, so its overnight hours too) from SAT_MAX_POSITION_FROM on,
+# a series with no hand-set cap takes SAT_MAX_POSITION instead. It rides the
+# family wire like the cap it replaces (the size test's half 225 -> 300,
+# elections 300 -> 400); a hand-set cap (a SeriesOverride max_position:
+# Broadway, ERCOT, the AS tests ...) stays literal. From Sunday 00:00 ET the
+# cap is normal again: a position built past it stops adding (nothing is
+# unwound) until it is back under. The skew knees and the event cap are
+# unchanged. IMM_SAT_MAX_POSITION=0 turns it off.
+SAT_MAX_POSITION = _env_float("IMM_SAT_MAX_POSITION", 200.0)
+SAT_MAX_POSITION_FROM = _env_et_day("IMM_SAT_MAX_POSITION_FROM", "2026-10-31")
+
+
+def default_max_position(now_utc: Optional[datetime] = None,
+                         peak: bool = False) -> float:
+    """The per-market cap before the family multiplier, for a series with no
+    hand-set one: MAX_POSITION_CONTRACTS, or SAT_MAX_POSITION on a Saturday
+    (ET) from SAT_MAX_POSITION_FROM on. `peak` = the larger whatever the day:
+    what a position built on a Saturday may still hold (the startup
+    reconcile's too-big-to-be-ours test). Only ever raises the cap, and an
+    uncapped (<= 0) MAX_POSITION_CONTRACTS stays uncapped."""
+    if MAX_POSITION_CONTRACTS <= 0 or SAT_MAX_POSITION <= MAX_POSITION_CONTRACTS \
+            or SAT_MAX_POSITION_FROM is None:
+        return MAX_POSITION_CONTRACTS
+    if peak:
+        return SAT_MAX_POSITION
+    et = (now_utc or datetime.now(timezone.utc)).astimezone(ET)
+    if et.weekday() == 5 and et.date() >= SAT_MAX_POSITION_FROM:
+        return SAT_MAX_POSITION
+    return MAX_POSITION_CONTRACTS
 # OpenRouter market-share events (2026-10-03): every strike is one author's
 # share, so the event's net YES is one bet. On 10/02 the bot built +222 YES
 # across three OpenAI strikes while OpenAI's share fell; the launcher's
@@ -11199,6 +11234,8 @@ _CONFIG_CODE_KNOBS = (
     "SAT_SIZE_MULT_GATED",
     # ...and Saturday morning's quiet hours at x4 (2026-10-30)
     "SAT_QUIET_HOUR_MULT", "SAT_QUIET_HOUR_MULT_FROM",
+    # ...and the per-market cap at SAT_MAX_POSITION on Saturdays (2026-10-30)
+    "SAT_MAX_POSITION", "SAT_MAX_POSITION_FROM",
     # evening window + yield size mode (2026-10-05, code defaults)
     "EVENING_SIZE_MULTS", "EVENING_SIZE_MULT_FROM", "YIELD_SIZE_MULT",
     "YIELD_SIZE_MULT_FROM", "YIELD_SIZE_MIN", "YIELD_SIZE_EXIT_FRAC",
@@ -30965,7 +31002,9 @@ class IncentiveMarketMaker:
             own = self.pnl.pos.get(t, 0.0)
             if abs(acct - own) < MANUAL_STANDOFF_CONTRACTS:
                 continue                      # below standoff threshold: harmless
-            if abs(acct) > series_max_position(series_of(t)):
+            # (judged on the Saturday cap whatever the day: a position built
+            # under it may outlive the Saturday)
+            if abs(acct) > series_max_position(series_of(t), peak=True):
                 continue                      # too big to be ours -> it's manual
             if t not in positions:
                 self._settle_or_drop(t, via="startup_reconcile")
@@ -32837,7 +32876,7 @@ class IncentiveMarketMaker:
                 side_max_bid = max(side_max_bid, lead_n)
             if lead_a is not None and lv_ask:
                 side_max_ask = max(side_max_ask, lead_n)
-            maxpos = series_max_position(meta.series)
+            maxpos = series_max_position(meta.series, now_utc)
             if lead_b is not None or lead_a is not None:       # a leading market's cap
                 maxpos = max(maxpos, FAIR_LEAD_MAX_POSITION if lead_src == "fair"
                              else COMP_LEAD_MAX_POSITION)
@@ -32876,7 +32915,7 @@ class IncentiveMarketMaker:
             if FAIR_LEAD_INV_QUOTE and meta.series in FAIR_LEAD_SERIES:
                 _xs = cap_pos - max(-FAIR_LEAD_MAX_POSITION,
                                     min(FAIR_LEAD_MAX_POSITION, cap_pos))
-                _base = series_max_position(meta.series)
+                _base = series_max_position(meta.series, now_utc)
                 # (a lead still on that side rests the rest of its own cap)
                 if cap_pos >= 1:
                     skew_b = _xs
@@ -37155,6 +37194,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"x{SAT_QUIET_HOUR_MULT:g} from {SAT_QUIET_HOUR_MULT_FROM.isoformat()} "
             f"(other mornings keep theirs; the Saturday multiplier on top for "
             f"long-dated series)")
+    if SAT_MAX_POSITION > MAX_POSITION_CONTRACTS > 0 and SAT_MAX_POSITION_FROM is not None:
+        log(f"[IMM] Saturday position cap: {SAT_MAX_POSITION:g} per market on "
+            f"Saturdays (ET, all day) from {SAT_MAX_POSITION_FROM.isoformat()}, "
+            f"{MAX_POSITION_CONTRACTS:g} otherwise -- times the family multiplier; "
+            f"hand-set caps unchanged (now {default_max_position():g})")
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):

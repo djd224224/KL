@@ -76,6 +76,11 @@ imm.YIELD_SIZE_MULT = 1.0
 # arms it explicitly.
 _SAT_AM_CODE_DEFAULT = (imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM)
 imm.SAT_QUIET_HOUR_MULT = 0.0
+# ...and the Saturday per-market cap (2026-10-30), so a suite run on a
+# Saturday sees the caps it does on any other day. TestSaturdayPositionCap
+# arms it explicitly.
+_SAT_CAP_CODE_DEFAULT = (imm.SAT_MAX_POSITION, imm.SAT_MAX_POSITION_FROM)
+imm.SAT_MAX_POSITION = 0.0
 # ...and the NFL player-prop gate (2026-10-03), default ON and fail-closed:
 # no refresher thread runs under test, so every NFL ladder / escalator would
 # stand aside and the ladder fixtures (sub-penny join, full unwind, the
@@ -9160,6 +9165,23 @@ class TestReconcileOwnershipGate(unittest.TestCase):
         self.assertEqual(bot.state.toxic_pending, [])
         self.assertEqual(bot.fetch_new_fills(), [])
 
+    def test_a_position_up_to_the_saturday_cap_is_ours_any_day(self):
+        """SAT_MAX_POSITION (2026-10-30): a 180-lot built under Saturday's 200
+        cap and found by a later restart is booked whatever the day; with the
+        Saturday cap off it is past the 150 cap and left as manual."""
+        for sat_cap, want in ((200.0, 180.0), (0.0, 0.0)):
+            with self.subTest(sat_cap=sat_cap):
+                bot = self._live_bot()
+                bot.client.fills = [self._fill("f1", "lost-o1", "180.00", "0.40")]
+                bot.client.order_lookup = {
+                    "lost-o1": {"client_order_id": "imm-dead0001-0123456789ab"}}
+                with mock.patch.multiple(imm, MAX_POSITION_CONTRACTS=150.0,
+                                         SAT_MAX_POSITION=sat_cap,
+                                         SAT_MAX_POSITION_FROM=datetime(2026, 10, 31).date()), \
+                        mock.patch.object(imm, "applied_mention_mult", return_value=1.0):
+                    bot._reconcile_orphaned_fills({self.T: 180.0})
+                self.assertAlmostEqual(bot.pnl.pos.get(self.T, 0.0), want)
+
     def test_known_order_fill_missed_by_the_read_needs_no_lookup(self):
         bot = self._live_bot()
         bot.state.our_order_ids["ours-1"] = time.time()
@@ -11301,6 +11323,76 @@ class TestSaturdayMorningX4(unittest.TestCase):
         imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM = _SAT_AM_CODE_DEFAULT
         imm.HOUR_SIZE_MULTS, imm.HOUR_SIZE_MULTS_NEXT = {}, {}
         self.assertEqual(imm.hour_size_mult("KXGOOD", self.et(2026, 10, 31, 3)), 2.0)
+
+
+class TestSaturdayPositionCap(unittest.TestCase):
+    """Jack 2026-10-30: "Raise it to 200 for Saturday including overnight,
+    otherwise keep it normal" -- the per-market cap of a series with no
+    hand-set one is SAT_MAX_POSITION all Saturday (ET) instead of
+    MAX_POSITION_CONTRACTS, times the family multiplier as before."""
+
+    def setUp(self):
+        self._saved = (imm.SAT_MAX_POSITION, imm.SAT_MAX_POSITION_FROM,
+                       imm.MAX_POSITION_CONTRACTS)
+        imm.SAT_MAX_POSITION, imm.SAT_MAX_POSITION_FROM = _SAT_CAP_CODE_DEFAULT
+        imm.MAX_POSITION_CONTRACTS = 150.0         # the launcher's
+
+    def tearDown(self):
+        (imm.SAT_MAX_POSITION, imm.SAT_MAX_POSITION_FROM,
+         imm.MAX_POSITION_CONTRACTS) = self._saved
+
+    @staticmethod
+    def et(y, mo, d, h, mi=0):
+        return imm.ET.localize(datetime(y, mo, d, h, mi)).astimezone(timezone.utc)
+
+    def test_code_default(self):
+        self.assertEqual(_SAT_CAP_CODE_DEFAULT, (200.0, datetime(2026, 10, 31).date()))
+
+    def test_all_saturday_overnight_included(self):
+        cap = imm.default_max_position
+        for when, want in (((2026, 10, 30, 23, 59), 150.0),    # Friday night
+                           ((2026, 10, 31, 0, 0), 200.0),      # Saturday from 00:00
+                           ((2026, 10, 31, 3, 0), 200.0),      # its overnight
+                           ((2026, 10, 31, 14, 0), 200.0),
+                           ((2026, 10, 31, 23, 59), 200.0),
+                           ((2026, 11, 1, 0, 0), 150.0),       # Sunday
+                           ((2026, 11, 3, 3, 0), 150.0),       # a weekday night
+                           ((2026, 11, 7, 0, 30), 200.0),      # an EST Saturday
+                           ((2026, 10, 24, 3, 0), 150.0)):     # before the start
+            with self.subTest(when=when):
+                self.assertEqual(cap(self.et(*when)), want)
+
+    def test_family_wire_scales_it_hand_set_caps_stay(self):
+        sat, sun = self.et(2026, 10, 31, 3), self.et(2026, 11, 1, 3)
+        with mock.patch.object(imm, "applied_mention_mult", return_value=1.5):
+            self.assertEqual(imm.series_max_position("KXPLAINCAP", sat), 300.0)
+            self.assertEqual(imm.series_max_position("KXPLAINCAP", sun), 225.0)
+        with mock.patch.dict(imm.SERIES_OVERRIDES,
+                             {"KXHANDCAP": imm.SeriesOverride(max_position=150.0)}):
+            self.assertEqual(imm.series_max_position("KXHANDCAP", sat), 150.0)
+
+    def test_the_x8_rung_rests_whole(self):
+        sat = self.et(2026, 10, 31, 3)
+        with mock.patch.object(imm, "applied_mention_mult", return_value=1.0):
+            cap = imm.series_max_position("KXPLAINCAP", sat)
+        self.assertEqual(imm.clamp_side_max_to_position_cap(160, 240, cap), (160, 200))
+
+    def test_peak_is_the_saturday_cap_any_day(self):
+        sun = self.et(2026, 11, 1, 3)
+        self.assertEqual(imm.default_max_position(sun, peak=True), 200.0)
+        imm.SAT_MAX_POSITION = 0.0
+        self.assertEqual(imm.default_max_position(sun, peak=True), 150.0)
+
+    def test_off_switch_never_lowers_never_caps_uncapped(self):
+        sat = self.et(2026, 10, 31, 3)
+        for sat_cap, base, want in ((0.0, 150.0, 150.0), (120.0, 150.0, 150.0),
+                                    (200.0, 0.0, 0.0)):
+            with self.subTest(sat_cap=sat_cap, base=base):
+                imm.SAT_MAX_POSITION, imm.MAX_POSITION_CONTRACTS = sat_cap, base
+                self.assertEqual(imm.default_max_position(sat), want)
+        imm.SAT_MAX_POSITION, imm.MAX_POSITION_CONTRACTS = 200.0, 150.0
+        imm.SAT_MAX_POSITION_FROM = None
+        self.assertEqual(imm.default_max_position(sat), 150.0)
 
 
 class TestSaturdayGatedStepUp(unittest.TestCase):
