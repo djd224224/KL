@@ -86,6 +86,10 @@ imm.SAT_MAX_POSITION = 0.0
 # TestWeekdayNightDeepBookCap arms it explicitly.
 _NIGHT_CAP_CODE_DEFAULT = imm.NIGHT_TOTAL_SIZE_MULT_CAP
 imm.NIGHT_TOTAL_SIZE_MULT_CAP = 0.0
+# ...and the strait weeklies' night hold (2026-10-31), so a suite run between
+# 00:00 and 08:00 ET sees their day size. TestShippingSizeAndBand arms it.
+_NIGHT_HOLD_CODE_DEFAULT = imm.SHIPPING_NIGHT_HOLD_SERIES
+imm.SHIPPING_NIGHT_HOLD_SERIES = ()
 # ...and the NFL player-prop gate (2026-10-03), default ON and fail-closed:
 # no refresher thread runs under test, so every NFL ladder / escalator would
 # stand aside and the ladder fixtures (sub-penny join, full unwind, the
@@ -11471,6 +11475,47 @@ class TestShippingSizeAndBand(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult("KXPANAMAWEEKLY"), 3.0)
             self.assertEqual(imm.applied_mention_mult("KXBALTPORTTEU"), 2.25)
             self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.5)
+
+    def test_the_weeklies_nights_keep_the_old_size(self):
+        """Jack 2026-10-31: "yes hold their nights at the old size" -- 00-08
+        ET the four strait weeklies run without the step; ports and Hormuz
+        peak keep it."""
+        def ts(h, m=0):
+            return imm.ET.localize(datetime(2026, 11, 2, h, m)).timestamp()   # a Monday
+        self.assertEqual(set(_NIGHT_HOLD_CODE_DEFAULT), set(self.MEASURED[:4]))
+        self.assertEqual(imm.SHIPPING_NIGHT_HOLD_ET, (0, 8))
+        patcher = mock.patch.object(imm, "SHIPPING_NIGHT_HOLD_SERIES",
+                                    _NIGHT_HOLD_CODE_DEFAULT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        step = imm.shipping_night_step
+        for s in self.MEASURED[:4]:
+            self.assertEqual(step(s, ts(0)), 1.5, s)
+            self.assertEqual(step(s, ts(7, 59)), 1.5, s)
+            self.assertEqual(step(s, ts(8)), 1.0, s)
+            self.assertEqual(step(s, ts(23, 59)), 1.0, s)
+        for s in self.MEASURED[4:] + self.BY_METADATA:
+            self.assertEqual(step(s, ts(3)), 1.0, s)
+        with mock.patch.object(imm, "size_test_mult", lambda s, now_ts=None: 1.0):
+            with mock.patch.object(imm.time, "time", return_value=ts(3)):
+                self.assertEqual(imm.applied_mention_mult("KXSUEZWEEKLY"), 2.0)
+                self.assertEqual(imm.applied_mention_mult("KXPANAMAWEEKLY"), 2.0)
+                self.assertEqual(imm.applied_mention_mult("KXMOBILETEU"), 3.0)
+                self.assertEqual(imm.applied_mention_mult("KXHORMUZPEAK"), 1.5)
+                self.assertEqual(imm.series_max_position("KXSUEZWEEKLY"),
+                                 2.0 * imm.MAX_POSITION_CONTRACTS)
+            with mock.patch.object(imm.time, "time", return_value=ts(12)):
+                self.assertEqual(imm.applied_mention_mult("KXSUEZWEEKLY"), 3.0)
+                self.assertEqual(imm.series_max_position("KXSUEZWEEKLY"),
+                                 3.0 * imm.MAX_POSITION_CONTRACTS)
+
+    def test_the_night_hold_turns_off(self):
+        night = imm.ET.localize(datetime(2026, 11, 2, 3)).timestamp()
+        with mock.patch.object(imm, "SHIPPING_NIGHT_HOLD_SERIES", ()):
+            self.assertEqual(imm.shipping_night_step("KXSUEZWEEKLY", night), 1.0)
+        with mock.patch.object(imm, "SHIPPING_NIGHT_HOLD_SERIES", _NIGHT_HOLD_CODE_DEFAULT), \
+                mock.patch.object(imm, "SHIPPING_SIZE_STEP", 1.0):
+            self.assertEqual(imm.shipping_night_step("KXSUEZWEEKLY", night), 1.0)
 
     def test_the_mid_screen_takes_a_shipping_strike_at_95c(self):
         bot = IncentiveMarketMaker(client=None, live=False)

@@ -2517,7 +2517,8 @@ def applied_mention_mult(series: str) -> float:
     # proportional -- and the estimator's hypothetical ladder, hence the
     # payout-floor projection, sees the doubled size, as Jack asked.
     if ov and ov.size_mult is not None:
-        m *= ov.size_mult
+        # (the strait weeklies' nights without the 10/31 shipping step)
+        m *= ov.size_mult / shipping_night_step(series)
     # ...and the base size split test's half (SIZE_TEST_MULT, 2026-10-26)
     return m * size_test_mult(series)
 
@@ -11285,7 +11286,7 @@ _CONFIG_CODE_KNOBS = (
     # shipping 5 strikes an event, x1.5 at 3-97c (2026-10-31)
     "SHIPPING_EVENT_TOP_N", "SHIPPING_EVENT_TOP_N_SERIES",
     "SHIPPING_SIZE_STEP", "SHIPPING_PRICE_MIN", "SHIPPING_PRICE_MAX",
-    "SHIPPING_STEP_SERIES",
+    "SHIPPING_STEP_SERIES", "SHIPPING_NIGHT_HOLD_SERIES", "SHIPPING_NIGHT_HOLD_ET",
     "AWARDS_SERIES", "AWARDS_PRE_EVENT_DAYS", "AWARDS_EVENT_DATES",
     "AWARDS_TABLE_ONLY_SERIES",
     # awards by Kalshi tag (2026-10-12)
@@ -18386,6 +18387,37 @@ for _s in SHIPPING_STEP_SERIES if SHIPPING_SIZE_STEP != 1.0 else ():
                  else SERIES_OVERRIDES[GRADUATE_AUTO_PARENT])
     SERIES_OVERRIDES[_s] = replace(
         _base, size_mult=(_base.size_mult or 1.0) * SHIPPING_SIZE_STEP)
+
+# ...THE WEEKLIES' NIGHTS AT THE OLD SIZE (Jack 2026-10-31: "yes hold their
+# nights at the old size", on the step putting Suez, Bab el-Mandeb and Hormuz
+# weekly at x4.5 overnight, x9 on Saturday mornings, against the x6 the
+# 10/14-15 pick-offs came at: traders counting transits off live ship
+# tracking). From SHIPPING_NIGHT_HOLD_ET (00:00 to 08:00 ET) the four strait
+# weeklies take their family size without SHIPPING_SIZE_STEP -- x2, x3 in
+# the size test's half, x2 more on a Saturday, as before 10/31 -- through
+# applied_mention_mult, so rungs, caps and skew knees step down together and
+# back up at 08:00. They already skip the global window's overnight x3
+# (QUIET_HOURS_OFF_SERIES). KXHORMUZPEAK and the ports keep the step at night.
+# IMM_SHIPPING_NIGHT_HOLD_SERIES="" turns it off.
+SHIPPING_NIGHT_HOLD_SERIES: Tuple[str, ...] = tuple(sorted({
+    s.strip() for s in os.environ.get(
+        "IMM_SHIPPING_NIGHT_HOLD_SERIES",
+        "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY").split(",")
+    if s.strip()}))
+SHIPPING_NIGHT_HOLD_ET: Tuple[int, int] = tuple(            # [start, end) ET hours
+    int(x) for x in os.environ.get("IMM_SHIPPING_NIGHT_HOLD_ET", "0-8").split("-"))
+
+
+def shipping_night_step(series: str, now_ts: Optional[float] = None) -> float:
+    """SHIPPING_SIZE_STEP while a SHIPPING_NIGHT_HOLD_SERIES weekly is inside
+    SHIPPING_NIGHT_HOLD_ET (its family size divides by it then), else 1.0."""
+    if (SHIPPING_SIZE_STEP == 1.0 or series not in SHIPPING_NIGHT_HOLD_SERIES
+            or series not in SHIPPING_STEP_SERIES):
+        return 1.0
+    ts = time.time() if now_ts is None else now_ts
+    hour = datetime.fromtimestamp(ts, timezone.utc).astimezone(ET).hour
+    lo, hi = SHIPPING_NIGHT_HOLD_ET
+    return SHIPPING_SIZE_STEP if lo <= hour < hi else 1.0
 
 # KXSOFTWAREUNEMP x3 LADDER (Jack 2026-10-25: "X3", the day it was enrolled,
 # on "tripling the size, as we did for the ski resorts"): at x1 its nine
@@ -37462,7 +37494,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"[IMM] shipping x{SHIPPING_SIZE_STEP:g}, band "
             f"{SHIPPING_PRICE_MIN}-{SHIPPING_PRICE_MAX}c: "
             + ", ".join(f"{_s} x{applied_mention_mult(_s):g}" for _s in SHIPPING_STEP_SERIES)
-            + " (family x size-test half, now)")
+            + " (family x size-test half, now)"
+            + (f"; {','.join(SHIPPING_NIGHT_HOLD_SERIES)} without the step "
+               f"{SHIPPING_NIGHT_HOLD_ET[0]:02d}-{SHIPPING_NIGHT_HOLD_ET[1]:02d} ET"
+               if SHIPPING_NIGHT_HOLD_SERIES and SHIPPING_SIZE_STEP != 1.0 else ""))
     for _pfx, _hrs in SERIES_HOUR_MULTS:
         _by_mult: Dict[float, List[int]] = {}
         for _h, _m in sorted(_hrs.items()):
