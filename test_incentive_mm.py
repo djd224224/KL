@@ -14759,6 +14759,254 @@ class TestRtFloorBoost(unittest.TestCase):
         bot._prune_near_cliff_boost()
         self.assertEqual(bot._rt_floor_boost, {})
 
+    def test_the_next_refresh_projects_the_boosted_ladder(self):
+        # the estimator reads _market_size_mult, so the refresh after the
+        # boost arms projects the x2.5 ladder that rests -- not the market's
+        # own size, which the verdict would then divide by x2.5 again and
+        # put on the hopeless clock (evicted 30 minutes later). Here x2.5
+        # really projects ~2.15x its own size, so the bar sits at 2.05x
+        P, plain = self._plain()
+        bot = self._bot()
+        with mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 2.05 * P):
+            bot.run_cycle()
+            self.assertEqual(bot._rt_floor_boost, {self.T: 2.5})
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot._rt_floor_boost, {self.T: 2.5})
+        self.assertNotIn(self.T, bot.state.hopeless_since)
+        self.assertEqual(self._sizes(bot), sorted(int(c * 2.5 + 0.5) for c in plain))
+
+
+class TestVercelFloorBoost(unittest.TestCase):
+    """Jack 2026-11-01: "payout floor is $1 across life, not per day. add rule
+    for ability to 2.5x multiplier up to 500 on each side on Vercel, if
+    necessary to get above $1 floor. once trending above floor, can decrease
+    multiplier back down." VERCEL FLOOR BOOST. Fixture: TestVercelFairLead's
+    far KXOPENVREQ event (a 40c fair at T20) with its leads COPIED, as the
+    04NOV26 cohort's were within a minute of listing: 6,837 YES rest on the
+    17c bid and 6,490 NO on the 77c offer, so each 200 keeps ~3% of its side."""
+
+    T = "KXOPENVREQ-05DEC68-T20"          # TestVercelFairLead's (defined below)
+    EV = "KXOPENVREQ-05DEC68"
+    CLOSE = datetime(2068, 12, 6, 3, 59, tzinfo=timezone.utc)
+    YES = [[1, 1], [2, 100], [17, 6837]]
+    NO = [[1, 1], [2, 100], [3, 1], [23, 6490]]
+
+    def setUp(self):
+        _clean_persist()
+        imm._vercel_state.update(mtime=0.0, entries={}, moved_at={})
+        try:
+            os.remove(imm.VERCEL_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "ADMIT_SUSTAIN_SECS", 0),
+                  mock.patch.object(imm, "LEVELS", [(0, 20)]),
+                  mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                  mock.patch.object(imm, "JOIN_AHEAD_MODE", "off")):
+            p.start()
+            self.addCleanup(p.stop)
+        TestVercelFairLead._drop_holds()
+        self.addCleanup(TestVercelFairLead._drop_holds)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _bot(self, copied=True):
+        """A fresh bot on the fixture book; `copied` = its leads hold at 17c /
+        77c beside the copier (COMP_HOLD_FILE), else they lead afresh."""
+        _clean_persist()
+        TestVercelFairLead._drop_holds()
+        TestVercelFairLead._write(self)
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 7000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.1700", "yes_ask_dollars": "0.7700",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+        bot = IncentiveMarketMaker(client=client, live=False)
+        if copied:
+            bot._comp_holds[self.T] = [17, 77, time.time()]
+        return bot
+
+    def _run(self, bot, bar, **patches):
+        """A selection refresh under the payout bar `bar` (and `patches`),
+        then two quoting cycles: (rungs, log lines)."""
+        lines = []
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(
+                imm, "floor_bar_dollars", lambda series, banked: bar))
+            for name, v in patches.items():
+                st.enter_context(mock.patch.object(imm, name, v))
+            st.enter_context(mock.patch.object(imm, "log", lines.append))
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        return TestVercelFairLead._rungs(self, bot), lines
+
+    def _plain(self, copied=True):
+        """The projection at the market's own size, the bar out of the way."""
+        bot = self._bot(copied)
+        rungs, _lines = self._run(bot, 0.0)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {})
+        if copied:
+            self.assertIn((17, 200), rungs.get("bid", []), rungs)
+            self.assertIn((77, 200), rungs.get("ask", []), rungs)
+        return bot._est_peak[self.T][0]
+
+    def test_the_steps_sizes_and_pick(self):
+        self.assertEqual(imm.VERCEL_FLOOR_BOOST_MAX, 2.5)
+        self.assertEqual(imm.VERCEL_FLOOR_BOOST_SIDE_CAP, 500.0)
+        for k in ("VERCEL_FLOOR_BOOST_MAX", "VERCEL_FLOOR_BOOST_SIDE_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        self.assertEqual(imm.vercel_boost_steps(), [1.0, 1.5, 2.0, 2.5])
+        with mock.patch.object(imm, "VERCEL_FLOOR_BOOST_MAX", 3.0):
+            self.assertEqual(imm.vercel_boost_steps(), [1.0, 1.5, 2.0, 2.5, 3.0])
+        with mock.patch.object(imm, "VERCEL_FLOOR_BOOST_MAX", 1.0):
+            self.assertEqual(imm.vercel_boost_steps(), [1.0])
+            self.assertFalse(imm.vercel_floor_boost_series("KXOPENVSPEND"))
+        for s in imm.VERCEL_SERIES:
+            self.assertTrue(imm.vercel_floor_boost_series(s), s)
+        self.assertFalse(imm.vercel_floor_boost_series("KXRT"))
+        # the lead: target/5 x the step, at most 500 a side
+        lead = imm.vercel_boost_lead_size
+        self.assertEqual([lead(1000.0, m) for m in (1.0, 1.5, 2.0, 2.5, 3.0)],
+                         [200, 300, 400, 500, 500])
+        self.assertEqual(lead(0.0, 2.5), 0)
+        # the cap that bounds each side: up to 500 while boosted, never lowered
+        cap = imm.vercel_boost_cap
+        self.assertEqual((cap(300.0, 1.0), cap(300.0, 1.5), cap(600.0, 2.5)),
+                         (300.0, 500.0, 600.0))
+        pick = imm.vercel_boost_pick
+        under = {1.0: 0.45, 1.5: 0.70, 2.0: 1.05, 2.5: 1.20}
+        self.assertEqual(pick(1.0, under, 1.0, 1.1), 2.0)            # smallest that clears
+        self.assertEqual(pick(1.0, {**under, 2.0: 0.95}, 1.0, 1.1), 2.5)
+        self.assertEqual(pick(1.0, {1.0: 1.02, 1.5: 1.5}, 1.0, 1.1), 1.0)
+        self.assertEqual(pick(1.0, {1.0: 0.3, 2.5: 0.8}, 1.0, 1.1), 1.0)   # no step lifts it
+        # boosted: x2 over the bar but under the line holds x2.5; a lower step
+        # over the line takes it down (the smallest such); short of the bar
+        # it steps up; with no step clearing, the step stands
+        self.assertEqual(pick(2.5, under, 1.0, 1.1), 2.5)
+        self.assertEqual(pick(2.5, {**under, 2.0: 1.12}, 1.0, 1.1), 2.0)
+        self.assertEqual(pick(2.5, {**under, 1.0: 1.15, 2.0: 1.6}, 1.0, 1.1), 1.0)
+        self.assertEqual(pick(1.5, under, 1.0, 1.1), 2.0)
+        self.assertEqual(pick(2.0, {1.0: 0.3, 1.5: 0.5, 2.0: 0.7, 2.5: 0.9}, 1.0, 1.1), 2.0)
+        # the line is never under the bar
+        self.assertEqual(pick(2.5, {1.0: 0.5, 2.0: 1.2, 2.5: 1.4}, 1.3, 1.1), 2.5)
+
+    def test_a_copied_lead_rests_the_step_that_clears_the_floor(self):
+        P = self._plain()
+        self.assertGreater(P, 3.0)
+        # the bar at 2.2x its own projection: x2 falls short, x2.5 clears
+        bot = self._bot()
+        rungs, lines = self._run(bot, 2.2 * P)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.5})
+        self.assertIn((17, 500), rungs.get("bid", []), rungs)
+        self.assertIn((77, 500), rungs.get("ask", []), rungs)
+        self.assertEqual(bot._comp_lead_px[self.T], (17, 77, 500))
+        self.assertTrue(any(f"vercel floor boost: {self.T} projects" in x
+                            and "at its own size, under the" in x
+                            and "x2.5 (a lead of 500, at most 500 a side)" in x
+                            for x in lines), lines)
+        # at 1.8x, x2 is enough: a lead of 400 a side
+        bot = self._bot()
+        rungs, _lines = self._run(bot, 1.8 * P)
+        self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.0})
+        self.assertIn((17, 400), rungs.get("bid", []), rungs)
+        self.assertIn((77, 400), rungs.get("ask", []), rungs)
+
+    def test_the_step_comes_down_once_a_lower_one_projects_the_line(self):
+        P = self._plain()
+        bot = self._bot()
+        self._run(bot, 2.2 * P)
+        self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.5})
+        # x2 (~1.94x) clears a 1.5x bar but not a 2.1x line: it holds at x2.5
+        rungs, _lines = self._run(bot, 1.5 * P, NEAR_CLIFF_SECURE_DOLLARS=2.1 * P)
+        self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.5})
+        self.assertIn((17, 500), rungs.get("bid", []), rungs)
+        # ...and comes down to x2 with the line at 1.9x
+        rungs, lines = self._run(bot, 1.5 * P, NEAR_CLIFF_SECURE_DOLLARS=1.9 * P)
+        self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.0})
+        self.assertIn((17, 400), rungs.get("bid", []), rungs)
+        self.assertTrue(any(f"vercel floor boost: {self.T} projects" in x
+                            and "at x2, over the" in x and "down from x2.5" in x
+                            for x in lines), lines)
+        # ...and to its own size once x1 projects the line itself
+        rungs, lines = self._run(bot, 0.5 * P, NEAR_CLIFF_SECURE_DOLLARS=0.9 * P)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {})
+        self.assertIn((17, 200), rungs.get("bid", []), rungs)
+        self.assertTrue(any("at its own size, over the" in x and "down from x2" in x
+                            for x in lines), lines)
+
+    def test_a_lead_alone_at_the_front_is_not_boosted_on_a_linear_guess(self):
+        # no copier: the fresh leads rest alone ahead of the walls with most
+        # of each side, so x2.5 adds little and a bar at 1.5x the projection
+        # stays out of reach (a linear guess would call it 2.5x)
+        P = self._plain(copied=False)
+        bot = self._bot(copied=False)
+        self._run(bot, 1.5 * P)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {})
+
+    def test_out_of_reach_or_off_it_stays_out(self):
+        P = self._plain()
+        bot = self._bot()
+        self._run(bot, 3.0 * P)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {})
+        bot = self._bot()
+        rungs, _lines = self._run(bot, 2.2 * P, VERCEL_FLOOR_BOOST_MAX=1.0)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {})
+
+    def test_every_reader_sees_the_step_and_a_restart_keeps_it(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.state.vercel_floor_boost = {self.T: 2.5}
+        with mock.patch.object(imm, "ca_landing_window", return_value=False):
+            self.assertEqual(bot._market_size_mult(self.T), 2.5)
+            bot._near_cliff_boost[self.T] = time.time()     # x1.5: the larger wins
+            self.assertEqual(bot._market_size_mult(self.T), 2.5)
+        bot._near_cliff_boost.clear()
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXOPENVREQ",
+                              dollars_per_day=11.42, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None, close_time=self.CLOSE,
+                              mid_cents=47.0, spread_cents=60, volume=0.0)
+        self.assertTrue(bot._room_priority(meta))           # first call on its event's room
+        with mock.patch.object(imm, "VERCEL_FLOOR_BOOST_MAX", 1.0):
+            self.assertEqual(bot._vercel_boost_mult(self.T), 1.0)
+            self.assertEqual(bot._market_size_mult(self.T), 1.0)
+        # persisted: a restart keeps the step its orders rest at
+        bot.state.vercel_floor_boost[f"{self.EV}-T21"] = 1.0      # not a step: dropped
+        bot._save_persist()
+        again = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(again.state.vercel_floor_boost, {self.T: 2.5})
+
+    def test_it_lasts_while_the_market_is_selected(self):
+        P = self._plain()
+        bot = self._bot()
+        bot.state.vercel_floor_boost[f"{self.EV}-T21"] = 2.0     # not a candidate here
+        self._run(bot, 2.2 * P)
+        self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.5})
+
 
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the

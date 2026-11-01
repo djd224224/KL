@@ -11779,6 +11779,8 @@ _CONFIG_CODE_KNOBS = (
     "RT_SETTLED_MODE", "RT_SETTLED_MIN_REVIEWS", "RT_SETTLED_P", "RT_SETTLED_MIN_GAP",
     "RT_SETTLED_MID", "RT_SETTLED_BAND_LO", "RT_SETTLED_BAND_HI", "RT_SETTLED_STOP_H",
     "RT_FLOOR_BOOST_MAX",         # RT up to x2.5 to clear the payout floor (2026-11-01)
+    # Vercel up to x2.5, 500 a side, to clear the payout floor (2026-11-01)
+    "VERCEL_FLOOR_BOOST_MAX", "VERCEL_FLOOR_BOOST_SIDE_CAP",
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
@@ -14912,6 +14914,85 @@ def rt_floor_boost_mult(accrued: float, plain: float, bar: float) -> Optional[fl
         m += 0.5
     steps.append(RT_FLOOR_BOOST_MAX)
     return next((m for m in steps if accrued + m * plain >= bar), None)
+
+
+# VERCEL FLOOR BOOST (Jack 2026-11-01: "payout floor is $1 across life, not
+# per day. add rule for ability to 2.5x multiplier up to 500 on each side on
+# Vercel, if necessary to get above $1 floor. once trending above floor, can
+# decrease multiplier back down."). The 04NOV26 cohort was copied within a
+# minute of its 16:55Z listing: 3-22k contracts joined every lead at its own
+# price, our 200 kept 1-3% of each side, and by 17:54Z 59 of its 63 lab
+# strikes projected under the $1.00 floor over their lives
+# (KXMOONVSPEND-04NOV26-T10P2: $0.49). A copied lead holds its price
+# (COMP_LEAD_HOLD_SHARE 0), so size is the lever left, and beside a copier
+# our share grows nearly in step with it. A VERCEL_SERIES market whose
+# projection misses the bar rests the smallest of x1.5, x2 ...
+# VERCEL_FLOOR_BOOST_MAX that clears it: its lead (target/5) and its ladder
+# both scale, each side at most VERCEL_FLOOR_BOOST_SIDE_CAP, and its position
+# cap rises to that while it is boosted. Each step's projection is the
+# estimator's own -- this refresh's floor projection rescaled by what that
+# step's ladder and lead score on the external book against the current
+# step's, so the caps and our own weight in the scored walk count. The step
+# is judged again every refresh (vercel_boost_pick): it holds while it still
+# clears the bar and rises when it does not, and it steps DOWN to the
+# smallest step that projects the secure line (NEAR_CLIFF_SECURE_DOLLARS,
+# where Kalshi paid 94%+ of estimated market-periods) -- the market trending
+# above the floor -- so one that banks its floor goes back to its own size.
+# It lasts while the market is selected, takes first call on its event's
+# room (as the near-cliff mode does) and is persisted, so a restart keeps
+# the step its orders rest at. The event cap is not raised. A market no step
+# lifts stays out. IMM_VERCEL_FLOOR_BOOST_MAX <= 1 turns it off.
+VERCEL_FLOOR_BOOST_MAX = _env_float("IMM_VERCEL_FLOOR_BOOST_MAX", 2.5)
+VERCEL_FLOOR_BOOST_SIDE_CAP = _env_float("IMM_VERCEL_FLOOR_BOOST_SIDE_CAP", 500.0)
+
+
+def vercel_floor_boost_series(series: str) -> bool:
+    return VERCEL_FLOOR_BOOST_MAX > 1.0 and vercel_series(series)
+
+
+def vercel_boost_steps() -> List[float]:
+    """x1 (the market's own size), then x1.5, x2 ... VERCEL_FLOOR_BOOST_MAX."""
+    steps, m = [1.0], 1.5
+    while m < VERCEL_FLOOR_BOOST_MAX - 1e-9:
+        steps.append(m)
+        m += 0.5
+    if VERCEL_FLOOR_BOOST_MAX > 1.0:
+        steps.append(VERCEL_FLOOR_BOOST_MAX)
+    return steps
+
+
+def vercel_boost_lead_size(target: float, boost: float) -> int:
+    """A leading side's size at VERCEL FLOOR BOOST step `boost`: target/5
+    times it, at most VERCEL_FLOOR_BOOST_SIDE_CAP and never under target/5."""
+    n = comp_lead_size(target)
+    if boost <= 1.0:
+        return n
+    return max(n, min(int(VERCEL_FLOOR_BOOST_SIDE_CAP), int(math.ceil(n * boost - 1e-9))))
+
+
+def vercel_boost_cap(maxpos: float, boost: float) -> float:
+    """A market's position cap -- which also bounds each side's resting size
+    (clamp_side_max_to_position_cap) -- at step `boost`: raised to
+    VERCEL_FLOOR_BOOST_SIDE_CAP while boosted, never lowered."""
+    return max(maxpos, VERCEL_FLOOR_BOOST_SIDE_CAP) if boost > 1.0 else maxpos
+
+
+def vercel_boost_pick(cur: float, proj: Dict[float, float], bar: float,
+                      line: float) -> float:
+    """The VERCEL FLOOR BOOST step for this refresh. `proj` = {step: banked +
+    projected total at that step}, x1 included; `cur` = the step the market
+    rests at now. A boosted market steps DOWN to the smallest step that
+    projects `line` (never under `bar`), else holds while its own step still
+    clears `bar`; otherwise -- and unboosted -- it takes the smallest step that
+    clears `bar`. With none clearing it, `cur` stands: no size lifts it."""
+    steps = sorted(proj)
+    if cur > 1.0:
+        for m in steps:
+            if m < cur and proj[m] >= max(line, bar):
+                return m
+        if proj.get(cur, 0.0) >= bar:
+            return cur
+    return next((m for m in steps if proj[m] >= bar), cur)
 
 
 # BROADWAY WEEKLY ATTENDANCE GATE (Jack 2026-10-25: "Can you build a fair
@@ -22318,6 +22399,9 @@ class MarketMeta:
     est_hour_mult: Optional[float] = None   # hour_size_mult the estimate ran at
     nc_size_mult: Optional[float] = None    # near-cliff mult on the probe ladder
     ys_size_mult: Optional[float] = None    # yield size mode after this refresh's verdict
+    vb_size_mult: Optional[float] = None    # VERCEL FLOOR BOOST step after this refresh's verdict
+    vb_floor_by_step: List[Tuple[float, float]] = field(default_factory=list)
+    #   [(Vercel floor boost step, floor $/day at it)]; [] = not a boosted family
     floor_by_mult: List[List[float]] = field(default_factory=list)
     #   [[mult, weight, $/day at that mult], ...]; [] = floor is the live estimate
     floor_realized_ratio: Optional[float] = None   # incumbent: resting score /
@@ -22443,6 +22527,10 @@ class BotState:
     # for the run to reach the sustain window, and only such a run may reset
     # hopeless_since. Persisted with hopeless_since (~20 restarts a day).
     admit_run: Dict[str, List[float]] = field(default_factory=dict)
+    # ticker -> the VERCEL FLOOR BOOST step it rests at (2026-11-01; absent =
+    # its own size). Persisted, so a restart scores and keeps the step its
+    # orders rest at; dropped once the market leaves the selection.
+    vercel_floor_boost: Dict[str, float] = field(default_factory=dict)
     #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
     rain_dir_done: Dict[str, float] = field(default_factory=dict)  # ticker -> entry ts
@@ -23931,6 +24019,11 @@ class IncentiveMarketMaker:
                 str(t): [float(v[0]), float(v[1])]
                 for t, v in (data.get("admit_run") or {}).items()
                 if isinstance(v, (list, tuple)) and len(v) == 2}
+            # the VERCEL FLOOR BOOST step each market's orders rest at
+            self.state.vercel_floor_boost = {
+                str(t): float(v)
+                for t, v in (data.get("vercel_floor_boost") or {}).items()
+                if isinstance(v, (int, float)) and float(v) > 1.0}
             self._loaded_credit = (set(self.state.accrued_est)
                                    | set(self.state.period_base)
                                    | set(self.state.period_start)
@@ -24367,6 +24460,9 @@ class IncentiveMarketMaker:
                                t: [round(v[0], 1), round(v[1], 1)]
                                for t, v in self.state.admit_run.items()
                                if self._keeps_accrual(t)},
+                           # the VERCEL FLOOR BOOST steps (2026-11-01): a
+                           # restart scores and keeps the size that rests
+                           "vercel_floor_boost": dict(self.state.vercel_floor_boost),
                            # pruned on the SAME rule as accrued_est: a ticker
                            # that drops out of one must drop out of the other,
                            # or a re-listed ticker resumes "already paid"
@@ -27692,10 +27788,12 @@ class IncentiveMarketMaker:
 
     def _room_priority(self, meta: "MarketMeta") -> bool:
         """First call on the event's room in the quote loop: a market in
-        near-cliff mode (verdict this refresh, or the sticky size mode)."""
+        near-cliff mode (verdict this refresh, or the sticky size mode), or on
+        a VERCEL FLOOR BOOST step."""
         return NEAR_CLIFF_ROOM_PRIORITY and (
             meta.ticker in self._near_cliff_boost
-            or bool(getattr(meta, "near_cliff", False)))
+            or bool(getattr(meta, "near_cliff", False))
+            or meta.ticker in self.state.vercel_floor_boost)
 
     def _near_cliff_size_mult(self, ticker: str) -> float:
         """NEAR_CLIFF_SIZE_MULT while `ticker` is in near-cliff mode (armed by
@@ -27720,13 +27818,20 @@ class IncentiveMarketMaker:
             return 1.0
         return YIELD_SIZE_MULT
 
+    def _vercel_boost_mult(self, ticker: str) -> float:
+        """The VERCEL FLOOR BOOST step `ticker` rests at (1.0: its own size)."""
+        if VERCEL_FLOOR_BOOST_MAX <= 1.0:
+            return 1.0
+        return self.state.vercel_floor_boost.get(ticker, 1.0)
+
     def _market_size_mult(self, ticker: str) -> float:
-        """Every PER-MARKET ladder multiplier: the larger of the near-cliff size
-        mode and the RT floor boost, x yield size mode. The one number each
-        reader of the shape applies (estimator probe and floor projection,
-        collateral reservation, quote loop, placement guard), so all of them
-        see the ladder the quote loop rests."""
-        return (max(self._near_cliff_size_mult(ticker), self._rt_floor_boost.get(ticker, 1.0))
+        """Every PER-MARKET ladder multiplier: the largest of the near-cliff
+        size mode, the RT floor boost and the Vercel floor boost, x yield size
+        mode. The one number each reader of the shape applies (estimator probe
+        and floor projection, collateral reservation, quote loop, placement
+        guard), so all of them see the ladder the quote loop rests."""
+        return (max(self._near_cliff_size_mult(ticker), self._rt_floor_boost.get(ticker, 1.0),
+                    self._vercel_boost_mult(ticker))
                 * self._yield_size_mult(ticker))
 
     def _yield_size_verdict(self, meta: "MarketMeta", now_ts: float) -> None:
@@ -28584,6 +28689,39 @@ class IncentiveMarketMaker:
                 meta.series, meta.ticker in prev_selected or accrued > 0.0)
             projected_total = accrued + max(est_total, proj_peak)
             reaches_min = projected_total >= floor_bar
+            # VERCEL FLOOR BOOST (2026-11-01, see VERCEL_FLOOR_BOOST_MAX): the
+            # step a Vercel market rests at, judged on each step's own
+            # projection (vb_floor_by_step); the floor rules below then read
+            # the projection at the step it takes
+            if meta.vb_floor_by_step and vercel_floor_boost_series(meta.series):
+                _vcur = self._vercel_boost_mult(meta.ticker)
+                _vfl = dict(meta.vb_floor_by_step)
+                _vproj = {m: accrued + max(fl * qdays, proj_peak) for m, fl in _vfl.items()}
+                _vline = max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS, floor_bar)
+                _vnew = vercel_boost_pick(_vcur, _vproj, floor_bar, _vline)
+                if _vnew != _vcur:
+                    if _vnew > 1.0:
+                        self.state.vercel_floor_boost[meta.ticker] = _vnew
+                    else:
+                        self.state.vercel_floor_boost.pop(meta.ticker, None)
+                    _vat = (lambda m: "its own size" if m <= 1.0 else f"x{m:g}")
+                    if _vnew > _vcur:
+                        log(f"{self.tag} vercel floor boost: {meta.ticker} projects "
+                            f"${_vproj[_vcur]:.2f} at {_vat(_vcur)}, under the "
+                            f"${floor_bar:.2f} floor; x{_vnew:g} (a lead of "
+                            f"{vercel_boost_lead_size(meta.target_size, _vnew)}, at most "
+                            f"{VERCEL_FLOOR_BOOST_SIDE_CAP:g} a side) projects "
+                            f"${_vproj[_vnew]:.2f}")
+                    else:
+                        log(f"{self.tag} vercel floor boost: {meta.ticker} projects "
+                            f"${_vproj[_vnew]:.2f} at {_vat(_vnew)}, over the "
+                            f"${_vline:.2f} line; down from x{_vcur:g}")
+                if _vnew in _vfl:
+                    meta.floor_dollars_per_day = _vfl[_vnew]
+                    est_total = _vfl[_vnew] * qdays
+                    projected_total = _vproj[_vnew]
+                    reaches_min = projected_total >= floor_bar
+                meta.vb_size_mult = _vnew
             # NEAR-CLIFF (Jack 2026-09-26, see NEAR_CLIFF_DOLLARS): a market
             # that has banked most of the cliff and projects to just under
             # it quotes to completion -- the same verdict feeds the hopeless
@@ -28681,6 +28819,12 @@ class IncentiveMarketMaker:
                         # the banked $ that ends it (secure line), else None = the cliff
                         "near_cliff_stop": self._near_cliff_stop.get(meta.ticker),
                         "rt_floor_boost": self._rt_floor_boost.get(meta.ticker),
+                        # the Vercel step it rests at, and each step's
+                        # projected total (VERCEL FLOOR BOOST)
+                        "vercel_floor_boost": self.state.vercel_floor_boost.get(meta.ticker),
+                        "vercel_boost_proj": ([[m, round(accrued + fl * qdays, 4)]
+                                               for m, fl in meta.vb_floor_by_step]
+                                              or None),
                         "hopeless_since": self.state.hopeless_since.get(meta.ticker),
                         "sub_bar_secs": round(sub_bar_secs),
                         # the admission clock (2026-09-27): held-above time
@@ -29035,6 +29179,10 @@ class IncentiveMarketMaker:
         dropped = [t for t in self.state.selected if t not in selected]
         added = [t for t in selected if t not in self.state.selected]
         self.state.selected = selected
+        # a VERCEL FLOOR BOOST step lasts while its market is selected (one
+        # judged this refresh and not taken is judged afresh when next read)
+        for _t in [t for t in self.state.vercel_floor_boost if t not in selected]:
+            del self.state.vercel_floor_boost[_t]
         # LIFETIME SLOTS ARE SPENT HERE (Jack 2026-09-09: "fix the lifetime
         # slot ordering too"). The ledger used to be written straight after
         # event_top_n_cut, which is what the comment up there always claimed
@@ -29135,6 +29283,7 @@ class IncentiveMarketMaker:
                         "est_hour_mult": mt.est_hour_mult,
                         "nc_size_mult": mt.nc_size_mult,
                         "ys_size_mult": mt.ys_size_mult,
+                        "vb_size_mult": mt.vb_size_mult,
                         "floor_by_mult": mt.floor_by_mult or None,
                         "floor_realized_ratio": (
                             round(mt.floor_realized_ratio, 4)
@@ -30931,6 +31080,8 @@ class IncentiveMarketMaker:
         meta.floor_dollars_per_day = 0.0     # set with the estimate below
         # decision-input logging: set below only if the estimate actually runs
         meta.est_hour_mult = meta.nc_size_mult = meta.ys_size_mult = None
+        meta.vb_size_mult = None
+        meta.vb_floor_by_step = []
         meta.floor_realized_ratio = None
         # Live-CONFIRMED events never come back (Jack 2026-08-31 #2): worth
         # nothing by decree, without even reading the book — so no market of
@@ -31021,7 +31172,10 @@ class IncentiveMarketMaker:
             _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_live)
                                if (self.live and own_live) else (yes_levels, no_levels))
             _leads = self._comp_lead(meta, _lx_yes, _lx_no)
-        _lead_n = comp_lead_size(meta.target_size)
+        # (a VERCEL FLOOR BOOST step scales the lead too: vercel_boost_lead_size)
+        _vbm = self._vercel_boost_mult(meta.ticker)
+        meta.vb_size_mult = _vbm       # decision-input logging (analytics only)
+        _lead_n = vercel_boost_lead_size(meta.target_size, _vbm)
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
         # collateral reservation) inherit the cap through these meta fields
         _hm = hour_size_mult(meta.series, datetime.now(timezone.utc))
@@ -31045,8 +31199,9 @@ class IncentiveMarketMaker:
         _ncm = self._near_cliff_size_mult(meta.ticker)
         meta.nc_size_mult = _ncm       # decision-input logging (analytics only)
         # ...and the yield size mode (2026-10-05) on top: every per-market
-        # multiplier the quote loop will apply (_market_size_mult)
-        _msm = _ncm * self._yield_size_mult(meta.ticker)
+        # multiplier the quote loop will apply -- _market_size_mult itself, so
+        # the RT and Vercel floor boosts count here as they do in the loop
+        _msm = self._market_size_mult(meta.ticker)
         _lv = scale_levels(hour_scaled_levels(meta.series, _now), _msm)
         # Carbon Arc late-month rule: the hypothetical ladder is per side too,
         # so the reward estimate (and the $1 floor projection built on it)
@@ -31079,7 +31234,8 @@ class IncentiveMarketMaker:
                           rpb: Optional[int], rpa: Optional[int],
                           sides: Optional[Tuple[float, float]] = None,
                           leads: Tuple[Optional[Tuple[int, int, int]],
-                                       Optional[Tuple[int, int, int]]] = (None, None)
+                                       Optional[Tuple[int, int, int]]] = (None, None),
+                          vb: Optional[float] = None
                           ) -> List[Quote]:
             """The buildable ladder at hour multiplier `hm` on rung sizes
             `lv`, per-side reference multipliers `rmb` / `rma`, external
@@ -31091,13 +31247,17 @@ class IncentiveMarketMaker:
             side_size_mults; the floor projection passes each window
             piece's own (FLOOR_PROJECTION_SIDES). `leads` = the (bid, ask)
             complement leads (comp_lead_prices): a leading side rests one
-            rung of at least target/5 at its lead price, as the loop does."""
+            rung of at least target/5 at its lead price, as the loop does.
+            `vb` = the VERCEL FLOOR BOOST step whose lead and caps apply,
+            default the market's own (`lv` must carry that step's size)."""
+            _b = _vbm if vb is None else vb
+            _ln = _lead_n if vb is None else vercel_boost_lead_size(meta.target_size, _b)
             sbm, sam = (_cbm, _cam) if sides is None else sides
             lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
             smb, sma = clamp_side_max_to_position_cap(
                 int(round(sum(s for _t, s in lvb) * rmb)),
                 int(round(sum(s for _t, s in lva) * rma)),
-                series_max_position(meta.series))
+                vercel_boost_cap(series_max_position(meta.series), _b))
             if quake_ask_strike(meta.ticker):
                 sma = min(sma, QUAKE_ASK_MAX_CONTRACTS)   # the loop's ask cap
             out: List[Quote] = []
@@ -31124,9 +31284,10 @@ class IncentiveMarketMaker:
             if lb is not None or la is not None:    # a leading market's cap
                 _cap = max(_cap, int(FAIR_LEAD_MAX_POSITION if _lsrc == "fair"
                                      else COMP_LEAD_MAX_POSITION))
+            _cap = int(vercel_boost_cap(_cap, _b))  # (and a boosted one's)
 
             def _lead_room(sm: int) -> int:
-                return max(sm, _lead_n) if _cap <= 0 else min(max(sm, _lead_n), _cap)
+                return max(sm, _ln) if _cap <= 0 else min(max(sm, _ln), _cap)
 
             lead_bok = (lb is not None and sum(s for _t, s in lvb) > 0
                         and comp_lead_band_ok(lb[0], band, meta.series))
@@ -31139,9 +31300,9 @@ class IncentiveMarketMaker:
                 if lead_bok:
                     out += build_side_ladder(meta.ticker, "bid", lb[0], ea,
                                              _lead_room(smb) if bid_ok
-                                             else min(_lead_room(smb), _lead_n),
+                                             else min(_lead_room(smb), _ln),
                                              levels=lvb, ref_px=lb[0], band=band,
-                                             hour_mult=hm, min_total=_lead_n)
+                                             hour_mult=hm, min_total=_ln)
                 else:
                     out += build_side_ladder(meta.ticker, "bid", eb, ea,
                                              smb, levels=lvb, ref_px=rpb,
@@ -31150,9 +31311,9 @@ class IncentiveMarketMaker:
                 if lead_aok:
                     out += build_side_ladder(meta.ticker, "ask", la[0], eb,
                                              _lead_room(sma) if ask_ok
-                                             else min(_lead_room(sma), _lead_n),
+                                             else min(_lead_room(sma), _ln),
                                              levels=lva, ref_px=la[0], band=band,
-                                             hour_mult=hm, min_total=_lead_n)
+                                             hour_mult=hm, min_total=_ln)
                 else:
                     out += build_side_ladder(meta.ticker, "ask", ea, eb,
                                              sma, levels=lva, ref_px=rpa,
@@ -31407,6 +31568,50 @@ class IncentiveMarketMaker:
                         meta.floor_realized_ratio = min(1.0, frac / f_live)
                         total *= meta.floor_realized_ratio
                 meta.floor_dollars_per_day = total
+        # VERCEL FLOOR BOOST (VERCEL_FLOOR_BOOST_MAX): the floor projection at
+        # each step, for the verdict -- the one above, rescaled by what that
+        # step's ladder and lead score on the external book at the live hour
+        # against the current step's (the caps and our own weight in the
+        # scored walk count, so a step that rests no more earns no more)
+        if vercel_floor_boost_series(meta.series) and meta.dollars_per_day > 0:
+            try:
+                if self.live and own_live:
+                    _vy, _vn = external_levels(yes_levels, no_levels, own_live)
+                else:
+                    _vy, _vn = yes_levels, no_levels
+                _vxb, _vxa = external_best(_vy, _vn)
+                _vrb, _vra = ladder_reference_prices(_vy, _vn, meta.target_size)
+                _vbase = max(_ncm, self._rt_floor_boost.get(meta.ticker, 1.0))
+                _vys = self._yield_size_mult(meta.ticker)
+
+                def _step_share(b: float) -> float:
+                    """Step b's live-hour ladder and lead, scored on the
+                    external book."""
+                    q_b = _probe_ladder(
+                        _hm, scale_levels(hour_scaled_levels(meta.series, _now),
+                                          max(_vbase, b) * _vys),
+                        capped_ref_mult(_vxb, _vrb, "bid", hour_mult=_hm, series=meta.series),
+                        capped_ref_mult(_vxa, _vra, "ask", hour_mult=_hm, series=meta.series),
+                        _vxb, _vxa, _vrb, _vra, leads=_leads, vb=b)
+                    if not q_b:
+                        return 0.0
+                    return estimate_reward_share(
+                        _vy, _vn, _overlay_with_pads(q_b, _vy, _vn, _vxb, _vxa),
+                        meta.target_size, meta.discount_factor, own_in_book=False)[0]
+
+                _vsh = {b: _step_share(b) for b in sorted(set(vercel_boost_steps()) | {_vbm})}
+                _vs0 = _vsh[_vbm]
+                meta.vb_floor_by_step = [
+                    (b, meta.floor_dollars_per_day if b == _vbm
+                     else meta.floor_dollars_per_day * s / _vs0 if _vs0 > 0
+                     else s * meta.dollars_per_day)
+                    for b, s in sorted(_vsh.items())]
+            except Exception as e:     # never costs the estimate: no step change
+                meta.vb_floor_by_step = []
+                if not getattr(self, "_vb_err_logged", False):
+                    self._vb_err_logged = True
+                    log(f"{self.tag} ! vercel floor boost: step projections failed on "
+                        f"{meta.ticker} ({e!r}); its step stands (logged once)")
         return True
 
     def _settle_or_drop(self, t: str, via: str = "settle_loop") -> None:
@@ -33690,7 +33895,9 @@ class IncentiveMarketMaker:
             # lead (FAIR LEAD) rests at least FAIR_LEAD_MARGIN_C inside its
             # fair, so inside whatever its own family's gate caps a side to
             lead_b = lead_a = None
-            lead_n = comp_lead_size(meta.target_size)
+            # (x its VERCEL FLOOR BOOST step: vercel_boost_lead_size)
+            vb_step = self._vercel_boost_mult(t)
+            lead_n = vercel_boost_lead_size(meta.target_size, vb_step)
             lead_src = self._lead_source(meta, stop=False)
             # (no lead of either kind across its feed's publish: OR_LEAD_BLACKOUT)
             _pub_out = fair_lead_blackout(meta.series, now_ts)
@@ -33811,6 +34018,9 @@ class IncentiveMarketMaker:
             if lead_b is not None or lead_a is not None:       # a leading market's cap
                 maxpos = max(maxpos, FAIR_LEAD_MAX_POSITION if lead_src == "fair"
                              else COMP_LEAD_MAX_POSITION)
+            # (a VERCEL FLOOR BOOST step's: VERCEL_FLOOR_BOOST_SIDE_CAP, which
+            # the clamp below makes each side's bound too)
+            maxpos = vercel_boost_cap(maxpos, vb_step)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             # (MANUAL_COEXIST_EVENTS too: the user's positions there are his)
@@ -37589,6 +37799,13 @@ class IncentiveMarketMaker:
                f"the bar, until it banks "
                f"${max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS):.2f}"
                if RT_FLOOR_BOOST_MAX > 1.0 else "off"))
+        log("vercel floor boost (2026-11-01): "
+            + (f"on -- a Vercel market short of the payout bar over its life rests "
+               f"the smallest of x1.5 to x{VERCEL_FLOOR_BOOST_MAX:g} of its size that "
+               f"clears it (lead and ladder, at most {VERCEL_FLOOR_BOOST_SIDE_CAP:g} a "
+               f"side), held while it clears the bar, and steps down once a lower step "
+               f"projects ${max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS):.2f}"
+               if VERCEL_FLOOR_BOOST_MAX > 1.0 else "off"))
         log("rt settled strikes (2026-11-01): "
             + (f"on -- a KXRT strike with {RT_SETTLED_MIN_REVIEWS}+ reviews, the score "
                f"{RT_SETTLED_MIN_GAP:g}+ points away, the RT model at "
