@@ -2065,15 +2065,19 @@ print(f"[LADDER] maker buffer {_maker_buffer}c ({RUN_SLOT}) | "
       f"night_size_mult={night_size_mult:g} (variable={variable})")
 
 # Fresh evening quotes (the NIGHT block above) rest an hour at most, so the
-# evening's near-touch band comes back, and the evening's top rung stops at
-# the model's fair (Jack 2026-11-01: "Ship both"). Evening fills 4-7c below
-# the best NO bid, late Aug - Oct 5: fresh (<= 60 min) +8.52c/ct on 3,249
-# contracts, stale -9.04c/ct on 8,056 -- the -3.69c behind the 8c buffer
-# above was the stale part. Evening fills priced above the model's fair NO
-# lost 17.3c/ct (682 contracts, Sep-Oct), and the fair-tied hi_no A/B
-# (AB_TEST_ENABLED) is off, so nothing else held the top rung under fair.
+# evening's near-touch band comes back (Jack 2026-11-01: "Ship both").
+# Evening fills 4-7c below the best NO bid, late Aug - Oct 5: fresh (<= 60
+# min) +8.52c/ct on 3,249 contracts, stale -9.04c/ct on 8,056 -- the -3.69c
+# behind the 8c buffer above was the stale part.
+# The evening fair cap ships OFF. It shipped on in ddf6860 on 682 evening
+# contracts priced above fair losing 17.3c/ct (Sep-Oct; observational and
+# mostly stale fills), but it is the hi_no A/B below again (fair - 3c, every
+# slot), KILLED 2026-08-09 after 1,290 settled markets with no significant
+# edge and a measured fill cost (Jack 2026-11-01: "i thought this was
+# exactly the test i ran, and said it wasnt statsig to cap top rung above
+# model's fair value"). EVENING_FAIR_CAP=true turns it on.
 MAKER_BUFFER_CENTS_EVENING_FRESH = int(os.environ.get("MAKER_BUFFER_CENTS_EVENING_FRESH", "4"))
-EVENING_FAIR_CAP = os.environ.get("EVENING_FAIR_CAP", "true").lower() == "true"
+EVENING_FAIR_CAP = os.environ.get("EVENING_FAIR_CAP", "false").lower() == "true"
 EVENING_FAIR_CAP_MARGIN_CENTS = float(os.environ.get("EVENING_FAIR_CAP_MARGIN_CENTS", "0"))
 
 
@@ -2104,12 +2108,18 @@ if RUN_SLOT == "evening":
 
 # Per-city size multipliers — tilt size toward better-edge cities, shrink for worse ones.
 # Cities not listed default to 1.0x.
+# 2026-11-01 (Jack: "Cut OKC, raise SFO"), on Sep-Oct markets, this bot's own
+# fills at settlement, the only two cities whose daily P&L clears |t| >= 2:
+#   San Francisco  morning +$245 (+29.7c/ct, t +2.2): 1.25 -> 1.5
+#   Oklahoma City  evening -$350 (-23.8c/ct, t -2.3), morning -$69: 1.0 -> 0.5,
+#                  and out of MORNING_CITY_MAX_CONTRACTS (morning cap 225 -> 150)
 CITY_SIZE_MULT = {
     "New York City": 1.0,
     "Austin": 1.0,
     "Los Angeles": 1.0,
     "Seattle": 1.0,
-    "San Francisco": 1.25,
+    "San Francisco": 1.5,
+    "Oklahoma City": 0.5,
     "Boston": 1.25,
     "Chicago": 0.5,
     "Dallas": 0.75,
@@ -2317,9 +2327,11 @@ MORNING_CAP_MULT = float(os.environ.get("MORNING_CAP_MULT", "1.0"))
 #     New Orleans    +6.8c/ct      Phoenix         +7.5c/ct
 # (New Orleans +14.0c, Phoenix +7.6c since September). Per-city c/ct is
 # only good to about ±5–7c on 30–70 days of fills.
+# Oklahoma City left this list 2026-11-01 (Jack: "Cut OKC, raise SFO"): it
+# lost -$69 on mornings and -$350 on evenings over Sep-Oct markets, so its
+# morning cap is back to the 100 base x MORNING_CAP_MULT = 150.
 MORNING_CITY_MAX_CONTRACTS = {
     "Boston": 150,
-    "Oklahoma City": 150,
     "New Orleans": 150,
     "Phoenix": 150,
 }

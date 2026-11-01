@@ -107,7 +107,7 @@ class TestCaps(unittest.TestCase):
 
     def test_morning_overrides_and_base_caps(self):
         cap = caps({"MORNING_CAP_MULT": "1.5"})["market_position_cap"]
-        for city in ("Boston", "Oklahoma City", "New Orleans", "Phoenix"):
+        for city in ("Boston", "New Orleans", "Phoenix"):
             self.assertEqual(cap(city, "morning"), 225, city)
             self.assertEqual(cap(city, "evening"), 100, city)
             self.assertEqual(cap(city, "west_late"), 100, city)     # Phoenix runs west_late: base cap
@@ -117,6 +117,20 @@ class TestCaps(unittest.TestCase):
         self.assertEqual(cap("Atlanta", "morning"), 150)
         self.assertEqual(cap("San Diego", "morning"), 75)
         self.assertEqual(cap("San Diego", "evening"), 50)
+        # Jack 2026-11-01: "Cut OKC" -- back to the 100 base x 1.5 on mornings
+        self.assertEqual(cap("Oklahoma City", "morning"), 150)
+        self.assertEqual(cap("Oklahoma City", "evening"), 100)
+
+    def test_city_size_multipliers(self):
+        with open(SRC, encoding="utf-8") as f:
+            src = f.read()
+        g = {}
+        exec(_slice(src, "CITY_SIZE_MULT = {", "}" + chr(10)), g)
+        mult = g["CITY_SIZE_MULT"]
+        self.assertEqual(mult["San Francisco"], 1.5)               # Jack 2026-11-01: "raise SFO"
+        self.assertEqual(mult["Oklahoma City"], 0.5)               # "Cut OKC"
+        self.assertEqual(mult["Boston"], 1.25)
+        self.assertEqual(mult.get("Atlanta", 1.0), 1.0)
 
     def test_reverting_the_morning_multiplier_still_reverts_the_scale(self):
         cap = caps({"MORNING_CAP_MULT": "1.0"})["market_position_cap"]

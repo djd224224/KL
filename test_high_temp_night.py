@@ -148,7 +148,8 @@ def ladder(slot, arm, env=None):
 
 class TestEveningBufferAndFairCap(unittest.TestCase):
     """Jack 2026-11-01: "Ship both" -- a 4c buffer on fresh evening markets,
-    and evening bids capped at the model's fair NO."""
+    and evening bids capped at the model's fair NO; the cap then went back
+    OFF by default (the killed 2026-08-09 hi_no A/B tested the same idea)."""
 
     def test_buffer_by_slot_and_arm(self):
         self.assertEqual(ladder("morning", "off")["maker_buffer_for"]("T"), 4)
@@ -158,16 +159,21 @@ class TestEveningBufferAndFairCap(unittest.TestCase):
         g = ladder("evening", "fresh", {"MAKER_BUFFER_CENTS_EVENING_FRESH": "6"})
         self.assertEqual(g["maker_buffer_for"]("T"), 6)
 
-    def test_evening_top_rung_stops_at_fair(self):
-        cap = ladder("evening", "fresh")["evening_fair_cap"]
+    def test_fair_cap_is_off_by_default(self):
+        self.assertFalse(ladder("evening", "fresh")["EVENING_FAIR_CAP"])
+        self.assertEqual(ladder("evening", "fresh")["evening_fair_cap"](70.0, 64.3), 70.0)
+
+    def test_evening_top_rung_stops_at_fair_when_on(self):
+        on = {"EVENING_FAIR_CAP": "true"}
+        cap = ladder("evening", "fresh", on)["evening_fair_cap"]
         self.assertEqual(cap(70.0, 64.3), 64.0)      # above fair: down to fair, whole cents
         self.assertEqual(cap(60.0, 64.3), 60.0)      # already under fair: unchanged
         self.assertEqual(cap(70.0, 64.0), 64.0)
-        self.assertEqual(ladder("evening", "fresh", {"EVENING_FAIR_CAP_MARGIN_CENTS": "1"})
+        self.assertEqual(ladder("evening", "fresh", dict(on, EVENING_FAIR_CAP_MARGIN_CENTS="1"))
                          ["evening_fair_cap"](70.0, 64.3), 63.0)
         self.assertEqual(ladder("evening", "fresh", {"EVENING_FAIR_CAP": "false"})
                          ["evening_fair_cap"](70.0, 64.3), 70.0)
-        self.assertEqual(ladder("morning", "off")["evening_fair_cap"](70.0, 64.3), 70.0)
+        self.assertEqual(ladder("morning", "off", on)["evening_fair_cap"](70.0, 64.3), 70.0)
 
 
 if __name__ == "__main__":
