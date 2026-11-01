@@ -5125,6 +5125,19 @@ _CUT_OR_SHARE_SERIES = tuple(s for s in _DEFAULT_OR_SHARE_SERIES.split(",") if s
 # an un-block is one line. Exact series (the dash). Standard semantics:
 # open positions ride to settlement. Un-block by removing this entry.
 _CUT_LOSERS_1101_SERIES = ("KXNETFLIXTOPVIEWSTV", "KXLOLTEEMO")
+# OREGON TIMBER OFF (Jack 2026-11-01: "Oregon only", choosing between blocking
+# KXORBOFHARVEST alone and also dropping the overnight x3 on the other seven
+# SMALL_BOOKS_X2_SERIES). At 05:48:12Z 11/01 one seller swept four strikes of
+# KXORBOFHARVEST-27NOV30 (Oregon state-forest timber harvest, FY2027) in the
+# same second, ~11,400 contracts. Our overnight touch bids, 270 each on
+# T180/T200/T220, filled: 810 contracts for $451, and the price never came
+# back (-$154 at mids). Its programs paid $71 in all (~$2/day), no model prices
+# it, and the event settles 2027-11-30. The sweep breaker and toxic halt fire
+# after a same-second sweep. The scan-graduate and small-books x2 entries are
+# kept so an un-block is one line. Exact series (the dash). Standard semantics:
+# the three sell-back asks are cancelled and the 755 contracts ride to
+# settlement. Un-block by removing this entry.
+_CUT_SWEPT_1101_SERIES = ("KXORBOFHARVEST",)
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
@@ -5171,6 +5184,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
     # Netflix top-10 TV + LoL Worlds Teemo (2026-11-01, above)
     + [f"{_s}-" for _s in _CUT_LOSERS_1101_SERIES]
+    # Oregon timber harvest, swept 11/01 (2026-11-01, above)
+    + [f"{_s}-" for _s in _CUT_SWEPT_1101_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 

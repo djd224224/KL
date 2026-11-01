@@ -2272,6 +2272,25 @@ class TestBlocklist(unittest.TestCase):
         for t in ("KXNETFLIXTOPVIEWSMOVIE-26NOV02-9", "KXLOLREGION-WORLDS26-LCK"):
             self.assertFalse(b(t), t)
 
+    def test_oregon_timber_cut_alone(self):
+        # Jack 2026-11-01 "Oregon only": KXORBOFHARVEST is frozen by NAME
+        # after the 11/01 sweep; the other seven small books keep quoting at
+        # x2 (the overnight x3 stays), and the graduate and x2 entries stay
+        # so an un-block is one line
+        b = IncentiveMarketMaker._blocked
+        for t in ("KXORBOFHARVEST-27NOV30-T180", "KXORBOFHARVEST-27NOV30-T240"):
+            self.assertTrue(b(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        self.assertTrue(imm.series_blocklisted("KXORBOFHARVEST"))
+        self.assertIn("KXORBOFHARVEST", imm.SCAN_GRADUATE_SERIES)
+        self.assertIn("KXORBOFHARVEST", imm.SMALL_BOOKS_X2_SERIES)
+        for s in imm.SMALL_BOOKS_X2_SERIES:
+            if s == "KXORBOFHARVEST":
+                continue
+            self.assertFalse(b(f"{s}-27JUN30-T1"), s)
+            self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-27JUN30-T1"), s)
+            self.assertFalse(imm.series_blocklisted(s), s)
+
     def test_series_blocklisted_sees_exact_series_cuts(self):
         # the enrollment paths check bare SERIES names: an exact-series cut
         # ("<series>-") must match them too, or the family watch re-enrolls
