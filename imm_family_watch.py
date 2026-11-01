@@ -138,7 +138,7 @@ _ONE_OFF_INSIDER_RE = re.compile(
     r"pause[ds]?|meet\w*|summit|visit\w*|talks|deal|agree\w*|ceasefire|declar\w*|"
     r"emergenc\w*|who will be|next)\b", re.I)
 _ONE_OFF_PUBLIC_RE = re.compile(
-    r"\b(repeal\w*|bills?|(?-i:Acts?)|legislat\w*|congress\w*|senate|law|statutes?|"
+    r"\b(repeal\w*|bills?|(?-i:Acts?)|legislat\w*|congress\w*|senate|laws?|statutes?|"
     r"ratif\w*|supreme court|ruling|regulat\w*|bans?)\b", re.I)
 
 

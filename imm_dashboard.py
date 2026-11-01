@@ -53,7 +53,9 @@ config_history_* (with `git log` for the deploys' subjects). With the API on
 (default), also Kalshi's incentive-program feed (new events), the 7:20
 quote-gaps estimator (imm_quote_gaps.classify_and_estimate: what unquoted
 events would earn), imm_pickoff.scan (pick-off windows), each cached for
-API_TTL minutes, and market / event records (strike structure, value now;
+API_TTL minutes, imm_unquoted.score_all (the unquoted series scored for
+adding, with the weekly email's calls; UNQUOTED_TTL_MIN), and market /
+event records (strike structure, value now;
 cached, a bounded number of reads per build). Every
 Kalshi read goes through the same code the morning emails use; nothing here
 places, amends or cancels anything, and nothing writes outside DASH_DIR.
@@ -148,6 +150,16 @@ FAMILY_CURVE_STEP = 3600          # per-family sparklines: hourly points
 NUMERIC_STRIKES = frozenset(("greater", "greater_or_equal", "less", "less_or_equal", "between"))
 PROMISING_EST = float(os.environ.get("IMM_DASH_PROMISING_EST", "3.0"))
 PROMISING_LEFT = float(os.environ.get("IMM_DASH_PROMISING_LEFT", "500"))
+# PROMISING UNQUOTED SERIES (Jack 2026-11-01: "also in the command center
+# dashboard, make sure the 'promising' unquoted markets section is built out
+# and would include any promising ones"): every "not in allowlist" series of
+# the gap list, scored by imm_unquoted -- the weekly email's scorer and calls
+# -- every UNQUOTED_TTL_MIN, with at most UNQUOTED_MAX_BOOKS book reads and
+# UNQUOTED_TAPE_SERIES new tapes a pass (the weekly email reads the rest;
+# both keep the tapes in CACHE_DIR).
+UNQUOTED_TTL_MIN = float(os.environ.get("IMM_DASH_UNQUOTED_TTL_MIN", "180"))
+UNQUOTED_MAX_BOOKS = int(os.environ.get("IMM_DASH_UNQUOTED_MAX_BOOKS", "400"))
+UNQUOTED_TAPE_SERIES = int(os.environ.get("IMM_DASH_UNQUOTED_TAPE_SERIES", "4"))
 TITLE_BUDGET = int(os.environ.get("IMM_DASH_TITLE_BUDGET", "80"))
 PAD_BID, PAD_ASK = 1, 99  # incentive_mm PAD_BID_CENTS / PAD_ASK_CENTS
 CACHE_VERSION = 5
@@ -1939,6 +1951,25 @@ def estimate_events(gaps, imm, bot, client, extra, now_utc, skip=frozenset()):
                        "n_est": n_est, "n_tried": len(tks)}
     log(f"extra estimates: {len(out)} of {len(want)} new events, {books} book reads")
     return out
+
+
+def fetch_unquoted(gaps, imm, now_utc, rows):
+    """imm_unquoted.score_all on the gap list's "not in allowlist" series --
+    the weekly email's estimates, tapes and calls -- bounded for a 10-minute
+    build (UNQUOTED_MAX_BOOKS, UNQUOTED_TAPE_SERIES). Each row gains its
+    dashboard family and its tape in cents a contract."""
+    import imm_unquoted as iu
+    if not rows:
+        raise RuntimeError("no gap list to score yet")
+    res = iu.score_all(rows, now_utc, imm=imm, gaps_mod=gaps, max_books=UNQUOTED_MAX_BOOKS,
+                       cache_path=os.path.join(CACHE_DIR, iu.TAPE_CACHE_NAME),
+                       tape_budget=UNQUOTED_TAPE_SERIES)
+    for r in res["rows"]:
+        r["fam"] = family_of(r["series"], r.get("category") or "")[0]
+        r["tape_c"] = iu.tape_cents(r.get("tape"))
+        r["tape_txt"] = iu.tape_text(r.get("tape"))
+        r["promising"] = r["call"] in iu.PROMISING_CALLS
+    return res
 
 
 def fetch_pickoff(gaps, imm, now_utc):
@@ -3823,9 +3854,19 @@ class Builder:
                                        lambda: fetch_gaps(gaps, imm, now_utc, _extra()))
         pick, k_at, k_err = _api_cached("pickoff", API_TTL_MIN, self.api_force,
                                         lambda: fetch_pickoff(gaps, imm, now_utc))
-        out = {"programs_at": p_at, "gaps_at": g_at, "pick_at": k_at,
+        unq, u_at, u_err = _api_cached(
+            "unquoted", UNQUOTED_TTL_MIN, self.api_force,
+            lambda: fetch_unquoted(gaps, imm, now_utc, (gap or {}).get("rows") or []))
+        out = {"programs_at": p_at, "gaps_at": g_at, "pick_at": k_at, "unquoted_at": u_at,
                "errors": {k: v for k, v in (("programs", p_err), ("gaps", g_err),
-                                            ("pickoff", k_err)) if v}}
+                                            ("pickoff", k_err), ("unquoted", u_err)) if v}}
+        # the shared calls, so a new launch the weekly email would pass is not
+        # flagged promising beside it
+        calls = {r["series"]: {"call": r["call"], "why": r["why"], "ok": bool(r.get("promising"))}
+                 for r in (unq or {}).get("rows") or []}
+        if unq:
+            out["unquoted"] = {"rows": unq["rows"], "ctx": unq.get("ctx") or {},
+                               "enrolled": unq.get("enrolled") or []}
         # first-seen registry (seeded above from the new-programs email's seen-file)
         gap_by_ev = {r["event"]: r for r in (gap or {}).get("rows", [])} if gap else {}
         for ev, x in ((gap or {}).get("extra") or {}).items():
@@ -3883,7 +3924,8 @@ class Builder:
             new_rows.sort(key=lambda r: -r["launched"])
             out["feed"] = {"events": len(progs), "pool_day": round(sum(r["pool_day"] for r in progs.values()), 2),
                            "markets": sum(r["n"] for r in progs.values())}
-        out["new_groups"] = {str(h): new_event_groups(new_rows, self.now - h * 3600, self.now)
+        out["new_groups"] = {str(h): new_event_groups(new_rows, self.now - h * 3600, self.now,
+                                                      calls)
                              for h in (24, 72, 168)}
         out["params"] = {"promising_est": PROMISING_EST, "promising_left": PROMISING_LEFT}
         if gap:
@@ -3912,7 +3954,7 @@ def _deliberate(row: dict) -> bool:
         or bot.startswith("blocked")
 
 
-def new_event_groups(rows, cut: float, now: float):
+def new_event_groups(rows, cut: float, now: float, calls=None):
     """Events launched since `cut`, one group per series, flagged.
 
     A group is ROUTINE when its series already had events before `cut`
@@ -3927,7 +3969,10 @@ def new_event_groups(rows, cut: float, now: float):
                        >= PROMISING_EST $/day there (or half that at >= 2%/day
                        ROI), and >= $3 over the time left in the programs
       unestimated pool no estimate yet (the estimator's book budget did not
-                       reach it) but >= PROMISING_LEFT dollars left."""
+                       reach it) but >= PROMISING_LEFT dollars left.
+    `calls` {series: {"call", "why", "ok"}} are imm_unquoted's (the weekly
+    email's): a group carries its series' call, and one the scorer would not
+    add ("ok" false: PASS / DON'T QUOTE) is not flagged at all."""
     groups = {}
     for r in rows:
         if r["launched"] < cut or r["end"] <= now:
@@ -3976,6 +4021,11 @@ def new_event_groups(rows, cut: float, now: float):
                 flag = "promising"
             elif est is None and g["left"] >= PROMISING_LEFT:
                 flag = "unestimated pool"
+        c = (calls or {}).get(g["ser"])
+        if c:
+            g["call"], g["why"] = c["call"], c["why"]
+            if not c["ok"]:
+                flag = ""
         g["flag"] = flag
         g["reason"] = g.pop("reasons").most_common(1)[0][0] if g["n_ev"] else ""
         g["events"].sort(key=lambda e: -e["left"])

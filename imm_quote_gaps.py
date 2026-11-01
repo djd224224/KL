@@ -454,6 +454,9 @@ def classify_and_estimate(client, bot, now_utc: datetime):
     # series + rain fairs + the AS test's daily picks (2026-10-27).
     imm.load_file_event_overrides()
     imm.load_extra_allow_series()
+    # ...and the finecon group's file (2026-11-01): without it the nine Carbon
+    # Arc arrays the family watch enrolled there read "not in allowlist"
+    imm.load_finecon_extra_series()
     imm.load_rain_fair()
     if hasattr(imm, "load_astest_picks"):
         imm.load_astest_picks()
