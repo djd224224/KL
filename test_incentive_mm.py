@@ -32124,6 +32124,62 @@ class TestFairLead(unittest.TestCase):
         self.assertEqual(rungs, {})
         self.assertNotIn(self.T, bot.state.selected)
 
+    def test_no_lead_in_the_day_before_its_measured_day(self):
+        # LEAD STOP (Jack 2026-11-01: "Rain leads stop leading 24 hours before
+        # the measured day"). The fixture's close, 30 days out, comes before
+        # its far Saturday's cutoff, so here it is the decision (TestLeadStop
+        # has a weekend's own), and the window is stretched to reach it
+        # rather than the clock moved. Just outside it SGF leads as before;
+        # inside it the loop stands the lead down, logs it off once, and the
+        # bid rests as a plain rung
+        out_h = 30 * 24.0
+        with mock.patch.object(imm, "LEAD_STOP_BEFORE_H", out_h - 1.0):
+            bot, rungs, _l = self._cycle()
+        self.assertEqual(rungs["bid"], (54, 200))
+        lines = []
+        with mock.patch.object(imm, "LEAD_STOP_BEFORE_H", out_h + 1.0), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"), \
+                mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            bot.run_cycle()
+        self.assertEqual(bot._comp_lead_px, {})
+        offs = [x for x in lines if f"fair lead {self.T} bid: off -- " in x]
+        self.assertEqual(len(offs), 1, lines)
+        self.assertIn("h or less before its decision at ", offs[0])
+        self.assertIn("(LEAD STOP)", offs[0])
+        self.assertNotIn((54, 200), [(o["yes_price"], int(o["remaining_count"]))
+                                     for o in bot.state.sim_orders.values()
+                                     if o["ticker"] == self.T])
+        # a fresh start inside it leads at no point
+        with mock.patch.object(imm, "LEAD_STOP_BEFORE_H", out_h + 1.0):
+            bot, rungs, lines = self._cycle()
+        self.assertNotEqual(rungs.get("bid"), (54, 200))
+        self.assertFalse(any(f"fair lead {self.T} " in x for x in lines), lines)
+        # the estimate prices no lead there (a city under the payout bar is
+        # not admitted on one it cannot rest); a day and an hour out it does
+        self._write()
+        book = self._book()
+
+        class _BookClient(FakeClient):
+            def get_orderbook(self_, ticker, depth=None):
+                return book
+
+        bot = IncentiveMarketMaker(client=_BookClient(), live=False)
+        now = datetime.now(timezone.utc)
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXRAINWKND",
+                              dollars_per_day=16.4, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=now + timedelta(hours=23),
+                              close_time=now + timedelta(days=2),
+                              mid_cents=54.0, spread_cents=12, volume=150.0)
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]):
+            bot._estimate_candidate_yield(meta, [])
+            self.assertLess(meta.est_frac, 0.05)
+            meta.cutoff = now + timedelta(hours=25)
+            bot._estimate_candidate_yield(meta, [])
+            self.assertGreater(meta.est_frac, 0.45)
+
 
 class TestVercelFairLead(unittest.TestCase):
     """Jack 2026-10-30: "Yes, extend it" -- FAIR LEAD on the Vercel family,
@@ -32468,6 +32524,29 @@ class TestVercelFairLead(unittest.TestCase):
         bot, rungs, _l = self._cycle(self.YES_3X99, self.NO_3X99, pos=200.0,
                                      FAIR_CLOSE_MODE="on", FAIR_LEAD_PAST_BAND=False)
         self.assertEqual(rungs, {})
+
+    def test_no_lead_in_the_day_before_its_measured_day(self):
+        # LEAD STOP (Jack 2026-11-01: "stop Vercel leading 24 hours before the
+        # measured day"): D = 2068-12-05 00:00Z, a day before its close; the
+        # window is stretched to reach it. FAIR CLOSE still offers a long at
+        # the model
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXOPENVREQ",
+                              dollars_per_day=20.0, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None, close_time=self.CLOSE)
+        d = datetime(2068, 12, 5, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(imm.lead_decision_ts(meta), d)
+        out_h = (d - time.time()) / 3600.0
+        bot, rungs, _l = self._cycle(LEAD_STOP_BEFORE_H=out_h - 1.0)
+        self.assertEqual(bot._comp_lead_px, {self.T: (17, 77, 200)})
+        bot, rungs, lines = self._cycle(LEAD_STOP_BEFORE_H=out_h + 1.0)
+        self.assertEqual(bot._comp_lead_px, {})
+        self.assertNotIn((17, 200), rungs.get("bid", []), rungs)
+        self.assertNotIn((77, 200), rungs.get("ask", []), rungs)
+        self.assertFalse(any(f"fair lead {self.T} " in x for x in lines), lines)
+        bot, rungs, _l = self._cycle(self.YES_3X99, self.NO_3X99, pos=200.0,
+                                     FAIR_CLOSE_MODE="on", LEAD_STOP_BEFORE_H=out_h + 1.0)
+        self.assertEqual(rungs, {"ask": [(40, 200)]})
+        self.assertEqual(bot._fair_close_px, {self.T: ("ask", 40)})
 
     def _estimate(self, yes, no, past=True):
         """One selection read of the book `yes` / `no`: the meta it scored."""
@@ -32832,6 +32911,33 @@ class TestOpenRouterFairLead(unittest.TestCase):
             self.assertEqual([px for px, _n in rungs.get("bid", [])], [60], rungs)
             self.assertFalse(any(f"lead {self.T}" in s for s in lines), lines)
 
+    def test_a_ladder_lead_stops_a_day_before_its_cutoff_or_close(self):
+        # LEAD STOP covers the complement / ladder lead too (Jack 2026-11-01:
+        # "keep this approach for all leading markets"): a day before its
+        # cutoff, else its close
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        lad = (f"{self.EV}-T188", self.T, f"{self.EV}-T192")
+        bot._ladders = {t: lad for t in lad}
+        close = datetime(2068, 12, 5, 4, 0, tzinfo=timezone.utc)
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXTOKENUSE",
+                              dollars_per_day=20.0, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None, close_time=close,
+                              mid_cents=86.0, spread_cents=12, volume=0.0)
+        self.assertEqual(bot._lead_source(meta), "comp")
+        out_h = (close.timestamp() - time.time()) / 3600.0
+        with mock.patch.object(imm, "LEAD_STOP_BEFORE_H", out_h + 1.0):
+            self.assertIsNone(bot._lead_source(meta))
+            self.assertEqual(bot._lead_source(meta, stop=False), "comp")
+            self.assertEqual(bot._comp_lead(meta, self.YES, self.NO), (None, None))
+        now = datetime.now(timezone.utc)
+        self.assertIsNone(bot._lead_source(
+            dataclasses.replace(meta, cutoff=now + timedelta(hours=23))))
+        self.assertEqual(bot._lead_source(
+            dataclasses.replace(meta, cutoff=now + timedelta(hours=25))), "comp")
+        with mock.patch.object(imm, "LEAD_STOP_BEFORE_H", 0.0):
+            self.assertEqual(bot._lead_source(
+                dataclasses.replace(meta, cutoff=now + timedelta(hours=1))), "comp")
+
     def test_the_fast_cancel_reads_the_lead_as_stale_in_the_window(self):
         self._write()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
@@ -32840,6 +32946,64 @@ class TestOpenRouterFairLead(unittest.TestCase):
         self.assertEqual(bot._fair_model_rungs(self.T, now), {("bid", 81)})
         imm._or_fair_state["last_day"] = ""
         self.assertEqual(bot._fair_model_rungs(self.T, now), set())
+
+
+class TestLeadStop(unittest.TestCase):
+    """Jack 2026-11-01: "stop Vercel leading 24 hours before the measured
+    day. Rain leads stop leading 24 hours before the measured day. keep this
+    approach for all leading markets". LEAD STOP: no lead of either kind
+    from LEAD_STOP_BEFORE_H before a market's decision -- a Vercel market's
+    measured UTC day, else its cutoff (rain: 00:00 ET of its first measured
+    day) or its close, whichever is first. The loop's side: TestFairLead,
+    TestVercelFairLead and TestOpenRouterFairLead (the ladder lead)."""
+
+    @staticmethod
+    def _u(*a):
+        return datetime(*a, tzinfo=timezone.utc)
+
+    def test_the_decision_and_the_day_before_it(self):
+        u = self._u
+        self.assertIn("LEAD_STOP_BEFORE_H", imm._CONFIG_CODE_KNOBS)
+        self.assertEqual(imm.LEAD_STOP_BEFORE_H, 24.0)
+        # Vercel: the measured UTC day, not the close (a lab series' ticker is
+        # the day, KXOPENSOURCESHARE's the day after: "for Nov 4" on 26NOV05)
+        lab = _meta(ticker="KXOPENVREQ-04NOV26-T22.4", event_ticker="KXOPENVREQ-04NOV26",
+                    series="KXOPENVREQ", close_time=u(2026, 11, 5, 4, 59))
+        oss = _meta(ticker="KXOPENSOURCESHARE-26NOV05-T75.9",
+                    event_ticker="KXOPENSOURCESHARE-26NOV05",
+                    series="KXOPENSOURCESHARE", close_time=u(2026, 11, 5, 15))
+        # ...its cutoff, the gate's hour before the day, is not the decision
+        for m in (lab, oss, dataclasses.replace(lab, cutoff=u(2026, 11, 3, 23))):
+            self.assertEqual(imm.lead_decision_ts(m), u(2026, 11, 4).timestamp(), m.ticker)
+            self.assertFalse(imm.lead_stop_due(m, u(2026, 11, 2, 23, 59).timestamp()))
+            self.assertTrue(imm.lead_stop_due(m, u(2026, 11, 3).timestamp()))
+        # rain: its cutoff, 00:00 ET of the measured day -- Election Day's
+        # 11/03 00:00 EST, so no lead from midnight ET the night before
+        ed = _meta(ticker="KXRAINELECTION-03NOV26-IND", event_ticker="KXRAINELECTION-03NOV26",
+                   series="KXRAINELECTION", cutoff=u(2026, 11, 3, 5),
+                   close_time=u(2026, 11, 4, 4, 59))
+        self.assertEqual(imm.lead_decision_ts(ed), u(2026, 11, 3, 5).timestamp())
+        self.assertFalse(imm.lead_stop_due(ed, u(2026, 11, 2, 4, 59).timestamp()))
+        self.assertTrue(imm.lead_stop_due(ed, u(2026, 11, 2, 5).timestamp()))
+        # the weekend's: 00:00 ET Saturday, so none from 00:00 ET Friday
+        wk = _meta(ticker="KXRAINWKND-26NOV07-ATL", event_ticker="KXRAINWKND-26NOV07",
+                   series="KXRAINWKND", cutoff=u(2026, 11, 7, 5),
+                   close_time=u(2026, 11, 9, 5))
+        self.assertFalse(imm.lead_stop_due(wk, u(2026, 11, 6, 4, 59).timestamp()))
+        self.assertTrue(imm.lead_stop_due(wk, u(2026, 11, 6, 5).timestamp()))
+        # any other market: its cutoff or its close, whichever is first;
+        # neither, no stop
+        comp = _meta(ticker="KXSTATELEG-26NOV03-X", event_ticker="KXSTATELEG-26NOV03",
+                     series="KXSTATELEG", close_time=u(2026, 11, 4, 5))
+        self.assertEqual(imm.lead_decision_ts(comp), u(2026, 11, 4, 5).timestamp())
+        self.assertEqual(imm.lead_decision_ts(dataclasses.replace(comp, cutoff=u(2026, 11, 3, 11))),
+                         u(2026, 11, 3, 11).timestamp())
+        bare = _meta(close_time=None)
+        self.assertIsNone(imm.lead_decision_ts(bare))
+        self.assertFalse(imm.lead_stop_due(bare, u(2026, 11, 3).timestamp()))
+        # 0 turns it off
+        with mock.patch.object(imm, "LEAD_STOP_BEFORE_H", 0.0):
+            self.assertFalse(imm.lead_stop_due(ed, u(2026, 11, 3, 4).timestamp()))
 
 
 class TestFairClose(unittest.TestCase):

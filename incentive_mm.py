@@ -11742,6 +11742,7 @@ _CONFIG_CODE_KNOBS = (
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
     "LEAD_OFF_SERIES",            # no leads on OpenRouter (2026-11-01)
+    "LEAD_STOP_BEFORE_H",         # no lead in the 24h before a decision (2026-11-01)
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
@@ -20656,6 +20657,43 @@ LEAD_OFF_SERIES: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get(
         "IMM_LEAD_OFF_SERIES", ",".join(["KXTOKENUSE", _DEFAULT_OR_SHARE_SERIES])).split(",")
     if p.strip())
+# LEAD STOP (Jack 2026-11-01: "stop Vercel leading 24 hours before the
+# measured day. Rain leads stop leading 24 hours before the measured day.
+# keep this approach for all leading markets"). The timing review behind it:
+# on the public tape, fills before a market's measured period were no safer
+# per contract early than late, but 3-7x more traded per hour near it while
+# a program pays the same every hour, and our Vercel leads lost net only in
+# the 24 hours before the measured day (about -$38 there, +$17 earlier,
+# 10/30-11/01). No lead of either kind -- fair or complement / ladder --
+# from LEAD_STOP_BEFORE_H before a market's decision (lead_decision_ts): a
+# Vercel market's measured UTC day, else the earlier of its cutoff (a rain
+# market's: 00:00 ET of its first measured day; any other family's own
+# stop) and its close. The market quotes as usual to its cutoff; FAIR CLOSE,
+# LEAD INVENTORY, the event rooms and lock jobs are as before. 0 turns it off.
+LEAD_STOP_BEFORE_H = _env_float("IMM_LEAD_STOP_BEFORE_H", 24.0)
+
+
+def lead_decision_ts(meta) -> Optional[float]:
+    """When `meta`'s outcome starts being decided, for LEAD STOP: a Vercel
+    market's measured UTC day (vercel_measured_day, 00:00Z -- its cutoff is
+    the gate's hour before it), else the earlier of its cutoff and its close;
+    None when none is known."""
+    if vercel_series(meta.series):
+        d0 = vercel_measured_day(meta.event_ticker)
+        if d0 is not None:
+            return d0.timestamp()
+    cands = [t.timestamp() for t in (meta.cutoff, meta.close_time) if t is not None]
+    return min(cands) if cands else None
+
+
+def lead_stop_due(meta, now_ts: float) -> bool:
+    """Is `meta` within LEAD_STOP_BEFORE_H of its decision, so it leads no more?"""
+    if LEAD_STOP_BEFORE_H <= 0:
+        return False
+    d = lead_decision_ts(meta)
+    return d is not None and now_ts >= d - LEAD_STOP_BEFORE_H * 3600.0
+
+
 # Kalshi's event record groups the markets: re-read every TTL, at most READS
 # event reads per universe refresh
 COMP_PAIR_TTL_SECS = _env_float("IMM_COMP_PAIR_TTL_H", 12.0) * 3600.0
@@ -29262,13 +29300,18 @@ class IncentiveMarketMaker:
         or a threshold ladder)?"""
         return t in self._comp_groups or t in self._ladders
 
-    def _lead_source(self, meta) -> Optional[str]:
+    def _lead_source(self, meta, stop: bool = True) -> Optional[str]:
         """Where `meta`'s leads would come from: "fair" (its fresh model fair:
         FAIR LEAD -- first, so a Vercel ladder strike leads off the model,
         not off its strikes' walls), "comp" (other markets' books: the
         complement lead) or None, always for a series in LEAD_OFF_SERIES
-        (OpenRouter's). Each mode's own switch applies (lead_mode)."""
+        (OpenRouter's) and, with `stop`, from LEAD_STOP_BEFORE_H before its
+        decision (LEAD STOP; the quote loop asks with stop=False so that it
+        logs the leads it stands down). Each mode's own switch applies
+        (lead_mode)."""
         if meta.series.startswith(LEAD_OFF_SERIES):
+            return None
+        if stop and lead_stop_due(meta, time.time()):
             return None
         if fair_lead_fair_c(meta.ticker, meta.series, time.time()) is not None:
             return "fair"
@@ -29450,6 +29493,21 @@ class IncentiveMarketMaker:
             log(f"{self.tag} {kind} lead{dry} {t} {side}: off -- OpenRouter's daily "
                 f"publish: no lead from {OR_LEAD_BLACKOUT_PRE_MIN:g} min before 00:00Z "
                 f"until the feed carries the day that ended")
+
+    def _lead_stop_note(self, t: str, src: str, meta) -> None:
+        """Log each side of `t` still noted as leading as off for LEAD STOP,
+        once."""
+        dry = "" if lead_mode(src) == "on" else " (dry)"
+        kind = "fair" if src == "fair" else "comp"
+        d = lead_decision_ts(meta)
+        at = "?" if d is None else datetime.fromtimestamp(d, timezone.utc).strftime("%m-%d %H:%MZ")
+        for side in ("bid", "ask"):
+            if self._comp_lead_noted.get((t, side)) is None:
+                continue
+            self._comp_lead_noted[(t, side)] = None
+            log(f"{self.tag} {kind} lead{dry} {t} {side}: off -- {LEAD_STOP_BEFORE_H:g}h "
+                f"or less before its decision at {at} (LEAD STOP): no lead from here "
+                f"on, its rungs quote as usual to its cutoff")
 
     def _fair_gap_note(self, t: str, yes_ext: List[List[float]],
                        no_ext: List[List[float]], fair_c: float) -> None:
@@ -33333,11 +33391,15 @@ class IncentiveMarketMaker:
             # fair, so inside whatever its own family's gate caps a side to
             lead_b = lead_a = None
             lead_n = comp_lead_size(meta.target_size)
-            lead_src = self._lead_source(meta)
+            lead_src = self._lead_source(meta, stop=False)
             # (no lead of either kind across its feed's publish: OR_LEAD_BLACKOUT)
             _pub_out = fair_lead_blackout(meta.series, now_ts)
             if lead_src is not None and _pub_out:
                 self._lead_blackout_note(t, lead_src)
+                lead_src = None
+            # (nor from LEAD_STOP_BEFORE_H before its decision: LEAD STOP)
+            if lead_src is not None and lead_stop_due(meta, now_ts):
+                self._lead_stop_note(t, lead_src, meta)
                 lead_src = None
             if (lead_src is not None and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None
@@ -37203,6 +37265,12 @@ class IncentiveMarketMaker:
                f"one of these leads neither off a model fair nor off its ladder's or "
                f"siblings' books; its rungs, locks and lock jobs as before"
                if LEAD_OFF_SERIES else "none -- every series in a lead's scope leads"))
+        log("lead stop (2026-11-01): "
+            + (f"no lead of either kind from {LEAD_STOP_BEFORE_H:g}h before a market's "
+               f"decision -- a Vercel market's measured UTC day, else its cutoff (rain: "
+               f"00:00 ET of its first measured day) or its close, whichever is first; it "
+               f"quotes as usual to its cutoff"
+               if LEAD_STOP_BEFORE_H > 0 else "off -- leads run to each market's cutoff"))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "
