@@ -1799,13 +1799,50 @@ def fetch_all_orders(ticker, max_pages=10):
     return orders
 
 
-def fetch_market_filled_cash(ticker, max_pages=10):
+def _is_bot_order(o):
+    """This bot's own order: its client_order_id is the uuid4 it sets on every
+    order it places. The IMM's are "imm-<run>-<hex>"; a manual order has none."""
+    coid = str(o.get('client_order_id') or '')
+    if len(coid) != 36:
+        return False
+    try:
+        return str(uuid.UUID(coid)) == coid
+    except ValueError:
+        return False
+
+
+def own_position(orders):
+    """Contracts this bot holds in a market, from its own orders' fills:
+    |NO bought - NO sold - YES bought + YES sold|. Since 2026-10-24 the IMM
+    quotes the same KXHIGH markets on this account, so the account's position
+    (get_positions) put its inventory into this bot's caps, and Kalshi nets
+    the two bots' YES and NO against each other (Jack 2026-11-01: "have the
+    bot count only its own positions against its caps"). `orders` is
+    fetch_all_orders' list: customer-view side / action, float filled_count."""
+    net = 0.0
+    for o in orders or []:
+        if not _is_bot_order(o):
+            continue
+        try:
+            filled = float(o.get('filled_count') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        side = str(o.get('side') or '').lower()
+        action = str(o.get('action') or '').lower()
+        net += filled if (side == 'no') == (action == 'buy') else -filled
+    return abs(net)
+
+
+def fetch_market_filled_cash(ticker, max_pages=10, order_ids=None):
     """Net buy cost in dollars of this account's fills on `ticker`, straight
     from the fills API (raw `count_fp` / `*_price_dollars` string fields, with
     a fallback to the normalized integer-cent fields if those ever appear
-    here). Sells (which this bot never places) would net out. Returns
-    (cash_dollars, complete) — `complete` is False when pagination was cut
-    short, in which case the value is a floor and callers must fail closed."""
+    here). Sells (which this bot never places) would net out. With
+    `order_ids`, only the fills of those orders count: this bot's own, since
+    the account's fills hold the IMM's KXHIGH fills too from 2026-10-24.
+    Returns (cash_dollars, complete) — `complete` is False when pagination
+    was cut short, in which case the value is a floor and callers must fail
+    closed."""
     cash = 0.0
     cursor = None
     for _ in range(max_pages):
@@ -1813,6 +1850,8 @@ def fetch_market_filled_cash(ticker, max_pages=10):
         if not isinstance(resp, dict):
             return cash, False
         for f in resp.get('fills') or []:
+            if order_ids is not None and f.get('order_id') not in order_ids:
+                continue
             try:
                 cnt = float(f.get('count_fp') or f.get('count') or 0)
                 side = (f.get('side') or '').lower()
@@ -1859,23 +1898,23 @@ for market_ticker in combined_table['market_ticker']:
         print(f"  cancel failed for {order_id}: {_ce}")
 
 ############## PULL CURRENT POSITIONS
+# This bot's own contracts per market, from its own orders' fills
+# (own_position): the account's position also holds the IMM's KXHIGH
+# inventory since 10/24. A failed read leaves 0 here; the per-market refresh
+# and the fail-closed live cap check before each rung read it again.
+combined_table['position'] = 0.0
 for market_ticker in combined_table['market_ticker']:
-  positions_params = {'ticker': market_ticker}
-  current_position = exchange_client.get_positions(**positions_params)
-  # print(current_position)
-  if 'market_positions' in current_position and current_position['market_positions']:
-    positions = pd.DataFrame(current_position['market_positions'])
-
-    if 'position' in positions.columns:
-      live_positions = positions[positions['position'] != 0]
-      if not live_positions.empty:
-        row_index = combined_table.index[combined_table['market_ticker'] == market_ticker].tolist()[0]
-        combined_table.loc[row_index, 'position'] = abs(live_positions['position'].iloc[0])
-  if 'position' not in combined_table.columns:
-    combined_table['position'] = 0
-  # float, not int: V2 contract quantities are fractional (e.g. 196.74)
-  combined_table['position'] = combined_table['position'].fillna(0).astype(float)
-  combined_table['resting_order_count'] = 0
+  try:
+    _own = own_position(fetch_all_orders(market_ticker))
+  except Exception as _pe:
+    print(f"  position read failed for {market_ticker}: {_pe}")
+    continue
+  if _own:
+    row_index = combined_table.index[combined_table['market_ticker'] == market_ticker].tolist()[0]
+    combined_table.loc[row_index, 'position'] = _own
+# float, not int: V2 contract quantities are fractional (e.g. 196.74)
+combined_table['position'] = combined_table['position'].fillna(0).astype(float)
+combined_table['resting_order_count'] = 0
 
 combined_table
 
@@ -2084,13 +2123,25 @@ _band_tilt_lo = (BAND_TILT_LO_CENTS_EVENING if RUN_SLOT == "evening"
 # already refuses most of what it wants -- the same reason MORNING_CAP_MULT
 # is morning-only. west_late groups with morning, as for the band tilt.
 # The 8–12c saturation hints the limit is near 25; if anything is tested
-# next, it is 25 vs 40 on mornings. SIZE_EXP_ENABLED=true restores the
-# 50/50 split for that.
+# next, it is 25 vs 40 on mornings -- the test below.
 # =====================================================================
-SIZE_EXP_NAME = "starting_contracts_15_vs_25"
-SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "false").lower() == "true"
-SIZE_EXP_TREATMENT_CONTRACTS = int(os.environ.get("SIZE_EXP_TREATMENT_CONTRACTS", "25"))
+# MORNING SIZE TEST, 25 vs 40 (Jack 2026-11-01: "Test a bigger morning size,
+# 25 vs 40"). Since base 25 (markets 10/13-10/30) mornings made +$434
+# (+$24/day, +12% on cost) and their fill rate held at 4.5%, so the 8-12c
+# saturation did not cap the slot. Each MORNING market goes to an arm by a
+# sticky hash salted with the test's name: control keeps the slot base
+# (BASE_CONTRACTS_DAY, 25), treatment rungs start at 40. The position and
+# cash caps are the same in both arms. Evening and west_late are outside
+# the test (arm "off", their slot base). Read it out in $ per market-day
+# against control, with filled per ordered contract and c/ct, after about
+# 3 weeks. SIZE_EXP_ENABLED=false ends it.
+# =====================================================================
+SIZE_EXP_NAME = "morning_25_vs_40"
+SIZE_EXP_ENABLED = os.environ.get("SIZE_EXP_ENABLED", "true").lower() == "true"
+SIZE_EXP_SLOTS = ("morning",)
+SIZE_EXP_TREATMENT_CONTRACTS = int(os.environ.get("SIZE_EXP_TREATMENT_CONTRACTS", "40"))
 SIZE_EXP_PROPORTION = float(os.environ.get("SIZE_EXP_PROPORTION", "0.5"))
+SIZE_EXP_ACTIVE = SIZE_EXP_ENABLED and RUN_SLOT in SIZE_EXP_SLOTS
 BASE_CONTRACTS_DAY = int(os.environ.get("BASE_CONTRACTS_DAY", "25"))          # morning + west_late
 BASE_CONTRACTS_EVENING = int(os.environ.get("BASE_CONTRACTS_EVENING", "15"))
 
@@ -2255,31 +2306,30 @@ def _size_exp_assign_arm(market_ticker):
     biasing the other — the only thing they cannot share is the
     interaction term, which needs roughly 4x the data.
     """
-    if not SIZE_EXP_ENABLED:
-        return "off"     # was "control" while the experiment ran; rows now carry the slot base
+    if not SIZE_EXP_ACTIVE:
+        return "off"     # outside the test's slots, or the test switched off
     key = f"{SIZE_EXP_NAME}|{market_ticker}"
     u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
     return "treatment" if u < SIZE_EXP_PROPORTION else "control"
 
 
 def _size_exp_base_contracts(arm):
-    """Base contracts for this arm. With the experiment off (the default since
-    2026-10-12) every market gets its run slot's base -- slot_base_contracts."""
-    if not SIZE_EXP_ENABLED:
-        return slot_base_contracts(RUN_SLOT)
-    return SIZE_EXP_TREATMENT_CONTRACTS if arm == "treatment" else starting_contracts
+    """Base contracts for this arm: the treatment's size, else the run slot's
+    base (slot_base_contracts) -- the control arm and every market outside
+    the test."""
+    return SIZE_EXP_TREATMENT_CONTRACTS if arm == "treatment" else slot_base_contracts(RUN_SLOT)
 
 
 print(f"\n[AB] test={AB_TEST_NAME} enabled={AB_TEST_ENABLED} "
       f"margin={AB_SAFETY_MARGIN_CENTS}c proportion={AB_TREATMENT_PROPORTION:.0%}")
-if SIZE_EXP_ENABLED:
-    print(f"[SIZE-EXP] test={SIZE_EXP_NAME} enabled=True "
-          f"control={starting_contracts} treatment={SIZE_EXP_TREATMENT_CONTRACTS} "
-          f"proportion={SIZE_EXP_PROPORTION:.0%} "
-          f"(read out on fills/ordered contract, not on c/ct)")
+if SIZE_EXP_ACTIVE:
+    print(f"[SIZE-EXP] test={SIZE_EXP_NAME} control={slot_base_contracts(RUN_SLOT)} "
+          f"treatment={SIZE_EXP_TREATMENT_CONTRACTS} proportion={SIZE_EXP_PROPORTION:.0%} "
+          f"(sticky by market; read out in $ per market-day against control)")
 else:
     print(f"[SIZE] base {slot_base_contracts(RUN_SLOT)} contracts/rung for the {RUN_SLOT} slot "
-          f"(day {BASE_CONTRACTS_DAY}, evening {BASE_CONTRACTS_EVENING}; size experiment ended 2026-10-12)")
+          f"(day {BASE_CONTRACTS_DAY}, evening {BASE_CONTRACTS_EVENING}; size test "
+          f"{SIZE_EXP_NAME} {'on mornings only' if SIZE_EXP_ENABLED else 'off'})")
 
 # Write the run-start marker now that all config is known. If anything below
 # crashes (BQ errors, Kalshi outages, etc.), this row remains as a "started_at
@@ -2289,15 +2339,15 @@ write_run_row(
     variable=int(variable),
     night_size_mult=float(night_size_mult),
     central_time_hour=int(central_time.hour),
-    # the base this run actually used (15 = control while the experiment runs)
-    starting_contracts=int(starting_contracts if SIZE_EXP_ENABLED else slot_base_contracts(RUN_SLOT)),
+    # the slot's base, which is the control arm's while the size test runs
+    starting_contracts=int(slot_base_contracts(RUN_SLOT)),
     ab_test_name=AB_TEST_NAME,
     ab_test_enabled=bool(AB_TEST_ENABLED),
     ab_treatment_proportion=float(AB_TREATMENT_PROPORTION),
     ab_safety_margin_cents=int(AB_SAFETY_MARGIN_CENTS),
     n_markets_in_table=int(len(combined_table)),
     size_exp_name=SIZE_EXP_NAME,
-    size_exp_enabled=bool(SIZE_EXP_ENABLED),
+    size_exp_enabled=bool(SIZE_EXP_ACTIVE),
     size_exp_treatment_contracts=int(SIZE_EXP_TREATMENT_CONTRACTS),
     size_exp_proportion=float(SIZE_EXP_PROPORTION),
     sigma_model=SIGMA_MODEL,
@@ -2333,11 +2383,10 @@ for index, row in combined_table.iterrows():
   # happened at pre-loop time; prior-run resting orders may have filled since
   # then. Without this, row['position'] is stale and the cap check at
   # `max_contracts >= position + resting + new` can pass when it shouldn't.
+  _mkt_orders = None
   try:
-    _pos_resp = exchange_client.get_positions(ticker=ticker)
-    _mps = _pos_resp.get('market_positions', []) if isinstance(_pos_resp, dict) else []
-    _live = [p for p in _mps if p.get('ticker') == ticker and p.get('position', 0) != 0]
-    _fresh_pos = abs(_live[0].get('position', 0)) if _live else 0
+    _mkt_orders = fetch_all_orders(ticker)
+    _fresh_pos = own_position(_mkt_orders)      # this bot's own, not the account's
     if _fresh_pos != row['position']:
       print(f"    📊 position refresh {row['position']} → {_fresh_pos}")
       row['position'] = _fresh_pos
@@ -2425,7 +2474,10 @@ for index, row in combined_table.iterrows():
   _filled_cash = 0.0
   if MARKET_CASH_CAP_DOLLARS > 0:
     try:
-      _filled_cash, _fc_complete = fetch_market_filled_cash(ticker)
+      if _mkt_orders is None:
+        _mkt_orders = fetch_all_orders(ticker)
+      _filled_cash, _fc_complete = fetch_market_filled_cash(
+          ticker, order_ids={o.get('order_id') for o in _mkt_orders if _is_bot_order(o)})
       if not _fc_complete:
         raise RuntimeError("fills pagination incomplete")
     except Exception as _fe:
@@ -2647,7 +2699,7 @@ for index, row in combined_table.iterrows():
   # night_size_mult keys off `variable` alone since 2026-10-06 (DST fix), so
   # the old "hour<5 CT" branch of this label would now be a lie.
   _nm_reason = "variable=1 overnight" if variable == 1 else f"same-day ×{MORNING_NIGHT_MULT:g}"
-  _arm_tag = f" [size-exp:{_size_arm}]" if SIZE_EXP_ENABLED else ""
+  _arm_tag = f" [size-exp:{_size_arm}]" if SIZE_EXP_ACTIVE else ""
   print(f"    Sizing:     base={_base_contracts}{_arm_tag} × night={night_size_mult:g}x "
         f"({_nm_reason}) × city={_city_mult:g}x ({row['City']})")
   print(f"                ladder size: {_base_size} contracts (flat across rungs; "
@@ -2823,12 +2875,8 @@ for index, row in combined_table.iterrows():
     # leak if a prior-run resting order fills mid-ladder. Fail closed: on
     # API error, alert and skip this rung — the cron continues.
     try:
-      _live_pos_resp = exchange_client.get_positions(ticker=row['market_ticker'])
-      _live_mps = _live_pos_resp.get('market_positions', []) if isinstance(_live_pos_resp, dict) else []
-      _live_active = [p for p in _live_mps if p.get('ticker') == row['market_ticker'] and p.get('position', 0) != 0]
-      _live_pos = abs(_live_active[0].get('position', 0)) if _live_active else 0
-
       _live_orders = fetch_all_orders(row['market_ticker'])
+      _live_pos = own_position(_live_orders)      # this bot's own, not the account's
       _live_resting = 0.0
       for _lo in _live_orders:
         # Same logic as the per-ticker refresh above: remaining_count is
@@ -2912,7 +2960,7 @@ for index, row in combined_table.iterrows():
           # Size experiment — join fills on client_order_id to get filled vs
           # ordered contracts per arm. This is the primary readout.
           'size_exp_name': SIZE_EXP_NAME,
-          'size_exp_enabled': SIZE_EXP_ENABLED,
+          'size_exp_enabled': SIZE_EXP_ACTIVE,
           'size_arm': _size_arm,
           'size_arm_base_contracts': int(_base_contracts),
           # σ model — lets the 90-day wet/dry readout run off the orders table

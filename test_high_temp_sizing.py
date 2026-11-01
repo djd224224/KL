@@ -3,10 +3,12 @@
 high_temp_trading.py talks to Kalshi on import, so -- like
 test_high_temp_run_slot.py -- this lifts the sizing blocks out of the source
 and executes them. What it pins down:
-  - with the size experiment ended (the default), morning and west_late rungs
-    start at 25 contracts and evening rungs at 15;
-  - BASE_CONTRACTS_DAY / BASE_CONTRACTS_EVENING override them;
-  - SIZE_EXP_ENABLED=true still restores the sticky 15-vs-25 split.
+  - morning markets split sticky 50/50 into the 25-vs-40 size test (Jack
+    2026-11-01: "Test a bigger morning size, 25 vs 40"): control rungs start
+    at the slot base, 25, treatment rungs at 40;
+  - evening (15) and west_late (25) stay out of the test at their slot base;
+  - BASE_CONTRACTS_DAY / BASE_CONTRACTS_EVENING / SIZE_EXP_TREATMENT_CONTRACTS
+    override the sizes, and SIZE_EXP_ENABLED=false ends the test.
 
     python -m unittest test_high_temp_sizing
 """
@@ -31,7 +33,7 @@ def sizing(run_slot, env=None):
     config = _slice(src, "SIZE_EXP_NAME = ",
                     'return BASE_CONTRACTS_EVENING if run_slot == "evening" else BASE_CONTRACTS_DAY')
     helpers = _slice(src, "def _size_exp_assign_arm(market_ticker):",
-                     'return SIZE_EXP_TREATMENT_CONTRACTS if arm == "treatment" else starting_contracts')
+                     'return SIZE_EXP_TREATMENT_CONTRACTS if arm == "treatment" else slot_base_contracts(RUN_SLOT)')
     g = {"os": os, "hashlib": hashlib, "starting_contracts": 15, "RUN_SLOT": run_slot}
     clean = {k: v for k, v in os.environ.items()
              if not k.startswith(("SIZE_EXP_", "BASE_CONTRACTS_"))}
@@ -48,29 +50,38 @@ def base_for(g, ticker):
 class TestBaseContracts(unittest.TestCase):
     TICKERS = [f"KXHIGHNY-26OCT{d:02d}-B{t}.5" for d in range(1, 29) for t in (60, 62, 64)]
 
-    def test_morning_and_west_late_are_25_evening_15(self):
-        for slot, want in (("morning", 25), ("west_late", 25), ("evening", 15)):
+    def test_mornings_split_25_vs_40(self):
+        g = sizing("morning")
+        self.assertTrue(g["SIZE_EXP_ACTIVE"])
+        arms = {t: g["_size_exp_assign_arm"](t) for t in self.TICKERS}
+        treated = sum(a == "treatment" for a in arms.values())
+        self.assertEqual(set(arms.values()), {"treatment", "control"})
+        self.assertTrue(0.3 < treated / len(arms) < 0.7, treated)
+        for t, arm in arms.items():
+            self.assertEqual(base_for(g, t), 40 if arm == "treatment" else 25)
+        # sticky: a later run gives every market the same arm
+        self.assertEqual(arms, {t: sizing("morning")["_size_exp_assign_arm"](t) for t in self.TICKERS})
+
+    def test_evening_and_west_late_stay_out(self):
+        for slot, want in (("west_late", 25), ("evening", 15)):
             g = sizing(slot)
-            self.assertFalse(g["SIZE_EXP_ENABLED"])
+            self.assertFalse(g["SIZE_EXP_ACTIVE"])
+            self.assertEqual({g["_size_exp_assign_arm"](t) for t in self.TICKERS}, {"off"}, slot)
             self.assertEqual({base_for(g, t) for t in self.TICKERS}, {want}, slot)
-            self.assertEqual(g["_size_exp_assign_arm"](self.TICKERS[0]), "off")
 
-    def test_env_overrides_each_slot(self):
-        g = sizing("morning", {"BASE_CONTRACTS_DAY": "30", "BASE_CONTRACTS_EVENING": "10"})
-        self.assertEqual(base_for(g, self.TICKERS[0]), 30)
-        g = sizing("evening", {"BASE_CONTRACTS_DAY": "30", "BASE_CONTRACTS_EVENING": "10"})
-        self.assertEqual(base_for(g, self.TICKERS[0]), 10)
+    def test_switched_off_every_slot_is_its_base(self):
+        for slot, want in (("morning", 25), ("west_late", 25), ("evening", 15)):
+            g = sizing(slot, {"SIZE_EXP_ENABLED": "false"})
+            self.assertEqual({g["_size_exp_assign_arm"](t) for t in self.TICKERS}, {"off"}, slot)
+            self.assertEqual({base_for(g, t) for t in self.TICKERS}, {want}, slot)
 
-    def test_experiment_can_still_be_switched_back_on(self):
-        for slot in ("morning", "evening"):
-            g = sizing(slot, {"SIZE_EXP_ENABLED": "true"})
-            arms = {t: g["_size_exp_assign_arm"](t) for t in self.TICKERS}
-            self.assertEqual(set(arms.values()), {"treatment", "control"})
-            for t, arm in arms.items():
-                self.assertEqual(base_for(g, t), 25 if arm == "treatment" else 15)
-            # sticky: same split for the same ticker whatever the slot
-            self.assertEqual(arms, {t: sizing("morning", {"SIZE_EXP_ENABLED": "true"})["_size_exp_assign_arm"](t)
-                                    for t in self.TICKERS})
+    def test_env_overrides_each_size(self):
+        env = {"BASE_CONTRACTS_DAY": "30", "BASE_CONTRACTS_EVENING": "10",
+               "SIZE_EXP_TREATMENT_CONTRACTS": "50"}
+        g = sizing("morning", env)
+        self.assertEqual({base_for(g, t) for t in self.TICKERS}, {30, 50})
+        g = sizing("evening", env)
+        self.assertEqual({base_for(g, t) for t in self.TICKERS}, {10})
 
 
 def caps(env=None):
