@@ -2565,6 +2565,48 @@ class TestTrumpApproveAllowlist(unittest.TestCase):
             self.assertEqual(imm.apply_series_cutoff_adjustments(
                 "KXAPRPOTUS", ev, cut, exp - timedelta(hours=1)), want, ev)
 
+    def test_votehub_weekly_at_x3_under_the_rcp_weekly_rules(self):
+        # Jack 2026-10-31: "Add at x3" -- KXTRUMPVH, VoteHub's approval
+        # average read at 10:00 AM ET on its Friday ticker date, one market a
+        # week; nothing had quoted it since the open scan went off on 10/03
+        a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
+        for t in ("KXTRUMPVH-26NOV06-T37.6", "KXTRUMPVH-26NOV13-T37.2"):
+            self.assertFalse(b(t), t)
+            self.assertTrue(a(t), t)
+        self.assertIn("KXTRUMPVH", imm.ALLOW_SERIES)
+        self.assertFalse(a("KXTRUMPVHX-26NOV06-T37.6"))           # exact series
+        # the twin's read-day cutoff at its own x3: rungs, both caps and the
+        # estimator's ladder together; out of the size test and join-ahead
+        ov, tw = imm.SERIES_OVERRIDES["KXTRUMPVH"], imm.SERIES_OVERRIDES["KXTRUMPAPPROVE"]
+        self.assertEqual(ov.event_day_cutoff_et, tw.event_day_cutoff_et)
+        self.assertEqual(ov.size_mult, 3.0)
+        self.assertEqual(imm.applied_mention_mult("KXTRUMPVH"), 3.0)
+        self.assertEqual(imm.series_max_position("KXTRUMPVH"),
+                         imm.MAX_POSITION_CONTRACTS * 3)
+        self.assertIsNone(imm.size_test_arm("KXTRUMPVH"))
+        self.assertIn("KXTRUMPVH", imm.SIZE_TEST_EXCLUDE)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            self.assertFalse(imm.join_ahead_series("KXTRUMPVH"))
+        # its own sweep hold, not the RCP pair's link; no fair gate
+        self.assertEqual(imm.sweep_linked_series("KXTRUMPVH"), ("KXTRUMPVH",))
+        self.assertNotIn("KXTRUMPVH", imm.SWEEP_HOLD_BY_SERIES)
+        self.assertEqual(imm.fair_gate_of("KXTRUMPVH"), "")
+        U = timezone.utc
+        # the live shapes: 26NOV06 (standard time; occurrence = expiration
+        # 15:00Z), 26OCT30 (occurrence 20 min after the 14:00Z expiration),
+        # 26OCT02 -- every cutoff is 07:00 ET on the read day
+        for ev, occ, exp, want in (
+                ("KXTRUMPVH-26NOV06", datetime(2026, 11, 6, 15, 0, tzinfo=U),
+                 datetime(2026, 11, 6, 15, 0, tzinfo=U), datetime(2026, 11, 6, 12, 0, tzinfo=U)),
+                ("KXTRUMPVH-26OCT30", datetime(2026, 10, 30, 14, 20, tzinfo=U),
+                 datetime(2026, 10, 30, 14, 0, tzinfo=U), datetime(2026, 10, 30, 11, 0, tzinfo=U)),
+                ("KXTRUMPVH-26OCT02", datetime(2026, 10, 2, 14, 0, tzinfo=U),
+                 datetime(2026, 10, 2, 14, 0, tzinfo=U), datetime(2026, 10, 2, 11, 0, tzinfo=U))):
+            cut = imm.trade_cutoff_utc(ev, occ, exp)
+            self.assertEqual(cut, want, ev)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXTRUMPVH", ev, cut, exp - timedelta(minutes=1)), want, ev)
+
     def test_x3_family_size_like_the_ladders(self):
         # Jack 2026-09-26 pm: "give KXTRUMPAPPROVE markets a 3x multiplier,
         # like LADDER/ESCALATOR" -- the same size_mult wire, so rungs, both
@@ -10924,10 +10966,11 @@ class TestQuietDailyMembers(unittest.TestCase):
 
     def test_code_defaults(self):
         # KXTRUMPAPPROVE left the keep-list on 2026-10-11 for the off-list;
-        # the four strait weeklies joined the off-list on 2026-10-15
+        # the four strait weeklies joined the off-list on 2026-10-15, the
+        # VoteHub weekly on 2026-10-31
         self.assertEqual(_QUIET_DAILY_SERIES_CODE_DEFAULT, frozenset({"KXTRUMPMENTIONB"}))
         self.assertEqual(_QUIET_HOURS_OFF_CODE_DEFAULT,
-                         frozenset({"KXTRUMPAPPROVE", "KXAPRPOTUS",
+                         frozenset({"KXTRUMPAPPROVE", "KXAPRPOTUS", "KXTRUMPVH",
                                     "KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY",
                                     "KXHORMUZWEEKLY", "KXPANAMAWEEKLY"}))
         self.assertTrue(_QUIET_RAIN_PERIOD_CODE_DEFAULT)
@@ -10975,6 +11018,20 @@ class TestQuietDailyMembers(unittest.TestCase):
                                imm.hour_size_mult(c, sat_night))         # Saturday kept
         prof = dict(imm.size_mult_profile(a, self.et(2026, 10, 6, 0), 1.0))
         self.assertEqual(prof, {1.0: 1.0})                               # floor projection
+
+    def test_votehub_weekly_never_takes_the_quiet_hours(self):
+        """Jack 2026-10-31: "Add at x3", under the RCP weekly's rules --
+        KXTRUMPVH rests x1 on its family size at 0-8 ET, keeps the evening
+        x1.5 and the Saturday step, like KXAPRPOTUS."""
+        imm.QUIET_HOURS_OFF_SERIES = _QUIET_HOURS_OFF_CODE_DEFAULT
+        v, w, c = "KXTRUMPVH", "KXAPRPOTUS", "KXTRUMPMENTIONB"
+        self.assertFalse(imm.is_daily_series(v))
+        for h in (0, 4, 8):
+            self.assertEqual(imm.hour_size_mult(v, self.et(2026, 11, 2, h)), 1.0, h)
+            self.assertEqual(imm.hour_size_mult(c, self.et(2026, 11, 2, h)), 3.0, h)
+        self.assertEqual(imm.hour_size_mult(v, self.et(2026, 11, 2, 19)), 1.5)   # evening kept
+        for t in (self.et(2026, 11, 7, 12), self.et(2026, 11, 7, 4), self.et(2026, 11, 4, 10)):
+            self.assertEqual(imm.hour_size_mult(v, t), imm.hour_size_mult(w, t), t)
 
     def test_trumpmentionb_pinned_through_a_daily_flip(self):
         """Jack 2026-10-07 "yes": x3 in the quiet hours whether or not the
@@ -30770,7 +30827,7 @@ class TestJoinAhead(unittest.TestCase):
             for s in ("KXGOOD", "KXRT", "KXOPENVREQ", "KXSUEZWEEKLY"):
                 self.assertTrue(imm.join_ahead_series(s), s)
             for s in ("KXNFLLADDERREC", "KXNFLESCALATORRECYDS", "KXRAIN", "KXTEMPNYCH",
-                      "KXAPRPOTUS", "KXTRUMPAPPROVE", "KXC4POS", "KXMCDFT",
+                      "KXAPRPOTUS", "KXTRUMPAPPROVE", "KXTRUMPVH", "KXC4POS", "KXMCDFT",
                       "KXUBERAPP", "KXAMZNCC", "KXSPORTSBOOKADS"):
                 self.assertFalse(imm.join_ahead_series(s), s)
             with mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):

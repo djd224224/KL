@@ -1778,10 +1778,12 @@ QUIET_RAIN_PERIOD = os.environ.get("IMM_QUIET_RAIN_PERIOD", "1") == "1"
 # updates only on Tuesdays). The day hours netted about +$44. They keep the
 # family x2, the evening x1.5 and Saturday; KXHORMUZPEAK (graduate auto, x1)
 # is not on the list.
+# KXTRUMPVH, the VoteHub weekly, joins with its x3 entry (2026-10-31: the RCP
+# weekly's rules, see TRUMPVH_SIZE_MULT).
 # IMM_QUIET_HOURS_OFF_SERIES = exact series names ("" = none).
 QUIET_HOURS_OFF_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_QUIET_HOURS_OFF_SERIES",
-    "KXTRUMPAPPROVE,KXAPRPOTUS,"
+    "KXTRUMPAPPROVE,KXAPRPOTUS,KXTRUMPVH,"
     "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY").split(",")
     if s.strip())
 
@@ -2415,6 +2417,7 @@ def mention_size_mult(series: str) -> float:
 # hand on 10/23, see GENMOV_SIZE_MULT; KXPRESRUN, whose hand-set x6 the test
 # half would have made x9 -- Jack 2026-10-25: "Take it out"; KXAPRPOTUS,
 # resized x3 -> x5 by hand the day before the start, see APRPOTUS_SIZE_MULT;
+# KXTRUMPVH, enrolled at x3 by hand mid-test on 10/31, see TRUMPVH_SIZE_MULT;
 # KXRT and the Vercel family, x2 -> x3 on its first day, added where their
 # sizes are set) and every series under SIZE_TEST_EXCLUDE_PREFIXES: the
 # temperature families (KXHIGH*, KXLOWT*), sized x5 by hand on 10/24, two
@@ -2434,7 +2437,7 @@ SIZE_TEST_SALT = os.environ.get("IMM_SIZE_TEST_SALT", "size15-1026-31")
 SIZE_TEST_EXCLUDE = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_SIZE_TEST_EXCLUDE",
-        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN,KXAPRPOTUS"
+        "KXTRUMPMENTION,KXTRUMPMENTIONB,KXGENERALMOV,KXPRESRUN,KXAPRPOTUS,KXTRUMPVH"
     ).split(",") if s.strip())
 # the election-day rain (2026-10-31): a three-day event joining mid-test,
 # quoted as the weekend family is (its control half: x1)
@@ -7081,7 +7084,13 @@ _DEFAULT_SPORTS_SERIES = "KXMLBPLAYOFFS,KXMLBSEASONGAMES"
 # Friday; weekly, listed the Friday before), in 0.2-0.3 point range buckets
 # -- the scan rejected it on `realclearpolling` like its twin. Same entry,
 # same 07:00 ET settlement-day cutoff, same x3 size, on the same knobs.
-_DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE,KXAPRPOTUS"
+# KXTRUMPVH (Jack 2026-10-31: "Add at x3", after "isnt it similar to my RCP
+# approval"): VoteHub's Trump approval average at 10:00 AM ET on the ticker
+# date (a Friday), ONE market a week ("above" last week's read, listed the
+# Friday before). The open scan had quoted it (9/25-26, -$17.20) and nothing
+# took it back after the scan went off on 10/03. The RCP weekly's entry and
+# rules at x3 -- see TRUMPVH_SIZE_MULT.
+_DEFAULT_POLITICS_SERIES = "KXTRUMPAPPROVE,KXAPRPOTUS,KXTRUMPVH"
 # AI USAGE (Jack 2026-09-27: "yes build the OpenRouter token usage gate").
 # KXTOKENUSE ("OpenRouter total token usage for Sep 21-27 above 164T") and
 # KXTOKENUSEM (the same over a 4-week "month") settle on OpenRouter's
@@ -9345,6 +9354,26 @@ SERIES_OVERRIDES["KXTRUMPAPPROVE"] = SeriesOverride(
 APRPOTUS_SIZE_MULT = _env_float("IMM_APRPOTUS_SIZE_MULT", 5.0)
 SERIES_OVERRIDES["KXAPRPOTUS"] = replace(SERIES_OVERRIDES["KXTRUMPAPPROVE"],
                                          size_mult=APRPOTUS_SIZE_MULT)
+# KXTRUMPVH, VoteHub's approval average read at 10:00 AM ET on the ticker
+# date (Jack 2026-10-31: "Add at x3", on "x3 under the RCP weekly's rules:
+# out at 7 AM ET on read day, and outside the size test"). The twin's
+# override at TRUMPVH_SIZE_MULT: the 07:00 ET read-day cutoff, rungs 20 -> 60,
+# per-market cap 450, per-event 3,000; the evening x1.5 and the Saturday step
+# stay, the quiet hours don't (QUIET_HOURS_OFF_SERIES); out of the size test
+# (SIZE_TEST_EXCLUDE: it joins mid-test) and of join-ahead
+# (JOIN_AHEAD_EXCLUDE), as the RCP pair. Not in the RCP pair's sweep link
+# (SWEEP_LINKED_GROUPS: a different average, so a trip in one says nothing
+# certain about the other) -- it takes the plain hold and the escalation.
+# Ungated like the RCP weekly: approval_fair reads RCP only, and VoteHub has
+# no feed. The case, 10/31: its one market and each of KXAPRPOTUS's 8 buckets
+# carried the same $101/day program, and the estimator put x3 near $5/day on
+# the 58c x 62c book. Public tape 8/28-10/30, 25-75c: makers -4.9c/ct on
+# KXTRUMPVH and -3.1c on KXAPRPOTUS, where our own fills lost -2.3c. Unlike
+# RCP's, VoteHub's losses sat 1-4 days before the read (-10c/ct), which the
+# read-day cutoff does not reach. IMM_TRUMPVH_SIZE_MULT sets the size.
+TRUMPVH_SIZE_MULT = _env_float("IMM_TRUMPVH_SIZE_MULT", 3.0)
+SERIES_OVERRIDES["KXTRUMPVH"] = replace(SERIES_OVERRIDES["KXTRUMPAPPROVE"],
+                                        size_mult=TRUMPVH_SIZE_MULT)
 
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
@@ -11555,6 +11584,7 @@ _CONFIG_CODE_KNOBS = (
     "ELECTION_SIZE_MULT",         # the family x2 (2026-10-11)
     "PRESRUN_SIZE_MULT", "NO_SIDE_ONLY_EVENTS",   # KXPRESRUN-28 (2026-10-11)
     "APRPOTUS_SIZE_MULT",         # the weekly RCP approval x5 (2026-10-25)
+    "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
@@ -20261,7 +20291,7 @@ JOIN_AHEAD_MIN_AHEAD = _env_float("IMM_JOIN_AHEAD_MIN_AHEAD", 50.0)
 JOIN_AHEAD_MIN_TICKS = max(1, _env_int("IMM_JOIN_AHEAD_MIN_TICKS", 1))
 JOIN_AHEAD_EXCLUDE: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get(
-        "IMM_JOIN_AHEAD_EXCLUDE", "KXTRUMPAPPROVE,KXAPRPOTUS").split(",")
+        "IMM_JOIN_AHEAD_EXCLUDE", "KXTRUMPAPPROVE,KXAPRPOTUS,KXTRUMPVH").split(",")
     if p.strip())
 
 
