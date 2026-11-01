@@ -146,12 +146,13 @@ class TestFills(unittest.TestCase):
         self.assertEqual(out["point of sale"]["bid"][:3], [1, 100.0, -10.0])
         self.assertEqual(out["point of sale"]["ask"][:3], [1, 50.0, 2.0])
         self.assertEqual(cm.cpc(out["point of sale"]["bid"]), "-10.0c")
-        # 12:00Z = 08:00 ET: inside point of sale's 07-10 landing window
+        # 12:00Z: inside point of sale's 11-14h UTC landing window (UTC hours
+        # since 2026-11-01; the old 07-10 ET reading of 12:00Z no longer counts)
         inside = cm.side_stats(fills, _fam, t0 - 1, t0 + 3600,
-                               windows={"point of sale": [(7, 10)]})
+                               windows={"point of sale": [(11, 14)]})
         self.assertEqual(inside["point of sale"]["bid"][1], 100.0)
         outside = cm.side_stats(fills, _fam, t0 - 1, t0 + 3600,
-                                windows={"point of sale": [(11, 14)]})
+                                windows={"point of sale": [(7, 10)]})
         self.assertEqual(outside["point of sale"]["bid"][1], 0.0)
 
     def test_late_violations_count_only_the_blocked_side_inside_the_window(self):

@@ -12443,6 +12443,20 @@ class TestCarbonArcFairGate(unittest.TestCase):
                           (12, True), (16, False)):
             self.assertEqual(imm.ca_landing_window("KXFAKECC", self._et(h)), inside, h)
 
+    def test_the_windows_keep_their_utc_hours_across_the_clock_change(self):
+        # Jack 2026-11-01: "Yes, both" -- Carbon Arc publishes on fixed UTC
+        # hours (POS 11:27Z on 10/30 and on 11/01), so the windows are UTC: the
+        # point-of-sale drop at 11:27Z is inside its window before and after
+        # the clocks went back, though it read 07:27 ET in October and 06:27 ET
+        # from 11/01 (an ET 07-10 window missed it)
+        self._write_fair({"KXFAKECC": dict(self._entry(100.0), category="Point of Sale")})
+        for day in (datetime(2026, 10, 30, 11, 27, tzinfo=timezone.utc),
+                    datetime(2026, 11, 2, 11, 27, tzinfo=timezone.utc)):
+            self.assertTrue(imm.ca_landing_window("KXFAKECC", day), day)
+        est = datetime(2026, 11, 2, 10, 30, tzinfo=timezone.utc)   # 05:30 ET
+        self.assertFalse(imm.ca_landing_window("KXFAKECC", est))
+        self.assertTrue(imm.ca_landing_window("KXFAKECC", est.replace(hour=13, minute=59)))
+
     def test_per_market_boosts_are_off_inside_the_window(self):
         bot = IncentiveMarketMaker(client=None, live=False)
         bot._yield_boost[self.T] = 1.0

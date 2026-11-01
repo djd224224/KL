@@ -1293,6 +1293,39 @@ class TestSizeTestPass(unittest.TestCase):
         self.assertEqual(sent[1:], ["IMM-WATCH size test pass FAILED"])
 
 
+class TestCaSettledPass(unittest.TestCase):
+    """Pass 8 (Jack 2026-11-01: "Yes, both"): the Carbon Arc settled-strike
+    dry run adds its summary line, and a failing pass is emailed at most
+    daily."""
+
+    def test_summary_and_failure(self):
+        from unittest import mock
+        import ca_settled_dry as csd
+        sent, seen = [], []
+        res = {"strikes": 2, "pool": 30.0, "est": {"20/20": 0.5, "20/1000": 4.0, "150/1000": 5.0},
+               "skip": {}}
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(csd, "run_pass",
+                                  lambda progs, now=None, dry=False: seen.append((progs, dry)) or res):
+            summary = []
+            fw.ca_settled_pass({"KXFAKECC-26NOV07-T90": {}}, {}, True, summary)
+        self.assertEqual(seen, [({"KXFAKECC-26NOV07-T90": {}}, True)])
+        self.assertEqual(summary, ["ca settled (dry) 2 strikes, pool $30/day, est $0 / $4 / $5 "
+                                   "a day at 20/20, 20/1000, 150/1000"])
+        self.assertEqual(sent, [])
+
+        def boom(progs, now=None, dry=False):
+            raise RuntimeError("books torn")
+        state = {}
+        with mock.patch.object(imm.Alerter, "send_message",
+                               lambda self, body, subject=None: sent.append(subject) or True), \
+                mock.patch.object(csd, "run_pass", boom):
+            fw.ca_settled_pass({}, state, False, [])
+            fw.ca_settled_pass({}, state, False, [])                     # no repeat within a day
+        self.assertEqual(sent, ["IMM-WATCH Carbon Arc dry run pass FAILED"])
+
+
 class TestResearchLoginFailure(unittest.TestCase):
     """Jack 2026-10-12: "send an email right away when research fails on a
     login error, instead of waiting until items give up"."""

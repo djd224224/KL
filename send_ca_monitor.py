@@ -192,7 +192,8 @@ def money(D: dict, day, fam_of) -> dict:
 def side_stats(fills, fam_of, a_ts: float, b_ts: float, windows=None) -> dict:
     """{family: {side: [fills, contracts, $ marked to now, $ markout]}} for
     our maker fills in [a_ts, b_ts) (pads and taker fills left out); with
-    `windows` ({family: [(a, b), ...]} ET hours) only fills inside them."""
+    `windows` ({family: [(a, b), ...]} UTC hours, as incentive_mm's
+    CA_LANDING_WINDOWS since 2026-11-01) only fills inside them."""
     out = {f[0]: {"bid": [0, 0.0, 0.0, 0.0], "ask": [0, 0.0, 0.0, 0.0],
                   "max": 0.0} for f in FAMILIES}
     for f in fills:
@@ -202,7 +203,7 @@ def side_stats(fills, fam_of, a_ts: float, b_ts: float, windows=None) -> dict:
         if fam is None or f.get("side") not in ("bid", "ask"):
             continue
         if windows is not None:
-            h = datetime.fromtimestamp(f["ts"], timezone.utc).astimezone(imm.ET).hour
+            h = datetime.fromtimestamp(f["ts"], timezone.utc).hour
             if not any((a <= h < b) if a < b else (h >= a or h < b)
                        for a, b in windows.get(fam, ())):
                 continue

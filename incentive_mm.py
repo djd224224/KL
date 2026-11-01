@@ -2333,13 +2333,19 @@ def _share_x1(series: str) -> bool:
 # category's window a Carbon Arc market is at 1x: the hour / Saturday
 # multipliers are capped at 1 here, and the per-market boosts (yield x1.5,
 # near-cliff) are off in the bot (ca_landing_window). The windows are the
-# landing hours plus ~2h for the reaction, [start, end) in ET hours; a window
-# may wrap midnight. IMM_CA_LANDING_WINDOWS: "category=a-b+c-d;..." (prism
+# landing hours plus ~2h for the reaction, [start, end) in UTC hours; a window
+# may wrap midnight. IMM_CA_LANDING_WINDOWS_UTC: "category=a-b+c-d;..." (prism
 # categories, lowercased); empty = off.
-_DEFAULT_CA_LANDING_WINDOWS = ("point of sale=7-10;foot traffic=8-11;app=8-12;"
-                               "credit card=11-15;advertising=21-6+11-14")
+# UTC since 2026-11-01 (Jack: "Yes, both", on moving the windows for the clock
+# change): Carbon Arc publishes on fixed UTC hours -- 11/01, the first EST
+# day, POS landed 11:27Z, foot traffic 12:56Z, card 16:03Z, the same UTC hours
+# as all October -- so the ET windows above (set in EDT) started an hour late
+# from 11/01: POS landed ~06:30 ET, before its 7-10 window and inside the x3
+# 00-08h ET. These are those same EDT windows in UTC.
+_DEFAULT_CA_LANDING_WINDOWS = ("point of sale=11-14;foot traffic=12-15;app=12-16;"
+                               "credit card=15-19;advertising=1-10+15-18")
 CA_LANDING_WINDOWS: Dict[str, List[Tuple[int, int]]] = {}
-for _part in os.environ.get("IMM_CA_LANDING_WINDOWS", _DEFAULT_CA_LANDING_WINDOWS).split(";"):
+for _part in os.environ.get("IMM_CA_LANDING_WINDOWS_UTC", _DEFAULT_CA_LANDING_WINDOWS).split(";"):
     if "=" not in _part:
         continue
     _cat, _spans = _part.split("=", 1)
@@ -2388,13 +2394,13 @@ def ca_category(series: str) -> Optional[str]:
 
 def ca_landing_window(series: str, now_utc: datetime) -> bool:
     """True while `series` is a Carbon Arc series inside its category's data
-    landing window (CA_LANDING_WINDOWS)."""
+    landing window (CA_LANDING_WINDOWS, UTC hours)."""
     if not CA_LANDING_WINDOWS:
         return False
     cat = ca_category(series)
     if not cat or cat not in CA_LANDING_WINDOWS:
         return False
-    h = now_utc.astimezone(ET).hour
+    h = now_utc.astimezone(timezone.utc).hour
     return any((a <= h < b) if a < b else (h >= a or h < b)
                for a, b in CA_LANDING_WINDOWS[cat])
 
@@ -36741,10 +36747,10 @@ class IncentiveMarketMaker:
                    f"carbon_arc_fair"
                    if CA_SCHEDULE_HOLD else "off (IMM_CA_SCHEDULE_HOLD=0)"))
             if CA_LANDING_WINDOWS:
-                log("ca 1x while data lands (2026-10-10): "
+                log("ca 1x while data lands (2026-10-10, UTC since 2026-11-01): "
                     + "; ".join(f"{c} " + "+".join(f"{a:02d}-{b:02d}h" for a, b in w)
                                 for c, w in sorted(CA_LANDING_WINDOWS.items()))
-                    + " ET -- no hour / Saturday / yield / near-cliff boost inside")
+                    + " UTC -- no hour / Saturday / yield / near-cliff boost inside")
         if CA_LATE_SIZE_MULT < 1.0 or CA_LATE_TOXIC_MULT < 1.0:
             _blk: Dict[str, List[str]] = {}
             for _c, _s in sorted(CA_LATE_TOXIC_SIDE_BY_CAT.items()):

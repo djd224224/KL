@@ -56,6 +56,11 @@ threshold". Three passes, each fail-safe on its own:
    10/27-11/09): its stop rule writes the bot's stop file, and the day-7 and
    final emails carry the verdict set in advance. A failing pass is emailed
    too (daily).
+8. CARBON ARC SETTLED-STRIKE DRY RUN (2026-11-01, Jack: "Yes, both") --
+   ca_settled_dry logs, for every Carbon Arc strike our read already settles,
+   what the settled-strike mode would rest and the bot's reward estimate for
+   it; nothing is placed. `python ca_settled_dry.py --report` scores it. A
+   failing pass is emailed too (daily).
 
 Imports imm_quote_gaps first: it mirrors the launcher's env (blocklist, allow
 lists, pilots) before incentive_mm is imported, so "allowed" means what the live
@@ -1729,6 +1734,28 @@ def size_test_pass(state: dict, dry: bool, summary: List[str]) -> None:
             state["size_test_err_sent"] = now.timestamp()
 
 
+def ca_settled_pass(progs: dict, state: dict, dry: bool, summary: List[str]) -> None:
+    """Pass 8 (Jack 2026-11-01: "Yes, both"): the Carbon Arc settled-strike
+    DRY RUN (ca_settled_dry.run_pass) -- logs what the mode would rest and
+    its estimated reward; places nothing. The pass's own failure is emailed
+    (at most daily)."""
+    import ca_settled_dry as csd
+    now = datetime.now(timezone.utc)
+    try:
+        res = csd.run_pass(progs, now=now, dry=dry)
+        summary.append(csd.summary_line(res))
+    except Exception as e:                           # noqa: BLE001 - emailed below
+        log(f"[WATCH] ! ca settled pass failed: {e!r}")
+        last = state.get("ca_settled_err_sent") or 0
+        if not dry and now.timestamp() - float(last) >= MODEL_PASS_ERR_HOURS * 3600:
+            imm.Alerter("IMM-WATCH", live=True).send_message(
+                f"The IMM family watch's Carbon Arc settled-strike dry run failed: {e!r}\n"
+                f"Nothing trades on it; until it is fixed the dry run logs nothing. "
+                f"Log: run-logs\\incentive-mm\\family-watch.log",
+                "IMM-WATCH Carbon Arc dry run pass FAILED")
+            state["ca_settled_err_sent"] = now.timestamp()
+
+
 def _load_state() -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -1754,6 +1781,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-model", action="store_true", help="skip pass 5 (model coverage)")
     ap.add_argument("--no-calendar", action="store_true", help="skip pass 6 (release calendar)")
     ap.add_argument("--no-size-test", action="store_true", help="skip pass 7 (size split test)")
+    ap.add_argument("--no-ca-settled", action="store_true",
+                    help="skip pass 8 (Carbon Arc settled-strike dry run)")
     ap.add_argument("--check-login", action="store_true",
                     help="test the research login with one tiny run, then exit")
     args = ap.parse_args(argv)
@@ -1843,6 +1872,8 @@ def main(argv=None) -> int:
         release_calendar_pass(client, new_state_series, state, args.dry, summary)
     if not args.no_size_test:
         size_test_pass(state, args.dry, summary)
+    if not args.no_ca_settled:
+        ca_settled_pass(progs, state, args.dry, summary)
     if not args.dry:
         _save_state(state)
     log(f"[WATCH] {', '.join(summary)} ({time.time() - t0:.0f}s"
