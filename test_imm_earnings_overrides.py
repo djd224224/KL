@@ -363,5 +363,16 @@ class TestTvmazeAirtime(unittest.TestCase):
                                     [_ep("ABC World News Tonight with David Muir", None)]))
 
 
+class TestClassifyBlocklist(unittest.TestCase):
+    def test_an_exact_series_cut_is_skipped(self):
+        # Jack 2026-11-01, "i thought it was blocked": the KXLOLTEEMO- cut
+        # missed this name check, so the family watch re-enrolled it into the
+        # LoL family every 30 min and emailed each time
+        verdict, why = ieo.classify_series("KXLOLTEEMO", "KXLOLTEEMO-WORLDS26-Y")
+        self.assertEqual((verdict, why), ("skip", "blocklisted (cloud fleet / manual)"))
+        self.assertNotEqual(
+            ieo.classify_series("KXLOLREGION", "KXLOLREGION-WORLDS26-LCK")[0], "skip")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -604,7 +604,10 @@ def owner_of(series: str) -> Tuple[str, bool]:
         if imm.rain_day_series(s):
             return "", False
     named = next((why for p, why in OWNER_PREFIXES if s.startswith(p)), "")
-    if any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ())):
+    # exact-series cuts ("KXLOLTEEMO-") too, via series_blocklisted (2026-11-01)
+    blocked = getattr(imm, "series_blocklisted", None)
+    if (blocked(s) if blocked else
+            any(s.startswith(p) for p in getattr(imm, "SERIES_BLOCKLIST_PREFIXES", ()))):
         return named or "blocklisted in incentive_mm.py", bool(named)
     if any(s.startswith(p) for p in getattr(imm, "SCAN_EXCLUDE_PREFIXES", ())):
         return named or "the bot's scan leaves these out on purpose", bool(named)

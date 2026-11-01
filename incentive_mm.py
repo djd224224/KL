@@ -5091,6 +5091,17 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
+
+def series_blocklisted(series: str) -> bool:
+    """A bare SERIES name under SERIES_BLOCKLIST_PREFIXES: a prefix entry, or
+    an exact-series entry ("<series>-", the cuts above), which a bare name
+    cannot startswith. The enrollment paths check names, not tickers, and
+    missed those: the family watch re-enrolled KXLOLTEEMO every 30 min after
+    its 2026-11-01 cut, emailing each time. An event-ticker entry
+    ("KXMLBPLAYOFFS-26") still leaves its series name alone."""
+    return any(series.startswith(p) or p == f"{series}-"
+               for p in SERIES_BLOCKLIST_PREFIXES)
+
 # WIND-DOWN EXEMPTION for a blocklisted series (Jack 2026-09-11, KXTRUEV):
 # event tickers that keep quoting to their own completion even though their
 # series prefix is blocklisted. Everything the event's normal rules already

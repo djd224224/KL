@@ -2272,6 +2272,19 @@ class TestBlocklist(unittest.TestCase):
         for t in ("KXNETFLIXTOPVIEWSMOVIE-26NOV02-9", "KXLOLREGION-WORLDS26-LCK"):
             self.assertFalse(b(t), t)
 
+    def test_series_blocklisted_sees_exact_series_cuts(self):
+        # the enrollment paths check bare SERIES names: an exact-series cut
+        # ("<series>-") must match them too, or the family watch re-enrolls
+        # the cut series every 30 min (KXLOLTEEMO, 2026-11-01)
+        sb = imm.series_blocklisted
+        for s in ("KXLOLTEEMO", "KXNETFLIXTOPVIEWSTV", "KXAAAGASM", "KXHIGHNY", "KXTRUEV"):
+            self.assertTrue(sb(s), s)
+        # neighbours of an exact cut, and an event-ticker entry's series
+        # (KXMLBPLAYOFFS-26 leaves KXMLBPLAYOFFS live for a 2027 listing)
+        for s in ("KXLOLTEEMOX", "KXLOLREGION", "KXNETFLIXTOPVIEWSMOVIE",
+                  "KXAAAGASMTX", "KXMLBPLAYOFFS"):
+            self.assertFalse(sb(s), s)
+
     def test_market_suffix_block_freezes_the_nqe_leg_only(self):
         # Jack 2026-09-11 pm ("implement the suffix block"): the mention
         # family's "Event does not qualify" leg is frozen by STRIKE SUFFIX

@@ -950,6 +950,9 @@ class TestQuoteCalls(unittest.TestCase):
         with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": True}):
             self.assertEqual(fw.owner_of("KXLOWTMIA"), ("", False))
         self.assertEqual(fw.owner_of("KXLOW-26OCT"), ("blocklisted in incentive_mm.py", False))
+        # an exact-series cut ("KXLOW-") by its bare name: the miss that
+        # re-enrolled KXLOLTEEMO every 30 min after its cut (2026-11-01)
+        self.assertEqual(fw.owner_of("KXLOW"), ("blocklisted in incentive_mm.py", False))
         self.assertEqual(fw.owner_of("KXFRANCEEMERGENCY"), ("", False))
         # a monthly rain city is the family's, named or not (2026-10-26, Jack:
         # "Enroll and prevent this issue in the future") -- not "kept out on

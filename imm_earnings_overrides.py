@@ -508,7 +508,7 @@ def classify_series(series: str, sample_ticker: str):
     """-> ('enroll', reason) | ('review', hint) | ('skip', reason)."""
     if series.endswith("MAXMON") or series.endswith("MINMON"):
         return "skip", "fleet monthly crypto"
-    if any(series.startswith(p) for p in imm.SERIES_BLOCKLIST_PREFIXES):
+    if imm.series_blocklisted(series):      # exact-series cuts too (2026-11-01)
         return "skip", "blocklisted (cloud fleet / manual)"
     if "MENTION" in series:
         return "enroll", "mention family (tailed variant)"
