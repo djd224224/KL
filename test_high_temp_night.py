@@ -1,11 +1,13 @@
-"""The night fresh-quote pilot in high_temp_trading.py (Jack 2026-11-01: "1+2").
+"""Night fresh quotes in high_temp_trading.py (Jack 2026-11-01: "1+2", then
+"just switch overnight to the new strategy").
 
 high_temp_trading.py talks to Kalshi on import, so -- like
 test_high_temp_sizing.py -- this lifts the pilot's block out of the source and
 executes it. What it pins down:
   - evening runs at 20 and 23 CT are base runs (both arms); any other evening
     hour is an extra run that quotes the fresh arm only;
-  - each evening market goes to the fresh or control arm by a sticky hash;
+  - every evening market is fresh by default; NIGHT_PILOT_PROPORTION < 1
+    brings back a sticky control arm;
   - a fresh market's evening order expires 60 minutes after placement (or at
     its usual 01:59 expiry if sooner); control keeps the usual expiry;
   - with NIGHT_PILOT_ENABLED=false every market is "off", and an off-hour
@@ -69,17 +71,26 @@ class TestNightPilot(unittest.TestCase):
         g, _ = night(22, env={"EVENING_BASE_HOURS_CT": "20,22,23"})
         self.assertFalse(g["EXTRA_NIGHT_RUN"])
 
-    def test_arms_are_a_sticky_split(self):
-        g, _ = night(20)
+    def test_every_evening_market_is_fresh_by_default(self):
+        for hour in (19, 20, 21, 22, 23):
+            g, _ = night(hour)
+            self.assertEqual({g["night_arm"](t) for t in TICKERS}, {"fresh"}, hour)
+            self.assertEqual(g["night_expiration"](NOW + 5 * 3600, TICKERS[0], NOW), NOW + 3600)
+
+    def test_a_proportion_brings_back_a_sticky_control(self):
+        half = {"NIGHT_PILOT_PROPORTION": "0.5"}
+        g, _ = night(20, env=half)
         arms = {t: g["night_arm"](t) for t in TICKERS}
         fresh = sum(a == "fresh" for a in arms.values())
         self.assertEqual(set(arms.values()), {"fresh", "control"})
         self.assertTrue(0.35 < fresh / len(arms) < 0.65, fresh)
         # the same arm on every run of the night, base or extra
-        self.assertEqual(arms, {t: night(22)[0]["night_arm"](t) for t in TICKERS})
+        self.assertEqual(arms, {t: night(22, env=half)[0]["night_arm"](t) for t in TICKERS})
+        g, _ = night(20, env={"NIGHT_PILOT_PROPORTION": "0"})
+        self.assertEqual({g["night_arm"](t) for t in TICKERS}, {"control"})
 
     def test_fresh_orders_expire_after_60_minutes(self):
-        g, _ = night(21)
+        g, _ = night(21, env={"NIGHT_PILOT_PROPORTION": "0.5"})
         usual = NOW + 5 * 3600
         for t in TICKERS[:40]:
             want = NOW + 3600 if g["night_arm"](t) == "fresh" else usual

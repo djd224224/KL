@@ -617,28 +617,29 @@ if not ACTIVE_CITIES:
     sys.exit(0)
 
 # =====================================================================
-# NIGHT PILOT: FRESH QUOTES (Jack 2026-11-01: "1+2" -- evening orders that
-# expire after 60 minutes, re-quoted every hour 7-11 PM CT).
+# NIGHT: FRESH QUOTES (Jack 2026-11-01: "1+2" -- evening orders that expire
+# after 60 minutes, re-quoted every hour 7-11 PM CT -- then, instead of a
+# pilot: "dont need to test. just switch overnight to the new strategy",
+# "the data is coonvincing enough").
 # On Sep-Oct markets, evening fills <= 60 min after their order went up made
 # +$513 (+13c/contract); older ones lost $1,002 (1-2 h -14c/ct, 2-4 h
 # -5c/ct), in every edge and price bucket: a resting evening quote goes stale
-# as the night's forecast updates land. Each evening market goes to an arm
-# by a sticky hash salted with the pilot's name:
-#   fresh    its orders expire NIGHT_ORDER_TTL_MIN (60) after placement, and
-#            every evening run quotes it (19:02-23:02 CT, hourly);
-#   control  unchanged: quoted only on the base runs (EVENING_BASE_HOURS_CT,
-#            20:02 and 23:02), resting to 01:59 CT.
-# A run at any other evening hour is an extra run: it cancels and quotes
-# fresh markets only, so control's 20:02 orders rest to 23:02 as before.
-# The arm is not stored in BigQuery: recompute night_arm(ticker) in the
-# readout ($ per market-day against control, after about 3 weeks).
-# NIGHT_PILOT_ENABLED=false ends it: every market back to control, and an
-# off-hour evening run then does nothing.
+# as the night's forecast updates land. So every evening market is "fresh":
+# its orders expire NIGHT_ORDER_TTL_MIN (60) after placement, and every
+# evening run quotes it (19:02-23:02 CT, hourly; nothing rests past ~00:02).
+# NIGHT_PILOT_PROPORTION (default 1.0) below 1 brings back a sticky control
+# arm, by a hash salted with NIGHT_PILOT_NAME: control is quoted only on the
+# base runs (EVENING_BASE_HOURS_CT, 20:02 and 23:02) and rests to 01:59 CT,
+# and a run at any other evening hour (an extra run) cancels and quotes the
+# fresh markets only. 0 = the old night on every market, plus extra runs
+# that do nothing. NIGHT_PILOT_ENABLED=false turns it all off: every market
+# back to the old night, and an off-hour evening run exits as a noop.
+# (The NIGHT_PILOT_* names stay from the 1bb3fb0 pilot design.)
 # =====================================================================
 NIGHT_PILOT_NAME = "night_fresh_60min"
 NIGHT_PILOT_ENABLED = os.environ.get("NIGHT_PILOT_ENABLED", "true").lower() == "true"
 NIGHT_ORDER_TTL_MIN = int(os.environ.get("NIGHT_ORDER_TTL_MIN", "60"))
-NIGHT_PILOT_PROPORTION = float(os.environ.get("NIGHT_PILOT_PROPORTION", "0.5"))
+NIGHT_PILOT_PROPORTION = float(os.environ.get("NIGHT_PILOT_PROPORTION", "1.0"))
 EVENING_BASE_HOURS_CT = {int(h) for h in os.environ.get("EVENING_BASE_HOURS_CT", "20,23").split(",")
                          if h.strip()}
 NIGHT_PILOT_ACTIVE = NIGHT_PILOT_ENABLED and RUN_SLOT == "evening"
@@ -646,7 +647,9 @@ EXTRA_NIGHT_RUN = RUN_SLOT == "evening" and central_time.hour not in EVENING_BAS
 
 
 def night_arm(market_ticker):
-    """'fresh' or 'control' for an evening market while the pilot runs, else 'off'."""
+    """'fresh' or 'control' for an evening market (every one is fresh at the
+    default NIGHT_PILOT_PROPORTION 1.0); 'off' outside the evening or with
+    NIGHT_PILOT_ENABLED=false."""
     if not NIGHT_PILOT_ACTIVE:
         return "off"
     key = f"{NIGHT_PILOT_NAME}|{market_ticker}"
@@ -663,11 +666,13 @@ def night_expiration(exp_ts, market_ticker, now_ts):
 
 
 if RUN_SLOT == "evening":
-    print(f"[NIGHT] pilot {NIGHT_PILOT_NAME}: "
-          + (f"{'extra run, fresh markets only' if EXTRA_NIGHT_RUN else 'base run, both arms'}; "
-             f"fresh orders live {NIGHT_ORDER_TTL_MIN} min" if NIGHT_PILOT_ACTIVE else "off"))
+    _scope = ("every market" if NIGHT_PILOT_PROPORTION >= 1
+              else f"{NIGHT_PILOT_PROPORTION:.0%} of markets (sticky; the rest are control)")
+    print(f"[NIGHT] fresh quotes: "
+          + (f"{_scope}, orders live {NIGHT_ORDER_TTL_MIN} min; "
+             f"{'extra' if EXTRA_NIGHT_RUN else 'base'} run" if NIGHT_PILOT_ACTIVE else "off"))
 if EXTRA_NIGHT_RUN and not NIGHT_PILOT_ACTIVE:
-    # An off-hour evening trigger with the pilot off. Before the pilot only
+    # An off-hour evening trigger with fresh quotes off. Before them only
     # the base hours ran, so this hour does what it did then: nothing.
     print(f"  {central_time.strftime('%H:%M')} CT is not a base evening hour "
           f"{sorted(EVENING_BASE_HOURS_CT)} and the night pilot is off; exiting")
