@@ -5031,6 +5031,17 @@ _CUT_AAA_MONTHLY_SERIES = ("KXAAAGASM",)
 # so KXOPENSOURCESHARE (Vercel) and KXTOKENUSE stay. Standard semantics:
 # open positions ride to settlement. Un-block by removing this entry.
 _CUT_OR_SHARE_SERIES = tuple(s for s in _DEFAULT_OR_SHARE_SERIES.split(",") if s)
+# NETFLIX TV + LOL TEEMO OFF (Jack 2026-11-01: "Just the clear two", after
+# "are there other events, even small, that are clear losers?"). The 31-day
+# series scan of the dashboard (10/02-11/01) found two clear losers still
+# quoting. KXNETFLIXTOPVIEWSTV: -$87 = $77 rewards against -$164 trading,
+# down 4 of its 5 weeks (makers on the public tape lose 8 weeks in 10).
+# KXLOLTEEMO: -$107 = $5 of rewards against -$112 trading, one -$99 week.
+# The movie twin KXNETFLIXTOPVIEWSMOVIE (+$32, up 4 of 5 weeks) and the
+# other LoL Worlds series keep quoting; the scan-graduate entry is kept so
+# an un-block is one line. Exact series (the dash). Standard semantics:
+# open positions ride to settlement. Un-block by removing this entry.
+_CUT_LOSERS_1101_SERIES = ("KXNETFLIXTOPVIEWSTV", "KXLOLTEEMO")
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
@@ -5075,6 +5086,8 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_AAA_MONTHLY_SERIES]
     # the OpenRouter share family (2026-10-09, above)
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
+    # Netflix top-10 TV + LoL Worlds Teemo (2026-11-01, above)
+    + [f"{_s}-" for _s in _CUT_LOSERS_1101_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 

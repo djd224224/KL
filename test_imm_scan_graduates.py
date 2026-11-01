@@ -24,9 +24,17 @@ class ScanGraduateTests(unittest.TestCase):
     def test_graduates_are_allowed_and_not_blocked(self):
         # the 83 of 10/03, and KXSOFTWAREUNEMP (Jack 2026-10-25: "Enroll this too")
         self.assertEqual(len(imm.SCAN_GRADUATE_SERIES), 84)
-        for s in sorted(imm.SCAN_GRADUATE_SERIES):
+        # ...less Netflix TV, cut BY NAME on 2026-11-01 (Jack: "Just the clear
+        # two"): the blocklist beats its graduate entry, which stays so an
+        # un-block is one line
+        cut = set(imm._CUT_LOSERS_1101_SERIES)
+        self.assertEqual(sorted(imm.SCAN_GRADUATE_SERIES & cut), ["KXNETFLIXTOPVIEWSTV"])
+        for s in sorted(imm.SCAN_GRADUATE_SERIES - cut):
             self.assertTrue(M._allowed(f"{s}-X"), s)
             self.assertFalse(M._blocked(f"{s}-X"), s)
+        for s in sorted(imm.SCAN_GRADUATE_SERIES & cut):
+            self.assertFalse(M._allowed(f"{s}-X"), s)
+            self.assertTrue(M._blocked(f"{s}-X"), s)
         for s in ("KXTRUMPENDORSEMENTS", "KXSUEZWEEKLY", "KXORBOFHARVEST",
                   "KXCFNAI", "KXNYCSUBWAY", "KXWYCOAL", "KXOER", "KXSOFTWAREUNEMP"):
             self.assertTrue(imm.scan_graduate_series(s), s)

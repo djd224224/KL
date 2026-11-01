@@ -2259,6 +2259,19 @@ class TestBlocklist(unittest.TestCase):
         # KXSOLD26 must be blocked WITHOUT eating KXSOLDATHOLDINGS
         self.assertFalse(b("KXSOLDATHOLDINGS-26AUG14-T2500000"))
 
+    def test_netflix_tv_and_lol_teemo_cut_by_name(self):
+        # Jack 2026-11-01 "Just the clear two": the 31-day scan's clear
+        # losers are frozen by NAME, so the movie twin and the other LoL
+        # Worlds series keep quoting, and the blocklist beats the
+        # scan-graduate allowlist entry Netflix TV still has
+        b = IncentiveMarketMaker._blocked
+        for t in ("KXNETFLIXTOPVIEWSTV-26NOV02-9", "KXLOLTEEMO-WORLDS26-Y"):
+            self.assertTrue(b(t), t)
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+        self.assertIn("KXNETFLIXTOPVIEWSTV", imm.SCAN_GRADUATE_SERIES)
+        for t in ("KXNETFLIXTOPVIEWSMOVIE-26NOV02-9", "KXLOLREGION-WORLDS26-LCK"):
+            self.assertFalse(b(t), t)
+
     def test_market_suffix_block_freezes_the_nqe_leg_only(self):
         # Jack 2026-09-11 pm ("implement the suffix block"): the mention
         # family's "Event does not qualify" leg is frozen by STRIKE SUFFIX
