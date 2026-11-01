@@ -37234,6 +37234,15 @@ class IncentiveMarketMaker:
                        + f" -- reads through day {_caf.CA_HOLIDAY_THROUGH_DAY}, sigma "
                        f"+{_caf.CA_HOLIDAY_SIGMA_SHARE:g} of the shift"
                        if _caf.CA_HOLIDAY_ENABLE else "off (IMM_CA_HOLIDAY=0)"))
+                # ...and the POS series' calendar factors (Jack 2026-11-01:
+                # "implement the proper drift fix, based on historical data"),
+                # from a table outside the repo the refresher re-reads
+                _tab = _caf.calendar_table() if _caf.CA_CALENDAR_ENABLE else {}
+                log("ca calendar factors (2026-11-01): "
+                    + ("off (IMM_CA_CALENDAR=0)" if not _caf.CA_CALENDAR_ENABLE
+                       else ("; ".join(f"{m} {len(rows)} series" for m, rows in sorted(_tab.items()))
+                             + f" from {_caf.CA_CALENDAR_FILE}, sigma +{_caf.CA_CALENDAR_SIGMA_SHARE:g} "
+                             f"of the shift") if _tab else f"no table at {_caf.CA_CALENDAR_FILE}"))
             except Exception as e:                           # noqa: BLE001 - a log line
                 log(f"ca holiday factor: unreadable ({e!r})")
             log("ca scheduled-data stand-aside (2026-10-15): "

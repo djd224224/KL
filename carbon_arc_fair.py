@@ -172,6 +172,55 @@ for _part in os.environ.get("IMM_CA_HOLIDAY_FACTORS", _DEFAULT_CA_HOLIDAY).split
             CA_HOLIDAY_FACTORS.setdefault(_month.strip(), {})[_s.strip()] = float(_f)
         except ValueError:
             continue
+# POINT-OF-SALE CALENDAR FACTORS (Jack 2026-11-01: "implement the proper drift
+# fix, based on historical data"; "Yes, buy it", 39.92 promo tokens for the
+# four POS prisms' daily sales, 10/25-1/3 of 2024-25 and 2025-26).
+# - The read is a month-to-date YoY, so the days it has not seen move the print:
+#   which weekdays and holidays they hold this year against last year.
+#   - Through November 8 the read holds two Sundays where last year's held two
+#     Saturdays: the print lands ~4-5% above it.
+#   - Thanksgiving week falls a day earlier against last year.
+#   - Last year's base itself is uneven.
+# - The factor is the expected final over the read at the read's data_through
+#   day. It assumes this year's days follow 2024's days weekday- and
+#   Thanksgiving-aligned (728 days back), against 2025's actual same-date base.
+# - Back-test: November 2025 predicted from 2024 alone. Median miss of the final
+#   0.90 / 0.71 / 0.54% against 1.35 / 1.31 / 1.26% for the read alone (days
+#   13-17 / 18-22 / 23-27). December came out WORSE than the read (Christmas
+#   week moves with the date, not the weekday), so the file holds November only.
+# - The table is derived from Carbon Arc's data, so it lives OUTSIDE the public
+#   repo, in CA_CALENDAR_FILE: {"YYYY-MM": {series: {"day": factor}}}, built by
+#   C:\Users\jackd\carbonarc_data\scripts\pos_factors.py.
+# - It is re-read when its mtime changes; no file, no factor. Sigma widens by
+#   CA_CALENDAR_SIGMA_SHARE of the shift, in quadrature. IMM_CA_CALENDAR=0
+#   turns it off.
+CA_CALENDAR_ENABLE = os.environ.get("IMM_CA_CALENDAR", "1") == "1"
+CA_CALENDAR_FILE = os.environ.get(
+    "IMM_CA_CALENDAR_FILE",
+    os.path.join(os.path.expanduser("~"), "carbonarc_data", "ca_calendar_factors.json"))
+CA_CALENDAR_SIGMA_SHARE = 0.5
+_calendar_cache: Dict[str, object] = {"mtime": None, "table": {}}
+
+
+def calendar_table() -> Dict[str, Dict[str, Dict[str, float]]]:
+    """CA_CALENDAR_FILE's month -> series -> day -> factor table, re-read when the
+    file changes; {} when it is missing or unreadable."""
+    try:
+        mtime = os.path.getmtime(CA_CALENDAR_FILE)
+    except OSError:
+        _calendar_cache.update(mtime=None, table={})
+        return {}
+    if mtime != _calendar_cache["mtime"]:
+        try:
+            with open(CA_CALENDAR_FILE, encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            table = {m: v for m, v in raw.items() if not m.startswith("_") and isinstance(v, dict)}
+        except (OSError, ValueError):
+            table = {}
+        _calendar_cache.update(mtime=mtime, table=table)
+    return _calendar_cache["table"]  # type: ignore[return-value]
+
+
 # no entry until this fraction of the month is observed. 0.10 (~3 days)
 # until 2026-10-04, which left every month unread for its first ~6-10 days
 # once the feed lag is added (READ FROM THE FIRST DAY, above);
@@ -720,6 +769,29 @@ def holiday_entry(series: str, entry: dict) -> dict:
     return dict(entry, mu=round(mu, 4), sigma=round(sigma, 4), holiday_factor=f)
 
 
+def calendar_entry(series: str, entry: dict) -> dict:
+    """`entry` with its mu scaled by the series' calendar factor for the
+    entry's month and data_through day (calendar_table) and sigma widened by
+    CA_CALENDAR_SIGMA_SHARE of the shift, in quadrature; the entry unchanged
+    when no factor applies (off, no file, another series, month or day)."""
+    if not CA_CALENDAR_ENABLE:
+        return entry
+    thru = str(entry.get("data_through") or "")
+    if len(thru) < 10:
+        return entry
+    days = calendar_table().get(str(entry.get("month") or ""), {}).get(series) or {}
+    try:
+        f = float(days.get(str(int(thru[8:10]))) or 0.0)
+    except (TypeError, ValueError):
+        return entry
+    if f <= 0 or f == 1.0:
+        return entry
+    mu = float(entry["mu"]) * f
+    shift = abs(mu - float(entry["mu"]))
+    sigma = math.sqrt(float(entry["sigma"]) ** 2 + (CA_CALENDAR_SIGMA_SHARE * shift) ** 2)
+    return dict(entry, mu=round(mu, 4), sigma=round(sigma, 4), calendar_factor=round(f, 5))
+
+
 def build_entries(payload: dict, series_map: Dict[str, dict],
                   now: datetime) -> Tuple[Dict[str, dict], List[str]]:
     """(series -> entry, series with no usable read). Entity names match
@@ -745,7 +817,7 @@ def build_entries(payload: dict, series_map: Dict[str, dict],
         if entry is None:
             missing.append(series)
             continue
-        entries[series] = holiday_entry(series, entry)
+        entries[series] = calendar_entry(series, holiday_entry(series, entry))
     return entries, missing
 
 

@@ -5,11 +5,15 @@ import json
 import math
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import carbon_arc_fair as caf
+
+# never the live calendar table in the home directory (built from bought data)
+caf.CA_CALENDAR_FILE = os.path.join(tempfile.mkdtemp(prefix="caf_calendar_test_"), "none.json")
 
 
 def _prism(pid, entities, data_through="2026-09-23",
@@ -409,6 +413,63 @@ class TestHolidayFactor(unittest.TestCase):
         self.assertGreater(entries["KXAMZNCC"]["sigma"], entries["KXWMTCC"]["sigma"])
         self.assertAlmostEqual(entries["KXWMTCC"]["mu"], 100.0)
         self.assertNotIn("holiday_factor", entries["KXWMTCC"])
+
+
+class TestCalendarFactor(unittest.TestCase):
+    """Jack 2026-11-01: "implement the proper drift fix, based on historical
+    data" -- a POS read through day d is scaled by the table's expected
+    final / read for that day (2024's days, weekday- and Thanksgiving-aligned,
+    against 2025's base), read from a file outside the repo."""
+
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(prefix="caf_calendar_"), "f.json")
+        self._old = caf.CA_CALENDAR_FILE
+        caf.CA_CALENDAR_FILE = self.path
+        caf._calendar_cache.update(mtime=None, table={})
+
+    def tearDown(self):
+        caf.CA_CALENDAR_FILE = self._old
+        caf._calendar_cache.update(mtime=None, table={})
+
+    def _write(self, table):
+        with open(self.path, "w") as f:
+            json.dump(table, f)
+
+    def _nov(self, thru="2026-11-08", mu=100.0, sigma=2.0):
+        return {"month": "2026-11", "data_through": thru, "mu": mu, "mtd": mu, "sigma": sigma}
+
+    def test_the_read_takes_its_days_factor(self):
+        self._write({"_meta": {"what": "x"}, "2026-11": {"KXC4POS": {"8": 1.05, "15": 0.98}}})
+        e = caf.calendar_entry("KXC4POS", self._nov())
+        self.assertAlmostEqual(e["mu"], 105.0)
+        self.assertEqual(e["mtd"], 100.0)
+        self.assertAlmostEqual(e["sigma"], round(math.sqrt(2.0 ** 2 + 2.5 ** 2), 4))
+        self.assertEqual(e["calendar_factor"], 1.05)
+        self.assertAlmostEqual(caf.calendar_entry("KXC4POS", self._nov(thru="2026-11-15"))["mu"], 98.0)
+
+    def test_no_factor_leaves_the_entry_alone(self):
+        nov = self._nov()
+        self.assertIs(caf.calendar_entry("KXC4POS", nov), nov)                  # no file
+        self._write({"2026-11": {"KXC4POS": {"8": 1.05}}})
+        self.assertIs(caf.calendar_entry("KXZYNPOS", nov), nov)                 # another series
+        day9 = self._nov(thru="2026-11-09")
+        self.assertIs(caf.calendar_entry("KXC4POS", day9), day9)                # a day not in the table
+        dec = dict(nov, month="2026-12", data_through="2026-12-08")
+        self.assertIs(caf.calendar_entry("KXC4POS", dec), dec)                  # another month
+        with mock.patch.object(caf, "CA_CALENDAR_ENABLE", False):
+            self.assertIs(caf.calendar_entry("KXC4POS", nov), nov)
+
+    def test_the_table_is_re_read_when_the_file_changes(self):
+        self._write({"2026-11": {"KXC4POS": {"8": 1.05}}})
+        self.assertAlmostEqual(caf.calendar_entry("KXC4POS", self._nov())["mu"], 105.0)
+        self._write({"2026-11": {"KXC4POS": {"8": 1.02}}})
+        os.utime(self.path, (time.time() + 5, time.time() + 5))
+        self.assertAlmostEqual(caf.calendar_entry("KXC4POS", self._nov())["mu"], 102.0)
+        with open(self.path, "w") as f:
+            f.write("{torn")
+        os.utime(self.path, (time.time() + 10, time.time() + 10))
+        nov = self._nov()
+        self.assertIs(caf.calendar_entry("KXC4POS", nov), nov)                  # unreadable: off
 
 
 class TestArrayShadow(unittest.TestCase):
