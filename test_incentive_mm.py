@@ -25873,11 +25873,47 @@ class TestAdmissionClock(unittest.TestCase):
     def setUp(self):
         self._saved = imm.ADMIT_SUSTAIN_SECS
         imm.ADMIT_SUSTAIN_SECS = 600
+        # KXGOOD projects ~8x its bar, so the wait's own tests run with the
+        # 3x skip (2026-11-01) off; test_a_clear_margin_skips_the_wait arms it
+        self._saved_skip = imm.ADMIT_SKIP_MULT
+        imm.ADMIT_SKIP_MULT = 0.0
         _clean_persist()
 
     def tearDown(self):
         imm.ADMIT_SUSTAIN_SECS = self._saved
+        imm.ADMIT_SKIP_MULT = self._saved_skip
         _clean_persist()
+
+    def test_a_clear_margin_skips_the_wait(self):
+        # Jack 2026-11-01: "Skip the wait on 3x or more". On 10/28-11/01 a
+        # market starting 4x+ over its bar fell back during the wait 3-5% of
+        # the time, against 32-35% under 1.25x; an existing event's markets
+        # fell back as often as a new event's (22% vs 19%)
+        self.assertEqual(self._saved_skip, 3.0)
+        self.assertIn("ADMIT_SKIP_MULT", imm._CONFIG_CODE_KNOBS)
+        imm.ADMIT_SKIP_MULT = 3.0
+        self.assertTrue(imm.admit_clear(4.5, 1.5))           # exactly 3x
+        self.assertFalse(imm.admit_clear(4.49, 1.5))
+        self.assertFalse(imm.admit_clear(4.5, 0.0))          # no bar, no skip
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot = self._bot()
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)             # on its first reading
+        self.assertTrue(bot.state.sim_orders)
+        self.assertTrue(any(f"admit {self.T} on its first reading" in s and "x its $" in s
+                            for s in lines), lines)
+        self.assertNotIn(self.T, bot.state.hopeless_since)
+        # under the margin it still waits (~8x is under 100x)
+        _clean_persist()
+        imm.ADMIT_SKIP_MULT = 100.0
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot._selection_prev.get(self.T), "admit_pending")
+        # ...and 0 restores the wait for every fresh candidate
+        imm.ADMIT_SKIP_MULT = 0.0
+        self.assertFalse(imm.admit_clear(1e9, 1.0))
 
     def _bot(self):
         return IncentiveMarketMaker(client=FakeClient(), live=False)

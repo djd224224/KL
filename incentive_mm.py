@@ -10517,6 +10517,27 @@ MEMBER_PEAK_GUARD = os.environ.get("IMM_MEMBER_PEAK_GUARD", "0") == "1"
 # IMM_ADMIT_SUSTAIN_SECS=0 restores single-reading entry AND reset.
 ADMIT_SUSTAIN_SECS = _env_int("IMM_ADMIT_SUSTAIN_SECS", 600)
 ADMIT_RUN_MAX_GAP_SECS = _env_int("IMM_ADMIT_RUN_MAX_GAP_SECS", 1500)
+# A CLEAR MARGIN SKIPS THE WAIT (Jack 2026-11-01: "Skip the wait on 3x or
+# more", after asking whether it should apply only to new events). Measured
+# 10/28-11/01 over 4,775 waits: a market joining an event already quoted fell
+# back under its bar during the wait as often as a new event's (22% vs 19%;
+# 24% once the program was a day old), so the event's age predicts nothing.
+# The margin at the wait's start does: 35% / 32% (existing / new event) fell
+# back from under 1.25x the bar, 16% / 18% from 1.25-4x, 5% / 3% from 4x or
+# more -- and those far over the bar carried most of what the wait cost
+# ($7.28 of ~$10.40/day at the entry estimate, 4x and up). A fresh
+# candidate whose projection is at least ADMIT_SKIP_MULT x its bar is
+# admitted on its first reading (`admit <t> on its first reading`); the
+# hopeless clock's reset still needs a held run. 0 restores the wait for
+# every fresh candidate.
+ADMIT_SKIP_MULT = _env_float("IMM_ADMIT_SKIP_MULT", 3.0)
+
+
+def admit_clear(projected_total: float, floor_bar: float) -> bool:
+    """A projection far enough over its bar (ADMIT_SKIP_MULT x) to skip the
+    admission wait."""
+    return ADMIT_SKIP_MULT > 0 and floor_bar > 0 \
+        and projected_total >= ADMIT_SKIP_MULT * floor_bar
 # THE $1 FLOOR IS PER PROGRAM PERIOD (Jack 2026-09-22 pm, on KXRT-STRA-50 /
 # -45: "why is this quoted? it should be hopeless"). Kalshi had re-listed
 # the Rotten Tomatoes programs as a fresh ONE-DAY period at 16:49Z; in it
@@ -11652,6 +11673,7 @@ _CONFIG_CODE_KNOBS = (
     # planned-restart order handoff, the realized floor anchor and the
     # near-cliff room priority
     "ADMIT_SUSTAIN_SECS", "ADMIT_RUN_MAX_GAP_SECS",
+    "ADMIT_SKIP_MULT",            # a 3x margin skips the wait (2026-11-01)
     "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
     "HOURLY_PROGRAM_MAX_HOURS",
     "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
@@ -28417,17 +28439,26 @@ class IncentiveMarketMaker:
                 skipped["payout_floor"] = skipped.get("payout_floor", 0) + 1
                 decisions[meta.ticker] = "payout_floor"
             elif ADMIT_SUSTAIN_SECS > 0 and not meta.near_cliff \
-                    and above_secs < ADMIT_SUSTAIN_SECS:
+                    and above_secs < ADMIT_SUSTAIN_SECS \
+                    and not admit_clear(projected_total, floor_bar):
                 # THE ADMISSION CLOCK (2026-09-27, see ADMIT_SUSTAIN_SECS):
                 # over the bar on this reading, but not yet for the sustain
                 # window -- a spike this refresh is not an admission. It
-                # enters on the first reading that finds the run long enough.
+                # enters on the first reading that finds the run long enough,
+                # or (2026-11-01) one ADMIT_SKIP_MULT x over its bar.
                 skipped["admit_pending"] = skipped.get("admit_pending", 0) + 1
                 decisions[meta.ticker] = "admit_pending"
             else:
                 # an ADMISSION starts the dip guard clean, as it always did
                 # (a held run already cleared it; this covers the near-cliff
-                # re-entrant, admitted on its first reading)
+                # re-entrant, admitted on its first reading, and one whose
+                # margin skips the wait)
+                if ADMIT_SUSTAIN_SECS > 0 and not meta.near_cliff \
+                        and above_secs < ADMIT_SUSTAIN_SECS:
+                    log(f"{self.tag} admit {meta.ticker} on its first reading: "
+                        f"${projected_total:.2f} projected, "
+                        f"{projected_total / floor_bar:.1f}x its ${floor_bar:.2f} "
+                        f"bar (no wait from x{ADMIT_SKIP_MULT:g})")
                 self.state.hopeless_since.pop(meta.ticker, None)
                 ranked.append(meta)
         if self._cand_rest["off"]:
