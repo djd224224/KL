@@ -2064,6 +2064,44 @@ _maker_buffer = (MAKER_BUFFER_CENTS_EVENING if RUN_SLOT == "evening"
 print(f"[LADDER] maker buffer {_maker_buffer}c ({RUN_SLOT}) | "
       f"night_size_mult={night_size_mult:g} (variable={variable})")
 
+# Fresh evening quotes (the NIGHT block above) rest an hour at most, so the
+# evening's near-touch band comes back, and the evening's top rung stops at
+# the model's fair (Jack 2026-11-01: "Ship both"). Evening fills 4-7c below
+# the best NO bid, late Aug - Oct 5: fresh (<= 60 min) +8.52c/ct on 3,249
+# contracts, stale -9.04c/ct on 8,056 -- the -3.69c behind the 8c buffer
+# above was the stale part. Evening fills priced above the model's fair NO
+# lost 17.3c/ct (682 contracts, Sep-Oct), and the fair-tied hi_no A/B
+# (AB_TEST_ENABLED) is off, so nothing else held the top rung under fair.
+MAKER_BUFFER_CENTS_EVENING_FRESH = int(os.environ.get("MAKER_BUFFER_CENTS_EVENING_FRESH", "4"))
+EVENING_FAIR_CAP = os.environ.get("EVENING_FAIR_CAP", "true").lower() == "true"
+EVENING_FAIR_CAP_MARGIN_CENTS = float(os.environ.get("EVENING_FAIR_CAP_MARGIN_CENTS", "0"))
+
+
+def maker_buffer_for(market_ticker):
+    """Cents a rung must sit below the best NO bid on this market: the day
+    buffer by day, MAKER_BUFFER_CENTS_EVENING_FRESH on a fresh evening market,
+    MAKER_BUFFER_CENTS_EVENING on any other evening market."""
+    if RUN_SLOT != "evening":
+        return MAKER_BUFFER_CENTS
+    if night_arm(market_ticker) == "fresh":
+        return MAKER_BUFFER_CENTS_EVENING_FRESH
+    return MAKER_BUFFER_CENTS_EVENING
+
+
+def evening_fair_cap(hi_no_cents, fair_no_cents):
+    """The evening's top-of-ladder NO price, never above the model's fair NO
+    less EVENING_FAIR_CAP_MARGIN_CENTS (whole cents, rounded down); the day
+    slots' top rung is unchanged."""
+    if RUN_SLOT != "evening" or not EVENING_FAIR_CAP:
+        return hi_no_cents
+    return min(hi_no_cents, float(int(fair_no_cents - EVENING_FAIR_CAP_MARGIN_CENTS)))
+
+
+if RUN_SLOT == "evening":
+    print(f"[LADDER] fresh evening markets: maker buffer {MAKER_BUFFER_CENTS_EVENING_FRESH}c; "
+          f"evening top rung " + (f"capped at fair NO - {EVENING_FAIR_CAP_MARGIN_CENTS:g}c"
+                                  if EVENING_FAIR_CAP else "NOT capped at fair"))
+
 # Per-city size multipliers — tilt size toward better-edge cities, shrink for worse ones.
 # Cities not listed default to 1.0x.
 CITY_SIZE_MULT = {
@@ -2588,6 +2626,16 @@ for index, row in combined_table.iterrows():
       continue
   else:
     _effective_hi_no = _hi_no_config
+  if RUN_SLOT == "evening":
+    _capped_hi_no = evening_fair_cap(_effective_hi_no, _fair_no_cents)
+    if _capped_hi_no < _effective_hi_no:
+      print(f"    Fair cap:   top rung {_effective_hi_no:.0f}c -> {_capped_hi_no:.0f}c "
+            f"(fair NO {_fair_no_cents:.1f}c; evening bids stay at or under fair)")
+      _effective_hi_no = _capped_hi_no
+      if _effective_hi_no < 2:
+        print(f"    SKIP: top rung {_effective_hi_no:.0f}c is under 2c after the evening fair cap")
+        continue
+  _maker_buffer_mkt = maker_buffer_for(ticker)
 
   # ==================================================================
   # Rich per-market detail block — prints only for markets that passed
@@ -2791,7 +2839,7 @@ for index, row in combined_table.iterrows():
           f"(headroom=${MARKET_CASH_CAP_DOLLARS - _filled_cash:.2f})")
 
   print(f"    Ladder (maker-only post_only; filters: bid<no_offer AND "
-        f"no_bid−bid≥{_maker_buffer}c [{RUN_SLOT}]):")
+        f"no_bid−bid≥{_maker_buffer_mkt}c [{RUN_SLOT}]):")
 
   # ==================================================================
   # Ladder loop — collect per-rung records, render as a block after.
@@ -2866,12 +2914,12 @@ for index, row in combined_table.iterrows():
       _skip_cnt["bid>=no_offer"] += 1
       _skip_ct["bid>=no_offer"] += contracts
       continue
-    # Filter B: bid must sit at least MAKER_BUFFER_CENTS below the best NO
-    # bid. 4c everywhere until 2026-10-06; now 8c on the evening slot only
-    # (see MAKER_BUFFER_CENTS above).
-    if not ((int(no_bid) - bid_price) >= _maker_buffer):
+    # Filter B: bid must sit at least maker_buffer_for(ticker) below the best
+    # NO bid: 4c by day; 8c on the evening slot from 2026-10-06, back to 4c on
+    # fresh evening markets from 2026-11-01 (see MAKER_BUFFER_* above).
+    if not ((int(no_bid) - bid_price) >= _maker_buffer_mkt):
       _rungs.append((i, bid_price, contracts, edge, 'SKIP',
-                     f'bid>no_bid−{_maker_buffer}({int(no_bid) - _maker_buffer})'))
+                     f'bid>no_bid−{_maker_buffer_mkt}({int(no_bid) - _maker_buffer_mkt})'))
       _skip_cnt["bid>=no_bid-3"] += 1
       _skip_ct["bid>=no_bid-3"] += contracts
       continue
@@ -3129,7 +3177,7 @@ for index, row in combined_table.iterrows():
       _reason = "no rung is ≥4c below current NO bid (market too tight for maker)"
     elif _skip_cnt["bid>=no_offer"] + _skip_cnt["bid>=no_bid-3"] == len(_rungs):
       _reason = (f"every rung either crosses offer or fails the "
-                 f"{_maker_buffer}c maker buffer")
+                 f"{_maker_buffer_mkt}c maker buffer")
     elif _skip_cnt["cash_cap"] == len(_rungs):
       _reason = f"cash cap reached (${MARKET_CASH_CAP_DOLLARS:.0f}/market)"
     elif _skip_cnt["position_cap"] > 0 and _skip_cnt["order_failed"] == 0:

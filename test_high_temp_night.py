@@ -129,5 +129,46 @@ class TestNightPilot(unittest.TestCase):
         self.assertEqual(rows[0][1]["central_time_hour"], 22)
 
 
+def ladder(slot, arm, env=None):
+    """Execute the fresh-evening buffer and fair-cap block for `slot`, with
+    every market in night arm `arm`."""
+    with open(SRC, encoding="utf-8") as f:
+        src = f.read()
+    start = src.index("MAKER_BUFFER_CENTS_EVENING_FRESH = ")
+    end = src.index("\n", src.index("    return min(hi_no_cents, float(int(", start)) + 1
+    g = {"os": os, "RUN_SLOT": slot, "night_arm": lambda t: arm,
+         "MAKER_BUFFER_CENTS": 4, "MAKER_BUFFER_CENTS_EVENING": 8}
+    clean = {k: v for k, v in os.environ.items()
+             if not k.startswith(("MAKER_BUFFER_", "EVENING_FAIR_CAP"))}
+    clean.update(env or {})
+    with mock.patch.dict(os.environ, clean, clear=True):
+        exec(src[start:end], g)
+    return g
+
+
+class TestEveningBufferAndFairCap(unittest.TestCase):
+    """Jack 2026-11-01: "Ship both" -- a 4c buffer on fresh evening markets,
+    and evening bids capped at the model's fair NO."""
+
+    def test_buffer_by_slot_and_arm(self):
+        self.assertEqual(ladder("morning", "off")["maker_buffer_for"]("T"), 4)
+        self.assertEqual(ladder("evening", "fresh")["maker_buffer_for"]("T"), 4)
+        self.assertEqual(ladder("evening", "control")["maker_buffer_for"]("T"), 8)
+        self.assertEqual(ladder("evening", "off")["maker_buffer_for"]("T"), 8)
+        g = ladder("evening", "fresh", {"MAKER_BUFFER_CENTS_EVENING_FRESH": "6"})
+        self.assertEqual(g["maker_buffer_for"]("T"), 6)
+
+    def test_evening_top_rung_stops_at_fair(self):
+        cap = ladder("evening", "fresh")["evening_fair_cap"]
+        self.assertEqual(cap(70.0, 64.3), 64.0)      # above fair: down to fair, whole cents
+        self.assertEqual(cap(60.0, 64.3), 60.0)      # already under fair: unchanged
+        self.assertEqual(cap(70.0, 64.0), 64.0)
+        self.assertEqual(ladder("evening", "fresh", {"EVENING_FAIR_CAP_MARGIN_CENTS": "1"})
+                         ["evening_fair_cap"](70.0, 64.3), 63.0)
+        self.assertEqual(ladder("evening", "fresh", {"EVENING_FAIR_CAP": "false"})
+                         ["evening_fair_cap"](70.0, 64.3), 70.0)
+        self.assertEqual(ladder("morning", "off")["evening_fair_cap"](70.0, 64.3), 70.0)
+
+
 if __name__ == "__main__":
     unittest.main()
