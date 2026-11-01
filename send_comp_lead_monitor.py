@@ -9,8 +9,9 @@ the price its sibling markets imply LEADS with one rung of target/5 (200) at
 the cheapest price that takes ~95% of that side's reward score -- the sell
 side in any family, the buy side in two-market election pairs. A lead that
 fills is hedged on its siblings once the set locks a profit; an order resting
-ahead of a lead is fought to a 5c stop, since 2026-10-30 only once it leaves
-the lead under half of its side (Jack: "Hold at one half").
+ahead of a lead was fought to a 5c stop, from 2026-10-30 only once it left
+the lead under half of its side (Jack: "Hold at one half"), and since
+2026-11-01 never: a lead stays where it rests (Jack: "Yes, hold always").
 
 Since 2026-10-29 (Jack: "1 and 2") every maker fill that opens a position
 in such an event, or on a threshold ladder ("above X" strikes of one
@@ -69,12 +70,14 @@ ONE EMAIL per ET day (the day before), the money first, in plain words
               AHEAD of a resting lead, off the bot's own book_depth rows (each
               cycle's book with our resting orders): what the lead kept of its
               side where it rested (the bot's _side_share, at the last cycle
-              before it acted) and what the bot did -- held (it kept half its
-              side and stayed), fought (under half: it re-led nearer the
-              model), chased (it moved up while it still kept half: the old
-              95% bar's habit, none expected since c06a4f7), stayed under half
-              (the order sat at or past the lead's cap), moved down, stopped
-              resting; then the sides most orders stood ahead of
+              before it acted) and what the bot did, against the hold bar of
+              the time -- held (it kept the bar and stayed), fought (under
+              the bar: it re-led nearer the model), chased (it moved up
+              while it kept the bar: the old 95% bar's habit, none expected
+              since c06a4f7, and since the hold-always rule any move up),
+              stayed under the bar (the order sat at or past the lead's
+              cap), moved down, stopped resting; then the sides most orders
+              stood ahead of
   hedges on other fills  every other fill watched for a lock: locked (and
               the dollars), unwound by the bot first, or left as inventory
   counts, then the top LIST_TOP leads by event of each kind (those that
@@ -137,10 +140,14 @@ LEAD_GAP_SECS = 600             # lead spans this close count as one (a restart'
 # c06a4f7 live (Jack 2026-10-30: "Hold at one half"): before it a lead fought
 # any order that cost it 5% of its side
 HOLD_HALF_SINCE = datetime(2026, 10, 31, 3, 6, 46, tzinfo=timezone.utc).timestamp()
+HALF_BAR = 0.5                  # the hold bar from HOLD_HALF_SINCE to HOLD_ALWAYS_SINCE
+# HOLD_ALWAYS_COMMIT live (Jack 2026-11-01: "Yes, hold always"): before it a
+# lead fought any order that left it under half of its side
+HOLD_ALWAYS_SINCE = datetime(2026, 11, 1, 16, 0, 0, tzinfo=timezone.utc).timestamp()
 
 _LEAD = re.compile(
     r"^(\S+ \S+)Z \[IMM\] (comp|fair) lead( \(dry\))? (\S+) (bid|ask): (\d+) @ (\d+)c, "
-    r"(?:ahead of|held at the cap, (?:with|behind)) its own (\d+)c; (.+?) "
+    r"(?:ahead of|held(?: at the cap)?, (?:with|behind)) its own (\d+)c; (.+?) "
     r"(?:implies|imply) (-?\d+)c")
 _OFF = re.compile(r"^(\S+ \S+)Z \[IMM\] (?:comp|fair) lead(?: \(dry\))? (\S+) (bid|ask): "
                   r"off -- ")
@@ -712,24 +719,34 @@ def orders_ahead(leads: dict, a_ts: float, b_ts: float) -> dict:
 
 
 def hold_bar() -> float:
-    """The share a lead holds at behind an order ahead (the bot's rule)."""
+    """The share a lead holds at behind an order ahead (the bot's rule; 0:
+    any share holds)."""
     if not imm.COMP_LEAD_HOLD_SMALL:
         return 1.01
     return min(imm.COMP_LEAD_HOLD_SHARE, imm.COMP_LEAD_SHARE)
 
 
-def ahead_summary(ev: list, bar: float) -> dict:
+def bar_at(ts: float) -> float:
+    """The hold bar the bot acted on at `ts`: the half bar until the
+    hold-always rule went live, the bot's own after."""
+    return HALF_BAR if ts < HOLD_ALWAYS_SINCE else hold_bar()
+
+
+def ahead_summary(ev: list, bar=None) -> dict:
     """The events by what the bot did, against the hold rule: "held" (kept
     the bar or more and stayed), "fought" (kept under it and moved up),
-    "chased" (moved up while it kept the bar -- the old 95% habit), "under"
-    (kept under it and stayed: the order sat at or past the lead's cap, or
-    left within a cycle), "down", "gone"."""
+    "chased" (moved up while it kept the bar -- the old 95% habit; under
+    the hold-always rule any move up), "under" (kept under it and stayed:
+    the order sat at or past the lead's cap, or left within a cycle),
+    "down", "gone". `bar` None: each spell against the bar of its time
+    (bar_at its last row, when the bot acted)."""
     out: dict = {k: [] for k in ("held", "fought", "chased", "under", "down", "gone")}
     for e in ev:
+        b = bar_at(e["last"]) if bar is None else bar
         if e["outcome"] == "held":
-            out["held" if e["kept"] >= bar else "under"].append(e)
+            out["held" if e["kept"] >= b else "under"].append(e)
         elif e["outcome"] == "fought":
-            out["chased" if e["kept"] >= bar else "fought"].append(e)
+            out["chased" if e["kept"] >= b else "fought"].append(e)
         else:
             out[e["outcome"]].append(e)
     return out
@@ -1072,38 +1089,55 @@ def _ahead_lines(ctx) -> list:
         return ["", f"{head}: none ({ah.get('rows', 0):,} books of leading markets in "
                     f"{ah.get('files', 0)} book_depth file(s)"
                     + (f"; {gone} spell(s) ended with the lead off" if gone else "") + ")"]
-    S = ahead_summary(ev, bar)
+    S = ahead_summary(ev)                   # each spell against the bar of its time
     sides = {(e["t"], e["side"]) for e in ev}
+    went = datetime.fromtimestamp(HOLD_ALWAYS_SINCE, timezone.utc).astimezone(imm.ET)
+    since = f"{went:%H:%M} ET {went:%m/%d}"
+    if bar > 1.0:
+        rule = "  rule: every order in front is fought (IMM_COMP_LEAD_HOLD_SMALL=0)"
+    elif bar <= 0:
+        rule = ("  rule: a lead stays put whatever rests in front of it (Jack 11/01: \"Yes, hold "
+                "always\")"
+                + (f"; until {since} it held while it kept {HALF_BAR:.0%} of its side and moved "
+                   f"up below that" if any(e["last"] < HOLD_ALWAYS_SINCE for e in ev) else ""))
+    else:
+        rule = (f"  rule: a lead stays put while it keeps {bar:.0%} of its side, and moves up "
+                f"toward the model below that (Jack 10/30: \"Hold at one half\")")
     out = ["", f"{head}: {len(ev)} time{'s' if len(ev) != 1 else ''}, on {len(sides)} lead "
                f"side{'s' if len(sides) != 1 else ''} (one spell at one lead price, however the "
-               f"orders in front came and went)",
-           (f"  rule: a lead stays put while it keeps {bar:.0%} of its side, and moves up toward "
-            f"the model below that (Jack 10/30: \"Hold at one half\")" if bar <= 1.0
-            else "  rule: every order in front is fought (IMM_COMP_LEAD_HOLD_SMALL=0)")]
+               f"orders in front came and went)", rule]
     if S["held"]:
         kept = [e["kept"] for e in S["held"]]
         out.append(f"  held {len(S['held'])}: stayed put, kept a median {_med(kept):.0%} of its "
                    f"side (lowest {min(kept):.0%}), a median "
                    f"{_med([e['ahead'] for e in S['held']]):,.0f} lots in front")
+    # the bar the fights and the stays under were held to: since the
+    # hold-always rule only the half bar's, before it went live
+    fbar = bar if 0 < bar <= 1.0 else HALF_BAR
     for k in ("fought", "chased"):
         g = S[k]
         if not g:
             if k == "chased":
-                out.append(f"  chased 0: none moved up while it kept {bar:.0%} of its side")
+                out.append("  chased 0: no lead moved up for an order in front" if bar <= 0
+                           else f"  chased 0: none moved up while it kept {bar:.0%} of its side")
             continue
         walked = [e["moved"] for e in g]
-        before = sum(1 for e in g if e["ts"] < HOLD_HALF_SINCE)
-        what = (f"kept under {bar:.0%}, moved up" if k == "fought"
-                else f"moved up though it kept {bar:.0%} or more,")
+        if k == "fought":
+            what = "moved up" if bar > 1.0 else f"kept under {fbar:.0%}, moved up"
+            note = (f"; all of them before the hold-always rule went live ({since})"
+                    if bar <= 0 else "")
+        else:
+            what = ("moved up though the rule held it," if bar <= 0
+                    else f"moved up though it kept {bar:.0%} or more,")
+            before = sum(1 for e in g if e["ts"] < HOLD_HALF_SINCE)
+            note = (f"; {'all' if before == len(g) else before} of them before the rule went "
+                    f"live ({_et(HOLD_HALF_SINCE)[4:]} 10/30)" if before else "")
         out.append(f"  {k} {len(g)}: {what} a median {_med(walked):.0f}c toward the model "
                    f"({sum(walked)}c in all; a median {_med([e['ahead'] for e in g]):,.0f} lots "
-                   f"in front)"
-                   + (f"; {'all' if before == len(g) else before} of them before the rule went "
-                      f"live ({_et(HOLD_HALF_SINCE)[4:]} 10/30)" if k == "chased" and before
-                      else ""))
+                   f"in front)" + note)
     if S["under"]:
-        out.append(f"  under {bar:.0%} {len(S['under'])}: stayed put -- the order in front sat at "
-                   f"or past the lead's cap, or left within a cycle")
+        out.append(f"  under {fbar:.0%} {len(S['under'])}: stayed put -- the order in front sat "
+                   f"at or past the lead's cap, or left within a cycle")
     if S["down"] or gone:
         out.append(f"  moved down {len(S['down'])}; {gone} more ended with the lead off (a gate "
                    f"hold, an off, a cap below its own rungs), left out above")
@@ -1113,7 +1147,7 @@ def _ahead_lines(ctx) -> list:
     top = sorted(by_side.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:AHEAD_LIST]
     out.append(f"  most often ({len(top)} of {len(by_side)} sides):")
     for (t, side), g in top:
-        s = ahead_summary(g, bar)
+        s = ahead_summary(g)
         held = [e["kept"] for e in s["held"]]
         parts = [f"held {len(held)}" + (f" ({min(held):.0%}-{max(held):.0%})" if held else "")]
         parts += [f"{k} {len(s[k])}" for k in ("fought", "chased", "under", "down") if s[k]]

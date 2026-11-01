@@ -65,6 +65,10 @@ class TestLeads(unittest.TestCase):
             # a fought lead held at the cap (Jack 2026-10-29 "2.")
             "2026-10-29 11:00:00Z [IMM] comp lead KXK-30-KMIN ask: 200 @ 43c, held at the "
             "cap, behind its own 41c; its 11 siblings' books imply 38c\n",
+            # held behind an order ahead, under its cap (Jack 2026-11-01: "Yes,
+            # hold always")
+            "2026-10-29 11:30:00Z [IMM] fair lead KXR-1-SFO bid: 200 @ 40c, held, behind "
+            "its own 44c; the election-day rain fair implies 50c\n",
         ]
         p = cm.parse_leads(lines, a, b)
         self.assertEqual(p["groups"], (125, 78))
@@ -80,6 +84,9 @@ class TestLeads(unittest.TestCase):
         self.assertTrue(d["leading_at_end"])
         self.assertNotIn(("KXLATE-1", "ask"), p["leads"])
         self.assertEqual(p["leads"][("KXK-30-KMIN", "ask")]["px"], 43)
+        sfo = p["leads"][("KXR-1-SFO", "bid")]
+        self.assertEqual((sfo["px"], sfo["best"], sfo["implied"], sfo["kind"]),
+                         (40, 44, 50, "fair"))
 
     def test_lead_fills_need_the_side_the_price_and_a_maker(self):
         leads = {("KXK-30-JDON", "ask"): {"spans": [[_ts(5), _ts(9)]], "px": 60}}
@@ -548,6 +555,13 @@ class TestOrdersAhead(unittest.TestCase):
         S = cm.ahead_summary(ev, 0.5)
         self.assertEqual({k: len(v) for k, v in S.items()},
                          dict(held=1, fought=1, chased=1, under=0, down=0, gone=1))
+        # with no bar, each spell against the bar of its time: these predate
+        # the hold-always rule, so the half bar
+        self.assertEqual({k: len(v) for k, v in cm.ahead_summary(ev).items()},
+                         {k: len(v) for k, v in S.items()})
+        self.assertEqual(cm.bar_at(_ts(5)), cm.HALF_BAR)
+        self.assertEqual(cm.bar_at(cm.HOLD_ALWAYS_SINCE), cm.hold_bar())
+        self.assertEqual(cm.hold_bar(), 0.0)                             # Jack 11/01
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.95):     # the old bar
             self.assertEqual(cm.hold_bar(), 0.95)
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SMALL", False):
@@ -585,7 +599,8 @@ class TestOrdersAhead(unittest.TestCase):
         ctx = dict(day="2026-10-29", leads=leads, groups=None, fills=[], hedges=h, est={},
                    ahead=res)
         ctx["level"], ctx["reasons"] = cm.verdict(ctx)
-        text = cm.render_text(ctx)
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):        # the half bar's day
+            text = cm.render_text(ctx)
         self.assertIn("ORDERS IN FRONT OF A LEAD: 3 times, on 1 lead side (one spell at one lead "
                       "price, however the orders in front came and went)\n"
                       "  rule: a lead stays put while it keeps 50% of its side, and moves up "
@@ -602,13 +617,60 @@ class TestOrdersAhead(unittest.TestCase):
         self.assertTrue(text.isascii())
         # since the half-side hold, a chase is not expected: the line says none
         ctx["ahead"] = dict(res, events=[e for e in res["events"] if e["moved"] != 2])
-        self.assertIn("  chased 0: none moved up while it kept 50% of its side",
-                      cm.render_text(ctx))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            self.assertIn("  chased 0: none moved up while it kept 50% of its side",
+                          cm.render_text(ctx))
         # a scan that failed says so; a report built without one has no section
         ctx["ahead"] = {"events": [], "files": 0, "rows": 0, "error": "OSError('x')"}
         self.assertIn("  not read: OSError('x')", cm.render_text(ctx))
         del ctx["ahead"]
         self.assertNotIn("ORDERS IN FRONT", cm.render_text(ctx))
+
+    def test_a_day_across_the_hold_always_rule(self):
+        # Jack 2026-11-01: "Yes, hold always". Spells the bot acted on before
+        # the rule went live read against the half bar, the rest against
+        # any share: a move up is then a chase, a stay under real size a hold
+        lines = [lead50("05:00:00"), lead50("05:01:40", px=32)]
+        rows = [book(_ts(5, 0, 40), (26, 200), [(27, 31)]),
+                book(_ts(5, 1, 20), (26, 200)),                       # held (84%)
+                book(_ts(5, 1, 40), (26, 200), [(27, 300)]),
+                book(_ts(5, 2, 0), (32, 200), [(27, 300)]),           # fought +6, at the half bar
+                book(_ts(5, 2, 20), (32, 200), [(33, 31)]),
+                book(_ts(5, 2, 40), (34, 200)),                       # +2 since: a chase
+                book(_ts(5, 3, 0), (34, 200), [(35, 300)]),
+                book(_ts(5, 3, 20), (34, 200), [(35, 300)]),
+                book(_ts(5, 3, 40), (34, 200))]                       # held at 25%
+        leads, res = self._run(lines, [("book_depth_2026-10-29_r1.jsonl.gz", rows)])
+        h = cm.hedge_summary([], [], _ts(12))
+        ctx = dict(day="2026-10-29", leads=leads, groups=None, fills=[], hedges=h, est={},
+                   ahead=res)
+        ctx["level"], ctx["reasons"] = cm.verdict(ctx)
+        went = _ts(5, 2, 10)                 # the half bar from 04:00, any share from 05:02:10
+        when = datetime.fromtimestamp(went, timezone.utc).astimezone(imm.ET)
+        since = f"{when:%H:%M} ET {when:%m/%d}"
+        with mock.patch.object(cm, "HOLD_ALWAYS_SINCE", went), \
+                mock.patch.object(cm, "HOLD_HALF_SINCE", _ts(4)):
+            S = cm.ahead_summary(res["events"])
+            self.assertEqual({k: len(v) for k, v in S.items()},
+                             dict(held=2, fought=1, chased=1, under=0, down=0, gone=0))
+            text = cm.render_text(ctx)
+            self.assertIn("  rule: a lead stays put whatever rests in front of it (Jack 11/01: "
+                          f"\"Yes, hold always\"); until {since} it held while it kept 50% of "
+                          "its side and moved up below that", text)
+            self.assertIn("  fought 1: kept under 50%, moved up a median 6c toward the model (6c "
+                          "in all; a median 300 lots in front); all of them before the "
+                          f"hold-always rule went live ({since})", text)
+            self.assertIn("  chased 1: moved up though the rule held it, a median 2c toward the "
+                          "model (2c in all; a median 31 lots in front)\n", text)
+            self.assertIn(f"    {T50} bid (complement): 4 -- held 2 (25%-84%), fought 1, "
+                          "chased 1", text)
+            ctx["ahead"] = dict(res, events=[e for e in res["events"] if e["moved"] != 2])
+            self.assertIn("  chased 0: no lead moved up for an order in front",
+                          cm.render_text(ctx))
+        # a day wholly under the rule names no half bar
+        with mock.patch.object(cm, "HOLD_ALWAYS_SINCE", _ts(4)):
+            self.assertIn("  rule: a lead stays put whatever rests in front of it (Jack 11/01: "
+                          "\"Yes, hold always\")\n", cm.render_text(ctx))
 
 
 if __name__ == "__main__":

@@ -11737,7 +11737,7 @@ _CONFIG_CODE_KNOBS = (
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_LEAD_HOLD_SMALL",       # a few lots ahead are not fought (2026-10-30)
-    "COMP_LEAD_HOLD_SHARE",       # ...while the lead keeps half its side (2026-10-30)
+    "COMP_LEAD_HOLD_SHARE",       # ...at any share since 2026-11-01 (half 10-30)
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
@@ -20588,7 +20588,8 @@ def join_ahead_pick(ext_levels: List[Tuple[int, float]], base_px: int,
 #     within 15s): the side leads again ahead of the whole book, at the
 #     cheapest price there that takes the share, else as far as the cap
 #     lets it; an order at or past the cap is not passed, and the rung rests
-#     at the cap with it or behind it. COMP_LEAD_MARGIN_C (5c since then)
+#     at the cap with it or behind it (since 2026-11-01 an order ahead is
+#     held, not fought: HOLD ALWAYS below). COMP_LEAD_MARGIN_C (5c since then)
 #     keeps every lead that far inside what the siblings imply, so a filled
 #     lead still hedges at a profit after taker fees (COMP_HEDGE_LEAD_EDGE_C;
 #     ~+1c on Korea, whose 11 legs cost ~4c a contract). Where each side last
@@ -20637,7 +20638,21 @@ COMP_LEAD_HOLD_SMALL = os.environ.get("IMM_COMP_LEAD_HOLD_SMALL", "1") == "1"
 # or over a wall that still scores -- and an order of target/5 or more,
 # which moves the reference past the lead (a third of the side at most), is
 # fought as before. Never above COMP_LEAD_SHARE; 0.95 restores the old bar.
-COMP_LEAD_HOLD_SHARE = _env_float("IMM_COMP_LEAD_HOLD_SHARE", 0.5)
+# HOLD ALWAYS (Jack 2026-11-01: "Yes, hold always", on "Stop fighting, and
+# hold leads at any share?"). The half bar ended the chases (125 on 10/30,
+# none on 11/01) but seldom held: 24 holds against 785 fights from 10/31
+# 03:06Z to 11/01 15:25Z, 627 of them under fewer than 200 lots ahead.
+# Copiers pile onto a lead's price, so one lot a tick ahead finds it under
+# half: on 10/31 19:28Z KXTOKENUSE-26NOV02-T190's bid went 49c -> 54c, a lot
+# rested at 55c within 20s and 160-340 lots piled onto 54c, so it fought to
+# 60c, and so on to 77c in 7 minutes -- 21 climbs of 15c+ in a day and a
+# half. The walk is what lead fills pay: 31 of them after one (10/30-11/01)
+# lost $514, $513 of it the walk (~$396 in the 10/31 07:00 ET OpenRouter
+# sweep), while the fights under half bought back at most $168 of reward.
+# 0 holds at any share: an order ahead leaves a lead where it rests. A lead
+# alone still moves down, and a cap that falls below it still leads it
+# afresh, lower. 0.5 restores the half bar.
+COMP_LEAD_HOLD_SHARE = _env_float("IMM_COMP_LEAD_HOLD_SHARE", 0.0)
 COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 5))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
@@ -20777,9 +20792,10 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     the same space; the cap is `margin` (default COMP_LEAD_MARGIN_C) inside
     it. A side that cannot reach the target with the lead in it does not lead.
     `hold`: the price the side already leads at. An order resting AHEAD of
-    it is fought where the lead keeps under COMP_LEAD_HOLD_SHARE of its side
-    there (COMP_LEAD_HOLD_SMALL; under target/5 lots ahead, a lone lead keeps
-    most of it): the side leads again at the cheapest
+    it leaves it there (COMP_LEAD_HOLD_SHARE 0, since 2026-11-01). With a bar
+    set, it is fought where the lead keeps under COMP_LEAD_HOLD_SHARE of its
+    side there (COMP_LEAD_HOLD_SMALL; under target/5 lots ahead, a lone lead
+    keeps most of it): the side leads again at the cheapest
     price ahead of the whole book that takes the share, else at the cap, and
     an order at or past the cap leaves the rung at the cap. An order sharing its price
     leaves it where it is; alone, it stays, or moves down when the book
@@ -20816,8 +20832,8 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
         below = [(p, q) for p, q in own if p < hold]
         at_or_above = [(p, q) for p, q in own if p >= hold]
         # (COMP_LEAD_HOLD_SMALL: an order ahead that leaves the lead
-        # COMP_LEAD_HOLD_SHARE of its side where it rests -- up to ~190 lots
-        # over a 200 -- is not fought)
+        # COMP_LEAD_HOLD_SHARE of its side where it rests is not fought -- at
+        # the default 0, none is)
         if any(p > hold for p, _q in at_or_above) and not (
                 COMP_LEAD_HOLD_SMALL and keeps_share(hold)):
             # fought: ahead of the whole book, never past the cap
@@ -20827,6 +20843,10 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
         held = sorted(at_or_above + [(hold, float(n))], key=lambda kv: -kv[0])
         if not _side_share(held + below, {hold: float(n)}, target, df)[1]:
             return None
+        if any(p > hold for p, _q in at_or_above):
+            # held behind an order ahead (HOLD ALWAYS): that order is the
+            # side's own best
+            return hold, cap, own[0][0]
         if at_or_above:
             # an order sharing our price: stay and share the front. Backing
             # off hands it the front (10/29 03:55Z: a 3,040-lot sat on the
@@ -20954,8 +20974,9 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # the payout bar with an at-reference rung behind the wall is admitted when
 # the lead clears it. The margin is a cap, not a target: the lead stays at
 # the cheapest price that wins the side, so it nears the model only where
-# the wall forces it there, and an order stepping ahead is fought no
-# further than the cap. On the 10/29 14:30Z books (26OCT31): at 10c, 5 bids
+# the wall forces it there, and an order stepping ahead leaves it where it
+# rests (HOLD ALWAYS; until 2026-11-01 fought, no further than the cap). On
+# the 10/29 14:30Z books (26OCT31): at 10c, 5 bids
 # and 1 ask led (ABQ, CMH, IND, LEX, SGF; CLL; at 5c, 9 sides, ~$80/day
 # before reactions), each market ~$8/day of a
 # $16.4/day pool before anyone reacts, against ~$10/day for the 35 markets
@@ -29476,8 +29497,8 @@ class IncentiveMarketMaker:
             implied = cap + margin if side == "bid" else cap - margin
             ahead = (px > best) if side == "bid" else (px < best)
             where = (f"ahead of its own {best}c" if ahead else
-                     f"held at the cap, {'with' if px == best else 'behind'} its own "
-                     f"{best}c")
+                     f"held{' at the cap' if px == cap else ''}, "
+                     f"{'with' if px == best else 'behind'} its own {best}c")
             log(f"{self.tag} {kind} lead{dry} {t} {side}: {n} @ {px}c, {where}; "
                 f"{who} {verb} {implied}c")
 
@@ -37228,11 +37249,13 @@ class IncentiveMarketMaker:
             + (f" -- {', '.join(FAIR_LEAD_SERIES) or 'no series'}: a side whose touch "
                f"sits ahead of a wall leads with target/5 at the cheapest price "
                f"taking {COMP_LEAD_SHARE:.0%} of the side, at least "
-               f"{FAIR_LEAD_MARGIN_C}c inside the model fair (fought to that cap"
-               + (f" only where an order ahead leaves it under "
-                  f"{min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE):.0%} of the side, "
-                  f"as every lead is" if COMP_LEAD_HOLD_SMALL
-                  else " by any order ahead")
+               f"{FAIR_LEAD_MARGIN_C}c inside the model fair ("
+               + ("held where it rests whatever steps ahead, as every lead is"
+                  if COMP_LEAD_HOLD_SMALL and min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE) <= 0
+                  else f"fought to that cap only where an order ahead leaves it under "
+                       f"{min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE):.0%} of the side, "
+                       f"as every lead is" if COMP_LEAD_HOLD_SMALL
+                  else "fought to that cap by any order ahead")
                + f"; never chased up), priced into the estimate so a market under the "
                f"payout bar is admitted on it; a leading market's position cap "
                f"{FAIR_LEAD_MAX_POSITION:g}, the family's event cap "

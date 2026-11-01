@@ -31188,13 +31188,17 @@ class TestComplementLead(unittest.TestCase):
                                             hold=65), (65, 65, 16))
         # Jack 2026-10-29 "2.": an order stepped AHEAD (1,000 at 30c) is
         # fought -- 7c ahead of it takes the share again -- but never past the
-        # cap: one at the cap is joined there, one past it rests behind it
+        # cap: one at the cap is joined there, one past it rests behind it.
+        # Since 2026-11-01 ("Yes, hold always") only with a hold bar set
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
+                                                hold=26), (37, 65, 30))
+            self.assertEqual(imm.comp_side_lead(wall + [[65, 1000.0]], r_no, 1000.0, 0.5,
+                                                hold=26), (65, 65, 65))
+            self.assertEqual(imm.comp_side_lead(wall + [[67, 1000.0]], r_no, 1000.0, 0.5,
+                                                hold=26), (65, 65, 67))
         self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=26), (37, 65, 30))
-        self.assertEqual(imm.comp_side_lead(wall + [[65, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=26), (65, 65, 65))
-        self.assertEqual(imm.comp_side_lead(wall + [[67, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=26), (65, 65, 67))
+                                            hold=26), (26, 65, 30))
         # alone, the wall below gone: down to the new cheapest price, but not
         # for a move under 3c
         thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
@@ -31217,54 +31221,86 @@ class TestComplementLead(unittest.TestCase):
         wall = [[15, 13238.0], [16, 21.0]]
         r_no = self.R_NO
         self.assertEqual(imm.comp_side_lead(wall + [[27, 3.0]], r_no, 1000.0, 0.5,
-                                            hold=26), (26, 65, 16))
+                                            hold=26), (26, 65, 27))
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.95):
             self.assertEqual(imm.comp_side_lead(wall + [[27, 10.0]], r_no, 1000.0, 0.5,
                                                 hold=26), (28, 65, 27))
-        # beside a 1,000-lot copier on its price, any order ahead costs the share
+        # beside a 1,000-lot copier on its price, any order ahead costs the
+        # share: fought at the half bar, held since 2026-11-01
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            self.assertEqual(imm.comp_side_lead(wall + [[26, 1000.0], [27, 3.0]], r_no,
+                                                1000.0, 0.5, hold=26), (33, 65, 27))
         self.assertEqual(imm.comp_side_lead(wall + [[26, 1000.0], [27, 3.0]], r_no,
-                                            1000.0, 0.5, hold=26), (33, 65, 27))
+                                            1000.0, 0.5, hold=26), (26, 65, 27))
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SMALL", False):      # the old rule
             self.assertEqual(imm.comp_side_lead(wall + [[27, 3.0]], r_no, 1000.0, 0.5,
                                                 hold=26), (28, 65, 27))
         self.assertIn("COMP_LEAD_HOLD_SMALL", imm._CONFIG_CODE_KNOBS)
 
     def test_a_lead_holds_while_it_keeps_half_its_side(self):
-        # Jack 2026-10-30: "Hold at one half" (COMP_LEAD_HOLD_SHARE). N lots
-        # under target/5 ahead keep the reference at the lead's 26c, so it
-        # keeps 200 / (206.5 + N) of its side: 10 lots 92%, a 31-lot jumper
+        # Jack 2026-10-30: "Hold at one half" (COMP_LEAD_HOLD_SHARE 0.5 until
+        # 2026-11-01, IMM_COMP_LEAD_HOLD_SHARE=0.5 now). N lots under
+        # target/5 ahead keep the reference at the lead's 26c, so it keeps
+        # 200 / (206.5 + N) of its side: 10 lots 92%, a 31-lot jumper
         # (KXTOKENUSE-26NOV02-T194's) 84%, 150 lots 56%, 193 lots 50.06% --
         # all held where the old bar walked it up (31 lots: to 29c)
         wall = [[15, 13238.0], [16, 21.0]]
         r_no = self.R_NO
-        for n in (10.0, 31.0, 150.0, 193.0):
-            self.assertEqual(imm.comp_side_lead(wall + [[27, n]], r_no, 1000.0, 0.5,
-                                                hold=26), (26, 65, 16), n)
-        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.95):
-            self.assertEqual(imm.comp_side_lead(wall + [[27, 31.0]], r_no, 1000.0, 0.5,
-                                                hold=26), (29, 65, 27))
-        # 194 lots leave it 49.9%: fought, to the cheapest price ahead of them
-        # taking COMP_LEAD_SHARE; 200 move the reference to 27c, leaving the
-        # lead a third of its side, and are fought the same
-        for n in (194.0, 200.0, 300.0):
-            self.assertEqual(imm.comp_side_lead(wall + [[27, n]], r_no, 1000.0, 0.5,
-                                                hold=26), (32, 65, 27), n)
-        # a copier on its price counts against the half: 100 there with 90
-        # ahead leave it 50.4%, held; with 100 ahead 49.2%, fought
-        self.assertEqual(imm.comp_side_lead(wall + [[26, 100.0], [27, 90.0]], r_no,
-                                            1000.0, 0.5, hold=26), (26, 65, 16))
-        self.assertEqual(imm.comp_side_lead(wall + [[26, 100.0], [27, 100.0]], r_no,
-                                            1000.0, 0.5, hold=26), (31, 65, 27))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            for n in (10.0, 31.0, 150.0, 193.0):
+                self.assertEqual(imm.comp_side_lead(wall + [[27, n]], r_no, 1000.0, 0.5,
+                                                    hold=26), (26, 65, 27), n)
+            with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.95):
+                self.assertEqual(imm.comp_side_lead(wall + [[27, 31.0]], r_no, 1000.0, 0.5,
+                                                    hold=26), (29, 65, 27))
+            # 194 lots leave it 49.9%: fought, to the cheapest price ahead of
+            # them taking COMP_LEAD_SHARE; 200 move the reference to 27c,
+            # leaving the lead a third of its side, and are fought the same
+            for n in (194.0, 200.0, 300.0):
+                self.assertEqual(imm.comp_side_lead(wall + [[27, n]], r_no, 1000.0, 0.5,
+                                                    hold=26), (32, 65, 27), n)
+            # a copier on its price counts against the half: 100 there with 90
+            # ahead leave it 50.4%, held; with 100 ahead 49.2%, fought
+            self.assertEqual(imm.comp_side_lead(wall + [[26, 100.0], [27, 90.0]], r_no,
+                                                1000.0, 0.5, hold=26), (26, 65, 27))
+            self.assertEqual(imm.comp_side_lead(wall + [[26, 100.0], [27, 100.0]], r_no,
+                                                1000.0, 0.5, hold=26), (31, 65, 27))
         # the bar never sits above the share a lead is placed at
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.99):
             self.assertEqual(imm.comp_side_lead(wall + [[27, 3.0]], r_no, 1000.0, 0.5,
-                                                hold=26), (26, 65, 16))
+                                                hold=26), (26, 65, 27))
         self.assertIn("COMP_LEAD_HOLD_SHARE", imm._CONFIG_CODE_KNOBS)
 
-    def test_an_outbid_lead_fights_after_a_restart_too(self):
+    def test_a_lead_holds_whatever_rests_ahead(self):
+        # Jack 2026-11-01: "Yes, hold always" (COMP_LEAD_HOLD_SHARE 0). The
+        # half bar walked KXTOKENUSE-26NOV02-T190's bid up 5-6c a step: at
+        # 10/31 19:29:37Z it rested at 54c beside 341 copied lots, 17 lots sat
+        # at 55c and its harder strikes implied 84c (cap 79c). It kept 36% of
+        # its side, so it fought to 60c, as it did live 21s later. Now it stays
+        t190 = [[41, 737.0], [42, 134.0], [48, 10.0], [54, 341.0], [55, 17.0]]
+        self.assertEqual(imm.comp_side_lead_ref(t190, 84, 1000.0, 0.5, hold=54), (54, 79, 55))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            self.assertEqual(imm.comp_side_lead_ref(t190, 84, 1000.0, 0.5, hold=54),
+                             (60, 79, 55))
+        # real size ahead is held too: 300 lots, a 1,000-lot, a copier with 3
+        # lots over it, a 1,000-lot at the cap -- the 26c lead stays at 26c,
+        # and the order ahead is the side's own best
+        wall = [[15, 13238.0], [16, 21.0]]
+        for ahead in ([[27, 300.0]], [[30, 1000.0]], [[26, 1000.0], [27, 3.0]],
+                      [[65, 1000.0]]):
+            self.assertEqual(imm.comp_side_lead(wall + ahead, self.R_NO, 1000.0, 0.5,
+                                                hold=26), (26, 65, ahead[-1][0]), ahead)
+        # a lead alone still moves down, and a cap below it still leads afresh
+        thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
+        self.assertEqual(imm.comp_side_lead(thin, self.R_NO, 1000.0, 0.5, hold=26)[0], 18)
+        self.assertEqual(imm.comp_side_lead(wall, [[40, 3000.0]], 1000.0, 0.5, hold=56),
+                         (26, 35, 16))
+
+    def test_an_outbid_lead_keeps_its_hold_after_a_restart(self):
         # the hold file keeps a restarted bot -- or a market that dropped out
-        # and came back -- fighting from where it led: past the 1,000-lot at
-        # 30c that stepped ahead of the 21c lead, to 37c
+        # and came back -- leading from where it led: since 2026-11-01 at the
+        # 21c it held behind the 1,000-lot at 30c that stepped ahead of it,
+        # and at the half bar fighting from there, past the 1,000 to 37c
         copier = [[1, 1001], [2, 2004], [15, 583], [30, 1000]]
         meta = self._meta(self.D)
         with tempfile.TemporaryDirectory() as tmp, \
@@ -31281,8 +31317,10 @@ class TestComplementLead(unittest.TestCase):
             self.assertEqual(bot2._comp_holds[self.D][:2], [21, None])
             bot2._ws = bot._ws
             bot2._comp_groups, bot2._comp_pairs = bot._comp_groups, bot._comp_pairs
-            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
-            # a lapsed entry is forgotten: a fresh read leads there as well
+            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (21, 65, 30))
+            with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+                self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
+            # a lapsed entry is forgotten: a fresh read leads ahead of the whole book
             bot2._comp_holds[self.D][2] = time.time() - imm.COMP_HOLD_TTL_SECS - 1
             self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
 
@@ -31297,11 +31335,15 @@ class TestComplementLead(unittest.TestCase):
         sibs = [([[b, 5000.0]], [[29, 15000.0]]) for b in (10, 10, 11, 4, 4, 4, 3, 4, 2, 6, 4)]
         lb, la = imm.comp_lead_group(jdon_yes, jdon_no, sibs, 1000.0, 0.5, bid_ok=True)
         self.assertEqual((lb, la), (None, (60, 43, 71)))
-        # the wall owner stepped 1c ahead (4,472 at 56c, NO 44): fought, 9
-        # ticks ahead of it at 47c, inside the 43c cap
+        # the wall owner stepped 1c ahead (4,472 at 56c, NO 44): at the half
+        # bar fought, 9 ticks ahead of it at 47c, inside the 43c cap; since
+        # 2026-11-01 ("Yes, hold always") the 57c offer stays behind it
         jdon_no2 = jdon_no[:5] + [[33, 3432], [44, 4472]]
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no2, sibs, 1000.0, 0.5,
+                                                 hold_ask=57), (None, (47, 43, 56)))
         self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no2, sibs, 1000.0, 0.5,
-                                             hold_ask=57), (None, (47, 43, 56)))
+                                             hold_ask=57), (None, (57, 43, 56)))
         # a sibling too thin to reach 200 sets no reference: no lead
         thin = sibs[:-1] + [([[4, 150.0]], [[29, 15000.0]])]
         self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no, thin, 1000.0, 0.5),
@@ -32357,26 +32399,31 @@ class TestVercelFairLead(unittest.TestCase):
         holds = dict(hold_bid=17, hold_ask=77)
         self.assertEqual(imm.fair_lead_group(self.YES + [[18, 3]], self.NO, 40.7,
                                              1000.0, 0.5, **holds),
-                         ((17, 35, 7), (77, 46, 87)))
+                         ((17, 35, 18), (77, 46, 87)))
         self.assertEqual(imm.fair_lead_group(self.YES, self.NO + [[24, 3]], 40.7,
                                              1000.0, 0.5, **holds),
-                         ((17, 35, 7), (77, 46, 87)))
+                         ((17, 35, 7), (77, 46, 76)))
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SMALL", False):
             self.assertEqual(imm.fair_lead_group(self.YES + [[18, 3]], self.NO, 40.7,
                                                  1000.0, 0.5, **holds)[0], (19, 35, 18))
         # Jack 2026-10-30: "Hold at one half". A 31-lot jumper on either side
         # is held (the old bar took the bid to 20c); 194 lots ahead leave the
-        # lead under half its side and are fought, bid to 23c, offer to 71c
-        for yes, no in ((self.YES + [[18, 31]], self.NO), (self.YES, self.NO + [[24, 31]])):
-            self.assertEqual(imm.fair_lead_group(yes, no, 40.7, 1000.0, 0.5, **holds),
-                             ((17, 35, 7), (77, 46, 87)))
+        # lead under half its side and were fought, bid to 23c, offer to 71c
+        for yes, no, want in ((self.YES + [[18, 31]], self.NO, ((17, 35, 18), (77, 46, 87))),
+                              (self.YES, self.NO + [[24, 31]], ((17, 35, 7), (77, 46, 76)))):
+            self.assertEqual(imm.fair_lead_group(yes, no, 40.7, 1000.0, 0.5, **holds), want)
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.95):
             self.assertEqual(imm.fair_lead_group(self.YES + [[18, 31]], self.NO, 40.7,
                                                  1000.0, 0.5, **holds)[0], (20, 35, 18))
-        self.assertEqual(imm.fair_lead_group(self.YES + [[18, 194]], self.NO, 40.7,
-                                             1000.0, 0.5, **holds)[0], (23, 35, 18))
-        self.assertEqual(imm.fair_lead_group(self.YES, self.NO + [[24, 194]], 40.7,
-                                             1000.0, 0.5, **holds)[1], (71, 46, 76))
+        with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
+            self.assertEqual(imm.fair_lead_group(self.YES + [[18, 194]], self.NO, 40.7,
+                                                 1000.0, 0.5, **holds)[0], (23, 35, 18))
+            self.assertEqual(imm.fair_lead_group(self.YES, self.NO + [[24, 194]], 40.7,
+                                                 1000.0, 0.5, **holds)[1], (71, 46, 76))
+        # Jack 2026-11-01: "Yes, hold always" -- 194 lots ahead are held too
+        for yes, no, want in ((self.YES + [[18, 194]], self.NO, ((17, 35, 18), (77, 46, 87))),
+                              (self.YES, self.NO + [[24, 194]], ((17, 35, 7), (77, 46, 76)))):
+            self.assertEqual(imm.fair_lead_group(yes, no, 40.7, 1000.0, 0.5, **holds), want)
 
     def test_the_quote_loop_leads_both_walls_with_200(self):
         bot, rungs, lines = self._cycle()
