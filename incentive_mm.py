@@ -25905,6 +25905,8 @@ class IncentiveMarketMaker:
         live pull would have avoided once since_trip_s clears the reaction
         time (a fill up to 5 s before the trip is logged too, negative: the
         same sweep, which no pull beats)."""
+        if self._tape is None:
+            return                     # no tape running: nothing to match or prune
         if trade_id:
             self._tape_ours[str(trade_id)] = now_ts
         if not self._tape_win and not self._tape_gwin:
