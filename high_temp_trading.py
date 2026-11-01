@@ -616,6 +616,67 @@ if not ACTIVE_CITIES:
                   exit_status="noop", run_slot=RUN_SLOT)
     sys.exit(0)
 
+# =====================================================================
+# NIGHT PILOT: FRESH QUOTES (Jack 2026-11-01: "1+2" -- evening orders that
+# expire after 60 minutes, re-quoted every hour 7-11 PM CT).
+# On Sep-Oct markets, evening fills <= 60 min after their order went up made
+# +$513 (+13c/contract); older ones lost $1,002 (1-2 h -14c/ct, 2-4 h
+# -5c/ct), in every edge and price bucket: a resting evening quote goes stale
+# as the night's forecast updates land. Each evening market goes to an arm
+# by a sticky hash salted with the pilot's name:
+#   fresh    its orders expire NIGHT_ORDER_TTL_MIN (60) after placement, and
+#            every evening run quotes it (19:02-23:02 CT, hourly);
+#   control  unchanged: quoted only on the base runs (EVENING_BASE_HOURS_CT,
+#            20:02 and 23:02), resting to 01:59 CT.
+# A run at any other evening hour is an extra run: it cancels and quotes
+# fresh markets only, so control's 20:02 orders rest to 23:02 as before.
+# The arm is not stored in BigQuery: recompute night_arm(ticker) in the
+# readout ($ per market-day against control, after about 3 weeks).
+# NIGHT_PILOT_ENABLED=false ends it: every market back to control, and an
+# off-hour evening run then does nothing.
+# =====================================================================
+NIGHT_PILOT_NAME = "night_fresh_60min"
+NIGHT_PILOT_ENABLED = os.environ.get("NIGHT_PILOT_ENABLED", "true").lower() == "true"
+NIGHT_ORDER_TTL_MIN = int(os.environ.get("NIGHT_ORDER_TTL_MIN", "60"))
+NIGHT_PILOT_PROPORTION = float(os.environ.get("NIGHT_PILOT_PROPORTION", "0.5"))
+EVENING_BASE_HOURS_CT = {int(h) for h in os.environ.get("EVENING_BASE_HOURS_CT", "20,23").split(",")
+                         if h.strip()}
+NIGHT_PILOT_ACTIVE = NIGHT_PILOT_ENABLED and RUN_SLOT == "evening"
+EXTRA_NIGHT_RUN = RUN_SLOT == "evening" and central_time.hour not in EVENING_BASE_HOURS_CT
+
+
+def night_arm(market_ticker):
+    """'fresh' or 'control' for an evening market while the pilot runs, else 'off'."""
+    if not NIGHT_PILOT_ACTIVE:
+        return "off"
+    key = f"{NIGHT_PILOT_NAME}|{market_ticker}"
+    u = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / (16**8)
+    return "fresh" if u < NIGHT_PILOT_PROPORTION else "control"
+
+
+def night_expiration(exp_ts, market_ticker, now_ts):
+    """A fresh market's evening order expires NIGHT_ORDER_TTL_MIN after now,
+    or at its usual expiry if that comes first."""
+    if night_arm(market_ticker) == "fresh":
+        return min(int(exp_ts), int(now_ts) + NIGHT_ORDER_TTL_MIN * 60)
+    return int(exp_ts)
+
+
+if RUN_SLOT == "evening":
+    print(f"[NIGHT] pilot {NIGHT_PILOT_NAME}: "
+          + (f"{'extra run, fresh markets only' if EXTRA_NIGHT_RUN else 'base run, both arms'}; "
+             f"fresh orders live {NIGHT_ORDER_TTL_MIN} min" if NIGHT_PILOT_ACTIVE else "off"))
+if EXTRA_NIGHT_RUN and not NIGHT_PILOT_ACTIVE:
+    # An off-hour evening trigger with the pilot off. Before the pilot only
+    # the base hours ran, so this hour does what it did then: nothing.
+    print(f"  {central_time.strftime('%H:%M')} CT is not a base evening hour "
+          f"{sorted(EVENING_BASE_HOURS_CT)} and the night pilot is off; exiting")
+    write_run_row("start", variable=int(variable), central_time_hour=int(central_time.hour),
+                  run_slot=RUN_SLOT)
+    write_run_row("end", finished_at=datetime.now(pytz.UTC), n_orders_placed=0,
+                  exit_status="noop", run_slot=RUN_SLOT)
+    sys.exit(0)
+
 def get_accuweather_forecast(coords):
     try:
         api_key = "lEl0lfAft6PncVXwatr92Y2YjGJL5YKs"  # Replace with your actual API key
@@ -1872,6 +1933,14 @@ def fetch_market_filled_cash(ticker, max_pages=10, order_ids=None):
             return cash, True
     return cash, False  # page cap hit — undercounted
 
+# Night pilot extra run: only the fresh arm's markets are cancelled and
+# quoted; control's orders from the last base run keep resting untouched.
+if EXTRA_NIGHT_RUN:
+  _fresh = combined_table['market_ticker'].map(night_arm) == "fresh"
+  print(f"[NIGHT] extra run: quoting {int(_fresh.sum())} fresh markets, leaving "
+        f"{int((~_fresh).sum())} control markets alone")
+  combined_table = combined_table[_fresh].reset_index(drop=True)
+
 ####### DELETE EXISTING ORDERS
 
 for market_ticker in combined_table['market_ticker']:
@@ -2367,7 +2436,8 @@ for index, row in combined_table.iterrows():
 
   # Per-market header — brief line that always prints; the rich detail block
   # prints after all pre-filters pass (so we don't bury skipped markets in log).
-  print(f"\n  {ticker} [{row['City']}]:")
+  print(f"\n  {ticker} [{row['City']}]"
+        + (f" [night:{night_arm(ticker)}]" if NIGHT_PILOT_ACTIVE else "") + ":")
 
   # Filter 0: check if market is still open for trading
   try:
@@ -2854,8 +2924,9 @@ for index, row in combined_table.iterrows():
     central_time = datetime.now(pytz.timezone('US/Central'))
     client_oid = str(uuid.uuid4())
     if variable == 1:
-      # Evening: rest until 01:59 CT on the target date.
-      exp_ts = get_unix_time_for_tomorrow(1, 59)
+      # Evening: rest until 01:59 CT on the target date -- or, on a night
+      # pilot fresh market, NIGHT_ORDER_TTL_MIN from now.
+      exp_ts = night_expiration(get_unix_time_for_tomorrow(1, 59), row['market_ticker'], time.time())
     else:
       # Day run: this city's cutoff today (see RUN SLOT), never rolled to tomorrow.
       exp_ts = int(_dayof_cutoff(row['City']).timestamp())
