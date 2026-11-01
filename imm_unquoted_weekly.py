@@ -13,10 +13,11 @@ the 7:20 quote-gaps classifier, refreshed hourly by the "KL imm dashboard"
 task), scores every "not in allowlist" series with imm_unquoted -- the bot's
 own estimator on the live books at x1 and x3, 75 days of public tape for
 makers' P&L, Jack's calls (ADD / ADD WITH CARE / PASS / DON'T QUOTE) -- and
-sends one short email ranked by the x1 $/day. A series worth adding gets its
-title, call and reason, x1 / x3 estimate, pool, tape, what adding it would
-take and what the family watch already sent; a passed one worth $1/day or
-more at x3 gets a line; the rest are named at the end. The series records and tapes
+sends one short email ranked by the x1 $/day. A series worth adding (an ADD
+/ ADD WITH CARE call on $1/day or more at x3) gets its title, call and
+reason, x1 / x3 estimate, pool, tape, what adding it would take and what the
+family watch already sent; the biggest passed ones get a line each; the
+rest are named at the end. The series records and tapes
 are cached beside the dashboard's (unquoted_tape.json), which the dashboard's
 Promising unquoted series table reads too.
 
@@ -43,7 +44,7 @@ import imm_dashboard as dash
 import imm_unquoted as iu
 from incentive_mm import log
 
-FULL_MIN_X3 = float(os.environ.get("IMM_UNQUOTED_FULL_MIN_X3", "1.0"))
+PASSED_SHOW = 20              # passed series with a line of their own; the rest are named
 GAPS_STALE_H = 6.0
 MARKER = "imm_unquoted_weekly_sent_{day}.marker"
 
@@ -98,14 +99,18 @@ def passed_line(r: dict) -> str:
             + (f"; {r['watch']}" if r.get("watch_alerted") else ""))
 
 
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 def build_email(res: dict, gaps_at: float, now_ts: float):
     """(subject, body) from imm_unquoted.score_all's result: the series worth
-    adding in full, then the passed ones worth $1/day at x3 on a line each,
-    both ranked by the x1 $/day as score_all orders them, then the rest by
-    name."""
+    adding (imm_unquoted.promising) in full, then the biggest PASSED_SHOW
+    passed ones worth $1/day at x3 on a line each, both ranked by the x1
+    $/day as score_all orders them, then the rest by name."""
     rows = res["rows"]
-    good = [r for r in rows if r["call"] in iu.PROMISING_CALLS]
-    passed = [r for r in rows if r not in good and r.get("x3", 0.0) >= FULL_MIN_X3]
+    good = [r for r in rows if iu.promising(r)]
+    passed = [r for r in rows if r not in good and r.get("x3", 0.0) >= iu.PROMISING_MIN_X3]
     small = [r for r in rows if r not in good and r not in passed and r.get("quotable")]
     dark = [r for r in rows if r not in good and r not in passed and not r.get("quotable")]
     n = Counter(r["call"] for r in good)
@@ -132,10 +137,15 @@ def build_email(res: dict, gaps_at: float, now_ts: float):
         out += ["Nothing is worth adding this week.", ""]
     if passed:
         out.append(f"PASSED, $1/day or more at x3 ({len(passed)}), by x1 $/day")
-        out += [passed_line(r) for r in passed] + [""]
+        out += [passed_line(r) for r in passed[:PASSED_SHOW]]
+        if len(passed) > PASSED_SHOW:
+            out.append(f"- also passed ({len(passed) - PASSED_SHOW}): " + ", ".join(
+                r["series"] for r in passed[PASSED_SHOW:]))
+        out.append("")
     if small:
         out.append(f"Under $1/day even at x3 ({len(small)}): " + ", ".join(
-            f"{r['series']} {_usd(r.get('x3', 0.0))}" for r in small))
+            f"{r['series']} {_usd(r.get('x3', 0.0))}"
+            + (f" ({r['call']})" if r["call"] in iu.PROMISING_CALLS else "") for r in small))
     if dark:
         out.append(f"Nothing quotable now ({len(dark)}): " + ", ".join(
             r["series"] for r in dark))
@@ -143,8 +153,8 @@ def build_email(res: dict, gaps_at: float, now_ts: float):
         out.append(f"Enrolled since the gap list was built, left out ({len(res['enrolled'])}): "
                    + ", ".join(res["enrolled"]))
     ctx = res.get("ctx") or {}
-    out.append(f"({ctx.get('books', 0)} books and {ctx.get('tape_reads', 0)} tapes read in "
-               f"{ctx.get('secs', 0):.0f}s.)")
+    out.append(f"({_plural(ctx.get('books', 0), 'book')} and "
+               f"{_plural(ctx.get('tape_reads', 0), 'tape')} read in {ctx.get('secs', 0):.0f}s.)")
     return subject, "\n".join(out).rstrip() + "\n"
 
 

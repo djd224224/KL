@@ -222,8 +222,13 @@ class CallTests(unittest.TestCase):
                                          owner_bot=True)),
                          ("DON'T QUOTE", "low_temp_trading.py trades the KXLOWT dailies: "
                                          "quoting it would cross that bot"))
-        self.assertEqual(iu.call_for(row(owner="blocklisted in incentive_mm.py"))[1],
-                         "kept out on purpose (blocklisted in incentive_mm.py)")
+        self.assertEqual(iu.call_for(row(owner="blocklisted in incentive_mm.py")),
+                         ("DON'T QUOTE", "blocklisted in incentive_mm.py"))
+
+    def test_worth_adding_needs_a_dollar_a_day_at_x3(self):
+        self.assertTrue(iu.promising(row(call="ADD WITH CARE", x3=1.0)))
+        self.assertFalse(iu.promising(row(call="ADD WITH CARE", x3=0.24)))
+        self.assertFalse(iu.promising(row(call="PASS", x3=50.0)))
 
     def test_nothing_quotable_or_under_the_bar_passes(self):
         self.assertEqual(iu.call_for(row(scored=0, quotable=0)),
@@ -514,8 +519,9 @@ class WeeklyEmailTests(unittest.TestCase):
                          r("KXCARE", "ADD WITH CARE", "a mention market", 1.0, 2.5,
                            tape={"days": 75, "cts": 0, "pnl": 0, "of": 0}),
                          r("KXTINY", "PASS", "under the bar", 0.1, 0.3),
+                         r("KXTINYADD", "ADD WITH CARE", "a slow public process", 0.08, 0.24),
                          r("KXDARK", "PASS", "no two-sided book", 0.0, 0.0, quotable=0)],
-                "enrolled": ["KXSODAARRAY"], "ctx": {"books": 12, "tape_reads": 3, "secs": 40}}
+                "enrolled": ["KXSODAARRAY"], "ctx": {"books": 12, "tape_reads": 1, "secs": 40}}
 
     def test_ranked_by_x1_with_calls_and_tails(self):
         import imm_unquoted_weekly as w
@@ -534,12 +540,18 @@ class WeeklyEmailTests(unittest.TestCase):
         self.assertIn("PASSED, $1/day or more at x3 (1), by x1 $/day", lines)
         self.assertIn("- KXBIG: Kxbig -- PASS: someone decides or announces it. x1 $9.00/day, x3 $20.00, "
                       "pool $100/day; watch emailed it 10/30 at ~$7.59/day", lines)
-        self.assertIn("Under $1/day even at x3 (1): KXTINY $0.30", body)
+        # a call worth adding on under $1/day at x3 is named, not proposed
+        self.assertIn("Under $1/day even at x3 (2): KXTINY $0.30, KXTINYADD $0.24 (ADD WITH CARE)",
+                      body)
         self.assertIn("Nothing quotable now (1): KXDARK", body)
         self.assertIn("Enrolled since the gap list was built, left out (1): KXSODAARRAY", body)
+        self.assertIn("(12 books and 1 tape read in 40s.)", body)
         self.assertNotIn("old: the dashboard", body)
         _, body = w.build_email(self.res(), now - 8 * 3600, now)
         self.assertIn("(8h old: the dashboard's Kalshi reads may be failing)", body)
+        with mock.patch.object(w, "PASSED_SHOW", 0):
+            body = w.build_email(self.res(), now, now)[1]
+        self.assertIn("- also passed (1): KXBIG", body.splitlines())
 
     def test_nothing_to_add(self):
         import imm_unquoted_weekly as w
@@ -595,7 +607,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_fetch_unquoted_adds_the_family_and_the_tape_cents(self):
         import imm_dashboard as dash
-        res = {"rows": [{"series": "KXTRUMPAPPROVEX", "category": "Politics", "call": "ADD",
+        res = {"rows": [{"series": "KXTRUMPAPPROVEX", "category": "Politics", "call": "ADD", "x3": 2.0,
                          "tape": {"days": 75, "cts": 1000.0, "pnl": -20.0, "events": 3}}],
                "enrolled": [], "ctx": {}}
         with mock.patch.object(iu, "score_all", return_value=res) as sa:

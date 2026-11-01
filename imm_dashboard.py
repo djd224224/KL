@@ -158,7 +158,9 @@ PROMISING_LEFT = float(os.environ.get("IMM_DASH_PROMISING_LEFT", "500"))
 # UNQUOTED_TAPE_SERIES new tapes a pass (the weekly email reads the rest;
 # both keep the tapes in CACHE_DIR).
 UNQUOTED_TTL_MIN = float(os.environ.get("IMM_DASH_UNQUOTED_TTL_MIN", "180"))
-UNQUOTED_MAX_BOOKS = int(os.environ.get("IMM_DASH_UNQUOTED_MAX_BOOKS", "400"))
+# (11/01: the series whose call can turn on the estimate needed 234 of the
+# 977 quotable books; the owned / live / insider ones read last, if at all)
+UNQUOTED_MAX_BOOKS = int(os.environ.get("IMM_DASH_UNQUOTED_MAX_BOOKS", "300"))
 UNQUOTED_TAPE_SERIES = int(os.environ.get("IMM_DASH_UNQUOTED_TAPE_SERIES", "4"))
 TITLE_BUDGET = int(os.environ.get("IMM_DASH_TITLE_BUDGET", "80"))
 PAD_BID, PAD_ASK = 1, 99  # incentive_mm PAD_BID_CENTS / PAD_ASK_CENTS
@@ -1968,7 +1970,7 @@ def fetch_unquoted(gaps, imm, now_utc, rows):
         r["fam"] = family_of(r["series"], r.get("category") or "")[0]
         r["tape_c"] = iu.tape_cents(r.get("tape"))
         r["tape_txt"] = iu.tape_text(r.get("tape"))
-        r["promising"] = r["call"] in iu.PROMISING_CALLS
+        r["promising"] = iu.promising(r)
     return res
 
 

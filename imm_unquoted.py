@@ -52,7 +52,8 @@ against" -- and the family watch's quote_call words):
                  public process; scheduled data with too little tape; makers
                  lost TAPE_CARE_C or more; an event market whose tape held up
   ADD            scheduled or slow public data with a clean tape
-A call is advice: nothing here enrolls anything.
+Worth adding (promising) = ADD or ADD WITH CARE on PROMISING_MIN_X3 $/day or
+more at x3. A call is advice: nothing here enrolls anything.
 
 Read-only against the live system: the offline bot never runs a cycle,
 places or cancels anything, or saves its state.
@@ -72,6 +73,10 @@ CANDIDATE_REASON = "not in allowlist"
 MULTS = (1.0, 3.0)
 CALLS = ("ADD", "ADD WITH CARE", "PASS", "DON'T QUOTE")
 PROMISING_CALLS = frozenset(("ADD", "ADD WITH CARE"))
+# worth adding = one of those calls and at least this much at x3 (Jack
+# 2026-10-22: "if a market is only a few dollars a day, still tell me about
+# it"; under $1/day even at x3 it is named, not proposed)
+PROMISING_MIN_X3 = float(os.environ.get("IMM_UNQUOTED_PROMISING_MIN_X3", "1.0"))
 
 MAX_BOOKS = int(os.environ.get("IMM_UNQUOTED_MAX_BOOKS", "1500"))
 BOOK_PACE_SECS = float(os.environ.get("IMM_UNQUOTED_BOOK_PACE", "0.05"))
@@ -86,8 +91,8 @@ TAPE_MIN_CTS = float(os.environ.get("IMM_UNQUOTED_TAPE_MIN_CTS", "2000"))
 TAPE_MIN_EVENTS = int(os.environ.get("IMM_UNQUOTED_TAPE_MIN_EVENTS", "2"))
 TAPE_CARE_C = float(os.environ.get("IMM_UNQUOTED_TAPE_CARE_C", "-2.0"))
 TAPE_PASS_C = float(os.environ.get("IMM_UNQUOTED_TAPE_PASS_C", "-5.0"))
-# below this x3 $/day a series' call cannot turn on its tape: not read
-TAPE_MIN_X3 = float(os.environ.get("IMM_UNQUOTED_TAPE_MIN_X3", "0.25"))
+# below this x3 $/day a series is not proposed whatever its tape: not read
+TAPE_MIN_X3 = PROMISING_MIN_X3
 META_TTL_DAYS = 7.0
 TAPE_CACHE_NAME = "unquoted_tape.json"
 
@@ -571,7 +576,7 @@ def call_for(row: dict) -> Tuple[str, str]:
     "frequency", "category", "live", "tape" (None = not read)."""
     if row.get("owner"):
         return "DON'T QUOTE", (f"{row['owner']}: quoting it would cross that bot"
-                               if row.get("owner_bot") else f"kept out on purpose ({row['owner']})")
+                               if row.get("owner_bot") else row["owner"])
     if not row.get("scored") and not row.get("unread"):
         return "PASS", "no paying market is open now (its program ended or its markets closed)"
     if not row.get("quotable"):
@@ -620,6 +625,12 @@ def call_for(row: dict) -> Tuple[str, str]:
     if data:
         return "ADD", (f"{freq} public data, " if freq in RECURRING else "public data, ") + tape_text(tp)
     return "ADD WITH CARE", f"an event market, but makers held up: {tape_text(tp)}"
+
+
+def promising(row: dict) -> bool:
+    """Worth adding: an ADD / ADD WITH CARE call on PROMISING_MIN_X3 or more
+    at x3 -- what the weekly email proposes and the dashboard lists."""
+    return row.get("call") in PROMISING_CALLS and row.get("x3", 0.0) >= PROMISING_MIN_X3
 
 
 def needs_for(row: dict) -> str:
