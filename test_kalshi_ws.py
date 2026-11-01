@@ -530,6 +530,92 @@ class TestFeed(unittest.TestCase):
         self.assertTrue(_wait(lambda: self.feed.book_fp("A") is None, 3))
 
 
+def _print_msg(sid, seq, t, px, n, side="yes"):
+    return {"type": "trade", "sid": sid, "seq": seq, "msg": {
+        "trade_id": f"tr-{t}-{seq}", "market_ticker": t,
+        "yes_price_dollars": px, "no_price_dollars": "0.5000",
+        "count_fp": n, "taker_side": side, "taker_outcome_side": side,
+        "taker_book_side": "bid" if side == "yes" else "ask",
+        "is_block_trade": False, "ts": 1, "ts_ms": 1000}}
+
+
+class TestTradeFeed(unittest.TestCase):
+    """channel="trade" (2026-11-01, the bot's TAPE_TRIGGER): the market set
+    subscribes Kalshi's public trade channel, no books are kept, and each
+    wanted print surfaces as a ("trade", msg) event."""
+
+    def setUp(self):
+        self.k = _ScriptedKalshi()
+        self.feed = kw.KalshiFeed(
+            self.k.server.url, auth_headers=lambda: {"KALSHI-ACCESS-KEY": "x"},
+            log=lambda s: None, want_fills=False, want_order_groups=False,
+            chunk=2, stale_secs=5.0, ping_secs=1.0, timeout=2.0,
+            backoff_max=0.5, retry_secs=0.2, channel="trade")
+
+    def tearDown(self):
+        self.feed.stop()
+        self.k.stop()
+
+    def _subs(self):
+        return [m for m in self.k.cmds if m.get("cmd") == "subscribe"]
+
+    def _start(self, markets):
+        self.feed.set_markets(markets)
+        self.feed.start()
+        self.assertTrue(self.k.ready.wait(5))
+        self.assertTrue(_wait(lambda: len(self._subs()) >= 1))
+        return self.k.conns[-1]
+
+    def test_subscribes_the_trade_channel_only_and_surfaces_wanted_prints(self):
+        c = self._start(["A", "B"])
+        sub, = self._subs()
+        self.assertEqual((sub["params"]["channels"], sub["params"]["market_tickers"]),
+                         (["trade"], ["A", "B"]))      # no fill / group / book subs
+        sid = sub["id"]
+        c.send_json(_print_msg(sid, 1, "A", "0.4000", "30.00", "no"))
+        c.send_json(_print_msg(sid, 2, "Z", "0.1000", "5.00"))     # never wanted
+        self.assertTrue(_wait(lambda: self.feed.status()["msgs"] >= 2))
+        self.assertTrue(self.feed.event_flag.is_set())
+        _dirty, ev, dropped = self.feed.drain()
+        self.assertEqual([(k, b["market_ticker"], b["count_fp"], b["taker_side"])
+                          for k, b in ev], [("trade", "A", "30.00", "no")])
+        st = self.feed.status()
+        self.assertEqual((st["trades"], st["channel"], st["gaps"], dropped),
+                         (1, "trade", 0, 0))
+        self.assertIsNone(self.feed.book_fp("A"))           # no books, ever
+        self.assertEqual(self.feed.ready(["A", "B"]), 0)
+
+    def test_a_gap_is_counted_and_nothing_is_re_read(self):
+        c = self._start(["A"])
+        sid = self._subs()[0]["id"]
+        c.send_json(_print_msg(sid, 1, "A", "0.4000", "1.00"))
+        c.send_json({"type": "ok", "id": 99, "sid": sid, "seq": 2, "msg": {}})
+        c.send_json(_print_msg(sid, 4, "A", "0.4000", "1.00"))     # skips 3
+        self.assertTrue(_wait(lambda: self.feed.status()["gaps"] == 1))
+        self.assertTrue(_wait(lambda: self.feed.status()["trades"] == 2))
+        self.assertFalse(any(m.get("params", {}).get("action") == "get_snapshot"
+                             for m in self.k.cmds))
+
+    def test_market_set_changes_add_and_delete_on_trade_subscriptions(self):
+        self._start(["A"])
+        sid = self._subs()[0]["id"]
+        self.assertTrue(_wait(lambda: self.feed.status()["subs"] == 1))
+        self.feed.set_markets(["A", "B", "C"])             # chunk=2
+        self.assertTrue(_wait(lambda: any(
+            m.get("params", {}).get("action") == "add_markets" for m in self.k.cmds)))
+        add = [m for m in self.k.cmds
+               if m.get("params", {}).get("action") == "add_markets"][0]
+        self.assertEqual((add["params"]["sids"], add["params"]["market_tickers"]),
+                         ([sid], ["B"]))
+        self.assertTrue(_wait(lambda: len(self._subs()) == 2))
+        self.assertEqual((self._subs()[1]["params"]["channels"],
+                          self._subs()[1]["params"]["market_tickers"]), (["trade"], ["C"]))
+        self.feed.set_markets(["B", "C"])
+        self.assertTrue(_wait(lambda: any(
+            m.get("params", {}).get("action") == "delete_markets"
+            for m in self.k.cmds)))
+
+
 class TestRestShape(unittest.TestCase):
     def test_round_trip_against_rest_levels(self):
         ob = {"orderbook_fp": {"yes_dollars": [["0.48", "500"], ["0.49", "600"]],

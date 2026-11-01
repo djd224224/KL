@@ -28426,23 +28426,31 @@ class TestWSStart(unittest.TestCase):
         self.assertIsNone(bot._ws)
 
     def test_shadow_starts_a_signed_feed_for_our_fills(self):
-        made = {}
+        feeds = []
 
         class _Feed:
             def __init__(self, url, headers, **kw):
-                made.update(url=url, headers=headers, kw=kw)
+                self.made = dict(url=url, headers=headers, kw=kw, markets=None)
+                feeds.append(self.made)
+
+            def set_markets(self, tickers):
+                self.made["markets"] = set(tickers)
 
             def start(self):
-                made["started"] = True
+                self.made["started"] = True
 
         client = FakeClient()
         client.key_id = "kid"
         client.sign_pss_text = lambda text: "sig:" + text
         with mock.patch.object(imm, "WS_MODE", "shadow"), \
+                mock.patch.object(imm, "TAPE_TRIGGER", "dry"), \
                 mock.patch.object(_kw, "KalshiFeed", _Feed):
             bot = IncentiveMarketMaker(client=client, live=False)
+            bot._ws_managed_last = {"M1"}
+            bot._ws_cand_want = {"C1"}
             bot._ws_start()
         self.assertIsNotNone(bot._ws)
+        made, tape = feeds                       # the book feed, then the tape
         self.assertTrue(made["started"])
         h = made["headers"]()
         self.assertEqual(h["KALSHI-ACCESS-KEY"], "kid")
@@ -28451,6 +28459,63 @@ class TestWSStart(unittest.TestCase):
         self.assertTrue(made["kw"]["fill_filter"]({"client_order_id": "imm-run-x"}))
         self.assertFalse(made["kw"]["fill_filter"]({"client_order_id": "other"}))
         self.assertFalse(made["kw"]["want_order_groups"])
+        self.assertNotIn("channel", made["kw"])  # the books: the default channel
+        # the trade tape (TAPE_TRIGGER, 2026-11-01): its own connection on the
+        # same signed headers, the public trade channel, the book feed's markets
+        self.assertIsNotNone(bot._tape)
+        self.assertTrue(tape["started"])
+        self.assertIs(tape["headers"], made["headers"])
+        self.assertEqual((tape["kw"]["channel"], tape["kw"]["want_fills"],
+                          tape["kw"]["want_order_groups"], tape["markets"]),
+                         ("trade", False, False, {"M1", "C1"}))
+        # ...and it follows the book feed's market set
+        bot._ws_managed_last = {"M2"}
+        bot._tape_sync()
+        self.assertEqual(tape["markets"], {"M2", "C1"})
+
+    def test_tape_off_starts_only_the_book_feed(self):
+        feeds = []
+
+        class _Feed:
+            def __init__(self, url, headers, **kw):
+                feeds.append(kw)
+
+            def set_markets(self, tickers):
+                pass
+
+            def start(self):
+                pass
+
+        client = FakeClient()
+        client.sign_pss_text = lambda text: "sig"
+        with mock.patch.object(imm, "WS_MODE", "shadow"), \
+                mock.patch.object(imm, "TAPE_TRIGGER", "off"), \
+                mock.patch.object(_kw, "KalshiFeed", _Feed):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot._ws_start()
+        self.assertEqual((len(feeds), bot._tape), (1, None))
+
+    def test_a_tape_that_fails_to_start_leaves_the_book_feed_running(self):
+        class _Feed:
+            def __init__(self, url, headers, **kw):
+                if kw.get("channel") == "trade":
+                    raise RuntimeError("no socket")
+
+            def set_markets(self, tickers):
+                pass
+
+            def start(self):
+                pass
+
+        client = FakeClient()
+        client.sign_pss_text = lambda text: "sig"
+        with mock.patch.object(imm, "WS_MODE", "shadow"), \
+                mock.patch.object(imm, "TAPE_TRIGGER", "dry"), \
+                mock.patch.object(_kw, "KalshiFeed", _Feed):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot._ws_start()
+        self.assertIsNotNone(bot._ws)
+        self.assertIsNone(bot._tape)
 
     def test_a_feed_that_fails_to_start_leaves_the_bot_rest_only(self):
         class _Boom:
@@ -28467,12 +28532,13 @@ class TestWSStart(unittest.TestCase):
 
     def test_stop_is_idempotent(self):
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
-        feed = _FakeFeed()
-        bot._ws = feed
+        feed, tape = _FakeFeed(), _FakeFeed()
+        bot._ws, bot._tape = feed, tape
         bot._ws_stop()
         bot._ws_stop()
-        self.assertTrue(feed.stopped)
+        self.assertTrue(feed.stopped and tape.stopped)
         self.assertIsNone(bot._ws)
+        self.assertIsNone(bot._tape)
 
 
 class TestWSStatus(unittest.TestCase):
@@ -36509,6 +36575,280 @@ class TestGroupBreaker(unittest.TestCase):
             self._fill(0, self.A)
             self._fill(60, self.B)
         self.assertEqual((self._lines(), self.bot._grp["fills"]), ([], 0))
+
+
+class TestTapeTrigger(unittest.TestCase):
+    """The TAPE TRIGGER (TAPE_TRIGGER, Jack 2026-11-01: "build this", on
+    "React to other traders' prints"): a taker burst on the public tape in a
+    sibling of our markets trips the event before the sweeper reaches us --
+    dry logs the trip and our fills inside the would-be hold; on pulls the
+    event and holds it through the sweep breaker's hold."""
+    E = "KXEVT-26NOV05"
+    A, B, S = E + "-A", E + "-B", E + "-S"          # S: a sibling we don't quote
+    C = "KXOTHER-26NOV05-C"
+
+    def setUp(self):
+        _clean_persist()
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.tape = _FakeFeed()
+        self.bot._ws = self.feed
+        self.bot._tape = self.tape
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 600.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "off"), ("SWEEP_GROUP", "off"),
+                        ("TAPE_TRIGGER", "dry"), ("TAPE_MIN_CT", 25.0),
+                        ("TAPE_MIN_LEVELS", 2), ("TAPE_BIG_CT", 100.0),
+                        ("TAPE_BURST_GAP_SECS", 1.0), ("TAPE_LOG_MIN_CT", 10.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+        def o(oid, side, px, rem):
+            return {"order_id": oid, "side": side, "px": px, "rem": rem,
+                    "placed": self.now - 100.0, "pad": False}
+        self.bot._resting_view = {
+            self.A: [o("o1", "bid", 40.0, 20.0), o("o2", "ask", 45.0, 20.0)],
+            self.B: [o("o3", "bid", 30.0, 10.0)],
+            self.C: [o("o4", "bid", 50.0, 20.0)]}
+        self.bot._last_panel = {t: {"est_frac": 0.1, "pool_per_day": 20.0}
+                                for t in (self.A, self.B, self.C)}
+        self.n = 0
+
+    def _print(self, t, side, px, n, dt=0.0, tid=None, block=False):
+        """One public print: the taker bought `side` ("yes" / "no") for `n`
+        contracts at YES `px` cents, dt s after now."""
+        self.n += 1
+        self.tape.events = [("trade", {
+            "trade_id": tid or f"pt{self.n}", "market_ticker": t,
+            "yes_price_dollars": f"{px / 100:.4f}",
+            "no_price_dollars": f"{(100 - px) / 100:.4f}",
+            "count_fp": f"{n:.2f}", "taker_side": side,
+            "is_block_trade": block, "ts_ms": int((self.now + dt) * 1000)})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _fill(self, oid, n, ticker, dt=0.0, tid=None):
+        self.feed.events = [("fill", {
+            "order_id": oid, "market_ticker": ticker, "count_fp": f"{n:.2f}",
+            "is_taker": False, "ts_ms": int((self.now + dt) * 1000),
+            "trade_id": tid or "t-" + oid})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _lines(self, ev=None):
+        return [r for name, r in self.recs
+                if name == "ws_tape" and (ev is None or r["ev"] == ev)]
+
+    def test_a_sibling_sweep_trips_its_event_dry(self):
+        self._print(self.S, "no", 40, 15, 0.0)
+        self.assertEqual(self._lines("trip"), [])        # one price, 15
+        self._print(self.S, "no", 39, 15, 0.3)          # walks a level, 30
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["event"], trip["ticker"],
+                          trip["taker_side"], trip["hits"], trip["count"],
+                          trip["levels"], trip["px_first"], trip["px_last"],
+                          trip["hold_s"], trip["markets"], trip["event_day"]),
+                         ("dry", self.E, self.S, "no", "bid", 30.0, 2, 40.0,
+                          39.0, 600.0, 2, 4.0))
+        self.assertEqual(sorted(p[1] for p in trip["pull"]), ["o1", "o2", "o3"])
+        self.assertAlmostEqual(trip["lag_s"], 0.3, places=2)
+        self.assertEqual(self.cancelled, [])              # dry: nothing pulled
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 10))
+        self.assertEqual(self.bot._tape_st["trips"], 1)
+        # the burst goes on: still one trip, and one burst line once it is over
+        self._print(self.S, "no", 38, 10, 0.6)
+        self.assertEqual(len(self._lines("trip")), 1)
+        self.bot._ws_process_events(self.now + 4.0)
+        burst, = self._lines("burst")
+        self.assertEqual((burst["count"], burst["levels"], burst["px_lo"],
+                          burst["px_hi"], burst["prints"], burst["trip"]),
+                         (40.0, 3, 38.0, 40.0, 3, "dry"))
+
+    def test_our_fills_inside_the_window_are_held_fills(self):
+        self._print(self.S, "no", 40, 15, 0.0)
+        self._print(self.S, "no", 39, 15, 0.3)
+        self._fill("o1", 20, self.A, dt=3.3)                # 3s after the trip
+        self._fill("o4", 20, self.C, dt=4.0)                # another event
+        held, = self._lines("held_fill")
+        self.assertEqual((held["mode"], held["scope"], held["ticker"], held["order_id"],
+                          held["side"], held["px"], held["count"], held["trip_ticker"]),
+                         ("dry", "event", self.A, "o1", "bid", 40.0, 20.0, self.S))
+        self.assertAlmostEqual(held["since_trip_s"], 3.0, places=2)
+        self._fill("o3", 10, self.B, dt=601.0)              # the window is over
+        self.assertEqual(len(self._lines("held_fill")), 1)
+        self.assertEqual((self.bot._tape_st["held_fills"], self.bot._tape_st["held_ct"]),
+                         (1, 20.0))
+
+    def test_small_bursts_and_one_level_bursts_under_the_big_line_never_trip(self):
+        self._print(self.S, "no", 40, 10, 0.0)
+        self._print(self.S, "no", 39, 10, 0.2)             # 2 prices, only 20
+        self._print(self.B, "yes", 31, 60, 5.0)            # 60 at one price
+        self.assertEqual(self._lines("trip"), [])
+        self._print(self.B, "yes", 31, 45, 5.5)            # 105 at one price
+        trip, = self._lines("trip")
+        self.assertEqual((trip["ticker"], trip["hits"], trip["count"], trip["levels"]),
+                         (self.B, "ask", 105.0, 1))
+
+    def test_a_gap_starts_a_new_burst(self):
+        self._print(self.S, "no", 40, 15, 0.0)
+        self._print(self.S, "no", 39, 15, 1.5)             # 1.5s later: apart
+        self.assertEqual(self._lines("trip"), [])
+        self.bot._ws_process_events(self.now + 5.0)
+        self.assertEqual([b["count"] for b in self._lines("burst")], [15.0, 15.0])
+        self.assertEqual(self.bot._tape_st["bursts"], 2)
+
+    def test_prints_where_we_rest_nothing_and_block_trades_are_ignored(self):
+        self._print("KXZZZ-26NOV05-A", "no", 40, 50, 0.0)
+        self._print("KXZZZ-26NOV05-A", "no", 39, 50, 0.1)
+        self._print(self.S, "no", 40, 200, 1.0, block=True)
+        st = self.bot._tape_st
+        self.assertEqual((self._lines(), st["trades"], st["relevant"], st["blocks"]),
+                         ([], 3, 0, 1))
+
+    def test_on_pulls_the_event_and_holds_it_like_a_sweep(self):
+        with mock.patch.object(imm, "TAPE_TRIGGER", "on"):
+            self._print(self.S, "yes", 60, 20, 0.0)
+            self._print(self.S, "yes", 61, 20, 0.2)
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 10))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 601))
+            self.assertFalse(self.bot.sweep_held("KXOTHER-26NOV05", self.now + 10))
+            self.assertEqual(self._lines("trip")[0]["mode"], "on")
+            # the hold is the sweep breaker's: it survives a restart with it
+            self.assertIn(self.E, self.bot._guard_holds_payload()["sweep_hold"])
+            # a second burst finds nothing of ours left there: no trip
+            self._print(self.B, "no", 30, 30, 5.0)
+            self._print(self.B, "no", 29, 30, 5.1)
+            self.assertEqual([t["mode"] for t in self._lines("trip")], ["on"])
+        self.assertEqual(sorted(self.cancelled), [("o1", "tape_trigger"),
+                                                  ("o2", "tape_trigger"),
+                                                  ("o3", "tape_trigger")])
+        st = self.bot._tape_st
+        self.assertEqual((st["trips"], st["trips_live"], st["cancels"]), (1, 1, 3))
+
+    def test_an_event_already_held_only_logs(self):
+        self.bot._sweep_hold[self.E] = self.now + 300.0     # a sweep trip's hold
+        with mock.patch.object(imm, "TAPE_TRIGGER", "on"):
+            self._print(self.S, "yes", 60, 20, 0.0)
+            self._print(self.S, "yes", 61, 20, 0.2)
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], self.cancelled, self.bot._tape_st["held"]),
+                         ("held", [], 1))
+        self.assertNotIn(self.E, self.bot._tape_win)        # no window to score
+        self.assertAlmostEqual(self.bot._sweep_hold[self.E], self.now + 300.0)
+
+    def test_on_respects_the_fast_cancel_budget(self):
+        with mock.patch.object(imm, "TAPE_TRIGGER", "on"), \
+                mock.patch.object(imm, "WS_FAST_MAX_CANCELS_PER_MIN", 1):
+            self._print(self.S, "yes", 60, 20, 0.0)
+            self._print(self.S, "yes", 61, 20, 0.2)
+        self.assertEqual((len(self.cancelled), self.bot._tape_st["skipped_budget"]),
+                         (1, 2))
+
+    def test_on_runs_dry_unless_the_sweep_breaker_is_on(self):
+        with mock.patch.object(imm, "TAPE_TRIGGER", "on"), \
+                mock.patch.object(imm, "SWEEP_BREAKER", "dry"):
+            self._print(self.S, "yes", 60, 20, 0.0)
+            self._print(self.S, "yes", 61, 20, 0.2)
+        self.assertEqual((self._lines("trip")[0]["mode"], self.cancelled), ("dry", []))
+
+    def test_a_trip_inside_an_open_window_only_logs(self):
+        self._print(self.S, "no", 40, 15, 0.0)
+        self._print(self.S, "no", 39, 15, 0.3)
+        self._print(self.B, "yes", 31, 60, 30.0)
+        self._print(self.B, "yes", 32, 60, 30.2)
+        self.assertEqual([t["mode"] for t in self._lines("trip")], ["dry", "inside"])
+        self.assertAlmostEqual(self.bot._tape_win[self.E]["at"], self.now + 0.3, places=2)
+
+    def test_mention_series_are_logged_exempt_and_never_pulled(self):
+        m = "KXTRUMPMENTION-26NOV05"
+        self.bot._resting_view[m + "-WORD"] = [
+            {"order_id": "o9", "side": "ask", "px": 30.0, "rem": 50.0,
+             "placed": self.now - 100.0, "pad": False}]
+        with mock.patch.object(imm, "TAPE_TRIGGER", "on"):
+            self._print(m + "-OTHER", "yes", 30, 20, 0.0)
+            self._print(m + "-OTHER", "yes", 31, 20, 0.1)
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], [p[1] for p in trip["pull"]]), ("exempt", ["o9"]))
+        self.assertEqual(self.cancelled, [])
+        self.assertFalse(self.bot.sweep_held(m, self.now + 10))
+
+    def test_a_burst_that_took_part_of_our_order_counts_our_share(self):
+        # a PARTIAL fill of ours never trips the sweep breaker; the tape does
+        self._fill("o1", 10, self.A, dt=0.0, tid="X1")          # ours first
+        self._print(self.A, "no", 40, 10, 0.0, tid="X1")        # the same print
+        self._print(self.A, "no", 39, 20, 0.1)
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["count"], trip["own_ct"]),
+                         ("dry", 30.0, 10.0))
+        self.assertEqual([n for n, _r in self.recs if n == "ws_sweep"], [])
+
+    def test_a_trip_opens_a_group_window_for_the_groups_other_events(self):
+        grp = {self.A: "G", self.B: "G", self.S: "G", self.C: "G"}
+        with mock.patch.object(imm, "risk_group_of", lambda t: grp.get(t)):
+            self._print(self.S, "no", 40, 15, 0.0)
+            self._print(self.S, "no", 39, 15, 0.3)
+            self._fill("o4", 20, self.C, dt=60.0)               # the group's other event
+            self._fill("o1", 20, self.A, dt=61.0)               # the trip's own event
+        trip, = self._lines("trip")
+        self.assertEqual((trip["group"], trip["group_orders"]), ("G", 1))
+        self.assertEqual(sorted((h["scope"], h["ticker"]) for h in self._lines("held_fill")),
+                         [("event", self.A), ("group", self.C)])
+        self.assertEqual(self.bot._tape_st["held_fills_group"], 1)
+
+    def test_orders_only_in_the_group_log_a_group_only_trip(self):
+        d = "KXOTHER3-26NOV05-D"                   # an event we rest nothing in
+        grp = {self.C: "G", d: "G"}
+        with mock.patch.object(imm, "risk_group_of", lambda t: grp.get(t)), \
+                mock.patch.object(imm, "TAPE_TRIGGER", "on"):
+            self._print("KXOTHER2-26NOV05-D", "no", 40, 50, 0.0)  # in no group: ignored
+            self._print("KXOTHER2-26NOV05-D", "no", 39, 50, 0.1)
+            self._print(d, "no", 40, 15, 1.0)
+            self._print(d, "no", 39, 15, 1.1)
+            self._fill("o4", 5, self.C, dt=30.0)    # inside the group window
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["pull"], trip["group_orders"]),
+                         ("group_only", [], 1))
+        self.assertEqual(self.cancelled, [])        # on, but nothing in its event
+        held, = self._lines("held_fill")
+        self.assertEqual((held["scope"], held["ticker"], held["trip_event"]),
+                         ("group", self.C, "KXOTHER3-26NOV05"))
+
+    def test_a_linked_twin_trips_the_whole_link(self):
+        a, w = "KXTRUMPAPPROVE-26NOV02-B38.5", "KXAPRPOTUS-26NOV06-T40"
+        self.bot._resting_view[a] = [
+            {"order_id": "o7", "side": "bid", "px": 20.0, "rem": 60.0,
+             "placed": self.now - 100.0, "pad": False}]
+        with mock.patch.object(imm, "TAPE_TRIGGER", "on"):
+            self._print(w, "no", 50, 20, 0.0)                   # the weekly twin
+            self._print(w, "no", 49, 20, 0.1)
+            trip, = self._lines("trip")
+            self.assertEqual((trip["linked"], [p[1] for p in trip["pull"]]),
+                             (["KXAPRPOTUS", "KXTRUMPAPPROVE"], ["o7"]))
+            self.assertTrue(self.bot.sweep_held("KXTRUMPAPPROVE-26NOV02", self.now + 60))
+        self.assertEqual(self.cancelled, [("o7", "tape_trigger")])
+
+    def test_the_status_file_carries_the_tape_block(self):
+        self._print(self.S, "no", 40, 15, 0.0)
+        self._print(self.S, "no", 39, 15, 0.3)
+        self.bot.write_status(datetime.now(timezone.utc))
+        with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
+                  encoding="utf-8") as f:
+            tape = json.load(f)["latency"]["tape"]
+        self.assertEqual((tape["mode"], tape["trips"], tape["windows_now"], tape["feed"]),
+                         ("dry", 1, 1, {"healthy": True, "books_ok": 0}))
+
+    def test_off_never_starts_the_tape(self):
+        self.bot._tape = None
+        with mock.patch.object(imm, "TAPE_TRIGGER", "off"):
+            self.bot._tape_start(lambda: {})
+        self.assertIsNone(self.bot._tape)
 
 
 class TestRiskLimits(unittest.TestCase):

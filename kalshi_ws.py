@@ -37,6 +37,17 @@ answering an update_subscription on that sid takes a seq in the SAME
 sequence (live: 34 deltas + 8 snapshots + 2 oks on sid 1, zero gaps only
 when the oks are counted). `subscribed` carries no seq; the first snapshot
 is seq 1. A get_snapshot request is answered by the snapshot alone (no ok).
+
+The PUBLIC TRADE TAPE (2026-11-01, the bot's TAPE_TRIGGER): a feed built
+with channel="trade" subscribes Kalshi's `trade` channel for its market set
+-- the same chunked subscribe / add_markets / delete_markets bookkeeping --
+keeps no books, and surfaces each print as a ("trade", msg) event. A print
+(docs.kalshi.com/websockets/public-trades) carries trade_id, market_ticker,
+yes_price_dollars / no_price_dollars ("0.3600"), count_fp ("136.00"),
+taker_side ("yes" = the taker bought YES), is_block_trade and ts_ms. A seq
+gap on a trade subscription is only counted: a missed print cannot be
+fetched back over the socket. The bot runs it on its OWN connection, so
+nothing on it can touch the books.
 """
 
 from __future__ import annotations
@@ -361,6 +372,8 @@ class _Book:
 class KalshiFeed(threading.Thread):
     """Maintains order books for a caller-chosen market set, and surfaces our
     fills and order-group events, over one Kalshi WebSocket connection.
+    With channel="trade" it keeps no books and surfaces the market set's
+    public prints instead (the trade tape, see the module docstring).
 
     Thread contract: the main thread calls `set_markets`, `book_fp`,
     `book_levels`, `ready`, `drain`, `healthy`, `status`, `stop`; everything else
@@ -379,8 +392,14 @@ class KalshiFeed(threading.Thread):
                  backoff_max: float = 60.0,
                  retry_secs: float = 60.0,
                  ssl_context: Optional[ssl.SSLContext] = None,
-                 connect_factory: Optional[Callable[[], WSConnection]] = None):
-        super().__init__(daemon=True, name="kalshi-ws")
+                 connect_factory: Optional[Callable[[], WSConnection]] = None,
+                 channel: str = "orderbook_delta"):
+        super().__init__(daemon=True, name="kalshi-ws" if channel == "orderbook_delta"
+                         else f"kalshi-ws-{channel}")
+        # the per-market channel the market set subscribes: "orderbook_delta"
+        # (books) or "trade" (the public tape: no books, ("trade", msg) events)
+        self.channel = channel
+        self._books_on = channel == "orderbook_delta"
         self.url = url
         self.auth_headers = auth_headers
         self.log = log
@@ -422,7 +441,7 @@ class KalshiFeed(threading.Thread):
         self.stats = {"connects": 0, "disconnects": 0, "msgs": 0,
                       "snapshots": 0, "deltas": 0, "gaps": 0, "fills": 0,
                       "og_events": 0, "errors": 0, "last_error": "",
-                      "resnapshots": 0, "resyncs": 0}
+                      "resnapshots": 0, "resyncs": 0, "trades": 0}
 
     # ---- main-thread API ----------------------------------------------------
 
@@ -470,7 +489,7 @@ class KalshiFeed(threading.Thread):
 
     def drain(self) -> Tuple[Set[str], List[Tuple[str, dict]], int]:
         """(tickers whose book changed, [(kind, msg)], dropped-event count)
-        since the last drain. kind is 'fill' or 'order_group'."""
+        since the last drain. kind is 'fill', 'order_group' or 'trade'."""
         with self._lock:
             dirty, self._dirty = self._dirty, set()
             ev = list(self._events)
@@ -483,7 +502,7 @@ class KalshiFeed(threading.Thread):
         with self._lock:
             out = dict(self.stats)
             out.update(connected=self._connected, healthy=self.healthy(),
-                       want=len(self._want),
+                       channel=self.channel, want=len(self._want),
                        books_ok=sum(1 for b in self._books.values() if b.ok),
                        subs=len(self._subs), sub_chunk=self._sub_chunk)
         return out
@@ -628,9 +647,10 @@ class KalshiFeed(threading.Thread):
             conn.send_json(obj)
 
     def _apply_market_set(self) -> None:
-        """Bring the orderbook_delta subscriptions in line with the wanted
-        market set: delete_markets for markets no longer wanted, add_markets
-        into subscriptions with room, new subscriptions for the rest."""
+        """Bring the channel's subscriptions (orderbook_delta, or trade for
+        the tape) in line with the wanted market set: delete_markets for
+        markets no longer wanted, add_markets into subscriptions with room,
+        new subscriptions for the rest."""
         with self._lock:
             if self._applied_ver == self._want_ver \
                     or time.monotonic() < self._apply_after:
@@ -669,10 +689,11 @@ class KalshiFeed(threading.Thread):
                 part = add[i:i + self._sub_chunk]
                 i += len(part)
                 self._queue_cmd("subscribe",
-                                {"channels": ["orderbook_delta"],
+                                {"channels": [self.channel],
                                  "market_tickers": part}, "subscribe", part)
-            for t in add:
-                self._books.setdefault(t, _Book())
+            if self._books_on:
+                for t in add:
+                    self._books.setdefault(t, _Book())
             self._applied_ver = self._want_ver
 
     # ---- message handling (feed thread) -------------------------------------
@@ -685,6 +706,8 @@ class KalshiFeed(threading.Thread):
                 self._on_book(msg, typ == "orderbook_snapshot")
             elif typ == "fill":
                 self._on_fill(msg)
+            elif typ == "trade":
+                self._on_trade(msg)
             elif typ == "order_group_updates":
                 self._seq_check(msg)
                 self.stats["og_events"] += 1
@@ -694,7 +717,9 @@ class KalshiFeed(threading.Thread):
             elif typ == "ok":
                 self._pending.pop(msg.get("id"), None)
                 # an ok on a book subscription takes a seq in its sequence
-                if not self._seq_check(msg) and msg.get("sid") is not None \
+                # (a trade subscription's too: checked, but nothing to re-read)
+                if not self._seq_check(msg) and self._books_on \
+                        and msg.get("sid") is not None \
                         and int(msg["sid"]) in self._subs:
                     self._resnapshot(int(msg["sid"]))
             elif typ == "error":
@@ -713,7 +738,7 @@ class KalshiFeed(threading.Thread):
         body = msg.get("msg") or {}
         kind, mk = self._pending.pop(msg.get("id"), ("", []))
         sid = body.get("sid")
-        if body.get("channel") == "orderbook_delta" and sid is not None:
+        if body.get("channel") == self.channel and sid is not None:
             s = self._subs.setdefault(int(sid), set())
             for t in mk:
                 if t in self._want:
@@ -825,3 +850,14 @@ class KalshiFeed(threading.Thread):
                 return
         self.stats["fills"] += 1
         self._push_event("fill", body)
+
+    def _on_trade(self, msg: dict) -> None:
+        # caller holds the lock. A gap is counted, nothing more: a missed
+        # print cannot be fetched back over the socket.
+        self._seq_check(msg)
+        body = msg.get("msg") or {}
+        t = body.get("market_ticker")
+        if not t or t not in self._want:
+            return          # a market we no longer (or never) wanted
+        self.stats["trades"] += 1
+        self._push_event("trade", body)
