@@ -24,12 +24,12 @@ class ScanGraduateTests(unittest.TestCase):
     def test_graduates_are_allowed_and_not_blocked(self):
         # the 83 of 10/03, and KXSOFTWAREUNEMP (Jack 2026-10-25: "Enroll this too")
         self.assertEqual(len(imm.SCAN_GRADUATE_SERIES), 84)
-        # ...less Netflix TV and Oregon timber, cut BY NAME on 2026-11-01
-        # (Jack: "Just the clear two", then "Oregon only"): the blocklist beats
-        # their graduate entries, which stay so an un-block is one line
-        cut = set(imm._CUT_LOSERS_1101_SERIES) | set(imm._CUT_SWEPT_1101_SERIES)
-        self.assertEqual(sorted(imm.SCAN_GRADUATE_SERIES & cut),
-                         ["KXNETFLIXTOPVIEWSTV", "KXORBOFHARVEST"])
+        # ...less Netflix TV, cut BY NAME on 2026-11-01 (Jack: "Just the clear
+        # two"): the blocklist beats its graduate entry, which stays so an
+        # un-block is one line. (Oregon timber is sell-back only, not cut:
+        # incentive_mm.SELL_BACK_ONLY_SERIES.)
+        cut = set(imm._CUT_LOSERS_1101_SERIES)
+        self.assertEqual(sorted(imm.SCAN_GRADUATE_SERIES & cut), ["KXNETFLIXTOPVIEWSTV"])
         for s in sorted(imm.SCAN_GRADUATE_SERIES - cut):
             self.assertTrue(M._allowed(f"{s}-X"), s)
             self.assertFalse(M._blocked(f"{s}-X"), s)

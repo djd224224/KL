@@ -2272,16 +2272,18 @@ class TestBlocklist(unittest.TestCase):
         for t in ("KXNETFLIXTOPVIEWSMOVIE-26NOV02-9", "KXLOLREGION-WORLDS26-LCK"):
             self.assertFalse(b(t), t)
 
-    def test_oregon_timber_cut_alone(self):
-        # Jack 2026-11-01 "Oregon only": KXORBOFHARVEST is frozen by NAME
-        # after the 11/01 sweep; the other seven small books keep quoting at
-        # x2 (the overnight x3 stays), and the graduate and x2 entries stay
-        # so an un-block is one line
+    def test_oregon_timber_sells_back_only(self):
+        # Jack 2026-11-01 "Oregon only", then "continue the sellback offers
+        # when they're earning rewards": KXORBOFHARVEST is NOT blocked (a
+        # block cancels the sell-back offers) but sell-back only; the other
+        # seven small books quote normally at x2 (the overnight x3 stays)
         b = IncentiveMarketMaker._blocked
+        self.assertEqual(imm.SELL_BACK_ONLY_SERIES, frozenset({"KXORBOFHARVEST"}))
         for t in ("KXORBOFHARVEST-27NOV30-T180", "KXORBOFHARVEST-27NOV30-T240"):
-            self.assertTrue(b(t), t)
-            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
-        self.assertTrue(imm.series_blocklisted("KXORBOFHARVEST"))
+            self.assertFalse(b(t), t)
+            self.assertTrue(IncentiveMarketMaker._allowed(t), t)
+        self.assertFalse(imm.series_blocklisted("KXORBOFHARVEST"))
+        self.assertTrue(imm.sell_back_only("KXORBOFHARVEST"))
         self.assertIn("KXORBOFHARVEST", imm.SCAN_GRADUATE_SERIES)
         self.assertIn("KXORBOFHARVEST", imm.SMALL_BOOKS_X2_SERIES)
         for s in imm.SMALL_BOOKS_X2_SERIES:
@@ -2289,7 +2291,7 @@ class TestBlocklist(unittest.TestCase):
                 continue
             self.assertFalse(b(f"{s}-27JUN30-T1"), s)
             self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-27JUN30-T1"), s)
-            self.assertFalse(imm.series_blocklisted(s), s)
+            self.assertFalse(imm.sell_back_only(s), s)
 
     def test_series_blocklisted_sees_exact_series_cuts(self):
         # the enrollment paths check bare SERIES names: an exact-series cut
@@ -4309,6 +4311,33 @@ class TestDryRunCycle(unittest.TestCase):
         self.assertTrue(orders)
         self.assertTrue(all(o["book_side"] == "ask" for o in orders))
         self.assertLessEqual(sum(o["remaining_count"] for o in orders), 10)
+
+    def test_sell_back_only_offers_what_we_hold(self):
+        """SELL_BACK_ONLY_SERIES (Jack 2026-11-01 on Oregon timber: "continue
+        the sellback offers when they're earning rewards"): a selected market
+        we hold quotes the reducing side only, never past flat."""
+        self.enterContext(mock.patch.object(imm, "SELL_BACK_ONLY_SERIES",
+                                            frozenset({"KXGOOD"})))
+        bot = self._bot()
+        t = "KXGOOD-99DEC31-A"
+        bot.client.positions[t] = 10
+        bot.pnl.pos[t] = 10                          # our inventory, not manual
+        bot.run_cycle()
+        self.assertIn(t, bot.state.selected)         # its program pays: selected
+        orders = list(bot.state.sim_orders.values())
+        self.assertTrue(orders)
+        self.assertTrue(all(o["book_side"] == "ask" for o in orders))
+        self.assertLessEqual(sum(o["remaining_count"] for o in orders), 10)
+
+    def test_sell_back_only_flat_market_is_no_candidate(self):
+        """...and a flat market of the series is never selected, so it holds
+        no orders and leaves its event's slots to the strikes we hold."""
+        self.enterContext(mock.patch.object(imm, "SELL_BACK_ONLY_SERIES",
+                                            frozenset({"KXGOOD"})))
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertNotIn("KXGOOD-99DEC31-A", bot.state.selected)
+        self.assertEqual(bot.state.sim_orders, {})
 
     def test_dropped_market_carries_no_orders(self):
         """DEFAULT since 2026-09-07 (Jack: "fine for market to get dropped,

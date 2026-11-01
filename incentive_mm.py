@@ -5125,19 +5125,34 @@ _CUT_OR_SHARE_SERIES = tuple(s for s in _DEFAULT_OR_SHARE_SERIES.split(",") if s
 # an un-block is one line. Exact series (the dash). Standard semantics:
 # open positions ride to settlement. Un-block by removing this entry.
 _CUT_LOSERS_1101_SERIES = ("KXNETFLIXTOPVIEWSTV", "KXLOLTEEMO")
-# OREGON TIMBER OFF (Jack 2026-11-01: "Oregon only", choosing between blocking
-# KXORBOFHARVEST alone and also dropping the overnight x3 on the other seven
-# SMALL_BOOKS_X2_SERIES). At 05:48:12Z 11/01 one seller swept four strikes of
-# KXORBOFHARVEST-27NOV30 (Oregon state-forest timber harvest, FY2027) in the
-# same second, ~11,400 contracts. Our overnight touch bids, 270 each on
-# T180/T200/T220, filled: 810 contracts for $451, and the price never came
-# back (-$154 at mids). Its programs paid $71 in all (~$2/day), no model prices
-# it, and the event settles 2027-11-30. The sweep breaker and toxic halt fire
-# after a same-second sweep. The scan-graduate and small-books x2 entries are
-# kept so an un-block is one line. Exact series (the dash). Standard semantics:
-# the three sell-back asks are cancelled and the 755 contracts ride to
-# settlement. Un-block by removing this entry.
-_CUT_SWEPT_1101_SERIES = ("KXORBOFHARVEST",)
+# OREGON TIMBER: SELL BACK ONLY (Jack 2026-11-01: "Oregon only", choosing
+# between stopping KXORBOFHARVEST alone and also dropping the overnight x3 on
+# the other seven SMALL_BOOKS_X2_SERIES; then, after 320cc3b blocked it, "continue
+# the sellback offers when they're earning rewards"). At 05:48:12Z 11/01 one
+# seller swept four strikes of KXORBOFHARVEST-27NOV30 (Oregon state-forest
+# timber harvest, FY2027) in the same second, ~11,400 contracts. Our overnight
+# touch bids, 270 each on T180/T200/T220, filled: 810 contracts for $451, and
+# the price never came back (-$154 at mids). Its programs paid $71 in all
+# (~$2/day), no model prices it, and the event settles 2027-11-30.
+# A series here never buys more: every market of it quotes REDUCE-ONLY (only
+# the side that shrinks our own position, never past flat), and a flat market
+# of it is no candidate at all, so the event's three graduate slots go to the
+# strikes we hold. It quotes only while selected -- a live program that clears
+# the payout bar -- so the sell-back offers rest while they earn rewards and
+# stop when the program does (WINDDOWN_DROPPED is off: no tail outside it).
+# The graduate and small-books x2 entries stay, so its sizes are the normal
+# ladder's, capped at the position. IMM_SELL_BACK_ONLY_SERIES replaces the list
+# ("" = none).
+SELL_BACK_ONLY_SERIES = frozenset(
+    s.strip() for s in os.environ.get("IMM_SELL_BACK_ONLY_SERIES",
+                                      "KXORBOFHARVEST").split(",") if s.strip())
+
+
+def sell_back_only(series: str) -> bool:
+    """Quote only to reduce our own position (SELL_BACK_ONLY_SERIES)."""
+    return series in SELL_BACK_ONLY_SERIES
+
+
 SERIES_BLOCKLIST_PREFIXES = tuple(
     [f"KX{a}MAXMON" for a in _CRYPTO_ASSETS] + [f"KX{a}MINMON" for a in _CRYPTO_ASSETS]
     # ANNUAL crypto = crypto_annual_mm.py's book as of 2026-08-13 (same
@@ -5184,8 +5199,6 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
     # Netflix top-10 TV + LoL Worlds Teemo (2026-11-01, above)
     + [f"{_s}-" for _s in _CUT_LOSERS_1101_SERIES]
-    # Oregon timber harvest, swept 11/01 (2026-11-01, above)
-    + [f"{_s}-" for _s in _CUT_SWEPT_1101_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
@@ -28646,7 +28659,11 @@ class IncentiveMarketMaker:
         candidates = sorted(
             ((t, info) for t, info in by_market.items()
              if self._allowed(t) and info["dollars_per_day"] > 0
-             and not ticker_cutoff_passed(t)),
+             and not ticker_cutoff_passed(t)
+             # a sell-back-only series offers only what we hold
+             # (SELL_BACK_ONLY_SERIES): a flat market of it is no candidate
+             and not (sell_back_only(series_of(t))
+                      and abs(self.pnl.pos.get(t, 0.0)) < REDUCE_ONLY_MIN_CONTRACTS)),
             key=lambda kv: -kv[1]["dollars_per_day"])[:MAX_CANDIDATE_BOOKS]
 
         # New family members (prefix/suffix-admitted) clone their archetype
@@ -33170,6 +33187,8 @@ class IncentiveMarketMaker:
                 if (meta.cutoff - now_utc).total_seconds() \
                         < series_pre_cutoff_reduce_only_secs(meta.series):
                     reduce_only = True
+            if sell_back_only(meta.series):
+                reduce_only = True           # SELL_BACK_ONLY_SERIES: never buys more
             # AAA PRINT BLACKOUT: a recurring scheduled release reprices this
             # book, so stand fully aside across it and resume after. Unlike
             # the cutoff this does NOT deselect — the market is still ours,
