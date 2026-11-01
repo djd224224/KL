@@ -14621,6 +14621,145 @@ class TestRtSettledStrikes(unittest.TestCase):
             self.assertEqual(self._quotes(bot), [])
 
 
+class TestRtFloorBoost(unittest.TestCase):
+    """Jack 2026-11-01: "add a rule that RT multiplier can go up to 2.5x to
+    get these markets above payout floor". RT FLOOR BOOST: a KXRT market
+    short of the bar at its own size rests the smallest of x1.5 / x2 / x2.5
+    that clears it. Fixture KXRT-ZZB-50 (49x51, 30 days out): its plain
+    projection is read off a first run, and the bar is set against it."""
+
+    T = "KXRT-ZZB-50"
+    EV = "KXRT-ZZB"
+
+    def setUp(self):
+        _clean_persist()
+        imm._rt_fair_state.update(mtime=0.0, markets={}, films={}, strikes={})
+        try:
+            os.remove(imm.RT_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "ADMIT_SUSTAIN_SECS", 0),
+                  mock.patch.object(imm, "LEVELS", [(0, 20)])):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _bot(self):
+        """A fresh bot (no state from an earlier one: a member is judged on
+        the exit bar, not the entry bar)."""
+        _clean_persist()
+        client = FakeClient()
+        close = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": close, "yes_bid_dollars": "0.4900",
+            "yes_ask_dollars": "0.5100", "volume_fp": "500.00"}
+        lv = [["0.45", "400"], ["0.46", "400"], ["0.47", "400"],
+              ["0.48", "400"], ["0.49", "300"]]
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": lv, "no_dollars": lv}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _sizes(self, bot):
+        return sorted(int(o["remaining_count"]) for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T and 1 < o["yes_price"] < 99)
+
+    def _plain(self):
+        """The plain projection and resting sizes, the bar out of the way."""
+        bot = self._bot()
+        with mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 0.0):
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot._rt_floor_boost, {})
+        return bot._est_peak[self.T][0], self._sizes(bot)
+
+    def test_the_steps(self):
+        f = imm.rt_floor_boost_mult
+        self.assertEqual(imm.RT_FLOOR_BOOST_MAX, 2.5)
+        self.assertIn("RT_FLOOR_BOOST_MAX", imm._CONFIG_CODE_KNOBS)
+        self.assertEqual(f(0.0, 0.9, 1.3), 1.5)          # 1.35
+        self.assertEqual(f(0.0, 0.7, 1.3), 2.0)          # 1.05, 1.40
+        self.assertEqual(f(0.0, 0.6, 1.3), 2.5)          # 1.20, 1.50
+        self.assertIsNone(f(0.0, 0.5, 1.3))              # 1.25 even at x2.5
+        self.assertEqual(f(0.4, 0.4, 1.0), 1.5)          # the period's banked counts
+        self.assertIsNone(f(0.0, 0.0, 1.3))
+        with mock.patch.object(imm, "RT_FLOOR_BOOST_MAX", 3.0):
+            self.assertEqual(f(0.0, 0.45, 1.3), 3.0)
+        with mock.patch.object(imm, "RT_FLOOR_BOOST_MAX", 1.0):
+            self.assertIsNone(f(0.0, 0.9, 1.3))
+            self.assertFalse(imm.rt_floor_boost_series("KXRT"))
+        self.assertTrue(imm.rt_floor_boost_series("KXRT"))
+        for s in ("KXRTTV", "KXGOOD"):
+            self.assertFalse(imm.rt_floor_boost_series(s), s)
+
+    def test_a_market_under_the_bar_rests_the_step_that_clears_it(self):
+        P, plain = self._plain()
+        self.assertTrue(plain)
+        # the bar at 2.2x its own projection: x2 falls short, x2.5 clears
+        bot = self._bot()
+        lines = []
+        with mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 2.2 * P), \
+                mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot._rt_floor_boost, {self.T: 2.5})
+        self.assertEqual(self._sizes(bot), sorted(int(c * 2.5 + 0.5) for c in plain))
+        self.assertTrue(any(f"rt floor boost: {self.T} projects" in x and "x2.5 size" in x
+                            for x in lines), lines)
+        # at 1.8x, x2 is enough
+        bot = self._bot()
+        with mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 1.8 * P):
+            bot.run_cycle()
+        self.assertEqual(bot._rt_floor_boost, {self.T: 2.0})
+        self.assertEqual(self._sizes(bot), sorted(int(c * 2.0 + 0.5) for c in plain))
+
+    def test_out_of_reach_or_off_it_stays_out(self):
+        P, _plain = self._plain()
+        bot = self._bot()
+        with mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 3.0 * P):
+            bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot._rt_floor_boost, {})
+        bot = self._bot()
+        with mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 2.2 * P), \
+                mock.patch.object(imm, "RT_FLOOR_BOOST_MAX", 1.0):
+            bot.run_cycle()
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot._rt_floor_boost, {})
+
+    def test_the_larger_mode_and_where_it_ends(self):
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        other = "KXRT-ZZB-60"
+        bot._rt_floor_boost = {self.T: 2.5, other: 2.0}
+        bot._near_cliff_boost[self.T] = time.time()     # x1.5: the larger mode wins
+        with mock.patch.object(imm, "ca_landing_window", return_value=False):
+            self.assertEqual(bot._market_size_mult(self.T), 2.5)
+        bot._near_cliff_boost.clear()
+        bot.state.selected = {self.T: None, other: None}
+        bot.state.accrued_est[self.T] = 1.12              # past the $1.10 line
+        bot.state.accrued_est[other] = 0.50
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot._prune_near_cliff_boost()
+        self.assertEqual(bot._rt_floor_boost, {other: 2.0})
+        self.assertTrue(any(f"rt floor boost: {self.T} banked $1.12, past the $1.10 line" in x
+                            for x in lines), lines)
+        del bot.state.selected[other]                     # off the selection
+        bot._prune_near_cliff_boost()
+        self.assertEqual(bot._rt_floor_boost, {})
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for

@@ -11778,6 +11778,7 @@ _CONFIG_CODE_KNOBS = (
     # RT settled strikes (2026-11-01)
     "RT_SETTLED_MODE", "RT_SETTLED_MIN_REVIEWS", "RT_SETTLED_P", "RT_SETTLED_MIN_GAP",
     "RT_SETTLED_MID", "RT_SETTLED_BAND_LO", "RT_SETTLED_BAND_HI", "RT_SETTLED_STOP_H",
+    "RT_FLOOR_BOOST_MAX",         # RT up to x2.5 to clear the payout floor (2026-11-01)
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
@@ -14875,6 +14876,42 @@ def rt_release_week(meta, now_ts: float) -> bool:
     return (KXRT_CUTOFF_BEFORE_CLOSE_DAYS > 0 and meta.close_time is not None
             and now_ts >= meta.close_time.timestamp()
             - KXRT_CUTOFF_BEFORE_CLOSE_DAYS * 86400.0)
+
+
+# RT FLOOR BOOST (Jack 2026-11-01: "add a rule that RT multiplier can go up
+# to 2.5x to get these markets above payout floor"). A KXRT market whose
+# projection at its own size falls short of the payout bar -- the crowded
+# books: 81 of 217 RT markets sat under the floor at 16:08Z 11/01, and every
+# settled strike (RT SETTLED STRIKES) at 18:17Z -- rests its ladder at the
+# smallest of x1.5, x2 ... RT_FLOOR_BOOST_MAX that clears the bar, on top of
+# the family's own size. The projection is taken as linear in size, as it
+# is where our orders are a sliver of the scored walk (I Play Rocky 72:
+# 50 / 150 / 300 a side read $0.34 / $1.01 / $2.00 a day on the 11/01 book).
+# It is the near-cliff size mode's machinery (_market_size_mult, so every
+# reader of the shape sees it; the larger of the two where both arm),
+# sticky until the period's banked accrual reaches the secure line
+# (NEAR_CLIFF_SECURE_DOLLARS) or the market leaves the selection. Caps are
+# not scaled. A market no step lifts stays out. IMM_RT_FLOOR_BOOST_MAX <= 1
+# turns it off.
+RT_FLOOR_BOOST_MAX = _env_float("IMM_RT_FLOOR_BOOST_MAX", 2.5)
+
+
+def rt_floor_boost_series(series: str) -> bool:
+    return RT_FLOOR_BOOST_MAX > 1.0 and rt_fair_series(series)
+
+
+def rt_floor_boost_mult(accrued: float, plain: float, bar: float) -> Optional[float]:
+    """The smallest step -- x1.5, x2 ... RT_FLOOR_BOOST_MAX -- at which the
+    period's `accrued` plus `plain` (the projection at the market's own
+    size) times the step clears `bar`; None when even the largest does not."""
+    if RT_FLOOR_BOOST_MAX <= 1.0 or plain <= 0:
+        return None
+    steps, m = [], 1.5
+    while m < RT_FLOOR_BOOST_MAX - 1e-9:
+        steps.append(m)
+        m += 0.5
+    steps.append(RT_FLOOR_BOOST_MAX)
+    return next((m for m in steps if accrued + m * plain >= bar), None)
 
 
 # BROADWAY WEEKLY ATTENDANCE GATE (Jack 2026-10-25: "Can you build a fair
@@ -22602,6 +22639,7 @@ class IncentiveMarketMaker:
         # near-cliff SIZE mode (2026-09-26): ticker -> armed ts; sticky until
         # the banked accrual crosses the cliff or the market leaves the selection
         self._near_cliff_boost: Dict[str, float] = {}
+        self._rt_floor_boost: Dict[str, float] = {}     # RT FLOOR BOOST: ticker -> step
         # ...ticker -> the banked $ that ends it, for one armed on the secure
         # line (NEAR_CLIFF_SECURE_DOLLARS); absent = the cliff
         self._near_cliff_stop: Dict[str, float] = {}
@@ -27683,11 +27721,13 @@ class IncentiveMarketMaker:
         return YIELD_SIZE_MULT
 
     def _market_size_mult(self, ticker: str) -> float:
-        """Every PER-MARKET ladder multiplier: near-cliff size mode x yield size
-        mode. The one number each reader of the shape applies (estimator probe
-        and floor projection, collateral reservation, quote loop, placement
-        guard), so all of them see the ladder the quote loop rests."""
-        return self._near_cliff_size_mult(ticker) * self._yield_size_mult(ticker)
+        """Every PER-MARKET ladder multiplier: the larger of the near-cliff size
+        mode and the RT floor boost, x yield size mode. The one number each
+        reader of the shape applies (estimator probe and floor projection,
+        collateral reservation, quote loop, placement guard), so all of them
+        see the ladder the quote loop rests."""
+        return (max(self._near_cliff_size_mult(ticker), self._rt_floor_boost.get(ticker, 1.0))
+                * self._yield_size_mult(ticker))
 
     def _yield_size_verdict(self, meta: "MarketMeta", now_ts: float) -> None:
         """Arm / keep / drop the yield size mode on this refresh's estimate.
@@ -27729,6 +27769,14 @@ class IncentiveMarketMaker:
                 elif crossed:
                     log(f"{self.tag} near-cliff: {t} crossed the cliff (banked "
                         f"${banked:.2f}); ladder back to normal size")
+        line = max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS)
+        for t in list(self._rt_floor_boost):
+            banked = self.period_accrued(t)
+            if banked >= line or t not in self.state.selected:
+                del self._rt_floor_boost[t]
+                if banked >= line:
+                    log(f"{self.tag} rt floor boost: {t} banked ${banked:.2f}, past the "
+                        f"${line:.2f} line; ladder back to its own size")
 
     def _paid_basis_delta(self, ticker: str, prev_acc: float,
                           new_acc: float) -> float:
@@ -28581,6 +28629,23 @@ class IncentiveMarketMaker:
                     f"${projected_total:.2f}, under the ${NEAR_CLIFF_SECURE_DOLLARS:.2f} "
                     f"secure line; x{self._near_cliff_size_mult(meta.ticker):g} size "
                     f"until banked reaches it")
+            # RT FLOOR BOOST (2026-11-01): a KXRT market short of the bar at
+            # its own size takes the smallest step up to RT_FLOOR_BOOST_MAX
+            # whose projection clears it (the estimate ran at the current
+            # size mode, so its plain-size projection is that over the mode)
+            if not reaches_min and rt_floor_boost_series(meta.series):
+                _cur = self._market_size_mult(meta.ticker)
+                _plain = max(est_total, proj_peak) / _cur if _cur > 0 else 0.0
+                _m = rt_floor_boost_mult(accrued, _plain, floor_bar)
+                if _m is not None and _m > self._rt_floor_boost.get(meta.ticker, 1.0):
+                    self._rt_floor_boost[meta.ticker] = _m
+                    reaches_min = True
+                    projected_total = accrued + _m * _plain
+                    log(f"{self.tag} rt floor boost: {meta.ticker} projects "
+                        f"${accrued + _plain:.2f} at its own size, under the "
+                        f"${floor_bar:.2f} bar; x{_m:g} size projects "
+                        f"${projected_total:.2f} -- quoting at x{_m:g} until it banks "
+                        f"${max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS):.2f}")
             meta.near_cliff_boost = meta.ticker in self._near_cliff_boost
             # DIP GUARD (Jack 2026-08-05). Track how long the projection has
             # been continuously under the bar; the exit below refuses to fire
@@ -28615,6 +28680,7 @@ class IncentiveMarketMaker:
                         "near_cliff_armed_ts": self._near_cliff_boost.get(meta.ticker),
                         # the banked $ that ends it (secure line), else None = the cliff
                         "near_cliff_stop": self._near_cliff_stop.get(meta.ticker),
+                        "rt_floor_boost": self._rt_floor_boost.get(meta.ticker),
                         "hopeless_since": self.state.hopeless_since.get(meta.ticker),
                         "sub_bar_secs": round(sub_bar_secs),
                         # the admission clock (2026-09-27): held-above time
@@ -37517,6 +37583,12 @@ class IncentiveMarketMaker:
                f"one of these leads neither off a model fair nor off its ladder's or "
                f"siblings' books; its rungs, locks and lock jobs as before"
                if LEAD_OFF_SERIES else "none -- every series in a lead's scope leads"))
+        log("rt floor boost (2026-11-01): "
+            + (f"on -- a KXRT market short of the payout bar at its own size rests "
+               f"x1.5 to x{RT_FLOOR_BOOST_MAX:g} of it, the smallest step that clears "
+               f"the bar, until it banks "
+               f"${max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS):.2f}"
+               if RT_FLOOR_BOOST_MAX > 1.0 else "off"))
         log("rt settled strikes (2026-11-01): "
             + (f"on -- a KXRT strike with {RT_SETTLED_MIN_REVIEWS}+ reviews, the score "
                f"{RT_SETTLED_MIN_GAP:g}+ points away, the RT model at "
