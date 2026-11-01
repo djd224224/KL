@@ -21,6 +21,10 @@ THE EMAIL, for the prior ET day, money first:
             past its strike
   strikes   one line per strike: hours quoted, reward, fills, value now
   settled   strikes we held that settled: did the side the model called win?
+  admitted  the strikes the rule admitted at the day's selection refreshes
+            (a KXRT cutoff moved to RT_SETTLED_STOP_H before the 10:00 ET
+            close, i.e. 04:00 ET; selection_snapshot rows), how many were
+            quoted, and how far the rest fell under the payout floor
 Verdict: STOP when a strike settled against the side the model called, or
 the net since go-live is STOP_NET_USD or worse; WATCH on a losing day or
 more than WATCH_OPEN_USD open against a swing; else OK.
@@ -227,6 +231,37 @@ def titles() -> dict:
     return {ev: str(e.get("title") or "") for ev, e in (data.get("open_events") or {}).items()}
 
 
+def admitted(a_ts: float, b_ts: float) -> dict:
+    """{ticker: its last selection row in the window} for the KXRT strikes
+    whose cutoff the rule moved: a KXRT market closes 10:00 ET, so its own
+    cutoff is 10:00 ET a week before and a settled strike's is
+    RT_SETTLED_STOP_H before the close."""
+    hour = int((10 - imm.RT_SETTLED_STOP_H) % 24)
+    out = {}
+    for d in lm.utc_dates(a_ts, b_ts):
+        try:
+            fh = open(os.path.join(imm.STATUS_DIR, f"selection_snapshot_{d}.jsonl"),
+                      encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"KXRT-' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not str(r.get("ticker", "")).startswith("KXRT-"):
+                    continue
+                ts, cut = lm.row_ts(r), imm.parse_iso_utc(str(r.get("cutoff") or ""))
+                if not (a_ts <= ts < b_ts) or cut is None:
+                    continue
+                if cut.astimezone(imm.ET).hour == hour and cut.astimezone(imm.ET).minute == 0:
+                    out[r["ticker"]] = r
+    return out
+
+
 def verdict(ctx: dict) -> tuple:
     """(level, reasons)."""
     level, why = 0, []
@@ -293,7 +328,9 @@ def build_report(day, now=None) -> dict:
                          net=round(net_rew + net_fills, 2), strikes=len(spans))
     since = dict(net=sum(v["net"] for v in days.values()), days=len(days),
                  first=min(days) if days else day_key)
+    adm = admitted(a_ts, b_ts)
     ctx = dict(day=day_key, now=now.isoformat(), spans=spans, rewards=rew, fills=fills,
+               admitted=adm,
                net_rewards=net_rew, net_fills=net_fills, net=net_rew + net_fills,
                hours=sum(e - s for v in spans.values() for s, e in v["spans"]) / 3600.0,
                settled=settled, titles=titles(), since=since,
@@ -341,6 +378,32 @@ def render_text(ctx) -> str:
     lvl = ctx["level"]
     out += ["", f"VERDICT: {lvl}" + (" -- " + "; ".join(ctx["reasons"]) if ctx["reasons"]
                                      else " -- nothing to act on")]
+    adm = ctx.get("admitted") or {}
+    priced_out = [t for t, r in adm.items() if r.get("decision") in ("extreme_mid", "one_sided")]
+    inside = {t: r for t, r in adm.items() if t not in priced_out}
+    if inside:
+        quoted = sorted(t for t, r in inside.items() if r.get("decision") == "selected")
+        rest = sorted((r for t, r in inside.items() if r.get("decision") != "selected"),
+                      key=lambda r: -float(r.get("projected_total") or 0.0))
+        out += ["", f"ADMITTED: {len(inside)} strike(s) qualified inside "
+                    f"{imm.RT_SETTLED_BAND_LO}-{imm.RT_SETTLED_BAND_HI}c at the day's last "
+                    f"refresh; {len(quoted)} quoted"
+                    + (" (" + ", ".join(_name(ctx, t) for t in quoted) + ")" if quoted else "")
+                    + "."]
+        if rest:
+            out.append("  The rest stayed out: "
+                       + "; ".join(f"{_name(ctx, r['ticker'])} {r.get('decision')} "
+                                   f"(${float(r.get('projected_total') or 0.0):.2f} "
+                                   f"projected vs ${float(r.get('floor_bar') or 0.0):.2f})"
+                                   for r in rest[:4])
+                       + ("" if len(rest) <= 4 else f"; {len(rest) - 4} more"))
+    else:
+        out += ["", f"ADMITTED: no strike qualified inside {imm.RT_SETTLED_BAND_LO}-"
+                    f"{imm.RT_SETTLED_BAND_HI}c at the day's selection refreshes."]
+    if priced_out:
+        out.append(f"  {len(priced_out)} more qualified but traded at "
+                   f"{imm.RT_SETTLED_BAND_HI + 1}c or above (or "
+                   f"{imm.RT_SETTLED_BAND_LO - 1}c or below), outside the band.")
     if ctx["spans"]:
         out += ["", "STRIKES"]
         for t, v in sorted(ctx["spans"].items(), key=lambda kv: -ctx["rewards"].get(kv[0], 0)):

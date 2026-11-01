@@ -128,6 +128,18 @@ class TestReport(unittest.TestCase):
                                                              for i in range(8)}}}}
         self._write(rs.lm.HOURLY_CACHE_FILE, json.dumps(cache))
         self._write(rs.STORE_FILE, json.dumps({"days": {"2026-10-29": {"net": -2.0}}}))
+        # the day's selection rows: a strike whose cutoff the rule moved to
+        # 04:00 ET (6h before the 10:00 ET close), quoted; one under the floor;
+        # one on the family's own 10:00 ET stand-down (not the rule's)
+        snap_ts = datetime.fromtimestamp(a, timezone.utc) + timedelta(hours=10)
+        rows = [dict(ts=snap_ts.isoformat(), ticker=T, decision="selected",
+                     cutoff="2026-11-09T09:00:00+00:00", projected_total=2.1, floor_bar=1.3),
+                dict(ts=snap_ts.isoformat(), ticker="KXRT-IPL-72", decision="payout_floor",
+                     cutoff="2026-11-23T09:00:00+00:00", projected_total=0.2, floor_bar=1.3),
+                dict(ts=snap_ts.isoformat(), ticker="KXRT-HUN-80", decision="payout_floor",
+                     cutoff="2026-11-16T15:00:00+00:00", projected_total=0.1, floor_bar=1.3)]
+        self._write("selection_snapshot_2026-10-30.jsonl",
+                    "".join(json.dumps(r) + "\n" for r in rows))
         now = datetime.fromtimestamp(b, timezone.utc) + timedelta(hours=8)
         ctx = rs.build_report(day, now=now)
         self.assertEqual(list(ctx["spans"]), [T])
@@ -140,6 +152,10 @@ class TestReport(unittest.TestCase):
         self.assertIn("NET +$3.00: rewards +$3.00 on 1 strike(s) over 6.0 market-hours", text)
         self.assertIn("Since it went live (2026-10-29): net +$1.00 over 2 day(s)", text)
         self.assertIn("RT settled strikes 10/30: net +$3.00", rs.subject_for(ctx))
+        self.assertEqual(sorted(ctx["admitted"]), ["KXRT-GOD-80", "KXRT-IPL-72"])
+        self.assertIn("ADMITTED: 2 strike(s) qualified inside 2-98c at the day's last "
+                      "refresh; 1 quoted (KXRT-GOD 80).", text)
+        self.assertIn("KXRT-IPL 72 payout_floor ($0.20 projected vs $1.30)", text)
         self.assertIn("<li>", rs.render_html(ctx))
 
 
