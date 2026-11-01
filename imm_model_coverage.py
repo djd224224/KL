@@ -26,6 +26,7 @@ is a coverage gap of its own).
   python imm_model_coverage.py           # print the current gaps (read-only)
 """
 
+import glob
 import json
 import os
 import re
@@ -52,6 +53,9 @@ FAIR_STALE_HOURS = float(os.environ.get("IMM_MODEL_FAIR_STALE_HOURS", "6"))
 # 10/22), and a watch pass inside that window reported a closed gap. One
 # pass later a real gap is still open.
 NEVER_READ_SETTLE_SECS = float(os.environ.get("IMM_MODEL_GAP_SETTLE_MIN", "20")) * 60
+# the bot's day logs in STATUS_DIR (incentive_mm's log(), by UTC date), read
+# for a refresher's last outcome line
+BOT_LOG_GLOB = "incentive-mm-20??-??-??.log"
 
 
 def _read(path: str) -> dict:
@@ -95,6 +99,51 @@ def _stale_gap(family: str, path: str, data: dict, key: str, now_ts: float,
     return []
 
 
+def _bot_log_last(needle: str, days: int = 2) -> Optional[str]:
+    """The newest line holding `needle` in the bot's last `days` day logs,
+    or None."""
+    paths = sorted(glob.glob(os.path.join(imm.STATUS_DIR, BOT_LOG_GLOB)))[-days:]
+    for path in reversed(paths):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        i = data.rfind(needle.encode("utf-8"))
+        if i >= 0:
+            end = data.find(b"\n", i)
+            return data[data.rfind(b"\n", 0, i) + 1:end if end >= 0 else None] \
+                .decode("utf-8", "replace").strip()
+    return None
+
+
+def _ca_refresh_fix() -> Optional[str]:
+    """A stale Carbon Arc file's fix, from the refresher's last log line (it
+    logs only when its outcome changes, and again on each bot start). The
+    thread runs on through a failed read, so a restart fixes nothing: on
+    11/01 from 01:13Z every read was "401 Client Error: Unauthorized" --
+    Carbon Arc voided the token when the account's free trial ran out (Jack:
+    "my free trial ran out"). None when the last line is not a failure (the
+    thread itself may be gone: the generic fix)."""
+    line = _bot_log_last("ca-fair refresh")
+    if not line or "refresh failed:" not in line:
+        return None
+    err = line.split("refresh failed:", 1)[1].strip()[:200]
+    m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d)", line)
+    said = err + (f"; bot log {m.group(1)}Z" if m else "")
+    every = f"every {max(30, imm.CA_FAIR_REFRESH_SECS) / 60:g} min"
+    if re.match(r"40[13]\b", err):
+        import carbon_arc_fair
+        return (f"Carbon Arc rejects the API token ({said}): check the account's "
+                f"plan is active (a lapsed plan or trial voids the token); if the "
+                f"token still fails, make a new one (app.carbonarc.ai, User Portal -> "
+                f"API Access) and save it in {carbon_arc_fair.CA_FEED_CONFIG} as "
+                f"{{\"token\": \"...\"}}. The refresher re-reads that file {every}, "
+                f"so no restart")
+    return (f"the refresher runs but its Carbon Arc reads fail ({said}); it retries "
+            f"{every}: fix the cause, no restart needed")
+
+
 # ---------------------------------------------------------------- checks ---
 # Each check: (progs: {market ticker: program}, now_ts) -> [gap, ...].
 # progs = the markets in an active reward program (what the bot can quote).
@@ -130,17 +179,45 @@ def check_rain_daily(progs: Dict[str, dict], now_ts: float) -> List[dict]:
 def check_carbon_arc(progs: Dict[str, dict], now_ts: float) -> List[dict]:
     """Carbon Arc-settled series (carbon_arc_settled, the gate's own test) need a Prism
     entity in the fair file's series_map (FAIL-OPEN: without one the CA
-    gate never reads the series, so it quotes on the book alone)."""
+    gate never reads the series, so it quotes on the book alone).
+
+    A market past its late-month stop (imm.ca_stop_utc) is never quoted
+    again, so it is no gap (Jack 2026-11-01: "there are no nov markets for
+    carbon arc yet, so why am i getting this email?"). A month's events are
+    dated by their print day early the next month and pay a week past the
+    stop: on 11/01 all 966 October markets (KXAALCC-26NOV07, ...) were
+    stopped yet still in a program, and a stale file emailed "the bot quotes
+    it now". A stale file is still reported then -- the next month's markets
+    will quote on it -- but as idle (nothing quoted now), under the key it
+    always had; with markets quoted it takes its own key, so they alert at
+    once rather than on the idle gap's daily re-send. Either way its fix is
+    the refresher's last error (_ca_refresh_fix), not a restart."""
+    now = datetime.fromtimestamp(now_ts, timezone.utc)
     by_ser = defaultdict(list)
+    stopped = 0
     for t in progs:
         s = _series(t)
         if imm.carbon_arc_settled(s):
+            stop = imm.ca_stop_utc(t)
+            if stop is not None and stop <= now:
+                stopped += 1
+                continue
             by_ser[s].append(t)
-    if not by_ser:
+    if not by_ser and not stopped:
         return []
     data = _read(imm.CA_FAIR_FILE)
+    quoted = [t for ts in by_ser.values() for t in ts]
     out = _stale_gap("Carbon Arc (carbon_arc_fair)", imm.CA_FAIR_FILE, data,
-                     "generated_at", now_ts, [t for ts in by_ser.values() for t in ts])
+                     "generated_at", now_ts, quoted)
+    for g in out:
+        g["fix"] = _ca_refresh_fix() or g["fix"]
+        if quoted:
+            g["key"] += "|quoted"
+        else:
+            g["idle"] = True
+            g["why"] += (f"; nothing is quoted on it now: all {stopped} Carbon Arc "
+                         f"markets still in a program are past the bot's stop "
+                         f"({imm.CA_LATE_STOP_DAYS:g} days before their data month ends)")
     mapped = set(data.get("series_map") or {})
     for s, ts in sorted(by_ser.items()):
         if s in mapped:

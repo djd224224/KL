@@ -11,17 +11,25 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import imm_model_coverage as mc                                      # noqa: E402
 import incentive_mm as imm                                           # noqa: E402
 
+# a Carbon Arc event date whose late-month stop is still ahead: a market past
+# its stop is no gap (Jack 2026-11-01), so a fixed date ages out of the tests
+CA_EV = (datetime.now(timezone.utc) + timedelta(days=40)).strftime("%y%b%d").upper()
+
 
 def _write(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f)
+
+
+def _ts(*ymdh):
+    return datetime(*ymdh, tzinfo=timezone.utc).timestamp()
 
 
 class TestCoverage(unittest.TestCase):
@@ -54,15 +62,81 @@ class TestCoverage(unittest.TestCase):
         self.assertIn("CLIZZZ", g["why"])
 
     def test_an_unmapped_carbon_arc_series_is_a_gap(self):
-        progs = {"KXTGTFT-26NOV08-T90": {}, "KXDPZFT-26NOV08-T50": {}, "KXGOOD-99DEC31-A": {}}
+        progs = {f"KXTGTFT-{CA_EV}-T90": {}, f"KXDPZFT-{CA_EV}-T50": {}, "KXGOOD-99DEC31-A": {}}
         verdict = {"KXTGTFT": True, "KXDPZFT": True}.get
         with mock.patch.object(imm, "family_verdict", verdict):
             gaps = mc.find_gaps(progs, self.now, [mc.check_carbon_arc])
         self.assertEqual(list(gaps), ["Carbon Arc (carbon_arc_fair)|KXDPZFT"])
 
+    def test_carbon_arc_markets_past_their_stop_are_no_gap(self):
+        # Jack 2026-11-01: "there are no nov markets for carbon arc yet, so why
+        # am i getting this email?" -- October's events, dated by their
+        # November print day, kept paying after the 10/27 04:00Z stop
+        progs = {"KXTGTFT-26NOV08-T90": {}, "KXDPZFT-26NOV08-T50": {}}
+        verdict = {"KXTGTFT": True, "KXDPZFT": True}.get
+        for now, want in ((_ts(2026, 10, 27, 3), ["Carbon Arc (carbon_arc_fair)|KXDPZFT"]),
+                          (_ts(2026, 10, 27, 5), [])):
+            _write(self.ca, {"generated_at": datetime.fromtimestamp(now, timezone.utc)
+                             .isoformat(), "series_map": {"KXTGTFT": {}}})
+            with mock.patch.object(imm, "family_verdict", verdict), \
+                    mock.patch.object(imm, "CA_LATE_STOP_DAYS", 5):
+                self.assertEqual(list(mc.find_gaps(progs, now, [mc.check_carbon_arc])), want)
+
+    def test_a_stale_carbon_arc_file_says_what_is_quoted_and_why(self):
+        """11/01: the CA token 401'd from 01:13Z (the account's trial ran
+        out). Every market in a program was past its stop, yet the email said
+        "the bot quotes it now", and its fix said to restart."""
+        now = _ts(2026, 11, 1, 13)
+        _write(self.ca, {"generated_at": "2026-11-01T01:11:08+00:00",
+                         "series_map": {"KXTGTFT": {}, "KXAALCC": {}}})
+        log = os.path.join(self.dir, "incentive-mm-2026-11-01.log")
+        with open(os.path.join(self.dir, "incentive-mm-2026-10-31.log"), "w",
+                  encoding="utf-8") as f:
+            f.write("2026-10-31 20:47:21Z [IMM] ca-fair refresh: 98 series with a read\n")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("2026-11-01 04:46:53Z === incentive_mm_v1.2 run=495c5bfc ===\n"
+                    "2026-11-01 04:47:18Z [IMM] ca-fair reloaded: 98 series\n"
+                    "2026-11-01 04:47:31Z [IMM] ! ca-fair refresh failed: 401 Client "
+                    "Error: Unauthorized for url: https://api.carbonarc.co/v2/prisms?"
+                    "insight_id=245\n"
+                    "2026-11-01 05:00:00Z [IMM] cycle ...\n")
+        stopped = {"KXTGTFT-26NOV08-T90": {}, "KXAALCC-26NOV07-T103": {}}
+        idle_key = "Carbon Arc (carbon_arc_fair)|(fair file)"
+        verdict = {"KXTGTFT": True, "KXAALCC": True}.get
+        with mock.patch.object(imm, "family_verdict", verdict), \
+                mock.patch.object(imm, "CA_LATE_STOP_DAYS", 5), \
+                mock.patch.object(imm, "STATUS_DIR", self.dir):
+            gaps = mc.find_gaps(stopped, now, [mc.check_carbon_arc])
+            self.assertEqual(list(gaps), [idle_key])   # the key it always had
+            g = gaps[idle_key]
+            self.assertTrue(g["idle"])
+            self.assertEqual(g["markets"], [])
+            self.assertIn("last written 11.8h ago; nothing is quoted on it now: all 2 "
+                          "Carbon Arc markets still in a program are past the bot's "
+                          "stop (5 days before their data month ends)", g["why"])
+            self.assertIn("rejects the API token (401 Client Error: Unauthorized", g["fix"])
+            self.assertIn("bot log 2026-11-01 04:47Z", g["fix"])
+            self.assertNotIn("restart if needed", g["fix"])
+            subject, text = mc.body([(idle_key, g, now, True)])
+            self.assertIn("0 market(s)", subject)
+            self.assertNotIn("markets:", text)
+            # a market before its stop is quoted on the stale file: its own key,
+            # so it alerts at once rather than on the idle gap's daily re-send
+            live = dict(stopped, **{f"KXTGTFT-{CA_EV}-T90": {}})
+            gaps = mc.find_gaps(live, now, [mc.check_carbon_arc])
+            g = gaps[idle_key + "|quoted"]
+            self.assertEqual(list(gaps), [idle_key + "|quoted"])
+            self.assertEqual(g["markets"], [f"KXTGTFT-{CA_EV}-T90"])
+            self.assertFalse(g.get("idle"))
+            self.assertIn("rejects the API token", g["fix"])
+            # the last refresh line a success: the thread itself may be gone
+            os.remove(log)
+            g = mc.find_gaps(stopped, now, [mc.check_carbon_arc])[idle_key]
+            self.assertIn("restart if needed", g["fix"])
+
     def test_an_unmapped_sector_array_is_a_known_gap_reported_once(self):
         # Jack 2026-10-16: "mark the ARRAY series as a known coverage gap"
-        progs = {"KXRIDEARRAY-26NOV08-T100": {}, "KXDPZFT-26NOV08-T50": {}}
+        progs = {f"KXRIDEARRAY-{CA_EV}-T100": {}, f"KXDPZFT-{CA_EV}-T50": {}}
         verdict = {"KXRIDEARRAY": True, "KXDPZFT": True}.get
         with mock.patch.object(imm, "family_verdict", verdict):
             gaps = mc.find_gaps(progs, self.now, [mc.check_carbon_arc])

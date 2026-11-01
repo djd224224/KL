@@ -1100,9 +1100,16 @@ class TestQuoteCalls(unittest.TestCase):
                          ["KXTTNSNOWM-26DEC-12"], "closed", "no station", "add the city")
         opn = mcov._gap("Daily rain (rain_fair)", "BNA", ["KXRAIN-26OCT12-BNA"],
                         "open", "no station", "add a row")
+        # 11/01: a stale Carbon Arc file with every market past its stop
+        idle = dict(mcov._gap("Carbon Arc (carbon_arc_fair)", "(fair file)", [], "open",
+                              "last written 6.2h ago", "a new token"), idle=True)
         with mock.patch.object(fw, "family_name", lambda s, c="": "Politics & approval"):
             self.assertEqual(fw.model_gap_call(shut, self.TRACK)[0], "QUOTE ONCE MODELED")
             self.assertEqual(fw.model_gap_call(opn, self.TRACK)[0], "QUOTE WITH CARE")
+            self.assertEqual(fw.model_gap_call(idle, self.TRACK),
+                             ("FIX, THEN QUOTE", "nothing is quoted on it now; make the fix "
+                              "before new markets join, or they quote without the model's "
+                              "protection"))
             _s, text = mcov.body([(shut["key"], shut, 0.0, True)],
                                  call=lambda g: fw.model_gap_call(g, self.TRACK))
         self.assertIn("      call: QUOTE ONCE MODELED -- it sits dark until the model has it",

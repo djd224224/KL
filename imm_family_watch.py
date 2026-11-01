@@ -777,7 +777,14 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
 
 def model_gap_call(g: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     """(call, why) for a model-coverage gap: FAIL-CLOSED sits dark until the
-    model has it; FAIL-OPEN is quoted now without the model's protection."""
+    model has it; FAIL-OPEN is quoted now without the model's protection --
+    unless the gap is idle (imm_model_coverage: a stale Carbon Arc file once
+    every market is past its stop, Jack 2026-11-01), which wants the fix
+    before new markets join."""
+    if g.get("idle"):
+        return ("FIX, THEN QUOTE", "nothing is quoted on it now; make the fix before "
+                                   "new markets join, or they quote without the "
+                                   "model's protection")
     mk = g.get("markets") or []
     fam = family_name(imm.series_of(mk[0])) if mk else ""
     rec = track.get(fam) if fam else None
