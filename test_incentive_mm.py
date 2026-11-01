@@ -32552,8 +32552,10 @@ class TestOpenRouterFairLead(unittest.TestCase):
     10/31 00:00Z read of KXTOKENUSE-26NOV02 (5 of 7 days in, 199.1T +-
     6.48T) on TestOpenRouterFairGate's far event; T190 reads 92.0c, and its
     book is a 3-lot 80c bid over a 5,000 wall at 60c, offered at 92c. Out of
-    the default list since 2026-10-31 (Jack: "Pull it back"): setUp puts it
-    back, as IMM_FAIR_LEAD_SERIES naming it would."""
+    the default list since 2026-10-31 (Jack: "Pull it back"), and no
+    OpenRouter market leads at all since 2026-11-01 (LEAD_OFF_SERIES): setUp
+    puts it back, as IMM_FAIR_LEAD_SERIES naming it and an empty
+    IMM_LEAD_OFF_SERIES would."""
 
     T = "KXTOKENUSE-68DEC04-T190"
     EV = "KXTOKENUSE-68DEC04"
@@ -32571,11 +32573,13 @@ class TestOpenRouterFairLead(unittest.TestCase):
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
         self.default_series = imm.FAIR_LEAD_SERIES
+        self.default_off = imm.LEAD_OFF_SERIES
         for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
                   mock.patch.object(imm, "LADDER_MODE", "atref"),
                   mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
                   mock.patch.object(imm, "FAIR_LEAD_SERIES", tuple(sorted(
                       set(imm.FAIR_LEAD_SERIES) | {"KXTOKENUSE"}))),
+                  mock.patch.object(imm, "LEAD_OFF_SERIES", ()),
                   # the window's pre-midnight minutes never ride the test clock
                   mock.patch.object(imm, "OR_LEAD_BLACKOUT_PRE_MIN", 0.0)):
             p.start()
@@ -32757,6 +32761,50 @@ class TestOpenRouterFairLead(unittest.TestCase):
             self.assertFalse(any(f"fair lead {self.T}" in s for s in lines), lines)
             _bot, rungs, _l = self._cycle(pos=-150.0)
             self.assertNotIn((91, 150), rungs.get("bid", []), rungs)
+
+    def test_no_openrouter_market_leads_of_either_kind_by_default(self):
+        # Jack 2026-11-01: "only on OpenRouter. and then evaluate the others",
+        # after "turn off the leading, its not working". Out of the fair lead,
+        # the weekly's strikes still led off one another's books
+        # (KXTOKENUSE-26NOV02-T199's ask held 200 at 29-32c that morning)
+        self.assertIn("LEAD_OFF_SERIES", imm._CONFIG_CODE_KNOBS)
+        for s in ("KXTOKENUSE", "KXTOKENUSEM", "KXTOKENUSED", "KXANTHSHARE",
+                  "KXXIAOMISHARE", "KXSTEALTHSHARE"):
+            self.assertTrue(s.startswith(self.default_off), s)
+        # Vercel's families (KXOPENSOURCESHARE is Vercel's), the rain leads
+        # and the complement leads lead on
+        for s in ("KXOPENSOURCESHARE", "KXOPENVREQ", "KXANTHVSPEND", "KXDEEPVREQ",
+                  "KXRAINWKND", "KXRAINELECTION", "KXGGWINNER", "KXSTATELEG",
+                  "KXDIESELYE"):
+            self.assertFalse(s.startswith(self.default_off), s)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        lad = (f"{self.EV}-T188", self.T, f"{self.EV}-T192")
+        bot._ladders = {t: lad for t in lad}
+        meta = imm.MarketMeta(ticker=self.T, event_ticker=self.EV, series="KXTOKENUSE",
+                              dollars_per_day=20.0, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None,
+                              close_time=datetime(2068, 12, 5, 4, 0, tzinfo=timezone.utc),
+                              mid_cents=86.0, spread_cents=12, volume=0.0)
+        self.assertEqual(bot._lead_source(meta), "comp")          # emptied: its ladder
+        self._write()
+        self.assertEqual(bot._lead_source(meta), "fair")          # ...or its model
+        with mock.patch.object(imm, "LEAD_OFF_SERIES", self.default_off):
+            self.assertIsNone(bot._lead_source(meta))
+            self.assertEqual(bot._comp_lead(meta, self.YES, self.NO), (None, None))
+            # the monthly's ladder too
+            mlad = ("KXTOKENUSEM-68DEC31-T850", "KXTOKENUSEM-68DEC31-T900")
+            bot._ladders.update({t: mlad for t in mlad})
+            self.assertIsNone(bot._lead_source(dataclasses.replace(
+                meta, ticker=mlad[0], event_ticker="KXTOKENUSEM-68DEC31",
+                series="KXTOKENUSEM")))
+            # the ladder stays grouped: a bid fill still locks on T192
+            self.assertEqual(bot._lock_kind(self.T, "bid"), ("ladder_bid", (lad[2],)))
+            # the quote loop rests no lead (the emptied list's 200 @ 81c:
+            # test_the_quote_loop_leads_and_stands_down_for_the_publish)
+            _bot, rungs, lines = self._cycle()
+            self.assertNotIn((81, 200), rungs.get("bid", []), rungs)
+            self.assertEqual([px for px, _n in rungs.get("bid", [])], [60], rungs)
+            self.assertFalse(any(f"lead {self.T}" in s for s in lines), lines)
 
     def test_the_fast_cancel_reads_the_lead_as_stale_in_the_window(self):
         self._write()

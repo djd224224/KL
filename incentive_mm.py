@@ -11717,6 +11717,7 @@ _CONFIG_CODE_KNOBS = (
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
+    "LEAD_OFF_SERIES",            # no leads on OpenRouter (2026-11-01)
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
@@ -20616,6 +20617,21 @@ COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 5))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
     if p.strip())
+# NO LEADS ON OPENROUTER (Jack 2026-11-01: "only on OpenRouter. and then
+# evaluate the others", after "turn off the leading, its not working"). The
+# 10/31 pull-back took the weekly out of FAIR_LEAD_SERIES, but its strikes
+# are a threshold ladder, so they went on leading off one another's books
+# (ladder_lead_group): KXTOKENUSE logged 312 lead lines and KXTOKENUSEM 11
+# over 10/31-11/01, T199's ask holding 200 at 29-32c on the morning of 11/01.
+# A market whose series starts with one of these leads of neither kind
+# (_lead_source); the ladder stays grouped, so a fill still locks on its
+# strikes and the 10/31 lead fills' lock jobs keep their legs. The
+# OpenRouter market-share series (_share_x1, quoted at x1) are named too.
+# Empty restores.
+LEAD_OFF_SERIES: Tuple[str, ...] = tuple(
+    p.strip() for p in os.environ.get(
+        "IMM_LEAD_OFF_SERIES", ",".join(["KXTOKENUSE", _DEFAULT_OR_SHARE_SERIES])).split(",")
+    if p.strip())
 # Kalshi's event record groups the markets: re-read every TTL, at most READS
 # event reads per universe refresh
 COMP_PAIR_TTL_SECS = _env_float("IMM_COMP_PAIR_TTL_H", 12.0) * 3600.0
@@ -29226,8 +29242,10 @@ class IncentiveMarketMaker:
         """Where `meta`'s leads would come from: "fair" (its fresh model fair:
         FAIR LEAD -- first, so a Vercel ladder strike leads off the model,
         not off its strikes' walls), "comp" (other markets' books: the
-        complement lead) or None. Each mode's own switch applies
-        (lead_mode)."""
+        complement lead) or None, always for a series in LEAD_OFF_SERIES
+        (OpenRouter's). Each mode's own switch applies (lead_mode)."""
+        if meta.series.startswith(LEAD_OFF_SERIES):
+            return None
         if fair_lead_fair_c(meta.ticker, meta.series, time.time()) is not None:
             return "fair"
         if self._comp_linked(meta.ticker) and comp_lead_series(meta.series):
@@ -37156,6 +37174,11 @@ class IncentiveMarketMaker:
                + (" (dry: logged, quoted as before)" if FAIR_CLOSE_MODE == "dry"
                   else "")
                if FAIR_CLOSE_MODE in ("on", "dry") else ""))
+        log("no leads (2026-11-01): "
+            + (f"{', '.join(LEAD_OFF_SERIES)} -- a market whose series starts with "
+               f"one of these leads neither off a model fair nor off its ladder's or "
+               f"siblings' books; its rungs, locks and lock jobs as before"
+               if LEAD_OFF_SERIES else "none -- every series in a lead's scope leads"))
         _lr_live = LONE_REF_GUARD_MODE in ("on", "dry")
         log(f"lone-reference guard (2026-10-16): {LONE_REF_GUARD_MODE}"
             + (f" -- a side whose reference rests on under {LONE_REF_MAX_MULT:g} x "
