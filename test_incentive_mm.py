@@ -14817,9 +14817,11 @@ class TestVercelFloorBoost(unittest.TestCase):
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
 
-    def _bot(self, copied=True):
-        """A fresh bot on the fixture book; `copied` = its leads hold at 17c /
-        77c beside the copier (COMP_HOLD_FILE), else they lead afresh."""
+    def _bot(self, copied=True, yes=None, no=None):
+        """A fresh bot on the fixture book (or `yes` / `no`); `copied` = its
+        leads hold at 17c / 77c (COMP_HOLD_FILE), else they lead afresh."""
+        yes = self.YES if yes is None else yes
+        no = self.NO if no is None else no
         _clean_persist()
         TestVercelFairLead._drop_holds()
         TestVercelFairLead._write(self)
@@ -14836,8 +14838,8 @@ class TestVercelFloorBoost(unittest.TestCase):
             "yes_bid_dollars": "0.1700", "yes_ask_dollars": "0.7700",
             "volume_fp": "0.00"}
         client.books[self.T] = {"orderbook_fp": {
-            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
-            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in yes],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in no]}}
         bot = IncentiveMarketMaker(client=client, live=False)
         if copied:
             bot._comp_holds[self.T] = [17, 77, time.time()]
@@ -15006,6 +15008,25 @@ class TestVercelFloorBoost(unittest.TestCase):
         bot.state.vercel_floor_boost[f"{self.EV}-T21"] = 2.0     # not a candidate here
         self._run(bot, 2.2 * P)
         self.assertEqual(bot.state.vercel_floor_boost, {self.T: 2.5})
+
+    def test_a_copier_ahead_of_the_held_leads_is_led_afresh(self):
+        # Jack 2026-11-01: "Yes, re-lead them". The copier a tick ahead of
+        # both held leads -- 6,837 YES at 18c over the 17c bid, 6,490 NO at
+        # 24c over the 77c offer -- leaves them nothing (zero_yield, out);
+        # they lead afresh ahead of the walls, at their own size
+        yes = [[1, 1], [2, 100], [18, 6837]]
+        no = [[1, 1], [2, 100], [3, 1], [24, 6490]]
+        bot = self._bot(yes=yes, no=no)
+        rungs, _lines = self._run(bot, 1.0)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.vercel_floor_boost, {})
+        self.assertIn((28, 200), rungs.get("bid", []), rungs)
+        self.assertIn((66, 200), rungs.get("ask", []), rungs)
+        self.assertEqual(bot._comp_lead_px[self.T], (28, 66, 200))
+        # ...where the hold kept them before
+        bot = self._bot(yes=yes, no=no)
+        self._run(bot, 1.0, COMP_LEAD_RELEAD_ZERO=False)
+        self.assertNotIn(self.T, bot.state.selected)
 
 
 class TestOpenRouterShareFairGate(unittest.TestCase):
@@ -31886,8 +31907,13 @@ class TestComplementLead(unittest.TestCase):
                                                 hold=26), (65, 65, 65))
             self.assertEqual(imm.comp_side_lead(wall + [[67, 1000.0]], r_no, 1000.0, 0.5,
                                                 hold=26), (65, 65, 67))
+        with mock.patch.object(imm, "COMP_LEAD_RELEAD_ZERO", False):
+            self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
+                                                hold=26), (26, 65, 30))
+        # ...unless it earns nothing there (Jack 2026-11-01: "Yes, re-lead
+        # them"): the 1,000 at 30c fills the scored walk, so it leads afresh
         self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], r_no, 1000.0, 0.5,
-                                            hold=26), (26, 65, 30))
+                                            hold=26), (37, 65, 30))
         # alone, the wall below gone: down to the new cheapest price, but not
         # for a move under 3c
         thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
@@ -31971,14 +31997,24 @@ class TestComplementLead(unittest.TestCase):
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
             self.assertEqual(imm.comp_side_lead_ref(t190, 84, 1000.0, 0.5, hold=54),
                              (60, 79, 55))
-        # real size ahead is held too: 300 lots, a 1,000-lot, a copier with 3
-        # lots over it, a 1,000-lot at the cap -- the 26c lead stays at 26c,
-        # and the order ahead is the side's own best
+        # real size ahead is held too while the lead still scores: 300 lots, a
+        # copier with 3 lots over it -- the 26c lead stays at 26c, and the
+        # order ahead is the side's own best
         wall = [[15, 13238.0], [16, 21.0]]
-        for ahead in ([[27, 300.0]], [[30, 1000.0]], [[26, 1000.0], [27, 3.0]],
-                      [[65, 1000.0]]):
+        for ahead in ([[27, 300.0]], [[26, 1000.0], [27, 3.0]]):
             self.assertEqual(imm.comp_side_lead(wall + ahead, self.R_NO, 1000.0, 0.5,
                                                 hold=26), (26, 65, ahead[-1][0]), ahead)
+        # Jack 2026-11-01: "Yes, re-lead them". A 1,000-lot ahead fills the
+        # scored walk, so the lead earns nothing at 26c and leads afresh: 7c
+        # over a 1,000 at 30c, none over one at the cap. Held before the rule
+        self.assertEqual(imm.comp_side_lead(wall + [[30, 1000.0]], self.R_NO, 1000.0, 0.5,
+                                            hold=26), (37, 65, 30))
+        self.assertIsNone(imm.comp_side_lead(wall + [[65, 1000.0]], self.R_NO, 1000.0, 0.5,
+                                             hold=26))
+        with mock.patch.object(imm, "COMP_LEAD_RELEAD_ZERO", False):
+            for ahead in ([[30, 1000.0]], [[65, 1000.0]]):
+                self.assertEqual(imm.comp_side_lead(wall + ahead, self.R_NO, 1000.0, 0.5,
+                                                    hold=26), (26, 65, ahead[-1][0]), ahead)
         # a lead alone still moves down, and a cap below it still leads afresh
         thin = [[2, 2008.0], [3, 1.0], [16, 21.0]]
         self.assertEqual(imm.comp_side_lead(thin, self.R_NO, 1000.0, 0.5, hold=26)[0], 18)
@@ -32006,7 +32042,11 @@ class TestComplementLead(unittest.TestCase):
             self.assertEqual(bot2._comp_holds[self.D][:2], [21, None])
             bot2._ws = bot._ws
             bot2._comp_groups, bot2._comp_pairs = bot._comp_groups, bot._comp_pairs
-            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (21, 65, 30))
+            with mock.patch.object(imm, "COMP_LEAD_RELEAD_ZERO", False):
+                self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (21, 65, 30))
+            # (since 2026-11-01 "Yes, re-lead them": the 1,000 ahead fills the
+            # scored walk, so the held 21c earns nothing and leads afresh)
+            self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
             with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
                 self.assertEqual(bot2._comp_lead(meta, copier, self.D_NO)[0], (37, 65, 30))
             # a lapsed entry is forgotten: a fresh read leads ahead of the whole book
@@ -32031,8 +32071,13 @@ class TestComplementLead(unittest.TestCase):
         with mock.patch.object(imm, "COMP_LEAD_HOLD_SHARE", 0.5):
             self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no2, sibs, 1000.0, 0.5,
                                                  hold_ask=57), (None, (47, 43, 56)))
+        with mock.patch.object(imm, "COMP_LEAD_RELEAD_ZERO", False):
+            self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no2, sibs, 1000.0, 0.5,
+                                                 hold_ask=57), (None, (57, 43, 56)))
+        # ...and since "Yes, re-lead them" (2026-11-01) leads afresh at 47c:
+        # the 4,472 ahead fill the scored walk, so the 57c offer earned nothing
         self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no2, sibs, 1000.0, 0.5,
-                                             hold_ask=57), (None, (57, 43, 56)))
+                                             hold_ask=57), (None, (47, 43, 56)))
         # a sibling too thin to reach 200 sets no reference: no lead
         thin = sibs[:-1] + [([[4, 150.0]], [[29, 15000.0]])]
         self.assertEqual(imm.comp_lead_group(jdon_yes, jdon_no, thin, 1000.0, 0.5),
@@ -33113,6 +33158,39 @@ class TestVercelFairLead(unittest.TestCase):
         for yes, no, want in ((self.YES + [[18, 194]], self.NO, ((17, 35, 18), (77, 46, 87))),
                               (self.YES, self.NO + [[24, 194]], ((17, 35, 7), (77, 46, 76)))):
             self.assertEqual(imm.fair_lead_group(yes, no, 40.7, 1000.0, 0.5, **holds), want)
+
+    def test_a_held_lead_that_earns_nothing_leads_afresh(self):
+        # Jack 2026-11-01: "Yes, re-lead them". The 04NOV26 copier stepped a
+        # tick ahead of the held leads -- 8,859 YES at 16c over the 15c bid,
+        # 17,440 NO at 17c over the 84c offer -- and Kalshi's walk stops at a
+        # side's first 1,000, so neither earned anything where it held
+        yes = [[1, 1], [2, 100], [16, 8859]]
+        no = [[1, 1], [2, 100], [3, 1], [17, 17440]]
+        holds = dict(hold_bid=15, hold_ask=84)
+        self.assertEqual(imm._side_share([(16, 8859.0), (15, 200.0), (2, 100.0)],
+                                         {15: 200.0}, 1000.0, 0.5), (0.0, True))
+        # both lead afresh, as with no hold: 26c and 72c, 10 and 11 ticks
+        # over their walls, at least 5c inside the 40c model
+        fresh = imm.fair_lead_group(yes, no, 40.0, 1000.0, 0.5)
+        self.assertEqual(fresh, ((26, 35, 16), (72, 45, 83)))
+        self.assertEqual(imm.fair_lead_group(yes, no, 40.0, 1000.0, 0.5, **holds), fresh)
+        self.assertIn("COMP_LEAD_RELEAD_ZERO", imm._CONFIG_CODE_KNOBS)
+        with mock.patch.object(imm, "COMP_LEAD_RELEAD_ZERO", False):     # held there before
+            self.assertEqual(imm.fair_lead_group(yes, no, 40.0, 1000.0, 0.5, **holds),
+                             ((15, 35, 16), (84, 45, 83)))
+        # a lead that keeps any share still holds: 999 lots ahead leave it in
+        # the walk at half weight, 1,000 fill the walk without it
+        for ahead, held in ((999, True), (1000, False)):
+            book = [[2, 100], [7, 6837], [16, ahead]]
+            got = imm.fair_lead_group(book, self.NO, 40.0, 1000.0, 0.5, hold_bid=15)[0]
+            if held:
+                self.assertEqual(got[0], 15, ahead)
+            else:
+                self.assertEqual(got, imm.fair_lead_group(book, self.NO, 40.0, 1000.0, 0.5)[0],
+                                 ahead)
+                self.assertGreater(got[0], 16)
+        # no price within the cap takes its share: no lead at all
+        self.assertIsNone(imm.fair_lead_group(yes, no, 25.0, 1000.0, 0.5, **holds)[0])
 
     def test_the_quote_loop_leads_both_walls_with_200(self):
         bot, rungs, lines = self._cycle()

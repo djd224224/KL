@@ -11821,6 +11821,7 @@ _CONFIG_CODE_KNOBS = (
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_LEAD_HOLD_SMALL",       # a few lots ahead are not fought (2026-10-30)
     "COMP_LEAD_HOLD_SHARE",       # ...at any share since 2026-11-01 (half 10-30)
+    "COMP_LEAD_RELEAD_ZERO",      # ...unless it earns nothing there (2026-11-01)
     "COMP_PAIR_TTL_SECS", "COMP_PAIR_READS_PER_REFRESH", "COMP_HOLD_TTL_SECS",
     "COMP_HEDGE_MODE", "COMP_HEDGE_EDGE_C", "COMP_HEDGE_MAX_AGE_SECS",
     "COMP_LEAD_MAX_POSITION",
@@ -20979,6 +20980,20 @@ COMP_LEAD_HOLD_SMALL = os.environ.get("IMM_COMP_LEAD_HOLD_SMALL", "1") == "1"
 # alone still moves down, and a cap that falls below it still leads it
 # afresh, lower. 0.5 restores the half bar.
 COMP_LEAD_HOLD_SHARE = _env_float("IMM_COMP_LEAD_HOLD_SHARE", 0.0)
+# ...UNLESS IT EARNS NOTHING (Jack 2026-11-01: "Yes, re-lead them", on "Should
+# a held lead that earns nothing re-lead at a fresh price?"). Between 18:45Z
+# and 19:47Z the 04NOV26 Vercel copier stepped a tick ahead of every held
+# lead (KXMOONVSPEND-04NOV26-T10P2: 8,859 YES at 16c over our 15c bid, 17,440
+# NO at 17c over our 84c offer). Kalshi scores a side's first target
+# contracts from the top, so a lead under a wall that fills them earns
+# exactly nothing at any size, and 49 of the cohort's 63 lab strikes read
+# zero_yield behind such walls. A held price where the lead would keep NO
+# share of its scored side is released, and the side leads afresh as a
+# market with no hold does: the cheapest price ahead of the whole book that
+# takes COMP_LEAD_SHARE, within the cap (none there: no lead). A lead that
+# keeps any share still holds, and a hold bar (0.5) fights as before.
+# IMM_COMP_LEAD_RELEAD_ZERO=0 holds there too.
+COMP_LEAD_RELEAD_ZERO = os.environ.get("IMM_COMP_LEAD_RELEAD_ZERO", "1") == "1"
 COMP_LEAD_MARGIN_C = max(0, _env_int("IMM_COMP_LEAD_MARGIN_C", 5))
 COMP_LEAD_SKIP: Tuple[str, ...] = tuple(
     p.strip() for p in os.environ.get("IMM_COMP_LEAD_SKIP", "").split(",")
@@ -21126,7 +21141,8 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
     an order at or past the cap leaves the rung at the cap. An order sharing its price
     leaves it where it is; alone, it stays, or moves down when the book
     below lets a price 3c+ lower take the share; a hold above the cap leads
-    afresh."""
+    afresh, and so does one that would keep no share of its scored side
+    where it rests (COMP_LEAD_RELEAD_ZERO)."""
     n = comp_lead_size(target)
     if n <= 0:
         return None
@@ -21154,6 +21170,15 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
         s, ok = share_at(px)
         return ok and s >= min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE)
 
+    def fresh() -> Optional[Tuple[int, int, int]]:
+        """The lead with no hold: the cheapest price ahead of the whole book
+        that takes COMP_LEAD_SHARE, within the cap."""
+        best = own[0][0] if own else 0
+        if cap <= best:
+            return None
+        px = cheapest(own)
+        return None if px is None else (px, cap, best)
+
     if hold is not None and hold <= cap:
         below = [(p, q) for p, q in own if p < hold]
         at_or_above = [(p, q) for p, q in own if p >= hold]
@@ -21171,7 +21196,10 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
             return None
         if any(p > hold for p, _q in at_or_above):
             # held behind an order ahead (HOLD ALWAYS): that order is the
-            # side's own best
+            # side's own best -- unless the orders ahead fill the scored walk
+            # and the lead would earn nothing there (COMP_LEAD_RELEAD_ZERO)
+            if COMP_LEAD_RELEAD_ZERO and share_at(hold)[0] <= 0.0:
+                return fresh()
             return hold, cap, own[0][0]
         if at_or_above:
             # an order sharing our price: stay and share the front. Backing
@@ -21183,11 +21211,7 @@ def comp_side_lead_ref(own_levels: List[List[float]], ref: int, target: float,
         if px is not None and px <= hold - 3:
             return px, cap, (below[0][0] if below else 0)
         return hold, cap, (below[0][0] if below else 0)
-    best = own[0][0] if own else 0
-    if cap <= best:
-        return None
-    px = cheapest(own)
-    return None if px is None else (px, cap, best)
+    return fresh()
 
 
 def comp_side_lead(own_levels: List[List[float]], twin_levels: List[List[float]],
@@ -38201,6 +38225,8 @@ class IncentiveMarketMaker:
                f"taking {COMP_LEAD_SHARE:.0%} of the side, at least "
                f"{FAIR_LEAD_MARGIN_C}c inside the model fair ("
                + ("held where it rests whatever steps ahead, as every lead is"
+                  + (", unless it would earn nothing there: then it leads afresh"
+                     if COMP_LEAD_RELEAD_ZERO else "")
                   if COMP_LEAD_HOLD_SMALL and min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE) <= 0
                   else f"fought to that cap only where an order ahead leaves it under "
                        f"{min(COMP_LEAD_HOLD_SHARE, COMP_LEAD_SHARE):.0%} of the side, "
