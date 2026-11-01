@@ -6,7 +6,8 @@ this mechanism").
 Run: python -m unittest test_send_comp_lead_monitor
 
 Worth testing: leads read off the day log (moves, ends, restarts, the window
-clip), lead fills matched to a lead's side and price, the hedge rows and the
+clip), lead fills matched to a lead's side and price and, since 2026-11-01,
+to the lead's own order off the orders rows, the hedge rows and the
 open jobs, the verdict rules, and the orders resting ahead of leads off the
 book_depth rows (Jack 2026-10-30: "Daily email report on leads").
 """
@@ -74,6 +75,7 @@ class TestLeads(unittest.TestCase):
         self.assertEqual(p["groups"], (125, 78))
         k = p["leads"][("KXK-30-JDON", "ask")]
         self.assertEqual(k["spans"], [[a, _ts(8)]])          # 04:00Z - 08:00Z
+        self.assertEqual(k["all_spans"], [[_ts(2), _ts(8)]])  # ...from 02:00Z, unclipped
         self.assertEqual(k["px"], 57)
         self.assertFalse(k["leading_at_end"])
         d = p["leads"][("KXW-26-D", "bid")]
@@ -255,6 +257,100 @@ class TestFairLeads(unittest.TestCase):
         self.assertIn("no price  KXRAINWKND-26OCT31-SGF bought 200 @ 54c at 03:00 ET, no price "
                       "yet  (fair: rides to settlement)", text)
         self.assertTrue(text.isascii())
+
+
+class TestLeadOrders(unittest.TestCase):
+    """A fill is a lead's when the order it filled was set at that price while
+    its side led and was our front order there, off the bot's own orders rows
+    (Jack 2026-11-01: "Do this task here: Count every lead fill in the leads
+    email"). The logged lead price alone found 493 of ~1,270 weekend-rain
+    lead contracts over 10/28-11/01."""
+
+    T = "KXRAINELECTION-03NOV26-IND"
+
+    @staticmethod
+    def _row(kind, oid, ts, px, count, side="bid", t=None, **kw):
+        return dict(kind=kind, order_id=oid, ticker=t or TestLeadOrders.T, book_side=side,
+                    price_cents=px, count=count,
+                    ts=datetime.fromtimestamp(ts, timezone.utc).isoformat(), **kw)
+
+    @staticmethod
+    def _fill(oid, ts, px, count, side="bid", t=None, **kw):
+        return dict(ticker=t or TestLeadOrders.T, order_id=oid, ts=int(ts),
+                    yes_price_cents=px, count=count, is_taker=False, our_book_side=side,
+                    side="yes" if side == "bid" else "no", action="buy", **kw)
+
+    def test_a_lead_moved_by_an_unlogged_amend_still_counts(self):
+        # 11/01: IND's bid lead logged 200 @ 30c, then went to 32c by an amend
+        # with no new lead line, and was swept 200 @ 32c ten minutes later
+        a, b = cm.day_window(date(2026, 10, 29))
+        lines = [fair_lead("06:03:47", tk=self.T, px=30, best=29, fair=37)]
+        leads = cm.parse_leads(lines, a, b)["leads"]
+        orders = [self._row("place", "A", _ts(6, 3, 50), 30, 200),
+                  self._row("amend", "A", _ts(6, 5, 44), 32, 200, total_count=200.0)]
+        fill = self._fill("A", _ts(6, 15, 44), 32, 200.0)
+        self.assertEqual(cm.lead_fills([fill], leads), [])      # the logged price alone
+        got = cm.lead_fills([fill], leads, orders)
+        self.assertEqual([(x["px"], x["count"], x["kind"]) for x in got], [(32.0, 200.0, "fair")])
+        # an amend in the fill's own second (a fill row keeps whole seconds):
+        # KXGOOGVREQ-02NOV26-T11P0's 600 @ 27c rung was led to 33c at
+        # 08:05:56.4 on 10/31 and filled 13 @ 33c that second
+        lines.append(fair_lead("08:05:53", tk="KXG-1", px=33, best=27, fair=57))
+        leads = cm.parse_leads(lines, a, b)["leads"]
+        orders += [self._row("place", "G", _ts(7, 53, 52), 27, 600, t="KXG-1"),
+                   self._row("amend", "G", _ts(8, 5, 56) + 0.4, 33, 600, t="KXG-1",
+                             total_count=600.0)]
+        got = cm.lead_fills([fill, self._fill("G", _ts(8, 5, 56), 33, 13.0, t="KXG-1")],
+                            leads, orders)
+        self.assertEqual([(x["ticker"], x["px"]) for x in got], [(self.T, 32.0), ("KXG-1", 33.0)])
+
+    def test_a_rung_behind_the_lead_or_set_before_it_does_not_count(self):
+        a, b = cm.day_window(date(2026, 10, 29))
+        leads = cm.parse_leads([fair_lead("06:00:00", tk=self.T, px=30, best=26, fair=40)],
+                               a, b)["leads"]
+        orders = [self._row("place", "R", _ts(5), 25, 60),           # a rung before the lead
+                  self._row("place", "S", _ts(5), 30, 50),           # one at the lead's price
+                  self._row("place", "A", _ts(6, 0, 5), 30, 200),    # the lead
+                  self._row("amend", "R", _ts(6, 2), 25, 61, total_count=61.0)]
+        fills = [self._fill("A", _ts(6, 10), 30, 200.0),             # the lead, swept...
+                 self._fill("R", _ts(6, 10), 25, 61.0),              # ...with the rung behind it
+                 self._fill("S", _ts(6, 20), 30, 50.0),              # in front once A is gone
+                 self._fill("X", _ts(6, 30), 30, 5.0),               # no rows: at the lead price
+                 self._fill("Y", _ts(6, 31), 31, 5.0),               # no rows: off it
+                 self._fill("L", _ts(6, 32), 30, 5.0, client_order_id="imm-r1-h0001")]
+        got = cm.lead_fills(fills, leads, orders)
+        self.assertEqual([(x["count"], x["px"]) for x in got], [(200.0, 30.0), (5.0, 30.0)])
+        # an order filled out earlier rests no more: S, set at the lead's
+        # price while it led, is the front once A's fills retired it
+        orders.append(self._row("amend", "S", _ts(6, 1), 30, 50, total_count=50.0))
+        got = cm.lead_fills(fills, leads, orders)
+        self.assertEqual([(x["count"], x["px"]) for x in got],
+                         [(200.0, 30.0), (50.0, 30.0), (5.0, 30.0)])
+
+    def test_the_report_reads_the_orders_rows_from_the_day_before(self):
+        # STL's 10/30 shape: an ask lead logged at 70c before midnight UTC,
+        # moved to 68c by an amend with no new lead line, picked off 167 @ 68c
+        # the next morning; the order's rows are all in the day before's file
+        t, d = "KXRAINWKND-26OCT25-STL", imm.STATUS_DIR
+        with open(os.path.join(d, "incentive-mm-2026-10-25.log"), "w", encoding="utf-8") as f:
+            f.write(fair_lead("23:45:00", tk=t, side="ask", px=70, best=72, fair=63, d=24))
+            f.write(f"2026-10-25 06:00:00Z [IMM] fair lead {t} ask: off -- the weekend rain "
+                    f"fair no longer puts it ahead of its own, or an order stepped ahead "
+                    f"of it\n")
+        with open(os.path.join(d, "orders_2026-10-24.jsonl"), "w", encoding="utf-8") as f:
+            for r in (self._row("place", "P", _ts(23, 45, 3, d=24), 70, 200, side="ask", t=t),
+                      self._row("amend", "P", _ts(23, 58, d=24), 68, 200, side="ask", t=t,
+                                total_count=200.0)):
+                f.write(json.dumps(r) + "\n")
+        fill = self._fill("P", _ts(5, 39, 10, d=25), 68, 167.0, side="ask", t=t)
+        with open(os.path.join(d, "fills_2026-10-25.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(fill) + "\n")
+        ctx = cm.build_report(date(2026, 10, 25),
+                              now=datetime(2026, 10, 26, 11, 55, tzinfo=timezone.utc))
+        self.assertEqual([(x["ticker"], x["side"], x["count"], x["px"]) for x in ctx["fills"]],
+                         [(t, "ask", 167.0, 68.0)])
+        self.assertEqual(cm.lead_fills([fill], ctx["leads"]), [])   # the logged 70c alone
+        self.assertIn("KXRAINWKND-26OCT25-STL sold 167 @ 68c", cm.render_text(ctx))
 
 
 class TestMoney(unittest.TestCase):

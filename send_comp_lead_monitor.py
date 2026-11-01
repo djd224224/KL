@@ -63,7 +63,13 @@ ONE EMAIL per ET day (the day before), the money first, in plain words
   fills       every fill at a lead (partial fills at one price as one),
               biggest first, at the bot's latest mark or the settlement, and
               what became of it (hedged, a hedge resting, none; a fair
-              lead's rides to settlement)
+              lead's rides to settlement). A fill is a lead's when the order
+              it filled was set at that price while its side led and was our
+              front order on that side, off the bot's own orders rows (Jack
+              2026-11-01: "Do this task here: Count every lead fill in the
+              leads email"): the bot moves a lead by an amend without always
+              logging a new lead line, so the logged price alone missed most
+              of them (10/28-11/01: 493 of ~1,270 weekend-rain contracts)
   top earners the markets that earned most while leading
   orders in front of a lead  (Jack 2026-10-30: "Daily email report on
               leads", after "Hold at one half") every time an order rested
@@ -84,7 +90,8 @@ ONE EMAIL per ET day (the day before), the money first, in plain words
               led LIST_MIN_HOURS or earned LIST_MIN_USD; one line an event)
 
 SOURCES, read-only: the bot's day logs (incentive-mm-*.log), fills_ /
-comp_hedge_ / selection_snapshot_ / settlements_<UTC date>.jsonl,
+comp_hedge_ / selection_snapshot_ / settlements_ / orders_<UTC date>.jsonl
+(the led markets' orders rows only, from a day before the window),
 comp_hedge_jobs.json, reward_est_hourly_cache.json, the newest
 marks_<date>.jsonl's tail and book_depth/book_depth_<UTC date>_<run>.jsonl.gz
 (a day's is ~0.5 GB, scanned as bytes in ~1-2 min). No Kalshi reads, no
@@ -135,6 +142,8 @@ LIST_MIN_USD = 0.05             # ...or earned this much while leading
 LIST_TOP = 3                    # ...the top this many events of each kind, by reward
 BOOK_DEPTH_SUBDIR = "book_depth"    # in STATUS_DIR: the bot's book_depth sink
 AHEAD_LIST = 3                  # ORDERS IN FRONT lists the sides most orders stood ahead of
+ORDERS_LOOKBACK_SECS = 86400    # orders rows read this far before the window: a lead's
+                                # order placed the day before still rests in it
 LEAD_GAP_SECS = 600             # lead spans this close count as one (a restart's handover:
                                 # the banner ends them, the rung rests on until relogged)
 # c06a4f7 live (Jack 2026-10-30: "Hold at one half"): before it a lead fought
@@ -227,10 +236,11 @@ def row_ts(r: dict) -> float:
 
 def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
     """{(ticker, side): {"spans": [[start, end], ...], "px", "best", "implied",
-    "who", "dry", "open", "kind", "notes"}} for the window from the day-log
-    lines (kind "comp" or "fair"; "notes" [(ts, YES cents or None for off)],
-    lookback included, oldest first). A restart banner closes every open lead
-    (a new process logs its leads afresh)."""
+    "who", "dry", "open", "kind", "notes", "all_spans"}} for the window from
+    the day-log lines (kind "comp" or "fair"; "notes" [(ts, YES cents or None
+    for off)] and "all_spans" (unclipped) lookback included, oldest first). A
+    restart banner closes every open lead (a new process logs its leads
+    afresh)."""
     leads: dict = {}
     groups = None
     for line in lines:
@@ -270,31 +280,144 @@ def parse_leads(lines, a_ts: float, b_ts: float) -> dict:
             groups = (int(m.group(2)), int(m.group(3)))
     out = {}
     for key, ld in leads.items():
-        spans = [[max(s, a_ts), min(e, b_ts)] for s, e in ld["spans"] + (
-            [[ld["open"], b_ts]] if ld["open"] is not None else []) if e > a_ts]
+        raw = [list(sp) for sp in ld["spans"]] + (
+            [[ld["open"], b_ts]] if ld["open"] is not None else [])
+        spans = [[max(s, a_ts), min(e, b_ts)] for s, e in raw if e > a_ts]
         spans = [sp for sp in spans if sp[1] > sp[0]]
         if spans:
-            out[key] = dict(ld, spans=spans, leading_at_end=ld["open"] is not None)
+            out[key] = dict(ld, spans=spans, all_spans=raw,
+                            leading_at_end=ld["open"] is not None)
     return {"leads": out, "groups": groups}
 
 
-def lead_fills(fills: list, leads: dict) -> list:
-    """Our maker fills on a side while it led, at the price it led at."""
+def _book_side(f: dict) -> str:
+    """The side of our book a fill row's order rested on."""
+    return f.get("our_book_side") or (
+        "bid" if (f.get("side") == "yes") == (f.get("action") == "buy") else "ask")
+
+
+def _lead_px_then(ld: dict, ts: float) -> set:
+    """A lead's prices in effect at `ts`: each one logged from 10 min before
+    it to a minute after, and the last one before it (the day's last price
+    for a lead that carries no notes)."""
+    notes = ld.get("notes")
+    if not notes:
+        return {ld["px"]} if ld.get("px") is not None else set()
+    before = [n for n in notes if n[0] <= ts + 60]
+    out = {px for t, px in before if t >= ts - 600 and px is not None}
+    last = next((px for _t, px in reversed(before) if px is not None), None)
+    if last is not None:
+        out.add(last)
+    return out
+
+
+def order_rows(tickers: set, a_ts: float, b_ts: float) -> list:
+    """The orders sink's rows (place / amend / cancel / gone / reject /
+    uncertain) of `tickers`, from ORDERS_LOOKBACK_SECS before the window to
+    its end, oldest first. A line is parsed only when it names one of them
+    (a day's file runs ~200 MB)."""
+    out = []
+    for d in utc_dates(a_ts - ORDERS_LOOKBACK_SECS, b_ts):
+        try:
+            fh = open(os.path.join(imm.STATUS_DIR, f"orders_{d}.jsonl"), encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                i = line.find('"ticker": "')
+                if i < 0:
+                    continue
+                j = line.find('"', i + 11)
+                if line[i + 11:j] not in tickers:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("order_id"):
+                    out.append(r)
+    out.sort(key=row_ts)
+    return out
+
+
+def lead_fills(fills: list, leads: dict, orders=None) -> list:
+    """Our maker fills on a side's LEAD order while it led.
+
+    With `orders` (the led markets' orders rows: order_rows), a fill counts
+    when the order it filled was set at that price -- placed or amended
+    there -- while its side led, and no other order of ours on that side
+    rested at a better price. The bot moves a lead by an amend without
+    always logging a new lead line (KXRAINELECTION-03NOV26-IND's bid, logged
+    at 30c, went to 32c and was swept, 200 @ 32c), and a lead can rest
+    merged with its side's anchored rung (300 lots) or trimmed by the
+    event's room, so neither the logged price nor the lead's size finds them
+    all. A fill on an order the rows do not hold, and every fill without
+    `orders`, counts at a lead price logged around it (_lead_px_then). A
+    profit lock leg's fill never counts. `fills` may reach back before the
+    window: those only retire the orders they filled out."""
+    hist: dict = defaultdict(list)         # order id -> [(ts, kind, YES cents)]
+    size: dict = {}                        # order id -> its size (a place's, an amend's total)
+    expires: dict = {}
+    by_side: dict = defaultdict(set)       # (ticker, side) -> order ids
+    for r in orders or ():
+        oid, kind = r["order_id"], r.get("kind")
+        hist[oid].append((row_ts(r), kind, r.get("price_cents")))
+        if kind in ("place", "uncertain"):
+            size[oid] = float(r.get("count") or 0)
+            if r.get("expiration_ts"):
+                expires[oid] = float(r["expiration_ts"])
+        elif kind == "amend":
+            size[oid] = float(r.get("total_count") or r.get("count") or 0)
+        if r.get("ticker") and r.get("book_side"):
+            by_side[(r["ticker"], r["book_side"])].add(oid)
+    filled: dict = defaultdict(list)       # order id -> [(ts, count)]
+    for f in fills:
+        if f.get("order_id"):
+            filled[f["order_id"]].append((row_ts(f), float(f.get("count") or 0)))
+
+    def resting_px(oid: str, ts: float):
+        """Where order `oid` rested at `ts` (YES cents), or None: not placed
+        yet, cancelled, gone, expired or filled out."""
+        rows = [h for h in hist.get(oid, ()) if h[0] <= ts]
+        if not rows or rows[-1][1] not in ("place", "amend", "uncertain"):
+            return None
+        if expires.get(oid, float("inf")) <= ts:
+            return None
+        if sum(c for t, c in filled.get(oid, ()) if t < ts) >= size.get(oid, 0.0) - 0.01:
+            return None
+        return rows[-1][2]
+
     out = []
     for f in fills:
-        if f.get("is_taker"):
+        if f.get("is_taker") or imm.lock_leg_order(f):
             continue
-        side = f.get("our_book_side") or (
-            "bid" if (f.get("side") == "yes") == (f.get("action") == "buy") else "ask")
+        side = _book_side(f)
         ld = leads.get((f.get("ticker"), side))
         if not ld:
             continue
         ts = row_ts(f)
         px = f.get("yes_price_cents")
-        if any(s - 60 <= ts <= e + 600 for s, e in ld["spans"]) and px is not None \
-                and abs(float(px) - ld["px"]) <= 0.5:
+        if px is None or not any(s - 60 <= ts <= e + 600 for s, e in ld["spans"]):
+            continue
+        px = float(px)
+        oid = f.get("order_id")
+        # the row that set the order at this price (an amend can share the
+        # fill's second: a fill row's time is whole seconds)
+        set_at = next((t for t, kind, p in reversed(hist.get(oid, ()))
+                       if t <= ts + 1 and kind in ("place", "amend", "uncertain")
+                       and p is not None and abs(float(p) - px) <= 0.5), None)
+        if set_at is None:
+            ok = any(abs(px - c) <= 0.5 for c in _lead_px_then(ld, ts))
+        else:
+            led = any(s - 60 <= set_at <= e for s, e in ld.get("all_spans") or ld["spans"])
+            better = (lambda p: p > px + 0.5) if side == "bid" else (lambda p: p < px - 0.5)
+            ok = led and not any(
+                p is not None and better(float(p))
+                for p in (resting_px(o, ts) for o in by_side.get((f["ticker"], side), ())
+                          if o != oid))
+        if ok:
             out.append(dict(ticker=f.get("ticker"), side=side, ts=ts,
-                            count=float(f.get("count") or 0), px=float(px),
+                            count=float(f.get("count") or 0), px=px,
                             kind=ld.get("kind", "comp")))
     return out
 
@@ -940,7 +1063,10 @@ def build_report(day, now=None) -> dict:
     a_ts, b_ts = day_window(day)
     parsed = parse_leads(day_log_lines(a_ts), a_ts, b_ts)
     leads = parsed["leads"]
-    fills = lead_fills(list(jsonl_rows("fills", a_ts, b_ts)), leads)
+    # the fills from a day before the window too: they retire the orders they
+    # filled out, so the replay knows what rested ahead of a lead's order
+    fills = lead_fills(list(jsonl_rows("fills", a_ts - ORDERS_LOOKBACK_SECS, b_ts)), leads,
+                       order_rows({t for t, _s in leads}, a_ts, b_ts))
     rows = [r for r in jsonl_rows("comp_hedge", a_ts, b_ts) if a_ts <= row_ts(r) < b_ts]
     hedges = hedge_summary(rows, load_jobs(), now.timestamp())
     # a half-done lock whose markets have all settled is final: its dollars,
