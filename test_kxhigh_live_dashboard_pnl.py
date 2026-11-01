@@ -153,5 +153,22 @@ class CardPnlTests(unittest.TestCase):
         self.assertEqual(card["realized_pnl_today"], 999.0 - 300.0)
 
 
+class ObsSparklineDstTests(unittest.TestCase):
+    """The fall-back hour: 01:00 ET happened twice on 2026-11-01, and flooring
+    the local times raised AmbiguousTimeError, failing every dashboard build
+    from 05:15Z (Jack 2026-11-01: "logger seems broken")."""
+
+    def test_the_repeated_hour_is_two_buckets(self):
+        times = ["2026-11-01T04:40:00Z",                          # 00:40 EDT
+                 "2026-11-01T05:10:00Z", "2026-11-01T05:40:00Z",  # 01:xx EDT
+                 "2026-11-01T06:10:00Z", "2026-11-01T06:50:00Z",  # 01:xx EST
+                 "2026-11-01T07:20:00Z"]                          # 02:20 EST
+        obs = pd.DataFrame({"city_abv": "NY", "observation_time": times,
+                            "temperature_f": [50.0, 51.0, 52.0, 53.0, 54.0, 55.0],
+                            "polled_at": times})
+        pts = ld.obs_sparklines(obs)[("NY", "2026-11-01")]
+        self.assertEqual([p["v"] for p in pts], [50.0, 52.0, 54.0, 55.0])  # hourly max
+
+
 if __name__ == "__main__":
     unittest.main()

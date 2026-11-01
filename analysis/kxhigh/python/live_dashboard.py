@@ -1441,9 +1441,14 @@ def obs_sparklines(nws_obs: pd.DataFrame) -> dict[tuple[str, str], list[dict]]:
             local_times = g["observation_time"].dt.tz_convert(tz)
         # `hour_bucket`: floor each obs to its containing hour in local
         # time. Two obs at 14:05 and 14:55 land in the same 14:00 bucket.
+        # Floored in UTC, then converted: every city's offset is whole
+        # hours, so it is the same local hour, and the fall-back hour
+        # (01:00 twice on 2026-11-01) stays two buckets. Flooring the local
+        # times raised AmbiguousTimeError and failed every build from
+        # 05:15Z that day.
         g = g.assign(
             local_date=local_times.dt.date,
-            hour_bucket=local_times.dt.floor("h"),
+            hour_bucket=g["observation_time"].dt.floor("h").dt.tz_convert(local_times.dt.tz),
         ).sort_values("observation_time")
         for local_date, day_obs in g.groupby("local_date"):
             # Pick the hottest reading per hour. For each hour-bucket,
