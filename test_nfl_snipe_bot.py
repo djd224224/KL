@@ -315,9 +315,9 @@ class TestDefaults(unittest.TestCase):
                          (80.0, 160.0, 250.0))
         self.assertTrue(c.refill)
         self.assertFalse(sb.Config.from_env({"SNIPE_REFILL": "0"}).refill)
-        self.assertEqual(c.max_contracts_market, 1000)          # Jack 2026-10-24
+        self.assertEqual(c.max_contracts_market, 500)           # Jack 2026-11-01
         self.assertEqual(sb.Config.from_env(
-            {"SNIPE_MAX_CONTRACTS_MARKET": "500"}).max_contracts_market, 500)
+            {"SNIPE_MAX_CONTRACTS_MARKET": "250"}).max_contracts_market, 250)
 
     def test_sibling_means_ignore_wide_books(self):
         entries = {T: entry(), T_ESC: entry(kind="escalator", fair=2.5, lo=1, hi=5)}
@@ -361,13 +361,13 @@ class TestSizing(unittest.TestCase):
                                cfg(max_risk_market=1000, max_risk_player=41))
         self.assertEqual((n, why), (0, "player_cap"))
 
-    def test_contracts_held_in_a_market_cap_at_1000(self):
-        # Jack 2026-10-24: "Cap max contracts at 1k" -- the refill bought
-        # 3,999 of a 2c ladder inside the $80 market cap
+    def test_contracts_held_in_a_market_cap_at_500(self):
+        # Jack 2026-11-01: "cut down NFL sniper to 500 max contracts on a given
+        # market" (1k since 10/24) -- the refill bought 871 of a 9c ladder
         big = cfg(max_risk_market=1e6, max_risk_player=1e6, max_risk_total=1e6)
-        self.book.apply_fill(T, "sell", 900, 34.0, 0.0, self.s.player_key, KICK, NOW)
+        self.book.apply_fill(T, "sell", 400, 34.0, 0.0, self.s.player_key, KICK, NOW)
         n, why = sb.size_order(self.s, 24.0, 5000, self.book, 1e6, big)
-        self.assertEqual((n, why), (100, ""))                 # the short grows to 1,000
+        self.assertEqual((n, why), (100, ""))                 # the short grows to 500
         self.book.apply_fill(T, "sell", 98, 34.0, 0.0, self.s.player_key, KICK, NOW)
         n, why = sb.size_order(self.s, 24.0, 5000, self.book, 1e6, big)
         self.assertEqual((n, why), (0, "contract_cap"))       # 2 left: under the minimum

@@ -72,9 +72,11 @@ bottom.
 
 SIZE. The external liquidity inside the limit (our own resting orders
 netted out), capped by max_contracts_order (300), by max_contracts_market
-(1,000) held in the market either way (Jack 2026-10-24: "Cap max contracts
-at 1k", after the refill took 3,999 of a 2c ladder in 5 minutes for $80 of
-the market cap), and by the money at risk:
+(500) held in the market either way (Jack 2026-11-01: "cut down NFL sniper
+to 500 max contracts on a given market", after the refill took 871 of Aaron
+Jones' 9c rushing ladder in 40 s; 1,000 from 2026-10-24, "Cap max contracts
+at 1k", after it took 3,999 of a 2c ladder in 5 minutes for $80 of the
+market cap), and by the money at risk:
 max_risk_market ($80), max_risk_player ($160), max_risk_total ($250) over
 this bot's open book (market / player $40 / $80 until Jack 2026-10-22:
 "Increase size" -- its one live trade, 9 of Nico Collins' yards ladder at
@@ -197,7 +199,7 @@ class Config:
     max_risk_player: float = 160.0       # (80 until 10/22)
     max_risk_total: float = 250.0
     max_contracts_order: int = 300
-    max_contracts_market: int = 1000     # held in one market (Jack 2026-10-24)
+    max_contracts_market: int = 500      # held in one market (Jack 2026-11-01; 1000 from 10/24)
     min_contracts_order: int = 5
     cash_floor: float = 500.0            # free cash left on the shard
     stop_before_kickoff_min: float = 15.0
