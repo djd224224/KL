@@ -278,6 +278,12 @@ class TestSkipReasons(unittest.TestCase):
         self.assertEqual(self.r(e=entry(injury="not on roster")), "injury")
         self.assertEqual(self.r(e=entry(missed_games=["2026w6"])), "missed_game")
         self.assertEqual(self.r(e=entry(missed_games=[])), "")
+        drop, rise = (0.28, 0.69, "2026w7"), (0.5, 0.2, "2026w7")
+        self.assertEqual(self.r(e=entry(role_change=drop)), "")       # a drop leaves a sell
+        self.assertEqual(self.r(self.sig(side="buy"), e=entry(role_change=drop)),
+                         "role_change")                               # Aaron Jones, 10/30
+        self.assertEqual(self.r(e=entry(role_change=rise)), "role_change")
+        self.assertEqual(self.r(e=entry(role_change=rise), role_change_ratio=0), "")
         self.assertEqual(self.r(e=entry(news_at=NOW - 1800)), "team_news")
         self.assertEqual(self.r(e=entry(news_at=NOW - 3601)), "")   # 1h skip
         self.assertEqual(self.r(imm_fair=20.0), "model_mismatch")   # 15 vs 20
@@ -318,6 +324,7 @@ class TestDefaults(unittest.TestCase):
         self.assertEqual(c.max_contracts_market, 500)           # Jack 2026-11-01
         self.assertEqual(sb.Config.from_env(
             {"SNIPE_MAX_CONTRACTS_MARKET": "250"}).max_contracts_market, 250)
+        self.assertEqual(c.role_change_ratio, 0.6)             # Jack 2026-11-01
 
     def test_sibling_means_ignore_wide_books(self):
         entries = {T: entry(), T_ESC: entry(kind="escalator", fair=2.5, lo=1, hi=5)}
@@ -418,10 +425,79 @@ class TestMissedGames(unittest.TestCase):
         self.assertEqual(sb.missed_games(self.idx({1}), {"team": "NYG"}, 2026), [])
 
 
+class TestRoleChange(unittest.TestCase):
+    """His share of the team's opportunities in its last game vs the
+    window's earlier games (Jack 2026-11-01: "So fix sniper" -- Jordan
+    Mason's return cut Aaron Jones' carry share and the sniper bought 887 of
+    his rushing ladder at 9c)."""
+
+    E = {"pid": "00-0033293", "team": "MIN", "stat": "rshyds"}
+    MASON, QB = "00-0000002", "00-0000003"
+
+    @staticmethod
+    def row(pid, week, carries, targets=0.0):
+        return {"player_id": pid, "name": pid, "position": "RB", "season": 2026,
+                "week": week, "season_type": "REG", "team": "MIN",
+                "carries": float(carries), "targets": float(targets), "receptions": 0.0,
+                "receiving_yards": 0.0, "rushing_yards": 0.0, "fantasy_points_ppr": 0.0,
+                "attempts": 0.0}
+
+    def idx(self):
+        # Mason out in weeks 3-5 (Jones 17 / 20 / 25 carries), the bye in
+        # week 6, Mason back in week 7 with 15 carries to Jones' 8
+        j, m, q = self.E["pid"], self.MASON, self.QB
+        return nf.PlayerIndex([
+            self.row(j, 3, 17, 6), self.row(q, 3, 4),
+            self.row(j, 4, 20, 8), self.row(q, 4, 9),
+            self.row(j, 5, 25, 3), self.row(q, 5, 10),
+            self.row(j, 7, 8, 1), self.row(m, 7, 15, 2), self.row(q, 7, 5)])
+
+    def test_mason_back(self):
+        rc = sb.role_change(self.idx(), self.E, 2026)
+        self.assertEqual(rc[2], "2026w7")
+        self.assertAlmostEqual(rc[0], 8 / 28)
+        self.assertAlmostEqual(rc[1], (17 / 21 + 20 / 29 + 25 / 35) / 3)
+        self.assertTrue(sb.role_moved(rc, "buy", 0.6))        # the 10/30 buy
+        self.assertFalse(sb.role_moved(rc, "sell", 0.6))
+        self.assertFalse(sb.role_moved(rc, "buy", 0.0))       # off
+        # the latest season on file when none is given
+        self.assertEqual(sb.role_change(self.idx(), self.E, None), rc)
+
+    def test_the_stat_picks_the_opportunities(self):
+        rec = sb.role_change(self.idx(), dict(self.E, stat="recyds"), 2026)
+        self.assertAlmostEqual(rec[0], 1 / 3)                 # targets: 1 of 3
+        self.assertAlmostEqual(rec[1], 1.0)
+        ff = sb.role_change(self.idx(), dict(self.E, stat="ffpts"), 2026)
+        self.assertAlmostEqual(ff[0], 9 / 31)                 # carries + targets
+        self.assertIsNone(sb.role_change(self.idx(), dict(self.E, stat="passyds"), 2026))
+
+    def test_rises_and_small_roles(self):
+        self.assertTrue(sb.role_moved((0.5, 0.2, "w"), "sell", 0.6))
+        self.assertFalse(sb.role_moved((0.5, 0.2, "w"), "buy", 0.6))
+        self.assertFalse(sb.role_moved((0.25, 0.2, "w"), "sell", 0.6))  # 1.25x: noise
+        self.assertFalse(sb.role_moved((0.15, 0.2, "w"), "buy", 0.6))   # 0.75x: noise
+        self.assertTrue(sb.role_moved((0.12, 0.01, "w"), "sell", 0.6))  # a new role
+        self.assertFalse(sb.role_moved((0.05, 0.01, "w"), "sell", 0.6))
+        self.assertFalse(sb.role_moved(None, "buy", 0.6))
+
+    def test_nothing_to_judge(self):
+        j = self.E["pid"]
+        # no line in the last game: missed_games skips that one
+        rows = [self.row(j, w, 20) for w in (3, 4, 5)] + [self.row(self.MASON, 7, 15)]
+        self.assertIsNone(sb.role_change(nf.PlayerIndex(rows), self.E, 2026))
+        # a single earlier game
+        rows = [self.row(j, 5, 20), self.row(j, 7, 8), self.row(self.MASON, 7, 15)]
+        self.assertIsNone(sb.role_change(nf.PlayerIndex(rows), self.E, 2026))
+        self.assertIsNone(sb.role_change(None, self.E, 2026))
+        self.assertIsNone(sb.role_change(FakeIndex({}), self.E, 2026))
+        self.assertIsNone(sb.role_change(self.idx(), self.E, 2027))
+
+
 # ------------------------------------------------------------- end to end
 
 class FakeExchange:
-    def __init__(self, markets, books, own=None, cash=2000.0, resp=None, booked=None):
+    def __init__(self, markets, books, own=None, cash=2000.0, resp=None, booked=None,
+                 held=None):
         self.markets, self.books = markets, books
         self.own = own or {}
         self.cash = cash
@@ -429,10 +505,22 @@ class FakeExchange:
         self.placed = []
         self.subaccount = 0
         self.booked = booked
+        # Kalshi's count: ticker -> contracts, "placed" = the orders' fills,
+        # None = unreadable
+        self.held = held
         self.api_base = "fake"
 
     def order_subaccount(self, order_id):
         return self.booked
+
+    def held_positions(self, ticker=None):
+        if self.held is None:
+            raise OSError("positions unreadable")
+        out = dict(self.held) if self.held != "placed" else {}
+        if self.held == "placed":
+            for t, side, count, _limit, _coid in self.placed:
+                out[t] = out.get(t, 0.0) + (count if side == "buy" else -count)
+        return {t: n for t, n in out.items() if n and (ticker is None or t == ticker)}
 
     def open_markets(self):
         return list(self.markets.values())
@@ -671,11 +759,11 @@ class TestSubaccountLive(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def bot(self, booked):
+    def bot(self, booked, held=None):
         ex = FakeExchange(
             {T: market(bid=34, ask=98)},
             {T: {"orderbook_fp": {"yes_dollars": [["0.3400", "60"]], "no_dollars": []}}},
-            booked=booked)
+            booked=booked, held=held)
         games = {entry()["pid"]: [{"receptions": v} for v in (3, 3, 4, 5)]}
         b = sb.Sniper(cfg(live=True, subaccount=3), exchange=ex,
                       watch=FakeWatch({T: entry()}, games), kick=FakeKick(),
@@ -701,6 +789,101 @@ class TestSubaccountLive(unittest.TestCase):
         self.assertEqual(js["subaccount"], 0)
         # ... and the next scan does nothing
         self.assertTrue(b.scan(NOW + 1000).get("halted"))
+
+    # Jack 2026-11-01: "So fix sniper" -- the 10/30 halt was an unreadable
+    # readback of an order Kalshi had booked to subaccount 1
+    def test_unreadable_order_confirmed_by_the_position_trades_on(self):
+        b, ex = self.bot(booked=None, held="placed")
+        out = b.scan(NOW)
+        self.assertEqual(len(out["taken"]), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.d, sb.HALT_FILE)))
+        self.assertLess(b.book.pos(T), 0)
+
+    def test_unreadable_order_not_in_the_subaccount_halts(self):
+        b, ex = self.bot(booked=None, held={})
+        out = b.scan(NOW)
+        self.assertEqual(out["skips"].get("wrong_subaccount"), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.d, sb.HALT_FILE)))
+        self.assertFalse(os.path.exists(os.path.join(self.d, sb.BOOK_FILE)))
+
+    def test_unreadable_order_and_positions_halts(self):
+        b, ex = self.bot(booked=None, held=None)
+        self.assertEqual(b.scan(NOW)["skips"].get("wrong_subaccount"), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.d, sb.HALT_FILE)))
+
+    def test_reconcile_takes_kalshis_count(self):
+        b, ex = self.bot(booked=3, held={T: 887.0, "KXOTHER-1": 5.0, "KXPAST-1": 2.0})
+        b.book.apply_fill(T, "buy", 871, 9.0, 4.9647, "p|MIN", KICK, NOW - 100, limit=9.0)
+        b.book.apply_fill("KXPAST-1", "buy", 1, 50.0, 0.02, "q|X", NOW - 60, NOW - 100)
+        lines = b.reconcile(NOW)
+        self.assertEqual(b.book.pos(T), 887.0)
+        self.assertAlmostEqual(b.book.d["cost"][T], 79.83, places=4)
+        self.assertAlmostEqual(b.book.d["fees"][T], 4.9647 * 887 / 871, places=4)
+        self.assertEqual(b.book.d["last_limit"][T], ["buy", 9.0])   # the refill's reference
+        self.assertEqual(b.book.last_trade(T), NOW - 100)           # no new cooldown
+        self.assertEqual(b.book.pos("KXPAST-1"), 1.0)               # kicked off: left as is
+        self.assertNotIn("KXOTHER-1", b.book.d["positions"])        # not in the book
+        warn = [ln for ln in lines if ln.startswith("!")]
+        self.assertEqual(len(warn), 2)
+        self.assertEqual([(r["ticker"], r["side"], r["n"]) for r in sb.load_trades(self.d, "live")],
+                         [(T, "buy", 16.0)])                        # the P&L sees the 16
+        again = sb.SnipeBook(os.path.join(self.d, "snipe_book_sub3.json"), 3)
+        self.assertEqual(again.pos(T), 887.0)
+        self.assertEqual(b.reconcile(NOW), warn)                    # nothing more to take
+
+    def test_reconcile_a_short(self):
+        b, ex = self.bot(booked=3, held={T: -12.0})
+        b.book.apply_fill(T, "sell", 9, 28.33, 0.13, "p|HOU", KICK, NOW - 100, limit=28.0)
+        self.assertEqual(len(b.reconcile(NOW)), 1)
+        self.assertEqual(b.book.pos(T), -12.0)
+        self.assertAlmostEqual(b.book.d["cost"][T], -12 * 0.2833, places=4)
+
+    def test_order_readback_retries(self):
+        calls = []
+
+        class Flaky:
+            def get(self, path, params):
+                calls.append(params)
+                if len(calls) <= 2:
+                    raise OSError("timed out")
+                return {"order": {"subaccount_number": 1}}
+
+        ex = sb.Exchange(1)
+        ex._acct = Flaky()
+        with mock.patch.object(sb.time, "sleep") as slept:
+            self.assertEqual(ex.order_subaccount("o1"), 1)
+        self.assertEqual(len(calls), 3)
+        slept.assert_called_once_with(0.5)
+
+        class Blank:
+            def get(self, path, params):
+                return {"order": {}}
+
+        ex._acct = Blank()
+        with mock.patch.object(sb.time, "sleep") as slept:
+            self.assertIsNone(ex.order_subaccount("o1"))
+        self.assertEqual([c.args for c in slept.call_args_list], [(0.5,), (1.5,)])
+
+    def test_held_positions_reads_the_subaccount(self):
+        calls = []
+
+        class C:
+            def get(self, path, params):
+                calls.append((path, dict(params)))
+                if "cursor" not in params:
+                    return {"market_positions": [{"ticker": "A", "position_fp": "887.00"},
+                                                 {"ticker": "B", "position_fp": "0.00"}],
+                            "cursor": "c2"}
+                return {"market_positions": [{"ticker": "C", "position": -9}], "cursor": ""}
+
+        ex = sb.Exchange(1)
+        ex._acct = C()
+        self.assertEqual(ex.held_positions(), {"A": 887.0, "C": -9.0})
+        self.assertEqual(calls[0], ("/portfolio/positions", {"subaccount": 1, "limit": 1000}))
+        self.assertEqual(calls[1][1]["cursor"], "c2")
+        calls.clear()
+        ex.held_positions("A")
+        self.assertEqual(calls[0][1]["ticker"], "A")
 
     def test_free_cash_reads_the_subaccounts_own_balance(self):
         got = {}

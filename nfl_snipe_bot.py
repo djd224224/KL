@@ -24,6 +24,16 @@ have (Keenan Allen out -> Downs' ladder 24 -> 34). A signal is SKIPPED when:
                 receiving mean at 19.8 yds off Weeks 2-5, and the sniper
                 bought 3,999 of his yards ladder at 2c (8 yds) on 10/24
                 (Jack 2026-10-24: "Yes fix sniper")
+  role_change   his share of the team's opportunities for the stat (carries
+                for rushing, targets for receiving, both for fantasy points)
+                in his team's last game is under role_change_ratio (0.6) of
+                his mean share in the window's earlier games he played, or
+                over 1/0.6 of it. A drop skips a buy and a rise skips a sell:
+                the model's mean lags a new role. Jordan Mason's return in
+                Week 7 (15 carries to 8) cut Aaron Jones' carry share from
+                69% to 28% while his mean stayed on Weeks 2-5, and the
+                sniper bought 887 of his rushing ladder at 9c (36 yds vs the
+                model's 60) on 10/30 (Jack 2026-11-01: "So fix sniper")
   team_news     a contributor on his team changed designation in the last
                 news_skip_hours (1; 12 until Jack 2026-10-09: "move sniper
                 down to 1hr") -- this bot's watch or the IMM's (a
@@ -149,7 +159,7 @@ from email.mime.text import MIMEText
 from collections import Counter
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -210,6 +220,7 @@ class Config:
     sibling_tol: float = 0.15
     model_mismatch_tol: float = 0.15     # vs the IMM's fair for the market
     recent_games: int = 4                # the recent-form band's window
+    role_change_ratio: float = 0.6       # last game's share vs the window's (0 = off)
     cooldown_secs: float = 900.0
     refill: bool = True                  # the cooldown passes a repeat at the last limit or better
     max_orders_per_scan: int = 3
@@ -699,19 +710,48 @@ class Exchange:
             body["subaccount"] = self.subaccount
         return c.post(path=c.events_orders_url, body=json.dumps(body))
 
-    def order_subaccount(self, order_id: str) -> Optional[int]:
+    def order_subaccount(self, order_id: str, tries: int = 3) -> Optional[int]:
         """The subaccount Kalshi booked an order to (subaccount_number on
-        the order record), None when it cannot be read."""
+        the order record), None when it cannot be read. Each try asks with
+        and without the subaccount; the tries wait 0.5 s, then 1.5 s (on
+        10/30 one unreadable read halted the bot over an order booked to
+        subaccount 1)."""
         c = self.acct()
-        for params in ({"subaccount": self.subaccount}, {}):
-            try:
-                js = c.get(f"/portfolio/orders/{order_id}", params)
-            except Exception:                            # noqa: BLE001
-                continue
-            o = (js or {}).get("order") or js or {}
-            if o.get("subaccount_number") is not None:
-                return int(o["subaccount_number"])
+        for i in range(tries):
+            if i:
+                time.sleep(0.5 if i == 1 else 1.5)
+            for params in ({"subaccount": self.subaccount}, {}):
+                try:
+                    js = c.get(f"/portfolio/orders/{order_id}", params)
+                except Exception:                        # noqa: BLE001
+                    continue
+                o = (js or {}).get("order") or js or {}
+                if o.get("subaccount_number") is not None:
+                    return int(o["subaccount_number"])
         return None
+
+    def held_positions(self, ticker: Optional[str] = None) -> Dict[str, float]:
+        """ticker -> the signed YES contracts this subaccount holds (markets
+        it holds none of are left out); one market when `ticker` is given.
+        Raises when Kalshi cannot be read."""
+        out: Dict[str, float] = {}
+        cursor = None
+        for _ in range(20):
+            params: Dict[str, Any] = {"subaccount": self.subaccount, "limit": 1000}
+            if ticker:
+                params["ticker"] = ticker
+            if cursor:
+                params["cursor"] = cursor
+            js = self.acct().get("/portfolio/positions", params) or {}
+            for p in js.get("market_positions") or []:
+                raw = p.get("position_fp")
+                n = float(raw if raw is not None else p.get("position") or 0.0)
+                if p.get("ticker") and abs(n) > 1e-9:
+                    out[p["ticker"]] = n
+            cursor = js.get("cursor")
+            if not cursor:
+                break
+        return out
 
 
 def _signed_get_json(path: str, params: dict) -> dict:
@@ -862,6 +902,8 @@ def skip_reason(sig: Signal, e: dict, snap_ts: float, now_ts: float,
         return "injury"
     if e.get("missed_games"):
         return "missed_game"
+    if role_moved(e.get("role_change"), sig.side, cfg.role_change_ratio):
+        return "role_change"
     na = e.get("news_at")
     if na is not None and now_ts - float(na) < cfg.news_skip_hours * 3600:
         return "team_news"
@@ -897,6 +939,59 @@ def missed_games(index: Any, e: dict, season: Optional[int],
     keys = sorted(key for key in games if key[0] == season)[-k:]
     return [f"{s}w{w}" for s, w in keys
             if not any(r.get("player_id") == pid for r in games[(s, w)])]
+
+
+# the opportunities a stat comes from, as nflverse columns
+ROLE_SHARE_COLS: Dict[str, Tuple[str, ...]] = {
+    "rshyds": ("carries",), "rec": ("targets",), "recyds": ("targets",),
+    "ffpts": ("carries", "targets")}
+ROLE_MIN_BASE = 0.02    # a mean share under this is no role to lose ...
+ROLE_NEW_SHARE = 0.10   # ... and a last game at this share is a new one
+
+
+def role_change(index: Any, e: dict, season: Optional[int],
+                k: int = 4) -> Optional[Tuple[float, float, str]]:
+    """(last, base, '<season>w<week>'): his share of the team's
+    opportunities for the entry's stat in his team's last game of `season`
+    (the latest season on file when None), and his mean share over the
+    earlier of its last k games in which he has a line. None without a line
+    in that last game (missed_games skips it), with fewer than 2 earlier
+    games, or with nothing to measure."""
+    tg = getattr(index, "team_games", None)
+    pid, team = e.get("pid"), e.get("team")
+    cols = ROLE_SHARE_COLS.get(e.get("stat") or "")
+    if not tg or pid is None or not team or not cols:
+        return None
+    games = tg.get(nf.KALSHI_TO_NFLV.get(team, team)) or {}
+    if season is None and games:
+        season = max(s for s, _w in games)
+    keys = sorted(key for key in games if key[0] == season)[-k:]
+    shares: List[Optional[float]] = []
+    for key in keys:
+        rows = games[key]
+        tot = sum(float(r.get(c) or 0.0) for r in rows for c in cols)
+        mine = [r for r in rows if r.get("player_id") == pid]
+        shares.append(sum(float(mine[0].get(c) or 0.0) for c in cols) / tot
+                      if mine and tot > 0 else None)
+    prior = [s for s in shares[:-1] if s is not None]
+    if not shares or shares[-1] is None or len(prior) < 2:
+        return None
+    s, w = keys[-1]
+    return shares[-1], sum(prior) / len(prior), f"{s}w{w}"
+
+
+def role_moved(rc: Optional[Sequence[Any]], side: str, ratio: float) -> bool:
+    """A role change (role_change's tuple) that leaves the model's mean stale
+    on this side: a drop (the mean too high) skips a buy, a rise skips a
+    sell. ratio <= 0 turns it off."""
+    if not rc or ratio <= 0:
+        return False
+    last, base = float(rc[0]), float(rc[1])
+    if base < ROLE_MIN_BASE:
+        dropped, rose = False, last >= ROLE_NEW_SHARE
+    else:
+        dropped, rose = last < ratio * base, last > base / ratio
+    return (dropped and side == "buy") or (rose and side == "sell")
 
 
 def espn_team(e: dict) -> Optional[str]:
@@ -1095,6 +1190,9 @@ class Sniper:
             missed = missed_games(index, e, season)
             if missed:
                 e = dict(e, missed_games=missed)
+            rc = role_change(index, e, season, cfg.recent_games)
+            if rc:
+                e = dict(e, role_change=rc)
             # the later of this watch's and the IMM's news on the team
             et = espn_team(e)
             if et in imm_news and (e.get("news_at") is None
@@ -1203,6 +1301,10 @@ class Sniper:
         oid = resp.get("order_id") or ""
         if cfg.subaccount and oid:
             booked = self.ex.order_subaccount(oid)
+            if booked is None and self._position_confirms(sig, filled):
+                self.log(f"order {oid} on {sig.ticker} unreadable; subaccount "
+                         f"{cfg.subaccount}'s position confirms it")
+                booked = cfg.subaccount
             if booked != cfg.subaccount:
                 return self._wrong_subaccount(sig, row, coid, oid, booked, filled,
                                               avg_fill, fee, now_ts)
@@ -1225,6 +1327,54 @@ class Sniper:
         self.book.save()
         return {**row, "filled": filled, "avg_cents": avg_fill, "fee": fee,
                 "order_id": oid}
+
+    def _position_confirms(self, sig: Signal, filled: float) -> bool:
+        """An order whose record cannot be read: the subaccount now holds the
+        book's position plus this fill (Kalshi's count, read back)."""
+        try:
+            held = self.ex.held_positions(sig.ticker).get(sig.ticker, 0.0)
+        except Exception:                                # noqa: BLE001
+            return False
+        want = self.book.pos(sig.ticker) + (filled if sig.side == "buy" else -filled)
+        return abs(held - want) < 0.5
+
+    def reconcile(self, now_ts: Optional[float] = None) -> List[str]:
+        """Live in a subaccount, at start: each open market not yet kicked off
+        takes the contract count Kalshi has for the subaccount (this bot's
+        alone), at the book's average price and fee, plus a `reconciled`
+        fills row for the P&L. On 10/30 an unreadable readback left 16 filled
+        contracts out of the book. Returns the log lines; raises when Kalshi
+        cannot be read."""
+        now_ts = time.time() if now_ts is None else now_ts
+        held = self.ex.held_positions()
+        d, lines = self.book.d, []
+        for t in sorted(set(d["positions"]) | set(held)):
+            have, got = self.book.pos(t), float(held.get(t, 0.0))
+            if abs(have - got) < 0.5:
+                continue
+            ko = d["kickoff"].get(t)
+            if t not in d["positions"] or ko is None or float(ko) <= now_ts:
+                lines.append(f"! book {have:g} vs Kalshi {got:g} on {t}: left as is "
+                             f"({'not in the book' if t not in d['positions'] else 'kicked off'})")
+                continue
+            delta = got - have
+            avg = float(d["cost"].get(t, 0.0)) / have * 100.0     # cents a YES contract
+            fee = float(d["fees"].get(t, 0.0)) / abs(have) * abs(delta)
+            side = "buy" if delta > 0 else "sell"
+            self.book.apply_fill(t, side, abs(delta), avg, fee, d["player"].get(t, ""),
+                                 float(ko), self.book.last_trade(t) or now_ts,
+                                 order_id="reconciled")
+            self.log.row("fills", {"ts": _utc(now_ts).isoformat(), "ticker": t,
+                                   "player": d["player"].get(t, ""), "side": side,
+                                   "filled": abs(delta), "avg_cents": round(avg, 4),
+                                   "fee": round(fee, 4), "kickoff": float(ko),
+                                   "reconciled": True, "live": True,
+                                   "subaccount": self.cfg.subaccount})
+            lines.append(f"book {have:g} -> {got:g} on {t}: Kalshi's count "
+                         f"({side} {abs(delta):g} @ {avg:.2f}c, fee ${fee:.2f})")
+        if any(not ln.startswith("!") for ln in lines):
+            self.book.save()
+        return lines
 
     def _wrong_subaccount(self, sig: Signal, row: dict, coid: str, oid: str,
                           booked: Optional[int], filled: float, avg_fill: float,
@@ -1624,6 +1774,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"player / ${cfg.max_risk_total:g} total, {cfg.max_contracts_market} contracts "
             f"a market, cash floor ${cfg.cash_floor:g}"
             + (f", orders via {ex.api_base}" if cfg.live else ""))
+    if cfg.live and cfg.subaccount:
+        try:
+            for line in bot.reconcile():
+                bot.log(line)
+        except Exception as e:                           # noqa: BLE001
+            bot.log(f"! book check against Kalshi failed: {type(e).__name__}: "
+                    f"{str(e)[:200]}")
     while True:
         t0 = time.time()
         try:
