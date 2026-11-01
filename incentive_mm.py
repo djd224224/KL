@@ -4499,6 +4499,25 @@ SWEEP_LINKED_GROUPS = _parse_sweep_groups(
     os.environ.get("IMM_SWEEP_LINKED", "KXTRUMPAPPROVE,KXAPRPOTUS"))
 SWEEP_HOLD_BY_SERIES = _parse_hold_by_series(
     os.environ.get("IMM_SWEEP_HOLD_BY_SERIES", "KXTRUMPAPPROVE:600,KXAPRPOTUS:600"))
+# TEN MINUTES, RAIN AT TWO (Jack 2026-11-01: "Yes, 10 minutes", on "Move the
+# breaker hold to 10 minutes, with rain kept at 2?"). The launcher's
+# IMM_SWEEP_HOLD_SECS went 120 -> 600. Replay of every live trip 10/18
+# 00:04Z - 11/01 16:35Z (2,190 trips on 402 events, 14.7 days): a trip
+# holds max(its hold, H), a later trip inside that hold never happens, the
+# event's fills there count as avoided (marked to the external mid), and the
+# event's modelled reward pays for the held time the real breaker did not
+# already hold. Per day against 2 min, at 30m / 4h mark-outs: 5 min +$0.71
+# / +$3.35, 10 min +$4.11 / +$13.63, 15 min -$0.53 / +$12.37, 30 min -$3.00
+# / +$12.73, 60 min -$20.35 / +$5.76. Rain lost at every longer hold (a
+# rain event spans dozens of cities, and its next sweep is usually another
+# region), so it keeps 2 min: then +$6.8 / +$17.7 a day, 10 of 15 days up.
+# The biggest save is KXTOKENUSE-26NOV02's second wave, 5 min after the
+# 10/31 10:55Z trip. A series starting with a SWEEP_HOLD_BY_PREFIX prefix
+# takes that hold in place of SWEEP_HOLD_SECS, shorter or longer (the
+# longest prefix wins); SWEEP_HOLD_BY_SERIES and its linked group still
+# lengthen it. IMM_SWEEP_HOLD_BY_PREFIX: "PREFIX:secs,..." ("" = none).
+SWEEP_HOLD_BY_PREFIX = _parse_hold_by_series(
+    os.environ.get("IMM_SWEEP_HOLD_BY_PREFIX", "KXRAIN:120"))
 
 
 def sweep_exempt(series: str) -> bool:
@@ -4521,12 +4540,19 @@ def sweep_hold_key(event: str) -> str:
     return event if len(g) < 2 else "group:" + ",".join(g)
 
 
+def sweep_base_hold(series: str) -> float:
+    """`series`'s hold before its linked group: its longest
+    SWEEP_HOLD_BY_PREFIX prefix's, else SWEEP_HOLD_SECS."""
+    p = max((p for p in SWEEP_HOLD_BY_PREFIX if series.startswith(p)), key=len, default=None)
+    return SWEEP_HOLD_SECS if p is None else SWEEP_HOLD_BY_PREFIX[p]
+
+
 def sweep_hold_secs(series: str) -> float:
     """A trip's hold in `series`: the longest SWEEP_HOLD_BY_SERIES entry in its
-    linked group, never under SWEEP_HOLD_SECS."""
-    return max([SWEEP_HOLD_SECS] + [SWEEP_HOLD_BY_SERIES[s]
-                                    for s in sweep_linked_series(series)
-                                    if s in SWEEP_HOLD_BY_SERIES])
+    linked group, never under its base (sweep_base_hold)."""
+    return max([sweep_base_hold(series)] + [SWEEP_HOLD_BY_SERIES[s]
+                                            for s in sweep_linked_series(series)
+                                            if s in SWEEP_HOLD_BY_SERIES])
 
 
 # ESCALATING HOLDS FOR REPEAT TRIPS (Jack 2026-10-17: "Build 1 without
@@ -11787,6 +11813,7 @@ _CONFIG_CODE_KNOBS = (
     "SWEEP_MIN_CT", "SWEEP_HOLDOUT",
     # ...its linked series and per-series holds (2026-10-15)
     "SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES",
+    "SWEEP_HOLD_BY_PREFIX",       # rain keeps 2 min under the 10-min base (2026-11-01)
     # ...its escalating holds for repeat trips (2026-10-17)
     "SWEEP_ESCALATE", "SWEEP_ESCALATE_WINDOW_SECS", "SWEEP_ESCALATE_HOLDS",
     "SWEEP_ESCALATE_EXCLUDE",
@@ -35050,6 +35077,7 @@ class IncentiveMarketMaker:
             out["sweep"] = dict(self._sweep, mode=SWEEP_BREAKER,
                                 hold_s=SWEEP_HOLD_SECS, holdout=SWEEP_HOLDOUT,
                                 hold_by_series=dict(SWEEP_HOLD_BY_SERIES),
+                                hold_by_prefix=dict(SWEEP_HOLD_BY_PREFIX),
                                 linked=[list(g) for g in SWEEP_LINKED_GROUPS],
                                 held_now=sum(1 for u in self._sweep_hold.values()
                                              if u > now),
@@ -37165,6 +37193,8 @@ class IncentiveMarketMaker:
                      + "".join(f"; {s} holds {v:.0f}s"
                                for s, v in SWEEP_HOLD_BY_SERIES.items()
                                if not any(s in g for g in SWEEP_LINKED_GROUPS))
+                     + "".join(f"; {p}* holds {v:.0f}s (2026-11-01)"
+                               for p, v in SWEEP_HOLD_BY_PREFIX.items())
                      + (f"; {SWEEP_HOLDOUT:.0%} of trips stay a dry CONTROL "
                         f"(the monitoring)" if SWEEP_HOLDOUT > 0 else "")
                      + f"{'' if WS_MODE != 'off' else ' (no WS feed: never trips)'}",

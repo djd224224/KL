@@ -28515,6 +28515,28 @@ class TestSweepBreaker(unittest.TestCase):
         self._fill("o2", 20, dt=301.0)
         self.assertEqual(len(self._trips()), 2)
 
+    def test_rain_keeps_two_minutes_under_the_ten_minute_base(self):
+        # Jack 2026-11-01: "Yes, 10 minutes" -- the base hold went 2 -> 10
+        # min and rain (SWEEP_HOLD_BY_PREFIX's KXRAIN:120) stayed at 2: a
+        # rain event spans dozens of cities, and its next sweep is usually
+        # another region's
+        r = "KXRAINELECTION-03NOV26-SFO"
+        self.bot._resting_view[r] = [
+            {"order_id": "o5", "side": "bid", "px": 40.0, "rem": 20.0,
+             "placed": self.now - 100.0, "pad": False},
+            {"order_id": "o6", "side": "ask", "px": 60.0, "rem": 20.0,
+             "placed": self.now - 100.0, "pad": False}]
+        with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
+                mock.patch.object(imm, "SWEEP_HOLD_SECS", 600.0):
+            self._fill("o5", 20, ticker=r)
+            self._fill("o1", 20, dt=1.0)
+            self.assertEqual({t["event"]: t["hold_s"] for t in self._trips()},
+                             {"KXRAINELECTION-03NOV26": 120.0, self.E: 600.0})
+            self.assertTrue(self.bot.sweep_held("KXRAINELECTION-03NOV26", self.now + 119))
+            self.assertFalse(self.bot.sweep_held("KXRAINELECTION-03NOV26", self.now + 121))
+            self.assertTrue(self.bot.sweep_held(self.E, self.now + 590))
+            self.assertFalse(self.bot.sweep_held(self.E, self.now + 602))
+
     def test_on_pulls_the_event_now_and_holds_it(self):
         with mock.patch.object(imm, "SWEEP_BREAKER", "on"):
             self._fill("o1", 20)
@@ -34312,7 +34334,21 @@ class TestSweepLinkedSeries(unittest.TestCase):
             self.assertEqual(imm.sweep_hold_secs("KXEVT"), 120.0)
         with mock.patch.object(imm, "SWEEP_HOLD_SECS", 900.0):
             self.assertEqual(imm.sweep_hold_secs("KXTRUMPAPPROVE"), 900.0)  # never under
-        for k in ("SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES"):
+        # Jack 2026-11-01: "Yes, 10 minutes" -- rain keeps 2 min under the
+        # 10-min base (SWEEP_HOLD_BY_PREFIX), shorter than SWEEP_HOLD_SECS
+        self.assertEqual(imm.SWEEP_HOLD_BY_PREFIX, {"KXRAIN": 120.0})
+        with mock.patch.object(imm, "SWEEP_HOLD_SECS", 600.0):
+            for s in ("KXRAINWKND", "KXRAINELECTION", "KXRAINDCHI", "KXRAINNYCM"):
+                self.assertEqual(imm.sweep_hold_secs(s), 120.0, s)
+            self.assertEqual(imm.sweep_hold_secs("KXEVT"), 600.0)
+            self.assertEqual(imm.sweep_hold_secs("KXAPRPOTUS"), 600.0)
+            with mock.patch.object(imm, "SWEEP_HOLD_BY_PREFIX",
+                                   {"KXRAIN": 120.0, "KXRAINWKND": 300.0}):
+                self.assertEqual(imm.sweep_hold_secs("KXRAINWKND"), 300.0)  # longest prefix
+                self.assertEqual(imm.sweep_hold_secs("KXRAINNYC"), 120.0)
+            with mock.patch.object(imm, "SWEEP_HOLD_BY_PREFIX", {}):
+                self.assertEqual(imm.sweep_hold_secs("KXRAINWKND"), 600.0)
+        for k in ("SWEEP_LINKED_GROUPS", "SWEEP_HOLD_BY_SERIES", "SWEEP_HOLD_BY_PREFIX"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
     def test_parsers(self):
