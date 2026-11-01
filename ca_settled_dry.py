@@ -66,10 +66,12 @@ MARGIN_REL = 0.03
 # Monday (11/30) where Nov 2025's fell on 12/1 (Adobe: $14.25B online, 3-4x
 # an ordinary day). So online-heavy card names and ad spend print above the
 # month-to-date we see at the stop. Wider margins for card and ad spend; the
-# online-heavy card names sit out after the month ends, when card's unseen
-# last days are Sunday 11/29 and Cyber Monday.
+# online-heavy card names -- Amazon, Temu, Shein and the buy-now-pay-later
+# lenders (Adobe: BNPL passed $1B on Cyber Monday 2025) -- sit out after the
+# month ends, when card's unseen last days are Sunday 11/29 and Cyber Monday.
 HOLIDAY_EXTRA = {"11": {"credit card": 3.0, "advertising": 3.0}}
-HOLIDAY_SKIP_AFTER_MONTH_END = {"11": frozenset({"KXAMZNCC", "KXTEMUCC", "KXSHEINCC"})}
+HOLIDAY_SKIP_AFTER_MONTH_END = {"11": frozenset({"KXAMZNCC", "KXTEMUCC", "KXSHEINCC", "KXAFRMCC",
+                                                 "KXAFTERPAYCC", "KXKLARCC"})}
 AGREE_C = 20        # a bid over this for the outcome our read rules out = the market disagrees
 WRONG_MAX_C = 3     # the other side joins its best bid only at this price or under, else 1c
 SIZES = ((20, 20), (20, 1000), (150, 1000))   # (settled side, other side) contracts

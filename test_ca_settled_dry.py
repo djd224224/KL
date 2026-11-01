@@ -69,7 +69,9 @@ class TestRules(unittest.TestCase):
         # ... and the online-heavy card names sit out once the month is over
         nov_cc = _read(100.0, cat="Credit Card", month="2026-11")
         self.assertIsNone(csd.margin(nov_cc, "KXAMZNCC", "2026-11", True))
+        self.assertIsNone(csd.margin(nov_cc, "KXKLARCC", "2026-11", True))     # BNPL, too
         self.assertEqual(csd.margin(nov_cc, "KXAMZNCC", "2026-11", False), 8.0)
+        self.assertEqual(csd.margin(nov_cc, "KXWMTCC", "2026-11", True), 8.0)
         self.assertIsNone(csd.margin(_read(100.0, cat="Weather"), "KXFAKEX", "2026-10", True))
 
     def test_settled_side(self):
