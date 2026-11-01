@@ -59,6 +59,7 @@ import glob
 import json
 import os
 import re
+import statistics
 import sys
 import threading
 import time
@@ -68,6 +69,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from html import escape as _esc
+from typing import Optional
 
 # imm_quote_gaps FIRST: it mirrors the launcher's $ProbeEnv and the alert
 # credential fallback into the environment before incentive_mm reads config.
@@ -623,6 +625,138 @@ def verdict(f: dict) -> tuple:
 
 # ---- build + render ------------------------------------------------------------
 
+# MONTH-END DRIFT CHECK (Jack 2026-11-01: "yes", on "add the monthly drift
+# check?"). How far each category's month-to-date read sat from that month's
+# final read, by the read's day. That is how POS's problem showed: in October
+# its reads ran 3-4% under the final in mid-month, 97-100% of them on the
+# same side. It was the calendar plus last year's base, which a calendar
+# model reproduced (carbon_arc_fair.calendar_entry).
+# - A category whose mid-month reads sit DRIFT_WATCH_PCT or more off the
+#   final, at least DRIFT_ONE_SIDED of them on one side, is WATCH: a
+#   candidate for the same model.
+# - The section rides one daily email per month. It goes on the first email
+#   after every category has rolled to the next month (each final read is
+#   then final), or on DRIFT_DUE_DAY at the latest. Sent months are kept in
+#   DRIFT_STATE.
+DRIFT_STATE = os.path.join(imm.STATUS_DIR, "ca_drift_check.json")
+DRIFT_BUCKETS = ((3, 7), (8, 12), (13, 17), (18, 22), (23, 27))
+DRIFT_MID = ((13, 17), (18, 22))          # the buckets the verdict reads
+DRIFT_WATCH_PCT = 1.5
+DRIFT_ONE_SIDED = 0.8
+DRIFT_DUE_DAY = 12
+
+
+def month_drift(vint: list, month: str) -> dict:
+    """{category: {"buckets": {(lo, hi): (median %, share of reads under the
+    final, n)}, "rolled": bool}} for `month` ("YYYY-MM"): each series' read
+    through day d against its last read of the month (positive = the read sat
+    under the final). "rolled": the category has a read of the next month."""
+    nxt = (datetime.strptime(month + "-01", "%Y-%m-%d") + timedelta(days=32)).strftime("%Y-%m")
+    last, rolled = {}, set()
+    for r in vint:
+        cat = str(r.get("category") or "").strip().lower()
+        if r.get("month") == nxt:
+            rolled.add(cat)
+        if r.get("month") != month or not r.get("series") or not r.get("data_through"):
+            continue
+        k = (r["series"], r["data_through"])
+        if k not in last or str(r.get("fetched_at")) > str(last[k].get("fetched_at")):
+            last[k] = dict(r, _cat=cat)
+    final = {}
+    for (s, d), r in last.items():
+        if s not in final or d > final[s]["data_through"]:
+            final[s] = r
+    xs = defaultdict(lambda: defaultdict(list))
+    for (s, d), r in last.items():
+        f = final[s]
+        try:
+            mtd, fin = float(r["mtd"]), float(f["mtd"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if d >= f["data_through"] or mtd <= 0 or fin <= 0:
+            continue
+        day = int(d[8:10])
+        for lo, hi in DRIFT_BUCKETS:
+            if lo <= day <= hi:
+                xs[r["_cat"]][(lo, hi)].append(100.0 * (fin - mtd) / mtd)
+    out = {}
+    for cat in {r["_cat"] for r in last.values()}:
+        b = {}
+        for key, v in xs[cat].items():
+            b[key] = (statistics.median(v), sum(1 for x in v if x > 0) / len(v), len(v))
+        out[cat] = {"buckets": b, "rolled": cat in rolled}
+    return out
+
+
+def drift_verdict(c: dict) -> tuple:
+    """(level, mid-month median %, share on that side) for one category."""
+    mids = [c["buckets"][k] for k in DRIFT_MID if k in c["buckets"]]
+    if not mids:
+        return "OK", 0.0, 0.0
+    med = statistics.median(m[0] for m in mids)
+    under = sum(m[1] * m[2] for m in mids) / max(1, sum(m[2] for m in mids))
+    side = under if med > 0 else 1.0 - under
+    return ("WATCH" if abs(med) >= DRIFT_WATCH_PCT and side >= DRIFT_ONE_SIDED else "OK"), med, side
+
+
+def drift_check(vint: list, now: datetime, state: Optional[dict] = None) -> Optional[dict]:
+    """The month-end drift section if due today: the month before `now`'s ET
+    month, once every category has rolled or from DRIFT_DUE_DAY, unless
+    already sent (DRIFT_STATE). None otherwise."""
+    today = now.astimezone(imm.ET).date()
+    month = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    if state is None:
+        try:
+            with open(DRIFT_STATE, encoding="utf-8") as f:
+                state = json.load(f) or {}
+        except (OSError, ValueError):
+            state = {}
+    if month in (state.get("sent") or []):
+        return None
+    d = month_drift(vint, month)
+    if not d:
+        return None
+    cats = [f[0] for f in FAMILIES]
+    if not all((d.get(c) or {}).get("rolled") for c in cats if c in d) and today.day < DRIFT_DUE_DAY:
+        return None
+    rows = []
+    for cat, tag, name in FAMILIES:
+        c = d.get(cat)
+        if c is None:
+            continue
+        level, med, side = drift_verdict(c)
+        rows.append({"cat": cat, "name": name, "level": level, "mid": med, "side": side,
+                     "final": c["rolled"], "buckets": c["buckets"]})
+    return {"month": month, "rows": rows}
+
+
+def mark_drift_sent(month: str) -> None:
+    try:
+        with open(DRIFT_STATE, encoding="utf-8") as f:
+            state = json.load(f) or {}
+    except (OSError, ValueError):
+        state = {}
+    state["sent"] = sorted(set(state.get("sent") or []) | {month})[-24:]
+    tmp = DRIFT_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, DRIFT_STATE)
+
+
+def _drift_lines(dr: dict) -> list:
+    """The email's short drift section: one line per category."""
+    mon = datetime.strptime(dr["month"] + "-01", "%Y-%m-%d").strftime("%B")
+    L = [f"{mon} drift check: how far each category's mid-month read (days 13-22) sat from "
+         f"its final read (+ = the read was low)."]
+    for r in dr["rows"]:
+        L.append(f"  {r['name']}: {r['mid']:+.1f}% ({r['side']:.0%} of reads on that side) -- {r['level']}"
+                 + ("" if r["final"] else " (not final yet: the category has not rolled)"))
+    if any(r["level"] == "WATCH" for r in dr["rows"]):
+        L.append("  WATCH = the read misses a calendar or base pattern by 1.5%+ on one side; "
+                 "model it as point of sale's calendar factors do.")
+    return L
+
+
 def build_report(day, with_market: bool = True, now=None) -> dict:
     now = now or datetime.now(timezone.utc)
     a_utc, b_utc = day_window(day)
@@ -706,6 +840,11 @@ def build_report(day, with_market: bool = True, now=None) -> dict:
                 "market_window": (mwin.get(cat) or {}) if ctx["late_active"] else {}}
         fctx["level"], fctx["reasons"] = verdict(fctx)
         ctx["families"].append(fctx)
+    try:
+        ctx["drift"] = drift_check(vint, now)
+    except Exception as e:                           # noqa: BLE001 - a note, not a failed email
+        ctx["drift"] = None
+        ctx["notes"].append(f"month-end drift check failed ({type(e).__name__}: {e})")
     return ctx
 
 
@@ -758,6 +897,11 @@ def subject_for(ctx) -> str:
         names = [f["name"] for f in _flagged(ctx) if f["level"] == lvl]
         if names:
             parts.append(f"{lvl} {', '.join(names)}")
+    dr = ctx.get("drift")
+    if dr:
+        mon = datetime.strptime(dr["month"] + "-01", "%Y-%m-%d").strftime("%b")
+        w = [r["name"] for r in dr["rows"] if r["level"] == "WATCH"]
+        parts.append(f"{mon} drift: " + (f"WATCH {', '.join(w)}" if w else "OK"))
     return head + " | " + (" | ".join(parts) if parts else "all OK")
 
 
@@ -823,6 +967,8 @@ def render_text(ctx) -> str:
             L.append(f"  {_fills_book(f)}")
     else:
         L += ["", "Every family performed as expected."]
+    if ctx.get("drift"):
+        L += [""] + _drift_lines(ctx["drift"])
     L += ["", f"Full numbers per family: {DETAIL_WHERE}"]
     return "\n".join(L)
 
@@ -876,6 +1022,17 @@ def render_detail(ctx) -> str:
             L.append(f"   open book: {b.get('markets', 0)} markets, long {b.get('long', 0):,.0f} / "
                      f"short {b.get('short', 0):,.0f} YES, unrealized {_usd(b.get('unreal', 0))}")
         L.append("")
+    dr = ctx.get("drift")
+    if dr:
+        L.append(f"Month-end drift check, {dr['month']}: median % the read through day d sat under "
+                 f"the month's final read (share of reads under it, n)")
+        for r in dr["rows"]:
+            L.append(f"   {r['name']:<14} {r['level']:<5} "
+                     + "  ".join(f"d{lo:02d}-{hi:02d} {r['buckets'][(lo, hi)][0]:+5.1f}% "
+                                 f"({r['buckets'][(lo, hi)][1]:.0%}, {r['buckets'][(lo, hi)][2]})"
+                                 for lo, hi in DRIFT_BUCKETS if (lo, hi) in r["buckets"])
+                     + ("" if r["final"] else "  [not rolled: not final]"))
+        L.append("")
     L.append("Verdict rules: PROBLEM = day net <= -$150, any blocked-side fill/order in the late "
              "window, a read that moved with no new data, or no read. WATCH = day net <= -$50, "
              "3-day net < 0, stale refresh/data, in the late window our kept side running "
@@ -915,6 +1072,12 @@ def render_html(ctx) -> str:
                      + f"</ul><p style='margin:2px 0 0;color:#555'>{_esc(_fills_book(f))}</p>")
     else:
         look = "<p style='margin:14px 0 0'>Every family performed as expected.</p>"
+    if ctx.get("drift"):
+        lines = _drift_lines(ctx["drift"])
+        look += (f"<h3 style='margin:18px 0 0'>{_esc(lines[0].split(':')[0])}</h3>"
+                 f"<p style='margin:4px 0 2px;color:#555'>{_esc(lines[0].split(': ', 1)[1])}</p>"
+                 "<ul style='margin:0;padding-left:20px'>"
+                 + "".join(f"<li>{_esc(x.strip())}</li>" for x in lines[1:]) + "</ul>")
     return (f"<div style='font-family:Arial,sans-serif;font-size:14px;line-height:1.45;max-width:640px'>"
             f"<h2 style='margin:0 0 6px'>Carbon Arc &mdash; {ctx['day']:%a %m/%d}</h2>{top}"
             f"<p style='margin:0 0 12px;color:#555'>{_esc(_late_text(ctx))}</p>{notes}"
@@ -970,6 +1133,11 @@ def main(argv=None) -> int:
                 f.write(now_utc.isoformat())
         except OSError as e:
             log(f"! sent-marker not written ({e!r}); a re-run today would send again")
+        if ctx.get("drift"):
+            try:
+                mark_drift_sent(ctx["drift"]["month"])
+            except OSError as e:
+                log(f"! drift-check state not written ({e!r}); tomorrow's email repeats it")
         cutoff = today_et - timedelta(days=7)
         for old in glob.glob(os.path.join(imm.STATUS_DIR, "imm_ca_monitor_sent_*.marker")):
             name = os.path.basename(old)[len("imm_ca_monitor_sent_"):-len(".marker")]

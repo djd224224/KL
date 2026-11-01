@@ -227,5 +227,70 @@ class TestSimpleEmail(unittest.TestCase):
         self.assertIn("Every family performed as expected.", cm.render_text(c))
 
 
+class TestDriftCheck(unittest.TestCase):
+    """Jack 2026-11-01: "yes", on adding a month-end drift check -- how far
+    each category's read sat from the month's final read, the way POS's
+    October drift (3-4% low mid-month, 97-100% of reads) showed."""
+
+    def _vint(self):
+        rows = []
+        for day in range(3, 31):
+            thru = "2026-10-%02d" % day
+            fa = "2026-10-%02dT12:00:00+00:00" % min(day + 1, 31)
+            # point of sale climbs to its final 104 (reads ~3% low mid-month)
+            for s, start in (("KXFAKEAPOS", 98.0), ("KXFAKEBPOS", 97.0)):
+                rows.append({"series": s, "category": "Point of Sale", "month": "2026-10",
+                             "data_through": thru, "fetched_at": fa,
+                             "mtd": start + (104.0 - start) * day / 30.0})
+            # card spend wobbles around its final 100
+            rows.append({"series": "KXFAKECC", "category": "Credit Card", "month": "2026-10",
+                         "data_through": thru, "fetched_at": fa,
+                         "mtd": 100.0 + (0.3 if day % 2 else -0.3) * (day < 30)})
+        return rows
+
+    def test_month_drift_and_verdicts(self):
+        d = cm.month_drift(self._vint(), "2026-10")
+        lvl, med, side = cm.drift_verdict(d["point of sale"])
+        self.assertEqual(lvl, "WATCH")
+        self.assertGreater(med, 1.5)
+        self.assertEqual(side, 1.0)
+        lvl, med, _ = cm.drift_verdict(d["credit card"])
+        self.assertEqual(lvl, "OK")
+        self.assertLess(abs(med), 0.5)
+        self.assertFalse(d["point of sale"]["rolled"])
+
+    def test_due_once_every_category_rolled_or_on_the_12th(self):
+        v = self._vint()
+        nov2 = datetime(2026, 11, 2, 12, 35, tzinfo=timezone.utc)
+        self.assertIsNone(cm.drift_check(v, nov2, state={}))           # nothing rolled yet
+        rolled = v + [{"series": s, "category": c, "month": "2026-11", "data_through": "2026-11-01",
+                       "fetched_at": "2026-11-02T12:00:00+00:00", "mtd": 100.0}
+                      for s, c in (("KXFAKEAPOS", "Point of Sale"), ("KXFAKECC", "Credit Card"))]
+        dr = cm.drift_check(rolled, nov2, state={})
+        self.assertEqual(dr["month"], "2026-10")
+        self.assertEqual([r["level"] for r in dr["rows"]], ["WATCH", "OK"])
+        self.assertIsNone(cm.drift_check(rolled, nov2, state={"sent": ["2026-10"]}))
+        nov12 = datetime(2026, 11, 12, 12, 35, tzinfo=timezone.utc)
+        dr = cm.drift_check(v, nov12, state={})                       # the 12th: send what is there
+        self.assertFalse(any(r["final"] for r in dr["rows"]))
+
+    def test_the_email_carries_it_and_the_state_marks_it_sent(self):
+        c = TestSimpleEmail().ctx()
+        rolled = self._vint() + [{"series": "KXFAKECC", "category": "Credit Card", "month": "2026-11",
+                                  "data_through": "2026-11-01", "fetched_at": "x", "mtd": 1.0},
+                                 {"series": "KXFAKEAPOS", "category": "Point of Sale", "month": "2026-11",
+                                  "data_through": "2026-11-01", "fetched_at": "x", "mtd": 1.0}]
+        c["drift"] = cm.drift_check(rolled, datetime(2026, 11, 3, 12, tzinfo=timezone.utc), state={})
+        self.assertTrue(cm.subject_for(c).endswith("| Oct drift: WATCH Point of sale"))
+        text = cm.render_text(c)
+        self.assertIn("October drift check: how far each category's mid-month read", text)
+        self.assertIn("Point of sale: +", text)
+        self.assertIn("-- WATCH", text)
+        self.assertIn("October drift check", cm.render_html(c))
+        with mock.patch.object(cm, "DRIFT_STATE", os.path.join(imm.STATUS_DIR, "drift_state_test.json")):
+            cm.mark_drift_sent("2026-10")
+            self.assertIsNone(cm.drift_check(rolled, datetime(2026, 11, 4, 12, tzinfo=timezone.utc)))
+
+
 if __name__ == "__main__":
     unittest.main()
