@@ -3042,6 +3042,21 @@ def default_max_position(now_utc: Optional[datetime] = None,
 # across three OpenAI strikes while OpenAI's share fell; the launcher's
 # IMM_MAX_EVENT=1000 never bound.
 SHARE_EVENT_CAP = _env_float("IMM_SHARE_EVENT_CAP", 100)
+# each event's markets with a live liquidity program, counted at every
+# programs read (note_programmed): a fair-lead family's event room is
+# FAIR_LEAD_EVENT_PER_MARKET a market (2026-10-31)
+EVENT_PROGRAMMED_N: Dict[str, int] = {}
+
+
+def note_programmed(tickers) -> None:
+    """Count each event's programmed markets from the programs feed's market
+    tickers (an event is its market's ticker less the last segment)."""
+    counts: Dict[str, int] = {}
+    for t in tickers:
+        ev = t.rsplit("-", 1)[0]
+        counts[ev] = counts.get(ev, 0) + 1
+    EVENT_PROGRAMMED_N.clear()
+    EVENT_PROGRAMMED_N.update(counts)
 
 
 def event_cap_contracts(event_ticker: str) -> float:
@@ -3073,10 +3088,14 @@ def event_cap_contracts(event_ticker: str) -> float:
     if nfl_auto_entry(series) is not None or league_auto_entry(series) is not None:
         return MAX_EVENT_CONTRACTS * applied_mention_mult("KXNFLLADDERREC")
     # a family that leads off its fair (2026-10-29, FAIR LEAD): room for the
-    # leads, which take first call on it, beside the other markets' rungs
+    # leads, which take first call on it, beside the other markets' rungs --
+    # FAIR_LEAD_EVENT_PER_MARKET for each of the event's programmed markets
+    # (2026-10-31), never under FAIR_LEAD_EVENT_CAP
     if globals().get("FAIR_LEAD_MODE") == "on" \
             and globals().get("in_fair_lead_series", lambda s: False)(series):
         return max(globals()["FAIR_LEAD_EVENT_CAP"],
+                   globals()["FAIR_LEAD_EVENT_PER_MARKET"]
+                   * EVENT_PROGRAMMED_N.get(event_ticker, 0),
                    MAX_EVENT_CONTRACTS * applied_mention_mult(series))
     return MAX_EVENT_CONTRACTS * applied_mention_mult(series)
 COLLATERAL_BUDGET = _env_float("IMM_COLLATERAL_BUDGET", 1000.0)  # $ resting + inventory
@@ -11560,6 +11579,7 @@ _CONFIG_CODE_KNOBS = (
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
+    "FAIR_LEAD_EVENT_PER_MARKET",  # ...200 an event's programmed market (2026-10-31)
     "FAIR_LEAD_MAX_GAP_C",        # the disagreement guard (2026-10-30)
     "FAIR_LEAD_GUARD_INSIDE",     # ...relaxed for leads inside the book too (2026-10-31)
     "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
@@ -20733,6 +20753,19 @@ FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
+# 200 A CITY (Jack 2026-10-31: "yes", to "give each event 200 contracts of
+# lead budget per city, never less than 2,000. That's 9,800 per side for
+# Election Day and 7,000 for a 35-city weekend event."). All 49 Election Day
+# cities are one event, and on the 23:31Z books ten 200-lot leads a side had
+# filled its 2,000: bids 1,998 and asks 2,000 rested, 27 cities had nothing
+# at all, and the room rotated among them at each selection refresh, so a
+# starved city's realized ratio fell and it dropped out (Detroit, Milwaukee,
+# Gainesville, Jacksonville, Miami, Seattle). 48 sides wanted a lead (31
+# asks, 17 bids). The event's room is now FAIR_LEAD_EVENT_PER_MARKET for
+# each of its programmed markets (EVENT_PROGRAMMED_N), at least the cap
+# above: the 9-strike Vercel events keep 2,000. A leading market's own cap
+# (FAIR_LEAD_MAX_POSITION) still bounds each city. 0 restores the flat cap.
+FAIR_LEAD_EVENT_PER_MARKET = _env_float("IMM_FAIR_LEAD_EVENT_PER_MARKET", 200.0)
 # DISAGREEMENT GUARD (Jack 2026-10-30: "yes stop new leads where the book is
 # that far from the model", on the 13:55Z books: Springfield 81x83 against a
 # 45c fair, St. Louis 78x82 against 59c, Atlanta 42x43 against 17c). No fair
@@ -27482,6 +27515,7 @@ class IncentiveMarketMaker:
         # transient feed outage).
         if by_market:
             self.state.programmed = set(by_market)
+            note_programmed(by_market)    # the fair-lead event room (2026-10-31)
             # CARBON ARC FAMILIES (2026-09-22, see ALLOW_FAMILY_SUFFIXES):
             # source-verify novel suffix matches BEFORE the candidates
             # filter below reads _allowed, so a sibling Kalshi listed since
@@ -36902,7 +36936,9 @@ class IncentiveMarketMaker:
                + f"; never chased up), priced into the estimate so a market under the "
                f"payout bar is admitted on it; a leading market's position cap "
                f"{FAIR_LEAD_MAX_POSITION:g}, the family's event cap "
-               f"{FAIR_LEAD_EVENT_CAP:g}; no hedge but a ladder strike's own lock; "
+               + (f"{FAIR_LEAD_EVENT_PER_MARKET:g} a programmed market, at least "
+                  if FAIR_LEAD_EVENT_PER_MARKET > 0 else "")
+               + f"{FAIR_LEAD_EVENT_CAP:g}; no hedge but a ladder strike's own lock; "
                f"the WS fast cancel reads a lead or close on our side of the "
                f"model as not stale"
                + (f"; no lead while the book's touch sits more than "

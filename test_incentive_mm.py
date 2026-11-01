@@ -31655,8 +31655,112 @@ class TestFairLead(unittest.TestCase):
         self.assertEqual(rungs["bid"], (54, 200))
         _b, rungs, _l = self._cycle(max_pos=50.0, max_event=100.0, lead_cap=0.0)
         self.assertLess(rungs["bid"][1], 200)                    # the series cap binds
+        # the event cap binds (2026-10-31: with no room a programmed market)
+        with mock.patch.object(imm, "FAIR_LEAD_EVENT_PER_MARKET", 0.0):
+            _b, rungs, _l = self._cycle(max_pos=50.0, max_event=100.0, event_cap=0.0)
+        self.assertLess(rungs["bid"][1], 200)
+        # ...while 200 a programmed market gives this one-market event 200
         _b, rungs, _l = self._cycle(max_pos=50.0, max_event=100.0, event_cap=0.0)
-        self.assertLess(rungs["bid"][1], 200)                    # the event cap binds
+        self.assertEqual(rungs["bid"], (54, 200))
+
+    def test_the_event_room_is_200_a_programmed_market(self):
+        # Jack 2026-10-31: "yes", to "give each event 200 contracts of lead
+        # budget per city, never less than 2,000. That's 9,800 per side for
+        # Election Day and 7,000 for a 35-city weekend event."
+        self.assertEqual(imm.FAIR_LEAD_EVENT_PER_MARKET, 200.0)
+        self.assertIn("FAIR_LEAD_EVENT_PER_MARKET", imm._CONFIG_CODE_KNOBS)
+        self.assertTrue(imm.in_fair_lead_series("KXRAINELECTION"))
+        self.assertTrue(imm.in_fair_lead_series("KXOPENVREQ"))
+        cities = [f"C{i:02d}" for i in range(49)]
+        feed = ([f"KXRAINELECTION-03NOV26-{c}" for c in cities]
+                + [f"{self.EV}-{c}" for c in cities[:35]]
+                + [f"KXOPENVREQ-02NOV26-T{19.8 + i:.1f}" for i in range(9)]
+                + ["KXGOOD-99DEC31-A"])
+        with mock.patch.dict(imm.EVENT_PROGRAMMED_N, clear=True), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0):
+            imm.note_programmed(feed)
+            self.assertEqual(imm.EVENT_PROGRAMMED_N["KXRAINELECTION-03NOV26"], 49)
+            self.assertEqual(imm.EVENT_PROGRAMMED_N["KXOPENVREQ-02NOV26"], 9)
+            self.assertEqual(imm.event_cap_contracts("KXRAINELECTION-03NOV26"), 9800.0)
+            self.assertEqual(imm.event_cap_contracts(self.EV), 7000.0)
+            # the 9-strike Vercel events keep their room (x3: 3,000), and an
+            # event the feed does not list the 2,000 floor
+            self.assertEqual(imm.event_cap_contracts("KXOPENVREQ-02NOV26"),
+                             max(2000.0, 1000.0 * imm.applied_mention_mult("KXOPENVREQ")))
+            self.assertEqual(imm.event_cap_contracts("KXRAINWKND-68OCT20"), 2000.0)
+            # another family is untouched
+            self.assertEqual(imm.event_cap_contracts("KXGOOD-99DEC31"),
+                             1000.0 * imm.applied_mention_mult("KXGOOD"))
+            # 0 restores the flat cap; a dry run leads nothing, so no room
+            with mock.patch.object(imm, "FAIR_LEAD_EVENT_PER_MARKET", 0.0):
+                self.assertEqual(imm.event_cap_contracts("KXRAINELECTION-03NOV26"),
+                                 2000.0)
+            with mock.patch.object(imm, "FAIR_LEAD_MODE", "dry"):
+                self.assertEqual(imm.event_cap_contracts("KXRAINELECTION-03NOV26"),
+                                 1000.0)
+            # each read replaces the counts
+            imm.note_programmed(feed[:10])
+            self.assertEqual(imm.event_cap_contracts("KXRAINELECTION-03NOV26"), 2000.0)
+            self.assertNotIn(self.EV, imm.EVENT_PROGRAMMED_N)
+
+    def test_every_city_of_the_event_leads(self):
+        # three cities of one event, each on SGF's book, each leading 200 @
+        # 54c: a flat 400 room rests at most 400 contracts of bids across
+        # them; at 200 a programmed market (600) all three lead
+        cities = [f"{self.EV}-{c}" for c in ("SGF", "STL", "ICT")]
+
+        def run(per_market):
+            _clean_persist()
+            at = datetime.now(timezone.utc).isoformat()
+            with open(imm.RAIN_WKND_FILE, "w", encoding="utf-8") as f:
+                json.dump({"markets": {t: {"event": self.EV, "p": 0.694,
+                                           "fetched_at": at} for t in cities}}, f)
+            os.utime(imm.RAIN_WKND_FILE, (time.time(), time.time() + TestFairLead._bump))
+            TestFairLead._bump += 1
+            imm.load_rain_wknd()
+            client = FakeClient()
+            far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            for t in cities:
+                client.programs.append(
+                    {"market_ticker": t, "incentive_type": "liquidity",
+                     "period_reward": 7000000, "target_size_fp": "1000.00",
+                     "discount_factor_bps": 5000, "paid_out": False,
+                     "start_date": client.programs[0]["start_date"],
+                     "end_date": client.programs[0]["end_date"]})
+                client.markets[t] = {
+                    "ticker": t, "event_ticker": self.EV, "status": "active",
+                    "close_time": far, "yes_bid_dollars": "0.4800",
+                    "yes_ask_dollars": "0.6000", "volume_fp": "150.00"}
+                client.books[t] = self._book()
+            with mock.patch.dict(imm.EVENT_PROGRAMMED_N, clear=True), \
+                    mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                    mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 100.0), \
+                    mock.patch.object(imm, "FAIR_LEAD_EVENT_CAP", 400.0), \
+                    mock.patch.object(imm, "FAIR_LEAD_EVENT_PER_MARKET", per_market), \
+                    mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                    mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"), \
+                    mock.patch.object(imm, "log", lambda *_a, **_k: None):
+                bot = IncentiveMarketMaker(client=client, live=False)
+                bot.run_cycle()
+                self.assertEqual(imm.EVENT_PROGRAMMED_N[self.EV], 3)
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+            bids = {}
+            for o in bot.state.sim_orders.values():
+                if o["ticker"] in cities and o["book_side"] == "bid" \
+                        and imm.PAD_BID_CENTS < o["yes_price"]:
+                    bids.setdefault(o["ticker"], []).append(
+                        (o["yes_price"], int(o["remaining_count"])))
+            return bot, bids
+
+        bot, bids = run(200.0)
+        self.assertEqual(set(bot.state.selected) & set(cities), set(cities))
+        self.assertEqual(bids, {t: [(54, 200)] for t in cities})
+        _bot, bids = run(0.0)
+        self.assertLessEqual(sum(q for rs in bids.values() for _p, q in rs), 400)
+        self.assertLess(sum(1 for rs in bids.values() if (54, 200) in rs), 3)
 
     def test_dry_logs_the_lead_and_rests_at_the_reference(self):
         bot, rungs, lines = self._cycle(mode="dry")
