@@ -136,6 +136,42 @@ CA_SIGMA_FLOOR_REL = _env_float("IMM_CA_SIGMA_FLOOR_REL", 0.01)
 # than 3 usable month-over-month changes
 CA_SIGMA_M_DEFAULT_REL = _env_float("IMM_CA_SIGMA_M_DEFAULT_REL", 0.05)
 CA_DRIFT_PTS = _env_float("IMM_CA_DRIFT_PTS", 0.0)
+# CYBER MONDAY MOVES INTO NOVEMBER (Jack 2026-11-01: "id like to account for
+# black friday/cyber monday in fair value", then "Estimates only" -- no
+# purchase of per-company daily data).
+# - Carbon Arc's YoY compares the same calendar dates. Thanksgiving and Black
+#   Friday fall in November both years, but Cyber Monday does not: 11/30/2026,
+#   12/1/2025. So November 2026 holds Cyber Monday where November 2025 held
+#   an ordinary Saturday (11/1).
+# - The read through ~11/23 compares like for like, and that is every read
+#   the bot quotes on before its 11/26 stop. The print lands above that read
+#   by the swap's share of the month.
+# - Adobe's 2025 totals put the swap at ~+8% for pure online spend: Cyber
+#   Monday $14.25B online, an ordinary day ~$3.5-4B, November ~$129B.
+# - So the read is multiplied, for these series only:
+#   - Amazon, Temu and Shein x1.075.
+#   - Affirm, Afterpay and Klarna x1.02. A card panel sees BNPL repayments:
+#     a Pay-in-4 charges a quarter of a Cyber Monday purchase that day, and
+#     the rest lands in December both years.
+# - Sigma widens by half the shift, added in quadrature (holiday_entry).
+# - Only reads through day CA_HOLIDAY_THROUGH_DAY take it. Later, the read
+#   starts to hold the holiday week itself, and the bot has stopped (11/26).
+# - IMM_CA_HOLIDAY=0 turns it off. IMM_CA_HOLIDAY_FACTORS
+#   "YYYY-MM:SERIES=factor,...;..." replaces the table.
+CA_HOLIDAY_ENABLE = os.environ.get("IMM_CA_HOLIDAY", "1") == "1"
+CA_HOLIDAY_THROUGH_DAY = 25
+CA_HOLIDAY_SIGMA_SHARE = 0.5
+_DEFAULT_CA_HOLIDAY = ("2026-11:KXAMZNCC=1.075,KXTEMUCC=1.075,KXSHEINCC=1.075,"
+                       "KXAFRMCC=1.02,KXAFTERPAYCC=1.02,KXKLARCC=1.02")
+CA_HOLIDAY_FACTORS: Dict[str, Dict[str, float]] = {}
+for _part in os.environ.get("IMM_CA_HOLIDAY_FACTORS", _DEFAULT_CA_HOLIDAY).split(";"):
+    _month, _, _rows = _part.partition(":")
+    for _kv in _rows.split(","):
+        _s, _, _f = _kv.partition("=")
+        try:
+            CA_HOLIDAY_FACTORS.setdefault(_month.strip(), {})[_s.strip()] = float(_f)
+        except ValueError:
+            continue
 # no entry until this fraction of the month is observed. 0.10 (~3 days)
 # until 2026-10-04, which left every month unread for its first ~6-10 days
 # once the feed lag is added (READ FROM THE FIRST DAY, above);
@@ -666,6 +702,24 @@ def entity_entry(prism: dict, entity: dict,
     return out
 
 
+def holiday_entry(series: str, entry: dict) -> dict:
+    """`entry` with its mu scaled by the series' holiday factor for the
+    entry's month (CA_HOLIDAY_FACTORS) and sigma widened by
+    CA_HOLIDAY_SIGMA_SHARE of the shift, in quadrature; the entry unchanged
+    when no factor applies (off, another series or month, or a read past day
+    CA_HOLIDAY_THROUGH_DAY). "mtd" stays the raw read."""
+    if not CA_HOLIDAY_ENABLE:
+        return entry
+    f = CA_HOLIDAY_FACTORS.get(str(entry.get("month") or ""), {}).get(series)
+    thru = str(entry.get("data_through") or "")
+    if not f or f == 1.0 or len(thru) < 10 or int(thru[8:10]) > CA_HOLIDAY_THROUGH_DAY:
+        return entry
+    mu = float(entry["mu"]) * f
+    shift = abs(mu - float(entry["mu"]))
+    sigma = math.sqrt(float(entry["sigma"]) ** 2 + (CA_HOLIDAY_SIGMA_SHARE * shift) ** 2)
+    return dict(entry, mu=round(mu, 4), sigma=round(sigma, 4), holiday_factor=f)
+
+
 def build_entries(payload: dict, series_map: Dict[str, dict],
                   now: datetime) -> Tuple[Dict[str, dict], List[str]]:
     """(series -> entry, series with no usable read). Entity names match
@@ -691,7 +745,7 @@ def build_entries(payload: dict, series_map: Dict[str, dict],
         if entry is None:
             missing.append(series)
             continue
-        entries[series] = entry
+        entries[series] = holiday_entry(series, entry)
     return entries, missing
 
 

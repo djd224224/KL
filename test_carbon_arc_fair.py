@@ -366,6 +366,51 @@ class TestBuildAndWrite(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out))
 
 
+class TestHolidayFactor(unittest.TestCase):
+    """Jack 2026-11-01: "id like to account for black friday/cyber monday in
+    fair value" -> "Estimates only": November 2026 holds Cyber Monday (11/30)
+    where November 2025 held an ordinary Saturday, so the online card series'
+    November mu is scaled up and its sigma widened."""
+
+    def _nov(self, thru="2026-11-20", mu=100.0, sigma=2.0):
+        return {"month": "2026-11", "data_through": thru, "mu": mu, "mtd": mu, "sigma": sigma}
+
+    def test_the_online_and_bnpl_series_take_their_factor(self):
+        e = caf.holiday_entry("KXAMZNCC", self._nov())
+        self.assertAlmostEqual(e["mu"], 107.5)
+        self.assertEqual(e["mtd"], 100.0)                       # the raw read is kept
+        self.assertAlmostEqual(e["sigma"], round(math.sqrt(2.0 ** 2 + 3.75 ** 2), 4))
+        self.assertEqual(e["holiday_factor"], 1.075)
+        self.assertAlmostEqual(caf.holiday_entry("KXKLARCC", self._nov())["mu"], 102.0)
+
+    def test_other_series_months_and_late_reads_are_unchanged(self):
+        nov = self._nov()
+        self.assertIs(caf.holiday_entry("KXWMTCC", nov), nov)
+        oct_ = dict(nov, month="2026-10", data_through="2026-10-20")
+        self.assertIs(caf.holiday_entry("KXAMZNCC", oct_), oct_)
+        # a read past the 25th starts to hold the holiday week itself
+        late = self._nov(thru="2026-11-27")
+        self.assertIs(caf.holiday_entry("KXAMZNCC", late), late)
+        self.assertEqual(caf.holiday_entry("KXAMZNCC", self._nov(thru="2026-11-25"))["holiday_factor"], 1.075)
+        with mock.patch.object(caf, "CA_HOLIDAY_ENABLE", False):
+            self.assertIs(caf.holiday_entry("KXAMZNCC", nov), nov)
+
+    def test_build_entries_applies_it(self):
+        now = datetime(2026, 11, 24, 20, 0, tzinfo=timezone.utc)
+        smap = {"KXAMZNCC": {"prism": "P1", "entity": "Amazon"},
+                "KXWMTCC": {"prism": "P1", "entity": "Walmart"}}
+        mtd = [("2026-11-%02d" % d, 100.0) for d in range(1, 22)]
+        payload = {"prisms": [_prism("P1", [_entity("Amazon", mtd, HIST), _entity("Walmart", mtd, HIST)],
+                                     data_through="2026-11-21",
+                                     refreshed="2026-11-24T16:00:00+00:00")]}
+        entries, missing = caf.build_entries(payload, smap, now)
+        self.assertEqual(missing, [])
+        self.assertAlmostEqual(entries["KXAMZNCC"]["mu"], 107.5)
+        self.assertGreater(entries["KXAMZNCC"]["sigma"], entries["KXWMTCC"]["sigma"])
+        self.assertAlmostEqual(entries["KXWMTCC"]["mu"], 100.0)
+        self.assertNotIn("holiday_factor", entries["KXWMTCC"])
+
+
 class TestArrayShadow(unittest.TestCase):
     """Jack 2026-10-16 (B2, shadow): a sector array rebuilt from the brand
     prism that holds its constituents."""

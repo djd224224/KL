@@ -275,7 +275,9 @@ def run_pass(progs: Dict[str, dict], now: Optional[datetime] = None,
             skip["no strike or read"] += 1
             continue
         try:
-            mu = float(r["mtd"])
+            # the fair's mu: the read, times carbon_arc_fair's Cyber Monday
+            # factor for the November online / BNPL card series (holiday_entry)
+            mu = float(r["mu"] if r.get("mu") is not None else r["mtd"])
         except (KeyError, TypeError, ValueError):
             mu = 0.0
         if mu <= 0:                       # a vendor dropout (KXCVXCC read 0.0 on 10/27-29)

@@ -161,6 +161,28 @@ class TestPass(unittest.TestCase):
             self.assertEqual(len(f.readlines()), 1)
 
 
+class TestHolidayRead(unittest.TestCase):
+
+    def test_a_pass_judges_the_fair_mu_not_the_raw_read(self):
+        # carbon_arc_fair's Cyber Monday factor (Jack 2026-11-01: "Estimates
+        # only"): Amazon's November read 100 is a fair of 107.5, so T95 is
+        # settled YES (12.5 clear of the 8-point November card margin) though
+        # the raw read sits only 5 over it
+        now = datetime(2026, 11, 20, 18, 0, tzinfo=timezone.utc)
+        r = dict(_read(100.0, cat="Credit Card", month="2026-11", thru="2026-11-17"), mu=107.5)
+        progs = {"KXAMZNCC-26DEC07-T95": _prog(start="2026-11-10T00:00:00Z", end="2026-11-30T00:00:00Z")}
+        books = {"KXAMZNCC-26DEC07-T95": ([[96, 500.0]], [[2, 300.0]])}
+        with mock.patch.dict(imm.FAMILY_VERDICTS, VER):
+            res = csd.run_pass(progs, now=now, reads={("KXAMZNCC", "2026-11"): r}, dry=True,
+                               books=lambda ts: {t: books[t] for t in ts if t in books})
+            self.assertEqual(res["strikes"], 1)
+            raw = dict(r)
+            raw.pop("mu")
+            res = csd.run_pass(progs, now=now, reads={("KXAMZNCC", "2026-11"): raw}, dry=True,
+                               books=lambda ts: {t: books[t] for t in ts if t in books})
+            self.assertEqual(res["skip"], {"near the money": 1})
+
+
 class TestReport(unittest.TestCase):
 
     def test_tape_fills_and_their_value(self):

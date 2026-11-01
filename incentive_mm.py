@@ -36947,6 +36947,19 @@ class IncentiveMarketMaker:
                 + ("caps the side (rests only while it earns)" if CA_FAIR_CAP
                    else "parks both sides")
                 + f", file {CA_FAIR_FILE}")
+            # the fair's November mu for the online / BNPL card series carries
+            # carbon_arc_fair's Cyber Monday factor (Jack 2026-11-01: "Estimates
+            # only"); the refresher writes it, the gate reads mu / sigma as ever
+            try:
+                import carbon_arc_fair as _caf
+                log("ca holiday factor (2026-11-01): "
+                    + ("; ".join(f"{m} " + ", ".join(f"{s} x{f:g}" for s, f in sorted(rows.items()))
+                                 for m, rows in sorted(_caf.CA_HOLIDAY_FACTORS.items()))
+                       + f" -- reads through day {_caf.CA_HOLIDAY_THROUGH_DAY}, sigma "
+                       f"+{_caf.CA_HOLIDAY_SIGMA_SHARE:g} of the shift"
+                       if _caf.CA_HOLIDAY_ENABLE else "off (IMM_CA_HOLIDAY=0)"))
+            except Exception as e:                           # noqa: BLE001 - a log line
+                log(f"ca holiday factor: unreadable ({e!r})")
             log("ca scheduled-data stand-aside (2026-10-15): "
                 + (f"{', '.join(sorted(CA_SCHEDULE_HOLD_CATS)) or '(no category)'} "
                    f"out from {CA_SCHEDULE_PRE_MIN:g}m before its panel's "
