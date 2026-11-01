@@ -14423,6 +14423,204 @@ class TestRtFairGate(TestCpiFairGate):
         self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
 
 
+class TestRtSettledStrikes(unittest.TestCase):
+    """Jack 2026-11-01: "run it live, and then email report on performnce so
+    i can monitor it", on quoting only strikes the Rotten Tomatoes model puts
+    well away from a well-reviewed film's score, up to 98c and through the
+    final week. RT SETTLED STRIKES. Fixture KXRT-ZZS-80: a film with 120
+    reviews at 93%, the model at 99.5% for 80, on a 97x98 book, closing in 3
+    days (inside the release-week stand-down)."""
+
+    T = "KXRT-ZZS-80"
+    EV = "KXRT-ZZS"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._rt_fair_state.update(mtime=0.0, markets={}, films={}, strikes={})
+        try:
+            os.remove(imm.RT_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        p = mock.patch.object(imm, "series_in_blackout", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, n=120, score=93.0, p=0.995, age_secs=0, jump_age_secs=None, k=80.0):
+        at = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        jump = (None if jump_age_secs is None else
+                (datetime.now(timezone.utc) - timedelta(seconds=jump_age_secs)).isoformat())
+        doc = {"films": {self.EV: {"n": n, "score": score, "liked": int(round(n * score / 100))}},
+               "open_events": {self.EV: {"strikes": {self.T: k}}},
+               "markets": {self.T: {"event": self.EV, "p": p, "n": n, "jump_at": jump,
+                                    "fetched_at": at.isoformat()}}}
+        with open(imm.RT_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        os.utime(imm.RT_FAIR_FILE, (time.time(), time.time() + TestRtSettledStrikes._bump))
+        TestRtSettledStrikes._bump += 1
+        return imm.load_rt_fair()
+
+    def _bot(self, close_days=3.0, bid=0.97, ask=0.98):
+        client = FakeClient()
+        close = (datetime.now(timezone.utc) + timedelta(days=close_days)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 5000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": close, "yes_bid_dollars": f"{bid:.4f}",
+            "yes_ask_dollars": f"{ask:.4f}", "volume_fp": "5000.00"}
+        no = round(1.0 - ask, 2)
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{bid - 0.02:.2f}", "2000"], [f"{bid - 0.01:.2f}", "1500"],
+                            [f"{bid:.2f}", "1500"]],
+            "no_dollars": [[f"{no - 0.01:.2f}", "2000"], [f"{no:.2f}", "1500"]]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+
+    def test_the_rule(self):
+        for k in ("RT_SETTLED_MODE", "RT_SETTLED_MIN_REVIEWS", "RT_SETTLED_P",
+                  "RT_SETTLED_MIN_GAP", "RT_SETTLED_MID", "RT_SETTLED_BAND_LO",
+                  "RT_SETTLED_BAND_HI", "RT_SETTLED_STOP_H"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        self.assertEqual((imm.RT_SETTLED_MODE, imm.RT_SETTLED_MIN_REVIEWS, imm.RT_SETTLED_P,
+                          imm.RT_SETTLED_MIN_GAP, imm.RT_SETTLED_BAND_LO,
+                          imm.RT_SETTLED_BAND_HI, imm.RT_SETTLED_STOP_H),
+                         ("on", 50, 0.97, 5.0, 2, 98, 6.0))
+        self.assertTrue(imm.rt_settled_series("KXRT"))
+        self.assertFalse(imm.rt_settled_series("KXRTTV"))
+        r, now = imm.rt_settled_reason, time.time()
+        self.assertEqual(r(self.T, 97.5, now), "no RT read")
+        self._write()
+        self.assertEqual(imm._rt_fair_state["films"][self.EV], {"n": 120, "score": 93.0})
+        self.assertEqual(imm.rt_strike(self.T), 80.0)
+        self.assertEqual(imm.rt_strike("KXRT-ZZS-72"), 72.0)          # off the ticker
+        self.assertIsNone(r(self.T, 97.5, now))                         # a settled YES strike
+        self.assertEqual(r(self.T, None, now), "no two-sided book")
+        self.assertEqual(r(self.T, 85.0, now), "the book's 85c mid disagrees")
+        self._write(n=49)
+        self.assertEqual(r(self.T, 97.5, now), "49 reviews, under 50")
+        self._write(score=84.0)
+        self.assertEqual(r(self.T, 97.5, now), "the 84% score is 4 from the 80 strike")
+        self._write(p=0.95)
+        self.assertEqual(r(self.T, 97.5, now), "the model reads 95.0%")
+        self._write(age_secs=imm.RT_FAIR_TTL_MIN * 60 + 5)
+        self.assertEqual(r(self.T, 97.5, time.time()), "the RT read is stale")
+        self._write(jump_age_secs=60)
+        self.assertEqual(r(self.T, 97.5, time.time()), "a review-count jump hold")
+        # a strike over the score: a settled NO
+        self._write(score=70.0, p=0.01)
+        self.assertIsNone(r(self.T, 3.0, time.time()))
+        self.assertEqual(r(self.T, 12.0, time.time()), "the book's 12c mid disagrees")
+        with mock.patch.object(imm, "RT_SETTLED_MODE", "off"):
+            self.assertFalse(imm.rt_settled_series("KXRT"))
+
+    def test_the_release_week_cutoff_moves_for_a_settled_strike(self):
+        close = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=3)
+        m = {"ticker": self.T, "yes_bid_dollars": "0.9700", "yes_ask_dollars": "0.9800"}
+        adj = imm.apply_series_cutoff_adjustments
+        week = close - timedelta(days=imm.KXRT_CUTOFF_BEFORE_CLOSE_DAYS)
+        self.assertEqual(adj("KXRT", self.EV, None, close_time=close, market=m), week)
+        self._write()
+        self.assertEqual(adj("KXRT", self.EV, None, close_time=close, market=m),
+                         close - timedelta(hours=imm.RT_SETTLED_STOP_H))
+        # no market object (the orphan restore), a book that disagrees (89c
+        # mid), the switch off: the family's stand-down
+        self.assertEqual(adj("KXRT", self.EV, None, close_time=close), week)
+        self.assertEqual(adj("KXRT", self.EV, None, close_time=close,
+                             market=dict(m, yes_bid_dollars="0.8000")), week)
+        with mock.patch.object(imm, "RT_SETTLED_MODE", "off"):
+            self.assertEqual(adj("KXRT", self.EV, None, close_time=close, market=m), week)
+
+    def test_the_loop_quotes_it_in_the_release_week_and_stands_aside_at_once(self):
+        self._write()
+        bot = self._bot()
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        q = self._quotes(bot)
+        self.assertTrue(any(sd == "bid" and px >= 95 for sd, px in q), q)
+        self.assertTrue(any(sd == "ask" and px >= 98 for sd, px in q), q)
+        ons = [x for x in lines if f"rt settled {self.T}: on -- " in x]
+        self.assertEqual(len(ons), 1, lines)
+        self.assertIn("120 reviews, score 93%, strike 80, model 99.5%, book mid 97.5c; "
+                      "past the release-week stand-down; a touch outside the normal band",
+                      ons[0])
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertEqual(len([x for x in lines if f"rt settled {self.T}: on" in x]), 1)
+        # the film reads under the bar at the next refresh's load: out at once
+        self._write(n=40)
+        lines.clear()
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertTrue(any(f"rt settled {self.T}: off -- 40 reviews, under 50" in x
+                            for x in lines), lines)
+
+    def test_past_the_week_one_that_stops_qualifying_stands_aside(self):
+        # a 90x91 book sits inside the family's own band, so only the rule's
+        # stand-aside takes the strike out once it stops qualifying
+        self._write()
+        bot = self._bot(bid=0.90, ask=0.91)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertTrue(self._quotes(bot), lines)
+        ons = [x for x in lines if f"rt settled {self.T}: on -- " in x]
+        self.assertEqual(len(ons), 1, lines)
+        self.assertIn("past the release-week stand-down", ons[0])
+        self.assertNotIn("normal band", ons[0])
+        self._write(n=40)
+        lines.clear()
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertTrue(any(f"rt settled {self.T}: off -- 40 reviews, under 50" in x
+                            for x in lines), lines)
+
+    def test_off_or_unsettled_it_stays_out_of_the_release_week(self):
+        self._write()
+        with mock.patch.object(imm, "RT_SETTLED_MODE", "off"):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+        self._write(n=40)
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+
+    def test_before_the_week_it_opens_the_band(self):
+        # 30 days out the family's cutoff is far, but a 97.5c mid is past the
+        # 5-90 fresh band: the rule admits it, and logs it for the band alone
+        self._write()
+        bot = self._bot(close_days=30.0)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertTrue(any(sd == "bid" and px >= 95 for sd, px in self._quotes(bot)))
+        ons = [x for x in lines if f"rt settled {self.T}: on -- " in x]
+        self.assertEqual(len(ons), 1, lines)
+        self.assertNotIn("release-week", ons[0])
+        self.assertIn("a touch outside the normal band", ons[0])
+        with mock.patch.object(imm, "RT_SETTLED_MODE", "off"):
+            bot = self._bot(close_days=30.0)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+
+
 class TestOpenRouterShareFairGate(unittest.TestCase):
     """openrouter_share_fair.json -> load_share_fair/share_gate_reason -> the
     stand-aside on KX<AUTHOR>SHARE (Jack 2026-09-30: "scrape OpenRouter for
@@ -25177,7 +25375,9 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the opportunistic AS test's fill pause (2026-10-25)
         # + band_both_out again below a fair-lead market's leads, where no
         # fair lead or close rests past the band (2026-10-30)
-        self.assertEqual(len(conts), 54)
+        # + an RT settled strike that stops qualifying past the release-week
+        # stand-down (2026-11-01)
+        self.assertEqual(len(conts), 55)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 

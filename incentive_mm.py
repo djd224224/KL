@@ -11775,6 +11775,9 @@ _CONFIG_CODE_KNOBS = (
     "COMP_LEAD_MAX_POSITION",
     "LEAD_OFF_SERIES",            # no leads on OpenRouter (2026-11-01)
     "LEAD_STOP_BEFORE_H",         # no lead in the 24h before a decision (2026-11-01)
+    # RT settled strikes (2026-11-01)
+    "RT_SETTLED_MODE", "RT_SETTLED_MIN_REVIEWS", "RT_SETTLED_P", "RT_SETTLED_MIN_GAP",
+    "RT_SETTLED_MID", "RT_SETTLED_BAND_LO", "RT_SETTLED_BAND_HI", "RT_SETTLED_STOP_H",
     # fair lead (2026-10-29)
     "FAIR_LEAD_MODE", "FAIR_LEAD_SERIES", "FAIR_LEAD_MARGIN_C",
     "FAIR_LEAD_MAX_POSITION", "FAIR_LEAD_EVENT_CAP",
@@ -14687,7 +14690,7 @@ RT_FAIR_FEW_REVIEWS = os.environ.get("IMM_RT_FAIR_FEW_REVIEWS", "1") == "1"
 RT_FAIR_MIN_REVIEWS_DEFAULT = 10      # rt_fair.MIN_REVIEWS, when the file has none
 RT_FAIR_FILE = os.environ.get(
     "IMM_RT_FAIR_FILE", os.path.join(STATUS_DIR, "rt_fair.json"))
-_rt_fair_state: dict = {"mtime": 0.0, "markets": {},
+_rt_fair_state: dict = {"mtime": 0.0, "markets": {}, "films": {}, "strikes": {},
                         "min_reviews": RT_FAIR_MIN_REVIEWS_DEFAULT}
 
 
@@ -14697,7 +14700,8 @@ def rt_fair_series(series: str) -> bool:
 
 def load_rt_fair() -> int:
     """Hot-reload RT_FAIR_FILE by mtime: markets {ticker: {p (None without
-    a price), event, n, ts, jump_ts}}; the market count, else -1."""
+    a price), event, n, ts, jump_ts}}, films {event: {n, score}} and strikes
+    {ticker: strike} (RT SETTLED STRIKES); the market count, else -1."""
     try:
         mtime = os.path.getmtime(RT_FAIR_FILE)
     except OSError:
@@ -14726,6 +14730,21 @@ def load_rt_fair() -> int:
         markets[str(t)] = {"p": p, "event": ev, "n": n, "ts": ts.timestamp(),
                            "jump_ts": jt.timestamp() if jt else None}
     _rt_fair_state["markets"] = markets
+    films: Dict[str, dict] = {}
+    for ev, f in (data.get("films") or {}).items():
+        try:
+            films[str(ev)] = {"n": int(f.get("n") or 0),
+                              "score": None if f.get("score") is None else float(f["score"])}
+        except (TypeError, ValueError, AttributeError):
+            continue
+    strikes: Dict[str, float] = {}
+    for oe in (data.get("open_events") or {}).values():
+        for t, k in ((oe or {}).get("strikes") or {}).items():
+            try:
+                strikes[str(t)] = float(k)
+            except (TypeError, ValueError):
+                continue
+    _rt_fair_state["films"], _rt_fair_state["strikes"] = films, strikes
     try:   # the feed's own pricing bar (rt_fair.MIN_REVIEWS), for the few-reviews hold
         mr = int((data.get("model") or {}).get("min_reviews") or 0)
     except (TypeError, ValueError, AttributeError):
@@ -14756,6 +14775,106 @@ def rt_fair_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return "", {}, None
     return fair_band_verdict(e["p"] * 100.0, ext_bid, ext_ask, RT_FAIR_TOL_CENTS,
                              "RT", RT_FAIR_CAP)
+
+
+# RT SETTLED STRIKES (Jack 2026-11-01: "run it live, and then email report on
+# performnce so i can monitor it", on quoting only strikes the Rotten
+# Tomatoes model puts well away from the score, on films with most of their
+# reviews in, up to 98c and through the final week). On a film whose score
+# rests on many reviews, a strike 5+ points from it is near-decided but
+# still trades two-sided at 92-98c (11/01: Godzilla Minus Zero 75 / 80 at
+# 98x99 / 96x97, I Play Rocky 65-72 at 95-98c), where the 5-90 fresh mid
+# band and the release-week stand-down (KXRT_CUTOFF_BEFORE_CLOSE_DAYS) kept
+# the bot out. A KXRT market is a SETTLED STRIKE while all of these hold
+# (rt_settled_reason): a fresh RT read, no review-jump hold, at least
+# RT_SETTLED_MIN_REVIEWS reviews, the score RT_SETTLED_MIN_GAP+ points from
+# the strike, the feed's model at RT_SETTLED_P+ on that side, and the book
+# agreeing (a mid at RT_SETTLED_MID+ for a strike under the score, at
+# 100 - it or less for one over). It is screened and quoted on
+# RT_SETTLED_BAND_LO-HI (2-98c), and its release-week cutoff moves to
+# RT_SETTLED_STOP_H before its close (apply_series_cutoff_adjustments, at
+# each refresh). Past the stand-down, a strike that stops qualifying stands
+# aside at once (the quote loop), its position riding as at any cutoff.
+# Size, floors, caps and the review-jump hold stay the family's. The loop
+# logs "rt settled <t>: on / off -- ..." while the rule is what quotes it
+# (past the stand-down, or a touch outside the normal band), which
+# send_rt_settled_monitor.py reads. IMM_RT_SETTLED=off turns it off.
+RT_SETTLED_MODE = os.environ.get("IMM_RT_SETTLED", "on").strip().lower()
+RT_SETTLED_MIN_REVIEWS = _env_int("IMM_RT_SETTLED_MIN_REVIEWS", 50)
+RT_SETTLED_P = _env_float("IMM_RT_SETTLED_P", 0.97)
+RT_SETTLED_MIN_GAP = _env_float("IMM_RT_SETTLED_MIN_GAP", 5.0)
+RT_SETTLED_MID = _env_float("IMM_RT_SETTLED_MID", 90.0)
+RT_SETTLED_BAND_LO = _env_int("IMM_RT_SETTLED_BAND_LO", 2)
+RT_SETTLED_BAND_HI = _env_int("IMM_RT_SETTLED_BAND_HI", 98)
+RT_SETTLED_STOP_H = _env_float("IMM_RT_SETTLED_STOP_H", 6.0)
+
+
+def rt_settled_series(series: str) -> bool:
+    return RT_SETTLED_MODE == "on" and rt_fair_series(series)
+
+
+def rt_strike(ticker: str) -> Optional[float]:
+    """A KXRT market's strike (score %): the feed's, else the ticker's tail."""
+    k = _rt_fair_state.get("strikes", {}).get(ticker)
+    if k is not None:
+        return k
+    try:
+        return float(ticker.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def rt_settled_reason(ticker: str, mid: Optional[float], now_ts: float) -> Optional[str]:
+    """None while `ticker` is a SETTLED STRIKE (RT SETTLED STRIKES), else why
+    not; `mid` is its book's mid in YES cents, None for a one-sided book."""
+    e = _rt_fair_state["markets"].get(ticker)
+    if e is None:
+        return "no RT read"
+    if now_ts - e["ts"] > RT_FAIR_TTL_MIN * 60:
+        return "the RT read is stale"
+    if e["jump_ts"] is not None and 0 <= now_ts - e["jump_ts"] < RT_FAIR_HOLD_MIN * 60:
+        return "a review-count jump hold"
+    film = _rt_fair_state.get("films", {}).get(e["event"]) or {}
+    n = int(film.get("n") or e["n"] or 0)
+    if n < RT_SETTLED_MIN_REVIEWS:
+        return f"{n} reviews, under {RT_SETTLED_MIN_REVIEWS}"
+    score, k, p = film.get("score"), rt_strike(ticker), e["p"]
+    if score is None or k is None or p is None:
+        return "no score, strike or model price"
+    if abs(score - k) < RT_SETTLED_MIN_GAP:
+        return f"the {score:g}% score is {abs(score - k):g} from the {k:g} strike"
+    if p >= RT_SETTLED_P and score > k:
+        yes = True
+    elif p <= 1.0 - RT_SETTLED_P and score < k:
+        yes = False
+    else:
+        return f"the model reads {p * 100:.1f}%"
+    if mid is None:
+        return "no two-sided book"
+    if (yes and mid < RT_SETTLED_MID) or (not yes and mid > 100.0 - RT_SETTLED_MID):
+        return f"the book's {mid:g}c mid disagrees"
+    return None
+
+
+def rt_settled_close_min(series: str, mins: float, market: Optional[dict]) -> float:
+    """A close-anchored cutoff's minutes before the close, cut to
+    RT_SETTLED_STOP_H for a settled strike read off its market object (RT
+    SETTLED STRIKES); unchanged with no market object (the orphan restore)."""
+    if market is None or not rt_settled_series(series):
+        return mins
+    bid, ask = market_cents(market, "yes_bid"), market_cents(market, "yes_ask")
+    mid = (bid + ask) / 2.0 if bid and ask else None
+    if rt_settled_reason(str(market.get("ticker") or ""), mid, time.time()) is None:
+        return min(mins, RT_SETTLED_STOP_H * 60.0)
+    return mins
+
+
+def rt_release_week(meta, now_ts: float) -> bool:
+    """Is `meta` past the family's release-week stand-down (its close less
+    KXRT_CUTOFF_BEFORE_CLOSE_DAYS)?"""
+    return (KXRT_CUTOFF_BEFORE_CLOSE_DAYS > 0 and meta.close_time is not None
+            and now_ts >= meta.close_time.timestamp()
+            - KXRT_CUTOFF_BEFORE_CLOSE_DAYS * 86400.0)
 
 
 # BROADWAY WEEKLY ATTENDANCE GATE (Jack 2026-10-25: "Can you build a fair
@@ -19259,7 +19378,9 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     # here could only ever compare against the already-minimised result and
     # would have quoted straight through a real event start.
     if ov and ov.cutoff_from_close_min is not None and close_time is not None:
-        anchored = close_time - timedelta(minutes=ov.cutoff_from_close_min)
+        # (a settled strike's runs through the release week: RT SETTLED STRIKES)
+        mins = rt_settled_close_min(series, ov.cutoff_from_close_min, market)
+        anchored = close_time - timedelta(minutes=mins)
         cutoff = anchored if cutoff is None else min(cutoff, anchored)
     if ov and ov.cutoff_before_event_min is not None:
         td = parse_event_date(event_ticker)
@@ -22590,6 +22711,7 @@ class IncentiveMarketMaker:
         self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
+        self._rt_settled_on: Dict[str, bool] = {}       # RT SETTLED STRIKES' logged state
         # FAIR CLOSE: (ticker, side) -> the closing rung's last logged price,
         # and ticker -> (side, YES price) of the closing rung it rests now
         self._fair_close_noted: Dict[Tuple[str, str], Optional[int]] = {}
@@ -28058,7 +28180,10 @@ class IncentiveMarketMaker:
             # the event-start machinery below doesn't apply.
             ov_close = series_override(series)
             if ov_close and ov_close.cutoff_from_close_min is not None:
-                cutoff = (close_time - timedelta(minutes=ov_close.cutoff_from_close_min)
+                # (a settled strike's runs through the release week: RT
+                # SETTLED STRIKES)
+                cutoff = (close_time - timedelta(minutes=rt_settled_close_min(
+                    series, ov_close.cutoff_from_close_min, m))
                           if close_time is not None else None)
             else:
                 # Real event start (statsapi / ESPN / fixed broadcast hour) beats
@@ -29548,6 +29673,27 @@ class IncentiveMarketMaker:
                 f"publish: no lead from {OR_LEAD_BLACKOUT_PRE_MIN:g} min before 00:00Z "
                 f"until the feed carries the day that ended")
 
+    def _rt_settled_note(self, t: str, why: Optional[str], mid: Optional[float],
+                         week: bool, band: bool) -> None:
+        """Log a SETTLED STRIKE (RT SETTLED STRIKES) going on -- quoted by the
+        rule: past the release-week stand-down, or a touch outside the
+        normal band -- or off, once each way."""
+        on = why is None and (week or band)
+        if on == self._rt_settled_on.get(t, False):
+            return
+        self._rt_settled_on[t] = on
+        if not on:
+            log(f"{self.tag} rt settled {t}: off -- "
+                + (why or "back inside the family's own rules"))
+            return
+        e = _rt_fair_state["markets"].get(t) or {}
+        film = _rt_fair_state.get("films", {}).get(e.get("event")) or {}
+        k = rt_strike(t)
+        log(f"{self.tag} rt settled {t}: on -- {film.get('n')} reviews, score "
+            f"{film.get('score'):g}%, strike {k:g}, model {e['p'] * 100:.1f}%, book mid "
+            f"{mid:g}c" + ("; past the release-week stand-down" if week else "")
+            + ("; a touch outside the normal band" if band else ""))
+
     def _lead_stop_note(self, t: str, src: str, meta) -> None:
         """Log each side of `t` still noted as leading as off for LEAD STOP,
         once."""
@@ -30844,6 +30990,11 @@ class IncentiveMarketMaker:
         # The band the quote loop quotes a SELECTED market in -- which every
         # candidate is by the time the loop reaches it (ESTIMATE_SIDE_BAND).
         _qlo, _qhi = member_price_band(meta.series, True)
+        # (a settled strike quotes on its own band: RT SETTLED STRIKES)
+        _rs_band = (rt_settled_series(meta.series)
+                    and rt_settled_reason(meta.ticker, meta.mid_cents, time.time()) is None)
+        if _rs_band:
+            _qlo, _qhi = min(_qlo, RT_SETTLED_BAND_LO), max(_qhi, RT_SETTLED_BAND_HI)
 
         def _sides_in_band(eb: Optional[int],
                            ea: Optional[int]) -> Tuple[bool, bool]:
@@ -31066,6 +31217,9 @@ class IncentiveMarketMaker:
         else:
             _pmin_s, _pmax_s = member_price_band(
                 meta.series, meta.ticker in self.state.selected)
+            if _rs_band:
+                _pmin_s = min(_pmin_s, RT_SETTLED_BAND_LO)
+                _pmax_s = max(_pmax_s, RT_SETTLED_BAND_HI)
             meta.quotable_sides = (
                 int(ext_b is not None and _pmin_s <= ext_b <= _pmax_s)
                 + int(ext_a is not None and _pmin_s <= ext_a <= _pmax_s))
@@ -31572,6 +31726,11 @@ class IncentiveMarketMaker:
             # the family's EXACT band (0.05-99.5c, subcent_edge_quotes)
             band_lo = min(band_lo, SPORTS_LADDER_PRICE_MIN_EXACT)
             band_hi = max(band_hi, SPORTS_LADDER_PRICE_MAX_EXACT)
+        # a settled strike is screened on its own band (RT SETTLED STRIKES)
+        if rt_settled_series(meta.series) \
+                and rt_settled_reason(meta.ticker, meta.mid_cents, now_ts) is None:
+            band_lo = min(band_lo, RT_SETTLED_BAND_LO)
+            band_hi = max(band_hi, RT_SETTLED_BAND_HI)
         if not (band_lo <= meta.mid_cents <= band_hi):
             return "extreme_mid"
         if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS:
@@ -32732,6 +32891,27 @@ class IncentiveMarketMaker:
             # Member band (5-93 since 8/3); fresh keeps the series band.
             pmin_s, pmax_s = member_price_band(
                 series_of(t), t in self.state.selected)
+            # RT SETTLED STRIKES (2026-11-01): a settled strike quotes on its
+            # own band; past the release-week stand-down, one that no longer
+            # qualifies stands aside at once (the next refresh puts its
+            # cutoff back), its position riding as at any cutoff
+            if rt_settled_series(meta.series):
+                _rs_mid = ((ext_bid + ext_ask) / 2.0
+                           if ext_bid is not None and ext_ask is not None else None)
+                _rs_why = rt_settled_reason(t, _rs_mid, now_ts)
+                _rs_week = rt_release_week(meta, now_ts)
+                if _rs_why is None:
+                    _rs_band = not all(pmin_s <= x <= pmax_s for x in (ext_bid, ext_ask)
+                                       if x is not None)
+                    pmin_s = min(pmin_s, RT_SETTLED_BAND_LO)
+                    pmax_s = max(pmax_s, RT_SETTLED_BAND_HI)
+                    self._rt_settled_note(t, None, _rs_mid, _rs_week, _rs_band)
+                else:
+                    self._rt_settled_note(t, _rs_why, _rs_mid, _rs_week, False)
+                    if _rs_week:
+                        self.cancel_market_orders(t, resting)
+                        self._gskip(t, "rt_settled_off", lambda: dict(why=_rs_why))
+                        continue
             # PER-SIDE top-in-band (Jack 2026-08-03 "Do 1", CHIH T69.99: a
             # live 3x29 book was fully stood down because its wide spread
             # put the bid touch under 5c): a side whose OWN touch is outside
@@ -37324,6 +37504,13 @@ class IncentiveMarketMaker:
                f"one of these leads neither off a model fair nor off its ladder's or "
                f"siblings' books; its rungs, locks and lock jobs as before"
                if LEAD_OFF_SERIES else "none -- every series in a lead's scope leads"))
+        log("rt settled strikes (2026-11-01): "
+            + (f"on -- a KXRT strike with {RT_SETTLED_MIN_REVIEWS}+ reviews, the score "
+               f"{RT_SETTLED_MIN_GAP:g}+ points away, the RT model at "
+               f"{RT_SETTLED_P * 100:g}%+ and the book agreeing quotes on "
+               f"{RT_SETTLED_BAND_LO}-{RT_SETTLED_BAND_HI}c, through the release week to "
+               f"{RT_SETTLED_STOP_H:g}h before its close"
+               if RT_SETTLED_MODE == "on" else "off"))
         log("lead stop (2026-11-01): "
             + (f"no lead of either kind from {LEAD_STOP_BEFORE_H:g}h before a market's "
                f"decision -- a Vercel market's measured UTC day, else its cutoff (rain: "
