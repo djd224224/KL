@@ -25386,16 +25386,162 @@ class TestWeatherShapes1030(unittest.TestCase):
         # the station stays on file for a producer whose market says less
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXRAINDNYC", "KXRAINDNYC-261031", None, market={}), cut)
-        # rules naming no US station stand it down: Paris (LFPG), whose rain
-        # day starts before the 22:00 ET stop
-        paris = {"rules_primary": "If the total precipitation at Paris-Charles de "
-                 "Gaulle (LFPG) in Paris on Sep 3, 2027 is strictly greater than 0 inches"}
-        self.assertEqual(imm.apply_series_cutoff_adjustments(
-            "KXRAINDPARIS", "KXRAINDPARIS-03SEP27", None, market=paris),
-            imm.RELEASE_GUARD_UNKNOWN)
+        # rules naming no station at all stand it down (a non-US one quotes:
+        # test_paris_quotes_on_its_station)
+        paris = {"rules_primary": "If the total precipitation in Paris on Sep 3, "
+                 "2027 is strictly greater than 0 inches"}
+        with mock.patch.dict(imm._RAIN_DAILY_INTL, clear=True):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXRAINDPARIS", "KXRAINDPARIS-03SEP27", None, market=paris),
+                imm.RELEASE_GUARD_UNKNOWN)
+            self.assertEqual(imm._RAIN_DAILY_INTL, {})
         self.assertTrue(imm.move_breaker_on("KXRAINDNYC"))
         self.assertFalse(imm.move_breaker_on("KXRAINDCM"))
         self.assertTrue(imm.is_daily_series("KXRAINDNYC"))
+
+    # ---- the international ones: Paris (2026-10-31) -----------------------
+    PARIS = "KXRAINDPARIS-03SEP27-T0"
+    PARIS_RULES = {"rules_primary": "If total precipitation at Paris Charles de Gaulle "
+                   "Airport (LFPG) for The Weather Company reporting day dated September "
+                   "3, 2027 (06:00 UTC that date to 06:00 UTC the following date) is "
+                   "strictly greater than 0 millimeters, then the market resolves to Yes."}
+
+    def _intl_clean(self):
+        for d in (imm._RAIN_DAILY_STATION, imm._RAIN_DAILY_INTL, imm._config_gaps):
+            p = mock.patch.dict(d, clear=True)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_release_guard_warned", "_config_gaps_seen"):
+            p = mock.patch.object(imm, name, set())
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_paris_quotes_on_its_station(self):
+        # Jack 2026-10-31: "quote the paris rain market with 1000 size
+        # contracts on each side as a base (with normal multipliers ontop of
+        # it), since nobody has a forecast that far out. make sure these new
+        # markets are auto-quoted"
+        self._intl_clean()
+        imm.ensure_family_override("KXRAINDPARIS")
+        ev = "KXRAINDPARIS-03SEP27"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(imm.IncentiveMarketMaker._allowed(self.PARIS))
+        # its rain day runs 06:00-06:00 UTC; it stops 14 days before, before
+        # any weather model reaches it
+        cut = imm.apply_series_cutoff_adjustments(
+            "KXRAINDPARIS", ev, imm.trade_cutoff_utc(ev, None, None), market=self.PARIS_RULES)
+        self.assertEqual(cut, imm.ET.localize(datetime(2027, 8, 20)).astimezone(timezone.utc))
+        self.assertEqual(imm._RAIN_DAILY_INTL, {"KXRAINDPARIS": "LFPG"})
+        self.assertEqual(imm._RAIN_DAILY_STATION, {})
+        # a new city's rules worded another way join on the station alone
+        # ("make sure these new markets are auto-quoted")
+        tokyo = {"rules_primary": "If total precipitation at Tokyo Haneda Airport (RJTT) "
+                 "for the reporting day dated March 1, 2027 (15:00 UTC the previous date "
+                 "to 15:00 UTC that date) is strictly greater than 0 millimeters"}
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINDTOKYO", "KXRAINDTOKYO-01MAR27", None, market=tokyo),
+            imm.ET.localize(datetime(2027, 2, 15)).astimezone(timezone.utc))
+        self.assertEqual(imm._RAIN_DAILY_INTL["KXRAINDTOKYO"], "RJTT")
+        self.assertNotIn(ev, imm._config_gaps)
+        # ...kept on file for a producer whose market says less
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXRAINDPARIS", ev, None, market={}), cut)
+        # no model: no fair, so the gate leaves plain band quoting
+        self.assertIsNone(imm.rain_fair_p(self.PARIS, time.time()))
+        self.assertEqual((imm.series_price_min("KXRAINDPARIS"),
+                          imm.series_price_max("KXRAINDPARIS")), (5, 90))
+        # a US station's daily keeps its own rules
+        self.assertFalse(imm.rain_daily_intl_series("KXRAINDNYC"))
+        self.assertIsNone(imm.note_rain_daily_intl("KXRAINDNYC", self.NYC_RULES))
+        # the switch stands it down again, with its gap
+        with mock.patch.object(imm, "RAIN_DAILY_INTL", False):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXRAINDPARIS", ev, None, market=self.PARIS_RULES),
+                imm.RELEASE_GUARD_UNKNOWN)
+        self.assertIn("rules name no station", imm._config_gaps[ev]["msg"])
+
+    def test_paris_rests_1000_a_side_as_a_base(self):
+        self._intl_clean()
+        imm.ensure_family_override("KXRAINDPARIS")
+        self.assertEqual(imm.RAIN_DAILY_INTL_BASE, 1000.0)
+        self.assertEqual(imm.RAIN_DAILY_INTL_STOP_DAYS, 14.0)
+        for k in ("RAIN_DAILY_INTL", "RAIN_DAILY_INTL_BASE", "RAIN_DAILY_INTL_STOP_DAYS"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        day = imm.ET.localize(datetime(2026, 11, 2, 14)).astimezone(timezone.utc)
+        eve = imm.ET.localize(datetime(2026, 11, 2, 21)).astimezone(timezone.utc)
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0), \
+                mock.patch.object(imm, "SAT_MAX_POSITION", 150.0), \
+                mock.patch.object(imm, "SERIES_HOUR_MULTS",
+                                  imm._parse_series_hour_mults("KXRAIN:19-1:0.5")):
+            # the family's size until its rules are read
+            self.assertEqual(imm.applied_mention_mult("KXRAINDPARIS"),
+                             imm.RAIN_DAILY_SIZE_MULT * imm.size_test_mult("KXRAINDPARIS"))
+            imm.note_rain_daily_intl("KXRAINDPARIS", self.PARIS_RULES)
+            # 1,000 for the launcher's 20-lot rung (x50), the family's x2 on
+            # top: 2,000 a side by day, 1,000 in the 19-01 ET halving; the
+            # caps and skew knees ride the same wire; out of the size test
+            self.assertIsNone(imm.size_test_arm("KXRAINDPARIS"))
+            self.assertEqual(imm.applied_mention_mult("KXRAINDPARIS"),
+                             50.0 * imm.RAIN_DAILY_SIZE_MULT)
+            self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", day), [(0, 2000)])
+            self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", eve), [(0, 1000)])
+            self.assertEqual(imm.series_max_position("KXRAINDPARIS", day), 15000.0)
+            with mock.patch.object(imm, "RAIN_DAILY_INTL_BASE", 0.0):
+                self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", day),
+                                 [(0, int(20 * imm.RAIN_DAILY_SIZE_MULT))])
+            # a US station's daily is untouched
+            imm.ensure_family_override("KXRAINDNYC")
+            imm.note_rain_daily_station("KXRAINDNYC", self.NYC_RULES)
+            self.assertEqual(imm.rain_daily_intl_base_mult("KXRAINDNYC"), 1.0)
+
+    def test_the_quote_loop_rests_2500_a_side_on_the_paris_book(self):
+        # the 11/01 03:10Z book: YES 170 @ 41c over 2,495 @ 40c; NO 5 @ 32c
+        # (a 68c offer) over 4,398 @ 31c (69c): at-ref rungs at 40c and 69c,
+        # each one tick behind its touch, so the deep-reference x1.25 rides
+        # on the 2,000 too
+        self._intl_clean()
+        _clean_persist()
+        lines = []
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.PARIS, "incentive_type": "liquidity",
+             "period_reward": 10000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.PARIS] = dict(
+            self.PARIS_RULES, ticker=self.PARIS, event_ticker="KXRAINDPARIS-03SEP27",
+            status="active", close_time="2027-09-04T05:59:00Z",
+            yes_bid_dollars="0.4100", yes_ask_dollars="0.6800", volume_fp="4498.66")
+        client.books[self.PARIS] = {"orderbook_fp": {
+            "yes_dollars": [["0.0100", "1051.00"], ["0.0300", "1.00"],
+                            ["0.4000", "2495.00"], ["0.4100", "170.00"]],
+            "no_dollars": [["0.0100", "21001.00"], ["0.0300", "1.00"], ["0.0500", "5000.00"],
+                           ["0.0600", "47.00"], ["0.2500", "1.97"], ["0.3100", "4398.00"],
+                           ["0.3200", "5.16"]]}}
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0), \
+                mock.patch.object(imm, "SAT_MAX_POSITION", 150.0), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0), \
+                mock.patch.object(imm, "COLLATERAL_BUDGET", 300000.0), \
+                mock.patch.object(imm, "SERIES_HOUR_MULTS", []), \
+                mock.patch.object(imm, "series_in_blackout", return_value=False), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"), \
+                mock.patch.object(imm, "log", lines.append):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        self.assertIn(self.PARIS, bot.state.selected,
+                      [s for s in lines if "PARIS" in s or "skips" in s])
+        rungs = sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                       for o in bot.state.sim_orders.values() if o["ticker"] == self.PARIS)
+        self.assertEqual(rungs, [("ask", 69, 2500), ("bid", 40, 2500)])
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            self.assertEqual(imm.ref_depth_mult(41, 40, "bid"), 1.25)
 
     def test_the_next_day_event_is_curated_past_the_floors(self):
         evening = utc(2026, 10, 31, 0, 30)          # 8:30 PM ET Oct 30

@@ -1232,10 +1232,11 @@ def rain_period_family_series(series: str) -> bool:
 # Hobby, not KXRAIN HOU's IAH; the next-day event exempt), the curated
 # next-day tier (past the payout floor and the hopeless exit, which
 # programs this small would otherwise never clear), the 15c/30m move
-# breaker and the 19-01 ET halving (KXRAIN prefix). It quotes only once a
-# market's rules name a US station, "(Kxxx)": Paris (LFPG) stands down, its
-# rain day starting before the 22:00 ET stop. Not the directional take,
-# which stays KXRAIN's own. IMM_RAIN_DAILY_CITY_RE="" turns it off.
+# breaker and the 19-01 ET halving (KXRAIN prefix). It quotes once a
+# market's rules name a US station, "(Kxxx)", or (2026-10-31, see
+# RAIN_DAILY_INTL) a non-US one: Paris (LFPG).
+# Not the directional take, which stays KXRAIN's own.
+# IMM_RAIN_DAILY_CITY_RE="" turns it off.
 _RAIN_DAILY_CITY_RE_SPEC = os.environ.get("IMM_RAIN_DAILY_CITY_RE", r"KXRAIND[A-Z]{2,5}")
 RAIN_DAILY_CITY_RE = re.compile(_RAIN_DAILY_CITY_RE_SPEC) if _RAIN_DAILY_CITY_RE_SPEC else None
 RAIN_DAILY_CITY_PARENT = "KXRAIN"
@@ -1289,6 +1290,86 @@ def note_rain_daily_station(series: str, market: Optional[dict]) -> Optional[str
             _RAIN_DAILY_STATION[series] = hit.group(1)
             log(f"[IMM] rain daily {series}: station K{hit.group(1)}, from its rules")
     return _RAIN_DAILY_STATION.get(series)
+
+
+# INTERNATIONAL RAIN DAILIES (Jack 2026-10-31: "quote the paris rain market
+# with 1000 size contracts on each side as a base (with normal multipliers
+# ontop of it), since nobody has a forecast that far out. make sure these new
+# markets are auto-quoted"). KXRAINDPARIS-03SEP27-T0, "Rain in Paris on Sep
+# 3, 2027?": precipitation at Paris Charles de Gaulle (LFPG) strictly over
+# 0 mm for The Weather Company's reporting day, "06:00 UTC that date to
+# 06:00 UTC the following date" (Meteo-France data). A $1,000 program from
+# 11/01 02:00Z to 11/07 00:31Z (target 1,000, ~$168/day) on a 41x68 book.
+# The 10/30 rule stood it down for naming no US station, on the belief that
+# its rain day started before the 22:00 ET stop; its rules put the day in
+# UTC, hours after it. A per-city daily whose rules name a non-US station,
+# "(LFPG)", now quotes on the family's rules with no model behind it (its
+# reporting window, logged when the rules give it in UTC, never matters:
+# it stops two weeks before the day):
+#   - no fair covers the station (rain_fair_p is None), so the gate leaves
+#     plain band quoting;
+#   - its base rung is RAIN_DAILY_INTL_BASE a side (1,000, for the
+#     launcher's 20-lot rung), with the family's x2 and the hour multipliers
+#     on top: the size wire, so its caps and skew knees scale with it (the
+#     KXRAIN 19-01 ET halving: 2,000 a side by day, 1,000 in the evening);
+#   - it is out of the size test, being sized by hand;
+#   - it stops RAIN_DAILY_INTL_STOP_DAYS (14) before its day, before any
+#     weather model reaches it.
+# Rules naming no station at all still stand down (fail closed).
+# IMM_RAIN_DAILY_INTL_BASE=0 keeps such a market at the family's size;
+# IMM_RAIN_DAILY_INTL=0 stands them all down again.
+RAIN_DAILY_INTL = os.environ.get("IMM_RAIN_DAILY_INTL", "1") == "1"
+RAIN_DAILY_INTL_BASE = _env_float("IMM_RAIN_DAILY_INTL_BASE", 1000.0)
+RAIN_DAILY_INTL_STOP_DAYS = _env_float("IMM_RAIN_DAILY_INTL_STOP_DAYS", 14.0)
+# series -> the non-US station its rules name ("LFPG")
+_RAIN_DAILY_INTL: Dict[str, str] = {}
+_RAIN_DAILY_INTL_STATION_RE = re.compile(r"\(([A-JL-Z][A-Z0-9]{3})\)")
+_RAIN_DAILY_UTC_DAY_RE = re.compile(r"\((\d{1,2}:\d{2}) UTC")
+
+
+def note_rain_daily_intl(series: str, market: Optional[dict]) -> Optional[str]:
+    """The non-US station a per-city daily's rules name, "(LFPG)" -> "LFPG",
+    noted from `market` when it names one and no US station; else the one
+    on file, or None (always, when RAIN_DAILY_INTL is off)."""
+    if not RAIN_DAILY_INTL:
+        return None
+    if isinstance(market, dict):
+        rules = str(market.get("rules_primary") or "")
+        st = _RAIN_DAILY_INTL_STATION_RE.search(rules)
+        if st and not _RAIN_DAILY_STATION_RE.search(rules) \
+                and _RAIN_DAILY_INTL.get(series) != st.group(1):
+            _RAIN_DAILY_INTL[series] = st.group(1)
+            day = _RAIN_DAILY_UTC_DAY_RE.search(rules)
+            log(f"[IMM] rain daily {series}: station {st.group(1)}"
+                + (f", its day from {day.group(1)} UTC" if day else "")
+                + f", from its rules; no model -- {RAIN_DAILY_INTL_BASE:g} a side "
+                f"as a base, out {RAIN_DAILY_INTL_STOP_DAYS:g}d before its day")
+    return _RAIN_DAILY_INTL.get(series)
+
+
+def rain_daily_intl_series(series: str) -> bool:
+    """A per-city daily on a non-US station, its UTC day on file."""
+    return RAIN_DAILY_INTL and series in _RAIN_DAILY_INTL
+
+
+def rain_daily_intl_base_mult(series: str) -> float:
+    """RAIN_DAILY_INTL_BASE over the global rung for such a series (1,000
+    over 20 = x50), else 1."""
+    if RAIN_DAILY_INTL_BASE <= 0 or not rain_daily_intl_series(series):
+        return 1.0
+    side = sum(s for _t, s in LEVELS)
+    return RAIN_DAILY_INTL_BASE / side if side > 0 else 1.0
+
+
+def rain_daily_intl_cutoff(event_ticker: str) -> datetime:
+    """00:00 ET RAIN_DAILY_INTL_STOP_DAYS before the rain day
+    (KXRAINDPARIS-03SEP27 -> 2027-08-20 00:00 ET); RELEASE_GUARD_UNKNOWN
+    (stand down) off the shape."""
+    rd = rain_daily_city_date(event_ticker)
+    if rd is None:
+        return RELEASE_GUARD_UNKNOWN
+    return ET.localize(datetime(rd.year, rd.month, rd.day)
+                       - timedelta(days=RAIN_DAILY_INTL_STOP_DAYS)).astimezone(timezone.utc)
 
 
 SERIES_OVERRIDES[RAIN_PERIOD_ARCHETYPE] = SeriesOverride(
@@ -2478,6 +2559,9 @@ def size_test_arm(series: str) -> Optional[str]:
     _rds = globals().get("rain_day_series")
     if _rds is not None and _rds(series):
         return None
+    # ...and the international rain dailies, sized by hand (2026-10-31)
+    if rain_daily_intl_series(series):
+        return None
     key = (SIZE_TEST_SALT, series)
     if key not in _size_test_cache:
         _size_test_cache[key] = hashlib.sha256(f"{SIZE_TEST_SALT}:{series}".encode()).digest()[0] % 2
@@ -2522,6 +2606,8 @@ def applied_mention_mult(series: str) -> float:
     if ov and ov.size_mult is not None:
         # (the strait weeklies' nights without the 10/31 shipping step)
         m *= ov.size_mult / shipping_night_step(series)
+    # ...an international rain daily's base (RAIN_DAILY_INTL_BASE, 2026-10-31)
+    m *= rain_daily_intl_base_mult(series)
     # ...and the base size split test's half (SIZE_TEST_MULT, 2026-10-26)
     return m * size_test_mult(series)
 
@@ -11620,6 +11706,8 @@ _CONFIG_CODE_KNOBS = (
     # weather shapes (2026-10-30): the per-city rain dailies, the cold thresholds
     "_RAIN_DAILY_CITY_RE_SPEC", "TEMP_THRESHOLD_ENABLE", "TEMP_THRESHOLD_STOP_DAYS",
     "TEMP_THRESHOLD_SIZE_MULT",
+    # ...and the international ones, Paris (2026-10-31)
+    "RAIN_DAILY_INTL", "RAIN_DAILY_INTL_BASE", "RAIN_DAILY_INTL_STOP_DAYS",
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -19080,14 +19168,20 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                         f"(<YYMON>) -- standing it down (fail closed)")
         cutoff = stop if cutoff is None else min(cutoff, stop)
     if rain_daily_city_series(series) and note_rain_daily_station(series, market) is None:
-        # PER-CITY RAIN DAILIES (2026-10-30): quoted only once a market's
-        # rules name a US station, "(Kxxx)" -- off the NWS map (Paris, LFPG)
-        # the 22:00 ET stop falls inside the rain day itself
-        if isinstance(market, dict):
-            _config_gap(series, event_ticker,
-                        f"{event_ticker}'s rules name no US station (Kxxx) -- "
-                        f"a per-city rain daily stands down (fail closed)")
-        cutoff = RELEASE_GUARD_UNKNOWN
+        # PER-CITY RAIN DAILIES (2026-10-30): quoted once a market's rules
+        # name a US station, "(Kxxx)" -- or (2026-10-31) a non-US one
+        # (Paris, LFPG), which no model covers: out RAIN_DAILY_INTL_STOP_DAYS
+        # before its day
+        if note_rain_daily_intl(series, market) is not None:
+            stop = rain_daily_intl_cutoff(event_ticker)
+            cutoff = stop if cutoff is None else min(cutoff, stop)
+        else:
+            if isinstance(market, dict):
+                _config_gap(series, event_ticker,
+                            f"{event_ticker}'s rules name no station (Kxxx, or a "
+                            f"non-US one like LFPG) -- a per-city rain daily stands "
+                            f"down (fail closed)")
+            cutoff = RELEASE_GUARD_UNKNOWN
     if temp_threshold_series(series):
         # MONTHLY COLD THRESHOLDS (2026-10-30): out TEMP_THRESHOLD_STOP_DAYS
         # before the period's first day; unreadable -> stood down (fail
@@ -36424,7 +36518,12 @@ class IncentiveMarketMaker:
         if RAIN_DAILY_CITY_RE is not None:
             log(f"rain dailies by city (2026-10-30): {_RAIN_DAILY_CITY_RE_SPEC}-<YYMMDD|DDMONYY> "
                 f"on {RAIN_DAILY_CITY_PARENT}'s guard set, the rain-fair gate (next "
-                f"day exempt), the curated next-day tier and the move breaker")
+                f"day exempt), the curated next-day tier and the move breaker"
+                + (f"; a non-US station (Paris, 2026-10-31): no model, "
+                   + (f"{RAIN_DAILY_INTL_BASE:g} a side as a base under the family's "
+                      f"multipliers" if RAIN_DAILY_INTL_BASE > 0 else "the family's size")
+                   + f", out of the size test, out {RAIN_DAILY_INTL_STOP_DAYS:g}d "
+                   f"before its day" if RAIN_DAILY_INTL else "; a non-US station stands down"))
         if TEMP_THRESHOLD_ENABLE:
             log(f"cold thresholds (2026-10-30): KX<CITY>LOWT safe-join, "
                 f"x{TEMP_THRESHOLD_SIZE_MULT:g} (cap {MAX_POSITION_CONTRACTS * TEMP_THRESHOLD_SIZE_MULT:g}), "
