@@ -141,9 +141,9 @@ LEAD_GAP_SECS = 600             # lead spans this close count as one (a restart'
 # any order that cost it 5% of its side
 HOLD_HALF_SINCE = datetime(2026, 10, 31, 3, 6, 46, tzinfo=timezone.utc).timestamp()
 HALF_BAR = 0.5                  # the hold bar from HOLD_HALF_SINCE to HOLD_ALWAYS_SINCE
-# HOLD_ALWAYS_COMMIT live (Jack 2026-11-01: "Yes, hold always"): before it a
-# lead fought any order that left it under half of its side
-HOLD_ALWAYS_SINCE = datetime(2026, 11, 1, 16, 0, 0, tzinfo=timezone.utc).timestamp()
+# 89b956f live (Jack 2026-11-01: "Yes, hold always"; run e07e312c): before it
+# a lead fought any order that left it under half of its side
+HOLD_ALWAYS_SINCE = datetime(2026, 11, 1, 16, 7, 43, tzinfo=timezone.utc).timestamp()
 
 _LEAD = re.compile(
     r"^(\S+ \S+)Z \[IMM\] (comp|fair) lead( \(dry\))? (\S+) (bid|ask): (\d+) @ (\d+)c, "
