@@ -13851,6 +13851,35 @@ class TestBwayFairGate(unittest.TestCase):
         import imm_risk_controls
         self.assertIn("bway_fair", imm_risk_controls.GATE_GUARDS)
 
+    def test_season_total_quotes_off_the_book_at_the_weekly_size(self):
+        # Jack 2026-11-01: "Yes", to adding the Broadway season total at x3,
+        # quoted off the book -- the weekly's x3 ladder at its 150 cap, no fair
+        s, t = "KXBWAYATTENDANCE", "KXBWAYATTENDANCE-27MAY23B-14000000"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            a = imm.IncentiveMarketMaker._allowed
+            self.assertTrue(imm.bway_season_series(s))
+            self.assertFalse(imm.IncentiveMarketMaker._blocked(t))
+            self.assertTrue(a(t))
+            self.assertFalse(a("KXBWAYATTENDANCEX-27MAY23B-14000000"))   # exact series
+            with mock.patch.object(imm, "BWAY_SEASON_ENABLE", False):
+                self.assertFalse(a(t))
+        self.assertFalse(imm.bway_fair_series(s))                        # not the weekly's gate
+        self.assertEqual(imm.fair_gate_of(s), "")
+        self.assertIsNone(imm.fair_file_gate(s, t, time.time(), 74, 85))
+        self.assertEqual(imm.series_max_position(s), 150)
+        self.assertEqual(imm.series_levels(s), imm.scale_levels(imm.LEVELS, 3.0))
+        self.assertIsNone(imm.size_test_arm(s))                          # out of the split test
+        self.assertEqual(imm.event_top_n_for(s), 0)
+        # out on the season's last day: the live fields put occurrence and
+        # expected expiration at 14:00Z that day, so the ticker date's ET
+        # midnight is the cutoff
+        exp = datetime(2027, 5, 23, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.trade_cutoff_utc("KXBWAYATTENDANCE-27MAY23B", exp, exp),
+                         imm.ET.localize(datetime(2027, 5, 23)).astimezone(timezone.utc))
+        for k in ("BWAY_SEASON_ENABLE", "BWAY_SEASON_SERIES", "BWAY_SEASON_SIZE_MULT",
+                  "BWAY_SEASON_MAX_POSITION"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
     def test_gate_fails_closed_and_caps_the_side_through_the_fair(self):
         g = imm.bway_fair_gate
         why, inp, caps = g(self.T, time.time(), 55, 70)

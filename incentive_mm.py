@@ -11556,6 +11556,9 @@ _CONFIG_CODE_KNOBS = (
     "BWAY_FAIR_ENABLE", "BWAY_FAIR_TOL_CENTS", "BWAY_FAIR_TTL_MIN", "BWAY_FAIR_CAP",
     "BWAY_FAIR_MAX_POSITION",
     "BWAY_FAIR_SIZE_MULT",                       # x3 ladder (Jack 2026-10-25: "X3")
+    # the Broadway season total, off the book at the weekly's size (2026-11-01)
+    "BWAY_SEASON_ENABLE", "BWAY_SEASON_SERIES", "BWAY_SEASON_SIZE_MULT",
+    "BWAY_SEASON_MAX_POSITION",
     # the RCP approval, Trump mention and ERCOT peak gates (2026-10-26); model
     # knobs in approval_fair.py, trump_mention_fair.py and ercot_fair.py
     "APPROVE_FAIR_ENABLE", "APPROVE_FAIR_TOL_CENTS", "APPROVE_FAIR_TTL_MIN",
@@ -14743,6 +14746,38 @@ if BWAY_FAIR_ENABLE:
 
 def bway_fair_series(series: str) -> bool:
     return BWAY_FAIR_ENABLE and series in BWAY_FAIR_SERIES
+
+
+# BROADWAY SEASON ATTENDANCE (Jack 2026-11-01: "Yes", to "add the Broadway
+# season total at x3 ... quote off the book"). KXBWAYATTENDANCE-27MAY23B-<K>:
+# is the Broadway League's Total Attendance for the whole 2026-27 season above
+# K (13.5M-14.8M; the market closes 7/22/2027)? Kalshi paid on it every day
+# 9/14-10/31, ~$290/day across 8 strikes; nothing quoted it once the open
+# scan went off (10/03). NO fair -- bway_fair.py forecasts weeks, not
+# seasons -- so it quotes off the book, the first Broadway market without
+# one. The case is the shape: the only news is the League's weekly posting,
+# ~2% of the season each week, public on a fixed day; the tail is a labor
+# strike. The weekly's size: the BWAY_SEASON_SIZE_MULT ladder (60 at the live
+# IMM_LEVELS=0:20) at a BWAY_SEASON_MAX_POSITION cap a market, which also
+# keeps it out of the base-size split test. On the 10/31 book the estimator
+# put the 7 two-sided strikes at $0.37-1.76/day each at that rung against
+# the $1.30 entry bar, so expect only the richest to quote. The day-dated
+# ticker's midnight-ET rule takes it out on the season's last day
+# (5/23/2027). IMM_BWAY_SEASON_ENABLE=0 takes it out; positions ride.
+BWAY_SEASON_ENABLE = os.environ.get("IMM_BWAY_SEASON_ENABLE", "1") == "1"
+BWAY_SEASON_SERIES: Tuple[str, ...] = ("KXBWAYATTENDANCE",)
+BWAY_SEASON_SIZE_MULT = _env_float("IMM_BWAY_SEASON_SIZE_MULT", 3.0)
+BWAY_SEASON_MAX_POSITION = _env_float("IMM_BWAY_SEASON_MAX_POSITION", 150)
+
+if BWAY_SEASON_ENABLE:
+    for _s in BWAY_SEASON_SERIES:
+        SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+                                       levels=scale_levels(LEVELS, BWAY_SEASON_SIZE_MULT),
+                                       max_position=BWAY_SEASON_MAX_POSITION)
+
+
+def bway_season_series(series: str) -> bool:
+    return BWAY_SEASON_ENABLE and series in BWAY_SEASON_SERIES
 
 
 def load_bway_fair() -> int:
@@ -27303,6 +27338,7 @@ class IncentiveMarketMaker:
             rain_day_series(series) or \
             resort_snow_series(series) or \
             bway_fair_series(series) or \
+            bway_season_series(series) or \
             ercot_fair_series(series) or \
             lowt_series(series) or \
             hight_series(series) or \
@@ -37233,6 +37269,11 @@ class IncentiveMarketMaker:
                 f"{scale_levels(LEVELS, BWAY_FAIR_SIZE_MULT)}), max "
                 f"{BWAY_FAIR_MAX_POSITION:g} per market, out as each week's Sunday "
                 f"starts (its ticker date)")
+        if BWAY_SEASON_ENABLE:
+            log(f"Broadway season (2026-11-01): {', '.join(BWAY_SEASON_SERIES)} quoted off "
+                f"the book, no fair; x{BWAY_SEASON_SIZE_MULT:g} (ladder "
+                f"{scale_levels(LEVELS, BWAY_SEASON_SIZE_MULT)}), max "
+                f"{BWAY_SEASON_MAX_POSITION:g} per market")
         if SOFTWAREUNEMP_SIZE_MULT != 1.0 and scan_graduate_series("KXSOFTWAREUNEMP"):
             log(f"KXSOFTWAREUNEMP (2026-10-25): the jobs graduates' guard set at "
                 f"x{SOFTWAREUNEMP_SIZE_MULT:g} (ladder "
