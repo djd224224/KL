@@ -16079,6 +16079,10 @@ def series_side_mults(series: str) -> Tuple[float, float]:
     (1.0, 1.0)."""
     if series in SIDE_MULT_SERIES:
         return SIDE_MULT_SERIES[series]
+    # the TRUMPSAY group quotes flat (Jack 2026-11-01: "Flat 20 a side", over
+    # Other mentions' 0.75 / 1.5 lean; see TWK_SAY_SERIES)
+    if twk_say_series(series):
+        return (1.0, 1.0)
     if FAMILY_SIDE_LEANS:
         lean = FAMILY_SIDE_LEANS.get(series_family(series))
         if lean is not None:
@@ -16112,6 +16116,7 @@ def longshot_side_mults(series: str, yes_mid: Optional[float]) -> Tuple[float, f
     """(bid_mult, ask_mult) of the event long-shot cut at this YES mid
     (cents); (1.0, 1.0) outside the families, off, or with no mid."""
     if (LONGSHOT_MULT == 1.0 or yes_mid is None or not LONGSHOT_FAMILIES
+            or twk_say_series(series)       # the TRUMPSAY group: flat 20 a side
             or series_family(series) not in LONGSHOT_FAMILIES):
         return (1.0, 1.0)
     if yes_mid < LONGSHOT_BID_BELOW:
@@ -17090,6 +17095,10 @@ def twk_bid_only(series: str) -> bool:
 #     the same night: "raise event filled position of 500 for trump, 1k for
 #     GTA"; TWK_SAY_EVENT_FILL_CAP, twk_say_fill_cap); the per-market 100 stays;
 #   * a TWK_SAY_DAILY_LOSS_LIMIT ($75) daily halt per series;
+#   * FLAT 20 A SIDE (Jack 2026-11-01: "Flat 20 a side"): no family side
+#     lean (Other mentions bids x0.75 / asks x1.5) and no long-shot cut
+#     (Sports & awards' x0.75), in series_side_mults / longshot_side_mults;
+#     an explicit SIDE_MULT_SERIES entry would still win;
 #   * QUICK PULLS of the WHOLE event, for the normal length (Jack, the same
 #     evening: "take the whole event out for normal amount of time, 60min is
 #     not necessary. i care more about fast pulls than long pulls. taker of

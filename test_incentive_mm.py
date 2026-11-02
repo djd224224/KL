@@ -23164,6 +23164,24 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
                 self.assertEqual(self._sides(bot, self.EO), sides, (cap, pos))
                 self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})
 
+    def test_the_group_quotes_flat_20_a_side(self):
+        # Jack 2026-11-01: "Flat 20 a side" -- no family lean, no long-shot cut
+        # (the module's import-time setup turns the leans off; put them back)
+        self.enterContext(mock.patch.object(
+            imm, "FAMILY_SIDE_LEANS", imm._family_lean_spec(imm._DEFAULT_FAMILY_SIDE_LEANS)))
+        self.enterContext(mock.patch.object(imm, "LONGSHOT_MULT", 0.75))
+        self.enterContext(mock.patch.object(
+            imm, "LONGSHOT_FAMILIES", frozenset({"Sports & awards"})))
+        with mock.patch.object(imm, "series_family", lambda s: "Other mentions"):
+            for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"):
+                self.assertEqual(imm.series_side_mults(s), (1.0, 1.0), s)
+            self.assertEqual(imm.series_side_mults("KXWORLDNEWSMENTION"), (0.75, 1.5))
+        with mock.patch.object(imm, "series_family", lambda s: "Sports & awards"):
+            self.assertEqual(imm.longshot_side_mults("KXFEATURE", 10.0), (1.0, 1.0))
+            self.assertEqual(imm.longshot_side_mults("KXFEATURE", 80.0), (1.0, 1.0))
+            self.assertEqual(imm.longshot_side_mults("KXNBAWINS", 10.0), (0.75, 1.0))
+            self.assertEqual(imm.series_side_mults("KXFEATURE"), (1.0, 1.0))
+
     def test_trumpsay_one_pickoff_halts_the_event_at_60s(self):
         # one fill the mark moves 5c+ against 60 s later takes the event for
         # the event rule's normal 30 min (Jack: "take the whole event out for
