@@ -23145,7 +23145,11 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         # Jack 2026-11-01: "200 contract cap is for fills, for resting raise
         # to 1500" (KXEOWEEK plays a TRUMPSAY series; a small fill cap keeps
         # the position under the market's skew knees)
-        self.assertEqual(imm.TWK_SAY_FILL_CAP, 200.0)
+        # ...then "raise event filled position of 500 for trump, 1k for GTA"
+        self.assertEqual(imm.TWK_SAY_FILL_CAP, 500.0)
+        self.assertEqual(imm.twk_say_fill_cap("KXTRUMPSAYCOMPANY-26DEC01"), 500.0)
+        self.assertEqual(imm.twk_say_fill_cap("KXTRUMPSAYMONTH-26DEC01"), 500.0)
+        self.assertEqual(imm.twk_say_fill_cap("KXFEATURE-26GTA6"), 1000.0)
         self.enterContext(mock.patch.object(imm, "TWK_SAY_SERIES", frozenset({"KXEOWEEK"})))
         for cap, pos, sides in ((50.0, 0.0, {"bid", "ask"}),
                                 (35.0, 40.0, {"ask"}),      # long past the fill cap

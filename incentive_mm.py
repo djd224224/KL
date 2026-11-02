@@ -17085,8 +17085,10 @@ def twk_bid_only(series: str) -> bool:
 #     for every resting order as if it filled, split across the event's
 #     markets, so 200 left 13-14 a market on 15-market events, under the
 #     20-lot rung; at 1500 each market rests its full rung (40 overnight),
-#     and once the event's filled net reaches 200 that side adds nothing;
-#     the per-market 100 stays;
+#     and once the event's filled net reaches its fill cap that side adds
+#     nothing -- 500 for the Trump series, 1,000 for the GTA VI album (Jack,
+#     the same night: "raise event filled position of 500 for trump, 1k for
+#     GTA"; TWK_SAY_EVENT_FILL_CAP, twk_say_fill_cap); the per-market 100 stays;
 #   * a TWK_SAY_DAILY_LOSS_LIMIT ($75) daily halt per series;
 #   * QUICK PULLS of the WHOLE event, for the normal length (Jack, the same
 #     evening: "take the whole event out for normal amount of time, 60min is
@@ -17110,7 +17112,9 @@ TWK_SAY_SERIES = frozenset(s for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH")
                            if s in TWK_SERIES) \
     | frozenset(series_of(e) for e in TWK_SAY_EVENTS)    # KXFEATURE-26GTA6's
 TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 1500)      # resting
-TWK_SAY_FILL_CAP = _env_float("IMM_TWK_SAY_FILL_CAP", 200)         # filled net
+TWK_SAY_FILL_CAP = _env_float("IMM_TWK_SAY_FILL_CAP", 500)         # filled net
+# a group event's own filled-net cap (the GTA VI album: 1,000)
+TWK_SAY_EVENT_FILL_CAP: Dict[str, float] = {"KXFEATURE-26GTA6": 1000.0}
 TWK_SAY_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_SAY_DAILY_LOSS_LIMIT", 75)
 TWK_SAY_TAKER_CT = _env_float("IMM_TWK_SAY_TAKER_CT", 100)
 # A group event's own pull size (Jack 2026-11-01: "for GTA increase the
@@ -17126,6 +17130,12 @@ TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN",
 def twk_say_series(series: str) -> bool:
     """A monthly TRUMPSAY series on its own pilot terms (TWK_SAY_SERIES)."""
     return twk_series(series) and series in TWK_SAY_SERIES
+
+
+def twk_say_fill_cap(event_ticker: str) -> float:
+    """The filled-net cap of a TRUMPSAY-group event: its own
+    (TWK_SAY_EVENT_FILL_CAP), else TWK_SAY_FILL_CAP."""
+    return TWK_SAY_EVENT_FILL_CAP.get(event_ticker, TWK_SAY_FILL_CAP)
 
 
 def twk_say_taker_ct(ticker: str) -> float:
@@ -33172,14 +33182,15 @@ class IncentiveMarketMaker:
             event_net.setdefault(ev, 0.0)
         event_room_buy = {e: event_cap_contracts(e) - n for e, n in event_net.items()}
         event_room_sell = {e: event_cap_contracts(e) + n for e, n in event_net.items()}
-        # TRUMPSAY group (TWK_SAY_FILL_CAP, 2026-11-01): the cap above is its
-        # RESTING cap; once the event's FILLED net reaches TWK_SAY_FILL_CAP on a
+        # TRUMPSAY group (twk_say_fill_cap, 2026-11-01): the cap above is its
+        # RESTING cap; once the event's FILLED net reaches its fill cap on a
         # side, that side rests nothing more anywhere in the event
         for e, n in event_net.items():
             if twk_say_series(series_of(e)):
-                if n >= TWK_SAY_FILL_CAP:
+                fill_cap = twk_say_fill_cap(e)
+                if n >= fill_cap:
                     event_room_buy[e] = 0.0
-                if n <= -TWK_SAY_FILL_CAP:
+                if n <= -fill_cap:
                     event_room_sell[e] = 0.0
         # A series' own side cut (SIDE_MULT_SERIES under 1) cuts that side's
         # event room by the same factor, as the quote loop cuts its position
@@ -38176,7 +38187,9 @@ class IncentiveMarketMaker:
                 f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f"; TRUMPSAY {','.join(sorted(TWK_SAY_SERIES))}: x2 00-08 ET, "
                    f"{TWK_SAY_EVENT_CAP:g} resting / {TWK_SAY_FILL_CAP:g} filled net "
-                   f"per event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
+                   + "".join(f"({_e} {_n:g}) " for _e, _n in
+                             sorted(TWK_SAY_EVENT_FILL_CAP.items()))
+                   + f"per event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
                    f"quick pulls (a {TWK_SAY_TAKER_CT:g}+ taker on the tape"
                    + "".join(f", {_e} {_n:g}+" for _e, _n in
                              sorted(TWK_SAY_EVENT_TAKER_CT.items()))
