@@ -36994,6 +36994,22 @@ class TestTapeTrigger(unittest.TestCase):
         self.assertEqual([t["mode"] for t in self._lines("trip")], ["on", "dry"])
         self.assertNotIn(("o4", "tape_trigger"), self.cancelled)
 
+    def test_a_group_event_with_its_own_pull_size(self):
+        # Jack 2026-11-01: "for GTA increase the threshold to 250 instead of
+        # 100 for a pull" -- the event's own size beats the group's 100
+        self.assertEqual(imm.twk_say_taker_ct("KXFEATURE-26GTA6-DUA"), 250.0)
+        self.assertEqual(imm.twk_say_taker_ct("KXTRUMPSAYCOMPANY-26DEC01-AAPL"), 100.0)
+        for name, v in (("TWK_ENABLE", True), ("TWK_SERIES", frozenset({"KXEVT"})),
+                        ("TWK_SAY_SERIES", frozenset({"KXEVT"})),
+                        ("TWK_SAY_EVENT_TAKER_CT", {self.E: 250.0})):
+            self.enterContext(mock.patch.object(imm, name, v))
+        self._print(self.S, "yes", 60, 148, 0.0)         # the DUA taker's size
+        self.assertEqual(self._lines("trip"), [])
+        self._print(self.S, "yes", 61, 102, 0.3)         # the same taker: 250
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["count"]), ("on", 250.0))
+        self.assertTrue(self.bot.sweep_held(self.E, self.now + 10))
+
     def test_a_trumpsay_taker_needs_the_sweep_breaker_on(self):
         for name, v in (("TWK_ENABLE", True), ("TWK_SERIES", frozenset({"KXEVT"})),
                         ("TWK_SAY_SERIES", frozenset({"KXEVT"})),

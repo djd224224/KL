@@ -17104,6 +17104,11 @@ TWK_SAY_SERIES = frozenset(s for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH")
 TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 200)
 TWK_SAY_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_SAY_DAILY_LOSS_LIMIT", 75)
 TWK_SAY_TAKER_CT = _env_float("IMM_TWK_SAY_TAKER_CT", 100)
+# A group event's own pull size (Jack 2026-11-01: "for GTA increase the
+# threshold to 250 instead of 100 for a pull", after the first live pull: a
+# 148-contract NO taker on KXFEATURE-26GTA6-DUA 15 minutes in, on a book that
+# trades 3-45k contracts a market).
+TWK_SAY_EVENT_TAKER_CT: Dict[str, float] = {"KXFEATURE-26GTA6": 250.0}
 TWK_SAY_CONFIRM_SECS = _env_int("IMM_TWK_SAY_CONFIRM_SECS", 60)
 TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN",
                                TOXIC_EVENT_HALT_SECS / 60.0) * 60.0
@@ -17112,6 +17117,12 @@ TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN",
 def twk_say_series(series: str) -> bool:
     """A monthly TRUMPSAY series on its own pilot terms (TWK_SAY_SERIES)."""
     return twk_series(series) and series in TWK_SAY_SERIES
+
+
+def twk_say_taker_ct(ticker: str) -> float:
+    """The taker size that pulls this market's TRUMPSAY-group event: the
+    event's own (TWK_SAY_EVENT_TAKER_CT), else TWK_SAY_TAKER_CT."""
+    return TWK_SAY_EVENT_TAKER_CT.get(event_ticker_of(ticker), TWK_SAY_TAKER_CT)
 
 
 # ----------------------------------------------------------------------------
@@ -26244,9 +26255,9 @@ class IncentiveMarketMaker:
         b["seen_last"] = now_ts
         if len(b["trades"]) < 500:
             b["trades"].append((str(body.get("trade_id") or ""), n))
-        # the monthly TRUMPSAY series trip on a taker of TWK_SAY_TAKER_CT+ alone
-        # (TWK_SAY_SERIES); every other series on the burst rule
-        trips = (b["ct"] + 1e-9 >= TWK_SAY_TAKER_CT) \
+        # the TRUMPSAY group trips on a taker of its size alone (TWK_SAY_TAKER_CT,
+        # or the event's own: GTA's 250); every other series on the burst rule
+        trips = (b["ct"] + 1e-9 >= twk_say_taker_ct(t)) \
             if twk_say_series(series_of(t)) \
             else tape_burst_trips(b["ct"], len(b["px"]))
         if b["trip"] is None and trips:
@@ -38147,7 +38158,10 @@ class IncentiveMarketMaker:
                 f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f"; TRUMPSAY {','.join(sorted(TWK_SAY_SERIES))}: x2 00-08 ET, "
                    f"{TWK_SAY_EVENT_CAP:g}/event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
-                   f"quick pulls (a {TWK_SAY_TAKER_CT:g}+ taker on the tape: the event "
+                   f"quick pulls (a {TWK_SAY_TAKER_CT:g}+ taker on the tape"
+                   + "".join(f", {_e} {_n:g}+" for _e, _n in
+                             sorted(TWK_SAY_EVENT_TAKER_CT.items()))
+                   + f": the event "
                    f"pulled and held the sweep hold"
                    + ("" if TAPE_TRIGGER != "off" and SWEEP_BREAKER == "on"
                       else " -- OFF: needs the tape feed and IMM_SWEEP_BREAKER=on")
