@@ -1805,11 +1805,13 @@ def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
 # runs). Prefixes are deliberately the
 # DAILY tickers — KXAAAGASW/M weeklies and monthlies keep full size. Times
 # are America/New_York (so EDT in summer), the convention every other window
-# in this file uses.
+# in this file uses. The monthly TRUMPSAY series take x2 from 00:00 to 08:59
+# ET (Jack 2026-11-01: "do 2x overnight"; see TWK_SAY_SERIES), over the Trump
+# pilots' x1 at every hour.
 SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "IMM_SERIES_HOUR_MULT",
     "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5,"
-    "KXTRUEV:17-1:0.5"))
+    "KXTRUEV:17-1:0.5,KXTRUMPSAYCOMPANY:0-8:2.0,KXTRUMPSAYMONTH:0-8:2.0"))
 
 # SPORTS LADDERS / ESCALATORS AT x3 EVERY HOUR (Jack 2026-10-06: "do the 3x
 # overnight multiplier, at all times for ESCALATOR/LADDER events"). The
@@ -3202,8 +3204,11 @@ def event_cap_contracts(event_ticker: str) -> float:
     # the YouTube weekly pilot (2026-10-06): YTW_EVENT_CAP net per event
     if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
         return globals()["YTW_EVENT_CAP"]
-    # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event
+    # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event --
+    # TWK_SAY_EVENT_CAP for the monthly TRUMPSAY series (2026-11-01)
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
+        if series in globals().get("TWK_SAY_SERIES", ()):
+            return globals()["TWK_SAY_EVENT_CAP"]
         return globals()["TWK_EVENT_CAP"]
     # the NFL auto families (2026-10-12) and the league auto families
     # (2026-10-15): the ladders' / escalators' event cap
@@ -17003,11 +17008,12 @@ def yt1_shadow_note(ev: str, e: dict, now_ts: float) -> Tuple[tuple, str]:
 # own rules"); these are those rules. The 75-day tape: makers +4.3 c/ct on
 # 311k contracts for COMPANY (-2.9 at 25-75c), +2.2 on 329k for MONTH (-6.8 at
 # 25-75c); the bot's estimator at x1 on the 11/01 books: ~$67 and ~$24/day.
-# They quote under the pilot rules above -- x1 every hour, 100 per market and
-# 100 net per event, the $40 daily halt per series -- plus the protections
-# every book has (the WS fast cancel, the sweep breaker, toxic halts: their
-# names carry no MENTION, so the mention exemption does not apply), to the
-# ticker-date cutoff (00:00 ET on the event's day).
+# They quote under the pilot rules above -- safe-join, 100 per market, out of
+# the size test -- on their own terms since the same evening (TWK_SAY_SERIES:
+# x2 overnight, 200 net per event, a $75 halt, quick event halts), plus the
+# protections every book has (the WS fast cancel, the sweep breaker, toxic
+# halts: their names carry no MENTION, so the mention exemption does not
+# apply), to the ticker-date cutoff (00:00 ET on the event's day).
 TWK_ENABLE = _TWK_LIVE
 TWK_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_ALLOW_TWK_SERIES", _DEFAULT_TWK_SERIES).split(",") if s.strip())
@@ -17036,6 +17042,39 @@ def twk_series(series: str) -> bool:
 
 def twk_bid_only(series: str) -> bool:
     return twk_series(series) and series in TWK_BID_ONLY_SERIES
+
+
+# THE MONTHLY TRUMPSAY SERIES' OWN TERMS (Jack 2026-11-01, an hour after they
+# joined: "if a lot of adverse selection risk, have extremely quick halts. do
+# 2x overnight. 200 net across each event. $75 loss limit."). Their tape has
+# the adverse selection where the rewards are (makers -2.9 / -6.8 c/ct at
+# 25-75c), and a speech can name several companies within seconds, so:
+#   * x2 from 00:00 to 08:59 ET every day (their SERIES_HOUR_MULTS entries,
+#     which beat the pilots' x1-every-hour daily rule), x1 the rest of it;
+#   * TWK_SAY_EVENT_CAP (200) net per event; the per-market 100 stays;
+#   * a TWK_SAY_DAILY_LOSS_LIMIT ($75) daily halt per series;
+#   * QUICK HALTS, each standing the WHOLE event down for TWK_SAY_HALT_SECS
+#     (60 min) through the toxic event halt (saved state, the quotes dropped
+#     from `desired`, the toxic_halts sink and the morning email):
+#       - the fill tripwire: our own book moving TWK_SAY_FILL_HALT_CONTRACTS
+#         (15) or more on any market of the event in one cycle -- a take of
+#         most of a rung -- halts it at once, before any price confirms it;
+#       - ONE pick-off (a fill the mark has moved TOXIC_PICKOFF_CENTS against
+#         TWK_SAY_CONFIRM_SECS later: 60 s, where the book's rule waits 5 min
+#         and needs two on a side or two markets of an event) halts it.
+# Both are off with the toxic halt (IMM_TOXIC_HALT=0).
+TWK_SAY_SERIES = frozenset(s for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH")
+                           if s in TWK_SERIES)
+TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 200)
+TWK_SAY_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_SAY_DAILY_LOSS_LIMIT", 75)
+TWK_SAY_FILL_HALT_CONTRACTS = _env_float("IMM_TWK_SAY_FILL_HALT", 15)
+TWK_SAY_CONFIRM_SECS = _env_int("IMM_TWK_SAY_CONFIRM_SECS", 60)
+TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN", 60.0) * 60.0
+
+
+def twk_say_series(series: str) -> bool:
+    """A monthly TRUMPSAY series on its own pilot terms (TWK_SAY_SERIES)."""
+    return twk_series(series) and series in TWK_SAY_SERIES
 
 
 # ----------------------------------------------------------------------------
@@ -17156,6 +17195,8 @@ def pilot_halt_limit(key: str) -> float:
         return NFL_AUTO_DAILY_LOSS_LIMIT
     if key.startswith(LEAGUE_AUTO_BUDGET_PREFIX):
         return LEAGUE_AUTO_DAILY_LOSS_LIMIT
+    if key in TWK_SAY_SERIES:                       # the monthly TRUMPSAY series
+        return TWK_SAY_DAILY_LOSS_LIMIT
     return TWK_DAILY_LOSS_LIMIT
 
 
@@ -23899,6 +23940,25 @@ class IncentiveMarketMaker:
                 tot += float(getattr(m, "est_dollars_per_day", 0.0) or 0.0)
         return tot
 
+    def _twk_say_halt(self, ev: str, ticker: str, why: str, now_ts: float) -> None:
+        """A QUICK HALT of a monthly TRUMPSAY event (TWK_SAY_SERIES): the whole
+        event out for TWK_SAY_HALT_SECS on the toxic event halt, alerted and
+        written to the toxic_halts sink like the event rule's halts."""
+        until = now_ts + TWK_SAY_HALT_SECS
+        self.state.toxic_event_halt_until[ev] = max(
+            until, self.state.toxic_event_halt_until.get(ev, 0.0))
+        ev_mkts = [m.ticker for m in self.state.selected.values()
+                   if self._event_of(m.ticker) == ev]
+        msg = (f"{ev}: {ticker} {why} -- quick halt, the whole event out "
+               f"{TWK_SAY_HALT_SECS / 60:g}min")
+        log(f"{self.tag} TOXIC {msg}")
+        self.alerter.alert("toxic_halt", msg, key=ev, urgent=False, now_ts=now_ts)
+        self._sink("toxic_halts", {
+            "kind": "event_halt", "rule": "twk_say", "ts": round(now_ts, 1),
+            "until": round(until, 1), "event": ev, "markets_picked": [ticker],
+            "why": why, "markets_halted": len(ev_mkts),
+            "est_per_day": round(self._toxic_est(ev_mkts), 4)})
+
     def _toxic_confirm(self, now_ts: float, fresh: Set[str]) -> List[str]:
         """Judge every queued fill whose check is due against the market's
         mark and record the pick-offs. A side halts on its TOXIC_PICKOFFS-th
@@ -23914,7 +23974,8 @@ class IncentiveMarketMaker:
         halted: List[str] = []
         for p in self.state.toxic_pending:
             t, side, px, fts = p[0], p[1], float(p[2]), float(p[3])
-            due = fts + TOXIC_CONFIRM_SECS
+            say = twk_say_series(series_of(t))        # a quick-halt series
+            due = fts + (TWK_SAY_CONFIRM_SECS if say else TOXIC_CONFIRM_SECS)
             if now_ts < due:
                 keep.append(p)
                 continue
@@ -23936,6 +23997,15 @@ class IncentiveMarketMaker:
                 "exempt": exempt})
             if exempt:
                 continue                  # mention families: recorded, never halt
+            if say:
+                # the monthly TRUMPSAY series: ONE pick-off takes the event
+                if self.state.toxic_event_halt_until.get(ev, 0.0) <= now_ts:
+                    self._twk_say_halt(
+                        ev, t, f"{side.upper()} picked off (filled {px:.0f}c, "
+                        f"mark {float(mark):.1f}c {now_ts - fts:.0f}s later)",
+                        now_ts)
+                    halted.append(ev)
+                continue
             # ---- the side rule ----
             key = self._toxic_key(t, side)
             picks = [x for x in self.state.toxic_picks.get(key, [])
@@ -33319,6 +33389,21 @@ class IncentiveMarketMaker:
                 self.state.prev_pos[t] = own_pos
                 self._gskip(t, "event_fill_tripwire", lambda: dict(own_pos=own_pos, prev_pos=prev, strikes=strikes, confirmed=confirmed, n_cx=n_cx))
                 continue
+            # TRUMPSAY QUICK HALT (2026-11-01, see TWK_SAY_SERIES): a take of
+            # TWK_SAY_FILL_HALT_CONTRACTS or more in one cycle on any market of
+            # a monthly TRUMPSAY event stands the WHOLE event down at once.
+            if (TOXIC_HALT and twk_say_series(meta.series) and prev is not None
+                    and abs(own_pos - prev) >= TWK_SAY_FILL_HALT_CONTRACTS):
+                self._twk_say_halt(ev, t, f"own book moved {own_pos - prev:+.0f} "
+                                   f"in one cycle", now_ts)
+                n_cx = 0
+                for m2 in by_event.get(ev, [meta]):
+                    n_cx += self.cancel_market_orders(m2.ticker, resting)
+                ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
+                desired = [q for q in desired if q.ticker not in ev_ticks]
+                self.state.prev_pos[t] = own_pos
+                self._gskip(t, "twk_say_fill_halt", lambda: dict(own_pos=own_pos, prev_pos=prev, n_cx=n_cx))
+                continue
             # OPEN-SCAN FILL TRIPWIRE (2026-09-05, see the SCAN_* block; OFF
             # unless IMM_SCAN_FILL_HALT > 0): being swept on a scan member
             # IS the adverse selection the tier's screens exist to avoid —
@@ -38024,6 +38109,11 @@ class IncentiveMarketMaker:
                 f"{','.join(sorted(TWK_BID_ONLY_SERIES & TWK_SERIES)) or '-'}; safe-join, "
                 f"x1 at every hour, {TWK_MAX_POSITION:g}/market and {TWK_EVENT_CAP:g}/event "
                 f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
+                + (f"; TRUMPSAY {','.join(sorted(TWK_SAY_SERIES))}: x2 00-08 ET, "
+                   f"{TWK_SAY_EVENT_CAP:g}/event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
+                   f"quick halts (a {TWK_SAY_FILL_HALT_CONTRACTS:g}-lot take, or one "
+                   f"pick-off at {TWK_SAY_CONFIRM_SECS}s: the event out "
+                   f"{TWK_SAY_HALT_SECS / 60:g}min)" if TWK_SAY_SERIES else "")
                 + "".join(f" ({_s} HALTED this roll day)" for _s, _d in
                           sorted(self.state.twk_halt_day.items()) if _d == _tw_today))
         else:

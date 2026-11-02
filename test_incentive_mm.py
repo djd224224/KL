@@ -23063,25 +23063,39 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
             self.assertTrue(IncentiveMarketMaker._allowed(self.TS))
             self.assertTrue(IncentiveMarketMaker._allowed(self.EO))
 
-    def test_the_monthly_trumpsay_series_join_at_x1(self):
-        # Jack 2026-11-01 "Add now at x1": the two monthly TRUMPSAY series
-        # quote under the pilot rules -- x1 every hour, out of the size test,
-        # 100 a market and net per event, their own $40 halt -- and are not
-        # the single-event mention family's (Jack 2026-10-13)
+    def test_the_monthly_trumpsay_series_join_on_their_own_terms(self):
+        # Jack 2026-11-01 "Add now at x1", then "do 2x overnight. 200 net
+        # across each event. $75 loss limit.": the two monthly TRUMPSAY series
+        # quote under the pilot rules (safe-join, 100 a market, out of the size
+        # test) on their own terms, and are not the single-event mention
+        # family's (Jack 2026-10-13)
+        self.assertEqual(imm.TWK_SAY_SERIES,
+                         frozenset({"KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"}))
         for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"):
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.twk_series(s), s)
+            self.assertTrue(imm.twk_say_series(s), s)
             self.assertTrue(imm.series_override(s).safe_join, s)
             self.assertEqual(imm.series_max_position(s), 100.0, s)
-            self.assertEqual(imm.event_cap_contracts(f"{s}-26DEC01"), 100.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26DEC01"), 200.0, s)
             self.assertTrue(imm.is_daily_series(s), s)
             self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
             self.assertIsNone(imm.size_test_arm(s), s)
-            for when in (datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc),     # quiet
-                         datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc),   # evening
-                         datetime(2026, 11, 7, 15, 0, tzinfo=timezone.utc)):   # Saturday
-                self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+            with mock.patch.object(imm, "SERIES_HOUR_MULTS", self._saved_hour_mults):
+                for when, m in ((datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc), 2.0),   # 02 ET
+                                (datetime(2026, 11, 3, 13, 59, tzinfo=timezone.utc), 2.0),  # 08:59
+                                (datetime(2026, 11, 3, 14, 0, tzinfo=timezone.utc), 1.0),   # 09:00
+                                (datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc), 1.0),  # evening
+                                (datetime(2026, 11, 7, 7, 0, tzinfo=timezone.utc), 2.0),    # Sat 02 ET
+                                (datetime(2026, 11, 7, 15, 0, tzinfo=timezone.utc), 1.0)):  # Sat 10 ET
+                    self.assertEqual(imm.hour_size_mult(s, when), m, (s, when))
             self.assertEqual(imm.pilot_halt_key(s), s)
+            self.assertEqual(imm.pilot_halt_limit(s), 75.0, s)
+        # the weekly pilots keep their own terms
+        self.assertEqual(imm.event_cap_contracts("KXEOWEEK-26OCT17"), 100.0)
+        self.assertEqual(imm.pilot_halt_limit("KXEOWEEK"), 40.0)
+        self.assertFalse(imm.twk_say_series("KXEOWEEK"))
+        for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"):
             self.assertFalse(imm.series_bid_only(s), s)
             self.assertIsNone(imm.series_override(s).cutoff_from_close_min, s)
             self.assertFalse(imm.mention_auto_series(s), s)
@@ -23091,6 +23105,51 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         # the third windowed TRUMPSAY series (the weekly) stays out
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             self.assertFalse(IncentiveMarketMaker._allowed("KXTRUMPSAY-26NOV08-TARIFF"))
+
+    def test_trumpsay_quick_halt_on_a_take(self):
+        # "extremely quick halts" (Jack 2026-11-01): a 15-lot take on one
+        # market stands its whole event down that cycle, for an hour
+        # (KXEOWEEK plays a TRUMPSAY series here)
+        self.enterContext(mock.patch.object(imm, "TWK_SAY_SERIES", frozenset({"KXEOWEEK"})))
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(self._sides(bot, self.EO), {"bid", "ask"})
+        bot.pnl.pos[self.EO] = imm.TWK_SAY_FILL_HALT_CONTRACTS      # our bid taken
+        bot.client.positions[self.EO] = imm.TWK_SAY_FILL_HALT_CONTRACTS
+        bot.run_cycle()
+        ev = self.EO.rsplit("-", 1)[0]
+        self.assertGreater(bot.state.toxic_event_halt_until.get(ev, 0.0),
+                           time.time() + imm.TWK_SAY_HALT_SECS - 120)
+        self.assertEqual(self._sides(bot, self.EO), set())
+        self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})     # not a TRUMPSAY
+        self.assertIn("toxic_halt", [c for c, _m in bot.alerter.today])
+        bot.run_cycle()                                  # still out next cycle
+        self.assertEqual(self._sides(bot, self.EO), set())
+
+    def test_trumpsay_one_pickoff_halts_the_event_at_60s(self):
+        # one fill the mark moves 5c+ against 60 s later takes the event; the
+        # book's rule waits 5 min and needs two
+        self.enterContext(mock.patch.object(imm, "TWK_SAY_SERIES", frozenset({"KXEOWEEK"})))
+        bot = self._bot()
+        bot.run_cycle()
+        now = time.time()
+        ev = self.EO.rsplit("-", 1)[0]
+        bot.state.toxic_pending = [[self.EO, "bid", 50.0, now - 30],    # not due yet
+                                   [self.TS, "bid", 50.0, now - 61]]    # the book's 5 min
+        bot.state.last_mark[self.EO] = 44.0
+        bot.state.last_mark[self.TS] = 44.0
+        self.assertEqual(bot._toxic_confirm(now, {self.EO, self.TS}), [])
+        self.assertEqual(len(bot.state.toxic_pending), 2)
+        bot.state.toxic_pending = [[self.EO, "bid", 50.0, now - 61]]
+        self.assertEqual(bot._toxic_confirm(now, {self.EO}), [ev])
+        self.assertAlmostEqual(bot.state.toxic_event_halt_until[ev],
+                               now + imm.TWK_SAY_HALT_SECS, delta=1)
+        self.assertTrue(bot.toxic_event_halted(ev, now + 60))
+        # a fill the mark did not move against halts nothing
+        bot.state.toxic_event_halt_until = {}
+        bot.state.toxic_pending = [[self.EO, "bid", 50.0, now - 61]]
+        bot.state.last_mark[self.EO] = 47.0
+        self.assertEqual(bot._toxic_confirm(now, {self.EO}), [])
 
     def test_both_sides_and_a_loss_halt_per_series(self):
         bot = self._bot()
@@ -25862,7 +25921,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # fair lead or close rests past the band (2026-10-30)
         # + an RT settled strike that stops qualifying past the release-week
         # stand-down (2026-11-01)
-        self.assertEqual(len(conts), 55)
+        # + the TRUMPSAY quick halt's fill tripwire (2026-11-01)
+        self.assertEqual(len(conts), 56)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
