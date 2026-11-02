@@ -36026,11 +36026,21 @@ class IncentiveMarketMaker:
             side_cap = max(side_cap, _u)
             max_level_size = max(max_level_size, _u)
             # a complement lead rests target/5 at its lead price (the quote
-            # loop sized it so: COMP_LEAD_MODE)
+            # loop sized it so: COMP_LEAD_MODE), and a fair lead its own size
+            # -- and a LEADING SIDE's bound is the lead's size whatever price
+            # the order rests at: the quote loop bounds the whole side by
+            # max(ladder, lead_n), the lead taking what a FAIR CLOSE rung
+            # beside it leaves. Bracketed only at the lead's own price, the
+            # closing rung met the bare ladder while the lead's size already
+            # counted (11/01: KXRAINELECTION-03NOV26-SJC's 25-lot closing bid
+            # at 51-67c beside its 175 lead at 49c, "blocked at 175/55.53",
+            # never placed in 285 tries; seven sides refused every cycle)
             _cl = self._comp_lead_px.get(q.ticker)
-            if _cl is not None and _cl[0 if q.book_side == "bid" else 1] == q.price_cents:
+            _lpx = _cl[0 if q.book_side == "bid" else 1] if _cl is not None else None
+            if _lpx is not None:
                 side_cap = max(side_cap, _cl[2])
-                max_level_size = max(max_level_size, _cl[2])
+                if _lpx == q.price_cents:
+                    max_level_size = max(max_level_size, _cl[2])
             # FAIR CLOSE: the side that reduces a fair-lead market's position
             # may rest the whole of it (the quote loop sized it so), and with
             # a closing rung ahead of the book its own ladder beside it -- an

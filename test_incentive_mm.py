@@ -34305,6 +34305,35 @@ class TestFairClose(unittest.TestCase):
         bot._fair_close_px[t] = ("bid", 32)
         self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 1)
 
+    def test_the_backstop_takes_the_closing_rung_beside_a_held_lead(self):
+        # 11/01: KXRAINELECTION-03NOV26-SJC led its bid with 175 at 49c (its
+        # 200 less the 25 the close took) and FAIR CLOSE asked 25 at 67c. The
+        # backstop bracketed the lead's size only at the lead's own price, so
+        # the closing bid met the bare ladder: "blocked at 175/55.53", 285
+        # tries, never placed
+        bot = IncentiveMarketMaker(client=None, live=False)
+        t = "KXRAINWKND-68OCT13-SJC"
+        bot.pnl.pos[t] = -25.0
+        lv = imm.scale_levels(imm.hour_scaled_levels("KXRAINWKND", datetime.now(timezone.utc)),
+                              bot._market_size_mult(t))
+        cap = sum(s for _t, s in lv) * imm.REF_DEPTH_MAX_MULT * \
+            max(1.0, imm.series_side_mults("KXRAINWKND")[0])
+        lead_n = cap + 100                           # a lead past the ladder's bracket
+        resting = [_resting("a", t, "bid", 49, lead_n - 25)]
+        q = Quote(t, "bid", 67, 25)
+        bot._fair_close_px[t] = ("bid", 67)
+        # leading the OTHER side: the closing bid still meets the ladder
+        bot._comp_lead_px[t] = (None, 70, lead_n)
+        self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 0)
+        # leading the bid: the side is bounded by the lead's size, as the quote
+        # loop bounds it, and the close fits beside the held lead
+        bot._comp_lead_px[t] = (49, None, lead_n)
+        self.assertEqual(bot.place_with_caps([q], resting, set(), time.time()), 1)
+        # ...while an order past the lead's size plus its close still stops
+        big = Quote(t, "bid", 66, 30)
+        self.assertEqual(bot.place_with_caps([big], resting + [_resting("b", t, "bid", 67, 25)],
+                                             set(), time.time()), 0)
+
     def test_the_side_a_position_adds_to_still_quotes_its_normal_rung(self):
         # Jack 2026-10-30: "just because a 200 position on one side, doesnt
         # mean that side has to stop quoting. can still quote that side
