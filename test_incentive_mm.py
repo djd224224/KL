@@ -23069,8 +23069,8 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         # quote under the pilot rules (safe-join, 100 a market, out of the size
         # test) on their own terms, and are not the single-event mention
         # family's (Jack 2026-10-13)
-        self.assertEqual(imm.TWK_SAY_SERIES,
-                         frozenset({"KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"}))
+        self.assertEqual(imm.TWK_SAY_SERIES, frozenset(
+            {"KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH", "KXFEATURE"}))
         for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"):
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.twk_series(s), s)
@@ -23106,29 +23106,36 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             self.assertFalse(IncentiveMarketMaker._allowed("KXTRUMPSAY-26NOV08-TARIFF"))
 
-    def test_trumpsay_quick_halt_on_a_take(self):
-        # "extremely quick halts" (Jack 2026-11-01): a 15-lot take on one
-        # market stands its whole event down that cycle, for an hour
-        # (KXEOWEEK plays a TRUMPSAY series here)
-        self.enterContext(mock.patch.object(imm, "TWK_SAY_SERIES", frozenset({"KXEOWEEK"})))
-        bot = self._bot()
-        bot.run_cycle()
-        self.assertEqual(self._sides(bot, self.EO), {"bid", "ask"})
-        bot.pnl.pos[self.EO] = imm.TWK_SAY_FILL_HALT_CONTRACTS      # our bid taken
-        bot.client.positions[self.EO] = imm.TWK_SAY_FILL_HALT_CONTRACTS
-        bot.run_cycle()
-        ev = self.EO.rsplit("-", 1)[0]
-        self.assertGreater(bot.state.toxic_event_halt_until.get(ev, 0.0),
-                           time.time() + imm.TWK_SAY_HALT_SECS - 120)
-        self.assertEqual(self._sides(bot, self.EO), set())
-        self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})     # not a TRUMPSAY
-        self.assertIn("toxic_halt", [c for c, _m in bot.alerter.today])
-        bot.run_cycle()                                  # still out next cycle
-        self.assertEqual(self._sides(bot, self.EO), set())
+    def test_the_gta6_album_features_join_the_group_by_event(self):
+        # Jack 2026-11-01: "put KXFEATURE-26GTA6 into the same group" -- that
+        # EVENT on the TRUMPSAY terms; the series' other events stay out
+        self.assertEqual(imm.TWK_SAY_EVENTS, frozenset({"KXFEATURE-26GTA6"}))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(IncentiveMarketMaker._allowed("KXFEATURE-26GTA6-DRA"))
+            self.assertTrue(IncentiveMarketMaker._allowed("KXFEATURE-26GTA6"))
+            self.assertFalse(IncentiveMarketMaker._allowed("KXFEATURE-27TLOP-A"))
+            self.assertFalse(IncentiveMarketMaker._allowed("KXFEATURE-X"))   # the probe
+        self.assertNotIn("KXFEATURE", imm.ALLOW_SERIES)
+        s = "KXFEATURE"
+        self.assertTrue(imm.twk_say_series(s))
+        self.assertEqual(imm.event_cap_contracts("KXFEATURE-26GTA6"), 200.0)
+        self.assertEqual(imm.series_max_position(s), 100.0)
+        self.assertEqual(imm.pilot_halt_limit(s), 75.0)
+        self.assertTrue(imm.series_override(s).safe_join)
+        self.assertIsNone(imm.size_test_arm(s))
+        with mock.patch.object(imm, "SERIES_HOUR_MULTS", self._saved_hour_mults):
+            self.assertEqual(imm.hour_size_mult(
+                s, datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc)), 2.0)    # 02 ET
+            self.assertEqual(imm.hour_size_mult(
+                s, datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)), 1.0)   # noon
+        with mock.patch.object(imm, "TWK_ENABLE", False):
+            self.assertFalse(imm.twk_event_ticker("KXFEATURE-26GTA6-DRA"))
 
     def test_trumpsay_one_pickoff_halts_the_event_at_60s(self):
-        # one fill the mark moves 5c+ against 60 s later takes the event; the
-        # book's rule waits 5 min and needs two
+        # one fill the mark moves 5c+ against 60 s later takes the event for
+        # the event rule's normal 30 min (Jack: "take the whole event out for
+        # normal amount of time"); the book's rule waits 5 min and needs two
+        self.assertEqual(imm.TWK_SAY_HALT_SECS, imm.TOXIC_EVENT_HALT_SECS)
         self.enterContext(mock.patch.object(imm, "TWK_SAY_SERIES", frozenset({"KXEOWEEK"})))
         bot = self._bot()
         bot.run_cycle()
@@ -25921,8 +25928,7 @@ class TestGuardSkipSink(unittest.TestCase):
         # fair lead or close rests past the band (2026-10-30)
         # + an RT settled strike that stops qualifying past the release-week
         # stand-down (2026-11-01)
-        # + the TRUMPSAY quick halt's fill tripwire (2026-11-01)
-        self.assertEqual(len(conts), 56)
+        self.assertEqual(len(conts), 55)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -36950,6 +36956,42 @@ class TestTapeTrigger(unittest.TestCase):
         st = self.bot._tape_st
         self.assertEqual((self._lines(), st["trades"], st["relevant"], st["blocks"]),
                          ([], 3, 0, 1))
+
+    def test_a_trumpsay_event_pulls_live_on_a_100_lot_taker(self):
+        # Jack 2026-11-01: "taker of 100+ contracts, not 15+ ... i care more
+        # about fast pulls than long pulls": a monthly TRUMPSAY event (KXEVT
+        # plays one) pulls LIVE on a taker of 100+ while the tape trigger runs
+        # dry for the rest of the book, for the sweep breaker's normal hold,
+        # and the book's 25-contract / 2-price rule does not trip it
+        for name, v in (("TWK_ENABLE", True), ("TWK_SERIES", frozenset({"KXEVT"})),
+                        ("TWK_SAY_SERIES", frozenset({"KXEVT"}))):
+            self.enterContext(mock.patch.object(imm, name, v))
+        self.assertEqual(imm.TAPE_TRIGGER, "dry")
+        self._print(self.S, "yes", 60, 20, 0.0)
+        self._print(self.S, "yes", 61, 20, 0.2)          # 40 over 2 prices
+        self.assertEqual(self._lines("trip"), [])
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 10))
+        self._print(self.S, "yes", 62, 60, 0.4)          # the same taker: 100
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["count"]), ("on", 100.0))
+        self.assertTrue(self.bot.sweep_held(self.E, self.now + 10))
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 601))
+        self.assertEqual(sorted(self.cancelled), [("o1", "tape_trigger"),
+                                                  ("o2", "tape_trigger"),
+                                                  ("o3", "tape_trigger")])
+        # another series' 100-lot taker stays dry: nothing of it pulled
+        self._print(self.C, "no", 50, 100, 5.0)
+        self.assertEqual([t["mode"] for t in self._lines("trip")], ["on", "dry"])
+        self.assertNotIn(("o4", "tape_trigger"), self.cancelled)
+
+    def test_a_trumpsay_taker_needs_the_sweep_breaker_on(self):
+        for name, v in (("TWK_ENABLE", True), ("TWK_SERIES", frozenset({"KXEVT"})),
+                        ("TWK_SAY_SERIES", frozenset({"KXEVT"})),
+                        ("SWEEP_BREAKER", "dry")):
+            self.enterContext(mock.patch.object(imm, name, v))
+        self._print(self.S, "yes", 60, 120, 0.0)
+        self.assertEqual(self._lines("trip")[0]["mode"], "dry")
+        self.assertEqual(self.cancelled, [])
 
     def test_on_pulls_the_event_and_holds_it_like_a_sweep(self):
         with mock.patch.object(imm, "TAPE_TRIGGER", "on"):

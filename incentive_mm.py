@@ -1811,7 +1811,8 @@ def _parse_series_hour_mults(spec: str) -> List[Tuple[str, Dict[int, float]]]:
 SERIES_HOUR_MULTS = _parse_series_hour_mults(os.environ.get(
     "IMM_SERIES_HOUR_MULT",
     "KXDIESELD:16-1:0.5,KXAAAGASD:16-1:0.5,KXRAIN:19-1:0.5,"
-    "KXTRUEV:17-1:0.5,KXTRUMPSAYCOMPANY:0-8:2.0,KXTRUMPSAYMONTH:0-8:2.0"))
+    "KXTRUEV:17-1:0.5,KXTRUMPSAYCOMPANY:0-8:2.0,KXTRUMPSAYMONTH:0-8:2.0,"
+    "KXFEATURE:0-8:2.0"))
 
 # SPORTS LADDERS / ESCALATORS AT x3 EVERY HOUR (Jack 2026-10-06: "do the 3x
 # overnight multiplier, at all times for ESCALATOR/LADDER events"). The
@@ -17015,8 +17016,23 @@ def yt1_shadow_note(ev: str, e: dict, now_ts: float) -> Tuple[tuple, str]:
 # halts: their names carry no MENTION, so the mention exemption does not
 # apply), to the ticker-date cutoff (00:00 ET on the event's day).
 TWK_ENABLE = _TWK_LIVE
+# SINGLE EVENTS ON THE TRUMPSAY TERMS (Jack 2026-11-01: "put KXFEATURE-26GTA6
+# into the same group"): an event listed here quotes under TWK_SAY_SERIES's
+# terms though its series is no Trump pilot. It is admitted per EVENT
+# (twk_event_ticker in _allowed; the series never joins ALLOW_SERIES), so the
+# series' other events stay out, and its series joins TWK_SERIES /
+# TWK_SAY_SERIES below for the rules, which are all keyed by series.
+# KXFEATURE-26GTA6, "Grand Theft Auto VI: The Album -- Features": 130 artist
+# markets (Drake, Bad Bunny, The Weeknd ...), ~$1,794/day of pool on 11/01,
+# closing 2026-12-31 04:59Z. Its ticker carries no date, so nothing cuts it
+# off before the close's hour (series_min_hours_to_close); the quick pulls,
+# the halts and the caps are its protection. IMM_TWK_SAY_EVENTS replaces the
+# list ("" = none).
+TWK_SAY_EVENTS = frozenset(e.strip() for e in os.environ.get(
+    "IMM_TWK_SAY_EVENTS", "KXFEATURE-26GTA6").split(",") if e.strip())
 TWK_SERIES = frozenset(s.strip() for s in os.environ.get(
-    "IMM_ALLOW_TWK_SERIES", _DEFAULT_TWK_SERIES).split(",") if s.strip())
+    "IMM_ALLOW_TWK_SERIES", _DEFAULT_TWK_SERIES).split(",") if s.strip()) \
+    | frozenset(series_of(e) for e in TWK_SAY_EVENTS)
 TWK_EARLY_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_TWK_EARLY_SERIES", "KXTRUTHSOCIAL").split(",") if s.strip())
 TWK_EARLY_CUTOFF_FROM_CLOSE_MIN = _env_int("IMM_TWK_EARLY_CUTOFF_FROM_CLOSE_MIN", 7200)
@@ -17040,6 +17056,12 @@ def twk_series(series: str) -> bool:
     return TWK_ENABLE and series in TWK_SERIES
 
 
+def twk_event_ticker(ticker: str) -> bool:
+    """A market (or the event) of a TWK_SAY_EVENTS event: admitted by _allowed
+    per event; the "<series>-X" probe and the series' other events are not."""
+    return TWK_ENABLE and event_ticker_of(ticker) in TWK_SAY_EVENTS
+
+
 def twk_bid_only(series: str) -> bool:
     return twk_series(series) and series in TWK_BID_ONLY_SERIES
 
@@ -17053,23 +17075,33 @@ def twk_bid_only(series: str) -> bool:
 #     which beat the pilots' x1-every-hour daily rule), x1 the rest of it;
 #   * TWK_SAY_EVENT_CAP (200) net per event; the per-market 100 stays;
 #   * a TWK_SAY_DAILY_LOSS_LIMIT ($75) daily halt per series;
-#   * QUICK HALTS, each standing the WHOLE event down for TWK_SAY_HALT_SECS
-#     (60 min) through the toxic event halt (saved state, the quotes dropped
-#     from `desired`, the toxic_halts sink and the morning email):
-#       - the fill tripwire: our own book moving TWK_SAY_FILL_HALT_CONTRACTS
-#         (15) or more on any market of the event in one cycle -- a take of
-#         most of a rung -- halts it at once, before any price confirms it;
+#   * QUICK PULLS of the WHOLE event, for the normal length (Jack, the same
+#     evening: "take the whole event out for normal amount of time, 60min is
+#     not necessary. i care more about fast pulls than long pulls. taker of
+#     100+ contracts, not 15+, 15 is too small."):
+#       - a TAKER of TWK_SAY_TAKER_CT (100) or more contracts on the public tape
+#         (the TAPE_TRIGGER feed: one market, one taker side, prints no more
+#         than TAPE_BURST_GAP_SECS apart, whoever's orders it took) pulls every
+#         resting order of ours in the event at once and holds it the sweep
+#         breaker's normal hold (sweep_hold_secs, 600 s) -- LIVE for these
+#         series while the tape trigger stays dry for the rest of the book; it
+#         needs the tape feed (IMM_TAPE_TRIGGER not off) and IMM_SWEEP_BREAKER=on,
+#         and replaces the normal 25-contract / 2-price burst rule here;
 #       - ONE pick-off (a fill the mark has moved TOXIC_PICKOFF_CENTS against
 #         TWK_SAY_CONFIRM_SECS later: 60 s, where the book's rule waits 5 min
-#         and needs two on a side or two markets of an event) halts it.
-# Both are off with the toxic halt (IMM_TOXIC_HALT=0).
+#         and needs two on a side or two markets of an event) takes the event
+#         out the event rule's normal TOXIC_EVENT_HALT_SECS (30 min), through
+#         the toxic event halt (saved state, the toxic_halts sink, the morning
+#         email); off with IMM_TOXIC_HALT=0.
 TWK_SAY_SERIES = frozenset(s for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH")
-                           if s in TWK_SERIES)
+                           if s in TWK_SERIES) \
+    | frozenset(series_of(e) for e in TWK_SAY_EVENTS)    # KXFEATURE-26GTA6's
 TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 200)
 TWK_SAY_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_SAY_DAILY_LOSS_LIMIT", 75)
-TWK_SAY_FILL_HALT_CONTRACTS = _env_float("IMM_TWK_SAY_FILL_HALT", 15)
+TWK_SAY_TAKER_CT = _env_float("IMM_TWK_SAY_TAKER_CT", 100)
 TWK_SAY_CONFIRM_SECS = _env_int("IMM_TWK_SAY_CONFIRM_SECS", 60)
-TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN", 60.0) * 60.0
+TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN",
+                               TOXIC_EVENT_HALT_SECS / 60.0) * 60.0
 
 
 def twk_say_series(series: str) -> bool:
@@ -26202,7 +26234,12 @@ class IncentiveMarketMaker:
         b["seen_last"] = now_ts
         if len(b["trades"]) < 500:
             b["trades"].append((str(body.get("trade_id") or ""), n))
-        if b["trip"] is None and tape_burst_trips(b["ct"], len(b["px"])):
+        # the monthly TRUMPSAY series trip on a taker of TWK_SAY_TAKER_CT+ alone
+        # (TWK_SAY_SERIES); every other series on the burst rule
+        trips = (b["ct"] + 1e-9 >= TWK_SAY_TAKER_CT) \
+            if twk_say_series(series_of(t)) \
+            else tape_burst_trips(b["ct"], len(b["px"]))
+        if b["trip"] is None and trips:
             self._tape_trip(t, side, b, now_ts)
 
     def _tape_own_ct(self, b: dict) -> float:
@@ -26285,7 +26322,10 @@ class IncentiveMarketMaker:
         elif sweep_exempt(series):
             mode = "exempt"            # mention families: logged, never pulled
         else:
-            mode = "on" if TAPE_TRIGGER == "on" and SWEEP_BREAKER == "on" else "dry"
+            # live for the monthly TRUMPSAY series (TWK_SAY_SERIES) while the
+            # tape trigger runs dry for the rest of the book
+            mode = "on" if (TAPE_TRIGGER == "on" or twk_say_series(series)) \
+                and SWEEP_BREAKER == "on" else "dry"
         b["trip"] = mode
         st["trips"] += 1
         if mode in ("held", "inside", "group_only", "exempt"):
@@ -28293,6 +28333,7 @@ class IncentiveMarketMaker:
             rain_period_gated(ticker) or \
             (rain_monthly_auto(series) and not rain_period_ticker(ticker)) or \
             ytw_pilot_ticker(ticker) or \
+            twk_event_ticker(ticker) or \
             snow_monthly_series(series) or \
             bigsky_series(series) or \
             temp_threshold_series(series) or \
@@ -33389,21 +33430,6 @@ class IncentiveMarketMaker:
                 self.state.prev_pos[t] = own_pos
                 self._gskip(t, "event_fill_tripwire", lambda: dict(own_pos=own_pos, prev_pos=prev, strikes=strikes, confirmed=confirmed, n_cx=n_cx))
                 continue
-            # TRUMPSAY QUICK HALT (2026-11-01, see TWK_SAY_SERIES): a take of
-            # TWK_SAY_FILL_HALT_CONTRACTS or more in one cycle on any market of
-            # a monthly TRUMPSAY event stands the WHOLE event down at once.
-            if (TOXIC_HALT and twk_say_series(meta.series) and prev is not None
-                    and abs(own_pos - prev) >= TWK_SAY_FILL_HALT_CONTRACTS):
-                self._twk_say_halt(ev, t, f"own book moved {own_pos - prev:+.0f} "
-                                   f"in one cycle", now_ts)
-                n_cx = 0
-                for m2 in by_event.get(ev, [meta]):
-                    n_cx += self.cancel_market_orders(m2.ticker, resting)
-                ev_ticks = {m2.ticker for m2 in by_event.get(ev, [meta])}
-                desired = [q for q in desired if q.ticker not in ev_ticks]
-                self.state.prev_pos[t] = own_pos
-                self._gskip(t, "twk_say_fill_halt", lambda: dict(own_pos=own_pos, prev_pos=prev, n_cx=n_cx))
-                continue
             # OPEN-SCAN FILL TRIPWIRE (2026-09-05, see the SCAN_* block; OFF
             # unless IMM_SCAN_FILL_HALT > 0): being swept on a scan member
             # IS the adverse selection the tier's screens exist to avoid —
@@ -38111,8 +38137,11 @@ class IncentiveMarketMaker:
                 f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f"; TRUMPSAY {','.join(sorted(TWK_SAY_SERIES))}: x2 00-08 ET, "
                    f"{TWK_SAY_EVENT_CAP:g}/event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
-                   f"quick halts (a {TWK_SAY_FILL_HALT_CONTRACTS:g}-lot take, or one "
-                   f"pick-off at {TWK_SAY_CONFIRM_SECS}s: the event out "
+                   f"quick pulls (a {TWK_SAY_TAKER_CT:g}+ taker on the tape: the event "
+                   f"pulled and held the sweep hold"
+                   + ("" if TAPE_TRIGGER != "off" and SWEEP_BREAKER == "on"
+                      else " -- OFF: needs the tape feed and IMM_SWEEP_BREAKER=on")
+                   + f"; one pick-off at {TWK_SAY_CONFIRM_SECS}s: the event out "
                    f"{TWK_SAY_HALT_SECS / 60:g}min)" if TWK_SAY_SERIES else "")
                 + "".join(f" ({_s} HALTED this roll day)" for _s, _d in
                           sorted(self.state.twk_halt_day.items()) if _d == _tw_today))
