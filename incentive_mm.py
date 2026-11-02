@@ -1321,6 +1321,24 @@ def note_rain_daily_station(series: str, market: Optional[dict]) -> Optional[str
 RAIN_DAILY_INTL = os.environ.get("IMM_RAIN_DAILY_INTL", "1") == "1"
 RAIN_DAILY_INTL_BASE = _env_float("IMM_RAIN_DAILY_INTL_BASE", 1000.0)
 RAIN_DAILY_INTL_STOP_DAYS = _env_float("IMM_RAIN_DAILY_INTL_STOP_DAYS", 14.0)
+# PARIS AT TWICE THE BASE (Jack 2026-11-01: "double size of paris rain
+# market"). KXRAINDPARIS-03SEP27-T0 held ~26% of its $168/day program at
+# 2,500 a side ($44/day at full size, no fills) on a book ~58,000 deep. Its
+# base goes to 2,000 a side: 4,000 by day and 2,000 in the 19-01 ET halving,
+# with the at-ref depth multiplier on top, and its caps and skew knees ride
+# the same wire (30,000 a market). Another non-US city keeps
+# RAIN_DAILY_INTL_BASE, and IMM_RAIN_DAILY_INTL_BASE=0 still puts every one
+# at the family's size.
+# IMM_RAIN_DAILY_INTL_BASE_BY_SERIES: "SERIES:base,..." ("" = none).
+RAIN_DAILY_INTL_BASE_BY_SERIES: Dict[str, float] = {}
+for _pair in os.environ.get(
+        "IMM_RAIN_DAILY_INTL_BASE_BY_SERIES", "KXRAINDPARIS:2000").split(","):
+    _s, _, _v = _pair.partition(":")
+    try:
+        if _s.strip() and float(_v) > 0:
+            RAIN_DAILY_INTL_BASE_BY_SERIES[_s.strip()] = float(_v)
+    except ValueError:
+        pass
 # series -> the non-US station its rules name ("LFPG")
 _RAIN_DAILY_INTL: Dict[str, str] = {}
 _RAIN_DAILY_INTL_STATION_RE = re.compile(r"\(([A-JL-Z][A-Z0-9]{3})\)")
@@ -1342,7 +1360,7 @@ def note_rain_daily_intl(series: str, market: Optional[dict]) -> Optional[str]:
             day = _RAIN_DAILY_UTC_DAY_RE.search(rules)
             log(f"[IMM] rain daily {series}: station {st.group(1)}"
                 + (f", its day from {day.group(1)} UTC" if day else "")
-                + f", from its rules; no model -- {RAIN_DAILY_INTL_BASE:g} a side "
+                + f", from its rules; no model -- {rain_daily_intl_base(series):g} a side "
                 f"as a base, out {RAIN_DAILY_INTL_STOP_DAYS:g}d before its day")
     return _RAIN_DAILY_INTL.get(series)
 
@@ -1352,13 +1370,22 @@ def rain_daily_intl_series(series: str) -> bool:
     return RAIN_DAILY_INTL and series in _RAIN_DAILY_INTL
 
 
+def rain_daily_intl_base(series: str) -> float:
+    """Such a series' base a side: its RAIN_DAILY_INTL_BASE_BY_SERIES entry
+    (KXRAINDPARIS 2,000), else RAIN_DAILY_INTL_BASE; 0 while that is 0."""
+    if RAIN_DAILY_INTL_BASE <= 0:
+        return 0.0
+    return RAIN_DAILY_INTL_BASE_BY_SERIES.get(series, RAIN_DAILY_INTL_BASE)
+
+
 def rain_daily_intl_base_mult(series: str) -> float:
-    """RAIN_DAILY_INTL_BASE over the global rung for such a series (1,000
-    over 20 = x50), else 1."""
-    if RAIN_DAILY_INTL_BASE <= 0 or not rain_daily_intl_series(series):
+    """The series' base over the global rung for such a series (1,000 over
+    20 = x50; Paris's 2,000 = x100), else 1."""
+    base = rain_daily_intl_base(series)
+    if base <= 0 or not rain_daily_intl_series(series):
         return 1.0
     side = sum(s for _t, s in LEVELS)
-    return RAIN_DAILY_INTL_BASE / side if side > 0 else 1.0
+    return base / side if side > 0 else 1.0
 
 
 def rain_daily_intl_cutoff(event_ticker: str) -> datetime:
@@ -11878,6 +11905,7 @@ _CONFIG_CODE_KNOBS = (
     "TEMP_THRESHOLD_SIZE_MULT",
     # ...and the international ones, Paris (2026-10-31)
     "RAIN_DAILY_INTL", "RAIN_DAILY_INTL_BASE", "RAIN_DAILY_INTL_STOP_DAYS",
+    "RAIN_DAILY_INTL_BASE_BY_SERIES",   # Paris at 2,000 (2026-11-01)
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # toxic-flow side halt (2026-09-29)
@@ -37696,8 +37724,12 @@ class IncentiveMarketMaker:
                 f"on {RAIN_DAILY_CITY_PARENT}'s guard set, the rain-fair gate (next "
                 f"day exempt), the curated next-day tier and the move breaker"
                 + (f"; a non-US station (Paris, 2026-10-31): no model, "
-                   + (f"{RAIN_DAILY_INTL_BASE:g} a side as a base under the family's "
-                      f"multipliers" if RAIN_DAILY_INTL_BASE > 0 else "the family's size")
+                   + (f"{RAIN_DAILY_INTL_BASE:g} a side as a base"
+                      + (" (" + ", ".join(f"{s} {b:g}" for s, b in sorted(
+                          RAIN_DAILY_INTL_BASE_BY_SERIES.items())) + ", 2026-11-01)"
+                         if RAIN_DAILY_INTL_BASE_BY_SERIES else "")
+                      + " under the family's multipliers"
+                      if RAIN_DAILY_INTL_BASE > 0 else "the family's size")
                    + f", out of the size test, out {RAIN_DAILY_INTL_STOP_DAYS:g}d "
                    f"before its day" if RAIN_DAILY_INTL else "; a non-US station stands down"))
         if TEMP_THRESHOLD_ENABLE:

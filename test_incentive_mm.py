@@ -26214,46 +26214,68 @@ class TestWeatherShapes1030(unittest.TestCase):
                 imm.RELEASE_GUARD_UNKNOWN)
         self.assertIn("rules name no station", imm._config_gaps[ev]["msg"])
 
-    def test_paris_rests_1000_a_side_as_a_base(self):
+    def test_paris_rests_2000_a_side_as_a_base(self):
+        # Jack 2026-11-01: "double size of paris rain market"
         self._intl_clean()
         imm.ensure_family_override("KXRAINDPARIS")
         self.assertEqual(imm.RAIN_DAILY_INTL_BASE, 1000.0)
+        self.assertEqual(imm.RAIN_DAILY_INTL_BASE_BY_SERIES, {"KXRAINDPARIS": 2000.0})
         self.assertEqual(imm.RAIN_DAILY_INTL_STOP_DAYS, 14.0)
-        for k in ("RAIN_DAILY_INTL", "RAIN_DAILY_INTL_BASE", "RAIN_DAILY_INTL_STOP_DAYS"):
+        for k in ("RAIN_DAILY_INTL", "RAIN_DAILY_INTL_BASE", "RAIN_DAILY_INTL_STOP_DAYS",
+                  "RAIN_DAILY_INTL_BASE_BY_SERIES"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
         day = imm.ET.localize(datetime(2026, 11, 2, 14)).astimezone(timezone.utc)
         eve = imm.ET.localize(datetime(2026, 11, 2, 21)).astimezone(timezone.utc)
+        tokyo = {"rules_primary": "If total precipitation at Tokyo Haneda Airport (RJTT) "
+                 "for the reporting day dated March 1, 2027 is strictly greater than 0 "
+                 "millimeters"}
+        lines = []
         with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
                 mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0), \
                 mock.patch.object(imm, "SAT_MAX_POSITION", 150.0), \
                 mock.patch.object(imm, "SERIES_HOUR_MULTS",
-                                  imm._parse_series_hour_mults("KXRAIN:19-1:0.5")):
+                                  imm._parse_series_hour_mults("KXRAIN:19-1:0.5")), \
+                mock.patch.object(imm, "log", lines.append):
             # the family's size until its rules are read
             self.assertEqual(imm.applied_mention_mult("KXRAINDPARIS"),
                              imm.RAIN_DAILY_SIZE_MULT * imm.size_test_mult("KXRAINDPARIS"))
             imm.note_rain_daily_intl("KXRAINDPARIS", self.PARIS_RULES)
-            # 1,000 for the launcher's 20-lot rung (x50), the family's x2 on
-            # top: 2,000 a side by day, 1,000 in the 19-01 ET halving; the
+            # 2,000 for the launcher's 20-lot rung (x100), the family's x2 on
+            # top: 4,000 a side by day, 2,000 in the 19-01 ET halving; the
             # caps and skew knees ride the same wire; out of the size test
             self.assertIsNone(imm.size_test_arm("KXRAINDPARIS"))
             self.assertEqual(imm.applied_mention_mult("KXRAINDPARIS"),
-                             50.0 * imm.RAIN_DAILY_SIZE_MULT)
-            self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", day), [(0, 2000)])
-            self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", eve), [(0, 1000)])
-            self.assertEqual(imm.series_max_position("KXRAINDPARIS", day), 15000.0)
+                             100.0 * imm.RAIN_DAILY_SIZE_MULT)
+            self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", day), [(0, 4000)])
+            self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", eve), [(0, 2000)])
+            self.assertEqual(imm.series_max_position("KXRAINDPARIS", day), 30000.0)
+            # another non-US city keeps the 1,000 (x50)
+            imm.note_rain_daily_intl("KXRAINDTOKYO", tokyo)
+            self.assertEqual(imm.rain_daily_intl_base_mult("KXRAINDTOKYO"), 50.0)
+            self.assertTrue(any("KXRAINDPARIS: station LFPG" in s and "2000 a side as a base" in s
+                                for s in lines), lines)
+            self.assertTrue(any("KXRAINDTOKYO: station RJTT" in s and "1000 a side as a base" in s
+                                for s in lines), lines)
+            # with no entry Paris is back at 1,000: 2,000 by day, 1,000 at night
+            with mock.patch.dict(imm.RAIN_DAILY_INTL_BASE_BY_SERIES, clear=True):
+                self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", day), [(0, 2000)])
+                self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", eve), [(0, 1000)])
+                self.assertEqual(imm.series_max_position("KXRAINDPARIS", day), 15000.0)
+            # the base switch still puts every one at the family's size
             with mock.patch.object(imm, "RAIN_DAILY_INTL_BASE", 0.0):
                 self.assertEqual(imm.hour_scaled_levels("KXRAINDPARIS", day),
                                  [(0, int(20 * imm.RAIN_DAILY_SIZE_MULT))])
+                self.assertEqual(imm.rain_daily_intl_base_mult("KXRAINDTOKYO"), 1.0)
             # a US station's daily is untouched
             imm.ensure_family_override("KXRAINDNYC")
             imm.note_rain_daily_station("KXRAINDNYC", self.NYC_RULES)
             self.assertEqual(imm.rain_daily_intl_base_mult("KXRAINDNYC"), 1.0)
 
-    def test_the_quote_loop_rests_2500_a_side_on_the_paris_book(self):
+    def test_the_quote_loop_rests_5000_a_side_on_the_paris_book(self):
         # the 11/01 03:10Z book: YES 170 @ 41c over 2,495 @ 40c; NO 5 @ 32c
         # (a 68c offer) over 4,398 @ 31c (69c): at-ref rungs at 40c and 69c,
         # each one tick behind its touch, so the deep-reference x1.25 rides
-        # on the 2,000 too
+        # on the 4,000 too (2,500 at the 1,000 base before 2026-11-01)
         self._intl_clean()
         _clean_persist()
         lines = []
@@ -26293,7 +26315,7 @@ class TestWeatherShapes1030(unittest.TestCase):
                       [s for s in lines if "PARIS" in s or "skips" in s])
         rungs = sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
                        for o in bot.state.sim_orders.values() if o["ticker"] == self.PARIS)
-        self.assertEqual(rungs, [("ask", 69, 2500), ("bid", 40, 2500)])
+        self.assertEqual(rungs, [("ask", 69, 5000), ("bid", 40, 5000)])
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
             self.assertEqual(imm.ref_depth_mult(41, 40, "bid"), 1.25)
 
