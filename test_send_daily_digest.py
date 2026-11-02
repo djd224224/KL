@@ -239,5 +239,61 @@ class ArchiveTests(_DigestTest):
         self.assertEqual(self.dd.archive_clause(None), "")
 
 
+def _cap_item(kind="risk_long", now=True, count=12, peak=463.0, limit=450.0, last=463.0,
+              fleet="monthly", bot="BTC-MIN", where="KXBTCMINMON-BTC-26NOV30"):
+    return {"fleet": fleet, "bot": bot, "kind": kind, "where": where, "limit": limit,
+            "peak": peak, "peak_ts": "2026-11-02 08:00:00Z", "last": last,
+            "ratio": peak / limit, "now": now, "first_at": "2026-11-02 08:00:00Z",
+            "last_at": "2026-11-02 11:50:00Z", "secs_at": count * 30.0, "count": count}
+
+
+def _cap_rep(hits=(), near=(), blind=()):
+    return {"hits": list(hits), "near": list(near), "blind": list(blind),
+            "top": (list(near) or [None])[0], "bots": 31, "window_hours": 24}
+
+
+class CapAlertTests(_DigestTest):
+    """Jack 2026-11-01: "make sure daily crypto email clearly alerts if any caps
+    are hit": a red line per hit up top, an always-on caps line, a section."""
+
+    def test_each_hit_is_a_top_warning(self):
+        w = self.dd.cap_warnings(_cap_rep(hits=[_cap_item()]))
+        self.assertEqual(len(w), 1)
+        self.assertTrue(w[0].startswith("CAP HIT: BTC-MIN monthly -- $-at-risk cap, long side"))
+        self.assertIn("$463 of $450; AT THE CAP NOW", w[0])
+
+    def test_many_hits_are_capped_with_a_pointer(self):
+        hits = [_cap_item(bot=f"B{i}") for i in range(self.dd.MAX_CAP_WARNINGS + 3)]
+        w = self.dd.cap_warnings(_cap_rep(hits=hits))
+        self.assertEqual(len(w), self.dd.MAX_CAP_WARNINGS + 1)
+        self.assertIn("3 more cap hits", w[-1])
+
+    def test_nothing_hit_means_no_warning_but_a_clean_caps_line(self):
+        rep = _cap_rep(near=[_cap_item(count=0, now=False, peak=400.0, last=400.0)])
+        self.assertEqual(self.dd.cap_warnings(rep), [])
+        self.assertTrue(self.dd.crypto_caps.summary_text(rep).startswith("Caps: none hit"))
+
+    def test_a_failed_or_blind_check_is_loud(self):
+        self.assertIn("NOT checked", self.dd.cap_warnings(None)[0])
+        w = self.dd.cap_warnings(_cap_rep(blind=["SOL-MIN monthly"]))
+        self.assertIn("BLIND for SOL-MIN monthly", w[0])
+
+    def test_section_lists_hits_near_and_limits(self):
+        rep = _cap_rep(hits=[_cap_item()],
+                       near=[_cap_item(kind="position", count=0, now=False, peak=250.0,
+                                       limit=300.0, last=-250.0,
+                                       where="KXSOLMINMON-SOL-26NOV30-8000|80")])
+        text = "\n".join(self.dd.caps_text(rep))
+        self.assertIn("== CAPS (last 24h) ==", text)
+        self.assertIn("HIT   BTC-MIN monthly: $-at-risk cap, long side: $463 of $450", text)
+        self.assertIn("near  BTC-MIN monthly: position cap on the 80 strike: 250 short of 300", text)
+        self.assertIn("Limits: monthly 300/market", text)
+        html = "".join(self.dd.caps_html(rep))
+        self.assertIn(">HIT<", html)
+        self.assertIn("$-at-risk cap, long side", html)
+        self.assertEqual(self.dd.caps_text(_cap_rep()), [])
+        self.assertEqual(self.dd.caps_html(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,7 @@ for _v in ("ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"):
 # Import AFTER the env fixup so the module-level cred constants pick them up.
 from crypto_touch_mm import (CT, MARKETS, STATUS_DIR, Alerter, build_client,  # noqa: E402
                              event_ticker_for, log)
+import crypto_caps  # noqa: E402
 
 STALE_AFTER_MINUTES = 30
 
@@ -122,6 +123,66 @@ def cash_warnings(shards: dict, guards: list) -> list:
         out.append(f"Cash guard holding new-risk orders on {len(guards)} bot"
                    f"{'s' if len(guards) != 1 else ''} ({names}): {guards[0][1].get('reason', '?')}")
     return out
+
+
+# Caps (Jack 2026-11-01: "make sure daily crypto email clearly alerts if any
+# caps are hit"). crypto_caps.cap_report reads the last 24h of every bot's
+# cycle lines; each hit becomes a red line at the top, the caps line under the
+# balance always says whether caps were checked, and the Caps section lists
+# hits, near misses (80%+) and the live limits.
+MAX_CAP_WARNINGS = 8
+
+
+def cap_warnings(rep) -> list:
+    """Top-of-email lines: one per cap hit (most urgent first), a failed
+    check, and bots the check could not see. [] when nothing was hit."""
+    if rep is None:
+        return ["Cap check FAILED this morning: caps were NOT checked (see digest-task.log)"]
+    out = [crypto_caps.hit_text(h) for h in rep["hits"][:MAX_CAP_WARNINGS]]
+    if len(rep["hits"]) > MAX_CAP_WARNINGS:
+        out.append(f"...and {len(rep['hits']) - MAX_CAP_WARNINGS} more cap hits "
+                   f"(all in the Caps section)")
+    if rep["blind"]:
+        out.append(f"Cap check BLIND for {', '.join(rep['blind'])}: no cycle lines in "
+                   f"their logs for the last {int(rep['window_hours'])}h")
+    return out
+
+
+def caps_text(rep) -> list:
+    """The Caps section (plain text); [] when nothing was hit or near."""
+    if not rep or not (rep["hits"] or rep["near"]):
+        return []
+    out = [f"== CAPS (last {int(rep['window_hours'])}h) =="]
+    for status, items in (("HIT ", rep["hits"]), ("near", rep["near"][:10])):
+        for it in items:
+            d = crypto_caps.describe(it)
+            out.append(f"{status}  {d['bot']}: {d['cap']}: {d['value']}; {d['when']}")
+    out.append(crypto_caps.limits_text())
+    return out + [""]
+
+
+def caps_html(rep) -> list:
+    if not rep or not (rep["hits"] or rep["near"]):
+        return []
+    h = [f'<div style="font-size:15px;font-weight:600;margin:14px 0 4px">Caps '
+         f'<span style="color:#888;font-weight:400">(last {int(rep["window_hours"])}h)</span></div>',
+         '<table style="border-collapse:collapse;font-size:13px">',
+         f'<tr style="background:#f4f4f4"><th style="{TDL}"></th><th style="{TDL}">Bot</th>'
+         f'<th style="{TDL}">Cap</th><th style="{TDL}">Peak vs cap</th>'
+         f'<th style="{TDL}">When</th></tr>']
+    for status, items in (("HIT", rep["hits"]), ("near", rep["near"][:10])):
+        color = "#c0392b" if status == "HIT" else "#b9770e"
+        for it in items:
+            d = crypto_caps.describe(it)
+            h.append(f'<tr><td style="{TDL}color:{color};font-weight:700">{status}</td>'
+                     f'<td style="{TDL}">{html_escape(d["bot"])}</td>'
+                     f'<td style="{TDL}">{html_escape(d["cap"])}</td>'
+                     f'<td style="{TDL}">{html_escape(d["value"])}</td>'
+                     f'<td style="{TDL}">{html_escape(d["when"])}</td></tr>')
+    h.append('</table>')
+    h.append(f'<div style="color:#777;font-size:12px;margin:4px 0 10px">'
+             f'{html_escape(crypto_caps.limits_text())}</div>')
+    return h
 
 
 # incentive_mm.MARK_WIDE_SPREAD_CENTS, off the bot's own knob: a two-sided
@@ -1018,6 +1079,12 @@ def build_digest(now_utc: datetime):
         bal_str = "?"
     warnings = cash_warnings(shards, active_cash_guards(
         (STATUS_DIR, WEEKLY_STATUS_DIR, ANNUAL_STATUS_DIR)))
+    try:
+        caps = crypto_caps.cap_report(now_utc)
+    except Exception as e:
+        log(f"! cap check failed: {e!r}")
+        caps = None
+    warnings += cap_warnings(caps)
 
     # Bottom table: all-time realized per tenor + the sections' current
     # unrealized. A failed sweep degrades to a note — never kills the digest.
@@ -1088,8 +1155,10 @@ def build_digest(now_utc: datetime):
                      f"fees {grand['fees']:,.2f})")
     lines.append(f"Net position {grand['net_pos']:+,.0f} contracts | "
                  f"$ exposure ${grand['exposure']:,.2f} | balance {bal_str}")
+    lines.append(crypto_caps.summary_text(caps))
     lines += [f"!! {w}" for w in warnings]
     lines.append("")
+    lines += caps_text(caps)
     lines += text_section("MONTHLY one-touch (KX*MAXMON/*MINMON)",
                           m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     lines.append("")
@@ -1140,9 +1209,14 @@ def build_digest(now_utc: datetime):
              f'net position <b>{grand["net_pos"]:+,.0f}</b> contracts &nbsp;&middot;&nbsp; '
              f'exposure <b>${grand["exposure"]:,.2f}</b> &nbsp;&middot;&nbsp; '
              f'balance <b>{bal_str}</b></div>')
+    caps_ok = caps is not None and not caps["hits"] and not caps["blind"]
+    h.append(f'<div style="margin:2px 0 4px;color:{"#0a7a2f" if caps_ok else "#c0392b"};'
+             f'font-weight:{400 if caps_ok else 700}">'
+             f'{html_escape(crypto_caps.summary_text(caps))}</div>')
     for w in warnings:
         h.append(f'<div style="color:#c0392b;font-weight:600;margin:6px 0">'
                  f'&#9888; {html_escape(w)}</div>')
+    h += caps_html(caps)
     h += html_section("Monthly one-touch (KX*MAXMON / *MINMON)",
                       m_rows, m_tot, m_quiet, m_failed, m_health, dd("monthly"))
     h += html_section("Weekly above/below (KX*D)",
