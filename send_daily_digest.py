@@ -13,6 +13,10 @@ position to the current market mid (a one-sided or 50c+ wide book: the
 last trade clamped to its touch, see yes_mark): YES value = pos x mid, NO
 value = |pos| x (1 - mid), minus Kalshi's cost basis (market_exposure).
 
+The all-time tables at the bottom sum settled history from Kalshi's
+settlements API, which keeps only ~66 days, plus Kalshi-Settlements-archive.csv
+for the crypto markets that have aged out of it (cumulative_family_realized).
+
 Scheduled daily shortly after the bots' 8:00 AM CT summary hour. Idempotent
 via a sent-marker; --test sends immediately and skips the marker.
 
@@ -21,6 +25,7 @@ falling back to HKCU\Environment (works under Task Scheduler's stripped env).
 """
 
 import argparse
+import csv
 import glob
 import json
 import os
@@ -204,9 +209,10 @@ WEEKLY_STATUS_DIR = os.environ.get(
 ANNUAL_STATUS_DIR = os.environ.get(
     "CAY_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\crypto-annual")
 
-# One {date: {fleet/monthly/weekly/daily/annual: P&L$}} entry per SENT digest
-# (written by main() next to the sent-marker, never by --test or ad-hoc
-# builds), so the next morning can show day-over-day deltas.
+# One {date: {fleet/monthly/weekly/daily/annual/cumulative/cum_archive: P&L$}}
+# entry per SENT digest (written by main() next to the sent-marker, never by
+# --test or ad-hoc builds), so the next morning can show day-over-day deltas;
+# cumulative_snap decides the two cumulative keys.
 PNL_HISTORY_PATH = os.path.join(STATUS_DIR, "digest_pnl_history.json")
 
 
@@ -409,10 +415,64 @@ def _settlement_pnl(s: dict) -> float:
 
 def _settle_dt(s: dict) -> datetime:
     try:
-        return datetime.fromisoformat(
+        dt = datetime.fromisoformat(
             (s.get("settled_time") or "").replace("Z", "+00:00"))
     except ValueError:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# Kalshi's settlements API serves only ~66 days (2026-10-08: earliest record
+# 2026-08-03T00:20Z). run_dashboards.ps1 merges every daily pull into this
+# append-only archive (merge_kalshi_archive.py, one row per ticker), so the
+# settled markets the API has dropped are still on disk here.
+SETTLEMENTS_ARCHIVE_PATH = os.environ.get(
+    "CMM_SETTLEMENTS_ARCHIVE",
+    r"C:\Users\jackd\Documents\KL\Kalshi-Settlements-archive.csv")
+
+
+def archive_settlements(path: str) -> dict:
+    """ticker -> (settled datetime, net P&L $) for every crypto-fleet market
+    in the settlements archive. Raises when the file is missing, unreadable,
+    or holds no settlement rows at all.
+
+    Rows are merge_kalshi_archive.py's format: Yes_/No_Contracts_Owned are
+    FLOORED counts, the *_Average_Price_In_Cents columns hold DOLLARS (2dp),
+    Result is yes/no, Original_Date is the settled time. P&L is
+    _settlement_pnl's payout - cost: the winning side's count minus
+    (yes_n * yes_avg + no_n * no_avg). NOT Profit_In_Dollars:
+    fetch_settlements_csv.py writes `revenue` (the gross payout) there,
+    while normalized website-export rows carry net profit. A row with any
+    other result (a void) is skipped: Profit_In_Dollars is its only payout
+    figure, and a refund nets to ~0 anyway.
+
+    The floored counts make this a little LOWER than the API's figure for
+    the same ticker: a fractional winning position loses its fraction. On
+    2026-10-08 the 1,176 crypto tickers in both sources summed $84.18 lower
+    here (-$91.41 from floored payouts, +$7.23 from the 2dp averages), so
+    the cumulative still drifts down by about that much as they age out of
+    the API over the next ~66 days, at most ~$15 for any one settle day."""
+    out = {}
+    n_rows = 0
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if r["type"] != "Settlement":
+                continue
+            n_rows += 1
+            ticker = r["Market_Ticker"] or ""
+            res = (r["Result"] or "").strip().lower()
+            if ticker in out or res not in ("yes", "no") \
+                    or _crypto_token_family(ticker) is None:
+                continue
+            yes_n = float(r["Yes_Contracts_Owned"] or 0)
+            no_n = float(r["No_Contracts_Owned"] or 0)
+            cost = (yes_n * float(r["Yes_Contracts_Average_Price_In_Cents"] or 0)
+                    + no_n * float(r["No_Contracts_Average_Price_In_Cents"] or 0))
+            out[ticker] = (_settle_dt({"settled_time": r["Original_Date"]}),
+                           (yes_n if res == "yes" else no_n) - cost)
+    if not n_rows:
+        raise ValueError(f"no settlement rows in {path}")
+    return out
 
 
 def _event_fully_settled(client, event_ticker: str) -> bool:
@@ -437,10 +497,11 @@ def recent_settlement_rows(client, recs: list, n: int = 20) -> list:
     events settle all strikes at one close, so any record there means the
     event is done; monthly/annual events are probed via _event_fully_settled.
     A row carries the WHOLE event's P&L (early touches included) dated by
-    its final settle — summed over the records still inside the settlements
-    API retention window (~66d), so a far-back early touch (annual events
-    especially) can age out of the sum. recs items are
-    (dt, family, label, event, pnl)."""
+    its final settle — summed over the API's records plus the archive's for
+    tickers that have aged out of the API's ~66 days
+    (cumulative_family_realized), so a far-back early touch (annual events
+    especially) stays in the sum unless the archive can't be read. recs
+    items are (dt, family, label, event, pnl)."""
     groups = {}
     for dt, fam, label, event, pnl in recs:
         g = groups.setdefault(event, [label, fam, dt, 0.0])
@@ -458,24 +519,35 @@ def recent_settlement_rows(client, recs: list, n: int = 20) -> list:
     return rows
 
 
-def cumulative_family_realized(client) -> tuple:
+def cumulative_family_realized(client, archive_path: str = None) -> tuple:
     """(family -> all-time realized $, settlement record tuples for
-    recent_settlement_rows, (asset, family6) -> all-time realized $) for the
-    crypto fleets — family6 keeps high/low separate for the by-token table.
+    recent_settlement_rows, (asset, family6) -> all-time realized $,
+    archive info) for the crypto fleets — family6 keeps high/low separate
+    for the by-token table; archive info is {"n", "pnl", "error"}: how many
+    aged-out tickers the archive filled in and their P&L, or why it could
+    not be read.
 
     Settled history comes from the settlements API — the positions endpoint
     AGES OUT settled records (verified 2026-08-14: zero July monthlies remain
-    there) while settlements reach back to account origin, the same source
-    the KXHIGH ground-truth recipe trusts — scored per record by
-    _settlement_pnl (see its docstring for why NOT `revenue`). Round-trip
-    realized on STILL-OPEN markets is added from unsettled positions. Round
-    trips on markets that later settled are the one blind spot (neither
-    source keeps them); these fleets are hold-to-settle-dominant, so the
-    miss is small — but this is a measured number with that stated edge,
-    not a model."""
+    there), and settlements are the source the KXHIGH ground-truth recipe
+    trusts — scored per record by _settlement_pnl (see its docstring for why
+    NOT `revenue`). But settlements age out too: the API now serves only
+    ~66 days (2026-10-08: earliest record 2026-08-03T00:20Z), so the July
+    monthly's 67 tickers (+566.27) silently left the 10/08 headline (-539.11
+    d/d while the open fleet rose +44.80). Crypto tickers the sweep no
+    longer returns are therefore filled in from the local archive
+    (SETTLEMENTS_ARCHIVE_PATH, scored by archive_settlements); a ticker in
+    both keeps its API record. A missing or unreadable archive leaves the
+    API window alone, as before, with the reason in info["error"].
+    Round-trip realized on STILL-OPEN markets is added from unsettled
+    positions. Round trips on markets that later settled are the one blind
+    spot (neither source keeps them); these fleets are hold-to-settle-
+    dominant, so the miss is small — but this is a measured number with
+    that stated edge, not a model."""
     fams = {}
     toks = {}
     recs = []
+    api_tickers = set()
 
     def _tally(ticker, pnl):
         hit = _crypto_token_family(ticker)
@@ -484,6 +556,14 @@ def cumulative_family_realized(client) -> tuple:
         fam = "monthly" if hit[1] in ("high", "low") else hit[1]
         fams[fam] = fams.get(fam, 0.0) + pnl
         toks[hit] = toks.get(hit, 0.0) + pnl
+        return fam
+
+    def _settled(ticker, dt, pnl):
+        fam = _tally(ticker, pnl)
+        if fam:
+            series = ticker.split("-", 1)[0]
+            recs.append((dt, fam, SERIES_LABEL.get(series, series),
+                         ticker.rsplit("-", 1)[0], pnl))
         return fam
 
     cursor = None
@@ -495,16 +575,23 @@ def cumulative_family_realized(client) -> tuple:
         batch = resp.get("settlements") or []
         for s in batch:
             ticker = s.get("ticker") or ""
-            pnl = _settlement_pnl(s)
-            fam = _tally(ticker, pnl)
-            if fam:
-                label = SERIES_LABEL.get(ticker.split("-", 1)[0],
-                                         ticker.split("-", 1)[0])
-                recs.append((_settle_dt(s), fam, label,
-                             ticker.rsplit("-", 1)[0], pnl))
+            api_tickers.add(ticker)
+            _settled(ticker, _settle_dt(s), _settlement_pnl(s))
         cursor = resp.get("cursor")
         if not cursor or not batch:
             break
+    arch = {"n": 0, "pnl": 0.0, "error": None}
+    try:
+        archived = archive_settlements(archive_path or SETTLEMENTS_ARCHIVE_PATH)
+    except Exception as e:
+        arch["error"] = f"{type(e).__name__}: {e}"
+        log(f"! settlements archive unreadable, cumulative = API window only: "
+            f"{arch['error']}")
+        archived = {}
+    for ticker, (dt, pnl) in archived.items():
+        if ticker not in api_tickers and _settled(ticker, dt, pnl):
+            arch["n"] += 1
+            arch["pnl"] += pnl
     cursor = None
     for _page in range(50):
         kw = {"limit": 200, "settlement_status": "unsettled"}
@@ -517,12 +604,37 @@ def cumulative_family_realized(client) -> tuple:
         cursor = resp.get("cursor")
         if not cursor or not batch:
             break
-    return fams, recs, toks
+    return fams, recs, toks, arch
 
 
-CUM_FOOTNOTE = ("realized = settled history + open-market round-trips, "
-                "account-level (manual fills on these series included); "
-                "unrealized = the sections above")
+CUM_FOOTNOTE = ("realized = settled history (Kalshi settlements API, ~66 days, "
+                "plus Kalshi-Settlements-archive.csv for markets older than that) "
+                "+ open-market round-trips, account-level (manual fills on these "
+                "series included); unrealized = the sections above")
+
+
+def archive_clause(arch) -> str:
+    """CUM_FOOTNOTE's live tail: what the archive filled in this morning, or
+    that it could not be read ('' when the sweep itself failed)."""
+    if not arch:
+        return ""
+    if arch["error"]:
+        return "; archive UNREADABLE this morning: settled history = the API window only"
+    return (f"; the archive filled in {arch['n']} aged-out market"
+            f"{'s' if arch['n'] != 1 else ''}, {arch['pnl']:+,.2f}")
+
+
+def cumulative_snap(cum_total, arch) -> dict:
+    """The headline's history keys (Jack 9/5), {} when there is nothing
+    comparable to record. A morning the archive can't be read totals only
+    the API's ~66 days: recorded, both its d/d and the next morning's
+    (against it) would swing by every aged-out dollar, so that morning
+    shows the total with a warning, no d/d, and keeps it out of the
+    history. cum_archive is the archive's share of the total."""
+    if cum_total is None or not arch or arch["error"]:
+        return {}
+    return {"cumulative": cum_total, "cum_archive": arch["pnl"]}
+
 
 # ---- cumulative P&L by TOKEN (Jack 2026-08-22) ----------------------------
 TOKEN_FAMS = ("daily", "weekly", "annual", "high", "low")   # disjoint P&L
@@ -626,7 +738,7 @@ def _token_order(cum_tok, unreal_tok):
     return [a for a, _tot, _cells in _token_matrix(cum_tok, unreal_tok)]
 
 
-def cumulative_text(cum, unreal_by, cum_tok, unreal_tok) -> list:
+def cumulative_text(cum, unreal_by, cum_tok, unreal_tok, arch=None) -> list:
     tokens = _token_order(cum_tok, unreal_tok)
     lines = ["== CUMULATIVE P&L by tenor (all-time) ==",
              f"{'TENOR':9s} {'REAL$':>9s} {'UNREAL$':>9s} {'TOTAL$':>9s} "
@@ -648,12 +760,12 @@ def cumulative_text(cum, unreal_by, cum_tok, unreal_tok) -> list:
     lines.append(f"{'TOTAL':9s} {tot_r:>+9.2f} {tot_u:>+9.2f} "
                  f"{tot_r + tot_u:>+9.2f} "
                  + " ".join(f"{col_tot[t]:>+8.2f}" for t in tokens))
-    lines.append(f"({CUM_FOOTNOTE}; token columns = that token's "
-                 f"realized+unrealized on the row's tenor)")
+    lines.append(f"({CUM_FOOTNOTE}{archive_clause(arch)}; token columns = "
+                 f"that token's realized+unrealized on the row's tenor)")
     return lines
 
 
-def cumulative_html(cum, unreal_by, cum_tok, unreal_tok) -> list:
+def cumulative_html(cum, unreal_by, cum_tok, unreal_tok, arch=None) -> list:
     tokens = _token_order(cum_tok, unreal_tok)
     h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">'
          'Cumulative P&amp;L by tenor (all-time)</div>',
@@ -687,8 +799,9 @@ def cumulative_html(cum, unreal_by, cum_tok, unreal_tok) -> list:
                        for t in tokens) + '</tr>')
     h.append('</table>')
     h.append(f'<div style="color:#888;font-size:12px;margin-top:6px">'
-             f'{CUM_FOOTNOTE}; token columns = that token&#39;s '
-             f'realized+unrealized on the row&#39;s tenor</div>')
+             f'{CUM_FOOTNOTE}{html_escape(archive_clause(arch))}; token '
+             f'columns = that token&#39;s realized+unrealized on the row&#39;s '
+             f'tenor</div>')
     return h
 
 
@@ -909,11 +1022,15 @@ def build_digest(now_utc: datetime):
     # Bottom table: all-time realized per tenor + the sections' current
     # unrealized. A failed sweep degrades to a note — never kills the digest.
     try:
-        cum, settle_recs, cum_tok = cumulative_family_realized(client)
+        cum, settle_recs, cum_tok, arch = cumulative_family_realized(client)
         recent = recent_settlement_rows(client, settle_recs)
     except Exception as e:
         log(f"! cumulative-by-tenor sweep failed: {e}")
-        cum, recent, cum_tok = None, [], {}
+        cum, recent, cum_tok, arch = None, [], {}, None
+    if arch and arch["error"]:
+        warnings.append(f"Settlements archive unreadable ({arch['error']}): the "
+                        f"cumulative P&L counts only the ~66 days Kalshi's "
+                        f"settlements API still serves, so it has no d/d today")
     unreal_by = {"daily": d_tot["unrealized"], "weekly": w_tot["unrealized"],
                  "monthly": m_tot["unrealized"], "annual": a_tot["unrealized"]}
     # per-(token, family) unrealized for the by-token table: monthly labels
@@ -940,8 +1057,7 @@ def build_digest(now_utc: datetime):
             "weekly": w_tot["realized"] + w_tot["unrealized"],
             "daily": d_tot["realized"] + d_tot["unrealized"],
             "annual": a_tot["realized"] + a_tot["unrealized"]}
-    if cum_total is not None:
-        snap["cumulative"] = cum_total
+    snap.update(cumulative_snap(cum_total, arch))
     dd_label, deltas = pnl_deltas(today_ct, snap)
 
     def dd(key):
@@ -987,7 +1103,7 @@ def build_digest(now_utc: datetime):
                           a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     lines.append("")
     if cum is not None:
-        lines += cumulative_text(cum, unreal_by, cum_tok, unreal_tok)
+        lines += cumulative_text(cum, unreal_by, cum_tok, unreal_tok, arch)
         lines.append("")
         lines += cumulative_token_text(cum_tok, unreal_tok)
     else:
@@ -1036,7 +1152,7 @@ def build_digest(now_utc: datetime):
     h += html_section("Annual touch+terminal (KX*MAXY / *MINY / *Y)",
                       a_rows, a_tot, a_quiet, a_failed, a_health, dd("annual"))
     if cum is not None:
-        h += cumulative_html(cum, unreal_by, cum_tok, unreal_tok)
+        h += cumulative_html(cum, unreal_by, cum_tok, unreal_tok, arch)
         h += cumulative_token_html(cum_tok, unreal_tok)
     else:
         h.append('<div style="color:#c0392b;margin-top:8px">cumulative '

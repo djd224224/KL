@@ -5,10 +5,21 @@ market_mids took (bid + ask) / 2 whenever both read above 0, so a stray bid
 under no offer marked half way to $1. It now marks the way the IMM's
 incentive_mm.bulk_mark_cents does, through a local yes_mark.
 
+And the all-time cumulative (2026-10-08): Kalshi's settlements API keeps
+only ~66 days, so the July monthly's 67 tickers (+$566.27) silently left the
+headline. Crypto tickers the API no longer returns now come from
+Kalshi-Settlements-archive.csv.
+
 send_daily_digest is imported inside setUp: importing it copies the alert
 credentials into os.environ and imports crypto_touch_mm, and a module-level
 import would do that during discovery, ahead of other test modules."""
+import csv
+import os
+import tempfile
 import unittest
+from datetime import date, datetime, timezone
+
+from merge_kalshi_archive import CSV_COLUMNS
 
 EV = "KXBTCD-26OCT0217"
 
@@ -87,6 +98,145 @@ class MarketMidsTests(_DigestTest):
         out = self.dd.event_pnl(client, EV)
         self.assertAlmostEqual(out["unrealized"], 3.70)
         self.assertEqual((out["net_pos"], out["realized"], out["ok"]), (10.0, 1.5, True))
+
+
+JUL_MAX = "KXBTCMAXMON-BTC-26JUL31-6500000"     # aged out of the API on 10/08
+AUG_MAX = "KXBTCMAXMON-BTC-26AUG31-8000000"     # still in it
+WEEKLY = "KXBTCD-26OCT0217-T118000"              # a Friday 5pm close
+
+
+def _arow(ticker, settled, result, yes_n, yes_avg, no_n, no_avg, profit):
+    """One Kalshi-Settlements-archive.csv row in merge_kalshi_archive's
+    format: floored counts, the *_In_Cents averages in dollars, and
+    Profit_In_Dollars = fetch_settlements_csv's gross `revenue`."""
+    row = dict.fromkeys(CSV_COLUMNS, "")
+    row.update({"type": "Settlement", "Original_Date": settled, "Market_Ticker": ticker,
+                "Yes_Contracts_Owned": str(yes_n), "Yes_Contracts_Average_Price_In_Cents": yes_avg,
+                "No_Contracts_Owned": str(no_n), "No_Contracts_Average_Price_In_Cents": no_avg,
+                "Result": result, "Profit_In_Dollars": profit})
+    return row
+
+
+def _api(ticker, settled, result, yes_n, yes_cost, no_n="0", no_cost="0"):
+    """One GET /portfolio/settlements record."""
+    return {"ticker": ticker, "settled_time": settled, "market_result": result,
+            "yes_count_fp": yes_n, "yes_total_cost_dollars": yes_cost,
+            "no_count_fp": no_n, "no_total_cost_dollars": no_cost}
+
+
+class _SweepClient:
+    """One page each of the two sweeps cumulative_family_realized makes, and
+    a fully settled answer to recent_settlement_rows' get_event probe."""
+
+    def __init__(self, settlements, unsettled=()):
+        self.settlements, self.unsettled = list(settlements), list(unsettled)
+
+    def get_portfolio_settlements(self, limit=None, cursor=None):
+        return {"settlements": self.settlements}
+
+    def get_positions(self, limit=None, settlement_status=None, cursor=None):
+        return {"market_positions": self.unsettled}
+
+    def get_event(self, event_ticker):
+        return {"markets": [{"result": "yes"}, {"result": "no"}]}
+
+
+class ArchiveTests(_DigestTest):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, "Kalshi-Settlements-archive.csv")
+
+    def _write(self, rows):
+        with open(self.path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, quoting=csv.QUOTE_ALL,
+                               lineterminator="\n")
+            w.writeheader()
+            w.writerows(rows)
+
+    def test_archive_pnl_is_payout_minus_cost_not_the_profit_column(self):
+        self._write([
+            # the real row: 127 YES @ $0.78 + 24 NO @ $0.31, touched: +20.50
+            # (Profit_In_Dollars is the 127.00 gross payout)
+            _arow(JUL_MAX, "2026-07-15T07:10:40.838Z", "yes", 127, "0.78", 24, "0.31", "127.00"),
+            _arow("KXETHMAXMON-ETH-26JUL31-400000", "2026-08-01T15:10:10.943Z", "no",
+                  10, "0.20", 30, "0.70", "30.00"),                  # 30 - 2.00 - 21.00
+            _arow("KXHIGHNY-26JUL20-B85.5", "2026-07-21T04:00:00Z", "yes",
+                  50, "0.40", 0, "0.00", "50.00"),                   # not a fleet market
+            _arow("KXBTCMINMON-BTC-26JUL31-5000000", "2026-08-01T15:10:20Z", "void",
+                  5, "0.50", 0, "0.00", "2.50"),                     # no yes/no payout
+        ])
+        got = self.dd.archive_settlements(self.path)
+        self.assertEqual(sorted(got), ["KXBTCMAXMON-BTC-26JUL31-6500000",
+                                       "KXETHMAXMON-ETH-26JUL31-400000"])
+        self.assertEqual(got[JUL_MAX][0],
+                         datetime(2026, 7, 15, 7, 10, 40, 838000, tzinfo=timezone.utc))
+        self.assertAlmostEqual(got[JUL_MAX][1], 20.50)
+        self.assertAlmostEqual(got["KXETHMAXMON-ETH-26JUL31-400000"][1], 7.00)
+
+    def test_aged_out_crypto_tickers_are_filled_in_from_the_archive(self):
+        self._write([
+            _arow(JUL_MAX, "2026-07-15T07:10:40.838Z", "yes", 127, "0.78", 24, "0.31", "127.00"),
+            _arow(AUG_MAX, "2026-09-01T04:00:10Z", "no", 100, "0.40", 0, "0.00", "0.00"),
+            _arow("KXHIGHNY-26JUL20-B85.5", "2026-07-21T04:00:00Z", "yes",
+                  50, "0.40", 0, "0.00", "50.00"),
+        ])
+        client = _SweepClient(
+            # AUG_MAX is in both: the API's -40.20 (100.5 YES) beats the archive's
+            # floored -40.00
+            [_api(AUG_MAX, "2026-09-01T04:00:10Z", "no", "100.50", "40.20"),
+             _api(WEEKLY, "2026-10-02T21:00:05Z", "yes", "10", "6.00")],
+            [{"ticker": "KXBTCMAXMON-BTC-26OCT31-9000000", "realized_pnl_dollars": "1.25"}])
+        fams, recs, toks, arch = self.dd.cumulative_family_realized(client, self.path)
+        self.assertAlmostEqual(fams["monthly"], 20.50 - 40.20 + 1.25)
+        self.assertAlmostEqual(fams["weekly"], 4.00)
+        self.assertAlmostEqual(toks[("BTC", "high")], 20.50 - 40.20 + 1.25)
+        self.assertEqual((arch["n"], round(arch["pnl"], 2), arch["error"]), (1, 20.50, None))
+        self.assertEqual(sorted((d.date(), f, label, ev, round(p, 2)) for d, f, label, ev, p in recs),
+                         [(date(2026, 7, 15), "monthly", "BTC-MAX", "KXBTCMAXMON-BTC-26JUL31", 20.50),
+                          (date(2026, 9, 1), "monthly", "BTC-MAX", "KXBTCMAXMON-BTC-26AUG31", -40.20),
+                          (date(2026, 10, 2), "weekly", "BTC", "KXBTCD-26OCT0217", 4.00)])
+
+    def test_recent_rows_sum_an_event_across_the_api_and_the_archive(self):
+        # HYPE-MIN July: its 7/31 early touch has aged out, the 8/1 settle hasn't
+        self._write([_arow("KXHYPEMINMON-HYPE-26JUL31-5250", "2026-07-31T20:20:51.035Z", "yes",
+                           114, "0.39", 0, "0.00", "114.00")])           # +69.54
+        client = _SweepClient([_api("KXHYPEMINMON-HYPE-26JUL31-5000",
+                                    "2026-08-01T15:10:20.951Z", "no", "20", "4.00")])
+        _fams, recs, _toks, _arch = self.dd.cumulative_family_realized(client, self.path)
+        rows = self.dd.recent_settlement_rows(client, recs)
+        self.assertEqual([(label, fam, day, round(pnl, 2)) for label, fam, day, pnl in rows],
+                         [("HYPE-MIN", "monthly", date(2026, 8, 1), 65.54)])
+
+    def test_a_missing_or_unreadable_archive_leaves_the_api_window_and_says_so(self):
+        client = _SweepClient([_api(AUG_MAX, "2026-09-01T04:00:10Z", "no", "100.50", "40.20"),
+                               _api(WEEKLY, "2026-10-02T21:00:05Z", "yes", "10", "6.00")])
+        fams, _recs, _toks, arch = self.dd.cumulative_family_realized(
+            client, os.path.join(os.path.dirname(self.path), "missing.csv"))
+        self.assertEqual({k: round(v, 2) for k, v in fams.items()},
+                         {"monthly": -40.20, "weekly": 4.00})
+        self.assertEqual(arch["n"], 0)
+        self.assertIn("FileNotFoundError", arch["error"])
+        for content in ("",                                               # empty
+                        '"type","Market_Id"\n"Settlement","x"\n'):        # not the archive's columns
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(content)
+            got, _recs, _toks, arch = self.dd.cumulative_family_realized(client, self.path)
+            self.assertEqual(got, fams, content)
+            self.assertTrue(arch["error"], content)
+
+    def test_an_api_only_total_gets_a_note_and_stays_out_of_the_history(self):
+        ok = {"n": 67, "pnl": 566.27, "error": None}
+        bad = {"n": 0, "pnl": 0.0, "error": "FileNotFoundError: no such file"}
+        self.assertEqual(self.dd.cumulative_snap(-1202.17, ok),
+                         {"cumulative": -1202.17, "cum_archive": 566.27})
+        self.assertEqual(self.dd.cumulative_snap(-1768.44, bad), {})     # no d/d, not recorded
+        self.assertEqual(self.dd.cumulative_snap(None, None), {})        # the sweep failed
+        self.assertEqual(self.dd.archive_clause(ok),
+                         "; the archive filled in 67 aged-out markets, +566.27")
+        self.assertIn("UNREADABLE", self.dd.archive_clause(bad))
+        self.assertEqual(self.dd.archive_clause(None), "")
 
 
 if __name__ == "__main__":
