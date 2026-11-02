@@ -278,6 +278,39 @@ class DashboardWindowsTests(_DigestTest):
                      "_calibration_caveat_text", "_calibration_caveat_html"):
             stubs[stub].assert_not_called()
 
+    def test_the_7am_run_keeps_the_days_risk_counts_and_a_blind_day_none(self):
+        # Jack 2026-11-01: "Add vs-usual too" -- the usual is the median of
+        # the days the 7:00 runs kept
+        from unittest import mock
+        sd = self.sd
+        now = datetime.fromtimestamp(self.now, timezone.utc)
+        seen = sd.risk._empty_evidence(self.now - 86400, self.now)
+        seen["lines"] = 1
+        stubs = {"build_client": mock.Mock(return_value=object()),
+                 "load_dashboard_summary": mock.Mock(return_value=self.summary),
+                 "load_json": mock.Mock(return_value={}),
+                 "current_mids": mock.Mock(return_value=({}, {})),
+                 "event_rows": mock.Mock(return_value=([], {}, {})),
+                 "capacity_note": mock.Mock(return_value=""),
+                 "cutoff_audit": mock.Mock(return_value={}),
+                 "cutoff_banner": mock.Mock(return_value=""),
+                 "health_line": mock.Mock(return_value="")}
+        pick = {"kalshi": {}, "rows": []}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hist.json")
+            for ev, record, kept in ((seen, False, False), (dict(seen, lines=0), True, False),
+                                     (seen, True, True)):
+                with mock.patch.multiple(sd, **stubs), \
+                        mock.patch.object(sd, "RISK_HISTORY_PATH", path), \
+                        mock.patch.object(sd, "risk_section", return_value=(ev, [])), \
+                        mock.patch.object(sd.imm_pickoff, "scan", return_value=pick), \
+                        mock.patch.object(sd.imm_pickoff, "text_lines", return_value=[]), \
+                        mock.patch.object(sd.imm_pickoff, "html_block", return_value=""), \
+                        mock.patch.object(sd.imm_pickoff, "error_text", return_value=""):
+                    sd.build_digest(now, record_risk=record)
+                day = now.astimezone(sd.ET).date().isoformat()
+                self.assertEqual(day in sd.risk.load_history(path), kept)
+
     def test_the_foot_speaks_only_when_the_bot_is_in_trouble(self):
         # Jack 2026-10-25: "Cut out" the all-clear line and its reward-ledger
         # reminder; a down or halted bot still says so
@@ -312,11 +345,14 @@ class SectionTests(_DigestTest):
         body = ">> " + self.sd.imm_pickoff.HEADER + ": KXFOO\nrest"
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(self.sd, "build_digest",
-                                  return_value=(body, "<div>x</div>", "RISK", "<div>r</div>")):
+                                  return_value=(body, "<div>x</div>", "RISK",
+                                                "<div>r</div>")) as bd:
             p = os.path.join(d, "s.json")
             self.assertEqual(self.sd.main(["--section-out", p]), 0)
             with open(p, encoding="utf-8") as f:
                 sec = json.load(f)
+        # the 7:00 run keeps the day's risk counts for the block's "usual"
+        self.assertIs(bd.call_args.kwargs.get("record_risk"), True)
         self.assertEqual((sec["text"], sec["html"]), (body, "<div>x</div>"))
         # the risk block travels on its own, for the portfolio email's chart
         self.assertEqual((sec["risk_text"], sec["risk_html"]), ("RISK", "<div>r</div>"))

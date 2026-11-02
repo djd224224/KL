@@ -397,7 +397,10 @@ def risk_context(client, state, status, resting):
             imm.ensure_family_override(series)
         except Exception:                                   # noqa: BLE001
             pass
-        positions.append((t, p, imm.series_max_position(series)))
+        # with the Saturday cap beside today's: a position built on a
+        # Saturday may hold up to it (imm_risk_controls.position_rows)
+        positions.append((t, p, imm.series_max_position(series),
+                          imm.series_max_position(series, peak=True)))
         ev = _event_of(t)
         by_ev[ev] = by_ev.get(ev, 0.0) + p
     events = [(ev, n, imm.event_cap_contracts(ev)) for ev, n in by_ev.items()]
@@ -427,6 +430,9 @@ def risk_context(client, state, status, resting):
         "resting_orders": resting.get("orders") if resting else None,
         "resting_notional": resting.get("collateral") if resting else None,
         "positions": positions, "events": events}}
+
+
+RISK_HISTORY_PATH = os.path.join(STATUS_DIR, risk.HISTORY_FILE)
 
 
 def risk_section(client, state, status, resting, now_utc):
@@ -1469,13 +1475,14 @@ def lifetime_raw(state: dict, mids: dict):
     return life_realized + life_unreal, life_realized, life_unreal
 
 
-def build_digest(now_utc: datetime):
+def build_digest(now_utc: datetime, record_risk: bool = False):
     """Returns (plain_text, html, risk_text, risk_html): the IMM section of
     the 7:00 portfolio email (send_portfolio_digest runs this script with
     --section-out; the IMM's own 7:10 email was cut 2026-10-02), and its
     risk-controls block on its own, which the portfolio email places under
     its chart. Yesterday, 7 days and the daily table are the dashboard's own
-    figures (dashboard_windows); lifetime is the bot's."""
+    figures (dashboard_windows); lifetime is the bot's. record_risk (the
+    7:00 run) keeps the day's risk counts for the block's "usual"."""
     today_et = now_utc.astimezone(ET).date()
     client = build_client()
     status = load_json(STATUS_PATH)
@@ -1582,7 +1589,12 @@ def build_digest(now_utc: datetime):
     # portfolio email places it under its balance chart. The finecon /
     # open-scan tracker that used to close this section is gone (same day:
     # "remove open scan and finecon tables and sections").
-    risk_text = "\n".join(risk.text_lines(risk_rows, risk_ev, ET, capacity_note()))
+    # each guard against its usual: the median of the 7 days before, kept by
+    # the 7:00 runs (Jack 2026-11-01: "Add vs-usual too")
+    risk_day = today_et.isoformat()
+    risk_usual = risk.usual(RISK_HISTORY_PATH, risk_day)
+    risk_text = "\n".join(risk.text_lines(risk_rows, risk_ev, ET, capacity_note(),
+                                          risk_usual))
 
     # ---- html ---------------------------------------------------------------
     h = ['<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;'
@@ -1660,7 +1672,14 @@ def build_digest(now_utc: datetime):
         h.append('<div style="color:#c0392b;font-size:12px;font-weight:600;margin-top:12px;'
                  'border-top:1px solid #eee;padding-top:8px">{}</div>'.format(health))
     h.append("</div>")
-    risk_html = risk.html(risk_rows, risk_ev, ET, capacity_note(), TD, TDL)
+    risk_html = risk.html(risk_rows, risk_ev, ET, capacity_note(), TD, TDL, risk_usual)
+    # a blind window (no bot log lines) is no day to learn the usual from
+    if record_risk and risk_ev["lines"]:
+        try:
+            risk.record(RISK_HISTORY_PATH, risk_day, risk.metrics(risk_rows),
+                        now_utc.timestamp())
+        except OSError as e:
+            log(f"risk controls: history not written ({e!r})")
     return text, "".join(h), risk_text, risk_html
 
 
@@ -1678,7 +1697,7 @@ def write_section(path: str, now_utc: datetime) -> None:
     fail on the first try."""
     for attempt in range(1, 4):
         try:
-            text, html, risk_text, risk_html = build_digest(now_utc)
+            text, html, risk_text, risk_html = build_digest(now_utc, record_risk=True)
             break
         except Exception as e:
             log(f"imm section build attempt {attempt}/3 failed: {e!r}")

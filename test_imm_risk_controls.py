@@ -190,7 +190,7 @@ class VerdictTests(unittest.TestCase):
         now["positions"].append(("KXTEMPAUSH-26AUG0409-T79.99", -70.0, 50.0))
         pm = _by(rc.build_rows(_ev(), _ctx(**now)))["Per-market position cap"]
         self.assertEqual(pm["status"], "BINDING")
-        self.assertIn("1 OVER it", pm["impact"])
+        self.assertIn("1 over any cap", pm["impact"])
         self.assertIn("KXTEMPAUSH", pm["impact"])
 
     def test_a_cap_that_bound_only_hours_ago_is_not_binding_now(self):
@@ -220,8 +220,8 @@ class VerdictTests(unittest.TestCase):
                        "$2,808 of $2,000 halt) | P&L today $-820.04 of -$2,000 halt | open-scan "
                        "$-29.43 of -$200 budget")]
         rows = _by(rc.build_rows(_ev(lines), _ctx(pnl_today=-14.23, scan_pnl=-1.0)))
-        self.assertEqual(rows["Daily loss halt"]["now"], "-820")
-        self.assertEqual(rows["Open-scan tier loss budget"]["now"], "-29")
+        self.assertEqual(rows["Daily loss halt"]["now"], "-$820")
+        self.assertEqual(rows["Open-scan tier loss budget"]["now"], "-$29")
         # never below the anchor reads as such, not "down $0"
         self.assertEqual(rows["Account-value guard (balance guard)"]["worst"],
                          "never below the anchor")
@@ -243,9 +243,12 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("1 side + 0 event halts", tx["impact"])        # the old one is outside
         self.assertIn("~$1", tx["impact"])                            # 48/day x 30 min
         self.assertEqual(rows["Fair-value & data gates"]["status"], "FIRED")
-        self.assertEqual(rows["Release blackouts (CPI, AAA)"]["status"], "FIRED")
-        self.assertEqual(rows["Circuit breakers (mid move / fill burst / one-sided)"]["status"],
-                         "OFF")
+        self.assertEqual(rows["Release pauses (CPI, AAA, Treasury, state stats)"]["status"],
+                         "FIRED")
+        # IMM_BREAKERS=0 turns the global breakers off; the mid-move breaker
+        # on rain and temperatures still runs, and reads under its own row
+        self.assertEqual(rows["Global breakers (IMM_BREAKERS)"]["status"], "OFF")
+        self.assertEqual(rows["Breakers & series halts"]["status"], "QUIET")
         self.assertEqual(rows["Watchdog & coverage alerts"]["status"], "QUIET")
 
     def test_rows_sort_worst_first_with_the_guards_after(self):
@@ -257,20 +260,216 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
 
     def test_renders_text_and_html(self):
-        rows = rc.build_rows(_ev(CASH_TRIP), _ctx())
-        text = "\n".join(rc.text_lines(rows, _ev(CASH_TRIP), timezone.utc, "caps ok"))
-        self.assertIn("!!TRIPPED Account-value guard (balance guard)", text)
-        self.assertIn("SLACK   Daily loss halt", text)
-        html = rc.html(rows, _ev(CASH_TRIP), timezone.utc, "caps ok", "td", "tdl")
+        ev = _ev(CASH_TRIP)
+        rows = rc.build_rows(ev, _ctx())
+        text = "\n".join(rc.text_lines(rows, ev, timezone.utc, "caps ok"))
+        self.assertIn("TRIPPED: Account-value guard (balance guard).", text)
+        self.assertIn("!! TRIPPED Account-value guard (balance guard): ", text)
+        self.assertIn("Kill switches (each stops all quoting)", text)
+        self.assertRegex(text, r"\n  !!Account value +\$2,000 drop/day")
+        self.assertIn("Guards (normal work", text)
+        self.assertNotIn("caps ok", text)          # the caps note speaks only when wrong
+        html = rc.html(rows, ev, timezone.utc, "caps ok", "td", "tdl")
         self.assertIn("TRIPPED in the last 24h", html)
-        self.assertNotIn("—", html)                # entities only in the email html
-        self.assertIn("Per-market guards", html)
+        self.assertEqual(html, html.encode("ascii").decode("ascii"))   # entities only
+        self.assertIn("Kill switch", html)
+        loud = "!! caps do NOT match the launcher"
+        self.assertIn(loud, "\n".join(rc.text_lines(rows, ev, timezone.utc, loud)))
+        self.assertIn(loud, rc.html(rows, ev, timezone.utc, loud, "td", "tdl"))
 
     def test_an_empty_window_says_it_is_blind(self):
         ev = _ev()
         self.assertIn("blind", rc.window_note(ev, timezone.utc))
         rows = rc.build_rows(ev, _ctx())
         self.assertTrue(rows)                            # still one row per control
+
+
+def _guard(name, ticker, ts="2026-10-03T08:00:00.000+00:00"):
+    return {"kind": "enter", "ts": ts, "guard": name, "ticker": ticker}
+
+
+class ClearerBlockTests(unittest.TestCase):
+    """Jack 2026-11-01, on making the block clearer: "Add vs-usual too".
+    The two rows that had read BINDING on 15 emails running were the
+    per-event strike cap (selection, by design) and the position cap (most
+    of it Saturday's 200 cap read against Sunday's 150, plus an order-size
+    alarm filed under it)."""
+
+    def test_the_strike_cap_and_cutoffs_read_by_design(self):
+        ev = _ev([_line("2026-10-03 10:10:00", UNIVERSE.replace("{budget}", "0"))])
+        by = rc._blocks(rc.build_rows(ev, _ctx()))
+        design = [r["name"] for r in by["design"]]
+        self.assertEqual(design, ["Slot caps (strikes per event, scan, finecon)",
+                                  "Trade cutoffs & closing"])
+        text = "\n".join(rc.text_lines(rc.build_rows(ev, _ctx()), ev, timezone.utc, ""))
+        self.assertIn("By design: the per-event strike cap left 28 strikes unquoted", text)
+        self.assertIn("996 markets past their cutoff", text)
+        self.assertIn("Nothing tripped.", text)
+        self.assertNotIn("strike cap", rc.held_line(rc.build_rows(ev, _ctx())))
+
+    def test_saturday_positions_only_sell_down_and_a_real_breach_is_named(self):
+        now = {"positions": [("KXRAINWKND-26OCT31-SGF", -200.0, 150.0, 200.0),
+                             ("KXLOL-WORLDS26-T1", -258.0, 150.0, 200.0),
+                             ("KXANFCC-26OCT07-T98", 40.0, 150.0, 200.0)]}
+        pm = _by(rc.build_rows(_ev(), _ctx(**now)))["Per-market position cap"]
+        self.assertEqual(pm["status"], "BINDING")
+        self.assertIn("2 markets full on one side", pm["impact"])
+        self.assertIn("1 of them above today's cap but inside Saturday's, so they only "
+                      "sell down", pm["impact"])
+        self.assertIn("1 over any cap: KXLOL-WORLDS26-T1 -258/200", pm["impact"])
+        self.assertNotIn("SGF", pm["impact"])
+        self.assertEqual(pm["metric"], {"pos_full": 2, "pos_sat": 1, "pos_over": 1})
+
+    def test_a_complement_lock_is_named_not_left_as_a_breach(self):
+        """11/01: the KXTRUTHSOCIAL-26NOV07 lock sold 115 on each bracket, -871
+        net against its 100 event cap."""
+        ev = _ev()
+        rc.scan_locks([{"ts": "2026-10-03T07:49:29+00:00", "kind": "open", "lock": "me_ask",
+                        "ticker": "KXTS-26NOV07-T360", "legs": ["KXTS-26NOV07-B289",
+                                                               "KXTS-26NOV07-B309",
+                                                               "KXTS-26NOV07-B149"]},
+                       {"ts": "2026-10-03T07:50:00+00:00", "kind": "leg_fill",
+                        "ticker": "KXTS-26NOV07-B289"}], ev)
+        now = {"positions": [("KXTS-26NOV07-T360", -115.0, 100.0, 100.0),
+                             ("KXTS-26NOV07-B289", -115.0, 100.0, 100.0),
+                             ("KXTS-26NOV07-B309", -100.0, 100.0, 100.0)],
+               "events": [("KXTS-26NOV07", -330.0, 100.0)]}
+        rows = _by(rc.build_rows(ev, _ctx(**now), timezone.utc))
+        e = rows["Per-event net cap"]
+        self.assertEqual(e["status"], "BINDING")
+        self.assertIn("at or over the cap", e["impact"])
+        self.assertIn("a complement lock since Sat 07:49 (2 of 3 legs held), so the net "
+                      "overstates it (only one bracket can pay)", e["impact"])
+        self.assertIn("event caps (1 full, all locks)", rc.held_line(list(rows.values())))
+        self.assertIn("KXTS-26NOV07-T360 -115/100 (lock)",
+                      rows["Per-market position cap"]["impact"])
+
+    def test_the_order_size_check_counts_market_sides_not_alert_lines(self):
+        lines = [_line(f"2026-10-03 10:{m:02d}:00", "ALERT [side_cap] KXRAINELECTION-03NOV26-PNS "
+                       "ask: blocked at 129/131.0") for m in range(50)]
+        lines += [_line("2026-10-03 10:51:00", "ALERT [level_cap] KXHIGHNY-26OCT04-T70 bid@55c: "
+                        "blocked at 30/20"),
+                  _line("2026-10-03 10:52:00", "ALERT [side_cap] KXRAINELECTION-03NOV26-SJC bid: "
+                        "blocked at 180/50.51")]
+        now = {"positions": [("KXANFCC-26OCT07-T98", 40.0, 150.0)]}
+        rows = _by(rc.build_rows(_ev(lines), _ctx(**now)))
+        o = rows["Order-size check (side / level backstop)"]
+        self.assertEqual(o["status"], "BINDING")
+        self.assertIn("refused 52 orders on 3 market sides: KXRAINELECTION-03NOV26-PNS ask "
+                      "(50)", o["impact"])
+        self.assertEqual(rc.block_of(o), "held")
+        # no longer filed under, or flipping, the position cap
+        self.assertEqual(rows["Per-market position cap"]["status"], "SLACK")
+        self.assertNotIn("side_cap", rows["Per-market position cap"]["impact"])
+        quiet = _by(rc.build_rows(_ev(), _ctx()))["Order-size check (side / level backstop)"]
+        self.assertEqual(rc.block_of(quiet), "room")
+
+    def test_sweep_breaker_trips_are_counted(self):
+        lines = [_line("2026-10-03 04:18:24", "sweep breaker (on): KXLOLQ-26SF-GEN ASK @ 92c "
+                       "filled out (203) -> pulling 14 order(s) in KXLOLQ-26SF for 120s"),
+                 _line("2026-10-03 04:21:15", "sweep breaker (on): KXNHMAPLE-27JUN30-T170000 BID "
+                       "@ 14c filled out (135) -> pulling 5 order(s) in KXNHMAPLE-27JUN30 + "
+                       "linked KXA/KXB (KXB-1) for 600s"),
+                 _line("2026-10-03 04:36:15", "sweep breaker (exempt): KXTRUMPMENTION-26NOV01-CANA "
+                       "ASK @ 87c filled out (11) -> mention series, nothing pulled")]
+        sw = _by(rc.build_rows(_ev(lines), _ctx()))["Sweep breaker"]
+        self.assertEqual(sw["status"], "FIRED")
+        self.assertEqual(sw["impact"], "2 trips on 2 events, 19 orders pulled")
+        self.assertEqual(sw["metric"], {"sweeps": 2})
+
+    def test_guards_read_in_plain_words_and_a_new_guard_by_its_own_name(self):
+        guards = [_guard("ytw_fair", "KXYTVIEWSW-A"), _guard("vercel_fair", "KXANTH-1"),
+                  _guard("vercel_fair", "KXANTH-2"), _guard("league_live", "KXLOL-A"),
+                  _guard("move_breaker", "KXRAIN-A"), _guard("breaker_cooldown", "KXRAIN-A"),
+                  _guard("twk_halt", "KXTS-A"), _guard("manual_yield", "KXATTY-A"),
+                  _guard("ust_blackout", "KXUST-A"), _guard("brand_new_gate", "KXNEW-A"),
+                  _guard("band_both_out", "KXB-A")]
+        rows = _by(rc.build_rows(_ev(guards=guards), _ctx()))
+        self.assertEqual(rows["Fair-value & data gates"]["impact"],
+                         "3 markets: Vercel 2 · YouTube weekly 1")
+        self.assertEqual(rows["Live games & news holds"]["impact"], "1 market: leagues live 1")
+        # the breaker and its cool-down are one, beside the series halts
+        self.assertEqual(rows["Breakers & series halts"]["impact"],
+                         "2 markets: mid-move breaker 1 · Trump weekly halt 1")
+        self.assertIn("Treasury 6-7am 1",
+                      rows["Release pauses (CPI, AAA, Treasury, state stats)"]["impact"])
+        self.assertEqual(rows["Manual stand-aside"]["impact"],
+                         "none rest now; the bot stood aside in 1 market over the window")
+        self.assertEqual(rows["Other stand-downs"]["impact"], "1 market: brand_new_gate 1")
+        self.assertNotIn("band_both_out", str(rows))       # a quoting rule, not risk
+
+    def test_a_worst_before_the_6am_roll_names_its_trading_day(self):
+        # Sun 08:30Z = Sun 04:30 EDT, before the roll; the window ends Sun 13:00Z
+        from datetime import timedelta
+        tz = timezone(timedelta(hours=-4))
+        until = datetime(2026, 10, 4, 13, 0, tzinfo=timezone.utc).timestamp()
+        ev = rc._empty_evidence(until - 86400, until)
+        rc.scan_log_lines([_line("2026-10-04 08:30:00", "1/2 mkts quoted, 10 resting, 0 amend, "
+                                 "0 cancel, 0 place, est $1.00/day reward share, P&L today "
+                                 "$-1139.00 (r/u) "),
+                           _line("2026-10-04 12:50:00", "1/2 mkts quoted, 10 resting, 0 amend, "
+                                 "0 cancel, 0 place, est $1.00/day reward share, P&L today "
+                                 "$-132.00 (r/u) ")], ev)
+        ctx = _ctx()
+        ctx["caps"]["DAILY_LOSS_LIMIT"] = 2000.0
+        rows = rc.build_rows(ev, ctx, tz)
+        d = _by(rows)["Daily loss halt"]
+        self.assertEqual(d["worst"], "-$1,139 (57%) Sun 04:30, Sat's day")
+        self.assertEqual(d["now"], "-$132")
+        self.assertEqual(rc.headline(rows, {}, tz, until),
+                         "Nothing tripped. Closest call: daily loss -$1,139 at Sun 04:30 "
+                         "(Sat's day), 57% of the -$2,000/day halt.")
+
+    def test_a_tripped_switch_is_not_the_closest_call(self):
+        rows = rc.build_rows(_ev(CASH_TRIP), _ctx())
+        self.assertNotIn("Closest call: account value", rc.headline(rows))
+        self.assertIn("Closest call: daily loss", rc.headline(rows))
+
+
+class UsualTests(unittest.TestCase):
+    """The usual: the median of the 7 days on file before today, from the
+    7:00 runs' risk_controls_history.json."""
+
+    def test_median_of_the_days_before_and_a_spike_reads_hot(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, rc.HISTORY_FILE)
+            self.assertEqual(rc.usual(path, "2026-10-10"), {})            # nothing on file
+            for i, n in enumerate((30, 10, 20, 40, 50, 60, 70, 80, 90)):
+                rc.record(path, f"2026-10-0{i + 1}", {"pickoffs": n})
+            rc.record(path, "2026-10-10", {"pickoffs": 999})              # today: not its own usual
+            # the 7 days before 10/10: 20 40 50 60 70 80 90 -> 60
+            self.assertEqual(rc.usual(path, "2026-10-10"), {"pickoffs": 60})
+            self.assertEqual(rc.usual(path, "2026-10-03"), {})            # two days: too few
+        self.assertEqual(rc._usual(19, 35), (" (usual 35)", False))
+        self.assertEqual(rc._usual(80, 35), (" (usual 35, 2.3x)", True))
+        self.assertEqual(rc._usual(3, 1), (" (usual 1)", False))         # 3x, but only +2
+        self.assertEqual(rc._usual(0.57, 0.32, pct=True), (" (usual 32%)", False))
+        self.assertEqual(rc._usual(0.70, 0.30, pct=True), (" (usual 30%, 2.3x)", True))
+
+    def test_the_block_shows_each_guard_against_its_usual(self):
+        toxic = [{"kind": "pickoff", "ts": T0 - 100 - i, "ticker": f"M{i}"} for i in range(80)]
+        ev = _ev(toxic=toxic)
+        rows = rc.build_rows(ev, _ctx())
+        usual = {"pickoffs": 35, "kill_pct": 0.3}
+        text = "\n".join(rc.text_lines(rows, ev, timezone.utc, "", usual))
+        self.assertIn("- Pick-offs: 80 (usual 35, 2.3x) on 80 markets, no halt", text)
+        html = rc.html(rows, ev, timezone.utc, "", "td", "tdl", usual)
+        self.assertIn('<b style="color:#d35400"> (usual 35, 2.3x)</b>', html)
+        m = rc.metrics(rows)
+        self.assertEqual((m["pickoffs"], m["toxic_halts"]), (80, 0))
+        self.assertIn("kill_pct", m)
+
+    def test_the_history_keeps_sixty_days(self):
+        import tempfile
+        from datetime import date, timedelta
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, rc.HISTORY_FILE)
+            for i in range(65):
+                rc.record(path, (date(2026, 8, 1) + timedelta(days=i)).isoformat(), {"x": i})
+            h = rc.load_history(path)
+            self.assertEqual(len(h), rc.HISTORY_KEEP_DAYS)
+            self.assertEqual(min(h), "2026-08-06")
 
 
 class BotRiskLineContractTests(unittest.TestCase):

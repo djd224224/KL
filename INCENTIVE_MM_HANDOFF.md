@@ -11071,3 +11071,36 @@ Deploy: incentive_mm.py change, so the sync's code-change restart; the watch imp
   $0.95/day x 1.13 days = $1.07. x3 lifts every one of those ladders by half.
 - IMM_GENMOV_SIZE_MULT=2 reverts (env => task-level restart).
 Deploy: incentive_mm.py change, so the sync's code-change restart.
+
+## 2026-11-02 ~02:00Z — the email's risk block, clearer, with each guard against its usual (Jack: "Add vs-usual too")
+
+Asked for suggestions to make "Risk controls & capacity — what fired, what binds, what has slack" clearer. The same
+two rows had read !!BINDING on all 15 emails 10/18-11/01, both mostly by design; 16 of 24 rows said nothing
+happened; the section was 19 KB of a 145 KB email that Gmail clips at ~102 KB. imm_risk_controls.py now renders:
+- Verdict: tripped or not; the closest kill-switch call as a % of its limit, against its usual (tripped switches
+  excluded); a list of what held quoting back.
+- Kill switches (daily loss, account value, fail-safe, the open-scan budget while its tier runs): limit / worst /
+  now. A worst before the 6am roll names its trading day ("Sun 04:34, Sat's day"); a note says account value moves
+  with reward credits and transfers while the daily loss is trading P&L.
+- Holding back quoting, only what limited quoting:
+  - Position caps judged against the Saturday cap too (risk_context passes series_max_position(peak=True), the
+    ac8ac88 Saturday 200). A position above today's cap but inside Saturday's only sells down: 11/01's "18 OVER"
+    were these. Over any cap is named.
+  - The order-size check (ALERT side_cap / level_cap) is its own row, counted by market side. 3,976 of 11/01's
+    "side_cap backstop 3987x" were three KXRAINELECTION-03NOV26 sides; the alerts had flipped the position row to
+    BINDING on their own.
+  - Complement locks (comp_hedge sink "open" records, 14 days) are named: KXTRUTHSOCIAL-26NOV07's 11/01 lock sold
+    100-115 on each bracket, -871 net against a 100 event cap, while only one bracket can pay.
+- Room to spare: one line of worst vs limit. By design: the per-event strike cap (bound at every refresh) and cutoffs.
+- Guards in plain names (GUARD_LABELS), each against its usual: pick-offs, the sweep breaker (new; the "sweep
+  breaker (on)" lines), fair & data gates (+ lowt/hight/ytw/yt1/nfl/rt_settled_off; manual_yield moves to "your own
+  orders"), live games & news, breakers & series halts (the mid-move breaker guards rain and temperatures with
+  IMM_BREAKERS=0, and the old row read "Circuit breakers OFF" while it stood markets down), release pauses
+  (+ ust_blackout, release_pause). Unknown guard names still land in "Other stand-downs" under their own names.
+- The caps note shows only when the caps are NOT the bot's. No status legend.
+The usual = the median of the 7 days on file before today (3+ days needed); 2x it and +5 (+10 points for a %)
+reads hot (bold orange). send_imm_digest's 7:00 run (--section-out -> build_digest(record_risk=True)) keeps each
+day in run-logs/incentive-mm/risk_controls_history.json (60 days; a blind window is not kept). Seeded 10/23-11/01 by
+a one-off scan of the logs and sinks (no position counts: those start with the 11/02 run). HTML ~5.5 KB.
+Tests: test_imm_risk_controls (28), test_send_imm_digest (18); the bot's GATE_GUARDS test classes pass (26).
+Deploy: no incentive_mm.py change; the 7:00 email picks it up after the KL sync.
