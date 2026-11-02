@@ -49,16 +49,23 @@ ONE EMAIL per ET day (the day before), the money first, in plain words
               at a lead at the latest marks (the biggest named) + the
               completed locks ("hedges" in the email)
   needs a look  each verdict reason, naming the market and what is left
-              (PROBLEM: a lead fill never locked, Kalshi refused a hedge
-              order, or a lock that gave up with legs traded or has been half
-              done for over HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD ($10)
-              or more as it stands (Jack 2026-10-30: "Yes, size-aware" --
-              10/29's 12-contract lock read PROBLEM at -$2.68); WATCH: such a
-              lock that can lose less, or a complement-lead fill that opened
-              no lock job). Then FYI lines: a half-done lock whose markets
-              have all settled, at its final dollars (10/30's WATCH named one
-              that had settled the day before), and the lock jobs in flight
-              (those read WATCH most days until 2026-10-31)
+              (PROBLEM: Kalshi refused a hedge order, or a lock that gave up
+              with legs traded or has been half done for over
+              HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD ($10) or more as it
+              stands (Jack 2026-10-30: "Yes, size-aware" -- 10/29's
+              12-contract lock read PROBLEM at -$2.68); WATCH: such a lock
+              that can lose less, or a complement-lead fill that opened no
+              lock job). Then FYI lines: a lead fill whose watch ended
+              unhedged, and why -- its hedge orders rested and never filled,
+              or no hedge ever reached break-even (Jack 2026-11-02: "Yes,
+              reword them": it had read PROBLEM, though a fill the market has
+              moved against is just what the lock declines to lock at a
+              loss); a half-done lock whose markets have all settled, at its
+              final dollars and what its filled legs added or cost against
+              the fill alone (11/01's "-$46.48, its worst case" was $19.38
+              better than the fill alone) -- 10/30's WATCH named one that had
+              settled the day before; and the lock jobs in flight (those read
+              WATCH most days until 2026-10-31)
   by source   complement / fair: sides and markets led, reward, fills
   fills       every fill at a lead (partial fills at one price as one),
               biggest first, at the bot's latest mark or the settlement, and
@@ -957,15 +964,18 @@ def _case(x: float, outcome) -> str:
 
 def verdict(ctx: dict) -> tuple:
     """(level, reasons): what needs a look, each reason naming the market and
-    what is left. PROBLEM: a lead fill never locked, Kalshi refused a hedge
-    order, or a lock that gave up with legs traded or has been half done for
-    over HEDGE_STUCK_SECS can lose LOCK_PROBLEM_USD or more as it stands (or
-    cannot be priced); WATCH: such a lock that can lose less, or a
-    complement-lead fill that opened no lock job; OK otherwise. A half-done
-    lock whose markets have all settled is final, and a lock job in flight
-    risks nothing past its fill: notes() lists both (Jack 2026-10-31: "make
-    it succinct and clearer" -- 10/30's WATCH was a lock whose markets had
-    settled the day before, and the jobs in flight read WATCH most days)."""
+    what is left. PROBLEM: Kalshi refused a hedge order, or a lock that gave
+    up with legs traded or has been half done for over HEDGE_STUCK_SECS can
+    lose LOCK_PROBLEM_USD or more as it stands (or cannot be priced); WATCH:
+    such a lock that can lose less, or a complement-lead fill that opened no
+    lock job; OK otherwise. A half-done lock whose markets have all settled is
+    final, and a lock job in flight risks nothing past its fill: notes()
+    lists both (Jack 2026-10-31: "make it succinct and clearer" -- 10/30's
+    WATCH was a lock whose markets had settled the day before, and the jobs
+    in flight read WATCH most days). So does a lead fill whose watch ended
+    unhedged (Jack 2026-11-02: "Yes, reword them"): the lock declines a
+    hedge under break-even by design, and 12 of the first 35 lead fills
+    ended so (median best -11.9c a contract)."""
     reasons, level = [], 0
 
     def flag(lv, why):
@@ -978,9 +988,6 @@ def verdict(ctx: dict) -> tuple:
         oc = r.get("outcome")
         flag(_lock_level(oc), f"{r.get('ticker') or r.get('job')}: its hedge gave up half done "
                               f"-- the filled legs now ride as inventory" + _sized(oc))
-    if h["never"]:
-        flag(2, f"{len(h['never'])} lead fill(s) were never hedged: " + ", ".join(
-            sorted({str(r.get("ticker") or r.get("job")) for r in h["never"]})))
     if h["refused"]:
         r0 = h["refused"][0]
         flag(2, f"Kalshi refused {len(h['refused'])} hedge order(s) (first: "
@@ -1004,13 +1011,44 @@ def verdict(ctx: dict) -> tuple:
     return LEVELS[level], reasons
 
 
+def _never_line(r: dict) -> str:
+    """A lead fill whose hedge watch ended with no lock (its `nolock` row),
+    and why: the lock takes no hedge under break-even (COMP_HEDGE_LEAD_EDGE_C
+    after fees), so a fill the market has moved against simply rides."""
+    hrs = imm.COMP_HEDGE_MAX_AGE_SECS / 3600.0
+    edge = float(imm.COMP_HEDGE_LEAD_EDGE_C)
+    best = r.get("best_c")
+    if best is None:
+        why = "no hedge could be priced"
+    elif float(best) >= edge:
+        why = f"its hedge orders rested at a {float(best):+.1f}c lock and never filled"
+    else:
+        why = (f"the best hedge on offer was {float(best):+.1f}c a contract, short of "
+               + ("break-even" if edge == 0 else f"the {edge:g}c it needs"))
+    return (f"{r.get('ticker') or r.get('job')}: a lead fill left unhedged after its "
+            f"{hrs:g}h watch -- {why}; it rides to settlement")
+
+
+def _legs_did(x: dict) -> str:
+    """What a settled half-done lock's filled legs did against its fill
+    alone ("its worst case" read as if the hedge had lost the money)."""
+    a = x.get("alone")
+    if a is None:
+        return _case(x["settled"], x.get("outcome"))
+    d = x["settled"] - a
+    return (f"; its filled legs {'added' if d >= 0 else 'cost'} {usd(abs(d))[1:]} "
+            f"(the fill alone: {usd(a)})")
+
+
 def notes(ctx: dict) -> list:
-    """The FYI lines under NEEDS A LOOK: each half-done lock whose markets
-    have all settled, at its final dollars, then the lock jobs in flight."""
+    """The FYI lines under NEEDS A LOOK: each lead fill whose watch ended
+    unhedged and why, each half-done lock whose markets have all settled, at
+    its final dollars and what its legs did, then the lock jobs in flight."""
     h = ctx["hedges"]
-    out = [f"{x.get('ticker') or x.get('job')}: its half-done hedge settled at "
-           f"{usd(x['settled'])}{_case(x['settled'], x.get('outcome'))}"
-           + (", after it gave up" if x.get("gave_up") else "") for x in _settled_locks(h)]
+    out = [_never_line(r) for r in sorted(h["never"], key=lambda r: str(r.get("ticker")))]
+    out += [f"{x.get('ticker') or x.get('job')}: its half-done hedge"
+            + (" (it gave up)" if x.get("gave_up") else "")
+            + f" settled at {usd(x['settled'])}{_legs_did(x)}" for x in _settled_locks(h)]
     work = _working(h)
     if work:
         old = max(work, key=lambda j: j["age_s"])
@@ -1035,8 +1073,6 @@ def _short(ctx) -> str:
     gave, stuck = _gave_up(h), _stuck(h)
     if gave:
         bits.append(f"{n_(len(gave), 'hedge')} gave up half done" + worst(gave))
-    if h["never"]:
-        bits.append(f"{n_(len(h['never']), 'lead fill')} never hedged")
     if h["refused"]:
         bits.append(f"{n_(len(h['refused']), 'hedge order')} refused")
     if stuck:
@@ -1073,14 +1109,19 @@ def build_report(day, now=None) -> dict:
     # not a worst case (10/30's email still called 10/29's KXAPRPOTUS lock
     # half done, a day after its markets settled at that worst case)
     results = load_results(a_ts - SETTLE_LOOKBACK_SECS, now.timestamp())
+    # ...and what its fill alone came to, so the FYI says what the legs did
     for r in hedges["expired"]:
         g = gave_up_lock(r)
         r["outcome"] = None if g is None else lock_outcomes(g[0], g[2], g[3], g[4])
         r["settled"] = None if g is None else settled_outcome(*g, results)
+        r["alone"] = None if g is None else settled_outcome(*g[:4], {}, results)
     for j in hedges["open_now"]:
         j["settled"] = (None if j.get("legs") is None else
                         settled_outcome(j["kind"], j["ticker"], j["price"], j["count"],
                                         j["legs"], results))
+        j["alone"] = (None if j.get("legs") is None else
+                      settled_outcome(j["kind"], j["ticker"], j["price"], j["count"], {},
+                                      results))
     est = latest_estimates({t for t, _s in leads}, a_ts, b_ts)
     hourly, covered = load_hourly(a_ts, b_ts)
     value_fills(fills, load_marks(a_ts, now.timestamp()))

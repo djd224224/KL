@@ -136,14 +136,34 @@ class TestHedgesAndVerdict(unittest.TestCase):
         self.assertEqual(cm.notes(ctx), ["1 hedge still working (1 with a leg filled); the "
                                          "oldest KXB-1, 10 min"])
         self.assertEqual(self._ctx(fills=[{"ticker": "A"}])["level"], "WATCH")  # no job
-        # a lead fill that never locked is a PROBLEM; another fill that did not
-        # lock just rides on, and one still in its watch is not reported
-        self.assertEqual(self._ctx(rows=[{"kind": "nolock", "job": "j", "lead": True}])["level"],
-                         "PROBLEM")
+        # a lead fill that never locked rides on, an FYI saying why (Jack
+        # 2026-11-02: "Yes, reword them" -- it had read PROBLEM); another fill
+        # that did not lock just rides on, and one still in its watch is not
+        # reported
+        ctx = self._ctx(rows=[{"kind": "nolock", "job": "j", "lead": True}])
+        self.assertEqual(ctx["level"], "OK")
+        self.assertEqual(cm.notes(ctx), ["j: a lead fill left unhedged after its 48h watch -- "
+                                         "no hedge could be priced; it rides to settlement"])
         self.assertEqual(self._ctx(rows=[{"kind": "nolock", "job": "j", "lead": False}])["level"],
                          "OK")
         watching = {"id": "j", "count": 20, "at": _ts(11, 58), "lead": False, "legs": {}}
         self.assertEqual(self._ctx(jobs=[watching])["level"], "OK")
+
+    def test_an_unhedged_lead_fill_says_why(self):
+        # 11/01: KXVTPERMITS rested 45 hedge orders at a +0.6c lock for 48h,
+        # none filled; KXOPENVREQ's best hedge never got near break-even
+        rows = [{"kind": "nolock", "job": "a", "ticker": "KXVT-27MAY03-T1800", "lead": True,
+                 "best_c": 0.61},
+                {"kind": "nolock", "job": "b", "ticker": "KXOV-02NOV26-T19P8", "lead": True,
+                 "best_c": -20.46}]
+        ctx = self._ctx(rows=rows)
+        self.assertEqual((ctx["level"], ctx["reasons"]), ("OK", []))
+        self.assertEqual(cm.notes(ctx), [
+            "KXOV-02NOV26-T19P8: a lead fill left unhedged after its 48h watch -- the best "
+            "hedge on offer was -20.5c a contract, short of break-even; it rides to settlement",
+            "KXVT-27MAY03-T1800: a lead fill left unhedged after its 48h watch -- its hedge "
+            "orders rested at a +0.6c lock and never filled; it rides to settlement"])
+        self.assertNotIn("never hedged", cm._short(ctx))
 
     def test_the_other_fills_locks(self):
         rows = [{"kind": "open", "job": "a", "lock": "me_ask", "lead": False},
@@ -483,11 +503,14 @@ class TestMoney(unittest.TestCase):
                                        now=datetime(2026, 10, 31, 11, 55, tzinfo=timezone.utc))
         ctx = report({"KXA-1": "yes", "KXA-2": "no"})
         self.assertEqual((ctx["level"], ctx["reasons"]), ("OK", []))
-        self.assertEqual(cm.notes(ctx), ["KXA-1: its half-done hedge settled at -$2.68, its "
-                                         "worst case"])
+        # ...and what its legs did against the fill alone (Jack 2026-11-02: "Yes,
+        # reword them" -- "its worst case" read as if the hedge lost the money)
+        self.assertEqual(cm.notes(ctx), ["KXA-1: its half-done hedge settled at -$2.68; its "
+                                         "filled legs added $2.96 (the fill alone: -$5.64)"])
         self.assertTrue(cm.subject_for(ctx).endswith("| OK"))
         self.assertIn("NEEDS A LOOK: nothing.\n"
-                      "  FYI: KXA-1: its half-done hedge settled at -$2.68, its worst case",
+                      "  FYI: KXA-1: its half-done hedge settled at -$2.68; its filled legs "
+                      "added $2.96 (the fill alone: -$5.64)",
                       cm.render_text(ctx))
         # while one of its markets is open it is still half done: a WATCH
         ctx = report({"KXA-1": "yes"})
