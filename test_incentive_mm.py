@@ -23130,6 +23130,16 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
                 s, datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)), 1.0)   # noon
         with mock.patch.object(imm, "TWK_ENABLE", False):
             self.assertFalse(imm.twk_event_ticker("KXFEATURE-26GTA6-DRA"))
+        # "Stop Nov 18" (Jack 2026-11-01): out at 00:00 ET Nov 18, a day before
+        # GTA VI's release; an earlier cutoff still wins; other events untouched
+        close = datetime(2026, 12, 31, 4, 59, tzinfo=timezone.utc)
+        stop = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)      # 00:00 EST
+        f = imm.apply_series_cutoff_adjustments
+        self.assertEqual(f(s, "KXFEATURE-26GTA6", None, close_time=close), stop)
+        self.assertEqual(f(s, "KXFEATURE-26GTA6", close, close_time=close), stop)
+        early = datetime(2026, 11, 10, tzinfo=timezone.utc)
+        self.assertEqual(f(s, "KXFEATURE-26GTA6", early, close_time=close), early)
+        self.assertIsNone(f(s, "KXFEATURE-27TLOP", None, close_time=close))
 
     def test_trumpsay_one_pickoff_halts_the_event_at_60s(self):
         # one fill the mark moves 5c+ against 60 s later takes the event for

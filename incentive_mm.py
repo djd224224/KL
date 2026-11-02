@@ -17024,12 +17024,17 @@ TWK_ENABLE = _TWK_LIVE
 # TWK_SAY_SERIES below for the rules, which are all keyed by series.
 # KXFEATURE-26GTA6, "Grand Theft Auto VI: The Album -- Features": 130 artist
 # markets (Drake, Bad Bunny, The Weeknd ...), ~$1,794/day of pool on 11/01,
-# closing 2026-12-31 04:59Z. Its ticker carries no date, so nothing cuts it
-# off before the close's hour (series_min_hours_to_close); the quick pulls,
-# the halts and the caps are its protection. IMM_TWK_SAY_EVENTS replaces the
-# list ("" = none).
+# closing 2026-12-31 04:59Z. Its ticker carries no date, so its stop is on
+# file in TWK_SAY_EVENT_STOPS (Jack 2026-11-01: "Stop Nov 18", on "Stop quoting
+# the GTA 6 album before the game's Nov 19 release?"): out at 00:00 ET on
+# Nov 18, a day ahead of the release, which reaches the earliest time zones
+# during Nov 18 ET. Until then the quick pulls, the halts and the caps are its
+# protection. IMM_TWK_SAY_EVENTS replaces the list ("" = none).
 TWK_SAY_EVENTS = frozenset(e.strip() for e in os.environ.get(
     "IMM_TWK_SAY_EVENTS", "KXFEATURE-26GTA6").split(",") if e.strip())
+TWK_SAY_EVENT_STOPS: Dict[str, datetime] = {
+    "KXFEATURE-26GTA6": ET.localize(datetime(2026, 11, 18)).astimezone(timezone.utc),
+}
 TWK_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_ALLOW_TWK_SERIES", _DEFAULT_TWK_SERIES).split(",") if s.strip()) \
     | frozenset(series_of(e) for e in TWK_SAY_EVENTS)
@@ -19670,6 +19675,11 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     # writes it for every match of the card), the bot quotes match day until
     # OVERRIDE_BUFFER_MIN before that start -- REPLACING midnight, which is
     # earlier. With none, midnight stands; the tighteners below still apply.
+    # A TRUMPSAY-group event with a stop on file (TWK_SAY_EVENT_STOPS, 2026-11-01:
+    # the GTA VI album out at 00:00 ET Nov 18) takes it, the earlier one winning.
+    _say_stop = TWK_SAY_EVENT_STOPS.get(event_ticker)
+    if _say_stop is not None:
+        cutoff = _say_stop if cutoff is None else min(cutoff, _say_stop)
     if series == POWERSLAP_SERIES:
         start = EVENT_START_OVERRIDES.get(event_ticker)
         if start is not None:
