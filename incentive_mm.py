@@ -7372,10 +7372,11 @@ _YT1_LIVE = _YT1_MODE == "live"
 # every other artist stays out. IMM_YTW_ENABLE=0 takes it out.
 _YTW_LIVE = os.environ.get("IMM_YTW_ENABLE", "1") == "1"
 # TRUMP WEEKLY PILOTS (Jack 2026-10-11: "yes pilot both, $40/day halt"):
-# KXTRUTHSOCIAL early in the week, KXEOWEEK both sides (see TWK_ENABLE).
+# KXTRUTHSOCIAL early in the week, KXEOWEEK both sides (see TWK_ENABLE); the
+# two monthly TRUMPSAY series since 2026-11-01 (see TWK_ENABLE).
 # IMM_TWK_ENABLE=0 or IMM_ALLOW_TWK_SERIES="" takes them out.
 _TWK_LIVE = os.environ.get("IMM_TWK_ENABLE", "1") == "1"
-_DEFAULT_TWK_SERIES = "KXTRUTHSOCIAL,KXEOWEEK"
+_DEFAULT_TWK_SERIES = "KXTRUTHSOCIAL,KXEOWEEK,KXTRUMPSAYCOMPANY,KXTRUMPSAYMONTH"
 # NFL HEAD-TO-HEAD PILOT (Jack 2026-10-12: "quote NFL H2H markets e.g.
 # KXNFLPASSYDSH2H, KXNFLRSHYDSH2H, KXNFLRECYDSH2H"): every KXNFL*H2H series,
 # see NFL_H2H_ENABLE. IMM_NFL_H2H_ENABLE=0 takes the family out.
@@ -16964,6 +16965,21 @@ def yt1_shadow_note(ev: str, e: dict, now_ts: float) -> Tuple[tuple, str]:
 # or below -TWK_DAILY_LOSS_LIMIT ($40) cancels its orders and stands it aside
 # until the 5am-CT roll; positions ride. Emails "twk_halt".
 # Kill switch IMM_TWK_ENABLE=0 (or IMM_ALLOW_TWK_SERIES=""); positions ride.
+# THE MONTHLY TRUMPSAY SERIES JOIN (Jack 2026-11-01: "Add now at x1", on the
+# first unquoted-series scan, imm_unquoted.py): KXTRUMPSAYCOMPANY ("Will
+# Trump mention company", one event of 53 markets, KXTRUMPSAYCOMPANY-26DEC01)
+# and KXTRUMPSAYMONTH ("Trump Monthly", 22 markets, -26DEC01). Mentions by
+# Kalshi category, but a month-long window with no broadcast to stop before,
+# so they were kept out of the single-event mention family (Jack 2026-10-13:
+# "dont include things like KXTRUMPSAY / -COMPANY / -MONTH that require it's
+# own rules"); these are those rules. The 75-day tape: makers +4.3 c/ct on
+# 311k contracts for COMPANY (-2.9 at 25-75c), +2.2 on 329k for MONTH (-6.8 at
+# 25-75c); the bot's estimator at x1 on the 11/01 books: ~$67 and ~$24/day.
+# They quote under the pilot rules above -- x1 every hour, 100 per market and
+# 100 net per event, the $40 daily halt per series -- plus the protections
+# every book has (the WS fast cancel, the sweep breaker, toxic halts: their
+# names carry no MENTION, so the mention exemption does not apply), to the
+# ticker-date cutoff (00:00 ET on the event's day).
 TWK_ENABLE = _TWK_LIVE
 TWK_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_ALLOW_TWK_SERIES", _DEFAULT_TWK_SERIES).split(",") if s.strip())

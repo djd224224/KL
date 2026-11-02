@@ -23063,6 +23063,35 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
             self.assertTrue(IncentiveMarketMaker._allowed(self.TS))
             self.assertTrue(IncentiveMarketMaker._allowed(self.EO))
 
+    def test_the_monthly_trumpsay_series_join_at_x1(self):
+        # Jack 2026-11-01 "Add now at x1": the two monthly TRUMPSAY series
+        # quote under the pilot rules -- x1 every hour, out of the size test,
+        # 100 a market and net per event, their own $40 halt -- and are not
+        # the single-event mention family's (Jack 2026-10-13)
+        for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.twk_series(s), s)
+            self.assertTrue(imm.series_override(s).safe_join, s)
+            self.assertEqual(imm.series_max_position(s), 100.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26DEC01"), 100.0, s)
+            self.assertTrue(imm.is_daily_series(s), s)
+            self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
+            self.assertIsNone(imm.size_test_arm(s), s)
+            for when in (datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc),     # quiet
+                         datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc),   # evening
+                         datetime(2026, 11, 7, 15, 0, tzinfo=timezone.utc)):   # Saturday
+                self.assertEqual(imm.hour_size_mult(s, when), 1.0, (s, when))
+            self.assertEqual(imm.pilot_halt_key(s), s)
+            self.assertFalse(imm.series_bid_only(s), s)
+            self.assertIsNone(imm.series_override(s).cutoff_from_close_min, s)
+            self.assertFalse(imm.mention_auto_series(s), s)
+            with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+                self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-26DEC01-AAPL"), s)
+            self.assertFalse(IncentiveMarketMaker._blocked(f"{s}-26DEC01-AAPL"), s)
+        # the third windowed TRUMPSAY series (the weekly) stays out
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(IncentiveMarketMaker._allowed("KXTRUMPSAY-26NOV08-TARIFF"))
+
     def test_both_sides_and_a_loss_halt_per_series(self):
         bot = self._bot()
         bot.run_cycle()
@@ -30416,8 +30445,10 @@ class TestMentionAutoFamily(unittest.TestCase):
             self.assertEqual(sorted(s for s, _w, _x in enrolled), ["KXDJTRALLY", "KXSASMITH"])
             self.assertEqual({w for _s, w, _x in enrolled}, {ieo.MENTION_AUTO_WHY})
             why = {s: w for s, w, _x in review}
-            for s in ("KXTRUMPSAY", "KXTRUMPSAYMONTH"):
-                self.assertIn("contract TRUMPSAY", why[s], s)
+            self.assertIn("contract TRUMPSAY", why["KXTRUMPSAY"])
+            # the monthly is allowlisted since 2026-11-01 (it joined the Trump
+            # pilots, TWK_SERIES), and the pass never reviews an allowed series
+            self.assertNotIn("KXTRUMPSAYMONTH", why)
             self.assertIn("a window", why["KXFOOSAYWEEK"])
             self.assertIn("Before Oct 19", why["KXBARSAY"])
             self.assertIn("no event day", why["KXNODAY"])
