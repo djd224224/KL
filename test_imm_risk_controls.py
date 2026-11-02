@@ -356,8 +356,13 @@ class ClearerBlockTests(unittest.TestCase):
         rows = _by(rc.build_rows(_ev(lines), _ctx(**now)))
         o = rows["Order-size check (side / level backstop)"]
         self.assertEqual(o["status"], "BINDING")
-        self.assertIn("refused 52 orders on 3 market sides: KXRAINELECTION-03NOV26-PNS ask "
-                      "(50)", o["impact"])
+        self.assertIn("refused orders on 3 market sides, each re-tried every cycle: "
+                      "KXRAINELECTION-03NOV26-PNS ask 50 times, KXHIGHNY-26OCT04-T70 bid once",
+                      o["impact"])
+        # a count of refusals, never read as an order size (11/02: "PNS ask · 2,947")
+        self.assertEqual(o["where"][:2], ["KXRAINELECTION-03NOV26-PNS ask · refused 50 times",
+                                          "KXHIGHNY-26OCT04-T70 bid · refused once"])
+        self.assertTrue(o["note"].startswith("the bot re-tries a refused order every cycle."))
         self.assertEqual(rc.block_of(o), "held")
         # no longer filed under, or flipping, the position cap
         self.assertEqual(rows["Per-market position cap"]["status"], "SLACK")
@@ -439,7 +444,7 @@ class ClearerBlockTests(unittest.TestCase):
         rows = rc.build_rows(ev, _ctx(**now))
         html = rc.html(rows, ev, timezone.utc, "", "", "")
         self.assertIn("HOLDING BACK QUOTING", html)
-        self.assertIn("KXR-03NOV26-PNS ask &#183; 1", html)               # where, per side
+        self.assertIn("KXR-03NOV26-PNS ask &#183; refused once", html)    # where, per side
         self.assertIn('color:#c0392b">&#9679;</span> <b>Position caps</b>', html)  # a breach
         self.assertIn('color:#e67e22">&#9679;</span> <b>Order-size check</b>', html)
 

@@ -413,6 +413,10 @@ def _s(n) -> str:
     return "" if n == 1 else "s"
 
 
+def _times(n) -> str:
+    return "once" if n == 1 else f"{n:,} times"
+
+
 def _pct_status(worst, limit):
     if worst is None or not limit:
         return None
@@ -811,7 +815,8 @@ def backstop_row(ev: dict, tz) -> dict:
     own ladder bracket. That is a sizing mismatch somewhere upstream, never
     routine (10/30: a rounding gap refused one bid 679 times), and it is not
     a position cap. Counted by market side, not by alert line: one stuck
-    side alerts every cycle."""
+    side alerts every cycle. Each side's count reads "refused N times": the
+    bare "PNS ask · 2,947" of 11/02 looked like a 2,947-lot order."""
     sides = defaultdict(lambda: [0, 0.0])          # (ticker, side) -> [alerts, last ts]
     for cat in ("side_cap", "level_cap"):
         for ts, msg in ev["alerts"].get(cat, []):
@@ -829,9 +834,9 @@ def backstop_row(ev: dict, tz) -> dict:
     top = sorted(sides.items(), key=lambda kv: (-kv[1][0], kv[0]))
     status = "BINDING" if last >= ev["until"] - RECENT_SECS else "SLACK"
     n = len(sides)
-    line = (f"refused {sum(a for a, _l in sides.values()):,} orders on {n} market "
-            f"side{_s(n)}{{usual}}: "
-            + ", ".join(f"{t} {side} ({a:,})" for (t, side), (a, _l) in top[:3])
+    line = (f"refused orders on {n} market side{_s(n)}{{usual}}, each re-tried every "
+            f"cycle: "
+            + ", ".join(f"{t} {side} {_times(a)}" for (t, side), (a, _l) in top[:3])
             + (f" +{n - 3} more" if n > 3 else "")
             + f"; last {_when(last, tz)}. Each would have put more on its side than "
               f"its ladder allows: a sizing mismatch to look at")
@@ -841,10 +846,10 @@ def backstop_row(ev: dict, tz) -> dict:
                 usual_key="backstop_sides", earlier=status != "BINDING",
                 metric={"backstop_sides": n}, count=n,
                 what=f"refused orders on {n} market side{_s(n)}, last {_when(last, tz)}",
-                where=[f"{t} {side} · {a:,}" for (t, side), (a, _l) in top[:3]]
+                where=[f"{t} {side} · refused {_times(a)}" for (t, side), (a, _l) in top[:3]]
                 + ([f"+{n - 3} more"] if n > 3 else []),
-                note="each would have put more on its side than its ladder allows: a sizing "
-                     "mismatch to look at")
+                note="the bot re-tries a refused order every cycle. Each would have put more "
+                     "on its side than its ladder allows: a sizing mismatch to look at")
 
 
 def position_rows(ev: dict, ctx: dict, tz) -> list:
