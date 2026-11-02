@@ -11104,3 +11104,12 @@ day in run-logs/incentive-mm/risk_controls_history.json (60 days; a blind window
 a one-off scan of the logs and sinks (no position counts: those start with the 11/02 run). HTML ~5.5 KB.
 Tests: test_imm_risk_controls (28), test_send_imm_digest (18); the bot's GATE_GUARDS test classes pass (26).
 Deploy: no incentive_mm.py change; the 7:00 email picks it up after the KL sync.
+- 11/02 ~02:05Z, visual pass (Jack: "it's still visually hard to read, improve it"). The changes:
+  - The verdict sits in a coloured box.
+  - Each kill switch gets a headroom bar: green under 50%, amber to 80%, red past.
+  - "Holding back quoting" is a table. The "where" column (tickers) is monospace, and a red dot marks a real breach.
+  - The guards are a table of Today | Usual | Biggest. A count at 2x its usual is orange, with a triangle.
+  - Room to spare reads in %.
+  - The text part uses aligned columns.
+  - Rows carry what / where / note / count / unit / detail for these tables.
+  - The HTML is ~12 KB (19 KB before 53e72a9).

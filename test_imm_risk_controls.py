@@ -265,14 +265,15 @@ class VerdictTests(unittest.TestCase):
         text = "\n".join(rc.text_lines(rows, ev, timezone.utc, "caps ok"))
         self.assertIn("TRIPPED: Account-value guard (balance guard).", text)
         self.assertIn("!! TRIPPED Account-value guard (balance guard): ", text)
-        self.assertIn("Kill switches (each stops all quoting)", text)
-        self.assertRegex(text, r"\n  !!Account value +\$2,000 drop/day")
-        self.assertIn("Guards (normal work", text)
+        self.assertIn("KILL SWITCHES — each stops all quoting until the 6am roll", text)
+        self.assertRegex(text, r"\n  !!Account value +not logged yet +\$2,000 drop/day")
+        self.assertIn("GUARDS — normal work", text)
         self.assertNotIn("caps ok", text)          # the caps note speaks only when wrong
         html = rc.html(rows, ev, timezone.utc, "caps ok", "td", "tdl")
-        self.assertIn("TRIPPED in the last 24h", html)
+        self.assertIn(">Tripped</div>", html)                          # the verdict box
+        self.assertIn("Account-value guard (balance guard): ", html)
         self.assertEqual(html, html.encode("ascii").decode("ascii"))   # entities only
-        self.assertIn("Kill switch", html)
+        self.assertIn("KILL SWITCHES", html)
         loud = "!! caps do NOT match the launcher"
         self.assertIn(loud, "\n".join(rc.text_lines(rows, ev, timezone.utc, loud)))
         self.assertIn(loud, rc.html(rows, ev, timezone.utc, loud, "td", "tdl"))
@@ -302,7 +303,7 @@ class ClearerBlockTests(unittest.TestCase):
         self.assertEqual(design, ["Slot caps (strikes per event, scan, finecon)",
                                   "Trade cutoffs & closing"])
         text = "\n".join(rc.text_lines(rc.build_rows(ev, _ctx()), ev, timezone.utc, ""))
-        self.assertIn("By design: the per-event strike cap left 28 strikes unquoted", text)
+        self.assertIn("BY DESIGN: strike cap per event left 28 strikes unquoted", text)
         self.assertIn("996 markets past their cutoff", text)
         self.assertIn("Nothing tripped.", text)
         self.assertNotIn("strike cap", rc.held_line(rc.build_rows(ev, _ctx())))
@@ -426,6 +427,23 @@ class ClearerBlockTests(unittest.TestCase):
         self.assertIn("Closest call: daily loss", rc.headline(rows))
 
 
+    def test_the_html_draws_headroom_bars_and_lists_where(self):
+        """Jack 2026-11-01: "it's still visually hard to read, improve it"."""
+        self.assertIn("width:57px;background:#e67e22", rc._bar_html(0.57))   # amber
+        self.assertIn("width:100px;background:#c0392b", rc._bar_html(9.75))  # a trip, capped
+        self.assertIn("width:100px;background:#e3e3e3", rc._bar_html(0.0))
+        lines = [_line("2026-10-03 10:50:00", "ALERT [side_cap] KXR-03NOV26-PNS ask: blocked "
+                       "at 129/101.0")]
+        now = {"positions": [("KXLOL-WORLDS26-T1", -258.0, 150.0, 200.0)]}
+        ev = _ev(lines)
+        rows = rc.build_rows(ev, _ctx(**now))
+        html = rc.html(rows, ev, timezone.utc, "", "", "")
+        self.assertIn("HOLDING BACK QUOTING", html)
+        self.assertIn("KXR-03NOV26-PNS ask &#183; 1", html)               # where, per side
+        self.assertIn('color:#c0392b">&#9679;</span> <b>Position caps</b>', html)  # a breach
+        self.assertIn('color:#e67e22">&#9679;</span> <b>Order-size check</b>', html)
+
+
 class UsualTests(unittest.TestCase):
     """The usual: the median of the 7 days on file before today, from the
     7:00 runs' risk_controls_history.json."""
@@ -453,9 +471,10 @@ class UsualTests(unittest.TestCase):
         rows = rc.build_rows(ev, _ctx())
         usual = {"pickoffs": 35, "kill_pct": 0.3}
         text = "\n".join(rc.text_lines(rows, ev, timezone.utc, "", usual))
-        self.assertIn("- Pick-offs: 80 (usual 35, 2.3x) on 80 markets, no halt", text)
+        # today and usual in columns, a count at 2x its usual marked
+        self.assertRegex(text, r"\n  ! Pick-offs +80 +35  on 80 markets, no halt")
         html = rc.html(rows, ev, timezone.utc, "", "td", "tdl", usual)
-        self.assertIn('<b style="color:#d35400"> (usual 35, 2.3x)</b>', html)
+        self.assertIn(';color:#d35400"><b>80</b> &#9650;</td>', html)
         m = rc.metrics(rows)
         self.assertEqual((m["pickoffs"], m["toxic_halts"]), (80, 0))
         self.assertIn("kill_pct", m)

@@ -610,7 +610,8 @@ def halt_rows(ev: dict, ctx: dict, tz) -> list:
                      f"{now.get('errors_today', 0)} errors today",
                      impact, (worst / lim) if lim else None, title="Fail-safe",
                      short="fail-safe", limit_phrase=f"{lim}-in-a-row limit",
-                     worst_val=f"{worst} failed cycles in a row", worst_at=None))
+                     worst_val=f"{worst} failed cycles in a row", worst_at=None,
+                     cell=f"{worst} in a row"))
 
     # -- manual kill switch ----------------------------------------------------
     if now.get("halt_file") or ev["halt_file"]:
@@ -731,7 +732,10 @@ def capacity_rows(ev: dict, ctx: dict, tz) -> list:
                              if caps.get(k) is not None)
         rows.append(_row("CAPACITY", "Slot caps (strikes per event, scan, finecon)", status,
                          lim_txt, "", "", impact, design=True,
-                         metric={"strike_cap": last_n[0][2]}))
+                         metric={"strike_cap": last_n[0][2]},
+                         brief="; ".join(f"{lbl.replace('the per-event strike cap', 'strike cap per event')}"
+                                         f" left {n:,} {unit} unquoted"
+                                         for lbl, unit, n in last_n if n) or impact))
     if not uni:
         rows.append(_row("CAPACITY", "Selection gate (events / budget / candidates)",
                          "SLACK", "", "n/a", "n/a",
@@ -835,7 +839,12 @@ def backstop_row(ev: dict, tz) -> dict:
                 title="Order-size check", short="order-size check",
                 tag=f"the order-size check ({n} market side{_s(n)})", line=line,
                 usual_key="backstop_sides", earlier=status != "BINDING",
-                metric={"backstop_sides": n})
+                metric={"backstop_sides": n}, count=n,
+                what=f"refused orders on {n} market side{_s(n)}, last {_when(last, tz)}",
+                where=[f"{t} {side} · {a:,}" for (t, side), (a, _l) in top[:3]]
+                + ([f"+{n - 3} more"] if n > 3 else []),
+                note="each would have put more on its side than its ladder allows: a sizing "
+                     "mismatch to look at")
 
 
 def position_rows(ev: dict, ctx: dict, tz) -> list:
@@ -887,6 +896,19 @@ def position_rows(ev: dict, ctx: dict, tz) -> list:
                       key=lambda x: -abs(x[1]) / x[3])
         k, v, c, _cp = max(items, key=lambda x: abs(x[1]) / x[2])
         pct = abs(v) / c
+        real_over = [x for x in over if not lock_tag(x[0])]
+        if full:
+            what = (f"{len(full):,} full on one side"
+                    + (f" · {len(sat):,} inside Saturday's cap, sell only" if sat else "")
+                    + (f" · {len(over):,} over any cap" if over else ""))
+            where = ([f"{t} {p:+,.0f}/{cap:,.0f}{lock_tag(t)}" for t, p, _c, cap in over[:3]]
+                     + ([f"+{len(over) - 3} more over" ] if len(over) > 3 else [])
+                     if over else [f"fullest: {k} {v:+,.0f}/{c:,.0f}"])
+        else:
+            near_n = sum(1 for x in items if abs(x[1]) >= CLOSE_FRAC * x[2])
+            what = (f"{near_n} above {CLOSE_FRAC:.0%} of their cap, none full" if near_n
+                    else f"fullest at {pct:.0%} of its cap")
+            where = [f"fullest: {k} {v:+,.0f}/{c:,.0f}"]
         if full:
             status = "BINDING"
             impact = (f"{len(full):,} market{_s(len(full))} full on one side{{usual}}: the "
@@ -916,7 +938,8 @@ def position_rows(ev: dict, ctx: dict, tz) -> list:
                          short="positions", brief=f"fullest at {pct:.0%} of its cap",
                          tag=tag, line=impact, usual_key="pos_full",
                          metric={"pos_full": len(full), "pos_sat": len(sat),
-                                 "pos_over": len(over)}))
+                                 "pos_over": len(over)},
+                         count=len(full), what=what, where=where, alarm=bool(real_over)))
 
     items = [(k, v, c) for k, v, c in (now.get("events") or []) if c and c > 0]
     name = "Per-event net cap"
@@ -928,6 +951,12 @@ def position_rows(ev: dict, ctx: dict, tz) -> list:
         k, v, c = max(items, key=lambda x: abs(x[1]) / x[2])
         pct = abs(v) / c
         at = [x for x in items if abs(x[1]) >= AT_CAP_FRAC * x[2]]
+        lk = locks.get(k)
+        where = [f"{k} {v:+,.0f} of {c:,.0f}"
+                 + (f" · complement lock, {sum(1 for t in lk.get('legs') or [] if abs(pos_by_t.get(t, 0.0)) >= 1)}"
+                    f" of {len(lk.get('legs') or [])} legs held: only one bracket can pay"
+                    if lk and lk.get("lock") in ("me_ask", "pair_bid") else
+                    " · complement lock: its legs hedge each other" if lk else "")]
         if at:
             status = "BINDING"
             over_ev = any(abs(x[1]) > x[2] + 0.5 for x in at)
@@ -936,15 +965,19 @@ def position_rows(ev: dict, ctx: dict, tz) -> list:
                       f"{c:,.0f}{lock_note(k, pos_by_t)}")
             tag = (f"event caps ({len(at)} full"
                    + (", all locks" if all(x[0] in locks for x in at) else "") + ")")
+            what = f"{len(at)} event{_s(len(at))} at {'or over ' if over_ev else ''}the cap"
+            alarm = any(abs(x[1]) > x[2] + 0.5 and x[0] not in locks for x in at)
         else:
             status = _pct_status(abs(v), c)
             impact = f"{k} {v:+,.0f} of {c:,.0f} ({pct:.0%}){lock_note(k, pos_by_t)}"
             tag = f"the event cap ({k} at {pct:.0%})"
+            what, alarm = f"fullest at {pct:.0%} of its cap", False
         rows.append(_row("POSITION", name, status, "per-series cap", "",
                          f"{abs(v):,.0f} / {c:,.0f} ({pct:.0%})",
                          impact + f" ({len(items):,} events open)", pct, title="Event caps",
                          short="event nets", brief=f"fullest at {pct:.0%} of its cap",
-                         tag=tag, metric={"event_pct": pct}))
+                         tag=tag, metric={"event_pct": pct}, what=what, where=where,
+                         alarm=alarm))
     return rows
 
 
@@ -980,7 +1013,9 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
         rows.append(_row("GUARD", name, "FIRED" if line else "QUIET", "", "", "",
                          line.replace("{usual}", "") or "nothing stood down",
                          title=title, short=short, show=bool(line), line=line,
-                         usual_key=usual_key, metric={usual_key: len(mk)}))
+                         usual_key=usual_key, metric={usual_key: len(mk)},
+                         count=len(mk), unit="market",
+                         detail="; ".join(x for x in (top(names) if mk else "", extra) if x)))
 
     # toxic flow: pick-offs and the halts they bring
     t = ev["toxic"]
@@ -1003,7 +1038,11 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
                          line.replace("{usual}", ""), title="Pick-offs",
                          short="pick-offs and toxic-flow halts", show=bool(pk or n_side or n_ev),
                          line=line, usual_key="pickoffs",
-                         metric={"pickoffs": pk, "toxic_halts": n_side + n_ev}))
+                         metric={"pickoffs": pk, "toxic_halts": n_side + n_ev},
+                         count=pk, unit="",
+                         detail=(f"on {pm:,} market{_s(pm)}"
+                                 + (f" -> {n_side} side + {n_ev} event halt{_s(n_side + n_ev)}"
+                                    if (n_side or n_ev) else ", no halt"))))
 
     # the event sweep breaker: a fill that clears our order pulls the event
     sw = [s for s in ev["sweeps"] if s[4] == "on"]
@@ -1016,7 +1055,11 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
     rows.append(_row("GUARD", "Sweep breaker", "FIRED" if line else "QUIET", "", "", "",
                      line.replace("{usual}", "") or "nothing tripped", title="Sweep breaker",
                      short="sweep breaker", show=bool(line), line=line, usual_key="sweeps",
-                     metric={"sweeps": len(sw)}))
+                     metric={"sweeps": len(sw)}, count=len(sw), unit="trip",
+                     detail="; ".join(x for x in (
+                         f"{len(evs):,} event{_s(len(evs))} · {sum(s[3] for s in sw):,} orders "
+                         f"pulled" if sw else "",
+                         f"{len(dry)} dry-run trip{_s(len(dry))}" if dry else "") if x)))
 
     # fair-value and data gates
     counted(GATE_GUARDS, "gate", "Fair & data gates", "fair & data gates",
@@ -1060,7 +1103,9 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
         rows.append(_row("GUARD", "Event fill tripwire", "FIRED" if fills else "QUIET",
                          f"{lim:g} cts/cycle", "", "", line or "no gated event was swept",
                          title="Event fill tripwire", short="event fill tripwire",
-                         show=bool(fills), line=line, metric={"event_fill": len(fe)}))
+                         show=bool(fills), line=line, metric={"event_fill": len(fe)},
+                         count=len(fe), unit="event",
+                         detail=f"{perm_f} for good" if perm_f else "stood down"))
 
     # trade cutoffs and closing: selection, by design
     cm = markets(CUTOFF_GUARDS)
@@ -1069,7 +1114,9 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
                      "", "", "",
                      (f"{past:,} markets past their cutoff" if past else "trade cutoffs")
                      + (f" ({len(cm):,} stood down mid-quote)" if cm else ""),
-                     design=True, metric={"cutoff_past": past, "cutoff_mid": len(cm)}))
+                     design=True, metric={"cutoff_past": past, "cutoff_mid": len(cm)},
+                     brief=(f"{past:,} markets past their cutoff" if past else "cutoffs")
+                     + (f" ({len(cm):,} mid-quote)" if cm else "")))
 
     # your own orders: the bot stands aside where they rest
     man = now.get("manual_standoff") or []
@@ -1084,7 +1131,9 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
     rows.append(_row("GUARD", "Manual stand-aside", "FIRED" if line else "QUIET", "", "", "",
                      line or "no manual orders in the bot's markets", title="Your own orders",
                      short="your own orders", show=bool(line), line=line,
-                     metric={"manual": n_now}))
+                     metric={"manual": n_now}, count=n_now or n_win, unit="market",
+                     detail=(f"where they rest ({n_win:,} over the window)" if n_now and n_win > n_now
+                             else "where they rest" if n_now else "over the window; none rest now")))
 
     # watchdog / coverage (page only)
     wd = ev["alerts"].get("watchdog", []) + ev["alerts"].get("coverage", [])
@@ -1093,7 +1142,8 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
                      if wd else "no empty-book or one-sided page", title="Watchdog",
                      short="watchdog", show=bool(wd),
                      line=f"{len(wd)} page{_s(len(wd))} (an empty or one-sided book)",
-                     metric={"watchdog": len(wd)}))
+                     metric={"watchdog": len(wd)}, count=len(wd), unit="page",
+                     detail="an empty or one-sided book"))
 
     # open-scan tripwires
     if any((caps.get(k) or 0) > 0 for k in ("SCAN_FILL_HALT_CONTRACTS", "SCAN_MID_JUMP_CENTS",
@@ -1102,7 +1152,8 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
         rows.append(_row("GUARD", "Open-scan tripwires", "FIRED" if n else "QUIET", "", "", "",
                          f"{n} event{_s(n)} evicted" if n else "nothing evicted",
                          title="Open-scan tripwires", short="open-scan tripwires",
-                         show=bool(n), line=f"{n} event{_s(n)} evicted"))
+                         show=bool(n), line=f"{n} event{_s(n)} evicted",
+                         count=n, unit="event", detail="evicted"))
     else:
         rows.append(_row("GUARD", "Open-scan tripwires (fill / mid jump / drift)", "OFF",
                          "", "", "", "off: IMM_SCAN_FILL_HALT / MID_JUMP / DRIFT = 0",
@@ -1119,7 +1170,8 @@ def guard_rows(ev: dict, ctx: dict, tz) -> list:
         rows.append(_row("GUARD", "Other stand-downs", "FIRED", "", "", "",
                          line.replace("{usual}", ""), title="Other stand-downs",
                          short="other stand-downs", show=True, line=line,
-                         usual_key="other", metric={"other": n}))
+                         usual_key="other", metric={"other": n}, count=n, unit="market",
+                         detail=top(other, 6)))
     return rows
 
 
@@ -1181,22 +1233,32 @@ def _usual_of(r: dict, usual: dict):
     return _usual((r.get("metric") or {}).get(k), usual.get(k))
 
 
-def _closest(by: dict, usual: dict, tz, until=None):
-    """(text, hot) for the kill switch that came closest to its limit
-    without tripping (a trip leads the verdict on its own)."""
+def _closest_parts(by: dict, usual: dict, tz, until=None):
+    """The kill switch that came closest to its limit without tripping (a
+    trip leads the verdict on its own): {what, when, pct, limit, usual,
+    hot}, or None when none moved toward its limit."""
     kills = [r for r in by["kill"] if r.get("pct") is not None and r.get("worst_val")
              and r["status"] != "TRIPPED"]
     k = max(kills, key=lambda r: r["pct"]) if kills else None
     if not k or k["pct"] <= 0:
-        return "No kill switch moved toward its limit.", False
+        return None
     u, hot = _usual(k["pct"], usual.get("kill_pct"), pct=True)
     when = ""
     if k.get("worst_at"):
         when = f" at {_when(k['worst_at'], tz)}"
         note = _day_note(k["worst_at"], until, tz) if until else ""
         when += f" ({note[2:]})" if note else ""
-    return (f"Closest call: {k['short']} {k['worst_val']}{when}, {k['pct']:.0%} of the "
-            f"{k['limit_phrase']}{u}."), hot
+    return {"what": f"{k['short']} {k['worst_val']}", "when": when, "pct": k["pct"],
+            "limit": k["limit_phrase"], "usual": u, "hot": hot}
+
+
+def _closest(by: dict, usual: dict, tz, until=None):
+    """(text, hot) for the closest call."""
+    p = _closest_parts(by, usual, tz, until)
+    if not p:
+        return "No kill switch moved toward its limit.", False
+    return (f"Closest call: {p['what']}{p['when']}, {p['pct']:.0%} of the "
+            f"{p['limit']}{p['usual']}."), p["hot"]
 
 
 def headline(rows: list, usual: dict = None, tz=timezone.utc, until=None) -> str:
@@ -1273,68 +1335,15 @@ def record(path: str, day: str, m: dict, until: float = None) -> None:
 
 
 # ---- rendering ---------------------------------------------------------------------
+# Jack 2026-11-01, on the first cut: "it's still visually hard to read, improve
+# it". So: the verdict in a coloured box, the kill switches with a headroom
+# bar each, what held quoting back and the guards as tables (each guard's
+# count beside its usual, in columns), the rest in two grey lines.
 
-FOOT_NOTE = ("Account value is cash + positions against the 6am anchor, so reward "
-             "credits and transfers move it too; the daily loss is trading P&L only.")
-
-
-def _held_text(r: dict, usual: dict, html_out: bool = False) -> str:
-    """A holding-back row's text, its usual where its line puts it."""
-    u, hot = _usual_of(r, usual)
-    if "line" not in r:
-        return _esc(r["impact"]) if html_out else r["impact"]
-    if html_out:
-        return _esc(r["line"]).replace("{usual}", _usual_html(u, hot))
-    return r["line"].replace("{usual}", u)
-
-
-def text_lines(rows: list, ev: dict, tz, caps_note: str, usual: dict = None) -> list:
-    """Plain-text version, in the html's order. caps_note shows only when
-    the caps are NOT the bot's (it starts "!!")."""
-    usual = usual or {}
-    by = _blocks(rows)
-    L = ["RISK CONTROLS — " + window_note(ev, tz)]
-    if caps_note.startswith("!!"):
-        L.append("  " + caps_note)
-    L.append("  " + headline(rows, usual, tz, ev["until"]))
-    for r in rows:
-        if r["status"] == "TRIPPED":
-            L.append(f"  !! TRIPPED {r['name']}: {r['impact']}")
-    L.append("  " + held_line(rows))
-
-    L += ["", "  Kill switches (each stops all quoting)",
-          "    {:<16s}{:<26s}{:<40s}{}".format("", "limit", "worst in the window",
-                                               "now, since the 6am roll")]
-    halt_file = None
-    for r in by["kill"]:
-        if r["name"] == "Manual HALT file" and r["status"] != "TRIPPED":
-            halt_file = r
-            continue
-        mark = "!!" if r["status"] == "TRIPPED" else "! " if r["status"] == "CLOSE" else "  "
-        L.append("  {}{:<16s}{:<26s}{:<40s}{}".format(mark, r.get("title", r["name"]),
-                                                     r["limit"], r["worst"] or "-", r["now"]))
-    L.append("    " + (f"HALT file: {halt_file['now']}. " if halt_file else "") + FOOT_NOTE)
-
-    if by["held"]:
-        L += ["", "  Holding back quoting"]
-        for r in by["held"]:
-            L.append(f"  - {r.get('title', r['name'])}: {_held_text(r, usual)}")
-    L.append("")
-    if by["room"]:
-        L.append("  Room to spare: " + " · ".join(f"{r['short']} {r['brief']}"
-                                                  for r in by["room"]))
-    if by["design"]:
-        L.append("  By design: " + " · ".join(r["impact"] for r in by["design"]))
-
-    L += ["", "  Guards (normal work; usual = the median of the 7 days before)"]
-    for r in by["guard"]:
-        u, _hot = _usual_of(r, usual)
-        L.append(f"  - {r['title']}: {r['line'].replace('{usual}', u)}")
-    if by["quiet"]:
-        L.append("  Quiet: " + ", ".join(r["short"] for r in by["quiet"]) + ".")
-    if by["off"]:
-        L.append("  Off: " + "; ".join(r.get("short", r["name"]) for r in by["off"]) + ".")
-    return L
+FOOT_NOTE = ("Account value is cash + positions against the 6am anchor, so reward credits "
+             "and transfers move it too; the daily loss is trading P&L only.")
+HOT = "#d35400"                  # a count at UNUSUAL_X its usual
+RED, AMBER, GREEN = "#c0392b", "#e67e22", "#27ae60"
 
 
 def _esc(s) -> str:
@@ -1346,76 +1355,233 @@ def _esc(s) -> str:
 def _usual_html(u: str, hot: bool) -> str:
     if not u:
         return ""
-    return (f'<b style="color:#d35400">{_esc(u)}</b>' if hot else
+    return (f'<b style="color:{HOT}">{_esc(u)}</b>' if hot else
             f'<span style="color:#888">{_esc(u)}</span>')
 
 
-def html(rows: list, ev: dict, tz, caps_note: str, td: str, tdl: str,
-         usual: dict = None) -> str:
-    usual = usual or {}
-    by = _blocks(rows)
-    grey = "color:#777;font-size:12px"
-    line = "font-size:12px;margin:1px 0 1px 10px"
-    h = ['<div style="font-size:15px;font-weight:600;margin:16px 0 2px">Risk controls '
-         '<span style="{};font-weight:400">{}</span></div>'.format(grey, _esc(window_note(ev, tz)))]
-    if caps_note.startswith("!!"):
-        h.append('<div style="color:#c0392b;font-size:12px;font-weight:600">{}</div>'.format(
-            _esc(caps_note)))
-    tripped = [r for r in rows if r["status"] == "TRIPPED"]
-    if tripped:
-        h.append('<div style="background:#fdecea;border-left:4px solid #c0392b;color:#8e2b21;'
-                 'padding:6px 10px;margin:6px 0;font-weight:600">TRIPPED in the last 24h: '
-                 + "; ".join(_esc(r["name"]) + " &mdash; " + _esc(r["impact"]) for r in tripped)
-                 + '</div>')
-    close, hot = _closest(by, usual, tz, ev["until"])
-    head = "TRIPPED." if tripped else "Nothing tripped."
-    h.append('<div style="margin:4px 0;font-size:13px"><b>{}</b> {}<br>{}</div>'.format(
-        head, '<b style="color:#d35400">{}</b>'.format(_esc(close)) if hot else _esc(close),
-        _esc(held_line(rows))))
+def _units(n, unit: str) -> str:
+    return f"{unit}{_s(n)}" if unit else ""
 
-    h.append('<table style="border-collapse:collapse;font-size:12px;margin:6px 0 2px">'
-             '<tr style="background:#f0f0f0;font-weight:600"><td style="{0}">Kill switch '
-             '(stops all quoting)</td><td style="{1}">Limit</td><td style="{0}">Worst in the '
-             'window</td><td style="{0}">Now, since the 6am roll</td></tr>'.format(tdl, td))
-    halt_file = None
+
+def _kill_cell(r: dict, tz, until) -> str:
+    """A kill switch's worst, its % aside: the value, when, and its day."""
+    if r.get("cell"):
+        return r["cell"]
+    if r.get("worst_val") and r.get("worst_at"):
+        return (f"{r['worst_val']} · {_when(r['worst_at'], tz)}"
+                + _day_note(r["worst_at"], until, tz))
+    return r["worst"] or "-"
+
+
+def _kills(by: dict):
+    """(the kill switches for the table, the HALT file's row while it is absent)."""
+    rows, halt = [], None
     for r in by["kill"]:
         if r["name"] == "Manual HALT file" and r["status"] != "TRIPPED":
-            halt_file = r
-            continue
-        col = ("color:#c0392b;font-weight:700" if r["status"] == "TRIPPED" else
-               "color:#b7950b;font-weight:700" if r["status"] == "CLOSE" else "")
-        h.append('<tr><td style="{tdl}">{n}</td><td style="{td}">{lim}</td>'
-                 '<td style="{tdl}{col}">{w}</td><td style="{tdl}">{now}</td></tr>'.format(
-                     tdl=tdl, td=td, col=(";" + col) if col else "",
-                     n=_esc(r.get("title", r["name"])), lim=_esc(r["limit"]),
-                     w=_esc(r["worst"]) or "&mdash;", now=_esc(r["now"])))
-    h.append('</table><div style="{}">{}{}</div>'.format(
-        grey, _esc(f"HALT file: {halt_file['now']}. ") if halt_file else "", _esc(FOOT_NOTE)))
+            halt = r
+        else:
+            rows.append(r)
+    return rows, halt
+
+
+def _room_txt(by: dict) -> str:
+    """Room to spare, a % of each limit where there is one."""
+    out = []
+    for r in by["room"]:
+        if r["kind"] == "CAPACITY" and r.get("pct") is not None and "/" in (r.get("brief") or ""):
+            out.append(f"{r['short']} {r['pct']:.0%}")
+        else:
+            out.append(f"{r['short']} {r['brief']}")
+    return " · ".join(out)
+
+
+def _design_txt(by: dict) -> str:
+    return " · ".join(r.get("brief") or r["impact"] for r in by["design"])
+
+
+def _bar_html(pct) -> str:
+    """A 100px headroom bar: green under half the limit, amber to 80%, red past."""
+    p = max(0.0, pct or 0.0)
+    w = int(round(min(p, 1.0) * 100))
+    col = RED if p >= CLOSE_FRAC else AMBER if p >= 0.5 else GREEN
+    cell = "height:8px;line-height:8px;font-size:0;padding:0;"
+    return ('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;'
+            'display:inline-table;vertical-align:middle;margin-right:6px"><tr>'
+            + (f'<td style="{cell}width:{w}px;background:{col}"></td>' if w else "")
+            + (f'<td style="{cell}width:{100 - w}px;background:#e3e3e3"></td>' if w < 100 else "")
+            + "</tr></table>")
+
+
+def text_lines(rows: list, ev: dict, tz, caps_note: str, usual: dict = None) -> list:
+    """Plain-text version, in the html's order and in aligned columns.
+    caps_note shows only when the caps are NOT the bot's (it starts "!!")."""
+    usual = usual or {}
+    by = _blocks(rows)
+    until = ev["until"]
+    L = ["RISK CONTROLS — " + window_note(ev, tz)]
+    if caps_note.startswith("!!"):
+        L.append("  " + caps_note)
+    L.append("  " + headline(rows, usual, tz, until))
+    for r in rows:
+        if r["status"] == "TRIPPED":
+            L.append(f"  !! TRIPPED {r['name']}: {r['impact']}")
+    L.append("  " + held_line(rows))
+
+    kills, halt = _kills(by)
+    L += ["", "  KILL SWITCHES — each stops all quoting until the 6am roll",
+          "    {:<17s}{:>5s}  {:<38s}{:<26s}{}".format("", "worst", "", "limit",
+                                                     "now, since 6am")]
+    for r in kills:
+        mark = "!!" if r["status"] == "TRIPPED" else "! " if r["status"] == "CLOSE" else "  "
+        pct = f"{r['pct']:.0%}" if r.get("pct") is not None else ""
+        L.append("  {}{:<17s}{:>5s}  {:<38s}{:<26s}{}".format(
+            mark, r.get("title", r["name"]), pct, _kill_cell(r, tz, until), r["limit"],
+            r["now"]))
+    L.append("    " + (f"HALT file {halt['now']}. " if halt else "") + FOOT_NOTE)
 
     if by["held"]:
-        h.append('<div style="font-size:13px;font-weight:600;margin:8px 0 2px">Holding back '
-                 'quoting</div>')
+        L += ["", "  HOLDING BACK QUOTING"]
         for r in by["held"]:
-            h.append('<div style="{}"><b>{}</b>: {}</div>'.format(
-                line, _esc(r.get("title", r["name"])), _held_text(r, usual, html_out=True)))
-    if by["room"]:
-        h.append('<div style="{};margin-top:6px"><b>Room to spare:</b> {}</div>'.format(
-            grey, _esc(" · ".join(f"{r['short']} {r['brief']}" for r in by["room"]))))
-    if by["design"]:
-        h.append('<div style="{}"><b>By design:</b> {}</div>'.format(
-            grey, _esc(" · ".join(r["impact"] for r in by["design"]))))
+            u, _hot = _usual_of(r, usual)
+            L.append("  {}{:<18s}{}{}".format("!!" if r.get("alarm") else "  ",
+                                             r.get("title", r["name"]),
+                                             r.get("what", r["impact"]), u))
+            for w in r.get("where") or []:
+                L.append(" " * 22 + w)
+            if r.get("note"):
+                L.append(" " * 22 + "(" + r["note"] + ")")
 
-    h.append('<div style="font-size:13px;font-weight:600;margin:8px 0 2px">Guards '
-             '<span style="{};font-weight:400">normal work; usual = the median of the 7 '
-             'days before</span></div>'.format(grey))
+    L += ["", "  GUARDS — normal work; usual = the median of the 7 days before",
+          "    {:<24s}{:>12s}{:>7s}  {}".format("", "today", "usual", "biggest")]
     for r in by["guard"]:
-        u, uhot = _usual_of(r, usual)
-        h.append('<div style="{}"><b>{}</b>: {}</div>'.format(
-            line, _esc(r["title"]), _esc(r["line"]).replace("{usual}", _usual_html(u, uhot))))
+        n = r.get("count", 0)
+        u = usual.get(r.get("usual_key"))
+        hot = _usual(n, u)[1]
+        today = f"{n:,}" + (f" {_units(n, r.get('unit', ''))}" if r.get("unit") else "")
+        L.append("  {}{:<24s}{:>12s}{:>7s}  {}".format(
+            "! " if hot else "  ", r["title"], today,
+            f"{u:,.0f}" if u is not None else "-", r.get("detail", "")))
     if by["quiet"]:
-        h.append('<div style="{};margin-left:10px">Quiet: {}.</div>'.format(
-            grey, _esc(", ".join(r["short"] for r in by["quiet"]))))
+        L.append("    Quiet: " + ", ".join(r["short"] for r in by["quiet"]) + ".")
     if by["off"]:
-        h.append('<div style="{};margin-left:10px">Off: {}.</div>'.format(
-            grey, _esc("; ".join(r.get("short", r["name"]) for r in by["off"]))))
+        L.append("    Off: " + "; ".join(r.get("short", r["name"]) for r in by["off"]) + ".")
+    L.append("")
+    if by["room"]:
+        L.append("  ROOM TO SPARE: " + _room_txt(by))
+    if by["design"]:
+        L.append("  BY DESIGN: " + _design_txt(by))
+    return L
+
+
+def html(rows: list, ev: dict, tz, caps_note: str, td: str = "", tdl: str = "",
+         usual: dict = None) -> str:
+    """The email block. td / tdl (the digest's gridded cell styles) are
+    unused now: these tables keep to light row rules."""
+    usual = usual or {}
+    by = _blocks(rows)
+    until = ev["until"]
+    tripped = [r for r in rows if r["status"] == "TRIPPED"]
+    th = ("padding:2px 12px 3px 0;text-align:left;font-size:11px;color:#888;"
+          "font-weight:600;border-bottom:1px solid #ddd")
+    c = "padding:4px 12px 4px 0;border-bottom:1px solid #eee;vertical-align:top"
+    num = c + ";text-align:right;white-space:nowrap"
+    mono = "font-family:Consolas,Menlo,monospace;font-size:11px;color:#444"
+    grey = "font-size:11px;color:#888;margin:2px 0"
+    tbl = ('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;'
+           'font-size:12px;margin:2px 0 4px">')
+
+    def head(title, sub=""):
+        return ('<div style="font-size:11px;font-weight:700;color:#555;letter-spacing:.06em;'
+                'margin:14px 0 3px">' + title.upper()
+                + (f' <span style="font-weight:400;letter-spacing:0;color:#999">'
+                   f'&middot; {_esc(sub)}</span>' if sub else "") + "</div>")
+
+    h = ['<div style="font-size:15px;font-weight:600;margin:16px 0 4px">Risk controls '
+         '<span style="color:#888;font-weight:400;font-size:12px">{}</span></div>'.format(
+             _esc(window_note(ev, tz)))]
+    if caps_note.startswith("!!"):
+        h.append(f'<div style="color:{RED};font-size:12px;font-weight:600">'
+                 f'{_esc(caps_note)}</div>')
+
+    # the verdict
+    col, bg = (RED, "#fdecea") if tripped else ("#1e8449", "#eafaf1")
+    v = [f'<div style="font-size:14px;font-weight:700;color:{col}">'
+         + ("Tripped" if tripped else "Nothing tripped") + "</div>"]
+    for r in tripped:
+        v.append(f'<div style="color:{RED};font-weight:600">{_esc(r["name"])}: '
+                 f'{_esc(r["impact"])}</div>')
+    p = _closest_parts(by, usual, tz, until)
+    v.append("<div>Closest call: <b>{}</b>{}, <b>{:.0%}</b> of the {}{}</div>".format(
+        _esc(p["what"]), _esc(p["when"]), p["pct"], _esc(p["limit"]),
+        _usual_html(p["usual"], p["hot"])) if p else
+        "<div>No kill switch moved toward its limit.</div>")
+    v.append(f"<div>{_esc(held_line(rows))}</div>")
+    h.append(f'<div style="border-left:4px solid {col};background:{bg};padding:7px 12px;'
+             f'margin:4px 0;font-size:13px;line-height:1.55">' + "".join(v) + "</div>")
+
+    # the kill switches, each with a headroom bar
+    kills, halt = _kills(by)
+    h.append(head("Kill switches", "each stops all quoting until the 6am roll"))
+    h.append(tbl + f'<tr><td style="{th}">Switch</td><td style="{th}">Worst in the window'
+             f'</td><td style="{th}">Limit</td><td style="{th}">Now, since 6am</td></tr>')
+    for r in kills:
+        pct = r.get("pct")
+        tone = (f";color:{RED};font-weight:700" if r["status"] == "TRIPPED" else
+                f";color:{AMBER};font-weight:700" if r["status"] == "CLOSE" else "")
+        h.append(f'<tr><td style="{c};font-weight:600;white-space:nowrap">'
+                 f'{_esc(r.get("title", r["name"]))}</td><td style="{c}{tone}">'
+                 + (_bar_html(pct) + f"<b>{pct:.0%}</b> &nbsp;" if pct is not None else "")
+                 + f'{_esc(_kill_cell(r, tz, until))}</td>'
+                 f'<td style="{c};color:#666;white-space:nowrap">{_esc(r["limit"])}</td>'
+                 f'<td style="{c};white-space:nowrap">{_esc(r["now"])}</td></tr>')
+    h.append("</table>")
+    h.append(f'<div style="{grey}">' + (_esc(f"HALT file {halt['now']}. ") if halt else "")
+             + _esc(FOOT_NOTE) + "</div>")
+
+    # what held quoting back
+    if by["held"]:
+        h.append(head("Holding back quoting"))
+        h.append(tbl)
+        for r in by["held"]:
+            u, hot = _usual_of(r, usual)
+            dot = RED if r.get("alarm") else AMBER
+            h.append(f'<tr><td style="{c};white-space:nowrap"><span style="color:{dot}">'
+                     f'&#9679;</span> <b>{_esc(r.get("title", r["name"]))}</b></td>'
+                     f'<td style="{c}">{_esc(r.get("what", r["impact"]))}{_usual_html(u, hot)}'
+                     + (f'<div style="color:#888;font-size:11px">{_esc(r["note"])}</div>'
+                        if r.get("note") else "")
+                     + f'</td><td style="{c};{mono}">'
+                     + "<br>".join(_esc(w) for w in (r.get("where") or [])) + "</td></tr>")
+        h.append("</table>")
+
+    # the guards, today against their usual
+    h.append(head("Guards", "normal work; usual = the median of the 7 days before"))
+    h.append(tbl + f'<tr><td style="{th}">Guard</td><td style="{th};text-align:right">Today'
+             f'</td><td style="{th};text-align:right">Usual</td><td style="{th}">Biggest'
+             f'</td></tr>')
+    for r in by["guard"]:
+        n = r.get("count", 0)
+        u = usual.get(r.get("usual_key"))
+        hot = _usual(n, u)[1]
+        unit = _units(n, r.get("unit", ""))
+        h.append(f'<tr><td style="{c};font-weight:600;white-space:nowrap">'
+                 f'{_esc(r["title"])}</td><td style="{num}'
+                 + (f";color:{HOT}" if hot else "") + f'"><b>{n:,}</b>'
+                 + (f' <span style="font-size:11px;color:#888">{unit}</span>' if unit else "")
+                 + (" &#9650;" if hot else "") + "</td>"
+                 f'<td style="{num};color:#888">'
+                 + (f"{u:,.0f}" if u is not None else "&ndash;") + "</td>"
+                 f'<td style="{c};color:#555">{_esc(r.get("detail", ""))}</td></tr>')
+    h.append("</table>")
+    if by["quiet"]:
+        h.append(f'<div style="{grey}"><b>Quiet:</b> '
+                 f'{_esc(", ".join(r["short"] for r in by["quiet"]))}</div>')
+    if by["off"]:
+        h.append(f'<div style="{grey}"><b>Off:</b> '
+                 f'{_esc("; ".join(r.get("short", r["name"]) for r in by["off"]))}</div>')
+    if by["room"]:
+        h.append(f'<div style="{grey};margin-top:8px"><b>Room to spare:</b> '
+                 f'{_esc(_room_txt(by))}</div>')
+    if by["design"]:
+        h.append(f'<div style="{grey}"><b>By design:</b> {_esc(_design_txt(by))}</div>')
     return "".join(h)
