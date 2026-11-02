@@ -23118,16 +23118,29 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         self.assertNotIn("KXFEATURE", imm.ALLOW_SERIES)
         s = "KXFEATURE"
         self.assertTrue(imm.twk_say_series(s))
-        self.assertEqual(imm.event_cap_contracts("KXFEATURE-26GTA6"), 1500.0)
+        # resting 5,000 for the GTA album ("3x size with 5k resting cap then")
+        self.assertEqual(imm.event_cap_contracts("KXFEATURE-26GTA6"), 5000.0)
+        self.assertEqual(imm.event_cap_contracts("KXTRUMPSAYMONTH-26DEC01"), 1500.0)
         self.assertEqual(imm.series_max_position(s), 100.0)
         self.assertEqual(imm.pilot_halt_limit(s), 75.0)
         self.assertTrue(imm.series_override(s).safe_join)
         self.assertIsNone(imm.size_test_arm(s))
         with mock.patch.object(imm, "SERIES_HOUR_MULTS", self._saved_hour_mults):
+            # x3 to the program's end (2026-11-05 05:00Z), x2 overnight on top
+            for when, m in ((datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc), 6.0),
+                            (datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc), 3.0),
+                            (datetime(2026, 11, 5, 4, 59, tzinfo=timezone.utc), 3.0),   # 23:59 ET
+                            (datetime(2026, 11, 5, 5, 0, tzinfo=timezone.utc), 2.0),
+                            (datetime(2026, 11, 6, 17, 0, tzinfo=timezone.utc), 1.0)):
+                self.assertEqual(imm.hour_size_mult(s, when), m, when)
+            # the Trump series take no part of it
             self.assertEqual(imm.hour_size_mult(
-                s, datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc)), 2.0)    # 02 ET
-            self.assertEqual(imm.hour_size_mult(
-                s, datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)), 1.0)   # noon
+                "KXTRUMPSAYCOMPANY", datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)), 1.0)
+        self.assertEqual(imm.twk_say_size_mult(
+            s, datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)), 3.0)
+        with mock.patch.object(imm, "TWK_ENABLE", False):
+            self.assertEqual(imm.twk_say_size_mult(
+                s, datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)), 1.0)
         with mock.patch.object(imm, "TWK_ENABLE", False):
             self.assertFalse(imm.twk_event_ticker("KXFEATURE-26GTA6-DRA"))
         # "Stop Nov 18" (Jack 2026-11-01): out at 00:00 ET Nov 18, a day before

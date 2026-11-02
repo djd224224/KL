@@ -2444,6 +2444,9 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     if _share_x1(series):
         return 1.0
     m = _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
+    # a TRUMPSAY-group event's dated size (TWK_SAY_EVENT_SIZE: the GTA VI album
+    # x3 to its program's end, 2026-11-01)
+    m *= globals().get("twk_say_size_mult", lambda s, n: 1.0)(series, now_utc)
     if m > 1.0 and ca_landing_window(series, now_utc):
         return 1.0
     return m
@@ -3210,7 +3213,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     # TWK_SAY_FILL_CAP bounds their filled net in the quote loop
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         if series in globals().get("TWK_SAY_SERIES", ()):
-            return globals()["TWK_SAY_EVENT_CAP"]
+            # (a group event's own resting cap: the GTA VI album's 5,000)
+            return globals()["TWK_SAY_EVENT_RESTING_CAP"].get(
+                event_ticker_of(event_ticker), globals()["TWK_SAY_EVENT_CAP"])
         return globals()["TWK_EVENT_CAP"]
     # the NFL auto families (2026-10-12) and the league auto families
     # (2026-10-15): the ladders' / escalators' event cap
@@ -17124,6 +17129,21 @@ TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 1500)      # resting
 TWK_SAY_FILL_CAP = _env_float("IMM_TWK_SAY_FILL_CAP", 500)         # filled net
 # a group event's own filled-net cap (the GTA VI album: 1,000)
 TWK_SAY_EVENT_FILL_CAP: Dict[str, float] = {"KXFEATURE-26GTA6": 1000.0}
+# THE GTA VI ALBUM AT x3 (Jack 2026-11-01: "3x size with 5k resting cap then",
+# on "Size GTA up to x3 with a 5,000 resting cap until Nov 5?"). At 20 / 40
+# lots on books whose programs target 1,000 contracts, the bot earned 0.2-2.6%
+# of a market's ~$13.91/day, so 112 of 129 markets projected under the $1.30
+# bar over the period ending 2026-11-05 05:00Z; the estimate put x3 at 44-75
+# markets and $27-63/day. TWK_SAY_EVENT_SIZE multiplies the event's series
+# through hour_size_mult (rungs and the floor projection both) until the
+# listed instant -- then it is x1 again by itself; the per-market 100 still
+# caps a side (an overnight 120 rests 100). TWK_SAY_EVENT_RESTING_CAP gives
+# the event 5,000 of resting room (75 markets x 60); the filled net stays
+# 1,000 (TWK_SAY_EVENT_FILL_CAP).
+TWK_SAY_EVENT_SIZE: Dict[str, Tuple[float, datetime]] = {
+    "KXFEATURE-26GTA6": (3.0, datetime(2026, 11, 5, 5, 0, tzinfo=timezone.utc)),
+}
+TWK_SAY_EVENT_RESTING_CAP: Dict[str, float] = {"KXFEATURE-26GTA6": 5000.0}
 TWK_SAY_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_SAY_DAILY_LOSS_LIMIT", 75)
 TWK_SAY_TAKER_CT = _env_float("IMM_TWK_SAY_TAKER_CT", 100)
 # A group event's own pull size (Jack 2026-11-01: "for GTA increase the
@@ -17139,6 +17159,15 @@ TWK_SAY_HALT_SECS = _env_float("IMM_TWK_SAY_HALT_MIN",
 def twk_say_series(series: str) -> bool:
     """A monthly TRUMPSAY series on its own pilot terms (TWK_SAY_SERIES)."""
     return twk_series(series) and series in TWK_SAY_SERIES
+
+
+def twk_say_size_mult(series: str, now_utc: datetime) -> float:
+    """A TRUMPSAY-group event's dated size multiplier on its series
+    (TWK_SAY_EVENT_SIZE), 1.0 outside it or past its end."""
+    for ev, (mult, until) in TWK_SAY_EVENT_SIZE.items():
+        if series_of(ev) == series and now_utc < until and twk_series(series):
+            return mult
+    return 1.0
 
 
 def twk_say_fill_cap(event_ticker: str) -> float:
@@ -38206,6 +38235,9 @@ class IncentiveMarketMaker:
                 f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f"; TRUMPSAY {','.join(sorted(TWK_SAY_SERIES))}: x2 00-08 ET, "
                    f"{TWK_SAY_EVENT_CAP:g} resting / {TWK_SAY_FILL_CAP:g} filled net "
+                   + "".join(f"({_e} x{_m:g} to {_u:%m-%d %H:%MZ}, "
+                             f"{TWK_SAY_EVENT_RESTING_CAP.get(_e, TWK_SAY_EVENT_CAP):g} resting) "
+                             for _e, (_m, _u) in sorted(TWK_SAY_EVENT_SIZE.items()))
                    + "".join(f"({_e} {_n:g}) " for _e, _n in
                              sorted(TWK_SAY_EVENT_FILL_CAP.items()))
                    + f"per event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
