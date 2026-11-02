@@ -485,7 +485,7 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(ud.UpDownMarketMaker.num_levels_by_cadence, {"daily": 1})
         self.assertEqual(ann.AnnualMarketMaker.num_levels_by_asset_cadence, {})
         self.assertEqual(ud.UpDownMarketMaker.num_levels_by_asset_cadence,
-                         {("BTC", "daily"): 1})
+                         {("BTC", "daily"): 1, ("BTC", "weekly"): 0})
         self.assertEqual(ud.UpDownMarketMaker.quote_offset_by_cadence,
                          {"daily": 5, "weekly": 5})
         self.assertEqual(ann.AnnualMarketMaker.max_asset, 400)

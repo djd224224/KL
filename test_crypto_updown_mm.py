@@ -138,8 +138,15 @@ class FakeClient:
         raise AssertionError(f"unexpected client call: {name}")
 
 
+# The fixtures quote BTC, whose weekly tenor is OFF live since 2026-11-01
+# (0 rungs, Jack "take off btc weekly"). The weekly mechanics still run on the
+# six alts, so the fixture bot puts BTC weekly back on the base ladder;
+# test_btc_weekly_is_off_live checks the live table itself.
 def bot(client=None, live=False, cadences=("hourly", "daily")):
-    return ud.UpDownMarketMaker(BTC, client or FakeClient(), live=live, cadences=cadences)
+    b = ud.UpDownMarketMaker(BTC, client or FakeClient(), live=live, cadences=cadences)
+    b.num_levels_by_asset_cadence = {k: v for k, v in ud.NUM_LEVELS_BY_ASSET_CADENCE.items()
+                                     if k != ("BTC", "weekly")}
+    return b
 
 
 def _candles_ending_at(n, interval_minutes, sigma_bar, spot):
@@ -597,10 +604,12 @@ class TestRunCycle(unittest.TestCase):
         a test first."""
         self.assertEqual(ud.CONTRACTS_PER_LEVEL_BY_CADENCE, {"daily": 1})
         self.assertEqual(ud.NUM_LEVELS_BY_CADENCE, {"daily": 1})
-        self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE, {("BTC", "daily"): 1})
+        # BTC weekly OFF since 2026-11-01 (Jack "take off btc weekly")
+        self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE,
+                         {("BTC", "daily"): 1, ("BTC", "weekly"): 0})
         self.assertEqual(ud.QUOTE_OFFSET_BY_CADENCE, {"daily": 5, "weekly": 5})
         c = FakeClient(markets=daily_event() + weekly_event())
-        b = bot(c, cadences=("daily", "weekly"))
+        b = bot(c, cadences=("daily", "weekly"))   # fixture: the alts' weekly shape
         with priced():
             b.run_cycle()
         sizes, side_counts = {}, {}
@@ -627,6 +636,29 @@ class TestRunCycle(unittest.TestCase):
                 key = (o["ticker"], o["book_side"])
                 eth_counts[key] = eth_counts.get(key, 0) + 1
         self.assertEqual(max(eth_counts.values()), 1)
+
+    def test_btc_weekly_is_off_live(self):
+        """BTC's weekly quotes nothing since 2026-11-01 (Jack "take off btc
+        weekly"): zero rungs, so no book reads for the event, no new orders,
+        and whatever still rests there is cancelled on the next cycle. The
+        six alts keep their 3x1 weekly ladder."""
+        self.assertEqual(ud.NUM_LEVELS_BY_ASSET_CADENCE[("BTC", "weekly")], 0)
+        c = FakeClient(markets=weekly_event())
+        b = bot(c, cadences=("weekly",))                 # fixture: BTC weekly on
+        with priced():
+            b.run_cycle()
+        self.assertTrue(any(o["ticker"].startswith(EV_W) for o in b.state.sim_orders.values()))
+        b.num_levels_by_asset_cadence = ud.NUM_LEVELS_BY_ASSET_CADENCE   # the live table
+        c.orderbook_calls.clear()
+        with priced():
+            b.run_cycle()
+        self.assertEqual(c.orderbook_calls, [])
+        self.assertFalse(any(o["ticker"].startswith(EV_W) for o in b.state.sim_orders.values()))
+        eth = ud.UpDownMarketMaker(ud.ASSETS["ETH"], FakeClient(markets=weekly_event()),
+                                   live=False, cadences=("weekly",))
+        with priced():
+            eth.run_cycle()
+        self.assertTrue(eth.state.sim_orders)
 
     def test_daily_offset_is_five_cents_minimum_edge(self):
         """Same args run_cycle passes for a daily event: 1 rung x 1 @5c.

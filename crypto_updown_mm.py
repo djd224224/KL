@@ -195,8 +195,16 @@ NUM_LEVELS_BY_CADENCE = {
 # BTC's own pin predates the all-dailies cut and stays as a deliberate
 # floor: a future bump of the daily default must not silently resize BTC,
 # where all of the first week's daily loss lived.
+# BTC weekly OFF since 2026-11-01 (Jack "take off btc weekly"): +$7 on 12,053
+# contracts over its life, its 2x tape replay ~$0, and it carried most of the
+# weekly's week-to-week swing (sd $98/week vs $51 for the six alts together).
+# Zero rungs, not a DISABLED_ASSET_CADENCES entry: BTC has no other enabled
+# tenor, and an asset with none exits main() on ap.error, which the launcher
+# would respawn every ~30s. At zero rungs the bot stays up, reads no books
+# for the event, and cancels whatever it still has resting there.
 NUM_LEVELS_BY_ASSET_CADENCE = {
     ("BTC", "daily"): _env_i("CUD_NUM_LEVELS_DAILY_BTC", 1),
+    ("BTC", "weekly"): _env_i("CUD_NUM_LEVELS_WEEKLY_BTC", 0),
 }
 QUOTE_OFFSET_BY_CADENCE = {
     # 4->5c (Jack 2026-08-18 "min edge 5c") after the 8/17 defenses; the
@@ -1121,6 +1129,11 @@ class UpDownMarketMaker(mm.TouchMarketMaker):
                 + (f", risk short/long ${risk_short:.0f}/${risk_long:.0f} cap ${risk_cap:g}"
                    if risk_cap != float("inf") else "")
                 + (f" [{'; '.join(ev_notes)}]" if ev_notes else ""))
+            if n_levels <= 0:
+                # tenor switched off for this asset: no book reads, nothing
+                # desired, so diff_orders cancels anything still resting here
+                summary.append(f"    {self.cfg.asset} {v.cadence} OFF (0 rungs): not quoting")
+                continue
             remaining = len(band)
             for _moneyness, ticker, strike, fair in band:
                 share_buy = event_room_buy / remaining if remaining > 0 else 0.0
@@ -1375,7 +1388,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             parts.append(f"offset {off}c")
         n = NUM_LEVELS_BY_ASSET_CADENCE.get((a, c))
         if n is not None:
-            parts.append(f"{n} rung{'s' if n != 1 else ''}")
+            parts.append("OFF (0 rungs)" if n <= 0 else f"{n} rung{'s' if n != 1 else ''}")
         defenses.append(f"{a} {c} {', '.join(parts)}")
     if defenses:
         log(f"=== defenses: {'; '.join(defenses)} ===")

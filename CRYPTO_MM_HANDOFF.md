@@ -428,6 +428,15 @@ tests pass untouched — but the extraction means a future fix to `run_cycle` be
 
 ## Above/below variant (`crypto_updown_mm.py`, v1.0 — built 2026-08-05)
 
+**BTC WEEKLY OFF since 2026-11-01** (Jack "take off btc weekly"): `NUM_LEVELS_BY_ASSET_CADENCE`
+has `("BTC", "weekly"): 0`. The case: +$7 on 12,053 contracts lifetime, the tape replay of a
+bigger ladder at ~$0, and most of the weekly's week-to-week swing. The BTC bot stays up: at zero
+rungs it reads no books for the event and cancels anything still resting there. A
+`DISABLED_ASSET_CADENCES` entry would instead leave BTC with no enabled tenor, so main() would
+exit on `ap.error` and the launcher would respawn it every ~30s. Re-enable by removing the
+entry (or `CUD_NUM_LEVELS_WEEKLY_BTC=3` for an emergency). Banner: `BTC weekly OFF (0 rungs)`.
+The six alts are unchanged (3x1 @5c).
+
 **DAILY TENOR OFF fleet-wide since 2026-09-03** (Jack "turn off daily crypto markets.
 keep weekly/monthly"): `DISABLED_ASSET_CADENCES` default is now `"*:daily"` — the `*`
 wildcard disables a cadence for every asset (BTC's 8/23 solo off-switch subsumed;
