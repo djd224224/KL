@@ -24,7 +24,8 @@ THE EMAIL, for the prior ET day, money first:
   admitted  the strikes the rule admitted at the day's selection refreshes
             (a KXRT cutoff moved to RT_SETTLED_STOP_H before the 10:00 ET
             close, i.e. 04:00 ET; selection_snapshot rows), how many were
-            quoted, and how far the rest fell under the payout floor
+            quoted, and for each of the rest its best projection of the day
+            against the payout bar and the size that would clear it
 Verdict: STOP when a strike settled against the side the model called, or
 the net since go-live is STOP_NET_USD or worse; WATCH on a losing day or
 more than WATCH_OPEN_USD open against a swing; else OK.
@@ -235,9 +236,16 @@ def admitted(a_ts: float, b_ts: float) -> dict:
     """{ticker: its last selection row in the window} for the KXRT strikes
     whose cutoff the rule moved: a KXRT market closes 10:00 ET, so its own
     cutoff is 10:00 ET a week before and a settled strike's is
-    RT_SETTLED_STOP_H before the close."""
+    RT_SETTLED_STOP_H before the close. Each row carries "_best": the
+    window's highest projected_total, when, and the program days left then.
+    The day's last refresh comes minutes before the daily KXRT program rolls,
+    with almost nothing left to project (11/02: every strike read "$0.00
+    projected vs $1.30" while it projected $0.13-0.36 for a full day). Rows
+    past the strike's own cutoff are skipped: the rule no longer quotes it,
+    and counting them put 22 Wicker / Only Living Pickpocket strikes, at
+    99.5c until their 11/02 stand-down, into "qualified inside 2-98c"."""
     hour = int((10 - imm.RT_SETTLED_STOP_H) % 24)
-    out = {}
+    out, best = {}, {}
     for d in lm.utc_dates(a_ts, b_ts):
         try:
             fh = open(os.path.join(imm.STATUS_DIR, f"selection_snapshot_{d}.jsonl"),
@@ -255,10 +263,18 @@ def admitted(a_ts: float, b_ts: float) -> dict:
                 if not str(r.get("ticker", "")).startswith("KXRT-"):
                     continue
                 ts, cut = lm.row_ts(r), imm.parse_iso_utc(str(r.get("cutoff") or ""))
-                if not (a_ts <= ts < b_ts) or cut is None:
+                if not (a_ts <= ts < b_ts) or cut is None or r.get("decision") == "cutoff":
                     continue
                 if cut.astimezone(imm.ET).hour == hour and cut.astimezone(imm.ET).minute == 0:
-                    out[r["ticker"]] = r
+                    t, proj = r["ticker"], float(r.get("projected_total") or 0.0)
+                    out[t] = r
+                    if t not in best or proj > best[t]["projected_total"]:
+                        best[t] = dict(projected_total=proj, ts=ts,
+                                       qdays=float(r.get("qdays") or 0.0),
+                                       banked=float(r.get("banked") or 0.0),
+                                       floor_bar=float(r.get("floor_bar") or 0.0))
+    for t, r in out.items():
+        r["_best"] = best[t]
     return out
 
 
@@ -352,6 +368,29 @@ def _name(ctx, t: str) -> str:
     return f"{title} {k}"
 
 
+def _short_of_bar(ctx, r: dict) -> str:
+    """A strike the rule admitted that stayed out: its best projection of
+    the day, when, the program hours left then, and the multiple of our size
+    that would have cleared the bar (linear, as the RT floor boost reads it)."""
+    b = r.get("_best") or {}
+    proj, bar, banked = b.get("projected_total", 0.0), b.get("floor_bar", 0.0), b.get("banked", 0.0)
+    s = f"{_name(ctx, r['ticker'])}: ${proj:.2f}"
+    if b.get("ts"):
+        s += f" at {datetime.fromtimestamp(b['ts'], imm.ET):%H:%M} ET"
+    if b.get("qdays"):
+        s += f", with {b['qdays'] * 24:.0f}h of its program left"
+    s += f", vs ${bar:.2f}: "
+    if proj >= bar:
+        s += "it cleared the bar then"
+    elif proj > banked:
+        s += f"x{(bar - banked) / (proj - banked):.1f}"
+    else:
+        s += "nothing projected"
+    if r.get("decision") != "payout_floor":
+        s += f" ({r.get('decision')} at the last refresh)"
+    return s
+
+
 def render_text(ctx) -> str:
     day = datetime.strptime(ctx["day"], "%Y-%m-%d")
     fills = ctx["fills"]
@@ -384,19 +423,21 @@ def render_text(ctx) -> str:
     if inside:
         quoted = sorted(t for t, r in inside.items() if r.get("decision") == "selected")
         rest = sorted((r for t, r in inside.items() if r.get("decision") != "selected"),
-                      key=lambda r: -float(r.get("projected_total") or 0.0))
+                      key=lambda r: -(r.get("_best") or {}).get("projected_total", 0.0))
         out += ["", f"ADMITTED: {len(inside)} strike(s) qualified inside "
                     f"{imm.RT_SETTLED_BAND_LO}-{imm.RT_SETTLED_BAND_HI}c at the day's last "
                     f"refresh; {len(quoted)} quoted"
                     + (" (" + ", ".join(_name(ctx, t) for t in quoted) + ")" if quoted else "")
                     + "."]
         if rest:
-            out.append("  The rest stayed out: "
-                       + "; ".join(f"{_name(ctx, r['ticker'])} {r.get('decision')} "
-                                   f"(${float(r.get('projected_total') or 0.0):.2f} "
-                                   f"projected vs ${float(r.get('floor_bar') or 0.0):.2f})"
-                                   for r in rest[:4])
-                       + ("" if len(rest) <= 4 else f"; {len(rest) - 4} more"))
+            boost = (f"the RT floor boost goes to x{imm.RT_FLOOR_BOOST_MAX:g}"
+                     if imm.RT_FLOOR_BOOST_MAX > 1.0 else "the RT floor boost is off")
+            out.append("  The rest stayed out under the payout bar. Each one's best "
+                       "projection of the day at our size, and the size that would clear "
+                       f"the bar ({boost}):")
+            out += ["    " + _short_of_bar(ctx, r) for r in rest[:5]]
+            if len(rest) > 5:
+                out.append(f"    {len(rest) - 5} more")
     else:
         out += ["", f"ADMITTED: no strike qualified inside {imm.RT_SETTLED_BAND_LO}-"
                     f"{imm.RT_SETTLED_BAND_HI}c at the day's selection refreshes."]
