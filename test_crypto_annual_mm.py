@@ -494,9 +494,10 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(ud.UpDownMarketMaker.poll_secs, 30)
 
     def test_monthly_fleet_globals_untouched(self):
-        # 3x5 since 2026-08-22 (Jack "return to 3x5"; was 5x12 from 8/5)
+        # 3x8 since 2026-11-01 (Jack "1.5x now"); 3x5 from 2026-08-22 (Jack
+        # "return to 3x5"; was 5x12 from 8/5)
         self.assertEqual(mm.NUM_LEVELS, 3)
-        self.assertEqual(mm.CONTRACTS_PER_LEVEL, 5)
+        self.assertEqual(mm.CONTRACTS_PER_LEVEL, 8)
         self.assertEqual(mm.QUOTE_OFFSET_CENTS, 5)
 
     def test_own_order_prefix_and_status_dir(self):

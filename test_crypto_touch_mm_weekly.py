@@ -123,10 +123,11 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertTrue(mm.MODEL_VERSION.startswith("crypto_touch_mm_v"))
         self.assertNotEqual(mm.MODEL_VERSION, wk.MODEL_VERSION)
         # the weekly's env-shim leak would overwrite these with its 100/500;
-        # pin the monthly to its OWN configured defaults (200/1000 since
-        # 8/22 pm) instead of asserting inequality
-        self.assertEqual(mm.MAX_POSITION_CONTRACTS, 200.0)
-        self.assertEqual(mm.MAX_EVENT_CONTRACTS, 1000.0)
+        # pin the monthly to its OWN configured defaults (300/1500 since the
+        # 1.5x size, Jack 2026-11-01 "1.5x now"; 200/1000 from 8/22 pm)
+        # instead of asserting inequality
+        self.assertEqual(mm.MAX_POSITION_CONTRACTS, 300.0)
+        self.assertEqual(mm.MAX_EVENT_CONTRACTS, 1500.0)
         self.assertNotEqual(mm.MAX_POSITION_CONTRACTS,
                             wk.WeeklyTouchMarketMaker.max_position)
 

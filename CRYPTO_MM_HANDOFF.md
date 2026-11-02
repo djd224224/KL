@@ -104,6 +104,19 @@ net BUYER of touches in low-vol regimes — long vol, lumpy), both +$357. Rule 1
 Verify after any restart: banner line `risk rules v2.6 ON: vol shrink w=0.25 ...` on all 16 bots;
 status json carries `sigma_raw`, `sigma_median`, `risk_short_dollars`, `risk_long_dollars`.
 
+## Monthly size 1.5x (2026-11-01, Jack "1.5x now")
+
+Ladder **3x8** (was 3x5; 7.5 is not a whole contract, so the ladder rounds up while every cap is
+exactly 1.5x): **300/market, 1,500/event, $450 at risk per event and direction, skew full at
+450, reduce-only at 900** (the v2.6 30%/60% ratios to the event cap kept).
+- Evidence, fills since the 9/12 rules: our fills are ~0.1% of the volume traded in the same
+  markets, and 86% of filled monthly orders filled completely. A replay of the public tape (±2s
+  around all 1,345 fill clusters) had 1.5x size filling 1.2-1.4x the contracts, at about today's
+  edge per contract. Nearly all of that measured gain came from October's crash month.
+- Shard 2 needs about 1.5x October's peak position cost ($1,050 -> ~$1,600 for the monthly).
+- Stop rule: back to 3x5 and 200/1000/$300 if NOV30 settles below -$450, or the digest's
+  monthly section marks below -$750.
+
 ## v1.1 risk rules on the weekly and annual fleets (2026-09-12, Jack "add to weekly and annual bots too")
 
 The same four rules, applied through the above/below cycle's per-cadence tables (the annual bot

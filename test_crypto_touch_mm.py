@@ -1185,11 +1185,12 @@ class TestLiveRiskRuleConfig(unittest.TestCase):
         m = mm.MonthlyTouchMarketMaker
         self.assertEqual(m.vol_shrink_w, 0.25)
         self.assertEqual(m.ask_min_fair_cents, 15)
-        self.assertEqual(m.max_event_risk_dollars, 300)
+        # $300 / 300 / 600 until the 1.5x size (Jack 2026-11-01 "1.5x now")
+        self.assertEqual(m.max_event_risk_dollars, 450)
         self.assertEqual(m.skew_max_cents, 4)
-        self.assertEqual(m.skew_full_at, 300)
+        self.assertEqual(m.skew_full_at, 450)
         self.assertEqual(m.skew_edge_floor_cents, 3)
-        self.assertEqual(m.reduce_only_at, 600)
+        self.assertEqual(m.reduce_only_at, 900)
         self.assertEqual(mm.MODEL_VERSION, "crypto_touch_mm_v2.6")
 
     def test_base_class_rules_are_off(self):
@@ -1199,11 +1200,12 @@ class TestLiveRiskRuleConfig(unittest.TestCase):
         self.assertEqual(b.max_event_risk_dollars, float("inf"))
         self.assertEqual(b.skew_max_cents, 0)
         self.assertEqual(b.reduce_only_at, float("inf"))
-        # the shipped ladder/caps are inherited unchanged
+        # the shipped ladder/caps are inherited unchanged: 3x8, 300/1500 since
+        # the 1.5x size (Jack 2026-11-01 "1.5x now"; 3x5, 200/1000 before)
         self.assertEqual((mm.MonthlyTouchMarketMaker.num_levels,
                           mm.MonthlyTouchMarketMaker.contracts_per_level,
                           mm.MonthlyTouchMarketMaker.max_position,
-                          mm.MonthlyTouchMarketMaker.max_event), (3, 5, 200, 1000))
+                          mm.MonthlyTouchMarketMaker.max_event), (3, 8, 300, 1500))
 
 
 class TestShrunkVol(unittest.TestCase):
@@ -1374,20 +1376,23 @@ class TestMonthlyRulesCycle(unittest.TestCase):
         books = {self.CHEAP: (10, 12), self.MID: (35, 45)}
         fairs = {self.CHEAP: 12, self.MID: 40}
         t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
+        C = mm.CONTRACTS_PER_LEVEL
         b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), {}, books, fairs)
-        self.assertEqual(b_asks[t_cheap], [(17, 5), (19, 5), (21, 5)])   # base still sells
-        self.assertEqual(b_bids[t_cheap], [(7, 5), (5, 5), (3, 5)])
+        self.assertEqual(b_asks[t_cheap], [(17, C), (19, C), (21, C)])   # base still sells
+        self.assertEqual(b_bids[t_cheap], [(7, C), (5, C), (3, C)])
         m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), {}, books, fairs)
         self.assertNotIn(t_cheap, m_asks)                                 # floor: no asks
-        self.assertEqual(m_bids[t_cheap], [(7, 5), (5, 5), (3, 5)])       # bids untouched
-        self.assertEqual(m_asks[t_mid], [(45, 5), (47, 5), (49, 5)])      # fair 40 >= 15: sells
-        self.assertEqual(m_bids[t_mid], [(35, 5), (33, 5), (31, 5)])
+        self.assertEqual(m_bids[t_cheap], [(7, C), (5, C), (3, C)])       # bids untouched
+        self.assertEqual(m_asks[t_mid], [(45, C), (47, C), (49, C)])      # fair 40 >= 15: sells
+        self.assertEqual(m_bids[t_mid], [(35, C), (33, C), (31, C)])
 
     def test_reduce_only_when_long_past_threshold(self):
         books = {self.CHEAP: (30, 34), self.MID: (35, 45)}
         fairs = {self.CHEAP: 32, self.MID: 40}
         t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
-        positions = {t_cheap: 650.0}          # event net +650 >= 600
+        long_ = mm.MonthlyTouchMarketMaker.reduce_only_at + 50   # +950 >= 900
+        self.assertLess(long_, mm.MAX_EVENT_CONTRACTS)   # the base still has room
+        positions = {t_cheap: long_}
         b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), positions, books, fairs)
         self.assertIn(t_mid, b_bids)          # base keeps buying the other strike
         m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), positions, books, fairs)
@@ -1399,10 +1404,12 @@ class TestMonthlyRulesCycle(unittest.TestCase):
         books = {self.CHEAP: (30, 34), self.MID: (35, 45)}
         fairs = {self.CHEAP: 32, self.MID: 40}
         t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
-        # -650 short at fair 32 also puts $442 at risk (> $300 cap): both rules
+        # -950 short at fair 32 also puts $646 at risk (> $450 cap): both rules
         # agree — no asks; bids quote on both strikes.
+        short = -(mm.MonthlyTouchMarketMaker.reduce_only_at + 50)
+        self.assertGreater(-short * 0.68, mm.MonthlyTouchMarketMaker.max_event_risk_dollars)
         m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(),
-                                   {t_cheap: -650.0}, books, fairs)
+                                   {t_cheap: short}, books, fairs)
         self.assertEqual(m_asks, {})
         self.assertIn(t_mid, m_bids)
 
@@ -1410,7 +1417,12 @@ class TestMonthlyRulesCycle(unittest.TestCase):
         books = {self.CHEAP: (15, 25), self.MID: (35, 45)}
         fairs = {self.CHEAP: 20, self.MID: 40}
         t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
-        positions = {t_cheap: -400.0}         # 400 x (100-20)c = $320 >= $300 cap; net -400 < 600
+        # 600 x (100-20)c = $480 >= the $450 cap, while net -600 stays short of
+        # reduce-only (900): the risk cap alone must block every strike's asks
+        m = mm.MonthlyTouchMarketMaker
+        self.assertGreaterEqual(600 * 0.8, m.max_event_risk_dollars)
+        self.assertLess(600, m.reduce_only_at)
+        positions = {t_cheap: -600.0}
         b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), positions, books, fairs)
         self.assertIn(t_mid, b_asks)
         m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), positions, books, fairs)
@@ -1419,29 +1431,32 @@ class TestMonthlyRulesCycle(unittest.TestCase):
 
     def test_risk_cap_shaves_the_ladder(self):
         class TightRisk(mm.MonthlyTouchMarketMaker):
-            max_event_risk_dollars = 20.0
+            max_event_risk_dollars = 22.0
             skew_max_cents = 0
 
         books = {self.CHEAP: (15, 25), self.MID: (35, 45)}
         fairs = {self.CHEAP: 20, self.MID: 40}
         t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
         _b, asks, _ = _cycle(TightRisk, self._markets(), {}, books, fairs)
-        # near-money first: MID (fair 40) quotes 15 asks = $9 at risk; CHEAP
-        # (fair 20, 80c/ct) then gets (20-9)/0.8 = 13 contracts, not 15.
-        self.assertEqual(sum(c for _p, c in asks[t_mid]), 15)
-        self.assertEqual(sum(c for _p, c in asks[t_cheap]), 13)
+        # near-money first: MID (fair 40) quotes its full 3x8 = 24 asks =
+        # $14.40 at risk; CHEAP (fair 20, 80c/ct) then gets (22-14.4)/0.8 = 9.5
+        # -> 9 contracts, not 24.
+        self.assertEqual(sum(c for _p, c in asks[t_mid]), 24)
+        self.assertEqual(sum(c for _p, c in asks[t_cheap]), 9)
 
     def test_inventory_skew_moves_quotes_against_the_position(self):
         books = {self.CHEAP: (30, 34), self.MID: (46, 54)}
         fairs = {self.CHEAP: 32, self.MID: 50}
         t_cheap, t_mid = _mk(self.CHEAP)["ticker"], _mk(self.MID)["ticker"]
-        positions = {t_cheap: 150.0}          # half of skew_full_at -> 2c skew
+        C = mm.CONTRACTS_PER_LEVEL
+        # half of skew_full_at (450 -> 225) -> 2c skew
+        positions = {t_cheap: mm.MonthlyTouchMarketMaker.skew_full_at / 2}
         b_bids, b_asks, _ = _cycle(mm.TouchMarketMaker, self._markets(), positions, books, fairs)
-        self.assertEqual(b_bids[t_mid], [(45, 5), (43, 5), (41, 5)])
-        self.assertEqual(b_asks[t_mid], [(55, 5), (57, 5), (59, 5)])
+        self.assertEqual(b_bids[t_mid], [(45, C), (43, C), (41, C)])
+        self.assertEqual(b_asks[t_mid], [(55, C), (57, C), (59, C)])
         m_bids, m_asks, _ = _cycle(mm.MonthlyTouchMarketMaker, self._markets(), positions, books, fairs)
-        self.assertEqual(m_bids[t_mid], [(43, 5), (41, 5), (39, 5)])   # bids back off 2c
-        self.assertEqual(m_asks[t_mid], [(54, 5), (56, 5), (58, 5)])   # asks join the book's 54
+        self.assertEqual(m_bids[t_mid], [(43, C), (41, C), (39, C)])   # bids back off 2c
+        self.assertEqual(m_asks[t_mid], [(54, C), (56, C), (58, C)])   # asks join the book's 54
 
     def test_flat_book_monthly_matches_base_when_fair_is_above_floor(self):
         books = {self.CHEAP: (30, 34), self.MID: (35, 45)}

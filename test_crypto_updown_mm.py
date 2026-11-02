@@ -1164,9 +1164,10 @@ class TestFleetIsolation(unittest.TestCase):
         C = ud.UpDownMarketMaker
         self.assertEqual((C.max_position, C.max_event), (80.0, 400.0))
         # independence rests on the CUD_/CMM_ env split; each fleet's values
-        # are pinned here (monthly 200/1000 since 8/22 pm)
-        self.assertEqual(mm.TouchMarketMaker.max_position, 200.0)
-        self.assertEqual(mm.TouchMarketMaker.max_event, 1000.0)
+        # are pinned here (monthly 300/1500 since the 1.5x size, Jack
+        # 2026-11-01 "1.5x now"; 200/1000 from 8/22 pm)
+        self.assertEqual(mm.TouchMarketMaker.max_position, 300.0)
+        self.assertEqual(mm.TouchMarketMaker.max_event, 1500.0)
 
     def test_data_cache_still_shared(self):
         self.assertTrue(mm._cache_path("price", "XBTUSD").startswith(mm.STATUS_DIR))

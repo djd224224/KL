@@ -134,7 +134,10 @@ MARKETS: Dict[str, MarketConfig] = {m.key: m for m in [
 QUOTE_OFFSET_CENTS = int(os.environ.get("CMM_QUOTE_OFFSET_CENTS", 5))
 LEVEL_SPACING_CENTS = int(os.environ.get("CMM_LEVEL_SPACING_CENTS", 2))
 NUM_LEVELS = int(os.environ.get("CMM_NUM_LEVELS", 3))
-CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 5))
+# 3x8 since 2026-11-01 (Jack "1.5x now"): 7.5 is not a whole contract, so the
+# ladder rounds up to 8 (1.6x resting) while every cap and threshold below is
+# exactly 1.5x. Was 3x5 from 2026-08-22.
+CONTRACTS_PER_LEVEL = int(os.environ.get("CMM_CONTRACTS_PER_LEVEL", 8))
 # HARD PRICE ENVELOPE (Jack 2026-09-13: "Don't quote Crypto above 90c"). No
 # resting order may BUY a side above BID_MAX_CENTS: a YES bid above 90c, or
 # a YES ask below ASK_MIN_CENTS (10c), which Kalshi books as a NO purchase
@@ -173,15 +176,18 @@ ASK_MIN_FAIR_CENTS = int(os.environ.get("CMM_ASK_MIN_FAIR_CENTS", 15))
 #     (100-fair)/ct if the strike touches, longs risk fair/ct if it never does.
 #     Adjacent strikes are one bet in a trend; the 28 cap-sized tickers made
 #     ALL of the Jul-Sep loss (-$1,651) while the other 162 made +$905.
-MAX_EVENT_RISK_DOLLARS = float(os.environ.get("CMM_MAX_EVENT_RISK", 300))
+#     $300 -> $450 with the 1.5x size (2026-11-01).
+MAX_EVENT_RISK_DOLLARS = float(os.environ.get("CMM_MAX_EVENT_RISK", 450))
 #  4. inventory skew (fair shifts against the event net, full at SKEW_FULL_AT;
 #     the side being encouraged keeps >= SKEW_EDGE_FLOOR of edge vs the
 #     unskewed fair, like the daily updown bot) + reduce-only at
-#     REDUCE_ONLY_AT net, well before the 1000-contract event cap.
+#     REDUCE_ONLY_AT net, well before the 1500-contract event cap. Both keep
+#     the v2.6 ratios to the event cap (30% / 60%): 300/600 -> 450/900 with
+#     the 1.5x size.
 SKEW_MAX_CENTS = int(os.environ.get("CMM_SKEW_MAX_CENTS", 4))
-SKEW_FULL_AT_CONTRACTS = float(os.environ.get("CMM_SKEW_FULL_AT", 300))
+SKEW_FULL_AT_CONTRACTS = float(os.environ.get("CMM_SKEW_FULL_AT", 450))
 SKEW_EDGE_FLOOR_CENTS = int(os.environ.get("CMM_SKEW_EDGE_FLOOR_CENTS", 3))
-REDUCE_ONLY_AT_CONTRACTS = float(os.environ.get("CMM_REDUCE_ONLY_AT", 600))
+REDUCE_ONLY_AT_CONTRACTS = float(os.environ.get("CMM_REDUCE_ONLY_AT", 900))
 
 # Risk / hygiene parameters
 # Caps scale proportionally with ladder size. History: 3x8 -> 128/800;
@@ -192,13 +198,16 @@ REDUCE_ONLY_AT_CONTRACTS = float(os.environ.get("CMM_REDUCE_ONLY_AT", 600))
 # 200/1000 (Jack "expand to 200/market, 1000/event") — ladder stays 3x5, so
 # the caps are room to ACCUMULATE, not bigger resting size. Markets holding
 # more than the cap quote reduce-only until they shrink below it.
-MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 200))  # per market, either sign
+# 1.5x on 2026-11-01 (Jack "1.5x now"): 3x8 ladder, 300/market, 1500/event.
+# The public-tape replay of every post-9/12 fill had more size filling at
+# about the same edge per contract (fills x1.2-1.4 at 1.5x).
+MAX_POSITION_CONTRACTS = float(os.environ.get("CMM_MAX_POSITION", 300))  # per market, either sign
 # Net cap across all strikes of one event (they are one correlated bet on the
 # same spot). 500 comfortably exceeds 8 full 3x10 ladders (480): non-binding
 # at rest so every bucket gets the full spec ladder; binds as fills
 # accumulate. The event budget is split evenly across quotable markets each
 # cycle.
-MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 1000))
+MAX_EVENT_CONTRACTS = float(os.environ.get("CMM_MAX_EVENT", 1500))
 SKIP_FAIR_ABOVE_CENTS = 97       # near-certain touch: model risk dominates, stand down
 BOOK_DIVERGENCE_BID = 85         # best bid >= this while our fair is 20c+ lower ->
 BOOK_DIVERGENCE_GAP = 20         # ... suspected touch we can't see; stand down
