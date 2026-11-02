@@ -9351,6 +9351,29 @@ GENMOV_SIZE_MULT = _env_float("IMM_GENMOV_SIZE_MULT", 3.0)
 SERIES_OVERRIDES[GENMOV_SERIES] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
                                           size_mult=GENMOV_SIZE_MULT)
 
+# KXGOPSIXSENATE (Jack 2026-11-02: "2x it and quote it", on "Leave
+# KXGOPSIXSENATE dark?"). "Will Republicans win 5+ of AK, IA, KS, MI, OH, TX
+# Senate?", one market (AL5), listed with a $52.62/day program at 19:00Z
+# 11/02, three hours before the family's election-day cutoff (00:00 ET 11/03).
+# Behind a ~37k-contract book it projected $0.44-1.25 for the night against
+# the $1.30 entry bar, so it flipped payout_floor / admit_pending and never
+# rested.
+#   * x4 = 2x the family x2, as KXGENERALMOV's x3: the election guard set at
+#     size_mult GOPSIX_SIZE_MULT (rungs 20 -> 80, per-market cap 150 -> 600).
+#     The series hashes to the size test's control half, so no x1.5 on top.
+#   * FORCED (FORCE_EVENTS): past the payout floor, the rate floor, the
+#     hopeless exit and the admission wait. The election cutoff still ends it
+#     at 05:00Z 11/03, so the force cannot outlive tonight.
+# IMM_GOPSIX_SIZE_MULT=2 / IMM_GOPSIX_FORCE_EVENTS="" undo either.
+GOPSIX_SERIES = "KXGOPSIXSENATE"
+GOPSIX_SIZE_MULT = _env_float("IMM_GOPSIX_SIZE_MULT", 4.0)
+SERIES_OVERRIDES[GOPSIX_SERIES] = replace(SERIES_OVERRIDES[ELECTION_ARCHETYPE],
+                                          size_mult=GOPSIX_SIZE_MULT)
+FORCE_EVENTS = FORCE_EVENTS | frozenset(
+    e.strip() for e in os.environ.get(
+        "IMM_GOPSIX_FORCE_EVENTS", "KXGOPSIXSENATE-26NOV03").split(",")
+    if e.strip())
+
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
 # global ladder and caps. Every member clones it (FAMILY_OVERRIDE_PARENTS).
@@ -11913,6 +11936,7 @@ _CONFIG_CODE_KNOBS = (
     "APRPOTUS_SIZE_MULT",         # the weekly RCP approval x5 (2026-10-25)
     "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
+    "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",

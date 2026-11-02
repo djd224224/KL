@@ -27500,6 +27500,15 @@ class TestForceEventsEmptied(unittest.TestCase):
                 _clean_persist()
             self.assertEqual(T in bot.state.selected, forced, forced)
 
+    def test_gopsix_senate_is_forced_at_twice_the_family_size(self):
+        """Jack 2026-11-02: "2x it and quote it" (KXGOPSIXSENATE, forced in
+        code, so the launcher stays empty)."""
+        self.assertIn("KXGOPSIXSENATE-26NOV03", imm.FORCE_EVENTS)
+        fam = imm.SERIES_OVERRIDES[imm.ELECTION_ARCHETYPE]
+        ov = imm.SERIES_OVERRIDES["KXGOPSIXSENATE"]
+        self.assertEqual(ov.size_mult, 2 * fam.size_mult)
+        self.assertEqual(dataclasses.replace(ov, size_mult=fam.size_mult), fam)
+
 
 class TestFloorSideSchedule(unittest.TestCase):
     """ROI scan fix (Jack 2026-09-27, "fix all 3"): the Carbon Arc
