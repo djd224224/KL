@@ -37240,6 +37240,164 @@ class TestTapeTrigger(unittest.TestCase):
             self.bot._tape_start(lambda: {})
         self.assertIsNone(self.bot._tape)
 
+    # ---- the live A/B (Jack 2026-11-02: "Build it"; 1-minute pause) ----------
+
+    def _ab(self, frac):
+        """IMM_TAPE_TRIGGER=ab at TAPE_AB_FRAC `frac` (1.0: every window
+        pauses; 0.0: every window is a control), its 60 s hold, 100+ rule and
+        40-cancel reserve."""
+        for name, v in (("TAPE_TRIGGER", "ab"), ("TAPE_AB_FRAC", frac),
+                        ("TAPE_HOLD_SECS", 60.0), ("TAPE_AB_MIN_CT", 100.0),
+                        ("TAPE_AB_CANCEL_RESERVE", 40)):
+            self.enterContext(mock.patch.object(imm, name, v))
+
+    def test_ab_pause_pulls_the_event_for_its_own_60s(self):
+        self._ab(1.0)
+        self._print(self.S, "no", 40, 60, 0.0)
+        self._print(self.S, "no", 39, 50, 0.3)          # 110 in one burst
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["ab"], trip["hold_s"], trip["ab_frac"]),
+                         ("on", "pause", 60.0, 1.0))
+        self.assertAlmostEqual(trip["until"], self.now + 60.3, places=2)
+        self.assertTrue(0.0 <= trip["ab_u"] < 1.0)
+        # held 60 s, not the sweep breaker's 600
+        self.assertTrue(self.bot.sweep_held(self.E, self.now + 30))
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 61))
+        self.assertEqual(sorted(self.cancelled), [("o1", "tape_trigger"),
+                                                  ("o2", "tape_trigger"),
+                                                  ("o3", "tape_trigger")])
+        st = self.bot._tape_st
+        self.assertEqual((st["ab_pause"], st["ab_control"], st["trips_live"]), (1, 0, 1))
+
+    def test_ab_control_logs_its_window_and_pulls_nothing(self):
+        self._ab(0.0)
+        self._print(self.S, "no", 40, 100, 0.0)          # 100 at one price
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["ab"], trip["hold_s"]), ("dry", "control", 60.0))
+        self.assertEqual(self.cancelled, [])
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 10))
+        self._fill("o1", 20, self.A, dt=20.0)            # inside the control window
+        held, = self._lines("held_fill")
+        self.assertEqual((held["ab"], held["mode"], held["scope"]), ("control", "dry", "event"))
+        self.assertEqual(self.bot._tape_st["ab_control"], 1)
+
+    def test_ab_trips_on_size_alone(self):
+        # the replay's rule C: 100+ in one burst at any prices; the book's
+        # 25-over-2 line trips nothing in the A/B
+        self._ab(0.0)
+        self._print(self.S, "no", 40, 30, 0.0)
+        self._print(self.S, "no", 39, 30, 0.2)          # 60 over 2 prices
+        self.assertEqual(self._lines("trip"), [])
+        self._print(self.S, "no", 38, 40, 0.4)          # the same burst: 100
+        trip, = self._lines("trip")
+        self.assertEqual((trip["count"], trip["levels"], trip["ab"]), (100.0, 3, "control"))
+
+    def test_ab_a_later_trip_extends_a_pause_with_nothing_left_resting(self):
+        self._ab(1.0)
+        self._print(self.S, "no", 40, 100, 0.0)          # paused until +60
+        # every order of ours there is gone, so the event leaves the sets...
+        self.bot._tape_refresh_sets(self.now + 10.0)
+        self.assertNotIn(self.E, self.bot._tape_keys)
+        # ...yet a sibling's 100-lot 40 s in still extends the pause
+        self._print(self.B, "yes", 31, 120, 40.0)
+        ext = self._lines("trip")[1]
+        self.assertEqual((ext["mode"], ext["ab"], ext["extend"], ext["pull"]),
+                         ("inside", "pause", 2, []))
+        self.assertAlmostEqual(ext["until"], self.now + 100.0, places=2)
+        self.assertAlmostEqual(ext["window_at"], self.now, places=2)
+        self.assertTrue(self.bot.sweep_held(self.E, self.now + 99))
+        self.assertFalse(self.bot.sweep_held(self.E, self.now + 101))
+        st = self.bot._tape_st
+        self.assertEqual((st["ab_extend"], st["ab_pause"], st["trips_live"]), (1, 1, 1))
+
+    def test_ab_a_control_window_extends_and_a_closed_one_draws_anew(self):
+        self._ab(0.0)
+        self._print(self.S, "no", 40, 100, 0.0)
+        self._print(self.B, "yes", 31, 100, 50.0)        # inside: now to +110
+        self.assertEqual([t["mode"] for t in self._lines("trip")], ["dry", "inside"])
+        self.assertAlmostEqual(self.bot._tape_win[self.E]["until"], self.now + 110.0, places=2)
+        self._print(self.S, "no", 40, 100, 200.0)        # over: a new window
+        third = self._lines("trip")[2]
+        self.assertEqual((third["mode"], third["ab"]), ("dry", "control"))
+        self.assertIn("ab_u", third)
+        self.assertNotIn("extend", third)
+        self.assertEqual(self.bot._tape_st["ab_control"], 2)
+
+    def test_ab_arm_is_a_stable_hash_split_at_the_fraction(self):
+        with mock.patch.object(imm, "TAPE_AB_FRAC", 0.5):
+            arms = [imm.tape_ab_arm("KXEVT-26NOV05", f"tid{i}") for i in range(4000)]
+            self.assertEqual(arms[7], imm.tape_ab_arm("KXEVT-26NOV05", "tid7"))
+            share = sum(1 for a, _u in arms if a == "pause") / len(arms)
+            self.assertTrue(0.46 < share < 0.54, share)
+            self.assertTrue(all((a == "pause") == (u < 0.5) for a, u in arms))
+        with mock.patch.object(imm, "TAPE_AB_FRAC", 0.0):
+            self.assertEqual(imm.tape_ab_arm("K", "x")[0], "control")
+        with mock.patch.object(imm, "TAPE_AB_FRAC", 1.0):
+            self.assertEqual(imm.tape_ab_arm("K", "x")[0], "pause")
+
+    def test_ab_draws_from_the_crossing_print(self):
+        self._ab(0.5)
+        self._print(self.S, "no", 40, 60, 0.0, tid="P1")
+        self._print(self.S, "no", 39, 60, 0.3, tid="P2")  # crosses 100 at P2
+        trip, = self._lines("trip")
+        arm, u = imm.tape_ab_arm(self.E, "P2")
+        self.assertEqual((trip["cross_tid"], trip["ab"], trip["ab_u"]), ("P2", arm, round(u, 6)))
+
+    def test_ab_leaves_mentions_exempt_and_trumpsay_its_own_pull(self):
+        self._ab(1.0)
+        for name, v in (("TWK_ENABLE", True), ("TWK_SERIES", frozenset({"KXEVT"})),
+                        ("TWK_SAY_SERIES", frozenset({"KXEVT"}))):
+            self.enterContext(mock.patch.object(imm, name, v))
+        self._print(self.S, "yes", 60, 100, 0.0)         # TRUMPSAY: its own hold
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["hold_s"]), ("on", 600.0))
+        self.assertNotIn("ab", trip)
+        m = "KXTRUMPMENTION-26NOV05"
+        self.bot._resting_view[m + "-WORD"] = [
+            {"order_id": "o9", "side": "ask", "px": 30.0, "rem": 50.0,
+             "placed": self.now - 100.0, "pad": False}]
+        self._print(m + "-OTHER", "yes", 30, 100, 6.0)
+        self.assertEqual(self._lines("trip")[1]["mode"], "exempt")
+        self.assertNotIn(("o9", "tape_trigger"), self.cancelled)
+
+    def test_ab_pulls_leave_a_reserve_of_the_cancel_budget(self):
+        self._ab(1.0)
+        self.enterContext(mock.patch.object(imm, "WS_FAST_MAX_CANCELS_PER_MIN", 42))
+        self._print(self.S, "no", 40, 100, 0.0)          # 40 of 42 kept back
+        self.assertEqual((len(self.cancelled), self.bot._tape_st["skipped_budget"]), (2, 1))
+        self.assertTrue(self.bot.sweep_held(self.E, self.now + 30))   # the cycle pulls the rest
+
+    def test_ab_pause_runs_dry_without_the_sweep_breaker(self):
+        self._ab(1.0)
+        self.enterContext(mock.patch.object(imm, "SWEEP_BREAKER", "dry"))
+        self._print(self.S, "no", 40, 100, 0.0)
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["ab"], self.cancelled), ("dry", "pause", []))
+
+    def test_a_sweep_inside_a_tape_pause_still_holds_the_breakers_full_length(self):
+        # the sweep breaker keeps its own trip state and escalation chain: a
+        # tape pause neither swallows its trip nor counts as an earlier hold
+        self._ab(1.0)
+        self.enterContext(mock.patch.object(imm, "SWEEP_ESCALATE", "on"))
+        self.enterContext(mock.patch.object(imm, "WS_FAST_MAX_CANCELS_PER_MIN", 41))
+        self._print(self.S, "no", 40, 100, 0.0)          # 1 pulled, 2 left to the cycle
+        self.assertEqual(self.cancelled, [("o1", "tape_trigger")])
+        self._fill("o3", 10, self.B, dt=5.0)             # o3 filled out in the pause
+        sweep, = [r for n, r in self.recs if n == "ws_sweep" and r["ev"] == "trip"]
+        self.assertEqual((sweep["mode"], sweep["hold_s"], sweep["trip_n"]), ("on", 600.0, 1))
+        self.assertAlmostEqual(self.bot._sweep_hold[self.E], self.now + 605.0, places=1)
+        self.assertTrue(self.bot.sweep_held(self.E, self.now + 300))
+
+    def test_ab_status_block(self):
+        self._ab(1.0)
+        self._print(self.S, "no", 40, 100, 0.0)
+        self.bot.write_status(datetime.now(timezone.utc))
+        with open(os.path.join(imm.STATUS_DIR, "status_incentive_mm.json"),
+                  encoding="utf-8") as f:
+            tape = json.load(f)["latency"]["tape"]
+        self.assertEqual((tape["mode"], tape["ab_pause"], tape["ab_windows_now"],
+                          tape["ab_hold_s"], tape["ab_frac"]), ("ab", 1, 1, 60.0, 1.0))
+
 
 class TestRiskLimits(unittest.TestCase):
     """DOLLAR WORST-CASE LIMITS + SKEW, dry (RISK_LIMITS, Jack 2026-10-17:

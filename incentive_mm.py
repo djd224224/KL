@@ -4896,21 +4896,62 @@ SWEEP_GROUP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_GROUP_MIN_CT", 0.0))
 # and never pulled. A trip also opens a window on its risk_group (SWEEP_GROUP's
 # groups): our fills in the group's OTHER events inside it are `held_fill`
 # lines with scope "group" -- logged only, to score a group scope.
-#    IMM_TAPE_TRIGGER=dry -- THE DEFAULT.  =on -- live.  =off -- no tape feed.
+#
+# THE LIVE A/B (Jack 2026-11-02: "Build it", on "Should I build the live A/B
+# test for you to switch on?"; "should i do 1min or 2min pause?" -> 1 min).
+# The pre-registered long replay's candidate P60, once its re-entry cost was
+# re-measured on the sweep breaker's random holdout, came out +$31/day base
+# and +$5-7 pessimistic: too close to call from history
+# (tape_replay_long\REPORT_REQUOTE.md). So it runs on a coin flip, and
+# pausing is measured against not pausing directly:
+#   - a taker of TAPE_AB_MIN_CT+ contracts in one burst (any number of
+#     prices) in an event we rest in opens a WINDOW there;
+#   - its arm is drawn from a hash of the hold key and the crossing print
+#     (tape_ab_arm: no state, so the log can be audited). TAPE_AB_FRAC of the
+#     windows PAUSE: every order of ours in the event is pulled, as `on`
+#     pulls, and held TAPE_HOLD_SECS through the sweep breaker's hold. The
+#     rest are CONTROL, logged like dry;
+#   - a later trip inside an open window extends it to TAPE_HOLD_SECS from
+#     that trip, in its arm (a paused event stays watched while nothing of
+#     ours rests there);
+#   - mention series stay exempt, and the TRUMPSAY group keeps its own pull;
+#   - a pause leaves TAPE_AB_CANCEL_RESERVE of the fast-cancel budget to the
+#     sweep breaker. The breaker's own trips, holds and escalation never read
+#     a tape window, so a sweep inside a pause still holds its full length.
+# imm_tape_ab_report.py scores pause against control
+# (tape_replay_long\PREREGISTRATION_LIVE_AB.md).
+#    IMM_TAPE_TRIGGER=dry -- THE DEFAULT.  =on -- live.  =ab -- the live A/B.
+#    =off -- no tape feed.
 TAPE_TRIGGER = os.environ.get("IMM_TAPE_TRIGGER", "dry").strip().lower()
-if TAPE_TRIGGER not in ("off", "dry", "on"):
+if TAPE_TRIGGER not in ("off", "dry", "on", "ab"):
     TAPE_TRIGGER = "off"
 TAPE_MIN_CT = max(0.0, _env_float("IMM_TAPE_MIN_CT", 25.0))
 TAPE_MIN_LEVELS = max(1, _env_int("IMM_TAPE_MIN_LEVELS", 2))
 TAPE_BIG_CT = max(0.0, _env_float("IMM_TAPE_BIG_CT", 100.0))
 TAPE_BURST_GAP_SECS = max(0.0, _env_float("IMM_TAPE_BURST_GAP_SECS", 1.0))
 TAPE_LOG_MIN_CT = max(0.0, _env_float("IMM_TAPE_LOG_MIN_CT", 10.0))
+TAPE_AB_FRAC = min(1.0, max(0.0, _env_float("IMM_TAPE_AB_FRAC", 0.5)))
+TAPE_HOLD_SECS = max(1.0, _env_float("IMM_TAPE_HOLD_SECS", 60.0))
+TAPE_AB_MIN_CT = max(0.0, _env_float("IMM_TAPE_AB_MIN_CT", 100.0))
+TAPE_AB_CANCEL_RESERVE = max(0, _env_int("IMM_TAPE_AB_CANCEL_RESERVE", 40))
 
 
 def tape_burst_trips(ct: float, levels: int) -> bool:
-    """Does a taker burst of `ct` contracts over `levels` prices trip?"""
+    """Does a taker burst of `ct` contracts over `levels` prices trip? (The
+    live A/B trips on its size alone: TAPE_AB_MIN_CT, any number of prices.)"""
+    if TAPE_TRIGGER == "ab":
+        return ct + 1e-9 >= TAPE_AB_MIN_CT
     return ct + 1e-9 >= TAPE_MIN_CT and (levels >= TAPE_MIN_LEVELS
                                          or ct + 1e-9 >= TAPE_BIG_CT)
+
+
+def tape_ab_arm(key: str, salt: str) -> Tuple[str, float]:
+    """A new A/B window's arm, and the draw behind it: a uniform number from
+    a hash of the hold key and the crossing print's trade id -- "pause" under
+    TAPE_AB_FRAC, else "control"."""
+    h = hashlib.sha256(f"{key}|{salt}".encode("utf-8")).hexdigest()
+    u = int(h[:13], 16) / float(16 ** 13)
+    return ("pause" if u < TAPE_AB_FRAC else "control"), u
 
 
 # DOLLAR WORST-CASE LIMITS + INVENTORY SKEW (#4/#5 of the 10/17 review), DRY.
@@ -11966,6 +12007,8 @@ _CONFIG_CODE_KNOBS = (
     # the tape trigger: other traders' sweeps on the public tape (2026-11-01)
     "TAPE_TRIGGER", "TAPE_MIN_CT", "TAPE_MIN_LEVELS", "TAPE_BIG_CT",
     "TAPE_BURST_GAP_SECS", "TAPE_LOG_MIN_CT",
+    # ...and its live A/B (2026-11-02)
+    "TAPE_AB_FRAC", "TAPE_HOLD_SECS", "TAPE_AB_MIN_CT", "TAPE_AB_CANCEL_RESERVE",
     # ...the narrow fast-cancel gate and the candidate books (2026-10-08)
     "WS_FAST_MIN_GAP_C", "WS_FAST_EXEMPT", "WS_CANDIDATES", "WS_CAND_WARM_SECS",
     # hang watchdog: wedge stacks, its handoff, the main-thread network
@@ -23321,7 +23364,8 @@ class IncentiveMarketMaker:
         # own connection); the open taker bursts, (ticker, taker side) ->
         # burst; hold key -> the window a trip opened {"at", "until", "mode",
         # ...} (dry: the hold `on` would keep, for held_fill lines), and the
-        # same per risk_group (scope "group", logged only); hold key -> a LIVE
+        # same per risk_group (scope "group", logged only; an A/B window adds
+        # its arm "ab", draw "u" and trip count "n"); hold key -> a LIVE
         # trip's hold end (telemetry only: the hold itself is _sweep_hold);
         # our recent fills' trade ids -> when seen (a burst's own share); the
         # hold keys and groups we rest orders in, rebuilt every few seconds
@@ -23340,7 +23384,8 @@ class IncentiveMarketMaker:
                          "trips": 0, "trips_live": 0, "exempt": 0, "held": 0,
                          "inside": 0, "group_only": 0, "held_fills": 0,
                          "held_ct": 0.0, "held_fills_group": 0, "cancels": 0,
-                         "skipped_budget": 0}
+                         "skipped_budget": 0, "ab_pause": 0, "ab_control": 0,
+                         "ab_extend": 0}
         # dollar limits + skew (2026-10-17, RISK_LIMITS, dry): the cycle's
         # account positions, the pass being worked off between cycles (its
         # event -> tickers map and queue), each event's last worst case and
@@ -26203,13 +26248,22 @@ class IncentiveMarketMaker:
             st["held_ct"] += n
         else:
             st["held_fills_group"] += 1
-        self._sink("ws_tape", {
+        rec = {
             "ev": "held_fill", "ts": round(now_ts, 3), "mode": win["mode"],
             "scope": scope, "event": ev, "ticker": t, "order_id": oid,
             "side": side, "px": px, "count": n, "fill_ts": round(fts, 3),
             "trade_id": trade_id, "trip_ts": win["at"],
             "since_trip_s": round(fts - win["at"], 3),
-            "trip_ticker": win["ticker"], "trip_event": win["event"]})
+            "trip_ticker": win["ticker"], "trip_event": win["event"]}
+        if win.get("ab"):
+            rec["ab"] = win["ab"]
+        self._sink("ws_tape", rec)
+
+    def _tape_ab_open(self, key: str, now_ts: float) -> Optional[dict]:
+        """The open live-A/B window on hold key `key`, if any. A paused event
+        has nothing of ours resting, yet a later trip there extends it."""
+        w = self._tape_win.get(key)
+        return w if w is not None and w.get("ab") and w["until"] > now_ts else None
 
     def _tape_process(self, now_ts: float) -> None:
         """Drain the public tape (TAPE_TRIGGER): each print into its taker
@@ -26290,7 +26344,8 @@ class IncentiveMarketMaker:
         ev = self._event_of(t)
         g = risk_group_of(t)
         if sweep_hold_key(ev) not in self._tape_keys and \
-                (g is None or g not in self._tape_grps):
+                (g is None or g not in self._tape_grps) and \
+                self._tape_ab_open(sweep_hold_key(ev), now_ts) is None:
             return                     # nowhere we rest: nothing at stake
         st["relevant"] += 1
         key = (t, side)
@@ -26318,6 +26373,7 @@ class IncentiveMarketMaker:
             if twk_say_series(series_of(t)) \
             else tape_burst_trips(b["ct"], len(b["px"]))
         if b["trip"] is None and trips:
+            b["cross_tid"] = str(body.get("trade_id") or "")    # the A/B's draw
             self._tape_trip(t, side, b, now_ts)
 
     def _tape_own_ct(self, b: dict) -> float:
@@ -26344,8 +26400,9 @@ class IncentiveMarketMaker:
 
     def _tape_trip(self, t: str, side: str, b: dict, now_ts: float) -> None:
         """A taker burst crossed the line: log the trip, open its windows and
-        -- on -- pull every resting order of ours in the event and hold it
-        through the sweep breaker's own hold (_sweep_hold)."""
+        -- on, or the live A/B's pause arm -- pull every resting order of ours
+        in the event and hold it through the sweep breaker's own hold
+        (_sweep_hold). In the A/B a trip inside an open window extends it."""
         st = self._tape_st
         ev = b["ev"]
         series = series_of(t)
@@ -26387,11 +26444,17 @@ class IncentiveMarketMaker:
             g_orders = sum(1 for tk, lst in self._resting_view.items()
                            if not _in_trip(tk) and risk_group_of(tk) == rg
                            for o in lst if o["rem"] > 0)
-        if not pull and not g_orders:
+        win = self._tape_win.get(key)
+        # an open live-A/B window: a later trip extends it, in its arm -- even
+        # with nothing of ours left to pull (its pause holds the event dark)
+        ab_win = self._tape_ab_open(key, now_ts)
+        if not pull and not g_orders and ab_win is None:
             b["trip"] = "none"         # nothing of ours left there
             return
-        win = self._tape_win.get(key)
-        if self.sweep_held(ev, now_ts):
+        ab_arm, ab_u = None, None
+        if ab_win is not None:
+            mode = "inside"            # the A/B window runs on (extended below)
+        elif self.sweep_held(ev, now_ts):
             mode = "held"              # already dark (the sweep breaker, or us)
         elif win is not None and win["until"] > now_ts:
             mode = "inside"            # its last trip's window is still open
@@ -26399,6 +26462,13 @@ class IncentiveMarketMaker:
             mode = "group_only"        # orders only in the group's other events
         elif sweep_exempt(series):
             mode = "exempt"            # mention families: logged, never pulled
+        elif TAPE_TRIGGER == "ab" and not twk_say_series(series):
+            # THE LIVE A/B: a new window, its arm drawn from the hold key and
+            # the crossing print; a pause holds TAPE_HOLD_SECS, not the sweep
+            # breaker's length
+            ab_arm, ab_u = tape_ab_arm(key, b.get("cross_tid") or f"{b['t1']:.3f}")
+            hold_s = TAPE_HOLD_SECS
+            mode = "on" if ab_arm == "pause" and SWEEP_BREAKER == "on" else "dry"
         else:
             # live for the monthly TRUMPSAY series (TWK_SAY_SERIES) while the
             # tape trigger runs dry for the rest of the book
@@ -26409,9 +26479,18 @@ class IncentiveMarketMaker:
         if mode in ("held", "inside", "group_only", "exempt"):
             st[mode] += 1
         lag = now_ts - b["t0"]
-        if mode in ("dry", "on", "exempt"):
+        if ab_win is not None:
+            ab_arm = ab_win["ab"]
+            hold_s = TAPE_HOLD_SECS
+            ab_win["until"] = max(ab_win["until"], now_ts + hold_s)
+            ab_win["n"] = int(ab_win.get("n") or 1) + 1
+            st["ab_extend"] += 1
+        elif mode in ("dry", "on", "exempt"):
             self._tape_win[key] = {"at": now_ts, "until": now_ts + hold_s,
                                    "mode": mode, "ticker": t, "event": ev}
+            if ab_arm is not None:
+                self._tape_win[key].update(ab=ab_arm, u=round(ab_u, 6), n=1)
+                st["ab_" + ab_arm] += 1
         if rg and mode != "inside":
             gw = self._tape_gwin.get(rg)
             if gw is None or gw["until"] <= now_ts:
@@ -26432,28 +26511,52 @@ class IncentiveMarketMaker:
                         for tk, o in pull]}
         if len(group) > 1:
             rec["linked"] = list(group)
+        if ab_arm is not None:
+            w = self._tape_win[key]
+            rec.update(ab=ab_arm, ab_frac=TAPE_AB_FRAC, window_at=round(w["at"], 3),
+                       until=round(w["until"], 3), cross_tid=b.get("cross_tid") or "")
+            if ab_win is None:
+                rec["ab_u"] = round(ab_u, 6)
+            else:
+                rec["extend"] = int(w["n"])
         self._sink("ws_tape", rec)
         if mode in ("dry", "on", "exempt"):
-            log(f"{self.tag} tape trigger ({mode}): {t} "
+            if mode == "exempt":
+                what = f"mention series, nothing pulled ({len(pull)} order(s))"
+            elif ab_arm == "control":
+                what = (f"A/B control: {len(pull)} order(s) left resting on "
+                        f"{len(mkts)} market(s) in {ev}, a {hold_s:.0f}s window, "
+                        f"~${ev_day:.2f}/day of reward")
+            else:
+                what = (f"{'pulling' if mode == 'on' else 'would pull'} {len(pull)} "
+                        f"order(s) on {len(mkts)} market(s) in {ev} for {hold_s:.0f}s, "
+                        f"~${ev_day:.2f}/day of reward")
+            label = mode if ab_arm is None else (
+                f"A/B {ab_arm}" + ("" if mode == "on" or ab_arm == "control"
+                                   else ", dry: IMM_SWEEP_BREAKER is not on"))
+            log(f"{self.tag} tape trigger ({label}): {t} "
                 f"{'YES' if side == 'yes' else 'NO'} bought {b['ct']:g} over "
                 f"{len(b['px'])} price(s) {b['px_first']:g}->{b['px_last']:g}c in "
                 f"{b['t1'] - b['t0']:.1f}s, seen {lag:.1f}s after its first print -> "
-                + (f"mention series, nothing pulled ({len(pull)} order(s))"
-                   if mode == "exempt" else
-                   f"{'pulling' if mode == 'on' else 'would pull'} {len(pull)} "
-                   f"order(s) on {len(mkts)} market(s) in {ev} for {hold_s:.0f}s, "
-                   f"~${ev_day:.2f}/day of reward"))
-        if mode != "on":
+                + what)
+        pause = mode == "on" or (ab_win is not None and ab_win["ab"] == "pause"
+                                 and ab_win["mode"] == "on")
+        if not pause:
             return
-        until = now_ts + hold_s
+        until = self._tape_win[key]["until"] if ab_arm is not None else now_ts + hold_s
         self._sweep_hold[key] = max(self._sweep_hold.get(key, 0.0), until)
-        self._tape_hold[key] = until
-        st["trips_live"] += 1
+        self._tape_hold[key] = max(self._tape_hold.get(key, 0.0), until)
+        if ab_win is None:
+            st["trips_live"] += 1
+        # the A/B's pauses leave TAPE_AB_CANCEL_RESERVE of the budget to the
+        # sweep breaker's own pulls
+        budget = WS_FAST_MAX_CANCELS_PER_MIN - (
+            TAPE_AB_CANCEL_RESERVE if ab_arm is not None else 0)
         for _tk, o in pull:
             while self._ws_cancel_times and \
                     self._ws_cancel_times[0] < now_ts - 60.0:
                 self._ws_cancel_times.popleft()
-            if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
+            if len(self._ws_cancel_times) >= budget:
                 st["skipped_budget"] += 1          # the cycle pulls it
                 continue
             self._ws_cancel_times.append(now_ts)
@@ -36283,6 +36386,10 @@ class IncentiveMarketMaker:
                 windows_now=sum(1 for w in self._tape_win.values()
                                 if w["until"] > now),
                 held_now=sum(1 for u in self._tape_hold.values() if u > now),
+                ab_frac=TAPE_AB_FRAC, ab_hold_s=TAPE_HOLD_SECS,
+                ab_min_ct=TAPE_AB_MIN_CT,
+                ab_windows_now=sum(1 for w in self._tape_win.values()
+                                   if w.get("ab") and w["until"] > now),
                 feed=tape.status() if tape is not None else None)
             out["risk_limits"] = dict(
                 self._risk, mode=RISK_LIMITS, primed=self._risk_primed,
@@ -38454,20 +38561,39 @@ class IncentiveMarketMaker:
                   if SWEEP_GROUP == "dry" else "")
                + ("" if SWEEP_BREAKER != "off" else
                   " (inactive: it reads the sweep breaker's fills, which is off)")))
+        if TAPE_TRIGGER == "ab":
+            _tape_how = (
+                f" -- THE LIVE A/B (2026-11-02): a taker of {TAPE_AB_MIN_CT:g}+ "
+                f"contracts in one burst on Kalshi's public tape (one market, one "
+                f"side, prints <= {TAPE_BURST_GAP_SECS:g}s apart, block trades out) "
+                f"opens a window on its event, and a hash of the event and the "
+                f"print draws its arm: {TAPE_AB_FRAC:.0%} PAUSE (every quote we "
+                f"have there pulled and held {TAPE_HOLD_SECS:g}s), the rest "
+                f"CONTROL (logged only); a later trip inside a window extends it; "
+                f"pulls leave {TAPE_AB_CANCEL_RESERVE} of the "
+                f"{WS_FAST_MAX_CANCELS_PER_MIN}/min fast-cancel budget to the "
+                f"sweep breaker; ws_tape_<date>.jsonl, scored by "
+                f"imm_tape_ab_report.py"
+                + ("" if SWEEP_BREAKER == "on" else
+                   f" -- the pause arm runs DRY: it needs IMM_SWEEP_BREAKER=on "
+                   f"(it is {SWEEP_BREAKER})"))
+        else:
+            _tape_how = (
+                f" -- a taker burst on Kalshi's public tape (one market, one "
+                f"side, prints <= {TAPE_BURST_GAP_SECS:g}s apart, block trades "
+                f"out) of {TAPE_MIN_CT:g}+ contracts over {TAPE_MIN_LEVELS}+ "
+                f"prices, or {TAPE_BIG_CT:g}+ at one, trips its event"
+                + (f" and pulls every quote we have there, held like a sweep "
+                   f"trip (600s base, rain 120s)" if TAPE_TRIGGER == "on"
+                   and SWEEP_BREAKER == "on" else
+                   f" -- LOGGED only (ws_tape_<date>.jsonl: trips, our fills "
+                   f"inside the would-be hold, every burst of {TAPE_LOG_MIN_CT:g}+), "
+                   f"nothing pulled"
+                   + ("" if TAPE_TRIGGER == "dry" else
+                      f" (on needs IMM_SWEEP_BREAKER=on; it is {SWEEP_BREAKER})")))
         log(f"tape trigger (2026-11-01): {TAPE_TRIGGER}"
             + ("" if TAPE_TRIGGER == "off" else
-               f" -- a taker burst on Kalshi's public tape (one market, one "
-               f"side, prints <= {TAPE_BURST_GAP_SECS:g}s apart, block trades "
-               f"out) of {TAPE_MIN_CT:g}+ contracts over {TAPE_MIN_LEVELS}+ "
-               f"prices, or {TAPE_BIG_CT:g}+ at one, trips its event"
-               + (f" and pulls every quote we have there, held like a sweep "
-                  f"trip (600s base, rain 120s)" if TAPE_TRIGGER == "on"
-                  and SWEEP_BREAKER == "on" else
-                  f" -- LOGGED only (ws_tape_<date>.jsonl: trips, our fills "
-                  f"inside the would-be hold, every burst of {TAPE_LOG_MIN_CT:g}+), "
-                  f"nothing pulled"
-                  + ("" if TAPE_TRIGGER == "dry" else
-                     f" (on needs IMM_SWEEP_BREAKER=on; it is {SWEEP_BREAKER})"))
+               _tape_how
                + "; mention series exempt"
                + ("" if WS_MODE != "off" else " (no WS feed: inactive)")))
         log(f"dollar limits + skew (2026-10-17): {RISK_LIMITS}"
