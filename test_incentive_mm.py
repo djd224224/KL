@@ -23077,7 +23077,7 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
             self.assertTrue(imm.twk_say_series(s), s)
             self.assertTrue(imm.series_override(s).safe_join, s)
             self.assertEqual(imm.series_max_position(s), 100.0, s)
-            self.assertEqual(imm.event_cap_contracts(f"{s}-26DEC01"), 200.0, s)
+            self.assertEqual(imm.event_cap_contracts(f"{s}-26DEC01"), 1500.0, s)  # resting
             self.assertTrue(imm.is_daily_series(s), s)
             self.assertEqual(imm.applied_mention_mult(s), 1.0, s)
             self.assertIsNone(imm.size_test_arm(s), s)
@@ -23118,7 +23118,7 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         self.assertNotIn("KXFEATURE", imm.ALLOW_SERIES)
         s = "KXFEATURE"
         self.assertTrue(imm.twk_say_series(s))
-        self.assertEqual(imm.event_cap_contracts("KXFEATURE-26GTA6"), 200.0)
+        self.assertEqual(imm.event_cap_contracts("KXFEATURE-26GTA6"), 1500.0)
         self.assertEqual(imm.series_max_position(s), 100.0)
         self.assertEqual(imm.pilot_halt_limit(s), 75.0)
         self.assertTrue(imm.series_override(s).safe_join)
@@ -23140,6 +23140,25 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         early = datetime(2026, 11, 10, tzinfo=timezone.utc)
         self.assertEqual(f(s, "KXFEATURE-26GTA6", early, close_time=close), early)
         self.assertIsNone(f(s, "KXFEATURE-27TLOP", None, close_time=close))
+
+    def test_trumpsay_fill_cap_stops_a_side_resting_cap_does_not_shrink_it(self):
+        # Jack 2026-11-01: "200 contract cap is for fills, for resting raise
+        # to 1500" (KXEOWEEK plays a TRUMPSAY series; a small fill cap keeps
+        # the position under the market's skew knees)
+        self.assertEqual(imm.TWK_SAY_FILL_CAP, 200.0)
+        self.enterContext(mock.patch.object(imm, "TWK_SAY_SERIES", frozenset({"KXEOWEEK"})))
+        for cap, pos, sides in ((50.0, 0.0, {"bid", "ask"}),
+                                (35.0, 40.0, {"ask"}),      # long past the fill cap
+                                (50.0, 40.0, {"bid", "ask"}),
+                                (35.0, -40.0, {"bid"})):    # short past it
+            with mock.patch.object(imm, "TWK_SAY_FILL_CAP", cap):
+                _clean_persist()
+                bot = self._bot()
+                bot.pnl.pos[self.EO] = pos
+                bot.client.positions[self.EO] = pos
+                bot.run_cycle()
+                self.assertEqual(self._sides(bot, self.EO), sides, (cap, pos))
+                self.assertEqual(self._sides(bot, self.TS), {"bid", "ask"})
 
     def test_trumpsay_one_pickoff_halts_the_event_at_60s(self):
         # one fill the mark moves 5c+ against 60 s later takes the event for

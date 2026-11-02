@@ -3206,7 +3206,8 @@ def event_cap_contracts(event_ticker: str) -> float:
     if series == globals().get("YTW_SERIES") and globals().get("YTW_ENABLE"):
         return globals()["YTW_EVENT_CAP"]
     # the Trump weekly pilots (2026-10-11): TWK_EVENT_CAP net per event --
-    # TWK_SAY_EVENT_CAP for the monthly TRUMPSAY series (2026-11-01)
+    # TWK_SAY_EVENT_CAP for the TRUMPSAY group (2026-11-01): their RESTING cap;
+    # TWK_SAY_FILL_CAP bounds their filled net in the quote loop
     if series in globals().get("TWK_SERIES", ()) and globals().get("TWK_ENABLE"):
         if series in globals().get("TWK_SAY_SERIES", ()):
             return globals()["TWK_SAY_EVENT_CAP"]
@@ -17011,7 +17012,7 @@ def yt1_shadow_note(ev: str, e: dict, now_ts: float) -> Tuple[tuple, str]:
 # 25-75c); the bot's estimator at x1 on the 11/01 books: ~$67 and ~$24/day.
 # They quote under the pilot rules above -- safe-join, 100 per market, out of
 # the size test -- on their own terms since the same evening (TWK_SAY_SERIES:
-# x2 overnight, 200 net per event, a $75 halt, quick event halts), plus the
+# x2 overnight, 1500 resting / 200 filled per event, a $75 halt, quick pulls), plus the
 # protections every book has (the WS fast cancel, the sweep breaker, toxic
 # halts: their names carry no MENTION, so the mention exemption does not
 # apply), to the ticker-date cutoff (00:00 ET on the event's day).
@@ -17078,7 +17079,14 @@ def twk_bid_only(series: str) -> bool:
 # 25-75c), and a speech can name several companies within seconds, so:
 #   * x2 from 00:00 to 08:59 ET every day (their SERIES_HOUR_MULTS entries,
 #     which beat the pilots' x1-every-hour daily rule), x1 the rest of it;
-#   * TWK_SAY_EVENT_CAP (200) net per event; the per-market 100 stays;
+#   * per event, TWK_SAY_EVENT_CAP (1500) of RESTING orders a side and
+#     TWK_SAY_FILL_CAP (200) of FILLED net (Jack 2026-11-01: "200 contract cap
+#     is for fills, for resting raise to 1500"): the event cap reserves room
+#     for every resting order as if it filled, split across the event's
+#     markets, so 200 left 13-14 a market on 15-market events, under the
+#     20-lot rung; at 1500 each market rests its full rung (40 overnight),
+#     and once the event's filled net reaches 200 that side adds nothing;
+#     the per-market 100 stays;
 #   * a TWK_SAY_DAILY_LOSS_LIMIT ($75) daily halt per series;
 #   * QUICK PULLS of the WHOLE event, for the normal length (Jack, the same
 #     evening: "take the whole event out for normal amount of time, 60min is
@@ -17101,7 +17109,8 @@ def twk_bid_only(series: str) -> bool:
 TWK_SAY_SERIES = frozenset(s for s in ("KXTRUMPSAYCOMPANY", "KXTRUMPSAYMONTH")
                            if s in TWK_SERIES) \
     | frozenset(series_of(e) for e in TWK_SAY_EVENTS)    # KXFEATURE-26GTA6's
-TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 200)
+TWK_SAY_EVENT_CAP = _env_float("IMM_TWK_SAY_EVENT_CAP", 1500)      # resting
+TWK_SAY_FILL_CAP = _env_float("IMM_TWK_SAY_FILL_CAP", 200)         # filled net
 TWK_SAY_DAILY_LOSS_LIMIT = _env_float("IMM_TWK_SAY_DAILY_LOSS_LIMIT", 75)
 TWK_SAY_TAKER_CT = _env_float("IMM_TWK_SAY_TAKER_CT", 100)
 # A group event's own pull size (Jack 2026-11-01: "for GTA increase the
@@ -33163,6 +33172,15 @@ class IncentiveMarketMaker:
             event_net.setdefault(ev, 0.0)
         event_room_buy = {e: event_cap_contracts(e) - n for e, n in event_net.items()}
         event_room_sell = {e: event_cap_contracts(e) + n for e, n in event_net.items()}
+        # TRUMPSAY group (TWK_SAY_FILL_CAP, 2026-11-01): the cap above is its
+        # RESTING cap; once the event's FILLED net reaches TWK_SAY_FILL_CAP on a
+        # side, that side rests nothing more anywhere in the event
+        for e, n in event_net.items():
+            if twk_say_series(series_of(e)):
+                if n >= TWK_SAY_FILL_CAP:
+                    event_room_buy[e] = 0.0
+                if n <= -TWK_SAY_FILL_CAP:
+                    event_room_sell[e] = 0.0
         # A series' own side cut (SIDE_MULT_SERIES under 1) cuts that side's
         # event room by the same factor, as the quote loop cuts its position
         # room (side_cut_room): on a wide event the per-market share binds
@@ -38157,7 +38175,8 @@ class IncentiveMarketMaker:
                 f"x1 at every hour, {TWK_MAX_POSITION:g}/market and {TWK_EVENT_CAP:g}/event "
                 f"net, halt per series at -${TWK_DAILY_LOSS_LIMIT:g} P&L today"
                 + (f"; TRUMPSAY {','.join(sorted(TWK_SAY_SERIES))}: x2 00-08 ET, "
-                   f"{TWK_SAY_EVENT_CAP:g}/event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
+                   f"{TWK_SAY_EVENT_CAP:g} resting / {TWK_SAY_FILL_CAP:g} filled net "
+                   f"per event, halt at -${TWK_SAY_DAILY_LOSS_LIMIT:g}, "
                    f"quick pulls (a {TWK_SAY_TAKER_CT:g}+ taker on the tape"
                    + "".join(f", {_e} {_n:g}+" for _e, _n in
                              sorted(TWK_SAY_EVENT_TAKER_CT.items()))
