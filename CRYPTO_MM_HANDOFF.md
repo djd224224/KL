@@ -588,6 +588,19 @@ separate module, a separate `terminal_prob()` (Black-Scholes N(d2), r=0, MC-vali
 
 ## Annual variant (`crypto_annual_mm.py`, v1.0 — built 2026-08-13)
 
+**3x since 2026-11-01** (Jack "3x"): ladder **3x3** (was 3x1); caps **120/600/1,200**
+(market/event/asset); **$180** at risk per event and direction; skew full at **180**;
+reduce-only at **360**. The v1.1 ratios to the event cap are kept.
+- Evidence: a public-tape replay of 400 annual fill clusters. The median outside volume at or
+  through our price within 2s was 61 contracts against our 1, and 3x size fills 2.4-2.8x the
+  contracts.
+- The extra fills mark at about +5-7c each: asks +14c, bids -7c.
+- A deeper ladder adds little: 5x3 over 3x3 is +42 ask contracts in a 333-cluster replay,
+  against +349 for 3x1 -> 3x3.
+- Stop rule: back to 3x1 if the annual's marked P&L since the change falls below -$200, or the
+  Dec 31 / Jan 1 settlement is negative.
+- Re-decide the size before the 2027 events, which would sit for a year.
+
 One bot per asset (8: BTC/ETH/SOL/XRP/DOGE/BNB/HYPE/ZEC) quoting THREE annual series
 concurrently, with the model chosen **by series, never by strike_type**:
 

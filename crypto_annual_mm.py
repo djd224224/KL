@@ -103,17 +103,20 @@ def _env_i(name: str, default: int) -> int:
 # ---------------------------------------------------------------------------
 
 # Ladder shape. Pilot = the updown fleet's opening size (3x1, 2026-08-05
-# vintage): unproven market, positions can sit until Dec 31.
+# vintage): unproven market, positions can sit until Dec 31. 3x3 since
+# 2026-11-01 (Jack "3x"), every cap below x3 with it. A public-tape replay of
+# 400 annual fill clusters had 3x size filling 2.4-2.8x the contracts: the
+# median outside volume at or through our price was 61 against our 1.
 NUM_LEVELS = _env_i("CAY_NUM_LEVELS", 3)
-CONTRACTS_PER_LEVEL = _env_i("CAY_CONTRACTS_PER_LEVEL", 1)
+CONTRACTS_PER_LEVEL = _env_i("CAY_CONTRACTS_PER_LEVEL", 3)
 QUOTE_OFFSET_CENTS = _env_i("CAY_QUOTE_OFFSET_CENTS", 3)
 LEVEL_SPACING_CENTS = _env_i("CAY_LEVEL_SPACING_CENTS", 2)
 
-# Risk. Non-binding backstops behind the ladder size (3 resting per market
-# per side), sized like the updown pilot's opening caps.
-MAX_POSITION_CONTRACTS = _env_f("CAY_MAX_POSITION", 40)   # per market
-MAX_EVENT_CONTRACTS = _env_f("CAY_MAX_EVENT", 200)        # per event
-MAX_ASSET_CONTRACTS = _env_f("CAY_MAX_ASSET", 400)        # across all 3 series
+# Risk. Backstops behind the ladder size (9 resting per market per side),
+# x3 the updown pilot's opening caps (40/200/400 until 2026-11-01).
+MAX_POSITION_CONTRACTS = _env_f("CAY_MAX_POSITION", 120)  # per market
+MAX_EVENT_CONTRACTS = _env_f("CAY_MAX_EVENT", 600)        # per event
+MAX_ASSET_CONTRACTS = _env_f("CAY_MAX_ASSET", 1200)       # across all 3 series
 
 # Band + divergence: see module docstring.
 SKIP_FAIR_ABOVE_CENTS = _env_i("CAY_SKIP_FAIR_ABOVE_CENTS", 90)
@@ -122,7 +125,8 @@ MAX_MARKETS_PER_EVENT = _env_i("CAY_MAX_MARKETS_PER_EVENT", 8)
 MAX_FAIR_DIVERGENCE_CENTS = _env_i("CAY_MAX_FAIR_DIVERGENCE_CENTS", 15)
 
 # ---- v1.1 risk rules (Jack 2026-09-12 "add to weekly and annual bots too") ----
-# The monthly fleet's v2.6 set, sized for 3x1 rungs and caps 40/200/400.
+# The monthly fleet's v2.6 set, sized for 3x1 rungs and caps 40/200/400, all
+# x3 with the 3x3 ladder since 2026-11-01 (the ratios below are unchanged).
 # Applied through the updown cycle's per-cadence tables (everything here is
 # cadence "annual"). Code defaults ARE the live config.
 #  1. sigma shrinkage toward the long-run median of the monthly estimator this
@@ -134,15 +138,15 @@ VOL_SHRINK_W = _env_f("CAY_VOL_SHRINK_W", 0.25)
 #     drops both sides below 10c).
 ASK_MIN_FAIR_CENTS = _env_i("CAY_ASK_MIN_FAIR_CENTS", 15)
 #  3. dollars-at-risk cap per event AND direction, valued at fair: 30% of the
-#     200-contract event cap (the monthly fleet's 300/1000 ratio).
-MAX_EVENT_RISK_DOLLARS = _env_f("CAY_MAX_EVENT_RISK", 60.0)
+#     600-contract event cap (the monthly fleet's 300/1000 ratio).
+MAX_EVENT_RISK_DOLLARS = _env_f("CAY_MAX_EVENT_RISK", 180.0)
 #  4. inventory skew +-4c, full at 30% of the event cap. With a 3c offset and
 #     the 3c edge floor the ENCOURAGED side cannot move, so here the skew is
 #     purely the back-off of the discouraged side (up to 4c), plus reduce-only
 #     beyond 60% of the event cap.
 SKEW_MAX_CENTS = _env_f("CAY_SKEW_MAX_CENTS", 4.0)
-SKEW_FULL_AT_CONTRACTS = _env_f("CAY_SKEW_FULL_AT", 60.0)
-REDUCE_ONLY_AT_CONTRACTS = _env_f("CAY_REDUCE_ONLY_AT", 120.0)
+SKEW_FULL_AT_CONTRACTS = _env_f("CAY_SKEW_FULL_AT", 180.0)
+REDUCE_ONLY_AT_CONTRACTS = _env_f("CAY_REDUCE_ONLY_AT", 360.0)
 
 # Year-scale markets move slowly; 60s keeps 8 bots light on the shared API.
 POLL_SECS = _env_i("CAY_POLL_SECS", 60)

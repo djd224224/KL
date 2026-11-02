@@ -200,9 +200,10 @@ class TestLiveLimits(unittest.TestCase):
         self.assertEqual(specs["weekly"]["asset"], 800)
         self.assertEqual(specs["weekly"]["risk"], {"weekly": 120})
         self.assertEqual(specs["weekly"]["reduce_only"], {"weekly": 240})
-        self.assertEqual(specs["annual"]["position"], 40)
-        self.assertEqual(specs["annual"]["risk"], {"annual": 60})
-        self.assertEqual(specs["annual"]["reduce_only"], {"annual": 120})
+        # annual x3 since 2026-11-01 (Jack "3x"): 40 / $60 / 120 before
+        self.assertEqual(specs["annual"]["position"], 120)
+        self.assertEqual(specs["annual"]["risk"], {"annual": 180})
+        self.assertEqual(specs["annual"]["reduce_only"], {"annual": 360})
 
 
 if __name__ == "__main__":

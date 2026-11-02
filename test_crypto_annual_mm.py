@@ -407,9 +407,10 @@ class TestRunCycle(unittest.TestCase):
         self.assertEqual(fetched, set(ann.annual_series_for("BTC")))
 
     def test_ladder_is_the_live_pilot_shape(self):
-        """Pins the deployed config: 3 levels x 1 contract, 3c off fair, 2c
-        apart, joining and never leading. Changing any of these is a size
-        change on a live bot and should have to break a test first."""
+        """Pins the deployed config: 3 levels x 3 contracts (3x1 until Jack
+        2026-11-01 "3x"), 3c off fair, 2c apart, joining and never leading.
+        Changing any of these is a size change on a live bot and should have
+        to break a test first."""
         c = FakeClient(markets_by_series={"KXBTCY": [term_mkt("greater", floor=100000)]})
         b = bot(c)
         with priced():
@@ -420,7 +421,7 @@ class TestRunCycle(unittest.TestCase):
         asks = sorted(o["yes_price"] for o in placed if o["book_side"] == "ask")
         self.assertEqual(len(bids), 3)
         self.assertEqual(len(asks), 3)
-        self.assertTrue(all(o["remaining_count"] == 1 for o in placed))
+        self.assertTrue(all(o["remaining_count"] == 3 for o in placed))
         self.assertLessEqual(bids[0], 40)      # external bid; join, never lead
         self.assertGreaterEqual(asks[0], 55)   # external ask = 100-45
         self.assertEqual([b1 - b2 for b1, b2 in zip(bids, bids[1:])],
@@ -460,16 +461,17 @@ class TestRunCycle(unittest.TestCase):
 
 class TestFleetIsolation(unittest.TestCase):
     def test_pilot_settings_are_pinned(self):
-        self.assertEqual((ann.NUM_LEVELS, ann.CONTRACTS_PER_LEVEL), (3, 1))
+        # 3x3 and 120/600/1200 since 2026-11-01 (Jack "3x"; 3x1, 40/200/400 before)
+        self.assertEqual((ann.NUM_LEVELS, ann.CONTRACTS_PER_LEVEL), (3, 3))
         self.assertEqual((ann.QUOTE_OFFSET_CENTS, ann.LEVEL_SPACING_CENTS), (3, 2))
         self.assertEqual((ann.MAX_POSITION_CONTRACTS, ann.MAX_EVENT_CONTRACTS,
-                          ann.MAX_ASSET_CONTRACTS), (40, 200, 400))
+                          ann.MAX_ASSET_CONTRACTS), (120, 600, 1200))
         self.assertEqual((ann.SKIP_FAIR_BELOW_CENTS, ann.SKIP_FAIR_ABOVE_CENTS), (10, 90))
         self.assertEqual(ann.MAX_FAIR_DIVERGENCE_CENTS, 15)
         self.assertEqual(ann.POLL_SECS, 60)
 
     def test_annual_class_attrs_do_not_touch_the_updown_fleet(self):
-        self.assertEqual(ann.AnnualMarketMaker.contracts_per_level, 1)
+        self.assertEqual(ann.AnnualMarketMaker.contracts_per_level, 3)
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level, 1)
         # the updown fleet's per-tenor daily tables must not leak in here
         self.assertEqual(ann.AnnualMarketMaker.contracts_per_level_by_cadence, {})
@@ -477,7 +479,7 @@ class TestFleetIsolation(unittest.TestCase):
         self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_cadence, {})
         self.assertEqual(ann.AnnualMarketMaker.quote_offset_by_asset_cadence, {})
         # v1.1: the annual skew table is its OWN (not the updown daily entry)
-        self.assertEqual(ann.AnnualMarketMaker.skew_by_cadence, {"annual": (4.0, 60.0)})
+        self.assertEqual(ann.AnnualMarketMaker.skew_by_cadence, {"annual": (4.0, 180.0)})
         self.assertNotIn("daily", ann.AnnualMarketMaker.skew_by_cadence)
         self.assertEqual(ann.AnnualMarketMaker.momo_cadences, ())
         self.assertEqual(ud.UpDownMarketMaker.contracts_per_level_by_cadence,
@@ -488,7 +490,7 @@ class TestFleetIsolation(unittest.TestCase):
                          {("BTC", "daily"): 1, ("BTC", "weekly"): 0})
         self.assertEqual(ud.UpDownMarketMaker.quote_offset_by_cadence,
                          {"daily": 5, "weekly": 5})
-        self.assertEqual(ann.AnnualMarketMaker.max_asset, 400)
+        self.assertEqual(ann.AnnualMarketMaker.max_asset, 1200)
         self.assertEqual(ud.UpDownMarketMaker.max_asset, 800)
         self.assertEqual(ann.AnnualMarketMaker.poll_secs, 60)
         self.assertEqual(ud.UpDownMarketMaker.poll_secs, 30)
@@ -552,16 +554,17 @@ class TestAnnualRiskRules(unittest.TestCase):
         self.assertEqual(ann.MODEL_VERSION, "crypto_annual_mm_v1.1")
         self.assertEqual(ann.VOL_SHRINK_W, 0.25)
         self.assertEqual(ann.ASK_MIN_FAIR_CENTS, 15)
-        self.assertEqual(ann.MAX_EVENT_RISK_DOLLARS, 60.0)
-        self.assertEqual((ann.SKEW_MAX_CENTS, ann.SKEW_FULL_AT_CONTRACTS), (4.0, 60.0))
-        self.assertEqual(ann.REDUCE_ONLY_AT_CONTRACTS, 120.0)
+        # x3 with the 3x3 ladder (Jack 2026-11-01 "3x"; $60 / 60 / 120 before)
+        self.assertEqual(ann.MAX_EVENT_RISK_DOLLARS, 180.0)
+        self.assertEqual((ann.SKEW_MAX_CENTS, ann.SKEW_FULL_AT_CONTRACTS), (4.0, 180.0))
+        self.assertEqual(ann.REDUCE_ONLY_AT_CONTRACTS, 360.0)
         m = ann.AnnualMarketMaker
         self.assertEqual(m.vol_shrink_w, 0.25)
         self.assertEqual(m.ask_min_fair_by_cadence, {"annual": 15})
-        self.assertEqual(m.max_event_risk_by_cadence, {"annual": 60.0})
-        self.assertEqual(m.skew_by_cadence, {"annual": (4.0, 60.0)})
+        self.assertEqual(m.max_event_risk_by_cadence, {"annual": 180.0})
+        self.assertEqual(m.skew_by_cadence, {"annual": (4.0, 180.0)})
         self.assertEqual(m.skew_backoff_cadences, ("annual",))
-        self.assertEqual(m.reduce_only_by_cadence, {"annual": 120.0})
+        self.assertEqual(m.reduce_only_by_cadence, {"annual": 360.0})
         # the updown fleet's own tables are not disturbed by the annual values
         self.assertEqual(ud.UpDownMarketMaker.max_event_risk_by_cadence, {"weekly": 120.0})
         self.assertEqual(ud.UpDownMarketMaker.vol_shrink_w, 0.5)
@@ -592,25 +595,30 @@ class TestAnnualRiskRules(unittest.TestCase):
     def test_reduce_only_long_blocks_new_bids(self):
         cheap, mid = f"{EV_MAXY}-130000", f"{EV_MAXY}-120000"
         probs = {120000: 0.5, 130000: 0.12}
-        bids, asks, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: 100.0}})   # net 100 < 120
+        ro = ann.AnnualMarketMaker.reduce_only_by_cadence["annual"]          # 360
+        bids, asks, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: ro - 60}})   # under
         self.assertIn(mid, bids)
-        bids, asks, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: 130.0}})   # net 130 >= 120
+        bids, asks, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: ro + 30}})   # past it
         self.assertEqual(bids, {})
         self.assertIn(mid, asks)
 
     def test_risk_cap_blocks_asks_across_the_event(self):
-        """Three 35-contract shorts stay inside the 40/market cap but put
-        $78.75 at risk (> $60): every strike's sell room is zero while bids
-        still quote. At 20 each ($45) the nearest strike sells again."""
+        """Three 100-contract shorts stay inside the 120/market cap but put
+        $225 at risk (> $180): every strike's sell room is zero while bids
+        still quote. At 60 each ($135) the nearest strike sells again."""
         t20, t25, t30 = (f"{EV_MAXY}-{k}" for k in (140000, 130000, 120000))
         probs = {120000: 0.30, 130000: 0.25, 140000: 0.20}
         books = {t30: (26, 30), t25: (21, 25), t20: (16, 20)}   # inside the 15c divergence guard
-        short = {EV_MAXY: {t20: -35.0, t25: -35.0, t30: -35.0}}   # net -105 < reduce-only 120
+        m = ann.AnnualMarketMaker
+        self.assertLessEqual(100, m.max_position)
+        self.assertLess(300, m.reduce_only_by_cadence["annual"])
+        self.assertGreater(100 * 2.25, m.max_event_risk_by_cadence["annual"])
+        short = {EV_MAXY: {t20: -100.0, t25: -100.0, t30: -100.0}}   # net -300 < reduce-only 360
         bids, asks, b = _touch_cycle(probs, positions=short, books=books)
         self.assertEqual(asks, {})
         self.assertEqual(set(bids), {t20, t25, t30})
-        self.assertAlmostEqual(b.state.risk_short, 35 * (0.8 + 0.75 + 0.7))
-        lighter = {EV_MAXY: {t20: -20.0, t25: -20.0, t30: -20.0}}      # $45: room left
+        self.assertAlmostEqual(b.state.risk_short, 100 * (0.8 + 0.75 + 0.7))
+        lighter = {EV_MAXY: {t20: -60.0, t25: -60.0, t30: -60.0}}      # $135: room left
         bids, asks, _ = _touch_cycle(probs, positions=lighter, books=books)
         self.assertIn(t30, asks)                                       # nearest-to-50c quotes first
 
@@ -620,10 +628,11 @@ class TestAnnualRiskRules(unittest.TestCase):
         probs = {120000: 0.5, 130000: 0.12}
         flat_b, flat_a, _ = _touch_cycle(probs, books=books)
         self.assertEqual((flat_b[mid], flat_a[mid]), ([47, 45, 43], [53, 55, 57]))
-        long_b, long_a, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: 60.0}}, books=books)
+        full = ann.AnnualMarketMaker.skew_by_cadence["annual"][1]          # 180
+        long_b, long_a, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: full}}, books=books)
         self.assertEqual(long_b[mid], [43, 41, 39])   # bids back off the full 4c
         self.assertEqual(long_a[mid], [53, 55, 57])   # 3c offset = 3c floor: asks cannot come in
-        short_b, short_a, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: -60.0}}, books=books)
+        short_b, short_a, _ = _touch_cycle(probs, positions={EV_MAXY: {cheap: -full}}, books=books)
         self.assertEqual(short_a[mid], [57, 59, 61])  # asks back off 4c
         self.assertEqual(short_b[mid], [47, 45, 43])  # bids unchanged
 
