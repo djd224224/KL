@@ -2440,8 +2440,9 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     hour-of-day window (global or per-series) times the Saturday multiplier;
     1.0 when neither applies, and always for the OpenRouter market-share
     family (_share_x1). Capped at 1 for a Carbon Arc series inside its data
-    landing window (CA_LANDING_WINDOWS)."""
-    if _share_x1(series):
+    landing window (CA_LANDING_WINDOWS). x1 for an election night session
+    (ENS_SERIES)."""
+    if _share_x1(series) or series in globals().get("ENS_SERIES", ()):
         return 1.0
     m = _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
     # a TRUMPSAY-group event's dated size (TWK_SAY_EVENT_SIZE: the GTA VI album
@@ -4010,7 +4011,9 @@ TOXIC_EXEMPT_WORDS = tuple(w.strip().upper() for w in os.environ.get(
 
 
 def toxic_exempt(series: str) -> bool:
-    return any(w in series for w in TOXIC_EXEMPT_WORDS)
+    # ... and an election night session (ENS_SERIES, 2026-11-03: no halting)
+    return (any(w in series for w in TOXIC_EXEMPT_WORDS)
+            or series in globals().get("ENS_SERIES", ()))
 
 
 # DROPPED MARKETS CARRY NO ORDERS (Jack 2026-09-07: "fine for market to get
@@ -4560,7 +4563,9 @@ SWEEP_HOLD_BY_PREFIX = _parse_hold_by_series(
 
 
 def sweep_exempt(series: str) -> bool:
-    return any(w in series for w in SWEEP_EXEMPT_WORDS)
+    # ... and an election night session (ENS_SERIES, 2026-11-03: no halting)
+    return (any(w in series for w in SWEEP_EXEMPT_WORDS)
+            or series in globals().get("ENS_SERIES", ()))
 
 
 def sweep_linked_series(series: str) -> Tuple[str, ...]:
@@ -9390,6 +9395,57 @@ FORCE_EVENTS = FORCE_EVENTS | frozenset(
         "IMM_GOPSIX_FORCE_EVENTS", "KXGOPSIXSENATE-26NOV03").split(",")
     if e.strip())
 
+# ELECTION NIGHT SESSION (Jack 2026-11-03: "IMM should quote
+# KXSENATESEATSD-27 starting at 7:15pm until midnight. there are some manual
+# orders ive placed already, ignore those ... stay at small size 1x base
+# contracts, 3 rungs in ladder placed 3c apart, market cap of 150 in any
+# direction. dont want any halting. primary goal is trading profit, while
+# secondary goal is to collect rewards" -> "launch at 7pm"). "How many Senate
+# seats will Democrats hold?", 13 strikes (10 with programs), traded hard on
+# election night. For the events in ENS_EVENTS, from ENS_START_ET to
+# ENS_END_ET only:
+#   * THE WINDOW: out before the start (blackout_et, cancelled and kept) and
+#     at the end (the cutoff, in place of the family's election-day cutoff).
+#   * THE LADDER: ENS_LEVELS (20 at the touch, 3c and 6c behind) as an
+#     offsets ladder (not the at-ref rung), per-market cap ENS_MAX_POSITION;
+#     no family, hour or Saturday multiplier (x1). Skew and the event cap as
+#     usual.
+#   * HIS ORDERS: his positions and his resting orders there neither stand
+#     the bot off nor count as its inventory (manual_coexist + the foreign
+#     order scan).
+#   * FORCED (FORCE_EVENTS): past the payout and rate floors, the hopeless
+#     exit and the admission wait -- trading first, rewards second.
+#   * NO HALTS: exempt from the toxic halts and the sweep breaker / tape
+#     trigger (toxic_exempt, sweep_exempt). The WS fast cancel and the
+#     account-level halts stay.
+# IMM_ENS_EVENTS="" turns it off (env => task-level restart).
+ENS_EVENTS = frozenset(e.strip() for e in os.environ.get(
+    "IMM_ENS_EVENTS", "KXSENATESEATSD-27").split(",") if e.strip())
+ENS_SERIES = frozenset(e.split("-")[0] for e in ENS_EVENTS)
+ENS_START_ET = os.environ.get("IMM_ENS_START_ET", "2026-11-03 19:00")
+ENS_END_ET = os.environ.get("IMM_ENS_END_ET", "2026-11-04 00:00")
+ENS_START = ET.localize(datetime.strptime(ENS_START_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
+ENS_END = ET.localize(datetime.strptime(ENS_END_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
+ENS_LEVELS = _parse_levels(os.environ.get("IMM_ENS_LEVELS", "0:20,3:20,6:20"))
+ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 150)
+
+
+def ens_series(series: str) -> bool:
+    return series in ENS_SERIES
+
+
+def ens_ticker(ticker: str) -> bool:
+    """A market (or the event itself) of an ENS_EVENTS event."""
+    return any(ticker == e or ticker.startswith(e + "-") for e in ENS_EVENTS)
+
+
+for _s in ENS_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES[ELECTION_ARCHETYPE], size_mult=None,
+        levels=ENS_LEVELS, max_position=ENS_MAX_POSITION,
+        blackout_et=("00:00", ENS_START.astimezone(ET).strftime("%H:%M")))
+FORCE_EVENTS = FORCE_EVENTS | ENS_EVENTS
+
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
 # global ladder and caps. Every member clones it (FAMILY_OVERRIDE_PARENTS).
@@ -11150,9 +11206,11 @@ MANUAL_COEXIST_EVENTS = frozenset(e.strip() for e in os.environ.get(
 
 def manual_coexist(series: str, event_ticker: str) -> bool:
     """The user's hand positions here are his, not the bot's inventory and
-    not a reason to stand off: a quote_all series, or MANUAL_COEXIST_EVENTS."""
+    not a reason to stand off: a quote_all series, MANUAL_COEXIST_EVENTS, or
+    an election night session (ENS_EVENTS)."""
     return bool((series_override(series) or SeriesOverride()).quote_all
-                or event_ticker in MANUAL_COEXIST_EVENTS)
+                or event_ticker in MANUAL_COEXIST_EVENTS
+                or event_ticker in ENS_EVENTS)
 
 # Self-trade prevention. The bot's orders are ALWAYS post-only (resting
 # makers), so the only self-cross possible is the USER aggressing into a bot
@@ -20144,6 +20202,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         if hand is not None:
             eday = min(eday, hand - timedelta(minutes=OVERRIDE_BUFFER_MIN))
         cutoff = eday
+    if event_ticker in ENS_EVENTS:
+        # an election night session ends at ENS_END, in place of whatever
+        # came in (its start is the series' blackout_et)
+        cutoff = ENS_END
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
@@ -22592,7 +22654,8 @@ def build_side_ladder(ticker: str, book_side: str, anchor: int,
     # passes the member-widened 2-98 for sticky markets; default = series.
     pmin, pmax = band if band is not None else (
         series_price_min(series_of(ticker)), series_price_max(series_of(ticker)))
-    if LADDER_MODE == "atref" and ref_px is not None:
+    # (an election night session rests its offsets ladder, ENS_LEVELS)
+    if LADDER_MODE == "atref" and ref_px is not None and not ens_series(series_of(ticker)):
         # Reference placement is EXEMPT from the series price band (Jack
         # 2026-08-01: "don't arbitrarily constrain to 5c... when it makes
         # sense to go lower", both sides). Safe by construction: bids only
@@ -28284,6 +28347,8 @@ class IncentiveMarketMaker:
                     self._note_shard(t, o.get("exchange_index"))
                 else:
                     t = o.get("ticker", "")
+                    if ens_ticker(t):
+                        continue          # his orders in an election night session
                     foreign[t] = foreign.get(t, 0) + 1
             cursor = resp.get("cursor")
             if not cursor or not batch:
@@ -29778,7 +29843,8 @@ class IncentiveMarketMaker:
             # stop the bot — the user wants full event coverage. The same for
             # MANUAL_COEXIST_EVENTS (2026-10-13).
             if coexist:
-                manual_skip = bool(foreign_n) or t in self.state.manual_standoff
+                manual_skip = bool(foreign_n) or (t in self.state.manual_standoff
+                                                  and not ens_ticker(t))
             else:
                 manual_skip = (t in self.state.manual_standoff or foreign_n
                                or manual >= MANUAL_STANDOFF_CONTRACTS

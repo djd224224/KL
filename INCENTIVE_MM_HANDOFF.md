@@ -11151,3 +11151,20 @@ Jack: "KXIBONDFIX-27MAY03 should be quoted as part of treasuries autofamily".
   (stand aside) inside that, where the informed estimates of the announcement trade. No crossed / near / fair
   checks: the strike is not a 5-year yield.
 - Tests: test_ibond_fixed_rate_is_long_dated_only (mutation-checked), TestTreasuryYieldSeriesEnrolled.
+
+## 2026-11-03 -- ELECTION NIGHT SESSION (KXSENATESEATSD-27, 7pm-midnight ET)
+Jack: "IMM should quote KXSENATESEATSD-27 starting at 7:15pm until midnight. there are some manual orders ive
+placed already, ignore those ... stay at small size 1x base contracts, 3 rungs in ladder placed 3c apart, market
+cap of 150 in any direction. dont want any halting. primary goal is trading profit, while secondary goal is to
+collect rewards", then "launch at 7pm".
+- ENS_EVENTS (IMM_ENS_EVENTS, "" = off), ENS_START_ET 2026-11-03 19:00, ENS_END_ET 2026-11-04 00:00.
+- Window: blackout_et 00:00 -> 19:00 on the series (cancelled and kept), cutoff ENS_END in
+  apply_series_cutoff_adjustments, in place of the elections family's election-day cutoff.
+- Ladder: ENS_LEVELS 0:20,3:20,6:20 as an offsets ladder (build_side_ladder skips the at-ref rung for
+  ens_series); max_position 150; hour_size_mult x1; levels hand-set, so no family x2 / size test. Skew 30/60 and
+  the event cap as usual.
+- His orders: manual_coexist covers his positions; the foreign-order scan skips ens_ticker orders; a stale
+  manual_standoff entry no longer holds selection.
+- FORCE_EVENTS (floors, hopeless, admission wait). toxic_exempt + sweep_exempt (no toxic halt, sweep breaker or
+  tape pause). WS fast cancel and the account-level halts stay.
+- Tests: TestElectionNightSession (3).

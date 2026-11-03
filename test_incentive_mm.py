@@ -39430,5 +39430,52 @@ class TestJoinWait1102(unittest.TestCase):
         self.assertFalse(any("join wait" in s and "wants" in s for s in lines))
 
 
+class TestElectionNightSession(unittest.TestCase):
+    """Jack 2026-11-03: KXSENATESEATSD-27 from 7pm ET to midnight, 1x base
+    size, 3 rungs 3c apart, cap 150, his manual orders ignored, no halting,
+    trading first and rewards second."""
+    S, EV, T = "KXSENATESEATSD", "KXSENATESEATSD-27", "KXSENATESEATSD-27-53"
+
+    def test_the_window(self):
+        self.assertEqual(imm.ENS_START, datetime(2026, 11, 4, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(imm.ENS_END, datetime(2026, 11, 4, 5, 0, tzinfo=timezone.utc))
+        self.assertTrue(imm.series_in_blackout(
+            self.S, datetime(2026, 11, 3, 23, 59, tzinfo=timezone.utc)))
+        for h, m in ((0, 0), (2, 30), (4, 59)):
+            self.assertFalse(imm.series_in_blackout(
+                self.S, datetime(2026, 11, 4, h, m, tzinfo=timezone.utc)))
+        # the end replaces the family's election-day cutoff
+        for elec in (True, False):
+            with mock.patch.object(imm, "election_series", lambda s, e=elec: e):
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    self.S, self.EV, None), imm.ENS_END)
+
+    def test_size_ladder_and_cap(self):
+        now = datetime(2026, 11, 4, 1, 0, tzinfo=timezone.utc)   # 8pm ET
+        self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
+        self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
+        lv = imm.hour_scaled_levels(self.S, now)
+        self.assertEqual(lv, [(0, 20), (3, 20), (6, 20)])
+        self.assertEqual(imm.series_max_position(self.S, now), 150)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 60, levels=lv, ref_px=60)
+            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 60, levels=lv, ref_px=70)
+            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 20), (61, 20), (58, 20)])
+            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 20), (69, 20), (72, 20)])
+            # every other series keeps its one at-ref rung
+            self.assertEqual(len(imm.build_side_ladder(
+                "KXUST10AD-26NOV05-T4.1", "bid", 64, 66, 60, levels=[(0, 20)], ref_px=60)), 1)
+
+    def test_no_halts_forced_and_his_orders_ignored(self):
+        self.assertTrue(imm.toxic_exempt(self.S))
+        self.assertTrue(imm.sweep_exempt(self.S))
+        self.assertFalse(imm.toxic_exempt("KXSENATE"))
+        self.assertIn(self.EV, imm.FORCE_EVENTS)
+        self.assertTrue(imm.manual_coexist(self.S, self.EV))
+        self.assertFalse(imm.manual_coexist(self.S, "KXSENATESEATSD-29"))
+        self.assertTrue(imm.ens_ticker(self.T))
+        self.assertFalse(imm.ens_ticker("KXSENATESEATSD-29-53"))
+
+
 if __name__ == "__main__":
     unittest.main()
