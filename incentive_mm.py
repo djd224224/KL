@@ -7993,7 +7993,9 @@ FINECON_DAILY_OPENINGS = _env_int("IMM_FINECON_DAILY_OPENINGS", 10)
 def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
                     members: Set[str], top_n: int, event_top_n: int,
                     extra_openings: int = 0, refill_to: int = 0,
-                    hard_cap: int = 0, min_roi: float = 0.0) -> Set[str]:
+                    hard_cap: int = 0, min_roi: float = 0.0,
+                    event_cap_exempt: Optional[Callable[["MarketMeta"], bool]] = None
+                    ) -> Set[str]:
     """The shared admission-only group walk (finecon since 2026-09-03; the
     open-scan tier since 2026-09-05): tickers of `group` to EXCLUDE.
     Members are never cut and consume their global and per-event slots
@@ -8011,6 +8013,10 @@ def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
     openings fired in one refresh at ET midnight (30 -> 35) and the tier
     then admitted NOTHING for 15h07m while it bled 35 -> 30. Admitting back
     up to `refill_to` closes that seat in the same pass.
+
+    `event_cap_exempt` (2026-11-02): a market it accepts is not held to
+    `event_top_n` (ARRAY TAIL LEADS: the per-strike offers of one array
+    event); it still takes a slot of the group's total.
 
     `hard_cap` bounds the result absolutely. It is required once refills
     stop the tier decaying: without it, each ET day's openings would stack
@@ -8031,7 +8037,8 @@ def _group_walk_cut(group: List["MarketMeta"], incumbent: Set[str],
     for m in newcomers:
         if len(keep) >= admit_cap:
             break
-        if 0 < event_top_n <= per_event.get(m.event_ticker, 0):
+        if 0 < event_top_n <= per_event.get(m.event_ticker, 0) and not (
+                event_cap_exempt is not None and event_cap_exempt(m)):
             continue
         # `min_roi` (2026-09-13, open scan only): a seat stays EMPTY rather
         # than go to a newcomer under the bar -- the raw ratio, without the
@@ -8081,7 +8088,10 @@ def finecon_group_cut(metas: List["MarketMeta"], incumbent: Set[str],
                            FINECON_EVENT_TOP_N, extra_openings,
                            refill_to=refill_to if FINECON_REFILL_ON_DEPARTURE
                            else 0,
-                           hard_cap=finecon_ceiling())
+                           hard_cap=finecon_ceiling(),
+                           # (an ARRAY TAIL LEADS array's strikes offer one by
+                           # one: no FINECON_EVENT_TOP_N for them)
+                           event_cap_exempt=lambda m: ca_array_lead_series(m.series))
 
 
 def _openings_used(n_kept: int, n_members: int, top_n: int) -> int:
@@ -11977,6 +11987,9 @@ _CONFIG_CODE_KNOBS = (
     "OR_LEAD_BLACKOUT", "OR_LEAD_BLACKOUT_PRE_MIN",   # the OpenRouter publish (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
+    # array tail leads off the shadow array fair (2026-11-02)
+    "CA_ARRAY_LEAD_SERIES", "CA_ARRAY_LEAD_EDGE_C", "CA_ARRAY_LEAD_ASK_MAX_P",
+    "CA_ARRAY_LEAD_BID_MIN_P", "CA_ARRAY_LEAD_MU_UP", "CA_ARRAY_LEAD_SIGMA_DIV",
     # weather shapes (2026-10-30): the per-city rain dailies, the cold thresholds
     "_RAIN_DAILY_CITY_RE_SPEC", "TEMP_THRESHOLD_ENABLE", "TEMP_THRESHOLD_STOP_DAYS",
     "TEMP_THRESHOLD_SIZE_MULT",
@@ -13716,6 +13729,68 @@ def ca_shadow_band(ticker: str, now_ts: float
     pc = _p_above(k, e["mu"], e["sigma"])
     pt = _p_above(k, e["mu"], max(1e-9, e["sigma"] * CA_FAIR_SIGMA_LO_FRAC))
     return 100.0 * min(pc, pt), 100.0 * max(pc, pt), "array_shadow"
+
+
+# ARRAY TAIL LEADS (Jack 2026-11-02: "build and turn on", on "Build the
+# 200-lot soda/energy/nicotine pilot dry, to turn on after tomorrow's October
+# prints check out?", after "is there a lower risk alterative? what about up
+# to 200 contracts"). The November arrays (programs 11/02 16:11Z -> 11/09
+# 05:00Z, $14.54/day a strike) were walled within two hours of listing:
+# 13-21k lots on each side of every strike, so our ~45 lots earned 1-4c a
+# day and 67 of the 71 strikes sat at payout_floor. 200 lots is target/5: a
+# rung that size sets the reward reference at its own price and the wall
+# behind it counts half per tick, so 200 YES offered at 90c ahead of a 99c
+# wall takes ~60% of its side (150 lots there take ~1%). A point-of-sale
+# array strike leads that way -- one target/5 rung CA_ARRAY_LEAD_EDGE_C from
+# 0c/100c, ahead of its side's external touch -- only on the side its SHADOW
+# array fair (carbon_arc_fair.build_array_shadow, not yet scored on a
+# settled month) calls safe under every variant: the read as it is, its mu x
+# CA_ARRAY_LEAD_MU_UP (November's first POS day, Sunday 11/01, was read
+# against a Saturday; the brand calendar factor for day 1 is x1.22), and
+# each at sigma / CA_ARRAY_LEAD_SIGMA_DIV. An offer needs P(YES) <=
+# CA_ARRAY_LEAD_ASK_MAX_P under all four, a bid >= CA_ARRAY_LEAD_BID_MIN_P.
+# On the 11/02 23:52Z books: 10 offers at 90c (energy T95-T110, nicotine
+# T125/T130, soda T92-T98), ~$42/day estimated, $200 at most if all 2,000
+# filled and every one settled YES. It rides the FAIR LEAD rails
+# (in_fair_lead_series: admission on the lead's estimate, the 200 position
+# cap, a rest past an out-of-band touch, the WS fast-cancel exemption, LEAD
+# STOP) without FAIR CLOSE: an unscored fair does not price the unwind
+# (fair_close_series). IMM_CA_ARRAY_LEAD_SERIES="" turns it off.
+CA_ARRAY_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
+    {s.strip() for s in os.environ.get(
+        "IMM_CA_ARRAY_LEAD_SERIES",
+        "KXENERGYARRAY,KXNICOTINEARRAY,KXSODAARRAY").split(",") if s.strip()}))
+CA_ARRAY_LEAD_EDGE_C = max(1, _env_int("IMM_CA_ARRAY_LEAD_EDGE_C", 10))
+CA_ARRAY_LEAD_ASK_MAX_P = _env_float("IMM_CA_ARRAY_LEAD_ASK_MAX_P", 0.60)
+CA_ARRAY_LEAD_BID_MIN_P = _env_float("IMM_CA_ARRAY_LEAD_BID_MIN_P", 0.40)
+CA_ARRAY_LEAD_MU_UP = _env_float("IMM_CA_ARRAY_LEAD_MU_UP", 1.22)
+CA_ARRAY_LEAD_SIGMA_DIV = max(1.0, _env_float("IMM_CA_ARRAY_LEAD_SIGMA_DIV", 3.0))
+
+
+def ca_array_lead_series(series: str) -> bool:
+    """Do this series' strikes lead off the shadow array fair (ARRAY TAIL
+    LEADS)?"""
+    return series in CA_ARRAY_LEAD_SERIES
+
+
+def ca_array_lead_p(ticker: str, now_ts: float
+                    ) -> Optional[Tuple[float, float, float]]:
+    """(lowest, highest, as read) P(YES) of an ARRAY TAIL LEADS strike across
+    the shadow read's variants, or None without a fresh shadow read of its
+    measurement month (CA_FAIR_TTL_MIN, as ca_shadow_band)."""
+    series = series_of(ticker)
+    if not ca_array_lead_series(series):
+        return None
+    m = _CA_STRIKE_RE.search(ticker)
+    e = (_ca_fair_state.get("array_shadow") or {}).get(series)
+    if not m or e is None or now_ts - e["ts"] > CA_FAIR_TTL_MIN * 60 \
+            or e["month"] != ca_measurement_month(ticker):
+        return None
+    k = ca_strike_value(float(m.group(1)))
+    ps = [_p_above(k, mu, sg)
+          for mu in (e["mu"], e["mu"] * CA_ARRAY_LEAD_MU_UP)
+          for sg in (e["sigma"], max(1e-9, e["sigma"] / CA_ARRAY_LEAD_SIGMA_DIV))]
+    return min(ps), max(ps), ps[0]
 
 
 def ca_shadow_proposals(meta: "MarketMeta", yes_levels: List[List[float]],
@@ -21759,9 +21834,18 @@ def past_band_ahead(side: str, px: int, best: Optional[int]) -> bool:
 
 def in_fair_lead_series(series: str) -> bool:
     """FAIR_LEAD_SERIES, with any rain-day series while the weekend family
-    is in it (AUTO DAY SERIES: it takes the weekend family's kit)."""
+    is in it (AUTO DAY SERIES: it takes the weekend family's kit), and the
+    ARRAY TAIL LEADS arrays (CA_ARRAY_LEAD_SERIES)."""
     return series in FAIR_LEAD_SERIES or (
-        "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series))
+        "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series)) \
+        or ca_array_lead_series(series)
+
+
+def fair_close_series(series: str) -> bool:
+    """May this fair-lead series' positions close off its model (FAIR CLOSE)?
+    Not the ARRAY TAIL LEADS arrays: their fair is a shadow read no settled
+    month has scored yet."""
+    return in_fair_lead_series(series) and not ca_array_lead_series(series)
 
 
 def fair_lead_series(series: str) -> bool:
@@ -21773,10 +21857,13 @@ def fair_lead_series(series: str) -> bool:
 def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
     """A FAIR_LEAD_SERIES market's model fair (YES cents) while its family's
     gate would still read it, else None: weekend rain's (rain_wknd_fair.py),
-    the Vercel family's (vercel_fair_c) or the OpenRouter weekly's
-    (or_fair_c)."""
+    the Vercel family's (vercel_fair_c), the OpenRouter weekly's (or_fair_c)
+    or an ARRAY TAIL LEADS strike's shadow read as it is (ca_array_lead_p)."""
     if not in_fair_lead_series(series):
         return None
+    if ca_array_lead_series(series):
+        r = ca_array_lead_p(ticker, now_ts)
+        return None if r is None else r[2] * 100.0
     if rain_wknd_series(series):
         e = _rain_wknd_state["markets"].get(ticker)
         if e is None or now_ts - e["ts"] > RAIN_WKND_TTL_MIN * 60:
@@ -21806,6 +21893,8 @@ def fair_model_label(series: str) -> str:
         return "the Vercel fair"
     if or_fair_series(series):
         return "the OpenRouter fair"
+    if ca_array_lead_series(series):
+        return "the Carbon Arc array fair"
     return "its model fair"
 
 
@@ -21854,6 +21943,44 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
             lb = None
         if la is not None and (eb is None or la[0] < eb + FAIR_LEAD_MAX_GAP_C):
             la = None
+    return lb, la
+
+
+def ca_array_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
+                        p_lo: float, p_hi: float, target: float, df: float,
+                        hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
+                        ) -> Tuple[Optional[Tuple[int, int, int]],
+                                   Optional[Tuple[int, int, int]]]:
+    """(bid lead, ask lead) for an ARRAY TAIL LEADS strike whose shadow
+    fair puts P(YES) between `p_lo` and `p_hi` across its variants, every book
+    EXTERNAL, each as fair_lead_group's (price, cap, own external best): an
+    offer of target/5 at 100 - CA_ARRAY_LEAD_EDGE_C while p_hi <=
+    CA_ARRAY_LEAD_ASK_MAX_P, a bid at CA_ARRAY_LEAD_EDGE_C while p_lo >=
+    CA_ARRAY_LEAD_BID_MIN_P -- each only ahead of its side's external touch
+    (or level with it where it already rests: `hold_bid` / `hold_ask`), clear
+    of the other side's, and where its side reaches the target with it in."""
+    n = comp_lead_size(target)
+    if n <= 0:
+        return None, None
+    eb, ea = external_best(yes_levels, no_levels)
+
+    def qualifies(levels: List[List[float]], px: int) -> bool:
+        lv: Dict[int, float] = dict(levels_desc(levels))
+        lv[px] = lv.get(px, 0.0) + float(n)
+        return _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
+                           {px: float(n)}, target, df)[1]
+
+    lb = la = None
+    px = CA_ARRAY_LEAD_EDGE_C
+    if (p_lo >= CA_ARRAY_LEAD_BID_MIN_P
+            and (eb is None or px > eb or (hold_bid == px and px >= eb))
+            and (ea is None or px < ea) and qualifies(yes_levels, px)):
+        lb = (px, px, eb if eb is not None else 0)
+    px = 100 - CA_ARRAY_LEAD_EDGE_C
+    if (p_hi <= CA_ARRAY_LEAD_ASK_MAX_P
+            and (ea is None or px < ea or (hold_ask == px and px <= ea))
+            and (eb is None or px > eb) and qualifies(no_levels, 100 - px)):
+        la = (px, px, ea if ea is not None else 100)
     return lb, la
 
 
@@ -21912,8 +22039,10 @@ FAIR_CLOSE_OVER_C = max(0, _env_int("IMM_FAIR_CLOSE_OVER_C", 1))
 def fair_close_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
     """The fair (YES cents) a FAIR_LEAD_SERIES market closes off, or None:
     its family's while its gate would still read it (fair_model_c), under
-    FAIR_CLOSE_MODE's own switch (a lead switched off still closes)."""
-    if FAIR_CLOSE_MODE not in ("on", "dry") or LADDER_MODE != "atref":
+    FAIR_CLOSE_MODE's own switch (a lead switched off still closes); never
+    an ARRAY TAIL LEADS array's (fair_close_series)."""
+    if FAIR_CLOSE_MODE not in ("on", "dry") or LADDER_MODE != "atref" \
+            or not fair_close_series(series):
         return None
     return fair_model_c(ticker, series, now_ts)
 
@@ -21996,7 +22125,7 @@ def fair_close_hold(series: str, pos: float) -> bool:
     """FAIR CLOSE keeps a FAIR_LEAD_SERIES market the bot holds a position in
     selected -- past the payout floor, the hopeless exit, the budget and a
     non-fatal screen, as quote_all does -- so its closing rung keeps resting."""
-    return FAIR_CLOSE_MODE == "on" and in_fair_lead_series(series) and abs(pos) >= 1
+    return FAIR_CLOSE_MODE == "on" and fair_close_series(series) and abs(pos) >= 1
 
 
 def comp_fill_price(levels: List[List[float]], count: float) -> Optional[int]:
@@ -30605,6 +30734,14 @@ class IncentiveMarketMaker:
             if h is not None and time.time() - float(h[2]) < COMP_HOLD_TTL_SECS:
                 held = (h[0], h[1], 0)
         held = held or (None, None, 0)
+        if src == "fair" and ca_array_lead_series(meta.series):
+            # ARRAY TAIL LEADS: off the shadow read's variants, not one fair
+            r = ca_array_lead_p(t, time.time())
+            if r is None:
+                return None, None
+            return ca_array_lead_group(yes_ext, no_ext, r[0], r[1],
+                                       meta.target_size, meta.discount_factor,
+                                       hold_bid=held[0], hold_ask=held[1])
         if src == "fair":
             fair_c = fair_lead_fair_c(t, meta.series, time.time())
             if fair_c is None:
@@ -30692,12 +30829,22 @@ class IncentiveMarketMaker:
                 continue
             _p, cap, best = lead
             implied = cap + margin if side == "bid" else cap - margin
+            extra = ""
+            _ar = (ca_array_lead_p(t, time.time())
+                   if src == "fair" and ca_array_lead_series(series_of(t)) else None)
+            if _ar is not None:
+                # ARRAY TAIL LEADS: the read's own P(YES) and its variants'
+                implied = int(round(_ar[2] * 100))
+                extra = (f" ({_ar[0] * 100:.0f}-{_ar[1] * 100:.0f}% across its "
+                         f"variants; an offer needs <= "
+                         f"{CA_ARRAY_LEAD_ASK_MAX_P * 100:.0f}%, a bid >= "
+                         f"{CA_ARRAY_LEAD_BID_MIN_P * 100:.0f}%)")
             ahead = (px > best) if side == "bid" else (px < best)
             where = (f"ahead of its own {best}c" if ahead else
                      f"held{' at the cap' if px == cap else ''}, "
                      f"{'with' if px == best else 'behind'} its own {best}c")
             log(f"{self.tag} {kind} lead{dry} {t} {side}: {n} @ {px}c, {where}; "
-                f"{who} {verb} {implied}c")
+                f"{who} {verb} {implied}c{extra}")
 
     def _lead_blackout_note(self, t: str, src: str) -> None:
         """Log each side of `t` still noted as leading as off for its feed's
@@ -36212,7 +36359,7 @@ class IncentiveMarketMaker:
             # old rung the diff is resizing still counts at its old size here
             # (10/30 14:19:45Z: LEX's 16 ahead "blocked at 60/60")
             _fp = self.pnl.pos.get(q.ticker, 0.0)
-            if (FAIR_CLOSE_MODE == "on" and in_fair_lead_series(series)
+            if (FAIR_CLOSE_MODE == "on" and fair_close_series(series)
                     and abs(_fp) >= 1 and (_fp < 0) == (q.book_side == "bid")):
                 _fc = min(abs(_fp), FAIR_LEAD_MAX_POSITION)
                 if self._fair_close_px.get(q.ticker, ("",))[0] == q.book_side:
@@ -38717,6 +38864,16 @@ class IncentiveMarketMaker:
                + (" (dry: logged, quoted as before)" if FAIR_CLOSE_MODE == "dry"
                   else "")
                if FAIR_CLOSE_MODE in ("on", "dry") else ""))
+        log("array tail leads (2026-11-02): "
+            + (f"{FAIR_LEAD_MODE} -- {', '.join(CA_ARRAY_LEAD_SERIES)}: a strike "
+               f"offers target/5 at {100 - CA_ARRAY_LEAD_EDGE_C}c (bids it at "
+               f"{CA_ARRAY_LEAD_EDGE_C}c) ahead of its side's touch while the "
+               f"shadow array fair puts P(YES) at or under "
+               f"{CA_ARRAY_LEAD_ASK_MAX_P:.0%} (at or over {CA_ARRAY_LEAD_BID_MIN_P:.0%}) "
+               f"as read, with mu x{CA_ARRAY_LEAD_MU_UP:g} and at sigma / "
+               f"{CA_ARRAY_LEAD_SIGMA_DIV:g}; the fair-lead rails, no fair close"
+               if CA_ARRAY_LEAD_SERIES and FAIR_LEAD_MODE in ("on", "dry")
+               else "off"))
         log("no leads (2026-11-01): "
             + (f"{', '.join(LEAD_OFF_SERIES)} -- a market whose series starts with "
                f"one of these leads neither off a model fair nor off its ladder's or "

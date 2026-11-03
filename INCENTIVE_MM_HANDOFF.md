@@ -11113,3 +11113,28 @@ Deploy: no incentive_mm.py change; the 7:00 email picks it up after the KL sync.
   - The text part uses aligned columns.
   - Rows carry what / where / note / count / unit / detail for these tables.
   - The HTML is ~12 KB (19 KB before 53e72a9).
+
+## 2026-11-02 -- ARRAY TAIL LEADS (Carbon Arc point-of-sale arrays offer 200 at 90c)
+Jack: "why are arrays like KXRIDEARRAY-26DEC08, KXSTREAMARRAY-26DEC08 not all quoting", then "is there a lower
+risk alterative? what about up to 200 contracts", then "build and turn on".
+- Why they were dark: the November arrays (programs 11/02 16:11Z -> 11/09 05:00Z, $14.54/day a strike) were
+  walled within two hours of listing, 13-21k lots on each side of every strike. Our ~45 lots earned 1-4c a day,
+  so 67 of 71 strikes sat at payout_floor.
+- 200 lots is target/5: a rung that size sets the reward reference at its own price, and the wall behind it counts
+  half per tick. 200 YES offered at 90c ahead of a 99c wall takes ~60% of that side; 150 there take ~1%.
+- The rule (ca_array_lead_group via _comp_lead): a KXSODAARRAY / KXENERGYARRAY / KXNICOTINEARRAY strike
+  offers target/5 at 100 - CA_ARRAY_LEAD_EDGE_C (90c) ahead of its side's external touch, while the SHADOW array
+  fair (array_shadow in carbon_arc_fair.json) puts P(YES) <= 60% under all four variants. The variants are the
+  read as it is, mu x1.22 (day 1 of November was a Sunday read against a Saturday), and each at sigma / 3.
+  A bid at 10c needs >= 40%. The rung stays level with a copier where it rests, and never goes past 90c.
+- It rides the FAIR LEAD rails (in_fair_lead_series): admission on the lead's estimate, the 200 position cap, a
+  rest past an out-of-band touch, the WS fast-cancel exemption, LEAD STOP, the leads email's FAIR LEADS section.
+  It has NO FAIR CLOSE (fair_close_series): the shadow fair has not been scored on a settled month.
+- The three series skip finecon's 3-per-event cap (event_cap_exempt in _group_walk_cut); they still count toward
+  the group's 25.
+- Preview on the 00:10Z 11/03 books: 10 strikes offer (energy T95-T110, nicotine T125/T130, soda T92-T98),
+  ~$41/day est. Worst case $200 if all 2,000 filled and every one settled YES.
+- Knobs: IMM_CA_ARRAY_LEAD_SERIES ("" = off), _EDGE_C, _ASK_MAX_P, _BID_MIN_P, _MU_UP, _SIGMA_DIV (config hash).
+  Startup line "array tail leads (2026-11-02)". Log: "fair lead <t> ask: 200 @ 90c, ahead of its own 99c; the
+  Carbon Arc array fair implies 20c (1-60% across its variants; ...)".
+- Tests: TestCaArrayLead (8; the loop and cap tests mutation-checked); TestFairLeads names "Carbon Arc arrays".

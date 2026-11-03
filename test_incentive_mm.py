@@ -35506,6 +35506,219 @@ class TestCarbonArcShadow(unittest.TestCase):
         os.remove(path)
 
 
+class TestCaArrayLead(unittest.TestCase):
+    """Jack 2026-11-02: "build and turn on" -- ARRAY TAIL LEADS. The
+    November point-of-sale arrays were walled within two hours of listing,
+    so our ~45 lots earned 1-4c a day a strike; 200 YES offered at 90c ahead
+    of a 99c wall takes ~60% of its side, on the strikes the shadow array
+    fair calls safe under every variant. Fixture: KXSODAARRAY-26DEC03-T92's
+    11/02 23:52Z book and the soda array's day-1 read (mu 76.64, sigma
+    17.93), moved to a far-off December so the month and TTL tests pass."""
+
+    T = "KXSODAARRAY-68DEC03-T92"
+    EV = "KXSODAARRAY-68DEC03"
+    CLOSE = datetime(2068, 12, 10, 15, 0, tzinfo=timezone.utc)
+    YES = [[1, 2005], [3, 23889], [4, 2517], [24, 23423]]
+    NO = [[1, 70671]]                                   # YES offered at 99c
+    MU, SIGMA = 76.6359, 17.9333
+
+    def setUp(self):
+        _clean_persist()
+        self.now = time.time()
+        self._shadow(self.MU)
+        for p in (mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "CA_FAIR_FILE",
+                                    os.path.join(imm.STATUS_DIR, "no_ca_fair.json"))):
+            p.start()
+            self.addCleanup(p.stop)
+        TestVercelFairLead._drop_holds()
+        self.addCleanup(TestVercelFairLead._drop_holds)
+
+    def _shadow(self, mu, month="2068-11", age_secs=0.0):
+        p = mock.patch.dict(imm._ca_fair_state, {
+            "entries": {}, "moved_at": {},
+            "array_shadow": {"KXSODAARRAY": {
+                "mu": mu, "sigma": self.SIGMA, "month": month,
+                "ts": time.time() - age_secs, "category": "point of sale"}}})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_variants_read_its_own_months_fresh_shadow(self):
+        self.assertEqual(imm.ca_measurement_month(self.T), "2068-11")
+        lo, hi, base = imm.ca_array_lead_p(self.T, self.now)
+        # as read 19.6%; mu x1.22 (93.5) at sigma / 3 59.9%; the raw read at
+        # sigma / 3 0.5%
+        self.assertAlmostEqual(base, imm._p_above(92.0, self.MU, self.SIGMA))
+        self.assertAlmostEqual(base, 0.196, places=3)
+        self.assertAlmostEqual(lo, 0.005, places=3)
+        self.assertAlmostEqual(hi, 0.599, places=3)
+        self.assertAlmostEqual(
+            hi, imm._p_above(92.0, self.MU * 1.22, self.SIGMA / 3.0))
+        # stale, another month's strike, a series out of the list: no read
+        self.assertIsNone(imm.ca_array_lead_p(
+            self.T, self.now + imm.CA_FAIR_TTL_MIN * 60 + 5))
+        self.assertIsNone(imm.ca_array_lead_p("KXSODAARRAY-69JAN03-T92", self.now))
+        self.assertIsNone(imm.ca_array_lead_p("KXRIDEARRAY-68DEC08-T100", self.now))
+        with mock.patch.object(imm, "CA_ARRAY_LEAD_SERIES", ()):
+            self.assertIsNone(imm.ca_array_lead_p(self.T, self.now))
+
+    def test_the_soda_book_offers_200_at_90c_ahead_of_its_99c_wall(self):
+        lo, hi, _b = imm.ca_array_lead_p(self.T, self.now)
+        self.assertEqual(imm.ca_array_lead_group(self.YES, self.NO, lo, hi, 1000.0, 0.5),
+                         (None, (90, 90, 99)))
+        # 200 sets the reference at NO 10c; the 70,671 nine ticks behind count
+        # 0.5^9 -- 59% of the side, half the strike's pool
+        lead = imm.estimate_reward_share(self.YES, self.NO, [("ask", 90, 200.0)],
+                                         1000.0, 0.5, own_in_book=False)[0]
+        self.assertAlmostEqual(lead, 0.5 * 200.0 / (200.0 + 70671.0 / 512.0), places=4)
+        self.assertGreater(lead, 0.29)
+        # 150 there do not reach target/5: the wall stays the reference
+        small = imm.estimate_reward_share(self.YES, self.NO, [("ask", 90, 150.0)],
+                                          1000.0, 0.5, own_in_book=False)[0]
+        self.assertLess(small, 0.002)
+        # an offer needs P(YES) <= 60% under every variant
+        self.assertEqual(imm.ca_array_lead_group(self.YES, self.NO, lo, 0.61, 1000.0, 0.5),
+                         (None, None))
+        # no bid: P(YES) is as low as 0.5%
+        self.assertIsNone(imm.ca_array_lead_group(self.YES, self.NO, lo, hi,
+                                                  1000.0, 0.5)[0])
+
+    def test_it_stays_level_with_a_copier_and_never_goes_past_90c(self):
+        lo, hi, _b = imm.ca_array_lead_p(self.T, self.now)
+        copied = self.NO + [[10, 5000]]                # 5,000 offered at our 90c
+        self.assertEqual(imm.ca_array_lead_group(self.YES, copied, lo, hi, 1000.0, 0.5),
+                         (None, None))                 # does not join one afresh
+        self.assertEqual(imm.ca_array_lead_group(self.YES, copied, lo, hi, 1000.0, 0.5,
+                                                 hold_ask=90),
+                         (None, (90, 90, 90)))         # but keeps its place
+        ahead = self.NO + [[11, 300]]                  # 300 offered at 89c
+        self.assertEqual(imm.ca_array_lead_group(self.YES, ahead, lo, hi, 1000.0, 0.5,
+                                                 hold_ask=90),
+                         (None, None))
+        # never across the bid
+        self.assertEqual(imm.ca_array_lead_group(self.YES + [[90, 50]], self.NO, lo, hi,
+                                                 1000.0, 0.5),
+                         (None, None))
+
+    def test_a_likely_yes_strike_bids_200_at_10c(self):
+        # KXNICOTINEARRAY-26DEC03-T150's walls (YES 1c x 55,930, offered at
+        # 63c) with a read that puts YES at 45-95%
+        yes, no = [[1, 55930]], [[1, 2005], [2, 5000], [15, 1100], [37, 13300]]
+        self.assertEqual(imm.ca_array_lead_group(yes, no, 0.45, 0.95, 1000.0, 0.5),
+                         ((10, 10, 1), None))
+        self.assertEqual(imm.ca_array_lead_group(yes, no, 0.39, 0.95, 1000.0, 0.5),
+                         (None, None))
+
+    def test_the_arrays_ride_the_fair_lead_rails_without_fair_close(self):
+        for s in ("KXSODAARRAY", "KXENERGYARRAY", "KXNICOTINEARRAY"):
+            self.assertIn(s, imm.CA_ARRAY_LEAD_SERIES)
+            self.assertTrue(imm.in_fair_lead_series(s), s)
+            self.assertFalse(imm.fair_close_series(s), s)
+        for s in ("KXRIDEARRAY", "KXSTREAMARRAY", "KXAIAPPARRAY", "KXDELIVARRAY"):
+            self.assertFalse(imm.in_fair_lead_series(s), s)
+        self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, "KXSODAARRAY", self.now),
+                               19.6, places=1)
+        self.assertIsNone(imm.fair_close_fair_c(self.T, "KXSODAARRAY", self.now))
+        self.assertFalse(imm.fair_close_hold("KXSODAARRAY", -200.0))
+        self.assertTrue(imm.fair_close_series("KXRAINWKND"))
+        self.assertEqual(imm.fair_model_label("KXSODAARRAY"), "the Carbon Arc array fair")
+        with mock.patch.object(imm, "CA_ARRAY_LEAD_SERIES", ()):
+            self.assertFalse(imm.in_fair_lead_series("KXSODAARRAY"))
+            self.assertIsNone(imm.fair_lead_fair_c(self.T, "KXSODAARRAY", self.now))
+        for k in ("CA_ARRAY_LEAD_SERIES", "CA_ARRAY_LEAD_EDGE_C", "CA_ARRAY_LEAD_ASK_MAX_P",
+                  "CA_ARRAY_LEAD_BID_MIN_P", "CA_ARRAY_LEAD_MU_UP",
+                  "CA_ARRAY_LEAD_SIGMA_DIV"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    def _cycle(self, **patches):
+        """Three cycles on T92's book: (bot, our rungs by side, log lines)."""
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 1454000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.2400", "yes_ask_dollars": "0.9900",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.YES],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in self.NO]}}
+        with contextlib.ExitStack() as st:
+            for name, v in dict({"LEVELS": [(0, 20)], "MAX_JOIN_SPREAD_CENTS": 99,
+                                 "JOIN_AHEAD_MODE": "off",
+                                 "FINECON_SERIES": set(imm.FINECON_SERIES) | {"KXSODAARRAY"},
+                                 "SERIES_HOUR_MULTS": []},
+                                **patches).items():
+                st.enter_context(mock.patch.object(imm, name, v))
+            st.enter_context(mock.patch.object(imm, "series_in_blackout",
+                                               return_value=False))
+            bot = IncentiveMarketMaker(client=client, live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {}
+        for o in bot.state.sim_orders.values():
+            if (o["ticker"] == self.T
+                    and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS):
+                rungs.setdefault(o["book_side"], []).append(
+                    (o["yes_price"], int(o["remaining_count"])))
+        return bot, rungs, lines
+
+    def test_the_loop_offers_200_at_90c_and_the_leads_email_reads_it(self):
+        bot, rungs, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertIn((90, 200), rungs.get("ask", []), rungs)
+        self.assertEqual(bot._comp_lead_px[self.T][:2], (None, 90))
+        note = [ln for ln in lines if f"fair lead {self.T} ask" in ln]
+        self.assertTrue(note, lines[-40:])
+        self.assertIn("200 @ 90c, ahead of its own 99c; the Carbon Arc array fair "
+                      "implies 20c (1-60% across its variants", note[0])
+        import send_comp_lead_monitor as clm
+        m = clm._LEAD.match(f"2068-11-02 23:59:00Z [IMM] {note[0].split('[IMM] ', 1)[-1]}")
+        self.assertIsNotNone(m, note[0])
+        self.assertEqual((m.group(4), m.group(5), m.group(7), m.group(10)),
+                         (self.T, "ask", "90", "20"))
+
+    def test_an_array_event_offers_past_the_finecon_three_per_event(self):
+        # soda's T92-T98 offers plus its quoting T100: five strikes of one
+        # event, where finecon admits three
+        def m(t, est):
+            return imm.MarketMeta(
+                ticker=t, event_ticker=t.rsplit("-", 1)[0],
+                series=t.split("-")[0], dollars_per_day=14.54,
+                program_end=None, target_size=1000, discount_factor=0.5,
+                cutoff=None, close_time=None, est_dollars_per_day=est,
+                est_exposure_dollars=20.0, est_collateral_dollars=0.0)
+        soda = [m(f"{self.EV}-T{k}", est) for k, est in
+                ((92, 4.3), (94, 4.31), (96, 3.72), (98, 0.53), (100, 0.1))]
+        grp = set(imm.FINECON_SERIES) | {"KXSODAARRAY", "KXRIDEARRAY"}
+        with mock.patch.object(imm, "FINECON_SERIES", grp):
+            self.assertEqual(imm.finecon_group_cut(soda, set(),
+                                                   members={f"{self.EV}-T100"}), set())
+            with mock.patch.object(imm, "CA_ARRAY_LEAD_SERIES", ()):
+                self.assertEqual(imm.finecon_group_cut(
+                    soda, set(), members={f"{self.EV}-T100"}),
+                    {f"{self.EV}-T96", f"{self.EV}-T98"})
+            # the ride array keeps three
+            ride = [m(f"KXRIDEARRAY-68DEC08-T{k}", 1.0) for k in (80, 85, 90, 95)]
+            self.assertEqual(len(imm.finecon_group_cut(ride, set())), 1)
+
+    def test_the_loop_offers_nothing_where_a_variant_makes_yes_likely(self):
+        # mu 80: at sigma / 3, x1.22 (97.6) puts T92 YES at 89%
+        self._shadow(80.0)
+        bot, rungs, lines = self._cycle()
+        self.assertNotIn((90, 200), rungs.get("ask", []), rungs)
+        self.assertFalse([ln for ln in lines if f"fair lead {self.T} ask: 200" in ln])
+
+
 class TestSweepEscalation(unittest.TestCase):
     """Repeat trips on an event hold it longer (SWEEP_ESCALATE, Jack
     2026-10-17: "Build 1 without approvals, rain, mentions. Shorten the

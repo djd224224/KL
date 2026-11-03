@@ -226,6 +226,13 @@ class TestFairLeads(unittest.TestCase):
     so it never asks for a hedge job."""
 
     def test_the_email_names_the_families_led_now_or_on_the_day(self):
+        # the Carbon Arc arrays joined 2026-11-02 (Jack: "build and turn on")
+        with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXOPENVREQ", "KXRAINWKND")):
+            self.assertEqual(cm._fair_names({}), "weekend rain, Vercel, Carbon Arc arrays")
+        self._names_without_arrays()
+
+    @mock.patch.object(imm, "CA_ARRAY_LEAD_SERIES", ())
+    def _names_without_arrays(self):
         # the OpenRouter weekly left the bot's list 2026-10-31 (Jack: "Pull
         # it back"); 10/31's email still names it, its leads ran that day
         with mock.patch.object(imm, "FAIR_LEAD_SERIES", ("KXOPENVREQ", "KXRAINWKND")):
