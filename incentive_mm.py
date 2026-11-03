@@ -11974,6 +11974,9 @@ _CONFIG_CODE_KNOBS = (
     "RT_SETTLED_MODE", "RT_SETTLED_MIN_REVIEWS", "RT_SETTLED_P", "RT_SETTLED_MIN_GAP",
     "RT_SETTLED_MID", "RT_SETTLED_BAND_LO", "RT_SETTLED_BAND_HI", "RT_SETTLED_STOP_H",
     "RT_FLOOR_BOOST_MAX",         # RT up to x2.5 to clear the payout floor (2026-11-01)
+    # RT locked strikes, 500 a side (2026-11-03)
+    "RT_LOCKED_MODE", "RT_LOCKED_MIN_REVIEWS", "RT_LOCKED_MIN_GAP", "RT_LOCKED_P",
+    "RT_LOCKED_MAX_DAYS", "RT_LOCKED_SIDE",
     # Vercel up to x2.5, 500 a side, to clear the payout floor (2026-11-01)
     "VERCEL_FLOOR_BOOST_MAX", "VERCEL_FLOOR_BOOST_SIDE_CAP",
     # fair lead (2026-10-29)
@@ -14963,7 +14966,7 @@ RT_FAIR_MIN_REVIEWS_DEFAULT = 10      # rt_fair.MIN_REVIEWS, when the file has n
 RT_FAIR_FILE = os.environ.get(
     "IMM_RT_FAIR_FILE", os.path.join(STATUS_DIR, "rt_fair.json"))
 _rt_fair_state: dict = {"mtime": 0.0, "markets": {}, "films": {}, "strikes": {},
-                        "min_reviews": RT_FAIR_MIN_REVIEWS_DEFAULT}
+                        "closes": {}, "min_reviews": RT_FAIR_MIN_REVIEWS_DEFAULT}
 
 
 def rt_fair_series(series: str) -> bool:
@@ -14972,8 +14975,9 @@ def rt_fair_series(series: str) -> bool:
 
 def load_rt_fair() -> int:
     """Hot-reload RT_FAIR_FILE by mtime: markets {ticker: {p (None without
-    a price), event, n, ts, jump_ts}}, films {event: {n, score}} and strikes
-    {ticker: strike} (RT SETTLED STRIKES); the market count, else -1."""
+    a price), event, n, ts, jump_ts}}, films {event: {n, score}}, strikes
+    {ticker: strike} (RT SETTLED STRIKES) and closes {event: ts} (RT LOCKED
+    SIZE); the market count, else -1."""
     try:
         mtime = os.path.getmtime(RT_FAIR_FILE)
     except OSError:
@@ -15010,13 +15014,18 @@ def load_rt_fair() -> int:
         except (TypeError, ValueError, AttributeError):
             continue
     strikes: Dict[str, float] = {}
-    for oe in (data.get("open_events") or {}).values():
+    closes: Dict[str, float] = {}       # event -> its close (RT LOCKED SIZE)
+    for ev, oe in (data.get("open_events") or {}).items():
         for t, k in ((oe or {}).get("strikes") or {}).items():
             try:
                 strikes[str(t)] = float(k)
             except (TypeError, ValueError):
                 continue
+        c = parse_iso_utc(str((oe or {}).get("close") or ""))
+        if c is not None:
+            closes[str(ev)] = c.timestamp()
     _rt_fair_state["films"], _rt_fair_state["strikes"] = films, strikes
+    _rt_fair_state["closes"] = closes
     try:   # the feed's own pricing bar (rt_fair.MIN_REVIEWS), for the few-reviews hold
         mr = int((data.get("model") or {}).get("min_reviews") or 0)
     except (TypeError, ValueError, AttributeError):
@@ -15147,6 +15156,66 @@ def rt_release_week(meta, now_ts: float) -> bool:
     return (KXRT_CUTOFF_BEFORE_CLOSE_DAYS > 0 and meta.close_time is not None
             and now_ts >= meta.close_time.timestamp()
             - KXRT_CUTOFF_BEFORE_CLOSE_DAYS * 86400.0)
+
+
+# RT LOCKED SIZE (Jack 2026-11-03: "on KXRT if the ratings are already nearly
+# 'locked' and unlikely to move, be open to quoting up to 500 contracts"). A
+# SETTLED STRIKE (rt_settled_reason) that is also LOCKED (rt_locked_reason:
+# RT_LOCKED_MIN_REVIEWS+ reviews, the score RT_LOCKED_MIN_GAP+ points from
+# the strike, the feed's model at RT_LOCKED_P+ on that side, and at most
+# RT_LOCKED_MAX_DAYS to its close) rests RT_LOCKED_SIDE on each side it
+# quotes, at every hour: the side's bound
+# and the market's position cap rise to it (the estimator and its floor
+# projection, the quote loop and the placement guard's bracket alike). The
+# event cap, the skew, the review-jump hold and the settled strike's own
+# tests stay, so a side that has filled stops growing and a strike that
+# stops qualifying drops back at once. The window is the evidence: on
+# Wayback RT snapshots of 56 settled films with 50+ reviews, scores moved at
+# most 6 points to the final inside 4 days of the close (550 strikes passing
+# the rest of the rule, none lost, the nearest 6 points clear), but 9 and 15
+# points from 4.8-5.8 days out as the release brought 2-3x the reviews: The
+# Social Reckoning's 60 at 70% (the model 99.7% for 55) settled at 55, and
+# Disclosure Day's 113 at 89% at 80. IMM_RT_LOCKED=off turns it off.
+RT_LOCKED_MODE = os.environ.get("IMM_RT_LOCKED", "on").strip().lower()
+RT_LOCKED_MIN_REVIEWS = _env_int("IMM_RT_LOCKED_MIN_REVIEWS", 50)
+RT_LOCKED_MIN_GAP = _env_float("IMM_RT_LOCKED_MIN_GAP", 10.0)
+RT_LOCKED_P = _env_float("IMM_RT_LOCKED_P", 0.995)
+RT_LOCKED_MAX_DAYS = _env_float("IMM_RT_LOCKED_MAX_DAYS", 4.0)
+RT_LOCKED_SIDE = _env_int("IMM_RT_LOCKED_SIDE", 500)
+
+
+def rt_locked_reason(ticker: str, mid: Optional[float], now_ts: float) -> Optional[str]:
+    """None while `ticker` is a LOCKED strike (RT LOCKED SIZE), else why not."""
+    if RT_LOCKED_MODE != "on" or RT_LOCKED_SIDE <= 0:
+        return "the rule is off"
+    why = rt_settled_reason(ticker, mid, now_ts)
+    if why is not None:
+        return why
+    e = _rt_fair_state["markets"][ticker]
+    film = _rt_fair_state.get("films", {}).get(e["event"]) or {}
+    n = int(film.get("n") or e["n"] or 0)
+    if n < RT_LOCKED_MIN_REVIEWS:
+        return f"{n} reviews, under {RT_LOCKED_MIN_REVIEWS}"
+    gap = abs(film["score"] - rt_strike(ticker))
+    if gap < RT_LOCKED_MIN_GAP:
+        return f"the score is {gap:g} from the strike, under {RT_LOCKED_MIN_GAP:g}"
+    p = e["p"] if film["score"] > rt_strike(ticker) else 1.0 - e["p"]
+    if p < RT_LOCKED_P:
+        return f"the model reads {p * 100:.2f}% on its side, under {RT_LOCKED_P * 100:g}%"
+    close = _rt_fair_state.get("closes", {}).get(e["event"])
+    if close is None:
+        return "no close time"
+    days = (close - now_ts) / 86400.0
+    if days > RT_LOCKED_MAX_DAYS:
+        return f"{days:.1f} days to its close, over {RT_LOCKED_MAX_DAYS:g}"
+    return None
+
+
+def rt_locked_size(series: str, ticker: str, mid: Optional[float], now_ts: float) -> int:
+    """Each side's size on a LOCKED strike (RT_LOCKED_SIDE), else 0."""
+    if not rt_settled_series(series):
+        return 0
+    return RT_LOCKED_SIDE if rt_locked_reason(ticker, mid, now_ts) is None else 0
 
 
 # RT FLOOR BOOST (Jack 2026-11-01: "add a rule that RT multiplier can go up
@@ -23498,6 +23567,8 @@ class IncentiveMarketMaker:
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
         self._rt_settled_on: Dict[str, bool] = {}       # RT SETTLED STRIKES' logged state
+        self._rt_locked_on: Dict[str, bool] = {}        # RT LOCKED SIZE's logged state
+        self._rt_locked_n: Dict[str, int] = {}          # ... ticker -> the side size it rests
         # FAIR CLOSE: (ticker, side) -> the closing rung's last logged price,
         # and ticker -> (side, YES price) of the closing rung it rests now
         self._fair_close_noted: Dict[Tuple[str, str], Optional[int]] = {}
@@ -28905,11 +28976,14 @@ class IncentiveMarketMaker:
     def _room_priority(self, meta: "MarketMeta") -> bool:
         """First call on the event's room in the quote loop: a market in
         near-cliff mode (verdict this refresh, or the sticky size mode), or on
-        a VERCEL FLOOR BOOST step."""
-        return NEAR_CLIFF_ROOM_PRIORITY and (
+        a VERCEL FLOOR BOOST step -- or a LOCKED strike (RT LOCKED SIZE), so
+        its RT_LOCKED_SIDE is not split down by its siblings (the event cap
+        itself stands)."""
+        return (NEAR_CLIFF_ROOM_PRIORITY and (
             meta.ticker in self._near_cliff_boost
             or bool(getattr(meta, "near_cliff", False))
-            or meta.ticker in self.state.vercel_floor_boost)
+            or meta.ticker in self.state.vercel_floor_boost)) or (
+            rt_locked_size(meta.series, meta.ticker, meta.mid_cents, time.time()) > 0)
 
     def _near_cliff_size_mult(self, ticker: str) -> float:
         """NEAR_CLIFF_SIZE_MULT while `ticker` is in near-cliff mode (armed by
@@ -31117,6 +31191,24 @@ class IncentiveMarketMaker:
             f"{mid:g}c" + ("; past the release-week stand-down" if week else "")
             + ("; a touch outside the normal band" if band else ""))
 
+    def _rt_locked_note(self, t: str, why: Optional[str]) -> None:
+        """Log a LOCKED strike (RT LOCKED SIZE) going on or off, once each
+        way; off only for one that was on."""
+        on = why is None
+        if on == self._rt_locked_on.get(t, False):
+            return
+        self._rt_locked_on[t] = on
+        if not on:
+            log(f"{self.tag} rt locked {t}: off -- {why}; back to the family's size")
+            return
+        e = _rt_fair_state["markets"].get(t) or {}
+        film = _rt_fair_state.get("films", {}).get(e.get("event")) or {}
+        k = rt_strike(t)
+        p = e["p"] if film["score"] > k else 1.0 - e["p"]
+        log(f"{self.tag} rt locked {t}: on -- {film.get('n')} reviews, score "
+            f"{film['score']:g}%, strike {k:g}, model {p * 100:.2f}% on its side; "
+            f"each side up to {RT_LOCKED_SIDE}")
+
     def _lead_stop_note(self, t: str, src: str, meta) -> None:
         """Log each side of `t` still noted as leading as off for LEAD STOP,
         once."""
@@ -31684,7 +31776,9 @@ class IncentiveMarketMaker:
                 p_yes = p_own if _side == "bid" else 100 - p_own
                 m = capped_ref_mult(_anchor, p_yes, _side, hour_mult=hm,
                                     series=meta.series)
-                return min(int(round(_total * m)), int(_room))
+                # (a locked strike's rung: RT LOCKED SIZE)
+                return min(max(int(round(_total * m)), self._rt_locked_n.get(t, 0)),
+                           int(_room))
 
             pick = join_ahead_pick(levels, base_own, top_own, size_at,
                                    target, df, pool)
@@ -32424,6 +32518,9 @@ class IncentiveMarketMaker:
                     and rt_settled_reason(meta.ticker, meta.mid_cents, time.time()) is None)
         if _rs_band:
             _qlo, _qhi = min(_qlo, RT_SETTLED_BAND_LO), max(_qhi, RT_SETTLED_BAND_HI)
+        # ...and a locked one rests RT_LOCKED_SIDE a side (RT LOCKED SIZE)
+        _rl = (rt_locked_size(meta.series, meta.ticker, meta.mid_cents, time.time())
+               if _rs_band else 0)
 
         def _sides_in_band(eb: Optional[int],
                            ea: Optional[int]) -> Tuple[bool, bool]:
@@ -32462,10 +32559,11 @@ class IncentiveMarketMaker:
             _ln = _lead_n if vb is None else vercel_boost_lead_size(meta.target_size, _b)
             sbm, sam = (_cbm, _cam) if sides is None else sides
             lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
+            _bsum, _asum = sum(s for _t, s in lvb), sum(s for _t, s in lva)
             smb, sma = clamp_side_max_to_position_cap(
-                int(round(sum(s for _t, s in lvb) * rmb)),
-                int(round(sum(s for _t, s in lva) * rma)),
-                vercel_boost_cap(series_max_position(meta.series), _b))
+                max(int(round(_bsum * rmb)), _rl if _bsum > 0 else 0),
+                max(int(round(_asum * rma)), _rl if _asum > 0 else 0),
+                max(vercel_boost_cap(series_max_position(meta.series), _b), _rl))
             if quake_ask_strike(meta.ticker):
                 sma = min(sma, QUAKE_ASK_MAX_CONTRACTS)   # the loop's ask cap
             out: List[Quote] = []
@@ -32514,7 +32612,7 @@ class IncentiveMarketMaker:
                 else:
                     out += build_side_ladder(meta.ticker, "bid", eb, ea,
                                              smb, levels=lvb, ref_px=rpb,
-                                             band=band, hour_mult=hm)
+                                             band=band, hour_mult=hm, min_total=_rl)
             if ask_ok or (past and lead_aok and past_band_ahead("ask", la[0], ea)):
                 if lead_aok:
                     out += build_side_ladder(meta.ticker, "ask", la[0], eb,
@@ -32525,7 +32623,7 @@ class IncentiveMarketMaker:
                 else:
                     out += build_side_ladder(meta.ticker, "ask", ea, eb,
                                              sma, levels=lva, ref_px=rpa,
-                                             band=band, hour_mult=hm)
+                                             band=band, hour_mult=hm, min_total=_rl)
             if (SUBPENNY_JOIN and meta.price_step < 0.01
                     and sports_ladder_league(meta.series) is not None):
                 # the loop's sub-cent edge rungs (subcent_edge_quotes)
@@ -34387,6 +34485,8 @@ class IncentiveMarketMaker:
             # own band; past the release-week stand-down, one that no longer
             # qualifies stands aside at once (the next refresh puts its
             # cutoff back), its position riding as at any cutoff
+            # (RT LOCKED SIZE: a locked one's sides rest rt_lock_n, below)
+            rt_lock_n = 0
             if rt_settled_series(meta.series):
                 _rs_mid = ((ext_bid + ext_ask) / 2.0
                            if ext_bid is not None and ext_ask is not None else None)
@@ -34398,12 +34498,23 @@ class IncentiveMarketMaker:
                     pmin_s = min(pmin_s, RT_SETTLED_BAND_LO)
                     pmax_s = max(pmax_s, RT_SETTLED_BAND_HI)
                     self._rt_settled_note(t, None, _rs_mid, _rs_week, _rs_band)
+                    _rl_why = rt_locked_reason(t, _rs_mid, now_ts)
+                    if RT_LOCKED_MODE == "on":
+                        self._rt_locked_note(t, _rl_why)
+                    rt_lock_n = RT_LOCKED_SIDE if _rl_why is None else 0
                 else:
+                    if RT_LOCKED_MODE == "on":
+                        self._rt_locked_note(t, _rs_why)
                     self._rt_settled_note(t, _rs_why, _rs_mid, _rs_week, False)
                     if _rs_week:
+                        self._rt_locked_n.pop(t, None)
                         self.cancel_market_orders(t, resting)
                         self._gskip(t, "rt_settled_off", lambda: dict(why=_rs_why))
                         continue
+            if rt_lock_n:      # (the placement guard's bracket reads it)
+                self._rt_locked_n[t] = rt_lock_n
+            else:
+                self._rt_locked_n.pop(t, None)
             # PER-SIDE top-in-band (Jack 2026-08-03 "Do 1", CHIH T69.99: a
             # live 3x29 book was fully stood down because its wide spread
             # put the bid touch under 5c): a side whose OWN touch is outside
@@ -35235,13 +35346,19 @@ class IncentiveMarketMaker:
                 side_max_bid = max(side_max_bid, lead_n)
             if lead_a is not None and lv_ask:
                 side_max_ask = max(side_max_ask, lead_n)
+            # ...and a LOCKED strike's sides RT_LOCKED_SIDE (RT LOCKED SIZE)
+            if rt_lock_n and lv_bid:
+                side_max_bid = max(side_max_bid, rt_lock_n)
+            if rt_lock_n and lv_ask:
+                side_max_ask = max(side_max_ask, rt_lock_n)
             maxpos = series_max_position(meta.series, now_utc)
             if lead_b is not None or lead_a is not None:       # a leading market's cap
                 maxpos = max(maxpos, FAIR_LEAD_MAX_POSITION if lead_src == "fair"
                              else COMP_LEAD_MAX_POSITION)
             # (a VERCEL FLOOR BOOST step's: VERCEL_FLOOR_BOOST_SIDE_CAP, which
-            # the clamp below makes each side's bound too)
-            maxpos = vercel_boost_cap(maxpos, vb_step)
+            # the clamp below makes each side's bound too; a locked strike's:
+            # RT_LOCKED_SIDE)
+            maxpos = max(vercel_boost_cap(maxpos, vb_step), rt_lock_n)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             # (MANUAL_COEXIST_EVENTS too: the user's positions there are his)
@@ -35440,7 +35557,7 @@ class IncentiveMarketMaker:
                             t, "bid", anc_bid, ext_ask, rest_b, levels=lv_bid,
                             ref_px=pl_bid_px, band=(rung_lo, pmax_s), hour_mult=hm,
                             min_total=max(0 if close_on_b else unwind_bid,
-                                          lead_n if lead_on_b else 0)))
+                                          lead_n if lead_on_b else 0, rt_lock_n)))
                     if n_c:
                         mq.extend(build_side_ladder(t, "bid", close_b[0], ext_ask, n_c,
                                                     levels=lv_bid, ref_px=close_b[0],
@@ -35462,7 +35579,7 @@ class IncentiveMarketMaker:
                             t, "ask", anc_ask, ext_bid, rest_a, levels=lv_ask,
                             ref_px=pl_ask_px, band=(rung_lo, pmax_s), hour_mult=hm,
                             min_total=max(0 if close_on_a else unwind_ask,
-                                          lead_n if lead_on_a else 0)))
+                                          lead_n if lead_on_a else 0, rt_lock_n)))
                     if n_c:
                         mq.extend(build_side_ladder(t, "ask", close_a[0], ext_bid, n_c,
                                                     levels=lv_ask, ref_px=close_a[0],
@@ -36586,6 +36703,11 @@ class IncentiveMarketMaker:
             _u = _ub if q.book_side == "bid" else _ua
             side_cap = max(side_cap, _u)
             max_level_size = max(max_level_size, _u)
+            # a LOCKED strike's side rests RT_LOCKED_SIDE (RT LOCKED SIZE; the
+            # quote loop sized it so this cycle)
+            _rl = self._rt_locked_n.get(q.ticker, 0)
+            side_cap = max(side_cap, _rl)
+            max_level_size = max(max_level_size, _rl)
             # a complement lead rests target/5 at its lead price (the quote
             # loop sized it so: COMP_LEAD_MODE), and a fair lead its own size
             # -- and a LEADING SIDE's bound is the lead's size whatever price
@@ -39148,6 +39270,14 @@ class IncentiveMarketMaker:
                f"{RT_SETTLED_BAND_LO}-{RT_SETTLED_BAND_HI}c, through the release week to "
                f"{RT_SETTLED_STOP_H:g}h before its close"
                if RT_SETTLED_MODE == "on" else "off"))
+        log("rt locked size (2026-11-03): "
+            + (f"on -- a settled strike with {RT_LOCKED_MIN_REVIEWS}+ reviews, the score "
+               f"{RT_LOCKED_MIN_GAP:g}+ points away and the RT model at "
+               f"{RT_LOCKED_P * 100:g}%+ on its side, {RT_LOCKED_MAX_DAYS:g} days or less "
+               f"from its close, rests up to {RT_LOCKED_SIDE} a side, "
+               f"its position cap raised to that; the event cap and the skew stay"
+               if RT_LOCKED_MODE == "on" and RT_SETTLED_MODE == "on" and RT_LOCKED_SIDE > 0
+               else "off"))
         log("lead stop (2026-11-01): "
             + (f"no lead of either kind from {LEAD_STOP_BEFORE_H:g}h before a market's "
                f"decision -- a Vercel market's measured UTC day, else its cutoff (rain: "

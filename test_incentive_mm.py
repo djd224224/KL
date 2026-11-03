@@ -14826,6 +14826,226 @@ class TestRtFloorBoost(unittest.TestCase):
         self.assertEqual(self._sizes(bot), sorted(int(c * 2.5 + 0.5) for c in plain))
 
 
+class TestRtLockedSize(unittest.TestCase):
+    """Jack 2026-11-03: "on KXRT if the ratings are already nearly 'locked'
+    and unlikely to move, be open to quoting up to 500 contracts". RT LOCKED
+    SIZE: a settled strike that is also locked rests RT_LOCKED_SIDE a side.
+    Fixture KXRT-ZZL-80: 150 reviews at 93%, the model at 99.95% for 80, on a
+    97x98 book, closing in 3 days; the live geometry (one 20-lot rung, 150
+    a market, 1,000 an event, x3 for KXRT)."""
+
+    T = "KXRT-ZZL-80"
+    EV = "KXRT-ZZL"
+    _bump = 1
+
+    def setUp(self):
+        _clean_persist()
+        imm._rt_fair_state.update(mtime=0.0, markets={}, films={}, strikes={})
+        try:
+            os.remove(imm.RT_FAIR_FILE)
+        except FileNotFoundError:
+            pass
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LEVELS", [(0, 20)]),
+                  mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0),
+                  mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _write(self, n=150, score=93.0, p=0.9995, k=80.0, jump_age_secs=None,
+               close_days=3.0):
+        now = datetime.now(timezone.utc)
+        jump = None if jump_age_secs is None else (
+            now - timedelta(seconds=jump_age_secs)).isoformat()
+        close = (now + timedelta(days=close_days)).isoformat()
+        doc = {"films": {self.EV: {"n": n, "score": score, "liked": int(round(n * score / 100))}},
+               "open_events": {self.EV: {"strikes": {self.T: k}, "close": close}},
+               "markets": {self.T: {"event": self.EV, "p": p, "n": n, "jump_at": jump,
+                                    "fetched_at": now.isoformat()}}}
+        with open(imm.RT_FAIR_FILE, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        os.utime(imm.RT_FAIR_FILE, (time.time(), time.time() + TestRtLockedSize._bump))
+        TestRtLockedSize._bump += 1
+        return imm.load_rt_fair()
+
+    def _bot(self, bid=0.97, ask=0.98, deep="5000"):
+        _clean_persist()
+        client = FakeClient()
+        close = (datetime.now(timezone.utc) + timedelta(days=3)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 50000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": close, "yes_bid_dollars": f"{bid:.4f}",
+            "yes_ask_dollars": f"{ask:.4f}", "volume_fp": "5000.00"}
+        no = round(1.0 - ask, 2)
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{bid - 0.01:.2f}", deep], [f"{bid:.2f}", "300"]],
+            "no_dollars": [[f"{no - 0.01:.2f}", deep], [f"{no:.2f}", "300"]]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _sizes(self, bot):
+        out = {}
+        for o in bot.state.sim_orders.values():
+            if o["ticker"] == self.T and 1 < o["yes_price"] < 99:
+                out[o["book_side"]] = out.get(o["book_side"], 0) + int(o["remaining_count"])
+        return out
+
+    def _run(self, bot):
+        lines = []
+        with mock.patch.object(imm, "log", lines.append), \
+                mock.patch.object(imm, "floor_bar_dollars", lambda series, banked: 0.0):
+            bot.run_cycle()
+        return lines
+
+    def test_the_rule(self):
+        for k in ("RT_LOCKED_MODE", "RT_LOCKED_MIN_REVIEWS", "RT_LOCKED_MIN_GAP",
+                  "RT_LOCKED_P", "RT_LOCKED_MAX_DAYS", "RT_LOCKED_SIDE"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        self.assertEqual((imm.RT_LOCKED_MODE, imm.RT_LOCKED_MIN_REVIEWS,
+                          imm.RT_LOCKED_MIN_GAP, imm.RT_LOCKED_P, imm.RT_LOCKED_MAX_DAYS,
+                          imm.RT_LOCKED_SIDE),
+                         ("on", 50, 10.0, 0.995, 4.0, 500))
+        r, now = imm.rt_locked_reason, time.time()
+        self.assertEqual(r(self.T, 97.5, now), "no RT read")
+        self._write()
+        self.assertIsNone(r(self.T, 97.5, now))
+        self.assertEqual(imm.rt_locked_size("KXRT", self.T, 97.5, now), 500)
+        self.assertEqual(imm.rt_locked_size("KXRTTV", self.T, 97.5, now), 0)
+        # the settled strike's own tests come first
+        self.assertEqual(r(self.T, 85.0, now), "the book's 85c mid disagrees")
+        self._write(jump_age_secs=60)
+        self.assertEqual(r(self.T, 97.5, time.time()), "a review-count jump hold")
+        # then the lock's: reviews (its own bar, raised here), the gap, the
+        # model on its side
+        self._write(n=99)
+        with mock.patch.object(imm, "RT_LOCKED_MIN_REVIEWS", 100):
+            self.assertEqual(r(self.T, 97.5, now), "99 reviews, under 100")
+        self._write(score=89.0)
+        self.assertEqual(r(self.T, 97.5, now), "the score is 9 from the strike, under 10")
+        self._write(p=0.99)
+        self.assertEqual(r(self.T, 97.5, now),
+                         "the model reads 99.00% on its side, under 99.5%")
+        # ...and the release weekend: The Social Reckoning's 60 reviews at
+        # 70% (the model 99.7% for 55) settled at 55 from 4.8 days out
+        self._write(close_days=5.0)
+        self.assertEqual(r(self.T, 97.5, time.time()), "5.0 days to its close, over 4")
+        self.assertIsNone(imm.rt_settled_reason(self.T, 97.5, time.time()))
+        # a strike over the score: a locked NO
+        self._write(score=70.0, p=0.002)
+        self.assertIsNone(r(self.T, 2.5, now))
+        self._write(score=70.0, p=0.01)
+        self.assertEqual(r(self.T, 2.5, now),
+                         "the model reads 99.00% on its side, under 99.5%")
+        self._write()
+        with mock.patch.object(imm, "RT_LOCKED_MODE", "off"):
+            self.assertEqual(r(self.T, 97.5, now), "the rule is off")
+            self.assertEqual(imm.rt_locked_size("KXRT", self.T, 97.5, now), 0)
+        with mock.patch.object(imm, "RT_SETTLED_MODE", "off"):
+            self.assertEqual(imm.rt_locked_size("KXRT", self.T, 97.5, now), 0)
+
+    def test_a_locked_strike_rests_500_a_side(self):
+        self._write()
+        bot = self._bot()
+        lines = self._run(bot)
+        self.assertEqual(self._sizes(bot), {"bid": 500, "ask": 500}, lines)
+        ons = [x for x in lines if f"rt locked {self.T}: on -- " in x]
+        self.assertEqual(len(ons), 1, lines)
+        self.assertIn("150 reviews, score 93%, strike 80, model 99.95% on its side; "
+                      "each side up to 500", ons[0])
+        self.assertEqual(bot._rt_locked_n, {self.T: 500})
+        self.assertFalse(any("side_cap" in x or "level_cap" in x for x in lines), lines)
+
+    def test_a_settled_strike_not_locked_keeps_the_family_size(self):
+        self._write(score=88.0)      # settled (5+ points), not locked (under 10)
+        bot = self._bot()
+        lines = self._run(bot)
+        sizes = self._sizes(bot)
+        self.assertTrue(sizes, lines)
+        self.assertTrue(all(0 < v <= 450 for v in sizes.values()), sizes)
+        self.assertFalse(any("rt locked" in x for x in lines), lines)
+        self.assertEqual(bot._rt_locked_n, {})
+        self._write()
+        with mock.patch.object(imm, "RT_LOCKED_MODE", "off"):
+            bot = self._bot()
+            self._run(bot)
+            self.assertEqual(self._sizes(bot), sizes)
+
+    def test_it_drops_back_once_it_stops_qualifying(self):
+        self._write()
+        bot = self._bot()
+        self._run(bot)
+        self.assertEqual(self._sizes(bot), {"bid": 500, "ask": 500})
+        self._write(score=88.0)
+        lines = self._run(bot)
+        sizes = self._sizes(bot)
+        self.assertTrue(all(0 < v <= 450 for v in sizes.values()), (sizes, lines))
+        self.assertTrue(any(f"rt locked {self.T}: off -- the score is 8 from the strike, "
+                            f"under 10; back to the family's size" in x for x in lines), lines)
+        self.assertEqual(bot._rt_locked_n, {})
+
+    def test_the_cap_and_skew_still_bind(self):
+        self._write()
+        bot = self._bot()
+        bot.client.positions[self.T] = 300.0
+        bot.pnl.pos[self.T] = 300.0          # long 300 (ours): past the x3 hard skew (180)
+        self._run(bot)
+        sizes = self._sizes(bot)
+        self.assertNotIn("bid", sizes)       # the accumulating side is pulled
+        self.assertEqual(sizes.get("ask"), 500)
+        bot = self._bot()
+        bot.client.positions[self.T] = -60.0
+        bot.pnl.pos[self.T] = -60.0          # short 60: under the skew, under the cap
+        self._run(bot)
+        self.assertEqual(self._sizes(bot).get("bid"), 500)
+
+    def test_it_has_first_call_on_the_event_room(self):
+        # four strikes share a 750 event cap (250 x3): split evenly, the
+        # locked one would rest 187; it takes its 500 first, and the event
+        # cap still bounds the event (the siblings share the 250 left)
+        self._write()
+        bot = self._bot()
+        for k in (88, 90, 92):
+            sib = f"{self.EV}-{k}"
+            bot.client.programs.append(dict(bot.client.programs[-1], market_ticker=sib))
+            far = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")              # (before the release-week stand-down)
+            bot.client.markets[sib] = dict(bot.client.markets[self.T], ticker=sib,
+                                           close_time=far, yes_bid_dollars="0.5000",
+                                           yes_ask_dollars="0.5100")
+            bot.client.books[sib] = {"orderbook_fp": {    # 50x51
+                "yes_dollars": [["0.49", "3000"], ["0.50", "300"]],
+                "no_dollars": [["0.48", "3000"], ["0.49", "300"]]}}
+        with mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 250.0):
+            lines = self._run(bot)
+        self.assertEqual(self._sizes(bot), {"bid": 500, "ask": 500}, lines)
+        bids = sum(int(o["remaining_count"]) for o in bot.state.sim_orders.values()
+                   if o["ticker"].startswith(self.EV + "-") and o["book_side"] == "bid"
+                   and 1 < o["yes_price"] < 99)
+        self.assertLessEqual(bids, 750)
+        self.assertGreater(bids, 500, lines)            # the siblings still quote
+
+    def test_the_estimate_sees_the_500(self):
+        self._write(score=88.0)
+        bot = self._bot()
+        self._run(bot)
+        plain = bot._est_peak[self.T][0]
+        self._write()
+        bot = self._bot()
+        self._run(bot)
+        self.assertGreater(bot._est_peak[self.T][0], 1.05 * plain)
+
+
 class TestVercelFloorBoost(unittest.TestCase):
     """Jack 2026-11-01: "payout floor is $1 across life, not per day. add rule
     for ability to 2.5x multiplier up to 500 on each side on Vercel, if
