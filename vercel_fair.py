@@ -78,6 +78,34 @@ OPEN_WIDEN 1.0 -> 1.5 with it: at 1.0 the open-weights 5-95% band missed
 16-17% of May-Oct outcomes (8% at 1.5). A log space was tried for Moonshot
 and dropped: comparable Brier, but 95th percentiles of 50-88% share.
 
+WEEKDAY RE-FIT (Jack 2026-11-02: "Re-fit weekday term", after the 02NOV26
+cohort lost -$318 on a Monday D, -$288 of it on four fair leads the book
+priced right). In October the weekly cycle grew on the business-usage series
+and the model missed the weekend <-> weekday turn: a Monday D read too low
+on OpenAI / Anthropic spend, OpenAI / DeepSeek requests (no weekday term, or
+a weak one), and Google requests too high Mon-Wed (its 90-day level-space
+term, learned at a 13-18% share, kept a -2.5 pp Saturday dip at ~9%). Two
+changes, the cautious variant (Jack 2026-11-02: "ship C3"):
+  DOW_SERIES = all eight series (the four 2026-10-11 left out included).
+  LOG_SERIES (KXGOOGVREQ, KXANTHVREQ): changes and the weekday effect
+      modelled in log(share), so the weekly cycle scales with the level.
+Backtest (complete anchors h = 1..4, CRPS of the widened sample vs the
+day's value, mean ratio to the old model over the eight series; Brier vs the
+book at D-1 00:30Z on the logger's two-sided strikes, 7 lab series):
+  Mar-Sep 2026: CRPS x0.997 (worst ANTHVSPEND x1.019) -- no variant did
+      much better before October; the cycle is new.
+  10/01-11/02:  CRPS x0.923 (worst x1.000); Brier 0.150 -> 0.136 vs the
+      book's 0.140 (Mon 0.133 -> 0.097 vs 0.088; Sat/Sun 0.162 -> 0.136 vs
+      0.132). 11/02's four lead fills: three no longer lead (fairs 22 / 48 /
+      73% vs prices 26c bid / 50c / 68-72c asks); T11P0's 41c bid sits under
+      a 47% fair.
+  The bolder variant, log space for all six lab series but Moonshot
+  (IMM_VERCEL_LOG_SERIES=KXOPENVSPEND,KXANTHVSPEND,KXGOOGVREQ,KXOPENVREQ,
+  KXDEEPVREQ,KXANTHVREQ): Mar-Sep x1.014 (worst OPENVSPEND x1.058), October
+  x0.868, Brier 0.129 (Mon 0.089, Sat/Sun 0.129). Its tails held, but for
+  DeepSeek's low-share spring (99th pct 3.9x the level).
+IMM_VERCEL_DOW_SERIES / IMM_VERCEL_LOG_SERIES restore any mix.
+
 Reads: the 100-day history (~2 MB) once per HISTORY_REFRESH_SECS and at
 each new UTC day, plus a fresh yesterday + today read (~40 KB) every refresh;
 the weight-class chart the same way (~25 KB, then ~1 KB).
@@ -168,13 +196,17 @@ MIN_SAMPLE = 20
 # (fairfix-2026-10-05/bt_lag0.json, anchors Jun-Oct, widen 1.5) cut their
 # CRPS 24.6% / 9.5% / 8.5% with the 90% band's coverage unchanged (98 -> 97%,
 # 89 -> 88%, 94 -> 94%). It made the other four series slightly worse (OPENVREQ,
-# OPENVSPEND, ANTHVSPEND, MOONVSPEND +0.6 to +1.9%), so they stay off.
-DOW_SERIES = _env_set("IMM_VERCEL_DOW_SERIES",
-                      "KXOPENSOURCESHARE,KXGOOGVREQ,KXDEEPVREQ,KXANTHVREQ")
+# OPENVSPEND, ANTHVSPEND, MOONVSPEND +0.6 to +1.9%), so they stayed off --
+# until 2026-11-02 (the weekday re-fit above): all eight carry it, and the
+# Google / Anthropic requests series model it in log space.
+DOW_SERIES = _env_set("IMM_VERCEL_DOW_SERIES", ",".join(ALL_SERIES))
 SEASON_DAYS = int(_env_float("IMM_VERCEL_SEASON_DAYS", 90))
 MR_SERIES = _env_set("IMM_VERCEL_MR_SERIES", "KXMOONVSPEND")
 MR_TRAIL_DAYS = int(_env_float("IMM_VERCEL_MR_TRAIL_DAYS", 7))
 SQRT_SERIES = _env_set("IMM_VERCEL_SQRT_SERIES", "KXMOONVSPEND")
+# a series in both takes sqrt; a share at 0 is read at LOG_FLOOR
+LOG_SERIES = _env_set("IMM_VERCEL_LOG_SERIES", "KXGOOGVREQ,KXANTHVREQ")
+LOG_FLOOR = 1e-3
 HISTORY_REFRESH_SECS = _env_float("IMM_VERCEL_HISTORY_REFRESH_SECS", 6 * 3600)
 # D-1 running anchor (2026-10-01); IMM_VERCEL_RUN_ANCHOR=0 restores the
 # complete-day anchor all day
@@ -509,10 +541,18 @@ def change_sample(x: Dict[str, float], last: date, h: int) -> List[float]:
 
 def _space(series: Optional[str]):
     """(f, finv) of the space a series' changes are modelled in: sqrt(share)
-    for SQRT_SERIES, the share itself otherwise."""
+    for SQRT_SERIES, log(share) for LOG_SERIES, the share itself otherwise."""
     if series in SQRT_SERIES:
         return (lambda v: math.sqrt(max(v, 0.0))), (lambda u: max(u, 0.0) ** 2)
+    if series in LOG_SERIES:
+        return (lambda v: math.log(max(v, LOG_FLOOR))), math.exp
     return (lambda v: v), (lambda u: u)
+
+
+def _space_name(series: Optional[str]) -> str:
+    if series in SQRT_SERIES:
+        return "sqrt"
+    return "log" if series in LOG_SERIES else "level"
 
 
 def dow_profile(z: Dict[str, float], last: date) -> Dict[int, float]:
@@ -596,9 +636,9 @@ def _centre(m: dict, anchor_day: date, y_anchor: float, d: date) -> float:
 
 def _adj(m: dict, series: Optional[str], anchor_day: date, d: date) -> dict:
     """What the 10/05 terms did to an entry, for the file (series with any)."""
-    if series not in DOW_SERIES and not m["mr"] and series not in SQRT_SERIES:
+    if series not in DOW_SERIES and not m["mr"] and _space_name(series) == "level":
         return {}
-    return {"adj": {"space": "sqrt" if series in SQRT_SERIES else "level",
+    return {"adj": {"space": _space_name(series),
                     "dow": round(m["prof"][d.weekday()]
                                  - m["prof"][anchor_day.weekday()], 4),
                     "mr_slope": round(m["slope"], 4)}}
@@ -721,7 +761,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
                       "run_tau_tol_min": RUN_TAU_TOL_MIN,
                       "dow_series": sorted(DOW_SERIES), "season_days": SEASON_DAYS,
                       "mr_series": sorted(MR_SERIES), "mr_trail_days": MR_TRAIL_DAYS,
-                      "sqrt_series": sorted(SQRT_SERIES)},
+                      "sqrt_series": sorted(SQRT_SERIES),
+                      "log_series": sorted(LOG_SERIES)},
             "anchor": {"mode": mode, "tau_min": round(tau, 1),
                        "open_source": open_source_of(tab, want),
                        "rows_today": n_today, "rows_last": n_last,

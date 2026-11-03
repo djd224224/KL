@@ -1,5 +1,6 @@
 """Tests for vercel_fair (the pre-D Vercel gate's fair values)."""
 import json
+import math
 import os
 import statistics
 import tempfile
@@ -196,7 +197,12 @@ class TestRunningAnchor(unittest.TestCase):
         self.assertIsNone(vf.run_entry(x, 25.0, [0.0] * 3, today, today, 1.0))
 
     def test_writes_running_entries_past_the_start(self):
-        (n, miss, mode), data = self._write(calib=calib(delta=-2.0))
+        # the running anchor's mechanics on the plain model: lab_table's 5-day
+        # cycle is not a weekly one, and the weekday term (all series since
+        # 2026-11-02) reads it as noise
+        with mock.patch.object(vf, "DOW_SERIES", frozenset()), \
+                mock.patch.object(vf, "LOG_SERIES", frozenset()):
+            (n, miss, mode), data = self._write(calib=calib(delta=-2.0))
         self.assertEqual((n, miss, mode), (8 * vf.HORIZON_DAYS, 0, "run"))
         e = data["entries"]["KXOPENVREQ-28SEP26"]               # D-1 = today
         self.assertEqual((e["anchor"], e["last"], e["h"]), ("run", "2026-09-27@run", 1))
@@ -333,25 +339,62 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
     def test_defaults(self):
         if os.environ.get("IMM_VERCEL_HORIZON_DAYS") is None:
             self.assertEqual(vf.HORIZON_DAYS, 4)
-        # + the Google / DeepSeek / Anthropic requests series (2026-10-11)
-        self.assertEqual(vf.DOW_SERIES, frozenset({"KXOPENSOURCESHARE", "KXGOOGVREQ",
-                                                   "KXDEEPVREQ", "KXANTHVREQ"}))
+        # every series since the 2026-11-02 re-fit (GOOG / DEEP / ANTH requests
+        # from 2026-10-11), Google / Anthropic requests in log space ("ship C3")
+        self.assertEqual(vf.DOW_SERIES, frozenset(vf.ALL_SERIES))
+        self.assertEqual(vf.LOG_SERIES, frozenset({"KXGOOGVREQ", "KXANTHVREQ"}))
         self.assertEqual(vf.MR_SERIES, frozenset({"KXMOONVSPEND"}))
         self.assertEqual(vf.SQRT_SERIES, frozenset({"KXMOONVSPEND"}))
 
-    def test_requests_series_take_the_weekday_term(self):
-        # Jack 2026-10-11 ("yes ship 3"): GOOG / DEEP / ANTH requests carry the
-        # weekday term; the other lab series (OPENVREQ here) do not
+    def test_lab_series_take_the_weekday_term(self):
+        # Jack 2026-11-02 ("Re-fit weekday term", "ship C3"): every lab series
+        # carries the weekday term; in log space the weekend effect is a
+        # ratio, 75 / 60, in level space 15 pp
         x = weekly_open()
         fri = max(date.fromisoformat(d) for d in x if date.fromisoformat(d).weekday() == 4)
         x = {d: v for d, v in x.items() if d <= fri.isoformat()}
         sun = fri + timedelta(days=2)
-        for s in ("KXGOOGVREQ", "KXDEEPVREQ", "KXANTHVREQ"):
+        for s in sorted(set(vf.LAB_SERIES) - vf.SQRT_SERIES):
             e = vf.fair_entry(x, sun, fri, 1.0, s)
-            self.assertAlmostEqual(e["adj"]["dow"], 15.0, delta=0.6, msg=s)
+            log = s in vf.LOG_SERIES
+            self.assertEqual(e["adj"]["space"], "log" if log else "level", msg=s)
+            self.assertAlmostEqual(e["adj"]["dow"], math.log(75.0 / 60.0) if log else 15.0,
+                                   delta=0.01 if log else 0.6, msg=s)
             self.assertAlmostEqual(e["x_l"] + statistics.median(e["errs"]), 75.0,
                                    delta=1.0, msg=s)
-        self.assertNotIn("adj", vf.fair_entry(x, sun, fri, 1.0, "KXOPENVREQ"))
+        self.assertEqual(sum(s in vf.LOG_SERIES for s in vf.LAB_SERIES), 2)
+        # the env knobs restore the old plain series
+        with mock.patch.object(vf, "DOW_SERIES", frozenset()), \
+                mock.patch.object(vf, "LOG_SERIES", frozenset()):
+            self.assertNotIn("adj", vf.fair_entry(x, sun, fri, 1.0, "KXOPENVREQ"))
+
+    def test_a_shrinking_weekly_cycle_scales_in_log_space(self):
+        # KXGOOGVREQ-02NOV26: a share that halves over the season with a
+        # weekly cycle in proportion to it (Sat x0.82, Sun x0.95, Mon x1.05).
+        # The level-space term keeps the Saturday dip in pp from when the share
+        # was high, so a Saturday anchor priced Monday too high (12.25 off
+        # 8.80 on 10/31; Monday settled 9.82); in log space the dip scales.
+        start, mult = date(2026, 5, 1), {5: 0.82, 6: 0.95, 0: 1.05}
+        x = {}
+        for i in range(150):
+            d = start + timedelta(days=i)
+            wiggle = 1.0 + (0.01 if i % 2 else -0.01)
+            x[d.isoformat()] = 18.0 * 0.5 ** (i / 150) * mult.get(d.weekday(), 1.0) * wiggle
+        sat = max(date.fromisoformat(d) for d in x if date.fromisoformat(d).weekday() == 5)
+        mon = sat + timedelta(days=2)
+        truth = 18.0 * 0.5 ** ((mon - start).days / 150) * 1.05
+        x = {d: v for d, v in x.items() if d <= sat.isoformat()}
+        e = vf.fair_entry(x, mon, sat, 1.5, "KXGOOGVREQ")
+        with mock.patch.object(vf, "LOG_SERIES", frozenset()):
+            lvl = vf.fair_entry(x, mon, sat, 1.5, "KXGOOGVREQ")
+        med = e["x_l"] + statistics.median(e["errs"])
+        med_lvl = lvl["x_l"] + statistics.median(lvl["errs"])
+        self.assertEqual((e["adj"]["space"], lvl["adj"]["space"]), ("log", "level"))
+        self.assertGreater(med_lvl - truth, 0.3)             # the old overshoot
+        self.assertLess(abs(med - truth), 0.5 * (med_lvl - truth))
+        self.assertLess(abs(med - truth), 0.25)
+        # a share at 0 is read at the floor, not a math error
+        self.assertEqual(vf._space("KXGOOGVREQ")[0](0.0), math.log(vf.LOG_FLOOR))
 
     def test_dow_profile_of_a_weekly_pattern(self):
         z = weekly_open(wiggle=False)
@@ -397,7 +440,9 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
         self.assertLess(e["adj"]["mr_slope"], -0.5)
         self.assertGreater(e["x_l"] + statistics.median(e["errs"]), 8.0)
         self.assertGreaterEqual(min(e["x_l"] + v for v in e["errs"]), -1e-9)
-        with mock.patch.object(vf, "MR_SERIES", frozenset()),                 mock.patch.object(vf, "SQRT_SERIES", frozenset()):
+        with mock.patch.object(vf, "MR_SERIES", frozenset()), \
+                mock.patch.object(vf, "SQRT_SERIES", frozenset()), \
+                mock.patch.object(vf, "DOW_SERIES", frozenset()):
             old = vf.fair_entry(x, d1, last, 1.5, "KXMOONVSPEND")
         self.assertNotIn("adj", old)
         self.assertLess(old["x_l"] + statistics.median(old["errs"]), 4.0)   # sticks at the dip
@@ -410,10 +455,17 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
         self.assertGreaterEqual(min(r["x_l"] + v for v in r["errs"]), -1e-9)
 
     def test_plain_series_are_unchanged(self):
+        # a series with none of the terms (none since 2026-11-02 by default;
+        # the env knobs can make one) is the plain h-day change sample
         tab = history(("openai", "requests"), 80, step=lambda i: (i % 7) * 0.4 + (i % 3) * 0.2)
         dates = sorted(tab[("openai", "requests")])
         x = vf.series_values(tab, "KXOPENVREQ", dates)
         last = date.fromisoformat(dates[-1])
+        plain = (mock.patch.object(vf, "DOW_SERIES", frozenset()),
+                 mock.patch.object(vf, "LOG_SERIES", frozenset()))
+        for p in plain:
+            p.start()
+            self.addCleanup(p.stop)
         for h in (1, 2, 3):
             e = vf.fair_entry(x, last + timedelta(days=h), last, 1.5, "KXOPENVREQ")
             ch = vf.change_sample(x, last, h)
@@ -432,15 +484,17 @@ class TestWeekdayAndMeanReversion(unittest.TestCase):
             data = json.load(f)
         self.assertEqual((n, miss, mode), (8 * vf.HORIZON_DAYS, 0, "complete"))
         m = data["model"]
-        self.assertEqual((m["dow_series"], m["mr_series"], m["sqrt_series"]),
-                         (["KXANTHVREQ", "KXDEEPVREQ", "KXGOOGVREQ", "KXOPENSOURCESHARE"],
-                          ["KXMOONVSPEND"], ["KXMOONVSPEND"]))
+        self.assertEqual((m["dow_series"], m["mr_series"], m["sqrt_series"], m["log_series"]),
+                         (sorted(vf.ALL_SERIES), ["KXMOONVSPEND"], ["KXMOONVSPEND"],
+                          ["KXANTHVREQ", "KXGOOGVREQ"]))
         self.assertEqual((m["season_days"], m["mr_trail_days"], m["open_widen"]),
                          (vf.SEASON_DAYS, vf.MR_TRAIL_DAYS, vf.OPEN_WIDEN))
-        self.assertIn("adj", data["entries"]["KXOPENSOURCESHARE-26SEP29"])
-        self.assertIn("adj", data["entries"]["KXMOONVSPEND-28SEP26"])
-        self.assertNotIn("adj", data["entries"]["KXOPENVREQ-28SEP26"])
-        self.assertIn("adj", data["entries"]["KXGOOGVREQ-28SEP26"])        # 2026-10-11
+        spaces = {ev: data["entries"][ev]["adj"]["space"] for ev in (
+            "KXOPENSOURCESHARE-26SEP29", "KXMOONVSPEND-28SEP26", "KXOPENVREQ-28SEP26",
+            "KXGOOGVREQ-28SEP26")}                                    # all carry it (11/02)
+        self.assertEqual(spaces, {"KXOPENSOURCESHARE-26SEP29": "level",
+                                  "KXMOONVSPEND-28SEP26": "sqrt",
+                                  "KXOPENVREQ-28SEP26": "level", "KXGOOGVREQ-28SEP26": "log"})
 
     def test_history_read_covers_the_weekday_window(self):
         r = mock.Mock()
