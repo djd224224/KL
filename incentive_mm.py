@@ -7727,6 +7727,12 @@ _DEFAULT_RATES_SERIES = ("KXUST2AD,KXUST5AD,KXUST7AD,KXUST10AD,KXUST30AD,"
 # blind, and on a long window with an $18/day pool it is the whole reason
 # nothing quoted -- the $1-per-period payout floor still decides entry
 # (IMM_RATES_EXTRA_MIN_RATE restores a bar).
+# + KXIBONDFIX (Jack 2026-11-03: "KXIBONDFIX-27MAY03 should be quoted as part
+# of treasuries autofamily"): the I bond fixed rate Treasury announces each
+# May / November (ECONSTATB, TreasuryDirect). Quoted by the open scan in
+# September (26NOV02), on no list since the scan went off 10/03. The gate
+# has no fair for it (treasury_fair.LONG_PROXY): the 5-year's feed / release
+# / move checks while more than 45 days out, standing aside inside that.
 _DEFAULT_RATES_EXTRA_SERIES = (
     "KXUST2AW,KXUST5AW,KXUST7AW,KXUST10AW,KXUST30AW,"
     "KXUST2A,KXUST5A,KXUST7A,KXUST10A,KXUST30A,"
@@ -7737,7 +7743,7 @@ _DEFAULT_RATES_EXTRA_SERIES = (
     "KX2YRDIRHM,KX2YRDIRLM,KX5YRDIRHM,KX5YRDIRLM,KX7YRDIRHM,KX7YRDIRLM,"
     "KX10YRDIRHM,KX10YRDIRHW,KX10YRDIRLM,KX10YRDIRLW,KX30YRDIRHM,KX30YRDIRLM,"
     "KXTREASURYMAX,KXTREASURYMAX5,KX30YUSTW,KXUSTYLD,KX3MTBILL,TBILL,KX2YFOMC,"
-    "KX10Y2Y,KX10Y2YDATE,KX10Y3M,10Y2Y,10Y3M,KXYINVERT,YINVERT")
+    "KX10Y2Y,KX10Y2YDATE,KX10Y3M,10Y2Y,10Y3M,KXYINVERT,YINVERT,KXIBONDFIX")
 # Finance/Economics quiet-print sweep (Jack 2026-09-02: "in Finance/Economics
 # sections that are unquoted in normal IMM bot, quote the top 10 markets
 # based on ROI (with no more than 3 on a single event). dont include any

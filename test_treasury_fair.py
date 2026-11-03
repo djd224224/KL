@@ -273,6 +273,28 @@ class TestAllTreasuryMarkets(unittest.TestCase):
         self.assertEqual(w.verdict("KX2YFOMC", "KX2YFOMC-26OCT28-T10", ts, 40, 60,
                                    oct30)[1]["reason"], "unmodelled")
 
+    def test_ibond_fixed_rate_is_long_dated_only(self):
+        """Jack 2026-11-03: KXIBONDFIX quoted with the Treasuries. No fair:
+        the 5-year's checks past FAIR_MAX_DAYS, aside inside it."""
+        self.assertEqual(tf.classify("KXIBONDFIX"), {"kind": "long", "inst": 5, "dir": "G"})
+        w = self._watch({5: 4.10})
+        ts = self.NOW.timestamp()
+        may3 = datetime(2027, 5, 3, 13, 59, tzinfo=timezone.utc)
+        # 7 months out, a strike far from the 5-year: quotes on any book
+        self.assertEqual(w.verdict("KXIBONDFIX", "KXIBONDFIX-27MAY03-T1.4", ts, 55, 63,
+                                   may3), ("", {}))
+        # within FAIR_MAX_DAYS of the announcement: no fair, aside
+        nov5 = datetime(2026, 11, 5, 13, 59, tzinfo=timezone.utc)
+        self.assertEqual(w.verdict("KXIBONDFIX", "KXIBONDFIX-26NOV05-T1.4", ts, 55, 63,
+                                   nov5)[1]["reason"], "no_fair")
+        # the 5-year's feed checks apply: no 5-year quote fails closed
+        self.assertEqual(self._watch({10: 5.26}).verdict(
+            "KXIBONDFIX", "KXIBONDFIX-27MAY03-T1.4", ts, 55, 63, may3)[1]["reason"],
+            "no_quote")
+        self.assertEqual(w.verdict("KXIBONDFIX", "KXIBONDFIX-27MAY03-T1.4",
+                                   ts + tf.READ_TTL_SECS + 5, 55, 63,
+                                   may3)[1]["reason"], "stale_read")
+
     def test_spread_touch(self):
         w = self._watch({10: 5.26, 2: 4.80})               # spread 0.46%
         ts = self.NOW.timestamp()

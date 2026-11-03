@@ -18,6 +18,8 @@ CONTRACTS (classify):
   POINT -- KXUST{2,5,7,10,30}A{D,W,M}, the older KXUST names, the year-end
       KXUST{10,30}YRRATE<yy> / KXUST10Y<yy>: YES if the par yield is ABOVE the
       strike ON the market's date ("greater"; T strikes).
+  LONG -- KXIBONDFIX (LONG_PROXY): no fair; quoted on the 5-year's checks
+      only while more than FAIR_MAX_DAYS out.
   Anything else (bucket strikes, the FOMC-move, bill, inversion, year-max
   and note series) is UNMODELLED and stands aside.
   Published to 2 dp: low YES <=> fix < K - 0.005; high / above YES <=>
@@ -90,6 +92,12 @@ POINT_RES = (re.compile(r"^KXUST(2|5|7|10|30)A[DWM]?$"),
              re.compile(r"^KXUST(10|30)YRRATE\d\d$"),
              re.compile(r"^KXUST(10)Y\d\d$"))
 SPREAD_TOUCH = {"KX10Y2Y": (10, 2), "10Y2Y": (10, 2), "KX10Y3M": (10, 0), "10Y3M": (10, 0)}
+# LONG-DATED ONLY (Jack 2026-11-03, KXIBONDFIX): a Treasury-set rate with no
+# fair here -- the I bond fixed rate, announced each May / November and
+# tracking real yields -- quotes on a proxy tenor's feed / release / move
+# checks while more than FAIR_MAX_DAYS out, and stands aside inside that
+# ("no_fair"), where the informed estimates of the announcement trade
+LONG_PROXY = {"KXIBONDFIX": 5}
 _MON = {m: i + 1 for i, m in enumerate(
     "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split())}
 
@@ -145,8 +153,8 @@ def touch_series(series: str) -> Optional[Tuple[int, str]]:
 
 
 def classify(series: str) -> Optional[dict]:
-    """{'kind': 'touch' | 'point', 'inst': tenor | (long, short), 'dir':
-    'L' | 'H' | 'G'} for a modelled series, else None."""
+    """{'kind': 'touch' | 'point' | 'long', 'inst': tenor | (long, short),
+    'dir': 'L' | 'H' | 'G'} for a modelled series, else None."""
     t = touch_series(series)
     if t:
         return {"kind": "touch", "inst": t[0], "dir": t[1]}
@@ -156,6 +164,8 @@ def classify(series: str) -> Optional[dict]:
             return {"kind": "point", "inst": int(m.group(1)), "dir": "G"}
     if series in SPREAD_TOUCH:
         return {"kind": "touch", "inst": SPREAD_TOUCH[series], "dir": "H"}
+    if series in LONG_PROXY:
+        return {"kind": "long", "inst": LONG_PROXY[series], "dir": "G"}
     return None
 
 
@@ -530,6 +540,11 @@ class YieldWatch:
         if frozen:
             return (f"{name} moving (>= {MOVE_BP:g}bp in {MOVE_WINDOW_MIN:g}m)",
                     {"reason": "moving", "y": y})
+        if spec["kind"] == "long":
+            if (last_day - now.astimezone(ET).date()).days > FAIR_MAX_DAYS:
+                return "", {}
+            return (f"{series}: no fair within {FAIR_MAX_DAYS:g} days of {last_day}",
+                    {"reason": "no_fair"})
         k_eff = k - 0.005 if kind == "L" else k + 0.005
         if touch and ((kind == "L" and y < k_eff) or (kind == "H" and y >= k_eff)):
             return (f"crossed: {name} {y:.3f}% vs {k:g}", {"reason": "crossed", "y": y})

@@ -17315,6 +17315,11 @@ class TestTreasuryYieldSeriesEnrolled(unittest.TestCase):
                                     imm.PAYOUT_FLOOR_DOLLARS, s)
         self.assertTrue(imm.IncentiveMarketMaker._allowed("KXUST10YRRATE27-27DEC31-T4.24"))
         self.assertTrue(imm.IncentiveMarketMaker._allowed("KXUST30YRRATE27-27DEC31-T4.24"))
+        # Jack 2026-11-03: the I bond fixed rate quotes with the Treasuries
+        self.assertIn("KXIBONDFIX", extra)
+        self.assertTrue(imm.IncentiveMarketMaker._allowed("KXIBONDFIX-27MAY03-T1.4"))
+        self.assertTrue(imm.treasury_gated_series("KXIBONDFIX"))
+        self.assertEqual(imm.SERIES_OVERRIDES["KXIBONDFIX"].size_mult, imm.RATES_SIZE_MULT)
         self.assertEqual(imm.scan_universe_reason("KXUST10YRRATE27-27DEC31-T4.24"), "allowed")
         for s in ("KX10YRRATE15M", "KX2YRRATE15M", "KX5YRRATE15M", "KX30YRRATE15M",
                   "KX2YTEST", "KXSECTREASURY", "KXUSTHOLDERS"):

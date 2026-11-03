@@ -11138,3 +11138,16 @@ risk alterative? what about up to 200 contracts", then "build and turn on".
   Startup line "array tail leads (2026-11-02)". Log: "fair lead <t> ask: 200 @ 90c, ahead of its own 99c; the
   Carbon Arc array fair implies 20c (1-60% across its variants; ...)".
 - Tests: TestCaArrayLead (8; the loop and cap tests mutation-checked); TestFairLeads names "Carbon Arc arrays".
+
+## 2026-11-03 -- KXIBONDFIX JOINS THE TREASURY FAMILY (long-dated only)
+Jack: "KXIBONDFIX-27MAY03 should be quoted as part of treasuries autofamily".
+- The I bond fixed rate Treasury announces each May / November (ECONSTATB, TreasuryDirect). The open scan quoted
+  26NOV02 in September; since the scan went off 10/03 it was on no list (family watch: "est new:KXIBONDFIX
+  $9.47/day", 7 strikes T0.8-T2.0, program to 11/08 05:00Z).
+- Now in _DEFAULT_RATES_EXTRA_SERIES: safe-join, the 07:30 ET event-day cutoff, x1.5 size, no rate bar, and the
+  Treasury gate.
+- The gate had no shape for it ("unmodelled" stands aside), so treasury_fair.LONG_PROXY gives it kind "long" on
+  the 5-year: the feed / stale / release / move checks while more than FAIR_MAX_DAYS (45) out, then "no_fair"
+  (stand aside) inside that, where the informed estimates of the announcement trade. No crossed / near / fair
+  checks: the strike is not a 5-year yield.
+- Tests: test_ibond_fixed_rate_is_long_dated_only (mutation-checked), TestTreasuryYieldSeriesEnrolled.
