@@ -11998,6 +11998,9 @@ _CONFIG_CODE_KNOBS = (
     "RAIN_DAILY_INTL_BASE_BY_SERIES",   # Paris at 2,000 (2026-11-01)
     # bait-fingerprint stop (2026-10-22)
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
+    # join wait (2026-11-02)
+    "JOIN_WAIT_MODE", "JOIN_WAIT_SECS_PER_DOLLAR", "JOIN_WAIT_FREE_DOLLARS",
+    "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -20908,6 +20911,163 @@ def et_day_end_ts(ts: float) -> float:
     return ET.localize(datetime(d.year, d.month, d.day) + timedelta(days=1)).timestamp()
 
 
+# JOIN WAIT (2026-11-02, Jack: "Build it", on "Build the anchored join wait
+# bot-wide at 2 seconds per dollar with $50 free?", after "what about building
+# the dwell corresponding to size-at-risk? larger size, longer dwell", "what
+# about no 10min cap" and "what about 2 seconds per dollar? and a minimum
+# threshold for dwell e.g. $50"). On 11/02 14:39-14:47Z a ~10,456-lot walked
+# KXRAINDPARIS-03SEP27-T0's at-ref bid 42 -> 44 -> 50 -> 55c in 35 s and was
+# pulled as a seller took our whole 4,000 at 55c; six minutes later the same
+# lot dragged the ask 58 -> 45c and a buyer took 4,000 there: -$400. The lot
+# was 17x the lone-reference test's thin-top line, so neither the guard nor
+# the bait stop looked, and the bot joined each step one cycle after it came.
+# Now an at-ref rung (after join-ahead; leads and FAIR CLOSE keep their own
+# prices) joins a better price only once the price it wants has stood there
+# for JOIN_WAIT_SECS_PER_DOLLAR seconds per dollar at risk: the side's room x
+# the cents over its ANCHOR -- the lowest price it rested at in the last
+# JOIN_WAIT_ANCHOR_MIN minutes -- past the first JOIN_WAIT_FREE_DOLLARS
+# (join_wait_needed_secs). No cap. A worse price is taken at once. Pricing
+# from the anchor matters: priced from where the side rests now, a rung walked
+# up 1c a cycle owes one step's wait at a time (the steps' clocks run side by
+# side), Paris in ~5 min at 2 s/$; from the anchor the walk owes its whole
+# size, ~20 min.
+# Replay of 11/02 (3.2M managed book snapshots, 799 markets, $495/day of
+# modeled reward): $1.36/day of reward (0.28%), 11 series ever wait, and it
+# blocks the two Paris fills and nothing else. Without the $50 allowance,
+# $3.94/day, 89 series, and 9 small good fills blocked as well.
+# A side's clocks live JOIN_WAIT_MEMORY_MIN minutes after it last wanted a
+# price (a re-entry after a 10-min breaker hold still waits) and across
+# restarts (state.join_wait); a side with no clocks starts from its resting
+# rung, so a restart mid-bait does not join the bait either. Penny books
+# only (sub-penny books skip it, as they do join-ahead). The room it prices
+# is the unheld reference's (the deep-reference size), so a held rung never
+# grows. IMM_JOIN_WAIT: "on" (default), "dry" (computed and logged, nothing
+# held), "off".
+JOIN_WAIT_MODE = os.environ.get("IMM_JOIN_WAIT", "on").strip().lower()
+JOIN_WAIT_SECS_PER_DOLLAR = _env_float("IMM_JOIN_WAIT_SECS_PER_DOLLAR", 2.0)
+JOIN_WAIT_FREE_DOLLARS = _env_float("IMM_JOIN_WAIT_FREE_DOLLARS", 50.0)
+JOIN_WAIT_ANCHOR_MIN = _env_float("IMM_JOIN_WAIT_ANCHOR_MIN", 30.0)
+JOIN_WAIT_MEMORY_MIN = _env_float("IMM_JOIN_WAIT_MEMORY_MIN", 60.0)
+
+
+def join_wait_needed_secs(size: float, cents_over_anchor: float) -> float:
+    """Seconds a side resting `size` contracts needs a price to stand before
+    it rests `cents_over_anchor` cents nearer the touch than its anchor:
+    JOIN_WAIT_SECS_PER_DOLLAR x the dollars at risk past the first
+    JOIN_WAIT_FREE_DOLLARS."""
+    if JOIN_WAIT_SECS_PER_DOLLAR <= 0:
+        return 0.0
+    at_risk = max(0.0, float(size)) * max(0.0, float(cents_over_anchor)) / 100.0
+    return JOIN_WAIT_SECS_PER_DOLLAR * max(0.0, at_risk - JOIN_WAIT_FREE_DOLLARS)
+
+
+def join_wait_anchor(st: dict, now: float) -> int:
+    """The lowest price (own price space) a join-wait side rested at within
+    the last JOIN_WAIT_ANCHOR_MIN minutes: its change points in force inside
+    the window (the one at the window's start included) and where it rests."""
+    win_start = now - JOIN_WAIT_ANCHOR_MIN * 60.0
+    h = st["h"]
+    lo = int(st["c"])
+    for i, (_ts, px) in enumerate(h):
+        if i + 1 == len(h) or h[i + 1][0] > win_start:
+            lo = min(lo, int(px))
+    return lo
+
+
+def join_wait_step(st: Optional[dict], want: int, size: float, now: float,
+                   resting: Optional[int] = None
+                   ) -> Tuple[dict, int, Optional[str], float]:
+    """One cycle of the JOIN WAIT on one side, in the side's own price space
+    (YES cents for a bid, NO cents for an ask: higher = nearer the touch).
+    `st` is the side's state (None = none yet), `want` where it would rest
+    without the wait, `size` its contracts, `resting` its resting rung's
+    price (a side with no state starts there). Returns (state, rest_px,
+    event, held_secs): event "hold" when the side starts waiting, "join" when
+    it reaches the price it waited on, "gone" when that price went away
+    first, else None; held_secs = how long the hold that just ended lasted.
+    State: c = where it rests, w = where it wants, s = when it last wanted a
+    price, since = {px: when `want` last reached px} for c < px <= w, h = the
+    change points [ts, c] of c inside the anchor window, hs = the hold's
+    start."""
+    want = int(want)
+    if st is None or now - float(st.get("s", 0.0)) > JOIN_WAIT_MEMORY_MIN * 60.0:
+        c0 = want if resting is None else min(int(resting), want)
+        st = {"c": c0, "w": c0, "s": now, "since": {}, "h": [[now, c0]], "hs": None}
+    c, w0 = int(st["c"]), int(st["w"])
+    held_before = c < w0
+    since = st["since"]
+    if want > w0:
+        for p in range(max(w0, c) + 1, want + 1):
+            since[p] = now
+    elif want < w0:
+        for p in [p for p in since if p > want]:
+            del since[p]
+    if want <= c:
+        new_c = want
+    else:
+        anchor = min(join_wait_anchor(st, now), c)
+        new_c = c
+        for p in range(c + 1, want + 1):
+            if now - since.get(p, now) >= join_wait_needed_secs(size, p - anchor):
+                new_c = p
+            else:
+                break
+    for p in [p for p in since if p <= new_c]:
+        del since[p]
+    h = st["h"]
+    if new_c != c:
+        h.append([now, new_c])
+    win_start = now - JOIN_WAIT_ANCHOR_MIN * 60.0
+    while len(h) > 1 and h[1][0] <= win_start:
+        h.pop(0)                     # keep the change point in force at the start
+    st["c"], st["w"], st["s"] = new_c, want, now
+    held = new_c < want
+    event, held_secs = None, 0.0
+    if held and not held_before:
+        event, st["hs"] = "hold", now
+    elif held_before and not held:
+        event = "join" if new_c > c else "gone"
+        held_secs = now - float(st.get("hs") or now)
+        st["hs"] = None
+    return st, new_c, event, held_secs
+
+
+def join_wait_payload(states: Dict[str, dict], now: float) -> Dict[str, dict]:
+    """The join-wait sides worth persisting: seen inside JOIN_WAIT_MEMORY_MIN
+    and either waiting or resting above their anchor (a side at its anchor
+    restarts the same from its resting rung)."""
+    out: Dict[str, dict] = {}
+    for k, st in states.items():
+        try:
+            if now - float(st["s"]) > JOIN_WAIT_MEMORY_MIN * 60.0:
+                continue
+            if int(st["c"]) >= int(st["w"]) and join_wait_anchor(st, now) >= int(st["c"]):
+                continue
+            out[k] = {"c": int(st["c"]), "w": int(st["w"]), "s": round(float(st["s"]), 1),
+                      "since": [[int(p), round(float(v), 1)]
+                                for p, v in sorted(st["since"].items())],
+                      "h": [[round(float(a), 1), int(b)] for a, b in st["h"]],
+                      "hs": None if st.get("hs") is None else round(float(st["hs"]), 1)}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def join_wait_load(raw) -> Dict[str, dict]:
+    """state.join_wait from the persisted join_wait_payload."""
+    out: Dict[str, dict] = {}
+    for k, st in (raw or {}).items():
+        try:
+            c, s = int(st["c"]), float(st["s"])
+            out[str(k)] = {"c": c, "w": int(st["w"]), "s": s,
+                           "since": {int(p): float(v) for p, v in st.get("since") or []},
+                           "h": [[float(a), int(b)] for a, b in st.get("h") or []] or [[s, c]],
+                           "hs": None if st.get("hs") is None else float(st["hs"])}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 def lone_reference(ext_levels_best_first: List[Tuple[int, float]], target: float,
                    max_mult: Optional[float] = None
                    ) -> Optional[Tuple[int, float, int]]:
@@ -22986,6 +23146,9 @@ class BotState:
     # lone-ref guard runs ON -> until. Persisted.
     bait_side_until: Dict[str, float] = field(default_factory=dict)
     bait_event_until: Dict[str, float] = field(default_factory=dict)
+    # Join wait (JOIN_WAIT_MODE, 2026-11-02): each at-ref side's clocks
+    # "ticker|book_side" -> join_wait_step's state. Persisted (join_wait_payload).
+    join_wait: Dict[str, dict] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
     order_ages: Dict[str, float] = field(default_factory=dict)
@@ -24735,6 +24898,8 @@ class IncentiveMarketMaker:
             self.state.bait_event_until = {
                 str(e): float(v)
                 for e, v in (data.get("bait_event_until") or {}).items()}
+            # join-wait clocks: a restart mid-wait keeps waiting
+            self.state.join_wait = join_wait_load(data.get("join_wait"))
             # every other breaker / hold still running (GUARDS ACROSS RESTARTS)
             try:
                 self._restore_guard_holds(data)
@@ -25167,6 +25332,8 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.bait_event_until.items()
                                if v > time.time()},
+                           "join_wait": join_wait_payload(self.state.join_wait,
+                                                          time.time()),
                            # every other breaker / hold still running
                            # (GUARDS ACROSS RESTARTS)
                            **self._guard_holds_payload()}, f)
@@ -30576,6 +30743,76 @@ class IncentiveMarketMaker:
         if live:
             self._save_persist()
 
+    # ---- join wait (2026-11-02, JOIN_WAIT_MODE) ----------------------------
+
+    def _join_wait(self, t: str, pl_bid: Optional[int], pl_ask: Optional[int],
+                   room_buy: float, room_sell: float, own, now_ts: float
+                   ) -> Tuple[Optional[int], Optional[int]]:
+        """The at-ref placement prices after the JOIN WAIT: each side rests
+        no nearer the touch than join_wait_step allows ("on"; "dry" logs the
+        wait and rests where it wants). A side with no placement price or no
+        room this cycle is left as it is (its clocks keep). Never raises."""
+        out: List[Optional[int]] = []
+        for side, px, room in (("bid", pl_bid, room_buy), ("ask", pl_ask, room_sell)):
+            try:
+                if px is None or not room or room <= 0:
+                    out.append(px)
+                    continue
+                want = int(px) if side == "bid" else 100 - int(px)
+                if side == "bid":
+                    mine = [int(p) for bs, p, _n in own if bs == "bid" and p > PAD_BID_CENTS]
+                else:
+                    mine = [100 - int(p) for bs, p, _n in own
+                            if bs == "ask" and p < PAD_ASK_CENTS]
+                key = self._toxic_key(t, side)
+                st, rest, ev, held_s = join_wait_step(
+                    self.state.join_wait.get(key), want, float(room), now_ts,
+                    max(mine) if mine else None)
+                self.state.join_wait[key] = st
+                if ev is not None:
+                    self._join_wait_note(t, side, ev, st, want, rest, float(room),
+                                         held_s, now_ts)
+                if JOIN_WAIT_MODE == "on":
+                    px = rest if side == "bid" else 100 - rest
+                out.append(px)
+            except Exception as e:      # never costs the cycle: where it wants
+                out.append(px)
+                if not getattr(self, "_join_wait_err_logged", False):
+                    self._join_wait_err_logged = True
+                    log(f"{self.tag} ! join wait failed on {t} {side} ({e!r}); "
+                        f"rests where it wants (logged once)")
+        if len(self.state.join_wait) > 4000:          # sides gone past their memory
+            mem = JOIN_WAIT_MEMORY_MIN * 60.0
+            self.state.join_wait = {k: v for k, v in self.state.join_wait.items()
+                                    if now_ts - float(v.get("s", 0.0)) <= mem}
+        return out[0], out[1]
+
+    def _join_wait_note(self, t: str, side: str, ev: str, st: dict, want: int,
+                        rest: int, room: float, held_s: float, now_ts: float) -> None:
+        """Log and sink one join-wait event (join_wait_<date>.jsonl)."""
+        def yes(p: int) -> int:
+            return p if side == "bid" else 100 - p
+
+        tag = "" if JOIN_WAIT_MODE == "on" else " (dry)"
+        if ev == "hold":
+            anchor = min(join_wait_anchor(st, now_ts), rest)
+            need = join_wait_needed_secs(room, want - anchor)
+            log(f"{self.tag} join wait{tag} {t} {side}: wants {yes(want)}c, rests "
+                f"{yes(rest)}c -- {room:g} contracts x {want - anchor}c over its "
+                f"{JOIN_WAIT_ANCHOR_MIN:g}-min anchor {yes(anchor)}c = "
+                f"${room * (want - anchor) / 100.0:,.0f} at risk, the first "
+                f"${JOIN_WAIT_FREE_DOLLARS:g} free: {yes(want)}c must stand {need:,.0f}s")
+        elif ev == "join":
+            log(f"{self.tag} join wait{tag} {t} {side}: joins {yes(rest)}c after "
+                f"{held_s:,.0f}s")
+        else:
+            log(f"{self.tag} join wait{tag} {t} {side}: the better price went away "
+                f"after {held_s:,.0f}s; rests {yes(rest)}c")
+        self._sink("join_wait", {
+            "ts": round(now_ts, 3), "mode": JOIN_WAIT_MODE, "ticker": t, "side": side,
+            "event": ev, "want": yes(want), "rest": yes(rest), "size": room,
+            "held_s": round(held_s, 1)})
+
     # ---- join ahead of the pile (2026-10-11, JOIN_AHEAD_MODE) --------------
 
     def _refresh_comp_pairs(self, metas: List["MarketMeta"], now_ts: float) -> None:
@@ -35103,6 +35340,18 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} ! join-ahead failed on {t} ({e!r}); "
                             f"plain reference placement (logged once)")
 
+            # JOIN WAIT (JOIN_WAIT_MODE, 2026-11-02): the at-ref rung joins a
+            # better price only once that price has stood join_wait_needed_secs
+            # (2 s per $ at risk over the side's 30-min anchor, the first $50
+            # free); a worse price at once. After join-ahead, before the leads
+            # and FAIR CLOSE (they keep their own prices). The room stays the
+            # unheld reference's, so a held rung never grows.
+            if (JOIN_WAIT_MODE in ("on", "dry") and LADDER_MODE == "atref"
+                    and meta.price_step >= 0.01):
+                pl_bid_px, pl_ask_px = self._join_wait(
+                    t, pl_bid_px, pl_ask_px, room_buy if lv_bid else 0.0,
+                    room_sell if lv_ask else 0.0, own, now_ts)
+
             # a leading side rests at its lead price, anchored there (the
             # anchor caps an at-ref rung) and at least target/5
             lead_on_b = lead_b is not None and bool(lv_bid)
@@ -38929,6 +39178,17 @@ class IncentiveMarketMaker:
                + f"; not checked: {','.join(BAIT_STOP_SKIP) or 'nothing'}"
                if _bs_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _bs_live else ""))
+        _jw_live = JOIN_WAIT_MODE in ("on", "dry") and JOIN_WAIT_SECS_PER_DOLLAR > 0
+        log(f"join wait (2026-11-02): {JOIN_WAIT_MODE if _jw_live else 'off'}"
+            + (f" -- an at-ref rung joins a better price only once it has stood "
+               f"{JOIN_WAIT_SECS_PER_DOLLAR:g}s per $ at risk (its contracts x the "
+               f"cents over the side's lowest price in the last "
+               f"{JOIN_WAIT_ANCHOR_MIN:g} min), the first ${JOIN_WAIT_FREE_DOLLARS:g} "
+               f"free, no cap; a worse price at once; clocks kept "
+               f"{JOIN_WAIT_MEMORY_MIN:g} min and across restarts"
+               + ("" if JOIN_WAIT_MODE == "on" else " (dry: logged, nothing held)")
+               if _jw_live and LADDER_MODE == "atref"
+               else " (inactive: needs IMM_LADDER_MODE=atref)" if _jw_live else ""))
         log("mid-move breaker: "
             + ("EVERY series (IMM_BREAKERS=1)" if BREAKERS_ENABLED else
                (",".join(sorted(MOVE_BREAKER_SERIES)) + " only (2026-10-09)")

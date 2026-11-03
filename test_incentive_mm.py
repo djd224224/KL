@@ -34892,9 +34892,13 @@ class TestLoneReferenceGuard(unittest.TestCase):
         and the YES prices of its non-pad `side` orders after each cycle."""
         _clean_persist()
         seen = []
+        # (JOIN_WAIT_MODE off: these read the guard on a rung that follows the
+        # top at once; the join wait would hold the 100-lot at 56c -- the free
+        # $50 -- for 26 s on the way to 69c, see TestJoinWait1102)
         with mock.patch.object(imm, "LADDER_MODE", "atref"), \
                 mock.patch.object(imm, "LONE_REF_GUARD_MODE", mode), \
                 mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"), \
+                mock.patch.object(imm, "JOIN_WAIT_MODE", "off"), \
                 mock.patch.object(imm, "LEVELS", [(0, 100)]), \
                 mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 300.0), \
                 mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0):
@@ -35013,10 +35017,13 @@ class TestBaitFingerprintStop(unittest.TestCase):
         """A bot whose bid on T followed the 200-lot from 6c to 69c (guard
         dry), so the side is flagged; returns it with its patches running."""
         _clean_persist()
+        # (JOIN_WAIT_MODE off: the walk must reach 69c in one cycle for the
+        # stop's fill to land on it, see TestJoinWait1102)
         for p in (mock.patch.object(imm, "LADDER_MODE", "atref"),
                   mock.patch.object(imm, "LONE_REF_GUARD_MODE", "dry"),
                   mock.patch.object(imm, "BAIT_STOP_MODE", mode),
                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                  mock.patch.object(imm, "JOIN_WAIT_MODE", "off"),
                   mock.patch.object(imm, "LEVELS", [(0, 100)]),
                   mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 300.0),
                   mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0)):
@@ -38947,6 +38954,255 @@ class TestOpportunisticAsTestDailyPicks(unittest.TestCase):
         bot.state.astest_fill_pause_until[self.EV] = now - 1
         bot.run_cycle()
         self.assertNotEqual(self._quotes(bot, self.T), [])
+
+
+class TestJoinWait1102(unittest.TestCase):
+    """Jack 2026-11-02: "Build it", on "Build the anchored join wait bot-wide
+    at 2 seconds per dollar with $50 free?" -- after the 11/02 Paris rain
+    bait: a ~10,456-lot walked our at-ref bid 42 -> 44 -> 50 -> 55c and was
+    pulled as a seller took our 4,000 at 55c; then the ask 58 -> 45c the
+    same way: -$400. An at-ref rung now joins a better price only once it
+    has stood 2 s per $ at risk over the side's 30-min anchor, the first $50
+    free (join_wait_step); a worse price at once."""
+
+    def setUp(self):
+        p = mock.patch.dict(imm.SERIES_OVERRIDES)
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def _run(steps, size, st=None, resting=None, t0=1000.0):
+        """[(secs, want), ...] through join_wait_step: [(rest, event), ...]."""
+        out = []
+        for secs, want in steps:
+            st, rest, ev, _h = imm.join_wait_step(st, want, size, t0 + secs, resting)
+            out.append((rest, ev))
+        return out, st
+
+    def test_the_wait_is_2_seconds_per_dollar_past_the_first_50(self):
+        self.assertEqual((imm.JOIN_WAIT_MODE, imm.JOIN_WAIT_SECS_PER_DOLLAR,
+                          imm.JOIN_WAIT_FREE_DOLLARS, imm.JOIN_WAIT_ANCHOR_MIN,
+                          imm.JOIN_WAIT_MEMORY_MIN), ("on", 2.0, 50.0, 30.0, 60.0))
+        for k in ("JOIN_WAIT_MODE", "JOIN_WAIT_SECS_PER_DOLLAR", "JOIN_WAIT_FREE_DOLLARS",
+                  "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        # Paris's 4,000 dragged 13c: $520 at risk, $470 past the free $50
+        self.assertEqual(imm.join_wait_needed_secs(4000, 13), 940.0)
+        self.assertEqual(imm.join_wait_needed_secs(4000, 1), 0.0)       # $40: free
+        self.assertEqual(imm.join_wait_needed_secs(100, 60), 20.0)      # $60: $10 past
+        self.assertEqual(imm.join_wait_needed_secs(200, 25), 0.0)       # $50 exactly
+        self.assertEqual(imm.join_wait_needed_secs(4000, -3), 0.0)
+        with mock.patch.object(imm, "JOIN_WAIT_SECS_PER_DOLLAR", 0.0):
+            self.assertEqual(imm.join_wait_needed_secs(4000, 13), 0.0)
+
+    def test_the_paris_bait_never_drags_the_bid_to_55c(self):
+        # the 11/02 walk, cycle by cycle (bid side, YES cents)
+        res, st = self._run([(0, 42), (17, 44), (35, 50), (52, 55), (56, 55)],
+                            4000, resting=42)
+        # 1c rides the free $50 ($40), and the rest waits: 43c when the
+        # seller came for 55c
+        self.assertEqual(res, [(42, None), (43, "hold"), (43, None), (43, None), (43, None)])
+        # the lot pulled: the side takes the worse price at once
+        st, rest, ev, held = imm.join_wait_step(st, 42, 4000, 1060.0, 42)
+        self.assertEqual((rest, ev), (42, "gone"))
+        self.assertAlmostEqual(held, 43.0)
+        # had 55c stood 940 s (4,000 x 13c = $520, $470 past the free $50, x2)
+        res, st = self._run([(0, 42), (1, 55), (940, 55), (942, 55)], 4000, resting=42,
+                            t0=5000.0)
+        self.assertEqual([r for r, _e in res], [42, 43, 54, 55])
+        self.assertEqual(res[-1][1], "join")
+
+    def test_a_walk_of_1c_a_cycle_owes_the_whole_walk(self):
+        # priced from the 30-min anchor, not from where the side rests now
+        # (whose clocks would let a 1c-a-cycle walk through in ~5 minutes)
+        st, t, want, reached = None, 0.0, 42, None
+        while t < 3600 and reached is None:
+            if want < 55:
+                want += 1
+            st, rest, _ev, _h = imm.join_wait_step(st, want, 4000, 1000.0 + t, 42)
+            if rest >= 55:
+                reached = t
+            t += 17.0
+        # 55c stood from t=204 s, then owes $470 x 2 s past the free $50
+        self.assertIsNotNone(reached)
+        self.assertGreaterEqual(reached, 204 + 940)
+
+    def test_a_worse_price_is_taken_at_once(self):
+        res, _st = self._run([(0, 55), (17, 50), (34, 30)], 4000, resting=55)
+        self.assertEqual(res, [(55, None), (50, None), (30, None)])
+
+    def test_small_rungs_follow_at_once(self):
+        # 20 x 50c = $10 and 200 x 25c = $50: inside the free $50
+        self.assertEqual(self._run([(0, 30), (17, 80)], 20)[0], [(30, None), (80, None)])
+        self.assertEqual(self._run([(0, 30), (17, 55)], 200)[0], [(30, None), (55, None)])
+        # 200 x 30c = $60: up to 55c at once ($50), then 2 s a $ past it --
+        # 58c after 13 s, 60c ($10 past) after 20 s
+        res, _st = self._run([(0, 30), (17, 60), (30, 60), (37, 60)], 200)
+        self.assertEqual(res, [(30, None), (55, "hold"), (58, None), (60, "join")])
+
+    def test_the_anchor_remembers_30_minutes(self):
+        # 42c -> 50c: 4,000 x 8c = $320, $270 past the free $50: 540 s
+        res, st = self._run([(0, 42), (1, 50), (542, 50)], 4000, resting=42)
+        self.assertEqual(res[-1], (50, "join"))
+        # back down to 45c and up again inside the 30 min: still priced from
+        # 42c (540 s again), not from 45c (5c = $200: 300 s)
+        st, rest, ev, _h = imm.join_wait_step(st, 45, 4000, 1600.0, 50)
+        self.assertEqual(rest, 45)
+        st, rest, ev, _h = imm.join_wait_step(st, 50, 4000, 1617.0, 45)
+        self.assertEqual((rest, ev), (45, "hold"))
+        st, rest, ev, _h = imm.join_wait_step(st, 50, 4000, 1617.0 + 301, 45)
+        self.assertEqual(rest, 47)
+        st, rest, ev, _h = imm.join_wait_step(st, 50, 4000, 1617.0 + 539, 47)
+        self.assertEqual(rest, 49)
+        st, rest, ev, _h = imm.join_wait_step(st, 50, 4000, 1617.0 + 541, 49)
+        self.assertEqual((rest, ev), (50, "join"))
+        # 30 min at 50c: the anchor is 50c, and 1c more ($40) is free
+        st, rest, ev, _h = imm.join_wait_step(st, 50, 4000, 2158.0 + 1801, 50)
+        self.assertEqual(imm.join_wait_anchor(st, 2158.0 + 1801), 50)
+        st, rest, ev, _h = imm.join_wait_step(st, 51, 4000, 2158.0 + 1818, 50)
+        self.assertEqual((rest, ev), (51, None))
+
+    def test_a_side_with_no_clocks_starts_from_its_resting_rung(self):
+        # a restart (or a new side) mid-bait does not join the bait (1c of
+        # 4,000 rides the free $50)
+        st, rest, ev, _h = imm.join_wait_step(None, 55, 4000, 1000.0, resting=42)
+        self.assertEqual((rest, ev), (43, "hold"))
+        # nothing resting: a fresh placement rests where it wants
+        self.assertEqual(imm.join_wait_step(None, 55, 4000, 1000.0)[1], 55)
+        # clocks older than the 60-min memory start over from the resting rung
+        st, rest, _ev, _h = imm.join_wait_step(None, 42, 4000, 0.0)
+        st, rest, ev, _h = imm.join_wait_step(st, 55, 4000, 3601.0, resting=None)
+        self.assertEqual((rest, ev), (55, None))
+
+    def test_the_clocks_survive_a_restart(self):
+        _res, st = self._run([(0, 42), (1, 55), (500, 55)], 4000, resting=42)
+        saved = json.loads(json.dumps(imm.join_wait_payload({"T|bid": st}, 1500.0)))
+        self.assertEqual(list(saved), ["T|bid"])
+        back = imm.join_wait_load(saved)["T|bid"]
+        _st, rest, ev, _h = imm.join_wait_step(back, 55, 4000, 1000.0 + 942, 42)
+        self.assertEqual((rest, ev), (55, "join"))
+        # a side resting at its anchor needs no save: it restarts the same
+        _res, st = self._run([(0, 42), (17, 42)], 4000, resting=42)
+        self.assertEqual(imm.join_wait_payload({"T|bid": st}, 1017.0), {})
+        # nor one past the 60-min memory
+        _res, st = self._run([(0, 42), (1, 55)], 4000, resting=42)
+        self.assertEqual(imm.join_wait_payload({"T|bid": st}, 1001.0 + 3601), {})
+        self.assertEqual(imm.join_wait_load({"bad": {"c": "x"}}), {})
+
+    def _paris_bot(self, lines):
+        TestWeatherShapes1030._intl_clean(self)
+        _clean_persist()
+        P = TestWeatherShapes1030.PARIS
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": P, "incentive_type": "liquidity",
+             "period_reward": 10000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[P] = dict(
+            TestWeatherShapes1030.PARIS_RULES, ticker=P, event_ticker="KXRAINDPARIS-03SEP27",
+            status="active", close_time="2027-09-04T05:59:00Z",
+            yes_bid_dollars="0.4100", yes_ask_dollars="0.6800", volume_fp="4498.66")
+        self.book = [["0.0100", "1051.00"], ["0.0300", "1.00"],
+                     ["0.4000", "2495.00"], ["0.4100", "170.00"]]
+        self.no_book = [["0.0100", "21001.00"], ["0.0300", "1.00"], ["0.0500", "5000.00"],
+                        ["0.0600", "47.00"], ["0.2500", "1.97"], ["0.3100", "4398.00"],
+                        ["0.3200", "5.16"]]
+        client.books[P] = {"orderbook_fp": {"yes_dollars": self.book,
+                                            "no_dollars": self.no_book}}
+        return client, P
+
+    def _paris_rungs(self, bot, P):
+        return sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                      for o in bot.state.sim_orders.values() if o["ticker"] == P)
+
+    def _patches(self, lines, mode="on"):
+        return [mock.patch.object(imm, "LEVELS", [(0, 20)]),
+                mock.patch.object(imm, "LADDER_MODE", "atref"),
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 150.0),
+                mock.patch.object(imm, "SAT_MAX_POSITION", 150.0),
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0),
+                mock.patch.object(imm, "COLLATERAL_BUDGET", 300000.0),
+                mock.patch.object(imm, "SERIES_HOUR_MULTS", []),
+                mock.patch.object(imm, "series_in_blackout", return_value=False),
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                mock.patch.object(imm, "JOIN_WAIT_MODE", mode),
+                mock.patch.object(imm, "log", lines.append)]
+
+    def test_the_quote_loop_holds_the_paris_bid_off_a_bait_lot(self):
+        lines = []
+        client, P = self._paris_bot(lines)
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(lines):
+                stack.enter_context(p)
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertEqual(self._paris_rungs(bot, P), [("ask", 69, 5000), ("bid", 40, 5000)])
+            # a 10,456-lot bids 55c: the reference jumps 15c, our bid holds
+            # at 40c (the free $50 is only 1.25c of 4,000), its size the
+            # unheld reference's 4,000 -- never the deep-reference x3
+            client.books[P]["orderbook_fp"]["yes_dollars"] = self.book + [["0.5500", "10456.00"]]
+            bot.run_cycle()
+            self.assertIn(("bid", 41, 4000), self._paris_rungs(bot, P))
+            self.assertTrue(any("join wait" in s and "wants 55c, rests 41c" in s
+                                and "must stand 1,100s" in s for s in lines),
+                            [s for s in lines if "join wait" in s])
+            key = f"{P}|bid"
+            self.assertEqual(bot.state.join_wait[key]["c"], 41)
+            # it survives the cycle's save (live, write_status saves every
+            # cycle; a dry bot saves only after placing, so save as live does)
+            bot._save_persist()
+            with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+                self.assertIn(key, json.load(f)["join_wait"])
+            # 55c stands its 1,100 s (4,000 x 15c = $600, $550 past the free $50)
+            bot.state.join_wait[key]["since"] = {
+                p: v - 1101 for p, v in bot.state.join_wait[key]["since"].items()}
+            bot.run_cycle()
+            self.assertIn(("bid", 55, 4000), self._paris_rungs(bot, P))
+            self.assertTrue(any("join wait" in s and "joins 55c" in s for s in lines))
+            # the lot pulled: back to 40c at once
+            client.books[P]["orderbook_fp"]["yes_dollars"] = self.book
+            bot.run_cycle()
+            self.assertIn(("bid", 40, 5000), self._paris_rungs(bot, P))
+            # the ask side never moved
+            self.assertIn(("ask", 69, 5000), self._paris_rungs(bot, P))
+
+    def test_dry_logs_the_wait_and_rests_where_it_wants(self):
+        lines = []
+        client, P = self._paris_bot(lines)
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(lines, mode="dry"):
+                stack.enter_context(p)
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+            client.books[P]["orderbook_fp"]["yes_dollars"] = self.book + [["0.5500", "10456.00"]]
+            bot.run_cycle()
+        self.assertIn(("bid", 55, 4000), self._paris_rungs(bot, P))
+        self.assertTrue(any("join wait (dry)" in s and "wants 55c, rests 41c" in s
+                            for s in lines), [s for s in lines if "join wait" in s])
+
+    def test_off_follows_at_once(self):
+        lines = []
+        client, P = self._paris_bot(lines)
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(lines, mode="off"):
+                stack.enter_context(p)
+            bot = IncentiveMarketMaker(client=client, live=False)
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+            client.books[P]["orderbook_fp"]["yes_dollars"] = self.book + [["0.5500", "10456.00"]]
+            bot.run_cycle()
+        self.assertIn(("bid", 55, 4000), self._paris_rungs(bot, P))
+        self.assertFalse(any("join wait" in s and "wants" in s for s in lines))
 
 
 if __name__ == "__main__":

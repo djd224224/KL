@@ -44,6 +44,7 @@ Every row carries `run_id` and `config_hash`.
 | `floor_state_*.jsonl` | on member floor-state change | the hopeless clock and near-cliff, visible |
 | `ws_stale_*.jsonl` | per stale-quote episode event | would a fast WS cancel have paid (2026-10-04) |
 | `ws_sweep_*.jsonl` | per sweep-breaker trip | would pulling an event on a sweep have paid (2026-10-04) |
+| `join_wait_*.jsonl` | per join-wait hold / join / gone | which better prices an at-ref rung waited on, for how long (2026-11-02) |
 
 ### fills
 
