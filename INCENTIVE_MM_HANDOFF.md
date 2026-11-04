@@ -11204,3 +11204,5 @@ Jack: "KXBRFINMIN-26OCT25, KXBRDEFMIN-26OCT25 should be autoquoting due to elect
   +4,610 net YES had left the bot only selling); the skew 90/180 on the account position is the one limit left.
   ...and "stop trading '51'" -> KXSENATESEATSD-27-51 in ENS_SKIP_MARKETS.
   ...and "dont trade 57, 58" -> both in ENS_SKIP_MARKETS.
+- 2026-11-04 02:23Z (Jack): "'51' still quoting. block it" -> the comp hedge (lock) legs ignored blocks: a 50 fill's legs sold
+  51 at 98c (02:16, 02:19; cancelled, no fill). Now a leg on a _blocked market is never priced and a working one is pulled.

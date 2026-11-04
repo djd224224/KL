@@ -31733,6 +31733,11 @@ class IncentiveMarketMaker:
                            if lg.get("oid") and lg["oid"] not in self._lock_cancelled
                            and (resting is None or lg["oid"] in resting
                                 or now_ts - float(lg.get("sent_at", 0.0)) < 60.0)}
+                # no leg on a market the bot does not trade (a block, an election
+                # night session's skip -- Jack 2026-11-04: "'51' still quoting.
+                # block it", a 50 fill's legs selling 51): pulled, never priced
+                for s_ in [s for s in working if self._blocked(s)]:
+                    self._lock_cancel(working.pop(s_)["oid"], s_, "blocked")
 
                 def end_legs(why: str) -> None:
                     for s_, lg_ in working.items():
@@ -31824,6 +31829,8 @@ class IncentiveMarketMaker:
                 sell = LOCK_KINDS[kind][0]
                 books: Dict[str, List[Tuple[int, float]]] = {}
                 for s in leg_tickers:
+                    if self._blocked(s):
+                        continue
                     px = self._lock_maker_px(s, sell)
                     if px is not None:
                         books[s] = [(px, q)]
