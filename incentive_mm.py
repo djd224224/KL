@@ -9512,6 +9512,37 @@ def skew_knees(series: str, fam_m: float) -> Tuple[float, float]:
     return SKEW_SOFT_CONTRACTS * fam_m, SKEW_HARD_CONTRACTS * fam_m
 
 
+def ens_no_loss_quotes(quotes: List["Quote"], pos: float,
+                       avg: Optional[float]) -> List["Quote"]:
+    """An election night session's CLOSING side never rests at a loss to the
+    bot's average cost (Jack 2026-11-04: "try not to match at a loss"): long,
+    its asks shift up so the first is at or above the average paid; short, its
+    bids shift down so the first is at or below the average sold. The ladder
+    keeps its spacing (so it only ever moves AWAY from the touch); rungs pushed
+    past ENS_PRICE_MIN..ENS_PRICE_MAX drop. Pads and the other side as built."""
+    if abs(pos) < 1 or not avg:
+        return quotes
+    side = "ask" if pos > 0 else "bid"
+    rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
+    if not rungs:
+        return quotes
+    if side == "ask":
+        shift = max(0, math.ceil(avg - 1e-9) - min(q.price_cents for q in rungs))
+    else:
+        shift = -max(0, max(q.price_cents for q in rungs) - math.floor(avg + 1e-9))
+    if not shift:
+        return quotes
+    out = []
+    for q in quotes:
+        if q.book_side == side and not q.is_pad:
+            px = q.price_cents + shift
+            if px < ENS_PRICE_MIN or px > ENS_PRICE_MAX:
+                continue
+            q = replace(q, price_cents=px, price_exact=None)
+        out.append(q)
+    return out
+
+
 def ens_ticker(ticker: str) -> bool:
     """A market (or the event itself) of an ENS_EVENTS event."""
     return any(ticker == e or ticker.startswith(e + "-") for e in ENS_EVENTS)
@@ -35754,6 +35785,10 @@ class IncentiveMarketMaker:
                                                     band=(rung_lo, pmax_s),
                                                     hour_mult=hm, min_total=n_c))
 
+            # an election night session closes no position at a loss to its
+            # average cost (ens_no_loss_quotes)
+            if ens_series(meta.series):
+                mq = ens_no_loss_quotes(mq, own_pos, self.pnl.avg.get(t))
             # quake gate: every bid rung at most the fair cap; asks only on an
             # ask strike whose ask may rest, at the floor or above
             if quake_cap is not None:

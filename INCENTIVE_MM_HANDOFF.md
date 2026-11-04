@@ -11188,3 +11188,6 @@ collect rewards", then "launch at 7pm".
   ...and no depth pads on ENS series (series_pad_to_target): the global pads rest at 1c/99c (a 180 @ 99c ask on 50).
 - 2026-11-04 00:55Z (Jack): "scale everything up by 20%, including contracts, caps, etc" -> rungs 36 (4 rungs), cap 180,
   skew 90/180, event cap 1,800; the 50/100 book-depth thresholds unchanged.
+- 2026-11-04 01:05Z (Jack): "try not to match at a loss" -> ens_no_loss_quotes: the closing side (asks when long,
+  bids when short) shifts so its first rung is at or past the bot's average cost (pnl.avg), spacing kept, only ever
+  away from the touch; out-of-band rungs drop. Average cost, not the page's FIFO lots.

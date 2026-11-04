@@ -39534,6 +39534,29 @@ class TestElectionNightSession(unittest.TestCase):
         # a 100+ level BEHIND a thin touch is not the touch: 1c behind it
         self.assertEqual(imm.ens_anchors([[62, 300], [63, 10]], [])[0], 61)
 
+    def test_no_close_at_a_loss(self):
+        """'try not to match at a loss': the closing side rests at or past the
+        bot's average cost, ladder spacing kept, the other side untouched"""
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 50, 36), Q(self.T, "bid", 47, 36),
+              Q(self.T, "ask", 53, 36), Q(self.T, "ask", 56, 36)]
+        px = lambda out, sd: [q.price_cents for q in out if q.book_side == sd]
+        # long 40 at 57.3c: asks from 58c, 3c apart; bids as built
+        out = imm.ens_no_loss_quotes(qs, 40, 57.3)
+        self.assertEqual(px(out, "ask"), [58, 61])
+        self.assertEqual(px(out, "bid"), [50, 47])
+        # short 40 at 45.6c: bids from 45c down
+        out = imm.ens_no_loss_quotes(qs, -40, 45.6)
+        self.assertEqual(px(out, "bid"), [45, 42])
+        self.assertEqual(px(out, "ask"), [53, 56])
+        # already past break-even, flat, or no average: unchanged
+        self.assertEqual(imm.ens_no_loss_quotes(qs, 40, 52.0), qs)
+        self.assertEqual(imm.ens_no_loss_quotes(qs, 0, 57.3), qs)
+        self.assertEqual(imm.ens_no_loss_quotes(qs, 40, None), qs)
+        # a rung pushed past 98c drops
+        self.assertEqual(px(imm.ens_no_loss_quotes(
+            [Q(self.T, "ask", 90, 36), Q(self.T, "ask", 93, 36)], 10, 96.2), "ask"), [97])
+
     def test_flat_20_on_cheap_sides(self):
         """Jack 2026-11-03 "Yes, all at 20": no long-shot cut, no family lean"""
         now = datetime(2026, 11, 4, 1, 0, tzinfo=timezone.utc)
