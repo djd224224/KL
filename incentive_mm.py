@@ -9685,9 +9685,17 @@ def load_pvd_markets() -> int:
                 PVD_CUSHION_LIVE if kind == "live" else PVD_CUSHION_DEAD)
         except (TypeError, ValueError):
             cushion = PVD_CUSHION_LIVE if kind == "live" else PVD_CUSHION_DEAD
+        # ...and its own price band (Jack 2026-11-04: "also remove the range
+        # cap on these" -- the cushion-0 finish-line markets): "price_min" /
+        # "price_max", default PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c)
+        try:
+            pmin = max(1, int(raw.get("price_min") or PVD_PRICE_MIN))
+            pmax = min(99, int(raw.get("price_max") or PVD_PRICE_MAX))
+        except (TypeError, ValueError):
+            pmin, pmax = PVD_PRICE_MIN, PVD_PRICE_MAX
         fresh[t] = {"stop": stop, "bid_max": bid_max, "ask_min": ask_min,
                     "size": size, "max_pos": max_pos, "kind": kind,
-                    "cushion": max(0, cushion),
+                    "cushion": max(0, cushion), "pmin": pmin, "pmax": pmax,
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -9759,9 +9767,10 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     inside the cushion -- the band still holds -- at no more than the
     position (`close_qty`), so a fill can only flatten it, never flip it."""
     bmax, amin = pvd_limits(entry, last)
+    lo, hi = entry.get("pmin", PVD_PRICE_MIN), entry.get("pmax", PVD_PRICE_MAX)
     out: List["Quote"] = []
     for q in quotes:
-        if q.is_pad or not (PVD_PRICE_MIN <= q.price_cents <= PVD_PRICE_MAX):
+        if q.is_pad or not (lo <= q.price_cents <= hi):
             continue
         inside = (q.price_cents <= bmax if q.book_side == "bid"
                   else q.price_cents >= amin)
@@ -27830,8 +27839,10 @@ class IncentiveMarketMaker:
         once per move."""
         bmax, amin = pvd_limits(pvd, PVD_LAST.get(t))
 
+        lo, hi = pvd.get("pmin", PVD_PRICE_MIN), pvd.get("pmax", PVD_PRICE_MAX)
+
         def ok(side: str, px: Optional[int]) -> bool:
-            if px is None or not (PVD_PRICE_MIN <= px <= PVD_PRICE_MAX):
+            if px is None or not (lo <= px <= hi):
                 return False
             if side == close_side:
                 return True            # the closing exemption: the band alone

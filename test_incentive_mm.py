@@ -39830,3 +39830,16 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
                           for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
                          [("bid", 49, 40.0)])
+
+    def test_a_market_s_own_price_band(self):
+        """Jack 2026-11-04: "also remove the range cap on these" -- an entry's
+        price_min / price_max replaces the 3-97c band for that market only"""
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 1, 40), Q(self.T, "bid", 2, 40), Q(self.T, "ask", 98, 40), Q(self.T, "ask", 99, 40)]
+        wide = {"bid_max": 50, "ask_min": 50, "pmin": 1, "pmax": 99}
+        self.assertEqual([q.price_cents for q in imm.pvd_guard_quotes(qs, wide)], [1, 2, 98, 99])
+        self.assertEqual(imm.pvd_guard_quotes(qs, {"bid_max": 50, "ask_min": 50}), [])
+        self._write({self.T: {"bid_max": 50, "ask_min": 50, "price_min": 1, "price_max": 99},
+                     self.T2: {"bid_max": 50, "ask_min": 50}})
+        self.assertEqual((imm.PVD_MARKETS[self.T]["pmin"], imm.PVD_MARKETS[self.T]["pmax"]), (1, 99))
+        self.assertEqual((imm.PVD_MARKETS[self.T2]["pmin"], imm.PVD_MARKETS[self.T2]["pmax"]), (3, 97))
