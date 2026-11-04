@@ -39846,3 +39846,21 @@ class TestPostVoteDeadBooks(unittest.TestCase):
                      self.T2: {"bid_max": 50, "ask_min": 50}})
         self.assertEqual((imm.PVD_MARKETS[self.T]["pmin"], imm.PVD_MARKETS[self.T]["pmax"]), (1, 99))
         self.assertEqual((imm.PVD_MARKETS[self.T2]["pmin"], imm.PVD_MARKETS[self.T2]["pmax"]), (3, 97))
+
+    def test_per_side_size_on_a_decided_market(self):
+        """Jack 2026-11-04: "for decided, be comfortable raising to 200
+        contracts on the decided side": bid_size / ask_size per side, each
+        side's position limit with its own size"""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 120, "bid_size": 200}})
+        e = imm.pvd_entry(self.T)
+        self.assertEqual((e["bsize"], e["asize"], e["max_pos"]), (200, 120, 200.0))
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        self.assertEqual(sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
+                                if o["ticker"] == self.T), [("ask", 120.0), ("bid", 200.0)])
+        # short 120 (its ask's limit): the ask stops, the 200 bid (closing) rests
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot2.pnl.pos[self.T], bot2.pnl.avg[self.T] = -120.0, 51.0
+        bot2.client.positions[self.T] = -120.0
+        bot2.run_cycle()
+        self.assertEqual([o["book_side"] for o in bot2.state.sim_orders.values() if o["ticker"] == self.T], ["bid"])

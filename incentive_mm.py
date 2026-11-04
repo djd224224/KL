@@ -9673,10 +9673,20 @@ def load_pvd_markets() -> int:
             size = max(1, int(raw.get("size") or PVD_SIZE))
         except (TypeError, ValueError):
             size = PVD_SIZE
+        # ...and per side (Jack 2026-11-04: "for decided, be comfortable raising
+        # to 200 contracts on the decided side"): "bid_size" / "ask_size"
+        # override `size` for that side; each side's position limit scales
+        # with its own size (the long one with the bid, the short one with
+        # the ask)
         try:
-            max_pos = float(raw.get("max_position") or PVD_MAX_POSITION * size / PVD_SIZE)
+            bsize = max(1, int(raw.get("bid_size") or size))
+            asize = max(1, int(raw.get("ask_size") or size))
         except (TypeError, ValueError):
-            max_pos = PVD_MAX_POSITION * size / PVD_SIZE
+            bsize = asize = size
+        try:
+            max_pos = float(raw.get("max_position") or PVD_MAX_POSITION * max(size, bsize, asize) / PVD_SIZE)
+        except (TypeError, ValueError):
+            max_pos = PVD_MAX_POSITION * max(size, bsize, asize) / PVD_SIZE
         # its kind sets its guard cushion (PVD_CUSHION_DEAD / _LIVE); an
         # entry's own "cushion" overrides
         kind = "live" if str(raw.get("kind") or "dead") == "live" else "dead"
@@ -9695,6 +9705,7 @@ def load_pvd_markets() -> int:
             pmin, pmax = PVD_PRICE_MIN, PVD_PRICE_MAX
         fresh[t] = {"stop": stop, "bid_max": bid_max, "ask_min": ask_min,
                     "size": size, "max_pos": max_pos, "kind": kind,
+                    "bsize": bsize, "asize": asize,
                     "cushion": max(0, cushion), "pmin": pmin, "pmax": pmax,
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
@@ -35855,8 +35866,8 @@ class IncentiveMarketMaker:
             # a post-vote dead book's rung is the same on both sides (no family
             # lean or long-shot cut); a side a guard above emptied stays dark
             if pvd is not None:
-                lv_bid = list(lv) if lv_bid else []
-                lv_ask = list(lv) if lv_ask else []
+                lv_bid = [(0, pvd.get("bsize", pvd["size"]))] if lv_bid else []
+                lv_ask = [(0, pvd.get("asize", pvd["size"]))] if lv_ask else []
             side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
@@ -35915,6 +35926,12 @@ class IncentiveMarketMaker:
             # and the event share carry it already)
             pos_room_buy, pos_room_sell = side_cut_room(
                 meta.series, maxpos - cap_pos, maxpos + cap_pos)
+            if pvd is not None:
+                # a post-vote dead book's position limit per side: long up to
+                # its bid size, short up to its ask size (x max_pos / size)
+                _pv_k = pvd["max_pos"] / max(pvd["size"], pvd.get("bsize", 0), pvd.get("asize", 0), 1)
+                pos_room_buy = min(pos_room_buy, max(0.0, pvd.get("bsize", pvd["size"]) * _pv_k - cap_pos))
+                pos_room_sell = min(pos_room_sell, max(0.0, pvd.get("asize", pvd["size"]) * _pv_k + cap_pos))
             # LEAD INVENTORY (FAIR_LEAD_INV_QUOTE): the side a fair-lead
             # market's position adds to, with no lead on it, quotes its normal
             # rung as if the first FAIR_LEAD_MAX_POSITION of the position were
@@ -35938,8 +35955,8 @@ class IncentiveMarketMaker:
             if pvd is not None:
                 # ...and never more than PVD_SIZE resting a side, the unwind
                 # of an older position included
-                side_max_bid = min(side_max_bid, pvd["size"])
-                side_max_ask = min(side_max_ask, pvd["size"])
+                side_max_bid = min(side_max_bid, pvd.get("bsize", pvd["size"]))
+                side_max_ask = min(side_max_ask, pvd.get("asize", pvd["size"]))
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
@@ -37329,7 +37346,8 @@ class IncentiveMarketMaker:
             # quote loop sized it so, whatever the series ladder reads)
             _pvq = pvd_entry(q.ticker)
             if _pvq is not None:
-                side_cap = max_level_size = float(_pvq["size"])
+                side_cap = max_level_size = float(_pvq.get(
+                    "bsize" if q.book_side == "bid" else "asize", _pvq["size"]))
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
