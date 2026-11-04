@@ -39488,7 +39488,7 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
         lv = imm.hour_scaled_levels(self.S, now)
         self.assertEqual(lv, [(0, 36), (3, 36), (6, 36), (9, 36)])   # 30, 4 rungs, then x1.2
-        self.assertEqual(imm.series_max_position(self.S, now), 180)
+        self.assertEqual(imm.series_max_position(self.S, now), 1_000_000)   # "remove ... market caps"
         # rungs re-pin to the anchor on any move, toward the touch too
         self.assertEqual(imm.series_atref_price_tol(self.S), 0)
         # "dont quote at 99c/1c": the band is 2-98 for fresh and member markets
@@ -39505,7 +39505,7 @@ class TestElectionNightSession(unittest.TestCase):
             self.assertFalse(imm.series_pad_to_target(self.S))
             self.assertTrue(imm.series_pad_to_target("KXSENATE"))
         # room for all 4 rungs on ~10 markets: the event cap is 150 x 10
-        self.assertEqual(imm.event_cap_contracts(self.EV), 1800)
+        self.assertEqual(imm.event_cap_contracts(self.EV), 1_000_000)      # "remove event cap"
         # "Yes, scale to 150" (75 / 150), then x1.2: halves at 90, pulls at 180
         soft, hard = imm.skew_knees(self.S, 1.0)
         self.assertEqual((soft, hard), (90, 180))
@@ -39535,6 +39535,7 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertFalse(imm.ens_ticker("KXSENATESEATSD-29-53"))
         # "dont quote 'at least 47'"
         self.assertTrue(imm.IncentiveMarketMaker._blocked("KXSENATESEATSD-27-47"))
+        self.assertTrue(imm.IncentiveMarketMaker._blocked("KXSENATESEATSD-27-51"))   # "stop trading '51'"
         self.assertFalse(imm.IncentiveMarketMaker._blocked(self.T))
 
     def test_no_per_market_size_boost(self):

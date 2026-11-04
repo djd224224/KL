@@ -9452,8 +9452,14 @@ ENS_JOIN_TOUCH_MIN = _env_float("IMM_ENS_JOIN_TOUCH_MIN", 100)
 # markets of a session never quoted (Jack 2026-11-03: "dont quote 'at least
 # 47'"): blocked, so their orders are pulled like any blocked market's
 ENS_SKIP_MARKETS = frozenset(t.strip() for t in os.environ.get(
-    "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47").split(",") if t.strip())
-ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 180)
+    # ...and "at least 51" (Jack 2026-11-04: "stop trading '51'")
+    "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47,KXSENATESEATSD-27-51").split(",") if t.strip())
+# NO MARKET OR EVENT CAP (Jack 2026-11-04: "remove event cap and market
+# caps", once the caps judged the account and his +4,610 net YES left the
+# bot only selling): ENS_MAX_POSITION and ENS_EVENT_CAP are 1,000,000 --
+# uncapped in effect. The skew (ENS_SKEW_SOFT / HARD on the account's
+# position) is the one inventory limit left.
+ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 1_000_000)
 # THE SKEW scaled to the cap (Jack 2026-11-04: "Yes, scale to 150", on "Raise
 # the session's skew so positions can build to the 150 cap?"): the adding side
 # is halved from ENS_SKEW_SOFT net contracts and pulled at ENS_SKEW_HARD, in
@@ -9467,7 +9473,7 @@ ENS_PRICE_MAX = _env_int("IMM_ENS_PRICE_MAX", 98)
 # THE EVENT CAP (2026-11-04): the bot's 1,000 net per event, split over ~9
 # quoted markets, left each side ~90-110 -- room for 3 of the 4 rungs Jack
 # asked for ("add a 4th rung"). ENS_EVENT_CAP = his 150 a market x 10.
-ENS_EVENT_CAP = _env_float("IMM_ENS_EVENT_CAP", 1800)
+ENS_EVENT_CAP = _env_float("IMM_ENS_EVENT_CAP", 1_000_000)
 
 
 def ens_series(series: str) -> bool:
