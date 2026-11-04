@@ -29090,7 +29090,10 @@ class IncentiveMarketMaker:
         size mode, the RT floor boost and the Vercel floor boost, x yield size
         mode. The one number each reader of the shape applies (estimator probe
         and floor projection, collateral reservation, quote loop, placement
-        guard), so all of them see the ladder the quote loop rests."""
+        guard), so all of them see the ladder the quote loop rests. x1 in an
+        election night session (ENS_EVENTS: "1x base contracts")."""
+        if ens_ticker(ticker):
+            return 1.0
         return (max(self._near_cliff_size_mult(ticker), self._rt_floor_boost.get(ticker, 1.0),
                     self._vercel_boost_mult(ticker))
                 * self._yield_size_mult(ticker))

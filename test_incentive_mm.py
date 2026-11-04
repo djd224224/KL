@@ -39476,6 +39476,15 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertTrue(imm.ens_ticker(self.T))
         self.assertFalse(imm.ens_ticker("KXSENATESEATSD-29-53"))
 
+    def test_no_per_market_size_boost(self):
+        """near-cliff / yield / floor boosts stay off: 1x base"""
+        mm = imm.IncentiveMarketMaker.__new__(imm.IncentiveMarketMaker)
+        mm._near_cliff_boost = {self.T: 0.0, "KXOTHER-26NOV05-T1": 0.0}
+        mm._rt_floor_boost, mm._yield_boost = {}, {}
+        with mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.5),                 mock.patch.object(mm, "_vercel_boost_mult", lambda t: 1.0, create=True),                 mock.patch.object(mm, "_yield_size_mult", lambda t: 1.0, create=True):
+            self.assertEqual(mm._market_size_mult(self.T), 1.0)
+            self.assertEqual(mm._market_size_mult("KXOTHER-26NOV05-T1"), 1.5)
+
 
 if __name__ == "__main__":
     unittest.main()
