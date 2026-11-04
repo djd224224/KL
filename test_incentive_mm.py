@@ -39685,6 +39685,15 @@ class TestPostVoteDeadBooks(unittest.TestCase):
               Q(self.T, "bid", 1, 900, is_pad=True), Q(self.T, "ask", 99, 900, is_pad=True)]
         self.assertEqual([(q.book_side, q.price_cents) for q in imm.pvd_guard_quotes(qs, e)],
                          [("bid", 30), ("ask", 70)])
+        # "dont quote 1/99c or 2/98c": an extreme rung drops even inside its limit
+        wide = {"bid_max": 2, "ask_min": 98}
+        qs = [Q(self.T, "bid", 1, 40), Q(self.T, "bid", 2, 40), Q(self.T, "ask", 98, 40),
+              Q(self.T, "ask", 99, 40)]
+        self.assertEqual(imm.pvd_guard_quotes(qs, wide), [])
+        loose = {"bid_max": 50, "ask_min": 50}
+        qs = [Q(self.T, "bid", 2, 40), Q(self.T, "bid", 3, 40), Q(self.T, "ask", 97, 40),
+              Q(self.T, "ask", 98, 40)]
+        self.assertEqual([q.price_cents for q in imm.pvd_guard_quotes(qs, loose)], [3, 97])
 
     def test_dry_cycle_rests_40_a_side_at_the_reference(self):
         """KXGOOD's book is 49 x 51: listed with limits around it, the bot

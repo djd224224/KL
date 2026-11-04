@@ -9702,12 +9702,21 @@ def load_pvd_markets() -> int:
     return changed
 
 
+# ...and nothing at the extremes (Jack 2026-11-04: "dont quote 1/99c or
+# 2/98c"): a rung outside PVD_PRICE_MIN..PVD_PRICE_MAX drops -- the side
+# stands down, it does not move inward
+PVD_PRICE_MIN = _env_int("IMM_PVD_PRICE_MIN", 3)
+PVD_PRICE_MAX = _env_int("IMM_PVD_PRICE_MAX", 97)
+
+
 def pvd_guard_quotes(quotes: List["Quote"], entry: dict) -> List["Quote"]:
-    """A post-vote dead book's side guard: no pads; a bid rests only at or
-    under bid_max, an ask only at or over ask_min (YES cents)."""
-    return [q for q in quotes if not q.is_pad and (
-        q.price_cents <= entry["bid_max"] if q.book_side == "bid"
-        else q.price_cents >= entry["ask_min"])]
+    """A post-vote dead book's side guard: no pads; nothing outside
+    PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
+    bid_max, an ask only at or over ask_min (YES cents)."""
+    return [q for q in quotes if not q.is_pad
+            and PVD_PRICE_MIN <= q.price_cents <= PVD_PRICE_MAX and (
+                q.price_cents <= entry["bid_max"] if q.book_side == "bid"
+                else q.price_cents >= entry["ask_min"])]
 
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
