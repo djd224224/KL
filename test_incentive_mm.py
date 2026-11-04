@@ -39803,3 +39803,30 @@ class TestPostVoteDeadBooks(unittest.TestCase):
             bot.run_cycle()
         self.assertEqual(sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
                                 if o["ticker"] == self.T), [("ask", 51), ("bid", 49)])
+
+    def test_closing_side_rests_inside_the_cushion_up_to_the_position(self):
+        """Jack 2026-11-04 "Yes, exempt closing": the side that reduces the
+        bot's own position may rest inside the cushion (never outside 3-97c),
+        at no more than the position -- a fill flattens it, never flips it"""
+        Q = imm.Quote
+        e = {"bid_max": 40, "ask_min": 60, "cushion": 2}
+        qs = [Q(self.T, "bid", 49, 120), Q(self.T, "ask", 51, 120)]
+        # flat: both inside the cushion -> both out
+        self.assertEqual(imm.pvd_guard_quotes(qs, e), [])
+        # short 70: the bid closes, capped at 70; the ask still out
+        out = imm.pvd_guard_quotes(qs, e, None, "bid", 70.0)
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 49, 70)])
+        # ...but never at 1-2c / 98-99c
+        self.assertEqual(imm.pvd_guard_quotes([Q(self.T, "ask", 2, 40)], e, None, "ask", 40.0), [])
+        # a closing rung inside its limit keeps its full size
+        out = imm.pvd_guard_quotes([Q(self.T, "bid", 30, 120)], e, None, "bid", 70.0)
+        self.assertEqual(out[0].count, 120)
+        # end to end: short 40 at the 40 cap, limits that block the 49c bid
+        self._write({self.T: {"bid_max": 40, "ask_min": 60, "cushion": 0}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, 51.0
+        bot.client.positions[self.T] = -40.0
+        bot.run_cycle()
+        self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
+                          for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
+                         [("bid", 49, 40.0)])

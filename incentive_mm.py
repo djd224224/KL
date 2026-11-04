@@ -9746,16 +9746,30 @@ def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
 
 
 def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
-                     last: Optional[float] = None) -> List["Quote"]:
+                     last: Optional[float] = None,
+                     close_side: Optional[str] = None,
+                     close_qty: float = 0.0) -> List["Quote"]:
     """A post-vote dead book's side guard: no pads; nothing outside
     PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
     bid_max, an ask only at or over ask_min (YES cents), each tightened to
-    the entry's cushion off the last trade (pvd_limits)."""
+    the entry's cushion off the last trade (pvd_limits).
+
+    CLOSING EXEMPTION (Jack 2026-11-04: "Yes, exempt closing"): the side that
+    reduces the bot's own position (`close_side`, 'bid' for a short) may rest
+    inside the cushion -- the band still holds -- at no more than the
+    position (`close_qty`), so a fill can only flatten it, never flip it."""
     bmax, amin = pvd_limits(entry, last)
-    return [q for q in quotes if not q.is_pad
-            and PVD_PRICE_MIN <= q.price_cents <= PVD_PRICE_MAX and (
-                q.price_cents <= bmax if q.book_side == "bid"
-                else q.price_cents >= amin)]
+    out: List["Quote"] = []
+    for q in quotes:
+        if q.is_pad or not (PVD_PRICE_MIN <= q.price_cents <= PVD_PRICE_MAX):
+            continue
+        inside = (q.price_cents <= bmax if q.book_side == "bid"
+                  else q.price_cents >= amin)
+        if inside:
+            out.append(q)
+        elif close_side is not None and q.book_side == close_side                 and int(close_qty) >= 1:
+            out.append(replace(q, count=int(min(q.count, int(close_qty)))))
+    return out
 
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
@@ -23948,6 +23962,7 @@ class IncentiveMarketMaker:
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
+        self._pvd_close: Dict[str, Optional[tuple]] = {}  # closing-exemption rung last logged
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
         self._join_ahead_state: Dict[Tuple[str, str], int] = {}
@@ -27806,7 +27821,9 @@ class IncentiveMarketMaker:
 
     def _pvd_ref_fallback(self, t: str, pvd: dict, pl_bid: Optional[int],
                           pl_ask: Optional[int], ref_bid: Optional[int],
-                          ref_ask: Optional[int]) -> Tuple[Optional[int], Optional[int]]:
+                          ref_ask: Optional[int],
+                          close_side: Optional[str] = None
+                          ) -> Tuple[Optional[int], Optional[int]]:
         """A post-vote dead book's placement price per side: as join-ahead /
         join wait set it while it stays inside the guard (pvd_limits and the
         3-97c band), else the side's reference when that is inside -- logged
@@ -27816,6 +27833,8 @@ class IncentiveMarketMaker:
         def ok(side: str, px: Optional[int]) -> bool:
             if px is None or not (PVD_PRICE_MIN <= px <= PVD_PRICE_MAX):
                 return False
+            if side == close_side:
+                return True            # the closing exemption: the band alone
             return px <= bmax if side == "bid" else px >= amin
 
         out = []
@@ -35977,7 +35996,8 @@ class IncentiveMarketMaker:
             # whenever join-ahead would push it past the limit")
             if pvd is not None:
                 pl_bid_px, pl_ask_px = self._pvd_ref_fallback(
-                    t, pvd, pl_bid_px, pl_ask_px, ref_bid_px, ref_ask_px)
+                    t, pvd, pl_bid_px, pl_ask_px, ref_bid_px, ref_ask_px,
+                    close_side=("bid" if own_pos <= -1 else "ask" if own_pos >= 1 else None))
 
             # a leading side rests at its lead price, anchored there (the
             # anchor caps an at-ref rung) and at least target/5
@@ -36164,7 +36184,22 @@ class IncentiveMarketMaker:
             if pvd is not None:
                 _pv_before = {q.book_side for q in mq if not q.is_pad}
                 _pv_last = PVD_LAST.get(t)
-                mq = pvd_guard_quotes(mq, pvd, _pv_last)
+                # the side that reduces the bot's own position is exempt from the
+                # cushion, up to the position (the closing exemption)
+                _pv_close = "bid" if own_pos <= -1 else "ask" if own_pos >= 1 else None
+                _pv_pb, _pv_pa = pvd_limits(pvd, _pv_last)
+                mq = pvd_guard_quotes(mq, pvd, _pv_last, _pv_close, abs(own_pos))
+                _pv_cl = next(((q.book_side, q.price_cents, q.count) for q in mq
+                               if q.book_side == _pv_close and not q.is_pad and (
+                                   q.price_cents > _pv_pb if q.book_side == "bid"
+                                   else q.price_cents < _pv_pa)), None)
+                if _pv_cl != self._pvd_close.get(t):
+                    if _pv_cl is not None:
+                        log(f"{self.tag} pvd close {t} {_pv_cl[0]}: {_pv_cl[2]} at "
+                            f"{_pv_cl[1]}c inside the cushion (limit "
+                            f"{'bid<=' + str(_pv_pb) if _pv_cl[0] == 'bid' else 'ask>=' + str(_pv_pa)}"
+                            f", last {_pv_last}) to flatten {own_pos:+.0f}")
+                    self._pvd_close[t] = _pv_cl
                 _pv_out = _pv_before - {q.book_side for q in mq}
                 if _pv_out != self._pvd_out.get(t, set()):
                     if _pv_out:
