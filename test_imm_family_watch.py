@@ -536,6 +536,10 @@ class TestResearchOnArrival(unittest.TestCase):
         self.assertIn("NOT a vote", p)
         # 10/09: a minister-after-the-election market takes the vote's day
         self.assertIn("OR by what a named upcoming vote decides", p)
+        # 11/04: ...unless that vote is past -- then the day the government
+        # takes office (KXBRFINMIN dark on the 10/25 runoff's row)
+        self.assertIn("ALREADY been held", p)
+        self.assertIn("never the past voting day", p)
 
     def test_parse_result_line(self):
         txt = ("did the work\n```\nRESULT_JSON: {\"gap:KXISR-26OCT27\": {\"status\": "

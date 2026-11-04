@@ -1333,6 +1333,16 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "event. A rally, debate, court case, retirement, or an appointment "
         "or announcement that no vote decides is NOT a vote: write nothing, "
         "status judgment.",
+        # 2026-11-04 (Jack, of KXBRFINMIN / KXBRDEFMIN-26OCT25, dark on rows
+        # research wrote on 11/04 dated to the past 10/25 Brazil runoff:
+        # "should be autoquoting due to elections family")
+        "- If that vote has ALREADY been held (its day is before today), the "
+        "market now hinges on the new government taking office: write the "
+        "day it is sworn in -- the inauguration or investiture date set in "
+        "law or officially announced (e.g. Brazil's president, and with him "
+        "the cabinet, on Jan 5 2027) -- never the past voting day, which "
+        "would leave the market dark for good. No such date known yet: the "
+        "contract's own deadline, with --term-end.",
         # 2026-10-28 (Jack, of KXJAPANHOUSE-30FEB07 -- "Next Japanese general
         # election winner?", dark because no vote was called: "date it to
         # term end as a rule")
