@@ -11172,3 +11172,9 @@ collect rewards", then "launch at 7pm".
   manual trades" check found the near-cliff x1.5); then "Yes, all at 20" -> no long-shot cut / family lean on
   ens_series; "dont sit at the touch, start at least 1 below the touch" -> ENS_LEVELS 1:20,4:20,7:20; "dont quote
   'at least 47'" -> ENS_SKIP_MARKETS (blocked in _blocked).
+- 2026-11-04 00:20Z (Jack): "Yes, all at 20" / "start at least 1 below the touch, and must be below a rung that has at
+  least 50 contracts" / "dont quote 'at least 47'" shipped in 778f2f3 (ens_anchors, ENS_SKIP_MARKETS, no long-shot
+  cut or family lean); then "sit at the touch if there are at least 100 contracts there" -> ENS_JOIN_TOUCH_MIN 100:
+  others' 100+ at the best price -> the first rung joins it; a 100+ level behind a thin touch keeps the 1c-behind rule.
+- 2026-11-04 00:21Z (Jack): "increase to 30 contracts instead of 20" -> ENS_LEVELS 0:30,3:30,6:30 (cap 150, skew
+  30/60 unchanged).

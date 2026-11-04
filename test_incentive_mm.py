@@ -39455,14 +39455,14 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
         self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
         lv = imm.hour_scaled_levels(self.S, now)
-        self.assertEqual(lv, [(0, 20), (3, 20), (6, 20)])
+        self.assertEqual(lv, [(0, 30), (3, 30), (6, 30)])     # "increase to 30"
         self.assertEqual(imm.series_max_position(self.S, now), 150)
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
-            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 60, levels=lv, ref_px=60)
-            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 60, levels=lv, ref_px=70)
+            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 90, levels=lv, ref_px=60)
+            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 90, levels=lv, ref_px=70)
             # 3c apart from the anchor (ens_anchors puts it behind the touch)
-            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 20), (61, 20), (58, 20)])
-            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 20), (69, 20), (72, 20)])
+            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 30), (61, 30), (58, 30)])
+            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 30), (69, 30), (72, 30)])
             # every other series keeps its one at-ref rung
             self.assertEqual(len(imm.build_side_ladder(
                 "KXUST10AD-26NOV05-T4.1", "bid", 64, 66, 60, levels=[(0, 20)], ref_px=60)), 1)
@@ -39501,6 +39501,13 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.ens_anchors([[63, 50]], [[37, 50]]), (62, 64))
         # no price with 50: that side rests nothing
         self.assertEqual(imm.ens_anchors([[63, 49]], []), (None, None))
+        # "sit at the touch if there are at least 100 contracts there"
+        self.assertEqual(imm.ens_anchors([[62, 300], [63, 100]], [[30, 60], [35, 150]]), (63, 65))
+        # ...others' 100, not ours: 120 there less our 20 still joins; less 21 does not
+        self.assertEqual(imm.ens_anchors([[63, 120]], [], [("bid", 63, 20.0)])[0], 63)
+        self.assertEqual(imm.ens_anchors([[63, 120]], [], [("bid", 63, 21.0)])[0], 62)
+        # a 100+ level BEHIND a thin touch is not the touch: 1c behind it
+        self.assertEqual(imm.ens_anchors([[62, 300], [63, 10]], [])[0], 61)
 
     def test_flat_20_on_cheap_sides(self):
         """Jack 2026-11-03 "Yes, all at 20": no long-shot cut, no family lean"""
