@@ -39536,6 +39536,8 @@ class TestElectionNightSession(unittest.TestCase):
         # "dont quote 'at least 47'"
         self.assertTrue(imm.IncentiveMarketMaker._blocked("KXSENATESEATSD-27-47"))
         self.assertTrue(imm.IncentiveMarketMaker._blocked("KXSENATESEATSD-27-51"))   # "stop trading '51'"
+        for t in ("KXSENATESEATSD-27-57", "KXSENATESEATSD-27-58"):                   # "dont trade 57, 58"
+            self.assertTrue(imm.IncentiveMarketMaker._blocked(t))
         self.assertFalse(imm.IncentiveMarketMaker._blocked(self.T))
 
     def test_no_per_market_size_boost(self):

@@ -9452,8 +9452,10 @@ ENS_JOIN_TOUCH_MIN = _env_float("IMM_ENS_JOIN_TOUCH_MIN", 100)
 # markets of a session never quoted (Jack 2026-11-03: "dont quote 'at least
 # 47'"): blocked, so their orders are pulled like any blocked market's
 ENS_SKIP_MARKETS = frozenset(t.strip() for t in os.environ.get(
-    # ...and "at least 51" (Jack 2026-11-04: "stop trading '51'")
-    "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47,KXSENATESEATSD-27-51").split(",") if t.strip())
+    # ...and "at least 51" (Jack 2026-11-04: "stop trading '51'"), 57 and 58
+    # ("dont trade 57, 58")
+    "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47,KXSENATESEATSD-27-51,"
+    "KXSENATESEATSD-27-57,KXSENATESEATSD-27-58").split(",") if t.strip())
 # NO MARKET OR EVENT CAP (Jack 2026-11-04: "remove event cap and market
 # caps", once the caps judged the account and his +4,610 net YES left the
 # bot only selling): ENS_MAX_POSITION and ENS_EVENT_CAP are 1,000,000 --

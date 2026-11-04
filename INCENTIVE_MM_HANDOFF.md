@@ -11203,3 +11203,4 @@ Jack: "KXBRFINMIN-26OCT25, KXBRDEFMIN-26OCT25 should be autoquoting due to elect
 - 2026-11-04 02:12Z (Jack): "remove event cap and market caps" -> ENS_MAX_POSITION / ENS_EVENT_CAP 1,000,000 (the account's
   +4,610 net YES had left the bot only selling); the skew 90/180 on the account position is the one limit left.
   ...and "stop trading '51'" -> KXSENATESEATSD-27-51 in ENS_SKIP_MARKETS.
+  ...and "dont trade 57, 58" -> both in ENS_SKIP_MARKETS.
