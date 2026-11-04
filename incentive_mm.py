@@ -9712,8 +9712,9 @@ PVD_PRICE_MAX = _env_int("IMM_PVD_PRICE_MAX", 97)
 # HOUSENC1-26LBUC-40's ask at 93c under a 94c one): each universe refresh
 # reads every listed market's last trade (PVD_LAST) and the guard holds a bid
 # PVD_CUSHION under it and an ask PVD_CUSHION over it -- tighten only, never
-# past the listed bid_max / ask_min
-PVD_CUSHION = _env_int("IMM_PVD_CUSHION", 20)
+# past the listed bid_max / ask_min. 10c since 16:00Z (Jack 2026-11-04: "go
+# from 20c to 10c" -- 20c kept $2,684/day of a band-only $3,844; 10c $3,002)
+PVD_CUSHION = _env_int("IMM_PVD_CUSHION", 10)
 PVD_LAST: Dict[str, float] = {}
 
 
