@@ -26224,7 +26224,7 @@ class TestGuardSkipSink(unittest.TestCase):
         # fair lead or close rests past the band (2026-10-30)
         # + an RT settled strike that stops qualifying past the release-week
         # stand-down (2026-11-01)
-        self.assertEqual(len(conts), 55)
+        self.assertEqual(len(conts), 56)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
