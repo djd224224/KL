@@ -23947,6 +23947,7 @@ class IncentiveMarketMaker:
         self._lol_last_live: Dict[str, float] = {}
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
+        self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
         self._join_ahead_state: Dict[Tuple[str, str], int] = {}
@@ -27802,6 +27803,32 @@ class IncentiveMarketMaker:
             p["done"] = True
             log(f"{self.tag} ! back-of-line step failed: {e}")
             return False
+
+    def _pvd_ref_fallback(self, t: str, pvd: dict, pl_bid: Optional[int],
+                          pl_ask: Optional[int], ref_bid: Optional[int],
+                          ref_ask: Optional[int]) -> Tuple[Optional[int], Optional[int]]:
+        """A post-vote dead book's placement price per side: as join-ahead /
+        join wait set it while it stays inside the guard (pvd_limits and the
+        3-97c band), else the side's reference when that is inside -- logged
+        once per move."""
+        bmax, amin = pvd_limits(pvd, PVD_LAST.get(t))
+
+        def ok(side: str, px: Optional[int]) -> bool:
+            if px is None or not (PVD_PRICE_MIN <= px <= PVD_PRICE_MAX):
+                return False
+            return px <= bmax if side == "bid" else px >= amin
+
+        out = []
+        for side, px, ref in (("bid", pl_bid, ref_bid), ("ask", pl_ask, ref_ask)):
+            if px is not None and px != ref and not ok(side, px) and ok(side, ref):
+                if self._pvd_fb.get((t, side)) != (px, ref):
+                    self._pvd_fb[(t, side)] = (px, ref)
+                    log(f"{self.tag} pvd join fallback {t} {side}: {px}c is past the "
+                        f"limit ({'bid<=' + str(bmax) if side == 'bid' else 'ask>=' + str(amin)})"
+                        f" -- rests at its reference {ref}c")
+                px = ref
+            out.append(px)
+        return out[0], out[1]
 
     def _back_of_line_move(self, m: dict, p: dict, now_ts: float) -> None:
         """One planned move, re-checked first: the order still rests at the
@@ -35941,6 +35968,16 @@ class IncentiveMarketMaker:
                 pl_bid_px, pl_ask_px = self._join_wait(
                     t, pl_bid_px, pl_ask_px, room_buy if lv_bid else 0.0,
                     room_sell if lv_ask else 0.0, own, now_ts)
+
+            # a POST-VOTE DEAD BOOK rung that join-ahead / join wait moved past
+            # its guard limit falls back to its reference, which the guard
+            # allows -- else pvd_guard_quotes drops the whole side (20:18-20:28Z
+            # 11/04: 11 sides, KXHOUSEWINSTATE-AZD-E6's bid 78c -> 80c over a 78c
+            # limit; Jack 2026-11-04 "yes" to "keep a PVD rung at its reference
+            # whenever join-ahead would push it past the limit")
+            if pvd is not None:
+                pl_bid_px, pl_ask_px = self._pvd_ref_fallback(
+                    t, pvd, pl_bid_px, pl_ask_px, ref_bid_px, ref_ask_px)
 
             # a leading side rests at its lead price, anchored there (the
             # anchor caps an at-ref rung) and at least target/5

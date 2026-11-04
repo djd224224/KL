@@ -39783,3 +39783,23 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([(o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
                           if o["ticker"] == self.T], [("bid", 49)])
         imm.PVD_LAST.clear()
+
+    def test_join_ahead_past_the_limit_rests_at_the_reference(self):
+        """Jack 2026-11-04 "yes": AZD-E6's bid joined 78c -> 80c over a 78c
+        limit and the guard dropped the side; now the rung rests at its
+        reference instead"""
+        mm = imm.IncentiveMarketMaker.__new__(imm.IncentiveMarketMaker)
+        mm._pvd_fb, mm.tag = {}, "[T]"
+        e = {"bid_max": 78, "ask_min": 82, "cushion": 2}
+        imm.PVD_LAST.clear()
+        self.assertEqual(mm._pvd_ref_fallback(self.T, e, 80, 85, 78, 86), (78, 85))   # bid falls back; ask ok
+        self.assertEqual(mm._pvd_ref_fallback(self.T, e, 77, 81, 76, 84), (77, 84))   # ask falls back
+        self.assertEqual(mm._pvd_ref_fallback(self.T, e, 80, 81, 79, 81), (80, 81))   # ref past too: left to the guard
+        # end to end: join-ahead pushes both rungs 1c into the book past 49/51
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "cushion": 0}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), mock.patch.object(imm, "join_ahead_series", lambda s: True), \
+                mock.patch.object(IncentiveMarketMaker, "_join_ahead", lambda self, t, meta, *a, **k: (50, 50)):
+            bot.run_cycle()
+        self.assertEqual(sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                                if o["ticker"] == self.T), [("ask", 51), ("bid", 49)])
