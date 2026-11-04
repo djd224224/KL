@@ -39755,19 +39755,27 @@ class TestPostVoteDeadBooks(unittest.TestCase):
 
     def test_limits_follow_the_last_trade(self):
         """14:45Z 11/04: a bid listed under a 99c last trade sat at 31c over a 27c
-        one -- the guard now tightens to PVD_CUSHION (10c since Jack's "go from
-        20c to 10c") off the latest last trade, never loosening past the
-        listed limits"""
-        self.assertEqual(imm.PVD_CUSHION, 10)
-        e = {"bid_max": 79, "ask_min": 98}
+        one -- the guard now tightens to the entry's cushion off the latest last
+        trade, never loosening past the listed limits. Per kind since Jack's
+        "cut cushion to 2c on dead books only, 5c on live books".
+        """
+        self.assertEqual((imm.PVD_CUSHION_DEAD, imm.PVD_CUSHION_LIVE), (2, 5))
+        e = {"bid_max": 79, "ask_min": 98, "cushion": 10}
         self.assertEqual(imm.pvd_limits(e, None), (79, 98))
         self.assertEqual(imm.pvd_limits(e, 27.0), (17, 98))
-        self.assertEqual(imm.pvd_limits({"bid_max": 2, "ask_min": 20}, 94.0), (2, 104))
-        self.assertEqual(imm.pvd_limits({"bid_max": 30, "ask_min": 70}, 50.0), (30, 70))   # never loosened
+        self.assertEqual(imm.pvd_limits({"bid_max": 2, "ask_min": 20, "cushion": 10}, 94.0), (2, 104))
+        self.assertEqual(imm.pvd_limits({"bid_max": 30, "ask_min": 70, "cushion": 10}, 50.0), (30, 70))   # never loosened
+        # the kind's cushion when the entry carries none: dead 2c, live 5c
+        self.assertEqual(imm.pvd_limits({"bid_max": 90, "ask_min": 10, "kind": "dead"}, 50.0), (48, 52))
+        self.assertEqual(imm.pvd_limits({"bid_max": 90, "ask_min": 10, "kind": "live"}, 50.0), (45, 55))
+        self._write({self.T: {"bid_max": 90, "ask_min": 10, "kind": "live"},
+                     self.T2: {"bid_max": 90, "ask_min": 10}})
+        self.assertEqual((imm.PVD_MARKETS[self.T]["cushion"], imm.PVD_MARKETS[self.T2]["cushion"]), (5, 2))
+        e = {"bid_max": 79, "ask_min": 98, "cushion": 10}
         Q = imm.Quote
         self.assertEqual(imm.pvd_guard_quotes([Q(self.T, "bid", 31, 40)], e, 27.0), [])
         # end to end: KXGOOD 49 x 51, last trade 75c -> the ask (51 < 85) stands down
-        self._write({self.T: {"bid_max": 60, "ask_min": 51}})
+        self._write({self.T: {"bid_max": 60, "ask_min": 51, "cushion": 10}})
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         bot.client.markets[self.T]["last_price_dollars"] = "0.7500"
         bot.run_cycle()

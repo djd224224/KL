@@ -9677,8 +9677,17 @@ def load_pvd_markets() -> int:
             max_pos = float(raw.get("max_position") or PVD_MAX_POSITION * size / PVD_SIZE)
         except (TypeError, ValueError):
             max_pos = PVD_MAX_POSITION * size / PVD_SIZE
+        # its kind sets its guard cushion (PVD_CUSHION_DEAD / _LIVE); an
+        # entry's own "cushion" overrides
+        kind = "live" if str(raw.get("kind") or "dead") == "live" else "dead"
+        try:
+            cushion = int(raw["cushion"]) if raw.get("cushion") is not None else (
+                PVD_CUSHION_LIVE if kind == "live" else PVD_CUSHION_DEAD)
+        except (TypeError, ValueError):
+            cushion = PVD_CUSHION_LIVE if kind == "live" else PVD_CUSHION_DEAD
         fresh[t] = {"stop": stop, "bid_max": bid_max, "ask_min": ask_min,
-                    "size": size, "max_pos": max_pos,
+                    "size": size, "max_pos": max_pos, "kind": kind,
+                    "cushion": max(0, cushion),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -9711,20 +9720,28 @@ PVD_PRICE_MAX = _env_int("IMM_PVD_PRICE_MAX", 97)
 # listing left GOVPARTYMA-26MMIN-36's bid at 31c over a 27c last trade, and
 # HOUSENC1-26LBUC-40's ask at 93c under a 94c one): each universe refresh
 # reads every listed market's last trade (PVD_LAST) and the guard holds a bid
-# PVD_CUSHION under it and an ask PVD_CUSHION over it -- tighten only, never
-# past the listed bid_max / ask_min. 10c since 16:00Z (Jack 2026-11-04: "go
-# from 20c to 10c" -- 20c kept $2,684/day of a band-only $3,844; 10c $3,002)
-PVD_CUSHION = _env_int("IMM_PVD_CUSHION", 10)
+# the entry's cushion under it and an ask that far over it -- tighten only, never
+# past the listed bid_max / ask_min. 10c from 16:00Z (Jack 2026-11-04: "go
+# from 20c to 10c" -- 20c kept $2,684/day of a band-only $3,844; 10c $3,002);
+# PER KIND from 19:30Z (Jack: "cut cushion to 2c on dead books only, 5c on
+# live books" -- by 19:06Z 264 of 571 listed markets were stood down at 10c,
+# the books' references pulled within 10c of their last trades)
+PVD_CUSHION_DEAD = _env_int("IMM_PVD_CUSHION_DEAD", 2)
+PVD_CUSHION_LIVE = _env_int("IMM_PVD_CUSHION_LIVE", 5)
 PVD_LAST: Dict[str, float] = {}
 
 
 def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
-    """(bid_max, ask_min) in force: the listed limits, tightened to
-    PVD_CUSHION either side of the market's last trade when there is one."""
+    """(bid_max, ask_min) in force: the listed limits, tightened to the
+    entry's cushion (its kind's PVD_CUSHION_DEAD / _LIVE) either side of the
+    market's last trade when there is one."""
     bmax, amin = int(entry["bid_max"]), int(entry["ask_min"])
+    c = entry.get("cushion")
+    if c is None:
+        c = PVD_CUSHION_LIVE if entry.get("kind") == "live" else PVD_CUSHION_DEAD
     if last is not None and last > 0:
-        bmax = min(bmax, math.floor(last - PVD_CUSHION))
-        amin = max(amin, math.ceil(last + PVD_CUSHION))
+        bmax = min(bmax, math.floor(last - c))
+        amin = max(amin, math.ceil(last + c))
     return bmax, amin
 
 
@@ -9733,7 +9750,7 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     """A post-vote dead book's side guard: no pads; nothing outside
     PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
     bid_max, an ask only at or over ask_min (YES cents), each tightened to
-    PVD_CUSHION off the last trade (pvd_limits)."""
+    the entry's cushion off the last trade (pvd_limits)."""
     bmax, amin = pvd_limits(entry, last)
     return [q for q in quotes if not q.is_pad
             and PVD_PRICE_MIN <= q.price_cents <= PVD_PRICE_MAX and (
