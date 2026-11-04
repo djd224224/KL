@@ -9578,6 +9578,122 @@ for _s in ENS_SERIES:
         blackout_et=("00:00", ENS_START.astimezone(ET).strftime("%H:%M")))
 FORCE_EVENTS = FORCE_EVENTS | ENS_EVENTS
 
+# POST-VOTE DEAD BOOKS (Jack 2026-11-04: "a whole wave of election markets
+# were posted last night with incentives, there will be realtime pickoff risk
+# but check for any thin ones that can be quoted" -> "40 contracts a side, not
+# 120" -> "just look at current books. there are a lot of 'dead' books, with
+# wide gaps like KXATTYGENOH-26, KXOHTREASR-26NOV03, etc" -> "just deploy it
+# when ready"). Kalshi lit ~5,300 election-result programs at 05:40Z 11/04
+# (margin, vote-share, county, ballot-measure bands; ~$450k/day, to 11/05
+# 10:00Z), all past the family's voting-day cutoff. Many books are dead: a
+# race called or nearly so, the touch 30c+ wide, stale walls left on each
+# side. The markets listed in PVD_FILE (in STATUS_DIR, hot-loaded by mtime at
+# import and every universe refresh), one entry per MARKET:
+#   {"stop": ISO, "markets": {TICKER: {"bid_max": c, "ask_min": c,
+#                                      "stop": ISO (optional), ...}}}
+#   * THE WINDOW: the entry's stop (else the file's) replaces the
+#     voting-day cutoff -- per market, so the event's other bands stay out.
+#   * FORCED (FORCE_EVENTS): past the payout and rate floors, the hopeless
+#     exit and the admission wait; the list was scored at this size.
+#   * THE LADDER: one rung of PVD_SIZE a side at the reference; no family,
+#     hour, Saturday, size-test or per-market boost and no side lean; no
+#     pads; per-market cap PVD_MAX_POSITION.
+#   * THE SIDE GUARD (pvd_guard_quotes, last): a bid rests only at or under
+#     the entry's bid_max, an ask only at or over its ask_min. The listing
+#     sets them from the last trade -- 20c clear of it, or at 1-2c / 98-99c,
+#     where a fill costs at most 2c -- so a side the book pulls past its limit
+#     stands down instead of chasing toward the fair.
+#   * Toxic halts, the sweep breaker, the WS fast cancel and the manual
+#     standoff all stay on.
+# IMM_PVD=0 turns it off (env => task-level restart); emptying the file
+# (or a past stop) ends it at the next refresh.
+PVD_ENABLE = os.environ.get("IMM_PVD", "1") == "1"
+PVD_FILE = "post_vote_dead_books.json"      # in STATUS_DIR
+PVD_SIZE = _env_int("IMM_PVD_SIZE", 40)
+PVD_MAX_POSITION = _env_float("IMM_PVD_MAX_POSITION", 40)
+PVD_MARKETS: Dict[str, dict] = {}
+_pvd_state = {"mtime": 0.0, "forced": frozenset()}
+
+
+def pvd_path() -> str:
+    return os.path.join(STATUS_DIR, PVD_FILE)
+
+
+def pvd_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]:
+    """The market's post-vote dead-book entry while its stop is ahead, else
+    None (and always None under IMM_PVD=0)."""
+    if not PVD_ENABLE or not ticker:
+        return None
+    e = PVD_MARKETS.get(ticker)
+    if e is None:
+        return None
+    now_utc = now_utc or datetime.now(timezone.utc)
+    return e if now_utc < e["stop"] else None
+
+
+def load_pvd_markets() -> int:
+    """(Re)load PVD_FILE when its mtime moves; rebinds FORCE_EVENTS to carry
+    the listed markets' events. Returns the number of markets changed."""
+    global FORCE_EVENTS
+    if not PVD_ENABLE:
+        return 0
+    try:
+        mtime = os.path.getmtime(pvd_path())
+    except OSError:
+        mtime = -1.0                      # no file: nothing listed
+    if mtime == _pvd_state["mtime"]:
+        return 0
+    _pvd_state["mtime"] = mtime
+    data: dict = {}
+    if mtime >= 0:
+        try:
+            with open(pvd_path(), encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except (OSError, ValueError) as e:
+            log(f"[IMM] ! post-vote dead-book file unreadable: {e}")
+            return 0
+    default_stop = parse_iso_utc(str(data.get("stop") or ""))
+    fresh: Dict[str, dict] = {}
+    for t, raw in (data.get("markets") or {}).items():
+        t = str(t).strip()
+        if not isinstance(raw, dict) or "-" not in t:
+            continue
+        stop = parse_iso_utc(str(raw.get("stop") or "")) or default_stop
+        try:
+            bid_max = int(raw["bid_max"])
+            ask_min = int(raw["ask_min"])
+        except (KeyError, TypeError, ValueError):
+            log(f"[IMM] ! post-vote dead book {t}: no bid_max/ask_min -- skipped")
+            continue
+        if stop is None or series_of(t) in ENS_SERIES:
+            continue
+        fresh[t] = {"stop": stop, "bid_max": bid_max, "ask_min": ask_min,
+                    "event": raw.get("event") or t.rsplit("-", 1)[0]}
+    changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
+        1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
+    PVD_MARKETS.clear()
+    PVD_MARKETS.update(fresh)
+    events = frozenset(e["event"] for e in fresh.values())
+    base = FORCE_EVENTS - _pvd_state["forced"]
+    added = events - base
+    FORCE_EVENTS = base | added
+    _pvd_state["forced"] = added
+    if changed:
+        stops = sorted({e["stop"] for e in fresh.values()})
+        log(f"[IMM] post-vote dead books: {len(fresh)} market(s) in "
+            f"{len(events)} event(s) listed ({changed} changed), "
+            f"{PVD_SIZE} a side, cap {PVD_MAX_POSITION:g}"
+            + (f", stop {stops[0].isoformat()}" if stops else ""))
+    return changed
+
+
+def pvd_guard_quotes(quotes: List["Quote"], entry: dict) -> List["Quote"]:
+    """A post-vote dead book's side guard: no pads; a bid rests only at or
+    under bid_max, an ask only at or over ask_min (YES cents)."""
+    return [q for q in quotes if not q.is_pad and (
+        q.price_cents <= entry["bid_max"] if q.book_side == "bid"
+        else q.price_cents >= entry["ask_min"])]
+
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
 # global ladder and caps. Every member clones it (FAMILY_OVERRIDE_PARENTS).
@@ -13140,6 +13256,7 @@ def save_family_verdicts() -> None:
 load_family_verdicts()
 load_sat_gate()          # Saturday step-up verdict (defined next to saturday_size_mult)
 load_election_extra_series()   # Elections-category members (beside election_series)
+load_pvd_markets()             # post-vote dead books (PVD_FILE)
 load_nfl_auto_series()         # NFL auto families (beside the election file)
 load_league_auto_series()      # NBA / WNBA / MLB auto families (ditto)
 load_awards_extra_series()     # awards by Kalshi tag (beside the election file)
@@ -20353,6 +20470,11 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         # an election night session ends at ENS_END, in place of whatever
         # came in (its start is the series' blackout_et)
         cutoff = ENS_END
+    # ...and a post-vote dead book at its listed stop, per MARKET (the event's
+    # other bands keep the voting-day cutoff)
+    _pvd = PVD_MARKETS.get((market or {}).get("ticker") or "") if PVD_ENABLE else None
+    if _pvd is not None:
+        cutoff = _pvd["stop"]
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
@@ -23761,6 +23883,7 @@ class IncentiveMarketMaker:
         self._lol_decided: Set[str] = set()
         self._lol_last_live: Dict[str, float] = {}
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
+        self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
         self._join_ahead_state: Dict[Tuple[str, str], int] = {}
@@ -29420,6 +29543,7 @@ class IncentiveMarketMaker:
         load_astest_picks(now_utc)    # the AS test's daily picks (2026-10-27)
         load_finecon_extra_series()
         load_election_extra_series()
+        load_pvd_markets()            # post-vote dead books (2026-11-04)
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
         load_league_auto_series()     # NBA / WNBA / MLB auto families (2026-10-15)
         load_awards_extra_series()    # awards by Kalshi tag (2026-10-12)
@@ -35456,6 +35580,13 @@ class IncentiveMarketMaker:
             # ...and the yield size mode (2026-10-05): _market_size_mult
             lv = scale_levels(lv, self._market_size_mult(t))
             hm = hour_size_mult(meta.series, now_utc)
+            # a POST-VOTE DEAD BOOK (PVD_FILE): one flat PVD_SIZE rung a side --
+            # no family, hour, size-test or per-market boost (Jack 2026-11-04:
+            # "40 contracts a side, not 120")
+            pvd = pvd_entry(t, now_utc)
+            if pvd is not None:
+                lv = [(0, PVD_SIZE)]
+                hm = 1.0
             # Carbon Arc late-month rule (Jack 2026-09-24, ca_late_month_mults):
             # from here the ladder is PER SIDE -- no bid rungs and asks at
             # 50% inside the window, the plain ladder on both sides otherwise.
@@ -35498,6 +35629,9 @@ class IncentiveMarketMaker:
             # (nor from LEAD_STOP_BEFORE_H before its decision: LEAD STOP)
             if lead_src is not None and lead_stop_due(meta, now_ts):
                 self._lead_stop_note(t, lead_src, meta)
+                lead_src = None
+            # (nor on a post-vote dead book: its one rung rests at the reference)
+            if pvd is not None:
                 lead_src = None
             if (lead_src is not None and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None
@@ -35590,6 +35724,11 @@ class IncentiveMarketMaker:
                         lv_bid = []
                     if lr_ask:
                         lv_ask = []
+            # a post-vote dead book's rung is the same on both sides (no family
+            # lean or long-shot cut); a side a guard above emptied stays dark
+            if pvd is not None:
+                lv_bid = list(lv) if lv_bid else []
+                lv_ask = list(lv) if lv_ask else []
             side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
@@ -35618,6 +35757,8 @@ class IncentiveMarketMaker:
             # the clamp below makes each side's bound too; a locked strike's:
             # RT_LOCKED_SIDE)
             maxpos = max(vercel_boost_cap(maxpos, vb_step), rt_lock_n)
+            if pvd is not None:
+                maxpos = PVD_MAX_POSITION      # a post-vote dead book's cap
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             # (MANUAL_COEXIST_EVENTS too: the user's positions there are his;
@@ -35666,6 +35807,11 @@ class IncentiveMarketMaker:
                     if lead_a is None:
                         pos_room_sell = side_cut_room(meta.series, _base - _xs,
                                                       _base + _xs)[1]
+            if pvd is not None:
+                # ...and never more than PVD_SIZE resting a side, the unwind
+                # of an older position included
+                side_max_bid = min(side_max_bid, PVD_SIZE)
+                side_max_ask = min(side_max_ask, PVD_SIZE)
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
@@ -35908,6 +36054,20 @@ class IncentiveMarketMaker:
                               if (lv_bid and "bid" not in _has) else 0),
                     ask_size=(int(min(side_max_ask, room_sell))
                               if (lv_ask and "ask" not in _has) else 0)))
+            # post-vote dead-book side guard: LAST with the fair gates -- no
+            # pads, no bid over bid_max, no ask under ask_min (pvd_guard_quotes)
+            if pvd is not None:
+                _pv_before = {q.book_side for q in mq if not q.is_pad}
+                mq = pvd_guard_quotes(mq, pvd)
+                _pv_out = _pv_before - {q.book_side for q in mq}
+                if _pv_out != self._pvd_out.get(t, set()):
+                    if _pv_out:
+                        log(f"{self.tag} pvd guard {t}: {'/'.join(sorted(_pv_out))} "
+                            f"out (limits bid<={pvd['bid_max']} ask>={pvd['ask_min']}, "
+                            f"book {ext_bid}x{ext_ask})")
+                    else:
+                        log(f"{self.tag} pvd guard {t}: clear")
+                    self._pvd_out[t] = _pv_out
             # mortgage gate: LAST, after pads and the sub-penny snap, so
             # nothing rests within MORT_FAIR_TOL_CENTS of the fair
             if mort_caps is not None:
@@ -37009,6 +37169,10 @@ class IncentiveMarketMaker:
                 else:
                     side_cap = max(side_cap, _fc)
                 max_level_size = max(max_level_size, _fc)
+            # a POST-VOTE DEAD BOOK rests PVD_SIZE a side, never more (the
+            # quote loop sized it so, whatever the series ladder reads)
+            if pvd_entry(q.ticker) is not None:
+                side_cap = max_level_size = float(PVD_SIZE)
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)

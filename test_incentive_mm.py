@@ -250,6 +250,11 @@ def setUpModule():
     # and its mtime map (no live file yet).
     imm.ELECTION_EXTRA_SERIES.clear()
     imm._election_extra_state["mtime"] = 0.0
+    # ...and the post-vote dead books (post_vote_dead_books.json, 2026-11-04):
+    # the import read the trading box's list and forced its events
+    imm.FORCE_EVENTS = imm.FORCE_EVENTS - imm._pvd_state["forced"]
+    imm._pvd_state.update(mtime=0.0, forced=frozenset())
+    imm.PVD_MARKETS.clear()
     imm.ELECTION_DATES_EXTRA[:] = []
     imm.AWARDS_DATES_EXTRA[:] = []
     imm._rows_extra_state.clear()
@@ -39615,3 +39620,104 @@ class TestElectionNightSession(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPostVoteDeadBooks(unittest.TestCase):
+    """Jack 2026-11-04: the post-vote election wave's dead books ("a lot of
+    'dead' books, with wide gaps like KXATTYGENOH-26, KXOHTREASR-26NOV03"),
+    "40 contracts a side, not 120", "just deploy it when ready"."""
+    T, T2 = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
+
+    def _write(self, markets, stop=None):
+        stop = stop or (datetime.now(timezone.utc) + timedelta(hours=6))
+        with open(imm.pvd_path(), "w", encoding="utf-8") as f:
+            json.dump({"stop": stop.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "markets": markets}, f)
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+
+    def tearDown(self):
+        try:
+            os.remove(imm.pvd_path())
+        except FileNotFoundError:
+            pass
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+        _clean_persist()
+
+    def test_load_force_and_unload(self):
+        base = imm.FORCE_EVENTS
+        self._write({self.T: {"bid_max": 30, "ask_min": 70},
+                     "KXSENATESEATSD-27-53": {"bid_max": 30, "ask_min": 70},   # ENS: never
+                     "KXGOOD-99DEC31-C": {"ask_min": 70}})                    # no limits: skipped
+        self.assertEqual(set(imm.PVD_MARKETS), {self.T})
+        self.assertIn("KXGOOD-99DEC31", imm.FORCE_EVENTS)
+        self.assertIsNotNone(imm.pvd_entry(self.T))
+        self.assertIsNone(imm.pvd_entry(self.T2))
+        # a past stop: listed, but no entry (the cutoff ends it)
+        self._write({self.T: {"bid_max": 30, "ask_min": 70}},
+                    stop=datetime.now(timezone.utc) - timedelta(minutes=1))
+        self.assertIsNone(imm.pvd_entry(self.T))
+        # the file gone: nothing listed, the force set back as it was
+        os.remove(imm.pvd_path())
+        imm.load_pvd_markets()
+        self.assertEqual(imm.PVD_MARKETS, {})
+        self.assertEqual(imm.FORCE_EVENTS, base)
+        with mock.patch.object(imm, "PVD_ENABLE", False):
+            self._write({self.T: {"bid_max": 30, "ask_min": 70}})
+            self.assertIsNone(imm.pvd_entry(self.T))
+
+    def test_cutoff_is_per_market(self):
+        stop = datetime(2099, 11, 5, 10, 0, tzinfo=timezone.utc)
+        self._write({self.T: {"bid_max": 30, "ask_min": 70}}, stop=stop)
+        past = datetime(2026, 11, 3, 5, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGOOD", "KXGOOD-99DEC31", past, market={"ticker": self.T}), stop)
+        # the event's other band keeps its own cutoff
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXGOOD", "KXGOOD-99DEC31", past, market={"ticker": self.T2}), past)
+
+    def test_side_guard(self):
+        Q = imm.Quote
+        e = {"bid_max": 30, "ask_min": 70}
+        qs = [Q(self.T, "bid", 30, 40), Q(self.T, "bid", 31, 40),
+              Q(self.T, "ask", 70, 40), Q(self.T, "ask", 69, 40),
+              Q(self.T, "bid", 1, 900, is_pad=True), Q(self.T, "ask", 99, 900, is_pad=True)]
+        self.assertEqual([(q.book_side, q.price_cents) for q in imm.pvd_guard_quotes(qs, e)],
+                         [("bid", 30), ("ask", 70)])
+
+    def test_dry_cycle_rests_40_a_side_at_the_reference(self):
+        """KXGOOD's book is 49 x 51: listed with limits around it, the bot
+        rests one 40-lot a side at the reference -- no pads, no multiplier --
+        and a side its limit excludes stands down."""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "hour_size_mult", lambda s, n: 3.0), \
+                mock.patch.object(imm, "applied_mention_mult", lambda s: 2.0):
+            bot.run_cycle()
+            orders = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+            self.assertEqual(sorted((o["book_side"], o["remaining_count"]) for o in orders),
+                             [("ask", 40.0), ("bid", 40.0)])
+            self.assertTrue(all(imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS
+                                for o in orders))
+            # the ask limit moves past the book's ask: the ask side stands down
+            self._write({self.T: {"bid_max": 49, "ask_min": 60}})
+            for oid in bot.state.sim_orders:
+                bot.state.order_ages[oid] -= imm.ORDER_REFRESH_SECS + 60
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            sides = {o["book_side"] for o in bot.state.sim_orders.values()
+                     if o["ticker"] == self.T}
+            self.assertEqual(sides, {"bid"})
+
+    def test_cap_40_stops_the_adding_side(self):
+        """long 40 (one full bid fill): the bid stands down at the 40 cap, the
+        ask keeps its 40"""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 40.0, 49.0
+        bot.client.positions[self.T] = 40.0
+        bot.run_cycle()
+        orders = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        self.assertEqual([(o["book_side"], o["remaining_count"]) for o in orders],
+                         [("ask", 40.0)])
