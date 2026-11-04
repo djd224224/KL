@@ -39721,3 +39721,25 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         orders = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
         self.assertEqual([(o["book_side"], o["remaining_count"]) for o in orders],
                          [("ask", 40.0)])
+
+    def test_a_market_s_own_size(self):
+        """Jack 2026-11-04: "1.5x multiplier on the 95 markets under $1": a
+        listed "size" rests that many a side, the cap scaling with it"""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 60}})
+        e = imm.pvd_entry(self.T)
+        self.assertEqual((e["size"], e["max_pos"]), (60, 60.0))
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        orders = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        self.assertEqual(sorted((o["book_side"], o["remaining_count"]) for o in orders),
+                         [("ask", 60.0), ("bid", 60.0)])
+        # long 60: the bid stands down at its 60 cap
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot2.pnl.pos[self.T], bot2.pnl.avg[self.T] = 60.0, 49.0
+        bot2.client.positions[self.T] = 60.0
+        bot2.run_cycle()
+        self.assertEqual([(o["book_side"], o["remaining_count"]) for o in bot2.state.sim_orders.values()
+                          if o["ticker"] == self.T], [("ask", 60.0)])
+        # no size: the default 40
+        self._write({self.T: {"bid_max": 49, "ask_min": 51}})
+        self.assertEqual(imm.pvd_entry(self.T)["size"], imm.PVD_SIZE)

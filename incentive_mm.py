@@ -9667,7 +9667,18 @@ def load_pvd_markets() -> int:
             continue
         if stop is None or series_of(t) in ENS_SERIES:
             continue
+        # a market's own size (Jack 2026-11-04: "1.5x multiplier on the 95
+        # markets under $1" -> "size": 60); its cap scales with it
+        try:
+            size = max(1, int(raw.get("size") or PVD_SIZE))
+        except (TypeError, ValueError):
+            size = PVD_SIZE
+        try:
+            max_pos = float(raw.get("max_position") or PVD_MAX_POSITION * size / PVD_SIZE)
+        except (TypeError, ValueError):
+            max_pos = PVD_MAX_POSITION * size / PVD_SIZE
         fresh[t] = {"stop": stop, "bid_max": bid_max, "ask_min": ask_min,
+                    "size": size, "max_pos": max_pos,
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -9680,9 +9691,13 @@ def load_pvd_markets() -> int:
     _pvd_state["forced"] = added
     if changed:
         stops = sorted({e["stop"] for e in fresh.values()})
+        sizes = sorted({e["size"] for e in fresh.values()})
+        by_size = ", ".join(f"{sum(1 for e in fresh.values() if e['size'] == s)} at {s}"
+                            for s in sizes)
         log(f"[IMM] post-vote dead books: {len(fresh)} market(s) in "
             f"{len(events)} event(s) listed ({changed} changed), "
-            f"{PVD_SIZE} a side, cap {PVD_MAX_POSITION:g}"
+            f"a side: {by_size or '-'} (cap = size, default {PVD_SIZE} / "
+            f"{PVD_MAX_POSITION:g})"
             + (f", stop {stops[0].isoformat()}" if stops else ""))
     return changed
 
@@ -35585,7 +35600,7 @@ class IncentiveMarketMaker:
             # "40 contracts a side, not 120")
             pvd = pvd_entry(t, now_utc)
             if pvd is not None:
-                lv = [(0, PVD_SIZE)]
+                lv = [(0, pvd["size"])]
                 hm = 1.0
             # Carbon Arc late-month rule (Jack 2026-09-24, ca_late_month_mults):
             # from here the ladder is PER SIDE -- no bid rungs and asks at
@@ -35758,7 +35773,7 @@ class IncentiveMarketMaker:
             # RT_LOCKED_SIDE)
             maxpos = max(vercel_boost_cap(maxpos, vb_step), rt_lock_n)
             if pvd is not None:
-                maxpos = PVD_MAX_POSITION      # a post-vote dead book's cap
+                maxpos = pvd["max_pos"]       # a post-vote dead book's cap
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
             # (MANUAL_COEXIST_EVENTS too: the user's positions there are his;
@@ -35810,8 +35825,8 @@ class IncentiveMarketMaker:
             if pvd is not None:
                 # ...and never more than PVD_SIZE resting a side, the unwind
                 # of an older position included
-                side_max_bid = min(side_max_bid, PVD_SIZE)
-                side_max_ask = min(side_max_ask, PVD_SIZE)
+                side_max_bid = min(side_max_bid, pvd["size"])
+                side_max_ask = min(side_max_ask, pvd["size"])
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
@@ -37171,8 +37186,9 @@ class IncentiveMarketMaker:
                 max_level_size = max(max_level_size, _fc)
             # a POST-VOTE DEAD BOOK rests PVD_SIZE a side, never more (the
             # quote loop sized it so, whatever the series ladder reads)
-            if pvd_entry(q.ticker) is not None:
-                side_cap = max_level_size = float(PVD_SIZE)
+            _pvq = pvd_entry(q.ticker)
+            if _pvq is not None:
+                side_cap = max_level_size = float(_pvq["size"])
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
