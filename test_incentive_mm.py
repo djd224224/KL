@@ -39864,3 +39864,23 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         bot2.client.positions[self.T] = -120.0
         bot2.run_cycle()
         self.assertEqual([o["book_side"] for o in bot2.state.sim_orders.values() if o["ticker"] == self.T], ["bid"])
+
+    def test_decided_side_no_cushion_2_to_99(self):
+        """Jack 2026-11-04: "for decided side, can go up to 99c and no cushion"
+        (and "dont quote 1c"): a winner's bid / a loser's ask rests anywhere in
+        2-99c; the other side keeps its guard"""
+        Q = imm.Quote
+        self.assertEqual((imm.pvd_decided_side(95.0), imm.pvd_decided_side(4.0), imm.pvd_decided_side(50.0)),
+                         ("bid", "ask", None))
+        e = {"bid_max": 0, "ask_min": 0, "cushion": 2}
+        # winner, last 97: bids at 98 / 99 rest (no cushion, past 97); the ask at 99 does not
+        qs = [Q(self.T, "bid", 99, 200), Q(self.T, "bid", 98, 200), Q(self.T, "ask", 99, 120)]
+        self.assertEqual([(q.book_side, q.price_cents) for q in imm.pvd_guard_quotes(qs, e, 97.0)],
+                         [("bid", 99), ("bid", 98)])
+        # loser, last 3: the ask at 2 rests, at 1 never; the bid keeps its cushion (<= 1) and band
+        qs = [Q(self.T, "ask", 2, 200), Q(self.T, "ask", 1, 200), Q(self.T, "bid", 2, 40)]
+        self.assertEqual([(q.book_side, q.price_cents) for q in imm.pvd_guard_quotes(qs, e, 3.0)],
+                         [("ask", 2)])
+        # undecided, last 50: the normal guard on both sides
+        qs = [Q(self.T, "bid", 49, 40), Q(self.T, "ask", 51, 40)]
+        self.assertEqual(imm.pvd_guard_quotes(qs, e, 50.0), [])

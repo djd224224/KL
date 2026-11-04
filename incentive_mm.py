@@ -9767,6 +9767,30 @@ def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
     return int(entry["bid_max"]), int(entry["ask_min"])
 
 
+# DECIDED SIDE (Jack 2026-11-04: "for decided side, can go up to 99c and no
+# cushion"): a market whose last trade is PVD_DECIDED_HI or over (a winner)
+# rests its BID -- or PVD_DECIDED_LO or under (a loser), its ASK -- with no
+# cushion off the last trade, anywhere in PVD_DECIDED_MIN..PVD_DECIDED_MAX
+# (2-99c: "dont quote 1c"). The other side keeps its limits and band; the
+# price is still the book's reference.
+PVD_DECIDED_HI = _env_int("IMM_PVD_DECIDED_HI", 90)
+PVD_DECIDED_LO = _env_int("IMM_PVD_DECIDED_LO", 10)
+PVD_DECIDED_MIN = _env_int("IMM_PVD_DECIDED_MIN", 2)
+PVD_DECIDED_MAX = _env_int("IMM_PVD_DECIDED_MAX", 99)
+
+
+def pvd_decided_side(last: Optional[float]) -> Optional[str]:
+    """'bid' for a decided winner (last >= PVD_DECIDED_HI), 'ask' for a
+    decided loser (last <= PVD_DECIDED_LO), else None."""
+    if last is None or last <= 0:
+        return None
+    if last >= PVD_DECIDED_HI:
+        return "bid"
+    if last <= PVD_DECIDED_LO:
+        return "ask"
+    return None
+
+
 def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
                      last: Optional[float] = None,
                      close_side: Optional[str] = None,
@@ -9782,9 +9806,17 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     position (`close_qty`), so a fill can only flatten it, never flip it."""
     bmax, amin = pvd_limits(entry, last)
     lo, hi = entry.get("pmin", PVD_PRICE_MIN), entry.get("pmax", PVD_PRICE_MAX)
+    decided = pvd_decided_side(last)
     out: List["Quote"] = []
     for q in quotes:
-        if q.is_pad or not (lo <= q.price_cents <= hi):
+        if q.is_pad:
+            continue
+        if q.book_side == decided:
+            # the decided side: the 2-99c band alone (no cushion)
+            if PVD_DECIDED_MIN <= q.price_cents <= PVD_DECIDED_MAX:
+                out.append(q)
+            continue
+        if not (lo <= q.price_cents <= hi):
             continue
         inside = (q.price_cents <= bmax if q.book_side == "bid"
                   else q.price_cents >= amin)
@@ -27854,8 +27886,11 @@ class IncentiveMarketMaker:
         bmax, amin = pvd_limits(pvd, PVD_LAST.get(t))
 
         lo, hi = pvd.get("pmin", PVD_PRICE_MIN), pvd.get("pmax", PVD_PRICE_MAX)
+        decided = pvd_decided_side(PVD_LAST.get(t))
 
         def ok(side: str, px: Optional[int]) -> bool:
+            if px is not None and side == decided:
+                return PVD_DECIDED_MIN <= px <= PVD_DECIDED_MAX
             if px is None or not (lo <= px <= hi):
                 return False
             if side == close_side:
