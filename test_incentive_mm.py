@@ -39752,3 +39752,24 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         # no size: the default 40
         self._write({self.T: {"bid_max": 49, "ask_min": 51}})
         self.assertEqual(imm.pvd_entry(self.T)["size"], imm.PVD_SIZE)
+
+    def test_limits_follow_the_last_trade(self):
+        """14:45Z 11/04: a bid listed under a 99c last trade sat at 31c over a 27c
+        one -- the guard now tightens to 20c off the latest last trade, never
+        loosening past the listed limits"""
+        e = {"bid_max": 79, "ask_min": 98}
+        self.assertEqual(imm.pvd_limits(e, None), (79, 98))
+        self.assertEqual(imm.pvd_limits(e, 27.0), (7, 98))
+        self.assertEqual(imm.pvd_limits({"bid_max": 2, "ask_min": 20}, 94.0), (2, 114))
+        self.assertEqual(imm.pvd_limits({"bid_max": 30, "ask_min": 70}, 50.0), (30, 70))   # never loosened
+        Q = imm.Quote
+        self.assertEqual(imm.pvd_guard_quotes([Q(self.T, "bid", 31, 40)], e, 27.0), [])
+        # end to end: KXGOOD 49 x 51, last trade 75c -> the ask (51 < 95) stands down
+        self._write({self.T: {"bid_max": 60, "ask_min": 51}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.client.markets[self.T]["last_price_dollars"] = "0.7500"
+        bot.run_cycle()
+        self.assertEqual(imm.PVD_LAST.get(self.T), 75.0)
+        self.assertEqual([(o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T], [("bid", 49)])
+        imm.PVD_LAST.clear()

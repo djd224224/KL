@@ -9707,16 +9707,37 @@ def load_pvd_markets() -> int:
 # stands down, it does not move inward
 PVD_PRICE_MIN = _env_int("IMM_PVD_PRICE_MIN", 3)
 PVD_PRICE_MAX = _env_int("IMM_PVD_PRICE_MAX", 97)
+# ...and the limits follow the market (2026-11-04 14:45Z: limits fixed at
+# listing left GOVPARTYMA-26MMIN-36's bid at 31c over a 27c last trade, and
+# HOUSENC1-26LBUC-40's ask at 93c under a 94c one): each universe refresh
+# reads every listed market's last trade (PVD_LAST) and the guard holds a bid
+# PVD_CUSHION under it and an ask PVD_CUSHION over it -- tighten only, never
+# past the listed bid_max / ask_min
+PVD_CUSHION = _env_int("IMM_PVD_CUSHION", 20)
+PVD_LAST: Dict[str, float] = {}
 
 
-def pvd_guard_quotes(quotes: List["Quote"], entry: dict) -> List["Quote"]:
+def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
+    """(bid_max, ask_min) in force: the listed limits, tightened to
+    PVD_CUSHION either side of the market's last trade when there is one."""
+    bmax, amin = int(entry["bid_max"]), int(entry["ask_min"])
+    if last is not None and last > 0:
+        bmax = min(bmax, math.floor(last - PVD_CUSHION))
+        amin = max(amin, math.ceil(last + PVD_CUSHION))
+    return bmax, amin
+
+
+def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
+                     last: Optional[float] = None) -> List["Quote"]:
     """A post-vote dead book's side guard: no pads; nothing outside
     PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
-    bid_max, an ask only at or over ask_min (YES cents)."""
+    bid_max, an ask only at or over ask_min (YES cents), each tightened to
+    PVD_CUSHION off the last trade (pvd_limits)."""
+    bmax, amin = pvd_limits(entry, last)
     return [q for q in quotes if not q.is_pad
             and PVD_PRICE_MIN <= q.price_cents <= PVD_PRICE_MAX and (
-                q.price_cents <= entry["bid_max"] if q.book_side == "bid"
-                else q.price_cents >= entry["ask_min"])]
+                q.price_cents <= bmax if q.book_side == "bid"
+                else q.price_cents >= amin)]
 
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
 # Pennsylvania quoted under -- safe-join, no fresh-candidate rate bar,
@@ -29941,6 +29962,11 @@ class IncentiveMarketMaker:
             cutoff = apply_series_cutoff_adjustments(series, event_ticker, cutoff,
                                                      close_time=close_time,
                                                      market=m)
+            if PVD_ENABLE and t in PVD_MARKETS:
+                # a post-vote dead book's guard follows its last trade (PVD_LAST)
+                _lp = dollars_to_cents(m.get("last_price_dollars"))
+                if _lp:
+                    PVD_LAST[t] = float(_lp)
             if t in scan_pre_set:
                 # open-scan month-named events (Fiscal.ai KPI class): out at
                 # 00:00 ET on the first of the report month, unless Kalshi's
@@ -36082,12 +36108,14 @@ class IncentiveMarketMaker:
             # pads, no bid over bid_max, no ask under ask_min (pvd_guard_quotes)
             if pvd is not None:
                 _pv_before = {q.book_side for q in mq if not q.is_pad}
-                mq = pvd_guard_quotes(mq, pvd)
+                _pv_last = PVD_LAST.get(t)
+                mq = pvd_guard_quotes(mq, pvd, _pv_last)
                 _pv_out = _pv_before - {q.book_side for q in mq}
                 if _pv_out != self._pvd_out.get(t, set()):
                     if _pv_out:
+                        _pb, _pa = pvd_limits(pvd, _pv_last)
                         log(f"{self.tag} pvd guard {t}: {'/'.join(sorted(_pv_out))} "
-                            f"out (limits bid<={pvd['bid_max']} ask>={pvd['ask_min']}, "
+                            f"out (limits bid<={_pb} ask>={_pa}, last {_pv_last}, "
                             f"book {ext_bid}x{ext_ask})")
                     else:
                         log(f"{self.tag} pvd guard {t}: clear")
