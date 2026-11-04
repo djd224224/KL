@@ -39455,14 +39455,16 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
         self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
         lv = imm.hour_scaled_levels(self.S, now)
-        self.assertEqual(lv, [(0, 30), (3, 30), (6, 30)])     # "increase to 30"
+        self.assertEqual(lv, [(0, 30), (3, 30), (6, 30), (9, 30)])   # "increase to 30", "add a 4th rung"
         self.assertEqual(imm.series_max_position(self.S, now), 150)
+        # rungs re-pin to the anchor on any move, toward the touch too
+        self.assertEqual(imm.series_atref_price_tol(self.S), 0)
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
-            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 90, levels=lv, ref_px=60)
-            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 90, levels=lv, ref_px=70)
+            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 120, levels=lv, ref_px=60)
+            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 120, levels=lv, ref_px=70)
             # 3c apart from the anchor (ens_anchors puts it behind the touch)
-            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 30), (61, 30), (58, 30)])
-            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 30), (69, 30), (72, 30)])
+            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 30), (61, 30), (58, 30), (55, 30)])
+            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 30), (69, 30), (72, 30), (75, 30)])
             # every other series keeps its one at-ref rung
             self.assertEqual(len(imm.build_side_ladder(
                 "KXUST10AD-26NOV05-T4.1", "bid", 64, 66, 60, levels=[(0, 20)], ref_px=60)), 1)

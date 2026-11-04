@@ -9406,8 +9406,9 @@ FORCE_EVENTS = FORCE_EVENTS | frozenset(
 # ENS_END_ET only:
 #   * THE WINDOW: out before the start (blackout_et, cancelled and kept) and
 #     at the end (the cutoff, in place of the family's election-day cutoff).
-#   * THE LADDER: ENS_LEVELS (30 at its anchor, 3c and 6c behind; 20 until
-#     Jack's "increase to 30 contracts instead of 20", 2026-11-04) as an
+#   * THE LADDER: ENS_LEVELS (30 at its anchor, 3c, 6c and 9c behind; 20 a
+#     rung until Jack's "increase to 30 contracts instead of 20", three rungs
+#     until his "add a 4th rung", 2026-11-04) as an
 #     offsets ladder (not the at-ref rung), per-market cap ENS_MAX_POSITION;
 #     no family, hour or Saturday multiplier (x1). Skew and the event cap as
 #     usual.
@@ -9427,7 +9428,7 @@ ENS_START_ET = os.environ.get("IMM_ENS_START_ET", "2026-11-03 19:00")
 ENS_END_ET = os.environ.get("IMM_ENS_END_ET", "2026-11-04 00:00")
 ENS_START = ET.localize(datetime.strptime(ENS_START_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
 ENS_END = ET.localize(datetime.strptime(ENS_END_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
-ENS_LEVELS = _parse_levels(os.environ.get("IMM_ENS_LEVELS", "0:30,3:30,6:30"))
+ENS_LEVELS = _parse_levels(os.environ.get("IMM_ENS_LEVELS", "0:30,3:30,6:30,9:30"))
 # THE ANCHOR (Jack 2026-11-03: "dont sit at the touch, start at least 1 below
 # the touch" -> "start at least 1 below the touch, and must be below a rung
 # that has at least 50 contracts"): each side anchors 1c behind the best price
@@ -9482,10 +9483,13 @@ def ens_ticker(ticker: str) -> bool:
     return any(ticker == e or ticker.startswith(e + "-") for e in ENS_EVENTS)
 
 
+# atref_price_tol_ticks=0 (2026-11-04): the rungs follow the anchor BOTH ways
+# on every move -- the at-ref "never chase toward the touch" keep left 53's
+# asks at 83-89c after its ask fell to 71c (anchor 73c)
 for _s in ENS_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES[ELECTION_ARCHETYPE], size_mult=None,
-        levels=ENS_LEVELS, max_position=ENS_MAX_POSITION,
+        levels=ENS_LEVELS, max_position=ENS_MAX_POSITION, atref_price_tol_ticks=0,
         blackout_et=("00:00", ENS_START.astimezone(ET).strftime("%H:%M")))
 FORCE_EVENTS = FORCE_EVENTS | ENS_EVENTS
 
