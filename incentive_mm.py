@@ -11569,6 +11569,19 @@ def _et_clock(ts: float, day: bool = False) -> str:
 # then re-enters selection like any fresh candidate (admission wait
 # included), and every live trigger stays armed.
 EVENT_LIVE_CLEAR_FILE = os.path.join(STATUS_DIR, "event_live_clear.txt")
+# ONE-SHOT OWN-BOOK FLATTEN (Jack 2026-11-04, KXSENATESEATSD-27-55: "i
+# manually offset it. assume there's no exposure on 55"). The bot's book
+# (pnl.pos / pnl.avg, persisted in imm_state.json) is its own fills only, so
+# a position the user offsets BY HAND stays on it: the cap, the skew and the
+# no-loss close (ens_no_loss_quotes) keep acting on exposure the account no
+# longer has. Drop market tickers into this file, one per line (# comments
+# ok): the next cycle, after booking its fills, sets each one's own position
+# to 0 and drops its average, logs what it held, and renames the file to
+# .done. Its realized P&L is left as it was; the offsetting trade is the
+# user's. Meant for markets where his positions coexist with the bot's
+# (MANUAL_COEXIST_EVENTS, an election night session): elsewhere the account's
+# leftover position reads as manual and the market stands off, as it should.
+OWN_BOOK_FLATTEN_FILE = os.path.join(STATUS_DIR, "own_book_flatten.txt")
 
 # THE SNIPER'S BOOK IS NOT MANUAL (Jack 2026-10-04: "Build the sniper taker
 # bot separately"). nfl_snipe_bot.py, run on this account (its subaccount 0
@@ -33760,6 +33773,27 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! could not retire {EVENT_LIVE_CLEAR_FILE} ({e})")
         self._save_persist()
 
+    def _apply_own_book_flatten(self) -> None:
+        """Consume OWN_BOOK_FLATTEN_FILE (see its definition)."""
+        try:
+            with open(OWN_BOOK_FLATTEN_FILE, encoding="utf-8") as f:
+                tickers = [ln.split("#", 1)[0].strip() for ln in f]
+        except OSError as e:
+            log(f"{self.tag} ! {OWN_BOOK_FLATTEN_FILE} unreadable ({e})")
+            return
+        for t in (x for x in tickers if x):
+            pos, avg = self.pnl.pos.get(t, 0.0), self.pnl.avg.get(t)
+            self.pnl.pos[t] = 0.0
+            self.pnl.avg.pop(t, None)
+            self.state.prev_pos[t] = 0.0
+            log(f"{self.tag} own-book flatten: {t} {pos:+.0f}"
+                + (f" @ {avg:.1f}c" if avg else "") + " -> 0 (offset by hand)")
+        try:
+            os.replace(OWN_BOOK_FLATTEN_FILE, OWN_BOOK_FLATTEN_FILE + ".done")
+        except OSError as e:
+            log(f"{self.tag} ! could not retire {OWN_BOOK_FLATTEN_FILE} ({e})")
+        self._save_persist()
+
     def run_cycle(self, fast_only: bool = False) -> None:
         # fast_only = a FAST-LANE mini-cycle (see FAST_LANE_SECS): same managed
         # set, same resting read, but only fast-lane series are (re)quoted and
@@ -33819,6 +33853,8 @@ class IncentiveMarketMaker:
             except Exception as e:
                 log(f"{self.tag} ! unparseable fill skipped: {e}")
         self._join_prune(now_ts)
+        if os.path.exists(OWN_BOOK_FLATTEN_FILE):
+            self._apply_own_book_flatten()
         # lock the fills that opened a position, with resting maker legs on
         # the markets that price them (COMP_HEDGE_MODE / LOCK_MODE)
         self._comp_hedge_run(now_ts)

@@ -11194,3 +11194,6 @@ collect rewards", then "launch at 7pm".
 
 ## 2026-11-04 -- CABINET MARKETS AFTER THEIR VOTE (family watch research)
 Jack: "KXBRFINMIN-26OCT25, KXBRDEFMIN-26OCT25 should be autoquoting due to elections family". Research (11/04 00:51Z) had dated them and KXBRFORMIN to the 10/25 runoff per the 10/09 minister rule, so the election cutoff had already passed: dark. Rows re-dated by hand to 2027-01-05 @America/Sao_Paulo (inauguration, EC 111/2021; Senado radio + Jornal do Comercio), and the research prompt now says: a vote already held -> the day the new government is sworn in, never the past voting day; none known -> the contract deadline with --term-end.
+- 2026-11-04 01:50Z (Jack): "i manually offset it. assume there's no exposure on 55" -> OWN_BOOK_FLATTEN_FILE
+  (own_book_flatten.txt, one ticker a line): the next cycle zeroes the bot's own pos/avg there once and renames it .done;
+  realized kept. Used for KXSENATESEATSD-27-55 (bot -180 @ 58.6 at the cap; asks dark, bids held by the no-loss close).

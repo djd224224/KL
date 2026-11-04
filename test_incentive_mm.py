@@ -147,6 +147,7 @@ def setUpModule():
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
     imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
+    imm.OWN_BOOK_FLATTEN_FILE = os.path.join(tmp, "own_book_flatten.txt")
     # a live sniper book on this machine must not net into the fixtures
     imm.SNIPE_BOOK_FILE = os.path.join(tmp, "nfl-snipe", "snipe_book.json")
     imm.IncentiveMarketMaker.PERSIST_PATH = os.path.join(tmp, "imm_state.json")
@@ -39428,6 +39429,37 @@ class TestJoinWait1102(unittest.TestCase):
             bot.run_cycle()
         self.assertIn(("bid", 55, 4000), self._paris_rungs(bot, P))
         self.assertFalse(any("join wait" in s and "wants" in s for s in lines))
+
+
+class TestOwnBookFlatten(unittest.TestCase):
+    """Jack 2026-11-04: "i manually offset it. assume there's no exposure on 55"."""
+
+    def test_flatten_once_then_trade_fresh(self):
+        T = "KXSENATESEATSD-27-55"
+        mm = imm.IncentiveMarketMaker.__new__(imm.IncentiveMarketMaker)
+        mm.tag, mm.pnl, mm.state = "[t]", imm.PnlTracker(), imm.BotState()
+        mm._save_persist = lambda: None
+        mm.pnl.on_fill(T, "yes", "sell", 180, 58.6)
+        mm.pnl.on_fill("OTHER-1", "yes", "buy", 10, 40)
+        mm.state.prev_pos[T] = -180.0
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "own_book_flatten.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# offset by hand" + chr(10) + T + chr(10))
+            with mock.patch.object(imm, "OWN_BOOK_FLATTEN_FILE", path):
+                mm._apply_own_book_flatten()
+            self.assertFalse(os.path.exists(path))
+            self.assertTrue(os.path.exists(path + ".done"))
+        self.assertEqual(mm.pnl.pos[T], 0.0)
+        self.assertNotIn(T, mm.pnl.avg)
+        self.assertEqual(mm.state.prev_pos[T], 0.0)
+        self.assertEqual(mm.pnl.pos["OTHER-1"], 10)          # untouched
+        # the next fill opens fresh, at its own price
+        mm.pnl.on_fill(T, "yes", "sell", 36, 70)
+        self.assertEqual((mm.pnl.pos[T], mm.pnl.avg[T]), (-36, 70))
+        # the no-loss close then works off the fresh average, not 58.6
+        out = imm.ens_no_loss_quotes([imm.Quote(T, "bid", 66, 36)], mm.pnl.pos[T], mm.pnl.avg[T])
+        self.assertEqual([q.price_cents for q in out], [66])
 
 
 class TestElectionNightSession(unittest.TestCase):
