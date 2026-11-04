@@ -39460,6 +39460,7 @@ class TestElectionNightSession(unittest.TestCase):
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
             bid = imm.build_side_ladder(self.T, "bid", 64, 66, 60, levels=lv, ref_px=60)
             ask = imm.build_side_ladder(self.T, "ask", 66, 64, 60, levels=lv, ref_px=70)
+            # 3c apart from the anchor (ens_anchors puts it behind the touch)
             self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 20), (61, 20), (58, 20)])
             self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 20), (69, 20), (72, 20)])
             # every other series keeps its one at-ref rung
@@ -39475,6 +39476,9 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertFalse(imm.manual_coexist(self.S, "KXSENATESEATSD-29"))
         self.assertTrue(imm.ens_ticker(self.T))
         self.assertFalse(imm.ens_ticker("KXSENATESEATSD-29-53"))
+        # "dont quote 'at least 47'"
+        self.assertTrue(imm.IncentiveMarketMaker._blocked("KXSENATESEATSD-27-47"))
+        self.assertFalse(imm.IncentiveMarketMaker._blocked(self.T))
 
     def test_no_per_market_size_boost(self):
         """near-cliff / yield / floor boosts stay off: 1x base"""
@@ -39484,6 +39488,29 @@ class TestElectionNightSession(unittest.TestCase):
         with mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.5),                 mock.patch.object(mm, "_vercel_boost_mult", lambda t: 1.0, create=True),                 mock.patch.object(mm, "_yield_size_mult", lambda t: 1.0, create=True):
             self.assertEqual(mm._market_size_mult(self.T), 1.0)
             self.assertEqual(mm._market_size_mult("KXOTHER-26NOV05-T1"), 1.5)
+
+    def test_anchor_behind_a_50_lot_price(self):
+        """'start at least 1 below the touch, and must be below a rung that has
+        at least 50 contracts'"""
+        yes = [[58, 300], [60, 30], [62, 100], [63, 10]]     # touch 63 x 10
+        no = [[25, 500], [30, 80], [35, 20]]                # YES ask 65 x 20
+        self.assertEqual(imm.ens_anchors(yes, no), (61, 71))
+        # our own 60 at 62 leaves 40 there: behind the 300 at 58 instead
+        self.assertEqual(imm.ens_anchors(yes, no, [("bid", 62, 60.0)]), (57, 71))
+        # a 50 at the touch itself: still 1 behind it
+        self.assertEqual(imm.ens_anchors([[63, 50]], [[37, 50]]), (62, 64))
+        # no price with 50: that side rests nothing
+        self.assertEqual(imm.ens_anchors([[63, 49]], []), (None, None))
+
+    def test_flat_20_on_cheap_sides(self):
+        """Jack 2026-11-03 "Yes, all at 20": no long-shot cut, no family lean"""
+        now = datetime(2026, 11, 4, 1, 0, tzinfo=timezone.utc)
+        for mid in (10.0, 50.0, 90.0):
+            self.assertEqual(imm.longshot_side_mults(self.S, mid), (1.0, 1.0))
+            self.assertEqual(imm.side_size_mults(self.T, now, mid), (1.0, 1.0))
+        with mock.patch.object(imm, "series_family", lambda s: "Elections"):
+            self.assertEqual(imm.longshot_side_mults("KXSENATE", 90.0), (1.0, imm.LONGSHOT_MULT))
+            self.assertEqual(imm.longshot_side_mults(self.S, 90.0), (1.0, 1.0))
 
 
 if __name__ == "__main__":

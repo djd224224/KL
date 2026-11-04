@@ -9406,7 +9406,7 @@ FORCE_EVENTS = FORCE_EVENTS | frozenset(
 # ENS_END_ET only:
 #   * THE WINDOW: out before the start (blackout_et, cancelled and kept) and
 #     at the end (the cutoff, in place of the family's election-day cutoff).
-#   * THE LADDER: ENS_LEVELS (20 at the touch, 3c and 6c behind) as an
+#   * THE LADDER: ENS_LEVELS (20 at its anchor, 3c and 6c behind) as an
 #     offsets ladder (not the at-ref rung), per-market cap ENS_MAX_POSITION;
 #     no family, hour or Saturday multiplier (x1). Skew and the event cap as
 #     usual.
@@ -9427,11 +9427,46 @@ ENS_END_ET = os.environ.get("IMM_ENS_END_ET", "2026-11-04 00:00")
 ENS_START = ET.localize(datetime.strptime(ENS_START_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
 ENS_END = ET.localize(datetime.strptime(ENS_END_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
 ENS_LEVELS = _parse_levels(os.environ.get("IMM_ENS_LEVELS", "0:20,3:20,6:20"))
+# THE ANCHOR (Jack 2026-11-03: "dont sit at the touch, start at least 1 below
+# the touch" -> "start at least 1 below the touch, and must be below a rung
+# that has at least 50 contracts"): each side anchors 1c behind the best price
+# where OTHERS rest at least ENS_MIN_AHEAD contracts (ens_anchors); a side with
+# no such price rests nothing
+ENS_MIN_AHEAD = _env_float("IMM_ENS_MIN_AHEAD", 50)
+# markets of a session never quoted (Jack 2026-11-03: "dont quote 'at least
+# 47'"): blocked, so their orders are pulled like any blocked market's
+ENS_SKIP_MARKETS = frozenset(t.strip() for t in os.environ.get(
+    "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47").split(",") if t.strip())
 ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 150)
 
 
 def ens_series(series: str) -> bool:
     return series in ENS_SERIES
+
+
+def ens_anchors(yes_levels: List[List[float]], no_levels: List[List[float]],
+                own_orders: List[Tuple[str, int, float]] = ()
+                ) -> Tuple[Optional[int], Optional[int]]:
+    """(bid_anchor, ask_anchor) in YES cents for an election night session:
+    1c behind the best price where others rest >= ENS_MIN_AHEAD contracts, our
+    own orders netted out as in external_best; None for a side with none."""
+    own_yes: Dict[int, float] = {}
+    own_no: Dict[int, float] = {}
+    for book_side, yes_px, remaining in own_orders:
+        if book_side == "bid":
+            own_yes[yes_px] = own_yes.get(yes_px, 0.0) + remaining
+        else:
+            own_no[100 - yes_px] = own_no.get(100 - yes_px, 0.0) + remaining
+
+    def best(levels: List[List[float]], own: Dict[int, float]) -> Optional[int]:
+        for px, qty in levels_desc(levels):
+            if qty - own.get(px, 0.0) >= ENS_MIN_AHEAD:
+                return px
+        return None
+
+    b, n = best(yes_levels, own_yes), best(no_levels, own_no)
+    return (b - 1 if b is not None else None,
+            100 - n + 1 if n is not None else None)
 
 
 def ens_ticker(ticker: str) -> bool:
@@ -16363,8 +16398,9 @@ def series_side_mults(series: str) -> Tuple[float, float]:
     if series in SIDE_MULT_SERIES:
         return SIDE_MULT_SERIES[series]
     # the TRUMPSAY group quotes flat (Jack 2026-11-01: "Flat 20 a side", over
-    # Other mentions' 0.75 / 1.5 lean; see TWK_SAY_SERIES)
-    if twk_say_series(series):
+    # Other mentions' 0.75 / 1.5 lean; see TWK_SAY_SERIES) -- and so does an
+    # election night session (ENS_SERIES, Jack 2026-11-03: "Yes, all at 20")
+    if twk_say_series(series) or ens_series(series):
         return (1.0, 1.0)
     if FAMILY_SIDE_LEANS:
         lean = FAMILY_SIDE_LEANS.get(series_family(series))
@@ -16400,6 +16436,7 @@ def longshot_side_mults(series: str, yes_mid: Optional[float]) -> Tuple[float, f
     (cents); (1.0, 1.0) outside the families, off, or with no mid."""
     if (LONGSHOT_MULT == 1.0 or yes_mid is None or not LONGSHOT_FAMILIES
             or twk_say_series(series)       # the TRUMPSAY group: flat 20 a side
+            or ens_series(series)           # ...and an election night session
             or series_family(series) not in LONGSHOT_FAMILIES):
         return (1.0, 1.0)
     if yes_mid < LONGSHOT_BID_BELOW:
@@ -28912,6 +28949,8 @@ class IncentiveMarketMaker:
 
     @staticmethod
     def _blocked(ticker: str) -> bool:
+        if ticker in ENS_SKIP_MARKETS:
+            return True                   # an election night session's skip
         prefixes = SERIES_BLOCKLIST_PREFIXES
         if ticker.startswith(HIGHT_PREFIX) and hight_series(series_of(ticker)):
             # the IMM's own high-temperature family (2026-10-23): the "KXHIGH"
@@ -35549,6 +35588,14 @@ class IncentiveMarketMaker:
             lead_on_b = lead_b is not None and bool(lv_bid)
             lead_on_a = lead_a is not None and bool(lv_ask)
             anc_bid, anc_ask = ext_bid, ext_ask
+            if ens_series(meta.series):
+                # an election night session: 1c behind the best 50+ level
+                # (ens_anchors); a side with none rests nothing
+                anc_bid, anc_ask = ens_anchors(yes_levels, no_levels, own_in_book)
+                if anc_bid is None:
+                    room_buy = 0
+                if anc_ask is None:
+                    room_sell = 0
             if lead_on_b:
                 pl_bid_px = anc_bid = lead_b[0]
             if lead_on_a:

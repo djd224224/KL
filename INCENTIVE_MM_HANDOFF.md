@@ -11168,3 +11168,7 @@ collect rewards", then "launch at 7pm".
 - FORCE_EVENTS (floors, hopeless, admission wait). toxic_exempt + sweep_exempt (no toxic halt, sweep breaker or
   tape pause). WS fast cancel and the account-level halts stay.
 - Tests: TestElectionNightSession (3).
+- 2026-11-04 00:05Z follow-ups (Jack): 46ddcf3 no per-market size boost on ENS markets ("make sure it ignores my
+  manual trades" check found the near-cliff x1.5); then "Yes, all at 20" -> no long-shot cut / family lean on
+  ens_series; "dont sit at the touch, start at least 1 below the touch" -> ENS_LEVELS 1:20,4:20,7:20; "dont quote
+  'at least 47'" -> ENS_SKIP_MARKETS (blocked in _blocked).
