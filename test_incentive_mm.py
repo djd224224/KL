@@ -39762,9 +39762,12 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual((imm.PVD_CUSHION_DEAD, imm.PVD_CUSHION_LIVE), (2, 5))
         e = {"bid_max": 79, "ask_min": 98, "cushion": 10}
         self.assertEqual(imm.pvd_limits(e, None), (79, 98))
-        self.assertEqual(imm.pvd_limits(e, 27.0), (17, 98))
-        self.assertEqual(imm.pvd_limits({"bid_max": 2, "ask_min": 20, "cushion": 10}, 94.0), (2, 104))
-        self.assertEqual(imm.pvd_limits({"bid_max": 30, "ask_min": 70, "cushion": 10}, 50.0), (30, 70))   # never loosened
+        self.assertEqual(imm.pvd_limits(e, 27.0), (17, 37))
+        self.assertEqual(imm.pvd_limits({"bid_max": 2, "ask_min": 20, "cushion": 10}, 94.0), (84, 104))
+        # both ways since Jack's "Follow both ways": a market that moved away
+        # from its listed limits follows its last trade, looser too
+        self.assertEqual(imm.pvd_limits({"bid_max": 30, "ask_min": 70, "cushion": 10}, 50.0), (40, 60))
+        self.assertEqual(imm.pvd_limits({"bid_max": 70, "ask_min": 80, "cushion": 5}, 87.0), (82, 92))   # E48
         # the kind's cushion when the entry carries none: dead 2c, live 5c
         self.assertEqual(imm.pvd_limits({"bid_max": 90, "ask_min": 10, "kind": "dead"}, 50.0), (48, 52))
         self.assertEqual(imm.pvd_limits({"bid_max": 90, "ask_min": 10, "kind": "live"}, 50.0), (45, 55))

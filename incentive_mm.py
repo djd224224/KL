@@ -9728,8 +9728,8 @@ PVD_PRICE_MAX = _env_int("IMM_PVD_PRICE_MAX", 97)
 # listing left GOVPARTYMA-26MMIN-36's bid at 31c over a 27c last trade, and
 # HOUSENC1-26LBUC-40's ask at 93c under a 94c one): each universe refresh
 # reads every listed market's last trade (PVD_LAST) and the guard holds a bid
-# the entry's cushion under it and an ask that far over it -- tighten only, never
-# past the listed bid_max / ask_min. 10c from 16:00Z (Jack 2026-11-04: "go
+# the entry's cushion under it and an ask that far over it (both ways since
+# 2026-11-04 22:5xZ; the listed bid_max / ask_min only without a last trade). 10c from 16:00Z (Jack 2026-11-04: "go
 # from 20c to 10c" -- 20c kept $2,684/day of a band-only $3,844; 10c $3,002);
 # PER KIND from 19:30Z (Jack: "cut cushion to 2c on dead books only, 5c on
 # live books" -- by 19:06Z 264 of 571 listed markets were stood down at 10c,
@@ -9740,17 +9740,20 @@ PVD_LAST: Dict[str, float] = {}
 
 
 def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
-    """(bid_max, ask_min) in force: the listed limits, tightened to the
-    entry's cushion (its kind's PVD_CUSHION_DEAD / _LIVE) either side of the
-    market's last trade when there is one."""
-    bmax, amin = int(entry["bid_max"]), int(entry["ask_min"])
+    """(bid_max, ask_min) in force: the entry's cushion (its kind's
+    PVD_CUSHION_DEAD / _LIVE) either side of the market's last trade when
+    there is one -- BOTH WAYS since Jack 2026-11-04 "Follow both ways" (the
+    listed limits only tightened, and went stale as markets moved with the
+    count: KXCAHOUSEDEM-26NOV03-E48's bid held at a 70c limit set at a 75c
+    last trade while the market traded 87c). The listed bid_max / ask_min
+    stand only for a market with no last trade. The limit gates a rung; the
+    price still comes from the book's reference."""
     c = entry.get("cushion")
     if c is None:
         c = PVD_CUSHION_LIVE if entry.get("kind") == "live" else PVD_CUSHION_DEAD
     if last is not None and last > 0:
-        bmax = min(bmax, math.floor(last - c))
-        amin = max(amin, math.ceil(last + c))
-    return bmax, amin
+        return math.floor(last - c), math.ceil(last + c)
+    return int(entry["bid_max"]), int(entry["ask_min"])
 
 
 def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
