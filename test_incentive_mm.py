@@ -39455,8 +39455,8 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.hour_size_mult(self.S, now), 1.0)
         self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
         lv = imm.hour_scaled_levels(self.S, now)
-        self.assertEqual(lv, [(0, 30), (3, 30), (6, 30), (9, 30)])   # "increase to 30", "add a 4th rung"
-        self.assertEqual(imm.series_max_position(self.S, now), 150)
+        self.assertEqual(lv, [(0, 36), (3, 36), (6, 36), (9, 36)])   # 30, 4 rungs, then x1.2
+        self.assertEqual(imm.series_max_position(self.S, now), 180)
         # rungs re-pin to the anchor on any move, toward the touch too
         self.assertEqual(imm.series_atref_price_tol(self.S), 0)
         # "dont quote at 99c/1c": the band is 2-98 for fresh and member markets
@@ -39473,21 +39473,21 @@ class TestElectionNightSession(unittest.TestCase):
             self.assertFalse(imm.series_pad_to_target(self.S))
             self.assertTrue(imm.series_pad_to_target("KXSENATE"))
         # room for all 4 rungs on ~10 markets: the event cap is 150 x 10
-        self.assertEqual(imm.event_cap_contracts(self.EV), 1500)
-        # "Yes, scale to 150": the skew halves at 75 and pulls at 150
+        self.assertEqual(imm.event_cap_contracts(self.EV), 1800)
+        # "Yes, scale to 150" (75 / 150), then x1.2: halves at 90, pulls at 180
         soft, hard = imm.skew_knees(self.S, 1.0)
-        self.assertEqual((soft, hard), (75, 150))
+        self.assertEqual((soft, hard), (90, 180))
         self.assertEqual(imm.skew_knees("KXSENATE", 1.0), (30, 60))
-        # short 66: the asks (adding) keep their full room; at 100, half; at 150, none
-        self.assertEqual(imm.skewed_side_room(120, -66, True, side_max=120, soft=soft, hard=hard), 120)
-        self.assertEqual(imm.skewed_side_room(120, -100, True, side_max=120, soft=soft, hard=hard), 60)
-        self.assertEqual(imm.skewed_side_room(120, -150, True, side_max=120, soft=soft, hard=hard), 0)
+        # short 66: the asks (adding) keep their full room; at 100, half; at 180, none
+        self.assertEqual(imm.skewed_side_room(144, -66, True, side_max=144, soft=soft, hard=hard), 144)
+        self.assertEqual(imm.skewed_side_room(144, -100, True, side_max=144, soft=soft, hard=hard), 72)
+        self.assertEqual(imm.skewed_side_room(144, -180, True, side_max=144, soft=soft, hard=hard), 0)
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
-            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 120, levels=lv, ref_px=60)
-            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 120, levels=lv, ref_px=70)
+            bid = imm.build_side_ladder(self.T, "bid", 64, 66, 144, levels=lv, ref_px=60)
+            ask = imm.build_side_ladder(self.T, "ask", 66, 64, 144, levels=lv, ref_px=70)
             # 3c apart from the anchor (ens_anchors puts it behind the touch)
-            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 30), (61, 30), (58, 30), (55, 30)])
-            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 30), (69, 30), (72, 30), (75, 30)])
+            self.assertEqual([(q.price_cents, q.count) for q in bid], [(64, 36), (61, 36), (58, 36), (55, 36)])
+            self.assertEqual([(q.price_cents, q.count) for q in ask], [(66, 36), (69, 36), (72, 36), (75, 36)])
             # every other series keeps its one at-ref rung
             self.assertEqual(len(imm.build_side_ladder(
                 "KXUST10AD-26NOV05-T4.1", "bid", 64, 66, 60, levels=[(0, 20)], ref_px=60)), 1)

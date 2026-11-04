@@ -9435,7 +9435,11 @@ ENS_START_ET = os.environ.get("IMM_ENS_START_ET", "2026-11-03 19:00")
 ENS_END_ET = os.environ.get("IMM_ENS_END_ET", "2026-11-04 00:00")
 ENS_START = ET.localize(datetime.strptime(ENS_START_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
 ENS_END = ET.localize(datetime.strptime(ENS_END_ET, "%Y-%m-%d %H:%M")).astimezone(timezone.utc)
-ENS_LEVELS = _parse_levels(os.environ.get("IMM_ENS_LEVELS", "0:30,3:30,6:30,9:30"))
+# x1.2 on every size, cap and knee (Jack 2026-11-04: "scale everything up by
+# 20%, including contracts, caps, etc"): rungs 30 -> 36, cap 150 -> 180, skew
+# 75 / 150 -> 90 / 180, event cap 1,500 -> 1,800. The 50 / 100 book-depth
+# thresholds (others' contracts, not ours) are unchanged.
+ENS_LEVELS = _parse_levels(os.environ.get("IMM_ENS_LEVELS", "0:36,3:36,6:36,9:36"))
 # THE ANCHOR (Jack 2026-11-03: "dont sit at the touch, start at least 1 below
 # the touch" -> "start at least 1 below the touch, and must be below a rung
 # that has at least 50 contracts"): each side anchors 1c behind the best price
@@ -9449,13 +9453,13 @@ ENS_JOIN_TOUCH_MIN = _env_float("IMM_ENS_JOIN_TOUCH_MIN", 100)
 # 47'"): blocked, so their orders are pulled like any blocked market's
 ENS_SKIP_MARKETS = frozenset(t.strip() for t in os.environ.get(
     "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47").split(",") if t.strip())
-ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 150)
+ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 180)
 # THE SKEW scaled to the cap (Jack 2026-11-04: "Yes, scale to 150", on "Raise
 # the session's skew so positions can build to the 150 cap?"): the adding side
 # is halved from ENS_SKEW_SOFT net contracts and pulled at ENS_SKEW_HARD, in
 # place of the bot's 30 / 60 (skew_knees)
-ENS_SKEW_SOFT = _env_float("IMM_ENS_SKEW_SOFT", 75)
-ENS_SKEW_HARD = _env_float("IMM_ENS_SKEW_HARD", 150)
+ENS_SKEW_SOFT = _env_float("IMM_ENS_SKEW_SOFT", 90)
+ENS_SKEW_HARD = _env_float("IMM_ENS_SKEW_HARD", 180)
 # THE BAND (Jack 2026-11-04: "dont quote at 99c/1c"): rungs only at
 # ENS_PRICE_MIN..ENS_PRICE_MAX, in place of the election family's 1-99
 ENS_PRICE_MIN = _env_int("IMM_ENS_PRICE_MIN", 2)
@@ -9463,7 +9467,7 @@ ENS_PRICE_MAX = _env_int("IMM_ENS_PRICE_MAX", 98)
 # THE EVENT CAP (2026-11-04): the bot's 1,000 net per event, split over ~9
 # quoted markets, left each side ~90-110 -- room for 3 of the 4 rungs Jack
 # asked for ("add a 4th rung"). ENS_EVENT_CAP = his 150 a market x 10.
-ENS_EVENT_CAP = _env_float("IMM_ENS_EVENT_CAP", 1500)
+ENS_EVENT_CAP = _env_float("IMM_ENS_EVENT_CAP", 1800)
 
 
 def ens_series(series: str) -> bool:

@@ -11186,3 +11186,5 @@ collect rewards", then "launch at 7pm".
 - 2026-11-04 00:44Z (Jack): "dont quote at 99c/1c" -> ENS band 2-98 (ENS_PRICE_MIN/MAX); and ENS_EVENT_CAP 1,500 (150 x
   10) so the 4th rung fits -- the 1,000 event cap split over ~9 markets left room for 3.
   ...and no depth pads on ENS series (series_pad_to_target): the global pads rest at 1c/99c (a 180 @ 99c ask on 50).
+- 2026-11-04 00:55Z (Jack): "scale everything up by 20%, including contracts, caps, etc" -> rungs 36 (4 rungs), cap 180,
+  skew 90/180, event cap 1,800; the 50/100 book-depth thresholds unchanged.
