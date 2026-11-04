@@ -9443,6 +9443,12 @@ ENS_JOIN_TOUCH_MIN = _env_float("IMM_ENS_JOIN_TOUCH_MIN", 100)
 ENS_SKIP_MARKETS = frozenset(t.strip() for t in os.environ.get(
     "IMM_ENS_SKIP_MARKETS", "KXSENATESEATSD-27-47").split(",") if t.strip())
 ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 150)
+# THE SKEW scaled to the cap (Jack 2026-11-04: "Yes, scale to 150", on "Raise
+# the session's skew so positions can build to the 150 cap?"): the adding side
+# is halved from ENS_SKEW_SOFT net contracts and pulled at ENS_SKEW_HARD, in
+# place of the bot's 30 / 60 (skew_knees)
+ENS_SKEW_SOFT = _env_float("IMM_ENS_SKEW_SOFT", 75)
+ENS_SKEW_HARD = _env_float("IMM_ENS_SKEW_HARD", 150)
 
 
 def ens_series(series: str) -> bool:
@@ -9476,6 +9482,15 @@ def ens_anchors(yes_levels: List[List[float]], no_levels: List[List[float]],
 
     b, n = anchor(yes_levels, own_yes), anchor(no_levels, own_no)
     return (b, 100 - n if n is not None else None)
+
+
+def skew_knees(series: str, fam_m: float) -> Tuple[float, float]:
+    """(soft, hard) inventory skew knees for a market of `series`: the bot's
+    SKEW_SOFT / SKEW_HARD x its family multiplier, or an election night
+    session's ENS_SKEW_SOFT / ENS_SKEW_HARD."""
+    if ens_series(series):
+        return ENS_SKEW_SOFT, ENS_SKEW_HARD
+    return SKEW_SOFT_CONTRACTS * fam_m, SKEW_HARD_CONTRACTS * fam_m
 
 
 def ens_ticker(ticker: str) -> bool:
@@ -35535,14 +35550,13 @@ class IncentiveMarketMaker:
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
+            sk_soft, sk_hard = skew_knees(meta.series, fam_m)
             room_buy = skewed_side_room(room_buy, skew_b, accumulating=skew_b > 0,
                                         side_max=side_max_bid,
-                                        soft=SKEW_SOFT_CONTRACTS * fam_m,
-                                        hard=SKEW_HARD_CONTRACTS * fam_m)
+                                        soft=sk_soft, hard=sk_hard)
             room_sell = skewed_side_room(room_sell, skew_a, accumulating=skew_a < 0,
                                          side_max=side_max_ask,
-                                         soft=SKEW_SOFT_CONTRACTS * fam_m,
-                                         hard=SKEW_HARD_CONTRACTS * fam_m)
+                                         soft=sk_soft, hard=sk_hard)
             if reduce_only:
                 # Only the reducing side, and never more than would flatten our
                 # OWN book (a +5 position must not sell 35 and flip short 30).

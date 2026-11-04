@@ -39459,6 +39459,14 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.series_max_position(self.S, now), 150)
         # rungs re-pin to the anchor on any move, toward the touch too
         self.assertEqual(imm.series_atref_price_tol(self.S), 0)
+        # "Yes, scale to 150": the skew halves at 75 and pulls at 150
+        soft, hard = imm.skew_knees(self.S, 1.0)
+        self.assertEqual((soft, hard), (75, 150))
+        self.assertEqual(imm.skew_knees("KXSENATE", 1.0), (30, 60))
+        # short 66: the asks (adding) keep their full room; at 100, half; at 150, none
+        self.assertEqual(imm.skewed_side_room(120, -66, True, side_max=120, soft=soft, hard=hard), 120)
+        self.assertEqual(imm.skewed_side_room(120, -100, True, side_max=120, soft=soft, hard=hard), 60)
+        self.assertEqual(imm.skewed_side_room(120, -150, True, side_max=120, soft=soft, hard=hard), 0)
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
             bid = imm.build_side_ladder(self.T, "bid", 64, 66, 120, levels=lv, ref_px=60)
             ask = imm.build_side_ladder(self.T, "ask", 66, 64, 120, levels=lv, ref_px=70)
