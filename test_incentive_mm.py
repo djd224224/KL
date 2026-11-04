@@ -255,6 +255,7 @@ def setUpModule():
     imm.FORCE_EVENTS = imm.FORCE_EVENTS - imm._pvd_state["forced"]
     imm._pvd_state.update(mtime=0.0, forced=frozenset())
     imm.PVD_MARKETS.clear()
+    imm.PVD_REMOVED.clear()
     imm.ELECTION_DATES_EXTRA[:] = []
     imm.AWARDS_DATES_EXTRA[:] = []
     imm._rows_extra_state.clear()
@@ -39643,6 +39644,7 @@ class TestPostVoteDeadBooks(unittest.TestCase):
             pass
         imm._pvd_state["mtime"] = 0.0
         imm.load_pvd_markets()
+        imm.PVD_REMOVED.clear()
         _clean_persist()
 
     def test_load_force_and_unload(self):
@@ -39884,3 +39886,19 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         # undecided, last 50: the normal guard on both sides
         qs = [Q(self.T, "bid", 49, 40), Q(self.T, "ask", 51, 40)]
         self.assertEqual(imm.pvd_guard_quotes(qs, e, 50.0), [])
+
+    def test_a_market_taken_off_the_list_stops_at_once(self):
+        """23:41-23:50Z 11/04: 93 markets dropped from the list kept quoting
+        under the plain family rules until the next universe refresh; now the
+        quote loop cancels them on the next cycle"""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot.run_cycle()
+        self.assertTrue([o for o in bot.state.sim_orders.values() if o["ticker"] == self.T])
+        self._write({})
+        self.assertIn(self.T, imm.PVD_REMOVED)
+        bot.run_cycle()                      # no universe refresh: the market is still selected
+        self.assertFalse([o for o in bot.state.sim_orders.values() if o["ticker"] == self.T])
+        self._write({self.T: {"bid_max": 49, "ask_min": 51}})
+        self.assertNotIn(self.T, imm.PVD_REMOVED)
+        imm.PVD_REMOVED.clear()

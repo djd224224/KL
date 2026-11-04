@@ -9612,6 +9612,11 @@ PVD_FILE = "post_vote_dead_books.json"      # in STATUS_DIR
 PVD_SIZE = _env_int("IMM_PVD_SIZE", 40)
 PVD_MAX_POSITION = _env_float("IMM_PVD_MAX_POSITION", 40)
 PVD_MARKETS: Dict[str, dict] = {}
+# markets taken OFF the list since they were on it: they stop at once (the
+# quote loop cancels them) instead of quoting under the plain family rules
+# until the next universe refresh re-reads their voting-day cutoff (23:41-
+# 23:50Z 11/04: 93 dropped markets kept quoting 9 minutes -- an ask at 0.6c)
+PVD_REMOVED: Set[str] = set()
 _pvd_state = {"mtime": 0.0, "forced": frozenset()}
 
 
@@ -9710,6 +9715,8 @@ def load_pvd_markets() -> int:
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
+    PVD_REMOVED.update(set(PVD_MARKETS) - set(fresh))
+    PVD_REMOVED.difference_update(fresh)
     PVD_MARKETS.clear()
     PVD_MARKETS.update(fresh)
     events = frozenset(e["event"] for e in fresh.values())
@@ -35741,6 +35748,12 @@ class IncentiveMarketMaker:
             if meta.cutoff is not None and now_utc >= meta.cutoff:
                 self.cancel_market_orders(t, resting)
                 self._gskip(t, "cutoff_extra", lambda: dict(cutoff=meta.cutoff.isoformat()), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                continue
+            # ...and a market taken off the post-vote dead-book list stops now
+            # (PVD_REMOVED), not at the next universe refresh
+            if PVD_ENABLE and t in PVD_REMOVED and t not in PVD_MARKETS:
+                self.cancel_market_orders(t, resting)
+                self._gskip(t, "pvd_removed", lambda: {}, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
             # Rooms: hard per-market cap, event share, then skew — all using
             # this market's SERIES ladder/cap (Love Island runs a bigger flat
