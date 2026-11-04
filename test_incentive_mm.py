@@ -39589,6 +39589,16 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(px(imm.ens_no_loss_quotes(
             [Q(self.T, "ask", 90, 36), Q(self.T, "ask", 93, 36)], 10, 96.2), "ask"), [97])
 
+    def test_caps_judge_the_account_position(self):
+        """'account for the manual trades, when looking at exposure and caps'"""
+        # bot short 180 that he offset by hand: the account is flat, so are the caps
+        self.assertEqual(imm.ens_cap_pos(self.S, True, -180.0, 0.0), 0.0)
+        # his own long 100 beside the bot's flat book: the caps see +100
+        self.assertEqual(imm.ens_cap_pos(self.S, True, 0.0, 100.0), 100.0)
+        # other coexist markets keep the bot's own book; the rest the account's
+        self.assertEqual(imm.ens_cap_pos("KXVTPERMITS", True, -30.0, 70.0), -30.0)
+        self.assertEqual(imm.ens_cap_pos("KXVTPERMITS", False, -30.0, 70.0), 70.0)
+
     def test_flat_20_on_cheap_sides(self):
         """Jack 2026-11-03 "Yes, all at 20": no long-shot cut, no family lean"""
         now = datetime(2026, 11, 4, 1, 0, tzinfo=timezone.utc)

@@ -9543,6 +9543,17 @@ def ens_no_loss_quotes(quotes: List["Quote"], pos: float,
     return out
 
 
+def ens_cap_pos(series: str, coexist: bool, own_pos: float, acct_pos: float) -> float:
+    """The position a market's caps, skew and unwind judge: the ACCOUNT's in an
+    election night session (Jack 2026-11-04: "account for the manual trades,
+    when looking at exposure and caps" -- his hand trades there still never
+    stand the bot off), the bot's own book in other coexist markets, else the
+    account's."""
+    if ens_series(series):
+        return acct_pos
+    return own_pos if coexist else acct_pos
+
+
 def ens_ticker(ticker: str) -> bool:
     """A market (or the event itself) of an ENS_EVENTS event."""
     return any(ticker == e or ticker.startswith(e + "-") for e in ENS_EVENTS)
@@ -34055,6 +34066,11 @@ class IncentiveMarketMaker:
                 event_net[ev] = event_net.get(ev, 0.0) + p
         for ev in managed_events:
             event_net.setdefault(ev, 0.0)
+        # an election night session's event cap judges the ACCOUNT's net there,
+        # his hand trades included (ens_cap_pos)
+        for ev in [e for e in event_net if e in ENS_EVENTS]:
+            event_net[ev] = sum(p for t, p in positions.items()
+                                if t.startswith(ev + "-") and abs(p) >= 1e-9)
         event_room_buy = {e: event_cap_contracts(e) - n for e, n in event_net.items()}
         event_room_sell = {e: event_cap_contracts(e) + n for e, n in event_net.items()}
         # TRUMPSAY group (twk_say_fill_cap, 2026-11-01): the cap above is its
@@ -35589,8 +35605,9 @@ class IncentiveMarketMaker:
             maxpos = max(vercel_boost_cap(maxpos, vb_step), rt_lock_n)
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
                 side_max_bid, side_max_ask, maxpos)
-            # (MANUAL_COEXIST_EVENTS too: the user's positions there are his)
-            cap_pos = own_pos if coexist else pos
+            # (MANUAL_COEXIST_EVENTS too: the user's positions there are his;
+            # an election night session's caps take the account's, ens_cap_pos)
+            cap_pos = ens_cap_pos(meta.series, coexist, own_pos, pos)
             # FULL UNWIND (unwind_side_sizes): the reducing side's ladder bound
             # becomes the whole position; the position cap, the event share
             # and the skew below still bind. A side with no ladder stays dark.

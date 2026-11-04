@@ -11197,3 +11197,6 @@ Jack: "KXBRFINMIN-26OCT25, KXBRDEFMIN-26OCT25 should be autoquoting due to elect
 - 2026-11-04 01:50Z (Jack): "i manually offset it. assume there's no exposure on 55" -> OWN_BOOK_FLATTEN_FILE
   (own_book_flatten.txt, one ticker a line): the next cycle zeroes the bot's own pos/avg there once and renames it .done;
   realized kept. Used for KXSENATESEATSD-27-55 (bot -180 @ 58.6 at the cap; asks dark, bids held by the no-loss close).
+- 2026-11-04 02:00Z (Jack): "account for the manual trades, when looking at exposure and caps" -> ens_cap_pos: the per-market
+  cap, skew and unwind judge the ACCOUNT's position in ENS markets, and the event cap the account's event net; his hand
+  trades still never stand the bot off; the no-loss close stays on the bot's own fills / average.
