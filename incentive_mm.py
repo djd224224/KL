@@ -1506,6 +1506,10 @@ def series_pad_to_target(series: str) -> bool:
     # Beats the global AND any per-series override.
     if series_event_depth_gated(series):
         return False
+    # ...nor an election night session (Jack 2026-11-04: "dont quote at
+    # 99c/1c" -- pads rest at exactly those prices)
+    if series in globals().get("ENS_SERIES", ()):
+        return False
     if PAD_TO_TARGET_GLOBAL:
         return True
     ov = SERIES_OVERRIDES.get(series)
@@ -3195,6 +3199,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     series = series_of(event_ticker)
     if _share_x1(series):
         return SHARE_EVENT_CAP
+    # an election night session (2026-11-04): ENS_EVENT_CAP
+    if series in globals().get("ENS_SERIES", ()):
+        return globals()["ENS_EVENT_CAP"]
     # the YouTube #2 pilot (2026-10-05): YT2_EVENT_CAP net per event
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
         return globals()["YT2_EVENT_CAP"]
@@ -9449,6 +9456,14 @@ ENS_MAX_POSITION = _env_float("IMM_ENS_MAX_POSITION", 150)
 # place of the bot's 30 / 60 (skew_knees)
 ENS_SKEW_SOFT = _env_float("IMM_ENS_SKEW_SOFT", 75)
 ENS_SKEW_HARD = _env_float("IMM_ENS_SKEW_HARD", 150)
+# THE BAND (Jack 2026-11-04: "dont quote at 99c/1c"): rungs only at
+# ENS_PRICE_MIN..ENS_PRICE_MAX, in place of the election family's 1-99
+ENS_PRICE_MIN = _env_int("IMM_ENS_PRICE_MIN", 2)
+ENS_PRICE_MAX = _env_int("IMM_ENS_PRICE_MAX", 98)
+# THE EVENT CAP (2026-11-04): the bot's 1,000 net per event, split over ~9
+# quoted markets, left each side ~90-110 -- room for 3 of the 4 rungs Jack
+# asked for ("add a 4th rung"). ENS_EVENT_CAP = his 150 a market x 10.
+ENS_EVENT_CAP = _env_float("IMM_ENS_EVENT_CAP", 1500)
 
 
 def ens_series(series: str) -> bool:
@@ -9505,6 +9520,7 @@ for _s in ENS_SERIES:
     SERIES_OVERRIDES[_s] = replace(
         SERIES_OVERRIDES[ELECTION_ARCHETYPE], size_mult=None,
         levels=ENS_LEVELS, max_position=ENS_MAX_POSITION, atref_price_tol_ticks=0,
+        price_min_cents=ENS_PRICE_MIN, price_max_cents=ENS_PRICE_MAX,
         blackout_et=("00:00", ENS_START.astimezone(ET).strftime("%H:%M")))
 FORCE_EVENTS = FORCE_EVENTS | ENS_EVENTS
 

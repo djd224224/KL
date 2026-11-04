@@ -39459,6 +39459,21 @@ class TestElectionNightSession(unittest.TestCase):
         self.assertEqual(imm.series_max_position(self.S, now), 150)
         # rungs re-pin to the anchor on any move, toward the touch too
         self.assertEqual(imm.series_atref_price_tol(self.S), 0)
+        # "dont quote at 99c/1c": the band is 2-98 for fresh and member markets
+        self.assertEqual(imm.member_price_band(self.S, False), (2, 98))
+        self.assertEqual(imm.member_price_band(self.S, True), (2, 98))
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            self.assertEqual([q.price_cents for q in imm.build_side_ladder(
+                self.T, "bid", 8, 12, 120, levels=lv, ref_px=8, band=(2, 98))], [8, 5, 2])
+            self.assertEqual([q.price_cents for q in imm.build_side_ladder(
+                self.T, "ask", 95, 90, 120, levels=lv, ref_px=95, band=(2, 98))], [95, 98])
+        # ...and no 1c / 99c depth pads
+        self.assertFalse(imm.series_pad_to_target(self.S))
+        with mock.patch.object(imm, "PAD_TO_TARGET_GLOBAL", True):
+            self.assertFalse(imm.series_pad_to_target(self.S))
+            self.assertTrue(imm.series_pad_to_target("KXSENATE"))
+        # room for all 4 rungs on ~10 markets: the event cap is 150 x 10
+        self.assertEqual(imm.event_cap_contracts(self.EV), 1500)
         # "Yes, scale to 150": the skew halves at 75 and pulls at 150
         soft, hard = imm.skew_knees(self.S, 1.0)
         self.assertEqual((soft, hard), (75, 150))

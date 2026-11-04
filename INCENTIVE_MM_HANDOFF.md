@@ -11183,3 +11183,6 @@ collect rewards", then "launch at 7pm".
   the touch) left 53's asks at 83-89c after the ask fell to 71c (anchor 73c); tolerance 0 re-pins both ways, as KXTEMP.
 - 2026-11-04 00:38Z (Jack): "Yes, scale to 150" -> skew_knees: ENS series halve the adding side at 75 and pull it at
   150 (ENS_SKEW_SOFT/HARD), in place of 30/60; every other market unchanged.
+- 2026-11-04 00:44Z (Jack): "dont quote at 99c/1c" -> ENS band 2-98 (ENS_PRICE_MIN/MAX); and ENS_EVENT_CAP 1,500 (150 x
+  10) so the 4th rung fits -- the 1,000 event cap split over ~9 markets left room for 3.
+  ...and no depth pads on ENS series (series_pad_to_target): the global pads rest at 1c/99c (a 180 @ 99c ask on 50).
