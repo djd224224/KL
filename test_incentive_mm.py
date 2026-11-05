@@ -39741,15 +39741,6 @@ class TestBreakevenOffset(unittest.TestCase):
         self.assertEqual(f(sp, -200, 50.0), (sp, 0))
         self.assertEqual(f(sp, -200, 50.5)[1], 200)
 
-    def test_a_dropped_markets_leg_keeps_only_breakeven_rungs(self):
-        Q, f = imm.Quote, imm.breakeven_offset_quotes
-        qs = [Q("T", "bid", 49, 60), Q("T", "bid", 1, 500, is_pad=True), Q("T", "ask", 51, 20)]
-        out, n = f(qs, -200, 55.0, leg_only=True)
-        self.assertEqual(([(q.book_side, q.price_cents, q.count) for q in out], n),
-                         ([("bid", 49, 200)], 200))
-        self.assertEqual(f(qs, -200, 45.0, leg_only=True), ([], 0))
-        self.assertEqual(f(qs, -200, None, leg_only=True), ([], 0))
-
     # --- end to end ---------------------------------------------------
     def test_a_selected_short_rests_a_full_buy_back(self):
         bot = self._bot()
@@ -39780,7 +39771,9 @@ class TestBreakevenOffset(unittest.TestCase):
             bot.run_cycle()
         self.assertLess(sum(o["remaining_count"] for o in self._side(bot, "bid")), 200)
 
-    def test_a_dropped_market_keeps_a_breakeven_leg(self):
+    def test_a_dropped_market_gets_no_offset(self):
+        # "no, i mean just markets earning rewards": a market the bot no
+        # longer selects carries no orders, however far out and in the money
         self.assertFalse(imm.WINDDOWN_DROPPED)
         bot = self._bot()
         bot.state.universe_at = time.time()          # skip refresh: nothing selected
@@ -39788,58 +39781,11 @@ class TestBreakevenOffset(unittest.TestCase):
                                                 series="KXGOOD")
         self._hold(bot, -200, 55.0)
         bot.run_cycle()
-        self.assertIn(self.T, bot.state.managed_extra)
-        orders = list(bot.state.sim_orders.values())
-        self.assertTrue(orders)
-        self.assertTrue(all(o["book_side"] == "bid" and o["yes_price"] <= 55 for o in orders))
-        self.assertEqual(sum(o["remaining_count"] for o in orders), 200)
-
-    def test_a_dropped_market_never_rests_past_breakeven(self):
-        bot = self._bot()
-        bot.state.universe_at = time.time()
-        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
-                                                series="KXGOOD")
-        self._hold(bot, -200, 45.0)            # buying back at 49 is a loss
-        bot.run_cycle()
         self.assertEqual(bot.state.sim_orders, {})
-
-    def test_a_blocked_or_manual_dropped_market_gets_no_leg(self):
-        bot = self._bot()
-        bot.state.universe_at = time.time()
-        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
-                                                series="KXGOOD")
-        self._hold(bot, -200, 55.0)
-        bot.client.positions[self.T] = -260    # 60 of it is his
-        bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})
-        self.assertNotIn(self.T, bot.state.managed_extra)
-        bot = self._bot()
-        bot.state.universe_at = time.time()
-        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
-                                                series="KXGOOD")
-        self._hold(bot, -200, 55.0)
-        with mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES",
-                               imm.SERIES_BLOCKLIST_PREFIXES + ("KXGOOD-99DEC31",)):
-            bot.run_cycle()
-        self.assertEqual(bot.state.sim_orders, {})
-
-    def test_the_orphan_restore_brings_a_leg_back(self):
-        bot = self._bot()
+        self.assertEqual(bot.state.managed_extra, {})
         bot.state.known_tickers.add(self.T)
-        self._hold(bot, -200, 55.0)
-        bot.restore_orphan_metas({self.T: -200.0})
-        self.assertIn(self.T, bot.state.managed_extra)
-        # a market the offset does not cover is read once, then skipped
-        bot = self._bot()
-        bot.state.known_tickers.add(self.T)
-        self._hold(bot, -200, 55.0)
-        with mock.patch.object(imm, "BE_OFFSET_DAYS", 1_000_000):
-            bot.restore_orphan_metas({self.T: -200.0})
-            self.assertNotIn(self.T, bot.state.managed_extra)
-            self.assertIn(self.T, bot._be_orphan_skip)
-            calls = list(getattr(bot.client, "calls", []))
-            bot.restore_orphan_metas({self.T: -200.0})
-            self.assertEqual(list(getattr(bot.client, "calls", [])), calls)
+        bot.restore_orphan_metas({self.T: -200.0})   # and nothing brings it back
+        self.assertEqual(bot.state.managed_extra, {})
 
     def test_off_switch(self):
         bot = self._bot()
