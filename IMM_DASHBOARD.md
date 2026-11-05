@@ -224,6 +224,12 @@ Jack 2026-10-16: "in 'Movers' section ... i should be able to select in last
 its own window buttons, kept per browser: the page's window (the default),
 15 min, 30 min, 1 hour, 3 hours, and 1 day (the 24h window).
 
+Columns (Jack 2026-11-05): Largest trading P&L moves splits trading into
+new fills and carry (`cr + cs`), as Drivers does; hovering a Trading cell shows
+realized vs the change in marks, and a Carry cell re-marked vs settled. Top
+reward earners shows each market's est $/day now (a dash when not quoting).
+Quoting now's Quoted events table shows the window's net, rewards and trading.
+
 The four short windows (`SHORT_WINDOWS`) run between two 5-minute position
 snapshots: from the snapshot nearest their length before the newest one, to
 the newest. Trading P&L is exact between the two. Rewards are the modeled

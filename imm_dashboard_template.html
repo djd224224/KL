@@ -465,8 +465,8 @@ footer { color: var(--muted); font-size: 12px; }
     <div class="shead"><h2>Movers</h2><span class="note" id="movNote"></span>
       <div class="right"><div class="seg" id="movSeg" role="group" aria-label="Movers window"></div></div></div>
     <div class="grid2">
-      <div><div class="sub-h">Largest trading P&amp;L moves<span class="note">realized + change in open marks</span></div><div class="tw" id="movPnl"></div></div>
-      <div><div class="sub-h">Top reward earners<span class="note">modeled accrual, with the trading P&amp;L beside it</span></div><div class="tw" id="movRew"></div></div>
+      <div><div class="sub-h">Largest trading P&amp;L moves<span class="note">new fills + carry (the position held from before)</span></div><div class="tw" id="movPnl"></div></div>
+      <div><div class="sub-h">Top reward earners<span class="note">modeled accrual and est $/day now, with the trading P&amp;L beside it</span></div><div class="tw" id="movRew"></div></div>
     </div>
   </section>
 
@@ -1941,18 +1941,29 @@ function renderMovers() {
   $("movNote").textContent = key ? wn.label + ": " + wn.desc + (off ? " (" + dur(wn.end - wn.start) + " between the nearest position snapshots)" : "") + ". " + what : what;
   $("movNote").title = key && wn.mins ? "From one of the bot's 5-minute position snapshots to the newest: trading P&L is exact between the two, rewards are the modeled accrual of the cycles in between. The page rebuilds every 10 minutes." : "";
   const rows = marketRows((m, w) => Math.abs(w.pnl || 0) >= 0.01, key);
+  // trading = new fills + carry, as in Drivers (Jack 2026-11-05: "in Largest
+  // trading P&L moves section, split new fills vs carry"); realized vs the
+  // marks' change stays in the Trading cell's tooltip
+  const carry = (r) => num(r.cr) + num(r.cs);
   table($("movPnl"), [
     { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam) + " · " + esc(cause(r))), sort: (r) => r.t },
     { k: "pos", label: "Position", num: true, title: "at the start and end of the window", fmt: (r) => { const p1 = r.pos1 != null ? r.pos1 : 0; return (r.pos0 != null && Math.round(r.pos0) !== Math.round(p1) ? fmtNum(r.pos0) + " \u2192 " : "") + fmtNum(p1); }, sort: (r) => Math.abs(r.pos1 || 0) },
-    { k: "real", label: "Realized", num: true, fmt: (r) => money(r.real) },
-    { k: "du", label: "Marks Δ", num: true, fmt: (r) => money(r.du + (r.xfer || 0)) },
-    { k: "pnl", label: "Trading", num: true, fmt: (r) => "<b>" + (na ? "n/a" : money(r.pnl)) + "</b>", sort: (r) => r.pnl },
+    { k: "nf", label: "New fills", num: true, title: "the window's own fills, marked to its end (or to the settlement)",
+      fmt: (r) => na ? "n/a" : money(num(r.pnl) - carry(r)), sort: (r) => num(r.pnl) - carry(r) },
+    { k: "carry", label: "Carry", num: true, title: "the position held at the window's start: re-marked to its end, or to the settlement",
+      fmt: (r) => na ? "n/a" : '<span title="re-marked ' + esc(fmtUSD(num(r.cr), { sign: true })) + ", settled " + esc(fmtUSD(num(r.cs), { sign: true })) + '">' + money(carry(r)) + "</span>", sort: carry },
+    { k: "pnl", label: "Trading", num: true, title: "new fills + carry (hover a cell: realized vs the change in open marks)",
+      fmt: (r) => "<b>" + (na ? "n/a" : '<span title="realized ' + esc(fmtUSD(num(r.real), { sign: true })) + ", marks " + esc(fmtUSD(num(r.du) + num(r.xfer), { sign: true })) + '">' + money(r.pnl) + "</span>") + "</b>", sort: (r) => r.pnl },
     { k: "rew", label: "Rewards", num: true, fmt: (r) => fmtUSD(r.rew) },
   ], rows, { presort: (a, b) => Math.abs(b.pnl) - Math.abs(a.pnl), limit: 15, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => openMarket(r.t), empty: "No position moved in this window." });
   const rw = marketRows((m, w) => (w.rew || 0) >= 0.01, key);
   table($("movRew"), [
-    { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam) + (r.m.cur ? " · now " + fmtUSD(r.m.cur.est_day) + "/day" : " · not quoting now")), sort: (r) => r.t },
+    { k: "t", label: "Market", fmt: (r) => mktCell(r.t, esc(r.fam)), sort: (r) => r.t },
     { k: "rew", label: "Rewards", num: true, fmt: (r) => "<b>" + fmtUSD(r.rew) + "</b>" },
+    // the bot's modeled reward a day now (Jack 2026-11-05: "in Top reward
+    // earners ... add est $/day")
+    { k: "est", label: "Est $/day", num: true, title: "the bot's modeled reward a day for this market now; a dash when it is not quoting",
+      fmt: (r) => r.m.cur ? fmtUSD(r.m.cur.est_day) : '<span class="muted" title="not quoting now">—</span>', sort: (r) => r.m.cur ? num(r.m.cur.est_day) : null },
     { k: "pnl", label: "Trading", num: true, fmt: (r) => na ? "n/a" : money(r.pnl) },
     { k: "net", label: "Net", num: true, fmt: (r) => na ? "n/a" : money(r.net) },
     { k: "fills", label: "Fills", num: true, fmt: (r) => fmtNum(r.fills || 0) },
@@ -1993,8 +2004,11 @@ function renderQuoting() {
     { k: "q", label: "Quoting", num: true, sort: (r) => r.q1 + r.q2, fmt: (r) => fmtNum(r.q1 + r.q2) + '<span class="muted">/' + r.sel + "</span>" + (r.held ? ' <span class="down">' + r.held + " held</span>" : "") },
     { k: "estNow", label: "Est $/day", num: true, fmt: (r) => fmtUSD(r.estNow) },
     { k: "restNow", label: "Resting $", num: true, fmt: (r) => fmtUSD(r.restNow) },
-    { k: "rew", label: "Rewards", num: true, fmt: (r) => fmtUSD(r.rew) },
-    { k: "pnl", label: "Trading", num: true, fmt: (r) => win().pnl_na ? "n/a" : money(r.pnl) },
+    // net, then its two parts (Jack 2026-11-05: "in Quoted events ... add net
+    // vs rewards vs trading PnLs")
+    { k: "net", label: "Net", num: true, title: "rewards + trading in the window", fmt: (r) => win().pnl_na ? "n/a" : "<b>" + money(num(r.rew) + num(r.pnl)) + "</b>", sort: (r) => num(r.rew) + num(r.pnl) },
+    { k: "rew", label: "Rewards", num: true, title: "modeled rewards in the window", fmt: (r) => fmtUSD(r.rew) },
+    { k: "pnl", label: "Trading", num: true, title: "trading P&L in the window: realized plus the change in open marks", fmt: (r) => win().pnl_na ? "n/a" : money(r.pnl) },
     { k: "u", label: "Open MTM", num: true, fmt: (r) => r.npos ? money(r.u) : '<span class="muted">—</span>' },
   ], evs, { sortKey: "estNow", limit: 20, rowAttr: (r, i) => ' class="click" data-i="' + i + '"', onRow: (r) => { openRows.add("f:" + r.fam); openRows.add("e:" + r.name); renderDrivers(); location.hash = "#drivers"; } });
   // decisions
