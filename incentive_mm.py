@@ -5281,6 +5281,18 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     # 2027 listing. Standard semantics: no new orders, resting quotes
     # cancelled next cycle, NOT reduce-only, positions ride to settlement.
     + ["KXMLBPLAYOFFS-26"]
+    # RED ROCKS OFF (Jack 2026-11-05: "Turn it off", choosing that over
+    # sell-back only for KXVENUEPERFORM-REDROCKS28JAN01, "Which artists
+    # perform at Red Rocks", 35 markets, settles 2028-01-01). $148 of
+    # lifetime credits against ~$150 of trading, trading down every week
+    # since September (7d: $16.74 credits vs -$37.80); its $500/day pool
+    # paid us ~$1-4/day; lineup news is insider-first. An EVENT-ticker
+    # prefix as KXMLBPLAYOFFS-26: every Red Rocks market and the event are
+    # frozen, KXVENUEPERFORM-GILLETTE27JAN01 and a later Red Rocks year
+    # stay allowed. Standard semantics: no new orders, resting quotes
+    # cancelled next cycle, positions (23, 842 contracts, ~$537 worst
+    # case) ride to settlement. Un-block by removing this entry.
+    + ["KXVENUEPERFORM-REDROCKS28JAN01"]
     # company KPIs, food-price trackers, AAA MAXM/MINM (2026-10-03, above)
     + [f"{_s}-" for _s in _CUT_KPI_SERIES + _CUT_FOOD_SERIES + _CUT_AAA_SERIES]
     # the gas trial's national + diesel dailies (2026-10-08, above)

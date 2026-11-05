@@ -2392,10 +2392,12 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
     def test_the_three_series_are_allowed_and_not_blocked(self):
         a, b = IncentiveMarketMaker._allowed, IncentiveMarketMaker._blocked
         # KXMLBPLAYOFFS-26 itself is event-blocklisted since 9/26 (see
-        # test_mlbplayoffs_26_event_blocked); the series stays allowed
+        # test_mlbplayoffs_26_event_blocked); the series stays allowed.
+        # Red Rocks 28JAN01 is event-blocklisted since 11/05 (see
+        # test_red_rocks_event_blocked); the Gillette event stands in.
         for t in ("KXMLBPLAYOFFS-27-NYY", "KXMLBPLAYOFFS-27-ATH",
                   "KXMLBSEASONGAMES-27-2425",
-                  "KXVENUEPERFORM-REDROCKS28JAN01-ODE",
+                  "KXVENUEPERFORM-GILLETTE27JAN01-ODE",
                   "KXCMA-NAOTY26-TWET", "KXCMA-MEOTY26-TIE",
                   "KXMC-MARV-95", "KXMC-SIL-70"):
             self.assertFalse(b(t), t)
@@ -2428,6 +2430,20 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         for t in ("KXMLBPLAYOFFS-X", "KXMLBPLAYOFFS-27-NYY"):
             self.assertFalse(b(t), t)
             self.assertTrue(a(t), t)
+
+    def test_red_rocks_event_blocked(self):
+        # Jack 2026-11-05: "Turn it off" (KXVENUEPERFORM-REDROCKS28JAN01).
+        # Every Red Rocks market and the event are frozen; the Gillette
+        # event and the series itself are not.
+        b = IncentiveMarketMaker._blocked
+        for t in ("KXVENUEPERFORM-REDROCKS28JAN01-GRI",
+                  "KXVENUEPERFORM-REDROCKS28JAN01-ZED",
+                  "KXVENUEPERFORM-REDROCKS28JAN01"):
+            self.assertTrue(b(t), t)
+        for t in ("KXVENUEPERFORM-GILLETTE27JAN01-ABC",
+                  "KXVENUEPERFORM-REDROCKS29JAN01-GRI", "KXVENUEPERFORM"):
+            self.assertFalse(b(t), t)
+        self.assertFalse(imm.series_blocklisted("KXVENUEPERFORM"))
 
     def test_exact_series_only_no_mlb_prefix_bleed(self):
         # KXMLBMENTION is mlb_trading.py's book and must stay frozen; no
