@@ -39902,3 +39902,15 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self._write({self.T: {"bid_max": 49, "ask_min": 51}})
         self.assertNotIn(self.T, imm.PVD_REMOVED)
         imm.PVD_REMOVED.clear()
+
+    def test_sub_penny_price_is_judged_exactly(self):
+        """00:2xZ 11/05: asks at 1.1-1.4c (sub-penny, a 2c bucket) slipped past
+        "dont quote 1c"; the guard now judges the exact price sent"""
+        Q = imm.Quote
+        e = {"bid_max": 0, "ask_min": 0, "cushion": 2}
+        loser = [Q(self.T, "ask", 2, 120, price_exact=1.2), Q(self.T, "ask", 2, 120, price_exact=2.0)]
+        self.assertEqual([q.price_exact for q in imm.pvd_guard_quotes(loser, e, 5.0)], [2.0])
+        winner = [Q(self.T, "bid", 99, 120, price_exact=99.5), Q(self.T, "bid", 99, 120, price_exact=98.9)]
+        self.assertEqual([q.price_exact for q in imm.pvd_guard_quotes(winner, e, 97.0)], [98.9])
+        band = {"bid_max": 90, "ask_min": 10, "cushion": 0, "pmin": 2, "pmax": 99}
+        self.assertEqual(imm.pvd_guard_quotes([Q(self.T, "bid", 2, 40, price_exact=1.9)], band, 50.0), [])

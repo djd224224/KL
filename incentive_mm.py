@@ -9818,15 +9818,18 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     for q in quotes:
         if q.is_pad:
             continue
+        # the price actually sent: a sub-penny rung (price_exact, e.g. 1.20c
+        # on a 0.1c-step book) is judged on it, not its whole-cent bucket --
+        # 00:2xZ 11/05: 11 asks rested at 1.1-1.4c behind a 2c bucket
+        px = q.price_exact if q.price_exact is not None else q.price_cents
         if q.book_side == decided:
             # the decided side: the 2-99c band alone (no cushion)
-            if PVD_DECIDED_MIN <= q.price_cents <= PVD_DECIDED_MAX:
+            if PVD_DECIDED_MIN <= px <= PVD_DECIDED_MAX:
                 out.append(q)
             continue
-        if not (lo <= q.price_cents <= hi):
+        if not (lo <= px <= hi):
             continue
-        inside = (q.price_cents <= bmax if q.book_side == "bid"
-                  else q.price_cents >= amin)
+        inside = (px <= bmax if q.book_side == "bid" else px >= amin)
         if inside:
             out.append(q)
         elif close_side is not None and q.book_side == close_side                 and int(close_qty) >= 1:
