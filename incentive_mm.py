@@ -9815,6 +9815,11 @@ def load_pvd_markets() -> int:
                     # "no_losing_side": once decided, the losing side rests
                     # nothing but a closing rung (Jack 2026-11-05: "Stop on the 21")
                     "no_losing": bool(raw.get("no_losing_side")),
+                    # "override_cutoff": the stop REPLACES the series cutoff,
+                    # as it always does for an election series (see
+                    # apply_series_cutoff_adjustments); otherwise it only
+                    # shortens it
+                    "override_cutoff": bool(raw.get("override_cutoff")),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -20730,10 +20735,18 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         # came in (its start is the series' blackout_et)
         cutoff = ENS_END
     # ...and a post-vote dead book at its listed stop, per MARKET (the event's
-    # other bands keep the voting-day cutoff)
+    # other bands keep the voting-day cutoff). The stop REPLACES the cutoff only
+    # for an election series -- lifting the voting-day stand-down is what the
+    # list is for there -- or an entry marked "override_cutoff". Any other
+    # wave's list can only SHORTEN the series' own cutoff (Jack 2026-11-05:
+    # "Yes, close the gaps"): a late stop must not quote through a game start
+    # or a release the family already stops for.
     _pvd = PVD_MARKETS.get((market or {}).get("ticker") or "") if PVD_ENABLE else None
     if _pvd is not None:
-        cutoff = _pvd["stop"]
+        if cutoff is None or election_series(series) or _pvd.get("override_cutoff"):
+            cutoff = _pvd["stop"]
+        else:
+            cutoff = min(cutoff, _pvd["stop"])
     hard = series_hard_expiry_utc(series, event_ticker)
     if hard is not None:
         cutoff = hard if cutoff is None else min(cutoff, hard)
@@ -29529,10 +29542,14 @@ class IncentiveMarketMaker:
         single-event mentions by Kalshi category, mention_auto_series; the AS
         test's Billboard and VoteHub families while live, astest_new_series;
         the road races by name, marathon_series) unless ALLOWLIST_ONLY is
-        off."""
+        off. A market on the post-vote / wave list (PVD_FILE) is allowed while
+        its entry is live: the list admits the MARKET, not its whole series
+        (Jack 2026-11-05: "Yes, close the gaps" -- the market-wave playbook)."""
         if cls._blocked(ticker):
             return False
         if not ALLOWLIST_ONLY:
+            return True
+        if pvd_entry(ticker) is not None:
             return True
         series = ticker.split("-")[0]
         # FINECON_SERIES checked live (not just via the import-time

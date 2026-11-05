@@ -39850,13 +39850,59 @@ class TestPostVoteDeadBooks(unittest.TestCase):
 
     def test_cutoff_is_per_market(self):
         stop = datetime(2099, 11, 5, 10, 0, tzinfo=timezone.utc)
-        self._write({self.T: {"bid_max": 30, "ask_min": 70}}, stop=stop)
+        # KXGOOD is no election series: "override_cutoff" lets its stop replace
+        # the (past) cutoff, as an election series' stop always does
+        self._write({self.T: {"bid_max": 30, "ask_min": 70, "override_cutoff": True}}, stop=stop)
         past = datetime(2026, 11, 3, 5, 0, tzinfo=timezone.utc)
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXGOOD", "KXGOOD-99DEC31", past, market={"ticker": self.T}), stop)
         # the event's other band keeps its own cutoff
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXGOOD", "KXGOOD-99DEC31", past, market={"ticker": self.T2}), past)
+
+    def test_stop_replaces_an_election_series_cutoff(self):
+        """The 11/04 case: the list lifts the voting-day stand-down."""
+        stop = datetime(2099, 11, 5, 10, 0, tzinfo=timezone.utc)
+        self._write({self.T: {"bid_max": 30, "ask_min": 70}}, stop=stop)
+        past = datetime(2026, 11, 3, 5, 0, tzinfo=timezone.utc)
+        with mock.patch.object(imm, "election_series", lambda s: s == "KXGOOD"):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGOOD", "KXGOOD-99DEC31", past, market={"ticker": self.T}), stop)
+
+    def test_other_waves_stop_only_shortens_the_cutoff(self):
+        """Jack 2026-11-05 "Yes, close the gaps": outside elections a list
+        entry's stop can only pull the series' own cutoff EARLIER, so a late
+        stop never quotes through a game start or a release."""
+        f = imm.apply_series_cutoff_adjustments
+        stop = datetime(2099, 11, 5, 10, 0, tzinfo=timezone.utc)
+        early = datetime(2099, 11, 5, 8, 0, tzinfo=timezone.utc)    # the family stops first
+        late = datetime(2099, 11, 6, 0, 0, tzinfo=timezone.utc)     # the list stops first
+        self._write({self.T: {"bid_max": 30, "ask_min": 70}}, stop=stop)
+        self.assertEqual(f("KXGOOD", "KXGOOD-99DEC31", early, market={"ticker": self.T}), early)
+        self.assertEqual(f("KXGOOD", "KXGOOD-99DEC31", late, market={"ticker": self.T}), stop)
+        self.assertEqual(f("KXGOOD", "KXGOOD-99DEC31", None, market={"ticker": self.T}), stop)
+        # "override_cutoff": true -> the stop replaces it
+        self._write({self.T: {"bid_max": 30, "ask_min": 70, "override_cutoff": True}}, stop=stop)
+        self.assertEqual(f("KXGOOD", "KXGOOD-99DEC31", early, market={"ticker": self.T}), stop)
+
+    def test_a_listed_market_is_allowed(self):
+        """Jack 2026-11-05 "Yes, close the gaps": the list admits the MARKET
+        (not its whole series) while its entry is live; the blocklist wins."""
+        allowed = imm.IncentiveMarketMaker._allowed
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(allowed(self.T))            # KXGOOD is on no family list
+            self._write({self.T: {"bid_max": 30, "ask_min": 70}})
+            self.assertTrue(allowed(self.T))
+            self.assertFalse(allowed(self.T2))           # its unlisted sibling stays out
+            with mock.patch.object(imm.IncentiveMarketMaker, "_blocked",
+                                   staticmethod(lambda t: True)):
+                self.assertFalse(allowed(self.T))        # the blocklist still wins
+            self._write({self.T: {"bid_max": 30, "ask_min": 70}},
+                        stop=datetime.now(timezone.utc) - timedelta(minutes=1))
+            self.assertFalse(allowed(self.T))            # past its stop: out again
+            with mock.patch.object(imm, "PVD_ENABLE", False):
+                self._write({self.T: {"bid_max": 30, "ask_min": 70}})
+                self.assertFalse(allowed(self.T))        # IMM_PVD=0 turns it off
 
     def test_side_guard(self):
         Q = imm.Quote
