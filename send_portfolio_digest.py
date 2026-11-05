@@ -32,8 +32,10 @@ Then the IMM bot's section (since 2026-10-02, when its own 7:10 email was
 cut): send_imm_digest.py --section-out, run as a child process (imm_section),
 with the dashboard's yesterday / 7-day / 30-day figures; its PICK-OFF WINDOW
 flag goes onto this subject, and its risk block (risk_text / risk_html) is
-the one placed under the chart. A failed section is one line saying so,
-never a held email. Kill: PF_IMM_SECTION=0 or --no-imm.
+the one placed under the chart. Right under the risk block goes its Live A/B
+tests block (ab_text / ab_html, since 2026-11-05; imm_live_tests: one card
+per randomized test running, kill PF_LIVE_TESTS=0). A failed section is one
+line saying so, never a held email. Kill: PF_IMM_SECTION=0 or --no-imm.
 
 Day P&L per event (since 2026-09-29, replay_day): every fill and settlement
 since the prior morning replayed per market, from the prior snapshot's own
@@ -3029,6 +3031,11 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     if imm and imm.get("risk_text"):
         lines.append("")
         lines.append(imm["risk_text"])
+    # the live A/B tests right after the risk controls (Jack 2026-11-05:
+    # "add section on live A/B and results right after the risk controls")
+    if imm and imm.get("ab_text"):
+        lines.append("")
+        lines.append(imm["ab_text"])
     lines.append("")
     lines.append(f"Biggest movers since yesterday, by family / event, grouped "
                  f"as on the IMM dashboard (settled + unrealized at {at}; top {len(movers)} of "
@@ -3159,6 +3166,9 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
     # section builds it and hands it over on its own
     if imm and imm.get("risk_html"):
         h.append(imm["risk_html"])
+    # the live A/B tests right after the risk controls (Jack 2026-11-05)
+    if imm and imm.get("ab_html"):
+        h.append(imm["ab_html"])
 
     h.append(f'<div style="font-size:15px;font-weight:600;margin:16px 0 4px">'
              f'Biggest movers since yesterday, by family / event'
@@ -3277,7 +3287,8 @@ IMM_SECTION_LOG = os.path.join(LOG_DIR, "imm-section.log")
 
 def imm_section(today_str: str, script: str = IMM_SECTION_SCRIPT,
                 timeout: int = IMM_SECTION_TIMEOUT_S) -> dict:
-    """{"text", "html", "subject_flag"} from `send_imm_digest.py
+    """{"text", "html", "risk_text", "risk_html", "ab_text", "ab_html",
+    "subject_flag"} from `send_imm_digest.py
     --section-out`, or {"error": why}: the portfolio email goes out either
     way, saying the section is missing. The child's output goes to
     imm-section.log (UTF-8; the task log's console encoding is not)."""

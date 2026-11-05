@@ -223,14 +223,24 @@ class BuildEmailTests(unittest.TestCase):
         chart at the top"; the IMM section hands it over on its own."""
         imm = {"text": "INCENTIVE MM body", "html": "<div>IMM BODY</div>",
                "risk_text": "RISK CONTROLS & CAPACITY ...",
-               "risk_html": "<div>RISK BLOCK</div>"}
+               "risk_html": "<div>RISK BLOCK</div>",
+               "ab_text": "LIVE A/B TESTS -- ...", "ab_html": "<div>AB BLOCK</div>"}
         _, text, html = pf.build_email(self._pf(), [], chart_ok=True, imm=imm)
         self.assertLess(html.index("cid:balancechart"), html.index("RISK BLOCK"))
-        self.assertLess(html.index("RISK BLOCK"), html.index("Biggest movers"))
+        # the live A/B tests right after the risk controls (Jack 2026-11-05)
+        self.assertLess(html.index("RISK BLOCK"), html.index("AB BLOCK"))
+        self.assertLess(html.index("AB BLOCK"), html.index("Biggest movers"))
         self.assertLess(html.index("Biggest movers"), html.index("IMM BODY"))
         self.assertEqual(html.count("RISK BLOCK"), 1)
-        self.assertLess(text.index("RISK CONTROLS"), text.index("Biggest movers"))
+        self.assertEqual(html.count("AB BLOCK"), 1)
+        self.assertLess(text.index("RISK CONTROLS"), text.index("LIVE A/B TESTS"))
+        self.assertLess(text.index("LIVE A/B TESTS"), text.index("Biggest movers"))
         self.assertLess(text.index("Biggest movers"), text.index("INCENTIVE MM body"))
+        # a section from before the block (or with no test running) has none
+        del imm["ab_text"], imm["ab_html"]
+        _, text, html = pf.build_email(self._pf(), [], chart_ok=True, imm=imm)
+        self.assertNotIn("LIVE A/B", text)
+        self.assertLess(html.index("RISK BLOCK"), html.index("Biggest movers"))
 
     def test_first_run_has_no_residual_line(self):
         _, text, html = pf.build_email(self._pf(first=True), [], chart_ok=False)

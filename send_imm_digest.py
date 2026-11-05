@@ -11,7 +11,10 @@ lifetime), the last 30 days' daily P&L, the cutoff audit and a one-line
 health check. The risk controls (every halt, cap and guard: what fired, what
 binds, what has slack — see imm_risk_controls) are built here but placed by
 the portfolio email under its chart; the finecon / open-scan tracker was
-removed 2026-10-03.
+removed 2026-10-03. So is the Live A/B tests block (imm_live_tests, since
+2026-11-05: one card per randomized test running, results through
+yesterday), which the portfolio email places right under the risk block.
+Kill: PF_LIVE_TESTS=0.
 
 Everything is the INCENTIVE BOT's own book, not the raw account. Yesterday, 7
 days and the daily table are the IMM dashboard's own figures, read from the
@@ -374,6 +377,25 @@ def health_line(status: dict, ss: dict, dash_note: str = "") -> str:
 
 
 import imm_risk_controls as risk                                    # noqa: E402
+import imm_live_tests as live_tests                                 # noqa: E402
+
+# the Live A/B tests block (Jack 2026-11-05: "in the daily portfolio email,
+# add section on live A/B and results right after the risk controls")
+LIVE_TESTS_ENABLED = os.environ.get("PF_LIVE_TESTS", "1") != "0"
+
+
+def live_tests_section(now_utc: datetime):
+    """(text, html) of the Live A/B tests block, ("", "") when no test is
+    running or PF_LIVE_TESTS=0. Read-only (the bot's sinks and dashboard),
+    and it never raises: the section goes out without it."""
+    if not LIVE_TESTS_ENABLED:
+        return "", ""
+    try:
+        cards = live_tests.collect(STATUS_DIR, now_utc)
+        return "\n".join(live_tests.text_lines(cards)), live_tests.html(cards)
+    except Exception as e:
+        log(f"live A/B tests block unavailable: {e!r}")
+        return "", ""
 
 # The selection gate's "universe:" line; imm_risk_controls owns the shape now.
 _UNIVERSE_RE = risk.UNIVERSE_RE
@@ -1691,8 +1713,9 @@ def subject_flag(text: str) -> str:
 
 def write_section(path: str, now_utc: datetime) -> None:
     """--section-out: build the section and write {text, html, risk_text,
-    risk_html, subject_flag, built_at} as JSON for send_portfolio_digest,
-    which puts the risk block under its chart and the rest after its movers
+    risk_html, ab_text, ab_html, subject_flag, built_at} as JSON for
+    send_portfolio_digest, which puts the risk block under its chart, the
+    Live A/B tests block right under that, and the rest after its movers
     table. A few retries, as the old standalone send had: a Kalshi read can
     fail on the first try."""
     for attempt in range(1, 4):
@@ -1704,8 +1727,10 @@ def write_section(path: str, now_utc: datetime) -> None:
             if attempt == 3:
                 raise
             time.sleep(60)
+    ab_text, ab_html = live_tests_section(now_utc)
     out = {"text": text, "html": html, "risk_text": risk_text,
-           "risk_html": risk_html, "subject_flag": subject_flag(text),
+           "risk_html": risk_html, "ab_text": ab_text, "ab_html": ab_html,
+           "subject_flag": subject_flag(text),
            "built_at": datetime.now(timezone.utc).isoformat()}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1732,11 +1757,13 @@ def main(argv=None) -> int:
         return 0
 
     if args.print_only:
-        body, html, risk_text, risk_html = build_digest(datetime.now(timezone.utc))
-        print(risk_text + "\n\n" + body)
+        now_utc = datetime.now(timezone.utc)
+        body, html, risk_text, risk_html = build_digest(now_utc)
+        ab_text, ab_html = live_tests_section(now_utc)
+        print(risk_text + "\n\n" + (ab_text + "\n\n" if ab_text else "") + body)
         if args.html_out:
             with open(args.html_out, "w", encoding="utf-8") as f:
-                f.write(risk_html + html)
+                f.write(risk_html + ab_html + html)
             log(f"wrote {args.html_out}")
         return 0
 
@@ -1751,8 +1778,11 @@ def main(argv=None) -> int:
 
     now_utc = datetime.now(timezone.utc)
     body, html, risk_text, risk_html = build_digest(now_utc)
-    # standalone, the risk block leads, as it does under the portfolio chart
-    body, html = risk_text + "\n\n" + body, risk_html + html
+    ab_text, ab_html = live_tests_section(now_utc)
+    # standalone, the risk block leads, as it does under the portfolio
+    # chart, with the Live A/B tests block under it
+    body = risk_text + "\n\n" + (ab_text + "\n\n" if ab_text else "") + body
+    html = risk_html + ab_html + html
     alerter = Alerter("IMM-DIGEST", live=True)
     if not alerter.enabled:
         log("cannot send imm digest: alert credentials not configured")

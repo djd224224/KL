@@ -346,7 +346,9 @@ class SectionTests(_DigestTest):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(self.sd, "build_digest",
                                   return_value=(body, "<div>x</div>", "RISK",
-                                                "<div>r</div>")) as bd:
+                                                "<div>r</div>")) as bd, \
+                mock.patch.object(self.sd, "live_tests_section",
+                                  return_value=("AB", "<div>ab</div>")):
             p = os.path.join(d, "s.json")
             self.assertEqual(self.sd.main(["--section-out", p]), 0)
             with open(p, encoding="utf-8") as f:
@@ -356,8 +358,29 @@ class SectionTests(_DigestTest):
         self.assertEqual((sec["text"], sec["html"]), (body, "<div>x</div>"))
         # the risk block travels on its own, for the portfolio email's chart
         self.assertEqual((sec["risk_text"], sec["risk_html"]), ("RISK", "<div>r</div>"))
+        # so does the Live A/B tests block, which goes right under it
+        self.assertEqual((sec["ab_text"], sec["ab_html"]), ("AB", "<div>ab</div>"))
         self.assertEqual(sec["subject_flag"], " - " + self.sd.imm_pickoff.HEADER)
         self.assertEqual(self.sd.subject_flag("no window today"), "")
+
+    def test_live_tests_block_never_holds_the_section(self):
+        """Jack 2026-11-05: "add section on live A/B and results right after
+        the risk controls"; a test that fails to score costs the block, not
+        the email."""
+        from unittest import mock
+        lt = self.sd.live_tests
+        with mock.patch.object(lt, "collect", return_value=[]):
+            self.assertEqual(self.sd.live_tests_section(None), ("", ""))
+        with mock.patch.object(lt, "collect", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.sd.live_tests_section(None), ("", ""))
+        card = {"name": "Tape trigger A/B", "error": "OSError: x"}
+        with mock.patch.object(lt, "collect", return_value=[card]):
+            text, html = self.sd.live_tests_section(None)
+        self.assertTrue(text.startswith("LIVE A/B TESTS"))
+        self.assertIn("not available", html)
+        with mock.patch.object(self.sd, "LIVE_TESTS_ENABLED", False), \
+                mock.patch.object(lt, "collect", side_effect=AssertionError("built")):
+            self.assertEqual(self.sd.live_tests_section(None), ("", ""))
 
 
 if __name__ == "__main__":
