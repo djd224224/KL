@@ -3123,6 +3123,83 @@ def unwind_side_sizes(series: str, pos: float, maxpos: float) -> Tuple[int, int]
     return (n, 0) if pos < 0 else (0, n)
 
 
+# BREAKEVEN OFFSET (Jack 2026-11-05: "add a rule where the overall exposure
+# e.g. short 200 contracts should at least quote a buy of 200 contracts to
+# offset the short (if it's higher than what would otherwise be quoted) if
+# the match nets out at breakeven or better. apply to any event that's 30D
+# out or more", after "why dont large positions get worked down? especially
+# that are far out without much pickoff risk e.g. POPVOTEMOV-28NOV07").
+# On a market whose quoting stop (its cutoff, else its close) is at least
+# BE_OFFSET_DAYS away and where the bot's OWN position is at least
+# BE_OFFSET_MIN_CONTRACTS, the side that reduces the position carries the
+# whole position: the reducing rung nearest the touch that is priced at the
+# bot's average cost or better (a bid at or under the average a short sold
+# at, an ask at or over the average a long paid) is raised so the side
+# totals the position. Never a new price -- a reducing side priced worse
+# than breakeven keeps its normal size -- and never past flat. A market the
+# bot no longer selects keeps a reduce-only leg for it (managed_extra, with
+# WINDDOWN_DROPPED off): only its breakeven-or-better reducing rungs rest,
+# sized to the position, so a dropped market never sells or covers at a
+# loss to its cost. Blocklisted events, call windows and markets where the
+# account's position is not the bot's (manual trades) are left alone; the
+# no-rent freeze does not apply (the offset is about the position, not the
+# program). Prices are against PnlTracker.avg, before fees.
+# IMM_BE_OFFSET_DAYS=0 turns it off.
+BE_OFFSET_DAYS = _env_float("IMM_BE_OFFSET_DAYS", 30.0)
+BE_OFFSET_MIN_CONTRACTS = _env_float("IMM_BE_OFFSET_MIN", 5.0)
+# a held market the orphan restore read and found no leg for is read again
+# after this long (its stop may come into range, its average appear)
+BE_ORPHAN_RETRY_SECS = 6 * 3600
+
+
+def be_offset_far(cutoff: Optional[datetime], close_time: Optional[datetime],
+                  now_utc: datetime) -> bool:
+    """Is this market's quoting stop (cutoff, else close) BE_OFFSET_DAYS or
+    more away? False with neither known or the rule off."""
+    stop = cutoff or close_time
+    return (BE_OFFSET_DAYS > 0 and stop is not None
+            and stop - now_utc >= timedelta(days=BE_OFFSET_DAYS))
+
+
+def be_offset_ok(book_side: str, price: float, avg: float) -> bool:
+    """A reducing order at `price` (YES cents) fills at the bot's average
+    cost or better: a bid buys back a short at or under the average it sold
+    at, an ask sells a long at or over the average it paid."""
+    if book_side == "bid":
+        return price <= avg + 1e-9
+    return price >= avg - 1e-9
+
+
+def breakeven_offset_quotes(quotes: List["Quote"], pos: float,
+                            avg: Optional[float], leg_only: bool = False
+                            ) -> Tuple[List["Quote"], int]:
+    """(quotes, n): the BREAKEVEN OFFSET on one market's built quotes. The
+    reducing side (bids when short, asks when long) is raised to the whole
+    position, in whole contracts, on its breakeven-or-better rung nearest the
+    touch; n is that rung's new size (0 = unchanged). `leg_only` (a market
+    the bot no longer selects): only breakeven-or-better reducing rungs are
+    kept, and they carry the position. Pads never count or carry."""
+    if not avg or abs(pos) < max(1.0, BE_OFFSET_MIN_CONTRACTS):
+        return ([] if leg_only else quotes), 0
+    side = "bid" if pos < 0 else "ask"
+
+    def px(q: "Quote") -> float:
+        return q.price_exact if q.price_exact is not None else float(q.price_cents)
+
+    if leg_only:
+        quotes = [q for q in quotes if q.book_side == side and not q.is_pad
+                  and be_offset_ok(side, px(q), avg)]
+    rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
+    ok = [q for q in rungs if be_offset_ok(side, px(q), avg)]
+    want = int(abs(pos))
+    have = sum(q.count for q in rungs)
+    if not ok or have >= want:
+        return quotes, 0
+    best = max(ok, key=px) if side == "bid" else min(ok, key=px)
+    n = best.count + (want - have)
+    return [replace(q, count=n) if q is best else q for q in quotes], n
+
+
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
     ov = SERIES_OVERRIDES.get(series)
     return ov.pre_cutoff_reduce_only_secs \
@@ -12441,6 +12518,7 @@ _CONFIG_CODE_KNOBS = (
     # near-cliff room priority
     "ADMIT_SUSTAIN_SECS", "ADMIT_RUN_MAX_GAP_SECS",
     "ADMIT_SKIP_MULT",            # a 3x margin skips the wait (2026-11-01)
+    "BE_OFFSET_DAYS", "BE_OFFSET_MIN_CONTRACTS",   # breakeven offset (2026-11-05)
     "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
     "HOURLY_PROGRAM_MAX_HOURS",
     "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
@@ -24100,6 +24178,12 @@ class IncentiveMarketMaker:
         self._rt_settled_on: Dict[str, bool] = {}       # RT SETTLED STRIKES' logged state
         self._rt_locked_on: Dict[str, bool] = {}        # RT LOCKED SIZE's logged state
         self._rt_locked_n: Dict[str, int] = {}          # ... ticker -> the side size it rests
+        # BREAKEVEN OFFSET: ticker -> (the reducing side's total, its raised
+        # rung's size) this cycle -- the placement backstop brackets that
+        # side and level by them -- and its logged state
+        self._be_offset_n: Dict[str, Tuple[int, int]] = {}
+        self._be_offset_noted: Dict[str, Tuple[str, int, int]] = {}
+        self._be_orphan_skip: Dict[str, float] = {}     # ticker -> next orphan read
         # FAIR CLOSE: (ticker, side) -> the closing rung's last logged price,
         # and ticker -> (side, YES price) of the closing rung it rests now
         self._fair_close_noted: Dict[Tuple[str, str], Optional[int]] = {}
@@ -33682,11 +33766,24 @@ class IncentiveMarketMaker:
         NO-OP unless WINDDOWN_DROPPED (Jack 2026-09-07): with the wind-down
         off there is nothing to manage on a dropped market — its orders are
         cancelled — and the event-cap accounting no longer needs a meta
-        either (event_net reads the own book directly)."""
-        if not WINDDOWN_DROPPED:
+        either (event_net reads the own book directly). EXCEPT a BREAKEVEN
+        OFFSET leg (2026-11-05): with the wind-down off, a held market the
+        offset covers (_be_leg_wanted: far enough out, the bot's own
+        position with an average) gets its meta back too; the rest are
+        skipped for BE_ORPHAN_RETRY_SECS so a cycle reads no market twice."""
+        be_only = not WINDDOWN_DROPPED
+        if be_only and BE_OFFSET_DAYS <= 0:
             return
+        now_ts = time.time()
+        if be_only:
+            for t in [t for t, ts in self._be_orphan_skip.items() if ts <= now_ts]:
+                del self._be_orphan_skip[t]
         missing = [t for t in self.state.known_tickers
                    if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
+                   and (not be_only or (t not in self._be_orphan_skip
+                                        and self.pnl.avg.get(t)
+                                        and abs(self.pnl.pos.get(t, 0.0))
+                                        >= max(1.0, BE_OFFSET_MIN_CONTRACTS)))
                    and t not in self.state.selected
                    and t not in self.state.managed_extra
                    # BLOCKLISTED = frozen entirely — not even reduce-only
@@ -33699,7 +33796,10 @@ class IncentiveMarketMaker:
                    # programs expired): a market with no LIVE incentive
                    # program gets no orders either — quotes exist only where
                    # rent exists. Empty programmed set = failsafe open.
-                   and (not self.state.programmed or t in self.state.programmed)
+                   # (A BREAKEVEN OFFSET leg is about the position, not the
+                   # program: the freeze does not apply to it.)
+                   and (be_only or not self.state.programmed
+                        or t in self.state.programmed)
                    # CALL-WINDOW FREEZE (Jack 2026-08-06: "sit out completely
                    # during call windows"). Same treatment as blocklisted —
                    # positions ride to settlement, flatten by hand.
@@ -33710,6 +33810,7 @@ class IncentiveMarketMaker:
                    < MANUAL_STANDOFF_CONTRACTS]
         if not missing:
             return
+        now_utc = datetime.now(timezone.utc)
         for i in range(0, len(missing), 50):
             chunk = missing[i:i + 50]
             try:
@@ -33717,11 +33818,14 @@ class IncentiveMarketMaker:
             except Exception as e:
                 log(f"{self.tag} ! orphan meta read failed ({e}); retry next cycle")
                 return
+            if be_only:                  # read once per BE_ORPHAN_RETRY_SECS
+                for t in chunk:
+                    self._be_orphan_skip[t] = now_ts + BE_ORPHAN_RETRY_SECS
             for m in (resp.get("markets") or []):
                 t = m.get("ticker", "")
                 self._note_shard(t, m.get("exchange_index"))
                 event_ticker = m.get("event_ticker") or t.rsplit("-", 1)[0]
-                self.state.managed_extra[t] = MarketMeta(
+                meta = MarketMeta(
                     ticker=t, event_ticker=event_ticker, series=t.split("-")[0],
                     dollars_per_day=0.0, program_end=None, target_size=0.0,
                     discount_factor=0.5,
@@ -33738,8 +33842,35 @@ class IncentiveMarketMaker:
                         market=m),
                     close_time=parse_iso_utc(m.get("close_time", "")),
                     price_step=market_price_step(m))
+                if be_only:
+                    if not self._be_leg_wanted(t, meta, positions, now_utc):
+                        continue
+                    self._be_orphan_skip.pop(t, None)
+                    self.state.managed_extra[t] = meta
+                    log(f"{self.tag} restored breakeven-offset leg {t} "
+                        f"(pos {self.pnl.pos.get(t, 0):+.0f}, avg "
+                        f"{self.pnl.avg.get(t, 0):.1f}c)")
+                    continue
+                self.state.managed_extra[t] = meta
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")
+
+    def _be_leg_wanted(self, t: str, meta: "MarketMeta", positions: Dict[str, float],
+                       now_utc: datetime) -> bool:
+        """BREAKEVEN OFFSET: does this market, not selected, keep a reduce-only
+        leg (WINDDOWN_DROPPED off)? The bot's own position at least
+        BE_OFFSET_MIN_CONTRACTS with an average cost, the account's position
+        the bot's (no manual trades), BE_OFFSET_DAYS or more to its stop, and
+        neither blocklisted nor inside a call window."""
+        if BE_OFFSET_DAYS <= 0 or WINDDOWN_DROPPED:
+            return False
+        own = self.pnl.pos.get(t, 0.0)
+        return (abs(own) >= max(1.0, BE_OFFSET_MIN_CONTRACTS)
+                and bool(self.pnl.avg.get(t))
+                and abs(positions.get(t, 0.0) - own) < MANUAL_STANDOFF_CONTRACTS
+                and be_offset_far(meta.cutoff, meta.close_time, now_utc)
+                and not self._blocked(t)
+                and not self._call_window_started(meta.event_ticker, now_utc))
 
     @staticmethod
     def _call_window_started(event_ticker: str,
@@ -34303,18 +34434,26 @@ class IncentiveMarketMaker:
         # and the stray-order sweep below cancels whatever is resting on it.
         managed: Dict[str, MarketMeta] = dict(self.state.selected)
         if not WINDDOWN_DROPPED and self.state.managed_extra:
-            log(f"{self.tag} dropped-market wind-down is off: releasing "
-                f"{len(self.state.managed_extra)} held market(s) to the "
-                f"stray-order sweep "
-                f"({', '.join(sorted(self.state.managed_extra)[:6])}"
-                + (" ..." if len(self.state.managed_extra) > 6 else "") + ")")
-            self.state.managed_extra.clear()
+            # ...except a BREAKEVEN OFFSET leg (2026-11-05): a held market far
+            # enough out keeps a reduce-only leg (_be_leg_wanted)
+            released = sorted(t for t, m in self.state.managed_extra.items()
+                              if t not in self.state.selected
+                              and not self._be_leg_wanted(t, m, positions, now_utc))
+            if released:
+                log(f"{self.tag} dropped-market wind-down is off: releasing "
+                    f"{len(released)} held market(s) to the "
+                    f"stray-order sweep "
+                    f"({', '.join(released[:6])}"
+                    + (" ..." if len(released) > 6 else "") + ")")
+            for t in released:
+                self.state.managed_extra.pop(t, None)
         for t, meta in list(self.state.managed_extra.items()):
             if self._blocked(t):
                 # frozen series (see restore_orphan_metas): flush any entry
                 # that predates the blocklisting so no wind-down orders rest
                 self.state.managed_extra.pop(t, None)
-            elif self.state.programmed and t not in self.state.programmed:
+            elif WINDDOWN_DROPPED and self.state.programmed \
+                    and t not in self.state.programmed:
                 # NO-RENT FREEZE: the market's incentive program ended, so
                 # wind-down quoting ends with it (Jack 2026-07-26, KXRT).
                 # Re-programming re-admits it through normal selection.
@@ -34333,6 +34472,14 @@ class IncentiveMarketMaker:
                 # remember metas for later reduce-only management
                 if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS:
                     self.state.managed_extra[t] = self.state.selected[t]
+        elif BE_OFFSET_DAYS > 0:
+            # ...or, with the wind-down off, for a BREAKEVEN OFFSET leg once
+            # the market is dropped
+            for t, m in list(self.state.selected.items()):
+                if self._be_leg_wanted(t, m, positions, now_utc):
+                    self.state.managed_extra[t] = m
+                else:
+                    self.state.managed_extra.pop(t, None)
 
         self.state.known_tickers |= set(managed)
         # Prune dead entries (unmanaged, flat) so the set stays bounded.
@@ -36442,6 +36589,40 @@ class IncentiveMarketMaker:
                             f"of the scored walk (book {ext_bid}x{ext_ask}) -- "
                             f"not resting it")
                     self._vercel_unearning[t] = _v_dropped
+            # BREAKEVEN OFFSET (BE_OFFSET_DAYS out or more): the reducing
+            # side carries the whole position at breakeven or better; a
+            # dropped market's leg keeps only those rungs. The event room
+            # below is charged the quotes as built (mq_built), so the
+            # offset never squeezes a sibling's side.
+            # (With WINDDOWN_DROPPED armed a dropped market keeps the old
+            # reduce-only wind-down, the offset on top; off -- the default --
+            # it is managed only as an offset leg.)
+            mq_built = mq
+            be_n = 0
+            be_leg = t not in self.state.selected and not WINDDOWN_DROPPED
+            if be_offset_far(meta.cutoff, meta.close_time, now_utc) \
+                    and not (pos_manual or event_manual):
+                mq, be_n = breakeven_offset_quotes(
+                    mq, own_pos, self.pnl.avg.get(t), leg_only=be_leg)
+            elif be_leg:
+                mq = []
+            if be_leg:
+                mq_built = []          # a leg only reduces: no event room
+            if be_n:
+                self._be_offset_n[t] = (int(abs(own_pos)), be_n)
+                be_side = "bid" if own_pos < 0 else "ask"
+                be_q = next(q for q in mq if q.count == be_n and q.book_side == be_side)
+                key = (be_side, be_q.price_cents, be_n)
+                if self._be_offset_noted.get(t) != key:
+                    self._be_offset_noted[t] = key
+                    log(f"{self.tag} breakeven offset {t}: {be_side}s total "
+                        f"{int(abs(own_pos))} ({be_n} @ {be_q.price_cents}c) to cover "
+                        f"{'short' if own_pos < 0 else 'long'} {abs(own_pos):.0f} "
+                        f"(avg {self.pnl.avg.get(t, 0):.1f}c)"
+                        + (" -- dropped-market leg" if be_leg else ""))
+            else:
+                self._be_offset_n.pop(t, None)
+                self._be_offset_noted.pop(t, None)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -36451,9 +36632,9 @@ class IncentiveMarketMaker:
                 # strikes and silently killed every later sibling's YES side
                 # (live bug 2026-07-29, TRUMPMENTIONB: ask-only on ~20
                 # strikes the morning pads went global).
-                bought = sum(q.count for q in mq
+                bought = sum(q.count for q in mq_built
                              if q.book_side == "bid" and not q.is_pad)
-                sold = sum(q.count for q in mq
+                sold = sum(q.count for q in mq_built
                            if q.book_side == "ask" and not q.is_pad)
                 event_room_buy[ev] = event_room_buy.get(ev, event_cap_contracts(ev)) - bought
                 event_room_sell[ev] = event_room_sell.get(ev, event_cap_contracts(ev)) - sold
@@ -37406,6 +37587,13 @@ class IncentiveMarketMaker:
             _u = _ub if q.book_side == "bid" else _ua
             side_cap = max(side_cap, _u)
             max_level_size = max(max_level_size, _u)
+            # BREAKEVEN OFFSET: the reducing side may rest the whole position
+            # on its breakeven rung (the quote loop sized it so this cycle)
+            _bp = self.pnl.pos.get(q.ticker, 0.0)
+            if (q.book_side == "bid") == (_bp < 0):
+                _be_side, _be_rung = self._be_offset_n.get(q.ticker, (0, 0))
+                side_cap = max(side_cap, _be_side)
+                max_level_size = max(max_level_size, _be_rung)
             # a LOCKED strike's side rests RT_LOCKED_SIDE (RT LOCKED SIZE; the
             # quote loop sized it so this cycle)
             _rl = self._rt_locked_n.get(q.ticker, 0)
@@ -39944,6 +40132,12 @@ class IncentiveMarketMaker:
                + (" (dry: logged, quoted as before)" if FAIR_CLOSE_MODE == "dry"
                   else "")
                if FAIR_CLOSE_MODE in ("on", "dry") else ""))
+        log("breakeven offset (2026-11-05): "
+            + (f"markets {BE_OFFSET_DAYS:g}+ days from their stop -- the side that "
+               f"reduces the bot's own position (>= {BE_OFFSET_MIN_CONTRACTS:g}) rests "
+               f"the whole position on its breakeven-or-better rung; a dropped "
+               f"market keeps that rung as a reduce-only leg"
+               if BE_OFFSET_DAYS > 0 else "off"))
         log("array tail leads (2026-11-02): "
             + (f"{FAIR_LEAD_MODE} -- {', '.join(CA_ARRAY_LEAD_SERIES)}: a strike "
                f"offers target/5 at {100 - CA_ARRAY_LEAD_EDGE_C}c (bids it at "

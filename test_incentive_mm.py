@@ -39675,6 +39675,180 @@ class TestElectionNightSession(unittest.TestCase):
             self.assertEqual(imm.longshot_side_mults(self.S, 90.0), (1.0, 1.0))
 
 
+class TestBreakevenOffset(unittest.TestCase):
+    """Jack 2026-11-05: "add a rule where the overall exposure e.g. short 200
+    contracts should at least quote a buy of 200 contracts to offset the
+    short (if it's higher than what would otherwise be quoted) if the match
+    nets out at breakeven or better. apply to any event that's 30D out or
+    more"."""
+    T, EV = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31"
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _hold(self, bot, pos, avg):
+        bot.client.positions[self.T] = pos
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = float(pos), float(avg)
+
+    def _side(self, bot, side):
+        return [o for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T and o["book_side"] == side]
+
+    # --- the pieces ---------------------------------------------------
+    def test_thirty_days_from_the_stop(self):
+        now = datetime(2026, 11, 5, tzinfo=timezone.utc)
+        f = imm.be_offset_far
+        self.assertTrue(f(now + timedelta(days=30), None, now))
+        self.assertFalse(f(now + timedelta(days=29, hours=23), None, now))
+        self.assertTrue(f(None, now + timedelta(days=400), now))       # close when no cutoff
+        self.assertFalse(f(now + timedelta(days=5), now + timedelta(days=400), now))
+        self.assertFalse(f(None, None, now))
+        with mock.patch.object(imm, "BE_OFFSET_DAYS", 0):
+            self.assertFalse(f(now + timedelta(days=400), None, now))
+
+    def test_the_reducing_side_carries_the_position_at_breakeven_or_better(self):
+        Q, f = imm.Quote, imm.breakeven_offset_quotes
+        qs = [Q("T", "bid", 49, 60), Q("T", "ask", 51, 20), Q("T", "bid", 1, 500, is_pad=True)]
+        # short 200 sold at 55: buying back at 49 is better than breakeven
+        out, n = f(qs, -200, 55.0)
+        self.assertEqual(n, 200)
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out],
+                         [("bid", 49, 200), ("ask", 51, 20), ("bid", 1, 500)])
+        # ...sold at 45: 49 would lock a loss, so nothing changes
+        self.assertEqual(f(qs, -200, 45.0), (qs, 0))
+        self.assertEqual(f(qs, -200, 49.0)[1], 200)                    # breakeven itself
+        # long 120 paid 40: the 51c ask covers it
+        out, n = f(qs, 120, 40.0)
+        self.assertEqual((n, [q.count for q in out if q.book_side == "ask"]), (120, [120]))
+        self.assertEqual(f(qs, 120, 52.0), (qs, 0))
+        # never smaller than what was built; fractional positions round down
+        self.assertEqual(f(qs, -40, 55.0), (qs, 0))
+        self.assertEqual(f(qs, -200.7, 55.0)[1], 200)
+        # no average, or under the minimum: unchanged
+        self.assertEqual(f(qs, -200, None), (qs, 0))
+        self.assertEqual(f(qs, -3, 55.0), (qs, 0))
+
+    def test_the_rung_nearest_the_touch_takes_it(self):
+        Q, f = imm.Quote, imm.breakeven_offset_quotes
+        qs = [Q("T", "bid", 48, 30), Q("T", "bid", 45, 30), Q("T", "bid", 60, 30)]
+        out, n = f(qs, -200, 50.0)
+        # 60 is past breakeven; 48 is the best price at or under 50
+        self.assertEqual(n, 30 + 110)
+        self.assertEqual([q.count for q in out], [140, 30, 30])
+        # a sub-penny rung is judged at its exact price
+        sp = [Q("T", "bid", 50, 30, price_exact=50.4)]
+        self.assertEqual(f(sp, -200, 50.0), (sp, 0))
+        self.assertEqual(f(sp, -200, 50.5)[1], 200)
+
+    def test_a_dropped_markets_leg_keeps_only_breakeven_rungs(self):
+        Q, f = imm.Quote, imm.breakeven_offset_quotes
+        qs = [Q("T", "bid", 49, 60), Q("T", "bid", 1, 500, is_pad=True), Q("T", "ask", 51, 20)]
+        out, n = f(qs, -200, 55.0, leg_only=True)
+        self.assertEqual(([(q.book_side, q.price_cents, q.count) for q in out], n),
+                         ([("bid", 49, 200)], 200))
+        self.assertEqual(f(qs, -200, 45.0, leg_only=True), ([], 0))
+        self.assertEqual(f(qs, -200, None, leg_only=True), ([], 0))
+
+    # --- end to end ---------------------------------------------------
+    def test_a_selected_short_rests_a_full_buy_back(self):
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.selected)
+        normal = sum(o["remaining_count"] for o in self._side(bot, "bid"))
+        self.assertLess(normal, 200)
+        self._hold(bot, -200, 55.0)
+        bot.run_cycle()
+        bids = self._side(bot, "bid")
+        self.assertEqual(sum(o["remaining_count"] for o in bids if o["yes_price"] > 1), 200)
+        self.assertTrue(all(o["yes_price"] <= 55 for o in bids))
+        side_total, rung = bot._be_offset_n.get(self.T)
+        self.assertEqual(side_total, 200)
+        self.assertEqual(rung, max(o["remaining_count"] for o in bids))
+
+    def test_a_short_sold_under_the_touch_keeps_its_normal_size(self):
+        bot = self._bot()
+        self._hold(bot, -200, 45.0)            # the 49c bid would lock a loss
+        bot.run_cycle()
+        self.assertLess(sum(o["remaining_count"] for o in self._side(bot, "bid")), 200)
+        self.assertNotIn(self.T, bot._be_offset_n)
+
+    def test_near_the_stop_no_offset(self):
+        bot = self._bot()
+        self._hold(bot, -200, 55.0)
+        with mock.patch.object(imm, "BE_OFFSET_DAYS", 1_000_000):   # stop "too near"
+            bot.run_cycle()
+        self.assertLess(sum(o["remaining_count"] for o in self._side(bot, "bid")), 200)
+
+    def test_a_dropped_market_keeps_a_breakeven_leg(self):
+        self.assertFalse(imm.WINDDOWN_DROPPED)
+        bot = self._bot()
+        bot.state.universe_at = time.time()          # skip refresh: nothing selected
+        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
+                                                series="KXGOOD")
+        self._hold(bot, -200, 55.0)
+        bot.run_cycle()
+        self.assertIn(self.T, bot.state.managed_extra)
+        orders = list(bot.state.sim_orders.values())
+        self.assertTrue(orders)
+        self.assertTrue(all(o["book_side"] == "bid" and o["yes_price"] <= 55 for o in orders))
+        self.assertEqual(sum(o["remaining_count"] for o in orders), 200)
+
+    def test_a_dropped_market_never_rests_past_breakeven(self):
+        bot = self._bot()
+        bot.state.universe_at = time.time()
+        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
+                                                series="KXGOOD")
+        self._hold(bot, -200, 45.0)            # buying back at 49 is a loss
+        bot.run_cycle()
+        self.assertEqual(bot.state.sim_orders, {})
+
+    def test_a_blocked_or_manual_dropped_market_gets_no_leg(self):
+        bot = self._bot()
+        bot.state.universe_at = time.time()
+        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
+                                                series="KXGOOD")
+        self._hold(bot, -200, 55.0)
+        bot.client.positions[self.T] = -260    # 60 of it is his
+        bot.run_cycle()
+        self.assertEqual(bot.state.sim_orders, {})
+        self.assertNotIn(self.T, bot.state.managed_extra)
+        bot = self._bot()
+        bot.state.universe_at = time.time()
+        bot.state.managed_extra[self.T] = _meta(ticker=self.T, event_ticker=self.EV,
+                                                series="KXGOOD")
+        self._hold(bot, -200, 55.0)
+        with mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES",
+                               imm.SERIES_BLOCKLIST_PREFIXES + ("KXGOOD-99DEC31",)):
+            bot.run_cycle()
+        self.assertEqual(bot.state.sim_orders, {})
+
+    def test_the_orphan_restore_brings_a_leg_back(self):
+        bot = self._bot()
+        bot.state.known_tickers.add(self.T)
+        self._hold(bot, -200, 55.0)
+        bot.restore_orphan_metas({self.T: -200.0})
+        self.assertIn(self.T, bot.state.managed_extra)
+        # a market the offset does not cover is read once, then skipped
+        bot = self._bot()
+        bot.state.known_tickers.add(self.T)
+        self._hold(bot, -200, 55.0)
+        with mock.patch.object(imm, "BE_OFFSET_DAYS", 1_000_000):
+            bot.restore_orphan_metas({self.T: -200.0})
+            self.assertNotIn(self.T, bot.state.managed_extra)
+            self.assertIn(self.T, bot._be_orphan_skip)
+            calls = list(getattr(bot.client, "calls", []))
+            bot.restore_orphan_metas({self.T: -200.0})
+            self.assertEqual(list(getattr(bot.client, "calls", [])), calls)
+
+    def test_off_switch(self):
+        bot = self._bot()
+        self._hold(bot, -200, 55.0)
+        with mock.patch.object(imm, "BE_OFFSET_DAYS", 0):
+            bot.run_cycle()
+        self.assertLess(sum(o["remaining_count"] for o in self._side(bot, "bid")), 200)
+
+
 if __name__ == "__main__":
     unittest.main()
 
