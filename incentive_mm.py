@@ -9440,8 +9440,21 @@ FORCE_EVENTS = FORCE_EVENTS | frozenset(
 #     trigger (toxic_exempt, sweep_exempt). The WS fast cancel and the
 #     account-level halts stay.
 # IMM_ENS_EVENTS="" turns it off (env => task-level restart).
+# THE SESSION IS OVER (Jack 2026-11-05: "Yes, end it", on "End the
+# election-night session so KXSENATESEATSD-29 quotes normally?"): the
+# default is now EMPTY. Its window closed 11/04 00:00 ET, but the override
+# below is keyed by SERIES, so KXSENATESEATSD-29 (2029 Senate, listed 11/04)
+# inherited it: cancelled every day 00:00-19:00 ET by the blackout (logged
+# as "AAA print blackout"), and in the evening quoted uncapped (1,000,000),
+# off the family x2 and exempt from the sweep breaker / tape trigger /
+# toxic halts. With no session KXSENATESEATSD is a plain elections-family
+# series again. The machinery stays for another one-night session: set
+# IMM_ENS_EVENTS (+ _START_ET / _END_ET) in the launcher and restart the
+# task -- and give it an event whose series has no other open event, or
+# scope the override first. ENS_SKIP_MARKETS keeps its -27 entries (that
+# event is past its voting-day cutoff, so they block nothing live).
 ENS_EVENTS = frozenset(e.strip() for e in os.environ.get(
-    "IMM_ENS_EVENTS", "KXSENATESEATSD-27").split(",") if e.strip())
+    "IMM_ENS_EVENTS", "").split(",") if e.strip())
 ENS_SERIES = frozenset(e.split("-")[0] for e in ENS_EVENTS)
 ENS_START_ET = os.environ.get("IMM_ENS_START_ET", "2026-11-03 19:00")
 ENS_END_ET = os.environ.get("IMM_ENS_END_ET", "2026-11-04 00:00")
@@ -9582,12 +9595,19 @@ def ens_ticker(ticker: str) -> bool:
 # atref_price_tol_ticks=0 (2026-11-04): the rungs follow the anchor BOTH ways
 # on every move -- the at-ref "never chase toward the touch" keep left 53's
 # asks at 83-89c after its ask fell to 71c (anchor 73c)
-for _s in ENS_SERIES:
-    SERIES_OVERRIDES[_s] = replace(
+def ens_series_override() -> "SeriesOverride":
+    """The series override an election night session installs on its series:
+    the election archetype with ENS_LEVELS, the ENS cap and price band, no
+    family multiplier, and a 00:00 -> ENS_START blackout."""
+    return replace(
         SERIES_OVERRIDES[ELECTION_ARCHETYPE], size_mult=None,
         levels=ENS_LEVELS, max_position=ENS_MAX_POSITION, atref_price_tol_ticks=0,
         price_min_cents=ENS_PRICE_MIN, price_max_cents=ENS_PRICE_MAX,
         blackout_et=("00:00", ENS_START.astimezone(ET).strftime("%H:%M")))
+
+
+for _s in ENS_SERIES:
+    SERIES_OVERRIDES[_s] = ens_series_override()
 FORCE_EVENTS = FORCE_EVENTS | ENS_EVENTS
 
 # POST-VOTE DEAD BOOKS (Jack 2026-11-04: "a whole wave of election markets

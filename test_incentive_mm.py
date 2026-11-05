@@ -39485,11 +39485,50 @@ class TestOwnBookFlatten(unittest.TestCase):
         self.assertEqual([q.price_cents for q in out], [66])
 
 
+def _ens_1103_on(test):
+    """Turn the 11/03 election night session back on for one test: the
+    module default is empty since 2026-11-05 (Jack: "Yes, end it"), so the
+    session's own tests install what the import used to."""
+    ev = frozenset({"KXSENATESEATSD-27"})
+    for p in (mock.patch.object(imm, "ENS_EVENTS", ev),
+              mock.patch.object(imm, "ENS_SERIES", frozenset({"KXSENATESEATSD"})),
+              mock.patch.object(imm, "FORCE_EVENTS", imm.FORCE_EVENTS | ev),
+              mock.patch.dict(imm.SERIES_OVERRIDES,
+                              {"KXSENATESEATSD": imm.ens_series_override()})):
+        p.start()
+        test.addCleanup(p.stop)
+
+
+class TestElectionNightSessionEnded(unittest.TestCase):
+    """Jack 2026-11-05: "Yes, end it" -- the session's series-wide override
+    had kept KXSENATESEATSD-29 blacked out 00:00-19:00 ET every day and
+    uncapped / unhalted in the evening."""
+
+    def test_no_session_by_default(self):
+        self.assertEqual(imm.ENS_EVENTS, frozenset())
+        self.assertEqual(imm.ENS_SERIES, frozenset())
+        s = "KXSENATESEATSD"
+        self.assertFalse(imm.ens_series(s))
+        self.assertFalse(imm.ens_ticker("KXSENATESEATSD-29-50"))
+        ov = imm.SERIES_OVERRIDES.get(s)
+        self.assertTrue(ov is None or ov.blackout_et is None, ov)
+        for h in (5, 12, 18):     # 00:00-19:00 ET used to be blacked out
+            self.assertFalse(imm.series_in_blackout(
+                s, datetime(2026, 11, 5, h, 0, tzinfo=timezone.utc)), h)
+        self.assertFalse(imm.toxic_exempt(s))
+        self.assertNotIn("KXSENATESEATSD-29", imm.FORCE_EVENTS)
+        self.assertFalse(imm.manual_coexist(s, "KXSENATESEATSD-29"))
+
+
 class TestElectionNightSession(unittest.TestCase):
     """Jack 2026-11-03: KXSENATESEATSD-27 from 7pm ET to midnight, 1x base
     size, 3 rungs 3c apart, cap 150, his manual orders ignored, no halting,
-    trading first and rewards second."""
+    trading first and rewards second. (Ended 11/05; these tests switch the
+    session back on with _ens_1103_on.)"""
     S, EV, T = "KXSENATESEATSD", "KXSENATESEATSD-27", "KXSENATESEATSD-27-53"
+
+    def setUp(self):
+        _ens_1103_on(self)
 
     def test_the_window(self):
         self.assertEqual(imm.ENS_START, datetime(2026, 11, 4, 0, 0, tzinfo=timezone.utc))
@@ -39645,6 +39684,9 @@ class TestPostVoteDeadBooks(unittest.TestCase):
     'dead' books, with wide gaps like KXATTYGENOH-26, KXOHTREASR-26NOV03"),
     "40 contracts a side, not 120", "just deploy it when ready"."""
     T, T2 = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
+
+    def setUp(self):
+        _ens_1103_on(self)     # the list skips a session's series (11/04 build)
 
     def _write(self, markets, stop=None):
         stop = stop or (datetime.now(timezone.utc) + timedelta(hours=6))
