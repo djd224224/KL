@@ -2955,18 +2955,18 @@ class TestPayoutFloorOneFifty(unittest.TestCase):
     to $1.5 (to account for risks of the orderbook changing and earnings
     falling below $1 minimum)"; 2026-10-11: "lower payout bar to $1.30
     (since pays out 1.15x on average, so a $1.30 payout bar is equivalent to
-    ~$1.5 in reality)"."""
+    ~$1.5 in reality)"; 2026-11-05: "lower general bar to 1.1"."""
 
-    def test_the_bar_is_one_thirty_and_the_exchange_minimum_is_untouched(self):
-        self.assertEqual(imm.MIN_EST_TOTAL_DOLLARS, 1.3)
+    def test_the_bar_is_one_ten_and_the_exchange_minimum_is_untouched(self):
+        self.assertEqual(imm.MIN_EST_TOTAL_DOLLARS, 1.1)
         self.assertEqual(imm.PAYOUT_FLOOR_DOLLARS, 1.0)   # a fact, not a knob
 
     def test_every_family_reads_the_same_bar(self):
         # plain, temp, a Ramp series, a Treasury, a finecon member, an
         # undated-guard series: nothing carries a lower bar of its own
         for s in ("KXGOOD", "KXTEMPDCH", "KXGOOGLADOPT", "KXUST2AD",
-                  "KXSPRLVL", "KXMLBPLAYOFFS"):
-            self.assertEqual(imm.series_min_est_total(s), 1.3, s)
+                  "KXSPRLVL", "KXMLBPLAYOFFS", "KXSENATESEATSR"):
+            self.assertEqual(imm.series_min_est_total(s), 1.1, s)
         for s, ov in imm.SERIES_OVERRIDES.items():
             if ov.min_est_total is not None:
                 if imm.SPORTS_LADDER_LEAGUE_RE.fullmatch(s):
@@ -2976,24 +2976,25 @@ class TestPayoutFloorOneFifty(unittest.TestCase):
                     # escalators to $1") -- the $1.00 cliff itself
                     self.assertEqual(imm.series_min_est_total(s), 1.0, s)
                     continue
-                self.assertGreaterEqual(imm.series_min_est_total(s), 1.3,
-                                        f"{s} carries a bar under $1.30")
+                self.assertGreaterEqual(imm.series_min_est_total(s), 1.1,
+                                        f"{s} carries a bar under $1.10")
 
-    def test_a_projection_between_one_and_one_thirty_does_not_enter(self):
+    def test_a_projection_between_one_and_one_ten_does_not_enter(self):
         # mirror of the entry/hopeless test in refresh_universe:
         #   accrued + max(est_total, peak) >= series_min_est_total(series)
         def reaches(accrued, est_total, peak=0.0, series="KXGOOD"):
             return (accrued + max(est_total, peak)
                     >= imm.series_min_est_total(series))
-        self.assertFalse(reaches(0.0, 1.20))          # cleared the old $1 bar
-        self.assertFalse(reaches(0.0, 1.29))
-        self.assertTrue(reaches(0.0, 1.30))
+        self.assertFalse(reaches(0.0, 1.05))          # cleared the old $1 bar
+        self.assertFalse(reaches(0.0, 1.09))
+        self.assertTrue(reaches(0.0, 1.10))
+        self.assertTrue(reaches(0.0, 1.22))           # KXSENATESEATSR-29-51, 11/05
         self.assertTrue(reaches(0.6, 0.95))           # accrued counts
         self.assertTrue(reaches(0.0, 0.9, peak=1.6))  # the 1h peak counts
 
     def test_both_floors_are_in_the_config_hash(self):
         cfg, _digest = imm._build_config()
-        self.assertEqual(cfg.get("code:MIN_EST_TOTAL_DOLLARS"), "1.3")
+        self.assertEqual(cfg.get("code:MIN_EST_TOTAL_DOLLARS"), "1.1")
         self.assertEqual(cfg.get("code:PAYOUT_FLOOR_DOLLARS"), "1.0")
 
 

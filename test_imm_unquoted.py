@@ -431,7 +431,9 @@ class ScoreAllTests(unittest.TestCase):
         progs = {t: dict(info) for t in ("KXZZW-26NOV20-A", "KXZZW-26NOV20-B", "KXZZS-26NOV20-A",
                                          "KXZZE-26NOV20-A", "KXZZX-26NOV20-A")}
         bot = FakeBot(progs, allowed={"KXZZE"}, screens={"KXZZW-26NOV20-B": "one_sided"},
-                      per={"KXZZW-26NOV20-A": 1.0, "KXZZS-26NOV20-A": 0.1, "KXZZX-26NOV20-A": 0.8})
+                      # KXZZS: $0.08/day x 4 days x3 = $0.96, under the $1.10 bar at x3
+                      # (0.1 -> 0.08 when the bar fell from $1.30, 2026-11-05)
+                      per={"KXZZW-26NOV20-A": 1.0, "KXZZS-26NOV20-A": 0.08, "KXZZX-26NOV20-A": 0.8})
         details = {t: {"ticker": t, "status": "active"} for t in progs}
         gaps_mod = SimpleNamespace(bulk_market_details=lambda client, tks: {t: details[t] for t in tks})
 

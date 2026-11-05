@@ -11080,7 +11080,14 @@ MAX_CANDIDATE_BOOKS = _env_int("IMM_MAX_CANDIDATE_BOOKS", 5000)
 # ~1.15x the estimate on average, so $1.30 estimated ~ $1.50 paid. Same
 # single bar everywhere series_min_est_total() is read; the exit still uses
 # the $1.00 cliff (EXIT_FLOOR_IS_PAYOUT) and ladders have their own $1.00.
-MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.3)
+# 1.3 -> 1.1 (Jack 2026-11-05: "lower general bar to 1.1", after
+# KXSENATESEATSR-29-51 sat on payout_floor at $1.22 projected): at ~1.15x
+# paid, $1.10 estimated ~ $1.27 paid, still over the $1.00 cliff on average.
+# Same single bar everywhere series_min_est_total() is read (fresh entry,
+# the open-scan hopeless bar, the finecon walk, the admission clock's 3x
+# skip); per-series overrides and the ladders' $1.00 are untouched.
+# IMM_MIN_EST_TOTAL=1.3 (launcher env + task restart) restores the old bar.
+MIN_EST_TOTAL_DOLLARS = _env_float("IMM_MIN_EST_TOTAL", 1.1)
 # The exchange's own minimum: a market whose payout for a program period comes
 # to less than this is paid NOTHING. Measured, not assumed — across all 2,720
 # LIQUIDITY credits on Jack's 2026-08-04 statement the smallest is exactly
