@@ -16842,11 +16842,16 @@ def _family_lean_spec(raw: str) -> Dict[str, Tuple[float, float]]:
     return out
 
 
+# BID LEAN OFF (Jack 2026-11-05: "Yes, go flat", on the 11/05 report's
+# "BID lean STOP": bids -12.2c vs asks +0.2c a contract 10/23-11/4, quoting
+# net -$44/day against the control). Commodities & shipping, Company KPIs,
+# AI & tech and Carbon Arc consumer rest 1x a side again -- flat, not
+# flipped: AI & tech's -$1.5k of bids was mostly the OpenRouter token-use
+# sweep and Vercel's Monday miss (fixed apart), commodities' sides tied, and
+# the 3-month history had bids ahead. The ASK lean (KEEP) stays.
 _ASK_LEAN, _BID_LEAN = "0.75:1.5", "1.5:0.75"
 _DEFAULT_FAMILY_SIDE_LEANS = (
-    f"Rotten Tomatoes:{_ASK_LEAN}|Other mentions:{_ASK_LEAN}|Econ & rates:{_ASK_LEAN}|"
-    f"Commodities & shipping:{_BID_LEAN}|Company KPIs:{_BID_LEAN}|AI & tech:{_BID_LEAN}|"
-    f"Carbon Arc consumer:{_BID_LEAN}")
+    f"Rotten Tomatoes:{_ASK_LEAN}|Other mentions:{_ASK_LEAN}|Econ & rates:{_ASK_LEAN}")
 FAMILY_SIDE_LEANS = _family_lean_spec(os.environ.get("IMM_FAMILY_SIDE_LEANS",
                                                      _DEFAULT_FAMILY_SIDE_LEANS))
 FAMILY_LEAN_TTL_SECS = 6 * 3600

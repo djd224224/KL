@@ -8663,11 +8663,10 @@ class TestFamilySideLeans(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_the_default_leans(self):
+        # the BID lean is off since 2026-11-05 ("Yes, go flat")
         self.assertEqual(imm._family_lean_spec(imm._DEFAULT_FAMILY_SIDE_LEANS), {
             "Rotten Tomatoes": (0.75, 1.5), "Other mentions": (0.75, 1.5),
-            "Econ & rates": (0.75, 1.5), "Commodities & shipping": (1.5, 0.75),
-            "Company KPIs": (1.5, 0.75), "AI & tech": (1.5, 0.75),
-            "Carbon Arc consumer": (1.5, 0.75)})
+            "Econ & rates": (0.75, 1.5)})
         self.assertEqual(imm._family_lean_spec("A & B:0.5:2|bad|C:1:x| :1:1"),
                          {"A & B": (0.5, 2.0)})
         self.assertEqual(imm._family_lean_spec(""), {})
@@ -8676,15 +8675,16 @@ class TestFamilySideLeans(unittest.TestCase):
     def test_each_family_leans_its_winning_side(self):
         for s in ("KXRT", "KXWCMENTION", "KXUST10AD"):
             self.assertEqual(imm.series_side_mults(s), (0.75, 1.5), s)
+        # the former BID-lean families are flat (2026-11-05)
         for s in ("KXSUEZWEEKLY", "KXLUV", "KXOPENSOURCESHARE", "KXLULUCC"):
-            self.assertEqual(imm.series_side_mults(s), (1.5, 0.75), s)
+            self.assertEqual(imm.series_side_mults(s), (1.0, 1.0), s)
         # no lean for the rest; Trump B keeps its own sizes (quarter bids,
         # half asks since 2026-10-29)
         self.assertEqual(imm.series_side_mults("KXHIGHNY"), (1.0, 1.0))
         self.assertEqual(imm.series_side_mults("KXTRUMPMENTIONB"), (0.25, 0.5))
         now = utc(2026, 10, 23, 15, 0)
         self.assertEqual(imm.side_size_mults("KXRT-WILD-90", now), (0.75, 1.5))
-        self.assertEqual(imm.side_size_mults("KXSUEZWEEKLY-26OCT25-T40", now), (1.5, 0.75))
+        self.assertEqual(imm.side_size_mults("KXSUEZWEEKLY-26OCT25-T40", now), (1.0, 1.0))
         with mock.patch.object(imm, "FAMILY_SIDE_LEANS", {}):
             self.assertEqual(imm.series_side_mults("KXRT"), (1.0, 1.0))
 
