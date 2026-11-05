@@ -137,7 +137,9 @@ settlements.
 
 A family -> event -> market tree. Families promote the rewards report's
 "Quiet-print & scan" subjects to top level (`family_of`), because that bucket
-is most of the book. Every header sorts (default: worst net first); the
+is most of the book. Every header sorts (default: worst net first); inside
+an open family or event, the events and markets sort by the size of that
+column, biggest gain or loss first; the
 horizon buttons pick the mark-out column; "At paid rate" swaps modeled
 rewards for what Kalshi has paid per modeled dollar.
 

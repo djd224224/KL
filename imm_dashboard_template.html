@@ -1626,6 +1626,17 @@ function renderDrivers() {
     if (vb == null) return -1;
     return (va - vb) * (drvSort.k === col.k ? drvSort.dir : col.dir);
   };
+  // inside an open family or event: the biggest moves of the sort column
+  // first, gains and losses alike (Jack 2026-11-05: "reorder the events when
+  // opening dropdown in Family/Event/Market table, so it shows largest
+  // absolute magnitudes"); the families keep the header's signed order
+  const absSorter = (a, b) => {
+    const va = col.v(a), vb = col.v(b);
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return Math.abs(vb) - Math.abs(va);
+  };
   fams.sort(sorter);
   const ncol = cols.length + 1;
   // header: groups, then sortable columns
@@ -1660,7 +1671,7 @@ function renderDrivers() {
     h += row(0, fKey, esc(f.name) + ' <span class="muted small">' + evs.length + (evs.length === 1 ? " event" : " events") + "</span>", whyFam(f, top, hb, w, eod), f);
     if (!(openRows.has(fKey) || (Q && !famMatch))) continue;
     evMatch.forEach((e) => { derive(e, f.name); e.sp = spanOf("e", e.name, f.name); });
-    evMatch.sort(sorter);
+    evMatch.sort(absSorter);
     const lim = TSTATE[fKey] || 40;
     evMatch.slice(0, lim).forEach((e) => {
       const eKey = "e:" + e.name;
@@ -1680,7 +1691,7 @@ function renderDrivers() {
         x.sp = spanOf("m", m.t, f.name);
         return derive(x, f.name);
       });
-      ms.sort(sorter);
+      ms.sort(absSorter);
       for (const x of ms) {
         const m = x._m, why = cause(Object.assign({}, x, { settled: null }));   // the tag already says settled
         h += row(2, "m:" + m.t, '<span class="mono">' + esc(m.t.slice(m.ev.length + 1) || m.t) + "</span> " + stateTags(m), why ? esc(why) : "", x);
