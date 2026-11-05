@@ -39914,3 +39914,22 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([q.price_exact for q in imm.pvd_guard_quotes(winner, e, 97.0)], [98.9])
         band = {"bid_max": 90, "ask_min": 10, "cushion": 0, "pmin": 2, "pmax": 99}
         self.assertEqual(imm.pvd_guard_quotes([Q(self.T, "bid", 2, 40, price_exact=1.9)], band, 50.0), [])
+
+    def test_no_losing_side_once_decided(self):
+        """Jack 2026-11-05: "Stop on the 21": a no_losing_side market, once
+        decided, rests nothing on its losing side but a closing rung"""
+        Q = imm.Quote
+        e = {"bid_max": 0, "ask_min": 0, "cushion": 0, "pmin": 2, "pmax": 99, "no_losing": True}
+        qs = [Q(self.T, "bid", 97, 120), Q(self.T, "ask", 99, 120)]
+        # winner at 97 (decided side = bid): the ask (losing side) is dropped
+        self.assertEqual([q.book_side for q in imm.pvd_guard_quotes(qs, e, 97.0)], ["bid"])
+        # ...unless it closes a long: then capped at the position
+        out = imm.pvd_guard_quotes(qs, e, 97.0, "ask", 50.0)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 50), ("bid", 120)])
+        # in play: both sides as usual
+        self.assertEqual(len(imm.pvd_guard_quotes([Q(self.T, "bid", 40, 40), Q(self.T, "ask", 60, 40)], e, 50.0)), 2)
+        # without the switch the losing side keeps its normal guard
+        e2 = dict(e, no_losing=False)
+        self.assertEqual(sorted(q.book_side for q in imm.pvd_guard_quotes(qs, e2, 97.0)), ["ask", "bid"])
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "no_losing_side": True}, self.T2: {"bid_max": 49, "ask_min": 51}})
+        self.assertEqual((imm.PVD_MARKETS[self.T]["no_losing"], imm.PVD_MARKETS[self.T2]["no_losing"]), (True, False))

@@ -9712,6 +9712,9 @@ def load_pvd_markets() -> int:
                     "size": size, "max_pos": max_pos, "kind": kind,
                     "bsize": bsize, "asize": asize,
                     "cushion": max(0, cushion), "pmin": pmin, "pmax": pmax,
+                    # "no_losing_side": once decided, the losing side rests
+                    # nothing but a closing rung (Jack 2026-11-05: "Stop on the 21")
+                    "no_losing": bool(raw.get("no_losing_side")),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -9818,6 +9821,12 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     for q in quotes:
         if q.is_pad:
             continue
+        # a "no_losing_side" market, once decided: its losing side rests only
+        # a closing rung, never more than the position
+        if entry.get("no_losing") and decided is not None and q.book_side != decided:
+            if q.book_side != close_side or int(close_qty) < 1:
+                continue
+            q = replace(q, count=int(min(q.count, int(close_qty))))
         # the price actually sent: a sub-penny rung (price_exact, e.g. 1.20c
         # on a 0.1c-step book) is judged on it, not its whole-cent bucket --
         # 00:2xZ 11/05: 11 asks rested at 1.1-1.4c behind a 2c bucket
