@@ -75,6 +75,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from combo_rfq_logger import DEFAULT_OUT, SHARD_FACTOR  # noqa: E402
+import combo_book_lines as book_lines  # noqa: E402  (the sportsbook's line: the second fair)
 
 MARKUPS = (0.05, 0.10, 0.15, 0.20, 0.30, 0.50)
 MAX_LEG_SPREAD = 0.10
@@ -627,7 +628,8 @@ def render(rep: dict, ctx: dict, since, until) -> str:
         L.append(f"**No scored combo has settled yet** ({rep['n_pending']:,} pending): the P&L tables"
                  " wait for the settlements. The markup table needs none.")
         L.append("")
-        return "\n".join(L + _s1_lines(rep) + _markup_lines(rep) + _method_lines(rep)) + "\n"
+        return "\n".join(L + _s1_lines(rep) + book_lines.render(rep.get("book") or {})
+                         + _markup_lines(rep) + _method_lines(rep)) + "\n"
     L.append("## The flow: what today's makers made at their own prices (settled)")
     L.append("")
     L.append(f"Makers took **{usd(fl['gross'])}** on {usd(fl['prem']).lstrip('+')} of taker premium"
@@ -663,6 +665,7 @@ def render(rep: dict, ctx: dict, since, until) -> str:
         L.append(f"| {r['markup']:.0%} | " + " | ".join(usd(r["by_legs"][lab]) for _, lab in LEG_BUCKETS) + " |")
     L.append("")
     L += _s1_lines(rep)
+    L += book_lines.render(rep.get("book") or {})
     L += _markup_lines(rep)
     L.append("## Calibration (eligible, settled, takers buying YES)")
     L.append("")
@@ -720,6 +723,31 @@ def _method_lines(rep: dict) -> list:
         " requesters who steer flow to the best maker. Read-only; nothing was quoted."]
 
 
+def book_fair(dir_, since, until, sel, markets, book, get=None) -> dict:
+    """The second fair: the logger's sportsbook snapshots, plus lines read now
+    for the games they miss, against each game-winner leg's Kalshi mid and
+    result (combo_book_lines). Never raises: a failed read leaves it empty."""
+    try:
+        snaps = book_lines.load(dir_, since, until)
+        needed = set()
+        for e in sel:
+            for leg in e["legs"]:
+                ser = leg[0].split("-")[0]
+                if ser in book_lines.LEAGUES:
+                    ev = (markets.get(leg[0]) or {}).get("event_ticker") or "-".join(leg[0].split("-")[:2])
+                    d = book_lines.day_of_event(ev)
+                    if d:
+                        needed.add((ser, d))
+        later = book_lines.close_rows(needed, **({"get": get} if get else {}), log=log)
+        lines = book_lines.Lines(snaps, later)
+        out = book_lines.summarize(book_lines.calibration(sel, markets, book, lines))
+        out["snap_rows"], out["later_rows"] = len(snaps), len(later)
+        return out
+    except Exception as e:
+        log(f"! book fair: {type(e).__name__}: {str(e)[:200]}")
+        return {}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     today = datetime.now(timezone.utc).date()
@@ -741,6 +769,7 @@ def main(argv=None) -> int:
     starts = game_starts(markets)
     scored = [score_exec(e, markets, book, starts) for e in sel]
     rep = build(scored)
+    rep["book"] = book_fair(a.dir, since, until, sel, markets, book)
     ctx = flow_context(stats, runs)
     text = render(rep, ctx, since, until)
     stamp = datetime.now(et_zone()).strftime("%Y-%m-%d")

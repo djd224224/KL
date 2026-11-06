@@ -146,9 +146,10 @@ class DayWriter:
     """Appends JSON lines to <out>\\combo_<UTC date>.jsonl; at the UTC day roll
     it closes the day's file and gzips it on a background thread."""
 
-    def __init__(self, out_dir: str, clock=time.time):
+    def __init__(self, out_dir: str, clock=time.time, prefix: str = "combo"):
         self.out_dir = out_dir
         self.clock = clock
+        self.prefix = prefix
         os.makedirs(out_dir, exist_ok=True)
         self.day = None
         self.f = None
@@ -156,7 +157,7 @@ class DayWriter:
         self.gz_threads = []
 
     def path_of(self, day: str) -> str:
-        return os.path.join(self.out_dir, f"combo_{day}.jsonl")
+        return os.path.join(self.out_dir, f"{self.prefix}_{day}.jsonl")
 
     def _open(self, day: str) -> None:
         if self.f is not None:
@@ -442,6 +443,14 @@ def run(out_dir: str, minutes: float, shard_factor: int, shard_key: int, url: st
     headers = signer()
     writer = DayWriter(out_dir)
     lg = ComboLogger(writer, shard=(shard_factor, shard_key))
+    # the sportsbook lines, for the scorer's second fair (combo_book_lines):
+    # public ESPN reads on a side thread, never the WebSocket's
+    odds_stop, odds_th = threading.Event(), None
+    import combo_book_lines as bl
+    if bl.SNAPSHOT_EVERY_S > 0:
+        odds_th = threading.Thread(target=bl.snapshot_loop, args=(out_dir, odds_stop),
+                                   kwargs={"log": log}, daemon=True, name="odds")
+        odds_th.start()
     deadline = time.time() + minutes * 60 if minutes else None
     writer.write({"k": "start", "t": lg._now_iso(), "pid": os.getpid(), "url": url,
                   "shard": [shard_factor, shard_key], "minutes": minutes,
@@ -513,6 +522,9 @@ def run(out_dir: str, minutes: float, shard_factor: int, shard_key: int, url: st
         lg.upkeep(time.time(), stat_secs=1.0)       # the last partial minute, if any
         writer.write({"k": "stop", "t": lg._now_iso(), "why": why, "totals": dict(lg.totals)})
         writer.close()
+        odds_stop.set()
+        if odds_th is not None:
+            odds_th.join(timeout=30)
         lock.close()
         log(f"stop ({why}): {dict(lg.totals)}")
     return EXIT_STOP if why == "stop file" else 0
