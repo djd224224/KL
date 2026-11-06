@@ -715,6 +715,7 @@ def main(argv=None) -> int:
     ap.add_argument("--games-mode", choices=("any", "all"), default="any",
                     help="all = every leg on those games")
     ap.add_argument("--min-legs", type=int, default=d.min_legs)
+    ap.add_argument("--max-legs", type=int, default=d.max_legs)
     ap.add_argument("--min-lead-min", type=float, default=d.min_lead_min,
                     help="stop quoting a game this many minutes before its start (Kalshi's start = "
                          "the game market's expiry - 3 h, checked against ESPN)")
@@ -729,6 +730,8 @@ def main(argv=None) -> int:
                  "fee-free: --nfl-only allows 3%; --allow-thin allows 3% anyway)"))
     if a.min_legs < 2:
         ap.error("--min-legs 2 or more")
+    if not a.min_legs <= a.max_legs <= 12:
+        ap.error("--max-legs from --min-legs to 12")
     if a.min_lead_min < 2:
         ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
@@ -736,7 +739,7 @@ def main(argv=None) -> int:
                  max_game_payout=a.max_game_payout, max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
-                 min_lead_min=a.min_lead_min)
+                 max_legs=a.max_legs, min_lead_min=a.min_lead_min)
     if not 1 <= cfg.shard_factor <= 100:
         ap.error("--shard-factor 1-100")
     return run(cfg, a.minutes)

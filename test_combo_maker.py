@@ -308,9 +308,16 @@ class GamesAndKnobs(unittest.TestCase):
         self.assertIsNone(cm.price_check([[L1, "yes"], [L2, "yes"]], mk, T0, cfg)[0])
         self.assertEqual(cm.price_check([[L1, "yes"], [L2, "yes"]], mk, T0, cm.Config())[0], "starts_soon")
 
+    def test_max_legs(self):
+        cfg = cm.Config(min_legs=2, max_legs=5)
+        six = [[f"KXNBAGAME-26NOV05G{i}H{i}-G{i}", "yes"] for i in range(6)]
+        self.assertEqual(cm.pre_check(six, cfg), "legs")
+        self.assertIsNone(cm.pre_check(six[:5], cfg))
+
     def test_cli_guards(self):
         for bad in (["--markup", "0.03"], ["--min-legs", "1"], ["--min-lead-min", "1"],
-                    ["--allow-thin", "--markup", "0.02"]):
+                    ["--allow-thin", "--markup", "0.02"], ["--min-legs", "3", "--max-legs", "2"],
+                    ["--max-legs", "13"]):
             with self.assertRaises(SystemExit):
                 cm.main(bad)
 
