@@ -215,6 +215,38 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(sc.main(["--day", DAY, "--rfq-dir", rd, "--maker-dir", empty, "--no-results"]), 2)
 
 
+class LayeredTape(unittest.TestCase):
+    def test_the_tape_first_the_implied_mids_behind_it(self):
+        tape = sc.Tape().finish()
+        tape.add(A, T0 + 3000, 0.65)
+        tape.exp[A] = EXP
+        tape.finish()
+        imp = sc.Tape(max_age=sc.WINDOW_S, source="implied")
+        imp.add(A, T0, 0.60)
+        imp.add(B, T0, 0.50)
+        imp.finish()
+        lt = sc.Layered(tape, imp)
+        self.assertEqual(lt.source, "tape+implied")
+        self.assertAlmostEqual(lt.at(A, T0 + 100)[1], 0.60)        # before the tape: implied
+        self.assertAlmostEqual(lt.at(A, T0 + 3100)[1], 0.65)       # the tape
+        self.assertAlmostEqual(lt.at(B, T0 + 100)[1], 0.50)
+        self.assertEqual(lt.exp[A], EXP)
+        self.assertAlmostEqual(lt.close(A, START), 0.65)
+
+    def test_main_layers_a_tape_that_starts_late(self):
+        quotes = [{"k": "quote", "at": T0 + i, "legs": [[A, "yes"], [B, "yes"]], "fair": 0.30} for i in range(3)] + \
+                 [{"k": "quote", "at": T0 + i, "legs": [[A, "yes"], [C, "no"]], "fair": 0.42} for i in range(3)] + \
+                 [{"k": "quote", "at": T0 + i, "legs": [[B, "yes"], [C, "no"]], "fair": 0.35} for i in range(3)]
+        with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as md:
+            write_jsonl(os.path.join(rd, f"combo_{DAY}.jsonl"), PRINTS)
+            write_jsonl(os.path.join(md, f"legs_{DAY}.jsonl"), [tape_rows()[1]])       # starts at T0 + 50 min
+            write_jsonl(os.path.join(md, f"combo_{DAY}.jsonl"), quotes)
+            self.assertEqual(sc.main(["--day", DAY, "--rfq-dir", rd, "--maker-dir", md, "--no-results"]), 0)
+            with open(os.path.join(rd, f"scorecard_{DAY}.json"), encoding="utf-8") as f:
+                js = json.load(f)
+            self.assertEqual((js["tape"], js["scored"]), ("tape+implied", 2))           # the early prints priced
+
+
 class EmailAndReads(unittest.TestCase):
     """The morning email (Jack 2026-11-06: "yes i want the scorecard every morning")
     and results read signed first through kalshi_reads."""

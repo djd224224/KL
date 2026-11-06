@@ -157,6 +157,32 @@ class Tape:
         return None if r is None else r[1]
 
 
+class Layered:
+    """The leg tape first, the implied mids behind it: a day whose tape starts
+    part-way (a maker restart onto the tape's code) prices its earlier prints too."""
+
+    def __init__(self, first: Tape, second: Tape):
+        self.first, self.second = first, second
+        self.exp = dict(second.exp)
+        self.exp.update(first.exp)
+        self.source = f"{first.source}+{second.source}"
+        self.max_age = first.max_age
+        self.tape_from = min((v[0] for v in first.ts.values() if v), default=None)
+
+    def at(self, tk: str, t: float, max_age: float = None):
+        r = self.first.at(tk, t, max_age)
+        return r if r is not None else self.second.at(tk, t, max_age)
+
+    def close(self, tk: str, start: float):
+        c = self.first.close(tk, start)
+        return c if c is not None else self.second.close(tk, start)
+
+
+def tape_start(tape: Tape):
+    """The tape's first line (epoch s), None when empty."""
+    return min((v[0] for v in tape.ts.values() if v), default=None)
+
+
 def load_tape(maker_dir: str, day: str):
     """The maker's leg tape for the day (and the day before, for the first minutes);
     None when the day has none."""
@@ -496,8 +522,10 @@ def render_md(day: str, sc: dict, results_left: int = 0, results_read: bool = Tr
     L.append(f"{sc['prints']:,} prints where the requester bought YES in the logger's slice (1 in {LOGGER_SLICE} "
              f"of the RFQs), {sc['no_side_prints']:,} more bought NO. Scored: {sc['scored']:,} cross-game main-line "
              f"prints ({_usd(sc['segments']['all']['premium'])} premium). Not scored: {sk}.")
-    src = ("the maker's leg tape (Kalshi mids + DraftKings + Polymarket)" if sc["tape"] == "tape" else
-           "mids backed out of the maker's own quotes (Kalshi only: our fair = the Kalshi-mid fair)")
+    src = {"tape": "the maker's leg tape (Kalshi mids + DraftKings + Polymarket)",
+           "implied": "mids backed out of the maker's own quotes (Kalshi only: our fair = the Kalshi-mid fair)",
+           "tape+implied": "the maker's leg tape where it ran (Kalshi mids + DraftKings + Polymarket), mids backed "
+                           "out of the maker's own quotes before it (Kalshi only)"}.get(sc["tape"], sc["tape"])
     L.append(f"Leg prices: {src}. Results: {sc['legs_settled']:,} of the {sc['legs']:,} legs settled"
              + (f"; {results_left:,} could not be read (Kalshi refused)" if results_left else "")
              + ("" if results_read else " (none read this run: --no-results)")
@@ -664,9 +692,16 @@ def main(argv=None) -> int:
     prints = [e for e in ex if e.get("side") == "yes"]
     log(f"{day}: {len(prints):,} YES prints, {len(ex) - len(prints):,} NO")
     tape = load_tape(a.maker_dir, day)
+    day0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
     if tape is None:
         log("no leg tape that day: backing the mids out of the maker's quotes")
         tape = implied_tape(a.maker_dir, day)
+    elif (tape_start(tape) or day0) > day0 + 1800:
+        log(f"the leg tape starts {datetime.fromtimestamp(tape_start(tape), timezone.utc):%H:%MZ}: "
+            "the mids backed out of the maker's quotes before it")
+        imp = implied_tape(a.maker_dir, day)
+        if imp is not None:
+            tape = Layered(tape, imp)
     if tape is None:
         log("no leg prices for the day (no tape, no quotes): nothing to score")
         return 2
