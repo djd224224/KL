@@ -10,6 +10,8 @@ only when:
   - every game is at least MIN_LEAD_MIN from its start (Kalshi sets game
     markets to expire ~GAME_HOURS after the start: JAC@BAL 11/05 01:15Z ->
     04:15Z);
+  - every leg settles within MAX_DAYS_OUT (its expected expiration), so a
+    ticket's cash comes back within days;
   - MIN_LEGS-MAX_LEGS legs, each on a two-sided book no wider than
     MAX_LEG_SPREAD;
   - the fair price (the product of the legs' mids, 1 - mid for a NO leg) is in
@@ -131,6 +133,10 @@ class Config:
         # schedule (tennis, UFC, boxing, the college first half): at least this
         # much margin, so an offset up to an hour longer still stops before play
         self.unchecked_lead_min = 60.0
+        # HORIZON (Jack 2026-11-05 ~11 PM ET: "dont quote anything further than 4
+        # days out, to not tie up cash."): every leg's expected expiration (when it
+        # settles, and the ticket's cash comes back) within this many days; 0 = off
+        self.max_days_out = 4.0
         # EXTRAS (Jack 2026-11-05: first-half / quarter / team-total lines, and
         # props on different games, "only where both sides of the book have real
         # depth ($1000+)"): US leagues; $ at the best bid AND the best ask (size x
@@ -238,6 +244,8 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config, game_start
             return "one_sided", None
         if ask - bid > cfg.max_leg_spread + 1e-9:
             return "wide", None
+        if too_far(_iso_s(m.get("expected_expiration_time")), now_s, cfg):
+            return "too_far", None
         if is_extra(tk):
             if (_f(m.get("yes_bid_size_fp"), 0.0) * bid < cfg.min_depth_usd
                     or _f(m.get("yes_ask_size_fp"), 0.0) * ask < cfg.min_depth_usd):
@@ -258,6 +266,11 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config, game_start
     if not (cfg.min_fair <= fair <= cfg.max_fair):
         return "fair_range", fair
     return None, fair
+
+
+def too_far(settles_s, now_s: float, cfg: Config) -> bool:
+    """A leg that settles (expected expiration) more than max_days_out from now."""
+    return bool(cfg.max_days_out) and settles_s is not None and settles_s - now_s > cfg.max_days_out * 86400
 
 
 def lead_min(ticker: str, cfg: Config) -> float:
@@ -481,6 +494,9 @@ class Maker:
         # read: skip without spending one (11/05: most reads went to parlays
         # holding the in-play ORL@PHX)
         for leg in legs:
+            if too_far(self.exp.get(leg[0]), now, self.cfg):
+                self._why("too_far")
+                return
             if is_extra(leg[0]):
                 st = self.game_start.get(game_of(leg[0]))
             else:
@@ -793,7 +809,8 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
         + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
         + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half), lead {cfg.min_lead_min:g} min, "
-        f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
+        + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
+        + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
         f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
         f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day; open now {len(book.open())}")
     deadline = time.time() + minutes * 60 if minutes else None
@@ -891,6 +908,9 @@ def main(argv=None) -> int:
                     help="all = every leg on those games")
     ap.add_argument("--min-legs", type=int, default=d.min_legs)
     ap.add_argument("--max-legs", type=int, default=d.max_legs)
+    ap.add_argument("--max-days-out", type=float, default=d.max_days_out,
+                    help="only legs that settle within this many days, so a ticket's cash comes back "
+                         "soon (0 = no limit)")
     ap.add_argument("--min-lead-min", type=float, default=d.min_lead_min,
                     help="stop quoting a game this many minutes before its start (Kalshi's start = "
                          "the game market's expiry - 3 h, checked against ESPN)")
@@ -927,7 +947,9 @@ def main(argv=None) -> int:
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
                  max_legs=a.max_legs, min_lead_min=a.min_lead_min,
                  max_reads_per_min=a.max_reads_per_min, max_quotes_per_min=a.max_quotes_per_min,
-                 allow_extras=not a.no_extras, min_depth_usd=a.min_depth)
+                 allow_extras=not a.no_extras, min_depth_usd=a.min_depth, max_days_out=a.max_days_out)
+    if cfg.max_days_out and not 0.25 <= cfg.max_days_out <= 400:
+        ap.error("--max-days-out 0.25 to 400 (0 = no limit)")
     if not 1 <= cfg.max_quotes_per_min <= 600:
         ap.error("--max-quotes-per-min 1-600")
     if cfg.min_depth_usd < 100:

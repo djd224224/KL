@@ -377,6 +377,36 @@ class FillCheck(unittest.TestCase):
         self.assertEqual(self.m.pause_until, 0.0)
 
 
+class Horizon(unittest.TestCase):
+    """Jack 2026-11-05: 'dont quote anything further than 4 days out, to not
+    tie up cash.'"""
+
+    def test_a_leg_that_settles_past_the_horizon(self):
+        cfg = cm.Config()
+        far = dict(MK, **{L2: mkt(L2, 0.49, 0.51, start_in_h=94)})            # settles in 97 h > 96
+        near = dict(MK, **{L2: mkt(L2, 0.49, 0.51, start_in_h=92)})           # settles in 95 h
+        self.assertEqual(cm.price_check(LEGS, far, T0, cfg)[0], "too_far")
+        self.assertIsNone(cm.price_check(LEGS, near, T0, cfg)[0])
+        self.assertIsNone(cm.price_check(LEGS, far, T0, cm.Config(max_days_out=0))[0])   # off
+        self.assertIsNone(cm.price_check(LEGS, far, T0, cm.Config(max_days_out=5))[0])
+
+    def test_a_known_far_leg_is_skipped_without_a_read(self):
+        mk = dict(MK, **{L2: mkt(L2, 0.49, 0.51, start_in_h=120)})
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(c, cm.Config(), W(), cm.Book(os.path.join(d.name, "s.json")), d.name, clock=lambda: T0)
+        m.handle(rfq_msg(rid="r1"))
+        self.assertEqual(m.st["why"].get("too_far"), 1)
+        n = len(c.gets)
+        m.handle(rfq_msg(rid="r2"))                                           # L2 is known: no read
+        self.assertEqual((m.st["why"].get("too_far"), len(c.gets)), (2, n))
+
+    def test_cli(self):
+        with self.assertRaises(SystemExit):
+            cm.main(["--max-days-out", "0.1"])
+
+
 class LegMarkup(unittest.TestCase):
     """Jack 2026-11-05: "quote a higher spread, the more legs"."""
 
