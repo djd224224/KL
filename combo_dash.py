@@ -387,7 +387,7 @@ footer{margin:20px 0 6px;color:var(--muted);font-size:12px}
 
 HISTORY_TTL_S = 300.0               # the legs' candles: re-read at most every 5 min...
 HISTORY_MIN_GAP_S = 60.0            # ...or on a new fill / settlement, but not more than once a minute
-HISTORY_STEP_S = 300.0              # one P&L point every 5 min
+HISTORY_STEP_S = 300.0              # one P&L point every 5 min (from 1-min candles)
 
 
 def fill_time(t: dict) -> float:
@@ -466,8 +466,9 @@ def fill_points(filled) -> list:
 
 
 class HistoryReads:
-    """The filled tickets' legs' 5-minute candles since the first fill (60-minute
-    past two days), read through the Kalshi reads' client and kept for
+    """The filled tickets' legs' 1-minute candles since the first fill (hourly
+    when that is over 12 h ago; Kalshi's candles come in 1, 60 or 1440 minutes --
+    a 5 returned one candle a market), read through the Kalshi reads' client and kept for
     HISTORY_TTL_S, or re-read sooner (>= HISTORY_MIN_GAP_S) on a new fill or
     settlement; the series is computed once per read. A failed read keeps the
     last good one."""
@@ -490,12 +491,14 @@ class HistoryReads:
             try:
                 c = self.kalshi._client()
                 t0 = min(fill_time(t) for t in filled)
-                period = 5 if now - t0 <= 2 * 86400 else 60
+                period = 1 if now - t0 <= 12 * 3600 else 60
+                per = 3 if period == 1 else 10              # <= ~2,200 candles a call (20 x 480 was refused)
+                start = max(t0 - 600, now - 4 * 86400)
                 legs = sorted({l[0] for t in filled for l in t["legs"]})
                 hist = {}
-                for i in range(0, len(legs), 5):            # <= 5 x 576 candles a call
-                    js = c.get("/markets/candlesticks", {"market_tickers": ",".join(legs[i:i + 5]),
-                                                          "start_ts": int(t0) - 600, "end_ts": int(now),
+                for i in range(0, len(legs), per):
+                    js = c.get("/markets/candlesticks", {"market_tickers": ",".join(legs[i:i + per]),
+                                                          "start_ts": int(start), "end_ts": int(now),
                                                           "period_interval": period})
                     for x in js.get("markets") or []:
                         pts = []

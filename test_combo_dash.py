@@ -251,6 +251,8 @@ class History(unittest.TestCase):
         self.assertEqual(set(d["legs"]), {"A", "B", "C"})
         self.assertTrue(d["series"])
         n = len(k.c.calls)
+        self.assertEqual({c[1]["period_interval"] for c in k.c.calls}, {1})   # Kalshi: 1, 60 or 1440 only
+        self.assertTrue(all(len(c[1]["market_tickers"].split(",")) <= 3 for c in k.c.calls))
         h.get(T0 + 1230, self.tickets(), {}, {})                          # cached
         self.assertEqual(len(k.c.calls), n)
         fp = cd.fill_points(self.tickets())
