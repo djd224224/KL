@@ -94,7 +94,23 @@ US_MAIN = re.compile(r"^KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAMB|NCAAWB)(GAME|SPREAD
 SOCCER_MAIN = re.compile(r"^KX(EPL|LALIGA|BUNDESLIGA|SERIEA|LIGUE1|MLS|LIGAMX|LIGAEXP|BRASILEIRO|BRASILEIROB|"
                          r"ARGPREMDIV|APFDDH|EREDIVISIE|UCL|UEL|UECL)(GAME|TOTAL|SPREAD)$")
 OTHER_MAIN = re.compile(r"^KX(ITFDOUBLES|ITFMATCH|ITFWMATCH|ATPMATCH|WTAMATCH|ATPCHALLENGERMATCH|"
-                        r"WTACHALLENGERMATCH|UFCFIGHT|BOXING|NCAAMB1H)$")
+                        r"WTACHALLENGERMATCH|UFCFIGHT|BOXING)$")
+# EXTRAS (Jack 2026-11-05: "Other deep game-level markets, such as first-half
+# lines" and "Props on different games, only where both sides of the book have
+# real depth ($1000+)"): US leagues only. Each needs $1,000+ at the best bid AND
+# the best ask, and takes its start from its GAME's winner market (props can
+# expire hours after the game: MIA@GSW props 09:00Z vs the game 06:00Z). Left
+# out: the *PROT variants (settlement terms not checked) and first-scorer markets.
+US_LEAGUE = r"(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAMB|NCAAWB)"
+EXTRA_GAME = re.compile(rf"^KX{US_LEAGUE}((1H|2H|1Q|2Q|3Q|4Q|1P)(SPREAD|TOTAL|TEAMTOTAL)?|TEAMTOTAL)$")
+PROP = re.compile(rf"^KX{US_LEAGUE}(PTS|REB|AST|3PT|PRA|STL|BLK|2D|3D|RECYDS|RSHYDS|PASSYDS|REC|TD|"
+                  r"PASSTDS|RSHATT|PASSINT|PASSCOMP|PASSATT|RRYDS|GOAL|SOG|SAVES|HITS|HR|KS|RBI)$")
+
+
+def league_of(series: str):
+    """'KXNBAPTS' -> 'NBA' (None outside the US leagues)."""
+    m = re.match(rf"^KX{US_LEAGUE}", series)
+    return m.group(1) if m else None
 
 
 class _AnyMain:
@@ -115,6 +131,10 @@ def sport_group(series: str) -> str:
         return "soccer"
     if OTHER_MAIN.match(series):
         return "unchecked"
+    if EXTRA_GAME.match(series):
+        return "extra"
+    if PROP.match(series):
+        return "prop"
     return ""
 S1 = {"min_legs": 3, "max_legs": 8, "min_fair": 0.02, "max_fair": 0.40, "max_leg_spread": 0.03,
       "min_lead_min": 30.0, "markups": (0.05, 0.10, 0.15, 0.20)}

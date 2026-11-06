@@ -15,9 +15,11 @@ def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def mkt(t, bid, ask, start_in_h=2.0, status="active"):
+def mkt(t, bid, ask, start_in_h=2.0, status="active", bid_size=5000.0, ask_size=5000.0, event=None):
     return {"ticker": t, "status": status, "yes_bid_dollars": f"{bid:.4f}",
-            "yes_ask_dollars": f"{ask:.4f}", "expected_expiration_time": iso(T0 + (start_in_h + 3) * 3600)}
+            "yes_ask_dollars": f"{ask:.4f}", "expected_expiration_time": iso(T0 + (start_in_h + 3) * 3600),
+            "yes_bid_size_fp": f"{bid_size:.2f}", "yes_ask_size_fp": f"{ask_size:.2f}",
+            "event_ticker": event or t.rsplit("-", 1)[0]}
 
 
 L1 = "KXNBAGAME-26NOV05MIAGSW-GSW"
@@ -56,6 +58,8 @@ class FakeClient:
 
     def get(self, path, params):
         self.gets.append((path, dict(params)))
+        if path == "/markets" and "event_ticker" in params:
+            return {"markets": [m for m in self.mk.values() if m.get("event_ticker") == params["event_ticker"]]}
         if path == "/markets":
             return {"markets": [self.mk[t] for t in params["tickers"].split(",") if t in self.mk]}
         if path == "/portfolio/positions":
@@ -104,7 +108,8 @@ class FiltersAndPricing(unittest.TestCase):
     def test_pre_check(self):
         self.assertIsNone(cm.pre_check(LEGS, self.cfg))
         self.assertEqual(cm.pre_check(LEGS[:2], self.cfg), "legs")               # 2 legs: < 3
-        self.assertEqual(cm.pre_check(LEGS + [[PROP, "yes"]], self.cfg), "not_main")
+        self.assertIsNone(cm.pre_check(LEGS + [[PROP, "yes"]], self.cfg))            # a prop on another game
+        self.assertEqual(cm.pre_check(LEGS + [[PROP, "yes"]], cm.Config(allow_extras=False)), "not_main")
         self.assertEqual(cm.pre_check([[L1, "yes"], [L4, "yes"], [L2, "yes"]], self.cfg), "same_game")
         self.assertEqual(cm.pre_check([[L1, "yes", "0.5"], [L2, "yes"], [L3, "no"]], self.cfg), "side")
 
@@ -332,7 +337,9 @@ class MoreSports(unittest.TestCase):
         cfg = cm.Config(min_legs=2, min_lead_min=5)
         self.assertIsNone(cm.pre_check([[self.EPL1, "yes"], [self.EPL2, "no"], [L1, "yes"]], cfg))
         self.assertIsNone(cm.pre_check([[self.TEN, "yes"], [L2, "yes"]], cfg))
-        self.assertEqual(cm.pre_check([[PROP, "yes"], [self.EPL1, "yes"]], cfg), "not_main")
+        self.assertIsNone(cm.pre_check([[PROP, "yes"], [self.EPL1, "yes"]], cfg))
+        self.assertEqual(cm.pre_check([["KXNBAPTSPROT-26NOV05ORLPHX-PHXDBOOKER15-25", "yes"],
+                                       [self.EPL1, "yes"]], cfg), "not_main")             # PROT left out
         self.assertEqual(cm.lead_min(self.TEN, cfg), 60.0)
         self.assertEqual(cm.lead_min(self.EPL1, cfg), 5.0)
         self.assertEqual(cm.lead_min(L1, cfg), 5.0)
@@ -366,6 +373,73 @@ class MoreSports(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cm.main(["--max-reads-per-min", "5"])
         self.assertEqual(cm.Config().max_reads_per_min, 120)
+
+
+class Extras(unittest.TestCase):
+    """First-half / quarter / team-total lines and props on other games: $1,000
+    at both sides of the book, the start from the game's winner market."""
+    GAME = "KXNBAGAME-26NOV05ORLPHX-PHX"
+    H1 = "KXNBA1QTOTAL-26NOV05ORLPHX-55"
+
+    def legs(self, extra=PROP):
+        return [[extra, "yes"], [L2, "yes"]]
+
+    def test_same_game_prop_is_out(self):
+        self.assertEqual(cm.pre_check([[PROP, "yes"], [self.GAME, "yes"]], cm.Config(min_legs=2)), "same_game")
+
+    def test_depth_on_both_sides_and_the_game_start(self):
+        cfg = cm.Config(min_legs=2)
+        start = {"26NOV05ORLPHX": T0 + 2 * 3600}
+        ok = {PROP: mkt(PROP, 0.59, 0.61, start_in_h=8, bid_size=2000, ask_size=2000), L2: mkt(L2, 0.49, 0.51)}
+        self.assertIsNone(cm.price_check(self.legs(), ok, T0, cfg, start)[0])           # $1,180 / $1,220
+        thin = dict(ok, **{PROP: mkt(PROP, 0.59, 0.61, start_in_h=8, bid_size=2000, ask_size=1500)})
+        self.assertEqual(cm.price_check(self.legs(), thin, T0, cfg, start)[0], "thin")  # $915 at the ask
+        self.assertEqual(cm.price_check(self.legs(), ok, T0, cfg, {})[0], "no_game_start")
+        # the prop's own expiry is 8 h out, but its GAME starts in 20 min: out (lead 30)
+        self.assertEqual(cm.price_check(self.legs(), ok, T0, cfg, {"26NOV05ORLPHX": T0 + 1200})[0], "starts_soon")
+        self.assertIsNone(cm.price_check(self.legs(), ok, T0, cm.Config(min_legs=2, min_depth_usd=500), start)[0])
+
+    def test_the_maker_reads_the_game_once_for_its_start(self):
+        mk = {PROP: mkt(PROP, 0.59, 0.61, start_in_h=8, bid_size=2000, ask_size=2000),
+              self.H1: mkt(self.H1, 0.49, 0.51, start_in_h=8, bid_size=3000, ask_size=3000),
+              self.GAME: mkt(self.GAME, 0.55, 0.56, start_in_h=2, event="KXNBAGAME-26NOV05ORLPHX"),
+              L2: mkt(L2, 0.49, 0.51)}
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, cm.Config(min_legs=2), w, cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg(rid="r1", legs=self.legs()))
+        self.assertAlmostEqual(m.game_start["26NOV05ORLPHX"], T0 + 2 * 3600)
+        self.assertEqual(len(w.k("would_quote")), 1)
+        game_reads = [p for p, prm in c.gets if "event_ticker" in prm]
+        m.handle(rfq_msg(rid="r2", legs=[[self.H1, "no"], [L2, "yes"]]))
+        self.assertEqual(len([p for p, prm in c.gets if "event_ticker" in prm]), len(game_reads))   # kept
+        self.assertEqual(len(w.k("would_quote")), 2)
+
+    def test_the_last_look_rechecks_the_depth(self):
+        mk = {PROP: mkt(PROP, 0.59, 0.61, start_in_h=8, bid_size=2000, ask_size=2000),
+              self.GAME: mkt(self.GAME, 0.55, 0.56, start_in_h=2, event="KXNBAGAME-26NOV05ORLPHX"),
+              L2: mkt(L2, 0.49, 0.51)}
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, cm.Config(live=True, min_legs=2), w, cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg(rid="r1", legs=self.legs()))
+        nb = c.posts[0][1]["no_bid"]
+        c.mk[PROP] = mkt(PROP, 0.59, 0.61, start_in_h=8, bid_size=100, ask_size=2000)   # the bid pulled
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": nb}})
+        self.assertEqual(c.puts, [])
+        self.assertEqual(w.k("decline")[0]["why"], "thin")
+
+    def test_cli(self):
+        with self.assertRaises(SystemExit):
+            cm.main(["--max-quotes-per-min", "0"])
+        with self.assertRaises(SystemExit):
+            cm.main(["--min-depth", "50"])
 
 
 class RunGuards(unittest.TestCase):

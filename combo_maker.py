@@ -63,7 +63,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import kalshi_ws  # noqa: E402
 from combo_rfq_logger import WS_PATH, WS_URL, DayWriter, iso_ms, legs_of  # noqa: E402
-from combo_rfq_score import DEFAULT_GRID, MAIN_SERIES, grid_up, maker_fee, sport_group  # noqa: E402
+from combo_rfq_score import (DEFAULT_GRID, MAIN_SERIES, grid_up, league_of, maker_fee,  # noqa: E402
+                             sport_group)
 
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
@@ -115,6 +116,13 @@ class Config:
         # schedule (tennis, UFC, boxing, the college first half): at least this
         # much margin, so an offset up to an hour longer still stops before play
         self.unchecked_lead_min = 60.0
+        # EXTRAS (Jack 2026-11-05: first-half / quarter / team-total lines, and
+        # props on different games, "only where both sides of the book have real
+        # depth ($1000+)"): US leagues; $ at the best bid AND the best ask (size x
+        # price) >= min_depth_usd at the quote and again at the last look; the
+        # start is the game's (its winner market's expiry - 3 h), not the leg's
+        self.allow_extras = True
+        self.min_depth_usd = 1000.0
         self.max_rfq_age_ms = 1500.0        # an RFQ older than this when we get to it: skip
         self.leg_cache_s = 15.0
         for k, v in kw.items():
@@ -163,13 +171,18 @@ def game_of(ticker: str) -> str:
 
 # ---- the decision, free of the network --------------------------------------------
 
+def is_extra(ticker: str) -> bool:
+    return sport_group(str(ticker).split("-")[0]) in ("extra", "prop")
+
+
 def pre_check(legs: list, cfg: Config):
     """Why an RFQ's legs are out before any read (None = worth pricing)."""
     if not (cfg.min_legs <= len(legs) <= cfg.max_legs):
         return "legs"
     if any(len(l) < 2 or l[1] not in ("yes", "no") or len(l) > 2 for l in legs):
         return "side"                                   # a scalar leg too
-    if any(not MAIN_SERIES.match(str(l[0]).split("-")[0]) for l in legs):
+    if any(not (MAIN_SERIES.match(str(l[0]).split("-")[0]) or (cfg.allow_extras and is_extra(l[0])))
+           for l in legs):
         return "not_main"
     if cfg.nfl_only and not cfg.fee_free(legs):
         return "not_nfl"
@@ -183,9 +196,11 @@ def pre_check(legs: list, cfg: Config):
     return None
 
 
-def price_check(legs: list, markets: dict, now_s: float, cfg: Config):
+def price_check(legs: list, markets: dict, now_s: float, cfg: Config, game_start=None):
     """(why not, fair): every leg active, two-sided, no wider than the cap,
-    its game far enough from the start; the fair in range."""
+    its game far enough from the start; the fair in range. An extra / prop leg
+    also needs min_depth_usd at both its best bid and best ask, and its start
+    comes from `game_start` {game key: start} (its game's winner market)."""
     probs = []
     for tk, side in ((l[0], l[1]) for l in legs):
         m = markets.get(tk)
@@ -198,10 +213,19 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config):
             return "one_sided", None
         if ask - bid > cfg.max_leg_spread + 1e-9:
             return "wide", None
-        exp = _iso_s(m.get("expected_expiration_time"))
-        if exp is None:
-            return "no_start", None
-        if exp - GAME_HOURS * 3600 - now_s < lead_min(tk, cfg) * 60:
+        if is_extra(tk):
+            if (_f(m.get("yes_bid_size_fp"), 0.0) * bid < cfg.min_depth_usd
+                    or _f(m.get("yes_ask_size_fp"), 0.0) * ask < cfg.min_depth_usd):
+                return "thin", None
+            start = (game_start or {}).get(game_of(tk))
+            if start is None:
+                return "no_game_start", None
+        else:
+            exp = _iso_s(m.get("expected_expiration_time"))
+            if exp is None:
+                return "no_start", None
+            start = exp - GAME_HOURS * 3600
+        if start - now_s < lead_min(tk, cfg) * 60:
             return "starts_soon", None
         mid = (bid + ask) / 2.0
         probs.append(mid if side == "yes" else 1.0 - mid)
@@ -287,9 +311,10 @@ def caps_check(book: Book, games: list, contracts: float, ask: float, cfg: Confi
     return None
 
 
-def confirm_check(q: dict, markets: dict, now_s: float, cfg: Config, book: Book, contracts: float):
+def confirm_check(q: dict, markets: dict, now_s: float, cfg: Config, book: Book, contracts: float,
+                  game_start=None):
     """The last look: (why not, fair now)."""
-    why, fair = price_check(q["legs"], markets, now_s, cfg)
+    why, fair = price_check(q["legs"], markets, now_s, cfg, game_start)
     if why:
         return why, fair
     if q["ask"] < fair * (1.0 + cfg.confirm_min_edge) - 1e-9:
@@ -339,6 +364,7 @@ class Maker:
         self.sent = deque()             # quote send times (rate cap)
         self.reads = deque()            # leg read times (rate cap)
         self.exp = {}                   # leg ticker -> expected expiration (never changes)
+        self.game_start = {}            # game key -> start (from its main lines' expiry - 3 h)
         self.st = {}
         self.direction_checks = 0
         self.pause_until = 0.0
@@ -372,7 +398,27 @@ class Maker:
                     ex = _iso_s(m.get("expected_expiration_time"))
                     if ex is not None:
                         self.exp[m["ticker"]] = ex
+                        if not is_extra(m["ticker"]) and sport_group(m["ticker"].split("-")[0]):
+                            self.game_start[game_of(m["ticker"])] = ex - GAME_HOURS * 3600
         return {t: self.cache[t][1] for t in tickers if t in self.cache}
+
+    def learn_game_starts(self, legs, now) -> None:
+        """An extra / prop leg's game start, from its game's winner market
+        (one read a game, kept for the run)."""
+        for tk in {l[0] for l in legs if is_extra(l[0])}:
+            game = game_of(tk)
+            if game in self.game_start:
+                continue
+            league = league_of(tk.split("-")[0])
+            if not league:
+                continue
+            self.reads.append(now)
+            js = self.c.get("/markets", {"event_ticker": f"KX{league}GAME-{game}", "limit": 10})
+            for m in js.get("markets") or []:
+                ex = _iso_s(m.get("expected_expiration_time"))
+                if ex is not None:
+                    self.game_start[game] = ex - GAME_HOURS * 3600
+                    break
 
     # ---- messages ---------------------------------------------------------------
 
@@ -410,8 +456,12 @@ class Maker:
         # read: skip without spending one (11/05: most reads went to parlays
         # holding the in-play ORL@PHX)
         for leg in legs:
-            ex = self.exp.get(leg[0])
-            if ex is not None and ex - GAME_HOURS * 3600 - now < lead_min(leg[0], self.cfg) * 60:
+            if is_extra(leg[0]):
+                st = self.game_start.get(game_of(leg[0]))
+            else:
+                ex = self.exp.get(leg[0])
+                st = None if ex is None else ex - GAME_HOURS * 3600
+            if st is not None and st - now < lead_min(leg[0], self.cfg) * 60:
                 self._why("starts_soon")
                 return
         while self.reads and now - self.reads[0] > 60:
@@ -432,11 +482,12 @@ class Maker:
             if any(l[0] not in self.cache or now - self.cache[l[0]][0] > self.cfg.leg_cache_s for l in legs):
                 self.reads.append(now)
             mk = self.markets([l[0] for l in legs], self.cfg.leg_cache_s)
+            self.learn_game_starts(legs, now)
             read_ms = (time.time() - t0) * 1000
         except Exception as e:
             self._error("leg read", e)
             return
-        why, fair = price_check(legs, mk, now, self.cfg)
+        why, fair = price_check(legs, mk, now, self.cfg, self.game_start)
         if why:
             self._why(why)
             return
@@ -483,12 +534,12 @@ class Maker:
             self._decline(q, "price_mismatch", None, cts)
             return
         try:
-            mk = self.markets([l[0] for l in q["legs"]], 0.0)       # fresh: the last look
+            mk = self.markets([l[0] for l in q["legs"]], -1.0)      # always re-read: the last look
         except Exception as e:
             self._error("confirm read", e)
             self._decline(q, "read_failed", None, cts)
             return
-        why, fair_now = confirm_check(q, mk, now, self.cfg, self.book, cts)
+        why, fair_now = confirm_check(q, mk, now, self.cfg, self.book, cts, self.game_start)
         if why:
             self._decline(q, why, fair_now, cts)
             return
@@ -745,6 +796,13 @@ def main(argv=None) -> int:
     ap.add_argument("--min-lead-min", type=float, default=d.min_lead_min,
                     help="stop quoting a game this many minutes before its start (Kalshi's start = "
                          "the game market's expiry - 3 h, checked against ESPN)")
+    ap.add_argument("--max-quotes-per-min", type=int, default=d.max_quotes_per_min,
+                    help="quotes a minute (2 tokens each on the combo shard's write bucket, which the IMM "
+                         "does not use)")
+    ap.add_argument("--no-extras", action="store_true",
+                    help="game / spread / total only: no first-half, quarter, team-total or prop legs")
+    ap.add_argument("--min-depth", type=float, default=d.min_depth_usd,
+                    help="$ an extra / prop leg needs at BOTH its best bid and best ask")
     ap.add_argument("--max-reads-per-min", type=int, default=d.max_reads_per_min,
                     help="leg reads a minute (10 tokens each); the reads are shared with the IMM's budget")
     ap.add_argument("--allow-thin", action="store_true",
@@ -768,7 +826,12 @@ def main(argv=None) -> int:
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
                  max_legs=a.max_legs, min_lead_min=a.min_lead_min,
-                 max_reads_per_min=a.max_reads_per_min)
+                 max_reads_per_min=a.max_reads_per_min, max_quotes_per_min=a.max_quotes_per_min,
+                 allow_extras=not a.no_extras, min_depth_usd=a.min_depth)
+    if not 1 <= cfg.max_quotes_per_min <= 600:
+        ap.error("--max-quotes-per-min 1-600")
+    if cfg.min_depth_usd < 100:
+        ap.error("--min-depth $100 or more")
     if not 10 <= cfg.max_reads_per_min <= 600:
         ap.error("--max-reads-per-min 10-600")
     if not 1 <= cfg.shard_factor <= 100:
