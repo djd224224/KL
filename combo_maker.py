@@ -70,6 +70,7 @@ import argparse
 import json
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -126,6 +127,7 @@ MOVE_HOLD_S = 1800.0                # ...is treated as in play for this long
 SHARD_FACTOR, SHARD_KEY = 50, 1     # a 2% slice of RFQs (the logger reads key 0)
 STALE_SECS = 30.0
 SETTLE_EVERY_S = 300.0
+GAME_RETRY_S = 600.0                # a game whose winner market a read did not find is not asked again sooner
 STAT_SECS = 60.0
 QUOTE_TTL_S = 120.0                 # forget our quote this long after it was sent
 DIRECTION_CHECKS = 3                # read back the position of the first N fills
@@ -526,7 +528,9 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config, game_start
             exp = _iso_s(m.get("expected_expiration_time"))
             if exp is None:
                 return "no_start", None
-            start = start_of(tk, exp)
+            if not is_winner(tk) and (game_start or {}).get(game_of(tk)) is None:
+                return "no_game_start", None            # a spread / total: its game's start, or no quote
+            start = leg_start(tk, exp, game_start)
         if start - now_s < lead_min(tk, cfg) * 60:
             return "starts_soon", None
         mid = (bid + ask) / 2.0
@@ -560,6 +564,44 @@ def start_of(ticker: str, exp_s: float) -> float:
     series = str(ticker).split("-")[0]
     hours = next((h for p, h in START_HOURS.items() if series.startswith(p)), GAME_HOURS)
     return exp_s - hours * 3600
+
+
+WINNER_ENDS = ("GAME", "FIGHT", "MATCH", "BOUT")
+_LINE_SUFFIX = re.compile(r"^(KX[A-Z0-9]+?)(?:1H|2H|1Q|2Q|3Q|4Q)?(?:TEAMTOTAL|TOTAL|SPREAD|BTTS)$")
+
+
+def is_winner(ticker: str) -> bool:
+    """A game's winner market (KXNBAGAME, KXEPLGAME, KXUFCFIGHT, KXATPMATCH ...): the one
+    whose expiry times the game. A spread / total can expire later -- 11/06 every soccer
+    league's +1 h, 9 of 113 college basketball lines +3 h, a few college football
+    lines +4.5 / +6.5 h -- so its own "expiry - 3 h" can put the start after kickoff
+    (11/06 the maker quoted Friday's soccer totals 13-45 min into the matches)."""
+    return str(ticker).split("-")[0].endswith(WINNER_ENDS)
+
+
+def winner_event(ticker: str):
+    """The event of a leg's game-winner market: KXEPLTOTAL-26NOV06EVECOV-2 ->
+    KXEPLGAME-26NOV06EVECOV, KXNCAAF1HSPREAD-.. -> KXNCAAFGAME-.., a prop by its
+    league (KXNBAPTS -> KXNBAGAME); None for a winner market or a series it can't place."""
+    parts = str(ticker).split("-")
+    if len(parts) < 2 or is_winner(ticker):
+        return None
+    m = _LINE_SUFFIX.match(parts[0])
+    if m:
+        return f"{m.group(1)}GAME-{parts[1]}"
+    lg = league_of(parts[0])
+    return f"KX{lg}GAME-{parts[1]}" if lg else None
+
+
+def leg_start(ticker: str, exp_s, game_start=None):
+    """A main-line leg's start: its own expiry - the league's hours, and a spread /
+    total no later than its game's winner market (game_start: game key -> start).
+    None when neither is known."""
+    own = None if exp_s is None else start_of(ticker, exp_s)
+    gs = None if is_winner(ticker) else (game_start or {}).get(game_of(ticker))
+    if gs is None:
+        return own
+    return gs if own is None else min(own, gs)
 
 
 def too_far(settles_s, now_s: float, cfg: Config) -> bool:
@@ -805,7 +847,8 @@ class Maker:
         self.sent = deque()             # quote send times (rate cap)
         self.reads = deque()            # leg read times (rate cap)
         self.exp = {}                   # leg ticker -> expected expiration (never changes)
-        self.game_start = {}            # game key -> start (from its main lines' expiry - 3 h)
+        self.game_start = {}            # game key -> start (from its WINNER market's expiry - 3 h)
+        self.game_tried = {}            # game key -> when its winner market was last looked up
         self.mids = {}                  # leg ticker -> deque of (read at, mid): the in-play guard
         self.moving_until = {}          # leg ticker -> held out until
         self.st = {}
@@ -867,7 +910,7 @@ class Maker:
                     ex = _iso_s(m.get("expected_expiration_time"))
                     if ex is not None:
                         self.exp[m["ticker"]] = ex
-                        if not is_extra(m["ticker"]) and sport_group(m["ticker"].split("-")[0]):
+                        if is_winner(m["ticker"]) and sport_group(m["ticker"].split("-")[0]):
                             self.game_start[game_of(m["ticker"])] = start_of(m["ticker"], ex)
                     self._track_mid(m, now)
                     self._tape(m["ticker"], m, now)
@@ -937,17 +980,19 @@ class Maker:
         return any(self.moving_until.get(l[0], 0.0) > now for l in legs)
 
     def learn_game_starts(self, legs, now) -> None:
-        """An extra / prop leg's game start, from its game's winner market
-        (one read a game, kept for the run)."""
-        for tk in {l[0] for l in legs if is_extra(l[0])}:
+        """A prop / spread / total leg's game start, from its game's winner market
+        (one read a game, kept for the run; a game whose read found none is asked
+        again after GAME_RETRY_S)."""
+        for tk in {l[0] for l in legs if is_extra(l[0]) or not is_winner(l[0])}:
             game = game_of(tk)
-            if game in self.game_start:
+            if game in self.game_start or now - self.game_tried.get(game, -1e18) < GAME_RETRY_S:
                 continue
-            league = league_of(tk.split("-")[0])
-            if not league:
+            ev = winner_event(tk)
+            if not ev:
                 continue
+            self.game_tried[game] = now
             self.reads.append(now)
-            js = self.c.get("/markets", {"event_ticker": f"KX{league}GAME-{game}", "limit": 10})
+            js = self.c.get("/markets", {"event_ticker": ev, "limit": 10})
             for m in js.get("markets") or []:
                 ex = _iso_s(m.get("expected_expiration_time"))
                 if ex is not None:
@@ -1007,8 +1052,7 @@ class Maker:
             if is_extra(leg[0]):
                 st = self.game_start.get(game_of(leg[0]))
             else:
-                ex = self.exp.get(leg[0])
-                st = None if ex is None else start_of(leg[0], ex)
+                st = leg_start(leg[0], self.exp.get(leg[0]), self.game_start)
             if st is not None and st - now < lead_min(leg[0], self.cfg) * 60:
                 self._why("starts_soon")
                 return

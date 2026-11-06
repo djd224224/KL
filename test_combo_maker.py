@@ -723,8 +723,8 @@ class NflOnly(unittest.TestCase):
 
     def test_nfl_tickets_carry_no_fee_estimate(self):
         mk = {t: mkt(t, b, b + 0.02, start_in_h=60) for t, b in
-              ((self.N1, 0.59), (self.N2, 0.49), (self.N3, 0.29))}
-        c = FakeClient(mk)
+              ((self.N1, 0.59), (self.N2, 0.49), (self.N3, 0.29), ("KXNFLGAME-26NOV08DETMIA-DET", 0.6))}
+        c = FakeClient(mk)                                  # (the spread's game: its winner market)
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         book = cm.Book(os.path.join(d.name, "s.json"))
@@ -1875,6 +1875,63 @@ class DayLossStop(GuardBase):
         for bad in (["--max-day-loss", "5"], ["--burst-accepts", "200"], ["--rush-window-min", "-1"]):
             with self.assertRaises(SystemExit):
                 cm.main(bad)
+
+
+class GameStart(unittest.TestCase):
+    """A spread / total starts no later than its game's winner market: 11/06 Kalshi's
+    soccer spreads / totals expired 1 h after their games' winner markets, and the
+    maker quoted Friday's soccer totals 13-45 min into the matches."""
+    TOT, WIN = "KXEPLTOTAL-26NOV07EVECOV-2", "KXEPLGAME-26NOV07EVECOV-EVE"
+
+    def test_winner_markets_and_their_events(self):
+        for tk, win, ev in ((self.TOT, False, "KXEPLGAME-26NOV07EVECOV"), (self.WIN, True, None),
+                            ("KXLIGUE1TOTAL-26NOV06TFCRCS-3", False, "KXLIGUE1GAME-26NOV06TFCRCS"),
+                            ("KXNCAAF1HSPREAD-26NOV07UKTENN-TENN7", False, "KXNCAAFGAME-26NOV07UKTENN"),
+                            ("KXNBATEAMTOTAL-26NOV06BOSCHA-BOS110", False, "KXNBAGAME-26NOV06BOSCHA"),
+                            (PROP, False, "KXNBAGAME-26NOV05ORLPHX"), ("KXUFCFIGHT-26NOV06NAKSCH-SCH", True, None)):
+            self.assertEqual((cm.is_winner(tk), cm.winner_event(tk)), (win, ev), tk)
+        g = {"26NOV07EVECOV": T0 + 600}
+        self.assertEqual(cm.leg_start(self.TOT, T0 + 5 * 3600, g), T0 + 600)          # the game's, earlier
+        self.assertEqual(cm.leg_start(self.TOT, T0 + 5 * 3600, {}), T0 + 2 * 3600)    # its own, unknown game
+        self.assertEqual(cm.leg_start(self.WIN, T0 + 5 * 3600, g), T0 + 2 * 3600)     # a winner: its own
+
+    def test_the_price_check_takes_the_games_start(self):
+        cfg = cm.Config(min_legs=2)
+        legs = [[self.TOT, "yes"], [L1, "yes"]]
+        mk = {self.TOT: mkt(self.TOT, 0.59, 0.61, start_in_h=2.0), L1: MK[L1]}       # its own expiry: 2 h out
+        self.assertEqual(cm.price_check(legs, mk, T0, cfg, {})[0], "no_game_start")
+        self.assertEqual(cm.price_check(legs, mk, T0, cfg, {"26NOV07EVECOV": T0 + 600})[0], "starts_soon")
+        self.assertIsNone(cm.price_check(legs, mk, T0, cfg, {"26NOV07EVECOV": T0 + 2 * 3600})[0])
+
+    def test_the_maker_reads_the_winner_market_and_skips_the_total(self):
+        mk = dict(MK, **{self.TOT: mkt(self.TOT, 0.59, 0.61, start_in_h=2.0),         # +1 h: says 2 h out
+                         self.WIN: mkt(self.WIN, 0.44, 0.46, start_in_h=0.25)})       # kickoff in 15 min
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(c, cm.Config(min_legs=2), W(), cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg(rid="r1", legs=[[self.TOT, "yes"], [L2, "yes"]]))
+        self.assertIn(("/markets", {"event_ticker": "KXEPLGAME-26NOV07EVECOV", "limit": 10}), c.gets)
+        self.assertAlmostEqual(m.game_start["26NOV07EVECOV"], T0 + 900)
+        self.assertEqual(m.st["why"].get("starts_soon"), 1)
+        n = len(c.gets)
+        m.handle(rfq_msg(rid="r2", legs=[[self.TOT, "yes"], [L2, "yes"]]))
+        self.assertEqual(len(c.gets), n)                                               # known now: no read
+        self.assertEqual(m.st["why"].get("starts_soon"), 2)
+
+    def test_a_total_read_no_longer_times_its_game(self):
+        c = FakeClient({self.TOT: mkt(self.TOT, 0.59, 0.61, start_in_h=2.0), L1: MK[L1]})
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(c, cm.Config(), W(), cm.Book(os.path.join(d.name, "s.json")), d.name, clock=lambda: T0)
+        m.markets([self.TOT], 15.0)
+        self.assertNotIn("26NOV07EVECOV", m.game_start)
+        m.markets([L1], 15.0)
+        self.assertIn(cm.game_of(L1), m.game_start)
+        m.learn_game_starts([[self.TOT, "yes"]], T0)                                   # nothing found...
+        m.learn_game_starts([[self.TOT, "yes"]], T0 + 60)                              # ...not asked again soon
+        self.assertEqual(sum(1 for p, q in c.gets if q.get("event_ticker")), 1)
 
 
 class LegTape(unittest.TestCase):

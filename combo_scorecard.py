@@ -337,11 +337,33 @@ def live_price(fair: float, legs, cfg) -> float:
     return ask
 
 
+def game_starts(tape, results: Results) -> dict:
+    """Each game's start from its WINNER market's expiry (tape or results): a spread /
+    total can expire hours after its game (cm.is_winner), and its own expiry would put
+    the close in play."""
+    out = {}
+    for src in (tape.exp, {tk: v.get("x") for tk, v in results.d.items()}):
+        for tk, x in src.items():
+            if x and cm.is_winner(tk):
+                out[cm.game_of(tk)] = cm.start_of(tk, float(x))
+    return out
+
+
+def leg_start_of(tk: str, tape, results: Results, starts: dict):
+    """A leg's start for its close: cm.leg_start; a spread / total without its game's
+    winner market known has none (its own expiry can be hours late)."""
+    x = results.exp(tk) or tape.exp.get(tk)
+    if not cm.is_winner(tk) and cm.game_of(tk) not in starts:
+        return None
+    return cm.leg_start(tk, x, starts)
+
+
 def price_prints(prints, tape: Tape, results: Results, now: float):
     """(scored rows, skips): each cross-game main-line YES print with every leg priced:
     its Kalshi-mid fair (fk), our fair (fmax: the highest source per leg), its close
     (None until every leg started and has one) and its outcome (None while open)."""
     rows, skip = [], Counter()
+    starts = game_starts(tape, results)
     for e in prints:
         legs = [(str(l[0]), str(l[1])) for l in e.get("legs") or []]
         if len(legs) < 2:
@@ -364,8 +386,7 @@ def price_prints(prints, tape: Tape, results: Results, now: float):
             fk *= p
             fmax *= max([p] + [(o if side == "yes" else 1.0 - o) for o in (r[2], r[3]) if o is not None])
             if close is not None:
-                x = results.exp(tk) or tape.exp.get(tk)
-                start = None if x is None else cm.start_of(tk, x)
+                start = leg_start_of(tk, tape, results, starts)
                 c = None if (start is None or start > now) else tape.close(tk, start)
                 close = None if c is None else close * (c if side == "yes" else 1.0 - c)
         if not priced:
@@ -467,11 +488,11 @@ def fair_sources(rs, tape: Tape, results: Results) -> dict:
     each fair an hour before the start against the close (mean |p - close|) and the
     result (Brier), each source on the legs it covered, with Kalshi's on the same legs."""
     acc = defaultdict(lambda: defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0.0]))   # sport -> src -> n, mae, brier, k mae, k brier
+    starts = game_starts(tape, results)
     for tk in sorted({tk for r in rs for tk, _ in r["legs"]}):
-        res, x = results.result(tk), results.exp(tk) or tape.exp.get(tk)
-        if res not in ("yes", "no") or x is None:
+        res, start = results.result(tk), leg_start_of(tk, tape, results, starts)
+        if res not in ("yes", "no") or start is None:
             continue
-        start = cm.start_of(tk, x)
         row, close = tape.at(tk, start - SOURCE_LEAD_S), tape.close(tk, start)
         if row is None or close is None:
             continue
