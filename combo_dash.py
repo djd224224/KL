@@ -465,7 +465,8 @@ def fill_rate(events, filled) -> dict:
         return {}
     since = min(qs)
     return {"quotes": len(qs), "accepted": sum(1 for e in events if e.get("k") == "accept"),
-            "filled": sum(1 for t in filled if fill_time(t) >= since), "since": since}
+            "filled": sum(1 for t in filled if fill_time(t) >= since), "since": since,
+            "taker": sum(1 for t in filled if fill_time(t) >= since and t.get("taker_fill"))}
 
 
 def fill_points(filled) -> list:
@@ -798,7 +799,9 @@ def render(s: dict) -> str:
         H.append(f"<div class='card'><div class='l'>Quotes filled</div>"
                  f"<div class='v'>{100.0 * fr['filled'] / fr['quotes']:.3f}%</div>"
                  f"<div class='l'>{fr['filled']} fills of {fr['quotes']:,} quotes since {html.escape(since)}{one_in}"
-                 f" &middot; {100.0 * fr['accepted'] / fr['quotes']:.3f}% accepted</div></div>")
+                 f" &middot; {100.0 * fr['accepted'] / fr['quotes']:.3f}% accepted"
+                 + (f" &middot; <span class='neg'>{fr['taker']} filled as taker</span>" if fr.get("taker") else "")
+                 + "</div></div>")
     H.append("</div>")
     pl = s.get("pnl") or {}
     if pl:

@@ -64,6 +64,8 @@ class FakeClient:
             return {"markets": [m for m in self.mk.values() if m.get("event_ticker") == params["event_ticker"]]}
         if path == "/markets":
             return {"markets": [self.mk[t] for t in params["tickers"].split(",") if t in self.mk]}
+        if path.endswith("/orderbook"):
+            return getattr(self, "book", None) or {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}
         if path.startswith("/portfolio/orders/"):
             oid = path.rsplit("/", 1)[1]
             return {"order": self.orders.get(oid) or {
@@ -624,6 +626,45 @@ class FillPrice(unittest.TestCase):
         self.clock[0] += 10
         self.m.upkeep()                                                       # read once
         self.assertEqual(len([g for g in self.c.gets[n:] if g[0].startswith("/portfolio/orders/")]), 0)
+
+
+class MakerOnly(unittest.TestCase):
+    """Jack 2026-11-06: "it should only ever be a maker"."""
+
+    def maker(self, c):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.w = W()
+        return cm.Maker(c, cm.Config(live=True, markup_per_leg=0.0), self.w, cm.Book(os.path.join(d.name, "s.json")),
+                        d.name, clock=lambda: T0)
+
+    def accept(self, m, c):
+        m.handle(rfq_msg())
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": c.posts[0][1]["no_bid"]}})
+
+    def test_a_resting_yes_bid_at_or_over_our_price_is_declined(self):
+        c = FakeClient(MK)
+        c.book = {"orderbook_fp": {"yes_dollars": [["0.2410", "17.47"]], "no_dollars": []}}    # we sell at 0.231
+        m = self.maker(c)
+        self.accept(m, c)
+        self.assertEqual(c.puts, [])
+        self.assertEqual(self.w.k("decline")[0]["why"], "would_take")
+
+    def test_an_empty_or_lower_book_confirms(self):
+        for book in (None, {"orderbook_fp": {"yes_dollars": [["0.2200", "40.00"]], "no_dollars": [["0.7000", "5"]]}}):
+            c = FakeClient(MK)
+            c.book = book
+            m = self.maker(c)
+            self.accept(m, c)
+            self.assertEqual(len(c.puts), 1)
+
+    def test_the_book_forms(self):
+        self.assertTrue(cm.would_take({"orderbook_fp": {"yes_dollars": [["0.3030", "17.47"]]}}, 0.293))
+        self.assertTrue(cm.would_take({"orderbook_fp": {"yes_dollars": [["0.2930", "1.00"]]}}, 0.293))   # equal
+        self.assertFalse(cm.would_take({"orderbook_fp": {"yes_dollars": [["0.2920", "9"]]}}, 0.293))
+        self.assertTrue(cm.would_take({"orderbook": {"yes": [[31, 10]]}}, 0.293))                       # cents form
+        self.assertFalse(cm.would_take({"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}, 0.293))
 
 
 class LegMarkup(unittest.TestCase):

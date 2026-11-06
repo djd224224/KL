@@ -174,6 +174,13 @@ class Config:
         # this much inside MOVE_WINDOW_S is held out for MOVE_HOLD_S, at the quote
         # and at the last look (the ITF legs swung 15-50c while we sold)
         self.max_leg_move = 0.05
+        # MAKER ONLY (Jack 2026-11-06: "it should only ever be a maker"). A confirmed
+        # quote becomes an ordinary limit order on the combo's own book (~1.7 s after
+        # the confirm), so it TAKES any resting order that crosses it: 11/06 04:25 and
+        # 04:33Z two of ours filled as the taker against a resting YES bid 0.6-1c over
+        # our price (taker fee 0.07 p(1-p), twice the maker's). The last look reads
+        # that book and declines when a resting YES bid is at or over our YES price
+        self.maker_only = True
         # HORIZON (Jack 2026-11-05 ~11 PM ET: "dont quote anything further than 4
         # days out, to not tie up cash."): every leg's expected expiration (when it
         # settles, and the ticket's cash comes back) within this many days; 0 = off
@@ -339,6 +346,24 @@ def start_of(ticker: str, exp_s: float) -> float:
 def too_far(settles_s, now_s: float, cfg: Config) -> bool:
     """A leg that settles (expected expiration) more than max_days_out from now."""
     return bool(cfg.max_days_out) and settles_s is not None and settles_s - now_s > cfg.max_days_out * 86400
+
+
+def best_yes_bid(book: dict):
+    """The best resting YES bid on a market's book (GET /markets/{t}/orderbook:
+    orderbook_fp.yes_dollars [[price, size], ...], or the cents form), None if empty."""
+    ob = (book or {}).get("orderbook_fp") or {}
+    levels = [_f(x[0]) for x in ob.get("yes_dollars") or [] if x and _f(x[0]) is not None and _f(x[-1], 0) > 0]
+    if not levels:
+        old = (book or {}).get("orderbook") or {}
+        levels = [x[0] / 100.0 for x in old.get("yes") or [] if x and x[0] is not None and (x[-1] or 0) > 0]
+    return max(levels) if levels else None
+
+
+def would_take(book: dict, ask: float) -> bool:
+    """Our order buys NO at 1 - ask: a resting YES bid at >= ask is a NO offer at
+    <= our bid, so the order would take it instead of being taken."""
+    b = best_yes_bid(book)
+    return b is not None and b >= ask - 1e-9
 
 
 def lead_min(ticker: str, cfg: Config) -> float:
@@ -768,6 +793,16 @@ class Maker:
         if why:
             self._decline(q, why, fair_now, cts)
             return
+        if self.cfg.maker_only:
+            try:
+                ob = self.c.get(f"/markets/{q['mt']}/orderbook", {"depth": 10})
+            except Exception as e:
+                self._error("book read", e)
+                self._decline(q, "book_read_failed", fair_now, cts)
+                return
+            if would_take(ob, q["ask"]):
+                self._decline(q, "would_take", fair_now, cts)
+                return
         try:
             put_json(self.c, f"/communications/rfqs/{q['id']}/quotes/{qid}/confirm")
         except Exception as e:
