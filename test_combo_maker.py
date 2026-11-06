@@ -175,7 +175,7 @@ class MakerFlow(unittest.TestCase):
         m.handle(rfq_msg())
         path, body = self.client.posts[0]
         self.assertEqual(path, "/communications/quotes")
-        self.assertEqual(body, {"rfq_id": "r1", "yes_bid": "0", "no_bid": "0.7690", "rest_remainder": False})
+        self.assertEqual(body, {"rfq_id": "r1", "yes_bid": "0.0000", "no_bid": "0.7690", "rest_remainder": False})
         m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
                                                       "no_bid_dollars": "0.7690", "accepted_side": "yes",
                                                       "contracts_accepted_fp": "43.29"}})

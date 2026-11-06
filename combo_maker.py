@@ -430,7 +430,7 @@ class Maker:
             self.w.write(dict(q, k="would_quote"))
             return
         try:
-            body = {"rfq_id": rfq["id"], "yes_bid": "0", "no_bid": f"{no_bid:.4f}", "rest_remainder": False}
+            body = {"rfq_id": rfq["id"], "yes_bid": "0.0000", "no_bid": f"{no_bid:.4f}", "rest_remainder": False}  # "0" is refused: "invalid dollar precision"
             js = self.c.post(path="/communications/quotes", body=json.dumps(body))
         except Exception as e:
             self._error("quote", e)
