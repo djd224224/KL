@@ -190,6 +190,70 @@ class KalshiReads:
             return self.data
 
 
+# ---- P&L (Jack 2026-11-06: "show total pnl, settled and unrealized, premiums and trading") ----
+
+def leg_value(leg, markets) -> float:
+    """A leg's value for its side: its book's mid, or 1 / 0 once it has a result
+    (None: no two-sided book and no result)."""
+    tk, side = leg[0], leg[1]
+    m = markets.get(tk) or {}
+    r = str(m.get("result") or "").lower()
+    if r in ("yes", "no"):
+        p = 1.0 if r == "yes" else 0.0
+    else:
+        bid, ask = _f(m.get("yes_bid_dollars"), 0.0), _f(m.get("yes_ask_dollars"), 0.0)
+        if not (0.0 < bid < ask <= 1.0):
+            return None
+        p = (bid + ask) / 2.0
+    return p if side == "yes" else 1.0 - p
+
+
+def ticket_value(t: dict, markets) -> float:
+    """The parlay's fair now: the product of its legs' values (None if one has no price)."""
+    v = 1.0
+    for leg in t["legs"]:
+        x = leg_value(leg, markets)
+        if x is None:
+            return None
+        v *= x
+    return v
+
+
+def pnl_parts(open_t, settled, markets) -> dict:
+    """Total = premiums + trading - fees, split settled / unrealized.
+    Premiums: what we sold over fair at the quote, contracts x (our price - the
+    legs' mid product then). Trading: how the parlay moved since, contracts x
+    (fair then - fair now), or x (fair then - payout) once settled. An open
+    ticket with a leg unpriced stays at its quote's fair (no trading yet)."""
+    out = {"premium": 0.0, "trading": 0.0, "fees": 0.0, "settled": 0.0, "unrealized": 0.0,
+           "collected": 0.0, "unpriced": 0}
+    for t in settled:
+        c, ask, fee = t["contracts"], t["ask"], _f(t.get("fee_est"), 0.0) or 0.0
+        fair = _f(t.get("fair"), ask)
+        pay = 1.0 if t.get("result") == "yes" else 0.0
+        out["premium"] += c * (ask - fair)
+        out["trading"] += c * (fair - pay)
+        out["fees"] += fee
+        out["settled"] += c * (ask - pay) - fee
+        out["collected"] += c * ask
+    for t in open_t:
+        c, ask, fee = t["contracts"], t["ask"], _f(t.get("fee_est"), 0.0) or 0.0
+        fair = _f(t.get("fair"), ask)
+        v = ticket_value(t, markets)
+        if v is None:
+            out["unpriced"] += 1
+            v = fair
+        t["_value"] = v
+        t["_pnl"] = c * (ask - v) - fee
+        out["premium"] += c * (ask - fair)
+        out["trading"] += c * (fair - v)
+        out["fees"] += fee
+        out["unrealized"] += t["_pnl"]
+        out["collected"] += c * ask
+    out["total"] = out["settled"] + out["unrealized"]
+    return out
+
+
 # ---- the snapshot ----------------------------------------------------------------
 
 def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
@@ -213,8 +277,9 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
     settled = [t for t in tickets if t.get("status") == "settled"]
     k = None
     if kalshi is not None:
-        k = kalshi.get(now, [t["mt"] for t in open_t], day0)
+        k = kalshi.get(now, [t["mt"] for t in open_t] + [l[0] for t in open_t for l in t["legs"]], day0)
     fills = (k or {}).get("fills") or []
+    pnl = pnl_parts(open_t, settled, (k or {}).get("markets") or {})
     return {
         "now": now, "running": running, "stopped": stopped,
         "live": bool(last_start and last_start.get("live")),
@@ -230,6 +295,7 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
         "open_loss": sum(t["contracts"] * (1.0 - t["ask"]) for t in open_t),
         "open_premium": sum(t["contracts"] * t["ask"] for t in open_t),
         "settled_pnl": sum(_f(t.get("pnl"), 0.0) for t in settled),
+        "pnl": pnl,
         "wins": sum(1 for t in settled if t.get("result") == "no"),
         "losses": sum(1 for t in settled if t.get("result") == "yes"),
         "last_stat": stats[-1] if stats else None,
@@ -341,6 +407,23 @@ def render(s: dict) -> str:
     H.append(f"<div class='card'><div class='l'>Fees on combo fills</div><div class='v'>{usd(s['fees'])}</div>"
              f"<div class='l'>{len(s['fills'])} fills recorded by Kalshi</div></div>")
     H.append("</div>")
+    pl = s.get("pnl") or {}
+    if pl:
+        H.append("<h2>P&amp;L</h2><div class='cards'>")
+        H.append(f"<div class='card'><div class='l'>Total</div><div class='v'>{signed(pl.get('total'))}</div>"
+                 f"<div class='l'>settled + unrealized</div></div>")
+        H.append(f"<div class='card'><div class='l'>Settled</div><div class='v'>{signed(pl.get('settled'))}</div>"
+                 f"<div class='l'>{s['wins']} kept &middot; {s['losses']} paid out</div></div>")
+        H.append(f"<div class='card'><div class='l'>Unrealized</div><div class='v'>{signed(pl.get('unrealized'))}</div>"
+                 f"<div class='l'>{len(s['open'])} open at the legs' mids now"
+                 + (f" &middot; {pl['unpriced']} unpriced" if pl.get("unpriced") else "") + "</div></div>")
+        H.append(f"<div class='card'><div class='l'>Premiums</div><div class='v'>{signed(pl.get('premium'))}</div>"
+                 f"<div class='l'>sold over fair at the quote, on {usd(pl.get('collected'))} of premium</div></div>")
+        H.append(f"<div class='card'><div class='l'>Trading</div><div class='v'>{signed(pl.get('trading'))}</div>"
+                 f"<div class='l'>the parlays' moves since the sale (payouts once settled)</div></div>")
+        H.append(f"<div class='card'><div class='l'>Fees</div><div class='v'>{signed(-(pl.get('fees') or 0.0))}</div>"
+                 f"<div class='l'>total = premiums + trading &minus; fees</div></div>")
+        H.append("</div>")
     H.append("<h2>Today</h2><div class='card'><div class='funnel'>"
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "
@@ -368,7 +451,7 @@ def render(s: dict) -> str:
     if s["open"]:
         H.append("<table><tr><th>Confirmed</th><th>Legs (we sold the parlay)</th><th class='n'>Our price</th>"
                  "<th class='n'>Fair (quote &rarr; confirm)</th><th class='n'>Contracts</th><th class='n'>Premium</th>"
-                 "<th class='n'>Can lose</th><th>Status</th></tr>")
+                 "<th class='n'>Can lose</th><th class='n'>Fair now</th><th class='n'>P&amp;L now</th><th>Status</th></tr>")
         mk = k.get("markets") or {}
         for t in sorted(s["open"], key=lambda t: -t.get("at", 0)):
             m = mk.get(t["mt"]) or {}
@@ -380,7 +463,9 @@ def render(s: dict) -> str:
                      f"<td class='n'>{t['ask'] * 100:.1f}&cent;</td>"
                      f"<td class='n'>{t['fair'] * 100:.1f} &rarr; {(fc * 100 if fc else 0):.1f}&cent;</td>"
                      f"<td class='n'>{t['contracts']:,.1f}</td><td class='n'>{usd(t['contracts'] * t['ask'])}</td>"
-                     f"<td class='n'>{usd(t['contracts'] * (1 - t['ask']))}</td><td class='small'>{st}</td></tr>")
+                     f"<td class='n'>{usd(t['contracts'] * (1 - t['ask']))}</td>"
+                     f"<td class='n'>{(t['_value'] * 100 if t.get('_value') is not None else 0):.1f}&cent;</td>"
+                     f"<td class='n'>{signed(t.get('_pnl'))}</td><td class='small'>{st}</td></tr>")
         H.append("</table>")
     else:
         H.append("<div class='empty'>No open tickets.</div>")

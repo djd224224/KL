@@ -149,5 +149,43 @@ class Dash(unittest.TestCase):
             srv.server_close()
 
 
+class Pnl(unittest.TestCase):
+    """Jack 2026-11-06: "show total pnl, settled and unrealized, premiums and trading"."""
+
+    def test_parts_add_up(self):
+        mk = {"A": {"yes_bid_dollars": "0.4900", "yes_ask_dollars": "0.5100"},      # mid 0.50
+              "B": {"yes_bid_dollars": "0.2900", "yes_ask_dollars": "0.3100"},      # mid 0.30
+              "C": {"result": "no"}}
+        open_t = [{"legs": [["A", "yes"], ["B", "no"]], "contracts": 100.0, "ask": 0.36, "fair": 0.33,
+                   "fee_est": 0.20}]                                                  # fair now 0.5 x 0.7 = 0.35
+        settled = [{"legs": [["C", "yes"]], "contracts": 50.0, "ask": 0.25, "fair": 0.24, "fee_est": 0.10,
+                    "result": "no", "pnl": 50 * 0.25 - 0.10}]
+        p = cd.pnl_parts(open_t, settled, mk)
+        self.assertAlmostEqual(p["unrealized"], 100 * (0.36 - 0.35) - 0.20)            # +0.80
+        self.assertAlmostEqual(p["settled"], 12.40)
+        self.assertAlmostEqual(p["premium"], 100 * 0.03 + 50 * 0.01)                   # 3.50
+        self.assertAlmostEqual(p["trading"], 100 * (0.33 - 0.35) + 50 * 0.24)          # -2 + 12 = 10.0
+        self.assertAlmostEqual(p["fees"], 0.30)
+        self.assertAlmostEqual(p["total"], p["premium"] + p["trading"] - p["fees"])
+        self.assertAlmostEqual(p["total"], p["settled"] + p["unrealized"])
+        self.assertAlmostEqual(open_t[0]["_value"], 0.35)
+
+    def test_an_unpriced_leg_holds_the_quote_fair(self):
+        open_t = [{"legs": [["A", "yes"]], "contracts": 10.0, "ask": 0.40, "fair": 0.38, "fee_est": 0.0}]
+        p = cd.pnl_parts(open_t, [], {"A": {"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.4100"}})
+        self.assertEqual(p["unpriced"], 1)
+        self.assertAlmostEqual(p["trading"], 0.0)
+        self.assertAlmostEqual(p["unrealized"], 10 * 0.02)
+
+    def test_the_page_shows_it(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        s = cd.snapshot(d.name, d.name, NOW)
+        h = cd.render(s)
+        for label in ("Total", "Settled", "Unrealized", "Premiums", "Trading", "Fees", "P&amp;L now"):
+            self.assertIn(label, h)
+
+
 if __name__ == "__main__":
     unittest.main()
