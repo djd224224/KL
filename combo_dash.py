@@ -5,6 +5,11 @@ r"""combo_dash.py -- a small LOCAL dashboard for the combo maker pilot (Jack
     python combo_dash.py              # http://127.0.0.1:8772, refreshes every 15 s
     python combo_dash.py --port 8780
 
+Kept up by the "KL combo-dash" Windows task (register_combo_dash.ps1: at logon
+and every 10 min, through run_combo_dash_hidden.vbs -> run_combo_dash.ps1, a
+restart loop that logs to run-logs\combo-dash\launcher-<date>.log). Stop it:
+create run-logs\combo-dash\combo_dash.stop. A second copy exits 4 (port taken).
+
 What it shows: the maker's status and settings, the combo shard's cash, today's
 funnel (quotes -> accepted -> confirmed, and why it declined), the open tickets
 (legs, our price vs fair, what each can lose), the settled ones with their P&L,
@@ -29,6 +34,7 @@ import html
 import json
 import math
 import os
+import socket
 import sys
 import threading
 import time
@@ -42,6 +48,14 @@ if HERE not in sys.path:
 
 MAKER_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 SHADOW_DIR = os.environ.get("COMBO_RFQ_DIR", os.path.join(HERE, "run-logs", "combo-rfq"))
+# The "KL combo-dash" task keeps the page up (register_combo_dash.ps1; Jack 2026-11-06
+# "Yes, add the task": the app had stopped its preview server when the session went
+# idle). Its launcher logs to DASH_DIR; the stop file there ends it (exit 3), and a
+# second copy finds the port taken and exits 4, leaving the first one serving.
+DASH_DIR = os.environ.get("COMBO_DASH_DIR", os.path.join(HERE, "run-logs", "combo-dash"))
+STOP_FILE = os.path.join(DASH_DIR, "combo_dash.stop")
+STOP_CHECK_S = 2.0
+EXIT_STOP, EXIT_PORT = 3, 4
 PORT = 8772
 REFRESH_S = 15
 KALSHI_TTL_S = 60.0
@@ -612,6 +626,7 @@ td.n,th.n{text-align:right;white-space:nowrap}
 .empty{padding:14px;color:var(--muted)}
 .chips span{display:inline-block;background:var(--chip);border-radius:6px;padding:1px 7px;margin:2px 4px 2px 0;font-size:12px}
 footer{margin:20px 0 6px;color:var(--muted);font-size:12px}
+tr.tot td{font-weight:700;border-top:2px solid var(--line);border-bottom:0}
 """
 
 
@@ -1120,6 +1135,14 @@ def render(s: dict) -> str:
                      f"<td class='n'>{usd(t['contracts'] * (1 - t['ask']))}</td>"
                      f"<td class='n'>{(t['_value'] * 100 if t.get('_value') is not None else 0):.1f}&cent;</td>"
                      f"<td class='n'>{signed(t.get('_pnl'))}</td><td class='small'>{st}</td></tr>")
+        # the column sums (Jack 2026-11-06: the rows' P&L now + the settled P&L "doesnt add up to the
+        # total"; it does at one refresh, but the two in-play tennis tickets at the bottom carried
+        # nearly all of it and move between refreshes)
+        n = len(s["open"])
+        H.append(f"<tr class='tot'><td colspan='5'>Total of {n} &middot; the Unrealized card</td>"
+                 f"<td class='n'>{usd(sum(t['contracts'] * t['ask'] for t in s['open']))}</td>"
+                 f"<td class='n'>{usd(sum(t['contracts'] * (1 - t['ask']) for t in s['open']))}</td><td></td>"
+                 f"<td class='n'>{signed(sum(_f(t.get('_pnl'), 0.0) for t in s['open']))}</td><td></td></tr>")
         H.append("</table>")
     else:
         H.append("<div class='empty'>No open tickets.</div>")
@@ -1132,6 +1155,8 @@ def render(s: dict) -> str:
             H.append(f"<tr><td class='small'>{tm(t.get('at', 0))}</td><td class='small'>{legs_html(t['legs'])}</td>"
                      f"<td class='n'>{t['ask'] * 100:.1f}&cent;</td><td class='n'>{t['contracts']:,.1f}</td>"
                      f"<td>{res}</td><td class='n'>{signed(_f(t.get('pnl')))}</td></tr>")
+        H.append(f"<tr class='tot'><td colspan='5'>Total of {len(s['settled'])} &middot; the Settled card</td>"
+                 f"<td class='n'>{signed(sum(_f(t.get('pnl'), 0.0) for t in s['settled']))}</td></tr>")
         H.append("</table>")
     else:
         H.append("<div class='empty'>Nothing settled yet.</div>")
@@ -1210,26 +1235,66 @@ def make_handler(maker_dir, shadow_dir, kalshi, history=None, logs=None):
     return H
 
 
+class DashServer(ThreadingHTTPServer):
+    """One dashboard to a port. HTTPServer sets SO_REUSEADDR, and on Windows that
+    lets a second process bind a port already in use -- a second dash would serve
+    beside the first. There the bind is exclusive instead, so a second copy fails."""
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def serve(srv, stop_file=None, check_s: float = STOP_CHECK_S) -> int:
+    """Serve until Ctrl+C (0), or until the stop file appears (EXIT_STOP)."""
+    seen, done = threading.Event(), threading.Event()
+
+    def watch():
+        while not done.wait(check_s):
+            if stop_file and os.path.exists(stop_file):
+                seen.set()
+                srv.shutdown()
+                return
+
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        srv.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        done.set()
+        srv.server_close()
+    return EXIT_STOP if seen.is_set() else 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--no-kalshi", action="store_true", help="local files only")
     a = ap.parse_args(argv)
+    if os.path.exists(STOP_FILE):
+        print(f"{STOP_FILE} exists: not starting (delete it and the task starts the dash again)", flush=True)
+        return EXIT_STOP
     kalshi = None if a.no_kalshi else KalshiReads()
     history = None if kalshi is None else HistoryReads(kalshi)
     logs = MakerLog(MAKER_DIR)
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history, logs))
+    try:
+        srv = DashServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history, logs))
+    except OSError as e:
+        print(f"port {a.port} is taken -- another dashboard serves it? ({e}); exiting", flush=True)
+        return EXIT_PORT
     print(f"combo dashboard on http://127.0.0.1:{a.port} (Ctrl+C to stop)", flush=True)
     t = time.perf_counter()               # the cold reads (the day's log, the first Kalshi and candle reads),
-    snapshot(MAKER_DIR, SHADOW_DIR, time.time(), kalshi, history, logs)   # a page asked for meanwhile waits
-    days = logs.update(time.time())
-    print(f"warmed in {time.perf_counter() - t:.1f} s: {sum(d.quotes for d in days):,} quotes, "
-          f"{sum(d.off for d in days) / 1e6:,.1f} MB of log", flush=True)
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    return 0
+    try:                                  # a page asked for meanwhile waits
+        snapshot(MAKER_DIR, SHADOW_DIR, time.time(), kalshi, history, logs)
+        days = logs.update(time.time())
+        print(f"warmed in {time.perf_counter() - t:.1f} s: {sum(d.quotes for d in days):,} quotes, "
+              f"{sum(d.off for d in days) / 1e6:,.1f} MB of log", flush=True)
+    except Exception as e:                # the page shows it; serve anyway
+        print(f"warm-up failed: {type(e).__name__}: {e}", flush=True)
+    return serve(srv, STOP_FILE)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import unittest
 import urllib.request
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 import combo_dash as cd
 
@@ -513,6 +514,55 @@ class Background(unittest.TestCase):
         gate.set()
         h.thread.join(5)
         self.assertEqual(h.data["at"], T0 + 1600)
+
+
+class Task(unittest.TestCase):
+    """The "KL combo-dash" task keeps the page up (Jack 2026-11-06: "Yes, add the task")."""
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        write_files(self.d.name)
+
+    def server(self, port=0):
+        return cd.DashServer(("127.0.0.1", port), cd.make_handler(self.d.name, self.d.name, None))
+
+    def test_a_second_dash_cannot_take_the_port(self):
+        a = self.server()
+        self.addCleanup(a.server_close)
+        with self.assertRaises(OSError):
+            self.server(a.server_address[1]).server_close()
+
+    def test_the_stop_file_ends_it(self):
+        srv = self.server()
+        stop = os.path.join(self.d.name, "combo_dash.stop")
+        out = []
+        th = threading.Thread(target=lambda: out.append(cd.serve(srv, stop, check_s=0.05)), daemon=True)
+        th.start()
+        page = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/", timeout=5).read().decode()
+        self.assertIn("Combo maker", page)
+        open(stop, "w").close()
+        th.join(5)
+        self.assertEqual(out, [cd.EXIT_STOP])
+
+    def test_main_exits_3_on_the_stop_file_and_4_on_a_taken_port(self):
+        stop = os.path.join(self.d.name, "combo_dash.stop")
+        with mock.patch.object(cd, "STOP_FILE", stop), mock.patch.object(cd, "MAKER_DIR", self.d.name), \
+                mock.patch.object(cd, "SHADOW_DIR", self.d.name):
+            open(stop, "w").close()
+            self.assertEqual(cd.main(["--no-kalshi", "--port", "0"]), cd.EXIT_STOP)
+            os.remove(stop)
+            a = self.server()
+            self.addCleanup(a.server_close)
+            self.assertEqual(cd.main(["--no-kalshi", "--port", str(a.server_address[1])]), cd.EXIT_PORT)
+
+    def test_the_tables_have_totals(self):
+        """Jack 2026-11-06: the rows' P&L now plus the settled P&L "doesnt add up to the total"."""
+        s = cd.snapshot(self.d.name, self.d.name, NOW, cd.KalshiReads(client_factory=FakeClient))
+        page = cd.render(s)
+        self.assertIn("Total of 1 &middot; the Unrealized card", page)
+        self.assertIn("Total of 1 &middot; the Settled card", page)
+        self.assertAlmostEqual(s["pnl"]["unrealized"], sum(t["_pnl"] for t in s["open"]))
 
 
 if __name__ == "__main__":
