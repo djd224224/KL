@@ -1,0 +1,141 @@
+"""Tests for combo_dash.py (the combo maker pilot's local dashboard,
+2026-11-05). Synthetic files and a fake Kalshi client; no network."""
+import json
+import os
+import tempfile
+import threading
+import time
+import unittest
+import urllib.request
+from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
+
+import combo_dash as cd
+
+NOW = 1793931000.0                 # 2026-11-06 02:30Z = 9:30 PM ET 11/05
+LEGS = [["KXNBAGAME-26NOV05MIAGSW-GSW", "yes"], ["KXNHLGAME-26NOV05BOSTOR-BOS", "no"]]
+
+
+class FakeClient:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, path, params):
+        self.calls.append(path)
+        if path == "/portfolio/balance":
+            return {"balance_breakdown": [{"balance": "16120.25", "exchange_index": 0},
+                                          {"balance": "232.10", "exchange_index": 1}]}
+        if path == "/portfolio/fills":
+            return {"fills": [{"market_ticker": "KXMVECROSSCATEGORY-S2026A-B", "count_fp": "30.00",
+                               "yes_price_dollars": "0.3350", "outcome_side": "no", "fee_cost": "0.000000",
+                               "created_time": "2026-11-06T02:10:05Z"},
+                              {"market_ticker": "KXNBAGAME-26NOV05MIAGSW-GSW", "count_fp": "5.00",
+                               "fee_cost": "0.10"}]}                       # not a combo: left out
+        if path == "/markets":
+            return {"markets": [{"ticker": "KXMVECROSSCATEGORY-S2026A-B", "status": "active", "result": ""}]}
+        raise AssertionError(path)
+
+
+def write_files(d, now=NOW):
+    day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    rows = [
+        {"k": "start", "t": now - 1800, "live": True,
+         "cfg": {"markup": 0.04, "min_legs": 2, "max_legs": 5, "games": ["26NOV05MIAGSW"], "min_lead_min": 5,
+                 "max_payout": 150, "max_game_payout": 300, "max_open_loss": 200}},
+        {"k": "quote", "at": now - 1200, "mt": "KXMVECROSSCATEGORY-S2026A-B", "legs": LEGS, "fair": 0.32,
+         "ask": 0.333, "contracts": 30.0, "sent_ms": 120.0},
+        {"k": "accept", "quote_id": "q1", "mt": "KXMVECROSSCATEGORY-S2026A-B", "contracts": 30.0},
+        {"k": "confirm", "at": now - 1199, "mt": "KXMVECROSSCATEGORY-S2026A-B", "legs": LEGS, "ask": 0.333,
+         "contracts": 30.0, "confirm_ms": 210.0},
+        {"k": "quote", "at": now - 900, "mt": "KXMVECROSSCATEGORY-S2026C-D", "legs": LEGS, "fair": 0.3,
+         "ask": 0.312, "contracts": 20.0},
+        {"k": "decline", "mt": "KXMVECROSSCATEGORY-S2026C-D", "why": "edge_gone", "ask": 0.312,
+         "fair": 0.3, "fair_now": 0.31},
+        {"k": "err", "what": "quote", "err": "HttpError: nope"},
+        {"k": "stat", "t": now - 30, "rfq": 21000, "pre_ok": 1500, "priced": 12, "quoted": 10,
+         "why": {"legs": 12000, "not_main": 5000}},
+    ]
+    with open(os.path.join(d, f"combo_{day}.jsonl"), "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    tickets = [{"quote_id": "q1", "mt": "KXMVECROSSCATEGORY-S2026A-B", "legs": LEGS, "ask": 0.333,
+                "fair": 0.32, "fair_confirm": 0.321, "contracts": 30.0, "status": "executed",
+                "at": now - 1199, "games": ["26NOV05MIAGSW", "26NOV05BOSTOR"]},
+               {"quote_id": "q0", "mt": "KXMVECROSSCATEGORY-S2026E-F", "legs": LEGS, "ask": 0.25,
+                "fair": 0.24, "contracts": 40.0, "status": "settled", "result": "no", "pnl": 9.65,
+                "at": now - 5000, "games": []}]
+    with open(os.path.join(d, "maker_state.json"), "w", encoding="utf-8") as f:
+        json.dump({"tickets": tickets}, f)
+
+
+class Dash(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        write_files(self.d.name)
+
+    def tearDown(self):
+        self.d.cleanup()
+
+    def test_labels(self):
+        self.assertEqual(cd.leg_label(LEGS[0]), "NBA MIAGSW: GSW win")
+        self.assertEqual(cd.leg_label(LEGS[1]), "NOT (NHL BOSTOR: BOS win)")
+        self.assertEqual(cd.leg_label(["KXNBASPREAD-26NOV05MIAGSW-GSW5", "yes"]), "NBA MIAGSW: GSW5 spread")
+
+    def test_unstamped_lines_take_the_last_time(self):
+        ev = cd.read_events(self.d.name, NOW)
+        by = {e["k"]: e for e in ev}
+        self.assertEqual(by["accept"]["_ts"], NOW - 1200)       # after the quote at -1200
+        self.assertEqual(by["err"]["_ts"], NOW - 900)
+
+    def test_snapshot_counts_and_kalshi(self):
+        k = cd.KalshiReads(client_factory=FakeClient)
+        s = cd.snapshot(self.d.name, self.d.name, NOW, k)
+        self.assertTrue(s["running"] and s["live"])
+        f = s["funnel"]
+        self.assertEqual((f["quotes"], f["accepted"], f["confirmed"], f["declined"], f["errors"]), (2, 1, 1, 1, 1))
+        self.assertEqual(s["declines"], {"edge_gone": 1})
+        self.assertEqual(len(s["open"]), 1)
+        self.assertAlmostEqual(s["open_loss"], 30 * (1 - 0.333))
+        self.assertAlmostEqual(s["settled_pnl"], 9.65)
+        self.assertEqual((s["wins"], s["losses"]), (1, 0))
+        self.assertAlmostEqual(s["kalshi"]["cash"], 232.10)
+        self.assertEqual(len(s["fills"]), 1)                     # the single-market fill is left out
+        # cached: a second snapshot inside the TTL reads nothing new
+        n = len(k.client.calls)
+        cd.snapshot(self.d.name, self.d.name, NOW + 5, k)
+        self.assertEqual(len(k.client.calls), n)
+
+    def test_stopped_when_quiet(self):
+        s = cd.snapshot(self.d.name, self.d.name, NOW + 600)
+        self.assertFalse(s["running"])
+
+    def test_page_renders(self):
+        s = cd.snapshot(self.d.name, self.d.name, NOW, cd.KalshiReads(client_factory=FakeClient))
+        page = cd.render(s)
+        for want in ("Combo maker", "LIVE", "Open tickets (1)", "Settled (1)", "NBA MIAGSW: GSW win",
+                     "edge_gone", "$232.10", "Fills on Kalshi (1)", "http-equiv='refresh'"):
+            self.assertIn(want, page)
+
+    def test_page_renders_with_nothing_there(self):
+        with tempfile.TemporaryDirectory() as empty:
+            page = cd.render(cd.snapshot(empty, empty, NOW))
+        self.assertIn("NOT RUNNING", page)
+        self.assertIn("No open tickets", page)
+
+    def test_server_answers(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), cd.make_handler(self.d.name, self.d.name, None))
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            port = srv.server_address[1]
+            body = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode()
+            self.assertIn("Combo maker", body)
+            js = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/data.json", timeout=5).read())
+            self.assertIn("funnel", js)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()
