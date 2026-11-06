@@ -59,6 +59,7 @@ EXIT_STOP, EXIT_PORT = 3, 4
 PORT = 8772
 REFRESH_S = 15
 KALSHI_TTL_S = 60.0
+COMBO_SHARD = 1            # the combo shard (exchange_index): its cash and its fills
 RUNNING_S = 120.0          # a maker with no line this recent is shown as stopped
 FEED_N = 40
 KINDS = {"GAME": "win", "SPREAD": "spread", "TOTAL": "total"}
@@ -394,14 +395,14 @@ class KalshiReads:
                 self.client = ks.client()
         return self.client
 
-    def get(self, now: float, open_tickers, day_start: float) -> dict:
+    def get(self, now: float, open_tickers, day_start: float, since=None) -> dict:
         with self.lock:
             if now - self.at < self.ttl or (self.busy and now - self.busy_since < BUSY_MAX_S):
                 return self.data
             self.at, self.busy, self.busy_since = now, True, now
             inline = not self.background or self.tries == 0
             self.tries += 1
-        args = (now, sorted(set(open_tickers)), day_start)
+        args = (now, sorted(set(open_tickers)), day_start, since)
         if inline:
             self._refresh(*args)
         else:
@@ -409,22 +410,35 @@ class KalshiReads:
             self.thread.start()
         return self.data
 
-    def _refresh(self, now: float, tks: list, day_start: float) -> None:
+    def _refresh(self, now: float, tks: list, day_start: float, since=None) -> None:
         try:
             with self.io:
                 c = self._client()
                 bal = c.get("/portfolio/balance", {})
                 cash = {int(r.get("exchange_index")): _f(r.get("balance"), 0.0)
                         for r in bal.get("balance_breakdown") or []}
-                fj = c.get("/portfolio/fills", {"min_ts": int(day_start - 86400), "limit": 200})
-                fills = [x for x in fj.get("fills") or []
-                         if str(x.get("market_ticker") or x.get("ticker") or "").startswith("KXMVE")]
+                # The combo shard's fills only (Jack 2026-11-06: make the two fee figures agree).
+                # The account's feed is mostly the IMM's, and its one page of 200 had pushed the
+                # older combo fills off (19 of 29 shown, $5.77 of $7.98 in fees). From the first
+                # ticket's fill (`since`), so this card and the P&L count the same fills.
+                fills, cursor = [], None
+                min_ts = int(since) if since else int(day_start - 86400)
+                for _ in range(10):
+                    params = {"min_ts": min_ts, "limit": 200, "exchange_index": COMBO_SHARD}
+                    if cursor:
+                        params["cursor"] = cursor
+                    fj = c.get("/portfolio/fills", params)
+                    fills += [x for x in fj.get("fills") or []
+                              if str(x.get("market_ticker") or x.get("ticker") or "").startswith("KXMVE")]
+                    cursor = fj.get("cursor")
+                    if not cursor:
+                        break
                 mk = {}
                 for i in range(0, len(tks), 100):
                     mj = c.get("/markets", {"tickers": ",".join(tks[i:i + 100]), "limit": 1000})
                     for m in mj.get("markets") or []:
                         mk[m.get("ticker")] = m
-            data = {"cash": cash.get(1), "fills": fills, "markets": mk, "error": None, "at": now}
+            data = {"cash": cash.get(COMBO_SHARD), "fills": fills, "markets": mk, "error": None, "at": now}
         except Exception as e:
             data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
         with self.lock:
@@ -524,12 +538,13 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
     firsts = [d.first_quote for d in days if d.first_quote is not None]
     open_t = [t for t in tickets if t.get("status") in ("confirmed", "executed")]
     settled = [t for t in tickets if t.get("status") == "settled"]
+    filled = filled_tickets(tickets)
+    since = (min(fill_time(t) for t in filled) - 60.0) if filled else None   # the fills the P&L counts
     k = None
     if kalshi is not None:
-        k = kalshi.get(now, [t["mt"] for t in open_t] + [l[0] for t in open_t for l in t["legs"]], day0)
+        k = kalshi.get(now, [t["mt"] for t in open_t] + [l[0] for t in open_t for l in t["legs"]], day0, since)
     fills = (k or {}).get("fills") or []
     pnl = pnl_parts(open_t, settled, (k or {}).get("markets") or {})
-    filled = filled_tickets(tickets)
     hist = history.get(now, filled, (k or {}).get("markets") or {}, settle_ts) if history is not None else None
     series = [p for p in (hist or {}).get("series") or [] if p["t"] < now]
     if filled:                                     # the last point is the cards' live P&L
@@ -1064,7 +1079,7 @@ def render(s: dict) -> str:
     H.append(f"<div class='card'><div class='l'>Open tickets</div><div class='v'>{len(s['open'])}</div>"
              f"<div class='l'>can lose {usd(s['open_loss'])} &middot; collected {usd(s['open_premium'])}</div></div>")
     H.append(f"<div class='card'><div class='l'>Fees on combo fills</div><div class='v'>{usd(s['fees'])}</div>"
-             f"<div class='l'>{len(s['fills'])} fills recorded by Kalshi</div></div>")
+             f"<div class='l'>{len(s['fills'])} fills on the combo shard, Kalshi's record</div></div>")
     fr = s.get("fill_rate") or {}
     if fr.get("quotes"):
         one_in = f" &middot; 1 in {fr['quotes'] / fr['filled']:,.0f}" if fr.get("filled") else ""

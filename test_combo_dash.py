@@ -600,5 +600,36 @@ class Wording(unittest.TestCase):
         self.assertIn("'collected'", cd.CHART_JS)
 
 
+class FeeCard(unittest.TestCase):
+    """Jack 2026-11-06: make the dashboard's two fee figures agree (the card read one page of the
+    whole account's fills, mostly the IMM's: 19 of 29 combo fills, $5.77 of $7.98)."""
+
+    def test_the_combo_shard_from_the_first_fill_through_every_page(self):
+        calls = []
+
+        class C(FakeClient):
+            def get(self, path, params):
+                if path == "/portfolio/fills":
+                    calls.append(dict(params))
+                    if not params.get("cursor"):
+                        return {"fills": [{"market_ticker": "KXMVECROSSCATEGORY-S2026A-B", "count_fp": "30.00",
+                                           "fee_cost": "0.100000", "created_time": "2026-11-06T02:10:05Z"}],
+                                "cursor": "p2"}
+                    return {"fills": [{"market_ticker": "KXMVECROSSCATEGORY-S2026E-F", "count_fp": "40.00",
+                                       "fee_cost": "0.050000", "created_time": "2026-11-06T01:07:00Z"}]}
+                return FakeClient.get(self, path, params)
+
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        s = cd.snapshot(d.name, d.name, NOW, cd.KalshiReads(client_factory=C))
+        self.assertEqual(len(calls), 2)                                          # the cursor was followed
+        self.assertEqual((calls[0]["exchange_index"], calls[1].get("cursor")), (1, "p2"))
+        self.assertEqual(calls[0]["min_ts"], int(NOW - 5000 - 60))               # the settled ticket's fill
+        self.assertAlmostEqual(s["fees"], 0.15)
+        self.assertEqual(len(s["fills"]), 2)
+        self.assertIn("2 fills on the combo shard", cd.render(s))
+
+
 if __name__ == "__main__":
     unittest.main()
