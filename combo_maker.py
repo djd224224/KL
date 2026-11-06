@@ -137,6 +137,11 @@ class Config:
         # down to 0% instead of 2%. 0 here, so a bare Config (the tests, the shadow
         # scorer) prices every parlay alike; the CLI's default is 0.02
         self.nfl_markup_cut = 0.0
+        # LAST-LOOK FLOOR (Jack 2026-11-06: "i want last look to have at least 1%
+        # edge"): whatever half the markup less the all-NFL cut comes to, the last
+        # look asks at least this much over the fair now. It binds on all-NFL 2-3
+        # leg parlays (0% / 0.5% -> 1%); every other parlay asks 2%+ at a 4% markup
+        self.confirm_edge_floor = 0.01
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -223,10 +228,10 @@ class Config:
     def confirm_edge_for(self, n_legs: int, legs=None) -> float:
         """The last look's minimum edge on an n-leg parlay: confirm_min_edge at 2
         legs, + half the step for each leg over 2 (half the markup, as before);
-        the whole all-NFL cut less when every one of `legs` is NFL (floor 0: our
-        price at or over the fair)."""
+        the whole all-NFL cut less when every one of `legs` is NFL; never under
+        confirm_edge_floor (1%)."""
         e = self.confirm_min_edge + self.markup_per_leg / 2.0 * max(0, int(n_legs) - 2)
-        return max(0.0, e - self.nfl_cut(legs))
+        return max(self.confirm_edge_floor, e - self.nfl_cut(legs))
 
     def fee_free(self, legs) -> bool:
         """Every leg an NFL market (main lines on different games by the
@@ -1069,7 +1074,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
         + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
         + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
-        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half)"
+        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half, at least {cfg.confirm_edge_floor * 100:.3g}%)"
         + (f", all-NFL {cfg.nfl_markup_cut * 100:.3g} pts less" if cfg.nfl_markup_cut else "")
         + f", lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
@@ -1165,6 +1170,10 @@ def main(argv=None) -> int:
                          "last look (0.02: 2 legs quoted at 2%% instead of 4%%, confirmed down to 0%% "
                          "instead of 2%%; 0 = no cut). Jack 2026-11-06: \"NFL parlays require 2c less "
                          "edge because there are no maker fees\"")
+    ap.add_argument("--confirm-edge-floor", type=float, default=d.confirm_edge_floor,
+                    help="the last look never asks less than this over the fair now (0.01: all-NFL 2-leg "
+                         "parlays confirm at 1%%+, not 0%%). Jack 2026-11-06: \"i want last look to have "
+                         "at least 1%% edge\"")
     ap.add_argument("--max-payout", type=float, default=d.max_payout)
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
     ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,
@@ -1218,6 +1227,9 @@ def main(argv=None) -> int:
         ap.error("--markup-per-leg 0 to 0.10")
     if not 0 <= a.nfl_markup_cut < a.markup:
         ap.error("--nfl-markup-cut from 0 to under --markup (an all-NFL parlay keeps some markup)")
+    if not 0 <= a.confirm_edge_floor < a.markup - a.nfl_markup_cut - 1e-9:
+        ap.error("--confirm-edge-floor from 0 to under the lowest quote markup (--markup minus "
+                 "--nfl-markup-cut), or a 2-leg all-NFL quote fails its own last look")
     if a.min_legs < 2:
         ap.error("--min-legs 2 or more")
     if not a.min_legs <= a.max_legs <= 12:
@@ -1226,7 +1238,8 @@ def main(argv=None) -> int:
         ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
     cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg,
-                 nfl_markup_cut=a.nfl_markup_cut, max_payout=a.max_payout,
+                 nfl_markup_cut=a.nfl_markup_cut, confirm_edge_floor=a.confirm_edge_floor,
+                 max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_ticket_loss=a.max_ticket_loss,
                  max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,

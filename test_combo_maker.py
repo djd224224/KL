@@ -758,8 +758,14 @@ class NflCut(unittest.TestCase):
         self.assertAlmostEqual(cfg.markup_for(3, nfl3), 0.03)
         self.assertAlmostEqual(cfg.markup_for(2, mixed), 0.04)
         self.assertAlmostEqual(cfg.markup_for(2), 0.04)                       # no legs given: as before
-        self.assertAlmostEqual(cfg.confirm_edge_for(2, nfl), 0.0)             # 2% - 2%: at or over the fair
-        self.assertAlmostEqual(cfg.confirm_edge_for(3, nfl3), 0.005)
+        # Jack 2026-11-06: "i want last look to have at least 1% edge"
+        self.assertAlmostEqual(cfg.confirm_edge_for(2, nfl), 0.01)            # 2% - 2% = 0 -> the 1% floor
+        self.assertAlmostEqual(cfg.confirm_edge_for(3, nfl3), 0.01)           # 0.5% -> 1%
+        nfl5 = nfl3 + [["KXNFLGAME-26NOV09NYGPHI-NYG", "yes"], ["KXNFLGAME-26NOV09GBCHI-GB", "no"]]
+        self.assertAlmostEqual(cfg.confirm_edge_for(5, nfl5), 0.015)          # 3.5% - 2%: over the floor
+        bare = self.cfg(confirm_edge_floor=0.0)
+        self.assertAlmostEqual(bare.confirm_edge_for(2, nfl), 0.0)
+        self.assertAlmostEqual(bare.confirm_edge_for(3, nfl3), 0.005)
         self.assertAlmostEqual(cfg.confirm_edge_for(2, mixed), 0.02)
         self.assertEqual(cm.quote_price(0.30, cfg, n_legs=2, legs=nfl), (0.306, 0.694))
         self.assertEqual(cm.quote_price(0.30, cfg, n_legs=2, legs=mixed), (0.312, 0.688))
@@ -782,12 +788,12 @@ class NflCut(unittest.TestCase):
 
     def test_an_all_nfl_parlay_is_quoted_and_confirmed_2_points_lower(self):
         nfl = [[self.N1, "yes"], [self.N2, "yes"]]
-        c, w = self.run_one(nfl, {self.N1: (0.60, 0.62)})                    # N1 0.60 -> 0.61: fair 0.305
+        c, w = self.run_one(nfl, {self.N1: (0.594, 0.614)})                  # N1 0.60 -> 0.604: fair 0.302
         self.assertEqual(c.posts[0][1]["no_bid"], "0.6940")                  # 0.306 = 0.30 x 1.02, not 0.312
         self.assertAlmostEqual(w.k("quote")[0]["mu"], 0.02)
-        self.assertEqual(len(c.puts), 1)                                     # 0.306 >= 0.305 (a 2% bar: 0.3111)
-        c, w = self.run_one(nfl, {self.N1: (0.61, 0.63)})                    # N1 -> 0.62: fair 0.31 > 0.306
-        self.assertEqual(c.puts, [])
+        self.assertEqual(len(c.puts), 1)                                     # 0.306 >= 0.302 x 1.01 = 0.30502
+        c, w = self.run_one(nfl, {self.N1: (0.60, 0.62)})                    # N1 -> 0.61: fair 0.305
+        self.assertEqual(c.puts, [])                                         # 0.306 < 0.305 x 1.01: the floor
         self.assertEqual(w.k("decline")[0]["why"], "edge_gone")
 
     def test_a_parlay_with_any_other_leg_keeps_the_markup(self):
@@ -797,7 +803,9 @@ class NflCut(unittest.TestCase):
 
     def test_cli_bounds(self):
         for bad in (["--nfl-markup-cut", "-0.01"],
-                    ["--allow-thin", "--markup", "0.04", "--nfl-markup-cut", "0.04"]):        # none left
+                    ["--allow-thin", "--markup", "0.04", "--nfl-markup-cut", "0.04"],         # none left
+                    ["--confirm-edge-floor", "-0.01"],
+                    ["--allow-thin", "--markup", "0.04", "--confirm-edge-floor", "0.02"]):    # = 4% - 2%
             with self.assertRaises(SystemExit):
                 cm.main(bad)
 

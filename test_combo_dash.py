@@ -559,8 +559,10 @@ class Task(unittest.TestCase):
     def test_the_header_shows_the_nfl_cut(self):
         """Jack 2026-11-06: "NFL parlays require 2c less edge because there are no maker fees"."""
         s = cd.snapshot(self.d.name, self.d.name, NOW)
-        s["cfg"]["nfl_markup_cut"] = 0.02
-        self.assertIn("all-NFL 2 pts less", cd.render(s))
+        s["cfg"]["nfl_markup_cut"], s["cfg"]["confirm_edge_floor"] = 0.02, 0.01
+        page = cd.render(s)
+        self.assertIn("all-NFL 2 pts less", page)
+        self.assertIn("last look &ge; 1%", page)
         s["cfg"]["nfl_markup_cut"] = 0.0
         self.assertNotIn("all-NFL", cd.render(s))
 
