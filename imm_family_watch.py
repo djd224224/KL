@@ -716,6 +716,19 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     if cat == "Elections":
         return ("QUOTE ONCE DATED", "an election: quote it once its election day is on "
                                     "file (verified date rows only)" + rec_txt)
+    # THE POLITICS FAMILY (Jack 2026-11-06: "auto-enroll the ones that are
+    # quotable / without pickoff risk into Politics family"): a Politics series
+    # still not allowed is one the family's rule left out
+    # (imm_earnings_overrides.politics_auto_why_not reads its rules; the
+    # review line in the log says why). The title shows the common reasons.
+    if cat == "Politics" and imm.POLITICS_AUTO and kind == "new":
+        m = ieo._POLITICS_INSIDER_RE.search(str(it.get("title") or ""))
+        if m:
+            return ("DON'T QUOTE", f"the Politics family's rule left it out: decided by one "
+                                   f"call, or known first by insiders (\"{m.group(0)}\")")
+        return ("YOUR CALL", "the Politics family's rule left it out (no public legislative "
+                             "process in its terms, a \"who\" strike, a live source or a "
+                             "near close: the watch log's review line says which)")
     # ONE-OFFS (Jack 2026-10-22: "One-off news is ok if it's not easy to be
     # adversely selected against", refining 10/19's "Don't suggest quoting
     # one-off news events"). A vote, or what a named vote decides (10/09: who

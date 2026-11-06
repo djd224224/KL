@@ -36,6 +36,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -548,7 +549,9 @@ def enroll_new_series(client, dry: bool):
     imm.load_awards_extra_series()
     imm.load_graduate_auto_series()
     imm.load_mention_auto_series()
+    imm.load_politics_auto_series()
     seen: dict = {}
+    paying: dict = {}                 # series -> every paying market ticker
     cursor = None
     while True:
         params = {"status": "active", "limit": 200}
@@ -560,6 +563,8 @@ def enroll_new_series(client, dry: bool):
             s = t.split("-")[0]
             if s and s not in seen:
                 seen[s] = t
+            if s and t not in paying.setdefault(s, []):
+                paying[s].append(t)
         cursor = resp.get("next_cursor")
         if not cursor:
             break
@@ -614,6 +619,7 @@ def enroll_new_series(client, dry: bool):
     awards_additions = []
     grad_additions: dict = {}
     mention_additions = []
+    politics_additions: dict = {}
     still_review = []
     for s, why, sample in review:
         se = series_meta(client, s)
@@ -656,6 +662,15 @@ def enroll_new_series(client, dry: bool):
                 enrolled.append((s, AWARDS_ENROLL_WHY, sample))
             else:
                 still_review.append((s, f"{why}; awards: {why_not}", sample))
+        elif imm.POLITICS_AUTO and se.get("category") == "Politics":
+            why_not, word = politics_auto_why_not(client, s, paying.get(s) or [sample], se)
+            if not why_not:
+                politics_additions[s] = {"title": se.get("title") or "", "word": word,
+                                         "sample": sample}
+                enrolled.append((s, f"{POLITICS_AUTO_WHY} (\"{word}\")", sample))
+            else:
+                still_review.append((s, f"{why}; {gwhy + '; ' if gwhy else ''}"
+                                        f"politics: {why_not}", sample))
         else:
             still_review.append((s, f"{why}; {gwhy}" if gwhy else why, sample))
     review = still_review
@@ -697,7 +712,155 @@ def enroll_new_series(client, dry: bool):
         _merge_series_file(imm.mention_auto_path(), mention_additions)
         log(f"mention-enrolled {len(mention_additions)} single-event Mentions "
             f"series ({', '.join(sorted(mention_additions))}) -> {imm.mention_auto_path()}")
+    if politics_additions and not dry:
+        _merge_series_file(imm.politics_auto_path(), politics_additions)
+        log(f"politics-enrolled {len(politics_additions)} Politics series "
+            f"({', '.join(sorted(politics_additions))}) -> {imm.politics_auto_path()}")
+        try:
+            politics_auto_notify(politics_additions)
+        except Exception as e:                       # noqa: BLE001
+            log(f"! politics auto enrollment email failed: {e!r}")
     return enrolled, review
+
+
+# THE POLITICS FAMILY BY KALSHI CATEGORY (Jack 2026-11-06: "go through the
+# batch one by one, auto-enroll the ones that are quotable / without pickoff
+# risk into Politics family. make sure this is a rule going forward"). A
+# REVIEW series Kalshi files under Politics joins incentive_mm.POLITICS_AUTO_
+# FILE (hot-reloaded; the bot's rules are documented there) when its outcome
+# is decided by a PUBLIC LEGISLATIVE PROCESS -- his 10/22 line, "One-off news
+# is ok if it's not easy to be adversely selected against": a bill or law
+# passing, a repeal, a Senate rules change, a state compact, recorded
+# impeachment votes, judges confirmed over a year. Every word of the series
+# title, the paying events' titles and every paying market's rules is read:
+#   - one _POLITICS_PROCESS_RE word somewhere, and
+#   - no _POLITICS_INSIDER_RE word anywhere -- the ways the answer reaches
+#     insiders first or arrives in one announcement: a personnel pick (chair,
+#     ranking member, leader, nominees), an executive act (orders, tariffs
+#     "of"/"on", vetoes, pardons, emergencies), a court ruling, a regulator's
+#     approval (commission, board of, authority), a shutdown or funding
+#     deadline, a coalition or confidence vote, a poll or average;
+#   - no person / company / entity strike (custom_strike: a "who" market);
+#   - no live-feed settlement source (sources_are_live);
+#   - no paying market closing within POLITICS_AUTO_MIN_DAYS (a vote that
+#     close is quoted through live).
+# The 11/06 batch read this way, one by one: IN -- KXFBUSTER, KXSCOTUSEXPAND-
+# LAW, KXTARIFFREPEAL, KXROEHOUSE, KXDCSTATEHOODHOUSE, KXNPVICSTATES,
+# KXITALYEXITTAX, KXLOCALLAW, KXGOPIMPEACHVOTES, KXTRUMPGOPCONVICT,
+# KXJUDGECOUNTYEAR; OUT -- the committee posts (KXSHELPRM, KXSJUDICIARYRM,
+# KXSBANKINGCHAIR, KXOVERSIGHTRM, KXHAGCHAIR, KXHEDUCATIONCHAIR,
+# KXHJUDICIARYRM), KXNRCCCHAIR, KXLAMEDUCKCONF (en bloc confirmations: one
+# cloture filing moves every strike), KXGOVTSHUTLENGTH, the executive /
+# court / regulator one-offs and the weekly trackers. One bulk /markets read
+# plus up to POLITICS_AUTO_MAX_EVENTS /events reads per novel series; a
+# refused series is read again next run (cheap: it stops at the first
+# refusing event). Each enrollment is emailed (IMM-POLITICS) so a wrong one
+# can be pulled: IMM_POLITICS_AUTO_EXCLUDE, or delete it from the file.
+POLITICS_AUTO_WHY = ("Kalshi Politics category, decided by a public legislative "
+                     "process -> politics auto family")
+POLITICS_AUTO_MIN_DAYS = 14
+POLITICS_AUTO_MAX_EVENTS = 3
+_POLITICS_PROCESS_RE = re.compile(
+    r"\b(bills?|laws?|legislation|legislatures?|(?-i:Acts?)|enact\w*|repeal\w*|"
+    r"codif\w*|statehood|compact|filibuster|cloture|constitutional amendment|"
+    r"amend(?:s|ed|ing)? the constitution|ratif\w*|impeach\w*|"
+    r"judges? (?:are |is |were |was )?confirmed|confirm\w* by the (?:u\.s\. )?senate|"
+    r"senate (?:votes? to )?confirm\w*)\b", re.I)
+_POLITICS_INSIDER_RE = re.compile(
+    r"\b(chair\w*|ranking member|leader\w*|speaker|whip|nominee\w*|nominat\w*|"
+    r"appoint\w*|announc\w*|resign\w*|retire\w*|step(?:s|ping)? down|fired?|"
+    r"expel\w*|censur\w*|pardon\w*|commut\w*|endorse\w*|cabinet|secretary|"
+    r"ambassador|charged|indict\w*|arrest\w*|lawsuits?|sues?|sued|plaintiffs?|"
+    r"court of appeals|circuit|district court|injunction|unconstitutional|"
+    r"struck down|strike down|invalidat\w*|vacat\w*|rulings?|"
+    r"executive orders?|proclamation|presidential actions?|invok\w*|declar\w*|"
+    r"emergenc\w*|martial|tariffs? (?:of|on)|vetoe?s?|vetoed|"
+    r"shutdown|shut down|appropriations|continuing resolution|government funding|"
+    r"debt (?:ceiling|limit)|coalition|unity government|government formation|"
+    r"confidence|regulators?|commission|board of|authority|"
+    r"polls?|polling|approval rating|average|favorab\w*)\b", re.I)
+_POLITICS_WHO_STRIKES = ("person", "company", "entity", "candidate", "nominee", "name")
+
+
+def politics_auto_why_not(client, series: str, tickers, se: dict,
+                          now: Optional[datetime] = None) -> Tuple[str, str]:
+    """('', the deciding process word) when the politics family takes a
+    Politics-category series, else (why not, ''): a carve-out, the
+    blocklist, a live source, an insider word, a "who" strike, a market
+    closing within POLITICS_AUTO_MIN_DAYS, no process word, or an unread
+    market / event (review, retried next run)."""
+    now = now or datetime.now(timezone.utc)
+    if series in imm.POLITICS_AUTO_EXCLUDE:
+        return "carved out (incentive_mm.POLITICS_AUTO_EXCLUDE)", ""
+    if "MENTION" in series or imm.series_pattern_blocked(series) \
+            or any(series.startswith(p) for p in imm.SERIES_BLOCKLIST_PREFIXES):
+        return "blocklisted", ""
+    if imm.sources_are_live(imm.series_source_blobs(se)):
+        return "settles on a live feed", ""
+    texts = [("the series title", str(se.get("title") or ""))]
+    try:
+        ms = (client.get("/markets", params={"tickers": ",".join(list(tickers)[:100])})
+              or {}).get("markets") or []
+    except Exception as e:                           # noqa: BLE001
+        return f"markets unread ({type(e).__name__})", ""
+    if not ms:
+        return "markets unread (none returned)", ""
+    events: List[str] = []
+    for m in ms:
+        t = m.get("ticker") or "?"
+        for k, v in (m.get("custom_strike") or {}).items():
+            if any(w in str(k).lower() for w in _POLITICS_WHO_STRIKES):
+                return (f"a \"who\" market ({t}: {k} = {v}): whoever decides it "
+                        f"knows first", "")
+        close = imm.parse_iso_utc(m.get("close_time") or "")
+        if close is not None and close - now < timedelta(days=POLITICS_AUTO_MIN_DAYS):
+            return (f"{t} closes {close:%Y-%m-%d}, within {POLITICS_AUTO_MIN_DAYS} days: "
+                    f"its vote would be quoted live", "")
+        texts.append((f"{t}'s rules", str(m.get("rules_primary") or "")))
+        ev = m.get("event_ticker")
+        if ev and ev not in events:
+            events.append(ev)
+    for ev in events[:POLITICS_AUTO_MAX_EVENTS]:
+        try:
+            e = (client.get(f"/events/{ev}") or {}).get("event") or {}
+        except Exception as ex:                      # noqa: BLE001
+            return f"event {ev} unread ({type(ex).__name__})", ""
+        texts.append((f"{ev}'s title", f"{e.get('title') or ''} / {e.get('sub_title') or ''}"))
+    word = ""
+    for where, text in texts:
+        m = _POLITICS_INSIDER_RE.search(text)
+        if m:
+            return (f"decided by one call, or known first by insiders "
+                    f"(\"{m.group(0)}\" in {where})", "")
+        if not word:
+            p = _POLITICS_PROCESS_RE.search(text)
+            if p:
+                word = p.group(0)
+    if not word:
+        return ("no public legislative process in its terms (a bill, a law, a repeal, "
+                "a Senate rule, recorded impeachment votes)", "")
+    return "", word
+
+
+def politics_auto_notify(additions: dict) -> None:
+    """One email for the Politics series just enrolled."""
+    n = len(additions)
+    subject = (f"IMM: {n} Politics series auto-enrolled -- "
+               f"{', '.join(sorted(additions))}")
+    lines = [subject, ""]
+    for s_, e in sorted(additions.items()):
+        lines.append(f"- {s_}: {e.get('title') or '(no title)'} -- decided by a public "
+                     f"legislative process (\"{e.get('word')}\"); e.g. {e.get('sample')}")
+    lines += ["",
+              "The Politics family's rule (Jack 2026-11-06): Kalshi's Politics category, "
+              "decided in the open -- a bill or law, a repeal, a Senate rule, recorded "
+              "impeachment votes -- and never a personnel pick, an executive act, a court "
+              "ruling, a regulator's approval, a shutdown deadline or a poll. Quoted at x1 "
+              "on the global spec, at the touch.",
+              f"To pull one: add it to IMM_POLITICS_AUTO_EXCLUDE, or delete it from "
+              f"{imm.politics_auto_path()} (the bot reloads it within one refresh), or "
+              f"ask Claude."]
+    imm.Alerter("IMM-POLITICS", live=True).send_message("\n".join(lines), subject)
 
 
 # SINGLE-EVENT MENTIONS BY KALSHI CATEGORY (Jack 2026-10-13: "build 3 Mentions

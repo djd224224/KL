@@ -10166,6 +10166,99 @@ def mention_auto_series(series: str) -> bool:
     (MENTION_AUTO_FILE); nothing while IMM_MENTION_AUTO=0."""
     return MENTION_AUTO and series in MENTION_AUTO_SERIES
 
+
+# POLITICS FAMILY BY KALSHI CATEGORY (Jack 2026-11-06: "go through the batch
+# one by one, auto-enroll the ones that are quotable / without pickoff risk
+# into Politics family. make sure this is a rule going forward"). Kalshi's
+# Politics category had no family: only the three approval series
+# (_DEFAULT_POLITICS_SERIES) and hand adds to extra_allow_series.json quoted,
+# so the post-midterm batch of 11/05-06 (~20 Congress series, ~$290/day of
+# bot estimate) sat dark. The new-series pass
+# (imm_earnings_overrides.politics_auto_why_not) writes each newly paying,
+# not-yet-allowed Politics-category series whose outcome is decided by a
+# public legislative process -- a bill or law passing, a repeal, a Senate
+# rules change, a state compact, recorded impeachment votes, judges
+# confirmed over a year -- here, {"series": [...]}, under Jack's 10/22 line
+# ("One-off news is ok if it's not easy to be adversely selected against").
+# Kept out: personnel picks (chairs, ranking members, leaders, nominees),
+# executive acts (orders, tariffs, vetoes, pardons), court rulings,
+# regulators' approvals, shutdown deadlines, coalitions, polls and live
+# counts. Hot-reloaded by mtime at import and every universe refresh. A
+# member quotes on the global spec (x1, at the touch), like the hand-enrolled
+# KXTXINCOMETAX / KXONIONACT. Its ticker date is the event's deadline, or --
+# KXFBUSTER-26JAN01, the 2026 edition of "Filibuster change this year?",
+# markets expiring 2027-2030 -- the window's START: a ticker date more than
+# POLITICS_WINDOW_START_GAP_DAYS before the market's expiration is not a day
+# to stand down before (politics_window_start; trade_cutoff_utc then cuts at
+# the expiration). POLITICS_AUTO_EXCLUDE and the blocklist always win;
+# IMM_POLITICS_AUTO=0 takes every member out (positions ride).
+POLITICS_AUTO = os.environ.get("IMM_POLITICS_AUTO", "1") == "1"
+POLITICS_AUTO_FILE = "politics_auto_series.json"        # in STATUS_DIR
+POLITICS_AUTO_EXCLUDE = frozenset(
+    s.strip() for s in os.environ.get("IMM_POLITICS_AUTO_EXCLUDE", "").split(",")
+    if s.strip())
+POLITICS_WINDOW_START_GAP_DAYS = _env_float("IMM_POLITICS_WINDOW_START_GAP_DAYS", 30.0)
+POLITICS_AUTO_SERIES: Set[str] = set()
+_politics_auto_state = {"mtime": 0.0}
+
+
+def politics_auto_path() -> str:
+    return os.path.join(STATUS_DIR, POLITICS_AUTO_FILE)
+
+
+def load_politics_auto_series() -> int:
+    """Re-read POLITICS_AUTO_FILE when it changed; members changed, else 0.
+    Refuses blocklisted series, POLITICS_AUTO_EXCLUDE and a MENTION-named
+    series."""
+    try:
+        mtime = os.path.getmtime(politics_auto_path())
+    except OSError:
+        return 0
+    if mtime == _politics_auto_state["mtime"]:
+        return 0
+    _politics_auto_state["mtime"] = mtime
+    try:
+        with open(politics_auto_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! politics auto file unreadable: {e}")
+        return 0
+    fresh: Set[str] = set()
+    for s in data.get("series") or []:
+        s = str(s).strip()
+        if not s.startswith("KX") or "MENTION" in s or s in POLITICS_AUTO_EXCLUDE:
+            continue
+        if any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES) \
+                or series_pattern_blocked(s):
+            log(f"[IMM] ! refused blocklisted series in politics auto: {s}")
+            continue
+        fresh.add(s)
+    changed = len(fresh ^ POLITICS_AUTO_SERIES)
+    POLITICS_AUTO_SERIES.clear()
+    POLITICS_AUTO_SERIES.update(fresh)
+    if changed:
+        log(f"[IMM] politics auto series: {len(fresh)} enrolled ({changed} changed)")
+    return changed
+
+
+def politics_auto_series(series: str) -> bool:
+    """A Politics-category member decided by a public legislative process
+    (POLITICS_AUTO_FILE); nothing while IMM_POLITICS_AUTO=0."""
+    return POLITICS_AUTO and series in POLITICS_AUTO_SERIES
+
+
+def politics_window_start(event_ticker: str, td: datetime,
+                          expected_expiration: Optional[datetime]) -> bool:
+    """True when a politics member's ticker date opens its window rather than
+    ending it: more than POLITICS_WINDOW_START_GAP_DAYS before the market's
+    expiration (KXFBUSTER-26JAN01-27 expires 2027-01-02). A deadline-dated
+    ticker (KXGOPIMPEACHVOTES-29JAN20, expiring the day after) keeps its
+    midnight cutoff. No expiration = no proof: the date stands."""
+    return (politics_auto_series(series_of(event_ticker))
+            and expected_expiration is not None
+            and expected_expiration - td
+            > timedelta(days=POLITICS_WINDOW_START_GAP_DAYS))
+
 # TREASURY YIELDS (Jack 2026-08-04: "quote treasuries until 7:30am EST").
 # Replaces the re-entry loop's entry so the safe-join + rate bar are kept.
 # The default midnight-ET ticker rule cost the whole overnight half of each
@@ -12287,6 +12380,8 @@ _CONFIG_CODE_KNOBS = (
     "GRADUATE_AUTO", "GRADUATE_AUTO_EXCLUDE",
     # single-event mentions by Kalshi category (2026-10-13)
     "MENTION_AUTO", "MENTION_AUTO_EXCLUDE", "MENTION_AUTO_GATE",
+    # the politics family by Kalshi category (2026-11-06)
+    "POLITICS_AUTO", "POLITICS_AUTO_EXCLUDE", "POLITICS_WINDOW_START_GAP_DAYS",
     "SCAN_LIVE_SOURCE_KEYWORDS", "SCAN_LIVE_OVERLAP_MIN", "SCAN_LIVE_TAIL_HOURS",
     "PAD_TOUCH_MIN_CENTS", "PAD_TOUCH_MAX_CENTS",
     "PAD_STICKY", "PAD_STICKY_RELEASE_MULT",   # sticky pads (2026-10-22)
@@ -13526,6 +13621,7 @@ load_league_auto_series()      # NBA / WNBA / MLB auto families (ditto)
 load_awards_extra_series()     # awards by Kalshi tag (beside the election file)
 load_graduate_auto_series()    # graduate families by Kalshi metadata (ditto)
 load_mention_auto_series()     # single-event mentions by Kalshi category (ditto)
+load_politics_auto_series()    # the politics family by Kalshi category (ditto)
 
 
 # ----------------------------------------------------------------------------
@@ -20902,6 +20998,12 @@ def trade_cutoff_utc(event_ticker: str, occurrence: Optional[datetime],
         # exactly where the 26AUG13/26AUG14 events landed on the first
         # post-fix cycle. An occurrence, if Kalshi ever sets one, still
         # wins the min() below.
+        candidates.append(expected_expiration)
+        td = None
+    if td is not None and politics_window_start(event_ticker, td, expected_expiration):
+        # a politics member's ticker date that OPENS its window (2026-11-06:
+        # KXFBUSTER-26JAN01, "Before Jan 1, 2027" .. "Before Jan 1, 2030")
+        # is no day to be out before; the market's expiration bounds it
         candidates.append(expected_expiration)
         td = None
     if td is not None:
@@ -29591,6 +29693,7 @@ class IncentiveMarketMaker:
             mlb_mvp_series(series) or \
             graduate_auto_series(series) or \
             mention_auto_series(series) or \
+            politics_auto_series(series) or \
             (astest_new_series(series) and astest_pick_event_ok(ticker)) or \
             marathon_series(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
@@ -29872,6 +29975,7 @@ class IncentiveMarketMaker:
         load_awards_extra_series()    # awards by Kalshi tag (2026-10-12)
         load_graduate_auto_series()   # graduate families by metadata (2026-10-12)
         load_mention_auto_series()    # single-event mentions by category (2026-10-13)
+        load_politics_auto_series()   # the politics family by category (2026-11-06)
         load_election_dates_extra()   # hot-reloaded rows (2026-10-07)
         load_awards_dates_extra()
         load_family_verdicts()
@@ -30042,6 +30146,11 @@ class IncentiveMarketMaker:
             # Elections: the verified ELECTION_DATES row is the date, not the
             # ticker string (2026-09-28) -- the cutoff decides in _screen.
             if election_series(series_of(t)):
+                return False
+            # Politics members (2026-11-06): the ticker date may open the
+            # window (KXFBUSTER-26JAN01, see politics_window_start), so the
+            # string alone cannot tell -- trade_cutoff_utc decides in _screen.
+            if politics_auto_series(series_of(t)):
                 return False
             # Mention-family tickers may embed a LISTING date (26AUG13
             # ran to Sep 4 — the 2026-08-14 listing-date fix): the string

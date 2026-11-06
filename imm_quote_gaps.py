@@ -178,6 +178,10 @@ def ticker_day_over(t: str, now_utc: datetime) -> bool:
     # string. Mirrors incentive_mm.
     if imm.election_series(imm.series_of(t)):
         return False
+    # Politics members: the ticker date may open the window
+    # (politics_window_start). Mirrors incentive_mm.
+    if imm.politics_auto_series(imm.series_of(t)):
+        return False
     # Mention-family tickers may embed a LISTING date (2026-08-14 fix):
     # never pre-drop on the string; trade_cutoff_utc decides from the
     # market's expected_expiration. Mirrors incentive_mm.

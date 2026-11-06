@@ -227,7 +227,8 @@ def reload_allowance(imm) -> None:
                  "load_finecon_extra_series", "load_election_extra_series",
                  "load_nfl_auto_series", "load_league_auto_series",
                  "load_awards_extra_series", "load_graduate_auto_series",
-                 "load_mention_auto_series", "load_election_dates_extra",
+                 "load_mention_auto_series", "load_politics_auto_series",
+                 "load_election_dates_extra",
                  "load_awards_dates_extra", "load_astest_picks"):
         fn = getattr(imm, name, None)
         if fn is not None:

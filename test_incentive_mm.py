@@ -30936,6 +30936,227 @@ class TestMentionAutoFamily(unittest.TestCase):
             wh.assert_not_called()
 
 
+class TestPoliticsAutoFamily(unittest.TestCase):
+    """Jack 2026-11-06: "go through the batch one by one, auto-enroll the ones
+    that are quotable / without pickoff risk into Politics family. make sure
+    this is a rule going forward"."""
+
+    def setUp(self):
+        def reset():
+            imm.POLITICS_AUTO_SERIES.clear()
+            imm._politics_auto_state["mtime"] = 0.0
+            try:
+                os.remove(imm.politics_auto_path())
+            except OSError:
+                pass
+        reset()
+        self.addCleanup(reset)
+
+    def _write(self, series):
+        with open(imm.politics_auto_path(), "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+        imm._politics_auto_state["mtime"] = 0.0
+        return imm.load_politics_auto_series()
+
+    def test_a_member_is_allowed_and_its_window_start_is_no_cutoff(self):
+        a = IncentiveMarketMaker._allowed
+        t = "KXFBUSTER-26JAN01-27"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(a(t))
+        self.assertEqual(self._write(["KXFBUSTER", "KXGOPIMPEACHVOTES", "KXFOOMENTION",
+                                      "notaseries"]), 2)
+        self.assertEqual(imm.POLITICS_AUTO_SERIES, {"KXFBUSTER", "KXGOPIMPEACHVOTES"})
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(a(t))
+        # KXFBUSTER-26JAN01 is the 2026 edition: its markets expire 2027-2030,
+        # so 2026-01-01 opens the window and the expiration bounds it ...
+        exp = utc(2027, 1, 2, 15, 0)
+        self.assertEqual(imm.trade_cutoff_utc("KXFBUSTER-26JAN01", None, exp), exp)
+        # ... a deadline-dated member keeps the midnight of its day ...
+        self.assertEqual(imm.trade_cutoff_utc("KXGOPIMPEACHVOTES-29JAN20", None,
+                                              utc(2029, 1, 21, 15, 0)),
+                         utc(2029, 1, 20, 5, 0))
+        # ... as does a non-member of the same shape, and a member with no
+        # expiration to prove it
+        self.assertEqual(imm.trade_cutoff_utc("KXFOOBUSTER-26JAN01", None, exp),
+                         utc(2026, 1, 1, 5, 0))
+        self.assertEqual(imm.trade_cutoff_utc("KXFBUSTER-26JAN01", None, None),
+                         utc(2026, 1, 1, 5, 0))
+        with mock.patch.object(imm, "POLITICS_AUTO", False), \
+                mock.patch.object(imm, "ALLOWLIST_ONLY", True):      # the kill switch
+            self.assertFalse(a(t))
+            self.assertEqual(imm.trade_cutoff_utc("KXFBUSTER-26JAN01", None, exp),
+                             utc(2026, 1, 1, 5, 0))
+        with mock.patch.object(imm, "POLITICS_AUTO_EXCLUDE", frozenset({"KXFBUSTER"})):
+            self.assertEqual(self._write(["KXFBUSTER"]), 2)
+        self.assertEqual(imm.POLITICS_AUTO_SERIES, set())
+
+    def test_the_quote_gaps_pre_filter_never_drops_a_member(self):
+        import imm_quote_gaps as iqg
+        now = utc(2026, 11, 6, 12, 0)
+        self.assertTrue(iqg.ticker_day_over("KXFBUSTER-26JAN01-27", now))
+        self._write(["KXFBUSTER"])
+        self.assertFalse(iqg.ticker_day_over("KXFBUSTER-26JAN01-27", now))
+
+    def test_the_new_series_pass_takes_public_processes_not_picks(self):
+        import imm_earnings_overrides as ieo
+        now = datetime.now(timezone.utc)
+        far = (now + timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        near = (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def mk(t, ev, rules, close=far, cs=None):
+            return {"ticker": t, "event_ticker": ev, "rules_primary": rules,
+                    "close_time": close, "custom_strike": cs}
+        markets = {
+            "KXFBUSTER-26JAN01-27": mk(
+                "KXFBUSTER-26JAN01-27", "KXFBUSTER-26JAN01",
+                "If there is a change in U.S. Senate rules or precedent that lowers the "
+                "threshold for cloture for any legislative action ... before January 1, "
+                "2027, then the market resolves to Yes."),
+            "KXROEHOUSE-26NOV": mk(
+                "KXROEHOUSE-26NOV", "KXROEHOUSE-26NOV",
+                "If a bill codifying Roe v. Wade has passed the House after Issuance and "
+                "before Jan 1, 2028, then the market resolves to Yes."),
+            "KXJUDGECOUNTYEAR-27DEC-4": mk(
+                "KXJUDGECOUNTYEAR-27DEC-4", "KXJUDGECOUNTYEAR-27DEC",
+                "If above 4 federal judges are confirmed after Jan 1, 2027 and before "
+                "Jan 2028, then the market resolves to Yes."),
+            "KXSHELPRM-27-RPAU": mk(
+                "KXSHELPRM-27-RPAU", "KXSHELPRM-27",
+                "If Rand Paul is the first Ranking Member of Senate HELP Committee for "
+                "the 120th Congress, then the market resolves to Yes."),
+            "KXOVERSIGHTRM-27-BGIL": mk(
+                "KXOVERSIGHTRM-27-BGIL", "KXOVERSIGHTRM-27",
+                "If Brandon Gill is the first holder of the post for the 120th Congress, "
+                "then the market resolves to Yes.", cs={"Person": "Brandon Gill"}),
+            "KXLAMEDUCKCONF-27JAN03-AL50": mk(
+                "KXLAMEDUCKCONF-27JAN03-AL50", "KXLAMEDUCKCONF-27JAN03",
+                "If the number of civilian nominees confirmed by the Senate is at least "
+                "50 after Issuance and before the 119th Congress ends on Jan 3, 2027, "
+                "then the market resolves to Yes."),
+            "KXMTSB542-SB54227": mk(
+                "KXMTSB542-SB54227", "KXMTSB542-SB54227",
+                "If any Montana state district court or the Montana Supreme Court holds "
+                "or declares Senate Bill 542 (2025) unconstitutional and void ..."),
+            "KXGOVTSHUTLENGTH-27JAN01": mk(
+                "KXGOVTSHUTLENGTH-27JAN01", "KXGOVTSHUTLENGTH-27JAN01",
+                "If the US federal government is at least partially shut down due to a "
+                "lapse of appropriations for at least 1 day between Jan 1, 2027 and "
+                "Dec 31, 2027, then the market resolves to Yes."),
+            "KXWEEKBILL-26NOV13": mk(
+                "KXWEEKBILL-26NOV13", "KXWEEKBILL-26NOV13",
+                "If the House passes the bill before Nov 13, 2026, then the market "
+                "resolves to Yes.", close=near),
+            "KXFOOEOWK-26NOV07-2": mk(
+                "KXFOOEOWK-26NOV07-2", "KXFOOEOWK-26NOV07",
+                "If the President signs above 2 executive orders during Nov 1, 2026 to "
+                "Nov 7, 2026, then the market resolves to Yes."),
+        }
+        events = {
+            "KXFBUSTER-26JAN01": {"title": "Will the filibuster be weakened?",
+                                  "sub_title": "Before Jan 1, 2030"},
+            "KXROEHOUSE-26NOV": {"title": "Will the House pass a bill to codify Roe v. Wade?",
+                                 "sub_title": "Before Jan 1, 2028"},
+            "KXJUDGECOUNTYEAR-27DEC": {"title": "How many federal judges will be confirmed "
+                                                "in 2027?", "sub_title": "In 2027"},
+            "KXSHELPRM-27": {"title": "Who will be Ranking Member of Senate HELP Committee?",
+                             "sub_title": "For the 120th Congress"},
+            "KXOVERSIGHTRM-27": {"title": "Who will hold the post?", "sub_title": ""},
+            "KXLAMEDUCKCONF-27JAN03": {"title": "How many will the Senate confirm "
+                                                "in the lame duck?", "sub_title": ""},
+            "KXMTSB542-SB54227": {"title": "Will a court invalidate Montana's new property "
+                                           "tax rates?", "sub_title": "Before 2027"},
+            "KXGOVTSHUTLENGTH-27JAN01": {"title": "Government shutdown in 2027?",
+                                         "sub_title": "In 2027"},
+            "KXWEEKBILL-26NOV13": {"title": "Will the House pass the bill this week?",
+                                   "sub_title": ""},
+            "KXFOOEOWK-26NOV07": {"title": "How many Executive Orders will Trump sign this "
+                                          "week?", "sub_title": ""},
+        }
+        meta = {
+            "KXFBUSTER": "Filibuster change this year?",
+            "KXROEHOUSE": "House passage of a bill to codify Roe v. Wade",
+            "KXJUDGECOUNTYEAR": "Judges confirmed in a year",
+            "KXSHELPRM": "Senate HELP Committee",
+            "KXOVERSIGHTRM": "Oversight Committee post",
+            "KXLAMEDUCKCONF": "Confirmations in the lame-duck session",
+            "KXMTSB542": "Montana's SB 542",
+            "KXGOVTSHUTLENGTH": "How long will it last?",
+            "KXWEEKBILL": "House bill this week",
+            "KXFOOEOWK": "EO this week?",
+        }
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/incentive_programs":
+                    return {"incentive_programs": [{"market_ticker": t} for t in markets]}
+                if path.startswith("/series/"):
+                    s = path[8:]
+                    return {"series": {"category": "Politics", "title": meta[s],
+                                       "tags": ["Congress"]} if s in meta else {}}
+                if path == "/markets":
+                    return {"markets": [markets[t] for t in params["tickers"].split(",")]}
+                if path.startswith("/events/"):
+                    return {"event": events.get(path[8:], {})}
+                raise AssertionError(path)
+        sent = []
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True), \
+                mock.patch.object(ieo, "politics_auto_notify", sent.append):
+            enrolled, review = ieo.enroll_new_series(_Client(), dry=False)
+            self.assertEqual(sorted(s for s, _w, _x in enrolled),
+                             ["KXFBUSTER", "KXJUDGECOUNTYEAR", "KXROEHOUSE"])
+            self.assertTrue(all(w.startswith(ieo.POLITICS_AUTO_WHY) for _s, w, _x in enrolled))
+            why = {s: w for s, w, _x in review}
+            self.assertIn('"Ranking Member"', why["KXSHELPRM"])
+            self.assertIn('"who" market', why["KXOVERSIGHTRM"])
+            self.assertIn('"nominees"', why["KXLAMEDUCKCONF"])
+            self.assertIn("district court", why["KXMTSB542"])
+            self.assertIn("shut down", why["KXGOVTSHUTLENGTH"])
+            self.assertIn("within 14 days", why["KXWEEKBILL"])
+            self.assertIn("executive order", why["KXFOOEOWK"].lower())
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sorted(sent[0]), ["KXFBUSTER", "KXJUDGECOUNTYEAR", "KXROEHOUSE"])
+            with open(imm.politics_auto_path(), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["series"],
+                                 ["KXFBUSTER", "KXJUDGECOUNTYEAR", "KXROEHOUSE"])
+            imm.load_politics_auto_series()
+            self.assertTrue(IncentiveMarketMaker._allowed("KXROEHOUSE-26NOV"))
+            enrolled2, _ = ieo.enroll_new_series(_Client(), dry=False)
+            self.assertEqual(enrolled2, [])
+            self.assertEqual(len(sent), 1)
+
+    def test_a_who_strike_or_a_live_source_stays_out(self):
+        import imm_earnings_overrides as ieo
+        far = (datetime.now(timezone.utc) + timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        class _Client:
+            def __init__(self, cs):
+                self.cs = cs
+
+            def get(self, path, params=None):
+                if path == "/markets":
+                    return {"markets": [{"ticker": "KXFOO-27-A", "event_ticker": "KXFOO-27",
+                                         "rules_primary": "If the bill becomes law ...",
+                                         "close_time": far, "custom_strike": self.cs}]}
+                if path.startswith("/events/"):
+                    return {"event": {"title": "Will the bill become law?"}}
+                raise AssertionError(path)
+        se = {"category": "Politics", "title": "Foo bill"}
+        self.assertEqual(ieo.politics_auto_why_not(_Client(None), "KXFOO", ["KXFOO-27-A"], se),
+                         ("", "bill"))
+        why, word = ieo.politics_auto_why_not(_Client({"Company": "Ford"}), "KXFOO",
+                                              ["KXFOO-27-A"], se)
+        self.assertIn('"who" market', why)
+        self.assertEqual(word, "")
+        with mock.patch.object(imm, "sources_are_live", lambda blobs: True):
+            self.assertEqual(ieo.politics_auto_why_not(_Client(None), "KXFOO",
+                                                       ["KXFOO-27-A"], se)[0],
+                             "settles on a live feed")
+        with mock.patch.object(imm, "POLITICS_AUTO_EXCLUDE", frozenset({"KXFOO"})):
+            self.assertIn("carved out", ieo.politics_auto_why_not(
+                _Client(None), "KXFOO", ["KXFOO-27-A"], se)[0])
+
+
 class TestElectionTermEnd(unittest.TestCase):
     """Jack 2026-10-28, of KXJAPANHOUSE-30FEB07 ("Next Japanese general
     election winner?", dark because no vote was called): "date it to term

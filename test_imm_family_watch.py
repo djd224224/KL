@@ -916,8 +916,12 @@ class TestQuoteCalls(unittest.TestCase):
 
     def setUp(self):
         from unittest import mock
+        # the calls below are the family-record / one-off rules; the Politics
+        # family (2026-11-06) answers for Politics series while it is on, and
+        # has its own test (test_politics_family_left_out_calls)
         self._p = [mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES", ("KXHIGH", "KXLOW-")),
-                   mock.patch.object(imm, "SCAN_EXCLUDE_PREFIXES", ("KXLOWT", "KXHIGH"))]
+                   mock.patch.object(imm, "SCAN_EXCLUDE_PREFIXES", ("KXLOWT", "KXHIGH")),
+                   mock.patch.object(imm, "POLITICS_AUTO", False)]
         for x in self._p:
             x.start()
 
@@ -931,6 +935,25 @@ class TestQuoteCalls(unittest.TestCase):
                    "fix": "your call"}, **it)
         with mock.patch.object(fw, "family_name", lambda s, c="": fam):
             return fw.quote_call(key, it, self.TRACK)
+
+    def test_politics_family_left_out_calls(self):
+        # Jack 2026-11-06: "auto-enroll the ones that are quotable / without
+        # pickoff risk into Politics family" -- a Politics series still dark
+        # is one the family's rule left out, never a family-record QUOTE
+        from unittest import mock
+        with mock.patch.object(imm, "POLITICS_AUTO", True):
+            c, why = self.call("new:KXSHELPRM", fam="Politics & approval", category="Politics",
+                               frequency="custom",
+                               title="Senate HELP Committee ranking member (Politics, custom)")
+            self.assertEqual(c, "DON'T QUOTE")
+            self.assertIn('"ranking member"', why)
+            c, why = self.call("new:KXKEVCOUNT", fam="Politics & approval", category="Politics",
+                               frequency="weekly", title="CISA KEV additions (Politics, weekly)")
+            self.assertEqual(c, "YOUR CALL")
+            self.assertIn("left it out", why)
+            # small items still SKIP first
+            self.assertEqual(self.call("new:KXSHELPRM", category="Politics", est_total=3.0,
+                                       title="Senate HELP Committee ranking member")[0], "SKIP")
 
     def test_another_bots_markets_are_never_quoted(self):
         from unittest import mock
