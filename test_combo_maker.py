@@ -989,6 +989,151 @@ class LongShots(unittest.TestCase):
             self.assertAlmostEqual(cfg.markup_for(2, two, fair), 0.04 + extra)
 
 
+class RequesterGuard(unittest.TestCase):
+    """Jack 2026-11-06: "Yes, build it" -- 11/06 two requesters accepted 3 of 5 and 2 of 4 of our quotes (-$130)."""
+
+    def maker(self, d, **kw):
+        self.w = W()
+        cfg = cm.Config(live=True, markup_per_leg=0.0, guard_min_accepts=2, guard_min_rate=0.10, **kw)
+        return cm.Maker(self.c, cfg, self.w, cm.Book(os.path.join(d, "s.json")), d, clock=lambda: T0)
+
+    def accept(self, m, qid, rid):
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": qid, "rfq_id": rid,
+                                                      "no_bid_dollars": self.c.posts[-1][1]["no_bid"]}})
+
+    def test_the_second_accept_at_a_high_rate_is_declined_and_blocks(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.c = FakeClient(MK)
+        m = self.maker(d.name)
+        m.handle(rfq_msg("r1"))
+        self.accept(m, "q1", "r1")
+        self.assertEqual(len(self.c.puts), 1)                               # the first fill confirms
+        m.handle(rfq_msg("r2"))
+        self.accept(m, "q2", "r2")
+        self.assertEqual(len(self.c.puts), 1)                               # 2 of 2: declined
+        self.assertEqual(self.w.k("decline")[-1]["why"], "requester_flagged")
+        blk = self.w.k("requester_block")[0]
+        self.assertEqual((blk["cr"], blk["quotes"], blk["accepts"]), ("abcdef01", 2, 2))
+        m.handle(rfq_msg("r3"))
+        self.assertEqual(len(self.c.posts), 2)                              # blocked: no quote
+        self.assertEqual(m.st["why"]["requester_blocked"], 1)
+        again = self.maker(d.name)                                          # a restart keeps the block
+        self.assertGreater(again.blocked["abcdef01"], T0)
+        self.assertEqual(again.req["abcdef01"]["a"], 2)
+        self.assertEqual(m.book.tickets[0]["cr"], "abcdef01")                # tickets carry the requester
+
+    def test_a_low_rate_requester_is_not_flagged(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.c = FakeClient(MK)
+        m = self.maker(d.name)
+        m.req["abcdef01"] = {"q": 98, "a": 1, "seen": T0}                    # one accept in 98 quotes
+        m.handle(rfq_msg("r1"))
+        self.accept(m, "q1", "r1")                                          # 2 of 99: 2%
+        self.assertEqual(len(self.c.puts), 1)
+        self.assertEqual(self.w.k("requester_block"), [])
+
+    def test_off(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.c = FakeClient(MK)
+        m = self.maker(d.name)
+        m.cfg.guard_min_accepts = 0
+        for rid, qid in (("r1", "q1"), ("r2", "q2")):
+            m.handle(rfq_msg(rid))
+            self.accept(m, qid, rid)
+        self.assertEqual(len(self.c.puts), 2)
+
+
+class OutcomeCap(unittest.TestCase):
+    """Jack 2026-11-06: "Limit exposure by outcome, not just by game"."""
+
+    def test_the_payout_riding_on_one_leg_result(self):
+        book = cm.Book(None)
+        book.tickets = [{"legs": [[L1, "yes"], [L2, "yes"]], "games": ["G1", "G2"], "contracts": 350.0, "ask": 0.2,
+                         "status": "executed", "day": "d"}]
+        cfg = cm.Config(max_outcome_payout=400.0, max_game_payout=5000.0, max_payout=500.0, max_open_loss=9999.0)
+        self.assertAlmostEqual(book.outcome_payout(L1, "yes"), 350.0)
+        self.assertEqual(book.outcome_payout(L1, "no"), 0.0)
+        self.assertEqual(cm.caps_check(book, ["G1", "G3"], 60.0, 0.2, cfg, "d", [[L1, "yes"], [L3, "no"]]),
+                         "outcome_cap")
+        self.assertIsNone(cm.caps_check(book, ["G1", "G3"], 60.0, 0.2, cfg, "d", [[L1, "no"], [L3, "no"]]))
+        self.assertIsNone(cm.caps_check(book, ["G1", "G3"], 40.0, 0.2, cfg, "d", [[L1, "yes"], [L3, "no"]]))
+        cfg.max_outcome_payout = None
+        self.assertIsNone(cm.caps_check(book, ["G1", "G3"], 60.0, 0.2, cfg, "d", [[L1, "yes"], [L3, "no"]]))
+
+    def test_the_quote_is_skipped(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        c = FakeClient(MK)
+        book = cm.Book(os.path.join(d.name, "s.json"))
+        book.tickets = [{"legs": [[L1, "yes"]], "games": ["X"], "contracts": 30.0, "ask": 0.6, "status": "executed",
+                         "day": "d"}]
+        m = cm.Maker(c, cm.Config(live=True, markup_per_leg=0.0, max_outcome_payout=50.0), W(), book, d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg())                                                  # 43 contracts more on L1 yes
+        self.assertEqual(c.posts, [])
+        self.assertEqual(m.st["why"]["outcome_cap"], 1)
+
+
+class BookFair(unittest.TestCase):
+    """Jack 2026-11-06: "A second fair price ... do this if it doesnt slow us down materially"."""
+
+    def maker(self, p_home):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        day = datetime.fromtimestamp(T0, timezone.utc).date().isoformat()
+        start = datetime.fromtimestamp(T0 + 2 * 3600, timezone.utc).strftime("%Y-%m-%dT%H:%MZ")   # L1's start
+        with open(os.path.join(d.name, f"odds_{day}.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"k": "odds", "t": T0 - 300, "lg": "KXNBAGAME", "eid": "9", "start": start,
+                                "home": "GSW", "away": "MIA", "hml": -150.0, "aml": 130.0, "p_home": p_home,
+                                "prov": "DraftKings", "state": "pre"}) + "\n")
+        self.c = FakeClient(MK)
+        self.w = W()
+        m = cm.Maker(self.c, cm.Config(live=True, markup_per_leg=0.0, book_fair=True, max_book_gap=0.05,
+                                       odds_dir=d.name), self.w, cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.reload_lines(T0)
+        return m
+
+    def test_the_book_raises_the_fair_on_a_covered_leg(self):
+        m = self.maker(0.63)                                                 # GSW 63% at the book, 60% on Kalshi
+        m.handle(rfq_msg())
+        q = self.w.k("quote")[0]
+        self.assertAlmostEqual(q["fair"], 0.63 * 0.50 * 0.70)               # the book's leg, Kalshi's others
+        self.assertEqual(c_ask := q["ask"], cm.grid_up(0.63 * 0.5 * 0.7 * 1.10))
+        self.assertTrue(c_ask > cm.grid_up(FAIR * 1.10))
+
+    def test_a_lower_book_keeps_kalshi(self):
+        m = self.maker(0.58)
+        m.handle(rfq_msg())
+        self.assertAlmostEqual(self.w.k("quote")[0]["fair"], FAIR)
+
+    def test_a_gap_skips(self):
+        m = self.maker(0.70)                                                 # 10 points from Kalshi's 60
+        m.handle(rfq_msg())
+        self.assertEqual(self.c.posts, [])
+        self.assertEqual(m.st["why"]["book_gap"], 1)
+
+    def test_the_last_look_uses_it_too(self):
+        m = self.maker(0.60)
+        m.handle(rfq_msg())                                                  # quoted at Kalshi's fair
+        start = datetime.fromtimestamp(T0 + 7200, timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        m.lines = cm.cbl.Lines([{"lg": "KXNBAGAME", "eid": "9", "t": T0 - 1, "p_home": 0.66, "start": start,
+                                 "home": "GSW", "away": "MIA"}])
+        m.line_match = {}
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": self.c.posts[0][1]["no_bid"]}})
+        self.assertEqual(self.c.puts, [])                                    # the book moved 6 points: gap
+        self.assertEqual(self.w.k("decline")[0]["why"], "book_gap")
+
+    def test_cli(self):
+        for bad in (["--max-book-gap", "0.9"], ["--guard-min-rate", "0"], ["--max-outcome-payout", "5"]):
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
+
+
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
     two NBA games as components)."""

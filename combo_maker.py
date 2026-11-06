@@ -76,9 +76,14 @@ import kalshi_ws  # noqa: E402
 from combo_rfq_logger import WS_PATH, WS_URL, DayWriter, iso_ms, legs_of  # noqa: E402
 from combo_rfq_score import (DEFAULT_GRID, MAIN_SERIES, MAKER_FEE_RATE, grid_up, league_of,  # noqa: E402
                              maker_fee, sport_group)
+import combo_book_lines as cbl  # noqa: E402
 
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
+REQUESTERS_NAME = "requesters.json"     # the requester guard's counts and blocks
+ODDS_DIR = os.environ.get("COMBO_RFQ_DIR", os.path.join(HERE, "run-logs", "combo-rfq"))   # the logger's odds_*.jsonl
+LINES_EVERY_S = 60.0                   # the sportsbook lines are re-read this often
+REQ_PRUNE_EVERY_S = 600.0              # requesters with no accept, unseen a day, are forgotten this often
 STOP_NAME = "combo_maker.stop"
 LOCK_NAME = "combo_maker.lock"
 # MAIN_SERIES comes from combo_rfq_score, so the shadow's Strategy 1 table and
@@ -161,6 +166,32 @@ class Config:
         # +1.9% at 20-40c). Quote side only: the last look keeps its bars. () here;
         # the CLI's default is 0.05:0.02,0.10:0.01,0.20:0.005
         self.longshot_markup = ()
+        # REQUESTER GUARD (Jack 2026-11-06: "Yes, build it"). 11/06 the in-play tennis
+        # losses came from two requesters that accepted 3 of 5 and 2 of 4 of our quotes
+        # (-$130); a typical requester accepts ~1 in 9,000. A requester (creator_id) whose
+        # accepts reach guard_min_accepts at a rate (accepts / our quotes to them) of
+        # guard_min_rate or more is flagged: the accept that trips it is declined at the
+        # last look, and we stop quoting them for guard_block_hours. 0 = off (here; the
+        # CLI's default is 2). The counts and blocks persist in requesters.json
+        self.guard_min_accepts = 0
+        self.guard_min_rate = 0.10
+        self.guard_block_hours = 24.0
+        # OUTCOME CAP (Jack 2026-11-06: "Limit exposure by outcome, not just by game"):
+        # the payout that rides on one leg result (ticker and side) across the open
+        # tickets, at the quote and at the last look. None = off (here; the CLI's
+        # default is $400, under the game cap, so a pile-up on one result binds first)
+        self.max_outcome_payout = None
+        # SECOND FAIR (Jack 2026-11-06: "A second fair price ... do this if it doesnt slow
+        # us down materially"): DraftKings' vig-free moneyline (the RFQ logger writes it
+        # to odds_<UTC day>.jsonl every 10 min; combo_book_lines.Lines matches it to a
+        # Kalshi game-winner leg). Re-read once a minute in upkeep, matched once a leg, so
+        # a quote pays a dict lookup a leg. On a covered leg the side's probability is the
+        # higher of Kalshi's mid and the book's -- we sell YES, so the higher fair is the
+        # safe one -- and a leg more than max_book_gap from the book skips the parlay
+        # (a stale Kalshi leg is what a picker hunts), at the quote and the last look
+        self.book_fair = False
+        self.max_book_gap = 0.05
+        self.odds_dir = None
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -498,6 +529,10 @@ class Book:
     def open(self):
         return [t for t in self.tickets if t.get("status") in ("confirmed", "executed")]
 
+    def outcome_payout(self, ticker: str, side: str) -> float:
+        """The payout riding on one leg result: open tickets holding that leg."""
+        return sum(t["contracts"] for t in self.open() if any(l[0] == ticker and l[1] == side for l in t["legs"]))
+
     def game_payout(self, game: str) -> float:
         return sum(t["contracts"] for t in self.open() if game in t["games"])
 
@@ -513,7 +548,7 @@ class Book:
         self.save()
 
 
-def caps_check(book: Book, games: list, contracts: float, ask: float, cfg: Config, day: str):
+def caps_check(book: Book, games: list, contracts: float, ask: float, cfg: Config, day: str, legs=None):
     """Why a ticket of `contracts` at `ask` would break a cap (None = fits)."""
     if contracts * ask < cfg.min_premium:
         return "dust"
@@ -524,6 +559,10 @@ def caps_check(book: Book, games: list, contracts: float, ask: float, cfg: Confi
     for g in games:
         if book.game_payout(g) + contracts > cfg.max_game_payout + 1e-9:
             return "game_cap"
+    if cfg.max_outcome_payout is not None:
+        for l in legs or []:
+            if book.outcome_payout(l[0], l[1]) + contracts > cfg.max_outcome_payout + 1e-9:
+                return "outcome_cap"
     if book.open_loss() + contracts * (1.0 - ask) > cfg.max_open_loss + 1e-9:
         return "loss_cap"
     if book.day_count(day) >= cfg.max_tickets:
@@ -532,17 +571,22 @@ def caps_check(book: Book, games: list, contracts: float, ask: float, cfg: Confi
 
 
 def confirm_check(q: dict, markets: dict, now_s: float, cfg: Config, book: Book, contracts: float,
-                  game_start=None):
-    """The last look: (why not, fair now)."""
+                  game_start=None, adjust=None):
+    """The last look: (why not, fair now). `adjust(legs, markets, now, fair)` ->
+    (why, fair): the second fair (Maker.book_adjust)."""
     why, fair = price_check(q["legs"], markets, now_s, cfg, game_start)
     if why:
         return why, fair
+    if adjust is not None:
+        why, fair = adjust(q["legs"], markets, now_s, fair)
+        if why:
+            return why, fair
     if q["ask"] < fair * (1.0 + cfg.confirm_edge_for(len(q["legs"]), q["legs"])) - 1e-9:
         return "edge_gone", fair
     floor = cfg.net_floor_for(len(q["legs"]))
     if floor > 0 and net_edge(q["ask"], fair, q["legs"], cfg) < floor - 1e-9:
         return "net_edge", fair                         # under the n-leg floor over the fair after the fee
-    return caps_check(book, q["games"], contracts, q["ask"], cfg, et_day(now_s)), fair
+    return caps_check(book, q["games"], contracts, q["ask"], cfg, et_day(now_s), q["legs"]), fair
 
 
 # ---- the network side -------------------------------------------------------------
@@ -638,6 +682,13 @@ class Maker:
         self.pause_until = 0.0
         self.errors = 0
         self.last_settle = 0.0
+        # the requester guard: creator id -> {"q": our quotes, "a": accepts, "seen": time}; -> blocked until
+        self.req, self.blocked = {}, {}
+        self.req_path = os.path.join(out_dir, REQUESTERS_NAME) if out_dir else None
+        self.req_pruned = 0.0
+        self._load_requesters()
+        # the second fair: the sportsbook lines (re-read in upkeep) and each leg's match to them
+        self.lines, self.lines_at, self.line_match = None, 0.0, {}
         self._reset_stats()
 
     def _reset_stats(self):
@@ -742,6 +793,10 @@ class Maker:
         if now < self.pause_until:
             self._why("paused")
             return
+        cr = str(msg.get("creator_id") or "")[:8]
+        if cr and self.blocked.get(cr, 0.0) > now:
+            self._why("requester_blocked")
+            return
         while self.sent and now - self.sent[0] > 60:
             self.sent.popleft()
         if len(self.sent) >= self.cfg.max_quotes_per_min:
@@ -792,6 +847,8 @@ class Maker:
             self._why("moving")
             return
         why, fair = price_check(legs, mk, now, self.cfg, self.game_start)
+        if not why and self.cfg.book_fair:
+            why, fair = self.book_adjust(legs, mk, now, fair)
         if why:
             self._why(why)
             return
@@ -804,7 +861,7 @@ class Maker:
                 raised, ask, no_bid = ask, floor_px, round(1.0 - floor_px, 4)
         cts = contracts_of(rfq, ask)
         games = [game_of(l[0]) for l in legs]
-        why = caps_check(self.book, games, cts, ask, self.cfg, et_day(now))
+        why = caps_check(self.book, games, cts, ask, self.cfg, et_day(now), legs)
         if why:
             self._why(why)
             return
@@ -821,6 +878,7 @@ class Maker:
             return
         body = {"rfq_id": rfq["id"], "yes_bid": "0.0000", "no_bid": f"{no_bid:.4f}", "rest_remainder": False}  # "0" is refused: "invalid dollar precision"
         self.sent.append(now)                           # counts against the cap from now, out or not
+        self._count_quote(rfq["cr"], now)
         if self.pool is None:
             self._send(q, body, now)
             return
@@ -875,6 +933,9 @@ class Maker:
                "side": msg.get("accepted_side"), "yes_bid": msg.get("yes_bid_dollars"),
                "no_bid": msg.get("no_bid_dollars"), "contracts": cts}
         self.w.write(rec)
+        if self._requester_accept(q.get("cr") or "", now):
+            self._decline(q, "requester_flagged", None, cts)
+            return
         if _f(msg.get("no_bid_dollars")) is not None and abs(_f(msg.get("no_bid_dollars")) - q["no_bid"]) > 1e-6:
             self._decline(q, "price_mismatch", None, cts)
             return
@@ -887,7 +948,8 @@ class Maker:
         if self.moving(q["legs"], now):
             self._decline(q, "moving", None, cts)
             return
-        why, fair_now = confirm_check(q, mk, now, self.cfg, self.book, cts, self.game_start)
+        why, fair_now = confirm_check(q, mk, now, self.cfg, self.book, cts, self.game_start,
+                                      self.book_adjust if self.cfg.book_fair else None)
         if why:
             self._decline(q, why, fair_now, cts)
             return
@@ -910,7 +972,7 @@ class Maker:
         self.st["confirmed"] += 1
         t = {"quote_id": qid, "rfq": q["id"], "mt": q["mt"], "legs": q["legs"], "games": q["games"],
              "ask": q["ask"], "fair": q["fair"], "fair_confirm": fair_now, "contracts": cts,
-             "status": "confirmed", "day": et_day(now), "at": now,
+             "status": "confirmed", "day": et_day(now), "at": now, "cr": q.get("cr"),
              # all-NFL combos pay no maker fee by Kalshi's table: checked on the fills
              "fee_est": 0.0 if self.cfg.fee_free(q["legs"]) else maker_fee(cts, q["ask"])}
         self.book.add(t)
@@ -1076,6 +1138,15 @@ class Maker:
         if self.cfg.live and now - self.last_settle >= SETTLE_EVERY_S:
             self.last_settle = now
             self.settle()
+        if self.cfg.book_fair and now - self.lines_at >= LINES_EVERY_S:
+            self.reload_lines(now)
+        if now - self.req_pruned >= REQ_PRUNE_EVERY_S:
+            self.req_pruned = now
+            with self.lock:
+                for cr in [k for k, r in self.req.items() if not r["a"] and now - r["seen"] > 86400]:
+                    del self.req[cr]
+                for cr in [k for k, until in self.blocked.items() if until <= now]:
+                    del self.blocked[cr]
         if now - self.st_since >= STAT_SECS:
             with self.lock:                             # the senders count into self.st too
                 st = self.st
@@ -1090,6 +1161,108 @@ class Maker:
                    else f"would quote {st['dry']}")
                 + f" | open {len(self.book.open())} can lose ${self.book.open_loss():,.2f} | top skips "
                 + ", ".join(f"{k} {v}" for k, v in top))
+
+    # ---- the requester guard -----------------------------------------------------
+
+    def _load_requesters(self) -> None:
+        if not self.req_path or not os.path.exists(self.req_path):
+            return
+        try:
+            with open(self.req_path, encoding="utf-8") as f:
+                js = json.load(f)
+            self.req = {k: dict(v) for k, v in (js.get("req") or {}).items()}
+            self.blocked = {k: float(v) for k, v in (js.get("blocked") or {}).items()}
+        except (OSError, ValueError) as e:
+            log(f"! {REQUESTERS_NAME} unreadable ({e!r}): starting the guard empty")
+
+    def _save_requesters(self) -> None:
+        """The requesters that ever accepted (and the blocks): the rest are counts
+        only, rebuilt as they quote again."""
+        if not self.req_path:
+            return
+        with self.lock:
+            js = {"req": {k: v for k, v in self.req.items() if v["a"]}, "blocked": dict(self.blocked)}
+        try:
+            tmp = self.req_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(js, f)
+            os.replace(tmp, self.req_path)
+        except OSError as e:
+            self._error("requesters save", e)
+
+    def _count_quote(self, cr: str, now: float) -> None:
+        if not cr:
+            return
+        with self.lock:
+            r = self.req.get(cr)
+            if r is None:
+                r = self.req[cr] = {"q": 0, "a": 0, "seen": now}
+            r["q"] += 1
+            r["seen"] = now
+
+    def _requester_accept(self, cr: str, now: float) -> bool:
+        """Count a buyer's accept; True when it flags them (the accept is then declined)."""
+        if not cr:
+            return False
+        with self.lock:
+            r = self.req.get(cr)
+            if r is None:
+                r = self.req[cr] = {"q": 0, "a": 0, "seen": now}
+            r["a"] += 1
+            r["seen"] = now
+            n = max(r["q"], r["a"])
+            flag = (self.cfg.guard_min_accepts > 0 and r["a"] >= self.cfg.guard_min_accepts
+                    and r["a"] / n >= self.cfg.guard_min_rate - 1e-12)
+            if flag:
+                self.blocked[cr] = now + self.cfg.guard_block_hours * 3600.0
+            quotes, accepts = r["q"], r["a"]
+        if flag:
+            self.w.write({"k": "requester_block", "t": now, "cr": cr, "quotes": quotes, "accepts": accepts,
+                          "until": self.blocked[cr]})
+            log(f"! requester {cr} accepted {accepts} of our {quotes} quotes: blocked "
+                f"{self.cfg.guard_block_hours:g} h")
+        self._save_requesters()
+        return flag
+
+    # ---- the second fair -----------------------------------------------------------
+
+    def reload_lines(self, now: float) -> None:
+        """The sportsbook lines from the logger's odds files (yesterday's and today's)."""
+        self.lines_at = now
+        try:
+            d = datetime.fromtimestamp(now, timezone.utc).date()
+            rows = cbl.load(self.cfg.odds_dir or ODDS_DIR, d, d)
+            self.lines, self.line_match = cbl.Lines(rows), {}
+        except Exception as e:
+            self._error("odds read", e)
+
+    def book_adjust(self, legs, markets: dict, now: float, fair: float):
+        """(why, fair): on each leg the book covers, the higher of Kalshi's mid and the
+        book's vig-free probability for the side; "book_gap" when one is more than
+        max_book_gap apart. Legs the book doesn't cover keep Kalshi's mid."""
+        lines = self.lines
+        if lines is None:
+            return None, fair
+        probs, moved = [], False
+        for tk, side in ((l[0], l[1]) for l in legs):
+            m = markets.get(tk) or {}
+            bid, ask = _f(m.get("yes_bid_dollars"), 0.0), _f(m.get("yes_ask_dollars"), 1.0)
+            k_yes = (bid + ask) / 2.0
+            p_k = k_yes if side == "yes" else 1.0 - k_yes
+            hit = self.line_match.get(tk, False)
+            if hit is False:
+                hit = self.line_match[tk] = lines.match(tk, m)
+            ph = lines.p_home(hit[0], now) if hit else None
+            if ph is None:
+                probs.append(p_k)
+                continue
+            b_yes = ph[0] if hit[1] else 1.0 - ph[0]
+            p_b = b_yes if side == "yes" else 1.0 - b_yes
+            if abs(p_b - p_k) > self.cfg.max_book_gap + 1e-9:
+                return "book_gap", fair
+            probs.append(max(p_k, p_b))
+            moved = moved or p_b > p_k
+        return None, (max(fair, math.prod(probs)) if moved else fair)
 
     def settle(self) -> None:
         open_t = [t for t in self.book.tickets if t.get("status") == "executed" and t.get("fill_checked")]
@@ -1280,6 +1453,20 @@ def main(argv=None) -> int:
                          "step it up .5%% each leg\"")
     ap.add_argument("--max-payout", type=float, default=d.max_payout)
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
+    ap.add_argument("--max-outcome-payout", type=float, default=400.0,
+                    help="the payout that may ride on one leg result (ticker and side) across the open "
+                         "tickets (0 = off). Jack 2026-11-06: \"Limit exposure by outcome, not just by game\"")
+    ap.add_argument("--guard-min-accepts", type=int, default=2,
+                    help="the requester guard: this many accepts from one requester at --guard-min-rate or more "
+                         "of our quotes to them blocks them --guard-block-hours (the accept that trips it is "
+                         "declined; 0 = off)")
+    ap.add_argument("--guard-min-rate", type=float, default=d.guard_min_rate)
+    ap.add_argument("--guard-block-hours", type=float, default=d.guard_block_hours)
+    ap.add_argument("--no-book-fair", action="store_true",
+                    help="drop the second fair (DraftKings' vig-free moneyline on game-winner legs, from the "
+                         "RFQ logger's odds files)")
+    ap.add_argument("--max-book-gap", type=float, default=d.max_book_gap,
+                    help="skip a parlay with a leg this far from the book's probability (0.05 = 5 points)")
     ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,
                     help="the most one ticket can lose, contracts x (1 - our price); raise --max-payout "
                          "above it or the payout cap binds first (default: only --max-payout)")
@@ -1352,6 +1539,9 @@ def main(argv=None) -> int:
                  confirm_floor_per_leg=a.confirm_floor_per_leg, longshot_markup=longshot,
                  max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_ticket_loss=a.max_ticket_loss,
+                 max_outcome_payout=a.max_outcome_payout or None, guard_min_accepts=a.guard_min_accepts,
+                 guard_min_rate=a.guard_min_rate, guard_block_hours=a.guard_block_hours,
+                 book_fair=not a.no_book_fair, max_book_gap=a.max_book_gap,
                  max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
@@ -1378,6 +1568,12 @@ def main(argv=None) -> int:
         ap.error("--max-reads-per-min 10-600")
     if not 1 <= cfg.shard_factor <= 100:
         ap.error("--shard-factor 1-100")
+    if cfg.max_outcome_payout is not None and not 10 <= cfg.max_outcome_payout <= 100_000:
+        ap.error("--max-outcome-payout $10 to $100,000 (0 = off)")
+    if not 0 <= cfg.guard_min_accepts <= 100 or not 0 < cfg.guard_min_rate <= 1 or not 0 < cfg.guard_block_hours <= 720:
+        ap.error("--guard-min-accepts 0-100, --guard-min-rate (0, 1], --guard-block-hours (0, 720]")
+    if not 0.005 <= cfg.max_book_gap <= 0.5:
+        ap.error("--max-book-gap 0.005 to 0.5")
     return run(cfg, a.minutes)
 
 

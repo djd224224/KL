@@ -283,6 +283,7 @@ class _DaySum:
         self.recent = recent if recent is not None else collections.OrderedDict()   # quote id -> segment
         self.sampler = sampler        # QuoteOutcomes: offered the sampled quotes
         self.acc_ids, self.dec_ids = set(), set()   # quote ids accepted by a buyer / declined at the last look
+        self.blocks = []              # the maker's requester-guard blocks
 
     def _seg_quote(self, key, mu, qid) -> None:
         v = self.seg_q.get(key)
@@ -398,6 +399,8 @@ class _DaySum:
                 self.acc_ids.add(e["quote_id"])
         elif k == "stat":
             self.last_stat = e
+        elif k == "requester_block":
+            self.blocks.append(e)
         elif k == "settled":
             self.settle_ts[e.get("mt")] = ts
         if k in FEED_KINDS:
@@ -807,6 +810,7 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
         "series": series, "fill_points": fill_points(filled),
         "analytics": analytics(days, tickets, min(firsts) if firsts else None, oc_rows),
         "outcomes": dict(outcomes.state(), sample_pct=OUTCOME_SAMPLE_PCT) if outcomes is not None else None,
+        "blocks": [b for d in days for b in d.blocks][-20:],
         "fill_rate": _fill_rate(sum(d.quotes for d in days), sum(d.accepts for d in days),
                                 min(firsts) if firsts else None, filled),
         "history_error": (hist or {}).get("error"),
@@ -1667,6 +1671,15 @@ def render(s: dict) -> str:
         if s.get("history_error"):
             H.append(f"<div class='small muted'>price history: {html.escape(str(s['history_error']))}</div>")
     H.append(analytics_html(s.get("analytics"), s.get("outcomes")))
+    if s.get("blocks"):                              # the maker's requester guard (Jack 2026-11-06)
+        H.append("<h2>Requesters blocked <span class='muted small'>accepted too many of our quotes; the accept "
+                 "that tripped it was declined</span></h2><div class='tw'><table><tr><th>When</th><th>Requester</th>"
+                 "<th class='n'>Accepted</th><th class='n'>Our quotes to them</th><th>Blocked until</th></tr>")
+        for b in reversed(s["blocks"]):
+            H.append(f"<tr><td class='small'>{tm(_f(b.get('t'), 0.0))}</td><td>{html.escape(str(b.get('cr')))}</td>"
+                     f"<td class='n'>{b.get('accepts')}</td><td class='n'>{b.get('quotes')}</td>"
+                     f"<td class='small'>{et(_f(b.get('until'), 0.0)).strftime('%a %I:%M %p').replace(' 0', ' ')}</td></tr>")
+        H.append("</table></div>")
     H.append("<h2>Today</h2><div class='card'><div class='funnel'>"
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "

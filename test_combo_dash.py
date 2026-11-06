@@ -839,5 +839,23 @@ class Outcomes(unittest.TestCase):
             self.assertIn(want, page)
 
 
+class Blocks(unittest.TestCase):
+    """The maker's requester guard on the page (Jack 2026-11-06)."""
+
+    def test_the_blocks_table(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        day = datetime.fromtimestamp(NOW, timezone.utc).strftime("%Y-%m-%d")
+        with open(os.path.join(d.name, f"combo_{day}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"k": "requester_block", "t": NOW - 60, "cr": "519ff6e6", "quotes": 3, "accepts": 2,
+                                "until": NOW + 86340}) + "\n")
+        s = cd.snapshot(d.name, d.name, NOW)
+        self.assertEqual([b["cr"] for b in s["blocks"]], ["519ff6e6"])
+        page = cd.render(s)
+        self.assertIn("Requesters blocked", page)
+        self.assertIn("519ff6e6", page)
+
+
 if __name__ == "__main__":
     unittest.main()
