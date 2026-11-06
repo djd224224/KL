@@ -165,10 +165,104 @@ def _quote_at(line: bytes):
         return None
 
 
+# ---- segments (Jack 2026-11-06: "add more robust analytics to the dash. segmenting by
+# # of legs, sports, etc to understand fill rates, edge, PnL, odds, etc") ----
+
+FAIR_BINS = ((0.05, "under 5¢"), (0.10, "5–10¢"), (0.20, "10–20¢"), (0.30, "20–30¢"), (0.40, "30–40¢"),
+             (9.0, "40¢ and up"))
+DIMS = (("legs", "Legs"), ("sports", "Sports"), ("odds", "Odds (fair at the sale)"), ("types", "Leg types"),
+        ("fee", "Maker fee"))
+TYPE_ORDER = ("winners only", "with spreads / totals", "with extras")
+FEE_ORDER = ("fee-paying", "all-NFL (no fee)")
+SPORT_ROWS = 12                    # the sports table: every mix we hold, then the busiest, the rest folded
+RECENT_QUOTES = 50_000             # quote id -> segment, for the accepts and declines that follow
+_SERIES = {}                       # series -> (sport, leg kind)
+
+
+def _series_info(series: str) -> tuple:
+    """(sport, kind) of a leg's series: the maker's sport_of (combo_maker) and
+    win / spread / total / extra (first half, quarters, team totals, props)."""
+    v = _SERIES.get(series)
+    if v is None:
+        try:
+            from combo_rfq_score import league_of, sport_group
+            g = sport_group(series)
+        except Exception:                       # the scorer's rules unavailable: unsegmented
+            g, league_of = "", (lambda s: None)
+        if g == "soccer":
+            sport = "SOCCER"
+        elif g in ("us", "extra", "prop"):
+            sport = league_of(series) or "?"
+        elif g == "unchecked":
+            sport = ("UFC" if series.startswith("KXUFCFIGHT") else "BOXING" if series.startswith("KXBOXING")
+                     else "TENNIS")
+        else:
+            sport = "?"
+        kind = ("extra" if g in ("extra", "prop") else "spread" if series.endswith("SPREAD")
+                else "total" if series.endswith("TOTAL") else "win")
+        v = _SERIES[series] = (sport, kind)
+    return v
+
+
+def fair_bin(fair) -> str:
+    if fair is None:
+        return "?"
+    for top, lab in FAIR_BINS:
+        if fair < top:
+            return lab
+    return FAIR_BINS[-1][1]
+
+
+def seg_key(legs, fair) -> tuple:
+    """A parlay's segment in each of DIMS: (legs, sports, odds, leg types, fee)."""
+    infos = [_series_info(str(l[0]).split("-")[0]) for l in legs]
+    kinds = {k for _, k in infos}
+    return (len(legs), "+".join(sorted({s for s, _ in infos})) or "?", fair_bin(fair),
+            "with extras" if "extra" in kinds else "with spreads / totals" if kinds & {"spread", "total"}
+            else "winners only",
+            "all-NFL (no fee)" if legs and all(str(l[0]).startswith("KXNFL") for l in legs) else "fee-paying")
+
+
+def _num_after(line: bytes, tag: bytes):
+    i = line.find(tag)
+    if i < 0:
+        return None
+    i += len(tag)
+    ends = [j for j in (line.find(b",", i), line.find(b"}", i)) if j >= 0]
+    try:
+        return float(line[i:min(ends)]) if ends else None
+    except ValueError:
+        return None
+
+
+def _str_after(line: bytes, tag: bytes):
+    i = line.find(tag)
+    if i < 0:
+        return None
+    a = line.find(b'"', i + len(tag))
+    b = line.find(b'"', a + 1) if a >= 0 else -1
+    return line[a + 1:b].decode("utf-8", "replace") if a >= 0 and b > a else None
+
+
+def _quote_seg(line: bytes):
+    """(segment, markup, quote id) of a quote line, read without a full parse
+    (only its legs array is parsed); None when the legs can't be read."""
+    i = line.find(b'"legs":')
+    j = line.find(b"]]", i) if i >= 0 else -1
+    if j < 0:
+        return None
+    try:
+        legs = json.loads(line[i + 7:j + 2])
+    except ValueError:
+        return None
+    return (seg_key(legs, _num_after(line, b'"fair":')), _num_after(line, b'"mu":') or 0.0,
+            _str_after(line, b'"quote_id":'))
+
+
 class _DaySum:
     """One UTC day's maker log, summed as it is read: what the page shows of it."""
 
-    def __init__(self, last: float = 0.0):
+    def __init__(self, last: float = 0.0, recent=None):
         self.off = 0                  # bytes of whole lines read
         self.final = False            # read to its end from the .gz: the maker closed the day
         self.last = last              # the last stamped line's time (an unstamped line takes it)
@@ -183,6 +277,22 @@ class _DaySum:
         self.first_quote = None
         self.settle_ts = {}           # combo -> its settled line's time
         self.feed = collections.deque(maxlen=FEED_N)     # parsed lines, or (time, raw) for quotes
+        self.seg_q = {}               # segment -> [quotes, markup sum]
+        self.seg_acc = {}             # segment -> accepts (by the accepted quote's id)
+        self.seg_dec = {}             # segment -> last-look declines
+        self.recent = recent if recent is not None else collections.OrderedDict()   # quote id -> segment
+
+    def _seg_quote(self, key, mu, qid) -> None:
+        v = self.seg_q.get(key)
+        if v is None:
+            v = self.seg_q[key] = [0, 0.0]
+        v[0] += 1
+        v[1] += mu or 0.0
+        if qid:
+            r = self.recent
+            r[qid] = key
+            if len(r) > RECENT_QUOTES:
+                r.popitem(last=False)
 
     def read(self, f, final: bool = False) -> None:
         """The lines from self.off on (f binary). An unfinished last line waits for
@@ -215,6 +325,9 @@ class _DaySum:
                 if self.first_quote is None or at < self.first_quote:
                     self.first_quote = at
                 feed.append((at, line))
+                seg = _quote_seg(line)
+                if seg is not None:
+                    self._seg_quote(*seg)
             self.off += cut
             tail = data[cut:]
         if final and tail.strip():
@@ -254,12 +367,20 @@ class _DaySum:
             if k == "decline":
                 w = e.get("why")
                 self.whys[(h, w)] = self.whys.get((h, w), 0) + 1
+                key = self.recent.get(e.get("quote_id"))
+                if key is not None:
+                    self.seg_dec[key] = self.seg_dec.get(key, 0) + 1
         if k == "quote":
             self.quotes += 1
             if self.first_quote is None or ts < self.first_quote:
                 self.first_quote = ts
+            if e is not None and e.get("legs"):
+                self._seg_quote(seg_key(e["legs"], _f(e.get("fair"))), _f(e.get("mu"), 0.0), e.get("quote_id"))
         elif k == "accept":
             self.accepts += 1
+            key = self.recent.get(e.get("quote_id"))
+            if key is not None:
+                self.seg_acc[key] = self.seg_acc.get(key, 0) + 1
         elif k == "stat":
             self.last_stat = e
         elif k == "settled":
@@ -287,6 +408,7 @@ class MakerLog:
     def __init__(self, maker_dir: str, days: int = 2):
         self.dir, self.days = maker_dir, days
         self.sums = {}                # UTC day -> _DaySum
+        self.recent = collections.OrderedDict()     # quote id -> segment, across the days
         self.lock = threading.Lock()
 
     def update(self, now: float) -> list:
@@ -313,14 +435,14 @@ class MakerLog:
         try:
             if os.path.exists(p):
                 if s is None or s.final or os.path.getsize(p) < s.off:
-                    s = _DaySum(last)                       # new, or the file was replaced
+                    s = _DaySum(last, self.recent)          # new, or the file was replaced
                 with open(p, "rb") as f:
                     s.read(f)
                 return s
             if os.path.exists(p + ".gz"):
                 if s is not None and s.final:
                     return s
-                s = s or _DaySum(last)                      # the rest of a day read while plain
+                s = s or _DaySum(last, self.recent)         # the rest of a day read while plain
                 with gzip.open(p + ".gz", "rb") as f:
                     s.read(f, final=True)
                 s.final = True
@@ -509,6 +631,89 @@ def pnl_parts(open_t, settled, markets) -> dict:
     return out
 
 
+def _order(dim: str, rows: list) -> list:
+    if dim == "legs":
+        return sorted(rows, key=lambda r: r["seg"] if isinstance(r["seg"], int) else 99)
+    if dim in ("odds", "types", "fee"):
+        order = {"odds": [lab for _, lab in FAIR_BINS] + ["?"], "types": list(TYPE_ORDER),
+                 "fee": list(FEE_ORDER)}[dim]
+        return sorted(rows, key=lambda r: order.index(r["seg"]) if r["seg"] in order else 99)
+    # sports: every mix we hold a ticket on, then the busiest by quotes; the rest folded together
+    keep = [r for r in rows if r["tickets"]]
+    rest = sorted((r for r in rows if not r["tickets"]), key=lambda r: -r["quotes"])
+    room = max(0, SPORT_ROWS - len(keep))
+    shown = sorted(keep + rest[:room], key=lambda r: (-r["quotes"], -r["tickets"]))
+    folded = rest[room:]
+    if folded:
+        other = {"seg": f"{len(folded)} other mixes"}
+        for k in folded[0]:
+            if k != "seg":
+                other[k] = sum(r[k] for r in folded)
+        shown.append(other)
+    return shown
+
+
+def analytics(days, tickets, since) -> dict:
+    """Per dimension in DIMS, one row a segment: the quoting the page's log holds
+    (quotes, the markup asked, accepts, last-look declines, fills from `since`, the
+    first quote there) and every filled ticket (collected, edge at sale, trading,
+    fees, P&L, settled hits against the fair's expectation). Run after pnl_parts,
+    which values the open tickets, so the P&L rows add up to the cards."""
+    q, acc, dec = {}, collections.Counter(), collections.Counter()
+    for d in days:
+        for key, (n, mus) in d.seg_q.items():
+            v = q.setdefault(key, [0, 0.0])
+            v[0] += n
+            v[1] += mus
+        acc.update(d.seg_acc)
+        dec.update(d.seg_dec)
+    tix = []
+    for t in filled_tickets(tickets):
+        c, ask = t["contracts"], t["ask"]
+        fair = _f(t.get("fair"), ask)
+        settled = t.get("status") == "settled"
+        v = (1.0 if t.get("result") == "yes" else 0.0) if settled else _f(t.get("_value"), fair)
+        tix.append((seg_key(t["legs"], fair), t, c, ask, fair, v, settled))
+    dims = {}
+    for di, (dim, _label) in enumerate(DIMS):
+        rows = {}
+
+        def row(name, rows=rows):
+            return rows.setdefault(name, {"seg": name, "quotes": 0, "mu_sum": 0.0, "accepted": 0, "declined": 0,
+                                          "filled": 0, "tickets": 0, "contracts": 0.0, "collected": 0.0,
+                                          "edge": 0.0, "trading": 0.0, "fees": 0.0, "pnl": 0.0, "open": 0,
+                                          "can_lose": 0.0, "settled": 0, "hits": 0, "exp_hits": 0.0})
+        for key, (n, mus) in q.items():
+            r = row(key[di])
+            r["quotes"] += n
+            r["mu_sum"] += mus
+        for key, n in acc.items():
+            row(key[di])["accepted"] += n
+        for key, n in dec.items():
+            row(key[di])["declined"] += n
+        for key, t, c, ask, fair, v, settled in tix:
+            r = row(key[di])
+            fee = _f(t.get("fee_est"), 0.0) or 0.0
+            if since is not None and fill_time(t) >= since:
+                r["filled"] += 1
+            r["tickets"] += 1
+            r["contracts"] += c
+            r["collected"] += c * ask
+            r["edge"] += c * (ask - fair)
+            r["trading"] += c * (fair - v)
+            r["fees"] += fee
+            r["pnl"] += c * (ask - v) - fee
+            if settled:
+                r["settled"] += 1
+                r["hits"] += 1 if t.get("result") == "yes" else 0
+                r["exp_hits"] += fair
+            else:
+                r["open"] += 1
+                r["can_lose"] += c * (1.0 - ask)
+        dims[dim] = _order(dim, list(rows.values()))
+    return {"since": since, "dims": dims}
+
+
 # ---- the snapshot ----------------------------------------------------------------
 
 def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=None, logs=None) -> dict:
@@ -567,6 +772,7 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
         "settled_pnl": sum(_f(t.get("pnl"), 0.0) for t in settled),
         "pnl": pnl,
         "series": series, "fill_points": fill_points(filled),
+        "analytics": analytics(days, tickets, min(firsts) if firsts else None),
         "fill_rate": _fill_rate(sum(d.quotes for d in days), sum(d.accepts for d in days),
                                 min(firsts) if firsts else None, filled),
         "history_error": (hist or {}).get("error"),
@@ -1040,6 +1246,99 @@ CHART_JS = """
 """
 
 
+SEG_CSS = """
+.segtabs{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px}
+.segtab{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:999px;padding:3px 12px;
+font:inherit;font-size:12px;cursor:pointer}.segtab.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.seg h3{font-size:13px;font-weight:600;margin:12px 0 6px}
+"""
+
+SEG_JS = """<script>(function () {
+  var KEY = 'combo-dash-segment', tabs = [].slice.call(document.querySelectorAll('.segtab')),
+      segs = [].slice.call(document.querySelectorAll('.seg'));
+  if (!tabs.length || !segs.length) return;
+  function show(d) {
+    if (!segs.some(function (s) { return s.getAttribute('data-dim') === d; })) d = segs[0].getAttribute('data-dim');
+    segs.forEach(function (s) { s.style.display = s.getAttribute('data-dim') === d ? '' : 'none'; });
+    tabs.forEach(function (t) { t.classList.toggle('on', t.getAttribute('data-dim') === d); });
+    try { localStorage.setItem(KEY, d); } catch (e) {}
+  }
+  var d0 = null;
+  try { d0 = localStorage.getItem(KEY); } catch (e) {}
+  tabs.forEach(function (t) { t.addEventListener('click', function () { show(t.getAttribute('data-dim')); }); });
+  show(d0 || 'legs');
+})();</script>"""
+
+
+def _seg_label(dim: str, v) -> str:
+    return f"{v} legs" if dim == "legs" and isinstance(v, int) else html.escape(str(v))
+
+
+def _fill_rate_cell(filled: int, quotes: int) -> str:
+    if not quotes:
+        return "&ndash;"
+    if not filled:
+        return "0"
+    return f"{100.0 * filled / quotes:.3f}% &middot; 1 in {quotes / filled:,.0f}"
+
+
+def analytics_html(an: dict) -> str:
+    """The segment tables, one dimension shown at a time (the choice kept in the
+    browser), each with the quoting since the log's first quote and the P&L of
+    every filled ticket, and a total row that matches the cards above."""
+    if not an or not an.get("dims"):
+        return ""
+    since = an.get("since")
+    since_s = (et(since).strftime("%a %I:%M %p").replace(" 0", " ") + " ET") if since else "the log's start"
+    tabs = "".join(f"<button type='button' class='segtab' data-dim='{d}'>{html.escape(lab)}</button>"
+                   for d, lab in DIMS)
+    H = ["<h2>Analytics <span class='muted small'>by segment</span></h2>", f"<div class='segtabs'>{tabs}</div>"]
+    for dim, label in DIMS:
+        rows = an["dims"].get(dim) or []
+        qrows = [r for r in rows if r["quotes"] or r["accepted"] or r["filled"]]
+        trows = [r for r in rows if r["tickets"]]
+        tot = {k: sum(r[k] for r in rows) for k in rows[0] if k != "seg"} if rows else {}
+        H.append(f"<div class='seg' data-dim='{dim}'>")
+        H.append(f"<h3>Quoting and fills since {html.escape(since_s)}</h3><div class='tw'><table><tr>"
+                 f"<th>{html.escape(label)}</th><th class='n'>Quotes</th><th class='n'>Edge asked</th>"
+                 "<th class='n'>Accepted</th><th class='n'>Declined at the last look</th><th class='n'>Filled</th>"
+                 "<th class='n'>Fill rate</th></tr>")
+        for r, cls in [(r, "") for r in qrows] + ([(tot, " class='tot'")] if qrows else []):
+            name = "Total" if r is tot else _seg_label(dim, r["seg"])
+            asked = f"{100.0 * r['mu_sum'] / r['quotes']:.1f}%" if r["quotes"] else "&ndash;"
+            H.append(f"<tr{cls}><td>{name}</td><td class='n'>{r['quotes']:,}</td><td class='n'>{asked}</td>"
+                     f"<td class='n'>{r['accepted']:,}</td><td class='n'>{r['declined']:,}</td>"
+                     f"<td class='n'>{r['filled']:,}</td><td class='n'>{_fill_rate_cell(r['filled'], r['quotes'])}</td></tr>")
+        if not qrows:
+            H.append("<tr><td colspan='7' class='empty'>No quotes in the log yet.</td></tr>")
+        H.append("</table></div>")
+        H.append("<h3>Tickets and P&amp;L, every fill</h3><div class='tw'><table><tr>"
+                 f"<th>{html.escape(label)}</th><th class='n'>Tickets</th><th class='n'>Collected</th>"
+                 "<th class='n'>Avg price</th><th class='n'>Edge at sale</th><th class='n'>Trading</th>"
+                 "<th class='n'>Fees</th><th class='n'>P&amp;L</th><th class='n'>Settled: hit vs fair</th>"
+                 "<th class='n'>Open: can lose</th></tr>")
+        for r, cls in [(r, "") for r in trows] + ([(tot, " class='tot'")] if trows else []):
+            name = "Total" if r is tot else _seg_label(dim, r["seg"])
+            avg = f"{100.0 * r['collected'] / r['contracts']:.1f}&cent;" if r["contracts"] else "&ndash;"
+            share = (f" <span class='muted small'>{100.0 * r['edge'] / r['collected']:.1f}%</span>"
+                     if r["collected"] else "")
+            hit = (f"{r['hits']} hit / {r['exp_hits']:.1f} expected of {r['settled']}" if r["settled"]
+                   else "&ndash;")
+            H.append(f"<tr{cls}><td>{name}</td><td class='n'>{r['tickets']:,}</td><td class='n'>{usd(r['collected'])}</td>"
+                     f"<td class='n'>{avg}</td><td class='n'>{signed(r['edge'])}{share}</td>"
+                     f"<td class='n'>{signed(r['trading'])}</td><td class='n'>{signed(-r['fees'])}</td>"
+                     f"<td class='n'>{signed(r['pnl'])}</td><td class='n'>{hit}</td>"
+                     f"<td class='n'>{usd(r['can_lose']) if r['open'] else '&ndash;'}</td></tr>")
+        if not trows:
+            H.append("<tr><td colspan='10' class='empty'>No fills yet.</td></tr>")
+        H.append("</table></div></div>")
+    H.append("<div class='small muted'>Edge asked: the average markup we quoted. Fill rate: fills / quotes. Edge at "
+             "sale: our price over the fair when we sold; trading: the parlays' moves since (payouts once settled); "
+             "P&amp;L = edge at sale + trading &minus; fees. Hit vs fair: settled parlays that hit (we paid) against "
+             "the sum of their fairs at the sale.</div>")
+    return "".join(H)
+
+
 def render(s: dict) -> str:
     cfg = s["cfg"]
     status = ("live" if s["live"] else "dry") if s["running"] else "off"
@@ -1067,7 +1366,7 @@ def render(s: dict) -> str:
     fn = s["funnel"]
     qn = fn["quotes"] or fn["would"]
     H = [f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-         f"<meta http-equiv='refresh' content='{REFRESH_S}'><title>Combo maker</title><style>{CSS}{CHART_CSS}</style></head><body><main>"]
+         f"<meta http-equiv='refresh' content='{REFRESH_S}'><title>Combo maker</title><style>{CSS}{CHART_CSS}{SEG_CSS}</style></head><body><main>"]
     H.append(f"<div class='top'><div><h1>Combo maker <span class='pill {status}'>{label}</span></h1>"
              f"<div class='muted small'>{setting}</div></div>"
              f"<div class='muted small'>as of {tm(s['now'])} ET &middot; refreshes every {REFRESH_S}s"
@@ -1117,6 +1416,7 @@ def render(s: dict) -> str:
                  f"</span></h2>" + chart_fills(fp, (ser[0]['t'] if ser else fp[0]['t']), s['now']))
         if s.get("history_error"):
             H.append(f"<div class='small muted'>price history: {html.escape(str(s['history_error']))}</div>")
+    H.append(analytics_html(s.get("analytics")))
     H.append("<h2>Today</h2><div class='card'><div class='funnel'>"
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "
@@ -1230,7 +1530,7 @@ def render(s: dict) -> str:
     if k.get("error"):
         H.append(f"<footer class='neg'>Kalshi read failed: {html.escape(k['error'])}</footer>")
     H.append(f"<footer>Read-only: the maker's files in {html.escape(MAKER_DIR)} and, once a minute, Kalshi's balance, "
-             "fills and markets. Times are ET.</footer></main>" + CHART_JS + "</body></html>")
+             "fills and markets. Times are ET.</footer></main>" + CHART_JS + SEG_JS + "</body></html>")
     return "".join(H)
 
 

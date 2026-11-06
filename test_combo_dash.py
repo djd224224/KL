@@ -631,5 +631,101 @@ class FeeCard(unittest.TestCase):
         self.assertIn("2 fills on the combo shard", cd.render(s))
 
 
+class Analytics(unittest.TestCase):
+    """Jack 2026-11-06: "add more robust analytics to the dash. segmenting by # of legs, sports, etc to
+    understand fill rates, edge, PnL, odds, etc"."""
+    NBA, NHL = "KXNBAGAME-26NOV06PHICLE-CLE", "KXNHLGAME-26NOV06CBJBUF-CBJ"
+    NFL1, NFL2 = "KXNFLGAME-26NOV08CINATL-CIN", "KXNFLSPREAD-26NOV08DALIND-DAL3"
+    PROP = "KXNBAPTS-26NOV06ORLPHX-PHXDBOOKER15-25"
+
+    def files(self, d):
+        day = datetime.fromtimestamp(NOW, timezone.utc).strftime("%Y-%m-%d")
+        two, nfl = [[self.NBA, "yes"], [self.NHL, "yes"]], [[self.NFL1, "yes"], [self.NFL2, "no"]]
+        three = two + [[self.PROP, "yes"]]
+        rows = [{"k": "start", "t": NOW - 1800, "live": True, "cfg": {"markup": 0.04}},
+                {"k": "quote", "at": NOW - 1500, "mt": "M1", "legs": two, "fair": 0.30, "ask": 0.312, "mu": 0.04,
+                 "contracts": 10.0, "quote_id": "a"},
+                {"k": "quote", "at": NOW - 1400, "mt": "M2", "legs": two, "fair": 0.04, "ask": 0.043, "mu": 0.06,
+                 "contracts": 10.0, "quote_id": "b"},
+                {"k": "quote", "at": NOW - 1300, "mt": "M3", "legs": nfl, "fair": 0.25, "ask": 0.2575, "mu": 0.025,
+                 "contracts": 10.0, "quote_id": "c"},
+                {"k": "quote", "at": NOW - 1200, "mt": "M4", "legs": three, "fair": 0.12, "ask": 0.127,
+                 "mu": 0.055, "contracts": 10.0, "quote_id": "d"},
+                {"k": "accept", "quote_id": "a", "mt": "M1", "contracts": 10.0},
+                {"k": "accept", "quote_id": "d", "mt": "M4", "contracts": 10.0},
+                {"k": "decline", "quote_id": "d", "mt": "M4", "why": "net_edge", "ask": 0.127, "fair": 0.12},
+                {"k": "stat", "t": NOW - 30, "rfq": 10, "pre_ok": 5, "priced": 4, "quoted": 4, "why": {}}]
+        with open(os.path.join(d, f"combo_{day}.jsonl"), "w", encoding="utf-8") as f:
+            for i, r in enumerate(rows):
+                f.write((json.dumps(r, separators=(",", ":")) if i % 2 else json.dumps(r)) + "\n")
+        tickets = [{"quote_id": "a", "mt": "M1", "legs": two, "ask": 0.312, "fair": 0.30, "contracts": 10.0,
+                    "fee_est": 0.07, "status": "executed", "at": NOW - 1499, "executed_at": NOW - 1498, "games": []},
+                   {"quote_id": "z", "mt": "M9", "legs": nfl, "ask": 0.2575, "fair": 0.25, "contracts": 20.0,
+                    "fee_est": 0.0, "status": "settled", "result": "yes", "pnl": -14.85, "at": NOW - 4000,
+                    "executed_at": NOW - 3999, "games": []}]
+        with open(os.path.join(d, "maker_state.json"), "w", encoding="utf-8") as f:
+            json.dump({"tickets": tickets}, f)
+
+    def snap(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.files(d.name)
+        return cd.snapshot(d.name, d.name, NOW)
+
+    def by(self, s, dim):
+        return {r["seg"]: r for r in s["analytics"]["dims"][dim]}
+
+    def test_the_segment_of_a_quote_line(self):
+        line = (b'{"id":"x","legs":[["KXNBAGAME-26NOV06PHICLE-CLE","yes"],["KXNHLGAME-26NOV06CBJBUF-CBJ","yes"]],'
+                b'"fair":0.3,"ask":0.312,"mu":0.04,"at":1.5,"k":"quote","quote_id":"q9","sent_ms":4.0}')
+        self.assertEqual(cd._quote_seg(line),
+                         ((2, "NBA+NHL", "30–40¢", "winners only", "fee-paying"), 0.04, "q9"))
+        spaced = json.dumps({"k": "quote", "legs": [[self.NFL1, "yes"], [self.NFL2, "no"]], "fair": 0.04,
+                             "mu": 0.04, "quote_id": "q8", "at": 2.0}).encode()
+        self.assertEqual(cd._quote_seg(spaced),
+                         ((2, "NFL", "under 5¢", "with spreads / totals", "all-NFL (no fee)"), 0.04, "q8"))
+        self.assertEqual(cd.seg_key([[self.NBA, "yes"], [self.PROP, "yes"]], 0.12)[1:4],
+                         ("NBA", "10–20¢", "with extras"))
+
+    def test_quoting_and_fills_by_segment(self):
+        s = self.snap()
+        legs = self.by(s, "legs")
+        self.assertEqual((legs[2]["quotes"], legs[2]["accepted"], legs[2]["filled"]), (3, 1, 1))  # z filled earlier
+        self.assertEqual((legs[3]["quotes"], legs[3]["accepted"], legs[3]["declined"]), (1, 1, 1))
+        self.assertAlmostEqual(legs[2]["mu_sum"], 0.04 + 0.06 + 0.025)
+        sports = self.by(s, "sports")
+        self.assertEqual((sports["NBA+NHL"]["quotes"], sports["NFL"]["quotes"]), (3, 1))   # the prop is NBA
+        odds = self.by(s, "odds")
+        self.assertEqual({k: odds[k]["quotes"] for k in odds}, {"under 5¢": 1, "10–20¢": 1, "20–30¢": 1, "30–40¢": 1})
+        types = self.by(s, "types")
+        self.assertEqual((types["winners only"]["quotes"], types["with spreads / totals"]["quotes"],
+                          types["with extras"]["quotes"]), (2, 1, 1))
+        fee = self.by(s, "fee")
+        self.assertEqual((fee["fee-paying"]["quotes"], fee["all-NFL (no fee)"]["quotes"]), (3, 1))
+        for dim, _ in cd.DIMS:                                              # every dimension adds up
+            rows = s["analytics"]["dims"][dim]
+            self.assertEqual(sum(r["quotes"] for r in rows), 4)
+            self.assertAlmostEqual(sum(r["pnl"] for r in rows), s["pnl"]["total"])
+            self.assertAlmostEqual(sum(r["edge"] for r in rows), s["pnl"]["premium"])
+
+    def test_tickets_and_pnl_by_segment(self):
+        s = self.snap()
+        nfl = self.by(s, "sports")["NFL"]
+        self.assertEqual((nfl["tickets"], nfl["settled"], nfl["hits"]), (1, 1, 1))
+        self.assertAlmostEqual(nfl["exp_hits"], 0.25)
+        self.assertAlmostEqual(nfl["pnl"], 20 * (0.2575 - 1.0))                 # it hit: we paid
+        self.assertAlmostEqual(nfl["edge"], 20 * 0.0075)
+        nba = self.by(s, "sports")["NBA+NHL"]
+        self.assertAlmostEqual(nba["can_lose"], 10 * (1 - 0.312))
+        self.assertAlmostEqual(nba["pnl"], 10 * (0.312 - 0.30) - 0.07)          # open at its quote fair (no Kalshi)
+
+    def test_the_page(self):
+        page = cd.render(self.snap())
+        for want in ("Analytics", "class='segtab' data-dim='legs'", "data-dim='sports'", "Quoting and fills since",
+                     "Tickets and P&amp;L, every fill", "Edge asked", "Fill rate", "NBA+NHL", "all-NFL (no fee)",
+                     "1 hit / 0.2 expected of 1", "with extras", "combo-dash-segment"):
+            self.assertIn(want, page)
+
+
 if __name__ == "__main__":
     unittest.main()
