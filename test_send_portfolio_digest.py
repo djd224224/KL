@@ -2052,5 +2052,119 @@ class RefundTests(unittest.TestCase):
         self.assertNotIn("Reward credits = cash that came in", html)
 
 
+class ShardLadderTests(unittest.TestCase):
+    """Jack 2026-11-06: "in daily portfolio email and comma center dash, make
+    sure to include how much $ is in each shard and how it ladders to the
+    total account value"."""
+
+    # /portfolio/balance at 14:21Z 11/06: the breakdown is member-wide, so its
+    # shard 0 holds subaccounts 1 and 2's cash too
+    BAL = {"balance_dollars": "17822.0601", "balance_breakdown": [
+        {"balance": "14448.9665", "exchange_index": 0},
+        {"balance": "173.2756", "exchange_index": 1},
+        {"balance": "2784.0973", "exchange_index": 2},
+        {"balance": "1507.2751", "exchange_index": 3}]}
+    CASH_BY = {0: {0: 13357.4121, 1: 173.2756, 2: 2784.0973, 3: 1507.2751},
+               1: {0: 187.5447}, 2: {0: 904.0097}}
+
+    def test_subaccounts_read_gives_cash_by_shard_and_each_accounts_parts(self):
+        s = pf.fetch_subaccounts(_FakeSubaccountClient())
+        self.assertEqual(s["cash_by"], {0: {0: 19859.5966, 2: 319.2742}, 1: {0: 290.0},
+                                        2: {0: 40.0}})
+        self.assertEqual(s["parts"], {1: {"cash": 290.0, "positions": 12.25},
+                                      2: {"cash": 40.0, "positions": 0.0}})
+
+    def _split(self, kalshi_pv=74.5):
+        mkt_pos = {"KXA-1": {"pos": 100.0, "cost": 40.0},      # shard 0, YES at 45c
+                   "KXA-2": {"pos": -50.0, "cost": 30.0},      # shard 0, NO at 70c
+                   "KXMVECOMBO-1": {"pos": 10.0, "cost": 5.0},  # shard 1
+                   "KXBTC-1": {"pos": 20.0, "cost": 10.0}}     # shard 2, no trade: at cost
+        info = {"KXA-1": {"event": "KXA", "shard": 0}, "KXA-2": {"event": "KXA", "shard": 0},
+                "KXMVECOMBO-1": {"event": "KXMVECOMBO", "shard": 1},
+                "KXBTC-1": {"event": "KXBTC", "shard": 2}}
+        lasts = {"KXA-1": 0.45, "KXA-2": 0.30, "KXMVECOMBO-1": 0.60}
+        return pf.shard_split(self.BAL, 17822.06, kalshi_pv, self.CASH_BY, mkt_pos, info,
+                              lasts, {"KXA": 20.0}, lambda tk: info[tk]["event"])
+
+    def test_cash_by_shard_leaves_the_subaccounts_out_and_adds_up(self):
+        rows = {r["shard"]: r for r in self._split()["rows"]}
+        self.assertEqual([rows[s]["cash"] for s in (0, 1, 2, 3)],
+                         [13357.40, 173.28, 2784.10, 1507.28])
+        self.assertEqual(round(sum(r["cash"] for r in rows.values()), 2), 17822.06)
+        self.assertEqual(rows[3]["name"], "Tennis, baseball, basketball")
+
+    def test_positions_go_to_their_markets_shard_less_the_events_refund(self):
+        sp = self._split()
+        rows = {r["shard"]: r for r in sp["rows"]}
+        # shard 0: 45 + 35 - the event's 20 refund = 60, less Kalshi's -1.50 gap
+        self.assertEqual([rows[s]["positions"] for s in (0, 1, 2, 3)], [58.5, 6.0, 10.0, 0.0])
+        self.assertEqual(sp["resid"], -1.5)
+        self.assertEqual(round(sum(r["positions"] for r in rows.values()), 2), 74.5)
+        self.assertEqual(rows[0]["total"], round(13357.40 + 58.5, 2))
+
+    def test_no_breakdown_no_split(self):
+        self.assertIsNone(pf.shard_split({"balance_dollars": "1.00"}, 1.0, 0.0, None, {}, {},
+                                         {}, {}, lambda tk: tk))
+
+    def _pf(self):
+        p = SubaccountTests()._pf(prior_subs=300.0, subs=312.25, moves=0.0, ntc=353.24,
+                                  ek=40287.76)
+        p["perps"] = {"equity": 120.27, "settled_funds": 99.15, "positions": []}
+        p["subs"] = {"accounts": {1: 312.25}, "moves": [],
+                     "parts": {1: {"cash": 300.0, "positions": 12.25}},
+                     "cash_by": {0: {0: 19808.0, 2: 319.28}, 1: {0: 300.0}}}
+        p["shards"] = {"resid": 0.4, "rows": [
+            {"shard": 0, "name": "Default", "cash": 19808.0, "positions": 20000.48,
+             "total": 39808.48},
+            {"shard": 1, "name": "Combos", "cash": 0.0, "positions": 0.0, "total": 0.0},
+            {"shard": 2, "name": "Crypto & commodities", "cash": 319.28, "positions": 160.0,
+             "total": 479.28},
+            {"shard": 3, "name": "Tennis, baseball, basketball", "cash": 0.0,
+             "positions": 0.0, "total": 0.0}]}
+        return p
+
+    def test_the_ladder_ties_to_the_account_value(self):
+        p = self._pf()
+        lad = pf.account_ladder(p)
+        self.assertEqual([r["k"] for r in lad],
+                         ["shard"] * 4 + ["main", "perps", "app", "sub", "value"])
+        self.assertEqual(round(sum(r["total"] for r in lad if r["k"] == "shard"), 2),
+                         lad[4]["total"])
+        self.assertEqual(lad[4], {"k": "main", "lbl": "Main account", "cash": 20127.28,
+                                  "pos": 20160.48, "total": 40287.76})
+        self.assertEqual(lad[5]["cash"], 99.15)
+        self.assertEqual(lad[6]["total"], round(40287.76 + 120.27, 2))
+        self.assertEqual(lad[7]["lbl"], "Subaccount 1 · NFL sniper (shard 0)")
+        self.assertEqual(lad[8]["total"], p["account_value"])
+        self.assertEqual(round(lad[6]["total"] + lad[7]["total"], 2), p["account_value"])
+        # the dashboard's card carries it
+        self.assertEqual(pf.account_summary(p, pf.day_split(p))["ladder"], lad)
+
+    def test_the_email_shows_the_ladder_under_the_headline(self):
+        _, text, html = pf.build_email(self._pf(), [], chart_ok=False)
+        self.assertIn("Account value by shard (cash + open positions at Kalshi's valuation):", text)
+        self.assertIn("    Shard 2 · Crypto & commodities", text)
+        self.assertRegex(text, r"\n  = Main account +20,127\.28 \+ +20,160\.48 = +40,287\.76\n")
+        self.assertRegex(text, r"\n  = Account value +40,720\.28\n")
+        self.assertLess(text.index("vs yesterday"), text.index("Account value by shard"))
+        self.assertLess(text.index("Account value by shard"), text.index("Biggest movers"))
+        self.assertIn("Account value by shard", html)
+        self.assertIn("= Kalshi app</td>", html.replace("&nbsp;", " "))
+        self.assertLess(html.index("Account value by shard"), html.index("Biggest movers"))
+        # a $0.40 gap is no note; $5+ is
+        self.assertNotIn("not matched to a market", text)
+        p = self._pf()
+        p["shards"]["resid"] = -12.0
+        self.assertIn("Shard 0's positions include -$12.00 of Kalshi's valuation",
+                      pf.build_email(p, [], chart_ok=False)[1])
+
+    def test_no_split_no_ladder(self):
+        p = self._pf()
+        p["shards"] = None
+        _, text, html = pf.build_email(p, [], chart_ok=False)
+        self.assertNotIn("Account value by shard", text + html)
+        self.assertIsNone(pf.account_ladder(p))
+
+
 if __name__ == "__main__":
     unittest.main()

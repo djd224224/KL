@@ -246,6 +246,12 @@ CRYPTO_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE", "ZEC")
 WEATHER_PREFIXES = ("KXHIGH", "KXLOWT", "KXTEMP")   # high_temp / low_temp bots, hourly temps
 SUBACCOUNT_BOTS = {1: "Other",      # nfl_snipe_bot, since 10/09
                    2: "Weather"}    # the KXTEMPMIAH hourly-temp live test (halted 10/16)
+SUBACCOUNT_NAMES = {1: "NFL sniper", 2: "hourly temp"}
+# Kalshi's exchange shards (exchange_index) as /exchange/status names them.
+# New events land on one by category and each shard holds its own cash
+# (memory: kalshi-exchange-shards).
+SHARD_NAMES = {0: "Default", 1: "Combos", 2: "Crypto & commodities",
+               3: "Tennis, baseball, basketball"}
 
 
 def imm_book_events(D, today_str: str):
@@ -348,6 +354,67 @@ def event_refunds(events, mkt_pos, ev_of) -> dict:
     return out
 
 
+def shard_split(bal, cash, kalshi_pv, cash_by, mkt_pos, mark_info, lasts, refunds, ev_of):
+    """The main account's money shard by shard (Jack 2026-11-06: "include
+    how much $ is in each shard and how it ladders to the total account
+    value"): [{"shard", "name", "cash", "positions", "total"}] for shards 0-3
+    and any other one in use, adding up to the cash and Kalshi's
+    portfolio_value to the cent, plus "resid". None without a breakdown.
+
+    Cash is held per shard. /portfolio/balance's balance_breakdown, read
+    with balance_dollars, is member-wide: its shard 0 holds the numbered
+    subaccounts' cash too ($1,091.55 on 11/06). So shards 1+ are their
+    breakdown less the subaccounts' cash there (cash_by, from the
+    subaccounts read), and shard 0 is the rest of the primary's
+    balance_dollars. Positions go to their market's shard (exchange_index on
+    the markets read; unknown -> 0) at the last trade, less the collateral
+    Kalshi has returned on their event, which is how Kalshi's portfolio_value
+    values them. What that leaves of Kalshi's own figure ("resid": a market
+    with no trade on record sits at its mid here, the reads are seconds
+    apart) goes to shard 0, so the ladder ties."""
+    bd = {}
+    for x in (bal or {}).get("balance_breakdown") or []:
+        try:
+            bd[int(x.get("exchange_index"))] = _f(x.get("balance"))
+        except (TypeError, ValueError):
+            continue
+    if not bd:
+        return None
+    shards = sorted(set(SHARD_NAMES) | set(bd))
+    sub_cash = {}
+    for n, by in (cash_by or {}).items():
+        if int(n):
+            for sh, v in by.items():
+                sub_cash[int(sh)] = sub_cash.get(int(sh), 0.0) + _f(v)
+    c = {sh: round(bd.get(sh, 0.0) - sub_cash.get(sh, 0.0), 2) for sh in shards if sh}
+    c[0] = round(cash - sum(c.values()), 2)
+    pos, ev_shard = {sh: 0.0 for sh in shards}, {}
+    for tk, rec in mkt_pos.items():
+        sh = (mark_info.get(tk) or {}).get("shard")
+        sh = int(sh) if sh is not None else 0
+        pos.setdefault(sh, 0.0)
+        ev_shard.setdefault(ev_of(tk), sh)
+        last = lasts.get(tk)
+        q = rec["pos"]
+        pos[sh] += (rec["cost"] if last is None
+                    else q * last if q > 0 else -q * (1.0 - last))
+    for ev, ref in (refunds or {}).items():
+        sh = ev_shard.get(ev, 0)
+        pos[sh] = pos.get(sh, 0.0) - ref
+    p = {sh: round(v, 2) for sh, v in pos.items() if sh}
+    resid = round(kalshi_pv - sum(p.values()) - pos.get(0, 0.0), 2)
+    p[0] = round(kalshi_pv - sum(p.values()), 2)
+    out = [{"shard": sh, "name": SHARD_NAMES.get(sh, f"shard {sh}"),
+            "cash": c.get(sh, 0.0), "positions": p.get(sh, 0.0),
+            "total": round(c.get(sh, 0.0) + p.get(sh, 0.0), 2)}
+           for sh in sorted(set(c) | set(p))
+           if sh in SHARD_NAMES or abs(c.get(sh, 0.0)) >= 0.005 or abs(p.get(sh, 0.0)) >= 0.005]
+    log("by shard: " + "; ".join(f"{r['shard']} {r['name']} cash {r['cash']:,.2f} + positions "
+                                 f"{r['positions']:,.2f}" for r in out)
+        + f" (Kalshi valuation not placed by market, in shard 0: {resid:+,.2f})")
+    return {"rows": out, "resid": resid}
+
+
 def net_of_refund(realized, value_d, value_now, refund_now, refund_prior):
     """A movers row the way Kalshi books a refund: the open value net of the
     event's refund (as Kalshi's positions value), the refund's cash in
@@ -425,9 +492,10 @@ def fetch_subaccounts(client):
     reward credit is wrong in the email").
 
     {"equity": $ over every numbered subaccount (its cash + Kalshi's
-    portfolio_value, as the primary), "accounts": {n: $}, "moves": [(ts, $
-    into the primary)], "moves_by": [(ts, n, $ that left subaccount n)]},
-    None when a read fails."""
+    portfolio_value, as the primary), "accounts": {n: $}, "parts": {n:
+    {"cash": $, "positions": $}}, "cash_by": {n: {shard: $}} (n = 0 is the
+    primary), "moves": [(ts, $ into the primary)], "moves_by": [(ts, n, $
+    that left subaccount n)]}, None when a read fails."""
     try:
         bals = client.get("/portfolio/subaccounts/balances").get("subaccount_balances") or []
         moves, moves_by = [], []
@@ -441,16 +509,22 @@ def fetch_subaccounts(client):
             for n, a in ((src, amt), (dst, -amt)):
                 if n:
                     moves_by.append((_f(t.get("created_ts")), n, a))
-        accounts = {}
+        cash_by = {}
+        for b in bals:
+            n, sh = int(b.get("subaccount_number") or 0), int(b.get("exchange_index") or 0)
+            cash_by.setdefault(n, {})[sh] = round(
+                cash_by.get(n, {}).get(sh, 0.0) + _f(b.get("balance")), 4)
+        accounts, parts = {}, {}
         for n in sorted({int(b.get("subaccount_number") or 0) for b in bals} - {0}):
             b = client.get("/portfolio/balance", params={"subaccount": n})
-            accounts[n] = round(_f(b.get("balance_dollars"))
-                                + _f(b.get("portfolio_value")) / 100.0, 2)
+            c, pv = _f(b.get("balance_dollars")), _f(b.get("portfolio_value")) / 100.0
+            accounts[n] = round(c + pv, 2)
+            parts[n] = {"cash": round(c, 2), "positions": round(accounts[n] - round(c, 2), 2)}
     except Exception as e:
         log(f"! subaccount read failed: {e!r}")
         return None
     return {"equity": round(sum(accounts.values()), 2), "accounts": accounts,
-            "moves": moves, "moves_by": moves_by}
+            "parts": parts, "cash_by": cash_by, "moves": moves, "moves_by": moves_by}
 
 
 def estimate_unpaid_rewards(client, now_utc):
@@ -653,8 +727,9 @@ def replay_day(start, fills, settlements, end, ev_of):
 
 
 def fetch_market_info(client, tickers):
-    """ticker -> {"event": ..., "yes_bid": $, "yes_ask": $, "last": $} in
-    chunks. Missing tickers just aren't in the result."""
+    """ticker -> {"event": ..., "yes_bid": $, "yes_ask": $, "last": $,
+    "shard": exchange_index} in chunks. Missing tickers just aren't in the
+    result."""
     info = {}
     tickers = sorted(set(tickers))
     for i in range(0, len(tickers), 50):
@@ -670,6 +745,7 @@ def fetch_market_info(client, tickers):
                 "yes_bid": _f(m.get("yes_bid_dollars")),
                 "yes_ask": _f(m.get("yes_ask_dollars")),
                 "last": _f(m.get("last_price_dollars")),
+                "shard": m.get("exchange_index"),
             }
     return info
 
@@ -1097,6 +1173,11 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
     equity_kalshi = round(cash + kalshi_pv, 2)
     account_value = round(equity_kalshi + (perps_equity or 0.0)
                           + (subs_equity or 0.0), 2)
+    # the main account shard by shard (cash + open positions), tying to the
+    # cash and Kalshi's portfolio_value: the ladder under the headline
+    shards = shard_split(bal, cash, kalshi_pv, (subs or {}).get("cash_by"), mkt_pos,
+                         mark_info, lasts, refunds,
+                         lambda tk: tk_event.get(tk) or event_from_ticker(tk))
     unpaid = estimate_unpaid_rewards(client, now_utc) if with_unpaid else None
 
     # Total profit (Jack 2026-10-04: "at the top also show total profit,
@@ -1125,6 +1206,7 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
                 "subs": None if subs is None else {
                     str(n): v for n, v in subs["accounts"].items()},
                 "account_value": account_value,
+                "shards": shards,
                 # every ticker carries its last trade from here on (MARK_BASIS)
                 "lasts_recorded": True, "mark_basis": mark_basis,
                 "refunds_recorded": True,            # events carry "refund"
@@ -1253,7 +1335,7 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
             "collateral_returned": collat,
             "collateral_d": (None if (prior or {}).get("collateral_returned") is None
                              else round(collat - _f(prior["collateral_returned"]), 2)),
-            "account_value": account_value,
+            "account_value": account_value, "shards": shards,
             "unpaid": unpaid, "deposited": deposited, "withdrawn": withdrawn,
             "total_profit": total_profit, "transfers": transfers,
             "rows": rows, "snapshot": snapshot, "prior": prior,
@@ -2829,6 +2911,51 @@ def _utc_ts(s):
         return None
 
 
+def account_ladder(pf):
+    """The account value built up from the shards (Jack 2026-11-06: "make
+    sure to include how much $ is in each shard and how it ladders to the
+    total account value"): [{"k", "lbl", "cash", "pos", "total"}], cash /
+    pos None where a line has no split. k = "shard" (the main account's
+    shards 0-3), "main" (= their sum: cash + Kalshi's valuation), "perps",
+    "app" (= the Kalshi app's figure; only beside subaccounts), "sub" (each
+    numbered subaccount, API-only) and "value" (= the account value). The
+    email and the IMM dashboard's account card both render it. None when
+    the shard split did not read."""
+    sh = pf.get("shards")
+    if not sh:
+        return None
+    rows = [{"k": "shard", "lbl": f"Shard {r['shard']} · {r['name']}", "cash": r["cash"],
+             "pos": r["positions"], "total": r["total"]} for r in sh["rows"]]
+    cash, kpv = pf["cash"], pf["kalshi_positions_value"]
+    rows.append({"k": "main", "lbl": "Main account", "cash": cash, "pos": kpv,
+                 "total": pf["equity_kalshi"]})
+    perps_eq, perps = pf.get("perps_equity"), pf.get("perps")
+    if perps_eq is not None:
+        pc = None if perps is None or pf.get("perps_stale") else perps.get("settled_funds")
+        rows.append({"k": "perps", "lbl": "Perpetuals" + (" (yesterday's value)" if pf.get("perps_stale") else ""),
+                     "cash": pc, "pos": None if pc is None else round(perps_eq - pc, 2),
+                     "total": perps_eq})
+    subs_eq, subs = pf.get("subs_equity"), pf.get("subs") or {}
+    if subs_eq is not None:
+        rows.append({"k": "app", "lbl": "Kalshi app", "cash": None, "pos": None,
+                     "total": round(pf["equity_kalshi"] + (perps_eq or 0.0), 2)})
+        if subs.get("accounts") and not pf.get("subs_stale"):
+            parts, cash_by = subs.get("parts") or {}, subs.get("cash_by") or {}
+            for n, v in sorted(subs["accounts"].items()):
+                on = sorted(int(k) for k, c in (cash_by.get(n) or {}).items() if abs(_f(c)) >= 0.005)
+                lbl = (f"Subaccount {n}" + (f" · {SUBACCOUNT_NAMES[n]}" if n in SUBACCOUNT_NAMES else "")
+                       + (" (shard " + ", ".join(map(str, on)) + ")" if on else ""))
+                pt = parts.get(n) or {}
+                rows.append({"k": "sub", "lbl": lbl, "cash": pt.get("cash"),
+                             "pos": pt.get("positions"), "total": v})
+        else:
+            rows.append({"k": "sub", "lbl": "Subaccounts (yesterday's value)", "cash": None,
+                         "pos": None, "total": subs_eq})
+    rows.append({"k": "value", "lbl": "Account value", "cash": None, "pos": None,
+                 "total": pf.get("account_value")})
+    return rows
+
+
 def account_summary(pf, split) -> dict:
     """The IMM dashboard's account card, JSON-ready: the account value and
     its parts, the Kalshi app's figure, total profit, and day_split's day by
@@ -2847,7 +2974,67 @@ def account_summary(pf, split) -> dict:
             "bots": [[b, tot, [[k, v] for k, v in ps]] for b, tot, ps in split["by_bot"] or []],
             "resid": split["pricing"], "resid_lbl": split["px_lbl"],
             "transfers": split["transfers"], "moves": split["moves"],
-            "late": split["late"]}
+            "late": split["late"], "ladder": account_ladder(pf)}
+
+
+LADDER_SIGN = {"shard": "", "main": "=", "perps": "+", "app": "=", "sub": "+", "value": "="}
+LADDER_TITLE = "Account value by shard"
+LADDER_NOTE = "cash + open positions at Kalshi's valuation"
+LADDER_RESID_NOTE = 5.0      # say so when this much of Kalshi's valuation sits in shard 0 unplaced
+
+
+def _ladder_resid(pf) -> str:
+    r = _f((pf.get("shards") or {}).get("resid"))
+    return ("" if abs(r) < LADDER_RESID_NOTE else
+            f"Shard 0's positions include {_signed_usd(r)} of Kalshi's valuation "
+            f"not matched to a market (a market with no trade on record).")
+
+
+def ladder_text(pf) -> list:
+    """account_ladder as plain-text lines ([] without a shard split)."""
+    rows = account_ladder(pf)
+    if not rows:
+        return []
+    m = lambda v: "" if v is None else f"{v:,.2f}"
+    out = [f"{LADDER_TITLE} ({LADDER_NOTE}):",
+           f"  {'':44s} {'CASH':>11s}   {'POSITIONS':>11s}   {'TOTAL':>11s}"]
+    for r in rows:
+        sign = LADDER_SIGN.get(r["k"], "")
+        lbl = (f"{sign} " if sign else "    ") + r["lbl"]
+        split = r["cash"] is not None and r["pos"] is not None
+        out.append(f"  {lbl[:44]:44s} {m(r['cash']):>11s} {'+' if split else ' '} "
+                   f"{m(r['pos']):>11s} {'=' if split else ' '} {m(r['total']):>11s}")
+    note = _ladder_resid(pf)
+    if note:
+        out.append(f"  ({note})")
+    return out
+
+
+def ladder_html(pf) -> str:
+    """account_ladder as the email's table ("" without a shard split)."""
+    rows = account_ladder(pf)
+    if not rows:
+        return ""
+    usd = lambda v: "" if v is None else f"{v:,.2f}"
+    h = [f'<div style="font-size:15px;font-weight:600;margin:10px 0 4px">{LADDER_TITLE} '
+         f'<span style="color:{C_MUTED};font-weight:400;font-size:13px">{_esc(LADDER_NOTE)}</span></div>',
+         '<table style="border-collapse:collapse;font-size:13px;margin-bottom:6px">',
+         f'<tr style="background:#f0f0f0;font-weight:600"><td style="{TDL}"></td>'
+         f'<td style="{TD}">Cash $</td><td style="{TD}">Open positions $</td>'
+         f'<td style="{TD}">Total $</td></tr>']
+    for r in rows:
+        k, sign = r["k"], LADDER_SIGN.get(r["k"], "")
+        sub = k in ("main", "app", "value")
+        style = (' style="background:#e8e8e4;font-weight:700"' if k == "value" else
+                 ' style="background:#f6f6f4;font-weight:600"' if sub else "")
+        lbl = (f'{sign}&nbsp;' if sign else '&nbsp;&nbsp;&nbsp;') + _esc(r["lbl"])
+        h.append(f'<tr{style}><td style="{TDL}">{lbl}</td><td style="{TD}">{usd(r["cash"])}</td>'
+                 f'<td style="{TD}">{usd(r["pos"])}</td><td style="{TD}">{usd(r["total"])}</td></tr>')
+    h.append('</table>')
+    note = _ladder_resid(pf)
+    if note:
+        h.append(f'<div style="color:{C_MUTED};font-size:12px;margin-bottom:6px">{_esc(note)}</div>')
+    return "".join(h)
 
 
 DAY_BY_BOT_PATH = os.path.join(LOG_DIR, "day_by_bot.json")
@@ -3011,6 +3198,11 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
         lines.append(f"vs yesterday: {d_day:+,.2f}  =  "
                      + "  +  ".join(f"{k} {v:+,.2f}" for k, v in day_parts)
                      + day_tail + excl_txt)
+    # the account value shard by shard (Jack 2026-11-06)
+    ladder = ladder_text(pf)
+    if ladder:
+        lines.append("")
+        lines += ladder
     if by_bot:
         lines.append("")
         lines.append(f"The day by bot (7am yesterday -> 7am today, at {at}):")
@@ -3126,6 +3318,10 @@ def build_email(pf, history, chart_ok: bool, imm=None, advice=None, imm_events=N
                 + ("" if not excl else
                    f' <span style="color:{C_MUTED}">{excl_txt.strip()}</span>'))
              + '</div>')
+    # the account value shard by shard, under the headline (Jack 2026-11-06:
+    # "make sure to include how much $ is in each shard and how it ladders
+    # to the total account value")
+    h.append(ladder_html(pf))
     if by_bot:
         h.append(f'<div style="font-size:15px;font-weight:600;margin:10px 0 4px">'
                  f'The day by bot <span style="color:{C_MUTED};font-weight:400;'

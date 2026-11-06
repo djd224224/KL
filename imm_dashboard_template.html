@@ -133,9 +133,9 @@ button { font: inherit; color: inherit; }
 .bar-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* the whole account, top right (Jack 2026-10-29: "i expect it to be at the top right of the command center in a small box") */
 .acctbox {
-  flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; padding: 5px 10px;
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 0; margin-bottom: 8px; padding: 3px 10px;
   border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
-  color: var(--ink); font-size: 12.5px; line-height: 1.35; white-space: nowrap;
+  color: var(--ink); font-size: 12.5px; line-height: 1.3; white-space: nowrap;
 }
 .acctbox[hidden] { display: none; }
 .acctbox:hover { text-decoration: none; border-color: var(--ink-2); }
@@ -537,7 +537,8 @@ footer { color: var(--muted); font-size: 12px; }
   <section id="health">
     <div class="shead"><h2>Bot health</h2><span class="note">The whole account and each bot's net, then heartbeat, cycle cadence, restarts, data freshness and the morning email lineup.</span></div>
     <div class="grid2">
-      <div><div class="sub-h">Account<span class="note" id="acctNote"></span></div><div class="statgrid" id="acctStats"></div></div>
+      <div><div class="sub-h">Account<span class="note" id="acctNote"></span></div><div class="statgrid" id="acctStats"></div>
+        <div class="sub-h">Account value by shard<span class="note">cash + open positions at Kalshi's valuation</span></div><div class="tw" id="acctShards"></div></div>
       <div><div class="sub-h">Net by bot<span class="note">split as the 7am portfolio email splits the day</span></div><div class="tw" id="acctBots"></div></div>
     </div>
     <div class="statgrid" id="healthStats"></div>
@@ -548,7 +549,7 @@ footer { color: var(--muted); font-size: 12px; }
     <div class="grid2">
       <div><div class="sub-h">Data freshness</div><div class="tw" id="sinks"></div></div>
       <div><div class="sub-h">How the numbers are built</div>
-        <p class="explain"><b>Account</b> is the 7am portfolio email's read of the whole Kalshi account (every bot and hand trade), made live each build: account value = cash + Kalshi's valuation of the open positions + the perpetuals account + the numbered subaccounts (API-only, so the Kalshi app shows the account less them); total profit = account value less every deposit, plus every withdrawal. <b>Net by bot</b> splits the change since the newest 7am snapshot as the email does: each event's trading at Kalshi's last trade goes to the bot that holds it (the IMM when this page's book has it, else crypto by asset, weather for the temperature dailies, else other), plus each bot's own cash lines: reward credits to the IMM, perps to crypto, subaccount 1 (NFL sniper) to other and 2 (hourly temps) to weather. <i>Kalshi</i> is the gap between Kalshi's valuation and the rows', no bot's. So the IMM line is cash and last trades, not this page's modeled rewards and mid marks. The email columns are each morning's email, 7am to 7am.</p>
+        <p class="explain"><b>Account</b> is the 7am portfolio email's read of the whole Kalshi account (every bot and hand trade), made live each build: account value = cash + Kalshi's valuation of the open positions + the perpetuals account + the numbered subaccounts (API-only, so the Kalshi app shows the account less them); total profit = account value less every deposit, plus every withdrawal. <b>Account value by shard</b>: Kalshi holds cash per exchange shard (0 default, 1 combos, 2 crypto &amp; commodities, 3 tennis, baseball, basketball), and each shard's open positions are its markets' at Kalshi's valuation; the shards add up to the main account, the perps make the Kalshi app's figure, and the subaccounts the account value. <b>Net by bot</b> splits the change since the newest 7am snapshot as the email does: each event's trading at Kalshi's last trade goes to the bot that holds it (the IMM when this page's book has it, else crypto by asset, weather for the temperature dailies, else other), plus each bot's own cash lines: reward credits to the IMM, perps to crypto, subaccount 1 (NFL sniper) to other and 2 (hourly temps) to weather. <i>Kalshi</i> is the gap between Kalshi's valuation and the rows', no bot's. So the IMM line is cash and last trades, not this page's modeled rewards and mid marks. The email columns are each morning's email, 7am to 7am.</p>
         <p class="explain"><b>Modeled rewards</b> integrate the bot's own reward estimate (est_frac × pool $/day) over every gap between full cycles, capped at 15 minutes, from the cycle logs. It is a model and sits before Kalshi's $1-per-market-per-period floor; credits land 1–2 days after a period ends and show up in the history as <i>credited</i>.</p>
         <p class="explain"><b>Trading P&amp;L</b> is mark-to-market on the bot's own book: realized in the window (closing fills and settlements) plus the change in open positions valued at mid (the last trade when a book is empty), from the 5-minute position snapshots. Exits the bot does not book itself are valued at Kalshi's actual settlement: scalar settlements (sports ladders and escalators, which the bot logs as "manual offsets") and positions that leave its book with no record. Only an exit Kalshi has not settled counts as a transfer at its last mark. Audited 9/29 against a replay of Kalshi's own fills and settlement results: equal to the cent for 9/16, 9/22, 9/27, 9/28, 9/29 and the 7-day window.</p>
         <p class="explain"><b>Net</b> is the two added together. Days are ET calendar days; the bot's own halt counter rolls at 5am CT and is shown under Risk. Kalshi fees are not deducted; the IMM digest's fee total runs $0–0.60 a day.</p>
@@ -2810,6 +2811,25 @@ function acctSum(list, k) {
   if (!cs.length) return null;
   return { v: cs.reduce((t, x) => t + x[1].v, 0), tip: cs.map((x) => day(x[0]) + " " + fmtUSD(x[1].v, { sign: true, dp: 2 })).join("\n") };
 }
+const LADDER_SIGN = { shard: "", main: "=", perps: "+", app: "=", sub: "+", value: "=" };
+function shardNum(r) {
+  // "Shard 2 · Crypto & commodities" -> "2"
+  return (r.lbl.match(/^Shard (\d+)/) || [])[1] || "?";
+}
+function renderShards(S) {
+  // the account value built up from the shards, as the 7am email shows it:
+  // shards -> main account (+ perps) -> Kalshi app (+ subaccounts) -> account value
+  const host = $("acctShards"), rows = S.ladder || [];
+  if (!rows.length) { host.innerHTML = '<div class="small muted">No shard split in this read yet.</div>'; return; }
+  const usd = (v) => v == null ? "" : fmtUSD(v, { dp: 2 });
+  let h = '<table class="t"><thead><tr><th></th><th class="num">Cash</th><th class="num">Open positions</th><th class="num">Total</th></tr></thead><tbody>';
+  for (const r of rows) {
+    const sum = r.k === "main" || r.k === "app" || r.k === "value", sign = LADDER_SIGN[r.k] || "";
+    h += "<tr" + (sum ? ' class="tot"' : "") + "><td>" + (sign ? esc(sign) + " " : '<span style="padding-left:1em"></span>') + esc(r.lbl) + '</td><td class="num">' + usd(r.cash) +
+      '</td><td class="num">' + usd(r.pos) + '</td><td class="num">' + usd(r.total) + "</td></tr>";
+  }
+  host.innerHTML = h + "</tbody></table>";
+}
 function renderAcctBox(S, L, why) {
   // the small box at the top right: the account, its move since 7am and the
   // three bots besides the IMM (the IMM, the Kalshi line and the email days
@@ -2818,15 +2838,22 @@ function renderAcctBox(S, L, why) {
   const usd = (c) => c ? '<span class="' + cls(c.v, 0.5) + '">' + fmtUSD(c.v, { sign: true, dp: 0 }) + "</span>" : '<span class="muted">—</span>';
   const dd = acctCell(S, "day");
   const box = $("acctBox");
+  // each shard's total, short; the tooltip and the Health tab carry the whole
+  // ladder (Jack 2026-11-06: "include how much $ is in each shard and how it ladders to the total account value")
+  const lad = S.ladder || [], shards = lad.filter((r) => r.k === "shard");
+  const k$ = (v) => Math.abs(v) >= 1000 ? fmtUSD(v / 1000, { dp: 1 }) + "k" : fmtUSD(v, { dp: 0 });
   box.innerHTML = '<div><span class="abk">Account</span> <b class="abv">' + fmtUSD(S.value, { dp: 0 }) + "</b>" +
     (dd ? " " + usd(dd) + ' <span class="abk">' + esc(at) + "</span>" : "") + "</div>" +
-    "<div>" + ["Crypto", "Weather", "Other"].map((b) => b + " " + usd(acctCell(S, b))).join(" · ") + "</div>";
+    "<div>" + ["Crypto", "Weather", "Other"].map((b) => b + " " + usd(acctCell(S, b))).join(" · ") + "</div>" +
+    (shards.length ? '<div><span class="abk">Shards</span> ' + shards.map((r) => shardNum(r) + " " + k$(r.total)).join(" · ") + "</div>" : "");
   const lines = ACCT_ROWS.map(([k, lbl]) => [lbl, acctCell(S, k)]).filter((x) => x[1]);
   box.title = "Account value " + fmtUSD(S.value, { dp: 2 }) + (S.app != null ? " (Kalshi app " + fmtUSD(S.app, { dp: 2 }) + ", no subaccounts)" : "") +
     " · total profit " + fmtUSD(S.profit, { sign: true }) + "\n" + (L ? "Since " + dtET(L.since) : at) + ": " +
     lines.map((x) => x[0] + " " + fmtUSD(x[1].v, { sign: true, dp: 2 })).join(", ") +
     (dd ? " = " + fmtUSD(dd.v, { sign: true, dp: 2 }) : "") + "\n" + (L ? "read " + dtET(L.until) : "the 7am email's") +
-    (why ? " · " + why : "") + "\nClick for the full split (Health)";
+    (why ? " · " + why : "") +
+    (lad.length ? "\n\nBy shard (cash + open positions):\n" + lad.map((r) => (LADDER_SIGN[r.k] || " ") + " " + r.lbl + "  " + fmtUSD(r.total, { dp: 2 })).join("\n") : "") +
+    "\nClick for the full split (Health)";
   box.hidden = false;
 }
 function renderAccount() {
@@ -2836,6 +2863,7 @@ function renderAccount() {
   if (!S) {
     $("acctStats").innerHTML = '<div class="small muted">No account read yet' + (why ? ": " + esc(why) : "") + "</div>";
     $("acctBots").innerHTML = "";
+    $("acctShards").innerHTML = "";
     $("acctNote").textContent = "";
     $("acctBox").hidden = true;
     return;
@@ -2851,6 +2879,7 @@ function renderAccount() {
     { k: "Account value", v: fmtUSD(S.value), s: S.app != null ? "Kalshi app " + fmtUSD(S.app) + ": no subaccounts" : "cash + positions + perps", tip: made },
     { k: "Total profit", v: fmtUSD(S.profit, { sign: true }), s: "all time, deposits left out", c: cls(S.profit || 0) },
   ];
+  renderShards(S);
   $("acctStats").innerHTML = stats.map((s) => '<div class="card stat" title="' + esc(s.tip || "") + '"><div class="k">' + esc(s.k) + '</div><div class="v ' + (s.c || "") + '">' + esc(s.v) + '</div><div class="s">' + esc(s.s) + "</div></div>").join("");
   const cell = (c) => c ? '<span title="' + esc(c.tip) + '">' + money(c.v) + "</span>" : '<span class="muted">—</span>';
   const wk = E.slice(-7);
