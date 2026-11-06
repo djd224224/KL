@@ -1035,7 +1035,7 @@ def render(s: dict) -> str:
     floor = _f(cfg.get('confirm_edge_floor'), 0) or 0
     setting = (f"markup {mu * 100:.3g}%" + (f" +{step * 100:.3g}%/leg over 2" if step else "")
                + (f", all-NFL {cut * 100:.3g} pts less" if cut else "")
-               + (f", last look &ge; {floor * 100:.3g}%" if floor else "")
+               + (f", last look &ge; {floor * 100:.3g}% after fees" if floor else "")
                + f" &middot; {cfg.get('min_legs', '?')}&ndash;"
                f"{cfg.get('max_legs', '?')} legs &middot; games {html.escape(games)} &middot; "
                f"lead {cfg.get('min_lead_min', '?')} min &middot; "

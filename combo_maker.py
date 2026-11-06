@@ -74,8 +74,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import kalshi_ws  # noqa: E402
 from combo_rfq_logger import WS_PATH, WS_URL, DayWriter, iso_ms, legs_of  # noqa: E402
-from combo_rfq_score import (DEFAULT_GRID, MAIN_SERIES, grid_up, league_of, maker_fee,  # noqa: E402
-                             sport_group)
+from combo_rfq_score import (DEFAULT_GRID, MAIN_SERIES, MAKER_FEE_RATE, grid_up, league_of,  # noqa: E402
+                             maker_fee, sport_group)
 
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
@@ -137,11 +137,15 @@ class Config:
         # down to 0% instead of 2%. 0 here, so a bare Config (the tests, the shadow
         # scorer) prices every parlay alike; the CLI's default is 0.02
         self.nfl_markup_cut = 0.0
-        # LAST-LOOK FLOOR (Jack 2026-11-06: "i want last look to have at least 1%
-        # edge"): whatever half the markup less the all-NFL cut comes to, the last
-        # look asks at least this much over the fair now. It binds on all-NFL 2-3
-        # leg parlays (0% / 0.5% -> 1%); every other parlay asks 2%+ at a 4% markup
-        self.confirm_edge_floor = 0.01
+        # LAST-LOOK FLOOR, AFTER FEES (Jack 2026-11-06: "i want last look to have at
+        # least 1% edge", then "i mean 1% edge, after fees"): the last look confirms
+        # only if our price less the maker fee (0.035 p(1-p) a contract; none on an
+        # all-NFL parlay) is at least this much over the fair now, on top of the
+        # half-markup bar. A quote whose markup leaves less goes out at the lowest
+        # grid price that clears it (2 legs at 5-15c fairs: one tick up), or every
+        # accept on it would be declined. 0 here, so a bare Config confirms as before
+        # (the tests); the CLI's default is 0.01
+        self.confirm_edge_floor = 0.0
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -228,10 +232,10 @@ class Config:
     def confirm_edge_for(self, n_legs: int, legs=None) -> float:
         """The last look's minimum edge on an n-leg parlay: confirm_min_edge at 2
         legs, + half the step for each leg over 2 (half the markup, as before);
-        the whole all-NFL cut less when every one of `legs` is NFL; never under
-        confirm_edge_floor (1%)."""
+        the whole all-NFL cut less when every one of `legs` is NFL (floor 0). The
+        floor after the fee is net_edge's, at the last look."""
         e = self.confirm_min_edge + self.markup_per_leg / 2.0 * max(0, int(n_legs) - 2)
-        return max(self.confirm_edge_floor, e - self.nfl_cut(legs))
+        return max(0.0, e - self.nfl_cut(legs))
 
     def fee_free(self, legs) -> bool:
         """Every leg an NFL market (main lines on different games by the
@@ -403,6 +407,34 @@ def quote_price(fair: float, cfg: Config, grid=None, n_legs: int = 2, legs=None)
     return ask, round(1.0 - ask, 4)
 
 
+def fee_per_contract(ask: float, legs, cfg: Config) -> float:
+    """The maker fee one contract at our price pays: 0.035 p(1-p) (Kalshi bills it
+    to $0.0001), none on an all-NFL parlay."""
+    return 0.0 if cfg.fee_free(legs) else maker_fee(1.0, ask)
+
+
+def net_edge(ask: float, fair: float, legs, cfg: Config) -> float:
+    """Our edge after the maker fee, over the fair: (price - fee) / fair - 1."""
+    return (ask - fee_per_contract(ask, legs, cfg)) / fair - 1.0 if fair > 0 else 0.0
+
+
+def net_floor_price(fair: float, legs, cfg: Config, grid=None) -> float:
+    """The lowest grid price that keeps cfg.confirm_edge_floor over the fair after
+    the fee: p - r p (1 - p) >= fair x (1 + floor), r the maker fee rate."""
+    t = fair * (1.0 + cfg.confirm_edge_floor)
+    if cfg.fee_free(legs):
+        p = t
+    else:
+        r = MAKER_FEE_RATE
+        p = (-(1.0 - r) + math.sqrt((1.0 - r) ** 2 + 4.0 * r * t)) / (2.0 * r)
+    p = grid_up(p, grid or DEFAULT_GRID)
+    for _ in range(5):                                  # float dust at a grid boundary: a step up
+        if net_edge(p, fair, legs, cfg) >= cfg.confirm_edge_floor - 1e-9:
+            break
+        p = grid_up(p + 1e-7, grid or DEFAULT_GRID)
+    return p
+
+
 def contracts_of(rfq: dict, ask: float):
     """Contracts the RFQ would fill at our price: a target-cost RFQ buys
     target / price; a contract-sized one its contracts."""
@@ -475,6 +507,8 @@ def confirm_check(q: dict, markets: dict, now_s: float, cfg: Config, book: Book,
         return why, fair
     if q["ask"] < fair * (1.0 + cfg.confirm_edge_for(len(q["legs"]), q["legs"])) - 1e-9:
         return "edge_gone", fair
+    if cfg.confirm_edge_floor and net_edge(q["ask"], fair, q["legs"], cfg) < cfg.confirm_edge_floor - 1e-9:
+        return "net_edge", fair                         # under the floor over the fair after the fee
     return caps_check(book, q["games"], contracts, q["ask"], cfg, et_day(now_s)), fair
 
 
@@ -576,7 +610,7 @@ class Maker:
     def _reset_stats(self):
         with self.lock:
             self.st = {"rfq": 0, "pre_ok": 0, "priced": 0, "quoted": 0, "dry": 0, "accepted": 0,
-                       "confirmed": 0, "declined": 0, "executed": 0, "errors": 0, "why": {}}
+                       "confirmed": 0, "declined": 0, "executed": 0, "errors": 0, "raised": 0, "why": {}}
             self.st_since = self.clock()
 
     def _why(self, w):
@@ -730,6 +764,11 @@ class Maker:
             return
         self.st["priced"] += 1
         ask, no_bid = quote_price(fair, self.cfg, n_legs=len(legs), legs=legs)
+        raised = None
+        if self.cfg.confirm_edge_floor:                 # the markup leaves under the floor after the fee:
+            floor_px = net_floor_price(fair, legs, self.cfg)    # up to the lowest price that clears it
+            if floor_px > ask + 1e-9:
+                raised, ask, no_bid = ask, floor_px, round(1.0 - floor_px, 4)
         cts = contracts_of(rfq, ask)
         games = [game_of(l[0]) for l in legs]
         why = caps_check(self.book, games, cts, ask, self.cfg, et_day(now))
@@ -739,6 +778,9 @@ class Maker:
         q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs), legs), 4),
                  contracts=cts, games=games, at=now,
                  lag_ms=None if rfq["rfq_ms"] is None else now * 1000 - rfq["rfq_ms"], read_ms=read_ms)
+        if raised is not None:
+            q["raised_from"] = raised
+            self.st["raised"] += 1
         if not self.cfg.live:
             self.st["dry"] += 1
             self.sent.append(now)                       # DRY keeps LIVE's quote rate
@@ -1074,7 +1116,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
         + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
         + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
-        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half, at least {cfg.confirm_edge_floor * 100:.3g}%)"
+        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half and >= {cfg.confirm_edge_floor * 100:.3g}% after the fee)"
         + (f", all-NFL {cfg.nfl_markup_cut * 100:.3g} pts less" if cfg.nfl_markup_cut else "")
         + f", lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
@@ -1170,10 +1212,11 @@ def main(argv=None) -> int:
                          "last look (0.02: 2 legs quoted at 2%% instead of 4%%, confirmed down to 0%% "
                          "instead of 2%%; 0 = no cut). Jack 2026-11-06: \"NFL parlays require 2c less "
                          "edge because there are no maker fees\"")
-    ap.add_argument("--confirm-edge-floor", type=float, default=d.confirm_edge_floor,
-                    help="the last look never asks less than this over the fair now (0.01: all-NFL 2-leg "
-                         "parlays confirm at 1%%+, not 0%%). Jack 2026-11-06: \"i want last look to have "
-                         "at least 1%% edge\"")
+    ap.add_argument("--confirm-edge-floor", type=float, default=0.01,
+                    help="the last look confirms only with this much edge over the fair AFTER the maker fee "
+                         "(0.035 p(1-p); none on all-NFL parlays); a quote whose markup leaves less goes out "
+                         "at the lowest price that clears it (0 = off). Jack 2026-11-06: \"i mean 1%% edge, "
+                         "after fees\"")
     ap.add_argument("--max-payout", type=float, default=d.max_payout)
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
     ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,

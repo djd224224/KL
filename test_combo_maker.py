@@ -748,7 +748,7 @@ class NflCut(unittest.TestCase):
     N1, N2, N3 = NflOnly.N1, NflOnly.N2, NflOnly.N3
 
     def cfg(self, **kw):
-        return cm.Config(markup=0.04, markup_per_leg=0.01, nfl_markup_cut=0.02, **kw)
+        return cm.Config(markup=0.04, markup_per_leg=0.01, nfl_markup_cut=0.02, confirm_edge_floor=0.01, **kw)
 
     def test_two_points_off_at_the_quote_and_at_the_last_look(self):
         cfg = self.cfg()
@@ -758,14 +758,11 @@ class NflCut(unittest.TestCase):
         self.assertAlmostEqual(cfg.markup_for(3, nfl3), 0.03)
         self.assertAlmostEqual(cfg.markup_for(2, mixed), 0.04)
         self.assertAlmostEqual(cfg.markup_for(2), 0.04)                       # no legs given: as before
-        # Jack 2026-11-06: "i want last look to have at least 1% edge"
-        self.assertAlmostEqual(cfg.confirm_edge_for(2, nfl), 0.01)            # 2% - 2% = 0 -> the 1% floor
-        self.assertAlmostEqual(cfg.confirm_edge_for(3, nfl3), 0.01)           # 0.5% -> 1%
+        self.assertAlmostEqual(cfg.confirm_edge_for(2, nfl), 0.0)             # the half-markup bar: 2% - 2%
+        self.assertAlmostEqual(cfg.confirm_edge_for(3, nfl3), 0.005)
         nfl5 = nfl3 + [["KXNFLGAME-26NOV09NYGPHI-NYG", "yes"], ["KXNFLGAME-26NOV09GBCHI-GB", "no"]]
-        self.assertAlmostEqual(cfg.confirm_edge_for(5, nfl5), 0.015)          # 3.5% - 2%: over the floor
-        bare = self.cfg(confirm_edge_floor=0.0)
-        self.assertAlmostEqual(bare.confirm_edge_for(2, nfl), 0.0)
-        self.assertAlmostEqual(bare.confirm_edge_for(3, nfl3), 0.005)
+        self.assertAlmostEqual(cfg.confirm_edge_for(5, nfl5), 0.015)
+        self.assertAlmostEqual(cm.net_edge(0.306, 0.30, nfl, cfg), 0.02)      # no fee: the 1% floor is gross
         self.assertAlmostEqual(cfg.confirm_edge_for(2, mixed), 0.02)
         self.assertEqual(cm.quote_price(0.30, cfg, n_legs=2, legs=nfl), (0.306, 0.694))
         self.assertEqual(cm.quote_price(0.30, cfg, n_legs=2, legs=mixed), (0.312, 0.688))
@@ -794,7 +791,7 @@ class NflCut(unittest.TestCase):
         self.assertEqual(len(c.puts), 1)                                     # 0.306 >= 0.302 x 1.01 = 0.30502
         c, w = self.run_one(nfl, {self.N1: (0.60, 0.62)})                    # N1 -> 0.61: fair 0.305
         self.assertEqual(c.puts, [])                                         # 0.306 < 0.305 x 1.01: the floor
-        self.assertEqual(w.k("decline")[0]["why"], "edge_gone")
+        self.assertEqual(w.k("decline")[0]["why"], "net_edge")
 
     def test_a_parlay_with_any_other_leg_keeps_the_markup(self):
         c, w = self.run_one([[self.N1, "yes"], [L1, "yes"]], {})
@@ -808,6 +805,76 @@ class NflCut(unittest.TestCase):
                     ["--allow-thin", "--markup", "0.04", "--confirm-edge-floor", "0.02"]):    # = 4% - 2%
             with self.assertRaises(SystemExit):
                 cm.main(bad)
+
+
+class FeeFloor(unittest.TestCase):
+    """Jack 2026-11-06: "i want last look to have at least 1% edge" -- "i mean 1% edge, after fees"."""
+    N1, N2 = NflOnly.N1, NflOnly.N2
+
+    def cfg(self, **kw):
+        return cm.Config(markup=0.04, markup_per_leg=0.01, nfl_markup_cut=0.02, confirm_edge_floor=0.01, **kw)
+
+    def test_the_edge_after_the_fee(self):
+        cfg, two, nfl = self.cfg(), [[L1, "yes"], [L2, "yes"]], [[self.N1, "yes"], [self.N2, "yes"]]
+        self.assertAlmostEqual(cm.fee_per_contract(0.30, two, cfg), 0.035 * 0.30 * 0.70)
+        self.assertEqual(cm.fee_per_contract(0.30, nfl, cfg), 0.0)
+        self.assertAlmostEqual(cm.net_edge(0.312, 0.30, two, cfg), (0.312 - 0.035 * 0.312 * 0.688) / 0.30 - 1)
+        # the lowest price that keeps 1% after the fee: fair 10c -> 10.5c (10.4c leaves 0.74%); all-NFL 10.1c
+        self.assertEqual(cm.net_floor_price(0.10, two, cfg), 0.105)
+        self.assertEqual(cm.net_floor_price(0.10, nfl, cfg), 0.101)
+        self.assertLess(cm.net_edge(0.104, 0.10, two, cfg), 0.01)
+        self.assertGreaterEqual(cm.net_edge(0.105, 0.10, two, cfg), 0.01)
+        for f in (0.02, 0.031, 0.077, 0.15, 0.2999, 0.40):                      # the lowest that clears
+            p = cm.net_floor_price(f, two, cfg)
+            self.assertGreaterEqual(cm.net_edge(p, f, two, cfg), 0.01 - 1e-9)
+            self.assertLess(cm.net_edge(p - 0.001, f, two, cfg), 0.01)
+
+    def maker(self, mk):
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, self.cfg(live=True, min_legs=2), w, cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        return c, w, m
+
+    def accept(self, c, m):
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": c.posts[0][1]["no_bid"]}})
+
+    def test_a_quote_the_last_look_would_refuse_goes_out_a_tick_up(self):
+        c, w, m = self.maker({L1: mkt(L1, 0.19, 0.21), L2: mkt(L2, 0.49, 0.51)})    # fair 0.20 x 0.50 = 0.10
+        m.handle(rfq_msg(legs=[[L1, "yes"], [L2, "yes"]]))
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.8950")                  # 10.5c, not the markup's 10.4c
+        q = w.k("quote")[0]
+        self.assertEqual((q["raised_from"], q["ask"], q["mu"]), (0.104, 0.105, 0.04))
+        self.accept(c, m)
+        self.assertEqual(len(c.puts), 1)                                     # the fair held: it confirms
+
+    def test_the_last_look_wants_1pct_after_the_fee(self):
+        c, w, m = self.maker(MK)                                             # fair 0.60 x 0.50 = 0.30
+        m.handle(rfq_msg(legs=[[L1, "yes"], [L2, "yes"]]))
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.6880")                  # 31.2c: 1.5% after the fee, kept
+        self.assertNotIn("raised_from", w.k("quote")[0])
+        c.mk[L1] = mkt(L1, 0.594, 0.614)                                     # fair 0.302: 0.312 clears the 2%
+        self.accept(c, m)                                                    # bar (0.3080) but not 1% net
+        self.assertEqual(c.puts, [])
+        self.assertEqual(w.k("decline")[0]["why"], "net_edge")
+
+    def test_all_nfl_pays_no_fee(self):
+        mk = {t: mkt(t, b, b + 0.02, start_in_h=60) for t, b in ((self.N1, 0.59), (self.N2, 0.49))}
+        c, w, m = self.maker(mk)
+        m.handle(rfq_msg(legs=[[self.N1, "yes"], [self.N2, "yes"]]))
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.6940")                  # 30.6c: 2%, no fee, not raised
+        self.assertNotIn("raised_from", w.k("quote")[0])
+        self.accept(c, m)
+        self.assertEqual(len(c.puts), 1)
+
+    def test_off_at_zero(self):
+        c, w, m = self.maker({L1: mkt(L1, 0.19, 0.21), L2: mkt(L2, 0.49, 0.51)})
+        m.cfg.confirm_edge_floor = 0.0
+        m.handle(rfq_msg(legs=[[L1, "yes"], [L2, "yes"]]))
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.8960")                  # the markup's 10.4c
 
 
 class GamesAndKnobs(unittest.TestCase):
