@@ -275,5 +275,20 @@ class History(unittest.TestCase):
         self.assertIn("Fills over time", h)
 
 
+class FillRate(unittest.TestCase):
+    def test_quotes_filled(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        s = cd.snapshot(d.name, d.name, NOW)
+        fr = s["fill_rate"]
+        # 2 quotes (from -1200), 1 accept; the executed ticket (-1199) counts, the settled one (-5000) is older
+        self.assertEqual((fr["quotes"], fr["accepted"], fr["filled"]), (2, 1, 1))
+        h = cd.render(s)
+        self.assertIn("Quotes filled", h)
+        self.assertIn("50.000%", h)
+        self.assertIn("1 in 2", h)
+
+
 if __name__ == "__main__":
     unittest.main()

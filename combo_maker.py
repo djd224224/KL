@@ -814,8 +814,9 @@ class Maker:
         = "unfilled", out of the caps and the P&L. An order that bought YES is
         the wrong direction: STOP, exit 5."""
         for t in self.book.tickets:
-            if t.get("status") not in ("confirmed", "executed") or t.get("fill_checked"):
-                continue
+            if t.get("status") not in ("confirmed", "executed") or (t.get("fill_checked") and t.get("px_checked")):
+                continue                                    # (fill_checked without px_checked: booked before
+                                                            # the fill price was read -- read it once)
             since = t.get("executed_at") or t.get("at") or now
             if now - since < FILL_CHECK_AFTER_S or now - t.get("fill_read_at", 0.0) < FILL_CHECK_EVERY_S:
                 continue
@@ -829,7 +830,7 @@ class Maker:
                     mine = [x for x in js.get("orders") or [] if x.get("ticker") == t["mt"]]
                     if not mine:
                         if now - (t.get("at") or now) >= NO_ORDER_AFTER_S:
-                            self._book_fill(t, 0.0, "no order on Kalshi", None)
+                            self._book_fill(t, 0.0, "no order on Kalshi", None, None)
                         continue
                     o = mine[0]
                     t["order_id"] = o.get("order_id")
@@ -845,10 +846,10 @@ class Maker:
                 raise SystemExit(5)
             fees = [_f(o.get(k)) for k in ("maker_fees_dollars", "taker_fees_dollars")]
             fee = sum(x for x in fees if x is not None) if any(x is not None for x in fees) else None
-            self._book_fill(t, filled, status, fee)
+            self._book_fill(t, filled, status, fee, o)
 
-    def _book_fill(self, t: dict, filled: float, why: str, fee) -> None:
-        t["fill_checked"] = True
+    def _book_fill(self, t: dict, filled: float, why: str, fee, o=None) -> None:
+        t["fill_checked"] = t["px_checked"] = True
         t.setdefault("contracts_quoted", t["contracts"])
         if filled <= 1e-9:
             t["status"], t["contracts"], t["fee_est"] = "unfilled", 0.0, 0.0
@@ -857,13 +858,26 @@ class Maker:
             log(f"! {t['mt']}: NOT filled ({why}): Kalshi has no fill, the ticket is dropped")
         else:
             t["contracts"] = filled
+            # Kalshi's price, not our quote's (11/06: 2 of 10 orders filled as the TAKER
+            # against a resting order, at a better NO price than quoted, taker fee): our
+            # YES-equivalent price = 1 - what the NO cost a contract
+            o = o or {}
+            mcost, tcost = (_f(o.get("maker_fill_cost_dollars"), 0.0) or 0.0,
+                            _f(o.get("taker_fill_cost_dollars"), 0.0) or 0.0)
+            if mcost + tcost > 0:
+                px = round(1.0 - (mcost + tcost) / filled, 6)
+                if abs(px - t["ask"]) > 1e-6:
+                    t.setdefault("ask_quoted", t["ask"])
+                    t["ask"] = px
+                t["taker_fill"] = tcost > 0
             if fee is None:                                 # no fee on the order: the table's
                 fee = 0.0 if self.cfg.fee_free(t["legs"]) else maker_fee(filled, t["ask"])
             t["fee_est"] = fee
             if t.get("status") != "executed":           # filled without a quote_executed message
                 t["status"], t["executed_at"] = "executed", self.clock()
             self.w.write({"k": "filled", "t": self.clock(), "mt": t["mt"], "order_id": t.get("order_id"),
-                          "contracts": filled, "quoted": t["contracts_quoted"], "fee": fee})
+                          "contracts": filled, "quoted": t["contracts_quoted"], "fee": fee, "ask": t["ask"],
+                          "ask_quoted": t.get("ask_quoted"), "taker": t.get("taker_fill")})
             log(f"fill check {t['mt']}: {filled:,.2f} of {t['contracts_quoted']:,.2f} filled, fee ${fee:,.4f}")
         self.book.save()
 

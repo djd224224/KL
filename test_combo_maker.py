@@ -580,6 +580,52 @@ class InPlay(unittest.TestCase):
         self.assertEqual(w.k("decline")[0]["why"], "moving")
 
 
+class FillPrice(unittest.TestCase):
+    """11/06: two orders filled as the taker at a better NO price than quoted."""
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.w = W()
+        self.c = FakeClient(MK)
+        self.book = cm.Book(os.path.join(self.d.name, "s.json"))
+        self.clock = [T0]
+        self.m = cm.Maker(self.c, cm.Config(live=True, markup_per_leg=0.0), self.w, self.book, self.d.name,
+                          clock=lambda: self.clock[0])
+
+    def test_a_taker_fill_at_a_better_price_is_booked_at_it(self):
+        self.m.handle(rfq_msg())
+        self.m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
+        self.m.handle({"type": "quote_executed", "msg": {"quote_id": "q1", "order_id": "o1"}})
+        self.c.orders["o1"] = {"order_id": "o1", "status": "executed", "side": "no", "action": "buy",
+                               "fill_count_fp": "17.47", "maker_fill_cost_dollars": "0.000000",
+                               "taker_fill_cost_dollars": f"{17.47 * 0.759:.6f}", "maker_fees_dollars": "0.000000",
+                               "taker_fees_dollars": "0.258300"}
+        self.clock[0] += 5
+        self.m.upkeep()
+        t = self.book.tickets[0]
+        self.assertAlmostEqual(t["ask"], 0.241, places=6)                    # 1 - 0.759, not the quoted 0.231
+        self.assertEqual((t["ask_quoted"], t["taker_fill"], t["fee_est"]), (0.231, True, 0.2583))
+        self.assertAlmostEqual(self.book.open_loss(), 17.47 * 0.759, places=6)
+
+    def test_tickets_checked_before_the_price_was_read_get_it_once(self):
+        old = {"quote_id": "qz", "mt": "KXMVECROSSCATEGORY-S2026Z-Z", "legs": LEGS, "games": ["g"], "ask": 0.293,
+               "contracts": 17.47, "status": "executed", "order_id": "oz", "day": "2026-11-05", "at": T0 - 600,
+               "executed_at": T0 - 599, "fee_est": 0.2583, "fill_checked": True, "dir_ok": True}
+        self.book.tickets.append(old)
+        self.c.orders["oz"] = {"order_id": "oz", "status": "executed", "side": "no", "action": "buy",
+                               "fill_count_fp": "17.47", "taker_fill_cost_dollars": f"{17.47 * 0.697:.6f}",
+                               "taker_fees_dollars": "0.258300"}
+        self.m.upkeep()
+        t = self.book.tickets[0]
+        self.assertAlmostEqual(t["ask"], 0.303, places=6)
+        self.assertTrue(t["px_checked"])
+        n = len(self.c.gets)
+        self.clock[0] += 10
+        self.m.upkeep()                                                       # read once
+        self.assertEqual(len([g for g in self.c.gets[n:] if g[0].startswith("/portfolio/orders/")]), 0)
+
+
 class LegMarkup(unittest.TestCase):
     """Jack 2026-11-05: "quote a higher spread, the more legs"."""
 

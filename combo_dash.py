@@ -305,6 +305,7 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
         "settled_pnl": sum(_f(t.get("pnl"), 0.0) for t in settled),
         "pnl": pnl,
         "series": series, "fill_points": fill_points(filled),
+        "fill_rate": fill_rate(events, filled),
         "history_error": (hist or {}).get("error"),
         "wins": sum(1 for t in settled if t.get("result") == "no"),
         "losses": sum(1 for t in settled if t.get("result") == "yes"),
@@ -453,6 +454,18 @@ def pnl_series(filled, leg_hist: dict, markets: dict, settle_ts: dict, now: floa
             fees += fee
         out.append({"t": g, "premium": prem, "trading": trad, "fees": fees, "total": prem + trad - fees})
     return out
+
+
+def fill_rate(events, filled) -> dict:
+    """Quotes filled (Jack 2026-11-06: "show a stat for % quotes filled"): Kalshi
+    fills / quotes sent, over the maker's logs the page reads (since its first
+    quote there), with the accepted share beside it."""
+    qs = [_ev_ts(e) for e in events if e.get("k") == "quote"]
+    if not qs:
+        return {}
+    since = min(qs)
+    return {"quotes": len(qs), "accepted": sum(1 for e in events if e.get("k") == "accept"),
+            "filled": sum(1 for t in filled if fill_time(t) >= since), "since": since}
 
 
 def fill_points(filled) -> list:
@@ -778,6 +791,14 @@ def render(s: dict) -> str:
              f"<div class='l'>can lose {usd(s['open_loss'])} &middot; premium {usd(s['open_premium'])}</div></div>")
     H.append(f"<div class='card'><div class='l'>Fees on combo fills</div><div class='v'>{usd(s['fees'])}</div>"
              f"<div class='l'>{len(s['fills'])} fills recorded by Kalshi</div></div>")
+    fr = s.get("fill_rate") or {}
+    if fr.get("quotes"):
+        one_in = f" &middot; 1 in {fr['quotes'] / fr['filled']:,.0f}" if fr.get("filled") else ""
+        since = et(fr["since"]).strftime("%a %I:%M %p").replace(" 0", " ")
+        H.append(f"<div class='card'><div class='l'>Quotes filled</div>"
+                 f"<div class='v'>{100.0 * fr['filled'] / fr['quotes']:.3f}%</div>"
+                 f"<div class='l'>{fr['filled']} fills of {fr['quotes']:,} quotes since {html.escape(since)}{one_in}"
+                 f" &middot; {100.0 * fr['accepted'] / fr['quotes']:.3f}% accepted</div></div>")
     H.append("</div>")
     pl = s.get("pnl") or {}
     if pl:
