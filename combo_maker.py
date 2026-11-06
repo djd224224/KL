@@ -63,8 +63,10 @@ import math
 import os
 import socket
 import sys
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +92,8 @@ SETTLE_EVERY_S = 300.0
 STAT_SECS = 60.0
 QUOTE_TTL_S = 120.0                 # forget our quote this long after it was sent
 DIRECTION_CHECKS = 3                # read back the position of the first N fills
+READ_GAP_S = 0.05                   # the loop's client: calls >= 50 ms apart (reads can't burst
+                                    # the read budget the IMM shares), sleeping only what is left
 FILL_CHECK_AFTER_S = 3.0            # read a ticket's order this long after quote_executed...
 FILL_CHECK_EVERY_S = 5.0            # ...and again this often until Kalshi calls it final
 NO_ORDER_AFTER_S = 60.0             # confirmed, no order on Kalshi after this long: nothing traded
@@ -134,6 +138,12 @@ class Config:
         self.max_open_loss = 400.0
         self.max_tickets = 30
         self.max_quotes_per_min = 60
+        # QUOTE SENDERS (11/06 04:05Z, at 150 quotes a minute: one loop did every
+        # POST (~270 ms: ~170 on the wire + the client's flat 100 ms sleep) and every
+        # leg read (~133 ms, the same sleep), and RFQs reached it 1.2 s old). Quotes
+        # now go out from this many threads, each with its own client; the loop only
+        # reads and prices. 0 = send inline (the tests)
+        self.quote_workers = 0
         self.max_reads_per_min = 120        # leg reads (10 tokens each): ~20 tokens/s at most
         # the sports whose start rule (expiry - 3 h) was NOT checked against a
         # schedule (tennis, UFC, boxing, the college first half): at least this
@@ -397,11 +407,54 @@ def lock_file(out_dir: str):
     return f
 
 
+class MinGap:
+    """A client's pacing: calls at least `gap` s apart, sleeping only what is left
+    of the gap (the bots' client sleeps a whole 100 ms whenever its last call was
+    under 100 ms ago, which cost the maker ~100 ms a call)."""
+
+    def __init__(self, gap: float, clock=time.monotonic, sleep=time.sleep):
+        self.gap, self.clock, self.sleep = gap, clock, sleep
+        self.last = -1e18
+        self.lock = threading.Lock()
+
+    def __call__(self) -> None:
+        with self.lock:
+            wait = self.last + self.gap - self.clock()
+            if wait > 0:
+                self.sleep(wait)
+            self.last = self.clock()
+
+
+class _Locked:
+    """The day writer, shared by the loop and the quote senders."""
+
+    def __init__(self, w):
+        self.w, self.lock = w, threading.Lock()
+
+    def write(self, o) -> None:
+        with self.lock:
+            self.w.write(o)
+
+    def flush(self) -> None:
+        with self.lock:
+            self.w.flush()
+
+    def __getattr__(self, k):
+        return getattr(self.w, k)
+
+
 class Maker:
-    def __init__(self, client, cfg: Config, writer, book: Book, out_dir: str, clock=time.time):
+    def __init__(self, client, cfg: Config, writer, book: Book, out_dir: str, clock=time.time,
+                 client_factory=None):
         self.c = client
         self.cfg = cfg
-        self.w = writer
+        self.w = _Locked(writer)
+        self.lock = threading.RLock()   # stats, quotes, pending, errors: shared with the senders
+        self.pending = {}               # rfq id -> our quote while its POST is out
+        self.client_factory = client_factory     # a client for each sender thread
+        self._tl = threading.local()
+        self.pool = (ThreadPoolExecutor(max_workers=cfg.quote_workers, thread_name_prefix="quote")
+                     if cfg.live and cfg.quote_workers else None)
         self.book = book
         self.out_dir = out_dir
         self.clock = clock
@@ -419,12 +472,19 @@ class Maker:
         self._reset_stats()
 
     def _reset_stats(self):
-        self.st = {"rfq": 0, "pre_ok": 0, "priced": 0, "quoted": 0, "dry": 0, "accepted": 0,
-                   "confirmed": 0, "declined": 0, "executed": 0, "errors": 0, "why": {}}
-        self.st_since = self.clock()
+        with self.lock:
+            self.st = {"rfq": 0, "pre_ok": 0, "priced": 0, "quoted": 0, "dry": 0, "accepted": 0,
+                       "confirmed": 0, "declined": 0, "executed": 0, "errors": 0, "why": {}}
+            self.st_since = self.clock()
 
     def _why(self, w):
-        self.st["why"][w] = self.st["why"].get(w, 0) + 1
+        with self.lock:
+            self.st["why"][w] = self.st["why"].get(w, 0) + 1
+
+    def close(self) -> None:
+        """Let the quotes in flight finish (their ids and records) before a stop."""
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
 
     def stop_file(self, why: str) -> None:
         with open(os.path.join(self.out_dir, STOP_NAME), "w", encoding="utf-8") as f:
@@ -556,21 +616,53 @@ class Maker:
             self.sent.append(now)                       # DRY keeps LIVE's quote rate
             self.w.write(dict(q, k="would_quote"))
             return
+        body = {"rfq_id": rfq["id"], "yes_bid": "0.0000", "no_bid": f"{no_bid:.4f}", "rest_remainder": False}  # "0" is refused: "invalid dollar precision"
+        self.sent.append(now)                           # counts against the cap from now, out or not
+        if self.pool is None:
+            self._send(q, body, now)
+            return
+        with self.lock:
+            self.pending[rfq["id"]] = q
+        self.pool.submit(self._send_logged, q, body, now)
+
+    def _sender_client(self):
+        if self.pool is None or self.client_factory is None:
+            return self.c
+        c = getattr(self._tl, "c", None)
+        if c is None:
+            c = self._tl.c = self.client_factory()
+        return c
+
+    def _send_logged(self, q: dict, body: dict, now: float) -> None:
         try:
-            body = {"rfq_id": rfq["id"], "yes_bid": "0.0000", "no_bid": f"{no_bid:.4f}", "rest_remainder": False}  # "0" is refused: "invalid dollar precision"
-            js = self.c.post(path="/communications/quotes", body=json.dumps(body))
+            self._send(q, body, now)
+        except Exception as e:                       # a sender thread must never fail silently
+            with self.lock:
+                self.pending.pop(q["id"], None)
+            self._error("sender", e)
+
+    def _send(self, q: dict, body: dict, now: float) -> None:
+        """POST one quote (inline, or on a sender thread) and book it."""
+        try:
+            js = self._sender_client().post(path="/communications/quotes", body=json.dumps(body))
         except Exception as e:
+            with self.lock:
+                self.pending.pop(q["id"], None)
             self._error("quote", e)
             return
         qid = js.get("id")
-        self.sent.append(now)
-        self.st["quoted"] += 1
-        self.quotes[qid] = dict(q, quote_id=qid)
+        with self.lock:
+            self.pending.pop(q["id"], None)
+            self.st["quoted"] += 1
+            self.quotes[qid] = dict(q, quote_id=qid)
         self.w.write(dict(q, k="quote", quote_id=qid, sent_ms=(time.time() - now) * 1000))
 
     def on_accepted(self, msg: dict) -> None:
         qid = msg.get("quote_id")
-        q = self.quotes.get(qid)
+        with self.lock:
+            q = self.quotes.get(qid)
+            if q is None and msg.get("rfq_id") in self.pending:    # accepted before our POST came back:
+                q = dict(self.pending[msg["rfq_id"]], quote_id=qid)  # quote_accepted only reaches its maker
         if q is None:
             return                                  # not ours (another maker's quote filled)
         self.st["accepted"] += 1
@@ -724,23 +816,26 @@ class Maker:
         if "rfq_closed" in body.lower():
             self._why("rfq_closed")       # the request closed before our quote landed: no fault, no pause
             return
-        self.errors += 1
-        self.st["errors"] += 1
+        low = body.lower()
+        with self.lock:
+            self.errors += 1
+            self.st["errors"] += 1
+            if "insufficient" in low:
+                self.pause_until = self.clock() + 300
+            elif self.errors % 10 == 0:
+                self.pause_until = self.clock() + 60
         self.w.write({"k": "err", "what": what, "err": f"{type(e).__name__}: {body}"})
         log(f"! {what}: {type(e).__name__}: {body[:160]}")
-        low = body.lower()
         if "insufficient" in low:
-            self.pause_until = self.clock() + 300
             log("! the combo shard is short of cash: quoting paused 5 min")
-        elif self.errors % 10 == 0:
-            self.pause_until = self.clock() + 60
 
     # ---- upkeep -----------------------------------------------------------------
 
     def upkeep(self) -> None:
         now = self.clock()
-        for qid in [k for k, q in self.quotes.items() if now - q["at"] > QUOTE_TTL_S]:
-            del self.quotes[qid]
+        with self.lock:
+            for qid in [k for k, q in self.quotes.items() if now - q["at"] > QUOTE_TTL_S]:
+                del self.quotes[qid]
         if self.cfg.live:
             self.check_fills(now)
         if self.direction_checks < DIRECTION_CHECKS:      # the first fills' side, read back
@@ -752,17 +847,19 @@ class Maker:
             self.last_settle = now
             self.settle()
         if now - self.st_since >= STAT_SECS:
-            rec = dict(self.st, k="stat", t=now, open=len(self.book.open()),
+            with self.lock:                             # the senders count into self.st too
+                st = self.st
+                self._reset_stats()
+            rec = dict(st, k="stat", t=now, open=len(self.book.open()),
                        open_loss=round(self.book.open_loss(), 2), live=self.cfg.live)
             self.w.write(rec)
-            top = sorted(self.st["why"].items(), key=lambda kv: -kv[1])[:4]
-            log(f"min: rfq {self.st['rfq']} pre-ok {self.st['pre_ok']} priced {self.st['priced']} "
-                + (f"quoted {self.st['quoted']} accepted {self.st['accepted']} confirmed "
-                   f"{self.st['confirmed']} declined {self.st['declined']}" if self.cfg.live
-                   else f"would quote {self.st['dry']}")
+            top = sorted(st["why"].items(), key=lambda kv: -kv[1])[:4]
+            log(f"min: rfq {st['rfq']} pre-ok {st['pre_ok']} priced {st['priced']} "
+                + (f"quoted {st['quoted']} accepted {st['accepted']} confirmed "
+                   f"{st['confirmed']} declined {st['declined']}" if self.cfg.live
+                   else f"would quote {st['dry']}")
                 + f" | open {len(self.book.open())} can lose ${self.book.open_loss():,.2f} | top skips "
                 + ", ".join(f"{k} {v}" for k, v in top))
-            self._reset_stats()
 
     def settle(self) -> None:
         open_t = [t for t in self.book.tickets if t.get("status") == "executed" and t.get("fill_checked")]
@@ -801,6 +898,12 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     # pooled TLS: ~30 ms a read instead of ~0.8 s (the 11/05 dry run fell 74 s behind without it)
     os.environ.setdefault("KALSHI_HTTP_KEEPALIVE", "1")
     client = ks.client()
+    client.rate_limit = MinGap(READ_GAP_S)      # the loop's reads / confirms: >= 50 ms apart, no flat 100 ms sleep
+
+    def sender_client():
+        c = ks.client()
+        c.rate_limit = lambda: None             # senders: paced by the quote cap and their count
+        return c
     if cfg.live:
         cash = ks.shard_balances(client).get(1, 0.0)
         log(f"LIVE: combo shard (1) cash ${cash:,.2f}")
@@ -810,7 +913,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
             return 2
     writer = DayWriter(out_dir)
     book = Book(os.path.join(out_dir, STATE_NAME))
-    mk = Maker(client, cfg, writer, book, out_dir)
+    mk = Maker(client, cfg, writer, book, out_dir, client_factory=sender_client)
     writer.write({"k": "start", "t": time.time(), "live": cfg.live,
                   "cfg": {k: sorted(v) if isinstance(v, set) else v for k, v in vars(cfg).items()}})
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
@@ -821,7 +924,8 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
         + (f"loss <= ${cfg.max_ticket_loss:,.0f}/ticket, " if cfg.max_ticket_loss is not None else "")
         + f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
-        f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day; open now {len(book.open())}")
+        f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day, {cfg.quote_workers} quote senders; "
+        f"open now {len(book.open())}")
     deadline = time.time() + minutes * 60 if minutes else None
     key_id = getattr(client, "key_id", None)
     backoff, code = 1.0, 0
@@ -884,6 +988,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     except KeyboardInterrupt:
         pass
     finally:
+        mk.close()
         mk.upkeep()
         writer.write({"k": "stop", "t": time.time(), "open": len(book.open()),
                       "open_loss": round(book.open_loss(), 2)})
@@ -929,6 +1034,9 @@ def main(argv=None) -> int:
     ap.add_argument("--max-quotes-per-min", type=int, default=d.max_quotes_per_min,
                     help="quotes a minute (2 tokens each on the combo shard's write bucket, which the IMM "
                          "does not use)")
+    ap.add_argument("--quote-workers", type=int, default=4,
+                    help="threads sending quotes, each with its own client, so the loop never waits on a POST "
+                         "(0 = inline)")
     ap.add_argument("--no-extras", action="store_true",
                     help="game / spread / total only: no first-half, quarter, team-total or prop legs")
     ap.add_argument("--min-depth", type=float, default=d.min_depth_usd,
@@ -960,7 +1068,10 @@ def main(argv=None) -> int:
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
                  max_legs=a.max_legs, min_lead_min=a.min_lead_min,
                  max_reads_per_min=a.max_reads_per_min, max_quotes_per_min=a.max_quotes_per_min,
-                 allow_extras=not a.no_extras, min_depth_usd=a.min_depth, max_days_out=a.max_days_out)
+                 allow_extras=not a.no_extras, min_depth_usd=a.min_depth, max_days_out=a.max_days_out,
+                 quote_workers=a.quote_workers)
+    if not 0 <= cfg.quote_workers <= 16:
+        ap.error("--quote-workers 0 to 16")
     if cfg.max_ticket_loss is not None and not 10 <= cfg.max_ticket_loss <= 5000:
         ap.error("--max-ticket-loss $10 to $5,000")
     if cfg.max_days_out and not 0.25 <= cfg.max_days_out <= 400:

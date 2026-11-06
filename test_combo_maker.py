@@ -429,6 +429,84 @@ class TicketLoss(unittest.TestCase):
                 cm.main(bad)
 
 
+class Senders(unittest.TestCase):
+    """11/06 04:05Z: at 150 quotes a minute the one loop was full (each POST ~270
+    ms, each leg read ~133 ms) and RFQs reached it 1.2 s old. Quotes go out from
+    sender threads now."""
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.w = W()
+
+    def maker(self, c, workers=2):
+        cfg = cm.Config(live=True, quote_workers=workers, markup_per_leg=0.0)
+        m = cm.Maker(c, cfg, self.w, cm.Book(os.path.join(self.d.name, "s.json")), self.d.name,
+                     clock=lambda: T0)
+        self.addCleanup(m.close)
+        return m
+
+    def test_quotes_go_out_from_the_pool(self):
+        c = FakeClient(MK)
+        m = self.maker(c)
+        for i in range(3):
+            m.handle(rfq_msg(rid=f"r{i}"))
+        m.close()
+        self.assertEqual(len(c.posts), 3)
+        self.assertEqual(len(self.w.k("quote")), 3)
+        self.assertEqual(set(m.quotes), {"q1", "q2", "q3"})
+        self.assertEqual((m.pending, m.st["quoted"]), ({}, 3))
+
+    def test_an_accept_that_beats_our_posts_response(self):
+        import threading
+
+        class Slow(FakeClient):
+            gate = threading.Event()
+
+            def post(self, path, body):
+                self.gate.wait(5)
+                return super().post(path, body)
+
+        c = Slow(MK)
+        m = self.maker(c)
+        m.handle(rfq_msg(rid="r1"))
+        self.assertIn("r1", m.pending)                       # the POST is still out
+        nb = f"{m.pending['r1']['no_bid']:.4f}"
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "qX", "rfq_id": "r1", "no_bid_dollars": nb}})
+        self.assertEqual(c.puts, [FakeClient.host + "/communications/rfqs/r1/quotes/qX/confirm"])
+        self.assertEqual(m.book.tickets[0]["quote_id"], "qX")
+        Slow.gate.set()
+        m.close()
+        self.assertEqual(m.pending, {})
+
+    def test_a_senders_error_counts_and_pauses(self):
+        c = FakeClient(MK)
+        c.post_error = Exception('HttpError: {"error":{"code":"insufficient_balance","message":"insufficient balance"}}')
+        m = self.maker(c)
+        m.handle(rfq_msg(rid="r1"))
+        m.close()
+        self.assertEqual((m.errors, len(self.w.k("err")), m.pending), (1, 1, {}))
+        self.assertEqual(m.pause_until, T0 + 300)
+
+    def test_min_gap_sleeps_only_what_is_left(self):
+        t, slept = [100.0], []
+
+        def sleep(s):
+            slept.append(round(s, 6))
+            t[0] += s
+        g = cm.MinGap(0.05, clock=lambda: t[0], sleep=sleep)
+        g()                                                  # first call: no wait
+        t[0] += 0.02
+        g()                                                  # 20 ms after: sleeps the other 30
+        t[0] += 0.10
+        g()                                                  # 100 ms after: none
+        self.assertEqual(slept, [0.03])
+
+    def test_cli(self):
+        with self.assertRaises(SystemExit):
+            cm.main(["--quote-workers", "17"])
+
+
 class LegMarkup(unittest.TestCase):
     """Jack 2026-11-05: "quote a higher spread, the more legs"."""
 
