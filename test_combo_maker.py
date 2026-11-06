@@ -322,6 +322,52 @@ class GamesAndKnobs(unittest.TestCase):
                 cm.main(bad)
 
 
+class MoreSports(unittest.TestCase):
+    """Soccer (start rule checked), tennis / fights / first half (unchecked:
+    an hour's margin at least), and the start memory that saves reads."""
+    EPL1, EPL2 = "KXEPLGAME-26NOV08ARSCHE-ARS", "KXLALIGAGAME-26NOV08RMABAR-TIE"
+    TEN = "KXATPCHALLENGERMATCH-26NOV06MONCEC-CEC"
+
+    def test_groups_and_filters(self):
+        cfg = cm.Config(min_legs=2, min_lead_min=5)
+        self.assertIsNone(cm.pre_check([[self.EPL1, "yes"], [self.EPL2, "no"], [L1, "yes"]], cfg))
+        self.assertIsNone(cm.pre_check([[self.TEN, "yes"], [L2, "yes"]], cfg))
+        self.assertEqual(cm.pre_check([[PROP, "yes"], [self.EPL1, "yes"]], cfg), "not_main")
+        self.assertEqual(cm.lead_min(self.TEN, cfg), 60.0)
+        self.assertEqual(cm.lead_min(self.EPL1, cfg), 5.0)
+        self.assertEqual(cm.lead_min(L1, cfg), 5.0)
+
+    def test_unchecked_sports_stop_an_hour_out(self):
+        cfg = cm.Config(min_legs=2, min_lead_min=5)
+        legs = [[self.TEN, "yes"], [L2, "yes"]]
+        mk = {self.TEN: mkt(self.TEN, 0.59, 0.61, start_in_h=0.8), L2: mkt(L2, 0.49, 0.51)}   # 48 min out
+        self.assertEqual(cm.price_check(legs, mk, T0, cfg)[0], "starts_soon")
+        mk[self.TEN] = mkt(self.TEN, 0.59, 0.61, start_in_h=1.2)                                # 72 min out
+        self.assertIsNone(cm.price_check(legs, mk, T0, cfg)[0])
+        legs2 = [[self.EPL1, "yes"], [L2, "yes"]]
+        mk2 = {self.EPL1: mkt(self.EPL1, 0.59, 0.61, start_in_h=0.2), L2: mkt(L2, 0.49, 0.51)}  # 12 min out
+        self.assertIsNone(cm.price_check(legs2, mk2, T0, cfg)[0])                              # soccer: 5 min
+
+    def test_a_known_started_leg_costs_no_read(self):
+        mk = {L1: mkt(L1, 0.59, 0.61, start_in_h=0.05), L2: mkt(L2, 0.49, 0.51), L3: mkt(L3, 0.29, 0.31)}
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(c, cm.Config(min_legs=2), W(), cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg(rid="r1"))                        # reads, learns L1 starts in 3 min
+        n = len(c.gets)
+        m.cache.clear()                                    # even with the price cache empty
+        m.handle(rfq_msg(rid="r2"))
+        self.assertEqual(len(c.gets), n)                   # skipped from the start memory
+        self.assertEqual(m.st["why"].get("starts_soon"), 2)
+
+    def test_read_cap_flag(self):
+        with self.assertRaises(SystemExit):
+            cm.main(["--max-reads-per-min", "5"])
+        self.assertEqual(cm.Config().max_reads_per_min, 120)
+
+
 class RunGuards(unittest.TestCase):
     def test_stop_file_and_lock(self):
         with tempfile.TemporaryDirectory() as d:

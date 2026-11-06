@@ -63,14 +63,16 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import kalshi_ws  # noqa: E402
 from combo_rfq_logger import WS_PATH, WS_URL, DayWriter, iso_ms, legs_of  # noqa: E402
-from combo_rfq_score import DEFAULT_GRID, MAIN_SERIES, grid_up, maker_fee  # noqa: E402
+from combo_rfq_score import DEFAULT_GRID, MAIN_SERIES, grid_up, maker_fee, sport_group  # noqa: E402
 
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
 STOP_NAME = "combo_maker.stop"
 LOCK_NAME = "combo_maker.lock"
-# MAIN_SERIES (US-league game / spread / total) comes from combo_rfq_score, so
-# the shadow's Strategy 1 table and this pilot share one definition
+# MAIN_SERIES comes from combo_rfq_score, so the shadow's Strategy 1 table and
+# this pilot share one definition: US-league game / spread / total, and since
+# 11/05 night the top soccer leagues (start rule checked) plus tennis, UFC,
+# boxing and the college first half (not checked: an hour's more margin)
 GAME_HOURS = 3.0
 SHARD_FACTOR, SHARD_KEY = 50, 1     # a 2% slice of RFQs (the logger reads key 0)
 STALE_SECS = 30.0
@@ -108,7 +110,11 @@ class Config:
         self.max_open_loss = 400.0
         self.max_tickets = 30
         self.max_quotes_per_min = 60
-        self.max_reads_per_min = 60         # leg reads (10 tokens each): ~10 tokens/s at most
+        self.max_reads_per_min = 120        # leg reads (10 tokens each): ~20 tokens/s at most
+        # the sports whose start rule (expiry - 3 h) was NOT checked against a
+        # schedule (tennis, UFC, boxing, the college first half): at least this
+        # much margin, so an offset up to an hour longer still stops before play
+        self.unchecked_lead_min = 60.0
         self.max_rfq_age_ms = 1500.0        # an RFQ older than this when we get to it: skip
         self.leg_cache_s = 15.0
         for k, v in kw.items():
@@ -195,7 +201,7 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config):
         exp = _iso_s(m.get("expected_expiration_time"))
         if exp is None:
             return "no_start", None
-        if exp - GAME_HOURS * 3600 - now_s < cfg.min_lead_min * 60:
+        if exp - GAME_HOURS * 3600 - now_s < lead_min(tk, cfg) * 60:
             return "starts_soon", None
         mid = (bid + ask) / 2.0
         probs.append(mid if side == "yes" else 1.0 - mid)
@@ -203,6 +209,14 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config):
     if not (cfg.min_fair <= fair <= cfg.max_fair):
         return "fair_range", fair
     return None, fair
+
+
+def lead_min(ticker: str, cfg: Config) -> float:
+    """Minutes before the start a leg stops being quotable: the configured
+    margin, and at least cfg.unchecked_lead_min for the unchecked sports."""
+    if sport_group(str(ticker).split("-")[0]) == "unchecked":
+        return max(cfg.min_lead_min, cfg.unchecked_lead_min)
+    return cfg.min_lead_min
 
 
 def quote_price(fair: float, cfg: Config, grid=None):
@@ -324,6 +338,7 @@ class Maker:
         self.quotes = {}                # quote id -> our quote
         self.sent = deque()             # quote send times (rate cap)
         self.reads = deque()            # leg read times (rate cap)
+        self.exp = {}                   # leg ticker -> expected expiration (never changes)
         self.st = {}
         self.direction_checks = 0
         self.pause_until = 0.0
@@ -354,6 +369,9 @@ class Maker:
             for m in js.get("markets") or []:
                 if m.get("ticker"):
                     self.cache[m["ticker"]] = (now, m)
+                    ex = _iso_s(m.get("expected_expiration_time"))
+                    if ex is not None:
+                        self.exp[m["ticker"]] = ex
         return {t: self.cache[t][1] for t in tickers if t in self.cache}
 
     # ---- messages ---------------------------------------------------------------
@@ -388,6 +406,14 @@ class Maker:
         if len(self.sent) >= self.cfg.max_quotes_per_min:
             self._why("rate_cap")
             return
+        # a leg whose game already starts too soon is known from an earlier
+        # read: skip without spending one (11/05: most reads went to parlays
+        # holding the in-play ORL@PHX)
+        for leg in legs:
+            ex = self.exp.get(leg[0])
+            if ex is not None and ex - GAME_HOURS * 3600 - now < lead_min(leg[0], self.cfg) * 60:
+                self._why("starts_soon")
+                return
         while self.reads and now - self.reads[0] > 60:
             self.reads.popleft()
         if len(self.reads) >= self.cfg.max_reads_per_min:
@@ -719,6 +745,8 @@ def main(argv=None) -> int:
     ap.add_argument("--min-lead-min", type=float, default=d.min_lead_min,
                     help="stop quoting a game this many minutes before its start (Kalshi's start = "
                          "the game market's expiry - 3 h, checked against ESPN)")
+    ap.add_argument("--max-reads-per-min", type=int, default=d.max_reads_per_min,
+                    help="leg reads a minute (10 tokens each); the reads are shared with the IMM's budget")
     ap.add_argument("--allow-thin", action="store_true",
                     help="allow a 3%% markup on fee-paying combos: about breakeven or worse after the "
                          "fee at Kalshi's mids (a mechanics test)")
@@ -739,7 +767,10 @@ def main(argv=None) -> int:
                  max_game_payout=a.max_game_payout, max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
-                 max_legs=a.max_legs, min_lead_min=a.min_lead_min)
+                 max_legs=a.max_legs, min_lead_min=a.min_lead_min,
+                 max_reads_per_min=a.max_reads_per_min)
+    if not 10 <= cfg.max_reads_per_min <= 600:
+        ap.error("--max-reads-per-min 10-600")
     if not 1 <= cfg.shard_factor <= 100:
         ap.error("--shard-factor 1-100")
     return run(cfg, a.minutes)

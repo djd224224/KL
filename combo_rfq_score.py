@@ -84,7 +84,38 @@ MAKER_FEE_RATE = 0.035     # combo makers: 0.5 x the 0.07 taker rate (fee schedu
 # STRATEGY 1, the live pilot's rule (combo_maker.py imports MAIN_SERIES; keep S1
 # in step with its Config): US-league main lines only, 3-8 legs, legs <= 3c
 # wide, fair 2-40c, every game >= 30 min from its start
-MAIN_SERIES = re.compile(r"^KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAMB|NCAAWB)(GAME|SPREAD|TOTAL)$")
+US_MAIN = re.compile(r"^KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAMB|NCAAWB)(GAME|SPREAD|TOTAL)$")
+# MORE SPORTS (Jack 2026-11-05: "add all of those sports with 'expiry minus 3
+# hours' rule"): the game-level markets of the leagues seen in that night's
+# cross-game parlays. Soccer's start rule checked against ESPN (kickoff =
+# expiry - 3.0 h: EPL 5/5, LaLiga 5/5, Bundesliga 3/3, Serie A 6/6, MLS 14/14,
+# Eredivisie 7/7, ...); tennis, fights and the college first half are NOT
+# checked (no schedule source), so the maker keeps an hour more margin there.
+SOCCER_MAIN = re.compile(r"^KX(EPL|LALIGA|BUNDESLIGA|SERIEA|LIGUE1|MLS|LIGAMX|LIGAEXP|BRASILEIRO|BRASILEIROB|"
+                         r"ARGPREMDIV|APFDDH|EREDIVISIE|UCL|UEL|UECL)(GAME|TOTAL|SPREAD)$")
+OTHER_MAIN = re.compile(r"^KX(ITFDOUBLES|ITFMATCH|ITFWMATCH|ATPMATCH|WTAMATCH|ATPCHALLENGERMATCH|"
+                        r"WTACHALLENGERMATCH|UFCFIGHT|BOXING|NCAAMB1H)$")
+
+
+class _AnyMain:
+    """MAIN_SERIES.match(series): a quotable game-level series of any group."""
+    def match(self, s):
+        return US_MAIN.match(s) or SOCCER_MAIN.match(s) or OTHER_MAIN.match(s)
+
+
+MAIN_SERIES = _AnyMain()
+
+
+def sport_group(series: str) -> str:
+    """'us' / 'soccer' (start rule checked) or 'unchecked' (tennis, fights,
+    the first half); '' when not quotable."""
+    if US_MAIN.match(series):
+        return "us"
+    if SOCCER_MAIN.match(series):
+        return "soccer"
+    if OTHER_MAIN.match(series):
+        return "unchecked"
+    return ""
 S1 = {"min_legs": 3, "max_legs": 8, "min_fair": 0.02, "max_fair": 0.40, "max_leg_spread": 0.03,
       "min_lead_min": 30.0, "markups": (0.05, 0.10, 0.15, 0.20)}
 MAX_EXECS_PER_DAY = 5000
