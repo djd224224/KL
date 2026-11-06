@@ -86,6 +86,22 @@ LOCK_NAME = "combo_maker.lock"
 # 11/05 night the top soccer leagues (start rule checked) plus tennis, UFC,
 # boxing and the college first half (not checked: an hour's more margin)
 GAME_HOURS = 3.0
+# Expected expiration minus kickoff, by series prefix, where it is not 3.0 h.
+# NCAAF (ESPN check 11/06 04:45Z, 49 games): 3.0 h on 24, but 3.5 / 5 / 5.5 /
+# 6.0 h on others, so its start is taken as expiry - 6 h (the latest seen):
+# quoting stops >= 3 h before a 3.0-h game's kickoff, never after one's start.
+# NFL 24/24, NBA, NHL, NCAAMB, NCAAWB and soccer checked at 3.0 h.
+# UFC (11/06): Kalshi's fight expiries do not time the card (the Cortes Acosta
+# vs Walker card expires 11/07 04:00-05:00Z; ESPN has it 11/07 22:00Z prelims,
+# 11/08 01:00Z main card), so its start is taken as expiry - 8 h: a whole card
+# before any expiry set after the main event.
+START_HOURS = {"KXNCAAF": 6.0, "KXUFCFIGHT": 8.0}
+ALL_SPORTS = ("NFL", "NBA", "WNBA", "NHL", "MLB", "NCAAF", "NCAAMB", "NCAAWB", "SOCCER", "UFC", "BOXING",
+              "TENNIS")
+# Jack 2026-11-05 ~11:45 PM ET: "quote NFL soccer, NBA, NHL college basketball NCAAF, UFC"
+DEFAULT_SPORTS = ("NFL", "NBA", "NHL", "NCAAMB", "NCAAWB", "NCAAF", "SOCCER", "UFC")
+MOVE_WINDOW_S = 600.0               # a leg whose mid moved >= cfg.max_leg_move inside this window...
+MOVE_HOLD_S = 1800.0                # ...is treated as in play for this long
 SHARD_FACTOR, SHARD_KEY = 50, 1     # a 2% slice of RFQs (the logger reads key 0)
 STALE_SECS = 30.0
 SETTLE_EVERY_S = 300.0
@@ -149,6 +165,15 @@ class Config:
         # schedule (tennis, UFC, boxing, the college first half): at least this
         # much margin, so an offset up to an hour longer still stops before play
         self.unchecked_lead_min = 60.0
+        # SPORTS (11/06 04:21-04:33Z: 6 tickets sold on ITF women's matches already
+        # in play -- their markets expire ~6 h after a match starts, not 3, so
+        # "expiry - 3 h" put the start 2-3 h late and the buyers had the score).
+        # Every leg's sport must be on this list (sport_of); tennis and boxing are off
+        self.sports = set(DEFAULT_SPORTS)
+        # IN-PLAY GUARD, any sport: a leg whose mid (from our own reads) moved by
+        # this much inside MOVE_WINDOW_S is held out for MOVE_HOLD_S, at the quote
+        # and at the last look (the ITF legs swung 15-50c while we sold)
+        self.max_leg_move = 0.05
         # HORIZON (Jack 2026-11-05 ~11 PM ET: "dont quote anything further than 4
         # days out, to not tie up cash."): every leg's expected expiration (when it
         # settles, and the ticket's cash comes back) within this many days; 0 = off
@@ -231,6 +256,8 @@ def pre_check(legs: list, cfg: Config):
     if any(not (MAIN_SERIES.match(str(l[0]).split("-")[0]) or (cfg.allow_extras and is_extra(l[0])))
            for l in legs):
         return "not_main"
+    if any(sport_of(str(l[0]).split("-")[0]) not in cfg.sports for l in legs):
+        return "sport_off"
     if cfg.nfl_only and not cfg.fee_free(legs):
         return "not_nfl"
     games = [game_of(l[0]) for l in legs]
@@ -273,7 +300,7 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config, game_start
             exp = _iso_s(m.get("expected_expiration_time"))
             if exp is None:
                 return "no_start", None
-            start = exp - GAME_HOURS * 3600
+            start = start_of(tk, exp)
         if start - now_s < lead_min(tk, cfg) * 60:
             return "starts_soon", None
         mid = (bid + ask) / 2.0
@@ -282,6 +309,31 @@ def price_check(legs: list, markets: dict, now_s: float, cfg: Config, game_start
     if not (cfg.min_fair <= fair <= cfg.max_fair):
         return "fair_range", fair
     return None, fair
+
+
+def sport_of(series: str) -> str:
+    """'KXNBAPTS' -> 'NBA', 'KXEPLGAME' -> 'SOCCER', 'KXUFCFIGHT' -> 'UFC',
+    'KXITFWMATCH' -> 'TENNIS' ('' outside the quotable series)."""
+    g = sport_group(series)
+    if g == "soccer":
+        return "SOCCER"
+    if g in ("us", "extra", "prop"):
+        return league_of(series) or ""
+    if g == "unchecked":
+        if series.startswith("KXUFCFIGHT"):
+            return "UFC"
+        if series.startswith("KXBOXING"):
+            return "BOXING"
+        return "TENNIS"
+    return ""
+
+
+def start_of(ticker: str, exp_s: float) -> float:
+    """A game's start from its market's expected expiration: expiry - 3 h,
+    or the league's own offset (START_HOURS)."""
+    series = str(ticker).split("-")[0]
+    hours = next((h for p, h in START_HOURS.items() if series.startswith(p)), GAME_HOURS)
+    return exp_s - hours * 3600
 
 
 def too_far(settles_s, now_s: float, cfg: Config) -> bool:
@@ -464,6 +516,8 @@ class Maker:
         self.reads = deque()            # leg read times (rate cap)
         self.exp = {}                   # leg ticker -> expected expiration (never changes)
         self.game_start = {}            # game key -> start (from its main lines' expiry - 3 h)
+        self.mids = {}                  # leg ticker -> deque of (read at, mid): the in-play guard
+        self.moving_until = {}          # leg ticker -> held out until
         self.st = {}
         self.direction_checks = 0
         self.pause_until = 0.0
@@ -505,8 +559,28 @@ class Maker:
                     if ex is not None:
                         self.exp[m["ticker"]] = ex
                         if not is_extra(m["ticker"]) and sport_group(m["ticker"].split("-")[0]):
-                            self.game_start[game_of(m["ticker"])] = ex - GAME_HOURS * 3600
+                            self.game_start[game_of(m["ticker"])] = start_of(m["ticker"], ex)
+                    self._track_mid(m, now)
         return {t: self.cache[t][1] for t in tickers if t in self.cache}
+
+    def _track_mid(self, m: dict, now: float) -> None:
+        bid, ask = _f(m.get("yes_bid_dollars"), 0.0), _f(m.get("yes_ask_dollars"), 1.0)
+        if not (0.0 < bid < ask < 1.0):
+            return
+        tk = m["ticker"]
+        h = self.mids.setdefault(tk, deque())
+        h.append((now, (bid + ask) / 2.0))
+        while h and now - h[0][0] > MOVE_WINDOW_S:
+            h.popleft()
+        lo, hi = min(x for _, x in h), max(x for _, x in h)
+        if self.cfg.max_leg_move and hi - lo >= self.cfg.max_leg_move - 1e-9:
+            if self.moving_until.get(tk, 0.0) < now:
+                log(f"in-play guard: {tk} moved {lo:.3f}-{hi:.3f} inside {MOVE_WINDOW_S / 60:.0f} min: "
+                    f"held out {MOVE_HOLD_S / 60:.0f} min")
+            self.moving_until[tk] = now + MOVE_HOLD_S
+
+    def moving(self, legs, now: float) -> bool:
+        return any(self.moving_until.get(l[0], 0.0) > now for l in legs)
 
     def learn_game_starts(self, legs, now) -> None:
         """An extra / prop leg's game start, from its game's winner market
@@ -523,7 +597,7 @@ class Maker:
             for m in js.get("markets") or []:
                 ex = _iso_s(m.get("expected_expiration_time"))
                 if ex is not None:
-                    self.game_start[game] = ex - GAME_HOURS * 3600
+                    self.game_start[game] = start_of(m["ticker"], ex)
                     break
 
     # ---- messages ---------------------------------------------------------------
@@ -561,6 +635,9 @@ class Maker:
         # a leg whose game already starts too soon is known from an earlier
         # read: skip without spending one (11/05: most reads went to parlays
         # holding the in-play ORL@PHX)
+        if self.moving(legs, now):
+            self._why("moving")
+            return
         for leg in legs:
             if too_far(self.exp.get(leg[0]), now, self.cfg):
                 self._why("too_far")
@@ -569,7 +646,7 @@ class Maker:
                 st = self.game_start.get(game_of(leg[0]))
             else:
                 ex = self.exp.get(leg[0])
-                st = None if ex is None else ex - GAME_HOURS * 3600
+                st = None if ex is None else start_of(leg[0], ex)
             if st is not None and st - now < lead_min(leg[0], self.cfg) * 60:
                 self._why("starts_soon")
                 return
@@ -595,6 +672,9 @@ class Maker:
             read_ms = (time.time() - t0) * 1000
         except Exception as e:
             self._error("leg read", e)
+            return
+        if self.moving(legs, now):                      # this read showed the move
+            self._why("moving")
             return
         why, fair = price_check(legs, mk, now, self.cfg, self.game_start)
         if why:
@@ -680,6 +760,9 @@ class Maker:
         except Exception as e:
             self._error("confirm read", e)
             self._decline(q, "read_failed", None, cts)
+            return
+        if self.moving(q["legs"], now):
+            self._decline(q, "moving", None, cts)
             return
         why, fair_now = confirm_check(q, mk, now, self.cfg, self.book, cts, self.game_start)
         if why:
@@ -1037,6 +1120,11 @@ def main(argv=None) -> int:
     ap.add_argument("--quote-workers", type=int, default=4,
                     help="threads sending quotes, each with its own client, so the loop never waits on a POST "
                          "(0 = inline)")
+    ap.add_argument("--sports", default=",".join(DEFAULT_SPORTS),
+                    help="sports every leg must be in, from " + ",".join(ALL_SPORTS) + " (tennis and boxing "
+                         "are off: their markets do not give start times; 11/06 ITF matches were sold in play)")
+    ap.add_argument("--max-leg-move", type=float, default=d.max_leg_move,
+                    help="hold a leg out 30 min once its mid moves this much inside 10 min (0 = off)")
     ap.add_argument("--no-extras", action="store_true",
                     help="game / spread / total only: no first-half, quarter, team-total or prop legs")
     ap.add_argument("--min-depth", type=float, default=d.min_depth_usd,
@@ -1069,7 +1157,12 @@ def main(argv=None) -> int:
                  max_legs=a.max_legs, min_lead_min=a.min_lead_min,
                  max_reads_per_min=a.max_reads_per_min, max_quotes_per_min=a.max_quotes_per_min,
                  allow_extras=not a.no_extras, min_depth_usd=a.min_depth, max_days_out=a.max_days_out,
-                 quote_workers=a.quote_workers)
+                 quote_workers=a.quote_workers, max_leg_move=a.max_leg_move,
+                 sports={x.strip().upper() for x in a.sports.split(",") if x.strip()})
+    if not cfg.sports or not cfg.sports <= set(ALL_SPORTS):
+        ap.error("--sports: a comma list from " + ",".join(ALL_SPORTS))
+    if not 0 <= cfg.max_leg_move <= 0.5:
+        ap.error("--max-leg-move 0 to 0.5")
     if not 0 <= cfg.quote_workers <= 16:
         ap.error("--quote-workers 0 to 16")
     if cfg.max_ticket_loss is not None and not 10 <= cfg.max_ticket_loss <= 5000:

@@ -208,7 +208,7 @@ class MakerFlow(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.d.name, cm.STOP_NAME)))
 
     def test_last_look_declines_when_the_legs_moved(self):
-        m = self.maker(live=True)
+        m = self.maker(live=True, max_leg_move=0.0)    # the edge test alone (InPlay covers the move guard)
         m.handle(rfq_msg())
         self.client.mk[L1] = mkt(L1, 0.65, 0.67)       # fair 0.66 x .5 x .7 = 0.231: edge gone
         self.clock[0] += 1
@@ -507,6 +507,79 @@ class Senders(unittest.TestCase):
             cm.main(["--quote-workers", "17"])
 
 
+class InPlay(unittest.TestCase):
+    """11/06 04:21-04:33Z: 6 tickets sold on ITF women's matches already in play."""
+    ITF = "KXITFWMATCH-26NOV05SHAWAN-SHA"
+
+    def test_jacks_sports_only(self):
+        legs = [[self.ITF, "yes"], [L2, "yes"]]
+        self.assertEqual(cm.pre_check(legs, cm.Config(min_legs=2)), "sport_off")            # tennis
+        self.assertIsNone(cm.pre_check(legs, cm.Config(min_legs=2, sports={"TENNIS", "NHL"})))
+        self.assertIsNone(cm.pre_check(LEGS, cm.Config()))                                  # NBA NHL NCAAMB
+        ufc = [["KXUFCFIGHT-26NOV06CORWAL-WAL", "yes"], [L2, "yes"]]
+        self.assertIsNone(cm.pre_check(ufc, cm.Config(min_legs=2)))
+        box = [["KXBOXING-26NOV07ABCDEF-ABC", "yes"], [L2, "yes"]]
+        self.assertEqual(cm.pre_check(box, cm.Config(min_legs=2)), "sport_off")
+        self.assertEqual([cm.sport_of(s) for s in ("KXNBAPTS", "KXEPLGAME", "KXNCAAF1HSPREAD", "KXATPMATCH")],
+                         ["NBA", "SOCCER", "NCAAF", "TENNIS"])
+        with self.assertRaises(SystemExit):
+            cm.main(["--sports", "NBA,CRICKET"])
+        exp = T0 + 20 * 3600
+        self.assertEqual(cm.start_of("KXUFCFIGHT-26NOV06CORWAL-WAL", exp), exp - 8 * 3600)
+
+    def test_ncaaf_starts_six_hours_before_its_expiry(self):
+        exp = T0 + 10 * 3600
+        self.assertEqual(cm.start_of("KXNCAAFGAME-26NOV07IOWANW-IOWA", exp), exp - 6 * 3600)
+        self.assertEqual(cm.start_of("KXNCAAFSPREAD-26NOV07IOWANW-IOWA3", exp), exp - 6 * 3600)
+        self.assertEqual(cm.start_of("KXNFLGAME-26NOV08LVSF-LV", exp), exp - 3 * 3600)
+        cfg = cm.Config()
+        n = "KXNCAAFGAME-26NOV07IOWANW-IOWA"
+        mk = dict(MK, **{n: mkt(n, 0.49, 0.51, start_in_h=2.0)})       # expires 5 h out: started 1 h ago
+        self.assertEqual(cm.price_check([[L1, "yes"], [n, "yes"], [L3, "no"]], mk, T0, cfg)[0], "starts_soon")
+
+    def test_a_moving_leg_is_held_out(self):
+        c = FakeClient(MK)
+        clock = [T0]
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, cm.Config(live=True, markup_per_leg=0.0), w, cm.Book(os.path.join(d.name, "s.json")),
+                     d.name, clock=lambda: clock[0])
+        m.handle(rfq_msg(rid="r1"))
+        self.assertEqual(len(c.posts), 1)
+        def fresh(rid):
+            msg = rfq_msg(rid=rid)
+            msg["msg"]["created_ts"] = iso(clock[0] - 0.2)
+            return msg
+        clock[0] += 60
+        c.mk[L2] = mkt(L2, 0.55, 0.57)                              # 0.50 -> 0.56 in a minute: in play
+        m.handle(fresh("r2"))
+        self.assertEqual((len(c.posts), m.st["why"].get("moving")), (1, 1))
+        clock[0] += 60
+        n = len(c.gets)
+        m.handle(fresh("r3"))                                       # held out: skipped before any read
+        self.assertEqual((m.st["why"].get("moving"), len(c.gets)), (2, n))
+        clock[0] += cm.MOVE_HOLD_S + 1
+        m.handle(fresh("r4"))                                       # the hold is over, the leg is still
+        self.assertEqual(len(c.posts), 2)
+
+    def test_the_last_look_declines_a_moving_leg(self):
+        c = FakeClient(MK)
+        clock = [T0]
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, cm.Config(live=True, markup_per_leg=0.0), w, cm.Book(os.path.join(d.name, "s.json")),
+                     d.name, clock=lambda: clock[0])
+        m.handle(rfq_msg(rid="r1"))
+        nb = c.posts[0][1]["no_bid"]
+        clock[0] += 5
+        c.mk[L3] = mkt(L3, 0.22, 0.24)                              # 0.30 -> 0.23 between quote and accept
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": nb}})
+        self.assertEqual(c.puts, [])
+        self.assertEqual(w.k("decline")[0]["why"], "moving")
+
+
 class LegMarkup(unittest.TestCase):
     """Jack 2026-11-05: "quote a higher spread, the more legs"."""
 
@@ -623,7 +696,7 @@ class MoreSports(unittest.TestCase):
     TEN = "KXATPCHALLENGERMATCH-26NOV06MONCEC-CEC"
 
     def test_groups_and_filters(self):
-        cfg = cm.Config(min_legs=2, min_lead_min=5)
+        cfg = cm.Config(min_legs=2, min_lead_min=5, sports=set(cm.ALL_SPORTS))   # tennis is off by default (InPlay)
         self.assertIsNone(cm.pre_check([[self.EPL1, "yes"], [self.EPL2, "no"], [L1, "yes"]], cfg))
         self.assertIsNone(cm.pre_check([[self.TEN, "yes"], [L2, "yes"]], cfg))
         self.assertIsNone(cm.pre_check([[PROP, "yes"], [self.EPL1, "yes"]], cfg))
