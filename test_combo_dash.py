@@ -107,6 +107,16 @@ class Dash(unittest.TestCase):
         cd.snapshot(self.d.name, self.d.name, NOW + 5, k)
         self.assertEqual(len(k.client.calls), n)
 
+    def test_a_kalshi_canceled_fill_is_not_counted(self):
+        day = datetime.fromtimestamp(NOW, timezone.utc).strftime("%Y-%m-%d")
+        with open(os.path.join(self.d.name, f"combo_{day}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"k": "executed", "quote_id": "q1", "mt": "KXMVECROSSCATEGORY-S2026A-B"}) + "\n")
+            f.write(json.dumps({"k": "unfilled", "t": NOW - 20, "mt": "KXMVECROSSCATEGORY-S2026A-B",
+                                "why": "canceled"}) + "\n")
+        s = cd.snapshot(self.d.name, self.d.name, NOW)
+        self.assertEqual((s["funnel"]["executed"], s["funnel"]["unfilled"]), (0, 1))
+        self.assertIn("1 canceled by Kalshi, 0 filled", cd.render(s))
+
     def test_stopped_when_quiet(self):
         s = cd.snapshot(self.d.name, self.d.name, NOW + 600)
         self.assertFalse(s["running"])

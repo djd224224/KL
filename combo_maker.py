@@ -31,15 +31,21 @@ The exchange adds its own: only the combo shard's cash (shard 1) can back a
 fill, so what Jack moves there is the most the pilot can ever put at risk.
 
 SAFETY: nothing is sent without --live (DRY prices and logs the quotes it
-would send). After each fill it reads the position back: a YES position on a
-combo (the wrong direction) writes the STOP file and stops. STOP file:
+would send). A ticket counts as filled only once Kalshi's order says so: the
+maker reads each confirmed ticket's order until it is final and books the
+contracts and fee Kalshi recorded; nothing filled = "unfilled", which frees
+its caps (quote_executed alone is not a fill: 11/06 03:04Z Kalshi canceled
+one such order 5 s later with 0 filled). An order that bought YES, or a YES
+position read back after one of the first fills, is the wrong direction: it
+writes the STOP file and stops. STOP file:
 run-logs\combo-maker\combo_maker.stop (it also refuses to start while the
 file exists). One instance at a time (combo_maker.lock). Open tickets persist
 in maker_state.json, so a restart keeps counting them against the caps;
 settlements are read every SETTLE_EVERY_S and free their exposure.
 
 Logs: run-logs\combo-maker\combo_<UTC date>.jsonl (quote / accept / confirm /
-decline / executed / position / settled / stat / err) and the console.
+decline / executed / filled / unfilled / position / settled / stat / err) and
+the console.
 
   python combo_maker.py                      # DRY: price and log, send nothing
   python combo_maker.py --live               # quote for real (Jack starts it)
@@ -81,6 +87,9 @@ SETTLE_EVERY_S = 300.0
 STAT_SECS = 60.0
 QUOTE_TTL_S = 120.0                 # forget our quote this long after it was sent
 DIRECTION_CHECKS = 3                # read back the position of the first N fills
+FILL_CHECK_AFTER_S = 3.0            # read a ticket's order this long after quote_executed...
+FILL_CHECK_EVERY_S = 5.0            # ...and again this often until Kalshi calls it final
+NO_ORDER_AFTER_S = 60.0             # confirmed, no order on Kalshi after this long: nothing traded
 DIRECTION_TRIES = 5                 # ...up to this many reads each
 ET_OFFSET = None                    # filled by et_today()
 
@@ -596,6 +605,69 @@ class Maker:
         self.book.save()
         self.w.write({"k": "executed", "quote_id": qid, "mt": t["mt"], "order_id": msg.get("order_id")})
 
+    def check_fills(self, now: float) -> None:
+        """Kalshi's word on every confirmed ticket. quote_executed is not proof
+        of a fill (11/06 03:04Z: it came for an order Kalshi canceled 5 s later
+        with 0 filled, and the maker booked a phantom ticket), so each ticket's
+        order is read until it is final (executed / canceled). With no executed
+        message, our orders on its combo are looked up instead. Then the ticket
+        takes the contracts Kalshi filled and the fee it charged; nothing filled
+        = "unfilled", out of the caps and the P&L. An order that bought YES is
+        the wrong direction: STOP, exit 5."""
+        for t in self.book.tickets:
+            if t.get("status") not in ("confirmed", "executed") or t.get("fill_checked"):
+                continue
+            since = t.get("executed_at") or t.get("at") or now
+            if now - since < FILL_CHECK_AFTER_S or now - t.get("fill_read_at", 0.0) < FILL_CHECK_EVERY_S:
+                continue
+            t["fill_read_at"] = now
+            try:
+                if t.get("order_id"):
+                    o = (self.c.get(f"/portfolio/orders/{t['order_id']}", {}) or {}).get("order") or {}
+                else:
+                    js = self.c.get("/portfolio/orders", {"ticker": t["mt"],
+                                                         "min_ts": int((t.get("at") or now) - 5), "limit": 20})
+                    mine = [x for x in js.get("orders") or [] if x.get("ticker") == t["mt"]]
+                    if not mine:
+                        if now - (t.get("at") or now) >= NO_ORDER_AFTER_S:
+                            self._book_fill(t, 0.0, "no order on Kalshi", None)
+                        continue
+                    o = mine[0]
+                    t["order_id"] = o.get("order_id")
+            except Exception as e:
+                self._error("fill check", e)
+                continue
+            status = str(o.get("status") or "")
+            if status not in ("executed", "canceled"):
+                continue                                    # still resting: read it again
+            filled = _f(o.get("fill_count_fp"), 0.0) or 0.0
+            if filled > 1e-9 and str(o.get("side")) == "yes" and str(o.get("action")) == "buy":
+                self.stop_file(f"WRONG DIRECTION: order {t.get('order_id')} bought {filled} YES on {t['mt']}")
+                raise SystemExit(5)
+            fees = [_f(o.get(k)) for k in ("maker_fees_dollars", "taker_fees_dollars")]
+            fee = sum(x for x in fees if x is not None) if any(x is not None for x in fees) else None
+            self._book_fill(t, filled, status, fee)
+
+    def _book_fill(self, t: dict, filled: float, why: str, fee) -> None:
+        t["fill_checked"] = True
+        t.setdefault("contracts_quoted", t["contracts"])
+        if filled <= 1e-9:
+            t["status"], t["contracts"], t["fee_est"] = "unfilled", 0.0, 0.0
+            self.w.write({"k": "unfilled", "t": self.clock(), "mt": t["mt"], "order_id": t.get("order_id"),
+                          "why": why, "quoted": t["contracts_quoted"]})
+            log(f"! {t['mt']}: NOT filled ({why}): Kalshi has no fill, the ticket is dropped")
+        else:
+            t["contracts"] = filled
+            if fee is None:                                 # no fee on the order: the table's
+                fee = 0.0 if self.cfg.fee_free(t["legs"]) else maker_fee(filled, t["ask"])
+            t["fee_est"] = fee
+            if t.get("status") != "executed":           # filled without a quote_executed message
+                t["status"], t["executed_at"] = "executed", self.clock()
+            self.w.write({"k": "filled", "t": self.clock(), "mt": t["mt"], "order_id": t.get("order_id"),
+                          "contracts": filled, "quoted": t["contracts_quoted"], "fee": fee})
+            log(f"fill check {t['mt']}: {filled:,.2f} of {t['contracts_quoted']:,.2f} filled, fee ${fee:,.4f}")
+        self.book.save()
+
     def check_direction(self, t: dict) -> None:
         """We should hold NO on the combo (short its YES). A YES position means
         the quote's side was read backwards: write STOP and stop at once. No
@@ -624,9 +696,12 @@ class Maker:
         self.book.save()
 
     def _error(self, what, e):
+        body = str(getattr(e, "body", "") or e)[:300]
+        if "rfq_closed" in body.lower():
+            self._why("rfq_closed")       # the request closed before our quote landed: no fault, no pause
+            return
         self.errors += 1
         self.st["errors"] += 1
-        body = str(getattr(e, "body", "") or e)[:300]
         self.w.write({"k": "err", "what": what, "err": f"{type(e).__name__}: {body}"})
         log(f"! {what}: {type(e).__name__}: {body[:160]}")
         low = body.lower()
@@ -642,8 +717,10 @@ class Maker:
         now = self.clock()
         for qid in [k for k, q in self.quotes.items() if now - q["at"] > QUOTE_TTL_S]:
             del self.quotes[qid]
+        if self.cfg.live:
+            self.check_fills(now)
         if self.direction_checks < DIRECTION_CHECKS:      # the first fills' side, read back
-            t = next((x for x in self.book.tickets if x.get("status") == "executed"
+            t = next((x for x in self.book.tickets if x.get("status") == "executed" and x.get("fill_checked")
                       and "dir_ok" not in x and now - x.get("executed_at", now) >= 3.0), None)
             if t is not None:
                 self.check_direction(t)
@@ -664,7 +741,7 @@ class Maker:
             self._reset_stats()
 
     def settle(self) -> None:
-        open_t = [t for t in self.book.tickets if t.get("status") == "executed"]
+        open_t = [t for t in self.book.tickets if t.get("status") == "executed" and t.get("fill_checked")]
         if not open_t:
             return
         try:

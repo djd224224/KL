@@ -223,7 +223,8 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
         "last_line_age": (now - last_t) if last_t else None,
         "funnel": {"quotes": count("quote"), "would": count("would_quote"), "accepted": count("accept"),
                    "confirmed": count("confirm"), "declined": count("decline"),
-                   "executed": count("executed"), "errors": count("err")},
+                   "executed": count("executed") - count("unfilled"), "unfilled": count("unfilled"),
+                   "errors": count("err")},
         "declines": declines,
         "open": open_t, "settled": settled,
         "open_loss": sum(t["contracts"] * (1.0 - t["ask"]) for t in open_t),
@@ -233,7 +234,8 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
         "losses": sum(1 for t in settled if t.get("result") == "yes"),
         "last_stat": stats[-1] if stats else None,
         "feed": [e for e in events if e.get("k") in ("quote", "would_quote", "accept", "confirm", "decline",
-                                                       "executed", "settled", "err", "position", "start",
+                                                       "executed", "filled", "unfilled", "settled", "err",
+                                                       "position", "start",
                                                        "stop")][-FEED_N:][::-1],
         "kalshi": k, "fees": sum(_f(x.get("fee_cost"), 0.0) for x in fills), "fills": fills,
         "pulse": shadow_pulse(shadow_dir, now),
@@ -298,7 +300,7 @@ th{text-align:left;font-size:11px;color:var(--muted);font-weight:600;padding:7px
 td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border-bottom:0}
 td.n,th.n{text-align:right;white-space:nowrap}
 .k{display:inline-block;min-width:74px;font-size:11px;font-weight:700;padding:1px 6px;border-radius:6px;background:var(--chip);text-align:center}
-.k.confirm,.k.executed{color:var(--pos)}.k.decline,.k.err{color:var(--neg)}.k.accept{color:var(--accent)}
+.k.confirm,.k.executed,.k.filled{color:var(--pos)}.k.decline,.k.err,.k.unfilled{color:var(--neg)}.k.accept{color:var(--accent)}
 .empty{padding:14px;color:var(--muted)}
 .chips span{display:inline-block;background:var(--chip);border-radius:6px;padding:1px 7px;margin:2px 4px 2px 0;font-size:12px}
 footer{margin:20px 0 6px;color:var(--muted);font-size:12px}
@@ -340,7 +342,8 @@ def render(s: dict) -> str:
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "
              f"<span class='arrow'>&rarr;</span> <b>{fn['executed']:,}</b> filled"
-             f"<span class='muted'>&nbsp;&middot; {fn['declined']} declined at the last look &middot; "
+             + (f" ({fn['unfilled']} canceled by Kalshi, 0 filled)" if fn.get("unfilled") else "")
+             + f"<span class='muted'>&nbsp;&middot; {fn['declined']} declined at the last look &middot; "
              f"{fn['errors']} errors</span></div>")
     if s["declines"]:
         H.append("<div class='chips small' style='margin-top:6px'>Declined because: " + "".join(

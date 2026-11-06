@@ -55,6 +55,8 @@ class FakeClient:
         self.mk = dict(markets)
         self.posts, self.puts, self.gets = [], [], []
         self.position = position
+        self.orders = {}             # order id -> order; default: executed, |position| filled, NO
+        self.post_error = None
 
     def get(self, path, params):
         self.gets.append((path, dict(params)))
@@ -62,11 +64,21 @@ class FakeClient:
             return {"markets": [m for m in self.mk.values() if m.get("event_ticker") == params["event_ticker"]]}
         if path == "/markets":
             return {"markets": [self.mk[t] for t in params["tickers"].split(",") if t in self.mk]}
+        if path.startswith("/portfolio/orders/"):
+            oid = path.rsplit("/", 1)[1]
+            return {"order": self.orders.get(oid) or {
+                "order_id": oid, "status": "executed", "side": "no", "action": "buy",
+                "fill_count_fp": f"{abs(self.position):.2f}", "maker_fees_dollars": "0.100000",
+                "taker_fees_dollars": "0.000000"}}
+        if path == "/portfolio/orders":
+            return {"orders": [o for o in self.orders.values() if o.get("ticker") == params.get("ticker")]}
         if path == "/portfolio/positions":
             return {"market_positions": [{"ticker": params["ticker"], "position_fp": f"{self.position:.2f}"}]}
         raise AssertionError(path)
 
     def post(self, path, body):
+        if self.post_error is not None:
+            raise self.post_error
         self.posts.append((path, json.loads(body)))
         return {"id": f"q{len(self.posts)}"}
 
@@ -249,13 +261,120 @@ class MakerFlow(unittest.TestCase):
         m.handle(rfq_msg())
         m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
         m.handle({"type": "quote_executed", "msg": {"quote_id": "q1", "order_id": "o1"}})
+        self.assertAlmostEqual(self.book.tickets[0]["fee_est"], 0.035 * (10 / 0.231) * 0.231 * 0.769)  # table
+        m.settle()                                                   # not before Kalshi's fill check
+        self.assertEqual(self.book.tickets[0]["status"], "executed")
+        self.clock[0] += 5
+        m.upkeep()                                                   # books 40 filled, fee $0.10
         self.client.mk["KXMVECROSSCATEGORY-S2026X-Y"] = {"ticker": "KXMVECROSSCATEGORY-S2026X-Y", "result": "no"}
         m.settle()
         t = self.book.tickets[0]
         self.assertEqual(t["status"], "settled")
-        self.assertAlmostEqual(t["pnl"], 10.0 - t["fee_est"])        # kept the $10 premium, less the fee
-        self.assertAlmostEqual(t["fee_est"], 0.035 * (10 / 0.231) * 0.231 * 0.769)
+        self.assertAlmostEqual(t["pnl"], 40.0 * 0.231 - 0.10)        # kept the premium, less Kalshi's fee
         self.assertEqual(self.book.open(), [])
+
+
+class FillCheck(unittest.TestCase):
+    """11/06 03:04Z: quote_executed came for an order Kalshi canceled 5 s later
+    with 0 filled; the maker booked it. Tickets now take Kalshi's order."""
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.clock = [T0]
+        self.w = W()
+        self.c = FakeClient(MK)
+        self.book = cm.Book(os.path.join(self.d.name, "state.json"))
+        self.m = cm.Maker(self.c, cm.Config(live=True, markup_per_leg=0.0), self.w, self.book, self.d.name,
+                          clock=lambda: self.clock[0])
+
+    def fill(self, executed=True):
+        self.m.handle(rfq_msg())
+        self.m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
+        if executed:
+            self.m.handle({"type": "quote_executed", "msg": {"quote_id": "q1", "order_id": "o1"}})
+
+    def order(self, status, filled, side="no", fee="0.050000", ticker="KXMVECROSSCATEGORY-S2026X-Y"):
+        return {"order_id": "o1", "ticker": ticker, "status": status, "side": side, "action": "buy",
+                "fill_count_fp": f"{filled:.2f}", "maker_fees_dollars": fee, "taker_fees_dollars": "0.000000"}
+
+    def tick(self, s):
+        self.clock[0] += s
+        self.m.upkeep()
+
+    def test_canceled_with_nothing_filled_is_dropped(self):
+        self.fill()
+        self.c.orders["o1"] = self.order("canceled", 0.0)
+        self.tick(5)
+        t = self.book.tickets[0]
+        self.assertEqual((t["status"], t["contracts"], t["fee_est"]), ("unfilled", 0.0, 0.0))
+        self.assertEqual((self.book.open(), self.book.open_loss()), ([], 0.0))
+        self.assertEqual(self.book.day_count(t["day"]), 0)
+        self.assertEqual(len(self.w.k("unfilled")), 1)
+        self.assertFalse(any(p == "/portfolio/positions" for p, _ in self.c.gets))   # no position check on it
+
+    def test_partial_fill_takes_kalshis_count_and_fee(self):
+        self.fill()
+        self.c.orders["o1"] = self.order("executed", 20.0, fee="0.041000")
+        self.tick(5)
+        t = self.book.tickets[0]
+        self.assertEqual((t["status"], t["contracts"], t["fee_est"]), ("executed", 20.0, 0.041))
+        self.assertAlmostEqual(t["contracts_quoted"], 10 / 0.231)
+        self.assertAlmostEqual(self.book.open_loss(), 20.0 * 0.769)
+        self.assertEqual(self.w.k("filled")[0]["contracts"], 20.0)
+
+    def test_a_resting_order_is_read_again(self):
+        self.fill()
+        self.c.orders["o1"] = self.order("resting", 0.0)
+        self.tick(5)
+        self.assertNotIn("fill_checked", self.book.tickets[0])
+        self.tick(1)                                          # within 5 s: no second read
+        self.assertEqual(sum(1 for p, _ in self.c.gets if p == "/portfolio/orders/o1"), 1)
+        self.c.orders["o1"] = self.order("executed", 43.29)
+        self.tick(5)
+        self.assertEqual((self.book.tickets[0]["status"], self.book.tickets[0]["contracts"]), ("executed", 43.29))
+
+    def test_confirmed_without_an_executed_message(self):
+        self.fill(executed=False)
+        self.tick(5)                                          # no order yet, under a minute: wait
+        self.assertEqual(self.book.tickets[0]["status"], "confirmed")
+        self.tick(60)                                         # still none: nothing traded
+        self.assertEqual(self.book.tickets[0]["status"], "unfilled")
+        self.assertEqual(self.w.k("unfilled")[0]["why"], "no order on Kalshi")
+
+    def test_confirmed_without_an_executed_message_but_filled(self):
+        self.fill(executed=False)
+        self.c.orders["o7"] = dict(self.order("executed", 43.29), order_id="o7")
+        self.tick(5)
+        t = self.book.tickets[0]
+        self.assertEqual((t["status"], t["order_id"], t["contracts"]), ("executed", "o7", 43.29))
+
+    def test_an_order_that_bought_yes_writes_stop(self):
+        self.fill()
+        self.c.orders["o1"] = self.order("executed", 43.29, side="yes")
+        self.clock[0] += 5
+        with self.assertRaises(SystemExit) as cx:
+            self.m.upkeep()
+        self.assertEqual(cx.exception.code, 5)
+        self.assertTrue(os.path.exists(os.path.join(self.d.name, cm.STOP_NAME)))
+
+    def test_a_ticket_booked_before_the_check_is_reconciled_on_start(self):
+        old = {"quote_id": "qz", "mt": "KXMVECROSSCATEGORY-S2026Z-Z", "legs": LEGS, "games": ["g"], "ask": 0.166,
+               "contracts": 21.0, "status": "executed", "order_id": "oz", "day": "2026-11-05", "at": T0 - 600,
+               "executed_at": T0 - 599, "fee_est": 0.1, "dir_ok": False}
+        self.book.tickets.append(old)
+        self.c.orders["oz"] = dict(self.order("canceled", 0.0), order_id="oz")
+        self.tick(0)
+        self.assertEqual(self.book.tickets[0]["status"], "unfilled")
+        again = cm.Book(os.path.join(self.d.name, "state.json"))
+        self.assertEqual(again.open(), [])
+
+    def test_rfq_closed_is_not_an_error(self):
+        self.c.post_error = Exception('HttpError: {"error":{"code":"rfq_closed","message":"rfq closed"}}')
+        self.m.handle(rfq_msg())
+        self.assertEqual((self.m.errors, self.m.st["errors"], self.w.k("err")), (0, 0, []))
+        self.assertEqual(self.m.st["why"].get("rfq_closed"), 1)
+        self.assertEqual(self.m.pause_until, 0.0)
 
 
 class LegMarkup(unittest.TestCase):
