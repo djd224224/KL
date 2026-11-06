@@ -12,12 +12,19 @@ the fills Kalshi recorded (price, fee), the latest minute's RFQ funnel, and a
 feed of the recent events.
 
 READ-ONLY. It reads the maker's files in run-logs\combo-maker (maker_state.json
-and combo_<UTC date>.jsonl), the shadow logger's last stat line
-(run-logs\combo-rfq), and at most once a minute three Kalshi reads: the shard
-balances, today's fills, and the open tickets' combo markets. It places nothing.
-It binds 127.0.0.1 only.
+and combo_<UTC date>.jsonl, or the .jsonl.gz the maker makes of a finished day),
+the shadow logger's last stat line (run-logs\combo-rfq), and at most once a
+minute three Kalshi reads: the shard balances, today's fills, and the open
+tickets' combo markets. It places nothing. It binds 127.0.0.1 only.
+
+A page load reads only the log lines written since the last one (MakerLog), and
+the Kalshi reads refresh on a background thread, so a load takes milliseconds
+however big the day's log gets (11/06: 133 MB by 9 AM ET had made it 8-22 s).
 """
 import argparse
+import collections
+import contextlib
+import gzip
 import html
 import json
 import math
@@ -25,6 +32,7 @@ import os
 import sys
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -40,6 +48,11 @@ KALSHI_TTL_S = 60.0
 RUNNING_S = 120.0          # a maker with no line this recent is shown as stopped
 FEED_N = 40
 KINDS = {"GAME": "win", "SPREAD": "spread", "TOTAL": "total"}
+FEED_KINDS = frozenset(("quote", "would_quote", "accept", "confirm", "decline", "executed", "filled", "unfilled",
+                        "settled", "err", "position", "start", "stop"))
+COUNT_KINDS = frozenset(("quote", "would_quote", "accept", "confirm", "decline", "executed", "unfilled", "err"))
+READ_CHUNK = 8 << 20       # the log is read in 8 MB pieces (a cold start reads a whole day)
+BUSY_MAX_S = 120.0         # a background Kalshi read this old is given up on and tried again
 
 
 def _f(x, dflt=None):
@@ -91,9 +104,13 @@ def read_events(maker_dir: str, now: float, days: int = 2) -> list:
     for d in range(days - 1, -1, -1):
         day = datetime.fromtimestamp(now - d * 86400, timezone.utc).strftime("%Y-%m-%d")
         p = os.path.join(maker_dir, f"combo_{day}.jsonl")
-        if not os.path.exists(p):
+        if os.path.exists(p):
+            f = open(p, encoding="utf-8")
+        elif os.path.exists(p + ".gz"):
+            f = gzip.open(p + ".gz", "rt", encoding="utf-8")
+        else:
             continue
-        with open(p, encoding="utf-8") as f:
+        with f:
             for line in f:
                 try:
                     e = json.loads(line)
@@ -105,6 +122,197 @@ def read_events(maker_dir: str, now: float, days: int = 2) -> list:
                 e["_ts"] = own or last
                 out.append(e)
     return out
+
+
+# The page's own reader (Jack 2026-11-06 "http://127.0.0.1:8772/ broken"): a load
+# used to re-parse the whole day's log -- 133 MB and 197,000 quote lines by 9 AM ET,
+# 8 s a load and growing all day -- and the maker gzips a day's file at the UTC
+# day roll (combo_<day>.jsonl -> .jsonl.gz), which the page then lost, start line
+# and all (NOT RUNNING, no config, today's funnel gone). MakerLog keeps a small
+# summary per UTC day and parses only the lines appended since the last load;
+# quote lines (all but a few hundred) are counted from their "at" without a full
+# parse, and only the feed's last few are parsed, when shown.
+
+def _quote_at(line: bytes):
+    """A quote line's own time (its "at"), read without parsing the line; None
+    when the line is not the maker's plain quote shape (it is parsed in full)."""
+    if (b'"k":"quote"' not in line and b'"k": "quote"' not in line) or b'"t":' in line:
+        return None
+    i = line.find(b'"at":')
+    if i < 0:
+        return None
+    ends = [j for j in (line.find(b",", i + 5), line.find(b"}", i + 5)) if j >= 0]
+    if not ends:
+        return None
+    try:
+        return float(line[i + 5:min(ends)]) or None
+    except ValueError:
+        return None
+
+
+class _DaySum:
+    """One UTC day's maker log, summed as it is read: what the page shows of it."""
+
+    def __init__(self, last: float = 0.0):
+        self.off = 0                  # bytes of whole lines read
+        self.final = False            # read to its end from the .gz: the maker closed the day
+        self.last = last              # the last stamped line's time (an unstamped line takes it)
+        self.max_ts = 0.0
+        self.last_start = None        # the day's last start line, the latest time from it on,
+        self.max_after = 0.0          # and whether a stop came after it
+        self.stop_after = self.any_stop = False
+        self.last_stat = None
+        self.counts = {}              # (UTC hour, kind) -> lines (ET midnights fall on whole hours)
+        self.whys = {}                # (UTC hour, why) -> declines
+        self.quotes = self.accepts = 0
+        self.first_quote = None
+        self.settle_ts = {}           # combo -> its settled line's time
+        self.feed = collections.deque(maxlen=FEED_N)     # parsed lines, or (time, raw) for quotes
+
+    def read(self, f, final: bool = False) -> None:
+        """The lines from self.off on (f binary). An unfinished last line waits for
+        the next read -- the maker may be writing it -- unless final."""
+        f.seek(self.off)
+        tail = b""
+        counts, feed = self.counts, self.feed
+        while True:
+            chunk = f.read(READ_CHUNK)
+            if not chunk:
+                break
+            data = tail + chunk
+            cut = data.rfind(b"\n") + 1
+            for line in data[:cut].split(b"\n"):
+                if len(line) < 3:
+                    continue
+                at = _quote_at(line)
+                if at is None:
+                    self._line(line)
+                    continue
+                # a quote line (nearly all of them): what _seen does for one, inline
+                self.last = at
+                if at > self.max_ts:
+                    self.max_ts = at
+                if self.last_start is not None and at > self.max_after:
+                    self.max_after = at
+                key = (int(at // 3600) * 3600, "quote")
+                counts[key] = counts.get(key, 0) + 1
+                self.quotes += 1
+                if self.first_quote is None or at < self.first_quote:
+                    self.first_quote = at
+                feed.append((at, line))
+            self.off += cut
+            tail = data[cut:]
+        if final and tail.strip():
+            self._line(tail)
+            self.off += len(tail)
+
+    def _line(self, line: bytes) -> None:
+        at = _quote_at(line)
+        if at is not None:
+            self.last = at
+            self._seen("quote", at, None, line)
+            return
+        try:
+            e = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(e, dict):
+            return
+        own = _f(e.get("t")) or _f(e.get("at"))
+        if own:
+            self.last = own
+        e["_ts"] = own or self.last
+        self._seen(e.get("k"), e["_ts"], e, None)
+
+    def _seen(self, k, ts: float, e, raw) -> None:
+        if ts > self.max_ts:
+            self.max_ts = ts
+        if k == "start":
+            self.last_start, self.max_after, self.stop_after = e, ts, False
+        elif self.last_start is not None and ts > self.max_after:
+            self.max_after = ts
+        if k == "stop":
+            self.stop_after = self.any_stop = True
+        if k in COUNT_KINDS:
+            h = int(ts // 3600) * 3600
+            self.counts[(h, k)] = self.counts.get((h, k), 0) + 1
+            if k == "decline":
+                w = e.get("why")
+                self.whys[(h, w)] = self.whys.get((h, w), 0) + 1
+        if k == "quote":
+            self.quotes += 1
+            if self.first_quote is None or ts < self.first_quote:
+                self.first_quote = ts
+        elif k == "accept":
+            self.accepts += 1
+        elif k == "stat":
+            self.last_stat = e
+        elif k == "settled":
+            self.settle_ts[e.get("mt")] = ts
+        if k in FEED_KINDS:
+            self.feed.append(e if e is not None else (ts, raw))
+
+
+def _feed_event(x) -> dict:
+    if not isinstance(x, tuple):
+        return x
+    ts, raw = x
+    try:
+        e = json.loads(raw)
+    except ValueError:
+        e = {"k": "quote"}
+    e["_ts"] = ts
+    return e
+
+
+class MakerLog:
+    """The maker's last `days` UTC days of log, one _DaySum each, read as they
+    grow; a day the maker has gzipped is read to its end once from the .gz."""
+
+    def __init__(self, maker_dir: str, days: int = 2):
+        self.dir, self.days = maker_dir, days
+        self.sums = {}                # UTC day -> _DaySum
+        self.lock = threading.Lock()
+
+    def update(self, now: float) -> list:
+        """The days' summaries, oldest first, read up to now."""
+        with self.lock:
+            want = [datetime.fromtimestamp(now - d * 86400, timezone.utc).strftime("%Y-%m-%d")
+                    for d in range(self.days - 1, -1, -1)]
+            for day in list(self.sums):
+                if day not in want:
+                    del self.sums[day]
+            out, last = [], 0.0
+            for day in want:
+                s = self._read(day, self.sums.get(day), last)
+                if s is None:
+                    self.sums.pop(day, None)
+                    continue
+                self.sums[day] = s
+                out.append(s)
+                last = s.last
+            return out
+
+    def _read(self, day: str, s, last: float):
+        p = os.path.join(self.dir, f"combo_{day}.jsonl")
+        try:
+            if os.path.exists(p):
+                if s is None or s.final or os.path.getsize(p) < s.off:
+                    s = _DaySum(last)                       # new, or the file was replaced
+                with open(p, "rb") as f:
+                    s.read(f)
+                return s
+            if os.path.exists(p + ".gz"):
+                if s is not None and s.final:
+                    return s
+                s = s or _DaySum(last)                      # the rest of a day read while plain
+                with gzip.open(p + ".gz", "rb") as f:
+                    s.read(f, final=True)
+                s.final = True
+                return s
+        except (OSError, EOFError, zlib.error):             # a file mid-roll: keep what was read
+            return s
+        return None
 
 
 def read_state(maker_dir: str) -> list:
@@ -146,15 +354,21 @@ def shadow_pulse(shadow_dir: str, now: float):
 
 class KalshiReads:
     """Shard cash, today's combo fills and the open combos' markets, refreshed
-    at most every KALSHI_TTL_S; a failed read keeps the last good one."""
+    at most every KALSHI_TTL_S; a failed read keeps the last good one. Only the
+    first read is made inline; after it a refresh runs on a background thread and
+    a page gets the last reads meanwhile (11/06: a load waited ~2 s on these once
+    a minute, and ~3 s on the candles every 5 min)."""
 
-    def __init__(self, client_factory=None, ttl: float = KALSHI_TTL_S):
+    def __init__(self, client_factory=None, ttl: float = KALSHI_TTL_S, background: bool = True):
         self.factory = client_factory
         self.ttl = ttl
+        self.background = background
         self.client = None
         self.at = 0.0
+        self.busy, self.busy_since, self.tries, self.thread = False, 0.0, 0, None
         self.data = {"cash": None, "fills": [], "markets": {}, "error": None, "at": None}
         self.lock = threading.Lock()
+        self.io = threading.Lock()            # one read at a time on the shared client (the candles' too)
 
     def _client(self):
         if self.client is None:
@@ -168,10 +382,22 @@ class KalshiReads:
 
     def get(self, now: float, open_tickers, day_start: float) -> dict:
         with self.lock:
-            if now - self.at < self.ttl:
+            if now - self.at < self.ttl or (self.busy and now - self.busy_since < BUSY_MAX_S):
                 return self.data
-            self.at = now
-            try:
+            self.at, self.busy, self.busy_since = now, True, now
+            inline = not self.background or self.tries == 0
+            self.tries += 1
+        args = (now, sorted(set(open_tickers)), day_start)
+        if inline:
+            self._refresh(*args)
+        else:
+            self.thread = threading.Thread(target=self._refresh, args=args, daemon=True)
+            self.thread.start()
+        return self.data
+
+    def _refresh(self, now: float, tks: list, day_start: float) -> None:
+        try:
+            with self.io:
                 c = self._client()
                 bal = c.get("/portfolio/balance", {})
                 cash = {int(r.get("exchange_index")): _f(r.get("balance"), 0.0)
@@ -180,15 +406,15 @@ class KalshiReads:
                 fills = [x for x in fj.get("fills") or []
                          if str(x.get("market_ticker") or x.get("ticker") or "").startswith("KXMVE")]
                 mk = {}
-                tks = sorted(set(open_tickers))
                 for i in range(0, len(tks), 100):
                     mj = c.get("/markets", {"tickers": ",".join(tks[i:i + 100]), "limit": 1000})
                     for m in mj.get("markets") or []:
                         mk[m.get("ticker")] = m
-                self.data = {"cash": cash.get(1), "fills": fills, "markets": mk, "error": None, "at": now}
-            except Exception as e:
-                self.data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
-            return self.data
+            data = {"cash": cash.get(1), "fills": fills, "markets": mk, "error": None, "at": now}
+        except Exception as e:
+            data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
+        with self.lock:
+            self.data, self.busy = data, False
 
 
 # ---- P&L (Jack 2026-11-06: "show total pnl, settled and unrealized, premiums and trading") ----
@@ -257,23 +483,31 @@ def pnl_parts(open_t, settled, markets) -> dict:
 
 # ---- the snapshot ----------------------------------------------------------------
 
-def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=None) -> dict:
-    events = read_events(maker_dir, now)
+def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=None, logs=None) -> dict:
+    """The page's numbers. `logs`: the server's MakerLog (only new lines are read);
+    without one the log is read whole."""
+    days = (logs if logs is not None else MakerLog(maker_dir)).update(now)
     tickets = read_state(maker_dir)
     day0 = et_midnight(now)
-    starts = [e for e in events if e.get("k") == "start"]
-    last_start = starts[-1] if starts else None
-    after_start = events[events.index(last_start):] if last_start else []
-    stopped = any(e.get("k") == "stop" for e in after_start)
-    stats = [e for e in events if e.get("k") == "stat"]
-    last_t = max((_ev_ts(e) for e in after_start), default=0.0)
+    last_start, stopped, last_t = None, False, 0.0
+    for d in days:                                   # oldest first: the last start, and what came after
+        if d.last_start is not None:
+            last_start, stopped, last_t = d.last_start, d.stop_after, d.max_after
+        elif last_start is not None:
+            stopped, last_t = stopped or d.any_stop, max(last_t, d.max_ts)
     running = bool(last_start) and not stopped and now - last_t <= RUNNING_S
-    today = [e for e in events if _ev_ts(e) >= day0]
-    count = lambda k: sum(1 for e in today if e.get("k") == k)  # noqa: E731
+    today = day0 - 1.0                               # (hour buckets; day0 is a whole hour up to float error)
+    count = lambda k: sum(n for d in days for (h, kk), n in d.counts.items() if kk == k and h >= today)  # noqa: E731
     declines = {}
-    for e in today:
-        if e.get("k") == "decline":
-            declines[e.get("why")] = declines.get(e.get("why"), 0) + 1
+    for d in days:
+        for (h, w), n in d.whys.items():
+            if h >= today:
+                declines[w] = declines.get(w, 0) + n
+    stats = [d.last_stat for d in days if d.last_stat is not None]
+    settle_ts = {}
+    for d in days:
+        settle_ts.update(d.settle_ts)
+    firsts = [d.first_quote for d in days if d.first_quote is not None]
     open_t = [t for t in tickets if t.get("status") in ("confirmed", "executed")]
     settled = [t for t in tickets if t.get("status") == "settled"]
     k = None
@@ -282,7 +516,6 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
     fills = (k or {}).get("fills") or []
     pnl = pnl_parts(open_t, settled, (k or {}).get("markets") or {})
     filled = filled_tickets(tickets)
-    settle_ts = {e.get("mt"): _ev_ts(e) for e in events if e.get("k") == "settled"}
     hist = history.get(now, filled, (k or {}).get("markets") or {}, settle_ts) if history is not None else None
     series = [p for p in (hist or {}).get("series") or [] if p["t"] < now]
     if filled:                                     # the last point is the cards' live P&L
@@ -305,15 +538,13 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
         "settled_pnl": sum(_f(t.get("pnl"), 0.0) for t in settled),
         "pnl": pnl,
         "series": series, "fill_points": fill_points(filled),
-        "fill_rate": fill_rate(events, filled),
+        "fill_rate": _fill_rate(sum(d.quotes for d in days), sum(d.accepts for d in days),
+                                min(firsts) if firsts else None, filled),
         "history_error": (hist or {}).get("error"),
         "wins": sum(1 for t in settled if t.get("result") == "no"),
         "losses": sum(1 for t in settled if t.get("result") == "yes"),
         "last_stat": stats[-1] if stats else None,
-        "feed": [e for e in events if e.get("k") in ("quote", "would_quote", "accept", "confirm", "decline",
-                                                       "executed", "filled", "unfilled", "settled", "err",
-                                                       "position", "start",
-                                                       "stop")][-FEED_N:][::-1],
+        "feed": [_feed_event(x) for x in [x for d in days for x in d.feed][-FEED_N:]][::-1],
         "kalshi": k, "fees": sum(_f(x.get("fee_cost"), 0.0) for x in fills), "fills": fills,
         "pulse": shadow_pulse(shadow_dir, now),
     }
@@ -461,10 +692,13 @@ def fill_rate(events, filled) -> dict:
     fills / quotes sent, over the maker's logs the page reads (since its first
     quote there), with the accepted share beside it."""
     qs = [_ev_ts(e) for e in events if e.get("k") == "quote"]
-    if not qs:
+    return _fill_rate(len(qs), sum(1 for e in events if e.get("k") == "accept"), min(qs) if qs else None, filled)
+
+
+def _fill_rate(quotes: int, accepted: int, since, filled) -> dict:
+    if not quotes:
         return {}
-    since = min(qs)
-    return {"quotes": len(qs), "accepted": sum(1 for e in events if e.get("k") == "accept"),
+    return {"quotes": quotes, "accepted": accepted,
             "filled": sum(1 for t in filled if fill_time(t) >= since), "since": since,
             "taker": sum(1 for t in filled if fill_time(t) >= since and t.get("taker_fill"))}
 
@@ -485,11 +719,13 @@ class HistoryReads:
     a 5 returned one candle a market), read through the Kalshi reads' client and kept for
     HISTORY_TTL_S, or re-read sooner (>= HISTORY_MIN_GAP_S) on a new fill or
     settlement; the series is computed once per read. A failed read keeps the
-    last good one."""
+    last good one. Like the Kalshi reads, only the first is made inline; later
+    ones run on a background thread while pages get the last series."""
 
-    def __init__(self, kalshi, ttl: float = HISTORY_TTL_S):
-        self.kalshi, self.ttl = kalshi, ttl
+    def __init__(self, kalshi, ttl: float = HISTORY_TTL_S, background: bool = True):
+        self.kalshi, self.ttl, self.background = kalshi, ttl, background
         self.at, self.key = 0.0, None
+        self.busy, self.busy_since, self.tries, self.thread = False, 0.0, 0, None
         self.data = {"legs": {}, "series": [], "error": None, "at": None}
         self.lock = threading.Lock()
 
@@ -499,10 +735,22 @@ class HistoryReads:
         key = tuple(sorted((str(t.get("quote_id")), str(t.get("status"))) for t in filled))
         with self.lock:
             stale = now - self.at >= self.ttl or (key != self.key and now - self.at >= HISTORY_MIN_GAP_S)
-            if not stale:
+            if not stale or (self.busy and now - self.busy_since < BUSY_MAX_S):
                 return self.data
-            self.at, self.key = now, key
-            try:
+            self.at, self.key, self.busy, self.busy_since = now, key, True, now
+            inline = not self.background or self.tries == 0
+            self.tries += 1
+        args = (now, list(filled), dict(markets), dict(settle_ts))
+        if inline:
+            self._refresh(*args)
+        else:
+            self.thread = threading.Thread(target=self._refresh, args=args, daemon=True)
+            self.thread.start()
+        return self.data
+
+    def _refresh(self, now: float, filled: list, markets: dict, settle_ts: dict) -> None:
+        try:
+            with getattr(self.kalshi, "io", None) or contextlib.nullcontext():
                 c = self.kalshi._client()
                 t0 = min(fill_time(t) for t in filled)
                 period = 1 if now - t0 <= 12 * 3600 else 60
@@ -522,11 +770,12 @@ class HistoryReads:
                             if 0.0 < b < a <= 1.0 and k.get("end_period_ts"):
                                 pts.append((float(k["end_period_ts"]), (a + b) / 2.0))
                         hist[x.get("market_ticker")] = sorted(pts)
-                self.data = {"legs": hist, "series": pnl_series(filled, hist, markets, settle_ts, now),
-                             "error": None, "at": now}
-            except Exception as e:
-                self.data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
-            return self.data
+            data = {"legs": hist, "series": pnl_series(filled, hist, markets, settle_ts, now),
+                    "error": None, "at": now}
+        except Exception as e:
+            data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
+        with self.lock:
+            self.data, self.busy = data, False
 
 
 # ---- the charts (inline SVG, no libraries; the dataviz reference palette's first three slots) ----
@@ -936,11 +1185,13 @@ def render(s: dict) -> str:
     return "".join(H)
 
 
-def make_handler(maker_dir, shadow_dir, kalshi, history=None):
+def make_handler(maker_dir, shadow_dir, kalshi, history=None, logs=None):
+    logs = logs if logs is not None else MakerLog(maker_dir)       # kept across requests
+
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             try:
-                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi, history)
+                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi, history, logs)
                 if self.path.startswith("/data.json"):
                     body, ctype = json.dumps(s, default=str).encode(), "application/json"
                 else:
@@ -966,8 +1217,14 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     kalshi = None if a.no_kalshi else KalshiReads()
     history = None if kalshi is None else HistoryReads(kalshi)
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history))
+    logs = MakerLog(MAKER_DIR)
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history, logs))
     print(f"combo dashboard on http://127.0.0.1:{a.port} (Ctrl+C to stop)", flush=True)
+    t = time.perf_counter()               # the cold reads (the day's log, the first Kalshi and candle reads),
+    snapshot(MAKER_DIR, SHADOW_DIR, time.time(), kalshi, history, logs)   # a page asked for meanwhile waits
+    days = logs.update(time.time())
+    print(f"warmed in {time.perf_counter() - t:.1f} s: {sum(d.quotes for d in days):,} quotes, "
+          f"{sum(d.off for d in days) / 1e6:,.1f} MB of log", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

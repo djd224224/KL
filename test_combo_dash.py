@@ -1,5 +1,6 @@
 """Tests for combo_dash.py (the combo maker pilot's local dashboard,
 2026-11-05). Synthetic files and a fake Kalshi client; no network."""
+import gzip
 import json
 import os
 import tempfile
@@ -288,6 +289,230 @@ class FillRate(unittest.TestCase):
         self.assertIn("Quotes filled", h)
         self.assertIn("50.000%", h)
         self.assertIn("1 in 2", h)
+
+
+# ---- the incremental reader (Jack 2026-11-06 "http://127.0.0.1:8772/ broken": 8-22 s loads) ----
+
+H = 3600.0
+
+
+def _line(o, compact=True) -> str:
+    return (json.dumps(o, separators=(",", ":")) if compact else json.dumps(o)) + "\n"
+
+
+def two_days():
+    """A log over two UTC days (NOW is 02:30Z, so the older day holds the end of
+    the ET day before as well): two starts with a stop between, unstamped lines
+    (the newer day opens with two), declines on both sides of ET midnight, both
+    JSON spacings, stats, a settlement."""
+    LG = LEGS
+    a = [{"k": "start", "t": NOW - 26 * H, "live": False, "cfg": {"markup": 0.03}},
+         {"k": "quote", "at": NOW - 25.5 * H, "mt": "M1", "legs": LG, "fair": 0.3, "ask": 0.31, "contracts": 5.0},
+         {"k": "accept", "quote_id": "q1", "mt": "M1", "contracts": 5.0},
+         {"k": "decline", "mt": "M1", "why": "edge_gone", "ask": 0.31, "fair": 0.3},
+         {"k": "quote", "at": NOW - 20 * H, "mt": "M2", "legs": LG, "fair": 0.2, "ask": 0.21, "contracts": 9.0},
+         {"k": "accept", "quote_id": "q2", "mt": "M2", "contracts": 9.0},
+         {"k": "confirm", "at": NOW - 20 * H + 1, "mt": "M2", "legs": LG, "ask": 0.21, "contracts": 9.0},
+         {"k": "decline", "mt": "M2", "why": "moving", "ask": 0.21, "fair": 0.2},
+         {"k": "err", "what": "quote", "err": "HttpError: {\"k\":\"quote\"}"},
+         {"k": "stat", "t": NOW - 19 * H, "rfq": 10, "pre_ok": 5, "priced": 2, "quoted": 1, "why": {}},
+         {"k": "executed", "quote_id": "q2", "mt": "M2"},
+         {"k": "filled", "t": NOW - 18 * H, "mt": "M2", "contracts": 9.0},
+         {"k": "settled", "mt": "M9", "result": "no", "pnl": 1.5},
+         {"k": "stop", "t": NOW - 10 * H, "open": 1},
+         {"k": "start", "t": NOW - 9 * H, "live": True, "cfg": {"markup": 0.04, "max_legs": 8}},
+         {"k": "quote", "at": NOW - 3 * H, "mt": "M3", "legs": LG, "fair": 0.4, "ask": 0.41, "contracts": 2.0},
+         {"k": "would_quote", "at": NOW - 2.75 * H, "mt": "M4", "legs": LG, "fair": 0.1, "ask": 0.11,
+          "contracts": 1.0}]
+    b = [{"k": "accept", "quote_id": "q3", "mt": "M3", "contracts": 2.0},
+         {"k": "err", "what": "book read", "err": "Timeout"},
+         {"k": "quote", "at": NOW - 2 * H, "mt": "M5", "legs": LG, "fair": 0.5, "ask": 0.52, "contracts": 3.0},
+         {"k": "quote", "at": NOW - 1.5 * H, "mt": "M6", "legs": LG, "fair": 0.25, "ask": 0.26, "contracts": 4.0},
+         {"k": "decline", "mt": "M6", "why": "would_take", "ask": 0.26, "fair": 0.25},
+         {"k": "position", "mt": "M2", "position": -9.0, "try": 1},
+         {"k": "unfilled", "t": NOW - 100, "mt": "M6", "why": "canceled"},
+         {"k": "stat", "t": NOW - 30, "rfq": 20, "pre_ok": 8, "priced": 3, "quoted": 2, "why": {"legs": 4}}]
+    return a, b
+
+
+def old_numbers(maker_dir, now):
+    """What snapshot() made of the log before MakerLog, from a full parse of every
+    line: the reference the summaries must match."""
+    events = cd.read_events(maker_dir, now)
+    day0 = cd.et_midnight(now)
+    starts = [e for e in events if e.get("k") == "start"]
+    last_start = starts[-1] if starts else None
+    after = events[events.index(last_start):] if last_start else []
+    last_t = max((cd._ev_ts(e) for e in after), default=0.0)
+    today = [e for e in events if cd._ev_ts(e) >= day0]
+    count = lambda k: sum(1 for e in today if e.get("k") == k)  # noqa: E731
+    declines = {}
+    for e in today:
+        if e.get("k") == "decline":
+            declines[e.get("why")] = declines.get(e.get("why"), 0) + 1
+    stats = [e for e in events if e.get("k") == "stat"]
+    return {"started": (last_start or {}).get("t"), "cfg": (last_start or {}).get("cfg") or {},
+            "stopped": any(e.get("k") == "stop" for e in after),
+            "last_line_age": (now - last_t) if last_t else None,
+            "funnel": {"quotes": count("quote"), "would": count("would_quote"), "accepted": count("accept"),
+                       "confirmed": count("confirm"), "declined": count("decline"),
+                       "executed": count("executed") - count("unfilled"), "unfilled": count("unfilled"),
+                       "errors": count("err")},
+            "declines": declines, "last_stat": stats[-1] if stats else None,
+            "fill_rate": cd.fill_rate(events, []),
+            "settle_ts": {e.get("mt"): cd._ev_ts(e) for e in events if e.get("k") == "settled"},
+            "feed": [(e.get("k"), cd._ev_ts(e), e.get("mt")) for e in events
+                     if e.get("k") in cd.FEED_KINDS][-cd.FEED_N:][::-1]}
+
+
+class Incremental(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.a, self.b = two_days()
+        self.pa = os.path.join(self.d.name, "combo_2026-11-05.jsonl")
+        self.pb = os.path.join(self.d.name, "combo_2026-11-06.jsonl")
+
+    def write(self, p, rows, mode="w"):
+        with open(p, mode, encoding="utf-8", newline="\r\n" if mode == "w" else None) as f:
+            for i, r in enumerate(rows):
+                f.write(_line(r, compact=i % 3 != 2))          # the maker's compact lines, some spaced
+
+    def same(self, s, now=NOW, logs=None):
+        want = old_numbers(self.d.name, now)
+        for key in ("started", "cfg", "stopped", "last_line_age", "funnel", "declines", "last_stat", "fill_rate"):
+            self.assertEqual(s[key], want[key], key)
+        self.assertEqual([(e.get("k"), cd._ev_ts(e), e.get("mt")) for e in s["feed"]], want["feed"])
+        days = (logs or cd.MakerLog(self.d.name)).update(now)
+        merged = {}
+        for x in days:
+            merged.update(x.settle_ts)
+        self.assertEqual(merged, want["settle_ts"])
+
+    def test_the_summaries_match_a_full_parse(self):
+        self.write(self.pa, self.a)
+        self.write(self.pb, self.b)
+        s = cd.snapshot(self.d.name, self.d.name, NOW)
+        self.same(s)
+        # the newer day's two unstamped lines took the older day's last time; today = since 04:00Z 11/05
+        self.assertEqual(s["funnel"]["quotes"], 4)
+        self.assertEqual(s["declines"], {"moving": 1, "would_take": 1})
+        self.assertTrue(s["live"] and not s["stopped"])
+        self.assertEqual(s["cfg"], {"markup": 0.04, "max_legs": 8})
+
+    def test_only_the_new_lines_are_read(self):
+        self.write(self.pa, self.a)
+        self.write(self.pb, self.b[:3])
+        logs = cd.MakerLog(self.d.name)
+        self.same(cd.snapshot(self.d.name, self.d.name, NOW, logs=logs), logs=logs)
+        sb = logs.sums["2026-11-06"]
+        off = sb.off
+        self.assertEqual(off, os.path.getsize(self.pb))
+        with open(self.pb, "a", encoding="utf-8") as f:                # the rest, and half a line
+            for r in self.b[3:]:
+                f.write(_line(r))
+            f.write('{"k":"quote","at":%r,"mt":"M7","legs":[],"fair":0.1,"ask":0.' % (NOW - 10))
+        s = cd.snapshot(self.d.name, self.d.name, NOW, logs=logs)
+        self.assertIs(logs.sums["2026-11-06"], sb)                      # the same summary, read on from `off`
+        self.same(s, logs=logs)
+        self.assertLess(sb.off, os.path.getsize(self.pb))               # the half line waits
+        with open(self.pb, "a", encoding="utf-8") as f:
+            f.write('11,"contracts":1.0}\n')
+        s = cd.snapshot(self.d.name, self.d.name, NOW, logs=logs)
+        self.same(s, logs=logs)
+        self.assertEqual(s["fill_rate"]["quotes"], 6)
+        self.assertEqual(sb.off, os.path.getsize(self.pb))
+
+    def test_the_gzipped_day_is_read_once_and_not_twice(self):
+        self.write(self.pa, self.a)
+        self.write(self.pb, self.b)
+        logs = cd.MakerLog(self.d.name)
+        before = cd.snapshot(self.d.name, self.d.name, NOW, logs=logs)
+        with open(self.pa, "rb") as src, gzip.open(self.pa + ".gz", "wb") as dst:   # the UTC day roll
+            dst.write(src.read())
+        os.remove(self.pa)
+        after = cd.snapshot(self.d.name, self.d.name, NOW, logs=logs)
+        self.same(after, logs=logs)
+        self.assertEqual(after["funnel"], before["funnel"])
+        self.assertTrue(logs.sums["2026-11-05"].final)
+        fresh = cd.snapshot(self.d.name, self.d.name, NOW)              # a page started after the roll
+        self.same(fresh)
+        self.assertEqual(fresh["cfg"], {"markup": 0.04, "max_legs": 8})
+
+    def test_a_replaced_file_is_read_again(self):
+        self.write(self.pb, self.b)
+        logs = cd.MakerLog(self.d.name)
+        cd.snapshot(self.d.name, self.d.name, NOW, logs=logs)
+        self.write(self.pb, self.b[:2])                                  # shorter: a new file
+        s = cd.snapshot(self.d.name, self.d.name, NOW, logs=logs)
+        self.same(s, logs=logs)
+
+    def test_quote_lines_skip_the_parse(self):
+        self.assertEqual(cd._quote_at(b'{"id":"x","at":1793974322.62,"k":"quote","sent_ms":4.1}\r'), 1793974322.62)
+        self.assertEqual(cd._quote_at(b'{"k": "quote", "at": 1.5}'), 1.5)
+        self.assertIsNone(cd._quote_at(b'{"k":"would_quote","at":1.5}'))
+        self.assertIsNone(cd._quote_at(b'{"k":"quote","t":2.0,"at":1.5}'))     # "t" first: parsed in full
+        self.assertIsNone(cd._quote_at(b'{"k":"err","err":"HttpError: {\\"k\\":\\"quote\\"}"}'))
+
+
+class Background(unittest.TestCase):
+    def test_a_stale_read_refreshes_behind_the_page(self):
+        gate = threading.Event()
+
+        class Slow(FakeClient):
+            n = 0
+
+            def get(self, path, params):
+                if path == "/portfolio/balance":
+                    Slow.n += 1
+                    if Slow.n > 1:
+                        assert gate.wait(10)
+                        return {"balance_breakdown": [{"balance": "99.00", "exchange_index": 1}]}
+                return FakeClient.get(self, path, params)
+
+        k = cd.KalshiReads(client_factory=Slow)
+        self.assertAlmostEqual(k.get(NOW, [], NOW)["cash"], 232.10)        # the first read: inline
+        t = time.perf_counter()
+        d = k.get(NOW + 61, [], NOW)                                        # stale: refreshed behind the page
+        self.assertLess(time.perf_counter() - t, 1.0)
+        self.assertAlmostEqual(d["cash"], 232.10)                           # the last reads meanwhile
+        self.assertIs(k.get(NOW + 62, [], NOW), d)
+        gate.set()
+        k.thread.join(5)
+        self.assertAlmostEqual(k.get(NOW + 63, [], NOW)["cash"], 99.0)
+        self.assertEqual(Slow.n, 2)                                         # one refresh at a time
+
+    def test_the_candles_too(self):
+        T0 = History.T0
+        gate = threading.Event()
+
+        class C:
+            n = 0
+
+            def get(self, path, params):
+                C.n += 1
+                if C.n > 1:                                                 # the first read is inline
+                    assert gate.wait(10)
+                return {"markets": [{"market_ticker": tk, "candlesticks": [
+                    {"end_period_ts": int(T0 + 300), "yes_bid": {"close_dollars": "0.4900"},
+                     "yes_ask": {"close_dollars": "0.5100"}}]} for tk in params["market_tickers"].split(",")]}
+
+        class K:
+            io = threading.Lock()
+
+            def _client(self):
+                return C()
+
+        h = cd.HistoryReads(K())
+        tickets = History().tickets()
+        first = h.get(T0 + 1200, tickets, {}, {})
+        self.assertTrue(first["series"])
+        t = time.perf_counter()
+        self.assertIs(h.get(T0 + 1600, tickets, {}, {}), first)             # stale: the last series meanwhile
+        self.assertLess(time.perf_counter() - t, 1.0)
+        gate.set()
+        h.thread.join(5)
+        self.assertEqual(h.data["at"], T0 + 1600)
 
 
 if __name__ == "__main__":
