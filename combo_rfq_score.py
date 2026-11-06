@@ -65,6 +65,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 import zlib
@@ -79,6 +80,12 @@ MARKUPS = (0.05, 0.10, 0.15, 0.20, 0.30, 0.50)
 MAX_LEG_SPREAD = 0.10
 GAME_HOURS = 3.0
 MAKER_FEE_RATE = 0.035     # combo makers: 0.5 x the 0.07 taker rate (fee schedule, 11/05)
+# STRATEGY 1, the live pilot's rule (combo_maker.py imports MAIN_SERIES; keep S1
+# in step with its Config): US-league main lines only, 3-8 legs, legs <= 3c
+# wide, fair 2-40c, every game >= 30 min from its start
+MAIN_SERIES = re.compile(r"^KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAMB|NCAAWB)(GAME|SPREAD|TOTAL)$")
+S1 = {"min_legs": 3, "max_legs": 8, "min_fair": 0.02, "max_fair": 0.40, "max_leg_spread": 0.03,
+      "min_lead_min": 30.0, "markups": (0.05, 0.10, 0.15, 0.20)}
 MAX_EXECS_PER_DAY = 5000
 CALL_GAP_S = 0.5
 BATCH = 100
@@ -410,6 +417,7 @@ def score_exec(e: dict, markets: dict, book: PriceBook, starts: dict) -> dict:
     mk_pnl = None if payoff is None else (ct * (px - payoff) if side == "yes" else ct * (payoff - px))
     anchor = min(keys, key=lambda k: starts.get(k, float("inf"))) if keys else ""
     in_play = any(k in starts and t >= starts[k] for k in keys)
+    leads = [(starts[k] - t) / 60.0 for k in keys if k in starts]
     return {"tid": e.get("tid"), "day": utc_day(e["rfq_ms"]), "t": t, "mt": e["mt"],
             "n_legs": len(e["legs"]), "bucket": leg_bucket(len(e["legs"])), "side": side,
             "px": px, "ct": ct, "tc": e.get("tc") is not None, "prem": prem,
@@ -419,6 +427,8 @@ def score_exec(e: dict, markets: dict, book: PriceBook, starts: dict) -> dict:
             # an NFL market and no two on one game (Kalshi defines it no further)
             "nfl_uncorr": bool(keys) and len(set(keys)) == len(keys)
             and all(str(l[0]).startswith("KXNFL") for l in e["legs"]),
+            "main_only": all(MAIN_SERIES.match(str(l[0]).split("-")[0]) for l in e["legs"]),
+            "lead_min": min(leads) if leads else None,
             "payoff": payoff, "mk_pnl": mk_pnl, "mk_fee": maker_fee(ct, px),
             "grid": combo.get("price_ranges") or DEFAULT_GRID}
 
@@ -443,6 +453,16 @@ def shadow_fill(s: dict, m: float):
     cts = (ct * (1.0 - px) / (1.0 - bid)) if s["tc"] else ct
     pnl = None if s["payoff"] is None else cts * (s["payoff"] - bid)
     return {"cts": cts, "price": bid, "prem": cts * (1.0 - bid), "fee": maker_fee(cts, bid), "pnl": pnl}
+
+
+def is_s1(s: dict) -> bool:
+    """Strategy 1's rule on a scored execution: the pilot's filters, on the
+    shadow's prices (the last 1-minute candle before the RFQ)."""
+    return bool(s["why"] is None and s.get("main_only")
+                and s["widest"] <= S1["max_leg_spread"] + 1e-9
+                and S1["min_legs"] <= s["n_legs"] <= S1["max_legs"] and s["fair"] is not None
+                and S1["min_fair"] <= s["fair"] <= S1["max_fair"]
+                and (s.get("lead_min") or 0.0) >= S1["min_lead_min"])
 
 
 def boot_ci(rows: list, value, cluster, n: int = BOOT_N, seed: int = SEED):
@@ -509,6 +529,21 @@ def build(scored: list, markups=MARKUPS) -> dict:
                    "by_legs": {lab: sum(f["pnl"] - f["fee"] for s, f in won if s["bucket"] == lab)
                                for _, lab in LEG_BUCKETS}})
     out["shadow"] = sh
+    # Strategy 1, the live pilot's rule, on the same executions
+    s1 = [s for s in elig if is_s1(s)]
+    s1_set = [s for s in s1 if s["payoff"] is not None]
+    out["s1"] = {"eligible": len(s1), "settled": len(s1_set),
+                 "with_nfl": sum(1 for s in s1 if s.get("nfl_uncorr")), "rows": []}
+    for m in S1["markups"]:
+        won = [(s, f) for s in s1_set for f in [shadow_fill(s, m)] if f is not None]
+        gross, fee = sum(f["pnl"] for _, f in won), sum(f["fee"] for _, f in won)
+        prem = sum(f["prem"] for _, f in won)
+        rows = [{"day": s["day"], "anchor": s["anchor"], "v": f["pnl"] - f["fee"]} for s, f in won]
+        lo, hi = boot_ci(rows, lambda r: r["v"], cluster) if rows else (None, None)
+        out["s1"]["rows"].append({
+            "markup": m, "wins": len(won), "prem": prem, "gross": gross, "fee": fee,
+            "net": gross - fee, "per_prem": ((gross - fee) / prem) if prem else None, "ci": [lo, hi],
+            "pending_wins": sum(1 for s in s1 if s["payoff"] is None and shadow_fill(s, m) is not None)})
     # the market's markup over the independence fair (takers buying YES)
     mk = collections.defaultdict(list)
     for s in elig:
@@ -592,7 +627,7 @@ def render(rep: dict, ctx: dict, since, until) -> str:
         L.append(f"**No scored combo has settled yet** ({rep['n_pending']:,} pending): the P&L tables"
                  " wait for the settlements. The markup table needs none.")
         L.append("")
-        return "\n".join(L + _markup_lines(rep) + _method_lines(rep)) + "\n"
+        return "\n".join(L + _s1_lines(rep) + _markup_lines(rep) + _method_lines(rep)) + "\n"
     L.append("## The flow: what today's makers made at their own prices (settled)")
     L.append("")
     L.append(f"Makers took **{usd(fl['gross'])}** on {usd(fl['prem']).lstrip('+')} of taker premium"
@@ -627,6 +662,7 @@ def render(rep: dict, ctx: dict, since, until) -> str:
     for r in rep["shadow"]:
         L.append(f"| {r['markup']:.0%} | " + " | ".join(usd(r["by_legs"][lab]) for _, lab in LEG_BUCKETS) + " |")
     L.append("")
+    L += _s1_lines(rep)
     L += _markup_lines(rep)
     L.append("## Calibration (eligible, settled, takers buying YES)")
     L.append("")
@@ -636,6 +672,22 @@ def render(rep: dict, ctx: dict, since, until) -> str:
         L.append(f"| {lab} | {c['n']:,} | {c['fair']:.2%} | {c['price']:.2%} | {c['hit']:.2%} |")
     L.append("")
     return "\n".join(L + _method_lines(rep)) + "\n"
+
+
+def _s1_lines(rep: dict) -> list:
+    s1 = rep.get("s1") or {}
+    L = ["## Strategy 1, the live pilot's rule (main lines, 3-8 legs, fair 2-40c, legs <= 3c wide,"
+         " >= 30 min to the start)", "",
+         f"{s1.get('eligible', 0):,} executions fit ({s1.get('settled', 0):,} settled;"
+         f" {s1.get('with_nfl', 0):,} all-NFL, which Kalshi's table exempts from the maker fee).", ""]
+    if s1.get("rows"):
+        L += ["| markup | wins | our premium | net after fee | net / premium | 90% range | pending wins |",
+              "|---:|---:|---:|---:|---:|---:|---:|"]
+        for r in s1["rows"]:
+            L.append(f"| {r['markup']:.0%} | {r['wins']:,} | {usd(r['prem']).lstrip('+')} | "
+                     f"**{usd(r['net'])}** | {pct(r['per_prem'])} | {usd(r['ci'][0])} to "
+                     f"{usd(r['ci'][1])} | {r['pending_wins']:,} |")
+    return L + [""]
 
 
 def _markup_lines(rep: dict) -> list:

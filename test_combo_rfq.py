@@ -303,6 +303,28 @@ class ScoreTests(unittest.TestCase):
         won = [r for r in rep["shadow"] if r["wins"]]
         self.assertTrue(won and all(abs(r["fee_nfl"] - r["fee"]) < 1e-12 for r in won))
 
+    def test_strategy_1_takes_only_the_pilots_combos(self):
+        # 3 main-line legs on 3 games, fair 0.6 x 0.5 x 0.7 = 0.21, legs 2c wide
+        nhl2 = "KXNHLGAME-26NOV05NYRPIT-NYR"
+        mk = dict(self.markets, **{nhl2: mkt(nhl2, T0 + 6 * 3600)})
+        legs = [LEGS[0], LEGS[1], [nhl2, "no"]]
+        book = book_with({LEGS[0][0]: (0.59, 0.61), LEGS[1][0]: (0.49, 0.51), nhl2: (0.29, 0.31)})
+        st = cs.game_starts(mk)
+        s = cs.score_exec(exec_rec(legs, px="0.2500"), mk, book, st)
+        self.assertTrue(s["main_only"])
+        self.assertAlmostEqual(s["fair"], 0.21)
+        self.assertTrue(cs.is_s1(s))
+        self.assertFalse(cs.is_s1(cs.score_exec(exec_rec(LEGS, px="0.2500"), mk, book, st)))   # 2 legs
+        prop = "KXNBAPTS-26NOV05MIAGSW-GSWSCURRY30-25"
+        book2 = book_with({LEGS[1][0]: (0.49, 0.51), nhl2: (0.29, 0.31), prop: (0.59, 0.61)})
+        self.assertFalse(cs.is_s1(cs.score_exec(exec_rec([[prop, "yes"], LEGS[1], [nhl2, "no"]]),
+                                                mk, book2, st)))                             # a prop
+        rep = cs.build([s])
+        self.assertEqual(rep["s1"]["eligible"], 1)
+        r10 = next(r for r in rep["s1"]["rows"] if r["markup"] == 0.10)
+        self.assertEqual(r10["wins"], 1)                    # 0.231 < the 0.25 print
+        self.assertGreater(r10["net"], 0)                   # the combo lost (payoff 0)
+
     def test_the_candle_used_ended_before_the_rfq(self):
         b = cs.PriceBook()
         b.add({"X": [(int(T0 - 60), 0.40, 0.42), (int(T0 + 1), 0.70, 0.72)]})

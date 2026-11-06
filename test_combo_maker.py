@@ -252,6 +252,43 @@ class MakerFlow(unittest.TestCase):
         self.assertEqual(self.book.open(), [])
 
 
+class NflOnly(unittest.TestCase):
+    """The fee-free mode: all-NFL main lines at a 3% markup."""
+    N1, N2, N3 = ("KXNFLGAME-26NOV08CINATL-CIN", "KXNFLGAME-26NOV08DALIND-DAL",
+                  "KXNFLSPREAD-26NOV08DETMIA-DET3")
+
+    def test_only_nfl_legs_and_half_markup_last_look(self):
+        cfg = cm.Config(nfl_only=True, markup=0.03)
+        self.assertAlmostEqual(cfg.confirm_min_edge, 0.015)
+        self.assertEqual(cm.pre_check(LEGS, cfg), "not_nfl")
+        legs = [[self.N1, "yes"], [self.N2, "yes"], [self.N3, "no"]]
+        self.assertIsNone(cm.pre_check(legs, cfg))
+        self.assertTrue(cfg.fee_free(legs))
+        self.assertFalse(cfg.fee_free(LEGS))
+        self.assertAlmostEqual(cm.Config().confirm_min_edge, 0.05)          # 10% default -> 5%
+
+    def test_nfl_tickets_carry_no_fee_estimate(self):
+        mk = {t: mkt(t, b, b + 0.02, start_in_h=60) for t, b in
+              ((self.N1, 0.59), (self.N2, 0.49), (self.N3, 0.29))}
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        book = cm.Book(os.path.join(d.name, "s.json"))
+        m = cm.Maker(c, cm.Config(live=True, nfl_only=True, markup=0.03), W(), book, d.name, clock=lambda: T0)
+        m.handle(rfq_msg(legs=[[self.N1, "yes"], [self.N2, "yes"], [self.N3, "no"]]))
+        qid = "q1"
+        nb = c.posts[0][1]["no_bid"]
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": qid, "rfq_id": "r1", "no_bid_dollars": nb}})
+        self.assertEqual(len(c.puts), 1)                                     # confirmed at +3%
+        self.assertEqual(book.tickets[0]["fee_est"], 0.0)
+
+    def test_cli_markup_floors(self):
+        with self.assertRaises(SystemExit):
+            cm.main(["--markup", "0.03"])                      # 3% only fee-free
+        with self.assertRaises(SystemExit):
+            cm.main(["--nfl-only", "--markup", "0.02"])
+
+
 class RunGuards(unittest.TestCase):
     def test_stop_file_and_lock(self):
         with tempfile.TemporaryDirectory() as d:

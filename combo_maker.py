@@ -52,25 +52,25 @@ import argparse
 import json
 import math
 import os
-import re
 import socket
 import sys
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import kalshi_ws  # noqa: E402
 from combo_rfq_logger import WS_PATH, WS_URL, DayWriter, iso_ms, legs_of  # noqa: E402
-from combo_rfq_score import DEFAULT_GRID, grid_up, maker_fee  # noqa: E402
+from combo_rfq_score import DEFAULT_GRID, MAIN_SERIES, grid_up, maker_fee  # noqa: E402
 
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
 STOP_NAME = "combo_maker.stop"
 LOCK_NAME = "combo_maker.lock"
-MAIN_SERIES = re.compile(r"^KX(NFL|NBA|WNBA|NHL|MLB|NCAAF|NCAAMB|NCAAWB)(GAME|SPREAD|TOTAL)$")
+# MAIN_SERIES (US-league game / spread / total) comes from combo_rfq_score, so
+# the shadow's Strategy 1 table and this pilot share one definition
 GAME_HOURS = 3.0
 SHARD_FACTOR, SHARD_KEY = 50, 1     # a 2% slice of RFQs (the logger reads key 0)
 STALE_SECS = 30.0
@@ -86,7 +86,13 @@ class Config:
     def __init__(self, **kw):
         self.live = False
         self.markup = 0.10
-        self.confirm_min_edge = 0.05
+        self.confirm_min_edge = None        # None = half the markup (0.05 at the default 10%)
+        # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
+        # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
+        # line, which Kalshi's fee table exempts from the combo maker fee
+        # ("Combos (excluding uncorrelated NFL)"), so a 3% markup is all edge
+        self.nfl_only = False
+        self.shard_factor = SHARD_FACTOR    # see 1/N of the RFQs (50 = 2%, ~90 KB/s; 10 = 10%, ~470 KB/s)
         self.min_legs, self.max_legs = 3, 8
         self.min_fair, self.max_fair = 0.02, 0.40
         self.max_leg_spread = 0.03
@@ -104,6 +110,13 @@ class Config:
             if not hasattr(self, k):
                 raise TypeError(f"unknown setting {k}")
             setattr(self, k, v)
+        if self.confirm_min_edge is None:
+            self.confirm_min_edge = self.markup / 2.0
+
+    def fee_free(self, legs) -> bool:
+        """Every leg an NFL market (main lines on different games by the
+        filters): the fee table's "uncorrelated NFL" combos, no maker fee."""
+        return all(str(l[0]).startswith("KXNFL") for l in legs)
 
 
 def log(msg: str) -> None:
@@ -147,6 +160,8 @@ def pre_check(legs: list, cfg: Config):
         return "side"                                   # a scalar leg too
     if any(not MAIN_SERIES.match(str(l[0]).split("-")[0]) for l in legs):
         return "not_main"
+    if cfg.nfl_only and not cfg.fee_free(legs):
+        return "not_nfl"
     games = [game_of(l[0]) for l in legs]
     if len(set(games)) < len(games):
         return "same_game"
@@ -452,7 +467,8 @@ class Maker:
         t = {"quote_id": qid, "rfq": q["id"], "mt": q["mt"], "legs": q["legs"], "games": q["games"],
              "ask": q["ask"], "fair": q["fair"], "fair_confirm": fair_now, "contracts": cts,
              "status": "confirmed", "day": et_day(now), "at": now,
-             "fee_est": maker_fee(cts, q["ask"])}
+             # all-NFL combos pay no maker fee by Kalshi's table: checked on the fills
+             "fee_est": 0.0 if self.cfg.fee_free(q["legs"]) else maker_fee(cts, q["ask"])}
         self.book.add(t)
         self.w.write(dict(t, k="confirm", confirm_ms=(self.clock() - now) * 1000))
         log(f"CONFIRMED {q['mt']} {len(q['legs'])} legs: sold {cts:,.1f} YES at {q['ask']:.3f} "
@@ -592,7 +608,8 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     book = Book(os.path.join(out_dir, STATE_NAME))
     mk = Maker(client, cfg, writer, book, out_dir)
     writer.write({"k": "start", "t": time.time(), "live": cfg.live, "cfg": vars(cfg)})
-    log(("LIVE" if cfg.live else "DRY (nothing is sent)") + f": markup {cfg.markup:.0%}, "
+    log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
+        + f": markup {cfg.markup:.0%} (confirm >= {cfg.confirm_min_edge:.1%}), "
         f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
         f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
         f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day; open now {len(book.open())}")
@@ -612,10 +629,12 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
                 conn = kalshi_ws.WSConnection(url, headers=hdr, timeout=10.0)
                 conn.connect()
                 conn.settimeout(0.5)
-                conn.send_json({"id": 1, "cmd": "subscribe",
-                                "params": {"channels": ["communications"], "shard_factor": SHARD_FACTOR,
-                                           "shard_key": SHARD_KEY}})
-                log("connected; subscribed communications (2% slice)")
+                sf = int(cfg.shard_factor)
+                params = {"channels": ["communications"]}
+                if sf > 1:
+                    params.update(shard_factor=sf, shard_key=SHARD_KEY % sf)
+                conn.send_json({"id": 1, "cmd": "subscribe", "params": params})
+                log(f"connected; subscribed communications (1/{sf} of the RFQs)")
                 last_up = 0.0
                 while True:
                     now = time.time()
@@ -676,12 +695,21 @@ def main(argv=None) -> int:
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
     ap.add_argument("--max-open-loss", type=float, default=d.max_open_loss)
     ap.add_argument("--max-tickets", type=int, default=d.max_tickets)
+    ap.add_argument("--nfl-only", action="store_true",
+                    help="only all-NFL combos (no maker fee by Kalshi's table); allows --markup 0.03")
+    ap.add_argument("--shard-factor", type=int, default=d.shard_factor,
+                    help="see 1 in N of the RFQs (50 = 2%%; 10 = 10%%, ~470 KB/s on the Wi-Fi)")
     a = ap.parse_args(argv)
-    if a.markup < 0.05:
-        ap.error("markup under 5% does not cover the 0.035 p(1-p) maker fee with room")
+    floor = 0.03 if a.nfl_only else 0.05
+    if a.markup < floor:
+        ap.error(f"markup under {floor:.0%}: " + ("too thin even fee-free" if a.nfl_only else
+                 "it does not cover the 0.035 p(1-p) maker fee with room (all-NFL combos are "
+                 "fee-free: --nfl-only allows 3%)"))
     cfg = Config(live=a.live, markup=a.markup, max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_open_loss=a.max_open_loss,
-                 max_tickets=a.max_tickets)
+                 max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor)
+    if not 1 <= cfg.shard_factor <= 100:
+        ap.error("--shard-factor 1-100")
     return run(cfg, a.minutes)
 
 
