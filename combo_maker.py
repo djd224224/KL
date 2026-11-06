@@ -88,7 +88,13 @@ ET_OFFSET = None                    # filled by et_today()
 class Config:
     def __init__(self, **kw):
         self.live = False
-        self.markup = 0.10
+        self.markup = 0.10                  # on a 2-leg parlay; more legs add markup_per_leg each
+        # MORE LEGS, MORE MARKUP (Jack 2026-11-05: "quote a higher spread, the more
+        # legs"). The market's own markup over the leg mids climbs with the legs:
+        # fee-paying cross-game pre-game prints (shadow, n 819), median / p75 2 legs
+        # +1.9/+2.5%, 3 +2.3/+3.6%, 4 +3.1/+4.2%, 5 +3.7/+5.8% -- about a point a leg
+        # at the p75 -- and each leg's mid error compounds into the fair
+        self.markup_per_leg = 0.01
         self.confirm_min_edge = None        # None = half the markup (0.05 at the default 10%)
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
@@ -131,6 +137,16 @@ class Config:
             setattr(self, k, v)
         if self.confirm_min_edge is None:
             self.confirm_min_edge = self.markup / 2.0
+
+    def markup_for(self, n_legs: int) -> float:
+        """The markup on an n-leg parlay: `markup` at 2 legs, + `markup_per_leg`
+        for each leg over 2."""
+        return self.markup + self.markup_per_leg * max(0, int(n_legs) - 2)
+
+    def confirm_edge_for(self, n_legs: int) -> float:
+        """The last look's minimum edge on an n-leg parlay: confirm_min_edge at 2
+        legs, + half the step for each leg over 2 (half the markup, as before)."""
+        return self.confirm_min_edge + self.markup_per_leg / 2.0 * max(0, int(n_legs) - 2)
 
     def fee_free(self, legs) -> bool:
         """Every leg an NFL market (main lines on different games by the
@@ -243,9 +259,9 @@ def lead_min(ticker: str, cfg: Config) -> float:
     return cfg.min_lead_min
 
 
-def quote_price(fair: float, cfg: Config, grid=None):
-    """(our YES price, the no_bid we post): fair x (1 + markup) rounded UP."""
-    ask = grid_up(fair * (1.0 + cfg.markup), grid or DEFAULT_GRID)
+def quote_price(fair: float, cfg: Config, grid=None, n_legs: int = 2):
+    """(our YES price, the no_bid we post): fair x (1 + the n-leg markup) rounded UP."""
+    ask = grid_up(fair * (1.0 + cfg.markup_for(n_legs)), grid or DEFAULT_GRID)
     return ask, round(1.0 - ask, 4)
 
 
@@ -317,7 +333,7 @@ def confirm_check(q: dict, markets: dict, now_s: float, cfg: Config, book: Book,
     why, fair = price_check(q["legs"], markets, now_s, cfg, game_start)
     if why:
         return why, fair
-    if q["ask"] < fair * (1.0 + cfg.confirm_min_edge) - 1e-9:
+    if q["ask"] < fair * (1.0 + cfg.confirm_edge_for(len(q["legs"]))) - 1e-9:
         return "edge_gone", fair
     return caps_check(book, q["games"], contracts, q["ask"], cfg, et_day(now_s)), fair
 
@@ -492,14 +508,15 @@ class Maker:
             self._why(why)
             return
         self.st["priced"] += 1
-        ask, no_bid = quote_price(fair, self.cfg)
+        ask, no_bid = quote_price(fair, self.cfg, n_legs=len(legs))
         cts = contracts_of(rfq, ask)
         games = [game_of(l[0]) for l in legs]
         why = caps_check(self.book, games, cts, ask, self.cfg, et_day(now))
         if why:
             self._why(why)
             return
-        q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, contracts=cts, games=games, at=now,
+        q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs)), 4),
+                 contracts=cts, games=games, at=now,
                  lag_ms=None if rfq["rfq_ms"] is None else now * 1000 - rfq["rfq_ms"], read_ms=read_ms)
         if not self.cfg.live:
             self.st["dry"] += 1
@@ -697,7 +714,8 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
                   "cfg": {k: sorted(v) if isinstance(v, set) else v for k, v in vars(cfg).items()}})
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
         + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
-        + f": markup {cfg.markup:.0%} (confirm >= {cfg.confirm_min_edge:.1%}), lead {cfg.min_lead_min:g} min, "
+        + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
+        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half), lead {cfg.min_lead_min:g} min, "
         f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
         f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
         f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day; open now {len(book.open())}")
@@ -778,7 +796,10 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--live", action="store_true", help="send quotes and confirms (default: DRY)")
     ap.add_argument("--minutes", type=float, default=0.0, help="stop after this long (0 = until stopped)")
-    ap.add_argument("--markup", type=float, default=d.markup)
+    ap.add_argument("--markup", type=float, default=d.markup, help="the markup on a 2-leg parlay")
+    ap.add_argument("--markup-per-leg", type=float, default=d.markup_per_leg,
+                    help="added to the markup for each leg over 2 (0.01: --markup 0.04 quotes 2 legs at "
+                         "4%%, 5 legs at 7%%; 0 = one markup for all)")
     ap.add_argument("--max-payout", type=float, default=d.max_payout)
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
     ap.add_argument("--max-open-loss", type=float, default=d.max_open_loss)
@@ -814,6 +835,8 @@ def main(argv=None) -> int:
         ap.error(f"markup under {floor:.0%}: " + ("too thin even fee-free" if floor == 0.03 else
                  "it does not cover the 0.035 p(1-p) maker fee with room (all-NFL combos are "
                  "fee-free: --nfl-only allows 3%; --allow-thin allows 3% anyway)"))
+    if not 0 <= a.markup_per_leg <= 0.10:
+        ap.error("--markup-per-leg 0 to 0.10")
     if a.min_legs < 2:
         ap.error("--min-legs 2 or more")
     if not a.min_legs <= a.max_legs <= 12:
@@ -821,7 +844,7 @@ def main(argv=None) -> int:
     if a.min_lead_min < 2:
         ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
-    cfg = Config(live=a.live, markup=a.markup, max_payout=a.max_payout,
+    cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg, max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,

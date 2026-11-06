@@ -310,7 +310,9 @@ def render(s: dict) -> str:
     status = ("live" if s["live"] else "dry") if s["running"] else "off"
     label = {"live": "LIVE", "dry": "DRY", "off": "STOPPED" if s["stopped"] else "NOT RUNNING"}[status]
     games = ", ".join(cfg.get("games") or []) or "any"
-    setting = (f"markup {(_f(cfg.get('markup'), 0) or 0):.0%} &middot; {cfg.get('min_legs', '?')}&ndash;"
+    mu, step = (_f(cfg.get('markup'), 0) or 0), (_f(cfg.get('markup_per_leg'), 0) or 0)
+    setting = (f"markup {mu * 100:.3g}%" + (f" +{step * 100:.3g}%/leg over 2" if step else "")
+               + f" &middot; {cfg.get('min_legs', '?')}&ndash;"
                f"{cfg.get('max_legs', '?')} legs &middot; games {html.escape(games)} &middot; "
                f"lead {cfg.get('min_lead_min', '?')} min &middot; caps ${cfg.get('max_payout', '?')}/ticket, "
                f"${cfg.get('max_game_payout', '?')}/game, open loss ${cfg.get('max_open_loss', '?')}") if cfg else "no run yet"

@@ -162,6 +162,7 @@ class MakerFlow(unittest.TestCase):
 
     def maker(self, live, client=None, **kw):
         self.client = client or FakeClient(MK)
+        kw.setdefault("markup_per_leg", 0.0)        # these flows pin one flat 10%; LegMarkup tests the ladder
         cfg = cm.Config(live=live, **kw)
         self.book = cm.Book(os.path.join(self.d.name, "state.json"))
         return cm.Maker(self.client, cfg, self.w, self.book, self.d.name, clock=lambda: self.clock[0])
@@ -255,6 +256,45 @@ class MakerFlow(unittest.TestCase):
         self.assertAlmostEqual(t["pnl"], 10.0 - t["fee_est"])        # kept the $10 premium, less the fee
         self.assertAlmostEqual(t["fee_est"], 0.035 * (10 / 0.231) * 0.231 * 0.769)
         self.assertEqual(self.book.open(), [])
+
+
+class LegMarkup(unittest.TestCase):
+    """Jack 2026-11-05: "quote a higher spread, the more legs"."""
+
+    def test_markup_and_last_look_grow_a_step_a_leg(self):
+        cfg = cm.Config(markup=0.04, markup_per_leg=0.01)
+        self.assertAlmostEqual(cfg.markup_for(2), 0.04)
+        self.assertAlmostEqual(cfg.markup_for(5), 0.07)
+        self.assertAlmostEqual(cfg.confirm_edge_for(2), 0.02)
+        self.assertAlmostEqual(cfg.confirm_edge_for(5), 0.035)
+        self.assertEqual(cm.quote_price(0.1234, cfg, n_legs=2), (0.129, 0.871))      # 0.128336 up
+        self.assertEqual(cm.quote_price(0.1234, cfg, n_legs=5), (0.133, 0.867))      # 0.132038 up
+        self.assertAlmostEqual(cm.Config(markup=0.04, markup_per_leg=0.0).markup_for(5), 0.04)
+
+    def test_posted_price_and_last_look_use_the_leg_count(self):
+        mk = dict(MK)
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        cfg = cm.Config(live=True, markup=0.05, markup_per_leg=0.02)
+        w = W()
+        m = cm.Maker(c, cfg, w, cm.Book(os.path.join(d.name, "s.json")), d.name, clock=lambda: T0)
+        m.handle(rfq_msg(legs=LEGS))                                          # 3 legs: 7%
+        ask = cm.grid_up(FAIR * 1.07)
+        self.assertEqual(c.posts[0][1]["no_bid"], f"{1 - ask:.4f}")
+        self.assertAlmostEqual(w.k("quote")[0]["mu"], 0.07)
+        # the books move: fair 0.21 -> 0.2184. Our 0.225 still clears the 2-leg bar
+        # (fair x 1.025 = 0.2239) but not the 3-leg one (2.5% + 1% = 3.5%: 0.2260) -> declined
+        c.mk[L1] = mkt(L1, 0.6140, 0.6340)
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": c.posts[0][1]["no_bid"]}})
+        self.assertEqual(c.puts, [])
+        self.assertEqual(w.k("decline")[0]["why"], "edge_gone")
+
+    def test_cli_step_bounds(self):
+        for bad in (["--markup-per-leg", "-0.01"], ["--markup-per-leg", "0.2"]):
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
 
 
 class NflOnly(unittest.TestCase):
