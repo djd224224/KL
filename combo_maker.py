@@ -46,9 +46,18 @@ file exists). One instance at a time (combo_maker.lock). Open tickets persist
 in maker_state.json, so a restart keeps counting them against the caps;
 settlements are read every SETTLE_EVERY_S and free their exposure.
 
+GUARDS (Jack 2026-11-06, "Yes, build both"): a DAY-LOSS STOP (no new tickets for
+the rest of the ET day once the day's P&L -- settled today plus the open tickets
+marked from their legs every MARK_EVERY_S -- is at or under -MAX_DAY_LOSS), a SPORT
+BURST (3 accepts in one sport inside 30 min, from 2+ requesters: that sport
+paused 1 h) and a LEG RUSH (one leg in accepts from 2+ requesters inside 30 min:
+its game held out 2 h). The accept that trips one is declined; they persist in
+guards.json.
+
 Logs: run-logs\combo-maker\combo_<UTC date>.jsonl (quote / accept / confirm /
-decline / executed / filled / unfilled / position / settled / stat / err) and
-the console.
+decline / executed / filled / unfilled / position / settled / guard / stat /
+err), the console, and the LEG TAPE legs_<UTC date>.jsonl: every leg we read,
+its book and outside fairs when they change (combo_scorecard.py's prices).
 
   python combo_maker.py                      # DRY: price and log, send nothing
   python combo_maker.py --live               # quote for real (Jack starts it)
@@ -67,7 +76,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -82,6 +91,11 @@ import combo_poly_lines as cpl  # noqa: E402
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
 REQUESTERS_NAME = "requesters.json"     # the requester guard's counts and blocks
+GUARDS_NAME = "guards.json"             # the day-loss stop, sport pauses, game holds, recent accepts
+MARK_EVERY_S = 60.0                     # the open tickets are marked (one read of their legs) this often
+LEG_LOG_S = 60.0                        # the leg tape is written this often: a leg read since its last
+LEG_REFRESH_S = 300.0                   # line goes again when it changed, or this long after that line
+LEG_FORGET_S = 6 * 3600.0               # a leg unread this long leaves the tape's memory
 ODDS_DIR = os.environ.get("COMBO_RFQ_DIR", os.path.join(HERE, "run-logs", "combo-rfq"))   # the logger's odds_*.jsonl
 LINES_EVERY_S = 60.0                   # the sportsbook lines are re-read this often
 POLY_EVERY_S = 180.0                   # Polymarket's moneylines, re-read on their own thread this often
@@ -178,6 +192,39 @@ class Config:
         self.guard_min_accepts = 0
         self.guard_min_rate = 0.10
         self.guard_block_hours = 24.0
+        # DAY-LOSS STOP (Jack 2026-11-06, "Yes, build both", after the desk review: there
+        # was no P&L stop -- the in-play tennis run sold 6 tickets in 12 min and lost $127
+        # before it was stopped by hand). Once the ET day's P&L is at or under
+        # -max_day_loss: no new tickets for the rest of the day (RFQs skipped and accepts
+        # declined, "day_loss"). The day's P&L = tickets settled today (their P&L, less
+        # their mark at the day's first look when sold before today) + the open tickets'
+        # marks now, less theirs at the day's first look (0 for a ticket sold today). A
+        # mark is contracts x (our price - the parlay's value) - fee, the value the
+        # product of the legs' mids (1 / 0 once Kalshi settled a leg), from one read of
+        # the open tickets' legs every MARK_EVERY_S. Persists in guards.json; clears at
+        # ET midnight; raising the limit over the loss lifts it. None = off (here; the
+        # CLI's default is $500)
+        self.max_day_loss = None
+        # SPORT BURST (same): burst_accepts accepts on parlays with a leg in one sport
+        # inside burst_window_min, from 2 or more requesters, pause that sport
+        # burst_pause_min; the accept that trips it is declined ("sport_burst", then
+        # "sport_paused"). Suddenly the best price in a sport, we likely miss what the
+        # other makers know (11/06: tennis in play; our accept rate there was 0.5% of
+        # quotes, NBA's 0.002%). The replay of 11/06's 40 accepts: 3 in 30 min tripped
+        # only the tennis run, at its 3rd accept (04:25Z), sparing its 5 losing tickets
+        # (-$130). One requester's burst is the requester guard's. 0 = off (here; the
+        # CLI's default is 3)
+        self.burst_accepts = 0
+        self.burst_window_min = 30.0
+        self.burst_pause_min = 60.0
+        # LEG RUSH (same): one leg (ticker and side) in accepts from 2 or more requesters
+        # inside rush_window_min holds its game out rush_hold_min, every leg on it; the
+        # accept that trips it is declined ("leg_rush", then "game_held"): several buyers
+        # wanting the same leg off us at once is how a stale leg looks. The 11/06 replay:
+        # the tennis legs from 04:25Z, and once Real Madrid (03:04Z, two soccer
+        # parlays 16 min apart). 0 = off (here; the CLI's default is 30)
+        self.rush_window_min = 0.0
+        self.rush_hold_min = 120.0
         # OUTCOME CAP (Jack 2026-11-06: "Limit exposure by outcome, not just by game"):
         # the payout that rides on one leg result (ticker and side) across the open
         # tickets, at the quote and at the last look. None = off (here; the CLI's
@@ -355,6 +402,60 @@ def et_day(ts: float) -> str:
         return datetime.fromtimestamp(ts, pytz.timezone("US/Eastern")).strftime("%Y-%m-%d")
     except ImportError:
         return datetime.fromtimestamp(ts - 5 * 3600, timezone.utc).strftime("%Y-%m-%d")
+
+
+def et_next_midnight(ts: float) -> float:
+    """The next ET midnight after ts (when the day-loss stop clears)."""
+    try:
+        import pytz
+        tz = pytz.timezone("US/Eastern")
+        d = datetime.fromtimestamp(ts, tz)
+        return tz.localize(datetime(d.year, d.month, d.day) + timedelta(days=1)).timestamp()
+    except ImportError:
+        return (math.floor((ts - 5 * 3600) / 86400) + 1) * 86400 + 5 * 3600
+
+
+MARK_WIDE = 0.15                        # a book wider than this marks at its last trade, if it has one
+
+
+def leg_value(m: dict, side: str):
+    """A leg's chance of going the parlay's way now: 1 / 0 once Kalshi settled it,
+    else its mid (1 - mid for a NO leg) -- the last trade instead without a real
+    book or with one over MARK_WIDE wide (in play, a 1c / 99c book's 50c says
+    nothing); None when there is neither."""
+    m = m or {}
+    r = str(m.get("result") or "").lower()
+    if r in ("yes", "no"):
+        return 1.0 if r == side else 0.0
+    last = _f(m.get("last_price_dollars"))
+    if last is None and _f(m.get("last_price")) is not None:
+        last = _f(m.get("last_price")) / 100.0
+    if last is not None and not 0.0 <= last <= 1.0:
+        last = None
+    bid, ask = _f(m.get("yes_bid_dollars")), _f(m.get("yes_ask_dollars"))
+    book = bid is not None and ask is not None and 0.0 <= bid < ask <= 1.0 and not (bid <= 0.0 and ask >= 1.0)
+    if book and (ask - bid <= MARK_WIDE + 1e-9 or last is None):
+        mid = (bid + ask) / 2.0
+    elif last is not None:
+        mid = last
+    else:
+        return None
+    return mid if side == "yes" else 1.0 - mid
+
+
+def parlay_value(legs, markets: dict):
+    """The parlay's value now: the product of its legs' leg_value -- 0 once any leg
+    lost, None while a live leg can't be valued."""
+    v, unknown = 1.0, False
+    for tk, side in ((l[0], l[1]) for l in legs):
+        x = leg_value(markets.get(tk), side)
+        if x is None:
+            unknown = True
+        elif x <= 0.0:
+            return 0.0
+        else:
+            v *= x
+    return None if unknown else v
 
 
 def game_of(ticker: str) -> str:
@@ -686,7 +787,7 @@ class _Locked:
 
 class Maker:
     def __init__(self, client, cfg: Config, writer, book: Book, out_dir: str, clock=time.time,
-                 client_factory=None):
+                 client_factory=None, leg_writer=None):
         self.c = client
         self.cfg = cfg
         self.w = _Locked(writer)
@@ -721,6 +822,16 @@ class Maker:
         self.lines, self.lines_at, self.line_match = None, 0.0, {}
         self.poly, self.poly_match, self.poly_seen = None, {}, None     # PolyLines (run() starts it)
         self.bout_seen, self.bout_logged = {}, set()                    # the bout guard's answers a leg
+        # the guards (day-loss stop, sport burst, leg rush), kept in guards.json
+        self.guards_path = os.path.join(out_dir, GUARDS_NAME) if out_dir else None
+        self.acc_hist = deque()                  # recent accepts: (time, requester, sports, legs)
+        self.sport_pause, self.game_hold = {}, {}   # sport / game key -> held out until
+        self.halt = None                         # the day-loss stop: {"day", "at", "pnl"}
+        self.day_pnl, self.last_mark = None, 0.0
+        self._load_guards()
+        # the leg tape: leg -> {"b", "a" (its book), "d", "p" (DraftKings / Polymarket YES),
+        # "seen" (read at), "at" (last line), "dirty", "xw" (its expiry written)}
+        self.leg_w, self.tape, self.tape_at = leg_writer, {}, 0.0
         self._reset_stats()
 
     def _reset_stats(self):
@@ -759,7 +870,52 @@ class Maker:
                         if not is_extra(m["ticker"]) and sport_group(m["ticker"].split("-")[0]):
                             self.game_start[game_of(m["ticker"])] = start_of(m["ticker"], ex)
                     self._track_mid(m, now)
+                    self._tape(m["ticker"], m, now)
         return {t: self.cache[t][1] for t in tickers if t in self.cache}
+
+    def _tape(self, tk: str, m: dict, now: float) -> None:
+        """Note a leg's book for the leg tape (written in upkeep)."""
+        if self.leg_w is None:
+            return
+        bid, ask = _f(m.get("yes_bid_dollars")), _f(m.get("yes_ask_dollars"))
+        e = self.tape.get(tk)
+        if e is None:
+            e = self.tape[tk] = {"b": None, "a": None, "d": None, "p": None, "at": None, "dirty": True}
+        if (bid, ask) != (e["b"], e["a"]):
+            e["b"], e["a"], e["dirty"] = bid, ask, True
+        e["seen"] = now
+
+    def _tape_src(self, tk: str, book_yes, poly_yes) -> None:
+        """Note a leg's outside fairs (YES) for the leg tape."""
+        e = self.tape.get(tk) if self.leg_w is not None else None
+        if e is None:
+            return
+        d = None if book_yes is None else round(book_yes, 4)
+        p = None if poly_yes is None else round(poly_yes, 4)
+        if (d, p) != (e["d"], e["p"]):
+            e["d"], e["p"], e["dirty"] = d, p, True
+
+    def write_tape(self, now: float) -> None:
+        """One "legs" line: each leg read since its last line whose book or outside
+        fairs changed, or LEG_REFRESH_S after that line -- [bid, ask, DraftKings YES,
+        Polymarket YES], + its expected expiration (epoch s) the first time."""
+        out = {}
+        for tk in list(self.tape):
+            e = self.tape[tk]
+            seen, at = e.get("seen", 0.0), e["at"]
+            if now - seen > LEG_FORGET_S:
+                del self.tape[tk]
+                continue
+            if at is not None and (seen <= at or (not e["dirty"] and now - at < LEG_REFRESH_S)):
+                continue
+            row = [e["b"], e["a"], e["d"], e["p"]]
+            if not e.get("xw") and self.exp.get(tk) is not None:
+                row.append(round(self.exp[tk]))
+                e["xw"] = True
+            out[tk] = row
+            e["at"], e["dirty"] = now, False
+        if out:
+            self.leg_w.write({"k": "legs", "t": round(now, 1), "m": out})
 
     def _track_mid(self, m: dict, now: float) -> None:
         bid, ask = _f(m.get("yes_bid_dollars"), 0.0), _f(m.get("yes_ask_dollars"), 1.0)
@@ -828,6 +984,10 @@ class Maker:
         cr = str(msg.get("creator_id") or "")[:8]
         if cr and self.blocked.get(cr, 0.0) > now:
             self._why("requester_blocked")
+            return
+        why = self._guard_block(legs, now)
+        if why:
+            self._why(why)
             return
         while self.sent and now - self.sent[0] > 60:
             self.sent.popleft()
@@ -968,8 +1128,17 @@ class Maker:
                "side": msg.get("accepted_side"), "yes_bid": msg.get("yes_bid_dollars"),
                "no_bid": msg.get("no_bid_dollars"), "contracts": cts}
         self.w.write(rec)
+        try:
+            tripped = self._note_accept(q, now)
+        except Exception as e:                          # a guard's fault must not lose the last look
+            self._error("accept guards", e)
+            tripped = None
         if self._requester_accept(q.get("cr") or "", now):
             self._decline(q, "requester_flagged", None, cts)
+            return
+        why = tripped or self._guard_block(q["legs"], now)
+        if why:
+            self._decline(q, why, None, cts)
             return
         if _f(msg.get("no_bid_dollars")) is not None and abs(_f(msg.get("no_bid_dollars")) - q["no_bid"]) > 1e-6:
             self._decline(q, "price_mismatch", None, cts)
@@ -1175,6 +1344,18 @@ class Maker:
             self.settle()
         if self.cfg.book_fair and now - self.lines_at >= LINES_EVERY_S:
             self.reload_lines(now)
+        if self.cfg.live and now - self.last_mark >= MARK_EVERY_S:
+            self.last_mark = now
+            try:
+                self.mark_book(now)
+            except Exception as e:                      # the marks must never stop the loop
+                self._error("marks", e)
+        if self.leg_w is not None and now - self.tape_at >= LEG_LOG_S:
+            self.tape_at = now
+            try:
+                self.write_tape(now)
+            except Exception as e:                      # nor the tape
+                self._error("leg tape", e)
         if now - self.req_pruned >= REQ_PRUNE_EVERY_S:
             self.req_pruned = now
             with self.lock:
@@ -1182,12 +1363,19 @@ class Maker:
                     del self.req[cr]
                 for cr in [k for k, until in self.blocked.items() if until <= now]:
                     del self.blocked[cr]
+            for d in (self.sport_pause, self.game_hold):
+                for k in [k for k, until in d.items() if until <= now]:
+                    del d[k]
+            if self.halt is not None and self.halt.get("day") != et_day(now):
+                self.halt = None                       # a past day's stop: over
         if now - self.st_since >= STAT_SECS:
             with self.lock:                             # the senders count into self.st too
                 st = self.st
                 self._reset_stats()
             rec = dict(st, k="stat", t=now, open=len(self.book.open()),
-                       open_loss=round(self.book.open_loss(), 2), live=self.cfg.live)
+                       open_loss=round(self.book.open_loss(), 2), live=self.cfg.live,
+                       day_pnl=None if self.day_pnl is None else round(self.day_pnl, 2),
+                       halted=self._halted(now))
             self.w.write(rec)
             top = sorted(st["why"].items(), key=lambda kv: -kv[1])[:4]
             log(f"min: rfq {st['rfq']} pre-ok {st['pre_ok']} priced {st['priced']} "
@@ -1196,6 +1384,135 @@ class Maker:
                    else f"would quote {st['dry']}")
                 + f" | open {len(self.book.open())} can lose ${self.book.open_loss():,.2f} | top skips "
                 + ", ".join(f"{k} {v}" for k, v in top))
+
+    # ---- the guards: day-loss stop, sport burst, leg rush -------------------------
+
+    def _halted(self, now: float) -> bool:
+        """The day-loss stop holds: tripped today, at a loss the limit still covers
+        (raising --max-day-loss over it lifts it; off lifts it)."""
+        h, lim = self.halt, self.cfg.max_day_loss
+        return bool(h) and lim is not None and h.get("day") == et_day(now) and _f(h.get("pnl"), 0.0) <= -lim + 1e-9
+
+    def _guard_block(self, legs, now: float):
+        """Why the guards keep these legs out now (None = they don't)."""
+        if self.halt is not None and self._halted(now):
+            return "day_loss"
+        if self.sport_pause and any(self.sport_pause.get(sport_of(str(l[0]).split("-")[0]), 0.0) > now
+                                    for l in legs):
+            return "sport_paused"
+        if self.game_hold and any(self.game_hold.get(game_of(l[0]), 0.0) > now for l in legs):
+            return "game_held"
+        return None
+
+    def _guard_rec(self, what: str, key: str, until: float, detail: str, now: float) -> None:
+        self.w.write({"k": "guard", "t": now, "what": what, "key": key, "until": until, "detail": detail})
+        log(f"! guard {what}: {key} held out until {datetime.fromtimestamp(until, timezone.utc):%H:%MZ} "
+            f"({detail})")
+
+    def _note_accept(self, q: dict, now: float):
+        """Count an accept for the sport burst and the leg rush; the guard it trips
+        ("sport_burst" / "leg_rush": the accept is then declined) or None."""
+        legs = tuple((str(l[0]), str(l[1])) for l in q["legs"])
+        sports = tuple(sorted({sport_of(tk.split("-")[0]) for tk, _ in legs}))
+        cr = q.get("cr") or ""
+        keep = max(self.cfg.burst_window_min if self.cfg.burst_accepts > 0 else 0.0, self.cfg.rush_window_min) * 60
+        while self.acc_hist and now - self.acc_hist[0][0] > keep:
+            self.acc_hist.popleft()
+        hist = list(self.acc_hist)
+        if keep > 0:
+            self.acc_hist.append((now, cr, sports, legs))
+        why = None
+        if self.cfg.burst_accepts > 0:
+            w = self.cfg.burst_window_min * 60
+            for s in sports:
+                recent = [c for t, c, ss, _ in hist if s in ss and now - t <= w] + [cr]
+                if len(recent) >= self.cfg.burst_accepts and len(set(recent)) >= 2:
+                    until = now + self.cfg.burst_pause_min * 60
+                    self.sport_pause[s] = max(self.sport_pause.get(s, 0.0), until)
+                    self._guard_rec("sport_burst", s, until, f"{len(recent)} accepts in {self.cfg.burst_window_min:g}"
+                                    f" min from {len(set(recent))} requesters", now)
+                    why = why or "sport_burst"
+        if self.cfg.rush_window_min > 0:
+            w = self.cfg.rush_window_min * 60
+            for leg in legs:
+                others = {c for t, c, _, ls in hist if leg in ls and now - t <= w and c != cr}
+                if others:
+                    g = game_of(leg[0])
+                    until = now + self.cfg.rush_hold_min * 60
+                    self.game_hold[g] = max(self.game_hold.get(g, 0.0), until)
+                    self._guard_rec("leg_rush", g, until, f"{leg[0]} {leg[1]} accepted by {len(others) + 1} "
+                                    f"requesters in {self.cfg.rush_window_min:g} min", now)
+                    why = why or "leg_rush"
+        self._save_guards()
+        return why
+
+    def mark_book(self, now: float) -> None:
+        """Mark the open tickets from one read of their legs, total the ET day's P&L
+        (Config.max_day_loss), trip the day-loss stop. A ticket whose live leg can't be
+        valued keeps its last mark; a failed read leaves the day's P&L as it was."""
+        day = et_day(now)
+        open_t = [t for t in self.book.tickets if t.get("status") == "executed" and t.get("fill_checked")]
+        legs = sorted({l[0] for t in open_t for l in t["legs"]})
+        mk = {}
+        try:
+            for i in range(0, len(legs), 100):
+                js = self.c.get("/markets", {"tickers": ",".join(legs[i:i + 100]), "limit": 1000})
+                mk.update({m["ticker"]: m for m in js.get("markets") or [] if m.get("ticker")})
+        except Exception as e:
+            self._error("mark read", e)
+            return
+        total = 0.0
+        for t in self.book.tickets:
+            if t.get("status") == "settled":
+                if t.get("settled_day") == day:
+                    total += (_f(t.get("pnl"), 0.0) or 0.0) - (t.get("m0", 0.0) if t.get("m0_day") == day else 0.0)
+                continue
+            if not (t.get("status") == "executed" and t.get("fill_checked")):
+                continue
+            v = parlay_value(t["legs"], mk)
+            if v is not None:
+                t["mark"] = round(t["contracts"] * (t["ask"] - v) - (t.get("fee_est") or 0.0), 4)
+            if t.get("mark") is None:
+                continue
+            if t.get("m0_day") != day:                  # the day's first look: its baseline
+                t["m0_day"], t["m0"] = day, (t["mark"] if t.get("day") != day else 0.0)
+            total += t["mark"] - t["m0"]
+        self.day_pnl = total
+        if open_t:
+            self.book.save()
+        lim = self.cfg.max_day_loss
+        if lim is not None and total <= -lim + 1e-9 and not self._halted(now):
+            self.halt = {"day": day, "at": now, "pnl": round(total, 2)}
+            self._guard_rec("day_loss", day, et_next_midnight(now),
+                            f"today's P&L ${total:,.2f} (settled + marked) is at or under -${lim:,.0f}", now)
+            self._save_guards()
+
+    def _load_guards(self) -> None:
+        if not self.guards_path or not os.path.exists(self.guards_path):
+            return
+        try:
+            with open(self.guards_path, encoding="utf-8") as f:
+                js = json.load(f)
+            self.sport_pause = {k: float(v) for k, v in (js.get("sport_pause") or {}).items()}
+            self.game_hold = {k: float(v) for k, v in (js.get("game_hold") or {}).items()}
+            self.halt = js.get("halt") or None
+            self.acc_hist = deque((float(a[0]), str(a[1]), tuple(a[2]), tuple(tuple(x) for x in a[3]))
+                                  for a in js.get("accepts") or [])
+        except (OSError, ValueError, TypeError, IndexError) as e:
+            log(f"! {GUARDS_NAME} unreadable ({e!r}): starting the guards empty")
+
+    def _save_guards(self) -> None:
+        if not self.guards_path:
+            return
+        js = {"sport_pause": self.sport_pause, "game_hold": self.game_hold, "halt": self.halt,
+              "accepts": [[a[0], a[1], list(a[2]), [list(x) for x in a[3]]] for a in self.acc_hist]}
+        try:
+            tmp = self.guards_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(js, f)
+            os.replace(tmp, self.guards_path)
+        except OSError as e:
+            self._error("guards save", e)
 
     # ---- the requester guard -----------------------------------------------------
 
@@ -1340,7 +1657,9 @@ class Maker:
             k_yes = (bid + ask) / 2.0
             p_k = k_yes if side == "yes" else 1.0 - k_yes
             best = p_k
-            for src, o_yes in (("book", self._book_yes(tk, m, now)), ("poly", self._poly_yes(tk, m))):
+            b_yes, p_yes = self._book_yes(tk, m, now), self._poly_yes(tk, m)
+            self._tape_src(tk, b_yes, p_yes)
+            for src, o_yes in (("book", b_yes), ("poly", p_yes)):
                 if o_yes is None:
                     continue
                 p_o = o_yes if side == "yes" else 1.0 - o_yes
@@ -1368,6 +1687,8 @@ class Maker:
                 continue
             payoff = 1.0 if r == "yes" else 0.0
             t["status"], t["result"] = "settled", r
+            t["settled_at"] = self.clock()
+            t["settled_day"] = et_day(t["settled_at"])
             t["pnl"] = t["contracts"] * (t["ask"] - payoff) - t["fee_est"]
             self.w.write({"k": "settled", "mt": t["mt"], "result": r, "pnl": round(t["pnl"], 2)})
             log(f"settled {t['mt']}: {r}, P&L {t['pnl']:+,.2f}")
@@ -1402,8 +1723,9 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
             lock.close()
             return 2
     writer = DayWriter(out_dir)
+    leg_writer = DayWriter(out_dir, prefix="legs")      # the leg tape: combo_scorecard.py's prices
     book = Book(os.path.join(out_dir, STATE_NAME))
-    mk = Maker(client, cfg, writer, book, out_dir, client_factory=sender_client)
+    mk = Maker(client, cfg, writer, book, out_dir, client_factory=sender_client, leg_writer=leg_writer)
     if cfg.poly_fair:                                   # the third fair: Polymarket, on its own thread
         mk.poly = cpl.PolyLines(log=lambda s: log(s))
         mk.poly.start(POLY_EVERY_S)
@@ -1418,6 +1740,10 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         + ((", long shots " + ", ".join(f"+{e * 100:.3g} pts under {t * 100:.3g}c"
                                         for t, e in sorted(cfg.longshot_markup, reverse=True)))
            if cfg.longshot_markup else "")
+        + (f", day-loss stop ${cfg.max_day_loss:,.0f}" if cfg.max_day_loss is not None else ", NO day-loss stop")
+        + (f", sport burst {cfg.burst_accepts} accepts/{cfg.burst_window_min:g} min -> {cfg.burst_pause_min:g} min"
+           if cfg.burst_accepts else "")
+        + (f", leg rush {cfg.rush_window_min:g} min -> game out {cfg.rush_hold_min:g} min" if cfg.rush_window_min else "")
         + f", lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
         + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
@@ -1454,6 +1780,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
                         last_up = now
                         mk.upkeep()
                         writer.flush()
+                        leg_writer.flush()
                         if (deadline and now >= deadline) or os.path.exists(stop_path):
                             raise StopIteration
                         if time.monotonic() - conn.last_rx > STALE_SECS:
@@ -1492,6 +1819,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         writer.write({"k": "stop", "t": time.time(), "open": len(book.open()),
                       "open_loss": round(book.open_loss(), 2)})
         writer.close()
+        leg_writer.close()
         lock.close()
         log(f"stopped; open tickets {len(book.open())}, can lose ${book.open_loss():,.2f}")
     return code
@@ -1553,6 +1881,20 @@ def main(argv=None) -> int:
                          "declined; 0 = off)")
     ap.add_argument("--guard-min-rate", type=float, default=d.guard_min_rate)
     ap.add_argument("--guard-block-hours", type=float, default=d.guard_block_hours)
+    ap.add_argument("--max-day-loss", type=float, default=500.0,
+                    help="no new tickets for the rest of the ET day once the day's P&L (tickets settled today + "
+                         "the open ones marked from their legs, each less its mark at the day's first look) is at "
+                         "or under minus this (0 = off). Jack 2026-11-06: \"Yes, build both\"")
+    ap.add_argument("--burst-accepts", type=int, default=3,
+                    help="this many accepts on parlays with a leg in one sport inside --burst-window-min, from 2+ "
+                         "requesters, pause that sport --burst-pause-min; the accept that trips it is declined "
+                         "(0 = off)")
+    ap.add_argument("--burst-window-min", type=float, default=d.burst_window_min)
+    ap.add_argument("--burst-pause-min", type=float, default=d.burst_pause_min)
+    ap.add_argument("--rush-window-min", type=float, default=30.0,
+                    help="one leg in accepts from 2+ requesters inside this many minutes holds its game out "
+                         "--rush-hold-min; the accept that trips it is declined (0 = off)")
+    ap.add_argument("--rush-hold-min", type=float, default=d.rush_hold_min)
     ap.add_argument("--no-book-fair", action="store_true",
                     help="drop the second fair (DraftKings' vig-free moneyline on game-winner legs, from the "
                          "RFQ logger's odds files)")
@@ -1645,6 +1987,9 @@ def main(argv=None) -> int:
                  max_game_payout=a.max_game_payout, max_ticket_loss=a.max_ticket_loss,
                  max_outcome_payout=a.max_outcome_payout or None, guard_min_accepts=a.guard_min_accepts,
                  guard_min_rate=a.guard_min_rate, guard_block_hours=a.guard_block_hours,
+                 max_day_loss=a.max_day_loss or None, burst_accepts=a.burst_accepts,
+                 burst_window_min=a.burst_window_min, burst_pause_min=a.burst_pause_min,
+                 rush_window_min=a.rush_window_min, rush_hold_min=a.rush_hold_min,
                  book_fair=not a.no_book_fair, max_book_gap=a.max_book_gap,
                  poly_fair=not a.no_poly_fair, max_poly_spread=a.max_poly_spread,
                  min_poly_liquidity=a.min_poly_liquidity, bout_guard=not a.no_bout_guard, skip_games=skip,
@@ -1682,6 +2027,12 @@ def main(argv=None) -> int:
         ap.error("--max-poly-spread 0.001 to 0.2, --min-poly-liquidity 0 or more")
     if not 0.005 <= cfg.max_book_gap <= 0.5:
         ap.error("--max-book-gap 0.005 to 0.5")
+    if cfg.max_day_loss is not None and not 10 <= cfg.max_day_loss <= 100_000:
+        ap.error("--max-day-loss $10 to $100,000 (0 = off)")
+    if not 0 <= cfg.burst_accepts <= 100 or not 0 < cfg.burst_window_min <= 1440 or not 0 < cfg.burst_pause_min <= 1440:
+        ap.error("--burst-accepts 0-100, --burst-window-min and --burst-pause-min (0, 1440]")
+    if not 0 <= cfg.rush_window_min <= 1440 or not 0 < cfg.rush_hold_min <= 2880:
+        ap.error("--rush-window-min 0-1440, --rush-hold-min (0, 2880]")
     return run(cfg, a.minutes)
 
 

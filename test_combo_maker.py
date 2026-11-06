@@ -1662,5 +1662,257 @@ class RunGuards(unittest.TestCase):
                 held.close()
 
 
+
+# ---- the guards (Jack 2026-11-06, "Yes, build both") ---------------------------------
+
+S1, S1B = "KXEPLGAME-26NOV07ARSCHE-ARS", "KXEPLGAME-26NOV07ARSCHE-CHE"
+S2, S3, S4 = "KXLALIGAGAME-26NOV07RMABAR-RMA", "KXSERIEAGAME-26NOV07INTMIL-INT", "KXLIGUE1GAME-26NOV07PSGOLY-PSG"
+GMK = dict(MK, **{S1: mkt(S1, 0.49, 0.51), S1B: mkt(S1B, 0.24, 0.26), S2: mkt(S2, 0.59, 0.61),
+                  S3: mkt(S3, 0.44, 0.46), S4: mkt(S4, 0.69, 0.71)})
+
+
+def rfq_by(rid, legs, creator, now):
+    m = rfq_msg(rid=rid, legs=legs)
+    m["msg"]["creator_id"], m["msg"]["created_ts"] = creator, iso(now - 0.2)
+    return m
+
+
+class GuardBase(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.clock = [T0]
+        self.w = W()
+
+    def cfg(self, **kw):
+        kw.setdefault("markup_per_leg", 0.0)
+        kw.setdefault("min_legs", 2)
+        return cm.Config(live=True, **kw)
+
+    def maker(self, **kw):
+        self.c = FakeClient(GMK)
+        self.book = cm.Book(os.path.join(self.d.name, "s.json"))
+        return cm.Maker(self.c, self.cfg(**kw), self.w, self.book, self.d.name, clock=lambda: self.clock[0])
+
+    def fresh(self, **kw):
+        """A restart: a new maker on the same folder (the test's client and book stay)."""
+        return cm.Maker(FakeClient(GMK), self.cfg(**kw), W(), cm.Book(os.path.join(self.d.name, "s.json")),
+                        self.d.name, clock=lambda: self.clock[0])
+
+    def sell(self, m, rid, legs, creator, minutes=0.0):
+        """An RFQ, our quote, its accept: True when confirmed, False when declined,
+        None when nothing was quoted."""
+        self.clock[0] += minutes * 60
+        n = len(self.c.posts)
+        m.handle(rfq_by(rid, legs, creator, self.clock[0]))
+        if len(self.c.posts) == n:
+            return None
+        puts = len(self.c.puts)
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": f"q{len(self.c.posts)}", "rfq_id": rid,
+                                                      "no_bid_dollars": self.c.posts[-1][1]["no_bid"]}})
+        return len(self.c.puts) > puts
+
+
+class SportBurst(GuardBase):
+    """11/06 replay: 3 accepts in one sport inside 30 min, from 2+ requesters,
+    tripped only the in-play tennis run (at 04:25Z, its 3rd accept)."""
+
+    def test_three_accepts_from_two_requesters_pause_the_sport(self):
+        m = self.maker(burst_accepts=3)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [S2, "yes"]], "aaaa0000"))
+        self.assertTrue(self.sell(m, "r2", [[S3, "yes"], [S4, "yes"]], "bbbb0000", minutes=5))
+        self.assertFalse(self.sell(m, "r3", [[S1, "yes"], [S3, "yes"]], "aaaa0000", minutes=5))   # the 3rd
+        self.assertEqual(self.w.k("decline")[-1]["why"], "sport_burst")
+        g = self.w.k("guard")[0]
+        self.assertEqual((g["what"], g["key"]), ("sport_burst", "SOCCER"))
+        self.assertAlmostEqual(g["until"], self.clock[0] + 3600)
+        self.assertIsNone(self.sell(m, "r4", [[S2, "yes"], [L1, "yes"]], "cccc0000", minutes=1))  # a soccer leg
+        self.assertEqual(m.st["why"]["sport_paused"], 1)
+        self.assertTrue(self.sell(m, "r5", [[L1, "yes"], [L2, "yes"]], "cccc0000"))              # NBA + NHL
+        self.assertGreater(self.fresh(burst_accepts=3).sport_pause["SOCCER"], self.clock[0])      # survives a restart
+        self.assertTrue(self.sell(m, "r6", [[S1, "yes"], [S2, "yes"]], "dddd0000", minutes=61))   # an hour on
+
+    def test_one_requester_alone_is_the_requester_guards(self):
+        m = self.maker(burst_accepts=3)
+        for i, legs in enumerate(([[S1, "yes"], [S2, "yes"]], [[S3, "yes"], [S4, "yes"]], [[S1, "yes"], [S3, "yes"]])):
+            self.assertTrue(self.sell(m, f"r{i}", legs, "aaaa0000", minutes=2))
+        self.assertEqual(self.w.k("guard"), [])
+
+    def test_spread_out_or_off(self):
+        m = self.maker(burst_accepts=3)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [S2, "yes"]], "aaaa0000"))
+        self.assertTrue(self.sell(m, "r2", [[S3, "yes"], [S4, "yes"]], "bbbb0000", minutes=20))
+        self.assertTrue(self.sell(m, "r3", [[S1, "yes"], [S3, "yes"]], "aaaa0000", minutes=20))   # r1 is 40 min old
+        self.assertEqual(self.w.k("guard"), [])
+        self.w = W()
+        m = self.maker(burst_accepts=0)
+        for i, (legs, cr) in enumerate((([[S1, "yes"], [S2, "yes"]], "a"), ([[S3, "yes"], [S4, "yes"]], "b"),
+                                        ([[S1, "yes"], [S3, "yes"]], "c"))):
+            self.assertTrue(self.sell(m, f"r{i}", legs, cr, minutes=1))
+
+
+class LegRush(GuardBase):
+    """One leg (ticker and side) in accepts from 2+ requesters inside 30 min holds its game out."""
+
+    def test_a_leg_two_requesters_take_holds_its_game(self):
+        m = self.maker(rush_window_min=30)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [L1, "yes"]], "aaaa0000"))
+        self.assertTrue(self.sell(m, "r2", [[S1, "no"], [L2, "yes"]], "bbbb0000", minutes=5))     # the other side
+        self.assertFalse(self.sell(m, "r3", [[S1, "yes"], [L3, "no"]], "bbbb0000", minutes=5))    # S1 YES again
+        self.assertEqual(self.w.k("decline")[-1]["why"], "leg_rush")
+        g = self.w.k("guard")[-1]
+        self.assertEqual((g["what"], g["key"]), ("leg_rush", "26NOV07ARSCHE"))
+        self.assertAlmostEqual(g["until"], self.clock[0] + 7200)
+        self.assertIsNone(self.sell(m, "r4", [[S1B, "yes"], [L2, "yes"]], "cccc0000"))            # same game
+        self.assertEqual(m.st["why"]["game_held"], 1)
+        self.assertFalse(self.sell(m, "r5", [[S3, "yes"], [L2, "yes"]], "cccc0000"))             # L2 YES: bbbb's too
+        self.assertTrue(self.sell(m, "r6", [[S3, "yes"], [L3, "yes"]], "cccc0000"))              # L3 YES: nobody's
+        self.assertGreater(self.fresh(rush_window_min=30).game_hold["26NOV07ARSCHE"], self.clock[0])
+
+    def test_one_requester_twice_or_far_apart_is_no_rush(self):
+        m = self.maker(rush_window_min=30)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [L1, "yes"]], "aaaa0000"))
+        self.assertTrue(self.sell(m, "r2", [[S1, "yes"], [L2, "yes"]], "aaaa0000", minutes=5))
+        self.assertTrue(self.sell(m, "r3", [[S1, "yes"], [L3, "no"]], "bbbb0000", minutes=31))     # r2 31 min old
+        self.assertEqual(self.w.k("guard"), [])
+
+
+class DayLossStop(GuardBase):
+    """No new tickets for the rest of the ET day once the day's P&L (settled + marked)
+    is at or under -max_day_loss."""
+
+    def ticket(self, **kw):
+        t = {"quote_id": "qx", "mt": "KXMVECROSSCATEGORY-S2026X-Z", "legs": [[L1, "yes"], [L2, "yes"]],
+             "games": [cm.game_of(L1), cm.game_of(L2)], "ask": 0.33, "fair": 0.30, "contracts": 100.0,
+             "status": "executed", "fill_checked": True, "px_checked": True, "day": cm.et_day(self.clock[0]),
+             "at": self.clock[0], "fee_est": 0.5}
+        t.update(kw)
+        return t
+
+    def test_the_marks_trip_it_and_it_holds_the_day(self):
+        m = self.maker(max_day_loss=10.0)
+        m.handle(rfq_by("r1", [[S1, "yes"], [S2, "yes"]], "aaaa0000", self.clock[0]))   # quoted before the stop
+        self.book.tickets.append(self.ticket())
+        m.mark_book(self.clock[0])                       # 0.6 x 0.5 = 0.30: 100 x (0.33 - 0.30) - 0.5
+        self.assertAlmostEqual(m.day_pnl, 2.5)
+        self.c.mk[L1] = mkt(L1, 0.79, 0.81)              # 0.8 x 0.5 = 0.40
+        m.mark_book(self.clock[0])
+        self.assertAlmostEqual(m.day_pnl, -7.5)
+        self.assertIsNone(m.halt)
+        self.c.mk[L2] = dict(mkt(L2, 0.0, 1.0), result="yes")     # L2 won: 0.8 is left
+        m.mark_book(self.clock[0])
+        self.assertAlmostEqual(m.day_pnl, -47.5)
+        self.assertEqual(m.halt["day"], cm.et_day(self.clock[0]))
+        g = self.w.k("guard")[-1]
+        self.assertEqual((g["what"], g["key"]), ("day_loss", cm.et_day(self.clock[0])))
+        self.assertAlmostEqual(g["until"], cm.et_next_midnight(self.clock[0]))
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": self.c.posts[-1][1]["no_bid"]}})
+        self.assertEqual((self.c.puts, self.w.k("decline")[-1]["why"]), ([], "day_loss"))
+        self.assertIsNone(self.sell(m, "r2", [[S3, "yes"], [S4, "yes"]], "bbbb0000"))
+        self.assertEqual(m.st["why"]["day_loss"], 1)
+        self.assertTrue(self.fresh(max_day_loss=10.0)._halted(self.clock[0]))                 # survives a restart
+        m.cfg.max_day_loss = 100.0                       # a limit over the loss lifts it
+        self.assertIsNotNone(self.sell(m, "r3", [[S3, "yes"], [S4, "yes"]], "bbbb0000"))
+        m.cfg.max_day_loss = 10.0
+        self.clock[0] = cm.et_next_midnight(self.clock[0]) + 60                               # the next ET day
+        self.assertFalse(m._halted(self.clock[0]))
+
+    def test_a_lost_leg_and_an_earlier_days_ticket(self):
+        m = self.maker(max_day_loss=500.0)
+        self.book.tickets.append(self.ticket(day="2026-11-04"))
+        m.mark_book(self.clock[0])
+        self.assertAlmostEqual(m.day_pnl, 0.0)           # counted from its mark at the day's first look (+2.5)
+        self.c.mk[L1] = mkt(L1, 0.79, 0.81)
+        m.mark_book(self.clock[0])
+        self.assertAlmostEqual(m.day_pnl, -10.0)         # -7.5 now, less the +2.5
+        self.c.mk[L1] = dict(mkt(L1, 0.0, 1.0), result="no")    # a leg lost: the parlay is ours
+        m.mark_book(self.clock[0])
+        self.assertAlmostEqual(m.day_pnl, 100 * 0.33 - 0.5 - 2.5)
+        self.assertEqual(cm.Book(os.path.join(self.d.name, "s.json")).tickets[0]["m0"], 2.5)     # kept
+
+    def test_settled_today_counts_other_days_do_not(self):
+        m = self.maker(max_day_loss=30.0)
+        today = cm.et_day(self.clock[0])
+        self.book.tickets += [self.ticket(status="settled", pnl=-40.0, settled_day=today),
+                              self.ticket(status="settled", pnl=-90.0, settled_day="2026-11-04")]
+        m.mark_book(self.clock[0])
+        self.assertAlmostEqual(m.day_pnl, -40.0)
+        self.assertTrue(m._halted(self.clock[0]))
+        m.cfg.max_day_loss = None                        # off: nothing held
+        self.assertIsNone(m._guard_block([[L1, "yes"]], self.clock[0]))
+
+    def test_upkeep_marks_a_minute_and_the_stat_line_carries_it(self):
+        m = self.maker(max_day_loss=500.0)
+        self.book.tickets.append(self.ticket())
+        self.clock[0] += 61
+        m.upkeep()
+        self.assertAlmostEqual(m.day_pnl, 2.5)
+        st = self.w.k("stat")[-1]
+        self.assertEqual((st["day_pnl"], st["halted"]), (2.5, False))
+
+    def test_settle_stamps_the_day(self):
+        m = self.maker()
+        self.book.tickets.append(self.ticket(mt="KXMVECROSSCATEGORY-S2026X-Z"))
+        self.c.mk["KXMVECROSSCATEGORY-S2026X-Z"] = {"ticker": "KXMVECROSSCATEGORY-S2026X-Z", "result": "no"}
+        m.settle()
+        t = self.book.tickets[0]
+        self.assertEqual((t["status"], t["settled_day"]), ("settled", cm.et_day(self.clock[0])))
+
+    def test_leg_and_parlay_values(self):
+        self.assertAlmostEqual(cm.leg_value(mkt(L1, 0.59, 0.61), "no"), 0.40)
+        self.assertEqual(cm.leg_value({"result": "yes"}, "no"), 0.0)
+        self.assertAlmostEqual(cm.leg_value({"yes_bid_dollars": "0", "yes_ask_dollars": "1",
+                                             "last_price_dollars": "0.97"}, "yes"), 0.97)
+        self.assertIsNone(cm.leg_value({"yes_bid_dollars": "0", "yes_ask_dollars": "1"}, "yes"))
+        wide = {"yes_bid_dollars": "0.0100", "yes_ask_dollars": "0.9900"}             # in play
+        self.assertAlmostEqual(cm.leg_value(dict(wide, last_price_dollars="0.8800"), "yes"), 0.88)
+        self.assertAlmostEqual(cm.leg_value(wide, "yes"), 0.50)                       # no trade: the mid
+        self.assertIsNone(cm.parlay_value([[L1, "yes"], [L2, "yes"]], {L1: MK[L1]}))      # L2 unread
+        self.assertEqual(cm.parlay_value([[L1, "yes"], [L2, "yes"]], {L2: {"result": "no"}}), 0.0)   # lost
+
+    def test_the_flags(self):
+        for bad in (["--max-day-loss", "5"], ["--burst-accepts", "200"], ["--rush-window-min", "-1"]):
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
+
+
+class LegTape(unittest.TestCase):
+    """The scorecard's prices: each leg we read, its book and outside fairs when
+    they change (or every LEG_REFRESH_S), in legs_<day>.jsonl."""
+
+    def test_changes_refreshes_and_the_outside_fairs(self):
+        lw, c, clock = W(), FakeClient(MK), [T0]
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(c, cm.Config(min_legs=2), W(), cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: clock[0], leg_writer=lw)
+
+        def step(rid, advance=61):
+            m.cache.clear()
+            m.handle(rfq_by(rid, LEGS, "aaaa0000", clock[0]))
+            clock[0] += advance
+            m.upkeep()
+
+        step("r1")
+        rec = lw.k("legs")[0]
+        self.assertEqual(rec["m"][L1], [0.59, 0.61, None, None, round(T0 + 5 * 3600)])   # + its expiry, once
+        step("r2")
+        self.assertEqual(len(lw.k("legs")), 1)                                          # unchanged: no line
+        c.mk[L1] = mkt(L1, 0.61, 0.63)
+        step("r3")
+        self.assertEqual(lw.k("legs")[-1]["m"], {L1: [0.61, 0.63, None, None]})
+        m._tape_src(L2, 0.52, None)                                                     # DraftKings on L2
+        step("r4")
+        self.assertEqual(lw.k("legs")[-1]["m"], {L2: [0.49, 0.51, 0.52, None]})
+        clock[0] += cm.LEG_REFRESH_S
+        step("r5")
+        self.assertEqual(sorted(lw.k("legs")[-1]["m"]), sorted([L1, L2, L3]))           # refreshed
+        n = len(lw.k("legs"))
+        clock[0] += 120
+        m.upkeep()
+        self.assertEqual(len(lw.k("legs")), n)                                          # not read since: nothing
+
+
 if __name__ == "__main__":
     unittest.main()

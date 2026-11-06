@@ -284,6 +284,7 @@ class _DaySum:
         self.sampler = sampler        # QuoteOutcomes: offered the sampled quotes
         self.acc_ids, self.dec_ids = set(), set()   # quote ids accepted by a buyer / declined at the last look
         self.blocks = []              # the maker's requester-guard blocks
+        self.guards = []              # the maker's other guards tripped: day-loss stop, sport burst, leg rush
 
     def _seg_quote(self, key, mu, qid) -> None:
         v = self.seg_q.get(key)
@@ -401,6 +402,8 @@ class _DaySum:
             self.last_stat = e
         elif k == "requester_block":
             self.blocks.append(e)
+        elif k == "guard":
+            self.guards.append(e)
         elif k == "settled":
             self.settle_ts[e.get("mt")] = ts
         if k in FEED_KINDS:
@@ -811,6 +814,7 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
         "analytics": analytics(days, tickets, min(firsts) if firsts else None, oc_rows),
         "outcomes": dict(outcomes.state(), sample_pct=OUTCOME_SAMPLE_PCT) if outcomes is not None else None,
         "blocks": [b for d in days for b in d.blocks][-20:],
+        "guards": [g for d in days for g in d.guards][-20:],
         "fill_rate": _fill_rate(sum(d.quotes for d in days), sum(d.accepts for d in days),
                                 min(firsts) if firsts else None, filled),
         "history_error": (hist or {}).get("error"),
@@ -1593,6 +1597,33 @@ def analytics_html(an: dict, s_outcomes=None) -> str:
     return "".join(H)
 
 
+GUARD_LABEL = {"day_loss": "Day-loss stop", "sport_burst": "Sport paused", "leg_rush": "Game held"}
+
+
+def guards_html(s: dict) -> tuple:
+    """(the banner for guards holding now, the table of guards tripped) -- the
+    maker's day-loss stop, sport burst and leg rush (Jack 2026-11-06, "Yes, build both")."""
+    gs = s.get("guards") or []
+    if not gs:
+        return "", ""
+    when = lambda ts: et(_f(ts, 0.0)).strftime("%a %I:%M %p").replace(" 0", " ")      # noqa: E731
+    act = [g for g in gs if (_f(g.get("until"), 0.0) or 0.0) > s["now"]]
+    banner = ""
+    if act:
+        banner = ("<div class='card' style='border-color:var(--neg);margin:10px 0'><b class='neg'>Guard on:</b> "
+                  + "; ".join(f"{GUARD_LABEL.get(g.get('what'), html.escape(str(g.get('what'))))} "
+                              f"<b>{html.escape(str(g.get('key')))}</b> until {when(g.get('until'))}"
+                              for g in act) + "</div>")
+    rows = "".join(f"<tr><td class='small'>{tm(_f(g.get('t'), 0.0))}</td>"
+                   f"<td>{GUARD_LABEL.get(g.get('what'), html.escape(str(g.get('what'))))}</td>"
+                   f"<td>{html.escape(str(g.get('key')))}</td><td class='small'>{when(g.get('until'))}</td>"
+                   f"<td class='small muted'>{html.escape(str(g.get('detail') or ''))}</td></tr>" for g in reversed(gs))
+    table = ("<h2>Guards tripped <span class='muted small'>the accept that tripped one was declined; nothing new "
+             "on what it holds until the time shown</span></h2><div class='tw'><table><tr><th>When</th><th>Guard</th>"
+             "<th>On</th><th>Until</th><th>Why</th></tr>" + rows + "</table></div>")
+    return banner, table
+
+
 def render(s: dict) -> str:
     cfg = s["cfg"]
     status = ("live" if s["live"] else "dry") if s["running"] else "off"
@@ -1626,6 +1657,8 @@ def render(s: dict) -> str:
              f"<div class='muted small'>as of {tm(s['now'])} ET &middot; refreshes every {REFRESH_S}s"
              + (f" &middot; last line {s['last_line_age']:.0f}s ago" if s.get("last_line_age") is not None else "")
              + "</div></div>")
+    g_banner, g_table = guards_html(s)
+    H.append(g_banner)
     H.append("<div class='cards'>")
     H.append(f"<div class='card'><div class='l'>Combo shard cash</div><div class='v'>{usd(k.get('cash'))}</div>"
              f"<div class='l'>{'Kalshi ' + tm(k['at']) if k.get('at') else 'not read yet'}</div></div>")
@@ -1680,6 +1713,7 @@ def render(s: dict) -> str:
                      f"<td class='n'>{b.get('accepts')}</td><td class='n'>{b.get('quotes')}</td>"
                      f"<td class='small'>{et(_f(b.get('until'), 0.0)).strftime('%a %I:%M %p').replace(' 0', ' ')}</td></tr>")
         H.append("</table></div>")
+    H.append(g_table)
     H.append("<h2>Today</h2><div class='card'><div class='funnel'>"
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "

@@ -857,5 +857,36 @@ class Blocks(unittest.TestCase):
         self.assertIn("519ff6e6", page)
 
 
+class Guards(unittest.TestCase):
+    """The maker's day-loss stop, sport burst and leg rush on the page (Jack 2026-11-06, "Yes, build both")."""
+
+    def test_the_banner_while_on_and_the_table(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        day = datetime.fromtimestamp(NOW, timezone.utc).strftime("%Y-%m-%d")
+        with open(os.path.join(d.name, f"combo_{day}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"k": "guard", "t": NOW - 7200, "what": "leg_rush", "key": "26NOV05BOSTOR",
+                                "until": NOW - 60, "detail": "BOS yes accepted by 2 requesters in 30 min"}) + "\n")
+            f.write(json.dumps({"k": "guard", "t": NOW - 60, "what": "sport_burst", "key": "TENNIS",
+                                "until": NOW + 3540, "detail": "3 accepts in 30 min from 3 requesters"}) + "\n")
+        s = cd.snapshot(d.name, d.name, NOW)
+        self.assertEqual([g["what"] for g in s["guards"]], ["leg_rush", "sport_burst"])
+        page = cd.render(s)
+        self.assertIn("Guard on:", page)
+        self.assertIn("Sport paused <b>TENNIS</b>", page)
+        self.assertNotIn("Game held <b>26NOV05BOSTOR</b>", page)          # over: the table only
+        self.assertIn("Guards tripped", page)
+        self.assertIn("26NOV05BOSTOR", page)
+
+    def test_no_guards_no_section(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        page = cd.render(cd.snapshot(d.name, d.name, NOW))
+        self.assertNotIn("Guards tripped", page)
+        self.assertNotIn("Guard on:", page)
+
+
 if __name__ == "__main__":
     unittest.main()
