@@ -1241,6 +1241,266 @@ class PolyLinesMatch(unittest.TestCase):
         self.assertEqual(cm.cpl.kalshi_date("KXEPLGAME-26NOV08CRYLFC-LFC").isoformat(), "2026-11-08")
 
 
+def poly_lines(rows_by_tag):
+    """A PolyLines read from {tag slug: [markets]} (only the tags named here exist)."""
+    ids = {slug: str(i + 1) for i, slug in enumerate(rows_by_tag)}
+    by_id = {v: k for k, v in ids.items()}
+
+    def get(path, params):
+        if path.startswith("/tags/slug/"):
+            slug = path.rsplit("/", 1)[1]
+            return {"id": ids[slug]} if slug in ids else {}
+        return rows_by_tag.get(by_id.get(params.get("tag_id")), [])
+    p = cm.cpl.PolyLines(get=get, clock=lambda: T0, log=lambda s: None)
+    p.refresh(T0)
+    return p
+
+
+def kmkt(name, a, b, what="college football game", day="Nov 7, 2026"):
+    """A Kalshi leg's market as the matcher sees it: its side's name and its rules."""
+    return {"yes_sub_title": name,
+            "rules_primary": f"If {name}  wins the {a} vs {b} {what} originally scheduled for {day}, then the "
+                             f"market resolves to Yes."}
+
+
+def ufc_mkt(name, a, b):
+    return kmkt(name, a, b, "professional MMA fight", "Nov 6, 2026")
+
+
+BASHI_ROWS = {"ufc": [poly_market("7", "ufc-aus7-car22-2026-11-07", "Bashi vs. Calderon",
+                                  ["Austin Bashi", "Carlos Calderon"], 0.83, 0.84),
+                      poly_market("8", "ufc-tat-vir-2026-11-07", "Suarez vs. Jandiroba",
+                                  ["Tatiana Suarez", "Virna Jandiroba"], 0.64, 0.65),
+                      poly_market("9", "ufc-wel-seo1-2026-11-07", "Turman vs. Ko", ["Wellington Turman", "Seokhyeon Ko"],
+                                  0.14, 0.15),
+                      poly_market("10", "ufc-bru-mik-2026-11-07", "Silva vs. Johnson", ["Bruno Silva", "Mike Johnson"],
+                                  0.50, 0.51)]}
+
+
+class PolyUSAndNames(unittest.TestCase):
+    """Jack 2026-11-06, "Yes, do both": Polymarket for the NBA / NFL / NHL / college
+    football, one team's code apart, both sides by name."""
+
+    def test_us_slug_both_sides(self):
+        p = poly_lines({"nba": [poly_market("11", "nba-sas-por-2026-11-07", "Spurs vs. Trail Blazers",
+                                            ["Spurs", "Trail Blazers"], 0.60, 0.61)],
+                        "nfl": [poly_market("12", "nfl-cin-atl-2026-11-08", "Bengals vs. Falcons",
+                                            ["Bengals", "Falcons"], 0.61, 0.62)]})
+        self.assertEqual(p.match("KXNBAGAME-26NOV07SASPOR-SAS"), ("11", 0))
+        self.assertEqual(p.match("KXNBAGAME-26NOV07SASPOR-POR"), ("11", 1))
+        self.assertEqual(p.match("KXNBAGAME-26NOV07PORSAS-POR"), ("11", 1))          # Kalshi's order the other way
+        self.assertAlmostEqual(p.p_yes(("11", 1))[0], 1 - 0.605)
+        self.assertIsNone(p.match("KXNBAGAME-26NOV08SASPOR-SAS"))                     # NBA: back-to-backs, the day only
+        self.assertEqual(p.match("KXNFLGAME-26NOV09CINATL-ATL"), ("12", 1))           # NFL: a day either side
+
+    def test_one_code_apart(self):
+        p = poly_lines({"nhl": [poly_market("21", "nhl-ana-cal-2026-11-06", "Ducks vs. Flames", ["Ducks", "Flames"],
+                                            0.42, 0.43),
+                                poly_market("22", "nhl-sj-min-2026-11-06", "Sharks vs. Wild", ["Sharks", "Wild"],
+                                            0.28, 0.29)],
+                        "la-liga": [poly_market("31", "lal-osa-bil-2026-11-07-osa", "Will CA Osasuna win?",
+                                                ["Yes", "No"], 0.30, 0.31, git="CA Osasuna"),
+                                    poly_market("32", "lal-osa-bil-2026-11-07-draw", "Draw?", ["Yes", "No"], 0.29, 0.30,
+                                                git="Draw (CA Osasuna vs. Athletic Club)"),
+                                    poly_market("33", "lal-osa-bil-2026-11-07-bil", "Will Athletic Club win?",
+                                                ["Yes", "No"], 0.40, 0.41, git="Athletic Club")]})
+        self.assertEqual(p.match("KXNHLGAME-26NOV06ANACGY-ANA"), ("21", 0))
+        self.assertEqual(p.match("KXNHLGAME-26NOV06ANACGY-CGY"), ("21", 1))           # Kalshi CGY, Polymarket cal
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV07OSAATH-ATH"), ("33", 0))        # Kalshi ATH, Polymarket bil
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV07OSAATH-TIE"), ("32", 0))
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV07OSAATH-OSA"), ("31", 0))
+        self.assertIsNone(p.match("KXNHLGAME-26NOV06SJANA-SJ"))                      # each code in another game
+        self.assertIsNone(p.match("KXNHLGAME-26NOV06BOSCGY-CGY"))                    # neither code
+        self.assertEqual(cm.cpl._split("anacgy", "cgy"), ("ana", "cgy"))
+        self.assertEqual(cm.cpl._split("sjmin", "sj"), ("sj", "min"))
+        self.assertIsNone(cm.cpl._split("sjmin", "draw"))
+
+    def test_college_football_by_both_names_exactly(self):
+        p = poly_lines({"cfb": [poly_market("41", "cfb-vtech-smu-2026-11-06", "Virginia Tech vs. SMU",
+                                            ["Virginia Tech", "SMU"], 0.32, 0.33),
+                                poly_market("42", "cfb-txtech-okst-2026-11-07", "Texas Tech vs. Oklahoma State",
+                                            ["Texas Tech", "Oklahoma State"], 0.55, 0.56)]})
+        vt = kmkt("Virginia Tech", "Virginia Tech", "SMU", day="Nov 6, 2026")
+        self.assertEqual(cm.cpl.kalshi_sides(vt), ("Virginia Tech", "SMU"))
+        self.assertEqual(p.match("KXNCAAFGAME-26NOV06VTSMU-VT", vt), ("41", 0))
+        self.assertEqual(p.match("KXNCAAFGAME-26NOV06VTSMU-SMU", kmkt("SMU", "Virginia Tech", "SMU")), ("41", 1))
+        self.assertIsNone(p.match("KXNCAAFGAME-26NOV07TEXOKLA-TEX", kmkt("Texas", "Texas", "Oklahoma")))  # not Tech
+        self.assertIsNone(p.match("KXNCAAFGAME-26NOV06VTSMU-VT", {"yes_sub_title": "Virginia Tech"}))   # no rules
+
+    def test_college_football_st_is_state(self):
+        p = poly_lines({"cfb": [poly_market("43", "cfb-pennst-wash-2026-11-07", "Penn State vs. Washington",
+                                            ["Penn State", "Washington"], 0.70, 0.71),
+                                poly_market("44", "cfb-penn-cor-2026-11-07", "Penn vs. Cornell", ["Penn", "Cornell"],
+                                            0.60, 0.61)]})
+        self.assertEqual(p.match("KXNCAAFGAME-26NOV07PSUWASH-PSU", kmkt("Penn St.", "Penn St.", "Washington")),
+                         ("43", 0))
+        self.assertEqual(p.match("KXNCAAFGAME-26NOV07PENNCOR-PENN", kmkt("Penn", "Penn", "Cornell")), ("44", 0))
+        self.assertIsNone(p.match("KXNCAAFGAME-26NOV07PENNWASH-PENN", kmkt("Penn", "Penn", "Washington")))
+
+    def test_ufc_by_both_names(self):
+        p = poly_lines(BASHI_ROWS)
+        ko = ufc_mkt("Seokhyeon Ko", "Wellington Turman", "Seokhyeon Ko")
+        self.assertEqual(p.match("KXUFCFIGHT-26NOV07TURKOS-KOS", ko), ("9", 1))      # codes off, both names on
+        self.assertIsNone(p.match("KXUFCFIGHT-26NOV06BASBRE-BAS",
+                                  ufc_mkt("Austin Bashi", "Austin Bashi", "Lucas Brennan")))     # another bout
+
+
+def soccer_mkt(name, a, b, league):
+    lead = "If Tie is the result of the" if name == "Tie" else f"If {name} wins the"
+    return {"yes_sub_title": name,
+            "rules_primary": f"{lead} {a} vs {b} professional {league} soccer game originally scheduled for Nov 7, "
+                             f"2026 after 90 minutes plus stoppage time (does not include extra time or penalties)"}
+
+
+class PolySoccerNames(unittest.TestCase):
+    """Soccer by both team names: a draw whose codes both differ (Kalshi NFOMCI,
+    Polymarket not-mac), a team named differently (Bayern Munich / München)."""
+
+    def pl(self):
+        yn = ["Yes", "No"]
+        return poly_lines({
+            "epl": [poly_market("61", "epl-not-mac-2026-11-07-not", "?", yn, 0.20, 0.21, git="Nottingham Forest FC"),
+                    poly_market("62", "epl-not-mac-2026-11-07-draw", "?", yn, 0.24, 0.25,
+                                git="Draw (Nottingham Forest FC vs. Manchester City FC)"),
+                    poly_market("63", "epl-not-mac-2026-11-07-mac", "?", yn, 0.55, 0.56, git="Manchester City FC")],
+            "bundesliga": [poly_market("51", "bun-mai-bay-2026-11-07-mai", "?", yn, 0.11, 0.12, git="1. FSV Mainz 05"),
+                           poly_market("52", "bun-mai-bay-2026-11-07-draw", "?", yn, 0.14, 0.15,
+                                       git="Draw (1. FSV Mainz 05 vs. FC Bayern München)"),
+                           poly_market("53", "bun-mai-bay-2026-11-07-bay", "?", yn, 0.74, 0.75, git="FC Bayern München")],
+            "ligue-1": [poly_market("71", "fl1-aja-pfc-2026-11-07-aja", "?", yn, 0.40, 0.41, git="AJ Auxerre"),
+                        poly_market("72", "fl1-aja-pfc-2026-11-07-draw", "?", yn, 0.27, 0.28,
+                                    git="Draw (AJ Auxerre vs. Paris FC)"),
+                        poly_market("73", "fl1-aja-pfc-2026-11-07-pfc", "?", yn, 0.31, 0.32, git="Paris FC"),
+                        poly_market("74", "fl1-psg-tro-2026-11-07-psg", "?", yn, 0.84, 0.85,
+                                    git="Paris Saint-Germain FC"),
+                        poly_market("76", "fl1-psg-tro-2026-11-07-tro", "?", yn, 0.05, 0.06, git="ES Troyes AC")]})
+
+    def test_draw_and_a_renamed_team(self):
+        p = self.pl()
+        epl = lambda n: soccer_mkt(n, "Nottingham Forest", "Manchester City", "Premier League")   # noqa: E731
+        self.assertEqual(p.match("KXEPLGAME-26NOV07NFOMCI-TIE", epl("Tie")), ("62", 0))
+        self.assertEqual(p.match("KXEPLGAME-26NOV07NFOMCI-MCI", epl("Manchester City")), ("63", 0))
+        bun = lambda n: soccer_mkt(n, "Mainz", "Bayern Munich", "Bundesliga")                       # noqa: E731
+        self.assertEqual(p.match("KXBUNDESLIGAGAME-26NOV07M05BMU-BMU", bun("Bayern Munich")), ("53", 0))  # by Mainz
+        self.assertEqual(p.match("KXBUNDESLIGAGAME-26NOV07M05BMU-M05", bun("Mainz")), ("51", 0))
+        self.assertEqual(p.match("KXBUNDESLIGAGAME-26NOV07M05BMU-TIE", bun("Tie")), ("52", 0))
+
+    def test_both_names_settle_a_shared_word(self):
+        p = self.pl()
+        par = soccer_mkt("Paris FC", "Auxerre", "Paris FC", "Ligue 1")
+        self.assertEqual(p.match("KXLIGUE1GAME-26NOV07AUXPAR-PAR", par), ("73", 0))
+        self.assertIsNone(p.match("KXLIGUE1GAME-26NOV07AUXPAR-PAR", {"yes_sub_title": "Paris FC"}))  # "Paris" twice
+        self.assertIsNone(p.match("KXLIGUE1GAME-26NOV07AUXTRO-AUX",
+                                  soccer_mkt("Auxerre", "Auxerre", "Troyes", "Ligue 1")))           # two games
+
+    def test_sides_from_the_rules(self):
+        sides = cm.cpl.kalshi_sides
+        self.assertEqual(sides(soccer_mkt("Tie", "Malaga", "Santander", "La Liga")), ("Malaga", "Santander"))
+        self.assertEqual(sides(soccer_mkt("Mainz", "Mainz", "1. FC Koln", "Bundesliga")), ("Mainz", "1. FC Koln"))
+        self.assertEqual(sides({"rules_primary": "If San Antonio wins the San Antonio vs Portland Pro Basketball game "
+                                                 "originally scheduled for Nov 7, 2026, then"}),
+                         ("San Antonio", "Portland"))
+        self.assertEqual(sides({"rules_primary": "If Anaheim wins the Anaheim vs Calgary NHL game originally "
+                                                 "scheduled for Nov 6, 2026"}), ("Anaheim", "Calgary"))
+        self.assertIsNone(sides({"rules_primary": "If the high is above 70 degrees ..."}))
+
+
+class BoutGuard(unittest.TestCase):
+    """Jack 2026-11-06, "Yes, do both": a UFC bout Polymarket shows changed skips
+    both its legs, at the quote and the last look (Kalshi's Bashi vs Brennan,
+    Polymarket's Bashi vs Calderon after Brennan's injury)."""
+    BAS, BRE = "KXUFCFIGHT-26NOV06BASBRE-BAS", "KXUFCFIGHT-26NOV06BASBRE-BRE"
+    SUA = "KXUFCFIGHT-26NOV06SUAJAN-SUA"
+
+    def test_both_legs_and_only_a_changed_bout(self):
+        p = poly_lines(BASHI_ROWS)
+        changed = "Austin Bashi vs Carlos Calderon"
+        self.assertEqual(p.bout_changed(self.BAS, ufc_mkt("Austin Bashi", "Austin Bashi", "Lucas Brennan")), changed)
+        self.assertEqual(p.bout_changed(self.BRE, ufc_mkt("Lucas Brennan", "Austin Bashi", "Lucas Brennan")),
+                         changed)                                                     # Brennan's leg too
+        sua = lambda b: ufc_mkt("Tatiana Suarez", "Tatiana Suarez", b)              # noqa: E731
+        self.assertIsNone(p.bout_changed(self.SUA, sua("Virna Jandiroba")))
+        self.assertIsNone(p.bout_changed(self.SUA, sua("V. Jandiroba")))             # respelled: the same bout
+        self.assertIsNone(p.bout_changed(self.SUA, sua("Virna Jandiroba Jr.")))
+        self.assertIsNone(p.bout_changed("KXUFCFIGHT-26NOV06SILDOE-SIL",
+                                         ufc_mkt("Jose Silva", "Jose Silva", "John Doe")))  # another Silva
+        self.assertIsNone(p.bout_changed(self.BAS, {"yes_sub_title": "Austin Bashi"}))     # no rules: can't say
+        self.assertIsNone(p.bout_changed("KXNBAGAME-26NOV07SASPOR-SAS",
+                                         ufc_mkt("Austin Bashi", "Austin Bashi", "Lucas Brennan")))
+
+    def test_a_failed_read_keeps_the_last_good_one(self):
+        state = {"fail": False}
+
+        def get(path, params):
+            if state["fail"]:
+                raise IOError("down")
+            if path.startswith("/tags/slug/"):
+                return {"id": "279"} if path.endswith("/ufc") else {}
+            return BASHI_ROWS["ufc"]
+        bas, changed = ufc_mkt("Austin Bashi", "Austin Bashi", "Lucas Brennan"), "Austin Bashi vs Carlos Calderon"
+        p = cm.cpl.PolyLines(get=get, clock=lambda: T0, log=lambda s: None)
+        p.refresh(T0)
+        state["fail"] = True
+        p.refresh(T0 + 600)                                      # 10 minutes on: the last good read stands
+        self.assertEqual(p.bout_changed(self.BAS, bas), changed)
+        self.assertIn("ufc: OSError", p.error)
+        p.refresh(T0 + 1000)                                     # past 15: gone
+        self.assertIsNone(p.bout_changed(self.BAS, bas))
+        q = cm.cpl.PolyLines(get=get, clock=lambda: T0, log=lambda s: None)
+        q.refresh(T0)                                            # the tag read fails: asked again, not forgotten
+        self.assertNotIn("ufc", q.tag_ids)
+        state["fail"] = False
+        q.refresh(T0 + 180)
+        self.assertEqual(q.bout_changed(self.BAS, bas), changed)
+
+    def maker(self, guard=True):
+        legs_mk = {self.BAS: dict(mkt(self.BAS, 0.63, 0.65, start_in_h=8.0),
+                                  **ufc_mkt("Austin Bashi", "Austin Bashi", "Lucas Brennan")),
+                   self.BRE: dict(mkt(self.BRE, 0.36, 0.38, start_in_h=8.0),
+                                  **ufc_mkt("Lucas Brennan", "Austin Bashi", "Lucas Brennan")),
+                   self.SUA: dict(mkt(self.SUA, 0.63, 0.65, start_in_h=8.0),
+                                  **ufc_mkt("Tatiana Suarez", "Tatiana Suarez", "Virna Jandiroba")),
+                   L2: mkt(L2, 0.49, 0.51)}
+        self.c, self.w = FakeClient(legs_mk), W()
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(self.c, cm.Config(live=True, markup_per_leg=0.0, poly_fair=True, bout_guard=guard,
+                                       min_legs=2, max_poly_spread=0.03, min_poly_liquidity=2000.0),
+                     self.w, cm.Book(os.path.join(d.name, "s.json")), d.name, clock=lambda: T0)
+        m.poly = poly_lines(BASHI_ROWS)
+        return m
+
+    def test_the_quote_skips_both_legs(self):
+        m = self.maker()
+        m.handle(rfq_msg(rid="r1", legs=[[self.BRE, "yes"], [L2, "yes"]]))
+        m.handle(rfq_msg(rid="r2", legs=[[self.BAS, "no"], [L2, "yes"]]))
+        self.assertEqual(self.c.posts, [])
+        self.assertEqual(m.st["why"]["bout_changed"], 2)
+        m.handle(rfq_msg(rid="r3", legs=[[self.SUA, "yes"], [L2, "yes"]]))        # an unchanged bout quotes
+        self.assertEqual(len(self.c.posts), 1)
+
+    def test_off_it_quotes(self):
+        m = self.maker(guard=False)
+        m.handle(rfq_msg(rid="r1", legs=[[self.BRE, "yes"], [L2, "yes"]]))
+        self.assertEqual(len(self.c.posts), 1)
+
+    def test_the_last_look_declines(self):
+        m = self.maker()
+        m.poly = None                                                        # not read yet: quoted
+        m.handle(rfq_msg(rid="r1", legs=[[self.BAS, "yes"], [L2, "yes"]]))
+        self.assertEqual(len(self.c.posts), 1)
+        m.poly = poly_lines(BASHI_ROWS)                                      # the read lands before the accept
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": self.c.posts[0][1]["no_bid"]}})
+        self.assertEqual(self.c.puts, [])
+        self.assertEqual(self.w.k("decline")[0]["why"], "bout_changed")
+
+    def test_skip_games_by_hand(self):
+        cfg = cm.Config(min_legs=2, skip_games={"26NOV06BASBRE"})
+        self.assertEqual(cm.pre_check([[self.BRE, "yes"], [L2, "yes"]], cfg), "game_skipped")
+        self.assertIsNone(cm.pre_check([[self.SUA, "yes"], [L2, "yes"]], cfg))
+
+
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
     two NBA games as components)."""

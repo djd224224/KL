@@ -196,14 +196,30 @@ class Config:
         self.odds_dir = None
         # THIRD FAIR (Jack 2026-11-06: "use Polymarket as another fair so DraftKings +
         # Polymarket + Kalshi"): Polymarket's moneylines for UFC and soccer, where the
-        # sportsbook feed has none (combo_poly_lines; read on a background thread every
+        # sportsbook feed has none, and the NBA, NFL, NHL and college football, where its
+        # line can be missing ("Yes, do both": 11/06 none yet for the 11/07 NBA slate)
+        # (combo_poly_lines; read on a background thread every
         # POLY_EVERY_S, matched once a leg). The same rule as the book: the higher of the
         # fairs on a covered leg, a leg over max_book_gap from Kalshi skips ("poly_gap").
         # Only books max_poly_spread wide or less with min_poly_liquidity or more count.
-        # 11/06 live check: 122 of 150 soccer / UFC legs covered, within +-1.5 points
+        # 11/06 live check: 122 of 150 soccer / UFC legs covered, within +-1.5 points; with
+        # the US leagues, 604 of the 667 game-winner legs out 4 days matched, 500 on books
+        # tight enough, none over 3 points from Kalshi's mid (college football 122 of 238,
+        # NBA 42 / 68, NHL 42 / 62, NFL 28 / 28, soccer 240 / 243, UFC 26 / 28); the open
+        # tickets' legs with an outside price went 41 -> 59 of 77
         self.poly_fair = False
         self.max_poly_spread = 0.03
         self.min_poly_liquidity = 2000.0
+        # BOUT GUARD (Jack 2026-11-06, "Yes, do both"): a UFC bout Polymarket shows
+        # changed -- one of Kalshi's two fighters booked against someone else (11/06:
+        # Kalshi's Bashi vs Brennan, Polymarket's Bashi vs Calderon after Brennan's
+        # ACL tear) -- skips both its legs ("bout_changed"), at the quote and the last
+        # look: Kalshi settles a bout that doesn't go ahead as listed at a fair price of
+        # its own choosing, and whoever asks has the news. Needs poly_fair. 11/06 live
+        # check: of 28 UFC legs it flagged the two of that bout, nothing else
+        self.bout_guard = True
+        # by hand: game keys (26NOV06BASBRE) no parlay may have a leg on ("game_skipped")
+        self.skip_games = None
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -370,6 +386,8 @@ def pre_check(legs: list, cfg: Config):
     games = [game_of(l[0]) for l in legs]
     if len(set(games)) < len(games):
         return "same_game"
+    if cfg.skip_games and any(g in cfg.skip_games for g in games):
+        return "game_skipped"
     if cfg.games:
         on = [g in cfg.games for g in games]
         if not (all(on) if cfg.games_mode == "all" else any(on)):
@@ -702,6 +720,7 @@ class Maker:
         # the second fair: the sportsbook lines (re-read in upkeep) and each leg's match to them
         self.lines, self.lines_at, self.line_match = None, 0.0, {}
         self.poly, self.poly_match, self.poly_seen = None, {}, None     # PolyLines (run() starts it)
+        self.bout_seen, self.bout_logged = {}, set()                    # the bout guard's answers a leg
         self._reset_stats()
 
     def _reset_stats(self):
@@ -1263,14 +1282,22 @@ class Maker:
         ph = lines.p_home(hit[0], now) if hit else None
         return None if ph is None else (ph[0] if hit[1] else 1.0 - ph[0])
 
-    def _poly_yes(self, tk: str, m: dict):
-        """Polymarket's YES mid for a leg, from a book max_poly_spread wide or less with
-        min_poly_liquidity or more (None: not covered, or too thin to say)."""
+    def _poly_now(self):
+        """The Polymarket lines once read (None: off, or not read yet); a new read
+        clears the legs' matches and bout answers."""
         poly = self.poly if self.cfg.poly_fair else None
         if poly is None or poly.at is None:
             return None
         if poly.at != self.poly_seen:                   # a new read: match the legs afresh
-            self.poly_match, self.poly_seen = {}, poly.at
+            self.poly_match, self.bout_seen, self.poly_seen = {}, {}, poly.at
+        return poly
+
+    def _poly_yes(self, tk: str, m: dict):
+        """Polymarket's YES mid for a leg, from a book max_poly_spread wide or less with
+        min_poly_liquidity or more (None: not covered, or too thin to say)."""
+        poly = self._poly_now()
+        if poly is None:
+            return None
         hit = self.poly_match.get(tk, False)
         if hit is False:
             hit = self.poly_match[tk] = poly.match(tk, m)
@@ -1279,16 +1306,36 @@ class Maker:
             return None
         return pp[0]
 
+    def _bout_changed(self, tk: str, m: dict):
+        """The bout guard: the Polymarket fight showing this UFC leg's bout changed, or None."""
+        if not self.cfg.bout_guard or not str(tk).startswith("KXUFCFIGHT-"):
+            return None
+        poly = self._poly_now()
+        if poly is None:
+            return None
+        hit = self.bout_seen.get(tk, False)
+        if hit is False:
+            hit = self.bout_seen[tk] = poly.bout_changed(tk, m)
+            g = game_of(tk)
+            if hit and g not in self.bout_logged:
+                self.bout_logged.add(g)
+                log(f"bout guard: {g} is {' vs '.join(cpl.kalshi_sides(m) or ('?', '?'))} on Kalshi, "
+                    f"Polymarket has {hit}: both legs out")
+        return hit
+
     def book_adjust(self, legs, markets: dict, now: float, fair: float):
         """(why, fair) from the outside fairs: on each leg the sportsbook (DraftKings)
         or Polymarket covers, the highest of Kalshi's mid and theirs for the side;
         "book_gap" / "poly_gap" when one is more than max_book_gap from Kalshi's.
-        Legs neither covers keep Kalshi's mid."""
+        Legs neither covers keep Kalshi's mid. "bout_changed": a UFC leg whose bout
+        Polymarket shows changed (the bout guard)."""
         if self.lines is None and self.poly is None:
             return None, fair
         probs, moved = [], False
         for tk, side in ((l[0], l[1]) for l in legs):
             m = markets.get(tk) or {}
+            if self._bout_changed(tk, m):
+                return "bout_changed", fair
             bid, ask = _f(m.get("yes_bid_dollars"), 0.0), _f(m.get("yes_ask_dollars"), 1.0)
             k_yes = (bid + ask) / 2.0
             p_k = k_yes if side == "yes" else 1.0 - k_yes
@@ -1364,6 +1411,7 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
                   "cfg": {k: sorted(v) if isinstance(v, set) else v for k, v in vars(cfg).items()}})
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
         + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
+        + (f", skipping {','.join(sorted(cfg.skip_games))}" if cfg.skip_games else "")
         + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
         + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half and >= {cfg.confirm_edge_floor * 100:.3g}% +{cfg.confirm_floor_per_leg * 100:.3g}%/leg after the fee)"
         + (f", all-NFL {cfg.nfl_markup_cut * 100:.3g} pts less" if cfg.nfl_markup_cut else "")
@@ -1509,10 +1557,17 @@ def main(argv=None) -> int:
                     help="drop the second fair (DraftKings' vig-free moneyline on game-winner legs, from the "
                          "RFQ logger's odds files)")
     ap.add_argument("--no-poly-fair", action="store_true",
-                    help="drop the third fair (Polymarket's moneylines on UFC and soccer legs)")
+                    help="drop the third fair (Polymarket's moneylines on UFC, soccer, NBA, NFL, NHL and "
+                         "college football legs) and the bout guard with it")
     ap.add_argument("--max-poly-spread", type=float, default=d.max_poly_spread,
                     help="a Polymarket book this wide or wider doesn't count (0.03 = 3c)")
     ap.add_argument("--min-poly-liquidity", type=float, default=d.min_poly_liquidity)
+    ap.add_argument("--no-bout-guard", action="store_true",
+                    help="keep quoting a UFC bout Polymarket shows changed (a fighter booked against "
+                         "someone else)")
+    ap.add_argument("--skip-games", default="",
+                    help="comma list of game keys (26NOV06BASBRE) or tickers on them: no parlay with a leg "
+                         "on one")
     ap.add_argument("--max-book-gap", type=float, default=d.max_book_gap,
                     help="skip a parlay with a leg this far from the book's probability (0.05 = 5 points)")
     ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,
@@ -1582,6 +1637,7 @@ def main(argv=None) -> int:
     if a.min_lead_min < 2:
         ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
+    skip = {game_of(g.strip().upper()) for g in a.skip_games.split(",") if g.strip()} or None
     cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg,
                  nfl_markup_cut=a.nfl_markup_cut, confirm_edge_floor=a.confirm_edge_floor,
                  confirm_floor_per_leg=a.confirm_floor_per_leg, longshot_markup=longshot,
@@ -1591,7 +1647,7 @@ def main(argv=None) -> int:
                  guard_min_rate=a.guard_min_rate, guard_block_hours=a.guard_block_hours,
                  book_fair=not a.no_book_fair, max_book_gap=a.max_book_gap,
                  poly_fair=not a.no_poly_fair, max_poly_spread=a.max_poly_spread,
-                 min_poly_liquidity=a.min_poly_liquidity,
+                 min_poly_liquidity=a.min_poly_liquidity, bout_guard=not a.no_bout_guard, skip_games=skip,
                  max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
