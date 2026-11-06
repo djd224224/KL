@@ -402,8 +402,6 @@ def render(s: dict) -> str:
              f"<div class='l'>{'Kalshi ' + tm(k['at']) if k.get('at') else 'not read yet'}</div></div>")
     H.append(f"<div class='card'><div class='l'>Open tickets</div><div class='v'>{len(s['open'])}</div>"
              f"<div class='l'>can lose {usd(s['open_loss'])} &middot; premium {usd(s['open_premium'])}</div></div>")
-    H.append(f"<div class='card'><div class='l'>Settled P&amp;L</div><div class='v'>{signed(s['settled_pnl'])}</div>"
-             f"<div class='l'>{s['wins']} kept &middot; {s['losses']} paid out</div></div>")
     H.append(f"<div class='card'><div class='l'>Fees on combo fills</div><div class='v'>{usd(s['fees'])}</div>"
              f"<div class='l'>{len(s['fills'])} fills recorded by Kalshi</div></div>")
     H.append("</div>")
