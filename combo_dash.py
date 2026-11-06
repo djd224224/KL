@@ -20,6 +20,7 @@ It binds 127.0.0.1 only.
 import argparse
 import html
 import json
+import math
 import os
 import sys
 import threading
@@ -256,7 +257,7 @@ def pnl_parts(open_t, settled, markets) -> dict:
 
 # ---- the snapshot ----------------------------------------------------------------
 
-def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
+def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=None) -> dict:
     events = read_events(maker_dir, now)
     tickets = read_state(maker_dir)
     day0 = et_midnight(now)
@@ -280,6 +281,13 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
         k = kalshi.get(now, [t["mt"] for t in open_t] + [l[0] for t in open_t for l in t["legs"]], day0)
     fills = (k or {}).get("fills") or []
     pnl = pnl_parts(open_t, settled, (k or {}).get("markets") or {})
+    filled = filled_tickets(tickets)
+    settle_ts = {e.get("mt"): _ev_ts(e) for e in events if e.get("k") == "settled"}
+    hist = history.get(now, filled, (k or {}).get("markets") or {}, settle_ts) if history is not None else None
+    series = [p for p in (hist or {}).get("series") or [] if p["t"] < now]
+    if filled:                                     # the last point is the cards' live P&L
+        series.append({"t": now, "premium": pnl["premium"], "trading": pnl["trading"], "fees": pnl["fees"],
+                       "total": pnl["total"]})
     return {
         "now": now, "running": running, "stopped": stopped,
         "live": bool(last_start and last_start.get("live")),
@@ -296,6 +304,8 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None) -> dict:
         "open_premium": sum(t["contracts"] * t["ask"] for t in open_t),
         "settled_pnl": sum(_f(t.get("pnl"), 0.0) for t in settled),
         "pnl": pnl,
+        "series": series, "fill_points": fill_points(filled),
+        "history_error": (hist or {}).get("error"),
         "wins": sum(1 for t in settled if t.get("result") == "no"),
         "losses": sum(1 for t in settled if t.get("result") == "yes"),
         "last_stat": stats[-1] if stats else None,
@@ -373,6 +383,367 @@ footer{margin:20px 0 6px;color:var(--muted);font-size:12px}
 """
 
 
+# ---- history: the P&L and fills over time (Jack 2026-11-06: "add time series of PnL and time series of fills") ----
+
+HISTORY_TTL_S = 300.0               # the legs' candles: re-read at most every 5 min...
+HISTORY_MIN_GAP_S = 60.0            # ...or on a new fill / settlement, but not more than once a minute
+HISTORY_STEP_S = 300.0              # one P&L point every 5 min
+
+
+def fill_time(t: dict) -> float:
+    return _f(t.get("executed_at")) or _f(t.get("at")) or 0.0
+
+
+def filled_tickets(tickets) -> list:
+    return [t for t in tickets if t.get("status") in ("confirmed", "executed", "settled") and _f(t.get("contracts"))]
+
+
+def _mid_at(points, t: float):
+    """The YES mid of the last candle that closed at or before t (None before the first)."""
+    lo, hi = 0, len(points)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if points[mid][0] <= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return points[lo - 1][1] if lo else None
+
+
+def pnl_series(filled, leg_hist: dict, markets: dict, settle_ts: dict, now: float,
+               step: float = HISTORY_STEP_S) -> list:
+    """Premiums, trading, fees and total at every step from the first fill: each
+    ticket from its fill on, its parlay valued at its legs' candle mids then (1 / 0
+    once a leg has a result and no later candle; a settled ticket at its payout from
+    its settlement on); before a leg's first candle the ticket sits at its quote fair."""
+    if not filled:
+        return []
+    t0 = min(fill_time(t) for t in filled)
+    grid, g = [], (t0 // step + 1) * step
+    while g < now:
+        grid.append(g)
+        g += step
+    out = []
+    for g in grid:
+        prem = trad = fees = 0.0
+        for t in filled:
+            if fill_time(t) > g:
+                continue
+            c, ask, fee = t["contracts"], t["ask"], _f(t.get("fee_est"), 0.0) or 0.0
+            fair = _f(t.get("fair"), ask)
+            if t.get("status") == "settled" and g >= (settle_ts.get(t.get("mt")) or now):
+                v = 1.0 if t.get("result") == "yes" else 0.0
+            else:
+                v = 1.0
+                for tk, side in t["legs"]:
+                    pts = leg_hist.get(tk) or []
+                    res = str((markets.get(tk) or {}).get("result") or "").lower()
+                    if res in ("yes", "no") and (not pts or g >= pts[-1][0]):
+                        p = 1.0 if res == "yes" else 0.0
+                    else:
+                        p = _mid_at(pts, g)
+                    if p is None:
+                        v = None
+                        break
+                    v *= p if side == "yes" else 1.0 - p
+                if v is None:
+                    v = fair
+            prem += c * (ask - fair)
+            trad += c * (fair - v)
+            fees += fee
+        out.append({"t": g, "premium": prem, "trading": trad, "fees": fees, "total": prem + trad - fees})
+    return out
+
+
+def fill_points(filled) -> list:
+    out = []
+    for t in sorted(filled, key=fill_time):
+        c, ask = t["contracts"], t["ask"]
+        out.append({"t": fill_time(t), "premium": c * ask, "lose": c * (1.0 - ask), "ask": ask, "contracts": c,
+                    "status": t.get("status"), "result": t.get("result"),
+                    "legs": " · ".join(leg_label(l) for l in t["legs"])})
+    return out
+
+
+class HistoryReads:
+    """The filled tickets' legs' 5-minute candles since the first fill (60-minute
+    past two days), read through the Kalshi reads' client and kept for
+    HISTORY_TTL_S, or re-read sooner (>= HISTORY_MIN_GAP_S) on a new fill or
+    settlement; the series is computed once per read. A failed read keeps the
+    last good one."""
+
+    def __init__(self, kalshi, ttl: float = HISTORY_TTL_S):
+        self.kalshi, self.ttl = kalshi, ttl
+        self.at, self.key = 0.0, None
+        self.data = {"legs": {}, "series": [], "error": None, "at": None}
+        self.lock = threading.Lock()
+
+    def get(self, now: float, filled, markets: dict, settle_ts: dict) -> dict:
+        if not filled:
+            return {"legs": {}, "series": [], "error": None, "at": None}
+        key = tuple(sorted((str(t.get("quote_id")), str(t.get("status"))) for t in filled))
+        with self.lock:
+            stale = now - self.at >= self.ttl or (key != self.key and now - self.at >= HISTORY_MIN_GAP_S)
+            if not stale:
+                return self.data
+            self.at, self.key = now, key
+            try:
+                c = self.kalshi._client()
+                t0 = min(fill_time(t) for t in filled)
+                period = 5 if now - t0 <= 2 * 86400 else 60
+                legs = sorted({l[0] for t in filled for l in t["legs"]})
+                hist = {}
+                for i in range(0, len(legs), 5):            # <= 5 x 576 candles a call
+                    js = c.get("/markets/candlesticks", {"market_tickers": ",".join(legs[i:i + 5]),
+                                                          "start_ts": int(t0) - 600, "end_ts": int(now),
+                                                          "period_interval": period})
+                    for x in js.get("markets") or []:
+                        pts = []
+                        for k in x.get("candlesticks") or []:
+                            b = _f((k.get("yes_bid") or {}).get("close_dollars"), 0.0) or 0.0
+                            a = _f((k.get("yes_ask") or {}).get("close_dollars"), 0.0) or 0.0
+                            if 0.0 < b < a <= 1.0 and k.get("end_period_ts"):
+                                pts.append((float(k["end_period_ts"]), (a + b) / 2.0))
+                        hist[x.get("market_ticker")] = sorted(pts)
+                self.data = {"legs": hist, "series": pnl_series(filled, hist, markets, settle_ts, now),
+                             "error": None, "at": now}
+            except Exception as e:
+                self.data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
+            return self.data
+
+
+# ---- the charts (inline SVG, no libraries; the dataviz reference palette's first three slots) ----
+
+CHART_W, CHART_H = 1100, 230
+CM_L, CM_R, CM_T, CM_B = 64, 132, 12, 26
+SERIES = (("total", "Total", "--s1"), ("premium", "Premiums", "--s2"), ("trading", "Trading", "--s3"))
+
+
+def _nice_step(span: float, n: int = 4) -> float:
+    raw = max(span, 1e-9) / n
+    mag = 10 ** math.floor(math.log10(raw))
+    return next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw - 1e-12)
+
+
+def _y_ticks(lo: float, hi: float):
+    st = _nice_step(hi - lo)
+    v, out = math.floor(lo / st) * st, []
+    while v <= hi + st * 1e-6:
+        out.append(round(v, 6))
+        v += st
+    return out
+
+
+def _x_ticks(t0: float, t1: float):
+    span = max(t1 - t0, 60.0)
+    st = next(s for s in (900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800) if span / s <= 7)
+    off = et(t0).utcoffset() if et(t0).utcoffset() is not None else timedelta(0)
+    loc = t0 + off.total_seconds()
+    first = (loc // st + 1) * st - off.total_seconds()
+    out, v = [], first
+    while v <= t1:
+        out.append(v)
+        v += st
+    return out, st
+
+
+def _x_label(ts: float, st: float) -> str:
+    d = et(ts)
+    s = d.strftime("%I:%M %p").lstrip("0")
+    return (d.strftime("%a ") + s) if (st >= 21600 or (d.hour == 0 and d.minute == 0)) else s
+
+
+def _money(v: float, signed_: bool = True) -> str:
+    sign = ("+" if v > 0 else "-" if v < 0 else "") if signed_ else ("-" if v < 0 else "")
+    return f"{sign}${abs(v):,.2f}"
+
+
+def _axes(t0, t1, lo, hi, X, Y, money_ticks=True) -> list:
+    g = []
+    for v in _y_ticks(lo, hi):
+        y = Y(v)
+        g.append(f"<line class='grid' x1='{CM_L}' x2='{CHART_W - CM_R}' y1='{y:.1f}' y2='{y:.1f}'/>")
+        g.append(f"<text class='tick' x='{CM_L - 8}' y='{y + 4:.1f}' text-anchor='end'>{html.escape(_money(v, False) if money_ticks else f'{v:g}')}</text>")
+    if lo < 0 < hi:
+        g.append(f"<line class='zero' x1='{CM_L}' x2='{CHART_W - CM_R}' y1='{Y(0):.1f}' y2='{Y(0):.1f}'/>")
+    xs, st = _x_ticks(t0, t1)
+    for t in xs:
+        x = X(t)
+        g.append(f"<text class='tick' x='{x:.1f}' y='{CHART_H - 8}' text-anchor='middle'>{html.escape(_x_label(t, st))}</text>")
+    g.append(f"<line class='axis' x1='{CM_L}' x2='{CHART_W - CM_R}' y1='{CHART_H - CM_B}' y2='{CHART_H - CM_B}'/>")
+    return g
+
+
+def chart_pnl(points: list) -> str:
+    """Total, premiums and trading over time: one $ axis, a legend with line keys,
+    end labels (moved apart with a leader when they would collide), a crosshair
+    tooltip, and a table view below."""
+    if len(points) < 2:
+        return "<div class='empty'>The P&amp;L series starts with the first fill.</div>"
+    t0, t1 = points[0]["t"], points[-1]["t"]
+    vals = [p[k] for p in points for k, _, _ in SERIES] + [0.0]
+    lo, hi = min(vals), max(vals)
+    pad = (hi - lo) * 0.08 or 1.0
+    lo, hi = lo - pad, hi + pad
+    ticks = _y_ticks(lo, hi)
+    lo, hi = min(lo, ticks[0]), max(hi, ticks[-1])
+    X = lambda t: CM_L + (t - t0) / max(t1 - t0, 1.0) * (CHART_W - CM_L - CM_R)       # noqa: E731
+    Y = lambda v: CM_T + (hi - v) / max(hi - lo, 1e-9) * (CHART_H - CM_T - CM_B)      # noqa: E731
+    g = [f"<svg id='pnl-svg' class='viz' viewBox='0 0 {CHART_W} {CHART_H}' role='img' "
+         f"aria-label='P&amp;L over time: total, premiums and trading'>"]
+    g += _axes(t0, t1, lo, hi, X, Y)
+    ends = []
+    for key, label, var in reversed(SERIES):                # Total drawn last, on top
+        d = " ".join(f"{'M' if i == 0 else 'L'}{X(p['t']):.1f},{Y(p[key]):.1f}" for i, p in enumerate(points))
+        g.append(f"<path d='{d}' fill='none' stroke='var({var})' stroke-width='2' stroke-linejoin='round' "
+                 f"stroke-linecap='round'/>")
+        ends.append((Y(points[-1][key]), key, label, var))
+    ends.sort()
+    ly = []
+    for y, *_ in ends:                                      # end labels at least 14 apart
+        ly.append(max(y, ly[-1] + 14) if ly else y)
+    shift = max(0.0, ly[-1] - (CHART_H - CM_B - 4)) if ly else 0.0
+    ly = [v - shift for v in ly]
+    xe = X(t1)
+    for (y, key, label, var), yl in zip(ends, ly):
+        g.append(f"<circle cx='{xe:.1f}' cy='{y:.1f}' r='4' fill='var({var})' class='ring'/>")
+        if abs(yl - y) > 1.5:
+            g.append(f"<line class='leader' x1='{xe + 5:.1f}' y1='{y:.1f}' x2='{xe + 12:.1f}' y2='{yl:.1f}'/>")
+        g.append(f"<text class='endlab' x='{xe + 14:.1f}' y='{yl + 4:.1f}'>{html.escape(label)} "
+                 f"{html.escape(_money(points[-1][key]))}</text>")
+    g.append(f"<line id='pnl-cross' class='cross' x1='0' x2='0' y1='{CM_T}' y2='{CHART_H - CM_B}' visibility='hidden'/>")
+    g.append(f"<rect class='hit' x='{CM_L}' y='{CM_T}' width='{CHART_W - CM_L - CM_R}' height='{CHART_H - CM_T - CM_B}'/>")
+    g.append("</svg>")
+    data = [{"x": round(X(p["t"]), 1), "when": tm(p["t"]), **{k: round(p[k], 2) for k, _, _ in SERIES},
+             "fees": round(p["fees"], 2)} for p in points]
+    legend = "".join(f"<span><i class='key' style='background:var({var})'></i>{html.escape(label)}</span>"
+                     for _, label, var in SERIES)
+    rows = "".join(f"<tr><td class='small'>{tm(p['t'])}</td>" + "".join(
+        f"<td class='n'>{signed(p[k])}</td>" for k, _, _ in SERIES) + f"<td class='n'>{signed(-p['fees'])}</td></tr>"
+        for p in points[::max(1, len(points) // 48)] + ([points[-1]] if len(points) > 48 else []))
+    return (f"<div class='legend small'>{legend}<span class='muted'>fees are the gap: total = premiums + trading "
+            f"&minus; fees</span></div><div class='vizbox'>{''.join(g)}</div>"
+            f"<script type='application/json' id='pnl-data'>{json.dumps(data)}</script>"
+            f"<details class='small'><summary>P&amp;L series as a table</summary><div class='tw'><table><tr><th>ET</th>"
+            + "".join(f"<th class='n'>{html.escape(label)}</th>" for _, label, _ in SERIES)
+            + f"<th class='n'>Fees</th></tr>{rows}</table></div></details>")
+
+
+def chart_fills(fills: list, t0: float, t1: float) -> str:
+    """One dot per fill: when (x), premium taken in (y); tooltip per dot. The
+    fills table further down is its table view."""
+    if not fills:
+        return "<div class='empty'>No fills yet.</div>"
+    t0 = min(t0, fills[0]["t"])
+    hi = max(f["premium"] for f in fills) * 1.12 or 1.0
+    ticks = _y_ticks(0.0, hi)
+    hi = max(hi, ticks[-1])
+    X = lambda t: CM_L + (t - t0) / max(t1 - t0, 1.0) * (CHART_W - CM_L - CM_R)       # noqa: E731
+    Y = lambda v: CM_T + (hi - v) / max(hi, 1e-9) * (CHART_H - CM_T - CM_B)           # noqa: E731
+    g = [f"<svg id='fill-svg' class='viz' viewBox='0 0 {CHART_W} {CHART_H}' role='img' "
+         f"aria-label='Fills over time: premium taken in per fill'>"]
+    g += _axes(t0, t1, 0.0, hi, X, Y)
+    data = []
+    for i, f in enumerate(fills):
+        x, y = X(f["t"]), Y(f["premium"])
+        g.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='4.5' fill='var(--s1)' class='ring'/>")
+        g.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='12' class='dothit' data-i='{i}' tabindex='0'/>")
+        data.append({"when": tm(f["t"]), "premium": round(f["premium"], 2), "lose": round(f["lose"], 2),
+                     "ask": round(f["ask"] * 100, 1), "contracts": round(f["contracts"], 2),
+                     "legs": f["legs"], "state": ("settled " + str(f.get("result") or "").upper())
+                     if f.get("status") == "settled" else "open"})
+    g.append("</svg>")
+    return (f"<div class='vizbox'>{''.join(g)}</div>"
+            f"<script type='application/json' id='fill-data'>{json.dumps(data)}</script>")
+
+
+CHART_CSS = """
+.viz-root,:root{--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--grid:#e1e0d9;--axisc:#c3c2b7}
+@media (prefers-color-scheme:dark){:root{--s1:#3987e5;--s2:#d95926;--s3:#199e70;--grid:#2c2c2a;--axisc:#383835}}
+.vizbox{position:relative;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 4px}
+svg.viz{display:block;width:100%;height:auto;font:12px system-ui,Segoe UI,Arial,sans-serif}
+svg.viz .grid{stroke:var(--grid);stroke-width:1}svg.viz .zero,svg.viz .axis{stroke:var(--axisc);stroke-width:1}
+svg.viz .tick{fill:var(--muted);font-variant-numeric:tabular-nums}
+svg.viz .endlab{fill:var(--ink);font-weight:600}svg.viz .leader{stroke:var(--muted);stroke-width:1}
+svg.viz .ring{stroke:var(--card);stroke-width:2}svg.viz .cross{stroke:var(--muted);stroke-width:1}
+svg.viz .hit{fill:transparent;cursor:crosshair}svg.viz .dothit{fill:transparent;cursor:pointer}
+svg.viz .dothit:focus{outline:none;stroke:var(--ink);stroke-width:1}
+.legend{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:2px 0 6px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.key{display:inline-block;width:14px;height:2px;border-radius:1px}
+#viz-tip{position:fixed;pointer-events:none;z-index:9;background:var(--card);color:var(--ink);border:1px solid var(--line);
+border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 2px 10px rgba(0,0,0,.12);display:none;max-width:360px}
+#viz-tip .row{display:flex;align-items:center;gap:6px}#viz-tip b{font-variant-numeric:tabular-nums}
+#viz-tip .when{color:var(--muted);margin-bottom:3px}
+details{margin-top:6px}summary{cursor:pointer;color:var(--muted)}
+"""
+
+CHART_JS = """
+<div id='viz-tip'></div>
+<script>
+(function () {
+  var tip = document.getElementById('viz-tip');
+  function money(v) { return (v > 0 ? '+' : v < 0 ? '\\u2212' : '') + '$' + Math.abs(v).toFixed(2); }
+  function clear() { while (tip.firstChild) tip.removeChild(tip.firstChild); }
+  function line(text, cls) { var d = document.createElement('div'); if (cls) d.className = cls; d.textContent = text; tip.appendChild(d); return d; }
+  function row(val, label, color) {
+    var d = document.createElement('div'); d.className = 'row';
+    if (color) { var k = document.createElement('i'); k.className = 'key'; k.style.background = 'var(' + color + ')'; d.appendChild(k); }
+    var b = document.createElement('b'); b.textContent = val; d.appendChild(b);
+    var s = document.createElement('span'); s.className = 'muted'; s.textContent = label; d.appendChild(s);
+    tip.appendChild(d);
+  }
+  function place(ev) {
+    tip.style.display = 'block';
+    var x = ev.clientX + 14, y = ev.clientY + 14;
+    if (x + tip.offsetWidth > window.innerWidth - 8) x = ev.clientX - tip.offsetWidth - 14;
+    if (y + tip.offsetHeight > window.innerHeight - 8) y = ev.clientY - tip.offsetHeight - 14;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  }
+  var ps = document.getElementById('pnl-svg'), pd = document.getElementById('pnl-data');
+  if (ps && pd) {
+    var pts = JSON.parse(pd.textContent), cross = document.getElementById('pnl-cross');
+    var hit = ps.querySelector('.hit');
+    function onMove(ev) {
+      var m = ps.getScreenCTM(); if (!m) return;
+      var p = ps.createSVGPoint(); p.x = ev.clientX; p.y = ev.clientY;
+      var vx = p.matrixTransform(m.inverse()).x, best = 0;
+      for (var i = 1; i < pts.length; i++) if (Math.abs(pts[i].x - vx) < Math.abs(pts[best].x - vx)) best = i;
+      var q = pts[best];
+      cross.setAttribute('x1', q.x); cross.setAttribute('x2', q.x); cross.setAttribute('visibility', 'visible');
+      clear(); line(q.when + ' ET', 'when');
+      row(money(q.total), 'Total', '--s1'); row(money(q.premium), 'Premiums', '--s2');
+      row(money(q.trading), 'Trading', '--s3'); row(money(-q.fees), 'Fees', null);
+      place(ev);
+    }
+    hit.addEventListener('pointermove', onMove);
+    hit.addEventListener('pointerleave', function () { tip.style.display = 'none'; cross.setAttribute('visibility', 'hidden'); });
+  }
+  var fs = document.getElementById('fill-svg'), fd = document.getElementById('fill-data');
+  if (fs && fd) {
+    var fills = JSON.parse(fd.textContent);
+    function show(el, ev) {
+      var f = fills[+el.getAttribute('data-i')]; if (!f) return;
+      clear(); line(f.when + ' ET \\u00b7 ' + f.state, 'when');
+      row('$' + f.premium.toFixed(2), 'premium in', null);
+      row(f.ask.toFixed(1) + '\\u00a2 x ' + f.contracts, 'our price x contracts', null);
+      row('$' + f.lose.toFixed(2), 'can lose', null);
+      line(f.legs);
+      if (ev && ev.clientX !== undefined) { place(ev); }
+      else { var r = el.getBoundingClientRect(); place({clientX: r.right, clientY: r.bottom}); }
+    }
+    Array.prototype.forEach.call(fs.querySelectorAll('.dothit'), function (el) {
+      el.addEventListener('pointermove', function (ev) { show(el, ev); });
+      el.addEventListener('pointerleave', function () { tip.style.display = 'none'; });
+      el.addEventListener('focus', function () { show(el, null); });
+      el.addEventListener('blur', function () { tip.style.display = 'none'; });
+    });
+  }
+})();
+</script>
+"""
+
+
 def render(s: dict) -> str:
     cfg = s["cfg"]
     status = ("live" if s["live"] else "dry") if s["running"] else "off"
@@ -391,7 +762,7 @@ def render(s: dict) -> str:
     fn = s["funnel"]
     qn = fn["quotes"] or fn["would"]
     H = [f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-         f"<meta http-equiv='refresh' content='{REFRESH_S}'><title>Combo maker</title><style>{CSS}</style></head><body><main>"]
+         f"<meta http-equiv='refresh' content='{REFRESH_S}'><title>Combo maker</title><style>{CSS}{CHART_CSS}</style></head><body><main>"]
     H.append(f"<div class='top'><div><h1>Combo maker <span class='pill {status}'>{label}</span></h1>"
              f"<div class='muted small'>{setting}</div></div>"
              f"<div class='muted small'>as of {tm(s['now'])} ET &middot; refreshes every {REFRESH_S}s"
@@ -422,6 +793,15 @@ def render(s: dict) -> str:
         H.append(f"<div class='card'><div class='l'>Fees</div><div class='v'>{signed(-(pl.get('fees') or 0.0))}</div>"
                  f"<div class='l'>total = premiums + trading &minus; fees</div></div>")
         H.append("</div>")
+    fp = s.get("fill_points") or []
+    if fp:
+        ser = s.get("series") or []
+        H.append("<h2>P&amp;L over time</h2>" + chart_pnl(ser))
+        H.append(f"<h2>Fills over time <span class='muted small'>{len(fp)} fills, "
+                 f"{usd(sum(f['premium'] for f in fp))} of premium in; a dot is one fill, its height the premium"
+                 f"</span></h2>" + chart_fills(fp, (ser[0]['t'] if ser else fp[0]['t']), s['now']))
+        if s.get("history_error"):
+            H.append(f"<div class='small muted'>price history: {html.escape(str(s['history_error']))}</div>")
     H.append("<h2>Today</h2><div class='card'><div class='funnel'>"
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "
@@ -525,15 +905,15 @@ def render(s: dict) -> str:
     if k.get("error"):
         H.append(f"<footer class='neg'>Kalshi read failed: {html.escape(k['error'])}</footer>")
     H.append(f"<footer>Read-only: the maker's files in {html.escape(MAKER_DIR)} and, once a minute, Kalshi's balance, "
-             "fills and markets. Times are ET.</footer></main></body></html>")
+             "fills and markets. Times are ET.</footer></main>" + CHART_JS + "</body></html>")
     return "".join(H)
 
 
-def make_handler(maker_dir, shadow_dir, kalshi):
+def make_handler(maker_dir, shadow_dir, kalshi, history=None):
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             try:
-                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi)
+                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi, history)
                 if self.path.startswith("/data.json"):
                     body, ctype = json.dumps(s, default=str).encode(), "application/json"
                 else:
@@ -558,7 +938,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-kalshi", action="store_true", help="local files only")
     a = ap.parse_args(argv)
     kalshi = None if a.no_kalshi else KalshiReads()
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi))
+    history = None if kalshi is None else HistoryReads(kalshi)
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history))
     print(f"combo dashboard on http://127.0.0.1:{a.port} (Ctrl+C to stop)", flush=True)
     try:
         srv.serve_forever()

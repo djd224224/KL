@@ -187,5 +187,91 @@ class Pnl(unittest.TestCase):
             self.assertIn(label, h)
 
 
+class History(unittest.TestCase):
+    """Jack 2026-11-06: "add time series of PnL and time series of fills"."""
+    T0 = 1793925000.0
+
+    def tickets(self):
+        return [{"quote_id": "a", "mt": "M1", "legs": [["A", "yes"], ["B", "no"]], "contracts": 100.0, "ask": 0.36,
+                 "fair": 0.33, "fee_est": 0.20, "status": "executed", "at": self.T0, "executed_at": self.T0 + 1},
+                {"quote_id": "b", "mt": "M2", "legs": [["C", "yes"]], "contracts": 50.0, "ask": 0.25, "fair": 0.24,
+                 "fee_est": 0.10, "status": "settled", "result": "no", "at": self.T0 + 600, "executed_at": self.T0 + 601}]
+
+    def hist(self):
+        T0 = self.T0
+        return {"A": [(T0 + 300, 0.50), (T0 + 900, 0.60)], "B": [(T0 + 300, 0.30)],
+                "C": [(T0 + 900, 0.25), (T0 + 1500, 0.10)]}
+
+    def test_the_series(self):
+        T0 = self.T0
+        s = cd.pnl_series(self.tickets(), self.hist(), {}, {"M2": T0 + 1800}, T0 + 2100, step=300)
+        by = {round(p["t"] - T0): p for p in s}
+        # T0+300: ticket a only; fair now 0.5 x 0.7 = 0.35 -> trading 100 x (0.33 - 0.35) = -2
+        self.assertAlmostEqual(by[300]["premium"], 3.0)
+        self.assertAlmostEqual(by[300]["trading"], -2.0)
+        self.assertAlmostEqual(by[300]["total"], 3.0 - 2.0 - 0.20)
+        # T0+900: a at 0.6 x 0.7 = 0.42 (-9); b at C 0.25 (50 x (0.24 - 0.25) = -0.5)
+        self.assertAlmostEqual(by[900]["trading"], -9.0 - 0.5)
+        # T0+1800: b settled NO at its settlement -> 50 x 0.24 = +12
+        self.assertAlmostEqual(by[1800]["trading"], -9.0 + 12.0)
+        self.assertAlmostEqual(by[1800]["fees"], 0.30)
+
+    def test_before_a_legs_first_candle_the_quote_fair_holds(self):
+        T0 = self.T0
+        s = cd.pnl_series(self.tickets()[:1], {"A": [(T0 + 900, 0.5)], "B": [(T0 + 300, 0.3)]}, {}, {}, T0 + 700, step=300)
+        self.assertAlmostEqual(s[0]["trading"], 0.0)                     # T0+300: A has no candle yet
+
+    def test_reads_render_and_tooltips(self):
+        T0 = self.T0
+
+        class C:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, path, params):
+                self.calls.append((path, dict(params)))
+                assert path == "/markets/candlesticks"
+                out = []
+                for tk in params["market_tickers"].split(","):
+                    out.append({"market_ticker": tk, "candlesticks": [
+                        {"end_period_ts": int(T0 + 300), "yes_bid": {"close_dollars": "0.4900"},
+                         "yes_ask": {"close_dollars": "0.5100"}}]})
+                return {"markets": out}
+
+        class K:
+            def __init__(self):
+                self.c = C()
+
+            def _client(self):
+                return self.c
+
+        k = K()
+        h = cd.HistoryReads(k)
+        d = h.get(T0 + 1200, self.tickets(), {}, {})
+        self.assertEqual(set(d["legs"]), {"A", "B", "C"})
+        self.assertTrue(d["series"])
+        n = len(k.c.calls)
+        h.get(T0 + 1230, self.tickets(), {}, {})                          # cached
+        self.assertEqual(len(k.c.calls), n)
+        fp = cd.fill_points(self.tickets())
+        self.assertEqual([round(f["premium"], 2) for f in fp], [36.0, 12.5])
+        pts = d["series"] + [{"t": T0 + 1200, "premium": 3.5, "trading": -1.0, "fees": 0.3, "total": 2.2}]
+        page = cd.chart_pnl(pts) + cd.chart_fills(fp, T0, T0 + 1200)
+        for needle in ("id='pnl-svg'", "id='fill-svg'", "Total +$2.20", "Premiums", "Trading", "pnl-data", "fill-data",
+                       "P&amp;L series as a table", "class='dothit'"):
+            self.assertIn(needle, page)
+        self.assertIn("viz-tip", cd.CHART_JS)
+
+    def test_the_page_has_both_charts(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        s = cd.snapshot(d.name, d.name, NOW)
+        self.assertEqual(len(s["fill_points"]), 2)                       # the executed + the settled ticket
+        h = cd.render(s)
+        self.assertIn("P&amp;L over time", h)
+        self.assertIn("Fills over time", h)
+
+
 if __name__ == "__main__":
     unittest.main()
