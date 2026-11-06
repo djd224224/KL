@@ -152,13 +152,14 @@ class Config:
         # (8 legs: 4%). 0 here; the CLI's default is 0.005
         self.confirm_floor_per_leg = 0.0
         # LONG SHOTS (Jack 2026-11-06: "longer shot should charge more edge right?",
-        # then "Yes, add it"): (fair below, extra markup) steps on top of the leg
-        # ladder -- +1 point under 10c, +2 under 5c. On the market's prints since the
+        # then "Yes, add it", "and +0.5% when fair is under 20"): (fair below, extra
+        # markup) steps on top of the leg ladder -- +0.5 point under 20c, +1 under 10c,
+        # +2 under 5c. On the market's prints since the
         # 11/05 evening, our wins under 5c tied up two-thirds of the cash for under a
         # quarter of the expected profit (0.12% per $ tied vs 1.36% at 20-40c), and
         # the other makers already charge long shots more (median +6.5% at 2-3c vs
         # +1.9% at 20-40c). Quote side only: the last look keeps its bars. () here;
-        # the CLI's default is 0.05:0.02,0.10:0.01
+        # the CLI's default is 0.05:0.02,0.10:0.01,0.20:0.005
         self.longshot_markup = ()
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
@@ -1269,9 +1270,9 @@ def main(argv=None) -> int:
                          "(0.035 p(1-p); none on all-NFL parlays); a quote whose markup leaves less goes out "
                          "at the lowest price that clears it (0 = off). Jack 2026-11-06: \"i mean 1%% edge, "
                          "after fees\"")
-    ap.add_argument("--longshot-markup", default="0.05:0.02,0.10:0.01",
+    ap.add_argument("--longshot-markup", default="0.05:0.02,0.10:0.01,0.20:0.005",
                     help="extra markup on long shots, as fair-below:extra pairs (default: +2 pts under 5c, "
-                         "+1 under 10c; '' = off). Quote side only. Jack 2026-11-06: \"longer shot should "
+                         "+1 under 10c, +0.5 under 20c; '' = off). Quote side only. Jack 2026-11-06: \"longer shot should "
                          "charge more edge right?\"")
     ap.add_argument("--confirm-floor-per-leg", type=float, default=0.005,
                     help="the floor after the fee grows this much for each leg over 2 (0.005: 1%%, 1.5%%, 2%% "

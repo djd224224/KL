@@ -974,6 +974,20 @@ class LongShots(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cm.main(["--longshot-markup", bad])
 
+    def test_the_cli_default_has_three_steps(self):
+        """Jack 2026-11-06: "and +0.5% when fair is under 20"."""
+        got, run = {}, cm.run
+        cm.run = lambda cfg, minutes: got.setdefault("cfg", cfg) and 0
+        try:
+            cm.main(["--allow-thin", "--markup", "0.04"])
+        finally:
+            cm.run = run
+        cfg = got["cfg"]
+        self.assertEqual(cfg.longshot_markup, ((0.05, 0.02), (0.10, 0.01), (0.20, 0.005)))
+        two = [[L1, "yes"], [L2, "yes"]]
+        for fair, extra in ((0.03, 0.02), (0.07, 0.01), (0.15, 0.005), (0.1999, 0.005), (0.20, 0.0), (0.35, 0.0)):
+            self.assertAlmostEqual(cfg.markup_for(2, two, fair), 0.04 + extra)
+
 
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
