@@ -289,6 +289,32 @@ class NflOnly(unittest.TestCase):
             cm.main(["--nfl-only", "--markup", "0.02"])
 
 
+class GamesAndKnobs(unittest.TestCase):
+    """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
+    two NBA games as components)."""
+
+    def test_games_filter_any_and_all(self):
+        cfg = cm.Config(games={"26NOV05MIAGSW"}, min_legs=2)
+        self.assertIsNone(cm.pre_check([[L1, "yes"], [L2, "yes"]], cfg))           # a MIA@GSW leg
+        self.assertEqual(cm.pre_check([[L2, "yes"], [L3, "no"]], cfg), "not_games")
+        cfg_all = cm.Config(games={"26NOV05MIAGSW", "26NOV05BOSTOR"}, games_mode="all", min_legs=2)
+        self.assertIsNone(cm.pre_check([[L1, "yes"], [L2, "yes"]], cfg_all))
+        self.assertEqual(cm.pre_check([[L1, "yes"], [L2, "yes"], [L3, "no"]], cfg_all), "not_games")
+
+    def test_two_legs_and_a_short_lead(self):
+        cfg = cm.Config(min_legs=2, min_lead_min=5)
+        self.assertIsNone(cm.pre_check([[L1, "yes"], [L2, "yes"]], cfg))
+        mk = {L1: mkt(L1, 0.59, 0.61, start_in_h=0.15), L2: mkt(L2, 0.49, 0.51)}   # 9 min to go
+        self.assertIsNone(cm.price_check([[L1, "yes"], [L2, "yes"]], mk, T0, cfg)[0])
+        self.assertEqual(cm.price_check([[L1, "yes"], [L2, "yes"]], mk, T0, cm.Config())[0], "starts_soon")
+
+    def test_cli_guards(self):
+        for bad in (["--markup", "0.03"], ["--min-legs", "1"], ["--min-lead-min", "1"],
+                    ["--allow-thin", "--markup", "0.02"]):
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
+
+
 class RunGuards(unittest.TestCase):
     def test_stop_file_and_lock(self):
         with tempfile.TemporaryDirectory() as d:

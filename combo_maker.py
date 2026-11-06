@@ -93,6 +93,11 @@ class Config:
         # ("Combos (excluding uncorrelated NFL)"), so a 3% markup is all edge
         self.nfl_only = False
         self.shard_factor = SHARD_FACTOR    # see 1/N of the RFQs (50 = 2%, ~90 KB/s; 10 = 10%, ~470 KB/s)
+        # GAMES (Jack 2026-11-05: "want to start quoting tonight, with the 2 NBA
+        # games as components"): only parlays with a leg on one of these game
+        # keys (26NOV05MIAGSW), or with every leg on them (games_mode "all")
+        self.games = None
+        self.games_mode = "any"
         self.min_legs, self.max_legs = 3, 8
         self.min_fair, self.max_fair = 0.02, 0.40
         self.max_leg_spread = 0.03
@@ -165,6 +170,10 @@ def pre_check(legs: list, cfg: Config):
     games = [game_of(l[0]) for l in legs]
     if len(set(games)) < len(games):
         return "same_game"
+    if cfg.games:
+        on = [g in cfg.games for g in games]
+        if not (all(on) if cfg.games_mode == "all" else any(on)):
+            return "not_games"
     return None
 
 
@@ -607,9 +616,11 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     writer = DayWriter(out_dir)
     book = Book(os.path.join(out_dir, STATE_NAME))
     mk = Maker(client, cfg, writer, book, out_dir)
-    writer.write({"k": "start", "t": time.time(), "live": cfg.live, "cfg": vars(cfg)})
+    writer.write({"k": "start", "t": time.time(), "live": cfg.live,
+                  "cfg": {k: sorted(v) if isinstance(v, set) else v for k, v in vars(cfg).items()}})
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
-        + f": markup {cfg.markup:.0%} (confirm >= {cfg.confirm_min_edge:.1%}), "
+        + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
+        + f": markup {cfg.markup:.0%} (confirm >= {cfg.confirm_min_edge:.1%}), lead {cfg.min_lead_min:g} min, "
         f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
         f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
         f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day; open now {len(book.open())}")
@@ -699,15 +710,33 @@ def main(argv=None) -> int:
                     help="only all-NFL combos (no maker fee by Kalshi's table); allows --markup 0.03")
     ap.add_argument("--shard-factor", type=int, default=d.shard_factor,
                     help="see 1 in N of the RFQs (50 = 2%%; 10 = 10%%, ~470 KB/s on the Wi-Fi)")
+    ap.add_argument("--games", default="",
+                    help="comma list of game keys (e.g. 26NOV05MIAGSW): only parlays with a leg on one")
+    ap.add_argument("--games-mode", choices=("any", "all"), default="any",
+                    help="all = every leg on those games")
+    ap.add_argument("--min-legs", type=int, default=d.min_legs)
+    ap.add_argument("--min-lead-min", type=float, default=d.min_lead_min,
+                    help="stop quoting a game this many minutes before its start (Kalshi's start = "
+                         "the game market's expiry - 3 h, checked against ESPN)")
+    ap.add_argument("--allow-thin", action="store_true",
+                    help="allow a 3%% markup on fee-paying combos: about breakeven or worse after the "
+                         "fee at Kalshi's mids (a mechanics test)")
     a = ap.parse_args(argv)
-    floor = 0.03 if a.nfl_only else 0.05
+    floor = 0.03 if (a.nfl_only or a.allow_thin) else 0.05
     if a.markup < floor:
-        ap.error(f"markup under {floor:.0%}: " + ("too thin even fee-free" if a.nfl_only else
+        ap.error(f"markup under {floor:.0%}: " + ("too thin even fee-free" if floor == 0.03 else
                  "it does not cover the 0.035 p(1-p) maker fee with room (all-NFL combos are "
-                 "fee-free: --nfl-only allows 3%)"))
+                 "fee-free: --nfl-only allows 3%; --allow-thin allows 3% anyway)"))
+    if a.min_legs < 2:
+        ap.error("--min-legs 2 or more")
+    if a.min_lead_min < 2:
+        ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
+    games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
     cfg = Config(live=a.live, markup=a.markup, max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_open_loss=a.max_open_loss,
-                 max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor)
+                 max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
+                 games=games, games_mode=a.games_mode, min_legs=a.min_legs,
+                 min_lead_min=a.min_lead_min)
     if not 1 <= cfg.shard_factor <= 100:
         ap.error("--shard-factor 1-100")
     return run(cfg, a.minutes)
