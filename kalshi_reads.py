@@ -187,6 +187,25 @@ def kalshi_get(path: str, params: Optional[dict] = None, prefer: str = "signed",
     raise KalshiReadError("; ".join(errors), status=status)
 
 
+# one market -- its record or its order book -- goes public first: Kalshi
+# mostly spares those unsigned. Everything else (/markets?..., /markets/trades,
+# /events?..., /series) is a list read, signed first.
+_ONE_MARKET = re.compile(r"^/markets/(?!trades$|candlesticks$)[^/?]+(/orderbook)?$")
+
+
+def prefer_for(path: str) -> str:
+    """The route `path` tries first: "public" for one market (GET /markets/<ticker>
+    or its /orderbook), "signed" for list reads, which Kalshi throttles unsigned from
+    any IP (11/06: this box's unsigned list reads were refused for over an hour)."""
+    return "public" if _ONE_MARKET.match(path) else "signed"
+
+
+def read(path: str, params: Optional[dict] = None, timeout: float = TIMEOUT) -> Any:
+    """kalshi_get on the path's own route (prefer_for). Raises KalshiReadError
+    when every route fails."""
+    return kalshi_get(path, params, prefer=prefer_for(path), timeout=timeout)
+
+
 def kalshi_get_all(path: str, params: Optional[dict] = None,
                    items_key: str = "markets", prefer: str = "signed",
                    max_pages: int = 100, pace: float = 0.2) -> List[Any]:

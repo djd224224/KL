@@ -3,8 +3,11 @@ files and a fake Kalshi read; no network."""
 import json
 import math
 import os
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 import combo_maker as cm
@@ -210,6 +213,60 @@ class EndToEnd(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(rd, f"scorecard_{DAY}.md")))
             with tempfile.TemporaryDirectory() as empty:
                 self.assertEqual(sc.main(["--day", DAY, "--rfq-dir", rd, "--maker-dir", empty, "--no-results"]), 2)
+
+
+class EmailAndReads(unittest.TestCase):
+    """The morning email (Jack 2026-11-06: "yes i want the scorecard every morning")
+    and results read signed first through kalshi_reads."""
+
+    def test_results_read_signed_first_and_none_on_failure(self):
+        import kalshi_reads as kr
+        with mock.patch.object(kr, "kalshi_get", return_value={"markets": []}) as g:
+            self.assertEqual(sc.kalshi_markets({"tickers": A}), {"markets": []})
+            self.assertEqual(g.call_args.args[0], "/markets")
+        with mock.patch.object(kr, "kalshi_get", side_effect=kr.KalshiReadError("both routes")):
+            self.assertIsNone(sc.kalshi_markets({"tickers": A}))
+
+    def test_html_and_subject(self):
+        h = sc.md_to_html("# T\n\n**2 legs** x<y\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
+        for want in ("<h2>T</h2>", "<b>2 legs</b> x&lt;y", "<th style", ">1</td>"):
+            self.assertIn(want, h)
+        self.assertNotIn("---", h)
+        s = {"scored": 4001, "segments": {"2": {"clear_median": 0.013, "fee_share": 0.021}},
+             "our_price": {"2": [{"markup": "live rule", "won": 11, "of": 367}]}}
+        self.assertEqual(sc.subject_for(DAY, s), "Combo scorecard 2026-11-06: 4,001 prints scored; 2 legs clear "
+                                                 "+1.3% over the mids (fee 2.1%); our 2-leg price beats 3% of them")
+
+    def test_main_emails_once_a_day(self):
+        sent = []
+
+        class Alerter:
+            enabled = True
+
+            def __init__(self, tag, live):
+                self.tag = tag
+
+            def send_message(self, body, subject="", html=None):
+                sent.append((self.tag, subject, html))
+                return True
+        fake_imm = types.SimpleNamespace(Alerter=Alerter)
+        with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as md,                 mock.patch.dict(sys.modules, {"imm_quote_gaps": types.ModuleType("imm_quote_gaps"),
+                                              "incentive_mm": fake_imm}),                 mock.patch.object(sc, "low_priority"):
+            write_jsonl(os.path.join(rd, f"combo_{DAY}.jsonl"), PRINTS)
+            write_jsonl(os.path.join(md, f"legs_{DAY}.jsonl"), tape_rows())
+            args = ["--day", DAY, "--rfq-dir", rd, "--maker-dir", md, "--no-results", "--email"]
+            self.assertEqual(sc.main(args), 0)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], "COMBO-SCORE")
+            self.assertTrue(sent[0][1].startswith("Combo scorecard 2026-11-06: 2 prints scored"))
+            self.assertIn("<table", sent[0][2])
+            self.assertEqual(sc.main(args), 0)                                  # the marker: not again today
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sc.main(args + ["--test"]), 0)                     # --test: again, no marker
+            self.assertEqual(len(sent), 2)
+            Alerter.enabled = False
+            os.remove(next(os.path.join(rd, f) for f in os.listdir(rd) if f.startswith("scorecard_sent_")))
+            self.assertEqual(sc.main(args), 1)                                  # no credentials: fail loudly
 
 
 if __name__ == "__main__":

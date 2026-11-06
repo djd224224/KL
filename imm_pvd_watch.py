@@ -51,6 +51,7 @@ os.environ.setdefault("IMM_STATUS_DIR", os.path.join(tempfile.gettempdir(), "imm
 os.makedirs(os.environ["IMM_STATUS_DIR"], exist_ok=True)
 sys.path.insert(0, HERE)
 import incentive_mm as imm  # noqa: E402
+import kalshi_reads  # noqa: E402
 
 PUBLIC = "https://api.elections.kalshi.com/trade-api/v2"
 GO_LIVE = (datetime.fromisoformat(os.environ["PVD_WATCH_GO_LIVE"].replace("Z", "+00:00"))
@@ -70,27 +71,12 @@ def _f(x) -> float:
 
 
 def _get(path: str, params: dict | None = None) -> dict:
-    """A public read, patient with 429s (the public limit is per IP and shared
-    with whatever else runs on this machine): up to ~75 s of backoff, then
-    raise -- the caller falls back to its last good read."""
-    s = getattr(_sess, "s", None)
-    if s is None:
-        s = _sess.s = requests.Session()
-    r = None
-    for a in range(9):
-        try:
-            r = s.get(PUBLIC + path, params=params, timeout=20)
-        except requests.RequestException:
-            time.sleep(2 + 2 * a)
-            continue
-        if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(2 + 2 * a)
-            continue
-        r.raise_for_status()
-        return r.json()
-    if r is not None:
-        r.raise_for_status()
-    raise RuntimeError(f"no response for {path}")
+    """One read through kalshi_reads: the /markets batches signed first (Kalshi
+    throttles unsigned list reads from any IP; 11/06 it refused this box's for over
+    an hour, while this page retried each refused read 9 times on 3 threads), the
+    order books public first with the signed client behind them. Raises when both
+    routes fail -- the caller falls back to its last good read."""
+    return kalshi_reads.read(path, params or {})
 
 
 SCAN_FILE = os.path.join(HERE, "run-logs", "pvd-scan", "last_scan.json")   # pvd_scan.py's last run

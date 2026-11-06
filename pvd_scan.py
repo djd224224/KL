@@ -88,6 +88,7 @@ DECIDED_SIZE = int(os.environ.get("PVD_SCAN_DECIDED_SIZE", "300"))  # the decide
 CUSH = {"dead": 2, "live": 5}
 
 import incentive_mm as imm                      # noqa: E402  (reads only: membership, voting days, scoring)
+import kalshi_reads                              # noqa: E402
 import send_imm_new_programs as snp             # noqa: E402
 
 _loc = threading.local()
@@ -101,20 +102,13 @@ def log(msg: str) -> None:
 
 
 def pget(path: str, params=None):
-    s = getattr(_loc, "s", None)
-    if s is None:
-        s = _loc.s = requests.Session()
-    for a in range(8):
-        try:
-            r = s.get(PUBLIC + path, params=params, timeout=20)
-            if r.status_code == 429 or r.status_code >= 500:
-                time.sleep(2 + 3 * a)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException:
-            time.sleep(1 + a)
-    return None
+    """One read through kalshi_reads (11/06: Kalshi refused this box's unsigned list
+    reads for over an hour): the /markets batches signed first, the order books
+    public first, each with the other route behind it; None when both fail."""
+    try:
+        return kalshi_reads.read(path, params or {})
+    except Exception:  # noqa: BLE001 -- the caller treats None as no read
+        return None
 
 
 def ts(s: str) -> datetime:

@@ -71,6 +71,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import imm_quote_gaps as _gaps  # noqa: F401,E402  (import side effects)
 import incentive_mm as imm  # noqa: E402
+import kalshi_reads  # noqa: E402
 from incentive_mm import log  # noqa: E402
 
 GUARD_LIVE_TS = datetime(2026, 10, 16, 16, 17, tzinfo=timezone.utc).timestamp()
@@ -377,21 +378,13 @@ _last_call = [0.0]
 
 
 def _get(path: str, params: dict) -> dict:
-    wait = TAPE_GAP_SECS - (time.time() - _last_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    url = f"{KALSHI}{path}?{urllib.parse.urlencode(params)}" if params else f"{KALSHI}{path}"
-    for i in range(6):
-        _last_call[0] = time.time()
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "imm-lone-ref-monitor"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.load(resp)
-        except urllib.error.HTTPError as e:
-            if e.code != 429:
-                raise
-            time.sleep(3 * (i + 1))
-    raise RuntimeError(f"429s on {path}")
+    """One read through kalshi_reads (11/06: Kalshi refused this box's unsigned list
+    reads for over an hour): the trade tape signed first, a single market public
+    first, each with the other route behind it. RuntimeError when both fail."""
+    try:
+        return kalshi_reads.read(path, params)
+    except kalshi_reads.KalshiReadError as e:
+        raise RuntimeError(f"read failed on {path}: {e}") from None
 
 
 def market_value(m: dict):

@@ -86,6 +86,7 @@ from html import escape as _esc
 # credential fallback into the environment before incentive_mm reads config.
 import imm_quote_gaps as _gaps  # noqa: F401  (import side effects)
 import incentive_mm as imm
+import kalshi_reads
 from incentive_mm import log
 
 MAX_ROWS = int(os.environ.get("IMM_TOXIC_EMAIL_MAX_ROWS", "60"))
@@ -310,22 +311,14 @@ _last_call = [0.0]
 
 
 def _get(path: str, params: dict) -> dict:
-    """One paced public GET (no auth); 429s back off and retry."""
-    wait = API_GAP_SECS - (time.time() - _last_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    url = f"{KALSHI}{path}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
-    for i in range(6):
-        _last_call[0] = time.time()
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "imm-toxic-halts"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.load(resp)
-        except urllib.error.HTTPError as e:
-            if e.code != 429:
-                raise
-            time.sleep(3 * (i + 1))
-    raise RuntimeError(f"429s on {path}")
+    """One read through kalshi_reads (11/06: Kalshi refused this box's unsigned list
+    reads for over an hour, and 43 of this report's tape reads with them): the
+    trade tape signed first, a single market public first, each with the other
+    route behind it. RuntimeError when both fail (the caller marks that market n/a)."""
+    try:
+        return kalshi_reads.read(path, params)
+    except kalshi_reads.KalshiReadError as e:
+        raise RuntimeError(f"read failed on {path}: {e}") from None
 
 
 def market_value(m: dict):

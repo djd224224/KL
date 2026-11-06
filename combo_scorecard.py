@@ -29,13 +29,19 @@ Leg prices: the maker's leg tape (run-logs\combo-maker\legs_<day>.jsonl, from
 11/06 evening on); for a day without one, mids backed out of the maker's own
 quotes (a quote's Kalshi-only fair is the product of its legs' mids: least
 squares over 20-minute windows; Kalshi only). Results and start times: Kalshi's
-/markets (public), a leg read until its result is in, kept in
+/markets through kalshi_reads (signed first: Kalshi throttles unsigned list
+reads from any IP), a leg read until its result is in, kept in
 run-logs\combo-rfq\leg_results.json.
 
   python combo_scorecard.py                     # yesterday (UTC)
   python combo_scorecard.py --day 2026-11-06
   python combo_scorecard.py --day today         # so far
-Writes run-logs\combo-rfq\scorecard_<day>.md and .json.
+  python combo_scorecard.py --email             # the scheduled morning run
+Writes run-logs\combo-rfq\scorecard_<day>.md and .json. --email also sends it
+(Jack 2026-11-06: "yes i want the scorecard every morning"): once an ET day
+(scorecard_sent_<ET day>.marker), at idle priority, through the IMM's alerter
+like the other morning emails; --test sends now and writes no marker.
+Scheduled daily 7:30 AM ET as "KL combo scorecard" (register_combo_scorecard.ps1).
 """
 import argparse
 import bisect
@@ -58,7 +64,6 @@ from combo_rfq_score import MAKER_FEE_RATE  # noqa: E402
 RFQ_DIR = os.environ.get("COMBO_RFQ_DIR", os.path.join(HERE, "run-logs", "combo-rfq"))
 MAKER_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 RESULTS_NAME = "leg_results.json"
-K_URL = "https://api.elections.kalshi.com/trade-api/v2"
 LOGGER_SLICE = 50                  # the logger ties prints to 1 in 50 of the RFQs (its shard)
 WINDOW_S = 1200.0                  # the implied mids' windows
 TAPE_AGE_S = 900.0                 # a leg-tape line older than this at a print doesn't price it
@@ -206,36 +211,16 @@ def implied_tape(maker_dir: str, day: str, window_s: float = WINDOW_S):
 
 # ---- results ----------------------------------------------------------------------
 
-def public_get(params: dict, tries: int = 6, sleep=time.sleep):
-    """GET /markets on Kalshi's public API, backing off on refusals; None if it never answers."""
-    import requests
-    for i in range(tries):
-        try:
-            r = requests.get(K_URL + "/markets", params=params, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-        except requests.RequestException:
-            pass
-        sleep(min(30.0, 2.0 * 2 ** i))
-    return None
-
-
-def auth_get():
-    """GET /markets with the bots' key, one call a second (it shares the live bots' read budget)."""
-    import kalshi_subaccount as ks
-    c, last = ks.client(), [0.0]
-
-    def get(params):
-        wait = last[0] + 1.0 - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        last[0] = time.time()
-        try:
-            return c.get("/markets", params)
-        except Exception as e:                                   # noqa: BLE001 -- a refusal ends the reads
-            log(f"! results read: {type(e).__name__}: {str(e)[:120]}")
-            return None
-    return get
+def kalshi_markets(params: dict):
+    """GET /markets through kalshi_reads: signed first (Kalshi throttles unsigned
+    list reads from any IP; 11/06 this box's were refused for over an hour), paced
+    to 4 a second, the public endpoint behind it. None when every route fails."""
+    import kalshi_reads
+    try:
+        return kalshi_reads.kalshi_get("/markets", params)
+    except Exception as e:                                       # noqa: BLE001 -- a refusal ends the reads
+        log(f"! results read: {type(e).__name__}: {str(e)[:160]}")
+        return None
 
 
 class Results:
@@ -576,6 +561,81 @@ def render_md(day: str, sc: dict, results_left: int = 0, results_read: bool = Tr
     return "\n".join(L) + "\n"
 
 
+def md_to_html(md: str) -> str:
+    """The report's markdown (headings, tables, bold, paragraphs) as an email's HTML."""
+    import re
+    esc = lambda s: re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s.replace("<", "&lt;").replace(">", "&gt;"))  # noqa: E731
+    out, lines, i = [], md.splitlines(), 0
+    cell = "border:1px solid #ddd;padding:3px 6px"
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                if not re.match(r"^\|[-| ]+\|$", lines[i]):
+                    rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            out.append("<table style='border-collapse:collapse;font-size:13px'>")
+            for k, r in enumerate(rows):
+                tag = "th" if k == 0 else "td"
+                out.append("<tr>" + "".join(f"<{tag} style='{cell}'>{esc(c)}</{tag}>" for c in r) + "</tr>")
+            out.append("</table>")
+            continue
+        if ln.startswith("# "):
+            out.append(f"<h2>{esc(ln[2:])}</h2>")
+        elif ln.startswith("## "):
+            out.append(f"<h3>{esc(ln[3:])}</h3>")
+        elif ln.strip():
+            out.append(f"<p>{esc(ln)}</p>")
+        i += 1
+    return "<html><body style='font-family:Segoe UI,Arial,sans-serif'>" + "\n".join(out) + "</body></html>"
+
+
+def subject_for(day: str, sc: dict) -> str:
+    """The email's subject: the day, the prints scored, where 2 legs clear, the live rule's wins."""
+    s2 = sc["segments"].get("2") or {}
+    live = next((o for o in sc["our_price"].get("2") or [] if o["markup"] == "live rule"), None)
+    parts = [f"Combo scorecard {day}: {sc['scored']:,} prints scored"]
+    if s2.get("clear_median") is not None:
+        parts.append(f"2 legs clear {s2['clear_median'] * 100:+.1f}% over the mids (fee "
+                     f"{(s2.get('fee_share') or 0) * 100:.1f}%)")
+    if live and live["of"]:
+        parts.append(f"our 2-leg price beats {live['won'] / live['of']:.0%} of them")
+    return "; ".join(parts)
+
+
+def low_priority() -> None:
+    """Idle priority for the scheduled run: the live bots share the PC."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.SetPriorityClass(k32.GetCurrentProcess(), 0x40)      # IDLE_PRIORITY_CLASS
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def send_email(day: str, sc: dict, md: str, attempts: int = 6, sleep=time.sleep) -> bool:
+    """The report through the IMM's alerter (imm_quote_gaps first, like the other
+    morning emails, so the launcher env and the alert credentials apply)."""
+    import imm_quote_gaps  # noqa: F401  (import side effects)
+    import incentive_mm as imm
+    alerter = imm.Alerter("COMBO-SCORE", live=True)
+    if not alerter.enabled:
+        log("cannot send the scorecard email: alert credentials not configured")
+        return False
+    subject, html = subject_for(day, sc), md_to_html(md)
+    for attempt in range(1, attempts + 1):
+        if alerter.send_message(md, subject=subject, html=html):
+            log(f"emailed: {subject}")
+            return True
+        log(f"scorecard send attempt {attempt}/{attempts} failed" + ("; retry in 5 min" if attempt < attempts else ""))
+        if attempt < attempts:
+            sleep(300)
+    return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--day", default="yesterday", help="UTC day YYYY-MM-DD, 'today' or 'yesterday' (default)")
@@ -583,12 +643,18 @@ def main(argv=None) -> int:
     ap.add_argument("--maker-dir", default=MAKER_DIR)
     ap.add_argument("--out", default=None, help="where the report goes (default: --rfq-dir)")
     ap.add_argument("--no-results", action="store_true", help="read no results from Kalshi (cached ones only)")
-    ap.add_argument("--auth", action="store_true",
-                    help="read results with the bots' key, 1 call a second (it shares the live bots' read budget); "
-                         "default: Kalshi's public API")
+    ap.add_argument("--email", action="store_true",
+                    help="the scheduled morning run: email the report, once an ET day (a sent-marker), at idle priority")
+    ap.add_argument("--test", action="store_true", help="with --email: send now, whatever the marker; write none")
     a = ap.parse_args(argv)
     now = time.time()
     today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    marker = os.path.join(a.rfq_dir, f"scorecard_sent_{cm.et_day(now)}.marker")
+    if a.email and not a.test:
+        if os.path.exists(marker):
+            log(f"the scorecard email already went out today ({os.path.basename(marker)}); exiting")
+            return 0
+        low_priority()
     day = {"today": today, "yesterday": prev_day(today)}.get(a.day, a.day)
     try:
         datetime.strptime(day, "%Y-%m-%d")
@@ -609,8 +675,7 @@ def main(argv=None) -> int:
     if not a.no_results:
         rows, _ = price_prints(prints, tape, Results(), now)
         legs = {tk for r in rows for tk, _ in r["legs"]}
-        get = auth_get() if a.auth else public_get
-        left = results.fetch(legs, get, now)
+        left = results.fetch(legs, kalshi_markets, now)
         log(f"results: {len(legs):,} legs, {sum(1 for t in legs if results.final(t)):,} final"
             + (f", {left:,} unread (Kalshi refused)" if left else ""))
     sc = score(prints, tape, results, now, cfg=live_config(a.maker_dir, day), no_prints=len(ex) - len(prints))
@@ -621,6 +686,15 @@ def main(argv=None) -> int:
     with open(os.path.join(out, f"scorecard_{day}.json"), "w", encoding="utf-8") as f:
         json.dump(dict(sc, day=day, made=now, results_unread=left), f, indent=1, default=str)
     log(f"wrote scorecard_{day}.md / .json: {sc['scored']:,} prints scored")
+    if a.email:
+        if not send_email(day, sc, md):
+            return 1
+        if not a.test:
+            try:
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(datetime.now(timezone.utc).isoformat())
+            except OSError as e:
+                log(f"! sent-marker not written ({e!r}): a re-run today would send again")
     return 0
 
 
