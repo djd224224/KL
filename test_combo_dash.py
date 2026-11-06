@@ -565,6 +565,8 @@ class Task(unittest.TestCase):
         self.assertIn("last look &ge; 1% after fees", page)
         s["cfg"]["confirm_floor_per_leg"] = 0.005
         self.assertIn("last look &ge; 1% +0.5%/leg after fees", cd.render(s))
+        s["cfg"]["longshot_markup"] = [[0.05, 0.02], [0.10, 0.01]]
+        self.assertIn("long shots +1 under 10&cent;, +2 under 5&cent;", cd.render(s))
         s["cfg"]["nfl_markup_cut"] = 0.0
         self.assertNotIn("all-NFL", cd.render(s))
 

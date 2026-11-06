@@ -927,6 +927,54 @@ class FloorStep(unittest.TestCase):
                 cm.main(bad)
 
 
+class LongShots(unittest.TestCase):
+    """Jack 2026-11-06: "longer shot should charge more edge right?" -- "Yes, add it"."""
+    N1, N2 = NflOnly.N1, NflOnly.N2
+
+    def cfg(self, **kw):
+        return cm.Config(markup=0.04, markup_per_leg=0.01, nfl_markup_cut=0.02,
+                         longshot_markup=((0.05, 0.02), (0.10, 0.01)), **kw)
+
+    def test_the_steps(self):
+        cfg, two = self.cfg(), [[L1, "yes"], [L2, "yes"]]
+        six = [[f"KXNBAGAME-26NOV07G{i}-X", "yes"] for i in range(6)]
+        self.assertAlmostEqual(cfg.markup_for(2, two, 0.03), 0.06)           # under 5c: +2
+        self.assertAlmostEqual(cfg.markup_for(2, two, 0.0499), 0.06)
+        self.assertAlmostEqual(cfg.markup_for(2, two, 0.05), 0.05)           # 5-10c: +1
+        self.assertAlmostEqual(cfg.markup_for(2, two, 0.0999), 0.05)
+        self.assertAlmostEqual(cfg.markup_for(2, two, 0.10), 0.04)           # 10c and up: none
+        self.assertAlmostEqual(cfg.markup_for(6, six, 0.03), 0.10)           # 8% for 6 legs + 2
+        self.assertAlmostEqual(cfg.markup_for(2, [[self.N1, "yes"], [self.N2, "yes"]], 0.04), 0.04)  # NFL 2% + 2
+        self.assertAlmostEqual(cfg.markup_for(2, two), 0.04)                 # no fair: the leg ladder
+        self.assertAlmostEqual(cm.Config(markup=0.04).markup_for(2, two, 0.03), 0.04)   # a bare Config: none
+        self.assertAlmostEqual(cfg.confirm_edge_for(2, two), 0.02)           # the last look is unchanged
+        self.assertEqual(cm.quote_price(0.04, cfg, n_legs=3, legs=LEGS), (0.043, 0.957))  # 0.04 x 1.07 up
+        self.assertEqual(cm.quote_price(0.04, cm.Config(markup=0.04, markup_per_leg=0.01), n_legs=3, legs=LEGS),
+                         (0.042, 0.958))
+
+    def test_a_long_shot_is_quoted_at_the_higher_markup(self):
+        mk = {L1: mkt(L1, 0.19, 0.21), L2: mkt(L2, 0.24, 0.26), L3: mkt(L3, 0.19, 0.21)}   # 0.2 x 0.25 x 0.8
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, self.cfg(live=True, confirm_edge_floor=0.01, confirm_floor_per_leg=0.005), w,
+                     cm.Book(os.path.join(d.name, "s.json")), d.name, clock=lambda: T0)
+        m.handle(rfq_msg(legs=LEGS, tc="5.0000"))
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.9570")                  # 4.3c: 5% + 2%, not 4.2c
+        q = w.k("quote")[0]
+        self.assertAlmostEqual(q["fair"], 0.04)
+        self.assertAlmostEqual(q["mu"], 0.07)
+        self.assertNotIn("raised_from", q)
+
+    def test_cli(self):
+        self.assertEqual(cm.parse_longshot("0.10:0.01,0.05:0.02"), ((0.05, 0.02), (0.10, 0.01)))
+        self.assertEqual(cm.parse_longshot(""), ())
+        for bad in ("0.05:-0.01", "abc", "0.5:0.01", "0.05:0.3"):
+            with self.assertRaises(SystemExit):
+                cm.main(["--longshot-markup", bad])
+
+
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
     two NBA games as components)."""

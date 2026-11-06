@@ -151,6 +151,15 @@ class Config:
         # after the fee grows this much for each leg over 2, half the markup's step
         # (8 legs: 4%). 0 here; the CLI's default is 0.005
         self.confirm_floor_per_leg = 0.0
+        # LONG SHOTS (Jack 2026-11-06: "longer shot should charge more edge right?",
+        # then "Yes, add it"): (fair below, extra markup) steps on top of the leg
+        # ladder -- +1 point under 10c, +2 under 5c. On the market's prints since the
+        # 11/05 evening, our wins under 5c tied up two-thirds of the cash for under a
+        # quarter of the expected profit (0.12% per $ tied vs 1.36% at 20-40c), and
+        # the other makers already charge long shots more (median +6.5% at 2-3c vs
+        # +1.9% at 20-40c). Quote side only: the last look keeps its bars. () here;
+        # the CLI's default is 0.05:0.02,0.10:0.01
+        self.longshot_markup = ()
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -233,10 +242,21 @@ class Config:
         """The all-NFL cut for these legs (0 without legs, or with a non-NFL leg)."""
         return self.nfl_markup_cut if (legs and self.nfl_markup_cut and self.fee_free(legs)) else 0.0
 
-    def markup_for(self, n_legs: int, legs=None) -> float:
+    def longshot_extra(self, fair) -> float:
+        """The long-shot step at this fair: the extra of the lowest threshold the
+        fair is under (0 at or over them all, or with no fair)."""
+        if fair is None:
+            return 0.0
+        for top, extra in sorted(self.longshot_markup):
+            if fair < top - 1e-12:
+                return extra
+        return 0.0
+
+    def markup_for(self, n_legs: int, legs=None, fair=None) -> float:
         """The markup on an n-leg parlay: `markup` at 2 legs, + `markup_per_leg`
-        for each leg over 2; nfl_markup_cut less when every one of `legs` is NFL."""
-        m = self.markup + self.markup_per_leg * max(0, int(n_legs) - 2)
+        for each leg over 2, + the long-shot step at `fair`; nfl_markup_cut less
+        when every one of `legs` is NFL."""
+        m = self.markup + self.markup_per_leg * max(0, int(n_legs) - 2) + self.longshot_extra(fair)
         return max(0.0, m - self.nfl_cut(legs))
 
     def confirm_edge_for(self, n_legs: int, legs=None) -> float:
@@ -413,7 +433,7 @@ def lead_min(ticker: str, cfg: Config) -> float:
 def quote_price(fair: float, cfg: Config, grid=None, n_legs: int = 2, legs=None):
     """(our YES price, the no_bid we post): fair x (1 + the n-leg markup) rounded UP
     (the all-NFL cut off it when `legs` are all NFL)."""
-    ask = grid_up(fair * (1.0 + cfg.markup_for(n_legs, legs)), grid or DEFAULT_GRID)
+    ask = grid_up(fair * (1.0 + cfg.markup_for(n_legs, legs, fair)), grid or DEFAULT_GRID)
     return ask, round(1.0 - ask, 4)
 
 
@@ -787,7 +807,7 @@ class Maker:
         if why:
             self._why(why)
             return
-        q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs), legs), 4),
+        q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs), legs, fair), 4),
                  contracts=cts, games=games, at=now,
                  lag_ms=None if rfq["rfq_ms"] is None else now * 1000 - rfq["rfq_ms"], read_ms=read_ms)
         if raised is not None:
@@ -1130,6 +1150,9 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
         + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half and >= {cfg.confirm_edge_floor * 100:.3g}% +{cfg.confirm_floor_per_leg * 100:.3g}%/leg after the fee)"
         + (f", all-NFL {cfg.nfl_markup_cut * 100:.3g} pts less" if cfg.nfl_markup_cut else "")
+        + ((", long shots " + ", ".join(f"+{e * 100:.3g} pts under {t * 100:.3g}c"
+                                        for t, e in sorted(cfg.longshot_markup, reverse=True)))
+           if cfg.longshot_markup else "")
         + f", lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
         + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
@@ -1209,6 +1232,23 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     return code
 
 
+def parse_longshot(s: str) -> tuple:
+    """'0.05:0.02,0.10:0.01' -> ((0.05, 0.02), (0.10, 0.01)): fair-below:extra
+    pairs, each fair in (0, 0.40] and each extra in [0, 0.20]; '' -> ()."""
+    out = []
+    for part in (s or "").split(","):
+        if not part.strip():
+            continue
+        try:
+            top, extra = (float(x) for x in part.split(":"))
+        except ValueError:
+            raise ValueError(f"{part!r} is not fair-below:extra (0.05:0.02)") from None
+        if not (0.0 < top <= 0.40 and 0.0 <= extra <= 0.20):
+            raise ValueError(f"{part!r}: the fair must be in (0, 0.40] and the extra in [0, 0.20]")
+        out.append((top, extra))
+    return tuple(sorted(out))
+
+
 def main(argv=None) -> int:
     d = Config()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
@@ -1229,6 +1269,10 @@ def main(argv=None) -> int:
                          "(0.035 p(1-p); none on all-NFL parlays); a quote whose markup leaves less goes out "
                          "at the lowest price that clears it (0 = off). Jack 2026-11-06: \"i mean 1%% edge, "
                          "after fees\"")
+    ap.add_argument("--longshot-markup", default="0.05:0.02,0.10:0.01",
+                    help="extra markup on long shots, as fair-below:extra pairs (default: +2 pts under 5c, "
+                         "+1 under 10c; '' = off). Quote side only. Jack 2026-11-06: \"longer shot should "
+                         "charge more edge right?\"")
     ap.add_argument("--confirm-floor-per-leg", type=float, default=0.005,
                     help="the floor after the fee grows this much for each leg over 2 (0.005: 1%%, 1.5%%, 2%% "
                          "... 4%% at 8 legs). Jack 2026-11-06: \"1%% would be the floor for 2 legs. and then "
@@ -1291,6 +1335,10 @@ def main(argv=None) -> int:
                  "--nfl-markup-cut), or a 2-leg all-NFL quote fails its own last look")
     if not 0 <= a.confirm_floor_per_leg <= a.markup_per_leg + 1e-9:
         ap.error("--confirm-floor-per-leg from 0 to --markup-per-leg (the floor may not outgrow the markup)")
+    try:
+        longshot = parse_longshot(a.longshot_markup)
+    except ValueError as e:
+        ap.error(f"--longshot-markup: {e}")
     if a.min_legs < 2:
         ap.error("--min-legs 2 or more")
     if not a.min_legs <= a.max_legs <= 12:
@@ -1300,7 +1348,8 @@ def main(argv=None) -> int:
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
     cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg,
                  nfl_markup_cut=a.nfl_markup_cut, confirm_edge_floor=a.confirm_edge_floor,
-                 confirm_floor_per_leg=a.confirm_floor_per_leg, max_payout=a.max_payout,
+                 confirm_floor_per_leg=a.confirm_floor_per_leg, longshot_markup=longshot,
+                 max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_ticket_loss=a.max_ticket_loss,
                  max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
