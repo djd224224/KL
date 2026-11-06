@@ -727,5 +727,117 @@ class Analytics(unittest.TestCase):
             self.assertIn(want, page)
 
 
+class Outcomes(unittest.TestCase):
+    """Jack 2026-11-06: "also track quotes based on what ultimately fills, vs our price being too high, etc"."""
+    TWO = [["KXNBAGAME-26NOV06PHICLE-CLE", "yes"], ["KXNHLGAME-26NOV06CBJBUF-CBJ", "yes"]]
+
+    def q(self, **kw):
+        base = {"qid": "x", "key": [2, "NBA+NHL", "30–40¢", "winners only", "fee-paying"], "mt": "KXMVE-A",
+                "rfq_s": NOW - 600, "at": NOW - 600, "ask": 0.312, "fair": 0.30, "tc": 10.0, "cn": None}
+        base.update(kw)
+        return base
+
+    def trade(self, px, ct, side="yes", when="2026-11-06T02:20:01Z"):
+        return {"yes_price_dollars": f"{px:.4f}", "no_price_dollars": f"{1 - px:.4f}", "count_fp": f"{ct:.2f}",
+                "taker_side": side, "created_time": when}
+
+    def test_classify(self):
+        q = self.q()
+        ct = lambda p: 10.0 / (p + 0.07 * p * (1 - p))          # noqa: E731 -- a $10 target cost with the taker fee
+        self.assertEqual(cd.classify(q, [])["outcome"], "not bought")
+        r = cd.classify(q, [self.trade(0.305, ct(0.305))])
+        self.assertEqual((r["outcome"], r["px"]), ("cheaper elsewhere", 0.305))
+        self.assertAlmostEqual(r["gap"], 0.305 / 0.312 - 1, places=4)
+        self.assertEqual(cd.classify(q, [self.trade(0.312, ct(0.312))])["outcome"], "same price elsewhere")
+        self.assertEqual(cd.classify(q, [self.trade(0.320, ct(0.320))])["outcome"], "dearer elsewhere")
+        self.assertEqual(cd.classify(q, [self.trade(0.300, 500.0)])["outcome"], "other print")      # another size
+        self.assertEqual(cd.classify(q, [self.trade(0.300, 10.0 / 0.7, side="no")])["why"], "NO bought")
+        self.assertEqual(cd.classify(self.q(tc=None, cn=40.0), [self.trade(0.31, 40.0)])["outcome"],
+                         "cheaper elsewhere")
+        self.assertEqual(cd.classify(q, [self.trade(0.300, 10.0 / 0.3)])["outcome"], "cheaper elsewhere")  # no fee
+
+    def test_values_off_a_quote_line(self):
+        line = b'{"id":"r","mt":"KXMVE-A","tc":"0.9000","cn":null,"rfq_ms":1793974322479,"fair":0.30,"ask":0.312}'
+        self.assertEqual(cd._val_after(line, b'"mt":'), "KXMVE-A")
+        self.assertEqual(cd._val_after(line, b'"tc":'), "0.9000")
+        self.assertIsNone(cd._val_after(line, b'"cn":'))
+        self.assertEqual(cd._val_after(line, b'"rfq_ms":'), 1793974322479.0)
+        self.assertIsNone(cd._val_after(b'{"tc": null, "cn": 5}', b'"tc":'))
+        self.assertEqual(cd._val_after(b'{"tc": null, "cn": 5}', b'"cn":'), 5.0)
+
+    def test_the_checker(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        calls = []
+
+        class C:
+            def get(self, path, params):
+                calls.append((path, dict(params)))
+                return {"trades": []}
+
+        class K:
+            io = threading.Lock()
+
+            def _client(self):
+                return C()
+
+        oc = cd.QuoteOutcomes(K(), out_dir=d.name, clock=lambda: NOW)
+        oc.offer(self.q(qid="a", rfq_s=NOW - 60))                          # its window is still open
+        self.assertIsNone(oc.due(NOW))
+        self.assertIsNone(oc.due(NOW + 60))
+        self.assertEqual(oc.due(NOW + 75)["qid"], "a")
+        oc.offer(self.q(qid="b"))
+        oc.offer(self.q(qid="c"))
+        oc.note_accepted({"c"})                                            # a buyer took it: the maker's record
+        self.assertTrue(oc.step(NOW))
+        self.assertEqual(calls[0][1]["ticker"], "KXMVE-A")
+        self.assertEqual((calls[0][1]["min_ts"], calls[0][1]["max_ts"]), (int(NOW - 602), int(NOW - 600 + 120)))
+        self.assertFalse(oc.step(NOW))                                     # c skipped
+        self.assertEqual([r["outcome"] for r in oc.results()], ["not bought"])
+        again = cd.QuoteOutcomes(K(), out_dir=d.name, clock=lambda: NOW)    # a restart reads them back
+        self.assertEqual(set(again.done), {"b"})
+        again.offer(self.q(qid="b"))                                       # and doesn't read b again
+        self.assertEqual(len(again.queue), 0)
+
+    def test_the_reader_offers_the_sample_and_the_page_shows_it(self):
+        ids = [f"q{i}" for i in range(4000) if cd._sampled(f"q{i}")][:2]
+        self.assertTrue(abs(sum(cd._sampled(f"q{i}") for i in range(4000)) - 80) < 40)   # about 2%
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        day = datetime.fromtimestamp(NOW, timezone.utc).strftime("%Y-%m-%d")
+        rows = [{"k": "start", "t": NOW - 1800, "live": True, "cfg": {}}]
+        for i, qid in enumerate(ids):
+            rows.append({"k": "quote", "at": NOW - 900 + i, "mt": f"KXMVE-{i}", "legs": self.TWO, "fair": 0.30,
+                         "ask": 0.312, "mu": 0.04, "tc": "10.0000", "cn": None, "rfq_ms": (NOW - 900.3 + i) * 1000,
+                         "contracts": 32.0, "quote_id": qid})
+        with open(os.path.join(d.name, f"combo_{day}.jsonl"), "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+
+        class C:
+            def get(self, path, params):
+                return {"trades": [{"yes_price_dollars": "0.3050", "count_fp": f"{10 / (0.305 + 0.07 * 0.305 * 0.695):.2f}",
+                                    "taker_side": "yes", "created_time": "2026-11-06T02:15:05Z"}]}
+
+        class K:
+            def _client(self):
+                return C()
+
+        oc = cd.QuoteOutcomes(K(), out_dir=d.name, clock=lambda: NOW)
+        logs = cd.MakerLog(d.name, sampler=oc)
+        cd.snapshot(d.name, d.name, NOW, logs=logs, outcomes=oc)
+        self.assertEqual([q["qid"] for q in oc.queue], ids)
+        self.assertAlmostEqual(oc.queue[0]["tc"], 10.0)
+        self.assertEqual(oc.queue[0]["key"][1], "NBA+NHL")
+        while oc.step(NOW):
+            pass
+        s = cd.snapshot(d.name, d.name, NOW, logs=logs, outcomes=oc)
+        legs = {r["seg"]: r for r in s["analytics"]["dims"]["legs"]}
+        self.assertEqual((legs[2]["checked"], legs[2]["o_cheaper"]), (2, 2))
+        page = cd.render(s)
+        for want in ("What became of our quotes", "Bought cheaper elsewhere", "100.0%", "Quote outcomes: 2 checked"):
+            self.assertIn(want, page)
+
+
 if __name__ == "__main__":
     unittest.main()

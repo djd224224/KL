@@ -262,7 +262,7 @@ def _quote_seg(line: bytes):
 class _DaySum:
     """One UTC day's maker log, summed as it is read: what the page shows of it."""
 
-    def __init__(self, last: float = 0.0, recent=None):
+    def __init__(self, last: float = 0.0, recent=None, sampler=None):
         self.off = 0                  # bytes of whole lines read
         self.final = False            # read to its end from the .gz: the maker closed the day
         self.last = last              # the last stamped line's time (an unstamped line takes it)
@@ -281,6 +281,8 @@ class _DaySum:
         self.seg_acc = {}             # segment -> accepts (by the accepted quote's id)
         self.seg_dec = {}             # segment -> last-look declines
         self.recent = recent if recent is not None else collections.OrderedDict()   # quote id -> segment
+        self.sampler = sampler        # QuoteOutcomes: offered the sampled quotes
+        self.acc_ids, self.dec_ids = set(), set()   # quote ids accepted by a buyer / declined at the last look
 
     def _seg_quote(self, key, mu, qid) -> None:
         v = self.seg_q.get(key)
@@ -328,6 +330,11 @@ class _DaySum:
                 seg = _quote_seg(line)
                 if seg is not None:
                     self._seg_quote(*seg)
+                    if self.sampler is not None and _sampled(seg[2]):
+                        self.sampler.offer(_quote_rec(seg[2], seg[0], _val_after(line, b'"mt":'),
+                                                      _val_after(line, b'"rfq_ms":'), at,
+                                                      _val_after(line, b'"ask":'), _val_after(line, b'"fair":'),
+                                                      _val_after(line, b'"tc":'), _val_after(line, b'"cn":')))
             self.off += cut
             tail = data[cut:]
         if final and tail.strip():
@@ -370,17 +377,25 @@ class _DaySum:
                 key = self.recent.get(e.get("quote_id"))
                 if key is not None:
                     self.seg_dec[key] = self.seg_dec.get(key, 0) + 1
+                if e.get("quote_id"):
+                    self.dec_ids.add(e["quote_id"])
         if k == "quote":
             self.quotes += 1
             if self.first_quote is None or ts < self.first_quote:
                 self.first_quote = ts
             if e is not None and e.get("legs"):
-                self._seg_quote(seg_key(e["legs"], _f(e.get("fair"))), _f(e.get("mu"), 0.0), e.get("quote_id"))
+                key = seg_key(e["legs"], _f(e.get("fair")))
+                self._seg_quote(key, _f(e.get("mu"), 0.0), e.get("quote_id"))
+                if self.sampler is not None and _sampled(e.get("quote_id")):
+                    self.sampler.offer(_quote_rec(e["quote_id"], key, e.get("mt"), e.get("rfq_ms"), ts,
+                                                  e.get("ask"), e.get("fair"), e.get("tc"), e.get("cn")))
         elif k == "accept":
             self.accepts += 1
             key = self.recent.get(e.get("quote_id"))
             if key is not None:
                 self.seg_acc[key] = self.seg_acc.get(key, 0) + 1
+            if e.get("quote_id"):
+                self.acc_ids.add(e["quote_id"])
         elif k == "stat":
             self.last_stat = e
         elif k == "settled":
@@ -405,10 +420,11 @@ class MakerLog:
     """The maker's last `days` UTC days of log, one _DaySum each, read as they
     grow; a day the maker has gzipped is read to its end once from the .gz."""
 
-    def __init__(self, maker_dir: str, days: int = 2):
+    def __init__(self, maker_dir: str, days: int = 2, sampler=None):
         self.dir, self.days = maker_dir, days
         self.sums = {}                # UTC day -> _DaySum
         self.recent = collections.OrderedDict()     # quote id -> segment, across the days
+        self.sampler = sampler                      # QuoteOutcomes (the server's), or None
         self.lock = threading.Lock()
 
     def update(self, now: float) -> list:
@@ -435,14 +451,14 @@ class MakerLog:
         try:
             if os.path.exists(p):
                 if s is None or s.final or os.path.getsize(p) < s.off:
-                    s = _DaySum(last, self.recent)          # new, or the file was replaced
+                    s = _DaySum(last, self.recent, self.sampler)    # new, or the file was replaced
                 with open(p, "rb") as f:
                     s.read(f)
                 return s
             if os.path.exists(p + ".gz"):
                 if s is not None and s.final:
                     return s
-                s = s or _DaySum(last, self.recent)         # the rest of a day read while plain
+                s = s or _DaySum(last, self.recent, self.sampler)   # the rest of a day read while plain
                 with gzip.open(p + ".gz", "rb") as f:
                     s.read(f, final=True)
                 s.final = True
@@ -653,7 +669,7 @@ def _order(dim: str, rows: list) -> list:
     return shown
 
 
-def analytics(days, tickets, since) -> dict:
+def analytics(days, tickets, since, outcomes=None) -> dict:
     """Per dimension in DIMS, one row a segment: the quoting the page's log holds
     (quotes, the markup asked, accepts, last-look declines, fills from `since`, the
     first quote there) and every filled ticket (collected, edge at sale, trading,
@@ -682,7 +698,9 @@ def analytics(days, tickets, since) -> dict:
             return rows.setdefault(name, {"seg": name, "quotes": 0, "mu_sum": 0.0, "accepted": 0, "declined": 0,
                                           "filled": 0, "tickets": 0, "contracts": 0.0, "collected": 0.0,
                                           "edge": 0.0, "trading": 0.0, "fees": 0.0, "pnl": 0.0, "open": 0,
-                                          "can_lose": 0.0, "settled": 0, "hits": 0, "exp_hits": 0.0})
+                                          "can_lose": 0.0, "settled": 0, "hits": 0, "exp_hits": 0.0,
+                                          "checked": 0, "o_not": 0, "o_cheaper": 0, "o_same": 0, "o_dearer": 0,
+                                          "o_other": 0, "gap_cheaper": 0.0})
         for key, (n, mus) in q.items():
             r = row(key[di])
             r["quotes"] += n
@@ -710,17 +728,32 @@ def analytics(days, tickets, since) -> dict:
             else:
                 r["open"] += 1
                 r["can_lose"] += c * (1.0 - ask)
+        for o in outcomes or []:
+            key = o.get("key")
+            if not key or len(key) != len(DIMS) or o.get("outcome") not in OUTCOME_KEY:
+                continue
+            r = row(key[di])
+            r["checked"] += 1
+            r[OUTCOME_KEY[o["outcome"]]] += 1
+            if o["outcome"] == "cheaper elsewhere":
+                r["gap_cheaper"] += _f(o.get("gap"), 0.0) or 0.0
         dims[dim] = _order(dim, list(rows.values()))
     return {"since": since, "dims": dims}
 
 
 # ---- the snapshot ----------------------------------------------------------------
 
-def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=None, logs=None) -> dict:
+def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=None, logs=None,
+             outcomes=None) -> dict:
     """The page's numbers. `logs`: the server's MakerLog (only new lines are read);
     without one the log is read whole."""
     days = (logs if logs is not None else MakerLog(maker_dir)).update(now)
     tickets = read_state(maker_dir)
+    oc_rows = None
+    if outcomes is not None:                         # the accepted quotes are the maker's own records
+        outcomes.note_accepted(set().union(*[d.acc_ids for d in days]) if days else set())
+        fq = [d.first_quote for d in days if d.first_quote is not None]
+        oc_rows = outcomes.results(min(fq) if fq else None)
     day0 = et_midnight(now)
     last_start, stopped, last_t = None, False, 0.0
     for d in days:                                   # oldest first: the last start, and what came after
@@ -772,7 +805,8 @@ def snapshot(maker_dir: str, shadow_dir: str, now: float, kalshi=None, history=N
         "settled_pnl": sum(_f(t.get("pnl"), 0.0) for t in settled),
         "pnl": pnl,
         "series": series, "fill_points": fill_points(filled),
-        "analytics": analytics(days, tickets, min(firsts) if firsts else None),
+        "analytics": analytics(days, tickets, min(firsts) if firsts else None, oc_rows),
+        "outcomes": dict(outcomes.state(), sample_pct=OUTCOME_SAMPLE_PCT) if outcomes is not None else None,
         "fill_rate": _fill_rate(sum(d.quotes for d in days), sum(d.accepts for d in days),
                                 min(firsts) if firsts else None, filled),
         "history_error": (hist or {}).get("error"),
@@ -1012,6 +1046,195 @@ class HistoryReads:
             data = dict(self.data, error=f"{type(e).__name__}: {str(e)[:160]}")
         with self.lock:
             self.data, self.busy = data, False
+
+
+# ---- what became of our quotes (Jack 2026-11-06: "also track quotes based on what
+# ultimately fills, vs our price being too high, etc") ----
+
+OUTCOME_SAMPLE_PCT = 2          # the quotes checked: crc32(quote id) % 100 under this -- unbiased, the same after a restart
+OUTCOME_CALLS_PER_MIN = 12      # trade-tape reads a minute, one a quote (2% of the maker's 600 quotes a minute)
+OUTCOME_WINDOW_S = 120.0        # an RFQ executes within this of its creation (an RFQ lives ~39 s at the p90)
+OUTCOME_QUEUE = 240             # quotes waiting for their window to close; the oldest are dropped (a restart
+                                # offers the day's whole sample, of which this keeps the newest)
+OUTCOME_KINDS = (("not bought", "o_not"), ("cheaper elsewhere", "o_cheaper"), ("same price elsewhere", "o_same"),
+                 ("dearer elsewhere", "o_dearer"), ("other print", "o_other"))
+OUTCOME_KEY = dict(OUTCOME_KINDS)
+
+
+def _sampled(qid) -> bool:
+    return bool(qid) and zlib.crc32(str(qid).encode("utf-8", "replace")) % 100 < OUTCOME_SAMPLE_PCT
+
+
+def _val_after(line: bytes, tag: bytes):
+    """The JSON scalar after `tag` ('"key":'): a string, a number, or None (null or missing)."""
+    i = line.find(tag)
+    if i < 0:
+        return None
+    i += len(tag)
+    while line[i:i + 1] in (b" ", b"\t"):
+        i += 1
+    if line[i:i + 1] == b'"':
+        j = line.find(b'"', i + 1)
+        return line[i + 1:j].decode("utf-8", "replace") if j > i else None
+    if line[i:i + 4] == b"null":
+        return None
+    ends = [j for j in (line.find(b",", i), line.find(b"}", i)) if j >= 0]
+    try:
+        return float(line[i:min(ends)]) if ends else None
+    except ValueError:
+        return None
+
+
+def _quote_rec(qid, key, mt, rfq_ms, at, ask, fair, tc, cn) -> dict:
+    return {"qid": qid, "key": list(key), "mt": mt, "rfq_s": (_f(rfq_ms) or at * 1000.0) / 1000.0, "at": at,
+            "ask": _f(ask), "fair": _f(fair), "tc": _f(tc), "cn": _f(cn)}
+
+
+def _same_size(q: dict, t: dict) -> bool:
+    """Is this print the RFQ's own execution? Its size matches the request: a
+    target cost ~ contracts x (price + the 0.07 p(1-p) taker fee) -- or the price
+    alone, on a fee-free all-NFL combo -- or the contracts asked for."""
+    ct = _f(t.get("count_fp"), 0.0) or 0.0
+    side = t.get("taker_side") or t.get("taker_outcome_side")
+    py = _f(t.get("yes_price_dollars"), 0.0) or 0.0
+    p = py if side == "yes" else (_f(t.get("no_price_dollars")) or 1.0 - py)
+    if q.get("cn"):
+        return abs(ct - q["cn"]) <= max(0.02, 0.01 * ct)
+    if q.get("tc"):
+        tol = max(0.05, 0.02 * q["tc"])
+        return abs(ct * (p + 0.07 * p * (1.0 - p)) - q["tc"]) <= tol or abs(ct * p - q["tc"]) <= tol
+    return True
+
+
+def classify(q: dict, trades: list) -> dict:
+    """What became of one of our quotes, from its combo's trade tape between the
+    RFQ's creation and OUTCOME_WINDOW_S after: not bought; bought elsewhere
+    cheaper than our price (ours too high), at it, or dearer (we were cheaper
+    but not taken); or a print that isn't this RFQ's (another size, NO bought)."""
+    if not trades:
+        return {"outcome": "not bought"}
+    for t in sorted(trades, key=lambda t: str(t.get("created_time") or "")):
+        if not _same_size(q, t):
+            continue
+        if (t.get("taker_side") or t.get("taker_outcome_side")) != "yes":
+            return {"outcome": "other print", "why": "NO bought"}
+        px, ask = _f(t.get("yes_price_dollars")), q.get("ask")
+        if px is None or not ask:
+            return {"outcome": "other print", "why": "no price"}
+        o = ("cheaper elsewhere" if px < ask - 1e-6 else "dearer elsewhere" if px > ask + 1e-6
+             else "same price elsewhere")
+        return {"outcome": o, "px": px, "gap": round(px / ask - 1.0, 5)}
+    return {"outcome": "other print", "why": "another size"}
+
+
+class QuoteOutcomes:
+    """What became of a sample of our quotes. The log reader offers every sampled
+    quote (_sampled); once its RFQ's window has closed, a background thread reads
+    its combo's trade tape (GET /markets/trades, OUTCOME_CALLS_PER_MIN a minute,
+    through the Kalshi reads' client) and classifies it. Quotes the buyer accepted
+    -- we filled, declined, or Kalshi canceled -- are the maker's own records,
+    counted exactly elsewhere, and are not read. Results append to
+    DASH_DIR/quote_outcomes_<UTC day>.jsonl and are read back at a restart."""
+
+    def __init__(self, kalshi, out_dir: str = None, clock=time.time):
+        self.kalshi, self.dir, self.clock = kalshi, out_dir or DASH_DIR, clock
+        self.queue = collections.deque(maxlen=OUTCOME_QUEUE)
+        self.done = {}                  # quote id -> result
+        self.skip = set()               # quote ids a buyer accepted
+        self.lock = threading.Lock()
+        self.calls, self.error, self.thread = 0, None, None
+        self.stopping = threading.Event()
+        self._load()
+
+    def _path(self, ts: float) -> str:
+        return os.path.join(self.dir, f"quote_outcomes_{datetime.fromtimestamp(ts, timezone.utc):%Y-%m-%d}.jsonl")
+
+    def _load(self) -> None:
+        now = self.clock()
+        for d in (1, 0):
+            p = self._path(now - d * 86400)
+            if not os.path.exists(p):
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        if r.get("qid"):
+                            self.done[r["qid"]] = r
+            except OSError:
+                pass
+
+    def offer(self, q: dict) -> None:
+        with self.lock:
+            if q.get("qid") and q.get("mt") and q["qid"] not in self.done:
+                self.queue.append(q)
+
+    def note_accepted(self, qids) -> None:
+        with self.lock:
+            self.skip.update(qids)
+
+    def due(self, now: float):
+        """The oldest queued quote whose window has closed (None: none yet)."""
+        with self.lock:
+            while self.queue:
+                q = self.queue[0]
+                if q["qid"] in self.done or q["qid"] in self.skip:
+                    self.queue.popleft()
+                    continue
+                if (q.get("rfq_s") or q.get("at") or 0.0) + OUTCOME_WINDOW_S + 10.0 > now:
+                    return None
+                return self.queue.popleft()
+            return None
+
+    def check(self, q: dict) -> dict:
+        t0 = q.get("rfq_s") or q.get("at")
+        with getattr(self.kalshi, "io", None) or contextlib.nullcontext():
+            js = self.kalshi._client().get("/markets/trades", {"ticker": q["mt"], "min_ts": int(t0 - 2),
+                                                               "max_ts": int(t0 + OUTCOME_WINDOW_S), "limit": 100})
+        self.calls += 1
+        trades = js.get("trades") or []
+        res = dict(classify(q, trades), qid=q["qid"], key=q.get("key"), t=t0, at=q.get("at") or t0, ask=q.get("ask"),
+                   fair=q.get("fair"), mt=q.get("mt"), prints=len(trades))
+        with self.lock:
+            self.done[q["qid"]] = res
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(self._path(t0), "a", encoding="utf-8") as f:
+                f.write(json.dumps(res, separators=(",", ":")) + "\n")
+        except OSError as e:
+            self.error = f"write: {e}"
+        return res
+
+    def step(self, now=None) -> bool:
+        """Read one due quote's tape (True if there was one)."""
+        q = self.due(self.clock() if now is None else now)
+        if q is None:
+            return False
+        try:
+            self.check(q)
+            self.error = None
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {str(e)[:160]}"
+        return True
+
+    def start(self) -> None:
+        def loop():
+            while not self.stopping.wait(60.0 / OUTCOME_CALLS_PER_MIN):
+                self.step()
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+
+    def results(self, since=None) -> list:
+        with self.lock:
+            return [r for r in self.done.values()                 # by the quote's time, as the page's window
+                    if since is None or (r.get("at") or r.get("t") or 0.0) >= since]
+
+    def state(self) -> dict:
+        with self.lock:
+            return {"queue": len(self.queue), "calls": self.calls, "error": self.error, "checked": len(self.done)}
 
 
 # ---- the charts (inline SVG, no libraries; the dataviz reference palette's first three slots) ----
@@ -1282,7 +1505,7 @@ def _fill_rate_cell(filled: int, quotes: int) -> str:
     return f"{100.0 * filled / quotes:.3f}% &middot; 1 in {quotes / filled:,.0f}"
 
 
-def analytics_html(an: dict) -> str:
+def analytics_html(an: dict, s_outcomes=None) -> str:
     """The segment tables, one dimension shown at a time (the choice kept in the
     browser), each with the quoting since the log's first quote and the P&L of
     every filled ticket, and a total row that matches the cards above."""
@@ -1331,7 +1554,34 @@ def analytics_html(an: dict) -> str:
                      f"<td class='n'>{usd(r['can_lose']) if r['open'] else '&ndash;'}</td></tr>")
         if not trows:
             H.append("<tr><td colspan='10' class='empty'>No fills yet.</td></tr>")
+        H.append("</table></div>")
+        orows = [r for r in rows if r.get("checked")]
+        H.append(f"<h3>What became of our quotes <span class='muted small'>a {OUTCOME_SAMPLE_PCT}% sample the "
+                 "buyer did not accept, read off each combo's trade tape</span></h3><div class='tw'><table><tr>"
+                 f"<th>{html.escape(label)}</th><th class='n'>Checked</th><th class='n'>Not bought</th>"
+                 "<th class='n'>Bought cheaper elsewhere</th><th class='n'>At our price elsewhere</th>"
+                 "<th class='n'>Dearer elsewhere</th><th class='n'>Another request&rsquo;s print</th>"
+                 "<th class='n'>Cheaper by (avg)</th></tr>")
+        for r, cls in [(r, "") for r in orows] + ([(tot, " class='tot'")] if orows else []):
+            name = "Total" if r is tot else _seg_label(dim, r["seg"])
+            n = r["checked"]
+            cells = "".join(f"<td class='n'>{100.0 * r[k] / n:.1f}% <span class='muted small'>{r[k]:,}</span></td>"
+                            for _o, k in OUTCOME_KINDS)
+            gap = f"{100.0 * r['gap_cheaper'] / r['o_cheaper']:+.1f}%" if r["o_cheaper"] else "&ndash;"
+            H.append(f"<tr{cls}><td>{name}</td><td class='n'>{n:,}</td>{cells}<td class='n'>{gap}</td></tr>")
+        if not orows:
+            H.append("<tr><td colspan='8' class='empty'>No quotes checked yet (the first are read 2 minutes after "
+                     "their RFQ).</td></tr>")
         H.append("</table></div></div>")
+    oc = s_outcomes
+    if oc:
+        H.append(f"<div class='small muted'>Quote outcomes: {oc['checked']:,} checked, {oc['queue']:,} waiting, "
+                 f"{oc['calls']:,} trade reads since the page started"
+                 + (f" &middot; <span class='neg'>{html.escape(str(oc['error']))}</span>" if oc.get("error") else "")
+                 + ". Not bought: no print of the request's size on the combo within 2 minutes. Cheaper / at our "
+                 "price / dearer elsewhere: another maker's fill of the request, its price against ours. Another "
+                 "request's print: the same parlay traded for a request of another size (or NO was bought), and ours "
+                 "did not -- every request for one set of legs shares a combo.</div>")
     H.append("<div class='small muted'>Edge asked: the average markup we quoted. Fill rate: fills / quotes. Edge at "
              "sale: our price over the fair when we sold; trading: the parlays' moves since (payouts once settled); "
              "P&amp;L = edge at sale + trading &minus; fees. Hit vs fair: settled parlays that hit (we paid) against "
@@ -1416,7 +1666,7 @@ def render(s: dict) -> str:
                  f"</span></h2>" + chart_fills(fp, (ser[0]['t'] if ser else fp[0]['t']), s['now']))
         if s.get("history_error"):
             H.append(f"<div class='small muted'>price history: {html.escape(str(s['history_error']))}</div>")
-    H.append(analytics_html(s.get("analytics")))
+    H.append(analytics_html(s.get("analytics"), s.get("outcomes")))
     H.append("<h2>Today</h2><div class='card'><div class='funnel'>"
              f"<b>{qn:,}</b> {'quotes sent' if fn['quotes'] else 'would quote (dry)'} <span class='arrow'>&rarr;</span> "
              f"<b>{fn['accepted']:,}</b> accepted <span class='arrow'>&rarr;</span> <b>{fn['confirmed']:,}</b> confirmed "
@@ -1534,13 +1784,13 @@ def render(s: dict) -> str:
     return "".join(H)
 
 
-def make_handler(maker_dir, shadow_dir, kalshi, history=None, logs=None):
+def make_handler(maker_dir, shadow_dir, kalshi, history=None, logs=None, outcomes=None):
     logs = logs if logs is not None else MakerLog(maker_dir)       # kept across requests
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             try:
-                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi, history, logs)
+                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi, history, logs, outcomes)
                 if self.path.startswith("/data.json"):
                     body, ctype = json.dumps(s, default=str).encode(), "application/json"
                 else:
@@ -1603,9 +1853,10 @@ def main(argv=None) -> int:
         return EXIT_STOP
     kalshi = None if a.no_kalshi else KalshiReads()
     history = None if kalshi is None else HistoryReads(kalshi)
-    logs = MakerLog(MAKER_DIR)
+    outcomes = None if kalshi is None else QuoteOutcomes(kalshi)
+    logs = MakerLog(MAKER_DIR, sampler=outcomes)
     try:
-        srv = DashServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history, logs))
+        srv = DashServer(("127.0.0.1", a.port), make_handler(MAKER_DIR, SHADOW_DIR, kalshi, history, logs, outcomes))
     except OSError as e:
         print(f"port {a.port} is taken -- another dashboard serves it? ({e}); exiting", flush=True)
         return EXIT_PORT
@@ -1618,6 +1869,9 @@ def main(argv=None) -> int:
               f"{sum(d.off for d in days) / 1e6:,.1f} MB of log", flush=True)
     except Exception as e:                # the page shows it; serve anyway
         print(f"warm-up failed: {type(e).__name__}: {e}", flush=True)
+    if outcomes is not None:
+        outcomes.start()
+        print(f"quote outcomes: {len(outcomes.done):,} read back, {len(outcomes.queue):,} queued", flush=True)
     return serve(srv, STOP_FILE)
 
 
