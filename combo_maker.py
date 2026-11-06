@@ -128,6 +128,15 @@ class Config:
         # at the p75 -- and each leg's mid error compounds into the fair
         self.markup_per_leg = 0.01
         self.confirm_min_edge = None        # None = half the markup (0.05 at the default 10%)
+        # ALL-NFL CUT (Jack 2026-11-06: "NFL parlays require 2c less edge because there
+        # are no maker fees"): a parlay whose every leg is an NFL market pays no maker
+        # fee (fee_free; Kalshi's table: "Combos (excluding uncorrelated NFL)"), and the
+        # fee is 0.035 p(1-p), 2.1-3.4% of our price over the 2-40c fairs. So it needs
+        # this much less edge at the quote AND at the last look (the fee saved is the
+        # whole fee at both): 0.02 quotes 2 legs at 2% instead of 4% and confirms them
+        # down to 0% instead of 2%. 0 here, so a bare Config (the tests, the shadow
+        # scorer) prices every parlay alike; the CLI's default is 0.02
+        self.nfl_markup_cut = 0.0
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -201,15 +210,23 @@ class Config:
         if self.confirm_min_edge is None:
             self.confirm_min_edge = self.markup / 2.0
 
-    def markup_for(self, n_legs: int) -> float:
-        """The markup on an n-leg parlay: `markup` at 2 legs, + `markup_per_leg`
-        for each leg over 2."""
-        return self.markup + self.markup_per_leg * max(0, int(n_legs) - 2)
+    def nfl_cut(self, legs) -> float:
+        """The all-NFL cut for these legs (0 without legs, or with a non-NFL leg)."""
+        return self.nfl_markup_cut if (legs and self.nfl_markup_cut and self.fee_free(legs)) else 0.0
 
-    def confirm_edge_for(self, n_legs: int) -> float:
+    def markup_for(self, n_legs: int, legs=None) -> float:
+        """The markup on an n-leg parlay: `markup` at 2 legs, + `markup_per_leg`
+        for each leg over 2; nfl_markup_cut less when every one of `legs` is NFL."""
+        m = self.markup + self.markup_per_leg * max(0, int(n_legs) - 2)
+        return max(0.0, m - self.nfl_cut(legs))
+
+    def confirm_edge_for(self, n_legs: int, legs=None) -> float:
         """The last look's minimum edge on an n-leg parlay: confirm_min_edge at 2
-        legs, + half the step for each leg over 2 (half the markup, as before)."""
-        return self.confirm_min_edge + self.markup_per_leg / 2.0 * max(0, int(n_legs) - 2)
+        legs, + half the step for each leg over 2 (half the markup, as before);
+        the whole all-NFL cut less when every one of `legs` is NFL (floor 0: our
+        price at or over the fair)."""
+        e = self.confirm_min_edge + self.markup_per_leg / 2.0 * max(0, int(n_legs) - 2)
+        return max(0.0, e - self.nfl_cut(legs))
 
     def fee_free(self, legs) -> bool:
         """Every leg an NFL market (main lines on different games by the
@@ -374,9 +391,10 @@ def lead_min(ticker: str, cfg: Config) -> float:
     return cfg.min_lead_min
 
 
-def quote_price(fair: float, cfg: Config, grid=None, n_legs: int = 2):
-    """(our YES price, the no_bid we post): fair x (1 + the n-leg markup) rounded UP."""
-    ask = grid_up(fair * (1.0 + cfg.markup_for(n_legs)), grid or DEFAULT_GRID)
+def quote_price(fair: float, cfg: Config, grid=None, n_legs: int = 2, legs=None):
+    """(our YES price, the no_bid we post): fair x (1 + the n-leg markup) rounded UP
+    (the all-NFL cut off it when `legs` are all NFL)."""
+    ask = grid_up(fair * (1.0 + cfg.markup_for(n_legs, legs)), grid or DEFAULT_GRID)
     return ask, round(1.0 - ask, 4)
 
 
@@ -450,7 +468,7 @@ def confirm_check(q: dict, markets: dict, now_s: float, cfg: Config, book: Book,
     why, fair = price_check(q["legs"], markets, now_s, cfg, game_start)
     if why:
         return why, fair
-    if q["ask"] < fair * (1.0 + cfg.confirm_edge_for(len(q["legs"]))) - 1e-9:
+    if q["ask"] < fair * (1.0 + cfg.confirm_edge_for(len(q["legs"]), q["legs"])) - 1e-9:
         return "edge_gone", fair
     return caps_check(book, q["games"], contracts, q["ask"], cfg, et_day(now_s)), fair
 
@@ -706,14 +724,14 @@ class Maker:
             self._why(why)
             return
         self.st["priced"] += 1
-        ask, no_bid = quote_price(fair, self.cfg, n_legs=len(legs))
+        ask, no_bid = quote_price(fair, self.cfg, n_legs=len(legs), legs=legs)
         cts = contracts_of(rfq, ask)
         games = [game_of(l[0]) for l in legs]
         why = caps_check(self.book, games, cts, ask, self.cfg, et_day(now))
         if why:
             self._why(why)
             return
-        q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs)), 4),
+        q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs), legs), 4),
                  contracts=cts, games=games, at=now,
                  lag_ms=None if rfq["rfq_ms"] is None else now * 1000 - rfq["rfq_ms"], read_ms=read_ms)
         if not self.cfg.live:
@@ -1051,7 +1069,9 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
         + (f", games {cfg.games_mode} of {','.join(sorted(cfg.games))}" if cfg.games else "")
         + ": markup " + "/".join(f"{cfg.markup_for(n) * 100:.3g}" for n in range(cfg.min_legs, cfg.max_legs + 1))
-        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half), lead {cfg.min_lead_min:g} min, "
+        + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half)"
+        + (f", all-NFL {cfg.nfl_markup_cut * 100:.3g} pts less" if cfg.nfl_markup_cut else "")
+        + f", lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
         + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
         + (f"loss <= ${cfg.max_ticket_loss:,.0f}/ticket, " if cfg.max_ticket_loss is not None else "")
@@ -1140,6 +1160,11 @@ def main(argv=None) -> int:
     ap.add_argument("--markup-per-leg", type=float, default=d.markup_per_leg,
                     help="added to the markup for each leg over 2 (0.01: --markup 0.04 quotes 2 legs at "
                          "4%%, 5 legs at 7%%; 0 = one markup for all)")
+    ap.add_argument("--nfl-markup-cut", type=float, default=0.02,
+                    help="all-NFL parlays (no maker fee) need this much less edge at the quote and at the "
+                         "last look (0.02: 2 legs quoted at 2%% instead of 4%%, confirmed down to 0%% "
+                         "instead of 2%%; 0 = no cut). Jack 2026-11-06: \"NFL parlays require 2c less "
+                         "edge because there are no maker fees\"")
     ap.add_argument("--max-payout", type=float, default=d.max_payout)
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
     ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,
@@ -1191,6 +1216,8 @@ def main(argv=None) -> int:
                  "fee-free: --nfl-only allows 3%; --allow-thin allows 3% anyway)"))
     if not 0 <= a.markup_per_leg <= 0.10:
         ap.error("--markup-per-leg 0 to 0.10")
+    if not 0 <= a.nfl_markup_cut < a.markup:
+        ap.error("--nfl-markup-cut from 0 to under --markup (an all-NFL parlay keeps some markup)")
     if a.min_legs < 2:
         ap.error("--min-legs 2 or more")
     if not a.min_legs <= a.max_legs <= 12:
@@ -1198,7 +1225,8 @@ def main(argv=None) -> int:
     if a.min_lead_min < 2:
         ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
-    cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg, max_payout=a.max_payout,
+    cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg,
+                 nfl_markup_cut=a.nfl_markup_cut, max_payout=a.max_payout,
                  max_game_payout=a.max_game_payout, max_ticket_loss=a.max_ticket_loss,
                  max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,

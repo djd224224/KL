@@ -743,6 +743,65 @@ class NflOnly(unittest.TestCase):
             cm.main(["--nfl-only", "--markup", "0.02"])
 
 
+class NflCut(unittest.TestCase):
+    """Jack 2026-11-06: "NFL parlays require 2c less edge because there are no maker fees"."""
+    N1, N2, N3 = NflOnly.N1, NflOnly.N2, NflOnly.N3
+
+    def cfg(self, **kw):
+        return cm.Config(markup=0.04, markup_per_leg=0.01, nfl_markup_cut=0.02, **kw)
+
+    def test_two_points_off_at_the_quote_and_at_the_last_look(self):
+        cfg = self.cfg()
+        nfl, nfl3 = [[self.N1, "yes"], [self.N2, "yes"]], [[self.N1, "yes"], [self.N2, "yes"], [self.N3, "no"]]
+        mixed = [[self.N1, "yes"], [L1, "yes"]]
+        self.assertAlmostEqual(cfg.markup_for(2, nfl), 0.02)
+        self.assertAlmostEqual(cfg.markup_for(3, nfl3), 0.03)
+        self.assertAlmostEqual(cfg.markup_for(2, mixed), 0.04)
+        self.assertAlmostEqual(cfg.markup_for(2), 0.04)                       # no legs given: as before
+        self.assertAlmostEqual(cfg.confirm_edge_for(2, nfl), 0.0)             # 2% - 2%: at or over the fair
+        self.assertAlmostEqual(cfg.confirm_edge_for(3, nfl3), 0.005)
+        self.assertAlmostEqual(cfg.confirm_edge_for(2, mixed), 0.02)
+        self.assertEqual(cm.quote_price(0.30, cfg, n_legs=2, legs=nfl), (0.306, 0.694))
+        self.assertEqual(cm.quote_price(0.30, cfg, n_legs=2, legs=mixed), (0.312, 0.688))
+        self.assertAlmostEqual(cm.Config(markup=0.04).markup_for(2, nfl), 0.04)  # a bare Config: no cut
+
+    def run_one(self, legs, after):
+        mk = {t: mkt(t, b, b + 0.02, start_in_h=60) for t, b in ((self.N1, 0.59), (self.N2, 0.49), (L1, 0.49))}
+        c = FakeClient(mk)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, self.cfg(live=True, min_legs=2), w, cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg(legs=legs))                                          # fair 0.60 x 0.50 = 0.30
+        for t, (b, a) in after.items():
+            c.mk[t] = mkt(t, b, a, start_in_h=60)
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": c.posts[0][1]["no_bid"]}})
+        return c, w
+
+    def test_an_all_nfl_parlay_is_quoted_and_confirmed_2_points_lower(self):
+        nfl = [[self.N1, "yes"], [self.N2, "yes"]]
+        c, w = self.run_one(nfl, {self.N1: (0.60, 0.62)})                    # N1 0.60 -> 0.61: fair 0.305
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.6940")                  # 0.306 = 0.30 x 1.02, not 0.312
+        self.assertAlmostEqual(w.k("quote")[0]["mu"], 0.02)
+        self.assertEqual(len(c.puts), 1)                                     # 0.306 >= 0.305 (a 2% bar: 0.3111)
+        c, w = self.run_one(nfl, {self.N1: (0.61, 0.63)})                    # N1 -> 0.62: fair 0.31 > 0.306
+        self.assertEqual(c.puts, [])
+        self.assertEqual(w.k("decline")[0]["why"], "edge_gone")
+
+    def test_a_parlay_with_any_other_leg_keeps_the_markup(self):
+        c, w = self.run_one([[self.N1, "yes"], [L1, "yes"]], {})
+        self.assertEqual(c.posts[0][1]["no_bid"], "0.6880")                  # 0.312 = 0.30 x 1.04
+        self.assertAlmostEqual(w.k("quote")[0]["mu"], 0.04)
+
+    def test_cli_bounds(self):
+        for bad in (["--nfl-markup-cut", "-0.01"],
+                    ["--allow-thin", "--markup", "0.04", "--nfl-markup-cut", "0.04"]):        # none left
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
+
+
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
     two NBA games as components)."""

@@ -556,6 +556,14 @@ class Task(unittest.TestCase):
             self.addCleanup(a.server_close)
             self.assertEqual(cd.main(["--no-kalshi", "--port", str(a.server_address[1])]), cd.EXIT_PORT)
 
+    def test_the_header_shows_the_nfl_cut(self):
+        """Jack 2026-11-06: "NFL parlays require 2c less edge because there are no maker fees"."""
+        s = cd.snapshot(self.d.name, self.d.name, NOW)
+        s["cfg"]["nfl_markup_cut"] = 0.02
+        self.assertIn("all-NFL 2 pts less", cd.render(s))
+        s["cfg"]["nfl_markup_cut"] = 0.0
+        self.assertNotIn("all-NFL", cd.render(s))
+
     def test_the_tables_have_totals(self):
         """Jack 2026-11-06: the rows' P&L now plus the settled P&L "doesnt add up to the total"."""
         s = cd.snapshot(self.d.name, self.d.name, NOW, cd.KalshiReads(client_factory=FakeClient))
