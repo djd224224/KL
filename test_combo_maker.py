@@ -877,6 +877,56 @@ class FeeFloor(unittest.TestCase):
         self.assertEqual(c.posts[0][1]["no_bid"], "0.8960")                  # the markup's 10.4c
 
 
+class FloorStep(unittest.TestCase):
+    """Jack 2026-11-06: "1% would be the floor for 2 legs. and then step it up .5% each leg so 1.5% 3 leg,
+    2% 4 leg, 2.5% 5 leg, etc"."""
+
+    def cfg(self, **kw):
+        return cm.Config(markup=0.04, markup_per_leg=0.01, nfl_markup_cut=0.02, confirm_edge_floor=0.01,
+                         confirm_floor_per_leg=0.005, **kw)
+
+    def test_the_ladder(self):
+        cfg = self.cfg()
+        for n, want in ((2, 0.01), (3, 0.015), (4, 0.02), (5, 0.025), (8, 0.04)):
+            self.assertAlmostEqual(cfg.net_floor_for(n), want)
+        self.assertAlmostEqual(cm.Config(confirm_edge_floor=0.01).net_floor_for(5), 0.01)   # no step: flat
+
+    def test_a_3_leg_parlay_wants_1_5pct_after_the_fee(self):
+        legs = LEGS                                                          # NBA / NHL / NCAAMB: fee-paying
+        cfg = self.cfg()
+        # the floor price at fair 0.21: 1.5% after the fee
+        p = cm.net_floor_price(FAIR, legs, cfg)
+        self.assertGreaterEqual(cm.net_edge(p, FAIR, legs, cfg), 0.015 - 1e-9)
+        self.assertLess(cm.net_edge(p - 0.001, FAIR, legs, cfg), 0.015)
+        c = FakeClient(MK)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        w = W()
+        m = cm.Maker(c, self.cfg(live=True), w, cm.Book(os.path.join(d.name, "s.json")), d.name,
+                     clock=lambda: T0)
+        m.handle(rfq_msg(legs=legs))                                         # 3 legs: 5% -> 0.21 x 1.05 = 0.2205
+        ask = cm.grid_up(FAIR * 1.05)
+        self.assertEqual(c.posts[0][1]["no_bid"], f"{1 - ask:.4f}")          # 2.5% after the fee: kept
+        self.assertNotIn("raised_from", w.k("quote")[0])
+        # our 0.221; fair 0.21 -> 0.21245 (L1 0.60 -> 0.607): 1.19% after the fee, under the 3-leg 1.5%
+        # -> declined, though it clears the 2-leg 1% and the half-markup 2.5% gross bar (0.21776)
+        c.mk[L1] = mkt(L1, 0.597, 0.617)
+        fair_now = 0.607 * 0.50 * 0.70
+        self.assertGreater(ask, fair_now * 1.025)
+        self.assertLess(cm.net_edge(ask, fair_now, legs, cfg), 0.015)
+        self.assertGreaterEqual(cm.net_edge(ask, fair_now, legs, cfg), 0.01 - 1e-9)
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": c.posts[0][1]["no_bid"]}})
+        self.assertEqual(c.puts, [])
+        self.assertEqual(w.k("decline")[0]["why"], "net_edge")
+
+    def test_cli_bounds(self):
+        for bad in (["--confirm-floor-per-leg", "-0.001"],
+                    ["--allow-thin", "--markup", "0.04", "--confirm-floor-per-leg", "0.02"]):   # > the 1% step
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
+
+
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
     two NBA games as components)."""
