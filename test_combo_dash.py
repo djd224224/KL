@@ -80,6 +80,8 @@ class Dash(unittest.TestCase):
         self.assertEqual(cd.leg_label(LEGS[0]), "NBA MIAGSW: GSW win")
         self.assertEqual(cd.leg_label(LEGS[1]), "NOT (NHL BOSTOR: BOS win)")
         self.assertEqual(cd.leg_label(["KXNBASPREAD-26NOV05MIAGSW-GSW5", "yes"]), "NBA MIAGSW: GSW5 spread")
+        self.assertEqual(cd.leg_label(["KXNBATOTAL-26NOV05MIAGSW-235", "yes"]), "NBA MIAGSW: over 235")
+        self.assertEqual(cd.leg_label(["KXNCAAMBTOTAL-26NOV05CPARIZ-175", "no"]), "NCAAMB CPARIZ: under 175")
 
     def test_unstamped_lines_take_the_last_time(self):
         ev = cd.read_events(self.d.name, NOW)

@@ -73,6 +73,8 @@ def leg_label(leg) -> str:
             break
     game = parts[1][7:] if len(parts) > 1 else ""
     pick = parts[-1] if len(parts) > 2 else ""
+    if kind == "total":                      # YES on a total = over the line
+        return f"{series} {game}: {'over' if side == 'yes' else 'under'} {pick}"
     s = f"{series} {game}: {pick} {kind}".strip()
     return s if side == "yes" else f"NOT ({s})"
 
