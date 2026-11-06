@@ -1,0 +1,269 @@
+"""Tests for combo_maker.py (the Strategy 1 combo maker pilot, 2026-11-05).
+A fake client; nothing reaches Kalshi."""
+import json
+import os
+import tempfile
+import unittest
+from datetime import datetime, timezone
+
+import combo_maker as cm
+
+T0 = 1793925000.0           # 2026-11-06 ~00:30Z
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def mkt(t, bid, ask, start_in_h=2.0, status="active"):
+    return {"ticker": t, "status": status, "yes_bid_dollars": f"{bid:.4f}",
+            "yes_ask_dollars": f"{ask:.4f}", "expected_expiration_time": iso(T0 + (start_in_h + 3) * 3600)}
+
+
+L1 = "KXNBAGAME-26NOV05MIAGSW-GSW"
+L2 = "KXNHLGAME-26NOV05BOSTOR-BOS"
+L3 = "KXNCAAMBGAME-26NOV05DUKEUNC-DUKE"
+L4 = "KXNBASPREAD-26NOV05MIAGSW-GSW5"          # same game as L1
+PROP = "KXNBAPTS-26NOV05ORLPHX-PHXDBOOKER15-25"
+LEGS = [[L1, "yes"], [L2, "yes"], [L3, "no"]]
+MK = {L1: mkt(L1, 0.59, 0.61), L2: mkt(L2, 0.49, 0.51), L3: mkt(L3, 0.29, 0.31), L4: mkt(L4, 0.4, 0.42)}
+FAIR = 0.60 * 0.50 * 0.70                      # 0.21
+
+
+class W:
+    def __init__(self):
+        self.rows = []
+
+    def write(self, o):
+        self.rows.append(o)
+
+    def flush(self):
+        pass
+
+    def k(self, k):
+        return [r for r in self.rows if r.get("k") == k]
+
+
+class FakeClient:
+    host = "https://x/trade-api/v2"
+    http_timeout = 5
+    key_id = "k"
+
+    def __init__(self, markets, position=-40.0):
+        self.mk = dict(markets)
+        self.posts, self.puts, self.gets = [], [], []
+        self.position = position
+
+    def get(self, path, params):
+        self.gets.append((path, dict(params)))
+        if path == "/markets":
+            return {"markets": [self.mk[t] for t in params["tickers"].split(",") if t in self.mk]}
+        if path == "/portfolio/positions":
+            return {"market_positions": [{"ticker": params["ticker"], "position_fp": f"{self.position:.2f}"}]}
+        raise AssertionError(path)
+
+    def post(self, path, body):
+        self.posts.append((path, json.loads(body)))
+        return {"id": f"q{len(self.posts)}"}
+
+    # what put_json uses
+    def rate_limit(self):
+        pass
+
+    def request_headers(self, method, path):
+        return {}
+
+    def raise_if_bad_response(self, r):
+        pass
+
+    def _http(self):
+        outer = self
+
+        class S:
+            def put(self, url, data, headers, timeout):
+                outer.puts.append(url)
+
+                class R:
+                    content = b""
+                return R()
+        return S()
+
+
+def rfq_msg(rid="r1", legs=LEGS, tc="10.0000", cn="0.00"):
+    return {"type": "rfq_created", "msg": {
+        "id": rid, "creator_id": "abcdef0123", "market_ticker": "KXMVECROSSCATEGORY-S2026X-Y",
+        "target_cost_dollars": tc, "contracts_fp": cn, "created_ts": iso(T0 - 0.2),
+        "mve_collection_ticker": "KXMVECROSSCATEGORY-R",
+        "mve_selected_legs": [{"event_ticker": l[0].rsplit("-", 1)[0], "market_ticker": l[0], "side": l[1]}
+                              for l in legs]}}
+
+
+class FiltersAndPricing(unittest.TestCase):
+    cfg = cm.Config()
+
+    def test_pre_check(self):
+        self.assertIsNone(cm.pre_check(LEGS, self.cfg))
+        self.assertEqual(cm.pre_check(LEGS[:2], self.cfg), "legs")               # 2 legs: < 3
+        self.assertEqual(cm.pre_check(LEGS + [[PROP, "yes"]], self.cfg), "not_main")
+        self.assertEqual(cm.pre_check([[L1, "yes"], [L4, "yes"], [L2, "yes"]], self.cfg), "same_game")
+        self.assertEqual(cm.pre_check([[L1, "yes", "0.5"], [L2, "yes"], [L3, "no"]], self.cfg), "side")
+
+    def test_price_check_and_fair(self):
+        why, fair = cm.price_check(LEGS, MK, T0, self.cfg)
+        self.assertIsNone(why)
+        self.assertAlmostEqual(fair, FAIR)
+        self.assertEqual(cm.price_check(LEGS, dict(MK, **{L2: mkt(L2, 0.45, 0.50)}), T0, self.cfg)[0], "wide")
+        self.assertEqual(cm.price_check(LEGS, dict(MK, **{L2: mkt(L2, 0.0, 0.50)}), T0, self.cfg)[0], "one_sided")
+        self.assertEqual(cm.price_check(LEGS, dict(MK, **{L2: mkt(L2, 0.49, 0.51, start_in_h=0.4)}), T0,
+                                        self.cfg)[0], "starts_soon")                 # 24 min < 30
+        self.assertEqual(cm.price_check(LEGS, dict(MK, **{L2: mkt(L2, 0.49, 0.51, status="closed")}), T0,
+                                        self.cfg)[0], "not_active")
+        hi = {L1: mkt(L1, 0.89, 0.91), L2: mkt(L2, 0.89, 0.91), L3: mkt(L3, 0.09, 0.11)}
+        self.assertEqual(cm.price_check(LEGS, hi, T0, self.cfg)[0], "fair_range")      # 0.73 > 0.40
+        self.assertEqual(cm.price_check(LEGS, {L1: MK[L1]}, T0, self.cfg)[0], "no_market")
+
+    def test_quote_price_rounds_our_price_up(self):
+        self.assertEqual(cm.quote_price(0.20, self.cfg), (0.22, 0.78))
+        self.assertEqual(cm.quote_price(0.1234, self.cfg), (0.136, 0.864))           # 0.13574 -> 0.136
+
+    def test_contracts_and_caps(self):
+        self.assertAlmostEqual(cm.contracts_of({"tc": "10.0000"}, 0.25), 40.0)
+        self.assertAlmostEqual(cm.contracts_of({"tc": None, "cn": "120.00"}, 0.25), 120.0)
+        b = cm.Book()
+        day = cm.et_day(T0)
+        self.assertIsNone(cm.caps_check(b, ["g1", "g2"], 100, 0.25, self.cfg, day))
+        self.assertEqual(cm.caps_check(b, ["g1"], 1.0, 0.25, self.cfg, day), "dust")      # $0.25 premium
+        self.assertEqual(cm.caps_check(b, ["g1"], 151, 0.25, self.cfg, day), "payout_cap")
+        b.tickets = [{"status": "executed", "contracts": 150, "ask": 0.25, "games": ["g1"], "day": day},
+                     {"status": "executed", "contracts": 140, "ask": 0.25, "games": ["g1", "g3"], "day": day}]
+        self.assertEqual(cm.caps_check(b, ["g1"], 20, 0.25, self.cfg, day), "game_cap")   # 290 + 20 > 300
+        self.assertIsNone(cm.caps_check(b, ["g2"], 100, 0.25, self.cfg, day))
+        b.tickets.append({"status": "confirmed", "contracts": 150, "ask": 0.05, "games": ["g9"], "day": day})
+        # open loss 150*.75 + 140*.75 + 150*.95 = 360; +100*.75 = 435 > 400
+        self.assertEqual(cm.caps_check(b, ["g2"], 100, 0.25, self.cfg, day), "loss_cap")
+        b.tickets = [{"status": "settled", "contracts": 1, "ask": 0.5, "games": [], "day": day}] * 30
+        self.assertEqual(cm.caps_check(b, ["g2"], 10, 0.25, self.cfg, day), "ticket_cap")
+
+
+class MakerFlow(unittest.TestCase):
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.clock = [T0]
+        self.w = W()
+
+    def tearDown(self):
+        self.d.cleanup()
+
+    def maker(self, live, client=None, **kw):
+        self.client = client or FakeClient(MK)
+        cfg = cm.Config(live=live, **kw)
+        self.book = cm.Book(os.path.join(self.d.name, "state.json"))
+        return cm.Maker(self.client, cfg, self.w, self.book, self.d.name, clock=lambda: self.clock[0])
+
+    def test_dry_prices_and_logs_but_sends_nothing(self):
+        m = self.maker(live=False)
+        m.handle(rfq_msg())
+        wq = self.w.k("would_quote")
+        self.assertEqual(len(wq), 1)
+        self.assertAlmostEqual(wq[0]["fair"], FAIR)
+        self.assertEqual((wq[0]["ask"], wq[0]["no_bid"]), (0.231, 0.769))
+        self.assertEqual(self.client.posts, [])
+
+    def test_live_quote_then_last_look_confirm(self):
+        m = self.maker(live=True)
+        m.handle(rfq_msg())
+        path, body = self.client.posts[0]
+        self.assertEqual(path, "/communications/quotes")
+        self.assertEqual(body, {"rfq_id": "r1", "yes_bid": "0", "no_bid": "0.7690", "rest_remainder": False})
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1",
+                                                      "no_bid_dollars": "0.7690", "accepted_side": "yes",
+                                                      "contracts_accepted_fp": "43.29"}})
+        self.assertEqual(self.client.puts, [FakeClient.host + "/communications/rfqs/r1/quotes/q1/confirm"])
+        t = self.book.tickets[0]
+        self.assertEqual((t["status"], t["ask"], t["contracts"]), ("confirmed", 0.231, 43.29))
+        # the fill, then the side read back: NO, as intended
+        m.handle({"type": "quote_executed", "msg": {"quote_id": "q1", "order_id": "o1"}})
+        self.clock[0] += 5
+        m.upkeep()
+        self.assertTrue(self.book.tickets[0]["dir_ok"])
+        self.assertFalse(os.path.exists(os.path.join(self.d.name, cm.STOP_NAME)))
+
+    def test_last_look_declines_when_the_legs_moved(self):
+        m = self.maker(live=True)
+        m.handle(rfq_msg())
+        self.client.mk[L1] = mkt(L1, 0.65, 0.67)       # fair 0.66 x .5 x .7 = 0.231: edge gone
+        self.clock[0] += 1
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
+        self.assertEqual(self.client.puts, [])
+        self.assertEqual(self.w.k("decline")[0]["why"], "edge_gone")
+        self.assertEqual(self.book.tickets, [])
+
+    def test_a_yes_position_writes_stop_and_exits(self):
+        m = self.maker(live=True, client=FakeClient(MK, position=+43.0))
+        m.handle(rfq_msg())
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
+        m.handle({"type": "quote_executed", "msg": {"quote_id": "q1", "order_id": "o1"}})
+        self.clock[0] += 5
+        with self.assertRaises(SystemExit) as cx:
+            m.upkeep()
+        self.assertEqual(cx.exception.code, 5)
+        self.assertTrue(os.path.exists(os.path.join(self.d.name, cm.STOP_NAME)))
+
+    def test_a_stale_rfq_is_skipped_before_any_read(self):
+        m = self.maker(live=True)
+        msg = rfq_msg()
+        msg["msg"]["created_ts"] = iso(T0 - 5.0)          # 5 s old: other makers answered long ago
+        m.handle(msg)
+        self.assertEqual((self.client.posts, self.client.gets), ([], []))
+        self.assertEqual(m.st["why"].get("stale"), 1)
+
+    def test_other_makers_quotes_and_unknown_accepts_are_ignored(self):
+        m = self.maker(live=True)
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "not-ours", "rfq_id": "rX"}})
+        self.assertEqual((self.client.puts, self.book.tickets), ([], []))
+
+    def test_rate_and_read_caps(self):
+        m = self.maker(live=False, max_quotes_per_min=2)
+        for i in range(4):
+            m.handle(rfq_msg(rid=f"r{i}"))
+        self.assertEqual(len(self.w.k("would_quote")), 2)
+        self.assertEqual(m.st["why"].get("rate_cap"), 2)
+
+    def test_state_survives_a_restart(self):
+        m = self.maker(live=True)
+        m.handle(rfq_msg())
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
+        again = cm.Book(os.path.join(self.d.name, "state.json"))
+        self.assertEqual(len(again.open()), 1)
+        self.assertAlmostEqual(again.open_loss(), 10 / 0.231 * (1 - 0.231), places=6)   # $10 at 23.1c
+
+    def test_settlement_frees_the_exposure(self):
+        m = self.maker(live=True)
+        m.handle(rfq_msg())
+        m.handle({"type": "quote_accepted", "msg": {"quote_id": "q1", "rfq_id": "r1", "no_bid_dollars": "0.7690"}})
+        m.handle({"type": "quote_executed", "msg": {"quote_id": "q1", "order_id": "o1"}})
+        self.client.mk["KXMVECROSSCATEGORY-S2026X-Y"] = {"ticker": "KXMVECROSSCATEGORY-S2026X-Y", "result": "no"}
+        m.settle()
+        t = self.book.tickets[0]
+        self.assertEqual(t["status"], "settled")
+        self.assertAlmostEqual(t["pnl"], 10.0 - t["fee_est"])        # kept the $10 premium, less the fee
+        self.assertAlmostEqual(t["fee_est"], 0.035 * (10 / 0.231) * 0.231 * 0.769)
+        self.assertEqual(self.book.open(), [])
+
+
+class RunGuards(unittest.TestCase):
+    def test_stop_file_and_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, cm.STOP_NAME), "w").close()
+            self.assertEqual(cm.run(cm.Config(), 1.0, out_dir=d, url="wss://unused.invalid"), 3)
+            os.remove(os.path.join(d, cm.STOP_NAME))
+            held = cm.lock_file(d)
+            try:
+                self.assertEqual(cm.run(cm.Config(), 1.0, out_dir=d, url="wss://unused.invalid"), 4)
+            finally:
+                held.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

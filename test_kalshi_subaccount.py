@@ -68,5 +68,33 @@ class TestSubaccountHelper(unittest.TestCase):
         self.assertEqual(c.gets[-1], ("/portfolio/balance", {"subaccount": 1}))
 
 
+class TestShardMove(unittest.TestCase):
+    """2026-11-05, the combo maker pilot: combos trade on exchange shard 1, so
+    the owner moves primary cash there by hand (typed MOVE)."""
+
+    def test_shard_body_is_in_centicents(self):
+        b = ks.shard_body(0, 1, 300)
+        self.assertEqual(b, {"source": "event_contract", "destination": "event_contract",
+                             "amount": 3000000, "source_exchange_shard": 0,
+                             "destination_exchange_shard": 1})
+        with self.assertRaises(ValueError):
+            ks.shard_body(0, 1, 0)
+        with self.assertRaises(ValueError):
+            ks.shard_body(1, 1, 5)
+
+    def test_shard_move_needs_the_word_and_reads_the_shards(self):
+        c = FakeClient()
+        self.assertEqual(ks.main(["shard", "300", "--to", "1"], c=c, ask=lambda p: "yes"), 1)
+        self.assertEqual(c.posts, [])
+        self.assertEqual(ks.main(["shard", "300", "--to", "1"], c=c, ask=lambda p: "MOVE"), 0)
+        path, body = c.posts[-1]
+        self.assertEqual(path, "/portfolio/intra_exchange_instance_transfer")
+        self.assertEqual((body["source_exchange_shard"], body["destination_exchange_shard"],
+                          body["amount"]), (0, 1, 3000000))
+        self.assertEqual(ks.shard_balances(c), {0: 18373.1369})
+        self.assertEqual(ks.main(["shards"], c=c), 0)          # read-only, no post
+        self.assertEqual(len(c.posts), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

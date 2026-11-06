@@ -11,6 +11,9 @@ steps: no bot calls this, and every write asks for a typed confirmation.
     python kalshi_subaccount.py fund 1 300        # $300 primary -> subaccount 1
     python kalshi_subaccount.py withdraw 1 300    # $300 subaccount 1 -> primary
     python kalshi_subaccount.py transfers         # the transfer history
+    python kalshi_subaccount.py shards            # the primary's cash by exchange shard (read-only)
+    python kalshi_subaccount.py shard 300 --to 1  # $300 primary shard 0 -> shard 1 (combos)
+    python kalshi_subaccount.py shard 300 --from 1 --to 0   # ...and back
 
 Kalshi's production host (external-api.kalshi.com), the account key that
 kalshi_reads signs with. Transfers move cash on exchange shard 0, where the
@@ -46,6 +49,28 @@ def balance(c: Any, n: int) -> float:
     return float(js.get("balance_dollars") or 0.0)
 
 
+def shard_balances(c: Any) -> dict:
+    """The primary account's cash by exchange shard {index: dollars} (0
+    default, 1 combos, 2 crypto & commodities, 3 tennis / baseball /
+    basketball)."""
+    js = c.get("/portfolio/balance", {})
+    return {int(r.get("exchange_index")): float(r.get("balance") or 0.0)
+            for r in js.get("balance_breakdown") or []}
+
+
+def shard_body(src: int, dst: int, dollars: float) -> dict:
+    """POST /portfolio/intra_exchange_instance_transfer: primary cash from
+    one exchange shard to another, in centicents ($1 = 10,000). Added
+    2026-11-05 for the combo maker pilot (combos trade on shard 1)."""
+    amount = int(round(dollars * 10000))
+    if amount <= 0:
+        raise ValueError("the amount must be positive")
+    if src == dst:
+        raise ValueError("from and to are the same shard")
+    return {"source": "event_contract", "destination": "event_contract", "amount": amount,
+            "source_exchange_shard": int(src), "destination_exchange_shard": int(dst)}
+
+
 def transfer_body(src: int, dst: int, dollars: float) -> dict:
     cents = int(round(dollars * 100))
     if cents <= 0:
@@ -65,6 +90,11 @@ def main(argv: Optional[list] = None, c: Any = None,
     b.add_argument("n", type=int)
     sp.add_parser("create")
     sp.add_parser("transfers")
+    sp.add_parser("shards")
+    sh = sp.add_parser("shard")
+    sh.add_argument("dollars", type=float)
+    sh.add_argument("--to", type=int, required=True, dest="to_shard")
+    sh.add_argument("--from", type=int, default=0, dest="from_shard")
     for name in ("fund", "withdraw"):
         p = sp.add_parser(name)
         p.add_argument("n", type=int)
@@ -77,6 +107,20 @@ def main(argv: Optional[list] = None, c: Any = None,
         return 0
     if args.cmd == "transfers":
         print(json.dumps(c.get("/portfolio/subaccounts/transfers", {}), indent=1))
+        return 0
+    if args.cmd == "shards":
+        for k, v in sorted(shard_balances(c).items()):
+            print(f"shard {k}: ${v:,.2f}")
+        return 0
+    if args.cmd == "shard":
+        body = shard_body(args.from_shard, args.to_shard, args.dollars)
+        if not confirm(f"Move ${args.dollars:,.2f} of PRIMARY cash from exchange shard "
+                       f"{args.from_shard} to shard {args.to_shard}?", "MOVE", ask):
+            print("nothing moved")
+            return 1
+        js = c.post(path="/portfolio/intra_exchange_instance_transfer", body=json.dumps(body))
+        print(f"moved ${args.dollars:,.2f}: {json.dumps(js)[:300]}")
+        print("shards now: " + ", ".join(f"{k} ${v:,.2f}" for k, v in sorted(shard_balances(c).items())))
         return 0
     if args.cmd == "create":
         if not confirm("Create a new numbered Kalshi subaccount on this account?",
