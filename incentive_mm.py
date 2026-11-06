@@ -20828,6 +20828,22 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                         f"down (fail closed)")
         else:
             pre = start - timedelta(days=ov.pre_event_days)
+            # KALSHI'S OCCURRENCE IS NOT THE REVEAL (2026-11-06, with the
+            # 1-day rule). A table-only family is dated by verified rows,
+            # never by Kalshi (Jack: two sources, not Kalshi's date), yet the
+            # cutoff that came in is trade_cutoff_utc's min() over Kalshi's
+            # occurrence_datetime. That one is stale on the one-series Grammy
+            # nominees: Nov 2 04:59Z on 134 markets Kalshi relit 11/06 to
+            # 11/13 for the Nov 16 nominations. The 15-day rule (out Nov 1)
+            # hid it; at 1 day it kept them dark. So a cutoff that IS the
+            # market's occurrence gives way to the row; anything else that
+            # came in earlier (a hand start on file, a resolver start, a
+            # series tightener) still wins below. No market object -> the
+            # occurrence stays, the safe direction.
+            occ = (parse_iso_utc(market.get("occurrence_datetime", ""))
+                   if isinstance(market, dict) else None)
+            if ov.pre_event_dates_only and occ is not None and cutoff == occ:
+                cutoff = None
         cutoff = pre if cutoff is None else min(cutoff, pre)
     if election_series(series):
         # ELECTION DAY (see ELECTION_DATES): out at the start of the VERIFIED

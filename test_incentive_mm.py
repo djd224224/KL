@@ -30319,6 +30319,30 @@ class TestAwardsByKalshiTag(unittest.TestCase):
                 "KXGRAMMYNOM", ev, None, close_time=None, market=self.GRN),
                 utc(2026, 11, 15, 5, 0), ev)
             self.assertNotIn(ev, imm._config_gaps, ev)
+            # 2026-11-06: the cutoff the producers pass in is
+            # trade_cutoff_utc's, i.e. Kalshi's stale Nov 2 04:59Z
+            # occurrence -- the row replaces it (134 markets were dark on it)
+            occ = imm.trade_cutoff_utc(
+                ev, utc(2026, 11, 2, 4, 59), utc(2027, 11, 1, 15, 0))
+            self.assertEqual(occ, utc(2026, 11, 2, 4, 59), ev)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGRAMMYNOM", ev, occ, close_time=None, market=self.GRN),
+                utc(2026, 11, 15, 5, 0), ev)
+            # ...but any other earlier cutoff (a hand start on file) stands,
+            # and with no market object the occurrence stays (fail safe)
+            hand = utc(2026, 11, 10, 12, 0)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGRAMMYNOM", ev, hand, close_time=None, market=self.GRN),
+                hand, ev)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGRAMMYNOM", ev, occ, close_time=None, market=None), occ, ev)
+        # a family that is NOT table-only keeps Kalshi's occurrence
+        with mock.patch.object(imm, "SERIES_OVERRIDES", dict(imm.SERIES_OVERRIDES)):
+            imm.SERIES_OVERRIDES["KXGRAMMYNOM"] = imm.replace(
+                imm.SERIES_OVERRIDES["KXGRAMMYNOM"], pre_event_dates_only=False)
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXGRAMMYNOM", "KXGRAMMYNOM-69BDPR", utc(2026, 11, 2, 4, 59),
+                close_time=None, market=self.GRN), utc(2026, 11, 2, 4, 59))
         # the next edition has no row: stood down, a gap for the research
         self.assertEqual(imm.apply_series_cutoff_adjustments(
             "KXGRAMMYNOM", "KXGRAMMYNOM-70BPDGP", None, close_time=None,
