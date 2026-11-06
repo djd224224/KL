@@ -3575,18 +3575,25 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 "=KXART:3,"
                                                 # award shows (2026-09-25);
                                                 # the Oscars are a prefix
-                                                # FAMILY (KXOSCAR<CATEGORY>)
-                                                "=KXGGNOM:3,=KXNATBOOKAWARDS:3,"
-                                                "=KXGRAMMY:3,=KXVMA:3,KXOSCAR:3,"
+                                                # FAMILY (KXOSCAR<CATEGORY>).
+                                                # 5 per event since
+                                                # 2026-11-06 (Jack: "open
+                                                # up to 5 event cap"; 3
+                                                # from 9/25), every award
+                                                # family below and the
+                                                # tag-enrolled members
+                                                # (AWARDS_AUTO_EVENT_TOP_N)
+                                                "=KXGGNOM:5,=KXNATBOOKAWARDS:5,"
+                                                "=KXGRAMMY:5,=KXVMA:5,KXOSCAR:5,"
                                                 # Critics Choice, a prefix
                                                 # FAMILY (2026-10-06)
-                                                "KXCRITICS:3,"
+                                                "KXCRITICS:5,"
                                                 # Grammy nominees, a pattern
                                                 # FAMILY (2026-10-07)
-                                                "KXGRAMMYNOM:3,"
+                                                "KXGRAMMYNOM:5,"
                                                 # CMA Awards, the awards
                                                 # rules since 2026-10-12
-                                                "=KXCMA:3,"
+                                                "=KXCMA:5,"
                                                 # OpenRouter token usage
                                                 # UNCAPPED (Jack 2026-09-29:
                                                 # "remove the 3-strike cap on
@@ -3714,7 +3721,7 @@ def event_top_n_for(series: str) -> int:
         return _scaled_top_n(SCAN_GRADUATE_EVENT_TOP_N)
     if awards_auto_rules(series):
         # an awards family member by Kalshi tag (2026-10-12): the award
-        # shows' 3 per event
+        # shows' cap (5 per event since 2026-11-06)
         return _scaled_top_n(AWARDS_AUTO_EVENT_TOP_N)
     return 0
 
@@ -6353,7 +6360,9 @@ AWARDS_EXTRA_FILE = "awards_extra_series.json"          # in STATUS_DIR
 # "KXOSCAR" and "KXCRITICS" are); its override is registered beside
 # AWARDS_SERIES, where AWARDS_PRE_EVENT_DAYS is known
 AWARDS_AUTO_PARENT = "KXAWARDSAUTO"
-AWARDS_AUTO_EVENT_TOP_N = _env_int("IMM_AWARDS_AUTO_EVENT_TOP_N", 3)
+# 5 since 2026-11-06 (Jack: "open up to 5 event cap"), with the award
+# shows' EVENT_TOP_N entries; 3 from 2026-10-12
+AWARDS_AUTO_EVENT_TOP_N = _env_int("IMM_AWARDS_AUTO_EVENT_TOP_N", 5)
 AWARDS_EXCLUDE = frozenset(
     s.strip() for s in os.environ.get("IMM_AWARDS_EXCLUDE", "").split(",")
     if s.strip())

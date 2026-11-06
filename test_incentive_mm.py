@@ -1862,7 +1862,7 @@ class TestScreen(unittest.TestCase):
             imm.SERIES_OVERRIDES.pop(s, None)
         try:
             for s in names:
-                self.assertEqual(imm.event_top_n_for(s), 3, s)
+                self.assertEqual(imm.event_top_n_for(s), 5, s)
                 imm.ensure_family_override(s)
                 ov = imm.series_override(s)
                 self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
@@ -1956,7 +1956,7 @@ class TestScreen(unittest.TestCase):
             imm.SERIES_OVERRIDES.pop(s, None)
         try:
             for s in ("KXCRITICSCHOICENOM",) + grammy:
-                self.assertEqual(imm.event_top_n_for(s), 3, s)
+                self.assertEqual(imm.event_top_n_for(s), 5, s)
                 imm.ensure_family_override(s)
                 ov = imm.series_override(s)
                 self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
@@ -2010,7 +2010,7 @@ class TestScreen(unittest.TestCase):
                 imm._release_guard_warned.discard(ev)
                 imm._config_gaps.pop(ev, None)
 
-    def test_award_shows_three_per_event_and_one_day_stand_down(self):
+    def test_award_shows_five_per_event_and_one_day_stand_down(self):
         # Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS, KXGRAMMY,
         # KXOSCAR, KXVMA. max 3 markets per event, and do not quote within
         # 1 month of when the event starts". Market objects as Kalshi served
@@ -2172,7 +2172,7 @@ class TestScreen(unittest.TestCase):
             imm.ALLOWLIST_ONLY = prev_only
         for s in ("KXGGNOM", "KXNATBOOKAWARDS", "KXGRAMMY", "KXVMA",
                   "KXOSCARPIC", "KXOSCARINTLFILM", "KXOSCARSVIEWER"):
-            self.assertEqual(imm.event_top_n_for(s), 3, s)
+            self.assertEqual(imm.event_top_n_for(s), 5, s)
         for s in ("KXGRAMMYWINNERS", "KXVMAPOP", "KXOSCARMENTION",
                   "KXTRUMPMENTION", "KXGGWIN"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
@@ -2556,7 +2556,7 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
         self.assertEqual((ov.safe_join, ov.pre_event_days, ov.pre_event_dates_only),
                          (True, 1.0, True))
         self.assertIsNone(ov.size_mult)
-        self.assertEqual(imm.event_top_n_for("KXCMA"), 3)
+        self.assertEqual(imm.event_top_n_for("KXCMA"), 5)
         self.assertEqual(imm.event_top_n_for("KXCMAX"), 0)   # exact entry
 
     def test_no_event_window_standdown_does_not_reach_them(self):
@@ -30308,7 +30308,7 @@ class TestAwardsByKalshiTag(unittest.TestCase):
                 self.assertFalse(IncentiveMarketMaker._blocked(t), t)
             # the nomination count ladders still are not
             self.assertFalse(IncentiveMarketMaker._allowed("KXGRAMMYNOMCOUNTKL-69-T10"))
-        self.assertEqual(imm.event_top_n_for("KXGRAMMYNOM"), 3)
+        self.assertEqual(imm.event_top_n_for("KXGRAMMYNOM"), 5)
         ov = imm.series_override("KXGRAMMYNOM")
         self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join),
                          (1.0, True, True))
@@ -30392,12 +30392,12 @@ class TestAwardsByKalshiTag(unittest.TestCase):
             self.assertFalse(IncentiveMarketMaker._allowed("KXOSCARAWARDACTR-27-X"))
         for s in ("KXGRAMAOTY", "KXTONYPLAY"):
             imm.SERIES_OVERRIDES.pop(s, None)
-            self.assertEqual(imm.event_top_n_for(s), 3, s)      # before inheriting
+            self.assertEqual(imm.event_top_n_for(s), 5, s)      # before inheriting
             imm.ensure_family_override(s)
             ov = imm.series_override(s)
             self.assertEqual((ov.pre_event_days, ov.pre_event_dates_only, ov.safe_join,
                               ov.size_mult), (1.0, True, True, None), s)
-            self.assertEqual(imm.event_top_n_for(s), 3, s)
+            self.assertEqual(imm.event_top_n_for(s), 5, s)
         # KXGRAMAOTY-69 (the 69th's Album of the Year winner): the Nov 16
         # nominations are its first narrowing -> out Nov 15, not at the show
         self.assertEqual(imm.apply_series_cutoff_adjustments(
