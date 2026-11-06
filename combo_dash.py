@@ -461,9 +461,9 @@ def ticket_value(t: dict, markets) -> float:
 
 
 def pnl_parts(open_t, settled, markets) -> dict:
-    """Total = premiums + trading - fees, split settled / unrealized.
-    Premiums: what we sold over fair at the quote, contracts x (our price - the
-    legs' mid product then). Trading: how the parlay moved since, contracts x
+    """Total = edge at sale + trading - fees, split settled / unrealized.
+    Edge at sale ("premium" in the data): what we sold over fair at the quote,
+    contracts x (our price - the legs' mid product then). Trading: how the parlay moved since, contracts x
     (fair then - fair now), or x (fair then - payout) once settled. An open
     ticket with a leg unpriced stays at its quote's fair (no trading yet)."""
     out = {"premium": 0.0, "trading": 0.0, "fees": 0.0, "settled": 0.0, "unrealized": 0.0,
@@ -659,7 +659,7 @@ def _mid_at(points, t: float):
 
 def pnl_series(filled, leg_hist: dict, markets: dict, settle_ts: dict, now: float,
                step: float = HISTORY_STEP_S) -> list:
-    """Premiums, trading, fees and total at every step from the first fill: each
+    """Edge at sale, trading, fees and total at every step from the first fill: each
     ticket from its fill on, its parlay valued at its legs' candle mids then (1 / 0
     once a leg has a result and no later candle; a settled ticket at its payout from
     its settlement on); before a leg's first candle the ticket sits at its quote fair."""
@@ -797,7 +797,7 @@ class HistoryReads:
 
 CHART_W, CHART_H = 1100, 230
 CM_L, CM_R, CM_T, CM_B = 64, 132, 12, 26
-SERIES = (("total", "Total", "--s1"), ("premium", "Premiums", "--s2"), ("trading", "Trading", "--s3"))
+SERIES = (("total", "Total", "--s1"), ("premium", "Edge at sale", "--s2"), ("trading", "Trading", "--s3"))
 
 
 def _nice_step(span: float, n: int = 4) -> float:
@@ -856,7 +856,7 @@ def _axes(t0, t1, lo, hi, X, Y, money_ticks=True) -> list:
 
 
 def chart_pnl(points: list) -> str:
-    """Total, premiums and trading over time: one $ axis, a legend with line keys,
+    """Total, edge at sale and trading over time: one $ axis, a legend with line keys,
     end labels (moved apart with a leader when they would collide), a crosshair
     tooltip, and a table view below."""
     if len(points) < 2:
@@ -871,7 +871,7 @@ def chart_pnl(points: list) -> str:
     X = lambda t: CM_L + (t - t0) / max(t1 - t0, 1.0) * (CHART_W - CM_L - CM_R)       # noqa: E731
     Y = lambda v: CM_T + (hi - v) / max(hi - lo, 1e-9) * (CHART_H - CM_T - CM_B)      # noqa: E731
     g = [f"<svg id='pnl-svg' class='viz' viewBox='0 0 {CHART_W} {CHART_H}' role='img' "
-         f"aria-label='P&amp;L over time: total, premiums and trading'>"]
+         f"aria-label='P&amp;L over time: total, edge at sale and trading'>"]
     g += _axes(t0, t1, lo, hi, X, Y)
     ends = []
     for key, label, var in reversed(SERIES):                # Total drawn last, on top
@@ -902,8 +902,8 @@ def chart_pnl(points: list) -> str:
     rows = "".join(f"<tr><td class='small'>{tm(p['t'])}</td>" + "".join(
         f"<td class='n'>{signed(p[k])}</td>" for k, _, _ in SERIES) + f"<td class='n'>{signed(-p['fees'])}</td></tr>"
         for p in points[::max(1, len(points) // 48)] + ([points[-1]] if len(points) > 48 else []))
-    return (f"<div class='legend small'>{legend}<span class='muted'>fees are the gap: total = premiums + trading "
-            f"&minus; fees</span></div><div class='vizbox'>{''.join(g)}</div>"
+    return (f"<div class='legend small'>{legend}<span class='muted'>fees are the gap: total = edge at sale + "
+            f"trading &minus; fees</span></div><div class='vizbox'>{''.join(g)}</div>"
             f"<script type='application/json' id='pnl-data'>{json.dumps(data)}</script>"
             f"<details class='small'><summary>P&amp;L series as a table</summary><div class='tw'><table><tr><th>ET</th>"
             + "".join(f"<th class='n'>{html.escape(label)}</th>" for _, label, _ in SERIES)
@@ -911,7 +911,7 @@ def chart_pnl(points: list) -> str:
 
 
 def chart_fills(fills: list, t0: float, t1: float) -> str:
-    """One dot per fill: when (x), premium taken in (y); tooltip per dot. The
+    """One dot per fill: when (x), what we collected (y); tooltip per dot. The
     fills table further down is its table view."""
     if not fills:
         return "<div class='empty'>No fills yet.</div>"
@@ -922,7 +922,7 @@ def chart_fills(fills: list, t0: float, t1: float) -> str:
     X = lambda t: CM_L + (t - t0) / max(t1 - t0, 1.0) * (CHART_W - CM_L - CM_R)       # noqa: E731
     Y = lambda v: CM_T + (hi - v) / max(hi, 1e-9) * (CHART_H - CM_T - CM_B)           # noqa: E731
     g = [f"<svg id='fill-svg' class='viz' viewBox='0 0 {CHART_W} {CHART_H}' role='img' "
-         f"aria-label='Fills over time: premium taken in per fill'>"]
+         f"aria-label='Fills over time: what we collected per fill'>"]
     g += _axes(t0, t1, 0.0, hi, X, Y)
     data = []
     for i, f in enumerate(fills):
@@ -993,7 +993,7 @@ CHART_JS = """
       var q = pts[best];
       cross.setAttribute('x1', q.x); cross.setAttribute('x2', q.x); cross.setAttribute('visibility', 'visible');
       clear(); line(q.when + ' ET', 'when');
-      row(money(q.total), 'Total', '--s1'); row(money(q.premium), 'Premiums', '--s2');
+      row(money(q.total), 'Total', '--s1'); row(money(q.premium), 'Edge at sale', '--s2');
       row(money(q.trading), 'Trading', '--s3'); row(money(-q.fees), 'Fees', null);
       place(ev);
     }
@@ -1006,7 +1006,7 @@ CHART_JS = """
     function show(el, ev) {
       var f = fills[+el.getAttribute('data-i')]; if (!f) return;
       clear(); line(f.when + ' ET \\u00b7 ' + f.state, 'when');
-      row('$' + f.premium.toFixed(2), 'premium in', null);
+      row('$' + f.premium.toFixed(2), 'collected', null);
       row(f.ask.toFixed(1) + '\\u00a2 x ' + f.contracts, 'our price x contracts', null);
       row('$' + f.lose.toFixed(2), 'can lose', null);
       line(f.legs);
@@ -1062,7 +1062,7 @@ def render(s: dict) -> str:
     H.append(f"<div class='card'><div class='l'>Combo shard cash</div><div class='v'>{usd(k.get('cash'))}</div>"
              f"<div class='l'>{'Kalshi ' + tm(k['at']) if k.get('at') else 'not read yet'}</div></div>")
     H.append(f"<div class='card'><div class='l'>Open tickets</div><div class='v'>{len(s['open'])}</div>"
-             f"<div class='l'>can lose {usd(s['open_loss'])} &middot; premium {usd(s['open_premium'])}</div></div>")
+             f"<div class='l'>can lose {usd(s['open_loss'])} &middot; collected {usd(s['open_premium'])}</div></div>")
     H.append(f"<div class='card'><div class='l'>Fees on combo fills</div><div class='v'>{usd(s['fees'])}</div>"
              f"<div class='l'>{len(s['fills'])} fills recorded by Kalshi</div></div>")
     fr = s.get("fill_rate") or {}
@@ -1086,19 +1086,19 @@ def render(s: dict) -> str:
         H.append(f"<div class='card'><div class='l'>Unrealized</div><div class='v'>{signed(pl.get('unrealized'))}</div>"
                  f"<div class='l'>{len(s['open'])} open at the legs' mids now"
                  + (f" &middot; {pl['unpriced']} unpriced" if pl.get("unpriced") else "") + "</div></div>")
-        H.append(f"<div class='card'><div class='l'>Premiums</div><div class='v'>{signed(pl.get('premium'))}</div>"
-                 f"<div class='l'>sold over fair at the quote, on {usd(pl.get('collected'))} of premium</div></div>")
+        H.append(f"<div class='card'><div class='l'>Edge at sale</div><div class='v'>{signed(pl.get('premium'))}</div>"
+                 f"<div class='l'>our price over the fair when we sold, on {usd(pl.get('collected'))} collected</div></div>")
         H.append(f"<div class='card'><div class='l'>Trading</div><div class='v'>{signed(pl.get('trading'))}</div>"
                  f"<div class='l'>the parlays' moves since the sale (payouts once settled)</div></div>")
         H.append(f"<div class='card'><div class='l'>Fees</div><div class='v'>{signed(-(pl.get('fees') or 0.0))}</div>"
-                 f"<div class='l'>total = premiums + trading &minus; fees</div></div>")
+                 f"<div class='l'>total = edge at sale + trading &minus; fees</div></div>")
         H.append("</div>")
     fp = s.get("fill_points") or []
     if fp:
         ser = s.get("series") or []
         H.append("<h2>P&amp;L over time</h2>" + chart_pnl(ser))
         H.append(f"<h2>Fills over time <span class='muted small'>{len(fp)} fills, "
-                 f"{usd(sum(f['premium'] for f in fp))} of premium in; a dot is one fill, its height the premium"
+                 f"{usd(sum(f['premium'] for f in fp))} collected; a dot is one fill, its height what we collected"
                  f"</span></h2>" + chart_fills(fp, (ser[0]['t'] if ser else fp[0]['t']), s['now']))
         if s.get("history_error"):
             H.append(f"<div class='small muted'>price history: {html.escape(str(s['history_error']))}</div>")
@@ -1123,12 +1123,12 @@ def render(s: dict) -> str:
     if p and p.get("secs"):
         H.append(f"<div class='small muted'>The whole market, last minute: ~{p.get('rfq', 0) * (p.get('shard') or [50])[0] / p['secs']:,.0f} "
                  f"RFQs/s, {p.get('mve_prints', 0) / p['secs']:.0f} combo fills/s, "
-                 f"{usd(p.get('mve_usd', 0) / p['secs'] * 60, 0)} of premium a minute.</div>")
+                 f"takers paid {usd(p.get('mve_usd', 0) / p['secs'] * 60, 0)} a minute.</div>")
     H.append("</div>")
     H.append(f"<h2>Open tickets ({len(s['open'])})</h2><div class='tw'>")
     if s["open"]:
         H.append("<table><tr><th>Confirmed</th><th>Legs (we sold the parlay)</th><th class='n'>Our price</th>"
-                 "<th class='n'>Fair (quote &rarr; confirm)</th><th class='n'>Contracts</th><th class='n'>Premium</th>"
+                 "<th class='n'>Fair (quote &rarr; confirm)</th><th class='n'>Contracts</th><th class='n'>Collected</th>"
                  "<th class='n'>Can lose</th><th class='n'>Fair now</th><th class='n'>P&amp;L now</th><th>Status</th></tr>")
         mk = k.get("markets") or {}
         for t in sorted(s["open"], key=lambda t: -t.get("at", 0)):

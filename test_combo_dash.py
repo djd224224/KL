@@ -185,7 +185,7 @@ class Pnl(unittest.TestCase):
         write_files(d.name)
         s = cd.snapshot(d.name, d.name, NOW)
         h = cd.render(s)
-        for label in ("Total", "Settled", "Unrealized", "Premiums", "Trading", "Fees", "P&amp;L now"):
+        for label in ("Total", "Settled", "Unrealized", "Edge at sale", "Trading", "Fees", "P&amp;L now"):
             self.assertIn(label, h)
 
 
@@ -261,7 +261,7 @@ class History(unittest.TestCase):
         self.assertEqual([round(f["premium"], 2) for f in fp], [36.0, 12.5])
         pts = d["series"] + [{"t": T0 + 1200, "premium": 3.5, "trading": -1.0, "fees": 0.3, "total": 2.2}]
         page = cd.chart_pnl(pts) + cd.chart_fills(fp, T0, T0 + 1200)
-        for needle in ("id='pnl-svg'", "id='fill-svg'", "Total +$2.20", "Premiums", "Trading", "pnl-data", "fill-data",
+        for needle in ("id='pnl-svg'", "id='fill-svg'", "Total +$2.20", "Edge at sale", "Trading", "pnl-data", "fill-data",
                        "P&amp;L series as a table", "class='dothit'"):
             self.assertIn(needle, page)
         self.assertIn("viz-tip", cd.CHART_JS)
@@ -577,6 +577,27 @@ class Task(unittest.TestCase):
         self.assertIn("Total of 1 &middot; the Unrealized card", page)
         self.assertIn("Total of 1 &middot; the Settled card", page)
         self.assertAlmostEqual(s["pnl"]["unrealized"], sum(t["_pnl"] for t in s["open"]))
+
+
+class Wording(unittest.TestCase):
+    """Jack 2026-11-06: "in the dash you use 'premiums' interchangably to mean different things and
+    it's confsing": collected (contracts x our price), edge at sale (over the fair), takers paid."""
+
+    def test_no_premium_on_the_visible_page(self):
+        import re
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        s = cd.snapshot(d.name, d.name, NOW, cd.KalshiReads(client_factory=FakeClient))
+        s["pulse"] = {"secs": 60.0, "rfq": 100, "shard": [5, 1], "mve_prints": 600, "mve_usd": 30000.0}
+        page = cd.render(s)
+        visible = re.sub(r"<script.*?</script>", "", page, flags=re.S | re.I)    # the data / JS keep their keys
+        self.assertNotIn("premium", visible.lower())
+        for want in ("Edge at sale", "collected", "<th class='n'>Collected</th>", "takers paid $30,000 a minute",
+                     "total = edge at sale + trading"):
+            self.assertIn(want, visible)
+        self.assertIn("'Edge at sale'", cd.CHART_JS)
+        self.assertIn("'collected'", cd.CHART_JS)
 
 
 if __name__ == "__main__":
