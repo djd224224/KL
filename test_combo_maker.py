@@ -1134,6 +1134,113 @@ class BookFair(unittest.TestCase):
                 cm.main(bad)
 
 
+def poly_market(mid, slug, question, outcomes, bid, ask, liq=50000.0, git=None):
+    return {"id": mid, "slug": slug, "question": question, "outcomes": json.dumps(outcomes), "bestBid": bid,
+            "bestAsk": ask, "liquidityNum": liq, "groupItemTitle": git, "acceptingOrders": True, "closed": False}
+
+
+class PolyFair(unittest.TestCase):
+    """Jack 2026-11-06: "use Polymarket as another fair so DraftKings + Polymarket + Kalshi"."""
+    EVE, COV = "KXEPLGAME-26NOV06EVECOV-EVE", "KXEPLGAME-26NOV06EVECOV-COV"
+    SUA = "KXUFCFIGHT-26NOV06SUAJAN-SUA"
+
+    def lines(self, eve=(0.62, 0.63), cov_liq=50000.0):
+        rows = {"epl": [poly_market("1", "epl-eve-cov-2026-11-06-eve", "Will Everton FC win?", ["Yes", "No"],
+                                    *eve, git="Everton FC"),
+                        poly_market("2", "epl-eve-cov-2026-11-06-cov", "Will Coventry City FC win?", ["Yes", "No"],
+                                    0.17, 0.18, liq=cov_liq, git="Coventry City FC")],
+                "ufc": [poly_market("3", "ufc-tat-vir-2026-11-07", "Suarez vs. Jandiroba",
+                                    ["Tatiana Suarez", "Virna Jandiroba"], 0.64, 0.65)]}
+        tags = {"epl": "306", "ufc": "279"}
+
+        def get(path, params):
+            if path.startswith("/tags/slug/"):
+                slug = path.rsplit("/", 1)[1]
+                return {"id": tags[slug]} if slug in tags else {}
+            return {v: k for k, v in tags.items()}.get(params.get("tag_id")) and rows[{v: k for k, v in tags.items()}[params["tag_id"]]] or []
+        pl = cm.cpl.PolyLines(get=get, clock=lambda: T0, log=lambda s: None)
+        pl.refresh(T0)
+        return pl
+
+    def maker(self, pl, legs_mk):
+        self.c = FakeClient(legs_mk)
+        self.w = W()
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        m = cm.Maker(self.c, cm.Config(live=True, markup_per_leg=0.0, poly_fair=True, max_book_gap=0.05,
+                                       min_legs=2, max_poly_spread=0.03, min_poly_liquidity=2000.0),
+                     self.w, cm.Book(os.path.join(d.name, "s.json")), d.name, clock=lambda: T0)
+        m.poly = pl
+        return m
+
+    def mk(self, eve_mid=0.60):
+        return {self.EVE: dict(mkt(self.EVE, eve_mid - 0.01, eve_mid + 0.01), yes_sub_title="Everton"),
+                L2: mkt(L2, 0.49, 0.51)}
+
+    def test_a_higher_polymarket_raises_the_fair(self):
+        m = self.maker(self.lines(eve=(0.62, 0.63)), self.mk(0.60))         # Kalshi 60, Polymarket 62.5
+        m.handle(rfq_msg(legs=[[self.EVE, "yes"], [L2, "yes"]]))
+        q = self.w.k("quote")[0]
+        self.assertAlmostEqual(q["fair"], 0.625 * 0.50)
+        self.assertAlmostEqual(q["fair_k"], 0.60 * 0.50)
+
+    def test_lower_keeps_kalshi_and_a_gap_skips(self):
+        m = self.maker(self.lines(eve=(0.57, 0.58)), self.mk(0.60))
+        m.handle(rfq_msg(legs=[[self.EVE, "yes"], [L2, "yes"]]))
+        self.assertAlmostEqual(self.w.k("quote")[0]["fair"], 0.30)
+        self.assertNotIn("fair_k", self.w.k("quote")[0])
+        m = self.maker(self.lines(eve=(0.69, 0.70)), self.mk(0.60))         # 9.5 points apart
+        m.handle(rfq_msg(legs=[[self.EVE, "yes"], [L2, "yes"]]))
+        self.assertEqual(self.c.posts, [])
+        self.assertEqual(m.st["why"]["poly_gap"], 1)
+
+    def test_a_thin_book_does_not_count(self):
+        m = self.maker(self.lines(eve=(0.55, 0.70)), self.mk(0.60))         # 15c wide: ignored
+        m.handle(rfq_msg(legs=[[self.EVE, "yes"], [L2, "yes"]]))
+        self.assertAlmostEqual(self.w.k("quote")[0]["fair"], 0.30)
+
+
+class PolyLinesMatch(unittest.TestCase):
+    def pl(self, rows):
+        def get(path, params):
+            if path.startswith("/tags/slug/"):
+                return {"id": "1"} if path.endswith(("/ufc", "/la-liga")) else {}
+            return rows
+        p = cm.cpl.PolyLines(get=get, clock=lambda: T0, log=lambda s: None)
+        p.refresh(T0)
+        return p
+
+    def test_soccer_by_slug_draw_and_name(self):
+        rows = [poly_market("1", "lal-sev-ala-2026-11-06-sev", "Will Sevilla FC win?", ["Yes", "No"], 0.49, 0.50,
+                            git="Sevilla FC"),
+                poly_market("2", "lal-sev-ala-2026-11-06-draw", "Draw?", ["Yes", "No"], 0.29, 0.30,
+                            git="Draw (Sevilla FC vs. Deportivo Alaves)"),
+                poly_market("3", "lal-sev-ala-2026-11-06-ala", "Will Alaves win?", ["Yes", "No"], 0.20, 0.21,
+                            git="Deportivo Alavés")]
+        p = self.pl(rows)
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV06SEVALA-SEV"), ("1", 0))
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV06SEVALA-TIE"), ("2", 0))
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV07SEVALA-ALA"), ("3", 0))              # a day off
+        self.assertEqual(p.match("KXLALIGAGAME-26NOV06SVLALV-SVL", {"yes_sub_title": "Sevilla"}), ("1", 0))  # by name
+        self.assertIsNone(p.match("KXLALIGAGAME-26NOV06SVLALV-TIE"))                          # no draw by name
+        self.assertAlmostEqual(p.p_yes(("2", 0))[0], 0.295)
+
+    def test_ufc_needs_both_fighters(self):
+        rows = [poly_market("7", "ufc-aus7-car22-2026-11-07", "Bashi vs. Calderon", ["Austin Bashi", "Carlos Calderon"],
+                            0.83, 0.84),
+                poly_market("8", "ufc-tat-vir-2026-11-07", "Suarez vs. Jandiroba", ["Tatiana Suarez", "Virna Jandiroba"],
+                            0.64, 0.65),
+                poly_market("9", "ufc-wel-seo1-2026-11-07", "Turman vs. Ko", ["Wellington Turman", "Seokhyeon Ko"],
+                            0.14, 0.15)]
+        p = self.pl(rows)
+        self.assertIsNone(p.match("KXUFCFIGHT-26NOV06BASBRE-BAS", {"yes_sub_title": "Austin Bashi"}))  # another bout
+        self.assertEqual(p.match("KXUFCFIGHT-26NOV06SUAJAN-JAN", {"yes_sub_title": "Virna Jandiroba"}), ("8", 1))
+        self.assertAlmostEqual(p.p_yes(("8", 1))[0], 1 - 0.645)
+        self.assertEqual(p.match("KXUFCFIGHT-26NOV07SEOTUR-SEO", {"yes_sub_title": "Seok Hyun Ko"}), ("9", 1))
+        self.assertEqual(cm.cpl.tokens("Deportivo Alavés FC"), {"deportivo", "alaves"})
+        self.assertEqual(cm.cpl.kalshi_date("KXEPLGAME-26NOV08CRYLFC-LFC").isoformat(), "2026-11-08")
+
+
 class GamesAndKnobs(unittest.TestCase):
     """--games / --min-legs / --min-lead-min / --allow-thin (11/05 night: the
     two NBA games as components)."""

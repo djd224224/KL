@@ -77,12 +77,14 @@ from combo_rfq_logger import WS_PATH, WS_URL, DayWriter, iso_ms, legs_of  # noqa
 from combo_rfq_score import (DEFAULT_GRID, MAIN_SERIES, MAKER_FEE_RATE, grid_up, league_of,  # noqa: E402
                              maker_fee, sport_group)
 import combo_book_lines as cbl  # noqa: E402
+import combo_poly_lines as cpl  # noqa: E402
 
 OUT_DIR = os.environ.get("COMBO_MAKER_DIR", os.path.join(HERE, "run-logs", "combo-maker"))
 STATE_NAME = "maker_state.json"
 REQUESTERS_NAME = "requesters.json"     # the requester guard's counts and blocks
 ODDS_DIR = os.environ.get("COMBO_RFQ_DIR", os.path.join(HERE, "run-logs", "combo-rfq"))   # the logger's odds_*.jsonl
 LINES_EVERY_S = 60.0                   # the sportsbook lines are re-read this often
+POLY_EVERY_S = 180.0                   # Polymarket's moneylines, re-read on their own thread this often
 REQ_PRUNE_EVERY_S = 600.0              # requesters with no accept, unseen a day, are forgotten this often
 STOP_NAME = "combo_maker.stop"
 LOCK_NAME = "combo_maker.lock"
@@ -192,6 +194,16 @@ class Config:
         self.book_fair = False
         self.max_book_gap = 0.05
         self.odds_dir = None
+        # THIRD FAIR (Jack 2026-11-06: "use Polymarket as another fair so DraftKings +
+        # Polymarket + Kalshi"): Polymarket's moneylines for UFC and soccer, where the
+        # sportsbook feed has none (combo_poly_lines; read on a background thread every
+        # POLY_EVERY_S, matched once a leg). The same rule as the book: the higher of the
+        # fairs on a covered leg, a leg over max_book_gap from Kalshi skips ("poly_gap").
+        # Only books max_poly_spread wide or less with min_poly_liquidity or more count.
+        # 11/06 live check: 122 of 150 soccer / UFC legs covered, within +-1.5 points
+        self.poly_fair = False
+        self.max_poly_spread = 0.03
+        self.min_poly_liquidity = 2000.0
         # NFL ONLY (Jack 2026-11-05, after the shadow: 147 Strategy-1 prints sat a
         # median +1.8% over fair, 3% of them over +5%): every leg an NFL main
         # line, which Kalshi's fee table exempts from the combo maker fee
@@ -689,6 +701,7 @@ class Maker:
         self._load_requesters()
         # the second fair: the sportsbook lines (re-read in upkeep) and each leg's match to them
         self.lines, self.lines_at, self.line_match = None, 0.0, {}
+        self.poly, self.poly_match, self.poly_seen = None, {}, None     # PolyLines (run() starts it)
         self._reset_stats()
 
     def _reset_stats(self):
@@ -847,7 +860,8 @@ class Maker:
             self._why("moving")
             return
         why, fair = price_check(legs, mk, now, self.cfg, self.game_start)
-        if not why and self.cfg.book_fair:
+        fair_k = fair
+        if not why and (self.cfg.book_fair or self.cfg.poly_fair):
             why, fair = self.book_adjust(legs, mk, now, fair)
         if why:
             self._why(why)
@@ -865,6 +879,8 @@ class Maker:
         if why:
             self._why(why)
             return
+        if fair != fair_k:
+            rfq = dict(rfq, fair_k=fair_k)              # the Kalshi-only fair, when an outside one raised it
         q = dict(rfq, fair=fair, ask=ask, no_bid=no_bid, mu=round(self.cfg.markup_for(len(legs), legs, fair), 4),
                  contracts=cts, games=games, at=now,
                  lag_ms=None if rfq["rfq_ms"] is None else now * 1000 - rfq["rfq_ms"], read_ms=read_ms)
@@ -949,7 +965,7 @@ class Maker:
             self._decline(q, "moving", None, cts)
             return
         why, fair_now = confirm_check(q, mk, now, self.cfg, self.book, cts, self.game_start,
-                                      self.book_adjust if self.cfg.book_fair else None)
+                                      self.book_adjust if (self.cfg.book_fair or self.cfg.poly_fair) else None)
         if why:
             self._decline(q, why, fair_now, cts)
             return
@@ -1236,12 +1252,39 @@ class Maker:
         except Exception as e:
             self._error("odds read", e)
 
-    def book_adjust(self, legs, markets: dict, now: float, fair: float):
-        """(why, fair): on each leg the book covers, the higher of Kalshi's mid and the
-        book's vig-free probability for the side; "book_gap" when one is more than
-        max_book_gap apart. Legs the book doesn't cover keep Kalshi's mid."""
-        lines = self.lines
+    def _book_yes(self, tk: str, m: dict, now: float):
+        """The sportsbook's vig-free YES probability for a leg (None: not covered)."""
+        lines = self.lines if self.cfg.book_fair else None
         if lines is None:
+            return None
+        hit = self.line_match.get(tk, False)
+        if hit is False:
+            hit = self.line_match[tk] = lines.match(tk, m)
+        ph = lines.p_home(hit[0], now) if hit else None
+        return None if ph is None else (ph[0] if hit[1] else 1.0 - ph[0])
+
+    def _poly_yes(self, tk: str, m: dict):
+        """Polymarket's YES mid for a leg, from a book max_poly_spread wide or less with
+        min_poly_liquidity or more (None: not covered, or too thin to say)."""
+        poly = self.poly if self.cfg.poly_fair else None
+        if poly is None or poly.at is None:
+            return None
+        if poly.at != self.poly_seen:                   # a new read: match the legs afresh
+            self.poly_match, self.poly_seen = {}, poly.at
+        hit = self.poly_match.get(tk, False)
+        if hit is False:
+            hit = self.poly_match[tk] = poly.match(tk, m)
+        pp = poly.p_yes(hit)
+        if pp is None or pp[1] > self.cfg.max_poly_spread + 1e-9 or pp[2] < self.cfg.min_poly_liquidity:
+            return None
+        return pp[0]
+
+    def book_adjust(self, legs, markets: dict, now: float, fair: float):
+        """(why, fair) from the outside fairs: on each leg the sportsbook (DraftKings)
+        or Polymarket covers, the highest of Kalshi's mid and theirs for the side;
+        "book_gap" / "poly_gap" when one is more than max_book_gap from Kalshi's.
+        Legs neither covers keep Kalshi's mid."""
+        if self.lines is None and self.poly is None:
             return None, fair
         probs, moved = [], False
         for tk, side in ((l[0], l[1]) for l in legs):
@@ -1249,19 +1292,16 @@ class Maker:
             bid, ask = _f(m.get("yes_bid_dollars"), 0.0), _f(m.get("yes_ask_dollars"), 1.0)
             k_yes = (bid + ask) / 2.0
             p_k = k_yes if side == "yes" else 1.0 - k_yes
-            hit = self.line_match.get(tk, False)
-            if hit is False:
-                hit = self.line_match[tk] = lines.match(tk, m)
-            ph = lines.p_home(hit[0], now) if hit else None
-            if ph is None:
-                probs.append(p_k)
-                continue
-            b_yes = ph[0] if hit[1] else 1.0 - ph[0]
-            p_b = b_yes if side == "yes" else 1.0 - b_yes
-            if abs(p_b - p_k) > self.cfg.max_book_gap + 1e-9:
-                return "book_gap", fair
-            probs.append(max(p_k, p_b))
-            moved = moved or p_b > p_k
+            best = p_k
+            for src, o_yes in (("book", self._book_yes(tk, m, now)), ("poly", self._poly_yes(tk, m))):
+                if o_yes is None:
+                    continue
+                p_o = o_yes if side == "yes" else 1.0 - o_yes
+                if abs(p_o - p_k) > self.cfg.max_book_gap + 1e-9:
+                    return f"{src}_gap", fair
+                best = max(best, p_o)
+            probs.append(best)
+            moved = moved or best > p_k
         return None, (max(fair, math.prod(probs)) if moved else fair)
 
     def settle(self) -> None:
@@ -1317,6 +1357,9 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
     writer = DayWriter(out_dir)
     book = Book(os.path.join(out_dir, STATE_NAME))
     mk = Maker(client, cfg, writer, book, out_dir, client_factory=sender_client)
+    if cfg.poly_fair:                                   # the third fair: Polymarket, on its own thread
+        mk.poly = cpl.PolyLines(log=lambda s: log(s))
+        mk.poly.start(POLY_EVERY_S)
     writer.write({"k": "start", "t": time.time(), "live": cfg.live,
                   "cfg": {k: sorted(v) if isinstance(v, set) else v for k, v in vars(cfg).items()}})
     log(("LIVE" if cfg.live else "DRY (nothing is sent)") + (", NFL ONLY (fee-free)" if cfg.nfl_only else "")
@@ -1465,6 +1508,11 @@ def main(argv=None) -> int:
     ap.add_argument("--no-book-fair", action="store_true",
                     help="drop the second fair (DraftKings' vig-free moneyline on game-winner legs, from the "
                          "RFQ logger's odds files)")
+    ap.add_argument("--no-poly-fair", action="store_true",
+                    help="drop the third fair (Polymarket's moneylines on UFC and soccer legs)")
+    ap.add_argument("--max-poly-spread", type=float, default=d.max_poly_spread,
+                    help="a Polymarket book this wide or wider doesn't count (0.03 = 3c)")
+    ap.add_argument("--min-poly-liquidity", type=float, default=d.min_poly_liquidity)
     ap.add_argument("--max-book-gap", type=float, default=d.max_book_gap,
                     help="skip a parlay with a leg this far from the book's probability (0.05 = 5 points)")
     ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,
@@ -1542,6 +1590,8 @@ def main(argv=None) -> int:
                  max_outcome_payout=a.max_outcome_payout or None, guard_min_accepts=a.guard_min_accepts,
                  guard_min_rate=a.guard_min_rate, guard_block_hours=a.guard_block_hours,
                  book_fair=not a.no_book_fair, max_book_gap=a.max_book_gap,
+                 poly_fair=not a.no_poly_fair, max_poly_spread=a.max_poly_spread,
+                 min_poly_liquidity=a.min_poly_liquidity,
                  max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
@@ -1572,6 +1622,8 @@ def main(argv=None) -> int:
         ap.error("--max-outcome-payout $10 to $100,000 (0 = off)")
     if not 0 <= cfg.guard_min_accepts <= 100 or not 0 < cfg.guard_min_rate <= 1 or not 0 < cfg.guard_block_hours <= 720:
         ap.error("--guard-min-accepts 0-100, --guard-min-rate (0, 1], --guard-block-hours (0, 720]")
+    if not 0.001 <= cfg.max_poly_spread <= 0.2 or cfg.min_poly_liquidity < 0:
+        ap.error("--max-poly-spread 0.001 to 0.2, --min-poly-liquidity 0 or more")
     if not 0.005 <= cfg.max_book_gap <= 0.5:
         ap.error("--max-book-gap 0.005 to 0.5")
     return run(cfg, a.minutes)
