@@ -19590,11 +19590,18 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #      04:59Z, VMAs 09-28 03:59Z, National Book Awards 11-19 04:59Z) or the
 #      day after the announcement (Golden Globe nominations 12-09 15:00Z).
 #      A Dec 31 expiration is the placeholder shape and reads as unknown.
-# cutoff = start - AWARDS_PRE_EVENT_DAYS. 15 days is "2 weeks" measured from
-# an end-of-day expiration: the stand-down begins two full weeks before the
-# event EVENING (14 would land inside it). It was 31 days ("1 month", 30
-# landing inside it) until 2026-10-23 (Jack: "award market stop quoting 2
-# weeks before"); the "-> out <date>" notes below were worked at 31 days.
+# cutoff = start - AWARDS_PRE_EVENT_DAYS. 1 day since 2026-11-06 (Jack:
+# "adjust to 1 day pre-nomination stand down, since now i have more risk
+# controls in place"). A table row's start is 00:00 ET of the announcement
+# day, so the stand-down begins 00:00 ET the day BEFORE it: Grammy
+# nominations Mon Nov 16 (7:45 AM ET) -> out Sun Nov 15 00:00 ET; an
+# end-of-day expiration (a ceremony evening) -> out at the end of the day
+# before. It was 15 days ("2 weeks" from an end-of-day expiration) from
+# 2026-10-23 (Jack: "award market stop quoting 2 weeks before") and 31
+# ("1 month") before that; the "-> out <date>" notes below were worked at
+# 31 or 15 days. The long windows hid one shape: an API start that sits
+# AFTER the reveal (KXGGNOM's expiration is the day after its
+# announcement), so such a family needs a table row (KXGGNOM-*26 below).
 # No usable start ->
 # RELEASE_GUARD_UNKNOWN (stood down, fail closed, logged once). Applied in
 # apply_series_cutoff_adjustments for both producers and the quote-gaps
@@ -19607,9 +19614,11 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 # API knows nothing about it -- so every winner family is TABLE-ONLY
 # (AWARDS_TABLE_ONLY_SERIES) and the hand table carries the announcement
 # dates; a family year without a row stands down until someone adds one.
-# KXGGNOM is the exception: its markets ARE the nominations, so Kalshi's
-# expiration (the day after the announcement) is the right start and it
-# stays on the API fallback. Dates in the default table (verified 9/26):
+# KXGGNOM was the exception until 2026-11-06: its markets ARE the
+# nominations, so Kalshi's expiration (the day after the announcement) did
+# as the start while the stand-down was weeks long. At 1 day that start is
+# past the reveal, so KXGGNOM is table-only too (row "84th Golden Globes"
+# below). Dates in the default table (verified 9/26):
 #   69th Grammys        nominations Nov 16 2026 (Recording Academy /
 #                       Rolling Stone; ceremony Feb 7 2027)
 #   2026 Nat'l Book Aw. finalists Oct 6 2026 (nationalbook.org; ceremony
@@ -19660,6 +19669,18 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #                       winner: Album of the Year", 2026-10-12): the same
 #                       Nov 16 nominations are their first narrowing. They
 #                       come in through the awards tag (AWARDS_EXTRA_FILE).
+#   84th Golden Globes  nominations Mon Dec 7 2026, 5:00 AM PT (the
+#                       84th timetable: goldenglobes.com, Awards Radar,
+#                       The Hollywood Reporter; ceremony Jan 10 2027).
+#                       Row KXGGNOM-*26 (2026-11-06): the nominee markets
+#                       ARE this reveal, and Kalshi's expiration is the day
+#                       AFTER it (12-09 15:00Z on 9/25), so at the 1-day
+#                       rule the API fallback would quote through the
+#                       announcement -> the row puts them out Dec 6 00:00
+#                       ET. KXGGNOM is TABLE-ONLY since then too, so next
+#                       year's KXGGNOM-*27 stands down (config gap) until
+#                       a row dates its nominations, instead of trusting
+#                       that day-after expiration.
 #   60th CMA Awards     the show itself, Wed Nov 18 2026 (live on ABC 8-11pm
 #                       ET; the CMA's announcement via Holler and Lakes
 #                       Media) -> out Oct 18. KXCMA (allowed 9/11 on the
@@ -19674,7 +19695,7 @@ def auction_event_date(event_ticker: str) -> Optional[datetime]:
 #                       year's KXCMA-*27 waits for a row (its nominations).
 # Knobs: IMM_AWARDS_SERIES, IMM_AWARDS_PRE_EVENT_DAYS, IMM_AWARDS_EVENT_DATES
 # (replaces the WHOLE table), IMM_AWARDS_TABLE_ONLY_SERIES.
-AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 15.0)
+AWARDS_PRE_EVENT_DAYS = _env_float("IMM_AWARDS_PRE_EVENT_DAYS", 1.0)
 AWARDS_SERIES = tuple(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_SERIES",
@@ -19685,7 +19706,7 @@ AWARDS_TABLE_ONLY_SERIES = frozenset(
     s.strip() for s in os.environ.get(
         "IMM_AWARDS_TABLE_ONLY_SERIES",
         "KXGRAMMY,KXNATBOOKAWARDS,KXVMA,KXOSCAR,KXCRITICS,"
-        "KXGRAMMYNOM,KXCMA").split(",") if s.strip())
+        "KXGRAMMYNOM,KXCMA,KXGGNOM").split(",") if s.strip())
 # 99th-Oscars categories whose first narrowing is the Dec 15 2026 SHORTLIST
 # (winner AND nomination series, by Kalshi's own names; KXOSCARNOMBSOUND is
 # "Oscar nomination for Best Song" and KXOSCARVIS is Makeup & Hairstyling
@@ -19728,6 +19749,8 @@ _CRITICS_NOM_OTHER_27 = ("PIC", "DIR", "ACTO", "ACTR", "SUPACTO", "SUPACTR",
 _AWARDS_DATES_DEFAULT = (
     "KXGRAMMY-*69=2026-11-16,KXGRAMMYNOM*-69=2026-11-16,"
     "KXGRAMMYNOM-69*=2026-11-16,KXGRAM*-69=2026-11-16,"
+    # the 84th Golden Globe nominations (see "84th Golden Globes" above)
+    "KXGGNOM-*26=2026-12-07,"
     # the 60th CMA Awards themselves (see "60th CMA Awards" above)
     "KXCMA-*26=2026-11-18,"
     "KXNATBOOKAWARDS-*26=2026-10-06,"
