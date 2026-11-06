@@ -46,6 +46,13 @@ priority, one instance at a time (a lock file in OUT). Stops on Ctrl+C,
 --minutes, or the STOP file <OUT>\combo_rfq_logger.stop (it also refuses to
 start while that file exists; delete it to allow runs again).
 
+ALWAYS ON (Jack 2026-11-05: "Register the logger as an always-on Windows task
+so it captures every night"): the "KL combo-rfq logger" task
+(register_combo_rfq_logger.ps1) runs run_combo_rfq_logger.ps1's restart loop
+through run_combo_rfq_logger_hidden.vbs. Exit codes for that loop: 3 = the
+STOP file (stop looping), 4 = another logger holds the lock (stop looping;
+that one runs on), anything else = restart after 20 s.
+
   python combo_rfq_logger.py [--minutes N] [--out DIR] [--shard-factor 50]
 """
 import argparse
@@ -84,6 +91,8 @@ COMBO_PREFIX = "KXMVE"
 BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 STOP_NAME = "combo_rfq_logger.stop"
 LOCK_NAME = "combo_rfq_logger.lock"
+EXIT_STOP = 3             # the STOP file: the launcher stops looping
+EXIT_LOCKED = 4           # another logger holds the lock: the launcher stops looping
 
 
 def log(msg: str) -> None:
@@ -424,11 +433,11 @@ def run(out_dir: str, minutes: float, shard_factor: int, shard_key: int, url: st
     stop_path = os.path.join(out_dir, STOP_NAME)
     if os.path.exists(stop_path):
         log(f"stop file present ({stop_path}); not starting")
-        return 0
+        return EXIT_STOP
     lock = single_instance(out_dir)
     if lock is None:
         log("another combo RFQ logger is running (lock held); exiting")
-        return 0
+        return EXIT_LOCKED
     below_normal()
     headers = signer()
     writer = DayWriter(out_dir)
@@ -506,7 +515,7 @@ def run(out_dir: str, minutes: float, shard_factor: int, shard_key: int, url: st
         writer.close()
         lock.close()
         log(f"stop ({why}): {dict(lg.totals)}")
-    return 0
+    return EXIT_STOP if why == "stop file" else 0
 
 
 def main(argv=None) -> int:

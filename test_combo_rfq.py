@@ -165,8 +165,18 @@ class LoggerTests(unittest.TestCase):
     def test_a_stop_file_keeps_it_from_starting(self):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, cl.STOP_NAME), "w").close()
-            self.assertEqual(cl.run(d, 1.0, 50, 0, url="wss://unused.invalid"), 0)
+            # 3 = the launcher loop stops (run_combo_rfq_logger.ps1)
+            self.assertEqual(cl.run(d, 1.0, 50, 0, url="wss://unused.invalid"), cl.EXIT_STOP)
             self.assertEqual(sorted(os.listdir(d)), [cl.STOP_NAME])     # nothing opened, no lock
+
+    def test_a_held_lock_exits_4_before_any_network(self):
+        with tempfile.TemporaryDirectory() as d:
+            held = cl.single_instance(d)
+            try:
+                # no exchange read, no socket: the 10-min task retries stay cheap
+                self.assertEqual(cl.run(d, 1.0, 50, 0, url="wss://unused.invalid"), cl.EXIT_LOCKED)
+            finally:
+                held.close()
 
 
 # ---- the scorer -------------------------------------------------------------------
@@ -263,6 +273,35 @@ class ScoreTests(unittest.TestCase):
         # a one-sided leg (no bid) has no mid
         book = book_with({LEGS[0][0]: (0.0, 0.51), LEGS[1][0]: (0.39, 0.41)})
         self.assertEqual(cs.score_exec(exec_rec(LEGS), self.markets, book, self.starts)["why"], "no_price")
+
+    def test_the_maker_fee_matches_kalshis_combo_row(self):
+        # kalshi.com/fee-schedule (11/05): combo makers $0.04-$0.88 per 100 contracts
+        # (50% of the taker's $0.07-$1.75), from a 1c to a 50c price
+        self.assertEqual(round(cs.maker_fee(100, 0.01), 2), 0.03)      # 0.03465: shown as $0.04
+        self.assertAlmostEqual(cs.maker_fee(100, 0.01), 0.03465)
+        self.assertAlmostEqual(cs.maker_fee(100, 0.50), 0.875)          # shown as $0.88
+        self.assertAlmostEqual(cs.maker_fee(100, 0.50), 0.5 * 0.07 * 100 * 0.25)
+
+    def test_all_nfl_cross_game_combos_are_flagged_for_the_exemption(self):
+        a, b = "KXNFLGAME-26NOV08KCBUF-KC", "KXNFLGAME-26NOV08DALPHI-PHI"
+        prop = "KXNFLPASSYDS-26NOV08KCBUF-KCPMAHOMES15-250"
+        mk = {t: mkt(t, T0 + 30 * 3600) for t in (a, b, prop)}
+        for m in mk.values():
+            m.pop("event_ticker")           # no event in the read: the ticker's game segment decides
+        mk[COMBO] = {"ticker": COMBO, "result": "", "status": "active"}
+        book = book_with({a: (0.59, 0.61), b: (0.44, 0.46), prop: (0.49, 0.51)})
+        st = cs.game_starts(mk)
+        nfl = cs.score_exec(exec_rec([[a, "yes"], [b, "yes"]], px="0.3500"), mk, book, st)  # fair 0.27
+        self.assertTrue(nfl["nfl_uncorr"])
+        self.assertIsNone(nfl["why"])
+        sgp = cs.score_exec(exec_rec([[a, "yes"], [prop, "yes"]]), mk, book, st)
+        self.assertFalse(sgp["nfl_uncorr"])                 # same game: correlated
+        mixed = cs.score_exec(exec_rec([[a, "yes"], LEGS[0]]), dict(mk, **self.markets),
+                              book_with({a: (0.59, 0.61), LEGS[0][0]: (0.49, 0.51)}), st)
+        self.assertFalse(mixed["nfl_uncorr"])               # not all NFL
+        rep = cs.build([dict(nfl, payoff=0.0, mk_pnl=10.0)])
+        won = [r for r in rep["shadow"] if r["wins"]]
+        self.assertTrue(won and all(abs(r["fee_nfl"] - r["fee"]) < 1e-12 for r in won))
 
     def test_the_candle_used_ended_before_the_rfq(self):
         b = cs.PriceBook()

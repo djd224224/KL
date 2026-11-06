@@ -30,10 +30,17 @@ slice; at most MAX_EXECS_PER_DAY a UTC day, picked by trade id) is scored:
             (contract-sized), at OUR price
   P&L       at the combo's settlement: short YES at a -> contracts x
             (a - payoff); long YES at b -> contracts x (payoff - b); less the
-            maker fee MAKER_FEE_RATE x contracts x p x (1 - p) (the series'
-            fee_type is quadratic_with_combo_maker_fees since 2026-08-20,
-            reported as half the 0.07 taker rate; uncorrelated NFL parlays
-            are reportedly exempt, charged here anyway)
+            maker fee MAKER_FEE_RATE x contracts x p x (1 - p). CONFIRMED
+            11/05 (Jack: "confirm the maker fee on combos"): Kalshi's fee
+            schedule (kalshi.com/fee-schedule) lists "Combos (excluding
+            uncorrelated NFL)" with maker fees at 50% of taker, $0.04-$0.88
+            per 100 contracts beside the taker's $0.07-$1.75 (= 0.07 x p(1-p)
+            from 1c to 50c); the API docs define the series' fee_type
+            quadratic_with_combo_maker_fees (since 2026-08-20) as a 0.5 maker
+            multiplier, 0.25 on ordinary maker-fee series; a fill's fee
+            rounds up to $0.000001 (docs fee_rounding). "Uncorrelated NFL" is
+            not defined further, so every fill is charged and the report
+            shows the part on all-NFL combos with no two legs on one game
 
 Context on every scored execution: the makers' own P&L at the print price
 (the flow's hold), the markup the market charges over the independence fair,
@@ -71,7 +78,7 @@ from combo_rfq_logger import DEFAULT_OUT, SHARD_FACTOR  # noqa: E402
 MARKUPS = (0.05, 0.10, 0.15, 0.20, 0.30, 0.50)
 MAX_LEG_SPREAD = 0.10
 GAME_HOURS = 3.0
-MAKER_FEE_RATE = 0.035
+MAKER_FEE_RATE = 0.035     # combo makers: 0.5 x the 0.07 taker rate (fee schedule, 11/05)
 MAX_EXECS_PER_DAY = 5000
 CALL_GAP_S = 0.5
 BATCH = 100
@@ -143,9 +150,11 @@ def game_key(event_ticker: str) -> str:
 
 
 def event_of_leg(ticker: str) -> str:
-    """A leg's event ticker from its own ticker when the market read lacks
-    one: everything before the last dash."""
-    return ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
+    """A leg's event from its own ticker when the market read lacks one: the
+    series and its next segment (KXNBAPTS-26NOV05MIAGSW-GSWSCURRY30-25 ->
+    KXNBAPTS-26NOV05MIAGSW), so a prop lands on its game, not on its player."""
+    parts = str(ticker).split("-")
+    return "-".join(parts[:2]) if len(parts) >= 2 else str(ticker)
 
 
 # ---- the price grid -------------------------------------------------------------
@@ -406,6 +415,10 @@ def score_exec(e: dict, markets: dict, book: PriceBook, starts: dict) -> dict:
             "px": px, "ct": ct, "tc": e.get("tc") is not None, "prem": prem,
             "fair": fair, "why": why, "widest": widest, "oldest_s": oldest,
             "same_game": len(set(keys)) < len(keys), "in_play": in_play, "anchor": anchor,
+            # the fee table's "uncorrelated NFL" exemption, read as: every leg
+            # an NFL market and no two on one game (Kalshi defines it no further)
+            "nfl_uncorr": bool(keys) and len(set(keys)) == len(keys)
+            and all(str(l[0]).startswith("KXNFL") for l in e["legs"]),
             "payoff": payoff, "mk_pnl": mk_pnl, "mk_fee": maker_fee(ct, px),
             "grid": combo.get("price_ranges") or DEFAULT_GRID}
 
@@ -490,6 +503,7 @@ def build(scored: list, markups=MARKUPS) -> dict:
         sh.append({"markup": m, "eligible": len(elig_set), "wins": len(won),
                    "win_share": (len(won) / len(elig_set)) if elig_set else None,
                    "prem": prem, "gross": gross, "fee": fee, "net": gross - fee,
+                   "fee_nfl": sum(f["fee"] for s, f in won if s.get("nfl_uncorr")),
                    "per_prem": ((gross - fee) / prem) if prem else None,
                    "ci": [lo, hi], "pending_wins": pend,
                    "by_legs": {lab: sum(f["pnl"] - f["fee"] for s, f in won if s["bucket"] == lab)
@@ -601,6 +615,11 @@ def render(rep: dict, ctx: dict, since, until) -> str:
                  f"{usd(r['gross'])} | {usd(-r['fee'])} | **{usd(r['net'])}** | {pct(r['per_prem'])} | "
                  f"{usd(r['ci'][0])} to {usd(r['ci'][1])} | {r['pending_wins']:,} |")
     L.append("")
+    if any(r["fee_nfl"] > 0 for r in rep["shadow"]):
+        L.append("Of that fee, on all-NFL combos with no same-game legs (exempt if that is what Kalshi's"
+                 " \"uncorrelated NFL\" means): "
+                 + ", ".join(f"{r['markup']:.0%} {usd(r['fee_nfl']).lstrip('+')}" for r in rep["shadow"]) + ".")
+        L.append("")
     L.append("Net by leg count:")
     L.append("")
     L.append("| markup | " + " | ".join(lab for _, lab in LEG_BUCKETS) + " |")
@@ -639,8 +658,9 @@ def _method_lines(rep: dict) -> list:
         f" series; start = earliest expected expiration - {GAME_HOURS:g} h.",
         "- A win needs a strictly better price than the print; ties and RFQs that never executed"
         " are not counted, so the win counts are a floor and our real fill rate is unknown.",
-        f"- Fee: {MAKER_FEE_RATE} x contracts x p(1-p) on every fill (uncorrelated NFL parlays are"
-        " reportedly exempt; not modelled).",
+        f"- Fee: {MAKER_FEE_RATE} x contracts x p(1-p) on every fill, Kalshi's combo maker rate (50% of"
+        " the 0.07 taker rate, kalshi.com/fee-schedule). The table excludes \"uncorrelated NFL\""
+        " combos without defining them, so they are charged here too.",
         "- Combos on one night share games, so outcomes move together"
         + ("." if rep["ci_by"] == "day" else
            f": with under {BOOT_MIN_DAYS} days the range resamples anchor games and is too narrow."),
