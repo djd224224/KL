@@ -407,6 +407,28 @@ class Horizon(unittest.TestCase):
             cm.main(["--max-days-out", "0.1"])
 
 
+class TicketLoss(unittest.TestCase):
+    """Jack 2026-11-05: 'allow a single loss of up to $300'."""
+
+    def test_one_tickets_loss_is_capped(self):
+        cfg = cm.Config(max_ticket_loss=300, max_payout=500, max_game_payout=600)
+        b = cm.Book()
+        day = cm.et_day(T0)
+        self.assertEqual(cm.caps_check(b, ["g1"], 429, 0.30, cfg, day), "ticket_loss_cap")   # loses $300.30
+        self.assertIsNone(cm.caps_check(b, ["g1"], 428, 0.30, cfg, day))                    # loses $299.60
+        self.assertEqual(cm.caps_check(b, ["g1"], 311, 0.035, cfg, day), "ticket_loss_cap")  # $300.12
+        self.assertIsNone(cm.caps_check(b, ["g1"], 310, 0.035, cfg, day))                   # $299.15
+        self.assertEqual(cm.caps_check(b, ["g1"], 501, 0.45, cfg, day), "payout_cap")      # the backstop
+        # off by default: only the $150 payout limits a ticket
+        self.assertIsNone(cm.Config().max_ticket_loss)
+        self.assertEqual(cm.caps_check(b, ["g1"], 200, 0.30, cm.Config(), day), "payout_cap")
+
+    def test_cli_bounds(self):
+        for bad in (["--max-ticket-loss", "5"], ["--max-ticket-loss", "6000"]):
+            with self.assertRaises(SystemExit):
+                cm.main(bad)
+
+
 class LegMarkup(unittest.TestCase):
     """Jack 2026-11-05: "quote a higher spread, the more legs"."""
 

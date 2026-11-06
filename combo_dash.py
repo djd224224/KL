@@ -318,6 +318,7 @@ def render(s: dict) -> str:
                f"{cfg.get('max_legs', '?')} legs &middot; games {html.escape(games)} &middot; "
                f"lead {cfg.get('min_lead_min', '?')} min &middot; "
                + (f"settles &le; {cfg.get('max_days_out'):g} days &middot; " if cfg.get("max_days_out") else "")
+               + (f"loss ${cfg.get('max_ticket_loss'):,.0f}/ticket &middot; " if cfg.get("max_ticket_loss") else "")
                + f"caps ${cfg.get('max_payout', '?')}/ticket, "
                f"${cfg.get('max_game_payout', '?')}/game, open loss ${cfg.get('max_open_loss', '?')}") if cfg else "no run yet"
     k = s.get("kalshi") or {}

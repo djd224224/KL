@@ -25,6 +25,7 @@ our price is still >= fair x (1 + CONFIRM_MIN_EDGE), and every cap holds.
 
 CAPS, checked before a quote and again at the confirm:
   one ticket's payout (contracts x $1)              <= MAX_PAYOUT
+  what one ticket can lose (contracts x NO px)       <= MAX_TICKET_LOSS (if set)
   the payout on any one game, over open tickets      <= MAX_GAME_PAYOUT
   what the open tickets can lose (contracts x NO px) <= MAX_OPEN_LOSS
   confirmed tickets an ET day                        <= MAX_TICKETS
@@ -123,6 +124,11 @@ class Config:
         self.max_leg_spread = 0.03
         self.min_lead_min = 30.0
         self.max_payout = 150.0
+        # ONE TICKET'S LOSS (Jack 2026-11-05 ~11:05 PM ET: "allow a single loss of up
+        # to $300"): contracts x (1 - our price), what the ticket loses if the
+        # parlay hits. None = only max_payout limits a ticket (a $150 payout loses
+        # under $150); set it with a max_payout above it, or the payout cap binds first
+        self.max_ticket_loss = None
         self.min_premium = 0.50
         self.max_game_payout = 300.0
         self.max_open_loss = 400.0
@@ -339,6 +345,8 @@ def caps_check(book: Book, games: list, contracts: float, ask: float, cfg: Confi
         return "dust"
     if contracts > cfg.max_payout + 1e-9:
         return "payout_cap"
+    if cfg.max_ticket_loss is not None and contracts * (1.0 - ask) > cfg.max_ticket_loss + 1e-9:
+        return "ticket_loss_cap"
     for g in games:
         if book.game_payout(g) + contracts > cfg.max_game_payout + 1e-9:
             return "game_cap"
@@ -811,7 +819,8 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         + f"% at {cfg.min_legs}-{cfg.max_legs} legs (confirm >= half), lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
         + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
-        f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
+        + (f"loss <= ${cfg.max_ticket_loss:,.0f}/ticket, " if cfg.max_ticket_loss is not None else "")
+        + f"payout <= ${cfg.max_payout:,.0f}/ticket, ${cfg.max_game_payout:,.0f}/game, open loss <= "
         f"${cfg.max_open_loss:,.0f}, {cfg.max_tickets} tickets/day; open now {len(book.open())}")
     deadline = time.time() + minutes * 60 if minutes else None
     key_id = getattr(client, "key_id", None)
@@ -896,6 +905,9 @@ def main(argv=None) -> int:
                          "4%%, 5 legs at 7%%; 0 = one markup for all)")
     ap.add_argument("--max-payout", type=float, default=d.max_payout)
     ap.add_argument("--max-game-payout", type=float, default=d.max_game_payout)
+    ap.add_argument("--max-ticket-loss", type=float, default=d.max_ticket_loss,
+                    help="the most one ticket can lose, contracts x (1 - our price); raise --max-payout "
+                         "above it or the payout cap binds first (default: only --max-payout)")
     ap.add_argument("--max-open-loss", type=float, default=d.max_open_loss)
     ap.add_argument("--max-tickets", type=int, default=d.max_tickets)
     ap.add_argument("--nfl-only", action="store_true",
@@ -942,12 +954,15 @@ def main(argv=None) -> int:
         ap.error("--min-lead-min 2 or more: the last minutes before a start are when lines jump")
     games = {g.strip().upper() for g in a.games.split(",") if g.strip()} or None
     cfg = Config(live=a.live, markup=a.markup, markup_per_leg=a.markup_per_leg, max_payout=a.max_payout,
-                 max_game_payout=a.max_game_payout, max_open_loss=a.max_open_loss,
+                 max_game_payout=a.max_game_payout, max_ticket_loss=a.max_ticket_loss,
+                 max_open_loss=a.max_open_loss,
                  max_tickets=a.max_tickets, nfl_only=a.nfl_only, shard_factor=a.shard_factor,
                  games=games, games_mode=a.games_mode, min_legs=a.min_legs,
                  max_legs=a.max_legs, min_lead_min=a.min_lead_min,
                  max_reads_per_min=a.max_reads_per_min, max_quotes_per_min=a.max_quotes_per_min,
                  allow_extras=not a.no_extras, min_depth_usd=a.min_depth, max_days_out=a.max_days_out)
+    if cfg.max_ticket_loss is not None and not 10 <= cfg.max_ticket_loss <= 5000:
+        ap.error("--max-ticket-loss $10 to $5,000")
     if cfg.max_days_out and not 0.25 <= cfg.max_days_out <= 400:
         ap.error("--max-days-out 0.25 to 400 (0 = no limit)")
     if not 1 <= cfg.max_quotes_per_min <= 600:
