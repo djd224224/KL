@@ -10461,6 +10461,32 @@ TRUMPVH_SIZE_MULT = _env_float("IMM_TRUMPVH_SIZE_MULT", 3.0)
 SERIES_OVERRIDES["KXTRUMPVH"] = replace(SERIES_OVERRIDES["KXTRUMPAPPROVE"],
                                         size_mult=TRUMPVH_SIZE_MULT)
 
+# SUPER BOWL HALFTIME (Jack 2026-11-07, Jay-Z at Super Bowl LXI): the two
+# series were hand-added to extra_allow_series.json the same morning, with
+# a kickoff start (2027-02-14 18:30 ET) on file in event_start_overrides.json.
+# - KXSBSETLISTS ("What songs will be played at the halftime show?", 45
+#   songs, ~$7.19/day each): x4.5 (Jack: "yes, x3. and increase range to
+#   2-98", then "x4.5" once told the series already ran the size test's x1.5,
+#   so the table's x3 row was x4.5 absolute). At x1.5 only 11 of the 39
+#   quotable songs projected over the $1.10 bar; x4.5 projected ~31. It
+#   rides the size_mult wire, so the per-market and per-event caps scale
+#   with it (150 -> 675, 1,000 -> 4,500), and it leaves the size test (see
+#   SIZE_TEST_EXCLUDE below: the test half would have made it x6.75).
+# - Both series quote 2-98c (Jack: "increase range to 2-98", then "Opener
+#   too"): six setlist songs have ~3c x 96c books that the 5-90 band read as
+#   no quotable side, and 20 of KXFIRSTSUPERBOWLSONG's 22 opener songs sit at
+#   1.5-4.5c mids the fresh 5c screen skipped. The opener keeps its size.
+# IMM_SBSETLISTS_SIZE_MULT / IMM_HALFTIME_PRICE_MIN / _MAX set them.
+SBSETLISTS_SIZE_MULT = _env_float("IMM_SBSETLISTS_SIZE_MULT", 4.5)
+HALFTIME_PRICE_MIN = _env_int("IMM_HALFTIME_PRICE_MIN", 2)
+HALFTIME_PRICE_MAX = _env_int("IMM_HALFTIME_PRICE_MAX", 98)
+SERIES_OVERRIDES["KXSBSETLISTS"] = SeriesOverride(
+    size_mult=SBSETLISTS_SIZE_MULT,
+    price_min_cents=HALFTIME_PRICE_MIN, price_max_cents=HALFTIME_PRICE_MAX)
+SERIES_OVERRIDES["KXFIRSTSUPERBOWLSONG"] = SeriesOverride(
+    price_min_cents=HALFTIME_PRICE_MIN, price_max_cents=HALFTIME_PRICE_MAX)
+SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | {"KXSBSETLISTS"}
+
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
 # on its print day" / "make sure KXTRUEV is quoting"). That breaks the

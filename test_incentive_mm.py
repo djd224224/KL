@@ -40554,3 +40554,55 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(sorted(q.book_side for q in imm.pvd_guard_quotes(qs, e2, 97.0)), ["ask", "bid"])
         self._write({self.T: {"bid_max": 49, "ask_min": 51, "no_losing_side": True}, self.T2: {"bid_max": 49, "ask_min": 51}})
         self.assertEqual((imm.PVD_MARKETS[self.T]["no_losing"], imm.PVD_MARKETS[self.T2]["no_losing"]), (True, False))
+
+
+class TestSuperBowlHalftime(unittest.TestCase):
+    """Jack 2026-11-07: "yes, x3. and increase range to 2-98" -- KXSBSETLISTS
+    at x4.5 absolute (the table's x3 row over the size test's x1.5), out of
+    the size test; both halftime series quote 2-98c ("Opener too")."""
+
+    def _m(self, series, mid):
+        return _meta(ticker=f"{series}-27-AAA", event_ticker=f"{series}-27",
+                     series=series, mid_cents=mid, spread_cents=2)
+
+    def test_setlists_at_x45_out_of_the_size_test(self):
+        ov = imm.SERIES_OVERRIDES["KXSBSETLISTS"]
+        self.assertEqual(ov.size_mult, 4.5)
+        self.assertIsNone(ov.levels)
+        self.assertIsNone(ov.max_position)
+        self.assertIn("KXSBSETLISTS", imm.SIZE_TEST_EXCLUDE)
+        self.assertIsNone(imm.size_test_arm("KXSBSETLISTS"))
+        # rungs and both caps ride the same wire, not x4.5 x the test's x1.5
+        self.assertEqual(imm.applied_mention_mult("KXSBSETLISTS"), 4.5)
+        self.assertEqual(imm.series_max_position("KXSBSETLISTS"),
+                         imm.MAX_POSITION_CONTRACTS * 4.5)
+        lv = imm.base_scaled_levels("KXSBSETLISTS")
+        self.assertEqual([s for _t, s in lv],
+                         [max(1, int(s * 4.5 + 0.5)) for _t, s in imm.LEVELS])
+
+    def test_opener_keeps_its_size(self):
+        ov = imm.SERIES_OVERRIDES["KXFIRSTSUPERBOWLSONG"]
+        self.assertIsNone(ov.size_mult)
+        self.assertNotIn("KXFIRSTSUPERBOWLSONG", imm.SIZE_TEST_EXCLUDE)
+        self.assertEqual(imm.applied_mention_mult("KXFIRSTSUPERBOWLSONG"),
+                         imm.size_test_mult("KXFIRSTSUPERBOWLSONG"))
+
+    def test_both_quote_2_to_98(self):
+        for s in ("KXSBSETLISTS", "KXFIRSTSUPERBOWLSONG"):
+            self.assertEqual((imm.series_price_min(s), imm.series_price_max(s)), (2, 98), s)
+            self.assertEqual(imm.member_price_band(s, False), (2, 98), s)
+            self.assertEqual(imm.member_price_band(s, True), (2, 98), s)
+        # the global band is untouched
+        self.assertEqual((imm.series_price_min("KXFOO"), imm.series_price_max("KXFOO")),
+                         (imm.PRICE_MIN_CENTS, imm.PRICE_MAX_CENTS))
+
+    def test_the_mid_screen_takes_2_to_98(self):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        now = datetime.now(timezone.utc)
+        for s in ("KXSBSETLISTS", "KXFIRSTSUPERBOWLSONG"):
+            for mid in (2.0, 3.0, 4.5, 95.5, 98.0):
+                self.assertIsNone(bot._screen(self._m(s, mid), now), (s, mid))
+            for mid in (1.5, 98.5):
+                self.assertEqual(bot._screen(self._m(s, mid), now), "extreme_mid", (s, mid))
+        # a series on the global band still screens a 3c fresh mid out
+        self.assertEqual(bot._screen(self._m("KXFOO", 3.0), now), "extreme_mid")
