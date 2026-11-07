@@ -156,8 +156,15 @@ def main() -> int:
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
+    ap.add_argument("--side-cap", action="append", default=[],
+                    help="SERIES:C:N -- a side of SERIES whose fill ties up >= C c a contract rests N")
+    ap.add_argument("--pause-at", action="append", default=[],
+                    help="SERIES:C -- a market of SERIES at C c+ (bid or last) quotes nothing, or only the "
+                         "side that unwinds its position; resumes under C - 2")
     ap.add_argument("--pin", action="append", default=[],
                     help="TICKER:N -- that market rests N a side: no --size-mult, bank step or cheap tier")
+    ap.add_argument("--pin-series", action="append", default=[],
+                    help="SERIES:N[:flat] -- --pin for every market of the series (a --pin of the market wins)")
     ap.add_argument("--hold-max", action="store_true",
                     help="a market raised to --bank-max stays there for its period (no step back down "
                          "to --bank-size before it banks)")
@@ -194,6 +201,9 @@ def main() -> int:
         v.sort()
     exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
     all_series = series == {"ALL"}
+    pause_at = {x.split(":")[0].strip(): float(x.split(":")[1]) for x in a.pause_at if ":" in x}
+    side_caps = [(x.split(":")[0].strip(), float(x.split(":")[1]), int(x.split(":")[2]))
+                 for x in a.side_cap if x.count(":") == 2]
     pins, pin_flat = {}, set()
     for x in a.pin:                 # TICKER:N or TICKER:N:flat
         pp = [s.strip() for s in x.split(":")]
@@ -201,6 +211,13 @@ def main() -> int:
             pins[pp[0]] = int(pp[1])
             if len(pp) > 2 and pp[2].lower() == "flat":
                 pin_flat.add(pp[0])
+    pin_series, pin_series_flat = {}, set()
+    for x in a.pin_series:          # SERIES:N or SERIES:N:flat
+        pp = [s.strip() for s in x.split(":")]
+        if len(pp) >= 2:
+            pin_series[pp[0]] = int(pp[1])
+            if len(pp) > 2 and pp[2].lower() == "flat":
+                pin_series_flat.add(pp[0])
 
     def in_scope(t: str) -> bool:
         s = t.split("-")[0]
@@ -212,7 +229,7 @@ def main() -> int:
     # the touches are read BEFORE the lock (18 calls for ~1,700 markets), so the
     # lock is held only for the read-modify-write of the list
     touch, missed = {}, 0
-    if a.reanchor is not None or tiers or stiers:
+    if a.reanchor is not None or tiers or stiers or side_caps:
         pre = json.load(open(LIST, encoding="utf-8")).get("markets") or {}
         touch, missed = read_touches([t for t in pre if in_scope(t)])
     if a.write:
@@ -251,6 +268,28 @@ def main() -> int:
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
         n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = n_pin = 0
+        n_pause = n_pause_off = n_pause_unw = 0
+
+        def caps_for(t: str, e: dict) -> dict:
+            """{side key: N} for the sides --side-cap holds, by the touch. SERIES "ALL"
+            caps every in-scope market (Jack 2026-11-07: "turn off quoting 90c+"). A
+            capped side that reduces our position (the wave dashboard's "pos") still
+            clears it: with flip-through the bot adds the position to N; without, the
+            side rests the position."""
+            out: dict = {}
+            if not side_caps or t not in touch:
+                return out
+            yb, ya, _lp = touch[t]
+            cost = {"bid_size": yb if yb > 0 else None, "ask_size": 100 - ya if 0 < ya < 100 else None}
+            pos_c = float((rows.get(t) or {}).get("pos") or 0) if rows else 0.0
+            for cs_, cc_, cn_ in side_caps:
+                if cs_ in ("ALL", "*") or t.split("-")[0] == cs_:
+                    for k, c in cost.items():
+                        if c is not None and c >= cc_:
+                            reduces = (k == "bid_size" and pos_c <= -1) or (k == "ask_size" and pos_c >= 1)
+                            out[k] = (max(cn_, int(abs(pos_c)))
+                                      if reduces and not e.get("flip_through") else cn_)
+            return out
         for t, e in (cur.get("markets") or {}).items():
             if not in_scope(t):
                 continue
@@ -266,7 +305,8 @@ def main() -> int:
                 e["bid_max"], e["ask_min"] = b0 + r, a0 - r
                 e["widened"] = f"{stamp}: limits {b0}/{a0} -> {b0 + r}/{a0 - r} ({a.room}c room each way) {a.note}".strip()
                 n_room += 1
-            if a.price_min is not None and a.price_max is not None and (
+            if a.price_min is not None and a.price_max is not None and not (
+                    isinstance(e.get("tpause"), dict) and e["tpause"].get("mode") == "off") and (
                     e.get("price_min") != a.price_min or e.get("price_max") != a.price_max):
                 e["price_min"], e["price_max"] = a.price_min, a.price_max
                 e["band"] = f"{stamp}: {a.price_min}-{a.price_max}c {a.note}".strip()
@@ -300,20 +340,33 @@ def main() -> int:
             # scale it down to base contract sizes"): N a side, no --size-mult, bank step or
             # cheap tier. Band, limits, flip-through etc. above still apply. In the task's
             # args, so a relit entry (rebuilt by the scanner) is pinned again.
-            pin = pins.get(t)
+            # ...or every market of a series (--pin-series SERIES:N[:flat], Jack 2026-11-07 on
+            # the 14 markets settling before July 2028: "all 14 to 300, keep position unwinds")
+            s_t = t.split("-")[0]
+            pin = pins.get(t) if t in pins else pin_series.get(s_t)
             if pin is not None:
-                if int(e.get("size") or 0) != pin or any(k in e for k in ("bid_size", "ask_size", "cheap_sides")):
+                is_flat = t in pin_flat or (t not in pins and s_t in pin_series_flat)
+                # the --side-cap still holds on a pinned market ("turn off quoting 90c+")
+                want_sides = caps_for(t, e)
+                have_sides = {k: int(e[k]) for k in ("bid_size", "ask_size") if k in e}
+                if int(e.get("size") or 0) != pin or have_sides != want_sides \
+                        or set(e.get("cheap_sides") or []) != set(want_sides):
                     for k in ("bid_size", "ask_size", "cheap_sides", "pre_bank"):
                         e.pop(k, None)
                     e["size"] = pin
-                    e["pinned"] = f"{stamp}: {pin} a side (no size mult, bank step or cheap tiers) {a.note}".strip()
+                    e.update(want_sides)
+                    if want_sides:
+                        e["cheap_sides"] = sorted(want_sides)
+                    e["pinned"] = (f"{stamp}: {pin} a side (no size mult, bank step or cheap tiers"
+                                   + (f"; capped {', '.join(f'{k.split(chr(95))[0]} {v}' for k, v in sorted(want_sides.items()))}"
+                                      if want_sides else "") + f") {a.note}").strip()
                     n_pin += 1
                 # ...":flat" (Jack 2026-11-07 on Jeffries long 450: "try to fully offset the
                 # exposure, so quote 450"): the reducing side rests max(N, position), not
                 # N + position -- one fill flattens it and none goes past flat (the bot's
                 # "flip_to_flat")
-                if (t in pin_flat) != bool(e.get("flip_to_flat")):
-                    if t in pin_flat:
+                if is_flat != bool(e.get("flip_to_flat")):
+                    if is_flat:
                         e["flip_to_flat"] = True
                     else:
                         e.pop("flip_to_flat", None)
@@ -420,7 +473,7 @@ def main() -> int:
                             n_up += 1
                         else:
                             n_down += 1
-            if (tiers or stiers) and t in touch:
+            if (tiers or stiers or side_caps) and t in touch:
                 # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
                 # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
                 # the market's size for the first tier with c <= C (Jack 2026-11-07:
@@ -437,11 +490,21 @@ def main() -> int:
                             if c <= cpx:
                                 mult[k] = cm
                                 break
-                now_c = set(mult)
+                # SIDE CAP (--side-cap SERIES:C:N, Jack 2026-11-07 on the House sweep: "its ok to
+                # quote if it's 5c of cash held but not if its 95c of cash held"): a side of SERIES
+                # whose fill ties up >= C c a contract rests N (the bot's floor is 1). With
+                # flip-through, the side that reduces a position still rests N + the position.
+                capk = caps_for(t, e)
+                now_c = set(mult) | set(capk)
                 prev_c = set(e.get("cheap_sides") or [])
                 ch = now_c != prev_c
                 for k in ("bid_size", "ask_size"):
-                    if k in now_c:
+                    if k in capk:
+                        want_k = int(capk[k])
+                        if int(e.get(k) or 0) != want_k:
+                            e[k] = want_k
+                            ch = True
+                    elif k in now_c:
                         want_k = int(round(sz * mult[k]))
                         if int(e.get(k) or 0) != want_k:
                             e[k] = want_k
@@ -455,8 +518,68 @@ def main() -> int:
                 if ch:
                     n_cheap += 1
                     e["cheap"] = (f"{stamp}: touch {yb:g}x{ya:g} -> "
-                                  + (", ".join(f"{k.split('_')[0]} {e[k]} (x{mult[k]:g})" for k in sorted(now_c)) or "none cheap")
+                                  + (", ".join(f"{k.split('_')[0]} {e[k]} "
+                                               + (f"(cap: {cost[k]:g}c a contract)" if k in capk else f"(x{mult[k]:g})")
+                                               for k in sorted(now_c)) or "none cheap")
                                   + f" {a.note}").strip()
+            # PAUSE AT (--pause-at SERIES:C, Jack 2026-11-07 on the House sweep: "fine to quote
+            # everything besides the 90c+ markets", "dont pause the legs that would unwind the
+            # positions"): a market of SERIES whose bid or last trade is >= C (back under C - 2
+            # to resume) quotes nothing -- price band 99..1 -- or, holding a position (the wave
+            # dashboard's "pos"), only the side that unwinds it: "max_position" 1 +
+            # "flip_to_flat", so the bot rests max(size, position) there and has no room on the
+            # other side. Its own fields come back when it resumes.
+            pc = pause_at.get(t.split("-")[0])
+            if pc is None and isinstance(e.get("tpause"), dict):
+                # its series left --pause-at: its own fields come back
+                for k, v in e["tpause"]["orig"].items():
+                    if v is None:
+                        e.pop(k, None)
+                    else:
+                        e[k] = v
+                e.pop("tpause", None)
+                n_pause += 1
+            if pc is not None:
+                tp = e.get("tpause") if isinstance(e.get("tpause"), dict) else None
+                mode = tp.get("mode") if tp else None
+                if t in touch:
+                    yb, ya, lp = touch[t]
+                    # the 2c hysteresis holds only under the threshold it was paused at (Jack
+                    # 2026-11-07 raised 90 -> 93: "reopen 90-92" -- a 91c market resumes at once)
+                    same = bool(mode) and tp.get("pc") is not None and float(tp["pc"]) == pc
+                    hot = max(yb, lp) >= (pc - 2 if same else pc)
+                else:
+                    yb = ya = lp = 0.0
+                    hot = mode is not None          # no read: leave it as it is
+                if rows:
+                    pos = float((rows.get(t) or {}).get("pos") or 0)
+                else:
+                    pos = float((tp or {}).get("pos") or 0)
+                want = None if not hot else ("unwind" if abs(pos) >= 1 else "off")
+                if want and want == mode and tp.get("pc") != pc:
+                    tp["pc"] = pc
+                    n_pause += 1
+                if want != mode:
+                    if tp:
+                        for k, v in tp["orig"].items():
+                            if v is None:
+                                e.pop(k, None)
+                            else:
+                                e[k] = v
+                        e.pop("tpause", None)
+                    if want:
+                        orig = {k: e.get(k) for k in ("price_min", "price_max", "max_position", "flip_to_flat")}
+                        if want == "off":
+                            e["price_min"], e["price_max"] = 99, 1
+                        else:
+                            e["max_position"], e["flip_to_flat"] = 1, True
+                        e["tpause"] = {"mode": want, "since": stamp, "pos": pos, "orig": orig, "pc": pc,
+                                       "touch": f"{yb:g}x{ya:g} last {lp:g}"}
+                    n_pause += 1
+                    if want == "off":
+                        n_pause_off += 1
+                    elif want == "unwind":
+                        n_pause_unw += 1
         msg = (f"{stamp} {len(series)} series since {a.since}: {n_seen} live entries, "
                f"{n_room} widened {a.room}c, {n_band} banded "
                f"{a.price_min}-{a.price_max}c" if a.price_min is not None else
@@ -483,8 +606,13 @@ def main() -> int:
             msg += f"; sizes x{a.size_mult:g}: {n_scaled} re-scaled"
         if pins:
             msg += f"; pinned ({', '.join(f'{k} {v}' for k, v in sorted(pins.items()))}): {n_pin} set"
+        if pause_at:
+            n_paused_now = sum(1 for e in (cur.get("markets") or {}).values()
+                               if isinstance(e.get("tpause"), dict))
+            msg += (f"; paused at ({', '.join(f'{k} {v:g}c' for k, v in sorted(pause_at.items()))}): "
+                    f"{n_paused_now} paused now ({n_pause} changed: {n_pause_off} off, {n_pause_unw} unwind-only)")
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled or n_pin):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled or n_pin or n_pause):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:

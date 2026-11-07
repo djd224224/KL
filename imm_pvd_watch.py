@@ -396,7 +396,7 @@ def poll(client, hist: dict) -> dict:
     # segmented by price"): by what a fill ties up a contract -- a bid its price, an
     # ask 100 - its price -- the cheap-side tiers' bands, then 30-50 / 50-70 / 70-90 / 90+
     bands = [{"band": lbl, "hi": hi, "fills": 0, "ct": 0.0, "used": 0.0, "open_ct": 0.0, "held": 0.0,
-              "open_pl": 0.0, "q_ct": 0.0, "q_usd": 0.0, "rew": 0.0, "rate": 0.0} for hi, lbl in PRICE_BANDS]
+              "open_pl": 0.0, "q_ct": 0.0, "q_n": 0, "q_usd": 0.0, "rew": 0.0, "rate": 0.0} for hi, lbl in PRICE_BANDS]
 
     def band_of(cost_c: float) -> dict:
         for b in bands:
@@ -464,6 +464,7 @@ def poll(client, hist: dict) -> dict:
             best = max(p for p, _q in lv) if side == "bid" else min(p for p, _q in lv)
             b = band_of(best if side == "bid" else 100 - best)
             b["q_ct"] += sum(q for _p, q in lv)
+            b["q_n"] += 1           # quoted sides: avg quote size = q_ct / q_n (Jack 2026-11-07)
             b["q_usd"] += sum(q * (p if side == "bid" else 100 - p) for p, q in lv) / 100.0
             b["rew"] += r.get("est", 0.0) * w
             b["rate"] += r.get("rate", 0.0) * w
@@ -627,7 +628,7 @@ tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 <h2>Pacing this period <span class="mut" id="pacesub" style="font-weight:400;font-size:12px"></span></h2>
 <div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Pacing to</th><th>Markets</th><th>Share</th><th>Est $/day now</th><th>Proj. this period</th><th>Earning $0 now</th></tr></thead><tbody id="pace"></tbody></table></div>
 <h2>Quotes, rewards, fills and cash by price <span class="mut" style="font-weight:400;font-size:12px">(by what a fill ties up a contract: a bid its price, an ask 100 - its price; quotes now, the rest since go-live; a market's rewards split between its sides by each side's share of its book, an estimate)</span></h2>
-<div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Cost per contract</th><th>Quoted contracts</th><th>Quoted $</th><th>Rewards so far</th><th>Rewards / contract</th><th>Est $/day now</th><th>Fills</th><th>Contracts filled</th><th>Cash used</th><th>Open contracts</th><th>Cash held now</th><th>Open P&amp;L (at last)</th></tr></thead><tbody id="byprice"></tbody></table></div>
+<div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Cost per contract</th><th>Quoted contracts</th><th>Avg quote size</th><th>Quoted $</th><th>Rewards so far</th><th>Rewards / contract</th><th>Est $/day now</th><th>Fills</th><th>Contracts filled</th><th>Cash used</th><th>Open contracts</th><th>Cash held now</th><th>Open P&amp;L (at last)</th></tr></thead><tbody id="byprice"></tbody></table></div>
 <div class="wrap" style="padding:8px 12px"><div class="mut key">Cumulative since go-live, a point every 5 min:
 <b style="color:var(--est)">&#9644; est rewards</b> &nbsp;<b style="color:var(--trade)">&#9644; trading P&amp;L</b> &nbsp;<b>&#9644; net</b></div>
 <svg id="chart" viewBox="0 0 800 220" style="width:100%;height:220px;display:block"></svg></div>
@@ -676,12 +677,13 @@ function render(){
   if(bp.length){
     const S=k=>bp.reduce((a,b)=>a+(b[k]||0),0);
     const rpc=(r,c)=>c?'$'+(r/c).toFixed(4):'';
-    $('byprice').innerHTML=bp.map(b=>`<tr><td>${b.band}</td><td>${b.q_ct?Math.round(b.q_ct).toLocaleString():''}</td><td>${b.q_usd?money(b.q_usd):''}</td>`+
+    const avg=(c,n)=>n?`${Math.round(c/n).toLocaleString()} <span class="mut">(${n.toLocaleString()} sides)</span>`:'';
+    $('byprice').innerHTML=bp.map(b=>`<tr><td>${b.band}</td><td>${b.q_ct?Math.round(b.q_ct).toLocaleString():''}</td><td>${avg(b.q_ct,b.q_n)}</td><td>${b.q_usd?money(b.q_usd):''}</td>`+
       `<td style="color:var(--est)">${b.rew?money(b.rew):''}</td><td>${rpc(b.rew,b.q_ct)}</td><td>${b.rate?money(b.rate):''}</td>`+
       `<td>${b.fills||''}</td><td>${b.ct?Math.round(b.ct).toLocaleString():''}</td>`+
       `<td>${b.used?money(b.used):''}</td><td>${b.open_ct?Math.round(b.open_ct).toLocaleString():''}</td><td><b>${b.held?money(b.held):''}</b></td>`+
       `<td class="${cls(b.open_pl)}">${b.open_ct?money(b.open_pl):''}</td></tr>`).join('')+
-      `<tr><td class="mut">total</td><td>${Math.round(S('q_ct')).toLocaleString()}</td><td>${money(S('q_usd'))}</td><td style="color:var(--est)">${money(S('rew'))}</td>`+
+      `<tr><td class="mut">total</td><td>${Math.round(S('q_ct')).toLocaleString()}</td><td>${avg(S('q_ct'),S('q_n'))}</td><td>${money(S('q_usd'))}</td><td style="color:var(--est)">${money(S('rew'))}</td>`+
       `<td>${rpc(S('rew'),S('q_ct'))}</td><td>${money(S('rate'))}</td><td>${S('fills')}</td><td>${Math.round(S('ct')).toLocaleString()}</td><td>${money(S('used'))}</td>`+
       `<td>${Math.round(S('open_ct')).toLocaleString()}</td><td><b>${money(S('held'))}</b></td><td class="${cls(S('open_pl'))}">${money(S('open_pl'))}</td></tr>`;
   }
