@@ -156,6 +156,9 @@ def main() -> int:
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
+    ap.add_argument("--hold-max", action="store_true",
+                    help="a market raised to --bank-max stays there for its period (no step back down "
+                         "to --bank-size before it banks)")
     ap.add_argument("--size-mult", type=float, default=1.0,
                     help="every size is X times what the rules give (bank size, bank max, base size, a banked "
                          "market's kept size; the cheap tiers multiply it); the bank-early test stays on the "
@@ -343,7 +346,13 @@ def main() -> int:
                     if not done and old < B and pre is None and not a.base_size:
                         e["pre_bank"] = {"size": old, "bid_size": e.get("bid_size"), "ask_size": e.get("ask_size")}
                     why = ""
-                    if not done and a.bank_max and rows:
+                    if not done and a.hold_max and M and old >= M:
+                        # --hold-max: a market at the bank max stays there for its period (Jack
+                        # 2026-11-07, "increase by 1.5x again everything 1c - 70c": the bigger
+                        # cheap sides earn more, and the 25%-spare step down to the bank size
+                        # would cut every side of the market by a third, undoing the raise)
+                        want, why = old, "at the bank max: held (--hold-max)"
+                    elif not done and a.bank_max and rows:
                         x = rows.get(t)
                         rate = float((x or {}).get("rate") or 0)
                         if x and float(x.get("rest_ct") or 0) > 0 and rate > 0:
