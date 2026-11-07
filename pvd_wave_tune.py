@@ -19,6 +19,9 @@ after --since, series in --series), idempotently:
                      size in "pre_bank" and goes back to it once banked (Jack
                      2026-11-07: "dont go lower than 200 on any market right now
                      until hitting $1.30 threshold" -- the other waves' own sizes).
+  --no-drop          once banked, a market KEEPS its size: no drop to --base-size, no
+                     return to its pre_bank size (Jack 2026-11-07: "dont drop any size
+                     after banking 1.3")
   --series ALL --exclude-series A,B
                      every listed series except those (another wave's own pass).
   --bank-url/--bank-max/--bank-by-hrs
@@ -148,6 +151,8 @@ def main() -> int:
     ap.add_argument("--bank-usd", type=float, default=1.30)
     ap.add_argument("--bank-hist", help="imm_pvd_watch history.json of the wave's dashboard")
     ap.add_argument("--bank-stale-min", type=float, default=30.0)
+    ap.add_argument("--no-drop", action="store_true",
+                    help="a market that has banked --bank-usd keeps its size (no drop to --base-size or back to its own)")
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
@@ -275,64 +280,67 @@ def main() -> int:
                         e["bid_max"], e["ask_min"] = b1, a1
                         e["anchored"] = f"{stamp}: touch {yb:g}x{ya:g} -> limits {b1}/{a1} (were {b0}/{a0})"
                         n_anch += 1
-            if bank is not None:
-                pk, pv = bank.get(t) or [None, 0.0]
-                banked = float(pv) if pk == (e.get("period_start") or "wave-1104") else 0.0   # the dashboard's key
-                done = banked >= a.bank_usd
-                n_banked += done
-                old = int(e.get("size") or 0)
-                pre = e.get("pre_bank") if isinstance(e.get("pre_bank"), dict) else None
-                if done and not a.base_size:
-                    # no --base-size: back to the entry's OWN size from before the raise
-                    if pre is not None:
-                        e.pop("pre_bank", None)
+            for _once in (0,):         # the bank step; break (not continue) keeps the tier step below
+                if bank is not None:
+                    pk, pv = bank.get(t) or [None, 0.0]
+                    banked = float(pv) if pk == (e.get("period_start") or "wave-1104") else 0.0   # the dashboard's key
+                    done = banked >= a.bank_usd
+                    n_banked += done
+                    old = int(e.get("size") or 0)
+                    pre = e.get("pre_bank") if isinstance(e.get("pre_bank"), dict) else None
+                    if done and a.no_drop:
+                        break               # banked: keep the size it has (Jack 2026-11-07: "dont drop any size after banking 1.3")
+                    if done and not a.base_size:
+                        # no --base-size: back to the entry's OWN size from before the raise
+                        if pre is not None:
+                            e.pop("pre_bank", None)
+                            for k in ("bid_size", "ask_size"):
+                                e.pop(k, None)
+                            e.update({k: v for k, v in pre.items() if v is not None})
+                            e["bank"] = (f"{stamp}: banked ${banked:.2f} this period -> back to its own "
+                                         f"{pre.get('size')} a side {a.note}").strip()
+                            n_down += 1
+                        break
+                    want = a.base_size if done else a.bank_size
+                    if not done and old < a.bank_size and pre is None and not a.base_size:
+                        e["pre_bank"] = {"size": old, "bid_size": e.get("bid_size"), "ask_size": e.get("ask_size")}
+                    why = ""
+                    if not done and a.bank_max and rows:
+                        x = rows.get(t)
+                        rate = float((x or {}).get("rate") or 0)
+                        if x and float(x.get("rest_ct") or 0) > 0 and rate > 0:
+                            sz = float(x.get("size") or old or a.bank_size)
+                            r_bank = rate * a.bank_size / max(sz, 1.0)
+                            hrs = max(0.0, float(x.get("hrs_left") or 0) - a.bank_by_hrs)
+                            p_by = banked + r_bank * hrs / 24.0
+                            # up when the bank size misses; back down only with 25% to spare
+                            # (so a market doesn't flap between the two sizes poll to poll)
+                            if p_by < a.bank_usd or (old >= a.bank_max and p_by < 1.25 * a.bank_usd):
+                                want = a.bank_max
+                                why = (f"${p_by:.2f} by {a.bank_by_hrs:g}h before the stop at {a.bank_size} "
+                                       f"(${r_bank:.2f}/day)")
+                        elif old > a.bank_size:
+                            # nothing resting, or earning $0 (outside the scoring window: size
+                            # won't help) -- an already-raised market keeps its size
+                            want, why = old, "nothing earning now: kept"
+                    n_max += (want == a.bank_max and not done and bool(a.bank_max))
+                    # a side the scanner sized above the bank size (a decided side at 300) keeps its own
+                    # size, as does a cheap side (--cheap-mult re-sizes it below)
+                    cs = set(e.get("cheap_sides") or [])
+                    sides = {k: e[k] for k in ("bid_size", "ask_size")
+                             if k in e and (int(e[k]) > a.bank_size or k in cs)}
+                    if old != want or any(k in e and k not in sides for k in ("bid_size", "ask_size")):
                         for k in ("bid_size", "ask_size"):
                             e.pop(k, None)
-                        e.update({k: v for k, v in pre.items() if v is not None})
-                        e["bank"] = (f"{stamp}: banked ${banked:.2f} this period -> back to its own "
-                                     f"{pre.get('size')} a side {a.note}").strip()
-                        n_down += 1
-                    continue
-                want = a.base_size if done else a.bank_size
-                if not done and old < a.bank_size and pre is None and not a.base_size:
-                    e["pre_bank"] = {"size": old, "bid_size": e.get("bid_size"), "ask_size": e.get("ask_size")}
-                why = ""
-                if not done and a.bank_max and rows:
-                    x = rows.get(t)
-                    rate = float((x or {}).get("rate") or 0)
-                    if x and float(x.get("rest_ct") or 0) > 0 and rate > 0:
-                        sz = float(x.get("size") or old or a.bank_size)
-                        r_bank = rate * a.bank_size / max(sz, 1.0)
-                        hrs = max(0.0, float(x.get("hrs_left") or 0) - a.bank_by_hrs)
-                        p_by = banked + r_bank * hrs / 24.0
-                        # up when the bank size misses; back down only with 25% to spare
-                        # (so a market doesn't flap between the two sizes poll to poll)
-                        if p_by < a.bank_usd or (old >= a.bank_max and p_by < 1.25 * a.bank_usd):
-                            want = a.bank_max
-                            why = (f"${p_by:.2f} by {a.bank_by_hrs:g}h before the stop at {a.bank_size} "
-                                   f"(${r_bank:.2f}/day)")
-                    elif old > a.bank_size:
-                        # nothing resting, or earning $0 (outside the scoring window: size
-                        # won't help) -- an already-raised market keeps its size
-                        want, why = old, "nothing earning now: kept"
-                n_max += (want == a.bank_max and not done and bool(a.bank_max))
-                # a side the scanner sized above the bank size (a decided side at 300) keeps its own
-                # size, as does a cheap side (--cheap-mult re-sizes it below)
-                cs = set(e.get("cheap_sides") or [])
-                sides = {k: e[k] for k in ("bid_size", "ask_size")
-                         if k in e and (int(e[k]) > a.bank_size or k in cs)}
-                if old != want or any(k in e and k not in sides for k in ("bid_size", "ask_size")):
-                    for k in ("bid_size", "ask_size"):
-                        e.pop(k, None)
-                    e.update(sides)
-                    e["size"] = want
-                    e["bank"] = (f"{stamp}: banked ${banked:.2f} this period -> {want} a side "
-                                 f"({'past' if done else 'under'} ${a.bank_usd:.2f}"
-                                 f"{'; ' + why if why else ''}) {a.note}").strip()
-                    if want > old:
-                        n_up += 1
-                    else:
-                        n_down += 1
+                        e.update(sides)
+                        e["size"] = want
+                        e["bank"] = (f"{stamp}: banked ${banked:.2f} this period -> {want} a side "
+                                     f"({'past' if done else 'under'} ${a.bank_usd:.2f}"
+                                     f"{'; ' + why if why else ''}) {a.note}").strip()
+                        if want > old:
+                            n_up += 1
+                        else:
+                            n_down += 1
             if (tiers or stiers) and t in touch:
                 # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
                 # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
