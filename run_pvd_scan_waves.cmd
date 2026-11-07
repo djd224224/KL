@@ -50,7 +50,7 @@ set PVD_SCAN_DEAD_SIZE=200
 set PVD_SCAN_LIVE_SIZE=
 set PVD_SCAN_DEAD_SIZE=
 echo ===== %date% %time% pass 4: 2028 band, follow the book, bank early >> "%LOG%"
-"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 1 --price-max 99 --flip-through --no-halts --cushion 0 --reanchor 3 --cheap-tiers 5:2,15:1.5,30:1.25 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
+"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 1 --price-max 99 --flip-through --no-halts --follow-book --cushion 0 --reanchor 3 --series-tier KXDPRESPRIMARY:bid:2:20 --cheap-tiers 5:2,15:1.5,30:1.25 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
 rem 5 + 6. THE 200 FLOOR on the other waves (Jack 2026-11-07: "dont go lower than 200 on any market
 rem right now until hitting $1.30 threshold"): 200 a side until the wave's dashboard shows $1.30
 rem banked this period, then back to the entry's own size (pre_bank). Nothing else changes there.

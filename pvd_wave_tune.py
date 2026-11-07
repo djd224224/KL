@@ -40,6 +40,13 @@ after --since, series in --series), idempotently:
                      fill ties up a contract) rests X x the size for the first tier it
                      fits (Jack 2026-11-07: "double cheap sides" = <= 5c x2, then "1.5x on
                      size 5 to 15" = <= 15c x1.5); back to the size when it leaves them
+  --series-tier SERIES:SIDE:C:X  (repeatable)
+                     that series' SIDE costing <= C c rests X x the size, ahead of the
+                     general tiers (Jack 2026-11-07, "yes" to 10x on the 2028 Democratic
+                     primaries' 1-2c bids: KXDPRESPRIMARY:bid:2:10)
+  --follow-book      set "follow_book": the bot keeps the listed limits even with a last
+                     trade, and --reanchor re-anchors traded entries too (Jack 2026-11-07:
+                     "Yes, fix it" -- a stale last trade held a side out of the book)
   --cushion N        the entry's last-trade cushion (the bot: live 5c, dead 2c). With
                      a last trade the guard holds a bid N c under it and an ask N c over
                      it, ignoring bid_max / ask_min; at 0 a side may rest at the trade.
@@ -150,7 +157,11 @@ def main() -> int:
                     help='set "no_halts" (the bot: no sweep breaker, tape trigger, group or toxic halt on the series)')
     ap.add_argument("--cheap-mult", type=float, help="the cheap side rests this x the size")
     ap.add_argument("--cheap-px", type=float, default=5.0, help="cheap = a bid touch <= this c / an ask touch >= 100 - this c")
+    ap.add_argument("--series-tier", action="append", default=[],
+                    help="SERIES:SIDE:C:X -- for that series a SIDE (bid/ask) costing <= C c rests X x the size, ahead of --cheap-tiers")
     ap.add_argument("--cheap-tiers", default="", help="C:X,... -- a side costing <= C c a contract rests X x the size (first tier that fits)")
+    ap.add_argument("--follow-book", action="store_true",
+                    help='set "follow_book" (the bot keeps the listed limits with a last trade too) and re-anchor traded entries as well')
     ap.add_argument("--cushion", type=int)
     ap.add_argument("--reanchor", type=int)
     ap.add_argument("--note", default="")
@@ -161,6 +172,12 @@ def main() -> int:
     tiers = sorted((float(c), float(m)) for c, m in (x.split(":") for x in a.cheap_tiers.split(",") if x.strip()))
     if not tiers and a.cheap_mult:
         tiers = [(a.cheap_px, a.cheap_mult)]
+    stiers = {}                         # {(series, 'bid_size'/'ask_size'): [(C, X), ...]}
+    for x in a.series_tier:
+        ss, sd, cc, mm = x.split(":")
+        stiers.setdefault((ss, sd + "_size"), []).append((float(cc), float(mm)))
+    for v in stiers.values():
+        v.sort()
     exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
     all_series = series == {"ALL"}
 
@@ -174,7 +191,7 @@ def main() -> int:
     # the touches are read BEFORE the lock (18 calls for ~1,700 markets), so the
     # lock is held only for the read-modify-write of the list
     touch, missed = {}, 0
-    if a.reanchor is not None or tiers:
+    if a.reanchor is not None or tiers or stiers:
         pre = json.load(open(LIST, encoding="utf-8")).get("markets") or {}
         touch, missed = read_touches([t for t in pre if in_scope(t)])
     if a.write:
@@ -212,7 +229,7 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = 0
         for t, e in (cur.get("markets") or {}).items():
             if not in_scope(t):
                 continue
@@ -243,9 +260,12 @@ def main() -> int:
                 e["cushion_set"] = f"{stamp}: cushion {e.get('cushion')} -> {a.cushion} {a.note}".strip()
                 e["cushion"] = a.cushion
                 n_cush += 1
+            if a.follow_book and not e.get("follow_book"):
+                e["follow_book"] = True
+                n_follow += 1
             if a.reanchor is not None and t in touch:
                 yb, ya, lp = touch[t]
-                if lp > 0:
+                if lp > 0 and not e.get("follow_book"):
                     n_traded += 1           # the guard follows the last trade; bid_max / ask_min unused
                 else:
                     b0, a0 = int(e["bid_max"]), int(e["ask_min"])
@@ -313,7 +333,7 @@ def main() -> int:
                         n_up += 1
                     else:
                         n_down += 1
-            if tiers and t in touch:
+            if (tiers or stiers) and t in touch:
                 # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
                 # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
                 # the market's size for the first tier with c <= C (Jack 2026-11-07:
@@ -325,7 +345,8 @@ def main() -> int:
                 mult = {}
                 for k, c in cost.items():
                     if c is not None:
-                        for cpx, cm in tiers:
+                        # a series' own tier first (--series-tier), then the general ones
+                        for cpx, cm in stiers.get((t.split("-")[0], k), []) + tiers:
                             if c <= cpx:
                                 mult[k] = cm
                                 break
@@ -356,19 +377,23 @@ def main() -> int:
         if bank is not None:
             msg += (f"; bank early: {n_banked} past ${a.bank_usd:.2f} this period, "
                     f"{n_max} at {a.bank_max or a.bank_size}, {n_up} sized up, {n_down} sized down")
-        if tiers:
-            msg += (f"; cheap sides ({', '.join(f'<= {c:g}c x{m:g}' for c, m in tiers)}): {n_cheap} re-sized")
+        if tiers or stiers:
+            msg += (f"; cheap sides ({', '.join(f'<= {c:g}c x{m:g}' for c, m in tiers)}"
+                    + "".join(f"; {ss} {sd.split('_')[0]} " + ", ".join(f"<= {c:g}c x{m:g}" for c, m in v)
+                              for (ss, sd), v in sorted(stiers.items())) + f"): {n_cheap} re-sized")
         if a.flip_through:
             msg += f"; flip-through: {n_flip} set"
         if a.no_halts:
             msg += f"; no halts: {n_nohalt} set"
+        if a.follow_book:
+            msg += f"; follow_book: {n_follow} set"
         if a.cushion is not None:
             msg += f"; cushion {a.cushion}: {n_cush} set"
         if a.reanchor is not None:
             msg += (f"; follow the book ({a.reanchor}c off the touch): {n_anch} re-anchored, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
