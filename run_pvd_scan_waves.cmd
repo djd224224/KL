@@ -3,6 +3,8 @@ rem Relight scanner for the NON-election-mode waves (task "KL pvd-scan waves", e
 rem :00/:15/:30/:45 local, offset from "KL pvd-scan" at :07/:22/:37/:52 -- they share scan.lock).
 rem Jack 2026-11-06: "also do 2 and 3" (2 = a relight task for the political and 2028 waves).
 rem
+rem Pass 0 restarts a wave dashboard that is down or hung (pvd_watch_keepalive.ps1; Jack
+rem 2026-11-07: "Yes, add it"): bank-early in pass 4 reads the 8773 one.
 rem Each pass adds relit / new programs of its wave by ROI (bar $1.10); listed markets
 rem whose period is unchanged are left alone. Never places, cancels or removes.
 rem   1. political wave 11/06 (22 series), default sizes 80 live / 120 dead
@@ -22,6 +24,11 @@ set LOG=%KL%\run-logs\pvd-scan\waves-task.log
 set PVD_SCAN_BUDGET=300000
 set W28=KXHOUSERACE,KXDPRESPRIMARY,KXRPRESPRIMARY,KXPRESSTATE,KXPRESDISTRICT,KXPOPVOTE,KXGOVRACE,KXCHINA1
 cd /d %KL%
+echo ===== %date% %time% pass 0: dashboard keepalive (8773 2028 wave, 8771 political wave) >> "%LOG%"
+rem NOT ">> %LOG%": a dashboard started here would inherit cmd's handle on the log and hold
+rem it open for life, and every later ">> %LOG%" redirect (so every pass) would then fail.
+rem The keepalive appends its own lines to the log instead.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KL%\pvd_watch_keepalive.ps1" > nul 2>&1
 echo ===== %date% %time% pass 1: political wave 11/06 >> "%LOG%"
 "%PY%" "%KL%\pvd_scan.py" --series KXDCSTATEHOODHOUSE,KXGOPIMPEACHVOTES,KXGOVTSHUTLENGTH,KXHAGCHAIR,KXHEDUCATIONCHAIR,KXHJUDICIARYRM,KXHOUSEEXPANDLAW,KXITALYEXITTAX,KXJUDGECOUNTYEAR,KXNPVICSTATES,KXNRCCCHAIR,KXOVERSIGHTRM,KXPRSTATEHOUSE,KXROEHOUSE,KXSBANKINGCHAIR,KXSCOTUSEXPANDHOUSE,KXSCOTUSEXPANDLAW,KXSCOTUSTERMHOUSE,KXSHELPRM,KXSJUDICIARYRM,KXTARIFFREPEAL,KXTRUMPGOPCONVICT --no-vote-check --new-since 2026-11-05T18:00:00Z --write >> "%LOG%" 2>&1
 echo ===== %date% %time% pass 2: 2028 elections at 80 >> "%LOG%"

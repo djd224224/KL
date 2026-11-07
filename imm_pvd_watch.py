@@ -45,6 +45,10 @@ LIST_FILE = os.path.join(LOG_DIR, "post_vote_dead_books.json")
 # PVD_WATCH_GO_LIVE (ISO) for its go-live; defaults = the 11/04 election wave
 HIST_DIR = os.environ.get("PVD_WATCH_DIR") or os.path.join(HERE, "run-logs", "pvd-watch")
 HIST_FILE = os.path.join(HIST_DIR, "history.json")
+# ...and PVD_WATCH_SERIES (comma-separated EXACT series) to show only that wave's
+# markets: the list holds every wave at once (Jack 2026-11-07: "dash looks like it
+# has last time's markets still in here too"). Unset = every listed market.
+WAVE_SERIES = {s.strip() for s in (os.environ.get("PVD_WATCH_SERIES") or "").split(",") if s.strip()}
 # importing incentive_mm reads and writes its STATUS_DIR; keep this
 # read-only watcher off the live bot's files
 os.environ.setdefault("IMM_STATUS_DIR", os.path.join(tempfile.gettempdir(), "imm_pvd_watch_status"))
@@ -105,6 +109,8 @@ def load_list() -> dict:
             e = dict(s.get("entry") or {})
             e["stopped_at"] = s.get("at")
             out[t] = e
+    if WAVE_SERIES:
+        out = {t: e for t, e in out.items() if t.split("-")[0] in WAVE_SERIES}
     return out
 
 
