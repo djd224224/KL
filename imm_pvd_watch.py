@@ -103,6 +103,7 @@ def _ts(s):
 _mk_cache: dict = {}          # ticker -> last good market record
 _book_cache: dict = {}        # ticker -> last good orderbook
 _stale = {"markets": 0, "books": 0}
+_cash_cache: dict = {}        # last good /portfolio/balance read: free cash shard 0 / all shards
 
 
 def load_list() -> dict:
@@ -295,6 +296,19 @@ def poll(client, hist: dict) -> dict:
                 continue
             own[t].append((bp[0], bp[1], imm.order_remaining(o)))
     quoted = [t for t in tickers if own[t]]
+    # CASH (Jack 2026-11-07: "in dash, show how much cash is held up"): what this
+    # page's resting orders would tie up if every one filled (a bid its price, an
+    # ask 100 - its price, a contract; Kalshi reserves nothing for a resting
+    # order, so this is exposure, not cash gone) and the account's free cash
+    rest_coll = sum((px if sd == "bid" else 100 - px) * q
+                    for t in quoted for sd, px, q in own[t]) / 100.0
+    try:
+        _b = client.get("/portfolio/balance") or {}
+        _cash_cache.update(shard0=imm.ladder_cash(_b),
+                           total=float(_b["balance_dollars"]) if _b.get("balance_dollars") is not None else None,
+                           at=now.isoformat())
+    except Exception:  # noqa: BLE001 -- keep the last good read
+        pass
     bot_est = bot_est_fracs(set(quoted), now)
     _stale["books"] = 0
     with ThreadPoolExecutor(3) as ex:           # books only where the bot has no fresh row
@@ -383,7 +397,8 @@ def poll(client, hist: dict) -> dict:
     fill_series = {"t0": b0, "step": step, "bid": [round(v, 1) for v in fb_bid],
                    "ask": [round(v, 1) for v in fb_ask]}
     tot = {"real": 0.0, "open": 0.0, "cost": 0.0, "fills": len(fills),
-           "fill_ct": sum(_f(f.get("count")) for f in fills)}
+           "fill_ct": sum(_f(f.get("count")) for f in fills), "rest_coll": round(rest_coll, 2),
+           "cash0": _cash_cache.get("shard0"), "cash_all": _cash_cache.get("total"), "cash_at": _cash_cache.get("at")}
     for t, r in rows.items():
         mark = r["last"] if r["last"] is not None else (
             (r["bid"] + r["ask"]) / 2 if r["bid"] and r["ask"] else None)
@@ -618,7 +633,9 @@ function render(){
     ['','Est reward rate now',money(t.rate)+'/day',`raw model; Kalshi has paid ~1.15x`],
     ['','Markets quoting',`${t.quoted} / ${t.listed}`,`${t.two_sided} scoring both sides &middot; ${t.rest_ct.toLocaleString()} contracts resting${t.ended?` &middot; ${t.ended} past their stop`:''}`],
     ['','This period vs $1',`<span class="up">${t.period_ok}</span> / <span class="dn">${t.period_short}</span>`,`active markets projected over / under $1 by their stop`],
-    ['','Fills since go-live',`${t.fills}`,`${Math.round(t.fill_ct).toLocaleString()} contracts &middot; open cost ${money(t.cost)}`]
+    ['','Fills since go-live',`${t.fills}`,`${Math.round(t.fill_ct).toLocaleString()} contracts &middot; open cost ${money(t.cost)}`],
+    ['big','Cash held in positions',money(t.cost),`this page's fills since go-live, at cost &middot; free cash ${t.cash0!=null?money(t.cash0):'-'} (shard 0)${t.cash_all!=null?` / ${money(t.cash_all)} all shards`:''}`],
+    ['','If every resting order filled',money(t.rest_coll||0),`what this page's resting orders would tie up (Kalshi reserves nothing for them until a fill)`]
   ].map(([c,k,v,s])=>`<div class="tile ${c}"><span class="mut">${k}</span><b>${v}</b><small>${s}</small></div>`).join('');
   $('kinds').innerHTML=(d.by_kind||[]).map(k=>`<tr><td><span class="tag ${k.kind}">${k.kind} books</span></td><td>${k.n}</td><td>${k.quoted}</td>
     <td style="color:var(--est)">${money(k.est)}</td><td class="${cls(k.trade)}"><b>${money(k.trade)}</b></td><td class="mut">${money(k.real)} / ${money(k.open)}</td>
