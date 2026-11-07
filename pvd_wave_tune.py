@@ -156,6 +156,8 @@ def main() -> int:
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
+    ap.add_argument("--pin", action="append", default=[],
+                    help="TICKER:N -- that market rests N a side: no --size-mult, bank step or cheap tier")
     ap.add_argument("--hold-max", action="store_true",
                     help="a market raised to --bank-max stays there for its period (no step back down "
                          "to --bank-size before it banks)")
@@ -192,6 +194,13 @@ def main() -> int:
         v.sort()
     exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
     all_series = series == {"ALL"}
+    pins, pin_flat = {}, set()
+    for x in a.pin:                 # TICKER:N or TICKER:N:flat
+        pp = [s.strip() for s in x.split(":")]
+        if len(pp) >= 2:
+            pins[pp[0]] = int(pp[1])
+            if len(pp) > 2 and pp[2].lower() == "flat":
+                pin_flat.add(pp[0])
 
     def in_scope(t: str) -> bool:
         s = t.split("-")[0]
@@ -241,7 +250,7 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = n_pin = 0
         for t, e in (cur.get("markets") or {}).items():
             if not in_scope(t):
                 continue
@@ -287,6 +296,29 @@ def main() -> int:
                         e["bid_max"], e["ask_min"] = b1, a1
                         e["anchored"] = f"{stamp}: touch {yb:g}x{ya:g} -> limits {b1}/{a1} (were {b0}/{a0})"
                         n_anch += 1
+            # PINNED (--pin TICKER:N, Jack 2026-11-07 on KXJEFFRIESFIRST-27FEB01: "too active,
+            # scale it down to base contract sizes"): N a side, no --size-mult, bank step or
+            # cheap tier. Band, limits, flip-through etc. above still apply. In the task's
+            # args, so a relit entry (rebuilt by the scanner) is pinned again.
+            pin = pins.get(t)
+            if pin is not None:
+                if int(e.get("size") or 0) != pin or any(k in e for k in ("bid_size", "ask_size", "cheap_sides")):
+                    for k in ("bid_size", "ask_size", "cheap_sides", "pre_bank"):
+                        e.pop(k, None)
+                    e["size"] = pin
+                    e["pinned"] = f"{stamp}: {pin} a side (no size mult, bank step or cheap tiers) {a.note}".strip()
+                    n_pin += 1
+                # ...":flat" (Jack 2026-11-07 on Jeffries long 450: "try to fully offset the
+                # exposure, so quote 450"): the reducing side rests max(N, position), not
+                # N + position -- one fill flattens it and none goes past flat (the bot's
+                # "flip_to_flat")
+                if (t in pin_flat) != bool(e.get("flip_to_flat")):
+                    if t in pin_flat:
+                        e["flip_to_flat"] = True
+                    else:
+                        e.pop("flip_to_flat", None)
+                    n_pin += 1
+                continue
             # SIZE MULTIPLIER (--size-mult, Jack 2026-11-07: "increase everything by 1.5x"):
             # an entry's sizes are scaled once to the new multiple (its size_mult key says
             # which it carries); the scanner writes a relit entry unscaled, so it is scaled
@@ -449,8 +481,10 @@ def main() -> int:
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
         if abs(a.size_mult - 1.0) > 1e-9 or n_scaled:
             msg += f"; sizes x{a.size_mult:g}: {n_scaled} re-scaled"
+        if pins:
+            msg += f"; pinned ({', '.join(f'{k} {v}' for k, v in sorted(pins.items()))}): {n_pin} set"
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled or n_pin):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
