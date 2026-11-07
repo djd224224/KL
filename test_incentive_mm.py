@@ -12339,6 +12339,11 @@ class TestCarbonArcFairGate(unittest.TestCase):
 
     def setUp(self):
         _clean_persist()
+        # the band breach rule is OFF in production since 2026-11-07
+        # (CA_FAIR_BAND_GATE); these tests keep exercising it behind the knob
+        _bg = mock.patch.object(imm, "CA_FAIR_BAND_GATE", True)
+        _bg.start()
+        self.addCleanup(_bg.stop)
         imm._ca_fair_state.update(mtime=0.0, entries={}, moved_at={},
                                   schedules={}, schedules_ts=0.0)
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
@@ -12766,6 +12771,25 @@ class TestCarbonArcFairGate(unittest.TestCase):
         self.assertFalse(any(s == "ask" for s, _p in q), q)
         self.assertEqual(bot._ca_unearning.get(self.T), {"ask"})
         self.assertNotIn(self.T, bot._ca_fair_stood)
+
+    def test_the_band_gate_is_off_by_default_and_the_data_holds_stay(self):
+        # Jack 2026-11-07: "Yes, drop it" (the gate study: net negative). A read
+        # far from the book caps nothing -- both sides quote -- while a moved
+        # read's hold still parks both sides
+        self.assertEqual(os.environ.get("IMM_CA_FAIR_BAND_GATE", "0"), "0")
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        with mock.patch.object(imm, "CA_FAIR_BAND_GATE", False):
+            bot = self._bot()
+            bot.run_cycle()
+            q = self._quotes(bot)
+            self.assertTrue(any(s == "bid" for s, _p in q), q)
+            self.assertTrue(any(s == "ask" for s, _p in q), q)
+            self.assertNotIn(self.T, bot._ca_fair_capped)
+            self.assertEqual(bot._ca_unearning.get(self.T, set()), set())
+            self._write_fair({"KXFAKECC": self._entry(98.0)})      # the read moves
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertIn(self.T, bot._ca_fair_stood)
 
     def test_cap_off_parks_both_sides_as_before(self):
         # IMM_CA_FAIR_CAP=0: the pre-2026-10-04 both-sides stand-aside

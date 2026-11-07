@@ -12679,7 +12679,7 @@ _CONFIG_CODE_KNOBS = (
     # the scheduled-data stand-aside (2026-10-15)
     "CA_SCHEDULE_HOLD", "CA_SCHEDULE_HOLD_CATS", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
     "CA_SCHEDULE_LATE_MAX_MIN",
-    "CA_FAIR_CAP",
+    "CA_FAIR_CAP", "CA_FAIR_BAND_GATE",
     # OpenRouter token-usage gate (2026-09-27); model knobs ride in the
     # fair file's "model" block (openrouter_fair.py)
     "OR_FAIR_ENABLE", "OR_FAIR_SERIES", "OR_FAIR_TOL_CENTS", "OR_FAIR_TTL_MIN",
@@ -14401,6 +14401,17 @@ _CA_STRIKE_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
 # the book moves through it, so it does not rest. The refresh hold still
 # parks both sides. IMM_CA_FAIR_CAP=0 restores the both-sides stand-aside.
 CA_FAIR_CAP = os.environ.get("IMM_CA_FAIR_CAP", "1") == "1"
+# BAND GATE OFF (Jack 2026-11-07: "Yes, drop it"), after the 11/07 study of
+# every gated episode 10/04-11/07 (run-logs\incentive-mm\ca_gate_value_1107,
+# pre-registered): the side cap above lost -$9.55/day share-scaled [90% day
+# range -12.83, -6.62] (-$6.46/day at the 0.63 paid basis) -- the trades it
+# blocked were makers' WINNERS at settlement, for ~$8/day of reward kept;
+# POS bids alone -$7.24/day (0 of 18 series positive). With the band gate
+# off no read caps or parks a side for disagreeing with the book; the data-
+# landing holds stay (the scheduled-data window and the hold after a moved
+# read, which park both sides -- not scored, kept). IMM_CA_FAIR_BAND_GATE=1
+# brings the breach rule back (as CA_FAIR_CAP says).
+CA_FAIR_BAND_GATE = os.environ.get("IMM_CA_FAIR_BAND_GATE", "0") == "1"
 
 
 def ca_fair_caps(lo_c: float, hi_c: float
@@ -33585,7 +33596,7 @@ class IncentiveMarketMaker:
         def _uw_gated(eb: Optional[int], ea: Optional[int]) -> bool:
             """Would the fair gate (CA_FAIR_CAP) cap the unwinding side on
             these touches -- its touch past the read's band + tolerance?"""
-            if _uw is None or not (CA_FAIR_ENABLE and CA_FAIR_CAP):
+            if _uw is None or not (CA_FAIR_ENABLE and CA_FAIR_CAP and CA_FAIR_BAND_GATE):
                 return False
             band = ca_fair_band(meta.ticker, _now.timestamp())
             if band is None:
@@ -35804,7 +35815,8 @@ class IncentiveMarketMaker:
                               f"{_ca_hold:g}m while the book reprices")
                     ca_in = dict(hold_min=_ca_hold)
                 else:
-                    band = ca_fair_band(t, now_ts)
+                    # (the band gate is off since 2026-11-07: CA_FAIR_BAND_GATE)
+                    band = ca_fair_band(t, now_ts) if CA_FAIR_BAND_GATE else None
                     if band is not None:
                         pc, plo, phi = band
                         ca_bid_bad, ca_ask_bad = fair_gate_breach(
@@ -35846,7 +35858,8 @@ class IncentiveMarketMaker:
                     self._ca_unearning.pop(t, None)
                     log(f"{self.tag} ca-fair uncapped {t}: "
                         + ("book back inside the read's band" if band is not None
-                           else "no usable read"))
+                           else "no usable read" if CA_FAIR_BAND_GATE
+                           else "the band gate is off"))
             if t in self._ca_fair_stood:
                 self._ca_fair_stood.discard(t)
                 log(f"{self.tag} ca-fair resume {t}")
@@ -39937,7 +39950,9 @@ class IncentiveMarketMaker:
                 + "".join(f" ({c} {m:g}m)" for c, m in sorted(CA_FAIR_REFRESH_HOLD_BY_CAT.items()))
                 + f", ttl {CA_FAIR_TTL_MIN}m, "
                 f"refresh {CA_FAIR_REFRESH_SECS}s, a breach "
-                + ("caps the side (rests only while it earns)" if CA_FAIR_CAP
+                + ("is ignored (band gate OFF since 2026-11-07, net negative: only the data holds park)"
+                   if not CA_FAIR_BAND_GATE
+                   else "caps the side (rests only while it earns)" if CA_FAIR_CAP
                    else "parks both sides")
                 + f", file {CA_FAIR_FILE}")
             # the fair's November mu for the online / BNPL card series carries
