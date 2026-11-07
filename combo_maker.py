@@ -220,21 +220,25 @@ class Config:
         self.burst_window_min = 30.0
         self.burst_pause_min = 60.0
         # LEG RUSH (same): one leg (ticker and side) in accepts from 2 or more requesters
-        # inside rush_window_min holds its game out rush_hold_min, every leg on it; the
-        # accept that trips it is declined ("leg_rush", then "game_held"): several buyers
-        # wanting the same leg off us at once is how a stale leg looks. The 11/06 replay:
-        # the tennis legs from 04:25Z, and once Real Madrid (03:04Z, two soccer
-        # parlays 16 min apart). 0 = off (here; the CLI's default is 30)
+        # inside rush_window_min holds its game out rush_hold_min, every leg on it: no
+        # new quote on the game ("game_held"). Several buyers wanting the same leg off
+        # us at once is how a stale leg looks. The 11/06 replay: the tennis legs from
+        # 04:25Z, and once Real Madrid (03:04Z, two soccer parlays 16 min apart). It
+        # never declines an accept -- the one that trips it, or one on a quote already
+        # out -- which goes on to its last look (Jack 2026-11-06: "dont turn down the
+        # accept. and stop quoting any parlay from that game for 30min, not 2 hours";
+        # it declined the tripping accept and held 120 min before). 0 = off (here; the
+        # CLI's default is 30)
         self.rush_window_min = 0.0
-        self.rush_hold_min = 120.0
+        self.rush_hold_min = 30.0
         # ...and only once the worst case on that game -- what its open tickets plus
         # the accept lose if every leg hits -- reaches rush_game_loss (Jack 2026-11-06:
         # "there needs to be an exposure cap to not quote it", then "set worse case
         # threshold to $200 on a game"). 11/06 8:21 PM ET a second requester's Warriors
         # leg held ORL-GSW 2 h with $54.69 riding on the game: a $7.24 6-leg ticket
-        # and the declined 66 at 28.1c. Under the bar the accept goes on to its last
-        # look, and the outcome and game caps bound it. 0 = any size holds (here; the
-        # CLI's default is $200)
+        # and the declined 66 at 28.1c. Under the bar the game stays quoted, and the
+        # outcome and game caps bound it. 0 = any size holds (here; the CLI's default
+        # is $200)
         self.rush_game_loss = 0.0
         # OUTCOME CAP (Jack 2026-11-06: "Limit exposure by outcome, not just by game"):
         # the payout that rides on one leg result (ticker and side) across the open
@@ -1190,6 +1194,8 @@ class Maker:
             self._decline(q, "requester_flagged", None, cts)
             return
         why = tripped or self._guard_block(q["legs"], now)
+        if why == "game_held":
+            why = None              # a held game stops new quotes only, never an accept (LEG RUSH)
         if why:
             self._decline(q, why, None, cts)
             return
@@ -1468,10 +1474,11 @@ class Maker:
         return sum(t["contracts"] * (1.0 - t["ask"]) for t in self.book.open() if game in t["games"])
 
     def _note_accept(self, q: dict, now: float, cts=None):
-        """Count an accept for the sport burst and the leg rush; the guard it trips
-        ("sport_burst" / "leg_rush": the accept is then declined) or None. The leg
-        rush holds a game only once its worst case, the accept's own (`cts`
-        contracts, else the quote's) included, reaches rush_game_loss."""
+        """Count an accept for the sport burst and the leg rush; "sport_burst" when
+        it trips the sport burst (the accept is then declined), else None. A leg rush
+        it trips holds the game's new quotes and lets the accept through; it holds
+        only once the game's worst case, the accept's own (`cts` contracts, else the
+        quote's) included, reaches rush_game_loss."""
         legs = tuple((str(l[0]), str(l[1])) for l in q["legs"])
         sports = tuple(sorted({sport_of(tk.split("-")[0]) for tk, _ in legs}))
         cr = q.get("cr") or ""
@@ -1511,7 +1518,6 @@ class Maker:
                     self.game_hold[g] = max(self.game_hold.get(g, 0.0), until)
                     self._guard_rec("leg_rush", g, until, f"{leg[0]} {leg[1]} accepted by {len(others) + 1} "
                                     f"requesters in {self.cfg.rush_window_min:g} min", now)
-                    why = why or "leg_rush"
         self._save_guards()
         return why
 
