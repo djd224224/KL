@@ -322,6 +322,11 @@ if ($Probe) {
     #   ~$28k account value). Note the hour/Saturday multipliers inflate
     #   the reservation: from 10/10 Saturday 0-8 ET runs x6, which can push
     #   it past $300k on those nights, so the budget may bind there again.
+    #   300000 -> 315000 (Jack 2026-11-07: "Raise to $315k"). At 13:11Z
+    #   11/07 the budget was full and 88 markets (~$158/day modelled, ~$14.7k
+    #   reservation) waited on it, including the 11 Super Bowl halftime
+    #   markets just allowlisted (KXSBSETLISTS / KXFIRSTSUPERBOWLSONG).
+    #   Default-shard cash was $14,850.
     # - MAX_TOTAL_RESTING 4000 -> 8000: peaked at 3,743 (94%). Untested
     #   above 4,000 resting on Kalshi.
     # - MAX_CANDIDATE_BOOKS 5000 -> 10000 (was the code default): peaked at
@@ -422,7 +427,7 @@ if ($Probe) {
     # EARNINGS x3 (Jack 2026-10-11: "increase it to 3x"): IMM_EARNINGS_SIZE_MULT_NEXT
     # 2.0 -> 3.0, FROM 2026-10-05 -> 2026-10-11 so the startup line reads true.
     # Env change: needs restart_imm.ps1 -Task.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=315000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
 }
 
 while ($true) {
