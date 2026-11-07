@@ -4093,9 +4093,11 @@ TOXIC_EXEMPT_WORDS = tuple(w.strip().upper() for w in os.environ.get(
 
 
 def toxic_exempt(series: str) -> bool:
-    # ... and an election night session (ENS_SERIES, 2026-11-03: no halting)
+    # ... and an election night session (ENS_SERIES, 2026-11-03: no halting),
+    # and a list entry's "no_halts" series (PVD_NO_HALT_SERIES, 2026-11-07)
     return (any(w in series for w in TOXIC_EXEMPT_WORDS)
-            or series in globals().get("ENS_SERIES", ()))
+            or series in globals().get("ENS_SERIES", ())
+            or series in globals().get("PVD_NO_HALT_SERIES", ()))
 
 
 # DROPPED MARKETS CARRY NO ORDERS (Jack 2026-09-07: "fine for market to get
@@ -4645,9 +4647,11 @@ SWEEP_HOLD_BY_PREFIX = _parse_hold_by_series(
 
 
 def sweep_exempt(series: str) -> bool:
-    # ... and an election night session (ENS_SERIES, 2026-11-03: no halting)
+    # ... and an election night session (ENS_SERIES, 2026-11-03: no halting),
+    # and a list entry's "no_halts" series (PVD_NO_HALT_SERIES, 2026-11-07)
     return (any(w in series for w in SWEEP_EXEMPT_WORDS)
-            or series in globals().get("ENS_SERIES", ()))
+            or series in globals().get("ENS_SERIES", ())
+            or series in globals().get("PVD_NO_HALT_SERIES", ()))
 
 
 def sweep_linked_series(series: str) -> Tuple[str, ...]:
@@ -9727,6 +9731,15 @@ PVD_MARKETS: Dict[str, dict] = {}
 # 23:50Z 11/04: 93 dropped markets kept quoting 9 minutes -- an ask at 0.6c)
 PVD_REMOVED: Set[str] = set()
 _pvd_state = {"mtime": 0.0, "forced": frozenset()}
+# NO HALTS BY LIST ENTRY (Jack 2026-11-07, on the 2028 election wave: "remove
+# any sweep breakers / halts on these markets", after KXHOUSERACE-WA07-28-D's
+# 97c fill pulled its event for 10 min): the series of any entry marked
+# "no_halts": true join sweep_exempt and toxic_exempt, as an election night
+# session's do -- no sweep breaker (or its linked holds), no tape trigger, no
+# cross-event group breaker (risk_group), no toxic halts. The WS fast cancel
+# and the account-level halts stay. By SERIES because the halts key on series
+# and events; the 2028 wave's series are its own.
+PVD_NO_HALT_SERIES: Set[str] = set()
 
 
 def pvd_path() -> str:
@@ -9832,6 +9845,8 @@ def load_pvd_markets() -> int:
                     # "flip_through": the reducing side rests its size PLUS the
                     # position (pvd_side_sizes)
                     "flip": bool(raw.get("flip_through")),
+                    # "no_halts": its series joins PVD_NO_HALT_SERIES
+                    "no_halts": bool(raw.get("no_halts")),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -9839,6 +9854,13 @@ def load_pvd_markets() -> int:
     PVD_REMOVED.difference_update(fresh)
     PVD_MARKETS.clear()
     PVD_MARKETS.update(fresh)
+    no_halt = {series_of(t) for t, e in fresh.items() if e.get("no_halts")}
+    if no_halt != PVD_NO_HALT_SERIES:
+        PVD_NO_HALT_SERIES.clear()
+        PVD_NO_HALT_SERIES.update(no_halt)
+        _risk_group_memo.clear()        # risk_group reads sweep_exempt
+        log(f"[IMM] post-vote dead books: no halts on {len(no_halt)} series"
+            + (f" ({', '.join(sorted(no_halt))})" if no_halt else ""))
     events = frozenset(e["event"] for e in fresh.values())
     base = FORCE_EVENTS - _pvd_state["forced"]
     added = events - base

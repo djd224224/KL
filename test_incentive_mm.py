@@ -256,6 +256,7 @@ def setUpModule():
     imm._pvd_state.update(mtime=0.0, forced=frozenset())
     imm.PVD_MARKETS.clear()
     imm.PVD_REMOVED.clear()
+    imm.PVD_NO_HALT_SERIES.clear()      # ...and its "no_halts" series (2026-11-07)
     imm.ELECTION_DATES_EXTRA[:] = []
     imm.AWARDS_DATES_EXTRA[:] = []
     imm._rows_extra_state.clear()
@@ -40349,6 +40350,29 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
                           for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
                          [("bid", 49, 40.0)])
+
+    def test_no_halts_entry_exempts_its_series(self):
+        """Jack 2026-11-07, on the 2028 election wave: "remove any sweep
+        breakers / halts on these markets" -- an entry's "no_halts" puts its
+        series in sweep_exempt (sweep breaker, tape trigger, its risk group)
+        and toxic_exempt, as an election night session's; off with the flag"""
+        s = self.T.split("-")[0]
+        self.assertFalse(imm.sweep_exempt(s) or imm.toxic_exempt(s))
+        self._write({self.T: {"bid_max": 40, "ask_min": 60, "no_halts": True},
+                     "KXOTHER-99DEC31-A": {"bid_max": 40, "ask_min": 60}})
+        self.assertEqual(imm.PVD_NO_HALT_SERIES, {s})
+        self.assertTrue(imm.PVD_MARKETS[self.T]["no_halts"])
+        self.assertTrue(imm.sweep_exempt(s) and imm.toxic_exempt(s))
+        self.assertFalse(imm.sweep_exempt("KXOTHER") or imm.toxic_exempt("KXOTHER"))
+        self.assertIsNone(imm.risk_group(self.T))
+        # the toxic halt reads it live: an event already halted stands down no longer
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        with mock.patch.object(imm, "TOXIC_HALT", True):
+            self.assertFalse(bot.toxic_market_halted(self.T, time.time()))
+        # the flag off (or the entry gone): halts again
+        self._write({self.T: {"bid_max": 40, "ask_min": 60}})
+        self.assertEqual(imm.PVD_NO_HALT_SERIES, set())
+        self.assertFalse(imm.sweep_exempt(s) or imm.toxic_exempt(s))
 
     def test_a_market_s_own_price_band(self):
         """Jack 2026-11-04: "also remove the range cap on these" -- an entry's
