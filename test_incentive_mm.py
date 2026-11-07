@@ -40027,6 +40027,12 @@ class TestBreakevenOffset(unittest.TestCase):
         # 60 is past breakeven; 48 is the best price at or under 50
         self.assertEqual(n, 30 + 110)
         self.assertEqual([q.count for q in out], [140, 30, 30])
+        # rungs at the best rung's price fold into it, so the raised rung is
+        # the level's only order (the backstop brackets that one rung)
+        dup = [Q("T", "bid", 48, 30), Q("T", "bid", 48, 20), Q("T", "bid", 45, 30)]
+        out, n = f(dup, -200, 50.0)
+        self.assertEqual(n, 30 + 20 + 120)
+        self.assertEqual([(q.price_cents, q.count) for q in out], [(48, 170), (45, 30)])
         # a sub-penny rung is judged at its exact price
         sp = [Q("T", "bid", 50, 30, price_exact=50.4)]
         self.assertEqual(f(sp, -200, 50.0), (sp, 0))
@@ -40636,3 +40642,169 @@ class TestSuperBowlHalftime(unittest.TestCase):
                 self.assertEqual(bot._screen(self._m(s, mid), now), "extreme_mid", (s, mid))
         # a series on the global band still screens a 3c fresh mid out
         self.assertEqual(bot._screen(self._m("KXFOO", 3.0), now), "extreme_mid")
+
+
+class TestCarbonArcUnwind(unittest.TestCase):
+    """Jack 2026-11-07: "carbon arc markets should try to hit the $1 payout
+    threshold + unwind positions at breakeven or better even if the rule is
+    not to place on that side / the fair gates it (if it results in
+    earning)". The fair gate's fixture (TestCarbonArcFairGate): a read of
+    mu 101.05 puts P(> 100) at 0.70, so the 51c ask touch is under 70 - 15 and
+    the gate floors the ask at 56c, behind the whole NO side."""
+
+    T = TestCarbonArcFairGate.T
+    setUp = TestCarbonArcFairGate.setUp
+    tearDown = TestCarbonArcFairGate.tearDown
+    _write_fair = TestCarbonArcFairGate._write_fair
+    _entry = TestCarbonArcFairGate._entry
+    _bot = TestCarbonArcFairGate._bot
+    _bump = property(lambda self: TestCarbonArcFairGate._bump)   # one mtime counter
+
+    def _hold(self, bot, pos, avg):
+        bot.client.positions[self.T] = pos
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = float(pos), float(avg)
+
+    def _side(self, bot, side):
+        return [o for o in bot.state.sim_orders.values()
+                if o["ticker"] == self.T and o["book_side"] == side]
+
+    # --- the pieces ---------------------------------------------------
+    def test_the_unwinding_side(self):
+        f = imm.ca_unwind_side
+        self.assertEqual(f("KXFAKECC", 200, 40.0), "ask")
+        self.assertEqual(f("KXFAKECC", -200, 60.0), "bid")
+        self.assertIsNone(f("KXNOTCACC", 200, 40.0))                 # not Carbon Arc
+        self.assertIsNone(f("KXFAKECC", 3, 40.0))                    # under the minimum
+        self.assertIsNone(f("KXFAKECC", 200, None))                  # no average
+        with mock.patch.object(imm, "CA_UNWIND", False):
+            self.assertIsNone(f("KXFAKECC", 200, 40.0))
+
+    def test_rungs_at_breakeven_or_better_else_at_breakeven(self):
+        Q, f = imm.Quote, imm.ca_unwind_rungs
+        qs = [Q("T", "ask", 51, 20), Q("T", "ask", 53, 20), Q("T", "bid", 49, 20),
+              Q("T", "ask", 99, 500, is_pad=True)]
+        self.assertEqual([(q.price_cents, q.count) for q in f(qs, "ask", 52.0)], [(53, 20)])
+        self.assertEqual(len(f(qs, "ask", 40.0)), 2)
+        # none at breakeven: the rung nearest the touch moves to it (rounded away)
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in f(qs, "ask", 54.2)],
+                         [("ask", 55, 20)])
+        self.assertEqual([(q.price_cents, q.count) for q in f(qs, "bid", 47.6)], [(47, 20)])
+        self.assertEqual(f(qs, "ask", 99.5), [])                     # past 99c: nothing
+        self.assertEqual(f([Q("T", "bid", 49, 20)], "ask", 40.0), [])  # no rung on that side
+
+    # --- end to end ---------------------------------------------------
+    def test_a_long_rests_its_whole_position_past_the_fair_gate(self):
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        bot = self._bot()
+        bot.run_cycle()
+        self.assertEqual(bot._ca_unearning.get(self.T), {"ask"})      # gated, flat
+        self.assertEqual(self._side(bot, "ask"), [])
+        self._hold(bot, 200, 40.0)
+        bot.run_cycle()
+        asks = [o for o in self._side(bot, "ask") if o["yes_price"] < 99]
+        self.assertEqual(sum(o["remaining_count"] for o in asks), 200)
+        self.assertTrue(all(o["yes_price"] >= 40 for o in asks), asks)
+        self.assertTrue(all(o["yes_price"] < 56 for o in asks), asks)   # under the gate's floor
+        self.assertEqual(bot._be_offset_n.get(self.T)[0], 200)        # the backstop's bracket
+        self.assertIn(self.T, bot._ca_unwind_noted)
+
+    def test_not_past_breakeven_and_only_while_it_earns(self):
+        # paid 55: the 51c touch would lock a loss, and 55c sits behind 1,100
+        # contracts at 51-53 against the 1,000 target -- it would not earn
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        bot = self._bot()
+        self._hold(bot, 200, 55.0)
+        bot.run_cycle()
+        self.assertEqual([o for o in self._side(bot, "ask") if o["yes_price"] < 99], [])
+        self.assertNotIn(self.T, bot._be_offset_n)
+
+    def test_a_short_keeps_its_bid_rules(self):
+        # short under the same read: the bid (the reducing side) was never gated,
+        # and the gated ask adds to the short -- the gate stands
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        bot = self._bot()
+        self._hold(bot, -200, 60.0)
+        bot.run_cycle()
+        self.assertEqual([o for o in self._side(bot, "ask") if o["yes_price"] < 99], [])
+        bids = [o for o in self._side(bot, "bid") if o["yes_price"] > 1]
+        self.assertEqual(sum(o["remaining_count"] for o in bids), 200)     # whole position
+        self.assertTrue(all(o["yes_price"] <= 60 for o in bids), bids)
+
+    def test_ungated_the_whole_position_at_breakeven_or_better(self):
+        # T119's case (Jack: "should try to hit the $1 payout threshold"): the
+        # read agrees with the book, the ask is not gated -- it rests the whole
+        # long at the touch when that is breakeven or better, whatever the
+        # stop's distance (the breakeven offset's 30 days do not apply)
+        self._write_fair({"KXFAKECC": self._entry(100.0)})
+        with mock.patch.object(imm, "BE_OFFSET_DAYS", 1_000_000):
+            bot = self._bot()
+            self._hold(bot, 160, 11.0)
+            bot.run_cycle()
+            asks = [o for o in self._side(bot, "ask") if o["yes_price"] < 99]
+            self.assertEqual(sum(o["remaining_count"] for o in asks), 160)
+            # paid more than the touch: the normal ask stays, no raise
+            bot2 = self._bot()
+            self._hold(bot2, 160, 70.0)
+            bot2.run_cycle()
+            asks2 = [o for o in self._side(bot2, "ask") if o["yes_price"] < 99]
+            self.assertLess(sum(o["remaining_count"] for o in asks2), 160)
+
+    def test_the_estimate_lifts_a_market_toward_its_dollar(self):
+        # the floor projection counts the whole-position ask, so a long under
+        # its $1 can be (re)admitted on it
+        self._write_fair({"KXFAKECC": self._entry(100.0)})
+        bot = self._bot()
+        bot.run_cycle()
+        meta = bot.state.selected[self.T]
+        bot._estimate_candidate_yield(meta, [])
+        flat, floor_flat = meta.est_frac, meta.floor_dollars_per_day
+        self._hold(bot, 160, 11.0)
+        bot._estimate_candidate_yield(meta, [])
+        self.assertGreater(meta.est_frac, flat)
+        self.assertGreater(meta.floor_dollars_per_day, floor_flat)
+        with mock.patch.object(imm, "CA_UNWIND", False):
+            bot._estimate_candidate_yield(meta, [])
+        self.assertAlmostEqual(meta.est_frac, flat, places=9)
+
+    def test_past_the_late_month_cut(self):
+        # the late-month rule zeroes the toxic side (asks here); a long's asks
+        # come back at the non-toxic size, at breakeven or better, then carry
+        # the position
+        self._write_fair({"KXFAKECC": self._entry(100.0)})            # the read agrees
+        past = datetime.now(timezone.utc) - timedelta(hours=1)
+        with mock.patch.object(imm, "ca_late_window_start", return_value=past), \
+                mock.patch.object(imm, "CA_LATE_TOXIC_SIDE", "ask"), \
+                mock.patch.object(imm, "CA_LATE_TOXIC_SIDE_BY_CAT", {}):
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual([o for o in self._side(bot, "ask") if o["yes_price"] < 99], [])
+            self._hold(bot, 120, 40.0)
+            bot.run_cycle()
+            asks = [o for o in self._side(bot, "ask") if o["yes_price"] < 99]
+            self.assertEqual(sum(o["remaining_count"] for o in asks), 120)
+            self.assertTrue(all(o["yes_price"] >= 40 for o in asks), asks)
+
+    def test_the_estimate_scores_the_unwind(self):
+        # the $1 floor projection sees the side the loop will rest: the whole
+        # position at breakeven or better, or nothing when that would not earn
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        bot = self._bot()
+        bot.run_cycle()
+        meta = bot.state.selected[self.T]
+        bot._estimate_candidate_yield(meta, [])
+        flat = meta.est_frac
+        self.assertGreater(flat, 0.0)
+        self._hold(bot, 200, 40.0)
+        bot._estimate_candidate_yield(meta, [])
+        self.assertGreater(meta.est_frac, flat)
+        self._hold(bot, 200, 55.0)
+        bot._estimate_candidate_yield(meta, [])
+        self.assertLess(meta.est_frac, flat)                          # the bid alone
+
+    def test_off_switch(self):
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        with mock.patch.object(imm, "CA_UNWIND", False):
+            bot = self._bot()
+            self._hold(bot, 200, 40.0)
+            bot.run_cycle()
+            self.assertEqual([o for o in self._side(bot, "ask") if o["yes_price"] < 99], [])

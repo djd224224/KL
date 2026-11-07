@@ -3187,8 +3187,86 @@ def breakeven_offset_quotes(quotes: List["Quote"], pos: float,
     if not ok or have >= want:
         return quotes, 0
     best = max(ok, key=px) if side == "bid" else min(ok, key=px)
-    n = best.count + (want - have)
-    return [replace(q, count=n) if q is best else q for q in quotes], n
+    # rungs sharing the best rung's price fold into it (2026-11-07): the
+    # placement backstop brackets the raised rung alone, so a same-price
+    # sibling beside it was refused as over the level cap (a safe-joined
+    # ladder collapses its rungs onto one price off the at-ref mode)
+    key = (best.price_cents, best.price_exact)
+    same = [q for q in rungs if (q.price_cents, q.price_exact) == key and q is not best]
+    n = best.count + sum(q.count for q in same) + (want - have)
+    return [replace(q, count=n) if q is best else q for q in quotes
+            if not any(q is s for s in same)], n
+
+
+# CARBON ARC UNWIND (Jack 2026-11-07: "carbon arc markets should try to hit the
+# $1 payout threshold + unwind positions at breakeven or better even if the
+# rule is not to place on that side / the fair gates it (if it results in
+# earning)"), after KXPARAMOUNTAPP-26DEC08-T128 sat out with $0.74 banked of
+# its period's $1: long 90, its bid past the skew knee and its ask floored at
+# 25c by the fair gate (Carbon Arc 45c against a 16c ask), so neither side
+# rested. On a SELECTED Carbon Arc market (one earning rewards, as the
+# breakeven offset) where the bot holds its own position (at least
+# BE_OFFSET_MIN_CONTRACTS, its average known, no manual position):
+#  - the side that REDUCES the position carries the whole position on its
+#    breakeven-or-better rung (the BREAKEVEN OFFSET, whatever the stop's
+#    distance), so a market sitting under its period's $1 can work toward it
+#    (KXPEACOCKAPP-26DEC08-T119, same day: long 160 at 11c, its 18c ask
+#    rested 25 lots and projected $0.81 of the $1);
+#  - that side is exempt from the late-month toxic-side cut
+#    (ca_late_month_mults) and from the fair gate's cap (CA_FAIR_CAP) -- but
+#    past either it rests only at the bot's average cost or better
+#    (be_offset_ok; a touch worse than that moves the rung to the breakeven
+#    price itself) and only while the scored walk still reaches it
+#    (drop_unearning_sides: it must earn).
+# The estimator scores the same side the same way, so the $1 floor
+# projection counts what it will earn and a market it lifts over the bar is
+# (re)admitted. The other side keeps every rule. The fair gate's data-landing
+# holds (scheduled data, a new read) still park both sides. IMM_CA_UNWIND=0.
+CA_UNWIND = os.environ.get("IMM_CA_UNWIND", "1") == "1"
+
+
+def ca_unwind_side(series: str, pos: float, avg: Optional[float]) -> Optional[str]:
+    """The side that unwinds the bot's own position on a Carbon Arc market --
+    "ask" long, "bid" short -- or None (rule off, not Carbon Arc, too small a
+    position, or no average to judge breakeven by)."""
+    if not CA_UNWIND or not avg or abs(pos) < max(1.0, BE_OFFSET_MIN_CONTRACTS):
+        return None
+    if not carbon_arc_settled(series):
+        return None
+    return "ask" if pos > 0 else "bid"
+
+
+def ca_unwind_late_mult(ticker: str, now_utc: datetime) -> float:
+    """The size an unwinding side rests at inside the late-month window: the
+    non-toxic side's CA_LATE_SIZE_MULT (1.0 outside the window)."""
+    start = ca_late_window_start(ticker)
+    return CA_LATE_SIZE_MULT if (start is not None and now_utc >= start) else 1.0
+
+
+def ca_unwind_rungs(quotes: List["Quote"], side: str, avg: float) -> List["Quote"]:
+    """The unwind side's rungs out of `quotes` (that side's, pads left out):
+    those priced at the bot's average cost or better; when none is, the rung
+    nearest the touch moved to the breakeven price itself (an ask at the
+    average rounded up, a bid at it rounded down). Sizes as built -- the
+    breakeven offset raises the side to the position afterwards."""
+    def px(q: "Quote") -> float:
+        return q.price_exact if q.price_exact is not None else float(q.price_cents)
+
+    rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
+    ok = [q for q in rungs if be_offset_ok(side, px(q), avg)]
+    if not ok and rungs:
+        near = max(rungs, key=px) if side == "bid" else min(rungs, key=px)
+        be = int(math.floor(avg + 1e-9)) if side == "bid" else int(math.ceil(avg - 1e-9))
+        if not 1 <= be <= 99:
+            return []
+        ok = [replace(near, price_cents=be, price_exact=None)]
+    # rungs at one price become one order: the raise to the position then
+    # lands on a single rung, as the placement backstop brackets it
+    merged: Dict[Tuple[int, Optional[float]], "Quote"] = {}
+    for q in ok:
+        k = (q.price_cents, q.price_exact)
+        merged[k] = replace(merged[k], count=merged[k].count + q.count) if k in merged else q
+    return list(merged.values())
 
 
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
@@ -12742,6 +12820,7 @@ _CONFIG_CODE_KNOBS = (
     "ADMIT_SUSTAIN_SECS", "ADMIT_RUN_MAX_GAP_SECS",
     "ADMIT_SKIP_MULT",            # a 3x margin skips the wait (2026-11-01)
     "BE_OFFSET_DAYS", "BE_OFFSET_MIN_CONTRACTS",   # breakeven offset (2026-11-05)
+    "CA_UNWIND",                                   # Carbon Arc unwind (2026-11-07)
     "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
     "HOURLY_PROGRAM_MAX_HOURS",
     "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
@@ -24469,6 +24548,8 @@ class IncentiveMarketMaker:
         # side and level by them -- and its logged state
         self._be_offset_n: Dict[str, Tuple[int, int]] = {}
         self._be_offset_noted: Dict[str, Tuple[str, int, int]] = {}
+        # CARBON ARC UNWIND: the last logged (side, rungs) per market
+        self._ca_unwind_noted: Dict[str, Tuple[str, tuple]] = {}
         # FAIR CLOSE: (ticker, side) -> the closing rung's last logged price,
         # and ticker -> (side, YES price) of the closing rung it rests now
         self._fair_close_noted: Dict[Tuple[str, str], Optional[int]] = {}
@@ -33477,6 +33558,27 @@ class IncentiveMarketMaker:
         # see the size the quote loop will actually rest.
         # (side_size_mults: the same rule plus the bid-only quake family)
         _cbm, _cam = side_size_mults(meta.ticker, _now, meta.mid_cents)
+        # CARBON ARC UNWIND: the side that reduces the bot's own position is
+        # scored as the loop rests it past the late-month cut or the fair
+        # gate -- at breakeven or better, the whole position, only if it earns
+        _uw_pos = self.pnl.pos.get(meta.ticker, 0.0)
+        _uw_avg = self.pnl.avg.get(meta.ticker)
+        _uw = ca_unwind_side(meta.series, _uw_pos, _uw_avg)
+        _uw_i = 0 if _uw == "bid" else 1
+        _uw_mid = touch_mid(ext_b, ext_a) if _uw is not None else None
+
+        def _uw_gated(eb: Optional[int], ea: Optional[int]) -> bool:
+            """Would the fair gate (CA_FAIR_CAP) cap the unwinding side on
+            these touches -- its touch past the read's band + tolerance?"""
+            if _uw is None or not (CA_FAIR_ENABLE and CA_FAIR_CAP):
+                return False
+            band = ca_fair_band(meta.ticker, _now.timestamp())
+            if band is None:
+                return False
+            _pc, plo, phi = band
+            bb, ab = fair_gate_breach(eb, ea, plo * 100.0, CA_FAIR_TOL_CENTS, phi * 100.0)
+            return bool(ab if _uw == "ask" else bb)
+
         # The band the quote loop quotes a SELECTED market in -- which every
         # candidate is by the time the loop reaches it (ESTIMATE_SIDE_BAND).
         _qlo, _qhi = member_price_band(meta.series, True)
@@ -33525,6 +33627,13 @@ class IncentiveMarketMaker:
             _b = _vbm if vb is None else vb
             _ln = _lead_n if vb is None else vercel_boost_lead_size(meta.target_size, _b)
             sbm, sam = (_cbm, _cam) if sides is None else sides
+            # CARBON ARC UNWIND: on a Carbon Arc market a zero side is the
+            # late-month cut; the unwinding side keeps the non-toxic size
+            _uw_lift = _uw is not None and (sbm if _uw == "bid" else sam) <= 0
+            if _uw_lift:
+                _um = (CA_LATE_SIZE_MULT * series_side_mults(meta.series)[_uw_i]
+                       * longshot_side_mults(meta.series, _uw_mid)[_uw_i])
+                sbm, sam = (_um, sam) if _uw == "bid" else (sbm, _um)
             lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
             _bsum, _asum = sum(s for _t, s in lvb), sum(s for _t, s in lva)
             smb, sma = clamp_side_max_to_position_cap(
@@ -33641,6 +33750,19 @@ class IncentiveMarketMaker:
                     [q for q in out if q.book_side != _rso],
                     yes_levels, no_levels, own_live if self.live else [],
                     meta.target_size, meta.discount_factor)
+            # CARBON ARC UNWIND, as the loop rests it: the unwinding side
+            # carries the whole position on its breakeven-or-better rung --
+            # and past the late-month cut or the fair gate's cap it counts
+            # only at breakeven or better and only if it earns
+            if _uw is not None:
+                if _uw_lift or _uw_gated(eb, ea):
+                    _uws = ca_unwind_rungs(out, _uw, _uw_avg)
+                    if _uws:
+                        _uws = drop_unearning_sides(_uws, yes_levels, no_levels,
+                                                    own_live if self.live else [],
+                                                    meta.target_size, meta.discount_factor)
+                    out = [q for q in out if q.book_side != _uw or q.is_pad] + _uws
+                out, _n = breakeven_offset_quotes(out, _uw_pos, _uw_avg)
             return out
 
         def _overlay_with_pads(quotes: List[Quote],
@@ -35648,6 +35770,8 @@ class IncentiveMarketMaker:
             # -- ca_caps, applied last below, where only a side that still
             # earns rests (CA_FAIR_CAP; off, the breach parks both sides).
             ca_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            ca_uw: Optional[str] = None          # CARBON ARC UNWIND (set with the ladder)
+            ca_uw_lifted = False
             if CA_FAIR_ENABLE and carbon_arc_settled(meta.series):
                 ca_why = ""
                 ca_in: dict = {}     # guard-skip inputs, built on THIS path
@@ -36209,6 +36333,17 @@ class IncentiveMarketMaker:
             # from here the ladder is PER SIDE -- no bid rungs and asks at
             # 50% inside the window, the plain ladder on both sides otherwise.
             ca_bm, ca_am = ca_late_month_mults(t, now_utc)
+            # CARBON ARC UNWIND: the side that reduces the bot's own position
+            # keeps the non-toxic side's size through the late-month cut; it
+            # rests below only at breakeven or better and only while it earns
+            ca_uw = None
+            ca_uw_lifted = False
+            if t in self.state.selected and not (pos_manual or event_manual):
+                ca_uw = ca_unwind_side(meta.series, own_pos, self.pnl.avg.get(t))
+            if ca_uw == "ask" and ca_am <= 0:
+                ca_am, ca_uw_lifted = ca_unwind_late_mult(t, now_utc), True
+            elif ca_uw == "bid" and ca_bm <= 0:
+                ca_bm, ca_uw_lifted = ca_unwind_late_mult(t, now_utc), True
             # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B;
             # else the family's lean) and the event long-shot cut at this
             # book's mid (LONGSHOT_MULT)
@@ -36767,6 +36902,7 @@ class IncentiveMarketMaker:
             # touch fights the read rests at most at its cap, and only while
             # the scored walk still reaches it ("sit on the bid if it's
             # earning money on it, but not if it wouldnt earn")
+            mq_pre_ca = mq
             if ca_caps is not None:
                 mq = mort_cap_quotes(mq, *ca_caps)
                 _c_before = {q.book_side for q in mq if not q.is_pad}
@@ -36788,6 +36924,49 @@ class IncentiveMarketMaker:
                             f"the scored walk after the caps {ca_caps} "
                             f"(book {ext_bid}x{ext_ask}) -- not resting them")
                     self._ca_unearning[t] = _c_dropped
+            # CARBON ARC UNWIND (ca_unwind_side): when the late-month cut or
+            # the fair gate's cap took or moved the side that reduces the
+            # bot's own position, that side comes back from the ladder as
+            # built -- at breakeven or better (ca_unwind_rungs) and only while
+            # it earns; the breakeven offset below raises it to the position
+            ca_uw_on = False
+            if ca_uw is not None:
+                _uw_pre = [q for q in mq_pre_ca if q.book_side == ca_uw and not q.is_pad]
+                _uw_post = [q for q in mq if q.book_side == ca_uw and not q.is_pad]
+                _uw_cut = ca_caps is not None and \
+                    [(q.price_cents, q.count) for q in _uw_pre] != [(q.price_cents, q.count) for q in _uw_post]
+                if ca_uw_lifted or _uw_cut:
+                    _uw_avg = self.pnl.avg.get(t)
+                    _uw = ca_unwind_rungs(_uw_pre, ca_uw, _uw_avg)
+                    if _uw and meta.price_step < 0.01:
+                        _ey, _en = orderbook_exact_levels(ob)
+                        _uw = drop_unearning_sides(
+                            _uw, _ey, _en,
+                            own_exact_by_ticker.get(t, []) if self.live else [],
+                            meta.target_size, meta.discount_factor)
+                    elif _uw:
+                        _uw = drop_unearning_sides(_uw, yes_levels, no_levels,
+                                                   own_in_book, meta.target_size,
+                                                   meta.discount_factor)
+                    mq = [q for q in mq if q.book_side != ca_uw or q.is_pad] + _uw
+                    ca_uw_on = bool(_uw)
+                    _why = "the late-month cut" if ca_uw_lifted and not _uw_cut else "the fair gate"
+                    _key = (ca_uw, tuple((q.price_cents, q.count) for q in _uw))
+                    if self._ca_unwind_noted.get(t) != _key:
+                        self._ca_unwind_noted[t] = _key
+                        _lg = "long" if own_pos > 0 else "short"
+                        if _uw:
+                            log(f"{self.tag} ca unwind {t}: {ca_uw}s rest past {_why} at "
+                                f"breakeven or better ({', '.join(f'{q.count} @ {q.price_cents}c' for q in _uw)}; "
+                                f"{_lg} {abs(own_pos):.0f}, avg {_uw_avg:.1f}c)")
+                        else:
+                            log(f"{self.tag} ca unwind {t}: no {ca_uw} at breakeven or better "
+                                f"earns ({_lg} {abs(own_pos):.0f}, avg {_uw_avg:.1f}c, "
+                                f"book {ext_bid}x{ext_ask})")
+                else:
+                    self._ca_unwind_noted.pop(t, None)
+            else:
+                self._ca_unwind_noted.pop(t, None)
             # period rain gate (RAIN_PERIOD_CAP): the Carbon Arc rule -- the
             # side whose touch fights the fair rests at most at its cap, and
             # only while the scored walk still reaches it
@@ -36837,11 +37016,14 @@ class IncentiveMarketMaker:
             # more): the reducing side carries the whole position at
             # breakeven or better. The event room below is charged the
             # quotes as built (mq_built), so the offset never squeezes a
-            # sibling's side.
+            # sibling's side. A Carbon Arc market with the bot's own position
+            # (CA UNWIND, ca_uw) takes it whatever the stop's distance: its
+            # reducing side rests the whole position at breakeven or better,
+            # gated or not, so it works toward the period's $1.
             mq_built = mq
             be_n = 0
             if t in self.state.selected \
-                    and be_offset_far(meta.cutoff, meta.close_time, now_utc) \
+                    and (be_offset_far(meta.cutoff, meta.close_time, now_utc) or ca_uw is not None) \
                     and not (pos_manual or event_manual):
                 mq, be_n = breakeven_offset_quotes(mq, own_pos, self.pnl.avg.get(t))
             if be_n:
@@ -40377,6 +40559,13 @@ class IncentiveMarketMaker:
                f"{BE_OFFSET_MIN_CONTRACTS:g}) rests the whole position on its "
                f"breakeven-or-better rung (markets earning rewards only)"
                if BE_OFFSET_DAYS > 0 else "off"))
+        log("ca unwind (2026-11-07): "
+            + ("selected Carbon Arc markets -- the side that reduces the bot's own "
+               f"position (>= {BE_OFFSET_MIN_CONTRACTS:g}) rests the whole position on "
+               "its breakeven-or-better rung, and past the late-month cut and the "
+               "fair gate's cap only at breakeven or better and only while it "
+               "earns (the estimate and the $1 floor score it the same)"
+               if CA_UNWIND else "off"))
         log("array tail leads (2026-11-02): "
             + (f"{FAIR_LEAD_MODE} -- {', '.join(CA_ARRAY_LEAD_SERIES)}: a strike "
                f"offers target/5 at {100 - CA_ARRAY_LEAD_EDGE_C}c (bids it at "
