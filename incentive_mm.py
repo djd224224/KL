@@ -3264,6 +3264,15 @@ def event_cap_contracts(event_ticker: str) -> float:
     """Per-event net cap, scaled commensurately with the family ladder
     multiplier (mention x1.5 -> event cap 750; Jack 2026-07-28); the
     OpenRouter market-share family's is SHARE_EVENT_CAP (_share_x1)."""
+    # an event with a LIVE post-vote dead-book entry (Jack 2026-11-07: "cap at
+    # 3k contracts per event"): PVD_EVENT_CAP. At the bot's 1,000 a 12-candidate
+    # 2028 primary (KXDPRESPRIMARY-28NY) split it ~166 a side, under the list's
+    # 200 floor; 621 of the 2028 wave's 1,858 markets rested below their size.
+    _pvs = globals().get("PVD_EVENT_STOPS")
+    if _pvs and globals().get("PVD_EVENT_CAP", 0) > 0:
+        _st = _pvs.get(event_ticker)
+        if _st is not None and _st > datetime.now(timezone.utc):
+            return globals()["PVD_EVENT_CAP"]
     series = series_of(event_ticker)
     if _share_x1(series):
         return SHARE_EVENT_CAP
@@ -9740,6 +9749,12 @@ _pvd_state = {"mtime": 0.0, "forced": frozenset()}
 # and the account-level halts stay. By SERIES because the halts key on series
 # and events; the 2028 wave's series are its own.
 PVD_NO_HALT_SERIES: Set[str] = set()
+# EVENT CAP FOR LISTED EVENTS (Jack 2026-11-07: "cap at 3k contracts per
+# event"): an event with a live entry (its latest stop still ahead) takes
+# PVD_EVENT_CAP net contracts in event_cap_contracts, in place of the family's
+# (IMM_MAX_EVENT, 1,000 on the box). IMM_PVD_EVENT_CAP=0 turns it off.
+PVD_EVENT_CAP = _env_float("IMM_PVD_EVENT_CAP", 3000)
+PVD_EVENT_STOPS: Dict[str, datetime] = {}
 
 
 def pvd_path() -> str:
@@ -9861,6 +9876,10 @@ def load_pvd_markets() -> int:
         _risk_group_memo.clear()        # risk_group reads sweep_exempt
         log(f"[IMM] post-vote dead books: no halts on {len(no_halt)} series"
             + (f" ({', '.join(sorted(no_halt))})" if no_halt else ""))
+    PVD_EVENT_STOPS.clear()
+    for e in fresh.values():
+        if PVD_EVENT_STOPS.get(e["event"]) is None or e["stop"] > PVD_EVENT_STOPS[e["event"]]:
+            PVD_EVENT_STOPS[e["event"]] = e["stop"]
     events = frozenset(e["event"] for e in fresh.values())
     base = FORCE_EVENTS - _pvd_state["forced"]
     added = events - base

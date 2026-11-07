@@ -257,6 +257,7 @@ def setUpModule():
     imm.PVD_MARKETS.clear()
     imm.PVD_REMOVED.clear()
     imm.PVD_NO_HALT_SERIES.clear()      # ...and its "no_halts" series (2026-11-07)
+    imm.PVD_EVENT_STOPS.clear()         # ...and its events' 3k cap (2026-11-07)
     imm.ELECTION_DATES_EXTRA[:] = []
     imm.AWARDS_DATES_EXTRA[:] = []
     imm._rows_extra_state.clear()
@@ -40350,6 +40351,30 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
                           for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
                          [("bid", 49, 40.0)])
+
+    def test_listed_event_takes_the_pvd_event_cap(self):
+        """Jack 2026-11-07: "cap at 3k contracts per event" -- an event with a
+        live list entry takes PVD_EVENT_CAP (3,000) in event_cap_contracts; an
+        unlisted event, or one whose entries have all stopped, keeps the
+        family's cap; IMM_PVD_EVENT_CAP=0 turns it off"""
+        ev, other = self.T.rsplit("-", 1)[0], "KXOTHER-99DEC31"
+        base = imm.event_cap_contracts(ev)
+        self.assertEqual(imm.PVD_EVENT_CAP, 3000)
+        self._write({self.T: {"bid_max": 40, "ask_min": 60}, self.T2: {"bid_max": 40, "ask_min": 60}})
+        self.assertEqual(imm.event_cap_contracts(ev), 3000)
+        self.assertEqual(imm.event_cap_contracts(other), imm.event_cap_contracts("KXOTHER-99DEC30"))
+        with mock.patch.object(imm, "PVD_EVENT_CAP", 0):
+            self.assertEqual(imm.event_cap_contracts(ev), base)
+        past = datetime.now(timezone.utc) - timedelta(minutes=5)
+        self._write({self.T: {"bid_max": 40, "ask_min": 60}}, stop=past)
+        self.assertEqual(imm.event_cap_contracts(ev), base)    # stopped: the family's cap
+        self._write({})
+        self.assertEqual(imm.event_cap_contracts(ev), base)
+        # a 12-market event (a 2028 primary's candidates) takes it too: its room split
+        # 12 ways is 250 a side, over the 200 floor (at 1,000 it was ~83-166)
+        many = {f"{ev}-M{i:02d}": {"bid_max": 40, "ask_min": 60, "size": 200} for i in range(12)}
+        self._write(many)
+        self.assertEqual(imm.event_cap_contracts(ev), 3000)
 
     def test_no_halts_entry_exempts_its_series(self):
         """Jack 2026-11-07, on the 2028 election wave: "remove any sweep
