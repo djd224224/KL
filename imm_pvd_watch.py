@@ -223,6 +223,57 @@ def read_book(t: str):
         return t, _book_cache.get(t)
 
 
+# THE BOT'S OWN SHARE (2026-11-07): the bot writes est_frac per market every
+# cycle (cycle_log_<UTC date>.csv), from ONE read of the book with its orders in
+# it. The dashboard's own estimate read every order first and then ~1,800 books
+# over ~10 minutes while the bot re-priced (follow the book) and resized (bank
+# early), so the two reads disagreed. At 02:56Z KXHOUSERACE-WA08-28-D rested at
+# the touch on both sides, and its book read without our orders scored 0; 547
+# of 1,848 paced under $0.75, against 37 scored the bot's way. A market with a
+# bot row from the last BOT_EST_MAX_AGE_S takes it, and needs no book read;
+# one without falls back to the dashboard's own estimate.
+BOT_EST_TAIL_BYTES = 8_000_000          # ~6 cycles of rows at ~3,000 markets a cycle
+BOT_EST_MAX_AGE_S = 900
+
+
+def bot_est_fracs(tickers: set, now: datetime) -> dict:
+    """{ticker: (est_frac, qual_sides, pool_per_day)} from the latest row per
+    market in the tail of today's (and, near midnight, yesterday's) cycle log."""
+    import csv
+    import io as _io
+    out: dict = {}
+    days = [now.strftime("%Y-%m-%d")]
+    if now.hour == 0:
+        days.insert(0, datetime.fromtimestamp(now.timestamp() - 3600, timezone.utc).strftime("%Y-%m-%d"))
+    for day in days:
+        path = os.path.join(LOG_DIR, f"cycle_log_{day}.csv")
+        try:
+            with open(path, "rb") as fh:
+                header = fh.readline().decode("utf-8", "replace").strip().split(",")
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(len(",".join(header)) + 1, size - BOT_EST_TAIL_BYTES))
+                chunk = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        lines = chunk.split("\n")[1:]           # the first line may be cut
+        col = {k: i for i, k in enumerate(header)}
+        need = ("ts", "ticker", "est_frac", "qual_sides", "pool_per_day")
+        if not all(k in col for k in need):
+            continue
+        for row in csv.reader(_io.StringIO("\n".join(lines))):
+            if len(row) < len(header) or row[col["ticker"]] not in tickers:
+                continue
+            ts_ = _ts(row[col["ts"]])
+            if ts_ is None or (now - ts_).total_seconds() > BOT_EST_MAX_AGE_S:
+                continue
+            try:
+                out[row[col["ticker"]]] = (float(row[col["est_frac"]] or 0), int(float(row[col["qual_sides"]] or 0)),
+                                           float(row[col["pool_per_day"]] or 0))
+            except ValueError:
+                continue
+    return out
+
+
 def poll(client, hist: dict) -> dict:
     now = datetime.now(timezone.utc)
     lst = load_list()
@@ -233,13 +284,21 @@ def poll(client, hist: dict) -> dict:
     for o in read_orders(client):
         t = o.get("ticker")
         if t in own and str(o.get("client_order_id", "")).startswith(prefix):
-            px = round(_f(o.get("yes_price_dollars")) * 100)
-            n = _f(o.get("remaining_count_fp") or o.get("remaining_count"))
-            own[t].append((o.get("book_side") or ("bid" if o.get("side") == "yes" else "ask"), px, n))
+            # the BOT's cent buckets (order_yes_book_cents: a bid floored, an ask
+            # ceiled), the same ones orderbook_levels files the book under. This
+            # used round(): on a sub-penny book a 1.5c bid read 2c against its
+            # level at 1c, a 9.2c ask NO 91 against NO 90, so our order matched no
+            # level and its side scored 0. 11/07 01:50Z: 666 of 1,804 2028-wave
+            # markets read under $0.75 for the period; scored the bot's way, 37.
+            bp = imm.order_yes_book_cents(o)
+            if bp is None:
+                continue
+            own[t].append((bp[0], bp[1], imm.order_remaining(o)))
     quoted = [t for t in tickers if own[t]]
+    bot_est = bot_est_fracs(set(quoted), now)
     _stale["books"] = 0
-    with ThreadPoolExecutor(3) as ex:
-        books = dict(ex.map(read_book, quoted))
+    with ThreadPoolExecutor(3) as ex:           # books only where the bot has no fresh row
+        books = dict(ex.map(read_book, [t for t in quoted if t not in bot_est]))
 
     rows, est_rate = {}, 0.0
     for t in tickers:
@@ -254,11 +313,16 @@ def poll(client, hist: dict) -> dict:
         bid = round(_f(m.get("yes_bid_dollars")) * 100) or None
         ask = round(_f(m.get("yes_ask_dollars")) * 100) or None
         last = _f(m.get("last_price_dollars")) * 100 or None
-        frac, sides = 0.0, 0
-        ob = books.get(t)
-        if ob:
-            y, n = imm.orderbook_levels(ob)
-            frac, sides = imm.estimate_reward_share(y, n, own[t], 1000.0, 0.5, own_in_book=True)
+        frac, sides, est_src = 0.0, 0, ""
+        if t in bot_est:
+            frac, sides, _pool = bot_est[t]
+            est_src = "bot"
+        else:
+            ob = books.get(t)
+            if ob:
+                y, n = imm.orderbook_levels(ob)
+                frac, sides = imm.estimate_reward_share(y, n, own[t], 1000.0, 0.5, own_in_book=True)
+                est_src = "dash"
         rate = frac * _f(e.get("pool_day"))
         est_rate += rate
         rows[t] = {"ticker": t, "event": e.get("event"), "series": t.split("-")[0],
@@ -268,7 +332,7 @@ def poll(client, hist: dict) -> dict:
                    "our_bid": max((p for s, p, q in own[t] if s == "bid"), default=None),
                    "our_ask": min((p for s, p, q in own[t] if s == "ask"), default=None),
                    "rest_ct": round(sum(q for _s, _p, q in own[t])),
-                   "share": round(frac, 4), "sides": sides, "rate": round(rate, 2),
+                   "share": round(frac, 4), "sides": sides, "rate": round(rate, 2), "est_src": est_src,
                    "pool": _f(e.get("pool_day")), "kind": e.get("kind") or "dead",
                    "size": int(e.get("size") or 40),
                    "bsize": int(e.get("bid_size") or e.get("size") or 40),
@@ -431,6 +495,7 @@ def poll(client, hist: dict) -> dict:
         b["share"] = round(b["n"] / len(quoted_rows), 4) if quoted_rows else 0.0
         b["rate"], b["proj"] = round(b["rate"], 2), round(b["proj"], 2)
     pace = {"quoted": len(quoted_rows), "active": sum(1 for r in rows.values() if r["active"]),
+            "src_bot": sum(1 for r in quoted_rows if r.get("est_src") == "bot"),
             "bar": PACE_BAR, "spare_h": PACE_SPARE_H, "buckets": pace_b}
     return {"now": now.isoformat(), "go_live": GO_LIVE.isoformat(), "stale": dict(_stale), "pace": pace,
             "end": end.isoformat() if end else None, "hrs_left": round(hrs_left, 2),
@@ -534,7 +599,7 @@ function render(){
     (d.end?'next stop '+etS(d.end)+' ET (in '+d.hrs_left.toFixed(1)+'h): '+(d.stop_mix||[]).map(([s,n])=>n+' to '+etS(s)).join(', '):'no listed market is active');
   const pc=d.pace;
   if(pc){
-    $('pacesub').textContent=`(${pc.quoted} quoted of ${pc.active} active; banked this period + the rate now x the hours to the stop; Kalshi pays a period only from $1)`;
+    $('pacesub').textContent=`(${pc.quoted} quoted of ${pc.active} active; banked this period + the rate now x the hours to the stop; Kalshi pays a period only from $1; share from the bot's own cycle log for ${pc.src_bot??0} of ${pc.quoted})`;
     $('pace').innerHTML=pc.buckets.map((b,i)=>`<tr><td>${i<2?'<b>'+b.label+'</b>':b.label}</td><td>${b.n.toLocaleString()}</td>`+
       `<td>${(100*b.share).toFixed(1)}%</td><td>${money(b.rate)}</td><td>${money(b.proj)}</td><td>${b.zero?b.zero.toLocaleString():''}</td></tr>`).join('')+
       `<tr><td class="mut">total</td><td>${pc.quoted.toLocaleString()}</td><td></td><td>${money(pc.buckets.reduce((a,b)=>a+b.rate,0))}</td>`+

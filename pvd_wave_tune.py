@@ -35,6 +35,11 @@ after --since, series in --series), idempotently:
   --no-halts         set "no_halts": the bot exempts the entry's series from the sweep
                      breaker, tape trigger, group breaker and toxic halts (Jack
                      2026-11-07: "remove any sweep breakers / halts on these markets")
+  --cheap-tiers C:X,C2:X2  (or --cheap-mult X --cheap-px C for one tier)
+                     a CHEAP side (a bid at its touch, an ask at 100 - its touch: what a
+                     fill ties up a contract) rests X x the size for the first tier it
+                     fits (Jack 2026-11-07: "double cheap sides" = <= 5c x2, then "1.5x on
+                     size 5 to 15" = <= 15c x1.5); back to the size when it leaves them
   --cushion N        the entry's last-trade cushion (the bot: live 5c, dead 2c). With
                      a last trade the guard holds a bid N c under it and an ask N c over
                      it, ignoring bid_max / ask_min; at 0 a side may rest at the trade.
@@ -143,6 +148,9 @@ def main() -> int:
                     help='set "flip_through" (the bot: the reducing side rests its size + the position)')
     ap.add_argument("--no-halts", action="store_true",
                     help='set "no_halts" (the bot: no sweep breaker, tape trigger, group or toxic halt on the series)')
+    ap.add_argument("--cheap-mult", type=float, help="the cheap side rests this x the size")
+    ap.add_argument("--cheap-px", type=float, default=5.0, help="cheap = a bid touch <= this c / an ask touch >= 100 - this c")
+    ap.add_argument("--cheap-tiers", default="", help="C:X,... -- a side costing <= C c a contract rests X x the size (first tier that fits)")
     ap.add_argument("--cushion", type=int)
     ap.add_argument("--reanchor", type=int)
     ap.add_argument("--note", default="")
@@ -150,6 +158,9 @@ def main() -> int:
     ap.add_argument("--write", action="store_true")
     a = ap.parse_args()
     series = {s.strip() for s in a.series.split(",") if s.strip()}
+    tiers = sorted((float(c), float(m)) for c, m in (x.split(":") for x in a.cheap_tiers.split(",") if x.strip()))
+    if not tiers and a.cheap_mult:
+        tiers = [(a.cheap_px, a.cheap_mult)]
     exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
     all_series = series == {"ALL"}
 
@@ -163,7 +174,7 @@ def main() -> int:
     # the touches are read BEFORE the lock (18 calls for ~1,700 markets), so the
     # lock is held only for the read-modify-write of the list
     touch, missed = {}, 0
-    if a.reanchor is not None:
+    if a.reanchor is not None or tiers:
         pre = json.load(open(LIST, encoding="utf-8")).get("markets") or {}
         touch, missed = read_touches([t for t in pre if in_scope(t)])
     if a.write:
@@ -201,7 +212,7 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = 0
         for t, e in (cur.get("markets") or {}).items():
             if not in_scope(t):
                 continue
@@ -285,8 +296,11 @@ def main() -> int:
                         # won't help) -- an already-raised market keeps its size
                         want, why = old, "nothing earning now: kept"
                 n_max += (want == a.bank_max and not done and bool(a.bank_max))
-                # a side the scanner sized above the bank size (a decided side at 300) keeps its own size
-                sides = {k: e[k] for k in ("bid_size", "ask_size") if k in e and int(e[k]) > a.bank_size}
+                # a side the scanner sized above the bank size (a decided side at 300) keeps its own
+                # size, as does a cheap side (--cheap-mult re-sizes it below)
+                cs = set(e.get("cheap_sides") or [])
+                sides = {k: e[k] for k in ("bid_size", "ask_size")
+                         if k in e and (int(e[k]) > a.bank_size or k in cs)}
                 if old != want or any(k in e and k not in sides for k in ("bid_size", "ask_size")):
                     for k in ("bid_size", "ask_size"):
                         e.pop(k, None)
@@ -299,6 +313,42 @@ def main() -> int:
                         n_up += 1
                     else:
                         n_down += 1
+            if tiers and t in touch:
+                # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
+                # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
+                # the market's size for the first tier with c <= C (Jack 2026-11-07:
+                # "double cheap sides" <= 5c, then "1.5x on size 5 to 15"); back to the
+                # size once the touch leaves every tier
+                yb, ya, _lp = touch[t]
+                sz = int(e.get("size") or 0)
+                cost = {"bid_size": yb if yb > 0 else None, "ask_size": 100 - ya if 0 < ya < 100 else None}
+                mult = {}
+                for k, c in cost.items():
+                    if c is not None:
+                        for cpx, cm in tiers:
+                            if c <= cpx:
+                                mult[k] = cm
+                                break
+                now_c = set(mult)
+                prev_c = set(e.get("cheap_sides") or [])
+                ch = now_c != prev_c
+                for k in ("bid_size", "ask_size"):
+                    if k in now_c:
+                        want_k = int(round(sz * mult[k]))
+                        if int(e.get(k) or 0) != want_k:
+                            e[k] = want_k
+                            ch = True
+                    elif k in prev_c:
+                        e.pop(k, None)          # no longer cheap: the side rests the size again
+                if now_c:
+                    e["cheap_sides"] = sorted(now_c)
+                else:
+                    e.pop("cheap_sides", None)
+                if ch:
+                    n_cheap += 1
+                    e["cheap"] = (f"{stamp}: touch {yb:g}x{ya:g} -> "
+                                  + (", ".join(f"{k.split('_')[0]} {e[k]} (x{mult[k]:g})" for k in sorted(now_c)) or "none cheap")
+                                  + f" {a.note}").strip()
         msg = (f"{stamp} {len(series)} series since {a.since}: {n_seen} live entries, "
                f"{n_room} widened {a.room}c, {n_band} banded "
                f"{a.price_min}-{a.price_max}c" if a.price_min is not None else
@@ -306,6 +356,8 @@ def main() -> int:
         if bank is not None:
             msg += (f"; bank early: {n_banked} past ${a.bank_usd:.2f} this period, "
                     f"{n_max} at {a.bank_max or a.bank_size}, {n_up} sized up, {n_down} sized down")
+        if tiers:
+            msg += (f"; cheap sides ({', '.join(f'<= {c:g}c x{m:g}' for c, m in tiers)}): {n_cheap} re-sized")
         if a.flip_through:
             msg += f"; flip-through: {n_flip} set"
         if a.no_halts:
@@ -316,7 +368,7 @@ def main() -> int:
             msg += (f"; follow the book ({a.reanchor}c off the touch): {n_anch} re-anchored, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
