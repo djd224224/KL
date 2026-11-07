@@ -13,8 +13,13 @@ rem   3. ...then 200 a side for what can't clear the bar at 80 (Jack: "Yes, list
 rem   4. re-apply the 2028 wave's 3c room + 2-98c band (a relit entry is rebuilt from scratch),
 rem      and BANK EARLY: 200 a side until the 8773 dashboard shows $1.30 banked this period,
 rem      then 80 (Jack 2026-11-07: "200 a side until $1.30 is banked, then back down").
+rem      300 a side where 200 won't bank $1.30 by 6 hours before the stop (Jack 2026-11-07:
+rem      "want to bank $1.30 sooner. go up to 300 a side where 200 wont bank $1.30 by 6 hours
+rem      before period end"), from the 8773 dashboard's /data rows.
+rem      FOLLOW THE BOOK (Jack 2026-11-07: "Yes, follow the book"): cushion 0, and a market
+rem      with no trade gets its limits re-anchored to the touch +-3c on every run.
 rem      The 8773 dashboard (imm_pvd_watch, PVD_WATCH_DIR=run-logs\pvd-watch-elec2028) must
-rem      be running: if its history.json is over 30 min old, sizes are left alone.
+rem      be running: if its data is over 30 min old, sizes are left alone.
 rem PVD_SCAN_BUDGET is the cap on ALL scan-added entries still live (both waves are ~$181k).
 rem Remove: Unregister-ScheduledTask -TaskName 'KL pvd-scan waves' -Confirm:$false
 set PYTHONPATH=C:\Users\jackd\AppData\Roaming\Python\Python312\site-packages
@@ -39,5 +44,5 @@ set PVD_SCAN_DEAD_SIZE=200
 "%PY%" "%KL%\pvd_scan.py" --series %W28% --no-vote-check --new-since 2026-11-06T22:30:00Z --write >> "%LOG%" 2>&1
 set PVD_SCAN_LIVE_SIZE=
 set PVD_SCAN_DEAD_SIZE=
-echo ===== %date% %time% pass 4: 2028 room + band >> "%LOG%"
-"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 2 --price-max 98 --bank-size 200 --base-size 80 --bank-usd 1.30 --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
+echo ===== %date% %time% pass 4: 2028 band, follow the book, bank early >> "%LOG%"
+"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 2 --price-max 98 --cushion 0 --reanchor 3 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
