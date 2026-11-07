@@ -3243,12 +3243,16 @@ def ca_unwind_late_mult(ticker: str, now_utc: datetime) -> float:
     return CA_LATE_SIZE_MULT if (start is not None and now_utc >= start) else 1.0
 
 
-def ca_unwind_rungs(quotes: List["Quote"], side: str, avg: float) -> List["Quote"]:
+def ca_unwind_rungs(quotes: List["Quote"], side: str, avg: float,
+                    pos: Optional[float] = None) -> List["Quote"]:
     """The unwind side's rungs out of `quotes` (that side's, pads left out):
     those priced at the bot's average cost or better; when none is, the rung
     nearest the touch moved to the breakeven price itself (an ask at the
-    average rounded up, a bid at it rounded down). Sizes as built -- the
-    breakeven offset raises the side to the position afterwards."""
+    average rounded up, a bid at it rounded down). Sizes as built, but with
+    `pos` never more than the position in all, cut from the far end (a gated
+    side only UNWINDS: live 11/07 16:34Z, KXMILLERLITEPOS-26DEC03-T89.5 short
+    30 rested a 75-lot bid past the gate) -- the breakeven offset raises the
+    side to the position afterwards."""
     def px(q: "Quote") -> float:
         return q.price_exact if q.price_exact is not None else float(q.price_cents)
 
@@ -3266,7 +3270,18 @@ def ca_unwind_rungs(quotes: List["Quote"], side: str, avg: float) -> List["Quote
     for q in ok:
         k = (q.price_cents, q.price_exact)
         merged[k] = replace(merged[k], count=merged[k].count + q.count) if k in merged else q
-    return list(merged.values())
+    out = list(merged.values())
+    if pos is None:
+        return out
+    left = int(abs(pos))
+    capped: List["Quote"] = []
+    for q in sorted(out, key=px, reverse=(side == "bid")):      # nearest the touch first
+        n = min(q.count, left)
+        if n <= 0:
+            break
+        capped.append(replace(q, count=n) if n != q.count else q)
+        left -= n
+    return capped
 
 
 def series_pre_cutoff_reduce_only_secs(series: str) -> int:
@@ -33756,7 +33771,7 @@ class IncentiveMarketMaker:
             # only at breakeven or better and only if it earns
             if _uw is not None:
                 if _uw_lift or _uw_gated(eb, ea):
-                    _uws = ca_unwind_rungs(out, _uw, _uw_avg)
+                    _uws = ca_unwind_rungs(out, _uw, _uw_avg, _uw_pos)
                     if _uws:
                         _uws = drop_unearning_sides(_uws, yes_levels, no_levels,
                                                     own_live if self.live else [],
@@ -36937,7 +36952,7 @@ class IncentiveMarketMaker:
                     [(q.price_cents, q.count) for q in _uw_pre] != [(q.price_cents, q.count) for q in _uw_post]
                 if ca_uw_lifted or _uw_cut:
                     _uw_avg = self.pnl.avg.get(t)
-                    _uw = ca_unwind_rungs(_uw_pre, ca_uw, _uw_avg)
+                    _uw = ca_unwind_rungs(_uw_pre, ca_uw, _uw_avg, own_pos)
                     if _uw and meta.price_step < 0.01:
                         _ey, _en = orderbook_exact_levels(ob)
                         _uw = drop_unearning_sides(

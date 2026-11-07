@@ -40690,6 +40690,13 @@ class TestCarbonArcUnwind(unittest.TestCase):
                          [("ask", 55, 20)])
         self.assertEqual([(q.price_cents, q.count) for q in f(qs, "bid", 47.6)], [(47, 20)])
         self.assertEqual(f(qs, "ask", 99.5), [])                     # past 99c: nothing
+        # given the position, never more than it in all, nearest the touch first
+        # (live 11/07: short 30 rested a 75-lot bid past the gate)
+        self.assertEqual([(q.price_cents, q.count) for q in f(qs, "ask", 40.0, 30)],
+                         [(51, 20), (53, 10)])
+        self.assertEqual([(q.price_cents, q.count) for q in f(qs, "ask", 40.0, 12)], [(51, 12)])
+        self.assertEqual([(q.price_cents, q.count) for q in f([Q("T", "bid", 45, 75)], "bid", 58.0, -30)],
+                         [(45, 30)])
         self.assertEqual(f([Q("T", "bid", 49, 20)], "ask", 40.0), [])  # no rung on that side
 
     # --- end to end ---------------------------------------------------
@@ -40707,6 +40714,16 @@ class TestCarbonArcUnwind(unittest.TestCase):
         self.assertTrue(all(o["yes_price"] < 56 for o in asks), asks)   # under the gate's floor
         self.assertEqual(bot._be_offset_n.get(self.T)[0], 200)        # the backstop's bracket
         self.assertIn(self.T, bot._ca_unwind_noted)
+
+    def test_past_the_gate_never_more_than_the_position(self):
+        # a small long under the gated ask: the side rests the position, not
+        # the ladder's size, so a fill only flattens
+        self._write_fair({"KXFAKECC": self._entry(101.05)})
+        bot = self._bot()
+        self._hold(bot, 8, 40.0)
+        bot.run_cycle()
+        asks = [o for o in self._side(bot, "ask") if o["yes_price"] < 99]
+        self.assertEqual(sum(o["remaining_count"] for o in asks), 8)
 
     def test_not_past_breakeven_and_only_while_it_earns(self):
         # paid 55: the 51c touch would lock a loss, and 55c sits behind 1,100
