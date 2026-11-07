@@ -396,6 +396,13 @@ if ($Probe) {
     # imm_tape_ab_report.py, emailed daily 08:10 ET ("KL imm tape-ab").
     # BACK OUT: drop IMM_TAPE_TRIGGER=ab here (the code default is dry),
     # then restart_imm.ps1 -Task.
+    # EVERY WINDOW PAUSES (Jack 2026-11-06: "go fully live", on day 5 of the
+    # 21, after "Oct showed these results too right?"): IMM_TAPE_AB_FRAC=1
+    # sends every window to PAUSE, so there are no controls and the A/B stops
+    # measuring. Through 11/06: +$38/day at 4h if every window paused (90%
+    # day-range +$5..+$74), 5m +$10 (-$10..+$33); the October replay +$45
+    # (+$18..+$74), September +$5. BACK TO THE A/B: IMM_TAPE_AB_FRAC=0.5
+    # (the code default) here, then restart_imm.ps1 -Task.
     # WEBSOCKET CANDIDATE BOOKS -- ON (Jack 2026-10-09: "set
     # IMM_WS_CANDIDATES=on to minimize time that isnt quoting"). The universe
     # refresh reads each candidate's book (~2,600) from the kalshi_ws.py feed
@@ -415,7 +422,7 @@ if ($Probe) {
     # EARNINGS x3 (Jack 2026-10-11: "increase it to 3x"): IMM_EARNINGS_SIZE_MULT_NEXT
     # 2.0 -> 3.0, FROM 2026-10-05 -> 2026-10-11 so the startup line reads true.
     # Env change: needs restart_imm.ps1 -Task.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=300000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=2000&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
 }
 
 while ($true) {
