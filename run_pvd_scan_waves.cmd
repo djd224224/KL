@@ -10,7 +10,8 @@ rem whose period is unchanged are left alone. Never places, cancels or removes.
 rem   1. political wave 11/06 (22 series), default sizes 80 live / 120 dead
 rem   2. 2028 election wave 11/06, 80 a side first...
 rem   3. ...then 200 a side for what can't clear the bar at 80 (Jack: "Yes, list at 200")
-rem   4. re-apply the 2028 wave's 3c room + 2-98c band (a relit entry is rebuilt from scratch),
+rem   4. re-apply the 2028 wave's 3c room + 1-99c band (a relit entry is rebuilt from scratch;
+rem      2-98c until Jack 2026-11-07: "expand range to 1-99c"),
 rem      and BANK EARLY: 200 a side until the 8773 dashboard shows $1.30 banked this period,
 rem      then 80 (Jack 2026-11-07: "200 a side until $1.30 is banked, then back down").
 rem      300 a side where 200 won't bank $1.30 by 6 hours before the stop (Jack 2026-11-07:
@@ -45,4 +46,4 @@ set PVD_SCAN_DEAD_SIZE=200
 set PVD_SCAN_LIVE_SIZE=
 set PVD_SCAN_DEAD_SIZE=
 echo ===== %date% %time% pass 4: 2028 band, follow the book, bank early >> "%LOG%"
-"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 2 --price-max 98 --cushion 0 --reanchor 3 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
+"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 1 --price-max 99 --flip-through --cushion 0 --reanchor 3 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1

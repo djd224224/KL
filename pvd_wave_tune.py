@@ -24,6 +24,9 @@ after --since, series in --series), idempotently:
                      (hours left - bank-by-hrs) / 24 < --bank-usd, and stays there
                      until it banks (no flapping). A market with nothing resting keeps
                      its size. /data replaces --bank-hist when given.
+  --flip-through     set "flip_through": the bot rests the side that reduces a
+                     position at its size PLUS the position (Jack 2026-11-07: "if i
+                     bought 200 on one side, i can sell 400 on the other side")
   --cushion N        the entry's last-trade cushion (the bot: live 5c, dead 2c). With
                      a last trade the guard holds a bid N c under it and an ask N c over
                      it, ignoring bid_max / ask_min; at 0 a side may rest at the trade.
@@ -127,6 +130,8 @@ def main() -> int:
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
+    ap.add_argument("--flip-through", action="store_true",
+                    help='set "flip_through" (the bot: the reducing side rests its size + the position)')
     ap.add_argument("--cushion", type=int)
     ap.add_argument("--reanchor", type=int)
     ap.add_argument("--note", default="")
@@ -179,7 +184,7 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = 0
         for t, e in (cur.get("markets") or {}).items():
             if t.split("-")[0] not in series:
                 continue
@@ -200,6 +205,9 @@ def main() -> int:
                 e["price_min"], e["price_max"] = a.price_min, a.price_max
                 e["band"] = f"{stamp}: {a.price_min}-{a.price_max}c {a.note}".strip()
                 n_band += 1
+            if a.flip_through and not e.get("flip_through"):
+                e["flip_through"] = True
+                n_flip += 1
             if a.cushion is not None and e.get("cushion") != a.cushion:
                 e["cushion_set"] = f"{stamp}: cushion {e.get('cushion')} -> {a.cushion} {a.note}".strip()
                 e["cushion"] = a.cushion
@@ -264,13 +272,15 @@ def main() -> int:
         if bank is not None:
             msg += (f"; bank early: {n_banked} past ${a.bank_usd:.2f} this period, "
                     f"{n_max} at {a.bank_max or a.bank_size}, {n_up} sized up, {n_down} sized down")
+        if a.flip_through:
+            msg += f"; flip-through: {n_flip} set"
         if a.cushion is not None:
             msg += f"; cushion {a.cushion}: {n_cush} set"
         if a.reanchor is not None:
             msg += (f"; follow the book ({a.reanchor}c off the touch): {n_anch} re-anchored, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
