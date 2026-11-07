@@ -730,8 +730,8 @@ def enroll_new_series(client, dry: bool):
 # FILE (hot-reloaded; the bot's rules are documented there) when its outcome
 # is decided by a PUBLIC LEGISLATIVE PROCESS -- his 10/22 line, "One-off news
 # is ok if it's not easy to be adversely selected against": a bill or law
-# passing, a repeal, a Senate rules change, a state compact, recorded
-# impeachment votes, judges confirmed over a year. Every word of the series
+# passing, a repeal, a Senate rules change, a state compact, judges
+# confirmed over a year. Every word of the series
 # title, the paying events' titles and every paying market's rules is read:
 #   - one _POLITICS_PROCESS_RE word somewhere, and
 #   - no _POLITICS_INSIDER_RE word anywhere -- the ways the answer reaches
@@ -739,7 +739,9 @@ def enroll_new_series(client, dry: bool):
 #     ranking member, leader, nominees), an executive act (orders, tariffs
 #     "of"/"on", vetoes, pardons, emergencies), a court ruling, a regulator's
 #     approval (commission, board of, authority), a shutdown or funding
-#     deadline, a coalition or confidence vote, a poll or average;
+#     deadline, a coalition or confidence vote, a poll or average, an
+#     impeachment (Jack 2026-11-06, after KXIMPEACH: "Yes, drop it" -- one
+#     House vote, or the news that it is coming, moves every strike at once);
 #   - no person / company / entity strike (custom_strike: a "who" market);
 #   - no live-feed settlement source (sources_are_live);
 #   - no paying market closing within POLITICS_AUTO_MIN_DAYS (a vote that
@@ -763,7 +765,7 @@ POLITICS_AUTO_MAX_EVENTS = 3
 _POLITICS_PROCESS_RE = re.compile(
     r"\b(bills?|laws?|legislation|legislatures?|(?-i:Acts?)|enact\w*|repeal\w*|"
     r"codif\w*|statehood|compact|filibuster|cloture|constitutional amendment|"
-    r"amend(?:s|ed|ing)? the constitution|ratif\w*|impeach\w*|"
+    r"amend(?:s|ed|ing)? the constitution|ratif\w*|"
     r"judges? (?:are |is |were |was )?confirmed|confirm\w* by the (?:u\.s\. )?senate|"
     r"senate (?:votes? to )?confirm\w*)\b", re.I)
 _POLITICS_INSIDER_RE = re.compile(
@@ -778,7 +780,7 @@ _POLITICS_INSIDER_RE = re.compile(
     r"shutdown|shut down|appropriations|continuing resolution|government funding|"
     r"debt (?:ceiling|limit)|coalition|unity government|government formation|"
     r"confidence|regulators?|commission|board of|authority|"
-    r"polls?|polling|approval rating|average|favorab\w*)\b", re.I)
+    r"polls?|polling|approval rating|average|favorab\w*|impeach\w*)\b", re.I)
 _POLITICS_WHO_STRIKES = ("person", "company", "entity", "candidate", "nominee", "name")
 
 
@@ -838,7 +840,7 @@ def politics_auto_why_not(client, series: str, tickers, se: dict,
                 word = p.group(0)
     if not word:
         return ("no public legislative process in its terms (a bill, a law, a repeal, "
-                "a Senate rule, recorded impeachment votes)", "")
+                "a Senate rule)", "")
     return "", word
 
 
@@ -853,9 +855,9 @@ def politics_auto_notify(additions: dict) -> None:
                      f"legislative process (\"{e.get('word')}\"); e.g. {e.get('sample')}")
     lines += ["",
               "The Politics family's rule (Jack 2026-11-06): Kalshi's Politics category, "
-              "decided in the open -- a bill or law, a repeal, a Senate rule, recorded "
-              "impeachment votes -- and never a personnel pick, an executive act, a court "
-              "ruling, a regulator's approval, a shutdown deadline or a poll. Quoted at x1 "
+              "decided in the open -- a bill or law, a repeal, a Senate rule -- and never "
+              "a personnel pick, an executive act, a court ruling, a regulator's approval, "
+              "a shutdown deadline, a poll or an impeachment. Quoted at x1 "
               "on the global spec, at the touch.",
               f"To pull one: add it to IMM_POLITICS_AUTO_EXCLUDE, or delete it from "
               f"{imm.politics_auto_path()} (the bot reloads it within one refresh), or "

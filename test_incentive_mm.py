@@ -31201,6 +31201,29 @@ class TestPoliticsAutoFamily(unittest.TestCase):
             self.assertIn("carved out", ieo.politics_auto_why_not(
                 _Client(None), "KXFOO", ["KXFOO-27-A"], se)[0])
 
+    def test_an_impeachment_stays_out(self):
+        # Jack 2026-11-06, after KXIMPEACH: "Yes, drop it" -- impeachment is
+        # no process word, and refuses a series even beside one ("resolution
+        # ... bill" below)
+        import imm_earnings_overrides as ieo
+        far = (datetime.now(timezone.utc) + timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        class _Client:
+            def get(self, path, params=None):
+                if path == "/markets":
+                    return {"markets": [{"ticker": "KXIMP-27-A", "event_ticker": "KXIMP-27",
+                                         "rules_primary": "If the House adopts articles of "
+                                                          "impeachment, a resolution like a bill ...",
+                                         "close_time": far}]}
+                if path.startswith("/events/"):
+                    return {"event": {"title": "Will the House impeach the President?"}}
+                raise AssertionError(path)
+        why, word = ieo.politics_auto_why_not(_Client(), "KXIMP", ["KXIMP-27-A"],
+                                              {"category": "Politics", "title": "Impeachment"})
+        self.assertIn('"Impeachment"', why)
+        self.assertEqual(word, "")
+        self.assertIsNone(ieo._POLITICS_PROCESS_RE.search("impeached by Jan 1"))
+
 
 class TestElectionTermEnd(unittest.TestCase):
     """Jack 2026-10-28, of KXJAPANHOUSE-30FEB07 ("Next Japanese general
