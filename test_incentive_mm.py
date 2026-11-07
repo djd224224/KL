@@ -40381,6 +40381,43 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         bot2.run_cycle()
         self.assertEqual([o["book_side"] for o in bot2.state.sim_orders.values() if o["ticker"] == self.T], ["bid"])
 
+    def test_flip_through_reducing_side_rests_size_plus_position(self):
+        """Jack 2026-11-07 (KXHOUSERACE-WA07-28-D long 200 at 97c): "if i bought
+        200 on one side, i can sell 400 on the other side (or if i bought 300 on
+        one side, i can go to 600 on the other side)" -- an entry's
+        "flip_through" rests the reducing side at its size + the position; the
+        position limit per side still caps the far side at its size"""
+        e = {"size": 200, "bsize": 200, "asize": 200, "flip": True}
+        self.assertEqual(imm.pvd_side_sizes(e, 200.0), (200, 400))
+        self.assertEqual(imm.pvd_side_sizes(e, -150.0), (350, 200))
+        self.assertEqual(imm.pvd_side_sizes(e, 0.0), (200, 200))
+        self.assertEqual(imm.pvd_side_sizes(dict(e, flip=False), 200.0), (200, 200))
+        self.assertEqual(imm.pvd_side_sizes({"size": 300, "flip": True}, 300.0), (300, 600))
+
+        def orders(markets, pos):
+            _clean_persist()            # each case a fresh bot (no fill tripwire off the last case)
+            self._write(markets)
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if pos:
+                bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, 50.0
+                bot.client.positions[self.T] = pos
+            bot.run_cycle()
+            return sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T)
+        flip = {self.T: {"bid_max": 49, "ask_min": 51, "size": 200, "flip_through": True}}
+        # long 200 = its long limit: no bid, and the ask sells the 200 back plus a 200 rung
+        self.assertEqual(orders(flip, 200.0), [("ask", 400.0)])
+        self.assertTrue(imm.PVD_MARKETS[self.T]["flip"])
+        # short 120: the bid buys the 120 back plus its 200 (the accumulating ask
+        # stands aside on the skew, as it does without the flag)
+        self.assertEqual(orders(flip, -120.0), [("bid", 320.0)])
+        self.assertEqual(orders({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}}, -120.0), [("bid", 200.0)])
+        # flat: both sides at the size, as without the flag
+        self.assertEqual(orders(flip, 0.0), [("ask", 200.0), ("bid", 200.0)])
+        # without the flag: the old cap, the ask at its size
+        self.assertEqual(orders({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}}, 200.0), [("ask", 200.0)])
+        self.assertFalse(imm.PVD_MARKETS[self.T]["flip"])
+
     def test_decided_side_no_cushion_2_to_99(self):
         """Jack 2026-11-04: "for decided side, can go up to 99c and no cushion"
         (and "dont quote 1c"): a winner's bid / a loser's ask rests anywhere in

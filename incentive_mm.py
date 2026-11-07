@@ -9829,6 +9829,9 @@ def load_pvd_markets() -> int:
                     # apply_series_cutoff_adjustments); otherwise it only
                     # shortens it
                     "override_cutoff": bool(raw.get("override_cutoff")),
+                    # "flip_through": the reducing side rests its size PLUS the
+                    # position (pvd_side_sizes)
+                    "flip": bool(raw.get("flip_through")),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
@@ -9872,6 +9875,26 @@ PVD_PRICE_MAX = _env_int("IMM_PVD_PRICE_MAX", 97)
 PVD_CUSHION_DEAD = _env_int("IMM_PVD_CUSHION_DEAD", 2)
 PVD_CUSHION_LIVE = _env_int("IMM_PVD_CUSHION_LIVE", 5)
 PVD_LAST: Dict[str, float] = {}
+
+
+def pvd_side_sizes(entry: dict, pos: float) -> Tuple[int, int]:
+    """(bid, ask) rung a post-vote dead book rests at position `pos`: its
+    bid_size / ask_size -- and with "flip_through" (entry["flip"]) the side
+    that REDUCES the position rests its size PLUS the position (Jack
+    2026-11-07, on KXHOUSERACE-WA07-28-D long 200 after its 97c bid filled:
+    "if i bought 200 on one side, i can sell 400 on the other side (or if i
+    bought 300 on one side, i can go to 600 on the other side)"). One fill
+    can then flatten the position and keep the usual rung on the far side;
+    the position limit per side (its size) still binds, so long 200 at 200
+    a side ends no shorter than 200."""
+    b = int(entry.get("bsize", entry["size"]))
+    a = int(entry.get("asize", entry["size"]))
+    if entry.get("flip") and abs(pos) >= 1:
+        if pos > 0:
+            a += int(pos)
+        else:
+            b += int(-pos)
+    return b, a
 
 
 def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
@@ -24317,6 +24340,10 @@ class IncentiveMarketMaker:
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
         self._pvd_close: Dict[str, Optional[tuple]] = {}  # closing-exemption rung last logged
+        # a flip-through entry's (bid, ask) rung as the quote loop sized it this
+        # cycle (pvd_side_sizes on the position it judged) -- place_with_caps'
+        # side cap reads it, so a 400 ask beside a long 200 isn't "blocked at 0/200"
+        self._pvd_side_n: Dict[str, Tuple[int, int]] = {}
         # (ticker, side) -> YES price the side rests at ahead of a pile
         # (JOIN_AHEAD_MODE); logging only, so a move is announced once
         self._join_ahead_state: Dict[Tuple[str, str], int] = {}
@@ -36222,8 +36249,11 @@ class IncentiveMarketMaker:
             # a post-vote dead book's rung is the same on both sides (no family
             # lean or long-shot cut); a side a guard above emptied stays dark
             if pvd is not None:
-                lv_bid = [(0, pvd.get("bsize", pvd["size"]))] if lv_bid else []
-                lv_ask = [(0, pvd.get("asize", pvd["size"]))] if lv_ask else []
+                _pv_b, _pv_a = pvd_side_sizes(pvd, ens_cap_pos(meta.series, coexist, own_pos, pos))
+                if pvd.get("flip"):
+                    self._pvd_side_n[t] = (_pv_b, _pv_a)
+                lv_bid = [(0, _pv_b)] if lv_bid else []
+                lv_ask = [(0, _pv_a)] if lv_ask else []
             side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
@@ -36311,8 +36341,16 @@ class IncentiveMarketMaker:
             if pvd is not None:
                 # ...and never more than PVD_SIZE resting a side, the unwind
                 # of an older position included
-                side_max_bid = min(side_max_bid, pvd.get("bsize", pvd["size"]))
-                side_max_ask = min(side_max_ask, pvd.get("asize", pvd["size"]))
+                if pvd.get("flip"):
+                    # FLIP THROUGH: the reducing side rests its size + the
+                    # position (pvd_side_sizes), past the one-order clamp to
+                    # the position cap above -- the per-side position room
+                    # (pos_room_*) still holds it to a short / long of its size
+                    side_max_bid = _pv_b if lv_bid else 0
+                    side_max_ask = _pv_a if lv_ask else 0
+                else:
+                    side_max_bid = min(side_max_bid, pvd.get("bsize", pvd["size"]))
+                    side_max_ask = min(side_max_ask, pvd.get("asize", pvd["size"]))
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
@@ -37736,6 +37774,10 @@ class IncentiveMarketMaker:
             if _pvq is not None:
                 side_cap = max_level_size = float(_pvq.get(
                     "bsize" if q.book_side == "bid" else "asize", _pvq["size"]))
+                # ...or, flip-through, the size + position the quote loop rested
+                _pvn = self._pvd_side_n.get(q.ticker) if _pvq.get("flip") else None
+                if _pvn is not None:
+                    side_cap = max_level_size = float(_pvn[0] if q.book_side == "bid" else _pvn[1])
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)
