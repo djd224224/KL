@@ -5083,7 +5083,8 @@ if WAVE_BREAKER not in ("off", "dry", "on"):
 WAVE_WINDOW_SECS = max(0.0, _env_float("IMM_WAVE_WINDOW_MIN", 10.0)) * 60.0
 WAVE_HOLD_SECS = max(0.0, _env_float("IMM_WAVE_HOLD_MIN", 15.0)) * 60.0
 WAVE_MIN_COST = _env_float("IMM_WAVE_MIN_COST", 90.0)
-WAVE_MIN_CT = max(0.0, _env_float("IMM_WAVE_MIN_CT", 25.0))
+# (Jack 2026-11-07: "two fills of 25+ contracts ... make that 200+")
+WAVE_MIN_CT = max(0.0, _env_float("IMM_WAVE_MIN_CT", 200.0))
 
 
 def wave_series(series: str) -> bool:
@@ -5167,12 +5168,19 @@ TAPE_LOG_MIN_CT = max(0.0, _env_float("IMM_TAPE_LOG_MIN_CT", 10.0))
 TAPE_AB_FRAC = min(1.0, max(0.0, _env_float("IMM_TAPE_AB_FRAC", 0.5)))
 TAPE_HOLD_SECS = max(1.0, _env_float("IMM_TAPE_HOLD_SECS", 60.0))
 TAPE_AB_MIN_CT = max(0.0, _env_float("IMM_TAPE_AB_MIN_CT", 100.0))
+# a no-halts wave series (wave_series) trips on a burst of TAPE_WAVE_MIN_CT+
+# alone, in any mode (Jack 2026-11-07: "the wave's series now get the 60-second
+# event pause on any 100+ burst ... make that 200+")
+TAPE_WAVE_MIN_CT = max(0.0, _env_float("IMM_TAPE_WAVE_MIN_CT", 200.0))
 TAPE_AB_CANCEL_RESERVE = max(0, _env_int("IMM_TAPE_AB_CANCEL_RESERVE", 40))
 
 
-def tape_burst_trips(ct: float, levels: int) -> bool:
+def tape_burst_trips(ct: float, levels: int, series: str = "") -> bool:
     """Does a taker burst of `ct` contracts over `levels` prices trip? (The
-    live A/B trips on its size alone: TAPE_AB_MIN_CT, any number of prices.)"""
+    live A/B trips on its size alone: TAPE_AB_MIN_CT, any number of prices; a
+    wave series on TAPE_WAVE_MIN_CT alone.)"""
+    if series and wave_series(series):
+        return ct + 1e-9 >= TAPE_WAVE_MIN_CT
     if TAPE_TRIGGER == "ab":
         return ct + 1e-9 >= TAPE_AB_MIN_CT
     return ct + 1e-9 >= TAPE_MIN_CT and (levels >= TAPE_MIN_LEVELS
@@ -27940,7 +27948,7 @@ class IncentiveMarketMaker:
         # or the event's own: GTA's 250); every other series on the burst rule
         trips = (b["ct"] + 1e-9 >= twk_say_taker_ct(t)) \
             if twk_say_series(series_of(t)) \
-            else tape_burst_trips(b["ct"], len(b["px"]))
+            else tape_burst_trips(b["ct"], len(b["px"]), series_of(t))
         if b["trip"] is None and trips:
             b["cross_tid"] = str(body.get("trade_id") or "")    # the A/B's draw
             self._tape_trip(t, side, b, now_ts)

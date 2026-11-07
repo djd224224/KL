@@ -40531,7 +40531,7 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         now = time.time()
         bot._wave_note_fill(self.T, "o1", "bid", 50.0, 300.0, now, now, None)       # 50c: not counted
-        bot._wave_note_fill(self.T, "o2", "bid", 95.0, 10.0, now, now, None)        # 10 lots: not counted
+        bot._wave_note_fill(self.T, "o2", "bid", 95.0, 150.0, now, now, None)       # under 200: not counted
         bot._wave_note_fill(self.T, "o3", "bid", 95.0, 300.0, now, now, None)
         bot._wave_note_fill(self.T, "o4", "bid", 96.0, 300.0, now + 5, now + 5, None)  # same market
         self.assertFalse(bot.wave_held(self.T, "bid", 95.0, now + 6))
@@ -40559,6 +40559,10 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertTrue(imm.sweep_exempt(s))
         self.assertFalse(imm.tape_exempt(s))
         self.assertTrue(imm.tape_exempt("KXTRUMPMENTION"))
+        # ...and trips there on a burst of 200+ alone (Jack: "make that 200+")
+        self.assertFalse(imm.tape_burst_trips(199.0, 3, s))
+        self.assertTrue(imm.tape_burst_trips(200.0, 1, s))
+        self.assertEqual(imm.tape_burst_trips(150.0, 1, "KXOTHER"), imm.tape_burst_trips(150.0, 1))
 
     def test_flip_to_flat_reducing_side_rests_the_position(self):
         """Jack 2026-11-07 (KXJEFFRIESFIRST-27FEB01-AL1 long 450, pinned 200 a
