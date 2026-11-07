@@ -1536,6 +1536,14 @@ class Maker:
         except Exception as e:
             self._error("mark read", e)
             return
+        # ...onto the leg tape too (2026-11-07, the scorecard's "our fills against the
+        # close"): an open ticket's leg nobody else asks about still gets its book on the
+        # tape every minute up to its start, so the ticket has a closing line
+        for tk, m in mk.items():
+            ex = _iso_s(m.get("expected_expiration_time"))
+            if ex is not None:
+                self.exp[tk] = ex
+            self._tape(tk, m, now)
         total = 0.0
         for t in self.book.tickets:
             if t.get("status") == "settled":

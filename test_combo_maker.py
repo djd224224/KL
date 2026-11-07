@@ -2023,3 +2023,26 @@ class LegTape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarksFeedTheTape(unittest.TestCase):
+    """2026-11-07 (the scorecard's "our fills against the close"): the open tickets'
+    once-a-minute mark read puts their legs on the leg tape too, so a leg nobody else
+    asks about still has a closing line."""
+
+    def test_an_open_tickets_legs_reach_the_tape(self):
+        lw, c, clock = W(), FakeClient(MK), [T0]
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        book = cm.Book(os.path.join(d.name, "s.json"))
+        m = cm.Maker(c, cm.Config(min_legs=2, live=True), W(), book, d.name, clock=lambda: clock[0], leg_writer=lw)
+        book.tickets.append({"quote_id": "qx", "mt": "KXMVECROSSCATEGORY-S2026X-Z", "legs": [[L1, "yes"], [L2, "yes"]],
+                             "games": [cm.game_of(L1), cm.game_of(L2)], "ask": 0.33, "fair": 0.30,
+                             "contracts": 100.0, "status": "executed", "fill_checked": True, "px_checked": True,
+                             "day": cm.et_day(clock[0]), "at": clock[0], "fee_est": 0.5})
+        m.mark_book(clock[0])
+        m.write_tape(clock[0])
+        rec = lw.k("legs")[-1]["m"]
+        self.assertEqual(sorted(rec), sorted([L1, L2]))
+        self.assertEqual(rec[L1], [0.59, 0.61, None, None, round(T0 + 5 * 3600)])     # + its expiry, once
+        self.assertEqual(rec[L2][:2], [0.49, 0.51])

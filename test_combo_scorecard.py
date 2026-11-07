@@ -303,3 +303,108 @@ class EmailAndReads(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+N1, N2 = "KXNFLGAME-26NOV06DALNYG-DAL", "KXNFLGAME-26NOV06KCBUF-KC"   # all-NFL: no maker fee
+TEN = "KXITFWMATCH-26NOV06SHAWAN-SHA"                                # tennis: sport off
+LATE = "KXNBAGAME-26NOV07LALDEN-LAL"                                 # starts after "now"
+STALE = "KXNHLGAME-26NOV06NYRBOS-NYR"                                # no mid near its start
+
+
+def ours_tape_rows():
+    """tape_rows() + the legs above: N1 0.40 / N2 0.50 at both lines, LATE read once
+    (expiry 30 h on), STALE read only 3.5 h before its start (too old for a close)."""
+    rows = tape_rows()
+    rows[0]["m"].update({N1: [0.39, 0.41, None, None, EXP], N2: [0.49, 0.51, None, None, EXP],
+                         LATE: [0.49, 0.51, None, None, START + 30 * 3600]})
+    rows[1]["m"].update({N1: [0.39, 0.41, None, None], N2: [0.49, 0.51, None, None]})
+    return [{"k": "legs", "t": START - 12600, "m": {STALE: [0.49, 0.51, None, None, EXP]}}] + rows
+
+
+def ticket(oid, legs, ask, fair, ct, fee, at=T0 + 100, status="executed", **kw):
+    t = {"quote_id": "q" + oid, "order_id": oid, "legs": legs, "ask": ask, "fair": fair, "contracts": ct,
+         "fee_est": fee, "at": at, "status": status, "fill_checked": True}
+    t.update(kw)
+    return t
+
+
+OURS = [ticket("o1", [[A, "yes"], [B, "yes"]], 0.34, 0.31, 100.0, 0.5),           # close 0.325
+        ticket("o2", [[N1, "yes"], [N2, "yes"]], 0.21, 0.20, 50.0, 0.0),          # all-NFL, close 0.20
+        ticket("o3", [[A, "yes"], [B, "yes"], [C, "no"]], 0.24, 0.22, 10.0, 0.05,  # close 0.2275, settled
+               status="settled", result="no", pnl=2.35),
+        ticket("o4", [[A, "yes"], [C, "no"]], 0.44, 0.42, 10.0, 0.1, at=START + 60),  # sold in play
+        ticket("o5", [[TEN, "yes"], [B, "yes"]], 0.30, 0.29, 10.0, 0.1),             # sport off
+        ticket("o6", [[A, "yes"], [LATE, "yes"]], 0.33, 0.30, 10.0, 0.1),            # waiting on LATE
+        ticket("o7", [[A, "yes"], [STALE, "yes"]], 0.33, 0.30, 10.0, 0.1),           # no close
+        dict(ticket("o8", [[A, "yes"], [B, "yes"]], 0.34, 0.31, 100.0, 0.5), status="unfilled")]  # not ours
+
+
+class OurFills(unittest.TestCase):
+    """Jack 2026-11-07 ("Yes, add it"): our own fills against the close, by legs."""
+
+    def setUp(self):
+        self.rd, self.md = tempfile.TemporaryDirectory(), tempfile.TemporaryDirectory()
+        self.addCleanup(self.rd.cleanup)
+        self.addCleanup(self.md.cleanup)
+        write_jsonl(os.path.join(self.md.name, f"legs_{DAY}.jsonl"), ours_tape_rows())
+        with open(os.path.join(self.md.name, "maker_state.json"), "w", encoding="utf-8") as f:
+            json.dump({"tickets": OURS}, f)
+        self.now = START + 3600
+
+    def test_rows_states_and_the_cache(self):
+        o = sc.our_fills(self.md.name, self.rd.name, sc.Results(), self.now)
+        self.assertEqual((o["tickets"], o["since"]), (7, DAY))                       # o8 never filled
+        self.assertEqual(o["left_out"], {"in play": 1, "sport off": 1, "no close": 1})
+        two, fp, nfl = o["rows"]["2"], o["rows"]["2, fee-paying"], o["rows"]["2, all-NFL (no fee)"]
+        self.assertEqual((two["tickets"], two["closed"], two["waiting"]), (6, 2, 1))
+        self.assertEqual((fp["tickets"], fp["closed"], nfl["tickets"], nfl["closed"]), (5, 1, 1, 1))
+        self.assertAlmostEqual(fp["vs_close"], round(100 * (0.34 - 0.325) - 0.5, 2))
+        self.assertAlmostEqual(fp["over_close"], (100 * (0.34 - 0.325) - 0.5) / (100 * 0.325))
+        self.assertAlmostEqual(fp["fair_over_close"], 100 * (0.31 - 0.325) / (100 * 0.325))
+        self.assertAlmostEqual(nfl["over_close"], 50 * (0.21 - 0.20) / (50 * 0.20))      # no fee
+        three = o["rows"]["3-4"]
+        self.assertEqual((three["closed"], three["settled"], three["pnl"]), (1, 1, 2.35))
+        self.assertAlmostEqual(three["vs_close"], round(10 * (0.24 - 0.65 * 0.5 * 0.7) - 0.05, 2))
+        self.assertEqual(o["rows"]["all"]["closed"], 3)
+        with open(os.path.join(self.rd.name, sc.OURS_CACHE), encoding="utf-8") as f:
+            cache = json.load(f)
+        self.assertEqual({k: v["s"] for k, v in cache.items()},
+                         {"o1": "closed", "o2": "closed", "o3": "closed", "o4": "in play", "o5": "sport off",
+                          "o7": "no close"})                                           # o6 is still waiting
+        # a later run with no tape left reads the finished tickets from the cache
+        os.remove(os.path.join(self.md.name, f"legs_{DAY}.jsonl"))
+        again = sc.our_fills(self.md.name, self.rd.name, sc.Results(), self.now + 86400)
+        self.assertEqual(again["rows"]["2, fee-paying"], fp)
+        self.assertEqual(again["left_out"], o["left_out"])
+
+    def test_waiting_until_the_start_and_results_give_starts(self):
+        early = sc.our_fills(self.md.name, self.rd.name, sc.Results(), START - 1, save=False)
+        self.assertEqual((early["rows"]["all"]["closed"], early["rows"]["all"]["waiting"]), (0, 5))
+        self.assertFalse(os.path.exists(os.path.join(self.rd.name, sc.OURS_CACHE)))
+        # a leg with no tape expiry gets its start from the results read
+        res = sc.Results()
+        res.d = {LATE: {"r": None, "x": START + 3 * 3600}}                           # LATE now starts at START
+        o = sc.our_fills(self.md.name, self.rd.name, res, self.now, save=False)
+        self.assertEqual(o["rows"]["2"]["waiting"], 0)
+
+    def test_the_report_section(self):
+        o = sc.our_fills(self.md.name, self.rd.name, sc.Results(), self.now, save=False)
+        md = "\n".join(sc.render_ours(o))
+        for want in ("## Our fills against the close", "| 2, fee-paying | 5 | 1 | 1 |",
+                     "| 2, all-NFL (no fee) | 1 | 1 | 0 |", "sold in play (a leg had started) 1",
+                     "Fee-paying 2 legs: 1 of the 30 with a close; so far +3.1% after fees ($1)"):
+            self.assertIn(want, md)
+        self.assertEqual(sc.render_ours(None), [])
+        self.assertIn("No filled tickets", "\n".join(sc.render_ours(sc.ours_stats([], {}))))
+
+    def test_main_puts_it_in_the_report(self):
+        write_jsonl(os.path.join(self.rd.name, f"combo_{DAY}.jsonl"), PRINTS)
+        write_jsonl(os.path.join(self.md.name, f"combo_{DAY}.jsonl"), [{"k": "start", "t": T0, "cfg": {"markup": 0.04}}])
+        with mock.patch.object(sc.time, "time", return_value=self.now):
+            self.assertEqual(sc.main(["--day", DAY, "--rfq-dir", self.rd.name, "--maker-dir", self.md.name,
+                                      "--no-results"]), 0)
+        with open(os.path.join(self.rd.name, f"scorecard_{DAY}.json"), encoding="utf-8") as f:
+            js = json.load(f)
+        self.assertEqual(js["ours"]["rows"]["all"]["closed"], 3)
+        with open(os.path.join(self.rd.name, f"scorecard_{DAY}.md"), encoding="utf-8") as f:
+            self.assertIn("## Our fills against the close", f.read())

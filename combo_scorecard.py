@@ -20,6 +20,10 @@ priced from the legs' Kalshi mids at the print:
                    have undercut and our margin over the close after the fee on
                    them -- what a markup would have earned, first order (no
                    reply from the other makers), and the live rule's own row;
+  OUR FILLS        every ticket the live maker sold (maker_state.json), by
+                   legs, once its legs have closes: what we sold above the
+                   close after the fee (2 legs split fee-paying / all-NFL),
+                   cumulative, each ticket's close kept in our_closes.json;
   REQUESTERS       the most active buyers, and the sharpest: their prints'
                    margin to the makers over the close;
   FAIR SOURCES     per leg an hour before its start: Kalshi's mid, DraftKings,
@@ -52,6 +56,7 @@ import os
 import statistics
 import sys
 import time
+import types
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -233,6 +238,26 @@ def implied_tape(maker_dir: str, day: str, window_s: float = WINDOW_S):
         for tk, v in mids.items():
             tape.add(tk, w * window_s, sum(v) / len(v))
     return tape.finish() if tape.rows else None
+
+
+def day_tape(maker_dir: str, day: str, quiet: bool = False):
+    """A day's leg prices: the leg tape; the mids backed out of the maker's quotes
+    behind it when it starts after 00:30Z (a maker restart onto the tape's code), or
+    alone on a day with no tape; None with neither."""
+    tape = load_tape(maker_dir, day)
+    day0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    if tape is None:
+        if not quiet:
+            log("no leg tape that day: backing the mids out of the maker's quotes")
+        return implied_tape(maker_dir, day)
+    if (tape_start(tape) or day0) > day0 + 1800:
+        if not quiet:
+            log(f"the leg tape starts {datetime.fromtimestamp(tape_start(tape), timezone.utc):%H:%MZ}: "
+                "the mids backed out of the maker's quotes before it")
+        imp = implied_tape(maker_dir, day)
+        if imp is not None:
+            return Layered(tape, imp)
+    return tape
 
 
 # ---- results ----------------------------------------------------------------------
@@ -527,6 +552,170 @@ def score(prints, tape: Tape, results: Results, now: float, cfg=None, no_prints:
             "legs_settled": len({tk for r in rows for tk, _ in r["legs"] if results.final(tk)})}
 
 
+# ---- our fills against the close ----------------------------------------------------
+# Jack 2026-11-07, "should i stop quoting 2-leg parlays?" then "Yes, add it": the
+# market's prints say 2-leg parlays clear under the maker fee, but those are other
+# makers' prices. What decides it is OUR fills against the closing line, by leg
+# count: every filled ticket of the live maker (maker_state.json), once each of its
+# legs has a close (the tape's last mid before the leg's start, as for the prints).
+# A ticket's final state is kept in OURS_CACHE, so a later run needs no old tape.
+
+OURS_CACHE = "our_closes.json"     # in --rfq-dir
+OURS_DECIDE_N = 30                 # fee-paying 2-leg tickets with a close before the 2-leg call
+OURS_FINAL = ("closed", "in play", "no close", "no start", "sport off")
+OURS_LEFT_OUT = (("in play", "sold in play (a leg had started)"),
+                 ("sport off", "sport off (tennis / boxing: start times never checked)"),
+                 ("no close", "no close (a started leg had no mid near its start)"),
+                 ("no start", "no start (a settled leg's start unknown)"))
+
+
+def utc_day(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+def our_tickets(maker_dir: str) -> list:
+    """The live maker's filled tickets: settled, or executed with the fill read back."""
+    try:
+        with open(os.path.join(maker_dir, "maker_state.json"), encoding="utf-8") as f:
+            st = json.load(f) or {}
+    except (OSError, ValueError):
+        return []
+    return [t for t in st.get("tickets") or []
+            if t.get("legs") and t.get("contracts") and t.get("at") and t.get("ask") is not None
+            and (t.get("status") == "settled" or (t.get("status") == "executed" and t.get("fill_checked")))]
+
+
+def ticket_key(t: dict) -> str:
+    return str(t.get("order_id") or t.get("quote_id"))
+
+
+def all_nfl(t: dict) -> bool:
+    """An all-NFL parlay: no maker fee (fee_of)."""
+    return all(str(l[0]).startswith("KXNFL") for l in t["legs"])
+
+
+class Days:
+    """Leg prices across days: a day's tape (day_tape) loaded on first use; a close
+    reads the tape of the day it falls on."""
+
+    def __init__(self, maker_dir: str, have: dict = None):
+        self.maker_dir, self.tapes = maker_dir, dict(have or {})
+
+    def tape(self, day: str):
+        if day not in self.tapes:
+            self.tapes[day] = day_tape(self.maker_dir, day, quiet=True)
+        return self.tapes[day]
+
+    def close(self, tk: str, start: float):
+        tp = self.tape(utc_day(start - CLOSE_GAP_S))
+        return None if tp is None else tp.close(tk, start)
+
+
+def ticket_close(t: dict, exps, results: Results, starts: dict, days: Days, now: float):
+    """(state, close) of one of our tickets: "sport off" (a leg in a sport whose start
+    times were never checked: tennis, boxing), "in play" (sold after a leg's start, so
+    no close came before the sale), "no start" (a settled leg with no start known), "no
+    close" (a started leg with no mid near its start), "waiting" (a leg not started),
+    else "closed" and the product of the legs' closing mids on the ticket's sides."""
+    legs = [(str(l[0]), str(l[1])) for l in t["legs"]]
+    if any(cm.sport_of(tk.split("-")[0]) not in cm.DEFAULT_SPORTS for tk, _ in legs):
+        return "sport off", None
+    close, waiting, missing = 1.0, False, None
+    for tk, side in legs:
+        start = leg_start_of(tk, exps, results, starts)
+        if start is None:
+            if results.final(tk):
+                missing = missing or "no start"
+            else:
+                waiting = True
+            continue
+        if start <= float(t["at"]):
+            return "in play", None
+        if start > now:
+            waiting = True
+            continue
+        c = days.close(tk, start)
+        if c is None:
+            missing = missing or "no close"
+            continue
+        close *= c if side == "yes" else 1.0 - c
+    if missing:
+        return missing, None
+    return ("waiting", None) if waiting else ("closed", close)
+
+
+def ours_row(group) -> dict:
+    """One row of the table: group = [(ticket, (state, close))]."""
+    closed = [(t, c) for t, (s, c) in group if s == "closed"]
+    close_value = sum(t["contracts"] * c for t, c in closed)
+    vs_close = sum(t["contracts"] * (t["ask"] - c) - (t.get("fee_est") or 0.0) for t, c in closed)
+    fair_vs = sum(t["contracts"] * ((t.get("fair") or 0.0) - c) for t, c in closed)
+    settled = [t for t, _ in group if t.get("status") == "settled"]
+    return {"tickets": len(group), "closed": len(closed),
+            "waiting": sum(1 for _, (s, _c) in group if s == "waiting"),
+            "collected": round(sum(t["contracts"] * t["ask"] for t, _ in closed), 2),
+            "close_value": round(close_value, 2), "vs_close": round(vs_close, 2),
+            "over_close": vs_close / close_value if close_value > 0 else None,
+            "fair_over_close": fair_vs / close_value if close_value > 0 else None,
+            "settled": len(settled), "pnl": round(sum(t.get("pnl") or 0.0 for t in settled), 2)}
+
+
+def ours_stats(tix: list, state: dict) -> dict:
+    pairs = [(t, state[ticket_key(t)]) for t in tix]
+    rows = {}
+    for b, _, _ in BUCKETS:
+        g = [p for p in pairs if bucket(len(p[0]["legs"])) == b]
+        if g:
+            rows[b] = ours_row(g)
+        if b == "2" and g:
+            rows["2, fee-paying"] = ours_row([p for p in g if not all_nfl(p[0])])
+            rows["2, all-NFL (no fee)"] = ours_row([p for p in g if all_nfl(p[0])])
+    rows["all"] = ours_row(pairs)
+    left = Counter(s for _, (s, _c) in pairs if s not in ("closed", "waiting"))
+    first = min((float(t["at"]) for t in tix), default=None)
+    return {"tickets": len(tix), "since": utc_day(first) if first else None, "rows": rows, "left_out": dict(left),
+            "decide_n": OURS_DECIDE_N}
+
+
+def our_fills(maker_dir: str, rfq_dir: str, results: Results, now: float, tapes: dict = None,
+              save: bool = True) -> dict:
+    """Our filled tickets against the close, by leg count (ours_stats). Each ticket's
+    state is worked out from the tapes until final, then read from OURS_CACHE."""
+    tix = our_tickets(maker_dir)
+    path = os.path.join(rfq_dir, OURS_CACHE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cache = json.load(f) or {}
+    except (OSError, ValueError):
+        cache = {}
+    days = Days(maker_dir, tapes)
+    todo = [t for t in tix if ticket_key(t) not in cache]
+    exp = {}
+    for d in sorted({utc_day(float(t["at"])) for t in todo}):     # expiries: the sale days' tapes...
+        tp = days.tape(d)
+        if tp is not None:
+            exp.update(tp.exp)
+    exp.update({tk: v["x"] for tk, v in results.d.items() if v.get("x")})   # ...and the results read
+    exps = types.SimpleNamespace(exp=exp)
+    starts = game_starts(exps, results)
+    state, new = {}, 0
+    for t in tix:
+        k = ticket_key(t)
+        if k in cache:
+            state[k] = (cache[k]["s"], cache[k].get("c"))
+            continue
+        state[k] = ticket_close(t, exps, results, starts, days, now)
+        if state[k][0] in OURS_FINAL:
+            cache[k] = {"s": state[k][0], "c": state[k][1], "at": round(now, 1)}
+            new += 1
+    if new and save:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    return ours_stats(tix, state)
+
+
 # ---- the report -------------------------------------------------------------------
 
 def _pct(x, d=1, sign=True):
@@ -535,6 +724,37 @@ def _pct(x, d=1, sign=True):
 
 def _usd(x):
     return "&ndash;" if x is None else (f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}")
+
+
+def render_ours(ours) -> list:
+    """The "Our fills against the close" section (our_fills); [] when not computed."""
+    if ours is None:
+        return []
+    L = ["## Our fills against the close", ""]
+    if not ours["tickets"]:
+        return L + ["No filled tickets of the live maker yet.", ""]
+    L += [f"Every ticket the live maker sold since {ours['since']} (UTC), {ours['tickets']:,} of them, by legs, once "
+          "each leg has its close (the last mid before its start). Over the close after fees: what we sold "
+          "above the close, less the maker fee, on the close's value (+ = we beat it). Our fair over the close: "
+          "the fair at the sale on the same close (+ = the fair was already above it, so the markup was extra).", "",
+          "| Legs | Tickets | With a close | Waiting | Collected | Our fair over the close | Over the close after "
+          "fees | $ over the close | Settled | Settled P&L |", "|---|---|---|---|---|---|---|---|---|---|"]
+    for b, r in ours["rows"].items():
+        L.append(f"| {b} | {r['tickets']:,} | {r['closed']:,} | {r['waiting']:,} | {_usd(r['collected'])} | "
+                 f"{_pct(r['fair_over_close'])} | {_pct(r['over_close'])} | "
+                 f"{_usd(r['vs_close']) if r['closed'] else '&ndash;'} | {r['settled']:,} | "
+                 f"{_usd(r['pnl']) if r['settled'] else '&ndash;'} |")
+    left = [f"{lab} {ours['left_out'][k]:,}" for k, lab in OURS_LEFT_OUT if ours["left_out"].get(k)]
+    if left:
+        L += ["", "Left out of the close columns: " + ", ".join(left) + "."]
+    fp = ours["rows"].get("2, fee-paying")
+    if fp and fp["tickets"]:
+        so_far = (f"so far {_pct(fp['over_close'])} after fees ({_usd(fp['vs_close'])})" if fp["closed"]
+                  else "none has its close yet")
+        L += ["", f"Fee-paying 2 legs: {fp['closed']:,} of the {ours['decide_n']} with a close; {so_far}. The 11/07 "
+                  "suggestion: under the close after fees at 30, stop fee-paying 2-leg quotes and keep the all-NFL "
+                  "ones (no maker fee)."]
+    return L + [""]
 
 
 def render_md(day: str, sc: dict, results_left: int = 0, results_read: bool = True) -> str:
@@ -584,6 +804,7 @@ def render_md(day: str, sc: dict, results_left: int = 0, results_read: bool = Tr
                      f"{_usd(o['vs_close']) if o['closed_premium'] else '&ndash;'} | "
                      f"{_usd(o['pnl']) if o['settled_premium'] else '&ndash;'} |")
         L.append("")
+    L += render_ours(sc.get("ours"))
     rq = sc["requesters"]
     L += ["## Requesters", "", f"{rq['count']:,} requesters bought the scored prints. The most active:", "",
           "| Requester | Prints | Premium | Over the close (makers' margin) | Settled | Paid / premium |", "|---|---|---|---|---|---|"]
@@ -712,17 +933,7 @@ def main(argv=None) -> int:
     ex = read_kind(os.path.join(a.rfq_dir, f"combo_{day}.jsonl"), "exec")
     prints = [e for e in ex if e.get("side") == "yes"]
     log(f"{day}: {len(prints):,} YES prints, {len(ex) - len(prints):,} NO")
-    tape = load_tape(a.maker_dir, day)
-    day0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
-    if tape is None:
-        log("no leg tape that day: backing the mids out of the maker's quotes")
-        tape = implied_tape(a.maker_dir, day)
-    elif (tape_start(tape) or day0) > day0 + 1800:
-        log(f"the leg tape starts {datetime.fromtimestamp(tape_start(tape), timezone.utc):%H:%MZ}: "
-            "the mids backed out of the maker's quotes before it")
-        imp = implied_tape(a.maker_dir, day)
-        if imp is not None:
-            tape = Layered(tape, imp)
+    tape = day_tape(a.maker_dir, day)
     if tape is None:
         log("no leg prices for the day (no tape, no quotes): nothing to score")
         return 2
@@ -731,10 +942,13 @@ def main(argv=None) -> int:
     if not a.no_results:
         rows, _ = price_prints(prints, tape, Results(), now)
         legs = {tk for r in rows for tk, _ in r["legs"]}
+        legs |= {str(l[0]) for t in our_tickets(a.maker_dir) for l in t["legs"]}    # our fills' legs too
         left = results.fetch(legs, kalshi_markets, now)
         log(f"results: {len(legs):,} legs, {sum(1 for t in legs if results.final(t)):,} final"
             + (f", {left:,} unread (Kalshi refused)" if left else ""))
     sc = score(prints, tape, results, now, cfg=live_config(a.maker_dir, day), no_prints=len(ex) - len(prints))
+    sc["ours"] = our_fills(a.maker_dir, a.rfq_dir, results, now, tapes={day: tape})
+    log(f"our fills: {sc['ours']['tickets']:,} tickets, {sc['ours']['rows']['all']['closed']:,} with a close")
     out = a.out or a.rfq_dir
     md = render_md(day, sc, left, results_read=not a.no_results)
     with open(os.path.join(out, f"scorecard_{day}.md"), "w", encoding="utf-8") as f:
