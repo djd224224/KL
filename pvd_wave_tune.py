@@ -156,6 +156,10 @@ def main() -> int:
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
+    ap.add_argument("--size-mult", type=float, default=1.0,
+                    help="every size is X times what the rules give (bank size, bank max, base size, a banked "
+                         "market's kept size; the cheap tiers multiply it); the bank-early test stays on the "
+                         "unscaled --bank-size. Applied once per entry (its size_mult key)")
     ap.add_argument("--flip-through", action="store_true",
                     help='set "flip_through" (the bot: the reducing side rests its size + the position)')
     ap.add_argument("--no-halts", action="store_true",
@@ -234,7 +238,7 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = 0
         for t, e in (cur.get("markets") or {}).items():
             if not in_scope(t):
                 continue
@@ -280,8 +284,42 @@ def main() -> int:
                         e["bid_max"], e["ask_min"] = b1, a1
                         e["anchored"] = f"{stamp}: touch {yb:g}x{ya:g} -> limits {b1}/{a1} (were {b0}/{a0})"
                         n_anch += 1
+            # SIZE MULTIPLIER (--size-mult, Jack 2026-11-07: "increase everything by 1.5x"):
+            # an entry's sizes are scaled once to the new multiple (its size_mult key says
+            # which it carries); the scanner writes a relit entry unscaled, so it is scaled
+            # again here. The bank step below works in the scaled sizes.
+            m_cur = float(e.get("size_mult") or 1.0)
+            if abs(m_cur - a.size_mult) > 1e-9:
+                f = a.size_mult / m_cur
+                for k in ("size", "bid_size", "ask_size"):
+                    if e.get(k):
+                        e[k] = max(1, int(round(int(e[k]) * f)))
+                if isinstance(e.get("pre_bank"), dict):
+                    for k in ("size", "bid_size", "ask_size"):
+                        if e["pre_bank"].get(k):
+                            e["pre_bank"][k] = max(1, int(round(int(e["pre_bank"][k]) * f)))
+                if abs(a.size_mult - 1.0) > 1e-9:
+                    e["size_mult"] = a.size_mult
+                else:
+                    e.pop("size_mult", None)
+                e["scaled"] = f"{stamp}: sizes x{f:g} (now x{a.size_mult:g}) -> {e.get('size')} a side {a.note}".strip()
+                e["scaled_at"] = stamp
+                n_scaled += 1
+            sm = a.size_mult
+            B = int(round(a.bank_size * sm)) if a.bank_size else 0
+            M = int(round(a.bank_max * sm)) if a.bank_max else 0
+            BASE = int(round(a.base_size * sm)) if a.base_size else 0
             for _once in (0,):         # the bank step; break (not continue) keeps the tier step below
                 if bank is not None:
+                    try:
+                        sa_age = (now - ts(e["scaled_at"])).total_seconds() if e.get("scaled_at") else 1e9
+                    except (TypeError, ValueError):
+                        sa_age = 1e9
+                    if sa_age < 1500:
+                        # re-scaled < 25 min ago: the dashboard's rate is still the bot's share at
+                        # the OLD size over the NEW listed size, so it reads every market short
+                        # (12:31:57Z 11/07: 153 markets 300 -> 450 two minutes after the x1.5)
+                        break
                     pk, pv = bank.get(t) or [None, 0.0]
                     banked = float(pv) if pk == (e.get("period_start") or "wave-1104") else 0.0   # the dashboard's key
                     done = banked >= a.bank_usd
@@ -301,34 +339,34 @@ def main() -> int:
                                          f"{pre.get('size')} a side {a.note}").strip()
                             n_down += 1
                         break
-                    want = a.base_size if done else a.bank_size
-                    if not done and old < a.bank_size and pre is None and not a.base_size:
+                    want = BASE if done else B
+                    if not done and old < B and pre is None and not a.base_size:
                         e["pre_bank"] = {"size": old, "bid_size": e.get("bid_size"), "ask_size": e.get("ask_size")}
                     why = ""
                     if not done and a.bank_max and rows:
                         x = rows.get(t)
                         rate = float((x or {}).get("rate") or 0)
                         if x and float(x.get("rest_ct") or 0) > 0 and rate > 0:
-                            sz = float(x.get("size") or old or a.bank_size)
+                            sz = float(x.get("size") or old or B)
                             r_bank = rate * a.bank_size / max(sz, 1.0)
                             hrs = max(0.0, float(x.get("hrs_left") or 0) - a.bank_by_hrs)
                             p_by = banked + r_bank * hrs / 24.0
                             # up when the bank size misses; back down only with 25% to spare
                             # (so a market doesn't flap between the two sizes poll to poll)
-                            if p_by < a.bank_usd or (old >= a.bank_max and p_by < 1.25 * a.bank_usd):
-                                want = a.bank_max
+                            if p_by < a.bank_usd or (old >= M and p_by < 1.25 * a.bank_usd):
+                                want = M
                                 why = (f"${p_by:.2f} by {a.bank_by_hrs:g}h before the stop at {a.bank_size} "
                                        f"(${r_bank:.2f}/day)")
-                        elif old > a.bank_size:
+                        elif old > B:
                             # nothing resting, or earning $0 (outside the scoring window: size
                             # won't help) -- an already-raised market keeps its size
                             want, why = old, "nothing earning now: kept"
-                    n_max += (want == a.bank_max and not done and bool(a.bank_max))
+                    n_max += (want == M and not done and bool(a.bank_max))
                     # a side the scanner sized above the bank size (a decided side at 300) keeps its own
                     # size, as does a cheap side (--cheap-mult re-sizes it below)
                     cs = set(e.get("cheap_sides") or [])
                     sides = {k: e[k] for k in ("bid_size", "ask_size")
-                             if k in e and (int(e[k]) > a.bank_size or k in cs)}
+                             if k in e and (int(e[k]) > B or k in cs)}
                     if old != want or any(k in e and k not in sides for k in ("bid_size", "ask_size")):
                         for k in ("bid_size", "ask_size"):
                             e.pop(k, None)
@@ -384,7 +422,7 @@ def main() -> int:
                f"{stamp} {len(series)} series since {a.since}: {n_seen} live entries, {n_room} widened {a.room}c")
         if bank is not None:
             msg += (f"; bank early: {n_banked} past ${a.bank_usd:.2f} this period, "
-                    f"{n_max} at {a.bank_max or a.bank_size}, {n_up} sized up, {n_down} sized down")
+                    f"{n_max} at {M or B}, {n_up} sized up, {n_down} sized down")
         if tiers or stiers:
             msg += (f"; cheap sides ({', '.join(f'<= {c:g}c x{m:g}' for c, m in tiers)}"
                     + "".join(f"; {ss} {sd.split('_')[0]} " + ", ".join(f"<= {c:g}c x{m:g}" for c, m in v)
@@ -400,8 +438,10 @@ def main() -> int:
         if a.reanchor is not None:
             msg += (f"; follow the book ({a.reanchor}c off the touch): {n_anch} re-anchored, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
+        if abs(a.size_mult - 1.0) > 1e-9 or n_scaled:
+            msg += f"; sizes x{a.size_mult:g}: {n_scaled} re-scaled"
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
