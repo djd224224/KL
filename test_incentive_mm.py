@@ -40433,6 +40433,24 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         bot2.run_cycle()
         self.assertEqual([o["book_side"] for o in bot2.state.sim_orders.values() if o["ticker"] == self.T], ["bid"])
 
+    def test_follow_book_ignores_a_stale_last_trade(self):
+        """Jack 2026-11-07 ("Yes, fix it"): an entry's "follow_book" keeps its
+        listed bid_max / ask_min with a last trade too -- KXDPRESPRIMWIN-28ANY-JOSS
+        traded 55c, the book moved to 49x54, and cushion 0 held its ask >= 55"""
+        Q = imm.Quote
+        stale = {"bid_max": 52, "ask_min": 51, "cushion": 0}
+        self.assertEqual(imm.pvd_limits(stale, 55.0), (55, 55))                   # pinned to the trade
+        self.assertEqual(imm.pvd_limits(dict(stale, follow_book=True), 55.0), (52, 51))
+        self.assertEqual(imm.pvd_limits(dict(stale, follow_book=True), None), (52, 51))
+        qs = [Q(self.T, "bid", 49, 300), Q(self.T, "ask", 54, 300)]
+        self.assertEqual([q.book_side for q in imm.pvd_guard_quotes(qs, stale, 55.0)], ["bid"])
+        self.assertEqual([q.book_side for q in imm.pvd_guard_quotes(qs, dict(stale, follow_book=True), 55.0)],
+                         ["bid", "ask"])
+        self._write({self.T: {"bid_max": 52, "ask_min": 51, "follow_book": True},
+                     self.T2: {"bid_max": 52, "ask_min": 51}})
+        self.assertTrue(imm.PVD_MARKETS[self.T]["follow_book"])
+        self.assertFalse(imm.PVD_MARKETS[self.T2]["follow_book"])
+
     def test_flip_through_reducing_side_rests_size_plus_position(self):
         """Jack 2026-11-07 (KXHOUSERACE-WA07-28-D long 200 at 97c): "if i bought
         200 on one side, i can sell 400 on the other side (or if i bought 300 on

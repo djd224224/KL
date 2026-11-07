@@ -9864,6 +9864,8 @@ def load_pvd_markets() -> int:
                     # "flip_through": the reducing side rests its size PLUS the
                     # position (pvd_side_sizes)
                     "flip": bool(raw.get("flip_through")),
+                    # "follow_book": the listed limits stand with a last trade too (pvd_limits)
+                    "follow_book": bool(raw.get("follow_book")),
                     # "no_halts": its series joins PVD_NO_HALT_SERIES
                     "no_halts": bool(raw.get("no_halts")),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
@@ -9950,7 +9952,16 @@ def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
     count: KXCAHOUSEDEM-26NOV03-E48's bid held at a 70c limit set at a 75c
     last trade while the market traded 87c). The listed bid_max / ask_min
     stand only for a market with no last trade. The limit gates a rung; the
-    price still comes from the book's reference."""
+    price still comes from the book's reference.
+
+    FOLLOW THE BOOK (entry "follow_book", Jack 2026-11-07: "Yes, fix it", on
+    traded markets going one-sided): the listed bid_max / ask_min stand even
+    with a last trade -- pvd_wave_tune.py re-anchors them to the touch +-3c
+    every 15 min. A stale trade pinned a side out of the book:
+    KXDPRESPRIMWIN-28ANY-JOSS traded 55c, then the book read 49x54, and an ask
+    held at >= 55 never rested (16 markets like it at 04:23Z)."""
+    if entry.get("follow_book"):
+        return int(entry["bid_max"]), int(entry["ask_min"])
     c = entry.get("cushion")
     if c is None:
         c = PVD_CUSHION_LIVE if entry.get("kind") == "live" else PVD_CUSHION_DEAD
