@@ -40482,11 +40482,41 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         # stands aside on the skew, as it does without the flag)
         self.assertEqual(orders(flip, -120.0), [("bid", 320.0)])
         self.assertEqual(orders({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}}, -120.0), [("bid", 200.0)])
+
         # flat: both sides at the size, as without the flag
         self.assertEqual(orders(flip, 0.0), [("ask", 200.0), ("bid", 200.0)])
         # without the flag: the old cap, the ask at its size
         self.assertEqual(orders({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}}, 200.0), [("ask", 200.0)])
         self.assertFalse(imm.PVD_MARKETS[self.T]["flip"])
+
+    def test_flip_to_flat_reducing_side_rests_the_position(self):
+        """Jack 2026-11-07 (KXJEFFRIESFIRST-27FEB01-AL1 long 450, pinned 200 a
+        side): "try to fully offset the exposure, so quote 450" -- with
+        "flip_to_flat" the reducing side rests max(its size, the position), not
+        size + position; the far side still stands aside at its limit"""
+        e = {"size": 200, "bsize": 200, "asize": 200, "flip": True, "to_flat": True}
+        self.assertEqual(imm.pvd_side_sizes(e, 450.0), (200, 450))
+        self.assertEqual(imm.pvd_side_sizes(e, 100.0), (200, 200))
+        self.assertEqual(imm.pvd_side_sizes(e, -300.0), (300, 200))
+        self.assertEqual(imm.pvd_side_sizes(e, 0.0), (200, 200))
+        self.assertEqual(imm.pvd_side_sizes(dict(e, to_flat=False), 450.0), (200, 650))
+
+        def orders(markets, pos):
+            _clean_persist()
+            self._write(markets)
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if pos:
+                bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, 50.0
+                bot.client.positions[self.T] = pos
+            bot.run_cycle()
+            return sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T)
+        flat = {self.T: {"bid_max": 49, "ask_min": 51, "size": 200, "flip_through": True, "flip_to_flat": True}}
+        # long 450 past its 200 limit: no bid, and the ask sells exactly the 450
+        self.assertEqual(orders(flat, 450.0), [("ask", 450.0)])
+        self.assertTrue(imm.PVD_MARKETS[self.T]["to_flat"])
+        # flat: the plain 200 a side
+        self.assertEqual(orders(flat, 0.0), [("ask", 200.0), ("bid", 200.0)])
 
     def test_decided_side_no_cushion_2_to_99(self):
         """Jack 2026-11-04: "for decided side, can go up to 99c and no cushion"

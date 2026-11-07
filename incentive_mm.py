@@ -9864,6 +9864,9 @@ def load_pvd_markets() -> int:
                     # "flip_through": the reducing side rests its size PLUS the
                     # position (pvd_side_sizes)
                     "flip": bool(raw.get("flip_through")),
+                    # "flip_to_flat": ...or max(its size, the position) -- no fill goes
+                    # past flat (pvd_side_sizes)
+                    "to_flat": bool(raw.get("flip_to_flat")),
                     # "follow_book": the listed limits stand with a last trade too (pvd_limits)
                     "follow_book": bool(raw.get("follow_book")),
                     # "no_halts": its series joins PVD_NO_HALT_SERIES
@@ -9933,11 +9936,22 @@ def pvd_side_sizes(entry: dict, pos: float) -> Tuple[int, int]:
     bought 300 on one side, i can go to 600 on the other side)"). One fill
     can then flatten the position and keep the usual rung on the far side;
     the position limit per side (its size) still binds, so long 200 at 200
-    a side ends no shorter than 200."""
+    a side ends no shorter than 200.
+
+    FLIP TO FLAT (entry "flip_to_flat" -> entry["to_flat"], Jack 2026-11-07 on
+    KXJEFFRIESFIRST-27FEB01-AL1 long 450 at 200 a side: "try to fully offset the
+    exposure, so quote 450"): the reducing side rests max(its size, the
+    position) instead -- 450 while long 450, so one fill takes it flat and no
+    further; its size again once the position is under it."""
     b = int(entry.get("bsize", entry["size"]))
     a = int(entry.get("asize", entry["size"]))
     if entry.get("flip") and abs(pos) >= 1:
-        if pos > 0:
+        if entry.get("to_flat"):
+            if pos > 0:
+                a = max(a, int(pos))
+            else:
+                b = max(b, int(-pos))
+        elif pos > 0:
             a += int(pos)
         else:
             b += int(-pos)
