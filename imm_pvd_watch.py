@@ -55,6 +55,9 @@ WAVE_EXCLUDE = {s.strip() for s in (os.environ.get("PVD_WATCH_EXCLUDE") or "").s
 # the pacing table's target: PACE_BAR banked with PACE_SPARE_H hours to spare
 # (the bank-early rule in pvd_wave_tune.py: $1.30, 6h before the stop)
 PACE_BAR = float(os.environ.get("PVD_WATCH_PACE_BAR") or 1.30)
+# the fills / cash-by-price table's bands: cost per contract (c), upper bound inclusive
+PRICE_BANDS = [(2, "2c or under"), (5, "2-5c"), (15, "5-15c"), (30, "15-30c"),
+               (50, "30-50c"), (70, "50-70c"), (90, "70-90c"), (100, "over 90c")]
 PACE_SPARE_H = float(os.environ.get("PVD_WATCH_PACE_SPARE_H") or 6.0)
 # importing incentive_mm reads and writes its STATUS_DIR; keep this
 # read-only watcher off the live bot's files
@@ -176,7 +179,7 @@ def fifo(fills: list, mark) -> dict:
     net = sum(l[0] for l in lots)
     opn = sum(l[0] * ((mark if mark is not None else l[1]) - l[1]) for l in lots) / 100.0
     cost = sum(abs(l[0]) * (l[1] if l[0] > 0 else 100 - l[1]) for l in lots) / 100.0
-    return {"real": real, "open": opn, "net": net, "cost": cost}
+    return {"real": real, "open": opn, "net": net, "cost": cost, "lots": [(l[0], l[1]) for l in lots]}
 
 
 def read_markets(tickers: list) -> dict:
@@ -268,8 +271,12 @@ def bot_est_fracs(tickers: set, now: datetime) -> dict:
             if ts_ is None or (now - ts_).total_seconds() > BOT_EST_MAX_AGE_S:
                 continue
             try:
+                def _g(k):
+                    return float(row[col[k]] or 0) if k in col else 0.0
                 out[row[col["ticker"]]] = (float(row[col["est_frac"]] or 0), int(float(row[col["qual_sides"]] or 0)),
-                                           float(row[col["pool_per_day"]] or 0))
+                                           float(row[col["pool_per_day"]] or 0),
+                                           {"ob": _g("own_bid_ct"), "oa": _g("own_ask_ct"),
+                                            "yd": _g("yes_depth"), "nd": _g("no_depth")})
             except ValueError:
                 continue
     return out
@@ -329,7 +336,7 @@ def poll(client, hist: dict) -> dict:
         last = _f(m.get("last_price_dollars")) * 100 or None
         frac, sides, est_src = 0.0, 0, ""
         if t in bot_est:
-            frac, sides, _pool = bot_est[t]
+            frac, sides, _pool, _sd = bot_est[t]
             est_src = "bot"
         else:
             ob = books.get(t)
@@ -385,6 +392,24 @@ def poll(client, hist: dict) -> dict:
         recent.append({"ts": datetime.fromtimestamp(_f(f.get("ts")), timezone.utc).strftime("%H:%M:%S"),
                        "ticker": f["ticker"], "side": "BUY YES" if d > 0 else "SELL YES",
                        "n": round(n, 1), "px": round(_f(f.get("yes_price_cents")))})
+    # FILLS AND CASH BY PRICE (Jack 2026-11-07: "add to dash, fills (and cash held)
+    # segmented by price"): by what a fill ties up a contract -- a bid its price, an
+    # ask 100 - its price -- the cheap-side tiers' bands, then 30-50 / 50-70 / 70-90 / 90+
+    bands = [{"band": lbl, "hi": hi, "fills": 0, "ct": 0.0, "used": 0.0, "open_ct": 0.0, "held": 0.0,
+              "open_pl": 0.0, "q_ct": 0.0, "q_usd": 0.0, "rew": 0.0, "rate": 0.0} for hi, lbl in PRICE_BANDS]
+
+    def band_of(cost_c: float) -> dict:
+        for b in bands:
+            if cost_c <= b["hi"]:
+                return b
+        return bands[-1]
+    for f in fills:
+        n = _f(f.get("count")); px = _f(f.get("yes_price_cents"))
+        cost_c = px if f.get("our_book_side") == "bid" else 100 - px
+        b = band_of(cost_c)
+        b["fills"] += 1
+        b["ct"] += n
+        b["used"] += n * cost_c / 100.0
     # fills over time: contracts per 5-min bucket since go-live, YES bought
     # (our bids filled) and YES sold (our asks filled)
     b0 = GO_LIVE.timestamp(); step = 300.0
@@ -410,6 +435,38 @@ def poll(client, hist: dict) -> dict:
         tot["real"] += fx["real"]
         tot["open"] += fx["open"]
         tot["cost"] += fx["cost"]
+        for q, px in fx["lots"]:
+            cost_c = px if q > 0 else 100 - px
+            b = band_of(cost_c)
+            b["open_ct"] += abs(q)
+            b["held"] += abs(q) * cost_c / 100.0
+            b["open_pl"] += q * ((mark if mark is not None else px) - px) / 100.0
+    # ...and what each band QUOTES (resting contracts and what they'd tie up) and
+    # EARNS: a market's rewards split between its two sides by each side's share
+    # of its own book (our contracts / ours + the rest of that side, from the bot's
+    # cycle log; an even split without it) -- an estimate, as Kalshi pays per market
+    for t in quoted:
+        r = rows.get(t)
+        if r is None:
+            continue
+        sd = {"bid": [(px, q) for s_, px, q in own[t] if s_ == "bid"],
+              "ask": [(px, q) for s_, px, q in own[t] if s_ != "bid"]}
+        q_b, q_a = sum(q for _p, q in sd["bid"]), sum(q for _p, q in sd["ask"])
+        cyc = (bot_est.get(t) or (None, None, None, {}))[3] or {}
+        sh_b = q_b / (q_b + cyc.get("yd", 0.0)) if q_b and (q_b + cyc.get("yd", 0.0)) > 0 else 0.0
+        sh_a = q_a / (q_a + cyc.get("nd", 0.0)) if q_a and (q_a + cyc.get("nd", 0.0)) > 0 else 0.0
+        if sh_b + sh_a <= 0:
+            sh_b, sh_a = (1.0 if q_b else 0.0), (1.0 if q_a else 0.0)
+        tot_sh = (sh_b + sh_a) or 1.0
+        for side, lv, w in (("bid", sd["bid"], sh_b / tot_sh), ("ask", sd["ask"], sh_a / tot_sh)):
+            if not lv:
+                continue
+            best = max(p for p, _q in lv) if side == "bid" else min(p for p, _q in lv)
+            b = band_of(best if side == "bid" else 100 - best)
+            b["q_ct"] += sum(q for _p, q in lv)
+            b["q_usd"] += sum(q * (p if side == "bid" else 100 - p) for p, q in lv) / 100.0
+            b["rew"] += r.get("est", 0.0) * w
+            b["rate"] += r.get("rate", 0.0) * w
     tot["trade"] = tot["real"] + tot["open"]
     tot["est"] = sum(cum.get(t, 0.0) for t in tickers)
     tot["net"] = tot["trade"] + tot["est"]
@@ -513,6 +570,7 @@ def poll(client, hist: dict) -> dict:
             "src_bot": sum(1 for r in quoted_rows if r.get("est_src") == "bot"),
             "bar": PACE_BAR, "spare_h": PACE_SPARE_H, "buckets": pace_b}
     return {"now": now.isoformat(), "go_live": GO_LIVE.isoformat(), "stale": dict(_stale), "pace": pace,
+            "by_price": [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in b.items()} for b in bands],
             "end": end.isoformat() if end else None, "hrs_left": round(hrs_left, 2),
             "totals": {k: (round(v, 2) if isinstance(v, float) else v) for k, v in tot.items()},
             "rows": sorted(rows.values(), key=lambda r: r["trade"]),
@@ -568,6 +626,8 @@ tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 <div class="tiles" id="tiles"></div>
 <h2>Pacing this period <span class="mut" id="pacesub" style="font-weight:400;font-size:12px"></span></h2>
 <div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Pacing to</th><th>Markets</th><th>Share</th><th>Est $/day now</th><th>Proj. this period</th><th>Earning $0 now</th></tr></thead><tbody id="pace"></tbody></table></div>
+<h2>Quotes, rewards, fills and cash by price <span class="mut" style="font-weight:400;font-size:12px">(by what a fill ties up a contract: a bid its price, an ask 100 - its price; quotes now, the rest since go-live; a market's rewards split between its sides by each side's share of its book, an estimate)</span></h2>
+<div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Cost per contract</th><th>Quoted contracts</th><th>Quoted $</th><th>Rewards so far</th><th>Rewards / contract</th><th>Est $/day now</th><th>Fills</th><th>Contracts filled</th><th>Cash used</th><th>Open contracts</th><th>Cash held now</th><th>Open P&amp;L (at last)</th></tr></thead><tbody id="byprice"></tbody></table></div>
 <div class="wrap" style="padding:8px 12px"><div class="mut key">Cumulative since go-live, a point every 5 min:
 <b style="color:var(--est)">&#9644; est rewards</b> &nbsp;<b style="color:var(--trade)">&#9644; trading P&amp;L</b> &nbsp;<b>&#9644; net</b></div>
 <svg id="chart" viewBox="0 0 800 220" style="width:100%;height:220px;display:block"></svg></div>
@@ -612,6 +672,19 @@ function render(){
   $('sub').textContent='updated '+new Date(d.now).toLocaleTimeString('en-US',{timeZone:'America/New_York'})+' ET'+
     (nxt!=null?' | next read in '+Math.ceil(nxt/60)+' min':'')+' | live since '+new Date(d.go_live).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'2-digit'})+' ET | '+
     (d.end?'next stop '+etS(d.end)+' ET (in '+d.hrs_left.toFixed(1)+'h): '+(d.stop_mix||[]).map(([s,n])=>n+' to '+etS(s)).join(', '):'no listed market is active');
+  const bp=d.by_price||[];
+  if(bp.length){
+    const S=k=>bp.reduce((a,b)=>a+(b[k]||0),0);
+    const rpc=(r,c)=>c?'$'+(r/c).toFixed(4):'';
+    $('byprice').innerHTML=bp.map(b=>`<tr><td>${b.band}</td><td>${b.q_ct?Math.round(b.q_ct).toLocaleString():''}</td><td>${b.q_usd?money(b.q_usd):''}</td>`+
+      `<td style="color:var(--est)">${b.rew?money(b.rew):''}</td><td>${rpc(b.rew,b.q_ct)}</td><td>${b.rate?money(b.rate):''}</td>`+
+      `<td>${b.fills||''}</td><td>${b.ct?Math.round(b.ct).toLocaleString():''}</td>`+
+      `<td>${b.used?money(b.used):''}</td><td>${b.open_ct?Math.round(b.open_ct).toLocaleString():''}</td><td><b>${b.held?money(b.held):''}</b></td>`+
+      `<td class="${cls(b.open_pl)}">${b.open_ct?money(b.open_pl):''}</td></tr>`).join('')+
+      `<tr><td class="mut">total</td><td>${Math.round(S('q_ct')).toLocaleString()}</td><td>${money(S('q_usd'))}</td><td style="color:var(--est)">${money(S('rew'))}</td>`+
+      `<td>${rpc(S('rew'),S('q_ct'))}</td><td>${money(S('rate'))}</td><td>${S('fills')}</td><td>${Math.round(S('ct')).toLocaleString()}</td><td>${money(S('used'))}</td>`+
+      `<td>${Math.round(S('open_ct')).toLocaleString()}</td><td><b>${money(S('held'))}</b></td><td class="${cls(S('open_pl'))}">${money(S('open_pl'))}</td></tr>`;
+  }
   const pc=d.pace;
   if(pc){
     $('pacesub').textContent=`(${pc.quoted} quoted of ${pc.active} active; banked this period + the rate now x the hours to the stop; Kalshi pays a period only from $1; share from the bot's own cycle log for ${pc.src_bot??0} of ${pc.quoted})`;
