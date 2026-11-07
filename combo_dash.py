@@ -58,6 +58,14 @@ STOP_CHECK_S = 2.0
 EXIT_STOP, EXIT_PORT = 3, 4
 PORT = 8772
 REFRESH_S = 15
+# THE PAGE, BUILT ONCE (Jack 2026-11-06 ~7:55 PM ET: "http://127.0.0.1:8772/ not
+# working"): each request had built its own snapshot on the threaded server; with the
+# box paging (0.4 GB of 15.7 GB free, the dash squeezed to a 10 MB working set) one build
+# took ~60 s, the page's 15-s refreshes stacked builds on each other, and it never loaded.
+# Now one thread builds the snapshot and renders it every PAGE_EVERY_S; a request sends
+# the latest bytes at once (the page says "as of"), the first waits for the first build.
+PAGE_EVERY_S = 10.0
+FIRST_BUILD_WAIT_S = 120.0
 KALSHI_TTL_S = 60.0
 COMBO_SHARD = 1            # the combo shard (exchange_index): its cash and its fills
 RUNNING_S = 120.0          # a maker with no line this recent is shown as stopped
@@ -1831,25 +1839,79 @@ def render(s: dict) -> str:
     return "".join(H)
 
 
-def make_handler(maker_dir, shadow_dir, kalshi, history=None, logs=None, outcomes=None):
+class PageCache:
+    """The page, built on ONE background thread: build(now) -> snapshot, rendered to the
+    page and the JSON once a build, every `every` s from the end of the last. get()
+    returns the latest (html bytes, json bytes, error) at once -- after a failed build the
+    last good page stays, with the error -- and the first call waits up to `wait` s for
+    the first build. Started by the first get()."""
+
+    def __init__(self, build, every: float = PAGE_EVERY_S, wait: float = FIRST_BUILD_WAIT_S,
+                 render_fn=None, clock=time.time):
+        self.build, self.every, self.wait, self.clock = build, every, wait, clock
+        self.render = render_fn or render
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.html = self.json = None
+        self.error, self.builds, self.thread = None, 0, None
+
+    def _once(self) -> None:
+        try:
+            s = self.build(self.clock())
+            html_b = self.render(s).encode("utf-8")
+            json_b = json.dumps(s, default=str).encode()
+            with self.lock:
+                self.html, self.json, self.error = html_b, json_b, None
+        except Exception as e:                                  # noqa: BLE001 -- keep the last good page
+            with self.lock:
+                self.error = f"{type(e).__name__}: {e}"
+        with self.lock:
+            self.builds += 1
+        self.ready.set()
+
+    def _loop(self) -> None:
+        while True:
+            t0 = self.clock()
+            self._once()
+            time.sleep(max(0.5, self.every - (self.clock() - t0)))
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread is not None:
+                return
+            self.thread = threading.Thread(target=self._loop, daemon=True, name="dash-page")
+        self.thread.start()
+
+    def get(self):
+        self.start()
+        self.ready.wait(self.wait)
+        with self.lock:
+            return self.html, self.json, self.error
+
+
+def make_handler(maker_dir, shadow_dir, kalshi, history=None, logs=None, outcomes=None, page_every=PAGE_EVERY_S):
     logs = logs if logs is not None else MakerLog(maker_dir)       # kept across requests
+    page = PageCache(lambda now: snapshot(maker_dir, shadow_dir, now, kalshi, history, logs, outcomes),
+                     every=page_every)
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            try:
-                s = snapshot(maker_dir, shadow_dir, time.time(), kalshi, history, logs, outcomes)
-                if self.path.startswith("/data.json"):
-                    body, ctype = json.dumps(s, default=str).encode(), "application/json"
-                else:
-                    body, ctype = render(s).encode("utf-8"), "text/html; charset=utf-8"
+            html_b, json_b, err = page.get()
+            body = json_b if self.path.startswith("/data.json") else html_b
+            if body is not None:
+                ctype = "application/json" if self.path.startswith("/data.json") else "text/html; charset=utf-8"
                 self.send_response(200)
-            except Exception as e:
-                body, ctype = f"dashboard error: {type(e).__name__}: {e}".encode(), "text/plain"
+            else:
+                body = f"dashboard error: {err or 'the first build is still running: reload in a minute'}".encode()
+                ctype = "text/plain"
                 self.send_response(500)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass                                    # the browser left (a reload): nothing to tell it
 
         def log_message(self, *a):
             pass

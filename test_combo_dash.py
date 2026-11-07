@@ -516,6 +516,58 @@ class Background(unittest.TestCase):
         self.assertEqual(h.data["at"], T0 + 1600)
 
 
+class PageCacheTests(unittest.TestCase):
+    """The page built on one thread, requests served from the latest build (Jack
+    2026-11-06: "http://127.0.0.1:8772/ not working": per-request builds took ~60 s
+    with the box paging, and the 15-s refreshes piled up)."""
+
+    def test_one_build_serves_many_requests_and_a_failure_keeps_the_last_page(self):
+        calls, fail = [], [False]
+
+        def build(now):
+            calls.append(now)
+            if fail[0]:
+                raise RuntimeError("log read")
+            time.sleep(0.05)
+            return {"n": len(calls)}
+        pc = cd.PageCache(build, every=0.2, render_fn=lambda s: f"page {s['n']}")
+        outs = []
+        ths = [threading.Thread(target=lambda: outs.append(pc.get())) for _ in range(8)]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join(5)
+        self.assertEqual(len(outs), 8)
+        self.assertTrue(all(o[0] == b"page 1" and o[2] is None for o in outs))   # 8 requests, 1 build
+        self.assertEqual(json.loads(outs[0][1]), {"n": 1})
+        time.sleep(0.5)
+        self.assertGreaterEqual(len(calls), 2)                                    # rebuilt on its own
+        fail[0] = True
+        n = len(calls)
+        deadline = time.time() + 3
+        while len(calls) == n and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.05)
+        html_b, json_b, err = pc.get()
+        self.assertTrue(html_b.startswith(b"page "))                              # the last good page
+        self.assertIn("log read", err)
+
+    def test_the_server_answers_at_once_while_a_build_runs(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write_files(d.name)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), cd.make_handler(d.name, d.name, None, page_every=60.0))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10).read()   # the first build
+        t0 = time.time()
+        for _ in range(5):
+            self.assertIn(b"Combo maker", urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read())
+        self.assertLess(time.time() - t0, 2.0)                                    # served, not rebuilt
+
+
 class Task(unittest.TestCase):
     """The "KL combo-dash" task keeps the page up (Jack 2026-11-06: "Yes, add the task")."""
 
