@@ -28,7 +28,10 @@ set PY=C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe
 set KL=C:\Users\jackd\Documents\KL
 set LOG=%KL%\run-logs\pvd-scan\waves-task.log
 set PVD_SCAN_BUDGET=300000
-set W28=KXHOUSERACE,KXDPRESPRIMARY,KXRPRESPRIMARY,KXPRESSTATE,KXPRESDISTRICT,KXPOPVOTE,KXGOVRACE,KXCHINA1
+rem W28 = the 2028 election wave (11/06 23:01Z) + the 2028 election-structure launches of 11/07
+rem 02:01Z (Jack: "several new elections events just launched at 9:01 ... bring the relevant ones in")
+set W28=KXHOUSERACE,KXDPRESPRIMARY,KXRPRESPRIMARY,KXPRESSTATE,KXPRESDISTRICT,KXPOPVOTE,KXGOVRACE,KXCHINA1,KXDPRESPRIMWIN,KXGOPDELMAJ,KXRPRESPRIMWIN,KXDEMDELMAJ,KXRPRESWINCOUNT,KXPAMINWAGE,KXDPRESWINCOUNT,KXRPRESSWEEP,KXTRUMPFIRSTENDORSE,KXGOPFIRSTWINNOM,KXJEFFRIESFIRST,KXDEMFIRSTWINNOM,KXWIMEDICAIDEXP,KXDPRESSWEEP,KXTHIRDPARTYSTATEWIN,KXRPRESFRACTURED,KXDPRESFRACTURED
+set POL=KXDCSTATEHOODHOUSE,KXGOPIMPEACHVOTES,KXGOVTSHUTLENGTH,KXHAGCHAIR,KXHEDUCATIONCHAIR,KXHJUDICIARYRM,KXHOUSEEXPANDLAW,KXITALYEXITTAX,KXJUDGECOUNTYEAR,KXNPVICSTATES,KXNRCCCHAIR,KXOVERSIGHTRM,KXPRSTATEHOUSE,KXROEHOUSE,KXSBANKINGCHAIR,KXSCOTUSEXPANDHOUSE,KXSCOTUSEXPANDLAW,KXSCOTUSTERMHOUSE,KXSHELPRM,KXSJUDICIARYRM,KXTARIFFREPEAL,KXTRUMPGOPCONVICT
 cd /d %KL%
 echo ===== %date% %time% pass 0: dashboard keepalive (8773 2028 wave, 8771 political wave) >> "%LOG%"
 rem NOT ">> %LOG%": a dashboard started here would inherit cmd's handle on the log and hold
@@ -36,7 +39,7 @@ rem it open for life, and every later ">> %LOG%" redirect (so every pass) would 
 rem The keepalive appends its own lines to the log instead.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%KL%\pvd_watch_keepalive.ps1" > nul 2>&1
 echo ===== %date% %time% pass 1: political wave 11/06 >> "%LOG%"
-"%PY%" "%KL%\pvd_scan.py" --series KXDCSTATEHOODHOUSE,KXGOPIMPEACHVOTES,KXGOVTSHUTLENGTH,KXHAGCHAIR,KXHEDUCATIONCHAIR,KXHJUDICIARYRM,KXHOUSEEXPANDLAW,KXITALYEXITTAX,KXJUDGECOUNTYEAR,KXNPVICSTATES,KXNRCCCHAIR,KXOVERSIGHTRM,KXPRSTATEHOUSE,KXROEHOUSE,KXSBANKINGCHAIR,KXSCOTUSEXPANDHOUSE,KXSCOTUSEXPANDLAW,KXSCOTUSTERMHOUSE,KXSHELPRM,KXSJUDICIARYRM,KXTARIFFREPEAL,KXTRUMPGOPCONVICT --no-vote-check --new-since 2026-11-05T18:00:00Z --write >> "%LOG%" 2>&1
+"%PY%" "%KL%\pvd_scan.py" --series %POL% --no-vote-check --new-since 2026-11-05T18:00:00Z --write >> "%LOG%" 2>&1
 echo ===== %date% %time% pass 2: 2028 elections at 80 >> "%LOG%"
 "%PY%" "%KL%\pvd_scan.py" --series %W28% --no-vote-check --new-since 2026-11-06T22:30:00Z --write >> "%LOG%" 2>&1
 echo ===== %date% %time% pass 3: 2028 elections at 200 >> "%LOG%"
@@ -46,4 +49,11 @@ set PVD_SCAN_DEAD_SIZE=200
 set PVD_SCAN_LIVE_SIZE=
 set PVD_SCAN_DEAD_SIZE=
 echo ===== %date% %time% pass 4: 2028 band, follow the book, bank early >> "%LOG%"
-"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 1 --price-max 99 --flip-through --cushion 0 --reanchor 3 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
+"%PY%" "%KL%\pvd_wave_tune.py" --series %W28% --since 2026-11-06T22:30:00Z --room 3 --price-min 1 --price-max 99 --flip-through --no-halts --cushion 0 --reanchor 3 --bank-size 200 --bank-max 300 --bank-by-hrs 6 --base-size 80 --bank-usd 1.30 --bank-url http://127.0.0.1:8773/data --bank-hist "%KL%\run-logs\pvd-watch-elec2028\history.json" --note "(relight task)" --write >> "%LOG%" 2>&1
+rem 5 + 6. THE 200 FLOOR on the other waves (Jack 2026-11-07: "dont go lower than 200 on any market
+rem right now until hitting $1.30 threshold"): 200 a side until the wave's dashboard shows $1.30
+rem banked this period, then back to the entry's own size (pre_bank). Nothing else changes there.
+echo ===== %date% %time% pass 5: political wave 200 floor >> "%LOG%"
+"%PY%" "%KL%\pvd_wave_tune.py" --series %POL% --since 2026-11-05T18:00:00Z --bank-size 200 --bank-usd 1.30 --bank-url http://127.0.0.1:8771/data --note "(relight task)" --write >> "%LOG%" 2>&1
+echo ===== %date% %time% pass 6: 11/04 election wave 200 floor >> "%LOG%"
+"%PY%" "%KL%\pvd_wave_tune.py" --series ALL --exclude-series %W28%,%POL% --since 2000-01-01T00:00:00Z --bank-size 200 --bank-usd 1.30 --bank-url http://127.0.0.1:8774/data --note "(relight task)" --write >> "%LOG%" 2>&1

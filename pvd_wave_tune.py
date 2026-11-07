@@ -15,7 +15,12 @@ after --since, series in --series), idempotently:
                      A relit entry starts a new period, so it goes back up. A side
                      the scanner sized above --bank-size (a decided side) is kept.
                      If history.json is older than --bank-stale-min, sizes are left
-                     as they are.
+                     as they are. WITHOUT --base-size, a raised entry keeps its own
+                     size in "pre_bank" and goes back to it once banked (Jack
+                     2026-11-07: "dont go lower than 200 on any market right now
+                     until hitting $1.30 threshold" -- the other waves' own sizes).
+  --series ALL --exclude-series A,B
+                     every listed series except those (another wave's own pass).
   --bank-url/--bank-max/--bank-by-hrs
                      ...and where --bank-size won't get there in time, --bank-max: read
                      the dashboard's /data rows (banked this period, live $/day at the
@@ -27,6 +32,9 @@ after --since, series in --series), idempotently:
   --flip-through     set "flip_through": the bot rests the side that reduces a
                      position at its size PLUS the position (Jack 2026-11-07: "if i
                      bought 200 on one side, i can sell 400 on the other side")
+  --no-halts         set "no_halts": the bot exempts the entry's series from the sweep
+                     breaker, tape trigger, group breaker and toxic halts (Jack
+                     2026-11-07: "remove any sweep breakers / halts on these markets")
   --cushion N        the entry's last-trade cushion (the bot: live 5c, dead 2c). With
                      a last trade the guard holds a bid N c under it and an ask N c over
                      it, ignoring bid_max / ask_min; at 0 a side may rest at the trade.
@@ -117,7 +125,8 @@ def read_touches(tickers):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--series", required=True, help="comma-separated EXACT series names")
+    ap.add_argument("--series", required=True, help="comma-separated EXACT series names, or ALL")
+    ap.add_argument("--exclude-series", default="", help="comma-separated series left out (with ALL: other waves)")
     ap.add_argument("--since", required=True, help="ISO: only entries whose period_start is at or after this")
     ap.add_argument("--room", type=int, default=0)
     ap.add_argument("--price-min", type=int)
@@ -132,6 +141,8 @@ def main() -> int:
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
     ap.add_argument("--flip-through", action="store_true",
                     help='set "flip_through" (the bot: the reducing side rests its size + the position)')
+    ap.add_argument("--no-halts", action="store_true",
+                    help='set "no_halts" (the bot: no sweep breaker, tape trigger, group or toxic halt on the series)')
     ap.add_argument("--cushion", type=int)
     ap.add_argument("--reanchor", type=int)
     ap.add_argument("--note", default="")
@@ -139,6 +150,12 @@ def main() -> int:
     ap.add_argument("--write", action="store_true")
     a = ap.parse_args()
     series = {s.strip() for s in a.series.split(",") if s.strip()}
+    exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
+    all_series = series == {"ALL"}
+
+    def in_scope(t: str) -> bool:
+        s = t.split("-")[0]
+        return (all_series or s in series) and s not in exclude
     since = ts(a.since)
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -148,7 +165,7 @@ def main() -> int:
     touch, missed = {}, 0
     if a.reanchor is not None:
         pre = json.load(open(LIST, encoding="utf-8")).get("markets") or {}
-        touch, missed = read_touches([t for t in pre if t.split("-")[0] in series])
+        touch, missed = read_touches([t for t in pre if in_scope(t)])
     if a.write:
         t0 = time.time()
         while os.path.exists(LOCK) and time.time() - os.path.getmtime(LOCK) < 1500:
@@ -160,7 +177,7 @@ def main() -> int:
     bank = None                     # {ticker: [period_start, banked $]} or None = sizes untouched
     rows = {}                       # /data rows by ticker (rate, size, hrs_left, rest_ct)
     bank_msg = ""
-    if a.bank_size and a.base_size and a.bank_url:
+    if a.bank_size and a.bank_url:
         try:
             req = urllib.request.Request(a.bank_url, headers={"User-Agent": "pvd_wave_tune"})
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -173,7 +190,7 @@ def main() -> int:
                 bank = {t: [x.get("period"), float(x.get("period_est") or 0)] for t, x in rows.items()}
         except Exception as ex:  # noqa: BLE001
             bank_msg = f"; bank sizing SKIPPED: {a.bank_url}: {ex}"
-    elif a.bank_size and a.base_size and a.bank_hist:
+    elif a.bank_size and a.bank_hist:
         try:
             age_min = (time.time() - os.path.getmtime(a.bank_hist)) / 60.0
             if age_min > a.bank_stale_min:
@@ -184,12 +201,12 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = 0
         for t, e in (cur.get("markets") or {}).items():
-            if t.split("-")[0] not in series:
+            if not in_scope(t):
                 continue
             try:
-                if ts(e["stop"]) <= now or ts(e.get("period_start") or "1970-01-01T00:00:00Z") < since:
+                if ts(e["stop"]) <= now or (e.get("period_start") and ts(e["period_start"]) < since):
                     continue
             except (KeyError, ValueError):
                 continue
@@ -208,6 +225,9 @@ def main() -> int:
             if a.flip_through and not e.get("flip_through"):
                 e["flip_through"] = True
                 n_flip += 1
+            if a.no_halts and not e.get("no_halts"):
+                e["no_halts"] = True
+                n_nohalt += 1
             if a.cushion is not None and e.get("cushion") != a.cushion:
                 e["cushion_set"] = f"{stamp}: cushion {e.get('cushion')} -> {a.cushion} {a.note}".strip()
                 e["cushion"] = a.cushion
@@ -226,11 +246,25 @@ def main() -> int:
                         n_anch += 1
             if bank is not None:
                 pk, pv = bank.get(t) or [None, 0.0]
-                banked = float(pv) if pk == e.get("period_start") else 0.0
+                banked = float(pv) if pk == (e.get("period_start") or "wave-1104") else 0.0   # the dashboard's key
                 done = banked >= a.bank_usd
                 n_banked += done
                 old = int(e.get("size") or 0)
+                pre = e.get("pre_bank") if isinstance(e.get("pre_bank"), dict) else None
+                if done and not a.base_size:
+                    # no --base-size: back to the entry's OWN size from before the raise
+                    if pre is not None:
+                        e.pop("pre_bank", None)
+                        for k in ("bid_size", "ask_size"):
+                            e.pop(k, None)
+                        e.update({k: v for k, v in pre.items() if v is not None})
+                        e["bank"] = (f"{stamp}: banked ${banked:.2f} this period -> back to its own "
+                                     f"{pre.get('size')} a side {a.note}").strip()
+                        n_down += 1
+                    continue
                 want = a.base_size if done else a.bank_size
+                if not done and old < a.bank_size and pre is None and not a.base_size:
+                    e["pre_bank"] = {"size": old, "bid_size": e.get("bid_size"), "ask_size": e.get("ask_size")}
                 why = ""
                 if not done and a.bank_max and rows:
                     x = rows.get(t)
@@ -274,13 +308,15 @@ def main() -> int:
                     f"{n_max} at {a.bank_max or a.bank_size}, {n_up} sized up, {n_down} sized down")
         if a.flip_through:
             msg += f"; flip-through: {n_flip} set"
+        if a.no_halts:
+            msg += f"; no halts: {n_nohalt} set"
         if a.cushion is not None:
             msg += f"; cushion {a.cushion}: {n_cush} set"
         if a.reanchor is not None:
             msg += (f"; follow the book ({a.reanchor}c off the touch): {n_anch} re-anchored, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:

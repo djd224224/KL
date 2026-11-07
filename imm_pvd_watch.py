@@ -49,6 +49,13 @@ HIST_FILE = os.path.join(HIST_DIR, "history.json")
 # markets: the list holds every wave at once (Jack 2026-11-07: "dash looks like it
 # has last time's markets still in here too"). Unset = every listed market.
 WAVE_SERIES = {s.strip() for s in (os.environ.get("PVD_WATCH_SERIES") or "").split(",") if s.strip()}
+# ...or PVD_WATCH_EXCLUDE: every listed market EXCEPT these series (the 11/04
+# election wave's page = the list less the 11/06 waves)
+WAVE_EXCLUDE = {s.strip() for s in (os.environ.get("PVD_WATCH_EXCLUDE") or "").split(",") if s.strip()}
+# the pacing table's target: PACE_BAR banked with PACE_SPARE_H hours to spare
+# (the bank-early rule in pvd_wave_tune.py: $1.30, 6h before the stop)
+PACE_BAR = float(os.environ.get("PVD_WATCH_PACE_BAR") or 1.30)
+PACE_SPARE_H = float(os.environ.get("PVD_WATCH_PACE_SPARE_H") or 6.0)
 # importing incentive_mm reads and writes its STATUS_DIR; keep this
 # read-only watcher off the live bot's files
 os.environ.setdefault("IMM_STATUS_DIR", os.path.join(tempfile.gettempdir(), "imm_pvd_watch_status"))
@@ -111,6 +118,8 @@ def load_list() -> dict:
             out[t] = e
     if WAVE_SERIES:
         out = {t: e for t, e in out.items() if t.split("-")[0] in WAVE_SERIES}
+    if WAVE_EXCLUDE:
+        out = {t: e for t, e in out.items() if t.split("-")[0] not in WAVE_EXCLUDE}
     return out
 
 
@@ -396,7 +405,34 @@ def poll(client, hist: dict) -> dict:
         b["net"] = round(b["est"] + b["trade"], 2)
         for k in ("est", "trade", "rate"):
             b[k] = round(b[k], 2)
-    return {"now": now.isoformat(), "go_live": GO_LIVE.isoformat(), "stale": dict(_stale),
+
+    # PACING THIS PERIOD (Jack 2026-11-07: "in dash, add a table at the top right
+    # before the charts that shows this data, refreshed"): every quoted market
+    # (active, an order resting) by where it lands -- banked this period + the
+    # rate now x the hours to its stop -- against Kalshi's $1 floor and the
+    # bank-early target (PACE_BAR with PACE_SPARE_H to spare)
+    quoted_rows = [r for r in rows.values() if r["active"] and r["rest_ct"]]
+    pace_b = [{"label": f"${PACE_BAR:.2f} with {PACE_SPARE_H:g}h to spare"},
+              {"label": f"${PACE_BAR:.2f} by the end"}, {"label": "$1.15"},
+              {"label": "$1.00"}, {"label": "$0.75"}, {"label": "under $0.75"}]
+    for b in pace_b:
+        b.update(n=0, rate=0.0, proj=0.0, zero=0)
+    for r in quoted_rows:
+        end_p = r["period_est"] + r["rate"] * r["hrs_left"] / 24.0
+        early_p = r["period_est"] + r["rate"] * max(0.0, r["hrs_left"] - PACE_SPARE_H) / 24.0
+        i = (0 if early_p >= PACE_BAR else 1 if end_p >= PACE_BAR else 2 if end_p >= 1.15
+             else 3 if end_p >= 1.00 else 4 if end_p >= 0.75 else 5)
+        b = pace_b[i]
+        b["n"] += 1
+        b["rate"] += r["rate"]
+        b["proj"] += end_p
+        b["zero"] += 1 if not r["rate"] else 0
+    for b in pace_b:
+        b["share"] = round(b["n"] / len(quoted_rows), 4) if quoted_rows else 0.0
+        b["rate"], b["proj"] = round(b["rate"], 2), round(b["proj"], 2)
+    pace = {"quoted": len(quoted_rows), "active": sum(1 for r in rows.values() if r["active"]),
+            "bar": PACE_BAR, "spare_h": PACE_SPARE_H, "buckets": pace_b}
+    return {"now": now.isoformat(), "go_live": GO_LIVE.isoformat(), "stale": dict(_stale), "pace": pace,
             "end": end.isoformat() if end else None, "hrs_left": round(hrs_left, 2),
             "totals": {k: (round(v, 2) if isinstance(v, float) else v) for k, v in tot.items()},
             "rows": sorted(rows.values(), key=lambda r: r["trade"]),
@@ -450,6 +486,8 @@ tr.pos td{background:var(--hi)}tr.off td{opacity:.5}
 <div class="mut" id="scan" style="font-size:12px;margin-top:2px"></div>
 <div class="err" id="err"></div>
 <div class="tiles" id="tiles"></div>
+<h2>Pacing this period <span class="mut" id="pacesub" style="font-weight:400;font-size:12px"></span></h2>
+<div class="wrap" style="margin-bottom:8px"><table><thead><tr><th>Pacing to</th><th>Markets</th><th>Share</th><th>Est $/day now</th><th>Proj. this period</th><th>Earning $0 now</th></tr></thead><tbody id="pace"></tbody></table></div>
 <div class="wrap" style="padding:8px 12px"><div class="mut key">Cumulative since go-live, a point every 5 min:
 <b style="color:var(--est)">&#9644; est rewards</b> &nbsp;<b style="color:var(--trade)">&#9644; trading P&amp;L</b> &nbsp;<b>&#9644; net</b></div>
 <svg id="chart" viewBox="0 0 800 220" style="width:100%;height:220px;display:block"></svg></div>
@@ -494,6 +532,14 @@ function render(){
   $('sub').textContent='updated '+new Date(d.now).toLocaleTimeString('en-US',{timeZone:'America/New_York'})+' ET'+
     (nxt!=null?' | next read in '+Math.ceil(nxt/60)+' min':'')+' | live since '+new Date(d.go_live).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'2-digit'})+' ET | '+
     (d.end?'next stop '+etS(d.end)+' ET (in '+d.hrs_left.toFixed(1)+'h): '+(d.stop_mix||[]).map(([s,n])=>n+' to '+etS(s)).join(', '):'no listed market is active');
+  const pc=d.pace;
+  if(pc){
+    $('pacesub').textContent=`(${pc.quoted} quoted of ${pc.active} active; banked this period + the rate now x the hours to the stop; Kalshi pays a period only from $1)`;
+    $('pace').innerHTML=pc.buckets.map((b,i)=>`<tr><td>${i<2?'<b>'+b.label+'</b>':b.label}</td><td>${b.n.toLocaleString()}</td>`+
+      `<td>${(100*b.share).toFixed(1)}%</td><td>${money(b.rate)}</td><td>${money(b.proj)}</td><td>${b.zero?b.zero.toLocaleString():''}</td></tr>`).join('')+
+      `<tr><td class="mut">total</td><td>${pc.quoted.toLocaleString()}</td><td></td><td>${money(pc.buckets.reduce((a,b)=>a+b.rate,0))}</td>`+
+      `<td>${money(pc.buckets.reduce((a,b)=>a+b.proj,0))}</td><td>${pc.buckets.reduce((a,b)=>a+b.zero,0).toLocaleString()||''}</td></tr>`;
+  }
   const sc=d.scan;
   $('scan').innerHTML=sc?`Overnight scanner (pvd_scan.py, every 15 min): last run ${etS(sc.at)} ET${sc.write?'':' (dry run)'} &middot; ${sc.candidates??0} candidate(s) `+
     `(extended ${sc.extend_candidates??0}, relit ${sc.relit_candidates??0}, new ${sc.new_candidates??0}) &middot; ${sc.past_vote??0} past their vote &middot; `+
