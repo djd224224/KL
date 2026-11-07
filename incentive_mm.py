@@ -3265,7 +3265,7 @@ def event_cap_contracts(event_ticker: str) -> float:
     multiplier (mention x1.5 -> event cap 750; Jack 2026-07-28); the
     OpenRouter market-share family's is SHARE_EVENT_CAP (_share_x1)."""
     # an event with a LIVE post-vote dead-book entry (Jack 2026-11-07: "cap at
-    # 3k contracts per event"): PVD_EVENT_CAP. At the bot's 1,000 a 12-candidate
+    # 3k contracts per event", then "remove event cap"): PVD_EVENT_CAP. At the bot's 1,000 a 12-candidate
     # 2028 primary (KXDPRESPRIMARY-28NY) split it ~166 a side, under the list's
     # 200 floor; 621 of the 2028 wave's 1,858 markets rested below their size.
     _pvs = globals().get("PVD_EVENT_STOPS")
@@ -9750,10 +9750,14 @@ _pvd_state = {"mtime": 0.0, "forced": frozenset()}
 # and events; the 2028 wave's series are its own.
 PVD_NO_HALT_SERIES: Set[str] = set()
 # EVENT CAP FOR LISTED EVENTS (Jack 2026-11-07: "cap at 3k contracts per
-# event"): an event with a live entry (its latest stop still ahead) takes
-# PVD_EVENT_CAP net contracts in event_cap_contracts, in place of the family's
-# (IMM_MAX_EVENT, 1,000 on the box). IMM_PVD_EVENT_CAP=0 turns it off.
-PVD_EVENT_CAP = _env_float("IMM_PVD_EVENT_CAP", 3000)
+# event", then "double cheap sides, remove event cap"): an event with a live
+# entry (its latest stop still ahead) takes PVD_EVENT_CAP net contracts in
+# event_cap_contracts, in place of the family's (IMM_MAX_EVENT, 1,000 on the
+# box). The default is effectively NO event cap (10,000,000, finite so the
+# room arithmetic and int() conversions stay safe); each listed market keeps
+# its own per-side position cap. IMM_PVD_EVENT_CAP=3000 restores the 3k cap,
+# 0 the family's.
+PVD_EVENT_CAP = _env_float("IMM_PVD_EVENT_CAP", 10_000_000)
 PVD_EVENT_STOPS: Dict[str, datetime] = {}
 
 
