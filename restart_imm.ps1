@@ -55,12 +55,29 @@
 # after the handoff exit. A bot that has not exited by the deadline is
 # killed exactly as before (its relaunch cancels the leftovers). -NoHandoff
 # restores the old hard kill.
+#
+# NO BOT IS KILLED BEFORE IT IS ASKED (2026-11-07). 01:53Z: a code-change
+# exit had just handed its book over (restart_handoff.json) and its launcher
+# was in the 30s relaunch sleep when -Task ran. No python was up, so the old
+# check skipped the handover; the launcher relaunched python, that python
+# took the handoff file, and the sweep after Stop-ScheduledTask killed it
+# mid-adoption -- the fresh task's bot found no handoff and cancelled the
+# book (5,449 orders, rebuilt by ~02:09Z). Now -Task kills the launcher
+# chain FIRST whether or not a bot is up (so no relaunch can start), asks a
+# bot that is up to hand over, and leaves a waiting restart_handoff.json for
+# the fresh task's bot; and the sweep asks any bot python it finds (one the
+# task's stop left, or one the watchdog started meanwhile) to hand over
+# before it kills anything. -LibraryOnly loads the functions and stops (the
+# tests dot-source the script that way; it never touches the bot).
 
 param(
     [switch]$Task,
     [switch]$Now,
     # the old hard kill: no handoff request, the relaunch cancels the book
     [switch]$NoHandoff,
+    # load the functions and return: test_restart_imm.py dot-sources the
+    # script this way and never reaches anything that touches the bot
+    [switch]$LibraryOnly,
     # how long to wait for the bot to finish its cycle, hand over and exit
     [int]$HandoffWaitSecs = 600,
     # Parameterized ONLY so a throwaway task can exercise -Task safely;
@@ -179,6 +196,88 @@ function Invoke-BotHandoff {
     return $true
 }
 
+function Stop-SupervisorChain {
+    # Kill the launcher chain -- launcher, cmd shim, wrapper: every rank
+    # under the bot python -- in up to four passes; $true once none is left.
+    for ($pass = 1; $pass -le 4; $pass++) {
+        $sup = @(Get-ImmChain | Where-Object { $_.Rank -lt 3 })
+        if ($sup.Count -eq 0) { return $true }
+        foreach ($p in $sup) {
+            Write-RLog "  killing $($p.Name) (pid $($p.ProcessId))"
+            Stop-Process -Id $p.ProcessId -Force
+        }
+        Start-Sleep -Seconds 2
+    }
+    return (@(Get-ImmChain | Where-Object { $_.Rank -lt 3 }).Count -eq 0)
+}
+
+function Invoke-TaskRestart {
+    # -Task: bounce the scheduled task, the book handed over (see NO BOT IS
+    # KILLED BEFORE IT IS ASKED, above).
+    $t = Get-ScheduledTask -TaskName $TaskName
+    if (-not $t) { Write-RLog "! task '$TaskName' not found"; exit 1 }
+    $asked = @()          # bot pids already asked to hand over (asked once)
+    if (-not $NoHandoff) {
+        # Launcher chain first and python left alone: the launcher would
+        # relaunch python on the OLD env the moment it exits. Killing the
+        # wrapper ends the task's own process, so the task falls back to Ready
+        # -- and the watchdog still refuses to start it while python lives.
+        # With no bot up the chain dies all the same: a launcher in its 30s
+        # relaunch sleep would start a bot that takes the handoff file.
+        $pending = Test-Path (Join-Path $StatusDir 'restart_handoff.json')
+        Write-RLog ("task restart: handing over -- stopping the launcher chain " +
+                    "of '$TaskName'; the bot trades on until it hands over")
+        if (-not (Stop-SupervisorChain)) {
+            Write-RLog "! launcher chain survived its sweep; no handoff -- hard bounce"
+        } elseif (@(Get-BotProcs).Count -gt 0) {
+            $asked += @(Get-BotProcs | ForEach-Object { [int]$_.ProcessId })
+            [void](Invoke-BotHandoff)
+        } elseif ($pending) {
+            Write-RLog ("task restart: no bot up and a handoff waiting " +
+                        "(restart_handoff.json) -- it stays for the fresh task's bot")
+        }
+    }
+    Write-RLog "task restart: stopping '$TaskName'"
+    Stop-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Seconds 2
+    # Stop-ScheduledTask can leave the chain under the task's own process
+    # alive -- the python child, still trading (2026-08-01), and under the
+    # hidden wrapper the launcher itself, which would relaunch python next
+    # to the fresh task's bot. Sweep it all before starting or two bots
+    # collide on one account. A bot python found here may hold the book (a
+    # handover it adopted), so unless -NoHandoff one not asked yet is asked
+    # to hand over first, and killed only if it has not gone by the deadline.
+    for ($pass = 1; $pass -le 4; $pass++) {
+        $chain = @(Get-ImmChain)
+        if ($chain.Count -eq 0) { break }
+        foreach ($p in @($chain | Where-Object { $_.Rank -lt 3 })) {
+            Write-RLog "  killing surviving $($p.Name) (pid $($p.ProcessId))"
+            Stop-Process -Id $p.ProcessId -Force
+        }
+        $new = @($chain | Where-Object { $_.Rank -eq 3 -and $asked -notcontains [int]$_.ProcessId })
+        if ($new.Count -gt 0 -and -not $NoHandoff) {
+            $asked += @($new | ForEach-Object { [int]$_.ProcessId })
+            if (Invoke-BotHandoff) { continue }
+        }
+        foreach ($p in @(Get-ImmChain | Where-Object { $_.Rank -eq 3 })) {
+            Write-RLog "  killing surviving $($p.Name) (pid $($p.ProcessId))"
+            Stop-Process -Id $p.ProcessId -Force
+        }
+        Start-Sleep -Seconds 2
+    }
+    $left = @(Get-ImmChain)
+    if ($left.Count -gt 0) {
+        Write-RLog ("! bot chain still alive after the sweep (pid " +
+                    (($left | ForEach-Object { $_.ProcessId }) -join ',') +
+                    "); NOT starting '$TaskName' -- it would duplicate the bot")
+        exit 1
+    }
+    Start-ScheduledTask -TaskName $TaskName
+    Write-RLog "task restart: '$TaskName' started (fresh launcher env + code)"
+}
+
+if ($LibraryOnly) { return }
+
 $procs = Get-BotProcs
 if ($procs.Count -eq 0 -and -not $Task) {
     Write-RLog ("no incentive_mm process found - nothing to kill; the " +
@@ -198,56 +297,7 @@ if (-not $Now -and $procs.Count -gt 0 -and (Test-HourlyTempLive) -and -not (Test
 }
 
 if ($Task) {
-    $t = Get-ScheduledTask -TaskName $TaskName
-    if (-not $t) { Write-RLog "! task '$TaskName' not found"; exit 1 }
-    if (-not $NoHandoff -and @(Get-BotProcs).Count -gt 0) {
-        # Launcher chain first and python left alone: the launcher would
-        # relaunch python on the OLD env the moment it exits. Killing the
-        # wrapper ends the task's own process, so the task falls back to Ready
-        # -- and the watchdog still refuses to start it while python lives.
-        Write-RLog ("task restart: handing over -- stopping the launcher chain " +
-                    "of '$TaskName'; the bot trades on until it hands over")
-        for ($pass = 1; $pass -le 4; $pass++) {
-            $sup = @(Get-ImmChain | Where-Object { $_.Rank -lt 3 })
-            if ($sup.Count -eq 0) { break }
-            foreach ($p in $sup) {
-                Write-RLog "  killing $($p.Name) (pid $($p.ProcessId))"
-                Stop-Process -Id $p.ProcessId -Force
-            }
-            Start-Sleep -Seconds 2
-        }
-        if (@(Get-ImmChain | Where-Object { $_.Rank -lt 3 }).Count -gt 0) {
-            Write-RLog "! launcher chain survived its sweep; no handoff -- hard bounce"
-        } else {
-            [void](Invoke-BotHandoff)
-        }
-    }
-    Write-RLog "task restart: stopping '$TaskName'"
-    Stop-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Seconds 2
-    # Stop-ScheduledTask can leave the chain under the task's own process
-    # alive -- the python child, still trading (2026-08-01), and under the
-    # hidden wrapper the launcher itself, which would relaunch python next
-    # to the fresh task's bot. Sweep it all before starting or two bots
-    # collide on one account.
-    for ($pass = 1; $pass -le 4; $pass++) {
-        $chain = @(Get-ImmChain)
-        if ($chain.Count -eq 0) { break }
-        foreach ($p in $chain) {
-            Write-RLog "  killing surviving $($p.Name) (pid $($p.ProcessId))"
-            Stop-Process -Id $p.ProcessId -Force
-        }
-        Start-Sleep -Seconds 2
-    }
-    $left = @(Get-ImmChain)
-    if ($left.Count -gt 0) {
-        Write-RLog ("! bot chain still alive after the sweep (pid " +
-                    (($left | ForEach-Object { $_.ProcessId }) -join ',') +
-                    "); NOT starting '$TaskName' -- it would duplicate the bot")
-        exit 1
-    }
-    Start-ScheduledTask -TaskName $TaskName
-    Write-RLog "task restart: '$TaskName' started (fresh launcher env + code)"
+    Invoke-TaskRestart
 } else {
     # Re-fetch: the window wait can be ~40 min and the launcher may have
     # cycled the python (new pid) in the meantime.
