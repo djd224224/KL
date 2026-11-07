@@ -10203,8 +10203,12 @@ def mention_auto_series(series: str) -> bool:
 # IMM_POLITICS_AUTO=0 takes every member out (positions ride).
 POLITICS_AUTO = os.environ.get("IMM_POLITICS_AUTO", "1") == "1"
 POLITICS_AUTO_FILE = "politics_auto_series.json"        # in STATUS_DIR
+# KXIMPEACH out (Jack 2026-11-06: "stop quoting KXIMPEACH"): its impeached-by-
+# a-date ladder (KXIMPEACH-27-JAN01 ... -28-JAN01) matched the "impeach"
+# process word, but one House vote -- or the news that it is coming -- moves
+# every strike at once.
 POLITICS_AUTO_EXCLUDE = frozenset(
-    s.strip() for s in os.environ.get("IMM_POLITICS_AUTO_EXCLUDE", "").split(",")
+    s.strip() for s in os.environ.get("IMM_POLITICS_AUTO_EXCLUDE", "KXIMPEACH").split(",")
     if s.strip())
 POLITICS_WINDOW_START_GAP_DAYS = _env_float("IMM_POLITICS_WINDOW_START_GAP_DAYS", 30.0)
 POLITICS_AUTO_SERIES: Set[str] = set()

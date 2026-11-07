@@ -30982,6 +30982,10 @@ class TestPoliticsAutoFamily(unittest.TestCase):
     that are quotable / without pickoff risk into Politics family. make sure
     this is a rule going forward"."""
 
+
+    def test_kximpeach_is_carved_out_by_default(self):
+        # Jack 2026-11-06: "stop quoting KXIMPEACH"
+        self.assertIn("KXIMPEACH", imm.POLITICS_AUTO_EXCLUDE)
     def setUp(self):
         def reset():
             imm.POLITICS_AUTO_SERIES.clear()
