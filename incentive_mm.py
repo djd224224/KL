@@ -4756,6 +4756,16 @@ def sweep_exempt(series: str) -> bool:
             or series in globals().get("PVD_NO_HALT_SERIES", ()))
 
 
+def tape_exempt(series: str) -> bool:
+    """The tape trigger's exemption: sweep_exempt's, EXCEPT a list entry's
+    "no_halts" series (Jack 2026-11-07: "also turn on tape trigger that pauses
+    an event for 60s when someone trades 100+ in a burst") -- its sweep breaker
+    and toxic halts stay off; mention words and an election night session stay
+    exempt."""
+    return (any(w in series for w in SWEEP_EXEMPT_WORDS)
+            or series in globals().get("ENS_SERIES", ()))
+
+
 def sweep_linked_series(series: str) -> Tuple[str, ...]:
     """The series one trip in `series` holds: its SWEEP_LINKED_GROUPS group,
     else just itself."""
@@ -5053,6 +5063,37 @@ if SWEEP_GROUP not in ("off", "dry", "on"):
 SWEEP_GROUP_WINDOW_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_WINDOW_MIN", 10.0)) * 60.0
 SWEEP_GROUP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_HOLD_MIN", 30.0)) * 60.0
 SWEEP_GROUP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_GROUP_MIN_CT", 0.0))
+
+# WAVE BREAKER (Jack 2026-11-07, after the House sweep: 16:18-16:38Z a taker
+# went district by district, selling the 90c+ favorites into our bids and
+# buying the 3-7c underdogs off our asks -- 23 fills, ~$7k of cash tied up to
+# 2028 -- while the wave's "no_halts" series had no breaker at all; "yes build
+# it, but hold that side for 15min"). A list entry's no-halts series
+# (PVD_NO_HALT_SERIES): two of OUR maker fills of WAVE_MIN_CT+ contracts on the
+# SAME side, each tying up WAVE_MIN_COST+ c a contract (a bid at its price, an
+# ask at 100 - its price), in DIFFERENT markets of the series within
+# WAVE_WINDOW_SECS -> that side's WAVE_MIN_COST+ rungs across the series are
+# held WAVE_HOLD_SECS and pulled at once; the cheaper rungs and the other side
+# keep quoting (Jack: "its ok to quote if it's 5c of cash held but not if its
+# 95c of cash held"). Each trip pages (alerter "wave_breaker").
+#    IMM_WAVE_BREAKER=on (default) / dry (logged to ws_wave_<date>.jsonl only) / off
+WAVE_BREAKER = os.environ.get("IMM_WAVE_BREAKER", "on").strip().lower()
+if WAVE_BREAKER not in ("off", "dry", "on"):
+    WAVE_BREAKER = "off"
+WAVE_WINDOW_SECS = max(0.0, _env_float("IMM_WAVE_WINDOW_MIN", 10.0)) * 60.0
+WAVE_HOLD_SECS = max(0.0, _env_float("IMM_WAVE_HOLD_MIN", 15.0)) * 60.0
+WAVE_MIN_COST = _env_float("IMM_WAVE_MIN_COST", 90.0)
+WAVE_MIN_CT = max(0.0, _env_float("IMM_WAVE_MIN_CT", 25.0))
+
+
+def wave_series(series: str) -> bool:
+    """A series the wave breaker watches: a list entry's "no_halts" series."""
+    return series in globals().get("PVD_NO_HALT_SERIES", ())
+
+
+def side_cost(side: str, px: float) -> float:
+    """What a fill ties up a contract, in cents: a bid its price, an ask 100 - it."""
+    return float(px) if side == "bid" else 100.0 - float(px)
 
 
 # TAPE TRIGGER (Jack 2026-11-01: "build this", on "React to other traders'
@@ -24751,6 +24792,14 @@ class IncentiveMarketMaker:
         self._grp_last: Dict[Tuple[str, str], dict] = {}
         self._grp_win: Dict[Tuple[str, str], dict] = {}
         self._grp_hold: Dict[Tuple[str, str], float] = {}
+        # wave breaker (2026-11-07, WAVE_BREAKER): (series, side) -> the last
+        # fill that could start a trip; -> a trip's window end (dry or on);
+        # -> a LIVE hold's end
+        self._wave_last: Dict[Tuple[str, str], dict] = {}
+        self._wave_win: Dict[Tuple[str, str], float] = {}
+        self._wave_hold: Dict[Tuple[str, str], float] = {}
+        self._wave_st = {"fills": 0, "trips": 0, "held_fills": 0, "cancels": 0,
+                         "skipped_budget": 0}
         self._grp = {"fills": 0, "trips": 0, "trips_live": 0, "held_fills": 0,
                      "held_ct": 0.0, "cancels": 0, "skipped_budget": 0,
                      "skipped_writes": 0}
@@ -26108,6 +26157,8 @@ class IncentiveMarketMaker:
             "bench_until": live(self.state.bench_until),
             "sweep_until": live(self._sweep_until),
             "sweep_hold": live(self._sweep_hold),
+            "wave_hold": {"\t".join(k): round(float(v), 1)
+                          for k, v in self._wave_hold.items() if float(v) > now},
             "sweep_esc": {str(k): {"n": int(s["n"]), "hold_until": round(float(s["hold_until"]), 1),
                                    "reset_at": round(float(s["reset_at"]), 1)}
                           for k, s in self._sweep_esc.items() if float(s["reset_at"]) > now},
@@ -26150,6 +26201,14 @@ class IncentiveMarketMaker:
                     n["grp_hold"] = n.get("grp_hold", 0) + 1
             except (TypeError, ValueError):
                 log(f"{self.tag} ! state file: bad grp_hold entry {k!r}: {v!r}")
+        for k, v in (data.get("wave_hold") or {}).items():
+            try:
+                if float(v) > now and "\t" in k:
+                    self._wave_hold[tuple(k.split("\t", 1))] = float(v)
+                    self._wave_win[tuple(k.split("\t", 1))] = float(v)
+                    n["wave_hold"] = n.get("wave_hold", 0) + 1
+            except (TypeError, ValueError):
+                log(f"{self.tag} ! state file: bad wave_hold entry {k!r}: {v!r}")
         moved = data.get("fair_moved_at") or {}
         for name, st in _fair_hold_states():
             for k, v in (moved.get(name) or {}).items():
@@ -27482,6 +27541,21 @@ class IncentiveMarketMaker:
         g = risk_group_of(ticker)
         return g is not None and self._grp_hold.get((g, side), 0.0) > now_ts
 
+    def wave_held(self, ticker: str, side: str, px: float, now_ts: float) -> bool:
+        """True while a LIVE wave-breaker trip holds `side` of the ticker's
+        series and a rung at `px` there ties up WAVE_MIN_COST+ c a contract."""
+        if WAVE_BREAKER != "on" or not self._wave_hold:
+            return False
+        return (self._wave_hold.get((series_of(ticker), side), 0.0) > now_ts
+                and side_cost(side, px) + 1e-9 >= WAVE_MIN_COST)
+
+    def wave_any_held(self, ticker: str, now_ts: float) -> bool:
+        """Either side of the ticker's series held by the wave breaker."""
+        if WAVE_BREAKER != "on" or not self._wave_hold:
+            return False
+        s = series_of(ticker)
+        return any(self._wave_hold.get((s, sd), 0.0) > now_ts for sd in ("bid", "ask"))
+
     def coverage_exempt(self, ticker: str, now_ts: float) -> bool:
         """A market the coverage alert neither counts nor pages: one the
         toxic-flow halt, the sweep breaker (its event) or the group breaker
@@ -27496,6 +27570,7 @@ class IncentiveMarketMaker:
                 or self.sweep_held(self._event_of(ticker), now_ts)
                 or self.group_held(ticker, "bid", now_ts)
                 or self.group_held(ticker, "ask", now_ts)
+                or self.wave_any_held(ticker, now_ts)
                 or self._xp_shard_paused(ticker))
 
     def _group_note_fill(self, t: str, oid: str, side: str, px: float,
@@ -27613,6 +27688,102 @@ class IncentiveMarketMaker:
                 if o["order_id"] in self._ws_flagged:
                     self._ws_episode_end(o["order_id"], "cancel", now_ts,
                                          by="group")
+
+    def _wave_note_fill(self, t: str, oid: str, side: str, px: float,
+                        n: float, fts: float, now_ts: float,
+                        trade_id: Any) -> None:
+        """The WAVE BREAKER (WAVE_BREAKER) on one of our maker fills, from
+        _sweep_note_fill: a fill of WAVE_MIN_CT+ tying up WAVE_MIN_COST+ c a
+        contract in a no-halts series, on the same side as the last such fill
+        in ANOTHER market of the series within WAVE_WINDOW_SECS, holds that
+        side's WAVE_MIN_COST+ rungs across the series for WAVE_HOLD_SECS and
+        pulls them (on), or logs that it would (dry)."""
+        s = series_of(t)
+        if not wave_series(s) or side not in ("bid", "ask"):
+            return
+        if side_cost(side, px) + 1e-9 < WAVE_MIN_COST or n + 1e-9 < WAVE_MIN_CT:
+            return
+        st = self._wave_st
+        st["fills"] += 1
+        key = (s, side)
+        if self._wave_win.get(key, 0.0) > now_ts:
+            st["held_fills"] += 1
+            self._sink("ws_wave", {"ev": "held_fill", "ts": round(now_ts, 3),
+                                   "mode": WAVE_BREAKER, "series": s, "side": side,
+                                   "ticker": t, "order_id": oid, "px": px, "count": n,
+                                   "fill_ts": fts, "trade_id": trade_id})
+            return
+        prev = self._wave_last.get(key)
+        self._wave_last[key] = {"ts": fts, "ticker": t, "count": n, "px": px,
+                                "order_id": oid, "trade_id": trade_id}
+        if prev is None or prev["ticker"] == t or fts - prev["ts"] > WAVE_WINDOW_SECS:
+            return
+        for d in (self._wave_win, self._wave_hold):
+            for k_old in [k for k, u in d.items() if u < now_ts - 3600]:
+                del d[k_old]
+        live = WAVE_BREAKER == "on"
+        until = now_ts + WAVE_HOLD_SECS
+        self._wave_win[key] = until
+        st["trips"] += 1
+        if live:
+            self._wave_hold[key] = until
+        # that side's expensive orders across the series: the cycle's view,
+        # plus what was placed since, which only the ledger holds yet
+        pull: List[Tuple[str, dict]] = []
+        for tk, lst in self._resting_view.items():
+            if series_of(tk) != s:
+                continue
+            pull.extend((tk, o) for o in lst
+                        if o["side"] == side and o["rem"] > 0
+                        and side_cost(side, o["px"]) + 1e-9 >= WAVE_MIN_COST)
+        in_view = {o["order_id"] for _tk, o in pull}
+        for l_oid, led in list(self.state.ledger.items()):
+            l_t = str(led.get("ticker") or "")
+            l_rem = float(led.get("remaining_count") or 0.0)
+            if l_oid in in_view or l_oid in self._cycle_cancelled or l_rem <= 0 \
+                    or str(led.get("book_side") or "") != side or not l_t \
+                    or series_of(l_t) != s \
+                    or any(o["order_id"] == l_oid
+                           for o in self._resting_view.get(l_t, ())):
+                continue
+            l_px = led.get("yes_price_exact")
+            l_px = float(l_px) if l_px is not None else float(led.get("yes_price") or 0)
+            if side_cost(side, l_px) + 1e-9 < WAVE_MIN_COST:
+                continue
+            pull.append((l_t, {"order_id": l_oid, "side": side, "px": l_px, "rem": l_rem}))
+        mode = "on" if live else "dry"
+        self._sink("ws_wave", {
+            "ev": "trip", "ts": round(now_ts, 3), "mode": mode, "series": s,
+            "side": side, "hold_s": WAVE_HOLD_SECS, "min_cost": WAVE_MIN_COST,
+            "gap_s": round(fts - prev["ts"], 1),
+            "first": {"ticker": prev["ticker"], "count": prev["count"], "px": prev["px"],
+                      "fill_ts": prev["ts"], "order_id": prev["order_id"]},
+            "second": {"ticker": t, "count": n, "px": px, "fill_ts": fts, "order_id": oid},
+            "pull": [[tk, o["order_id"], o["px"], o["rem"]] for tk, o in pull]})
+        msg = (f"{s} {side.upper()}s tying up {WAVE_MIN_COST:g}c+ hit in {prev['ticker']} "
+               f"({prev['count']:.0f} @ {prev['px']:g}c) then {t} ({n:.0f} @ {px:g}c), "
+               f"{fts - prev['ts']:.0f}s apart -> {'holding' if live else 'would hold'} "
+               f"those {side}s across {s} {WAVE_HOLD_SECS / 60:.0f} min: {len(pull)} order(s)")
+        log(f"{self.tag} wave breaker ({mode}): {msg}")
+        self.alerter.alert("wave_breaker", msg, key=f"{s}-{side}", urgent=True, now_ts=now_ts)
+        if not live:
+            return
+        for _tk, o in pull:
+            while self._ws_cancel_times and \
+                    self._ws_cancel_times[0] < now_ts - 60.0:
+                self._ws_cancel_times.popleft()
+            if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
+                st["skipped_budget"] += 1          # the cycle pulls it
+                continue
+            self._ws_cancel_times.append(now_ts)
+            if self.cancel_order(o["order_id"], reason="wave_breaker"):
+                self.state.cancelled_today += 1
+                st["cancels"] += 1
+                o["rem"] = 0.0
+                self._ws_suspect.pop(o["order_id"], None)
+                if o["order_id"] in self._ws_flagged:
+                    self._ws_episode_end(o["order_id"], "cancel", now_ts,
+                                         by="wave")
 
     def _tape_note_fill(self, t: str, oid: str, side: str, px: float,
                         n: float, fts: float, now_ts: float,
@@ -27858,7 +28029,7 @@ class IncentiveMarketMaker:
             mode = "inside"            # its last trip's window is still open
         elif not pull:
             mode = "group_only"        # orders only in the group's other events
-        elif sweep_exempt(series):
+        elif tape_exempt(series):
             mode = "exempt"            # mention families: logged, never pulled
         elif TAPE_TRIGGER == "ab" and not twk_say_series(series):
             # THE LIVE A/B: a new window, its arm drawn from the hold key and
@@ -28034,6 +28205,10 @@ class IncentiveMarketMaker:
                 # or not (2026-10-17)
                 self._group_note_fill(t, oid, side, px, n, fts, now_ts,
                                       body.get("trade_id"))
+            if WAVE_BREAKER != "off":
+                # the wave breaker (2026-11-07): no-halts series, 90c+ fills
+                self._wave_note_fill(t, oid, side, px, n, fts, now_ts,
+                                     body.get("trade_id"))
             if TAPE_TRIGGER != "off":
                 # the tape trigger's windows and a burst's own share (2026-11-01)
                 self._tape_note_fill(t, oid, side, px, n, fts, now_ts,
@@ -37554,6 +37729,13 @@ class IncentiveMarketMaker:
         if SWEEP_GROUP == "on" and self._grp_hold:
             desired = [q for q in desired
                        if not self.group_held(q.ticker, q.book_side, now_ts)]
+        # ...and the wave breaker's held sides (on, 2026-11-07, see WAVE_BREAKER):
+        # no WAVE_MIN_COST+ rung on that side of the series until the hold ends
+        if WAVE_BREAKER == "on" and self._wave_hold:
+            desired = [q for q in desired
+                       if not self.wave_held(q.ticker, q.book_side,
+                                             q.price_exact if q.price_exact is not None
+                                             else q.price_cents, now_ts)]
 
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel

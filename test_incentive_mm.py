@@ -40519,6 +40519,47 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(orders({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}}, 200.0), [("ask", 200.0)])
         self.assertFalse(imm.PVD_MARKETS[self.T]["flip"])
 
+    def test_wave_breaker_holds_the_side_across_the_series(self):
+        """Jack 2026-11-07 (the House sweep 16:18-16:38Z): "yes build it, but hold
+        that side for 15min" -- two fills of 25+ tying up 90c+ on the same side
+        in different markets of a no-halts series within 10 min hold that side's
+        90c+ rungs across the series for 15 min; cheaper rungs and the other side
+        keep quoting"""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200, "no_halts": True},
+                     self.T2: {"bid_max": 49, "ask_min": 51, "size": 200, "no_halts": True}})
+        self.assertTrue(imm.wave_series(imm.series_of(self.T)))
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot._wave_note_fill(self.T, "o1", "bid", 50.0, 300.0, now, now, None)       # 50c: not counted
+        bot._wave_note_fill(self.T, "o2", "bid", 95.0, 10.0, now, now, None)        # 10 lots: not counted
+        bot._wave_note_fill(self.T, "o3", "bid", 95.0, 300.0, now, now, None)
+        bot._wave_note_fill(self.T, "o4", "bid", 96.0, 300.0, now + 5, now + 5, None)  # same market
+        self.assertFalse(bot.wave_held(self.T, "bid", 95.0, now + 6))
+        bot._wave_note_fill(self.T2, "o5", "ask", 4.0, 300.0, now + 30, now + 30, None)  # other side
+        self.assertFalse(bot.wave_held(self.T, "bid", 95.0, now + 31))
+        bot._wave_note_fill(self.T2, "o6", "bid", 94.0, 300.0, now + 60, now + 60, None)
+        self.assertTrue(bot.wave_held(self.T, "bid", 95.0, now + 61))
+        self.assertTrue(bot.wave_held(self.T2, "bid", 90.0, now + 61))
+        self.assertFalse(bot.wave_held(self.T, "bid", 89.0, now + 61))     # a cheaper rung quotes
+        self.assertFalse(bot.wave_held(self.T, "ask", 5.0, now + 61))      # the other side quotes
+        self.assertTrue(bot.coverage_exempt(self.T, now + 61))
+        self.assertFalse(bot.wave_held(self.T, "bid", 95.0, now + 60 + 15 * 60 + 1))
+        self.assertEqual(bot._wave_st["trips"], 1)
+        # a series without "no_halts" is not watched
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
+        self.assertFalse(imm.wave_series(imm.series_of(self.T)))
+
+    def test_tape_trigger_acts_on_no_halts_series(self):
+        """Jack 2026-11-07: "also turn on tape trigger that pauses an event for
+        60s when someone trades 100+ in a burst" -- a no-halts series stays
+        exempt from the sweep breaker but not from the tape trigger; mention
+        series stay exempt from both"""
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200, "no_halts": True}})
+        s = imm.series_of(self.T)
+        self.assertTrue(imm.sweep_exempt(s))
+        self.assertFalse(imm.tape_exempt(s))
+        self.assertTrue(imm.tape_exempt("KXTRUMPMENTION"))
+
     def test_flip_to_flat_reducing_side_rests_the_position(self):
         """Jack 2026-11-07 (KXJEFFRIESFIRST-27FEB01-AL1 long 450, pinned 200 a
         side): "try to fully offset the exposure, so quote 450" -- with
