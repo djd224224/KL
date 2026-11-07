@@ -227,6 +227,15 @@ class Config:
         # parlays 16 min apart). 0 = off (here; the CLI's default is 30)
         self.rush_window_min = 0.0
         self.rush_hold_min = 120.0
+        # ...and only once the worst case on that game -- what its open tickets plus
+        # the accept lose if every leg hits -- reaches rush_game_loss (Jack 2026-11-06:
+        # "there needs to be an exposure cap to not quote it", then "set worse case
+        # threshold to $200 on a game"). 11/06 8:21 PM ET a second requester's Warriors
+        # leg held ORL-GSW 2 h with $54.69 riding on the game: a $7.24 6-leg ticket
+        # and the declined 66 at 28.1c. Under the bar the accept goes on to its last
+        # look, and the outcome and game caps bound it. 0 = any size holds (here; the
+        # CLI's default is $200)
+        self.rush_game_loss = 0.0
         # OUTCOME CAP (Jack 2026-11-06: "Limit exposure by outcome, not just by game"):
         # the payout that rides on one leg result (ticker and side) across the open
         # tickets, at the quote and at the last look. None = off (here; the CLI's
@@ -1173,7 +1182,7 @@ class Maker:
                "no_bid": msg.get("no_bid_dollars"), "contracts": cts}
         self.w.write(rec)
         try:
-            tripped = self._note_accept(q, now)
+            tripped = self._note_accept(q, now, cts)
         except Exception as e:                          # a guard's fault must not lose the last look
             self._error("accept guards", e)
             tripped = None
@@ -1453,9 +1462,16 @@ class Maker:
         log(f"! guard {what}: {key} held out until {datetime.fromtimestamp(until, timezone.utc):%H:%MZ} "
             f"({detail})")
 
-    def _note_accept(self, q: dict, now: float):
+    def game_loss(self, game: str) -> float:
+        """The worst case on one game: what its open tickets lose if every leg hits,
+        contracts x (1 - ask) each."""
+        return sum(t["contracts"] * (1.0 - t["ask"]) for t in self.book.open() if game in t["games"])
+
+    def _note_accept(self, q: dict, now: float, cts=None):
         """Count an accept for the sport burst and the leg rush; the guard it trips
-        ("sport_burst" / "leg_rush": the accept is then declined) or None."""
+        ("sport_burst" / "leg_rush": the accept is then declined) or None. The leg
+        rush holds a game only once its worst case, the accept's own (`cts`
+        contracts, else the quote's) included, reaches rush_game_loss."""
         legs = tuple((str(l[0]), str(l[1])) for l in q["legs"])
         sports = tuple(sorted({sport_of(tk.split("-")[0]) for tk, _ in legs}))
         cr = q.get("cr") or ""
@@ -1480,6 +1496,15 @@ class Maker:
             w = self.cfg.rush_window_min * 60
             for leg in legs:
                 others = {c for t, c, _, ls in hist if leg in ls and now - t <= w and c != cr}
+                if others and self.cfg.rush_game_loss > 0:
+                    g = game_of(leg[0])
+                    risk = (self.game_loss(g)
+                            + (cts if cts is not None else q["contracts"]) * (1.0 - q["ask"]))
+                    if risk < self.cfg.rush_game_loss - 1e-9:
+                        log(f"guard leg_rush: {leg[0]} {leg[1]} accepted by {len(others) + 1} requesters in "
+                            f"{self.cfg.rush_window_min:g} min, but the worst case on {g} is ${risk:,.2f} "
+                            f"(under ${self.cfg.rush_game_loss:,.0f}): the game stays quoted")
+                        continue
                 if others:
                     g = game_of(leg[0])
                     until = now + self.cfg.rush_hold_min * 60
@@ -1787,7 +1812,9 @@ def run(cfg: Config, minutes: float, out_dir: str = OUT_DIR, url: str = WS_URL) 
         + (f", day-loss stop ${cfg.max_day_loss:,.0f}" if cfg.max_day_loss is not None else ", NO day-loss stop")
         + (f", sport burst {cfg.burst_accepts} accepts/{cfg.burst_window_min:g} min -> {cfg.burst_pause_min:g} min"
            if cfg.burst_accepts else "")
-        + (f", leg rush {cfg.rush_window_min:g} min -> game out {cfg.rush_hold_min:g} min" if cfg.rush_window_min else "")
+        + (f", leg rush {cfg.rush_window_min:g} min -> game out {cfg.rush_hold_min:g} min"
+           + (f" once its worst case reaches ${cfg.rush_game_loss:,.0f}" if cfg.rush_game_loss > 0 else "")
+           if cfg.rush_window_min else "")
         + f", lead {cfg.min_lead_min:g} min, "
         + (f"legs settle within {cfg.max_days_out:g} days, " if cfg.max_days_out else "")
         + f"{cfg.min_legs}-{cfg.max_legs} main-line legs, fair {cfg.min_fair:.0%}-{cfg.max_fair:.0%}, "
@@ -1939,6 +1966,9 @@ def main(argv=None) -> int:
                     help="one leg in accepts from 2+ requesters inside this many minutes holds its game out "
                          "--rush-hold-min; the accept that trips it is declined (0 = off)")
     ap.add_argument("--rush-hold-min", type=float, default=d.rush_hold_min)
+    ap.add_argument("--rush-game-loss", type=float, default=200.0,
+                    help="the leg rush holds a game only once its worst case -- what its open tickets "
+                         "plus the accept lose if every leg hits -- reaches this many dollars (0 = any size)")
     ap.add_argument("--no-book-fair", action="store_true",
                     help="drop the second fair (DraftKings' vig-free moneyline on game-winner legs, from the "
                          "RFQ logger's odds files)")
@@ -2034,6 +2064,7 @@ def main(argv=None) -> int:
                  max_day_loss=a.max_day_loss or None, burst_accepts=a.burst_accepts,
                  burst_window_min=a.burst_window_min, burst_pause_min=a.burst_pause_min,
                  rush_window_min=a.rush_window_min, rush_hold_min=a.rush_hold_min,
+                 rush_game_loss=a.rush_game_loss,
                  book_fair=not a.no_book_fair, max_book_gap=a.max_book_gap,
                  poly_fair=not a.no_poly_fair, max_poly_spread=a.max_poly_spread,
                  min_poly_liquidity=a.min_poly_liquidity, bout_guard=not a.no_bout_guard, skip_games=skip,
@@ -2077,6 +2108,8 @@ def main(argv=None) -> int:
         ap.error("--burst-accepts 0-100, --burst-window-min and --burst-pause-min (0, 1440]")
     if not 0 <= cfg.rush_window_min <= 1440 or not 0 < cfg.rush_hold_min <= 2880:
         ap.error("--rush-window-min 0-1440, --rush-hold-min (0, 2880]")
+    if not 0 <= cfg.rush_game_loss <= 100_000:
+        ap.error("--rush-game-loss $0 to $100,000 (0 = any size)")
     return run(cfg, a.minutes)
 
 

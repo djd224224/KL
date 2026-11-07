@@ -1769,6 +1769,36 @@ class LegRush(GuardBase):
         self.assertTrue(self.sell(m, "r6", [[S3, "yes"], [L3, "yes"]], "cccc0000"))              # L3 YES: nobody's
         self.assertGreater(self.fresh(rush_window_min=30).game_hold["26NOV07ARSCHE"], self.clock[0])
 
+    def test_under_the_game_loss_bar_the_game_stays_quoted(self):
+        # Jack 2026-11-06: "there needs to be an exposure cap to not quote it", then
+        # "set worse case threshold to $200 on a game"
+        m = self.maker(rush_window_min=30, rush_game_loss=1e6)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [L1, "yes"]], "aaaa0000"))
+        self.assertTrue(self.sell(m, "r2", [[S1, "yes"], [L2, "yes"]], "bbbb0000", minutes=5))
+        self.assertEqual(self.w.k("guard"), [])
+        self.assertEqual(m.game_hold, {})
+        self.assertTrue(self.sell(m, "r3", [[S1B, "yes"], [L3, "yes"]], "cccc0000"))           # same game
+
+    def test_over_the_game_loss_bar_it_holds(self):
+        m = self.maker(rush_window_min=30, rush_game_loss=1e-3)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [L1, "yes"]], "aaaa0000"))
+        self.assertFalse(self.sell(m, "r2", [[S1, "yes"], [L2, "yes"]], "bbbb0000", minutes=5))
+        self.assertEqual(self.w.k("guard")[-1]["what"], "leg_rush")
+
+    def test_the_bar_counts_every_open_ticket_on_the_game(self):
+        m = self.maker(rush_window_min=30, rush_game_loss=1e6)
+        self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [L1, "yes"]], "aaaa0000"))
+        self.assertTrue(self.sell(m, "r2", [[S1B, "yes"], [L2, "yes"]], "bbbb0000", minutes=5))  # same game, other leg
+        g = cm.game_of(S1)
+        on = [t for t in self.book.open() if g in t["games"]]
+        self.assertEqual(len(on), 2)
+        self.assertAlmostEqual(m.game_loss(g), sum(t["contracts"] * (1.0 - t["ask"]) for t in on))
+        self.assertAlmostEqual(m.game_loss("26NOV99NOPE"), 0.0)
+        # the bar just over the game's worst case now: a rushed S1 YES's own loss tips it
+        m.cfg.rush_game_loss = m.game_loss(g) + 1e-6
+        self.assertFalse(self.sell(m, "r3", [[S1, "yes"], [L3, "yes"]], "cccc0000", minutes=1))
+        self.assertEqual(self.w.k("guard")[-1]["what"], "leg_rush")
+
     def test_one_requester_twice_or_far_apart_is_no_rush(self):
         m = self.maker(rush_window_min=30)
         self.assertTrue(self.sell(m, "r1", [[S1, "yes"], [L1, "yes"]], "aaaa0000"))
