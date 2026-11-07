@@ -40120,6 +40120,67 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestFullEarnSize(unittest.TestCase):
+    """Jack 2026-11-07: "Don't rest more than earning incentive amount eg 1000
+    orders, unless necessary. Don't rest more than needed to fully earn the
+    incentive" -- a listed side rests the smallest size from the target up that
+    keeps 95% of its listed size's side share; unwinds keep position + target."""
+
+    def test_alone_at_the_best_price_rests_the_target(self):
+        n, s_new, s_full = imm.full_earn_size({}, 4.0, 30000, 1000.0, 0.5, keep=0.95)
+        self.assertEqual(n, 1000)
+        self.assertAlmostEqual(s_new, 1.0)
+        self.assertAlmostEqual(s_full, 1.0)
+        # behind us only: the walk ends at our level, so still the target
+        n, *_ = imm.full_earn_size({3.0: 50000.0, 2.0: 9000.0}, 4.0, 30000, 1000.0, 0.5, keep=0.95)
+        self.assertEqual(n, 1000)
+
+    def test_shared_level_keeps_what_earns_95_percent(self):
+        ext = {4.0: 1000.0}                          # another 1,000 at our price
+        n, s_new, s_full = imm.full_earn_size(ext, 4.0, 30000, 1000.0, 0.5, keep=0.95)
+        self.assertAlmostEqual(s_full, 30000 / 31000)
+        self.assertGreaterEqual(s_new, 0.95 * s_full - 1e-12)
+        _, s_less, _ = imm.full_earn_size(ext, 4.0, n - 1, 1000.0, 0.5, keep=1.0)
+        self.assertLess(s_less, 0.95 * s_full)       # one fewer would fall short
+        self.assertLess(n, 30000)
+        self.assertGreater(n, 1000)
+
+    def test_not_over_the_target_or_not_earning(self):
+        self.assertEqual(imm.full_earn_size({}, 4.0, 800, 1000.0, 0.5)[0], 800)
+        self.assertEqual(imm.full_earn_size({}, 4.0, 1000, 1000.0, 0.5)[0], 1000)
+        # 1,500 strictly ahead of us: the walk never reaches us -> down to the target
+        n, s_new, s_full = imm.full_earn_size({6.0: 1500.0}, 4.0, 30000, 1000.0, 0.5)
+        self.assertEqual((n, s_full), (1000, 0.0))
+
+    def test_trim_both_sides_on_the_live_book(self):
+        Q, T = imm.Quote, "KXGOOD-99DEC31-A"
+        # live: the book holds our own 30,000 a side (bid 4c; ask 96c = a 4c NO bid)
+        yes, no = [[4, 30000.0], [3, 200.0]], [[4, 30000.0]]
+        own = [("bid", 4, 30000.0), ("ask", 96, 30000.0)]
+        qs = [Q(T, "bid", 4, 30000), Q(T, "ask", 96, 30000)]
+        out, trims = imm.full_earn_trim(qs, yes, no, own, 1000.0, 0.5, 0.0, keep=0.95)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 1000), ("bid", 1000)])
+        self.assertEqual(trims["bid"][:2], (30000, 1000))
+        self.assertEqual(trims["ask"][:2], (30000, 1000))
+        # long 5,000: the ask (reducing) keeps the position plus the target
+        out, trims = imm.full_earn_trim(qs, yes, no, own, 1000.0, 0.5, 5000.0, keep=0.95)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 6000), ("bid", 1000)])
+        # short 40,000: the bid is all unwind -- untouched
+        out, trims = imm.full_earn_trim(qs, yes, no, own, 1000.0, 0.5, -40000.0, keep=0.95)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 1000), ("bid", 30000)])
+        self.assertNotIn("bid", trims)
+
+    def test_pads_and_ladders_are_left_alone(self):
+        Q, T = imm.Quote, "KXGOOD-99DEC31-A"
+        qs = [Q(T, "bid", 4, 5000), Q(T, "bid", 1, 2000, is_pad=True),
+              Q(T, "ask", 96, 3000), Q(T, "ask", 97, 3000)]          # a two-price ask ladder
+        out, trims = imm.full_earn_trim(qs, [], [], [], 1000.0, 0.5, 0.0)
+        self.assertEqual(sorted((q.book_side, q.price_cents, q.count, q.is_pad) for q in out),
+                         [("ask", 96, 3000, False), ("ask", 97, 3000, False),
+                          ("bid", 1, 2000, True), ("bid", 4, 1000, False)])
+        self.assertEqual(set(trims), {"bid"})
+
+
 class TestPostVoteDeadBooks(unittest.TestCase):
     """Jack 2026-11-04: the post-vote election wave's dead books ("a lot of
     'dead' books, with wide gaps like KXATTYGENOH-26, KXOHTREASR-26NOV03"),
@@ -40518,6 +40579,25 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         # without the flag: the old cap, the ask at its size
         self.assertEqual(orders({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}}, 200.0), [("ask", 200.0)])
         self.assertFalse(imm.PVD_MARKETS[self.T]["flip"])
+
+    def test_full_earn_size_cuts_a_listed_side_to_what_earns(self):
+        """Jack 2026-11-07: "Don't rest more than needed to fully earn the
+        incentive" -- a 30,000 listed side comes down to the target (1,000) or
+        what keeps 95% of its share; "off" rests the listed size"""
+        def orders(mode):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 30000}})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            with mock.patch.object(imm, "PVD_FULL_EARN_MODE", mode):
+                bot.run_cycle()
+            return sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T)
+        off = orders("off")
+        on = orders("on")
+        self.assertTrue(off and all(n == 30000.0 for _s, n in off), off)
+        self.assertEqual([s for s, _n in on], [s for s, _n in off])
+        self.assertTrue(all(1000.0 <= n < 30000.0 for _s, n in on), on)
+        self.assertEqual(orders("dry"), off)
 
     def test_wave_breaker_holds_the_side_across_the_series(self):
         """Jack 2026-11-07 (the House sweep 16:18-16:38Z): "yes build it, but hold

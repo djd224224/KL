@@ -10100,6 +10100,137 @@ def pvd_side_sizes(entry: dict, pos: float) -> Tuple[int, int]:
     return b, a
 
 
+# FULL-EARN SIZE (Jack 2026-11-07: "Don't rest more than earning incentive
+# amount eg 1000 orders, unless necessary. Don't rest more than needed to
+# fully earn the incentive"). A listed market's side (post-vote dead books and
+# every wave) rests no more than the smallest size, from the program's target
+# (usually 1,000) up, that keeps PVD_FULL_EARN_KEEP (95%) of the side score
+# share its full listed size would hold on the book as it stands. The scoring
+# walk (_side_share) runs from the best price until the target is reached and
+# splits every level it takes pro-rata by size. So alone at the best price,
+# target contracts end the walk at our level and hold the whole side: anything
+# past the target earns nothing (the 2028 wave rested 30,000-contract cheap
+# sides there). With others at or ahead of our price, more size still buys
+# share, and the side keeps what earns the 95% ("unless necessary").
+# Never under the target (the side alone still qualifies the snapshot), never
+# over the listed size; the side that REDUCES a position keeps the position
+# plus the target (an unwind is necessary). A side that earns nothing at its
+# listed size comes down to the target. Applied in the quote loop on the live
+# book every cycle (full_earn_trim), after every other gate. "dry" logs the
+# trims without applying them; "off" skips them.
+PVD_FULL_EARN_MODE = os.environ.get("IMM_PVD_FULL_EARN", "on").strip().lower()
+PVD_FULL_EARN_KEEP = _env_float("IMM_PVD_FULL_EARN_KEEP", 0.95)
+PVD_FULL_EARN_LOG_S = 600.0
+
+
+def full_earn_size(ext: Dict[float, float], px: float, planned: int, target: float,
+                   df: float, keep: Optional[float] = None
+                   ) -> Tuple[int, float, float]:
+    """(size, its side share, the planned size's side share) for one side.
+    ext: the side's EXTERNAL depth by price on the walk's own axis (YES cents
+    for a bid, NO cents for an ask), our orders netted out; px: our rung on
+    that axis. The size is the smallest whole number from ceil(target) to
+    `planned` whose share is at least keep x the planned size's (the share
+    only grows with our size once it reaches the target); `planned` itself
+    when it is not over the target."""
+    keep = PVD_FULL_EARN_KEEP if keep is None else keep
+    k = round(float(px), 2)
+    base = {round(float(p_), 2): float(q) for p_, q in ext.items() if float(q) > 1e-9}
+    base.setdefault(k, 0.0)
+    order = sorted(base, reverse=True)        # best first; sorted once, not per probe
+    planned = int(planned)
+    if planned >= target:
+        # every probe is >= the target, so the walk ends at our level or before
+        order = [p_ for p_ in order if p_ >= k]
+
+    def share(n: float) -> float:
+        levels = [(p_, base[p_] + (float(n) if p_ == k else 0.0)) for p_ in order]
+        return _side_share(levels, {k: float(n)}, target, df)[0]
+
+    full = share(planned)
+    lo = int(math.ceil(target)) if target > 0 else planned
+    if planned <= lo:
+        return planned, full, full
+    s_lo = share(lo)
+    if s_lo >= keep * full - 1e-12:
+        return lo, s_lo, full
+    hi = planned                       # share(hi) >= keep x full; share(lo) is not
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if share(mid) >= keep * full - 1e-12:
+            hi = mid
+        else:
+            lo = mid
+    return hi, share(hi), full
+
+
+def full_earn_trim(quotes: List["Quote"], yes_levels: List[List[float]],
+                   no_levels: List[List[float]],
+                   own_in_book: List[Tuple[str, float, float]],
+                   target: float, df: float, pos: float,
+                   keep: Optional[float] = None
+                   ) -> Tuple[List["Quote"], Dict[str, Tuple[int, int, float, float, float]]]:
+    """(quotes, trims): a listed market's quotes with each side cut to its
+    full-earn size (see above), and side -> (listed, kept, share at listed,
+    share kept, cents a contract ties up) for every side it cut. Levels and
+    own_in_book as for drop_unearning_sides (our resting orders are netted out
+    of the book; pads count as depth). A side with rungs at more than one
+    price is not a listed rung and is left alone. `pos` is the position the
+    caps use: long, the ask side keeps at least pos + target; short, the bid."""
+    if not quotes or target <= 0:
+        return quotes, {}
+
+    def key(side: str, yes_px: float) -> float:
+        return round(yes_px if side == "bid" else 100.0 - yes_px, 2)
+
+    def qpx(q: "Quote") -> float:
+        return q.price_exact if q.price_exact is not None else float(q.price_cents)
+
+    ext: Dict[str, Dict[float, float]] = {"bid": {}, "ask": {}}
+    for side, levels in (("bid", yes_levels), ("ask", no_levels)):
+        for px, q in levels:
+            k = round(float(px), 2)
+            ext[side][k] = ext[side].get(k, 0.0) + float(q)
+    for side, yes_px, q in own_in_book:
+        s_ = "bid" if side == "bid" else "ask"
+        k = key(s_, float(yes_px))
+        ext[s_][k] = max(0.0, ext[s_].get(k, 0.0) - float(q))
+    for q in quotes:
+        if q.is_pad:
+            k = key(q.book_side, qpx(q))
+            ext[q.book_side][k] = ext[q.book_side].get(k, 0.0) + float(q.count)
+    out = list(quotes)
+    trims: Dict[str, Tuple[int, int, float, float, float]] = {}
+    for side in ("bid", "ask"):
+        idx = [i for i, q in enumerate(out) if q.book_side == side and not q.is_pad]
+        if not idx:
+            continue
+        pxs = {key(side, qpx(out[i])) for i in idx}
+        if len(pxs) != 1:
+            continue
+        px = next(iter(pxs))
+        planned = int(sum(out[i].count for i in idx))
+        reducing = (side == "ask" and pos > 0) or (side == "bid" and pos < 0)
+        floor = int(math.ceil(target + (abs(pos) if reducing else 0.0)))
+        if planned <= floor:
+            continue
+        new, s_new, s_full = full_earn_size(ext[side], px, planned, target, df, keep)
+        if new < floor:
+            new, s_new = floor, None
+        if new >= planned:
+            continue
+        cut = planned - new
+        for i in reversed(idx):
+            if cut <= 0:
+                break
+            take = min(cut, out[i].count)
+            out[i] = replace(out[i], count=out[i].count - take)
+            cut -= take
+        out = [q for q in out if q.count > 0]
+        trims[side] = (planned, new, s_full, s_new if s_new is not None else -1.0, px)
+    return out, trims
+
+
 def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
     """(bid_max, ask_min) in force: the entry's cushion (its kind's
     PVD_CUSHION_DEAD / _LIVE) either side of the market's last trade when
@@ -24586,6 +24717,8 @@ class IncentiveMarketMaker:
         self._lol_cache: Dict[str, Tuple[float, Any]] = {}
         self._lol_decided: Set[str] = set()
         self._lol_last_live: Dict[str, float] = {}
+        self._full_earn: Dict[str, Tuple[float, float, Dict[str, tuple]]] = {}  # FULL-EARN SIZE: t -> (ts, pool/day, trims)
+        self._full_earn_logged = 0.0
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
@@ -33569,6 +33702,34 @@ class IncentiveMarketMaker:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
 
+    def _full_earn_note(self, now_ts: float) -> None:
+        """Every PVD_FULL_EARN_LOG_S: one line on what FULL-EARN SIZE cut over
+        the markets it touched in that window -- sides, contracts, the cash
+        they would have tied up, and the reward share given up in $/day (each
+        side is half of a market's pool)."""
+        if now_ts - self._full_earn_logged < PVD_FULL_EARN_LOG_S:
+            return
+        self._full_earn_logged = now_ts
+        live = {t: v for t, v in self._full_earn.items() if now_ts - v[0] <= PVD_FULL_EARN_LOG_S}
+        for t in [t for t in self._full_earn if t not in live]:
+            self._full_earn.pop(t, None)
+        sides = cts = 0
+        usd = lost = 0.0
+        alone = 0
+        for _ts, pool, trims in live.values():
+            for side, (planned, new, s_full, s_new, px) in trims.items():
+                sides += 1
+                cts += planned - new
+                usd += (planned - new) * px / 100.0       # px is on the side's own axis: what a contract ties up
+                if s_new >= 0:
+                    lost += pool * max(0.0, s_full - s_new) / 2.0
+                if s_full >= 0.999:
+                    alone += 1
+        log(f"[IMM] full-earn size ({PVD_FULL_EARN_MODE}, keep {PVD_FULL_EARN_KEEP:.0%} of a side's "
+            f"share, floor = target): {sides} side(s) in {len(live)} listed market(s) cut by "
+            f"{cts:,.0f} contracts (${usd:,.0f} they would tie up); {alone} held the whole side "
+            f"already; est reward given up ${lost:,.2f}/day")
+
     def _coverage(self, ticker: str, counted: bool) -> float:
         """Update + return the per-market counted-snapshot EMA.
 
@@ -37223,6 +37384,27 @@ class IncentiveMarketMaker:
                             f"of the scored walk (book {ext_bid}x{ext_ask}) -- "
                             f"not resting it")
                     self._vercel_unearning[t] = _v_dropped
+            # FULL-EARN SIZE (PVD_FULL_EARN_MODE): a listed market's side
+            # rests no more than it takes to earn PVD_FULL_EARN_KEEP of its
+            # side share on the book as it stands, never under the target;
+            # the side that reduces the position keeps it plus the target
+            if pvd is not None and PVD_FULL_EARN_MODE in ("on", "dry") and mq:
+                if meta.price_step < 0.01:
+                    _fy, _fn = orderbook_exact_levels(ob)
+                    _fo = own_exact_by_ticker.get(t, []) if self.live else []
+                else:
+                    _fy, _fn, _fo = yes_levels, no_levels, own_in_book
+                _fe_q, _fe = full_earn_trim(mq, _fy, _fn, _fo, meta.target_size,
+                                            meta.discount_factor, cap_pos)
+                if _fe:
+                    self._full_earn[t] = (now_ts, float(meta.dollars_per_day or 0.0), _fe)
+                    if PVD_FULL_EARN_MODE == "on":
+                        mq = _fe_q
+                else:
+                    self._full_earn.pop(t, None)
+                self._full_earn_note(now_ts)
+            else:
+                self._full_earn.pop(t, None)
             # BREAKEVEN OFFSET (a SELECTED market BE_OFFSET_DAYS out or
             # more): the reducing side carries the whole position at
             # breakeven or better. The event room below is charged the
