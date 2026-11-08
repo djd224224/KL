@@ -118,8 +118,40 @@ def listed_in(lo, hi):
     return out, cur
 
 
-def accrue(tickers, lo, hi):
-    """{ticker: [usd, cycles, cycles_quoted]} over [lo, hi) from the cycle logs."""
+def listed_spans():
+    """{ticker: [(from_ts, to_ts)]}: when each market was on the cheap-side list,
+    from every listing cheap_scan wrote (list_history.jsonl); a market still on
+    it runs to +inf. Rewards and fills count only inside these spans, so a
+    market the bot quoted under its family rules before (or after) is not
+    credited to the cheap-side books."""
+    spans, open_at = defaultdict(list), {}
+    try:
+        with open(HISTORY, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    at = datetime.fromisoformat(rec["at"].replace("Z", "+00:00")).timestamp()
+                    now_set = set(rec.get("markets") or {})
+                except (ValueError, KeyError, TypeError):
+                    continue
+                for t in now_set - set(open_at):
+                    open_at[t] = at
+                for t in set(open_at) - now_set:
+                    spans[t].append((open_at.pop(t), at))
+    except OSError:
+        pass
+    for t, at in open_at.items():
+        spans[t].append((at, float("inf")))
+    return dict(spans)
+
+
+def in_spans(spans, t, x):
+    return any(a <= x < b for a, b in spans.get(t, ()))
+
+
+def accrue(tickers, lo, hi, spans=None):
+    """{ticker: [usd, cycles, cycles_quoted]} over [lo, hi) from the cycle logs
+    (only inside the ticker's listed spans, when given)."""
     want = {t.encode() for t in tickers}
     res = defaultdict(lambda: [0.0, 0, 0])
     if not want:
@@ -135,6 +167,8 @@ def accrue(tickers, lo, hi):
 
         def flush(dt):
             for tk, frac, pool, quoted in batch:
+                if spans is not None and not in_spans(spans, tk, cur_ts):
+                    continue
                 r = res[tk]
                 r[0] += frac * pool * dt / 86400.0
                 r[1] += 1
@@ -177,7 +211,7 @@ def accrue(tickers, lo, hi):
     return dict(res)
 
 
-def fills_in(tickers, lo, hi):
+def fills_in(tickers, lo, hi, spans=None):
     out = defaultdict(list)
     for d in utc_dates(lo, hi):
         p = os.path.join(imm.STATUS_DIR, f"fills_{d}.jsonl")
@@ -191,6 +225,8 @@ def fills_in(tickers, lo, hi):
                     continue
                 t = f.get("ticker")
                 if t not in tickers or not (lo.timestamp() <= float(f.get("ts") or 0) < hi.timestamp()):
+                    continue
+                if spans is not None and not in_spans(spans, t, float(f.get("ts") or 0)):
                     continue
                 px = f.get("our_price_cents")
                 if px is None:
@@ -265,15 +301,16 @@ def build(day, now):
     lo, hi = et_window(day)
     hi_eff = min(hi, now)
     listed, cur = listed_in(lo, hi_eff)
+    spans = listed_spans()
     store = load_store()
     days = store.setdefault("days", {})
-    rew = accrue(set(listed), lo, hi_eff)
-    fills = fills_in(set(listed) | set(cur), lo, hi_eff)
+    rew = accrue(set(listed), lo, hi_eff, spans)
+    fills = fills_in(set(listed) | set(cur), lo, hi_eff, spans)
     # every fill since launch, for the running position and its worth now
     launch = store.get("launch") or zs(lo)
     lo_all = datetime.fromisoformat(launch.replace("Z", "+00:00"))
     all_t = set(listed) | set(cur) | set(store.get("tickers") or [])
-    fills_all = fills_in(all_t, lo_all, now)
+    fills_all = fills_in(all_t, lo_all, now, spans)
     vals = market_values(all_t | set(fills_all))
     rest = resting_now(set(cur))
     per = []
