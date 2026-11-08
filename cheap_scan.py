@@ -53,12 +53,18 @@ lists anything: whether the answer is really 6M+ away is Jack's call.
 --reject keeps it out of the email (and off the list, if it was on it). The
 decisions live in run-logs/cheap-scan/series.json; REJECTED_1108 holds the
 11/08 review's far-dated payers that are not truly far.
+Before the email, a headless Claude calls each flagged series' timing from
+its titles and rules (TIMING_PROMPT; "can you not distinguish what can be
+settled instantly vs cannot be?"): scheduled / slow are shown for approval,
+sudden / soon are left out on one line; IMM_CHEAP_TIMING=off skips it.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -102,6 +108,48 @@ REJECTED_1108 = {
     # can be settled tomororw"): truly far = the answer cannot land before 6M out
     "KXPNP": "P vs NP before 2028: a proof would settle it the day it lands",
 }
+# TIMING CHECK (Jack 2026-11-08: "can you not distinguish what can be settled
+# instantly vs cannot be?", then "Build it"). Kalshi's data cannot: its
+# can_close_early flag is True on every series, the truly-far ones included,
+# and its early-close wording is mostly generic. --discover asks a headless
+# Claude (the family watch's research setup: its token, no tools) how each
+# flagged series' answer gets decided -- scheduled 6M+ out / slow (months of
+# public steps first) pass; sudden (any day, no warning) / soon (a dated event
+# inside 6 months) are left out of the approval list, named on one line so
+# Jack can overrule. A failed check leaves the series in, marked unchecked.
+TIMING_MODE = os.environ.get("IMM_CHEAP_TIMING", "on").strip().lower()      # on | off
+TIMING_MODEL = os.environ.get("IMM_CHEAP_TIMING_MODEL", "sonnet")
+TIMING_TIMEOUT_SECS = 300
+TIMING_BUDGET_USD = 1.0
+TIMING_CACHE_DAYS = 30.0         # a series' call is re-asked after this
+TIMING_MAX_SERIES = 25           # the most series one run asks about (the biggest $/day first)
+TIMING_LABELS = ("scheduled", "slow", "sudden", "soon")
+TIMING_PASS = ("scheduled", "slow")
+TIMING_PROMPT = """You classify Kalshi prediction-market series for a market maker that rests tiny 1-2c bids \
+for months to earn liquidity rewards. It must quote ONLY series whose answer CANNOT land before {cutoff} \
+(6 months from today, {today}). Kalshi's dates do not tell: a market "closes early if the event occurs" on \
+almost every series. Decide from the titles and rules how each series' outcome gets decided:
+
+scheduled - fixed by a dated event or date after {cutoff}: an election or vote on a known date, a term end, \
+a count or a data release for a period ending after {cutoff}. Nothing before then can settle it.
+slow - it settles early only through something that cannot happen without months of public steps first \
+(a US state admitted by Congress, a crewed Moon landing).
+sudden - it can settle, or its answer become known, within days and without warning: a proof or discovery, \
+an announcement, a casting, a signing or transfer, an appointment, a death or resignation, an IPO filing, a \
+product launch, a court ruling, a single report.
+soon - fixed by a dated event or release before {cutoff}, whatever Kalshi's dates say.
+
+When unsure between slow and sudden, answer sudden. The desk's own calls: KXPNP "P vs NP resolved before \
+2028" = sudden (a proof can be published any day); KXFRENCHPRES "2027 French presidential election" = \
+scheduled; KXSTATE51 "a 51st US state before Jan 20, 2029" = slow; KXGRAMMYNOM "Grammy nominees" = soon \
+(announced 11/16); KXBOND "the next James Bond" = sudden; KXJOINCLUB "Haaland's next club" = sudden.
+
+Reply with ONLY a JSON object mapping each series ticker to {{"timing": "scheduled" | "slow" | "sudden" | \
+"soon", "why": "<at most 15 words>"}}.
+
+Series (JSON):
+{series}
+"""
 
 
 def log(msg: str) -> None:
@@ -542,7 +590,8 @@ def discover(a) -> int:
                 "proj": round(pick["proj"], 2), "horizon": zs(hz), "stop": zs(pr["end"]),
                 # Kalshi's own words on an early close: every market says it can, so
                 # only the wording helps Jack judge whether it can settle tomorrow
-                "early": " ".join(str(m.get("early_close_condition") or "").split())[:160]})
+                "early": " ".join(str(m.get("early_close_condition") or "").split())[:160],
+                "rules": " ".join(str(m.get("rules_primary") or "").split())[:500]})
     cands = []
     for s, g in sorted(by.items()):
         ms = sorted(g["markets"], key=lambda x: -x["usd_day"])
@@ -561,28 +610,137 @@ def discover(a) -> int:
             "program_end": min(x["stop"] for x in ms),
             "early": next((x["early"] for x in ms if x.get("early")), ""), "top": ms[:5]})
     cands.sort(key=lambda c: (not c["new"], -c["usd_day"]))
+    t_cost = timing_check(cands, st, now)
     if ok:
         try:   # re-read: an --approve / --reject since the start stays
             st2, _ = load_series_state(strict=True)
             for c in cands:
                 e = st2["seen"].setdefault(c["series"], {"first_seen": c["first_seen"]})
                 e.update(last_seen=zs(now), usd_day=c["usd_day"], n_list=c["n_list"], title=c["title"])
+                if c.get("timing") in TIMING_LABELS and c.get("timing_at"):
+                    e["timing"] = {"label": c["timing"], "why": c.get("timing_why", ""),
+                                   "at": c["timing_at"], "model": c.get("timing_model", ""),
+                                   "events": c.get("events") or []}
             save_series_state(st2)
         except (OSError, ValueError) as e:
             log(f"! {SERIES_FILE} not updated ({e!r})")
     res = {"at": zs(now), "bar": a.bar, "max_usd": a.max_usd, "min_days": a.min_days,
            "programs": len(progs), "outside": len(outside), "rejected_markets": n_rej,
            "far_near_best": len(far), "books": n_read, "watching": list(prefixes) + sorted(approved),
-           "rejected": sorted(rejected), "candidates": cands}
+           "rejected": sorted(rejected), "timing_cost_usd": round(t_cost, 4), "candidates": cands}
     tmp = DISCOVER_OUT + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(res, fh, indent=1)
     os.replace(tmp, DISCOVER_OUT)
     log(f"discover: {len(progs)} program markets, {len(outside)} outside the list's series "
         f"({n_rej} in rejected series), {len(far)} far with a side near 0, {n_read} books read; "
-        f"{len(cands)} series would list ({sum(1 for c in cands if c['new'])} new): "
-        + (", ".join(f"{c['series']} {c['n_list']} ${c['usd_day']:.2f}/d" for c in cands[:12]) or "none"))
+        f"{len(cands)} series would list ({sum(1 for c in cands if c['new'])} new; timing check "
+        f"${t_cost:.2f}): "
+        + (", ".join(f"{c['series']} {c['n_list']} ${c['usd_day']:.2f}/d {c.get('timing') or 'unchecked'}"
+                     for c in cands[:12]) or "none"))
     return 0
+
+
+def _claude_env():
+    """(env, exe) for a headless Claude run: the family watch's research setup
+    (its token file in the env, never logged; the WinGet claude.exe), else the
+    stored login."""
+    try:
+        import imm_family_watch as ifw   # lazy: only when a series needs a call
+        return ifw.research_env(), (shutil.which("claude") or ifw.CLAUDE_FALLBACK)
+    except Exception:  # noqa: BLE001
+        return dict(os.environ), (shutil.which("claude") or "claude")
+
+
+def run_claude(prompt: str):
+    """(result text, cost USD, error) from one tool-less headless Claude run;
+    the prompt goes in on stdin (no command-line length limit)."""
+    env, exe = _claude_env()
+    cmd = [exe, "-p", "Do exactly what the input says. Reply with only the JSON object it asks for.",
+           "--output-format", "json", "--no-session-persistence", "--model", TIMING_MODEL,
+           "--max-budget-usd", f"{TIMING_BUDGET_USD:g}", "--restricted", "--strict-mcp-config", "--tools", ""]
+    try:
+        p = subprocess.run(cmd, input=prompt, cwd=HERE, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=TIMING_TIMEOUT_SECS, env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "", 0.0, f"{type(e).__name__}: {e}"
+    try:
+        js = json.loads(p.stdout or "{}")
+    except ValueError:
+        return p.stdout or "", 0.0, f"exit {p.returncode}: non-JSON output {(p.stderr or p.stdout or '')[:160]!r}"
+    err = "" if p.returncode == 0 and not js.get("is_error") else \
+        f"exit {p.returncode}: {(js.get('result') or p.stderr or '')[:160]}"
+    return (js.get("result") or ""), float(js.get("total_cost_usd") or 0.0), err
+
+
+def parse_timing(text: str, want) -> dict:
+    """{series: (label, why)} from the reply's JSON object, for the series asked."""
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j <= i:
+        raise ValueError("no JSON object in the reply")
+    obj = json.loads(text[i:j + 1])
+    out = {}
+    for s in want:
+        v = obj.get(s)
+        if isinstance(v, dict) and str(v.get("timing", "")).lower() in TIMING_LABELS:
+            out[s] = (str(v["timing"]).lower(), " ".join(str(v.get("why") or "").split())[:120])
+    return out
+
+
+def timing_check(cands, st, now) -> float:
+    """Set each candidate's timing (scheduled / slow / sudden / soon), its why,
+    and timing_err when it could not be checked; a call under TIMING_CACHE_DAYS
+    old in series.json is reused. Returns the run's cost in USD."""
+    need = []
+    for c in cands:
+        t = (st["seen"].get(c["series"]) or {}).get("timing") or {}
+        try:
+            fresh = (now - ts(t["at"])).total_seconds() < TIMING_CACHE_DAYS * 86400
+        except (KeyError, ValueError, TypeError):
+            fresh = False
+        # a call covers the events it was made on: one series can hold a 2026 and
+        # a 2028 event (KXSENATESEATSD-27 / -29), so a new event is asked again
+        fresh = fresh and set(c.get("events") or ()) <= set(t.get("events") or ())
+        if fresh and t.get("label") in TIMING_LABELS:
+            c.update(timing=t["label"], timing_why=t.get("why", ""), timing_at=t["at"],
+                     timing_model=t.get("model", ""))
+        else:
+            need.append(c)
+    if not need:
+        return 0.0
+    if TIMING_MODE != "on":
+        for c in need:
+            c["timing_err"] = "timing check off (IMM_CHEAP_TIMING)"
+        return 0.0
+    ask = sorted(need, key=lambda c: -c["usd_day"])[:TIMING_MAX_SERIES]
+    for c in need:
+        if c not in ask:
+            c["timing_err"] = f"not asked (over {TIMING_MAX_SERIES} series this run)"
+    payload = [{"series": c["series"], "series_title": c["title"], "category": c["category"],
+                "events": c.get("events") or [], "kalshi_expected_expiration": c["horizon_min"][:10],
+                "markets": [{"title": x.get("title"), "yes_sub_title": x.get("sub"), "rules": x.get("rules"),
+                             "early_close_condition": x.get("early")} for x in c["top"][:3]]}
+               for c in ask]
+    prompt = TIMING_PROMPT.format(today=now.strftime("%Y-%m-%d"),
+                                  cutoff=(now + timedelta(days=182)).strftime("%Y-%m-%d"),
+                                  series=json.dumps(payload, indent=1, ensure_ascii=False))
+    text, cost, err = run_claude(prompt)
+    got = {}
+    if not err:
+        try:
+            got = parse_timing(text, [c["series"] for c in ask])
+        except ValueError as e:
+            err = f"unreadable reply ({e}): {text[:120]!r}"
+    for c in ask:
+        if c["series"] in got:
+            c["timing"], c["timing_why"] = got[c["series"]]
+            c["timing_at"], c["timing_model"] = zs(now), TIMING_MODEL
+        else:
+            c["timing_err"] = err or "no call in the reply"
+    log(f"timing check: asked {len(ask)} series, ${cost:.2f}"
+        + (f"; FAILED {err}" if err else "") + "; "
+        + ", ".join(f"{c['series']} {c.get('timing') or 'unchecked'}" for c in ask))
+    return cost
 
 
 def mark_emailed(series, day: str) -> None:
@@ -651,19 +809,25 @@ def render_discover(d, now):
     if not d:
         return (["", "NEW FAR-DATED SERIES: the daily check did not run "
                      "(run-logs/cheap-scan/discover.json missing)."], 0)
-    cands = d.get("candidates") or []
+    allc = d.get("candidates") or []
+    # the timing check's left-outs (sudden / soon): named once, in the email that first has them
+    out = [c for c in allc if c.get("timing") in TIMING_LABELS and c["timing"] not in TIMING_PASS]
+    cands = [c for c in allc if c not in out]
+    out_new = [c for c in out if c.get("new")]
     new = [c for c in cands if c.get("new")]
     old = [c for c in cands if not c.get("new")]
     age_h = (now - ts(d["at"])).total_seconds() / 3600
-    head = (f"NEW FAR-DATED SERIES FOR YOU TO APPROVE: {len(new)} new, {len(old)} still waiting (checked "
-            f"{d['at'][:16].replace('T', ' ')}Z: {d.get('books', 0):,} far books outside the list's "
-            f"{len(d.get('watching') or [])} series)")
+    head = (f"NEW FAR-DATED SERIES FOR YOU TO APPROVE: {len(new)} new, {len(old)} still waiting"
+            + (f", {len(out_new)} left out as able to settle soon" if out_new else "")
+            + f" (checked {d['at'][:16].replace('T', ' ')}Z: {d.get('books', 0):,} far books outside the list's "
+              f"{len(d.get('watching') or [])} series)")
     if age_h > 26:
         head += f" -- STALE, {age_h:.0f}h old"
     lines = ["", head + ":"]
     if not cands:
         lines.append(f"  none: no other series has a far-dated market where a 1-2c rung projects "
-                     f"${d.get('bar', 1.1):.2f} by its program end at ${d.get('max_usd', 50):g} a market.")
+                     f"${d.get('bar', 1.1):.2f} by its program end at ${d.get('max_usd', 50):g} a market"
+                     + (", and that the timing check passes." if out_new else "."))
     for c in new:
         hz = c["horizon_min"][:10] + (f" to {c['horizon_max'][:10]}" if c["horizon_max"][:10] != c["horizon_min"][:10]
                                       else "")
@@ -673,6 +837,10 @@ def render_discover(d, now):
         lines.append(f"      {c['n_list']} market(s) pay: ${c['usd_day']:.2f}/day modelled, ${c['risk']:,.0f} if "
                      f"every rung fills, ${c['proj']:.2f} by the program end {c['program_end'][:10]}; Kalshi "
                      f"dates it {hz}{more}")
+        if c.get("timing"):
+            lines.append(f"      Timing check: {c['timing'].upper()} -- {c.get('timing_why') or '-'}")
+        else:
+            lines.append(f"      Timing check: NOT CHECKED ({c.get('timing_err') or 'no call'}) -- judge it yourself")
         if c.get("early"):
             lines.append(f"      Kalshi on an early close: \"{c['early']}\"")
         for x in c["top"][:3]:
@@ -683,13 +851,18 @@ def render_discover(d, now):
                      f"{c['n_list']} pay ${c['usd_day']:.2f}/day")
     if len(old) > 10:
         lines.append(f"  ... and {len(old) - 10} more (run-logs/cheap-scan/discover.json)")
-    if cands:
+    if out_new:
+        lines.append("  Left out by the timing check (it can settle before 6 months; say \"approve <series>\" "
+                     "to overrule): " + "; ".join(
+                         f"{c['series']} -- {c['title'][:50]} ({c['timing']}: {c.get('timing_why') or '-'}; "
+                         f"${c['usd_day']:.2f}/day)" for c in out_new))
+    if cands or out_new:
         lines.append("  Could it settle tomorrow -- a proof, an announcement, a signing, a transfer? Then it "
-                     "is not truly far (your 11/08 call on KXPNP, P vs NP before 2028). Kalshi's dates do not "
-                     "tell (Grammy nominations read 358 days out, announced 11/16), nor does its early-close "
-                     "flag (every market carries it). To quote one, tell Claude \"approve <series> for the "
-                     "cheap-side books\"; to stop seeing it, \"reject <series>\" (cheap_scan.py --approve / "
-                     "--reject).")
+                     "is not truly far (your 11/08 call on KXPNP, P vs NP before 2028). A headless Claude "
+                     "makes that call first (scheduled / slow pass, sudden / soon are left out); Kalshi's "
+                     "dates and its early-close flag cannot. To quote one, tell Claude \"approve <series> for "
+                     "the cheap-side books\"; to stop seeing it, \"reject <series>\" (cheap_scan.py --approve "
+                     "/ --reject).")
     return lines, len(new)
 
 

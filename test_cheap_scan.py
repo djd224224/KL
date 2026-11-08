@@ -150,13 +150,22 @@ class TestDiscover(_TempPaths):
             if path.startswith("/series/"):
                 return {"series": {"title": "New far thing", "category": "Politics"}}
             return None
+        asked = []
+
+        def claude(prompt):
+            asked.append(prompt)
+            return '{"KXNEWFAR": {"timing": "scheduled", "why": "decided by the 2028 vote"}}', 0.03, ""
         with mock.patch.object(cs, "programs", lambda client, keep, now: progs), \
                 mock.patch.object(cs, "rd", rd), \
                 mock.patch.object(cs, "own_orders", lambda client: ({}, {}, {"KXNEWFAR-28-C"})), \
                 mock.patch.object(imm, "_fair_reader_client", lambda: None), \
                 mock.patch.object(imm.IncentiveMarketMaker, "_blocked", staticmethod(lambda t: False)), \
+                mock.patch.object(cs, "run_claude", claude), \
                 mock.patch.object(cs.time, "sleep", lambda s: None):
             self.assertEqual(cs.discover(self._args()), 0)
+        self.assertEqual(len(asked), 1)
+        self.assertIn('"series": "KXNEWFAR"', asked[0])
+        self.assertIn("Will A happen?", asked[0])                # the market titles go in
         with open(cs.DISCOVER_OUT, encoding="utf-8") as fh:
             d = json.load(fh)
         self.assertEqual(d["outside"], 5)                       # KXSTATE51 in scope, the Grammy noms rejected
@@ -170,27 +179,88 @@ class TestDiscover(_TempPaths):
         self.assertEqual(c["yours"], 1)                         # your orders on C: the standoff
         self.assertEqual(c["category"], "Politics")
         self.assertEqual(c["top"][0]["side"], "yes")
+        self.assertEqual((c["timing"], c["timing_why"]), ("scheduled", "decided by the 2028 vote"))
         st, _ = cs.load_series_state(strict=True)
         self.assertIn("KXNEWFAR", st["seen"])
+        self.assertEqual(st["seen"]["KXNEWFAR"]["timing"]["label"], "scheduled")
 
-        # one email shows it, then it waits
+        # one email shows it, then it waits; the timing call is reused, not re-asked
         cs.mark_emailed(["KXNEWFAR"], "2026-11-09")
         with mock.patch.object(cs, "programs", lambda client, keep, now: progs), \
                 mock.patch.object(cs, "rd", rd), \
                 mock.patch.object(cs, "own_orders", lambda client: ({}, {}, set())), \
                 mock.patch.object(imm, "_fair_reader_client", lambda: None), \
                 mock.patch.object(imm.IncentiveMarketMaker, "_blocked", staticmethod(lambda t: False)), \
+                mock.patch.object(cs, "run_claude", claude), \
                 mock.patch.object(cs.time, "sleep", lambda s: None):
             cs.discover(self._args())
         with open(cs.DISCOVER_OUT, encoding="utf-8") as fh:
             c = json.load(fh)["candidates"][0]
         self.assertFalse(c["new"])
         self.assertEqual(c["n_list"], 3)
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(c["timing"], "scheduled")
+
+
+class TestTimingCheck(_TempPaths):
+    def _cands(self):
+        return [{"series": s, "title": f"{s} title", "category": "Science", "horizon_min": "2028-01-07T15:00:00Z",
+                 "usd_day": u, "top": [{"title": f"{s}?", "sub": "x", "rules": "If ...", "early": ""}]}
+                for s, u in (("KXPROOF", 0.5), ("KXVOTE", 2.0))]
+
+    def test_parse_and_a_failed_run_leaves_them_unchecked(self):
+        st = {"approved": {}, "rejected": {}, "seen": {}}
+        now = datetime(2026, 11, 9, 13, 30, tzinfo=timezone.utc)
+        cands = self._cands()
+        reply = ('Sure:\n{"KXPROOF": {"timing": "Sudden", "why": "a proof can land any day"},'
+                 ' "KXVOTE": {"timing": "scheduled", "why": "the 2028 vote"}, "KXOTHER": {"timing": "slow"}}')
+        with mock.patch.object(cs, "run_claude", lambda p: (reply, 0.02, "")):
+            self.assertAlmostEqual(cs.timing_check(cands, st, now), 0.02)
+        self.assertEqual([(c["timing"], c["timing_why"]) for c in cands],
+                         [("sudden", "a proof can land any day"), ("scheduled", "the 2028 vote")])
+        cands = self._cands()
+        with mock.patch.object(cs, "run_claude", lambda p: ("", 0.0, "exit 1: Failed to authenticate")):
+            cs.timing_check(cands, st, now)
+        self.assertTrue(all("timing" not in c and "authenticate" in c["timing_err"] for c in cands))
+        cands = self._cands()
+        with mock.patch.object(cs, "run_claude", lambda p: ("no json here", 0.01, "")):
+            cs.timing_check(cands, st, now)
+        self.assertTrue(all("unreadable reply" in c["timing_err"] for c in cands))
+        cands = self._cands()
+        with mock.patch.object(cs, "TIMING_MODE", "off"), \
+                mock.patch.object(cs, "run_claude", lambda p: self.fail("asked with the check off")):
+            cs.timing_check(cands, st, now)
+        self.assertTrue(all("off" in c["timing_err"] for c in cands))
+
+    def test_a_cached_call_covers_its_events_only(self):
+        now = datetime(2026, 11, 9, 13, 30, tzinfo=timezone.utc)
+        st = {"approved": {}, "rejected": {}, "seen": {"KXVOTE": {"timing": {
+            "label": "scheduled", "why": "2028 vote", "at": "2026-11-01T13:30:00Z", "events": ["KXVOTE-28"]}}}}
+        asked = []
+        c = dict(self._cands()[1], events=["KXVOTE-28"])
+        with mock.patch.object(cs, "run_claude", lambda p: (asked.append(p) or "{}", 0.0, "")):
+            cs.timing_check([c], st, now)
+        self.assertEqual((asked, c["timing"]), ([], "scheduled"))
+        c = dict(self._cands()[1], events=["KXVOTE-26", "KXVOTE-28"])    # a new event: asked again
+        with mock.patch.object(cs, "run_claude", lambda p: (asked.append(p) or
+                                                            '{"KXVOTE": {"timing": "soon", "why": "2026"}}', 0.0, "")):
+            cs.timing_check([c], st, now)
+        self.assertEqual((len(asked), c["timing"]), (1, "soon"))
+
+    def test_the_prompt_carries_the_desks_calls_and_the_cutoff(self):
+        seen = []
+        now = datetime(2026, 11, 9, 13, 30, tzinfo=timezone.utc)
+        with mock.patch.object(cs, "run_claude", lambda p: (seen.append(p) or "{}", 0.0, "")):
+            cs.timing_check(self._cands(), {"approved": {}, "rejected": {}, "seen": {}}, now)
+        self.assertIn("2027-05-10", seen[0])                     # today + 182 days
+        self.assertIn("KXPNP", seen[0])
+        self.assertIn('"series": "KXVOTE"', seen[0])
 
 
 class TestRenderDiscover(unittest.TestCase):
-    def _c(self, s, new, usd=3.0):
+    def _c(self, s, new, usd=3.0, timing="scheduled"):
         return {"series": s, "title": f"{s} title", "category": "Politics", "first_seen": "2026-11-09T13:30:00Z",
+                "timing": timing, "timing_why": f"{s} why",
                 "new": new, "n_list": 2, "yours": 0, "bot_more": 0, "usd_day": usd, "risk": 100.0, "proj": 9.0,
                 "horizon_min": "2028-11-07T15:00:00Z", "horizon_max": "2028-11-07T15:00:00Z",
                 "program_end": "2026-11-15T05:00:00Z", "early": "This market will close early if the event occurs.",
@@ -216,8 +286,29 @@ class TestRenderDiscover(unittest.TestCase):
         self.assertIn("Could it settle tomorrow", text)
         self.assertIn('Kalshi on an early close: "This market will close early if the event occurs."', text)
         self.assertNotIn("STALE", text)
+        self.assertIn("Timing check: SCHEDULED -- KXNEW why", text)
         lines, _ = cs.render_discover(d, now + timedelta(days=2))
         self.assertIn("STALE", lines[1])
+
+    def test_left_out_and_unchecked(self):
+        now = datetime(2026, 11, 9, 13, 40, tzinfo=timezone.utc)
+        unchecked = self._c("KXUNK", True, timing=None)
+        unchecked["timing_err"] = "exit 1: Failed to authenticate"
+        d = {"at": "2026-11-09T13:30:00Z", "books": 300, "watching": ["A"],
+             "candidates": [self._c("KXPROOF", True, timing="sudden"), self._c("KXOLDSUD", False, timing="soon"),
+                            unchecked]}
+        lines, n = cs.render_discover(d, now)
+        text = "\n".join(lines)
+        self.assertEqual(n, 1)                                  # the unchecked one; the left-out is not "new"
+        self.assertIn("1 new, 0 still waiting, 1 left out", text)
+        self.assertIn("Left out by the timing check", text)
+        self.assertIn("KXPROOF -- KXPROOF title (sudden: KXPROOF why", text)
+        self.assertNotIn("KXOLDSUD", text)                      # named once, already emailed
+        self.assertIn("Timing check: NOT CHECKED (exit 1: Failed to authenticate) -- judge it yourself", text)
+        d["candidates"] = [self._c("KXPROOF", True, timing="sudden")]
+        lines, n = cs.render_discover(d, now)
+        self.assertEqual(n, 0)
+        self.assertIn("and that the timing check passes", "\n".join(lines))
 
 
 if __name__ == "__main__":
