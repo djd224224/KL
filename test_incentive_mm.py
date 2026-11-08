@@ -148,6 +148,7 @@ def setUpModule():
     imm.HALT_FILE = os.path.join(tmp, "HALT")
     imm.UNWIND_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY")
     imm.UNWIND_WAVES_FILE = os.path.join(tmp, "UNWIND_ONLY_EXCEPT_WAVES")
+    imm.UNWIND_WAVES_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY_WAVES")
     imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
     imm.OWN_BOOK_FLATTEN_FILE = os.path.join(tmp, "own_book_flatten.txt")
     # a live sniper book on this machine must not net into the fixtures
@@ -40865,6 +40866,74 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual({s for s, _n in orders(0.0, True, waves=True)}, {"bid", "ask"})
         # ...and the except file alone (no UNWIND_ONLY) changes nothing
         self.assertEqual(orders(150.0, False, waves=True), orders(150.0, False))
+
+    def test_waves_alone_unwind_at_breakeven_or_better(self):
+        """Jack 2026-11-08: "unwind only was meant for the 'market-wave', not IMM
+        bot", then "yes, wave unwind-only but at breakeven or better" -- while
+        UNWIND_ONLY_WAVES exists a listed market rests only its reducing side,
+        never worse than the bot's average cost; every other market as usual"""
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 40, 500), Q(self.T, "ask", 60, 200), Q(self.T, "ask", 62, 200)]
+
+        def uq(*a, **k):
+            return [(q.book_side, q.price_cents, q.price_exact, q.count)
+                    for q in imm.unwind_only_quotes(qs, *a, **k)]
+        self.assertEqual(uq(300.0, touch=55, usual=57, breakeven=58), [("ask", 58, None, 300)])
+        self.assertEqual(uq(300.0, touch=55, usual=57, breakeven=52), [("ask", 55, None, 300)])
+        self.assertEqual(uq(300.0, breakeven=63), [("ask", 63, None, 300)])     # own price under it
+        self.assertEqual(uq(-120.0, touch=45, usual=44, breakeven=42), [("bid", 42, None, 120)])
+        self.assertEqual(uq(-120.0, touch=45, usual=44, breakeven=47), [("bid", 45, None, 120)])
+        self.assertEqual(uq(300.0, touch=6.1, usual=8.0, breakeven=6.45), [("ask", 7, 6.45, 300)])
+
+        other = "KXGOOD-99DEC30-A"                 # a market on no list, beside the listed one
+
+        def orders(pos, avg=50.0, waves_only=True, unwind=False):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
+            c = FakeClient()
+            c.programs.append(dict(c.programs[0], market_ticker=other))
+            c.markets[other] = dict(c.markets[self.T], ticker=other, event_ticker="KXGOOD-99DEC30")
+            c.books[other] = c.books[self.T]
+            bot = IncentiveMarketMaker(client=c, live=False)
+            if pos:
+                bot.pnl.pos[self.T] = pos
+                if avg is not None:
+                    bot.pnl.avg[self.T] = avg
+                bot.client.positions[self.T] = pos
+            flags = ([imm.UNWIND_WAVES_ONLY_FILE] if waves_only else []) + (
+                [imm.UNWIND_ONLY_FILE] if unwind else [])
+            for f in flags:
+                open(f, "w").close()
+            lines = []
+            try:
+                with mock.patch.object(imm, "log", lines.append):
+                    bot.run_cycle()
+            finally:
+                for f in flags:
+                    if os.path.exists(f):
+                        os.remove(f)
+            by = lambda t: sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                                  for o in bot.state.sim_orders.values() if o["ticker"] == t)
+            return by(self.T), by(other), lines
+        plain, plain_other, _l = orders(0.0, waves_only=False)
+        self.assertEqual({s for s, _p, _n in plain}, {"bid", "ask"})
+        self.assertTrue(plain_other)
+        listed, rest, lines = orders(150.0, avg=50.0)          # long, bought under the ask
+        self.assertEqual([(s, n) for s, _p, n in listed], [("ask", 150.0)])
+        self.assertGreaterEqual(listed[0][1], 50)
+        self.assertEqual(rest, plain_other)                     # the rest of the book: as usual
+        self.assertTrue(any("WAVES UNWIND ONLY ON" in x for x in lines), lines)
+        listed, _r, _l = orders(150.0, avg=70.0)                # bought over the market: waits at 70
+        self.assertEqual(listed, [("ask", 70, 150.0)])
+        listed, _r, _l = orders(-80.0, avg=45.0)                # short sold under the bid: buys at 45
+        self.assertEqual(listed, [("bid", 45, 80.0)])
+        self.assertEqual(orders(0.0)[0], [])                    # flat: nothing
+        self.assertEqual(orders(150.0, avg=None)[0], [])        # no average known: nothing
+        # with UNWIND_ONLY too: the listed market still waits at breakeven, and
+        # the rest of the book unwinds (here flat: nothing)
+        listed, rest, _l = orders(150.0, avg=70.0, unwind=True)
+        self.assertEqual(listed, [("ask", 70, 150.0)])
+        self.assertEqual(rest, [])
 
     def test_off_usual_size_rests_the_base_off_the_usual_price(self):
         """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the

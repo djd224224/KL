@@ -12404,18 +12404,32 @@ UNWIND_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY")
 # size); every other market stays unwind-only. Without UNWIND_ONLY it does
 # nothing.
 UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
+# ...AND THE WAVES ALONE AT BREAKEVEN (Jack 2026-11-08: "unwind only was meant
+# for the 'market-wave', not IMM bot", then "yes, wave unwind-only but at
+# breakeven or better"): while this file exists every listed market (pvd_entry:
+# each wave and the post-vote dead books) only unwinds -- the reducing side, the
+# whole position as one order, as UNWIND ONLY -- and never at a price worse than
+# the bot's average cost (PnlTracker.avg, before fees, as the breakeven offset):
+# where the touch is worse, the order rests at the average itself. A listed
+# market with a position but no known average rests nothing. Every other market
+# quotes as usual. It needs no UNWIND_ONLY; with UNWIND_ONLY too, a listed market
+# still unwinds this way.
+UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
 
 
 def unwind_only_quotes(quotes: List["Quote"], pos: float,
                        touch: Optional[float] = None,
                        usual: Optional[float] = None,
-                       off_c: Optional[float] = None) -> List["Quote"]:
+                       off_c: Optional[float] = None,
+                       breakeven: Optional[float] = None) -> List["Quote"]:
     """The UNWIND ONLY filter on one market's quotes: no pads; only the side
     that reduces `pos` (asks while long, bids while short), as ONE order of
     |pos| at its nearest-the-touch rung -- moved to `touch` (the best external
     price on that side, YES cents) when that is better, but with a `usual`
     price never more than `off_c` past it toward the taker, and never
-    crossing; nothing while flat or when the side was not built."""
+    crossing; nothing while flat or when the side was not built. With a
+    `breakeven` (the bot's average cost, YES cents) the order is never priced
+    worse than it: an ask at or over it, a bid at or under it."""
     if abs(pos) < 1:
         return []
     off_c = PVD_OFF_USUAL_C if off_c is None else off_c
@@ -12434,6 +12448,8 @@ def unwind_only_quotes(quotes: List["Quote"], pos: float,
             new = min(new, max(float(touch), float(usual) - off_c))
         else:
             new = max(new, min(float(touch), float(usual) + off_c))
+    if breakeven is not None:
+        new = max(new, float(breakeven)) if side == "ask" else min(new, float(breakeven))
     new = round(new, 2)
     if not 0 < new < 100:
         return []
@@ -25011,6 +25027,7 @@ class IncentiveMarketMaker:
         self._full_earn_logged = 0.0
         self._unwind_only = False      # UNWIND ONLY: UNWIND_ONLY_FILE seen this cycle
         self._unwind_waves = False     # ...EXCEPT THE WAVES: UNWIND_WAVES_FILE too
+        self._unwind_waves_only = False  # THE WAVES ALONE AT BREAKEVEN: UNWIND_WAVES_ONLY_FILE
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
         self._off_usual_logged = 0.0
         self._off_usual_noted: Dict[str, tuple] = {}
@@ -34027,8 +34044,16 @@ class IncentiveMarketMaker:
 
     def _unwinds(self, t: str) -> bool:
         """Does market `t` only unwind this cycle (UNWIND ONLY, and not a
-        listed wave market while UNWIND_WAVES_FILE exists)?"""
-        return self._unwind_only and not (self._unwind_waves and pvd_entry(t) is not None)
+        listed wave market while UNWIND_WAVES_FILE exists; or a listed wave
+        market while UNWIND_WAVES_ONLY_FILE exists)?"""
+        listed = pvd_entry(t) is not None
+        return (self._unwind_waves_only and listed) or (
+            self._unwind_only and not (self._unwind_waves and listed))
+
+    def _unwinds_at_breakeven(self, t: str) -> bool:
+        """Does market `t` unwind at its average cost or better (THE WAVES
+        ALONE AT BREAKEVEN)?"""
+        return self._unwind_waves_only and pvd_entry(t) is not None
 
     def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple]) -> None:
         """Log a side's OFF-USUAL SIZE cut when it starts or changes."""
@@ -35450,6 +35475,14 @@ class IncentiveMarketMaker:
                    f"sides as usual; every other market only unwinds" if _uw
                    else "OFF" + (": every market only unwinds" if _uo else "")))
         self._unwind_waves = _uw
+        _uwo = os.path.exists(UNWIND_WAVES_ONLY_FILE)
+        if _uwo != self._unwind_waves_only:
+            log(f"{self.tag} WAVES UNWIND ONLY "
+                + (f"ON ({UNWIND_WAVES_ONLY_FILE}): every listed wave market quotes only "
+                   f"the side that reduces the bot's own position, at its average cost or "
+                   f"better; flat ones rest nothing; every other market as usual" if _uwo
+                   else "OFF: the listed wave markets quote both sides again"))
+        self._unwind_waves_only = _uwo
         if self.state.halted_until > now_ts:
             log(f"{self.tag} daily-loss halt active until "
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
@@ -37860,7 +37893,14 @@ class IncentiveMarketMaker:
                             _u_usual = _u_a if own_pos > 0 else _u_b
                     except Exception:       # its own price, as before
                         _u_touch = _u_usual = None
-                mq = unwind_only_quotes(mq, own_pos, touch=_u_touch, usual=_u_usual)
+                # (a listed wave under UNWIND_WAVES_ONLY_FILE: never worse than
+                # the bot's average cost; with no average, nothing rests)
+                _u_be = self.pnl.avg.get(t) if self._unwinds_at_breakeven(t) else None
+                if self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_be:
+                    mq = []
+                else:
+                    mq = unwind_only_quotes(mq, own_pos, touch=_u_touch, usual=_u_usual,
+                                            breakeven=_u_be)
             desired.extend(mq)
             if mq:
                 quoted += 1
