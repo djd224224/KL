@@ -1838,6 +1838,28 @@ class DayByBotTests(unittest.TestCase):
                          {"KXRAIN-26OCT22", "KXA-26", "KXC-26"})
         self.assertIsNone(pf.imm_book_events(None, "2026-10-22"))
 
+    def test_the_imm_book_takes_the_rows_event_names(self):
+        """2026-11-08: the bot's event_ticker for KXMEDICAIDWORKHOUSE-26NOV is
+        the series, the digest's rows name it after the markets endpoint, so
+        30 IMM events (-$1,138) fell to Other. pf["ev_map"] fixes the name."""
+        D = {"markets": {"KXMEDICAIDWORKHOUSE-26NOV": {"ev": "KXMEDICAIDWORKHOUSE",
+                                                       "pos": -1519.0},
+                         "KXPRESRUN-28-JVAN": {"ev": "KXPRESRUN", "pos": -10.0}},
+             "days": {"2026-11-08": {"m": {"KXIMPEACH-26-X": []}}}}
+        ev_map = {"KXMEDICAIDWORKHOUSE-26NOV": "KXMEDICAIDWORKHOUSE-26NOV",
+                  "KXPRESRUN-28-JVAN": "KXPRESRUN-28"}
+        got = pf.imm_book_events(D, "2026-11-08", ev_map)
+        for ev in ("KXMEDICAIDWORKHOUSE-26NOV", "KXPRESRUN-28",
+                   "KXIMPEACH-26"):                   # not in the map: replay's fallback
+            self.assertEqual(pf.bot_of_event(ev, got), "IMM", ev)
+        self.assertEqual(pf.bot_of_event("KXMEDICAIDWORKHOUSE-26NOV",
+                                         pf.imm_book_events(D, "2026-11-08")), "Other")
+        p = {"rows": [{"event": "KXMEDICAIDWORKHOUSE-26NOV", "day": -516.46},
+                      {"event": "KXMVECROSSCATEGORY-S2026X", "day": -80.30}]}
+        by = dict((b, t) for b, t, _ in pf.day_by_bot(p, got, ("reward credits", 0.0),
+                                                      None, None))
+        self.assertEqual((by["IMM"], by["Other"]), (-516.46, -80.3))
+
     def test_subaccount_moves_are_kept_per_account(self):
         s = pf.fetch_subaccounts(_FakeSubaccountClient())
         self.assertEqual(s["moves_by"], [(1791509617.0, 1, -300.0), (1791520000.0, 1, 50.0),

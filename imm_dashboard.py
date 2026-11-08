@@ -2006,7 +2006,8 @@ def account_now(D: dict, now: float) -> dict:
     with contextlib.redirect_stdout(buf):
         pf = spd.build_portfolio(now_utc, prior_before=(today + timedelta(days=1)).isoformat(),
                                  with_unpaid=False)
-        out = spd.account_summary(pf, spd.day_split(pf, spd.imm_book_events(D, today.isoformat())))
+        out = spd.account_summary(pf, spd.day_split(
+            pf, spd.imm_book_events(D, today.isoformat(), pf.get("ev_map"))))
     warn = [m for m in (ln.split("Z ", 1)[-1] for ln in buf.getvalue().splitlines())
             if m.startswith("!")]
     if warn:

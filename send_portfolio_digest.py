@@ -254,11 +254,18 @@ SHARD_NAMES = {0: "Default", 1: "Combos", 2: "Crypto & commodities",
                3: "Tennis, baseball, basketball"}
 
 
-def imm_book_events(D, today_str: str):
+def imm_book_events(D, today_str: str, ev_map=None):
     """Event tickers in the IMM bot's own book across the digest's 7am -> 7am
     window: a position now, or a dashboard day row (own fills, re-marks,
     settlements, rewards) on the ET day before today_str or on today_str.
-    None without a dashboard."""
+    None without a dashboard.
+
+    ev_map (build_portfolio's pf["ev_map"], ticker -> event) adds each
+    ticker's event under the name the digest's rows carry, as the replay
+    names it (the map, else event_from_ticker). The dashboard's "ev" is the
+    bot's event_ticker, which for some markets is another name (the series
+    for KXMEDICAIDWORKHOUSE-26NOV, KXPRESRUN-28's legs): without the map
+    those rows fell to Other (2026-11-08: 30 events, -$1,138)."""
     if not D:
         return None
     mk = D.get("markets") or {}
@@ -267,7 +274,10 @@ def imm_book_events(D, today_str: str):
     tickers = {t for t, m in mk.items() if abs(_f((m or {}).get("pos"))) > 1e-9}
     for d in (y, today_str):
         tickers |= set((days.get(d) or {}).get("m") or {})
-    return {(mk.get(t) or {}).get("ev") or event_from_ticker(t) for t in tickers}
+    out = {(mk.get(t) or {}).get("ev") or event_from_ticker(t) for t in tickers}
+    if ev_map is not None:
+        out |= {ev_map.get(t) or event_from_ticker(t) for t in tickers}
+    return out
 
 
 def bot_of_event(event_ticker: str, imm_events) -> str:
@@ -1226,6 +1236,11 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
     # per-market positions (none since 8/14).
     rows, no_trade_cash, net_transfers, replay_info = [], None, None, None
     sub_moves = sub_moves_by = None
+    # ticker -> the event name the rows carry (pf["ev_map"]): day by bot maps
+    # the IMM's tickers through it, since the bot's own event_ticker can be
+    # another name for the same market (KXMEDICAIDWORKHOUSE-26NOV's is the
+    # series; 2026-11-08 that filed 30 IMM events, -$1,138, under Other)
+    ev_names = dict(tk_event)
     prior_tickers = (prior or {}).get("tickers")
     if prior and prior_created is not None and prior_tickers:
         start, ev_map = start_values(prior_tickers, mark_basis)
@@ -1237,6 +1252,7 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
                 if s.get("event_ticker"):
                     ev_map.setdefault(s.get("ticker") or "", s["event_ticker"])
         ev_map.update(tk_event)
+        ev_names = ev_map
         fills = fetch_fills(client, prior_created, now_utc)
         evs, trade_cash, mism, settled_now = replay_day(
             start, fills, win_setts, tk_end,
@@ -1343,7 +1359,7 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
             "refunds_total": round(sum(refunds.values()), 2),
             "n_settlements": len(settlements),
             "no_trade_cash": no_trade_cash, "net_transfers": net_transfers,
-            "replay": replay_info,
+            "replay": replay_info, "ev_map": ev_names,
             "first_run": prior is None}
 
 
@@ -3610,7 +3626,7 @@ def main(argv=None) -> int:
     imm_events = None
     if BY_BOT_ENABLED and dash is not None:
         try:
-            imm_events = imm_book_events(dash, today_str)
+            imm_events = imm_book_events(dash, today_str, pf.get("ev_map") if pf else None)
         except Exception as e:                    # never holds the email
             log(f"! day by bot unavailable: {e!r}")
 
