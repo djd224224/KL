@@ -45,6 +45,8 @@ Guards (all deliberate, see INCENTIVE_MM_HANDOFF.md):
   - Daily loss halt (realized + MTM, IMM_DAILY_LOSS_LIMIT) cancels everything
     until the next 5am-CT roll, when its counter resets. A HALT file in the
     status dir does the same on demand.
+  - Net halt (IMM_NET_LOSS_LIMIT): the same, on P&L today plus today's
+    estimated rewards (the loss halt stays as the backstop).
   - Fail-safe: 4 consecutive errored cycles cancel every resting order.
     TTL (600s) bounds orphan risk if the process dies uncleanly.
 
@@ -4228,6 +4230,17 @@ WINDDOWN_DROPPED = os.environ.get("IMM_WINDDOWN_DROPPED", "0") == "1"
 # window (per-series via SeriesOverride.pre_cutoff_reduce_only_secs).
 PRE_CUTOFF_REDUCE_ONLY_SECS = _env_int("IMM_PRE_CUTOFF_REDUCE_ONLY", 0)
 
+# NET HALT (Jack 2026-11-08: "What I really care about isn't the loss on the
+# portfolio purely, it's the relative loss vs rewards gained. Can you set a
+# threshold on that?" -> "net below -$2k"): the loss halt's P&L today
+# (realized + marked, carried across restarts) PLUS today's estimated rewards
+# -- the lower of the raw estimate (reward_est_today) and the paid basis
+# (reward_paid_today), both restored on a same-roll-day restart -- at or below
+# -NET_LOSS_LIMIT cancels everything and halts until the next 5am-CT roll,
+# exactly like the loss halt, which stays as the backstop. The rewards are the
+# bot's own estimate; Kalshi pays later. 0 = off (the code default; the
+# launcher sets it).
+NET_LOSS_LIMIT = _env_float("IMM_NET_LOSS_LIMIT", 0.0)
 DAILY_LOSS_LIMIT = _env_float("IMM_DAILY_LOSS_LIMIT", 1200.0)  # realized+unrealized $, halts until the next 5am-CT roll (user raises: 50->150 7/14; ->500 7/19; ->800 7/20; ->1200 7/21)
 MAX_TOTAL_RESTING_ORDERS = _env_int("IMM_MAX_TOTAL_RESTING", 2000)  # 450->1000->2000
 #   (Jack 2026-07-23: universe grew to ~263 mkts/50 events wanting >1300 orders;
@@ -12965,7 +12978,7 @@ _CONFIG_CODE_KNOBS = (
     "ORDER_TTL_SECS", "PAD_BID_CENTS", "PAD_ASK_CENTS", "PAD_MIN_TICKS_BEHIND",
     "QUALIFY_PATIENCE_CYCLES", "BENCH_COOLDOWN_SECS", "MAX_MARKETS",
     "MAX_POSITION_CONTRACTS", "MAX_EVENT_CONTRACTS",
-    "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "ACCOUNT_DROP_HALT", "RATE_FLOOR_TOTAL_ALT",
+    "COLLATERAL_BUDGET", "DAILY_LOSS_LIMIT", "NET_LOSS_LIMIT", "ACCOUNT_DROP_HALT", "RATE_FLOOR_TOTAL_ALT",
     # both floors by their REAL global names (2026-09-12: "PAYOUT_FLOOR" had
     # never matched a global, so the exchange minimum was silently unhashed,
     # and the entry bar was never in the hash at all)
@@ -13530,8 +13543,16 @@ def balance_halt_email(drop: float, anchor: float, value: float, cash: float,
     return subject, body
 
 
+def net_today(pnl_today: float, reward_raw: float, reward_paid: float) -> Tuple[float, float]:
+    """(net today, the rewards it counts) for the NET HALT: P&L today plus the
+    lower of today's two reward estimates (raw, paid basis), never below 0."""
+    rew = max(0.0, min(float(reward_raw or 0.0), float(reward_paid or 0.0)))
+    return float(pnl_today) + rew, rew
+
+
 def risk_line(account: Optional[Tuple[float, float]], pnl_today: float,
-              scan_pnl: Optional[float]) -> str:
+              scan_pnl: Optional[float],
+              net: Optional[Tuple[float, float]] = None) -> str:
     """The once-per-full-cycle "risk:" log line: where the three daily
     halts stand against their limits (Jack 2026-10-03: the 7:00 email shows
     how close each risk control came to breaching). `account` is (value,
@@ -13546,6 +13567,10 @@ def risk_line(account: Optional[Tuple[float, float]], pnl_today: float,
                      f"{'down' if drop >= 0 else 'up'} ${abs(drop):,.0f} of "
                      f"${ACCOUNT_DROP_HALT:,.0f} halt)")
     parts.append(f"P&L today ${pnl_today:+,.2f} of -${DAILY_LOSS_LIMIT:,.0f} halt")
+    if net is not None and NET_LOSS_LIMIT > 0:
+        # never "P&L today $" here: imm_risk_controls' RISK_PNL_RE reads that
+        parts.append(f"net today ${net[0]:+,.2f} (trading + est rewards ${net[1]:,.2f}) "
+                     f"of -${NET_LOSS_LIMIT:,.0f} net halt")
     if scan_pnl is not None and SCAN_TOP_N > 0 and SCAN_DAILY_LOSS_LIMIT > 0:
         parts.append(f"open-scan ${scan_pnl:+,.2f} of "
                      f"-${SCAN_DAILY_LOSS_LIMIT:,.0f} budget")
@@ -38142,6 +38167,21 @@ class IncentiveMarketMaker:
             if not fast_only:
                 self._write_cycle_log(cycle_rows)
             return
+        # NET HALT (Jack 2026-11-08, see NET_LOSS_LIMIT): the same halt on P&L
+        # today plus today's estimated rewards (accrued just above)
+        net_now, net_rew = net_today(pnl_today, self.state.reward_est_today,
+                                     self.state.reward_paid_today)
+        if NET_LOSS_LIMIT > 0 and net_now <= -NET_LOSS_LIMIT:
+            self.state.halted_until = _next_roll_utc(now_utc).timestamp()
+            n = self.cancel_all_bot_orders()
+            self.alerter.alert(
+                "net_halt", f"net today ${net_now:,.2f} = P&L today ${pnl_today:,.2f} "
+                f"+ est rewards ${net_rew:,.2f} <= -${NET_LOSS_LIMIT:,.0f}; cancelled "
+                f"{n} orders, halted until the {SUMMARY_HOUR_CT}am CT roll",
+                key="net_halt")
+            if not fast_only:
+                self._write_cycle_log(cycle_rows)
+            return
 
         # OPEN-SCAN DAILY LOSS BUDGET (2026-09-05): the tier's own realized +
         # MTM today over every market it ever admitted (scan_book), carried
@@ -38361,7 +38401,8 @@ class IncentiveMarketMaker:
         if not fast_only:
             log(f"{self.tag} " + risk_line(
                 self._acct_reading, pnl_today,
-                self.state.scan_pnl_today_last if self.state.scan_book else None))
+                self.state.scan_pnl_today_last if self.state.scan_book else None,
+                net=(net_now, net_rew)))
 
         # Watchdog: markets selected but the book nearly empty for several
         # consecutive cycles — the silent-death signature (dead cutoffs,
@@ -41467,6 +41508,12 @@ class IncentiveMarketMaker:
                + ("" if JOIN_WAIT_MODE == "on" else " (dry: logged, nothing held)")
                if _jw_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _jw_live else ""))
+        log("net halt (2026-11-08): "
+            + (f"on -- P&L today + est rewards today (the lower of raw and paid basis) "
+               f"at or below -${NET_LOSS_LIMIT:,.0f} cancels everything until the "
+               f"{SUMMARY_HOUR_CT}am CT roll; the -${DAILY_LOSS_LIMIT:,.0f} loss halt "
+               f"stays as the backstop" if NET_LOSS_LIMIT > 0
+               else "off (IMM_NET_LOSS_LIMIT=0)"))
         log(f"off-usual size (2026-11-08): {PVD_OFF_USUAL_MODE}"
             + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c nearer "
                f"the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "

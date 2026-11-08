@@ -8881,6 +8881,56 @@ class TestLossHalt(unittest.TestCase):
         bot.run_cycle()
         self.assertGreater(bot.state.halted_until, time.time())
 
+    def test_net_halt_counts_todays_rewards(self):
+        """Jack 2026-11-08: "it's the relative loss vs rewards gained" -> "net
+        below -$2k": P&L today + est rewards today <= -$2,000 halts until the
+        roll; the lower of the two reward estimates counts."""
+        saved = imm.NET_LOSS_LIMIT, imm.DAILY_LOSS_LIMIT
+        imm.NET_LOSS_LIMIT, imm.DAILY_LOSS_LIMIT = 2000.0, 5000.0
+        try:
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertTrue(bot.state.sim_orders)
+            # -$3,000 traded, $1,200 of rewards (paid basis $1,500): net -$1,800
+            bot.state.pnl_carry = -3000.0
+            bot.state.reward_est_today, bot.state.reward_paid_today = 1200.0, 1500.0
+            bot.run_cycle()
+            self.assertEqual(bot.state.halted_until, 0.0)
+            self.assertTrue(bot.state.sim_orders)
+            # the paid basis falls to $900: net -$2,100 -> halt, everything cancelled
+            bot.state.reward_paid_today = 900.0
+            bot.run_cycle()
+            self.assertEqual(bot.state.sim_orders, {})
+            self.assertEqual(bot.state.halted_until,
+                             imm._next_roll_utc(datetime.now(timezone.utc)).timestamp())
+            self.assertIn("net_halt", [c for c, _m in bot.alerter.today])
+            self.assertNotIn("loss_halt", [c for c, _m in bot.alerter.today])
+            # off at 0: the same -$2,100 net only answers to the $5,000 loss halt
+            imm.NET_LOSS_LIMIT = 0.0
+            bot = self._bot()
+            bot.state.pnl_carry = -3000.0
+            bot.state.reward_est_today, bot.state.reward_paid_today = 900.0, 900.0
+            bot.run_cycle()
+            self.assertEqual(bot.state.halted_until, 0.0)
+        finally:
+            imm.NET_LOSS_LIMIT, imm.DAILY_LOSS_LIMIT = saved
+
+    def test_net_today_and_the_risk_line(self):
+        self.assertEqual(imm.net_today(-3000.0, 1200.0, 1500.0), (-1800.0, 1200.0))
+        self.assertEqual(imm.net_today(-100.0, 50.0, 0.0), (-100.0, 0.0))
+        saved = imm.NET_LOSS_LIMIT
+        try:
+            imm.NET_LOSS_LIMIT = 2000.0
+            line = imm.risk_line(None, -1500.0, None, net=(-1450.0, 50.0))
+            self.assertIn("net today $-1,450.00 (trading + est rewards $50.00) of -$2,000 net halt", line)
+            # the morning risk email still reads P&L today off the same line
+            import imm_risk_controls as irc
+            self.assertEqual(irc.RISK_PNL_RE.search(line).group(1), "-1,500.00")
+            imm.NET_LOSS_LIMIT = 0.0
+            self.assertNotIn("net today", imm.risk_line(None, -1500.0, None, net=(-1450.0, 50.0)))
+        finally:
+            imm.NET_LOSS_LIMIT = saved
+
 
 class TestMtmAndSettlement(unittest.TestCase):
     def _bot(self):
