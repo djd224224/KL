@@ -41113,6 +41113,58 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(listed, [("ask", 70, 150.0)])
         self.assertEqual(rest, [])
 
+    def test_unwind_never_leads(self):
+        """Jack 2026-11-08: "when unwinding, dont lead like in
+        KXHOUSERACE-AR02-28-D" -- an unwind rests no better than the best
+        external price with UNWIND_NO_LEAD_MIN+ lots on its side; a smaller
+        lot (a follower) does not set it; breakeven still floors it"""
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 40, 500), Q(self.T, "ask", 15, 200)]
+
+        def uq(*a, **k):
+            return [(q.book_side, q.price_cents, q.count)
+                    for q in imm.unwind_only_quotes(qs, *a, **k)]
+        self.assertEqual(uq(300.0, touch=15, no_lead=19), [("ask", 19, 300)])     # joins 19
+        self.assertEqual(uq(300.0, touch=15, no_lead=19, breakeven=21), [("ask", 21, 300)])
+        self.assertEqual(uq(300.0, touch=15, no_lead=12), [("ask", 15, 300)])     # already behind
+        self.assertEqual(uq(300.0, touch=15), [("ask", 15, 300)])                 # nothing to join
+        self.assertEqual(uq(-120.0, touch=38, no_lead=38), [("bid", 38, 120)])    # 40 would lead
+        # the size floor: AR02's book -- a 10-lot joined our 4,389 at 15c, 200 at 19c
+        yes, no = [[10, 43], [11, 20]], [[81, 200], [85, 4399]]
+        own = [("ask", 15, 4389.0)]
+        self.assertEqual(imm.external_best(yes, no, own), (11, 15))
+        self.assertEqual(imm.external_best(yes, no, own, min_qty=20), (11, 19))
+        self.assertEqual(imm.external_touch_exact(
+            [[9.9, 200.0], [11.0, 20.0]], [[81.0, 200.0], [85.0, 4399.0]],
+            [("ask", 15.0, 4389.0)], min_qty=20), (11.0, 19.0))
+
+        def run(no_levels, on=True):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
+            c = FakeClient()
+            c.markets[self.T] = dict(c.markets[self.T], yes_bid_dollars="0.1100",
+                                     yes_ask_dollars="0.1500")
+            c.books[self.T] = {"orderbook_fp": {"yes_dollars": [["0.10", "43"], ["0.11", "20"]],
+                                                "no_dollars": no_levels}}
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 4389.0, 14.0
+            c.positions[self.T] = 4389.0
+            open(imm.UNWIND_WAVES_ONLY_FILE, "w").close()
+            try:
+                with mock.patch.object(imm, "log", lambda *a, **k: None), \
+                        mock.patch.object(imm, "UNWIND_NO_LEAD", on):
+                    bot.run_cycle()
+            finally:
+                os.remove(imm.UNWIND_WAVES_ONLY_FILE)
+            return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                          for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+        ar02 = [["0.81", "200"], ["0.85", "10"]]          # a 10-lot at 15c, 200 at 19c
+        self.assertEqual(run(ar02), [("ask", 19, 4389.0)])
+        self.assertEqual(run([["0.81", "200"], ["0.85", "200"]]), [("ask", 15, 4389.0)])   # a real 15c ask
+        old = run(ar02, on=False)
+        self.assertEqual([(s, n) for s, _p, n in old], [("ask", 4389.0)])
+        self.assertLess(old[0][1], 19)                    # before: it led
+
     def test_breakeven_unwinds_skip_three_guards(self):
         """Jack 2026-11-08: "Yes, those 22" -- a breakeven wave unwind rests
         past the depth gate and the post-vote side guard, and a held wave

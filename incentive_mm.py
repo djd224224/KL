@@ -12800,6 +12800,19 @@ UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
 # the 2026 midterm markets (voting day 11/03 passed) rest nothing and ride to
 # settlement -- a breakeven order there fills only on the winners.
 UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
+# NO LEAD (Jack 2026-11-08: "when unwinding, dont lead like in
+# KXHOUSERACE-AR02-28-D"): every unwind order (unwind_only_quotes: UNWIND ONLY,
+# the waves' breakeven unwind and their held markets) rests no better than the
+# best EXTERNAL price on its side that holds UNWIND_NO_LEAD_MIN+ contracts --
+# an ask at or over that ask, a bid at or under that bid: it joins it or rests
+# behind, then the breakeven floor still holds. Our own orders are netted out,
+# and a smaller lot does not set the price: AR02-D rested its 4,389-lot ask at
+# 15c in an 11x19 book (the quote builder's rung inside the spread), and a
+# 10-lot that joined it at 15c would otherwise keep it there. With no such
+# external quote on the side, nothing to join: the order prices as before.
+# IMM_UNWIND_NO_LEAD=0 turns it off.
+UNWIND_NO_LEAD = os.environ.get("IMM_UNWIND_NO_LEAD", "1") != "0"
+UNWIND_NO_LEAD_MIN = max(1.0, _env_float("IMM_UNWIND_NO_LEAD_MIN", 20.0))
 
 
 def breakeven_whole_cent(be: float, side: str) -> int:
@@ -12816,7 +12829,8 @@ def unwind_only_quotes(quotes: List["Quote"], pos: float,
                        touch: Optional[float] = None,
                        usual: Optional[float] = None,
                        off_c: Optional[float] = None,
-                       breakeven: Optional[float] = None) -> List["Quote"]:
+                       breakeven: Optional[float] = None,
+                       no_lead: Optional[float] = None) -> List["Quote"]:
     """The UNWIND ONLY filter on one market's quotes: no pads; only the side
     that reduces `pos` (asks while long, bids while short), as ONE order of
     |pos| at its nearest-the-touch rung -- moved to `touch` (the best external
@@ -12824,7 +12838,10 @@ def unwind_only_quotes(quotes: List["Quote"], pos: float,
     price never more than `off_c` past it toward the taker, and never
     crossing; nothing while flat or when the side was not built. With a
     `breakeven` (the bot's average cost, YES cents) the order is never priced
-    worse than it: an ask at or over it, a bid at or under it."""
+    worse than it: an ask at or over it, a bid at or under it. With `no_lead`
+    (NO LEAD: the best external price on that side with real size) it is never
+    priced better than that: it joins it or rests behind, then the breakeven
+    floor still holds."""
     if abs(pos) < 1:
         return []
     off_c = PVD_OFF_USUAL_C if off_c is None else off_c
@@ -12843,6 +12860,8 @@ def unwind_only_quotes(quotes: List["Quote"], pos: float,
             new = min(new, max(float(touch), float(usual) - off_c))
         else:
             new = max(new, min(float(touch), float(usual) + off_c))
+    if no_lead is not None and no_lead > 0:
+        new = max(new, float(no_lead)) if side == "ask" else min(new, float(no_lead))
     if breakeven is not None:
         new = max(new, float(breakeven)) if side == "ask" else min(new, float(breakeven))
     new = round(new, 2)
@@ -12857,10 +12876,12 @@ def unwind_only_quotes(quotes: List["Quote"], pos: float,
 
 
 def external_touch_exact(yes_exact: List[List[float]], no_exact: List[List[float]],
-                         own_exact: List[Tuple[str, float, float]] = ()
+                         own_exact: List[Tuple[str, float, float]] = (),
+                         min_qty: float = 0.0,
                          ) -> Tuple[Optional[float], Optional[float]]:
     """(best external bid, best external ask) in exact YES cents on a
-    sub-penny book, our own resting orders netted out (as subpenny_snap does)."""
+    sub-penny book, our own resting orders netted out (as subpenny_snap does);
+    with `min_qty`, only a level holding that many external contracts counts."""
     own_yes: Dict[float, float] = {}
     own_no: Dict[float, float] = {}
     for bs, p, rem in own_exact:
@@ -12869,8 +12890,10 @@ def external_touch_exact(yes_exact: List[List[float]], no_exact: List[List[float
         else:
             k = round(100 - p, 2)
             own_no[k] = own_no.get(k, 0.0) + rem
-    bids = [p for p, q in yes_exact if q - own_yes.get(p, 0.0) > 1e-9]
-    asks = [round(100 - p, 2) for p, q in no_exact if q - own_no.get(p, 0.0) > 1e-9]
+    bids = [p for p, q in yes_exact if q - own_yes.get(p, 0.0) > 1e-9
+            and q - own_yes.get(p, 0.0) >= min_qty - 1e-9]
+    asks = [round(100 - p, 2) for p, q in no_exact if q - own_no.get(p, 0.0) > 1e-9
+            and q - own_no.get(p, 0.0) >= min_qty - 1e-9]
     return (max(bids) if bids else None), (min(asks) if asks else None)
 # RATE-LIMIT ALERT (Jack 2026-10-17: "Raise to 24/s ... Email alert me if
 # rate limit rejections occur"). Every RATE_LIMIT_CHECK_SECS the bot counts
@@ -22461,11 +22484,13 @@ def subpenny_snap(quotes: List["Quote"], yes_exact: List[List[float]],
 
 
 def external_best(yes_levels: List[List[float]], no_levels: List[List[float]],
-                  own_orders: List[Tuple[str, int, float]] = ()
+                  own_orders: List[Tuple[str, int, float]] = (),
+                  min_qty: float = 0.0,
                   ) -> Tuple[Optional[int], Optional[int]]:
     """(best_yes_bid, best_yes_ask) in cents EXCLUDING our own resting orders
     given as (book_side, yes_price_cents, remaining). Our asks rest on the NO
-    book at (100 - yes_price)."""
+    book at (100 - yes_price). With `min_qty`, only a level holding that many
+    external contracts counts (NO LEAD)."""
     own_yes: Dict[int, float] = {}
     own_no: Dict[int, float] = {}
     for book_side, yes_px, remaining in own_orders:
@@ -22476,7 +22501,8 @@ def external_best(yes_levels: List[List[float]], no_levels: List[List[float]],
 
     def best(levels: List[List[float]], own: Dict[int, float]) -> Optional[int]:
         for px, qty in reversed(levels):
-            if qty - own.get(int(px), 0.0) > 0.01:
+            rem = qty - own.get(int(px), 0.0)
+            if rem > 0.01 and rem >= min_qty - 1e-9:
                 return int(px)
         return None
 
@@ -25428,6 +25454,7 @@ class IncentiveMarketMaker:
         self._unwind_only = False      # UNWIND ONLY: UNWIND_ONLY_FILE seen this cycle
         self._unwind_waves = False     # ...EXCEPT THE WAVES: UNWIND_WAVES_FILE too
         self._unwind_waves_only = False  # THE WAVES ALONE AT BREAKEVEN: UNWIND_WAVES_ONLY_FILE
+        self._unwind_nolead_noted: Dict[str, Any] = {}   # NO LEAD: last logged move per market
         self._wave_unwind: Dict[str, "MarketMeta"] = {}   # ...held wave markets outside the selection
         self._wave_unwind_noted: Optional[int] = None
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
@@ -38513,21 +38540,30 @@ class IncentiveMarketMaker:
             # a rung (leads, closes, offsets): the reducing side alone, never
             # past flat
             if self._unwinds(t):
-                _u_touch = _u_usual = None
+                _u_touch = _u_usual = _u_nolead = None
                 if abs(own_pos) >= 1:
                     try:
                         if meta.price_step < 0.01:
+                            _u_own = own_exact_by_ticker.get(t, []) if self.live else []
                             _u_eb, _u_ea = external_touch_exact(
-                                *orderbook_exact_levels(ob),
-                                own_exact_by_ticker.get(t, []) if self.live else [])
+                                *orderbook_exact_levels(ob), _u_own)
+                            _u_nb, _u_na = external_touch_exact(
+                                *orderbook_exact_levels(ob), _u_own,
+                                min_qty=UNWIND_NO_LEAD_MIN)
                         else:
                             _u_eb, _u_ea = ext_bid, ext_ask
+                            _u_nb, _u_na = external_best(yes_levels, no_levels, own_in_book,
+                                                         min_qty=UNWIND_NO_LEAD_MIN)
                         _u_touch = _u_ea if own_pos > 0 else _u_eb
+                        # NO LEAD: never better than the best external price
+                        # with real size on the reducing side
+                        if UNWIND_NO_LEAD:
+                            _u_nolead = _u_na if own_pos > 0 else _u_nb
                         if pvd is not None:
                             _u_b, _u_a = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
                             _u_usual = _u_a if own_pos > 0 else _u_b
                     except Exception:       # its own price, as before
-                        _u_touch = _u_usual = None
+                        _u_touch = _u_usual = _u_nolead = None
                 # (a listed wave under UNWIND_WAVES_ONLY_FILE: never worse than
                 # the bot's average cost; with no average, nothing rests)
                 _u_be = self.pnl.avg.get(t) if self._unwinds_at_breakeven(t) else None
@@ -38536,8 +38572,21 @@ class IncentiveMarketMaker:
                 if self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_be:
                     mq = []
                 else:
-                    mq = unwind_only_quotes(mq, own_pos, touch=_u_touch, usual=_u_usual,
-                                            breakeven=_u_be)
+                    _u_in = mq
+                    mq = unwind_only_quotes(_u_in, own_pos, touch=_u_touch, usual=_u_usual,
+                                            breakeven=_u_be, no_lead=_u_nolead)
+                    if _u_nolead is not None and mq:
+                        _u_old = unwind_only_quotes(_u_in, own_pos, touch=_u_touch,
+                                                    usual=_u_usual, breakeven=_u_be)
+                        _u_px = lambda q: q.price_exact if q.price_exact is not None else q.price_cents
+                        _u_key = ((mq[0].book_side, _u_px(_u_old[0]), _u_px(mq[0]))
+                                  if _u_old and _u_px(_u_old[0]) != _u_px(mq[0]) else None)
+                        if _u_key != self._unwind_nolead_noted.get(t):
+                            if _u_key is not None:
+                                log(f"{self.tag} unwind no-lead {t}: {_u_key[0]} {_u_key[1]}c -> "
+                                    f"{_u_key[2]}c (best external {_u_key[0]} with "
+                                    f"{UNWIND_NO_LEAD_MIN:.0f}+ lots: {_u_nolead}c)")
+                            self._unwind_nolead_noted[t] = _u_key
             desired.extend(mq)
             if mq:
                 quoted += 1
