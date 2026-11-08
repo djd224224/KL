@@ -11,12 +11,15 @@
 #
 # NOT REGISTERED AS A SCHEDULED TASK (deliberate): Jack starts it. Detached:
 #   Start-Process powershell -WindowStyle Hidden -ArgumentList '-ExecutionPolicy','Bypass','-File','C:\Users\jackd\Documents\KL\run_follow_probe.ps1','-Live','-Subaccount','N'
+# -MaxOpen M runs M probes at once (FPROBE_MAX_OPEN; default 6; one per event;
+# started 4 per 5 s). A restart keeps today's caps and the markets already used.
 # Stop: create run-logs\follow-probe\HALT (the bot cancels its orders and
 # idles while it exists), or end the powershell / python processes.
 
 param(
     [switch]$Live,
-    [int]$Subaccount = 0
+    [int]$Subaccount = 0,
+    [int]$MaxOpen = 0
 )
 
 $Python = "C:\Users\jackd\AppData\Local\Programs\Python\Python312\python.exe"
@@ -31,11 +34,13 @@ if ($Live -and $Subaccount -le 0) {
 Set-Location $Repo
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $env:PYTHONIOENCODING = "utf-8"
+if ($MaxOpen -gt 0) { $env:FPROBE_MAX_OPEN = "$MaxOpen" }
 
 $BotArgs = @("$Repo\follow_probe.py", "--quiet")
 if ($Live) { $BotArgs += "--live" }
 if ($Subaccount -gt 0) { $BotArgs += @("--subaccount", "$Subaccount") }
 $Mode = if ($Live) { "live, subaccount $Subaccount" } else { "dry run (no-order baseline)" }
+if ($MaxOpen -gt 0) { $Mode += ", $MaxOpen at once" }
 
 while ($true) {
     $log = Join-Path $LogDir ("launcher-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))

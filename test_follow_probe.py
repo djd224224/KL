@@ -4,6 +4,7 @@ import json
 import os
 import random
 import tempfile
+import time
 import unittest
 
 import follow_probe as fp
@@ -469,6 +470,82 @@ class TestBotFlow(BotHarness):
         self.assertIn("probes today", b.caps_block())
         self.assertEqual(fp.held_cost_of([{"market_exposure_dollars": "0.37"},
                                           {"position_fp": "-2.00"}]), 2.37)
+
+
+    def test_start_burst_ramps_up(self):
+        cs = [cand(f"T{i}", f"E{i}") for i in range(10)]
+        b = self.bot(cands=cs, max_open=10, start_burst=3)
+        b.step(0.0)
+        self.assertEqual(b.open_count(), 3)
+        b.step(2.0)
+        self.assertEqual(b.open_count(), 3)                    # the next start tick is 5 s on
+        b.step(5.0)
+        self.assertEqual(b.open_count(), 6)
+        picks = rows_of(self.dir, "picks")
+        self.assertEqual(len(picks), 6)
+        self.assertTrue(all(p["mode"] == "dry" and p["event_ticker"] == "E" + p["ticker"][1:]
+                            for p in picks))
+        with self.assertRaises(ValueError):
+            cfg(start_burst=0)
+
+
+class TestRestore(BotHarness):
+    def write(self, name, day, rows):
+        with open(os.path.join(self.dir, f"{name}_{day}.jsonl"), "a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def test_restart_keeps_caps_and_cooldowns(self):
+        now = fp.parse_iso("2026-11-08T21:00:00Z")
+        today, yday = "2026-11-08", "2026-11-07"
+        self.write("orders", today, [               # a v2 run: no picks rows, no event_ticker
+            {"ts": "2026-11-08T20:41:42Z", "tid": "r1-1", "event": "placed", "ticker": "KXA-26NOV09-T1"},
+            {"ts": "2026-11-08T20:41:43Z", "tid": "r1-2", "event": "placed", "ticker": "KXB-30ARK-Y"},
+            {"ts": "2026-11-08T20:51:43Z", "tid": "r1-1", "event": "cancel_ok",
+             "ticker": "KXA-26NOV09-T1"}])
+        fill = {"ts": "2026-11-08T20:41:47Z", "order_id": "o2", "tid": "r1-2",
+                "body": {"trade_id": "t1", "order_id": "o2", "count_fp": "1.00"}}
+        self.write("fills", today, [fill, fill])       # the same trade twice
+        self.write("picks", today, [
+            {"ts": "2026-11-08T20:58:00Z", "tid": "r2-1", "mode": "live", "ticker": "KXC-X",
+             "event_ticker": "EVC"},
+            {"ts": "2026-11-08T20:58:00Z", "tid": "d-1", "mode": "dry", "ticker": "KXD-X",
+             "event_ticker": "EVD"}])
+        self.write("trials", today, [
+            {"ts": "2026-11-08T20:56:43Z", "tid": "r1-1", "mode": "live", "status": "done",
+             "ticker": "KXA-26NOV09-T1", "event": "KXA-26NOV09",
+             "ev": {"follow": 12.0, "join": 12.0}}])
+        self.write("picks", yday, [
+            {"ts": "2026-11-07T20:00:00Z", "tid": "y-1", "mode": "live", "ticker": "KXOLD-1",
+             "event_ticker": "EVOLD"},                  # over 24 h ago: free again
+            {"ts": "2026-11-07T22:00:00Z", "tid": "y-2", "mode": "live", "ticker": "KXRECENT-1",
+             "event_ticker": "EVR"}])
+        b = self.bot(live=True)
+        msg = b.restore(now)
+        self.assertEqual((b.counts["probes"], b.counts["placed"], b.counts["fills"]), (3, 2, 1.0))
+        self.assertEqual((b.counts["done"], b.counts["followed"], b.counts["joined"]), (1, 1, 1))
+        self.assertEqual({k for k, v in b.cooled.items() if v > now},
+                         {"KXA-26NOV09-T1", "KXB-30ARK-Y", "KXC-X", "KXRECENT-1"})
+        self.assertEqual({k for k, v in b.event_free.items() if v > now},
+                         {"KXA-26NOV09", "KXB-30ARK", "EVC"})
+        self.assertIn("t1", b._fills_seen)
+        self.assertIn("3 probes, 2 placed, 1 filled", msg)
+        d = self.bot()                                  # a dry run counts dry rows only
+        d.restore(now)
+        self.assertEqual((d.counts["probes"], d.counts["placed"], d.counts["fills"]), (1, 0, 0.0))
+        self.assertEqual({k for k, v in d.cooled.items() if v > now}, {"KXD-X"})
+
+    def test_restart_skips_used_markets_and_events(self):
+        now = time.time()
+        self.write("orders", fp.utc_day(now), [
+            {"ts": fp.utc_iso(now - 120), "tid": "r1-1", "event": "placed", "ticker": "KXA-E1-T1"}])
+        cs = [cand("KXA-E1-T1", "KXA-E1"), cand("KXA-E1-T2", "KXA-E1"), cand("KXB-E2-T1", "KXB-E2")]
+        b = self.bot(live=True, cands=cs, max_open=5)
+        b.scanner = FakeScanner(cs, now)
+        b.restore(now)
+        b.step(now)
+        self.assertEqual([t.ticker for t in b.trials.values()], ["KXB-E2-T1"])
+        self.assertEqual(b.counts["probes"], 2)
 
 
 class TestPreflight(unittest.TestCase):

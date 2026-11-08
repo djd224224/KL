@@ -101,7 +101,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-VERSION = "2"                             # 2: no control twin (v1 rows carry "pair")
+VERSION = "3"   # 3: restarts restore caps + cooldowns; staggered starts; picks rows (2: no control twin; v1 rows carry "pair")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("FPROBE_DATA", os.path.join(HERE, "run-logs", "follow-probe"))
 # orders and subaccount reads: Kalshi's production host (nfl_snipe_bot's finding)
@@ -134,6 +134,10 @@ class Config:
     debounce_s: float = 1.0          # an event counts once it stood this long
     book_wait_s: float = 60.0        # a book that never arrives: abandon
     max_open: int = 6                # probes running at once
+    # probes started per 5 s start tick: a wide max_open ramps up over a minute
+    # or two, so its places (and the cancels 10 min later) never burst on the
+    # API key the IMM shares
+    start_burst: int = 4
     max_probes_day: int = 150        # probes started per UTC day (both modes)
     max_fills_day: int = 60          # live: contracts filled per UTC day
     max_held_cost: float = 40.0      # live: $ of positions at cost
@@ -168,6 +172,8 @@ class Config:
             raise ValueError("FPROBE_HOLD_S must be > 0, PRE_S / POST_S >= 0")
         if not 0.0 <= self.active_share <= 1.0:
             raise ValueError("FPROBE_ACTIVE_SHARE must be in [0, 1]")
+        if self.start_burst < 1 or self.max_open < 1:
+            raise ValueError("FPROBE_START_BURST and FPROBE_MAX_OPEN must be >= 1")
         return self
 
     @classmethod
@@ -1024,6 +1030,85 @@ class Bot:
         return {"probes": 0, "placed": 0, "fills": 0.0, "done": 0, "abandoned": 0,
                 "followed": 0, "joined": 0}
 
+    # -- picking up after a restart --
+    def _day_rows(self, name: str, day: str) -> List[dict]:
+        out: List[dict] = []
+        try:
+            with open(os.path.join(self.data_dir, f"{name}_{day}.jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+        return out
+
+    def restore(self, now: float) -> str:
+        """Pick up where earlier runs in this mode left off. Today's caps count
+        their probes, placed orders and fills, and the markets / events they
+        used stay cooled. Without this a restart (by hand, or the launcher after
+        a crash) re-probed the same markets within minutes and reset the
+        fills-per-day cap. Reads picks / trials / orders / fills of today and
+        yesterday; a row without an event ticker (orders before v3) takes the
+        ticker minus its last '-' part."""
+        cfg = self.cfg
+        today = utc_day(now)
+        gap = cfg.trial_s + cfg.book_wait_s + cfg.event_gap_min * 60
+        tids: Set[str] = set()
+        placed, fills = 0, 0.0
+        done = {"done": 0, "abandoned": 0, "followed": 0, "joined": 0}
+
+        def cool(ticker: Any, ev: Any, ts: Optional[float]) -> None:
+            if not ticker or ts is None:
+                return
+            t = str(ticker)
+            self.cooled[t] = max(self.cooled.get(t, float("-inf")),
+                                 ts + cfg.market_cooldown_h * 3600)
+            e = str(ev or t.rsplit("-", 1)[0])
+            self.event_free[e] = max(self.event_free.get(e, float("-inf")), ts + gap)
+
+        for day in (utc_day(now - 86400), today):
+            mine = [r for r in self._day_rows("picks", day) if r.get("mode") == self.mode]
+            for r in mine:
+                cool(r.get("ticker"), r.get("event_ticker"), parse_iso(r.get("ts")))
+            trials = [r for r in self._day_rows("trials", day) if r.get("mode") == self.mode]
+            for r in trials:
+                cool(r.get("ticker"), r.get("event"), parse_iso(r.get("ts")))
+            orders = ([r for r in self._day_rows("orders", day) if r.get("event") == "placed"]
+                      if self.live else [])
+            for r in orders:
+                cool(r.get("ticker"), r.get("event_ticker"), parse_iso(r.get("ts")))
+            if day != today:
+                continue
+            tids |= {str(r["tid"]) for r in mine + trials + orders if r.get("tid")}
+            placed = len(orders)
+            for r in trials:
+                ev = r.get("ev") or {}
+                if r.get("status") in ("done", "abandoned"):
+                    done[r["status"]] += 1
+                done["followed"] += ev.get("follow") is not None
+                done["joined"] += ev.get("join") is not None
+            if self.live:
+                for r in self._day_rows("fills", day):
+                    b = r.get("body") or {}
+                    key = (str(b.get("trade_id") or b.get("fill_id") or "")
+                           or f"{b.get('order_id')}:{b.get('ts')}")
+                    if key in self._fills_seen:
+                        continue
+                    self._fills_seen.add(key)
+                    fills += abs(float(fpf(b.get("count_fp", b.get("count")), 0.0) or 0.0))
+        c = self.counts
+        c["probes"] = max(c["probes"], len(tids))
+        c["placed"] = max(c["placed"], placed)
+        c["fills"] = max(c["fills"], fills)
+        for k, v in done.items():
+            c[k] = max(c[k], v)
+        n_cool = sum(1 for v in self.cooled.values() if v > now)
+        n_gap = sum(1 for v in self.event_free.values() if v > now)
+        return (f"restored from today's logs: {c['probes']} probes, {c['placed']} placed, "
+                f"{c['fills']:g} filled; {n_cool} market(s) cooling, {n_gap} event(s) resting")
+
     # -- helpers --
     def _roll_day(self, now: float) -> None:
         d = utc_day(now)
@@ -1072,7 +1157,7 @@ class Bot:
                 self._last_cap_log = now
                 self.log(f"no new probes: {why}")
             return 0
-        n = min(n, self.cfg.max_probes_day - self.counts["probes"])
+        n = min(n, self.cfg.start_burst, self.cfg.max_probes_day - self.counts["probes"])
         busy = {t.c.event for t in self.trials.values() if t.active}
         cooled = {k for k, v in self.cooled.items() if v > now}
         gap = {k for k, v in self.event_free.items() if v > now}
@@ -1089,6 +1174,9 @@ class Bot:
             self.cooled[cand.ticker] = now + self.cfg.market_cooldown_h * 3600
             self.counts["probes"] += 1
             started += 1
+            self.log.row("picks", {"run": self.run_id, "tid": tr.tid, "mode": self.mode,
+                                   "ticker": cand.ticker, "event_ticker": cand.event,
+                                   "side": side, "stratum": stratum})
             self.log(f"probe {tr.tid} ({stratum}, {side}): {cand.ticker} "
                      f"{cand.bid_c:g}/{cand.ask_c:g}")
         if started:
@@ -1237,7 +1325,8 @@ class Bot:
         self.by_oid[oid] = tr
         self.counts["placed"] += 1
         self.log.row("orders", {"run": self.run_id, "tid": tr.tid, "event": "placed",
-                                "ticker": tr.ticker, "side": tr.side, "x": tr.x,
+                                "ticker": tr.ticker, "event_ticker": tr.c.event,
+                                "side": tr.side, "x": tr.x,
                                 "yes_px": yes_price_c(tr.side, tr.x), "coid": tr.coid,
                                 "order_id": oid, "expires": utc_iso(exp),
                                 "subaccount": self.ex.sub})
@@ -1444,7 +1533,8 @@ class Bot:
         self.log(f"follow probe v{VERSION} run {self.run_id}: {self.mode}"
                  f"{' subaccount ' + str(self.ex.sub) if self.live else ' (nothing placed: the no-order baseline)'}"
                  f"; hold {self.cfg.hold_s:g}s pre {self.cfg.pre_s:g}s post {self.cfg.post_s:g}s"
-                 f", {self.cfg.max_open} probes at once, spread {self.cfg.min_spread_c:g}c"
+                 f", {self.cfg.max_open} probes at once ({self.cfg.start_burst} started per 5 s)"
+                 f", spread {self.cfg.min_spread_c:g}c"
                  f" to {self.cfg.max_spread_c:g}c")
         try:
             while until is None or time.time() < until:
@@ -1845,6 +1935,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         scanner = Scanner(lambda: fetch_scan(ex, cfg), cfg.scan_every_s, log)
         bot = Bot(cfg, ex, feed, log, data_dir, live, rng, scanner, our_oids)
         log(f"seed {seed}; data {data_dir}")
+        log(bot.restore(time.time()))
         feed.start()
         scanner.start()
         if live:
