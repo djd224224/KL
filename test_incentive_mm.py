@@ -40993,7 +40993,7 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         past the depth gate and the post-vote side guard, and a held wave
         market's unknown-date cutoff becomes a day before Kalshi's own date;
         a real passed cutoff stays"""
-        def run(pos, avg, flag=True):
+        def run(pos, avg, flag=True, exact=False):
             _clean_persist()
             self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
             bot = IncentiveMarketMaker(client=FakeClient(), live=False)
@@ -41009,12 +41009,19 @@ class TestPostVoteDeadBooks(unittest.TestCase):
             finally:
                 if os.path.exists(imm.UNWIND_WAVES_ONLY_FILE):
                     os.remove(imm.UNWIND_WAVES_ONLY_FILE)
-            return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+            return sorted(((o["book_side"], o["yes_price"], o["yes_price_exact"], o["remaining_count"])
+                           if exact else (o["book_side"], o["yes_price"], o["remaining_count"]))
                           for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
         self.assertEqual(run(-80.0, 45.0), [("bid", 45, 80.0)])       # both guards would block
         self.assertEqual(run(150.0, 70.0), [("ask", 70, 150.0)])
         self.assertEqual(run(-80.0, 45.0, flag=False), [])           # not unwinding: guarded
         self.assertEqual(run(0.0, None), [])                         # flat: nothing
+        # a fractional average: a whole cent, the safe way (invalid_price 11/08)
+        self.assertEqual(imm.breakeven_whole_cent(87.62, "bid"), 87)
+        self.assertEqual(imm.breakeven_whole_cent(68.9, "ask"), 69)
+        self.assertEqual(imm.breakeven_whole_cent(70.0000001, "ask"), 70)
+        self.assertEqual(run(150.0, 70.4, exact=True), [("ask", 71, None, 150.0)])
+        self.assertEqual(run(-80.0, 45.6, exact=True), [("bid", 45, None, 80.0)])
 
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         m = {"ticker": "KXGOOD-99DEC31-A", "event_ticker": "KXGOOD-99DEC31",

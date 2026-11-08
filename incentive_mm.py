@@ -12512,6 +12512,16 @@ UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
 UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
 
 
+def breakeven_whole_cent(be: float, side: str) -> int:
+    """THE WAVES ALONE AT BREAKEVEN: the bot's average cost as a whole-cent
+    limit, rounded the safe way -- an ask up, a bid down (87.62c: ask 88, bid
+    87). A fractional average sent as-is was refused as invalid_price on
+    whole-cent books and on the 1c middle of tapered ones (206 rejects
+    14:00-15:11Z 11/08: KXJEFFRIESFIRST-27FEB01-AL1 bid 87.62c,
+    KXSTATELEG-AKHOUSE26-R ask 68.90c); a whole cent is on every grid."""
+    return int(math.ceil(be - 1e-6)) if side == "ask" else int(math.floor(be + 1e-6))
+
+
 def unwind_only_quotes(quotes: List["Quote"], pos: float,
                        touch: Optional[float] = None,
                        usual: Optional[float] = None,
@@ -38068,6 +38078,8 @@ class IncentiveMarketMaker:
                 # (a listed wave under UNWIND_WAVES_ONLY_FILE: never worse than
                 # the bot's average cost; with no average, nothing rests)
                 _u_be = self.pnl.avg.get(t) if self._unwinds_at_breakeven(t) else None
+                if _u_be:
+                    _u_be = breakeven_whole_cent(_u_be, "ask" if own_pos > 0 else "bid")
                 if self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_be:
                     mq = []
                 else:
