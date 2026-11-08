@@ -23,6 +23,10 @@ ONE EMAIL per ET day, money first, ending in KEEP / WATCH / STOP:
 Verdict: STOP when fills since launch have cost more than the rewards earned
 and more than $25; WATCH when a rung filled yesterday, a listed market rests
 nothing, or nothing is listed; KEEP otherwise.
+Then NEW FAR-DATED SERIES FOR YOU TO APPROVE (Jack 2026-11-08: "Add it"): the
+series outside the list where a 1-2c rung would pay, from the morning's
+cheap_scan.py --discover (run-logs/cheap-scan/discover.json); NEW until one
+email has shown it (the subject counts them). Approving is Jack's call.
 
 SOURCES, read-only: cheap_side_books.json, run-logs/cheap-scan/list_history.
 jsonl (every listing cheap_scan wrote), cycle_log_<UTC date>.csv, fills_<UTC
@@ -52,6 +56,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import imm_quote_gaps as _gaps  # noqa: F401,E402  (import side effects: env + alert creds)
 import incentive_mm as imm  # noqa: E402
+import cheap_scan as cs  # noqa: E402  (the new-series section)
 import kalshi_reads  # noqa: E402
 import send_lone_ref_monitor as slr  # noqa: E402  (low_priority)
 from incentive_mm import log  # noqa: E402
@@ -368,7 +373,19 @@ def build(day, now):
         if why:
             verdict = "WATCH"
     ends = sorted({str(e.get("stop"))[:10] for e in cur.values() if e.get("stop")})
-    return {"day": str(day), "lo": lo, "hi": hi_eff, "per": per, "pos": pos, "vals": vals,
+    disc = None
+    try:
+        with open(cs.DISCOVER_OUT, encoding="utf-8") as fh:
+            disc = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    try:
+        disc_lines, n_new = cs.render_discover(disc, now)
+    except Exception as e:  # noqa: BLE001  (the money part still goes out)
+        disc_lines, n_new, disc = ["", f"NEW FAR-DATED SERIES: discover.json unreadable ({e!r})."], 0, None
+    return {"disc_lines": disc_lines, "n_new": n_new,
+            "disc_series": [x["series"] for x in (disc or {}).get("candidates") or []],
+            "day": str(day), "lo": lo, "hi": hi_eff, "per": per, "pos": pos, "vals": vals,
             "day_rew": day_rew, "day_fill_cost": day_fill_cost, "day_fill_worth": day_fill_worth,
             "tot_rew": tot_rew, "tot_cost": tot_cost, "tot_worth": tot_worth, "net_all": net_all,
             "listed_now": len(cur), "resting_now": n_rest, "risk": risk, "ends": ends,
@@ -391,6 +408,7 @@ def render(c):
     ]
     if c["why"]:
         lines.append("Why " + c["verdict"] + ": " + "; ".join(c["why"]) + ".")
+    lines += c.get("disc_lines") or []
     lines += ["", "By market, yesterday (rewards, share of the day quoted, rung, fills; position since launch):"]
     for x in sorted(c["per"], key=lambda x: -x["usd"]):
         p = c["pos"].get(x["t"]) or {}
@@ -413,7 +431,8 @@ def subject(c):
     d = datetime.strptime(c["day"], "%Y-%m-%d")
     net = c["day_rew"] + c["day_fill_worth"] - c["day_fill_cost"]
     return (f"Cheap-side books {d:%m/%d}: {net:+.2f} (rewards ${c['day_rew']:.2f}, fills "
-            f"${c['day_fill_cost']:.2f}) -- {c['verdict']}")
+            f"${c['day_fill_cost']:.2f}) -- {c['verdict']}"
+            + (f" | {c['n_new']} new series to review" if c.get("n_new") else ""))
 
 
 def main(argv=None) -> int:
@@ -459,6 +478,7 @@ def main(argv=None) -> int:
     if not ok:
         return 1
     if not (args.test or args.day):
+        cs.mark_emailed(c.get("disc_series") or [], str(today_et))   # NEW only in one email
         try:
             with open(marker, "w") as fh:
                 fh.write(now.isoformat())
