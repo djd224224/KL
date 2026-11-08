@@ -10530,6 +10530,26 @@ PVD_OFF_USUAL_MIN_N = int(_env_float("IMM_PVD_OFF_USUAL_MIN_N", 4))
 PVD_OFF_USUAL_SAMPLE_S = _env_float("IMM_PVD_OFF_USUAL_SAMPLE_S", 900.0)
 PVD_OFF_USUAL_LOG_S = 600.0
 PVD_OFF_USUAL_COLD = os.environ.get("IMM_PVD_OFF_USUAL_COLD", "base").strip().lower() != "full"
+# CLOSE CLAMP (Jack 2026-11-08, on the side that reduces a position following a
+# bait at any price: "dont allow that"). The closing exemption (Jack 2026-11-04:
+# "Yes, exempt closing") let the reducing side rest past the listed limits, up to
+# the position, at whatever price the book's reference gave -- and 13 of the 14
+# biggest bait fills on the 11/07 House night landed on exactly that side: a sweep
+# of our capped 1-lot side (the probe) made a small position, a ~200-lot bait set
+# the reference, the closing rung followed it, the next tune re-anchored onto it and
+# flip-through made it full size (IL16-D bought 1,783 @33 at a 5c usual, AZ08-R sold
+# 1,819 @61 at a 91c usual, IN04-D 1,274 @40 at 3c). Now the reducing side never
+# rests more than PVD_OFF_USUAL_C (3c) past its 6 h usual price toward the taker --
+# a bid at most usual + 3, an ask at least usual - 3 -- and a rung past that is
+# RE-PRICED at the bound, so the unwind keeps working at a sane price. With no usual
+# price on that side (fewer than PVD_OFF_USUAL_MIN_N samples: a new listing, or a
+# restart after a long halt) there is no exemption past the limits at all. Replay on
+# every wave fill since 11/04: the defenses saved $4,271 of the $6,033 lost; with
+# the clamp $4,619, every reducing-side bait fill to 0. IMM_PVD_CLOSE_CLAMP: "on"
+# (default), "dry" (logged, nothing re-priced), "off" (the 11/04 exemption).
+PVD_CLOSE_CLAMP_MODE = os.environ.get("IMM_PVD_CLOSE_CLAMP", "on").strip().lower()
+if PVD_CLOSE_CLAMP_MODE not in ("on", "dry", "off"):
+    PVD_CLOSE_CLAMP_MODE = "on"
 # OFF-USUAL SIZE FOR BIG SIDES OFF THE LIST (Jack 2026-11-08: "Port for big
 # sides"). A 24-day replay of the rule on the book outside the waves (10/16-
 # 11/08, 8,096 fills): fills 10c+ off their usual price marked -4.0c a contract
@@ -10714,10 +10734,39 @@ def pvd_decided_side(last: Optional[float]) -> Optional[str]:
     return None
 
 
+def pvd_clamp_toward_taker(q: "Quote", usual: float, off_c: float) -> Optional["Quote"]:
+    """THE CLOSE CLAMP on one rung: a bid resting over `usual` + off_c, or an
+    ask under `usual` - off_c, re-priced AT that bound (rounded away from the
+    taker: a sub-penny rung on the 0.1c grid, a whole-cent one to the cent);
+    unchanged when it rests inside; None when the bound leaves 1-99c."""
+    px = float(q.price_exact if q.price_exact is not None else q.price_cents)
+    if q.book_side == "bid":
+        bound = float(usual) + float(off_c)
+        if px <= bound + 1e-9:
+            return q
+        new = (math.floor(bound * 10 + 1e-6) / 10.0 if q.price_exact is not None
+               else float(math.floor(bound + 1e-9)))
+    else:
+        bound = float(usual) - float(off_c)
+        if px >= bound - 1e-9:
+            return q
+        new = (math.ceil(bound * 10 - 1e-6) / 10.0 if q.price_exact is not None
+               else float(math.ceil(bound - 1e-9)))
+    if not 1 <= new <= 99:
+        return None
+    if q.price_exact is not None and abs(new - round(new)) > 1e-6:
+        bucket = math.floor(new) if q.book_side == "bid" else math.ceil(new)
+        return replace(q, price_cents=int(bucket), price_exact=round(new, 2))
+    return replace(q, price_cents=int(round(new)), price_exact=None)
+
+
 def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
                      last: Optional[float] = None,
                      close_side: Optional[str] = None,
-                     close_qty: float = 0.0) -> List["Quote"]:
+                     close_qty: float = 0.0,
+                     close_usual: Optional[float] = None,
+                     close_clamp: str = "off",
+                     off_c: Optional[float] = None) -> List["Quote"]:
     """A post-vote dead book's side guard: no pads; nothing outside
     PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
     bid_max, an ask only at or over ask_min (YES cents), each tightened to
@@ -10726,10 +10775,39 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     CLOSING EXEMPTION (Jack 2026-11-04: "Yes, exempt closing"): the side that
     reduces the bot's own position (`close_side`, 'bid' for a short) may rest
     inside the cushion -- the band still holds -- at no more than the
-    position (`close_qty`), so a fill can only flatten it, never flip it."""
+    position (`close_qty`), so a fill can only flatten it, never flip it.
+
+    CLOSE CLAMP (`close_clamp` "on", Jack 2026-11-08: "dont allow that" -- the
+    reducing side following a bait at any price): every rung of that side rests
+    no more than `off_c` (PVD_OFF_USUAL_C) past `close_usual`, its 6 h usual
+    price, toward the taker, re-priced at the bound (pvd_clamp_toward_taker);
+    with no usual price there is no exemption past the limits. "dry" changes
+    nothing here (the caller logs what it would do)."""
     bmax, amin = pvd_limits(entry, last)
     lo, hi = entry.get("pmin", PVD_PRICE_MIN), entry.get("pmax", PVD_PRICE_MAX)
     decided = pvd_decided_side(last)
+    exempt = True
+    if close_clamp == "on" and close_side is not None:
+        if close_usual is None:
+            exempt = False        # no usual price: the limits hold the reducing side too
+        else:
+            oc = PVD_OFF_USUAL_C if off_c is None else float(off_c)
+            clamped: List["Quote"] = []
+            for q in quotes:
+                if q.book_side == close_side and not q.is_pad:
+                    q = pvd_clamp_toward_taker(q, close_usual, oc)
+                    if q is None:
+                        continue
+                    for i, x in enumerate(clamped):      # two rungs clamped onto one price: one rung
+                        if (x.book_side, x.price_cents, x.price_exact, x.is_pad) == (
+                                q.book_side, q.price_cents, q.price_exact, q.is_pad):
+                            clamped[i] = replace(x, count=int(x.count) + int(q.count))
+                            q = None
+                            break
+                    if q is None:
+                        continue
+                clamped.append(q)
+            quotes = clamped
     out: List["Quote"] = []
     for q in quotes:
         if q.is_pad:
@@ -10754,7 +10832,8 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
         inside = (px <= bmax if q.book_side == "bid" else px >= amin)
         if inside:
             out.append(q)
-        elif close_side is not None and q.book_side == close_side                 and int(close_qty) >= 1:
+        elif exempt and close_side is not None and q.book_side == close_side \
+                and int(close_qty) >= 1:
             out.append(replace(q, count=int(min(q.count, int(close_qty)))))
     return out
 
@@ -13650,7 +13729,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN", "JOIN_WAIT_SUBPENNY",
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
-    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS",
+    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
     # toxic-flow side halt (2026-09-29)
@@ -25360,6 +25439,7 @@ class IncentiveMarketMaker:
         self._cheap_noted: Dict[str, tuple] = {}  # CHEAP-SIDE BOOK rung last logged
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
         self._pvd_close: Dict[str, Optional[tuple]] = {}  # closing-exemption rung last logged
+        self._pvd_clamp: Dict[str, Optional[tuple]] = {}  # CLOSE CLAMP: t -> (side, from, to) last logged
         # a flip-through entry's (bid, ask) rung as the quote loop sized it this
         # cycle (pvd_side_sizes on the position it judged) -- place_with_caps'
         # side cap reads it, so a 400 ask beside a long 200 isn't "blocked at 0/200"
@@ -34404,6 +34484,36 @@ class IncentiveMarketMaker:
             f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * int(info.get('px') or 0) / 100:.0f} "
             f"if it all fills (other side's best {info.get('limit')}c)")
 
+    def _pvd_clamp_note(self, t: str, quotes: list, side: str, usual, pos: float) -> None:
+        """Log the CLOSE CLAMP on a market when what it does there changes: the
+        reducing side's best rung, where it would rest, and the usual price."""
+        try:
+            rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
+            if not rungs:
+                self._pvd_clamp.pop(t, None)
+                return
+            px = lambda q: float(q.price_exact if q.price_exact is not None else q.price_cents)  # noqa: E731
+            best = max(rungs, key=px) if side == "bid" else min(rungs, key=px)
+            if usual is None:
+                key = (side, round(px(best), 2), None)
+                why = "no usual price yet: no closing exemption past the limits"
+            else:
+                c = pvd_clamp_toward_taker(best, usual, PVD_OFF_USUAL_C)
+                if c is not None and c is best:
+                    self._pvd_clamp.pop(t, None)
+                    return
+                to = None if c is None else round(px(c), 2)
+                key = (side, round(px(best), 2), to)
+                why = (f"usual {usual:g}c, so {'at most' if side == 'bid' else 'at least'} "
+                       f"{usual + PVD_OFF_USUAL_C if side == 'bid' else usual - PVD_OFF_USUAL_C:g}c"
+                       + (f" -> rests at {to:g}c" if to is not None else " -> out of 1-99c, not resting"))
+            if self._pvd_clamp.get(t) != key:
+                self._pvd_clamp[t] = key
+                log(f"{self.tag} close clamp{' (dry)' if PVD_CLOSE_CLAMP_MODE == 'dry' else ''} {t} "
+                    f"{side} {px(best):g}c to flatten {pos:+.0f}: {why}")
+        except Exception:  # noqa: BLE001 -- a log line never costs the cycle
+            pass
+
     def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple], big: bool = False) -> None:
         """Log a side's OFF-USUAL SIZE cut when it starts or changes (`big`: a
         big side off the list, OFF_USUAL_BIG_MODE)."""
@@ -38072,7 +38182,18 @@ class IncentiveMarketMaker:
                 # cushion, up to the position (the closing exemption)
                 _pv_close = "bid" if own_pos <= -1 else "ask" if own_pos >= 1 else None
                 _pv_pb, _pv_pa = pvd_limits(pvd, _pv_last)
-                mq = pvd_guard_quotes(mq, pvd, _pv_last, _pv_close, abs(own_pos))
+                # CLOSE CLAMP (PVD_CLOSE_CLAMP_MODE): the reducing side never
+                # more than PVD_OFF_USUAL_C past its 6 h usual price toward the taker
+                _pv_cu = None
+                if _pv_close is not None and PVD_CLOSE_CLAMP_MODE in ("on", "dry"):
+                    try:
+                        _cub, _cua = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
+                        _pv_cu = _cub if _pv_close == "bid" else _cua
+                    except Exception:   # no usual: no exemption past the limits
+                        _pv_cu = None
+                    self._pvd_clamp_note(t, mq, _pv_close, _pv_cu, own_pos)
+                mq = pvd_guard_quotes(mq, pvd, _pv_last, _pv_close, abs(own_pos),
+                                      close_usual=_pv_cu, close_clamp=PVD_CLOSE_CLAMP_MODE)
                 _pv_cl = next(((q.book_side, q.price_cents, q.count) for q in mq
                                if q.book_side == _pv_close and not q.is_pad and (
                                    q.price_cents > _pv_pb if q.book_side == "bid"
@@ -38284,9 +38405,23 @@ class IncentiveMarketMaker:
                             self._off_usual_noted.pop(t, None)
                     _tb = max((float(p) for p, q in yes_levels if float(q) > 0), default=None)
                     _tn = max((float(p) for p, q in no_levels if float(q) > 0), default=None)
+                    _ta = None if _tn is None else 100.0 - _tn
+                    # the EXTERNAL touch (2026-11-08, with the close clamp): our own
+                    # rung must not walk its own usual price toward a bait -- ours
+                    # only where nobody else quotes the side
+                    try:
+                        if meta.price_step < 0.01:
+                            _xb, _xa = external_touch_exact(
+                                *orderbook_exact_levels(ob),
+                                own_exact_by_ticker.get(t, []) if self.live else [])
+                        else:
+                            _xb, _xa = ext_bid, ext_ask
+                        _tb = _tb if _xb is None else float(_xb)
+                        _ta = _ta if _xa is None else float(_xa)
+                    except Exception:
+                        pass
                     self.state.pvd_usual[t] = pvd_usual_sample(
-                        self.state.pvd_usual.get(t), now_ts, _tb,
-                        None if _tn is None else 100.0 - _tn)
+                        self.state.pvd_usual.get(t), now_ts, _tb, _ta)
                 except Exception as e:      # never costs the cycle: sizes as built
                     if not getattr(self, "_off_usual_err_logged", False):
                         self._off_usual_err_logged = True
@@ -42064,6 +42199,13 @@ class IncentiveMarketMaker:
                f"{SUMMARY_HOUR_CT}am CT roll; the -${DAILY_LOSS_LIMIT:,.0f} loss halt "
                f"stays as the backstop" if NET_LOSS_LIMIT > 0
                else "off (IMM_NET_LOSS_LIMIT=0)"))
+        log(f"close clamp (2026-11-08): {PVD_CLOSE_CLAMP_MODE}"
+            + (f" -- the side that reduces a position on a listed market rests no more than "
+               f"{PVD_OFF_USUAL_C:g}c past its {PVD_OFF_USUAL_HOURS:g}h usual price toward the taker "
+               f"(a bid <= usual + {PVD_OFF_USUAL_C:g}, an ask >= usual - {PVD_OFF_USUAL_C:g}, re-priced "
+               f"at that bound); no usual price: no closing exemption past the limits"
+               + ("" if PVD_CLOSE_CLAMP_MODE == "on" else " (dry: logged, nothing re-priced)")
+               if PVD_CLOSE_CLAMP_MODE in ("on", "dry") else " (the 11/04 closing exemption as was)"))
         log(f"off-usual size (2026-11-08): {PVD_OFF_USUAL_MODE}"
             + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c nearer "
                f"the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "

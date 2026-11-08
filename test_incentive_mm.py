@@ -40747,6 +40747,56 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
                                 if o["ticker"] == self.T), [("ask", 51), ("bid", 49)])
 
+    def test_close_clamp_keeps_the_reducing_side_off_a_bait(self):
+        """Jack 2026-11-08, on the side that reduces a position following the bait
+        at any price: "dont allow that" -- it rests no more than 3c past its 6 h
+        usual price toward the taker, re-priced at the bound; no usual price, no
+        exemption past the limits; "off" is the 11/04 exemption as it was"""
+        Q = imm.Quote
+        e = {"bid_max": 8, "ask_min": 10, "follow_book": True}
+        # IL16-D: short 200 after the probe, the bait sets the bid reference at 33c
+        bait = [Q(self.T, "bid", 33, 1783)]
+        out = imm.pvd_guard_quotes(bait, e, None, "bid", 200.0, close_usual=5.0, close_clamp="on")
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 8, 1783)])
+        # 8c = usual 5 + 3 is inside the limit, so the whole flip-through side rests
+        # there; a tighter limit leaves the exemption at the bound, up to the position
+        out = imm.pvd_guard_quotes(bait, dict(e, bid_max=6), None, "bid", 200.0,
+                                   close_usual=5.0, close_clamp="on")
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 8, 200)])
+        # AZ08-R: long 300, the ask walked down to 61 under a 91c usual -> 88
+        ask = [Q(self.T, "ask", 61, 1819)]
+        out = imm.pvd_guard_quotes(ask, {"bid_max": 58, "ask_min": 64, "follow_book": True}, None, "ask",
+                                   300.0, close_usual=91.0, close_clamp="on")
+        self.assertEqual([(q.price_cents, q.count) for q in out], [(88, 1819)])
+        # no usual price: no exemption past the limits (the 33c bid is over 8)
+        self.assertEqual(imm.pvd_guard_quotes(bait[:1], e, None, "bid", 200.0, close_usual=None,
+                                              close_clamp="on"), [])
+        # "off" / "dry": the 11/04 exemption, the bait price and all
+        for mode in ("off", "dry"):
+            out = imm.pvd_guard_quotes(bait[:1], e, None, "bid", 200.0, close_usual=5.0, close_clamp=mode)
+            self.assertEqual([(q.price_cents, q.count) for q in out], [(33, 200)], mode)
+        # a sub-penny rung moves on the 0.1c grid, rounded away from the taker
+        sp = [Q(self.T, "bid", 33, 100, price_exact=32.7)]
+        out = imm.pvd_guard_quotes(sp, {"bid_max": 99, "ask_min": 99, "follow_book": True}, None, "bid",
+                                   100.0, close_usual=4.35, close_clamp="on")
+        self.assertEqual([(q.price_cents, q.price_exact) for q in out], [(7, 7.3)])
+        # the side that ADDS is not this rule's (off-usual size and the join wait hold it)
+        out = imm.pvd_guard_quotes([Q(self.T, "ask", 4, 300)], {"bid_max": 1, "ask_min": 4,
+                                   "follow_book": True}, None, "bid", 200.0, close_usual=5.0, close_clamp="on")
+        self.assertEqual([(q.book_side, q.price_cents) for q in out], [("ask", 4)])
+        # end to end: short 40 at limits that block the 49c closing bid, usual 40/44
+        # -> the bid rests at 43, not at the 49 reference
+        self._write({self.T: {"bid_max": 40, "ask_min": 60, "cushion": 0}})
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), 40.0, 44.0] for i in range(8)]
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, 51.0
+        bot.client.positions[self.T] = -40.0
+        bot.run_cycle()
+        self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
+                          for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
+                         [("bid", 43, 40.0)])
+
     def test_closing_side_rests_inside_the_cushion_up_to_the_position(self):
         """Jack 2026-11-04 "Yes, exempt closing": the side that reduces the
         bot's own position may rest inside the cushion (never outside 3-97c),
@@ -40765,8 +40815,11 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         out = imm.pvd_guard_quotes([Q(self.T, "bid", 30, 120)], e, None, "bid", 70.0)
         self.assertEqual(out[0].count, 120)
         # end to end: short 40 at the 40 cap, limits that block the 49c bid
+        # (the close clamp, 11/08, needs a usual price: here the book's own 49x51)
         self._write({self.T: {"bid_max": 40, "ask_min": 60, "cushion": 0}})
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), 49.0, 51.0] for i in range(8)]
         bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, 51.0
         bot.client.positions[self.T] = -40.0
         bot.run_cycle()
