@@ -39735,6 +39735,32 @@ class TestJoinWait1102(unittest.TestCase):
             # the ask side never moved
             self.assertIn(("ask", 69, 5000), self._paris_rungs(bot, P))
 
+    def test_subpenny_books_wait_too(self):
+        """Jack 2026-11-08: "Add bait defense" -- eight 0.1c-step KXHOUSERACE
+        books jumped far off fair 11/07-11/08 and picked us off while the wait
+        ran on penny books only. The Paris bait on a 0.1c-step market now holds
+        the bid at 41c; IMM_JOIN_WAIT_SUBPENNY=off restores the old skip (the
+        bid joins 55c at once, which also proves the market reads as sub-penny)."""
+        for sub, want in ((True, ("bid", 41, 4000)), (False, ("bid", 55, 4000))):
+            lines = []
+            client, P = self._paris_bot(lines)
+            client.markets[P]["price_ranges"] = [
+                {"start": "0.0000", "end": "1.0000", "step": "0.0010"}]
+            with contextlib.ExitStack() as stack:
+                for p in self._patches(lines) + [
+                        mock.patch.object(imm, "JOIN_WAIT_SUBPENNY", sub)]:
+                    stack.enter_context(p)
+                bot = IncentiveMarketMaker(client=client, live=False)
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+                self.assertIn(("bid", 40, 5000), self._paris_rungs(bot, P))
+                client.books[P]["orderbook_fp"]["yes_dollars"] = self.book + [["0.5500", "10456.00"]]
+                bot.run_cycle()
+            self.assertIn(want, self._paris_rungs(bot, P), (sub, [s for s in lines if "join wait" in s]))
+            self.assertEqual(any("join wait" in s and "wants 55c, rests 41c" in s for s in lines), sub)
+
     def test_dry_logs_the_wait_and_rests_where_it_wants(self):
         lines = []
         client, P = self._paris_bot(lines)

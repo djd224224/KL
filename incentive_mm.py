@@ -13093,7 +13093,7 @@ _CONFIG_CODE_KNOBS = (
     "BAIT_STOP_MODE", "BAIT_STOP_SKIP", "BAIT_TAPE_DELAY_SECS", "BAIT_TAPE_MAX_TRIES",
     # join wait (2026-11-02)
     "JOIN_WAIT_MODE", "JOIN_WAIT_SECS_PER_DOLLAR", "JOIN_WAIT_FREE_DOLLARS",
-    "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN",
+    "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN", "JOIN_WAIT_SUBPENNY",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -22179,8 +22179,17 @@ def et_day_end_ts(ts: float) -> float:
 # A side's clocks live JOIN_WAIT_MEMORY_MIN minutes after it last wanted a
 # price (a re-entry after a 10-min breaker hold still waits) and across
 # restarts (state.join_wait); a side with no clocks starts from its resting
-# rung, so a restart mid-bait does not join the bait either. Penny books
-# only (sub-penny books skip it, as they do join-ahead). The room it prices
+# rung, so a restart mid-bait does not join the bait either. SUB-PENNY
+# BOOKS TOO since 2026-11-08 (Jack: "Add bait defense"; JOIN_WAIT_SUBPENNY,
+# IMM_JOIN_WAIT_SUBPENNY=off restores the old penny-books-only skip): 23:19Z
+# 11/07 - 02:08Z 11/08 eight 0.1c-step KXHOUSERACE books jumped far off fair
+# for 5-15 min (IN04-D, a 3c long shot, to 40x80; IL06-D, a ~95c favorite,
+# to 23x66), the wave's re-anchor put full size on the jumped touch, and it
+# was hit (~$2.9k at the next morning's marks) -- the wait never looked,
+# since it ran on penny books only. It works in whole cents there as well:
+# the held rung's cent is snapped inside that cent afterwards (subpenny_snap),
+# so it rests at most the cent's fraction nearer than the wait allows.
+# The room it prices
 # is the unheld reference's (the deep-reference size), so a held rung never
 # grows. IMM_JOIN_WAIT: "on" (default), "dry" (computed and logged, nothing
 # held), "off".
@@ -22189,6 +22198,8 @@ JOIN_WAIT_SECS_PER_DOLLAR = _env_float("IMM_JOIN_WAIT_SECS_PER_DOLLAR", 2.0)
 JOIN_WAIT_FREE_DOLLARS = _env_float("IMM_JOIN_WAIT_FREE_DOLLARS", 50.0)
 JOIN_WAIT_ANCHOR_MIN = _env_float("IMM_JOIN_WAIT_ANCHOR_MIN", 30.0)
 JOIN_WAIT_MEMORY_MIN = _env_float("IMM_JOIN_WAIT_MEMORY_MIN", 60.0)
+JOIN_WAIT_SUBPENNY = os.environ.get("IMM_JOIN_WAIT_SUBPENNY", "on").strip().lower() not in (
+    "off", "0", "false", "no")
 
 
 def join_wait_needed_secs(size: float, cents_over_anchor: float) -> float:
@@ -37011,7 +37022,7 @@ class IncentiveMarketMaker:
             # and FAIR CLOSE (they keep their own prices). The room stays the
             # unheld reference's, so a held rung never grows.
             if (JOIN_WAIT_MODE in ("on", "dry") and LADDER_MODE == "atref"
-                    and meta.price_step >= 0.01):
+                    and (meta.price_step >= 0.01 or JOIN_WAIT_SUBPENNY)):
                 pl_bid_px, pl_ask_px = self._join_wait(
                     t, pl_bid_px, pl_ask_px, room_buy if lv_bid else 0.0,
                     room_sell if lv_ask else 0.0, own, now_ts)
@@ -41048,7 +41059,9 @@ class IncentiveMarketMaker:
                f"cents over the side's lowest price in the last "
                f"{JOIN_WAIT_ANCHOR_MIN:g} min), the first ${JOIN_WAIT_FREE_DOLLARS:g} "
                f"free, no cap; a worse price at once; clocks kept "
-               f"{JOIN_WAIT_MEMORY_MIN:g} min and across restarts"
+               f"{JOIN_WAIT_MEMORY_MIN:g} min and across restarts; "
+               + ("penny and sub-penny books (2026-11-08)" if JOIN_WAIT_SUBPENNY
+                  else "penny books only (IMM_JOIN_WAIT_SUBPENNY=off)")
                + ("" if JOIN_WAIT_MODE == "on" else " (dry: logged, nothing held)")
                if _jw_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _jw_live else ""))
