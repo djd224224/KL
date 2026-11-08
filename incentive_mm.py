@@ -10231,6 +10231,24 @@ def load_pvd_markets() -> int:
             asize = max(1, int(raw.get("ask_size") or size))
         except (TypeError, ValueError):
             bsize = asize = size
+        # ...and a side sized 0 is OFF (PVD_ZERO_OFF): it rests nothing but the
+        # order that closes the position (pvd_side_sizes). A 0 given -- not a
+        # missing size -- sets that side's own size to the 1 floor for the
+        # position limit; `or size` alone read it as the market's full size
+        off = []
+        for _k, _s in (("bid_size", "bid"), ("ask_size", "ask")):
+            _v = raw.get(_k)
+            try:
+                _zero = _v is not None and _v != "" and int(_v) <= 0
+            except (TypeError, ValueError):
+                _zero = False
+            if _zero:
+                if _s == "bid":
+                    bsize = 1
+                else:
+                    asize = 1
+                if PVD_ZERO_OFF:
+                    off.append(_s)
         try:
             max_pos = float(raw.get("max_position") or PVD_MAX_POSITION * max(size, bsize, asize) / PVD_SIZE)
         except (TypeError, ValueError):
@@ -10254,6 +10272,8 @@ def load_pvd_markets() -> int:
         fresh[t] = {"stop": stop, "bid_max": bid_max, "ask_min": ask_min,
                     "size": size, "max_pos": max_pos, "kind": kind,
                     "bsize": bsize, "asize": asize,
+                    # "off": the sides sized 0 (PVD_ZERO_OFF)
+                    "off": tuple(off),
                     "cushion": max(0, cushion), "pmin": pmin, "pmax": pmax,
                     # "no_losing_side": once decided, the losing side rests
                     # nothing but a closing rung (Jack 2026-11-05: "Stop on the 21")
@@ -10315,6 +10335,13 @@ def load_pvd_markets() -> int:
             f"a side: {by_size or '-'} (cap = size, default {PVD_SIZE} / "
             f"{PVD_MAX_POSITION:g})"
             + (f", stop {stops[0].isoformat()}" if stops else ""))
+        n_off = sum(len(e.get("off") or ()) for e in fresh.values())
+        if n_off or _pvd_state.get("n_off"):
+            log(f"[IMM] post-vote dead books: {n_off} side(s) OFF (sized 0: "
+                f"{sum(1 for e in fresh.values() if 'bid' in (e.get('off') or ()))} bid / "
+                f"{sum(1 for e in fresh.values() if 'ask' in (e.get('off') or ()))} ask) -- "
+                f"each rests only the order that closes a position")
+        _pvd_state["n_off"] = n_off
         ch = [e for e in fresh.values() if e.get("cheap")]
         if ch or cheap:
             log(f"[IMM] cheap-side books ({CHEAP_MODE}): {len(ch)} market(s), "
@@ -10344,6 +10371,26 @@ PVD_CUSHION_LIVE = _env_int("IMM_PVD_CUSHION_LIVE", 5)
 PVD_LAST: Dict[str, float] = {}
 
 
+# OFF MEANS ZERO (Jack 2026-11-08: "why even have a probe? i wanted to stop
+# quoting those markets and the probe was the way to do it", then "Yes, build
+# it"). A listed market's side sized 0 ("bid_size": 0 / "ask_size": 0 -- the
+# tune's --side-cap SERIES:C:0 and its twin block) is OFF: it rests nothing but
+# the order that closes the bot's position, at most that position, so one fill
+# takes it flat and never past (flip-through never applies to it). Before, a 0
+# read as the market's full size (`"bid_size" or size`), so "turn off quoting
+# 90c+" (11/07) was built as a 1-lot, and that 1-lot was the PROBE the bait
+# sweeps took: of the 90 wave fills of 5 contracts or fewer 11/04-11/08, 75 were
+# 90c+ 1-lots and 3 more twin-block 1-lots, each leaving the 1-contract position
+# whose reducing side then followed the bait (IL06-D: a 95.9c 1-lot bid filled at
+# 00:04Z 11/08, and 18 min later 1,360 sold at 67c on a ~94c market, -$366). A
+# 1-lot earns next to nothing: a snapshot pays only with both sides of the book
+# at the program's target (usually 1,000). Sized from the live position each
+# cycle (pvd_side_sizes), so a closing order that fills takes its side dark at
+# once, not at the next tune run. IMM_PVD_ZERO_OFF=0 rests a 0 at 1 (the old
+# 1-lot) -- never at the full size.
+PVD_ZERO_OFF = os.environ.get("IMM_PVD_ZERO_OFF", "1") != "0"
+
+
 def pvd_side_sizes(entry: dict, pos: float) -> Tuple[int, int]:
     """(bid, ask) rung a post-vote dead book rests at position `pos`: its
     bid_size / ask_size -- and with "flip_through" (entry["flip"]) the side
@@ -10359,7 +10406,10 @@ def pvd_side_sizes(entry: dict, pos: float) -> Tuple[int, int]:
     KXJEFFRIESFIRST-27FEB01-AL1 long 450 at 200 a side: "try to fully offset the
     exposure, so quote 450"): the reducing side rests max(its size, the
     position) instead -- 450 while long 450, so one fill takes it flat and no
-    further; its size again once the position is under it."""
+    further; its size again once the position is under it.
+
+    An OFF side (entry "off": sized 0, PVD_ZERO_OFF) rests the position when it
+    reduces it -- to flat, never past -- else 0 (dark)."""
     b = int(entry.get("bsize", entry["size"]))
     a = int(entry.get("asize", entry["size"]))
     if entry.get("flip") and abs(pos) >= 1:
@@ -10372,6 +10422,12 @@ def pvd_side_sizes(entry: dict, pos: float) -> Tuple[int, int]:
             a += int(pos)
         else:
             b += int(-pos)
+    # OFF MEANS ZERO: an off side rests the position it closes, else nothing
+    off = entry.get("off") or ()
+    if "bid" in off:
+        b = int(-pos) if pos <= -1 else 0
+    if "ask" in off:
+        a = int(pos) if pos >= 1 else 0
     return b, a
 
 
@@ -10835,6 +10891,41 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
         elif exempt and close_side is not None and q.book_side == close_side \
                 and int(close_qty) >= 1:
             out.append(replace(q, count=int(min(q.count, int(close_qty)))))
+    # OFF MEANS ZERO (PVD_ZERO_OFF): an off side keeps only its closing rungs,
+    # best price first, the position in all (the sizing already holds it there)
+    off = entry.get("off") or ()
+    if off:
+        out = pvd_keep_off_closing(out, off, close_side, close_qty)
+    return out
+
+
+def pvd_keep_off_closing(quotes: List["Quote"], off, close_side: Optional[str],
+                         close_qty: float) -> List["Quote"]:
+    """The rungs of an OFF side (PVD_ZERO_OFF) that close the position: none
+    unless that side is `close_side`, and then the best-priced rungs first, up
+    to `close_qty` contracts in all; every other rung as it was."""
+    left = int(close_qty) if close_side is not None and close_side in off else 0
+    keep: Dict[int, int] = {}
+    if left >= 1:
+        rungs = [q for q in quotes if q.book_side == close_side and not q.is_pad]
+        rungs.sort(key=lambda q: float(q.price_exact if q.price_exact is not None else q.price_cents),
+                   reverse=(close_side == "bid"))
+        for q in rungs:
+            if left < 1:
+                break
+            n = int(min(int(q.count), left))
+            if n >= 1:
+                keep[id(q)] = n
+                left -= n
+    out: List["Quote"] = []
+    for q in quotes:
+        if q.book_side in off:
+            n = keep.get(id(q), 0)
+            if n < 1:
+                continue
+            if n != int(q.count):
+                q = replace(q, count=n)
+        out.append(q)
     return out
 
 # DATA CENTER archetype (see DATACENTER_ALLOW): the open-scan guard set
@@ -13752,7 +13843,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN", "JOIN_WAIT_SUBPENNY",
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
-    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE",
+    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
     # toxic-flow side halt (2026-09-29)
@@ -37843,10 +37934,11 @@ class IncentiveMarketMaker:
             # lean or long-shot cut); a side a guard above emptied stays dark
             if pvd is not None:
                 _pv_b, _pv_a = pvd_side_sizes(pvd, ens_cap_pos(meta.series, coexist, own_pos, pos))
-                if pvd.get("flip"):
+                if pvd.get("flip") or pvd.get("off"):
                     self._pvd_side_n[t] = (_pv_b, _pv_a)
-                lv_bid = [(0, _pv_b)] if lv_bid else []
-                lv_ask = [(0, _pv_a)] if lv_ask else []
+                # (an OFF side with no position to close sizes 0: it stays dark)
+                lv_bid = [(0, _pv_b)] if lv_bid and _pv_b >= 1 else []
+                lv_ask = [(0, _pv_a)] if lv_ask and _pv_a >= 1 else []
             side_max_bid = int(round(sum(s for _t, s in lv_bid) *
                                      capped_ref_mult(ext_bid, ref_bid_px, "bid",
                                                      hour_mult=hm,
@@ -37942,8 +38034,12 @@ class IncentiveMarketMaker:
                     side_max_bid = _pv_b if lv_bid else 0
                     side_max_ask = _pv_a if lv_ask else 0
                 else:
-                    side_max_bid = min(side_max_bid, pvd.get("bsize", pvd["size"]))
-                    side_max_ask = min(side_max_ask, pvd.get("asize", pvd["size"]))
+                    # (an OFF side: the position it closes -- pvd_side_sizes)
+                    _pv_off = pvd.get("off") or ()
+                    side_max_bid = min(side_max_bid, _pv_b if "bid" in _pv_off
+                                       else pvd.get("bsize", pvd["size"]))
+                    side_max_ask = min(side_max_ask, _pv_a if "ask" in _pv_off
+                                       else pvd.get("asize", pvd["size"]))
             room_buy = min(pos_room_buy, share_buy, side_max_bid)
             room_sell = min(pos_room_sell, share_sell, side_max_ask)
             fam_m = applied_mention_mult(meta.series)
@@ -39626,7 +39722,8 @@ class IncentiveMarketMaker:
                 side_cap = max_level_size = float(_pvq.get(
                     "bsize" if q.book_side == "bid" else "asize", _pvq["size"]))
                 # ...or, flip-through, the size + position the quote loop rested
-                _pvn = self._pvd_side_n.get(q.ticker) if _pvq.get("flip") else None
+                # (and on an OFF side the position it closes, never the 1 floor)
+                _pvn = self._pvd_side_n.get(q.ticker) if (_pvq.get("flip") or _pvq.get("off")) else None
                 if _pvn is not None:
                     side_cap = max_level_size = float(_pvn[0] if q.book_side == "bid" else _pvn[1])
             # UNWIND ONLY: the reducing side rests the whole position as one
@@ -42255,6 +42352,10 @@ class IncentiveMarketMaker:
                f"at that bound); no usual price: no closing exemption past the limits"
                + ("" if PVD_CLOSE_CLAMP_MODE == "on" else " (dry: logged, nothing re-priced)")
                if PVD_CLOSE_CLAMP_MODE in ("on", "dry") else " (the 11/04 closing exemption as was)"))
+        log(f"zero-size sides (2026-11-08): {'off' if PVD_ZERO_OFF else 'the old 1-lot'} -- a listed "
+            f"side sized 0 (the tune's 90c+ side cap and twin block) "
+            + ("rests nothing but the order that closes a position, at most the position"
+               if PVD_ZERO_OFF else "rests 1 contract (IMM_PVD_ZERO_OFF=0), never the full size"))
         log(f"off-usual size (2026-11-08): {PVD_OFF_USUAL_MODE}"
             + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c nearer "
                f"the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "

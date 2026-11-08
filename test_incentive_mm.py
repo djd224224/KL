@@ -40827,6 +40827,63 @@ class TestPostVoteDeadBooks(unittest.TestCase):
                           for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
                          [("bid", 49, 40.0)])
 
+    def test_a_side_sized_zero_rests_nothing_but_its_close(self):
+        """Jack 2026-11-08: "why even have a probe? i wanted to stop quoting
+        those markets and the probe was the way to do it", then "Yes, build it"
+        -- a listed side sized 0 is OFF: nothing rests there but the order that
+        closes the bot's position, at most the position (flip-through never
+        adds); before, `or size` read a 0 as the market's full size, so "off"
+        was a 1-lot -- the probe the bait sweeps took"""
+        self.assertTrue(imm.PVD_ZERO_OFF)
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200, "bid_size": 0},
+                     self.T2: {"bid_max": 49, "ask_min": 51, "size": 200, "ask_size": "0"}})
+        e, e2 = imm.pvd_entry(self.T), imm.pvd_entry(self.T2)
+        self.assertEqual((e["off"], e["bsize"], e["asize"]), (("bid",), 1, 200))
+        self.assertEqual((e2["off"], e2["bsize"], e2["asize"]), (("ask",), 200, 1))
+        # a missing size is not a 0: the market's size, nothing off
+        self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
+        self.assertEqual((imm.pvd_entry(self.T)["off"], imm.pvd_entry(self.T)["bsize"]), ((), 200))
+        # live sizes: the position it closes, else dark; flip-through never adds to it
+        self.assertEqual(imm.pvd_side_sizes(e, 0.0), (0, 200))
+        self.assertEqual(imm.pvd_side_sizes(e, -70.0), (70, 200))
+        self.assertEqual(imm.pvd_side_sizes(e, 70.0), (0, 200))
+        self.assertEqual(imm.pvd_side_sizes(dict(e, flip=True), -70.0), (70, 200))
+        self.assertEqual(imm.pvd_side_sizes(dict(e, flip=True), 70.0), (0, 270))
+        # the guard keeps an off side's closing rungs only: best price first, the position in all
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 47, 50), Q(self.T, "bid", 48, 50), Q(self.T, "ask", 51, 200)]
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in imm.pvd_guard_quotes(qs, e)],
+                         [("ask", 51, 200)])
+        out = imm.pvd_guard_quotes(qs, e, None, "bid", 70.0)
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out],
+                         [("bid", 47, 20), ("bid", 48, 50), ("ask", 51, 200)])
+        self.assertEqual(imm.pvd_keep_off_closing(qs, ("bid",), "ask", 70.0), [qs[2]])
+
+    def test_a_side_sized_zero_end_to_end(self):
+        """...through the cycle: flat, the off bid never rests (it was a 1-lot);
+        short 70, it buys exactly the 70 back, flip-through too; long, still no
+        bid; IMM_PVD_ZERO_OFF=0 rests the old 1-lot -- never the full 200"""
+        def orders(markets, pos):
+            _clean_persist()            # each case a fresh bot
+            self._write(markets)
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if pos:
+                bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, 50.0
+                bot.client.positions[self.T] = pos
+            bot.run_cycle()
+            return sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T)
+
+        def bids(markets, pos):
+            return [x for x in orders(markets, pos) if x[0] == "bid"]
+        off = {self.T: {"bid_max": 49, "ask_min": 51, "size": 200, "bid_size": 0}}
+        self.assertEqual(orders(off, 0.0), [("ask", 200.0)])
+        self.assertEqual(bids(off, -70.0), [("bid", 70.0)])
+        self.assertEqual(bids(off, 70.0), [])
+        self.assertEqual(bids({self.T: dict(off[self.T], flip_through=True)}, -70.0), [("bid", 70.0)])
+        with mock.patch.object(imm, "PVD_ZERO_OFF", False):
+            self.assertEqual(orders(off, 0.0), [("ask", 200.0), ("bid", 1.0)])
+
     def test_listed_event_takes_the_pvd_event_cap(self):
         """Jack 2026-11-07: "cap at 3k contracts per event", then "remove event
         cap" -- an event with a live list entry takes PVD_EVENT_CAP (no cap by
