@@ -5550,15 +5550,94 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
 )
 
 
+# COMPANY KPIs OFF (Jack 2026-11-08: "turn off company KPIs from quoting in
+# IMM", after KXCCLA-28JANALBD -- Kalshi's "Carnival Cruise KPI" -- bought
+# 580 @ 8c at 06:55Z and marked ~3c). Every series Kalshi tags "KPIs" in its
+# Financials, Companies or Economics categories is frozen like a
+# SERIES_BLOCKLIST_PREFIXES entry: no new orders, resting quotes cancelled
+# next cycle, NOT reduce-only, positions ride to settlement (62 KPI positions
+# at the change). That is the Fiscal.ai company-KPI class (KX<stock> /
+# KX<stock>A: deliveries, subscribers, headcount, cards, clicks ...) plus
+# Netflix / Spotify / NYT subscribers, Tesla deliveries, the Costco hot dog
+# -- 324 series in the 11/07 catalog, the three the 10/03 cut un-blocked
+# (KXHOOD/KXHOODA, KXFSLR, KXCOINBASE) included.
+# Membership = the snapshot below OR the dashboard's series_meta.json tags
+# (dash_cache, re-read every 10 min), so a new company's KPI series is caught
+# once the dashboard's cache knows it, and the block holds with no cache.
+# NOT included: KPI-tagged AI leaderboards (LLM1, TOPLLM, OAIAGI, Science and
+# Technology), KXEVSHARE (Climate and Weather), and the Carbon Arc alt-data
+# families (foot traffic, point of sale, app downloads, ad spend), which
+# Kalshi does not tag KPIs. IMM_COMPANY_KPI_BLOCK=0 turns the block off.
+COMPANY_KPI_BLOCK = os.environ.get("IMM_COMPANY_KPI_BLOCK", "1").strip().lower() \
+    not in ("0", "off", "false", "no")
+COMPANY_KPI_CATEGORIES = frozenset({"Financials", "Companies", "Economics"})
+_COMPANY_KPI_SNAPSHOT = frozenset("""
+    CBVOLUME FBDAU GOOGLESHARE KXAAL KXAALA KXAAPLA KXABNB KXABNBA KXAC KXACA
+    KXAFRM KXAFRMA KXALK KXALKA KXAMZN KXAMZNA KXATZ KXATZA KXAXP KXAXPA KXBA KXBAA
+    KXBBY KXBBYA KXBCE KXBCEA KXBOEING KXBROS KXBROSA KXBTSG KXBTSGA KXBULL KXBULLA
+    KXCAKE KXCAKEA KXCART KXCARTA KXCAVA KXCAVAA KXCBVOLUME KXCCL KXCCLA KXCDE
+    KXCDEA KXCHWY KXCHWYA KXCHYM KXCHYMA KXCMG KXCMGA KXCOINA KXCOINBASE
+    KXCOMPANYACTIONWAYMO KXCOST KXCOSTCOA KXCOSTCOHOTDOG KXCOSTCOMEMBER KXCRWV
+    KXCRWVA KXCTCA KXCTCQ KXCVNA KXCVNAA KXDASH KXDASHA KXDASHORDERS KXDAVE KXDAVEA
+    KXDDOG KXDDOGA KXDG KXDGA KXDIS KXDISA KXDISNEYSUBS KXDKNG KXDKNGA KXDKNGMUP
+    KXDKS KXDKSA KXDOL KXDOLA KXDPZ KXDPZA KXDUOL KXDUOLA KXEBAY KXEBAYA KXETOR
+    KXETORA KXETSY KXETSYA KXEVLV KXEVLVA KXF KXFA KXFBDAU KXFDX KXFIG KXFIGA
+    KXFIGMAA KXFSLR KXFSLRA KXFUTU KXFUTUA KXGOOG KXGOOGA KXGOOGLESHARE KXGRAB
+    KXGRABA KXGRND KXGRNDA KXGTLB KXGTLBA KXHD KXHDA KXHIMS KXHIMSA KXHLT KXHOOD
+    KXHOODA KXINTC KXINTCA KXIOT KXIOTA KXJBLU KXJBLUA KXKLAR KXKLARA KXKLARNAA
+    KXKR KXKRA KXKVYO KXKVYOA KXLIF KXLIFA KXLMND KXLMNDA KXLMT KXLMTA KXLOB KXLOBA
+    KXLOW KXLOWA KXLULU KXLULUA KXLUV KXLUVA KXLYFT KXLYFTA KXMAR KXMARA
+    KXMATCHPAYERS KXMCD KXMCDA KXMDT KXMDTA KXMELI KXMELIA KXMETA KXMETAA KXMETADAP
+    KXMETAHEADCOUNT KXMNDY KXMNDYA KXMNST KXMNSTA KXMO KXMOA KXMTCH KXMTCHA KXMTN
+    KXNCLH KXNCLHA KXNET KXNETA KXNETFLIXSUBS KXNFLXA KXNIO KXNIOA KXNP KXNPA
+    KXNTRA KXNTRAA KXNU KXNUA KXNVDAA KXNYT KXNYTSUBS KXOKTA KXOKTAA KXORCLA
+    KXPALANTIR KXPATH KXPATHA KXPAY KXPAYA KXPBR KXPBRA KXPLANETFITNESSSUBS KXPLNT
+    KXPLTR KXPLTRA KXPM KXPMA KXPSKY KXRACE KXRACEA KXRBLX KXRBLXA KXRDDT KXRDDTA
+    KXRELY KXRELYA KXRHGOLD KXRIVN KXRIVNA KXRKLB KXRKLBA KXROKU KXSBUX KXSBUXA
+    KXSCHW KXSCHWA KXSE KXSEA KXSEZL KXSEZLA KXSG KXSGA KXSHOP KXSHOPA KXSNAP
+    KXSNAPA KXSNOWA KXSNOWFLAKE KXSOFI KXSOFIA KXSOFIMEMBERS KXSPCX KXSPCXA KXSPOT
+    KXSPOTA KXSPOTIFYMAU KXSPOTIFYSUBS KXSTUB KXSTUBA KXSTZ KXSTZA KXT KXTA
+    KXTARGETA KXTESLA KXTESLADELIVERYBY KXTESLAENERGYBY KXTESLAPROD KXTESLASEMI
+    KXTGT KXTGTA KXTLN KXTLNA KXTOL KXTOLA KXTOLLA KXTOPLLM KXTOST KXTOSTA KXTSLA
+    KXTSLAA KXTSM KXTTAN KXTTANA KXUAL KXUALA KXUBER KXUBERA KXUBERKPI KXUBERTRIPS
+    KXUBERTRIPSA KXULCC KXULCCA KXULTA KXULTAA KXURBN KXURBNA KXV KXVG KXVGA KXVSXY
+    KXVSXYA KXVZ KXVZA KXWALMARTA KXWEBULLA KXWEN KXWENA KXWH KXWHA KXWING KXWINGA
+    KXWK KXWKA KXWMT KXWMTA KXWSM KXWSMA KXYOU KXYOUA KXYUM KXYUMA KXZETA KXZETAA
+    KXZM KXZMA KXZS KXZSA METADAP NETFLIXSUBS NYTSUBS RHGOLD SOFIMEMBERS
+    SPOTIFYSUBS TESLA TESLAPROD
+""".split())
+_company_kpi_tagged = {"at": 0.0, "set": frozenset()}
+
+
+def company_kpi_tagged() -> frozenset:
+    """Series the dashboard's Kalshi cache tags "KPIs" in a company category,
+    re-read at most every 10 minutes (empty when the cache is missing)."""
+    now = time.time()
+    if now - _company_kpi_tagged["at"] > 600:
+        ser = dash_cache("series_meta.json").get("series") or {}
+        _company_kpi_tagged["set"] = frozenset(
+            s for s, m in ser.items()
+            if "KPIs" in (m.get("t") or ()) and m.get("c") in COMPANY_KPI_CATEGORIES)
+        _company_kpi_tagged["at"] = now
+    return _company_kpi_tagged["set"]
+
+
+def company_kpi_series(series: str) -> bool:
+    """A company-KPI series, frozen by COMPANY_KPI_BLOCK."""
+    return COMPANY_KPI_BLOCK and (series in _COMPANY_KPI_SNAPSHOT
+                                  or series in company_kpi_tagged())
+
+
 def series_blocklisted(series: str) -> bool:
     """A bare SERIES name under SERIES_BLOCKLIST_PREFIXES: a prefix entry, or
     an exact-series entry ("<series>-", the cuts above), which a bare name
     cannot startswith. The enrollment paths check names, not tickers, and
     missed those: the family watch re-enrolled KXLOLTEEMO every 30 min after
     its 2026-11-01 cut, emailing each time. An event-ticker entry
-    ("KXMLBPLAYOFFS-26") still leaves its series name alone."""
-    return any(series.startswith(p) or p == f"{series}-"
-               for p in SERIES_BLOCKLIST_PREFIXES)
+    ("KXMLBPLAYOFFS-26") still leaves its series name alone. A company-KPI
+    series (COMPANY_KPI_BLOCK, 2026-11-08) counts too."""
+    return company_kpi_series(series) or any(
+        series.startswith(p) or p == f"{series}-" for p in SERIES_BLOCKLIST_PREFIXES)
 
 # WIND-DOWN EXEMPTION for a blocklisted series (Jack 2026-09-11, KXTRUEV):
 # event tickers that keep quoting to their own completion even though their
@@ -30556,7 +30635,8 @@ class IncentiveMarketMaker:
         astest = astest_gas_series(series_of(ticker)) or astest_pick_gas_ticker(ticker)
         if any(ticker.startswith(p) for p in prefixes) \
                 or (series_pattern_blocked(series_of(ticker)) and not astest) \
-                or event_pattern_blocked(ticker):
+                or event_pattern_blocked(ticker) \
+                or company_kpi_series(series_of(ticker)):
             # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
             # exception to a prefix block. Accept the market ticker or the
             # event ticker itself: the freeze paths pass markets, the
@@ -41618,6 +41698,11 @@ class IncentiveMarketMaker:
                + ("" if JOIN_WAIT_MODE == "on" else " (dry: logged, nothing held)")
                if _jw_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _jw_live else ""))
+        log("company KPIs (2026-11-08): "
+            + (f"OFF -- every series Kalshi tags KPIs in {', '.join(sorted(COMPANY_KPI_CATEGORIES))} "
+               f"is frozen ({len(_COMPANY_KPI_SNAPSHOT)} in the snapshot, "
+               f"{len(company_kpi_tagged())} tagged in the dashboard cache); positions ride"
+               if COMPANY_KPI_BLOCK else "quotable (IMM_COMPANY_KPI_BLOCK=0)"))
         log("net halt (2026-11-08): "
             + (f"on -- P&L today + est rewards today (the lower of raw and paid basis) "
                f"at or below -${NET_LOSS_LIMIT:,.0f} cancels everything until the "

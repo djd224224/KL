@@ -3263,6 +3263,9 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(a("KXHYPEMINY-HYPE-26DEC31"))
         self.assertFalse(a("KXZECMAXY-ZEC-26DEC31"))
 
+    # these series are company KPIs, frozen since 2026-11-08 (COMPANY_KPI_BLOCK);
+    # the test exercises the older rule underneath, so the block stands aside
+    @mock.patch.object(imm, "COMPANY_KPI_BLOCK", False)
     def test_company_metric_series(self):
         # 2026-08-02 RE-ENTRY (Jack): company family quotes again (freeze
         # default emptied) behind the $2/day rate floor + safe-join rule.
@@ -4598,6 +4601,9 @@ class TestOverrideBuffer(unittest.TestCase):
     before the event (Jack: all orders expire 10 min before the release), vs
     the 30-min game buffer; and orders are expiration-capped at that cutoff."""
 
+    # these series are company KPIs, frozen since 2026-11-08 (COMPANY_KPI_BLOCK);
+    # the test exercises the older rule underneath, so the block stands aside
+    @mock.patch.object(imm, "COMPANY_KPI_BLOCK", False)
     def test_disclosure_release_cutoff_and_order_expiry(self):
         _clean_persist()
         now = datetime.now(timezone.utc)
@@ -5036,6 +5042,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         import imm_earnings_overrides as ieo
         return ieo.classify_series(series, sample)
 
+    # these series are company KPIs, frozen since 2026-11-08 (COMPANY_KPI_BLOCK);
+    # the test exercises the older rule underneath, so the block stands aside
+    @mock.patch.object(imm, "COMPANY_KPI_BLOCK", False)
     def test_classifier(self):
         self.assertEqual(self._classify("KXTVMENTION", "KXTVMENTION-26AUG01-FOO")[0],
                          "enroll")
@@ -5373,6 +5382,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         self.assertIsNone(ov.levels)
         self.assertIsNone(ov.max_position)
 
+    # these series are company KPIs, frozen since 2026-11-08 (COMPANY_KPI_BLOCK);
+    # the test exercises the older rule underneath, so the block stands aside
+    @mock.patch.object(imm, "COMPANY_KPI_BLOCK", False)
     def test_company_headcount_events_are_blocked(self):
         # Jack 2026-09-24: "blocklist ... company headcount markets". The
         # Fiscal.ai KPI class names the metric in the EVENT segment
@@ -5768,6 +5780,9 @@ class TestSeriesAutoEnroll(unittest.TestCase):
                                                  members=quoting - {f"{ev}-T200"}),
                              set())
 
+    # these series are company KPIs, frozen since 2026-11-08 (COMPANY_KPI_BLOCK);
+    # the test exercises the older rule underneath, so the block stands aside
+    @mock.patch.object(imm, "COMPANY_KPI_BLOCK", False)
     def test_finecon_sweep_enrollment_and_guards(self):
         # Jack 2026-09-02: Finance/Economics sweep — the risk-screened
         # survivors are allowed, guarded (safe-join, no rate bar), and the
@@ -8931,6 +8946,44 @@ class TestLossHalt(unittest.TestCase):
             self.assertNotIn("net today", imm.risk_line(None, -1500.0, None, net=(-1450.0, 50.0)))
         finally:
             imm.NET_LOSS_LIMIT = saved
+
+
+class TestCompanyKpiOff(unittest.TestCase):
+    """Jack 2026-11-08: "turn off company KPIs from quoting in IMM"."""
+
+    def test_kpi_series_are_frozen_and_others_stay(self):
+        blocked = imm.IncentiveMarketMaker._blocked
+        for t in ("KXCCLA-28JANALBD-97500000.0", "KXHOODA-27FEBGOLDSUBS-5200000.0",
+                  "KXFSLR-27JULMWSOLD-2800", "KXCOINBASE-26DEC-X", "NETFLIXSUBS-26Q4-300",
+                  "KXCOSTCOHOTDOG-26-150"):
+            self.assertTrue(blocked(t), t)
+        self.assertTrue(imm.series_blocklisted("KXCCLA"))
+        # not company KPIs: AI leaderboards, EV share, Carbon Arc foot traffic
+        for s in ("LLM1", "TOPLLM", "KXEVSHARE", "KXBKFT", "KXMOUNTAINDEWPOS", "KXHEADLINE"):
+            self.assertFalse(imm.company_kpi_series(s), s)
+        saved = imm.COMPANY_KPI_BLOCK
+        try:
+            imm.COMPANY_KPI_BLOCK = False
+            self.assertFalse(imm.company_kpi_series("KXCCLA"))
+        finally:
+            imm.COMPANY_KPI_BLOCK = saved
+
+    def test_a_new_kpi_series_is_caught_by_its_kalshi_tag(self):
+        d = os.path.join(imm.STATUS_DIR, "dashboard", "cache")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "series_meta.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"series": {"KXNEWCOA": {"c": "Companies", "t": ["KPIs"]},
+                                  "KXNEWAI": {"c": "Science and Technology", "t": ["AI", "KPIs"]}}}, f)
+        imm._company_kpi_tagged["at"] = 0.0
+        try:
+            self.assertTrue(imm.company_kpi_series("KXNEWCOA"))
+            self.assertTrue(imm.IncentiveMarketMaker._blocked("KXNEWCOA-27JAN-5"))
+            self.assertFalse(imm.company_kpi_series("KXNEWAI"))
+        finally:
+            os.remove(p)
+            imm._company_kpi_tagged["at"] = 0.0
+            imm._company_kpi_tagged["set"] = frozenset()
 
 
 class TestMtmAndSettlement(unittest.TestCase):
