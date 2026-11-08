@@ -18,20 +18,22 @@ THE EXPERIMENT
   other makers' do not). A trial in which one of OUR other bots touched the
   market is kept out of the score: the question is about OTHER makers.
 
-  Randomized pairs. Two wide books from different events and the same stratum
-  ("active": traded in the last 24 h; "quiet": not) start together. A coin
-  flip makes one the PROBE and the other the CONTROL, and both take the same
-  side (bid or ask, another coin flip). The pair is the unit the report
-  compares, so whatever moves both markets at that moment cancels out.
+  Probes. One market per event at a time, drawn from two strata ("active":
+  traded in the last 24 h; "quiet": not), side (bid or ask) by a coin flip.
+  NO CONTROL TWIN (Jack 2026-11-08: "dont need a twin", "if something moves
+  to join, can attribute it to the probe"): our price sits inside a 10c+ gap
+  where nobody rests, so a maker joining or stepping ahead of it is a
+  reaction to it. The 11/08 dry run backs that: with no order, 0 of 24 books
+  got anyone at the mid within 10 min. The report shows the dry runs' rate
+  beside the live one as the no-order baseline.
 
   Theoretical price: the mid of the LIVE WebSocket book at placement, rounded
   toward our side: a bid at floor(mid), an ask at ceil(mid). That is the best
   price a maker can rest at without paying over the mid. FPROBE_EDGE_C backs
-  it off by that many cents. The PROBE rests 1 contract there, post-only, for
-  FPROBE_HOLD_S (600 s), then cancels. The CONTROL computes the same price and
-  places nothing. Neither reacts to what others do: the probe rests its whole
-  hold and can be filled. It is a real order, never pulled because someone
-  followed it.
+  it off by that many cents. The probe rests 1 contract there, post-only, for
+  FPROBE_HOLD_S (600 s), then cancels. It never reacts to what others do: it
+  rests its whole hold and can be filled. It is a real order, never pulled
+  because someone followed it.
 
   A trial: subscribe -> pre (FPROBE_PRE_S, 60 s of baseline) -> t0: price
   and place -> hold -> t1: cancel -> post (FPROBE_POST_S, 300 s: does the
@@ -56,13 +58,10 @@ FPROBE_DEBOUNCE_S (1 s), and it is timed from when it began:
   present_t1  a follower is still at/over our price when we cancel
   gone_s    after our cancel, seconds until that follower left (post phase)
   revert    how far others' best fell back toward its t0 level after cancel
-The CONTROL gets the same numbers against the price we WOULD have placed.
-The effect of our order is probe minus control, pair by pair (report: 90%
-bootstrap over pairs).
+The report gives each rate with a 90% bootstrap interval over probes.
 
-DRY BY DEFAULT. Without --live nothing is placed in either arm, so a dry run
-is an A/A test: its probe-minus-control difference should be ~0, which checks
-the measurement before any money is involved.
+DRY BY DEFAULT. Without --live nothing is placed: a dry run measures the
+same numbers against the price we WOULD have placed -- the no-order baseline.
 
 LIVE needs --live --subaccount N, a numbered Kalshi subaccount that holds
 nothing else (Jack creates and funds it: kalshi_subaccount.py; --setup prints
@@ -76,7 +75,7 @@ $40 of positions at cost. A filled contract is held to settlement.
 HALT file (run-logs/follow-probe/HALT): the bot cancels its orders, ends its
 trials and idles while it exists.
 
-    python follow_probe.py                      # dry run (A/A), until Ctrl-C
+    python follow_probe.py                      # dry run (no-order baseline), until Ctrl-C
     python follow_probe.py --until 2026-11-09T02:00Z
     python follow_probe.py --scan               # one universe scan (read-only)
     python follow_probe.py --report [--since 2026-11-08] [--until ...]
@@ -102,7 +101,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-VERSION = "1"
+VERSION = "2"                             # 2: no control twin (v1 rows carry "pair")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("FPROBE_DATA", os.path.join(HERE, "run-logs", "follow-probe"))
 # orders and subaccount reads: Kalshi's production host (nfl_snipe_bot's finding)
@@ -134,17 +133,17 @@ class Config:
     post_s: float = 300.0
     debounce_s: float = 1.0          # an event counts once it stood this long
     book_wait_s: float = 60.0        # a book that never arrives: abandon
-    max_pairs: int = 6               # pairs running at once
-    max_probes_day: int = 150        # pairs started per UTC day (both modes)
+    max_open: int = 6                # probes running at once
+    max_probes_day: int = 150        # probes started per UTC day (both modes)
     max_fills_day: int = 60          # live: contracts filled per UTC day
     max_held_cost: float = 40.0      # live: $ of positions at cost
     min_cash: float = 5.0            # live: the subaccount's cash floor
     market_cooldown_h: float = 24.0  # a market is used once per this
     event_gap_min: float = 30.0      # an event rests this long between trials
     min_close_h: float = 3.0         # the market must close this far out
-    active_share: float = 0.5        # pairs drawn from the "active" stratum
+    active_share: float = 0.5        # probes drawn from the "active" stratum
     scan_every_s: float = 600.0
-    scan_max_age_s: float = 1800.0   # no new pairs on an older scan
+    scan_max_age_s: float = 1800.0   # no new probes on an older scan
     imm_exclude: str = "event"       # event | market (primary resting orders)
     max_unavail_frac: float = 0.1    # report: book unreadable this share of hold
     ws_stale_s: float = 30.0
@@ -385,11 +384,11 @@ def build_scan(progs: List[dict], markets: List[dict], primary_orders: List[dict
                       excl_markets=excl_markets, stats=stats)
 
 
-def pick_pairs(cands: List[Cand], n: int, busy_events: Set[str], cooled: Set[str],
-               gap_events: Set[str], cfg: Config, rng: random.Random
-               ) -> List[Tuple[Cand, Cand, str, str]]:
-    """Up to n (probe, control, side, stratum): one market per event, two
-    events of one stratum per pair, the arms and the side by coin flips."""
+def pick_probes(cands: List[Cand], n: int, busy_events: Set[str], cooled: Set[str],
+                gap_events: Set[str], cfg: Config, rng: random.Random
+                ) -> List[Tuple[Cand, str, str]]:
+    """Up to n (market, side, stratum): one market per event, the stratum
+    by active_share, the side by a coin flip."""
     pool: Dict[str, List[Cand]] = {}
     for c in cands:
         if c.event in busy_events or c.event in gap_events or c.ticker in cooled:
@@ -399,19 +398,17 @@ def pick_pairs(cands: List[Cand], n: int, busy_events: Set[str], cooled: Set[str
     for ev in sorted(pool):
         c = rng.choice(sorted(pool[ev], key=lambda k: k.ticker))
         strata[c.stratum].append(c)
-    out: List[Tuple[Cand, Cand, str, str]] = []
+    out: List[Tuple[Cand, str, str]] = []
     for _ in range(max(0, int(n))):
         want = "active" if rng.random() < cfg.active_share else "quiet"
         s = next((s for s in (want, "quiet" if want == "active" else "active")
-                  if len(strata[s]) >= 2), None)
+                  if strata[s]), None)
         if s is None:
             break
         lst = strata[s]
-        a = lst.pop(rng.randrange(len(lst)))
-        b = lst.pop(rng.randrange(len(lst)))
-        probe, control = (a, b) if rng.random() < 0.5 else (b, a)
+        c = lst.pop(rng.randrange(len(lst)))
         side = cfg.side if cfg.side != "random" else ("bid" if rng.random() < 0.5 else "ask")
-        out.append((probe, control, side, s))
+        out.append((c, side, s))
     return out
 
 
@@ -441,13 +438,12 @@ HOLD_EVENTS = ("join", "improve", "follow", "step", "opp_step")
 
 
 class Trial:
-    """One market's run: sub -> pre -> hold -> post -> done (or abandoned).
-    The probe arm rests 1 contract at x during hold (live); the control arm
-    only measures against x."""
+    """One probe: sub -> pre -> hold -> post -> done (or abandoned). Live, it
+    rests 1 contract at x during hold; dry, it only measures against x."""
 
-    def __init__(self, tid: str, pair_id: str, arm: str, cand: Cand, side: str,
-                 stratum: str, now: float, cfg: Config, live: bool):
-        self.tid, self.pair_id, self.arm, self.c = tid, pair_id, arm, cand
+    def __init__(self, tid: str, cand: Cand, side: str, stratum: str, now: float,
+                 cfg: Config, live: bool):
+        self.tid, self.c = tid, cand
         self.side, self.stratum, self.cfg, self.live = side, stratum, cfg, live
         self.phase = "sub"
         self.t_sub = now
@@ -625,8 +621,8 @@ class Trial:
             revert = round((self.t1_best - self.post_best_end) / (self.t1_best - self.b0), 3)
         hold = self.cfg.hold_s
         return {
-            "v": VERSION, "run": run_id, "mode": mode, "tid": self.tid, "pair": self.pair_id,
-            "arm": self.arm, "status": "done" if self.phase == "done" else "abandoned",
+            "v": VERSION, "run": run_id, "mode": mode, "tid": self.tid, "arm": "probe",
+            "status": "done" if self.phase == "done" else "abandoned",
             "reason": self.reason, "ticker": self.ticker, "event": self.c.event,
             "series": self.c.series, "side": self.side, "stratum": self.stratum,
             "scan": self.c.brief(),
@@ -1007,7 +1003,6 @@ class Bot:
         self.cooled: Dict[str, float] = {}           # ticker -> until
         self.event_free: Dict[str, float] = {}       # event -> free from
         self.seq = 0
-        self.pair_seq = 0
         self.day = utc_day()
         self.counts = self._zero_counts()
         self.cash: Optional[float] = None
@@ -1026,8 +1021,8 @@ class Bot:
 
     @staticmethod
     def _zero_counts() -> Dict[str, Any]:
-        return {"pairs": 0, "placed": 0, "fills": 0.0, "done": 0, "abandoned": 0,
-                "followed_probe": 0, "followed_control": 0}
+        return {"probes": 0, "placed": 0, "fills": 0.0, "done": 0, "abandoned": 0,
+                "followed": 0, "joined": 0}
 
     # -- helpers --
     def _roll_day(self, now: float) -> None:
@@ -1048,14 +1043,14 @@ class Bot:
     def _sync_markets(self) -> None:
         self.feed.set_markets({t.ticker for t in self.trials.values() if t.active})
 
-    def active_pairs(self) -> int:
-        return len({t.pair_id for t in self.trials.values() if t.active})
+    def open_count(self) -> int:
+        return sum(1 for t in self.trials.values() if t.active)
 
-    # -- starting pairs --
+    # -- starting probes --
     def caps_block(self) -> Optional[str]:
         c = self.cfg
-        if self.counts["pairs"] >= c.max_probes_day:
-            return f"{c.max_probes_day} pairs today"
+        if self.counts["probes"] >= c.max_probes_day:
+            return f"{c.max_probes_day} probes today"
         if self.live:
             if self.counts["fills"] >= c.max_fills_day:
                 return f"{c.max_fills_day} contracts filled today"
@@ -1065,58 +1060,53 @@ class Bot:
                 return f"cash ${self.cash:.2f} under ${c.min_cash:.2f}"
         return None
 
-    def start_pairs(self, now: float, scan: Optional[ScanResult]) -> int:
+    def start_probes(self, now: float, scan: Optional[ScanResult]) -> int:
         if self.halted or scan is None or now - scan.ts > self.cfg.scan_max_age_s:
             return 0
-        n = self.cfg.max_pairs - self.active_pairs()
+        n = self.cfg.max_open - self.open_count()
         if n <= 0:
             return 0
         why = self.caps_block()
         if why:
             if now - self._last_cap_log > 3600:
                 self._last_cap_log = now
-                self.log(f"no new pairs: {why}")
+                self.log(f"no new probes: {why}")
             return 0
-        n = min(n, self.cfg.max_probes_day - self.counts["pairs"])
+        n = min(n, self.cfg.max_probes_day - self.counts["probes"])
         busy = {t.c.event for t in self.trials.values() if t.active}
         cooled = {k for k, v in self.cooled.items() if v > now}
         gap = {k for k, v in self.event_free.items() if v > now}
         started = 0
-        for probe, control, side, stratum in pick_pairs(scan.cands, n, busy, cooled, gap,
-                                                        self.cfg, self.rng):
-            if not self._primary_clear(probe, control):
+        for cand, side, stratum in pick_probes(scan.cands, n, busy, cooled, gap,
+                                               self.cfg, self.rng):
+            if not self._primary_clear(cand):
                 continue
-            self.pair_seq += 1
-            pid = f"{self.run_id}-p{self.pair_seq}"
-            for arm, cand in (("probe", probe), ("control", control)):
-                self.seq += 1
-                tr = Trial(f"{self.run_id}-{self.seq}", pid, arm, cand, side, stratum,
-                           now, self.cfg, self.live)
-                self.trials[tr.tid] = tr
-                self.by_ticker[cand.ticker] = tr
-                self.cooled[cand.ticker] = now + self.cfg.market_cooldown_h * 3600
-            self.counts["pairs"] += 1
+            self.seq += 1
+            tr = Trial(f"{self.run_id}-{self.seq}", cand, side, stratum, now, self.cfg,
+                       self.live)
+            self.trials[tr.tid] = tr
+            self.by_ticker[cand.ticker] = tr
+            self.cooled[cand.ticker] = now + self.cfg.market_cooldown_h * 3600
+            self.counts["probes"] += 1
             started += 1
-            self.log(f"pair {pid} ({stratum}, {side}): probe {probe.ticker} "
-                     f"{probe.bid_c:g}/{probe.ask_c:g} | control {control.ticker} "
-                     f"{control.bid_c:g}/{control.ask_c:g}")
+            self.log(f"probe {tr.tid} ({stratum}, {side}): {cand.ticker} "
+                     f"{cand.bid_c:g}/{cand.ask_c:g}")
         if started:
             self._sync_markets()
         return started
 
-    def _primary_clear(self, *cands: Cand) -> bool:
-        """No primary-account order rests on these markets right now (the
+    def _primary_clear(self, c: Cand) -> bool:
+        """No primary-account order rests on this market right now (the
         scan's read can be up to scan_every_s old)."""
-        for c in cands:
-            try:
-                rows = self.ex.primary_resting(c.ticker)
-            except Exception as e:                              # noqa: BLE001
-                self.log(f"! primary orders read failed on {c.ticker}: {err_text(e)}; skipped")
-                return False
-            if rows:
-                self.log(f"skip {c.ticker}: the primary account rests {len(rows)} order(s) there")
-                self.cooled[c.ticker] = time.time() + self.cfg.market_cooldown_h * 3600
-                return False
+        try:
+            rows = self.ex.primary_resting(c.ticker)
+        except Exception as e:                                  # noqa: BLE001
+            self.log(f"! primary orders read failed on {c.ticker}: {err_text(e)}; skipped")
+            return False
+        if rows:
+            self.log(f"skip {c.ticker}: the primary account rests {len(rows)} order(s) there")
+            self.cooled[c.ticker] = time.time() + self.cfg.market_cooldown_h * 3600
+            return False
         return True
 
     # -- events --
@@ -1210,11 +1200,11 @@ class Bot:
         if x is None:
             return self.abandon(tr, now, "no_price_t0")
         tr.start_hold(now, own, opp, x)
-        if tr.arm == "probe" and self.live:
+        if self.live:
             if not self._place(tr, now):
                 return
         tr.observe(now, lv, self._timeline)
-        self.log(f"t0 {tr.arm} {tr.ticker} {tr.side}: book {b:g}/{opp:g} (own space) -> "
+        self.log(f"t0 {tr.ticker} {tr.side}: book {b:g}/{opp:g} (own space) -> "
                  f"{'PLACED' if tr.placed else 'would rest'} 1 @ {x:g} "
                  f"(YES {yes_price_c(tr.side, x):g}c)")
 
@@ -1260,7 +1250,7 @@ class Bot:
 
     def begin_post(self, tr: Trial, now: float) -> None:
         tr.start_post(now)
-        if tr.arm == "probe" and tr.placed and tr.our_rem > EPS:
+        if tr.placed and tr.our_rem > EPS:
             self._cancel(tr, now)
         lv = self._levels(tr.ticker)
         if lv is not None:
@@ -1289,8 +1279,10 @@ class Bot:
         self.counts["done"] += 1
         f = row["ev"].get("follow")
         if f is not None:
-            self.counts[f"followed_{tr.arm}"] += 1
-        self.log(f"done {tr.arm} {tr.ticker}: follow {f if f is not None else '-'}s "
+            self.counts["followed"] += 1
+        if row["ev"].get("join") is not None:
+            self.counts["joined"] += 1
+        self.log(f"done {tr.ticker}: follow {f if f is not None else '-'}s "
                  f"join {row['ev'].get('join', '-')} improve {row['ev'].get('improve', '-')} "
                  f"step {row['ev'].get('step', '-')} gap {row['gap_closed']} "
                  f"t1 size {row['t1_size']:g} gone {row['gone_s']} "
@@ -1304,7 +1296,7 @@ class Bot:
         self._close(tr, now)
         self.log.row("trials", tr.row(self.mode, self.run_id))
         self.counts["abandoned"] += 1
-        self.log(f"abandoned {tr.arm} {tr.ticker}: {reason}")
+        self.log(f"abandoned {tr.ticker}: {reason}")
 
     def _close(self, tr: Trial, now: float) -> None:
         self.event_free[tr.c.event] = now + self.cfg.event_gap_min * 60
@@ -1402,7 +1394,7 @@ class Bot:
               "caps": {"max_probes_day": self.cfg.max_probes_day,
                        "max_fills_day": self.cfg.max_fills_day,
                        "max_held_cost": self.cfg.max_held_cost},
-              "active": [{"tid": t.tid, "pair": t.pair_id, "arm": t.arm, "ticker": t.ticker,
+              "active": [{"tid": t.tid, "ticker": t.ticker,
                           "side": t.side, "phase": t.phase, "x": t.x,
                           "follow": t.ev.get("follow"), "placed": t.placed}
                          for t in self.trials.values()],
@@ -1440,7 +1432,7 @@ class Bot:
         scan = self.scanner.latest() if self.scanner else None
         if now - self._last_start >= 5.0:
             self._last_start = now
-            self.start_pairs(now, scan)
+            self.start_probes(now, scan)
         if now - self._last_status >= 30.0:
             self._last_status = now
             try:
@@ -1450,9 +1442,10 @@ class Bot:
 
     def run(self, until: Optional[float] = None) -> int:
         self.log(f"follow probe v{VERSION} run {self.run_id}: {self.mode}"
-                 f"{' subaccount ' + str(self.ex.sub) if self.live else ' (A/A: nothing placed)'}"
+                 f"{' subaccount ' + str(self.ex.sub) if self.live else ' (nothing placed: the no-order baseline)'}"
                  f"; hold {self.cfg.hold_s:g}s pre {self.cfg.pre_s:g}s post {self.cfg.post_s:g}s"
-                 f", {self.cfg.max_pairs} pairs at once, spread >= {self.cfg.min_spread_c:g}c")
+                 f", {self.cfg.max_open} probes at once, spread {self.cfg.min_spread_c:g}c"
+                 f" to {self.cfg.max_spread_c:g}c")
         try:
             while until is None or time.time() < until:
                 ev = getattr(self.feed, "event_flag", None)
@@ -1589,16 +1582,16 @@ def usable(r: dict, max_unavail: float = 0.1) -> bool:
         return False
     if (r.get("unavail_frac") or 0.0) > max_unavail:
         return False
-    if r.get("arm") == "probe" and r.get("mode") == "live" and not r.get("placed"):
+    if r.get("mode") == "live" and not r.get("placed"):
         return False
     return True
 
 
 METRICS: List[Tuple[str, str]] = [
-    ("follow", "someone else at our price or better"),
-    ("follow60", "...within 60 s"),
     ("join", "joined AT our price"),
     ("improve", "stepped AHEAD of us"),
+    ("follow", "either: someone else at our price or better"),
+    ("follow60", "...within 60 s"),
     ("step", "others' best moved up at all"),
     ("opp_step", "the other side came in"),
     ("present_t1", "a follower still there at our cancel"),
@@ -1616,28 +1609,15 @@ def metric(r: dict, k: str) -> Optional[float]:
     return 1.0 if ev.get(k) is not None else 0.0
 
 
-def pairs_of(rows: List[dict], max_unavail: float = 0.1) -> List[Tuple[dict, dict]]:
-    by: Dict[str, Dict[str, dict]] = {}
-    for r in rows:
-        if usable(r, max_unavail):
-            by.setdefault(r["pair"], {})[r["arm"]] = r
-    return [(d["probe"], d["control"]) for _, d in sorted(by.items())
-            if "probe" in d and "control" in d]
+def mean(xs: List[Optional[float]]) -> Optional[float]:
+    vals = [x for x in xs if x is not None]
+    return sum(vals) / len(vals) if vals else None
 
 
-def mean(xs: List[float]) -> Optional[float]:
-    xs = [x for x in xs if x is not None]
-    return sum(xs) / len(xs) if xs else None
-
-
-def boot_diff(pairs: List[Tuple[dict, dict]], k: str, n: int = 2000,
+def boot_rate(rows: List[dict], k: str, n: int = 2000,
               seed: int = 7) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """probe - control mean over pairs, with a 90% bootstrap interval."""
-    d = []
-    for p, c in pairs:
-        a, b = metric(p, k), metric(c, k)
-        if a is not None and b is not None:
-            d.append(a - b)
+    """The mean of metric k over rows, with a 90% bootstrap interval."""
+    d = [v for v in (metric(r, k) for r in rows) if v is not None]
     if not d:
         return None, None, None
     rng = random.Random(seed)
@@ -1646,11 +1626,11 @@ def boot_diff(pairs: List[Tuple[dict, dict]], k: str, n: int = 2000,
     return sum(d) / m, boots[int(0.05 * (n - 1))], boots[int(0.95 * (n - 1))]
 
 
-def quantiles(xs: List[float], qs=(0.25, 0.5, 0.75)) -> List[Optional[float]]:
-    xs = sorted(x for x in xs if x is not None)
-    if not xs:
+def quantiles(xs: List[Optional[float]], qs=(0.25, 0.5, 0.75)) -> List[Optional[float]]:
+    vals = sorted(x for x in xs if x is not None)
+    if not vals:
         return [None for _ in qs]
-    return [xs[int(q * (len(xs) - 1))] for q in qs]
+    return [vals[int(q * (len(vals) - 1))] for q in qs]
 
 
 def _pct(v: Optional[float]) -> str:
@@ -1661,25 +1641,30 @@ def _num(v: Optional[float], fmt: str = "{:.0f}") -> str:
     return "-" if v is None else fmt.format(v)
 
 
+def _count(rows: List[dict], k: str) -> int:
+    return sum(1 for r in rows if metric(r, k))
+
+
+def _of(rows: List[dict], k: str) -> str:
+    return f"{_count(rows, k)} of {len(rows)} ({_pct(mean([metric(r, k) for r in rows]))})"
+
+
 def render_report(rows: List[dict], max_unavail: float = 0.1, title: str = "") -> str:
-    modes = sorted({r.get("mode") for r in rows if r.get("mode")})
+    live = [r for r in rows if r.get("mode") == "live" and usable(r, max_unavail)]
+    base = [r for r in rows if r.get("mode") == "dry" and usable(r, max_unavail)]
     done = [r for r in rows if r.get("status") == "done"]
     aband = [r for r in rows if r.get("status") == "abandoned"]
-    use = [r for r in rows if usable(r, max_unavail)]
-    pairs = pairs_of(rows, max_unavail)
     own_key = [r for r in done if r.get("own_key_deltas")]
-    lines = [f"# Follow probe report{(' -- ' + title) if title else ''}", ""]
-    if modes == ["dry"]:
-        lines += ["**Dry run = A/A test: nothing was placed in either arm.** The probe-minus-"
-                  "control difference should be near 0; anything else is measurement bias.", ""]
-    lines += [f"Trials: {len(rows)} ({len(done)} done, {len(aband)} abandoned); usable "
-              f"{len(use)}; complete pairs {len(pairs)}. Modes: {', '.join(modes) or '-'}.", ""]
+    lines = [f"# Follow probe report{(' -- ' + title) if title else ''}", "",
+             f"Trials: {len(rows)} ({len(done)} done, {len(aband)} abandoned). Usable: "
+             f"{len(live)} live probes, {len(base)} dry (nothing placed: the no-order "
+             f"baseline).", ""]
     if aband:
         rs: Dict[str, int] = {}
         for r in aband:
             rs[str(r.get("reason"))] = rs.get(str(r.get("reason")), 0) + 1
-        lines += ["Abandoned: " + ", ".join(f"{k} {v}" for k, v in sorted(rs.items(),
-                                                                         key=lambda kv: -kv[1])), ""]
+        lines += ["Abandoned: " + ", ".join(f"{k} {v}" for k, v in
+                                           sorted(rs.items(), key=lambda kv: -kv[1])), ""]
     if own_key:
         pre: Dict[str, int] = {}
         for r in own_key:
@@ -1687,72 +1672,65 @@ def render_report(rows: List[dict], max_unavail: float = 0.1, title: str = "") -
                 pre[p] = pre.get(p, 0) + 1
         lines += [f"Left out because one of OUR bots touched the market: {len(own_key)} "
                   f"({', '.join(f'{k} {v}' for k, v in sorted(pre.items()))}).", ""]
-    if not pairs:
-        lines += ["No complete pairs yet."]
-        return "\n".join(lines) + "\n"
-    lines += ["## Probe vs control (paired)", "",
-              "| Metric | Probe | Control | Probe - control (90% CI) |",
-              "|---|---|---|---|"]
+    lines += ["## Did other makers follow?", "",
+              "| Metric | Live probes | 90% CI | No-order baseline (dry) |", "|---|---|---|---|"]
     for k, label in METRICS:
-        p = mean([metric(a, k) for a, _ in pairs])
-        c = mean([metric(b, k) for _, b in pairs])
-        d, lo, hi = boot_diff(pairs, k)
-        lines.append(f"| {label} | {_pct(p)} | {_pct(c)} | {_pct(d)} ({_pct(lo)} .. {_pct(hi)}) |")
-    gp = mean([a.get("gap_closed") for a, _ in pairs])
-    gc = mean([b.get("gap_closed") for _, b in pairs])
-    lines += ["", f"Mean share of the gap to our price that others' best closed: probe "
-              f"{_num(gp, '{:.2f}')}, control {_num(gc, '{:.2f}')}.", ""]
-    pf = [a["ev"]["follow"] for a, _ in pairs if (a.get("ev") or {}).get("follow") is not None]
-    cf = [b["ev"]["follow"] for _, b in pairs if (b.get("ev") or {}).get("follow") is not None]
-    q1 = quantiles(pf)
-    q2 = quantiles(cf)
-    lines += ["## When followers came", "",
-              f"Seconds after t0 to the first follow (25th / median / 75th): probe "
-              f"{' / '.join(_num(v) for v in q1)} (n={len(pf)}), control "
-              f"{' / '.join(_num(v) for v in q2)} (n={len(cf)}).", ""]
-    stay = [a for a, _ in pairs if (a.get("t1_size") or 0.0) > EPS]
-    gone = [a for a in stay if a.get("gone_s") is not None]
-    rv = [a.get("revert") for a in stay if a.get("revert") is not None]
+        v, lo, hi = boot_rate(live, k)
+        lines.append(f"| {label} | {_of(live, k) if live else '-'} | {_pct(lo)} .. {_pct(hi)} | "
+                     f"{_of(base, k) if base else '-'} |")
+    lines += ["", f"Mean share of the gap to our price that others' best closed: live "
+              f"{_num(mean([r.get('gap_closed') for r in live]), '{:.2f}')}, baseline "
+              f"{_num(mean([r.get('gap_closed') for r in base]), '{:.2f}')}.", ""]
+    if not live:
+        lines += ["No live probes yet."]
+        return "\n".join(lines) + "\n"
+    fol = [r for r in live if (r.get("ev") or {}).get("follow") is not None]
+    ahead = [r.get("improve_by_max") for r in fol if r.get("improve_by_max")]
+    lines += ["## The followers", "",
+              f"Seconds after we placed to the first follow (25th / median / 75th): "
+              f"{' / '.join(_num(v) for v in quantiles([r['ev']['follow'] for r in fol]))} "
+              f"(n={len(fol)}). Largest size at or over our price: median "
+              f"{_num(quantiles([r.get('follow_size_max') for r in fol])[1], '{:g}')} contracts. "
+              f"Stepped ahead by: median {_num(quantiles(ahead)[1], '{:g}')}c.", ""]
+    stay = [r for r in live if (r.get("t1_size") or 0.0) > EPS]
     if stay:
-        lines += [f"After our cancel: of {len(stay)} probes with a follower still there, "
-                  f"{len(gone)} saw it leave within {stay[0].get('post_s', 0):g}s (median "
-                  f"{_num(quantiles([a['gone_s'] for a in gone])[1])}s); others' best fell "
-                  f"back {_num(mean(rv), '{:.2f}')} of the way to where it started.", ""]
-    lines += ["## By stratum and side", "", "| Group | Pairs | Follow probe | Follow control | Diff (90% CI) |",
-              "|---|---|---|---|---|"]
-    groups: Dict[str, List[Tuple[dict, dict]]] = {}
-    for a, b in pairs:
-        groups.setdefault(f"stratum {a.get('stratum')}", []).append((a, b))
-        groups.setdefault(f"side {a.get('side')}", []).append((a, b))
-        sp = a.get("spread0") or 0
-        groups.setdefault("spread " + ("10-19c" if sp < 20 else "20-39c" if sp < 40 else "40c+"),
-                          []).append((a, b))
+        gone = [r for r in stay if r.get("gone_s") is not None]
+        lines += [f"After our cancel: {len(gone)} of the {len(stay)} followers still there left "
+                  f"within {stay[0].get('post_s', 0):g}s (median "
+                  f"{_num(quantiles([r['gone_s'] for r in gone])[1])}s); leaving with us "
+                  f"means they were pegged to our order. Others' best fell back "
+                  f"{_num(mean([r.get('revert') for r in stay]), '{:.2f}')} of the way to where "
+                  f"it started.", ""]
+    lines += ["## By group", "", "| Group | Probes | Joined | Ahead | Either | 90% CI |",
+              "|---|---|---|---|---|---|"]
+    groups: Dict[str, List[dict]] = {}
+    for r in live:
+        groups.setdefault(f"stratum {r.get('stratum')}", []).append(r)
+        groups.setdefault(f"side {r.get('side')}", []).append(r)
+        sp = r.get("spread0") or 0
+        groups.setdefault("spread " + ("10-19c" if sp < 20 else "20-29c" if sp < 30 else "30c+"),
+                          []).append(r)
     for g in sorted(groups):
-        ps = groups[g]
-        d, lo, hi = boot_diff(ps, "follow")
-        lines.append(f"| {g} | {len(ps)} | {_pct(mean([metric(a, 'follow') for a, _ in ps]))} | "
-                     f"{_pct(mean([metric(b, 'follow') for _, b in ps]))} | {_pct(d)} "
-                     f"({_pct(lo)} .. {_pct(hi)}) |")
+        rs_ = groups[g]
+        v, lo, hi = boot_rate(rs_, "follow")
+        lines.append(f"| {g} | {len(rs_)} | {_count(rs_, 'join')} | {_count(rs_, 'improve')} | "
+                     f"{_count(rs_, 'follow')} ({_pct(v)}) | {_pct(lo)} .. {_pct(hi)} |")
     ser: Dict[str, List[dict]] = {}
-    for a, _ in pairs:
-        ser.setdefault(a.get("series") or "?", []).append(a)
+    for r in live:
+        ser.setdefault(r.get("series") or "?", []).append(r)
     top = sorted(ser.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:15]
-    lines += ["", "## Probe follows by series (top 15 by probes)", "",
-              "| Series | Probes | Followed | Joined | Ahead | Median s |", "|---|---|---|---|---|---|"]
+    lines += ["", "## By series (top 15 by probes)", "",
+              "| Series | Probes | Joined | Ahead | Median s to follow |", "|---|---|---|---|---|"]
     for s, rs_ in top:
         fs = [r["ev"]["follow"] for r in rs_ if (r.get("ev") or {}).get("follow") is not None]
-        lines.append(f"| {s} | {len(rs_)} | {len(fs)} | "
-                     f"{sum(1 for r in rs_ if (r.get('ev') or {}).get('join') is not None)} | "
-                     f"{sum(1 for r in rs_ if (r.get('ev') or {}).get('improve') is not None)} | "
+        lines.append(f"| {s} | {len(rs_)} | {_count(rs_, 'join')} | {_count(rs_, 'improve')} | "
                      f"{_num(quantiles(fs)[1])} |")
-    fills = [r for r in rows if (r.get("fill_n") or 0) > 0]
-    if fills:
-        lines += ["", f"## Our fills: {sum(r['fill_n'] for r in fills):g} contract(s) on "
-                  f"{len(fills)} probe(s)", ""]
-        for r in fills[:20]:
-            lines.append(f"- {r['ticker']} {r['side']} {r['fill_n']:g} @ {r.get('fill_px')}c "
-                         f"after {_num(r.get('fill_s'))}s (mid at t0 "
-                         f"{_num(((r.get('b0') or 0) + (r.get('a0') or 0)) / 2, '{:.1f}')} own space)")
+    fills = [r for r in live if (r.get("fill_n") or 0) > 0]
+    lines += ["", f"## Our fills: {sum(r['fill_n'] for r in fills):g} contract(s) on "
+              f"{len(fills)} of {len(live)} probes", ""]
+    for r in fills[:20]:
+        lines.append(f"- {r['ticker']} {r['side']} {r['fill_n']:g} @ {r.get('fill_px')}c "
+                     f"after {_num(r.get('fill_s'))}s")
     return "\n".join(lines) + "\n"
 
 

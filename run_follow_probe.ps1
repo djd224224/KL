@@ -4,7 +4,7 @@
 # run-logs\follow-probe\launcher-YYYY-MM-DD.log (the bot keeps its own
 # probe_<date>.log, trials / timeline / orders / fills jsonl beside it).
 #
-# DRY RUN by default: nothing is placed (an A/A test of the measurement).
+# DRY RUN by default: nothing is placed (the no-order baseline).
 # -Live places real 1-contract orders in the numbered Kalshi subaccount given
 # by -Subaccount; create and fund it first with kalshi_subaccount.py
 # (python follow_probe.py --setup prints the steps).
@@ -35,7 +35,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $BotArgs = @("$Repo\follow_probe.py", "--quiet")
 if ($Live) { $BotArgs += "--live" }
 if ($Subaccount -gt 0) { $BotArgs += @("--subaccount", "$Subaccount") }
-$Mode = if ($Live) { "live, subaccount $Subaccount" } else { "dry run (A/A)" }
+$Mode = if ($Live) { "live, subaccount $Subaccount" } else { "dry run (no-order baseline)" }
 
 while ($true) {
     $log = Join-Path $LogDir ("launcher-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
