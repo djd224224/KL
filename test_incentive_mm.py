@@ -41253,6 +41253,213 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual((imm.PVD_MARKETS[self.T]["no_losing"], imm.PVD_MARKETS[self.T2]["no_losing"]), (True, False))
 
 
+class TestCheapSideBooks(unittest.TestCase):
+    """Jack 2026-11-08: "scan incentive rewards markets, with far out settle
+    dates (6M+) where i can place 1-2c quotes with little fill risk but can
+    earn $$", then "Build it": CHEAP_FILE lists a market with ONE rung on its
+    cheap side -- a YES bid at 1-2c on a long shot, or a NO bid at 1-2c (a YES
+    ask at 98-99c) on a near-certainty -- and nothing else ever rests there."""
+    T, T2 = "KXGOOD-99DEC31-A", "KXGOOD-99DEC31-B"
+
+    def setUp(self):
+        _clean_persist()
+
+    def tearDown(self):
+        for p in (imm.cheap_path(), imm.pvd_path()):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+        imm.PVD_REMOVED.clear()
+        _clean_persist()
+
+    def _write(self, markets, stop=None):
+        stop = stop or (datetime.now(timezone.utc) + timedelta(hours=6))
+        with open(imm.cheap_path(), "w", encoding="utf-8") as f:
+            json.dump({"stop": stop.strftime("%Y-%m-%dT%H:%M:%SZ"), "markets": markets}, f)
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+
+    @staticmethod
+    def _long_shot(c, t="KXGOOD-99DEC31-A", yes=(("0.01", "300"),), no=(("0.97", "1500"),)):
+        """KXGOOD as a 1x3 long shot: 300 YES bid at 1c, 1,500 NO bid at 97c."""
+        c.markets[t] = dict(c.markets[t], yes_bid_dollars="0.0100", yes_ask_dollars="0.0300")
+        c.books[t] = {"orderbook_fp": {"yes_dollars": [list(x) for x in yes],
+                                       "no_dollars": [list(x) for x in no]}}
+        return c
+
+    def _q(self, entry, yes, no, pos=0.0, target=1000.0, yes_exact=None, no_exact=None):
+        e = dict({"size": 1000}, **entry)
+        e["cheap"] = {"side": e.pop("side"), "px": e.pop("px")}
+        return imm.cheap_side_quote(self.T, e, [list(x) for x in yes], [list(x) for x in no], [],
+                                    yes_exact or [], no_exact or [], [], target, 0.5, pos)
+
+    def test_load_bounds_and_the_wave_list_wins(self):
+        base = imm.FORCE_EVENTS
+        with open(imm.pvd_path(), "w", encoding="utf-8") as f:
+            json.dump({"stop": (datetime.now(timezone.utc) + timedelta(hours=6)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"), "markets": {self.T2: {"bid_max": 30, "ask_min": 70}}}, f)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write({self.T: {"side": "yes", "px": 2, "size": 1000},
+                         self.T2: {"side": "yes", "px": 1, "size": 1000},          # on the wave list
+                         "KXGOOD-99DEC31-C": {"side": "yes", "px": 3, "size": 100},   # over 2c
+                         "KXGOOD-99DEC31-D": {"side": "no", "px": 2, "size": 20000},  # over the size cap
+                         "KXGOOD-99DEC31-E": {"side": "no", "px": 2, "size": 10001},
+                         "KXGOOD-99DEC31-F": {"side": "maybe", "px": 1, "size": 10}})
+        e = imm.cheap_entry(self.T)
+        self.assertEqual((e["cheap"], e["size"], e["max_pos"], e["bsize"]),
+                         ({"side": "yes", "px": 2}, 1000, 1000.0, 1000))
+        self.assertIsNone(imm.cheap_entry(self.T2))        # keeps its wave entry
+        self.assertIsNotNone(imm.wave_entry(self.T2))
+        self.assertIsNone(imm.wave_entry(self.T))
+        self.assertEqual(set(imm.PVD_MARKETS), {self.T, self.T2})
+        self.assertIn("KXGOOD-99DEC31", imm.FORCE_EVENTS)
+        self.assertTrue(any("4 market(s) skipped" in x for x in lines), lines)
+        self.assertTrue(any("also on the wave list" in x for x in lines), lines)
+        # $200 a market at most: 10,000 at 2c is $200 (in), 10,001 is not
+        self._write({self.T: {"side": "no", "px": 2, "size": 10000}})
+        self.assertIsNotNone(imm.cheap_entry(self.T))
+        with mock.patch.object(imm, "CHEAP_MAX_USD", 100.0):
+            self._write({self.T: {"side": "no", "px": 2, "size": 10000}})
+            self.assertIsNone(imm.cheap_entry(self.T))
+        # off: the file is ignored; gone: nothing listed, the force set as it was
+        with mock.patch.object(imm, "CHEAP_MODE", "off"):
+            self._write({self.T: {"side": "yes", "px": 2, "size": 1000}})
+            self.assertIsNone(imm.cheap_entry(self.T))
+        os.remove(imm.pvd_path())
+        os.remove(imm.cheap_path())
+        imm.load_pvd_markets()
+        self.assertEqual(imm.PVD_MARKETS, {})
+        self.assertEqual(imm.FORCE_EVENTS, base)
+
+    def test_the_rung(self):
+        Y = lambda q: None if q is None else (q.book_side, q.price_cents, q.count)
+        ls_yes, ls_no = [(1, 300)], [(97, 1500)]                # a 1x3 long shot
+        q, info = self._q({"side": "yes", "px": 2}, ls_yes, ls_no)
+        self.assertEqual(Y(q), ("bid", 2, 1000))                # 2c ahead of the 1c pile
+        self.assertAlmostEqual(info["share"], 1.0)              # the whole side: 1,000 is the target
+        self.assertEqual(Y(self._q({"side": "yes", "px": 1}, ls_yes, ls_no)[0]), ("bid", 1, 1000))
+        # never crosses: an ask at 2c -> the 2c rung steps down to 1c; at 1c -> nothing
+        self.assertEqual(Y(self._q({"side": "yes", "px": 2}, ls_yes, [(98, 1500)])[0]), ("bid", 1, 1000))
+        q, info = self._q({"side": "yes", "px": 2}, ls_yes, [(99, 1500)])
+        self.assertIsNone(q)
+        self.assertIn("cross", info["why"])
+        # ...exact on a sub-penny book: an ask at 1.2c leaves only 1c
+        q, _ = self._q({"side": "yes", "px": 2}, ls_yes, [(98, 1500)],
+                       yes_exact=[[1.0, 300]], no_exact=[[98.8, 1500]])
+        self.assertEqual(Y(q), ("bid", 1, 1000))
+        # the other side under target: the snapshot pays nobody -> nothing
+        q, info = self._q({"side": "yes", "px": 2}, ls_yes, [(97, 500)])
+        self.assertIsNone(q)
+        self.assertIn("under target", info["why"])
+        # the book moved up past the target: the 2c rung is out of the walk
+        q, info = self._q({"side": "yes", "px": 2}, [(10, 1200)], [(85, 1500)])
+        self.assertIsNone(q)
+        # ...or so deep under it that it scores almost nothing (7 ticks: 0.5^7,
+        # 7.8 of 908 = 0.9% of the side)
+        q, info = self._q({"side": "yes", "px": 2}, [(9, 900)], [(85, 1500)])
+        self.assertIsNone(q)
+        self.assertIn("scores", info["why"])
+        # its position cap is its size
+        self.assertEqual(Y(self._q({"side": "yes", "px": 2}, ls_yes, ls_no, pos=200.0)[0]), ("bid", 2, 800))
+        # (long 400: the 600 left + the 300 at 1c is under the 1,000 target --
+        # the side would not qualify, so nothing rests)
+        self.assertIsNone(self._q({"side": "yes", "px": 2}, ls_yes, ls_no, pos=400.0)[0])
+        q, info = self._q({"side": "yes", "px": 2}, ls_yes, ls_no, pos=1000.0)
+        self.assertIsNone(q)
+        self.assertIn("cap", info["why"])
+        # a NO bid on a near-certainty (98x99): the YES ask at 99c, 98c if it pays
+        nc_yes, nc_no = [(98, 1500)], [(1, 200)]
+        self.assertEqual(Y(self._q({"side": "no", "px": 1}, nc_yes, nc_no)[0]), ("ask", 99, 1000))
+        self.assertEqual(Y(self._q({"side": "no", "px": 2}, nc_yes, nc_no)[0]), ("ask", 99, 1000))  # 98 would lock
+        self.assertEqual(Y(self._q({"side": "no", "px": 2}, [(97, 1500)], nc_no)[0]), ("ask", 98, 1000))
+        self.assertEqual(Y(self._q({"side": "no", "px": 1}, nc_yes, nc_no, pos=-1000.0)[0]), None)
+
+    def _cycle(self, c, flags=(), mode="on"):
+        bot = IncentiveMarketMaker(client=c, live=False)
+        for f in flags:
+            open(f, "w").close()
+        lines = []
+        try:
+            with mock.patch.object(imm, "log", lines.append), \
+                    mock.patch.object(imm, "CHEAP_MODE", mode):
+                bot.run_cycle()
+        finally:
+            for f in flags:
+                if os.path.exists(f):
+                    os.remove(f)
+        return bot, lines
+
+    def _orders(self, bot, t=None):
+        return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == (t or self.T))
+
+    def test_dry_cycle_rests_the_one_rung(self):
+        """KXGOOD as a 1x3 long shot listed YES 2c x 1,000: the bot rests that
+        bid and nothing else -- no 97c NO side, no pad, no ladder"""
+        self._write({self.T: {"side": "yes", "px": 2, "size": 1000}})
+        bot, lines = self._cycle(self._long_shot(FakeClient()))
+        self.assertEqual(self._orders(bot), [("bid", 2, 1000.0)])
+        self.assertTrue(any("cheap KXGOOD-99DEC31-A: YES bid 2c x1000" in x for x in lines), lines)
+        # the same book a cycle later: the rung stays (no cancel / re-place)
+        oid = next(iter(bot.state.sim_orders))
+        bot.state.universe_at = 0.0
+        with mock.patch.object(imm, "log", lambda *a: None):
+            bot.run_cycle()
+        self.assertEqual(self._orders(bot), [("bid", 2, 1000.0)])
+        self.assertIn(oid, bot.state.sim_orders)
+        # a 1c rung too (the bot's pad price): one order, kept
+        self._write({self.T: {"side": "yes", "px": 1, "size": 1000}})
+        bot, _ = self._cycle(self._long_shot(FakeClient()))
+        self.assertEqual(self._orders(bot), [("bid", 1, 1000.0)])
+        # a near-certainty listed NO 1c: the YES ask at 99c alone
+        c = self._long_shot(FakeClient(), yes=(("0.98", "1500"),), no=(("0.01", "200"),))
+        c.markets[self.T].update(yes_bid_dollars="0.9800", yes_ask_dollars="0.9900")
+        self._write({self.T: {"side": "no", "px": 1, "size": 1000}})
+        bot, _ = self._cycle(c)
+        self.assertEqual(self._orders(bot), [("ask", 99, 1000.0)])
+
+    def test_dry_mode_and_reduce_only_rest_nothing(self):
+        self._write({self.T: {"side": "yes", "px": 2, "size": 1000}})
+        bot, lines = self._cycle(self._long_shot(FakeClient()), mode="dry")
+        self.assertEqual(self._orders(bot), [])
+        self.assertTrue(any("(dry: not placed)" in x for x in lines), lines)
+        # long the full 1,000 (its fill): the side is at its cap, nothing rests
+        c = self._long_shot(FakeClient())
+        bot = IncentiveMarketMaker(client=c, live=False)
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 1000.0, 2.0
+        c.positions[self.T] = 1000.0
+        with mock.patch.object(imm, "log", lambda *a: None):
+            bot.run_cycle()
+        self.assertEqual(self._orders(bot), [])
+
+    def test_not_a_wave(self):
+        """UNWIND_ONLY_WAVES (the waves alone unwind) leaves a cheap-side book
+        quoting; bot-wide UNWIND_ONLY takes it like any other market"""
+        self._write({self.T: {"side": "yes", "px": 2, "size": 1000}})
+        bot, _ = self._cycle(self._long_shot(FakeClient()), flags=[imm.UNWIND_WAVES_ONLY_FILE])
+        self.assertEqual(self._orders(bot), [("bid", 2, 1000.0)])
+        self.assertFalse(bot._unwinds(self.T))
+        self.assertFalse(bot._unwinds_at_breakeven(self.T))
+        bot, _ = self._cycle(self._long_shot(FakeClient()),
+                             flags=[imm.UNWIND_ONLY_FILE, imm.UNWIND_WAVES_FILE])
+        self.assertEqual(self._orders(bot), [])
+
+    def test_a_1c_rung_counts_against_the_side_cap(self):
+        """The placement backstop counts a cheap-side book's 1c bid (the bot's
+        pad price) like any rung: a second 1,000 on top is refused"""
+        self._write({self.T: {"side": "yes", "px": 1, "size": 1000}})
+        bot = IncentiveMarketMaker(client=self._long_shot(FakeClient()), live=False)
+        resting = [{"order_id": "r1", "ticker": self.T, "side": "yes", "action": "buy",
+                    "yes_price": 1, "remaining_count": 1000.0}]
+        with mock.patch.object(imm, "log", lambda *a: None):
+            n = bot.place_with_caps([imm.Quote(self.T, "bid", 1, 1000)], resting, set(), time.time())
+        self.assertEqual(n, 0)
+
+
 class TestSuperBowlHalftime(unittest.TestCase):
     """Jack 2026-11-07: "yes, x3. and increase range to 2-98" -- KXSBSETLISTS
     at x4.5 absolute (the table's x3 row over the size test's x1.5), out of

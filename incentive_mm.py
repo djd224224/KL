@@ -10011,6 +10011,169 @@ def pvd_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]
     return e if now_utc < e["stop"] else None
 
 
+# CHEAP-SIDE BOOKS (Jack 2026-11-08: "scan incentive rewards markets, with far
+# out settle dates (6M+) where i can place 1-2c quotes with little fill risk but
+# can earn $$", then "Build it" -- a list mode so the bot can quote them; the
+# scan's truly-far set: KXDSENATESEATS-29, KXSTATE51, KXSCOTUSPOWER,
+# KXFRENCHPRES). One market, ONE rung, on its cheap side only: a YES bid at
+# 1-2c on a long shot ("side": "yes"), or a NO bid at 1-2c -- a YES ask at
+# 98-99c -- on a near-certainty ("side": "no"). A fill costs at most px cents a
+# contract and the side's position is capped at its size, so the worst case is
+# size x px. Its own file, CHEAP_FILE, beside the wave list: the wave tools
+# (pvd_scan, pvd_wave_tune, the dashboards) rebuild and retune every entry of
+# post_vote_dead_books.json, and must never touch these. The loader merges the
+# two into PVD_MARKETS (forced events, the stop as cutoff, the list admits the
+# market, the placement backstop's side cap = its size), each marked "cheap";
+# a ticker on both lists keeps its wave entry. In the quote loop the market
+# runs the plain path and then cheap_side_quote REPLACES its quotes: the rung
+# rests pinned at its own price -- ahead of a thinner 1c pile at 2c, behind
+# nothing -- never crosses the opposite side's exact external best (a step
+# down to 1c if it would), and rests only while it earns (the opposite side
+# reaches target on its own, its own side reaches target with the rung, and
+# the rung is in the scored walk). Nothing else ever rests there: no pads, no
+# other side, no lead, no breakeven offset. It is NOT a wave: UNWIND_ONLY_WAVES
+# and the held-wave unwind leave it alone; HALT, bot-wide UNWIND_ONLY, the
+# sweep breaker and the other pre-quote guards all still apply. A position
+# that fills rides to settlement (a reduce-only market rests nothing).
+# File: {"stop": ISO default, "markets": {ticker: {"side": "yes"|"no",
+# "px": 1|2, "size": N, "stop": ISO, "event": ...}}}. IMM_CHEAP_SIDE=on|dry|off
+# (dry logs the rung and rests nothing; off ignores the file).
+CHEAP_FILE = "cheap_side_books.json"            # in STATUS_DIR
+CHEAP_MODE = os.environ.get("IMM_CHEAP_SIDE", "on").strip().lower()
+CHEAP_PX_MAX = max(1, _env_int("IMM_CHEAP_PX_MAX", 2))         # cents, the cheap side's own price
+CHEAP_MAX_SIZE = max(1, _env_int("IMM_CHEAP_MAX_SIZE", 10000))  # contracts a market
+CHEAP_MAX_USD = _env_float("IMM_CHEAP_MAX_USD", 200.0)         # size x px a market
+# ...and the rung rests only while it holds at least this share of its side's
+# score (a 2c bid deep under a book that moved up earns ~nothing)
+CHEAP_MIN_SHARE = _env_float("IMM_CHEAP_MIN_SHARE", 0.01)
+
+
+def cheap_path() -> str:
+    return os.path.join(STATUS_DIR, CHEAP_FILE)
+
+
+def cheap_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]:
+    """The market's CHEAP-SIDE BOOK entry while its stop is ahead, else None."""
+    e = pvd_entry(ticker, now_utc)
+    return e if e is not None and e.get("cheap") else None
+
+
+def wave_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]:
+    """A live list entry that is NOT a cheap-side book (the waves and the
+    post-vote dead books: what the waves' own switches act on)."""
+    e = pvd_entry(ticker, now_utc)
+    return e if e is not None and not e.get("cheap") else None
+
+
+def load_cheap_entries(mtime: float) -> Dict[str, dict]:
+    """CHEAP_FILE's markets as list entries (the PVD entry shape, "cheap" set);
+    a malformed or out-of-bounds market is skipped and logged."""
+    out: Dict[str, dict] = {}
+    if mtime < 0 or CHEAP_MODE == "off":
+        return out
+    try:
+        with open(cheap_path(), encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! cheap-side book file unreadable: {e}")
+        return out
+    default_stop = parse_iso_utc(str(data.get("stop") or ""))
+    bad: List[str] = []
+    for t, raw in (data.get("markets") or {}).items():
+        t = str(t).strip()
+        if not isinstance(raw, dict) or "-" not in t:
+            continue
+        stop = parse_iso_utc(str(raw.get("stop") or "")) or default_stop
+        side = str(raw.get("side") or "").strip().lower()
+        try:
+            px = int(raw.get("px"))
+            size = int(raw.get("size"))
+        except (TypeError, ValueError):
+            px = size = 0
+        if stop is None or side not in ("yes", "no") or not 1 <= px <= CHEAP_PX_MAX \
+                or not 1 <= size <= CHEAP_MAX_SIZE or size * px / 100.0 > CHEAP_MAX_USD + 1e-9:
+            bad.append(f"{t} (side {side or '-'}, px {px}, size {size}, stop {raw.get('stop')})")
+            continue
+        if series_of(t) in ENS_SERIES:
+            continue
+        out[t] = {"stop": stop, "bid_max": px if side == "yes" else 0,
+                  "ask_min": 100 - px if side == "no" else 100,
+                  "size": size, "max_pos": float(size), "kind": "dead",
+                  "bsize": size, "asize": size, "cushion": 0, "pmin": 1, "pmax": 99,
+                  "no_losing": False, "override_cutoff": bool(raw.get("override_cutoff")),
+                  "flip": False, "to_flat": False, "follow_book": False, "no_halts": False,
+                  "event": raw.get("event") or t.rsplit("-", 1)[0],
+                  "cheap": {"side": side, "px": px}}
+    if bad:
+        log(f"[IMM] ! cheap-side books: {len(bad)} market(s) skipped (side yes|no, px 1-"
+            f"{CHEAP_PX_MAX}, size 1-{CHEAP_MAX_SIZE}, size x px <= ${CHEAP_MAX_USD:g}, a stop): "
+            + "; ".join(bad[:10]))
+    return out
+
+
+def cheap_side_quote(ticker: str, entry: dict,
+                     yes_levels: List[List[float]], no_levels: List[List[float]],
+                     own_in_book: List[Tuple[str, float, float]],
+                     yes_exact: List[List[float]], no_exact: List[List[float]],
+                     own_exact: List[Tuple[str, float, float]],
+                     target: float, df: float, pos: float
+                     ) -> Tuple[Optional["Quote"], dict]:
+    """A CHEAP-SIDE BOOK's one rung this cycle, or None, and why.
+
+    Its size less what the side already holds (the side's position cap is its
+    size); at its own price `px` (the cheap side's cents), or the highest
+    whole cent under it that stays strictly behind the opposite side's best
+    EXTERNAL price (exact on a sub-penny book); and only while it earns on the
+    external book scored the bot's way (whole-cent buckets, _side_share): the
+    opposite side reaches target alone, its own side with the rung, and the
+    rung scores."""
+    c = entry["cheap"]
+    side, px, size = c["side"], int(c["px"]), int(entry["size"])
+    held = pos if side == "yes" else -pos
+    n = int(max(0.0, min(float(size), size - held)))
+    info: dict = {"side": side, "px": px, "n": n, "held": held}
+    if n < 1:
+        info["why"] = f"at its cap ({held:+.0f} of {size})"
+        return None, info
+    ye, ne = external_levels(yes_levels, no_levels, own_in_book)
+    if yes_exact or no_exact:
+        eb, ea = external_touch_exact(yes_exact, no_exact, own_exact)
+    else:
+        eb = max((float(p) for p, q in ye if q > 0), default=None)
+        _nb = max((float(p) for p, q in ne if q > 0), default=None)
+        ea = None if _nb is None else 100.0 - _nb
+    # the opposite side's best, in this side's own cents: the rung stays under it
+    limit = ea if side == "yes" else (None if eb is None else 100.0 - eb)
+    p = px
+    if limit is not None:
+        p = min(px, int(math.ceil(round(limit, 2))) - 1)
+    info.update(px=p, limit=None if limit is None else round(limit, 2))
+    if p < 1:
+        info["why"] = f"would cross (the other side's best is {limit:.2f}c)"
+        return None, info
+    mine, other = (ye, ne) if side == "yes" else (ne, ye)
+    lv: Dict[int, float] = {}
+    for a, b in mine:
+        if b > 0:
+            lv[int(a)] = lv.get(int(a), 0.0) + float(b)
+    lv[p] = lv.get(p, 0.0) + n
+    share, ok_mine = _side_share(sorted(lv.items(), key=lambda kv: -kv[0]),
+                                 {p: float(n)}, target, df)
+    _, ok_other = _side_share(sorted(((int(a), float(b)) for a, b in other if b > 0),
+                                     key=lambda kv: -kv[0]), {}, target, df)
+    info["share"] = round(share, 4)
+    if not ok_other:
+        info["why"] = "the other side is under target (the snapshot pays nobody)"
+        return None, info
+    if not ok_mine or share <= 0 or share < CHEAP_MIN_SHARE:
+        info["why"] = (f"the rung scores {share * 100:.1f}% of its side (under "
+                       f"{CHEAP_MIN_SHARE * 100:g}%)" if ok_mine and share > 0
+                       else "the rung is out of the scored walk")
+        return None, info
+    return Quote(ticker, "bid" if side == "yes" else "ask",
+                 p if side == "yes" else 100 - p, n), info
+
+
 def load_pvd_markets() -> int:
     """(Re)load PVD_FILE when its mtime moves; rebinds FORCE_EVENTS to carry
     the listed markets' events. Returns the number of markets changed."""
@@ -10021,9 +10184,14 @@ def load_pvd_markets() -> int:
         mtime = os.path.getmtime(pvd_path())
     except OSError:
         mtime = -1.0                      # no file: nothing listed
-    if mtime == _pvd_state["mtime"]:
+    try:
+        cmtime = os.path.getmtime(cheap_path())
+    except OSError:
+        cmtime = -1.0                     # no cheap-side books
+    if mtime == _pvd_state["mtime"] and cmtime == _pvd_state.get("cheap_mtime"):
         return 0
     _pvd_state["mtime"] = mtime
+    _pvd_state["cheap_mtime"] = cmtime
     data: dict = {}
     if mtime >= 0:
         try:
@@ -10106,6 +10274,15 @@ def load_pvd_markets() -> int:
                     # "no_halts": its series joins PVD_NO_HALT_SERIES
                     "no_halts": bool(raw.get("no_halts")),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
+    # ...and the CHEAP-SIDE BOOKS (CHEAP_FILE): a ticker on the wave list too
+    # keeps its wave entry
+    cheap = load_cheap_entries(cmtime)
+    both = sorted(t for t in cheap if t in fresh)
+    if both:
+        log(f"[IMM] ! cheap-side books: {len(both)} market(s) also on the wave list keep "
+            f"their wave entry: {', '.join(both[:10])}")
+    for t, e in cheap.items():
+        fresh.setdefault(t, e)
     changed = len(set(fresh) ^ set(PVD_MARKETS)) + sum(
         1 for t in fresh if t in PVD_MARKETS and fresh[t] != PVD_MARKETS[t])
     PVD_REMOVED.update(set(PVD_MARKETS) - set(fresh))
@@ -10138,6 +10315,12 @@ def load_pvd_markets() -> int:
             f"a side: {by_size or '-'} (cap = size, default {PVD_SIZE} / "
             f"{PVD_MAX_POSITION:g})"
             + (f", stop {stops[0].isoformat()}" if stops else ""))
+        ch = [e for e in fresh.values() if e.get("cheap")]
+        if ch or cheap:
+            log(f"[IMM] cheap-side books ({CHEAP_MODE}): {len(ch)} market(s), "
+                f"{sum(1 for e in ch if e['cheap']['side'] == 'yes')} YES bid / "
+                f"{sum(1 for e in ch if e['cheap']['side'] == 'no')} NO bid at 1-{CHEAP_PX_MAX}c, "
+                f"${sum(e['size'] * e['cheap']['px'] / 100.0 for e in ch):,.0f} if every rung fills")
     return changed
 
 
@@ -25144,6 +25327,7 @@ class IncentiveMarketMaker:
         self._off_usual_noted: Dict[str, tuple] = {}
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
+        self._cheap_noted: Dict[str, tuple] = {}  # CHEAP-SIDE BOOK rung last logged
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
         self._pvd_close: Dict[str, Optional[tuple]] = {}  # closing-exemption rung last logged
         # a flip-through entry's (bid, ask) rung as the quote loop sized it this
@@ -25861,7 +26045,9 @@ class IncentiveMarketMaker:
                 "client_order_id": coid,
                 "order_age_secs": (round(now_ts - placed, 1)
                                    if placed else None),
+                # (a CHEAP-SIDE BOOK's 1c / 99c rung is no pad)
                 "is_pad": (self._is_pad_price(book_side, our_px)
+                           and PVD_MARKETS.get(tkr, {}).get("cheap") is None
                            if book_side and our_px is not None
                            else None),
                 # --- inventory context ---
@@ -26285,6 +26471,7 @@ class IncentiveMarketMaker:
                 "price_cents": price_cents,
                 "count": count,
                 "is_pad": (self._is_pad_price(book_side, price_cents)
+                           and PVD_MARKETS.get(ticker, {}).get("cheap") is None
                            if book_side and price_cents is not None else None),
                 "ticks_from_touch": ticks,
                 "ext_bid": eb, "ext_ask": ea,
@@ -34158,14 +34345,34 @@ class IncentiveMarketMaker:
         """Does market `t` only unwind this cycle (UNWIND ONLY, and not a
         listed wave market while UNWIND_WAVES_FILE exists; or a listed wave
         market while UNWIND_WAVES_ONLY_FILE exists)?"""
-        listed = pvd_entry(t) is not None
+        # (a CHEAP-SIDE BOOK is no wave: the waves' switches pass it by, and
+        # bot-wide UNWIND ONLY takes it like any other market)
+        listed = wave_entry(t) is not None
         return (self._unwind_waves_only and (listed or t in self._wave_unwind)) or (
             self._unwind_only and not (self._unwind_waves and listed))
 
     def _unwinds_at_breakeven(self, t: str) -> bool:
         """Does market `t` unwind at its average cost or better (THE WAVES
         ALONE AT BREAKEVEN)?"""
-        return self._unwind_waves_only and (pvd_entry(t) is not None or t in self._wave_unwind)
+        return self._unwind_waves_only and (wave_entry(t) is not None or t in self._wave_unwind)
+
+    def _cheap_side_note(self, t: str, q: Optional["Quote"], info: dict,
+                         meta: "MarketMeta") -> None:
+        """Log a CHEAP-SIDE BOOK's rung when it starts, moves or stands aside."""
+        key = (None, info.get("why")) if q is None else (q.book_side, q.price_cents, q.count)
+        if self._cheap_noted.get(t) == key:
+            return
+        self._cheap_noted[t] = key
+        side = str(info.get("side", "?")).upper()
+        if q is None:
+            log(f"{self.tag} cheap {t}: {side} side rests nothing -- {info.get('why')}")
+            return
+        usd = float(info.get("share") or 0.0) / 2.0 * float(meta.dollars_per_day or 0.0)
+        log(f"{self.tag} cheap {t}: {side} bid {info.get('px')}c x{q.count}"
+            f"{' (dry: not placed)' if CHEAP_MODE != 'on' else ''} -- side share "
+            f"{float(info.get('share') or 0) * 100:.0f}%, ~${usd:.2f}/day of "
+            f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * int(info.get('px') or 0) / 100:.0f} "
+            f"if it all fills (other side's best {info.get('limit')}c)")
 
     def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple]) -> None:
         """Log a side's OFF-USUAL SIZE cut when it starts or changes."""
@@ -35134,6 +35341,7 @@ class IncentiveMarketMaker:
         (an inactive or unreadable market stays out and is read again later)."""
         want = [t for t in PVD_MARKETS
                 if t not in managed and not self._blocked(t)
+                and not PVD_MARKETS[t].get("cheap")        # no wave: its fills ride
                 and abs(self.pnl.pos.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
                 and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
                 < MANUAL_STANDOFF_CONTRACTS]
@@ -35294,9 +35502,14 @@ class IncentiveMarketMaker:
             dc_why = dc_screen_reason(meta.ticker, now_ts)
             if dc_why:
                 return dc_why
-        if meta.mid_cents is None or meta.spread_cents is None:
+        # a CHEAP-SIDE BOOK lives at the extremes (a 1x3 long shot, a book with
+        # no YES bid at all): no one-sided, spread, mid or volume screen -- its
+        # one rung (cheap_side_quote) judges the book every cycle; the breaker,
+        # bench and target screens below still hold
+        cheap_book = cheap_entry(meta.ticker, now_utc) is not None
+        if (meta.mid_cents is None or meta.spread_cents is None) and not cheap_book:
             return "one_sided"
-        if meta.spread_cents > MAX_JOIN_SPREAD_CENTS:
+        if not cheap_book and meta.spread_cents > MAX_JOIN_SPREAD_CENTS:
             return "wide"
         # Members are screened against the SAME band they are allowed to quote
         # in (member_price_band); fresh entry keeps the tighter 5-90.
@@ -35313,13 +35526,13 @@ class IncentiveMarketMaker:
             band_lo = min(band_lo, SPORTS_LADDER_PRICE_MIN_EXACT)
             band_hi = max(band_hi, SPORTS_LADDER_PRICE_MAX_EXACT)
         # a settled strike is screened on its own band (RT SETTLED STRIKES)
-        if rt_settled_series(meta.series) \
+        if rt_settled_series(meta.series) and not cheap_book \
                 and rt_settled_reason(meta.ticker, meta.mid_cents, now_ts) is None:
             band_lo = min(band_lo, RT_SETTLED_BAND_LO)
             band_hi = max(band_hi, RT_SETTLED_BAND_HI)
-        if not (band_lo <= meta.mid_cents <= band_hi):
+        if not cheap_book and not (band_lo <= meta.mid_cents <= band_hi):
             return "extreme_mid"
-        if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS:
+        if MIN_VOLUME_CONTRACTS > 0 and meta.volume < MIN_VOLUME_CONTRACTS and not cheap_book:
             # Fresh listings get a pass: mention markets list the day before
             # the game with zero volume, and that pre-event window is exactly
             # the rent we're here for. The anti-junk intent of the volume
@@ -36547,6 +36760,10 @@ class IncentiveMarketMaker:
             # Member band (5-93 since 8/3); fresh keeps the series band.
             pmin_s, pmax_s = member_price_band(
                 series_of(t), t in self.state.selected)
+            # a CHEAP-SIDE BOOK (CHEAP_FILE) skips the band and depth skips
+            # below: its one rung (cheap_side_quote, after every other path)
+            # judges its own price, crossing and earning
+            cheap = cheap_entry(t, now_utc)
             # (a held wave market's unwind -- THE WAVES ALONE AT BREAKEVEN --
             # quotes on the whole 1-99c band: its one order is never priced
             # worse than the bot's average cost, and most of them are long
@@ -36602,7 +36819,7 @@ class IncentiveMarketMaker:
             fair_past = (FAIR_LEAD_PAST_BAND and not (bid_in_band and ask_in_band)
                          and (fair_lead_fair_c(t, meta.series, now_ts) is not None
                               or fair_close_fair_c(t, meta.series, now_ts) is not None))
-            if not bid_in_band and not ask_in_band and not fair_past:
+            if not bid_in_band and not ask_in_band and not fair_past and cheap is None:
                 self.cancel_market_orders(t, resting)
                 self._gskip(t, "band_both_out", lambda: dict(lo=pmin_s, hi=pmax_s, member=t in self.state.selected), book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
                 continue
@@ -36627,7 +36844,7 @@ class IncentiveMarketMaker:
                 ext_bid, ext_ask, ticker=t)
             # (a breakeven wave unwind earns nothing either way: no gate --
             # THE WAVES ALONE AT BREAKEVEN, past three guards)
-            if not (bid_ok and ask_ok) and not (
+            if not (bid_ok and ask_ok) and cheap is None and not (
                     self._unwinds_at_breakeven(t) and abs(own_pos) >= 1):
                 n_cx = self.cancel_market_orders(t, resting)
                 if n_cx:
@@ -37285,7 +37502,9 @@ class IncentiveMarketMaker:
             # a POST-VOTE DEAD BOOK (PVD_FILE): one flat PVD_SIZE rung a side --
             # no family, hour, size-test or per-market boost (Jack 2026-11-04:
             # "40 contracts a side, not 120")
-            pvd = pvd_entry(t, now_utc)
+            # (a CHEAP-SIDE BOOK is no wave: it runs the plain path, and its
+            # one rung replaces the quotes below -- cheap_side_quote)
+            pvd = wave_entry(t, now_utc)
             if pvd is not None:
                 lv = [(0, pvd["size"])]
                 hm = 1.0
@@ -37681,7 +37900,7 @@ class IncentiveMarketMaker:
                                           else ("ask", close_a[0]))
             else:
                 self._fair_close_px.pop(t, None)
-            if not bid_in_band and not ask_in_band and not (
+            if not bid_in_band and not ask_in_band and cheap is None and not (
                     lead_on_b or lead_on_a or close_on_b or close_on_a):
                 # past the band only with a fair lead or close to rest
                 # (FAIR_LEAD_PAST_BAND): neither side has one this cycle
@@ -38028,6 +38247,23 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} ! off-usual size failed on {t} ({e!r}); "
                             f"sizes left as built (logged once)")
                 self._off_usual_note(now_ts)
+            # CHEAP-SIDE BOOK (CHEAP_FILE): its one rung REPLACES whatever the
+            # plain path built -- the cheap side alone, pinned at its own price,
+            # only while it earns; dry logs it and rests nothing; a reduce-only
+            # market (out of the selection) rests nothing, its position riding
+            if cheap is not None:
+                try:
+                    _cq, _ci = cheap_side_quote(
+                        t, cheap, yes_levels, no_levels, own_in_book,
+                        *orderbook_exact_levels(ob),
+                        own_exact_by_ticker.get(t, []) if self.live else [],
+                        meta.target_size, meta.discount_factor, cap_pos)
+                except Exception as e:      # never costs the cycle: nothing rests
+                    _cq, _ci = None, {"why": f"failed ({e!r})"}
+                if reduce_only and _cq is not None:
+                    _cq, _ci = None, dict(_ci, why="reduce-only (out of the selection)")
+                self._cheap_side_note(t, _cq, _ci, meta)
+                mq = [_cq] if (_cq is not None and CHEAP_MODE == "on") else []
             # BREAKEVEN OFFSET (a SELECTED market BE_OFFSET_DAYS out or
             # more): the reducing side carries the whole position at
             # breakeven or better. The event room below is charged the
@@ -38038,7 +38274,7 @@ class IncentiveMarketMaker:
             # gated or not, so it works toward the period's $1.
             mq_built = mq
             be_n = 0
-            if t in self.state.selected \
+            if t in self.state.selected and cheap is None \
                     and (be_offset_far(meta.cutoff, meta.close_time, now_utc) or ca_uw is not None) \
                     and not (pos_manual or event_manual):
                 mq, be_n = breakeven_offset_quotes(mq, own_pos, self.pnl.avg.get(t))
@@ -38938,7 +39174,10 @@ class IncentiveMarketMaker:
             if parsed is None:
                 return 0
             rem = order_remaining(o) * sign
-            if not self._is_pad_price(parsed[0], parsed[1]):
+            # (a CHEAP-SIDE BOOK's 1c bid / 99c ask is its real rung, not a pad:
+            # it counts against the side cap)
+            if not self._is_pad_price(parsed[0], parsed[1]) \
+                    or cheap_entry(o.get("ticker", "")) is not None:
                 skey = (o.get("ticker", ""), parsed[0])
                 side_totals[skey] = side_totals.get(skey, 0.0) + rem
                 lkey = (o.get("ticker", ""), parsed[0], parsed[1])
