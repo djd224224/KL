@@ -459,6 +459,23 @@ if ($Probe) {
     $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=1000000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=6000&& set IMM_NET_LOSS_LIMIT=0&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
 }
 
+# SIZE OVERRIDES BY TEXT (Jack 2026-11-08: "allow sizing adjustments too", for
+# text replies to Claude: sms_inbox.py -> phone_actions.py size, behind a
+# confirmation code). That writes run-logs\incentive-mm\env_overrides.txt
+# (untracked), one IMM_<NAME>_SIZE_MULT=<number> a line, and starts
+# restart_imm.ps1 -Task. Appended LAST, so each line wins over the same name
+# above. Only *_SIZE_MULT names with a plain number are taken; anything else
+# in the file is ignored. Read once here, like the rest of $ProbeEnv: a change
+# applies at the next -Task restart. No file = no change.
+$EnvOverrides = Join-Path $Repo "run-logs\incentive-mm\env_overrides.txt"
+if (Test-Path $EnvOverrides) {
+    foreach ($ln in (Get-Content -Path $EnvOverrides -ErrorAction SilentlyContinue)) {
+        if ($ln -match '^\s*(IMM_[A-Z0-9_]+_SIZE_MULT)=([0-9]+(\.[0-9]+)?)\s*$') {
+            $ProbeEnv += "set $($Matches[1])=$($Matches[2])&& "
+        }
+    }
+}
+
 while ($true) {
     $log = Join-Path $Repo ("run-logs\incentive-mm\incentive-mm-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
     Add-Content $log "$(Get-Date -Format u) launcher: starting incentive_mm live$(if ($Probe) { ' [MICRO-PROBE]' })"
