@@ -40434,6 +40434,78 @@ class TestOffUsualSize(unittest.TestCase):
         self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 5751), ("bid", 300)])
 
 
+class TestOffUsualBigSides(unittest.TestCase):
+    """Jack 2026-11-08: "Port for big sides" -- off the wave list, a side
+    planning 1,000+ contracts that rests more than 3c nearer the taker than its
+    6-hour median touch rests no more than 1,000, once the market has 3 h of
+    samples (12); fewer samples keep the size (no cold-start cut off the list).
+    The 11/02 Paris rain bait filled 4,000 each way at 55c and 45c (-$400)."""
+    T = "KXGOOD-99DEC31-A"
+
+    def test_defaults_and_what_counts_as_big(self):
+        self.assertEqual((imm.OFF_USUAL_BIG_MODE, imm.OFF_USUAL_BIG_MIN, imm.OFF_USUAL_BIG_MIN_N),
+                         ("on", 1000, 12))
+        for k in ("OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        Q, T = imm.Quote, self.T
+        self.assertFalse(imm.off_usual_big_side([Q(T, "bid", 40, 999), Q(T, "ask", 60, 999)]))
+        self.assertTrue(imm.off_usual_big_side([Q(T, "bid", 40, 600), Q(T, "bid", 39, 400)]))
+        # pads never count toward a big side
+        self.assertFalse(imm.off_usual_big_side([Q(T, "bid", 40, 500), Q(T, "bid", 1, 5000, is_pad=True)]))
+        self.assertFalse(imm.off_usual_big_side([]))
+        # Paris: 4,000 bid dragged to 55c over a 42c usual -> 1,000; the ask at its usual keeps 4,000
+        out, cuts = imm.pvd_off_usual_cut([Q(T, "bid", 55, 4000), Q(T, "ask", 60, 4000)],
+                                          42.0, 60.0, 1000)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 4000), ("bid", 1000)])
+        self.assertEqual(cuts, {"bid": (4000, 1000, 55.0, 42.0)})
+
+    def test_a_cycle_cuts_a_big_side_off_its_usual_price(self):
+        def run(mode, shift=None, n=16, min_ct=None):
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if shift is not None:
+                now = time.time()
+                bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), bid - shift, ask + shift]
+                                               for i in range(n)]
+            lines = []
+            with mock.patch.object(imm, "OFF_USUAL_BIG_MODE", mode), \
+                    mock.patch.object(imm, "OFF_USUAL_BIG_MIN", min_ct or big_min), \
+                    mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+            tot = {}
+            for o in bot.state.sim_orders.values():
+                if o["ticker"] == self.T and not o.get("is_pad"):
+                    tot[o["book_side"]] = tot.get(o["book_side"], 0) + o["remaining_count"]
+            return bot, dict(tot), lines
+        bid = ask = 0.0
+        big_min = 10 ** 9
+        bot, plain, _l = run("off")
+        self.assertIsNone(imm.pvd_entry(self.T))                 # off the list
+        self.assertEqual(set(plain), {"bid", "ask"}, plain)
+        prices = [o["yes_price"] for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        bid = max(o["yes_price"] for o in bot.state.sim_orders.values()
+                  if o["ticker"] == self.T and o["book_side"] == "bid")
+        ask = min(o["yes_price"] for o in bot.state.sim_orders.values()
+                  if o["ticker"] == self.T and o["book_side"] == "ask")
+        self.assertTrue(prices)
+        big_min = max(1, int(min(plain.values()) // 2))          # both sides plan "big"
+        # both sides 10c nearer the taker than 4 h of samples: each keeps big_min
+        bot, cut, lines = run("on", shift=10)
+        self.assertEqual(cut, {"bid": big_min, "ask": big_min})
+        self.assertTrue(any("(big side, off the list)" in x for x in lines), lines)
+        self.assertEqual(len(bot.state.pvd_usual[self.T]), 17)   # the cycle sampled
+        # dry logs, cuts nothing; at the usual price, or under 12 samples: untouched
+        _b, dry, lines = run("dry", shift=10)
+        self.assertEqual(dry, plain)
+        self.assertTrue(any("off-usual size (dry)" in x for x in lines), lines)
+        self.assertEqual(run("on", shift=0)[1], plain)
+        self.assertEqual(run("on", shift=10, n=8)[1], plain)
+        # a side under the big size is left alone, and a market never big is not sampled
+        bot, small, _l = run("on", min_ct=10 ** 9)
+        self.assertEqual(small, plain)
+        self.assertNotIn(self.T, bot.state.pvd_usual)
+
+
 class TestPostVoteDeadBooks(unittest.TestCase):
     """Jack 2026-11-04: the post-vote election wave's dead books ("a lot of
     'dead' books, with wide gaps like KXATTYGENOH-26, KXOHTREASR-26NOV03"),

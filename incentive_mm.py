@@ -10530,6 +10530,34 @@ PVD_OFF_USUAL_MIN_N = int(_env_float("IMM_PVD_OFF_USUAL_MIN_N", 4))
 PVD_OFF_USUAL_SAMPLE_S = _env_float("IMM_PVD_OFF_USUAL_SAMPLE_S", 900.0)
 PVD_OFF_USUAL_LOG_S = 600.0
 PVD_OFF_USUAL_COLD = os.environ.get("IMM_PVD_OFF_USUAL_COLD", "base").strip().lower() != "full"
+# OFF-USUAL SIZE FOR BIG SIDES OFF THE LIST (Jack 2026-11-08: "Port for big
+# sides"). A 24-day replay of the rule on the book outside the waves (10/16-
+# 11/08, 8,096 fills): fills 10c+ off their usual price marked -4.0c a contract
+# an hour later against -1.9c at the usual price, but nearly every side there
+# rests under 100 contracts; the one big side picked off was KXRAINDPARIS's
+# 4,000 each way on 11/02 (-$400). So a market NOT on the list whose side
+# plans OFF_USUAL_BIG_MIN contracts or more, resting more than PVD_OFF_USUAL_C
+# c nearer the taker than its usual price (the same 6h median touch), rests
+# no more than OFF_USUAL_BIG_MIN -- the side that reduces the position keeps
+# that plus the position. Only with enough history: OFF_USUAL_BIG_MIN_N
+# samples (12 = 3 h at one per 15 min); a side with fewer keeps its size
+# (no cold-start cut off the list). Sampled while a side plans big, and for
+# the 6 h after (state.pvd_usual, beside the listed markets). Pads untouched.
+# IMM_OFF_USUAL_BIG: "on" (default), "dry" (logged, nothing cut), "off".
+OFF_USUAL_BIG_MODE = os.environ.get("IMM_OFF_USUAL_BIG", "on").strip().lower()
+OFF_USUAL_BIG_MIN = int(_env_float("IMM_OFF_USUAL_BIG_MIN", 1000))
+OFF_USUAL_BIG_MIN_N = int(_env_float("IMM_OFF_USUAL_BIG_MIN_N", 12))
+
+
+def off_usual_big_side(quotes: List["Quote"], min_ct: Optional[int] = None) -> bool:
+    """Does either side of `quotes` (pads aside) plan `min_ct` contracts or
+    more -- a market OFF-USUAL SIZE watches off the list?"""
+    min_ct = OFF_USUAL_BIG_MIN if min_ct is None else int(min_ct)
+    tot = {"bid": 0, "ask": 0}
+    for q in quotes or []:
+        if not q.is_pad and q.book_side in tot:
+            tot[q.book_side] += int(q.count)
+    return min_ct >= 1 and max(tot.values()) >= min_ct
 
 
 def pvd_usual_sample(hist, now: float, bid: Optional[float], ask: Optional[float],
@@ -13624,6 +13652,7 @@ _CONFIG_CODE_KNOBS = (
     # off-usual size on listed markets (2026-11-08)
     "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
+    "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -25325,6 +25354,7 @@ class IncentiveMarketMaker:
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
         self._off_usual_logged = 0.0
         self._off_usual_noted: Dict[str, tuple] = {}
+        self._off_usual_big: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # big sides off the list: t -> (ts, cuts)
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         self._cheap_noted: Dict[str, tuple] = {}  # CHEAP-SIDE BOOK rung last logged
@@ -34374,13 +34404,21 @@ class IncentiveMarketMaker:
             f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * int(info.get('px') or 0) / 100:.0f} "
             f"if it all fills (other side's best {info.get('limit')}c)")
 
-    def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple]) -> None:
-        """Log a side's OFF-USUAL SIZE cut when it starts or changes."""
+    def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple], big: bool = False) -> None:
+        """Log a side's OFF-USUAL SIZE cut when it starts or changes (`big`: a
+        big side off the list, OFF_USUAL_BIG_MODE)."""
         key = tuple(sorted((s, round(c[2], 1), None if c[3] is None else round(c[3], 1), c[0])
                            for s, c in cuts.items()))
         if self._off_usual_noted.get(t) == key:
             return
         self._off_usual_noted[t] = key
+        if big:
+            tag = "" if OFF_USUAL_BIG_MODE == "on" else " (dry)"
+            for side, (planned, kept, px, usual) in sorted(cuts.items()):
+                log(f"{self.tag} off-usual size{tag} {t} {side} (big side, off the list): "
+                    f"rests {px:g}c, {abs(px - usual):g}c nearer the taker than its "
+                    f"{PVD_OFF_USUAL_HOURS:g}h usual {usual:g}c -- {planned:,} -> {kept:,}")
+            return
         tag = "" if PVD_OFF_USUAL_MODE == "on" else " (dry)"
         for side, (planned, kept, px, usual) in sorted(cuts.items()):
             if usual is None:
@@ -34401,11 +34439,19 @@ class IncentiveMarketMaker:
         for t in [t for t in self._off_usual if t not in live]:
             self._off_usual.pop(t, None)
             self._off_usual_noted.pop(t, None)
+        big = {t: v for t, v in self._off_usual_big.items() if now_ts - v[0] <= PVD_OFF_USUAL_LOG_S}
+        for t in [t for t in self._off_usual_big if t not in big]:
+            self._off_usual_big.pop(t, None)
+            self._off_usual_noted.pop(t, None)
         sides = sum(len(c) for _ts, c in live.values())
         cts = sum(p - k for _ts, c in live.values() for p, k, _px, _u in c.values())
+        b_sides = sum(len(c) for _ts, c in big.values())
+        b_cts = sum(p - k for _ts, c in big.values() for p, k, _px, _u in c.values())
         log(f"[IMM] off-usual size ({PVD_OFF_USUAL_MODE}, {PVD_OFF_USUAL_C:g}c past the "
             f"{PVD_OFF_USUAL_HOURS:g}h median touch -> base size): {sides} side(s) in "
-            f"{len(live)} listed market(s) cut by {cts:,} contracts; "
+            f"{len(live)} listed market(s) cut by {cts:,} contracts; big sides off the list "
+            f"({OFF_USUAL_BIG_MODE}, {OFF_USUAL_BIG_MIN:,}+ -> {OFF_USUAL_BIG_MIN:,}): "
+            f"{b_sides} side(s) in {len(big)} market(s) cut by {b_cts:,} contracts; "
             f"{len(self.state.pvd_usual)} market(s) sampled")
 
     def _full_earn_note(self, now_ts: float) -> None:
@@ -38247,6 +38293,42 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} ! off-usual size failed on {t} ({e!r}); "
                             f"sizes left as built (logged once)")
                 self._off_usual_note(now_ts)
+            elif pvd is None and cheap is None and OFF_USUAL_BIG_MODE in ("on", "dry"):
+                # OFF-USUAL SIZE FOR BIG SIDES (OFF_USUAL_BIG_MODE): off the
+                # list, a side planning OFF_USUAL_BIG_MIN+ that rests more than
+                # PVD_OFF_USUAL_C c nearer the taker than its usual price (with
+                # OFF_USUAL_BIG_MIN_N samples or more) keeps OFF_USUAL_BIG_MIN;
+                # the touch is sampled while a side plans big and for 6 h after
+                # (a cheap-side book is pinned at its own price: left alone)
+                try:
+                    _big = off_usual_big_side(mq)
+                    if _big or t in self.state.pvd_usual:
+                        if _big:
+                            _ub, _ua = pvd_usual_px(self.state.pvd_usual.get(t), now_ts,
+                                                    min_n=OFF_USUAL_BIG_MIN_N)
+                            _ou_q, _ou = pvd_off_usual_cut(mq, _ub, _ua, OFF_USUAL_BIG_MIN,
+                                                           pos=cap_pos)
+                        else:
+                            _ou = {}
+                        if _ou:
+                            self._off_usual_big[t] = (now_ts, _ou)
+                            self._off_usual_side_note(t, _ou, big=True)
+                            if OFF_USUAL_BIG_MODE == "on":
+                                mq = _ou_q
+                        else:
+                            self._off_usual_big.pop(t, None)
+                            self._off_usual_noted.pop(t, None)
+                        _tb = max((float(p) for p, q in yes_levels if float(q) > 0), default=None)
+                        _tn = max((float(p) for p, q in no_levels if float(q) > 0), default=None)
+                        self.state.pvd_usual[t] = pvd_usual_sample(
+                            self.state.pvd_usual.get(t), now_ts, _tb,
+                            None if _tn is None else 100.0 - _tn)
+                except Exception as e:      # never costs the cycle: sizes as built
+                    if not getattr(self, "_off_usual_big_err_logged", False):
+                        self._off_usual_big_err_logged = True
+                        log(f"{self.tag} ! off-usual size (big sides) failed on {t} ({e!r}); "
+                            f"sizes left as built (logged once)")
+                self._off_usual_note(now_ts)
             # CHEAP-SIDE BOOK (CHEAP_FILE): its one rung REPLACES whatever the
             # plain path built -- the cheap side alone, pinned at its own price,
             # only while it earns; dry logs it and rests nothing; a reduce-only
@@ -41990,6 +42072,14 @@ class IncentiveMarketMaker:
                                              if PVD_OFF_USUAL_COLD else "")
                + ("" if PVD_OFF_USUAL_MODE == "on" else " (dry: logged, nothing cut)")
                if PVD_OFF_USUAL_MODE in ("on", "dry") else ""))
+        log(f"off-usual size for big sides off the list (2026-11-08): {OFF_USUAL_BIG_MODE}"
+            + (f" -- a market off the wave list whose side plans {OFF_USUAL_BIG_MIN:,}+ "
+               f"contracts and rests more than {PVD_OFF_USUAL_C:g}c nearer the taker than "
+               f"its {PVD_OFF_USUAL_HOURS:g}h median touch (at least {OFF_USUAL_BIG_MIN_N} "
+               f"samples, one per {PVD_OFF_USUAL_SAMPLE_S / 60:g} min) rests no more than "
+               f"{OFF_USUAL_BIG_MIN:,}; with fewer samples it keeps its size"
+               + ("" if OFF_USUAL_BIG_MODE == "on" else " (dry: logged, nothing cut)")
+               if OFF_USUAL_BIG_MODE in ("on", "dry") else ""))
         log("mid-move breaker: "
             + ("EVERY series (IMM_BREAKERS=1)" if BREAKERS_ENABLED else
                (",".join(sorted(MOVE_BREAKER_SERIES)) + " only (2026-10-09)")
