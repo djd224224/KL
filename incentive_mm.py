@@ -12384,6 +12384,13 @@ HALT_FILE = os.path.join(STATUS_DIR, "HALT")
 # bait book cannot drag the whole position there); with no usual price, at
 # its own price. The size backstop at placement lets it rest the position.
 UNWIND_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY")
+# ...EXCEPT THE WAVES (Jack 2026-11-08: "Turn market wave autoquoting back
+# on"): while this file exists too, every listed market (pvd_entry: each
+# market-wave wave and the post-vote dead books) quotes both sides as usual,
+# under its own guards (re-anchor cap, join wait + rest memory, off-usual
+# size); every other market stays unwind-only. Without UNWIND_ONLY it does
+# nothing.
+UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
 
 
 def unwind_only_quotes(quotes: List["Quote"], pos: float,
@@ -24978,6 +24985,7 @@ class IncentiveMarketMaker:
         self._full_earn: Dict[str, Tuple[float, float, Dict[str, tuple]]] = {}  # FULL-EARN SIZE: t -> (ts, pool/day, trims)
         self._full_earn_logged = 0.0
         self._unwind_only = False      # UNWIND ONLY: UNWIND_ONLY_FILE seen this cycle
+        self._unwind_waves = False     # ...EXCEPT THE WAVES: UNWIND_WAVES_FILE too
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
         self._off_usual_logged = 0.0
         self._off_usual_noted: Dict[str, tuple] = {}
@@ -33992,6 +34000,11 @@ class IncentiveMarketMaker:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
 
+    def _unwinds(self, t: str) -> bool:
+        """Does market `t` only unwind this cycle (UNWIND ONLY, and not a
+        listed wave market while UNWIND_WAVES_FILE exists)?"""
+        return self._unwind_only and not (self._unwind_waves and pvd_entry(t) is not None)
+
     def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple]) -> None:
         """Log a side's OFF-USUAL SIZE cut when it starts or changes."""
         key = tuple(sorted((s, round(c[2], 1), None if c[3] is None else round(c[3], 1), c[0])
@@ -35405,6 +35418,13 @@ class IncentiveMarketMaker:
                    f"reduces the bot's own position, never past flat; flat markets rest "
                    f"nothing" if _uo else "OFF: both sides quote again"))
         self._unwind_only = _uo
+        _uw = _uo and os.path.exists(UNWIND_WAVES_FILE)
+        if _uw != self._unwind_waves:
+            log(f"{self.tag} UNWIND ONLY EXCEPT THE WAVES "
+                + (f"ON ({UNWIND_WAVES_FILE}): every listed wave market quotes both "
+                   f"sides as usual; every other market only unwinds" if _uw
+                   else "OFF" + (": every market only unwinds" if _uo else "")))
+        self._unwind_waves = _uw
         if self.state.halted_until > now_ts:
             log(f"{self.tag} daily-loss halt active until "
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
@@ -35838,7 +35858,7 @@ class IncentiveMarketMaker:
                 self._gskip(t, "scan_evicted")
                 continue
 
-            reduce_only = t not in self.state.selected or self._unwind_only
+            reduce_only = t not in self.state.selected or self._unwinds(t)
             # Registry for place_order: exchange-side expiration is capped at
             # the cutoff so resting orders cannot fill past event start.
             if meta.cutoff is not None:
@@ -37799,7 +37819,7 @@ class IncentiveMarketMaker:
             # UNWIND ONLY (UNWIND_ONLY_FILE): last, after every path that adds
             # a rung (leads, closes, offsets): the reducing side alone, never
             # past flat
-            if self._unwind_only:
+            if self._unwinds(t):
                 _u_touch = _u_usual = None
                 if abs(own_pos) >= 1:
                     try:
@@ -37850,7 +37870,7 @@ class IncentiveMarketMaker:
             # target, it stops qualifying -- so it neither counts nor pages;
             # nor does one the sweep or group breaker holds, or one on a shard
             # Kalshi has paused: coverage_exempt.)
-            if not fast_only and t in self.state.selected and mq and not self._unwind_only \
+            if not fast_only and t in self.state.selected and mq and not self._unwinds(t) \
                     and pad_band_ok(meta.series, ext_bid, ext_ask) \
                     and not self.coverage_exempt(t, now_ts):
                 if sides < 2:
@@ -38841,7 +38861,7 @@ class IncentiveMarketMaker:
                     side_cap = max_level_size = float(_pvn[0] if q.book_side == "bid" else _pvn[1])
             # UNWIND ONLY: the reducing side rests the whole position as one
             # order (the quote loop sized it so, unwind_only_quotes)
-            if self._unwind_only:
+            if self._unwinds(q.ticker):
                 _up = self.pnl.pos.get(q.ticker, 0.0)
                 if abs(_up) >= 1 and (_up < 0) == (q.book_side == "bid"):
                     side_cap = max(side_cap, abs(_up))

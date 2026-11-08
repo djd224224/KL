@@ -147,6 +147,7 @@ def setUpModule():
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
     imm.UNWIND_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY")
+    imm.UNWIND_WAVES_FILE = os.path.join(tmp, "UNWIND_ONLY_EXCEPT_WAVES")
     imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
     imm.OWN_BOOK_FLATTEN_FILE = os.path.join(tmp, "own_book_flatten.txt")
     # a live sniper book on this machine must not net into the fixtures
@@ -40780,21 +40781,24 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(imm.external_touch_exact([[5.9, 100.0], [6.0, 30.0]], [[93.9, 50.0], [90.0, 10.0]],
                                                   [("bid", 6.0, 30.0)]), (5.9, 6.1))
 
-        def orders(pos, unwind):
+        def orders(pos, unwind, waves=False):
             _clean_persist()
             self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
             bot = IncentiveMarketMaker(client=FakeClient(), live=False)
             if pos:
                 bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, 50.0
                 bot.client.positions[self.T] = pos
-            flag = imm.UNWIND_ONLY_FILE
+            flag, wflag = imm.UNWIND_ONLY_FILE, imm.UNWIND_WAVES_FILE
             if unwind:
                 open(flag, "w").close()
+            if waves:
+                open(wflag, "w").close()
             try:
                 bot.run_cycle()
             finally:
-                if os.path.exists(flag):
-                    os.remove(flag)
+                for f in (flag, wflag):
+                    if os.path.exists(f):
+                        os.remove(f)
             return sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
                           if o["ticker"] == self.T)
         self.assertEqual({s for s, _n in orders(0.0, False)}, {"bid", "ask"})   # off: both sides
@@ -40805,6 +40809,12 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         # past the listed 200 a side: the whole position in one order, the
         # placement backstop lets it through
         self.assertEqual(orders(500.0, True), [("ask", 500.0)])
+        # Jack 2026-11-08: "Turn market wave autoquoting back on" -- with
+        # UNWIND_ONLY_EXCEPT_WAVES too, a listed (wave) market quotes as usual
+        self.assertEqual(orders(150.0, True, waves=True), orders(150.0, False))
+        self.assertEqual({s for s, _n in orders(0.0, True, waves=True)}, {"bid", "ask"})
+        # ...and the except file alone (no UNWIND_ONLY) changes nothing
+        self.assertEqual(orders(150.0, False, waves=True), orders(150.0, False))
 
     def test_off_usual_size_rests_the_base_off_the_usual_price(self):
         """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the
