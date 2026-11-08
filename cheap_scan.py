@@ -108,7 +108,11 @@ def programs(client, prefixes, now):
 
 
 def own_orders(client):
-    own, exact, cursor = {}, {}, None
+    """The bot's resting orders per market (book cents, exact cents), and the
+    markets where the account rests orders the bot did not place (Jack's own:
+    the bot stands off a market with one -- its manual standoff -- so a rung
+    listed there would never rest)."""
+    own, exact, foreign, cursor = {}, {}, set(), None
     for _ in range(60):
         q = {"status": "resting", "limit": 1000}
         if cursor:
@@ -116,6 +120,8 @@ def own_orders(client):
         r = client.get("/portfolio/orders", params=q) or {}
         for o in r.get("orders") or []:
             if not str(o.get("client_order_id", "")).startswith(imm.CLIENT_ORDER_PREFIX + "-"):
+                if o.get("ticker"):
+                    foreign.add(o["ticker"])
                 continue
             bp = imm.order_yes_book_cents(o)
             if bp:
@@ -126,7 +132,7 @@ def own_orders(client):
         cursor = r.get("cursor")
         if not cursor or not r.get("orders"):
             break
-    return own, exact
+    return own, exact, foreign
 
 
 def best_rung(t, pr, ob, own, own_exact, max_usd, hrs):
@@ -213,7 +219,7 @@ def scan(a) -> int:
         ds = [ts(m[k]) for k in ("expected_expiration_time", "close_time") if m.get(k)]
         if ds and (min(ds) - now).total_seconds() / 86400 >= a.min_days:
             far[t] = (m, min(ds))
-    own, own_exact = own_orders(client)
+    own, own_exact, foreign = own_orders(client)
 
     def book(t):
         ob = rd(f"/markets/{t}/orderbook")
@@ -222,7 +228,8 @@ def scan(a) -> int:
     with ThreadPoolExecutor(4) as ex:
         books = dict(ex.map(book, sorted(far)))
 
-    rows, why = [], {"no book": 0, "no paying 1-2c rung": 0, "under bar": 0, "bot earns more": 0}
+    rows, why = [], {"no book": 0, "no paying 1-2c rung": 0, "under bar": 0, "bot earns more": 0,
+                     "your orders there": 0}
     for t, (m, hz) in sorted(far.items()):
         ob = books.get(t)
         if not ob:
@@ -245,6 +252,10 @@ def scan(a) -> int:
         if pick is None:
             why["no paying 1-2c rung"] += 1
             r["verdict"] = "none"
+        elif t in foreign:
+            # (the bot's manual standoff: it rests nothing beside orders it did not place)
+            why["your orders there"] += 1
+            r["verdict"] = "your orders there"
         elif pick["proj"] < a.bar and not same:
             why["under bar"] += 1
             r["verdict"] = "under bar"
