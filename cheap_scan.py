@@ -98,6 +98,9 @@ REJECTED_1108 = {
     "KXBOZPERMITS": "Bozeman permits: monthly data",
     "KXUCLLEADER": "Champions League leaders: weekly information (borderline)",
     "KXMILEAD": "left out 11/08",
+    # the first --discover flag, 11/08 21:05Z (Jack: "KXPNP is not truly far out because it
+    # can be settled tomororw"): truly far = the answer cannot land before 6M out
+    "KXPNP": "P vs NP before 2028: a proof would settle it the day it lands",
 }
 
 
@@ -536,7 +539,10 @@ def discover(a) -> int:
                 "title": (m.get("title") or "")[:90], "side": pick["side"], "px": pick["px"],
                 "size": pick["size"], "share": round(float(pick["share"]), 4),
                 "usd_day": round(pick["usd_day"], 2), "risk": round(pick["risk"], 2),
-                "proj": round(pick["proj"], 2), "horizon": zs(hz), "stop": zs(pr["end"])})
+                "proj": round(pick["proj"], 2), "horizon": zs(hz), "stop": zs(pr["end"]),
+                # Kalshi's own words on an early close: every market says it can, so
+                # only the wording helps Jack judge whether it can settle tomorrow
+                "early": " ".join(str(m.get("early_close_condition") or "").split())[:160]})
     cands = []
     for s, g in sorted(by.items()):
         ms = sorted(g["markets"], key=lambda x: -x["usd_day"])
@@ -552,7 +558,8 @@ def discover(a) -> int:
             "usd_day": round(sum(x["usd_day"] for x in ms), 2), "risk": round(sum(x["risk"] for x in ms), 2),
             "proj": round(sum(x["proj"] for x in ms), 2),
             "horizon_min": min(x["horizon"] for x in ms), "horizon_max": max(x["horizon"] for x in ms),
-            "program_end": min(x["stop"] for x in ms), "top": ms[:5]})
+            "program_end": min(x["stop"] for x in ms),
+            "early": next((x["early"] for x in ms if x.get("early")), ""), "top": ms[:5]})
     cands.sort(key=lambda c: (not c["new"], -c["usd_day"]))
     if ok:
         try:   # re-read: an --approve / --reject since the start stays
@@ -666,6 +673,8 @@ def render_discover(d, now):
         lines.append(f"      {c['n_list']} market(s) pay: ${c['usd_day']:.2f}/day modelled, ${c['risk']:,.0f} if "
                      f"every rung fills, ${c['proj']:.2f} by the program end {c['program_end'][:10]}; Kalshi "
                      f"dates it {hz}{more}")
+        if c.get("early"):
+            lines.append(f"      Kalshi on an early close: \"{c['early']}\"")
         for x in c["top"][:3]:
             lines.append(f"      {x['ticker']} ({x['sub']}): {x['side'].upper()} bid {x['px']}c x{x['size']:,}, "
                          f"{x['share'] * 100:.0f}% of its side, ${x['usd_day']:.2f}/day")
@@ -675,8 +684,10 @@ def render_discover(d, now):
     if len(old) > 10:
         lines.append(f"  ... and {len(old) - 10} more (run-logs/cheap-scan/discover.json)")
     if cands:
-        lines.append("  Is the answer really 6M+ away? Kalshi's dates often are not (Grammy nominations read "
-                     "358 days out, announced 11/16). To quote one, tell Claude \"approve <series> for the "
+        lines.append("  Could it settle tomorrow -- a proof, an announcement, a signing, a transfer? Then it "
+                     "is not truly far (your 11/08 call on KXPNP, P vs NP before 2028). Kalshi's dates do not "
+                     "tell (Grammy nominations read 358 days out, announced 11/16), nor does its early-close "
+                     "flag (every market carries it). To quote one, tell Claude \"approve <series> for the "
                      "cheap-side books\"; to stop seeing it, \"reject <series>\" (cheap_scan.py --approve / "
                      "--reject).")
     return lines, len(new)

@@ -44,6 +44,7 @@ class TestSeriesScope(_TempPaths):
         self.assertEqual(cs.pat_match("KXBOND", cs.REJECTED_1108), "KXBOND")
         self.assertIsNone(cs.pat_match("KXBONDYIELD", cs.REJECTED_1108))   # exact, not a prefix
         self.assertIsNone(cs.pat_match("KXSTATE51", cs.REJECTED_1108))
+        self.assertEqual(cs.pat_match("KXPNP", cs.REJECTED_1108), "KXPNP")   # "can be settled tomororw"
 
     def test_scope_prefixes_approvals_rejections(self):
         st = {"approved": {"KXFOO": {}}, "rejected": {"KXMOONMAN": {}}, "seen": {}}
@@ -192,7 +193,7 @@ class TestRenderDiscover(unittest.TestCase):
         return {"series": s, "title": f"{s} title", "category": "Politics", "first_seen": "2026-11-09T13:30:00Z",
                 "new": new, "n_list": 2, "yours": 0, "bot_more": 0, "usd_day": usd, "risk": 100.0, "proj": 9.0,
                 "horizon_min": "2028-11-07T15:00:00Z", "horizon_max": "2028-11-07T15:00:00Z",
-                "program_end": "2026-11-15T05:00:00Z",
+                "program_end": "2026-11-15T05:00:00Z", "early": "This market will close early if the event occurs.",
                 "top": [{"ticker": f"{s}-28-A", "sub": "A", "side": "yes", "px": 1, "size": 5000,
                          "share": 0.25, "usd_day": 2.0}]}
 
@@ -212,6 +213,8 @@ class TestRenderDiscover(unittest.TestCase):
         self.assertIn("KXNEW-28-A (A): YES bid 1c x5,000, 25% of its side", text)
         self.assertIn("waiting since 2026-11-09: KXOLD", text)
         self.assertIn("approve <series>", text)
+        self.assertIn("Could it settle tomorrow", text)
+        self.assertIn('Kalshi on an early close: "This market will close early if the event occurs."', text)
         self.assertNotIn("STALE", text)
         lines, _ = cs.render_discover(d, now + timedelta(days=2))
         self.assertIn("STALE", lines[1])
