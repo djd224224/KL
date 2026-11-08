@@ -12499,7 +12499,16 @@ UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
 # REDUCE_ONLY_MIN_CONTRACTS+ and that the selection left out is managed anyway,
 # for this unwind alone (_wave_unwind_manage). It needs no program: it earns
 # nothing and is there to work the position down. Its meta is read once
-# (get_markets, 50 a call) and kept while it is held.
+# (get_markets, 50 a call) and kept while it is held. ...PAST THREE GUARDS
+# (Jack 2026-11-08: "Yes, those 22", on 22 undecided wave markets, $4.8k at
+# cost, that rested nothing): a breakeven unwind (_unwinds_at_breakeven, a
+# position of 1+) skips the two-sided depth gate (cannot_qualify: it earns
+# nothing either way) and the post-vote side guard (pvd_guard_quotes: its
+# price is the bot's cost or better); and a held market's fail-closed cutoff
+# (RELEASE_GUARD_UNKNOWN: no verified election day, e.g. the 2028 House races)
+# becomes a day before Kalshi's own date. A cutoff that is a real date stays:
+# the 2026 midterm markets (voting day 11/03 passed) rest nothing and ride to
+# settlement -- a breakeven order there fills only on the winners.
 UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
 
 
@@ -35082,21 +35091,28 @@ class IncentiveMarketMaker:
         t = m.get("ticker", "")
         self._note_shard(t, m.get("exchange_index"))
         event_ticker = m.get("event_ticker") or t.rsplit("-", 1)[0]
+        raw = trade_cutoff_utc(
+            event_ticker,
+            parse_iso_utc(m.get("occurrence_datetime", "")),
+            parse_iso_utc(m.get("expected_expiration_time", "")))
+        cutoff = apply_series_cutoff_adjustments(
+            t.split("-")[0], event_ticker, raw,
+            # close_time is what makes the close-anchored rule
+            # (temp close-10) work on THIS producer too; market
+            # is what makes the data-month release guard work here
+            close_time=parse_iso_utc(m.get("close_time", "")),
+            market=m, pvd_stop=pvd_stop)
+        if not pvd_stop and cutoff == RELEASE_GUARD_UNKNOWN and raw is not None:
+            # THE WAVES ALONE AT BREAKEVEN, past three guards: a held wave
+            # market's fail-closed cutoff (no verified date) is a day before
+            # Kalshi's own date for its unwind
+            cutoff = raw - timedelta(days=1)
+            log(f"{self.tag} wave unwind {t}: no verified date -- its unwind "
+                f"stops a day before Kalshi's ({cutoff:%Y-%m-%d %H:%MZ})")
         return MarketMeta(
             ticker=t, event_ticker=event_ticker, series=t.split("-")[0],
             dollars_per_day=0.0, program_end=None, target_size=0.0,
-            discount_factor=0.5,
-            cutoff=apply_series_cutoff_adjustments(
-                t.split("-")[0], event_ticker,
-                trade_cutoff_utc(
-                    event_ticker,
-                    parse_iso_utc(m.get("occurrence_datetime", "")),
-                    parse_iso_utc(m.get("expected_expiration_time", ""))),
-                # close_time is what makes the close-anchored rule
-                # (temp close-10) work on THIS producer too; market
-                # is what makes the data-month release guard work here
-                close_time=parse_iso_utc(m.get("close_time", "")),
-                market=m, pvd_stop=pvd_stop),
+            discount_factor=0.5, cutoff=cutoff,
             close_time=parse_iso_utc(m.get("close_time", "")),
             price_step=market_price_step(m))
 
@@ -36599,7 +36615,10 @@ class IncentiveMarketMaker:
             bid_ok, ask_ok = sides_can_qualify(
                 meta.series, meta.target_size, depth_yes, depth_no,
                 ext_bid, ext_ask, ticker=t)
-            if not (bid_ok and ask_ok):
+            # (a breakeven wave unwind earns nothing either way: no gate --
+            # THE WAVES ALONE AT BREAKEVEN, past three guards)
+            if not (bid_ok and ask_ok) and not (
+                    self._unwinds_at_breakeven(t) and abs(own_pos) >= 1):
                 n_cx = self.cancel_market_orders(t, resting)
                 if n_cx:
                     log(f"{self.tag} cannot qualify {t}: yes {depth_yes:.0f} / "
@@ -37768,7 +37787,10 @@ class IncentiveMarketMaker:
                               if (lv_ask and "ask" not in _has) else 0)))
             # post-vote dead-book side guard: LAST with the fair gates -- no
             # pads, no bid over bid_max, no ask under ask_min (pvd_guard_quotes)
-            if pvd is not None:
+            # (a breakeven wave unwind skips it: its one order is the bot's
+            # cost or better -- THE WAVES ALONE AT BREAKEVEN, past three guards)
+            if pvd is not None and not (
+                    self._unwinds_at_breakeven(t) and abs(own_pos) >= 1):
                 _pv_before = {q.book_side for q in mq if not q.is_pad}
                 _pv_last = PVD_LAST.get(t)
                 # the side that reduces the bot's own position is exempt from the

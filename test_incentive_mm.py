@@ -40988,6 +40988,47 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(listed, [("ask", 70, 150.0)])
         self.assertEqual(rest, [])
 
+    def test_breakeven_unwinds_skip_three_guards(self):
+        """Jack 2026-11-08: "Yes, those 22" -- a breakeven wave unwind rests
+        past the depth gate and the post-vote side guard, and a held wave
+        market's unknown-date cutoff becomes a day before Kalshi's own date;
+        a real passed cutoff stays"""
+        def run(pos, avg, flag=True):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, avg
+            bot.client.positions[self.T] = pos
+            if flag:
+                open(imm.UNWIND_WAVES_ONLY_FILE, "w").close()
+            try:
+                with mock.patch.object(imm, "log", lambda *a, **k: None), \
+                        mock.patch.object(imm, "sides_can_qualify", lambda *a, **k: (False, False)), \
+                        mock.patch.object(imm, "pvd_guard_quotes", lambda *a, **k: []):
+                    bot.run_cycle()
+            finally:
+                if os.path.exists(imm.UNWIND_WAVES_ONLY_FILE):
+                    os.remove(imm.UNWIND_WAVES_ONLY_FILE)
+            return sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                          for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+        self.assertEqual(run(-80.0, 45.0), [("bid", 45, 80.0)])       # both guards would block
+        self.assertEqual(run(150.0, 70.0), [("ask", 70, 150.0)])
+        self.assertEqual(run(-80.0, 45.0, flag=False), [])           # not unwinding: guarded
+        self.assertEqual(run(0.0, None), [])                         # flat: nothing
+
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        m = {"ticker": "KXGOOD-99DEC31-A", "event_ticker": "KXGOOD-99DEC31",
+             "occurrence_datetime": "2099-11-07T15:00:00Z",
+             "close_time": "2100-11-07T15:00:00Z"}
+        unknown = lambda *a, **k: imm.RELEASE_GUARD_UNKNOWN
+        with mock.patch.object(imm, "apply_series_cutoff_adjustments", unknown):
+            self.assertEqual(bot._held_meta(m, pvd_stop=False).cutoff,
+                             datetime(2099, 11, 6, 15, 0, tzinfo=timezone.utc))
+            self.assertEqual(bot._held_meta(m).cutoff, imm.RELEASE_GUARD_UNKNOWN)   # orphans: fail closed
+        voted = datetime(2026, 11, 3, 5, 0, tzinfo=timezone.utc)
+        with mock.patch.object(imm, "apply_series_cutoff_adjustments", lambda *a, **k: voted):
+            self.assertEqual(bot._held_meta(m, pvd_stop=False).cutoff, voted)        # a real date stays
+
     def test_held_wave_markets_outside_the_selection_unwind_too(self):
         """Jack 2026-11-08: "Yes, unwind them" -- a market on the wave list
         (its stop passed, its program gone) where the bot holds a position the
