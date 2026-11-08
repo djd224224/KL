@@ -39761,6 +39761,42 @@ class TestJoinWait1102(unittest.TestCase):
             self.assertIn(want, self._paris_rungs(bot, P), (sub, [s for s in lines if "join wait" in s]))
             self.assertEqual(any("join wait" in s and "wants 55c, rests 41c" in s for s in lines), sub)
 
+    def test_a_side_back_after_a_halt_starts_from_its_last_rest(self):
+        """Jack 2026-11-08: "Build both 1". While the bot sat halted with its
+        orders cancelled, OH08-D's bid moved 9 -> 14c and IN09-D's 3 -> 12c; the
+        restart had no rung and no clocks, joined at once and was picked off. A
+        side with no rung now starts from where it last rested (24 h), so the
+        moved price has to stand its wait; with the memory at 0 it joins at once."""
+        for mem, want in ((24.0, ("bid", 41, 4000)), (0.0, ("bid", 55, 4000))):
+            lines = []
+            client, P = self._paris_bot(lines)
+            with contextlib.ExitStack() as stack:
+                for p in self._patches(lines) + [
+                        mock.patch.object(imm, "JOIN_WAIT_REST_MEMORY_H", mem)]:
+                    stack.enter_context(p)
+                bot = IncentiveMarketMaker(client=client, live=False)
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+                self.assertIn(("bid", 40, 5000), self._paris_rungs(bot, P))
+                self.assertEqual(bot.state.join_wait_last[f"{P}|bid"][0], 40)
+                # the halt: every order cancelled, the clocks past their 60 min
+                bot.cancel_all_bot_orders()
+                self.assertEqual(self._paris_rungs(bot, P), [])
+                bot.state.join_wait.clear()
+                client.books[P]["orderbook_fp"]["yes_dollars"] = self.book + [["0.5500", "10456.00"]]
+                bot.run_cycle()
+            self.assertIn(want, self._paris_rungs(bot, P),
+                          (mem, [s for s in lines if "join wait" in s]))
+
+    def test_the_last_rest_persists_24_hours(self):
+        last = {"T|bid": [40, 1000.0], "T|ask": [31, 1000.0 - 25 * 3600]}
+        out = imm.join_wait_last_payload(last, 1060.0)
+        self.assertEqual(out, {"T|bid": [40, 1000]})          # past 24 h: dropped
+        self.assertEqual(imm.join_wait_last_load(out), {"T|bid": [40, 1000.0]})
+        self.assertEqual(imm.join_wait_last_load({"bad": ["x"]}), {})
+
     def test_dry_logs_the_wait_and_rests_where_it_wants(self):
         lines = []
         client, P = self._paris_bot(lines)
@@ -40207,6 +40243,56 @@ class TestFullEarnSize(unittest.TestCase):
         self.assertEqual(set(trims), {"bid"})
 
 
+class TestOffUsualSize(unittest.TestCase):
+    """Jack 2026-11-08: "Build both 1" -- a listed side resting more than 3c
+    nearer the taker than its 6-hour median touch rests no more than its base
+    size: IN09-D's bid 3 -> 12c and OH08-D's 9 -> 14c filled 2,813 and 5,452
+    under the cheap-side multipliers (~-$400)."""
+
+    def test_usual_is_the_median_of_4_or_more_samples(self):
+        h = None
+        for i, (b, a) in enumerate([(3, 4), (3, 4), (12, 14)]):
+            h = imm.pvd_usual_sample(h, 1000.0 + 900 * i, b, a)
+        self.assertEqual(imm.pvd_usual_px(h, 1000.0 + 1800), (None, None))    # 3 < 4
+        h = imm.pvd_usual_sample(h, 1000.0 + 2700, 3, 4)
+        self.assertEqual(imm.pvd_usual_px(h, 1000.0 + 2700), (3.0, 4.0))
+        # one sample per 15 min; 6 h kept; a side with no touch is skipped
+        self.assertEqual(len(imm.pvd_usual_sample(h, 1000.0 + 2701, 9, 9)), 4)
+        h2 = imm.pvd_usual_sample(h, 1000.0 + 7 * 3600, None, 50)
+        self.assertEqual(len(h2), 1)
+        self.assertEqual(imm.pvd_usual_px(h2, 1000.0 + 7 * 3600, min_n=1), (None, 50.0))
+        # persisted inside the window only, and read back
+        pay = imm.pvd_usual_payload({"T": h, "U": []}, 1000.0 + 2700)
+        self.assertEqual(list(pay), ["T"])
+        self.assertEqual(imm.pvd_usual_px(imm.pvd_usual_load(pay)["T"], 1000.0 + 2700), (3.0, 4.0))
+
+    def test_a_side_off_its_usual_rests_the_base(self):
+        Q, T = imm.Quote, "KXGOOD-99DEC31-A"
+        qs = [Q(T, "bid", 12, 2813), Q(T, "ask", 14, 3000), Q(T, "bid", 1, 500, is_pad=True)]
+        out, cuts = imm.pvd_off_usual_cut(qs, 3.0, 4.0, 300)
+        self.assertEqual(sorted((q.book_side, q.price_cents, q.count, q.is_pad) for q in out),
+                         [("ask", 14, 3000, False), ("bid", 1, 500, True), ("bid", 12, 300, False)])
+        self.assertEqual(cuts, {"bid": (2813, 300, 12.0, 3.0)})
+        # within 3c, or no usual price yet: untouched
+        self.assertEqual(imm.pvd_off_usual_cut(qs, 9.0, None, 300)[1], {})
+        # an ask 3c+ under its usual (IL06-D 96 -> 67c): the base, nearest rung first
+        out, cuts = imm.pvd_off_usual_cut([Q(T, "ask", 67, 1000), Q(T, "ask", 68, 1000)],
+                                          None, 96.0, 300)
+        self.assertEqual([(q.price_cents, q.count) for q in out], [(67, 300)])
+        # a side already at or under the base is left alone
+        self.assertEqual(imm.pvd_off_usual_cut([Q(T, "bid", 12, 200)], 3.0, None, 300)[1], {})
+        # no usual price yet (a restart after a long halt, a new listing): the
+        # base for the cold sides only
+        out, cuts = imm.pvd_off_usual_cut(qs[:2], None, None, 300, cold_sides=("bid",))
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 3000), ("bid", 300)])
+        self.assertEqual(cuts, {"bid": (2813, 300, 12.0, None)})
+        # the side that reduces a position keeps base + the position (flip-through):
+        # long 5,451 (OH08-D), the ask off its usual keeps 300 + 5,451; the bid 300
+        qs = [Q(T, "bid", 14, 5452), Q(T, "ask", 9, 9000)]
+        out, cuts = imm.pvd_off_usual_cut(qs, 8.0, 13.0, 300, pos=5451.0)
+        self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 5751), ("bid", 300)])
+
+
 class TestPostVoteDeadBooks(unittest.TestCase):
     """Jack 2026-11-04: the post-vote election wave's dead books ("a lot of
     'dead' books, with wide gaps like KXATTYGENOH-26, KXOHTREASR-26NOV03"),
@@ -40215,6 +40301,12 @@ class TestPostVoteDeadBooks(unittest.TestCase):
 
     def setUp(self):
         _ens_1103_on(self)     # the list skips a session's series (11/04 build)
+        # a fresh bot has no usual price yet: these tests size listed sides
+        # above the base on purpose, so the OFF-USUAL cold start is off here
+        # (test_off_usual_size_rests_the_base_off_the_usual_price sets it)
+        p = mock.patch.object(imm, "PVD_OFF_USUAL_COLD", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _write(self, markets, stop=None):
         stop = stop or (datetime.now(timezone.utc) + timedelta(hours=6))
@@ -40624,6 +40716,38 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([s for s, _n in on], [s for s, _n in off])
         self.assertTrue(all(1000.0 <= n < 30000.0 for _s, n in on), on)
         self.assertEqual(orders("dry"), off)
+
+    def test_off_usual_size_rests_the_base_off_the_usual_price(self):
+        """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the
+        taker than its 6-hour median touch rests its base size; at its usual
+        price, or "dry", it rests the listed size; each cycle samples the touch"""
+        def run(mode, usual, cold=True):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 300,
+                                  "bid_size": 30000, "ask_size": 30000}})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if usual is not None:
+                now = time.time()
+                bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), usual[0], usual[1]]
+                                               for i in range(8)]
+            with mock.patch.object(imm, "PVD_OFF_USUAL_MODE", mode), \
+                    mock.patch.object(imm, "PVD_OFF_USUAL_COLD", cold), \
+                    mock.patch.object(imm, "PVD_FULL_EARN_MODE", "off"):
+                bot.run_cycle()
+            return bot, sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                               for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+        _b, plain = run("off", None)              # off: the listed size
+        self.assertTrue(plain and all(n == 30000.0 for _s, _p, n in plain), plain)
+        bid = max(p for s, p, _n in plain if s == "bid")
+        ask = min(p for s, p, _n in plain if s == "ask")
+        bot, cold = run("on", None)               # no history yet: the base
+        self.assertEqual([(s, n) for s, _p, n in cold], [("ask", 300.0), ("bid", 300.0)])
+        self.assertEqual(len(bot.state.pvd_usual[self.T]), 1)    # the cycle sampled
+        self.assertEqual(run("on", None, cold=False)[1], plain)  # ..._COLD=full
+        _b, off = run("on", (bid - 10, ask + 10))   # both sides 10c toward the taker
+        self.assertEqual([(s, n) for s, _p, n in off], [("ask", 300.0), ("bid", 300.0)])
+        self.assertEqual(run("dry", (bid - 10, ask + 10))[1], plain)
+        self.assertEqual(run("on", (bid, ask))[1], plain)
 
     def test_wave_breaker_holds_the_side_across_the_series(self):
         """Jack 2026-11-07 (the House sweep 16:18-16:38Z): "yes build it, but hold

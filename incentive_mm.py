@@ -10231,6 +10231,136 @@ def full_earn_trim(quotes: List["Quote"], yes_levels: List[List[float]],
     return out, trims
 
 
+# OFF-USUAL SIZE (Jack 2026-11-08: "Build both 1"). A listed market's side
+# (post-vote dead books and every wave) that would rest more than
+# PVD_OFF_USUAL_C cents nearer the taker than its USUAL price -- the median of
+# the book's touch (ours included), sampled every PVD_OFF_USUAL_SAMPLE_S over
+# the last PVD_OFF_USUAL_HOURS -- rests no more than the entry's base size (its
+# "size", before the cheap-side multipliers), nearest-the-touch rung first.
+# 11/07-11/08 the books that picked us off sat off their usual price for 5-45
+# min (IN09-D 3 -> 12c, OH08-D 9 -> 14c, IL06-D 96 -> 67c) while cheap-side
+# multipliers rested 1,000-5,500 there: ~-$150-500 a fill, where the base
+# (200-450) costs ~$15-40. A real move gets full size back once it is the
+# usual price (about half the window). A side with fewer than
+# PVD_OFF_USUAL_MIN_N samples has no usual price yet and rests its base too
+# (PVD_OFF_USUAL_COLD; IMM_PVD_OFF_USUAL_COLD=full rests it in full): the
+# halted bot takes no samples, so a restart after a long halt -- or a new
+# listing -- spends its first hour at base size. Pads untouched. Samples persist (state.pvd_usual), so a halt or a
+# restart keeps the usual price. IMM_PVD_OFF_USUAL: "on" (default), "dry"
+# (logged, nothing cut), "off".
+PVD_OFF_USUAL_MODE = os.environ.get("IMM_PVD_OFF_USUAL", "on").strip().lower()
+PVD_OFF_USUAL_C = _env_float("IMM_PVD_OFF_USUAL_C", 3.0)
+PVD_OFF_USUAL_HOURS = _env_float("IMM_PVD_OFF_USUAL_HOURS", 6.0)
+PVD_OFF_USUAL_MIN_N = int(_env_float("IMM_PVD_OFF_USUAL_MIN_N", 4))
+PVD_OFF_USUAL_SAMPLE_S = _env_float("IMM_PVD_OFF_USUAL_SAMPLE_S", 900.0)
+PVD_OFF_USUAL_LOG_S = 600.0
+PVD_OFF_USUAL_COLD = os.environ.get("IMM_PVD_OFF_USUAL_COLD", "base").strip().lower() != "full"
+
+
+def pvd_usual_sample(hist, now: float, bid: Optional[float], ask: Optional[float],
+                     every: Optional[float] = None, hours: Optional[float] = None) -> list:
+    """A market's touch history ([unix secs, bid c or None, ask c or None]) with
+    one more sample when the last is `every` secs old or more, and nothing
+    older than `hours`."""
+    every = PVD_OFF_USUAL_SAMPLE_S if every is None else every
+    hours = PVD_OFF_USUAL_HOURS if hours is None else hours
+    h = list(hist or [])
+    if not h or now - float(h[-1][0]) >= every:
+        h.append([round(now), None if bid is None else round(float(bid), 1),
+                  None if ask is None else round(float(ask), 1)])
+    cut = now - hours * 3600.0
+    return [s for s in h if float(s[0]) >= cut]
+
+
+def pvd_usual_px(hist, now: float, hours: Optional[float] = None,
+                 min_n: Optional[int] = None) -> Tuple[Optional[float], Optional[float]]:
+    """(usual bid, usual ask): each side's median sample inside the last
+    `hours`, or None with fewer than `min_n` samples."""
+    hours = PVD_OFF_USUAL_HOURS if hours is None else hours
+    min_n = PVD_OFF_USUAL_MIN_N if min_n is None else min_n
+    cut = now - hours * 3600.0
+    out: List[Optional[float]] = []
+    for i in (1, 2):
+        xs = [float(s[i]) for s in (hist or []) if float(s[0]) >= cut and s[i] is not None]
+        out.append(float(statistics.median(xs)) if len(xs) >= max(1, int(min_n)) else None)
+    return out[0], out[1]
+
+
+def pvd_usual_payload(hists: Dict[str, list], now: float) -> Dict[str, list]:
+    """state.pvd_usual to persist: the samples inside PVD_OFF_USUAL_HOURS."""
+    cut = now - PVD_OFF_USUAL_HOURS * 3600.0
+    out: Dict[str, list] = {}
+    for t, h in (hists or {}).items():
+        try:
+            keep = [[round(float(s[0])), s[1], s[2]] for s in h if float(s[0]) >= cut]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if keep:
+            out[t] = keep
+    return out
+
+
+def pvd_usual_load(raw) -> Dict[str, list]:
+    """state.pvd_usual from pvd_usual_payload."""
+    out: Dict[str, list] = {}
+    for t, h in (raw or {}).items():
+        try:
+            out[str(t)] = [[float(s[0]), None if s[1] is None else float(s[1]),
+                            None if s[2] is None else float(s[2])] for s in h]
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def pvd_off_usual_cut(quotes: List["Quote"], usual_bid: Optional[float],
+                      usual_ask: Optional[float], base: int,
+                      off_c: Optional[float] = None,
+                      cold_sides: Tuple[str, ...] = (),
+                      pos: float = 0.0) -> Tuple[List["Quote"], Dict[str, tuple]]:
+    """(quotes, cuts): a side whose best rung rests more than `off_c` cents
+    nearer the taker than its usual price (a bid over usual_bid + off_c, an ask
+    under usual_ask - off_c) keeps at most `base` contracts, nearest-the-touch
+    rung first; a side in `cold_sides` (no usual price yet) keeps at most
+    `base` too. The side that reduces the position `pos` keeps base + |pos|,
+    so one fill can still take it flat and no further (flip-through).
+    cuts[side] = (planned, kept, best px, usual or None). Pads untouched."""
+    off_c = PVD_OFF_USUAL_C if off_c is None else off_c
+    base = int(base)
+    out = list(quotes)
+    cuts: Dict[str, tuple] = {}
+    if base < 1:
+        return out, cuts
+
+    def px(q) -> float:
+        return float(q.price_exact if q.price_exact is not None else q.price_cents)
+
+    for side, usual in (("bid", usual_bid), ("ask", usual_ask)):
+        if usual is None and side not in cold_sides:
+            continue
+        idx = [i for i, q in enumerate(out) if q.book_side == side and not q.is_pad]
+        if not idx:
+            continue
+        best = max(px(out[i]) for i in idx) if side == "bid" else min(px(out[i]) for i in idx)
+        if usual is None:
+            off = True                       # no usual price yet: the base
+        else:
+            off = best > usual + off_c if side == "bid" else best < usual - off_c
+        planned = sum(int(out[i].count) for i in idx)
+        cap = base + (int(abs(pos)) if (side == "ask" and pos >= 1) or (side == "bid" and pos <= -1)
+                      else 0)
+        if not off or planned <= cap:
+            continue
+        idx.sort(key=lambda i: -px(out[i]) if side == "bid" else px(out[i]))
+        left = cap
+        for i in idx:
+            keep = min(int(out[i].count), left)
+            out[i] = replace(out[i], count=keep)
+            left -= keep
+        out = [q for q in out if q.count > 0]
+        cuts[side] = (planned, cap, best, None if usual is None else float(usual))
+    return out, cuts
+
+
 def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
     """(bid_max, ask_min) in force: the entry's cushion (its kind's
     PVD_CUSHION_DEAD / _LIVE) either side of the market's last trade when
@@ -13094,6 +13224,10 @@ _CONFIG_CODE_KNOBS = (
     # join wait (2026-11-02)
     "JOIN_WAIT_MODE", "JOIN_WAIT_SECS_PER_DOLLAR", "JOIN_WAIT_FREE_DOLLARS",
     "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN", "JOIN_WAIT_SUBPENNY",
+    "JOIN_WAIT_REST_MEMORY_H",
+    # off-usual size on listed markets (2026-11-08)
+    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS",
+    "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -22200,6 +22334,16 @@ JOIN_WAIT_ANCHOR_MIN = _env_float("IMM_JOIN_WAIT_ANCHOR_MIN", 30.0)
 JOIN_WAIT_MEMORY_MIN = _env_float("IMM_JOIN_WAIT_MEMORY_MIN", 60.0)
 JOIN_WAIT_SUBPENNY = os.environ.get("IMM_JOIN_WAIT_SUBPENNY", "on").strip().lower() not in (
     "off", "0", "false", "no")
+# REST MEMORY (Jack 2026-11-08: "Build both 1"). A side with no rung resting
+# -- a halt, a guard pull or a restart cancelled it -- and no live clocks used
+# to start from where it WANTS, so it joined a moved book at once: 02:54Z 11/08
+# the daily-loss halt cancelled the book, OH08-D's bid moved 9 -> 14c and
+# IN09-D's 3 -> 12c while we were out, and the 03:26Z restart rested 5,452 and
+# 2,813 there; both were sold into within 6 min and the bids went back (~-$400).
+# Every side's last resting price (own price space) is now kept
+# JOIN_WAIT_REST_MEMORY_H hours (state.join_wait_last, persisted) and a side
+# with no rung starts from it, so the moved price has to stand its wait. 0 off.
+JOIN_WAIT_REST_MEMORY_H = _env_float("IMM_JOIN_WAIT_REST_MEMORY_H", 24.0)
 
 
 def join_wait_needed_secs(size: float, cents_over_anchor: float) -> float:
@@ -22301,6 +22445,31 @@ def join_wait_payload(states: Dict[str, dict], now: float) -> Dict[str, dict]:
                       "h": [[round(float(a), 1), int(b)] for a, b in st["h"]],
                       "hs": None if st.get("hs") is None else round(float(st["hs"]), 1)}
         except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def join_wait_last_payload(last: Dict[str, list], now: float) -> Dict[str, list]:
+    """state.join_wait_last to persist: [rest, unix secs] per side, the ones
+    inside JOIN_WAIT_REST_MEMORY_H."""
+    out: Dict[str, list] = {}
+    keep = JOIN_WAIT_REST_MEMORY_H * 3600.0
+    for k, v in (last or {}).items():
+        try:
+            if now - float(v[1]) <= keep:
+                out[k] = [int(v[0]), round(float(v[1]))]
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def join_wait_last_load(raw) -> Dict[str, list]:
+    """state.join_wait_last from join_wait_last_payload."""
+    out: Dict[str, list] = {}
+    for k, v in (raw or {}).items():
+        try:
+            out[str(k)] = [int(v[0]), float(v[1])]
+        except (TypeError, ValueError, IndexError):
             continue
     return out
 
@@ -24402,6 +24571,12 @@ class BotState:
     # Join wait (JOIN_WAIT_MODE, 2026-11-02): each at-ref side's clocks
     # "ticker|book_side" -> join_wait_step's state. Persisted (join_wait_payload).
     join_wait: Dict[str, dict] = field(default_factory=dict)
+    # ...and each side's last resting price, [rest, unix secs], kept
+    # JOIN_WAIT_REST_MEMORY_H (REST MEMORY, 2026-11-08). Persisted.
+    join_wait_last: Dict[str, list] = field(default_factory=dict)
+    # OFF-USUAL SIZE (2026-11-08): each listed market's touch samples,
+    # [[unix secs, bid c, ask c], ...] over PVD_OFF_USUAL_HOURS. Persisted.
+    pvd_usual: Dict[str, list] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
     order_ages: Dict[str, float] = field(default_factory=dict)
@@ -24730,6 +24905,9 @@ class IncentiveMarketMaker:
         self._lol_last_live: Dict[str, float] = {}
         self._full_earn: Dict[str, Tuple[float, float, Dict[str, tuple]]] = {}  # FULL-EARN SIZE: t -> (ts, pool/day, trims)
         self._full_earn_logged = 0.0
+        self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
+        self._off_usual_logged = 0.0
+        self._off_usual_noted: Dict[str, tuple] = {}
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
@@ -26179,6 +26357,8 @@ class IncentiveMarketMaker:
                 for e, v in (data.get("bait_event_until") or {}).items()}
             # join-wait clocks: a restart mid-wait keeps waiting
             self.state.join_wait = join_wait_load(data.get("join_wait"))
+            self.state.join_wait_last = join_wait_last_load(data.get("join_wait_last"))
+            self.state.pvd_usual = pvd_usual_load(data.get("pvd_usual"))
             # every other breaker / hold still running (GUARDS ACROSS RESTARTS)
             try:
                 self._restore_guard_holds(data)
@@ -26622,6 +26802,10 @@ class IncentiveMarketMaker:
                                for e, v in self.state.bait_event_until.items()
                                if v > time.time()},
                            "join_wait": join_wait_payload(self.state.join_wait,
+                                                          time.time()),
+                           "join_wait_last": join_wait_last_payload(
+                               self.state.join_wait_last, time.time()),
+                           "pvd_usual": pvd_usual_payload(self.state.pvd_usual,
                                                           time.time()),
                            # every other breaker / hold still running
                            # (GUARDS ACROSS RESTARTS)
@@ -32233,10 +32417,17 @@ class IncentiveMarketMaker:
                     mine = [100 - int(p) for bs, p, _n in own
                             if bs == "ask" and p < PAD_ASK_CENTS]
                 key = self._toxic_key(t, side)
+                resting = max(mine) if mine else None
+                if resting is None and JOIN_WAIT_REST_MEMORY_H > 0:
+                    # REST MEMORY: no rung (a halt / pull / restart cancelled
+                    # it) -- start from where the side last rested
+                    last = self.state.join_wait_last.get(key)
+                    if last and now_ts - float(last[1]) <= JOIN_WAIT_REST_MEMORY_H * 3600.0:
+                        resting = int(last[0])
                 st, rest, ev, held_s = join_wait_step(
-                    self.state.join_wait.get(key), want, float(room), now_ts,
-                    max(mine) if mine else None)
+                    self.state.join_wait.get(key), want, float(room), now_ts, resting)
                 self.state.join_wait[key] = st
+                self.state.join_wait_last[key] = [int(rest), round(now_ts)]
                 if ev is not None:
                     self._join_wait_note(t, side, ev, st, want, rest, float(room),
                                          held_s, now_ts)
@@ -32249,6 +32440,10 @@ class IncentiveMarketMaker:
                     self._join_wait_err_logged = True
                     log(f"{self.tag} ! join wait failed on {t} {side} ({e!r}); "
                         f"rests where it wants (logged once)")
+        if len(self.state.join_wait_last) > 20000:    # sides past the rest memory
+            keep = JOIN_WAIT_REST_MEMORY_H * 3600.0
+            self.state.join_wait_last = {k: v for k, v in self.state.join_wait_last.items()
+                                         if now_ts - float(v[1]) <= keep}
         if len(self.state.join_wait) > 4000:          # sides gone past their memory
             mem = JOIN_WAIT_MEMORY_MIN * 60.0
             self.state.join_wait = {k: v for k, v in self.state.join_wait.items()
@@ -33712,6 +33907,40 @@ class IncentiveMarketMaker:
             if abs(p) > 1e-9 and mark is not None:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
+
+    def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple]) -> None:
+        """Log a side's OFF-USUAL SIZE cut when it starts or changes."""
+        key = tuple(sorted((s, round(c[2], 1), None if c[3] is None else round(c[3], 1), c[0])
+                           for s, c in cuts.items()))
+        if self._off_usual_noted.get(t) == key:
+            return
+        self._off_usual_noted[t] = key
+        tag = "" if PVD_OFF_USUAL_MODE == "on" else " (dry)"
+        for side, (planned, kept, px, usual) in sorted(cuts.items()):
+            if usual is None:
+                log(f"{self.tag} off-usual size{tag} {t} {side}: rests {px:g}c with no "
+                    f"usual price yet (under {PVD_OFF_USUAL_MIN_N} samples) -- "
+                    f"{planned:,} -> {kept:,} (base size)")
+                continue
+            log(f"{self.tag} off-usual size{tag} {t} {side}: rests {px:g}c, "
+                f"{abs(px - usual):g}c nearer the taker than its {PVD_OFF_USUAL_HOURS:g}h "
+                f"usual {usual:g}c -- {planned:,} -> {kept:,} (base size)")
+
+    def _off_usual_note(self, now_ts: float) -> None:
+        """Every PVD_OFF_USUAL_LOG_S: one line on the sides OFF-USUAL SIZE cut."""
+        if now_ts - self._off_usual_logged < PVD_OFF_USUAL_LOG_S:
+            return
+        self._off_usual_logged = now_ts
+        live = {t: v for t, v in self._off_usual.items() if now_ts - v[0] <= PVD_OFF_USUAL_LOG_S}
+        for t in [t for t in self._off_usual if t not in live]:
+            self._off_usual.pop(t, None)
+            self._off_usual_noted.pop(t, None)
+        sides = sum(len(c) for _ts, c in live.values())
+        cts = sum(p - k for _ts, c in live.values() for p, k, _px, _u in c.values())
+        log(f"[IMM] off-usual size ({PVD_OFF_USUAL_MODE}, {PVD_OFF_USUAL_C:g}c past the "
+            f"{PVD_OFF_USUAL_HOURS:g}h median touch -> base size): {sides} side(s) in "
+            f"{len(live)} listed market(s) cut by {cts:,} contracts; "
+            f"{len(self.state.pvd_usual)} market(s) sampled")
 
     def _full_earn_note(self, now_ts: float) -> None:
         """Every PVD_FULL_EARN_LOG_S: one line on what FULL-EARN SIZE cut over
@@ -37416,6 +37645,38 @@ class IncentiveMarketMaker:
                 self._full_earn_note(now_ts)
             else:
                 self._full_earn.pop(t, None)
+            # OFF-USUAL SIZE (PVD_OFF_USUAL_MODE): a listed side resting more
+            # than PVD_OFF_USUAL_C c nearer the taker than its 6-hour median
+            # touch rests no more than the entry's base size; then this
+            # cycle's touch (ours included) joins the samples
+            if pvd is not None and PVD_OFF_USUAL_MODE in ("on", "dry"):
+                try:
+                    _ub, _ua = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
+                    if mq:
+                        _ou_q, _ou = pvd_off_usual_cut(
+                            mq, _ub, _ua, int(pvd.get("size") or 0),
+                            cold_sides=tuple(s for s, u in (("bid", _ub), ("ask", _ua))
+                                             if u is None) if PVD_OFF_USUAL_COLD else (),
+                            pos=cap_pos)
+                        if _ou:
+                            self._off_usual[t] = (now_ts, _ou)
+                            self._off_usual_side_note(t, _ou)
+                            if PVD_OFF_USUAL_MODE == "on":
+                                mq = _ou_q
+                        else:
+                            self._off_usual.pop(t, None)
+                            self._off_usual_noted.pop(t, None)
+                    _tb = max((float(p) for p, q in yes_levels if float(q) > 0), default=None)
+                    _tn = max((float(p) for p, q in no_levels if float(q) > 0), default=None)
+                    self.state.pvd_usual[t] = pvd_usual_sample(
+                        self.state.pvd_usual.get(t), now_ts, _tb,
+                        None if _tn is None else 100.0 - _tn)
+                except Exception as e:      # never costs the cycle: sizes as built
+                    if not getattr(self, "_off_usual_err_logged", False):
+                        self._off_usual_err_logged = True
+                        log(f"{self.tag} ! off-usual size failed on {t} ({e!r}); "
+                            f"sizes left as built (logged once)")
+                self._off_usual_note(now_ts)
             # BREAKEVEN OFFSET (a SELECTED market BE_OFFSET_DAYS out or
             # more): the reducing side carries the whole position at
             # breakeven or better. The event room below is charged the
@@ -41062,9 +41323,20 @@ class IncentiveMarketMaker:
                f"{JOIN_WAIT_MEMORY_MIN:g} min and across restarts; "
                + ("penny and sub-penny books (2026-11-08)" if JOIN_WAIT_SUBPENNY
                   else "penny books only (IMM_JOIN_WAIT_SUBPENNY=off)")
+               + (f"; a side with no rung starts from where it last rested "
+                  f"({JOIN_WAIT_REST_MEMORY_H:g} h memory)" if JOIN_WAIT_REST_MEMORY_H > 0
+                  else "; no rest memory (IMM_JOIN_WAIT_REST_MEMORY_H=0)")
                + ("" if JOIN_WAIT_MODE == "on" else " (dry: logged, nothing held)")
                if _jw_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _jw_live else ""))
+        log(f"off-usual size (2026-11-08): {PVD_OFF_USUAL_MODE}"
+            + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c nearer "
+               f"the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "
+               f"{PVD_OFF_USUAL_SAMPLE_S / 60:g} min, at least {PVD_OFF_USUAL_MIN_N}) rests no "
+               f"more than its base size" + ("; so does one with no usual price yet"
+                                             if PVD_OFF_USUAL_COLD else "")
+               + ("" if PVD_OFF_USUAL_MODE == "on" else " (dry: logged, nothing cut)")
+               if PVD_OFF_USUAL_MODE in ("on", "dry") else ""))
         log("mid-move breaker: "
             + ("EVERY series (IMM_BREAKERS=1)" if BREAKERS_ENABLED else
                (",".join(sorted(MOVE_BREAKER_SERIES)) + " only (2026-10-09)")
