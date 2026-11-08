@@ -3979,6 +3979,158 @@ class TestToxicSideHalt(unittest.TestCase):
         self.assertTrue(b2.toxic_event_halted("KXGOOD-99DEC31", now))
 
 
+class TestExternalMarks(unittest.TestCase):
+    """P&L today (the loss and net halts) values held positions from other
+    people's orders and trades only (Jack 2026-11-08: "Build marks that leave
+    out our own quotes, so the halt reads real prices?" -> "Yes, build it")."""
+
+    HELD, WIDE = "KXHELD-99DEC31-C", "KXWIDEHELD-99DEC31-D"
+
+    def _bot(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        c = bot.client
+        c.markets[self.HELD] = {
+            "ticker": self.HELD, "event_ticker": "KXHELD-99DEC31", "status": "active",
+            "yes_bid_dollars": "0.0300", "yes_ask_dollars": "0.1200",
+            "last_price_dollars": "0.1200"}
+        # the 12c offer is ours: 4,666 to sell = a NO bid of 4,666 at 88
+        c.books[self.HELD] = {"orderbook_fp": {"yes_dollars": [["0.03", "500"]],
+                                               "no_dollars": [["0.88", "4666"]]}}
+        c.markets[self.WIDE] = {
+            "ticker": self.WIDE, "event_ticker": "KXWIDEHELD-99DEC31", "status": "active",
+            "yes_bid_dollars": "0.1000", "yes_ask_dollars": "0.9000",
+            "last_price_dollars": "0.4000"}
+        bot.pnl.pos[self.HELD], bot.pnl.avg[self.HELD] = 4666.0, 12.0
+        bot.pnl.pos[self.WIDE], bot.pnl.avg[self.WIDE] = 100.0, 40.0
+        bot._own_fill_loaded = True
+        bot.state.own_last_fill_px.update({self.HELD: 12.0, self.WIDE: 40.0})
+        return bot
+
+    def test_the_halt_mark_rule(self):
+        hm = imm.halt_mark_cents
+        self.assertEqual(hm(40, 44, 12.0, 100, 30.0), 42.0)     # two-sided under 50c: the mid
+        self.assertEqual(hm(10, 90, 30.0, 100, 40.0), 30.0)     # wide: an outside trade inside the touch
+        self.assertEqual(hm(10, 90, 95.0, 100, 40.0), 90.0)
+        self.assertEqual(hm(10, 90, None, 100, 40.0), 10.0)     # wide, no outside trade: a long exits at the bid
+        self.assertEqual(hm(10, 90, None, -100, 40.0), 90.0)    # ... a short at the offer
+        self.assertEqual(hm(3, None, 10.0, 4666, 12.0), 10.0)   # bid only + an outside trade: max(trade, bid)
+        self.assertEqual(hm(3, None, None, 4666, 12.0), 3.0)    # bid only, the last trade ours: the bid
+        self.assertEqual(hm(None, 8, None, 4666, 12.0), 8.0)    # offer only: a long is worth at most it
+        self.assertEqual(hm(None, 30, None, 4666, 12.0), 12.0)  # ... and never more than cost off it
+        self.assertEqual(hm(None, 29, None, -180, 17.0), 29.0)  # AZ05R-P5: a short under a 29c offer
+        self.assertEqual(hm(5, None, None, -58, 91.5), 91.5)    # a short under a stray 5c bid: no phantom gain
+        self.assertEqual(hm(95, None, None, -58, 91.5), 95.0)   # ... a bid over cost: that loss
+        self.assertEqual(hm(None, None, None, 10, 33.0), 33.0)  # nothing outside: cost
+        self.assertEqual(hm(None, None, 20.0, 10, 33.0), 20.0)  # an outside trade alone
+        with mock.patch.object(imm, "MARK_WIDE_SPREAD_CENTS", 0):
+            self.assertEqual(hm(10, 90, None, 100, 40.0), 50.0)
+
+    def test_held_markets_marked_without_our_orders_or_our_own_fill(self):
+        bot = self._bot()
+        bot.live = True                    # our orders are in the exchange's book
+        own = {self.HELD: [("ask", 12, 4666.0)]}
+        bot._refresh_marks(set(), {}, own)
+        # last_mark keeps its rule: Kalshi's 3/12 touch (our offer in it), and
+        # the wide 10/90 book at its last trade (our own fill)
+        self.assertEqual(bot.state.last_mark[self.HELD], 7.5)
+        self.assertEqual(bot.state.last_mark[self.WIDE], 40.0)
+        # P&L today's marks: our offer out of the book (bid only) and our 12c
+        # fill no price -> the long exits at the 3c bid; no order of ours at
+        # WIDE's touch, its 40 last trade ours -> the 10c bid
+        self.assertEqual(bot.state.halt_mark[self.HELD], 3.0)
+        self.assertEqual(bot.state.halt_mark[self.WIDE], 10.0)
+        marks = bot._pnl_marks()
+        self.assertEqual((marks[self.HELD], marks[self.WIDE]), (3.0, 10.0))
+        self.assertAlmostEqual(bot.pnl.unrealized(marks),
+                               4666 * (3 - 12) / 100.0 + 100 * (10 - 40) / 100.0)
+        # an outside trade since (our last fill was at 35): the trade counts again
+        bot.state.own_last_fill_px[self.WIDE] = 35.0
+        bot._refresh_marks(set(), {}, own)
+        self.assertEqual(bot.state.halt_mark[self.WIDE], 40.0)
+        # a book the quote loop read this cycle is taken as given: no read here
+        with mock.patch.object(bot.client, "get_orderbook", side_effect=AssertionError("read")):
+            bot._refresh_marks(set(), {self.HELD: (5, 9)}, own)
+        self.assertEqual(bot.state.halt_mark[self.HELD], 7.0)
+        # a closed position drops its halt mark
+        bot.pnl.pos[self.WIDE] = 0.0
+        bot._refresh_marks(set(), {}, own)
+        self.assertNotIn(self.WIDE, bot.state.halt_mark)
+
+    def test_book_reads_are_budgeted_and_kept_a_while(self):
+        bot = self._bot()
+        bot.live = True
+        bot._halt_marks_primed = True
+        own = {self.HELD: [("ask", 12, 4666.0)]}
+        with mock.patch.object(bot.client, "get_orderbook",
+                               wraps=bot.client.get_orderbook) as rd:
+            with mock.patch.object(imm, "MARK_EXT_BOOK_READS", 0):
+                bot._refresh_marks(set(), {}, own)
+            self.assertEqual(rd.call_count, 0)
+            self.assertNotIn(self.HELD, bot.state.halt_mark)     # last_mark stands in
+            self.assertEqual(bot._pnl_marks()[self.HELD], 7.5)
+            bot._refresh_marks(set(), {}, own)
+            bot._refresh_marks(set(), {}, own)                    # inside MARK_EXT_TTL_SECS
+            self.assertEqual(rd.call_count, 1)
+        self.assertEqual(bot.state.halt_mark[self.HELD], 3.0)
+        # a dry run's orders are in no book: Kalshi's touch is external as read
+        bot.live = False
+        bot._ext_touch_cache.clear()
+        with mock.patch.object(bot.client, "get_orderbook", side_effect=AssertionError("read")):
+            bot._refresh_marks(set(), {}, own)
+        self.assertEqual(bot.state.halt_mark[self.HELD], 7.5)
+
+    def test_off_p_and_l_today_reads_last_mark(self):
+        bot = self._bot()
+        bot.live = True
+        with mock.patch.object(imm, "MARK_EXTERNAL", False):
+            bot._refresh_marks(set(), {}, {self.HELD: [("ask", 12, 4666.0)]})
+            self.assertEqual(bot.state.halt_mark, {})
+            self.assertIs(bot._pnl_marks(), bot.state.last_mark)
+
+    def test_p_and_l_today_reads_the_halt_marks(self):
+        # a dry cycle end to end: the wide held market marks at our own 40c
+        # fill in last_mark and at the 10c bid for P&L today; the bid moving
+        # to 20 is +$10 of P&L today while last_mark does not move
+        bot = self._bot()
+        bot.pnl.pos.pop(self.HELD)
+        bot.pnl.avg.pop(self.HELD)
+        bot.client.positions[self.WIDE] = 100.0
+        bot.run_cycle()
+        self.assertEqual(bot.state.last_mark[self.WIDE], 40.0)
+        self.assertEqual(bot.state.halt_mark[self.WIDE], 10.0)
+        self.assertAlmostEqual(bot.state.pnl_today_last, 0.0)
+        bot.client.markets[self.WIDE]["yes_bid_dollars"] = "0.2000"
+        bot.run_cycle()
+        self.assertEqual(bot.state.last_mark[self.WIDE], 40.0)
+        self.assertAlmostEqual(bot.state.pnl_today_last, 10.0)
+
+    def test_our_latest_fill_comes_from_the_fills_sink(self):
+        bot = self._bot()
+        bot.state.own_last_fill_px.clear()
+        d = tempfile.mkdtemp()
+        rows = {"fills_2026-11-07.jsonl": [{"ts": 1, "ticker": "KXA-1", "yes_price_cents": 12.0},
+                                           {"ts": 2, "ticker": "KXB-1", "yes_price_cents": 50.0}],
+                "fills_2026-11-08.jsonl": [{"ts": 5, "ticker": "KXA-1", "yes_price_cents": 14.3},
+                                           {"ts": 4, "ticker": "KXA-1", "yes_price_cents": 13.0}],
+                "fills_join_2026-11-09.jsonl": [{"ts": 9, "ticker": "KXB-1", "yes_price_cents": 99.0}]}
+        for name, rs in rows.items():
+            with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+                for r in rs:
+                    fh.write(json.dumps(r) + "\n")
+        bot.pnl.pos.clear()
+        bot.pnl.pos.update({"KXA-1": 10.0, "KXB-1": -5.0, "KXC-1": 3.0})
+        with mock.patch.object(imm, "STATUS_DIR", d):
+            self.assertEqual(bot._load_own_last_fills(), 2)
+        self.assertEqual(bot.state.own_last_fill_px, {"KXA-1": 14.3, "KXB-1": 50.0})
+        # a fill this run keeps it current
+        bot._book_fill({"ticker": "KXA-1", "side": "yes", "action": "sell", "count_fp": "1.00",
+                        "yes_price_dollars": "0.1500", "order_id": "x", "fill_id": "f-x",
+                        "trade_id": "f-x", "ts": int(time.time()), "is_taker": False},
+                       time.time(), toxic=False)
+        self.assertAlmostEqual(bot.state.own_last_fill_px["KXA-1"], 15.0)
+
+
 class TestDryRunCycle(unittest.TestCase):
     def _bot(self):
         _clean_persist()

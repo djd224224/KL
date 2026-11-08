@@ -4069,6 +4069,38 @@ MAX_JOIN_SPREAD_CENTS = _env_int("IMM_MAX_JOIN_SPREAD", 99)
 # and prev_mid, the breakers and the depth gate keep reading the mid.
 # 0 turns it off (every two-sided book marks at its mid).
 MARK_WIDE_SPREAD_CENTS = _env_int("IMM_MARK_WIDE_SPREAD", 50)
+# EXTERNAL MARKS FOR P&L TODAY (Jack 2026-11-08: "Build marks that leave out our
+# own quotes, so the halt reads real prices?" -> "Yes, build it"). P&L today
+# (the daily-loss and net halts, the risk line, the status file's pnl_today)
+# valued held positions with last_mark, which lets our own book in two ways:
+#   - a held market the quote loop read no book for this cycle (no longer
+#     selected: an ended wave market working down, a dropped market) is marked
+#     off Kalshi's touch, our own resting orders included. The 14:34Z 11/08 net
+#     halt tripped that way with no fills: KXHOUSERACE-AR03-28-D's mark went
+#     62.5 -> 47.5 as our orders left its 23/72 book;
+#   - a wide or one-sided book is marked at the LAST TRADE clamped to the
+#     touch, and on a thin book the last trade is often our own fill, so a
+#     position under water shows no loss (KXMIDTERMMOV-AZ05R-P5, short 180 @ 17
+#     under a 29c offer, marked 17: its own fill).
+# Measured 23:20Z 11/08 on 1,388 held positions, our orders and fills moved the
+# total unrealized by ~$240 of -$10.7k: that day's loss was real prices.
+# With this on, P&L today values every held position from OTHER PEOPLE's orders
+# and trades only (halt_mark_cents): the EXTERNAL touch (our resting orders
+# netted out; a held market with no book read this cycle and one of our orders
+# at Kalshi's touch has its book read here, at most MARK_EXT_BOOK_READS a cycle
+# -- MARK_EXT_FIRST_READS on the first -- each kept MARK_EXT_TTL_SECS), and the
+# last trade only when it was not our own fill (not within half a cent of our
+# latest fill's price there; MARK_EXT_FILL_DAYS of the fills sink at startup).
+# last_mark itself is unchanged: toxic halts, the dollar risk limits, the
+# family pilots and the marks sink keep their rule. A restart re-anchors P&L
+# today on its first measurement (day_baseline + carry), so turning this on or
+# off moves the halt's count by nothing. IMM_MARK_EXTERNAL=0 = P&L today on
+# last_mark again.
+MARK_EXTERNAL = os.environ.get("IMM_MARK_EXTERNAL", "1") != "0"
+MARK_EXT_BOOK_READS = _env_int("IMM_MARK_EXT_BOOK_READS", 40)
+MARK_EXT_FIRST_READS = _env_int("IMM_MARK_EXT_FIRST_READS", 400)
+MARK_EXT_TTL_SECS = _env_float("IMM_MARK_EXT_TTL_SECS", 120.0)
+MARK_EXT_FILL_DAYS = _env_int("IMM_MARK_EXT_FILL_DAYS", 30)
 # Volume screen REMOVED (Jack 2026-07-22): a book with no volume can't fill
 # you — resting there is incentive rent with ~zero P&L risk, which is the
 # whole point. Set IMM_MIN_VOLUME > 0 to restore the old anti-junk screen.
@@ -13844,6 +13876,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
     "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF",
+    "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
     # toxic-flow side halt (2026-09-29)
@@ -22408,6 +22441,35 @@ def bulk_mark_cents(m: dict,
     return touch_mark_cents(bid, ask, market_cents(m, "last_price"))
 
 
+def halt_mark_cents(bid: Optional[int], ask: Optional[int], last: Optional[float],
+                    pos: float, avg: float) -> float:
+    """The YES mark (cents) P&L today values a held position at under
+    MARK_EXTERNAL: other people's orders and trades only. `bid` / `ask` = the
+    EXTERNAL touch (our resting orders netted out; None = an empty side),
+    `last` = the last trade, None when there is none or it was our own fill.
+      - Two-sided and narrower than MARK_WIDE_SPREAD_CENTS: the mid.
+      - Else an outside last trade, held inside the outside touch (the
+        touch_mark_cents rule).
+      - Else the price we could exit at now: a long at the outside bid, a
+        short at the outside offer.
+      - Else only the other side is there, and it bounds the value from one
+        side (a long is worth at most the outside offer, a short owes at least
+        the outside bid): that side where it shows a loss, cost otherwise --
+        never a gain off the wrong side of the book.
+      - Else nothing outside at all: cost."""
+    if bid is not None and ask is not None and not wide_mark_book(bid, ask):
+        return (bid + ask) / 2.0
+    if last is not None:
+        return float(touch_mark_cents(bid, ask, last))
+    exit_px = bid if pos > 0 else ask
+    if exit_px is not None:
+        return float(exit_px)
+    other = ask if pos > 0 else bid
+    if other is not None:
+        return float(min(avg, other)) if pos > 0 else float(max(avg, other))
+    return float(avg)
+
+
 # Market statuses at which Kalshi has paid a settlement out ("settled" is the
 # older API's name for "finalized").
 SETTLED_STATUSES = ("finalized", "settled")
@@ -25325,6 +25387,13 @@ class BotState:
     place_uncertain: Dict[Tuple[str, str, int], float] = field(default_factory=dict)
     realized_baseline: float = 0.0       # lifetime realized at last daily roll
     last_mark: Dict[str, float] = field(default_factory=dict)   # ticker -> YES mid cents
+    # P&L today's marks under MARK_EXTERNAL (halt_mark_cents): other people's
+    # orders and trades only. Not persisted: rebuilt on the first refresh.
+    halt_mark: Dict[str, float] = field(default_factory=dict)
+    # ticker -> YES cents of our latest fill there (MARK_EXTERNAL: was the last
+    # trade ours?); read from the fills sink on the first refresh, then kept
+    # current by _book_fill
+    own_last_fill_px: Dict[str, float] = field(default_factory=dict)
     day_baseline: Optional[float] = None  # realized+unrealized at last daily roll
     halted_until: float = 0.0            # daily-loss halt (epoch); persisted
     pnl_carry: float = 0.0               # pnl_today carried across restarts (same
@@ -25649,6 +25718,11 @@ class IncentiveMarketMaker:
         self._realized_by_ticker: Dict[str, float] = {}   # per-market delta base
         self._cycle_hdr_ok = False                 # cycle-log header checked once
         self._marks_at = 0.0                       # 5-min mark series throttle
+        # MARK_EXTERNAL: the fills sink read once, the first refresh done, and
+        # each held market's external touch read here (ts, bid, ask)
+        self._own_fill_loaded = False
+        self._halt_marks_primed = False
+        self._ext_touch_cache: Dict[str, Tuple[float, Optional[int], Optional[int]]] = {}
         self._selection_prev: Dict[str, str] = {}   # ticker -> last decision
         self._selection_snap_at = 0.0              # hourly full-candidate dump
         self._inventory_snap_day = ""              # daily open-book snapshot
@@ -26161,6 +26235,7 @@ class IncentiveMarketMaker:
             avg_before = self.pnl.avg.get(tkr, 0.0)
             self.pnl.on_fill(tkr, side, action, count, px_cents)
             self.state.fills_today += count
+            self.state.own_last_fill_px[tkr] = px_cents       # (MARK_EXTERNAL)
             if QUAKE_ASK_STRIKES and quake_gated(series_of(tkr)) \
                     and self.pnl.pos.get(tkr, 0.0) < pos_before - 1e-9:
                 # one of our quake asks sold YES: brake the event's asks
@@ -35451,6 +35526,7 @@ class IncentiveMarketMaker:
             self.pnl.pos.pop(t, None)
             self.pnl.avg.pop(t, None)
         self.state.last_mark.pop(t, None)
+        self.state.halt_mark.pop(t, None)
 
     def _mark_from_book(self, t: str, ext_bid: int, ext_ask: int,
                         marked: Set[str]) -> None:
@@ -35463,8 +35539,97 @@ class IncentiveMarketMaker:
             self.state.last_mark[t] = (ext_bid + ext_ask) / 2.0
             marked.add(t)
 
+    def _pnl_marks(self) -> Dict[str, float]:
+        """The marks P&L today is measured with (the daily-loss and net halts,
+        the risk line, the status file's pnl_today, the roll's baseline):
+        last_mark, overlaid with the external halt marks under MARK_EXTERNAL
+        (a held market with none yet keeps its last_mark)."""
+        if not MARK_EXTERNAL or not self.state.halt_mark:
+            return self.state.last_mark
+        marks = dict(self.state.last_mark)
+        marks.update(self.state.halt_mark)
+        return marks
+
+    _FILLS_SINK_RE = re.compile(r"^fills_\d{4}-\d{2}-\d{2}\.jsonl$")
+
+    def _load_own_last_fills(self) -> int:
+        """MARK_EXTERNAL: our latest fill price on each held market, from the
+        fills sink (STATUS_DIR/fills_<UTC date>.jsonl, newest day first, at
+        most MARK_EXT_FILL_DAYS days), for fills before this process started;
+        _book_fill keeps it current after that. Returns how many held markets
+        it found a fill for."""
+        self._own_fill_loaded = True
+        want = {t for t, p in self.pnl.pos.items()
+                if abs(p) > 1e-9 and t not in self.state.own_last_fill_px}
+        if not want:
+            return 0
+        try:
+            names = sorted((n for n in os.listdir(STATUS_DIR) if self._FILLS_SINK_RE.match(n)),
+                           reverse=True)[:max(0, MARK_EXT_FILL_DAYS)]
+        except OSError:
+            return 0
+        key = '"ticker": "'
+        found = 0
+        for name in names:
+            if not want:
+                break
+            best: Dict[str, Tuple[float, float]] = {}
+            try:
+                with open(os.path.join(STATUS_DIR, name), encoding="utf-8") as fh:
+                    for ln in fh:
+                        i = ln.find(key)
+                        if i < 0:
+                            continue
+                        j = ln.find('"', i + len(key))
+                        if ln[i + len(key):j] not in want:
+                            continue
+                        try:
+                            r = json.loads(ln)
+                            t, ts, px = r["ticker"], float(r.get("ts") or 0.0), float(r["yes_price_cents"])
+                        except (ValueError, KeyError, TypeError):
+                            continue
+                        if t not in best or ts >= best[t][0]:
+                            best[t] = (ts, px)
+            except OSError:
+                continue
+            for t, (_ts, px) in best.items():
+                self.state.own_last_fill_px[t] = px
+                want.discard(t)
+                found += 1
+        return found
+
+    def _halt_touch(self, t: str, m: dict, own: List[Tuple[str, int, float]],
+                    now_ts: float, budget: List[int]
+                    ) -> Optional[Tuple[Optional[int], Optional[int]]]:
+        """MARK_EXTERNAL: the EXTERNAL (bid, ask) of held market `t`, whose
+        book the quote loop did not read this cycle. Kalshi's touch off the
+        bulk read `m` when none of our resting orders is at it; else the order
+        book with our orders netted out, read here (budget[0] reads left this
+        cycle; each read kept MARK_EXT_TTL_SECS). None when it cannot be told
+        this cycle (the previous halt mark stands)."""
+        bid, ask = yes_touch_cents(m)
+        mine = own if self.live else []          # dry-run orders are in no book
+        if not any(r > 0 and ((s == "bid" and (bid is None or px >= bid))
+                              or (s != "bid" and (ask is None or px <= ask)))
+                   for s, px, r in mine):
+            return bid, ask
+        hit = self._ext_touch_cache.get(t)
+        if hit is not None and now_ts - hit[0] < MARK_EXT_TTL_SECS:
+            return hit[1], hit[2]
+        if budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        try:
+            yl, nl = orderbook_levels(self.client.get_orderbook(ticker=t))
+        except Exception:
+            return None
+        eb, ea = external_best(yl, nl, mine)
+        self._ext_touch_cache[t] = (now_ts, eb, ea)
+        return eb, ea
+
     def _refresh_marks(self, marked_this_cycle: Set[str],
-                       ext_touch: Optional[Dict[str, Tuple[Optional[int], Optional[int]]]] = None
+                       ext_touch: Optional[Dict[str, Tuple[Optional[int], Optional[int]]]] = None,
+                       own_by_ticker: Optional[Dict[str, List[Tuple[str, int, float]]]] = None
                        ) -> None:
         """Ensure every open own-book position has a usable YES mark.
         Managed markets with a two-sided external book narrower than
@@ -35474,8 +35639,31 @@ class IncentiveMarketMaker:
         or to the live side of a one-sided one). A market whose order book was
         read this cycle is judged on that EXTERNAL touch (`ext_touch`, own
         quotes excluded) with the bulk read's last trade. A read with no usable
-        price keeps the previous mark."""
+        price keeps the previous mark.
+
+        MARK_EXTERNAL: every held position also gets P&L today's mark
+        (state.halt_mark, halt_mark_cents): the same two-sided mids, else the
+        external touch (`ext_touch`, or _halt_touch with this cycle's
+        `own_by_ticker`) and the last trade unless it was our own fill."""
         ext_touch = ext_touch or {}
+        own_by_ticker = own_by_ticker or {}
+        held = {t for t, p in self.pnl.pos.items() if abs(p) > 1e-9}
+        budget = [MARK_EXT_BOOK_READS if self._halt_marks_primed
+                  else max(MARK_EXT_BOOK_READS, MARK_EXT_FIRST_READS)]
+        mine_set = 0
+        if MARK_EXTERNAL:
+            if not self._own_fill_loaded:
+                n_fill = self._load_own_last_fills()
+                log(f"{self.tag} external marks: our latest fill price on {n_fill} more "
+                    f"held market(s) from the fills sink ({len(held)} held)")
+            for t in [t for t in self.state.halt_mark if t not in held]:
+                del self.state.halt_mark[t]
+            for t in [t for t in self._ext_touch_cache if t not in held]:
+                del self._ext_touch_cache[t]
+            for t in held & marked_this_cycle:
+                if t in self.state.last_mark:
+                    self.state.halt_mark[t] = self.state.last_mark[t]
+        now_ts = time.time()
         stale = [t for t, p in self.pnl.pos.items()
                  if abs(p) > 1e-9 and t not in marked_this_cycle]
         for i in range(0, len(stale), 50):
@@ -35490,6 +35678,30 @@ class IncentiveMarketMaker:
                 mk = bulk_mark_cents(m, ext_touch.get(t))
                 if mk is not None:
                     self.state.last_mark[t] = mk
+                if not MARK_EXTERNAL or t not in held:
+                    continue
+                touch = ext_touch.get(t)
+                if touch is None:
+                    touch = self._halt_touch(t, m, own_by_ticker.get(t, []), now_ts, budget)
+                if touch is None:
+                    continue                  # its previous halt mark stands
+                last = market_cents(m, "last_price")
+                mine = self.state.own_last_fill_px.get(t)
+                if last is not None and mine is not None and abs(last - mine) < 0.51:
+                    last = None               # the last trade was our own fill: no price
+                    mine_set += 1
+                self.state.halt_mark[t] = halt_mark_cents(
+                    touch[0], touch[1], last, self.pnl.pos.get(t, 0.0),
+                    self.pnl.avg.get(t, 0.0))
+        if MARK_EXTERNAL and not self._halt_marks_primed:
+            self._halt_marks_primed = True
+            u_last = self.pnl.unrealized(self.state.last_mark)
+            u_halt = self.pnl.unrealized(self._pnl_marks())
+            log(f"{self.tag} external marks primed: {len(self.state.halt_mark)}/{len(held)} held "
+                f"position(s) marked off other people's orders and trades "
+                f"({mine_set} last trade(s) our own fill, set aside); unrealized "
+                f"${u_halt:+,.2f} against last_mark's ${u_last:+,.2f} -- P&L today "
+                f"re-anchors on this first measurement")
 
     def _live_event_slots(self, ev: str, entry: dict,
                           unquotable_now: Set[str]) -> List[str]:
@@ -38934,7 +39146,7 @@ class IncentiveMarketMaker:
         # inventory counts even before it settles. Runs before any placement.
         # touch_map: the external touch of every book read this cycle, so a
         # one-sided or wide managed book is marked without our own quotes.
-        self._refresh_marks(marked, touch_map)
+        self._refresh_marks(marked, touch_map, own_by_ticker)
         # Mark series for every open position, every 5 minutes.
         #
         # This is what makes adverse selection measurable. A mark-out needs the
@@ -38956,13 +39168,14 @@ class IncentiveMarketMaker:
                         "event_ticker": self._event_of(tkr),
                         "pos": p, "avg_cents": self.pnl.avg.get(tkr, 0.0),
                         "mark_cents": self.state.last_mark.get(tkr),
+                        "halt_mark_cents": self.state.halt_mark.get(tkr),
                         "realized_dollars": self.pnl.realized.get(tkr, 0.0),
                     })
             except Exception as e:
                 if "marks" not in self._sink_muted:
                     self._sink_muted.add("marks")
                     log(f"{self.tag} ! marks sink failed ({e}); muted this run")
-        unrealized = self.pnl.unrealized(self.state.last_mark)
+        unrealized = self.pnl.unrealized(self._pnl_marks())     # (MARK_EXTERNAL)
         unmarked = [t for t, p in self.pnl.pos.items()
                     if abs(p) > 1e-9 and t not in self.state.last_mark]
         if unmarked:
@@ -39820,9 +40033,11 @@ class IncentiveMarketMaker:
             "realized_today": round(self.pnl.total_realized() - s.realized_baseline, 2),
             "realized_lifetime": round(self.pnl.total_realized(), 2),
             "unrealized_mtm": round(self.pnl.unrealized(s.last_mark), 2),
+            # P&L today's own marks (MARK_EXTERNAL: ours out)
+            "unrealized_ext": round(self.pnl.unrealized(self._pnl_marks()), 2),
             "inventory_contracts": round(self.pnl.inventory_contracts(), 1),
             "pnl_today": round(self.pnl.total_realized()
-                               + self.pnl.unrealized(s.last_mark)
+                               + self.pnl.unrealized(self._pnl_marks())
                                - (s.day_baseline or 0.0), 2),
             "fills_today": s.fills_today,
             "cycles_today": s.cycles_today,
@@ -40039,7 +40254,7 @@ class IncentiveMarketMaker:
         s.contract_minutes_today = 0.0
         # roll both loss-halt windows + the restart-carry and balance anchor
         s.realized_baseline = self.pnl.total_realized()
-        s.day_baseline = self.pnl.total_realized() + unrealized
+        s.day_baseline = self.pnl.total_realized() + self.pnl.unrealized(self._pnl_marks())
         s.pnl_carry = 0.0
         s.pnl_today_last = 0.0
         s.account_value_day_start = 0.0    # re-anchors on the next cycle
@@ -42356,6 +42571,15 @@ class IncentiveMarketMaker:
             f"side sized 0 (the tune's 90c+ side cap and twin block) "
             + ("rests nothing but the order that closes a position, at most the position"
                if PVD_ZERO_OFF else "rests 1 contract (IMM_PVD_ZERO_OFF=0), never the full size"))
+        log(f"external marks (2026-11-08): {'on' if MARK_EXTERNAL else 'OFF'} -- "
+            + (f"P&L today (the loss and net halts, the risk line) values every held position "
+               f"from other people's orders and trades only: the external mid of a two-sided "
+               f"book under {MARK_WIDE_SPREAD_CENTS}c wide, else an outside last trade held inside "
+               f"the outside touch, else the side we would exit at (a long's bid, a short's "
+               f"offer), else cost (or the other side where it shows a loss); our resting orders "
+               f"and our own last fill never set it. last_mark (toxic halts, risk limits) is "
+               f"unchanged"
+               if MARK_EXTERNAL else "P&L today reads last_mark (IMM_MARK_EXTERNAL=0)"))
         log(f"off-usual size (2026-11-08): {PVD_OFF_USUAL_MODE}"
             + (f" -- a listed market's side resting more than {PVD_OFF_USUAL_C:g}c nearer "
                f"the taker than its {PVD_OFF_USUAL_HOURS:g}h median touch (sampled every "
