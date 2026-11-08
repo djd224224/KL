@@ -26415,6 +26415,17 @@ class IncentiveMarketMaker:
                 self.state.twk_pnl_carry = {
                     str(k): float(v or 0.0)
                     for k, v in (data.get("twk_pnl_carry") or {}).items()}
+                # ...and each restored carry is the last measured value too, so
+                # a process that never measures (started under HALT, or idle on
+                # a daily-loss halt) saves the carry it restored, not 0. 04:16Z
+                # 11/08 a restart under HALT restored -$2,887 of P&L today and
+                # saved $0, so the 04:27Z restart began the day's $4,000 loss
+                # budget fresh.
+                self.state.pnl_today_last = self.state.pnl_carry
+                self.state.scan_pnl_today_last = self.state.scan_pnl_carry
+                self.state.yt2_pnl_today_last = self.state.yt2_pnl_carry
+                self.state.ytw_pnl_today_last = self.state.ytw_pnl_carry
+                self.state.twk_pnl_today_last = dict(self.state.twk_pnl_carry)
                 if self.state.halted_until > time.time():
                     log(f"{self.tag} restored ACTIVE daily-loss halt "
                         f"(pnl carry ${self.state.pnl_carry:+.2f})")

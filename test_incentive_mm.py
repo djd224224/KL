@@ -40244,6 +40244,41 @@ class TestFullEarnSize(unittest.TestCase):
         self.assertEqual(set(trims), {"bid"})
 
 
+class TestCarryAcrossIdleRestarts(unittest.TestCase):
+    """2026-11-08: the 04:16Z restart under HALT restored -$2,887 of P&L today
+    and saved $0 (it never ran a measuring cycle), so the 04:27Z restart began
+    the day's $4,000 loss budget fresh. A restored carry is now also the last
+    measured value until a cycle measures, so an idle process saves it."""
+
+    def tearDown(self):
+        for p in (imm.HALT_FILE,):
+            if os.path.exists(p):
+                os.remove(p)
+        _clean_persist()
+
+    def test_a_process_that_never_measures_keeps_the_carry(self):
+        _clean_persist()
+        day = imm._halt_day_key(datetime.now(timezone.utc))
+        with open(IncentiveMarketMaker.PERSIST_PATH, "w", encoding="utf-8") as f:
+            json.dump({"halt_day_key": day, "pnl_today_carry": -2887.36,
+                       "scan_pnl_carry": -12.5, "twk_pnl_carry": {"KXTRUTHSOCIAL": -3.0}}, f)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertAlmostEqual(bot.state.pnl_carry, -2887.36)
+        self.assertAlmostEqual(bot.state.pnl_today_last, -2887.36)
+        open(imm.HALT_FILE, "w").close()             # idle: the cycle never measures
+        bot.run_cycle()
+        os.remove(imm.HALT_FILE)
+        bot._save_persist()
+        with open(bot.PERSIST_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertAlmostEqual(saved["pnl_today_carry"], -2887.36)
+        self.assertAlmostEqual(saved["scan_pnl_carry"], -12.5)
+        self.assertEqual(saved["twk_pnl_carry"], {"KXTRUTHSOCIAL": -3.0})
+        # ...and the next restart restores it again
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertAlmostEqual(bot2.state.pnl_carry, -2887.36)
+
+
 class TestOffUsualSize(unittest.TestCase):
     """Jack 2026-11-08: "Build both 1" -- a listed side resting more than 3c
     nearer the taker than its 6-hour median touch rests no more than its base
