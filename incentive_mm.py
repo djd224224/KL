@@ -12369,6 +12369,38 @@ EVENT_LEVEL_STANDOFF = os.environ.get("IMM_EVENT_STANDOFF", "1") == "1"
 STATUS_DIR = os.environ.get(
     "IMM_STATUS_DIR", r"C:\Users\jackd\Documents\KL\run-logs\incentive-mm")
 HALT_FILE = os.path.join(STATUS_DIR, "HALT")
+# UNWIND ONLY (Jack 2026-11-08: "Turn it back on only for unwinding
+# positions", after the 2028 wave's pick-offs and "Turn off bot"). While this
+# file exists every market the bot manages quotes only the side that reduces
+# the bot's own position, never more than takes it flat (unwind_only_quotes,
+# plus the reduce_only room), with no pads -- so no position opens or grows
+# anywhere; a flat market rests nothing. Prices stay the bot's own (the
+# breakeven offset still holds a far-out market's unwind at breakeven or
+# better). Delete the file to quote both sides again; HALT still wins.
+UNWIND_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY")
+
+
+def unwind_only_quotes(quotes: List["Quote"], pos: float) -> List["Quote"]:
+    """The UNWIND ONLY filter on one market's quotes: no pads; only the side
+    that reduces `pos` (asks while long, bids while short), its total capped
+    at |pos|, nearest-the-touch rung first; nothing while flat."""
+    if abs(pos) < 1:
+        return []
+    side = "ask" if pos > 0 else "bid"
+
+    def px(q) -> float:
+        return float(q.price_exact if q.price_exact is not None else q.price_cents)
+
+    rungs = sorted((q for q in quotes if q.book_side == side and not q.is_pad),
+                   key=lambda q: -px(q) if side == "bid" else px(q))
+    left = int(abs(pos))
+    out: List["Quote"] = []
+    for q in rungs:
+        keep = min(int(q.count), left)
+        if keep >= 1:
+            out.append(replace(q, count=keep))
+            left -= keep
+    return out
 # RATE-LIMIT ALERT (Jack 2026-10-17: "Raise to 24/s ... Email alert me if
 # rate limit rejections occur"). Every RATE_LIMIT_CHECK_SECS the bot counts
 # the 429s (Too Many Requests) since its last look: its own, from the Kalshi
@@ -24905,6 +24937,7 @@ class IncentiveMarketMaker:
         self._lol_last_live: Dict[str, float] = {}
         self._full_earn: Dict[str, Tuple[float, float, Dict[str, tuple]]] = {}  # FULL-EARN SIZE: t -> (ts, pool/day, trims)
         self._full_earn_logged = 0.0
+        self._unwind_only = False      # UNWIND ONLY: UNWIND_ONLY_FILE seen this cycle
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
         self._off_usual_logged = 0.0
         self._off_usual_noted: Dict[str, tuple] = {}
@@ -35314,6 +35347,13 @@ class IncentiveMarketMaker:
             n = self.cancel_all_bot_orders()
             log(f"{self.tag} HALT file present ({HALT_FILE}); cancelled {n}; idle")
             return
+        _uo = os.path.exists(UNWIND_ONLY_FILE)
+        if _uo != self._unwind_only:
+            log(f"{self.tag} UNWIND ONLY "
+                + (f"ON ({UNWIND_ONLY_FILE}): every market quotes only the side that "
+                   f"reduces the bot's own position, never past flat; flat markets rest "
+                   f"nothing" if _uo else "OFF: both sides quote again"))
+        self._unwind_only = _uo
         if self.state.halted_until > now_ts:
             log(f"{self.tag} daily-loss halt active until "
                 f"{datetime.fromtimestamp(self.state.halted_until, timezone.utc)}; idle")
@@ -35747,7 +35787,7 @@ class IncentiveMarketMaker:
                 self._gskip(t, "scan_evicted")
                 continue
 
-            reduce_only = t not in self.state.selected
+            reduce_only = t not in self.state.selected or self._unwind_only
             # Registry for place_order: exchange-side expiration is capped at
             # the cutoff so resting orders cannot fill past event start.
             if meta.cutoff is not None:
@@ -37705,6 +37745,11 @@ class IncentiveMarketMaker:
             else:
                 self._be_offset_n.pop(t, None)
                 self._be_offset_noted.pop(t, None)
+            # UNWIND ONLY (UNWIND_ONLY_FILE): last, after every path that adds
+            # a rung (leads, closes, offsets): the reducing side alone, never
+            # past flat
+            if self._unwind_only:
+                mq = unwind_only_quotes(mq, own_pos)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -37739,7 +37784,7 @@ class IncentiveMarketMaker:
             # target, it stops qualifying -- so it neither counts nor pages;
             # nor does one the sweep or group breaker holds, or one on a shard
             # Kalshi has paused: coverage_exempt.)
-            if not fast_only and t in self.state.selected and mq \
+            if not fast_only and t in self.state.selected and mq and not self._unwind_only \
                     and pad_band_ok(meta.series, ext_bid, ext_ask) \
                     and not self.coverage_exempt(t, now_ts):
                 if sides < 2:

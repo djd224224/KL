@@ -146,6 +146,7 @@ def setUpModule():
     tmp = tempfile.mkdtemp(prefix="imm_test_")
     imm.STATUS_DIR = tmp
     imm.HALT_FILE = os.path.join(tmp, "HALT")
+    imm.UNWIND_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY")
     imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
     imm.OWN_BOOK_FLATTEN_FILE = os.path.join(tmp, "own_book_flatten.txt")
     # a live sniper book on this machine must not net into the fixtures
@@ -40716,6 +40717,42 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual([s for s, _n in on], [s for s, _n in off])
         self.assertTrue(all(1000.0 <= n < 30000.0 for _s, n in on), on)
         self.assertEqual(orders("dry"), off)
+
+    def test_unwind_only_rests_just_the_reducing_side(self):
+        """Jack 2026-11-08: "Turn it back on only for unwinding positions" --
+        while UNWIND_ONLY exists a market rests only the side that reduces the
+        bot's own position, never past flat; a flat market rests nothing"""
+        Q = imm.Quote
+        qs = [Q(self.T, "bid", 40, 500), Q(self.T, "ask", 60, 200), Q(self.T, "ask", 62, 200),
+              Q(self.T, "ask", 99, 50, is_pad=True)]
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in imm.unwind_only_quotes(qs, 300.0)],
+                         [("ask", 60, 200), ("ask", 62, 100)])
+        self.assertEqual([(q.book_side, q.count) for q in imm.unwind_only_quotes(qs, -120.0)],
+                         [("bid", 120)])
+        self.assertEqual(imm.unwind_only_quotes(qs, 0.4), [])
+
+        def orders(pos, unwind):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if pos:
+                bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, 50.0
+                bot.client.positions[self.T] = pos
+            flag = imm.UNWIND_ONLY_FILE
+            if unwind:
+                open(flag, "w").close()
+            try:
+                bot.run_cycle()
+            finally:
+                if os.path.exists(flag):
+                    os.remove(flag)
+            return sorted((o["book_side"], o["remaining_count"]) for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T)
+        self.assertEqual({s for s, _n in orders(0.0, False)}, {"bid", "ask"})   # off: both sides
+        self.assertIn(("ask", 200.0), orders(150.0, False))           # off: the ask rests its size
+        self.assertEqual(orders(150.0, True), [("ask", 150.0)])     # long: sells it back only
+        self.assertEqual(orders(-80.0, True), [("bid", 80.0)])      # short: buys it back only
+        self.assertEqual(orders(0.0, True), [])                     # flat: nothing
 
     def test_off_usual_size_rests_the_base_off_the_usual_price(self):
         """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the
