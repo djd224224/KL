@@ -12374,33 +12374,73 @@ HALT_FILE = os.path.join(STATUS_DIR, "HALT")
 # file exists every market the bot manages quotes only the side that reduces
 # the bot's own position, never more than takes it flat (unwind_only_quotes,
 # plus the reduce_only room), with no pads -- so no position opens or grows
-# anywhere; a flat market rests nothing. Prices stay the bot's own (the
-# breakeven offset still holds a far-out market's unwind at breakeven or
-# better). Delete the file to quote both sides again; HALT still wins.
+# anywhere; a flat market rests nothing. Delete the file to quote both
+# sides again; HALT still wins.
+# NO BREAKEVEN (Jack 2026-11-08: "Don't need these to unwind at breakeven,
+# make an exception"): the reducing side rests the WHOLE position as one
+# order whatever the bot paid, at the better of its own price and the best
+# external price on its side -- never crossing, and on a listed market never
+# more than PVD_OFF_USUAL_C past its 6-hour usual price toward the taker (a
+# bait book cannot drag the whole position there); with no usual price, at
+# its own price. The size backstop at placement lets it rest the position.
 UNWIND_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY")
 
 
-def unwind_only_quotes(quotes: List["Quote"], pos: float) -> List["Quote"]:
+def unwind_only_quotes(quotes: List["Quote"], pos: float,
+                       touch: Optional[float] = None,
+                       usual: Optional[float] = None,
+                       off_c: Optional[float] = None) -> List["Quote"]:
     """The UNWIND ONLY filter on one market's quotes: no pads; only the side
-    that reduces `pos` (asks while long, bids while short), its total capped
-    at |pos|, nearest-the-touch rung first; nothing while flat."""
+    that reduces `pos` (asks while long, bids while short), as ONE order of
+    |pos| at its nearest-the-touch rung -- moved to `touch` (the best external
+    price on that side, YES cents) when that is better, but with a `usual`
+    price never more than `off_c` past it toward the taker, and never
+    crossing; nothing while flat or when the side was not built."""
     if abs(pos) < 1:
         return []
+    off_c = PVD_OFF_USUAL_C if off_c is None else off_c
     side = "ask" if pos > 0 else "bid"
 
     def px(q) -> float:
         return float(q.price_exact if q.price_exact is not None else q.price_cents)
 
-    rungs = sorted((q for q in quotes if q.book_side == side and not q.is_pad),
-                   key=lambda q: -px(q) if side == "bid" else px(q))
-    left = int(abs(pos))
-    out: List["Quote"] = []
-    for q in rungs:
-        keep = min(int(q.count), left)
-        if keep >= 1:
-            out.append(replace(q, count=keep))
-            left -= keep
-    return out
+    rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
+    if not rungs:
+        return []
+    near = max(rungs, key=px) if side == "bid" else min(rungs, key=px)
+    new = px(near)
+    if touch is not None and touch > 0 and usual is not None:
+        if side == "ask":
+            new = min(new, max(float(touch), float(usual) - off_c))
+        else:
+            new = max(new, min(float(touch), float(usual) + off_c))
+    new = round(new, 2)
+    if not 0 < new < 100:
+        return []
+    if abs(new - round(new)) < 0.005:
+        q = replace(near, count=int(abs(pos)), price_cents=int(round(new)), price_exact=None)
+    else:
+        bucket = math.ceil(new) if side == "ask" else math.floor(new)
+        q = replace(near, count=int(abs(pos)), price_cents=int(bucket), price_exact=new)
+    return [q]
+
+
+def external_touch_exact(yes_exact: List[List[float]], no_exact: List[List[float]],
+                         own_exact: List[Tuple[str, float, float]] = ()
+                         ) -> Tuple[Optional[float], Optional[float]]:
+    """(best external bid, best external ask) in exact YES cents on a
+    sub-penny book, our own resting orders netted out (as subpenny_snap does)."""
+    own_yes: Dict[float, float] = {}
+    own_no: Dict[float, float] = {}
+    for bs, p, rem in own_exact:
+        if bs == "bid":
+            own_yes[p] = own_yes.get(p, 0.0) + rem
+        else:
+            k = round(100 - p, 2)
+            own_no[k] = own_no.get(k, 0.0) + rem
+    bids = [p for p, q in yes_exact if q - own_yes.get(p, 0.0) > 1e-9]
+    asks = [round(100 - p, 2) for p, q in no_exact if q - own_no.get(p, 0.0) > 1e-9]
+    return (max(bids) if bids else None), (min(asks) if asks else None)
 # RATE-LIMIT ALERT (Jack 2026-10-17: "Raise to 24/s ... Email alert me if
 # rate limit rejections occur"). Every RATE_LIMIT_CHECK_SECS the bot counts
 # the 429s (Too Many Requests) since its last look: its own, from the Kalshi
@@ -37760,7 +37800,22 @@ class IncentiveMarketMaker:
             # a rung (leads, closes, offsets): the reducing side alone, never
             # past flat
             if self._unwind_only:
-                mq = unwind_only_quotes(mq, own_pos)
+                _u_touch = _u_usual = None
+                if abs(own_pos) >= 1:
+                    try:
+                        if meta.price_step < 0.01:
+                            _u_eb, _u_ea = external_touch_exact(
+                                *orderbook_exact_levels(ob),
+                                own_exact_by_ticker.get(t, []) if self.live else [])
+                        else:
+                            _u_eb, _u_ea = ext_bid, ext_ask
+                        _u_touch = _u_ea if own_pos > 0 else _u_eb
+                        if pvd is not None:
+                            _u_b, _u_a = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
+                            _u_usual = _u_a if own_pos > 0 else _u_b
+                    except Exception:       # its own price, as before
+                        _u_touch = _u_usual = None
+                mq = unwind_only_quotes(mq, own_pos, touch=_u_touch, usual=_u_usual)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -38784,6 +38839,13 @@ class IncentiveMarketMaker:
                 _pvn = self._pvd_side_n.get(q.ticker) if _pvq.get("flip") else None
                 if _pvn is not None:
                     side_cap = max_level_size = float(_pvn[0] if q.book_side == "bid" else _pvn[1])
+            # UNWIND ONLY: the reducing side rests the whole position as one
+            # order (the quote loop sized it so, unwind_only_quotes)
+            if self._unwind_only:
+                _up = self.pnl.pos.get(q.ticker, 0.0)
+                if abs(_up) >= 1 and (_up < 0) == (q.book_side == "bid"):
+                    side_cap = max(side_cap, abs(_up))
+                    max_level_size = max(max_level_size, abs(_up))
             skey = (q.ticker, q.book_side)
             lkey = (q.ticker, q.book_side, q.price_cents)
             have_side = side_totals.get(skey, 0.0)

@@ -40760,11 +40760,25 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         Q = imm.Quote
         qs = [Q(self.T, "bid", 40, 500), Q(self.T, "ask", 60, 200), Q(self.T, "ask", 62, 200),
               Q(self.T, "ask", 99, 50, is_pad=True)]
-        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in imm.unwind_only_quotes(qs, 300.0)],
-                         [("ask", 60, 200), ("ask", 62, 100)])
-        self.assertEqual([(q.book_side, q.count) for q in imm.unwind_only_quotes(qs, -120.0)],
-                         [("bid", 120)])
+        # Jack 2026-11-08: "Don't need these to unwind at breakeven, make an
+        # exception" -- the whole position as one order, whatever it cost
+        def uq(*a, **k):
+            return [(q.book_side, q.price_cents, q.price_exact, q.count)
+                    for q in imm.unwind_only_quotes(qs, *a, **k)]
+        self.assertEqual(uq(300.0), [("ask", 60, None, 300)])            # its own price
+        self.assertEqual(uq(-120.0), [("bid", 40, None, 120)])
         self.assertEqual(imm.unwind_only_quotes(qs, 0.4), [])
+        # joins the best external price, never past its usual - 3c toward the taker
+        self.assertEqual(uq(300.0, touch=55, usual=57), [("ask", 55, None, 300)])
+        self.assertEqual(uq(300.0, touch=50, usual=57), [("ask", 54, None, 300)])
+        self.assertEqual(uq(300.0, touch=55, usual=None), [("ask", 60, None, 300)])   # no usual: own price
+        self.assertEqual(uq(300.0, touch=65, usual=70), [("ask", 60, None, 300)])     # own already better
+        self.assertEqual(uq(-120.0, touch=45, usual=44), [("bid", 45, None, 120)])
+        self.assertEqual(uq(-120.0, touch=60, usual=44), [("bid", 47, None, 120)])
+        # a 0.1c book: the exact price, in its cent bucket
+        self.assertEqual(uq(300.0, touch=6.1, usual=8.0), [("ask", 7, 6.1, 300)])
+        self.assertEqual(imm.external_touch_exact([[5.9, 100.0], [6.0, 30.0]], [[93.9, 50.0], [90.0, 10.0]],
+                                                  [("bid", 6.0, 30.0)]), (5.9, 6.1))
 
         def orders(pos, unwind):
             _clean_persist()
@@ -40788,6 +40802,9 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(orders(150.0, True), [("ask", 150.0)])     # long: sells it back only
         self.assertEqual(orders(-80.0, True), [("bid", 80.0)])      # short: buys it back only
         self.assertEqual(orders(0.0, True), [])                     # flat: nothing
+        # past the listed 200 a side: the whole position in one order, the
+        # placement backstop lets it through
+        self.assertEqual(orders(500.0, True), [("ask", 500.0)])
 
     def test_off_usual_size_rests_the_base_off_the_usual_price(self):
         """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the
