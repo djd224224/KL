@@ -40935,6 +40935,49 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(listed, [("ask", 70, 150.0)])
         self.assertEqual(rest, [])
 
+    def test_held_wave_markets_outside_the_selection_unwind_too(self):
+        """Jack 2026-11-08: "Yes, unwind them" -- a market on the wave list
+        (its stop passed, its program gone) where the bot holds a position the
+        selection left out rests its breakeven unwind while UNWIND_ONLY_WAVES
+        exists, and nothing without it"""
+        def run(pos, avg, flag=True, manual=0.0, fav=False):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}},
+                        stop=datetime.now(timezone.utc) - timedelta(hours=2))
+            c = FakeClient()
+            c.programs = [p for p in c.programs if p["market_ticker"] != self.T]   # no program
+            if fav:                                  # a 96x97 favorite, past the 5-90c band
+                c.markets[self.T] = dict(c.markets[self.T], yes_bid_dollars="0.9600",
+                                         yes_ask_dollars="0.9700")
+                c.books[self.T] = {"orderbook_fp": {"yes_dollars": [["0.95", "800"], ["0.96", "500"]],
+                                                    "no_dollars": [["0.02", "800"], ["0.03", "500"]]}}
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, avg
+            c.positions[self.T] = pos + manual
+            lines = []
+            if flag:
+                open(imm.UNWIND_WAVES_ONLY_FILE, "w").close()
+            try:
+                with mock.patch.object(imm, "log", lines.append):
+                    bot.run_cycle()
+            finally:
+                if os.path.exists(imm.UNWIND_WAVES_ONLY_FILE):
+                    os.remove(imm.UNWIND_WAVES_ONLY_FILE)
+            return bot, sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                               for o in bot.state.sim_orders.values() if o["ticker"] == self.T), lines
+        bot, orders, lines = run(150.0, 70.0)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertIn(self.T, bot._wave_unwind)
+        self.assertEqual(orders, [("ask", 70, 150.0)])               # waits at its 70c cost
+        self.assertTrue(any("wave unwind: 1 held wave market(s)" in x for x in lines), lines)
+        self.assertEqual(run(-80.0, 45.0)[1], [("bid", 45, 80.0)])   # a short buys back at 45
+        self.assertEqual(run(150.0, 70.0, flag=False)[1], [])        # without the file: nothing
+        self.assertEqual(run(3.0, 70.0)[1], [])                      # under REDUCE_ONLY_MIN
+        self.assertEqual(run(150.0, 70.0, manual=40.0)[1], [])       # a manual position: hands off
+        # a long favorite bought at 95c: sells at the 97c touch, past the usual band
+        self.assertEqual(run(150.0, 95.0, fav=True)[1], [("ask", 97, 150.0)])
+        self.assertEqual(run(150.0, 98.0, fav=True)[1], [("ask", 98, 150.0)])   # waits at its cost
+
     def test_off_usual_size_rests_the_base_off_the_usual_price(self):
         """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the
         taker than its 6-hour median touch rests its base size; at its usual

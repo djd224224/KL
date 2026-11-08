@@ -12413,7 +12413,14 @@ UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
 # where the touch is worse, the order rests at the average itself. A listed
 # market with a position but no known average rests nothing. Every other market
 # quotes as usual. It needs no UNWIND_ONLY; with UNWIND_ONLY too, a listed market
-# still unwinds this way.
+# still unwinds this way. ...AND THEIR HELD MARKETS (Jack 2026-11-08: "Yes, unwind
+# them", on 243 wave markets held outside the selection, $28k at cost, after
+# their programs ended at 05:00Z): a market on the wave list file (PVD_MARKETS,
+# its stop passed or not) where the bot holds its own position of
+# REDUCE_ONLY_MIN_CONTRACTS+ and that the selection left out is managed anyway,
+# for this unwind alone (_wave_unwind_manage). It needs no program: it earns
+# nothing and is there to work the position down. Its meta is read once
+# (get_markets, 50 a call) and kept while it is held.
 UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
 
 
@@ -21309,6 +21316,7 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                                     cutoff: Optional[datetime],
                                     close_time: Optional[datetime] = None,
                                     market: Optional[dict] = None,
+                                    pvd_stop: bool = True,
                                     ) -> Optional[datetime]:
     """Series-level tighteners every cutoff PRODUCER must run: the
     CLOSE-ANCHORED rule (cutoff_from_close_min, e.g. hourly temp close-10),
@@ -21552,7 +21560,10 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
     # wave's list can only SHORTEN the series' own cutoff (Jack 2026-11-05:
     # "Yes, close the gaps"): a late stop must not quote through a game start
     # or a release the family already stops for.
-    _pvd = PVD_MARKETS.get((market or {}).get("ticker") or "") if PVD_ENABLE else None
+    # (pvd_stop=False: the market's own cutoff, its list stop left out -- the
+    # held-wave unwind, whose list stop has passed: THE WAVES ALONE AT BREAKEVEN)
+    _pvd = (PVD_MARKETS.get((market or {}).get("ticker") or "")
+            if PVD_ENABLE and pvd_stop else None)
     if _pvd is not None:
         if cutoff is None or election_series(series) or _pvd.get("override_cutoff"):
             cutoff = _pvd["stop"]
@@ -25028,6 +25039,8 @@ class IncentiveMarketMaker:
         self._unwind_only = False      # UNWIND ONLY: UNWIND_ONLY_FILE seen this cycle
         self._unwind_waves = False     # ...EXCEPT THE WAVES: UNWIND_WAVES_FILE too
         self._unwind_waves_only = False  # THE WAVES ALONE AT BREAKEVEN: UNWIND_WAVES_ONLY_FILE
+        self._wave_unwind: Dict[str, "MarketMeta"] = {}   # ...held wave markets outside the selection
+        self._wave_unwind_noted: Optional[int] = None
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
         self._off_usual_logged = 0.0
         self._off_usual_noted: Dict[str, tuple] = {}
@@ -34047,13 +34060,13 @@ class IncentiveMarketMaker:
         listed wave market while UNWIND_WAVES_FILE exists; or a listed wave
         market while UNWIND_WAVES_ONLY_FILE exists)?"""
         listed = pvd_entry(t) is not None
-        return (self._unwind_waves_only and listed) or (
+        return (self._unwind_waves_only and (listed or t in self._wave_unwind)) or (
             self._unwind_only and not (self._unwind_waves and listed))
 
     def _unwinds_at_breakeven(self, t: str) -> bool:
         """Does market `t` unwind at its average cost or better (THE WAVES
         ALONE AT BREAKEVEN)?"""
-        return self._unwind_waves_only and pvd_entry(t) is not None
+        return self._unwind_waves_only and (pvd_entry(t) is not None or t in self._wave_unwind)
 
     def _off_usual_side_note(self, t: str, cuts: Dict[str, tuple]) -> None:
         """Log a side's OFF-USUAL SIZE cut when it starts or changes."""
@@ -34978,27 +34991,71 @@ class IncentiveMarketMaker:
                 return
             for m in (resp.get("markets") or []):
                 t = m.get("ticker", "")
-                self._note_shard(t, m.get("exchange_index"))
-                event_ticker = m.get("event_ticker") or t.rsplit("-", 1)[0]
-                self.state.managed_extra[t] = MarketMeta(
-                    ticker=t, event_ticker=event_ticker, series=t.split("-")[0],
-                    dollars_per_day=0.0, program_end=None, target_size=0.0,
-                    discount_factor=0.5,
-                    cutoff=apply_series_cutoff_adjustments(
-                        t.split("-")[0], event_ticker,
-                        trade_cutoff_utc(
-                            event_ticker,
-                            parse_iso_utc(m.get("occurrence_datetime", "")),
-                            parse_iso_utc(m.get("expected_expiration_time", ""))),
-                        # close_time is what makes the close-anchored rule
-                        # (temp close-10) work on THIS producer too; market
-                        # is what makes the data-month release guard work here
-                        close_time=parse_iso_utc(m.get("close_time", "")),
-                        market=m),
-                    close_time=parse_iso_utc(m.get("close_time", "")),
-                    price_step=market_price_step(m))
+                self.state.managed_extra[t] = self._held_meta(m)
                 log(f"{self.tag} restored orphan position market {t} "
                     f"(pos {positions.get(t, 0):+.0f}, reduce-only)")
+
+    def _held_meta(self, m: dict, pvd_stop: bool = True) -> "MarketMeta":
+        """A reduce-only MarketMeta for a held market outside the selection,
+        from its /markets row (no program: no reward, no target); with
+        pvd_stop=False its cutoff leaves out a wave list's stop."""
+        t = m.get("ticker", "")
+        self._note_shard(t, m.get("exchange_index"))
+        event_ticker = m.get("event_ticker") or t.rsplit("-", 1)[0]
+        return MarketMeta(
+            ticker=t, event_ticker=event_ticker, series=t.split("-")[0],
+            dollars_per_day=0.0, program_end=None, target_size=0.0,
+            discount_factor=0.5,
+            cutoff=apply_series_cutoff_adjustments(
+                t.split("-")[0], event_ticker,
+                trade_cutoff_utc(
+                    event_ticker,
+                    parse_iso_utc(m.get("occurrence_datetime", "")),
+                    parse_iso_utc(m.get("expected_expiration_time", ""))),
+                # close_time is what makes the close-anchored rule
+                # (temp close-10) work on THIS producer too; market
+                # is what makes the data-month release guard work here
+                close_time=parse_iso_utc(m.get("close_time", "")),
+                market=m, pvd_stop=pvd_stop),
+            close_time=parse_iso_utc(m.get("close_time", "")),
+            price_step=market_price_step(m))
+
+    def _wave_unwind_manage(self, managed: Dict[str, "MarketMeta"],
+                            positions: Dict[str, float]) -> None:
+        """THE WAVES ALONE AT BREAKEVEN, their held markets: add to `managed`
+        every market on the wave list the bot holds its own position in (and
+        no manual one) that the selection left out, reading the metas it lacks
+        (an inactive or unreadable market stays out and is read again later)."""
+        want = [t for t in PVD_MARKETS
+                if t not in managed and not self._blocked(t)
+                and abs(self.pnl.pos.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
+                and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
+                < MANUAL_STANDOFF_CONTRACTS]
+        keep = set(want)
+        for t in [t for t in self._wave_unwind if t not in keep]:
+            del self._wave_unwind[t]
+        missing = [t for t in want if t not in self._wave_unwind]
+        for i in range(0, len(missing), 50):
+            chunk = missing[i:i + 50]
+            try:
+                resp = self.client.get_markets(tickers=",".join(chunk), limit=len(chunk))
+            except Exception as e:
+                log(f"{self.tag} ! wave unwind: market read failed ({e}); retried next cycle")
+                break
+            for m in (resp.get("markets") or []):
+                if str(m.get("status") or "active") not in ("active", "open"):
+                    continue
+                self._wave_unwind[m.get("ticker", "")] = self._held_meta(m, pvd_stop=False)
+        n = 0
+        for t in want:
+            meta = self._wave_unwind.get(t)
+            if meta is not None:
+                managed[t] = meta
+                n += 1
+        if n != self._wave_unwind_noted:
+            self._wave_unwind_noted = n
+            log(f"{self.tag} wave unwind: {n} held wave market(s) outside the selection "
+                f"unwind at the bot's average cost or better ({len(want)} held)")
 
     @staticmethod
     def _call_window_started(event_ticker: str,
@@ -35615,6 +35672,13 @@ class IncentiveMarketMaker:
                 if abs(positions.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS:
                     self.state.managed_extra[t] = self.state.selected[t]
 
+        # THE WAVES ALONE AT BREAKEVEN: held wave markets the selection left
+        # out are managed for their unwind (UNWIND_WAVES_ONLY_FILE)
+        if self._unwind_waves_only:
+            self._wave_unwind_manage(managed, positions)
+        elif self._wave_unwind:
+            self._wave_unwind.clear()
+            self._wave_unwind_noted = None
         self.state.known_tickers |= set(managed)
         # Prune dead entries (unmanaged, flat) so the set stays bounded.
         self.state.known_tickers &= (set(managed) | set(positions))
@@ -36377,6 +36441,12 @@ class IncentiveMarketMaker:
             # Member band (5-93 since 8/3); fresh keeps the series band.
             pmin_s, pmax_s = member_price_band(
                 series_of(t), t in self.state.selected)
+            # (a held wave market's unwind -- THE WAVES ALONE AT BREAKEVEN --
+            # quotes on the whole 1-99c band: its one order is never priced
+            # worse than the bot's average cost, and most of them are long
+            # favorites or short long shots past the usual 5-90c)
+            if t in self._wave_unwind:
+                pmin_s, pmax_s = min(pmin_s, 1), max(pmax_s, 99)
             # RT SETTLED STRIKES (2026-11-01): a settled strike quotes on its
             # own band; past the release-week stand-down, one that no longer
             # qualifies stands aside at once (the next refresh puts its
