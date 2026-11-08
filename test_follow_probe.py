@@ -1,0 +1,535 @@
+"""Tests for follow_probe.py. Every test writes only to its own temp dir."""
+
+import json
+import os
+import random
+import tempfile
+import unittest
+
+import follow_probe as fp
+
+
+def cfg(**kw):
+    base = dict(pre_s=10.0, hold_s=100.0, post_s=50.0, debounce_s=1.0, book_wait_s=20.0,
+                max_pairs=2, scan_max_age_s=10 ** 9, reconcile_s=10 ** 9, tick_s=0.5)
+    base.update(kw)
+    return fp.Config(**base).validate()
+
+
+def cand(t, ev, bid=30.0, ask=45.0, vol=0.0):
+    return fp.Cand(ticker=t, event=ev, bid_c=bid, ask_c=ask, vol24h=vol,
+                   prog={"reward_day": 10.0, "target": 1000.0})
+
+
+def book(yes=None, no=None):
+    """{cents: size} YES bids / NO bids, as Trial.observe takes them."""
+    return dict(yes or {}), dict(no or {})
+
+
+class FakeFeed:
+    def __init__(self):
+        self.books = {}          # ticker -> (yes {c: q}, no {c: q}) or None
+        self.markets = set()
+        self.events = []
+        self.dirty = set()
+        self.event_flag = None
+
+    def set(self, t, yes=None, no=None):
+        self.books[t] = book(yes, no)
+        self.dirty.add(t)
+
+    def book_levels(self, t):
+        b = self.books.get(t)
+        if b is None or t not in self.markets:
+            return None
+        return ({p / 100.0: q for p, q in b[0].items()}, {p / 100.0: q for p, q in b[1].items()})
+
+    def set_markets(self, ts):
+        self.markets = set(ts)
+
+    def drain(self):
+        d, e = self.dirty, self.events
+        self.dirty, self.events = set(), []
+        return d, e, 0
+
+    def status(self):
+        return {"fake": True}
+
+
+class FakeEx:
+    def __init__(self, live=False, sub=0, booked=None):
+        self.live, self.sub = live, sub
+        self.created, self.cancelled = [], []
+        self.primary = {}
+        self.booked = booked
+        self.resting, self.positions, self.cash = [], [], 50.0
+        self.n = 0
+
+    def primary_resting(self, ticker=None):
+        return self.primary.get(ticker, [])
+
+    def create(self, ticker, side, x, coid, exp):
+        if not self.live:
+            raise AssertionError("dry run must never place")
+        self.n += 1
+        self.created.append((ticker, side, x, coid, exp))
+        return f"oid{self.n}"
+
+    def cancel(self, oid, ticker, subaccount=None):
+        self.cancelled.append((oid, ticker, subaccount))
+        return "ok"
+
+    def order_subaccount(self, oid, tries=2):
+        return self.sub if self.booked is None else self.booked
+
+    def sub_resting(self, ticker=None):
+        return [o for o in self.resting if ticker is None or o.get("ticker") == ticker]
+
+    def sub_positions(self):
+        return self.positions
+
+    def balance(self):
+        return self.cash
+
+    def sub_fills(self, min_ts):
+        return []
+
+
+class FakeScanner:
+    def __init__(self, cands, ts):
+        self.res = fp.ScanResult(ts=ts, cands=cands, excl_events=set(), excl_markets=set(),
+                                 stats={})
+
+    def latest(self):
+        return self.res
+
+
+def rows_of(d, name="trials"):
+    out = []
+    for n in sorted(os.listdir(d)):
+        if n.startswith(name + "_"):
+            with open(os.path.join(d, n), encoding="utf-8") as f:
+                out += [json.loads(line) for line in f]
+    return out
+
+
+class TestConfig(unittest.TestCase):
+    def test_env(self):
+        c = fp.Config.from_env({"FPROBE_HOLD_S": "300", "FPROBE_MAX_PAIRS": "3",
+                                "FPROBE_SIDE": "ask", "FPROBE_SEED": "9"})
+        self.assertEqual((c.hold_s, c.max_pairs, c.side, c.seed), (300.0, 3, "ask", 9))
+        self.assertIsInstance(c.max_pairs, int)
+
+    def test_bad(self):
+        for env in ({"FPROBE_SIDE": "both"}, {"FPROBE_IMM_EXCLUDE": "x"},
+                    {"FPROBE_MIN_SPREAD_C": "1"}, {"FPROBE_HOLD_S": "0"},
+                    {"FPROBE_MAX_SPREAD_C": "10"}):
+            with self.assertRaises(ValueError):
+                fp.Config.from_env(env)
+
+
+class TestPricing(unittest.TestCase):
+    def test_bid_floor_mid(self):
+        own, opp = fp.own_view({30: 5}, {55: 7}, "bid")     # YES 30 / 45
+        self.assertEqual((fp.best(own), opp), (30, 45.0))
+        self.assertEqual(fp.theo_x(30, 45.0, cfg()), 37.0)
+        self.assertEqual(fp.yes_price_c("bid", 37.0), 37.0)
+
+    def test_ask_ceil_mid(self):
+        own, opp = fp.own_view({30: 5}, {55: 7}, "ask")     # sell YES: NO-bid space
+        self.assertEqual((fp.best(own), opp), (55, 70.0))
+        x = fp.theo_x(55, 70.0, cfg())
+        self.assertEqual(x, 62.0)
+        self.assertEqual(fp.yes_price_c("ask", x), 38.0)     # ceil(37.5)
+
+    def test_edge_and_limits(self):
+        self.assertEqual(fp.theo_x(30, 45.0, cfg(edge_c=3)), 34.0)
+        self.assertIsNone(fp.theo_x(30, 31.0, cfg()))        # no room inside
+        self.assertIsNone(fp.theo_x(None, 45.0, cfg()))
+        self.assertIsNone(fp.theo_x(30, 100.0, cfg()))       # one-sided
+        self.assertIsNone(fp.theo_x(30, 45.0, cfg(edge_c=8)))  # backed off to the touch
+
+    def test_subpenny_levels(self):
+        self.assertEqual(fp.levels_cents({0.305: 2.0, 0.31: 0.0}), {30.5: 2.0})
+        self.assertEqual(fp.theo_x(30.5, 45.0, cfg()), 37.0)
+
+
+def mrow(t, ev, bid="0.3000", ask="0.4500", **kw):
+    m = {"ticker": t, "event_ticker": ev, "status": "active", "exchange_index": 0,
+         "yes_bid_dollars": bid, "yes_ask_dollars": ask, "close_time": "2030-01-01T00:00:00Z",
+         "volume_24h_fp": "0.00"}
+    m.update(kw)
+    return m
+
+
+def prog(t, end="2030-01-01T00:00:00Z"):
+    return {"market_ticker": t, "incentive_type": "liquidity", "period_reward": 700000,
+            "start_date": "2029-12-25T00:00:00Z", "end_date": end, "target_size_fp": "500.00",
+            "discount_factor_bps": 5000}
+
+
+class TestUniverse(unittest.TestCase):
+    NOW = 1893000000.0          # 2029-12-26
+
+    def test_reasons(self):
+        c = cfg()
+        p = {"end_ts": self.NOW + 86400 * 5}
+        self.assertIsNone(fp.market_reason(mrow("A", "E"), p, self.NOW, c))
+        self.assertEqual(fp.market_reason(mrow("A", "E", ask="0.3900"), p, self.NOW, c), "tight")
+        self.assertEqual(fp.market_reason(mrow("A", "E", bid="0.0900", ask="0.9500"), p,
+                                          self.NOW, c), "stub")
+        self.assertIsNone(fp.market_reason(mrow("A", "E", bid="0.0900", ask="0.9500"), p,
+                                           self.NOW, cfg(max_spread_c=0)))
+        self.assertEqual(fp.market_reason(mrow("A", "E", bid="0.0000"), p, self.NOW, c),
+                         "one_sided")
+        self.assertEqual(fp.market_reason(mrow("A", "E", exchange_index=3), p, self.NOW, c),
+                         "shard")
+        self.assertEqual(fp.market_reason(mrow("A", "E", close_time="2029-12-26T01:00:00Z"),
+                                          p, self.NOW, c), "closing")
+        self.assertEqual(fp.market_reason(mrow("A", "E"), {"end_ts": self.NOW + 100},
+                                          self.NOW, c), "program_ending")
+        self.assertEqual(fp.market_reason(mrow("KXTEMPMIAH-X", "KXTEMPMIAH-26"), p,
+                                          self.NOW, c), "series")
+
+    def test_build_scan_excludes_primary(self):
+        progs = [prog("A1"), prog("A2"), prog("B1"), prog("C1")]
+        ms = [mrow("A1", "EA"), mrow("A2", "EA"), mrow("B1", "EB", volume_24h_fp="12.00"),
+              mrow("C1", "EC"), mrow("D1", "ED")]                     # D1: no program
+        res = fp.build_scan(progs, ms, [{"ticker": "A1"}], self.NOW, cfg())
+        self.assertEqual(sorted(c.ticker for c in res.cands), ["B1", "C1"])
+        self.assertEqual(res.stats["skipped"], {"imm_market": 1, "imm_event": 1})
+        self.assertEqual(res.cands[0].prog["reward_day"], 10.0)        # $70 over 7 days
+        self.assertEqual({c.ticker: c.stratum for c in res.cands}, {"B1": "active", "C1": "quiet"})
+        res2 = fp.build_scan(progs, ms, [{"ticker": "A1"}], self.NOW, cfg(imm_exclude="market"))
+        self.assertEqual(sorted(c.ticker for c in res2.cands), ["A2", "B1", "C1"])
+
+
+class TestPickPairs(unittest.TestCase):
+    def test_pairs(self):
+        cands = [cand(f"Q{i}-{j}", f"Q{i}") for i in range(4) for j in range(3)]
+        cands += [cand(f"A{i}", f"EA{i}", vol=5) for i in range(2)]
+        out = fp.pick_pairs(cands, 5, set(), set(), set(), cfg(), random.Random(1))
+        self.assertEqual(len(out), 3)                          # 4 quiet + 2 active events
+        used = [c.event for p, k, _, _ in out for c in (p, k)]
+        self.assertEqual(len(used), len(set(used)))            # one market per event
+        for p, k, side, s in out:
+            self.assertEqual(p.stratum, s)
+            self.assertEqual(k.stratum, s)
+            self.assertIn(side, ("bid", "ask"))
+        again = fp.pick_pairs(cands, 5, set(), set(), set(), cfg(), random.Random(1))
+        self.assertEqual([(p.ticker, k.ticker, s) for p, k, s, _ in out],
+                         [(p.ticker, k.ticker, s) for p, k, s, _ in again])
+
+    def test_filters_and_side(self):
+        cands = [cand("A", "EA"), cand("B", "EB"), cand("C", "EC"), cand("D", "ED")]
+        out = fp.pick_pairs(cands, 5, {"EA"}, {"B"}, {"EC"}, cfg(side="ask"), random.Random(2))
+        self.assertEqual(out, [])                              # busy / cooled / gap: only D left
+        out = fp.pick_pairs(cands, 5, {"EA"}, set(), set(), cfg(side="ask"), random.Random(2))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][2], "ask")
+        self.assertNotIn("A", (out[0][0].ticker, out[0][1].ticker))
+
+
+class TestTrialMetrics(unittest.TestCase):
+    def mk(self, arm="control", side="bid", **kw):
+        c = cfg(**kw)
+        tr = fp.Trial("t1", "p1", arm, cand("M", "EM"), side, "quiet", 0.0, c, False)
+        tr.phase, tr.t_pre = "pre", 0.0
+        tr.observe(0.0, book({30: 5}, {55: 7}))
+        own, opp = fp.own_view({30: 5}, {55: 7}, side)
+        tr.start_hold(10.0, own, opp, fp.theo_x(fp.best(own), opp, c))
+        tr.observe(10.0, book({30: 5}, {55: 7}))
+        return tr
+
+    def test_join_debounced(self):
+        tr = self.mk()
+        self.assertEqual((tr.x, tr.b0, tr.a0), (37.0, 30, 45.0))
+        for t in (15.0, 15.5, 16.1):
+            tr.observe(t, book({30: 5, 37: 50}, {55: 7}))
+        self.assertEqual(tr.ev.get("join"), 5.0)
+        self.assertEqual(tr.ev.get("follow"), 5.0)
+        self.assertEqual(tr.ev.get("step"), 5.0)
+        self.assertNotIn("improve", tr.ev)
+        self.assertEqual(tr.follow_size_max, 50.0)
+        self.assertEqual(tr.row("dry", "r")["gap_closed"], 1.0)
+
+    def test_flicker_is_raw_only(self):
+        tr = self.mk()
+        tr.observe(20.0, book({30: 5, 38: 10}, {55: 7}))
+        tr.observe(20.4, book({30: 5}, {55: 7}))
+        tr.observe(25.0, book({30: 5}, {55: 7}))
+        self.assertEqual(tr.raw.get("improve"), 10.0)
+        self.assertNotIn("improve", tr.ev)
+        self.assertNotIn("follow", tr.ev)
+
+    def test_improve_and_partial_step(self):
+        tr = self.mk()
+        tr.observe(12.0, book({34: 3, 30: 5}, {55: 7}))
+        tr.observe(13.5, book({34: 3, 30: 5}, {55: 7}))
+        self.assertEqual(tr.ev.get("step"), 2.0)
+        self.assertNotIn("follow", tr.ev)
+        tr.observe(30.0, book({39: 1, 34: 3}, {55: 7}))
+        tr.observe(32.0, book({39: 1, 34: 3}, {55: 7}))
+        self.assertEqual(tr.ev.get("improve"), 20.0)
+        self.assertEqual(tr.improve_by_max, 2.0)
+        self.assertEqual(tr.row("dry", "r")["gap_closed"], round(9 / 7, 3))
+
+    def test_probe_excludes_our_contract(self):
+        tr = self.mk(arm="probe")
+        tr.our_rem = 1.0
+        for t in (12.0, 14.0):
+            tr.observe(t, book({30: 5, 37: 1}, {55: 7}))        # only ours
+        self.assertNotIn("join", tr.ev)
+        for t in (20.0, 22.0):
+            tr.observe(t, book({30: 5, 37: 3}, {55: 7}))        # 2 more joined
+        self.assertEqual(tr.ev.get("join"), 10.0)
+        self.assertEqual(tr.follow_size_max, 2.0)
+
+    def test_fill_race_not_a_join(self):
+        tr = self.mk(arm="probe")
+        tr.our_rem = 1.0
+        tr.observe(12.0, book({30: 5, 37: 1}, {55: 7}))
+        tr.our_rem = 0.0                                        # the fill came first
+        tr.observe(12.1, book({30: 5, 37: 1}, {55: 7}))
+        tr.observe(12.3, book({30: 5}, {55: 7}))                # then its delta
+        tr.observe(20.0, book({30: 5}, {55: 7}))
+        self.assertNotIn("join", tr.ev)
+
+    def test_opp_side(self):
+        tr = self.mk()
+        tr.observe(40.0, book({30: 5}, {58: 4}))                # YES ask 45 -> 42
+        tr.observe(42.0, book({30: 5}, {58: 4}))
+        self.assertEqual(tr.ev.get("opp_step"), 30.0)
+        self.assertEqual(tr.row("dry", "r")["opp_gap_closed"], round(3 / 8, 3))
+
+    def test_ask_side_join(self):
+        tr = self.mk(side="ask")
+        self.assertEqual((tr.x, tr.b0, tr.a0), (62.0, 55, 70.0))
+        for t in (15.0, 17.0):
+            tr.observe(t, book({30: 5}, {55: 7, 62: 20}))      # a YES ask at 38
+        self.assertEqual(tr.ev.get("join"), 5.0)
+
+    def test_post_gone_and_revert(self):
+        tr = self.mk()
+        for t in (15.0, 17.0):
+            tr.observe(t, book({30: 5, 37: 50}, {55: 7}))
+        tr.start_post(110.0)
+        self.assertEqual((tr.t1_best, tr.t1_size), (37, 50.0))
+        tr.observe(110.0, book({30: 5, 37: 50}, {55: 7}))
+        tr.observe(130.0, book({30: 5}, {55: 7}))
+        tr.observe(131.5, book({30: 5}, {55: 7}))
+        r = tr.row("dry", "r")
+        self.assertEqual(r["gone_s"], 20.0)
+        self.assertEqual(r["revert"], 1.0)
+
+    def test_unavailable_time(self):
+        tr = self.mk()
+        tr.observe(20.0, None)
+        tr.observe(30.0, None)
+        tr.observe(35.0, book({30: 5}, {55: 7}))
+        self.assertAlmostEqual(tr.unavail_s, 15.0)
+
+
+class BotHarness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.feed = FakeFeed()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def bot(self, live=False, cands=None, booked=None, **kw):
+        c = cfg(**kw)
+        self.ex = FakeEx(live=live, sub=7 if live else 0, booked=booked)
+        cands = cands or [cand("A", "EA"), cand("B", "EB")]
+        for x in cands:
+            self.feed.set(x.ticker, {30: 5}, {55: 7})
+        b = fp.Bot(c, self.ex, self.feed, fp.Log(self.dir, echo=False), self.dir, live,
+                   random.Random(3), FakeScanner(cands, 0.0), run_id="R")
+        return b
+
+    def run_to(self, b, t0, t1, dt=0.5):
+        t = t0
+        while t <= t1 + 1e-9:
+            b.step(t)
+            t += dt
+
+
+class TestBotFlow(BotHarness):
+    def test_dry_pair_runs_to_rows_without_orders(self):
+        b = self.bot()
+        self.run_to(b, 0.0, 200.0)
+        rows = rows_of(self.dir)
+        self.assertEqual(sorted(r["arm"] for r in rows), ["control", "probe"])
+        self.assertTrue(all(r["status"] == "done" and r["mode"] == "dry" for r in rows))
+        self.assertTrue(all(r["x"] in (37.0, 62.0) for r in rows))
+        self.assertEqual(rows[0]["pair"], rows[1]["pair"])
+        self.assertEqual(self.ex.created, [])
+        self.assertEqual(b.counts["pairs"], 1)
+        self.assertEqual(self.feed.markets, set())              # unsubscribed at the end
+
+    def test_live_places_fills_and_cancels(self):
+        b = self.bot(live=True, side="bid")
+        self.run_to(b, 0.0, 20.0)
+        self.assertEqual(len(self.ex.created), 1)
+        t, side, x, coid, exp = self.ex.created[0]
+        self.assertEqual((side, x), ("bid", 37.0))
+        self.assertTrue(coid.startswith("fpb-R-"))
+        probe = b.by_oid["oid1"]
+        self.assertEqual(probe.our_rem, 1.0)
+        self.assertAlmostEqual(exp - probe.t0, 100 + 120, delta=1)
+        self.feed.set(t, {30: 5, 37: 1}, {55: 7})             # our contract shows
+        self.run_to(b, 20.5, 60.0)
+        self.assertNotIn("join", probe.ev)
+        self.run_to(b, 60.5, 200.0)
+        self.assertEqual([c[0] for c in self.ex.cancelled], ["oid1"])
+        rows = {r["arm"]: r for r in rows_of(self.dir)}
+        self.assertTrue(rows["probe"]["placed"])
+        self.assertIsNone(rows["control"]["order_id"])
+        self.assertEqual(rows_of(self.dir, "orders")[0]["event"], "placed")
+
+    def test_live_fill_stops_the_cancel(self):
+        b = self.bot(live=True, side="bid")
+        self.run_to(b, 0.0, 20.0)
+        t = self.ex.created[0][0]
+        self.feed.events.append(("fill", {"order_id": "oid1", "trade_id": "x1",
+                                          "count_fp": "1.00", "yes_price_dollars": "0.3700",
+                                          "market_ticker": t}))
+        self.run_to(b, 20.5, 200.0)
+        self.assertEqual(self.ex.cancelled, [])
+        self.assertEqual(b.counts["fills"], 1.0)
+        self.assertAlmostEqual(b.held_cost, 0.37)
+        probe = [r for r in rows_of(self.dir) if r["arm"] == "probe"][0]
+        self.assertEqual((probe["fill_n"], probe["fill_px"]), (1.0, 37.0))
+
+    def test_own_key_in_pre_abandons(self):
+        b = self.bot()
+        self.run_to(b, 0.0, 3.0)
+        tr = b.by_ticker["A"]
+        self.feed.events.append(("own_delta", {"market_ticker": "A", "client_order_id": "imm-9",
+                                               "delta_fp": "5.00", "subaccount": 0}))
+        self.run_to(b, 3.5, 200.0)
+        rows = {r["ticker"]: r for r in rows_of(self.dir)}
+        self.assertEqual(rows["A"]["status"], "abandoned")
+        self.assertEqual(rows["A"]["reason"], "own_key_pre")
+        self.assertEqual(rows["A"]["own_key_prefixes"], ["imm"])
+        self.assertEqual(rows["B"]["status"], "done")
+        self.assertIsNotNone(tr)
+
+    def test_primary_resting_skips_the_pair(self):
+        b = self.bot()
+        self.ex.primary["A"] = [{"ticker": "A"}]
+        b.step(0.0)
+        self.assertEqual(b.trials, {})
+        self.assertIn("A", b.cooled)
+
+    def test_wrong_subaccount_halts(self):
+        b = self.bot(live=True, booked=0)
+        self.run_to(b, 0.0, 20.0)
+        self.assertTrue(b.halted)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "HALT")))
+        self.assertIn(("oid1", self.ex.created[0][0], 0), self.ex.cancelled)
+        self.assertEqual(b.trials, {})
+
+    def test_halt_file_idles_and_resumes(self):
+        b = self.bot(cands=[cand(f"T{i}", f"E{i}") for i in range(6)])
+        b.step(0.0)
+        self.assertEqual(b.active_pairs(), 2)
+        open(os.path.join(self.dir, "HALT"), "w").write("stop\n")
+        b.step(3.0)
+        self.assertTrue(b.halted)
+        self.assertEqual(b.trials, {})
+        b.step(10.0)
+        self.assertEqual(b.trials, {})
+        os.remove(os.path.join(self.dir, "HALT"))
+        b.step(13.0)
+        b.step(20.0)
+        self.assertFalse(b.halted)
+        self.assertEqual(b.active_pairs(), 1)                  # 2 markets left uncooled
+
+    def test_caps(self):
+        b = self.bot(live=True, max_probes_day=1)
+        self.assertIsNone(b.caps_block())
+        b.held_cost = 39.5
+        self.assertIn("held", b.caps_block())
+        b.held_cost = 0
+        b.counts["pairs"] = 1
+        self.assertIn("pairs today", b.caps_block())
+        self.assertEqual(fp.held_cost_of([{"market_exposure_dollars": "0.37"},
+                                          {"position_fp": "-2.00"}]), 2.37)
+
+
+class TestPreflight(unittest.TestCase):
+    def test_refusals_and_go(self):
+        with tempfile.TemporaryDirectory() as d:
+            c, msgs = cfg(), []
+            ex = FakeEx(live=True, sub=0)
+            self.assertIn("subaccount", fp.live_preflight(ex, c, d, msgs.append))
+            ex = FakeEx(live=True, sub=5)
+            ex.cash = 1.0
+            self.assertIn("fund it", fp.live_preflight(ex, c, d, msgs.append))
+            ex.cash = 50.0
+            ex.resting = [{"ticker": "X", "client_order_id": "tmm-1", "order_id": "o"}]
+            self.assertIn("did not place", fp.live_preflight(ex, c, d, msgs.append))
+            ex.resting = [{"ticker": "X", "client_order_id": "fpb-old-1", "order_id": "o9"}]
+            ex.positions = [{"ticker": "Y", "position_fp": "3.00"}]
+            self.assertIn("never traded", fp.live_preflight(ex, c, d, msgs.append))
+            with open(os.path.join(d, "orders_2026-11-08.jsonl"), "w") as f:
+                f.write(json.dumps({"event": "placed", "ticker": "Y"}) + "\n")
+            self.assertIsNone(fp.live_preflight(ex, c, d, msgs.append))
+            self.assertEqual(ex.cancelled, [("o9", "X", None)])
+
+
+def trow(pair, arm, follow=None, mode="dry", **kw):
+    r = {"pair": pair, "arm": arm, "mode": mode, "status": "done", "own_key_deltas": 0,
+         "unavail_frac": 0.0, "placed": arm == "probe" and mode == "live",
+         "ev": {} if follow is None else {"follow": follow, "join": follow},
+         "t1_size": 0.0, "gap_closed": 1.0 if follow is not None else 0.0,
+         "stratum": "quiet", "side": "bid", "spread0": 15.0, "series": "KXA", "ticker": "KXA-1",
+         "post_s": 300.0}
+    r.update(kw)
+    return r
+
+
+class TestReport(unittest.TestCase):
+    def test_paired_diff(self):
+        rows = []
+        for i in range(20):
+            rows.append(trow(f"p{i}", "probe", 5.0 if i < 12 else None, mode="live"))
+            rows.append(trow(f"p{i}", "control", 30.0 if i < 2 else None, mode="live"))
+        rows.append(trow("p99", "probe", 5.0, mode="live", own_key_deltas=3))
+        rows.append(trow("p99", "control", None, mode="live"))
+        pairs = fp.pairs_of(rows)
+        self.assertEqual(len(pairs), 20)
+        d, lo, hi = fp.boot_diff(pairs, "follow")
+        self.assertAlmostEqual(d, 0.5)
+        self.assertLess(lo, 0.5)
+        self.assertGreater(hi, 0.5)
+        self.assertGreater(lo, 0.2)
+        self.assertEqual(fp.boot_diff(pairs, "follow"), (d, lo, hi))
+        txt = fp.render_report(rows)
+        self.assertIn("| someone else at our price or better | 60% | 10% | 50%", txt)
+        self.assertIn("OUR bots", txt)
+        self.assertNotIn("A/A", txt)
+
+    def test_dry_banner_and_unplaced_live_probe(self):
+        rows = [trow("p1", "probe", 5.0), trow("p1", "control", None)]
+        self.assertIn("A/A", fp.render_report(rows))
+        live = [trow("p1", "probe", 5.0, mode="live", placed=False),
+                trow("p1", "control", None, mode="live")]
+        self.assertEqual(fp.pairs_of(live), [])
+        self.assertIn("No complete pairs", fp.render_report(live))
+
+    def test_cli_report_and_setup(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "trials_2026-11-08.jsonl"), "w") as f:
+                for r in (trow("p1", "probe", 5.0), trow("p1", "control", None)):
+                    f.write(json.dumps(r) + "\n")
+            self.assertEqual(fp.main(["--report", "--data-dir", d]), 0)
+            self.assertTrue(any(n.startswith("report_") for n in os.listdir(d)))
+            self.assertEqual(fp.main(["--setup"]), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
