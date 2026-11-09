@@ -149,6 +149,9 @@ def setUpModule():
     imm.UNWIND_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY")
     imm.UNWIND_WAVES_FILE = os.path.join(tmp, "UNWIND_ONLY_EXCEPT_WAVES")
     imm.UNWIND_WAVES_ONLY_FILE = os.path.join(tmp, "UNWIND_ONLY_WAVES")
+    # every Carbon Arc family quotes in the fixtures (POS + apps are off live
+    # since 2026-11-08: TestCaFamiliesOff sets it)
+    imm.CA_FAMILY_BLOCK = frozenset()
     imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
     imm.OWN_BOOK_FLATTEN_FILE = os.path.join(tmp, "own_book_flatten.txt")
     # a live sniper book on this machine must not net into the fixtures
@@ -9136,6 +9139,35 @@ class TestCompanyKpiOff(unittest.TestCase):
             os.remove(p)
             imm._company_kpi_tagged["at"] = 0.0
             imm._company_kpi_tagged["set"] = frozenset()
+
+
+class TestCaFamiliesOff(unittest.TestCase):
+    """Jack 2026-11-08: "turn off POS + Apps" -- Carbon Arc point of sale and
+    app series are frozen; card spend, foot traffic and ad spend quote."""
+
+    def test_pos_and_apps_are_frozen_and_the_rest_quote(self):
+        ca = {"KXMILLERLITEPOS", "KXPEACOCKAPP", "KXSODAARRAY", "KXAMZNCC", "KXBKFT",
+              "KXCASINOADS"}
+        with mock.patch.object(imm, "CA_FAMILY_BLOCK", frozenset({"point of sale", "app"})), \
+                mock.patch.object(imm, "family_verdict", lambda s: True if s in ca else None), \
+                mock.patch.dict(imm.FAMILY_VERDICTS,
+                                {"KXSODAARRAY": {"title": "Soda point of sale spend array"}}):
+            blocked = imm.IncentiveMarketMaker._blocked
+            for t in ("KXMILLERLITEPOS-26DEC03-T89.5", "KXPEACOCKAPP-26DEC08-T119",
+                      "KXSODAARRAY-26DEC03-T100"):
+                self.assertTrue(blocked(t), t)
+            self.assertTrue(imm.series_blocklisted("KXPEACOCKAPP"))
+            for t in ("KXAMZNCC-26DEC05-T106", "KXBKFT-26DEC04-T95", "KXCASINOADS-26DEC06-T59.5"):
+                self.assertFalse(blocked(t), t)
+            # not Carbon Arc (no verdict): an app-store series stays quotable
+            self.assertFalse(imm.ca_family_blocked("KXTOPAPP"))
+        with mock.patch.object(imm, "CA_FAMILY_BLOCK", frozenset()), \
+                mock.patch.object(imm, "family_verdict", lambda s: True if s in ca else None):
+            self.assertFalse(imm.IncentiveMarketMaker._blocked("KXMILLERLITEPOS-26DEC03-T89.5"))
+
+    def test_the_env_default(self):
+        self.assertEqual(imm._CA_FAMILY_BLOCK_RAW if "IMM_CA_FAMILY_BLOCK" in os.environ
+                         else "point of sale,app", imm._CA_FAMILY_BLOCK_RAW)
 
 
 class TestMtmAndSettlement(unittest.TestCase):

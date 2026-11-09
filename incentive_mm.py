@@ -5660,6 +5660,27 @@ def company_kpi_series(series: str) -> bool:
                                   or series in company_kpi_tagged())
 
 
+# CARBON ARC POINT OF SALE + APPS OFF (Jack 2026-11-08: "turn off POS +
+# Apps"), after the by-data-month review: point of sale lost every month
+# (September data -$202, October -$632, November so far -$134, rewards
+# included) and apps -$358 over the three, while card spend (+$980) and foot
+# traffic (+$370) won every month. Every Carbon Arc-settled series whose
+# category (ca_category: the prism's, else the suffix's, else the verdict
+# title's -- the sector arrays too) is in CA_FAMILY_BLOCK is frozen like a
+# blocklisted series: no new orders, resting quotes cancelled the next cycle,
+# positions ride to settlement. An unverified series (no Carbon Arc verdict
+# yet) is not caught. IMM_CA_FAMILY_BLOCK = comma list of categories
+# (default "point of sale,app"; "" / 0 / none = every family quotes).
+_CA_FAMILY_BLOCK_RAW = os.environ.get("IMM_CA_FAMILY_BLOCK", "point of sale,app").strip().lower()
+CA_FAMILY_BLOCK = frozenset() if _CA_FAMILY_BLOCK_RAW in ("", "0", "off", "none") else frozenset(
+    c.strip() for c in _CA_FAMILY_BLOCK_RAW.split(",") if c.strip())
+
+
+def ca_family_blocked(series: str) -> bool:
+    """A Carbon Arc series in a family CA_FAMILY_BLOCK turns off."""
+    return bool(CA_FAMILY_BLOCK) and (ca_category(series) or "") in CA_FAMILY_BLOCK
+
+
 def series_blocklisted(series: str) -> bool:
     """A bare SERIES name under SERIES_BLOCKLIST_PREFIXES: a prefix entry, or
     an exact-series entry ("<series>-", the cuts above), which a bare name
@@ -5667,8 +5688,9 @@ def series_blocklisted(series: str) -> bool:
     missed those: the family watch re-enrolled KXLOLTEEMO every 30 min after
     its 2026-11-01 cut, emailing each time. An event-ticker entry
     ("KXMLBPLAYOFFS-26") still leaves its series name alone. A company-KPI
-    series (COMPANY_KPI_BLOCK, 2026-11-08) counts too."""
-    return company_kpi_series(series) or any(
+    series (COMPANY_KPI_BLOCK, 2026-11-08) counts too, and a Carbon Arc
+    family turned off (CA_FAMILY_BLOCK, 2026-11-08)."""
+    return company_kpi_series(series) or ca_family_blocked(series) or any(
         series.startswith(p) or p == f"{series}-" for p in SERIES_BLOCKLIST_PREFIXES)
 
 # WIND-DOWN EXEMPTION for a blocklisted series (Jack 2026-09-11, KXTRUEV):
@@ -31214,7 +31236,8 @@ class IncentiveMarketMaker:
         if any(ticker.startswith(p) for p in prefixes) \
                 or (series_pattern_blocked(series_of(ticker)) and not astest) \
                 or event_pattern_blocked(ticker) \
-                or company_kpi_series(series_of(ticker)):
+                or company_kpi_series(series_of(ticker)) \
+                or ca_family_blocked(series_of(ticker)):
             # A wind-down event (BLOCKLIST_WIND_DOWN_EVENTS) is the one
             # exception to a prefix block. Accept the market ticker or the
             # event ticker itself: the freeze paths pass markets, the
@@ -42668,6 +42691,10 @@ class IncentiveMarketMaker:
                f"is frozen ({len(_COMPANY_KPI_SNAPSHOT)} in the snapshot, "
                f"{len(company_kpi_tagged())} tagged in the dashboard cache); positions ride"
                if COMPANY_KPI_BLOCK else "quotable (IMM_COMPANY_KPI_BLOCK=0)"))
+        log("carbon arc families (2026-11-08): "
+            + (f"OFF -- {', '.join(sorted(CA_FAMILY_BLOCK))} (frozen: no new orders, "
+               f"resting quotes cancelled, positions ride); the other families quote"
+               if CA_FAMILY_BLOCK else "every family quotes (IMM_CA_FAMILY_BLOCK=0)"))
         log("net halt (2026-11-08): "
             + (f"on -- P&L today + est rewards today (the lower of raw and paid basis) "
                f"at or below -${NET_LOSS_LIMIT:,.0f} cancels everything until the "
