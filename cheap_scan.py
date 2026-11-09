@@ -332,7 +332,7 @@ def main(argv=None) -> int:
     ap.add_argument("--series", default=TRULY_FAR,
                     help="comma-separated series PREFIXES (the truly-far set; default the scheduled list)")
     ap.add_argument("--min-days", type=float, default=182.0, help="horizon backstop (6M)")
-    ap.add_argument("--max-usd", type=float, default=50.0, help="size x px a market, at most")
+    ap.add_argument("--max-usd", type=float, default=100.0, help="size x px a market, at most")
     ap.add_argument("--bar", type=float, default=1.10, help="$ the rung must project by its program end")
     ap.add_argument("--include-quoted", action="store_true",
                     help="list a market even where the bot earns more under its family rules")
