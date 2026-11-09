@@ -10325,6 +10325,11 @@ def load_pvd_markets() -> int:
                     "follow_book": bool(raw.get("follow_book")),
                     # "no_halts": its series joins PVD_NO_HALT_SERIES
                     "no_halts": bool(raw.get("no_halts")),
+                    # "wave_added": the registry wave's creation time (epoch s;
+                    # UNWIND_WAVES_EXEMPT_NEW -- a wave added after the waves
+                    # switch appeared is not covered by it)
+                    "wave_added": (lambda d: d.timestamp() if d else None)(
+                        parse_iso_utc(str(raw.get("wave_added") or ""))),
                     "event": raw.get("event") or t.rsplit("-", 1)[0]}
     # ...and the CHEAP-SIDE BOOKS (CHEAP_FILE): a ticker on the wave list too
     # keeps its wave entry
@@ -10638,6 +10643,14 @@ PVD_OFF_USUAL_COLD = os.environ.get("IMM_PVD_OFF_USUAL_COLD", "base").strip().lo
 PVD_CLOSE_CLAMP_MODE = os.environ.get("IMM_PVD_CLOSE_CLAMP", "on").strip().lower()
 if PVD_CLOSE_CLAMP_MODE not in ("on", "dry", "off"):
     PVD_CLOSE_CLAMP_MODE = "on"
+# 5c, OR BREAKEVEN (Jack 2026-11-08: "change to 5c instead of 3c. or if it's
+# breakeven or better, it can rest there."): the reducing side rests no more
+# than PVD_CLOSE_CLAMP_C past its usual price toward the taker, or at the
+# position's average cost or better where that reaches further (a bid at most
+# max(usual + 5, cost), an ask at least min(usual - 5, cost)); with no usual
+# price, past the limits only at breakeven or better (pvd_close_bound).
+# PVD_OFF_USUAL_C (3c) still sets the off-usual size cut.
+PVD_CLOSE_CLAMP_C = _env_float("IMM_PVD_CLOSE_CLAMP_C", 5.0)
 # OFF-USUAL SIZE FOR BIG SIDES OFF THE LIST (Jack 2026-11-08: "Port for big
 # sides"). A 24-day replay of the rule on the book outside the waves (10/16-
 # 11/08, 8,096 fills): fills 10c+ off their usual price marked -4.0c a contract
@@ -10822,20 +10835,49 @@ def pvd_decided_side(last: Optional[float]) -> Optional[str]:
     return None
 
 
+def pvd_close_bound(side: str, usual: Optional[float], cost: Optional[float],
+                    off_c: float) -> Optional[float]:
+    """THE CLOSE CLAMP's bound for the side that reduces a position: no more
+    than `off_c` past its usual price toward the taker, or breakeven (`cost`,
+    the position's average YES price) where that reaches further -- a bid at
+    most max(usual + off_c, cost), an ask at least min(usual - off_c, cost)
+    (Jack 2026-11-08: "change to 5c instead of 3c. or if it's breakeven or
+    better, it can rest there."). None with no usual price."""
+    if usual is None:
+        return None
+    b = float(usual) + float(off_c) if side == "bid" else float(usual) - float(off_c)
+    if cost is not None and cost > 0:
+        b = max(b, float(cost)) if side == "bid" else min(b, float(cost))
+    return b
+
+
+def pvd_at_breakeven(side: str, px: float, cost: Optional[float]) -> bool:
+    """A closing rung at the position's cost or better: a bid (buying back a
+    short) at or under it, an ask (selling a long) at or over it."""
+    if cost is None or cost <= 0:
+        return False
+    return px <= float(cost) + 1e-9 if side == "bid" else px >= float(cost) - 1e-9
+
+
 def pvd_clamp_toward_taker(q: "Quote", usual: float, off_c: float) -> Optional["Quote"]:
-    """THE CLOSE CLAMP on one rung: a bid resting over `usual` + off_c, or an
-    ask under `usual` - off_c, re-priced AT that bound (rounded away from the
-    taker: a sub-penny rung on the 0.1c grid, a whole-cent one to the cent);
+    """THE CLOSE CLAMP on one rung at `usual` +- off_c (pvd_clamp_at)."""
+    return pvd_clamp_at(q, float(usual) + float(off_c) if q.book_side == "bid"
+                        else float(usual) - float(off_c))
+
+
+def pvd_clamp_at(q: "Quote", bound: float) -> Optional["Quote"]:
+    """THE CLOSE CLAMP on one rung: a bid resting over `bound`, or an ask
+    under it, re-priced AT that bound (rounded away from the taker: a
+    sub-penny rung on the 0.1c grid, a whole-cent one to the cent);
     unchanged when it rests inside; None when the bound leaves 1-99c."""
     px = float(q.price_exact if q.price_exact is not None else q.price_cents)
+    bound = float(bound)
     if q.book_side == "bid":
-        bound = float(usual) + float(off_c)
         if px <= bound + 1e-9:
             return q
         new = (math.floor(bound * 10 + 1e-6) / 10.0 if q.price_exact is not None
                else float(math.floor(bound + 1e-9)))
     else:
-        bound = float(usual) - float(off_c)
         if px >= bound - 1e-9:
             return q
         new = (math.ceil(bound * 10 - 1e-6) / 10.0 if q.price_exact is not None
@@ -10854,7 +10896,8 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
                      close_qty: float = 0.0,
                      close_usual: Optional[float] = None,
                      close_clamp: str = "off",
-                     off_c: Optional[float] = None) -> List["Quote"]:
+                     off_c: Optional[float] = None,
+                     close_cost: Optional[float] = None) -> List["Quote"]:
     """A post-vote dead book's side guard: no pads; nothing outside
     PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
     bid_max, an ask only at or over ask_min (YES cents), each tightened to
@@ -10867,23 +10910,28 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
 
     CLOSE CLAMP (`close_clamp` "on", Jack 2026-11-08: "dont allow that" -- the
     reducing side following a bait at any price): every rung of that side rests
-    no more than `off_c` (PVD_OFF_USUAL_C) past `close_usual`, its 6 h usual
-    price, toward the taker, re-priced at the bound (pvd_clamp_toward_taker);
-    with no usual price there is no exemption past the limits. "dry" changes
-    nothing here (the caller logs what it would do)."""
+    no more than `off_c` (PVD_CLOSE_CLAMP_C, 5c) past `close_usual`, its 6 h
+    usual price, toward the taker -- or at `close_cost` (breakeven) or better
+    where that reaches further -- re-priced at the bound (pvd_close_bound,
+    pvd_clamp_at); with no usual price a closing rung rests past the limits
+    only at breakeven or better. "dry" changes nothing here (the caller logs
+    what it would do)."""
     bmax, amin = pvd_limits(entry, last)
     lo, hi = entry.get("pmin", PVD_PRICE_MIN), entry.get("pmax", PVD_PRICE_MAX)
     decided = pvd_decided_side(last)
     exempt = True
     if close_clamp == "on" and close_side is not None:
         if close_usual is None:
-            exempt = False        # no usual price: the limits hold the reducing side too
+            # no usual price: the limits hold the reducing side too -- except
+            # at breakeven or better (Jack 2026-11-08)
+            exempt = "breakeven" if close_cost is not None and close_cost > 0 else False
         else:
-            oc = PVD_OFF_USUAL_C if off_c is None else float(off_c)
+            oc = PVD_CLOSE_CLAMP_C if off_c is None else float(off_c)
+            bound = pvd_close_bound(close_side, close_usual, close_cost, oc)
             clamped: List["Quote"] = []
             for q in quotes:
                 if q.book_side == close_side and not q.is_pad:
-                    q = pvd_clamp_toward_taker(q, close_usual, oc)
+                    q = pvd_clamp_at(q, bound)
                     if q is None:
                         continue
                     for i, x in enumerate(clamped):      # two rungs clamped onto one price: one rung
@@ -10922,6 +10970,8 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
             out.append(q)
         elif exempt and close_side is not None and q.book_side == close_side \
                 and int(close_qty) >= 1:
+            if exempt == "breakeven" and not pvd_at_breakeven(q.book_side, px, close_cost):
+                continue
             out.append(replace(q, count=int(min(q.count, int(close_qty)))))
     # OFF MEANS ZERO (PVD_ZERO_OFF): an off side keeps only its closing rungs,
     # best price first, the position in all (the sizing already holds it there)
@@ -12923,6 +12973,16 @@ UNWIND_WAVES_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_EXCEPT_WAVES")
 # the 2026 midterm markets (voting day 11/03 passed) rest nothing and ride to
 # settlement -- a breakeven order there fills only on the winners.
 UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
+# ...EXISTING WAVES ONLY (Jack 2026-11-08: "yes for existing waves, but shouldnt
+# disqualify new waves from quoting"): the switch covers the waves that were on
+# the list when it appeared. A listed market whose entry carries "wave_added"
+# (the registry wave's creation time, written by pvd_wave_tune --wave-added)
+# LATER than the switch file's mtime quotes as usual, and its held markets off
+# the list ride like any unlisted market; entries with no wave_added (the
+# hand-built waves of 11/04-11/07) or an earlier one keep unwinding at
+# breakeven or better. Recreating the file covers every wave listed by then.
+# IMM_UNWIND_WAVES_EXEMPT_NEW=0 = the switch covers every listed market again.
+UNWIND_WAVES_EXEMPT_NEW = os.environ.get("IMM_UNWIND_WAVES_EXEMPT_NEW", "1") != "0"
 # NO LEAD (Jack 2026-11-08: "when unwinding, dont lead like in
 # KXHOUSERACE-AR02-28-D"): every unwind order (unwind_only_quotes: UNWIND ONLY,
 # the waves' breakeven unwind and their held markets) rests no better than the
@@ -13829,6 +13889,7 @@ _CONFIG_CODE_KNOBS = (
     # lone-reference guard (2026-10-16)
     "LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
     "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
+    "LONE_REF_PVD_MODE",          # on for the wave list (2026-11-08)
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_LEAD_HOLD_SMALL",       # a few lots ahead are not fought (2026-10-30)
@@ -13875,7 +13936,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_ANCHOR_MIN", "JOIN_WAIT_MEMORY_MIN", "JOIN_WAIT_SUBPENNY",
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
-    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF",
+    "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
@@ -22847,6 +22908,13 @@ LONE_REF_SKIP: Tuple[str, ...] = tuple(
 # no-fair-value markets: +$17.44/day. IMM_LONE_REF_SKIP_FAIR=0 checks the
 # fair-gated markets again.
 LONE_REF_SKIP_FAIR = os.environ.get("IMM_LONE_REF_SKIP_FAIR", "1") == "1"
+# ...ON FOR THE MARKET WAVES (Jack 2026-11-08: "turn on lone ref guard for
+# market-wave"). On the 11/07 House night the dry guard logged "would stand
+# aside" before every bait, and the next tune took the side to full size at the
+# bait price. A listed wave market (wave_entry) runs the guard in
+# LONE_REF_PVD_MODE ("on" | "dry" | "off"); every other market keeps
+# LONE_REF_GUARD_MODE. "" = the wave list follows LONE_REF_GUARD_MODE too.
+LONE_REF_PVD_MODE = os.environ.get("IMM_LONE_REF_PVD", "on").strip().lower()
 
 
 def fair_gate_of(series: str) -> str:
@@ -25614,6 +25682,7 @@ class IncentiveMarketMaker:
         self._unwind_only = False      # UNWIND ONLY: UNWIND_ONLY_FILE seen this cycle
         self._unwind_waves = False     # ...EXCEPT THE WAVES: UNWIND_WAVES_FILE too
         self._unwind_waves_only = False  # THE WAVES ALONE AT BREAKEVEN: UNWIND_WAVES_ONLY_FILE
+        self._unwind_waves_only_since = 0.0   # ...its mtime (UNWIND_WAVES_EXEMPT_NEW)
         self._unwind_nolead_noted: Dict[str, Any] = {}   # NO LEAD: last logged move per market
         self._wave_unwind: Dict[str, "MarketMeta"] = {}   # ...held wave markets outside the selection
         self._wave_unwind_noted: Optional[int] = None
@@ -34644,20 +34713,37 @@ class IncentiveMarketMaker:
                 total += p * (mark - self.pnl.avg.get(t, 0.0)) / 100.0
         return total
 
+    def _wave_after_switch(self, e: Optional[dict]) -> bool:
+        """A list entry whose wave was added after UNWIND_WAVES_ONLY_FILE
+        appeared (UNWIND_WAVES_EXEMPT_NEW): the switch does not cover it."""
+        if not UNWIND_WAVES_EXEMPT_NEW or not e:
+            return False
+        wa = e.get("wave_added")
+        return wa is not None and float(wa) > float(self._unwind_waves_only_since or 0.0)
+
+    def _waves_switch_covers(self, t: str) -> bool:
+        """Is `t` one of the waves UNWIND_WAVES_ONLY_FILE covers: a listed wave
+        market (or a held one off the list, _wave_unwind) whose wave existed
+        when the switch appeared?"""
+        if t in self._wave_unwind:
+            return True
+        e = wave_entry(t)
+        return e is not None and not self._wave_after_switch(e)
+
     def _unwinds(self, t: str) -> bool:
         """Does market `t` only unwind this cycle (UNWIND ONLY, and not a
         listed wave market while UNWIND_WAVES_FILE exists; or a listed wave
-        market while UNWIND_WAVES_ONLY_FILE exists)?"""
+        market the waves switch covers while UNWIND_WAVES_ONLY_FILE exists)?"""
         # (a CHEAP-SIDE BOOK is no wave: the waves' switches pass it by, and
         # bot-wide UNWIND ONLY takes it like any other market)
         listed = wave_entry(t) is not None
-        return (self._unwind_waves_only and (listed or t in self._wave_unwind)) or (
+        return (self._unwind_waves_only and self._waves_switch_covers(t)) or (
             self._unwind_only and not (self._unwind_waves and listed))
 
     def _unwinds_at_breakeven(self, t: str) -> bool:
         """Does market `t` unwind at its average cost or better (THE WAVES
-        ALONE AT BREAKEVEN)?"""
-        return self._unwind_waves_only and (wave_entry(t) is not None or t in self._wave_unwind)
+        ALONE AT BREAKEVEN, the waves the switch covers)?"""
+        return self._unwind_waves_only and self._waves_switch_covers(t)
 
     def _cheap_side_note(self, t: str, q: Optional["Quote"], info: dict,
                          meta: "MarketMeta") -> None:
@@ -34677,9 +34763,11 @@ class IncentiveMarketMaker:
             f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * int(info.get('px') or 0) / 100:.0f} "
             f"if it all fills (other side's best {info.get('limit')}c)")
 
-    def _pvd_clamp_note(self, t: str, quotes: list, side: str, usual, pos: float) -> None:
+    def _pvd_clamp_note(self, t: str, quotes: list, side: str, usual, pos: float,
+                        cost: Optional[float] = None) -> None:
         """Log the CLOSE CLAMP on a market when what it does there changes: the
-        reducing side's best rung, where it would rest, and the usual price."""
+        reducing side's best rung, where it would rest, the usual price and
+        breakeven (the position's average cost)."""
         try:
             rungs = [q for q in quotes if q.book_side == side and not q.is_pad]
             if not rungs:
@@ -34689,16 +34777,19 @@ class IncentiveMarketMaker:
             best = max(rungs, key=px) if side == "bid" else min(rungs, key=px)
             if usual is None:
                 key = (side, round(px(best), 2), None)
-                why = "no usual price yet: no closing exemption past the limits"
+                why = ("no usual price yet: past the limits only at breakeven or better "
+                       f"({cost:g}c)" if cost else
+                       "no usual price yet: no closing exemption past the limits")
             else:
-                c = pvd_clamp_toward_taker(best, usual, PVD_OFF_USUAL_C)
+                bound = pvd_close_bound(side, usual, cost, PVD_CLOSE_CLAMP_C)
+                c = pvd_clamp_at(best, bound)
                 if c is not None and c is best:
                     self._pvd_clamp.pop(t, None)
                     return
                 to = None if c is None else round(px(c), 2)
                 key = (side, round(px(best), 2), to)
-                why = (f"usual {usual:g}c, so {'at most' if side == 'bid' else 'at least'} "
-                       f"{usual + PVD_OFF_USUAL_C if side == 'bid' else usual - PVD_OFF_USUAL_C:g}c"
+                why = (f"usual {usual:g}c{f', breakeven {cost:g}c' if cost else ''}, so "
+                       f"{'at most' if side == 'bid' else 'at least'} {bound:g}c"
                        + (f" -> rests at {to:g}c" if to is not None else " -> out of 1-99c, not resting"))
             if self._pvd_clamp.get(t) != key:
                 self._pvd_clamp[t] = key
@@ -35828,6 +35919,7 @@ class IncentiveMarketMaker:
         want = [t for t in PVD_MARKETS
                 if t not in managed and not self._blocked(t)
                 and not PVD_MARKETS[t].get("cheap")        # no wave: its fills ride
+                and not self._wave_after_switch(PVD_MARKETS[t])   # a new wave: rides
                 and abs(self.pnl.pos.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
                 and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
                 < MANUAL_STANDOFF_CONTRACTS]
@@ -36338,6 +36430,15 @@ class IncentiveMarketMaker:
                    else "OFF" + (": every market only unwinds" if _uo else "")))
         self._unwind_waves = _uw
         _uwo = os.path.exists(UNWIND_WAVES_ONLY_FILE)
+        try:
+            _uws = os.path.getmtime(UNWIND_WAVES_ONLY_FILE) if _uwo else 0.0
+        except OSError:
+            _uws = 0.0
+        if _uwo and UNWIND_WAVES_EXEMPT_NEW and _uws != self._unwind_waves_only_since:
+            log(f"{self.tag} WAVES UNWIND ONLY covers the waves listed before "
+                f"{datetime.fromtimestamp(_uws, timezone.utc):%Y-%m-%d %H:%M:%SZ}; a wave added "
+                f"after that (its entries' wave_added) quotes as usual")
+        self._unwind_waves_only_since = _uws
         if _uwo != self._unwind_waves_only:
             log(f"{self.tag} WAVES UNWIND ONLY "
                 + (f"ON ({UNWIND_WAVES_ONLY_FILE}): every listed wave market quotes only "
@@ -38127,11 +38228,14 @@ class IncentiveMarketMaker:
             # on its own series (quietly where the guard does not look), and
             # an event it stopped a side in runs the guard ON until ET
             # midnight.
-            lr_guard = (LONE_REF_GUARD_MODE in ("on", "dry")
+            # (a listed wave market runs LONE_REF_PVD_MODE, "on": Jack 2026-11-08)
+            lr_mode = (LONE_REF_PVD_MODE if pvd is not None and LONE_REF_PVD_MODE
+                       in ("on", "dry", "off") else LONE_REF_GUARD_MODE)
+            lr_guard = (lr_mode in ("on", "dry")
                         and lone_ref_series(meta.series))
             lr_bait = bait_series(meta.series)
             if LADDER_MODE == "atref" and (lr_guard or lr_bait):
-                lr_on = (lr_guard and LONE_REF_GUARD_MODE == "on") or (
+                lr_on = (lr_guard and lr_mode == "on") or (
                     lr_bait and self.bait_event_guarded(meta.event_ticker, now_ts))
                 lr_bid, lr_ask = self._lone_ref_check(
                     t, meta, yes_levels, no_levels, own_in_book, own,
@@ -38524,11 +38628,14 @@ class IncentiveMarketMaker:
                     try:
                         _cub, _cua = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
                         _pv_cu = _cub if _pv_close == "bid" else _cua
-                    except Exception:   # no usual: no exemption past the limits
+                    except Exception:   # no usual: past the limits only at breakeven
                         _pv_cu = None
-                    self._pvd_clamp_note(t, mq, _pv_close, _pv_cu, own_pos)
+                _pv_cost = self.pnl.avg.get(t) if _pv_close is not None else None
+                if _pv_close is not None and PVD_CLOSE_CLAMP_MODE in ("on", "dry"):
+                    self._pvd_clamp_note(t, mq, _pv_close, _pv_cu, own_pos, _pv_cost)
                 mq = pvd_guard_quotes(mq, pvd, _pv_last, _pv_close, abs(own_pos),
-                                      close_usual=_pv_cu, close_clamp=PVD_CLOSE_CLAMP_MODE)
+                                      close_usual=_pv_cu, close_clamp=PVD_CLOSE_CLAMP_MODE,
+                                      close_cost=_pv_cost)
                 _pv_cl = next(((q.book_side, q.price_cents, q.count) for q in mq
                                if q.book_side == _pv_close and not q.is_pad and (
                                    q.price_cents > _pv_pb if q.book_side == "bid"
@@ -42522,6 +42629,13 @@ class IncentiveMarketMaker:
                   if LONE_REF_SKIP_FAIR else "")
                if _lr_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _lr_live else ""))
+        log(f"lone-reference guard on the wave list (2026-11-08): "
+            + (f"{LONE_REF_PVD_MODE} -- a listed wave market runs the guard "
+               + ("ON (a tripped side stands aside)" if LONE_REF_PVD_MODE == "on"
+                  else "dry (logged)" if LONE_REF_PVD_MODE == "dry" else "off")
+               + f"; every other market: {LONE_REF_GUARD_MODE}"
+               if LONE_REF_PVD_MODE in ("on", "dry", "off")
+               else f"as the rest of the bot ({LONE_REF_GUARD_MODE})"))
         _bs_live = BAIT_STOP_MODE in ("on", "dry")
         log(f"bait-fingerprint stop (2026-10-22): {BAIT_STOP_MODE}"
             + (" -- a fill that takes our whole rung on a side the lone-reference "
@@ -42562,11 +42676,18 @@ class IncentiveMarketMaker:
                else "off (IMM_NET_LOSS_LIMIT=0)"))
         log(f"close clamp (2026-11-08): {PVD_CLOSE_CLAMP_MODE}"
             + (f" -- the side that reduces a position on a listed market rests no more than "
-               f"{PVD_OFF_USUAL_C:g}c past its {PVD_OFF_USUAL_HOURS:g}h usual price toward the taker "
-               f"(a bid <= usual + {PVD_OFF_USUAL_C:g}, an ask >= usual - {PVD_OFF_USUAL_C:g}, re-priced "
-               f"at that bound); no usual price: no closing exemption past the limits"
+               f"{PVD_CLOSE_CLAMP_C:g}c past its {PVD_OFF_USUAL_HOURS:g}h usual price toward the taker, "
+               f"or at breakeven or better (its average cost) where that reaches further (a bid <= "
+               f"max(usual + {PVD_CLOSE_CLAMP_C:g}, cost), an ask >= min(usual - {PVD_CLOSE_CLAMP_C:g}, "
+               f"cost), re-priced at that bound); no usual price: past the limits only at breakeven "
+               f"or better"
                + ("" if PVD_CLOSE_CLAMP_MODE == "on" else " (dry: logged, nothing re-priced)")
                if PVD_CLOSE_CLAMP_MODE in ("on", "dry") else " (the 11/04 closing exemption as was)"))
+        log(f"unwind-only waves scope (2026-11-08): "
+            + ("existing waves -- UNWIND_ONLY_WAVES covers the waves listed before the switch "
+               "file appeared; a wave added after it quotes as usual"
+               if UNWIND_WAVES_EXEMPT_NEW else
+               "every listed wave (IMM_UNWIND_WAVES_EXEMPT_NEW=0)"))
         log(f"zero-size sides (2026-11-08): {'off' if PVD_ZERO_OFF else 'the old 1-lot'} -- a listed "
             f"side sized 0 (the tune's 90c+ side cap and twin block) "
             + ("rests nothing but the order that closes a position, at most the position"

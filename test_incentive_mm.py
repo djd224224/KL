@@ -40917,25 +40917,27 @@ class TestPostVoteDeadBooks(unittest.TestCase):
 
     def test_close_clamp_keeps_the_reducing_side_off_a_bait(self):
         """Jack 2026-11-08, on the side that reduces a position following the bait
-        at any price: "dont allow that" -- it rests no more than 3c past its 6 h
-        usual price toward the taker, re-priced at the bound; no usual price, no
-        exemption past the limits; "off" is the 11/04 exemption as it was"""
+        at any price: "dont allow that" -- it rests no more than 5c ("change to 5c
+        instead of 3c") past its 6 h usual price toward the taker, re-priced at the
+        bound; no usual price, no exemption past the limits; "off" is the 11/04
+        exemption as it was"""
         Q = imm.Quote
-        e = {"bid_max": 8, "ask_min": 10, "follow_book": True}
+        self.assertEqual(imm.PVD_CLOSE_CLAMP_C, 5.0)
+        e = {"bid_max": 10, "ask_min": 12, "follow_book": True}
         # IL16-D: short 200 after the probe, the bait sets the bid reference at 33c
         bait = [Q(self.T, "bid", 33, 1783)]
         out = imm.pvd_guard_quotes(bait, e, None, "bid", 200.0, close_usual=5.0, close_clamp="on")
-        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 8, 1783)])
-        # 8c = usual 5 + 3 is inside the limit, so the whole flip-through side rests
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 10, 1783)])
+        # 10c = usual 5 + 5 is inside the limit, so the whole flip-through side rests
         # there; a tighter limit leaves the exemption at the bound, up to the position
         out = imm.pvd_guard_quotes(bait, dict(e, bid_max=6), None, "bid", 200.0,
                                    close_usual=5.0, close_clamp="on")
-        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 8, 200)])
-        # AZ08-R: long 300, the ask walked down to 61 under a 91c usual -> 88
+        self.assertEqual([(q.book_side, q.price_cents, q.count) for q in out], [("bid", 10, 200)])
+        # AZ08-R: long 300, the ask walked down to 61 under a 91c usual -> 86
         ask = [Q(self.T, "ask", 61, 1819)]
         out = imm.pvd_guard_quotes(ask, {"bid_max": 58, "ask_min": 64, "follow_book": True}, None, "ask",
                                    300.0, close_usual=91.0, close_clamp="on")
-        self.assertEqual([(q.price_cents, q.count) for q in out], [(88, 1819)])
+        self.assertEqual([(q.price_cents, q.count) for q in out], [(86, 1819)])
         # no usual price: no exemption past the limits (the 33c bid is over 8)
         self.assertEqual(imm.pvd_guard_quotes(bait[:1], e, None, "bid", 200.0, close_usual=None,
                                               close_clamp="on"), [])
@@ -40947,23 +40949,101 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         sp = [Q(self.T, "bid", 33, 100, price_exact=32.7)]
         out = imm.pvd_guard_quotes(sp, {"bid_max": 99, "ask_min": 99, "follow_book": True}, None, "bid",
                                    100.0, close_usual=4.35, close_clamp="on")
-        self.assertEqual([(q.price_cents, q.price_exact) for q in out], [(7, 7.3)])
+        self.assertEqual([(q.price_cents, q.price_exact) for q in out], [(9, 9.3)])
         # the side that ADDS is not this rule's (off-usual size and the join wait hold it)
         out = imm.pvd_guard_quotes([Q(self.T, "ask", 4, 300)], {"bid_max": 1, "ask_min": 4,
                                    "follow_book": True}, None, "bid", 200.0, close_usual=5.0, close_clamp="on")
         self.assertEqual([(q.book_side, q.price_cents) for q in out], [("ask", 4)])
         # end to end: short 40 at limits that block the 49c closing bid, usual 40/44
-        # -> the bid rests at 43, not at the 49 reference
+        # -> the bid rests at 45 (40 + 5), not at the 49 reference...
         self._write({self.T: {"bid_max": 40, "ask_min": 60, "cushion": 0}})
-        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
-        now = time.time()
-        bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), 40.0, 44.0] for i in range(8)]
-        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, 51.0
-        bot.client.positions[self.T] = -40.0
-        bot.run_cycle()
-        self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
-                          for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
-                         [("bid", 43, 40.0)])
+        for avg, want in ((44.0, 45), (51.0, 49)):
+            _clean_persist()
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            now = time.time()
+            bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), 40.0, 44.0] for i in range(8)]
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -40.0, avg
+            bot.client.positions[self.T] = -40.0
+            bot.run_cycle()
+            # ...unless that is breakeven or better: sold at 51, the 49 bid buys back
+            # under cost, so it rests there (Jack: "or if it's breakeven or better")
+            self.assertEqual([(o["book_side"], o["yes_price"], o["remaining_count"])
+                              for o in bot.state.sim_orders.values() if o["ticker"] == self.T],
+                             [("bid", want, 40.0)], avg)
+
+    def test_close_clamp_lets_breakeven_or_better_rest(self):
+        """Jack 2026-11-08: "change to 5c instead of 3c. or if it's breakeven or
+        better, it can rest there." -- the bound is the further of the usual price
+        +- 5c and the position's average cost"""
+        Q = imm.Quote
+        self.assertEqual(imm.pvd_close_bound("ask", 70.0, 50.0, 5.0), 50.0)    # long @50: down to cost
+        self.assertEqual(imm.pvd_close_bound("ask", 70.0, 67.0, 5.0), 65.0)    # cost inside: usual - 5
+        self.assertEqual(imm.pvd_close_bound("bid", 20.0, 30.0, 5.0), 30.0)    # short @30: up to cost
+        self.assertEqual(imm.pvd_close_bound("bid", 20.0, None, 5.0), 25.0)
+        self.assertIsNone(imm.pvd_close_bound("bid", None, 30.0, 5.0))
+        e = {"bid_max": 1, "ask_min": 99, "follow_book": True}
+        g = lambda qs, side, usual, cost: [(q.book_side, q.price_cents, q.count) for q in imm.pvd_guard_quotes(
+            qs, e, None, side, 100.0, close_usual=usual, close_clamp="on", close_cost=cost)]
+        # long 100 @ 50, usual 70: a bait pulls the ask to 40 -> rests at 50 (breakeven)
+        self.assertEqual(g([Q(self.T, "ask", 40, 300)], "ask", 70.0, 50.0), [("ask", 50, 100)])
+        # ...an ask at 55 is past usual - 5 but over cost: it rests where it is
+        self.assertEqual(g([Q(self.T, "ask", 55, 300)], "ask", 70.0, 50.0), [("ask", 55, 100)])
+        # short 100 @ 30, usual 20: a bait bid at 40 -> rests at 30
+        self.assertEqual(g([Q(self.T, "bid", 40, 300)], "bid", 20.0, 30.0), [("bid", 30, 100)])
+        # no usual price: past the limits only at breakeven or better
+        self.assertEqual(g([Q(self.T, "ask", 55, 300)], "ask", None, 50.0), [("ask", 55, 100)])
+        self.assertEqual(g([Q(self.T, "ask", 45, 300)], "ask", None, 50.0), [])
+        self.assertEqual(g([Q(self.T, "ask", 55, 300)], "ask", None, None), [])
+        # "dry": the 11/04 exemption, whatever the cost
+        self.assertEqual([(q.price_cents, q.count) for q in imm.pvd_guard_quotes(
+            [Q(self.T, "ask", 40, 300)], e, None, "ask", 100.0, close_usual=70.0, close_clamp="dry",
+            close_cost=50.0)], [(40, 100)])
+
+    def test_the_waves_switch_spares_a_wave_added_after_it(self):
+        """Jack 2026-11-08, on UNWIND_ONLY_WAVES: "yes for existing waves, but
+        shouldnt disqualify new waves from quoting" -- a listed market whose wave
+        was added (wave_added) after the switch file appeared quotes as usual;
+        the waves before it and the hand-built ones (no wave_added) still unwind"""
+        self.assertTrue(imm.UNWIND_WAVES_EXEMPT_NEW)
+        f = imm.UNWIND_WAVES_ONLY_FILE
+        open(f, "w").close()
+        self.addCleanup(lambda: os.path.exists(f) and os.remove(f))
+        t0 = os.path.getmtime(f)
+        z = lambda s: datetime.fromtimestamp(s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        bot = None
+        for wa, unwinds in ((None, True), (z(t0 - 3600), True), (z(t0 + 3600), False)):
+            _clean_persist()
+            e = {"bid_max": 49, "ask_min": 51, "size": 200}
+            if wa:
+                e["wave_added"] = wa
+            self._write({self.T: e})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            with mock.patch.object(imm, "log", lambda *a: None):
+                bot.run_cycle()
+            self.assertEqual(bot._unwinds(self.T), unwinds, wa)
+            self.assertEqual(bot._unwinds_at_breakeven(self.T), unwinds, wa)
+            sides = {o["book_side"] for o in bot.state.sim_orders.values() if o["ticker"] == self.T}
+            self.assertEqual(sides, set() if unwinds else {"bid", "ask"}, wa)
+        # the knob off: every listed market unwinds again
+        with mock.patch.object(imm, "UNWIND_WAVES_EXEMPT_NEW", False):
+            self.assertTrue(bot._unwinds(self.T))
+        # a new wave's held market off the list rides (no breakeven unwind)
+        self.assertFalse(bot._wave_after_switch({"wave_added": t0 - 1}))
+        self.assertTrue(bot._wave_after_switch({"wave_added": t0 + 1}))
+
+    def test_lone_ref_guard_on_for_the_wave_list(self):
+        """Jack 2026-11-08: "turn on lone ref guard for market-wave" -- a listed
+        wave market runs the guard ON while the rest of the bot keeps its dry
+        mode; LONE_REF_PVD_MODE "" puts the list back on the bot-wide mode"""
+        self.assertEqual(imm.LONE_REF_PVD_MODE, "on")
+        self.assertIn("LONE_REF_PVD_MODE", imm._CONFIG_CODE_KNOBS)
+        self._write({self.T: {"bid_max": 90, "ask_min": 91, "size": 100, "follow_book": True}})
+        W, B = TestLoneReferenceGuard.WIDE, TestLoneReferenceGuard.BAIT
+        _bot, seen = TestLoneReferenceGuard._cycles(self, "dry", [W, B, W])
+        self.assertEqual(seen, [[6], [], [6]])
+        with mock.patch.object(imm, "LONE_REF_PVD_MODE", ""):
+            _bot, seen = TestLoneReferenceGuard._cycles(self, "dry", [W, B])
+        self.assertEqual(seen, [[6], [69]])
 
     def test_closing_side_rests_inside_the_cushion_up_to_the_position(self):
         """Jack 2026-11-04 "Yes, exempt closing": the side that reduces the
