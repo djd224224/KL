@@ -9735,14 +9735,20 @@ class TestFullUnwind(unittest.TestCase):
                                   min_total=60)
             self.assertEqual([(x.price_cents, x.count) for x in q], [(52, 30), (53, 10), (54, 20)])
 
-    def _short_bot(self, unwind: bool):
+    def _short_bot(self, unwind: bool, be_offset_days: float = 0.0):
+        """Short 100 @ 50 on KXGOOD-99DEC31-A, one cycle. The breakeven
+        offset (6f03bbf, 2026-11-05) is OFF by default here: the fixture's
+        ticker date is 2099, so the offset would cover it and raise the
+        reducing bid to the whole position whatever the flag says --
+        `be_offset_days` turns it back on."""
         _clean_persist()
         bot = IncentiveMarketMaker(client=FakeClient(), live=False)
         bot.client.positions[self.T] = -100.0
         bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -100.0, 50.0
         with mock.patch.dict(imm.SERIES_OVERRIDES,
                              {"KXGOOD": imm.SeriesOverride(unwind_full_position=unwind)}), \
-                mock.patch.object(imm, "LADDER_MODE", "offsets"):
+                mock.patch.object(imm, "LADDER_MODE", "offsets"), \
+                mock.patch.object(imm, "BE_OFFSET_DAYS", be_offset_days):
             bot.run_cycle()
         return {side: sum(o["remaining_count"] for o in bot.state.sim_orders.values()
                           if o["ticker"] == self.T and o["book_side"] == side)
@@ -9755,6 +9761,16 @@ class TestFullUnwind(unittest.TestCase):
         its side cap for the reducing side only."""
         self.assertEqual(self._short_bot(unwind=False), {"bid": 35.0, "ask": 0})
         self.assertEqual(self._short_bot(unwind=True), {"bid": 100.0, "ask": 0})
+
+    def test_the_breakeven_offset_rests_the_whole_position_without_the_flag(self):
+        """Jack 2026-11-05 (6f03bbf): a market 30+ days out rests its whole
+        position on the reducing side when that nets out at breakeven or
+        better. The 49c bid buys back the short at under its 50c average,
+        so the offset lifts the ladder's 35 to the whole 100 with the
+        full-unwind flag off too."""
+        self.assertEqual(self._short_bot(unwind=False, be_offset_days=imm.BE_OFFSET_DAYS),
+                         {"bid": 100.0, "ask": 0})
+        self.assertEqual(imm.BE_OFFSET_DAYS, 30.0)
 
 
 class TestCycleLog(unittest.TestCase):
