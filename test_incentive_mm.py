@@ -152,6 +152,10 @@ def setUpModule():
     # every Carbon Arc family quotes in the fixtures (POS + apps are off live
     # since 2026-11-08: TestCaFamiliesOff sets it)
     imm.CA_FAMILY_BLOCK = frozenset()
+    # the locking hedge's fixtures run it on (off live since 2026-11-09:
+    # TestLockingHedgeOff sets it)
+    imm.COMP_HEDGE_MODE = "on"
+    imm.LOCK_MODE = "on"
     imm.EVENT_LIVE_CLEAR_FILE = os.path.join(tmp, "event_live_clear.txt")
     imm.OWN_BOOK_FLATTEN_FILE = os.path.join(tmp, "own_book_flatten.txt")
     # a live sniper book on this machine must not net into the fixtures
@@ -9139,6 +9143,39 @@ class TestCompanyKpiOff(unittest.TestCase):
             os.remove(p)
             imm._company_kpi_tagged["at"] = 0.0
             imm._company_kpi_tagged["set"] = frozenset()
+
+
+class TestLockingHedgeOff(unittest.TestCase):
+    """Jack 2026-11-09: "stop it" -- the locking hedge is off by default, and
+    an open job pulls its resting legs and ends."""
+
+    def test_defaults_are_off(self):
+        src = open(imm.__file__, encoding="utf-8").read()
+        self.assertIn('os.environ.get("IMM_COMP_HEDGE", "off")', src)
+        self.assertIn('os.environ.get("IMM_LOCK", "off")', src)
+
+    def test_an_open_job_pulls_its_legs_and_ends(self):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        now = time.time()
+        bot._comp_hedges = [{
+            "id": "J2", "ticker": "KXGOOD-99DEC31-A", "side": "ask", "price": 47.0,
+            "count": 160.0, "lead": True, "kind": "me_ask", "at": now - 60, "until": now + 3600,
+            "legs": {"KXGOOD-99DEC31-B": {"filled": 0.0, "value": 0.0, "fee": 0.0,
+                                          "oid": "OID-1", "sent_at": now - 5}}}]
+        bot._lock_resting = None
+        with mock.patch.object(imm, "COMP_HEDGE_MODE", "off"), \
+                mock.patch.object(bot, "_lock_cancel") as lc, \
+                mock.patch.object(imm, "log", lambda *a, **k: None):
+            bot._comp_hedge_run(now)
+        lc.assert_called_once_with("OID-1", "KXGOOD-99DEC31-B", "off")
+        self.assertEqual(bot._comp_hedges, [])
+        # no new job on a fill while off
+        with mock.patch.object(imm, "COMP_HEDGE_MODE", "off"), \
+                mock.patch.object(imm, "LOCK_MODE", "off"):
+            bot._comp_hedge_on_fill({"order_id": "x"}, "KXGOOD-99DEC31-A", "yes", "sell",
+                                    10.0, 47.0, now, pos_before=0.0, pos_after=-10.0)
+        self.assertEqual(bot._comp_hedges, [])
 
 
 class TestCompHedgeGiveUpLogOnly(unittest.TestCase):

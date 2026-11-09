@@ -23937,7 +23937,14 @@ COMP_PAIR_TTL_SECS = _env_float("IMM_COMP_PAIR_TTL_H", 12.0) * 3600.0
 COMP_PAIR_READS_PER_REFRESH = _env_int("IMM_COMP_PAIR_READS", 300)
 COMP_HOLD_FILE = "comp_lead_holds.json"
 COMP_HOLD_TTL_SECS = _env_float("IMM_COMP_HOLD_TTL_H", 168.0) * 3600.0
-COMP_HEDGE_MODE = os.environ.get("IMM_COMP_HEDGE", "on").strip().lower()
+# LOCKING HEDGE OFF (Jack 2026-11-09: "stop it", after its review 10/29-11/09:
+# 1,240 jobs, 36 locked (3%) for +$28.34 in all, its legs' own P&L +$4.31 --
+# about breakeven, rarely completing). IMM_COMP_HEDGE (a lead's fill) and
+# IMM_LOCK (any other fill) now default off: no new lock job, and an open job
+# whose switch is off pulls its resting legs and ends (its fill and any leg
+# filled ride on as ordinary inventory). The complement LEAD (COMP_LEAD_MODE)
+# is untouched. IMM_COMP_HEDGE=on / IMM_LOCK=on restore them.
+COMP_HEDGE_MODE = os.environ.get("IMM_COMP_HEDGE", "off").strip().lower()
 COMP_HEDGE_EDGE_C = _env_float("IMM_COMP_HEDGE_EDGE_C", 2.0)
 # ...a LEAD's fill locks at any floor after taker fees: the 5c margin is
 # before fees, and selling Korea's 11 siblings costs ~4c a contract in them
@@ -23978,7 +23985,7 @@ COMP_LEAD_MAX_POSITION = _env_float("IMM_COMP_LEAD_MAX_POSITION", 400.0)
 # lead like the complement lead: a strike's ask off the easier strikes'
 # offers, its bid off the harder strikes' bids, both sides in any family (the
 # hedge needs no winner: ladder_lead_group).
-LOCK_MODE = os.environ.get("IMM_LOCK", "on").strip().lower()
+LOCK_MODE = os.environ.get("IMM_LOCK", "off").strip().lower()   # off since 2026-11-09 (above)
 LOCK_WATCH_SECS = _env_float("IMM_LOCK_WATCH_MIN", 60.0) * 60.0
 LOCK_LEG_TTL_SECS = _env_float("IMM_LOCK_LEG_TTL_MIN", 30.0) * 60.0
 LOCK_MAKER_FEE_MULT = _env_float("IMM_LOCK_MAKER_FEE_MULT", 0.25)   # 0.0175 / 0.07
@@ -34093,6 +34100,19 @@ class IncentiveMarketMaker:
                     for s_, lg_ in working.items():
                         self._lock_cancel(lg_["oid"], s_, why)
                         lg_["oid"] = None
+
+                # LOCKING HEDGE OFF: a job whose switch is off pulls its legs
+                # and ends; its fill rides on as ordinary inventory
+                if (COMP_HEDGE_MODE if lead else LOCK_MODE) == "off":
+                    end_legs("off")
+                    log(f"{self.tag} comp hedge: {j['id']} ended -- the locking hedge "
+                        f"is off ({len(working)} leg(s) pulled)")
+                    self._sink("comp_hedge", {
+                        "ts": datetime.now(timezone.utc).isoformat(), "kind": "off",
+                        "job": j["id"], "ticker": t, "lock": kind, "lead": lead,
+                        "legs": {s: d[0] for s, d in done.items()}})
+                    changed = True
+                    continue
 
                 age = now_ts - float(j.get("at", now_ts))
                 edge = COMP_HEDGE_LEAD_EDGE_C if lead else COMP_HEDGE_EDGE_C
