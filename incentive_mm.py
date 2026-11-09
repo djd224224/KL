@@ -5676,6 +5676,20 @@ CA_FAMILY_BLOCK = frozenset() if _CA_FAMILY_BLOCK_RAW in ("", "0", "off", "none"
     c.strip() for c in _CA_FAMILY_BLOCK_RAW.split(",") if c.strip())
 
 
+# ...AND THEIR POSITIONS UNWIND AT BREAKEVEN (Jack 2026-11-08: "add an unwind
+# at breakeven or better", on the 131 positions the families held at the
+# change, -$877 marked): a market of a family CA_FAMILY_BLOCK turns off where
+# the bot holds its own position of REDUCE_ONLY_MIN_CONTRACTS+ (no manual one)
+# is managed for its unwind alone (_ca_family_unwind_manage), as the waves' held
+# markets are: the reducing side only, the whole position as one order, never
+# worse than the bot's average cost (a whole cent), never leading (NO LEAD),
+# on the 1-99c band. Its meta is read once (get_markets, 50 a call). It keeps
+# the series' own cutoff and data holds; the late-month cut (#3, the toxic
+# side) does not take its reducing side. It earns nothing. IMM_CA_FAMILY_UNWIND=0
+# turns the unwind off (the positions then ride).
+CA_FAMILY_UNWIND = os.environ.get("IMM_CA_FAMILY_UNWIND", "1") != "0"
+
+
 def ca_family_blocked(series: str) -> bool:
     """A Carbon Arc series in a family CA_FAMILY_BLOCK turns off."""
     return bool(CA_FAMILY_BLOCK) and (ca_category(series) or "") in CA_FAMILY_BLOCK
@@ -25788,6 +25802,8 @@ class IncentiveMarketMaker:
         self._unwind_nolead_noted: Dict[str, Any] = {}   # NO LEAD: last logged move per market
         self._wave_unwind: Dict[str, "MarketMeta"] = {}   # ...held wave markets outside the selection
         self._wave_unwind_noted: Optional[int] = None
+        self._ca_family_unwind: Dict[str, "MarketMeta"] = {}   # held markets of a Carbon Arc family turned off
+        self._ca_family_unwind_noted: Optional[int] = None
         self._off_usual: Dict[str, Tuple[float, Dict[str, tuple]]] = {}  # OFF-USUAL SIZE: t -> (ts, cuts)
         self._off_usual_logged = 0.0
         self._off_usual_noted: Dict[str, tuple] = {}
@@ -34840,13 +34856,16 @@ class IncentiveMarketMaker:
         # (a CHEAP-SIDE BOOK is no wave: the waves' switches pass it by, and
         # bot-wide UNWIND ONLY takes it like any other market)
         listed = wave_entry(t) is not None
-        return (self._unwind_waves_only and self._waves_switch_covers(t)) or (
+        return (t in self._ca_family_unwind) or (
+            self._unwind_waves_only and self._waves_switch_covers(t)) or (
             self._unwind_only and not (self._unwind_waves and listed))
 
     def _unwinds_at_breakeven(self, t: str) -> bool:
         """Does market `t` unwind at its average cost or better (THE WAVES
-        ALONE AT BREAKEVEN, the waves the switch covers)?"""
-        return self._unwind_waves_only and self._waves_switch_covers(t)
+        ALONE AT BREAKEVEN, the waves the switch covers; or a held market of
+        a Carbon Arc family turned off, CA_FAMILY_UNWIND)?"""
+        return (t in self._ca_family_unwind) or (
+            self._unwind_waves_only and self._waves_switch_covers(t))
 
     def _cheap_side_note(self, t: str, q: Optional["Quote"], info: dict,
                          meta: "MarketMeta") -> None:
@@ -36013,6 +36032,43 @@ class IncentiveMarketMaker:
             close_time=parse_iso_utc(m.get("close_time", "")),
             price_step=market_price_step(m))
 
+    def _ca_family_unwind_manage(self, managed: Dict[str, "MarketMeta"],
+                          positions: Dict[str, float]) -> None:
+        """CA_FAMILY_UNWIND: add to `managed` every market of a Carbon Arc
+        family CA_FAMILY_BLOCK turns off where the bot holds its own position
+        (and no manual one), reading the metas it lacks (an inactive or
+        unreadable market stays out and is read again later)."""
+        want = [t for t, p in self.pnl.pos.items()
+                if t not in managed and abs(p) >= REDUCE_ONLY_MIN_CONTRACTS
+                and ca_family_blocked(series_of(t))
+                and abs(positions.get(t, 0.0) - p) < MANUAL_STANDOFF_CONTRACTS]
+        keep = set(want)
+        for t in [t for t in self._ca_family_unwind if t not in keep]:
+            del self._ca_family_unwind[t]
+        missing = [t for t in want if t not in self._ca_family_unwind]
+        for i in range(0, len(missing), 50):
+            chunk = missing[i:i + 50]
+            try:
+                resp = self.client.get_markets(tickers=",".join(chunk), limit=len(chunk))
+            except Exception as e:
+                log(f"{self.tag} ! ca unwind: market read failed ({e}); retried next cycle")
+                break
+            for m in (resp.get("markets") or []):
+                if str(m.get("status") or "active") not in ("active", "open"):
+                    continue
+                self._ca_family_unwind[m.get("ticker", "")] = self._held_meta(m)
+        n = 0
+        for t in want:
+            meta = self._ca_family_unwind.get(t)
+            if meta is not None:
+                managed[t] = meta
+                n += 1
+        if n != self._ca_family_unwind_noted:
+            self._ca_family_unwind_noted = n
+            log(f"{self.tag} ca family unwind: {n} held market(s) of "
+                f"{', '.join(sorted(CA_FAMILY_BLOCK))} unwind at the bot's average cost "
+                f"or better ({len(want)} held)")
+
     def _wave_unwind_manage(self, managed: Dict[str, "MarketMeta"],
                             positions: Dict[str, float]) -> None:
         """THE WAVES ALONE AT BREAKEVEN, their held markets: add to `managed`
@@ -36688,6 +36744,12 @@ class IncentiveMarketMaker:
         elif self._wave_unwind:
             self._wave_unwind.clear()
             self._wave_unwind_noted = None
+        # ...and the Carbon Arc families turned off (CA_FAMILY_UNWIND)
+        if CA_FAMILY_UNWIND and CA_FAMILY_BLOCK:
+            self._ca_family_unwind_manage(managed, positions)
+        elif self._ca_family_unwind:
+            self._ca_family_unwind.clear()
+            self._ca_family_unwind_noted = None
         self.state.known_tickers |= set(managed)
         # Prune dead entries (unmanaged, flat) so the set stays bounded.
         self.state.known_tickers &= (set(managed) | set(positions))
@@ -37458,7 +37520,7 @@ class IncentiveMarketMaker:
             # quotes on the whole 1-99c band: its one order is never priced
             # worse than the bot's average cost, and most of them are long
             # favorites or short long shots past the usual 5-90c)
-            if t in self._wave_unwind:
+            if t in self._wave_unwind or t in self._ca_family_unwind:
                 pmin_s, pmax_s = min(pmin_s, 1), max(pmax_s, 99)
             # RT SETTLED STRIKES (2026-11-01): a settled strike quotes on its
             # own band; past the release-week stand-down, one that no longer
@@ -38213,6 +38275,14 @@ class IncentiveMarketMaker:
                 ca_am, ca_uw_lifted = ca_unwind_late_mult(t, now_utc), True
             elif ca_uw == "bid" and ca_bm <= 0:
                 ca_bm, ca_uw_lifted = ca_unwind_late_mult(t, now_utc), True
+            # (a held market of a family turned off, CA_FAMILY_UNWIND: its
+            # reducing side rests through the late-month cut; the unwind
+            # prices it at breakeven or better)
+            if t in self._ca_family_unwind:
+                if own_pos > 0 and ca_am <= 0:
+                    ca_am = ca_unwind_late_mult(t, now_utc)
+                elif own_pos < 0 and ca_bm <= 0:
+                    ca_bm = ca_unwind_late_mult(t, now_utc)
             # ...times the series' own side sizes (SIDE_MULT_SERIES, Trump B;
             # else the family's lean) and the event long-shot cut at this
             # book's mid (LONGSHOT_MULT)
@@ -42773,7 +42843,10 @@ class IncentiveMarketMaker:
                if COMPANY_KPI_BLOCK else "quotable (IMM_COMPANY_KPI_BLOCK=0)"))
         log("carbon arc families (2026-11-08): "
             + (f"OFF -- {', '.join(sorted(CA_FAMILY_BLOCK))} (frozen: no new orders, "
-               f"resting quotes cancelled, positions ride); the other families quote"
+               f"resting quotes cancelled"
+               + ("; held positions unwind at breakeven or better, never leading"
+                  if CA_FAMILY_UNWIND else "; positions ride (IMM_CA_FAMILY_UNWIND=0)")
+               + "); the other families quote"
                if CA_FAMILY_BLOCK else "every family quotes (IMM_CA_FAMILY_BLOCK=0)"))
         log("net halt (2026-11-08): "
             + (f"on -- P&L today + est rewards today (the lower of raw and paid basis) "

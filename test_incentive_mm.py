@@ -9169,6 +9169,47 @@ class TestCaFamiliesOff(unittest.TestCase):
         self.assertEqual(imm._CA_FAMILY_BLOCK_RAW if "IMM_CA_FAMILY_BLOCK" in os.environ
                          else "point of sale,app", imm._CA_FAMILY_BLOCK_RAW)
 
+    def test_held_positions_unwind_at_breakeven_or_better(self):
+        """Jack 2026-11-08: "add an unwind at breakeven or better" -- a held
+        market of a family turned off rests one reducing order for the whole
+        position, at its cost or better, never leading; nothing when flat, with
+        a manual position, or with the unwind off"""
+        T = "KXMILLERLITEPOS-99DEC03-T89.5"
+
+        def run(pos, avg, manual=0.0, on=True, no_levels=None):
+            _clean_persist()
+            c = FakeClient()
+            c.markets[T] = {"ticker": T, "event_ticker": "KXMILLERLITEPOS-99DEC03",
+                            "status": "active", "close_time": c.markets["KXGOOD-99DEC31-A"]["close_time"],
+                            "yes_bid_dollars": "0.4000", "yes_ask_dollars": "0.5000",
+                            "volume_fp": "500.00"}
+            c.books[T] = {"orderbook_fp": {"yes_dollars": [["0.39", "300"], ["0.40", "300"]],
+                                           "no_dollars": no_levels or [["0.50", "300"]]}}   # 40x50
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[T], bot.pnl.avg[T] = pos, avg
+            c.positions[T] = pos + manual
+            lines = []
+            with mock.patch.object(imm, "CA_FAMILY_BLOCK", frozenset({"point of sale", "app"})), \
+                    mock.patch.object(imm, "CA_FAMILY_UNWIND", on), \
+                    mock.patch.object(imm, "family_verdict",
+                                      lambda s: True if s == "KXMILLERLITEPOS" else None), \
+                    mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+            return bot, sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                               for o in bot.state.sim_orders.values() if o["ticker"] == T), lines
+        bot, orders, lines = run(120.0, 45.0)
+        self.assertIn(T, bot._ca_family_unwind)
+        self.assertNotIn(T, bot.state.selected)
+        self.assertEqual(orders, [("ask", 50, 120.0)])            # joins the 50c ask, over its 45c cost
+        self.assertTrue(any("ca family unwind: 1 held market(s)" in x for x in lines), lines)
+        self.assertEqual(run(120.0, 55.4)[1], [("ask", 56, 120.0)])   # waits at its cost, whole cent
+        self.assertEqual(run(-80.0, 47.0)[1], [("bid", 40, 80.0)])    # a short joins the 40c bid
+        self.assertEqual(run(120.0, 45.0, no_levels=[["0.50", "300"], ["0.53", "5"]])[1],
+                         [("ask", 50, 120.0)])                      # a 5-lot at 47c is not joined
+        self.assertEqual(run(3.0, 45.0)[1], [])                     # under REDUCE_ONLY_MIN
+        self.assertEqual(run(120.0, 45.0, manual=40.0)[1], [])      # a manual position: hands off
+        self.assertEqual(run(120.0, 45.0, on=False)[1], [])         # the unwind off: positions ride
+
 
 class TestMtmAndSettlement(unittest.TestCase):
     def _bot(self):
