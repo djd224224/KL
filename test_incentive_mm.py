@@ -9141,6 +9141,17 @@ class TestCompanyKpiOff(unittest.TestCase):
             imm._company_kpi_tagged["set"] = frozenset()
 
 
+class TestNextSpeakerCut(unittest.TestCase):
+    """Jack 2026-11-08: "KXNEXTSPEAKER-31 ^why is this quoting at all", then
+    "Yes, stop it" -- the series is frozen, whatever family enrolls it."""
+
+    def test_the_series_is_frozen(self):
+        self.assertTrue(imm.IncentiveMarketMaker._blocked("KXNEXTSPEAKER-31-HJEF"))
+        self.assertTrue(imm.IncentiveMarketMaker._blocked("KXNEXTSPEAKER-31-KCLA"))
+        self.assertTrue(imm.series_blocklisted("KXNEXTSPEAKER"))
+        self.assertFalse(imm.series_blocklisted("KXNEXTSPEAKERX"))   # an exact series, not a prefix
+
+
 class TestCaFamiliesOff(unittest.TestCase):
     """Jack 2026-11-08: "turn off POS + Apps" -- Carbon Arc point of sale and
     app series are frozen; card spend, foot traffic and ad spend quote."""

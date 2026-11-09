@@ -5492,6 +5492,14 @@ _CUT_OR_SHARE_SERIES = tuple(s for s in _DEFAULT_OR_SHARE_SERIES.split(",") if s
 # an un-block is one line. Exact series (the dash). Standard semantics:
 # open positions ride to settlement. Un-block by removing this entry.
 _CUT_LOSERS_1101_SERIES = ("KXNETFLIXTOPVIEWSTV", "KXLOLTEEMO")
+# KXNEXTSPEAKER CUT (Jack 2026-11-08: "KXNEXTSPEAKER-31 ^why is this quoting at
+# all", then "Yes, stop it"): the Elections family had enrolled it
+# (election_extra_series.json) and quoted Jeffries two-sided at 94-95c, with
+# the complement hedge resting 9-lot legs at 1-3c on the other candidates.
+# Blocklisted as an exact series: no new orders, resting quotes and hedge legs
+# cancelled, the ~10-contract position rides to settlement; the blocklist wins
+# over the Elections and Politics families.
+_CUT_1108_SERIES = ("KXNEXTSPEAKER",)
 # OREGON TIMBER: SELL BACK ONLY (Jack 2026-11-01: "Oregon only", choosing
 # between stopping KXORBOFHARVEST alone and also dropping the overnight x3 on
 # the other seven SMALL_BOOKS_X2_SERIES; then, after 320cc3b blocked it, "continue
@@ -5578,6 +5586,7 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     + [f"{_s}-" for _s in _CUT_OR_SHARE_SERIES]
     # Netflix top-10 TV + LoL Worlds Teemo (2026-11-01, above)
     + [f"{_s}-" for _s in _CUT_LOSERS_1101_SERIES]
+    + [f"{_s}-" for _s in _CUT_1108_SERIES]
     + [p for p in os.environ.get("IMM_BLOCKLIST", "").split(",") if p]
 )
 
