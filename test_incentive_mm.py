@@ -42207,3 +42207,72 @@ class TestCarbonArcUnwind(unittest.TestCase):
             self._hold(bot, 200, 40.0)
             bot.run_cycle()
             self.assertEqual([o for o in self._side(bot, "ask") if o["yes_price"] < 99], [])
+
+
+class TestStraitWeeklyStop(unittest.TestCase):
+    """Jack 2026-11-08: "stop quoting strait weeklies in the last 2 days of the
+    period" -- out at 00:00 UTC two days before the Monday-Sunday week ends."""
+
+    EV = "KXBABELMANDEBWEEKLY-26NOV08"
+    MKT = {"title": "Will there be more than 220 transit calls through the Bab "
+                    "el-Mandeb Strait from Nov 2, 2026 to Nov 8, 2026?",
+           "rules_secondary": "The total is calculated by summing daily counts "
+                              "from Nov 2, 2026 to Nov 8, 2026."}
+
+    def test_series(self):
+        for s in ("KXSUEZWEEKLY", "KXBABELMANDEBWEEKLY", "KXHORMUZWEEKLY",
+                  "KXPANAMAWEEKLY", "KXHORMUZPEAK"):
+            self.assertIn(s, imm.STRAIT_WEEKLY_STOP_SERIES)
+        self.assertNotIn("KXNYNJPORTTEU", imm.STRAIT_WEEKLY_STOP_SERIES)   # monthly ports
+        self.assertEqual(imm.STRAIT_WEEKLY_STOP_DAYS, 2)
+
+    def test_stop_is_saturday_midnight_utc(self):
+        self.assertEqual(imm.strait_weekly_last_day(self.EV), date(2026, 11, 8))
+        self.assertEqual(imm.strait_weekly_stop_utc(self.EV), utc(2026, 11, 7))
+        self.assertEqual(imm.strait_weekly_stop_utc(self.EV, self.MKT), utc(2026, 11, 7))
+        et = imm.strait_weekly_stop_utc(self.EV).astimezone(imm.ET)
+        self.assertEqual((et.weekday(), et.hour), (4, 19))                 # Friday 7 PM ET
+        self.assertEqual(imm.strait_weekly_stop_utc("KXHORMUZPEAK-26NOV15"), utc(2026, 11, 14))
+
+    def test_earlier_text_wins(self):
+        m = {"title": "... from Nov 1, 2026 to Nov 7, 2026?"}
+        self.assertEqual(imm.strait_weekly_stop_utc(self.EV, m), utc(2026, 11, 6))
+        # a later date in the text never loosens the ticker's
+        m = {"rules_primary": "... from Nov 3, 2026 to November 9, 2026, then ..."}
+        self.assertEqual(imm.strait_weekly_stop_utc(self.EV, m), utc(2026, 11, 7))
+
+    def test_unreadable_stands_down(self):
+        self.assertEqual(imm.strait_weekly_stop_utc("KXSUEZWEEKLY-NOV"),
+                         imm.RELEASE_GUARD_UNKNOWN)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXSUEZWEEKLY", "KXSUEZWEEKLY-NOV", None), imm.RELEASE_GUARD_UNKNOWN)
+
+    def test_the_shared_tightener_moves_the_cutoff(self):
+        exp, close = utc(2026, 11, 10, 15), utc(2026, 11, 10, 14)
+        raw = trade_cutoff_utc(self.EV, None, exp)
+        self.assertEqual(raw, parse_event_date(self.EV))               # Sunday 00:00 ET
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXBABELMANDEBWEEKLY", self.EV, raw, close_time=close, market=self.MKT),
+            utc(2026, 11, 7))
+        # an earlier cutoff stays; another series keeps its own
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXBABELMANDEBWEEKLY", self.EV, utc(2026, 11, 5), close_time=close,
+            market=self.MKT), utc(2026, 11, 5))
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXFOO", "KXFOO-26NOV08", parse_event_date("KXFOO-26NOV08")),
+            parse_event_date("KXFOO-26NOV08"))
+
+    def test_off_switch(self):
+        raw = parse_event_date(self.EV)
+        with mock.patch.object(imm, "STRAIT_WEEKLY_STOP_DAYS", 0):
+            self.assertEqual(imm.apply_series_cutoff_adjustments(
+                "KXBABELMANDEBWEEKLY", self.EV, raw, market=self.MKT), raw)
+
+    def test_screen_stands_the_market_down(self):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        stop = imm.strait_weekly_stop_utc(self.EV, self.MKT)
+        m = _meta(ticker=self.EV + "-T220", event_ticker=self.EV,
+                  series="KXBABELMANDEBWEEKLY", close_time=utc(2026, 11, 10, 14),
+                  cutoff=stop)
+        self.assertEqual(bot._screen(m, stop + timedelta(minutes=1)), "cutoff")
+        self.assertIsNone(bot._screen(m, stop - timedelta(hours=1)))

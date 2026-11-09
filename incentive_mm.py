@@ -13962,6 +13962,8 @@ _CONFIG_CODE_KNOBS = (
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
+    # strait weeklies out for the week's last two days (2026-11-08)
+    "STRAIT_WEEKLY_STOP_DAYS", "STRAIT_WEEKLY_STOP_SERIES",
     # toxic-flow side halt (2026-09-29)
     "TOXIC_HALT", "TOXIC_PICKOFF_CENTS", "TOXIC_CONFIRM_SECS",
     "TOXIC_PICKOFFS", "TOXIC_WINDOW_SECS", "TOXIC_HALT_SECS",
@@ -21413,6 +21415,72 @@ def shipping_night_step(series: str, now_ts: Optional[float] = None) -> float:
     lo, hi = SHIPPING_NIGHT_HOLD_ET
     return SHIPPING_SIZE_STEP if lo <= hour <= hi else 1.0
 
+# STRAIT WEEKLIES OUT FOR THE WEEK'S LAST TWO DAYS (Jack 2026-11-08: "stop
+# quoting strait weeklies in the last 2 days of the period"). The four
+# weeklies and Hormuz peak settle on IMF PortWatch's daily transit counts for
+# a Monday-Sunday week -- KXBABELMANDEBWEEKLY-26NOV08: "above 220 ... from
+# Nov 2, 2026 to Nov 8, 2026", the daily counts summed; Hormuz peak takes the
+# week's highest day -- and the event's ticker date is the week's last day.
+# Traders count transits off live ship tracking, so by the weekend most of
+# the week is known: on ET 11/07, a Saturday, the Nov 2-8 Bab el-Mandeb week
+# ran low and our YES bids filled at every step down (T210 at 43/38/36/34c,
+# T200 at 64 then 46c), about -$370 over 27 shipping fills, and the toxic rule
+# (5c within 5 min, twice) halted one side of it: a slow slide never moves
+# that fast. The ticker day's midnight-ET exit already left the Sunday out;
+# this takes the market out at 00:00 UTC (PortWatch's day)
+# STRAIT_WEEKLY_STOP_DAYS days before the week ends -- for 2, Saturday 00:00
+# UTC, Friday 7 PM ET -- and it stays out through its Tuesday 9 AM ET close.
+# The week's last day is read from the market's own text ("to Nov 8, 2026")
+# where the producer passes it, and from the ticker date; the earlier wins,
+# and neither -> stood down (fail closed). IMM_STRAIT_WEEKLY_STOP_DAYS=0
+# leaves the midnight-ET exit alone; IMM_STRAIT_WEEKLY_STOP_SERIES names the
+# series (env => task restart).
+STRAIT_WEEKLY_STOP_DAYS = _env_int("IMM_STRAIT_WEEKLY_STOP_DAYS", 2)
+STRAIT_WEEKLY_STOP_SERIES: Tuple[str, ...] = tuple(sorted({
+    s.strip() for s in os.environ.get(
+        "IMM_STRAIT_WEEKLY_STOP_SERIES",
+        "KXSUEZWEEKLY,KXBABELMANDEBWEEKLY,KXHORMUZWEEKLY,KXPANAMAWEEKLY,"
+        "KXHORMUZPEAK").split(",")
+    if s.strip()}))
+_STRAIT_WEEK_END_RE = re.compile(r"\bto ([A-Z][a-z]{2})[a-z]*\.? (\d{1,2}), (\d{4})")
+
+
+def strait_weekly_last_day(event_ticker: str,
+                           market: Optional[dict] = None) -> Optional[date]:
+    """The week's last day: "to Nov 8, 2026" in the market's title or rules,
+    and the ticker date (KXSUEZWEEKLY-26NOV08 -> Nov 8); the earlier of those
+    that read, None when neither does."""
+    days: List[date] = []
+    if isinstance(market, dict):
+        for k in ("title", "rules_primary", "rules_secondary"):
+            m = _STRAIT_WEEK_END_RE.search(str(market.get(k) or ""))
+            if m is None:
+                continue
+            mon = _MONTHS.get(m.group(1).upper())
+            if mon is not None:
+                try:
+                    days.append(date(int(m.group(3)), mon, int(m.group(2))))
+                except ValueError:
+                    pass
+            break
+    td = parse_event_date(event_ticker)
+    if td is not None:
+        days.append(td.astimezone(ET).date())
+    return min(days) if days else None
+
+
+def strait_weekly_stop_utc(event_ticker: str,
+                           market: Optional[dict] = None) -> datetime:
+    """00:00 UTC STRAIT_WEEKLY_STOP_DAYS days before the week ends
+    (KXBABELMANDEBWEEKLY-26NOV08 at 2 -> 2026-11-07 00:00 UTC, Friday 7 PM
+    ET), or RELEASE_GUARD_UNKNOWN (stand down) when the week's last day
+    can't be read."""
+    last = strait_weekly_last_day(event_ticker, market)
+    if last is None:
+        return RELEASE_GUARD_UNKNOWN
+    d = last - timedelta(days=max(1, STRAIT_WEEKLY_STOP_DAYS) - 1)
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
 # KXSOFTWAREUNEMP x3 LADDER (Jack 2026-10-25: "X3", the day it was enrolled,
 # on "tripling the size, as we did for the ski resorts"): at x1 its nine
 # strikes' ~$21/day pools sat behind ~12k contracts of other quotes, ~1% of
@@ -22051,6 +22119,18 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
         if stop == RELEASE_GUARD_UNKNOWN:
             _config_gap(series, event_ticker,
                         f"cold-threshold stop needs the period's first day in "
+                        f"{event_ticker}'s rules or ticker -- standing it down "
+                        f"(fail closed)")
+        cutoff = stop if cutoff is None else min(cutoff, stop)
+    if series in STRAIT_WEEKLY_STOP_SERIES and STRAIT_WEEKLY_STOP_DAYS > 0:
+        # STRAIT WEEKLIES (2026-11-08, see STRAIT_WEEKLY_STOP_DAYS): out at
+        # 00:00 UTC two days before the week ends (Friday 7 PM ET) through
+        # the close; the week's end unreadable -> stood down (fail closed),
+        # logged once
+        stop = strait_weekly_stop_utc(event_ticker, market)
+        if stop == RELEASE_GUARD_UNKNOWN:
+            _config_gap(series, event_ticker,
+                        f"the strait-weekly stop needs the week's last day in "
                         f"{event_ticker}'s rules or ticker -- standing it down "
                         f"(fail closed)")
         cutoff = stop if cutoff is None else min(cutoff, stop)
@@ -42715,6 +42795,14 @@ class IncentiveMarketMaker:
                "file appeared; a wave added after it quotes as usual"
                if UNWIND_WAVES_EXEMPT_NEW else
                "every listed wave (IMM_UNWIND_WAVES_EXEMPT_NEW=0)"))
+        log(f"strait weeklies (2026-11-08): "
+            + (f"out for the last {STRAIT_WEEKLY_STOP_DAYS} days of each week -- "
+               f"{', '.join(STRAIT_WEEKLY_STOP_SERIES)} stand down at 00:00 UTC "
+               f"(PortWatch's day) {STRAIT_WEEKLY_STOP_DAYS} days before the week ends"
+               + (" (Saturday 00:00 UTC, Friday 7 PM ET)" if STRAIT_WEEKLY_STOP_DAYS == 2 else "")
+               + " and stay out through the Tuesday close"
+               if STRAIT_WEEKLY_STOP_DAYS > 0 and STRAIT_WEEKLY_STOP_SERIES else
+               "off -- the ticker day's midnight-ET exit alone (IMM_STRAIT_WEEKLY_STOP_DAYS=0)"))
         log(f"zero-size sides (2026-11-08): {'off' if PVD_ZERO_OFF else 'the old 1-lot'} -- a listed "
             f"side sized 0 (the tune's 90c+ side cap and twin block) "
             + ("rests nothing but the order that closes a position, at most the position"
