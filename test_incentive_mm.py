@@ -41967,7 +41967,7 @@ class TestCheapSideBooks(unittest.TestCase):
             self._write({self.T: {"side": "yes", "px": 2, "size": 1000},
                          self.T2: {"side": "yes", "px": 1, "size": 1000},          # on the wave list
                          "KXGOOD-99DEC31-C": {"side": "yes", "px": 3, "size": 100},   # over 2c
-                         "KXGOOD-99DEC31-D": {"side": "no", "px": 2, "size": 20000},  # over the size cap
+                         "KXGOOD-99DEC31-D": {"side": "no", "px": 2, "size": 20000},  # $400: over the $ cap
                          "KXGOOD-99DEC31-E": {"side": "no", "px": 2, "size": 10001},
                          "KXGOOD-99DEC31-F": {"side": "maybe", "px": 1, "size": 10}})
         e = imm.cheap_entry(self.T)
@@ -41983,6 +41983,11 @@ class TestCheapSideBooks(unittest.TestCase):
         # $200 a market at most: 10,000 at 2c is $200 (in), 10,001 is not
         self._write({self.T: {"side": "no", "px": 2, "size": 10000}})
         self.assertIsNotNone(imm.cheap_entry(self.T))
+        # ...and $200 at 1c is 20,000 (the $1 floor's top-up, Jack 2026-11-09); 20,001 is not
+        self._write({self.T: {"side": "yes", "px": 1, "size": 20000}})
+        self.assertEqual(imm.cheap_entry(self.T)["size"], 20000)
+        self._write({self.T: {"side": "yes", "px": 1, "size": 20001}})
+        self.assertIsNone(imm.cheap_entry(self.T))
         with mock.patch.object(imm, "CHEAP_MAX_USD", 100.0):
             self._write({self.T: {"side": "no", "px": 2, "size": 10000}})
             self.assertIsNone(imm.cheap_entry(self.T))

@@ -311,5 +311,92 @@ class TestRenderDiscover(unittest.TestCase):
         self.assertIn("and that the timing check passes", "\n".join(lines))
 
 
+class TestDollarFloor(_TempPaths):
+    """Jack 2026-11-09: "Build it" -- the $1 floor in the hourly scan: a listed
+    market projecting under ~$1.20 for its period has its rung raised toward
+    $200; when even $200 can't reach $1 it comes off the list."""
+    HRS = 39.0                                  # 11/09 13:51Z -> the period's end 11/11 05:00Z
+
+    @staticmethod
+    def _c(size, usd_day, px=1, side="yes"):
+        return {"side": side, "px": px, "size": size, "share": 0.0, "usd_day": usd_day,
+                "risk": size * px / 100.0, "proj": usd_day * TestDollarFloor.HRS / 24.0}
+
+    def _cands(self, per10k):
+        """A 1c ladder whose $/day grows with size (10,000 earns `per10k`)."""
+        return [self._c(n, per10k * n / 10000.0) for n in (5000, 10000, 15000, 20000)]
+
+    def test_pick_rung_stays_within_the_list_cap(self):
+        cands = self._cands(0.40)
+        self.assertEqual(cs.pick_rung(cands, 100.0)["size"], 10000)
+        self.assertEqual(cs.pick_rung(cands, 200.0)["size"], 20000)
+        self.assertIsNone(cs.pick_rung([self._c(20000, 1.0)], 100.0))
+
+    def test_tops_up_to_the_smallest_rung_that_reaches_the_aim(self):
+        # E45 at 13:51Z: banked $0.35, 10,000 at 1c earns ~$0.29/day -> $0.82 for the period
+        # 15,000 projects 0.35 + 0.71 = $1.06, 20,000 projects 0.35 + 0.94 = $1.29: the aim
+        rung, act = cs.floor_rung(self._cands(0.29), 0.35, self.HRS, 1.20, 1.00)
+        self.assertEqual((rung["size"], act), (20000, "aim"))
+
+    def test_actions(self):
+        cands = self._cands(0.40)                   # 10,000: $0.65 over 39h; 20,000: $1.30
+        rung, act = cs.floor_rung(cands, 0.30, self.HRS, 1.20, 1.00)
+        self.assertEqual((rung["size"], act), (15000, "aim"))     # 0.30 + 0.975 = 1.275
+        rung, act = cs.floor_rung(cands, 0.0, self.HRS, 1.40, 1.00)
+        self.assertEqual((rung["size"], act), (20000, "short"))   # 1.30: short of 1.40, over $1
+        rung, act = cs.floor_rung(self._cands(0.08), 0.03, self.HRS, 1.20, 1.00)
+        self.assertEqual((rung, act), (None, "drop"))             # PRIMEENG-like: $0.29 at best
+        # unknown banked (the bot's state is on another period): never dropped blind
+        rung, act = cs.floor_rung(self._cands(0.08), None, self.HRS, 1.20, 1.00)
+        self.assertEqual((rung["size"], act), (20000, "short"))
+        self.assertEqual(cs.floor_rung([], 0.5, self.HRS, 1.20, 1.00), (None, "drop"))
+
+    def test_period_banked_from_the_bots_state(self):
+        p = os.path.join(self.dir, "imm_state.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"accrued_est": {"A-1": 0.8435, "B-1": 2.43, "C-1": 1.0},
+                       "period_base": {"A-1": 0.4945},
+                       "period_start": {"A-1": "2026-11-04T05:00:00+00:00",
+                                        "B-1": "2026-11-06T14:25:26+00:00"}}, fh)
+        bk = cs.period_banked(p)
+        start = datetime(2026, 11, 4, 5, tzinfo=timezone.utc)
+        self.assertAlmostEqual(cs.banked_for(bk, "A-1", start), 0.349, places=3)
+        self.assertAlmostEqual(cs.banked_for(bk, "B-1", datetime(2026, 11, 6, 14, 25, 26,
+                                                                 tzinfo=timezone.utc)), 2.43)
+        self.assertIsNone(cs.banked_for(bk, "B-1", start))          # the state is on another period
+        self.assertIsNone(cs.banked_for(bk, "C-1", start))          # no period start in the state
+        self.assertIsNone(cs.banked_for(bk, "D-1", start))
+        self.assertEqual(cs.period_banked(os.path.join(self.dir, "missing.json")), {})
+
+    def test_apply_floor_moves_the_row(self):
+        a = SimpleNamespace(floor_aim=1.20, floor=1.00, floor_max_usd=200.0)
+        why = {"floor top-up": 0, "floor drop": 0}
+        cands = self._cands(0.40)
+        pick = cs.pick_rung(cands, 100.0)
+        r = {"verdict": "LIST", "pick": pick}
+        cs.apply_floor(r, "KXA-1", pick, cands, 0.30, self.HRS, a, why)
+        self.assertEqual((r["verdict"], r["pick"]["size"]), ("LIST", 15000))
+        self.assertAlmostEqual(r["proj_total"], 1.275, places=2)     # 0.30 + 0.975
+        self.assertEqual(r["floor"]["action"], "aim")
+        self.assertEqual(why["floor top-up"], 1)
+        # banked enough already: untouched
+        r = {"verdict": "LIST", "pick": pick}
+        cs.apply_floor(r, "KXA-1", pick, cands, 0.90, self.HRS, a, why)
+        self.assertEqual((r["pick"]["size"], r.get("floor")), (10000, None))
+        # even $200 can't reach $1: off the list
+        cands = self._cands(0.08)
+        pick = cs.pick_rung(cands, 100.0)
+        r = {"verdict": "LIST", "pick": pick}
+        cs.apply_floor(r, "KXB-1", pick, cands, 0.03, self.HRS, a, why)
+        self.assertEqual((r["verdict"], r["floor"]["action"]), ("floor drop", "drop"))
+        self.assertEqual(why["floor drop"], 1)
+        with open(os.path.join(self.dir, "scan.log"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("floor: KXA-1 banked $0.30", text)
+        self.assertIn("-> YES 1c x15000 ($150)", text)
+        self.assertIn("KXB-1", text)
+        self.assertIn("OFF the list", text)
+
+
 if __name__ == "__main__":
     unittest.main()

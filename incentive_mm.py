@@ -10131,7 +10131,10 @@ def pvd_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]
 CHEAP_FILE = "cheap_side_books.json"            # in STATUS_DIR
 CHEAP_MODE = os.environ.get("IMM_CHEAP_SIDE", "on").strip().lower()
 CHEAP_PX_MAX = max(1, _env_int("IMM_CHEAP_PX_MAX", 2))         # cents, the cheap side's own price
-CHEAP_MAX_SIZE = max(1, _env_int("IMM_CHEAP_MAX_SIZE", 10000))  # contracts a market
+# contracts a market: 20,000 so the hourly scan's $1-floor top-up can rest $200
+# at 1c (Jack 2026-11-09: "Build it" -- "raise that market's rung toward $200");
+# CHEAP_MAX_USD still caps size x px
+CHEAP_MAX_SIZE = max(1, _env_int("IMM_CHEAP_MAX_SIZE", 20000))
 CHEAP_MAX_USD = _env_float("IMM_CHEAP_MAX_USD", 200.0)         # size x px a market
 # ...and the rung rests only while it holds at least this share of its side's
 # score (a 2c bid deep under a book that moved up earns ~nothing)

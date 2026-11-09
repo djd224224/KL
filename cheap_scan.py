@@ -33,7 +33,10 @@ that. A scheduled re-run never drops a market it could not read (a failed
 /markets batch or book keeps the entry), and a market already listed for its
 current program period keeps its entry to the period's end while its rung
 still pays, whatever it projects for the hours left (the $1 counts the whole
-period). Log: run-logs/cheap-scan/scan.log.
+period). THE $1 FLOOR (FLOOR_MODE, Jack 2026-11-09) then checks each of those:
+banked so far + the rung over the hours left under --floor-aim ($1.20) grows
+the rung toward --floor-max-usd ($200); if even that can't reach --floor ($1),
+the market comes off the list. Log: run-logs/cheap-scan/scan.log.
 
 NEW SERIES FOR JACK TO APPROVE (Jack 2026-11-08: "Should the daily email flag
 new far-dated program series for you to approve?" -> "Add it"):
@@ -76,7 +79,22 @@ import incentive_mm as imm                      # noqa: E402  (reads only, but -
 import kalshi_reads                              # noqa: E402
 import send_imm_new_programs as snp             # noqa: E402
 
-SIZES = (1000, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000)
+SIZES = (1000, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 15000, 20000)
+# THE $1 FLOOR (Jack 2026-11-09: "Build it", on "a $1 rule in the hourly scan.
+# When a listed market projects under about $1.20 for its period, it would raise
+# that market's rung toward $200. When even $200 can't reach $1, it would take
+# the market off the list"). Kalshi pays a market only once it banks $1 in its
+# program period, and the 1c piles grow after a listing (11/09: the Senate
+# rungs' share fell from ~11% at 03:10Z to 2-3.5% by 13:50Z, most of them
+# projecting $0.8-1.3 for a period ending 11/11; KXPRIMEENGCONSUMPTION ~$0.55).
+# Each hourly run checks every market listed for its CURRENT period: the bot's
+# own accrual so far (period_banked, from imm_state.json) plus the rung's $/day
+# over the hours left. Under --floor-aim, the rung grows to the smallest one up
+# to --floor-max-usd that projects the aim (else the most it can); if even that
+# projects under --floor, the market comes off the list (a held position
+# rides). The rung steps back down as the banked $ grows. IMM_CHEAP_FLOOR=off
+# turns the rule off. The bot admits $200 at 1c (incentive_mm CHEAP_MAX_SIZE).
+FLOOR_MODE = os.environ.get("IMM_CHEAP_FLOOR", "on").strip().lower()       # on | off
 OUT_DIR = os.path.join(HERE, "run-logs", "cheap-scan")
 LOCK = os.path.join(OUT_DIR, "scan.lock")
 SERIES_FILE = os.path.join(OUT_DIR, "series.json")
@@ -295,7 +313,9 @@ def own_orders(client):
     return own, exact, foreign
 
 
-def best_rung(t, pr, ob, own, own_exact, max_usd, hrs):
+def rung_cands(t, pr, ob, own, own_exact, max_usd, hrs):
+    """Every 1-2c rung on either side up to `max_usd` of risk that the bot's
+    own cheap_side_quote would rest and score, one per (side, px, count)."""
     y0, n0 = imm.orderbook_levels(ob)
     ye, ne = imm.orderbook_exact_levels(ob)
     seen, cands = set(), []
@@ -317,14 +337,117 @@ def best_rung(t, pr, ob, own, own_exact, max_usd, hrs):
                 cands.append({"side": side, "px": info["px"], "size": q.count, "share": info["share"],
                               "usd_day": usd, "risk": q.count * info["px"] / 100.0,
                               "proj": usd * hrs / 24.0, "limit": info.get("limit")})
+    return cands
+
+
+def pick_rung(cands, max_usd):
+    """The best $/day within `max_usd`, then the smallest risk holding 95% of it."""
+    cands = [c for c in cands if c["risk"] <= max_usd + 1e-9]
     if not cands:
-        return None, None
+        return None
     top = max(c["usd_day"] for c in cands)
-    pick = sorted((c for c in cands if c["usd_day"] >= 0.95 * top),
+    return sorted((c for c in cands if c["usd_day"] >= 0.95 * top),
                   key=lambda c: (c["risk"], -c["usd_day"]))[0]
+
+
+def best_rung(t, pr, ob, own, own_exact, max_usd, hrs, cap_usd=None):
+    """(the rung within `max_usd`, what the bot earns there now in $/day); with
+    `cap_usd`, also every rung up to it (the $1 floor's top-ups)."""
+    cands = rung_cands(t, pr, ob, own, own_exact, max(max_usd, cap_usd or 0.0), hrs)
+    pick = pick_rung(cands, max_usd)
+    if pick is None:
+        return (None, None, cands) if cap_usd is not None else (None, None)
     # what the bot earns there now, on its own resting orders (live book)
+    y0, n0 = imm.orderbook_levels(ob)
     cur_frac, _ = imm.estimate_reward_share(y0, n0, own, pr["target"], pr["df"], own_in_book=True)
-    return pick, cur_frac * pr["pd"]
+    return (pick, cur_frac * pr["pd"], cands) if cap_usd is not None else (pick, cur_frac * pr["pd"])
+
+
+def period_banked(path=None):
+    """{ticker: (period start, $ the bot's reward model has accrued there this
+    program period)} from the bot's own state (imm_state.json: accrued_est less
+    period_base, the per-period credit its own $1-floor logic uses -- the same
+    cycle-by-cycle integral the daily email sums from the cycle logs, without
+    reading ~1 GB of them a day). {} when unreadable."""
+    try:
+        with open(path or imm.IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as fh:
+            s = json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+    acc, base, start = (s.get(k) or {} for k in ("accrued_est", "period_base", "period_start"))
+    out = {}
+    for t, v in acc.items():
+        try:
+            out[t] = (ts(start[t]) if start.get(t) else None,
+                      max(0.0, float(v) - float(base.get(t) or 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def banked_for(banked, t, period_start):
+    """This period's accrual on `t`, or None when the bot's state has not
+    rolled to this period (its period start differs by more than a minute)."""
+    st, usd = banked.get(t, (None, None))
+    if st is None or usd is None or abs((st - period_start).total_seconds()) > 60:
+        return None
+    return usd
+
+
+def floor_rung(cands, banked, hrs, aim, floor):
+    """THE $1 FLOOR for a market listed this program period whose rung projects
+    under `aim` for the whole period (banked so far + the rung's $/day over
+    `hrs` left): (rung, action).
+      "aim"   the smallest-risk rung in `cands` that projects `aim`
+      "short" none does: the one that projects the most, while that still
+              clears `floor` (or the banked $ is unknown: never drop blind)
+      "drop"  even the best projects under `floor`: (None, "drop")"""
+    b = banked or 0.0
+    proj = lambda c: b + c["usd_day"] * hrs / 24.0
+    if not cands:
+        return None, "drop"
+    ok = [c for c in cands if proj(c) >= aim]
+    if ok:
+        return min(ok, key=lambda c: (c["risk"], -c["usd_day"])), "aim"
+    best = max(cands, key=lambda c: (proj(c), -c["risk"]))
+    if proj(best) >= floor or banked is None:
+        return best, "short"
+    return None, "drop"
+
+
+def _rung_s(c) -> str:
+    return f"{c['side'].upper()} {c['px']}c x{c['size']} (${c['risk']:,.0f})"
+
+
+def apply_floor(r, t, pick, cands, banked, hrs, a, why) -> None:
+    """The $1 floor on one scored row listed this period (r["verdict"] LIST):
+    records the period projection on the row, and tops its rung up or turns it
+    into a "floor drop" (floor_rung), logging what moved."""
+    b = banked or 0.0
+    total = b + pick["proj"]
+    r["banked"] = None if banked is None else round(banked, 2)
+    r["proj_total"] = round(total, 2)
+    if total >= a.floor_aim:
+        return
+    new, act = floor_rung(cands, banked, hrs, a.floor_aim, a.floor)
+    seen = "unknown (the bot's state is on another period)" if banked is None else f"${b:.2f}"
+    head = (f"floor: {t} banked {seen} + {_rung_s(pick)} ${pick['usd_day']:.2f}/day x "
+            f"{hrs:.1f}h = ${total:.2f} for the period, under ${a.floor_aim:.2f}")
+    if new is None:
+        best = max(c["proj"] for c in cands) if cands else 0.0
+        r["verdict"] = "floor drop"
+        r["floor"] = {"action": "drop", "proj_before": round(total, 2), "best": round(b + best, 2)}
+        why["floor drop"] += 1
+        log(f"{head}; even ${a.floor_max_usd:,.0f} projects ${b + best:.2f} < ${a.floor:.2f}: OFF the list")
+        return
+    after = b + new["proj"]
+    r["pick"], r["proj_total"] = new, round(after, 2)
+    r["floor"] = {"action": act, "proj_before": round(total, 2), "proj_after": round(after, 2),
+                  "from": _rung_s(pick)}
+    if (new["side"], new["px"], new["size"]) != (pick["side"], pick["px"], pick["size"]):
+        why["floor top-up"] += 1
+    log(f"{head} -> {_rung_s(new)} ${new['usd_day']:.2f}/day projects ${after:.2f}"
+        + ("" if act == "aim" else f" (the most it can; aim ${a.floor_aim:.2f})"))
 
 
 def main(argv=None) -> int:
@@ -334,6 +457,12 @@ def main(argv=None) -> int:
     ap.add_argument("--min-days", type=float, default=182.0, help="horizon backstop (6M)")
     ap.add_argument("--max-usd", type=float, default=100.0, help="size x px a market, at most")
     ap.add_argument("--bar", type=float, default=1.10, help="$ the rung must project by its program end")
+    ap.add_argument("--floor-aim", type=float, default=1.20,
+                    help="the $1 floor: a listed market projecting under this for its period is topped up")
+    ap.add_argument("--floor", type=float, default=1.00,
+                    help="the $1 floor: ...and comes off the list when even --floor-max-usd projects under this")
+    ap.add_argument("--floor-max-usd", type=float, default=200.0,
+                    help="the $1 floor: the most a top-up rung risks (size x px)")
     ap.add_argument("--include-quoted", action="store_true",
                     help="list a market even where the bot earns more under its family rules")
     ap.add_argument("--report", help="write every scored market here (.json)")
@@ -403,7 +532,9 @@ def scan(a) -> int:
         books = dict(ex.map(book, sorted(far)))
 
     rows, why = [], {"no book": 0, "no paying 1-2c rung": 0, "under bar": 0, "bot earns more": 0,
-                     "your orders there": 0}
+                     "your orders there": 0, "floor top-up": 0, "floor drop": 0}
+    floor_on = FLOOR_MODE != "off" and a.floor_max_usd > 0
+    banked = period_banked() if floor_on and listed_now else {}
     for t, (m, hz) in sorted(far.items()):
         ob = books.get(t)
         if not ob:
@@ -412,10 +543,13 @@ def scan(a) -> int:
             continue
         pr = progs[t]
         hrs = (pr["end"] - max(now, pr["start"])).total_seconds() / 3600
-        # our own cheap rung, netted out of the book like the rest of our orders
-        pick, cur = best_rung(t, pr, ob, own.get(t, []), own_exact.get(t, []), a.max_usd, hrs)
         # listed for this same program period: kept to its end while it pays
         same = (listed_now.get(t) or {}).get("stop") == zs(pr["end"])
+        # our own cheap rung, netted out of the book like the rest of our orders
+        # (and, for a market listed this period, every rung up to the $1 floor's cap)
+        cap = a.floor_max_usd if floor_on and same else None
+        res = best_rung(t, pr, ob, own.get(t, []), own_exact.get(t, []), a.max_usd, hrs, cap_usd=cap)
+        pick, cur, cands = res if cap is not None else (res[0], res[1], [])
         if t in listed_now:
             cur = 0.0                   # what the bot earns there now is this list's rung
         r = {"ticker": t, "event": m.get("event_ticker"), "sub": (m.get("yes_sub_title") or "")[:40],
@@ -438,6 +572,8 @@ def scan(a) -> int:
             r["verdict"] = "bot earns more"
         else:
             r["verdict"] = "LIST"
+            if cap is not None:
+                apply_floor(r, t, pick, cands, banked_for(banked, t, pr["start"]), hrs, a, why)
         rows.append(r)
     take = [r for r in rows if r["verdict"] == "LIST"]
     kept = {t: e for t, e in listed_now.items() if t in unread and keep(t)
@@ -479,6 +615,10 @@ def scan(a) -> int:
                  "est_usd_day": round(p["usd_day"], 2), "proj_period": round(p["proj"], 2),
                  "risk_usd": round(p["risk"], 2), "horizon": r["horizon"],
                  "added": f"cheap_scan {stamp} (share {p['share'] * 100:.0f}%)"}
+            if r.get("floor"):          # the $1 floor moved this rung
+                f = r["floor"]
+                e["floor"] = (f"{stamp} $1 floor: {f['from']} projected ${f['proj_before']:.2f} for "
+                              f"the period -> ${f['proj_after']:.2f}")
             # an unchanged rung keeps its first listing note (the file only moves when a rung does)
             if all(old.get(k) == e[k] for k in ("side", "px", "size", "stop")):
                 e = dict(old)
