@@ -23944,6 +23944,15 @@ COMP_HEDGE_EDGE_C = _env_float("IMM_COMP_HEDGE_EDGE_C", 2.0)
 COMP_HEDGE_LEAD_EDGE_C = _env_float("IMM_COMP_HEDGE_LEAD_EDGE_C", 0.0)
 COMP_HEDGE_FILE = "comp_hedge_jobs.json"
 COMP_HEDGE_MAX_AGE_SECS = _env_float("IMM_COMP_HEDGE_MAX_AGE_H", 48.0) * 3600.0
+# GIVE-UPS LOG ONLY (Jack 2026-11-09: "Log only", on "whats point of comp hedge
+# alert emails e.g. ... lock gave up with legs KXFRENCHPRES-27-CLAG 160 filled"):
+# a job that ends without a lock -- a lead fill never locked, or legs filled
+# and no lock after COMP_HEDGE_MAX_AGE_SECS -- is logged and kept in
+# comp_hedge_<date>.jsonl but sends no alert email: by then the bot has already
+# pulled the legs and the positions are ordinary inventory (~67 urgent emails
+# 11/01-11/09, none actionable). A completed lead lock still alerts.
+# IMM_COMP_HEDGE_GIVEUP_EMAIL=1 emails them again.
+COMP_HEDGE_GIVEUP_EMAIL = os.environ.get("IMM_COMP_HEDGE_GIVEUP_EMAIL", "0") == "1"
 # A market with a side leading takes a per-market position cap of at least
 # this, and first call on its event's room once it has led a cycle (Jack
 # 2026-10-29: "For these type of markets, increase position limits to 400").
@@ -34118,9 +34127,10 @@ class IncentiveMarketMaker:
                         log(f"{self.tag} ! comp hedge: {j['id']} gave up after "
                             f"{COMP_HEDGE_MAX_AGE_SECS / 3600:g}h without a lock (best "
                             f"{j.get('best')}c a contract)")
-                        self.alerter.alert(
-                            "comp_hedge", f"{t}: lead fill {q:g} @ {p:g}c never locked "
-                            f"in {COMP_HEDGE_MAX_AGE_SECS / 3600:g}h", key=j["id"], urgent=True)
+                        if COMP_HEDGE_GIVEUP_EMAIL:
+                            self.alerter.alert(
+                                "comp_hedge", f"{t}: lead fill {q:g} @ {p:g}c never locked "
+                                f"in {COMP_HEDGE_MAX_AGE_SECS / 3600:g}h", key=j["id"], urgent=True)
                     changed = True
                     continue
                 if done and age > COMP_HEDGE_MAX_AGE_SECS:
@@ -34133,10 +34143,11 @@ class IncentiveMarketMaker:
                         "ts": datetime.now(timezone.utc).isoformat(), "kind": "expired",
                         "job": j["id"], "ticker": t, "lock": kind,
                         "legs": {s: d[0] for s, d in done.items()}})
-                    self.alerter.alert(
-                        "comp_hedge", f"{t}: lock gave up with legs "
-                        + ", ".join(f"{s} {d[0]:g}" for s, d in sorted(done.items()))
-                        + " filled", key=j["id"], urgent=True)
+                    if COMP_HEDGE_GIVEUP_EMAIL:
+                        self.alerter.alert(
+                            "comp_hedge", f"{t}: lock gave up with legs "
+                            + ", ".join(f"{s} {d[0]:g}" for s, d in sorted(done.items()))
+                            + " filled", key=j["id"], urgent=True)
                     changed = True
                     continue
                 keep.append(j)

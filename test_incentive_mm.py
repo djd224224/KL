@@ -9141,6 +9141,41 @@ class TestCompanyKpiOff(unittest.TestCase):
             imm._company_kpi_tagged["set"] = frozenset()
 
 
+class TestCompHedgeGiveUpLogOnly(unittest.TestCase):
+    """Jack 2026-11-09: "Log only" -- a hedge job that ends without a lock is
+    logged, not emailed; IMM_COMP_HEDGE_GIVEUP_EMAIL=1 emails it again."""
+
+    def _run(self, job, email):
+        _clean_persist()
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._comp_hedges = [job]
+        bot._lock_resting = {}
+        lines = []
+        with mock.patch.object(bot.alerter, "alert") as al, \
+                mock.patch.object(imm, "COMP_HEDGE_GIVEUP_EMAIL", email), \
+                mock.patch.object(imm, "log", lines.append):
+            bot._comp_hedge_run(time.time())
+        return bot, al, lines
+
+    def _job(self, filled):
+        return {"id": "J1", "ticker": "KXGOOD-99DEC31-A", "side": "ask", "price": 47.0,
+                "count": 160.0, "lead": True, "kind": None,
+                "at": time.time() - imm.COMP_HEDGE_MAX_AGE_SECS - 60,
+                "until": time.time() - 60,
+                "legs": {"KXGOOD-99DEC31-B": {"filled": filled, "value": filled * 6.0,
+                                              "fee": 0.0, "oid": None}}}
+
+    def test_give_ups_are_logged_not_emailed(self):
+        for filled in (160.0, 0.0):            # legs filled, no lock / never locked
+            bot, al, lines = self._run(self._job(filled), email=False)
+            al.assert_not_called()
+            self.assertEqual(bot._comp_hedges, [])
+            self.assertTrue(any("comp hedge: J1 gave up" in x for x in lines), lines)
+            bot, al, _l = self._run(self._job(filled), email=True)
+            self.assertEqual(al.call_count, 1)
+            self.assertTrue(al.call_args[1].get("urgent"))
+
+
 class TestNextSpeakerCut(unittest.TestCase):
     """Jack 2026-11-08: "KXNEXTSPEAKER-31 ^why is this quoting at all", then
     "Yes, stop it" -- the series is frozen, whatever family enrolls it."""
