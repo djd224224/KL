@@ -9164,9 +9164,14 @@ class TestCaFamiliesOff(unittest.TestCase):
                 mock.patch.dict(imm.FAMILY_VERDICTS,
                                 {"KXSODAARRAY": {"title": "Soda point of sale spend array"}}):
             blocked = imm.IncentiveMarketMaker._blocked
-            for t in ("KXMILLERLITEPOS-26DEC03-T89.5", "KXPEACOCKAPP-26DEC08-T119",
-                      "KXSODAARRAY-26DEC03-T100"):
+            for t in ("KXMILLERLITEPOS-26DEC03-T89.5", "KXPEACOCKAPP-26DEC08-T119"):
                 self.assertTrue(blocked(t), t)
+            # the sector arrays quote (Jack 2026-11-09: "allow array carbon arc
+            # markets to quote"), unless CA_FAMILY_BLOCK_ARRAYS
+            self.assertFalse(blocked("KXSODAARRAY-26DEC03-T100"))
+            self.assertFalse(imm.ca_family_blocked("KXAIAPPARRAY"))
+            with mock.patch.object(imm, "CA_FAMILY_BLOCK_ARRAYS", True):
+                self.assertTrue(blocked("KXSODAARRAY-26DEC03-T100"))
             self.assertTrue(imm.series_blocklisted("KXPEACOCKAPP"))
             for t in ("KXAMZNCC-26DEC05-T106", "KXBKFT-26DEC04-T95", "KXCASINOADS-26DEC06-T59.5"):
                 self.assertFalse(blocked(t), t)

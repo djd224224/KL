@@ -5699,8 +5699,21 @@ CA_FAMILY_BLOCK = frozenset() if _CA_FAMILY_BLOCK_RAW in ("", "0", "off", "none"
 CA_FAMILY_UNWIND = os.environ.get("IMM_CA_FAMILY_UNWIND", "1") != "0"
 
 
+# ...BUT THE SECTOR ARRAYS QUOTE (Jack 2026-11-09: "allow array carbon arc
+# markets to quote", after their review: -$8 lifetime on 955 contracts, the
+# point-of-sale and app arrays included). A Carbon Arc series ending ARRAY
+# (KXNICOTINEARRAY, KXAIAPPARRAY, ...) is never turned off by CA_FAMILY_BLOCK:
+# it quotes as before 2026-11-08, under the Carbon Arc rules (late-month cut,
+# data holds, the selected-market unwind). IMM_CA_FAMILY_BLOCK_ARRAYS=1 turns
+# them off with their family again.
+CA_FAMILY_BLOCK_ARRAYS = os.environ.get("IMM_CA_FAMILY_BLOCK_ARRAYS", "0") == "1"
+
+
 def ca_family_blocked(series: str) -> bool:
-    """A Carbon Arc series in a family CA_FAMILY_BLOCK turns off."""
+    """A Carbon Arc series in a family CA_FAMILY_BLOCK turns off (a sector
+    array only with CA_FAMILY_BLOCK_ARRAYS)."""
+    if series.endswith("ARRAY") and not CA_FAMILY_BLOCK_ARRAYS:
+        return False
     return bool(CA_FAMILY_BLOCK) and (ca_category(series) or "") in CA_FAMILY_BLOCK
 
 
@@ -42888,6 +42901,7 @@ class IncentiveMarketMaker:
                + ("; held positions unwind at breakeven or better, never leading"
                   if CA_FAMILY_UNWIND else "; positions ride (IMM_CA_FAMILY_UNWIND=0)")
                + "); the other families quote"
+               + ("" if CA_FAMILY_BLOCK_ARRAYS else ", and every sector array (2026-11-09)")
                if CA_FAMILY_BLOCK else "every family quotes (IMM_CA_FAMILY_BLOCK=0)"))
         log("net halt (2026-11-08): "
             + (f"on -- P&L today + est rewards today (the lower of raw and paid basis) "
