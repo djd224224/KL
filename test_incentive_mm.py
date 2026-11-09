@@ -40684,9 +40684,9 @@ class TestOffUsualBigSides(unittest.TestCase):
     T = "KXGOOD-99DEC31-A"
 
     def test_defaults_and_what_counts_as_big(self):
-        self.assertEqual((imm.OFF_USUAL_BIG_MODE, imm.OFF_USUAL_BIG_MIN, imm.OFF_USUAL_BIG_MIN_N),
-                         ("on", 1000, 12))
-        for k in ("OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N"):
+        self.assertEqual((imm.OFF_USUAL_BIG_MODE, imm.OFF_USUAL_BIG_MIN, imm.OFF_USUAL_BIG_MIN_N,
+                          imm.OFF_USUAL_BIG_TO), ("on", 1000, 12, "base"))
+        for k in ("OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N", "OFF_USUAL_BIG_TO"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
         Q, T = imm.Quote, self.T
         self.assertFalse(imm.off_usual_big_side([Q(T, "bid", 40, 999), Q(T, "ask", 60, 999)]))
@@ -40699,9 +40699,20 @@ class TestOffUsualBigSides(unittest.TestCase):
                                           42.0, 60.0, 1000)
         self.assertEqual(sorted((q.book_side, q.count) for q in out), [("ask", 4000), ("bid", 1000)])
         self.assertEqual(cuts, {"bid": (4000, 1000, 55.0, 42.0)})
+        # what a cut side keeps (Jack 2026-11-08 evening: "Cut to the market's base
+        # size, as on the waves"): its day ladder's side, at most 1,000
+        with mock.patch.object(imm, "base_scaled_levels", lambda s: [(0, 60), (1, 30)]):
+            self.assertEqual(imm.off_usual_big_keep("KXGOOD"), 90)
+        with mock.patch.object(imm, "base_scaled_levels", lambda s: [(0, 2000)]):   # Paris's own base
+            self.assertEqual(imm.off_usual_big_keep("KXRAINDPARIS"), 1000)
+        with mock.patch.object(imm, "OFF_USUAL_BIG_TO", "min"):                      # as 5077527 shipped
+            self.assertEqual(imm.off_usual_big_keep("KXGOOD"), 1000)
+        self.assertEqual(imm.off_usual_big_keep("KXGOOD"),
+                         max(1, min(1000, sum(s for _t, s in imm.base_scaled_levels("KXGOOD")))))
+        self.assertIn("its base size, at most 1,000", imm.off_usual_big_to_text())
 
     def test_a_cycle_cuts_a_big_side_off_its_usual_price(self):
-        def run(mode, shift=None, n=16, min_ct=None):
+        def run(mode, shift=None, n=16, min_ct=None, keep=None):
             _clean_persist()
             bot = IncentiveMarketMaker(client=FakeClient(), live=False)
             if shift is not None:
@@ -40709,8 +40720,11 @@ class TestOffUsualBigSides(unittest.TestCase):
                 bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), bid - shift, ask + shift]
                                                for i in range(n)]
             lines = []
+            real_keep = imm.off_usual_big_keep
             with mock.patch.object(imm, "OFF_USUAL_BIG_MODE", mode), \
                     mock.patch.object(imm, "OFF_USUAL_BIG_MIN", min_ct or big_min), \
+                    mock.patch.object(imm, "off_usual_big_keep",
+                                      real_keep if keep is None else (lambda s: keep)), \
                     mock.patch.object(imm, "log", lines.append):
                 bot.run_cycle()
             tot = {}
@@ -40732,7 +40746,11 @@ class TestOffUsualBigSides(unittest.TestCase):
         big_min = max(1, int(min(plain.values()) // 2))          # both sides plan "big"
         # both sides 10c nearer the taker than 4 h of samples: each keeps big_min
         bot, cut, lines = run("on", shift=10)
-        self.assertEqual(cut, {"bid": big_min, "ask": big_min})
+        want = max(1, min(big_min, sum(s for _t, s in imm.base_scaled_levels("KXGOOD"))))
+        self.assertEqual(cut, {"bid": want, "ask": want})
+        # the cut is the market's base (off_usual_big_keep): a 3-lot base keeps 3
+        self.assertGreater(big_min, 3)
+        self.assertEqual(run("on", shift=10, keep=3)[1], {"bid": 3, "ask": 3})
         self.assertTrue(any("(big side, off the list)" in x for x in lines), lines)
         self.assertEqual(len(bot.state.pvd_usual[self.T]), 17)   # the cycle sampled
         # dry logs, cuts nothing; at the usual price, or under 12 samples: untouched

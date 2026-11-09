@@ -10704,6 +10704,36 @@ PVD_CLOSE_CLAMP_C = _env_float("IMM_PVD_CLOSE_CLAMP_C", 5.0)
 OFF_USUAL_BIG_MODE = os.environ.get("IMM_OFF_USUAL_BIG", "on").strip().lower()
 OFF_USUAL_BIG_MIN = int(_env_float("IMM_OFF_USUAL_BIG_MIN", 1000))
 OFF_USUAL_BIG_MIN_N = int(_env_float("IMM_OFF_USUAL_BIG_MIN_N", 12))
+# ...CUT TO THE MARKET'S BASE SIZE (Jack 2026-11-08 evening: "Cut to the
+# market's base size, as on the waves", over keeping 1,000). A side the rule
+# cuts keeps the market's base, as a listed side keeps its entry's base: the
+# day ladder (base_scaled_levels) -- the series' rungs with its family /
+# mention size and the size test's half, without the hour-of-day or Saturday
+# multipliers, the per-market boosts (near-cliff, yield), the deep-reference
+# multiplier or a side lean -- and never more than OFF_USUAL_BIG_MIN, so no
+# side keeps more than it did (KXRAINDPARIS's own base is 2,000: it keeps
+# 1,000). The side that reduces the position keeps that plus the position.
+# IMM_OFF_USUAL_BIG_TO: "base" (default) or "min" (OFF_USUAL_BIG_MIN, as
+# 5077527 shipped).
+OFF_USUAL_BIG_TO = os.environ.get("IMM_OFF_USUAL_BIG_TO", "base").strip().lower()
+if OFF_USUAL_BIG_TO not in ("base", "min"):
+    OFF_USUAL_BIG_TO = "base"
+
+
+def off_usual_big_keep(series: str) -> int:
+    """What a big side off its usual price keeps, off the list: the series'
+    base side (base_scaled_levels' rungs summed), at most OFF_USUAL_BIG_MIN;
+    OFF_USUAL_BIG_MIN itself under IMM_OFF_USUAL_BIG_TO=min."""
+    if OFF_USUAL_BIG_TO == "min":
+        return OFF_USUAL_BIG_MIN
+    base = sum(int(s) for _t, s in base_scaled_levels(series))
+    return max(1, min(base, OFF_USUAL_BIG_MIN))
+
+
+def off_usual_big_to_text() -> str:
+    """The cut's size in words, for the log lines."""
+    return (f"its base size, at most {OFF_USUAL_BIG_MIN:,}" if OFF_USUAL_BIG_TO == "base"
+            else f"{OFF_USUAL_BIG_MIN:,}")
 
 
 def off_usual_big_side(quotes: List["Quote"], min_ct: Optional[int] = None) -> bool:
@@ -13975,7 +14005,7 @@ _CONFIG_CODE_KNOBS = (
     "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
-    "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N",
+    "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N", "OFF_USUAL_BIG_TO",
     # strait weeklies out for the week's last two days (2026-11-08)
     "STRAIT_WEEKLY_STOP_DAYS", "STRAIT_WEEKLY_STOP_SERIES",
     # toxic-flow side halt (2026-09-29)
@@ -34933,7 +34963,8 @@ class IncentiveMarketMaker:
             for side, (planned, kept, px, usual) in sorted(cuts.items()):
                 log(f"{self.tag} off-usual size{tag} {t} {side} (big side, off the list): "
                     f"rests {px:g}c, {abs(px - usual):g}c nearer the taker than its "
-                    f"{PVD_OFF_USUAL_HOURS:g}h usual {usual:g}c -- {planned:,} -> {kept:,}")
+                    f"{PVD_OFF_USUAL_HOURS:g}h usual {usual:g}c -- {planned:,} -> {kept:,}"
+                    + (" (base size)" if OFF_USUAL_BIG_TO == "base" else ""))
             return
         tag = "" if PVD_OFF_USUAL_MODE == "on" else " (dry)"
         for side, (planned, kept, px, usual) in sorted(cuts.items()):
@@ -34966,7 +34997,7 @@ class IncentiveMarketMaker:
         log(f"[IMM] off-usual size ({PVD_OFF_USUAL_MODE}, {PVD_OFF_USUAL_C:g}c past the "
             f"{PVD_OFF_USUAL_HOURS:g}h median touch -> base size): {sides} side(s) in "
             f"{len(live)} listed market(s) cut by {cts:,} contracts; big sides off the list "
-            f"({OFF_USUAL_BIG_MODE}, {OFF_USUAL_BIG_MIN:,}+ -> {OFF_USUAL_BIG_MIN:,}): "
+            f"({OFF_USUAL_BIG_MODE}, {OFF_USUAL_BIG_MIN:,}+ -> {off_usual_big_to_text()}): "
             f"{b_sides} side(s) in {len(big)} market(s) cut by {b_cts:,} contracts; "
             f"{len(self.state.pvd_usual)} market(s) sampled")
 
@@ -39047,7 +39078,8 @@ class IncentiveMarketMaker:
                 # OFF-USUAL SIZE FOR BIG SIDES (OFF_USUAL_BIG_MODE): off the
                 # list, a side planning OFF_USUAL_BIG_MIN+ that rests more than
                 # PVD_OFF_USUAL_C c nearer the taker than its usual price (with
-                # OFF_USUAL_BIG_MIN_N samples or more) keeps OFF_USUAL_BIG_MIN;
+                # OFF_USUAL_BIG_MIN_N samples or more) keeps its base, at most
+                # OFF_USUAL_BIG_MIN (off_usual_big_keep);
                 # the touch is sampled while a side plans big and for 6 h after
                 # (a cheap-side book is pinned at its own price: left alone)
                 try:
@@ -39056,7 +39088,7 @@ class IncentiveMarketMaker:
                         if _big:
                             _ub, _ua = pvd_usual_px(self.state.pvd_usual.get(t), now_ts,
                                                     min_n=OFF_USUAL_BIG_MIN_N)
-                            _ou_q, _ou = pvd_off_usual_cut(mq, _ub, _ua, OFF_USUAL_BIG_MIN,
+                            _ou_q, _ou = pvd_off_usual_cut(mq, _ub, _ua, off_usual_big_keep(meta.series),
                                                            pos=cap_pos)
                         else:
                             _ou = {}
@@ -42902,7 +42934,10 @@ class IncentiveMarketMaker:
                f"contracts and rests more than {PVD_OFF_USUAL_C:g}c nearer the taker than "
                f"its {PVD_OFF_USUAL_HOURS:g}h median touch (at least {OFF_USUAL_BIG_MIN_N} "
                f"samples, one per {PVD_OFF_USUAL_SAMPLE_S / 60:g} min) rests no more than "
-               f"{OFF_USUAL_BIG_MIN:,}; with fewer samples it keeps its size"
+               f"{off_usual_big_to_text()}"
+               + (" (the day ladder: the family size, no hour, Saturday, per-market boost or "
+                  "depth multiplier)" if OFF_USUAL_BIG_TO == "base" else "")
+               + "; with fewer samples it keeps its size"
                + ("" if OFF_USUAL_BIG_MODE == "on" else " (dry: logged, nothing cut)")
                if OFF_USUAL_BIG_MODE in ("on", "dry") else ""))
         log("mid-move breaker: "
