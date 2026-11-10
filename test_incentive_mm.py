@@ -42044,6 +42044,118 @@ class TestCheapSideBooks(unittest.TestCase):
         self.assertEqual(Y(self._q({"side": "no", "px": 2}, [(97, 1500)], nc_no)[0]), ("ask", 98, 1000))
         self.assertEqual(Y(self._q({"side": "no", "px": 1}, nc_yes, nc_no, pos=-1000.0)[0]), None)
 
+    def test_subpenny_px_parse_and_load(self):
+        """Jack 2026-11-10: "it's ok to go lower to 0.1% to catch markets like
+        KXFRENCHPRES-27" -- a rung may sit at 0.1-0.9c on the 0.1c grid; the
+        list may hold $200 at 0.1c (200,000 contracts)"""
+        cp = imm.cheap_px
+        self.assertEqual([cp(1), cp(2), cp(2.0), cp("1")], [1, 2, 2, 1])
+        self.assertIsInstance(cp(2.0), int)
+        self.assertEqual([cp(0.2), cp("0.3"), cp(0.9), cp(0.1)], [0.2, 0.3, 0.9, 0.1])
+        for bad in (0.25, 0.05, 0.0, 3, 1.5, -1, "x", None, float("nan")):
+            self.assertIsNone(cp(bad), bad)
+        with mock.patch.object(imm, "CHEAP_PX_MIN", 1.0):          # sub-penny off
+            self.assertIsNone(cp(0.2))
+            self.assertEqual(cp(1), 1)
+        self._write({self.T: {"side": "yes", "px": 0.2, "size": 50000}})
+        e = imm.cheap_entry(self.T)
+        self.assertEqual((e["cheap"], e["size"], e["bid_max"], e["ask_min"]),
+                         ({"side": "yes", "px": 0.2}, 50000, 1, 100))
+        self._write({self.T: {"side": "no", "px": 0.4, "size": 25000}})
+        e = imm.cheap_entry(self.T)
+        self.assertEqual((e["cheap"]["px"], e["bid_max"], e["ask_min"]), (0.4, 0, 99))
+        self._write({self.T: {"side": "yes", "px": 0.1, "size": 200000}})     # $200
+        self.assertEqual(imm.cheap_entry(self.T)["size"], 200000)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write({self.T: {"side": "yes", "px": 0.1, "size": 200001},
+                         self.T2: {"side": "yes", "px": 0.3, "size": 70000},      # $210
+                         "KXGOOD-99DEC31-C": {"side": "yes", "px": 0.25, "size": 1000}})
+        self.assertIsNone(imm.cheap_entry(self.T))
+        self.assertIsNone(imm.cheap_entry(self.T2))
+        self.assertTrue(any("3 market(s) skipped" in x and "0.1c grid" in x for x in lines), lines)
+
+    def test_the_subpenny_rung(self):
+        """On a market priced in tenths of a cent (KXFRENCHPRES-27-MPAN at 11/10
+        02:50Z: YES 0.2x0.3, 11,112 at 0.1c and 4 at 0.2c), the rung rests at
+        its exact price on the 0.1c grid, never crossing, scored one tick = 0.1c"""
+        X = lambda q: None if q is None else (q.book_side, q.price_cents, q.price_exact, q.count)
+
+        def q_(px, ye, ne, side="yes", size=5000, step=0.001, own=(), pos=0.0):
+            e = {"size": size, "cheap": {"side": side, "px": px}}
+            y0 = [[int(p), n] for p, n in ye]           # the cent buckets, floored
+            n0 = [[int(p), n] for p, n in ne]
+            return imm.cheap_side_quote(self.T, e, y0, n0, [], [list(x) for x in ye],
+                                        [list(x) for x in ne], list(own), 1000.0, 0.5, pos,
+                                        step=step)
+        mpan_y, mpan_n = [(0.1, 11112.0), (0.2, 4.0)], [(99.7, 5000.0)]     # YES 0.2x0.3
+        q, info = q_(0.2, mpan_y, mpan_n)
+        self.assertEqual(X(q), ("bid", 0, 0.2, 5000))
+        self.assertAlmostEqual(info["share"], 5000 / 5004, places=4)     # the walk ends at 0.2c
+        self.assertEqual(info["limit"], 0.3)
+        # pinned at px, or the highest 0.1c under the ask: 0.4 -> 0.2 (the ask is 0.3)
+        self.assertEqual(X(q_(0.4, mpan_y, mpan_n)[0]), ("bid", 0, 0.2, 5000))
+        # an ask at 0.2c: 0.1c, behind the 11,112 pile (5,000 of 16,112)
+        q, info = q_(0.2, [(0.1, 11112.0)], [(99.8, 5000.0)])
+        self.assertEqual(X(q), ("bid", 0, 0.1, 5000))
+        self.assertAlmostEqual(info["share"], 5000 / 16112, places=4)
+        # an ask at 0.1c: nothing fits under it
+        q, info = q_(0.2, [(0.05, 11112.0)], [(99.9, 5000.0)])
+        self.assertIsNone(q)
+        self.assertIn("cross", info["why"])
+        # a whole-cent market rests nothing at a sub-penny px (by its step, or
+        # without one, a book with no fractional-cent level)
+        q, info = q_(0.2, mpan_y, mpan_n, step=0.01)
+        self.assertIsNone(q)
+        self.assertIn("whole-cent", info["why"])
+        q, info = q_(0.5, [(1.0, 300.0)], [(97.0, 1500.0)], step=None)
+        self.assertIsNone(q)
+        self.assertIn("whole-cent", info["why"])
+        self.assertEqual(X(q_(0.2, mpan_y, mpan_n, step=None)[0]), ("bid", 0, 0.2, 5000))
+        # the other side under target: nothing
+        q, info = q_(0.2, mpan_y, [(99.7, 500.0)])
+        self.assertIsNone(q)
+        self.assertIn("under target", info["why"])
+        # a rung 3 ticks under the touch scores 0.5^3 of its size: 1,000 at
+        # 0.2c under 500 at 0.5c is 125 of 625 = 20%; under 5,000 there (the
+        # target reached at the touch) it is out of the walk
+        q, info = q_(0.2, [(0.5, 500.0)], [(99.4, 5000.0)], size=1000)
+        self.assertAlmostEqual(info["share"], 125 / 625, places=4)
+        self.assertEqual(X(q), ("bid", 0, 0.2, 1000))
+        q, info = q_(0.2, [(0.5, 5000.0)], [(99.4, 5000.0)], size=1000)
+        self.assertIsNone(q)
+        self.assertIn("out of the scored walk", info["why"])
+        # our own resting rung is netted out, never counted twice
+        q, info = q_(0.2, [(0.1, 11112.0), (0.2, 5004.0)], mpan_n, own=[("bid", 0.2, 5000.0)])
+        self.assertAlmostEqual(info["share"], 5000 / 5004, places=4)
+        # its position cap is its size
+        self.assertEqual(X(q_(0.2, mpan_y, mpan_n, pos=1000.0)[0]), ("bid", 0, 0.2, 4000))
+        # a NO bid on a near-certainty at 99.7x99.8: the YES ask at 99.8 (NO 0.2c)
+        q, _ = q_(0.2, [(99.7, 5000.0)], [(0.1, 9000.0), (0.2, 4.0)], side="no")
+        self.assertEqual(X(q), ("ask", 100, 99.8, 5000))
+
+    def test_dry_cycle_rests_a_subpenny_rung(self):
+        """A market priced in tenths of a cent, YES 0.2x0.3, listed YES 0.2c x
+        5,000: the bot rests that bid at its exact price, and keeps it"""
+        c = self._long_shot(FakeClient(), yes=(("0.0010", "11112"), ("0.0020", "4")),
+                            no=(("0.9970", "5000"),))
+        c.markets[self.T].update(yes_bid_dollars="0.0020", yes_ask_dollars="0.0030",
+                                 price_ranges=[{"start": "0.0000", "end": "1.0000",
+                                                "step": "0.0010"}])
+        self._write({self.T: {"side": "yes", "px": 0.2, "size": 5000}})
+        bot, lines = self._cycle(c)
+        rest = [o for o in bot.state.sim_orders.values() if o["ticker"] == self.T]
+        self.assertEqual([(o["book_side"], o["yes_price_exact"], o["remaining_count"]) for o in rest],
+                         [("bid", 0.2, 5000.0)], lines[-40:])
+        self.assertTrue(any("cheap KXGOOD-99DEC31-A: YES bid 0.2c x5000" in x and "$10 if it all fills"
+                            in x for x in lines), [x for x in lines if "cheap" in x])
+        oid = rest[0]["order_id"]
+        bot.state.universe_at = 0.0
+        with mock.patch.object(imm, "log", lambda *a: None):
+            bot.run_cycle()
+        self.assertEqual([o["order_id"] for o in bot.state.sim_orders.values()
+                          if o["ticker"] == self.T], [oid])
+
     def _cycle(self, c, flags=(), mode="on"):
         bot = IncentiveMarketMaker(client=c, live=False)
         for f in flags:

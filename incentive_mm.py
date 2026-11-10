@@ -10126,15 +10126,25 @@ def pvd_entry(ticker: str, now_utc: Optional[datetime] = None) -> Optional[dict]
 # sweep breaker and the other pre-quote guards all still apply. A position
 # that fills rides to settlement (a reduce-only market rests nothing).
 # File: {"stop": ISO default, "markets": {ticker: {"side": "yes"|"no",
-# "px": 1|2, "size": N, "stop": ISO, "event": ...}}}. IMM_CHEAP_SIDE=on|dry|off
-# (dry logs the rung and rests nothing; off ignores the file).
+# "px": 1|2 (or 0.1-0.9, below), "size": N, "stop": ISO, "event": ...}}}.
+# IMM_CHEAP_SIDE=on|dry|off (dry logs the rung and rests nothing; off ignores
+# the file).
+# SUB-PENNY RUNGS (Jack 2026-11-10: "it's ok to go lower to 0.1% to catch
+# markets like KXFRENCHPRES-27"). On a market priced in tenths of a cent, a
+# long shot's YES often trades at 0.2x0.3c, where a 1c bid would cross; the
+# rung may then sit on the 0.1c grid at 0.1-0.9c (px 0.1-0.9): the wire price
+# is exact (price_exact, post-only like every order), it never crosses the
+# opposite side's exact best (a step down the 0.1c grid if it would), and its
+# share is scored on the exact book, one tick = 0.1c. A whole-cent market
+# rests nothing at a sub-penny px. IMM_CHEAP_PX_MIN=1 turns them off.
 CHEAP_FILE = "cheap_side_books.json"            # in STATUS_DIR
 CHEAP_MODE = os.environ.get("IMM_CHEAP_SIDE", "on").strip().lower()
 CHEAP_PX_MAX = max(1, _env_int("IMM_CHEAP_PX_MAX", 2))         # cents, the cheap side's own price
-# contracts a market: 20,000 so the hourly scan's $1-floor top-up can rest $200
-# at 1c (Jack 2026-11-09: "Build it" -- "raise that market's rung toward $200");
+CHEAP_PX_MIN = min(1.0, max(0.1, _env_float("IMM_CHEAP_PX_MIN", 0.1)))   # cents (sub-penny)
+# contracts a market: 200,000 so a sub-penny rung can rest $200 at 0.1c (the
+# hourly scan's $1-floor top-up rests up to $200, Jack 2026-11-09: "Build it");
 # CHEAP_MAX_USD still caps size x px
-CHEAP_MAX_SIZE = max(1, _env_int("IMM_CHEAP_MAX_SIZE", 20000))
+CHEAP_MAX_SIZE = max(1, _env_int("IMM_CHEAP_MAX_SIZE", 200000))
 CHEAP_MAX_USD = _env_float("IMM_CHEAP_MAX_USD", 200.0)         # size x px a market
 # ...and the rung rests only while it holds at least this share of its side's
 # score (a 2c bid deep under a book that moved up earns ~nothing)
@@ -10178,19 +10188,21 @@ def load_cheap_entries(mtime: float) -> Dict[str, dict]:
             continue
         stop = parse_iso_utc(str(raw.get("stop") or "")) or default_stop
         side = str(raw.get("side") or "").strip().lower()
+        px = cheap_px(raw.get("px"))
         try:
-            px = int(raw.get("px"))
             size = int(raw.get("size"))
         except (TypeError, ValueError):
-            px = size = 0
-        if stop is None or side not in ("yes", "no") or not 1 <= px <= CHEAP_PX_MAX \
+            size = 0
+        if stop is None or side not in ("yes", "no") or px is None \
                 or not 1 <= size <= CHEAP_MAX_SIZE or size * px / 100.0 > CHEAP_MAX_USD + 1e-9:
-            bad.append(f"{t} (side {side or '-'}, px {px}, size {size}, stop {raw.get('stop')})")
+            bad.append(f"{t} (side {side or '-'}, px {raw.get('px')}, size {size}, "
+                       f"stop {raw.get('stop')})")
             continue
         if series_of(t) in ENS_SERIES:
             continue
-        out[t] = {"stop": stop, "bid_max": px if side == "yes" else 0,
-                  "ask_min": 100 - px if side == "no" else 100,
+        pc = max(1, int(math.floor(px)))    # the whole-cent bound the plain path reads
+        out[t] = {"stop": stop, "bid_max": pc if side == "yes" else 0,
+                  "ask_min": 100 - pc if side == "no" else 100,
                   "size": size, "max_pos": float(size), "kind": "dead",
                   "bsize": size, "asize": size, "cushion": 0, "pmin": 1, "pmax": 99,
                   "no_losing": False, "override_cutoff": bool(raw.get("override_cutoff")),
@@ -10199,9 +10211,62 @@ def load_cheap_entries(mtime: float) -> Dict[str, dict]:
                   "cheap": {"side": side, "px": px}}
     if bad:
         log(f"[IMM] ! cheap-side books: {len(bad)} market(s) skipped (side yes|no, px 1-"
-            f"{CHEAP_PX_MAX}, size 1-{CHEAP_MAX_SIZE}, size x px <= ${CHEAP_MAX_USD:g}, a stop): "
-            + "; ".join(bad[:10]))
+            f"{CHEAP_PX_MAX} or {CHEAP_PX_MIN:g}-0.9 on the 0.1c grid, size 1-{CHEAP_MAX_SIZE}, "
+            f"size x px <= ${CHEAP_MAX_USD:g}, a stop): " + "; ".join(bad[:10]))
     return out
+
+
+def cheap_px(raw) -> Optional[float]:
+    """A cheap-side rung's price from the list: a whole cent 1-CHEAP_PX_MAX
+    (an int), or a SUB-PENNY price CHEAP_PX_MIN-0.9c on the 0.1c grid (a
+    float); None for anything else."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if abs(v - round(v)) < 1e-9:
+        w = int(round(v))
+        return w if 1 <= w <= CHEAP_PX_MAX else None
+    k = round(v * 10)
+    if abs(v * 10 - k) > 1e-6 or not CHEAP_PX_MIN - 1e-9 <= v < 1.0:
+        return None
+    return round(k / 10.0, 1)
+
+
+def _cheap_exact_sides(yes_exact: List[List[float]], no_exact: List[List[float]],
+                       own_exact: List[Tuple[str, float, float]], side: str
+                       ) -> Tuple[Dict[float, float], Dict[float, float]]:
+    """(this side's, the other side's) EXTERNAL exact levels, each in its own
+    side's cents ({price: contracts}), our own resting orders netted out."""
+    y: Dict[float, float] = {}
+    n: Dict[float, float] = {}
+    for p, q in yes_exact:
+        k = round(float(p), 2)
+        y[k] = y.get(k, 0.0) + float(q)
+    for p, q in no_exact:
+        k = round(float(p), 2)
+        n[k] = n.get(k, 0.0) + float(q)
+    for bs, yx, rem in own_exact:
+        if bs == "bid":
+            k = round(float(yx), 2)
+            y[k] = y.get(k, 0.0) - float(rem)
+        else:
+            k = round(100.0 - float(yx), 2)
+            n[k] = n.get(k, 0.0) - float(rem)
+    y = {k: v for k, v in y.items() if v > 1e-9}
+    n = {k: v for k, v in n.items() if v > 1e-9}
+    return (y, n) if side == "yes" else (n, y)
+
+
+def _tick_walk(levels: Dict[float, float]) -> List[Tuple[int, float]]:
+    """Exact levels on the 0.1c tick grid (price x 10), best first."""
+    w: Dict[int, float] = {}
+    for p, q in levels.items():
+        k = int(round(float(p) * 10))
+        w[k] = w.get(k, 0.0) + float(q)
+    return sorted(w.items(), key=lambda kv: -kv[0])
 
 
 def cheap_side_quote(ticker: str, entry: dict,
@@ -10209,7 +10274,8 @@ def cheap_side_quote(ticker: str, entry: dict,
                      own_in_book: List[Tuple[str, float, float]],
                      yes_exact: List[List[float]], no_exact: List[List[float]],
                      own_exact: List[Tuple[str, float, float]],
-                     target: float, df: float, pos: float
+                     target: float, df: float, pos: float,
+                     step: Optional[float] = None
                      ) -> Tuple[Optional["Quote"], dict]:
     """A CHEAP-SIDE BOOK's one rung this cycle, or None, and why.
 
@@ -10219,9 +10285,19 @@ def cheap_side_quote(ticker: str, entry: dict,
     EXTERNAL price (exact on a sub-penny book); and only while it earns on the
     external book scored the bot's way (whole-cent buckets, _side_share): the
     opposite side reaches target alone, its own side with the rung, and the
-    rung scores."""
+    rung scores.
+
+    A SUB-PENNY px (0.1-0.9c) rests only on a market priced finer than a cent
+    (`step`, the market's price step in dollars; without it, a book showing a
+    fractional-cent level): pinned at px or the highest 0.1c under the
+    opposite side's exact best, sent at its exact price, and scored on the
+    exact book with one tick = 0.1c."""
     c = entry["cheap"]
-    side, px, size = c["side"], int(c["px"]), int(entry["size"])
+    side, size = c["side"], int(entry["size"])
+    px = float(c["px"])
+    sub = px < 1.0 - 1e-9
+    if not sub:
+        px = int(round(px))
     held = pos if side == "yes" else -pos
     n = int(max(0.0, min(float(size), size - held)))
     info: dict = {"side": side, "px": px, "n": n, "held": held}
@@ -10237,6 +10313,41 @@ def cheap_side_quote(ticker: str, entry: dict,
         ea = None if _nb is None else 100.0 - _nb
     # the opposite side's best, in this side's own cents: the rung stays under it
     limit = ea if side == "yes" else (None if eb is None else 100.0 - eb)
+    if sub:
+        fine = (step < 0.01 - 1e-12) if step is not None else any(
+            abs(float(a) - round(float(a))) > 1e-6
+            for a, b in list(yes_exact) + list(no_exact) if float(b) > 0)
+        info["limit"] = None if limit is None else round(limit, 2)
+        if not fine:
+            info["why"] = f"a whole-cent market (a {px:g}c rung needs a sub-penny book)"
+            return None, info
+        sp = px
+        if limit is not None:
+            sp = min(px, (math.ceil(round(limit, 2) * 10 - 1e-6) - 1) / 10.0)
+        sp = round(sp, 1)
+        info["px"] = sp
+        if sp < 0.1 - 1e-9:
+            info["why"] = f"would cross (the other side's best is {limit:.2f}c)"
+            return None, info
+        mine_x, other_x = _cheap_exact_sides(yes_exact, no_exact, own_exact, side)
+        k0 = int(round(sp * 10))
+        walk = dict(_tick_walk(mine_x))
+        walk[k0] = walk.get(k0, 0.0) + n
+        share, ok_mine = _side_share(sorted(walk.items(), key=lambda kv: -kv[0]),
+                                     {k0: float(n)}, target, df)
+        _, ok_other = _side_share(_tick_walk(other_x), {}, target, df)
+        info["share"] = round(share, 4)
+        if not ok_other:
+            info["why"] = "the other side is under target (the snapshot pays nobody)"
+            return None, info
+        if not ok_mine or share <= 0 or share < CHEAP_MIN_SHARE:
+            info["why"] = (f"the rung scores {share * 100:.1f}% of its side (under "
+                           f"{CHEAP_MIN_SHARE * 100:g}%)" if ok_mine and share > 0
+                           else "the rung is out of the scored walk")
+            return None, info
+        if side == "yes":
+            return Quote(ticker, "bid", int(math.floor(sp)), n, price_exact=sp), info
+        return Quote(ticker, "ask", 100, n, price_exact=round(100.0 - sp, 2)), info
     p = px
     if limit is not None:
         p = min(px, int(math.ceil(round(limit, 2))) - 1)
@@ -10444,7 +10555,9 @@ def load_pvd_markets() -> int:
         if ch or cheap:
             log(f"[IMM] cheap-side books ({CHEAP_MODE}): {len(ch)} market(s), "
                 f"{sum(1 for e in ch if e['cheap']['side'] == 'yes')} YES bid / "
-                f"{sum(1 for e in ch if e['cheap']['side'] == 'no')} NO bid at 1-{CHEAP_PX_MAX}c, "
+                f"{sum(1 for e in ch if e['cheap']['side'] == 'no')} NO bid at "
+                f"{CHEAP_PX_MIN:g}-{CHEAP_PX_MAX}c ({sum(1 for e in ch if e['cheap']['px'] < 1)} "
+                f"under 1c), "
                 f"${sum(e['size'] * e['cheap']['px'] / 100.0 for e in ch):,.0f} if every rung fills")
     return changed
 
@@ -34956,7 +35069,8 @@ class IncentiveMarketMaker:
     def _cheap_side_note(self, t: str, q: Optional["Quote"], info: dict,
                          meta: "MarketMeta") -> None:
         """Log a CHEAP-SIDE BOOK's rung when it starts, moves or stands aside."""
-        key = (None, info.get("why")) if q is None else (q.book_side, q.price_cents, q.count)
+        key = (None, info.get("why")) if q is None else (q.book_side, q.price_cents,
+                                                         q.price_exact, q.count)
         if self._cheap_noted.get(t) == key:
             return
         self._cheap_noted[t] = key
@@ -34965,10 +35079,10 @@ class IncentiveMarketMaker:
             log(f"{self.tag} cheap {t}: {side} side rests nothing -- {info.get('why')}")
             return
         usd = float(info.get("share") or 0.0) / 2.0 * float(meta.dollars_per_day or 0.0)
-        log(f"{self.tag} cheap {t}: {side} bid {info.get('px')}c x{q.count}"
+        log(f"{self.tag} cheap {t}: {side} bid {float(info.get('px') or 0):g}c x{q.count}"
             f"{' (dry: not placed)' if CHEAP_MODE != 'on' else ''} -- side share "
             f"{float(info.get('share') or 0) * 100:.0f}%, ~${usd:.2f}/day of "
-            f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * int(info.get('px') or 0) / 100:.0f} "
+            f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * float(info.get('px') or 0) / 100:.0f} "
             f"if it all fills (other side's best {info.get('limit')}c)")
 
     def _pvd_clamp_note(self, t: str, quotes: list, side: str, usual, pos: float,
@@ -39177,7 +39291,8 @@ class IncentiveMarketMaker:
                         t, cheap, yes_levels, no_levels, own_in_book,
                         *orderbook_exact_levels(ob),
                         own_exact_by_ticker.get(t, []) if self.live else [],
-                        meta.target_size, meta.discount_factor, cap_pos)
+                        meta.target_size, meta.discount_factor, cap_pos,
+                        step=meta.price_step)
                 except Exception as e:      # never costs the cycle: nothing rests
                     _cq, _ci = None, {"why": f"failed ({e!r})"}
                 if reduce_only and _cq is not None:

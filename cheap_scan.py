@@ -11,7 +11,10 @@ least --min-days out, it reads the book (the bot's own resting orders netted
 out) and scores a 1c and a 2c rung on each side -- a YES bid, and a NO bid (a
 YES ask at 98-99c) -- at sizes up to --max-usd of risk, with the bot's own
 cheap_side_quote (whole-cent walk, never crossing, the opposite side reaching
-target alone). Per market it takes the best $/day, then the smallest risk
+target alone); on a market priced in tenths of a cent, also each 0.1-0.9c
+rung from $10 up (SUB-PENNY RUNGS, Jack 2026-11-10: "it's ok to go lower to
+0.1% to catch markets like KXFRENCHPRES-27"; the exact book, one tick =
+0.1c). Per market it takes the best $/day, then the smallest risk
 holding 95% of it, and keeps it when the rung projects at least --bar over the
 rest of the program period. A market the bot already earns more on under its
 family rules is left to them (--include-quoted lists it anyway).
@@ -80,6 +83,15 @@ import kalshi_reads                              # noqa: E402
 import send_imm_new_programs as snp             # noqa: E402
 
 SIZES = (1000, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 15000, 20000)
+# SUB-PENNY RUNGS (Jack 2026-11-10: "it's ok to go lower to 0.1% to catch
+# markets like KXFRENCHPRES-27"): on a market priced in tenths of a cent, the
+# rung may also sit at 0.1-0.9c (incentive_mm CHEAP_PX_MIN; the bot's own
+# cheap_side_quote prices and scores it), sized in dollars: these at each price.
+# 11/10 02:50Z: ~20 of KXFRENCHPRES-27's 30 markets ($14.29/day pools) had YES
+# at 0.1-0.9c, where a 1c bid would cross; 15 of them thin enough to model
+# ~$87/day at $100 a market.
+SUB_USD = (10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200)
+SUB_PX = tuple(k / 10.0 for k in range(1, 10))
 # THE $1 FLOOR (Jack 2026-11-09: "Build it", on "a $1 rule in the hourly scan.
 # When a listed market projects under about $1.20 for its period, it would raise
 # that market's rung toward $200. When even $200 can't reach $1, it would take
@@ -313,22 +325,45 @@ def own_orders(client):
     return own, exact, foreign
 
 
-def rung_cands(t, pr, ob, own, own_exact, max_usd, hrs):
-    """Every 1-2c rung on either side up to `max_usd` of risk that the bot's
-    own cheap_side_quote would rest and score, one per (side, px, count)."""
+def sub_penny(ye, ne, step=None) -> bool:
+    """A market priced finer than a cent: its price step (dollars) when
+    known, else a book showing a fractional-cent level."""
+    if step is not None:
+        return step < 0.01 - 1e-12
+    return any(abs(float(p) - round(float(p))) > 1e-6
+               for p, q in list(ye) + list(ne) if float(q) > 0)
+
+
+def rung_prices(ye, ne, step=None):
+    """(px, sizes) to try: 1c and 2c at SIZES, and on a sub-penny market each
+    0.1c price from the bot's CHEAP_PX_MIN to 0.9c at SUB_USD."""
+    out = [(1, SIZES), (2, SIZES)]
+    if imm.CHEAP_PX_MIN < 1.0 - 1e-9 and sub_penny(ye, ne, step):
+        for px in SUB_PX:
+            if px >= imm.CHEAP_PX_MIN - 1e-9:
+                out.append((px, tuple(int(round(u * 100 / px)) for u in SUB_USD)))
+    return out
+
+
+def rung_cands(t, pr, ob, own, own_exact, max_usd, hrs, step=None):
+    """Every rung on either side up to `max_usd` of risk that the bot's own
+    cheap_side_quote would rest and score (1-2c, and 0.1-0.9c on a sub-penny
+    market), one per (side, px, count)."""
     y0, n0 = imm.orderbook_levels(ob)
     ye, ne = imm.orderbook_exact_levels(ob)
     seen, cands = set(), []
     for side in ("yes", "no"):
-        for px in (1, 2):
-            for n in SIZES:
-                if n * px / 100.0 > max_usd + 1e-9:
+        for px, sizes in rung_prices(ye, ne, step):
+            for n in sizes:
+                if n * px / 100.0 > max_usd + 1e-9 or n > imm.CHEAP_MAX_SIZE:
                     continue
                 e = {"size": n, "cheap": {"side": side, "px": px}}
                 q, info = imm.cheap_side_quote(t, e, y0, n0, own, ye, ne, own_exact,
-                                               pr["target"], pr["df"], 0.0)
+                                               pr["target"], pr["df"], 0.0, step=step)
                 if q is None:
                     continue
+                if info["px"] < 1 and q.count * info["px"] / 100.0 < SUB_USD[0] - 1e-9:
+                    continue            # (a size for a higher px, stepped down under $10)
                 key = (side, info["px"], q.count)
                 if key in seen:
                     continue
@@ -350,10 +385,12 @@ def pick_rung(cands, max_usd):
                   key=lambda c: (c["risk"], -c["usd_day"]))[0]
 
 
-def best_rung(t, pr, ob, own, own_exact, max_usd, hrs, cap_usd=None):
+def best_rung(t, pr, ob, own, own_exact, max_usd, hrs, cap_usd=None, step=None):
     """(the rung within `max_usd`, what the bot earns there now in $/day); with
-    `cap_usd`, also every rung up to it (the $1 floor's top-ups)."""
-    cands = rung_cands(t, pr, ob, own, own_exact, max(max_usd, cap_usd or 0.0), hrs)
+    `cap_usd`, also every rung up to it (the $1 floor's top-ups). `step` is the
+    market's price step in dollars (imm.market_price_step), None to read it
+    off the book."""
+    cands = rung_cands(t, pr, ob, own, own_exact, max(max_usd, cap_usd or 0.0), hrs, step=step)
     pick = pick_rung(cands, max_usd)
     if pick is None:
         return (None, None, cands) if cap_usd is not None else (None, None)
@@ -416,7 +453,7 @@ def floor_rung(cands, banked, hrs, aim, floor):
 
 
 def _rung_s(c) -> str:
-    return f"{c['side'].upper()} {c['px']}c x{c['size']} (${c['risk']:,.0f})"
+    return f"{c['side'].upper()} {c['px']:g}c x{c['size']} (${c['risk']:,.0f})"
 
 
 def apply_floor(r, t, pick, cands, banked, hrs, a, why) -> None:
@@ -548,7 +585,8 @@ def scan(a) -> int:
         # our own cheap rung, netted out of the book like the rest of our orders
         # (and, for a market listed this period, every rung up to the $1 floor's cap)
         cap = a.floor_max_usd if floor_on and same else None
-        res = best_rung(t, pr, ob, own.get(t, []), own_exact.get(t, []), a.max_usd, hrs, cap_usd=cap)
+        res = best_rung(t, pr, ob, own.get(t, []), own_exact.get(t, []), a.max_usd, hrs, cap_usd=cap,
+                        step=imm.market_price_step(m))
         pick, cur, cands = res if cap is not None else (res[0], res[1], [])
         if t in listed_now:
             cur = 0.0                   # what the bot earns there now is this list's rung
@@ -582,13 +620,13 @@ def scan(a) -> int:
         f"{len(far)} at {a.min_days:.0f}d+; listing {len(take)} "
         f"({sum(1 for r in take if r['same_period'])} already this period); unread {len(unread)} "
         f"(kept {len(kept)} listed); skipped {why}")
-    print(f"{'ticker':36} {'sub':24} {'side':4} {'px':>2} {'size':>6} {'share':>6} {'$/day':>6} "
+    print(f"{'ticker':36} {'sub':24} {'side':4} {'px':>3} {'size':>6} {'share':>6} {'$/day':>6} "
           f"{'risk$':>6} {'proj$':>6} {'now$/d':>6} stop")
     for r in sorted(rows, key=lambda r: -((r["pick"] or {}).get("usd_day") or 0)):
         p = r["pick"] or {}
         if not p:
             continue
-        print(f"{r['ticker'][:36]:36} {r['sub'][:24]:24} {p['side'].upper():4} {p['px']:2d} {p['size']:6d} "
+        print(f"{r['ticker'][:36]:36} {r['sub'][:24]:24} {p['side'].upper():4} {p['px']:>3g} {p['size']:6d} "
               f"{p['share'] * 100:5.0f}% {p['usd_day']:6.2f} {p['risk']:6.0f} {p['proj']:6.2f} "
               f"{r['bot_usd_day_now']:6.2f} {r['stop'][5:16]}  {'' if r['verdict'] == 'LIST' else r['verdict']}")
     log(f"TOTAL listed: ${sum(r['pick']['usd_day'] for r in take):,.2f}/day modelled, "
@@ -713,7 +751,8 @@ def discover(a) -> int:
         n_read += 1
         pr = outside[t]
         hrs = (pr["end"] - max(now, pr["start"])).total_seconds() / 3600
-        pick, cur = best_rung(t, pr, ob, own.get(t, []), own_exact.get(t, []), a.max_usd, hrs)
+        pick, cur = best_rung(t, pr, ob, own.get(t, []), own_exact.get(t, []), a.max_usd, hrs,
+                              step=imm.market_price_step(m))
         if pick is None or pick["proj"] < a.bar:
             continue
         g = by.setdefault(series_of(t), {"markets": [], "yours": 0, "bot_more": 0})

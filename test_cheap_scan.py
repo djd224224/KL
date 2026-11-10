@@ -398,5 +398,44 @@ class TestDollarFloor(_TempPaths):
         self.assertIn("OFF the list", text)
 
 
+class TestSubPenny(unittest.TestCase):
+    """Jack 2026-11-10: "it's ok to go lower to 0.1% to catch markets like
+    KXFRENCHPRES-27" -- on a market priced in tenths of a cent the scan also
+    tries 0.1-0.9c rungs, sized in dollars."""
+    PR = {"pd": 14.29, "target": 1000.0, "df": 0.5}
+
+    @staticmethod
+    def _book(yes, no):
+        return {"orderbook_fp": {"yes_dollars": [[f"{p / 100:.4f}", f"{n:.2f}"] for p, n in yes],
+                                 "no_dollars": [[f"{p / 100:.4f}", f"{n:.2f}"] for p, n in no]}}
+
+    def test_prices_tried(self):
+        whole = cs.rung_prices([[1.0, 300]], [[97.0, 1500]])
+        self.assertEqual([p for p, _ in whole], [1, 2])
+        self.assertEqual([p for p, _ in cs.rung_prices([[1.0, 300]], [[97.0, 1500]], step=0.001)],
+                         [1, 2] + [k / 10 for k in range(1, 10)])
+        sub = dict(cs.rung_prices([[0.2, 4]], [[99.7, 5000]]))     # read off the book
+        self.assertEqual(sub[0.2][:3], (5000, 7500, 10000))         # $10, $15, $20 at 0.2c
+        self.assertEqual(sub[0.1][-1], 200000)                      # $200 at 0.1c
+        self.assertEqual(len(cs.rung_prices([[0.2, 4]], [[99.7, 5000]], step=0.01)), 2)
+        with mock.patch.object(imm, "CHEAP_PX_MIN", 1.0):
+            self.assertEqual(len(cs.rung_prices([[0.2, 4]], [[99.7, 5000]])), 2)
+
+    def test_picks_the_subpenny_rung(self):
+        # KXFRENCHPRES-27-MPAN at 11/10 02:50Z: YES 0.2x0.3, 11,112 at 0.1c, 4 at 0.2c
+        ob = self._book([(0.1, 11112), (0.2, 4)], [(99.7, 5000)])
+        cands = cs.rung_cands("KXFRENCHPRES-27-MPAN", self.PR, ob, [], [], 100.0, 48.0, step=0.001)
+        self.assertTrue(cands)
+        self.assertFalse([c for c in cands if c["px"] >= 1])        # a 1c bid would cross
+        self.assertEqual({c["px"] for c in cands}, {0.1, 0.2})      # 0.3c+ steps down to 0.2c
+        pick = cs.pick_rung(cands, 100.0)
+        self.assertEqual((pick["side"], pick["px"], pick["size"]), ("yes", 0.2, 5000))
+        self.assertAlmostEqual(pick["risk"], 10.0)
+        self.assertAlmostEqual(pick["usd_day"], 5000 / 5004 / 2 * 14.29, places=3)
+        self.assertEqual(cs._rung_s(pick), "YES 0.2c x5000 ($10)")
+        # the same book on a whole-cent market: nothing
+        self.assertEqual(cs.rung_cands("X-1", self.PR, ob, [], [], 100.0, 48.0, step=0.01), [])
+
+
 if __name__ == "__main__":
     unittest.main()
