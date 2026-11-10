@@ -24815,20 +24815,41 @@ def book_lead_set_comp(tickers) -> None:
     _book_lead["comp"] = frozenset(tickers)
 
 
+# OWN-RULES FAMILIES SIT OUT (2026-11-10, 16:33Z, the first live hour): the
+# book lead rested 200 on 9 KXTRUMPSAYMONTH sides past the Trump pilot's 100
+# per market, and a 200 ask on a KXMAMDANIMENTION word. Those families' sizes
+# were cut on purpose after their pick-offs (the TWK pilot caps and halts,
+# the mention multipliers): one utterance settles a word at 0 or 100, so a
+# usual price says nothing about the next speech. They keep their own quotes;
+# no book lead. And an awards family is any AWARDS_SERIES prefix or tag
+# member (KXGRAMMYNOM is a code family, not a tag member: its leads rested 6
+# days before the Nov 16 nominations): 7 days clear of its stand-down.
+def book_lead_own_rules(ticker: str, series: str) -> bool:
+    """A Trump-pilot (TWK) market or event, or a mention family: no book lead."""
+    if "MENTION" in series or mention_auto_series(series) or twk_event_ticker(ticker):
+        return True
+    return twk_series(series) and series not in {series_of(e) for e in TWK_SAY_EVENTS}
+
+
+def book_lead_awards(series: str) -> bool:
+    return awards_extra_series(series) or series.startswith(AWARDS_SERIES)
+
+
 def _book_lead_static_ok(ticker: str, series: str, now_ts: float) -> bool:
     """Everything but the touch: the switch, the series, the lists, the 24h
     volume and the time to the decision."""
     if BOOK_LEAD_MODE != "on" or FAIR_LEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
         return False
     if in_fair_lead_series(series) or series.startswith(LEAD_OFF_SERIES) \
-            or (BOOK_LEAD_SKIP_SERIES and series.startswith(BOOK_LEAD_SKIP_SERIES)):
+            or (BOOK_LEAD_SKIP_SERIES and series.startswith(BOOK_LEAD_SKIP_SERIES)) \
+            or book_lead_own_rules(ticker, series):
         return False
     if ticker in _book_lead["comp"] or PVD_MARKETS.get(ticker) is not None:
         return False
     info = _book_lead["info"].get(ticker)
     if info is None or info[0] is None or info[0] > BOOK_LEAD_MAX_VOL24:
         return False
-    need_h = BOOK_LEAD_AWARDS_MIN_HOURS if awards_extra_series(series) else BOOK_LEAD_MIN_HOURS
+    need_h = BOOK_LEAD_AWARDS_MIN_HOURS if book_lead_awards(series) else BOOK_LEAD_MIN_HOURS
     return info[1] is None or info[1] - now_ts >= need_h * 3600.0
 
 

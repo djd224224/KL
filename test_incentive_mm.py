@@ -35207,6 +35207,34 @@ class TestBookLead(unittest.TestCase):
         self.assertIsNotNone(imm.book_lead_anchor(self.T, self.S, now))
         self.assertIsNone(imm.book_lead_anchor("KXGOOD-99DEC31-Z", self.S, now))   # no info
 
+    def test_own_rules_families_sit_out_and_awards_keep_a_week(self):
+        """2026-11-10, the first live hour: 200 on KXTRUMPSAYMONTH past the
+        pilot's 100, a KXMAMDANIMENTION word, KXGRAMMYNOM 6 days before its
+        nominations."""
+        now = time.time()
+
+        def leads(t, s, hours=30 * 24):
+            self._note(now, t=t, series=s, hours=hours)
+            self._seed(now, t=t)
+            return imm.book_lead_anchor(t, s, now) is not None
+
+        with mock.patch.object(imm, "TWK_ENABLE", True), \
+                mock.patch.object(imm, "TWK_SERIES",
+                                  frozenset({"KXTRUMPSAYMONTH", "KXFEATURE"})), \
+                mock.patch.object(imm, "TWK_SAY_EVENTS", frozenset({"KXFEATURE-26GTA6"})):
+            self.assertFalse(leads("KXTRUMPSAYMONTH-26DEC01-TRUM", "KXTRUMPSAYMONTH"))
+            self.assertFalse(leads("KXFEATURE-26GTA6-LOL", "KXFEATURE"))
+            # the GTA event's series runs its other events on the usual terms
+            self.assertTrue(leads("KXFEATURE-27X-A", "KXFEATURE"))
+        self.assertFalse(leads("KXMAMDANIMENTION-26NOV18-MIDT", "KXMAMDANIMENTION"))
+        with mock.patch.object(imm, "mention_auto_series", return_value=True):
+            self.assertFalse(leads("KXSAYSOME-26-A", "KXSAYSOME"))
+        # a code awards family (not a tag member): 7 days before its stand-down
+        with mock.patch.object(imm, "awards_extra_series", return_value=False):
+            self.assertFalse(leads("KXGRAMMYNOM-69BDPR-PET", "KXGRAMMYNOM", hours=5 * 24))
+            self.assertFalse(leads("KXGRAMMYNOMSOTY-69-APE", "KXGRAMMYNOMSOTY", hours=5 * 24))
+            self.assertTrue(leads("KXGRAMMYNOM-69BDPR-PET", "KXGRAMMYNOM", hours=8 * 24))
+
     def test_sampling_every_15_minutes_and_the_saved_history(self):
         now = float(int(time.time()))        # (a sample's time is stored rounded)
         self._note(now)
