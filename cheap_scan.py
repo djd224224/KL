@@ -15,7 +15,9 @@ target alone); on a market priced in tenths of a cent, also each 0.1-0.9c
 rung from $10 up (SUB-PENNY RUNGS, Jack 2026-11-10: "it's ok to go lower to
 0.1% to catch markets like KXFRENCHPRES-27"; the exact book, one tick =
 0.1c). Per market it takes the best $/day, then the smallest risk
-holding 95% of it, and keeps it when the rung projects at least --bar over the
+earning 75% of it (PICK_FRAC; 95% before Jack 2026-11-10: "dont quote the full
+$100 if you can earn 75% of the share of earnings with less dollars at
+stake"), and keeps it when the rung projects at least --bar over the
 rest of the program period. A market the bot already earns more on under its
 family rules is left to them (--include-quoted lists it anyway).
 
@@ -375,13 +377,22 @@ def rung_cands(t, pr, ob, own, own_exact, max_usd, hrs, step=None):
     return cands
 
 
-def pick_rung(cands, max_usd):
-    """The best $/day within `max_usd`, then the smallest risk holding 95% of it."""
+# LESS AT STAKE (Jack 2026-11-10: "dont quote the full $100 if you can earn 75%
+# of the share of earnings with less dollars at stake", on the sub-penny rungs
+# holding 55-100% of their sides): the rung is the smallest risk that earns at
+# least PICK_FRAC of the best $/day within the list's cap (it was 95%).
+PICK_FRAC = 0.75
+
+
+def pick_rung(cands, max_usd, frac=None):
+    """The best $/day within `max_usd`, then the smallest risk earning at least
+    `frac` (PICK_FRAC) of it."""
     cands = [c for c in cands if c["risk"] <= max_usd + 1e-9]
     if not cands:
         return None
+    frac = PICK_FRAC if frac is None else frac
     top = max(c["usd_day"] for c in cands)
-    return sorted((c for c in cands if c["usd_day"] >= 0.95 * top),
+    return sorted((c for c in cands if c["usd_day"] >= frac * top - 1e-12),
                   key=lambda c: (c["risk"], -c["usd_day"]))[0]
 
 

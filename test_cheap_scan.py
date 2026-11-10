@@ -328,9 +328,21 @@ class TestDollarFloor(_TempPaths):
 
     def test_pick_rung_stays_within_the_list_cap(self):
         cands = self._cands(0.40)
-        self.assertEqual(cs.pick_rung(cands, 100.0)["size"], 10000)
-        self.assertEqual(cs.pick_rung(cands, 200.0)["size"], 20000)
+        self.assertEqual(cs.pick_rung(cands, 100.0)["size"], 10000)   # 5,000 earns only 50%
+        self.assertEqual(cs.pick_rung(cands, 200.0)["size"], 15000)   # 75% of 20,000's $/day
+        self.assertEqual(cs.pick_rung(cands, 200.0, frac=0.95)["size"], 20000)
         self.assertIsNone(cs.pick_rung([self._c(20000, 1.0)], 100.0))
+
+    def test_less_at_stake_for_75_percent(self):
+        """Jack 2026-11-10: "dont quote the full $100 if you can earn 75% of the
+        share of earnings with less dollars at stake" -- KXFRENCHPRES-27-SLEC at
+        04:00Z: 0.2c x 37,500 ($75) earned $5.88/day, x 15,000 ($30) $4.65"""
+        self.assertEqual(cs.PICK_FRAC, 0.75)
+        slec = [self._c(n, d, px=0.2) for n, d in
+                ((5000, 2.10), (10000, 3.70), (15000, 4.65), (25000, 5.40), (37500, 5.88), (50000, 5.90))]
+        pick = cs.pick_rung(slec, 100.0)
+        self.assertEqual((pick["size"], pick["risk"]), (15000, 30.0))     # 4.65 >= 0.75 x 5.90
+        self.assertEqual(cs.pick_rung(slec, 100.0, frac=0.95)["size"], 37500)
 
     def test_tops_up_to_the_smallest_rung_that_reaches_the_aim(self):
         # E45 at 13:51Z: banked $0.35, 10,000 at 1c earns ~$0.29/day -> $0.82 for the period
