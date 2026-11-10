@@ -1410,6 +1410,50 @@ def parse_research(text: str) -> Dict[str, dict]:
     return {}
 
 
+def _result_key(key: str) -> str:
+    """A RESULT_JSON key for matching: no case, no surrounding spaces or
+    backticks, no leading "KEY " (the prompt's own label)."""
+    key = (key or "").strip().strip("`").strip()
+    if key.upper().startswith("KEY "):
+        key = key[4:].strip()
+    return key.upper()
+
+
+def match_results(res: Dict[str, dict], due: List[str],
+                  targets: Dict[str, dict]) -> Tuple[Dict[str, dict], List[str]]:
+    """({due key: its result}, the RESULT_JSON keys no target took).
+
+    The run is told to key each result by its KEY ("gap:KXPRESRUNFIRSTR-28"),
+    but it often keys by the bare event instead ({"KXPRESRUNFIRSTR-28": ...},
+    probed 2026-11-10). Every verdict then went unread from 11/09 17:53Z:
+    rows it wrote still counted through the row check, but each judgment call
+    (the four KX*LEADRUN-26, KXPRESRUNFIRSTR/D-28) was filed "error -- no
+    result line" and retried every 30 min until its 6 tries ran out.
+    A result matches its KEY first; else the KEY less its "kind:" prefix or
+    the target's event, as long as no other due target shares that name."""
+    norm: Dict[str, Tuple[str, dict]] = {}
+    for rk, v in (res or {}).items():
+        norm.setdefault(_result_key(rk), (rk, v))
+    fallback: Dict[str, set] = {}
+    for k in due:
+        t = targets.get(k) or {}
+        names = {_result_key(k.split(":", 1)[1])} if ":" in k else set()
+        if t.get("event"):
+            names.add(_result_key(str(t["event"])))
+        fallback[k] = names - {"", _result_key(k)}
+    shared = Counter(n for names in fallback.values() for n in names)
+    out: Dict[str, dict] = {}
+    used = set()
+    for k in due:
+        for name in [_result_key(k)] + sorted(n for n in fallback[k] if shared[n] == 1):
+            hit = norm.get(name)
+            if hit is not None and hit[0] not in used:
+                out[k] = hit[1]
+                used.add(hit[0])
+                break
+    return out, [rk for rk in (res or {}) if rk not in used]
+
+
 def research_token() -> str:
     """The research token in RESEARCH_TOKEN_FILE, or '' (no file, unreadable,
     or no token in it). The first sk-ant-... run counts, so a paste of
@@ -1605,17 +1649,20 @@ def apply_results(rstate: Dict[str, dict], due: List[str], targets: Dict[str, di
     02:24Z: the run wrote KXALBERTAREFS and KXCZECHSENATE but printed no
     result line, and all 8 were filed "unresolved -- no result"): a row in
     place is "written"; otherwise the run failed for it -- "error", retried
-    after RESEARCH_ERROR_RETRY_H."""
+    after RESEARCH_ERROR_RETRY_H. Results are matched by match_results (a
+    bare-event key counts, 2026-11-10); a key no target took is noted."""
     imm.load_election_dates_extra()
     imm.load_awards_dates_extra()
     imm.load_file_event_overrides()
+    matched, unmatched = match_results(res, due, targets)
     notes = []
     for k in due:
         r = rstate.setdefault(k, {})
         r["attempts"] = int(r.get("attempts") or 0) + 1
         r["last"] = r["seen"] = now_ts
-        got = res.get(k) or {}
-        status, note = got.get("status"), got.get("note") or ""
+        got = matched.get(k) or {}
+        status = str(got.get("status") or "").strip().lower().replace("judgement", "judgment")
+        note = str(got.get("note") or "")
         if status not in ("written", "judgment", "unresolved"):
             if target_fixed(targets[k]):
                 status, note = "written", "row in place after the run (no result line)"
@@ -1623,6 +1670,9 @@ def apply_results(rstate: Dict[str, dict], due: List[str], targets: Dict[str, di
                 status, note = "error", (err or "no result line for this target")
         r["status"], r["note"] = status, note[:300]
         notes.append(f"{k}: {status} -- {r['note']}")
+    if unmatched:
+        notes.append(f"research: RESULT_JSON keys that matched no target: "
+                     f"{', '.join(map(str, unmatched[:8]))}")
     return notes
 
 

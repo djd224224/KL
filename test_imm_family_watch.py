@@ -899,6 +899,88 @@ class TestResearchResilience(unittest.TestCase):
         self.assertEqual(back["gap:KXOBAMARALLY-26NOV03"]["seen"], t + 7200)
 
 
+class TestResearchResultKeys(unittest.TestCase):
+    """Jack 2026-11-10: "Yes, fix it" -- the run keys its RESULT_JSON by the
+    bare event, so every verdict since 11/09 17:53Z went unread and judgment
+    calls were filed "error -- no result line" until their tries ran out."""
+
+    # the tail of the 2026-11-10 probe run (the watch's own prompt, no Bash)
+    PROBE = ('Both targets are "announcement" markets ... No command needed.\n\n'
+             'RESULT_JSON: {"KXPRESRUNFIRSTR-28": {"status": "judgment", "note": '
+             '"Market resolves on an announcement of a 2028 run, not a vote"}, '
+             '"KXPRESRUNFIRSTD-28": {"status": "judgment", "note": "Market resolves on '
+             'an announcement of a 2028 run, not a vote"}}')
+
+    @staticmethod
+    def T(*pairs):
+        kind = {"gap": "election"}                 # research_targets' key -> kind
+        return {k: {"kind": kind.get(k.split(":", 1)[0], k.split(":", 1)[0]), "event": ev,
+                    "series": ev.split("-")[0], "msg": "m"} for k, ev in pairs}
+
+    def apply(self, due, targets, res):
+        rstate = {}
+        with mock.patch.object(fw.imm, "election_cutoff_utc", lambda ev, market=None: None), \
+                mock.patch.object(fw.imm, "election_term_end_row", lambda ev: None), \
+                mock.patch.object(fw.imm, "EVENT_START_OVERRIDES", {}), \
+                mock.patch.object(fw.imm, "load_election_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_awards_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_file_event_overrides", lambda: 0):
+            notes = fw.apply_results(rstate, due, targets, res, "", 1.0)
+        return rstate, notes
+
+    def test_the_probe_runs_bare_event_keys_are_read(self):
+        targets = {f"gap:{ev}": {"kind": "election", "event": ev, "series": ev.split("-")[0],
+                                 "msg": "m"} for ev in ("KXPRESRUNFIRSTR-28", "KXPRESRUNFIRSTD-28")}
+        rstate, notes = self.apply(list(targets), targets, fw.parse_research(self.PROBE))
+        for k in targets:
+            self.assertEqual(rstate[k]["status"], "judgment", k)
+            self.assertIn("not a vote", rstate[k]["note"])
+        self.assertFalse([n for n in notes if "matched no target" in n])
+        # a judgment is never retried; the old "error" came back every 30 min
+        self.assertEqual(fw.research_due(rstate, targets, 1.0 + 86400), [])
+
+    def test_the_full_key_still_wins(self):
+        targets = self.T(("gap:KXA-26NOV03", "KXA-26NOV03"))
+        res = {"KXA-26NOV03": {"status": "unresolved", "note": "bare"},
+               "gap:KXA-26NOV03": {"status": "judgment", "note": "full"}}
+        rstate, notes = self.apply(list(targets), targets, res)
+        self.assertEqual(rstate["gap:KXA-26NOV03"]["note"], "full")
+        self.assertIn("research: RESULT_JSON keys that matched no target: KXA-26NOV03", notes)
+
+    def test_a_shared_event_needs_its_full_key(self):
+        # two targets on one event: the bare event is ambiguous, so neither takes it
+        targets = self.T(("gap:KXB-26NOV03", "KXB-26NOV03"), ("start:KXB-26NOV03", "KXB-26NOV03"))
+        rstate, notes = self.apply(list(targets), targets,
+                                   {"KXB-26NOV03": {"status": "judgment", "note": "?"}})
+        self.assertEqual({r["status"] for r in rstate.values()}, {"error"})
+        self.assertIn("research: RESULT_JSON keys that matched no target: KXB-26NOV03", notes)
+        rstate, _ = self.apply(list(targets), targets,
+                               {"start:KXB-26NOV03": {"status": "unresolved", "note": "s"}})
+        self.assertEqual(rstate["start:KXB-26NOV03"]["status"], "unresolved")
+        self.assertEqual(rstate["gap:KXB-26NOV03"]["status"], "error")
+
+    def test_case_the_key_label_and_judgement_spelling(self):
+        targets = self.T(("gap:KXC-26NOV03", "KXC-26NOV03"))
+        rstate, _ = self.apply(list(targets), targets,
+                               {" KEY gap:kxc-26nov03 ": {"status": "Judgement", "note": "n"}})
+        self.assertEqual(rstate["gap:KXC-26NOV03"]["status"], "judgment")
+
+    def test_a_recheck_answers_to_its_glob(self):
+        key = "recheck:KXJAPANHOUSE-30FEB07:2026-11-01"
+        targets = {key: {"kind": "recheck", "event": "KXJAPANHOUSE-30FEB07",
+                         "series": "KXJAPANHOUSE", "checked": 1.0, "msg": "m"}}
+        rstate, _ = self.apply([key], targets,
+                               {"KXJAPANHOUSE-30FEB07": {"status": "unresolved", "note": "u"}})
+        self.assertEqual(rstate[key]["status"], "unresolved")
+
+    def test_an_unknown_key_is_noted_and_the_target_errors(self):
+        targets = self.T(("gap:KXD-26NOV03", "KXD-26NOV03"))
+        rstate, notes = self.apply(list(targets), targets,
+                                   {"KXZZZ-26NOV03": {"status": "judgment", "note": "?"}})
+        self.assertEqual(rstate["gap:KXD-26NOV03"]["status"], "error")
+        self.assertIn("research: RESULT_JSON keys that matched no target: KXZZZ-26NOV03", notes)
+
+
 if __name__ == "__main__":
     unittest.main()
 
