@@ -35119,6 +35119,203 @@ class TestOpenRouterFairLead(unittest.TestCase):
         self.assertEqual(bot._fair_model_rungs(self.T, now), set())
 
 
+class TestBookLead(unittest.TestCase):
+    """Jack 2026-11-10: "build it live", after "are you casting a wide net? and
+    shouldnt the criteria be that there are wide enough ranges and it's a
+    relatively quiet book?" -- BOOK LEAD: a wide (10c+ usual spread), quiet
+    (<= 200 traded in 24h) book 48h+ from its decision leads like a fair lead
+    off the middle of its 6h usual EXTERNAL touch."""
+
+    T, S = "KXGOOD-99DEC31-A", "KXGOOD"
+    # 5 bid at 20c ahead of a 3,000 wall at 10c; 5 offered at 80c (NO 20c)
+    # ahead of 3,000 at 90c (NO 10c): a 20x80 book
+    YES = [[10, 3000], [20, 5]]
+    NO = [[10, 3000], [20, 5]]
+
+    def setUp(self):
+        _clean_persist()
+        self._reset()
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                  mock.patch.object(imm, "BOOK_LEAD_MODE", "on")):
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._reset)
+
+    def _reset(self):
+        imm._book_lead.update(usual={}, info={}, comp=frozenset(), loaded=True, saved_at=0.0)
+        try:
+            os.remove(imm.book_lead_path())
+        except FileNotFoundError:
+            pass
+
+    def _seed(self, now, bid=20.0, ask=80.0, n=4, t=None):
+        imm._book_lead["usual"][t or self.T] = [
+            [now - 900.0 * (n - i), bid, ask] for i in range(n)]
+
+    def _note(self, now, vol24=50.0, hours=30 * 24, t=None, series=None):
+        imm.book_lead_note_market(t or self.T, series or self.S, vol24,
+                                  None if hours is None else now + hours * 3600.0)
+
+    def test_the_anchor_and_who_may_book_lead(self):
+        now = time.time()
+        self._note(now)
+        self._seed(now)
+        self.assertAlmostEqual(imm.book_lead_anchor(self.T, self.S, now), 50.0)
+        self.assertAlmostEqual(imm.fair_lead_fair_c(self.T, self.S, now), 50.0)
+        # too few samples, a narrow usual spread
+        self._seed(now, n=3)
+        self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        self._seed(now, bid=45.0, ask=54.0)
+        self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        self._seed(now, bid=45.0, ask=55.0)
+        self.assertAlmostEqual(imm.book_lead_anchor(self.T, self.S, now), 50.0)
+        self._seed(now)
+        # the quiet test (Kalshi's 24h volume) and the time to the decision
+        for vol in (None, 201.0):
+            self._note(now, vol24=vol)
+            self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        self._note(now, vol24=200.0)
+        self.assertIsNotNone(imm.book_lead_anchor(self.T, self.S, now))
+        self._note(now, hours=47.5)
+        self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        self._note(now, hours=None)                      # no decision known
+        self.assertIsNotNone(imm.book_lead_anchor(self.T, self.S, now))
+        self._note(now, hours=100)
+        self.assertIsNotNone(imm.book_lead_anchor(self.T, self.S, now))
+        with mock.patch.object(imm, "awards_extra_series", return_value=True):
+            self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))    # awards: a week
+        self._note(now)
+        self.assertIsNone(imm.book_lead_anchor(self.T, "X", time.time() + 10 ** 9))
+        # never: off, a model family, siblings, a listed wave / cheap market,
+        # lead-off and skip series
+        for patch in (("BOOK_LEAD_MODE", "off"), ("FAIR_LEAD_MODE", "off"),
+                      ("LADDER_MODE", "offsets"), ("LEAD_OFF_SERIES", ("KXGOOD",)),
+                      ("BOOK_LEAD_SKIP_SERIES", ("KXGO",))):
+            with mock.patch.object(imm, patch[0], patch[1]):
+                self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now), patch)
+        with mock.patch.object(imm, "FAIR_LEAD_MODE", "dry"):
+            self.assertIsNotNone(imm.book_lead_anchor(self.T, self.S, now))
+        with mock.patch.object(imm, "in_fair_lead_series", return_value=True):
+            self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        imm.book_lead_set_comp([self.T])
+        self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        imm.book_lead_set_comp([])
+        with mock.patch.dict(imm.PVD_MARKETS, {self.T: {"cheap": {"side": "yes", "px": 1}}}):
+            self.assertIsNone(imm.book_lead_anchor(self.T, self.S, now))
+        self.assertIsNotNone(imm.book_lead_anchor(self.T, self.S, now))
+        self.assertIsNone(imm.book_lead_anchor("KXGOOD-99DEC31-Z", self.S, now))   # no info
+
+    def test_sampling_every_15_minutes_and_the_saved_history(self):
+        now = float(int(time.time()))        # (a sample's time is stored rounded)
+        self._note(now)
+        imm.book_lead_sample(self.T, self.S, 20.0, 80.0, now)
+        imm.book_lead_sample(self.T, self.S, 30.0, 70.0, now + 600)     # inside 15 min
+        imm.book_lead_sample(self.T, self.S, 22.0, 78.0, now + 900)
+        self.assertEqual([s[1:] for s in imm._book_lead["usual"][self.T]],
+                         [[20.0, 80.0], [22.0, 78.0]])
+        imm.book_lead_sample("KXGOOD-99DEC31-Z", self.S, 20.0, 80.0, now)  # no info: none
+        self.assertNotIn("KXGOOD-99DEC31-Z", imm._book_lead["usual"])
+        # a restart reads the saved history back
+        imm.book_lead_save(now + 900, force=True)
+        imm._book_lead.update(usual={}, loaded=False)
+        self.assertEqual(len(imm._book_lead["usual"].get(self.T, [])), 0)
+        imm.book_lead_usual(self.T, now + 900)
+        self.assertEqual(len(imm._book_lead["usual"][self.T]), 2)
+        # a save before anything was read keeps the saved history
+        imm._book_lead.update(usual={}, loaded=False, saved_at=0.0)
+        imm.book_lead_save(now + 1000)
+        with open(imm.book_lead_path(), encoding="utf-8") as f:
+            self.assertIn(self.T, json.load(f)["usual"])
+        # ...and drops samples older than the window
+        imm.book_lead_save(now + 900 + imm.BOOK_LEAD_USUAL_HOURS * 3600 + 1, force=True)
+        self.assertNotIn(self.T, imm._book_lead["usual"])
+
+    def test_the_leads_on_a_wide_book(self):
+        # the 50c usual middle caps the bid at 45c and the ask at 55c; 200 a
+        # tick ahead of each thin touch takes ~98% of its side
+        self.assertEqual(imm.fair_lead_group(self.YES, self.NO, 50.0, 1000.0, 0.5),
+                         ((21, 45, 20), (79, 55, 80)))
+        # a bait bid jumps the book to 62c, 12c past the anchor: the guard
+        # stands the bid lead down; the ask leads only 10c+ over that bid
+        jumped = self.YES + [[62, 200]]
+        lb, la = imm.fair_lead_group(jumped, self.NO, 50.0, 1000.0, 0.5)
+        self.assertIsNone(lb)
+        self.assertEqual(la[0], 79)
+
+    def _meta(self, close_days=30.0):
+        return imm.MarketMeta(ticker=self.T, event_ticker="KXGOOD-99DEC31", series=self.S,
+                              dollars_per_day=14.29, program_end=None, target_size=1000.0,
+                              discount_factor=0.5, cutoff=None,
+                              close_time=datetime.now(timezone.utc) + timedelta(days=close_days),
+                              mid_cents=50.0, spread_cents=60, volume=150.0)
+
+    def test_the_lead_source_model_then_siblings_then_book(self):
+        now = time.time()
+        self._note(now)
+        self._seed(now)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(bot._lead_source(self._meta()), "fair")
+        with mock.patch.object(imm, "COMP_LEAD_MODE", "on"):
+            bot._comp_groups = {self.T: (self.T, "KXGOOD-99DEC31-B")}
+            self.assertEqual(bot._lead_source(self._meta()), "comp")
+            bot._comp_groups = {}
+        # the LEAD STOP still applies
+        self.assertIsNone(bot._lead_source(self._meta(close_days=0.5)))
+
+    def _book(self, yes=None, no=None):
+        return {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in (yes or self.YES)],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in (no or self.NO)]}}
+
+    def _cycle(self, vol24="50.00", seed=True):
+        client = FakeClient()
+        client.markets[self.T].update(yes_bid_dollars="0.2000", yes_ask_dollars="0.8000",
+                                      volume_24h_fp=vol24)
+        client.books[self.T] = self._book()
+        if seed:
+            self._seed(time.time())
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {(o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                 for o in bot.state.sim_orders.values()
+                 if o["ticker"] == self.T
+                 and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+        return bot, rungs, lines
+
+    def test_the_quote_loop_book_leads_with_200(self):
+        bot, rungs, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertIn(("bid", 21, 200), rungs, lines[-30:])
+        self.assertIn(("ask", 79, 200), rungs)
+        self.assertEqual(bot._comp_lead_px.get(self.T), (21, 79, 200))
+        self.assertTrue(any("fair lead KXGOOD-99DEC31-A bid: 200 @ 21c, ahead of its own 20c; "
+                            "the book's 6h usual price implies 50c" in s for s in lines),
+                        [s for s in lines if "lead" in s])
+        self.assertAlmostEqual(imm._book_lead["info"][self.T][0], 50.0)
+        # the lead rungs are judged against the anchor by the WS fast cancel
+        self.assertEqual(bot._fair_model_rungs(self.T, time.time()),
+                         {("bid", 21), ("ask", 79)})
+
+    def test_a_busy_book_or_no_history_leads_nothing(self):
+        for kw in ({"vol24": "500.00"}, {"seed": False}):
+            self._reset()
+            bot, rungs, lines = self._cycle(**kw)
+            self.assertFalse(any(r[2] == 200 for r in rungs), (kw, rungs))
+            self.assertFalse(any("fair lead KXGOOD" in s for s in lines), kw)
+        # (the cycle sampled the touch: the history builds from there)
+        self.assertEqual(imm._book_lead["usual"][self.T][-1][1:], [20.0, 80.0])
+
+
 class TestLeadStop(unittest.TestCase):
     """Jack 2026-11-01: "stop Vercel leading 24 hours before the measured
     day. Rain leads stop leading 24 hours before the measured day. keep this

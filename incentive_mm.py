@@ -24705,10 +24705,162 @@ def fair_model_label(series: str) -> str:
 
 
 def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
-    """The fair (YES cents) `ticker` leads off, or None (fair_model_c)."""
+    """The fair (YES cents) `ticker` leads off, or None: its family's model
+    (fair_model_c) on a FAIR_LEAD_SERIES market, else its BOOK LEAD anchor."""
     if not fair_lead_series(series):
-        return None
+        return book_lead_anchor(ticker, series, now_ts)
     return fair_model_c(ticker, series, now_ts)
+
+
+# BOOK LEAD (Jack 2026-11-10: "build it live", after "are you casting a wide
+# net? and shouldnt the criteria be that there are wide enough ranges and it's
+# a relatively quiet book?"). A FAIR LEAD with no model: on a WIDE, QUIET book
+# a side leads off the book's own slow middle -- the median of its EXTERNAL
+# touch over the last BOOK_LEAD_USUAL_HOURS (pvd_usual_sample / pvd_usual_px,
+# our own orders netted out, so a lead never moves its own anchor) -- with
+# everything a fair lead has: one target/5 rung at the cheapest price ahead of
+# the side's external best that takes COMP_LEAD_SHARE of it, at least
+# FAIR_LEAD_MARGIN_C (5c) inside the anchor; hold-always; the disagreement
+# guard (no lead while the live touch sits FAIR_LEAD_MAX_GAP_C past the
+# anchor: a bait order that jumps the book stands the lead down rather than
+# dragging it); the admission estimate; a side holding FAIR_LEAD_MAX_POSITION
+# leads no more; LEAD STOP; the WS fast cancel judging it against the
+# anchor. No FAIR CLOSE and no LEAD INVENTORY zone (no model prices an
+# unwind): a filled lead's position quotes and skews as usual.
+# A market book-leads only while: its 24h volume is BOOK_LEAD_MAX_VOL24 or
+# less (Kalshi's volume_24h at the universe refresh), its usual spread is
+# BOOK_LEAD_MIN_SPREAD_C or more, its decision (lead_decision_ts) is
+# BOOK_LEAD_MIN_HOURS or more away (an awards-tag series BOOK_LEAD_AWARDS_MIN_
+# HOURS: announcements), and its touch has BOOK_LEAD_MIN_N samples. Never on
+# a series with its own model fair (FAIR_LEAD_SERIES: it leads off the
+# model), a complement-led market (a mutually exclusive group or threshold
+# ladder: its siblings price it), a listed wave / cheap-side market, or
+# LEAD_OFF_SERIES / BOOK_LEAD_SKIP_SERIES. The scan behind it (11/10 13:55Z,
+# 4,175 program books): 529 books 10c+ wide with <= 200 traded in 24h and
+# 24h+ to close, $6.3k/day of pools, the bot earning $100/day there; a lead
+# fit 292 of them, +$2.6k/day before anyone reacts (~$1.85k without
+# KXYTVIEWSHIGH, kept out by the live-source screen). The bot's own fills in
+# such books 10/27-11/10 marked -12.95c/contract at the 11/10 mids (74 fills)
+# against -2.81c elsewhere: the leads' fills are the risk this pays for.
+# Logs: `fair lead <t> bid: 200 @ 27c, ahead of its own 20c; the book's 6h
+# usual price implies 45c` (the leads email counts them as fair leads).
+# IMM_BOOK_LEAD=off turns it off (the history keeps sampling).
+BOOK_LEAD_MODE = os.environ.get("IMM_BOOK_LEAD", "on").strip().lower()
+BOOK_LEAD_MIN_SPREAD_C = _env_float("IMM_BOOK_LEAD_MIN_SPREAD_C", 10.0)
+BOOK_LEAD_MAX_VOL24 = _env_float("IMM_BOOK_LEAD_MAX_VOL24", 200.0)
+BOOK_LEAD_MIN_HOURS = _env_float("IMM_BOOK_LEAD_MIN_HOURS", 48.0)
+BOOK_LEAD_AWARDS_MIN_HOURS = _env_float("IMM_BOOK_LEAD_AWARDS_MIN_HOURS", 168.0)
+BOOK_LEAD_USUAL_HOURS = _env_float("IMM_BOOK_LEAD_USUAL_HOURS", 6.0)
+BOOK_LEAD_SAMPLE_S = _env_float("IMM_BOOK_LEAD_SAMPLE_S", 900.0)
+BOOK_LEAD_MIN_N = int(_env_float("IMM_BOOK_LEAD_MIN_N", 4))
+BOOK_LEAD_SKIP_SERIES: Tuple[str, ...] = tuple(
+    s.strip() for s in os.environ.get("IMM_BOOK_LEAD_SKIP_SERIES", "").split(",") if s.strip())
+BOOK_LEAD_FILE = "book_lead_usual.json"          # in STATUS_DIR
+BOOK_LEAD_SAVE_S = 300.0
+# {"usual": {ticker: touch history}, "info": {ticker: (24h volume or None,
+# decision ts or None, series)}, "comp": complement-led tickers, ...}
+_book_lead: Dict[str, Any] = {"usual": {}, "info": {}, "comp": frozenset(),
+                              "loaded": False, "saved_at": 0.0}
+
+
+def book_lead_path() -> str:
+    return os.path.join(STATUS_DIR, BOOK_LEAD_FILE)
+
+
+def _book_lead_load() -> None:
+    """The touch histories from BOOK_LEAD_FILE, once (a restart keeps them)."""
+    if _book_lead["loaded"]:
+        return
+    _book_lead["loaded"] = True
+    try:
+        with open(book_lead_path(), encoding="utf-8") as f:
+            raw = json.load(f) or {}
+        _book_lead["usual"].update(pvd_usual_load(raw.get("usual") or {}))
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def book_lead_save(now_ts: float, force: bool = False) -> None:
+    """Write the touch histories (inside BOOK_LEAD_USUAL_HOURS) at most every
+    BOOK_LEAD_SAVE_S. Never raises."""
+    if not force and now_ts - _book_lead["saved_at"] < BOOK_LEAD_SAVE_S:
+        return
+    _book_lead_load()                 # never write over a history not yet read
+    _book_lead["saved_at"] = now_ts
+    cut = now_ts - BOOK_LEAD_USUAL_HOURS * 3600.0
+    keep: Dict[str, list] = {}
+    for t, h in list(_book_lead["usual"].items()):
+        h = [s for s in h if float(s[0]) >= cut]
+        if h:
+            keep[t] = h
+    _book_lead["usual"] = keep
+    path = book_lead_path()
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "usual": keep}, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def book_lead_note_market(ticker: str, series: str, vol24: Optional[float],
+                          decision_ts: Optional[float]) -> None:
+    """A market's 24h volume and decision time, as the universe refresh read
+    them."""
+    _book_lead["info"][ticker] = (vol24, decision_ts, series)
+
+
+def book_lead_set_comp(tickers) -> None:
+    """The complement-led markets (their siblings price them: no book lead)."""
+    _book_lead["comp"] = frozenset(tickers)
+
+
+def _book_lead_static_ok(ticker: str, series: str, now_ts: float) -> bool:
+    """Everything but the touch: the switch, the series, the lists, the 24h
+    volume and the time to the decision."""
+    if BOOK_LEAD_MODE != "on" or FAIR_LEAD_MODE not in ("on", "dry") or LADDER_MODE != "atref":
+        return False
+    if in_fair_lead_series(series) or series.startswith(LEAD_OFF_SERIES) \
+            or (BOOK_LEAD_SKIP_SERIES and series.startswith(BOOK_LEAD_SKIP_SERIES)):
+        return False
+    if ticker in _book_lead["comp"] or PVD_MARKETS.get(ticker) is not None:
+        return False
+    info = _book_lead["info"].get(ticker)
+    if info is None or info[0] is None or info[0] > BOOK_LEAD_MAX_VOL24:
+        return False
+    need_h = BOOK_LEAD_AWARDS_MIN_HOURS if awards_extra_series(series) else BOOK_LEAD_MIN_HOURS
+    return info[1] is None or info[1] - now_ts >= need_h * 3600.0
+
+
+def book_lead_sample(ticker: str, series: str, ext_bid: Optional[float],
+                     ext_ask: Optional[float], now_ts: float) -> None:
+    """One more sample of a book-lead-able market's EXTERNAL touch (at most
+    every BOOK_LEAD_SAMPLE_S)."""
+    if not _book_lead_static_ok(ticker, series, now_ts):
+        return
+    _book_lead_load()
+    _book_lead["usual"][ticker] = pvd_usual_sample(
+        _book_lead["usual"].get(ticker), now_ts, ext_bid, ext_ask,
+        every=BOOK_LEAD_SAMPLE_S, hours=BOOK_LEAD_USUAL_HOURS)
+
+
+def book_lead_usual(ticker: str, now_ts: float) -> Tuple[Optional[float], Optional[float]]:
+    """(usual bid, usual ask) of a market's external touch, else Nones."""
+    _book_lead_load()
+    return pvd_usual_px(_book_lead["usual"].get(ticker), now_ts,
+                        hours=BOOK_LEAD_USUAL_HOURS, min_n=BOOK_LEAD_MIN_N)
+
+
+def book_lead_anchor(ticker: str, series: str, now_ts: float) -> Optional[float]:
+    """BOOK LEAD: the middle of `ticker`'s usual external touch (YES cents)
+    while it may book-lead (wide, quiet, far from its decision, no model or
+    siblings to price it), else None."""
+    if not _book_lead_static_ok(ticker, series, now_ts):
+        return None
+    ub, ua = book_lead_usual(ticker, now_ts)
+    if ub is None or ua is None or ua - ub < BOOK_LEAD_MIN_SPREAD_C - 1e-9:
+        return None
+    return (ub + ua) / 2.0
 
 
 def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
@@ -29030,6 +29182,8 @@ class IncentiveMarketMaker:
             return set()
         series = series_of(t)
         fair = fair_model_c(t, series, now_ts)
+        if fair is None:
+            fair = book_lead_anchor(t, series, now_ts)      # BOOK LEAD
         if fair is None or fair_lead_blackout(series, now_ts):
             return set()
         cands: List[Tuple[str, Optional[int]]] = []
@@ -32453,6 +32607,11 @@ class IncentiveMarketMaker:
                 volume = float(m.get("volume_fp") or m.get("volume") or 0)
             except (TypeError, ValueError):
                 volume = 0.0
+            try:
+                _v24 = m.get("volume_24h_fp", m.get("volume_24h"))
+                vol24 = None if _v24 is None else float(_v24)
+            except (TypeError, ValueError):
+                vol24 = None
             # the pool over the window Kalshi will pay (trimmed_pool_rate)
             _dpd, _pool_end = trimmed_pool_rate(
                 series, event_ticker, info["dollars_per_day"],
@@ -32480,6 +32639,10 @@ class IncentiveMarketMaker:
                 open_time=parse_iso_utc(m.get("open_time", "")),
                 program_start=info.get("start"),
                 price_step=market_price_step(m))
+            # BOOK LEAD: the quiet test (its own copy of Kalshi's 24h volume:
+            # meta.volume_24h stays as the callers that set it leave it) and
+            # the time to the decision
+            book_lead_note_market(t, series, vol24, lead_decision_ts(meta))
             if _pool_end is not None:
                 meta.pool_listed_per_day = info["dollars_per_day"]
                 meta.pool_end_eff = _pool_end
@@ -33826,6 +33989,9 @@ class IncentiveMarketMaker:
         self._comp_groups = groups
         self._comp_pairs = pairs
         self._ladders = ladders
+        # BOOK LEAD: a market its siblings price leads off them, never its book
+        book_lead_set_comp(t for t in set(groups) | set(ladders)
+                           if comp_lead_series(series_of(t)))
 
     def _comp_linked(self, t: str) -> bool:
         """Does another market's book price `t` (a mutually exclusive group
@@ -33845,10 +34011,16 @@ class IncentiveMarketMaker:
             return None
         if stop and lead_stop_due(meta, time.time()):
             return None
-        if fair_lead_fair_c(meta.ticker, meta.series, time.time()) is not None:
-            return "fair"
+        now_ts = time.time()
+        if fair_lead_series(meta.series):
+            if fair_model_c(meta.ticker, meta.series, now_ts) is not None:
+                return "fair"
         if self._comp_linked(meta.ticker) and comp_lead_series(meta.series):
             return "comp"
+        # BOOK LEAD: a wide, quiet book leads off its own usual middle
+        if not fair_lead_series(meta.series) and \
+                book_lead_anchor(meta.ticker, meta.series, now_ts) is not None:
+            return "fair"
         return None
 
     def _comp_books(self, tickers) -> List[Tuple[str, List[List[float]], List[List[float]]]]:
@@ -33995,7 +34167,9 @@ class IncentiveMarketMaker:
         who, verb = ((f"{self._comp_pairs[t]}'s book", "implies") if t in self._comp_pairs
                      else (f"its {max(len(grp) - 1, 0)} siblings' books", "imply"))
         if src == "fair":
-            who, verb = fair_model_label(series_of(t)), "implies"
+            _fs = series_of(t)
+            who, verb = (fair_model_label(_fs) if in_fair_lead_series(_fs)
+                         else "the book's 6h usual price"), "implies"
         for side, lead in (("bid", lead_b), ("ask", lead_a)):
             if src != "fair" and not grp and t in self._ladders:
                 who, verb = (("its harder strikes' books", "imply") if side == "bid"
@@ -35555,6 +35729,12 @@ class IncentiveMarketMaker:
         # is admitted when its lead clears it
         _leads: Tuple[Optional[Tuple[int, int, int]],
                       Optional[Tuple[int, int, int]]] = (None, None)
+        # BOOK LEAD: one more sample of the external touch (every candidate,
+        # so a market's usual price is there when it could lead)
+        if BOOK_LEAD_MODE == "on":
+            _bl_b, _bl_a = (external_best(yes_levels, no_levels, own_live)
+                            if own_live else (ext_b, ext_a))
+            book_lead_sample(meta.ticker, meta.series, _bl_b, _bl_a, time.time())
         _lsrc = self._lead_source(meta)
         if _lsrc is not None and lead_mode(_lsrc) == "on":
             _lx_yes, _lx_no = (external_levels(yes_levels, no_levels, own_live)
@@ -37667,6 +37847,9 @@ class IncentiveMarketMaker:
             own_in_book = own if self.live else []
             ext_bid, ext_ask = external_best(yes_levels, no_levels, own_in_book)
             touch_map[t] = (ext_bid, ext_ask)
+            # BOOK LEAD: the usual price's sample (at most every 15 min)
+            if BOOK_LEAD_MODE == "on":
+                book_lead_sample(t, meta.series, ext_bid, ext_ask, now_ts)
 
             # LIVE-EVENT DEPTH GATE (Jack 2026-08-31, TRUMPMENTION /
             # MAMDANIMENTION — see EVENT_DEPTH_GATE_PREFIXES): a thin
@@ -43633,6 +43816,8 @@ class IncentiveMarketMaker:
                 now_utc = datetime.now(timezone.utc)
                 # (the daily roll runs at the top of run_cycle, before the halts)
                 self.write_status(now_utc)
+                if BOOK_LEAD_MODE == "on":
+                    book_lead_save(now_utc.timestamp())     # BOOK LEAD's usual prices
                 # ...or during the cycle that just ran (RESTART_REQUEST_FILE)
                 if not once and not stopping["flag"] and self._restart_requested():
                     break
