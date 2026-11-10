@@ -33,7 +33,7 @@ Every row carries `run_id` and `config_hash`.
 | `orders_*.jsonl` | per order event | fill rate, queue position, ladder shape, churn |
 | `settlements_*.jsonl` | per settlement | where the P&L actually lands |
 | `realized_*.jsonl` | per P&L change | per-market rent vs risk |
-| `marks_*.jsonl` | 5 min, open positions | mark-out, MTM history |
+| `marks_*.jsonl` | 5 min, open positions | mark-out (`mark_cents`), MTM history (`last_cents`: Kalshi's last trade, the dashboard's valuation from 2026-11-10; also on rows 02:18-02:31Z 10/30, unused) |
 | `selection_events_*.jsonl` | on decision change | why market X was not quoted |
 | `selection_snapshot_*.jsonl` | hourly, all candidates | the counterfactual |
 | `config_history_*.jsonl` | per run | which config produced which rows |
