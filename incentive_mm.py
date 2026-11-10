@@ -3401,6 +3401,10 @@ def event_cap_contracts(event_ticker: str) -> float:
     # (2026-10-15): the ladders' / escalators' event cap
     if nfl_auto_entry(series) is not None or league_auto_entry(series) is not None:
         return MAX_EVENT_CONTRACTS * applied_mention_mult("KXNFLLADDERREC")
+    # Rotten Tomatoes (Jack 2026-11-10: "increase per-event cap to 5k"):
+    # RT_EVENT_CAP net per film event, in place of 1,000 x the family's x3
+    if series == "KXRT" and globals().get("RT_EVENT_CAP", 0) > 0:
+        return globals()["RT_EVENT_CAP"]
     # a family that leads off its fair (2026-10-29, FAIR LEAD): room for the
     # leads, which take first call on it, beside the other markets' rungs --
     # FAIR_LEAD_EVENT_PER_MARKET for each of the event's programmed markets
@@ -14188,6 +14192,7 @@ _CONFIG_CODE_KNOBS = (
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",
+    "RT_EVENT_CAP",               # KXRT's 5,000 a film event (2026-11-10)
     # ...and the eight fill-free graduates x2 (FAMILY_X2_1022)
     "SMALL_BOOKS_SIZE_MULT", "SMALL_BOOKS_X2_SERIES",
     # ...and KXSOFTWAREUNEMP's x3 ladder at the 150 cap (2026-10-25)
@@ -21599,6 +21604,16 @@ SERIES_OVERRIDES["KXGRAMMYNOM"] = replace(SERIES_OVERRIDES["KXGRAMMYNOM"],
 # email suggested" -- up on 7 of 7 days, +$234 over the 7 and +$915 over 30
 # days' earning days, ~+$3/day at x1.5); out of the size test, below.
 RT_SIZE_MULT = _env_float("IMM_RT_SIZE_MULT", 3.0)
+# KXRT EVENT CAP 5,000 (Jack 2026-11-10: "increase per-event cap to 5k and let
+# me know the impact"), after KXRT-FOC-75's 270 ask rested 249: the
+# Focker-In-Law event, net short 1,362, had 1,638 of its 3,000 left for new
+# sells, split across seven strikes. A film event's net cap is RT_EVENT_CAP
+# (event_cap_contracts) instead of IMM_MAX_EVENT x the family's x3 = 3,000;
+# the 450 per-market cap and the 90 / 180 skew knees stay. Cycle logs
+# 11/08-11/10: the 3,000 pinched asks only -- FOC ~5h, HUN ~4h, EBE under 1h
+# a day -- ~66 contracts more resting on the day's average, ~+$1/day of
+# rewards. 0 = back to 3,000 (env => task-level restart).
+RT_EVENT_CAP = _env_float("IMM_RT_EVENT_CAP", 5000.0)
 ENDORSE_SIZE_MULT = _env_float("IMM_ENDORSE_SIZE_MULT", 2.0)
 SHIPPING_SIZE_MULT = _env_float("IMM_SHIPPING_SIZE_MULT", 2.0)
 AIADOPT_SIZE_MULT = _env_float("IMM_AIADOPT_SIZE_MULT", 2.0)
@@ -43236,6 +43251,14 @@ class IncentiveMarketMaker:
                f"its position cap raised to that; the event cap and the skew stay"
                if RT_LOCKED_MODE == "on" and RT_SETTLED_MODE == "on" and RT_LOCKED_SIDE > 0
                else "off"))
+        _rt_ev_base = MAX_EVENT_CONTRACTS * applied_mention_mult("KXRT")
+        log("rt event cap (2026-11-10): "
+            + (f"{RT_EVENT_CAP:,.0f} net contracts a KXRT film event (the family's "
+               f"{MAX_EVENT_CONTRACTS:g} x{applied_mention_mult('KXRT'):g} = {_rt_ev_base:,.0f} "
+               f"before); the per-market cap and the skew knees stay"
+               if RT_EVENT_CAP > 0 else
+               f"off -- {_rt_ev_base:,.0f} a film event ({MAX_EVENT_CONTRACTS:g} "
+               f"x{applied_mention_mult('KXRT'):g})"))
         log("lead stop (2026-11-01): "
             + (f"no lead of either kind from {LEAD_STOP_BEFORE_H:g}h before a market's "
                f"decision -- a Vercel market's measured UTC day, else its cutoff (rain: "

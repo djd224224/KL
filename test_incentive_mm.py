@@ -15575,9 +15575,10 @@ class TestRtLockedSize(unittest.TestCase):
         self.assertEqual(self._sizes(bot).get("bid"), 500)
 
     def test_it_has_first_call_on_the_event_room(self):
-        # four strikes share a 750 event cap (250 x3): split evenly, the
-        # locked one would rest 187; it takes its 500 first, and the event
-        # cap still bounds the event (the siblings share the 250 left)
+        # four strikes share a 750 event cap (RT_EVENT_CAP patched down from
+        # its 5,000): split evenly, the locked one would rest 187; it takes
+        # its 500 first, and the event cap still bounds the event (the
+        # siblings share the 250 left)
         self._write()
         bot = self._bot()
         for k in (88, 90, 92):
@@ -15591,7 +15592,7 @@ class TestRtLockedSize(unittest.TestCase):
             bot.client.books[sib] = {"orderbook_fp": {    # 50x51
                 "yes_dollars": [["0.49", "3000"], ["0.50", "300"]],
                 "no_dollars": [["0.48", "3000"], ["0.49", "300"]]}}
-        with mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 250.0):
+        with mock.patch.object(imm, "RT_EVENT_CAP", 750.0):
             lines = self._run(bot)
         self.assertEqual(self._sizes(bot), {"bid": 500, "ask": 500}, lines)
         bids = sum(int(o["remaining_count"]) for o in bot.state.sim_orders.values()
@@ -15609,6 +15610,32 @@ class TestRtLockedSize(unittest.TestCase):
         bot = self._bot()
         self._run(bot)
         self.assertGreater(bot._est_peak[self.T][0], 1.05 * plain)
+
+
+class TestRtEventCap(unittest.TestCase):
+    """Jack 2026-11-10: "increase per-event cap to 5k and let me know the
+    impact" -- a KXRT film event's net cap is RT_EVENT_CAP (5,000) instead of
+    IMM_MAX_EVENT x the family's x3; every other series keeps its own, and
+    RT_EVENT_CAP 0 puts KXRT back on the family's"""
+
+    def test_a_film_event_takes_the_rt_event_cap(self):
+        self.assertEqual(imm.RT_EVENT_CAP, 5000.0)
+        self.assertEqual(imm.event_cap_contracts("KXRT-FOC"), 5000.0)
+        with mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0):
+            self.assertEqual(imm.event_cap_contracts("KXRT-FOC"), 5000.0)
+
+    def test_other_series_keep_their_cap(self):
+        for ev in ("KXRTTV-26NOV30", "KXHIGHNY-26NOV10", "KXTRUMPMENTION-26NOV11"):
+            s = ev.split("-")[0]
+            self.assertEqual(imm.event_cap_contracts(ev),
+                             imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult(s), ev)
+
+    def test_zero_turns_it_off(self):
+        with mock.patch.object(imm, "RT_EVENT_CAP", 0.0):
+            self.assertEqual(imm.event_cap_contracts("KXRT-FOC"),
+                             imm.MAX_EVENT_CONTRACTS * imm.applied_mention_mult("KXRT"))
+    # (the quote loop honouring it: TestRtLockedSize.test_it_has_first_call_on_
+    # the_event_room runs a film event under RT_EVENT_CAP patched to 750)
 
 
 class TestVercelFloorBoost(unittest.TestCase):
@@ -32984,8 +33011,10 @@ class TestFamilyX2Oct11(unittest.TestCase):
             self.assertEqual(imm.applied_mention_mult(s), m, s)
             self.assertEqual(imm.series_max_position(s),
                              m * imm.MAX_POSITION_CONTRACTS, s)
+            # (KXRT's event cap is its own RT_EVENT_CAP since 2026-11-10)
             self.assertEqual(imm.event_cap_contracts(s + "-26OCT"),
-                             m * imm.MAX_EVENT_CONTRACTS, s)
+                             imm.RT_EVENT_CAP if s == "KXRT"
+                             else m * imm.MAX_EVENT_CONTRACTS, s)
             self.assertFalse(imm.yield_size_eligible(s), s)    # no x1.5 on top
         base = imm.series_levels("KXRT")
         self.assertEqual(imm.base_scaled_levels("KXRT"),
