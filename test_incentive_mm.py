@@ -42198,6 +42198,106 @@ class TestCheapSideBooks(unittest.TestCase):
         q, _ = q_(0.2, [(99.7, 5000.0)], [(0.1, 9000.0), (0.2, 4.0)], side="no")
         self.assertEqual(X(q), ("ask", 100, 99.8, 5000))
 
+    def test_the_100_dollar_stop_and_its_unwind(self):
+        """Jack 2026-11-10: "if i already have $100 of exposure, stop quoting that
+        side. and try to unwind at breakeven or better" -- after 10,000
+        KXFRENCHPRES-27-GATT YES filled at 1c (03:04Z), the book then 0.5x0.7"""
+        ex = imm.cheap_exposure
+        self.assertAlmostEqual(ex("yes", 10000, 1.0, 0.6), 100.0)
+        self.assertAlmostEqual(ex("yes", 50000, 0.2, 0.2), 100.0)
+        self.assertAlmostEqual(ex("no", -5000, 98.0, 1), 100.0)       # NO at 2c
+        self.assertAlmostEqual(ex("yes", 4000, None, 1), 40.0)        # no average: the px
+        self.assertEqual(ex("yes", 0.0, None, 1), 0.0)
+        self.assertEqual(ex("yes", -300, 99.0, 1), 0.0)               # held on the other side
+        X = lambda q: None if q is None else (q.book_side, q.price_cents, q.price_exact, q.count)
+
+        def u(pos, avg, ye, ne, side="yes", step=0.001, eb=None, ea=None):
+            return imm.cheap_unwind_quote(self.T, side, pos, avg, [list(x) for x in ye],
+                                          [list(x) for x in ne], [], eb, ea, step=step)
+        gatt_y = [(0.5, 4400.0), (0.4, 44198.0)]
+        gatt_n = [(99.3, 10583.0), (99.2, 6705.0), (99.1, 400.0)]      # YES asks 0.7 / 0.8 / 0.9
+        q, info = u(10000, 1.0, gatt_y, gatt_n)
+        self.assertEqual(X(q), ("ask", 1, None, 10000))               # behind the 0.7 ask, at cost
+        self.assertEqual((info["best_bid"], info["best_ask"]), (0.5, 0.7))
+        # the book back over cost: it joins the best ask with real size (better than breakeven)
+        self.assertEqual(X(u(10000, 1.0, [(1.5, 3000.0)], [(98.4, 5000.0)])[0]),
+                         ("ask", 2, 1.6, 10000))
+        # ...a lot under UNWIND_NO_LEAD_MIN at 1.2c does not set the price
+        self.assertEqual(X(u(10000, 1.0, [(1.1, 3000.0)], [(98.8, 5.0), (98.4, 5000.0)])[0]),
+                         ("ask", 2, 1.6, 10000))
+        # no ask at all, the bid over cost: one tick over the bid, never crossing it
+        self.assertEqual(X(u(10000, 1.0, [(3.0, 500.0)], [])[0]), ("ask", 4, 3.1, 10000))
+        # the grid: a sub-penny average rounds UP to 0.1c on a sub-penny market, to the cent otherwise
+        self.assertEqual(X(u(50000, 0.23, [(0.1, 9000.0)], [(99.85, 5000.0)])[0]),
+                         ("ask", 1, 0.3, 50000))                    # (the 0.15c ask is under cost)
+        self.assertEqual(X(u(500, 41.62, [(30.0, 100.0)], [(65.0, 100.0)], step=0.01)[0]),
+                         ("ask", 42, None, 500))                    # (the 35c ask is under cost)
+        # holding NO (short YES at 99c): the YES bid at or under 99, joining a bid with size
+        self.assertEqual(X(u(-5000, 99.0, [(98.5, 3000.0)], [(0.4, 5000.0)], side="no")[0]),
+                         ("bid", 98, 98.5, 5000))
+        self.assertEqual(X(u(-5000, 99.0, [(99.5, 3000.0)], [(0.4, 5000.0)], side="no")[0]),
+                         ("bid", 99, None, 5000))                     # at cost, under the 99.5 bid
+        for args, why in (((0.0, 1.0), "flat"), ((10000, None), "no average")):
+            q, info = u(*args, gatt_y, gatt_n)
+            self.assertIsNone(q)
+            self.assertIn(why, info["why"])
+
+    def test_a_cheap_position_reserves_its_cost(self):
+        """The selection's inventory reserve: 50c a contract, but a cheap-side
+        position reserves its cost (50,000 at 0.2c is $100, not $25,000)"""
+        r = imm.inventory_reserve_usd
+        self.assertAlmostEqual(r("X-1", 50000, 0.2), 100.0)           # bought under 1c
+        self.assertAlmostEqual(r("X-1", -50000, 99.8), 100.0)         # NO bought at 0.2c
+        self.assertAlmostEqual(r("X-1", 10000, 1.0), 5000.0)          # 1c, not listed: as before
+        self.assertAlmostEqual(r("X-1", 200, 60.0), 100.0)
+        self.assertAlmostEqual(r("X-1", 200, None), 100.0)
+        self.assertEqual(r("X-1", 0.0, 1.0), 0.0)
+        self._write({self.T: {"side": "yes", "px": 1, "size": 10000}})
+        self.assertAlmostEqual(r(self.T, 10000, 1.0), 100.0)          # listed: at cost
+        self.assertAlmostEqual(r(self.T, -60, 2.0), 30.0)             # ...never over 50c
+
+    def test_dry_cycle_unwinds_at_the_100_dollar_stop(self):
+        """GATT after its fill: listed YES 0.6c x 1,667, the bot long 10,000 at
+        1c ($100): no bid; the whole 10,000 rests as a YES ask at 1c (behind the
+        0.7c ask); at $50 held the bid quotes as before"""
+        def gatt():
+            c = self._long_shot(FakeClient(), yes=(("0.0050", "4400"), ("0.0040", "44198")),
+                                no=(("0.9930", "10583"), ("0.9920", "6705")))
+            c.markets[self.T].update(yes_bid_dollars="0.0050", yes_ask_dollars="0.0070",
+                                     price_ranges=[{"start": "0.0000", "end": "1.0000",
+                                                    "step": "0.0010"}])
+            return c
+        self._write({self.T: {"side": "yes", "px": 0.6, "size": 1667}})
+        for held, want in ((10000.0, [("ask", 1, None, 10000.0)]),
+                           (5000.0, [])):                            # $50: at its 1,667 cap
+            c = gatt()
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = held, 1.0
+            c.positions[self.T] = held
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+            got = sorted((o["book_side"], o["yes_price"], o.get("yes_price_exact"),
+                          o["remaining_count"]) for o in bot.state.sim_orders.values()
+                         if o["ticker"] == self.T)
+            self.assertEqual(got, want, [x for x in lines if "cheap" in x or "cap" in x])
+            if held >= 10000:
+                self.assertTrue(any("$100.00 held on its YES side" in x and "unwinding ASK 10000 @ 1c"
+                                    in x for x in lines), [x for x in lines if "cheap" in x])
+                self.assertEqual(bot._cheap_unwind.get(self.T), ("ask", 10000))
+            else:
+                self.assertTrue(any("at its cap (+5000 of 1667)" in x for x in lines),
+                                [x for x in lines if "cheap" in x])
+        # off: the old rule (at its cap, nothing rests)
+        with mock.patch.object(imm, "CHEAP_STOP_USD", 0.0):
+            c = gatt()
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 10000.0, 1.0
+            c.positions[self.T] = 10000.0
+            with mock.patch.object(imm, "log", lambda *a: None):
+                bot.run_cycle()
+            self.assertEqual([o for o in bot.state.sim_orders.values() if o["ticker"] == self.T], [])
+
     def test_dry_cycle_rests_a_subpenny_rung(self):
         """A market priced in tenths of a cent, YES 0.2x0.3, listed YES 0.2c x
         5,000: the bot rests that bid at its exact price, and keeps it"""

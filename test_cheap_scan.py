@@ -398,6 +398,37 @@ class TestDollarFloor(_TempPaths):
         self.assertIn("OFF the list", text)
 
 
+class TestHeldKeep(_TempPaths):
+    """Jack 2026-11-10: "if i already have $100 of exposure, stop quoting that
+    side. and try to unwind at breakeven or better" -- the bot unwinds only a
+    listed market, so one it holds $100+ on stays listed while held."""
+
+    def test_held_positions_and_keep(self):
+        p = os.path.join(self.dir, "imm_state.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"own_pos": {"G-1": 10000.0, "S-1": 120.0, "N-1": -5000.0, "B-1": "x"},
+                       "own_avg": {"G-1": 1.0, "S-1": 0.4, "N-1": 98.0}}, fh)
+        held = cs.held_positions(p)
+        self.assertEqual(held["G-1"], (10000.0, 1.0))
+        self.assertEqual(held["N-1"], (-5000.0, 98.0))
+        self.assertNotIn("B-1", held)
+        self.assertEqual(cs.held_positions(os.path.join(self.dir, "missing.json")), {})
+        now = datetime(2026, 11, 12, 4, 0, tzinfo=timezone.utc)
+        listed = {"G-1": {"side": "yes", "px": 0.6, "size": 1667, "stop": "2026-11-12T05:00:00Z"},
+                  "S-1": {"side": "yes", "px": 0.4, "size": 18750, "stop": "2026-11-12T05:00:00Z"},
+                  "N-1": {"side": "no", "px": 2, "size": 5000, "stop": "2026-11-20T05:00:00Z"},
+                  "T-1": {"side": "yes", "px": 1, "size": 10000, "stop": "2026-11-12T05:00:00Z"}}
+        out = cs.held_keep(listed, {"T-1"}, lambda t: True, held, now)
+        self.assertEqual(set(out), {"G-1", "N-1"})                 # $100 / $100; S-1 is $0.48
+        self.assertEqual(out["G-1"]["stop"], "2026-11-13T16:00:00Z")   # 1h left: rolled 36h
+        self.assertEqual(out["N-1"]["stop"], "2026-11-20T05:00:00Z")   # far enough: kept as is
+        self.assertIn("$100 stop", out["G-1"]["held"])
+        self.assertEqual(listed["G-1"]["stop"], "2026-11-12T05:00:00Z")  # the input untouched
+        self.assertEqual(cs.held_keep(listed, set(), lambda t: t != "G-1", held, now).keys(), {"N-1"})
+        with mock.patch.object(imm, "CHEAP_STOP_USD", 0.0):
+            self.assertEqual(cs.held_keep(listed, set(), lambda t: True, held, now), {})
+
+
 class TestSubPenny(unittest.TestCase):
     """Jack 2026-11-10: "it's ok to go lower to 0.1% to catch markets like
     KXFRENCHPRES-27" -- on a market priced in tenths of a cent the scan also

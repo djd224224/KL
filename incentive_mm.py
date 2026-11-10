@@ -10149,6 +10149,20 @@ CHEAP_MAX_USD = _env_float("IMM_CHEAP_MAX_USD", 200.0)         # size x px a mar
 # ...and the rung rests only while it holds at least this share of its side's
 # score (a 2c bid deep under a book that moved up earns ~nothing)
 CHEAP_MIN_SHARE = _env_float("IMM_CHEAP_MIN_SHARE", 0.01)
+# THE $100 STOP (Jack 2026-11-10: "if i already have $100 of exposure, stop
+# quoting that side. and try to unwind at breakeven or better", after the first
+# cheap-side fill: 10,000 KXFRENCHPRES-27-GATT YES at 1c, $100, at 03:04Z, the
+# book then 0.5x0.7). Once the bot's own position on a cheap market's side
+# costs CHEAP_STOP_USD or more (contracts x the average cost; the rung's px
+# with no average), that side rests nothing, and the market's one order is
+# the UNWIND instead (cheap_unwind_quote): the whole position on the reducing
+# side, never worse than the average cost (an ask at or over it, a bid at or
+# under it), never leading the best external price on that side with
+# UNWIND_NO_LEAD_MIN+ contracts (it joins that price when it beats the
+# average), never crossing, on the market's own grid (0.1c on a sub-penny
+# book). The hourly scan keeps such a market listed while it is held, so the
+# unwind outlives the program period. IMM_CHEAP_STOP_USD=0 turns it off.
+CHEAP_STOP_USD = _env_float("IMM_CHEAP_STOP_USD", 100.0)
 
 
 def cheap_path() -> str:
@@ -10260,6 +10274,98 @@ def _cheap_exact_sides(yes_exact: List[List[float]], no_exact: List[List[float]]
     return (y, n) if side == "yes" else (n, y)
 
 
+def _fine_book(step: Optional[float], yes_exact: List[List[float]],
+               no_exact: List[List[float]]) -> bool:
+    """A market priced finer than a cent: its price step (dollars) when known,
+    else a book showing a fractional-cent level."""
+    if step is not None:
+        return step < 0.01 - 1e-12
+    return any(abs(float(a) - round(float(a))) > 1e-6
+               for a, b in list(yes_exact) + list(no_exact) if float(b) > 0)
+
+
+def cheap_exposure(side: str, pos: float, avg: Optional[float], px: float) -> float:
+    """THE $100 STOP: $ the bot holds on a cheap market's own side -- the
+    contracts held there x their average cost (YES cents for a YES position,
+    100 - it for a NO one; the rung's px when no average is known)."""
+    held = pos if side == "yes" else -pos
+    if held < 1:
+        return 0.0
+    if avg is None:
+        c = float(px)
+    else:
+        c = float(avg) if side == "yes" else 100.0 - float(avg)
+    return held * max(0.0, c) / 100.0
+
+
+def cheap_unwind_quote(ticker: str, side: str, pos: float, avg: Optional[float],
+                       yes_exact: List[List[float]], no_exact: List[List[float]],
+                       own_exact: List[Tuple[str, float, float]],
+                       ext_bid: Optional[float], ext_ask: Optional[float],
+                       step: Optional[float] = None) -> Tuple[Optional["Quote"], dict]:
+    """THE $100 STOP's unwind for a cheap market the bot holds on its own side
+    (`pos`, the bot's own YES position; `avg` its average cost, YES cents): ONE
+    order of the whole position on the reducing side -- a YES ask while long
+    YES, a YES bid while holding NO -- at breakeven or better: an ask at or over
+    `avg`, a bid at or under it, never better than the best EXTERNAL price on
+    its side holding UNWIND_NO_LEAD_MIN+ contracts (it joins that price when it
+    beats breakeven), never crossing the other side's best; on the 0.1c grid
+    of a sub-penny market, else whole cents. None (and why) when flat on that
+    side or with no average."""
+    held = pos if side == "yes" else -pos
+    rside = "ask" if side == "yes" else "bid"
+    info: dict = {"side": side, "unwind": rside, "held": held, "avg": avg}
+    n = int(abs(pos))
+    if held < 1 or n < 1:
+        info["why"] = "flat on its side"
+        return None, info
+    if avg is None:
+        info["why"] = "no average cost known (no breakeven to rest at)"
+        return None, info
+    if yes_exact or no_exact:
+        eb, ea = external_touch_exact(yes_exact, no_exact, own_exact)
+        nb, na = external_touch_exact(yes_exact, no_exact, own_exact, min_qty=UNWIND_NO_LEAD_MIN)
+    else:
+        eb, ea = ext_bid, ext_ask
+        nb, na = ext_bid, ext_ask
+    g = 0.1 if _fine_book(step, yes_exact, no_exact) else 1.0
+    be = float(avg)
+    if rside == "ask":
+        p = be if na is None else max(be, float(na))
+        p = math.ceil(round(p / g, 6) - 1e-6) * g
+        if eb is not None and p <= float(eb) + 1e-9:           # never crosses the bid
+            p = (math.floor(round(float(eb) / g, 6) + 1e-6) + 1) * g
+    else:
+        p = be if nb is None else min(be, float(nb))
+        p = math.floor(round(p / g, 6) + 1e-6) * g
+        if ea is not None and p >= float(ea) - 1e-9:           # never crosses the ask
+            p = (math.ceil(round(float(ea) / g, 6) - 1e-6) - 1) * g
+    p = round(p, 2)
+    info.update(px=p, best_bid=eb, best_ask=ea, join=na if rside == "ask" else nb)
+    if not 0 < p < 100:
+        info["why"] = f"no price inside 0-100c ({p:g}c)"
+        return None, info
+    if abs(p - round(p)) < 0.005:
+        return Quote(ticker, rside, int(round(p)), n), info
+    bucket = math.ceil(p) if rside == "ask" else math.floor(p)
+    return Quote(ticker, rside, int(bucket), n, price_exact=p), info
+
+
+def inventory_reserve_usd(ticker: str, pos: float, avg: Optional[float]) -> float:
+    """The selection's inventory reserve for one of the bot's own positions:
+    50c a contract, except a CHEAP-SIDE position -- its market on the cheap
+    list, or its held side bought under 1c -- which reserves its cost (its
+    whole downside; the held side's average, YES cents long / 100 - it short),
+    never more than the 50c."""
+    n = abs(float(pos))
+    if n < 1e-9:
+        return 0.0
+    c = None if avg is None else (float(avg) if pos > 0 else 100.0 - float(avg))
+    if c is not None and 0.0 <= c and (c < 1.0 - 1e-9 or cheap_entry(ticker) is not None):
+        return n * min(c, 50.0) / 100.0
+    return n * 0.50
+
+
 def _tick_walk(levels: Dict[float, float]) -> List[Tuple[int, float]]:
     """Exact levels on the 0.1c tick grid (price x 10), best first."""
     w: Dict[int, float] = {}
@@ -10314,9 +10420,7 @@ def cheap_side_quote(ticker: str, entry: dict,
     # the opposite side's best, in this side's own cents: the rung stays under it
     limit = ea if side == "yes" else (None if eb is None else 100.0 - eb)
     if sub:
-        fine = (step < 0.01 - 1e-12) if step is not None else any(
-            abs(float(a) - round(float(a))) > 1e-6
-            for a, b in list(yes_exact) + list(no_exact) if float(b) > 0)
+        fine = _fine_book(step, yes_exact, no_exact)
         info["limit"] = None if limit is None else round(limit, 2)
         if not fine:
             info["why"] = f"a whole-cent market (a {px:g}c rung needs a sub-penny book)"
@@ -26015,6 +26119,9 @@ class IncentiveMarketMaker:
         self._nfl_unearning: Dict[str, Set[str]] = {}  # sides dropped as unearning
         self._pvd_out: Dict[str, Set[str]] = {}  # post-vote dead-book sides the guard dropped
         self._cheap_noted: Dict[str, tuple] = {}  # CHEAP-SIDE BOOK rung last logged
+        # THE $100 STOP: cheap markets whose one order this cycle is the unwind
+        # -> (its book side, its count), for the placement backstop's side cap
+        self._cheap_unwind: Dict[str, Tuple[str, int]] = {}
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
         self._pvd_close: Dict[str, Optional[tuple]] = {}  # closing-exemption rung last logged
         self._pvd_clamp: Dict[str, Optional[tuple]] = {}  # CLOSE CLAMP: t -> (side, from, to) last logged
@@ -33018,8 +33125,12 @@ class IncentiveMarketMaker:
         # Inventory reserve: the bot's OWN open book consumes budget at a
         # 50c/contract estimate. Own-book positions, not account positions —
         # the fleet's and the user's manual inventory must not starve this
-        # bot's budget.
-        inv_reserve = sum(abs(v) for v in self.pnl.pos.values()) * 0.50
+        # bot's budget. A CHEAP-SIDE position (its market on the cheap list,
+        # or bought under 1c on its held side) reserves its cost instead, its
+        # whole downside: a sub-penny rung's 50,000 at 0.2c is $100, not the
+        # $25,000 that 50c/contract would hold out of the budget (2026-11-10)
+        inv_reserve = sum(inventory_reserve_usd(t, v, self.pnl.avg.get(t))
+                          for t, v in self.pnl.pos.items())
 
         def market_cost(meta: MarketMeta) -> float:
             if meta.mid_cents is None or meta.spread_cents is None:
@@ -35094,6 +35205,28 @@ class IncentiveMarketMaker:
         a Carbon Arc family turned off, CA_FAMILY_UNWIND)?"""
         return (t in self._ca_family_unwind) or (
             self._unwind_waves_only and self._waves_switch_covers(t))
+
+    def _cheap_unwind_note(self, t: str, q: Optional["Quote"], info: dict) -> None:
+        """Log THE $100 STOP on a cheap market when its unwind starts, moves or
+        stands aside."""
+        key = ("unwind", None, info.get("why")) if q is None else (
+            "unwind", q.book_side, q.price_cents, q.price_exact, q.count)
+        if self._cheap_noted.get(t) == key:
+            return
+        self._cheap_noted[t] = key
+        side = str(info.get("side", "?")).upper()
+        avg = info.get("avg")
+        head = (f"{self.tag} cheap {t}: ${float(info.get('exposure') or 0):,.2f} held on its {side} "
+                f"side ({float(info.get('held') or 0):,.0f} at avg "
+                f"{'?' if avg is None else f'{float(avg):.2f}'}c) -- the $100 stop: {side} side "
+                f"rests nothing")
+        if q is None:
+            log(f"{head}; no unwind ({info.get('why')})")
+            return
+        px = q.price_exact if q.price_exact is not None else q.price_cents
+        log(f"{head}; unwinding {q.book_side.upper()} {q.count} @ {px:g}c at breakeven or better"
+            f"{' (dry: not placed)' if CHEAP_MODE != 'on' else ''} (book "
+            f"{info.get('best_bid')}x{info.get('best_ask')}c)")
 
     def _cheap_side_note(self, t: str, q: Optional["Quote"], info: dict,
                          meta: "MarketMeta") -> None:
@@ -39339,21 +39472,45 @@ class IncentiveMarketMaker:
             # CHEAP-SIDE BOOK (CHEAP_FILE): its one rung REPLACES whatever the
             # plain path built -- the cheap side alone, pinned at its own price,
             # only while it earns; dry logs it and rests nothing; a reduce-only
-            # market (out of the selection) rests nothing, its position riding
+            # market (out of the selection) rests nothing, its position riding.
+            # THE $100 STOP: $100+ held on its side -> that side rests nothing
+            # and the one order is the unwind at breakeven or better
             if cheap is not None:
-                try:
-                    _cq, _ci = cheap_side_quote(
-                        t, cheap, yes_levels, no_levels, own_in_book,
-                        *orderbook_exact_levels(ob),
-                        own_exact_by_ticker.get(t, []) if self.live else [],
-                        meta.target_size, meta.discount_factor, cap_pos,
-                        step=meta.price_step)
-                except Exception as e:      # never costs the cycle: nothing rests
-                    _cq, _ci = None, {"why": f"failed ({e!r})"}
-                if reduce_only and _cq is not None:
-                    _cq, _ci = None, dict(_ci, why="reduce-only (out of the selection)")
-                self._cheap_side_note(t, _cq, _ci, meta)
-                mq = [_cq] if (_cq is not None and CHEAP_MODE == "on") else []
+                _cs = cheap["cheap"]["side"]
+                _cavg = self.pnl.avg.get(t)
+                _cexp = cheap_exposure(_cs, cap_pos, _cavg, cheap["cheap"]["px"])
+                if CHEAP_STOP_USD > 0 and _cexp >= CHEAP_STOP_USD - 0.005:
+                    try:
+                        _cq, _ci = cheap_unwind_quote(
+                            t, _cs, own_pos, _cavg, *orderbook_exact_levels(ob),
+                            own_exact_by_ticker.get(t, []) if self.live else [],
+                            ext_bid, ext_ask, step=meta.price_step)
+                    except Exception as e:  # never costs the cycle: nothing rests
+                        _cq, _ci = None, {"why": f"unwind failed ({e!r})"}
+                    _ci["exposure"] = _cexp
+                    if _cq is not None:
+                        self._cheap_unwind[t] = (_cq.book_side, _cq.count)
+                    else:
+                        self._cheap_unwind.pop(t, None)
+                    self._cheap_unwind_note(t, _cq, _ci)
+                    mq = [_cq] if (_cq is not None and CHEAP_MODE == "on") else []
+                else:
+                    self._cheap_unwind.pop(t, None)
+                    try:
+                        _cq, _ci = cheap_side_quote(
+                            t, cheap, yes_levels, no_levels, own_in_book,
+                            *orderbook_exact_levels(ob),
+                            own_exact_by_ticker.get(t, []) if self.live else [],
+                            meta.target_size, meta.discount_factor, cap_pos,
+                            step=meta.price_step)
+                    except Exception as e:  # never costs the cycle: nothing rests
+                        _cq, _ci = None, {"why": f"failed ({e!r})"}
+                    if reduce_only and _cq is not None:
+                        _cq, _ci = None, dict(_ci, why="reduce-only (out of the selection)")
+                    self._cheap_side_note(t, _cq, _ci, meta)
+                    mq = [_cq] if (_cq is not None and CHEAP_MODE == "on") else []
+            else:
+                self._cheap_unwind.pop(t, None)
             # BREAKEVEN OFFSET (a SELECTED market BE_OFFSET_DAYS out or
             # more): the reducing side carries the whole position at
             # breakeven or better. The event room below is charged the
@@ -40484,6 +40641,12 @@ class IncentiveMarketMaker:
                 _pvn = self._pvd_side_n.get(q.ticker) if (_pvq.get("flip") or _pvq.get("off")) else None
                 if _pvn is not None:
                     side_cap = max_level_size = float(_pvn[0] if q.book_side == "bid" else _pvn[1])
+            # THE $100 STOP: a cheap market's unwind rests the whole position
+            # on its reducing side (the quote loop sized it so this cycle)
+            _cu = self._cheap_unwind.get(q.ticker)
+            if _cu is not None and q.book_side == _cu[0]:
+                side_cap = max(side_cap, float(_cu[1]))
+                max_level_size = max(max_level_size, float(_cu[1]))
             # UNWIND ONLY: the reducing side rests the whole position as one
             # order (the quote loop sized it so, unwind_only_quotes)
             if self._unwinds(q.ticker):

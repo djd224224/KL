@@ -422,6 +422,64 @@ def period_banked(path=None):
     return out
 
 
+def held_positions(path=None):
+    """{ticker: (the bot's own YES position, its average cost in YES cents or
+    None)} from the bot's state (imm_state.json own_pos / own_avg). {} when
+    unreadable."""
+    try:
+        with open(path or imm.IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as fh:
+            s = json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+    pos, avg = s.get("own_pos") or {}, s.get("own_avg") or {}
+    out = {}
+    for t, v in pos.items():
+        try:
+            a = avg.get(t)
+            out[t] = (float(v), None if a is None else float(a))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# THE $100 STOP (Jack 2026-11-10: "if i already have $100 of exposure, stop
+# quoting that side. and try to unwind at breakeven or better"): the bot works
+# such a market's position down at breakeven or better (incentive_mm
+# cheap_unwind_quote) only while the market is on this list, so a listed market
+# the bot holds $100+ on stays listed while held -- its entry as it stands,
+# its stop rolled forward HELD_KEEP_HOURS whenever it is within half of that.
+HELD_KEEP_HOURS = 36.0
+
+
+def held_keep(listed_now, skip, keep, held, now):
+    """THE $100 STOP's listed markets to keep: {ticker: entry} for each market
+    on the list (not in `skip`, in scope) where the bot's own position on the
+    entry's side costs imm.CHEAP_STOP_USD+, its stop rolled forward."""
+    out = {}
+    if imm.CHEAP_STOP_USD <= 0:
+        return out
+    for t, e in listed_now.items():
+        if t in skip or not keep(t):
+            continue
+        px = imm.cheap_px(e.get("px"))
+        pos, avg = held.get(t, (0.0, None))
+        if px is None or imm.cheap_exposure(str(e.get("side") or ""), pos, avg, px) \
+                < imm.CHEAP_STOP_USD - 0.005:
+            continue
+        try:
+            stop = ts(e.get("stop") or "1970-01-01T00:00:00Z")
+        except ValueError:
+            stop = now
+        e = dict(e)
+        if (stop - now).total_seconds() < HELD_KEEP_HOURS * 1800:
+            e["stop"] = zs(now + timedelta(hours=HELD_KEEP_HOURS))
+        e["held"] = (f"{now.strftime('%Y-%m-%dT%H:%MZ')} $100 stop: the bot holds "
+                     f"{abs(pos):,.0f} at {'?' if avg is None else f'{avg:.2f}'}c -- kept listed "
+                     f"while it unwinds at breakeven or better")
+        out[t] = e
+    return out
+
+
 def banked_for(banked, t, period_start):
     """This period's accrual on `t`, or None when the bot's state has not
     rolled to this period (its period start differs by more than a minute)."""
@@ -616,10 +674,13 @@ def scan(a) -> int:
     take = [r for r in rows if r["verdict"] == "LIST"]
     kept = {t: e for t, e in listed_now.items() if t in unread and keep(t)
             and ts(e.get("stop") or "1970-01-01T00:00:00Z") > now and t not in {r["ticker"] for r in take}}
+    # THE $100 STOP: a listed market the bot holds $100+ on stays while held
+    held = held_keep(listed_now, {r["ticker"] for r in take} | set(kept), keep,
+                     held_positions(), now)
     log(f"cheap_scan: {len(progs)} program markets in {names}; "
         f"{len(far)} at {a.min_days:.0f}d+; listing {len(take)} "
         f"({sum(1 for r in take if r['same_period'])} already this period); unread {len(unread)} "
-        f"(kept {len(kept)} listed); skipped {why}")
+        f"(kept {len(kept)} listed); held $100+ kept {len(held)} {sorted(held)[:6]}; skipped {why}")
     print(f"{'ticker':36} {'sub':24} {'side':4} {'px':>3} {'size':>6} {'share':>6} {'$/day':>6} "
           f"{'risk$':>6} {'proj$':>6} {'now$/d':>6} stop")
     for r in sorted(rows, key=lambda r: -((r["pick"] or {}).get("usd_day") or 0)):
@@ -644,6 +705,7 @@ def scan(a) -> int:
             cur = {}
         L = {t: e for t, e in (cur.get("markets") or {}).items() if not keep(t)}
         L.update(kept)
+        L.update(held)
         stamp = now.strftime("%Y-%m-%dT%H:%MZ")
         for r in take:
             p = r["pick"]
