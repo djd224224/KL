@@ -85,6 +85,10 @@ jobs:
         # the live path is inputs.run_slot, set by cron-job.org.
         KXHIGH_RUN_SLOT: ${{ github.event_name == 'schedule' && 'west_late' || inputs.run_slot }}
         WEST_LATE_ENABLED: ${{ vars.KXHIGH_WEST_LATE_ENABLED || 'true' }}
+        # Evenings OFF (Jack 2026-11-09: "turn off evenings"): an evening run
+        # exits as a noop. Repo variable KXHIGH_EVENING_ENABLED=true brings
+        # them back without a deploy.
+        EVENING_ENABLED: ${{ vars.KXHIGH_EVENING_ENABLED || 'false' }}
         # Morning-slot cap multiplier, ON at 1.5 (Jack 2026-10-06). Morning
         # caps become 150/225/75 for the 100/150/50-cap cities; evening and
         # west_late keep their base caps. The ladder telemetry showed the

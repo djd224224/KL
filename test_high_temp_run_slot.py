@@ -3,7 +3,7 @@
 high_temp_trading.py is a top-level script that talks to Kalshi on import,
 so this test lifts the RUN SLOT block out of the source and executes it
 against a fake clock. What it pins down:
-  - morning / evening runs trade every city, as before;
+  - morning runs trade every city; evening runs only with EVENING_ENABLED=true (off since 2026-11-09);
   - day-run orders expire at the city's own cutoff, never tomorrow;
   - a late run touches only the west cities, until 10:05 LOCAL, across DST;
   - the late run is a no-op when disabled, too late, or fired after 14:00 CT.
@@ -139,11 +139,29 @@ class RunSlotTest(unittest.TestCase):
             g = run_block(_real_datetime(2026, 9, 29, *when), env)
             self.assertEqual(g["ACTIVE_CITIES"], [], when)
 
-    def test_evening_runs_trade_everything(self):
-        for hhmm in ((20, 2), (23, 2)):
-            g = run_block(_real_datetime(2026, 9, 29, *hhmm))
+    def test_evening_runs_trade_everything_when_enabled(self):
+        for hhmm in ((19, 2), (20, 2), (23, 2)):
+            g = run_block(_real_datetime(2026, 9, 29, *hhmm), {"EVENING_ENABLED": "true"})
             self.assertEqual(g["RUN_SLOT"], "evening")
             self.assertEqual(set(g["ACTIVE_CITIES"]), set(g["CITY_COORDS"]))
+
+    def test_evenings_off_by_default(self):
+        # 2026-11-09 (Jack: "turn off evenings"): an evening run trades no
+        # city unless EVENING_ENABLED=true, so it exits as a noop.
+        for hhmm in ((19, 2), (20, 2), (21, 2), (22, 2), (23, 2)):
+            for env in ({}, {"EVENING_ENABLED": "false"}, {"EVENING_ENABLED": "nope"}):
+                g = run_block(_real_datetime(2026, 11, 9, *hhmm), env)
+                self.assertEqual(g["RUN_SLOT"], "evening")
+                self.assertFalse(g["EVENING_ENABLED"])
+                self.assertEqual(g["ACTIVE_CITIES"], [], (hhmm, env))
+
+    def test_evenings_off_leaves_day_runs_alone(self):
+        g = run_block(_real_datetime(2026, 11, 9, 5, 2))
+        self.assertEqual(g["RUN_SLOT"], "morning")
+        self.assertEqual(set(g["ACTIVE_CITIES"]), set(g["CITY_COORDS"]))
+        g = run_block(_real_datetime(2026, 11, 9, 9, 7), {"KXHIGH_RUN_SLOT": "west_late"})
+        self.assertEqual(g["RUN_SLOT"], "west_late")
+        self.assertIn("Los Angeles", g["ACTIVE_CITIES"])
 
 
 if __name__ == "__main__":

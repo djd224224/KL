@@ -540,6 +540,17 @@ WEST_LATE_CUTOFF_LOCAL = (10, 5)
 WEST_LATE_START_HOUR_CT = 9
 DAYOF_MIN_LEAD_MIN = int(os.environ.get("DAYOF_MIN_LEAD_MIN", "20"))
 
+# EVENINGS OFF (Jack 2026-11-09: "turn off evenings"). Next-day quoting from
+# the evening runs lost in every stretch measured on the bot's own fills
+# valued at settlement: 9/2-10/12 -$511 (-$12/day), 10/13-11/01 -$120
+# (-$6/day), and 11/02-11/07 under the hourly 60-minute quotes -$137
+# (-$23/day, -22c/contract); mornings made +$1,796 over the same days. With
+# EVENING_ENABLED false an evening run trades no city, so it exits as a noop
+# (below) without cancelling or placing anything. Morning and west_late are
+# unaffected. EVENING_ENABLED=true (repo variable KXHIGH_EVENING_ENABLED)
+# brings the evenings back exactly as configured by the NIGHT_* settings.
+EVENING_ENABLED = os.environ.get("EVENING_ENABLED", "false").strip().lower() == "true"
+
 _slot_env = os.environ.get("KXHIGH_RUN_SLOT", "").strip().lower()
 if _slot_env == "west_late":
     RUN_SLOT = "west_late"          # the scheduled late run, however late it fires
@@ -569,7 +580,7 @@ def _dayof_cutoff(city):
 
 def _city_trades_this_run(city):
     if RUN_SLOT == "evening":
-        return True
+        return EVENING_ENABLED
     if RUN_SLOT == "west_late":
         # variable == 1 here means a late run delayed past 14:00 CT: that
         # would be an unscheduled evening run, so it trades nothing.
@@ -591,7 +602,8 @@ if RUN_SLOT != "evening":
         print(f"  {_c:<15} orders expire {_co.strftime('%H:%M %Z')} "
               f"({_co.astimezone(CT_TZ).strftime('%H:%M')} CT)")
 if not ACTIVE_CITIES:
-    print(f"  nothing to trade (west_late enabled={WEST_LATE_ENABLED}); "
+    print(f"  nothing to trade (west_late enabled={WEST_LATE_ENABLED}, "
+          f"evening enabled={EVENING_ENABLED}); "
           f"exiting without cancelling or placing anything")
     # A no-op because the trigger fired LATE is a broken test, not a quiet
     # day, and it used to look identical to a deliberate kill in BigQuery.
