@@ -14121,6 +14121,7 @@ _CONFIG_CODE_KNOBS = (
     # YouTube weekly pilot (2026-10-06); yt_weekly_fair's knobs ride in the
     # fair file's "model" block
     "YTW_ENABLE", "YTW_ARTISTS", "YTW_CUTOFF_FROM_CLOSE_MIN", "YTW_MAX_POSITION",
+    "YTW_ENDED",                  # the pilot ended (2026-11-10)
     "YTW_REF_MULT_CAP", "YTW_EVENT_CAP", "YTW_DAILY_LOSS_LIMIT", "YTW_FAIR_TOL_CENTS",
     "YTW_FAIR_MIN_P", "YTW_FAIR_TTL_MIN", "YTW_FAIR_REFRESH_SECS",
     # Trump weekly pilots (2026-10-11)
@@ -19848,7 +19849,23 @@ def pilot_halt_keys() -> List[str]:
 # running to 2026-10-18 12:00Z; past that the fair goes stale and the gate
 # stands everything aside until a feed replaces them.
 # Kill switch IMM_YTW_ENABLE=0 (positions ride).
-YTW_ENABLE = _YTW_LIVE
+#
+# PILOT ENDED (Jack 2026-11-10: "Yes, turn it off", to "Turn off the
+# YouTube weekly pilot (positions ride to settlement)?"). 10/11-11/10 it
+# made -$27.54 ($19.52 of modeled reward against -$47.06 of trading), and
+# the fair loses to Kalshi's own prices: replayed point-in-time every 2h
+# over 16 settled artist-weeks (26OCT11-26NOV01) its Brier score on
+# contested hours (market 5-95c) was 0.193 against the market's 0.099,
+# worse at every horizon (6-24h to close 0.172 vs 0.015) and for every
+# artist but The Weeknd (0.091 vs 0.080), overconfident at both ends. The
+# market reads YouTube Charts' daily prints, which the fair cannot (its
+# pulls get 429s). While YTW_ENDED the pilot is off (YTW_ENABLE false: no
+# admission, no fair refresher, no halt) and KXYTVIEWSW is BLOCKED
+# (IncentiveMarketMaker._blocked): out of selection at the next refresh,
+# resting orders cancelled with it, positions ride to settlement.
+# IMM_YTW_ENDED=0 brings the pilot back with every rule above.
+YTW_ENDED = os.environ.get("IMM_YTW_ENDED", "1") == "1"
+YTW_ENABLE = _YTW_LIVE and not YTW_ENDED
 YTW_SERIES = "KXYTVIEWSW"
 # TAT (Tate McRae) added 2026-10-06 (Jack: "yes add her"): makers +22.6 c/ct
 # in the gate's windows on the tape (2 weeks, 1.1k ct), nowcast MAE ~1.1%
@@ -19868,7 +19885,9 @@ YTW_FAIR_FILE = os.environ.get(
 _ytw_state: dict = {"mtime": 0.0, "entries": {}}
 _YTW_EVENT_RE = re.compile(r"^KXYTVIEWSW-([A-Z]+)\d{2}[A-Z]{3}\d{2}$")
 
-if YTW_ENABLE:
+# registered on the switch alone, ended or not: an ended pilot's series is
+# blocked anyway, and its tests revive it by patching YTW_ENABLE
+if _YTW_LIVE:
     SERIES_OVERRIDES[YTW_SERIES] = replace(
         SERIES_OVERRIDES.get(YTW_SERIES) or SeriesOverride(),
         cutoff_from_close_min=YTW_CUTOFF_FROM_CLOSE_MIN,
@@ -31666,6 +31685,9 @@ class IncentiveMarketMaker:
         # the YouTube #2 pilot, ended 2026-10-22 (YT2_ENDED)
         if YT2_ENDED and yt2_series(series_of(ticker)):
             return True
+        # the YouTube weekly pilot, ended 2026-11-10 (YTW_ENDED)
+        if YTW_ENDED and series_of(ticker) == YTW_SERIES:
+            return True
         # Strike-suffix block (MARKET_BLOCK_SUFFIXES, the -NQE leg): only a
         # MARKET ticker has a strike segment -- two dashes or more. Event
         # tickers and the "<series>-X" probe have one and fall through.
@@ -42792,6 +42814,9 @@ class IncentiveMarketMaker:
                 + (f" (HALTED this roll day, ${self.state.ytw_pnl_carry:+.2f})"
                    if self.state.ytw_halt_day == _halt_day_key(
                        datetime.now(timezone.utc)) else ""))
+        elif YTW_ENDED:
+            log(f"ytw pilot: ENDED 2026-11-10 -- {YTW_SERIES} blocked, positions "
+                f"ride (IMM_YTW_ENDED=0 brings it back)")
         else:
             log("ytw pilot: OFF -- KXYTVIEWSW is not enrolled")
         if TWK_ENABLE:

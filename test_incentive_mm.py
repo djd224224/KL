@@ -25177,6 +25177,13 @@ class TestYouTubeWeeklyPilot(unittest.TestCase):
     def setUp(self):
         _clean_persist()
         imm._ytw_state.update(mtime=0.0, entries={})
+        # the pilot ENDED 2026-11-10 (YTW_ENDED); these tests keep its rules
+        # covered for an IMM_YTW_ENDED=0 revival
+        self._ended_default = (imm.YTW_ENDED, imm.YTW_ENABLE)
+        for name, v in (("YTW_ENDED", False), ("YTW_ENABLE", True)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
         self._saved_hour_mults = imm.SERIES_HOUR_MULTS
         imm.SERIES_HOUR_MULTS = []
         try:
@@ -25186,6 +25193,24 @@ class TestYouTubeWeeklyPilot(unittest.TestCase):
 
     def tearDown(self):
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def test_the_pilot_is_ended_by_default(self):
+        """Jack 2026-11-10: "Yes, turn it off" (the YouTube weekly pilot):
+        -$27.54 over 31 days and a fair the market beats. Its series is
+        blocked and the pilot is off, so nothing quotes; IMM_YTW_ENDED=0
+        revives it."""
+        self.assertEqual(self._ended_default, (True, False))
+        self.assertIn("YTW_ENDED", imm._CONFIG_CODE_KNOBS)
+        self._write(p=0.5)
+        with mock.patch.object(imm, "YTW_ENDED", True), \
+                mock.patch.object(imm, "YTW_ENABLE", False):
+            self.assertTrue(IncentiveMarketMaker._blocked(self.T))
+            self.assertFalse(IncentiveMarketMaker._allowed(self.T))
+            self.assertFalse(imm.ytw_series(imm.YTW_SERIES))
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+        self.assertFalse(IncentiveMarketMaker._blocked(self.T))
 
     def _write(self, p=0.5, hold="", age_secs=0.0, key="21.0M"):
         fetched = (datetime.now(timezone.utc) - timedelta(seconds=age_secs)).isoformat()
