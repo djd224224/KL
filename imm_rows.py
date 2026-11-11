@@ -29,6 +29,16 @@ watch's research re-checks it weekly, adding the same row again re-stamps it,
 and a voting-day add replaces it once the vote is called:
   python imm_rows.py election add KXJAPANHOUSE-30FEB07 2030-02-07 --zone Asia/Tokyo \\
       --term-end --source ... --source ...
+
+NOT A VOTE (Jack 2026-11-10: "even if its not a vote, it can still be safe
+ascertain if it's safe or not to quote"): a market no vote decides (a candidacy
+announcement, an appointment no vote decides) that research judged safe to
+quote for now takes --term-end --not-vote. The row is marked "not_vote" and the
+family watch re-checks it every few days, removing it once its news is near.
+The mark sticks to the glob's later rows, which stay term-end rows (remove the
+row first to date it any other way):
+  python imm_rows.py election add KXCHRISTIERUN-28 2027-04-01 --term-end --not-vote \\
+      --source ... --source ...
 """
 
 import argparse
@@ -71,12 +81,16 @@ def _code_table(kind: str) -> List[str]:
 
 
 def validate(kind: str, glob: str, day: str, zone: str, sources: List[str],
-             term_end: bool = False) -> str:
+             term_end: bool = False, not_vote: bool = False) -> str:
     """'' when the row is acceptable, else why not."""
     if kind not in KINDS:
         return f"kind must be one of {KINDS}"
     if term_end and kind != "election":
         return "--term-end is for election rows only"
+    if not_vote and kind != "election":
+        return "--not-vote is for election rows only"
+    if not_vote and not term_end:
+        return "--not-vote needs --term-end (its re-checks are what keep it safe)"
     if not imm.ROWS_GLOB_RE.fullmatch(glob or ""):
         return (f"bad event glob {glob!r} (a series name of 3+ letters/digits, "
                 f"then letters/digits/-/*?[])")
@@ -101,15 +115,21 @@ def validate(kind: str, glob: str, day: str, zone: str, sources: List[str],
 
 def add_row(kind: str, glob: str, day: str, sources: List[str], zone: str = "",
             by: str = "", note: str = "", replace: bool = False,
-            term_end: bool = False) -> Tuple[bool, str]:
+            term_end: bool = False, not_vote: bool = False) -> Tuple[bool, str]:
     """Validate and write one row. (ok, message). The same term-end row again
     re-stamps its "checked"; a voting-day row replaces a term-end one (the
-    vote was called) without `replace`."""
-    why = validate(kind, glob, day, zone, sources, term_end)
-    if why:
-        return False, why
+    vote was called) without `replace`. A not-a-vote row's mark sticks: its
+    glob's later rows keep it and must stay term-end rows."""
     rows = load_rows(kind)
     old = [r for r in rows if r.get("glob") == glob]
+    if old and old[0].get("not_vote"):
+        if not term_end:
+            return False, (f"{glob} has a not-a-vote row: it stays a --term-end row "
+                           f"(re-checked); remove it first to date it otherwise")
+        not_vote = True
+    why = validate(kind, glob, day, zone, sources, term_end, not_vote)
+    if why:
+        return False, why
     restamp = False
     if old and not replace:
         was_term = bool(old[0].get("term_end"))
@@ -132,9 +152,12 @@ def add_row(kind: str, glob: str, day: str, sources: List[str], zone: str = "",
     if term_end:
         row["term_end"] = True
         row["checked"] = now
+    if not_vote:
+        row["not_vote"] = True
     save_rows(kind, [r for r in rows if r.get("glob") != glob] + [row])
     return True, (f"{kind} row {glob} = {day}" + (f" @{zone}" if zone else "")
-                  + ((" (term end, re-checked)" if restamp else " (term end)")
+                  + ((" (term end" + (", not a vote" if not_vote else "")
+                      + (", re-checked)" if restamp else ")"))
                      if term_end else ""))
 
 
@@ -184,6 +207,9 @@ def main(argv=None) -> int:
     a.add_argument("--term-end", action="store_true",
                    help="election only: a vote not yet called, dated to its term end "
                         "(re-adding the same row re-stamps its check)")
+    a.add_argument("--not-vote", action="store_true",
+                   help="election only, with --term-end: a market no vote decides, judged "
+                        "safe to quote while its news is quiet (re-checked every few days)")
     r = sub.add_parser("remove")
     r.add_argument("glob")
     sub.add_parser("list")
@@ -197,7 +223,8 @@ def main(argv=None) -> int:
         for row in load_rows(args.kind):
             print(f"{row.get('glob')} = {row.get('date')}"
                   + (f" @{row['zone']}" if row.get("zone") else "")
-                  + (f" (term end, checked {row.get('checked')})" if row.get("term_end") else "")
+                  + (f" (term end{', not a vote' if row.get('not_vote') else ''}, "
+                     f"checked {row.get('checked')})" if row.get("term_end") else "")
                   + f"  [{row.get('by')}, {row.get('at')}]  " + " | ".join(row.get("sources") or []))
         return 0
     if args.cmd == "remove":
@@ -205,7 +232,7 @@ def main(argv=None) -> int:
     else:
         ok, msg = add_row(args.kind, args.glob, args.date, args.source, zone=args.zone,
                           by=args.by, note=args.note, replace=args.replace,
-                          term_end=args.term_end)
+                          term_end=args.term_end, not_vote=args.not_vote)
     print(("OK: " if ok else "REFUSED: ") + msg)
     return 0 if ok else 1
 

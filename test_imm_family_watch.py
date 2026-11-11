@@ -1081,10 +1081,13 @@ class TestQuoteCalls(unittest.TestCase):
         self.assertEqual(self.call("start:KXTRUMPMENTIONB-26OCT19")[0], "KEEP QUOTING")
         self.assertEqual(self.call("gap:KXSENGA-26", what="KXSENGA-26: no verified "
                                    "election day on file")[0], "QUOTE ONCE DATED")
-        c, why = self.call("gap:KXRETIREMM-26", fix="research (1 try): judgment -- Not a "
-                           "vote market: resolves on a resignation")
+        # 2026-11-10: a market no vote decides is out only when research
+        # judged its news near ("unsafe"), not for being no vote
+        c, why = self.call("gap:KXRETIREMM-26", research="unsafe",
+                           fix="research (1 try): unsafe -- resigns this week, per reports")
         self.assertEqual(c, "DON'T QUOTE")
-        self.assertIn("non-vote political markets stay out", why)
+        self.assertIn("research judged it unsafe to quote for now", why)
+        self.assertIn(f"within {fw.NONVOTE_HORIZON_DAYS} days", why)
 
     def test_the_family_it_would_join(self):
         c, why = self.call("new:KXBILLSNEW", fam="Politics & approval",
@@ -1615,3 +1618,194 @@ class TestResearchToken(unittest.TestCase):
                                lambda p: ("Failed to authenticate: OAuth session expired",
                                           0.0, "exit 1: ")):
             self.assertEqual(fw.check_login(), 1)
+
+
+class TestNotAVote(unittest.TestCase):
+    """Jack 2026-11-10, of KXPRESRUNFIRSTR / D-28 ("When will the first listed
+    Republican / Democrat announce a 2028 presidential run?"), filed "not a
+    vote" and left dark: "even if its not a vote, it can still be safe
+    ascertain if it's safe or not to quote"."""
+
+    EV = "KXCHRISTIERUN-28"
+    VOTE = "KXJAPANHOUSE-30FEB07"
+    T = {"gap:KXPRESRUNFIRSTR-28": {"kind": "election", "event": "KXPRESRUNFIRSTR-28",
+                                    "series": "KXPRESRUNFIRSTR",
+                                    "msg": "no verified election day"}}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="not_vote_")
+        self._saved = imm.STATUS_DIR
+        imm.STATUS_DIR = self.tmp
+        self.addCleanup(lambda: (setattr(imm, "STATUS_DIR", self._saved),
+                                 shutil.rmtree(self.tmp, ignore_errors=True)))
+        for lst in (imm.ELECTION_DATES_EXTRA, imm.ELECTION_TERM_ENDS):
+            self.addCleanup(lst.__setitem__, slice(None), list(lst))
+            lst[:] = []
+
+    def reload(self):
+        imm._rows_extra_state.pop(imm.election_dates_extra_path(), None)
+        imm.load_election_dates_extra()
+
+    def add(self, day="2027-04-01", term_end=True, not_vote=True, replace=False, glob=None,
+            zone=""):
+        out = imm_rows.add_row("election", glob or self.EV, day, ["kalshi terms", "news today"],
+                               zone=zone, by="test", replace=replace, term_end=term_end,
+                               not_vote=not_vote)
+        self.reload()
+        return out
+
+    def age(self, days, glob=None):
+        rows = imm_rows.load_rows("election")
+        for r in rows:
+            if r["glob"] == (glob or self.EV):
+                r["checked"] = (datetime.now(timezone.utc)
+                                - timedelta(days=days)).isoformat(timespec="seconds")
+        imm_rows.save_rows("election", rows)
+        self.reload()
+
+    def test_a_safe_market_takes_a_marked_term_end_row(self):
+        ok, msg = self.add()
+        self.assertTrue(ok, msg)
+        self.assertEqual(msg, f"election row {self.EV} = 2027-04-01 (term end, not a vote)")
+        row = imm_rows.load_rows("election")[0]
+        self.assertEqual((row["term_end"], row["not_vote"]), (True, True))
+        self.assertEqual(imm.election_cutoff_utc(self.EV),
+                         datetime(2027, 4, 1, 4, 0, tzinfo=timezone.utc))
+        # only on a term-end election row: its re-checks are what keep it safe
+        self.assertIn("needs --term-end", imm_rows.validate(
+            "election", "KXVANHOLLENRUN-28", "2027-05-01", "", ["a", "b"], not_vote=True))
+        self.assertIn("--not-vote is for election rows only", imm_rows.validate(
+            "award", "KXOSCARPIC-28", "2028-01-20", "", ["a", "b"], not_vote=True))
+
+    def test_the_mark_sticks_and_never_becomes_an_unchecked_dated_row(self):
+        self.add()
+        self.age(4.0)
+        ok, msg = self.add(not_vote=False)              # a re-stamp that left the flag off
+        self.assertTrue(ok, msg)
+        self.assertTrue(msg.endswith("(term end, not a vote, re-checked)"), msg)
+        self.assertTrue(imm_rows.load_rows("election")[0]["not_vote"])
+        for replace in (False, True):
+            ok, msg = self.add(day="2027-03-01", term_end=False, not_vote=False, replace=replace)
+            self.assertFalse(ok)
+            self.assertIn("stays a --term-end row", msg)
+        # its day passed with later markets open: the next deadline, with replace
+        self.assertFalse(self.add(day="2027-06-01")[0])
+        ok, msg = self.add(day="2027-06-01", replace=True)
+        self.assertTrue(ok, msg)
+        self.assertTrue(imm_rows.load_rows("election")[0]["not_vote"])
+        # the news came near: removed, the bot stands it down at once
+        self.assertTrue(imm_rows.remove_row("election", self.EV)[0])
+        self.reload()
+        self.assertIsNone(imm.election_cutoff_utc(self.EV))
+
+    def test_a_not_a_vote_row_is_re_checked_every_3_days_for_its_news(self):
+        self.add()
+        self.add(day="2030-02-07", not_vote=False, glob=self.VOTE, zone="Asia/Tokyo")
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(fw.ieo, "discover_broadcast_mention_events", lambda c, now: []), \
+                mock.patch.object(fw, "powerslap_events_needing_start", lambda c: []):
+            self.assertEqual(fw.research_targets(None, {}, now, dry=True), {})
+            self.age(3.5)
+            self.age(3.5, glob=self.VOTE)
+            t = fw.research_targets(None, {}, now, dry=True)
+        key = f"recheck:{self.EV}:{(now - timedelta(days=3.5)):%Y-%m-%d}"
+        self.assertEqual(sorted(t), [key])               # the vote's row waits its 5 days
+        tgt = t[key]
+        self.assertTrue(tgt["not_vote"])
+        self.assertIn("not a vote; its news was quiet when last checked", tgt["msg"])
+        p = fw.research_prompt([(key, tgt, "")])
+        self.assertIn(f"KEY {key} -- recheck (not a vote): find whether the news that "
+                      f"decides it is NEAR now", p)
+        self.assertIn(f"near: python imm_rows.py election remove {self.EV}", p)
+        self.assertIn(f"python imm_rows.py election add {self.EV} 2027-04-01 --term-end "
+                      f"--not-vote", p)
+        # done once re-stamped; removed is not "written"
+        self.assertFalse(fw.target_fixed(tgt))
+        self.add()
+        self.assertTrue(fw.target_fixed(tgt))
+        imm_rows.remove_row("election", self.EV)
+        self.reload()
+        self.assertFalse(fw.target_fixed(tgt))
+
+    def test_the_prompt_judges_safety_instead_of_ruling_it_out(self):
+        p = fw.research_prompt([(k, v, "") for k, v in self.T.items()])
+        self.assertIn("NOT A VOTE: decide whether it is SAFE TO QUOTE now", p)
+        self.assertIn(f"within the next {fw.NONVOTE_HORIZON_DAYS} days", p)
+        self.assertIn("ANY person listed counts", p)
+        self.assertIn("--term-end --not-vote", p)
+        self.assertIn('status "unsafe"', p)
+        self.assertNotIn("write nothing, status judgment", p)    # the rule it replaces
+        self.assertIn('"written"|"unsafe"|"judgment"|"unresolved"', p)
+
+    def test_unsafe_is_looked_at_again_every_3_days_however_many_looks(self):
+        t = 1_800_000_000.0
+        k = "gap:KXPRESRUNFIRSTR-28"
+        r = {k: {"attempts": 1, "last": t, "status": "unsafe", "rules": fw.RESEARCH_RULES}}
+        h = fw.NONVOTE_UNSAFE_RETRY_H
+        self.assertEqual(fw.research_due(r, self.T, t + (h - 1) * 3600), [])
+        self.assertEqual(fw.research_due(r, self.T, t + (h + 1) * 3600), [k])
+        r[k]["attempts"] = fw.RESEARCH_MAX_ATTEMPTS + 3
+        self.assertEqual(fw.research_due(r, self.T, t + (h + 1) * 3600), [k])
+        r[k]["status"] = "judgment"
+        self.assertEqual(fw.research_due(r, self.T, t + 99 * 86400), [])
+
+    def test_an_unsafe_verdict_is_kept_and_called_dont_quote(self):
+        t = 1_800_000_000.0
+        T = dict(self.T, **{"start:KXTRUMPMENTION-26NOV12": {
+            "kind": "start", "event": "KXTRUMPMENTION-26NOV12", "series": "KXTRUMPMENTION",
+            "msg": "no start time"}})
+        res = {"KXPRESRUNFIRSTR-28": {"status": "Unsafe", "note": "a run announced for next "
+                                      "week (a, b)"},
+               "start:KXTRUMPMENTION-26NOV12": {"status": "unsafe", "note": "?"}}
+        rstate = {}
+        with mock.patch.object(fw.imm, "election_cutoff_utc", lambda ev, market=None: None), \
+                mock.patch.object(fw.imm, "load_election_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_awards_dates_extra", lambda: 0), \
+                mock.patch.object(fw.imm, "load_file_event_overrides", lambda: 0):
+            fw.apply_results(rstate, list(T), T, res, "", t)
+        k = "gap:KXPRESRUNFIRSTR-28"
+        self.assertEqual((rstate[k]["status"], rstate[k]["rules"]), ("unsafe", fw.RESEARCH_RULES))
+        # the not-a-vote test is for election markets only
+        self.assertEqual(rstate["start:KXTRUMPMENTION-26NOV12"]["status"], "judgment")
+        items = {k: {"est": 30.0, "what": "KXPRESRUNFIRSTR-28: no verified election day",
+                     "fix": "f"}}
+        fw.hold_researched(items, T, {"research": rstate, "items": {k: {"first": t}}}, t + 60)
+        self.assertFalse(items[k]["hold"])                # alerted, not held
+        self.assertEqual(items[k]["research"], "unsafe")
+        with mock.patch.object(fw, "family_name", lambda s, c="": ""):
+            c, why = fw.quote_call(k, items[k], {})
+        self.assertEqual(c, "DON'T QUOTE")
+        self.assertIn("research judged it unsafe to quote for now", why)
+
+    def test_verdicts_from_before_the_rule_are_asked_again_once(self):
+        t = 1_800_000_000.0
+        T = {f"gap:{ev}": {"kind": "election", "event": ev, "series": imm.series_of(ev),
+                           "msg": "no verified election day"}
+             for ev in ("KXPRESRUNFIRSTR-28", "KXSENGOPLEADRUN-26", "KXISR-26OCT27")}
+        T["start:KXTRUMPMENTION-26NOV12"] = {"kind": "start", "event": "KXTRUMPMENTION-26NOV12",
+                                             "series": "KXTRUMPMENTION", "msg": "no start time"}
+        rstate = {
+            "gap:KXPRESRUNFIRSTR-28": {"attempts": 2, "last": t, "seen": t, "status": "judgment",
+                                       "note": "Market resolves on an announcement of a "
+                                               "candidacy, not a vote"},
+            "gap:KXSENGOPLEADRUN-26": {"attempts": 6, "last": t, "seen": t, "status": "error",
+                                       "note": "no result line for this target"},
+            "gap:KXISR-26OCT27": {"attempts": 1, "last": t, "seen": t, "status": "unresolved",
+                                  "note": "page not up"},
+            "start:KXTRUMPMENTION-26NOV12": {"attempts": 1, "last": t, "seen": t,
+                                             "status": "judgment", "note": "not a broadcast"}}
+        notes = fw.requeue_old_rules(rstate, T)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertTrue(notes[0].startswith("gap:KXPRESRUNFIRSTR-28: asked again under the "
+                                            f"{fw.RESEARCH_RULES} rules (was judgment after 2 "
+                                            "tries"), notes[0])
+        self.assertEqual(rstate["gap:KXPRESRUNFIRSTR-28"],
+                         {"attempts": 0, "rules": fw.RESEARCH_RULES, "seen": t})
+        self.assertEqual(rstate["gap:KXSENGOPLEADRUN-26"]["attempts"], 0)
+        self.assertEqual(rstate["gap:KXISR-26OCT27"]["status"], "unresolved")      # in hand
+        self.assertEqual(rstate["start:KXTRUMPMENTION-26NOV12"]["status"], "judgment")
+        self.assertEqual(sorted(fw.research_due(rstate, T, t + 60)),
+                         ["gap:KXPRESRUNFIRSTR-28", "gap:KXSENGOPLEADRUN-26"])
+        # once: a verdict under these rules stands
+        rstate["gap:KXPRESRUNFIRSTR-28"].update(attempts=1, status="judgment", last=t)
+        self.assertEqual(fw.requeue_old_rules(rstate, T), [])

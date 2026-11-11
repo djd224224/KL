@@ -341,9 +341,11 @@ def due_alerts(state_items: Dict[str, dict], items: Dict[str, dict], now_ts: flo
 def hold_researched(items: Dict[str, dict], targets: Dict[str, dict], state: dict,
                     now_ts: float) -> None:
     """Mark the researchable items research has not given up on as `hold`
-    (tracked, not alerted) and add research's last word to each. Research has
-    given up on a judgment call, on two unresolved tries, or on the attempt
-    cap; and anything dark ALERT_STALE_HOURS is alerted regardless."""
+    (tracked, not alerted) and add research's last word to each (`fix`, and
+    its status as `research`). Research has given up on a judgment call, a
+    market it judged unsafe (not a vote, its news near: 2026-11-10), two
+    unresolved tries, or the attempt cap; and anything dark ALERT_STALE_HOURS
+    is alerted regardless."""
     rstate = state.get("research") or {}
     seen = state.get("items") or {}
     # a lapsed term-end row's stand-down gap is researched as its re-check
@@ -354,12 +356,13 @@ def hold_researched(items: Dict[str, dict], targets: Dict[str, dict], state: dic
             continue
         r = rstate.get(rkey) or {}
         n = int(r.get("attempts") or 0)
-        gave_up = (r.get("status") == "judgment"
+        gave_up = (r.get("status") in ("judgment", "unsafe")
                    or (r.get("status") == "unresolved" and n >= 2)
                    or n >= RESEARCH_MAX_ATTEMPTS)
         first = float((seen.get(key) or {}).get("first") or now_ts)
         it["hold"] = not gave_up and (now_ts - first) < ALERT_STALE_HOURS * 3600
         if r.get("status"):
+            it["research"] = r["status"]
             it["fix"] = f"research ({n} tr{'y' if n == 1 else 'ies'}): {r['status']} -- {r.get('note', '')}"
 
 
@@ -499,8 +502,9 @@ def _fmt_et(ts: float) -> str:
 #      its program -- SKIP.
 #   3. THE ITEM'S OWN RULE: a mention event quoted without a start time ->
 #      KEEP QUOTING (add the start); an election / award gap -> QUOTE ONCE
-#      DATED (verified date rows only); research found no vote -> DON'T
-#      QUOTE (non-vote political markets stay out); a new mention family ->
+#      DATED (verified date rows only); research judged a market no vote
+#      decides unsafe, its news near (2026-11-10) -> DON'T QUOTE (a quiet
+#      one is quoted on a re-checked row instead); a new mention family ->
 #      QUOTE WITH CARE (the mention live gates); a new election family ->
 #      QUOTE ONCE DATED; a ONE-OFF (Kalshi frequency one_off): a vote, or
 #      what a named vote decides -> QUOTE ONCE DATED; otherwise by how the
@@ -699,9 +703,11 @@ def quote_call(key: str, it: dict, track: Dict[str, dict]) -> Tuple[str, str]:
     if kind == "start":
         return ("KEEP QUOTING", "a mention event, quoted behind the live gates" + rec_txt)
     if kind == "gap":
-        if "not a vote market" in str(it.get("fix") or "").lower():
-            return ("DON'T QUOTE", "research found it is not a vote market, and non-vote "
-                                   "political markets stay out")
+        if it.get("research") == "unsafe":
+            return ("DON'T QUOTE", f"not a vote, and research judged it unsafe to quote for "
+                                   f"now: its deciding news may come within "
+                                   f"{NONVOTE_HORIZON_DAYS} days (research looks again "
+                                   f"every {NONVOTE_UNSAFE_RETRY_H / 24:g} days)")
         g = gap_kind(it.get("what") or "")
         if g in ("election", "award"):
             return ("QUOTE ONCE DATED", f"{'elections' if g == 'election' else 'awards'} "
@@ -1069,7 +1075,9 @@ def real_estimates(client, items: Dict[str, dict], progs: Dict[str, dict],
 # A target is researched on first sight, then again RESEARCH_BACKOFF_H after
 # each unresolved attempt (answers are often not published yet: a rally page,
 # the WH schedule a day ahead), at most RESEARCH_MAX_ATTEMPTS times; a
-# judgment call (not a vote, a new family) is not retried.
+# judgment call (a new family, no such market) is not retried, and a market
+# no vote decides whose news is near ("unsafe", below) is asked again every
+# NONVOTE_UNSAFE_RETRY_H.
 RESEARCH_ENABLE = os.environ.get("IMM_WATCH_RESEARCH", "1") == "1"
 RESEARCH_MAX_TARGETS = int(os.environ.get("IMM_WATCH_RESEARCH_MAX", "8"))
 RESEARCH_TIMEOUT_SECS = int(os.environ.get("IMM_WATCH_RESEARCH_TIMEOUT", "720"))
@@ -1088,6 +1096,25 @@ RESEARCH_MAX_ATTEMPTS = int(os.environ.get("IMM_WATCH_RESEARCH_ATTEMPTS", "6"))
 # vote's day replaces it. Its event's stand-down gap, once it lapses, is
 # not a second target.
 TERM_END_REFRESH_DAYS = float(os.environ.get("IMM_WATCH_TERM_END_REFRESH_DAYS", "5"))
+# NOT A VOTE (Jack 2026-11-10, of KXPRESRUNFIRSTR / D-28 -- "When will the
+# first listed Republican / Democrat announce a 2028 presidential run?", filed
+# "not a vote" and left dark: "even if its not a vote, it can still be safe
+# ascertain if it's safe or not to quote"). A market no vote decides (a
+# candidacy announcement, an appointment no vote decides) is no longer out for
+# that alone: research judges whether its deciding news may come within
+# NONVOTE_HORIZON_DAYS. Quiet: a term-end row marked not_vote (imm_rows.py
+# --term-end --not-vote), re-checked from NONVOTE_REFRESH_DAYS -- still quiet
+# re-stamps it, near removes it (the bot stands down at once; research looks
+# again). Near from the start: status "unsafe", no row, asked again every
+# NONVOTE_UNSAFE_RETRY_H. The bot lets a term-end row stand only
+# imm.ELECTION_TERM_END_RECHECK_DAYS (7) from its check, so missed looks stand
+# it down.
+NONVOTE_HORIZON_DAYS = int(os.environ.get("IMM_WATCH_NONVOTE_HORIZON_DAYS", "14"))
+NONVOTE_REFRESH_DAYS = float(os.environ.get("IMM_WATCH_NONVOTE_REFRESH_DAYS", "3"))
+NONVOTE_UNSAFE_RETRY_H = float(os.environ.get("IMM_WATCH_NONVOTE_UNSAFE_RETRY_H", "72"))
+# the rules research verdicts are made under: an election target's judgment
+# call or give-up from before them is asked again under these, once
+RESEARCH_RULES = "2026-11-10"
 # alert on a researchable item only once research gave up on it (a judgment
 # call, or unresolved twice) -- or when it has simply been dark this long
 ALERT_STALE_HOURS = float(os.environ.get("IMM_GAP_ALERT_STALE_HOURS", "6"))
@@ -1186,20 +1213,29 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
             targets[f"gap:{ev}"] = {"kind": kind, "event": ev,
                                     "series": g.get("series") or imm.series_of(ev),
                                     "msg": g.get("msg") or ""}
-    # the term-end rows due a re-check (live_gaps has just re-read the rows)
+    # the term-end rows due a re-check (live_gaps has just re-read the rows);
+    # a not-a-vote row's sooner, for its news coming near (2026-11-10)
     stored = {r.get("glob"): r for r in imm_rows.load_rows("election")}
     for glob_s, _when, day, _zone, checked in tuple(imm.ELECTION_TERM_ENDS):
-        if now.timestamp() - checked < TERM_END_REFRESH_DAYS * 86400:
+        row = stored.get(glob_s) or {}
+        not_vote = bool(row.get("not_vote"))
+        refresh = NONVOTE_REFRESH_DAYS if not_vote else TERM_END_REFRESH_DAYS
+        if now.timestamp() - checked < refresh * 86400:
             continue
         stamp = datetime.fromtimestamp(checked, timezone.utc).strftime("%Y-%m-%d")
-        zone = (stored.get(glob_s) or {}).get("zone") or ""
-        targets[f"recheck:{glob_s}:{stamp}"] = {
-            "kind": "recheck", "event": glob_s, "series": imm.series_of(glob_s),
-            "checked": checked, "day": str(day),
-            "zone_arg": f" --zone {zone}" if zone else "",
-            "msg": (f"quoting to its term end {day} -- no vote was called when "
-                    f"last checked ({stamp}); out once "
-                    f"{imm.ELECTION_TERM_END_RECHECK_DAYS:g} days pass unchecked")}
+        zone = row.get("zone") or ""
+        t = {"kind": "recheck", "event": glob_s, "series": imm.series_of(glob_s),
+             "checked": checked, "day": str(day),
+             "zone_arg": f" --zone {zone}" if zone else "",
+             "msg": (f"quoting to its term end {day} -- no vote was called when "
+                     f"last checked ({stamp}); out once "
+                     f"{imm.ELECTION_TERM_END_RECHECK_DAYS:g} days pass unchecked")}
+        if not_vote:
+            t["not_vote"] = True
+            t["msg"] = (f"quoting to {day} -- not a vote; its news was quiet when last "
+                        f"checked ({stamp}); out once "
+                        f"{imm.ELECTION_TERM_END_RECHECK_DAYS:g} days pass unchecked")
+        targets[f"recheck:{glob_s}:{stamp}"] = t
     resolved = []
     for ev, series in ieo.discover_broadcast_mention_events(client, now):
         if ev in imm.EVENT_START_OVERRIDES:
@@ -1244,7 +1280,9 @@ def research_due(rstate: Dict[str, dict], targets: Dict[str, dict], now_ts: floa
                  est: Dict[str, float] = None) -> List[str]:
     """The target keys to research now: never tried, or the backoff after the
     last unresolved try has run out; not judgment calls, not past
-    RESEARCH_MAX_ATTEMPTS; and paying -- with `est`, a target with no active
+    RESEARCH_MAX_ATTEMPTS -- but a market judged unsafe (not a vote, its news
+    near) is looked at again every NONVOTE_UNSAFE_RETRY_H, however many
+    looks it took; and paying -- with `est`, a target with no active
     program ($0) waits until one lights (the bot lists unpaid election
     events as gaps too: the 02:20Z 10/08 KX*OUTPERFORMRCP batch). Highest
     estimated value first, at most RESEARCH_MAX_TARGETS."""
@@ -1254,10 +1292,12 @@ def research_due(rstate: Dict[str, dict], targets: Dict[str, dict], now_ts: floa
             continue
         r = rstate.get(key) or {}
         n = int(r.get("attempts") or 0)
-        if r.get("status") == "judgment" or n >= RESEARCH_MAX_ATTEMPTS:
+        status = r.get("status")
+        if status == "judgment" or (n >= RESEARCH_MAX_ATTEMPTS and status != "unsafe"):
             continue
         if n:
-            wait = (RESEARCH_ERROR_RETRY_H if r.get("status") == "error" else
+            wait = (RESEARCH_ERROR_RETRY_H if status == "error" else
+                    NONVOTE_UNSAFE_RETRY_H if status == "unsafe" else
                     RESEARCH_BACKOFF_H[min(n - 1, len(RESEARCH_BACKOFF_H) - 1)]) * 3600
             if now_ts - float(r.get("last") or 0) < wait:
                 continue
@@ -1267,11 +1307,23 @@ def research_due(rstate: Dict[str, dict], targets: Dict[str, dict], now_ts: floa
 
 
 _HOW = {
-    "election": ("the VOTING DAY", "python imm_rows.py election add {ev} YYYY-MM-DD "
+    "election": ("the VOTING DAY -- or, for a market no vote decides, whether it is SAFE "
+                 "TO QUOTE now",
+                 "python imm_rows.py election add {ev} YYYY-MM-DD "
                  "[--zone IANA/Zone] --source \"...\" --source \"...\" --by family-watch-research "
                  "--note \"what the vote is\"   (--zone only for a jurisdiction EAST of US "
                  "Eastern time, e.g. Asia/Jerusalem, Europe/Madrid; add --term-end for a "
-                 "vote not yet called -- see the rules)"),
+                 "vote not yet called, --term-end --not-vote for a market no vote decides "
+                 "that is safe to quote -- see the rules)"),
+    # a not-a-vote row's re-check (2026-11-10): is its news near now?
+    "nvrecheck": (f"whether the news that decides it is NEAR now (within "
+                  f"{NONVOTE_HORIZON_DAYS} days -- the not-a-vote test in the rules); it is "
+                  f"not a vote and quotes only while that news is quiet",
+                  "near: python imm_rows.py election remove {ev}   |   still quiet: python "
+                  "imm_rows.py election add {ev} {day}{zone} --term-end --not-vote --source "
+                  "\"...\" --source \"...\" --by family-watch-research --note \"not a vote: "
+                  "quiet as of <today>: <what you found>\"   (its day {day} past while later "
+                  "markets are still open: the earliest open deadline instead, plus --replace)"),
     # a term-end row's re-check (2026-10-28): has its vote been called since?
     "recheck": ("whether its vote has been CALLED or SCHEDULED since the last check "
                 "(a dissolution, a writ, an announced date)",
@@ -1343,9 +1395,9 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "chamber control, vote share) OR by what a named upcoming vote "
         "decides: who becomes prime minister or a minister, or forms the "
         "government, after that election -- its day is the information "
-        "event. A rally, debate, court case, retirement, or an appointment "
-        "or announcement that no vote decides is NOT a vote: write nothing, "
-        "status judgment.",
+        "event. A rally, debate, court case, retirement, resignation, or an "
+        "appointment or announcement (who runs, who is first to) that no vote "
+        "decides is NOT a vote: judge it by the not-a-vote test below.",
         # 2026-11-04 (Jack, of KXBRFINMIN / KXBRDEFMIN-26OCT25, dark on rows
         # research wrote on 11/04 dated to the past 10/25 Brazil runoff:
         # "should be autoquoting due to elections family")
@@ -1370,11 +1422,44 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "plus --term-end; the sources show the term rule or deadline and that "
         "no vote has been called. The bot quotes to that day and re-checks "
         "weekly.",
+        # 2026-11-10 (Jack, of KXPRESRUNFIRSTR / D-28, filed "not a vote" and
+        # left dark: "even if its not a vote, it can still be safe ascertain
+        # if it's safe or not to quote")
+        f"- NOT A VOTE: decide whether it is SAFE TO QUOTE now. The risk is "
+        f"being picked off: whoever makes the news (the person, their staff, "
+        f"the reporters they brief) knows first, and the bot quotes until it "
+        f"stands down. Search today's news. It is UNSAFE when the deciding "
+        f"news may come within the next {NONVOTE_HORIZON_DAYS} days: a "
+        f"reported plan, date or event to announce or decide in that time; "
+        f"reporting that it is imminent or due 'in the coming days/weeks'; a "
+        f"filing, exploratory committee or launch already in motion; a "
+        f"deadline or vote it must come before within that time; a field "
+        f"being settled right now (rivals announcing, some of the event's "
+        f"markets already closed or settled early); or the market moving "
+        f"sharply on it in the last few days. For a market on who does it, "
+        f"or who does it first, ANY person listed counts. UNSAFE: write "
+        f"nothing; status \"unsafe\", the note says what makes it near, with "
+        f"sources. SAFE (none of that): write the election command plus "
+        f"--term-end --not-vote on the EARLIEST of the day the deciding news "
+        f"is due if one is set, the earliest deadline among the event's open "
+        f"markets, and Kalshi's own date for the event; the sources are "
+        f"Kalshi's terms for that day and recent news that shows nothing is "
+        f"near; the note is \"not a vote: <what decides it>; quiet as of "
+        f"<today>: <what you found>\". The bot quotes to that day while "
+        f"research re-checks it every {NONVOTE_REFRESH_DAYS:g} days.",
         "- A recheck target already quotes to its term end: look for news "
         "that its vote has since been called or scheduled. Called: write the "
         "voting day (no --term-end). Not called yet: write the same term-end "
         "row again with the command shown (it re-stamps the check). Two "
         "sources either way.",
+        "- A recheck (not a vote) target quotes to its row's day only while "
+        "its news is quiet: apply the not-a-vote test to today's news. Near: "
+        "remove its row with the command shown (the bot stops quoting at "
+        "once; research looks at it again later), status \"unsafe\". Still "
+        "quiet: write the same row again with the command shown (it re-stamps "
+        "the check; two sources, as for the first row) -- or, if its day has "
+        "passed while later markets are still open, the earliest open "
+        "deadline, plus --replace.",
         "- The only commands you may run are the ones shown, plus "
         "`python imm_rows.py election lookup EVENT` (read-only: Kalshi's own "
         "wording). If a command prints REFUSED, do not work around it.",
@@ -1382,15 +1467,16 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "Targets:",
     ]
     for i, (key, t, ctx) in enumerate(items, 1):
-        what, cmd = _HOW[t["kind"]]
-        lines += [f"{i}. KEY {key} -- {t['kind']}: find {what}.",
+        what, cmd = _HOW["nvrecheck" if t.get("not_vote") else t["kind"]]
+        label = f"{t['kind']} (not a vote)" if t.get("not_vote") else t["kind"]
+        lines += [f"{i}. KEY {key} -- {label}: find {what}.",
                   f"   bot says: {t['msg']}",
                   f"   Kalshi: {ctx}",
                   f"   write with: {cmd.format(ev=t['event'], day=t.get('day', ''), zone=t.get('zone_arg', ''))}"]
     lines += [
         "",
         "Finish with ONE line, nothing after it:",
-        "RESULT_JSON: {\"<KEY>\": {\"status\": \"written\"|\"judgment\"|"
+        "RESULT_JSON: {\"<KEY>\": {\"status\": \"written\"|\"unsafe\"|\"judgment\"|"
         "\"unresolved\", \"note\": \"value + sources, or why\"}, ...}",
         "covering every KEY above.",
     ]
@@ -1624,6 +1710,27 @@ def prune_research(rstate: Dict[str, dict], targets: Dict[str, dict],
     return out
 
 
+def requeue_old_rules(rstate: Dict[str, dict], targets: Dict[str, dict]) -> List[str]:
+    """An election target research gave up on under rules before
+    RESEARCH_RULES -- a judgment call (2026-11-10: "not a vote", which the
+    not-a-vote test now judges for safety instead), or the attempt cap (its
+    verdicts unread until 201ffda) -- gets fresh tries under these, once:
+    the new record carries the stamp. Returns a note per target."""
+    notes = []
+    for k, r in list(rstate.items()):
+        if (targets.get(k) or {}).get("kind") != "election" or r.get("rules") == RESEARCH_RULES:
+            continue
+        n = int(r.get("attempts") or 0)
+        if r.get("status") != "judgment" and n < RESEARCH_MAX_ATTEMPTS:
+            continue
+        notes.append(f"{k}: asked again under the {RESEARCH_RULES} rules (was "
+                     f"{r.get('status')} after {n} tr{'y' if n == 1 else 'ies'}: "
+                     f"{str(r.get('note') or '')[:90]})")
+        rstate[k] = {"attempts": 0, "rules": RESEARCH_RULES,
+                     "seen": r.get("seen") or r.get("last")}
+    return notes
+
+
 def target_fixed(t: dict) -> bool:
     """Whether a research target's row / start time is now in place."""
     ev = t["event"]
@@ -1660,10 +1767,13 @@ def apply_results(rstate: Dict[str, dict], due: List[str], targets: Dict[str, di
         r = rstate.setdefault(k, {})
         r["attempts"] = int(r.get("attempts") or 0) + 1
         r["last"] = r["seen"] = now_ts
+        r["rules"] = RESEARCH_RULES
         got = matched.get(k) or {}
         status = str(got.get("status") or "").strip().lower().replace("judgement", "judgment")
         note = str(got.get("note") or "")
-        if status not in ("written", "judgment", "unresolved"):
+        if status == "unsafe" and targets[k]["kind"] not in ("election", "recheck"):
+            status = "judgment"           # the not-a-vote test is for election markets
+        if status not in ("written", "unsafe", "judgment", "unresolved"):
             if target_fixed(targets[k]):
                 status, note = "written", "row in place after the run (no result line)"
             else:
@@ -1682,10 +1792,10 @@ def research_pass(client, gaps: dict, state: dict, dry: bool) -> Tuple[Dict[str,
     now_ts = time.time()
     targets = research_targets(client, gaps, datetime.now(timezone.utc), dry)
     rstate = prune_research(state.get("research") or {}, targets, now_ts)
+    notes = requeue_old_rules(rstate, targets)
     pools = event_pools(ifa.fetch_active_programs(client)) if targets else {}
     est = {k: pools.get(t["event"], 0.0) * GAP_CAPTURE for k, t in targets.items()}
     due = research_due(rstate, targets, now_ts, est)
-    notes = []
     if due and RESEARCH_ENABLE and not dry:
         items = [(k, targets[k], imm_rows.lookup(targets[k]["event"]).replace("\n", " / ")[:900])
                  for k in due]
