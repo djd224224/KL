@@ -7727,7 +7727,14 @@ CPI_PILOT_FAMILIES = tuple(sorted(
     s.strip() for s in os.environ.get(
         "IMM_CPI_PILOT_FAMILIES", "KXCPICOREYOY").split(",")
     if s.strip()))
-_cpi_until = os.environ.get("IMM_CPI_PILOT_UNTIL", "").strip()
+# PILOT ENDED (Jack 2026-11-11 01:48Z: "stop quoting CPI"). The default end
+# is the moment he asked, so the block closes over every pilot event and
+# family again: no new orders, resting quotes are cancelled the next cycle,
+# and positions ride to their releases. The guards above and the pilot lists
+# stay, so restarting the pilot is only a matter of setting the end:
+# IMM_CPI_PILOT_UNTIL="" (env = task restart) means no end, as before.
+_cpi_until = os.environ.get(
+    "IMM_CPI_PILOT_UNTIL", "2026-11-11T01:48:00+00:00").strip()
 CPI_PILOT_UNTIL: Optional[datetime] = (
     datetime.fromisoformat(_cpi_until) if _cpi_until else None)   # None = no end
 CPI_PILOT_BLACKOUT_ET = tuple(os.environ.get(

@@ -5439,7 +5439,14 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         # IMM_CPI_PILOT_UNTIL can still set one.
         self.assertEqual(imm.CPI_PILOT_EVENTS,
                          ("KXCPICORE-26DEC", "KXCPICORE-26NOV"))
-        self.assertIsNone(imm.CPI_PILOT_UNTIL)
+        # Jack 2026-11-11 01:48Z: "stop quoting CPI" -- the default end is
+        # that moment, so the shipped bot blocks every pilot event and family
+        self.assertEqual(imm.CPI_PILOT_UNTIL,
+                         datetime(2026, 11, 11, 1, 48, tzinfo=timezone.utc))
+        for t in ("KXCPICORE-26NOV-T0.3", "KXCPICORE-26DEC-T0.2",
+                  "KXCPICOREYOY-26DEC-T3.0", "KXCPICOREYOY-26NOV-T2.5"):
+            self.assertFalse(imm.cpi_pilot_active(t), t)
+            self.assertTrue(IncentiveMarketMaker._blocked(t), t)
         prev_only, prev_until = imm.ALLOWLIST_ONLY, imm.CPI_PILOT_UNTIL
         try:
             imm.ALLOWLIST_ONLY = True
