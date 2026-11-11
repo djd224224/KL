@@ -233,9 +233,12 @@ def fills_in(tickers, lo, hi, spans=None):
                     continue
                 if spans is not None and not in_spans(spans, t, float(f.get("ts") or 0)):
                     continue
-                px = f.get("our_price_cents")
+                # the trade's own YES price first: our_price_cents is the order
+                # ledger's whole-cent price, 0 on a sub-penny rung (SKNA's
+                # 9,880 @ 0.4c on 11/10 read as $0.00)
+                px = f.get("yes_price_cents")
                 if px is None:
-                    px = f.get("yes_price_cents")
+                    px = f.get("our_price_cents")
                 bs = f.get("our_book_side") or ("bid" if (f.get("side") == "yes") == (f.get("action") == "buy")
                                                 else "ask")
                 if px is None:
