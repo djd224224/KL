@@ -1561,9 +1561,11 @@ class TestScreen(unittest.TestCase):
                 self.assertFalse(IncentiveMarketMaker._allowed(t), t)
         finally:
             imm.ALLOWLIST_ONLY = prev_only
-        # max 3 markets per event, by ROI, EXACT series (a prefix entry
-        # would have capped KXARTISTSTREAMS the day the scan admitted one)
-        self.assertEqual(imm.event_top_n_for("KXART"), 3)
+        # max 5 markets per event (Jack 2026-11-11: "allow quoting on up to
+        # 5 markets on the event"; 3 from 9/25), by ROI, EXACT series (a
+        # prefix entry would have capped KXARTISTSTREAMS the day the scan
+        # admitted one)
+        self.assertEqual(imm.event_top_n_for("KXART"), 5)
         for s in ("KXARTISTSTREAMS", "KXARTEMISII", "KXARTICICE", "KXRT"):
             self.assertEqual(imm.event_top_n_for(s), 0, s)
 
@@ -1577,9 +1579,10 @@ class TestScreen(unittest.TestCase):
                 for i, est in enumerate((2.0, 3.0, 1.0, 4.0, 0.5, 2.5, 0.2,
                                          1.5, 0.1))]
         cut = imm.event_top_n_cut(lots, incumbent=set())
-        self.assertEqual(len(cut), 6)
+        self.assertEqual(len(cut), 4)
         self.assertEqual({m.ticker for m in lots} - cut,
-                         {f"{ev}-60000", f"{ev}-40000", f"{ev}-80000"})
+                         {f"{ev}-60000", f"{ev}-40000", f"{ev}-80000",
+                          f"{ev}-30000", f"{ev}-100000"})
         # no other override: no cap, no safe-join, no hour rule (the 2-98c
         # band only: TestArtFloorBoost)
         ov = imm.series_override("KXART")
@@ -28496,7 +28499,7 @@ class TestArtFloorBoost(unittest.TestCase):
         self.assertEqual(caps(None, None), (400, 400))
         self.assertEqual(caps(4, 95, lead_bid_px=16), (400, 10000))   # a lead ahead
         self.assertEqual(caps(4, 95, lead_ask_px=97), (10000, 10000))
-        self.assertEqual(imm.event_cap_contracts(self.EV), 30000.0)
+        self.assertEqual(imm.event_cap_contracts(self.EV), 50000.0)
         self.assertEqual(imm.ART_BOOST_STEPS[0], 1.0)
         self.assertEqual(imm.ART_BOOST_STEPS[-1], 500.0)
         self.assertEqual(list(imm.ART_BOOST_STEPS), sorted(imm.ART_BOOST_STEPS))

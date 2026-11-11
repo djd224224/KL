@@ -3682,8 +3682,12 @@ EVENT_TOP_N = _parse_event_top_n(os.environ.get("IMM_EVENT_TOP_N",
                                                 # markets per event")
                                                 "*DATACENTERS:3,"
                                                 # exact: KXART is a prefix
-                                                # of 20 unrelated series
-                                                "=KXART:3,"
+                                                # of 20 unrelated series.
+                                                # 5 per lot since 2026-11-11
+                                                # (Jack: "allow quoting on
+                                                # up to 5 markets on the
+                                                # event"; 3 from 9/25)
+                                                "=KXART:5,"
                                                 # award shows (2026-09-25);
                                                 # the Oscars are a prefix
                                                 # FAMILY (KXOSCAR<CATEGORY>).
@@ -7607,8 +7611,8 @@ _DEFAULT_ECON_SERIES = (
 # 9/27 03:59Z), never quoted, zero positions. Exact series -- KXART is a
 # prefix of twenty unrelated series (KXARTISTSTREAMS*, KXARTISTCOLLAB*,
 # KXARTEMISII, KXARTICICE), none of which rides in. Two rules of its own:
-# the 3-per-event ROI cap (EVENT_TOP_N "=KXART:3", the exact-match form
-# added for it) and the AUCTION-DAY CUTOFF (AUCTION_DATE_SERIES): the hammer
+# the per-event ROI cap (EVENT_TOP_N "=KXART:<N>", the exact-match form
+# added for it; 3, then 5 from 2026-11-11) and the AUCTION-DAY CUTOFF (AUCTION_DATE_SERIES): the hammer
 # is the reveal, a day before the close, and the trailing DDMMMYY in the
 # event segment is what parse_event_date cannot read.
 # AWARD SHOWS (Jack 2026-09-25: "allowlist KXGGNOM, KXNATBOOKAWARDS,
@@ -11795,7 +11799,7 @@ SPRLVLDATE_SIZE_MULT = _env_float("IMM_SPRLVLDATE_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXSPRLVLDATE"] = SeriesOverride(size_mult=SPRLVLDATE_SIZE_MULT)
 
 # ART LOT SALES. KXART markets settle on one auction lot's sale price
-# (Sotheby's, Christie's, Phillips; 3 markets per lot). On 11/11 at 12:16Z,
+# (Sotheby's, Christie's, Phillips; 5 markets per lot). On 11/11 at 12:16Z,
 # lots 106 and 121 of Sotheby's 11/16 evening sale had reward walls of
 # 23k-91k contracts at a 3-4c YES bid and a 95-96c ask on both sides of
 # nearly every strike.
@@ -11824,7 +11828,8 @@ SERIES_OVERRIDES["KXSPRLVLDATE"] = SeriesOverride(size_mult=SPRLVLDATE_SIZE_MULT
 #     and lowers it once a smaller step projects the secure line. The step
 #     is persisted and lasts while the market is selected. A market no step
 #     lifts stays out.
-#   - The per-lot net cap is ART_EVENT_CAP (30,000 = 3 markets x 10k), so the
+#   - The per-lot net cap is ART_EVENT_CAP (50,000 = 5 markets x 10k, since
+#     the lot cap went 3 -> 5 the same day; 30,000 before), so the
 #     per-market caps bind. The skew knees are unchanged.
 #   - IMM_ART_BOOST_SIDE_CAP=0 turns the boost off.
 ART_PRICE_MIN = _env_int("IMM_ART_PRICE_MIN", 2)
@@ -11837,7 +11842,7 @@ ART_BOOST_CHEAP_C = _env_int("IMM_ART_BOOST_CHEAP_C", 5)
 ART_BOOST_CHEAP_SIDE_CAP = _env_int("IMM_ART_BOOST_CHEAP_SIDE_CAP", 10000)
 ART_BOOST_STEPS: Tuple[float, ...] = (1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0,
                                       30.0, 50.0, 75.0, 100.0, 150.0, 250.0, 500.0)
-ART_EVENT_CAP = _env_float("IMM_ART_EVENT_CAP", 30000.0)
+ART_EVENT_CAP = _env_float("IMM_ART_EVENT_CAP", 50000.0)
 
 
 def art_boost_series(series: str) -> bool:
