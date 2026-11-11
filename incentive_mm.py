@@ -13392,6 +13392,22 @@ UNWIND_WAVES_ONLY_FILE = os.path.join(STATUS_DIR, "UNWIND_ONLY_WAVES")
 # breakeven or better. Recreating the file covers every wave listed by then.
 # IMM_UNWIND_WAVES_EXEMPT_NEW=0 = the switch covers every listed market again.
 UNWIND_WAVES_EXEMPT_NEW = os.environ.get("IMM_UNWIND_WAVES_EXEMPT_NEW", "1") != "0"
+# ...BUT A NEWER WAVE'S HELD MARKETS STILL UNWIND (Jack 2026-11-11: "if the 2028
+# previously quoted markets get relit, they should be quoted. if new 2028
+# markets come online, they should be quoted. only the markets with positions
+# should be on unwind mode"): a market of a wave added after the switch (its
+# entry's wave_added) unwinds at breakeven or better WHILE the bot holds its own
+# position there (1+ contracts, PnlTracker.pos) -- a fill on a flat one puts it
+# on that unwind until it is flat again -- and quotes both sides as usual while
+# flat; its held markets outside the selection are managed for the unwind too
+# (_wave_unwind_manage). A wave listed before the switch (no wave_added: the
+# hand-built waves of 11/04-11/07, whose relight passes carried the 11/07 sizes)
+# is unchanged -- nothing while flat, the unwind while held -- until a registry
+# tune or the relight task stamps its entries (pvd_wave_tune --wave-added). On
+# 11/11 the 2028 relight sat dark that way: 724 markets listed, 1 quoting.
+# Without the switch file none of this applies. IMM_UNWIND_WAVES_HELD=0 = a
+# newer wave rides as before (both sides, positions included).
+UNWIND_WAVES_HELD = os.environ.get("IMM_UNWIND_WAVES_HELD", "1") != "0"
 # NO LEAD (Jack 2026-11-08: "when unwinding, dont lead like in
 # KXHOUSERACE-AR02-28-D"): every unwind order (unwind_only_quotes: UNWIND ONLY,
 # the waves' breakeven unwind and their held markets) rests no better than the
@@ -14354,6 +14370,7 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
     "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
+    "UNWIND_WAVES_HELD",          # a newer wave's held markets unwind (2026-11-11)
     # the twin check in mutually exclusive events (2026-11-11)
     "TWIN_CHECK_MODE", "TWIN_CHECK_TOL_C",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
@@ -35892,11 +35909,17 @@ class IncentiveMarketMaker:
     def _waves_switch_covers(self, t: str) -> bool:
         """Is `t` one of the waves UNWIND_WAVES_ONLY_FILE covers: a listed wave
         market (or a held one off the list, _wave_unwind) whose wave existed
-        when the switch appeared?"""
+        when the switch appeared -- or, since 2026-11-11 (UNWIND_WAVES_HELD),
+        a newer wave's market while the bot holds its own position there?"""
         if t in self._wave_unwind:
             return True
         e = wave_entry(t)
-        return e is not None and not self._wave_after_switch(e)
+        if e is None:
+            return False
+        if not self._wave_after_switch(e):
+            return True
+        # HELD MARKETS ONLY: a newer wave's market unwinds while held, quotes while flat
+        return UNWIND_WAVES_HELD and abs(self.pnl.pos.get(t, 0.0)) >= 1
 
     def _unwinds(self, t: str) -> bool:
         """Does market `t` only unwind this cycle (UNWIND ONLY, and not a
@@ -37240,7 +37263,8 @@ class IncentiveMarketMaker:
         want = [t for t in PVD_MARKETS
                 if t not in managed and not self._blocked(t)
                 and not PVD_MARKETS[t].get("cheap")        # no wave: its fills ride
-                and not self._wave_after_switch(PVD_MARKETS[t])   # a new wave: rides
+                # a newer wave's held markets unwind too (UNWIND_WAVES_HELD, 2026-11-11)
+                and (UNWIND_WAVES_HELD or not self._wave_after_switch(PVD_MARKETS[t]))
                 and abs(self.pnl.pos.get(t, 0.0)) >= REDUCE_ONLY_MIN_CONTRACTS
                 and abs(positions.get(t, 0.0) - self.pnl.pos.get(t, 0.0))
                 < MANUAL_STANDOFF_CONTRACTS]
@@ -44125,6 +44149,10 @@ class IncentiveMarketMaker:
         log(f"unwind-only waves scope (2026-11-08): "
             + ("existing waves -- UNWIND_ONLY_WAVES covers the waves listed before the switch "
                "file appeared; a wave added after it quotes as usual"
+               + ("; held markets only (2026-11-11): a newer wave's market unwinds at "
+                  "breakeven or better while the bot holds a position there, and quotes "
+                  "both sides while flat" if UNWIND_WAVES_HELD else
+                  ", positions included (IMM_UNWIND_WAVES_HELD=0)")
                if UNWIND_WAVES_EXEMPT_NEW else
                "every listed wave (IMM_UNWIND_WAVES_EXEMPT_NEW=0)"))
         log(f"strait weeklies (2026-11-08): "

@@ -41867,9 +41867,86 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         # the knob off: every listed market unwinds again
         with mock.patch.object(imm, "UNWIND_WAVES_EXEMPT_NEW", False):
             self.assertTrue(bot._unwinds(self.T))
-        # a new wave's held market off the list rides (no breakeven unwind)
+        # (whether a newer wave's held market unwinds: UNWIND_WAVES_HELD, next test)
         self.assertFalse(bot._wave_after_switch({"wave_added": t0 - 1}))
         self.assertTrue(bot._wave_after_switch({"wave_added": t0 + 1}))
+
+    def test_a_newer_wave_unwinds_its_held_markets_only(self):
+        """Jack 2026-11-11: "if the 2028 previously quoted markets get relit, they
+        should be quoted. if new 2028 markets come online, they should be quoted.
+        only the markets with positions should be on unwind mode" -- while
+        UNWIND_ONLY_WAVES exists, a newer wave's market (wave_added after the
+        switch) quotes both sides while flat and unwinds at breakeven or better
+        while the bot holds a position there; a wave listed before the switch
+        (no wave_added) is unchanged; IMM_UNWIND_WAVES_HELD=0 lets it ride"""
+        self.assertTrue(imm.UNWIND_WAVES_HELD)
+        self.assertIn("UNWIND_WAVES_HELD", imm._CONFIG_CODE_KNOBS)
+        f = imm.UNWIND_WAVES_ONLY_FILE
+        open(f, "w").close()
+        self.addCleanup(lambda: os.path.exists(f) and os.remove(f))
+        t0 = os.path.getmtime(f)
+        z = lambda s: datetime.fromtimestamp(s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        new, old = z(t0 + 3600), None
+
+        def cycle(wa, pos, held_rule=True):
+            _clean_persist()
+            e = {"bid_max": 49, "ask_min": 51, "size": 200}
+            if wa:
+                e["wave_added"] = wa
+            self._write({self.T: e})
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            if pos:
+                bot.pnl.pos[self.T], bot.pnl.avg[self.T] = pos, 44.0
+                bot.client.positions[self.T] = pos
+            with mock.patch.object(imm, "UNWIND_WAVES_HELD", held_rule), \
+                    mock.patch.object(imm, "log", lambda *a: None):
+                bot.run_cycle()
+                unwinds = (bot._unwinds(self.T), bot._unwinds_at_breakeven(self.T))
+            rungs = sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                           for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+            return bot, unwinds, rungs
+
+        # a newer wave, flat: both sides as usual
+        _b, unwinds, rungs = cycle(new, 0.0)
+        self.assertEqual(unwinds, (False, False))
+        self.assertEqual({r[0] for r in rungs}, {"bid", "ask"})
+        # ...held long 40 @ 44c: only the ask, the whole 40, at breakeven or better
+        bot, unwinds, rungs = cycle(new, 40.0)
+        self.assertEqual(unwinds, (True, True))
+        self.assertEqual(len(rungs), 1, rungs)
+        self.assertEqual((rungs[0][0], rungs[0][2]), ("ask", 40.0))
+        self.assertGreaterEqual(rungs[0][1], 44)
+        # ...short 40 @ 44c: only the bid, at 44c or better
+        _b, unwinds, rungs = cycle(new, -40.0)
+        self.assertEqual(unwinds, (True, True))
+        self.assertEqual([(r[0], r[2]) for r in rungs], [("bid", 40.0)])
+        self.assertLessEqual(rungs[0][1], 44)
+        # a wave listed before the switch: unchanged -- nothing flat, the unwind held
+        _b, unwinds, rungs = cycle(old, 0.0)
+        self.assertEqual((unwinds, rungs), ((True, True), []))
+        _b, unwinds, rungs = cycle(old, 40.0)
+        self.assertEqual([(r[0], r[2]) for r in rungs], [("ask", 40.0)])
+        # the knob off: a newer wave's held market rides, both sides
+        _b, unwinds, rungs = cycle(new, 40.0, held_rule=False)
+        self.assertEqual(unwinds, (False, False))
+        self.assertEqual({r[0] for r in rungs}, {"bid", "ask"})
+        # a newer wave's held market OUTSIDE the selection is managed for the unwind
+        bot._wave_unwind.clear()
+        bot.pnl.pos[self.T] = 40.0
+        managed = {}
+        with mock.patch.object(imm, "log", lambda *a: None):
+            bot._wave_unwind_manage(managed, {self.T: 40.0})
+        self.assertIn(self.T, managed)
+        with mock.patch.object(imm, "UNWIND_WAVES_HELD", False), \
+                mock.patch.object(imm, "log", lambda *a: None):
+            managed = {}
+            bot._wave_unwind_manage(managed, {self.T: 40.0})
+        self.assertNotIn(self.T, managed)
+        # no switch file: none of it applies
+        os.remove(f)
+        _b, unwinds, rungs = cycle(new, 40.0)
+        self.assertEqual(unwinds, (False, False))
+        self.assertEqual({r[0] for r in rungs}, {"bid", "ask"})
 
     def test_lone_ref_guard_on_for_the_wave_list(self):
         """Jack 2026-11-08: "turn on lone ref guard for market-wave" -- a listed
