@@ -28358,6 +28358,16 @@ class TestForceEventsEmptied(unittest.TestCase):
         self.assertEqual(ov.size_mult, 2 * fam.size_mult)
         self.assertEqual(dataclasses.replace(ov, size_mult=fam.size_mult), fam)
 
+    def test_sprlvldate_rests_at_twice_the_global_size(self):
+        """Jack 2026-11-10: "2x SPR to get it over the payout bar". Only the
+        size changes (the global spec otherwise), and the applied multiplier
+        that the ladder, the caps and the floor projection read is 2."""
+        ov = imm.SERIES_OVERRIDES["KXSPRLVLDATE"]
+        self.assertEqual(ov, imm.SeriesOverride(size_mult=2.0))
+        with mock.patch.object(imm, "size_test_mult", return_value=1.0):
+            self.assertEqual(imm.applied_mention_mult("KXSPRLVLDATE"), 2.0)
+        self.assertIn("SPRLVLDATE_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+
 
 class TestFloorSideSchedule(unittest.TestCase):
     """ROI scan fix (Jack 2026-09-27, "fix all 3"): the Carbon Arc

@@ -11778,6 +11778,19 @@ SERIES_OVERRIDES["KXFIRSTSUPERBOWLSONG"] = SeriesOverride(
     price_min_cents=HALFTIME_PRICE_MIN, price_max_cents=HALFTIME_PRICE_MAX)
 SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | {"KXSBSETLISTS"}
 
+# KXSPRLVLDATE x2 (Jack 2026-11-10: "2x SPR to get it over the payout bar").
+# "When will the US SPR level be above 300 million barrels?", three markets
+# (before Jul 1 2027 / Oct 1 2027 / Jan 1 2028) that settle on EIA's weekly
+# SPR level. It was hand-added to extra_allow_series.json at 01:33Z 11/11,
+# with KXARCTICICEMAX. At x1, behind 7k-37k walls on both sides, the markets
+# projected $1.04 / $0.55 / $0.56 to the program end (11/15 05:00Z) against
+# the $1.10 bar, and none rested. The multiplier uses the size_mult wire, so
+# the ladder, the per-market and per-event caps and the payout-floor
+# projection all double. The split size test ended 11/09, so nothing stacks
+# on top. IMM_SPRLVLDATE_SIZE_MULT sets it.
+SPRLVLDATE_SIZE_MULT = _env_float("IMM_SPRLVLDATE_SIZE_MULT", 2.0)
+SERIES_OVERRIDES["KXSPRLVLDATE"] = SeriesOverride(size_mult=SPRLVLDATE_SIZE_MULT)
+
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
 # on its print day" / "make sure KXTRUEV is quoting"). That breaks the
@@ -14196,6 +14209,7 @@ _CONFIG_CODE_KNOBS = (
     "TRUMPVH_SIZE_MULT",          # the weekly VoteHub approval x3 (2026-10-31)
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
+    "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",
