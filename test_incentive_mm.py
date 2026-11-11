@@ -28564,16 +28564,47 @@ class TestArtFloorBoost(unittest.TestCase):
         again = IncentiveMarketMaker(client=FakeClient(), live=False)
         self.assertEqual(again.state.art_floor_boost, {self.T: step})
         # with the bar down, it comes down to the smallest step that still
-        # projects the line -- here the $1.00 cliff, as its own size projects
-        # ~$0.13 (vercel_boost_pick: never under the payout floor)
+        # projects the SIZE AIM ($1.20; its own size projects ~$0.13)
         rungs, lines = self._run(bot, 0.5 * P, NEAR_CLIFF_SECURE_DOLLARS=0.9 * P)
         down = bot.state.art_floor_boost.get(self.T)
         self.assertIsNotNone(down)
         self.assertLess(down, step)
         self.assertEqual(rungs.get("bid"), [(4, int(20 * down))], rungs)
         self.assertTrue(any(f"art floor boost: {self.T} projects" in x
-                            and f"at x{down:g}, over the $1.00 line" in x
+                            and f"at x{down:g}, over the $1.20 aim" in x
                             and f"down from x{step:g}" in x for x in lines), lines)
+
+    def test_the_size_aim(self):
+        """Jack 2026-11-11: "in general as a rule of thumb when sizing to hit
+        threshold, aim for $1.2" (SIZE AIM)."""
+        self.assertEqual(imm.SIZE_AIM_DOLLARS, 1.20)
+        self.assertIn("SIZE_AIM_DOLLARS", imm._CONFIG_CODE_KNOBS)
+        pick = imm.vercel_boost_pick
+        proj = {1.0: 1.05, 1.5: 1.12, 2.0: 1.18, 3.0: 1.26, 5.0: 1.40}
+        # a member at $1.05 (bar $1.00, line $1.10) goes to the first step
+        # at $1.20, not the first over the bar
+        self.assertEqual(pick(1.0, proj, 1.0, 1.1, aim=1.2), 3.0)
+        self.assertEqual(pick(1.0, proj, 1.0, 1.1), 1.0)          # (bar only)
+        # a fresh one under the $1.10 bar: the same
+        self.assertEqual(pick(1.0, {**proj, 1.0: 0.4}, 1.1, 1.1, aim=1.2), 3.0)
+        # held between the line and the aim; down only to a step at the aim
+        self.assertEqual(pick(3.0, {**proj, 3.0: 1.15}, 1.0, 1.1, aim=1.2), 3.0)
+        self.assertEqual(pick(5.0, proj, 1.0, 1.1, aim=1.2), 3.0)
+        # under the line with nothing at the aim: the smallest step at the
+        # best projection over the bar, else where it is
+        low = {1.0: 0.5, 1.5: 0.9, 2.0: 1.04, 3.0: 1.04}
+        self.assertEqual(pick(1.0, low, 1.0, 1.1, aim=1.2), 2.0)
+        self.assertEqual(pick(1.0, {1.0: 0.5, 2.0: 0.8}, 1.0, 1.1, aim=1.2), 1.0)
+        # a bar the aim sits under is the target itself; no bar = no sizing
+        self.assertEqual(pick(1.0, {1.0: 1.0, 2.0: 2.0, 3.0: 3.0}, 2.5, 2.5, aim=1.2), 3.0)
+        self.assertEqual(pick(1.0, {1.0: 0.1, 2.0: 1.3}, 0.0, 1.1, aim=1.2), 1.0)
+        # the RT floor boost: x2 clears the $1.10 bar, x2.5 reaches $1.20
+        f = imm.rt_floor_boost_mult
+        self.assertEqual(f(0.0, 0.5, 1.1), 2.5)
+        self.assertEqual(f(0.0, 0.56, 1.1), 2.0)
+        self.assertEqual(f(0.0, 0.56, 1.1, aim=1.2), 2.5)
+        self.assertEqual(f(0.0, 0.45, 1.1, aim=1.2), 2.5)        # (only the bar)
+        self.assertIsNone(f(0.0, 0.4, 1.1, aim=1.2))
 
 
 class TestFloorSideSchedule(unittest.TestCase):

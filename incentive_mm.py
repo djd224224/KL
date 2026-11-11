@@ -13041,6 +13041,21 @@ NEAR_CLIFF_BOOST_MIN_BANKED = _env_float("IMM_NEAR_CLIFF_BOOST_MIN_BANKED", 0.50
 # markets finished at a median $1.37 -- they were mostly safe already).
 # A value at or under PAYOUT_FLOOR_DOLLARS switches the line off.
 NEAR_CLIFF_SECURE_DOLLARS = _env_float("IMM_NEAR_CLIFF_SECURE_DOLLARS", 1.10)
+# SIZE AIM (Jack 2026-11-11: "in general as a rule of thumb when sizing to
+# hit threshold, aim for $1.2"). The floor boosts size a market to project
+# at least this much, not just to clear the bar. Without it, the art boost
+# left 22 of its 149 markets at $1.00-1.10 on 11/11, a slip from the $1
+# cliff, where a period pays nothing.
+# - The VERCEL and ART FLOOR BOOSTS (vercel_boost_pick, aim=): a market
+#   under the secure line (NEAR_CLIFF_SECURE_DOLLARS) takes the smallest
+#   step projecting max(this, the bar). With no step that high, it takes the
+#   smallest step at the best projection that still clears the bar.
+#   A boosted market comes down only to a step that still projects this.
+# - The RT FLOOR BOOST (rt_floor_boost_mult, aim=): the smallest step
+#   projecting max(this, the bar), else the smallest that clears the bar.
+# - The entry bar and the hold bar are unchanged.
+# IMM_SIZE_AIM_DOLLARS=0 restores the bar-only sizing.
+SIZE_AIM_DOLLARS = _env_float("IMM_SIZE_AIM_DOLLARS", 1.20)
 # YIELD SIZE MODE (Jack 2026-10-02, "1 and 2 for monday", from the multiplier
 # review): from 00:00 ET 2026-10-05 a market whose modelled reward per resting
 # contract (meta.yield_per_contract, $/contract/day -- the estimator's own
@@ -14077,6 +14092,8 @@ _CONFIG_CODE_KNOBS = (
     "NEAR_CLIFF_BOOST_MIN_BANKED",
     # ...and its secure line above the cliff (2026-10-30)
     "NEAR_CLIFF_SECURE_DOLLARS",
+    # the floor boosts size to project this (SIZE AIM, 2026-11-11)
+    "SIZE_AIM_DOLLARS",
     # decision-input logging (2026-09-26): the thresholds the logged inputs
     # are compared against, so a guard_skips / floor row can be read against
     # the rule that was actually in force (HOPELESS_SUSTAIN_SECS and
@@ -17639,10 +17656,12 @@ def rt_floor_boost_series(series: str) -> bool:
     return RT_FLOOR_BOOST_MAX > 1.0 and rt_fair_series(series)
 
 
-def rt_floor_boost_mult(accrued: float, plain: float, bar: float) -> Optional[float]:
+def rt_floor_boost_mult(accrued: float, plain: float, bar: float,
+                        aim: float = 0.0) -> Optional[float]:
     """The smallest step -- x1.5, x2 ... RT_FLOOR_BOOST_MAX -- at which the
     period's `accrued` plus `plain` (the projection at the market's own
-    size) times the step clears `bar`; None when even the largest does not."""
+    size) times the step reaches max(`aim`, `bar`) (SIZE AIM), else the
+    smallest that clears `bar`; None when even the largest does not."""
     if RT_FLOOR_BOOST_MAX <= 1.0 or plain <= 0:
         return None
     steps, m = [], 1.5
@@ -17650,6 +17669,10 @@ def rt_floor_boost_mult(accrued: float, plain: float, bar: float) -> Optional[fl
         steps.append(m)
         m += 0.5
     steps.append(RT_FLOOR_BOOST_MAX)
+    target = max(aim, bar)
+    hit = next((m for m in steps if accrued + m * plain >= target), None)
+    if hit is not None:
+        return hit
     return next((m for m in steps if accrued + m * plain >= bar), None)
 
 
@@ -17715,14 +17738,34 @@ def vercel_boost_cap(maxpos: float, boost: float) -> float:
 
 
 def vercel_boost_pick(cur: float, proj: Dict[float, float], bar: float,
-                      line: float) -> float:
+                      line: float, aim: Optional[float] = None) -> float:
     """The VERCEL FLOOR BOOST step for this refresh. `proj` = {step: banked +
     projected total at that step}, x1 included; `cur` = the step the market
     rests at now. A boosted market steps DOWN to the smallest step that
     projects `line` (never under `bar`), else holds while its own step still
     clears `bar`; otherwise -- and unboosted -- it takes the smallest step that
-    clears `bar`. With none clearing it, `cur` stands: no size lifts it."""
+    clears `bar`. With none clearing it, `cur` stands: no size lifts it.
+
+    With `aim` (SIZE AIM, 2026-11-11; the ART FLOOR BOOST's too) and a bar
+    over 0: a market whose own step projects `line` (and `bar`) or more holds
+    it, or comes down to the smallest step still projecting max(`aim`,
+    `line`). Under that, it takes the smallest step projecting that much,
+    else the smallest at the best projection that clears `bar`, else `cur`."""
     steps = sorted(proj)
+    if aim is not None and aim > 0 and bar > 0:
+        target = max(aim, line, bar)
+        if proj.get(cur, 0.0) >= max(line, bar):
+            for m in steps:
+                if m < cur and proj[m] >= target:
+                    return m
+            return cur
+        hit = next((m for m in steps if proj[m] >= target), None)
+        if hit is not None:
+            return hit
+        best = max(proj.values(), default=0.0)
+        if best >= bar:
+            return next(m for m in steps if proj[m] >= best - 1e-9)
+        return cur
     if cur > 1.0:
         for m in steps:
             if m < cur and proj[m] >= max(line, bar):
@@ -33311,7 +33354,10 @@ class IncentiveMarketMaker:
                 _vfl = dict(meta.vb_floor_by_step)
                 _vproj = {m: accrued + max(fl * qdays, proj_peak) for m, fl in _vfl.items()}
                 _vline = max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS, floor_bar)
-                _vnew = vercel_boost_pick(_vcur, _vproj, floor_bar, _vline)
+                # (SIZE AIM: sized to project SIZE_AIM_DOLLARS, not just the bar)
+                _vnew = vercel_boost_pick(_vcur, _vproj, floor_bar, _vline,
+                                          aim=SIZE_AIM_DOLLARS)
+                _vaim = max(SIZE_AIM_DOLLARS, _vline, floor_bar)
                 if _vnew != _vcur:
                     if _vnew > 1.0:
                         self.state.vercel_floor_boost[meta.ticker] = _vnew
@@ -33321,14 +33367,14 @@ class IncentiveMarketMaker:
                     if _vnew > _vcur:
                         log(f"{self.tag} vercel floor boost: {meta.ticker} projects "
                             f"${_vproj[_vcur]:.2f} at {_vat(_vcur)}, under the "
-                            f"${floor_bar:.2f} floor; x{_vnew:g} (a lead of "
+                            f"${max(_vline, floor_bar):.2f} line; x{_vnew:g} (a lead of "
                             f"{vercel_boost_lead_size(meta.target_size, _vnew)}, at most "
                             f"{VERCEL_FLOOR_BOOST_SIDE_CAP:g} a side) projects "
-                            f"${_vproj[_vnew]:.2f}")
+                            f"${_vproj[_vnew]:.2f} (aim ${_vaim:.2f})")
                     else:
                         log(f"{self.tag} vercel floor boost: {meta.ticker} projects "
                             f"${_vproj[_vnew]:.2f} at {_vat(_vnew)}, over the "
-                            f"${_vline:.2f} line; down from x{_vcur:g}")
+                            f"${_vaim:.2f} aim; down from x{_vcur:g}")
                 if _vnew in _vfl:
                     meta.floor_dollars_per_day = _vfl[_vnew]
                     est_total = _vfl[_vnew] * qdays
@@ -33342,7 +33388,10 @@ class IncentiveMarketMaker:
                 _afl = dict(meta.ab_floor_by_step)
                 _aproj = {m: accrued + max(fl * qdays, proj_peak) for m, fl in _afl.items()}
                 _aline = max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS, floor_bar)
-                _anew = vercel_boost_pick(_acur, _aproj, floor_bar, _aline)
+                # (SIZE AIM: sized to project SIZE_AIM_DOLLARS, not just the bar)
+                _anew = vercel_boost_pick(_acur, _aproj, floor_bar, _aline,
+                                          aim=SIZE_AIM_DOLLARS)
+                _aaim = max(SIZE_AIM_DOLLARS, _aline, floor_bar)
                 if _anew != _acur:
                     if _anew > 1.0:
                         self.state.art_floor_boost[meta.ticker] = _anew
@@ -33352,13 +33401,14 @@ class IncentiveMarketMaker:
                     if _anew > _acur:
                         log(f"{self.tag} art floor boost: {meta.ticker} projects "
                             f"${_aproj[_acur]:.2f} at {_aat(_acur)}, under the "
-                            f"${floor_bar:.2f} floor; x{_anew:g} (at most "
+                            f"${max(_aline, floor_bar):.2f} line; x{_anew:g} (at most "
                             f"{ART_BOOST_SIDE_CAP} a side, {ART_BOOST_CHEAP_SIDE_CAP:,} at "
-                            f"<= {ART_BOOST_CHEAP_C}c) projects ${_aproj[_anew]:.2f}")
+                            f"<= {ART_BOOST_CHEAP_C}c) projects ${_aproj[_anew]:.2f} "
+                            f"(aim ${_aaim:.2f})")
                     else:
                         log(f"{self.tag} art floor boost: {meta.ticker} projects "
                             f"${_aproj[_anew]:.2f} at {_aat(_anew)}, over the "
-                            f"${_aline:.2f} line; down from x{_acur:g}")
+                            f"${_aaim:.2f} aim; down from x{_acur:g}")
                 if _anew in _afl:
                     meta.floor_dollars_per_day = _afl[_anew]
                     est_total = _afl[_anew] * qdays
@@ -33417,7 +33467,8 @@ class IncentiveMarketMaker:
             if not reaches_min and rt_floor_boost_series(meta.series):
                 _cur = self._market_size_mult(meta.ticker)
                 _plain = max(est_total, proj_peak) / _cur if _cur > 0 else 0.0
-                _m = rt_floor_boost_mult(accrued, _plain, floor_bar)
+                # (SIZE AIM: the step that projects SIZE_AIM_DOLLARS if one does)
+                _m = rt_floor_boost_mult(accrued, _plain, floor_bar, aim=SIZE_AIM_DOLLARS)
                 if _m is not None and _m > self._rt_floor_boost.get(meta.ticker, 1.0):
                     self._rt_floor_boost[meta.ticker] = _m
                     reaches_min = True
