@@ -61,7 +61,8 @@ paid/modelled ratio). Kalshi has no credits endpoint, so it is a model.
 Under it, the TOTAL PROFIT (since 2026-10-04): the account value less every
 dollar deposited plus every dollar withdrawn since the account opened
 (fetch_transfers: /portfolio/deposits and /portfolio/withdrawals, read in
-full each morning), with the same after-rewards estimate. The day change
+full each morning; a deposit the bank sent back, "returned", is left out),
+with the same after-rewards estimate. The day change
 leaves deposits and withdrawals out too: it is the day's change in total
 profit, so the day's transfers are the move in the all-time totals the two
 mornings recorded (day_transfers), not the transfers Kalshi dates inside
@@ -572,14 +573,35 @@ def fetch_fills(client, t0: datetime, t1: datetime):
     return out
 
 
+# Transfer statuses left out of the deposited / withdrawn totals: the money
+# never reached the account (failed ... pending), or it came and went back
+# (TRANSFER_SENT_BACK). A bank (ACH) deposit can be applied, credited and
+# counted, then "returned" by the bank days later, when Kalshi takes the cash
+# back out: the $1,000 started 11/07 17:15Z counted as deposited on the 11/08
+# email, went back on 11/10, and still counted, so the 11/11 email read the
+# cash that left as a day loss and as reward credits ("day -$1.4k: trading
+# -$0.9k, rewards -$0.5k"; Jack 2026-11-11: "^wrong, i had a $1k deposit that
+# was rejected yesterday"). Left out, the all-time total falls by it the first
+# morning Kalshi lists it returned, and day_transfers takes that fall out of
+# the day like a withdrawal.
+TRANSFER_SENT_BACK = frozenset(("returned", "reversed", "refunded", "charged_back",
+                                "chargeback", "voided", "void"))
+TRANSFER_LEFT_OUT = TRANSFER_SENT_BACK | frozenset((
+    "failed", "cancelled", "canceled", "rejected", "declined", "expired", "pending"))
+# a sent-back transfer started this many days ago or less is named in the log
+TRANSFER_LOG_DAYS = 30
+
+
 def fetch_transfers(client):
     """Every deposit and withdrawal since the account opened, as [(ts, $)]:
     deposits positive, withdrawals negative. None when either read fails:
     the day change then lumps them in with credits, and the headline has no
-    total profit. Failed, cancelled, rejected and still-pending transfers
-    are left out. On 10/4 that was 12 deposits back to 2026-02-08 and no
+    total profit. Transfers in TRANSFER_LEFT_OUT are left out: failed,
+    cancelled, rejected and still pending, and those sent back (a returned
+    bank deposit). On 10/4 that was 12 deposits back to 2026-02-08 and no
     withdrawals, but every page is read anyway."""
     out = []
+    recent = time.time() - TRANSFER_LOG_DAYS * 86400
     for path, sign in (("/portfolio/deposits", 1.0), ("/portfolio/withdrawals", -1.0)):
         cursor = None
         for _page in range(50):
@@ -594,10 +616,19 @@ def fetch_transfers(client):
             items = next((v for v in resp.values() if isinstance(v, list)), [])
             for it in items:
                 status = str(it.get("status") or "").lower()
-                if status in ("failed", "cancelled", "canceled", "rejected", "pending"):
+                amt = _f(it.get("amount_cents")) / 100.0
+                if status in TRANSFER_LEFT_OUT:
+                    started = _f(it.get("created_ts"))
+                    if status in TRANSFER_SENT_BACK and started >= recent:
+                        day = datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%d")
+                        log(f"left out of the {path.rsplit('/', 1)[-1]}: ${amt:,.2f} "
+                            f"({it.get('type') or '?'}, started {day}), {status}")
                     continue
+                if status != "applied":
+                    log(f"! {path.rsplit('/', 1)[-1]}: ${amt:,.2f} counted with "
+                        f"status {status!r}")
                 ts = _f(it.get("finalized_ts") or it.get("created_ts"))
-                out.append((ts, sign * _f(it.get("amount_cents")) / 100.0))
+                out.append((ts, sign * amt))
             cursor = resp.get("cursor") or None
             if not cursor or not items:
                 break

@@ -702,6 +702,66 @@ class TotalProfitTests(unittest.TestCase):
                       "+3.27  +  subaccount 1 +0.00  (excludes deposits/withdrawals "
                       "+500.00)", text)
 
+    def test_a_deposit_the_bank_sent_back_leaves_the_totals(self):
+        # Jack 2026-11-11: "portfolio 2026-11-11: profit +$35.8k (day -$1.4k:
+        # trading -$0.9k, rewards -$0.5k) ^wrong, i had a $1k deposit that was
+        # rejected yesterday". The $1,000 ACH deposit started 11/07 17:15Z was
+        # applied (the 11/08 email counted it), then went back on 11/10; Kalshi
+        # lists it "returned", with no finalized_ts, as on 11/11
+        class C:
+            def get(self, path, params=None):
+                if path == "/portfolio/deposits":
+                    return {"deposits": [
+                        {"amount_cents": 100000, "status": "returned", "type": "ach",
+                         "created_ts": 1794071727, "fee_cents": 0},
+                        {"amount_cents": 100000, "status": "applied", "type": "apm",
+                         "created_ts": 1794069900, "finalized_ts": 1794069900,
+                         "fee_cents": 0},
+                        {"amount_cents": 50000, "status": "reversed", "type": "debit",
+                         "created_ts": 1794069000, "finalized_ts": 1794069000}]}
+                return {"withdrawals": []}
+        from datetime import datetime, timezone
+        tr = pf.fetch_transfers(C())
+        self.assertEqual(tr, [(1794069900.0, 1000.0)])
+        t0 = datetime(2026, 11, 10, 12, 0, 3, tzinfo=timezone.utc)
+        t1 = datetime(2026, 11, 11, 12, 0, 11, tzinfo=timezone.utc)
+        self.assertEqual(pf.sum_transfers(tr, None, t1), (1000.0, 0.0))
+        # the first morning that reads it returned: the all-time total is
+        # $1,000 under the prior morning's, so the day takes it out like a
+        # withdrawal; the morning after, the totals agree again
+        self.assertEqual(pf.day_transfers(tr, {"deposited": 38500.0, "withdrawn": 0},
+                                          37500.0, 0.0, t0, t1), -1000.0)
+        self.assertEqual(pf.day_transfers(tr, {"deposited": 37500.0, "withdrawn": 0},
+                                          37500.0, 0.0, t0, t1), 0.0)
+
+    def test_the_11_11_email_with_the_returned_deposit(self):
+        # The 11/11 email: -1,361.36 = trading -881.12 + reward credits
+        # -478.84 + residual +0.00 + perps -1.31 + subaccounts -0.09, with
+        # 38,500 still counted as deposited. Kalshi took the $1,000 back
+        # overnight, so the cash with no trade behind it read -357.97; out of
+        # the day, the credits are +521.16 (the IMM modelled +572.76 for 11/10)
+        # and total profit is 74,288.43 - 37,500 = 36,788.43
+        p = {"today": "2026-11-11", "rows": [_row("KXA-26", value_d=-881.12)],
+             "first_run": False, "mark_basis": "last",
+             "prior": {"equity_kalshi": 75533.74, "perps_equity": 66.89,
+                       "subs_equity": 49.16, "deposited": 38500.0, "withdrawn": 0},
+             "equity_kalshi": 74173.78, "cash": 12995.29,
+             "kalshi_positions_value": 61178.49, "equity": 83958.39,
+             "positions_value": 70963.10, "perps_equity": 65.58, "perps_stale": False,
+             "perps": {"equity": 65.58, "positions": []},
+             "subs_equity": 49.07, "subs_stale": False, "sub_moves": 0.0,
+             "account_value": 74288.43, "unpaid": None,
+             "no_trade_cash": -357.97, "collateral_d": 120.87, "net_transfers": -1000.0,
+             "total_profit": 36788.43, "deposited": 37500.0, "withdrawn": 0.0}
+        subject, text, _ = pf.build_email(p, [], chart_ok=False)
+        self.assertEqual(subject, "portfolio 2026-11-11: profit +$36.8k "
+                                  "(day -$0.4k: trading -$0.9k, rewards +$0.5k)")
+        self.assertIn("vs yesterday: -361.36  =  trading (at last trade) -881.12  +  "
+                      "reward credits +521.16  +  valuation residual ", text)
+        self.assertIn("perpetuals -1.31  +  subaccounts -0.09  (excludes "
+                      "deposits/withdrawals -1,000.00)", text)
+        self.assertIn("account value - $37,500.00 deposited, all time", text)
+
     def test_signed_usd(self):
         self.assertEqual(pf._signed_usd(13138.5), "+$13,138.50")
         self.assertEqual(pf._signed_usd(-0.5), "-$0.50")
