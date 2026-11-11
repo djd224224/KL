@@ -14252,6 +14252,8 @@ _CONFIG_CODE_KNOBS = (
     "FAIR_LEAD_GUARD_INSIDE",     # ...relaxed for leads inside the book too (2026-10-31)
     "FAIR_LEAD_INV_QUOTE",        # lead inventory quotes on (2026-10-30)
     "FAIR_LEAD_PAST_BAND",        # leads past the band, ahead of the touch (2026-10-30)
+    "BOOK_LEAD_MODE",             # book leads (2026-11-10)
+    "BOOK_LEAD_PULL_C",           # ...fast-cancelled once their book moves away (2026-11-11)
     "OR_LEAD_BLACKOUT", "OR_LEAD_BLACKOUT_PRE_MIN",   # the OpenRouter publish (2026-10-30)
     # fair close (2026-10-30)
     "FAIR_CLOSE_MODE", "FAIR_CLOSE_OVER_C",
@@ -24746,7 +24748,7 @@ def fair_lead_fair_c(ticker: str, series: str, now_ts: float) -> Optional[float]
 # anchor: a bait order that jumps the book stands the lead down rather than
 # dragging it); the admission estimate; a side holding FAIR_LEAD_MAX_POSITION
 # leads no more; LEAD STOP; the WS fast cancel judging it against the
-# anchor. No FAIR CLOSE and no LEAD INVENTORY zone (no model prices an
+# anchor (until its side's book moves away: BOOK LEAD PULL). No FAIR CLOSE and no LEAD INVENTORY zone (no model prices an
 # unwind): a filled lead's position quotes and skews as usual.
 # A market book-leads only while: its 24h volume is BOOK_LEAD_MAX_VOL24 or
 # less (Kalshi's volume_24h at the universe refresh), its usual spread is
@@ -24776,6 +24778,64 @@ BOOK_LEAD_SAMPLE_S = _env_float("IMM_BOOK_LEAD_SAMPLE_S", 900.0)
 BOOK_LEAD_MIN_N = int(_env_float("IMM_BOOK_LEAD_MIN_N", 4))
 BOOK_LEAD_SKIP_SERIES: Tuple[str, ...] = tuple(
     s.strip() for s in os.environ.get("IMM_BOOK_LEAD_SKIP_SERIES", "").split(",") if s.strip())
+# BOOK LEAD PULL (Jack 2026-11-11: "Yes, build it", on "Build the fast cancel
+# for book leads when their book moves away?" after "and there is
+# bait-protection?"). The WS fast cancel judges a lead against its fair
+# (_fair_model_rungs), and a book lead's "fair" is its 6h usual middle: slow on
+# purpose, so a bait wall cannot drag it -- and blind for the same reason when
+# news moves the book. Then the reward walls in front of the lead pull within
+# seconds and its 200 is left alone at the old price until the next cycle's
+# disagreement guard, ~2 min later (one taker: ~200 x the move). It cannot
+# simply be judged by the live book like a plain rung: a fresh lead rests
+# 7-13c ahead of a wall by design (95% of a side at df 0.5 over a big wall:
+# 11/10 16:33-16:49Z, 14 snapshots 10c+ ahead). So the bot remembers where
+# the rest of the side stood when the lead took its price -- the price where
+# its external size first reaches the lead's own (target/5, the reward
+# reference's depth: a 5-lot penny leaving is no news) -- and once the rest
+# of that side stands BOOK_LEAD_PULL_C or more farther away, or nothing is
+# left on it, the lead is a plain rung to the fast cancel again (its narrow
+# 10c gate too, which a side with nothing left would otherwise never reach).
+# A pull that cancels forgets the price taken, so the next cycle's lead --
+# re-led off the book there (a lone held lead moves down when a price 3c+
+# lower takes the share), stood down, or even the same price again -- starts
+# from the book of the moment, and no cancel / re-place loop forms. A model
+# lead (FAIR_LEAD_SERIES) is unchanged: its model, not the book, prices it.
+# IMM_BOOK_LEAD_PULL_C=0: off.
+BOOK_LEAD_PULL_C = max(0, _env_int("IMM_BOOK_LEAD_PULL_C", 10))
+
+
+def book_lead_depth_c(levels_best_first: List[Tuple[float, float]],
+                      need: float) -> Optional[float]:
+    """Where one side's external levels (that side's own price space, best
+    first) first reach `need` contracts; the deepest price when they never
+    do; None on an empty side."""
+    cum, last = 0.0, None
+    for px, q in levels_best_first:
+        if q <= 0:
+            continue
+        cum += float(q)
+        last = float(px)
+        if cum >= need - 1e-9:
+            break
+    return last
+
+
+def book_lead_pulled(side: str, placed_c: Optional[float], now_c: Optional[float],
+                     pull_c: Optional[float] = None) -> bool:
+    """BOOK LEAD PULL: has the rest of a book lead's side moved `pull_c`
+    (BOOK_LEAD_PULL_C) or more away since the lead took its price?
+    `placed_c` / `now_c`: book_lead_depth_c of the side then and now, in YES
+    cents (an ask's: 100 less its NO depth); None = nothing on the side. A
+    side that was empty then has nowhere to move from; one emptied since has
+    moved all the way."""
+    pull = BOOK_LEAD_PULL_C if pull_c is None else pull_c
+    if pull <= 0 or placed_c is None:
+        return False
+    if now_c is None:
+        return True
+    return (placed_c - now_c if side == "bid" else now_c - placed_c) >= pull - 1e-6
+
+
 BOOK_LEAD_FILE = "book_lead_usual.json"          # in STATUS_DIR
 BOOK_LEAD_SAVE_S = 300.0
 # {"usual": {ticker: touch history}, "info": {ticker: (24h volume or None,
@@ -26378,6 +26438,13 @@ class IncentiveMarketMaker:
         self._comp_own: Dict[str, List[Tuple[str, int, float]]] = {}
         self._comp_lead_px: Dict[str, Tuple[Optional[int], Optional[int], int]] = {}
         self._comp_lead_noted: Dict[Tuple[str, str], Optional[int]] = {}
+        # BOOK LEAD PULL: (ticker, side) -> (its book lead's price, where the
+        # rest of the side reached the lead's size when it took that price --
+        # YES cents, None for an empty side -- and that size), and the
+        # (ticker, side, price) pulls already logged
+        self._book_lead_placed: Dict[Tuple[str, str],
+                                     Tuple[int, Optional[float], float]] = {}
+        self._book_lead_pull_noted: Set[Tuple[str, str, int]] = set()
         self._rt_settled_on: Dict[str, bool] = {}       # RT SETTLED STRIKES' logged state
         self._rt_locked_on: Dict[str, bool] = {}        # RT LOCKED SIZE's logged state
         self._rt_locked_n: Dict[str, int] = {}          # ... ticker -> the side size it rests
@@ -29127,8 +29194,14 @@ class IncentiveMarketMaker:
                 ahead = ((ext_bid is None or p > ext_bid + 1e-6)
                          if o["side"] == "bid"
                          else (ext_ask is None or p < ext_ask - 1e-6))
+                # (a book lead whose side's book moved BOOK_LEAD_PULL_C away
+                # since it took its price is a plain rung again: BOOK LEAD PULL)
+                pulled = False
                 if ahead and (o["side"], int(round(o["px"]))) in model_rungs:
-                    ahead = False        # a fair lead / close inside its model
+                    pulled = (self._book_lead_pull(t, o, yes, own_yes) if o["side"] == "bid"
+                              else self._book_lead_pull(t, o, no, own_no))
+                    if not pulled:
+                        ahead = False    # a fair lead / close inside its model
                 if not ahead:
                     self._ws_suspect_end(oid, now_ts, "clear")
                     if oid in self._ws_flagged:     # the touch came back
@@ -29139,7 +29212,7 @@ class IncentiveMarketMaker:
                 # the narrow gate (WS_FAST_MIN_GAP_C): only a rung at least
                 # that far ahead is cancelled; the other flags stay dry
                 gap = _ws_gap_c(o["side"], o["px"], ext_bid, ext_ask)
-                wide = WS_FAST_MIN_GAP_C <= 0 or (
+                wide = pulled or WS_FAST_MIN_GAP_C <= 0 or (
                     gap is not None and gap >= WS_FAST_MIN_GAP_C - 1e-9)
                 act = not dry and wide and not exempt
                 if oid not in self._ws_suspect:
@@ -29199,6 +29272,8 @@ class IncentiveMarketMaker:
                     cancels += 1
                     self._ws_fast["cancels"] += 1
                     orders.remove(o)
+                    if pulled:
+                        self._book_lead_pull_done(t, o["side"], int(round(o["px"])))
                     self._ws_episode_end(oid, "cancel", now_ts, by="fast",
                                          arm=arm, seen_s=round(now_ts - first, 2))
                     log(f"{self.tag} WS fast: cancelled {t} "
@@ -29237,6 +29312,47 @@ class IncentiveMarketMaker:
         lo = int(math.ceil(fair)) - FAIR_CLOSE_OVER_C      # an ask at or over it
         return {(s, int(px)) for s, px in cands
                 if px is not None and (px <= hi if s == "bid" else px >= lo)}
+
+    def _book_lead_pull(self, t: str, o: dict, side_book: Dict[float, float],
+                        own_side: Dict[float, float]) -> bool:
+        """BOOK LEAD PULL: is `o` -- a lead rung the fast cancel would judge
+        against its fair -- a BOOK lead whose side's book (`side_book`: the
+        WS levels of its side in that side's own dollars, YES for a bid, NO
+        for an ask; `own_side` our size there) has moved BOOK_LEAD_PULL_C or
+        more away from where it stood when the lead took this price
+        (book_lead_pulled)? Then it is judged as a plain rung. Logged once
+        per side and price."""
+        if BOOK_LEAD_PULL_C <= 0 or fair_lead_series(series_of(t)):
+            return False
+        side, px = o["side"], int(round(o["px"]))
+        rec = self._book_lead_placed.get((t, side))
+        if rec is None or rec[0] != px:
+            return False
+        ext = sorted(((p * 100.0, q - own_side.get(p, 0.0)) for p, q in side_book.items()
+                      if q - own_side.get(p, 0.0) > 0.01), key=lambda kv: -kv[0])
+        now_c = book_lead_depth_c(ext, rec[2])
+        if side == "ask" and now_c is not None:
+            now_c = 100.0 - now_c
+        if not book_lead_pulled(side, rec[1], now_c):
+            return False
+        key = (t, side, px)
+        if key not in self._book_lead_pull_noted:
+            self._book_lead_pull_noted.add(key)
+            if len(self._book_lead_pull_noted) > 5000:
+                self._book_lead_pull_noted = {key}
+            log(f"{self.tag} book lead pull {t} {side} {o.get('rem', 0):g} @ {px}c: "
+                f"the rest of its side reached {rec[2]:g} at {rec[1]:g}c when it took "
+                f"the price, now "
+                + ("nothing is left" if now_c is None else f"at {round(now_c, 2):g}c")
+                + f" ({BOOK_LEAD_PULL_C}c+ away) -- the WS fast cancel judges it "
+                f"as a plain rung")
+        return True
+
+    def _book_lead_pull_done(self, t: str, side: str, px: int) -> None:
+        """A pulled book lead was cancelled: forget the price it took (the
+        next lead there starts from the book of the moment)."""
+        self._book_lead_placed.pop((t, side), None)
+        self._book_lead_pull_noted.discard((t, side, px))
 
     def _ws_suspect_end(self, oid: str, now_ts: float, why: str) -> None:
         """A suspect stops reading ahead (`why`: clear / gone / cycle). One
@@ -37464,6 +37580,8 @@ class IncentiveMarketMaker:
         # (a market no longer managed has no complement lead left to judge)
         self._comp_lead_px = {k: v for k, v in self._comp_lead_px.items()
                               if k in managed_set}
+        self._book_lead_placed = {k: v for k, v in self._book_lead_placed.items()
+                                  if k[0] in managed_set}
         self._fair_close_px = {k: v for k, v in self._fair_close_px.items()
                                if k in managed_set}
         stray = [o for o in resting if o.get("ticker") not in managed_set]
@@ -39270,6 +39388,19 @@ class IncentiveMarketMaker:
                 pl_bid_px = anc_bid = lead_b[0]
             if lead_on_a:
                 pl_ask_px = anc_ask = lead_a[0]
+            # BOOK LEAD PULL: where the rest of a book-led side reached the
+            # lead's size when the lead took this price (its EXTERNAL book);
+            # a new price takes the book of the moment
+            _bl = lead_src == "fair" and not fair_lead_series(meta.series)
+            for _sd, _ld, _on in (("bid", lead_b, lead_on_b), ("ask", lead_a, lead_on_a)):
+                if not (_bl and _on):
+                    self._book_lead_placed.pop((t, _sd), None)
+                elif self._book_lead_placed.get((t, _sd), (None,))[0] != _ld[0]:
+                    _dep = book_lead_depth_c(levels_desc(_lx_yes if _sd == "bid" else _lx_no),
+                                             float(lead_n))
+                    if _sd == "ask" and _dep is not None:
+                        _dep = 100.0 - _dep
+                    self._book_lead_placed[(t, _sd)] = (int(_ld[0]), _dep, float(lead_n))
             if lead_on_b or lead_on_a:
                 self._comp_lead_px[t] = (lead_b[0] if lead_on_b else None,
                                          lead_a[0] if lead_on_a else None, lead_n)

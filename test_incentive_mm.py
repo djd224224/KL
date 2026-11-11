@@ -35350,6 +35350,100 @@ class TestBookLead(unittest.TestCase):
         # the lead rungs are judged against the anchor by the WS fast cancel
         self.assertEqual(bot._fair_model_rungs(self.T, time.time()),
                          {("bid", 21), ("ask", 79)})
+        # ...and each remembers where the rest of its side reached 200 when
+        # it took its price (BOOK LEAD PULL): past the 5 at 20c, the 10c wall;
+        # past the 5 offered at 80c, the 90c wall
+        self.assertEqual(bot._book_lead_placed, {(self.T, "bid"): (21, 10.0, 200.0),
+                                                 (self.T, "ask"): (79, 90.0, 200.0)})
+
+    def test_book_lead_pull_the_rule(self):
+        """Jack 2026-11-11: "Yes, build it" -- a book lead is a plain rung to
+        the WS fast cancel once the rest of its side moves 10c+ away from
+        where it reached the lead's size when the lead took its price."""
+        d = imm.book_lead_depth_c
+        self.assertEqual(d([(20, 5.0), (10, 3000.0)], 200.0), 10.0)    # past a penny
+        self.assertEqual(d([(20, 250.0), (10, 3000.0)], 200.0), 20.0)
+        self.assertEqual(d([(20, 5.0), (15, 0.0), (12, 50.0)], 200.0), 12.0)  # never: deepest
+        self.assertIsNone(d([], 200.0))
+        p = imm.book_lead_pulled
+        self.assertEqual(imm.BOOK_LEAD_PULL_C, 10)
+        self.assertFalse(p("bid", 40.0, 31.0))
+        self.assertTrue(p("bid", 40.0, 30.0))
+        self.assertTrue(p("bid", 40.0, None))             # nothing left on the side
+        self.assertFalse(p("bid", 40.0, 45.0))            # it came up: no news
+        self.assertFalse(p("bid", None, None))            # empty then: nowhere to move from
+        self.assertFalse(p("ask", 60.0, 69.0))
+        self.assertTrue(p("ask", 60.0, 70.0))
+        self.assertTrue(p("ask", 60.0, None))
+        self.assertFalse(p("bid", 40.0, 20.0, pull_c=0))  # IMM_BOOK_LEAD_PULL_C=0: off
+        self.assertIn("BOOK_LEAD_PULL_C", imm._CONFIG_CODE_KNOBS)
+
+    def test_book_lead_pull_in_the_fast_cancel(self):
+        # a 200 bid lead at 44c over 5 at 43c and a 3,000 wall at 40c (anchor
+        # 50c: the lead is inside it, so the fast cancel leaves it be)
+        now = time.time()
+        self._note(now)
+        self._seed(now, bid=40.0, ask=60.0)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        feed = _FakeFeed()
+        bot._ws = feed
+        cancelled, lines = [], []
+        bot.cancel_order = lambda oid, reason="": cancelled.append(oid) or True
+        bot._sink = lambda name, rec: None
+
+        def lead():
+            bot._comp_lead_px = {self.T: (44, None, 200)}
+            bot._book_lead_placed = {(self.T, "bid"): (44, 40.0, 200.0)}
+            bot._resting_view = {self.T: [{"order_id": "lead", "side": "bid", "px": 44.0,
+                                           "rem": 200.0, "placed": now - 100.0,
+                                           "pad": False}]}
+
+        def check(yes, dt):
+            feed.books[self.T] = ({0.44: 200.0, **yes}, {0.40: 3000.0})
+            return bot._ws_fast_check({self.T}, now + dt)
+
+        for name, v in (("WS_MODE", "on"), ("WS_FAST", True), ("WS_FAST_MIN_GAP_C", 10.0),
+                        ("WS_FAST_CONFIRM_HOLDOUT", 0.0), ("WS_FAST_CONFIRM_SECS", 0.25),
+                        ("WS_SEEN_LOG", False)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        lead()
+        with mock.patch.object(imm, "log", lines.append):
+            self.assertEqual(bot._fair_model_rungs(self.T, now), {("bid", 44)})
+            for dt, yes in ((0, {0.43: 5.0, 0.40: 3000.0}),
+                            (1, {0.40: 3000.0}),           # the penny left: 4c ahead
+                            (2, {0.33: 3000.0}),           # the wall 7c lower: 11c ahead
+                            (3, {0.33: 3000.0}),
+                            (4, {0.43: 5.0, 0.31: 3000.0}),  # 9c lower, a penny back
+                            (5, {0.43: 5.0, 0.31: 3000.0})):
+                self.assertEqual(check(yes, dt), 0, dt)
+            self.assertEqual(cancelled, [])
+            # the wall 10c lower: a plain rung 14c ahead -- cancelled once confirmed
+            self.assertEqual(check({0.30: 3000.0}, 6.0), 0)
+            self.assertEqual(check({0.30: 3000.0}, 6.5), 1)
+        self.assertEqual(cancelled, ["lead"])
+        self.assertNotIn((self.T, "bid"), bot._book_lead_placed)      # forgotten
+        self.assertTrue(any("book lead pull KXGOOD-99DEC31-A bid 200 @ 44c: the rest of "
+                            "its side reached 200 at 40c when it took the price, now at "
+                            "30c (10c+ away)" in s for s in lines), lines)
+        # nothing left on the side: cancelled too (the narrow gate has no gap there)
+        cancelled.clear()
+        lead()
+        with mock.patch.object(imm, "log", lines.append):
+            check({}, 10.0)
+            self.assertEqual(check({}, 10.5), 1)
+        self.assertEqual(cancelled, ["lead"])
+        # off, or a model lead (its model prices it): left be
+        for patch in (mock.patch.object(imm, "BOOK_LEAD_PULL_C", 0),
+                      mock.patch.object(imm, "fair_lead_series", return_value=True)):
+            cancelled.clear()
+            lead()
+            with patch, mock.patch.object(imm, "fair_model_c", return_value=50.0), \
+                    mock.patch.object(imm, "log", lines.append):
+                check({0.20: 3000.0}, 20.0)
+                self.assertEqual(check({0.20: 3000.0}, 21.0), 0)
+            self.assertEqual(cancelled, [])
 
     def test_a_busy_book_or_no_history_leads_nothing(self):
         for kw in ({"vol24": "500.00"}, {"seed": False}):
