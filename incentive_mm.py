@@ -293,9 +293,6 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("TWK_ENABLE") \
             and series in globals().get("TWK_SERIES", ()):
         m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
-    # the art lots (2026-11-11): a flat 150 a side, no deep-reference size
-    if series is not None and series in globals().get("ART_FLAT_SIZE_SERIES", ()):
-        m = 1.0
     return m
 
 
@@ -2450,9 +2447,8 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     1.0 when neither applies, and always for the OpenRouter market-share
     family (_share_x1). Capped at 1 for a Carbon Arc series inside its data
     landing window (CA_LANDING_WINDOWS). x1 for an election night session
-    (ENS_SERIES), and for the art lots' flat 150 (ART_FLAT_SIZE_SERIES)."""
-    if _share_x1(series) or series in globals().get("ENS_SERIES", ()) \
-            or series in globals().get("ART_FLAT_SIZE_SERIES", ()):
+    (ENS_SERIES)."""
+    if _share_x1(series) or series in globals().get("ENS_SERIES", ()):
         return 1.0
     m = _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
     # a TRUMPSAY-group event's dated size (TWK_SAY_EVENT_SIZE: the GTA VI album
@@ -3375,6 +3371,9 @@ def event_cap_contracts(event_ticker: str) -> float:
     series = series_of(event_ticker)
     if _share_x1(series):
         return SHARE_EVENT_CAP
+    # an art lot (ART FLOOR BOOST, 2026-11-11): ART_EVENT_CAP
+    if globals().get("art_boost_series", lambda s: False)(series):
+        return globals()["ART_EVENT_CAP"]
     # an election night session (2026-11-04): ENS_EVENT_CAP
     if series in globals().get("ENS_SERIES", ()):
         return globals()["ENS_EVENT_CAP"]
@@ -11795,35 +11794,74 @@ SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | {"KXSBSETLISTS"}
 SPRLVLDATE_SIZE_MULT = _env_float("IMM_SPRLVLDATE_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXSPRLVLDATE"] = SeriesOverride(size_mult=SPRLVLDATE_SIZE_MULT)
 
-# ART LOT SALES: 2-98c AND 150 A SIDE (Jack 2026-11-11: "expand to 2-98c for
-# art lot sales. go up to 150 a side"). KXART markets settle on one auction
-# lot's sale price (Sotheby's, Christie's, Phillips; 3 markets per lot), and
-# most strikes were dark. On 11/11 at 12:16Z, lots 106 and 121 of Sotheby's
-# 11/16 evening sale had walls of 23k-91k contracts at a 3-4c YES bid and a
-# 95-96c ask on both sides of nearly every strike. Both touches sat outside
-# the 5-90c fresh band, so no side could rest (zero_yield). The two strikes
-# with a side in the band (106 >$6M bid 20c, 121 >$2M bid 21c) projected
-# $0.30 / $0.14 against the bar at ~50 a side.
-# The series now quotes 2-98c and rests a FLAT 150 a side:
-# - a hand-tuned one-rung ladder, so applied_mention_mult is 1.0: the caps
-#   stay unscaled, and the series is out of the size test and the yield
-#   size mode;
-# - the per-market net cap pinned at 150 (no Saturday raise);
-# - ART_FLAT_SIZE_SERIES turns off every other size lever: the hour, evening
-#   and Saturday multipliers (hour_size_mult), the deep-reference size
-#   (capped_ref_mult), the near-cliff x1.5 (_near_cliff_size_mult) and the
-#   200-lot book lead (_book_lead_static_ok). Nothing rests past 150 a side.
-# The 3-per-lot cap (EVENT_TOP_N "=KXART:3") and the auction-day cutoff stay.
-# At 150 a side joined at the 11/11 walls, only 106 >$6M clears the $1.10
-# bar; the rest needed 210-770 a side.
-# IMM_ART_SIDE_SIZE / IMM_ART_PRICE_MIN / IMM_ART_PRICE_MAX set them.
-ART_SIDE_SIZE = _env_int("IMM_ART_SIDE_SIZE", 150)
+# ART LOT SALES. KXART markets settle on one auction lot's sale price
+# (Sotheby's, Christie's, Phillips; 3 markets per lot). On 11/11 at 12:16Z,
+# lots 106 and 121 of Sotheby's 11/16 evening sale had reward walls of
+# 23k-91k contracts at a 3-4c YES bid and a 95-96c ask on both sides of
+# nearly every strike.
+# - 2-98c (Jack 2026-11-11: "expand to 2-98c for art lot sales"): those
+#   touches sat outside the 5-90c fresh band, so no side could rest
+#   (zero_yield). IMM_ART_PRICE_MIN / _MAX.
+# - ART FLOOR BOOST (Jack 2026-11-11: "up to 400 a side if necessary, and if
+#   <=5c at risk then can go up to 10k"). This replaces 60203cb's flat 150 a
+#   side. Jack also said "keep size booster for art": the hour, evening and
+#   Saturday multipliers, the deep-reference size, the near-cliff x1.5 and
+#   the 200-lot book leads all apply as on any other series.
+#   - A KXART market rests its own size while that clears the payout bar.
+#     One that misses takes the smallest step of ART_BOOST_STEPS (x1.5 ...
+#     x500 of its ladder) whose projection clears the bar.
+#   - Each side's resting size, boosters included, is at most
+#     ART_BOOST_SIDE_CAP (400). It is ART_BOOST_CHEAP_SIDE_CAP (10,000) while
+#     one contract of the side risks at most ART_BOOST_CHEAP_C (5c): a bid at
+#     <= 5c, or an ask at >= 95c. art_side_caps prices the side at its touch,
+#     or at its lead's price when a lead rests ahead of it.
+#   - While boosted, the market's position may build to each side's cap:
+#     long to the bid's, short to the ask's.
+#   - The machinery is the VERCEL FLOOR BOOST's. Each step's projection is
+#     the estimator's own, rescaled by what that step's capped ladder scores
+#     on the external book, so a capped side earns no more at a bigger step.
+#     vercel_boost_pick holds, raises or lowers the step at every refresh,
+#     and lowers it once a smaller step projects the secure line. The step
+#     is persisted and lasts while the market is selected. A market no step
+#     lifts stays out.
+#   - The per-lot net cap is ART_EVENT_CAP (30,000 = 3 markets x 10k), so the
+#     per-market caps bind. The skew knees are unchanged.
+#   - IMM_ART_BOOST_SIDE_CAP=0 turns the boost off.
 ART_PRICE_MIN = _env_int("IMM_ART_PRICE_MIN", 2)
 ART_PRICE_MAX = _env_int("IMM_ART_PRICE_MAX", 98)
-ART_FLAT_SIZE_SERIES = frozenset({"KXART"})
 SERIES_OVERRIDES["KXART"] = SeriesOverride(
-    levels=[(0, ART_SIDE_SIZE)], max_position=float(ART_SIDE_SIZE),
     price_min_cents=ART_PRICE_MIN, price_max_cents=ART_PRICE_MAX)
+ART_BOOST_SERIES = frozenset({"KXART"})
+ART_BOOST_SIDE_CAP = _env_int("IMM_ART_BOOST_SIDE_CAP", 400)
+ART_BOOST_CHEAP_C = _env_int("IMM_ART_BOOST_CHEAP_C", 5)
+ART_BOOST_CHEAP_SIDE_CAP = _env_int("IMM_ART_BOOST_CHEAP_SIDE_CAP", 10000)
+ART_BOOST_STEPS: Tuple[float, ...] = (1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0,
+                                      30.0, 50.0, 75.0, 100.0, 150.0, 250.0, 500.0)
+ART_EVENT_CAP = _env_float("IMM_ART_EVENT_CAP", 30000.0)
+
+
+def art_boost_series(series: str) -> bool:
+    return ART_BOOST_SIDE_CAP > 0 and series in ART_BOOST_SERIES
+
+
+def art_side_cap(cost_c: Optional[float]) -> int:
+    """An art side's resting cap from what one contract of it risks (cents):
+    ART_BOOST_CHEAP_SIDE_CAP at <= ART_BOOST_CHEAP_C, else ART_BOOST_SIDE_CAP
+    (unknown = the plain cap)."""
+    if cost_c is not None and cost_c <= ART_BOOST_CHEAP_C:
+        return max(ART_BOOST_CHEAP_SIDE_CAP, ART_BOOST_SIDE_CAP)
+    return ART_BOOST_SIDE_CAP
+
+
+def art_side_caps(bid_px: Optional[float], ask_px: Optional[float],
+                  lead_bid_px: Optional[float] = None,
+                  lead_ask_px: Optional[float] = None) -> Tuple[int, int]:
+    """(bid cap, ask cap) for an art market (ART FLOOR BOOST). A bid risks the
+    highest price it may rest at -- its touch, or its lead's price ahead of
+    it -- and an ask 100 minus the lowest."""
+    bpx = max((p for p in (bid_px, lead_bid_px) if p is not None), default=None)
+    apx = min((p for p in (ask_px, lead_ask_px) if p is not None), default=None)
+    return art_side_cap(bpx), art_side_cap(None if apx is None else 100 - apx)
 
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
@@ -14244,7 +14282,9 @@ _CONFIG_CODE_KNOBS = (
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
-    "ART_SIDE_SIZE", "ART_PRICE_MIN", "ART_PRICE_MAX",   # KXART (2026-11-11)
+    "ART_PRICE_MIN", "ART_PRICE_MAX",                    # KXART 2-98c (2026-11-11)
+    "ART_BOOST_SIDE_CAP", "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP",
+    "ART_EVENT_CAP",                                     # ART FLOOR BOOST (2026-11-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",
@@ -25082,8 +25122,7 @@ def _book_lead_static_ok(ticker: str, series: str, now_ts: float) -> bool:
         return False
     if in_fair_lead_series(series) or series.startswith(LEAD_OFF_SERIES) \
             or (BOOK_LEAD_SKIP_SERIES and series.startswith(BOOK_LEAD_SKIP_SERIES)) \
-            or book_lead_own_rules(ticker, series) \
-            or series in ART_FLAT_SIZE_SERIES:      # flat 150 a side (2026-11-11)
+            or book_lead_own_rules(ticker, series):
         return False
     if ticker in _book_lead["comp"] or PVD_MARKETS.get(ticker) is not None:
         return False
@@ -26119,6 +26158,8 @@ class MarketMeta:
     ys_size_mult: Optional[float] = None    # yield size mode after this refresh's verdict
     vb_size_mult: Optional[float] = None    # VERCEL FLOOR BOOST step after this refresh's verdict
     vb_floor_by_step: List[Tuple[float, float]] = field(default_factory=list)
+    ab_size_mult: Optional[float] = None    # ART FLOOR BOOST step after this refresh's verdict
+    ab_floor_by_step: List[Tuple[float, float]] = field(default_factory=list)
     #   [(Vercel floor boost step, floor $/day at it)]; [] = not a boosted family
     floor_by_mult: List[List[float]] = field(default_factory=list)
     #   [[mult, weight, $/day at that mult], ...]; [] = floor is the live estimate
@@ -26258,6 +26299,8 @@ class BotState:
     # its own size). Persisted, so a restart scores and keeps the step its
     # orders rest at; dropped once the market leaves the selection.
     vercel_floor_boost: Dict[str, float] = field(default_factory=dict)
+    # ticker -> the ART FLOOR BOOST step it rests at (2026-11-11), the same way
+    art_floor_boost: Dict[str, float] = field(default_factory=dict)
     #   reward accrued ($; live share x $/day integrated per cycle). Feeds the
     #   hopeless-exit / entry-floor credit: accrued + projection vs the $1 bar.
     rain_dir_done: Dict[str, float] = field(default_factory=dict)  # ticker -> entry ts
@@ -27884,6 +27927,11 @@ class IncentiveMarketMaker:
                 str(t): float(v)
                 for t, v in (data.get("vercel_floor_boost") or {}).items()
                 if isinstance(v, (int, float)) and float(v) > 1.0}
+            # ...and the ART FLOOR BOOST step
+            self.state.art_floor_boost = {
+                str(t): float(v)
+                for t, v in (data.get("art_floor_boost") or {}).items()
+                if isinstance(v, (int, float)) and float(v) > 1.0}
             self._loaded_credit = (set(self.state.accrued_est)
                                    | set(self.state.period_base)
                                    | set(self.state.period_start)
@@ -28348,6 +28396,7 @@ class IncentiveMarketMaker:
                            # the VERCEL FLOOR BOOST steps (2026-11-01): a
                            # restart scores and keeps the size that rests
                            "vercel_floor_boost": dict(self.state.vercel_floor_boost),
+                           "art_floor_boost": dict(self.state.art_floor_boost),
                            # pruned on the SAME rule as accrued_est: a ticker
                            # that drops out of one must drop out of the other,
                            # or a re-listed ticker resumes "already paid"
@@ -32311,9 +32360,6 @@ class IncentiveMarketMaker:
             return 1.0
         if ticker not in self._near_cliff_boost:
             return 1.0
-        # the art lots rest a flat 150 a side (ART_FLAT_SIZE_SERIES, 2026-11-11)
-        if series_of(ticker) in ART_FLAT_SIZE_SERIES:
-            return 1.0
         # a Carbon Arc market is 1x while its data lands (CA_LANDING_WINDOWS)
         if ca_landing_window(series_of(ticker), datetime.now(timezone.utc)):
             return 1.0
@@ -32334,6 +32380,12 @@ class IncentiveMarketMaker:
             return 1.0
         return self.state.vercel_floor_boost.get(ticker, 1.0)
 
+    def _art_boost_mult(self, ticker: str) -> float:
+        """The ART FLOOR BOOST step `ticker` rests at (1.0: its own size)."""
+        if not art_boost_series(series_of(ticker)):
+            return 1.0
+        return self.state.art_floor_boost.get(ticker, 1.0)
+
     def _market_size_mult(self, ticker: str) -> float:
         """Every PER-MARKET ladder multiplier: the largest of the near-cliff
         size mode, the RT floor boost and the Vercel floor boost, x yield size
@@ -32344,7 +32396,7 @@ class IncentiveMarketMaker:
         if ens_ticker(ticker):
             return 1.0
         return (max(self._near_cliff_size_mult(ticker), self._rt_floor_boost.get(ticker, 1.0),
-                    self._vercel_boost_mult(ticker))
+                    self._vercel_boost_mult(ticker), self._art_boost_mult(ticker))
                 * self._yield_size_mult(ticker))
 
     def _yield_size_verdict(self, meta: "MarketMeta", now_ts: float) -> None:
@@ -33261,6 +33313,36 @@ class IncentiveMarketMaker:
                     projected_total = _vproj[_vnew]
                     reaches_min = projected_total >= floor_bar
                 meta.vb_size_mult = _vnew
+            # ART FLOOR BOOST (2026-11-11, see ART_BOOST_SIDE_CAP): the same
+            # verdict on an art market's steps (ab_floor_by_step)
+            if meta.ab_floor_by_step and art_boost_series(meta.series):
+                _acur = self._art_boost_mult(meta.ticker)
+                _afl = dict(meta.ab_floor_by_step)
+                _aproj = {m: accrued + max(fl * qdays, proj_peak) for m, fl in _afl.items()}
+                _aline = max(NEAR_CLIFF_SECURE_DOLLARS, PAYOUT_FLOOR_DOLLARS, floor_bar)
+                _anew = vercel_boost_pick(_acur, _aproj, floor_bar, _aline)
+                if _anew != _acur:
+                    if _anew > 1.0:
+                        self.state.art_floor_boost[meta.ticker] = _anew
+                    else:
+                        self.state.art_floor_boost.pop(meta.ticker, None)
+                    _aat = (lambda m: "its own size" if m <= 1.0 else f"x{m:g}")
+                    if _anew > _acur:
+                        log(f"{self.tag} art floor boost: {meta.ticker} projects "
+                            f"${_aproj[_acur]:.2f} at {_aat(_acur)}, under the "
+                            f"${floor_bar:.2f} floor; x{_anew:g} (at most "
+                            f"{ART_BOOST_SIDE_CAP} a side, {ART_BOOST_CHEAP_SIDE_CAP:,} at "
+                            f"<= {ART_BOOST_CHEAP_C}c) projects ${_aproj[_anew]:.2f}")
+                    else:
+                        log(f"{self.tag} art floor boost: {meta.ticker} projects "
+                            f"${_aproj[_anew]:.2f} at {_aat(_anew)}, over the "
+                            f"${_aline:.2f} line; down from x{_acur:g}")
+                if _anew in _afl:
+                    meta.floor_dollars_per_day = _afl[_anew]
+                    est_total = _afl[_anew] * qdays
+                    projected_total = _aproj[_anew]
+                    reaches_min = projected_total >= floor_bar
+                meta.ab_size_mult = _anew
             # NEAR-CLIFF (Jack 2026-09-26, see NEAR_CLIFF_DOLLARS): a market
             # that has banked most of the cliff and projects to just under
             # it quotes to completion -- the same verdict feeds the hopeless
@@ -33364,6 +33446,11 @@ class IncentiveMarketMaker:
                         "vercel_boost_proj": ([[m, round(accrued + fl * qdays, 4)]
                                                for m, fl in meta.vb_floor_by_step]
                                               or None),
+                        # ...and the ART FLOOR BOOST's
+                        "art_floor_boost": self.state.art_floor_boost.get(meta.ticker),
+                        "art_boost_proj": ([[m, round(accrued + fl * qdays, 4)]
+                                            for m, fl in meta.ab_floor_by_step]
+                                           or None),
                         "hopeless_since": self.state.hopeless_since.get(meta.ticker),
                         "sub_bar_secs": round(sub_bar_secs),
                         # the admission clock (2026-09-27): held-above time
@@ -33673,6 +33760,12 @@ class IncentiveMarketMaker:
                      * meta.ref_mult_bid
                      + ladder_collateral_dollars(None, ask, scale_levels(lv, _cam))
                      * meta.ref_mult_ask)
+            if art_boost_series(meta.series):
+                # (each side at most its ART FLOOR BOOST cap)
+                _acb, _aca = art_side_caps(bid, ask)
+                _bq = min(sum(s for _t, s in scale_levels(lv, _cbm)) * meta.ref_mult_bid, _acb)
+                _aq = min(sum(s for _t, s in scale_levels(lv, _cam)) * meta.ref_mult_ask, _aca)
+                worst = (max(bid, 1) * _bq + max(100 - ask, 1) * _aq) / 100.0
             return worst * COLLATERAL_REALIZATION   # realistic, not worst-case
 
         # quote_all series (e.g. Love Island) are force-included: EVERY market
@@ -33726,6 +33819,8 @@ class IncentiveMarketMaker:
         # judged this refresh and not taken is judged afresh when next read)
         for _t in [t for t in self.state.vercel_floor_boost if t not in selected]:
             del self.state.vercel_floor_boost[_t]
+        for _t in [t for t in self.state.art_floor_boost if t not in selected]:
+            del self.state.art_floor_boost[_t]
         # LIFETIME SLOTS ARE SPENT HERE (Jack 2026-09-09: "fix the lifetime
         # slot ordering too"). The ledger used to be written straight after
         # event_top_n_cut, which is what the comment up there always claimed
@@ -36143,6 +36238,9 @@ class IncentiveMarketMaker:
         _vbm = self._vercel_boost_mult(meta.ticker)
         meta.vb_size_mult = _vbm       # decision-input logging (analytics only)
         _lead_n = vercel_boost_lead_size(meta.target_size, _vbm)
+        # (an ART FLOOR BOOST step: its side caps, art_side_caps)
+        _abm = self._art_boost_mult(meta.ticker)
+        meta.ab_size_mult = _abm       # decision-input logging (analytics only)
         # capped so hour x ref <= TOTAL_SIZE_MULT_CAP; consumers (side rooms,
         # collateral reservation) inherit the cap through these meta fields
         _hm = hour_size_mult(meta.series, datetime.now(timezone.utc))
@@ -36226,7 +36324,8 @@ class IncentiveMarketMaker:
                           sides: Optional[Tuple[float, float]] = None,
                           leads: Tuple[Optional[Tuple[int, int, int]],
                                        Optional[Tuple[int, int, int]]] = (None, None),
-                          vb: Optional[float] = None
+                          vb: Optional[float] = None,
+                          ab: Optional[float] = None
                           ) -> List[Quote]:
             """The buildable ladder at hour multiplier `hm` on rung sizes
             `lv`, per-side reference multipliers `rmb` / `rma`, external
@@ -36240,7 +36339,8 @@ class IncentiveMarketMaker:
             complement leads (comp_lead_prices): a leading side rests one
             rung of at least target/5 at its lead price, as the loop does.
             `vb` = the VERCEL FLOOR BOOST step whose lead and caps apply,
-            default the market's own (`lv` must carry that step's size)."""
+            default the market's own (`lv` must carry that step's size);
+            `ab` the same for the ART FLOOR BOOST's caps."""
             _b = _vbm if vb is None else vb
             _ln = _lead_n if vb is None else vercel_boost_lead_size(meta.target_size, _b)
             sbm, sam = (_cbm, _cam) if sides is None else sides
@@ -36253,10 +36353,19 @@ class IncentiveMarketMaker:
                 sbm, sam = (_um, sam) if _uw == "bid" else (sbm, _um)
             lvb, lva = scale_levels(lv, sbm), scale_levels(lv, sam)
             _bsum, _asum = sum(s for _t, s in lvb), sum(s for _t, s in lva)
+            # ART FLOOR BOOST: each side at most its price's cap, and while
+            # boosted the position may build to it (art_side_caps)
+            _ab = _abm if ab is None else ab
+            _acb, _aca = (art_side_caps(eb, ea, leads[0][0] if leads[0] else None,
+                                        leads[1][0] if leads[1] else None)
+                          if art_boost_series(meta.series) else (0, 0))
+            _apos = max(_acb, _aca) if _ab > 1.0 else 0
             smb, sma = clamp_side_max_to_position_cap(
                 max(int(round(_bsum * rmb)), _rl if _bsum > 0 else 0),
                 max(int(round(_asum * rma)), _rl if _asum > 0 else 0),
-                max(vercel_boost_cap(series_max_position(meta.series), _b), _rl))
+                max(vercel_boost_cap(series_max_position(meta.series), _b), _rl, _apos))
+            if _acb:
+                smb, sma = min(smb, _acb), min(sma, _aca)
             if quake_ask_strike(meta.ticker):
                 sma = min(sma, QUAKE_ASK_MAX_CONTRACTS)   # the loop's ask cap
             out: List[Quote] = []
@@ -36284,6 +36393,7 @@ class IncentiveMarketMaker:
                 _cap = max(_cap, int(FAIR_LEAD_MAX_POSITION if _lsrc == "fair"
                                      else COMP_LEAD_MAX_POSITION))
             _cap = int(vercel_boost_cap(_cap, _b))  # (and a boosted one's)
+            _cap = max(_cap, _apos)                 # (an art step's too)
 
             def _lead_room(sm: int) -> int:
                 return max(sm, _ln) if _cap <= 0 else min(max(sm, _ln), _cap)
@@ -36623,6 +36733,48 @@ class IncentiveMarketMaker:
                 if not getattr(self, "_vb_err_logged", False):
                     self._vb_err_logged = True
                     log(f"{self.tag} ! vercel floor boost: step projections failed on "
+                        f"{meta.ticker} ({e!r}); its step stands (logged once)")
+        # ART FLOOR BOOST (ART_BOOST_SIDE_CAP): the same per-step projection
+        # for an art market -- each step's capped ladder, scored on the
+        # external book at the live hour against the current step's
+        if art_boost_series(meta.series) and meta.dollars_per_day > 0:
+            try:
+                if self.live and own_live:
+                    _ay, _an = external_levels(yes_levels, no_levels, own_live)
+                else:
+                    _ay, _an = yes_levels, no_levels
+                _axb, _axa = external_best(_ay, _an)
+                _arb, _ara = ladder_reference_prices(_ay, _an, meta.target_size)
+                _ays = self._yield_size_mult(meta.ticker)
+                _abase = max(_ncm, self._rt_floor_boost.get(meta.ticker, 1.0),
+                             self._vercel_boost_mult(meta.ticker))
+
+                def _art_share(b: float) -> float:
+                    """Step b's live-hour capped ladder, scored on the external book."""
+                    q_b = _probe_ladder(
+                        _hm, scale_levels(hour_scaled_levels(meta.series, _now),
+                                          max(_abase, b) * _ays),
+                        capped_ref_mult(_axb, _arb, "bid", hour_mult=_hm, series=meta.series),
+                        capped_ref_mult(_axa, _ara, "ask", hour_mult=_hm, series=meta.series),
+                        _axb, _axa, _arb, _ara, leads=_leads, ab=b)
+                    if not q_b:
+                        return 0.0
+                    return estimate_reward_share(
+                        _ay, _an, _overlay_with_pads(q_b, _ay, _an, _axb, _axa),
+                        meta.target_size, meta.discount_factor, own_in_book=False)[0]
+
+                _ash = {b: _art_share(b) for b in sorted(set(ART_BOOST_STEPS) | {_abm})}
+                _as0 = _ash[_abm]
+                meta.ab_floor_by_step = [
+                    (b, meta.floor_dollars_per_day if b == _abm
+                     else meta.floor_dollars_per_day * s / _as0 if _as0 > 0
+                     else s * meta.dollars_per_day)
+                    for b, s in sorted(_ash.items())]
+            except Exception as e:     # never costs the estimate: no step change
+                meta.ab_floor_by_step = []
+                if not getattr(self, "_ab_err_logged", False):
+                    self._ab_err_logged = True
+                    log(f"{self.tag} ! art floor boost: step projections failed on "
                         f"{meta.ticker} ({e!r}); its step stands (logged once)")
         return True
 
@@ -39321,6 +39473,7 @@ class IncentiveMarketMaker:
             lead_b = lead_a = None
             # (x its VERCEL FLOOR BOOST step: vercel_boost_lead_size)
             vb_step = self._vercel_boost_mult(t)
+            ab_step = self._art_boost_mult(t)       # (ART FLOOR BOOST)
             lead_n = vercel_boost_lead_size(meta.target_size, vb_step)
             lead_src = self._lead_source(meta, stop=False)
             # (no lead of either kind across its feed's publish: OR_LEAD_BLACKOUT)
@@ -39458,6 +39611,15 @@ class IncentiveMarketMaker:
                 side_max_bid = max(side_max_bid, rt_lock_n)
             if rt_lock_n and lv_ask:
                 side_max_ask = max(side_max_ask, rt_lock_n)
+            # ART FLOOR BOOST: each side at most its price's cap (400, or
+            # 10,000 while one contract of it risks <= 5c; art_side_caps)
+            art_cb = art_ca = 0
+            if art_boost_series(meta.series):
+                art_cb, art_ca = art_side_caps(
+                    ext_bid, ext_ask, lead_b[0] if lead_b is not None else None,
+                    lead_a[0] if lead_a is not None else None)
+                side_max_bid = min(side_max_bid, art_cb)
+                side_max_ask = min(side_max_ask, art_ca)
             maxpos = series_max_position(meta.series, now_utc)
             if lead_b is not None or lead_a is not None:       # a leading market's cap
                 maxpos = max(maxpos, FAIR_LEAD_MAX_POSITION if lead_src == "fair"
@@ -39466,6 +39628,8 @@ class IncentiveMarketMaker:
             # the clamp below makes each side's bound too; a locked strike's:
             # RT_LOCKED_SIDE)
             maxpos = max(vercel_boost_cap(maxpos, vb_step), rt_lock_n)
+            if art_cb and ab_step > 1.0:      # (a boosted art market's: its side caps)
+                maxpos = max(maxpos, art_cb, art_ca)
             if pvd is not None:
                 maxpos = pvd["max_pos"]       # a post-vote dead book's cap
             side_max_bid, side_max_ask = clamp_side_max_to_position_cap(
@@ -39496,6 +39660,10 @@ class IncentiveMarketMaker:
             # and the event share carry it already)
             pos_room_buy, pos_room_sell = side_cut_room(
                 meta.series, maxpos - cap_pos, maxpos + cap_pos)
+            if art_cb and ab_step > 1.0:
+                # (a boosted art market: long to its bid's cap, short to its ask's)
+                pos_room_buy = min(pos_room_buy, max(0.0, art_cb - cap_pos))
+                pos_room_sell = min(pos_room_sell, max(0.0, art_ca + cap_pos))
             if pvd is not None:
                 # a post-vote dead book's position limit per side: long up to
                 # its bid size, short up to its ask size (x max_pos / size)

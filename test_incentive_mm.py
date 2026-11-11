@@ -1580,10 +1580,10 @@ class TestScreen(unittest.TestCase):
         self.assertEqual(len(cut), 6)
         self.assertEqual({m.ticker for m in lots} - cut,
                          {f"{ev}-60000", f"{ev}-40000", f"{ev}-80000"})
-        # no other override: no safe-join, no hour rule; the cap is the flat
-        # 150 a side (Jack 2026-11-11, TestArtLotsFlat150)
+        # no other override: no cap, no safe-join, no hour rule (the 2-98c
+        # band only: TestArtFloorBoost)
         ov = imm.series_override("KXART")
-        self.assertTrue(ov is None or (ov.max_position in (None, 150.0)
+        self.assertTrue(ov is None or (ov.max_position is None
                                        and not ov.safe_join
                                        and ov.cutoff_from_close_min is None))
 
@@ -28370,61 +28370,207 @@ class TestForceEventsEmptied(unittest.TestCase):
         self.assertIn("SPRLVLDATE_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
 
 
-class TestArtLotsFlat150(unittest.TestCase):
-    """Jack 2026-11-11: "expand to 2-98c for art lot sales. go up to 150 a
-    side". KXART quotes 2-98c and rests a flat 150 a side: no hour,
-    Saturday, deep-reference or near-cliff size, no 200-lot book lead, and
-    the per-market net cap stays 150."""
+class TestArtBoostersKept(unittest.TestCase):
+    """Jack 2026-11-11: "keep size booster for art: the overnight, evening and
+    Saturday multipliers, the deep-book size-up, the x1.5 boost near the
+    payout cutoff, and the 200-lot leads" -- KXART takes them as any series."""
 
     S = "KXART"
-    T = "KXART-SOT10616NOV26-6000000"
-    SAT_NIGHT = datetime(2026, 11, 14, 9, 0, tzinfo=timezone.utc)  # Sat 04:00 ET
+    T = "KXART-SOT10616NOV68-6000000"
 
-    def test_override_is_the_flat_ladder_and_the_wide_band(self):
-        self.assertEqual(imm.SERIES_OVERRIDES[self.S], imm.SeriesOverride(
-            levels=[(0, 150)], max_position=150.0,
-            price_min_cents=2, price_max_cents=98))
-        self.assertEqual((imm.series_price_min(self.S), imm.series_price_max(self.S)),
-                         (2, 98))
-        self.assertEqual(imm.member_price_band(self.S, False), (2, 98))
-        for knob in ("ART_SIDE_SIZE", "ART_PRICE_MIN", "ART_PRICE_MAX"):
-            self.assertIn(knob, imm._CONFIG_CODE_KNOBS)
-
-    def test_no_size_lever_lifts_a_side_past_150(self):
+    def test_every_booster_applies(self):
+        when = datetime(2068, 11, 10, 9, 0, tzinfo=timezone.utc)
         with mock.patch.object(imm, "_hour_window_mult", return_value=3.0), \
                 mock.patch.object(imm, "saturday_size_mult", return_value=1.5):
-            self.assertEqual(imm.hour_size_mult(self.S, self.SAT_NIGHT), 1.0)
-            self.assertEqual(imm.hour_scaled_levels(self.S, self.SAT_NIGHT), [(0, 150)])
-            # the control: a series on the global ladder takes the x4.5
-            self.assertEqual(imm.hour_size_mult("KXTESTPLAIN", self.SAT_NIGHT), 4.5)
-        self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
-        self.assertEqual(imm.series_max_position(self.S, self.SAT_NIGHT, peak=True), 150.0)
-        self.assertIsNone(imm.size_test_arm(self.S))
-        self.assertFalse(imm.yield_size_eligible(self.S))
+            self.assertEqual(imm.hour_size_mult(self.S, when), 4.5)
         with mock.patch.object(imm, "LADDER_MODE", "atref"):
-            # a reference 6 ticks under the touch: x2.5 elsewhere, x1 here
-            self.assertGreater(imm.capped_ref_mult(10, 4, "bid", series="KXTESTPLAIN"), 1.0)
-            self.assertEqual(imm.capped_ref_mult(10, 4, "bid", series=self.S), 1.0)
-
-    def test_no_near_cliff_boost(self):
-        fake = mock.Mock(_near_cliff_boost={self.T, "KXTESTPLAIN-X"})
+            self.assertGreater(imm.capped_ref_mult(10, 4, "bid", series=self.S), 1.0)
+        bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot._near_cliff_boost[self.T] = time.time()
         with mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.5), \
                 mock.patch.object(imm, "ca_landing_window", return_value=False):
-            self.assertEqual(
-                imm.IncentiveMarketMaker._near_cliff_size_mult(fake, self.T), 1.0)
-            self.assertEqual(
-                imm.IncentiveMarketMaker._near_cliff_size_mult(fake, "KXTESTPLAIN-X"), 1.5)
-
-    def test_no_book_lead(self):
+            self.assertEqual(bot._near_cliff_size_mult(self.T), 1.5)
         now = time.time()
-        info = {self.T: (0, now + 5 * 86400, self.S),
-                "KXTESTPLAIN-X": (0, now + 5 * 86400, "KXTESTPLAIN")}
         with mock.patch.object(imm, "BOOK_LEAD_MODE", "on"), \
                 mock.patch.object(imm, "FAIR_LEAD_MODE", "on"), \
                 mock.patch.object(imm, "LADDER_MODE", "atref"), \
-                mock.patch.dict(imm._book_lead["info"], info):
-            self.assertTrue(imm._book_lead_static_ok("KXTESTPLAIN-X", "KXTESTPLAIN", now))
-            self.assertFalse(imm._book_lead_static_ok(self.T, self.S, now))
+                mock.patch.dict(imm._book_lead["info"],
+                                {self.T: (0, now + 5 * 86400, self.S)}):
+            self.assertTrue(imm._book_lead_static_ok(self.T, self.S, now))
+        # no hand-tuned ladder or cap: the family wire and the size test as usual
+        ov = imm.SERIES_OVERRIDES[self.S]
+        self.assertEqual(ov, imm.SeriesOverride(price_min_cents=2, price_max_cents=98))
+
+
+class TestArtFloorBoost(unittest.TestCase):
+    """Jack 2026-11-11: "up to 400 a side if necessary, and if <=5c at risk
+    then can go up to 10k" (ART FLOOR BOOST), on the 2-98c band ("expand to
+    2-98c for art lot sales"). Fixture: a far-dated Sotheby's lot behind the
+    11/11 reward walls -- 23,766 YES at 4c and 24,383 NO at 5c (a 95c offer),
+    or a 20c bid of 10,113 over a 96c offer of 28,770."""
+
+    T = "KXART-SOT10616NOV68-10000000"
+    EV = "KXART-SOT10616NOV68"
+    CLOSE = datetime(2068, 11, 17, 15, 0, tzinfo=timezone.utc)
+    CHEAP = ([[3, 6000], [4, 23766]], [[3, 5001], [5, 24383]])
+    MIXED = ([[3, 5100], [20, 10113]], [[3, 5001], [4, 28770]])
+
+    def setUp(self):
+        _clean_persist()
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "ADMIT_SUSTAIN_SECS", 0),
+                  mock.patch.object(imm, "LEVELS", [(0, 20)]),
+                  mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                  mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                  mock.patch.object(imm, "BOOK_LEAD_MODE", "off"),
+                  mock.patch.object(imm, "hour_size_mult", lambda s, n: 1.0)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+
+    def _bot(self, book):
+        yes, no = book
+        _clean_persist()
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 1800000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": f"{yes[-1][0] / 100:.4f}",
+            "yes_ask_dollars": f"{(100 - no[-1][0]) / 100:.4f}",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in yes],
+            "no_dollars": [[f"{px / 100:.2f}", str(q)] for px, q in no]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _run(self, bot, bar, **patches):
+        """A selection refresh under the payout bar `bar`, then two quoting
+        cycles: (rungs, log lines)."""
+        lines = []
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(
+                imm, "floor_bar_dollars", lambda series, banked: bar))
+            for name, v in patches.items():
+                st.enter_context(mock.patch.object(imm, name, v))
+            st.enter_context(mock.patch.object(imm, "log", lines.append))
+            bot.state.universe_at = 0.0
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rungs = {}
+        for o in bot.state.sim_orders.values():
+            if (o["ticker"] == self.T
+                    and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS):
+                rungs.setdefault(o["book_side"], []).append(
+                    (o["yes_price"], int(o["remaining_count"])))
+        return rungs, lines
+
+    def _plain(self, book):
+        bot = self._bot(book)
+        rungs, _lines = self._run(bot, 0.0)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.art_floor_boost, {})
+        return bot._est_peak[self.T][0], rungs
+
+    def test_caps_steps_and_knobs(self):
+        self.assertTrue(imm.art_boost_series("KXART"))
+        for s in ("KXARTISTSTREAMS", "KXARTEMISII", "KXARCTICICEMAX"):
+            self.assertFalse(imm.art_boost_series(s), s)
+        caps = imm.art_side_caps
+        self.assertEqual(caps(4, 95), (10000, 10000))     # 4c bid, 5c NO
+        self.assertEqual(caps(20, 96), (400, 10000))
+        self.assertEqual(caps(3, 80), (10000, 400))
+        self.assertEqual(caps(5, 94), (10000, 400))       # 5c in, 6c out
+        self.assertEqual(caps(None, None), (400, 400))
+        self.assertEqual(caps(4, 95, lead_bid_px=16), (400, 10000))   # a lead ahead
+        self.assertEqual(caps(4, 95, lead_ask_px=97), (10000, 10000))
+        self.assertEqual(imm.event_cap_contracts(self.EV), 30000.0)
+        self.assertEqual(imm.ART_BOOST_STEPS[0], 1.0)
+        self.assertEqual(imm.ART_BOOST_STEPS[-1], 500.0)
+        self.assertEqual(list(imm.ART_BOOST_STEPS), sorted(imm.ART_BOOST_STEPS))
+        for k in ("ART_PRICE_MIN", "ART_PRICE_MAX", "ART_BOOST_SIDE_CAP",
+                  "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP", "ART_EVENT_CAP"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+        with mock.patch.object(imm, "ART_BOOST_SIDE_CAP", 0):
+            self.assertFalse(imm.art_boost_series("KXART"))
+
+    def test_a_market_over_the_bar_rests_its_own_size(self):
+        _p, rungs = self._plain(self.CHEAP)
+        self.assertEqual(rungs.get("bid"), [(4, 20)], rungs)
+        self.assertEqual(rungs.get("ask"), [(95, 20)], rungs)
+
+    def test_cheap_walls_take_the_step_that_clears_past_400(self):
+        P, _r = self._plain(self.CHEAP)
+        bot = self._bot(self.CHEAP)
+        rungs, lines = self._run(bot, 30 * P)
+        self.assertIn(self.T, bot.state.selected)
+        step = bot.state.art_floor_boost.get(self.T)
+        self.assertIsNotNone(step)
+        self.assertGreater(20 * step, 400)
+        self.assertEqual(rungs.get("bid"), [(4, int(20 * step))], rungs)
+        self.assertEqual(rungs.get("ask"), [(95, int(20 * step))], rungs)
+        self.assertTrue(any(f"art floor boost: {self.T} projects" in x
+                            and "at its own size, under the" in x
+                            and f"x{step:g} (at most 400 a side, 10,000 at <= 5c)" in x
+                            for x in lines), lines)
+
+    def test_a_20c_bid_stops_at_400_while_its_cheap_ask_goes_on(self):
+        P, _r = self._plain(self.MIXED)
+        bot = self._bot(self.MIXED)
+        rungs, _lines = self._run(bot, 30 * P)
+        self.assertIn(self.T, bot.state.selected)
+        step = bot.state.art_floor_boost.get(self.T)
+        self.assertIsNotNone(step)
+        self.assertEqual(rungs.get("bid"), [(20, 400)], rungs)
+        self.assertEqual(rungs.get("ask"), [(96, int(20 * step))], rungs)
+        self.assertGreater(20 * step, 400)
+        self.assertLessEqual(20 * step, 10000)
+
+    def test_out_of_reach_or_off_it_stays_out(self):
+        P, _r = self._plain(self.CHEAP)
+        bot = self._bot(self.CHEAP)
+        self._run(bot, 10000 * P)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.art_floor_boost, {})
+        bot = self._bot(self.CHEAP)
+        self._run(bot, 30 * P, ART_BOOST_SIDE_CAP=0)
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(bot.state.art_floor_boost, {})
+
+    def test_the_step_comes_down_and_a_restart_keeps_it(self):
+        P, _r = self._plain(self.CHEAP)
+        bot = self._bot(self.CHEAP)
+        self._run(bot, 30 * P)
+        step = bot.state.art_floor_boost[self.T]
+        with mock.patch.object(imm, "ca_landing_window", return_value=False):
+            self.assertEqual(bot._market_size_mult(self.T), step)
+        # persisted: a restart keeps the step its orders rest at
+        bot._save_persist()
+        again = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.assertEqual(again.state.art_floor_boost, {self.T: step})
+        # with the bar down, it comes down to the smallest step that still
+        # projects the line -- here the $1.00 cliff, as its own size projects
+        # ~$0.13 (vercel_boost_pick: never under the payout floor)
+        rungs, lines = self._run(bot, 0.5 * P, NEAR_CLIFF_SECURE_DOLLARS=0.9 * P)
+        down = bot.state.art_floor_boost.get(self.T)
+        self.assertIsNotNone(down)
+        self.assertLess(down, step)
+        self.assertEqual(rungs.get("bid"), [(4, int(20 * down))], rungs)
+        self.assertTrue(any(f"art floor boost: {self.T} projects" in x
+                            and f"at x{down:g}, over the $1.00 line" in x
+                            and f"down from x{step:g}" in x for x in lines), lines)
 
 
 class TestFloorSideSchedule(unittest.TestCase):
