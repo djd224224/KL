@@ -14309,6 +14309,8 @@ _CONFIG_CODE_KNOBS = (
     "JOIN_WAIT_REST_MEMORY_H",
     # off-usual size on listed markets (2026-11-08)
     "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
+    # the twin check in mutually exclusive events (2026-11-11)
+    "TWIN_CHECK_MODE", "TWIN_CHECK_TOL_C",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N", "OFF_USUAL_BIG_TO",
@@ -24497,6 +24499,128 @@ def comp_lead_prices(yes_levels: List[List[float]], no_levels: List[List[float]]
                            hold_bid=hold_bid, hold_ask=hold_ask, bid_ok=True)
 
 
+# TWIN CHECK (Jack 2026-11-11: "when quoting 2 sided markets, e.g. Democrat or
+# Republican wins, make sure the quotes on each side make sense relative to
+# each other. that should also help prevent baiting"). In an event Kalshi marks
+# mutually exclusive every market is priced twice -- by its own book and by
+# its siblings' (the complement lead's groups, _comp_groups) -- and a quote
+# that pays more for a market than its siblings say it can be worth, or sells
+# it for less, is no price a sensible maker shows. It is also what a ONE-LEG
+# bait buys: a thin order jumps one leg's book far off the price the other
+# leg still shows, our rung follows the jumped touch, and a taker trades it.
+# Replayed on the 2028 wave's 201 fills of 11/06-11/08 (179 in mutually
+# exclusive events, -$4,220 on the losing ones): at 2c it re-prices 5 fills,
+# -$736 at 11/11's marks -- IL06-D sold 1,360 @ 67c while IL06-R was offered
+# at ~5c (floor 93c), FL18-R 1,425 @ 60c (floor 89c) -- all on the ask floor.
+# It misses the House night's other baits, which moved BOTH legs together
+# (IN04 at 40x60 on D and R when D bought 1,274 @ 40c; AZ08, IL16, KS04 the
+# same): those are the off-usual size cut's and the re-anchor cap's. On the
+# 11/11 books (915 markets in such events) it re-priced nothing at 2, 5 or
+# 10c: books that agree pass untouched. Per market, on EXTERNAL books (our own
+# orders netted out of every sibling's), each sibling's side walked to
+# target/5 (side_reference_level, the reward reference -- a thin top does not
+# set it):
+#   * BID CAP, any mutually exclusive event: our YES bid rests at most
+#     100 - the siblings' summed YES-bid references + TWIN_CHECK_TOL_C. The
+#     market cannot be worth more, even if none of them wins.
+#   * ASK FLOOR, two-market election pairs (D/R; election_series): our YES ask
+#     rests at least the twin's NO-bid reference - TWIN_CHECK_TOL_C. Someone
+#     pays that for "not the twin", which is this market but for a tie or a
+#     third party (the complement lead's bid side and pair_bid lock read it
+#     the same way); with more markets that floor needs one of them to win.
+# A rung past its bound is RE-PRICED at it (pvd_clamp_at keeps the sub-penny
+# grid), a pad past it is dropped, and a bound outside 1-99c drops the side.
+# It runs LAST in the quote loop, after every path that adds a rung (leads,
+# closes, offsets, unwinds), so nothing re-prices past it. A sibling off the
+# WS feed adds nothing to the cap (it can only loosen it); with the twin off
+# the feed there is no floor. The groups are read for it even with the
+# complement lead off (comp_group_series). IMM_TWIN_CHECK: "on" (default),
+# "dry" (logged, nothing re-priced), "off"; IMM_TWIN_CHECK_TOL_C (2c) is the
+# slack each way: books that agree pass untouched.
+TWIN_CHECK_MODE = os.environ.get("IMM_TWIN_CHECK", "on").strip().lower()
+if TWIN_CHECK_MODE not in ("on", "dry", "off"):
+    TWIN_CHECK_MODE = "on"
+TWIN_CHECK_TOL_C = max(0.0, _env_float("IMM_TWIN_CHECK_TOL_C", 2.0))
+
+
+def comp_group_series(series: str) -> bool:
+    """Are this series' mutually exclusive events grouped from Kalshi's event
+    record (_refresh_comp_pairs)? For the complement lead (comp_lead_series)
+    or the TWIN CHECK."""
+    return comp_lead_series(series) or TWIN_CHECK_MODE in ("on", "dry")
+
+
+def twin_bounds(sibs: List[Tuple[List[List[float]], List[List[float]]]],
+                target: float, pair_floor: bool,
+                tol: Optional[float] = None) -> Tuple[Optional[float], Optional[float]]:
+    """THE TWIN CHECK's (bid cap, ask floor) in YES cents for one market of a
+    mutually exclusive event, from its siblings' EXTERNAL books (`sibs`: each
+    (YES levels, NO levels), orderbook_levels shape), each side walked to
+    target/5. The cap is 100 - the siblings' summed YES-bid references + tol
+    (None when no sibling has one); the floor, with `pair_floor` and exactly
+    one sibling (a two-market election pair), is the twin's NO-bid reference
+    - tol (None without one)."""
+    if target <= 0 or not sibs:
+        return None, None
+    tol = TWIN_CHECK_TOL_C if tol is None else max(0.0, float(tol))
+    refs = [r for r in (side_reference_level(levels_desc(sy), target) for sy, _sn in sibs)
+            if r is not None]
+    cap = (100.0 - float(sum(refs)) + tol) if refs else None
+    floor = None
+    if pair_floor and len(sibs) == 1:
+        n = side_reference_level(levels_desc(sibs[0][1]), target)
+        if n is not None:
+            floor = float(n) - tol
+    return cap, floor
+
+
+def twin_check_quotes(quotes: List["Quote"], bid_cap: Optional[float],
+                      ask_floor: Optional[float]
+                      ) -> Tuple[List["Quote"], Dict[str, Tuple[float, Optional[float]]]]:
+    """THE TWIN CHECK on one market's rungs: every bid at most `bid_cap`,
+    every ask at least `ask_floor` (YES cents; None = no bound). A rung past
+    its bound is re-priced at it (pvd_clamp_at), two rungs landing on one
+    price merge, a pad past it is dropped, and a bound outside 1-99c drops
+    the rung. Returns (quotes, moved): moved = {side: (its best rung's price
+    before, after -- None when the side no longer rests)} for each side whose
+    best rung changed."""
+    def px(q: "Quote") -> float:
+        return float(q.price_exact if q.price_exact is not None else q.price_cents)
+
+    def best(qs: List["Quote"], side: str) -> Optional[float]:
+        ps = [px(q) for q in qs if q.book_side == side and not q.is_pad]
+        if not ps:
+            return None
+        return max(ps) if side == "bid" else min(ps)
+
+    out: List["Quote"] = []
+    for q in quotes:
+        bound = bid_cap if q.book_side == "bid" else ask_floor
+        if bound is not None and (px(q) > bound + 1e-9 if q.book_side == "bid"
+                                  else px(q) < bound - 1e-9):
+            if q.is_pad:
+                continue
+            q = pvd_clamp_at(q, bound)
+            if q is None:
+                continue
+            merged = False
+            for i, x in enumerate(out):      # two rungs clamped onto one price: one rung
+                if (x.book_side, x.price_cents, x.price_exact, x.is_pad) == (
+                        q.book_side, q.price_cents, q.price_exact, q.is_pad):
+                    out[i] = replace(x, count=int(x.count) + int(q.count))
+                    merged = True
+                    break
+            if merged:
+                continue
+        out.append(q)
+    moved: Dict[str, Tuple[float, Optional[float]]] = {}
+    for side in ("bid", "ask"):
+        b0, b1 = best(quotes, side), best(out, side)
+        if b0 is not None and b0 != b1:
+            moved[side] = (b0, b1)
+    return out, moved
+
+
 def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
                       easier: List[Tuple[List[List[float]], List[List[float]]]],
                       harder: List[Tuple[List[List[float]], List[List[float]]]],
@@ -26449,6 +26573,8 @@ class IncentiveMarketMaker:
         self._pvd_fb: Dict[Tuple[str, str], Tuple[int, int]] = {}  # (t, side) -> (moved, ref) last logged
         self._pvd_close: Dict[str, Optional[tuple]] = {}  # closing-exemption rung last logged
         self._pvd_clamp: Dict[str, Optional[tuple]] = {}  # CLOSE CLAMP: t -> (side, from, to) last logged
+        self._twin_noted: Dict[str, tuple] = {}            # TWIN CHECK: t -> what it last logged
+        self._twin_books: Tuple[float, Dict[str, tuple]] = (0.0, {})  # (cycle ts, sibling books)
         # a flip-through entry's (bid, ask) rung as the quote loop sized it this
         # cycle (pvd_side_sizes on the position it judged) -- place_with_caps'
         # side cap reads it, so a 400 ask beside a long 200 isn't "blocked at 0/200"
@@ -33025,10 +33151,10 @@ class IncentiveMarketMaker:
                 own_by_ticker.setdefault(o.get("ticker", ""), []).append(
                     (o.get("book_side", "bid"), int(o.get("yes_price", 0)),
                      float(o.get("remaining_count", 0))))
-        # two-market twins for the complement lead, and the own orders a
-        # twin's book is read without (COMP_LEAD_MODE)
+        # two-market twins for the complement lead and the TWIN CHECK, and the
+        # own orders a twin's book is read without (COMP_LEAD_MODE, TWIN_CHECK_MODE)
         self._comp_own = own_by_ticker
-        if COMP_LEAD_MODE in ("on", "dry"):
+        if COMP_LEAD_MODE in ("on", "dry") or TWIN_CHECK_MODE in ("on", "dry"):
             self._refresh_comp_pairs(metas, now_ts)
         self._prune_near_cliff_boost()
         self._prune_yield_boost()
@@ -34125,7 +34251,8 @@ class IncentiveMarketMaker:
 
     def _refresh_comp_pairs(self, metas: List["MarketMeta"], now_ts: float) -> None:
         """Group the markets of every mutually exclusive event in the
-        complement-lead scope (COMP_LEAD_MODE) from Kalshi's event record:
+        complement-lead scope (COMP_LEAD_MODE) or the TWIN CHECK's
+        (comp_group_series) from Kalshi's event record:
         an event with two or more candidates is read when unread or older than
         COMP_PAIR_TTL_SECS, at most COMP_PAIR_READS_PER_REFRESH a refresh. A
         group is EVERY market of the event (siblings outside the programs
@@ -34133,7 +34260,7 @@ class IncentiveMarketMaker:
         event ungrouped until the next try. Never raises."""
         by_ev: Dict[str, Set[str]] = {}
         for m in metas:
-            if comp_lead_series(m.series):
+            if comp_group_series(m.series):
                 by_ev.setdefault(m.event_ticker, set()).add(m.ticker)
         reads = 0
         for ev in sorted(by_ev):
@@ -34264,6 +34391,81 @@ class IncentiveMarketMaker:
                 sy, sn = external_levels(sy, sn, own_s)
             out.append((s, sy, sn))
         return out or None
+
+    def _twin_check(self, t: str, meta, mq: List["Quote"], now_ts: float) -> List["Quote"]:
+        """THE TWIN CHECK (TWIN_CHECK_MODE) on market `t`'s rungs as built:
+        twin_bounds from its mutually exclusive group's siblings' EXTERNAL
+        books on the WS feed (each read once a cycle), then twin_check_quotes;
+        "dry" logs what it would do and returns the rungs as built. Never
+        raises: a failure leaves them as built (logged once)."""
+        if TWIN_CHECK_MODE not in ("on", "dry") or not mq:
+            return mq
+        grp = self._comp_groups.get(t)
+        if not grp:
+            self._twin_note(t, {}, None, None, ())
+            return mq
+        try:
+            ts0, cache = self._twin_books
+            if ts0 != now_ts:
+                cache = {}
+                self._twin_books = (now_ts, cache)
+            sibs = [s for s in grp if s != t]
+            miss = [s for s in sibs if s not in cache]
+            if miss:
+                got = {s: (sy, sn) for s, sy, sn in self._comp_books(miss)}
+                for s in miss:
+                    cache[s] = got.get(s)
+            books = [cache[s] for s in sibs if cache.get(s) is not None]
+            pair = len(sibs) == 1 and len(books) == 1 and election_series(meta.series)
+            cap, floor = twin_bounds(books, float(meta.target_size or 0.0), pair)
+            if cap is None and floor is None:
+                self._twin_note(t, {}, None, None, sibs)
+                return mq
+            out, moved = twin_check_quotes(mq, cap, floor)
+            self._twin_note(t, moved, cap, floor, sibs, n_books=len(books))
+            return out if TWIN_CHECK_MODE == "on" else mq
+        except Exception as e:  # noqa: BLE001 -- a guard's failure never costs the cycle
+            if not getattr(self, "_twin_err_logged", False):
+                self._twin_err_logged = True
+                log(f"{self.tag} ! twin check failed on {t} ({e!r}); its rungs rest "
+                    f"as built (logged once)")
+            return mq
+
+    def _twin_note(self, t: str, moved: Dict[str, Tuple[float, Optional[float]]],
+                   cap: Optional[float], floor: Optional[float], sibs,
+                   n_books: int = 0) -> None:
+        """Log (and sink, twin_check_<date>.jsonl) THE TWIN CHECK on a market
+        when what it re-prices there changes, and "clear" once it stops."""
+        tag = "" if TWIN_CHECK_MODE == "on" else " (dry)"
+        key = tuple(sorted((s, round(a, 2), None if b is None else round(b, 2))
+                           for s, (a, b) in moved.items()))
+        prev = self._twin_noted.get(t)
+        if not key:
+            if prev:
+                self._twin_noted.pop(t, None)
+                log(f"{self.tag} twin check{tag} {t}: clear")
+            return
+        if prev == key:
+            return
+        self._twin_noted[t] = key
+        tol = TWIN_CHECK_TOL_C
+        for side, (a, b) in sorted(moved.items()):
+            if side == "bid" and cap is not None:
+                why = (f"its {len(sibs)} sibling(s) are bid {100 - (cap - tol):g}c between "
+                       f"them at target/5, so it is worth at most {cap - tol:g}c "
+                       f"(+{tol:g}c slack)")
+            elif floor is not None and sibs:
+                why = (f"{sibs[0]} is offered at {100 - (floor + tol):g}c (its NO bid "
+                       f"{floor + tol:g}c at target/5), so this is worth at least "
+                       f"{floor + tol:g}c (-{tol:g}c slack)")
+            else:
+                why = "its siblings' books"
+            to = "out of 1-99c, not resting" if b is None else f"{b:g}c"
+            log(f"{self.tag} twin check{tag} {t} {side}: {a:g}c -> {to} -- {why}")
+            self._sink("twin_check", {
+                "ts": round(time.time(), 3), "mode": TWIN_CHECK_MODE, "ticker": t,
+                "side": side, "from": a, "to": b, "cap": cap, "floor": floor,
+                "sibs": len(sibs), "books": n_books})
 
     def _comp_lead(self, meta, yes_ext: List[List[float]], no_ext: List[List[float]]
                    ) -> Tuple[Optional[Tuple[int, int, int]],
@@ -40022,6 +40224,11 @@ class IncentiveMarketMaker:
                                     f"{_u_key[2]}c (best external {_u_key[0]} with "
                                     f"{UNWIND_NO_LEAD_MIN:.0f}+ lots: {_u_nolead}c)")
                             self._unwind_nolead_noted[t] = _u_key
+            # TWIN CHECK (TWIN_CHECK_MODE): LAST, after every path that adds or
+            # moves a rung -- in a mutually exclusive event no bid over what the
+            # siblings' bids leave this market worth, and in a two-market
+            # election pair no ask under what the twin's NO bids pay for it
+            mq = self._twin_check(t, meta, mq, now_ts)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -43735,6 +43942,13 @@ class IncentiveMarketMaker:
                f"or better"
                + ("" if PVD_CLOSE_CLAMP_MODE == "on" else " (dry: logged, nothing re-priced)")
                if PVD_CLOSE_CLAMP_MODE in ("on", "dry") else " (the 11/04 closing exemption as was)"))
+        log(f"twin check (2026-11-11): {TWIN_CHECK_MODE}"
+            + (f" -- in every mutually exclusive event a bid rests at most 100 - its siblings' "
+               f"YES bids (each walked to target/5) + {TWIN_CHECK_TOL_C:g}c, and in a two-market "
+               f"election pair an ask at least the twin's NO bid - {TWIN_CHECK_TOL_C:g}c, on books "
+               f"without our own orders; a rung past it is re-priced at the bound"
+               + ("" if TWIN_CHECK_MODE == "on" else " (dry: logged, nothing re-priced)")
+               if TWIN_CHECK_MODE in ("on", "dry") else " (IMM_TWIN_CHECK=off)"))
         log(f"unwind-only waves scope (2026-11-08): "
             + ("existing waves -- UNWIND_ONLY_WAVES covers the waves listed before the switch "
                "file appeared; a wave added after it quotes as usual"

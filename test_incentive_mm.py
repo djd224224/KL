@@ -43152,3 +43152,166 @@ class TestStraitWeeklyStop(unittest.TestCase):
                   cutoff=stop)
         self.assertEqual(bot._screen(m, stop + timedelta(minutes=1)), "cutoff")
         self.assertIsNone(bot._screen(m, stop - timedelta(hours=1)))
+
+
+class TestTwinCheck(unittest.TestCase):
+    """Jack 2026-11-11: "when quoting 2 sided markets, e.g. Democrat or
+    Republican wins, make sure the quotes on each side make sense relative to
+    each other. that should also help prevent baiting". In a mutually
+    exclusive event no bid rests over 100 - the siblings' YES-bid references
+    (+ the slack), and in a two-market election pair no ask under the twin's
+    NO-bid reference (- the slack); a rung past it is re-priced at it."""
+
+    EV = "KXFOOLEG-99DEC31"
+    D, R = "KXFOOLEG-99DEC31-D", "KXFOOLEG-99DEC31-R"
+    # a one-leg bait in miniature: a thin 250 jumped D's book to 40x80 while
+    # R, the favorite, still shows 95x97 -- R's bids price D at 5c at most, so
+    # a 40c bid on D pays 35c over what it can be worth (the 11/08 IL06 bait
+    # was the ask-side twin of it: D sold 1,360 @ 67c with R offered at ~5c)
+    D_YES = [[3, 100.0], [40, 250.0]]
+    D_NO = [[5, 100.0], [20, 250.0]]
+    R_YES = [[95, 300.0]]
+    R_NO = [[3, 300.0]]
+
+    def test_bounds_of_a_pair(self):
+        # R bid 95c at target/5 (200 of a 1,000): D worth at most 5c, +2c slack;
+        # R offered at 97c (its NO bid 3c): D worth at least 3c, -2c slack
+        self.assertEqual(imm.twin_bounds([(self.R_YES, self.R_NO)], 1000.0, True, tol=2),
+                         (7.0, 1.0))
+        # no floor outside an election pair, or with more than one sibling
+        self.assertEqual(imm.twin_bounds([(self.R_YES, self.R_NO)], 1000.0, False, tol=2),
+                         (7.0, None))
+        three = [([[30, 500.0]], [[60, 500.0]]), ([[30, 500.0]], [[60, 500.0]]),
+                 ([[20, 500.0]], [[70, 500.0]])]
+        self.assertEqual(imm.twin_bounds(three, 1000.0, True, tol=2), (22.0, None))
+        # a thin top does not set a sibling's reference: 100 at 96c, then 5,000 at 2c
+        thin = [([[2, 5000.0], [96, 100.0]], [[3, 300.0]])]
+        self.assertEqual(imm.twin_bounds(thin, 1000.0, False, tol=2), (100.0, None))
+        # a sibling with no reference (too thin all the way) bounds nothing
+        self.assertEqual(imm.twin_bounds([([[50, 10.0]], [[40, 10.0]])], 1000.0, True, tol=2),
+                         (None, None))
+        self.assertEqual(imm.twin_bounds([], 1000.0, True), (None, None))
+
+    def test_rungs_are_repriced_at_the_bound(self):
+        q = imm.Quote
+        rungs = [q(self.D, "bid", 40, 1274), q(self.D, "bid", 30, 200),
+                 q(self.D, "ask", 67, 1360), q(self.D, "ask", 99, 5000, is_pad=True),
+                 q(self.D, "bid", 1, 5000, is_pad=True)]
+        out, moved = imm.twin_check_quotes(rungs, 7.0, 95.0)
+        got = sorted((x.book_side, x.price_cents, x.count, x.is_pad) for x in out)
+        # both bids land on 7c as one rung; the ask goes up to 95c; pads stand
+        self.assertEqual(got, [("ask", 95, 1360, False), ("ask", 99, 5000, True),
+                               ("bid", 1, 5000, True), ("bid", 7, 1474, False)])
+        self.assertEqual(moved, {"bid": (40.0, 7.0), "ask": (67.0, 95.0)})
+        # quotes that agree with the twin pass untouched
+        ok = [q(self.D, "bid", 3, 200), q(self.D, "ask", 97, 200)]
+        self.assertEqual(imm.twin_check_quotes(ok, 7.0, 95.0), (ok, {}))
+        # a sub-penny rung keeps the 0.1c grid
+        out, _m = imm.twin_check_quotes([q(self.D, "bid", 7, 200, price_exact=7.4)], 6.5, None)
+        self.assertEqual((out[0].price_cents, out[0].price_exact), (6, 6.5))
+        # a bound outside 1-99c drops the side; a pad past its bound is dropped
+        out, moved = imm.twin_check_quotes(
+            [q(self.D, "bid", 3, 200), q(self.D, "bid", 1, 5000, is_pad=True),
+             q(self.D, "ask", 97, 200)], 0.5, None)
+        self.assertEqual([(x.book_side, x.price_cents) for x in out], [("ask", 97)])
+        self.assertEqual(moved, {"bid": (3.0, None)})
+
+    def _feed(self):
+        feed = _FakeFeed()
+
+        def dollars(levels):
+            return {round(px / 100.0, 4): float(qty) for px, qty in levels}
+        feed.books[self.D] = (dollars(self.D_YES), dollars(self.D_NO))
+        feed.books[self.R] = (dollars(self.R_YES), dollars(self.R_NO))
+        return feed
+
+    def _cycle(self, twin_mode, comp_mode="off"):
+        _clean_persist()
+        D, R, test = self.D, self.R, self
+
+        class _PairClient(FakeClient):
+            def __init__(self_):
+                super().__init__()
+                now = datetime.now(timezone.utc)
+                start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self_.programs = [
+                    {"market_ticker": t, "incentive_type": "liquidity",
+                     "period_reward": 7000000, "target_size_fp": "1000.00",
+                     "discount_factor_bps": 5000, "paid_out": False,
+                     "start_date": start, "end_date": end} for t in (D, R)]
+                self_.markets = {t: {
+                    "ticker": t, "event_ticker": test.EV, "status": "active",
+                    "close_time": far, "yes_bid_dollars": bid, "yes_ask_dollars": ask,
+                    "volume_fp": "3000.00"} for t, bid, ask in (
+                        (D, "0.4000", "0.8000"), (R, "0.9500", "0.9700"))}
+
+                def fp(yes, no):
+                    return {"orderbook_fp": {
+                        "yes_dollars": [[f"{px / 100:.2f}", str(qty)] for px, qty in yes],
+                        "no_dollars": [[f"{px / 100:.2f}", str(qty)] for px, qty in no]}}
+                self_.books = {D: fp(test.D_YES, test.D_NO), R: fp(test.R_YES, test.R_NO)}
+
+            def get(self_, path, params=None):
+                if path == f"/events/{test.EV}":
+                    return {"event": {"mutually_exclusive": True, "markets": [
+                        {"ticker": D, "status": "active"},
+                        {"ticker": R, "status": "active"}]}}
+                return super().get(path, params)
+
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "COMP_LEAD_MODE", comp_mode), \
+                mock.patch.object(imm, "TWIN_CHECK_MODE", twin_mode), \
+                mock.patch.object(imm, "TWIN_CHECK_TOL_C", 2.0), \
+                mock.patch.object(imm, "LONE_REF_GUARD_MODE", "off"), \
+                mock.patch.object(imm, "ELECTION_EXTRA_SERIES", {"KXFOOLEG"}), \
+                mock.patch.object(imm, "ELECTION_DATES", imm._parse_election_dates(
+                    f"{self.EV}*=2099-12-31")), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=_PairClient(), live=False)
+            bot._ws = self._feed()
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {(o["ticker"], o["book_side"]): o["yes_price"]
+                 for o in bot.state.sim_orders.values()
+                 if imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+        return bot, rungs, lines
+
+    def test_the_bait_bid_rests_where_the_twin_prices_it(self):
+        # off: D's bid joins the bait at 40c
+        bot, rungs, lines = self._cycle("off")
+        self.assertEqual(rungs.get((self.D, "bid")), 40, rungs)
+        # on, with the complement lead OFF: the groups are read for the check
+        bot, rungs, lines = self._cycle("on")
+        self.assertEqual(bot._comp_groups.get(self.D), (self.D, self.R))
+        self.assertEqual(rungs.get((self.D, "bid")), 7, rungs)
+        self.assertTrue(any(
+            "twin check KXFOOLEG-99DEC31-D bid: 40c -> 7c -- its 1 sibling(s) are bid 95c "
+            "between them at target/5, so it is worth at most 5c (+2c slack)" in s
+            for s in lines), [s for s in lines if "twin" in s])
+        # D's ask (80c) already agrees with R's book
+        self.assertEqual(rungs.get((self.D, "ask")), 80, rungs)
+        # the books disagree, so R's bid steps back too: D's 250 bid at 40c
+        # (past target/5) leaves R worth at most 60c (+2c) -- a bait on one
+        # leg pulls the other leg's same-bet side back, never forward
+        self.assertEqual(imm.twin_bounds([(self.D_YES, self.D_NO)], 1000.0, True, tol=2),
+                         (62.0, 18.0))
+
+    def test_dry_logs_and_rests_as_built(self):
+        bot, rungs, lines = self._cycle("dry")
+        self.assertEqual(rungs.get((self.D, "bid")), 40, rungs)
+        self.assertTrue(any("twin check (dry) KXFOOLEG-99DEC31-D bid: 40c -> 7c" in s
+                            for s in lines), [s for s in lines if "twin" in s])
+
+    def test_off_with_the_lead_off_reads_no_groups(self):
+        bot, rungs, lines = self._cycle("off", comp_mode="off")
+        self.assertEqual(bot._comp_groups, {})
+        self.assertFalse(any(s.startswith("twin check") or " twin check " in s
+                             for s in lines if "(2026-11-11)" not in s))
