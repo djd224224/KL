@@ -1654,14 +1654,56 @@ class TestNotAVote(unittest.TestCase):
         self.reload()
         return out
 
-    def age(self, days, glob=None):
+    def stamp(self, at, glob=None):
         rows = imm_rows.load_rows("election")
         for r in rows:
             if r["glob"] == (glob or self.EV):
-                r["checked"] = (datetime.now(timezone.utc)
-                                - timedelta(days=days)).isoformat(timespec="seconds")
+                r["checked"] = at.isoformat(timespec="seconds")
         imm_rows.save_rows("election", rows)
         self.reload()
+
+    def age(self, days, glob=None):
+        self.stamp(datetime.now(timezone.utc) - timedelta(days=days), glob)
+
+    def test_the_lookup_lists_the_open_markets_dates_earliest_first(self):
+        # 2026-11-11: research dated KXCHRISTIERUN-28 Apr 1 from three markets
+        # in Kalshi's order, with a Jan 1 strike open -- 3 of 9 sat dark
+        class Client:
+            def get_event(self, ev):
+                return {"event": {"title": "Will Chris Christie announce a presidential run?",
+                                  "sub_title": "2028", "category": "Elections"}}
+
+            def get_markets(self, event_ticker=None):
+                def m(t, status, close):
+                    return {"ticker": f"{event_ticker}-{t}", "status": status,
+                            "close_time": close, "occurrence_datetime": close,
+                            "expected_expiration_time": close, "rules_primary": f"before {t}"}
+                return {"markets": [m("27JUN01", "active", "2027-06-01T14:00:00Z"),
+                                    m("27APR01", "active", "2027-04-01T14:00:00Z"),
+                                    m("26NOV01", "finalized", "2026-11-01T14:00:00Z"),
+                                    m("27JAN01", "active", "2027-01-01T15:00:00Z"),
+                                    m("27FEB01", "active", "2027-02-01T15:00:00Z")]}
+        with mock.patch.object(imm, "_fair_reader_client", lambda: Client()):
+            out = imm_rows.lookup(self.EV)
+        self.assertIn("Kalshi dates of its 4 open market(s), ET, earliest first: 2027-01-01, "
+                      "2027-02-01, 2027-04-01, 2027-06-01", out)
+        self.assertEqual([ln.split()[0] for ln in out.splitlines()[2:]],
+                         [f"{self.EV}-27JAN01", f"{self.EV}-27FEB01", f"{self.EV}-27APR01"])
+
+    def test_a_ladder_row_is_moved_on_from_a_day_before_its_day(self):
+        self.add(day="2027-01-01")
+        self.add(day="2027-01-01", not_vote=False, glob=self.VOTE)     # a vote's row, same day
+        when = imm.election_term_end_row(self.EV)[1]                    # 00:00 ET Jan 1 2027
+        for glob in (self.EV, self.VOTE):
+            self.stamp(when - timedelta(hours=30), glob)                # both checked lately
+        with mock.patch.object(fw.ieo, "discover_broadcast_mention_events", lambda c, now: []), \
+                mock.patch.object(fw, "powerslap_events_needing_start", lambda c: []):
+            self.assertEqual(fw.research_targets(None, {}, when - timedelta(hours=25), dry=True), {})
+            t = fw.research_targets(None, {}, when - timedelta(hours=23), dry=True)
+        self.assertEqual([k.split(":")[1] for k in t], [self.EV])       # the vote's row waits
+        p = fw.research_prompt([(k, v, "") for k, v in t.items()])
+        self.assertIn("the first of the lookup's Kalshi dates more than a day away: when "
+                      "2027-01-01 is not, that date instead, plus --replace", p)
 
     def test_a_safe_market_takes_a_marked_term_end_row(self):
         ok, msg = self.add()

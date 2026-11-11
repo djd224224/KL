@@ -184,7 +184,16 @@ def lookup(event: str) -> str:
         ms = []
     out = [f"event {event}: {e.get('title')} | sub_title: {e.get('sub_title')} | "
            f"category {e.get('category')}"]
-    for m in ms[:3]:
+    # Kalshi's dates for the OPEN markets, read as the bot reads them (2026-11-11:
+    # research dated KXCHRISTIERUN-28's not-a-vote row Apr 1 from the three
+    # markets shown below, with a Jan 1 strike open; a term-end row dated later
+    # than a market's own date stands that market down, so 3 of 9 sat dark)
+    live = [m for m in ms if str(m.get("status") or "").lower() in ("active", "open")]
+    days = sorted({d for m in live for d in imm._kalshi_vote_days(event, m, imm.ET)})
+    if days:
+        out.append(f"  Kalshi dates of its {len(live)} open market(s), ET, earliest first: "
+                   + ", ".join(map(str, days[:12])) + (" ..." if len(days) > 12 else ""))
+    for m in sorted(ms, key=lambda m: (m not in live, m.get("close_time") or ""))[:3]:
         out.append(f"  {m.get('ticker')} ({m.get('yes_sub_title') or ''}): "
                    f"{(m.get('rules_primary') or '').strip()[:500]} | expected_expiration "
                    f"{m.get('expected_expiration_time')} | occurrence "

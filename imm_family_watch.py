@@ -80,7 +80,7 @@ import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import imm_quote_gaps  # noqa: F401  (launcher env, then incentive_mm)
@@ -1214,13 +1214,16 @@ def research_targets(client, gaps: dict, now: datetime, dry: bool) -> Dict[str, 
                                     "series": g.get("series") or imm.series_of(ev),
                                     "msg": g.get("msg") or ""}
     # the term-end rows due a re-check (live_gaps has just re-read the rows);
-    # a not-a-vote row's sooner, for its news coming near (2026-11-10)
+    # a not-a-vote row's sooner, for its news coming near (2026-11-10), and
+    # from a day before its own day, to move it on to its event's next
+    # market's date (one row stops every strike of a ladder)
     stored = {r.get("glob"): r for r in imm_rows.load_rows("election")}
-    for glob_s, _when, day, _zone, checked in tuple(imm.ELECTION_TERM_ENDS):
+    for glob_s, when, day, _zone, checked in tuple(imm.ELECTION_TERM_ENDS):
         row = stored.get(glob_s) or {}
         not_vote = bool(row.get("not_vote"))
         refresh = NONVOTE_REFRESH_DAYS if not_vote else TERM_END_REFRESH_DAYS
-        if now.timestamp() - checked < refresh * 86400:
+        if now.timestamp() - checked < refresh * 86400 and not (
+                not_vote and now >= when - timedelta(days=1)):
             continue
         stamp = datetime.fromtimestamp(checked, timezone.utc).strftime("%Y-%m-%d")
         zone = row.get("zone") or ""
@@ -1322,8 +1325,9 @@ _HOW = {
                   "near: python imm_rows.py election remove {ev}   |   still quiet: python "
                   "imm_rows.py election add {ev} {day}{zone} --term-end --not-vote --source "
                   "\"...\" --source \"...\" --by family-watch-research --note \"not a vote: "
-                  "quiet as of <today>: <what you found>\"   (its day {day} past while later "
-                  "markets are still open: the earliest open deadline instead, plus --replace)"),
+                  "quiet as of <today>: <what you found>\"   (the day must be the first of the "
+                  "lookup's Kalshi dates more than a day away: when {day} is not, that date "
+                  "instead, plus --replace)"),
     # a term-end row's re-check (2026-10-28): has its vote been called since?
     "recheck": ("whether its vote has been CALLED or SCHEDULED since the last check "
                 "(a dissolution, a writ, an announced date)",
@@ -1441,11 +1445,12 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         f"nothing; status \"unsafe\", the note says what makes it near, with "
         f"sources. SAFE (none of that): write the election command plus "
         f"--term-end --not-vote on the EARLIEST of the day the deciding news "
-        f"is due if one is set, the earliest deadline among the event's open "
-        f"markets, and Kalshi's own date for the event; the sources are "
-        f"Kalshi's terms for that day and recent news that shows nothing is "
-        f"near; the note is \"not a vote: <what decides it>; quiet as of "
-        f"<today>: <what you found>\". The bot quotes to that day while "
+        f"is due if one is set and the first of the lookup's \"Kalshi dates\" "
+        f"(its open markets' own dates) more than a day away -- a row dated "
+        f"after an open market's own date stands that market down; the "
+        f"sources are Kalshi's terms for that day and recent news that shows "
+        f"nothing is near; the note is \"not a vote: <what decides it>; quiet "
+        f"as of <today>: <what you found>\". The bot quotes to that day while "
         f"research re-checks it every {NONVOTE_REFRESH_DAYS:g} days.",
         "- A recheck target already quotes to its term end: look for news "
         "that its vote has since been called or scheduled. Called: write the "
@@ -1457,9 +1462,10 @@ def research_prompt(items: List[Tuple[str, dict, str]]) -> str:
         "remove its row with the command shown (the bot stops quoting at "
         "once; research looks at it again later), status \"unsafe\". Still "
         "quiet: write the same row again with the command shown (it re-stamps "
-        "the check; two sources, as for the first row) -- or, if its day has "
-        "passed while later markets are still open, the earliest open "
-        "deadline, plus --replace.",
+        "the check; two sources, as for the first row) -- but if its day is "
+        "not the first of the lookup's Kalshi dates more than a day away (an "
+        "earlier market it missed, or its own day a day off or past while "
+        "later markets are open), write that date instead, plus --replace.",
         "- The only commands you may run are the ones shown, plus "
         "`python imm_rows.py election lookup EVENT` (read-only: Kalshi's own "
         "wording). If a command prints REFUSED, do not work around it.",
