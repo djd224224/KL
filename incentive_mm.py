@@ -293,6 +293,9 @@ def capped_ref_mult(anchor: Optional[int], ref_px: Optional[int],
     if series is not None and globals().get("TWK_ENABLE") \
             and series in globals().get("TWK_SERIES", ()):
         m = min(m, max(1.0, globals().get("TWK_REF_MULT_CAP", 1.0)))
+    # the art lots (2026-11-11): a flat 150 a side, no deep-reference size
+    if series is not None and series in globals().get("ART_FLAT_SIZE_SERIES", ()):
+        m = 1.0
     return m
 
 
@@ -2447,8 +2450,9 @@ def hour_size_mult(series: str, now_utc: datetime) -> float:
     1.0 when neither applies, and always for the OpenRouter market-share
     family (_share_x1). Capped at 1 for a Carbon Arc series inside its data
     landing window (CA_LANDING_WINDOWS). x1 for an election night session
-    (ENS_SERIES)."""
-    if _share_x1(series) or series in globals().get("ENS_SERIES", ()):
+    (ENS_SERIES), and for the art lots' flat 150 (ART_FLAT_SIZE_SERIES)."""
+    if _share_x1(series) or series in globals().get("ENS_SERIES", ()) \
+            or series in globals().get("ART_FLAT_SIZE_SERIES", ()):
         return 1.0
     m = _hour_window_mult(series, now_utc) * saturday_size_mult(series, now_utc)
     # a TRUMPSAY-group event's dated size (TWK_SAY_EVENT_SIZE: the GTA VI album
@@ -11791,6 +11795,36 @@ SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | {"KXSBSETLISTS"}
 SPRLVLDATE_SIZE_MULT = _env_float("IMM_SPRLVLDATE_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXSPRLVLDATE"] = SeriesOverride(size_mult=SPRLVLDATE_SIZE_MULT)
 
+# ART LOT SALES: 2-98c AND 150 A SIDE (Jack 2026-11-11: "expand to 2-98c for
+# art lot sales. go up to 150 a side"). KXART markets settle on one auction
+# lot's sale price (Sotheby's, Christie's, Phillips; 3 markets per lot), and
+# most strikes were dark. On 11/11 at 12:16Z, lots 106 and 121 of Sotheby's
+# 11/16 evening sale had walls of 23k-91k contracts at a 3-4c YES bid and a
+# 95-96c ask on both sides of nearly every strike. Both touches sat outside
+# the 5-90c fresh band, so no side could rest (zero_yield). The two strikes
+# with a side in the band (106 >$6M bid 20c, 121 >$2M bid 21c) projected
+# $0.30 / $0.14 against the bar at ~50 a side.
+# The series now quotes 2-98c and rests a FLAT 150 a side:
+# - a hand-tuned one-rung ladder, so applied_mention_mult is 1.0: the caps
+#   stay unscaled, and the series is out of the size test and the yield
+#   size mode;
+# - the per-market net cap pinned at 150 (no Saturday raise);
+# - ART_FLAT_SIZE_SERIES turns off every other size lever: the hour, evening
+#   and Saturday multipliers (hour_size_mult), the deep-reference size
+#   (capped_ref_mult), the near-cliff x1.5 (_near_cliff_size_mult) and the
+#   200-lot book lead (_book_lead_static_ok). Nothing rests past 150 a side.
+# The 3-per-lot cap (EVENT_TOP_N "=KXART:3") and the auction-day cutoff stay.
+# At 150 a side joined at the 11/11 walls, only 106 >$6M clears the $1.10
+# bar; the rest needed 210-770 a side.
+# IMM_ART_SIDE_SIZE / IMM_ART_PRICE_MIN / IMM_ART_PRICE_MAX set them.
+ART_SIDE_SIZE = _env_int("IMM_ART_SIDE_SIZE", 150)
+ART_PRICE_MIN = _env_int("IMM_ART_PRICE_MIN", 2)
+ART_PRICE_MAX = _env_int("IMM_ART_PRICE_MAX", 98)
+ART_FLAT_SIZE_SERIES = frozenset({"KXART"})
+SERIES_OVERRIDES["KXART"] = SeriesOverride(
+    levels=[(0, ART_SIDE_SIZE)], max_position=float(ART_SIDE_SIZE),
+    price_min_cents=ART_PRICE_MIN, price_max_cents=ART_PRICE_MAX)
+
 # KXTRUEV: Kalshi lists each daily only ON its print day (Jack 2026-08-24,
 # after the enrollment shipped dark: "i think Kalshi only lists each market
 # on its print day" / "make sure KXTRUEV is quoting"). That breaks the
@@ -14210,6 +14244,7 @@ _CONFIG_CODE_KNOBS = (
     "GENMOV_SIZE_MULT",           # the margin-of-victory races x3 (2026-10-23)
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
+    "ART_SIDE_SIZE", "ART_PRICE_MIN", "ART_PRICE_MAX",   # KXART (2026-11-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
     "RT_SIZE_MULT", "ENDORSE_SIZE_MULT", "SHIPPING_SIZE_MULT", "AIADOPT_SIZE_MULT",
     "SHIPPING_X2_SERIES",
@@ -24923,7 +24958,8 @@ def _book_lead_static_ok(ticker: str, series: str, now_ts: float) -> bool:
         return False
     if in_fair_lead_series(series) or series.startswith(LEAD_OFF_SERIES) \
             or (BOOK_LEAD_SKIP_SERIES and series.startswith(BOOK_LEAD_SKIP_SERIES)) \
-            or book_lead_own_rules(ticker, series):
+            or book_lead_own_rules(ticker, series) \
+            or series in ART_FLAT_SIZE_SERIES:      # flat 150 a side (2026-11-11)
         return False
     if ticker in _book_lead["comp"] or PVD_MARKETS.get(ticker) is not None:
         return False
@@ -32148,6 +32184,9 @@ class IncentiveMarketMaker:
         if NEAR_CLIFF_SIZE_MULT <= 0 or NEAR_CLIFF_SIZE_MULT == 1.0:
             return 1.0
         if ticker not in self._near_cliff_boost:
+            return 1.0
+        # the art lots rest a flat 150 a side (ART_FLAT_SIZE_SERIES, 2026-11-11)
+        if series_of(ticker) in ART_FLAT_SIZE_SERIES:
             return 1.0
         # a Carbon Arc market is 1x while its data lands (CA_LANDING_WINDOWS)
         if ca_landing_window(series_of(ticker), datetime.now(timezone.utc)):

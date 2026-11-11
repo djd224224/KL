@@ -1580,9 +1580,10 @@ class TestScreen(unittest.TestCase):
         self.assertEqual(len(cut), 6)
         self.assertEqual({m.ticker for m in lots} - cut,
                          {f"{ev}-60000", f"{ev}-40000", f"{ev}-80000"})
-        # no other override: no cap, no safe-join, no hour rule
+        # no other override: no safe-join, no hour rule; the cap is the flat
+        # 150 a side (Jack 2026-11-11, TestArtLotsFlat150)
         ov = imm.series_override("KXART")
-        self.assertTrue(ov is None or (ov.max_position is None
+        self.assertTrue(ov is None or (ov.max_position in (None, 150.0)
                                        and not ov.safe_join
                                        and ov.cutoff_from_close_min is None))
 
@@ -28367,6 +28368,63 @@ class TestForceEventsEmptied(unittest.TestCase):
         with mock.patch.object(imm, "size_test_mult", return_value=1.0):
             self.assertEqual(imm.applied_mention_mult("KXSPRLVLDATE"), 2.0)
         self.assertIn("SPRLVLDATE_SIZE_MULT", imm._CONFIG_CODE_KNOBS)
+
+
+class TestArtLotsFlat150(unittest.TestCase):
+    """Jack 2026-11-11: "expand to 2-98c for art lot sales. go up to 150 a
+    side". KXART quotes 2-98c and rests a flat 150 a side: no hour,
+    Saturday, deep-reference or near-cliff size, no 200-lot book lead, and
+    the per-market net cap stays 150."""
+
+    S = "KXART"
+    T = "KXART-SOT10616NOV26-6000000"
+    SAT_NIGHT = datetime(2026, 11, 14, 9, 0, tzinfo=timezone.utc)  # Sat 04:00 ET
+
+    def test_override_is_the_flat_ladder_and_the_wide_band(self):
+        self.assertEqual(imm.SERIES_OVERRIDES[self.S], imm.SeriesOverride(
+            levels=[(0, 150)], max_position=150.0,
+            price_min_cents=2, price_max_cents=98))
+        self.assertEqual((imm.series_price_min(self.S), imm.series_price_max(self.S)),
+                         (2, 98))
+        self.assertEqual(imm.member_price_band(self.S, False), (2, 98))
+        for knob in ("ART_SIDE_SIZE", "ART_PRICE_MIN", "ART_PRICE_MAX"):
+            self.assertIn(knob, imm._CONFIG_CODE_KNOBS)
+
+    def test_no_size_lever_lifts_a_side_past_150(self):
+        with mock.patch.object(imm, "_hour_window_mult", return_value=3.0), \
+                mock.patch.object(imm, "saturday_size_mult", return_value=1.5):
+            self.assertEqual(imm.hour_size_mult(self.S, self.SAT_NIGHT), 1.0)
+            self.assertEqual(imm.hour_scaled_levels(self.S, self.SAT_NIGHT), [(0, 150)])
+            # the control: a series on the global ladder takes the x4.5
+            self.assertEqual(imm.hour_size_mult("KXTESTPLAIN", self.SAT_NIGHT), 4.5)
+        self.assertEqual(imm.applied_mention_mult(self.S), 1.0)
+        self.assertEqual(imm.series_max_position(self.S, self.SAT_NIGHT, peak=True), 150.0)
+        self.assertIsNone(imm.size_test_arm(self.S))
+        self.assertFalse(imm.yield_size_eligible(self.S))
+        with mock.patch.object(imm, "LADDER_MODE", "atref"):
+            # a reference 6 ticks under the touch: x2.5 elsewhere, x1 here
+            self.assertGreater(imm.capped_ref_mult(10, 4, "bid", series="KXTESTPLAIN"), 1.0)
+            self.assertEqual(imm.capped_ref_mult(10, 4, "bid", series=self.S), 1.0)
+
+    def test_no_near_cliff_boost(self):
+        fake = mock.Mock(_near_cliff_boost={self.T, "KXTESTPLAIN-X"})
+        with mock.patch.object(imm, "NEAR_CLIFF_SIZE_MULT", 1.5), \
+                mock.patch.object(imm, "ca_landing_window", return_value=False):
+            self.assertEqual(
+                imm.IncentiveMarketMaker._near_cliff_size_mult(fake, self.T), 1.0)
+            self.assertEqual(
+                imm.IncentiveMarketMaker._near_cliff_size_mult(fake, "KXTESTPLAIN-X"), 1.5)
+
+    def test_no_book_lead(self):
+        now = time.time()
+        info = {self.T: (0, now + 5 * 86400, self.S),
+                "KXTESTPLAIN-X": (0, now + 5 * 86400, "KXTESTPLAIN")}
+        with mock.patch.object(imm, "BOOK_LEAD_MODE", "on"), \
+                mock.patch.object(imm, "FAIR_LEAD_MODE", "on"), \
+                mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.dict(imm._book_lead["info"], info):
+            self.assertTrue(imm._book_lead_static_ok("KXTESTPLAIN-X", "KXTESTPLAIN", now))
+            self.assertFalse(imm._book_lead_static_ok(self.T, self.S, now))
 
 
 class TestFloorSideSchedule(unittest.TestCase):
