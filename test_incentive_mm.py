@@ -38926,7 +38926,8 @@ class TestGroupBreaker(unittest.TestCase):
                         ("SWEEP_HOLD_SECS", 120.0), ("SWEEP_HOLDOUT", 0.0),
                         ("SWEEP_ESCALATE", "off"), ("SWEEP_GROUP", "dry"),
                         ("SWEEP_GROUP_WINDOW_SECS", 600.0),
-                        ("SWEEP_GROUP_HOLD_SECS", 1800.0), ("SWEEP_GROUP_MIN_CT", 0.0)):
+                        ("SWEEP_GROUP_HOLD_SECS", 1800.0), ("SWEEP_GROUP_MIN_CT", 0.0),
+                        ("SWEEP_GROUP_MIN_EVENTS", 2)):
             p = mock.patch.object(imm, name, v)
             p.start()
             self.addCleanup(p.stop)
@@ -39009,6 +39010,75 @@ class TestGroupBreaker(unittest.TestCase):
             self._fill(0, self.A)
             self._fill(60, self.B)
         self.assertEqual((self._lines(), self.bot._grp["fills"]), ([], 0))
+
+    def test_live_defaults_are_3_events_200_up_20_min(self):
+        # Jack 2026-11-12: "Yes, after the 3rd fill and hold for 20min", on the
+        # 200-contract floor offered after the KXSENATENOM favorites sweep
+        src = open(imm.__file__, encoding="utf-8").read()
+        for want in ('os.environ.get("IMM_SWEEP_GROUP", "on")',
+                     '_env_float("IMM_SWEEP_GROUP_HOLD_MIN", 20.0)',
+                     '_env_float("IMM_SWEEP_GROUP_MIN_CT", 200.0)',
+                     '_env_int("IMM_SWEEP_GROUP_MIN_EVENTS", 3)',
+                     '_env_float("IMM_SWEEP_GROUP_WINDOW_MIN", 10.0)'):
+            self.assertIn(want, src)
+
+    def _three_events(self):
+        """A, B (one game) and C (another game) in one group: the 3-event
+        tests put all three in the test group."""
+        imm._risk_group_memo.update({self.A: self.G, self.B: self.G, self.C: self.G})
+        p = mock.patch.object(imm, "_risk_group_memo_at", [time.time() + 3600])
+        p.start()
+        self.addCleanup(p.stop)
+        for lst in self.bot._resting_view.values():      # fills stay partial
+            for o in lst:
+                o["rem"] = 1000.0
+
+    def test_three_events_trip_on_the_third_and_hold_20_min(self):
+        self._three_events()
+        with mock.patch.object(imm, "SWEEP_GROUP", "on"), \
+                mock.patch.object(imm, "SWEEP_GROUP_MIN_EVENTS", 3), \
+                mock.patch.object(imm, "SWEEP_GROUP_HOLD_SECS", 1200.0):
+            self._fill(0, self.A)
+            self._fill(85, self.B)                  # 2 events: no trip yet
+            self.assertEqual((self._lines("trip"), self.cancelled), ([], []))
+            self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 86))
+            self._fill(190, self.C)                 # the 3rd event trips
+            trip, = self._lines("trip")
+            self.assertEqual(trip["events"], [self.bot._event_of(t) for t in (self.A, self.B, self.C)])
+            self.assertEqual(len(set(trip["events"])), 3)
+            self.assertEqual((trip["first"]["ticker"], trip["second"]["ticker"],
+                              trip["gap_s"], trip["window_fills"], trip["hold_s"]),
+                             (self.A, self.C, 190.0, 3, 1200.0))
+            self.assertEqual(sorted(o for o, _r in self.cancelled),
+                             sorted(t[-6:] + "-bid" for t in (self.A, self.B, self.C)))
+            self.assertTrue(self.bot.group_held(self.B, "bid", self.now + 191))
+            self.assertFalse(self.bot.group_held(self.B, "ask", self.now + 191))
+            self.assertTrue(self.bot.group_held(self.B, "bid", self.now + 190 + 1199))
+            self.assertFalse(self.bot.group_held(self.B, "bid", self.now + 190 + 1201))
+
+    def test_three_events_need_all_three_inside_the_window(self):
+        self._three_events()
+        with mock.patch.object(imm, "SWEEP_GROUP_MIN_EVENTS", 3):
+            self._fill(0, self.A)
+            self._fill(30, self.A)                  # the same event twice
+            self._fill(400, self.B)
+            self.assertEqual(self._lines("trip"), [])
+            self._fill(30 + 601, self.C)            # A's fills left the window
+            self.assertEqual(self._lines("trip"), [])
+            self._fill(700, self.A)                 # B, C, A inside 10 min
+            trip, = self._lines("trip")
+            self.assertEqual((trip["first"]["ticker"], trip["second"]["ticker"]), (self.B, self.A))
+
+    def test_three_events_skip_small_fills(self):
+        self._three_events()
+        with mock.patch.object(imm, "SWEEP_GROUP_MIN_EVENTS", 3), \
+                mock.patch.object(imm, "SWEEP_GROUP_MIN_CT", 200.0):
+            self._fill(0, self.A, count=250.0)
+            self._fill(60, self.B, count=30.0)      # under 200: not counted
+            self._fill(120, self.C, count=200.0)
+            self.assertEqual(self._lines("trip"), [])
+            self._fill(180, self.B, count=300.0)
+            self.assertEqual(len(self._lines("trip")), 1)
 
 
 class TestTapeTrigger(unittest.TestCase):

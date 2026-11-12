@@ -5094,8 +5094,9 @@ def risk_group_of(ticker: str) -> Optional[str]:
         return g
 
 
-# CROSS-EVENT BREAKER (#2 of the 10/17 risk-return review). Two maker fills on
-# the SAME side (both on our bids, or both on our asks) in DIFFERENT events of
+# CROSS-EVENT BREAKER (#2 of the 10/17 risk-return review). Maker fills on
+# the SAME side (both on our bids, or both on our asks) in SWEEP_GROUP_MIN_EVENTS
+# (3 since 2026-11-12; 2 as designed 10/17) DIFFERENT events of
 # one risk_group within SWEEP_GROUP_WINDOW_SECS -> that side of every market
 # in the group is held SWEEP_GROUP_HOLD_SECS; the other side keeps quoting (it
 # is the side that buys back). A fill inside a hold neither re-trips nor
@@ -5105,20 +5106,35 @@ def risk_group_of(ticker: str) -> Optional[str]:
 # (SWEEP_GROUP_MIN_CT 0; the trip lines carry both sizes, so the report can
 # score a floor). It reads the sweep breaker's WS fills, so it needs
 # IMM_SWEEP_BREAKER on or dry.
-#    IMM_SWEEP_GROUP=dry -- THE DEFAULT: each trip is LOGGED
-#                   (ws_group_<date>.jsonl `trip`: the two fills, the orders
-#                   it would pull, the group side's reward a day) and every
-#                   fill on a held side as `held_fill`; nothing pulled.
-#    IMM_SWEEP_GROUP=on  -- the held side's resting orders are cancelled at
-#                   once (on the fast-cancel budget) and the cycle quotes
-#                   nothing on that side of the group until the hold ends.
+#    IMM_SWEEP_GROUP=on  -- THE DEFAULT since 2026-11-12: the held side's
+#                   resting orders are cancelled at once (on the fast-cancel
+#                   budget) and the cycle quotes nothing on that side of the
+#                   group until the hold ends.
+#    IMM_SWEEP_GROUP=dry -- each trip is LOGGED (ws_group_<date>.jsonl `trip`:
+#                   the first and last fills, the events, the orders it would
+#                   pull, the group side's reward a day) and every fill on a
+#                   held side as `held_fill`; nothing pulled.
 #    IMM_SWEEP_GROUP=off -- nothing.
-SWEEP_GROUP = os.environ.get("IMM_SWEEP_GROUP", "dry").strip().lower()
+# LIVE 2026-11-12 at 3 events / 200+ contracts / 20 min (Jack: "Yes, after the
+# 3rd fill and hold for 20min"). 3:08-3:44 PM ET that day one seller cleared
+# the top bid of 18 KXSENATENOM favorites, a state every 20-60 s (15,655 at
+# 35c on TNR-GJAC, 8,596 at 85c on NVD-CMAS ...): 18 of our bids filled, $3.3k
+# of cash, -$130 at the marks an hour on. The per-event sweep breaker tripped
+# on each but can't get ahead of a taker that moves to the next event; dry,
+# this breaker saw it after the 2nd fill. As built then (2 events, any size,
+# 30 min) its 7-day replay was net -$22: each US-elections trip gives up
+# $14-52 of reward since the waves, and most catch nothing. At 200+ the only
+# trip since 11/08 is this sweep (+$117 of marks avoided after the 2nd fill,
+# ~$115 after the 3rd, vs ~$10 of reward for 20 min).
+SWEEP_GROUP = os.environ.get("IMM_SWEEP_GROUP", "on").strip().lower()
 if SWEEP_GROUP not in ("off", "dry", "on"):
     SWEEP_GROUP = "off"
 SWEEP_GROUP_WINDOW_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_WINDOW_MIN", 10.0)) * 60.0
-SWEEP_GROUP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_HOLD_MIN", 30.0)) * 60.0
-SWEEP_GROUP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_GROUP_MIN_CT", 0.0))
+SWEEP_GROUP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_HOLD_MIN", 20.0)) * 60.0
+SWEEP_GROUP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_GROUP_MIN_CT", 200.0))
+# different events with a qualifying fill inside the window that trip it
+# (the 3rd event's fill trips; 2 is the 10/17 design)
+SWEEP_GROUP_MIN_EVENTS = max(2, _env_int("IMM_SWEEP_GROUP_MIN_EVENTS", 3))
 
 # WAVE BREAKER (Jack 2026-11-07, after the House sweep: 16:18-16:38Z a taker
 # went district by district, selling the 90c+ favorites into our bids and
@@ -14461,7 +14477,7 @@ _CONFIG_CODE_KNOBS = (
     "EXCH_PAUSE_OVERRUN_MIN",
     # cross-event breaker and the dollar limits + skew, dry (2026-10-17)
     "SWEEP_GROUP", "SWEEP_GROUP_WINDOW_SECS", "SWEEP_GROUP_HOLD_SECS",
-    "SWEEP_GROUP_MIN_CT", "RISK_LIMITS", "RISK_EVENT_FLOOR", "RISK_EVENT_DAYS",
+    "SWEEP_GROUP_MIN_CT", "SWEEP_GROUP_MIN_EVENTS", "RISK_LIMITS", "RISK_EVENT_FLOOR", "RISK_EVENT_DAYS",
     "RISK_GROUP_FLOOR", "RISK_GROUP_DAYS", "RISK_SKEW_FROM", "RISK_SLICE_SECS",
     "RISK_PASS_EVERY_SECS", "RISK_SUMMARY_SECS", "RISK_REWARD_TAU_SECS",
     "RISK_EXEMPT",
@@ -27063,10 +27079,11 @@ class IncentiveMarketMaker:
         self._cash_pause: Dict[object, dict] = {}
         self._cash_stats = {"pauses": 0, "refused": 0, "held": 0}
         # cross-event breaker (2026-10-17, SWEEP_GROUP): (group, side) -> the
-        # last fill that could start a trip; -> the trip's window {"at",
-        # "until", "mode"} (dry: the hold `on` would keep, for held_fill
-        # lines); -> a LIVE hold's end, the only thing that keeps a side out
-        self._grp_last: Dict[Tuple[str, str], dict] = {}
+        # fills inside the window that could start a trip (oldest first); ->
+        # the trip's window {"at", "until", "mode"} (dry: the hold `on` would
+        # keep, for held_fill lines); -> a LIVE hold's end, the only thing
+        # that keeps a side out
+        self._grp_last: Dict[Tuple[str, str], List[dict]] = {}
         self._grp_win: Dict[Tuple[str, str], dict] = {}
         self._grp_hold: Dict[Tuple[str, str], float] = {}
         # wave breaker (2026-11-07, WAVE_BREAKER): (series, side) -> the last
@@ -29933,9 +29950,10 @@ class IncentiveMarketMaker:
                          trade_id: Any) -> None:
         """The CROSS-EVENT BREAKER (SWEEP_GROUP) on one of our maker fills,
         from _sweep_note_fill. A fill on a side inside a trip's window is a
-        `held_fill` line (dry: a fill `on` would not have taken); otherwise a
-        fill on the same side of the group in ANOTHER event within
-        SWEEP_GROUP_WINDOW_SECS of the last trips that side for
+        `held_fill` line (dry: a fill `on` would not have taken); otherwise
+        once SWEEP_GROUP_MIN_EVENTS different events of the group have
+        SWEEP_GROUP_MIN_CT+ fills on the same side within
+        SWEEP_GROUP_WINDOW_SECS, the last one trips that side for
         SWEEP_GROUP_HOLD_SECS -- logged dry, held and pulled on."""
         g = risk_group_of(t)
         if g is None or side not in ("bid", "ask"):
@@ -29957,18 +29975,29 @@ class IncentiveMarketMaker:
             return
         if n + 1e-9 < SWEEP_GROUP_MIN_CT:
             return
-        prev = self._grp_last.get(key)
-        self._grp_last[key] = {"ts": fts, "event": ev, "ticker": t, "count": n,
-                               "px": px, "order_id": oid, "trade_id": trade_id}
-        if prev is None or prev["event"] == ev or \
-                fts - prev["ts"] > SWEEP_GROUP_WINDOW_SECS:
+        # the side's qualifying fills inside the window, this one last; a trip
+        # needs SWEEP_GROUP_MIN_EVENTS different events among them
+        recent = [p for p in self._grp_last.get(key) or ()
+                  if fts - p["ts"] <= SWEEP_GROUP_WINDOW_SECS]
+        recent.append({"ts": fts, "event": ev, "ticker": t, "count": n,
+                       "px": px, "order_id": oid, "trade_id": trade_id})
+        self._grp_last[key] = recent[-100:]
+        evs: List[str] = []
+        for p in recent:
+            if p["event"] not in evs:
+                evs.append(p["event"])
+        if len(evs) < max(2, SWEEP_GROUP_MIN_EVENTS):
             return
+        # `first`: the window's earliest fill in another event
+        prev = next(p for p in recent if p["event"] != ev)
+        self._grp_last[key] = []
         for k_old in [k for k, w in self._grp_win.items()
                       if w["until"] < now_ts - 3600]:
             del self._grp_win[k_old]
         for k_old in [k for k, u in self._grp_hold.items() if u < now_ts - 3600]:
             del self._grp_hold[k_old]
-        for k_old in [k for k, p in self._grp_last.items() if p["ts"] < fts - 3600]:
+        for k_old in [k for k, p in self._grp_last.items()
+                      if not p or p[-1]["ts"] < fts - 3600]:
             del self._grp_last[k_old]
         live = SWEEP_GROUP == "on"
         mode = "on" if live else "dry"
@@ -30017,11 +30046,13 @@ class IncentiveMarketMaker:
                       "trade_id": prev["trade_id"]},
             "second": {"event": ev, "ticker": t, "count": n, "px": px,
                        "fill_ts": fts, "order_id": oid, "trade_id": trade_id},
+            "events": evs, "window_fills": len(recent),
             "markets": n_mkts, "group_day": round(grp_day, 2),
             "side_day": round(grp_day / 2.0, 2),
             "pull": [[tk, o["order_id"], o["px"], o["rem"]] for tk, o in pull]})
         log(f"{self.tag} group breaker ({mode}): {g} {side.upper()}s hit in "
-            f"{prev['event']} then {ev} ({fts - prev['ts']:.0f}s apart) -> "
+            f"{', '.join(evs[:-1])} then {evs[-1]} "
+            f"({fts - prev['ts']:.0f}s {'apart' if len(evs) == 2 else 'from the first'}) -> "
             f"{'holding' if live else 'would hold'} that side "
             f"{SWEEP_GROUP_HOLD_SECS / 60:.0f} min: {len(pull)} order(s) on "
             f"{n_mkts} market(s), ~${grp_day / 2.0:.2f}/day of reward")
@@ -41901,6 +41932,7 @@ class IncentiveMarketMaker:
                 self._grp, mode=SWEEP_GROUP,
                 window_min=SWEEP_GROUP_WINDOW_SECS / 60,
                 hold_min=SWEEP_GROUP_HOLD_SECS / 60, min_ct=SWEEP_GROUP_MIN_CT,
+                min_events=SWEEP_GROUP_MIN_EVENTS,
                 held_now=sum(1 for u in self._grp_hold.values() if u > now),
                 windows_now=sum(1 for w in self._grp_win.values()
                                 if w["until"] > now))
@@ -44138,7 +44170,7 @@ class IncentiveMarketMaker:
                   f" (the breaker itself is {SWEEP_BREAKER})")))
         log(f"group breaker (2026-10-17): {SWEEP_GROUP}"
             + ("" if SWEEP_GROUP == "off" else
-               f" -- maker fills on the same side in two events of one group "
+               f" -- maker fills on the same side in {SWEEP_GROUP_MIN_EVENTS} events of one group "
                f"(NFL game, Carbon Arc panel, US general elections, state "
                f"legislatures, USDA corn) within "
                f"{SWEEP_GROUP_WINDOW_SECS / 60:g} min hold that side of the "
