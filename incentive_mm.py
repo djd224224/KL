@@ -5587,6 +5587,15 @@ SERIES_BLOCKLIST_PREFIXES = tuple(
     # cancelled next cycle, positions (23, 842 contracts, ~$537 worst
     # case) ride to settlement. Un-block by removing this entry.
     + ["KXVENUEPERFORM-REDROCKS28JAN01"]
+    # GTA VI ALBUM OFF (Jack 2026-11-12: "stop quoting KXFEATURE-26GTA6").
+    # The TRUMPSAY-group event of 2026-11-01 (TWK_SAY_EVENTS) had quoted
+    # under its own terms with a stop on file for 00:00 ET Nov 18; this
+    # ends it now. An EVENT-ticker prefix as Red Rocks: every
+    # KXFEATURE-26GTA6-<ARTIST> market and the event are frozen. Standard
+    # semantics: no new orders, resting quotes cancelled next cycle, NOT
+    # reduce-only, positions ride to settlement. Un-block by removing this
+    # entry (the TWK_SAY_* terms are kept).
+    + ["KXFEATURE-26GTA6"]
     # company KPIs, food-price trackers, AAA MAXM/MINM (2026-10-03, above)
     + [f"{_s}-" for _s in _CUT_KPI_SERIES + _CUT_FOOD_SERIES + _CUT_AAA_SERIES]
     # the gas trial's national + diesel dailies (2026-10-08, above)

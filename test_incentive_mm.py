@@ -2476,6 +2476,18 @@ class TestSportsAndVenueAllowlist(unittest.TestCase):
             self.assertFalse(b(t), t)
         self.assertFalse(imm.series_blocklisted("KXVENUEPERFORM"))
 
+    def test_gta6_album_blocked(self):
+        # Jack 2026-11-12: "stop quoting KXFEATURE-26GTA6". Every artist
+        # market and the event are frozen; another KXFEATURE event and the
+        # series itself are not.
+        b = IncentiveMarketMaker._blocked
+        for t in ("KXFEATURE-26GTA6-DUA", "KXFEATURE-26GTA6-DRA",
+                  "KXFEATURE-26GTA6"):
+            self.assertTrue(b(t), t)
+        for t in ("KXFEATURE-27ABC-DUA", "KXFEATURE-X", "KXFEATURE"):
+            self.assertFalse(b(t), t)
+        self.assertFalse(imm.series_blocklisted("KXFEATURE"))
+
     def test_exact_series_only_no_mlb_prefix_bleed(self):
         # KXMLBMENTION is mlb_trading.py's book and must stay frozen; no
         # other KXMLB* series rides in on these two entries.
@@ -23938,7 +23950,14 @@ class TestTrumpWeeklyPilot(unittest.TestCase):
         # Jack 2026-11-01: "put KXFEATURE-26GTA6 into the same group" -- that
         # EVENT on the TRUMPSAY terms; the series' other events stay out
         self.assertEqual(imm.TWK_SAY_EVENTS, frozenset({"KXFEATURE-26GTA6"}))
-        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+        # Jack 2026-11-12: "stop quoting KXFEATURE-26GTA6" -- the event is
+        # blocklisted (test_gta6_album_blocked); the admission below is
+        # checked with that one entry lifted, as an un-block would leave it
+        unblocked = tuple(p for p in imm.SERIES_BLOCKLIST_PREFIXES
+                          if p != "KXFEATURE-26GTA6")
+        self.assertFalse(IncentiveMarketMaker._allowed("KXFEATURE-26GTA6-DRA"))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True), \
+                mock.patch.object(imm, "SERIES_BLOCKLIST_PREFIXES", unblocked):
             self.assertTrue(IncentiveMarketMaker._allowed("KXFEATURE-26GTA6-DRA"))
             self.assertTrue(IncentiveMarketMaker._allowed("KXFEATURE-26GTA6"))
             self.assertFalse(IncentiveMarketMaker._allowed("KXFEATURE-27TLOP-A"))
