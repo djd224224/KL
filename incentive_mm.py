@@ -7942,6 +7942,15 @@ def nfl_h2h_series(series: str) -> bool:
 # pattern-blocked (SERIES_BLOCK_PATTERNS).
 _MORT_LIVE = os.environ.get("IMM_MORT_ENABLE", "1") == "1"
 _DEFAULT_MORT_SERIES = "KXFM30YMTG,KXMORTGAGERATE"
+# ZILLOW HOME VALUES (Jack 2026-11-12: "there are also home value markets
+# KXVENICEHOME-30NOV26, KXSEAHOME-30NOV26 starting at 4:41pm today. can you
+# build a fair value for this?"): $90 a strike from 21:41Z 11/12 to 11/19.
+# Enrolled here only with the HOME_* gate -- quoted against
+# zillow_home_fair's first-print fair, never within HOME_FAIR_TOL_CENTS of
+# it, fail closed; IMM_HOME_ENABLE=0 or IMM_ALLOW_HOME_SERIES="" takes them
+# out.
+_HOME_LIVE = os.environ.get("IMM_HOME_ENABLE", "1") == "1"
+_DEFAULT_HOME_SERIES = "KXSEAHOME,KXVENICEHOME"
 # OPENROUTER MARKET SHARE (Jack 2026-09-30: "scrape OpenRouter for market
 # share markets", then "i got permission"). KX<AUTHOR>SHARE settle on the
 # Market Share chart of openrouter.ai/rankings -- an author's share of the
@@ -8390,6 +8399,11 @@ ALLOW_SERIES = frozenset(
                 + "," + (os.environ.get("IMM_ALLOW_MORT_SERIES",
                                         _DEFAULT_MORT_SERIES)
                          if _MORT_LIVE else "")
+                # Zillow home values (2026-11-12): only while the home gate
+                # is on
+                + "," + (os.environ.get("IMM_ALLOW_HOME_SERIES",
+                                        _DEFAULT_HOME_SERIES)
+                         if _HOME_LIVE else "")
                 # OpenRouter market share (2026-09-30): only while the share
                 # gate is on
                 + "," + (os.environ.get("IMM_ALLOW_OR_SHARE_SERIES",
@@ -14295,6 +14309,10 @@ _CONFIG_CODE_KNOBS = (
     # ride in its status file's "model" block
     "MORT_ENABLE", "MORT_SERIES", "MORT_FAIR_TOL_CENTS", "MORT_FAIR_TTL_MIN",
     "MORT_FAIR_REFRESH_SECS", "MORT_CUTOFF_BUFFER_DAYS", "MORT_SIZE_MULT",
+    # Zillow home value gate (2026-11-12); zillow_home_fair's model knobs
+    # ride in its status file's "model" block
+    "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
+    "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT",
     # Pokemon gate (2026-10-03); pokemon_fair's model knobs ride in its
     # status file's "model" block
     "POKE_ENABLE", "POKE_SERIES", "POKE_FAIR_TOL_CENTS", "POKE_BAND_TOL_CENTS",
@@ -20313,6 +20331,121 @@ def mort_cap_quotes(quotes: List["Quote"], bid_cap: Optional[int],
 
 
 # ----------------------------------------------------------------------------
+# ZILLOW HOME VALUE GATE (Jack 2026-11-12: "there are also home value markets
+# KXVENICEHOME-30NOV26, KXSEAHOME-30NOV26 starting at 4:41pm today. can you
+# build a fair value for this?"). KX<CITY>HOME settles on the FIRST print of
+# Zillow's middle-tier, smoothed, seasonally adjusted ZHVI for the home type
+# the rules name (the 30NOV26 cities: single-family homes), mid-December.
+#   - FAIR: zillow_home_fair.py (refresher thread "home-fair") -- the last
+#     published month, an AR(1) path for the months to the target, and one
+#     whole-history re-anchor per release still to come (every archived
+#     Zillow vintage rescales a region's history by one constant: -0.9% a
+#     release this fall); lognormal P(first print > strike). The Zillow CSVs
+#     are HEADed every 5 minutes and re-read on a new Last-Modified.
+#   - The quote loop stands a market aside (cancel) with no read, one whose
+#     Zillow check is older than HOME_FAIR_TTL_MIN (fail closed), within
+#     HOME_RELEASE_HOLD_MIN of a new Zillow release (the book re-prices on
+#     it), a market the model does not cover (only "above $K at <month>"),
+#     a decided strike, or a touch fighting the fair by more than
+#     HOME_FAIR_TOL_CENTS on the adverse side. Otherwise every bid is at most
+#     fair - HOME_FAIR_TOL_CENTS and every ask at least fair +
+#     HOME_FAIR_TOL_CENTS (mort_cap_quotes).
+#   - CUTOFF 00:00 ET on the ticker's day (30NOV26 -> Nov 30), before the
+#     target month's first print; the generic date rule reads "30NOV26" as
+#     2030-11-26, so home_cutoff_utc sets it. Unparseable -> stood down.
+# Price band 1-99c (the fair bound does the band's job), size x
+# HOME_SIZE_MULT. Kill switch IMM_HOME_ENABLE=0.
+HOME_ENABLE = _HOME_LIVE
+HOME_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_HOME_SERIES", _DEFAULT_HOME_SERIES).split(",") if s.strip())
+HOME_FAIR_TOL_CENTS = _env_int("IMM_HOME_FAIR_TOL_CENTS", 15)
+HOME_FAIR_TTL_MIN = _env_int("IMM_HOME_FAIR_TTL_MIN", 20)
+HOME_FAIR_REFRESH_SECS = _env_int("IMM_HOME_FAIR_REFRESH_SECS", 60)
+HOME_RELEASE_HOLD_MIN = _env_int("IMM_HOME_RELEASE_HOLD_MIN", 60)
+HOME_SIZE_MULT = _env_float("IMM_HOME_SIZE_MULT", 1.0)
+HOME_STATUS_FILE = os.environ.get(
+    "IMM_HOME_STATUS_FILE", os.path.join(STATUS_DIR, "home_value_fair.json"))
+# the regions parsed out of Zillow's files, by Last-Modified (a restart reuses
+# them instead of downloading ~100MB a file again)
+HOME_CACHE_FILE = os.environ.get(
+    "IMM_HOME_CACHE_FILE", os.path.join(STATUS_DIR, "zillow_home_cache.json"))
+_home_state: dict = {"snap": None}
+_HOME_SEG_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})$")      # 30NOV26
+
+for _s in HOME_SERIES:
+    SERIES_OVERRIDES[_s] = replace(
+        SERIES_OVERRIDES.get(_s) or SeriesOverride(),
+        size_mult=HOME_SIZE_MULT, price_min_cents=1, price_max_cents=99)
+
+
+def home_series(series: str) -> bool:
+    return HOME_ENABLE and series in HOME_SERIES
+
+
+def home_cutoff_utc(event_ticker: str) -> Optional[datetime]:
+    """00:00 ET on the ticker's day (KXSEAHOME-30NOV26 -> 2026-11-30), else
+    None (unparseable)."""
+    seg = (event_ticker or "").partition("-")[2]
+    m = _HOME_SEG_RE.match(seg)
+    if not m or m.group(2) not in _MONTHS:
+        return None
+    try:
+        d = datetime(2000 + int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))
+    except ValueError:
+        return None
+    return ET.localize(d).astimezone(timezone.utc)
+
+
+def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+              ext_ask: Optional[float]
+              ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when a home-value market may quote
+    -- bids at most bid_cap, asks at least ask_floor, None = that side not at
+    all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    snap = _home_state.get("snap")
+    if snap is None or snap.get("checked_ts") is None:
+        return "no zillow read yet", {"reason": "no_read"}, None
+    age = now_ts - float(snap["checked_ts"])
+    if age > HOME_FAIR_TTL_MIN * 60:
+        return (f"zillow check is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    rel = snap.get("release_ts")
+    if rel is not None and 0 <= now_ts - float(rel) < HOME_RELEASE_HOLD_MIN * 60:
+        return (f"new zillow release {(now_ts - float(rel)) / 60:.0f}m ago "
+                f"(hold {HOME_RELEASE_HOLD_MIN}m)",
+                {"reason": "release_hold", "since_s": round(now_ts - float(rel))},
+                None)
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        return "market not in the zillow read", {"reason": "no_market"}, None
+    if e.get("err") or e.get("p") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return f"not modelled: {why}", {"reason": "model", "why": why}, None
+    fair = float(e["p"]) * 100.0
+    inputs = {"fair": round(fair, 2), "mu": e.get("mu"), "sd_pct": e.get("sd_pct"),
+              "h": e.get("h"), "last": e.get("last_value"),
+              "tol": HOME_FAIR_TOL_CENTS}
+    if e.get("decided"):
+        return (f"decided at {fair:.0f}c (the target month is out)",
+                dict(inputs, reason="decided"), None)
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, HOME_FAIR_TOL_CENTS)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
+                f"{HOME_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+                f"mu ${e.get('mu') or 0:,})",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad),
+                None)
+    bid_cap = int(math.floor(fair - HOME_FAIR_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(fair + HOME_FAIR_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None,
+            ask_floor if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side {HOME_FAIR_TOL_CENTS}c clear of fair {fair:.0f}c",
+                dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+# ----------------------------------------------------------------------------
 # POKEMON GATE (Jack 2026-10-03: "yes build the gate to quote all pokemon
 # events", after "are you able to quote KXPOKEMON-26OCTCHA based on Collectr
 # realtime data"). KXPOKEMON settles on Collectr's ungraded price the day
@@ -22820,6 +22953,17 @@ def apply_series_cutoff_adjustments(series: str, event_ticker: str,
                         f"mortgage shape (year-end / how-high-in-a-year) -- "
                         f"standing it down (fail closed)")
         cutoff = mc if cutoff is None else min(cutoff, mc)
+    if home_series(series):
+        # ZILLOW HOME VALUE CUTOFF (2026-11-12, see HOME_ENABLE): 00:00 ET on
+        # the ticker's day -- the generic rule reads 30NOV26 as 2030-11-26.
+        # Unparseable -> stood down, logged once.
+        hc = home_cutoff_utc(event_ticker)
+        if hc is None:
+            hc = RELEASE_GUARD_UNKNOWN
+            _config_gap(series, event_ticker,
+                        f"{event_ticker} has no DDMMMYY day to cut off at -- "
+                        f"standing it down (fail closed)")
+        cutoff = hc if cutoff is None else min(cutoff, hc)
     # CARBON ARC LATE-MONTH STOP (Jack 2026-09-24 pm, see CA_LATE_STOP_DAYS):
     # keyed on the bot's own source verdict, not the name, so a *FT that is
     # not Carbon Arc (the Taylor Swift charts) keeps its ordinary cutoff.
@@ -23563,6 +23707,7 @@ def fair_gate_of(series: str) -> str:
         ("yt1", lambda: yt1_series(series)),
         ("treasury", lambda: treasury_gated_series(series)),
         ("mortgage", lambda: mort_series(series)),
+        ("zillow home", lambda: home_series(series)),
         ("pokemon", lambda: poke_series(series)),
         ("nfl props", lambda: nfl_series(series)),
     )
@@ -26635,6 +26780,7 @@ class IncentiveMarketMaker:
         self._yt1_stood: Set[str] = set()         # YouTube #1 pilot stand-asides
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
+        self._home_stood: Set[str] = set()        # zillow home gate stand-asides
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -36536,6 +36682,10 @@ class IncentiveMarketMaker:
                 # rungs held MORT_FAIR_TOL_CENTS clear of the fair
                 _mw, _mi, _mc = mort_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_mw or _mc is None) else mort_cap_quotes(out, *_mc)
+            if home_series(meta.series):
+                # Zillow home gate: the same, HOME_FAIR_TOL_CENTS clear
+                _hw, _hi, _hc = home_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_hw or _hc is None) else mort_cap_quotes(out, *_hc)
             if poke_series(meta.series):
                 # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
                 _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
@@ -39357,6 +39507,25 @@ class IncentiveMarketMaker:
                 self._mort_stood.discard(t)
                 log(f"{self.tag} mortgage resume {t}")
 
+            # ZILLOW HOME VALUE GATE (Jack 2026-11-12, see HOME_ENABLE): stand
+            # aside (cancel) without a fresh Zillow check, just after a
+            # Zillow release, on a shape the model does not cover, or when the
+            # touch fights the fair; otherwise every rung below stays
+            # HOME_FAIR_TOL_CENTS on the safe side of the fair.
+            home_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if home_series(meta.series):
+                hg_why, hg_in, home_caps = home_gate(t, now_ts, ext_bid, ext_ask)
+                if hg_why:
+                    if t not in self._home_stood:
+                        self._home_stood.add(t)
+                        log(f"{self.tag} home-value stand-aside {t}: {hg_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "home_fair", lambda: hg_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._home_stood:
+                self._home_stood.discard(t)
+                log(f"{self.tag} home-value resume {t}")
+
             # POKEMON GATE (Jack 2026-10-03, see POKE_ENABLE): stand aside
             # (cancel) without a fresh TCGplayer fair, on an unmapped event
             # or one whose rules name another item, just after the item's
@@ -40114,6 +40283,9 @@ class IncentiveMarketMaker:
             # nothing rests within MORT_FAIR_TOL_CENTS of the fair
             if mort_caps is not None:
                 mq = mort_cap_quotes(mq, *mort_caps)
+            # Zillow home gate: likewise last, HOME_FAIR_TOL_CENTS clear
+            if home_caps is not None:
+                mq = mort_cap_quotes(mq, *home_caps)
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
             if poke_caps is not None:
                 mq = mort_cap_quotes(mq, *poke_caps)
@@ -43244,6 +43416,53 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_mort_fair_refresh, daemon=True,
                              name="mort-fair").start()
+        if HOME_ENABLE and HOME_SERIES and not once:
+            # Zillow home value refresher (2026-11-12): the mortgage
+            # refresher's shape. Kalshi markets every 15 min, the Zillow CSVs
+            # HEADed every 5 (re-read on a new Last-Modified) inside
+            # HomeWatch; the gate reads _home_state. A failed check leaves
+            # checked_ts behind, so the gate fails closed after
+            # HOME_FAIR_TTL_MIN.
+            def _home_fair_refresh():
+                try:
+                    import zillow_home_fair
+                except Exception as e:
+                    log(f"{self.tag} ! home-value refresher disabled: {e}")
+                    return
+                watch = zillow_home_fair.HomeWatch(fair_reader(), sorted(HOME_SERIES),
+                                                   cache_path=HOME_CACHE_FILE)
+                last = None
+                while True:
+                    delay = max(30, HOME_FAIR_REFRESH_SECS)
+                    try:
+                        snap = watch.refresh()
+                        _home_state["snap"] = snap
+                        ents = snap.get("markets") or {}
+                        n_ok = sum(1 for e in ents.values() if "p" in e)
+                        key = (n_ok, len(ents), snap.get("release_ts"),
+                               snap.get("checked_ts") is None,
+                               len(snap.get("errors") or []))
+                        if last != key:
+                            log(f"{self.tag} home-fair refresh: {n_ok}/{len(ents)} "
+                                f"markets priced, zillow release "
+                                f"{snap.get('release_ts')}"
+                                + (f"; {'; '.join(snap['errors'])[:200]}"
+                                   if snap.get("errors") else ""))
+                        last = key
+                        try:
+                            zillow_home_fair.write_status(HOME_STATUS_FILE, snap)
+                        except Exception:
+                            pass      # observability only
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! home-fair refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 60)
+                    time.sleep(delay)
+            threading.Thread(target=_home_fair_refresh, daemon=True,
+                             name="home-fair").start()
         if POKE_ENABLE and not once:
             # Pokemon refresher (2026-10-03): the mortgage refresher's shape
             # -- Kalshi (signed) and TCGplayer reads off the trading thread
@@ -43767,6 +43986,13 @@ class IncentiveMarketMaker:
                 f"{7 + MORT_CUTOFF_BUFFER_DAYS}d before the first print that "
                 f"can settle, ttl {MORT_FAIR_TTL_MIN}m, refresh "
                 f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
+        if HOME_ENABLE and HOME_SERIES:
+            log(f"zillow home gate: {','.join(sorted(HOME_SERIES))} fail-closed, "
+                f"bids <= fair - {HOME_FAIR_TOL_CENTS}c, asks >= fair + "
+                f"{HOME_FAIR_TOL_CENTS}c, a touch fighting the fair by more "
+                f"stands aside, {HOME_RELEASE_HOLD_MIN}m out after a Zillow "
+                f"release, size x{HOME_SIZE_MULT:g}, 1-99c, out 00:00 ET on the "
+                f"ticker day, ttl {HOME_FAIR_TTL_MIN}m, status {HOME_STATUS_FILE}")
         else:
             log("mortgage gate: OFF -- KXFM30YMTG/KXMORTGAGERATE not enrolled")
         if POKE_ENABLE:

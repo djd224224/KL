@@ -227,6 +227,10 @@ def setUpModule():
     # only the refresher thread writes either, but never the live file
     imm.MORT_STATUS_FILE = os.path.join(tmp, "mortgage_fair.json")
     imm._mort_state["snap"] = None
+    # the Zillow home value gate's (2026-11-12): the same
+    imm.HOME_STATUS_FILE = os.path.join(tmp, "home_value_fair.json")
+    imm.HOME_CACHE_FILE = os.path.join(tmp, "zillow_home_cache.json")
+    imm._home_state["snap"] = None
     # the Pokemon gate's status file and in-memory snapshot (2026-10-03):
     # the same -- only its refresher thread writes them
     imm.POKE_STATUS_FILE = os.path.join(tmp, "pokemon_fair.json")
@@ -25708,6 +25712,158 @@ class TestMortgageFairGate(unittest.TestCase):
         self.assertIn(self.T, bot._mort_stood)
 
 
+class TestZillowHomeGate(unittest.TestCase):
+    """zillow_home_fair's snapshot -> home_gate / mort_cap_quotes -> the
+    Zillow home value markets quoted only against the first-print fair,
+    never within HOME_FAIR_TOL_CENTS of it, failing closed, held after a
+    Zillow release, out 00:00 ET on the ticker day (Jack 2026-11-12: "can
+    you build a fair value for this?"). Fixture KXSEAHOME-30NOV67 (cutoff
+    2067-11-30, far away), strike GT882500, book 50x90."""
+
+    T = "KXSEAHOME-30NOV67-GT882500"
+    EV = "KXSEAHOME-30NOV67"
+    CLOSE = datetime(2067, 12, 17, 15, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _clean_persist()
+        imm._home_state["snap"] = None
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._home_state["snap"] = None
+
+    def _snap(self, p=0.70, check_age=0.0, release_age=30 * 86400.0, err=None,
+              decided=False, ticker=None):
+        now = time.time()
+        e = {"strike": 882500.0, "target": "2067-11", "h": 2, "mu": 880000,
+             "sd_pct": 1.3, "last_value": 891130}
+        if err:
+            e["err"] = err
+        else:
+            e["p"] = p
+            if decided:
+                e["decided"] = True
+        imm._home_state["snap"] = {
+            "ts": now, "checked_ts": None if check_age is None else now - check_age,
+            "release_ts": None if release_age is None else now - release_age,
+            "markets": {ticker or self.T: e}, "errors": []}
+
+    def _bot(self):
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 9000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.5000", "yes_ask_dollars": "0.9000",
+            "volume_fp": "500.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.46", "400"], ["0.48", "400"], ["0.50", "400"]],
+            "no_dollars": [["0.06", "400"], ["0.08", "400"], ["0.10", "400"]]}}
+        return IncentiveMarketMaker(client=client, live=False)
+
+    def _quotes(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+
+    def test_enrolled_and_cut_off_on_the_ticker_day(self):
+        for s in ("KXSEAHOME", "KXVENICEHOME"):
+            self.assertIn(s, imm.ALLOW_SERIES, s)
+            self.assertTrue(imm.home_series(s), s)
+            ov = imm.series_override(s)
+            self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
+                             (1.0, 1, 99), s)
+            with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+                self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-30NOV26-GT1"), s)
+            self.assertFalse(IncentiveMarketMaker._blocked(f"{s}-30NOV26-GT1"), s)
+        # Jack named two; the other cities are not enrolled
+        self.assertFalse(imm.home_series("KXSANTAMONICAHOME"))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(IncentiveMarketMaker._allowed(
+                "KXSANTAMONICAHOME-30NOV26-GT2655000"))
+        # 00:00 ET Nov 30 -- the generic rule reads 30NOV26 as 2030-11-26
+        nov30 = datetime(2026, 11, 30, 5, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.home_cutoff_utc("KXSEAHOME-30NOV26"), nov30)
+        generic = imm.trade_cutoff_utc("KXSEAHOME-30NOV26", None, None)
+        self.assertGreater(generic, nov30)
+        close = datetime(2026, 12, 17, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXSEAHOME", "KXSEAHOME-30NOV26", generic, close_time=close), nov30)
+        self.assertEqual(imm.apply_series_cutoff_adjustments(
+            "KXSEAHOME", "KXSEAHOME-NOV26", None, close_time=close),
+            imm.RELEASE_GUARD_UNKNOWN)
+        self.assertIsNone(imm.home_cutoff_utc("KXSEAHOME-31FEB26"))
+
+    def test_gate_reasons_fail_closed(self):
+        now = time.time()
+        r = lambda t=self.T, b=50, a=90: imm.home_gate(t, now, b, a)[1].get("reason")
+        self.assertEqual(r(), "no_read")
+        self._snap(check_age=None)
+        self.assertEqual(r(), "no_read")
+        self._snap(check_age=imm.HOME_FAIR_TTL_MIN * 60 + 30)
+        self.assertEqual(r(), "stale")
+        self._snap(release_age=10 * 60)                       # a new release
+        self.assertEqual(r(), "release_hold")
+        self._snap(release_age=imm.HOME_RELEASE_HOLD_MIN * 60 + 5)
+        self.assertIsNone(r())
+        self._snap(release_age=None)                          # no file yet
+        self.assertIsNone(r())
+        self._snap()
+        self.assertEqual(r(t="KXSEAHOME-30NOV67-GT875000"), "no_market")
+        self._snap(err="not modelled: below / at")
+        self.assertEqual(r(), "model")
+        self._snap(p=1.0, decided=True)
+        self.assertEqual(r(), "decided")
+        self._snap(p=0.70)
+        self.assertEqual(r(b=86), "band")                     # bid over 70 + 15
+        self.assertEqual(r(a=54), "band")                     # ask under 70 - 15
+        self.assertIsNone(r(b=85, a=55))                      # at tol: quotes
+        why, inputs, caps = imm.home_gate(self.T, now, 50, 90)
+        self.assertEqual((why, caps), ("", (55, 85)))
+        self.assertEqual(inputs["fair"], 70.0)
+        self._snap(p=0.90)                                    # no ask room
+        self.assertEqual(imm.home_gate(self.T, now, 50, 99)[2], (75, None))
+        self._snap(p=0.10)                                    # no bid room
+        self.assertEqual(imm.home_gate(self.T, now, 2, 50)[2], (None, 25))
+        with mock.patch.object(imm, "HOME_FAIR_TOL_CENTS", 60):
+            self._snap(p=0.50)
+            self.assertEqual(r(b=None, a=None), "decided")
+
+    def test_quotes_only_clear_of_the_fair(self):
+        bot = self._bot()
+        bot.run_cycle()         # no read: nothing -- the estimate is zero too
+        self.assertEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot.state.selected)
+
+        def cycle(p):
+            self._snap(p=p)
+            bot.state.universe_at = 0.0                       # re-estimate
+            bot.run_cycle()
+            q = self._quotes(bot)
+            return ({px for s_, px in q if s_ == "bid"},
+                    {px for s_, px in q if s_ == "ask"})
+        self.assertEqual(cycle(0.70), ({48, 49, 50}, {90, 91, 92}))  # 55 / 85
+        self.assertNotIn(self.T, bot._home_stood)
+        self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
+        self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
+        # bid touch 50 over 30 + 15: the whole market stands aside
+        self._snap(p=0.30)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+        self.assertIn(self.T, bot._home_stood)
+        # a new Zillow release: out for the hold, whatever the fair says
+        self._snap(p=0.70, release_age=60)
+        bot.run_cycle()
+        self.assertEqual(self._quotes(bot), [])
+
+
 class TestPokemonFairGate(unittest.TestCase):
     """pokemon_fair's snapshot -> poke_gate / mort_cap_quotes -> KXPOKEMON
     quoted only against the TCGplayer fair, never within POKE_FAIR_TOL_CENTS
@@ -26864,7 +27020,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # fair lead or close rests past the band (2026-10-30)
         # + an RT settled strike that stops qualifying past the release-week
         # stand-down (2026-11-01)
-        self.assertEqual(len(conts), 56)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
+        # + the Zillow home value gate (2026-11-12)
+        self.assertEqual(len(conts), 57)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
