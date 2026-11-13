@@ -5445,6 +5445,12 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         for keep in ("KXPCE", "KXPPI", "KXGDP", "KXJOLTS", "KXUST10Y", "KXFED",
                      "KXUSGBEEF", "KXTRUFEGGS"):
             self.assertFalse(imm.series_pattern_blocked(keep), keep)
+        # ...and so is a PARTY COMBO (Jack 2026-11-13: "be open to quoting
+        # these type of upcoming combo markets ... KXCPIPARTYCOMBO-30MAR"),
+        # dated to the 2028 general; a combo of CPI prints stays blocked
+        self.assertFalse(imm.series_pattern_blocked("KXCPIPARTYCOMBO"))
+        self.assertFalse(IncentiveMarketMaker._blocked("KXCPIPARTYCOMBO-30MAR-DEM-LE1.9"))
+        self.assertTrue(imm.series_pattern_blocked("KXCPICOMBO"))
         # the earlier two entries still hold (the gas one in its 2026-09-27
         # form: states only while the GasBuddy gate is off)
         self.assertTrue(imm.series_pattern_blocked("KXAAAGASDNYC"))

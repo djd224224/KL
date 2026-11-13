@@ -5965,7 +5965,14 @@ def _series_block_default(gb_state_gas_live: bool) -> str:
     return (("KXAAAGASD[A-Z][A-Z][A-Z]+," if gb_state_gas_live
              else "KXAAAGASD[A-Z]+,")
             + "KXTEMP[A-Z]+H,"
-            ".*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT,"
+            # ...but not a PARTY COMBO (Jack 2026-11-13: "be open to quoting
+            # these type of upcoming combo markets KXLEPENEURCOMBO-27JUN,
+            # KXCPIPARTYCOMBO-30MAR, KXAOCMAMDANICOMBO-28MAR"): "2029
+            # inflation x 2028 winner" is an election-family market dated to
+            # the 2028 general (its row in election_dates_extra), long before
+            # its 2029 CPI leg prints. KXCPICOMBO, a combo of CPI prints, is
+            # still a CPI market and stays blocked.
+            "(?!.*PARTYCOMBO$).*CPI.*,KXCOREUND,KXUSEDCAR,USEDCAR,KX[A-Z0-9]+HEADCOUNT,"
             # KXOSCARAWARDACTR is a SAG Award series filed under the Oscar
             # prefix (2026-09-26 audit of the 66 KXOSCAR* names); the KXOSCAR
             # prefix allow must never quote it under the Oscars' dates
