@@ -84,7 +84,10 @@ REANCHOR_IDIO_SD_OTHER_PCT = _env_float("IMM_HOME_REANCHOR_IDIO_SD_OTHER_PCT", 0
 SHAPE_SD_MULT = _env_float("IMM_HOME_SHAPE_SD_MULT", 1.0)
 SD_FLOOR_PCT = _env_float("IMM_HOME_SD_FLOOR_PCT", 0.5)
 AR_MONTHS = int(_env_float("IMM_HOME_AR_MONTHS", 36))
-HEAD_SECS = _env_float("IMM_HOME_HEAD_SECS", 300)
+# every minute since the HOME LEADS (2026-11-13): 200-lot leads ~15c+ off the
+# fair rest on every strike, and a new Zillow release is what moves it, so the
+# gate's release hold must start within a minute of Zillow's file changing
+HEAD_SECS = _env_float("IMM_HOME_HEAD_SECS", 60)
 META_REFRESH_SECS = _env_float("IMM_HOME_META_REFRESH_SECS", 900)
 
 # home type (as the rules word it) -> Zillow Research cut (middle tier, sm_sa)

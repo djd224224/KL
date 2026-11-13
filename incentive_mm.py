@@ -20514,6 +20514,15 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
 
+def home_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """`ticker`'s Zillow fair (YES cents) while the home gate reads it -- a
+    fresh check, no new-release hold, a modelled and undecided strike, a side
+    HOME_FAIR_TOL_CENTS clear of it -- else None: FAIR LEAD's view of the
+    family (the gate's book test apart; see HOME LEADS)."""
+    why, inputs, _caps = home_gate(ticker, now_ts, None, None)
+    return None if why else float(inputs["fair"])
+
+
 # ----------------------------------------------------------------------------
 # POKEMON GATE (Jack 2026-10-03: "yes build the gate to quote all pokemon
 # events", after "are you able to quote KXPOKEMON-26OCTCHA based on Collectr
@@ -25055,13 +25064,39 @@ def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]
 # IMM_FAIR_LEAD_SERIES naming it puts it back.
 # THE ELECTION-DAY RAIN (Jack 2026-10-31: "in same way as weekend rain
 # family"): RAIN_DAY_SERIES leads off the weekend writer's fair for its day.
+# HOME LEADS (Jack 2026-11-13: "zillow cities -- can quote empty book,
+# because there's a fair you can extend range 1-99c"). The 16 Zillow
+# home-value cities (HOME_SERIES) opened 11/12 with ~40,000 contracts resting
+# at 1c on BOTH sides of every strike and nothing between: a ladder joining
+# that wall at its reference scored ~0.3% of a side (Venice ~$0.02/day a
+# strike of a $14/day pool), so 14 of 16 cities stood down under the payout
+# bar. Off the Zillow fair (home_fair_c: the gate's own read) a side leads
+# with one target/5 rung (200 of a 1,000 target) at the cheapest price ahead
+# of the wall that takes COMP_LEAD_SHARE of it -- ~13 ticks over a 1c wall,
+# about 95% of the side -- in the family's 1-99c band, never closer to the
+# fair than the home gate's own HOME_FAIR_TOL_CENTS (fair_lead_margin; the
+# gate's bid <= fair - 15 / ask >= fair + 15 caps still apply on top). Every
+# other FAIR LEAD rule comes with it: the disagreement guard, LEAD STOP, the
+# 200-contract leading-market cap and event room, FAIR CLOSE, the WS fast
+# cancel judged against the model. A stale read, a new Zillow release (the
+# hold) or a decided strike leads nothing (home_fair_c returns None).
+# IMM_FAIR_LEAD_SERIES without them takes the family out.
 FAIR_LEAD_MODE = os.environ.get("IMM_FAIR_LEAD", "on").strip().lower()
 FAIR_LEAD_SERIES: Tuple[str, ...] = tuple(sorted(
     {s.strip() for s in os.environ.get(
         "IMM_FAIR_LEAD_SERIES",
-        ",".join(["KXRAINWKND", *sorted(RAIN_DAY_SERIES)] + sorted(VERCEL_SERIES))).split(",")
+        ",".join(["KXRAINWKND", *sorted(RAIN_DAY_SERIES)] + sorted(VERCEL_SERIES)
+                 + (sorted(HOME_SERIES) if HOME_ENABLE else []))).split(",")
      if s.strip()}))
 FAIR_LEAD_MARGIN_C = max(0, _env_int("IMM_FAIR_LEAD_MARGIN_C", 5))
+
+
+def fair_lead_margin(series: str) -> int:
+    """How far inside its fair a FAIR LEAD may come at most: the home gate's
+    own tolerance for the Zillow family (HOME LEADS), else FAIR_LEAD_MARGIN_C."""
+    if home_series(series):
+        return max(FAIR_LEAD_MARGIN_C, HOME_FAIR_TOL_CENTS)
+    return FAIR_LEAD_MARGIN_C
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
 # 200 A CITY (Jack 2026-10-31: "yes", to "give each event 200 contracts of
@@ -25189,6 +25224,8 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
         return vercel_fair_c(ticker, now_ts)
     if or_fair_series(series):
         return or_fair_c(ticker, now_ts)
+    if home_series(series):
+        return home_fair_c(ticker, now_ts)
     return None
 
 
@@ -25211,6 +25248,8 @@ def fair_model_label(series: str) -> str:
         return "the OpenRouter fair"
     if ca_array_lead_series(series):
         return "the Carbon Arc array fair"
+    if home_series(series):
+        return "the Zillow fair"
     return "its model fair"
 
 
@@ -25454,7 +25493,8 @@ def book_lead_anchor(ticker: str, series: str, now_ts: float) -> Optional[float]
 
 def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
                     fair_c: float, target: float, df: float,
-                    hold_bid: Optional[int] = None, hold_ask: Optional[int] = None
+                    hold_bid: Optional[int] = None, hold_ask: Optional[int] = None,
+                    margin: Optional[int] = None
                     ) -> Tuple[Optional[Tuple[int, int, int]],
                                Optional[Tuple[int, int, int]]]:
     """(bid lead, ask lead) for a market off its model fair `fair_c` (YES
@@ -25464,7 +25504,9 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
     guards as comp_lead_group; while the book's touch sits more than
     FAIR_LEAD_MAX_GAP_C past the fair (the disagreement guard) a side leads
     only that far inside the book's far touch too (FAIR_LEAD_GUARD_INSIDE),
-    else neither does."""
+    else neither does. `margin` (default FAIR_LEAD_MARGIN_C): see
+    fair_lead_margin."""
+    margin = FAIR_LEAD_MARGIN_C if margin is None else margin
     lb = ln = None
     eb, ea = external_best(yes_levels, no_levels)
     held = bool(FAIR_LEAD_MAX_GAP_C) and any(
@@ -25473,10 +25515,10 @@ def fair_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
         return None, None
     if target > 0:
         lb = comp_side_lead_ref(yes_levels, int(math.floor(fair_c)), target, df,
-                                hold=hold_bid, margin=FAIR_LEAD_MARGIN_C)
+                                hold=hold_bid, margin=margin)
         ln = comp_side_lead_ref(no_levels, 100 - int(math.ceil(fair_c)), target, df,
                                 hold=None if hold_ask is None else 100 - hold_ask,
-                                margin=FAIR_LEAD_MARGIN_C)
+                                margin=margin)
     la = None if ln is None else (100 - ln[0], 100 - ln[1], 100 - ln[2])
     if lb is not None and ea is not None and lb[0] >= ea:
         lb = None
@@ -35049,7 +35091,8 @@ class IncentiveMarketMaker:
             self._fair_gap_note(t, yes_ext, no_ext, fair_c)
             return fair_lead_group(yes_ext, no_ext, fair_c,
                                    meta.target_size, meta.discount_factor,
-                                   hold_bid=held[0], hold_ask=held[1])
+                                   hold_bid=held[0], hold_ask=held[1],
+                                   margin=fair_lead_margin(meta.series))
         if t not in self._comp_groups:
             lad = self._ladders[t]
             i = lad.index(t)
@@ -35104,7 +35147,7 @@ class IncentiveMarketMaker:
         -- when it starts, stops or moves 3c or more (the mode's dry says
         so)."""
         dry = "" if lead_mode(src) == "on" else " (dry)"
-        kind, margin = ("fair", FAIR_LEAD_MARGIN_C) if src == "fair" \
+        kind, margin = ("fair", fair_lead_margin(series_of(t))) if src == "fair" \
             else ("comp", COMP_LEAD_MARGIN_C)
         grp = self._comp_groups.get(t) or ()
         who, verb = ((f"{self._comp_pairs[t]}'s book", "implies") if t in self._comp_pairs

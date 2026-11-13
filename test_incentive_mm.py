@@ -41719,6 +41719,114 @@ class TestUpcomingPrograms(unittest.TestCase):
         self.assertFalse(any("KXLATERCC-26DEC05-T1" in x for x in seen))
 
 
+class TestHomeLead(unittest.TestCase):
+    """HOME LEADS (Jack 2026-11-13: "zillow cities -- can quote empty book,
+    because there's a fair you can extend range 1-99c"): the Zillow cities
+    lead off the home gate's fair (FAIR LEAD) at the gate's own 15c margin.
+    Fixture: NYC $875k's 11/12 book -- 40,139 YES and 39,924 NO at 1c,
+    nothing between -- against a 30.6c fair."""
+
+    T = "KXNYCHOME-30NOV67-GT875000"
+    EV = "KXNYCHOME-30NOV67"
+    CLOSE = datetime(2067, 12, 17, 15, 0, tzinfo=timezone.utc)
+    WALLS = ([[1, 40139.0]], [[1, 39924.0]])
+    _snap = TestZillowHomeGate._snap
+
+    def setUp(self):
+        _clean_persist()
+        imm._home_state["snap"] = None
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        for p in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                  mock.patch.object(imm, "LADDER_MODE", "atref"),
+                  mock.patch.object(imm, "FAIR_LEAD_MODE", "on")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        imm.SERIES_HOUR_MULTS = self._saved_hour_mults
+        imm._home_state["snap"] = None
+
+    def test_the_family_leads_at_the_gates_margin(self):
+        for s in imm.HOME_SERIES:
+            self.assertIn(s, imm.FAIR_LEAD_SERIES, s)
+            self.assertTrue(imm.fair_lead_series(s), s)
+        self.assertEqual(imm.fair_lead_margin("KXNYCHOME"), imm.HOME_FAIR_TOL_CENTS)
+        self.assertEqual(imm.fair_lead_margin("KXRAINWKND"), imm.FAIR_LEAD_MARGIN_C)
+        self.assertEqual(imm.fair_model_label("KXNYCHOME"), "the Zillow fair")
+
+    def test_the_fair_is_the_gates_read(self):
+        now = time.time()
+        self._snap(p=0.306)
+        self.assertAlmostEqual(imm.fair_model_c(self.T, "KXNYCHOME", now), 30.6)
+        self._snap(p=0.306, release_age=600.0)            # a new Zillow release: held
+        self.assertIsNone(imm.fair_model_c(self.T, "KXNYCHOME", now))
+        self._snap(p=0.306, check_age=3600.0)             # stale: fail closed
+        self.assertIsNone(imm.fair_model_c(self.T, "KXNYCHOME", now))
+        self._snap(p=0.306, decided=True)
+        self.assertIsNone(imm.fair_model_c(self.T, "KXNYCHOME", now))
+        self._snap(err="not modelled: below / at")
+        self.assertIsNone(imm.fair_model_c(self.T, "KXNYCHOME", now))
+
+    def test_the_lead_over_the_1c_walls(self):
+        m = imm.fair_lead_margin("KXNYCHOME")
+        lb, la = imm.fair_lead_group(*self.WALLS, 30.6, 1000.0, 0.5, margin=m)
+        self.assertEqual(lb, (13, 15, 1))        # 13c, capped at the gate's fair - 15
+        self.assertEqual(la, (87, 46, 99))       # 87c, floored at fair + 15
+        share, sides = imm.estimate_reward_share(
+            *self.WALLS, [("bid", 13, 200.0), ("ask", 87, 200.0)], 1000.0, 0.5, False)
+        self.assertEqual(sides, 2)
+        self.assertGreater(share, 0.95)
+        # a strike near either end leads its one side
+        self.assertEqual(imm.fair_lead_group(*self.WALLS, 1.9, 1000.0, 0.5, margin=m)[0], None)
+        self.assertEqual(imm.fair_lead_group(*self.WALLS, 85.0, 1000.0, 0.5, margin=m)[1], None)
+        # the margin binds where the wall forces a lead closer than 15c
+        wall10 = ([[10, 1000.0]], [[1, 39924.0]])
+        self.assertIsNone(imm.fair_lead_group(*wall10, 30.6, 1000.0, 0.5, margin=m)[0])
+        self.assertEqual(imm.fair_lead_group(*wall10, 30.6, 1000.0, 0.5, margin=5)[0][0], 17)
+
+    def _cycle(self, p=0.306):
+        self._snap(p=p)
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 900000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": self.CLOSE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "yes_bid_dollars": "0.0100", "yes_ask_dollars": "0.9900",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "40139"]], "no_dollars": [["0.01", "39924"]]}}
+        with mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=client, live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                self._snap(p=p)                       # keep the read fresh
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {o["book_side"]: (o["yes_price"], int(o["remaining_count"]))
+                 for o in bot.state.sim_orders.values()
+                 if o["ticker"] == self.T
+                 and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+        return bot, rungs, lines
+
+    def test_the_quote_loop_leads_the_empty_book(self):
+        bot, rungs, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(rungs.get("bid"), (13, 200), lines[-40:])
+        self.assertEqual(rungs.get("ask"), (87, 200))
+        self.assertTrue(any(f"fair lead {self.T} bid: 200 @ 13c" in s and "the Zillow fair" in s
+                            for s in lines), [s for s in lines if "fair lead" in s])
+
+
 if __name__ == "__main__":
     unittest.main()
 
