@@ -40303,8 +40303,12 @@ class TestLowTempPeriods(unittest.TestCase):
                     "fetched_at": "2026-11-13T14:00:00+00:00", "skip": None,
                     "markets": {self.T: 0.79}, "decided": [], "near": []}}}, f)
             with mock.patch.object(imm, "LOWT_PERIOD_FAIR_FILE", path):
-                self.assertEqual(imm.load_lowt_period_fair(), 1)
+                # the gate reloads it itself, not only the universe refresh
+                imm.lowt_period_gate(self.T, utc(2026, 11, 13, 14, 5).timestamp(), 39, 98)
+                self.assertIn(self.EV, imm._lowt_period_state["events"])
                 self.assertEqual(imm.load_lowt_period_fair(), 0)       # unchanged mtime
+                os.utime(path, (time.time() + 5, time.time() + 5))
+                self.assertEqual(imm.load_lowt_period_fair(), 1)
             self.assertEqual(imm._lowt_period_state["events"][self.EV]["ts"],
                              utc(2026, 11, 13, 14, 0).timestamp())
         for k in ("LOWT_PERIOD_ENABLE", "LOWT_PERIOD_FAIR_TOL_CENTS"):

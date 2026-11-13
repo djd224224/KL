@@ -15848,7 +15848,11 @@ def lowt_period_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                      ext_ask: Optional[float]) -> Tuple[str, dict]:
     """('', inputs) when a period strike may quote, else (why, inputs): a
     decided or near strike on a fresh read, then _temp_gate's checks (no
-    read, stale, skipped, unmodelled, the band) at the period tolerance."""
+    read, stale, skipped, unmodelled, the band) at the period tolerance.
+    Reloads the file itself (an mtime check) rather than waiting for the
+    next universe refresh: a new decided or near strike reaches the book
+    on the cycle after the writer's, not up to 10 minutes later."""
+    load_lowt_period_fair()
     e = _lowt_period_state["events"].get(ticker.rsplit("-", 1)[0])
     if e is not None and not e.get("skip") and \
             now_ts - float(e.get("ts") or 0.0) <= LOWT_PERIOD_FAIR_TTL_MIN * 60:
