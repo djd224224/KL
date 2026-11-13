@@ -39020,14 +39020,16 @@ class TestGroupBreaker(unittest.TestCase):
             self._fill(60, self.B)
         self.assertEqual((self._lines(), self.bot._grp["fills"]), ([], 0))
 
-    def test_live_defaults_are_3_events_200_up_20_min(self):
+    def test_live_defaults_are_2_events_200_up_20_min(self):
         # Jack 2026-11-12: "Yes, after the 3rd fill and hold for 20min", on the
-        # 200-contract floor offered after the KXSENATENOM favorites sweep
+        # 200-contract floor offered after the KXSENATENOM favorites sweep;
+        # 2026-11-13: "change the 20min pause to be on the 2nd fill, instead
+        # of 3rd fill"
         src = open(imm.__file__, encoding="utf-8").read()
         for want in ('os.environ.get("IMM_SWEEP_GROUP", "on")',
                      '_env_float("IMM_SWEEP_GROUP_HOLD_MIN", 20.0)',
                      '_env_float("IMM_SWEEP_GROUP_MIN_CT", 200.0)',
-                     '_env_int("IMM_SWEEP_GROUP_MIN_EVENTS", 3)',
+                     '_env_int("IMM_SWEEP_GROUP_MIN_EVENTS", 2)',
                      '_env_float("IMM_SWEEP_GROUP_WINDOW_MIN", 10.0)'):
             self.assertIn(want, src)
 

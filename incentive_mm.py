@@ -5124,7 +5124,7 @@ def risk_group_of(ticker: str) -> Optional[str]:
 
 # CROSS-EVENT BREAKER (#2 of the 10/17 risk-return review). Maker fills on
 # the SAME side (both on our bids, or both on our asks) in SWEEP_GROUP_MIN_EVENTS
-# (3 since 2026-11-12; 2 as designed 10/17) DIFFERENT events of
+# (2 since 2026-11-13, as designed 10/17; 3 on 11/12) DIFFERENT events of
 # one risk_group within SWEEP_GROUP_WINDOW_SECS -> that side of every market
 # in the group is held SWEEP_GROUP_HOLD_SECS; the other side keeps quoting (it
 # is the side that buys back). A fill inside a hold neither re-trips nor
@@ -5154,6 +5154,10 @@ def risk_group_of(ticker: str) -> Optional[str]:
 # $14-52 of reward since the waves, and most catch nothing. At 200+ the only
 # trip since 11/08 is this sweep (+$117 of marks avoided after the 2nd fill,
 # ~$115 after the 3rd, vs ~$10 of reward for 20 min).
+# 2 EVENTS since 2026-11-13 (Jack: "change the 20min pause to be on the 2nd
+# fill, instead of 3rd fill"): on the 11/12 sweep it trips at 3:10 PM ET on
+# the 2nd fill, one fill sooner; at 200+ that sweep is still the only trip
+# since 11/08, so the reward it gives up is unchanged.
 SWEEP_GROUP = os.environ.get("IMM_SWEEP_GROUP", "on").strip().lower()
 if SWEEP_GROUP not in ("off", "dry", "on"):
     SWEEP_GROUP = "off"
@@ -5161,8 +5165,8 @@ SWEEP_GROUP_WINDOW_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_WINDOW_MIN", 10.0
 SWEEP_GROUP_HOLD_SECS = max(0.0, _env_float("IMM_SWEEP_GROUP_HOLD_MIN", 20.0)) * 60.0
 SWEEP_GROUP_MIN_CT = max(0.0, _env_float("IMM_SWEEP_GROUP_MIN_CT", 200.0))
 # different events with a qualifying fill inside the window that trip it
-# (the 3rd event's fill trips; 2 is the 10/17 design)
-SWEEP_GROUP_MIN_EVENTS = max(2, _env_int("IMM_SWEEP_GROUP_MIN_EVENTS", 3))
+# (the 2nd event's fill trips, Jack 2026-11-13; it was the 3rd on 11/12)
+SWEEP_GROUP_MIN_EVENTS = max(2, _env_int("IMM_SWEEP_GROUP_MIN_EVENTS", 2))
 
 # WAVE BREAKER (Jack 2026-11-07, after the House sweep: 16:18-16:38Z a taker
 # went district by district, selling the 90c+ favorites into our bids and
