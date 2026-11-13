@@ -28150,6 +28150,7 @@ class TestRestartHandoff(unittest.TestCase):
         self.assertTrue(imm.RESTART_KEEP_ORDERS)
         self.assertEqual((imm.RESTART_HANDOFF_MAX_AGE_SECS,
                           imm.RESTART_KEEP_MIN_CUTOFF_SECS), (300, 1800))
+        self.assertTrue(imm.RESTART_KEEP_WAVE_UNWIND)
 
     def test_exit_hands_over_the_safe_part_of_the_book(self):
         bot = self._bot()
@@ -28165,6 +28166,61 @@ class TestRestartHandoff(unittest.TestCase):
         bot.shutdown_cancel()
         self.assertEqual(sorted(bot.client.cancelled), ["o1", "o2", "o3"])
         self.assertEqual([o["order_id"] for o in bot.client.resting], ["o0"])
+
+    def test_held_wave_closing_orders_ride_through(self):
+        """Jack 2026-11-13: "Yes, keep them" (the held waves' closing orders
+        through restarts), after "why are my old waves not trying to unwind
+        -- KXHOUSERACE-KS04-28, KXHOUSERACE-KY04-28, etc": a held wave market
+        outside the selection keeps its CLOSING order; its other side, a flat
+        or near-cutoff one, and every unselected market still go."""
+        LONG, SHORT, FLAT, NEARW = ("KXHOUSERACE-KS04-28-D", "KXHOUSERACE-KS04-28-R",
+                                    "KXHOUSERACE-KY04-28-D", "KXHOUSERACE-KY04-28-R")
+        now = datetime.now(timezone.utc)
+
+        def side(o, s):
+            o["book_side"] = s
+            return o
+        orders = [side(self._order("w0", LONG), "ask"),    # closes the long: kept
+                  side(self._order("w1", LONG), "bid"),    # adds: cancelled
+                  side(self._order("w2", SHORT), "bid"),   # closes the short: kept
+                  side(self._order("w3", FLAT), "ask"),    # no position: cancelled
+                  side(self._order("w4", NEARW), "bid"),   # near its cutoff: cancelled
+                  self._order("o0", self.OK), self._order("o3", self.UNSEL)]
+
+        def build():
+            bot = self._bot()
+            bot.client = _HandoffClient([dict(o) for o in orders])
+            for t, cut in ((LONG, now + timedelta(days=30)), (SHORT, now + timedelta(days=30)),
+                           (FLAT, now + timedelta(days=30)), (NEARW, now + timedelta(minutes=10))):
+                bot._wave_unwind[t] = MarketMeta(
+                    ticker=t, event_ticker=t.rsplit("-", 1)[0], series=imm.series_of(t),
+                    dollars_per_day=0.0, program_end=now + timedelta(days=30),
+                    target_size=0.0, discount_factor=0.5, cutoff=cut,
+                    close_time=now + timedelta(days=60))
+            bot.pnl.pos.update({LONG: 150.0, SHORT: -1065.0, NEARW: -1270.0})
+            return bot
+        bot = build()
+        with mock.patch.object(bot, "_restart_preflight", return_value=(True, "ok")):
+            self.assertTrue(bot._prepare_restart_handoff())
+        with open(imm.restart_handoff_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["order_ids"], ["o0", "w0", "w2"])
+        self.assertEqual(sorted(bot.client.cancelled), ["o3", "w1", "w3", "w4"])
+        # the hang watchdog's list keeps the same orders, from the ledger
+        for o in orders:
+            bot.state.ledger[o["order_id"]] = {"ticker": o["ticker"],
+                                               "book_side": o["book_side"]}
+        bot._full_cycles = 1
+        with mock.patch.object(imm, "WATCHDOG_HANDOFF", True):
+            self.assertEqual(bot._watchdog_handoff(30.0), (3, "ok"))
+        with open(imm.restart_handoff_path(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["order_ids"], ["o0", "w0", "w2"])
+        os.remove(imm.restart_handoff_path())
+        # the knob off: cancelled at handoff as before
+        bot = build()
+        with mock.patch.object(imm, "RESTART_KEEP_WAVE_UNWIND", False),                 mock.patch.object(bot, "_restart_preflight", return_value=(True, "ok")):
+            self.assertTrue(bot._prepare_restart_handoff())
+        self.assertEqual(sorted(bot.client.cancelled), ["o3", "w0", "w1", "w2", "w3", "w4"])
 
     def test_gated_market_rides_through_before_its_live_gate_arms(self):
         """2026-10-05, KXTRUMPMENTION-26OCT05: a known-start gated event (7pm

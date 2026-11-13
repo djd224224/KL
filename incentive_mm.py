@@ -14035,6 +14035,20 @@ EXIT_ON_CODE_CHANGE = os.environ.get("IMM_EXIT_ON_CODE_CHANGE", "1") == "1"
 # cancel-on-exit + cancel-at-startup behaviour.
 RESTART_KEEP_ORDERS = os.environ.get("IMM_RESTART_KEEP_ORDERS", "1") == "1"
 RESTART_HANDOFF_MAX_AGE_SECS = _env_int("IMM_RESTART_HANDOFF_MAX_AGE_SECS", 300)
+# HELD WAVE MARKETS' CLOSING ORDERS RIDE THROUGH TOO (Jack 2026-11-13: "Yes,
+# keep them", on keeping the wave closing orders resting through bot
+# restarts, after "why are my old waves not trying to unwind --
+# KXHOUSERACE-KS04-28, KXHOUSERACE-KY04-28, etc"). A held wave market outside
+# the selection (_wave_unwind) is not in state.selected, so point 2 cancelled
+# its closing order at every handoff: off Kalshi until the relaunch's first
+# cycle re-placed it (~2.5 min a deploy; 13:05-13:21Z on 11/13, when the
+# relaunch missed the handoff and rebuilt the book 1,000 orders a cycle).
+# Only the CLOSING side of a market the bot still unwinds rides through, under
+# the same live-event / fast-lane / halt / near-cutoff refusals; an unmanaged
+# minute can't move it toward a flashed price (only a re-price does), and a
+# fill there closes the position at the price the last cycle chose inside its
+# bound. IMM_RESTART_KEEP_WAVE_UNWIND=0 cancels them at handoff as before.
+RESTART_KEEP_WAVE_UNWIND = os.environ.get("IMM_RESTART_KEEP_WAVE_UNWIND", "1") == "1"
 RESTART_KEEP_MIN_CUTOFF_SECS = _env_int("IMM_RESTART_KEEP_MIN_CUTOFF_SECS", 1800)
 RESTART_PREFLIGHT_TIMEOUT_SECS = _env_int("IMM_RESTART_PREFLIGHT_TIMEOUT_SECS", 120)
 RESTART_HANDOFF_FILE = "restart_handoff.json"
@@ -14408,7 +14422,7 @@ _CONFIG_CODE_KNOBS = (
     "CA_UNWIND",                                   # Carbon Arc unwind (2026-11-07)
     "HOURLY_ACTIVATION_WINDOW_SECS", "HOURLY_ACTIVATION_AUTO",
     "HOURLY_PROGRAM_MAX_HOURS",
-    "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS",
+    "RESTART_KEEP_ORDERS", "RESTART_HANDOFF_MAX_AGE_SECS", "RESTART_KEEP_WAVE_UNWIND",
     "RESTART_KEEP_MIN_CUTOFF_SECS", "RESTART_REQUEST_MAX_AGE_SECS",
     "PLACE_RATE_PER_SEC", "ORDER_REFRESH_JITTER_SECS",
     "FLOOR_PROJECTION_REALIZED", "NEAR_CLIFF_ROOM_PRIORITY",
@@ -42552,13 +42566,22 @@ class IncentiveMarketMaker:
                            f"{tail[-1][:160] if tail else 'no output'}")
         return True, "ok"
 
-    def _restart_keep_ok(self, ticker: str, now_ts: float) -> bool:
+    def _restart_keep_ok(self, ticker: str, now_ts: float,
+                         book_side: Optional[str] = None) -> bool:
         """May this market's resting orders ride through a planned restart?
         Only a SELECTED market off every live-event / fast / near-cutoff
-        list (see RESTART_KEEP_ORDERS)."""
+        list (see RESTART_KEEP_ORDERS) -- or, for an order on `book_side`, a
+        held wave market the bot unwinds (_wave_unwind) when that side
+        closes its position (RESTART_KEEP_WAVE_UNWIND)."""
         meta = self.state.selected.get(ticker)
         if meta is None:
-            return False
+            meta = (self._wave_unwind.get(ticker)
+                    if RESTART_KEEP_WAVE_UNWIND else None)
+            if meta is None:
+                return False
+            pos = self.pnl.pos.get(ticker, 0.0)
+            if abs(pos) < REDUCE_ONLY_MIN_CONTRACTS                     or book_side != ("ask" if pos > 0 else "bid"):
+                return False
         if series_fast_lane(meta.series) or quake_gated(meta.series):
             return False
         # A gated (live-event) series rides through only while its event's
@@ -42603,7 +42626,8 @@ class IncentiveMarketMaker:
             log(f"{self.tag} restart handoff SKIPPED: resting read failed "
                 f"({e}); cancelling the book as before")
             return False
-        keep = [o for o in orders if self._restart_keep_ok(o.get("ticker", ""), now_ts)]
+        keep = [o for o in orders if self._restart_keep_ok(
+            o.get("ticker", ""), now_ts, (order_yes_book_cents(o) or (None,))[0])]
         keep_ids = {o.get("order_id") for o in keep}
         n_cx = 0
         for o in orders:
@@ -42630,8 +42654,11 @@ class IncentiveMarketMaker:
             return False
         self._handoff_keep = True
         self._handoff_kept = len(keep)
+        n_wave = sum(1 for o in keep if o.get("ticker", "") not in self.state.selected)
         log(f"{self.tag} restart handoff: {len(keep)} order(s) left resting for "
-            f"the relaunch; cancelled {n_cx} on gated / fast-lane / "
+            f"the relaunch"
+            + (f" ({n_wave} of them held wave markets' closing orders)" if n_wave else "")
+            + f"; cancelled {n_cx} on gated / fast-lane / "
             f"near-cutoff / unselected markets")
         return True
 
@@ -42659,7 +42686,8 @@ class IncentiveMarketMaker:
         try:
             keep = sorted(str(oid) for oid, led in list(self.state.ledger.items())
                           if oid and self._restart_keep_ok(
-                              str(led.get("ticker") or ""), now_ts))
+                              str(led.get("ticker") or ""), now_ts,
+                              led.get("book_side")))
             payload = {"ts": round(now_ts, 3), "run_id": RUN_ID,
                        "source_mtime": _SOURCE_MTIME, "kind": "watchdog",
                        "kept": len(keep), "cancelled": 0, "order_ids": keep,
