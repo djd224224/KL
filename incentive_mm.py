@@ -19536,14 +19536,18 @@ def vercel_series(series: str) -> bool:
 #     takes the reading nearer this year. The midnight-ET rule then has an
 #     *EVENT strike out before its release day (its 9:30 ET observation
 #     follows an 8:30 release), a touch market at its deadline.
-#   CASH (CRYPTO_OPEN_BUDGET): crypto events sit on exchange shard 2, whose
-#     free cash the crypto fleet shares ($1,183 on 11/13). The selection
-#     admits the family, best ROI first, while its worst-case resting NO
-#     cost stays under the budget, so it cannot starve the fleet's orders.
+#   CASH (CRYPTO_OPEN_BUDGET, OFF): a cap on the family's worst-case
+#     resting NO cost, admitted best ROI first, past it `crypto_budget`.
+#     Shipped at $500 to spare shard 2's cash (the crypto fleet's, $1,183
+#     on 11/13), it held all 14 touch markets dark behind six *EVENT seats
+#     -- and Kalshi holds no cash for RESTING orders (Jack 2026-11-13:
+#     "kalshi doesn't hold cash for resting orders"; shard 2 read $1,170
+#     with $639 of these resting), so only fills draw on the fleet's cash.
+#     0 = no cap (the default since); a positive value puts one back.
 # IMM_CRYPTO_OPEN=0 takes the family out.
 CRYPTO_OPEN = os.environ.get("IMM_CRYPTO_OPEN", "1") == "1"
 CRYPTO_OPEN_SIZE_MULT = _env_float("IMM_CRYPTO_OPEN_SIZE_MULT", 5.0)
-CRYPTO_OPEN_BUDGET = _env_float("IMM_CRYPTO_OPEN_BUDGET", 500.0)
+CRYPTO_OPEN_BUDGET = _env_float("IMM_CRYPTO_OPEN_BUDGET", 0.0)
 CRYPTO_OPEN_CATEGORY = os.environ.get("IMM_CRYPTO_OPEN_CATEGORY", "Crypto")
 CRYPTO_OPEN_DISCOVER_SECS = _env_int("IMM_CRYPTO_OPEN_DISCOVER_SECS", 3600)
 CRYPTO_OPEN_FILE = os.environ.get(
@@ -34769,8 +34773,8 @@ class IncentiveMarketMaker:
             collateral += market_cost(meta)
             selected[meta.ticker] = meta
         forced_collateral = collateral
-        # CRYPTO OPEN FAMILY cash (2026-11-13): its worst-case resting NO cost
-        # on shard 2, the fleet's cash, held to CRYPTO_OPEN_BUDGET
+        # CRYPTO OPEN FAMILY cap (2026-11-13; off at 0): its worst-case resting
+        # NO cost, held to CRYPTO_OPEN_BUDGET
         _real = COLLATERAL_REALIZATION if COLLATERAL_REALIZATION > 0 else 1.0
         crypto_cost = sum(market_cost(m) / _real for t, m in selected.items()
                           if crypto_open_series(m.series))

@@ -44887,6 +44887,11 @@ class TestCryptoOpenFamily(unittest.TestCase):
         self.assertEqual({side for _t, side, _px in rest}, {"ask"}, rest)
         self.assertTrue(all(1 <= px <= 99 for _t, _side, px in rest), rest)
 
+    def test_the_cap_is_off_by_default(self):
+        # Jack 2026-11-13: "kalshi doesn't hold cash for resting orders"
+        if os.environ.get("IMM_CRYPTO_OPEN_BUDGET") is None:
+            self.assertEqual(imm.CRYPTO_OPEN_BUDGET, 0.0)
+
     def test_the_cash_budget_holds_the_family_out(self):
         bot, tickers, rest, lines = self._cycle(budget=1.0)
         self.assertFalse(set(tickers) & set(bot.state.selected))
