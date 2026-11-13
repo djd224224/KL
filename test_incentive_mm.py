@@ -42923,6 +42923,81 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(run(150.0, 95.0, fav=True)[1], [("ask", 97, 150.0)])
         self.assertEqual(run(150.0, 98.0, fav=True)[1], [("ask", 98, 150.0)])   # waits at its cost
 
+    def test_wave_unwind_not_at_breakeven_but_never_baited(self):
+        """Jack 2026-11-12: "unwind, doesnt have to be at breakeven but dont
+        lead", then "and make sure unwind positions also dont get baited" -- a
+        wave's closing order rests at the close clamp's bound (no more than
+        PVD_CLOSE_CLAMP_C past its usual external price toward the taker, or at
+        cost), never leading the best outside lot; at cost until a usual price
+        exists; IMM_UNWIND_WAVES_AT_COST=1 = at cost again"""
+        def run(pos, avg, usual=(49.0, 51.0), book=None, touch=None, at_cost=False,
+                ended=False, n=8):
+            _clean_persist()
+            self._write({self.T: {"bid_max": 49, "ask_min": 51, "size": 200}},
+                        stop=(datetime.now(timezone.utc) - timedelta(hours=2)) if ended else None)
+            c = FakeClient()
+            if ended:
+                c.programs = [p for p in c.programs if p["market_ticker"] != self.T]
+            if book is not None:
+                c.books[self.T] = {"orderbook_fp": book}
+                c.markets[self.T] = dict(c.markets[self.T], yes_bid_dollars=f"{touch[0] / 100:.4f}",
+                                         yes_ask_dollars=f"{touch[1] / 100:.4f}")
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T] = pos
+            if avg is not None:
+                bot.pnl.avg[self.T] = avg
+            c.positions[self.T] = pos
+            if usual is not None:
+                now = time.time()
+                bot.state.pvd_usual[self.T] = [[now - 900 * (i + 1), usual[0], usual[1]]
+                                               for i in range(n)]
+            open(imm.UNWIND_WAVES_ONLY_FILE, "w").close()
+            lines = []
+            try:
+                with mock.patch.object(imm, "log", lines.append), \
+                        mock.patch.object(imm, "UNWIND_WAVES_AT_COST", at_cost):
+                    bot.run_cycle()
+            finally:
+                os.remove(imm.UNWIND_WAVES_ONLY_FILE)
+            return bot, sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                               for o in bot.state.sim_orders.values() if o["ticker"] == self.T), lines
+        self.assertIn("UNWIND_WAVES_AT_COST", imm._CONFIG_CODE_KNOBS)
+        self.assertFalse(imm.UNWIND_WAVES_AT_COST)
+        # long 150 bought at 70 in a 49x51 book that has stood there: joins the
+        # 51c ask, under its cost (the bound is min(51 - 5, 70) = 46)
+        _b, orders, lines = run(150.0, 70.0)
+        self.assertEqual(orders, [("ask", 51, 150.0)])
+        self.assertTrue(any("wave unwind KXGOOD-99DEC31-A: ask 150 @ 51c past cost 70.0c" in x
+                            for x in lines), lines)
+        self.assertEqual(run(150.0, 70.0, at_cost=True)[1], [("ask", 70, 150.0)])   # ..._AT_COST=1
+        self.assertEqual(run(150.0, 70.0, usual=None)[1], [("ask", 70, 150.0)])     # no usual: cost
+        # 2 samples + the cycle's own = 3, under PVD_OFF_USUAL_MIN_N (4): cost
+        self.assertEqual(run(150.0, 70.0, n=2)[1], [("ask", 70, 150.0)])
+        self.assertEqual(run(150.0, 45.0)[1], [("ask", 51, 150.0)])     # in the money: the touch
+        self.assertEqual(run(-80.0, 45.0)[1], [("bid", 49, 80.0)])      # short sold at 45: the 49 bid
+        self.assertEqual(run(150.0, None)[1], [])                       # no average: nothing
+        # THE BAIT: a lone 200-lot ask flashed at 40c (bids pulled to 38c) in a
+        # book that sat at 49x51 -- the unwind stays at the bound or above, never
+        # following it down
+        bait = {"yes_dollars": [["0.37", "500"], ["0.38", "600"]], "no_dollars": [["0.60", "200"]]}
+        _b, baited, _l = run(150.0, 70.0, book=bait, touch=(38, 40))
+        self.assertTrue(all(s == "ask" and p >= 46 for s, p, _n in baited), baited)
+        self.assertEqual(baited, [("ask", 46, 150.0)])      # the bound: usual 51 - 5
+        # ...a short in the mirror bait (a lone 200 bid flashed at 60c, asks lifted to 62c)
+        mirror = {"yes_dollars": [["0.60", "200"]], "no_dollars": [["0.37", "500"], ["0.38", "600"]]}
+        _b, baited, _l = run(-80.0, 45.0, book=mirror, touch=(60, 62))
+        self.assertTrue(all(s == "bid" and p <= 54 for s, p, _n in baited), baited)
+        self.assertEqual(baited, [("bid", 54, 80.0)])       # the bound: usual 49 + 5
+        # a held market off the live list (its stop passed): its external touch
+        # is sampled while it unwinds, so it gets a usual price too
+        bot, orders, _l = run(150.0, 70.0, usual=None, ended=True)
+        self.assertIn(self.T, bot._wave_unwind)
+        self.assertEqual(orders, [("ask", 70, 150.0)])                  # first sample: still cost
+        self.assertEqual(bot.state.pvd_usual[self.T][-1][1:], [49.0, 51.0])
+        bot, orders, _l = run(150.0, 70.0, ended=True)                  # with a usual price
+        self.assertIn(self.T, bot._wave_unwind)
+        self.assertEqual(orders, [("ask", 51, 150.0)])
+
     def test_off_usual_size_rests_the_base_off_the_usual_price(self):
         """Jack 2026-11-08: "Build both 1" -- a listed side 3c+ nearer the
         taker than its 6-hour median touch rests its base size; at its usual

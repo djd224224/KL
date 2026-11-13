@@ -13497,6 +13497,19 @@ UNWIND_WAVES_EXEMPT_NEW = os.environ.get("IMM_UNWIND_WAVES_EXEMPT_NEW", "1") != 
 # Without the switch file none of this applies. IMM_UNWIND_WAVES_HELD=0 = a
 # newer wave rides as before (both sides, positions included).
 UNWIND_WAVES_HELD = os.environ.get("IMM_UNWIND_WAVES_HELD", "1") != "0"
+# ...NOT AT BREAKEVEN, NEVER BAITED (Jack 2026-11-12: "unwind, doesnt have to
+# be at breakeven but dont lead", then "and make sure unwind positions also dont
+# get baited"): a wave's closing order is no longer held at the bot's average
+# cost. It rests at the CLOSE CLAMP's bound or better -- no more than
+# PVD_CLOSE_CLAMP_C (5c) past its side's 6 h usual EXTERNAL price toward the
+# taker, or at cost where that reaches further (pvd_close_bound) -- and NO LEAD
+# still keeps it at or behind the best outside price with real size. With no
+# usual price yet (fewer than PVD_OFF_USUAL_MIN_N samples) it waits at cost as
+# before; a held market off the live list has its external touch sampled while
+# it unwinds, so it gets a usual price within ~1 h. The Carbon Arc family unwind
+# keeps its average cost. IMM_UNWIND_WAVES_AT_COST=1 = the waves' unwind at
+# breakeven or better again.
+UNWIND_WAVES_AT_COST = os.environ.get("IMM_UNWIND_WAVES_AT_COST", "0") == "1"
 # NO LEAD (Jack 2026-11-08: "when unwinding, dont lead like in
 # KXHOUSERACE-AR02-28-D"): every unwind order (unwind_only_quotes: UNWIND ONLY,
 # the waves' breakeven unwind and their held markets) rests no better than the
@@ -14470,6 +14483,7 @@ _CONFIG_CODE_KNOBS = (
     # off-usual size on listed markets (2026-11-08)
     "PVD_OFF_USUAL_MODE", "PVD_OFF_USUAL_C", "PVD_OFF_USUAL_HOURS", "PVD_CLOSE_CLAMP_MODE", "PVD_ZERO_OFF", "PVD_CLOSE_CLAMP_C", "UNWIND_WAVES_EXEMPT_NEW",
     "UNWIND_WAVES_HELD",          # a newer wave's held markets unwind (2026-11-11)
+    "UNWIND_WAVES_AT_COST",       # the waves' unwind at the close clamp's bound, not cost (2026-11-12)
     # the twin check in mutually exclusive events (2026-11-11)
     "TWIN_CHECK_MODE", "TWIN_CHECK_TOL_C",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
@@ -26880,6 +26894,7 @@ class IncentiveMarketMaker:
         self._unwind_waves_only = False  # THE WAVES ALONE AT BREAKEVEN: UNWIND_WAVES_ONLY_FILE
         self._unwind_waves_only_since = 0.0   # ...its mtime (UNWIND_WAVES_EXEMPT_NEW)
         self._unwind_nolead_noted: Dict[str, Any] = {}   # NO LEAD: last logged move per market
+        self._unwind_past_cost_noted: Dict[str, Any] = {}  # a wave unwind resting past cost (2026-11-12)
         self._wave_unwind: Dict[str, "MarketMeta"] = {}   # ...held wave markets outside the selection
         self._wave_unwind_noted: Optional[int] = None
         self._ca_family_unwind: Dict[str, "MarketMeta"] = {}   # held markets of a Carbon Arc family turned off
@@ -36345,9 +36360,11 @@ class IncentiveMarketMaker:
             self._unwind_only and not (self._unwind_waves and listed))
 
     def _unwinds_at_breakeven(self, t: str) -> bool:
-        """Does market `t` unwind at its average cost or better (THE WAVES
-        ALONE AT BREAKEVEN, the waves the switch covers; or a held market of
-        a Carbon Arc family turned off, CA_FAMILY_UNWIND)?"""
+        """Does market `t` unwind under a price bound (a held market of a
+        Carbon Arc family turned off, CA_FAMILY_UNWIND: its average cost or
+        better; the waves the switch covers: since 2026-11-12 the close clamp's
+        bound -- within PVD_CLOSE_CLAMP_C of its usual price, or cost -- and its
+        average cost only until it has a usual price)?"""
         return (t in self._ca_family_unwind) or (
             self._unwind_waves_only and self._waves_switch_covers(t))
 
@@ -37708,6 +37725,10 @@ class IncentiveMarketMaker:
         if n != self._wave_unwind_noted:
             self._wave_unwind_noted = n
             log(f"{self.tag} wave unwind: {n} held wave market(s) outside the selection "
+                f"unwind within {PVD_CLOSE_CLAMP_C:g}c of their usual price or at cost, never "
+                f"leading (at cost until a usual price exists) ({len(want)} held)"
+                if not UNWIND_WAVES_AT_COST else
+                f"{self.tag} wave unwind: {n} held wave market(s) outside the selection "
                 f"unwind at the bot's average cost or better ({len(want)} held)")
 
     @staticmethod
@@ -40439,8 +40460,9 @@ class IncentiveMarketMaker:
                               if (lv_ask and "ask" not in _has) else 0)))
             # post-vote dead-book side guard: LAST with the fair gates -- no
             # pads, no bid over bid_max, no ask under ask_min (pvd_guard_quotes)
-            # (a breakeven wave unwind skips it: its one order is the bot's
-            # cost or better -- THE WAVES ALONE AT BREAKEVEN, past three guards)
+            # (a wave unwind skips it: its one order carries the close clamp's
+            # bound itself, or the bot's cost -- THE WAVES ALONE AT BREAKEVEN, past
+            # three guards; since 2026-11-12 not at breakeven, never baited)
             if pvd is not None and not (
                     self._unwinds_at_breakeven(t) and abs(own_pos) >= 1):
                 _pv_before = {q.book_side for q in mq if not q.is_pad}
@@ -40831,17 +40853,41 @@ class IncentiveMarketMaker:
                         # with real size on the reducing side
                         if UNWIND_NO_LEAD:
                             _u_nolead = _u_na if own_pos > 0 else _u_nb
-                        if pvd is not None:
+                        if pvd is None and t in self._wave_unwind:
+                            # a held wave market off the live list (its stop passed,
+                            # _wave_unwind_manage): its EXTERNAL touch joins the
+                            # usual-price samples here, as a live entry's does in
+                            # OFF-USUAL SIZE, so the bound below has a usual price
+                            # (2026-11-12; ~1 h of samples, PVD_OFF_USUAL_MIN_N)
+                            self.state.pvd_usual[t] = pvd_usual_sample(
+                                self.state.pvd_usual.get(t), now_ts, _u_eb, _u_ea)
+                        if pvd is not None or t in self._wave_unwind:
                             _u_b, _u_a = pvd_usual_px(self.state.pvd_usual.get(t), now_ts)
                             _u_usual = _u_a if own_pos > 0 else _u_b
                     except Exception:       # its own price, as before
                         _u_touch = _u_usual = _u_nolead = None
-                # (a listed wave under UNWIND_WAVES_ONLY_FILE: never worse than
-                # the bot's average cost; with no average, nothing rests)
-                _u_be = self.pnl.avg.get(t) if self._unwinds_at_breakeven(t) else None
-                if _u_be:
-                    _u_be = breakeven_whole_cent(_u_be, "ask" if own_pos > 0 else "bid")
-                if self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_be:
+                # THE WAVES' UNWIND (UNWIND_WAVES_ONLY_FILE) -- NOT AT BREAKEVEN, NEVER
+                # BAITED (Jack 2026-11-12: "unwind, doesnt have to be at breakeven but
+                # dont lead", then "and make sure unwind positions also dont get
+                # baited"): the CLOSE CLAMP's bound (pvd_close_bound) -- no more than
+                # PVD_CLOSE_CLAMP_C (5c) past the side's 6 h usual EXTERNAL price toward
+                # the taker, or the bot's average cost or better where that reaches
+                # further. A bait's flashed price moves neither the usual price (a
+                # median of 15-min samples) nor, past the bound, the order; NO LEAD
+                # above still holds. With no usual price yet, the average cost as
+                # before. A Carbon Arc family unwind (CA_FAMILY_UNWIND) and
+                # IMM_UNWIND_WAVES_AT_COST=1 keep the average cost. With no average,
+                # nothing rests.
+                _u_side = "ask" if own_pos > 0 else "bid"
+                _u_cost = self.pnl.avg.get(t) if self._unwinds_at_breakeven(t) else None
+                _u_be = None
+                if _u_cost:
+                    _u_be = float(_u_cost)
+                    if (not UNWIND_WAVES_AT_COST and t not in self._ca_family_unwind
+                            and _u_usual is not None):
+                        _u_be = pvd_close_bound(_u_side, _u_usual, _u_cost, PVD_CLOSE_CLAMP_C)
+                    _u_be = breakeven_whole_cent(_u_be, _u_side)
+                if self._unwinds_at_breakeven(t) and abs(own_pos) >= 1 and not _u_cost:
                     mq = []
                 else:
                     _u_in = mq
@@ -40859,6 +40905,21 @@ class IncentiveMarketMaker:
                                     f"{_u_key[2]}c (best external {_u_key[0]} with "
                                     f"{UNWIND_NO_LEAD_MIN:.0f}+ lots: {_u_nolead}c)")
                             self._unwind_nolead_noted[t] = _u_key
+                    # a wave unwind resting past the bot's cost: logged when it starts or moves
+                    if mq and _u_cost:
+                        _u_p = float(mq[0].price_exact if mq[0].price_exact is not None
+                                     else mq[0].price_cents)
+                        _u_past = (_u_p < float(_u_cost) - 1e-6 if own_pos > 0
+                                   else _u_p > float(_u_cost) + 1e-6)
+                        _u_ck = (mq[0].book_side, round(_u_p, 2), int(mq[0].count)) if _u_past else None
+                        if _u_ck != self._unwind_past_cost_noted.get(t):
+                            if _u_ck is not None:
+                                log(f"{self.tag} wave unwind {t}: {_u_ck[0]} {_u_ck[2]} @ {_u_ck[1]:g}c "
+                                    f"past cost {float(_u_cost):.1f}c -- bound {_u_be}c (usual "
+                                    f"{'?' if _u_usual is None else f'{_u_usual:g}'}c "
+                                    f"{'-' if own_pos > 0 else '+'} {PVD_CLOSE_CLAMP_C:g}c, "
+                                    f"or cost), no lead {_u_nolead}c")
+                            self._unwind_past_cost_noted[t] = _u_ck
             # TWIN CHECK (TWIN_CHECK_MODE): LAST, after every path that adds or
             # moves a rung -- in a mutually exclusive event no bid over what the
             # siblings' bids leave this market worth, and in a two-market
@@ -44642,12 +44703,17 @@ class IncentiveMarketMaker:
         log(f"unwind-only waves scope (2026-11-08): "
             + ("existing waves -- UNWIND_ONLY_WAVES covers the waves listed before the switch "
                "file appeared; a wave added after it quotes as usual"
-               + ("; held markets only (2026-11-11): a newer wave's market unwinds at "
-                  "breakeven or better while the bot holds a position there, and quotes "
-                  "both sides while flat" if UNWIND_WAVES_HELD else
+               + ("; held markets only (2026-11-11): a newer wave's market unwinds "
+                  "while the bot holds a position there, and quotes both sides while flat"
+                  if UNWIND_WAVES_HELD else
                   ", positions included (IMM_UNWIND_WAVES_HELD=0)")
                if UNWIND_WAVES_EXEMPT_NEW else
-               "every listed wave (IMM_UNWIND_WAVES_EXEMPT_NEW=0)"))
+               "every listed wave (IMM_UNWIND_WAVES_EXEMPT_NEW=0)")
+            + (f"; unwind price (2026-11-12): within {PVD_CLOSE_CLAMP_C:g}c of the side's "
+               f"{PVD_OFF_USUAL_HOURS:g}h usual external price or at cost, never leading the "
+               f"best outside {UNWIND_NO_LEAD_MIN:.0f}+ lot; at cost until a usual price exists"
+               if not UNWIND_WAVES_AT_COST else
+               "; unwind price: the bot's average cost or better (IMM_UNWIND_WAVES_AT_COST=1)"))
         log(f"strait weeklies (2026-11-08): "
             + (f"out for the last {STRAIT_WEEKLY_STOP_DAYS} days of each week -- "
                f"{', '.join(STRAIT_WEEKLY_STOP_SERIES)} stand down at 00:00 UTC "
