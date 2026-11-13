@@ -185,6 +185,7 @@ def setUpModule():
     imm.RAIN_FAIR_FILE = os.path.join(tmp, "rain_fair_values.json")
     # the low-temperature fair (2026-10-23)
     imm.LOWT_FAIR_FILE = os.path.join(tmp, "lowt_fair.json")
+    imm.LOWT_PERIOD_FAIR_FILE = os.path.join(tmp, "lowt_period_fair.json")
     imm.HIGHT_FAIR_FILE = os.path.join(tmp, "hight_fair.json")
     # The base-size split test runs on the wall clock from 2026-10-26 00:00
     # ET: from then on its "test" half read x1.5 in every family-multiplier
@@ -29240,7 +29241,8 @@ class TestSignedFairReads(unittest.TestCase):
         write_fair_file (the threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 17)
+        # ... and the period lows (2026-11-13)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 18)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -29253,6 +29255,7 @@ class TestSignedFairReads(unittest.TestCase):
                           ("rt_fair", "RT_FAIR_FILE"),
                           ("resort_snow_fair", "RESORT_SNOW_FILE"),
                           ("lowt_fair", "LOWT_FAIR_FILE"),
+                          ("lowt_period_fair", "LOWT_PERIOD_FAIR_FILE"),
                           ("hight_fair", "HIGHT_FAIR_FILE"),
                           ("bway_fair", "BWAY_FAIR_FILE"),
                           ("approval_fair", "APPROVE_FAIR_FILE"),
@@ -40169,6 +40172,86 @@ class TestLowTempFamily(unittest.TestCase):
             self.assertEqual(imm.pilot_halt_limit(imm.LOWT_HALT_KEY), 100.0)
             self.assertIn(imm.LOWT_HALT_KEY, imm.pilot_halt_keys())
         for k in ("LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_DAILY_LOSS_LIMIT"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+
+class TestLowTempPeriods(unittest.TestCase):
+    """Jack 2026-11-13: "daily new incentive program said
+    KXLOWTPERIOD-26NOV15PVD, KXLOWTPERIOD-26NOV15BOS are quoted but they
+    arent. build a fair value and quote", then "this family"."""
+
+    EV = "KXLOWTPERIOD-26NOV15PVD"
+    T = EV + "-T34"
+
+    def setUp(self):
+        self._p = [mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": True}),
+                   mock.patch.dict(imm._lowt_state, {"mtime": 0.0, "events": {}}),
+                   mock.patch.dict(imm._lowt_period_state, {"mtime": 0.0, "events": {}})]
+        for x in self._p:
+            x.start()
+
+    def tearDown(self):
+        for x in self._p:
+            x.stop()
+
+    def _read(self, now_ts, **kw):
+        e = {"ts": now_ts - 300, "mu": 36.3, "b": 1.93, "nws": 36.0, "wu": None,
+             "skip": None, "obs": {"now_f": 39, "now_at": "2026-11-13T12:51:00+00:00",
+                                   "min_hi": 39, "min_lo": 39},
+             "markets": {self.T: 0.79, self.EV + "-T38": 0.99, self.EV + "-T40": 0.999},
+             "decided": [self.EV + "-T40"], "near": [self.EV + "-T38"]}
+        e.update(kw)
+        imm._lowt_period_state["events"][self.EV] = e
+
+    def test_member_of_the_low_family_with_its_own_gate(self):
+        self.assertTrue(imm.lowt_series("KXLOWTPERIOD"))
+        self.assertTrue(imm.lowt_period_series("KXLOWTPERIOD"))
+        self.assertFalse(imm.lowt_period_series("KXLOWTPVD"))          # a daily
+        self.assertTrue(imm.move_breaker_on("KXLOWTPERIOD"))
+        with mock.patch.object(imm, "LOWT_PERIOD_ENABLE", False):
+            self.assertFalse(imm.lowt_period_series("KXLOWTPERIOD"))
+        with mock.patch.dict(imm._lowt_owner, {"at": 1e18, "paused": False}):
+            self.assertFalse(imm.lowt_period_series("KXLOWTPERIOD"))
+
+    def test_out_at_midnight_et_of_the_periods_last_day(self):
+        self.assertEqual(imm.trade_cutoff_utc(self.EV, None, None), utc(2026, 11, 15, 5, 0))
+
+    def test_gate(self):
+        now = time.time()
+        g = imm.lowt_period_gate
+        # fails closed, as before the fair existed
+        self.assertEqual(g(self.T, now, 39, 98)[1]["reason"], "no_read")
+        self._read(now, ts=now - (imm.LOWT_PERIOD_FAIR_TTL_MIN * 60 + 5))
+        self.assertEqual(g(self.T, now, 39, 98)[1]["reason"], "stale")
+        self.assertEqual(g(self.EV + "-T40", now, 98, 99)[1]["reason"], "stale")
+        self._read(now, skip="the NWS hourly forecast ends before the period's last hour")
+        self.assertEqual(g(self.EV + "-T40", now, 98, 99)[1]["reason"], "skip")
+        self._read(now)
+        why, inputs = g(self.EV + "-T40", now, 98, 99)                 # the low is under it
+        self.assertEqual((inputs["reason"], inputs["min_hi"]), ("decided", 39))
+        self.assertIn("39F", why)
+        self.assertEqual(g(self.EV + "-T38", now, 41, 99)[1]["reason"], "near")
+        # fair 79c, tol 30c: the books Kalshi showed at 13:55Z quote
+        self.assertEqual(imm.LOWT_PERIOD_FAIR_TOL_CENTS, 30)
+        why, inputs = g(self.T, now, 39, 98)
+        self.assertEqual((why, inputs["fair"], inputs["tol"]), ("", 79.0, 30))
+        self.assertEqual(g(self.T, now, 39, 49)[0], "")                # ask exactly at fair - tol
+        self.assertEqual(g(self.T, now, 39, 48)[1]["reason"], "band")  # ask under fair - tol
+        self.assertEqual(g(self.EV + "-T30", now, 1, 44)[1]["reason"], "no_market")
+
+    def test_the_period_file_reloads_by_mtime(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "lowt_period_fair.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"events": {self.EV: {
+                    "fetched_at": "2026-11-13T14:00:00+00:00", "skip": None,
+                    "markets": {self.T: 0.79}, "decided": [], "near": []}}}, f)
+            with mock.patch.object(imm, "LOWT_PERIOD_FAIR_FILE", path):
+                self.assertEqual(imm.load_lowt_period_fair(), 1)
+                self.assertEqual(imm.load_lowt_period_fair(), 0)       # unchanged mtime
+            self.assertEqual(imm._lowt_period_state["events"][self.EV]["ts"],
+                             utc(2026, 11, 13, 14, 0).timestamp())
+        for k in ("LOWT_PERIOD_ENABLE", "LOWT_PERIOD_FAIR_TOL_CENTS"):
             self.assertIn(k, imm._CONFIG_CODE_KNOBS)
 
 

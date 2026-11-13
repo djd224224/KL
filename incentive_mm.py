@@ -14205,6 +14205,8 @@ _CONFIG_CODE_KNOBS = (
     # the low-temperature family (2026-10-23)
     "LOWT_ENABLE", "LOWT_FAIR_TOL_CENTS", "LOWT_FAIR_TTL_MIN",
     "LOWT_DAILY_LOSS_LIMIT", "LOWT_SIZE_MULT", "LOWT_PRICE_MIN", "LOWT_PRICE_MAX",
+    # ...its period lows (2026-11-13)
+    "LOWT_PERIOD_ENABLE", "LOWT_PERIOD_FAIR_TOL_CENTS", "LOWT_PERIOD_FAIR_TTL_MIN",
     # ...and the high-temperature family (2026-10-23)
     "HIGHT_ENABLE", "HIGHT_STOP_BEFORE_MIN", "HIGHT_FAIR_TOL_CENTS",
     "HIGHT_FAIR_TTL_MIN", "HIGHT_DAILY_LOSS_LIMIT", "HIGHT_SIZE_MULT",
@@ -15777,6 +15779,80 @@ def lowt_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     """_temp_gate on the low-temperature read."""
     return _temp_gate(_lowt_state, ticker, now_ts, ext_bid, ext_ask,
                       LOWT_FAIR_TOL_CENTS, LOWT_FAIR_TTL_MIN, "low-temp")
+
+
+# ----------------------------------------------------------------------------
+# LOW-TEMPERATURE PERIODS (Jack 2026-11-13: "daily new incentive program said
+# KXLOWTPERIOD-26NOV15PVD, KXLOWTPERIOD-26NOV15BOS are quoted but they arent.
+# build a fair value and quote", then "this family"). KXLOWTPERIOD-<last
+# day><CITY>-T<k> = "Will Newark fall below 40F from Nov 12 to 15, 2026?":
+# the lowest of The Weather Company's daily minimums over a few local days at
+# the station in the rules. The series joined the low family by its prefix
+# (x5, 3-97c, the move breaker), but lowt_fair reads one-day events only, so
+# from its 11/12 listing every strike stood aside "no low-temp fair for this
+# event" while selection -- and the morning email -- counted it as quoting.
+#   - FAIR: lowt_period_fair.py -- the period's low so far (the METAR and NWS
+#     CLI readings), then each remaining local day on the NWS hourly shifted
+#     to the latest reading, under lowt_fair's Laplace and city scales;
+#     refresher thread "lowt-period-fair" every LOWT_PERIOD_REFRESH_SECS
+#     (10 min: the observed part moves through the night).
+#   - GATE (lowt_period_gate) fails closed like lowt_gate, and stands aside
+#     a DECIDED strike (the low so far is already under it: the YES is
+#     settled, so quoting it only sells a sure thing), a NEAR one (the latest
+#     reading within lowt_period_fair.NEAR_F of deciding it: that book moves
+#     on every five-minute reading, faster than any refresh), and a touch
+#     more than LOWT_PERIOD_FAIR_TOL_CENTS through the fair -- 30c, tighter
+#     than the dailies' 40c, because observations anchor this fair.
+#   - HOURS: the ticker-date rule, out at 00:00 ET of the period's last day
+#     (KXLOWTPERIOD-26NOV15EWR: Nov 15 00:00 ET), so the last day, when the
+#     answer is mostly in, is never quoted.
+# Kill switch IMM_LOWT_PERIOD_ENABLE=0 (an env change: restart_imm.ps1 -Task):
+# the series then stands aside on lowt_gate again (no fair), as before.
+LOWT_PERIOD_ENABLE = os.environ.get("IMM_LOWT_PERIOD_ENABLE", "1") == "1"
+LOWT_PERIOD_PREFIX = "KXLOWTPERIOD"
+LOWT_PERIOD_FAIR_FILE = os.environ.get(
+    "IMM_LOWT_PERIOD_FAIR_FILE", os.path.join(STATUS_DIR, "lowt_period_fair.json"))
+LOWT_PERIOD_FAIR_TOL_CENTS = _env_int("IMM_LOWT_PERIOD_FAIR_TOL_CENTS", 30)
+LOWT_PERIOD_FAIR_TTL_MIN = _env_int("IMM_LOWT_PERIOD_FAIR_TTL_MIN", 30)
+LOWT_PERIOD_REFRESH_SECS = _env_int("IMM_LOWT_PERIOD_REFRESH_SECS", 600)
+_lowt_period_state: dict = {"mtime": 0.0, "events": {}}
+
+
+def lowt_period_series(series: str) -> bool:
+    """A low-temperature PERIOD series (KXLOWTPERIOD) while the low family
+    and its period gate are on."""
+    return (LOWT_PERIOD_ENABLE and series.startswith(LOWT_PERIOD_PREFIX)
+            and lowt_series(series))
+
+
+def load_lowt_period_fair() -> int:
+    """Hot-reload LOWT_PERIOD_FAIR_FILE by mtime into _lowt_period_state."""
+    return _load_temp_fair(LOWT_PERIOD_FAIR_FILE, _lowt_period_state, "low-temp period")
+
+
+def lowt_period_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                     ext_ask: Optional[float]) -> Tuple[str, dict]:
+    """('', inputs) when a period strike may quote, else (why, inputs): a
+    decided or near strike on a fresh read, then _temp_gate's checks (no
+    read, stale, skipped, unmodelled, the band) at the period tolerance."""
+    e = _lowt_period_state["events"].get(ticker.rsplit("-", 1)[0])
+    if e is not None and not e.get("skip") and \
+            now_ts - float(e.get("ts") or 0.0) <= LOWT_PERIOD_FAIR_TTL_MIN * 60:
+        obs = e.get("obs") or {}
+        fair = (e.get("markets") or {}).get(ticker)
+        inputs = {"fair": None if fair is None else round(float(fair) * 100.0, 2),
+                  "min_hi": obs.get("min_hi"), "min_lo": obs.get("min_lo"),
+                  "now_f": obs.get("now_f"), "now_at": obs.get("now_at")}
+        if ticker in (e.get("decided") or ()):
+            return (f"decided: the period's low so far is {obs.get('min_hi')}F",
+                    dict(inputs, reason="decided"))
+        if ticker in (e.get("near") or ()):
+            return (f"near: the latest reading {obs.get('now_f')}F "
+                    f"({obs.get('now_at')}) is that close to deciding it",
+                    dict(inputs, reason="near"))
+    return _temp_gate(_lowt_period_state, ticker, now_ts, ext_bid, ext_ask,
+                      LOWT_PERIOD_FAIR_TOL_CENTS, LOWT_PERIOD_FAIR_TTL_MIN,
+                      "low-temp period")
 
 
 # ----------------------------------------------------------------------------
@@ -33113,6 +33189,7 @@ class IncentiveMarketMaker:
         load_sat_gate()
         load_rain_fair()
         load_lowt_fair()              # low-temperature fair (2026-10-23)
+        load_lowt_period_fair()       # ... and its period events (2026-11-13)
         load_hight_fair()             # high-temperature fair (2026-10-23)
         _ca_n, _ca_moved = load_ca_fair()
         if _ca_moved:
@@ -39394,8 +39471,11 @@ class IncentiveMarketMaker:
             # unchanged; the market stands aside (both sides, cancel) with no
             # fresh fair, on a shape-filter day, or when the touch fights the
             # fair by more than LOWT_FAIR_TOL_CENTS on the adverse side.
+            # A PERIOD series (KXLOWTPERIOD, 2026-11-13) takes its own read
+            # and gate (lowt_period_gate: decided / near / 30c).
             if lowt_series(meta.series):
-                lt_why, lt_in = lowt_gate(t, now_ts, ext_bid, ext_ask)
+                lt_why, lt_in = (lowt_period_gate if lowt_period_series(meta.series)
+                                 else lowt_gate)(t, now_ts, ext_bid, ext_ask)
                 if lt_why:
                     if t not in self._lowt_stood:
                         self._lowt_stood.add(t)
@@ -42906,6 +42986,28 @@ class IncentiveMarketMaker:
                     time.sleep(max(300, LOWT_FAIR_REFRESH_SECS))
             threading.Thread(target=_lowt_fair_refresh, daemon=True,
                              name="lowt-fair").start()
+        if LOWT_ENABLE and LOWT_PERIOD_ENABLE and not once:
+            # The period lows' refresher (2026-11-13): lowt-fair's contract
+            # on lowt_period_fair.py, every LOWT_PERIOD_REFRESH_SECS
+            def _lowt_period_fair_refresh():
+                try:
+                    import lowt_period_fair
+                except Exception as e:
+                    log(f"{self.tag} ! lowt-period-fair refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                while True:
+                    try:
+                        ok, skipped, failed = lowt_period_fair.write_fair_file(
+                            LOWT_PERIOD_FAIR_FILE, get_json=kalshi_get)
+                        log(f"{self.tag} lowt-period-fair refresh: {ok} events priced"
+                            + (f", {skipped} stood aside" if skipped else "")
+                            + (f", {failed} FAILED" if failed else ""))
+                    except Exception as e:
+                        log(f"{self.tag} ! lowt-period-fair refresh failed: {e}")
+                    time.sleep(max(120, LOWT_PERIOD_REFRESH_SECS))
+            threading.Thread(target=_lowt_period_fair_refresh, daemon=True,
+                             name="lowt-period-fair").start()
         if HIGHT_ENABLE and not once:
             # High-temperature fair refresher (2026-10-23): the low one's
             # contract on hight_fair.py
@@ -44221,6 +44323,12 @@ class IncentiveMarketMaker:
                 + ("" if lowt_owner_paused(force=True) else
                    " -- OFF while low_temp_trading.py is not paused "
                    f"({os.path.basename(LOWT_OWNER_FLAG)} missing)"))
+            if LOWT_PERIOD_ENABLE:
+                log(f"low-temp periods (2026-11-13): {LOWT_PERIOD_PREFIX}* on "
+                    f"lowt_period_fair (observed low + shifted NWS hourly, every "
+                    f"{LOWT_PERIOD_REFRESH_SECS // 60}m); decided and near strikes "
+                    f"stand aside, tol {LOWT_PERIOD_FAIR_TOL_CENTS}c, fails closed; "
+                    f"out 00:00 ET of the period's last day")
         if HIGHT_ENABLE:
             _hs = HIGHT_STOP_BEFORE_MIN
             log(f"high-temp family (2026-10-23): {HIGHT_PREFIX}* next day only, "
