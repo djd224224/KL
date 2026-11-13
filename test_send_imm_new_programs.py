@@ -46,6 +46,9 @@ def setUpModule():
     # Fixture series are not in the production allowlist; allowlist policy has
     # its own tests below that patch _allowed/_blocked explicitly.
     imm.ALLOWLIST_ONLY = False
+    # The upcoming section builds an offline bot and reads the live upcoming
+    # feed; test_imm_upcoming covers it with its own fakes.
+    np.UPCOMING_SECTION = False
 
 
 def _iso(dt: datetime) -> str:

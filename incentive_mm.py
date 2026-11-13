@@ -64,6 +64,7 @@ Usage:
 import argparse
 import atexit
 import base64
+import bisect
 import json
 import math
 import os
@@ -3957,6 +3958,33 @@ def event_top_n_cut(metas: List["MarketMeta"], incumbent: Set[str],
 
 POLL_SECS = _env_int("IMM_POLL_SECS", 90)
 UNIVERSE_REFRESH_SECS = _env_int("IMM_UNIVERSE_REFRESH_SECS", 600)
+# UPCOMING PROGRAMS (Jack 2026-11-12: "since we can now see upcoming markets,
+# you can prepare to quote them when they're turned on"). GET
+# /incentive_programs?status=upcoming lists programs before they start. Read
+# every UPCOMING_REFRESH_SECS beside the active feed (fetch_upcoming), it
+#   1. forces a universe refresh on the first cycle after an ALLOWED market's
+#      program starts (_program_starts_due), instead of the next 600s tick --
+#      the 11/12 Carbon Arc FT programs started 19:25Z and quoted at 19:32;
+#   2. carries a program that has started but is not in the active read yet
+#      into the feed, for UPCOMING_GRACE_SECS after its start
+#      (_merge_started_upcoming);
+#   3. source-verifies the family-suffix series of programs starting within
+#      UPCOMING_VERIFY_HOURS (_resolve_family_verdicts), so the Carbon Arc
+#      rails apply from the first refresh after the start.
+# Per market only its NEXT program is kept (the earliest start; programs
+# sharing that start are summed): back-to-back daily periods are not one
+# window. Best effort: a failed read keeps the last list and retries in
+# UPCOMING_RETRY_SECS. IMM_UPCOMING=0 turns all three off.
+UPCOMING_ENABLE = os.environ.get("IMM_UPCOMING", "1") == "1"
+UPCOMING_REFRESH_SECS = _env_int("IMM_UPCOMING_REFRESH_SECS", 1800)
+UPCOMING_RETRY_SECS = _env_int("IMM_UPCOMING_RETRY_SECS", 300)
+UPCOMING_GRACE_SECS = _env_int("IMM_UPCOMING_GRACE_SECS", 900)
+# a start-forced refresh waits at least this long after the last refresh (a
+# full refresh reads ~2,700 books; 11/13 has starts at 17:55, 17:56, 18:01):
+# a start inside the gap is still due, and runs once the gap has passed
+UPCOMING_MIN_GAP_SECS = _env_int("IMM_UPCOMING_MIN_GAP_SECS", 120)
+UPCOMING_VERIFY_HOURS = float(os.environ.get("IMM_UPCOMING_VERIFY_HOURS", "24"))
+UPCOMING_MAX_PAGES = _env_int("IMM_UPCOMING_MAX_PAGES", 10)
 # Kalshi publishes each hour's hourly-series (KXTEMP) programs LATE — absent
 # when the hour-crossed refresh fires at ~hh:01, present by ~hh:11 (observed
 # at the 01:00Z and 02:00Z boundaries, 2026-07-21) — so for the first N
@@ -14336,6 +14364,10 @@ _CONFIG_CODE_KNOBS = (
     # ride in its status file's "model" block
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
     "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT",
+    # upcoming programs (2026-11-12)
+    "UPCOMING_ENABLE", "UPCOMING_REFRESH_SECS", "UPCOMING_RETRY_SECS",
+    "UPCOMING_GRACE_SECS", "UPCOMING_MIN_GAP_SECS", "UPCOMING_VERIFY_HOURS",
+    "UPCOMING_MAX_PAGES",
     # Pokemon gate (2026-10-03); pokemon_fair's model knobs ride in its
     # status file's "model" block
     "POKE_ENABLE", "POKE_SERIES", "POKE_FAIR_TOL_CENTS", "POKE_BAND_TOL_CENTS",
@@ -26761,6 +26793,12 @@ class IncentiveMarketMaker:
         # candidate on an hourly program? Set by every refresh; the first
         # refresh runs regardless (universe_at starts at 0).
         self._hourly_programs_live = False
+        # upcoming programs (2026-11-12, UPCOMING_ENABLE): market -> its next
+        # program (fetch_programs' shape); the allowed markets' start
+        # timestamps, sorted (one per market); when the list was read
+        self._upcoming: Dict[str, dict] = {}
+        self._upcoming_starts: List[float] = []
+        self._upcoming_at = 0.0
         # planned-restart order handoff (2026-09-27, RESTART_KEEP_ORDERS):
         # True once a code-change exit has written the handoff file, so the
         # shutdown path leaves the book resting for the relaunch
@@ -32405,7 +32443,9 @@ class IncentiveMarketMaker:
     # ---- universe: programs -> candidate markets -> selection ---------------
 
     def fetch_programs(self) -> Dict[str, dict]:
-        """market_ticker -> aggregated active liquidity program info."""
+        """market_ticker -> aggregated active liquidity program info -- plus,
+        with UPCOMING_ENABLE, a program from the upcoming list that has
+        started but is not in the active read yet (_merge_started_upcoming)."""
         now = datetime.now(timezone.utc)
         programs: List[dict] = []
         cursor = None
@@ -32448,8 +32488,121 @@ class IncentiveMarketMaker:
                 cur["start"] = min(cur["start"], start)
                 cur["end"] = max(cur["end"], end)
                 cur["target"] = max(cur["target"], target)
+        if UPCOMING_ENABLE:
+            self._merge_started_upcoming(by_market, now)
         self.state.programs_count = len(by_market)
         return by_market
+
+    @staticmethod
+    def upcoming_by_market(programs: List[dict], now: datetime) -> Dict[str, dict]:
+        """Upcoming program rows -> market_ticker -> its NEXT program in
+        fetch_programs' shape ({dollars_per_day, start, end, target, df}).
+        Only liquidity programs not paid out and not ended; per market the
+        earliest start wins and programs sharing that start are summed (two
+        back-to-back daily periods are two programs, not one window)."""
+        rows: Dict[str, List[Tuple[datetime, datetime, dict]]] = {}
+        for p in programs:
+            if p.get("incentive_type") != "liquidity" or p.get("paid_out"):
+                continue
+            start = parse_iso_utc(p.get("start_date", ""))
+            end = parse_iso_utc(p.get("end_date", ""))
+            t = p.get("market_ticker") or ""
+            if not t or not start or not end or end <= start or end <= now:
+                continue
+            rows.setdefault(t, []).append((start, end, p))
+        out: Dict[str, dict] = {}
+        for t, rs in rows.items():
+            first = min(r[0] for r in rs)
+            info = None
+            for start, end, p in rs:
+                if start != first:
+                    continue
+                days = max((end - start).total_seconds() / 86400.0, 1.0 / 24)
+                dpd = (p.get("period_reward") or 0) / 10000.0 / days
+                try:
+                    target = float(p.get("target_size_fp") or 0)
+                except (TypeError, ValueError):
+                    target = 0.0
+                df = (p.get("discount_factor_bps") or 5000) / 10000.0
+                if info is None:
+                    info = {"dollars_per_day": dpd, "start": start, "end": end,
+                            "target": target, "df": df}
+                else:
+                    info["dollars_per_day"] += dpd
+                    info["end"] = max(info["end"], end)
+                    info["target"] = max(info["target"], target)
+            out[t] = info
+        return out
+
+    def fetch_upcoming(self, now: datetime) -> int:
+        """Read the upcoming list (UPCOMING_MAX_PAGES pages at most) into
+        self._upcoming / self._upcoming_starts. Raises on a failed read (the
+        caller keeps the last list). Returns the market count."""
+        programs: List[dict] = []
+        cursor = None
+        for _page in range(max(1, UPCOMING_MAX_PAGES)):
+            params = {"limit": 1000, "status": "upcoming"}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self.client.get("/incentive_programs", params=params) or {}
+            batch = resp.get("incentive_programs") or []
+            programs.extend(batch)
+            cursor = resp.get("next_cursor")
+            if not cursor or not batch:
+                break
+        up = self.upcoming_by_market(programs, now)
+        self._upcoming = up
+        self._upcoming_starts = sorted(
+            info["start"].timestamp() for t, info in up.items()
+            if info["start"] > now and self._allowed(t))
+        self._upcoming_at = now.timestamp()
+        return len(up)
+
+    def _merge_started_upcoming(self, by_market: Dict[str, dict],
+                                now: datetime) -> int:
+        """Refresh the upcoming list when due, then carry into `by_market`
+        each listed program that has started within UPCOMING_GRACE_SECS and
+        that the active read does not have yet. Returns how many."""
+        now_ts = now.timestamp()
+        if now_ts - self._upcoming_at >= UPCOMING_REFRESH_SECS:
+            try:
+                n = self.fetch_upcoming(now)
+                nxt: Dict[str, int] = {}
+                for ts in self._upcoming_starts[:2000]:
+                    k = datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%MZ")
+                    nxt[k] = nxt.get(k, 0) + 1
+                    if len(nxt) > 4:
+                        nxt.pop(k)
+                        break
+                log(f"{self.tag} upcoming programs: {n} market(s) listed, "
+                    f"{len(self._upcoming_starts)} allowed; next starts "
+                    + (", ".join(f"{k} x{v}" for k, v in nxt.items()) or "none"))
+            except Exception as e:
+                log(f"{self.tag} ! upcoming programs read failed ({e!r:.80}); "
+                    f"the last list is kept, retry in {UPCOMING_RETRY_SECS}s")
+                self._upcoming_at = now_ts - UPCOMING_REFRESH_SECS + UPCOMING_RETRY_SECS
+        added: List[str] = []
+        for t, info in self._upcoming.items():
+            start = info["start"]
+            if t in by_market or not (start <= now < info["end"]):
+                continue
+            if (now - start).total_seconds() > UPCOMING_GRACE_SECS:
+                continue
+            by_market[t] = dict(info)
+            added.append(t)
+        if added:
+            log(f"{self.tag} upcoming programs started, not in the active read "
+                f"yet: {len(added)} market(s) carried in (e.g. {sorted(added)[0]})")
+        return len(added)
+
+    def _program_starts_due(self, now_ts: float) -> int:
+        """How many allowed markets' programs (the upcoming list) started
+        since the last universe refresh."""
+        starts = self._upcoming_starts
+        if not starts:
+            return 0
+        return (bisect.bisect_right(starts, now_ts)
+                - bisect.bisect_right(starts, self.state.universe_at))
 
     @staticmethod
     def _blocked(ticker: str) -> bool:
@@ -32889,9 +33042,15 @@ class IncentiveMarketMaker:
         in_activation_window = (
             (now_ts % 3600) < HOURLY_ACTIVATION_WINDOW_SECS
             and (not HOURLY_ACTIVATION_AUTO or self._hourly_programs_live))
+        # a program starting (UPCOMING_ENABLE): refresh on the first cycle
+        # after an allowed market's start, not at the next 600s tick
+        starts_due = self._program_starts_due(now_ts) if UPCOMING_ENABLE else 0
         if (now_ts - self.state.universe_at < UNIVERSE_REFRESH_SECS
                 and not hour_crossed and not in_activation_window):
-            return
+            if not starts_due or now_ts - self.state.universe_at < UPCOMING_MIN_GAP_SECS:
+                return
+            log(f"{self.tag} universe refresh at a program start: {starts_due} "
+                f"allowed market(s) started since the last refresh")
         # NETWORK GUARD (UNIVERSE_NET_GUARD): a refresh that comes due in
         # network trouble waits, with the current universe kept, for up to
         # UNIVERSE_DEFER_MAX_SECS
@@ -32935,6 +33094,15 @@ class IncentiveMarketMaker:
             # filter below reads _allowed, so a sibling Kalshi listed since
             # the last refresh is admitted in this one. LIVE feed only.
             self._resolve_family_verdicts(by_market, now_ts)
+            # ...and ahead of time, for the programs starting within
+            # UPCOMING_VERIFY_HOURS (2026-11-12), so a new family-suffix
+            # series is source-verified before its first refresh
+            if UPCOMING_ENABLE and self._upcoming:
+                _soon = {t: i for t, i in self._upcoming.items()
+                         if t not in by_market and
+                         i["start"].timestamp() - now_ts <= UPCOMING_VERIFY_HOURS * 3600}
+                if _soon:
+                    self._resolve_family_verdicts(_soon, now_ts)
             # FINECON FAMILY (2026-09-09): admit prefix-matching series the
             # moment Kalshi programs them, so a newly listed central bank is
             # covered the same refresh rather than waiting for a hand add.

@@ -41554,6 +41554,171 @@ class TestBreakevenOffset(unittest.TestCase):
         self.assertLess(sum(o["remaining_count"] for o in self._side(bot, "bid")), 200)
 
 
+class TestUpcomingPrograms(unittest.TestCase):
+    """UPCOMING PROGRAMS (Jack 2026-11-12: "since we can now see upcoming
+    markets, you can prepare to quote them when they're turned on"): the
+    bot reads status=upcoming beside the active feed, refreshes the
+    universe at an allowed market's start, carries a started-but-unlisted
+    program in for UPCOMING_GRACE_SECS, and verifies family series ahead."""
+
+    @staticmethod
+    def _p(t, start, end, reward=700000):
+        f = "%Y-%m-%dT%H:%M:%SZ"
+        return {"market_ticker": t, "incentive_type": "liquidity",
+                "period_reward": reward, "target_size_fp": "500.00",
+                "discount_factor_bps": 5000, "paid_out": False,
+                "start_date": start.strftime(f), "end_date": end.strftime(f)}
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.lines = []
+        p = mock.patch.object(imm, "log", side_effect=self.lines.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_defaults(self):
+        self.assertEqual((imm.UPCOMING_ENABLE, imm.UPCOMING_REFRESH_SECS,
+                          imm.UPCOMING_GRACE_SECS, imm.UPCOMING_VERIFY_HOURS),
+                         (True, 1800, 900, 24.0))
+
+    def test_only_the_next_program_of_a_market_counts(self):
+        now = datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc)
+        d1 = datetime(2026, 11, 13, 5, 0, tzinfo=timezone.utc)
+        d2, d3 = d1 + timedelta(days=1), d1 + timedelta(days=2)
+        rows = [self._p("KXA-1", d1, d2, 700000), self._p("KXA-1", d2, d3, 700000),
+                # two programs sharing a start are one paying stretch
+                self._p("KXB-1", d1, d2, 300000), self._p("KXB-1", d1, d2, 100000),
+                self._p("KXC-1", now - timedelta(days=2), now - timedelta(days=1)),
+                dict(self._p("KXD-1", d1, d2), incentive_type="volume"),
+                dict(self._p("KXE-1", d1, d2), paid_out=True)]
+        up = IncentiveMarketMaker.upcoming_by_market(rows, now)
+        self.assertEqual(sorted(up), ["KXA-1", "KXB-1"])
+        self.assertEqual((up["KXA-1"]["start"], up["KXA-1"]["end"]), (d1, d2))
+        self.assertAlmostEqual(up["KXA-1"]["dollars_per_day"], 70.0)   # not 140
+        self.assertAlmostEqual(up["KXB-1"]["dollars_per_day"], 40.0)
+        self.assertEqual(up["KXB-1"]["target"], 500.0)
+
+    def test_the_read_lists_allowed_starts_only(self):
+        b = self.bot
+        now = datetime.now(timezone.utc)
+        s1, s2 = now + timedelta(minutes=30), now + timedelta(hours=2)
+        rows = [self._p("KXGOOD-99DEC31-A", s1, s1 + timedelta(days=7)),
+                self._p("KXNOTALLOWED-99DEC31-A", s2, s2 + timedelta(days=7))]
+        b.client.get = lambda path, params=None: {"incentive_programs": rows}
+        allowed = lambda t: t.startswith("KXGOOD")              # noqa: E731
+        with mock.patch.object(IncentiveMarketMaker, "_allowed", staticmethod(allowed)):
+            self.assertEqual(b.fetch_upcoming(now), 2)
+        self.assertEqual(sorted(b._upcoming), ["KXGOOD-99DEC31-A", "KXNOTALLOWED-99DEC31-A"])
+        self.assertEqual(b._upcoming_starts, [s1.replace(microsecond=0).timestamp()])
+
+    def test_a_started_program_rides_in_until_the_active_read_has_it(self):
+        b = self.bot
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        end = now + timedelta(days=6)
+        b._upcoming = {
+            "KXNEW-1": {"dollars_per_day": 10.0, "start": now - timedelta(minutes=2),
+                        "end": end, "target": 500.0, "df": 0.5},
+            "KXOLD-1": {"dollars_per_day": 10.0, "start": now - timedelta(minutes=20),
+                        "end": end, "target": 500.0, "df": 0.5},
+            "KXSOON-1": {"dollars_per_day": 10.0, "start": now + timedelta(minutes=5),
+                         "end": end, "target": 500.0, "df": 0.5},
+            "KXLIVE-1": {"dollars_per_day": 99.0, "start": now - timedelta(minutes=1),
+                         "end": end, "target": 500.0, "df": 0.5}}
+        b._upcoming_at = now.timestamp()                       # not due a re-read
+        by_market = {"KXLIVE-1": {"dollars_per_day": 5.0, "start": now, "end": end,
+                                  "target": 500.0, "df": 0.5}}
+        self.assertEqual(b._merge_started_upcoming(by_market, now), 1)
+        self.assertEqual(sorted(by_market), ["KXLIVE-1", "KXNEW-1"])
+        self.assertEqual(by_market["KXLIVE-1"]["dollars_per_day"], 5.0)   # the active read wins
+        self.assertTrue(any("carried in" in s for s in self.lines))
+
+    def test_a_failed_read_keeps_the_list_and_retries_soon(self):
+        b = self.bot
+        now = datetime.now(timezone.utc)
+        b._upcoming = {"KXKEPT-1": {"dollars_per_day": 1.0, "start": now + timedelta(hours=1),
+                                    "end": now + timedelta(days=1), "target": 0.0, "df": 0.5}}
+
+        def boom(path, params=None):
+            raise RuntimeError("429")
+        b.client.get = boom
+        b._upcoming_at = 0.0
+        b._merge_started_upcoming({}, now)
+        self.assertIn("KXKEPT-1", b._upcoming)
+        self.assertAlmostEqual(now.timestamp() - b._upcoming_at,
+                               imm.UPCOMING_REFRESH_SECS - imm.UPCOMING_RETRY_SECS, delta=2)
+        self.assertTrue(any("upcoming programs read failed" in s for s in self.lines))
+
+    def test_a_start_since_the_last_refresh_forces_one(self):
+        b = self.bot
+        b.run_cycle()
+        now_ts = time.time()
+        b.state.universe_at = now_ts - 200                      # 600s gate not due
+        b._upcoming_starts = [now_ts - 3600, now_ts - 30, now_ts + 600]
+        self.assertEqual(b._program_starts_due(now_ts), 1)
+        calls = []
+        real = b.fetch_programs
+        b.fetch_programs = lambda: (calls.append(1), real())[1]
+        now_utc = datetime.fromtimestamp(now_ts, timezone.utc)
+        if int(now_ts // 3600) != int((now_ts - 200) // 3600):
+            self.skipTest("an hour boundary would force the refresh anyway")
+        with mock.patch.object(imm, "HOURLY_ACTIVATION_AUTO", True):
+            b._hourly_programs_live = False
+            b.state.universe_at = now_ts - 200
+            b.refresh_universe(now_utc, {})
+        self.assertEqual(calls, [1])
+        self.assertTrue(any("universe refresh at a program start: 1" in s for s in self.lines))
+        # ...not inside the minimum gap, though the start is still due
+        calls.clear()
+        b._upcoming_starts = [now_ts - 30]
+        b.state.universe_at = now_ts - 60
+        with mock.patch.object(imm, "HOURLY_ACTIVATION_AUTO", True):
+            b._hourly_programs_live = False
+            b.refresh_universe(now_utc, {})
+        self.assertEqual(calls, [])
+        self.assertEqual(b._program_starts_due(now_ts), 1)
+        # ...and with nothing starting, the 600s gate holds
+        b._upcoming_starts = [now_ts + 600]
+        b.state.universe_at = now_ts - 200
+        with mock.patch.object(imm, "HOURLY_ACTIVATION_AUTO", True):
+            b.refresh_universe(now_utc, {})
+        self.assertEqual(calls, [])
+
+    def test_off_switch(self):
+        b = self.bot
+        now_ts = time.time()
+        b.run_cycle()
+        b._upcoming_starts = [now_ts - 30]
+        b.state.universe_at = now_ts - 200
+        calls = []
+        b.fetch_programs = lambda: (calls.append(1), {})[1]
+        if int(now_ts // 3600) != int((now_ts - 200) // 3600):
+            self.skipTest("an hour boundary would force the refresh anyway")
+        with mock.patch.object(imm, "UPCOMING_ENABLE", False), \
+                mock.patch.object(imm, "HOURLY_ACTIVATION_AUTO", True):
+            b._hourly_programs_live = False
+            b.refresh_universe(datetime.fromtimestamp(now_ts, timezone.utc), {})
+        self.assertEqual(calls, [])
+
+    def test_family_series_starting_soon_are_verified_ahead(self):
+        b = self.bot
+        now = datetime.now(timezone.utc)
+        b._upcoming = {
+            "KXSOONCC-26DEC05-T1": {"dollars_per_day": 1.0, "start": now + timedelta(hours=3),
+                                    "end": now + timedelta(days=7), "target": 0.0, "df": 0.5},
+            "KXLATERCC-26DEC05-T1": {"dollars_per_day": 1.0, "start": now + timedelta(days=3),
+                                     "end": now + timedelta(days=9), "target": 0.0, "df": 0.5}}
+        b._upcoming_at = now.timestamp()
+        seen = []
+        real = b._resolve_family_verdicts
+        b._resolve_family_verdicts = lambda bm, ts: (seen.append(sorted(bm)), real(bm, ts))[1]
+        b.run_cycle()
+        b.state.universe_at = 0.0
+        b.refresh_universe(now, {})
+        self.assertIn(["KXSOONCC-26DEC05-T1"], seen)
+        self.assertFalse(any("KXLATERCC-26DEC05-T1" in x for x in seen))
+
+
 if __name__ == "__main__":
     unittest.main()
 

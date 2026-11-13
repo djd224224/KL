@@ -552,22 +552,31 @@ def enroll_new_series(client, dry: bool):
     imm.load_politics_auto_series()
     seen: dict = {}
     paying: dict = {}                 # series -> every paying market ticker
-    cursor = None
-    while True:
-        params = {"status": "active", "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        resp = client.get("/incentive_programs", params=params)
-        for p in resp.get("incentive_programs") or []:
-            t = p.get("market_ticker", "")
-            s = t.split("-")[0]
-            if s and s not in seen:
-                seen[s] = t
-            if s and t not in paying.setdefault(s, []):
-                paying[s].append(t)
-        cursor = resp.get("next_cursor")
-        if not cursor:
-            break
+    # ...and the UPCOMING programs (Jack 2026-11-12: "since we can now see
+    # upcoming markets, you can prepare to quote them when they're turned
+    # on"): a series is classified and enrolled before its first program
+    # starts, so the bot quotes it from the start instead of after the next
+    # watch run. Enrolling early changes nothing until then -- the bot only
+    # quotes markets with a live program. IMM_UPCOMING=0: active only.
+    statuses = (("active", 200),) + ((("upcoming", 1000),)
+                                     if getattr(imm, "UPCOMING_ENABLE", False) else ())
+    for status, limit in statuses:
+        cursor = None
+        for _page in range(500):
+            params = {"status": status, "limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.get("/incentive_programs", params=params)
+            for p in resp.get("incentive_programs") or []:
+                t = p.get("market_ticker", "")
+                s = t.split("-")[0]
+                if s and s not in seen:
+                    seen[s] = t
+                if s and t not in paying.setdefault(s, []):
+                    paying[s].append(t)
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
     enrolled, review = [], []
     additions = []
     for s, sample in sorted(seen.items()):

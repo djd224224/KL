@@ -24,6 +24,14 @@ email):
     it (quoting / allowed / blocked / not allowlisted, plus a cutoff flag
     when the bot provably cannot earn the pool). Sorted biggest pool first.
 Both carry a TOTAL row across EVERY new event (not just the rows shown).
+  * between them, UPCOMING PROGRAMS (Jack 2026-11-12: "yes add 'upcoming
+    incentive markets' to the morning new-programs email, ranked by
+    attractiveness and whether we are expecting to quote them or not"):
+    Kalshi's status=upcoming programs that have not started, one row per
+    series, ranked by the bot's estimate of what it would earn there, with
+    whether the bot expects to quote each one at its start (imm_upcoming:
+    allowlist, screens and payout floor as of the start). Best effort: a
+    failed read costs the section, never the email.
 
 WHY IT EXISTS: reward supply is the bot's raw material and it moves before
 P&L does, but nothing in the morning lineup reports the SUPPLY SIDE. The
@@ -122,6 +130,7 @@ import imm_quote_gaps as gaps
 import incentive_mm as imm
 from incentive_mm import log
 import imm_dashboard as dash  # read_last_snapshot: the bot's estimates (stdlib-only)
+import imm_upcoming             # the upcoming-programs section (2026-11-12)
 
 SEEN_PATH = os.path.join(imm.STATUS_DIR, "imm_new_programs_seen.json")
 STATE_PATH = os.path.join(imm.STATUS_DIR, "imm_state.json")
@@ -159,6 +168,13 @@ PAGE_LIMIT = int(os.environ.get("IMM_NEWPROG_PAGE_LIMIT", "1000"))
 MAX_PAGES = int(os.environ.get("IMM_NEWPROG_MAX_PAGES", "40"))
 # One GET per event for Kalshi's own title; biggest pools first, bounded.
 TITLE_BUDGET = int(os.environ.get("IMM_NEWPROG_TITLES", "60"))
+# The upcoming section (imm_upcoming): on by default; the top rows by
+# estimate, every series the bot expects (or may) quote added beneath them,
+# at most UPCOMING_MAX_ROWS rows; Kalshi titles for the rows shown.
+UPCOMING_SECTION = os.environ.get("IMM_NEWPROG_UPCOMING", "1") == "1"
+UPCOMING_ROWS = int(os.environ.get("IMM_NEWPROG_UPCOMING_ROWS", "30"))
+UPCOMING_MAX_ROWS = int(os.environ.get("IMM_NEWPROG_UPCOMING_MAX_ROWS", "60"))
+UPCOMING_TITLES = int(os.environ.get("IMM_NEWPROG_UPCOMING_TITLES", "40"))
 ENDED_STATUSES = tuple(s for s in os.environ.get(
     "IMM_NEWPROG_ENDED_STATUSES", "settled,closed").split(",") if s)
 
@@ -703,6 +719,24 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
 
     seen_next = next_seen(seen, events, now_utc, feed_ok)
 
+    upcoming = None
+    if UPCOMING_SECTION:
+        try:
+            live = {t for r in events.values() for t in r["live_tickers"]}
+            upcoming = imm_upcoming.build(client, live, now_utc)
+            upcoming["shown"] = upcoming_rows(upcoming)
+            for i, e in enumerate(upcoming["shown"]):
+                title = ""
+                if i < UPCOMING_TITLES:
+                    try:
+                        title = gaps.event_title(client, e["events"][0])
+                    except Exception:
+                        title = ""
+                e["what"] = gaps.describe_event(e["events"][0], title)
+        except Exception as e:
+            log(f"! upcoming section failed ({e!r}); the email goes without it")
+            upcoming = {"error": f"{e!r}"[:200]}
+
     ctx = {
         "now": now_utc, "window_start": window_start, "window_why": window_why,
         "new": new_recs, "late": late_recs, "seeding": seeding,
@@ -713,6 +747,7 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
         "series_new": series_new, "series_relit": series_relit,
         "series_pool": series_pool, "skipped_types": skipped_types,
         "banner": banner, "statuses": statuses, "est_at": est_at,
+        "upcoming": upcoming,
     }
     text = render_text(ctx)
     html = render_html(ctx)
@@ -956,6 +991,120 @@ def _summary_html(ctx) -> str:
     return "".join(h)
 
 
+# ----------------------------------------------------------------------------
+# Upcoming programs (2026-11-12, imm_upcoming)
+# ----------------------------------------------------------------------------
+
+_UP_COLS = (("STARTS (ET)", 13, "<"), ("SERIES / EVENT", 30, "<"),
+            ("WHAT IT IS", 26, "<"), ("MKTS", 4, ">"), ("POOL $", 8, ">"),
+            ("EST $/DAY", 9, ">"), ("EST $", 13, ">"), ("QUOTE?", 40, "<"))
+
+
+def upcoming_rows(up: dict) -> list:
+    """The rows shown: the top UPCOMING_ROWS by estimate, then every series
+    the bot expects (or may) quote that missed the cut, at most
+    UPCOMING_MAX_ROWS, all in estimate order."""
+    rows = up.get("rows") or []
+    top = rows[:UPCOMING_ROWS]
+    rest = [e for e in rows[UPCOMING_ROWS:] if e["kind"] in ("yes", "maybe")]
+    return (top + rest)[:UPCOMING_MAX_ROWS]
+
+
+def _up_head(up: dict) -> list:
+    """The section's headline lines."""
+    rows = up["rows"]
+    s = imm_upcoming.summary(up)
+    events = up["n_events"]
+    lines = [f"{len(rows)} series ({events} event{'' if events == 1 else 's'}, "
+             f"{up['n_new_markets']:,} markets) start in the next "
+             f"{up['horizon_days']:g} days, ${sum(e['pool'] for e in rows):,.0f} of pool"]
+    lines.append(
+        f"expect to quote: {s['yes'][0]} series, est ${s['yes'][1]:,.0f} - "
+        f"maybe: {s['maybe'][0]}, est ${s['maybe'][1]:,.0f} - "
+        f"won't quote: {s['no'][0]}, est ${s['no'][1]:,.0f} if they were quoted")
+    return lines
+
+
+def _up_cells(e: dict) -> tuple:
+    return (_et(e["start"]), _short(e["label"]), e.get("what", ""), str(e["n"]),
+            f"{e['pool']:,.0f}", imm_upcoming.day_cell(e), imm_upcoming.est_cell(e),
+            imm_upcoming.quote_cell(e))
+
+
+def _up_notes(up: dict) -> list:
+    n, pool = up["renewals"]
+    shown = len(up.get("shown") or [])
+    notes = ["EST $ = the bot's estimator on today's book: day-size $/day over "
+             "each market's quotable days from its start (the payout bar's "
+             "projection), for unquotable markets too, so a 'no' row says what "
+             "fixing it would be worth. ~ = the series' unread markets take its "
+             "read markets' capture; proxy = pool x "
+             f"{imm_upcoming.PROXY_CAPTURE:.1%}. Pre-start books are thin, so it "
+             "leans high: it ranks, it does not promise.",
+             "QUOTE? = the bot's allowlist, screens and payout floor as of the "
+             "start (maybe = only the start settles it: a wide or one-sided book "
+             "today, a Carbon Arc check, the open-scan screens, the book budget). "
+             "Fair gates, slots and the collateral budget are not modelled. The "
+             "bot refreshes at each allowed start and reads this list every 30 min."]
+    tail = f"{shown} of {len(up['rows'])} series shown"
+    if n:
+        tail += (f"; renewals not listed: the next period on {n:,} market(s) "
+                 f"paying now, ${pool:,.0f}")
+    notes.append(tail + f"; {up['books']} books read.")
+    return notes
+
+
+def _upcoming_text(ctx) -> list:
+    up = ctx.get("upcoming")
+    if not up:
+        return []
+    if up.get("error"):
+        return [f"UPCOMING PROGRAMS: unavailable today ({up['error']})"]
+    lines = ["UPCOMING PROGRAMS (not started yet; ranked by the bot's estimate)"]
+    lines += ["  " + ln for ln in _up_head(up)]
+    lines.append("  ".join(f"{n:{a}{w}}" for n, w, a in _UP_COLS).rstrip())
+    for e in up.get("shown") or []:
+        lines.append("  ".join(f"{_clip(c, w):{a}{w}}" for c, (_n, w, a)
+                               in zip(_up_cells(e), _UP_COLS)).rstrip())
+    return lines + _up_notes(up)
+
+
+def _upcoming_html(ctx) -> str:
+    up = ctx.get("upcoming")
+    if not up:
+        return ""
+    if up.get("error"):
+        return ('<div style="color:#888;font-size:12px;margin:8px 0">Upcoming '
+                'programs: unavailable today ({})</div>'.format(_esc(up["error"])))
+    right = ' align="right"'
+    head = _up_head(up)
+    h = ['<div style="font-size:15px;font-weight:600;margin:14px 0 2px">Upcoming '
+         'programs <span style="color:#888;font-weight:400;font-size:12px">'
+         '&mdash; not started yet, ranked by the bot\'s estimate</span></div>',
+         '<div style="font-size:13px;color:#555;margin:1px 0">{}</div>'.format(
+             "<br>".join(_esc(x) for x in head)),
+         '<table cellpadding="5" cellspacing="0" style="border-collapse:collapse;'
+         'margin:4px 0;font-size:13px">',
+         '<tr style="background:#f0f0f0;font-weight:600">' + "".join(
+             '<td{}>{}</td>'.format("" if a == "<" else right, _esc(n))
+             for n, _w, a in _UP_COLS) + '</tr>']
+    color = {"yes": "#1e8449", "maybe": "#9a6700", "no": "#888"}
+    for i, e in enumerate(up.get("shown") or []):
+        start, label, what, n, pool, day, est, quote = _up_cells(e)
+        h.append('<tr{bg}><td style="white-space:nowrap">{start}</td>'
+                 '<td style="font-family:Consolas,monospace">{label}</td>'
+                 '<td>{what}</td><td{r}>{n}</td><td{r}>{pool}</td><td{r}>{day}</td>'
+                 '<td{r}><b>{est}</b></td><td style="color:{c}{w}">{quote}</td></tr>'.format(
+                     bg=' style="background:#f6f6f6"' if i % 2 else "", r=right,
+                     start=_esc(start), label=_esc(label), what=_esc(_clip(what, 60)),
+                     n=n, pool=pool, day=day, est=_esc(est), c=color[e["kind"]],
+                     w=";font-weight:600" if e["kind"] == "yes" else "",
+                     quote=_esc(quote)))
+    h.append('</table><div style="color:#888;font-size:12px;margin:2px 0 8px">{}'
+             '</div>'.format("<br>".join(_esc(x) for x in _up_notes(up))))
+    return "".join(h)
+
+
 # BOT is last and left-aligned, so its padding costs nothing once the line is
 # rstripped; the fixed part of a row is ~117 chars, in line with the 7:20
 # quote-gaps table. The HTML table is the one to read — this is the fallback.
@@ -999,6 +1148,9 @@ def render_text(ctx) -> str:
         out += ["!! " + ctx["banner"], ""]
     if ctx["new"]:
         out += _summary_text(ctx) + [""]
+    up = _upcoming_text(ctx)
+    if up:
+        out += up + [""]
     out += _headline(ctx) + [""]
     if ctx["new"]:
         shown = ctx["new"][:MAX_ROWS]
@@ -1085,6 +1237,7 @@ def render_html(ctx) -> str:
                  '{}</div>'.format(_esc(ctx["banner"])))
     if ctx["new"]:
         h.append(_summary_html(ctx))
+    h.append(_upcoming_html(ctx))
     head = _headline(ctx)
     h.append('<div style="font-size:20px;font-weight:800;margin:6px 0 2px">{}</div>'
              .format(_esc(head[0])))
