@@ -782,6 +782,8 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
         imm.load_finecon_extra_series()
     except Exception as e:            # a missing extension file is not fatal
         log(f"! finecon extension load failed ({e!r}); allowlist may be narrow")
+    if hasattr(imm, "load_vercel_series"):
+        imm.load_vercel_series()      # the discovered Vercel series (2026-11-13)
 
     client = imm.build_client()
     statuses = ("active",) + (ENDED_STATUSES if include_ended else ())

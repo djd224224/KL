@@ -150,6 +150,35 @@ OPEN_WEIGHT_LABS = ("deepseek", "zai", "moonshotai", "stepfun", "xiaomi", "minim
                     "alibaba", "inclusionai", "nvidia", "tencent", "meituan", "arcee-ai",
                     "baseten", "reflection")
 ALL_SERIES = tuple(LAB_SERIES) + (OPEN_SERIES,)
+# THE FAMILY IS DISCOVERED, NOT LISTED (Jack 2026-11-13: "let the vercel family
+# be more generalized than a fixed list, so it automatically picks up stuff
+# like this", on KXOSSPEND -- listed 11/13 18:01Z with KXGOOGVSPEND, KXZAIVREQ
+# and KXZAIVSPEND, none of them in the eight-series list, so none quoted).
+# Kalshi's series list carries each series' settlement source; a Vercel AI
+# Gateway leaderboard source names its own spec:
+#   .../leaderboards/labs + title "<Lab> Vercel <spend|requests|tokens> share"
+#       -> a LAB series: that lab's share of that metric in the lab export;
+#   .../leaderboards/models?...group=weights#<anchor> -> an OPEN-WEIGHTS
+#       series: the Open Weights share of the weight-class chart's metric
+#       (#open-vs-closed = tokens, KXOPENSOURCESHARE; #spend = cost,
+#       KXOSSPEND). Its running-to-final deltas are the lab sum of the same
+#       metric (spend for cost), as KXOPENSOURCESHARE's are of tokens.
+# discover() reads the list, register() adds what it finds to LAB_SERIES /
+# OPEN_SPECS / ALL_SERIES (the eight above are the base and always win). A
+# discovered series takes the default model: the weekday term (DOW_SERIES,
+# unless IMM_VERCEL_DOW_SERIES names a set), level space, no mean reversion.
+# Every ticker but KXOPENSOURCESHARE's dates D as DDMMMYY.
+OPEN_SPECS: Dict[str, str] = {OPEN_SERIES: "tokens"}
+LEGACY_D1_SERIES = frozenset({OPEN_SERIES})       # YYMMMDD = D + 1
+CHART_METRICS = ("tokens", "cost", "requests")
+# the chart's metric -> the lab export's (the lab-sum fallback + deltas)
+LAB_METRIC_OF = {"tokens": "tokens", "cost": "spend", "requests": "requests"}
+LEADERBOARD_URL = "vercel.com/ai-gateway/leaderboards"
+_LAB_TITLE_RE = re.compile(r"^\s*(.+?)\s+vercel\s+(spend|requests|tokens)\s+share\b",
+                           re.IGNORECASE)
+_OPEN_ANCHOR_METRIC = {"open-vs-closed": "tokens", "tokens": "tokens",
+                       "spend": "cost", "cost": "cost", "requests": "requests"}
+_registry = {"version": 0}
 # KXOPENSOURCESHARE's own number (Jack 2026-10-22: pasted the meta model-
 # coverage gap, "QUOTE WITH CARE -- ... make the fix, or block it until
 # then"). The rules settle on "the Open Weights percentage in Vercel AI
@@ -200,6 +229,8 @@ MIN_SAMPLE = 20
 # until 2026-11-02 (the weekday re-fit above): all eight carry it, and the
 # Google / Anthropic requests series model it in log space.
 DOW_SERIES = _env_set("IMM_VERCEL_DOW_SERIES", ",".join(ALL_SERIES))
+# unset = every series, discovered ones included (register adds them)
+DOW_ALL = os.environ.get("IMM_VERCEL_DOW_SERIES") is None
 SEASON_DAYS = int(_env_float("IMM_VERCEL_SEASON_DAYS", 90))
 MR_SERIES = _env_set("IMM_VERCEL_MR_SERIES", "KXMOONVSPEND")
 MR_TRAIL_DAYS = int(_env_float("IMM_VERCEL_MR_TRAIL_DAYS", 7))
@@ -242,10 +273,10 @@ def measured_day(event_ticker: str) -> Optional[date]:
         return None
     seg, series = parts[1], parts[0]
     try:
-        if series == OPEN_SERIES:
+        if series in LEGACY_D1_SERIES:
             d = date(2000 + int(seg[:2]), _MON[seg[2:5]], int(seg[5:7]))
             return d - timedelta(days=1)
-        if series in LAB_SERIES:
+        if series in LAB_SERIES or series in OPEN_SPECS:
             return date(2000 + int(seg[5:7]), _MON[seg[2:5]], int(seg[:2]))
     except (KeyError, ValueError):
         return None
@@ -253,7 +284,7 @@ def measured_day(event_ticker: str) -> Optional[date]:
 
 
 def event_ticker_for(series: str, d: date) -> str:
-    if series == OPEN_SERIES:
+    if series in LEGACY_D1_SERIES:
         e = d + timedelta(days=1)
         return f"{series}-{e.year % 100:02d}{_MON_NAMES[e.month]}{e.day:02d}"
     return f"{series}-{d.day:02d}{_MON_NAMES[d.month]}{d.year % 100:02d}"
@@ -305,10 +336,12 @@ def fetch_labs(now: Optional[datetime] = None, timeout: float = 30,
 
 
 def fetch_weight_class(now: Optional[datetime] = None, timeout: float = 30,
-                       days_back: Optional[int] = None) -> Dict[str, float]:
-    """{date: Open Weights % of TOKENS} from Vercel's weight-class chart over
-    fetch_labs' window, today's RUNNING day included (served max-age=0, so
-    no cache-busting `to` is needed)."""
+                       days_back: Optional[int] = None,
+                       metric: str = "tokens") -> Dict[str, float]:
+    """{date: Open Weights % of `metric` (tokens; cost = spend; requests)}
+    from Vercel's weight-class chart over fetch_labs' window, today's
+    RUNNING day included (served max-age=0, so no cache-busting `to` is
+    needed)."""
     now = now or datetime.now(timezone.utc)
     today = now.date()
     back = max(HISTORY_DAYS, SEASON_DAYS) + 10 if days_back is None else days_back
@@ -319,7 +352,7 @@ def fetch_weight_class(now: Optional[datetime] = None, timeout: float = 30,
     body = r.json()
     out: Dict[str, float] = {}
     for x in (body.get("data") if isinstance(body, dict) else body) or []:
-        if not isinstance(x, dict) or x.get("metric") != "tokens":
+        if not isinstance(x, dict) or x.get("metric") != metric:
             continue
         try:
             v = {str(k): float(s) for k, s in x["chef_values"]}
@@ -328,7 +361,7 @@ def fetch_weight_class(now: Optional[datetime] = None, timeout: float = 30,
         except (KeyError, TypeError, ValueError, ZeroDivisionError):
             continue
     if not out:
-        raise RuntimeError("Vercel weight-class chart returned no token rows")
+        raise RuntimeError(f"Vercel weight-class chart returned no {metric} rows")
     return out
 
 
@@ -357,47 +390,90 @@ def fetch_table(now: Optional[datetime] = None, timeout: float = 30
     return out
 
 
+def chart_key(metric: str) -> Tuple[str, str]:
+    """fetch_table's key of the chart's `metric` (CHART_KEY = tokens)."""
+    return (CHART_KEY[0], metric)
+
+
+def _chart_read(now: datetime, timeout: float, days_back: Optional[int],
+                metric: str) -> Dict[str, float]:
+    if metric == "tokens":
+        return fetch_weight_class(now, timeout, days_back=days_back)
+    return fetch_weight_class(now, timeout, days_back=days_back, metric=metric)
+
+
 def _add_chart(out: dict, now: datetime, timeout: float) -> None:
-    """The weight-class chart into `out` under CHART_KEY: its full window once
-    per history read, then a fresh yesterday + today over it. A failed read
-    leaves the key out, so the open series falls back to the lab sum for that
+    """The weight-class chart into `out` under chart_key(metric), for every
+    metric an open-weights series reads: its full window once per history
+    read, then a fresh yesterday + today over it. A failed read leaves that
+    metric's key out, so its series fall back to the lab sum for that
     refresh (never a chart history beside a lab-sum running day)."""
     if OPEN_SOURCE != "chart":
         _chart_state["source"] = "labs"
+        _chart_state["by_metric"] = {}
         return
-    try:
-        if _hist["chart"] is None:
-            _hist["chart"] = fetch_weight_class(now, timeout)
-            chart = dict(_hist["chart"])
-        else:
-            t_iso = now.date().isoformat()
-            chart = {d: v for d, v in _hist["chart"].items() if d != t_iso}
-            chart.update(fetch_weight_class(now, timeout, days_back=1))
-    except Exception as e:                        # noqa: BLE001 - the lab sum stands in
-        _chart_state["source"] = f"labs (chart unreadable: {type(e).__name__})"
-        return
-    out[CHART_KEY] = chart
-    _chart_state["source"] = "chart"
+    if not isinstance(_hist.get("chart"), dict) or not all(
+            isinstance(v, dict) for v in _hist["chart"].values()):
+        _hist["chart"] = {}
+    by_metric = {}
+    for metric in sorted(set(OPEN_SPECS.values())):
+        try:
+            if metric not in _hist["chart"]:
+                _hist["chart"][metric] = _chart_read(now, timeout, None, metric)
+                chart = dict(_hist["chart"][metric])
+            else:
+                t_iso = now.date().isoformat()
+                chart = {d: v for d, v in _hist["chart"][metric].items() if d != t_iso}
+                chart.update(_chart_read(now, timeout, 1, metric))
+        except Exception as e:                    # noqa: BLE001 - the lab sum stands in
+            by_metric[metric] = f"labs (chart unreadable: {type(e).__name__})"
+            continue
+        out[chart_key(metric)] = chart
+        by_metric[metric] = "chart"
+    _chart_state["by_metric"] = by_metric
+    _chart_state["source"] = by_metric.get("tokens", "labs")
+
+
+def lab_key(tab, series: str) -> Optional[Tuple[str, str]]:
+    """The export row a lab series reads: its (lab, metric), else the one
+    export lab whose name extends or is extended by the series' lab (a
+    title's "Mistral" for the export's "mistralai"), else None."""
+    lab, met = LAB_SERIES[series]
+    if (lab, met) in tab:
+        return (lab, met)
+    hits = {k for k in tab if isinstance(k, tuple) and len(k) == 2 and k[1] == met
+            and k[0] != CHART_KEY[0] and (k[0].startswith(lab) or lab.startswith(k[0]))}
+    return hits.pop() if len(hits) == 1 else None
 
 
 def series_values(tab, series: str, dates: List[str]) -> Dict[str, float]:
     if series in LAB_SERIES:
-        v = tab.get(LAB_SERIES[series], {})
+        v = tab.get(lab_key(tab, series) or LAB_SERIES[series], {})
         return {d: v.get(d, 0.0) for d in dates}
-    if open_source_of(tab, dates) == "chart":
-        return {d: tab[CHART_KEY][d] for d in dates}
-    return {d: sum(tab.get((lab, "tokens"), {}).get(d, 0.0) for lab in OPEN_WEIGHT_LABS)
+    metric = OPEN_SPECS.get(series, "tokens")
+    if open_source_of(tab, dates, metric) == "chart":
+        return {d: tab[chart_key(metric)][d] for d in dates}
+    lab_met = LAB_METRIC_OF[metric]
+    return {d: sum(tab.get((lab, lab_met), {}).get(d, 0.0) for lab in OPEN_WEIGHT_LABS)
             for d in dates}
 
 
-def open_source_of(tab, dates: List[str]) -> str:
-    """What series_values reads for the open series on `dates`: "chart" when
-    the chart has every one of them, else the lab sum and why."""
-    chart = tab.get(CHART_KEY)
+def series_has_data(tab, series: str) -> bool:
+    """A lab series whose export row exists (an open series always has its
+    lab sum)."""
+    return series not in LAB_SERIES or lab_key(tab, series) is not None
+
+
+def open_source_of(tab, dates: List[str], metric: str = "tokens") -> str:
+    """What series_values reads for an open series of the chart's `metric`
+    on `dates`: "chart" when the chart has every one of them, else the lab
+    sum and why."""
+    chart = tab.get(chart_key(metric))
     if chart:
         miss = sum(1 for d in dates if d not in chart)
         return "chart" if not miss else f"labs (the chart lacks {miss} of the days)"
-    src = _chart_state["source"]
+    src = (_chart_state.get("by_metric") or {}).get(metric) or (
+        _chart_state["source"] if metric == "tokens" else "labs")
     return src if src.startswith("labs (") else "labs"
 
 
@@ -411,8 +487,9 @@ def block_series(block: dict) -> Dict[str, float]:
     """A logger block {"lab|metric": share} -> {series: value}."""
     out = {s: float(block.get(f"{lab}|{met}") or 0.0)
            for s, (lab, met) in LAB_SERIES.items()}
-    out[OPEN_SERIES] = sum(float(block.get(f"{lab}|tokens") or 0.0)
-                           for lab in OPEN_WEIGHT_LABS)
+    for s, metric in OPEN_SPECS.items():
+        out[s] = sum(float(block.get(f"{lab}|{LAB_METRIC_OF[metric]}") or 0.0)
+                     for lab in OPEN_WEIGHT_LABS)
     return out
 
 
@@ -471,7 +548,7 @@ def parse_logger_day(path: str, day: date, want_run: bool = True) -> dict:
 
 
 def _parsed(path: str, day: date, want_run: bool) -> dict:
-    key = (path, want_run)
+    key = (path, want_run, _registry["version"])
     mtime = os.path.getmtime(path)
     hit = _parsed_files.get(key)
     if hit is not None and hit[0] == mtime:
@@ -696,6 +773,101 @@ def p_yes(entry: dict, k: float) -> float:
     return min(max(hit / len(errs), 0.01), 0.99)
 
 
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def spec_of(series_obj: dict) -> Optional[tuple]:
+    """A Kalshi series object -> ("lab", lab, metric) / ("open", chart metric)
+    when a settlement source is a Vercel AI Gateway leaderboard it can price,
+    else None."""
+    if not isinstance(series_obj, dict):
+        return None
+    urls = [str((src or {}).get("url") or "")
+            for src in series_obj.get("settlement_sources") or []
+            if isinstance(src, dict)]
+    urls = [u for u in urls if LEADERBOARD_URL in u.lower()]
+    if not urls:
+        return None
+    url, title = urls[0].lower(), str(series_obj.get("title") or "")
+    if "/leaderboards/labs" in url:
+        m = _LAB_TITLE_RE.match(title)
+        if not m or not _norm(m.group(1)):
+            return None
+        return ("lab", _norm(m.group(1)), m.group(2).lower())
+    if "group=weights" in url or "weights=open" in url:
+        metric = _OPEN_ANCHOR_METRIC.get(url.split("#", 1)[1] if "#" in url else "")
+        if metric is None:
+            t = title.lower()
+            metric = ("cost" if "spend" in t else "requests" if "request" in t
+                      else "tokens" if "token" in t or "market share" in t else None)
+        return ("open", metric) if metric else None
+    return None
+
+
+def discover(get_json, categories=("Science and Technology",)) -> Dict[str, tuple]:
+    """{series: spec} over Kalshi's series list in `categories`
+    (get_json(path, params) -> the response body); raises on a failed read."""
+    out: Dict[str, tuple] = {}
+    for cat in categories:
+        cursor = None
+        for _ in range(50):
+            params = {"category": cat}
+            if cursor:
+                params["cursor"] = cursor
+            body = get_json("/series", params) or {}
+            for so in body.get("series") or []:
+                sp = spec_of(so)
+                if sp and so.get("ticker"):
+                    out[str(so["ticker"])] = sp
+            cursor = body.get("cursor") or body.get("next_cursor")
+            if not cursor:
+                break
+    return out
+
+
+def register(specs: Dict[str, tuple]) -> List[str]:
+    """Add discovered specs to the family (the base eight keep theirs);
+    returns the series added."""
+    global ALL_SERIES, DOW_SERIES
+    new = []
+    for s, sp in sorted((specs or {}).items()):
+        if s in LAB_SERIES or s in OPEN_SPECS or not sp:
+            continue
+        if sp[0] == "lab" and len(sp) == 3 and sp[2] in ("spend", "requests", "tokens"):
+            LAB_SERIES[s] = (str(sp[1]), str(sp[2]))
+        elif sp[0] == "open" and len(sp) == 2 and sp[1] in CHART_METRICS:
+            OPEN_SPECS[s] = str(sp[1])
+        else:
+            continue
+        new.append(s)
+    if new:
+        ALL_SERIES = tuple(LAB_SERIES) + tuple(OPEN_SPECS)
+        if DOW_ALL:
+            DOW_SERIES = DOW_SERIES | frozenset(new)
+        _registry["version"] += 1
+    return new
+
+
+def save_specs(path: str, specs: Dict[str, tuple], at: Optional[datetime] = None) -> None:
+    data = {"at": (at or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
+            "series": {s: list(sp) for s, sp in sorted(specs.items())}}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def load_specs(path: str) -> Dict[str, tuple]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+    return {str(s): tuple(sp) for s, sp in (data.get("series") or {}).items()
+            if isinstance(sp, list) and sp}
+
+
 def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
                     calib: Optional[Dict[str, dict]] = None) -> Tuple[int, int, str]:
     """Write VERCEL_FAIR_FILE; returns (entries written, series without one,
@@ -731,7 +903,10 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
     for s in ALL_SERIES:
         xv = series_values(tab, s, want)
         x = {d: xv[d] for d in dates}
-        widen = OPEN_WIDEN if s == OPEN_SERIES else LAB_WIDEN
+        if not series_has_data(tab, s):
+            missing += 1
+            continue
+        widen = OPEN_WIDEN if s in OPEN_SPECS else LAB_WIDEN
         run_val = xv[t_iso] if mode == "run" else None
         got = 0
         for k in range(1, HORIZON_DAYS + 1):
@@ -765,6 +940,11 @@ def write_fair_file(path: str, now: Optional[datetime] = None, tab=None,
                       "log_series": sorted(LOG_SERIES)},
             "anchor": {"mode": mode, "tau_min": round(tau, 1),
                        "open_source": open_source_of(tab, want),
+                       "open_sources": {s: open_source_of(tab, want, m)
+                                        for s, m in sorted(OPEN_SPECS.items())},
+                       "series": {s: (list(LAB_SERIES[s]) if s in LAB_SERIES
+                                      else ["open", OPEN_SPECS[s]])
+                                  for s in ALL_SERIES},
                        "rows_today": n_today, "rows_last": n_last,
                        "calib_days": sorted(calib) if calib else [],
                        "delta_n": {s: len(v) for s, v in deltas.items()}},

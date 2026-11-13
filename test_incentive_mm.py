@@ -176,6 +176,7 @@ def setUpModule():
     imm.EVENT_OVERRIDES_FILE = os.path.join(tmp, "event_start_overrides.json")
     imm.EXTRA_ALLOW_FILE = os.path.join(tmp, "extra_allow_series.json")
     imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
+    imm.VERCEL_SERIES_FILE = os.path.join(tmp, "vercel_series.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -44669,3 +44670,59 @@ class TestCarbonArcTikTokShop(unittest.TestCase):
     def test_a_non_carbon_arc_tts_name_stays_out(self):
         self._verdicts("KXNOTCATTS", carbon_arc=False)
         self.assertFalse(IncentiveMarketMaker._allowed("KXNOTCATTS-26DEC06-T1"))
+
+
+class TestVercelDiscovery(unittest.TestCase):
+    """Jack 2026-11-13: "let the vercel family be more generalized than a
+    fixed list, so it automatically picks up stuff like this" (KXOSSPEND)."""
+
+    NEW = ("KXOSSPEND", "KXZAIVREQ")
+
+    def setUp(self):
+        self.saved_only = imm.ALLOWLIST_ONLY
+        imm.ALLOWLIST_ONLY = True
+        imm._vercel_series_state["mtime"] = 0.0
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self.saved_only
+        for s in self.NEW + ("KXHIGHVREQ",):
+            imm.VERCEL_SERIES.discard(s)
+            imm.SERIES_OVERRIDES.pop(s, None)
+        imm._vercel_series_state["mtime"] = 0.0
+        try:
+            os.remove(imm.VERCEL_SERIES_FILE)
+        except OSError:
+            pass
+
+    def _write(self, series):
+        with open(imm.VERCEL_SERIES_FILE, "w", encoding="utf-8") as f:
+            json.dump({"series": series}, f)
+
+    def test_a_discovered_series_joins_the_family(self):
+        for s in self.NEW:
+            self.assertFalse(imm.vercel_series(s))
+            self.assertFalse(IncentiveMarketMaker._allowed(f"{s}-16NOV26-T27P3"))
+        self._write({"KXOSSPEND": ["open", "cost"], "KXZAIVREQ": ["lab", "zai", "requests"],
+                     "KXOPENVREQ": ["lab", "openai", "requests"],
+                     "KXHIGHVREQ": ["lab", "high", "requests"]})        # blocklisted
+        with mock.patch.object(imm, "log"):
+            self.assertEqual(imm.load_vercel_series(), 2)
+            self.assertEqual(imm.load_vercel_series(), 0)               # mtime-gated
+        self.assertFalse(imm.vercel_series("KXHIGHVREQ"))
+        for s in self.NEW:
+            self.assertTrue(imm.vercel_series(s))
+            self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-16NOV26-T27P3"))
+            self.assertTrue(imm.in_fair_lead_series(s))
+            ov = imm.SERIES_OVERRIDES[s]
+            self.assertEqual(ov.size_mult, imm.VERCEL_SIZE_MULT)
+            self.assertEqual(ov.cutoff_from_close_min, 0)
+            self.assertTrue(ov.safe_join)
+        # D = the ticker's DDMMMYY: out at 23:00Z the day before
+        self.assertEqual(imm.vercel_measured_day("KXOSSPEND-16NOV26"),
+                         datetime(2026, 11, 16, tzinfo=timezone.utc))
+
+    def test_the_kill_switch_keeps_the_base_list(self):
+        self._write({"KXOSSPEND": ["open", "cost"]})
+        with mock.patch.object(imm, "VERCEL_DISCOVER", False):
+            self.assertEqual(imm.load_vercel_series(), 0)
+        self.assertFalse(imm.vercel_series("KXOSSPEND"))

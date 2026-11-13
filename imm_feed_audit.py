@@ -120,6 +120,10 @@ def run_audit(client=None, progs=None) -> dict:
     # (rain_wknd_fair.json's "day_series", 2026-10-31): the bot allows them
     if hasattr(imm, "load_rain_wknd"):
         imm.load_rain_wknd()
+    # ...and the Vercel family's discovered series (vercel_series.json,
+    # 2026-11-13): the bot enrolls them from the file at every refresh
+    if hasattr(imm, "load_vercel_series"):
+        imm.load_vercel_series()
     # ...and the central-bank family (FINECON_SERIES_PREFIXES, "KXCBD"),
     # which the bot admits from the live programs feed at every refresh
     # (finecon_expand_family, in memory only). Without it every bank past

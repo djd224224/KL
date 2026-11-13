@@ -461,6 +461,9 @@ def classify_and_estimate(client, bot, now_utc: datetime):
     # ...and the finecon group's file (2026-11-01): without it the nine Carbon
     # Arc arrays the family watch enrolled there read "not in allowlist"
     imm.load_finecon_extra_series()
+    # ...and the Vercel family's discovered series (2026-11-13)
+    if hasattr(imm, "load_vercel_series"):
+        imm.load_vercel_series()
     imm.load_rain_fair()
     if hasattr(imm, "load_astest_picks"):
         imm.load_astest_picks()

@@ -19386,8 +19386,13 @@ def treasury_gate_reason(series: str, ticker: str, now_ts: float,
 # cutoff). Safe-join placement. Kill switch IMM_VERCEL_ENABLE=0 takes the
 # family out of the allowlist entirely.
 VERCEL_ENABLE = _VERCEL_LIVE
-VERCEL_SERIES = frozenset(s.strip() for s in os.environ.get(
+# MUTABLE since 2026-11-13 (see VERCEL_DISCOVER): the base list plus every
+# Vercel-leaderboard series the refresher discovers on Kalshi.
+VERCEL_SERIES: Set[str] = set(s.strip() for s in os.environ.get(
     "IMM_VERCEL_SERIES", _DEFAULT_VERCEL_SERIES).split(",") if s.strip())
+# the list itself: a discovered series leads while the family's base does
+# (in_fair_lead_series), as the rain-day series follow KXRAINWKND
+VERCEL_BASE_SERIES = frozenset(VERCEL_SERIES)
 VERCEL_CUTOFF_BEFORE_D_MIN = _env_int("IMM_VERCEL_CUTOFF_BEFORE_D_MIN", 60)
 VERCEL_FAIR_TOL_CENTS = _env_int("IMM_VERCEL_FAIR_TOL_CENTS", 15)
 VERCEL_FAIR_MIN_P = _env_float("IMM_VERCEL_FAIR_MIN_P", 0.05)
@@ -19436,6 +19441,68 @@ VERCEL_SIZE_MULT = _env_float("IMM_VERCEL_SIZE_MULT", 3.0)
 for _s in VERCEL_SERIES:
     SERIES_OVERRIDES[_s] = replace(SERIES_OVERRIDES[_s],
                                    size_mult=VERCEL_SIZE_MULT)
+# THE FAMILY IS DISCOVERED (Jack 2026-11-13: "let the vercel family be more
+# generalized than a fixed list, so it automatically picks up stuff like
+# this", on KXOSSPEND-16NOV26). KXOSSPEND, KXGOOGVSPEND, KXZAIVREQ and
+# KXZAIVSPEND listed 11/13 18:01Z on the same Vercel leaderboards as the
+# eight, but nothing quoted them: the family was the fixed list above and
+# vercel_fair had no spec for them. Now the vercel-fair refresher reads
+# Kalshi's series list (VERCEL_DISCOVER_CATEGORIES) every
+# VERCEL_DISCOVER_SECS, keeps each series whose settlement source is a
+# Vercel AI Gateway leaderboard vercel_fair can price (vercel_fair.spec_of:
+# a lab's spend / requests / tokens share, or the open-weights share of a
+# chart metric), registers it with the fair model and writes
+# VERCEL_SERIES_FILE; load_vercel_series (each refresh, mtime-gated) enrolls
+# it here with the family's whole kit -- the allowlist, the pre-D cutoff,
+# the fair gate, FAIR LEAD, safe-join, x VERCEL_SIZE_MULT. A failed read
+# keeps the last file. IMM_VERCEL_DISCOVER=0 keeps the base list only.
+VERCEL_DISCOVER = os.environ.get("IMM_VERCEL_DISCOVER", "1") == "1"
+VERCEL_DISCOVER_SECS = _env_int("IMM_VERCEL_DISCOVER_SECS", 3600)
+VERCEL_DISCOVER_CATEGORIES: Tuple[str, ...] = tuple(
+    c.strip() for c in os.environ.get(
+        "IMM_VERCEL_DISCOVER_CATEGORIES", "Science and Technology").split(",")
+    if c.strip())
+VERCEL_SERIES_FILE = os.environ.get(
+    "IMM_VERCEL_SERIES_FILE", os.path.join(STATUS_DIR, "vercel_series.json"))
+_vercel_series_state: dict = {"mtime": 0.0}
+
+
+def add_vercel_series(series: str) -> bool:
+    """Enroll a discovered Vercel series with the family's overrides; False
+    for one already in, or blocklisted."""
+    if not series or series in VERCEL_SERIES \
+            or any(series.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES):
+        return False
+    VERCEL_SERIES.add(series)
+    SERIES_OVERRIDES[series] = replace(
+        SERIES_OVERRIDES.get(series) or SeriesOverride(),
+        cutoff_from_close_min=0, safe_join=True, size_mult=VERCEL_SIZE_MULT)
+    return True
+
+
+def load_vercel_series() -> int:
+    """Hot-load VERCEL_SERIES_FILE (the refresher's discoveries) by mtime;
+    returns how many series joined."""
+    if not VERCEL_DISCOVER:
+        return 0
+    try:
+        mtime = os.path.getmtime(VERCEL_SERIES_FILE)
+    except OSError:
+        return 0
+    if mtime == _vercel_series_state["mtime"]:
+        return 0
+    _vercel_series_state["mtime"] = mtime
+    try:
+        with open(VERCEL_SERIES_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! vercel series file unreadable: {e}")
+        return 0
+    added = [s for s in sorted(data.get("series") or {}) if add_vercel_series(str(s))]
+    if added:
+        log(f"[IMM] vercel family: +{len(added)} discovered -> {', '.join(added)} "
+            f"(pre-D gate, fair lead, x{VERCEL_SIZE_MULT:g})")
+    return len(added)
 
 
 def vercel_series(series: str) -> bool:
@@ -25436,11 +25503,13 @@ def in_fair_lead_series(series: str) -> bool:
     """FAIR_LEAD_SERIES, with any rain-day series while the weekend family
     is in it (AUTO DAY SERIES: it takes the weekend family's kit), the
     ARRAY TAIL LEADS arrays (CA_ARRAY_LEAD_SERIES), and the auto-enrolled
-    Zillow series while the hand-named ones lead (HOME_AUTO_LEAD)."""
+    Zillow series while the hand-named ones lead (HOME_AUTO_LEAD), and the
+    discovered Vercel series while the family's base leads."""
     return series in FAIR_LEAD_SERIES or (
         "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series)) \
         or ca_array_lead_series(series) \
-        or (HOME_AUTO_LEAD and home_auto_allowed(series))
+        or (HOME_AUTO_LEAD and home_auto_allowed(series)) \
+        or (vercel_series(series) and any(s in FAIR_LEAD_SERIES for s in VERCEL_BASE_SERIES))
 
 
 def fair_close_series(series: str) -> bool:
@@ -32981,7 +33050,7 @@ class IncentiveMarketMaker:
         # ALLOW_SERIES merge): task-appended Carbon Arc extensions must
         # be allowed the same refresh they join the group.
         return series in ALLOW_SERIES or series in EXTRA_ALLOW_SERIES or \
-            series in FINECON_SERIES or \
+            series in FINECON_SERIES or vercel_series(series) or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             family_series_allowed(series) or \
             series_pattern_allowed(series) or \
@@ -33293,6 +33362,7 @@ class IncentiveMarketMaker:
         load_extra_allow_series()
         load_astest_picks(now_utc)    # the AS test's daily picks (2026-10-27)
         load_finecon_extra_series()
+        load_vercel_series()          # discovered Vercel series (2026-11-13)
         load_election_extra_series()
         load_pvd_markets()            # post-vote dead books (2026-11-04)
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
@@ -43835,9 +43905,38 @@ class IncentiveMarketMaker:
                     log(f"{self.tag} ! vercel-fair refresher disabled: {e}")
                     return
                 last = None
+                reader = SignedKalshiGet()
+                discovered_at = [0.0]
+
+                def _discover():
+                    # the family's discovery (2026-11-13): the series list
+                    # every VERCEL_DISCOVER_SECS; a failed read registers
+                    # the last file's specs, so a restart still prices them
+                    if not VERCEL_DISCOVER or \
+                            time.time() - discovered_at[0] < VERCEL_DISCOVER_SECS:
+                        return
+                    discovered_at[0] = time.time()
+                    try:
+                        specs = vercel_fair.discover(reader, VERCEL_DISCOVER_CATEGORIES)
+                    except Exception as e:
+                        log(f"{self.tag} ! vercel discovery failed: "
+                            f"{type(e).__name__}: {str(e)[:120]}")
+                        specs = vercel_fair.load_specs(VERCEL_SERIES_FILE)
+                        discovered_at[0] -= VERCEL_DISCOVER_SECS - 600
+                    else:
+                        if specs and specs != vercel_fair.load_specs(VERCEL_SERIES_FILE):
+                            vercel_fair.save_specs(VERCEL_SERIES_FILE, specs)
+                    specs = {s: sp for s, sp in specs.items()
+                             if not any(s.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES)}
+                    new = vercel_fair.register(specs)
+                    if new:
+                        log(f"{self.tag} vercel discovery: priced "
+                            + ", ".join(f"{s} {'/'.join(map(str, specs[s][1:]))}"
+                                        for s in new))
                 while True:
                     delay = max(120, VERCEL_FAIR_REFRESH_SECS)
                     try:
+                        _discover()
                         ok, miss, mode = vercel_fair.write_fair_file(
                             VERCEL_FAIR_FILE)
                         if last != (ok, miss, mode):

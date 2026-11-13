@@ -645,5 +645,113 @@ class TestWeightClassChart(unittest.TestCase):
         self.assertEqual(out["chart"]["anchor"]["rows_last"], out["labs"]["anchor"]["rows_last"])
 
 
+class TestDiscovery(unittest.TestCase):
+    """Jack 2026-11-13: "let the vercel family be more generalized than a
+    fixed list, so it automatically picks up stuff like this" (KXOSSPEND)."""
+
+    LABS_URL = "https://vercel.com/ai-gateway/leaderboards/labs"
+    OPEN_URL = ("https://vercel.com/ai-gateway/leaderboards/models?weights=open"
+                "&range=2m&group=weights#")
+
+    def setUp(self):
+        saved = (dict(vf.LAB_SERIES), dict(vf.OPEN_SPECS), vf.ALL_SERIES, vf.DOW_SERIES)
+
+        def restore():
+            vf.LAB_SERIES.clear(); vf.LAB_SERIES.update(saved[0])
+            vf.OPEN_SPECS.clear(); vf.OPEN_SPECS.update(saved[1])
+            vf.ALL_SERIES, vf.DOW_SERIES = saved[2], saved[3]
+        self.addCleanup(restore)
+        self.addCleanup(vf._chart_state.update, source="labs", by_metric={})
+
+    def obj(self, ticker, title, url):
+        return {"ticker": ticker, "title": title,
+                "settlement_sources": [{"name": "Vercel AI Gateway Leaderboards", "url": url}]}
+
+    def test_spec_of_reads_the_source_and_title(self):
+        self.assertEqual(vf.spec_of(self.obj("KXZAIVREQ", "Z.AI Vercel requests share",
+                                             self.LABS_URL)), ("lab", "zai", "requests"))
+        self.assertEqual(vf.spec_of(self.obj("KXMOONVSPEND", "Moonshot AI Vercel spend share",
+                                             self.LABS_URL)), ("lab", "moonshotai", "spend"))
+        self.assertEqual(vf.spec_of(self.obj("KXOSSPEND", "Open source share of spend",
+                                             self.OPEN_URL + "spend")), ("open", "cost"))
+        self.assertEqual(vf.spec_of(self.obj("KXOPENSOURCESHARE", "Open weights AI market share",
+                                             self.OPEN_URL + "open-vs-closed")), ("open", "tokens"))
+        # not Vercel, or a Vercel page it cannot price
+        self.assertIsNone(vf.spec_of(self.obj("KXFOO", "Foo", "https://example.com/labs")))
+        self.assertIsNone(vf.spec_of(self.obj("KXFOO", "Top model on Vercel",
+                                              "https://vercel.com/ai-gateway/leaderboards/models")))
+        self.assertIsNone(vf.spec_of(self.obj("KXFOO", "Something else", self.LABS_URL)))
+
+    def test_discover_and_register(self):
+        pages = [{"series": [self.obj("KXZAIVREQ", "Z.AI Vercel requests share", self.LABS_URL),
+                             self.obj("KXOPENVREQ", "OpenAI Vercel requests share", self.LABS_URL),
+                             {"ticker": "KXFED", "title": "Fed", "settlement_sources": []}],
+                  "cursor": "c2"},
+                 {"series": [self.obj("KXOSSPEND", "Open source share of spend",
+                                      self.OPEN_URL + "spend")]}]
+        calls = []
+
+        def get_json(path, params):
+            calls.append((path, dict(params)))
+            return pages[len(calls) - 1]
+        specs = vf.discover(get_json)
+        self.assertEqual(calls[1][1], {"category": "Science and Technology", "cursor": "c2"})
+        self.assertEqual(sorted(specs), ["KXOPENVREQ", "KXOSSPEND", "KXZAIVREQ"])
+        self.assertEqual(vf.register(specs), ["KXOSSPEND", "KXZAIVREQ"])   # base kept
+        self.assertEqual(vf.LAB_SERIES["KXZAIVREQ"], ("zai", "requests"))
+        self.assertEqual(vf.OPEN_SPECS["KXOSSPEND"], "cost")
+        self.assertIn("KXOSSPEND", vf.ALL_SERIES)
+        self.assertIn("KXZAIVREQ", vf.DOW_SERIES)
+        self.assertEqual(vf.register(specs), [])
+        # its ticker dates D as DDMMMYY (only KXOPENSOURCESHARE is D + 1)
+        self.assertEqual(vf.measured_day("KXOSSPEND-16NOV26"), date(2026, 11, 16))
+        self.assertEqual(vf.event_ticker_for("KXOSSPEND", date(2026, 11, 16)), "KXOSSPEND-16NOV26")
+        # specs survive a file round trip
+        path = os.path.join(tempfile.mkdtemp(), "vs.json")
+        vf.save_specs(path, specs)
+        self.assertEqual(vf.load_specs(path), specs)
+        self.assertEqual(vf.load_specs(path + ".missing"), {})
+
+    def test_the_open_spend_series_reads_the_cost_chart_or_the_spend_lab_sum(self):
+        vf.register({"KXOSSPEND": ("open", "cost")})
+        tab = {("deepseek", "spend"): {"2026-11-12": 20.0, "2026-11-13": 21.0},
+               ("zai", "spend"): {"2026-11-12": 15.0, "2026-11-13": 13.0},
+               ("deepseek", "tokens"): {"2026-11-12": 50.0, "2026-11-13": 50.0},
+               vf.chart_key("cost"): {"2026-11-12": 37.0, "2026-11-13": 34.0}}
+        both = ["2026-11-12", "2026-11-13"]
+        self.assertEqual(vf.series_values(tab, "KXOSSPEND", both),
+                         {"2026-11-12": 37.0, "2026-11-13": 34.0})
+        del tab[vf.chart_key("cost")]
+        self.assertEqual(vf.series_values(tab, "KXOSSPEND", both),
+                         {"2026-11-12": 35.0, "2026-11-13": 34.0})
+        # the logger's running block: the spend lab sum
+        self.assertEqual(vf.block_series({"deepseek|spend": 20.0, "zai|spend": 13.0,
+                                          "deepseek|tokens": 50.0})["KXOSSPEND"], 33.0)
+
+    def test_a_lab_named_differently_in_the_export_still_reads(self):
+        vf.register({"KXMISTVREQ": ("lab", "mistral", "requests")})
+        tab = {("mistralai", "requests"): {"2026-11-12": 2.0}}
+        self.assertEqual(vf.series_values(tab, "KXMISTVREQ", ["2026-11-12"]), {"2026-11-12": 2.0})
+        self.assertTrue(vf.series_has_data(tab, "KXMISTVREQ"))
+        self.assertFalse(vf.series_has_data({}, "KXMISTVREQ"))
+
+    def test_write_fair_file_prices_a_discovered_series(self):
+        vf.register({"KXZAIVSPEND": ("lab", "zai", "spend"), "KXOSSPEND": ("open", "cost")})
+        tab = {}
+        for lab, met in list(vf.LAB_SERIES.values()) + [("deepseek", "spend")]:
+            tab.update(history((lab, met), 80, start=date(2026, 7, 10), base=20.0,
+                               step=lambda i: (i % 5) * 0.3))
+        tab[vf.chart_key("cost")] = {d: v + 10.0 for d, v in tab[("deepseek", "spend")].items()}
+        now = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)
+        path = os.path.join(tempfile.mkdtemp(), "vf.json")
+        with mock.patch.object(vf, "RUN_ANCHOR", False):
+            vf.write_fair_file(path, now=now, tab=tab)
+        data = json.load(open(path, encoding="utf-8"))
+        self.assertIn("KXZAIVSPEND-28SEP26", data["entries"])
+        self.assertIn("KXOSSPEND-28SEP26", data["entries"])
+        self.assertEqual(data["anchor"]["open_sources"]["KXOSSPEND"], "chart")
+        self.assertEqual(data["anchor"]["series"]["KXOSSPEND"], ["open", "cost"])
+
+
 if __name__ == "__main__":
     unittest.main()
