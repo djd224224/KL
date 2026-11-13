@@ -100,7 +100,8 @@ def clear_files():
         if os.path.exists(p):
             os.remove(p)
     for name in os.listdir(imm.STATUS_DIR):
-        if name.startswith(("imm_new_programs_sent_", "selection_snapshot_")):
+        if name.startswith(("imm_new_programs_sent_", "selection_snapshot_",
+                            "guard_skips_")):
             os.remove(os.path.join(imm.STATUS_DIR, name))
     gaps_cache = getattr(np.gaps, "_TITLE_CACHE", None)
     if isinstance(gaps_cache, dict):
@@ -624,6 +625,18 @@ def snap(ticker, est_day, proj, decision="selected"):
             "projected_total": proj, "decision": decision}
 
 
+def guard(kind, ts, ticker=None, g=None, **kw):
+    """One guard_skips row, written as incentive_mm._flush_guard_skips does
+    (ts, kind, ticker first; one UTC-day file)."""
+    row = {"ts": ts.isoformat(), "kind": kind}
+    if kind != "cycle":
+        row.update({"ticker": ticker, "prev": None, "guard": g, "inputs": {}})
+    row.update(kw)
+    path = os.path.join(imm.STATUS_DIR, f"guard_skips_{ts:%Y-%m-%d}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+
 class TopTable(unittest.TestCase):
     """Jack 2026-10-25: "show a table at the top, of new events in the past
     day, which are quoting, what fraction of the markets within an event are
@@ -654,7 +667,7 @@ class TopTable(unittest.TestCase):
         out = np.quote_summary(rec, {"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"}, est)
         self.assertEqual(out, {"n_quoted": 2, "est_day": 4.0, "est_total": 7.0,
                                "est_missing": 0, "n_ever": 2, "est_earned": 0.0,
-                               "last_quoted": None})
+                               "last_quoted": None, "n_held": 0, "held_guards": []})
 
     def test_table_is_at_the_top_with_quoting_events_first(self):
         write_state({"KXQ-26SEP20-T1", "KXQ-26SEP20-T2"})
@@ -761,6 +774,121 @@ class TopTable(unittest.TestCase):
         top_html = html.split("PROGRAM WINDOW (ET)", 1)[0]
         self.assertIn("Q-26SEP20", top_html)
         self.assertIn("N-26SEP20", top_html)
+
+
+class GateHolds(unittest.TestCase):
+    """Jack 2026-11-13: "daily new incentive program said
+    KXLOWTPERIOD-26NOV15PVD, KXLOWTPERIOD-26NOV15BOS are quoted but they
+    arent" -- selected from their listing while the low-temp fair gate held
+    every strike. A market a gate holds is not quoting, now or in the
+    history."""
+
+    T1, T2, T3 = "KXQ-26SEP20-T1", "KXQ-26SEP20-T2", "KXQ-26SEP20-T3"
+
+    def setUp(self):
+        clear_files()
+
+    def tearDown(self):
+        clear_files()
+
+    def _rows(self):
+        return TopTable._rows(self)
+
+    def _holds(self, since=NOW - timedelta(hours=24)):
+        return np.load_guard_holds({self.T1, self.T2, self.T3}, since, NOW)
+
+    def test_replay_enter_clear_and_a_guard_change(self):
+        h = NOW - timedelta(hours=5)
+        guard("enter", h, self.T1, "lowt_fair")
+        guard("enter", h + timedelta(hours=1), self.T1, "move_breaker", prev="lowt_fair")
+        guard("clear", h + timedelta(hours=2), self.T1, None, prev="move_breaker")
+        guard("enter", h + timedelta(hours=3), self.T2, "lowt_fair")
+        guard("enter", h, "KXOTHER-26SEP20-T1", "lowt_fair")           # not asked for
+        guard("enter", NOW + timedelta(minutes=5), self.T3, "lowt_fair")  # after now
+        holds = self._holds()
+        self.assertEqual(holds[self.T1], [[h, h + timedelta(hours=2), "move_breaker"]])
+        self.assertEqual(holds[self.T2], [[h + timedelta(hours=3), None, "lowt_fair"]])
+        self.assertNotIn(self.T3, holds)
+        self.assertNotIn("KXOTHER-26SEP20-T1", holds)
+        self.assertEqual(np.held_now(holds, {self.T1, self.T2}), {self.T2: "lowt_fair"})
+        self.assertEqual(np.held_now(holds, {self.T1}), {})            # not selected
+
+    def test_the_hourly_snapshot_restates_the_holds_across_a_restart(self):
+        h = NOW - timedelta(hours=5)
+        guard("enter", h, self.T1, "lowt_fair")
+        guard("enter", h, self.T2, "lowt_fair")
+        # restart: the new process logs nothing for T1 (no longer held) but
+        # its first cycle snapshots T2 and a hold that predates this file
+        s = h + timedelta(hours=1)
+        guard("snapshot", s, self.T2, "lowt_fair")
+        guard("snapshot", s, self.T3, "rain_fair")
+        guard("cycle", s, n_managed=10, counts={"lowt_fair": 1, "rain_fair": 1})
+        holds = self._holds()
+        self.assertEqual(holds[self.T1], [[h, s, "lowt_fair"]])
+        self.assertEqual(holds[self.T2], [[h, None, "lowt_fair"]])
+        self.assertEqual(holds[self.T3], [[s, None, "rain_fair"]])
+
+    def test_no_guard_log_leaves_selection_alone(self):
+        self.assertEqual(self._holds(), {})
+
+    def test_bot_cell(self):
+        rec = BotColumn._rec(self, tickers=(self.T1, self.T2))
+        res = imm.EventStartResolver()
+        held = {self.T1: "lowt_fair", self.T2: "lowt_fair"}
+        self.assertEqual(np.bot_status(rec, set(), res, NOW, held),
+                         "selected, gate holds 2/2 (lowt_fair)")
+        self.assertEqual(np.bot_status(rec, {self.T2}, res, NOW, {self.T1: "move_breaker"}),
+                         "quoting 1/2, gate holds 1 (move_breaker)")
+
+    def test_held_time_is_not_quoted_time(self):
+        write_snapshot([snap(self.T1, 2.4, 1.0), snap(self.T2, 2.4, 1.0)],
+                       ts=NOW - timedelta(hours=3))
+        write_snapshot([snap(self.T1, 0.0, 0.0, "cutoff"),
+                        snap(self.T2, 0.0, 0.0, "cutoff")],
+                       ts=NOW - timedelta(hours=2))
+        # T1 held the whole hour; T2 for its first half
+        guard("enter", NOW - timedelta(hours=4), self.T1, "lowt_fair")
+        guard("enter", NOW - timedelta(hours=3), self.T2, "lowt_fair")
+        guard("clear", NOW - timedelta(hours=2, minutes=30), self.T2, None)
+        holds = self._holds()
+        hist = np.load_quote_history([{"tickers": {self.T1, self.T2}}],
+                                     NOW - timedelta(hours=24), NOW, holds)
+        self.assertEqual(hist[self.T1], (False, 0.0, None))
+        ever, earned, last = hist[self.T2]
+        self.assertTrue(ever)
+        self.assertAlmostEqual(earned, 2.4 * 0.5 / 24)
+        self.assertEqual(last, NOW - timedelta(hours=2))
+
+    def test_the_email_names_the_gate_instead_of_quoting(self):
+        write_state({self.T1, self.T2})
+        write_snapshot([snap(self.T1, 2.5, 4.0), snap(self.T2, 1.5, 3.0)])
+        for t in (self.T1, self.T2):
+            guard("enter", NOW - timedelta(hours=1, minutes=50), t, "lowt_fair")
+        text, html, *_rest = run_report(self._rows())
+        self.assertIn("already quoting: 0 event(s)", text)
+        self.assertIn("selected but a gate holds every quote: 1 event(s), "
+                      "$27.69/day (lowt_fair)", text)          # $30 over 26h
+        top = text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1]
+        line = TopTable._line(self, top, "Q-26SEP20")
+        for cell in ("0/3 0%", "selected, gate holds 2/3 (lowt_fair)"):
+            self.assertIn(cell, line)
+        self.assertNotIn("4.00", line)                     # no estimate while dark
+        self.assertIn("0 quoting, 1 gate-held", TopTable._line(self, top, "TOTAL"))
+        self.assertIn("selected, gate holds 2/3 (lowt_fair)", html)
+        text.encode("ascii")
+
+    def test_one_held_market_leaves_the_rest_quoting(self):
+        write_state({self.T1, self.T2})
+        write_snapshot([snap(self.T1, 2.5, 4.0), snap(self.T2, 1.5, 3.0)])
+        guard("enter", NOW - timedelta(hours=1, minutes=50), self.T1, "move_breaker")
+        text, html, *_rest = run_report(self._rows())
+        self.assertIn("already quoting: 1 event(s)", text)
+        line = TopTable._line(self, text.split("QUOTING AND ESTIMATED EARNINGS", 1)[1],
+                              "Q-26SEP20")
+        for cell in ("1/3 33%", "1.50", "3.00", "yes"):
+            self.assertIn(cell, line)
+        # the full table's BOT cell (clipped to 22 in the text fallback)
+        self.assertIn("quoting 1/3, gate holds 1 (move_breaker)", html)
 
 
 # ---------------------------------------------------------------------------

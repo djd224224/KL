@@ -85,7 +85,12 @@ GET /trade-api/v2/incentive_programs; `period_reward` is CENTI-CENTS
 (1,000,000 = $100), converted exactly as incentive_mm.fetch_programs does.
 Allowlist verdicts come from the bot's own IncentiveMarketMaker._allowed /
 _blocked with the extra-allow and finecon extension files hot-loaded, and
-"quoting" is selected_tickers from the bot's persisted imm_state.json.
+"quoting" is selected_tickers from the bot's persisted imm_state.json LESS
+the markets a quote-loop gate holds (its guard_skips log replayed: a fair
+gate, a breaker, a blackout -- Jack 2026-11-13, "daily new incentive program
+said KXLOWTPERIOD-26NOV15PVD, KXLOWTPERIOD-26NOV15BOS are quoted but they
+arent": selected from their listing, every strike held "no low-temp fair").
+Those read "selected, gate holds n/N (<guard>)", now and in the history.
 The estimates are the bot's own selection_snapshot rows (every candidate it
 scored, hourly; imm_dashboard.read_last_snapshot reads the file tail only).
 Config parity with the live bot comes from importing imm_quote_gaps FIRST,
@@ -439,9 +444,23 @@ def cutoff_flag(rec: dict, resolver, now: datetime) -> str:
     return ""
 
 
-def bot_status(rec: dict, quoted: set, resolver, now: datetime) -> str:
+def _guard_names(guards) -> str:
+    """"lowt_fair" / "lowt_fair, move_breaker": the guards holding an event's
+    markets, commonest first, at most two named."""
+    c = Counter(guards)
+    names = [g for g, _n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return ", ".join(names[:2]) + (f" +{len(names) - 2}" if len(names) > 2 else "")
+
+
+def bot_status(rec: dict, quoted: set, resolver, now: datetime,
+               held=None) -> str:
     """One cell: ALLOWLIST policy plus whether the bot is already quoting the
     event, and the cutoff flag when its pool is provably unreachable.
+
+    `quoted` is the selected markets no gate holds; `held` ({ticker: guard},
+    load_guard_holds) the selected ones a gate keeps dark right now. Those
+    are named, not counted as quoting: selection alone said "quoting" on
+    KXLOWTPERIOD for a day while its fair gate held every strike.
 
     Deliberately not the full admission chain — the no-new gate, ROI, payout
     floor, slots and capacity are the 7:20 quote-gaps email's job, on the same
@@ -451,8 +470,15 @@ def bot_status(rec: dict, quoted: set, resolver, now: datetime) -> str:
     tickers = sorted(rec["tickers"])
     n_quoted = sum(1 for t in tickers if t in quoted)
     n_allowed = sum(1 for t in tickers if imm.IncentiveMarketMaker._allowed(t))
+    held = held or {}
+    gated = [held[t] for t in tickers if t in held and t not in quoted]
     if n_quoted:
         label = f"quoting {n_quoted}/{len(tickers)}"
+        if gated:
+            label += f", gate holds {len(gated)} ({_guard_names(gated)})"
+    elif gated:
+        label = (f"selected, gate holds {len(gated)}/{len(tickers)} "
+                 f"({_guard_names(gated)})")
     elif rec.get("n_ever"):
         # quoted earlier in the window and stopped (a next-day family past its
         # stop, a same-day block, a pool the bot gave up on): say so before
@@ -487,9 +513,105 @@ def load_estimates():
 
 _SNAP_TS_RE = re.compile(r'"ts": "([^"]+)"')
 _SNAP_TICKER_RE = re.compile(r'"ticker": "([^"]+)"')
+_GUARD_KIND_RE = re.compile(r'"kind": "([a-z]+)"')
 
 
-def load_quote_history(recs, since: datetime, now: datetime) -> dict:
+def load_guard_holds(tickers, since: datetime, now: datetime) -> dict:
+    """{ticker: [[start, end or None, guard], ...]}: the stretches a quote-loop
+    gate held each of `tickers` (a fair gate, a breaker, a blackout -- any
+    _gskip: every one ends the market's cycle with no new quote), from the
+    bot's guard_skips_<UTC day>.jsonl since the day before `since`. end None =
+    still held at the last row.
+
+    The log is change-driven (incentive_mm._flush_guard_skips): "enter" opens
+    a hold (or moves it to another guard), "clear" ends it, and the hourly
+    "snapshot" rows + their "cycle" row restate every hold at once. The
+    replay resets to that restatement at each cycle row, which is also what
+    makes a restart safe: the new process logs nothing for a hold that ended
+    while it was down, but its first cycle writes a snapshot without it.
+    A missing or unreadable file costs the gate view (the email then counts
+    selection alone, as it did before), never the email."""
+    want = set(tickers)
+    if not want:
+        return {}
+    try:
+        files = dash.day_files("guard_skips", "jsonl",
+                               (since - timedelta(days=1)).strftime("%Y-%m-%d"))
+    except Exception as e:
+        log(f"! guard_skips not listed ({e!r}); quoting = selection alone today")
+        return {}
+    spans, open_, snap = {}, {}, {}
+
+    def close(t, at):
+        start, guard = open_.pop(t)
+        spans.setdefault(t, []).append([start, at, guard])
+
+    for _day, path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    k = _GUARD_KIND_RE.search(line)
+                    if not k:
+                        continue
+                    kind = k.group(1)
+                    if kind != "cycle":
+                        m = _SNAP_TICKER_RE.search(line)
+                        if not m or m.group(1) not in want:
+                            continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    at = imm.parse_iso_utc(row.get("ts") or "")
+                    if at is None or at > now:
+                        continue
+                    t, guard = row.get("ticker"), row.get("guard") or "?"
+                    if kind == "enter":
+                        open_[t] = (open_[t][0] if t in open_ else at, guard)
+                    elif kind == "clear":
+                        if t in open_:
+                            close(t, at)
+                    elif kind == "snapshot":
+                        snap.setdefault(row["ts"], {})[t] = guard
+                    elif kind == "cycle":
+                        now_held = snap.pop(row["ts"], {})
+                        snap.clear()
+                        for t2 in [x for x in open_ if x not in now_held]:
+                            close(t2, at)
+                        for t2, g2 in now_held.items():
+                            open_[t2] = (open_[t2][0] if t2 in open_ else at, g2)
+        except OSError as e:
+            log(f"! {os.path.basename(path)} unreadable ({e!r}); gate view partial")
+    for t, (start, guard) in open_.items():
+        spans.setdefault(t, []).append([start, None, guard])
+    return spans
+
+
+def held_now(holds: dict, selected) -> dict:
+    """{ticker: guard} for the selected markets a gate holds at the log's end."""
+    return {t: sp[-1][2] for t, sp in holds.items()
+            if t in selected and sp and sp[-1][1] is None}
+
+
+def _unheld(a: datetime, b: datetime, spans) -> list:
+    """[(start, end)]: the pieces of [a, b) no hold in `spans` covers."""
+    pieces = [(a, b)]
+    for s, e, _g in spans or ():
+        e = b if e is None else e
+        nxt = []
+        for x, y in pieces:
+            if e <= x or s >= y:
+                nxt.append((x, y))
+                continue
+            if x < s:
+                nxt.append((x, s))
+            if e < y:
+                nxt.append((e, y))
+        pieces = nxt
+    return pieces
+
+
+def load_quote_history(recs, since: datetime, now: datetime, holds=None) -> dict:
     """{ticker: (quoted at all, est earned $, end of its last quoted stretch)}
     for the program markets of `recs`, from every selection_snapshot block
     since `since` (Jack 2026-10-26: "why isn't earthquake and high / low temp
@@ -501,8 +623,11 @@ def load_quote_history(recs, since: datetime, now: datetime) -> dict:
     A market is quoted in a block whose decision is "selected"; its
     est_dollars_per_day then accrues until the next block, at most
     HIST_GAP_HOURS. The bot's own "banked" is not used: it stayed 0 on the
-    KXLOWT markets of 10/25 while they were selected at ~$6/day. A file that
+    KXLOWT markets of 10/25 while they were selected at ~$6/day. Time a gate
+    held the market (`holds`, load_guard_holds) is not quoted time: it earns
+    nothing and does not make the market "quoted earlier". A file that
     cannot be read costs the history, never the email."""
+    holds = holds or {}
     want = {t for r in recs for t in r["tickers"]}
     if not want:
         return {}
@@ -548,13 +673,14 @@ def load_quote_history(recs, since: datetime, now: datetime) -> dict:
             if not r or not r[0]:
                 continue
             end = min(when[order[i + 1]] if i + 1 < len(order) else now, when[s] + gap)
-            earned += r[1] * (end - when[s]).total_seconds() / 86400.0
-            ever, last = True, end
+            for a, b in _unheld(when[s], end, holds.get(ticker)):
+                earned += r[1] * (b - a).total_seconds() / 86400.0
+                ever, last = True, b
         out[ticker] = (ever, earned, last)
     return out
 
 
-def quote_summary(rec: dict, quoted: set, est: dict, hist=None) -> dict:
+def quote_summary(rec: dict, quoted: set, est: dict, hist=None, held=None) -> dict:
     """The top table's numbers for one event: how many of its program markets
     the bot quotes, and the bot's own estimate summed over THOSE markets --
     est_dollars_per_day (its modelled share of the pool at its current size)
@@ -565,7 +691,11 @@ def quote_summary(rec: dict, quoted: set, est: dict, hist=None) -> dict:
     after it), so a partial sum is marked as one, not shown as the whole.
     n_ever / est_earned / last_quoted come from load_quote_history: the
     markets quoted at any point in the window (now included), the modelled
-    reward while they were, and when the last quoted stretch ended."""
+    reward while they were, and when the last quoted stretch ended.
+    n_held / held_guards: the selected markets a gate holds now (`held`,
+    {ticker: guard}), which `quoted` already leaves out."""
+    held = held or {}
+    gated = sorted(held[t] for t in rec["tickers"] if t in held and t not in quoted)
     q = [t for t in rec["tickers"] if t in quoted]
     day = total = 0.0
     missing = 0
@@ -584,7 +714,8 @@ def quote_summary(rec: dict, quoted: set, est: dict, hist=None) -> dict:
             "n_ever": sum(1 for t in rec["tickers"]
                           if t in quoted or (t in hist and hist[t][0])),
             "est_earned": sum(x[1] for x in h),
-            "last_quoted": max(lasts) if lasts else None}
+            "last_quoted": max(lasts) if lasts else None,
+            "n_held": len(gated), "held_guards": gated}
 
 
 # ----------------------------------------------------------------------------
@@ -691,11 +822,15 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
             if dark_days >= RELIT_DAYS:
                 series_relit[s] = dark_days
 
-    quoted = set(load_json(STATE_PATH).get("selected_tickers") or [])
+    selected = set(load_json(STATE_PATH).get("selected_tickers") or [])
+    holds = load_guard_holds({t for r in new_recs + late_recs for t in r["tickers"]},
+                             window_start, now_utc)
+    held = held_now(holds, selected)
+    quoted = selected - set(held)     # selected and no gate holding it dark
     est, est_at = load_estimates()
-    hist = load_quote_history(new_recs + late_recs, window_start, now_utc)
+    hist = load_quote_history(new_recs + late_recs, window_start, now_utc, holds)
     for rec in new_recs + late_recs:
-        rec.update(quote_summary(rec, quoted, est, hist))
+        rec.update(quote_summary(rec, quoted, est, hist, held))
     resolver = imm.EventStartResolver()
     # Titles go to the top table's quoting rows first (small pools, so the
     # biggest-pool-first budget would leave them as bare tickers), then the
@@ -705,7 +840,7 @@ def build_report(now_utc: datetime, since_hours=None, include_ended=False):
                   + late_recs[:MAX_LATE_ROWS])
     for rec in new_recs + late_recs:
         rec.setdefault("what", gaps.describe_event(rec["event"]))
-        rec["bot"] = bot_status(rec, quoted, resolver, now_utc)
+        rec["bot"] = bot_status(rec, quoted, resolver, now_utc, held)
 
     # Feed-health guard: a collapsed feed must not advance the watermark.
     n_programs = sum(r["n_programs"] for r in events.values())
@@ -783,6 +918,12 @@ def _headline(ctx) -> list:
             f"${sum(r['pool_day'] for r in allowed):,.2f}/day - "
             f"already quoting: {len(quoting)} event(s), "
             f"${sum(r['pool_day'] for r in quoting):,.2f}/day")
+    gated = [r for r in new if r["bot"].startswith("selected, gate holds")]
+    if gated:
+        lines.append(
+            f"  selected but a gate holds every quote: {len(gated)} event(s), "
+            f"${sum(r['pool_day'] for r in gated):,.2f}/day ("
+            + _guard_names(g for r in gated for g in r.get("held_guards", ())) + ")")
     if earlier:
         lines.append(
             f"  quoted earlier, not now: {len(earlier)} event(s), "
@@ -853,13 +994,18 @@ _SUM_COLS = (("EVENT", 26, "<"), ("WHAT IT IS", 26, "<"), ("POOL $", 9, ">"),
 
 def _summary_order(new) -> list:
     """Every new event: quoting ones first, biggest estimate first, then the
-    ones quoted earlier in the window (biggest estimated earnings first),
-    then the rest in the full table's order (pool $/day)."""
+    selected ones a gate holds dark (biggest pool first: the ones to look
+    at), then the ones quoted earlier in the window (biggest estimated
+    earnings first), then the rest in the full table's order (pool $/day)."""
     quoting = sorted((r for r in new if r["n_quoted"]),
                      key=lambda r: (-r["est_total"], -r["est_day"], r["event"]))
-    earlier = sorted((r for r in new if not r["n_quoted"] and r.get("n_ever")),
+    rest = [r for r in new if not r["n_quoted"]]
+    gated = sorted((r for r in rest if r.get("n_held")),
+                   key=lambda r: (-r["pool_day"], r["event"]))
+    rest = [r for r in rest if not r.get("n_held")]
+    earlier = sorted((r for r in rest if r.get("n_ever")),
                      key=lambda r: (-r.get("est_earned", 0.0), r["event"]))
-    return quoting + earlier + [r for r in new if not r["n_quoted"] and not r.get("n_ever")]
+    return quoting + gated + earlier + [r for r in rest if not r.get("n_ever")]
 
 
 def _est_cell(value, n_quoted, n_missing) -> str:
@@ -877,10 +1023,13 @@ def _frac(k, n) -> str:
 
 
 def _quoting_cell(rec) -> str:
-    """"yes" now; "earlier, to <when>" when only the window's snapshots show
-    it quoted; else the BOT cell's reason."""
+    """"yes" now; "selected, gate holds ..." when a gate keeps it dark now;
+    "earlier, to <when>" when only the window's snapshots show it quoted;
+    else the BOT cell's reason."""
     if rec["n_quoted"]:
         return "yes"
+    if rec.get("n_held"):
+        return rec.get("bot", "")
     if rec.get("n_ever"):
         last = rec.get("last_quoted")
         return "earlier" + (f", to {_et(last)}" if last else "")
@@ -902,7 +1051,9 @@ def _summary_total(rows) -> tuple:
     q = sum(r["n_quoted"] for r in rows)
     ever = sum(r.get("n_ever", r["n_quoted"]) for r in rows)
     miss = sum(r["est_missing"] for r in rows)
-    n_earlier = sum(1 for r in rows if not r["n_quoted"] and r.get("n_ever"))
+    n_gated = sum(1 for r in rows if not r["n_quoted"] and r.get("n_held"))
+    n_earlier = sum(1 for r in rows if not r["n_quoted"] and r.get("n_ever")
+                    and not r.get("n_held"))
     return ("TOTAL", f"{len(rows)} new event{'' if len(rows) == 1 else 's'}",
             f"{sum(r['pool_total'] for r in rows):,.0f}",
             _frac(ever, sum(len(r["tickers"]) for r in rows)),
@@ -910,6 +1061,7 @@ def _summary_total(rows) -> tuple:
             _est_cell(sum(r["est_day"] for r in rows), q, miss),
             _est_cell(sum(r["est_total"] for r in rows), q, miss),
             f"{sum(1 for r in rows if r['n_quoted'])} quoting"
+            + (f", {n_gated} gate-held" if n_gated else "")
             + (f", {n_earlier} earlier" if n_earlier else ""))
 
 
@@ -928,7 +1080,10 @@ def _summary_notes(ctx) -> tuple:
              "(its hourly snapshots, and now); EST EARNED = the bot's "
              "modelled $/day on each while it was quoted, times the time "
              "quoted. 'earlier, to <time>' = quoted then, not now (a "
-             "next-day family past its stop, a same-day block).",
+             "next-day family past its stop, a same-day block). 'selected, "
+             "gate holds' = the bot picked the market but a gate (a fair "
+             "gate, a breaker, a blackout) keeps it dark: not quoting, and "
+             "that time earns nothing here.",
              "EST $/DAY = the bot's modelled reward on the markets it "
              "quotes now; EST $ = banked this period + that rate at day size "
              "over the quotable time left to its stop (the payout bar's "
@@ -971,6 +1126,8 @@ def _summary_html(ctx) -> str:
     for i, rec in enumerate(_summary_order(ctx["new"])):
         ev, what, pool, frac, earned, day, total, quoting = _summary_cells(rec)
         quoting = ('<b style="color:#1e8449">yes</b>' if rec["n_quoted"] else
+                   '<b style="color:#b03a2e">{}</b>'.format(_esc(quoting))
+                   if rec.get("n_held") else
                    '<span style="color:#9a6700">{}</span>'.format(_esc(quoting))
                    if rec.get("n_ever") else
                    '<span style="color:#888">{}</span>'.format(_esc(quoting)))
