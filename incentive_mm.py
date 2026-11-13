@@ -14387,7 +14387,7 @@ _CONFIG_CODE_KNOBS = (
     # Zillow home value gate (2026-11-12); zillow_home_fair's model knobs
     # ride in its status file's "model" block
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
-    "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT",
+    "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT", "HOME_EDGES",
     # upcoming programs (2026-11-12)
     "UPCOMING_ENABLE", "UPCOMING_REFRESH_SECS", "UPCOMING_RETRY_SECS",
     "UPCOMING_GRACE_SECS", "UPCOMING_MIN_GAP_SECS", "UPCOMING_VERIFY_HOURS",
@@ -20428,9 +20428,11 @@ def mort_cap_quotes(quotes: List["Quote"], bid_cap: Optional[int],
 #     HOME_RELEASE_HOLD_MIN of a new Zillow release (the book re-prices on
 #     it), a market the model does not cover (only "above $K at <month>"),
 #     a decided strike, or a touch fighting the fair by more than
-#     HOME_FAIR_TOL_CENTS on the adverse side. Otherwise every bid is at most
-#     fair - HOME_FAIR_TOL_CENTS and every ask at least fair +
-#     HOME_FAIR_TOL_CENTS (mort_cap_quotes).
+#     HOME_FAIR_TOL_CENTS on the adverse side (since 11/13 that last one
+#     rests the 1c bid / 99c ask alone: HOME_EDGES). Otherwise every bid is
+#     at most fair - HOME_FAIR_TOL_CENTS and every ask at least fair +
+#     HOME_FAIR_TOL_CENTS (mort_cap_quotes) -- a 1c bid and a 99c ask always
+#     allowed (HOME_EDGES).
 #   - CUTOFF 00:00 ET on the ticker's day (30NOV26 -> Nov 30), before the
 #     target month's first print; the generic date rule reads "30NOV26" as
 #     2030-11-26, so home_cutoff_utc sets it. Unparseable -> stood down.
@@ -20444,6 +20446,19 @@ HOME_FAIR_TTL_MIN = _env_int("IMM_HOME_FAIR_TTL_MIN", 20)
 HOME_FAIR_REFRESH_SECS = _env_int("IMM_HOME_FAIR_REFRESH_SECS", 60)
 HOME_RELEASE_HOLD_MIN = _env_int("IMM_HOME_RELEASE_HOLD_MIN", 60)
 HOME_SIZE_MULT = _env_float("IMM_HOME_SIZE_MULT", 1.0)
+# THE 1c / 99c EDGES (Jack 2026-11-13: "why not quote 1c side on the Zillow
+# markets? expand range to 1-99c"). A 1c bid or a 99c ask risks at most 1c a
+# contract, so the gate never takes a side off the book for sitting too close
+# to the fair: a strike whose fair is under 1 + HOME_FAIR_TOL_CENTS (16c) still
+# bids 1c, one over 99 - HOME_FAIR_TOL_CENTS (84c) still asks 99c -- each only
+# while the edge is no worse than the fair (a 1c bid at a fair of 1c or more,
+# a 99c ask at 99c or less). Before this, 30 of the 80 strikes rested no bid
+# at all (fair under 16c) beside 12-37k-contract 1c walls. A touch fighting
+# the fair (the band) no longer stands the whole market aside either: it rests
+# the edges alone, with no lead (home-value edges only). The fail-closed
+# stand-asides -- no read, a stale check, a new release, an unmodelled or a
+# decided strike -- still take everything off. IMM_HOME_EDGES=0: the old caps.
+HOME_EDGES = os.environ.get("IMM_HOME_EDGES", "1") == "1"
 HOME_STATUS_FILE = os.environ.get(
     "IMM_HOME_STATUS_FILE", os.path.join(STATUS_DIR, "home_value_fair.json"))
 # the regions parsed out of Zillow's files, by Last-Modified (a restart reuses
@@ -20482,7 +20497,9 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
               ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
     """('', inputs, (bid_cap, ask_floor)) when a home-value market may quote
     -- bids at most bid_cap, asks at least ask_floor, None = that side not at
-    all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    all -- else (why, guard-skip inputs, None). Fails CLOSED. One exception
+    (HOME_EDGES): a touch fighting the fair returns (why, inputs, edges) --
+    the 1c bid / 99c ask alone (inputs["edges_only"])."""
     snap = _home_state.get("snap")
     if snap is None or snap.get("checked_ts") is None:
         return "no zillow read yet", {"reason": "no_read"}, None
@@ -20509,15 +20526,25 @@ def home_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     if e.get("decided"):
         return (f"decided at {fair:.0f}c (the target month is out)",
                 dict(inputs, reason="decided"), None)
+    # the band edges a fair of `fair` never argues with (HOME_EDGES)
+    edges = ((1 if fair >= 1.0 else None, 99 if fair <= 99.0 else None)
+             if HOME_EDGES else (None, None))
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, HOME_FAIR_TOL_CENTS)
     if bid_bad or ask_bad:
-        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
-                f"{HOME_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
-                f"mu ${e.get('mu') or 0:,})",
-                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad),
-                None)
+        why = (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
+               f"{HOME_FAIR_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side; "
+               f"mu ${e.get('mu') or 0:,})")
+        band_in = dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad)
+        if edges != (None, None):
+            return why, dict(band_in, edges_only=True, bid_cap=edges[0],
+                             ask_floor=edges[1]), edges
+        return why, band_in, None
     bid_cap = int(math.floor(fair - HOME_FAIR_TOL_CENTS + 1e-9))
     ask_floor = int(math.ceil(fair + HOME_FAIR_TOL_CENTS - 1e-9))
+    if edges[0] is not None:
+        bid_cap = max(bid_cap, edges[0])
+    if edges[1] is not None:
+        ask_floor = min(ask_floor, edges[1])
     caps = (bid_cap if bid_cap >= 1 else None,
             ask_floor if ask_floor <= 99 else None)
     if caps == (None, None):
@@ -26930,6 +26957,7 @@ class IncentiveMarketMaker:
         self._treasury_stood: Set[str] = set()    # Treasury touch gate stand-asides
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._home_stood: Set[str] = set()        # zillow home gate stand-asides
+        self._home_edges: Set[str] = set()        # ...and its edges-only markets
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -36982,8 +37010,9 @@ class IncentiveMarketMaker:
                 out = [] if (_mw or _mc is None) else mort_cap_quotes(out, *_mc)
             if home_series(meta.series):
                 # Zillow home gate: the same, HOME_FAIR_TOL_CENTS clear
+                # (a touch fighting the fair: the 1c / 99c edges alone, HOME_EDGES)
                 _hw, _hi, _hc = home_gate(meta.ticker, _now.timestamp(), eb, ea)
-                out = [] if (_hw or _hc is None) else mort_cap_quotes(out, *_hc)
+                out = [] if _hc is None else mort_cap_quotes(out, *_hc)
             if poke_series(meta.series):
                 # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
                 _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
@@ -39814,10 +39843,22 @@ class IncentiveMarketMaker:
             # Zillow release, on a shape the model does not cover, or when the
             # touch fights the fair; otherwise every rung below stays
             # HOME_FAIR_TOL_CENTS on the safe side of the fair.
+            # A touch fighting the fair rests the 1c bid / 99c ask alone, with
+            # no lead (HOME_EDGES: home_edges_only).
             home_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            home_edges_only = False
             if home_series(meta.series):
                 hg_why, hg_in, home_caps = home_gate(t, now_ts, ext_bid, ext_ask)
-                if hg_why:
+                home_edges_only = bool(hg_why) and home_caps is not None
+                if home_edges_only != (t in self._home_edges):
+                    if home_edges_only:
+                        self._home_edges.add(t)
+                        log(f"{self.tag} home-value edges only {t}: {hg_why} -- "
+                            f"the 1c bid / 99c ask alone {home_caps}")
+                    else:
+                        self._home_edges.discard(t)
+                        log(f"{self.tag} home-value edges clear {t}")
+                if hg_why and home_caps is None:
                     if t not in self._home_stood:
                         self._home_stood.add(t)
                         log(f"{self.tag} home-value stand-aside {t}: {hg_why}")
@@ -40047,6 +40088,9 @@ class IncentiveMarketMaker:
                 lead_src = None
             # (nor on a post-vote dead book: its one rung rests at the reference)
             if pvd is not None:
+                lead_src = None
+            # (nor beside a touch fighting the Zillow fair: the edges alone)
+            if home_edges_only:
                 lead_src = None
             if (lead_src is not None and not reduce_only
                     and quake_cap is None and yt1_cap is None and mort_caps is None

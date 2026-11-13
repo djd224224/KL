@@ -25837,13 +25837,21 @@ class TestZillowHomeGate(unittest.TestCase):
         why, inputs, caps = imm.home_gate(self.T, now, 50, 90)
         self.assertEqual((why, caps), ("", (55, 85)))
         self.assertEqual(inputs["fair"], 70.0)
-        self._snap(p=0.90)                                    # no ask room
-        self.assertEqual(imm.home_gate(self.T, now, 50, 99)[2], (75, None))
-        self._snap(p=0.10)                                    # no bid room
-        self.assertEqual(imm.home_gate(self.T, now, 2, 50)[2], (None, 25))
+        self._snap(p=0.90)                    # no ask room 15c clear: the 99c edge
+        self.assertEqual(imm.home_gate(self.T, now, 50, 99)[2], (75, 99))
+        self._snap(p=0.10)                    # no bid room 15c clear: the 1c edge
+        self.assertEqual(imm.home_gate(self.T, now, 2, 50)[2], (1, 25))
         with mock.patch.object(imm, "HOME_FAIR_TOL_CENTS", 60):
             self._snap(p=0.50)
-            self.assertEqual(r(b=None, a=None), "decided")
+            self.assertEqual(imm.home_gate(self.T, now, None, None)[2], (1, 99))
+        with mock.patch.object(imm, "HOME_EDGES", False):     # the old caps
+            self._snap(p=0.90)
+            self.assertEqual(imm.home_gate(self.T, now, 50, 99)[2], (75, None))
+            self._snap(p=0.10)
+            self.assertEqual(imm.home_gate(self.T, now, 2, 50)[2], (None, 25))
+            with mock.patch.object(imm, "HOME_FAIR_TOL_CENTS", 60):
+                self._snap(p=0.50)
+                self.assertEqual(r(b=None, a=None), "decided")
 
     def test_quotes_only_clear_of_the_fair(self):
         bot = self._bot()
@@ -25862,15 +25870,28 @@ class TestZillowHomeGate(unittest.TestCase):
         self.assertNotIn(self.T, bot._home_stood)
         self.assertEqual(cycle(0.60), ({45}, {90, 91, 92}))   # bids capped at 45
         self.assertEqual(cycle(0.80), ({48, 49, 50}, {95}))   # asks lifted to 95
-        # bid touch 50 over 30 + 15: the whole market stands aside
+        # bid touch 50 over 30 + 15: the 1c bid / 99c ask alone (HOME_EDGES),
+        # no lead beside them
         self._snap(p=0.30)
-        bot.run_cycle()
-        self.assertEqual(self._quotes(bot), [])
-        self.assertIn(self.T, bot._home_stood)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertEqual(set(self._quotes(bot)), {("bid", 1), ("ask", 99)})
+        self.assertTrue(any(f"home-value edges only {self.T}" in s for s in lines), lines)
+        self.assertFalse(any(f"fair lead {self.T}" in s and " @ " in s for s in lines))
+        self.assertIn(self.T, bot._home_edges)
+        self.assertNotIn(self.T, bot._home_stood)
+        # ...the whole market stood aside before them
+        with mock.patch.object(imm, "HOME_EDGES", False):
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertIn(self.T, bot._home_stood)
+            self.assertNotIn(self.T, bot._home_edges)
         # a new Zillow release: out for the hold, whatever the fair says
         self._snap(p=0.70, release_age=60)
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
+        self.assertNotIn(self.T, bot._home_edges)
 
 
 class TestPokemonFairGate(unittest.TestCase):
@@ -41833,6 +41854,53 @@ class TestHomeLead(unittest.TestCase):
         self.assertEqual(rungs.get("ask"), (87, 200))
         self.assertTrue(any(f"fair lead {self.T} bid: 200 @ 13c" in s and "the Zillow fair" in s
                             for s in lines), [s for s in lines if "fair lead" in s])
+
+    # THE 1c / 99c EDGES (Jack 2026-11-13: "why not quote 1c side on the
+    # Zillow markets? expand range to 1-99c"): a fair under 16c leaves no bid
+    # 15c clear of it, so the strike rested its ask lead alone; HOME_EDGES
+    # keeps the 1c bid, which risks at most 1c a contract.
+
+    def test_an_edge_never_fights_the_fair(self):
+        now = time.time()
+
+        def caps(p):
+            self._snap(p=p)
+            return imm.home_gate(self.T, now, None, None)[2]
+        self.assertEqual(caps(0.094), (1, 25))
+        self.assertEqual(caps(0.005), (None, 16))    # a 1c bid pays over a 0.5c fair
+        self.assertEqual(caps(0.85), (70, 99))
+        self.assertEqual(caps(0.995), (84, None))
+        self.assertEqual(caps(0.306), (15, 46))      # 15c clear: unchanged
+        # the fail-closed stand-asides keep everything off, edges too
+        self._snap(p=0.094, release_age=60)
+        self.assertIsNone(imm.home_gate(self.T, now, None, None)[2])
+        self._snap(p=0.094, check_age=3600.0)
+        self.assertIsNone(imm.home_gate(self.T, now, None, None)[2])
+        self._snap(p=0.094, decided=True)
+        self.assertIsNone(imm.home_gate(self.T, now, None, None)[2])
+        # a touch fighting the fair: the edges alone
+        self._snap(p=0.094)
+        why, inputs, c = imm.home_gate(self.T, now, 30, 99)
+        self.assertTrue(why)
+        self.assertEqual((c, inputs["reason"], inputs["edges_only"]), ((1, 99), "band", True))
+        # ...and the fair lead still reads the fair (the lead's own guard
+        # judges the book)
+        self.assertAlmostEqual(imm.home_fair_c(self.T, now), 9.4)
+
+    def _orders(self, bot):
+        return sorted((o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+
+    def test_a_low_strike_bids_the_1c_wall(self):
+        bot, rungs, lines = self._cycle(p=0.094)
+        self.assertIn(self.T, bot.state.selected)
+        self.assertEqual(rungs.get("ask"), (87, 200))            # the lead
+        bids = {px for s, px in self._orders(bot) if s == "bid"}
+        self.assertEqual(bids, {1}, lines[-40:])
+        with mock.patch.object(imm, "HOME_EDGES", False):        # before: no bid
+            bot, rungs, _ = self._cycle(p=0.094)
+        self.assertEqual(rungs.get("ask"), (87, 200))
+        self.assertEqual({px for s, px in self._orders(bot) if s == "bid"}, set())
 
 
 if __name__ == "__main__":
