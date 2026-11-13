@@ -25921,7 +25921,12 @@ def _book_lead_static_ok(ticker: str, series: str, now_ts: float) -> bool:
         return False
     if in_fair_lead_series(series) or series.startswith(LEAD_OFF_SERIES) \
             or (BOOK_LEAD_SKIP_SERIES and series.startswith(BOOK_LEAD_SKIP_SERIES)) \
-            or book_lead_own_rules(ticker, series):
+            or book_lead_own_rules(ticker, series) \
+            or crypto_open_series(series):
+        # (the CRYPTO OPEN FAMILY joins the NO touch only, 2026-11-13: a
+        # 200-lot lead at the usual mid sold YES at 38-45c on six *EVENT
+        # strikes in its first minute -- not "the no side at 5x base", and
+        # $696 of NO against its $500 shard-2 budget)
         return False
     if ticker in _book_lead["comp"] or PVD_MARKETS.get(ticker) is not None:
         return False

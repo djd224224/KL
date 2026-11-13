@@ -44812,6 +44812,19 @@ class TestCryptoOpenFamily(unittest.TestCase):
             self.assertFalse(imm.crypto_open_series("KXBTCHITBY"))
             self.assertFalse(IncentiveMarketMaker._allowed("KXBTCHITBY-01JAN270000-10500000-YES"))
 
+    def test_no_book_lead(self):
+        # a wide quiet *EVENT book drew 200-lot book leads at its usual mid
+        # in the first live minute (11/13 23:18Z); the family only joins
+        t = "KXBTCEVENT-10DEC260930-T7350000"
+        now = time.time()
+        with mock.patch.dict(imm._book_lead["info"], {t: (0.0, None)}), \
+                mock.patch.object(imm, "BOOK_LEAD_MODE", "on"), \
+                mock.patch.object(imm, "FAIR_LEAD_MODE", "on"), \
+                mock.patch.object(imm, "LADDER_MODE", "atref"):
+            self.assertTrue(imm._book_lead_static_ok(t, "KXBTCEVENT", now))
+            imm._crypto_open_enroll(["KXBTCEVENT"])
+            self.assertFalse(imm._book_lead_static_ok(t, "KXBTCEVENT", now))
+
     def test_a_failed_read_keeps_the_list(self):
         imm._crypto_open_enroll(["KXBTCHITBY"])
 
