@@ -7965,8 +7965,15 @@ _DEFAULT_MORT_SERIES = "KXFM30YMTG,KXMORTGAGERATE"
 # zillow_home_fair's first-print fair, never within HOME_FAIR_TOL_CENTS of
 # it, fail closed; IMM_HOME_ENABLE=0 or IMM_ALLOW_HOME_SERIES="" takes them
 # out.
+# + 14 MORE CITIES (Jack 2026-11-12: "Add all 14"): the 30NOV26 single-family
+# ladders whose $90 programs started 21:28Z 11/12. KXHOUHOME stays out -- its
+# markets are condo "below" strikes (LT), which the fair does not model.
 _HOME_LIVE = os.environ.get("IMM_HOME_ENABLE", "1") == "1"
-_DEFAULT_HOME_SERIES = "KXSEAHOME,KXVENICEHOME"
+_DEFAULT_HOME_SERIES = ("KXSEAHOME,KXVENICEHOME,"
+                        "KXAUSHOME,KXCHIHOME,KXDALHOME,KXHOBHOME,KXJCHOME,"
+                        "KXLAHOME,KXMIAHOME,KXNYCHOME,KXPALISADESHOME,"
+                        "KXPALOHOME,KXPHLHOME,KXPHXHOME,KXSANTAMONICAHOME,"
+                        "KXSDHOME")
 # OPENROUTER MARKET SHARE (Jack 2026-09-30: "scrape OpenRouter for market
 # share markets", then "i got permission"). KX<AUTHOR>SHARE settle on the
 # Market Share chart of openrouter.ai/rankings -- an author's share of the

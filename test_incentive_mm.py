@@ -25774,7 +25774,10 @@ class TestZillowHomeGate(unittest.TestCase):
                       if o["ticker"] == self.T)
 
     def test_enrolled_and_cut_off_on_the_ticker_day(self):
-        for s in ("KXSEAHOME", "KXVENICEHOME"):
+        for s in ("KXSEAHOME", "KXVENICEHOME", "KXAUSHOME", "KXCHIHOME",
+                  "KXDALHOME", "KXHOBHOME", "KXJCHOME", "KXLAHOME",
+                  "KXMIAHOME", "KXNYCHOME", "KXPALISADESHOME", "KXPALOHOME",
+                  "KXPHLHOME", "KXPHXHOME", "KXSANTAMONICAHOME", "KXSDHOME"):
             self.assertIn(s, imm.ALLOW_SERIES, s)
             self.assertTrue(imm.home_series(s), s)
             ov = imm.series_override(s)
@@ -25783,11 +25786,11 @@ class TestZillowHomeGate(unittest.TestCase):
             with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
                 self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-30NOV26-GT1"), s)
             self.assertFalse(IncentiveMarketMaker._blocked(f"{s}-30NOV26-GT1"), s)
-        # Jack named two; the other cities are not enrolled
-        self.assertFalse(imm.home_series("KXSANTAMONICAHOME"))
+        # Houston's condo "below" ladders are not modelled, so not enrolled
+        self.assertFalse(imm.home_series("KXHOUHOME"))
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             self.assertFalse(IncentiveMarketMaker._allowed(
-                "KXSANTAMONICAHOME-30NOV26-GT2655000"))
+                "KXHOUHOME-28FEB27-LT111000"))
         # 00:00 ET Nov 30 -- the generic rule reads 30NOV26 as 2030-11-26
         nov30 = datetime(2026, 11, 30, 5, 0, tzinfo=timezone.utc)
         self.assertEqual(imm.home_cutoff_utc("KXSEAHOME-30NOV26"), nov30)
