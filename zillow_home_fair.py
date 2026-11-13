@@ -46,6 +46,18 @@ just the regions the markets need. The snapshot carries `release_ts` (the
 newest Last-Modified in use) so the gate can hold after a release, and
 `checked_ts` (the last time every file answered) so it fails closed when
 Zillow cannot be reached.
+
+ANY ZILLOW SERIES (Jack 2026-11-13: "why isnt KXMEMHOME-31DEC26 quoting? make
+the Zillow markets generalizable and auto-quote new ones"). The region comes
+from each market's own rules ("Zillow region ID N"), so nothing is mapped by
+hand: HomeWatch takes `discover`, the series the bot's programs feed lists
+with HOME in the ticker, and a candidate whose open markets' rules name a
+Zillow Home Value Index joins `auto` (KXMEMHOME, KXHOUHOME); one whose rules
+do not (KXEXUSHOME: FRED; KX<ST>HOMEPRICE: FHFA) is probed again only every
+META_REFRESH_SECS. "below" / "at most" strikes price as 1 - P(above) and
+"at least" as "above"; a target month more than MAX_H months past the latest
+print is not modelled (the re-anchor drift is measured over a season, not
+years: KXHOUHOME's December 2027 strikes stand aside).
 """
 import csv
 import json
@@ -84,6 +96,10 @@ REANCHOR_IDIO_SD_OTHER_PCT = _env_float("IMM_HOME_REANCHOR_IDIO_SD_OTHER_PCT", 0
 SHAPE_SD_MULT = _env_float("IMM_HOME_SHAPE_SD_MULT", 1.0)
 SD_FLOOR_PCT = _env_float("IMM_HOME_SD_FLOOR_PCT", 0.5)
 AR_MONTHS = int(_env_float("IMM_HOME_AR_MONTHS", 36))
+# the furthest target month modelled, in months past the latest print: the
+# AR fit is scored to h=3 and the re-anchor drift (h x REANCHOR_MEAN_PCT) is
+# a fall-2026 reading, so a year out it would be a -6% guess
+MAX_H = int(_env_float("IMM_HOME_MAX_H", 6))
 # every minute since the HOME LEADS (2026-11-13): 200-lot leads ~15c+ off the
 # fair rest on every strike, and a new Zillow release is what moves it, so the
 # gate's release hold must start within a minute of Zillow's file changing
@@ -112,6 +128,9 @@ _RULES_RE = re.compile(
     r"\$(?P<val>[\d,]+(?:\.\d+)?)(?: (?P<unit>million|thousand|billion))? "
     r"(?P<inat>at|in) (?P<mon>[A-Z][a-z]+) (?P<yr>\d{4})")
 _SERIES_URL_RE = re.compile(r"zillow\.com/home-values/(\d+)/")
+# the rules' comparison -> (YES on the low side?, strict?)
+_OPS = {"above": (False, True), "at least": (False, False),
+        "below": (True, True), "at most": (True, False)}
 
 
 def _log(msg: str) -> None:
@@ -295,21 +314,25 @@ def _markets(get_json, series: str) -> List[dict]:
 # ---------------------------------------------------------------- snapshot
 
 def market_entry(m: dict, region: Optional[dict], geo: Optional[str]) -> dict:
-    """One market's fair, or {"err": why}. Models "above $K at <month>" only."""
+    """One market's fair, or {"err": why}. Models "above / at least / below /
+    at most $K at <month>" up to MAX_H months past the latest print."""
     terms = parse_rules(m.get("rules_primary") or "")
     if terms is None:
         return {"err": "rules do not parse"}
-    if terms["op"] != "above" or terms["inat"] != "at":
+    if terms["op"] not in _OPS or terms["inat"] != "at":
         return {"err": f"not modelled: {terms['op']} / {terms['inat']}"}
+    low, strict = _OPS[terms["op"]]
     if terms["type"] not in HOME_TYPE_CUT:
         return {"err": f"home type {terms['type']!r} not modelled"}
-    strike = m.get("floor_strike")
+    # an "above" ladder carries floor_strike, a "below" one cap_strike
+    field = "cap_strike" if low else "floor_strike"
+    strike = m.get(field)
     try:
         strike = float(strike)
     except (TypeError, ValueError):
-        return {"err": "no floor_strike"}
+        return {"err": f"no {field}"}
     if abs(strike - terms["value"]) > 0.5:
-        return {"err": f"floor_strike {strike:g} != rules ${terms['value']:,}"}
+        return {"err": f"{field} {strike:g} != rules ${terms['value']:,}"}
     if region is None:
         return {"err": f"region {terms['rid']} not in the {terms['type']} files"}
     months, vals = region["months"], region["values"]
@@ -321,27 +344,48 @@ def market_entry(m: dict, region: Optional[dict], geo: Optional[str]) -> dict:
     h = month_index(terms["year"], terms["month"]) - month_index(ly, lm)
     base = {"strike": strike, "target": f"{terms['year']}-{terms['month']:02d}",
             "last_month": f"{ly}-{lm:02d}", "last_value": round(vals[last]),
-            "h": h, "rid": terms["rid"], "type": terms["type"], "geo": geo}
+            "h": h, "rid": terms["rid"], "type": terms["type"], "geo": geo,
+            "op": terms["op"]}
     if h < 0:
         return dict(base, err="the target month's first print is out")
     if h == 0:
         # the latest file IS the target's first print
-        return dict(base, p=1.0 if vals[last] > strike else 0.0, decided=True)
+        v = vals[last]
+        yes = (v < strike if strict else v <= strike) if low else \
+            (v > strike if strict else v >= strike)
+        return dict(base, p=1.0 if yes else 0.0, decided=True)
+    if h > MAX_H:
+        return dict(base, err=f"not modelled: {h} months past the latest "
+                              f"print (max {MAX_H})")
     mu, sd = first_print_dist(vals[last - AR_MONTHS:last + 1], h, geo or "")
-    return dict(base, p=p_above(mu, sd, strike), mu=round(math.exp(mu)),
+    up = p_above(mu, sd, strike)
+    return dict(base, p=1.0 - up if low else up, mu=round(math.exp(mu)),
                 sd_pct=round(100 * sd, 3))
 
 
 class HomeWatch:
     """The refresher's state. Kalshi markets every META_REFRESH_SECS; every
     Zillow file in use HEADed each HEAD_SECS (re-downloaded on a new
-    Last-Modified); `snap` is what the gate reads."""
+    Last-Modified); `snap` is what the gate reads.
+
+    `discover` (optional) returns candidate series -- the bot passes the
+    programs feed's HOME series. A candidate whose open markets' rules name a
+    Zillow Home Value Index joins `auto` (priced from then on, and listed in
+    the snapshot's auto_series); one with no open market yet, or whose rules
+    do not parse, is probed again META_REFRESH_SECS later. `auto` seeds the
+    confirmed set (a restart reads it back from the status file)."""
 
     def __init__(self, get_json: Optional[Callable[[str, dict], dict]] = None,
                  series: Iterable[str] = FAMILY_SERIES,
-                 cache_path: Optional[str] = None):
+                 cache_path: Optional[str] = None,
+                 discover: Optional[Callable[[], Iterable[str]]] = None,
+                 auto: Iterable[str] = ()):
         self.get_json = get_json
         self.series = tuple(series)
+        self.discover = discover
+        self.auto: set = set(auto) - set(self.series)
+        # unconfirmed candidate -> (last probe ts, why)
+        self.probed: Dict[str, Tuple[float, str]] = {}
         # the parsed regions on disk, keyed by file and its Last-Modified /
         # ETag, so a restart does not download ~100MB a file again
         self.cache_path = cache_path
@@ -473,18 +517,59 @@ class HomeWatch:
         if ok:
             self.checked_ts = now_ts
 
+    def _candidates(self, now_ts: float, errors: List[str]) -> List[str]:
+        """Discovered series neither listed, confirmed, nor probed within
+        META_REFRESH_SECS."""
+        if self.discover is None:
+            return []
+        try:
+            got = {str(s) for s in (self.discover() or ()) if s}
+        except Exception as e:                          # noqa: BLE001
+            errors.append(f"discover: {type(e).__name__}: {str(e)[:80]}")
+            return []
+        return sorted(s for s in got - set(self.series) - self.auto
+                      if now_ts - self.probed.get(s, (-1e18, ""))[0]
+                      >= META_REFRESH_SECS)
+
+    def _probe(self, s: str, now_ts: float) -> List[dict]:
+        """A candidate's open markets if their rules name a Zillow Home Value
+        Index (it joins `auto`), else [] (probed again later)."""
+        ms = _markets(self.get_json, s)
+        if any(parse_rules(m.get("rules_primary") or "") for m in ms):
+            self.auto.add(s)
+            self.probed.pop(s, None)
+            _log(f"auto: {s} settles on a Zillow Home Value Index "
+                 f"({len(ms)} open markets) -- priced from now on")
+            return ms
+        why = "rules name no Zillow Home Value Index" if ms else "no open market yet"
+        if self.probed.get(s, (0.0, ""))[1] != why:
+            _log(f"auto: {s} not taken: {why}")
+        self.probed[s] = (now_ts, why)
+        return []
+
     def refresh(self, now_ts: Optional[float] = None) -> dict:
         now_ts = time.time() if now_ts is None else now_ts
         errors: List[str] = []
+        new = self._candidates(now_ts, errors)
         if now_ts - self.meta_at >= META_REFRESH_SECS or not self.markets:
             try:
                 mk: List[dict] = []
-                for s in self.series:
+                for s in self.series + tuple(sorted(self.auto)):
                     mk.extend(_markets(self.get_json, s))
                 self.markets = mk
                 self.meta_at = now_ts
             except Exception as e:                      # noqa: BLE001
                 errors.append(f"markets: {type(e).__name__}: {str(e)[:100]}")
+        for s in new:
+            # a new series is probed at once, not at the next listing
+            try:
+                ms = self._probe(s, now_ts)
+            except Exception as e:                      # noqa: BLE001
+                errors.append(f"probe {s}: {type(e).__name__}: {str(e)[:80]}")
+                continue
+            have = {m.get("ticker") for m in self.markets}
+            self.markets = self.markets + [m for m in ms
+                                           if m.get("ticker") not in have]
         if now_ts - self.head_at >= HEAD_SECS or self.checked_ts is None:
             self.head_at = now_ts
             self._sync_zillow(now_ts, errors)
@@ -517,6 +602,9 @@ class HomeWatch:
             "ts": now_ts, "checked_ts": self.checked_ts,
             "release_ts": max(lms) if lms else None,
             "markets": markets, "errors": errors,
+            "series": sorted(set(self.series) | self.auto),
+            "auto_series": sorted(self.auto),
+            "probed": {s: why for s, (_ts, why) in sorted(self.probed.items())},
             "files": {f"{g}/{c}": {"last_modified": v.get("lm"), "etag": v.get("etag"),
                                    "regions": sorted(v.get("regions", {}))}
                       for (g, c), v in self.files.items()},
@@ -525,7 +613,7 @@ class HomeWatch:
                       "reanchor_idio_sd_pct": dict(REANCHOR_IDIO_SD_PCT,
                                                    other=REANCHOR_IDIO_SD_OTHER_PCT),
                       "shape_sd_mult": SHAPE_SD_MULT, "sd_floor_pct": SD_FLOOR_PCT,
-                      "ar_months": AR_MONTHS},
+                      "ar_months": AR_MONTHS, "max_h": MAX_H},
         }
 
 

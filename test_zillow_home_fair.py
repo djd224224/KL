@@ -92,9 +92,10 @@ class TestMarketEntry(unittest.TestCase):
         # the strike must match the rules
         self.assertIn("err", z.market_entry(dict(m, floor_strike=880000), self.region(), "City"))
         self.assertIn("err", z.market_entry(dict(m, floor_strike=None), self.region(), "City"))
-        # below / unknown type / no region / no rules: not modelled
+        # "exactly" / unknown type / no region / no rules: not modelled
         self.assertIn("not modelled", z.market_entry(
-            {"rules_primary": HOU, "floor_strike": 111000}, self.region(), "City")["err"])
+            dict(m, rules_primary=SEA.replace("is above", "is exactly")),
+            self.region(), "City")["err"])
         self.assertIn("err", z.market_entry(
             dict(m, rules_primary=SEA.replace("single-family homes", "5+ bedroom homes")),
             self.region(), "City"))
@@ -103,12 +104,60 @@ class TestMarketEntry(unittest.TestCase):
         self.assertEqual(z.market_entry(m, self.region(n=30), "City")["err"],
                          "too little history")
 
+    def test_below_and_at_least(self):
+        # Jack 2026-11-13: "make the Zillow markets generalizable" -- KXHOUHOME
+        # is a "below" ladder (cap_strike); it prices as 1 - P(above)
+        nov = SEA.replace("November 2026", "November 2026")
+        up = z.market_entry({"rules_primary": nov, "floor_strike": 882500},
+                            self.region(), "City")
+        below = SEA.replace("is above", "is below")
+        dn = z.market_entry({"rules_primary": below, "cap_strike": 882500},
+                            self.region(), "City")
+        self.assertAlmostEqual(dn["p"], 1.0 - up["p"], places=9)
+        self.assertEqual((dn["op"], dn["strike"]), ("below", 882500.0))
+        # a "below" market carries cap_strike, not floor_strike
+        self.assertEqual(z.market_entry({"rules_primary": below, "floor_strike": 882500},
+                                        self.region(), "City")["err"], "no cap_strike")
+        most = z.market_entry({"rules_primary": SEA.replace("is above", "is at most"),
+                               "cap_strike": 882500}, self.region(), "City")
+        self.assertAlmostEqual(most["p"], dn["p"], places=9)
+        least = z.market_entry({"rules_primary": SEA.replace("is above", "is at least"),
+                                "floor_strike": 882500}, self.region(), "City")
+        self.assertAlmostEqual(least["p"], up["p"], places=9)
+        # HOU's own rules: condos, February 2027 (h=5)
+        h = z.market_entry({"rules_primary": HOU, "cap_strike": 111000},
+                           self.region(), "City")
+        self.assertEqual((h["h"], h["op"]), (5, "below"))
+        self.assertTrue(0.0 <= h["p"] <= 1.0)
+
+    def test_too_far_out_is_not_modelled(self):
+        far = SEA.replace("November 2026", "December 2027")       # h = 15
+        e = z.market_entry({"rules_primary": far, "floor_strike": 882500},
+                           self.region(), "City")
+        self.assertIn("not modelled: 15 months", e["err"])
+        self.assertNotIn("p", e)
+        mar = SEA.replace("November 2026", "March 2027")          # h = 6
+        self.assertIn("p", z.market_entry({"rules_primary": mar, "floor_strike": 882500},
+                                          self.region(), "City"))
+        with mock.patch.object(z, "MAX_H", 20):
+            self.assertIn("p", z.market_entry({"rules_primary": far, "floor_strike": 882500},
+                                              self.region(), "City"))
+
     def test_target_month_published(self):
         sep = SEA.replace("November 2026", "September 2026")
         m = {"rules_primary": sep, "floor_strike": 882500}
         self.assertEqual(z.market_entry(m, self.region(last_value=900000), "City")["p"], 1.0)
         e = z.market_entry(m, self.region(last_value=882500), "City")
         self.assertEqual((e["p"], e["decided"]), (0.0, True))      # "above" is strict
+        # "below" decided the other way; "at least" is not strict
+        below = sep.replace("is above", "is below")
+        self.assertEqual(z.market_entry({"rules_primary": below, "cap_strike": 882500},
+                                        self.region(last_value=870000), "City")["p"], 1.0)
+        self.assertEqual(z.market_entry({"rules_primary": below, "cap_strike": 882500},
+                                        self.region(last_value=882500), "City")["p"], 0.0)
+        least = sep.replace("is above", "is at least")
+        self.assertEqual(z.market_entry({"rules_primary": least, "floor_strike": 882500},
+                                        self.region(last_value=882500), "City")["p"], 1.0)
         aug = SEA.replace("November 2026", "August 2026")
         self.assertIn("first print is out", z.market_entry(
             {"rules_primary": aug, "floor_strike": 882500}, self.region(), "City")["err"])
@@ -216,6 +265,90 @@ class TestSync(unittest.TestCase):
             n = len(self.loads)
             w.refresh(now_ts=5000.0 + z.HEAD_SECS)
             self.assertEqual(len(self.loads), n)
+
+
+MEM = ("If the Zillow Home Value Index for single-family homes in Memphis, TN "
+       "(Zillow region ID 32811) is above $148,000 at December 2026, then the "
+       "market resolves to Yes.")
+FRED = ("If the Median Sales Price of Existing Homes (HOSMEDUSM052N) for "
+        "November 2026 is above $435,000, then the market resolves to Yes.")
+
+
+class TestDiscover(unittest.TestCase):
+    """Jack 2026-11-13: "why isnt KXMEMHOME-31DEC26 quoting? make the Zillow
+    markets generalizable and auto-quote new ones"."""
+
+    def setUp(self):
+        self.listed = {
+            "KXSEAHOME": [{"ticker": "KXSEAHOME-30NOV26-GT882500",
+                           "rules_primary": SEA, "floor_strike": 882500}],
+            "KXMEMHOME": [{"ticker": "KXMEMHOME-31DEC26-GT148000",
+                           "rules_primary": MEM, "floor_strike": 148000}],
+            "KXEXUSHOME": [{"ticker": "KXEXUSHOME-26DEC09-T435000",
+                            "rules_primary": FRED, "floor_strike": 435000}],
+            "KXNEWHOME": [],
+        }
+        self.calls = []
+        self.cands = ["KXSEAHOME", "KXMEMHOME", "KXEXUSHOME", "KXNEWHOME"]
+
+    def _markets(self, gj, series):
+        self.calls.append(series)
+        return list(self.listed.get(series, []))
+
+    def _refresh(self, w, ts):
+        with mock.patch.object(z, "_markets", self._markets),                 mock.patch.object(z.HomeWatch, "_sync_zillow", lambda *a: None):
+            return w.refresh(now_ts=ts)
+
+    def test_zillow_rules_join_and_others_wait(self):
+        w = z.HomeWatch(None, ["KXSEAHOME"], discover=lambda: self.cands)
+        s = self._refresh(w, 10000.0)
+        self.assertEqual(s["auto_series"], ["KXMEMHOME"])
+        self.assertEqual(s["series"], ["KXMEMHOME", "KXSEAHOME"])
+        self.assertEqual(s["probed"], {
+            "KXEXUSHOME": "rules name no Zillow Home Value Index",
+            "KXNEWHOME": "no open market yet"})
+        self.assertIn("KXMEMHOME-31DEC26-GT148000", s["markets"])
+        self.assertNotIn("KXEXUSHOME-26DEC09-T435000", s["markets"])
+        # the listed series is never probed; nothing is probed twice inside
+        # META_REFRESH_SECS
+        self.assertNotIn("KXSEAHOME", [c for c in self.calls[1:]])
+        n = len(self.calls)
+        self._refresh(w, 10000.0 + 60)
+        self.assertEqual(self.calls[n:], [])
+        # KXNEWHOME lists its ladder: the next probe takes it
+        self.listed["KXNEWHOME"] = [{"ticker": "KXNEWHOME-31DEC26-GT1",
+                                     "rules_primary": MEM, "floor_strike": 1}]
+        s = self._refresh(w, 10000.0 + z.META_REFRESH_SECS)
+        self.assertEqual(s["auto_series"], ["KXMEMHOME", "KXNEWHOME"])
+        self.assertEqual(s["probed"], {"KXEXUSHOME": "rules name no Zillow Home Value Index"})
+        # a full listing covers the auto series too
+        self.assertIn("KXMEMHOME", self.calls[len(self.calls) - 6:])
+
+    def test_seeded_auto_is_listed_without_a_probe(self):
+        w = z.HomeWatch(None, ["KXSEAHOME"], auto=["KXMEMHOME", "KXSEAHOME"])
+        self.assertEqual(w.auto, {"KXMEMHOME"})
+        s = self._refresh(w, 10000.0)
+        self.assertEqual(self.calls, ["KXSEAHOME", "KXMEMHOME"])
+        self.assertEqual(s["auto_series"], ["KXMEMHOME"])
+        self.assertIn("KXMEMHOME-31DEC26-GT148000", s["markets"])
+
+    def test_a_failing_discover_or_probe_is_an_error_not_a_crash(self):
+        def boom():
+            raise RuntimeError("feed down")
+        w = z.HomeWatch(None, ["KXSEAHOME"], discover=boom)
+        s = self._refresh(w, 10000.0)
+        self.assertIn("discover: RuntimeError", " ".join(s["errors"]))
+        w = z.HomeWatch(None, ["KXSEAHOME"], discover=lambda: ["KXMEMHOME"])
+        real = self._markets
+
+        def flaky(gj, series):
+            if series == "KXMEMHOME":
+                raise OSError("429")
+            return real(gj, series)
+        with mock.patch.object(z, "_markets", flaky),                 mock.patch.object(z.HomeWatch, "_sync_zillow", lambda *a: None):
+            s = w.refresh(now_ts=10000.0)
+        self.assertIn("probe KXMEMHOME: OSError", " ".join(s["errors"]))
+        self.assertEqual(s["auto_series"], [])
 
 
 if __name__ == "__main__":

@@ -8021,6 +8021,8 @@ _DEFAULT_MORT_SERIES = "KXFM30YMTG,KXMORTGAGERATE"
 # + 14 MORE CITIES (Jack 2026-11-12: "Add all 14"): the 30NOV26 single-family
 # ladders whose $90 programs started 21:28Z 11/12. KXHOUHOME stays out -- its
 # markets are condo "below" strikes (LT), which the fair does not model.
+# Since 11/13 any other Zillow series joins on its own (HOME_AUTO): this list
+# is the hand-named core, not the family's limit.
 _HOME_LIVE = os.environ.get("IMM_HOME_ENABLE", "1") == "1"
 _DEFAULT_HOME_SERIES = ("KXSEAHOME,KXVENICEHOME,"
                         "KXAUSHOME,KXCHIHOME,KXDALHOME,KXHOBHOME,KXJCHOME,"
@@ -14422,6 +14424,7 @@ _CONFIG_CODE_KNOBS = (
     # ride in its status file's "model" block
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
     "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT", "HOME_EDGES",
+    "HOME_AUTO", "HOME_AUTO_PATTERN",
     # upcoming programs (2026-11-12)
     "UPCOMING_ENABLE", "UPCOMING_REFRESH_SECS", "UPCOMING_RETRY_SECS",
     "UPCOMING_GRACE_SECS", "UPCOMING_MIN_GAP_SECS", "UPCOMING_VERIFY_HOURS",
@@ -20577,7 +20580,26 @@ HOME_STATUS_FILE = os.environ.get(
 # them instead of downloading ~100MB a file again)
 HOME_CACHE_FILE = os.environ.get(
     "IMM_HOME_CACHE_FILE", os.path.join(STATUS_DIR, "zillow_home_cache.json"))
-_home_state: dict = {"snap": None}
+# ANY ZILLOW SERIES (Jack 2026-11-13: "why isnt KXMEMHOME-31DEC26 quoting?
+# make the Zillow markets generalizable and auto-quote new ones").
+# KXMEMHOME's $8.95/day program sat outside HOME_SERIES -- the family watch
+# had it as "needs a place on the allowlist". Nothing about a city needs a
+# hand: each market's rules name its Zillow region ID and home type, which
+# is all the fair reads. So every universe refresh hands the home refresher
+# the programs feed's series matching HOME_AUTO_PATTERN (active and
+# upcoming: home_note_programs), the refresher lists each new one's open
+# markets, and one whose rules name a Zillow Home Value Index joins
+# (home_auto_install): the family's override (x HOME_SIZE_MULT, 1-99c), the
+# allowlist (home_auto_allowed), the home gate with its 1c / 99c edges, and
+# HOME LEADS while the listed family leads. One whose rules do not
+# (KXEXUSHOME: FRED; KX<ST>HOMEPRICE: FHFA) is probed again every 15 min and
+# never enrolled. The confirmed set is in the status file's auto_series and
+# is read back once per process (home_auto_series), so a restart -- and the
+# family watch / quote-gap audits, which import this module -- know them
+# before the first read. IMM_HOME_AUTO=0: the hand-named HOME_SERIES only.
+HOME_AUTO = os.environ.get("IMM_HOME_AUTO", "1") == "1"
+HOME_AUTO_PATTERN = re.compile(os.environ.get("IMM_HOME_AUTO_PATTERN", r"HOME"))
+_home_state: dict = {"snap": None, "auto": None, "candidates": frozenset()}
 _HOME_SEG_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})$")      # 30NOV26
 
 for _s in HOME_SERIES:
@@ -20587,7 +20609,58 @@ for _s in HOME_SERIES:
 
 
 def home_series(series: str) -> bool:
-    return HOME_ENABLE and series in HOME_SERIES
+    """A Zillow home-value series: hand-named (HOME_SERIES) or confirmed by
+    the refresher (HOME_AUTO)."""
+    return HOME_ENABLE and (series in HOME_SERIES or home_auto_allowed(series))
+
+
+def home_auto_install(series: Iterable[str]) -> List[str]:
+    """Enroll confirmed Zillow series in the family (the HOME_SERIES override:
+    size x HOME_SIZE_MULT, band 1-99c). Returns the ones newly added. The set
+    is replaced, never changed in place (the quote loop reads it)."""
+    cur = _home_state.get("auto") or frozenset()
+    added = sorted({str(x) for x in series if x} - set(cur) - HOME_SERIES)
+    for s_ in added:
+        SERIES_OVERRIDES[s_] = replace(
+            SERIES_OVERRIDES.get(s_) or SeriesOverride(),
+            size_mult=HOME_SIZE_MULT, price_min_cents=1, price_max_cents=99)
+    _home_state["auto"] = frozenset(set(cur) | set(added))
+    return added
+
+
+def home_auto_series() -> frozenset:
+    """The confirmed auto series -- read back from HOME_STATUS_FILE the first
+    time a process asks (the refresher keeps it current after that)."""
+    auto = _home_state.get("auto")
+    if auto is None:
+        _home_state["auto"] = frozenset()
+        seed: List[str] = []
+        try:
+            with open(HOME_STATUS_FILE, encoding="utf-8") as f:
+                seed = [x for x in (json.load(f) or {}).get("auto_series") or []
+                        if isinstance(x, str)]
+        except (OSError, ValueError, AttributeError):
+            pass
+        home_auto_install(seed)
+        auto = _home_state["auto"]
+    return auto
+
+
+def home_auto_allowed(series: str) -> bool:
+    """A Zillow series the refresher confirmed (HOME_AUTO), not hand-named."""
+    return HOME_ENABLE and HOME_AUTO and series not in HOME_SERIES \
+        and series in home_auto_series()
+
+
+def home_note_programs(tickers: Iterable[str]) -> frozenset:
+    """Hand the home refresher this refresh's candidate series: the program
+    markets' series matching HOME_AUTO_PATTERN."""
+    if not (HOME_ENABLE and HOME_AUTO):
+        return frozenset()
+    cands = frozenset(s_ for s_ in {series_of(t) for t in tickers if t}
+                      if s_ and HOME_AUTO_PATTERN.search(s_))
+    _home_state["candidates"] = cands
+    return cands
 
 
 def home_cutoff_utc(event_ticker: str) -> Optional[datetime]:
@@ -25354,13 +25427,20 @@ def past_band_ahead(side: str, px: int, best: Optional[int]) -> bool:
     return px > best if side == "bid" else px < best
 
 
+# HOME LEADS for the auto-enrolled Zillow series (HOME_AUTO): while any
+# hand-named home series is in FAIR_LEAD_SERIES, the family's kit is theirs too
+HOME_AUTO_LEAD = any(s_ in FAIR_LEAD_SERIES for s_ in HOME_SERIES)
+
+
 def in_fair_lead_series(series: str) -> bool:
     """FAIR_LEAD_SERIES, with any rain-day series while the weekend family
-    is in it (AUTO DAY SERIES: it takes the weekend family's kit), and the
-    ARRAY TAIL LEADS arrays (CA_ARRAY_LEAD_SERIES)."""
+    is in it (AUTO DAY SERIES: it takes the weekend family's kit), the
+    ARRAY TAIL LEADS arrays (CA_ARRAY_LEAD_SERIES), and the auto-enrolled
+    Zillow series while the hand-named ones lead (HOME_AUTO_LEAD)."""
     return series in FAIR_LEAD_SERIES or (
         "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series)) \
-        or ca_array_lead_series(series)
+        or ca_array_lead_series(series) \
+        or (HOME_AUTO_LEAD and home_auto_allowed(series))
 
 
 def fair_close_series(series: str) -> bool:
@@ -32885,8 +32965,9 @@ class IncentiveMarketMaker:
         graduate families by Kalshi metadata, graduate_auto_series; the
         single-event mentions by Kalshi category, mention_auto_series; the AS
         test's Billboard and VoteHub families while live, astest_new_series;
-        the road races by name, marathon_series) unless ALLOWLIST_ONLY is
-        off. A market on the post-vote / wave list (PVD_FILE) is allowed while
+        the road races by name, marathon_series; any Zillow series whose
+        rules the home refresher confirmed, home_auto_allowed) unless
+        ALLOWLIST_ONLY is off. A market on the post-vote / wave list (PVD_FILE) is allowed while
         its entry is live: the list admits the MARKET, not its whole series
         (Jack 2026-11-05: "Yes, close the gaps" -- the market-wave playbook)."""
         if cls._blocked(ticker):
@@ -32933,6 +33014,7 @@ class IncentiveMarketMaker:
             politics_auto_series(series) or \
             (astest_new_series(series) and astest_pick_event_ok(ticker)) or \
             marathon_series(series) or \
+            home_auto_allowed(series) or \
             any(series.startswith(p) for p in ALLOW_SERIES_PREFIXES)
 
     def period_accrued(self, ticker: str) -> float:
@@ -33319,6 +33401,10 @@ class IncentiveMarketMaker:
         if by_market:
             self.state.programmed = set(by_market)
             note_programmed(by_market)    # the fair-lead event room (2026-10-31)
+            # ANY ZILLOW SERIES (2026-11-13, HOME_AUTO): the HOME series on
+            # the feed, active and upcoming, for the home refresher to probe
+            home_note_programs(list(by_market)
+                               + list(getattr(self, "_upcoming", None) or {}))
             # CARBON ARC FAMILIES (2026-09-22, see ALLOW_FAMILY_SUFFIXES):
             # source-verify novel suffix matches BEFORE the candidates
             # filter below reads _allowed, so a sibling Kalshi listed since
@@ -43955,7 +44041,7 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_mort_fair_refresh, daemon=True,
                              name="mort-fair").start()
-        if HOME_ENABLE and HOME_SERIES and not once:
+        if HOME_ENABLE and (HOME_SERIES or HOME_AUTO) and not once:
             # Zillow home value refresher (2026-11-12): the mortgage
             # refresher's shape. Kalshi markets every 15 min, the Zillow CSVs
             # HEADed every 5 (re-read on a new Last-Modified) inside
@@ -43968,14 +44054,23 @@ class IncentiveMarketMaker:
                 except Exception as e:
                     log(f"{self.tag} ! home-value refresher disabled: {e}")
                     return
-                watch = zillow_home_fair.HomeWatch(fair_reader(), sorted(HOME_SERIES),
-                                                   cache_path=HOME_CACHE_FILE)
+                watch = zillow_home_fair.HomeWatch(
+                    fair_reader(), sorted(HOME_SERIES), cache_path=HOME_CACHE_FILE,
+                    discover=((lambda: _home_state.get("candidates") or ())
+                              if HOME_AUTO else None),
+                    auto=sorted(home_auto_series()) if HOME_AUTO else ())
                 last = None
                 while True:
                     delay = max(30, HOME_FAIR_REFRESH_SECS)
                     try:
                         snap = watch.refresh()
                         _home_state["snap"] = snap
+                        if HOME_AUTO:
+                            for s_ in home_auto_install(snap.get("auto_series") or ()):
+                                log(f"{self.tag} home-value auto family: {s_} "
+                                    f"enrolled -- its rules name a Zillow Home "
+                                    f"Value Index (x{HOME_SIZE_MULT:g}, 1-99c, "
+                                    f"the home gate, its edges and leads)")
                         ents = snap.get("markets") or {}
                         n_ok = sum(1 for e in ents.values() if "p" in e)
                         key = (n_ok, len(ents), snap.get("release_ts"),
@@ -44531,8 +44626,12 @@ class IncentiveMarketMaker:
                 f"{7 + MORT_CUTOFF_BUFFER_DAYS}d before the first print that "
                 f"can settle, ttl {MORT_FAIR_TTL_MIN}m, refresh "
                 f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
-        if HOME_ENABLE and HOME_SERIES:
-            log(f"zillow home gate: {','.join(sorted(HOME_SERIES))} fail-closed, "
+        if HOME_ENABLE and (HOME_SERIES or HOME_AUTO):
+            log(f"zillow home gate: {','.join(sorted(HOME_SERIES))}"
+                + (f" + auto {','.join(sorted(home_auto_series())) or '-'} "
+                   f"(any HOME series on the feed whose rules name a Zillow "
+                   f"Home Value Index)" if HOME_AUTO else "")
+                + f" fail-closed, "
                 f"bids <= fair - {HOME_FAIR_TOL_CENTS}c, asks >= fair + "
                 f"{HOME_FAIR_TOL_CENTS}c, a touch fighting the fair by more "
                 f"stands aside, {HOME_RELEASE_HOLD_MIN}m out after a Zillow "

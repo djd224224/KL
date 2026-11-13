@@ -25793,7 +25793,8 @@ class TestZillowHomeGate(unittest.TestCase):
             with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
                 self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-30NOV26-GT1"), s)
             self.assertFalse(IncentiveMarketMaker._blocked(f"{s}-30NOV26-GT1"), s)
-        # Houston's condo "below" ladders are not modelled, so not enrolled
+        # Houston is not hand-named: it joins only once the refresher has
+        # confirmed its rules (HOME_AUTO, TestHomeAutoFamily)
         self.assertFalse(imm.home_series("KXHOUHOME"))
         with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
             self.assertFalse(IncentiveMarketMaker._allowed(
@@ -25893,6 +25894,116 @@ class TestZillowHomeGate(unittest.TestCase):
         bot.run_cycle()
         self.assertEqual(self._quotes(bot), [])
         self.assertNotIn(self.T, bot._home_edges)
+
+
+class TestHomeAutoFamily(TestZillowHomeGate):
+    """ANY ZILLOW SERIES (Jack 2026-11-13: "why isnt KXMEMHOME-31DEC26
+    quoting? make the Zillow markets generalizable and auto-quote new
+    ones"): the programs feed's HOME series go to the home refresher, and one
+    whose rules name a Zillow Home Value Index joins the family -- the
+    allowlist, the x1 / 1-99c override, the home gate and HOME LEADS --
+    without a hand-written list. Fixture KXMEMHOME-31DEC67-GT148000."""
+
+    T = "KXMEMHOME-31DEC67-GT148000"
+    EV = "KXMEMHOME-31DEC67"
+
+    def setUp(self):
+        super().setUp()
+        self._saved_auto = (imm._home_state.get("auto"),
+                            imm._home_state.get("candidates"))
+        imm._home_state["auto"] = frozenset()
+        imm._home_state["candidates"] = frozenset()
+
+    def tearDown(self):
+        for s_ in imm._home_state.get("auto") or ():
+            imm.SERIES_OVERRIDES.pop(s_, None)
+        imm._home_state["auto"], imm._home_state["candidates"] = self._saved_auto
+        super().tearDown()
+
+    def test_the_feed_hands_over_home_series(self):
+        got = imm.home_note_programs([
+            "KXMEMHOME-31DEC26-GT148000", "KXHOUHOME-28FEB27-LT111000",
+            "KXEXUSHOME-26DEC09-T435000", "KXNHHOMEPRICE-27FEB28-T478.68",
+            "KXSEAHOME-30NOV26-GT882500", "KXHIGHNY-26NOV14-T50", ""])
+        self.assertEqual(got, {"KXMEMHOME", "KXHOUHOME", "KXEXUSHOME",
+                               "KXNHHOMEPRICE", "KXSEAHOME"})
+        self.assertEqual(imm._home_state["candidates"], got)
+        with mock.patch.object(imm, "HOME_AUTO", False):
+            self.assertEqual(imm.home_note_programs(["KXMEMHOME-31DEC26-GT1"]),
+                             frozenset())
+        self.assertEqual(imm._home_state["candidates"], got)
+
+    def test_a_confirmed_series_joins_the_family(self):
+        s_ = "KXMEMHOME"
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertFalse(IncentiveMarketMaker._allowed(f"{s_}-31DEC26-GT1"))
+        self.assertFalse(imm.home_series(s_))
+        # a hand-named series is never "auto"
+        self.assertEqual(imm.home_auto_install([s_, "KXSEAHOME", s_]), [s_])
+        self.assertEqual(imm.home_auto_install([s_]), [])
+        self.assertEqual(imm._home_state["auto"], {s_})
+        self.assertTrue(imm.home_series(s_))
+        self.assertFalse(imm.home_auto_allowed("KXSEAHOME"))
+        self.assertTrue(imm.home_series("KXSEAHOME"))
+        ov = imm.series_override(s_)
+        self.assertEqual((ov.size_mult, ov.price_min_cents, ov.price_max_cents),
+                         (imm.HOME_SIZE_MULT, 1, 99))
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            self.assertTrue(IncentiveMarketMaker._allowed(f"{s_}-31DEC26-GT1"))
+        self.assertEqual(imm.in_fair_lead_series(s_), imm.HOME_AUTO_LEAD)
+        self.assertTrue(imm.HOME_AUTO_LEAD)
+        self.assertEqual(imm.fair_lead_margin(s_), imm.HOME_FAIR_TOL_CENTS)
+        nov30 = imm.home_cutoff_utc("KXMEMHOME-31DEC26")
+        self.assertEqual(nov30, datetime(2026, 12, 31, 5, 0, tzinfo=timezone.utc))
+        # the kill switches
+        with mock.patch.object(imm, "HOME_AUTO", False):
+            self.assertFalse(imm.home_series(s_))
+            with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+                self.assertFalse(IncentiveMarketMaker._allowed(f"{s_}-31DEC26-GT1"))
+        with mock.patch.object(imm, "HOME_ENABLE", False):
+            self.assertFalse(imm.home_series(s_))
+        with mock.patch.object(imm, "HOME_AUTO_LEAD", False):
+            self.assertFalse(imm.in_fair_lead_series(s_))
+
+    def test_a_restart_reads_the_confirmed_set_back(self):
+        with open(imm.HOME_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"auto_series": ["KXMEMHOME", 5, "KXHOUHOME"]}, f)
+        try:
+            imm._home_state["auto"] = None
+            self.assertEqual(imm.home_auto_series(), {"KXMEMHOME", "KXHOUHOME"})
+            self.assertEqual(imm.series_override("KXHOUHOME").price_min_cents, 1)
+            # read once a process: the refresher keeps it from then on
+            os.remove(imm.HOME_STATUS_FILE)
+            self.assertEqual(imm.home_auto_series(), {"KXMEMHOME", "KXHOUHOME"})
+            imm._home_state["auto"] = None
+            self.assertEqual(imm.home_auto_series(), frozenset())
+            with open(imm.HOME_STATUS_FILE, "w", encoding="utf-8") as f:
+                f.write("{not json")
+            imm._home_state["auto"] = None
+            self.assertEqual(imm.home_auto_series(), frozenset())
+        finally:
+            if os.path.exists(imm.HOME_STATUS_FILE):
+                os.remove(imm.HOME_STATUS_FILE)
+
+    def test_quotes_only_clear_of_the_fair(self):
+        with mock.patch.object(imm, "ALLOWLIST_ONLY", True):
+            # not confirmed yet: not allowed, nothing quoted
+            bot = self._bot()
+            self._snap(p=0.70)
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertNotIn(self.T, bot.state.selected)
+            # confirmed: the hand-named family's whole kit, through the
+            # allowlist
+            imm.home_auto_install(["KXMEMHOME"])
+            imm._home_state["snap"] = None
+            super().test_quotes_only_clear_of_the_fair()
+
+    def test_enrolled_and_cut_off_on_the_ticker_day(self):
+        pass                                  # the hand-named list's own test
+
+    def test_gate_reasons_fail_closed(self):
+        pass                                  # the gate is the same function
 
 
 class TestPokemonFairGate(unittest.TestCase):
