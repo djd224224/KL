@@ -44177,3 +44177,106 @@ class TestTwinCheck(unittest.TestCase):
         self.assertEqual(bot._comp_groups, {})
         self.assertFalse(any(s.startswith("twin check") or " twin check " in s
                              for s in lines if "(2026-11-11)" not in s))
+
+
+class TestOscarsWinnersBand(unittest.TestCase):
+    """OSCARS 1-99c (Jack 2026-11-13: "be open to quoting oscars when they
+    launch KXOSCARS-EDIT27, KXOSCARS-SOUND27, etc"): the KXOSCARS winners
+    (category in the event segment) inherit the Oscar guard set, dated on
+    the family's Dec 15 shortlist row, and quote 1-99c -- a long shot at a
+    1c bid x a 6c ask, the shape of every EDIT27 / SOUND27 nominee on 11/13,
+    is no longer screened out."""
+
+    T = "KXOSCARS-EDIT27-WNIN"
+    EV = "KXOSCARS-EDIT27"
+
+    def setUp(self):
+        _clean_persist()
+        for s in ("KXOSCARS", "KXOSCARMENTION"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+        self.addCleanup(lambda: [imm.SERIES_OVERRIDES.pop(s, None)
+                                 for s in ("KXOSCARS", "KXOSCARMENTION")])
+        self._saved_hour_mults = imm.SERIES_HOUR_MULTS
+        imm.SERIES_HOUR_MULTS = []
+        self.addCleanup(setattr, imm, "SERIES_HOUR_MULTS", self._saved_hour_mults)
+
+    def test_the_winners_clone_the_family_at_1_to_99(self):
+        self.assertEqual((imm.OSCAR_PRICE_MIN, imm.OSCAR_PRICE_MAX), (1, 99))
+        self.assertTrue(IncentiveMarketMaker._allowed(self.T))
+        imm.ensure_family_override("KXOSCARS")
+        ov = imm.series_override("KXOSCARS")
+        self.assertEqual((ov.price_min_cents, ov.price_max_cents), (1, 99))
+        self.assertTrue(ov.safe_join)
+        self.assertTrue(ov.pre_event_dates_only)
+        self.assertEqual(ov.pre_event_days, 1.0)
+        self.assertEqual((imm.series_price_min("KXOSCARS"), imm.series_price_max("KXOSCARS")),
+                         (1, 99))
+        # no row has the -<CATEGORY>27 shape: the family's earliest -27 row,
+        # the Dec 15 shortlist, dates every category (out Dec 14 00:00 ET)
+        try:
+            for ev in (self.EV, "KXOSCARS-SOUND27", "KXOSCARS-PROD27"):
+                self.assertEqual(imm.apply_series_cutoff_adjustments(
+                    "KXOSCARS", ev, None, close_time=None, market=None),
+                    utc(2026, 12, 14, 5, 0), ev)
+        finally:
+            for ev in (self.EV, "KXOSCARS-SOUND27", "KXOSCARS-PROD27"):
+                imm._config_gaps.pop(ev, None)
+        # the mention book stays the mention family's
+        imm.ensure_family_override("KXOSCARMENTION")
+        self.assertNotIn("KXOSCARMENTION", imm.SERIES_OVERRIDES)
+
+    def _cycle(self, band=None):
+        now = datetime.now(timezone.utc)
+        client = FakeClient()
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 9000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.EV, "status": "active",
+            "close_time": "2099-12-31T15:00:00Z",
+            "expected_expiration_time": "2099-12-31T15:00:00Z",
+            "yes_bid_dollars": "0.0100", "yes_ask_dollars": "0.0600",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "1500"]], "no_dollars": [["0.94", "1500"]]}}
+        far = ((f"{self.EV[:-2]}*27", now + timedelta(days=60)),)  # a date the test can't outlive
+        patches = [mock.patch.object(imm, "AWARDS_EVENT_DATES", far),
+                   mock.patch.object(imm, "AWARDS_DATES_EXTRA", ()),
+                   mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off")]
+        if band is not None:
+            imm.ensure_family_override("KXOSCARS")
+            imm.SERIES_OVERRIDES["KXOSCARS"] = dataclasses.replace(
+                imm.SERIES_OVERRIDES["KXOSCARS"],
+                price_min_cents=band[0], price_max_cents=band[1])
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rest = sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                      if o["ticker"] == self.T)
+        return bot, rest, lines
+
+    def test_a_long_shot_quotes(self):
+        bot, rest, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected,
+                      [s for s in lines if "universe:" in s][-3:])
+        self.assertTrue(rest, [s for s in lines if self.T in s][-10:])
+        self.assertTrue(all(1 <= px <= 99 for _side, px in rest), rest)
+
+    def test_the_old_band_screened_it_out(self):
+        bot, rest, lines = self._cycle(band=(5, 90))
+        self.assertNotIn(self.T, bot.state.selected)
+        self.assertEqual(rest, [])
+        self.assertTrue(any("'extreme_mid': 1" in s for s in lines if "universe:" in s),
+                        [s for s in lines if "universe:" in s][-3:])

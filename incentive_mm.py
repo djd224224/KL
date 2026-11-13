@@ -14427,6 +14427,7 @@ _CONFIG_CODE_KNOBS = (
     "GOPSIX_SIZE_MULT",           # KXGOPSIXSENATE x4, forced (2026-11-02)
     "SPRLVLDATE_SIZE_MULT",       # KXSPRLVLDATE x2 (2026-11-10)
     "ART_PRICE_MIN", "ART_PRICE_MAX",                    # KXART 2-98c (2026-11-11)
+    "OSCAR_PRICE_MIN", "OSCAR_PRICE_MAX",                # KXOSCAR* 1-99c (2026-11-13)
     "ART_BOOST_SIDE_CAP", "ART_BOOST_CHEAP_C", "ART_BOOST_CHEAP_SIDE_CAP",
     "ART_EVENT_CAP",                                     # ART FLOOR BOOST (2026-11-11)
     # ...and four more families x2 the same day (FAMILY_X2_1011)
@@ -21974,6 +21975,26 @@ SERIES_OVERRIDES["KXCRITICS"] = replace(SERIES_OVERRIDES["KXCRITICS"],
 GRAMMY_NOM_SIZE_MULT = _env_float("IMM_GRAMMY_NOM_SIZE_MULT", 2.0)
 SERIES_OVERRIDES["KXGRAMMYNOM"] = replace(SERIES_OVERRIDES["KXGRAMMYNOM"],
                                           size_mult=GRAMMY_NOM_SIZE_MULT)
+# OSCARS 1-99c (Jack 2026-11-13: "be open to quoting oscars when they launch
+# KXOSCARS-EDIT27, KXOSCARS-SOUND27, etc"). Kalshi listed KXOSCARS, the 99th
+# Oscars' winners with the category in the event segment: 10 events (EDIT,
+# SOUND, CAST, COST, PROD, SONG, VFX, ANIMSHORT, DOCSHORT, LIVESHORT), 72
+# markets, $1,965 of programs 11/13 17:00Z -> 11/15 05:00Z. The family
+# already admits them (OSCAR_FAMILY_RE) and dates them: no table row matches
+# the -<CATEGORY>27 shape, so awards_family_default puts every category on
+# the family's earliest -27 row, the Dec 15 shortlist (out Dec 14 00:00 ET,
+# the safe error). But 57 of the 72 are long shots at a 1c bid x a 5-11c ask
+# -- every EDIT27 and SOUND27 nominee -- and the 5-90c band screened them out
+# (extreme_mid). The family parent takes 1-99c, so every KXOSCAR* member
+# (winners and nominations; not KXOSCARMENTION, the mention family's) clones
+# it: a long shot's bid can join the 1c wall, the least-risk quote there.
+# Size (x1), the 5/event cap, safe-join and the stand-down are unchanged.
+# IMM_OSCAR_PRICE_MIN / _MAX (5 / 90 = the old screen).
+OSCAR_PRICE_MIN = _env_int("IMM_OSCAR_PRICE_MIN", 1)
+OSCAR_PRICE_MAX = _env_int("IMM_OSCAR_PRICE_MAX", 99)
+SERIES_OVERRIDES["KXOSCAR"] = replace(SERIES_OVERRIDES["KXOSCAR"],
+                                      price_min_cents=OSCAR_PRICE_MIN,
+                                      price_max_cents=OSCAR_PRICE_MAX)
 
 # FAMILY x2, 2026-10-11 (Jack: "do 1,2,6,8" -- #2 and #6 of the consolidated
 # recommendations): Rotten Tomatoes, Trump endorsements, the strait / port
