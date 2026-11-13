@@ -6353,7 +6353,7 @@ class TestSeriesAutoEnroll(unittest.TestCase):
         imm.ALLOWLIST_ONLY = True
         imm.FAMILY_VERDICTS.clear()
         try:
-            self.assertEqual(imm.ALLOW_FAMILY_SUFFIXES, ("CC", "ADS", "POS"))
+            self.assertEqual(imm.ALLOW_FAMILY_SUFFIXES[:3], ("CC", "ADS", "POS"))
             self.assertTrue(imm.FAMILY_SOURCE_CHECK)
             members = ("KXURBNCC", "KXDGCC", "KXCOSTCC", "KXAMZNCC",
                        "KXSBUXCC", "KXNEVERSEENCC",
@@ -44491,3 +44491,70 @@ class TestOscarsWinnersBand(unittest.TestCase):
         self.assertEqual(rest, [])
         self.assertTrue(any("'extreme_mid': 1" in s for s in lines if "universe:" in s),
                         [s for s in lines if "universe:" in s][-3:])
+
+
+class TestCarbonArcTikTokShop(unittest.TestCase):
+    """Jack 2026-11-13: "they should quote as part of carbon arc auto-quoting
+    family along other tiktok shop" (KXHAUSTTS-26DEC06, KXRHODETTS-26DEC06).
+    The TikTok Shop brand monthlies and their array leave the capped finecon
+    group for the normal book, source-verified like *CC / *ADS / *POS."""
+
+    SINGLES = ("KXHAUSTTS", "KXRHODETTS", "KXRARETTS", "KXFENTYTTS", "KXREMTTS")
+    ARRAY = "KXCELEBTTSARRAY"
+
+    def setUp(self):
+        self.saved_only = imm.ALLOWLIST_ONLY
+        self.saved_verdicts = dict(imm.FAMILY_VERDICTS)
+        self.saved_state = dict(imm._finecon_extra_state)
+        imm.ALLOWLIST_ONLY = True
+        imm.FAMILY_VERDICTS.clear()
+
+    def tearDown(self):
+        imm.ALLOWLIST_ONLY = self.saved_only
+        imm.FAMILY_VERDICTS.clear()
+        imm.FAMILY_VERDICTS.update(self.saved_verdicts)
+        for s in self.SINGLES + (self.ARRAY, "KXNOTCATTS"):
+            imm.SERIES_OVERRIDES.pop(s, None)
+        imm.FINECON_SERIES.clear()
+        imm.FINECON_SERIES.update(imm._FINECON_BASE)
+        imm._finecon_extra_state.update(self.saved_state)
+        try:
+            os.remove(imm.FINECON_EXTRA_FILE)
+        except OSError:
+            pass
+
+    def _verdicts(self, *series, carbon_arc=True):
+        for s in series:
+            imm.FAMILY_VERDICTS[s] = {"carbon_arc": carbon_arc, "ts": time.time(),
+                                      "title": f"{s} TikTok Shop sales"}
+
+    def test_the_family_takes_them_into_the_normal_book(self):
+        every = self.SINGLES + (self.ARRAY,)
+        for s in every:
+            self.assertTrue(imm.series_family_suffix(s), s)
+            # no verdict yet: fail closed, like every Carbon Arc family
+            self.assertFalse(IncentiveMarketMaker._allowed(f"{s}-26DEC06-T100"), s)
+        self._verdicts(*every)
+        for s in every:
+            self.assertTrue(IncentiveMarketMaker._allowed(f"{s}-26DEC06-T100"), s)
+            self.assertTrue(imm.carbon_arc_settled(s), s)
+            self.assertEqual(imm.ca_category(s), "tiktok shop", s)
+            self.assertEqual(imm.event_top_n_for(s), 0, s)
+            imm.ensure_family_override(s)
+            self.assertEqual(imm.SERIES_OVERRIDES[s],
+                             imm.SERIES_OVERRIDES["KXDRPEPPERPOS"], s)
+
+    def test_the_finecon_loader_refuses_them(self):
+        with open(imm.FINECON_EXTRA_FILE, "w", encoding="utf-8") as f:
+            json.dump({"series": list(self.SINGLES) + [self.ARRAY, "KXSODAARRAY"]}, f)
+        os.utime(imm.FINECON_EXTRA_FILE, (time.time(), time.time() + 7))
+        with mock.patch.object(imm, "log"):
+            imm.load_finecon_extra_series()
+        for s in self.SINGLES + (self.ARRAY,):
+            self.assertNotIn(s, imm.FINECON_SERIES, s)
+        # the other Carbon Arc sector arrays stay in the finecon group
+        self.assertIn("KXSODAARRAY", imm.FINECON_SERIES)
+
+    def test_a_non_carbon_arc_tts_name_stays_out(self):
+        self._verdicts("KXNOTCATTS", carbon_arc=False)
+        self.assertFalse(IncentiveMarketMaker._allowed("KXNOTCATTS-26DEC06-T1"))

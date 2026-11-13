@@ -2395,7 +2395,8 @@ for _part in os.environ.get("IMM_CA_LANDING_WINDOWS_UTC", _DEFAULT_CA_LANDING_WI
 # a series with no read yet is categorised by its ticker suffix
 _CA_SUFFIX_CATEGORY = (("ADS", "advertising"), ("APP", "app"),
                        ("POS", "point of sale"), ("FT", "foot traffic"),
-                       ("CC", "credit card"))
+                       ("CC", "credit card"), ("TTS", "tiktok shop"),
+                       ("TTSARRAY", "tiktok shop"))
 # ...and, with no suffix either, by the Kalshi series title its source
 # verdict stored (Jack 2026-10-16: "Ship A1 and A2 now"). The Carbon Arc
 # SECTOR ARRAYS listed 10/16 (KXSODAARRAY "Soda point of sale spend array",
@@ -2408,7 +2409,8 @@ _CA_TITLE_CATEGORY = (("point of sale", "point of sale"),
                       ("app download", "app"),
                       ("foot traffic", "foot traffic"),
                       ("ad spend", "advertising"),
-                      ("advertising", "advertising"))
+                      ("advertising", "advertising"),
+                      ("tiktok shop", "tiktok shop"))
 
 
 def ca_category(series: str) -> Optional[str]:
@@ -3526,7 +3528,7 @@ def _parse_event_top_n(spec: str) -> Tuple[Tuple[str, int], ...]:
 # IMM_CA_FAMILY_EVENT_TOP_N=3 and IMM_RAMP_EVENT_TOP_N=3.
 CA_FAMILY_EVENT_TOP_N = _env_int("IMM_CA_FAMILY_EVENT_TOP_N", 0)
 _CA_FAMILY_EVENT_TOP_N_SPEC = (
-    "," + ",".join(f"*{_suf}:{CA_FAMILY_EVENT_TOP_N}" for _suf in ("CC", "ADS", "POS"))
+    "," + ",".join(f"*{_suf}:{CA_FAMILY_EVENT_TOP_N}" for _suf in ("CC", "ADS", "POS", "TTS", "TTSARRAY"))
     if CA_FAMILY_EVENT_TOP_N > 0 else "")
 _RAMP_EVENT_TOP_N_SPEC = (
     "," + ",".join(f"{_s}:{RAMP_EVENT_TOP_N}" for _s in RAMP_AI_SERIES)
@@ -6141,8 +6143,20 @@ ALLOW_SERIES_SUFFIXES = tuple(
 # new sibling on the next refresh, not the next day. A failed read keeps the
 # previous verdict (a transient 429 must never un-admit a quoting family).
 # IMM_FAMILY_SOURCE_CHECK=0 is the kill switch back to the bare suffix rule.
+# *TTS / *TTSARRAY (Jack 2026-11-13: "they should quote as part of carbon arc
+# auto-quoting family along other tiktok shop", on KXHAUSTTS-26DEC06 /
+# KXRHODETTS-26DEC06): the Carbon Arc TikTok Shop brand monthlies (KXHAUSTTS
+# Haus Labs, KXRHODETTS Rhode, KXRARETTS, KXFENTYTTS, KXREMTTS) and their
+# celebrity array (KXCELEBTTSARRAY), listed 11/13 18:01Z. The overrides
+# task had filed them in the finecon group, whose 35 seats were full of
+# members (26 of them under the bar): all 43 strikes sat out as
+# `finecon_top_n` while projecting $2-5 each. The same move as *ADS / *POS
+# on 2026-09-22: the normal book by name pattern, source-verified, with the
+# POS guard set (FAMILY_OVERRIDE_PARENTS) and the finecon loader refusing
+# them. IMM_ALLOW_FAMILY_SUFFIXES=CC,ADS,POS reverts.
 ALLOW_FAMILY_SUFFIXES = tuple(
-    s for s in os.environ.get("IMM_ALLOW_FAMILY_SUFFIXES", "CC,ADS,POS").split(",")
+    s for s in os.environ.get("IMM_ALLOW_FAMILY_SUFFIXES",
+                              "CC,ADS,POS,TTS,TTSARRAY").split(",")
     if s)
 FAMILY_SOURCE_CHECK = os.environ.get("IMM_FAMILY_SOURCE_CHECK", "1") == "1"
 FAMILY_SOURCE_KEYWORDS = tuple(k.strip().lower() for k in os.environ.get(
@@ -12563,6 +12577,10 @@ FAMILY_OVERRIDE_PARENTS = (
     ("family_suffix", "CC", "KXAMZNCC"),
     ("family_suffix", "ADS", "KXAMUSEMENTADS"),
     ("family_suffix", "POS", "KXDRPEPPERPOS"),
+    # TikTok Shop brand monthlies + their array (2026-11-13): the POS guard
+    # set (safe-join, no rate bar), the same one every Carbon Arc family has
+    ("family_suffix", "TTS", "KXDRPEPPERPOS"),
+    ("family_suffix", "TTSARRAY", "KXDRPEPPERPOS"),
     # regex kind (2026-09-24): the sports ladder / escalator families
     ("pattern", SPORTS_LADDER_LEAGUE_RE, "KXNFLLADDERREC"),
     # monthly rain cities beyond the named list (2026-10-26, see
