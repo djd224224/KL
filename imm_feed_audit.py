@@ -124,6 +124,8 @@ def run_audit(client=None, progs=None) -> dict:
     # 2026-11-13): the bot enrolls them from the file at every refresh
     if hasattr(imm, "load_vercel_series"):
         imm.load_vercel_series()
+        if hasattr(imm, "load_crypto_open_series"):
+            imm.load_crypto_open_series()   # the crypto open family (2026-11-13)
     # ...and the central-bank family (FINECON_SERIES_PREFIXES, "KXCBD"),
     # which the bot admits from the live programs feed at every refresh
     # (finecon_expand_family, in memory only). Without it every bank past

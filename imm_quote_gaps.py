@@ -464,6 +464,8 @@ def classify_and_estimate(client, bot, now_utc: datetime):
     # ...and the Vercel family's discovered series (2026-11-13)
     if hasattr(imm, "load_vercel_series"):
         imm.load_vercel_series()
+        if hasattr(imm, "load_crypto_open_series"):
+            imm.load_crypto_open_series()   # the crypto open family (2026-11-13)
     imm.load_rain_fair()
     if hasattr(imm, "load_astest_picks"):
         imm.load_astest_picks()

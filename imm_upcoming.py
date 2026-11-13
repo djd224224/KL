@@ -94,7 +94,7 @@ def fetch_upcoming_raw(client) -> list:
 # the bot's hot-reloaded admission files, as refresh_universe loads them: the
 # allowlist verdicts here must be the running bot's
 _RELOADS = ("load_file_event_overrides", "load_extra_allow_series",
-            "load_finecon_extra_series", "load_vercel_series",
+            "load_finecon_extra_series", "load_vercel_series", "load_crypto_open_series",
             "load_election_extra_series",
             "load_pvd_markets", "load_nfl_auto_series", "load_league_auto_series",
             "load_awards_extra_series", "load_graduate_auto_series",

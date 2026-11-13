@@ -9900,7 +9900,8 @@ def no_side_only(ticker: str) -> bool:
     not event_ticker_of: KXPRESRUN-28's markets carry a date segment too
     (KXPRESRUN-28-28NOV07-TMAS), which that helper would keep."""
     return any(ticker == ev or ticker.startswith(ev + "-")
-               for ev in NO_SIDE_ONLY_EVENTS)
+               for ev in NO_SIDE_ONLY_EVENTS) \
+        or crypto_open_series(ticker.split("-")[0])     # CRYPTO OPEN FAMILY
 
 # KXGENERALMOV (Jack 2026-10-23: "What multiplier are they at?" -> the family
 # x2 -> "Increase to 3x"). The margin-of-victory races: 11 Senate and 4
@@ -19509,6 +19510,149 @@ def vercel_series(series: str) -> bool:
     return VERCEL_ENABLE and series in VERCEL_SERIES
 
 
+# CRYPTO OPEN FAMILY (Jack 2026-11-13: "for KXBTCHITBY / KXSOLABOVEBY, and
+# others just quote the no side at 5x base. besides the markets the crypto
+# bot quotes, all other crypto markets are fair game for IMM"). Every crypto
+# series had been out by OWNERSHIP (SCAN_EXCLUDE_PREFIXES: KXBTC, KXSOL, ...)
+# and no list carried the ones no fleet bot trades, so KXBTCHITBY,
+# KXSOLABOVEBY, KXBTCHIT85K/90K/95K, KXETHABOVE*BY and the four *EVENT
+# series ("<asset> after economic events", 136 strikes each) sat dark under
+# $3.4k of programs (11/13).
+#   MEMBERSHIP: a series in Kalshi's Crypto category (GET /series, re-read
+#     every CRYPTO_OPEN_DISCOVER_SECS, kept in CRYPTO_OPEN_FILE) that is not
+#     the fleet's (CRYPTO_FLEET_SERIES: crypto_touch_mm's MAX/MINMON,
+#     crypto_touch_mm_weekly's MAX/MINW, crypto_updown_mm's <A>D,
+#     crypto_annual_mm's MAX/MINY and terminal Y, for every fleet asset),
+#     not blocklisted and not already on a list (the structural
+#     _DEFAULT_CRYPTO_SERIES keep their own two-sided quoting).
+#   NO SIDE ONLY (no_side_only): YES asks (= NO bids), never a YES bid.
+#   x CRYPTO_OPEN_SIZE_MULT (5) on the base ladder, no rate bar, a 1-99c
+#     band (a BTC touch at $105k from $68k rests its NO at 95c); joined at
+#     the touch -- safe-join's 2 ticks behind scored nothing on these
+#     1c x 5c books.
+#   DATES: these tickers write DDMMMYY(HHMM) -- KXBTCEVENT-10DEC260930 is
+#     Dec 10, 2026, KXBTCHITBY-01JAN270000 Jan 1, 2027 -- while Kalshi's
+#     hourly crypto writes YYMMMDDHH (KXBTC-26NOV1317); parse_event_date
+#     takes the reading nearer this year. The midnight-ET rule then has an
+#     *EVENT strike out before its release day (its 9:30 ET observation
+#     follows an 8:30 release), a touch market at its deadline.
+#   CASH (CRYPTO_OPEN_BUDGET): crypto events sit on exchange shard 2, whose
+#     free cash the crypto fleet shares ($1,183 on 11/13). The selection
+#     admits the family, best ROI first, while its worst-case resting NO
+#     cost stays under the budget, so it cannot starve the fleet's orders.
+# IMM_CRYPTO_OPEN=0 takes the family out.
+CRYPTO_OPEN = os.environ.get("IMM_CRYPTO_OPEN", "1") == "1"
+CRYPTO_OPEN_SIZE_MULT = _env_float("IMM_CRYPTO_OPEN_SIZE_MULT", 5.0)
+CRYPTO_OPEN_BUDGET = _env_float("IMM_CRYPTO_OPEN_BUDGET", 500.0)
+CRYPTO_OPEN_CATEGORY = os.environ.get("IMM_CRYPTO_OPEN_CATEGORY", "Crypto")
+CRYPTO_OPEN_DISCOVER_SECS = _env_int("IMM_CRYPTO_OPEN_DISCOVER_SECS", 3600)
+CRYPTO_OPEN_FILE = os.environ.get(
+    "IMM_CRYPTO_OPEN_FILE", os.path.join(STATUS_DIR, "crypto_series.json"))
+_CRYPTO_FLEET_SUFFIXES = ("MAXMON", "MINMON", "MAXW", "MINW", "D",
+                          "MAXY", "MINY", "Y")
+CRYPTO_FLEET_SERIES = frozenset(
+    f"KX{a}{suf}" for a in _CRYPTO_ASSETS for suf in _CRYPTO_FLEET_SUFFIXES
+) | {"KXSOLD26"}
+CRYPTO_CATEGORY_SERIES: Set[str] = set()
+_crypto_open_state: dict = {"mtime": 0.0, "next_read": 0.0}
+
+
+def crypto_open_series(series: str) -> bool:
+    """A crypto series the IMM quotes NO side only (CRYPTO OPEN FAMILY)."""
+    return (CRYPTO_OPEN and series in CRYPTO_CATEGORY_SERIES
+            and series not in CRYPTO_FLEET_SERIES
+            and series not in ALLOW_SERIES and series not in EXTRA_ALLOW_SERIES
+            and not any(series.startswith(p) for p in SERIES_BLOCKLIST_PREFIXES))
+
+
+def _crypto_open_enroll(series_set) -> List[str]:
+    """Merge Crypto-category series in; returns the family members new to it.
+    Members take the family's overrides (a hand-tuned one wins)."""
+    series_set = set(series_set)
+    new = sorted(series_set - CRYPTO_CATEGORY_SERIES)
+    CRYPTO_CATEGORY_SERIES.update(series_set)
+    for s in CRYPTO_CATEGORY_SERIES:
+        if crypto_open_series(s) and s not in SERIES_OVERRIDES:
+            SERIES_OVERRIDES[s] = SeriesOverride(
+                min_est_per_day=0.0,
+                size_mult=CRYPTO_OPEN_SIZE_MULT,
+                price_min_cents=1, price_max_cents=99)
+    return [s for s in new if crypto_open_series(s)]
+
+
+def load_crypto_open_series() -> int:
+    """Hot-load CRYPTO_OPEN_FILE by mtime; returns new family members."""
+    if not CRYPTO_OPEN:
+        return 0
+    try:
+        mtime = os.path.getmtime(CRYPTO_OPEN_FILE)
+    except OSError:
+        return 0
+    if mtime == _crypto_open_state["mtime"]:
+        return 0
+    _crypto_open_state["mtime"] = mtime
+    try:
+        with open(CRYPTO_OPEN_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as e:
+        log(f"[IMM] ! crypto series file unreadable: {e}")
+        return 0
+    new = _crypto_open_enroll(str(x) for x in data.get("series") or [])
+    if new:
+        log(f"[IMM] crypto open family: +{len(new)} -> {', '.join(new)} "
+            f"(NO side only, x{CRYPTO_OPEN_SIZE_MULT:g}, budget "
+            f"${CRYPTO_OPEN_BUDGET:,.0f})")
+    return len(new)
+
+
+def refresh_crypto_open_series(client, now_ts: Optional[float] = None) -> int:
+    """The family's membership: the file, then Kalshi's Crypto category
+    every CRYPTO_OPEN_DISCOVER_SECS (a failed read retries in 10 min and
+    keeps the last list)."""
+    if not CRYPTO_OPEN:
+        return 0
+    n = load_crypto_open_series()
+    now_ts = time.time() if now_ts is None else now_ts
+    if client is None or now_ts < _crypto_open_state["next_read"]:
+        return n
+    _crypto_open_state["next_read"] = now_ts + 600
+    try:
+        found: Set[str] = set()
+        cursor = None
+        for _ in range(50):
+            params = {"category": CRYPTO_OPEN_CATEGORY}
+            if cursor:
+                params["cursor"] = cursor
+            body = client.get("/series", params) or {}
+            found.update(str(x.get("ticker")) for x in body.get("series") or []
+                         if isinstance(x, dict) and x.get("ticker"))
+            cursor = body.get("cursor") or body.get("next_cursor")
+            if not cursor:
+                break
+    except Exception as e:                      # noqa: BLE001 - keep the last list
+        log(f"[IMM] ! crypto category read failed: {type(e).__name__}: {str(e)[:120]}")
+        return n
+    _crypto_open_state["next_read"] = now_ts + CRYPTO_OPEN_DISCOVER_SECS
+    if not found:
+        return n
+    if found - CRYPTO_CATEGORY_SERIES:
+        tmp = CRYPTO_OPEN_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                           "category": CRYPTO_OPEN_CATEGORY,
+                           "series": sorted(found)}, f, indent=1)
+            os.replace(tmp, CRYPTO_OPEN_FILE)
+        except OSError as e:
+            log(f"[IMM] ! crypto series file not written: {e}")
+    new = _crypto_open_enroll(found)
+    if new:
+        log(f"[IMM] crypto open family: +{len(new)} -> {', '.join(new)} "
+            f"(NO side only, x{CRYPTO_OPEN_SIZE_MULT:g}, budget "
+            f"${CRYPTO_OPEN_BUDGET:,.0f})")
+    return n + len(new)
+
+
 def vercel_measured_day(event_ticker: str) -> Optional[datetime]:
     """00:00Z of the UTC day D a Vercel event measures: lab series DDMMMYY =
     D, KXOPENSOURCESHARE YYMMMDD = D + 1. None when it does not parse."""
@@ -21407,6 +21551,14 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
         # YYMONDD reading (2024-12-26) put every strike past its cutoff.
         # The six, and every resort series the writer has mapped since.
         yy, dd = dd, yy
+    _cos = globals().get("crypto_open_series")
+    if _cos is not None and _cos(parts[0]):
+        # CRYPTO OPEN FAMILY (2026-11-13): DDMMMYY(HHMM) on the price-by-date
+        # and after-event series, YYMMMDDHH on the hourly ones -- the reading
+        # nearer this year
+        _yy = datetime.now(timezone.utc).year % 100
+        if abs(int(dd) - _yy) < abs(int(yy) - _yy):
+            yy, dd = dd, yy
     if parts[0] in RAIN_DAY_SERIES:
         # the election-day rain (2026-10-31) writes its day first too:
         # KXRAINELECTION-03NOV26 is November 3, 2026, not 2003-11-26
@@ -33051,6 +33203,7 @@ class IncentiveMarketMaker:
         # be allowed the same refresh they join the group.
         return series in ALLOW_SERIES or series in EXTRA_ALLOW_SERIES or \
             series in FINECON_SERIES or vercel_series(series) or \
+            crypto_open_series(series) or \
             any(series.endswith(suf) for suf in ALLOW_SERIES_SUFFIXES) or \
             family_series_allowed(series) or \
             series_pattern_allowed(series) or \
@@ -33363,6 +33516,7 @@ class IncentiveMarketMaker:
         load_astest_picks(now_utc)    # the AS test's daily picks (2026-10-27)
         load_finecon_extra_series()
         load_vercel_series()          # discovered Vercel series (2026-11-13)
+        refresh_crypto_open_series(self.client)   # crypto open family (2026-11-13)
         load_election_extra_series()
         load_pvd_markets()            # post-vote dead books (2026-11-04)
         load_nfl_auto_series()        # NFL auto families (2026-10-12)
@@ -34610,6 +34764,11 @@ class IncentiveMarketMaker:
             collateral += market_cost(meta)
             selected[meta.ticker] = meta
         forced_collateral = collateral
+        # CRYPTO OPEN FAMILY cash (2026-11-13): its worst-case resting NO cost
+        # on shard 2, the fleet's cash, held to CRYPTO_OPEN_BUDGET
+        _real = COLLATERAL_REALIZATION if COLLATERAL_REALIZATION > 0 else 1.0
+        crypto_cost = sum(market_cost(m) / _real for t, m in selected.items()
+                          if crypto_open_series(m.series))
         # MAX_MARKETS bounds the number of distinct EVENTS, not markets: once an
         # event is opened (its best-yielding market clears the budget), EVERY
         # other screened market of that event is eligible too — no per-event
@@ -34628,6 +34787,12 @@ class IncentiveMarketMaker:
                 skipped["budget"] = skipped.get("budget", 0) + 1
                 decisions[meta.ticker] = "budget"
                 continue
+            if CRYPTO_OPEN_BUDGET > 0 and crypto_open_series(meta.series):
+                if crypto_cost + cost / _real > CRYPTO_OPEN_BUDGET:
+                    skipped["crypto_budget"] = skipped.get("crypto_budget", 0) + 1
+                    decisions[meta.ticker] = "crypto_budget"
+                    continue
+                crypto_cost += cost / _real
             collateral += cost
             selected[meta.ticker] = meta
             selected_events.add(meta.event_ticker)

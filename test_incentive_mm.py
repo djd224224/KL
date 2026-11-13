@@ -177,6 +177,7 @@ def setUpModule():
     imm.EXTRA_ALLOW_FILE = os.path.join(tmp, "extra_allow_series.json")
     imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
     imm.VERCEL_SERIES_FILE = os.path.join(tmp, "vercel_series.json")
+    imm.CRYPTO_OPEN_FILE = os.path.join(tmp, "crypto_series.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -44726,3 +44727,156 @@ class TestVercelDiscovery(unittest.TestCase):
         with mock.patch.object(imm, "VERCEL_DISCOVER", False):
             self.assertEqual(imm.load_vercel_series(), 0)
         self.assertFalse(imm.vercel_series("KXOSSPEND"))
+
+
+class TestCryptoOpenFamily(unittest.TestCase):
+    """Jack 2026-11-13: "for KXBTCHITBY / KXSOLABOVEBY, and others just quote
+    the no side at 5x base. besides the markets the crypto bot quotes, all
+    other crypto markets are fair game for IMM"."""
+
+    CATEGORY = ["KXBTCHITBY", "KXSOLABOVEBY", "KXBTCEVENT", "KXBTC",
+                "KXBTCMAXMON", "KXBTCD", "KXETHMAXW", "KXBTCMAXY", "KXSOLD26",
+                "KXBTCRESERVE"]
+    MEMBERS = ["KXBTC", "KXBTCEVENT", "KXBTCHITBY", "KXSOLABOVEBY"]
+
+    def setUp(self):
+        _clean_persist()
+        saved = (set(imm.CRYPTO_CATEGORY_SERIES), dict(imm._crypto_open_state),
+                 imm.ALLOWLIST_ONLY)
+        had = {s_ for s_ in self.CATEGORY if s_ in imm.SERIES_OVERRIDES}
+
+        def restore():
+            imm.CRYPTO_CATEGORY_SERIES.clear()
+            imm.CRYPTO_CATEGORY_SERIES.update(saved[0])
+            imm._crypto_open_state.clear()
+            imm._crypto_open_state.update(saved[1])
+            imm.ALLOWLIST_ONLY = saved[2]
+            for s_ in self.CATEGORY:
+                if s_ not in had:
+                    imm.SERIES_OVERRIDES.pop(s_, None)
+            try:
+                os.remove(imm.CRYPTO_OPEN_FILE)
+            except OSError:
+                pass
+        self.addCleanup(restore)
+        imm.CRYPTO_CATEGORY_SERIES.clear()
+        imm._crypto_open_state.update(mtime=0.0, next_read=0.0)
+        imm.ALLOWLIST_ONLY = True
+
+    def _client(self):
+        calls = []
+        category = self.CATEGORY
+
+        class C:
+            def get(self, path, params=None):
+                calls.append((path, dict(params or {})))
+                return {"series": [{"ticker": t} for t in category]}
+        return C(), calls
+
+    def test_the_family_is_the_category_less_the_fleet(self):
+        client, calls = self._client()
+        with mock.patch.object(imm, "log"):
+            imm.refresh_crypto_open_series(client, 1000.0)
+            imm.refresh_crypto_open_series(client, 1000.0 + 60)     # not due
+        self.assertEqual(calls, [("/series", {"category": "Crypto"})])
+        self.assertEqual(sorted(s_ for s_ in self.CATEGORY if imm.crypto_open_series(s_)),
+                         self.MEMBERS)
+        with open(imm.CRYPTO_OPEN_FILE, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["series"], sorted(self.CATEGORY))
+        for s_ in self.MEMBERS:
+            ov = imm.SERIES_OVERRIDES[s_]
+            self.assertEqual(ov.size_mult, 5.0)
+            self.assertEqual((ov.price_min_cents, ov.price_max_cents), (1, 99))
+            self.assertFalse(ov.safe_join)
+        t = "KXBTCHITBY-01JAN270000-10500000-YES"
+        self.assertTrue(IncentiveMarketMaker._allowed(t))
+        self.assertTrue(imm.no_side_only(t))
+        # the fleet's own series stay out, and so do the listed structurals
+        for t in ("KXBTCMAXMON-BTC-26NOV30-11000000", "KXBTCD-26NOV1317-T68000"):
+            self.assertFalse(IncentiveMarketMaker._allowed(t), t)
+            self.assertFalse(imm.no_side_only(t), t)
+        self.assertFalse(imm.crypto_open_series("KXBTCRESERVE"))
+        # the dates: DDMMMYY(HHMM), and the hourly YYMMMDDHH
+        self.assertEqual(imm.parse_event_date("KXBTCEVENT-10DEC260930"), utc(2026, 12, 10, 5, 0))
+        self.assertEqual(imm.parse_event_date("KXBTCHITBY-01JAN270000"), utc(2027, 1, 1, 5, 0))
+        self.assertEqual(imm.parse_event_date("KXSOLABOVEBY-30NOV261000"), utc(2026, 11, 30, 5, 0))
+        self.assertEqual(imm.parse_event_date("KXBTC-26NOV1317"), utc(2026, 11, 13, 5, 0))
+        # a restart reads the file before Kalshi
+        imm.CRYPTO_CATEGORY_SERIES.clear()
+        imm._crypto_open_state.update(mtime=0.0, next_read=1e12)
+        with mock.patch.object(imm, "log"):
+            imm.refresh_crypto_open_series(client, 2000.0)
+        self.assertTrue(imm.crypto_open_series("KXBTCHITBY"))
+        # IMM_CRYPTO_OPEN=0
+        with mock.patch.object(imm, "CRYPTO_OPEN", False):
+            self.assertFalse(imm.crypto_open_series("KXBTCHITBY"))
+            self.assertFalse(IncentiveMarketMaker._allowed("KXBTCHITBY-01JAN270000-10500000-YES"))
+
+    def test_a_failed_read_keeps_the_list(self):
+        imm._crypto_open_enroll(["KXBTCHITBY"])
+
+        class Down:
+            def get(self, path, params=None):
+                raise RuntimeError("429")
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            imm.refresh_crypto_open_series(Down(), 1000.0)
+        self.assertTrue(imm.crypto_open_series("KXBTCHITBY"))
+        self.assertTrue(any("crypto category read failed" in line for line in lines))
+        self.assertEqual(imm._crypto_open_state["next_read"], 1600.0)   # 10 min
+
+    def _cycle(self, budget):
+        now = datetime.now(timezone.utc)
+        d = now + timedelta(days=40)
+        seg = f"{d.day:02d}{d.strftime('%b').upper()}{d.year % 100:02d}0000"
+        client = FakeClient()
+        tickers = [f"KXBTCHITBY-{seg}-{k}-YES" for k in (10000000, 10500000, 11000000)]
+        close = (d + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for t in tickers:
+            client.programs.append(
+                {"market_ticker": t, "incentive_type": "liquidity",
+                 "period_reward": 9000000, "target_size_fp": "1000.00",
+                 "discount_factor_bps": 5000, "paid_out": False,
+                 "start_date": client.programs[0]["start_date"],
+                 "end_date": client.programs[0]["end_date"]})
+            client.markets[t] = {
+                "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                "close_time": close, "expected_expiration_time": close,
+                "yes_bid_dollars": "0.0100", "yes_ask_dollars": "0.0500",
+                "volume_fp": "0.00"}
+            client.books[t] = {"orderbook_fp": {
+                "yes_dollars": [["0.01", "3300"]], "no_dollars": [["0.95", "1113"]]}}
+        imm._crypto_open_enroll(["KXBTCHITBY"])
+        imm._crypto_open_state["next_read"] = 1e12
+        for p_ in (mock.patch.object(imm, "CRYPTO_OPEN_BUDGET", budget),
+                   mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                   mock.patch.object(imm, "SERIES_HOUR_MULTS", [])):
+            p_.start()
+            self.addCleanup(p_.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rest = sorted((o["ticker"], o["book_side"], o["yes_price"])
+                      for o in bot.state.sim_orders.values() if o["ticker"] in tickers)
+        return bot, tickers, rest, lines
+
+    def test_the_no_side_rests_alone(self):
+        bot, tickers, rest, lines = self._cycle(budget=1e9)
+        self.assertTrue(set(tickers) & set(bot.state.selected),
+                        [s_ for s_ in lines if "universe:" in s_][-2:])
+        self.assertTrue(rest, [s_ for s_ in lines if "KXBTCHITBY" in s_][-10:])
+        self.assertEqual({side for _t, side, _px in rest}, {"ask"}, rest)
+        self.assertTrue(all(1 <= px <= 99 for _t, _side, px in rest), rest)
+
+    def test_the_cash_budget_holds_the_family_out(self):
+        bot, tickers, rest, lines = self._cycle(budget=1.0)
+        self.assertFalse(set(tickers) & set(bot.state.selected))
+        self.assertEqual(rest, [])
+        self.assertTrue(any("'crypto_budget'" in s_ for s_ in lines if "universe:" in s_),
+                        [s_ for s_ in lines if "universe:" in s_][-2:])
