@@ -28733,6 +28733,28 @@ class TestRequoteInterleave(unittest.TestCase):
         self.assertIn("b", self.bot.state.sim_orders)
         self.assertNotIn("c", self.bot.state.sim_orders)
 
+    def test_cap_deferral_keeps_a_same_price_size_up_resting(self):
+        # Jack 2026-11-14: "prioritize quoting time" -- a deferred size-up at the
+        # same price keeps the smaller order; a size-down still loses it
+        resting = [self._o("a", "T", "bid", 49, 20), self._o("b", "U", "bid", 40, 20),
+                   self._o("c", "V", "bid", 30, 50)]
+        to_place = [Quote("T", "bid", 50, 20),    # a reprice of a: within the cap
+                    Quote("U", "bid", 40, 45),    # size-up of b: deferred, b rests
+                    Quote("V", "bid", 30, 20)]    # size-down of c: deferred, c goes
+        lines = []
+        with mock.patch.object(imm, "MAX_PLACEMENTS_PER_CYCLE", 1),                 mock.patch.object(imm, "PLACE_PRIORITY", False),                 mock.patch.object(imm, "log", lines.append):
+            placed = self.bot.place_with_caps(to_place, resting, set(), self.now,
+                                              replaces={0: "a", 1: "b", 2: "c"})
+        self.assertEqual(placed, 1)
+        self.assertEqual([c[1] for c in self.calls if c[0] == "cancel"], ["a", "c"])
+        self.assertIn("b", self.bot.state.sim_orders)
+        self.assertNotIn("c", self.bot.state.sim_orders)
+        self.assertTrue(any("1 same-price size-up(s) left resting" in x for x in lines), lines)
+        with mock.patch.object(imm, "DEFER_KEEP_SIZE_UP", False),                 mock.patch.object(imm, "MAX_PLACEMENTS_PER_CYCLE", 0),                 mock.patch.object(imm, "PLACE_PRIORITY", False):
+            self.bot.place_with_caps([Quote("U", "bid", 40, 45)], [self.bot.state.sim_orders["b"]],
+                                     set(), self.now, replaces={0: "b"})
+        self.assertNotIn("b", self.bot.state.sim_orders)       # off: the old order goes
+
     def _queue(self):
         resting = [self._o("a", "T", "bid", 49, 20), self._o("b", "U", "bid", 40, 20),
                    self._o("c", "V", "bid", 30, 20), self._o("d", "W", "bid", 20, 20)]

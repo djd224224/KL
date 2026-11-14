@@ -4447,6 +4447,9 @@ class WritePacer:
 # the next cycle instead of leaving the book; any other deferred pair is
 # cancelled as before. IMM_REQUOTE_INTERLEAVE=0 restores all-cancels-first.
 REQUOTE_INTERLEAVE = os.environ.get("IMM_REQUOTE_INTERLEAVE", "1") == "1"
+# ...and a deferred same-price SIZE-UP keeps its smaller order resting too
+# (place_with_caps; Jack 2026-11-14: "prioritize quoting time").
+DEFER_KEEP_SIZE_UP = os.environ.get("IMM_DEFER_KEEP_SIZE_UP", "1") == "1"
 QUALIFY_PATIENCE_CYCLES = _env_int("IMM_QUALIFY_PATIENCE", 30)  # bench zero-reward markets
 BENCH_COOLDOWN_SECS = _env_int("IMM_BENCH_COOLDOWN", 4 * 3600)
 # Post-2026-07-30 payouts scale by the ratio of non-excluded snapshots (a
@@ -42968,6 +42971,13 @@ class IncentiveMarketMaker:
     def _identical_quote(o: dict, q: Quote) -> bool:
         """Is resting order `o` already exactly quote `q` (a pure TTL
         renewal)? Same side, cent bucket, exact sub-penny price, size."""
+        return IncentiveMarketMaker._same_price_quote(o, q) \
+            and abs(order_remaining(o) - q.count) < 0.5
+
+    @staticmethod
+    def _same_price_quote(o: dict, q: Quote) -> bool:
+        """Is resting order `o` at quote `q`'s price (same side, cent bucket,
+        exact sub-penny price), whatever its size?"""
         parsed = order_yes_book_cents(o)
         if parsed is None or parsed != (q.book_side, q.price_cents):
             return False
@@ -42975,7 +42985,7 @@ class IncentiveMarketMaker:
             ox = order_yes_exact_cents(o)
             if ox is None or abs(ox - q.price_exact) >= 0.005:
                 return False
-        return abs(order_remaining(o) - q.count) < 0.5
+        return True
 
     def _place_tiers(self, to_place: List[Quote], replaces: Dict[int, str],
                      resting: List[dict], cancelled_ids: Set[str],
@@ -43285,7 +43295,7 @@ class IncentiveMarketMaker:
             # replacements the caps pushed to the next cycle: a pure renewal
             # keeps its (identical) order resting meanwhile; any other swap
             # loses the old order now, as before
-            kept = 0
+            kept = kept_up = 0
             for j in range(deferred_from, len(to_place)):
                 old = replaces.get(j)
                 if old is None:
@@ -43294,14 +43304,29 @@ class IncentiveMarketMaker:
                 if o is not None and self._identical_quote(o, to_place[j]):
                     kept += 1
                     continue
+                # ...and so does a SIZE-UP at the same price (Jack 2026-11-14:
+                # "quoting time is valuable given the incentive window is so
+                # short, so prioritize quoting time"): 04:10Z 11/14 1,166 swaps
+                # were deferred while the FX / metals wave's 408 markets were
+                # re-sized, and each cancelled its order, leaving the side dark
+                # for a cycle. The smaller old order is less than the cycle wants,
+                # never more, at a price it still wants. A size-DOWN (a pin, an
+                # off-usual cut, a stand-down) or a price change still loses the
+                # old order now. IMM_DEFER_KEEP_SIZE_UP=0 restores that for all.
+                if (o is not None and DEFER_KEEP_SIZE_UP
+                        and self._same_price_quote(o, to_place[j])
+                        and order_remaining(o) <= to_place[j].count + 0.5):
+                    kept_up += 1
+                    continue
                 if self.cancel_order(old, reason="requote_diff"):
                     self.state.cancelled_today += 1
                     cancelled_ids.add(old)
                 elif failed_cancels is not None:
                     failed_cancels.append(old)
-            if kept:
-                log(f"{self.tag} placement cap: {kept} identical renewal(s) "
-                    f"left resting until the next cycle")
+            if kept or kept_up:
+                log(f"{self.tag} placement cap: {kept} identical renewal(s)"
+                    + (f" and {kept_up} same-price size-up(s)" if kept_up else "")
+                    + " left resting until the next cycle")
         return placed
 
     # ---- status / summary ----------------------------------------------------
