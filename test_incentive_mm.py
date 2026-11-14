@@ -45213,6 +45213,29 @@ class TestCryptoEventFair(unittest.TestCase):
             self._snap(t, p=0.294, lo=0.270, hi=0.314, asset_hold=now + 300)
             self.assertEqual(imm.crypto_event_gate(t, now, 27, 37)[1]["reason"], "jump_hold")
 
+    def test_a_wave_listed_strike_takes_its_limits_from_the_fair(self):
+        # Jack 2026-11-14: "yes, use the fair" -- the list's limits walk 5c a
+        # 15-min run; a listed crypto strike's limits are its live fair band
+        imm._crypto_open_enroll(["KXBTCEVENT"])
+        t, _d = self._t()
+        now = time.time()
+        self._snap(t, p=0.294, lo=0.270, hi=0.314)
+        entry = {"bid_max": 30, "ask_min": 39, "follow_book": True}
+        self.assertEqual(imm.pvd_limits(entry, None), (30, 39))           # no ticker: the list
+        self.assertEqual(imm.pvd_limits(entry, None, t), (30, 39))        # not listed: the list
+        with mock.patch.object(imm, "pvd_entry", lambda tk, now_utc=None: {"stop": None}):
+            self.assertEqual(imm.pvd_limits(entry, None, t), (31, 27))
+            q = [Quote(t, "bid", 27, 300), Quote(t, "ask", 34, 300)]
+            self.assertEqual(sorted((x.book_side, x.price_cents) for x in imm.pvd_guard_quotes(
+                q, dict(entry, pmin=1, pmax=99), None, ticker=t)), [("ask", 34), ("bid", 27)])
+            # ...the list's 39 would have stood that ask out
+            self.assertEqual([x.book_side for x in imm.pvd_guard_quotes(
+                q, dict(entry, pmin=1, pmax=99), None)], ["bid"])
+            # no fresh read: the list's limits stand (the gate stands it aside anyway)
+            self._snap(t, p=0.294, lo=0.270, hi=0.314, spot_age=imm.CRYPTO_EVENT_TTL_SECS + 9)
+            self.assertEqual(imm.pvd_limits(entry, None, t), (30, 39))
+        self.assertEqual(imm.pvd_limits(entry, None, "KXFOO-26DEC01-T1"), (30, 39))
+
     def test_the_narrowed_band(self):
         # Jack 2026-11-14: "Yes, narrow it" -- spot +-0.5%, sigma x0.9 /
         # x1.11, 2c (from +-1%, x0.8 / x1.25, 3c)

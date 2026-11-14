@@ -11276,7 +11276,8 @@ def pvd_off_usual_cut(quotes: List["Quote"], usual_bid: Optional[float],
     return out, cuts
 
 
-def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
+def pvd_limits(entry: dict, last: Optional[float],
+               ticker: Optional[str] = None) -> Tuple[int, int]:
     """(bid_max, ask_min) in force: the entry's cushion (its kind's
     PVD_CUSHION_DEAD / _LIVE) either side of the market's last trade when
     there is one -- BOTH WAYS since Jack 2026-11-04 "Follow both ways" (the
@@ -11291,7 +11292,18 @@ def pvd_limits(entry: dict, last: Optional[float]) -> Tuple[int, int]:
     with a last trade -- pvd_wave_tune.py re-anchors them to the touch +-3c
     every 15 min. A stale trade pinned a side out of the book:
     KXDPRESPRIMWIN-28ANY-JOSS traded 55c, then the book read 49x54, and an ask
-    held at >= 55 never rested (16 markets like it at 04:23Z)."""
+    held at >= 55 never rested (16 markets like it at 04:23Z).
+
+    FAIR LIMITS FOR CRYPTO (Jack 2026-11-14: "yes, use the fair"): a crypto
+    event strike (`ticker`) with a fresh read takes its limits from the crypto
+    event fair instead -- no bid over the band's top, no ask under its bottom
+    (crypto_event_wave_limits) -- live every cycle, where the list's limits
+    walk 5c a 15-min run: after the 02:47Z listing other makers moved inside
+    them and 164 asks stood out ("pvd guard ... ask out") at 04:00Z."""
+    if ticker:
+        fl = crypto_event_wave_limits(ticker, time.time())
+        if fl is not None:
+            return fl
     if entry.get("follow_book"):
         return int(entry["bid_max"]), int(entry["ask_min"])
     c = entry.get("cushion")
@@ -11388,7 +11400,8 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
                      close_usual: Optional[float] = None,
                      close_clamp: str = "off",
                      off_c: Optional[float] = None,
-                     close_cost: Optional[float] = None) -> List["Quote"]:
+                     close_cost: Optional[float] = None,
+                     ticker: Optional[str] = None) -> List["Quote"]:
     """A post-vote dead book's side guard: no pads; nothing outside
     PVD_PRICE_MIN..PVD_PRICE_MAX (3-97c); a bid rests only at or under
     bid_max, an ask only at or over ask_min (YES cents), each tightened to
@@ -11407,7 +11420,7 @@ def pvd_guard_quotes(quotes: List["Quote"], entry: dict,
     pvd_clamp_at); with no usual price a closing rung rests past the limits
     only at breakeven or better. "dry" changes nothing here (the caller logs
     what it would do)."""
-    bmax, amin = pvd_limits(entry, last)
+    bmax, amin = pvd_limits(entry, last, ticker)
     lo, hi = entry.get("pmin", PVD_PRICE_MIN), entry.get("pmax", PVD_PRICE_MAX)
     decided = pvd_decided_side(last)
     exempt = True
@@ -19874,6 +19887,20 @@ def crypto_event_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"no side {CRYPTO_EVENT_TOL_CENTS}c clear of the band {lo_c:.1f}-"
                 f"{hi_c:.1f}c", dict(inputs, reason="decided"), None)
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+def crypto_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]]:
+    """A wave-listed crypto event strike's (bid_max, ask_min) off its fair --
+    the WAVE BOOK caps (bid <= p_hi, ask >= p_lo); a side with no room reads
+    0 / 100 (nothing passes) -- or None (not a listed crypto strike, or no
+    fresh read: the list's limits stand, and the gate stands it aside)."""
+    if not crypto_event_series(series_of(ticker)):
+        return None
+    why, inputs, caps = crypto_event_gate(ticker, now_ts, None, None)
+    if why or caps is None or not inputs.get("wave"):
+        return None
+    return (caps[0] if caps[0] is not None else 0,
+            caps[1] if caps[1] is not None else 100)
 
 
 def crypto_event_fair_c(ticker: str, now_ts: float) -> Optional[float]:
@@ -31901,7 +31928,7 @@ class IncentiveMarketMaker:
         join wait set it while it stays inside the guard (pvd_limits and the
         3-97c band), else the side's reference when that is inside -- logged
         once per move."""
-        bmax, amin = pvd_limits(pvd, PVD_LAST.get(t))
+        bmax, amin = pvd_limits(pvd, PVD_LAST.get(t), t)
 
         lo, hi = pvd.get("pmin", PVD_PRICE_MIN), pvd.get("pmax", PVD_PRICE_MAX)
         decided = pvd_decided_side(PVD_LAST.get(t))
@@ -41660,7 +41687,7 @@ class IncentiveMarketMaker:
                 # the side that reduces the bot's own position is exempt from the
                 # cushion, up to the position (the closing exemption)
                 _pv_close = "bid" if own_pos <= -1 else "ask" if own_pos >= 1 else None
-                _pv_pb, _pv_pa = pvd_limits(pvd, _pv_last)
+                _pv_pb, _pv_pa = pvd_limits(pvd, _pv_last, t)
                 # CLOSE CLAMP (PVD_CLOSE_CLAMP_MODE): the reducing side never
                 # more than PVD_OFF_USUAL_C past its 6 h usual price toward the taker
                 _pv_cu = None
@@ -41675,7 +41702,7 @@ class IncentiveMarketMaker:
                     self._pvd_clamp_note(t, mq, _pv_close, _pv_cu, own_pos, _pv_cost)
                 mq = pvd_guard_quotes(mq, pvd, _pv_last, _pv_close, abs(own_pos),
                                       close_usual=_pv_cu, close_clamp=PVD_CLOSE_CLAMP_MODE,
-                                      close_cost=_pv_cost)
+                                      close_cost=_pv_cost, ticker=t)
                 _pv_cl = next(((q.book_side, q.price_cents, q.count) for q in mq
                                if q.book_side == _pv_close and not q.is_pad and (
                                    q.price_cents > _pv_pb if q.book_side == "bid"
@@ -41690,7 +41717,7 @@ class IncentiveMarketMaker:
                 _pv_out = _pv_before - {q.book_side for q in mq}
                 if _pv_out != self._pvd_out.get(t, set()):
                     if _pv_out:
-                        _pb, _pa = pvd_limits(pvd, _pv_last)
+                        _pb, _pa = pvd_limits(pvd, _pv_last, t)
                         log(f"{self.tag} pvd guard {t}: {'/'.join(sorted(_pv_out))} "
                             f"out (limits bid<={_pb} ask>={_pa}, last {_pv_last}, "
                             f"book {ext_bid}x{ext_ask})")
