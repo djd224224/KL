@@ -324,6 +324,29 @@ class ReplayDayTests(unittest.TestCase):
                                       {"KXC-26-T3": (7.0, 1.4)}, self.EV)
         self.assertEqual(mism, ["KXC-26-T3"])
 
+    def test_flows_time_every_cash_move_and_add_up_to_the_cash(self):
+        # the dashboard's cash chart (Jack 2026-11-14): 10 YES held; a 25-lot
+        # ask at 40c sells the 10 (+4.00, "sell") and opens 15 NO at 60c
+        # (-9.00, "buy", carrying the 5c fee); a 3-lot YES bid at 70c then
+        # nets 3 NO pairs (+0.90, "sell"); the other 12 NO pay $12 at a NO
+        # settlement ("settle")
+        flows = []
+        start = {"KXF-26-T1": (10.0, 3.0)}
+        fills = [dict(_fill(5, "KXF-26-T1", "ask", 25, 0.40, fee=0.05), fill_id="f1"),
+                 dict(_fill(6, "KXF-26-T1", "bid", 3, 0.70), fill_id="f2")]
+        setts = [{"ticker": "KXF-26-T1", "revenue": 1200, "fee_cost": "0",
+                  "market_result": "no", "settled_time": "1970-01-01T00:00:09Z"}]
+        _, cash, _, _ = pf.replay_day(start, fills, setts, {}, self.EV, flows=flows)
+        self.assertEqual([(f[0], f[2], f[4]) for f in flows],
+                         [(5, "sell", "f1"), (5, "buy", "f1"), (6, "sell", "f2"), (9, "settle", None)])
+        self.assertAlmostEqual(flows[0][3], 4.0)
+        self.assertAlmostEqual(flows[1][3], -9.05)
+        self.assertAlmostEqual(flows[2][3], 0.9)
+        self.assertAlmostEqual(flows[3][3], 12.0)
+        self.assertAlmostEqual(sum(f[3] for f in flows), cash)
+        # without the list nothing changes
+        self.assertEqual(pf.replay_day(start, fills, setts, {}, self.EV)[1], cash)
+
     def test_side_value(self):
         self.assertAlmostEqual(pf.side_value(10.0, 0.3, 9.0), 3.0)
         self.assertAlmostEqual(pf.side_value(-10.0, 0.3, 9.0), 7.0)

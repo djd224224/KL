@@ -39,6 +39,13 @@
   --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
   --hm-mid: #f0efec;
+  /* cash chart: what moved the cash (categorical slots, fixed per kind; the
+     trading bar stacks sell|settle, the account bar credits|transfer|collateral) */
+  --cf-buy: #eb6834;
+  --cf-sell: #2a78d6;
+  --cf-settle: #eda100;
+  --cf-transfer: #008300;
+  --cf-coll: #e87ba4;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -69,6 +76,11 @@
     --chip-info: rgba(57, 135, 229, 0.16);
     --shadow: none;
     --hm-mid: #383835;
+    --cf-buy: #d95926;
+    --cf-sell: #3987e5;
+    --cf-settle: #c98500;
+    --cf-transfer: #008300;
+    --cf-coll: #d55181;
   }
 }
 :root[data-theme="dark"] {
@@ -99,6 +111,11 @@
   --chip-info: rgba(57, 135, 229, 0.16);
   --shadow: none;
   --hm-mid: #383835;
+  --cf-buy: #d95926;
+  --cf-sell: #3987e5;
+  --cf-settle: #c98500;
+  --cf-transfer: #008300;
+  --cf-coll: #d55181;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -332,6 +349,15 @@ table.t tr.tot td { font-weight: 600; border-top: 1px solid var(--axis); border-
 svg.sparkc { display: block; margin-left: auto; overflow: visible; }
 td.shape, td.spk { cursor: default; }
 .bridge-note { font-size: 12px; color: var(--ink-2); margin-top: 4px; }
+/* cash chart */
+.cashcard { margin-top: 14px; }
+.cash-sum { font-size: 13px; margin: 6px 0 2px; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
+.cash-sum .big { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.cash-sum .part { color: var(--ink-2); white-space: nowrap; }
+.cash-sum .part b { font-weight: 500; font-variant-numeric: tabular-nums; }
+#cashChart svg text.pl { fill: var(--ink-2); font-size: 11px; }
+.cashtw { margin-top: 12px; }
+.cashtw .grp { margin-left: 6px; }
 /* mark-out heatmap: diverging blue (made money) / red (lost) around a gray midpoint */
 table.hm { width: 100%; border-collapse: separate; border-spacing: 2px; font-size: 12.5px; }
 table.hm th { font-weight: 500; font-size: 12px; color: var(--ink-2); padding: 3px 6px; text-align: center; border-radius: 4px; white-space: nowrap; cursor: pointer; }
@@ -457,6 +483,13 @@ footer { color: var(--muted); font-size: 12px; }
       <div class="card chartcard"><div class="cardhead"><h3 id="bridgeTitle">P&amp;L bridge</h3><div class="legend" id="bridgeLegend"></div></div><div id="bridge"></div><div class="bridge-note" id="bridgeNote"></div></div>
       <div class="card chartcard"><div class="cardhead"><h3>Fill mark-outs by horizon, ¢ per contract</h3><div class="legend" id="hmLegend"></div></div><div id="moHeat"></div></div>
     </div>
+    <div class="card chartcard cashcard">
+      <div class="cardhead"><h3 id="cashTitle">Cash balance</h3><div class="legend" id="cashLegend"></div></div>
+      <div class="cash-sum" id="cashSum"></div>
+      <div id="cashChart"></div>
+      <div class="bridge-note" id="cashNote"></div>
+    </div>
+    <div class="cashtw"><div class="sub-h">Cash by source<span class="note" id="cashTableNote"></span></div><div class="tw" id="cashTable"></div></div>
     <div class="tw drvtw" id="drvTable"></div>
     <p class="explain" id="drvFoot"></p>
   </section>
@@ -556,6 +589,7 @@ footer { color: var(--muted); font-size: 12px; }
         <p class="explain"><b>P&amp;L explain</b> (Drivers). Trading P&amp;L splits exactly into three parts. <i>Carry: marks</i> is the position held at the window's start, re-marked from its start mark to its end mark (or to its last mark before it left the book). <i>Carry: settled</i> is that start position in a market Kalshi settled during the window, from its start mark to the settlement. <i>New fills</i> is the rest: the window's own fills, marked to the window's end or to the settlement.</p>
         <p class="explain"><b>Mark-outs</b> cover maker fills only (no pads, no taker fills). They are per contract and signed for our side. <i>At fill</i> is the edge: the fill price against the mid of the external book the bot read the cycle before the fill (none on a book 50¢+ wide). <i>5m</i>, <i>30m</i> and <i>4h</i> use the first 5-minute position snapshot at least that long after the fill; a mark must land within 5 minutes for 5m and within 15 minutes otherwise, so a fill that closed the position has none. <i>To date</i> uses Kalshi's settlement, else the bot's mark while it holds the market, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule. <i>Coverage</i> is rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow.</p>
         <p class="explain"><b>Last 7 days</b> and <b>Last 30 days</b> (Drivers) add up the rewards and trading P&amp;L of the 7 and 30 ET days through the window's last day: today so far on a live window, that day on a past one. Rewards follow the basis picked above the table. <i>Per day</i> divides by the days covered, today by its hours so far. <i>Shape</i> is the cumulative net, day by day from 0 at the span's start; hover it for a day's net, rewards and trading. The page keeps 30 days, so a past day's 30 days count only the ones it has (the header's tooltip says how many). The total row covers the whole book, including families with nothing in the window.</p>
+        <p class="explain"><b>Cash balance</b> (Drivers) is the main account's cash, every shard together, as Kalshi reports it (the numbered subaccounts hold their own). The line runs through Kalshi's actual readings, the 7am portfolio email's snapshots and, from Nov 14, every dashboard build's account read (~10 min), and between them replays every account fill and settlement from the snapshot's positions, as the email replays its day: a fill that opens contracts pays cash out (<i>bought</i>, fees included), one that closes or nets a YES/NO pair pays cash in (<i>sold</i>), a settlement pays its revenue (<i>settled</i>). A fill is the IMM's when its Kalshi fill id is in the bot's own fills log, filed under its family as above; the rest go to the crypto bots, the weather bots or <i>other trades</i> (hand trades, the other bots) by series. What no record explains, reading to reading: <i>deposits &amp; transfers</i> (the move in the all-time deposited and withdrawn totals, and moves to and from the subaccounts), then <i>collateral</i> (the change in what Kalshi hands back on open mutually exclusive and nested positions), then the rest, <i>reward credits</i> (almost all of it Kalshi's ~6:15 AM batch; anything else with no record lands there too). Those land on the reading that shows them, so before the 10-minute readings began they sit on the 7am snapshot. The path ties to every reading to the cent, and the 7am-to-7am day reproduces the email's trading cash and reward credits.</p>
         <p class="explain"><b>Exp. net/day</b> is a model: the rewards the bot's estimator gives the quotes resting now, plus the family's average trading P&amp;L per day over the last 7 days. <b>Typical day</b> is the family's mean net per complete ET day over the 7 and 30 days before the window. The σ mark flags a window 1.5+ standard deviations from that mean, pro-rated to the window's length.</p>
         <p class="explain"><b>Worst case</b> is the loss from today's marks to settlement if everything goes against the book. It is netted inside an event: across its strikes when every market prices the same number (greater / less / between), and across names when Kalshi marks the event mutually exclusive. Mention words and anything whose structure has not been read count in full. Summed across events, it assumes every event goes wrong at once. On a past day it is the book at that day's close.</p>
         <p class="explain"><b>Paid rate</b> is what Kalshi credited per dollar of modeled reward on settled events (imm_reward_recon's calibration). The <i>raw</i> basis covers the $1 per-market-per-period floor and the model error together. The older <i>floored</i> basis covers the model error only. Account credits include other bots quoting the same markets, which can push a family above 1×.</p>
@@ -1801,6 +1835,7 @@ function renderDrivers() {
 function renderDriverCharts() {
   renderBridge(DRV_LAST.fams, DRV_LAST.tot);
   renderMoHeat(DRV_LAST.fams, DRV_LAST.tot);
+  renderCash();
 }
 
 /* the window's P&L as a bridge: rewards, then the three trading parts, to net */
@@ -1909,6 +1944,236 @@ function renderMoHeat(fams, t) {
 }
 
 /* ======================= movers ======================= */
+/* ======================= cash ======================= */
+// The main account's cash through the window and what moved it (Jack
+// 2026-11-14: "add a time series chart view of cash balance and how it's
+// changing throughout the day e.g. what families are drawing cash or adding
+// cash, rewards, deposits, etc"). D.cash (imm_cash.build): the cash path
+// (Kalshi's readings, the replayed fills and settlements between them) and
+// 10-minute cells of [bucket, source, kind, $].
+// [kind, label, color token, bar]: two bars per bin, trading (t) and the
+// account's own moves (a), so only a bar's own kinds ever stack together
+const CF = [["buy", "Bought", "--cf-buy", "t"], ["sell", "Sold", "--cf-sell", "t"], ["settle", "Settled", "--cf-settle", "t"],
+  ["reward", "Reward credits", "--s-cred", "a"], ["transfer", "Deposits & transfers", "--cf-transfer", "a"], ["collateral", "Collateral (Kalshi)", "--cf-coll", "a"]];
+const CF_GRP = { imm: "IMM", bot: "other bot", acct: "account" };
+let cashSel = null;                 // a source row clicked: the bars show it alone
+function cashModel() {
+  const C = D.cash;
+  if (!C || !C.path) return null;
+  // a live window runs to the newest account read (it lands after the build starts)
+  const w = win(), s = w.start, e = w.end >= D.generated - 1 ? Math.max(w.end, num(C.until)) : w.end;
+  const span = Math.max(e - s, 600), bin = span <= 26 * 3600 ? 3600 : 6 * 3600;
+  const nb = Math.max(1, Math.ceil(span / bin)), nk = C.k.length;
+  const ord = CF.map((c) => C.k.indexOf(c[0]));        // CF order -> C.k index
+  const bins = [];
+  for (let i = 0; i < nb; i++) bins.push({ t0: s + i * bin, t1: Math.min(s + (i + 1) * bin, e), k: new Array(nk).fill(0), by: {} });
+  const rows = {};
+  const tot = new Array(nk).fill(0);
+  const ok = C.src.map((n, i) => matchQ(n, CF_GRP[C.grp[i]]));
+  for (const c of C.cells) {
+    const ts = c[0] * C.b;
+    if (ts < s || ts >= e) continue;
+    const name = C.src[c[1]], bi = Math.min(nb - 1, Math.floor((ts - s) / bin));
+    const r = rows[name] || (rows[name] = { name, grp: C.grp[c[1]], v: new Array(nk).fill(0), bins: new Array(nb).fill(0), net: 0 });
+    r.v[c[2]] += c[3]; r.bins[bi] += c[3]; r.net += c[3];
+    tot[c[2]] += c[3];
+    if (!ok[c[1]] || (cashSel && cashSel !== name)) continue;
+    bins[bi].k[c[2]] += c[3];
+    bins[bi].by[name] = (bins[bi].by[name] || 0) + c[3];
+  }
+  // the line: the value at the window's start, then every point inside it
+  let c0 = null;
+  const pts = [];
+  for (const p of C.path) {
+    if (p[0] <= s) { c0 = p[1]; continue; }
+    if (p[0] > e) break;
+    pts.push(p);
+  }
+  if (c0 != null) pts.unshift([s, c0]);
+  const reads = (C.reads || []).filter((r) => r[0] >= s && r[0] <= e);
+  let c1 = null;
+  for (let i = pts.length - 1; i >= 0; i--) if (pts[i][1] != null) { c1 = pts[i][1]; break; }
+  // cash at each bin's end (the last point at or before it)
+  let pi = 0, last = c0;
+  for (const b of bins) {
+    while (pi < pts.length && pts[pi][0] <= b.t1) { if (pts[pi][1] != null) last = pts[pi][1]; pi++; }
+    b.cash = last;
+    b.read = null;
+    for (const r of reads) if (r[0] > b.t0 && r[0] <= b.t1) b.read = r;
+  }
+  const gaps = pts.filter((p) => p[1] == null).length;
+  return { C, w, s, e, bin, bins, rows, tot, ord, pts, reads, c0, c1, gaps };
+}
+function cashTipRows(M, b) {
+  const rows = [];
+  if (b.cash != null) rows.push({ name: "Cash at " + tET(b.t1), value: fmtUSD(b.cash, { dp: 0 }) });
+  let net = 0;
+  M.ord.forEach((ki, j) => {
+    const v = b.k[ki];
+    if (Math.abs(v) < 0.005) return;
+    net += v;
+    rows.push({ name: CF[j][1], value: fmtUSD(v, { sign: true }), color: css(CF[j][2]) });
+  });
+  rows.push({ name: "Net" + (cashSel ? " · " + cashSel : ""), value: fmtUSD(net, { sign: true }) });
+  const lead = Object.entries(b.by).filter((x) => Math.abs(x[1]) >= 0.5).sort((x, y) => Math.abs(y[1]) - Math.abs(x[1])).slice(0, 5);
+  if (lead.length && !cashSel) rows.push({ block: "Most: " + lead.map((x) => x[0] + " " + fmtUSD(x[1], { sign: true, dp: 0 })).join(" · "), muted: true });
+  if (b.read) rows.push({ block: "Kalshi read " + fmtUSD(b.read[1]) + " at " + tET(b.read[0]) + (b.read[2] === "7am" ? " (the 7am snapshot)" : ""), muted: true });
+  return rows;
+}
+function renderCash() {
+  const host = $("cashChart");
+  host.textContent = "";
+  const lg = (bar) => CF.filter((c) => c[3] === bar).map((c) => '<span><i class="key" style="background:var(' + c[2] + ')"></i>' + esc(c[1]) + "</span>").join("");
+  $("cashLegend").innerHTML = '<span class="muted">Trading</span>' + lg("t") + '<span class="muted">Account</span>' + lg("a") +
+    '<span><i class="keyline" style="background:var(--ink)"></i>Cash</span>';
+  const M = cashModel();
+  const w = win();
+  $("cashTitle").textContent = "Cash balance · " + w.desc + (cashSel ? " · bars: " + cashSel + " only" : (Q ? " · bars: filter “" + Q + "”" : ""));
+  if (!M) {
+    host.innerHTML = '<div class="empty">' + (D.cash === undefined ? "This build has no cash data." : "The cash read failed in this build (see Health).") + "</div>";
+    $("cashSum").innerHTML = ""; $("cashNote").textContent = "";
+    renderCashTable(null);
+    return;
+  }
+  if (!M.pts.some((p) => p[1] != null)) {
+    host.innerHTML = '<div class="empty">No cash readings cover this window yet.</div>';
+    $("cashSum").innerHTML = ""; $("cashNote").textContent = "";
+    renderCashTable(M);
+    return;
+  }
+  // the reading in words: start -> end, then each kind
+  const parts = M.ord.map((ki, j) => [CF[j][1], M.tot[ki]]).filter((p) => Math.abs(p[1]) >= 0.5);
+  const live = w.end >= D.generated - 1;
+  $("cashSum").innerHTML = (M.c0 != null ? '<span class="part">' + fmtUSD(M.c0, { dp: 0 }) + " →</span> " : "") +
+    '<span class="big">' + fmtUSD(M.c1, { dp: 0 }) + "</span>" +
+    (M.c0 != null ? " " + money(M.c1 - M.c0, { dp: 0 }) : "") +
+    '<span class="part">' + (live ? "now" : "at the window's end") + "</span>" +
+    parts.map((p) => '<span class="part">' + esc(p[0]) + " <b>" + money(p[1], { dp: 0 }) + "</b></span>").join("");
+  // geometry: the cash line on top, the flows as diverging stacked bars below, one x
+  const W0 = Math.max(host.clientWidth || 700, 300), H1 = 170, G = 14, H2 = 150, XB = 22;
+  const H = H1 + G + H2 + XB, m = { l: 62, r: 12, t: 8 };
+  const X = (t) => m.l + (W0 - m.l - m.r) * (t - M.s) / Math.max(M.e - M.s, 1);
+  let lo = Infinity, hi = -Infinity;
+  for (const p of M.pts) if (p[1] != null) { lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); }
+  const pad = Math.max((hi - lo) * 0.08, 50);
+  const d1 = niceDomain(lo - pad, hi + pad, 4);
+  const Y1 = (v) => m.t + (H1 - m.t) * (1 - (v - d1.lo) / (d1.hi - d1.lo));
+  let blo = 0, bhi = 0;
+  for (const b of M.bins) {
+    for (const bar of ["t", "a"]) {
+      let up = 0, dn = 0;
+      M.ord.forEach((ki, j) => { if (CF[j][3] !== bar) return; const v = b.k[ki]; if (v > 0) up += v; else dn += v; });
+      bhi = Math.max(bhi, up); blo = Math.min(blo, dn);
+    }
+  }
+  if (bhi === 0 && blo === 0) bhi = 1;
+  const d2 = niceDomain(blo, bhi, 4);
+  const top2 = H1 + G, Y2 = (v) => top2 + H2 * (1 - (v - d2.lo) / (d2.hi - d2.lo));
+  const svg = svgEl("svg", { class: "ch", viewBox: "0 0 " + W0 + " " + H, height: H, role: "img",
+    "aria-label": "Cash balance through the window, and the cash in and out per " + (M.bin === 3600 ? "hour" : "6 hours") + " by kind" });
+  const yfmt = (v) => fmtUSD(v, { dp: 0, compact: true });
+  for (const tv of d1.ticks) {
+    svg.appendChild(svgEl("line", { x1: m.l, x2: W0 - m.r, y1: Y1(tv), y2: Y1(tv), class: "grid" }));
+    const tx = svgEl("text", { x: m.l - 8, y: Y1(tv) + 4, "text-anchor": "end" }); tx.textContent = yfmt(tv); svg.appendChild(tx);
+  }
+  for (const tv of d2.ticks) {
+    svg.appendChild(svgEl("line", { x1: m.l, x2: W0 - m.r, y1: Y2(tv), y2: Y2(tv), class: tv === 0 ? "zero" : "grid" }));
+    const tx = svgEl("text", { x: m.l - 8, y: Y2(tv) + 4, "text-anchor": "end" }); tx.textContent = fmtUSD(tv, { dp: 0, compact: true, sign: true }); svg.appendChild(tx);
+  }
+  const pl1 = svgEl("text", { x: m.l + 2, y: m.t + 10, class: "pl" }); pl1.textContent = "Cash"; svg.appendChild(pl1);
+  const pl2 = svgEl("text", { x: m.l + 2, y: top2 + 10, class: "pl" }); pl2.textContent = "In (+) and out (−) per " + (M.bin === 3600 ? "hour" : "6 hours") + ": trading, then the account's own"; svg.appendChild(pl2);
+  for (const t of timeTicks(M.s, M.e)) {
+    const px = X(t.v); if (px < m.l - 1 || px > W0 - m.r + 1) continue;
+    const tx = svgEl("text", { x: px, y: H - 6, "text-anchor": "middle" }); tx.textContent = t.label; svg.appendChild(tx);
+  }
+  // bars: stacked out from zero in CF order, a 2px surface gap between segments
+  const band = (W0 - m.l - m.r) * M.bin / Math.max(M.e - M.s, 1), bw = Math.max(2, Math.min(13, band * 0.36));
+  const surf = css("--surface");
+  M.bins.forEach((b) => {
+    const cx = X((b.t0 + Math.min(b.t0 + M.bin, M.e)) / 2);
+    for (const [bar, x] of [["t", cx - bw - 1], ["a", cx + 1]]) for (const side of [1, -1]) {
+      let acc = 0;
+      const segs = [];
+      M.ord.forEach((ki, j) => { if (CF[j][3] !== bar) return; const v = b.k[ki]; if (v * side > 0.005) { segs.push([acc, acc + v, j]); acc += v; } });
+      segs.forEach((g, i) => {
+        const ya = Y2(g[0]), yb = Y2(g[1]), y0 = Math.min(ya, yb), hgt = Math.max(1, Math.abs(yb - ya));
+        const outer = i === segs.length - 1, r = outer ? Math.min(4, bw / 2, hgt) : 0;
+        let d;
+        if (side > 0) d = "M" + x + " " + (y0 + hgt) + "V" + (y0 + r) + "Q" + x + " " + y0 + " " + (x + r) + " " + y0 + "H" + (x + bw - r) + "Q" + (x + bw) + " " + y0 + " " + (x + bw) + " " + (y0 + r) + "V" + (y0 + hgt) + "Z";
+        else d = "M" + x + " " + y0 + "V" + (y0 + hgt - r) + "Q" + x + " " + (y0 + hgt) + " " + (x + r) + " " + (y0 + hgt) + "H" + (x + bw - r) + "Q" + (x + bw) + " " + (y0 + hgt) + " " + (x + bw) + " " + (y0 + hgt - r) + "V" + y0 + "Z";
+        svg.appendChild(svgEl("path", { d, fill: css(CF[g[2]][2]), stroke: surf, "stroke-width": i ? 2 : 0, "paint-order": "stroke" }));
+      });
+    }
+  });
+  // the cash line (a gap where a day was not replayed), the 7am readings as dots
+  let dd = "", pen = false;
+  for (const p of M.pts) {
+    if (p[1] == null) { pen = false; continue; }
+    dd += (pen ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y1(p[1]).toFixed(1); pen = true;
+  }
+  svg.appendChild(svgEl("path", { d: dd, fill: "none", stroke: css("--ink"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  for (const r of M.reads) if (r[2] === "7am") svg.appendChild(svgEl("circle", { cx: X(r[0]), cy: Y1(r[1]), r: 4, fill: css("--ink"), stroke: surf, "stroke-width": 2 }));
+  const lastP = [...M.pts].reverse().find((p) => p[1] != null);
+  if (lastP) svg.appendChild(svgEl("circle", { cx: X(lastP[0]), cy: Y1(lastP[1]), r: 4, fill: css("--ink"), stroke: surf, "stroke-width": 2 }));
+  // hover: one crosshair over both panels, one tooltip per bin
+  const cross = svgEl("line", { y1: m.t, y2: top2 + H2, class: "cross", visibility: "hidden" });
+  const dot = svgEl("circle", { r: 4, fill: css("--ink"), stroke: surf, "stroke-width": 2, visibility: "hidden" });
+  svg.appendChild(cross); svg.appendChild(dot);
+  M.bins.forEach((b) => {
+    const xa = X(b.t0), xb = X(Math.min(b.t0 + M.bin, M.e));
+    const hit = svgEl("rect", { x: xa, y: 0, width: Math.max(1, xb - xa), height: top2 + H2, fill: "transparent" });
+    hit.addEventListener("pointermove", (ev) => {
+      const xe = X(b.t1);
+      cross.setAttribute("x1", xe); cross.setAttribute("x2", xe); cross.setAttribute("visibility", "visible");
+      if (b.cash != null) { dot.setAttribute("cx", xe); dot.setAttribute("cy", Y1(b.cash)); dot.setAttribute("visibility", "visible"); }
+      const head = (M.bin === 3600 ? tET(b.t0) + " – " + tET(b.t1) + " · " + dET(b.t0) : dtET(b.t0) + " – " + tET(b.t1));
+      showTip(ev, head, cashTipRows(M, b));
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); hideTip(); });
+    svg.appendChild(hit);
+  });
+  host.appendChild(svg);
+  // where the numbers come from, in a line
+  const C = M.C, lf = C.live_from;
+  const sh = C.shards && live ? Object.keys(C.shards).sort().map((k) => k + " " + fmtUSD(C.shards[k], { dp: 0 })).join(" · ") : "";
+  $("cashNote").textContent = "The main account's cash, every shard (subaccounts not counted): Kalshi's reading at each 7am snapshot (dots)" +
+    (lf ? " and every dashboard build since " + dtET(lf) : "") + ", and between readings every fill and settlement, replayed. " +
+    "Collateral and reward credits have no record of their own: they land on the reading that shows them" +
+    (lf && lf > M.s ? " (before " + dtET(lf) + ", on the 7am snapshot)" : "") + "." +
+    (M.gaps ? " A gap in the line is a day not replayed yet." : "") +
+    (sh ? " Cash by shard now: " + sh + "." : "");
+  renderCashTable(M);
+}
+function renderCashTable(M) {
+  const host = $("cashTable");
+  $("cashTableNote").textContent = "what each family and bot paid out and took in over the window; click a row to chart it alone" + (cashSel ? " (click it again for all)" : "");
+  if (!M) { host.innerHTML = '<div class="empty">No cash data.</div>'; return; }
+  const ki = {}; M.C.k.forEach((k, i) => { ki[k] = i; });
+  const rows = Object.values(M.rows).filter((r) => matchQ(r.name, CF_GRP[r.grp])).map((r) => {
+    let c = 0;
+    const cum = r.bins.map((v) => (c += v));
+    return { name: r.name, grp: r.grp, buy: r.v[ki.buy], sell: r.v[ki.sell], settle: r.v[ki.settle], net: r.net, cum };
+  });
+  const sum = (k) => rows.reduce((a, r) => a + num(r[k]), 0);
+  const trade = (r) => r.grp !== "acct";
+  const amt = (r, k) => !trade(r) ? "" : Math.abs(num(r[k])) < 0.5 ? '<span class="muted">—</span>' : money(r[k], { dp: 0 });
+  table(host, [
+    { k: "name", label: "Source", fmt: (r) => esc(r.name) + '<span class="tag grp">' + esc(CF_GRP[r.grp]) + "</span>" },
+    { k: "buy", label: "Bought", num: true, title: "cash paid for contracts the fill opened (fees included)", fmt: (r) => amt(r, "buy") },
+    { k: "sell", label: "Sold", num: true, title: "cash in from contracts the fill closed or netted", fmt: (r) => amt(r, "sell") },
+    { k: "settle", label: "Settled", num: true, title: "Kalshi's settlement payouts", fmt: (r) => amt(r, "settle") },
+    { k: "net", label: "Net cash", num: true, title: "what it added to (+) or drew from (−) the cash over the window", fmt: (r) => "<b>" + money(r.net, { dp: 0 }) + "</b>" },
+    { k: "shape", label: "Through the window", nosort: true, title: "its cumulative net cash, " + (M.bin === 3600 ? "hour" : "6 hours") + " by " + (M.bin === 3600 ? "hour" : "6 hours"), fmt: (r) => spark([0].concat(r.cum), css(r.net < 0 ? "--div-neg" : "--div-pos"), true) },
+  ], rows, {
+    presort: (a, b) => Math.abs(b.net) - Math.abs(a.net), limit: 12,
+    empty: Q ? "No source matches the filter." : "No cash moved in this window.",
+    rowAttr: (r, i) => ' class="click' + (cashSel === r.name ? " sel" : "") + '" data-i="' + i + '"',
+    onRow: (r) => { cashSel = cashSel === r.name ? null : r.name; hideTip(); renderCash(); },
+    totalRow: { name: Q ? "Matching sources" : "All cash", buy: money(sum("buy"), { dp: 0 }), sell: money(sum("sell"), { dp: 0 }),
+      settle: money(sum("settle"), { dp: 0 }), net: "<b>" + money(sum("net"), { dp: 0 }) + "</b>" },
+  });
+}
+
 function marketRows(filterFn, key) {       // key: one of D.windows, else the page's window
   const out = [];
   for (const t in D.markets) {

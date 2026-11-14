@@ -674,7 +674,7 @@ def side_value(pos: float, mark, cost: float) -> float:
     return pos * m if pos > 0 else -pos * (1.0 - m)
 
 
-def replay_day(start, fills, settlements, end, ev_of):
+def replay_day(start, fills, settlements, end, ev_of, flows=None):
     """Each event's P&L since the prior morning, from what actually happened
     to each market (Jack 2026-09-29: "double confirm that the 'Biggest
     movers since yesterday, by family' is accurate. i dont trust it").
@@ -704,7 +704,15 @@ def replay_day(start, fills, settlements, end, ev_of):
     Returns (events, cash, mismatches, settled): events maps event ->
     {"realized", "value_d"}; cash = the day's trading + settlement cash;
     mismatches = markets whose replayed position disagrees with `end`;
-    settled = event -> set of market results."""
+    settled = event -> set of market results.
+
+    flows (a list, optional) gets each cash move as it happens, for the
+    dashboard's cash chart (Jack 2026-11-14: "a time series chart view of
+    cash balance and how it's changing throughout the day e.g. what families
+    are drawing cash or adding cash"): (ts, ticker, kind, $, fill_id), kind
+    "buy" (a fill that opened contracts: cash out), "sell" (one that closed
+    or netted them: cash in) or "settle" (a settlement's payout); a fill's
+    fee rides on its last part. The moves add up to `cash` exactly."""
     st = {}
     for tk, (q, v) in start.items():
         st[tk] = {"q": q, "basis": v, "real": 0.0}
@@ -715,18 +723,21 @@ def replay_day(start, fills, settlements, end, ev_of):
         t = datetime.fromisoformat((s.get("settled_time") or "").replace("Z", "+00:00"))
         stream.append((int(t.timestamp()), 1, s))
     stream.sort(key=lambda x: (x[0], x[1]))
-    for _, kind, x in stream:
+    for at, kind, x in stream:
         tk = x.get("ticker") or x.get("market_ticker") or ""
         d = st.setdefault(tk, {"q": 0.0, "basis": 0.0, "real": 0.0})
         if kind == 1:
             pay = _f(x.get("revenue")) / 100.0 - _f(x.get("fee_cost"))
             d["real"] += pay - d["basis"]
             cash += pay
+            if flows is not None:
+                flows.append((at, tk, "settle", pay, None))
             d["q"] = d["basis"] = 0.0
             d["settled"] = x.get("market_result") or "?"
             settled.setdefault(ev_of(tk), set()).add(d["settled"])
             continue
         n, p, q = _f(x.get("count_fp")), _f(x.get("yes_price_dollars")), d["q"]
+        parts = []                                       # (kind, $) for flows
         if x.get("book_side") == "bid":                  # +YES at p
             k = min(n, -q) if q < 0 else 0.0             # closes NO at 1 - p
             if k > 0:
@@ -734,10 +745,12 @@ def replay_day(start, fills, settlements, end, ev_of):
                 d["real"] += k * (1.0 - p) - cb
                 d["basis"] -= cb
                 cash += k * (1.0 - p)
+                parts.append(["sell", k * (1.0 - p)])
                 q += k
             if n - k > 0:
                 d["basis"] += (n - k) * p
                 cash -= (n - k) * p
+                parts.append(["buy", -(n - k) * p])
                 q += n - k
         else:                                            # -YES at p
             k = min(n, q) if q > 0 else 0.0              # sells YES held
@@ -746,15 +759,23 @@ def replay_day(start, fills, settlements, end, ev_of):
                 d["real"] += k * p - cb
                 d["basis"] -= cb
                 cash += k * p
+                parts.append(["sell", k * p])
                 q -= k
             if n - k > 0:                                # opens NO at 1 - p
                 d["basis"] += (n - k) * (1.0 - p)
                 cash -= (n - k) * (1.0 - p)
+                parts.append(["buy", -(n - k) * (1.0 - p)])
                 q -= n - k
         d["q"] = q
         fee = _f(x.get("fee_cost"))
         d["real"] -= fee
         cash -= fee
+        if flows is not None:
+            if not parts:
+                parts.append(["buy", 0.0])
+            parts[-1][1] -= fee
+            for kd, amt in parts:
+                flows.append((at, tk, kd, amt, x.get("fill_id") or x.get("trade_id")))
     events, mismatches = {}, []
     for tk in set(st) | set(end):
         d = st.get(tk) or {"q": 0.0, "basis": 0.0, "real": 0.0}
@@ -1267,6 +1288,9 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
     # per-market positions (none since 8/14).
     rows, no_trade_cash, net_transfers, replay_info = [], None, None, None
     sub_moves = sub_moves_by = None
+    # every cash move of the replay, timed (replay_day's flows): the IMM
+    # dashboard's cash chart; None when there was no replay
+    cash_flows = None
     # ticker -> the event name the rows carry (pf["ev_map"]): day by bot maps
     # the IMM's tickers through it, since the bot's own event_ticker can be
     # another name for the same market (KXMEDICAIDWORKHOUSE-26NOV's is the
@@ -1285,9 +1309,10 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
         ev_map.update(tk_event)
         ev_names = ev_map
         fills = fetch_fills(client, prior_created, now_utc)
+        cash_flows = []
         evs, trade_cash, mism, settled_now = replay_day(
             start, fills, win_setts, tk_end,
-            lambda tk: ev_map.get(tk) or event_from_ticker(tk))
+            lambda tk: ev_map.get(tk) or event_from_ticker(tk), flows=cash_flows)
         if mism:
             log(f"! replay: {len(mism)} market(s) disagree with the positions "
                 f"endpoint: {', '.join(sorted(mism)[:8])}")
@@ -1391,6 +1416,7 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
             "n_settlements": len(settlements),
             "no_trade_cash": no_trade_cash, "net_transfers": net_transfers,
             "replay": replay_info, "ev_map": ev_names,
+            "cash_flows": cash_flows,
             "first_run": prior is None}
 
 

@@ -125,6 +125,10 @@ PROGRAMS_TTL_MIN = float(os.environ.get("IMM_DASH_PROGRAMS_TTL_MIN", "30"))
 # (account_now, ~55 Kalshi reads), beside the days the 7am email keeps
 ACCOUNT_TTL_MIN = float(os.environ.get("IMM_DASH_ACCOUNT_TTL_MIN", "8"))
 DAY_BY_BOT_FILE = os.path.join("..", "portfolio-digest", "day_by_bot.json")  # under STATUS_DIR
+# The Drivers tab's cash chart (imm_cash; Jack 2026-11-14: "a time series
+# chart view of cash balance and how it's changing throughout the day"): the
+# 7am email's snapshots live here, the live readings in DASH_DIR
+PF_SNAPSHOT_DIR = os.environ.get("IMM_DASH_PF_DIR", r"C:\Users\jackd\Documents\KL\portfolio_daily")
 ACCOUNT_EMAIL_DAYS = 7
 HEARTBEAT_STALE_MIN = 30
 MARKOUT_SECS = 1800       # fill mark-out horizon (the toxic backtest's 30m)
@@ -2057,7 +2061,28 @@ def account_now(D: dict, now: float) -> dict:
             if m.startswith("!")]
     if warn:
         out["warn"] = warn[:5]
+    try:            # the cash chart's part never costs the account card
+        out["cash"] = cash_extras(pf, now)
+    except Exception as e:
+        log(f"! cash chart: the account read's cash part failed ({e!r})")
     return out
+
+
+def cash_extras(pf: dict, now: float) -> dict:
+    """What the cash chart takes from one live account read (Builder._account
+    pops it before D.acct): the reading, the replayed moves since the prior
+    snapshot (send_portfolio_digest.replay_day's flows) and the transfer
+    records."""
+    import imm_cash
+    prior = pf.get("prior") or {}
+    flows = pf.get("cash_flows")
+    return {"read": imm_cash.live_read(pf, now),
+            "a0": imm_cash.snapshot_read(prior) if prior.get("created_utc") else None,
+            "flows": (None if flows is None else
+                      [[float(a), tk, k, round(v, 4), fid] for a, tk, k, v, fid in flows]),
+            "until": now,
+            "transfers": pf.get("transfers"),
+            "moves": (pf.get("subs") or {}).get("moves")}
 
 
 # ----------------------------------------------------------------------------
@@ -2084,6 +2109,7 @@ class Builder:
         self.markouts_h = {}
         self.env = {}
         self.fine, self.fine_snaps = {}, []
+        self.cash_live = None         # the account read's cash extras (cash_extras)
 
     def _t(self, name, t0):
         self.timing[name] = round(time.time() - t0, 2)
@@ -3651,6 +3677,9 @@ class Builder:
         t0 = time.time()
         model["acct"] = self._account(model)
         self._t("account", t0)
+        t0 = time.time()
+        model["cash"] = self._cash(model)
+        self._t("cash", t0)
         # positions are valued at Kalshi's last trade from this snapshot on
         # (parse_marks_file), at the bot's own marks before it
         model["last_from"] = round(self.switch[0]) if self.switch else None
@@ -3669,8 +3698,80 @@ class Builder:
             return out
         val, at, err = _api_cached("account", ACCOUNT_TTL_MIN, self.api_force,
                                    lambda: account_now(model, time.time()))
+        if isinstance(val, dict) and "cash" in val:
+            val = dict(val)
+            self.cash_live = val.pop("cash")
         out.update(live=val, at=at or None, err=err)
         return out
+
+    def _cash(self, model):
+        """D.cash, the Drivers tab's cash chart (imm_cash.build): the 7am
+        snapshots and the live readings, the completed days' replayed moves
+        (cached per day; up to imm_cash.MAX_SEG_PER_BUILD new ones a build,
+        API builds only) and this read's moves since the newest snapshot.
+        None when it fails (the chart says so)."""
+        import imm_cash
+        try:
+            live = self.cash_live
+            if live and live.get("read"):
+                imm_cash.record_sample(DASH_DIR, live["read"], self.now)
+            samples = imm_cash.load_samples(DASH_DIR)
+            days = model.get("days") or {}
+            start = min((d["s"] for d in days.values()), default=self.now - HISTORY_DAYS * 86400)
+            first = (datetime.fromtimestamp(start, ET).date() - timedelta(days=1)).isoformat()
+            snaps = sorted(m.group(1) for m in (
+                re.search(r"pf_snapshot_(\d{4}-\d{2}-\d{2})\.json$", p)
+                for p in glob.glob(os.path.join(PF_SNAPSHOT_DIR, "pf_snapshot_*.json"))) if m)
+            snaps = [d for d in snaps if d >= first]
+            segs, todo = [], []
+            for d0, d1 in zip(snaps, snaps[1:]):
+                seg = imm_cash.load_seg(CACHE_DIR, d0, d1)
+                if seg:
+                    segs.append(seg)
+                else:
+                    todo.append((d0, d1))
+            if todo and self.api:
+                pairs = []
+                for d0, d1 in todo[-imm_cash.MAX_SEG_PER_BUILD:]:
+                    S0 = load_json(os.path.join(PF_SNAPSHOT_DIR, f"pf_snapshot_{d0}.json"))
+                    S1 = load_json(os.path.join(PF_SNAPSHOT_DIR, f"pf_snapshot_{d1}.json"))
+                    if S0 and S1 and S0.get("created_utc") and S1.get("created_utc"):
+                        pairs.append((S0, S1))
+                import contextlib
+                import io
+                import send_portfolio_digest as spd
+                buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        segs += imm_cash.compute_segs(spd, spd.build_client(), pairs, CACHE_DIR)
+                finally:
+                    for ln in buf.getvalue().splitlines():
+                        if "cash:" in ln or "! " in ln:
+                            log(ln.split("Z ", 1)[-1])
+            segs.sort(key=lambda g: g["d0"])
+            live_span = None
+            if live and live.get("a0") and live.get("flows") is not None:
+                live_span = {"a0": live["a0"], "flows": live["flows"], "until": live["until"]}
+            markets = model.get("markets") or {}
+            imm_fids = {f["id"] for f in self.fills}
+            imm_tks = ({f["t"] for f in self.fills} | {t for _ts, t, _e, _d in self.realized}
+                       | {e["t"] for e in self.exits} | set(self.last_snap[1]))
+
+            def fam(tk):
+                r = markets.get(tk)
+                return r["fam"] if r else family_of(series_of(tk))[0]
+
+            def src_of(tk, kind, fid):
+                if (tk in imm_tks) if kind == "settle" else (fid in imm_fids):
+                    return fam(tk), "imm"
+                return imm_cash.bot_src(series_of(tk)), "bot"
+
+            return imm_cash.build(segs, live_span, samples, (live or {}).get("transfers"),
+                                  (live or {}).get("moves"), src_of, start, self.now)
+        except Exception as e:
+            log(f"! cash chart: {e!r}")
+            self.warnings.append(f"cash chart: {e!r}")
+            return None
 
     def _decision_mix(self):
         """{family: {decision: [markets, modelled $/day]}} over the newest

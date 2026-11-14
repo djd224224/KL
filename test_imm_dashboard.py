@@ -1262,6 +1262,42 @@ class BuilderIntegrationTests(unittest.TestCase):
                                sum(v["w"].get("today", {}).get("pnl", 0) for v in m["markets"].values()),
                                places=1)
 
+    def test_cash_chart_files_each_move_under_its_source(self):
+        # Jack 2026-11-14: "what families are drawing cash or adding cash".
+        # A replayed day cached between two 7am snapshots: the IMM's own fill
+        # (its fill id is in the bot's log) goes to its family, another bot's
+        # fill to that bot, a settlement of a market the IMM held to its
+        # family; the rest of the cash move is reward credits
+        import imm_cash
+        old_pf = dash.PF_SNAPSHOT_DIR
+        dash.PF_SNAPSHOT_DIR = self.dir
+        self.addCleanup(setattr, dash, "PF_SNAPSHOT_DIR", old_pf)
+        for d in ("2026-09-27", "2026-09-28"):
+            with open(os.path.join(self.dir, f"pf_snapshot_{d}.json"), "w", encoding="utf-8") as f:
+                json.dump({"date": d, "created_utc": d + "T11:00:00Z"}, f)
+        a0 = {"ts": _ts("2026-09-27T11:00:00Z"), "cash": 1000.0, "R": 0.0, "dep": 0.0, "wd": 0.0, "src": "7am"}
+        a1 = dict(a0, ts=_ts("2026-09-28T11:00:00Z"), cash=1000.0)
+        seg = {"v": imm_cash.SEG_VERSION, "d0": "2026-09-27", "d1": "2026-09-28", "a0": a0, "a1": a1,
+               "flows": [[_ts("2026-09-28T09:00:00Z"), "KXBTCD-26SEP2817-T1", "buy", -7.0, "zz"],
+                         [_ts("2026-09-28T10:00:00Z"), "KXA-1", "buy", -2.5, "f1"],
+                         [_ts("2026-09-28T10:30:00Z"), "KXC-1", "settle", 4.0, None]],
+               "fills": 2, "setts": 1, "mism": 0}
+        os.makedirs(dash.CACHE_DIR, exist_ok=True)
+        with open(imm_cash.seg_path(dash.CACHE_DIR, "2026-09-27"), "w", encoding="utf-8") as f:
+            json.dump(seg, f)
+        m = dash.Builder(self.NOW, api=False, api_force=False).build()
+        C = m["cash"]
+        by = {}
+        for _b, s, k, v in C["cells"]:
+            by[(C["src"][s], C["k"][k])] = round(by.get((C["src"][s], C["k"][k]), 0.0) + v, 2)
+        fam = m["markets"]["KXA-1"]["fam"]
+        self.assertEqual(by[(fam, "buy")], -2.5)
+        self.assertEqual(by[("Crypto bots", "buy")], -7.0)
+        self.assertEqual(by[(m["markets"]["KXC-1"]["fam"], "settle")], 4.0)
+        self.assertEqual(by[("Reward credits", "reward")], 5.5)        # 1000 -> 1000 less -5.5 of moves
+        self.assertEqual(C["path"][-1], [round(a1["ts"]), 1000.0])
+        self.assertNotIn("cash", m["acct"].get("live") or {})
+
     def test_halts_and_guards(self):
         m = dash.Builder(self.NOW, api=False, api_force=False).build()
         self.assertEqual([x["t"] for x in m["halts"]["side"]], ["KXA-1"])      # expired one dropped
