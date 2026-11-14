@@ -45248,9 +45248,10 @@ class TestHeightenedBait1113(unittest.TestCase):
         trips = {r["key"]: r for r in self._rows("trip")}
         self.assertEqual(sorted(trips), ["e|" + self.E, "m|" + self.A])
         self.assertEqual(self.cancelled, [])
+        # no day-log line per trip (the sink has them; the summary counts them)
         said = " ".join(str(c.args[0]) for c in lg.call_args_list)
-        self.assertIn(f"heightened bait mode (dry) market {self.A}: 3 pulls", said)
-        self.assertIn("would run heightened until", said)
+        self.assertNotIn("would run heightened", said)
+        self.assertEqual(self.bot._hz_trip_series, {"KXEVT": 2})
         # the state file keeps the windows
         self.assertEqual(sorted(self.bot._hz_payload()["windows"]),
                          ["e|" + self.E, "m|" + self.A])
@@ -45330,8 +45331,9 @@ class TestHeightenedBait1113(unittest.TestCase):
                 if "last 10 min" in str(c.args[0])]
         self.assertEqual(len(said), 1)
         self.assertIn("3 pulled (0 taken, 0 stood), 2 trips", said[0])
-        self.assertIn("2 windows open", said[0])
+        self.assertIn("2 windows open (most trips: KXEVT 2); ", said[0])
         self.assertIn("ms avg", said[0])
+        self.assertEqual(self.bot._hz_trip_series, {})     # counted afresh
 
     def test_off_reads_nothing(self):
         with mock.patch.object(imm, "HEIGHTENED_MODE", "off"):

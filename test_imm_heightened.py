@@ -215,9 +215,27 @@ class TestHeightenedWatch(unittest.TestCase):
         w3.load(w2.payload(T0 + 200), T0 + 200)
         self.assertEqual(sorted(w3.windows), ["e|" + self.EV, "m|" + self.T])
         self.assertIn(10456.0, w3.sizes[self.EV])
+        # each pull is kept once, compactly
+        pay = w2.payload(T0 + 200)
+        self.assertEqual(len(pay["pulls"]), 3)
+        self.assertNotIn("pulls_ev", pay)
+        self.assertEqual(pay["pulls"][0][1:4], [self.T, self.EV, "bid"])
         # junk never raises
         H.HeightenedWatch(day_end=day_end).load({"windows": 5, "trips_day": {"x": "y"}}, T0)
         H.HeightenedWatch(day_end=day_end).load("nope", T0)
+
+    def test_the_first_builds_payload_still_loads(self):
+        old = {"pulls_mkt": {self.T: [
+            {"ticker": self.T, "side": "bid", "ts": T0 + 60 * k, "base": 42.0,
+             "px": 55.0, "life_s": 20.0, "size": 500.0, "added": 500.0,
+             "joined": False} for k in range(2)]},
+            "pulls_ev": {self.EV: []}}
+        self.w.load(old, T0 + 130)
+        self.assertEqual((len(self.w.pulls_mkt[self.T]), len(self.w.pulls_ev[self.EV])),
+                         (2, 2))
+        rows = self._flash(T0 + 140)
+        self.assertEqual(sorted(r["key"] for r in rows if r["ev"] == "trip"),
+                         ["e|" + self.EV, "m|" + self.T])
 
     def test_prune_forgets_old_sides_and_prints(self):
         self._flash(T0)

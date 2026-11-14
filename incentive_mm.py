@@ -27779,6 +27779,7 @@ class IncentiveMarketMaker:
         self._hz_sum_at = time.time()
         self._hz_sum_base: Dict[str, int] = {}
         self._hz_cost = {"n": 0, "secs": 0.0, "max": 0.0}
+        self._hz_trip_series: Dict[str, int] = {}
         self._bait = {"candidates": 0, "tape_reads": 0, "tape_fails": 0,
                       "not_on_tape": 0, "bigger_taker": 0, "fingerprints": 0,
                       "stops": 0, "last": None}
@@ -35611,34 +35612,15 @@ class IncentiveMarketMaker:
             pass
 
     def _hz_emit(self, rows: List[dict]) -> None:
-        """The watch's rows to the `heightened` sink; trips and clears to the
-        day log too."""
+        """The watch's rows to the `heightened` sink. Trips are counted by
+        series for the 10-minute summary; no line each in the day log (live
+        on 11/14 the raw trigger tripped ~115 times in its first 8 min)."""
         for r in rows:
             r = dict(r, mode=HEIGHTENED_MODE)
             self._sink("heightened", r)
-            kind = r.get("ev")
-            if kind not in ("trip", "clear"):
-                continue
-            name = r.get("ticker") if r.get("scope") == "market" else r.get("event")
-            ex = f"; exempt ({r['exempt']})" if r.get("exempt") else ""
-            if kind == "trip":
-                until = datetime.fromtimestamp(float(r["until"]), timezone.utc) \
-                    .astimezone(ET).strftime("%H:%M")
-                pulls = ", ".join(
-                    f"{p['ticker'].rsplit('-', 1)[-1]} {p['side']} "
-                    f"{p['px']:g}c over {'none' if p['base'] is None else format(p['base'], 'g') + 'c'}"
-                    f" {p['life_s']:.0f}s" for p in r.get("pulls") or [])
-                log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}) "
-                    f"{r['scope']} {name}: {len(r.get('pulls') or [])} pulls in "
-                    f"{HEIGHTENED_WINDOW_MIN:g} min ({pulls}) -- would run heightened "
-                    f"until {until} ET"
-                    + (" (2nd trip today: to midnight)" if r.get("to_midnight") else "")
-                    + ex)
-            else:
-                log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}) "
-                    f"{r['scope']} {name}: clear after {r['dur_min']:g} min -- "
-                    f"{r['pulls']} pulls, {r['fills']} fills of ours inside "
-                    f"({r['fill_ct']:g} contracts){ex}")
+            if r.get("ev") == "trip":
+                k = "exempt" if r.get("exempt") else series_of(str(r.get("ticker") or ""))
+                self._hz_trip_series[k] = self._hz_trip_series.get(k, 0) + 1
 
     def _hz_summary(self, now_ts: float) -> None:
         """Every 10 minutes, one day-log line of the watch's counters."""
@@ -35649,13 +35631,19 @@ class IncentiveMarketMaker:
         d = {k: v - self._hz_sum_base.get(k, 0) for k, v in st.items()}
         self._hz_sum_base = st
         c = self._hz_cost
+        top = sorted(((n, k) for k, n in self._hz_trip_series.items() if k != "exempt"),
+                     reverse=True)[:3]
+        n_ex = self._hz_trip_series.get("exempt", 0)
+        most = ", ".join(f"{k} {n}" for n, k in top) + (f"; exempt {n_ex}" if n_ex else "")
         log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}), last 10 min: "
             f"{d['flashes']} better prices, {d['pulls']} pulled ({d['taken']} taken, "
             f"{d['stood']} stood), {d['trips']} trips, {d['fills']} fills of ours "
-            f"inside, {d['actors']} repeat sizes; {len(self._hz.windows)} windows open; "
+            f"inside, {d['actors']} repeat sizes; {len(self._hz.windows)} windows open"
+            + (f" (most trips: {most})" if most else "") + "; "
             f"{c['n']} looks, {1000.0 * c['secs'] / max(1, c['n']):.1f} ms avg / "
             f"{1000.0 * c['max']:.0f} ms max, {len(self._hz_dirty)} books waiting")
         self._hz_cost = {"n": 0, "secs": 0.0, "max": 0.0}
+        self._hz_trip_series = {}
 
     # ---- bait-fingerprint stop (2026-10-22, BAIT_STOP_MODE) -----------------
 
@@ -45973,7 +45961,8 @@ class IncentiveMarketMaker:
                f"untraded is a pull; {HEIGHTENED_PULLS} in {HEIGHTENED_WINDOW_MIN:g} min "
                f"on a market or across an event open a {HEIGHTENED_HOLD_MIN:g}-min "
                f"window (a 2nd trip the same day: to ET midnight); logged to "
-               f"heightened_<date>.jsonl, no quote changed; exempt rows: "
+               f"heightened_<date>.jsonl (trips counted in a 10-min summary line), no "
+               f"quote changed; exempt rows: "
                f"{','.join(HEIGHTENED_SKIP) or 'nothing'}, crypto"
                + ("" if TAPE_TRIGGER != "off"
                   else " (no trade tape: a better price that traded reads as pulled)")

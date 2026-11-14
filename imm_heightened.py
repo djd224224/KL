@@ -251,7 +251,7 @@ class HeightenedWatch:
             if px is None:
                 return None
             return round(px if p["side"] == "bid" else 100.0 - px, 2)
-        rec = {"ticker": t, "side": p["side"], "ts": round(ts, 3),
+        rec = {"ticker": t, "event": ev, "side": p["side"], "ts": round(ts, 3),
                "base": yes(p["base"]), "px": yes(p["px_hi"]),
                "after": yes(p["after"]),
                "gain_c": None if p["base"] is None
@@ -267,8 +267,7 @@ class HeightenedWatch:
                 dq.popleft()
         if p["added"] > 0:
             self.sizes.setdefault(ev, {})[round(p["added"], 2)] = ts
-        out = [dict(rec, ev="pull", event=ev, n_market=len(dm), n_event=len(de),
-                    exempt=ex)]
+        out = [dict(rec, ev="pull", n_market=len(dm), n_event=len(de), exempt=ex)]
         for key, scope, dq in (("m|" + t, "market", dm), ("e|" + ev, "event", de)):
             w = self.windows.get(key)
             if w is not None and w["until"] > ts:
@@ -298,8 +297,8 @@ class HeightenedWatch:
                 "ticker": t, "event": ev, "until": round(until, 3),
                 "trips_today": n, "to_midnight": n >= 2, "exempt": ex,
                 "markets": sorted({x["ticker"] for x in pulls}),
-                "pulls": [{k: x[k] for k in ("ticker", "side", "ts", "base", "px",
-                                             "life_s", "size", "added", "joined")}
+                "pulls": [{k: x.get(k) for k in ("ticker", "side", "ts", "base", "px",
+                                                 "life_s", "size", "added", "joined")}
                           for x in pulls]}
 
     def _actor_check(self, t: str, ev: str, side: str,
@@ -354,10 +353,14 @@ class HeightenedWatch:
                         if w["until"] > now},
             "trips_day": {k: [round(e, 1), n] for k, (e, n) in self.trips_day.items()
                           if e > now},
-            "pulls_mkt": {k: list(dq) for k, dq in self.pulls_mkt.items()
-                          if dq and dq[-1]["ts"] >= now - self.window_secs},
-            "pulls_ev": {k: list(dq) for k, dq in self.pulls_ev.items()
-                         if dq and dq[-1]["ts"] >= now - self.window_secs},
+            # each pull once, as a compact row (the event lists are rebuilt
+            # from it): [ts, ticker, event, side, base, px, life_s, size,
+            # added, joined]
+            "pulls": [[r["ts"], r["ticker"], r.get("event", ""), r["side"],
+                       r.get("base"), r.get("px"), r.get("life_s"), r.get("size"),
+                       r.get("added"), bool(r.get("joined"))]
+                      for dq in self.pulls_mkt.values() for r in dq
+                      if r["ts"] >= now - self.window_secs],
             "sizes": {ev: {str(s): round(v, 1) for s, v in d.items()}
                       for ev, d in self.sizes.items()
                       if d and max(d.values()) >= now - 86400.0},
@@ -374,13 +377,22 @@ class HeightenedWatch:
             for k, v in (data.get("trips_day") or {}).items():
                 if float(v[0]) > now:
                     self.trips_day[str(k)] = (float(v[0]), int(v[1]))
-            for name in ("pulls_mkt", "pulls_ev"):
-                d = getattr(self, name)
-                for k, lst in (data.get(name) or {}).items():
-                    rows = [dict(r) for r in lst if isinstance(r, dict)
-                            and float(r.get("ts") or 0) >= now - self.window_secs]
-                    if rows:
-                        d[str(k)] = deque(rows)
+            pulls = []
+            for row in data.get("pulls") or []:
+                if isinstance(row, list) and len(row) >= 10 and                         float(row[0]) >= now - self.window_secs:
+                    pulls.append(dict(zip(
+                        ("ts", "ticker", "event", "side", "base", "px", "life_s",
+                         "size", "added", "joined"), row)))
+            # the first build's payload kept whole rows per market and event
+            for lst in (data.get("pulls_mkt") or {}).values():
+                for r in lst:
+                    if isinstance(r, dict) and float(r.get("ts") or 0) >=                             now - self.window_secs:
+                        r = dict(r)
+                        r.setdefault("event", str(r.get("ticker") or "").rsplit("-", 1)[0])
+                        pulls.append(r)
+            for r in sorted(pulls, key=lambda r: float(r["ts"])):
+                self.pulls_mkt.setdefault(str(r["ticker"]), deque()).append(r)
+                self.pulls_ev.setdefault(str(r["event"]), deque()).append(r)
             for ev, s in (data.get("sizes") or {}).items():
                 self.sizes[str(ev)] = {round(float(k), 2): float(v) for k, v in s.items()}
         except (TypeError, ValueError, IndexError, AttributeError):
