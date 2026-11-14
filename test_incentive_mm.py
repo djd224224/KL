@@ -180,6 +180,7 @@ def setUpModule():
     imm.CRYPTO_OPEN_FILE = os.path.join(tmp, "crypto_series.json")
     imm.CRYPTO_EVENT_FAIR_FILE = os.path.join(tmp, "crypto_event_fair.json")
     imm.CRYPTO_EVENT_STOP_FILE = os.path.join(tmp, "crypto_event_stop.json")
+    imm.FX_EVENT_FAIR_FILE = os.path.join(tmp, "fx_event_fair.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -27219,7 +27220,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # stand-down (2026-11-01)
         # + the Zillow home value gate (2026-11-12)
         # + the crypto event gate (2026-11-14)
-        self.assertEqual(len(conts), 58)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
+        # + the FX event gate (2026-11-14)
+        self.assertEqual(len(conts), 59)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -45348,6 +45350,181 @@ class TestCryptoEventFair(unittest.TestCase):
             self.assertEqual(self._resting(bot, t), [], kw)
             self.assertIn(t, bot._cev_stood)
 
+
+
+class TestFxEventFair(unittest.TestCase):
+    """FX EVENT FAIR (Jack 2026-11-14: "after-economic events can quote anytime not just when
+    markets are shut, but need a fair value" -> "Yes, build it" to a live fair in the bot like
+    the crypto strikes'): the FX + metals "after economic events" strikes quote only inside
+    their live fair's limits, failing closed, the list's 15-min limits replaced every cycle."""
+
+    def _t(self, days=3):
+        d = datetime.now(timezone.utc) + timedelta(days=days)
+        seg = f"{d.day:02d}{d.strftime('%b').upper()}{d.year % 100:02d}1500"
+        return f"KXGOLDEVENT-{seg}-T388000", d
+
+    def _snap(self, t, p=0.48, bid_max=46, ask_min=50, spot_age=5.0, hold=None, s_hold=None,
+              err=None, cut=False):
+        now = time.time()
+        e = ({"series": "KXGOLDEVENT", "err": err, **({"cut": True} if cut else {})} if err else
+             {"series": "KXGOLDEVENT", "strike": 3880.0, "p": p, "margin": 2.0, "bid_max": bid_max,
+              "ask_min": ask_min, "spot": 3884.1, "spot_ts": now - spot_age, "t_days": 3.0,
+              "hold_until": hold})
+        imm._fx_event_state["snap"] = {
+            "checked_ts": now, "mode": "weekend", "close_at": "2026-11-13T22:00Z",
+            "series": {"KXGOLDEVENT": {"spot": 3884.1, "hold_until": s_hold, "err": None}},
+            "markets": {t: e}}
+        self.addCleanup(imm._fx_event_state.update, snap=None)
+
+    def test_the_series_and_the_gate_table(self):
+        self.assertTrue(imm.fx_event_series("KXGOLDEVENT"))
+        self.assertTrue(imm.fx_event_series("KXUSDMXNEVENT"))
+        self.assertFalse(imm.fx_event_series("KXBTCEVENT"))         # crypto's own gate
+        self.assertFalse(imm.fx_event_series("KX10YRRATEEVENT"))    # yields: no fair
+        self.assertEqual(imm.fair_gate_of("KXGOLDEVENT"), "fx event")
+        with mock.patch.object(imm, "FX_EVENT_FAIR", False):
+            self.assertFalse(imm.fx_event_series("KXGOLDEVENT"))
+        self.assertEqual(len(imm.FX_EVENT_SERIES), 9)
+
+    def test_gate_reasons_fail_closed(self):
+        t, _d = self._t()
+        now = time.time()
+        r = lambda: imm.fx_event_gate(t, now)[1].get("reason")
+        imm._fx_event_state["snap"] = None
+        self.assertEqual(r(), "no_read")
+        self._snap("KXGOLDEVENT-OTHER-T1")
+        self.assertEqual(r(), "no_market")
+        self._snap(t, err="no close kept for the 11/13 22:00Z close yet")
+        self.assertEqual(r(), "model")
+        self._snap(t, err="within 12 h of its measurement", cut=True)
+        self.assertEqual(r(), "cutoff")
+        self._snap(t, spot_age=imm.FX_EVENT_TTL_SECS + 5)
+        self.assertEqual(r(), "stale")
+        self._snap(t, hold=now + 300)
+        self.assertEqual(r(), "jump_hold")
+        self._snap(t, s_hold=now + 300)
+        self.assertEqual(r(), "jump_hold")
+        self._snap(t, bid_max=0, ask_min=100)
+        self.assertEqual(r(), "decided")
+        self._snap(t)
+        why, inputs, caps = imm.fx_event_gate(t, now)
+        self.assertEqual((why, caps), ("", (46, 50)))
+        self.assertEqual(inputs["fair"], 48.0)
+        self._snap(t, bid_max=0, ask_min=3)                         # a far strike: asks only
+        self.assertEqual(imm.fx_event_gate(t, now)[2], (None, 3))
+        self._snap(t, bid_max=97, ask_min=100)                      # deep in: bids only
+        self.assertEqual(imm.fx_event_gate(t, now)[2], (97, None))
+
+    def test_a_listed_strike_takes_its_limits_from_the_live_fair(self):
+        t, _d = self._t()
+        self._snap(t)
+        entry = {"bid_max": 30, "ask_min": 70, "follow_book": True}
+        self.assertEqual(imm.pvd_limits(entry, None), (30, 70))                          # no ticker: the list
+        self.assertEqual(imm.pvd_limits(entry, None, t), (46, 50))                       # the live fair
+        q = [Quote(t, "bid", 40, 300), Quote(t, "ask", 55, 300)]
+        self.assertEqual(sorted((x.book_side, x.price_cents) for x in imm.pvd_guard_quotes(
+            q, dict(entry, pmin=1, pmax=99), None, ticker=t)), [("ask", 55), ("bid", 40)])
+        # ...the list's 30 / 70 would have stood both out
+        self.assertEqual(imm.pvd_guard_quotes(q, dict(entry, pmin=1, pmax=99), None), [])
+        # a far strike's live limits: no bid at all (0), an ask from 3c
+        self._snap(t, bid_max=0, ask_min=3)
+        self.assertEqual(imm.pvd_limits(entry, None, t), (0, 3))
+        # no fresh read: the list's limits stand (the gate stands it aside anyway)
+        self._snap(t, spot_age=imm.FX_EVENT_TTL_SECS + 9)
+        self.assertEqual(imm.pvd_limits(entry, None, t), (30, 70))
+        with mock.patch.object(imm, "FX_EVENT_FAIR", False):
+            self._snap(t)
+            self.assertEqual(imm.pvd_limits(entry, None, t), (30, 70))
+        self.assertEqual(imm.pvd_limits(entry, None, "KXFOO-26DEC01-T1"), (30, 70))
+
+    def _write(self, markets):
+        stop = datetime.now(timezone.utc) + timedelta(hours=6)
+        with open(imm.pvd_path(), "w", encoding="utf-8") as f:
+            json.dump({"stop": stop.strftime("%Y-%m-%dT%H:%M:%SZ"), "markets": markets}, f)
+        imm._pvd_state["mtime"] = 0.0
+        imm.load_pvd_markets()
+
+        def clean():
+            try:
+                os.remove(imm.pvd_path())
+            except FileNotFoundError:
+                pass
+            imm._pvd_state["mtime"] = 0.0
+            imm.load_pvd_markets()
+            imm.PVD_REMOVED.clear()
+            _clean_persist()
+        self.addCleanup(clean)
+
+    def _cycle(self, cycles=3, **snap):
+        _clean_persist()
+        p = mock.patch.object(imm, "PVD_OFF_USUAL_COLD", False)
+        p.start()
+        self.addCleanup(p.stop)
+        t, d = self._t()
+        client = FakeClient()
+        close = d.replace(hour=20, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity", "period_reward": 9000000,
+             "target_size_fp": "1000.00", "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"], "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {"ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+                             "close_time": close, "expected_expiration_time": close,
+                             "yes_bid_dollars": "0.4000", "yes_ask_dollars": "0.5500", "volume_fp": "0.00"}
+        client.books[t] = {"orderbook_fp": {"yes_dollars": [["0.40", "5000"]], "no_dollars": [["0.45", "5000"]]}}
+        self._write({t: {"bid_max": 30, "ask_min": 70, "follow_book": True, "size": 100}})
+        self._snap(t, **snap)
+        # these tickers are DDMONYYHHMM: live, pvd_waves.py datefix writes the event's Kalshi
+        # time into event_start_overrides.json (the bot reads YYMONDD)
+        when = datetime.fromisoformat(close.replace("Z", "+00:00"))
+        for p_ in (mock.patch.dict(imm.EVENT_START_OVERRIDES, {t.rsplit("-", 1)[0]: when}),
+                   mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                   mock.patch.object(imm, "SERIES_HOUR_MULTS", [])):
+            p_.start()
+            self.addCleanup(p_.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            for _ in range(cycles):
+                self._snap(t, **snap)                              # keep the read fresh
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+        rest = sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                      if o["ticker"] == t and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+        return bot, t, rest, lines
+
+    def test_a_listed_strike_quotes_inside_the_live_limits(self):
+        bot, t, rest, lines = self._cycle()
+        self.assertIn(t, bot.state.selected, [s_ for s_ in lines if "universe:" in s_][-2:])
+        self.assertEqual({side for side, _px in rest}, {"bid", "ask"}, (rest, [s_ for s_ in lines if t in s_][-12:]))
+        self.assertTrue(all(px <= 46 for side, px in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 50 for side, px in rest if side == "ask"), rest)
+        # tighter live limits hold them out
+        bot2, t2, rest2, _l = self._cycle(bid_max=35, ask_min=60)
+        self.assertTrue(all(px <= 35 for side, px in rest2 if side == "bid"), rest2)
+        self.assertTrue(all(px >= 60 for side, px in rest2 if side == "ask"), rest2)
+
+    def test_a_stale_read_stands_the_strike_aside(self):
+        bot, t, rest, lines = self._cycle()
+        self.assertTrue(rest)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._snap(t, spot_age=imm.FX_EVENT_TTL_SECS + 30)
+            bot.run_cycle()
+        left = [o for o in bot.state.sim_orders.values() if o["ticker"] == t
+                and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS]
+        self.assertEqual(left, [])
+        self.assertIn(t, bot._fev_stood)
+        self.assertTrue(any(f"fx-event stand-aside {t}:" in s_ and "source price is" in s_ for s_ in lines),
+                        [s_ for s_ in lines if "fx-event" in s_])
+        # ...and comes back on a fresh read
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._snap(t)
+            bot.run_cycle()
+        self.assertNotIn(t, bot._fev_stood)
+        self.assertTrue(any(f"fx-event resume {t}" in s_ for s_ in lines))
 
 
 class TestHeightenedBait1113(unittest.TestCase):

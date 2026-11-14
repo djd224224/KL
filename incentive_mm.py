@@ -11312,9 +11312,17 @@ def pvd_limits(entry: dict, last: Optional[float],
     event fair instead -- no bid over the band's top, no ask under its bottom
     (crypto_event_wave_limits) -- live every cycle, where the list's limits
     walk 5c a 15-min run: after the 02:47Z listing other makers moved inside
-    them and 164 asks stood out ("pvd guard ... ask out") at 04:00Z."""
+    them and 164 asks stood out ("pvd guard ... ask out") at 04:00Z.
+
+    FAIR LIMITS FOR FX + METALS (Jack 2026-11-14: "after-economic events can quote anytime not
+    just when markets are shut, but need a fair value" -> "Yes, build it"): likewise an FX
+    event strike with a fresh read takes fair -/+ its margin from the live FX event fair
+    (fx_event_wave_limits) in place of the list's 15-min fair-file limits."""
     if ticker:
         fl = crypto_event_wave_limits(ticker, time.time())
+        if fl is not None:
+            return fl
+        fl = fx_event_wave_limits(ticker, time.time())
         if fl is not None:
             return fl
     if entry.get("follow_book"):
@@ -19998,6 +20006,87 @@ def crypto_event_fair_c(ticker: str, now_ts: float) -> Optional[float]:
     return None if why else float(inputs["fair"])
 
 
+# FX EVENT FAIR (Jack 2026-11-14: "after-economic events can quote anytime not just when
+# markets are shut, but need a fair value", then "Yes, build it" to a 15-second live fair in
+# the bot like the crypto strikes'). The nine FX + metals "after economic events" series
+# (FX_EVENT_SERIES) quote only as wave books (w1113-fxmetals). fx_event_fair.py (refresher
+# thread "fx-event-fair", every FX_EVENT_REFRESH_SECS) prices every strike on wave_fair.py's
+# model -- the weekend's kept Friday close (run-logs/pvd-scan/wave_fair_closes.json, filled by
+# the wave's pass-7 fair_cmd) moved by its 24/7 source (Hyperliquid perps, Kraken, Bitso) --
+# with each strike's margin and limits:
+#   STAND ASIDE (cancel, fail closed): no read; a series with no kept close or no source
+#     price; a source read older than FX_EVENT_TTL_SECS; a series in its jump hold (its source
+#     moved > 0.35 daily sigma inside 5 min: 5 min out); a weekday strike within 12 h of its
+#     measurement (the release it settles one minute after); a strike the model does not price;
+#     no side left.
+#   LIMITS: bids at most bid_max, asks at least ask_min -- fair -/+ (the series' 2c base, copper
+#     6c, + the 25% vol-error term, + on weekdays 2 sd of its source's 3-min move), floors 2c on
+#     weekends and 0 on weekdays -- live every cycle in place of the list's 15-min fair-file
+#     limits (pvd_limits), as the crypto wave books (no lead, no book-fight stand-aside: wide
+#     weekend books sit off fair and the limits already hold them out).
+# IMM_FX_EVENT_FAIR=0 turns it off: the list's limits (pvd_wave_tune --fair-file) stand alone.
+FX_EVENT_FAIR = os.environ.get("IMM_FX_EVENT_FAIR", "1") == "1"
+FX_EVENT_TTL_SECS = _env_int("IMM_FX_EVENT_TTL_SECS", 180)
+FX_EVENT_REFRESH_SECS = _env_int("IMM_FX_EVENT_REFRESH_SECS", 15)
+FX_EVENT_FAIR_FILE = os.environ.get(
+    "IMM_FX_EVENT_FAIR_FILE", os.path.join(STATUS_DIR, "fx_event_fair.json"))
+FX_EVENT_SERIES = frozenset(s_.strip().upper() for s_ in os.environ.get(
+    "IMM_FX_EVENT_SERIES",
+    "KXGOLDEVENT,KXSILVEREVENT,KXCOPPEREVENT,KXUSDJPYEVENT,KXEURUSDEVENT,KXAUDUSDEVENT,"
+    "KXUSDMXNEVENT,KXUSDCADEVENT,KXGBPUSDEVENT").split(",") if s_.strip())
+_fx_event_state: dict = {"snap": None}
+
+
+def fx_event_series(series: str) -> bool:
+    """An FX / metals "after economic events" series, quoted off the live FX event fair."""
+    return FX_EVENT_FAIR and (series or "") in FX_EVENT_SERIES
+
+
+def fx_event_gate(ticker: str, now_ts: float
+                  ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when an FX event strike may quote -- bids at most
+    bid_cap, asks at least ask_floor, None = that side not at all -- else (why, guard-skip
+    inputs, None). Fails CLOSED."""
+    snap = _fx_event_state.get("snap")
+    if snap is None:
+        return "no fx event read yet", {"reason": "no_read"}, None
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        return "market not in the fx event read", {"reason": "no_market"}, None
+    if e.get("err") or e.get("p") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return (f"not quoted: {why}", {"reason": "cutoff" if e.get("cut") else "model", "why": why}, None)
+    age = now_ts - float(e.get("spot_ts") or 0.0)
+    if age > FX_EVENT_TTL_SECS:
+        return (f"{e.get('series')} source price is {age:.0f}s old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    hold = float(e.get("hold_until") or 0.0)
+    s_hold = ((snap.get("series") or {}).get(e.get("series")) or {}).get("hold_until")
+    hold = max(hold, float(s_hold or 0.0))
+    if hold > now_ts:
+        return (f"{e.get('series')} jump hold ({(hold - now_ts) / 60:.0f}m left)",
+                {"reason": "jump_hold", "left_s": round(hold - now_ts)}, None)
+    bmax, amin = int(e["bid_max"]), int(e["ask_min"])
+    inputs = {"fair": round(float(e["p"]) * 100.0, 2), "margin": e.get("margin"), "spot": e.get("spot"),
+              "t_days": e.get("t_days"), "mode": snap.get("mode"), "bid_max": bmax, "ask_min": amin}
+    caps = (bmax if bmax >= 1 else None, amin if amin <= 99 else None)
+    if caps == (None, None):
+        return "no side inside 1-99c of the fair", dict(inputs, reason="decided"), None
+    return "", inputs, caps
+
+
+def fx_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]]:
+    """A listed FX event strike's (bid_max, ask_min) off its live fair -- a side with no room
+    reads 0 / 100 (nothing passes) -- or None (not an FX event strike, or no fresh read: the
+    list's limits stand, and the gate stands it aside)."""
+    if not fx_event_series(series_of(ticker)):
+        return None
+    why, inputs, caps = fx_event_gate(ticker, now_ts)
+    if why or caps is None:
+        return None
+    return (caps[0] if caps[0] is not None else 0, caps[1] if caps[1] is not None else 100)
+
+
 def vercel_measured_day(event_ticker: str) -> Optional[datetime]:
     """00:00Z of the UTC day D a Vercel event measures: lab series DDMMMYY =
     D, KXOPENSOURCESHARE YYMMMDD = D + 1. None when it does not parse."""
@@ -24595,6 +24684,7 @@ def fair_gate_of(series: str) -> str:
         ("mortgage", lambda: mort_series(series)),
         ("zillow home", lambda: home_series(series)),
         ("crypto event", lambda: crypto_event_series(series)),
+        ("fx event", lambda: fx_event_series(series)),
         ("pokemon", lambda: poke_series(series)),
         ("nfl props", lambda: nfl_series(series)),
     )
@@ -27799,6 +27889,7 @@ class IncentiveMarketMaker:
         self._home_stood: Set[str] = set()        # zillow home gate stand-asides
         self._home_edges: Set[str] = set()        # ...and its edges-only markets
         self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
+        self._fev_stood: Set[str] = set()         # FX event gate stand-asides
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -38154,6 +38245,10 @@ class IncentiveMarketMaker:
                 # crypto event gate: the same, the band plus CRYPTO_EVENT_TOL_CENTS
                 _cw, _ci, _cc = crypto_event_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_cw or _cc is None) else mort_cap_quotes(out, *_cc)
+            if fx_event_series(meta.series):
+                # FX event gate: the same, inside the live limits
+                _fw, _fi, _fc = fx_event_gate(meta.ticker, _now.timestamp())
+                out = [] if (_fw or _fc is None) else mort_cap_quotes(out, *_fc)
             if poke_series(meta.series):
                 # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
                 _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
@@ -41052,6 +41147,24 @@ class IncentiveMarketMaker:
                 self._cev_stood.discard(t)
                 log(f"{self.tag} crypto-event resume {t}")
 
+            # FX EVENT GATE (Jack 2026-11-14, see FX_EVENT_FAIR): stand aside (cancel)
+            # without a fresh source price or kept close, in a series' jump hold, on a
+            # weekday strike within 12 h of its measurement, or on a strike the model does
+            # not price; otherwise every rung below stays inside the live limits.
+            fev_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if fx_event_series(meta.series):
+                fe_why, fe_in, fev_caps = fx_event_gate(t, now_ts)
+                if fe_why or fev_caps is None:
+                    if t not in self._fev_stood:
+                        self._fev_stood.add(t)
+                        log(f"{self.tag} fx-event stand-aside {t}: {fe_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "fx_event_fair", lambda: fe_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._fev_stood:
+                self._fev_stood.discard(t)
+                log(f"{self.tag} fx-event resume {t}")
+
             # POKEMON GATE (Jack 2026-10-03, see POKE_ENABLE): stand aside
             # (cancel) without a fresh TCGplayer fair, on an unmapped event
             # or one whose rules name another item, just after the item's
@@ -41819,6 +41932,9 @@ class IncentiveMarketMaker:
             # crypto event gate: likewise last, outside the band by the tolerance
             if cev_caps is not None:
                 mq = mort_cap_quotes(mq, *cev_caps)
+            # FX event gate: likewise last, inside the live limits
+            if fev_caps is not None:
+                mq = mort_cap_quotes(mq, *fev_caps)
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
             if poke_caps is not None:
                 mq = mort_cap_quotes(mq, *poke_caps)
@@ -45177,6 +45293,53 @@ class IncentiveMarketMaker:
                     time.sleep(max(5, CRYPTO_EVENT_REFRESH_SECS))
             threading.Thread(target=_crypto_event_fair_refresh, daemon=True,
                              name="crypto-event-fair").start()
+        if FX_EVENT_FAIR and FX_EVENT_SERIES and not once:
+            # FX event fair refresher (2026-11-14): market lists every 10 min, the kept
+            # closes when their file changes, the 24/7 sources every FX_EVENT_REFRESH_SECS;
+            # the gate reads _fx_event_state. A failed source leaves its spot_ts behind, so
+            # the gate fails closed after FX_EVENT_TTL_SECS.
+            def _fx_event_fair_refresh():
+                try:
+                    import fx_event_fair
+                except Exception as e:
+                    log(f"{self.tag} ! fx event refresher disabled: {e}")
+                    return
+                watch = fx_event_fair.FxEventWatch(fair_reader(), lambda: sorted(FX_EVENT_SERIES))
+                last = None
+                status_at = 0.0
+                while True:
+                    try:
+                        snap = watch.refresh()
+                        _fx_event_state["snap"] = snap
+                        ents = snap.get("markets") or {}
+                        n_ok = sum(1 for e in ents.values() if "p" in e)
+                        n_cut = sum(1 for e in ents.values() if e.get("cut"))
+                        ser = snap.get("series") or {}
+                        holds = sorted(s_ for s_, v in ser.items() if (v.get("hold_until") or 0) > time.time())
+                        bad = sorted(s_ for s_, v in ser.items() if v.get("err"))
+                        key = (n_ok, len(ents), n_cut, snap.get("mode"), tuple(holds), tuple(bad))
+                        if last != key:
+                            log(f"{self.tag} fx-event fair ({snap.get('mode')}, close {snap.get('close_at')}): "
+                                f"{n_ok}/{len(ents)} strikes priced"
+                                + (f", {n_cut} within 12 h of their measurement" if n_cut else "")
+                                + "; " + ", ".join(f"{s_.replace('KX', '').replace('EVENT', '')} "
+                                                   f"{v.get('spot') or 0:,.5g}" for s_, v in sorted(ser.items())
+                                                   if v.get("spot"))
+                                + (f"; JUMP HOLD {', '.join(holds)}" if holds else "")
+                                + (f"; NO FAIR {', '.join(bad)}: {ser[bad[0]].get('err')}" if bad else "")
+                                + (f"; {'; '.join(snap['errors'])[:200]}" if snap.get("errors") else ""))
+                        last = key
+                        if time.time() - status_at >= 60:
+                            status_at = time.time()
+                            try:
+                                fx_event_fair.write_status(FX_EVENT_FAIR_FILE, snap)
+                            except Exception:
+                                pass      # observability only
+                    except Exception as e:
+                        log(f"{self.tag} ! fx-event fair refresh: {type(e).__name__}: {str(e)[:120]}")
+                    time.sleep(max(5, FX_EVENT_REFRESH_SECS))
+            threading.Thread(target=_fx_event_fair_refresh, daemon=True,
+                             name="fx-event-fair").start()
         if HOME_ENABLE and (HOME_SERIES or HOME_AUTO) and not once:
             # Zillow home value refresher (2026-11-12): the mortgage
             # refresher's shape. Kalshi markets every 15 min, the Zillow CSVs
