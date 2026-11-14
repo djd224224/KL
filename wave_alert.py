@@ -33,7 +33,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIST = os.path.join(HERE, "run-logs", "incentive-mm", "post_vote_dead_books.json")
@@ -64,6 +64,30 @@ def ascii_text(s: str) -> str:
 def short(s: str, n: int = NAME_CHARS) -> str:
     s = " ".join(ascii_text(s).split())
     return s if len(s) <= n else s[: n - 3].rstrip() + "..."
+
+
+def _iso(s):
+    """A '2026-11-12T20:08:53Z' stamp as an aware UTC datetime, else None."""
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def et_clock(t: datetime, ampm: bool = True) -> str:
+    """'3:08 PM' in US Eastern (DST-aware), or '3:08' with ampm=False."""
+    try:
+        from zoneinfo import ZoneInfo
+        t = t.astimezone(ZoneInfo("America/New_York"))
+    except Exception:  # noqa: BLE001 -- no tz database: EST/EDT by the US rule
+        y = t.year
+        start = datetime(y, 3, 8, 7, tzinfo=timezone.utc)      # 2nd Sunday of March, 2 AM EST
+        start += timedelta(days=(6 - start.weekday()) % 7)
+        end = datetime(y, 11, 1, 6, tzinfo=timezone.utc)       # 1st Sunday of November, 2 AM EDT
+        end += timedelta(days=(6 - end.weekday()) % 7)
+        t = t + timedelta(hours=-4 if start <= t < end else -5)
+    s = t.strftime("%I:%M %p").lstrip("0")
+    return s if ampm else s[:-3]
 
 
 def event_titles(events, cap: int = 2 * N_NAMES) -> dict:
@@ -300,15 +324,41 @@ def relight_msg(r: dict):
     named = sum(e["markets"] for e in evs)
     g = (f"{plural(len(evs), 'event')} ({n_mk:,} mkts)" if evs and named == n_mk
          else plural(n_mk, "market"))
-    head = (f"RELIGHT: {g} greenlit, {d_mk:,} mkts denied (~${usd:,.0f}/day)"
-            if n_mk else f"RELIGHT: programs {p0} -> {p1} (+{jump:,}), 0 greenlit")
+    # "listed", not "greenlit" (Jack 2026-11-11: the 11/11 relight texts said "247
+    # markets greenlit" for markets the old-wave lock kept dark): a listing is
+    # checked on Kalshi 20 min later (pvd_waves.py darkcheck), and a DARK alert follows
+    # a NEW wave the 24/7 wave check listed in the window (relight_watch.py "new_waves"):
+    # its programs are the jump, and its markets are listed by the check, not by the
+    # relight tasks (2026-11-11 16:22Z: "programs 5513 -> 6316 (+803), 0 listed" was
+    # w1111-statenom, 654 mkts listed at 16:08Z)
+    nw = r.get("new_waves") or []
+    nw_mk, nw_usd = sum(w.get("markets") or 0 for w in nw), sum(w.get("usd_day") or 0 for w in nw)
+    nw_names = ", ".join(w["name"] for w in nw)
+    if n_mk:
+        head = f"RELIGHT: {g} listed, {d_mk:,} mkts denied (~${usd:,.0f}/day)"
+    elif nw:
+        head = (f"RELIGHT: programs {p0} -> {p1} (+{jump:,}) = new wave {nw_names}, "
+                f"{nw_mk:,} mkts listed (~${nw_usd:,.0f}/day)")
+    else:
+        head = (f"RELIGHT: programs {p0} -> {p1} (+{jump:,}), none listed by the relight tasks: "
+                f"the wave check judges new series next (a WAVE alert follows if they fit)")
     tot = collections.Counter()
     for p in r.get("passes") or []:
         tot.update({"new": p["new"], "relit": p["relit"], "extended": p["extended"]})
-    whys = [f"Greenlit because: pool ROI over the $1.10/day bar (new {tot['new']}, relit {tot['relit']}, "
-            f"extended {tot['extended']})"] if n_mk else []
+    whys = [f"Listed because: pool ROI over the $1.10/day bar (new {tot['new']}, relit {tot['relit']}, "
+            f"extended {tot['extended']})",
+            "Quoting checked on Kalshi 20 min after listing: a DARK alert follows if they rest nothing"
+            ] if n_mk else []
     if d_mk:
         whys.append("Denied because: " + "; ".join(f"{v} {k}" for k, v in skipped.most_common() if v))
+    auto = [w for w in nw if str(w.get("note") or "").startswith("auto")]   # the check's own adds
+    for w in nw:
+        by = ("by the 24/7 wave check, its own WAVE alert sent" if w in auto
+              else "by hand (/market-wave)")
+        whys.append(f"New wave {w['name']} (added {str(w.get('added') or '')[11:16]}Z {by}): "
+                    f"{w.get('markets') or 0:,} mkts on the list, {plural(len(w.get('series') or []), 'series')}")
+    if nw and not n_mk:
+        whys.append("Quoting checked on Kalshi 20 min after listing: a DARK alert follows if they rest nothing")
     if jump:
         whys.append(f"Programs {p0} -> {p1} (+{jump:,})")
     why = "\n".join(whys)
@@ -327,7 +377,8 @@ def relight_msg(r: dict):
                                f"extended {p['extended']}), ~${p['usd_day']:,.0f}/day"
                                + (f"; skipped {p['skipped']}" if p.get("skipped") else "")
                                for p in r.get("passes") or []]
-    big = n_mk >= 100 or jump >= 1000
+    # a jump that is a new wave the check added was texted by its own WAVE alert
+    big = n_mk >= 100 or (jump >= 1000 and not auto)
     return text, short(head, 150), "market-wave relight: " + short(head, 150), "\n".join(body), big
 
 
@@ -353,9 +404,26 @@ def pickoff_msg(r: dict):
     if leg:
         whys.append(f"{plural(len(leg), 'flagged mkt')} on legacy waves: a hand stand-down (your word)")
 
+    # WHEN IT FILLED (Jack 2026-11-12: "Why are these emails coming? are they delayed?"
+    # -> "Yes" to the fill's time in the text): a fill alerts the first time its mark is
+    # past the bar, which can be hours after the fill (the 3:08 PM KXSENATENOM sweep
+    # fills alerted at 5:31 and 7:02 PM as the books kept falling), so each line says
+    # when it filled and how long before this check.
+    at = _iso(r.get("at")) or datetime.now(timezone.utc)
+
+    def when(g):
+        t0, t1 = _iso(g.get("first")), _iso(g.get("last"))
+        if t1 is None:
+            return ""
+        t0 = t0 or t1
+        span = et_clock(t0) if t1 - t0 < timedelta(minutes=1) else f"{et_clock(t0, ampm=False)}-{et_clock(t1)}"
+        mins = max(0, int((at - t1).total_seconds() // 60))
+        ago = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60:02d}m"
+        return f" filled {span} ET ({'last ' if t1 - t0 >= timedelta(minutes=1) else ''}{ago} ago)"
+
     def one(g):
         verb = "bought" if g["side"] == "bid" else "sold"
-        return (f"{g['ticker']} {verb} {g['contracts']:,.0f} @{g['vwap_c']:g}, mark {g['mark_c']:.1f} "
+        return (f"{g['ticker']} {verb} {g['contracts']:,.0f} @{g['vwap_c']:g}{when(g)}, mark {g['mark_c']:.1f} "
                 f"(-${g['adverse_usd']:,.0f})")
     rows = sorted(new or flagged, key=lambda g: float(g.get("adverse_usd") or 0), reverse=True)
     lines = [head] + whys + [f"x{i}. {one(g)}" for i, g in enumerate(rows[:N_NAMES], 1)]
@@ -374,7 +442,107 @@ def pickoff_msg(r: dict):
     return text, short(head, 150), "market-wave pick-off: " + short(head, 150), "\n".join(body), do_text
 
 
+def dark_msg(r: dict):
+    """A DARK alert from `pvd_waves.py darkcheck --json` (Jack 2026-11-11: "ELI5 why
+    market-wave didnt autoquote last night, and what needs to be fixed so that never
+    happens again"): listed wave markets that rest nothing on Kalshi, why, and what
+    --act did about it. Texts whenever darkcheck says alert (any new market under
+    the old-wave lock, or 10+ new dark for other reasons)."""
+    new = r.get("new") or []
+    kinds = collections.Counter(x.get("kind") for x in new)
+    # (since Jack's "stop false alarming", 11/11: only darkness seen at two checks in a
+    # row alerts -- under the old-wave lock after the auto-fix, or wave-wide)
+    tail = f"({r.get('two_sided', 0):,} of {r.get('checked', 0):,} checked are two-sided)"
+    head = (f"DARK, WAVE-WIDE: {plural(len(new), 'listed mkt')} rest nothing on Kalshi at two checks "
+            f"in a row {tail}" if r.get("wave_wide") else
+            f"DARK: {plural(len(new), 'listed mkt')} still rest nothing under the old-wave lock "
+            f"after the auto-fix {tail}")
+    reasons = collections.Counter(x.get("reason") for x in new)
+    whys = ["Why: " + "; ".join(f"{n} {short(k, 70)}" for k, n in reasons.most_common(3))]
+    acted = r.get("acted") or []
+    if acted:
+        whys.append("Did: " + "; ".join(
+            f"{x['action']} {x['wave']} ({', '.join(x['series'][:3])}{'...' if len(x['series']) > 3 else ''}, "
+            f"{x['markets']} mkts)" + (f" -- {x['why']}" if x.get("why") else "") for x in acted))
+    elif kinds.get("lock"):
+        whys.append("Did: nothing (darkcheck ran without --act): needs you")
+    if kinds.get("unexplained"):
+        whys.append(f"{kinds['unexplained']} dark with no reason on record: see the email")
+    if kinds.get("bot"):
+        whys.append(f"{kinds['bot']} dark for the bot's own reasons (guards, cutoffs, payout floor)")
+    lines = [head] + whys + [f"x{i}. {x['ticker']}" for i, x in enumerate(new[:N_NAMES], 1)]
+    if len(new) > N_NAMES:
+        lines.append(f"(+{len(new) - N_NAMES} more)")
+    text = "\n".join(lines)
+    if len(text) > TEXT_CHARS:
+        text = text[: TEXT_CHARS - 3] + "..."
+    body = [head] + whys + ["",
+                            f"Listed {r.get('listed', 0):,}; checked {r.get('checked', 0):,} (20+ min into their "
+                            f"listing); two-sided {r.get('two_sided', 0):,}, one-sided {r.get('one_sided', 0):,}, "
+                            f"dark {r.get('dark', 0):,}.", "", "ALL DARK, by reason:"]
+    by = collections.defaultdict(list)
+    for x in r.get("dark_rows") or []:
+        by[x.get("reason")].append(x)
+    for why, rows in sorted(by.items(), key=lambda kv: -len(kv[1])):
+        body.append(f"  {len(rows)}  {why}")
+        body += [f"      {'NEW ' if x in new else '    '}{x['ticker']}  [{x.get('wave') or '?'}, held "
+                 f"{float(x.get('pos') or 0):+,.0f}, listed {x.get('listed_at')}]" for x in rows[:40]]
+        if len(rows) > 40:
+            body.append(f"      +{len(rows) - 40} more")
+    one = collections.Counter(x.get("series") for x in r.get("one_rows") or [])
+    if one:
+        body += ["", "One-sided by series (guards: lone-ref, twin check, side caps): "
+                 + ", ".join(f"{s} {n}" for s, n in one.most_common(10))]
+    body += ["", "Fix by hand: python pvd_waves.py darkcheck --act (re-tunes or adopts the old-wave-lock "
+                 "series); the other reasons: the IMM triage (imm-quoting-triage)."]
+    return text, short(head, 150), "market-wave dark: " + short(head, 150), "\n".join(body), bool(r.get("alert"))
+
+
 ALERTS_LOG = os.path.join(HERE, "run-logs", "pvd-scan", "alerts_sent.jsonl")
+
+
+def bait_line(it: dict) -> str:
+    """One bait-watch item in plain words (bait_watch.py)."""
+    t, side, k = it["ticker"], it.get("side", ""), it["kind"]
+    when = f"{str(it.get('ts', ''))[11:16]}Z"
+    if k == "bait stop":
+        return (f"BAIT STOP {t} {side} @{it['px']:g}c {when}: a taker of exactly our {it['n']:,.0f} took the whole "
+                f"rung on a thin top our quote had jumped to" + (" (dry: logged only)" if it.get("dry")
+                                                                  else "; that side out till midnight ET"))
+    if k == "toxic halt":
+        return (f"TOXIC {t} {side} {when}: picked off {it['times']}x in 24h (filled {it['px']:g}c, "
+                f"{it['mark']:g}c {it['after_min']} min later); side paused 30 min")
+    if k.startswith("swept"):
+        return (f"{k.upper()} {it['event']} {when}: {t} {side} @{it['px']:g}c taken ({it['n']:,.0f} ct), "
+                f"trip {it['trip']} in 30 min; {it['pulled']} orders pulled {it['hold_min']} min")
+    if k == "flash":
+        return (f"FLASH {t} {side}: a better price shown and pulled {it['times']}x since {it['first'][11:16]}Z; "
+                f"the join wait kept us out each time")
+    return f"{k} {t} {side} {when}"
+
+
+def bait_msg(r: dict):
+    """A bait-watch alert from `bait_watch.py --json` (Jack 2026-11-11: "Be extremely careful for
+    baiters, notify me when something suspicious occurs", "Just cover market wave"). Texts on
+    hard evidence only."""
+    new = r.get("new") or []
+    order = {"bait stop": 0, "swept 3x": 1, "toxic halt": 2, "swept 2x": 3, "flash": 4}
+    new = sorted(new, key=lambda i: (i["level"] != "text", order.get(i["kind"], 9), i.get("ts", "")))
+    kinds = collections.Counter(i["kind"] for i in new)
+    head = (f"BAIT WATCH: {plural(len(new), 'suspicious sign')} on wave mkts - "
+            + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items(), key=lambda kv: order.get(kv[0], 9))))
+    loud = [i for i in new if i["level"] == "text"]
+    whys = ["Why: " + ("hard evidence of baiting -- the bot already pulled or stood down that side"
+                       if loud else "the bot's bait defenses acted on these; check the fills if one keeps coming")]
+    lines = [head] + whys + [f"!{n}. {bait_line(i)}" for n, i in enumerate(new[:N_NAMES], 1)]
+    text = "\n".join(lines)
+    if len(text) > TEXT_CHARS:
+        text = text[: TEXT_CHARS - 3] + "..."
+    body = [head] + whys + ["", "NEW:"] + [f"  [{i['level']}] {bait_line(i)}  ({i.get('wave')})" for i in new]
+    body += ["", "Text = bait stop or swept 3x. Email only = toxic halt, swept 2x, flash (3+ in 60 min). "
+             "Fills that went against us on wave markets come in the PICK-OFF alerts (pass 8).",
+             "Checked every 15 min on market-wave markets only (bait_watch.py, relight task pass 10)."]
+    return text, short(head, 150), "market-wave bait: " + short(head, 150), "\n".join(body), bool(loud)
 
 
 def send(text, subject, body, do_text: bool) -> int:
@@ -418,6 +586,12 @@ def main() -> int:
     po = sub.add_parser("pickoff", help="from pvd_waves.py pickoffs --json: texts at $100+ new, a series trip or a stand-down")
     po.add_argument("--pickoffs", required=True)
     po.add_argument("--send", action="store_true")
+    dk = sub.add_parser("dark", help="from pvd_waves.py darkcheck --json: listed markets resting nothing")
+    dk.add_argument("--dark", required=True)
+    dk.add_argument("--send", action="store_true")
+    bt = sub.add_parser("bait", help="from bait_watch.py --json: suspicious signs of baiting, every market")
+    bt.add_argument("--bait", required=True)
+    bt.add_argument("--send", action="store_true")
     a = ap.parse_args()
 
     if a.kind == "wave":
@@ -437,6 +611,10 @@ def main() -> int:
         do_text = a.outcome in ("live", "not-live")
     elif a.kind == "pickoff":
         text, push, subject, body, do_text = pickoff_msg(load(a.pickoffs))
+    elif a.kind == "dark":
+        text, push, subject, body, do_text = dark_msg(load(a.dark))
+    elif a.kind == "bait":
+        text, push, subject, body, do_text = bait_msg(load(a.bait))
     else:
         text, push, subject, body, do_text = relight_msg(load(a.relight))
 

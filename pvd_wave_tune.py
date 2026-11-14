@@ -38,6 +38,10 @@ after --since, series in --series), idempotently:
   --no-halts         set "no_halts": the bot exempts the entry's series from the sweep
                      breaker, tape trigger, group breaker and toxic halts (Jack
                      2026-11-07: "remove any sweep breakers / halts on these markets")
+  --halts-on         clear "no_halts" from the entries in scope: the sweep breaker, tape
+                     trigger and toxic halts apply again (dropping --no-halts alone leaves
+                     the flag on entries already listed; a relit entry is rebuilt without
+                     it). Jack's word, like --no-halts (2026-11-08 pick-off review).
   --cheap-tiers C:X,C2:X2  (or --cheap-mult X --cheap-px C for one tier)
                      a CHEAP side (a bid at its touch, an ask at 100 - its touch: what a
                      fill ties up a contract) rests X x the size for the first tier it
@@ -57,7 +61,34 @@ after --since, series in --series), idempotently:
                      bid_max = best bid + N, ask_min = best ask - N from a fresh
                      /markets read (the touch, ours included). Fixed limits went stale
                      within minutes as other makers tightened the spreads. A market
-                     the read misses keeps its limits.
+                     the read misses keeps its limits. CAPPED (Jack 2026-11-08: "Cap
+                     the reanchor"): toward the taker (bid_max up, ask_min down) a
+                     limit moves at most --reanchor-step c (5) a run, and holds in a
+                     run where that side's touch jumped --reanchor-jump c (10)+ that
+                     way since the last run (entry "anchor_touch"); away from the
+                     taker it moves at once. 8 jumped books cost ~$2k 11/07-11/08.
+  --size-mult-file PATH
+                     PER-MARKET MULTIPLES (Jack 2026-11-14: "size them up and report back",
+                     on the FX + metals wave's ~400 markets pacing within 2x of the $1
+                     payout floor): PATH = {ticker: X}. A listed market's target multiple
+                     is --size-mult x its X (1 when absent), applied once per entry like
+                     --size-mult (base, bank and kept sizes; the cheap tiers multiply it),
+                     so dropping a ticker from the file scales it back. X = 0 is OFF:
+                     pinned at 0 a side (only a position's closing order rests). Unreadable: x1.
+  --fair-file PATH   FAIR LIMITS (Jack 2026-11-13, the after-economic-events FX + metals
+                     wave: "Are there Fair value calculated on these markets?" -> "1",
+                     stand down the wrong-side quotes and build a fair). PATH =
+                     {"fair": {ticker: cents}, "margin": {series: c}, "valid_until": ISO}.
+                     After the re-anchor, an in-scope entry's bid limit is at most
+                     fair - margin and its ask limit at least fair + margin; margin = the
+                     series' base (the file's, else --fair-margin, 3c) + 100 x
+                     --fair-vol-err (0.25) x phi(z)|z| -- how far the fair moves under that
+                     vol error: 0 at the money and deep in the tails, ~6c at one sd out.
+                     Never tighter than --fair-floor (2): a bid at <= 2c and an ask at >= 98c
+                     always pass (a fill there costs <= 2c a contract). A side whose touch is
+                     past its limit stands out (the bot's "pvd guard ... out (limits ...)").
+                     No fair for the ticker, a file past valid_until, or an unreadable file:
+                     only the floor sides may rest. Entry note "fair_clamp".
 
 Holds pvd_scan's lock while it reads and writes, so a scan can't overwrite it
 (and it waits up to --wait secs for a running scan, then gives up: the next run
@@ -82,6 +113,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from statistics import NormalDist
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIST = os.path.join(HERE, "run-logs", "incentive-mm", "post_vote_dead_books.json")
@@ -138,10 +170,23 @@ def read_touches(tickers):
     return out, missed
 
 
+_ND = NormalDist()
+
+
+def fair_margin(base: float, fair_c: float, vol_err: float) -> float:
+    """--fair-file's margin (c) at a fair of fair_c: the base + the fair's move under a
+    relative vol error of vol_err, 100 x vol_err x phi(z)|z| (z = the fair's normal score)."""
+    p = min(max(fair_c / 100.0, 1e-6), 1 - 1e-6)
+    z = _ND.inv_cdf(p)
+    return base + 100.0 * vol_err * _ND.pdf(z) * abs(z)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--series", required=True, help="comma-separated EXACT series names, or ALL")
     ap.add_argument("--exclude-series", default="", help="comma-separated series left out (with ALL: other waves)")
+    ap.add_argument("--exclude-registry", action="store_true",
+                    help="also leave out every series of run-logs/pvd-scan/waves.json (pvd_waves.py)")
     ap.add_argument("--since", required=True, help="ISO: only entries whose period_start is at or after this")
     ap.add_argument("--room", type=int, default=0)
     ap.add_argument("--price-min", type=int)
@@ -156,8 +201,13 @@ def main() -> int:
     ap.add_argument("--bank-url", help="the wave dashboard's /data, e.g. http://127.0.0.1:8773/data")
     ap.add_argument("--bank-max", type=int)
     ap.add_argument("--bank-by-hrs", type=float, default=6.0)
+    ap.add_argument("--twin-block", type=float, default=0.0,
+                    help="N: in a two-leg D/R event, when one leg holds >= N contracts (Kalshi position), the "
+                         "other leg's side that makes the same bet rests 0 -- off: the bot rests only an order that closes a "
+                         "position there (long YES on D -> R's ask; short -> R's bid)")
     ap.add_argument("--side-cap", action="append", default=[],
-                    help="SERIES:C:N -- a side of SERIES whose fill ties up >= C c a contract rests N")
+                    help="SERIES:C:N -- a side of SERIES whose fill ties up >= C c a contract rests N "
+                         "(0 = off: the bot rests only an order that closes a position, 1b58188)")
     ap.add_argument("--pause-at", action="append", default=[],
                     help="SERIES:C -- a market of SERIES at C c+ (bid or last) quotes nothing, or only the "
                          "side that unwinds its position; resumes under C - 2")
@@ -176,6 +226,8 @@ def main() -> int:
                     help='set "flip_through" (the bot: the reducing side rests its size + the position)')
     ap.add_argument("--no-halts", action="store_true",
                     help='set "no_halts" (the bot: no sweep breaker, tape trigger, group or toxic halt on the series)')
+    ap.add_argument("--halts-on", action="store_true",
+                    help="clear no_halts from the entries in scope (the bot's breakers and halts apply again)")
     ap.add_argument("--cheap-mult", type=float, help="the cheap side rests this x the size")
     ap.add_argument("--cheap-px", type=float, default=5.0, help="cheap = a bid touch <= this c / an ask touch >= 100 - this c")
     ap.add_argument("--series-tier", action="append", default=[],
@@ -185,7 +237,25 @@ def main() -> int:
                     help='set "follow_book" (the bot keeps the listed limits with a last trade too) and re-anchor traded entries as well')
     ap.add_argument("--cushion", type=int)
     ap.add_argument("--reanchor", type=int)
+    ap.add_argument("--reanchor-step", type=int, default=5,
+                    help="a re-anchor moves bid_max up / ask_min down at most this c a run (0 = no cap)")
+    ap.add_argument("--reanchor-jump", type=int, default=10,
+                    help="a side whose touch jumped this c+ toward the taker since the last run keeps its limit (0 = off)")
+    ap.add_argument("--size-mult-file",
+                    help="{ticker: X}: that market's sizes are --size-mult x X (applied once per entry)")
+    ap.add_argument("--fair-file",
+                    help='{"fair": {ticker: cents}, "margin": {series: c}, "valid_until": ISO}: after the '
+                         "re-anchor, bid limit <= fair - margin and ask limit >= fair + margin (see the docstring)")
+    ap.add_argument("--fair-margin", type=float, default=3.0,
+                    help="--fair-file's base margin c (the file's per-series margin wins)")
+    ap.add_argument("--fair-vol-err", type=float, default=0.25,
+                    help="--fair-file: margin += 100 x this x phi(z)|z|, the fair's move under this relative vol error")
+    ap.add_argument("--fair-floor", type=int, default=2,
+                    help="--fair-file: a bid at <= this c and an ask at >= 100 - this c always pass")
     ap.add_argument("--note", default="")
+    ap.add_argument("--wave-added", default="",
+                    help="ISO: the registry wave's creation time, written on every entry in scope (the bot: "
+                         "UNWIND_ONLY_WAVES covers only waves added before the switch; Jack 2026-11-08)")
     ap.add_argument("--wait", type=int, default=120)
     ap.add_argument("--write", action="store_true")
     a = ap.parse_args()
@@ -200,6 +270,15 @@ def main() -> int:
     for v in stiers.values():
         v.sort()
     exclude = {s.strip() for s in (a.exclude_series or "").split(",") if s.strip()}
+    if a.exclude_registry:
+        # the registry's waves (pvd_waves.py) tune themselves in pass 7; a catch-all pass
+        # (--series ALL) must leave them alone or the two passes fight every run
+        try:
+            with open(os.path.join(os.path.dirname(LIST), "..", "pvd-scan", "waves.json"), encoding="utf-8") as fh:
+                exclude |= {s for w in (json.load(fh).get("waves") or {}).values()
+                            for s in (w.get("series") or []) + (w.get("near") or [])}
+        except (OSError, ValueError):
+            pass
     all_series = series == {"ALL"}
     pause_at = {x.split(":")[0].strip(): float(x.split(":")[1]) for x in a.pause_at if ":" in x}
     side_caps = [(x.split(":")[0].strip(), float(x.split(":")[1]), int(x.split(":")[2]))
@@ -225,13 +304,61 @@ def main() -> int:
     since = ts(a.since)
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    tmult, tmult_why, off_by_file = {}, "", set()
+    if a.size_mult_file:
+        try:
+            with open(a.size_mult_file, encoding="utf-8") as fh:
+                tmult = {str(k): float(v) for k, v in (json.load(fh) or {}).items() if float(v) >= 0}
+            # a 0 is OFF (Jack 2026-11-14: "stop quoting the rest"): that market is pinned
+            # at 0 a side -- it rests nothing but the order that closes a position
+            for k in [k for k, v in tmult.items() if v == 0]:
+                pins.setdefault(k, 0)
+                off_by_file.add(k)
+                del tmult[k]
+        except (OSError, ValueError, TypeError, AttributeError) as ex:
+            tmult_why = f"; size-mult file unreadable ({ex}): x1"
+            tmult = {}
+    # FAIR LIMITS (--fair-file): None = off; {} = on with no usable fair (floors only)
+    fair_map, fair_base, fair_why = None, {}, ""
+    if a.fair_file:
+        try:
+            with open(a.fair_file, encoding="utf-8") as fh:
+                _fd = json.load(fh)
+            fair_map = {k: float(v) for k, v in (_fd.get("fair") or {}).items()}
+            fair_base = {k: float(v) for k, v in (_fd.get("margin") or {}).items()}
+            if _fd.get("valid_until") and now >= ts(_fd["valid_until"]):
+                fair_why = f"fair file stale since {_fd['valid_until']}"
+                fair_map = {}
+        except (OSError, ValueError, TypeError, AttributeError) as ex:
+            fair_why = f"fair file unreadable ({ex})"
+            fair_map = {}
 
     # the touches are read BEFORE the lock (18 calls for ~1,700 markets), so the
     # lock is held only for the read-modify-write of the list
     touch, missed = {}, 0
-    if a.reanchor is not None or tiers or stiers or side_caps:
+    if a.reanchor is not None or tiers or stiers or side_caps or a.twin_block:
         pre = json.load(open(LIST, encoding="utf-8")).get("markets") or {}
         touch, missed = read_touches([t for t in pre if in_scope(t)])
+    # TWIN BLOCK: the account's positions (Kalshi, so fills from before any dashboard's
+    # history count) and the two-leg D/R events on the list
+    acct_pos, twin_of = {}, {}
+    if a.twin_block:
+        try:
+            from kalshi_reads import kalshi_get_all
+            for x in kalshi_get_all("/portfolio/positions", {"limit": 1000, "count_filter": "position"},
+                                    items_key="market_positions") or []:
+                v = float(x.get("position_fp") or x.get("position") or 0)
+                if v:
+                    acct_pos[x["ticker"]] = v
+        except Exception as ex:  # noqa: BLE001
+            print(f"{stamp} ! twin block: position read failed ({ex}); no twin caps this run")
+            acct_pos = None
+        evs = {}
+        for t_ in (json.load(open(LIST, encoding="utf-8")).get("markets") or {}):
+            evs.setdefault(t_.rsplit("-", 1)[0], []).append(t_)
+        for ev, ts_ in evs.items():
+            if len(ts_) == 2 and {x.rsplit("-", 1)[1] for x in ts_} == {"D", "R"}:
+                twin_of[ts_[0]], twin_of[ts_[1]] = ts_[1], ts_[0]
     if a.write:
         t0 = time.time()
         while os.path.exists(LOCK) and time.time() - os.path.getmtime(LOCK) < 1500:
@@ -267,17 +394,37 @@ def main() -> int:
             bank_msg = f"; bank sizing SKIPPED: {ex}"
     try:
         cur = json.load(open(LIST, encoding="utf-8"))
-        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = n_pin = 0
+        n_room = n_band = n_seen = n_up = n_down = n_banked = n_cush = n_anch = n_traded = n_max = n_flip = n_nohalt = n_cheap = n_follow = n_scaled = n_pin = n_capped = n_touch = n_wadd = 0
         n_pause = n_pause_off = n_pause_unw = 0
+        n_fair = n_fair_none = 0
+        # the bank sizes, set here too: a run with no unpinned live entry never reaches
+        # the per-entry lines below, and the summary used to crash on M (pass 4, every
+        # run from 05:00Z 11/08, once the 2028 programs ended -- nothing was written)
+        B = int(round(a.bank_size * a.size_mult)) if a.bank_size else 0
+        M = int(round(a.bank_max * a.size_mult)) if a.bank_max else 0
 
         def caps_for(t: str, e: dict) -> dict:
             """{side key: N} for the sides --side-cap holds, by the touch. SERIES "ALL"
             caps every in-scope market (Jack 2026-11-07: "turn off quoting 90c+"). A
             capped side that reduces our position (the wave dashboard's "pos") still
             clears it: with flip-through the bot adds the position to N; without, the
-            side rests the position."""
+            side rests the position. N = 0 is OFF (Jack 2026-11-08: "why even have a
+            probe?"): 0 is written as is, and the bot sizes the order that closes a
+            position from the live position each cycle (1b58188)."""
             out: dict = {}
-            if not side_caps or t not in touch:
+            capwhy.clear()
+            if t not in touch:
+                return out
+            # the twin leg holds the same bet: block that side here -- 0, OFF (Jack
+            # 2026-11-08: "why even have a probe?"; it was a 1-lot, which the sweeps
+            # took; the bot rests only an order that closes a position there, 1b58188)
+            if a.twin_block and acct_pos is not None and t in twin_of:
+                p_tw = acct_pos.get(twin_of[t], 0.0)
+                if p_tw >= a.twin_block:
+                    out["ask_size"], capwhy["ask_size"] = 0, f"twin {twin_of[t].rsplit('-', 1)[1]} long {p_tw:.0f}"
+                elif p_tw <= -a.twin_block:
+                    out["bid_size"], capwhy["bid_size"] = 0, f"twin {twin_of[t].rsplit('-', 1)[1]} short {-p_tw:.0f}"
+            if not side_caps:
                 return out
             yb, ya, _lp = touch[t]
             cost = {"bid_size": yb if yb > 0 else None, "ask_size": 100 - ya if 0 < ya < 100 else None}
@@ -286,10 +433,14 @@ def main() -> int:
                 if cs_ in ("ALL", "*") or t.split("-")[0] == cs_:
                     for k, c in cost.items():
                         if c is not None and c >= cc_:
+                            if k in out:
+                                continue        # already blocked by the twin rule
                             reduces = (k == "bid_size" and pos_c <= -1) or (k == "ask_size" and pos_c >= 1)
+                            # (N = 0 is OFF: the bot sizes the closing order live, 1b58188)
                             out[k] = (max(cn_, int(abs(pos_c)))
-                                      if reduces and not e.get("flip_through") else cn_)
+                                      if cn_ >= 1 and reduces and not e.get("flip_through") else cn_)
             return out
+        capwhy: dict = {}
         for t, e in (cur.get("markets") or {}).items():
             if not in_scope(t):
                 continue
@@ -317,6 +468,12 @@ def main() -> int:
             if a.no_halts and not e.get("no_halts"):
                 e["no_halts"] = True
                 n_nohalt += 1
+            elif a.halts_on and not a.no_halts and e.get("no_halts"):
+                e.pop("no_halts", None)
+                n_nohalt += 1
+            if a.wave_added and e.get("wave_added") != a.wave_added:
+                e["wave_added"] = a.wave_added
+                n_wadd += 1
             if a.cushion is not None and e.get("cushion") != a.cushion:
                 e["cushion_set"] = f"{stamp}: cushion {e.get('cushion')} -> {a.cushion} {a.note}".strip()
                 e["cushion"] = a.cushion
@@ -332,10 +489,67 @@ def main() -> int:
                     b0, a0 = int(e["bid_max"]), int(e["ask_min"])
                     b1 = min(99, int(math.floor(yb)) + a.reanchor) if yb > 0 else b0
                     a1 = max(1, int(math.ceil(ya)) - a.reanchor) if 0 < ya < 100 else a0
+                    # CAPPED RE-ANCHOR (Jack 2026-11-08: "Cap the reanchor"). 23:19Z 11/07 -
+                    # 02:08Z 11/08, 8 thin KXHOUSERACE books jumped far off fair for 5-15 min
+                    # (IN04-D, a 3c long shot, to 40x80; IL06-D, a ~95c favorite, to 23x66);
+                    # the next run put the limits on the jumped touch, the bot rested full
+                    # size there and was hit (~$2k), then the books snapped back. Now a limit
+                    # moves toward the taker's side (bid_max up, ask_min down) at most
+                    # --reanchor-step c a run, and not at all in a run where that side's touch
+                    # jumped --reanchor-jump c+ that way since the last run (it has to stand a
+                    # run first). Moves away from the taker (bid_max down, ask_min up) apply at
+                    # once. 0 turns either off.
+                    prev = e.get("anchor_touch")
+                    pb, pa = (prev[0], prev[1]) if isinstance(prev, list) and len(prev) >= 2 else (None, None)
+                    why = []
+                    # ...and a side that was EMPTY last run (no bid / no ask) holds a run too:
+                    # a bait order into an empty side is a jump from nothing (11/08 audit)
+                    if b1 > b0:
+                        if a.reanchor_jump > 0 and pb is not None and yb > 0 and (
+                                pb <= 0 or yb - pb >= a.reanchor_jump):
+                            b1 = b0
+                            why.append(f"bid touch jumped {pb:g}->{yb:g}, held")
+                        elif a.reanchor_step > 0 and b1 - b0 > a.reanchor_step:
+                            b1 = b0 + a.reanchor_step
+                            why.append(f"bid up {a.reanchor_step}c")
+                    if a1 < a0:
+                        if a.reanchor_jump > 0 and pa is not None and 0 < ya < 100 and (
+                                not 0 < pa < 100 or pa - ya >= a.reanchor_jump):
+                            a1 = a0
+                            why.append(f"ask touch jumped {pa:g}->{ya:g}, held")
+                        elif a.reanchor_step > 0 and a0 - a1 > a.reanchor_step:
+                            a1 = a0 - a.reanchor_step
+                            why.append(f"ask down {a.reanchor_step}c")
+                    if why:
+                        n_capped += 1
+                        e["anchor_capped"] = f"{stamp}: touch {yb:g}x{ya:g}: {'; '.join(why)}"
+                    now_touch = [round(yb, 2), round(ya, 2)]
+                    if prev != now_touch:
+                        e["anchor_touch"] = now_touch
+                        n_touch += 1
                     if (b1, a1) != (b0, a0):
                         e["bid_max"], e["ask_min"] = b1, a1
                         e["anchored"] = f"{stamp}: touch {yb:g}x{ya:g} -> limits {b1}/{a1} (were {b0}/{a0})"
                         n_anch += 1
+            # FAIR LIMITS (--fair-file, Jack 2026-11-13: see the docstring): after the
+            # re-anchor, so a limit it walks toward the touch comes back to the fair each run
+            if fair_map is not None:
+                b0, a0 = int(e["bid_max"]), int(e["ask_min"])
+                f_ = fair_map.get(t)
+                if f_ is None:
+                    fb, fa = a.fair_floor, 100 - a.fair_floor
+                    why_f = f"no fair ({fair_why or 'not in the file'}): floors only"
+                    n_fair_none += 1
+                else:
+                    m_ = fair_margin(fair_base.get(t.split("-")[0], a.fair_margin), f_, a.fair_vol_err)
+                    fb = max(a.fair_floor, int(math.floor(f_ - m_)))
+                    fa = min(100 - a.fair_floor, int(math.ceil(f_ + m_)))
+                    why_f = f"fair {f_:g} +-{m_:.1f}c"
+                b1, a1 = min(b0, fb), max(a0, fa)
+                if (b1, a1) != (b0, a0):
+                    e["bid_max"], e["ask_min"] = b1, a1
+                    e["fair_clamp"] = f"{stamp}: {why_f} -> limits {b1}/{a1} (were {b0}/{a0})"
+                    n_fair += 1
             # PINNED (--pin TICKER:N, Jack 2026-11-07 on KXJEFFRIESFIRST-27FEB01: "too active,
             # scale it down to base contract sizes"): N a side, no --size-mult, bank step or
             # cheap tier. Band, limits, flip-through etc. above still apply. In the task's
@@ -344,10 +558,26 @@ def main() -> int:
             # the 14 markets settling before July 2028: "all 14 to 300, keep position unwinds")
             s_t = t.split("-")[0]
             pin = pins.get(t) if t in pins else pin_series.get(s_t)
+            # OFF BY THE MULTIPLES FILE (a 0 there): the sizes are kept in "pre_off" so lifting
+            # the 0 brings them back (a pin at 0 alone would leave the market at size 0)
+            if t in off_by_file and pin == 0 and "pre_off" not in e and int(e.get("size") or 0) > 0:
+                e["pre_off"] = {k: e[k] for k in ("size", "bid_size", "ask_size", "size_mult") if k in e}
+            elif pin is None and isinstance(e.get("pre_off"), dict):
+                for k in ("bid_size", "ask_size", "cheap_sides", "pre_bank", "pinned", "size_mult"):
+                    e.pop(k, None)
+                e.update(e.pop("pre_off"))
+                e["unpinned"] = f"{stamp}: back on from the multiples file's 0 {a.note}".strip()
+                n_pin += 1
             if pin is not None:
                 is_flat = t in pin_flat or (t not in pins and s_t in pin_series_flat)
                 # the --side-cap still holds on a pinned market ("turn off quoting 90c+")
                 want_sides = caps_for(t, e)
+                # ...and a pin at 0 is OFF on both sides: the bot reads "size": 0 as its default
+                # size (PVD_SIZE, 40 a side), so only "bid_size"/"ask_size" 0 rest nothing but a
+                # closing order (PVD_ZERO_OFF). 11/14: 335 of the 341 markets the w1113 multiples
+                # file turned off still rested 40-80 a side
+                if pin == 0:
+                    want_sides = {"bid_size": 0, "ask_size": 0}
                 have_sides = {k: int(e[k]) for k in ("bid_size", "ask_size") if k in e}
                 if int(e.get("size") or 0) != pin or have_sides != want_sides \
                         or set(e.get("cheap_sides") or []) != set(want_sides):
@@ -377,8 +607,9 @@ def main() -> int:
             # which it carries); the scanner writes a relit entry unscaled, so it is scaled
             # again here. The bank step below works in the scaled sizes.
             m_cur = float(e.get("size_mult") or 1.0)
-            if abs(m_cur - a.size_mult) > 1e-9:
-                f = a.size_mult / m_cur
+            sm_t = a.size_mult * tmult.get(t, 1.0)      # the wave's multiple x this market's own
+            if abs(m_cur - sm_t) > 1e-9:
+                f = sm_t / m_cur
                 for k in ("size", "bid_size", "ask_size"):
                     if e.get(k):
                         e[k] = max(1, int(round(int(e[k]) * f)))
@@ -386,14 +617,14 @@ def main() -> int:
                     for k in ("size", "bid_size", "ask_size"):
                         if e["pre_bank"].get(k):
                             e["pre_bank"][k] = max(1, int(round(int(e["pre_bank"][k]) * f)))
-                if abs(a.size_mult - 1.0) > 1e-9:
-                    e["size_mult"] = a.size_mult
+                if abs(sm_t - 1.0) > 1e-9:
+                    e["size_mult"] = sm_t
                 else:
                     e.pop("size_mult", None)
-                e["scaled"] = f"{stamp}: sizes x{f:g} (now x{a.size_mult:g}) -> {e.get('size')} a side {a.note}".strip()
+                e["scaled"] = f"{stamp}: sizes x{f:g} (now x{sm_t:g}) -> {e.get('size')} a side {a.note}".strip()
                 e["scaled_at"] = stamp
                 n_scaled += 1
-            sm = a.size_mult
+            sm = sm_t
             B = int(round(a.bank_size * sm)) if a.bank_size else 0
             M = int(round(a.bank_max * sm)) if a.bank_max else 0
             BASE = int(round(a.base_size * sm)) if a.base_size else 0
@@ -473,7 +704,7 @@ def main() -> int:
                             n_up += 1
                         else:
                             n_down += 1
-            if (tiers or stiers or side_caps) and t in touch:
+            if (tiers or stiers or side_caps or a.twin_block) and t in touch:
                 # CHEAP SIDES by tier (--cheap-tiers C:X,...): a side whose fill ties up c
                 # a contract -- a bid at its touch, an ask at 100 - its touch -- rests X x
                 # the market's size for the first tier with c <= C (Jack 2026-11-07:
@@ -492,7 +723,7 @@ def main() -> int:
                                 break
                 # SIDE CAP (--side-cap SERIES:C:N, Jack 2026-11-07 on the House sweep: "its ok to
                 # quote if it's 5c of cash held but not if its 95c of cash held"): a side of SERIES
-                # whose fill ties up >= C c a contract rests N (the bot's floor is 1). With
+                # whose fill ties up >= C c a contract rests N (0 = off since 1b58188). With
                 # flip-through, the side that reduces a position still rests N + the position.
                 capk = caps_for(t, e)
                 now_c = set(mult) | set(capk)
@@ -501,7 +732,7 @@ def main() -> int:
                 for k in ("bid_size", "ask_size"):
                     if k in capk:
                         want_k = int(capk[k])
-                        if int(e.get(k) or 0) != want_k:
+                        if k not in e or int(e.get(k) or 0) != want_k:      # (a 0 is written too)
                             e[k] = want_k
                             ch = True
                     elif k in now_c:
@@ -518,8 +749,9 @@ def main() -> int:
                 if ch:
                     n_cheap += 1
                     e["cheap"] = (f"{stamp}: touch {yb:g}x{ya:g} -> "
-                                  + (", ".join(f"{k.split('_')[0]} {e[k]} "
-                                               + (f"(cap: {cost[k]:g}c a contract)" if k in capk else f"(x{mult[k]:g})")
+                                  + (", ".join(f"{k.split('_')[0]} {e.get(k, e.get('size'))} "
+                                               + ((f"(cap: {capwhy[k]})" if k in capwhy else f"(cap: {cost[k]:g}c a contract)")
+                                                  if k in capk else f"(x{mult[k]:g})")
                                                for k in sorted(now_c)) or "none cheap")
                                   + f" {a.note}").strip()
             # PAUSE AT (--pause-at SERIES:C, Jack 2026-11-07 on the House sweep: "fine to quote
@@ -593,17 +825,28 @@ def main() -> int:
                               for (ss, sd), v in sorted(stiers.items())) + f"): {n_cheap} re-sized")
         if a.flip_through:
             msg += f"; flip-through: {n_flip} set"
+        if a.wave_added:
+            msg += f"; wave added {a.wave_added}: {n_wadd} set"
+        if fair_map is not None:
+            msg += (f"; fair limits ({os.path.basename(a.fair_file)}, margin {a.fair_margin:g}c + vol err "
+                    f"{a.fair_vol_err:g}, floor {a.fair_floor}c{'; ' + fair_why if fair_why else ''}): "
+                    f"{n_fair} clamped, {n_fair_none} with no fair (floors only)")
         if a.no_halts:
             msg += f"; no halts: {n_nohalt} set"
+        elif a.halts_on:
+            msg += f"; halts on: no_halts cleared on {n_nohalt}"
         if a.follow_book:
             msg += f"; follow_book: {n_follow} set"
         if a.cushion is not None:
             msg += f"; cushion {a.cushion}: {n_cush} set"
         if a.reanchor is not None:
-            msg += (f"; follow the book ({a.reanchor}c off the touch): {n_anch} re-anchored, "
+            msg += (f"; follow the book ({a.reanchor}c off the touch, toward the taker at most "
+                    f"{a.reanchor_step}c a run, held on a {a.reanchor_jump}c+ jump): {n_anch} re-anchored, "
+                    f"{n_capped} capped or held, "
                     f"{n_traded} traded (guard follows the trade), {missed} missed by the read")
-        if abs(a.size_mult - 1.0) > 1e-9 or n_scaled:
-            msg += f"; sizes x{a.size_mult:g}: {n_scaled} re-scaled"
+        if abs(a.size_mult - 1.0) > 1e-9 or n_scaled or tmult:
+            msg += f"; sizes x{a.size_mult:g}" + (f" ({len(tmult)} markets with their own multiple)" if tmult else "") \
+                + f": {n_scaled} re-scaled" + tmult_why
         if pins:
             msg += f"; pinned ({', '.join(f'{k} {v}' for k, v in sorted(pins.items()))}): {n_pin} set"
         if pause_at:
@@ -612,7 +855,7 @@ def main() -> int:
             msg += (f"; paused at ({', '.join(f'{k} {v:g}c' for k, v in sorted(pause_at.items()))}): "
                     f"{n_paused_now} paused now ({n_pause} changed: {n_pause_off} off, {n_pause_unw} unwind-only)")
         msg += bank_msg
-        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled or n_pin or n_pause):
+        if a.write and (n_room or n_band or n_up or n_down or n_cush or n_anch or n_touch or n_flip or n_nohalt or n_cheap or n_follow or n_scaled or n_pin or n_pause or n_wadd or n_fair):
             cur["tune_last"] = msg          # one key, overwritten (this runs every 15 min)
             tmp = LIST + ".tune.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:

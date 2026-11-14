@@ -356,8 +356,9 @@ def poll(client, hist: dict) -> dict:
                    "share": round(frac, 4), "sides": sides, "rate": round(rate, 2), "est_src": est_src,
                    "pool": _f(e.get("pool_day")), "kind": e.get("kind") or "dead",
                    "size": int(e.get("size") or 40),
-                   "bsize": int(e.get("bid_size") or e.get("size") or 40),
-                   "asize": int(e.get("ask_size") or e.get("size") or 40),
+                   # (a side sized 0 is OFF since 1b58188: shown as 0, not the size)
+                   "bsize": int(e["bid_size"]) if e.get("bid_size") is not None else int(e.get("size") or 40),
+                   "asize": int(e["ask_size"]) if e.get("ask_size") is not None else int(e.get("size") or 40),
                    "stop": e.get("stopped_at") or e.get("stop"),
                    "active": bool(stop and stop > now and not e.get("stopped_at")), "src": src,
                    "period": e.get("period_start") or "wave-1104",
@@ -817,8 +818,39 @@ tick();setInterval(tick,30000);addEventListener('resize',()=>{if(D){chart(D.seri
 </script></body></html>"""
 
 
+# PHONE ACCESS (Jack 2026-11-07: "Allow for accessing dashboard on mobile"): with
+# PVD_WATCH_HOST=0.0.0.0 the page is served on the home network too. A request from
+# another device must carry PVD_WATCH_TOKEN once (?k=<token>); a cookie keeps it.
+# This PC (loopback: the tune's /data reads, the browser here) needs no key. No token
+# = loopback only, whatever the host says.
+TOKEN = os.environ.get("PVD_WATCH_TOKEN", "").strip()
+
+
 class Handler(__import__("http.server").server.BaseHTTPRequestHandler):
+    def _auth(self):
+        """(allowed, set_cookie)"""
+        import hmac
+        from urllib.parse import parse_qs, urlparse
+        if self.client_address[0] in ("127.0.0.1", "::1") or not TOKEN:
+            return True, False
+        k = (parse_qs(urlparse(self.path).query).get("k") or [""])[0]
+        if k and hmac.compare_digest(k, TOKEN):
+            return True, True
+        ck = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in part:
+                n, v = part.split("=", 1)
+                ck[n.strip()] = v.strip()
+        return hmac.compare_digest(ck.get("pvdk", ""), TOKEN), False
+
     def do_GET(self):  # noqa: N802
+        ok, set_ck = self._auth()
+        if not ok:
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"open the link with ?k=<key> once (see the market-wave notes)")
+            return
         if self.path.startswith("/data"):
             with _lock:
                 body = json.dumps({"data": _state["data"], "err": _state["err"],
@@ -829,6 +861,8 @@ class Handler(__import__("http.server").server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        if set_ck:
+            self.send_header("Set-Cookie", f"pvdk={TOKEN}; Max-Age=31536000; Path=/; SameSite=Strict; HttpOnly")
         self.end_headers()
         self.wfile.write(body)
 
@@ -840,14 +874,20 @@ def main() -> None:
     from http.server import ThreadingHTTPServer
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8771)
+    ap.add_argument("--host", default=os.environ.get("PVD_WATCH_HOST", "127.0.0.1"))
     a = ap.parse_args()
+    if a.host not in ("127.0.0.1", "localhost") and not TOKEN:
+        print("imm_pvd_watch: no PVD_WATCH_TOKEN -- serving this PC only", flush=True)
+        a.host = "127.0.0.1"
     # no SO_REUSEADDR: on Windows it lets a second server bind a port another
     # page already serves (8765/8766 run the ENS page), and the browser then
     # reaches the wrong one -- fail loudly instead
     ThreadingHTTPServer.allow_reuse_address = False
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
     threading.Thread(target=poller, daemon=True).start()
-    print(f"imm_pvd_watch: http://127.0.0.1:{a.port}/", flush=True)
+    print(f"imm_pvd_watch: http://127.0.0.1:{a.port}/" + (" (and the home network, key required)"
+                                                          if a.host not in ("127.0.0.1", "localhost") else ""),
+          flush=True)
     srv.serve_forever()
 
 

@@ -71,6 +71,14 @@ BAR = float(os.environ.get("PVD_SCAN_BAR", "1.10"))
 BUDGET = float(os.environ.get("PVD_SCAN_BUDGET", "60000"))
 # (Kalshi reserves no cash for resting orders -- each only has to be fundable
 # when placed -- so this caps exposure, not cash. The 11/04 list rested ~$43k.)
+# PER-WAVE BUDGET (2026-11-14, Jack "Yes, do them" on the market-wave skill update): BUDGET
+# counts EVERY wave's live scan adds, so once other waves held $691k a new wave on the
+# shared $300k + its own +$50-100k listed nothing (the crypto wave at +$100k: "213 over
+# budget"; an overnight auto wave at +$50k would have listed 0). A registry wave's scan
+# (pvd_waves.py scan_cmd) also passes its own budget and series: a market over BUDGET is
+# still taken while the wave's OWN live listings stay within OWN_BUDGET. 0 = off.
+OWN_BUDGET = float(os.environ.get("PVD_SCAN_OWN_BUDGET", "0") or 0)
+OWN_SERIES = tuple(x.strip() for x in (os.environ.get("PVD_SCAN_OWN_SERIES") or "").split(",") if x.strip())
 NEW_SINCE = datetime.fromisoformat(os.environ.get("PVD_SCAN_NEW_SINCE", "2026-11-04T06:00:00+00:00"))
 # DRY-RUN what-if only: project every candidate over this many hours (a fresh
 # relit period) instead of its real time left. Ignored with --write.
@@ -86,6 +94,39 @@ DEAD_SIZE = int(os.environ.get("PVD_SCAN_DEAD_SIZE", "120"))       # a side, dea
 LIVE_SIZE = int(os.environ.get("PVD_SCAN_LIVE_SIZE", "80"))        # a side, live books
 DECIDED_SIZE = int(os.environ.get("PVD_SCAN_DECIDED_SIZE", "300"))  # the decided side (winner's bid / loser's ask)
 CUSH = {"dead": 2, "live": 5}
+# CHEAP SIDES AT THE WAVE'S SIZE (Jack 2026-11-11: "should quote larger size if <=5c,
+# otherwise if still under the $1.1 bar then yes dont quote it"): a registry wave's
+# tune rests a side whose fill ties up <= C c a contract (a bid at its price, an ask at
+# 100 - its price) at X x the listing size (its --cheap-tiers; default 2:10,5:5), but
+# the scan judged the $1.10 bar at the flat listing size -- so a market whose cheap
+# side would clear it was never listed (11/11: 57 "under bar" on w1111-elec2028).
+# With PVD_SCAN_CHEAP_TIERS set (pvd_waves.py scan_cmd passes the wave's own tiers), a
+# market under the bar at the flat size is scored again with its cheap sides at the
+# tier size; it lists if THAT clears the bar, and is left out if it still does not.
+# The entry keeps the flat size: the tune sizes its cheap sides (and drops a side out of
+# the cheap zone back to the size). Its collateral is counted at the tier size.
+# PVD_SCAN_TIER_SKIP: series / tickers the wave pins (no tiers there).
+CHEAP_TIERS = sorted((float(c), float(x)) for c, x in (
+    p.split(":") for p in os.environ.get("PVD_SCAN_CHEAP_TIERS", "").split(",") if ":" in p))
+TIER_SKIP = {s.strip() for s in os.environ.get("PVD_SCAN_TIER_SKIP", "").split(",") if s.strip()}
+# ...JUDGED AT THE WAVE'S OWN PRICES TOO: a side was "quotable" only at 3-97c and its
+# kind's cushion (dead 2c / live 5c) off the last trade, so a 1-2c long-shot side --
+# the cheap side the tiers size up -- never counted (11/11: 195 "no quotable side" on
+# w1111-elec2028), while the wave's tune rests 1-99c and follows the book (cushion 0).
+# scan_cmd passes the wave's --price-min / --price-max / --cushion / --follow-book.
+BAND_LO = int(os.environ.get("PVD_SCAN_PRICE_MIN", "3"))
+BAND_HI = int(os.environ.get("PVD_SCAN_PRICE_MAX", "97"))
+WAVE_CUSHION = (int(os.environ["PVD_SCAN_CUSHION"]) if os.environ.get("PVD_SCAN_CUSHION", "") != ""
+                else None)
+WAVE_FOLLOW_BOOK = os.environ.get("PVD_SCAN_FOLLOW_BOOK", "") == "1"
+
+
+def tier_mult(cost: float) -> float:
+    """The wave's cheap-tier multiple for a side whose fill ties up `cost` c a contract."""
+    for c, x in CHEAP_TIERS:
+        if cost <= c:
+            return x
+    return 1.0
 
 import incentive_mm as imm                      # noqa: E402  (reads only: membership, voting days, scoring)
 import kalshi_reads                              # noqa: E402
@@ -251,9 +292,11 @@ def scan(write: bool) -> int:
                 e["extended"] = f"scan {stamp}: stop {old.get('stop')} -> {zs(x['end'])}"
                 bs0 = old.get("bid_size", old.get("size", 40))
                 as0 = old.get("ask_size", old.get("size", 40))
-                if x["bs"] > bs0:
+                # (a side sized 0 is OFF -- the tune's 90c+ cap or twin block, 1b58188:
+                # never raised here; the tune re-judges it every 15 min)
+                if x["bs"] > bs0 and old.get("bid_size") not in (0, 1):
                     e["bid_size"] = x["bs"]
-                if x["as_"] > as0:
+                if x["as_"] > as0 and old.get("ask_size") not in (0, 1):
                     e["ask_size"] = x["as_"]
                 L[x["t"]] = e
                 continue
@@ -272,6 +315,14 @@ def scan(write: bool) -> int:
                 e["ask_size"] = x["as_"]
             if old.get("no_losing_side"):
                 e["no_losing_side"] = True              # Jack's per-market call (abc97d5) carries over
+            # ...and an OFF side (sized 0: the tune's 90c+ cap or twin block, 1b58188) stays
+            # off until the tune re-judges it, as one of its cheap_sides so it can lift it
+            # (a stored 1 is the pre-1b58188 "off" 1-lot: off too)
+            _off = [k for k in ("bid_size", "ask_size") if old.get(k) in (0, 1)]
+            if _off:
+                for k in _off:
+                    e[k] = 0
+                e["cheap_sides"] = sorted(set(_off) | set(e.get("cheap_sides") or []))
             if old:
                 e["prev_period"] = {k: old.get(k) for k in ("stop", "size", "bid_size", "ask_size", "kind")
                                     if old.get(k) is not None}
@@ -294,11 +345,53 @@ def scan(write: bool) -> int:
     return 0
 
 
+def own_live_collateral(L: dict, now, past) -> float:
+    """The scan-added collateral still live on THIS wave's series (OWN_SERIES, else the
+    scan's --series prefixes); 0 outside a registry wave's scan."""
+    pref = OWN_SERIES or SERIES_PREFIXES or ()
+    if not pref:
+        return 0.0
+    return sum(float(e.get("coll_usd") or 0) for t, e in L.items()
+               if t.split("-")[0].startswith(pref) and str(e.get("added", "")).startswith("scan 20")
+               and ts(e["stop"]) > now and t not in past)
+
+
+def pick_within_budget(scored: list, live_scan: float, live_own: float) -> tuple:
+    """(taken, n taken on the wave's own budget). Best ROI first; an extended entry
+    (exposure already resting) is never charged. A market fits under the shared
+    BUDGET (every wave's live scan adds) or, failing that, under the wave's own
+    OWN_BUDGET (its own live adds only)."""
+    used, used_own, taken, n_own = live_scan, live_own, [], 0
+    for x in scored:
+        if x["ext"]:
+            taken.append(x)                 # exposure already resting: not charged to the budget
+            continue
+        if used + x["coll"] > BUDGET:
+            if not (OWN_BUDGET > 0 and used_own + x["coll"] <= OWN_BUDGET):
+                continue
+            n_own += 1
+        used += x["coll"]
+        used_own += x["coll"]
+        taken.append(x)
+    return taken, n_own
+
+
 def score_and_pick(client, cands, L, now, summary):
     mk = {}
     tick = sorted(cands)
     for i in range(0, len(tick), 100):
-        j = pget("/markets", {"tickers": ",".join(tick[i:i + 100]), "limit": 1000}) or {}
+        batch = tick[i:i + 100]
+        j = pget("/markets", {"tickers": ",".join(batch), "limit": 1000})
+        if j is None:          # pget gave up: one more try, then SAY so (it used to drop silently)
+            time.sleep(3)
+            j = pget("/markets", {"tickers": ",".join(batch), "limit": 1000})
+        if j is None:
+            summary["dropped_batches"] = summary.get("dropped_batches", 0) + 1
+            summary["dropped_tickers"] = summary.get("dropped_tickers", 0) + len(batch)
+            log(f"! /markets batch {i // 100 + 1} failed twice: {len(batch)} tickers NOT scored this run "
+                f"(next run retries)")
+            continue
+        j = j or {}
         for m in j.get("markets") or []:
             mk[m["ticker"]] = m
         time.sleep(0.4)
@@ -340,8 +433,11 @@ def score_and_pick(client, cands, L, now, summary):
                    for t, os_ in own.items() if t in L for sd, px, q in os_)
     live_scan = sum(float(e.get("coll_usd") or 0) for t, e in L.items()
                     if str(e.get("added", "")).startswith("scan 20") and ts(e["stop"]) > now and t not in past)
+    live_own = own_live_collateral(L, now, past)
     summary["pvd_resting_collateral"] = round(rest_pvd, 2)
     summary["scan_collateral_live"] = round(live_scan, 2)
+    summary["scan_collateral_live_own"] = round(live_own, 2)
+    summary["own_budget"] = OWN_BUDGET
 
     def book(t):
         ob = pget(f"/markets/{t}/orderbook")
@@ -370,12 +466,15 @@ def score_and_pick(client, cands, L, now, summary):
         qa = 100 - (ref_px(n) or min(n))
         last = float(m.get("last_price_dollars") or 0) * 100 or None
         dec = imm.pvd_decided_side(last)
-        c = CUSH[kind]
+        c = CUSH[kind] if WAVE_CUSHION is None else WAVE_CUSHION
         no_losing = bool((L.get(t) or {}).get("no_losing_side"))
+        # (a wave that follows the book judges a side by the touch alone, inside its own band)
+        near_last_b = WAVE_FOLLOW_BOOK or last is None or qb <= math.floor(last - c)
+        near_last_a = WAVE_FOLLOW_BOOK or last is None or qa >= math.ceil(last + c)
         ok_b = (2 <= qb <= 99) if dec == "bid" else \
-            (3 <= qb <= 97 and (last is None or qb <= math.floor(last - c)) and not (no_losing and dec == "ask"))
+            (BAND_LO <= qb <= BAND_HI and near_last_b and not (no_losing and dec == "ask"))
         ok_a = (2 <= qa <= 99) if dec == "ask" else \
-            (3 <= qa <= 97 and (last is None or qa >= math.ceil(last + c)) and not (no_losing and dec == "bid"))
+            (BAND_LO <= qa <= BAND_HI and near_last_a and not (no_losing and dec == "bid"))
         if not (ok_b or ok_a):
             why["no quotable side"] += 1
             continue
@@ -394,11 +493,23 @@ def score_and_pick(client, cands, L, now, summary):
         bs = DECIDED_SIZE if dec == "bid" else s
         as_ = DECIDED_SIZE if dec == "ask" else s
         r = rate(bs, as_)
+        tiered = None
+        if r * hrs / 24 < BAR and CHEAP_TIERS and t not in TIER_SKIP and t.split("-")[0] not in TIER_SKIP:
+            # CHEAP SIDES AT THE WAVE'S SIZE: judged again with each cheap side at the
+            # tier size the wave's tune will rest it at (the entry keeps the flat size)
+            tb = int(round(bs * tier_mult(qb))) if ok_b else bs
+            ta = int(round(as_ * tier_mult(100 - qa))) if ok_a else as_
+            if (tb, ta) != (bs, as_):
+                r2 = rate(tb, ta)
+                if r2 * hrs / 24 >= BAR:
+                    r, tiered = r2, (tb, ta)
         if r * hrs / 24 < BAR:
             why["under bar"] += 1         # can't clear $1.30 by its program end even at full size
             continue
-        coll = (bs * qb / 100 if ok_b else 0) + (as_ * (100 - qa) / 100 if ok_a else 0)
-        scored.append(dict(t=t, ev=m.get("event_ticker"), kind=kind, dec=dec, last=last, size=s, bs=bs, as_=as_,
+        cb, ca = tiered or (bs, as_)
+        coll = (cb * qb / 100 if ok_b else 0) + (ca * (100 - qa) / 100 if ok_a else 0)
+        scored.append(dict(tiered=tiered,
+                           t=t, ev=m.get("event_ticker"), kind=kind, dec=dec, last=last, size=s, bs=bs, as_=as_,
                            rate=r, proj=r * hrs / 24, coll=coll, roi=r / coll if coll else 0.0, pd=pr["pd"],
                            start=pr["start"], end=pr["end"], ext=bool(pr.get("extend")),
                            relit=t in L and not pr.get("extend"), book=f"{bb}x{ba}", qb=qb, qa=qa, c=c))
@@ -417,28 +528,27 @@ def score_and_pick(client, cands, L, now, summary):
     if SIM_HOURS:
         with open(os.path.join(OUT_DIR, "sim_scored.json"), "w", encoding="utf-8") as fh:
             json.dump(scored, fh, default=str)
-    used, taken = live_scan, []
-    for x in scored:
-        if x["ext"]:
-            taken.append(x)                 # exposure already resting: not charged to the budget
-            continue
-        if used + x["coll"] > BUDGET:
-            continue
-        used += x["coll"]
-        taken.append(x)
+    taken, n_own = pick_within_budget(scored, live_scan, live_own)
     summary.update(scored=len(scored), skipped=why, taken_n=len(taken),
                    taken_usd_day=round(sum(x["rate"] for x in taken), 2),
                    taken_collateral=round(sum(x["coll"] for x in taken), 2),
-                   over_budget=len(scored) - len(taken))
-    log(f"PVD collateral resting now ${rest_pvd:,.0f}; scan adds still live ${live_scan:,.0f}")
+                   over_budget=len(scored) - len(taken), taken_on_own_budget=n_own)
+    log(f"PVD collateral resting now ${rest_pvd:,.0f}; scan adds still live ${live_scan:,.0f}"
+        + (f"; this wave's own ${live_own:,.0f} of its ${OWN_BUDGET:,.0f} ({n_own} taken on its own budget)"
+           if OWN_BUDGET > 0 else ""))
     log(f"scored {len(scored)} clearing ${BAR:.2f} | skipped {why} | taking {len(taken)} by ROI "
         f"(extended {sum(1 for x in taken if x['ext'])}, relit {sum(1 for x in taken if x['relit'])}, "
         f"new {sum(1 for x in taken if not x['relit'] and not x['ext'])}), "
         f"new at risk if filled ${sum(x['coll'] for x in taken if not x['ext']):,.0f} (budget ${BUDGET:,.0f}), "
-        f"~${sum(x['rate'] for x in taken):,.0f}/day; {len(scored) - len(taken)} over budget")
+        f"~${sum(x['rate'] for x in taken):,.0f}/day; {len(scored) - len(taken)} over budget"
+        + (f"; {sum(1 for x in taken if x.get('tiered'))} clear the bar only at the cheap-side tier size "
+           f"(tiers {','.join(f'{c:g}:{x:g}' for c, x in CHEAP_TIERS)})" if CHEAP_TIERS else ""))
+    summary["tiered_taken"] = sum(1 for x in taken if x.get("tiered"))
     for x in taken[:20]:
         log(f"  {'EXTEND' if x['ext'] else 'RELIT ' if x['relit'] else 'NEW   '} {x['t']} {x['kind']} last {x['last']} book {x['book']} "
-            f"size {x['bs']}/{x['as_']} ${x['rate']:.2f}/day proj ${x['proj']:.2f} "
+            f"size {x['bs']}/{x['as_']}"
+            + (f" (cheap side at the tier size: {x['tiered'][0]}/{x['tiered'][1]})" if x.get("tiered") else "")
+            + f" ${x['rate']:.2f}/day proj ${x['proj']:.2f} "
             f"ROI {x['roi'] * 100:.1f}%/day {zs(x['start'])[5:16]}->{zs(x['end'])[5:16]}")
     return taken
 

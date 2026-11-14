@@ -579,8 +579,11 @@ def enroll_new_series(client, dry: bool):
                 break
     enrolled, review = [], []
     additions = []
+    list_only = []                    # allowed by the wave list alone (below)
     for s, sample in sorted(seen.items()):
         if imm.IncentiveMarketMaker._allowed(sample):
+            if allowed_by_wave_list_only(sample):
+                list_only.append((s, sample))
             continue                      # already covered somewhere
         # A family-suffix series the bot has not source-verified yet
         # (2026-09-22, incentive_mm.ALLOW_FAMILY_SUFFIXES): the bot's own
@@ -683,6 +686,22 @@ def enroll_new_series(client, dry: bool):
         else:
             still_review.append((s, f"{why}; {gwhy}" if gwhy else why, sample))
     review = still_review
+    # A series the wave list alone admits still joins the election family when
+    # Kalshi files it under Elections (2026-11-11, w1111-statenom: the 24/7 wave
+    # check listed KXSENATENOM, KXGOVNOM and 7 state-race series at 16:08Z, so
+    # the skip above passed them over, and the bot's entry screen -- the
+    # family's 1-99c band is not theirs -- kept 231 listed long shots dark;
+    # Jack: "if new 2028 markets come online, they should be quoted"). The
+    # list admits only its MARKETS, so nothing else changes for them: any other
+    # category is left as it was (no review row, no file), and a listed
+    # election market keeps the list's stop as its cutoff. One /series read
+    # per such series per run.
+    for s, sample in list_only:
+        if s in imm.ELECTION_EXCLUDE:
+            continue
+        if series_meta(client, s).get("category") == "Elections":
+            elec_additions.append(s)
+            enrolled.append((s, ELECTION_LISTED_ENROLL_WHY, sample))
     if elec_additions and not dry:
         _merge_series_file(imm.election_extra_path(), elec_additions)
         log(f"election-enrolled {len(elec_additions)} Kalshi Elections "
@@ -996,6 +1015,23 @@ def graduate_auto_entry(fam: str, sample: str, se: dict) -> dict:
 
 
 ELECTION_ENROLL_WHY = "Kalshi Elections category -> election family"
+ELECTION_LISTED_ENROLL_WHY = ("Kalshi Elections category -> election family "
+                              "(on a wave list, not yet a member)")
+
+
+def allowed_by_wave_list_only(ticker: str) -> bool:
+    """True when the bot admits `ticker` only because it is on the wave list
+    (incentive_mm.pvd_entry) -- no family, allowlist or pattern covers its
+    series. Asks the bot's own _allowed with the list switched off for the one
+    call (this runs in the task's process, never the bot's)."""
+    if imm.pvd_entry(ticker) is None:
+        return False
+    saved = imm.PVD_ENABLE
+    imm.PVD_ENABLE = False
+    try:
+        return not imm.IncentiveMarketMaker._allowed(ticker)
+    finally:
+        imm.PVD_ENABLE = saved
 
 # AWARDS BY KALSHI TAG (Jack 2026-10-12: "all awards families should be
 # looked at, just like election and nfl families"). A REVIEW series Kalshi
