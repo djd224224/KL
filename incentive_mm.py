@@ -40217,6 +40217,16 @@ class IncentiveMarketMaker:
             # favorites or short long shots past the usual 5-90c)
             if t in self._wave_unwind or t in self._ca_family_unwind:
                 pmin_s, pmax_s = min(pmin_s, 1), max(pmax_s, 99)
+            # ...and a LISTED WAVE MARKET quotes on its own list band (Jack
+            # 2026-11-13: "can quote 1-99c, like prior waves"; 38f07e9 let the
+            # selection screen take it, but this per-side band still held the
+            # member 5-93c: 02:15Z 11/14, 1,312 of the FX / metals wave's 2,957
+            # dark sides were 1-4c bids and 94-99c asks). The pvd guard's
+            # limits (the tune's fair limits included) still bound each side.
+            _wvb = wave_entry(t, now_utc)
+            if _wvb is not None:
+                pmin_s = min(pmin_s, int(_wvb.get("pmin", PVD_PRICE_MIN)))
+                pmax_s = max(pmax_s, int(_wvb.get("pmax", PVD_PRICE_MAX)))
             # RT SETTLED STRIKES (2026-11-01): a settled strike quotes on its
             # own band; past the release-week stand-down, one that no longer
             # qualifies stands aside at once (the next refresh puts its

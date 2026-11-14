@@ -27071,6 +27071,41 @@ class TestGuardSkipSink(unittest.TestCase):
         self.assertIn("hi", enter["inputs"])
         self.assertEqual((enter["ext_bid"], enter["ext_ask"]), (2, 3))
 
+    def test_listed_wave_market_quotes_on_its_list_band(self):
+        # Jack 2026-11-13: "can quote 1-99c, like prior waves" -- the same 2 x 3 book
+        # on a listed wave market (its entry's 1-99c band) is not stood down
+        bot = self._bot()
+        bot.run_cycle()
+        bot._guard_snap_at = time.time()
+        self._book(bot, 1200, 1200, yes_px="0.02", no_px="0.97")   # 2 x 3
+        def listed(pmin, pmax):
+            stop = datetime.now(timezone.utc) + timedelta(hours=6)
+            with open(imm.pvd_path(), "w", encoding="utf-8") as f:
+                json.dump({"stop": stop.strftime("%Y-%m-%dT%H:%M:%SZ"), "markets": {self.T: {
+                    "bid_max": 2, "ask_min": 3, "size": 200, "follow_book": True,
+                    "price_min": pmin, "price_max": pmax}}}, f)
+            imm._pvd_state["mtime"] = 0.0
+            imm.load_pvd_markets()
+
+        def unlist():           # the list tests' own tearDown (TestPostVoteDeadBooks)
+            try:
+                os.remove(imm.pvd_path())
+            except FileNotFoundError:
+                pass
+            imm._pvd_state["mtime"] = 0.0
+            imm.load_pvd_markets()
+            imm.PVD_REMOVED.clear()
+            _clean_persist()
+        self.addCleanup(unlist)
+        listed(1, 99)
+        self.assertIsNotNone(imm.wave_entry(self.T))
+        self._held_cycle(bot)
+        self.assertNotIn("band_both_out", [r["guard"] for r in self._rows("enter")])
+        # ...an entry band no wider than the member 5-93c still stands it down
+        listed(5, 93)
+        self._held_cycle(bot)
+        self.assertIn("band_both_out", [r["guard"] for r in self._rows("enter")])
+
     def test_clear_for_a_market_that_left_the_book_logs_no_stale_book(self):
         bot = self._bot()
         bot.run_cycle()
