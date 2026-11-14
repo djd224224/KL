@@ -45258,6 +45258,23 @@ class TestCryptoEventFair(unittest.TestCase):
             self.assertEqual(imm.pvd_limits(entry, None, t), (30, 39))
         self.assertEqual(imm.pvd_limits(entry, None, "KXFOO-26DEC01-T1"), (30, 39))
 
+    def test_crypto_wave_cold_start_rests_up_to_400(self):
+        # Jack 2026-11-14: "dont rest base size for the first hour, allow them
+        # to go up to 400 each side now"
+        self.assertEqual(imm.CRYPTO_WAVE_COLD_SIZE, 400)
+        q = [Quote("T", "bid", 20, 600), Quote("T", "ask", 30, 3000)]
+        out, cuts = imm.pvd_off_usual_cut(q, None, None, 300, cold_sides=("bid", "ask"))
+        self.assertEqual(sorted((x.book_side, x.count) for x in out), [("ask", 300), ("bid", 300)])
+        out, cuts = imm.pvd_off_usual_cut(q, None, None, 300, cold_sides=("bid", "ask"), cold_cap=400)
+        self.assertEqual(sorted((x.book_side, x.count) for x in out), [("ask", 400), ("bid", 400)])
+        # a usual price 3c+ off still cuts to base
+        out, _ = imm.pvd_off_usual_cut(q, 10.0, 30.0, 300, cold_sides=(), cold_cap=400)
+        self.assertEqual(sorted((x.book_side, x.count) for x in out), [("ask", 3000), ("bid", 300)])
+        # a smaller side keeps its own size
+        out, _ = imm.pvd_off_usual_cut([Quote("T", "bid", 20, 300)], None, None, 300,
+                                       cold_sides=("bid",), cold_cap=400)
+        self.assertEqual([x.count for x in out], [300])
+
     def test_the_narrowed_band(self):
         # Jack 2026-11-14: "Yes, narrow it" -- spot +-0.5%, sigma x0.9 /
         # x1.11, 2c (from +-1%, x0.8 / x1.25, 3c)

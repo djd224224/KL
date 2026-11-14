@@ -11087,6 +11087,14 @@ PVD_OFF_USUAL_MIN_N = int(_env_float("IMM_PVD_OFF_USUAL_MIN_N", 4))
 PVD_OFF_USUAL_SAMPLE_S = _env_float("IMM_PVD_OFF_USUAL_SAMPLE_S", 900.0)
 PVD_OFF_USUAL_LOG_S = 600.0
 PVD_OFF_USUAL_COLD = os.environ.get("IMM_PVD_OFF_USUAL_COLD", "base").strip().lower() != "full"
+# CRYPTO WAVE COLD START (Jack 2026-11-14: "dont rest base size for the first
+# hour, allow them to go up to 400 each side now", the incentive window ending
+# 11/15 05:00Z): a crypto event strike on the wave list with no usual price yet
+# keeps up to CRYPTO_WAVE_COLD_SIZE a side (400) instead of its base (200-300);
+# its 2x pins (600) and cheap-tier sides (1,000-3,000) rest 400 until the
+# usual price exists, then in full. The live fair bounds every price and its
+# stand-asides hold. Off-usual (3c+ toward the taker) still cuts to base.
+CRYPTO_WAVE_COLD_SIZE = _env_int("IMM_CRYPTO_WAVE_COLD_SIZE", 400)
 # CLOSE CLAMP (Jack 2026-11-08, on the side that reduces a position following a
 # bait at any price: "dont allow that"). The closing exemption (Jack 2026-11-04:
 # "Yes, exempt closing") let the reducing side rest past the listed limits, up to
@@ -11234,12 +11242,14 @@ def pvd_off_usual_cut(quotes: List["Quote"], usual_bid: Optional[float],
                       usual_ask: Optional[float], base: int,
                       off_c: Optional[float] = None,
                       cold_sides: Tuple[str, ...] = (),
-                      pos: float = 0.0) -> Tuple[List["Quote"], Dict[str, tuple]]:
+                      pos: float = 0.0,
+                      cold_cap: Optional[int] = None) -> Tuple[List["Quote"], Dict[str, tuple]]:
     """(quotes, cuts): a side whose best rung rests more than `off_c` cents
     nearer the taker than its usual price (a bid over usual_bid + off_c, an ask
     under usual_ask - off_c) keeps at most `base` contracts, nearest-the-touch
     rung first; a side in `cold_sides` (no usual price yet) keeps at most
-    `base` too. The side that reduces the position `pos` keeps base + |pos|,
+    `base` too, or `cold_cap` when given (CRYPTO WAVE COLD START). The side
+    that reduces the position `pos` keeps base + |pos|,
     so one fill can still take it flat and no further (flip-through).
     cuts[side] = (planned, kept, best px, usual or None). Pads untouched."""
     off_c = PVD_OFF_USUAL_C if off_c is None else off_c
@@ -11264,8 +11274,8 @@ def pvd_off_usual_cut(quotes: List["Quote"], usual_bid: Optional[float],
         else:
             off = best > usual + off_c if side == "bid" else best < usual - off_c
         planned = sum(int(out[i].count) for i in idx)
-        cap = base + (int(abs(pos)) if (side == "ask" and pos >= 1) or (side == "bid" and pos <= -1)
-                      else 0)
+        cap = (max(base, int(cold_cap)) if usual is None and cold_cap else base) + (
+            int(abs(pos)) if (side == "ask" and pos >= 1) or (side == "bid" and pos <= -1) else 0)
         if not off or planned <= cap:
             continue
         idx.sort(key=lambda i: -px(out[i]) if side == "bid" else px(out[i]))
@@ -14645,6 +14655,7 @@ _CONFIG_CODE_KNOBS = (
     "HEIGHTENED_STRIKE_SECS",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
+    "CRYPTO_WAVE_COLD_SIZE",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N", "OFF_USUAL_BIG_TO",
     # strait weeklies out for the week's last two days (2026-11-08)
     "STRAIT_WEEKLY_STOP_DAYS", "STRAIT_WEEKLY_STOP_SERIES",
@@ -41912,7 +41923,9 @@ class IncentiveMarketMaker:
                             mq, _ub, _ua, int(pvd.get("size") or 0),
                             cold_sides=tuple(s for s, u in (("bid", _ub), ("ask", _ua))
                                              if u is None) if PVD_OFF_USUAL_COLD else (),
-                            pos=cap_pos)
+                            pos=cap_pos,
+                            cold_cap=(CRYPTO_WAVE_COLD_SIZE if crypto_event_series(meta.series)
+                                      else None))
                         if _ou:
                             self._off_usual[t] = (now_ts, _ou)
                             self._off_usual_side_note(t, _ou)
