@@ -2082,7 +2082,9 @@ def cash_extras(pf: dict, now: float) -> dict:
                       [[float(a), tk, k, round(v, 4), fid] for a, tk, k, v, fid in flows]),
             "until": now,
             "transfers": pf.get("transfers"),
-            "moves": (pf.get("subs") or {}).get("moves")}
+            "moves": (pf.get("subs") or {}).get("moves"),
+            "positions": pf.get("open_positions"),
+            "exposure": pf.get("event_exposure")}
 
 
 # ----------------------------------------------------------------------------
@@ -3766,8 +3768,21 @@ class Builder:
                     return fam(tk), "imm"
                 return imm_cash.bot_src(series_of(tk)), "bot"
 
-            return imm_cash.build(segs, live_span, samples, (live or {}).get("transfers"),
-                                  (live or {}).get("moves"), src_of, start, self.now)
+            out = imm_cash.build(segs, live_span, samples, (live or {}).get("transfers"),
+                                 (live or {}).get("moves"), src_of, start, self.now)
+            # where the cash is tied up now: the IMM's book by family, the
+            # rest by bot (Jack 2026-11-14: "in case i need to emergency
+            # unwind it")
+            if live and live.get("positions") is not None:
+                book = {t for t, v in self.last_snap[1].items() if abs(_f(v[0])) > 1e-9}
+
+                def src_now(tk):
+                    return (fam(tk), "imm") if tk in book else (imm_cash.bot_src(series_of(tk)), "bot")
+
+                out["tied"] = imm_cash.tied(live["positions"], live.get("exposure") or {}, src_now,
+                                            load_json(os.path.join(CACHE_DIR, "event_titles.json"), {}) or {},
+                                            live["until"])
+            return out
         except Exception as e:
             log(f"! cash chart: {e!r}")
             self.warnings.append(f"cash chart: {e!r}")

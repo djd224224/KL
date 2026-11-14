@@ -243,6 +243,81 @@ def gap_items(a: dict, b: dict, flow_sum: float, transfers, moves) -> list:
 
 
 # ----------------------------------------------------------------------------
+# Where the cash is tied up
+# ----------------------------------------------------------------------------
+
+TIED_EVENTS = 80                    # rows shipped; the page shows the top ones
+TIED_MARKETS = 150
+
+
+def exit_value(pos: float, bid, ask) -> float:
+    """What selling `pos` (> 0 YES, < 0 NO) at today's touch pays: YES at the
+    YES bid, NO at the NO bid (1 - the YES ask); an empty side pays 0. Top of
+    book only: the size behind it is not read."""
+    if pos > 0:
+        return pos * _f(bid) if _f(bid) > 0 else 0.0
+    a = _f(ask)
+    return -pos * (1.0 - a) if 0 < a < 1 else 0.0
+
+
+def tied(positions: dict, exposure: dict, src_of, titles: dict, at: float) -> dict:
+    """D.cash.tied (Jack 2026-11-14: "include the top events/markets that ties
+    up cash (in case i need to emergency unwind it)"): the account's open
+    positions as of one account read.
+
+    positions: ticker -> {"ev", "pos", "cost", "bid", "ask", "mark", "shard"}
+    (build_portfolio's open_positions); exposure: event -> Kalshi's event
+    exposure, the cash the event ties up (its markets' cost less the
+    collateral Kalshi hands back on mutually exclusive and nested ones);
+    src_of(ticker) -> (row name, "imm" | "bot").
+
+    An event's "freed" is what unwinding it at the touch would bring in:
+    every market sold at the bid, less the collateral Kalshi takes back as
+    the positions go. Rows: "ev" [event, title, source, group, shard,
+    markets, contracts, tied, freed, value at the mark], top TIED_EVENTS by
+    tied; "mk" [ticker, event, source, group, contracts (+ YES / - NO), avg
+    price, cost, bid, ask, freed at the touch, shard], top TIED_MARKETS by
+    cost."""
+    evs, mks = {}, []
+    for tk, p in (positions or {}).items():
+        q = _f(p.get("pos"))
+        if abs(q) < 1e-9:
+            continue
+        cost = _f(p.get("cost"))
+        ex = exit_value(q, p.get("bid"), p.get("ask"))
+        mk = p.get("mark")
+        val = cost if mk is None else (q * _f(mk) if q > 0 else -q * (1.0 - _f(mk)))
+        name, grp = src_of(tk)
+        ev = p.get("ev") or tk
+        e = evs.setdefault(ev, {"cost": 0.0, "exit": 0.0, "val": 0.0, "n": 0, "cts": 0.0,
+                                "src": {}, "shard": p.get("shard")})
+        e["cost"] += cost
+        e["exit"] += ex
+        e["val"] += val
+        e["n"] += 1
+        e["cts"] += abs(q)
+        e["src"][(name, grp)] = e["src"].get((name, grp), 0.0) + cost
+        mks.append([tk, ev, name, grp, round(q, 2), round(cost / abs(q), 4), round(cost, 2),
+                    p.get("bid"), p.get("ask"), round(ex, 2), p.get("shard")])
+    rows = []
+    for ev, e in evs.items():
+        x = exposure.get(ev) if exposure else None
+        tie = _f(x) if x is not None else e["cost"]
+        refund = e["cost"] - tie              # collateral handed back, taken back on exit
+        (name, grp) = max(e["src"].items(), key=lambda kv: kv[1])[0]
+        rows.append([ev, (titles or {}).get(ev) or "", name, grp, e["shard"], e["n"],
+                     round(e["cts"], 2), round(tie, 2), round(e["exit"] - refund, 2),
+                     round(e["val"] - refund, 2)])
+    rows.sort(key=lambda r: -r[7])
+    mks.sort(key=lambda r: -r[6])
+    return {"at": round(at), "tied": round(sum(r[7] for r in rows), 2),
+            "freed": round(sum(r[8] for r in rows), 2),
+            "cost": round(sum(e["cost"] for e in evs.values()), 2),
+            "n_ev": len(rows), "n_mk": len(mks),
+            "ev": rows[:TIED_EVENTS], "mk": mks[:TIED_MARKETS]}
+
+
+# ----------------------------------------------------------------------------
 # The payload
 # ----------------------------------------------------------------------------
 

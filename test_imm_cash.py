@@ -123,6 +123,37 @@ class BuildTests(unittest.TestCase):
         self.assertTrue(all(p[0] >= T0 + 43200 for p in out["path"]))
 
 
+class TiedTests(unittest.TestCase):
+    """Jack 2026-11-14: "include the top events/markets that ties up cash (in
+    case i need to emergency unwind it)"."""
+
+    def test_exit_at_the_touch(self):
+        self.assertAlmostEqual(ic.exit_value(10, 0.40, 0.45), 4.0)        # YES at the YES bid
+        self.assertAlmostEqual(ic.exit_value(-10, 0.40, 0.45), 5.5)       # NO at 1 - the YES ask
+        self.assertEqual(ic.exit_value(10, 0.0, 0.45), 0.0)               # no bid
+        self.assertEqual(ic.exit_value(-10, 0.40, 0.0), 0.0)              # no YES ask = no NO bid
+
+    def test_exclusive_event_nets_the_collateral_and_takes_it_back_on_exit(self):
+        # three NO at 90c on mutually exclusive names: $2.70 paid, at most one
+        # NO loses, so Kalshi ties up $0.70 and has handed back $2.00; selling
+        # the three at a 92c NO bid brings in $2.76 less that $2.00
+        pos = {f"KXWIN-26-{n}": {"ev": "KXWIN-26", "pos": -1.0, "cost": 0.9, "bid": 0.05,
+                                 "ask": 0.08, "mark": 0.065, "shard": 0} for n in "ABC"}
+        pos["KXBIG-1"] = {"ev": "KXBIG", "pos": 100.0, "cost": 50.0, "bid": 0.48, "ask": 0.52,
+                          "mark": 0.5, "shard": 0}
+        out = ic.tied(pos, {"KXWIN-26": 0.7, "KXBIG": 50.0},
+                      lambda tk: ("Fam", "imm") if tk.startswith("KXBIG") else ("Other trades", "bot"),
+                      {"KXBIG": "Big one"}, T0)
+        ev = {r[0]: r for r in out["ev"]}
+        self.assertEqual([r[0] for r in out["ev"]], ["KXBIG", "KXWIN-26"])     # biggest first
+        self.assertEqual(ev["KXBIG"][1:4], ["Big one", "Fam", "imm"])
+        self.assertEqual(ev["KXBIG"][7:9], [50.0, 48.0])
+        self.assertEqual(ev["KXWIN-26"][7], 0.7)
+        self.assertAlmostEqual(ev["KXWIN-26"][8], 0.76)
+        self.assertEqual((out["tied"], out["cost"], out["n_ev"], out["n_mk"]), (50.7, 52.7, 2, 4))
+        self.assertEqual(out["mk"][0][:5], ["KXBIG-1", "KXBIG", "Fam", "imm", 100.0])
+
+
 class SampleTests(unittest.TestCase):
 
     def setUp(self):

@@ -1417,6 +1417,20 @@ def build_portfolio(now_utc: datetime, prior_before: str = None, with_unpaid: bo
             "no_trade_cash": no_trade_cash, "net_transfers": net_transfers,
             "replay": replay_info, "ev_map": ev_names,
             "cash_flows": cash_flows,
+            # the dashboard's "where the cash is tied up" (Jack 2026-11-14:
+            # "include the top events/markets that ties up cash (in case i
+            # need to emergency unwind it)"): each open market with its touch,
+            # and Kalshi's exposure per event (its cost less the collateral
+            # handed back)
+            "open_positions": {tk: {"ev": tk_event.get(tk) or event_from_ticker(tk),
+                                    "pos": rec["pos"], "cost": round(rec["cost"], 4),
+                                    "bid": (mark_info.get(tk) or {}).get("yes_bid"),
+                                    "ask": (mark_info.get(tk) or {}).get("yes_ask"),
+                                    "mark": marks.get(tk),
+                                    "shard": (mark_info.get(tk) or {}).get("shard")}
+                               for tk, rec in mkt_pos.items()},
+            "event_exposure": {ev: e["exposure"] for ev, e in ev_roll.items()
+                               if e.get("exposure") is not None},
             "first_run": prior is None}
 
 
