@@ -4384,6 +4384,28 @@ MAX_PLACEMENTS_PER_CYCLE = _env_int("IMM_MAX_PLACEMENTS_PER_CYCLE", 120)
 # rest of the fleet. RATE_LIMIT_ALERT emails any write a 429 rejects, ours or
 # the crypto bots' (their read 429s are logged only, 2026-10-22).
 PLACE_RATE_PER_SEC = _env_float("IMM_PLACE_RATE_PER_SEC", 24.0)
+# PLACE PRIORITY (Jack 2026-11-14: "1", to "Queue priority: send orders for
+# markets with nothing resting first ... then price changes, then renewals").
+# The bot is write-bound in its steady state: 00:00-01:00Z 11/14, with no
+# restart, it placed 2,300-3,900 orders every 10 minutes against the 1,000-a-
+# cycle cap, most of them TTL renewals (~6,000-7,000 resting, renewed every
+# ORDER_REFRESH_SECS). The queue ran in the quote loop's market order, so after
+# a restart (three deploys in 25 minutes that night) newly admitted strikes
+# waited 3-5 cycles behind renewals of orders that were resting anyway --
+# 2,946 deferred at 01:58Z, the crypto *EVENT live count 447 -> 138. Each
+# cycle's placements now go out by tier, the market order kept inside one:
+#   0 a real rung on a side with nothing real resting (a new admission, a
+#     side dark after a restart, a fill or an expiry);
+#   1 a price or size change (deferred, its old order is cancelled anyway, so
+#     the side would go dark), and a renewal whose order expires within
+#     RENEW_URGENT_SECS (or whose expiry is unknown);
+#   2 another rung on a side already resting one, and pads;
+#   3 an identical renewal with time to spare -- deferred, it keeps resting.
+# The deferral line counts what each tier left behind. IMM_PLACE_PRIORITY=0
+# restores the market order.
+PLACE_PRIORITY = os.environ.get("IMM_PLACE_PRIORITY", "1") == "1"
+RENEW_URGENT_SECS = _env_float("IMM_RENEW_URGENT_SECS", 240.0)
+_PLACE_TIER_NAMES = ("dark side", "re-price/urgent renewal", "extra rung/pad", "renewal")
 
 
 class WritePacer:
@@ -14477,6 +14499,8 @@ _CONFIG_CODE_KNOBS = (
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
     "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT", "HOME_EDGES",
     "HOME_AUTO", "HOME_AUTO_PATTERN",
+    # placement queue priority (2026-11-14)
+    "PLACE_PRIORITY", "RENEW_URGENT_SECS",
     # crypto event fair (2026-11-13)
     "CRYPTO_EVENT_FAIR", "CRYPTO_EVENT_LEAD", "CRYPTO_EVENT_TOL_CENTS",
     "CRYPTO_EVENT_SPOT_BAND", "CRYPTO_EVENT_VOL_LO", "CRYPTO_EVENT_VOL_HI",
@@ -42852,6 +42876,37 @@ class IncentiveMarketMaker:
                 return False
         return abs(order_remaining(o) - q.count) < 0.5
 
+    def _place_tiers(self, to_place: List[Quote], replaces: Dict[int, str],
+                     resting: List[dict], cancelled_ids: Set[str],
+                     now_ts: float) -> List[int]:
+        """Each placement's PLACE PRIORITY tier (0 first): 0 a real rung on a
+        side with nothing real resting, 1 a re-price or a renewal about to
+        expire, 2 another rung or a pad, 3 an identical renewal with time to
+        spare. An order being replaced still rests until its swap."""
+        live_sides: Set[Tuple[str, str]] = set()
+        for o in resting:
+            if o.get("order_id") in cancelled_ids:
+                continue
+            parsed = order_yes_book_cents(o)
+            if parsed is None or (self._is_pad_price(parsed[0], parsed[1])
+                                  and cheap_entry(o.get("ticker", "")) is None):
+                continue
+            live_sides.add((o.get("ticker", ""), parsed[0]))
+        by_id = {o.get("order_id"): o for o in resting}
+        tiers = []
+        for i, q in enumerate(to_place):
+            old = replaces.get(i)
+            if old is None:
+                tiers.append(2 if q.is_pad or (q.ticker, q.book_side) in live_sides else 0)
+                continue
+            o = by_id.get(old)
+            if o is None or not self._identical_quote(o, q):
+                tiers.append(1)
+                continue
+            exp = order_expiry_ts(o)
+            tiers.append(1 if exp is None or exp - now_ts < RENEW_URGENT_SECS else 3)
+        return tiers
+
     def place_with_caps(self, to_place: List[Quote], resting: List[dict],
                         cancelled_ids: Set[str], now_ts: float,
                         replaces: Optional[Dict[int, str]] = None,
@@ -42870,6 +42925,16 @@ class IncentiveMarketMaker:
         order already identical to its replacement keeps resting until the
         next cycle; any other is cancelled now, as before."""
         replaces = replaces or {}
+        tiers: List[int] = []
+        if PLACE_PRIORITY and len(to_place) > 1:
+            # PLACE PRIORITY: dark sides first, identical renewals last (a
+            # stable sort: the market order holds inside a tier)
+            tiers = self._place_tiers(to_place, replaces, resting, cancelled_ids, now_ts)
+            order = sorted(range(len(to_place)), key=lambda k: (tiers[k], k))
+            if order != list(range(len(to_place))):
+                to_place = [to_place[k] for k in order]
+                replaces = {n: replaces[k] for n, k in enumerate(order) if k in replaces}
+                tiers = [tiers[k] for k in order]
         pending = set(replaces.values())
         by_id = {o.get("order_id"): o for o in resting}
         side_totals: Dict[Tuple[str, str], float] = {}
@@ -42941,8 +43006,15 @@ class IncentiveMarketMaker:
                     total_resting += _count(by_id[old_c], 1)
                 continue
             if placed >= MAX_PLACEMENTS_PER_CYCLE:
+                _left = ""
+                if tiers:
+                    _lc = [0, 0, 0, 0]
+                    for _t in tiers[i:]:
+                        _lc[_t] += 1
+                    _left = " (" + ", ".join(f"{_PLACE_TIER_NAMES[_k]} {_lc[_k]}"
+                                             for _k in range(4) if _lc[_k]) + ")"
                 log(f"{self.tag} placement cap {MAX_PLACEMENTS_PER_CYCLE}/cycle reached; "
-                    f"{len(to_place) - i} deferred to next cycle")
+                    f"{len(to_place) - i} deferred to next cycle{_left}")
                 deferred_from = i
                 break
             if total_resting >= MAX_TOTAL_RESTING_ORDERS:

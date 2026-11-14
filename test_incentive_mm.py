@@ -28698,6 +28698,58 @@ class TestRequoteInterleave(unittest.TestCase):
         self.assertIn("b", self.bot.state.sim_orders)
         self.assertNotIn("c", self.bot.state.sim_orders)
 
+    def _queue(self):
+        resting = [self._o("a", "T", "bid", 49, 20), self._o("b", "U", "bid", 40, 20),
+                   self._o("c", "V", "bid", 30, 20), self._o("d", "W", "bid", 20, 20)]
+        resting[0]["expire_at"] = self.now + 1500       # a renewal with time to spare
+        resting[1]["expire_at"] = self.now + 100        # ...and one about to expire
+        to_place = [Quote("T", "bid", 49, 20),          # 3 renewal of a
+                    Quote("U", "bid", 40, 20),          # 1 urgent renewal of b
+                    Quote("V", "bid", 31, 20),          # 1 re-price of c
+                    Quote("W", "bid", 19, 10),          # 2 another rung beside d
+                    Quote("X", "bid", 50, 20),          # 0 a dark side
+                    Quote("Y", "bid", imm.PAD_BID_CENTS, 800, is_pad=True)]   # 2 a pad
+        return resting, to_place, {0: "a", 1: "b", 2: "c"}
+
+    def test_place_priority_dark_sides_first_renewals_last(self):
+        # Jack 2026-11-14: "1" -- dark sides first, then price changes, then
+        # renewals; an identical renewal deferred keeps resting
+        self.assertTrue(imm.PLACE_PRIORITY)
+        resting, to_place, replaces = self._queue()
+        self.assertEqual(self.bot._place_tiers(to_place, replaces, resting, set(), self.now),
+                         [3, 1, 1, 2, 0, 2])
+        lines = []
+        with mock.patch.object(imm, "MAX_PLACEMENTS_PER_CYCLE", 3), \
+                mock.patch.object(imm, "log", lines.append):
+            placed = self.bot.place_with_caps(to_place, resting, set(), self.now,
+                                              replaces=replaces)
+        self.assertEqual(placed, 3)
+        self.assertEqual(self.calls, [("place", "X", "bid", 50),
+                                      ("cancel", "b"), ("place", "U", "bid", 40),
+                                      ("cancel", "c"), ("place", "V", "bid", 31)])
+        self.assertIn("a", self.bot.state.sim_orders)          # deferred, still resting
+        self.assertTrue(any("3 deferred to next cycle (extra rung/pad 2, renewal 1)" in x
+                            for x in lines), lines)
+
+    def test_place_priority_kill_switch_keeps_the_market_order(self):
+        resting, to_place, replaces = self._queue()
+        with mock.patch.object(imm, "PLACE_PRIORITY", False), \
+                mock.patch.object(imm, "MAX_PLACEMENTS_PER_CYCLE", 1), \
+                mock.patch.object(imm, "log"):
+            self.bot.place_with_caps(to_place, resting, set(), self.now, replaces=replaces)
+        self.assertEqual([c for c in self.calls if c[0] == "place"], [("place", "T", "bid", 49)])
+
+    def test_a_side_resting_only_a_pad_counts_as_dark(self):
+        resting = [self._o("p", "Z", "bid", imm.PAD_BID_CENTS, 700)]
+        self.assertEqual(self.bot._place_tiers([Quote("Z", "bid", 30, 20)], {}, resting,
+                                               set(), self.now), [0])
+        # ...and a side whose only order was cancelled this cycle is dark too
+        resting = [self._o("q", "Z", "bid", 31, 20)]
+        self.assertEqual(self.bot._place_tiers([Quote("Z", "bid", 30, 20)], {}, resting,
+                                               {"q"}, self.now), [0])
+        self.assertEqual(self.bot._place_tiers([Quote("Z", "bid", 30, 20)], {}, resting,
+                                               set(), self.now), [2])
+
     def test_ttl_renewals_interleave_in_a_cycle(self):
         """End to end on the dry-run fixture: age every resting order past the
         refresh age and the next cycle renews them cancel/place pairwise; the
@@ -29586,6 +29638,14 @@ class TestPacedPlacements(unittest.TestCase):
         placed = self._run([Quote("T", "bid", 48, 5), Quote("U", "bid", 40, 5)],
                            resting=[old], replaces={0: "a"})
         self.assertEqual(placed, 2)
+        # (PLACE PRIORITY, 2026-11-14: U's dark side goes first, then T's
+        # re-price -- its cancel and replacement still back to back)
+        self.assertEqual(self.events, [("place", "U"), ("sleep", 0.1),
+                                       ("cancel", "a"), ("place", "T")])
+        self.events.clear()
+        with mock.patch.object(imm, "PLACE_PRIORITY", False):
+            self._run([Quote("T", "bid", 48, 5), Quote("U", "bid", 40, 5)],
+                      resting=[dict(old)], replaces={0: "a"})
         self.assertEqual(self.events, [("cancel", "a"), ("place", "T"),
                                        ("sleep", 0.2), ("place", "U")])
 
