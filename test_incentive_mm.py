@@ -45435,3 +45435,52 @@ class TestHeightenedBait1113(unittest.TestCase):
                 self._flash(120.0 * k)
         self.assertEqual(self._rows(), [])
         self.assertIsNone(self.bot._hz)
+
+
+class TestRestingReadPages(unittest.TestCase):
+    """2026-11-14: the account-wide resting read stopped at 40 x 200 = 8,000 orders
+    once the resting cap went to 12,000 -- the bot saw 7,401 of 12,591 and placed
+    the rest again every cycle. It reads 1,000 a page now and flags a short read."""
+
+    class _Pages:
+        def __init__(self, n_orders, per_page_max=1000):
+            self.all = [{"order_id": f"o{i}", "ticker": f"KXFOO-99DEC31-{i}", "status": "resting",
+                         "client_order_id": f"imm-run-{i:06x}", "side": "yes", "action": "buy",
+                         "yes_price_dollars": "0.40", "remaining_count_fp": "10"} for i in range(n_orders)]
+            self.limits = []
+            self.cap = per_page_max
+
+        def get_orders(self, status=None, limit=None, cursor=None, **kw):
+            self.limits.append(limit)
+            start = int(cursor or 0)
+            n = min(limit, self.cap)
+            batch = self.all[start:start + n]
+            nxt = start + n
+            return {"orders": batch, "cursor": str(nxt) if nxt < len(self.all) else None}
+
+    def _bot(self, client):
+        bot = IncentiveMarketMaker(client=None, live=False)
+        bot.client = client
+        return bot
+
+    def test_reads_1000_a_page_past_8000(self):
+        c = self._Pages(12591)
+        bot = self._bot(c)
+        got = bot._get_resting_orders_global()
+        self.assertEqual(len(got), 12591)
+        self.assertEqual(set(c.limits), {1000})
+        self.assertFalse(bot.resting_read_truncated)
+
+    def test_a_read_past_the_last_page_is_flagged(self):
+        c = self._Pages(2500)
+        bot = self._bot(c)
+        with mock.patch.object(imm, "RESTING_READ_PAGES", 2), \
+                mock.patch.object(imm, "log") as lg:
+            got = bot._get_resting_orders_global()
+        self.assertEqual(len(got), 2000)
+        self.assertTrue(bot.resting_read_truncated)
+        self.assertTrue(any("RESTING_READ_TRUNCATED" in str(a.args[0]) for a in lg.call_args_list))
+
+    def test_read_capacity_clears_the_resting_cap(self):
+        # pages x limit stays above the launcher's IMM_MAX_TOTAL_RESTING (12,000)
+        self.assertGreaterEqual(imm.RESTING_READ_PAGES * imm.RESTING_READ_LIMIT, 3 * 12000)

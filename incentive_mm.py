@@ -14117,6 +14117,11 @@ EXIT_ON_CODE_CHANGE = os.environ.get("IMM_EXIT_ON_CODE_CHANGE", "1") == "1"
 # new one's first (~4-5 min including the first full refresh) -- the book is
 # stale there instead of empty. IMM_RESTART_KEEP_ORDERS=0 restores the
 # cancel-on-exit + cancel-at-startup behaviour.
+# The account-wide resting-order read (_get_resting_orders_global): pages x limit
+# must stay well above IMM_MAX_TOTAL_RESTING plus every other bot's resting orders
+# on the key (2026-11-14: 40 x 200 = 8,000 cut the read off at 7,401 of ours).
+RESTING_READ_LIMIT = max(1, min(1000, _env_int("IMM_RESTING_READ_LIMIT", 1000)))
+RESTING_READ_PAGES = max(1, _env_int("IMM_RESTING_READ_PAGES", 40))
 RESTART_KEEP_ORDERS = os.environ.get("IMM_RESTART_KEEP_ORDERS", "1") == "1"
 # 300 -> 1200 (Jack 2026-11-13: "make sure restarts dont cancel everything", with
 # the resting cap raised to 12,000). At 300 s a slow relaunch fell back to the
@@ -32760,8 +32765,17 @@ class IncentiveMarketMaker:
         foreign: Dict[str, int] = {}
         order_ticker: Dict[str, str] = {}
         cursor = None
-        for _page in range(40):
-            resp = self.client.get_orders(status="resting", limit=200, cursor=cursor)
+        # 1,000 A PAGE (2026-11-14, after IMM_MAX_TOTAL_RESTING 8000 -> 12000 on Jack's
+        # "yes, but make sure restarts dont cancel everything"): at 40 pages of 200
+        # the read stopped at the account's first 8,000 resting orders, ours and
+        # every other bot's. 03:30Z 11/14 Kalshi held 12,591 imm- orders while the
+        # bot saw 7,401: the rest looked dark, were placed again every cycle (1,500
+        # a cycle, 3,462 market-sides doubled) and rested unmanaged until their TTL.
+        # 40 pages of 1,000 (Kalshi's max) reads 40,000; reaching the last page
+        # with a cursor left is logged (RESTING_READ_TRUNCATED) and flags the read.
+        truncated = False
+        for _page in range(RESTING_READ_PAGES):
+            resp = self.client.get_orders(status="resting", limit=RESTING_READ_LIMIT, cursor=cursor)
             batch = resp.get("orders") or []
             for o in batch:
                 if o.get("status") != "resting":
@@ -32779,6 +32793,14 @@ class IncentiveMarketMaker:
             cursor = resp.get("cursor")
             if not cursor or not batch:
                 break
+        else:
+            truncated = bool(cursor)
+        if truncated:
+            log(f"{self.tag} ! RESTING_READ_TRUNCATED: {RESTING_READ_PAGES} pages of "
+                f"{RESTING_READ_LIMIT} read and the account has more resting orders "
+                f"({len(orders)} ours seen) -- orders past the read look dark and get "
+                f"placed again")
+        self.resting_read_truncated = truncated
         self._foreign_resting = foreign
         self._order_ticker = order_ticker
         return orders
