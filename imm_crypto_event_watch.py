@@ -151,6 +151,8 @@ def poll(client, hist: dict) -> dict:
 
 w.load_list = load_list
 w.poll = poll
+# no wave scanner line: pvd_scan.py lists dead books, not these
+w.SCAN_FILE = os.path.join(HERE, "run-logs", "crypto-event-watch", "no_scan.json")
 w.PAGE = (w.PAGE
           .replace("<title>Dead Books Live</title>", "<title>Crypto Events Live</title>")
           .replace("<h1>Post-vote dead books</h1>",
