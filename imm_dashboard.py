@@ -125,7 +125,7 @@ PROGRAMS_TTL_MIN = float(os.environ.get("IMM_DASH_PROGRAMS_TTL_MIN", "30"))
 # (account_now, ~55 Kalshi reads), beside the days the 7am email keeps
 ACCOUNT_TTL_MIN = float(os.environ.get("IMM_DASH_ACCOUNT_TTL_MIN", "8"))
 DAY_BY_BOT_FILE = os.path.join("..", "portfolio-digest", "day_by_bot.json")  # under STATUS_DIR
-# The Drivers tab's cash chart (imm_cash; Jack 2026-11-14: "a time series
+# The Cash section's chart (imm_cash; Jack 2026-11-14: "a time series
 # chart view of cash balance and how it's changing throughout the day"): the
 # 7am email's snapshots live here, the live readings in DASH_DIR
 PF_SNAPSHOT_DIR = os.environ.get("IMM_DASH_PF_DIR", r"C:\Users\jackd\Documents\KL\portfolio_daily")
@@ -3707,7 +3707,7 @@ class Builder:
         return out
 
     def _cash(self, model):
-        """D.cash, the Drivers tab's cash chart (imm_cash.build): the 7am
+        """D.cash, the Cash section's chart (imm_cash.build): the 7am
         snapshots and the live readings, the completed days' replayed moves
         (cached per day; up to imm_cash.MAX_SEG_PER_BUILD new ones a build,
         API builds only) and this read's moves since the newest snapshot.

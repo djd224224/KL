@@ -1,5 +1,5 @@
-"""The main account's cash through the day, for the IMM dashboard's Drivers
-tab (Jack 2026-11-14: "add a time series chart view of cash balance and how
+"""The main account's cash through the day, for the IMM dashboard's Cash
+section (Jack 2026-11-14: "add a time series chart view of cash balance and how
 it's changing throughout the day e.g. what families are drawing cash or
 adding cash, rewards, deposits, etc").
 

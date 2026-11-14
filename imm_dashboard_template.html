@@ -350,13 +350,11 @@ svg.sparkc { display: block; margin-left: auto; overflow: visible; }
 td.shape, td.spk { cursor: default; }
 .bridge-note { font-size: 12px; color: var(--ink-2); margin-top: 4px; }
 /* cash chart */
-.cashcard { margin-top: 14px; }
 .cash-sum { font-size: 13px; margin: 6px 0 2px; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
 .cash-sum .big { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .cash-sum .part { color: var(--ink-2); white-space: nowrap; }
 .cash-sum .part b { font-weight: 500; font-variant-numeric: tabular-nums; }
 #cashChart svg text.pl { fill: var(--ink-2); font-size: 11px; }
-.cashtw { margin-top: 12px; }
 .cashtw .grp { margin-left: 6px; }
 .cashtw .sub-h .seg { font-weight: 400; }
 .cashtw .sub-h .seg button { padding: 3px 10px; font-size: 12px; }
@@ -450,6 +448,7 @@ footer { color: var(--muted); font-size: 12px; }
       <a href="#drivers">Drivers</a>
       <a href="#movers">Movers</a>
       <a href="#quoting">Quoting</a>
+      <a href="#cash">Cash</a>
       <a href="#opps">Opportunities<span class="badge" id="bOpp" hidden></span></a>
       <a href="#risk">Risk &amp; halts<span class="badge" id="bRisk" hidden></span></a>
       <a href="#fillday">Fill timing</a>
@@ -486,15 +485,6 @@ footer { color: var(--muted); font-size: 12px; }
       <div class="card chartcard"><div class="cardhead"><h3 id="bridgeTitle">P&amp;L bridge</h3><div class="legend" id="bridgeLegend"></div></div><div id="bridge"></div><div class="bridge-note" id="bridgeNote"></div></div>
       <div class="card chartcard"><div class="cardhead"><h3>Fill mark-outs by horizon, ¢ per contract</h3><div class="legend" id="hmLegend"></div></div><div id="moHeat"></div></div>
     </div>
-    <div class="card chartcard cashcard">
-      <div class="cardhead"><h3 id="cashTitle">Cash balance</h3><div class="legend" id="cashLegend"></div></div>
-      <div class="cash-sum" id="cashSum"></div>
-      <div id="cashChart"></div>
-      <div class="bridge-note" id="cashNote"></div>
-    </div>
-    <div class="cashtw"><div class="sub-h">Cash by source<span class="note" id="cashTableNote"></span></div><div class="tw" id="cashTable"></div></div>
-    <div class="cashtw"><div class="sub-h">Where the cash is tied up<span class="note" id="tiedNote"></span><span class="grow"></span><div class="seg" id="tiedSeg" role="group" aria-label="Events or markets"></div></div>
-      <div class="cash-sum" id="tiedSum"></div><div class="tw" id="tiedTable"></div></div>
     <div class="tw drvtw" id="drvTable"></div>
     <p class="explain" id="drvFoot"></p>
   </section>
@@ -515,6 +505,19 @@ footer { color: var(--muted); font-size: 12px; }
       <div><div class="sub-h">Quoted events<span class="note">sorted by modeled $/day now</span></div><div class="tw" id="qEvents"></div></div>
       <div><div class="sub-h">Why candidates are not quoted<span class="note" id="decNote"></span></div><div class="tw" id="decTable"></div></div>
     </div>
+  </section>
+
+  <section id="cash">
+    <div class="shead"><h2>Cash</h2><span class="note">The main account's cash through the window and what moved it, then where it is tied up now.</span></div>
+    <div class="card chartcard cashcard">
+      <div class="cardhead"><h3 id="cashTitle">Cash balance</h3><div class="legend" id="cashLegend"></div></div>
+      <div class="cash-sum" id="cashSum"></div>
+      <div id="cashChart"></div>
+      <div class="bridge-note" id="cashNote"></div>
+    </div>
+    <div class="cashtw"><div class="sub-h">Cash by source<span class="note" id="cashTableNote"></span></div><div class="tw" id="cashTable"></div></div>
+    <div class="cashtw"><div class="sub-h">Where the cash is tied up<span class="note" id="tiedNote"></span><span class="grow"></span><div class="seg" id="tiedSeg" role="group" aria-label="Events or markets"></div></div>
+      <div class="cash-sum" id="tiedSum"></div><div class="tw" id="tiedTable"></div></div>
   </section>
 
   <section id="opps">
@@ -594,7 +597,7 @@ footer { color: var(--muted); font-size: 12px; }
         <p class="explain"><b>P&amp;L explain</b> (Drivers). Trading P&amp;L splits exactly into three parts. <i>Carry: marks</i> is the position held at the window's start, re-marked from its start mark to its end mark (or to its last mark before it left the book). <i>Carry: settled</i> is that start position in a market Kalshi settled during the window, from its start mark to the settlement. <i>New fills</i> is the rest: the window's own fills, marked to the window's end or to the settlement.</p>
         <p class="explain"><b>Mark-outs</b> cover maker fills only (no pads, no taker fills). They are per contract and signed for our side. <i>At fill</i> is the edge: the fill price against the mid of the external book the bot read the cycle before the fill (none on a book 50¢+ wide). <i>5m</i>, <i>30m</i> and <i>4h</i> use the first 5-minute position snapshot at least that long after the fill; a mark must land within 5 minutes for 5m and within 15 minutes otherwise, so a fill that closed the position has none. <i>To date</i> uses Kalshi's settlement, else the bot's mark while it holds the market, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule. <i>Coverage</i> is rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow.</p>
         <p class="explain"><b>Last 7 days</b> and <b>Last 30 days</b> (Drivers) add up the rewards and trading P&amp;L of the 7 and 30 ET days through the window's last day: today so far on a live window, that day on a past one. Rewards follow the basis picked above the table. <i>Per day</i> divides by the days covered, today by its hours so far. <i>Shape</i> is the cumulative net, day by day from 0 at the span's start; hover it for a day's net, rewards and trading. The page keeps 30 days, so a past day's 30 days count only the ones it has (the header's tooltip says how many). The total row covers the whole book, including families with nothing in the window.</p>
-        <p class="explain"><b>Cash balance</b> (Drivers) is the main account's cash, every shard together, as Kalshi reports it (the numbered subaccounts hold their own). The line runs through Kalshi's actual readings, the 7am portfolio email's snapshots and, from Nov 14, every dashboard build's account read (~10 min), and between them replays every account fill and settlement from the snapshot's positions, as the email replays its day: a fill that opens contracts pays cash out (<i>bought</i>, fees included), one that closes or nets a YES/NO pair pays cash in (<i>sold</i>), a settlement pays its revenue (<i>settled</i>). A fill is the IMM's when its Kalshi fill id is in the bot's own fills log, filed under its family as above; the rest go to the crypto bots, the weather bots or <i>other trades</i> (hand trades, the other bots) by series. What no record explains, reading to reading: <i>deposits &amp; transfers</i> (the move in the all-time deposited and withdrawn totals, and moves to and from the subaccounts), then <i>collateral</i> (the change in what Kalshi hands back on open mutually exclusive and nested positions), then the rest, <i>reward credits</i> (almost all of it Kalshi's ~6:15 AM batch; anything else with no record lands there too). Those land on the reading that shows them, so before the 10-minute readings began they sit on the 7am snapshot. The path ties to every reading to the cent, and the 7am-to-7am day reproduces the email's trading cash and reward credits. <b>Where the cash is tied up</b> lists the open positions of the whole account at the newest account read, whatever the window: <i>cash tied</i> is Kalshi's exposure on the event (what its positions cost, less the collateral Kalshi hands back on mutually exclusive and nested ones; a market row shows its own cost); <i>freed now</i> is selling every position at today's touch (the bid of the side held, top of book only, so a big position would get less) less the collateral Kalshi takes back as the positions go.</p>
+        <p class="explain"><b>Cash balance</b> (Cash) is the main account's cash, every shard together, as Kalshi reports it (the numbered subaccounts hold their own). The line runs through Kalshi's actual readings, the 7am portfolio email's snapshots and, from Nov 14, every dashboard build's account read (~10 min), and between them replays every account fill and settlement from the snapshot's positions, as the email replays its day: a fill that opens contracts pays cash out (<i>bought</i>, fees included), one that closes or nets a YES/NO pair pays cash in (<i>sold</i>), a settlement pays its revenue (<i>settled</i>). A fill is the IMM's when its Kalshi fill id is in the bot's own fills log, filed under its family as above; the rest go to the crypto bots, the weather bots or <i>other trades</i> (hand trades, the other bots) by series. What no record explains, reading to reading: <i>deposits &amp; transfers</i> (the move in the all-time deposited and withdrawn totals, and moves to and from the subaccounts), then <i>collateral</i> (the change in what Kalshi hands back on open mutually exclusive and nested positions), then the rest, <i>reward credits</i> (almost all of it Kalshi's ~6:15 AM batch; anything else with no record lands there too). Those land on the reading that shows them, so before the 10-minute readings began they sit on the 7am snapshot. The path ties to every reading to the cent, and the 7am-to-7am day reproduces the email's trading cash and reward credits. <b>Where the cash is tied up</b> lists the open positions of the whole account at the newest account read, whatever the window: <i>cash tied</i> is Kalshi's exposure on the event (what its positions cost, less the collateral Kalshi hands back on mutually exclusive and nested ones; a market row shows its own cost); <i>freed now</i> is selling every position at today's touch (the bid of the side held, top of book only, so a big position would get less) less the collateral Kalshi takes back as the positions go.</p>
         <p class="explain"><b>Exp. net/day</b> is a model: the rewards the bot's estimator gives the quotes resting now, plus the family's average trading P&amp;L per day over the last 7 days. <b>Typical day</b> is the family's mean net per complete ET day over the 7 and 30 days before the window. The σ mark flags a window 1.5+ standard deviations from that mean, pro-rated to the window's length.</p>
         <p class="explain"><b>Worst case</b> is the loss from today's marks to settlement if everything goes against the book. It is netted inside an event: across its strikes when every market prices the same number (greater / less / between), and across names when Kalshi marks the event mutually exclusive. Mention words and anything whose structure has not been read count in full. Summed across events, it assumes every event goes wrong at once. On a past day it is the book at that day's close.</p>
         <p class="explain"><b>Paid rate</b> is what Kalshi credited per dollar of modeled reward on settled events (imm_reward_recon's calibration). The <i>raw</i> basis covers the $1 per-market-per-period floor and the model error together. The older <i>floored</i> basis covers the model error only. Account credits include other bots quoting the same markets, which can push a family above 1×.</p>
@@ -1840,7 +1843,6 @@ function renderDrivers() {
 function renderDriverCharts() {
   renderBridge(DRV_LAST.fams, DRV_LAST.tot);
   renderMoHeat(DRV_LAST.fams, DRV_LAST.tot);
-  renderCash();
 }
 
 /* the window's P&L as a bridge: rewards, then the three trading parts, to net */
@@ -3362,6 +3364,7 @@ function renderAll() {
   renderDrivers();
   renderMovers();
   renderQuoting();
+  renderCash();
   renderOpps();
   renderRisk();
   renderFillDay();
@@ -3376,7 +3379,7 @@ if (!D) {
   let qt = null;
   $("q").addEventListener("input", (e) => { clearTimeout(qt); qt = setTimeout(() => { Q = e.target.value.trim().toLowerCase(); for (const k in TSTATE) if (TSTATE[k] && TSTATE[k].limit) TSTATE[k].limit = Math.max(TSTATE[k].limit, 25); renderAll(); }, 160); });
   let rt = null;
-  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderSummary(); renderDriverCharts(); renderFillDay(); renderHistory(); }, 200); });
+  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderSummary(); renderDriverCharts(); renderCash(); renderFillDay(); renderHistory(); }, 200); });
   // nav highlight
   const links = [...document.querySelectorAll("#nav a")];
   const secs = links.map((a) => document.querySelector(a.getAttribute("href")));
