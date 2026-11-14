@@ -61,6 +61,46 @@ Usage:
     python incentive_mm.py --cancel-all    # cancel every resting imm- order
 """
 
+import os
+import sys
+
+# EARLY NORMAL PRIORITY (Jack 2026-11-13: "make sure restarts dont cancel
+# everything"). The scheduled task starts the bot below normal (CPU class, memory
+# priority 2, I/O 1), and _normal_priority() only ran once the run loop started --
+# AFTER this module's import, which is what starved under RAM pressure on 11/13
+# (426 s from the handoff to the adopt check; raising the pid from outside
+# unstuck it at once). Run as the bot, the process now raises itself before the
+# heavy imports and module body; the same raise-only rules as _normal_priority()
+# (which still runs and logs). Importers (tests, tools) are untouched.
+if __name__ == "__main__" and sys.platform == "win32" \
+        and os.environ.get("IMM_NORMAL_PRIORITY", "1") == "1":
+    try:
+        import ctypes as _ct
+        _k32, _ntd = _ct.WinDLL("kernel32"), _ct.WinDLL("ntdll")
+        _k32.GetCurrentProcess.restype = _ct.c_void_p
+        _k32.GetPriorityClass.argtypes = [_ct.c_void_p]
+        _k32.GetPriorityClass.restype = _ct.c_ulong
+        _k32.SetPriorityClass.argtypes = [_ct.c_void_p, _ct.c_ulong]
+        for _f in (_k32.GetProcessInformation, _k32.SetProcessInformation):
+            _f.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_ulong]
+        for _f in (_ntd.NtQueryInformationProcess, _ntd.NtSetInformationProcess):
+            _f.restype = _ct.c_long
+        _ntd.NtQueryInformationProcess.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_ulong, _ct.c_void_p]
+        _ntd.NtSetInformationProcess.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_ulong]
+        _me = _k32.GetCurrentProcess()
+        if _k32.GetPriorityClass(_me) in (0x40, 0x4000):          # idle / below normal
+            _k32.SetPriorityClass(_me, 0x20)                       # -> normal
+        _v = _ct.c_ulong(0)                                        # ProcessMemoryPriority = 0
+        if _k32.GetProcessInformation(_me, 0, _ct.byref(_v), 4) and _v.value < 5:
+            _v = _ct.c_ulong(5)
+            _k32.SetProcessInformation(_me, 0, _ct.byref(_v), 4)
+        _v = _ct.c_ulong(9)                                        # ProcessIoPriority = 33
+        if _ntd.NtQueryInformationProcess(_me, 33, _ct.byref(_v), 4, None) == 0 and _v.value < 2:
+            _v = _ct.c_ulong(2)
+            _ntd.NtSetInformationProcess(_me, 33, _ct.byref(_v), 4)
+    except Exception:  # noqa: BLE001  (best effort; _normal_priority() tries again)
+        pass
+
 import argparse
 import atexit
 import base64
@@ -14056,7 +14096,17 @@ EXIT_ON_CODE_CHANGE = os.environ.get("IMM_EXIT_ON_CODE_CHANGE", "1") == "1"
 # stale there instead of empty. IMM_RESTART_KEEP_ORDERS=0 restores the
 # cancel-on-exit + cancel-at-startup behaviour.
 RESTART_KEEP_ORDERS = os.environ.get("IMM_RESTART_KEEP_ORDERS", "1") == "1"
-RESTART_HANDOFF_MAX_AGE_SECS = _env_int("IMM_RESTART_HANDOFF_MAX_AGE_SECS", 300)
+# 300 -> 1200 (Jack 2026-11-13: "make sure restarts dont cancel everything", with
+# the resting cap raised to 12,000). At 300 s a slow relaunch fell back to the
+# cancel-all: 13:05Z 11/13 the new process started 426 s after the handoff (its
+# import starved at the task's below-normal priority) and cancelled 5,092 orders,
+# then rebuilt 1,000 a cycle. Adopting later is no riskier than the wait itself
+# -- the orders rested unmanaged all along; a cancel-all only throws them away
+# after the fact. 1200 stays under both bounds that keep a kept order sane: its
+# 30-min exchange TTL (the launcher's IMM_ORDER_TTL_SECS=1800) and
+# RESTART_KEEP_MIN_CUTOFF_SECS (no
+# order within 30 min of its cutoff is kept), so nothing adopted is past either.
+RESTART_HANDOFF_MAX_AGE_SECS = _env_int("IMM_RESTART_HANDOFF_MAX_AGE_SECS", 1200)
 # HELD WAVE MARKETS' CLOSING ORDERS RIDE THROUGH TOO (Jack 2026-11-13: "Yes,
 # keep them", on keeping the wave closing orders resting through bot
 # restarts, after "why are my old waves not trying to unwind --
@@ -38557,6 +38607,16 @@ class IncentiveMarketMaker:
         # book. A narrower series band never tightens this screen (unchanged).
         band_lo = min(band_lo, series_price_min(meta.series))
         band_hi = max(band_hi, series_price_max(meta.series))
+        # A LISTED WAVE MARKET is screened on its own list band (Jack 2026-11-13:
+        # "can quote 1-99c, like prior waves"): the after-economic-events FX and
+        # metals wave (w1113-fxmetals) is no family's member, so its 1-99c tails
+        # met the fresh 5-90 screen and 174 of 807 listed markets stood down
+        # "extreme_mid". The election waves' members had their family band. Like
+        # the series band, it never tightens the screen.
+        _wv = wave_entry(meta.ticker, now_utc)
+        if _wv is not None:
+            band_lo = min(band_lo, int(_wv.get("pmin", PVD_PRICE_MIN)))
+            band_hi = max(band_hi, int(_wv.get("pmax", PVD_PRICE_MAX)))
         if sports_ladder_league(meta.series) is not None:
             # the family's EXACT band (0.05-99.5c, subcent_edge_quotes)
             band_lo = min(band_lo, SPORTS_LADDER_PRICE_MIN_EXACT)

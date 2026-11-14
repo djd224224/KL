@@ -333,6 +333,9 @@ if ($Probe) {
     #   "raise to $1M"). The reservation is modelled, not cash ($19.2k cash).
     # - MAX_TOTAL_RESTING 4000 -> 8000: peaked at 3,743 (94%). Untested
     #   above 4,000 resting on Kalshi.
+    # - MAX_TOTAL_RESTING 8000 -> 12000 (Jack 2026-11-13: "yes, but make sure
+    #   restarts dont cancel everything"): 7,128 of 8,000 after the FX + metals
+    #   wave's first 807 markets; at the cap the bot defers EVERY new placement.
     # - MAX_CANDIDATE_BOOKS 5000 -> 10000 (was the code default): peaked at
     #   4,647. More books read per refresh only once the universe grows.
     # - Slot caps were doubled the same afternoon, then REVERTED (Jack
@@ -464,7 +467,7 @@ if ($Probe) {
     # EARNINGS x3 (Jack 2026-10-11: "increase it to 3x"): IMM_EARNINGS_SIZE_MULT_NEXT
     # 2.0 -> 3.0, FROM 2026-10-05 -> 2026-10-11 so the startup line reads true.
     # Env change: needs restart_imm.ps1 -Task.
-    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=8000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=1000000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=8000&& set IMM_NET_LOSS_LIMIT=0&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
+    $ProbeEnv = "set IMM_SCAN_TOP_N=0&& set IMM_FORCE_EVENTS=&&set IMM_BLOCKLIST=KXCRYPTOSTRUCTURE,KXAAAGASW,KXDIESELW&& set IMM_LEVELS=0:20&& set IMM_TEMP_LEVELS=0:20&& set IMM_MAX_POSITION=150&& set IMM_MAX_TOTAL_RESTING=12000&& set IMM_MAX_EVENT=1000&& set IMM_LADDER_MODE=atref&& set IMM_MAX_MARKETS=1000&& set IMM_COLLATERAL_BUDGET=1000000&& set IMM_ORDER_TTL_SECS=1800&& set IMM_ORDER_REFRESH_SECS=1500&& set KALSHI_RATE_LIMIT_MS=25&& set IMM_MAX_PLACEMENTS_PER_CYCLE=1000&& set IMM_HOUR_SIZE_MULT=0-9:2.0&& set IMM_HOUR_SIZE_MULT_NEXT=0-8:3.0&& set IMM_HOUR_SIZE_MULT_FROM=2026-10-05&& set IMM_EARNINGS_SIZE_MULT_NEXT=3.0&& set IMM_EARNINGS_SIZE_MULT_FROM=2026-10-11&& set IMM_SAT_SIZE_MULT=1.5&& set IMM_BENCH_COOLDOWN=3600&& set IMM_MAX_CANDIDATE_BOOKS=10000&& set IMM_DAILY_LOSS_LIMIT=8000&& set IMM_NET_LOSS_LIMIT=0&& set IMM_WS=on&& set IMM_SWEEP_BREAKER=on&& set IMM_SWEEP_HOLD_SECS=600&& set IMM_SWEEP_HOLDOUT=0&& set IMM_TAPE_TRIGGER=ab&& set IMM_TAPE_AB_FRAC=1&& set IMM_WS_CANDIDATES=on&& set IMM_WS_FAST_MIN_GAP_C=10&&"
 }
 
 # SIZE OVERRIDES BY TEXT (Jack 2026-11-08: "allow sizing adjustments too", for

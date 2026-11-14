@@ -2245,6 +2245,22 @@ class TestScreen(unittest.TestCase):
         self.assertIsNone(self.bot._screen(
             _meta(mid_cents=float(imm.MID_BAND_LO)), self.now))
 
+    def test_listed_wave_market_is_screened_on_its_own_band(self):
+        # Jack 2026-11-13: "can quote 1-99c, like prior waves" -- the FX/metals
+        # wave's tails (no family) met the fresh band and stood down extreme_mid
+        stop = self.now + timedelta(days=1)
+        for mid in (1.5, 98.5):
+            m = _meta(mid_cents=mid, spread_cents=1)
+            self.assertEqual(self.bot._screen(m, self.now), "extreme_mid")
+            with mock.patch.dict(imm.PVD_MARKETS, {m.ticker: {"stop": stop, "pmin": 1, "pmax": 99}}):
+                self.assertIsNone(self.bot._screen(m, self.now), mid)
+            # ...never wider than the entry's own band, and an ended entry is no entry
+            with mock.patch.dict(imm.PVD_MARKETS, {m.ticker: {"stop": stop, "pmin": 3, "pmax": 97}}):
+                self.assertEqual(self.bot._screen(m, self.now), "extreme_mid")
+            with mock.patch.dict(imm.PVD_MARKETS, {m.ticker: {"stop": self.now - timedelta(seconds=1),
+                                                               "pmin": 1, "pmax": 99}}):
+                self.assertEqual(self.bot._screen(m, self.now), "extreme_mid")
+
     def test_no_volume_screen_removed_by_default(self):
         # Jack 2026-07-22: dead books can't fill you — rewards without P&L
         # risk. Screen inert at the default (IMM_MIN_VOLUME=0)...
@@ -28263,8 +28279,23 @@ class TestRestartHandoff(unittest.TestCase):
 
     def test_defaults(self):
         self.assertTrue(imm.RESTART_KEEP_ORDERS)
+        # 1200 since 2026-11-13 (Jack: "make sure restarts dont cancel everything"):
+        # under the launcher's 30-min order TTL and the 30-min keep-cutoff floor
         self.assertEqual((imm.RESTART_HANDOFF_MAX_AGE_SECS,
-                          imm.RESTART_KEEP_MIN_CUTOFF_SECS), (300, 1800))
+                          imm.RESTART_KEEP_MIN_CUTOFF_SECS), (1200, 1800))
+        self.assertLess(imm.RESTART_HANDOFF_MAX_AGE_SECS, imm.RESTART_KEEP_MIN_CUTOFF_SECS)
+
+    def test_a_slow_relaunch_still_adopts(self):
+        # 13:05Z 11/13: the relaunch reached the adopt check 426 s after the exit
+        self._write_handoff(426)
+        bot = self._bot()
+        self.assertEqual(bot._adopt_restart_handoff(), 4)
+
+    def test_early_priority_block_runs_only_as_the_bot(self):
+        src = open(imm.__file__, encoding="utf-8").read()
+        i = src.index("# EARLY NORMAL PRIORITY")
+        self.assertLess(i, src.index("import pytz"))           # ahead of the heavy imports
+        self.assertIn('if __name__ == "__main__" and sys.platform == "win32"', src[i:i + 2000])
         self.assertTrue(imm.RESTART_KEEP_WAVE_UNWIND)
 
     def test_exit_hands_over_the_safe_part_of_the_book(self):
