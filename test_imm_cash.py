@@ -149,6 +149,7 @@ class TiedTests(unittest.TestCase):
         self.assertEqual(ev["KXBIG"][1:4], ["Big one", "Fam", "imm"])
         self.assertEqual(ev["KXBIG"][7:9], [50.0, 48.0])
         self.assertEqual(ev["KXWIN-26"][7], 0.7)
+        self.assertEqual(ev["KXWIN-26"][10], 2.7)                          # paid, before the return
         self.assertAlmostEqual(ev["KXWIN-26"][8], 0.76)
         self.assertEqual((out["tied"], out["cost"], out["n_ev"], out["n_mk"]), (50.7, 52.7, 2, 4))
         self.assertEqual(out["mk"][0][:5], ["KXBIG-1", "KXBIG", "Fam", "imm", 100.0])

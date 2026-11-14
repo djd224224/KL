@@ -274,7 +274,8 @@ def tied(positions: dict, exposure: dict, src_of, titles: dict, at: float) -> di
     An event's "freed" is what unwinding it at the touch would bring in:
     every market sold at the bid, less the collateral Kalshi takes back as
     the positions go. Rows: "ev" [event, title, source, group, shard,
-    markets, contracts, tied, freed, value at the mark], top TIED_EVENTS by
+    markets, contracts, tied, freed, value at the mark, paid (the markets'
+    cost before Kalshi's collateral return)], top TIED_EVENTS by
     tied; "mk" [ticker, event, source, group, contracts (+ YES / - NO), avg
     price, cost, bid, ask, freed at the touch, shard], top TIED_MARKETS by
     cost."""
@@ -307,7 +308,7 @@ def tied(positions: dict, exposure: dict, src_of, titles: dict, at: float) -> di
         (name, grp) = max(e["src"].items(), key=lambda kv: kv[1])[0]
         rows.append([ev, (titles or {}).get(ev) or "", name, grp, e["shard"], e["n"],
                      round(e["cts"], 2), round(tie, 2), round(e["exit"] - refund, 2),
-                     round(e["val"] - refund, 2)])
+                     round(e["val"] - refund, 2), round(e["cost"], 2)])
     rows.sort(key=lambda r: -r[7])
     mks.sort(key=lambda r: -r[6])
     return {"at": round(at), "tied": round(sum(r[7] for r in rows), 2),
