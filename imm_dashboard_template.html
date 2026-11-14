@@ -449,6 +449,7 @@ footer { color: var(--muted); font-size: 12px; }
       <a href="#movers">Movers</a>
       <a href="#quoting">Quoting</a>
       <a href="#cash">Cash</a>
+      <a href="#evq">Events</a>
       <a href="#opps">Opportunities<span class="badge" id="bOpp" hidden></span></a>
       <a href="#risk">Risk &amp; halts<span class="badge" id="bRisk" hidden></span></a>
       <a href="#fillday">Fill timing</a>
@@ -518,6 +519,13 @@ footer { color: var(--muted); font-size: 12px; }
     <div class="cashtw"><div class="sub-h">Cash by source<span class="note" id="cashTableNote"></span></div><div class="tw" id="cashTable"></div></div>
     <div class="cashtw"><div class="sub-h">Where the cash is tied up<span class="note" id="tiedNote"></span><span class="grow"></span><div class="seg" id="tiedSeg" role="group" aria-label="Events or markets"></div></div>
       <div class="cash-sum" id="tiedSum"></div><div class="tw" id="tiedTable"></div></div>
+  </section>
+
+  <!-- Jack 2026-11-14: "add a section of running events quoted chronologically by recency, and upcoming events that expect to be quoted" -->
+  <section id="evq">
+    <div class="shead"><h2>Events</h2><span class="note">What the bot is quoting now, newest first, and the programs about to start that it expects to quote.</span></div>
+    <div><div class="sub-h">Quoting now, newest first<span class="note" id="evqNote"></span></div><div class="tw" id="evqLive"></div></div>
+    <div><div class="sub-h">Starting soon<span class="note" id="evqUpNote"></span><span class="grow"></span><div class="seg" id="evqUpSeg" role="group" aria-label="Expected to quote or not"></div></div><div class="tw" id="evqUp"></div></div>
   </section>
 
   <section id="opps">
@@ -598,6 +606,7 @@ footer { color: var(--muted); font-size: 12px; }
         <p class="explain"><b>Mark-outs</b> cover maker fills only (no pads, no taker fills). They are per contract and signed for our side. <i>At fill</i> is the edge: the fill price against the mid of the external book the bot read the cycle before the fill (none on a book 50¢+ wide). <i>5m</i>, <i>30m</i> and <i>4h</i> use the first 5-minute position snapshot at least that long after the fill; a mark must land within 5 minutes for 5m and within 15 minutes otherwise, so a fill that closed the position has none. <i>To date</i> uses Kalshi's settlement, else the bot's mark while it holds the market, else the external mid it quotes against, else Kalshi's touch under the bot's mark rule. <i>Coverage</i> is rewards ÷ what the new fills lost: under 1× the pool does not pay for the flow.</p>
         <p class="explain"><b>Last 7 days</b> and <b>Last 30 days</b> (Drivers) add up the rewards and trading P&amp;L of the 7 and 30 ET days through the window's last day: today so far on a live window, that day on a past one. Rewards follow the basis picked above the table. <i>Per day</i> divides by the days covered, today by its hours so far. <i>Shape</i> is the cumulative net, day by day from 0 at the span's start; hover it for a day's net, rewards and trading. The page keeps 30 days, so a past day's 30 days count only the ones it has (the header's tooltip says how many). The total row covers the whole book, including families with nothing in the window.</p>
         <p class="explain"><b>Cash balance</b> (Cash) is the main account's cash, every shard together, as Kalshi reports it (the numbered subaccounts hold their own). The line runs through Kalshi's actual readings, the 7am portfolio email's snapshots and, from Nov 14, every dashboard build's account read (~10 min), and between them replays every account fill and settlement from the snapshot's positions, as the email replays its day: a fill that opens contracts pays cash out (<i>bought</i>, fees included), one that closes or nets a YES/NO pair pays cash in (<i>sold</i>), a settlement pays its revenue (<i>settled</i>). A fill is the IMM's when its Kalshi fill id is in the bot's own fills log, filed under its family as above; the rest go to the crypto bots, the weather bots or <i>other trades</i> (hand trades, the other bots) by series. What no record explains, reading to reading: <i>deposits &amp; transfers</i> (the move in the all-time deposited and withdrawn totals, and moves to and from the subaccounts), then <i>collateral</i> (the change in what Kalshi hands back on open mutually exclusive and nested positions), then the rest, <i>reward credits</i> (almost all of it Kalshi's ~6:15 AM batch; anything else with no record lands there too). Those land on the reading that shows them, so before the 10-minute readings began they sit on the 7am snapshot. The path ties to every reading to the cent, and the 7am-to-7am day reproduces the email's trading cash and reward credits. <b>Where the cash is tied up</b> lists the open positions of the whole account at the newest account read, whatever the window: <i>paid</i> is what its open positions cost; <i>cash tied</i> is Kalshi's exposure on the event, that cost less the collateral Kalshi hands back on mutually exclusive and nested ones (a market row shows its own cost); <i>freed now</i> is selling every position at today's touch (the bid of the side held, top of book only, so a big position would get less) less the collateral Kalshi takes back as the positions go.</p>
+        <p class="explain"><b>Events</b>: <i>quoting now</i> lists every event with an order resting in the bot's last cycle (pad orders aside), newest first. <i>Quoting since</i> is the start of its current run: the first cycle with something resting after any idle gap of 3+ hours (shorter gaps, like Kalshi's Thursday pause, carry the run over); a time marked ~ is estimated from the resting time in its first hour, for days the page read before it kept exact starts. <i>First quoted</i> is its first quote in the 30 days of cycle logs the page reads. <i>Starting soon</i> is Kalshi's upcoming-programs feed as the 7am new-programs email judges it (imm_upcoming), re-read every 30 minutes: one row per series, its verdict as of the program start (<i>yes</i> = allowlisted, the screens pass and the projection clears the payout bar, though the fair gates in the quote loop still apply; <i>maybe</i> = allowed, but the book, a Carbon Arc check or the open-market check can only be settled at the start), and <i>Est $</i> = the bot's estimator on today's book over its quotable days, which leans high because books fill once a program starts.</p>
         <p class="explain"><b>Exp. net/day</b> is a model: the rewards the bot's estimator gives the quotes resting now, plus the family's average trading P&amp;L per day over the last 7 days. <b>Typical day</b> is the family's mean net per complete ET day over the 7 and 30 days before the window. The σ mark flags a window 1.5+ standard deviations from that mean, pro-rated to the window's length.</p>
         <p class="explain"><b>Worst case</b> is the loss from today's marks to settlement if everything goes against the book. It is netted inside an event: across its strikes when every market prices the same number (greater / less / between), and across names when Kalshi marks the event mutually exclusive. Mention words and anything whose structure has not been read count in full. Summed across events, it assumes every event goes wrong at once. On a past day it is the book at that day's close.</p>
         <p class="explain"><b>Paid rate</b> is what Kalshi credited per dollar of modeled reward on settled events (imm_reward_recon's calibration). The <i>raw</i> basis covers the $1 per-market-per-period floor and the model error together. The older <i>floored</i> basis covers the model error only. Account credits include other bots quoting the same markets, which can push a family above 1×.</p>
@@ -2210,6 +2219,56 @@ function renderTied() {
     ], rows, { sortKey: "cost", dir: -1, limit: 15, empty: Q ? "No market matches the filter." : "No open positions." });
   }
 }
+/* ======================= events: running + upcoming ======================= */
+let evqUp = store("imm.evqUp") || "yes";
+function whenCell(ts, exact, sub) {
+  if (!ts) return '<span class="muted">—</span>';
+  return '<div class="cell-main"><span' + (exact ? "" : ' title="estimated from the resting time in its first hour (a cycle log read before the exact start was kept)"') + ">" + (exact ? "" : "~") + esc(dtET(ts)) + '</span><span class="t2">' + esc(sub != null ? sub : ago(ts)) + "</span></div>";
+}
+function renderEvq() {
+  const E = D.evq;
+  if (!E) { $("evqLive").innerHTML = '<div class="empty">Not in this build.</div>'; $("evqUp").innerHTML = ""; return; }
+  const live = E.live.filter((r) => matchQ(r.ev, r.fam, r.grp, r.what));
+  const nNew = E.live.filter((r) => !r.older && r.first != null && r.since - r.first < 60).length;
+  $("evqNote").textContent = fmtNum(E.live.length) + " events resting a quote in the bot's last cycle" + (nNew ? ", " + nNew + " quoted for the first time in " + E.hist_days + " days" : "") + "; a run carries over idle gaps under " + E.gap_h + " h (the Thursday pause)";
+  table($("evqLive"), [
+    // a run that reaches back to the first log read (since === first) began before it
+    { k: "since", label: "Quoting since", title: "the start of its current run of quoting: the first cycle with an order resting, after any idle gap of " + E.gap_h + "+ hours", fmt: (r) => r.older && r.since === r.first ? '<div class="cell-main"><span class="muted">' + E.hist_days + "+ days</span><span class=\"t2\">before the logs read</span></div>" : whenCell(r.since, r.ex) },
+    { k: "ev", label: "Event", fmt: (r) => '<div class="cell-main"><span class="mono">' + esc(r.ev) + "</span>" + (r.what ? '<span class="t2">' + esc(r.what) + "</span>" : "") + "</div>" },
+    { k: "fam", label: "Family", fmt: (r) => esc(r.fam) },
+    { k: "first", label: "First quoted", title: "its first quote in the " + E.hist_days + " days of cycle logs the page reads", sort: (r) => r.older ? 0 : r.first,
+      fmt: (r) => r.older ? '<span class="muted">' + E.hist_days + "+ days</span>" : (r.since - r.first < 60 ? '<span class="tag good">new</span>' : esc(dtET(r.first))) },
+    { k: "nq", label: "Quoting", num: true, title: "markets resting a quote now, of the markets in its program (two-sided in the tooltip)", fmt: (r) => '<span title="' + r.two + ' two-sided">' + fmtNum(r.nq) + '<span class="muted">/' + fmtNum(r.n) + "</span></span>" },
+    { k: "usd", label: "Resting $", num: true, fmt: (r) => fmtUSD(r.usd) },
+    { k: "est", label: "Est $/day", num: true, title: "the bot's modeled reward a day on it now", fmt: (r) => fmtUSD(r.est) },
+    { k: "pool", label: "Pool $/day", num: true, fmt: (r) => fmtUSD(r.pool) },
+    { k: "end", label: "Program ends", title: "its reward program's end", fmt: (r) => r.end ? esc(dtET(r.end)) + '<span class="t2 muted"> ' + esc(ago(r.end)) + "</span>" : '<span class="muted">—</span>' },
+  ], live, { presort: (a, b) => (b.since || 0) - (a.since || 0), limit: 25, empty: Q ? "No event matches the filter." : "Nothing is resting a quote." });
+
+  const U = E.up, host = $("evqUp"), seg = $("evqUpSeg");
+  if (!U) {
+    seg.innerHTML = "";
+    $("evqUpNote").textContent = "";
+    host.innerHTML = '<div class="empty">' + esc(E.up_off ? "Built with --no-api: the upcoming-programs feed was skipped." : "No upcoming-programs read yet" + (E.up_err ? ": " + E.up_err : ".")) + "</div>";
+    return;
+  }
+  seg.innerHTML = [["yes", "Expected to quote (" + U.rows.length + ")"], ["no", "Not expected (" + U.n_no + ")"]].map((x) => '<button type="button" data-v="' + x[0] + '" aria-pressed="' + (x[0] === evqUp) + '">' + esc(x[1]) + "</button>").join("");
+  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { evqUp = b.dataset.v; store("imm.evqUp", evqUp); delete TSTATE.evqUp; renderEvq(); }));
+  $("evqUpNote").textContent = "Kalshi's upcoming programs over the next " + Math.round(U.horizon_days) + " days, read " + ago(E.up_at) + (E.up_err ? " (refresh failed: " + E.up_err + ")" : "") + "; one row per series, the 7am email's verdict as of its start (yes = admitted, the fair gates still apply; maybe = only the start can tell)" + (U.renewals && U.renewals[0] ? "; " + fmtNum(U.renewals[0]) + " markets paying now just renew" : "");
+  const rows = (evqUp === "no" ? U.no : U.rows).filter((r) => matchQ(r.series, r.label, r.fam, r.grp, r.events.join(" ")));
+  const kindTag = (r) => '<span class="tag ' + (r.kind === "yes" ? "good" : r.kind === "maybe" ? "info" : "") + '">' + esc(r.kind) + "</span>";
+  table(host, [
+    { k: "start", label: "Starts", fmt: (r) => whenCell(r.start, true) },
+    { k: "label", label: "Series", sort: (r) => r.series, fmt: (r) => '<div class="cell-main"><span class="mono" title="' + esc(r.events.join(", ") + (r.n_ev > r.events.length ? ", …" : "")) + '">' + esc(r.label) + '</span><span class="t2">' + esc(r.fam) + "</span></div>" },
+    { k: "kind", label: "Quote?", sort: (r) => ({ yes: 2, maybe: 1, no: 0 })[r.kind], fmt: (r) => kindTag(r) + ' <span class="small ink2">' + esc(r.quote.replace(/^(yes|maybe|no) ?/, "")) + "</span>" },
+    { k: "n", label: "Mkts", num: true, fmt: (r) => fmtNum(r.n) },
+    { k: "pool_day", label: "Pool $/day", num: true, fmt: (r) => fmtUSD(r.pool_day) },
+    { k: "pool", label: "Pool", num: true, title: "the whole reward pool over its program", fmt: (r) => fmtUSD(r.pool, { dp: 0 }) },
+    { k: "est", label: "Est $", num: true, title: "the bot's estimator on today's book: day-size $/day over its quotable days from the start (~ = some markets extrapolated; proxy = no book read). Books fill once a program starts, so it leans high: it ranks, it does not promise", fmt: (r) => (r.est_src === "~" ? "~" : "") + fmtUSD(r.est, { dp: r.est < 10 ? 2 : 0 }) + (r.est_src === "proxy" ? ' <span class="muted small">proxy</span>' : "") },
+    { k: "end", label: "Ends", fmt: (r) => esc(dtET(r.end)) },
+  ], rows, { presort: (a, b) => a.start - b.start, limit: 25, empty: Q ? "No series matches the filter." : (evqUp === "no" ? "Every upcoming series is expected to quote." : "No upcoming program the bot expects to quote.") });
+}
+
 function renderCashTable(M) {
   const host = $("cashTable");
   $("cashTableNote").textContent = "what each family and bot paid out and took in over the window; click a row to chart it alone" + (cashSel ? " (click it again for all)" : "");
@@ -3367,6 +3426,7 @@ function renderAll() {
   renderMovers();
   renderQuoting();
   renderCash();
+  renderEvq();
   renderOpps();
   renderRisk();
   renderFillDay();

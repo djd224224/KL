@@ -162,6 +162,12 @@ PROMISING_LEFT = float(os.environ.get("IMM_DASH_PROMISING_LEFT", "500"))
 # UNQUOTED_TAPE_SERIES new tapes a pass (the weekly email reads the rest;
 # both keep the tapes in CACHE_DIR).
 UNQUOTED_TTL_MIN = float(os.environ.get("IMM_DASH_UNQUOTED_TTL_MIN", "180"))
+# the Events section (Jack 2026-11-14: "add a section of running events quoted
+# chronologically by recency, and upcoming events that expect to be quoted"):
+# a run of quoting survives this many idle hours (the Thursday pause is 2)
+RUN_GAP_HOURS = int(os.environ.get("IMM_DASH_RUN_GAP_HOURS", "3"))
+# imm_upcoming's assessment (the morning email's "Upcoming programs"), re-read
+UPCOMING_TTL_MIN = float(os.environ.get("IMM_DASH_UPCOMING_TTL_MIN", "30"))
 # (11/01: the series whose call can turn on the estimate needed 234 of the
 # 977 quotable books; the owned / live / insider ones read last, if at all)
 UNQUOTED_MAX_BOOKS = int(os.environ.get("IMM_DASH_UNQUOTED_MAX_BOOKS", "300"))
@@ -789,6 +795,63 @@ def series_sizes(imm, series) -> dict:
     return out
 
 
+def event_runs(rest, rs, ev_of, now: float, gap_h: int = RUN_GAP_HOURS) -> dict:
+    """The Events section's run starts (Jack 2026-11-14: "add a section of
+    running events quoted chronologically by recency").
+
+    rest: {ticker: {utc_hour: resting $-seconds}}; rs: {ticker: {utc_hour:
+    the hour's first resting cycle}} (parse_cycle_file); ev_of: ticker ->
+    event. Per event with anything resting: {"since": epoch, "exact": bool,
+    "first": epoch, "older": bool}.
+      since  the start of its newest run: the newest stretch of hours with
+             something resting, gaps under gap_h idle hours bridged. The
+             first resting cycle of the run's first hour when the cycle log's
+             parse kept it (rs); else estimated from that hour's resting
+             $-seconds against the next full hour's (exact False), or the
+             hour's start.
+      first  its first resting hour in the history read (same rule);
+             older = it was resting in the history's first hour already."""
+    ev_rest = defaultdict(lambda: defaultdict(float))
+    ev_rs = defaultdict(dict)
+    h_hist = None
+    for t, hs in rest.items():
+        e = ev_of(t)
+        d = ev_rest[e]
+        for h, v in hs.items():
+            if v > 0:
+                d[h] += v
+                h_hist = h if h_hist is None or h < h_hist else h_hist
+        for h, v in (rs.get(t) or {}).items():
+            r = ev_rs[e]
+            if h not in r or v < r[h]:
+                r[h] = v
+    h_now = int(now // 3600)
+
+    def start_of(e, h0):
+        hs, r = ev_rest[e], ev_rs.get(e) or {}
+        if h0 in r:
+            return float(r[h0]), True
+        nxt = hs.get(h0 + 1)
+        if nxt and h0 + 1 < h_now:
+            frac = min(1.0, hs[h0] / nxt)
+            return (h0 + 1) * 3600.0 - frac * 3600.0, False
+        return h0 * 3600.0, False
+
+    out = {}
+    for e, hs in ev_rest.items():
+        hours = sorted(hs)
+        if not hours:
+            continue
+        i = len(hours) - 1
+        while i > 0 and hours[i] - hours[i - 1] - 1 < gap_h:
+            i -= 1
+        since, exact = start_of(e, hours[i])
+        first, _x = start_of(e, hours[0])
+        out[e] = {"since": since, "exact": exact, "first": first,
+                  "older": hours[0] == h_hist}
+    return out
+
+
 def fill_day_payload(rest, fam_of, h0: int, h1: int, now: float, mult_of=None) -> dict:
     """Hourly context for the "Fills through the day" section.
 
@@ -1241,11 +1304,15 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
          last    {ticker: row dict} of the last FULL cycle (keep_last only)
          fine    {ticker: {cycle epoch: est $}}    the same accrual per cycle,
                  for the cycles at or after fine_from (the Movers' short windows)
+         rs      {ticker: {utc_hour: epoch}}       the hour's first cycle with
+                 something resting (the Events section's run starts; files
+                 cached before 2026-11-14 lack it)
     The accrual reproduces imm_reward_recon._scan_cycle_log: each cycle is
     credited with est_frac x pool_per_day over the gap since the previous
     cycle, capped at max_dt, and lands in the UTC hour of its own timestamp."""
     hourly = defaultdict(lambda: defaultdict(float))
     rest = defaultdict(lambda: defaultdict(float))
+    rs = defaultdict(dict)
     fine = defaultdict(dict)
     cycles, runs = [], {}
     prev_ts = cur_ts = None
@@ -1264,11 +1331,13 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
                     d[key] = d.get(key, 0.0) + v
             if rc:
                 rest[tkr][hour] += rc / 100.0 * dt
+                rs[tkr].setdefault(hour, int(ts))
 
     try:
         f = open(path, newline="", encoding="utf-8", errors="replace")
     except OSError:
-        return {"hourly": {}, "rest": {}, "cycles": [], "runs": {}, "last": {}, "fine": {}}
+        return {"hourly": {}, "rest": {}, "cycles": [], "runs": {}, "last": {}, "fine": {},
+                "rs": {}}
     with f:
         rdr = csv.reader(f)
         # rows the bot writes while this build runs are after the build's "now":
@@ -1332,7 +1401,8 @@ def parse_cycle_file(path: str, keep_last: bool = False, max_dt: float = MAX_DT,
             last[tkr] = d
     return {"hourly": {t: dict(h) for t, h in hourly.items()},
             "rest": {t: dict(h) for t, h in rest.items()},
-            "cycles": cycles, "runs": runs, "last": last, "fine": dict(fine)}
+            "cycles": cycles, "runs": runs, "last": last, "fine": dict(fine),
+            "rs": dict(rs)}
 
 
 # ----------------------------------------------------------------------------
@@ -2023,6 +2093,31 @@ def fetch_unquoted(gaps, imm, now_utc, rows):
     return res
 
 
+def fetch_upcoming(gaps, imm, now_utc, active):
+    """The Events section's upcoming half: imm_upcoming's assessment (the
+    7am new-programs email's "Upcoming programs"), one row per series, the
+    datetimes as epochs. active = every market paying now (its next period
+    is a renewal, not listed)."""
+    import imm_upcoming as iu
+    client = imm.build_client()
+    up = iu.build(client, set(active), now_utc)
+    rows = []
+    for e in up["rows"]:
+        rows.append({
+            "series": e["series"], "label": e["label"], "events": e["events"][:40],
+            "n_ev": len(e["events"]), "n": e["n"], "n_yes": e["n_yes"],
+            "n_maybe": e["n_maybe"], "n_no": e["n_no"], "kind": e["kind"],
+            "why_maybe": e["why_maybe"], "why_no": e["why_no"], "quote": iu.quote_cell(e),
+            "pool": round(e["pool"], 2), "pool_day": round(e["pool_day"], 2),
+            "start": e["start"].timestamp(), "end": e["end"].timestamp(),
+            "est": round(e["est_total"], 2),
+            "est_day": None if e["est_day"] is None else round(e["est_day"], 2),
+            "est_src": e["est_src"]})
+    return {"rows": rows, "renewals": list(up["renewals"]), "n_new": up["n_new_markets"],
+            "n_events": up["n_events"], "books": up["books"],
+            "horizon_days": up["horizon_days"]}
+
+
 def fetch_pickoff(gaps, imm, now_utc):
     import imm_pickoff
     client = imm.build_client()
@@ -2112,6 +2207,8 @@ class Builder:
         self.env = {}
         self.fine, self.fine_snaps = {}, []
         self.cash_live = None         # the account read's cash extras (cash_extras)
+        self.progs = None             # the programs feed, once _opportunities read it
+        self.upcoming_fn = None       # tests inject () -> fetch_upcoming's payload
 
     def _t(self, name, t0):
         self.timing[name] = round(time.time() - t0, 2)
@@ -2127,6 +2224,7 @@ class Builder:
         cache = FileCache("cycle")
         self.hourly = defaultdict(lambda: defaultdict(float))
         self.rest = defaultdict(lambda: defaultdict(float))
+        self.rs = defaultdict(dict)       # {ticker: {utc_hour: first resting cycle}}
         self.fine = defaultdict(dict)    # {ticker: {cycle epoch: est $}} since fine_from
         fine_from = self.now - FINE_SPAN
         self.cycles, self.runs = [], {}
@@ -2166,6 +2264,11 @@ class Builder:
                 d = self.rest[t]
                 for h, v in hs.items():
                     d[h] += v
+            for t, hs in (val.get("rs") or {}).items():
+                d = self.rs[t]
+                for h, v in hs.items():
+                    if h not in d or v < d[h]:
+                        d[h] = v
             self.cycles.extend(val["cycles"])
             for rid, r in val["runs"].items():
                 cur = self.runs.get(rid)
@@ -3614,6 +3717,9 @@ class Builder:
 
         health = self._health(cycle_ts)
         opp = self._opportunities(selected, cur) if self.api else {"off": True}
+        t1 = time.time()
+        evq = self._evq(cur, markets)
+        self._t("evq", t1)
         proj = self.projection(snap_by_t, cycle_ts)     # after the API import: the size schedule
         # fills through the day: resting $ per family per hour + the size schedule
         fday = fill_day_payload(
@@ -3641,6 +3747,7 @@ class Builder:
             "struct_cover": self._struct_cover(held),
             "sizes": series_sizes(_imm_mod, {m["ser"] for m in markets.values()}),
             "fills": fills_out, "fday": fday, "halts": halts, "health": health, "opp": opp,
+            "evq": evq,
             "exits": [{"ts": round(e["ts"]), "t": e["t"], "pos": round(e["pos"], 2),
                        "avg": round(e["avg"], 2), "mark": round(e["mark"], 2),
                        "kind": e["kind"], "label": e["label"], "amount": round(e["amount"], 2),
@@ -3686,6 +3793,67 @@ class Builder:
         # (parse_marks_file), at the bot's own marks before it
         model["last_from"] = round(self.switch[0]) if self.switch else None
         return model
+
+    def _evq(self, cur, markets):
+        """D.evq, the Events section (Jack 2026-11-14: "add a section of
+        running events quoted chronologically by recency, and upcoming events
+        that expect to be quoted"). "live": every event resting a quote now
+        (the last cycle, pads aside), newest run first (event_runs); "up":
+        fetch_upcoming's rows that expect to quote (yes / maybe), soonest
+        first, plus the biggest "no" ones, re-read every UPCOMING_TTL_MIN in
+        an API build."""
+        runs = event_runs(self.rest, self.rs, event_of, self.now)
+        progs = self.progs or {}
+        by_ev = defaultdict(list)
+        for t, c in cur.items():
+            if c["q"] > 0:
+                by_ev[event_of(t)].append(t)
+        live = []
+        for ev, ts in by_ev.items():
+            r = runs.get(ev) or {}
+            p = progs.get(ev) or {}
+            m0 = markets.get(ts[0]) or {}
+            live.append({
+                "ev": ev, "fam": m0.get("fam") or family_of(series_of(ts[0]))[0],
+                "grp": m0.get("grp"), "what": p.get("what") or "",
+                "since": round(r["since"]) if r else None, "ex": 1 if r.get("exact") else 0,
+                "first": round(r["first"]) if r else None, "older": 1 if r.get("older") else 0,
+                "nq": len(ts), "n": p.get("n") or len(ts),
+                "two": sum(1 for t in ts if cur[t]["q"] == 2),
+                "usd": round(sum(cur[t]["usd"] for t in ts), 2),
+                "est": round(sum(cur[t]["est_day"] for t in ts), 2),
+                "pool": round(p["pool_day"], 2) if p.get("pool_day") is not None
+                else round(sum(cur[t]["pool_day"] for t in ts), 2),
+                "end": round(p["end"]) if p.get("end") else None,
+            })
+        live.sort(key=lambda x: -(x["since"] or 0))
+        out = {"live": live, "hist_days": HISTORY_DAYS, "gap_h": RUN_GAP_HOURS, "up": None,
+               "up_at": None, "up_err": None, "up_off": not self.api}
+        if self.upcoming_fn is not None:
+            up, out["up_at"], out["up_err"] = self.upcoming_fn(), self.now, None
+        elif self.api and progs:
+            gaps, imm = _import_imm()
+            if gaps is None:
+                return out
+            now_utc = datetime.fromtimestamp(self.now, timezone.utc)
+            active = {t for rec in progs.values() for t in rec.get("tickers") or []}
+            up, out["up_at"], out["up_err"] = _api_cached(
+                "upcoming", UPCOMING_TTL_MIN, self.api_force,
+                lambda: fetch_upcoming(gaps, imm, now_utc, active))
+        else:
+            return out
+        if up:
+            rows = [r for r in up["rows"] if r["end"] > self.now]
+            for r in rows:
+                r["fam"], r["grp"] = family_of(r["series"])
+            keep = [r for r in rows if r["kind"] in ("yes", "maybe")]
+            no = [r for r in rows if r["kind"] == "no"]
+            no.sort(key=lambda r: -r["est"])
+            out["up"] = dict({k: v for k, v in up.items() if k != "rows"},
+                             rows=sorted(keep, key=lambda r: r["start"]),
+                             no=sorted(no[:60], key=lambda r: r["start"]), n_no=len(no),
+                             no_pool=round(sum(r["pool"] for r in no), 2))
+        return out
 
     def _account(self, model):
         """D.acct, the Health tab's account card: "live" = account_now
@@ -4039,6 +4207,7 @@ class Builder:
         now_utc = datetime.fromtimestamp(self.now, timezone.utc)
         progs, p_at, p_err = _api_cached("programs", PROGRAMS_TTL_MIN, self.api_force,
                                          lambda: fetch_programs(gaps, imm, now_utc))
+        self.progs = progs                  # the Events section's titles and windows
         if progs:                           # a new launch's series files by its category too
             self.refresh_series_meta({r["series"] for r in progs.values()})
         reg_path = os.path.join(DASH_DIR, "programs_seen.json")

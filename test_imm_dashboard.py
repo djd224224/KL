@@ -574,6 +574,21 @@ class CycleParseTests(unittest.TestCase):
         self.assertEqual(list(late["fine"]["KXA-1"]), [int(_ts("2026-09-28T04:01:00Z"))])
 
 
+    def test_rs_keeps_each_hours_first_resting_cycle(self):
+        # the Events section's run starts: the first cycle of each hour with
+        # an order resting (a cycle is credited when the next one arrives)
+        path = self._write([
+            self._row("2026-09-28T04:00:00Z", "KXA-1", 0.1, 864, 0, 0),
+            self._row("2026-09-28T04:10:00Z", "KXA-1", 0.1, 864, 0, 0),
+            self._row("2026-09-28T04:20:00Z", "KXA-1", 0.1, 864, 10, 0, 40, ""),
+            self._row("2026-09-28T04:30:00Z", "KXA-1", 0.1, 864, 10, 0, 40, ""),
+            self._row("2026-09-28T05:05:00Z", "KXA-1", 0.1, 864, 10, 0, 40, ""),
+        ])
+        out = dash.parse_cycle_file(path)
+        h4 = int(_ts("2026-09-28T04:00:00Z") // 3600)
+        self.assertEqual(out["rs"]["KXA-1"], {h4: int(_ts("2026-09-28T04:20:00Z")),
+                                              h4 + 1: int(_ts("2026-09-28T05:05:00Z"))})
+
 class NewEventGroupTests(unittest.TestCase):
     NOW = _ts("2026-09-28T20:00:00Z")
 
@@ -1154,6 +1169,47 @@ class RenderTests(unittest.TestCase):
         self.assertIn("<\\/script>", body.split("\n", 1)[0])
 
 
+class EventRunsTests(unittest.TestCase):
+    """Jack 2026-11-14: "add a section of running events quoted
+    chronologically by recency"."""
+
+    H = int(_ts("2026-11-14T00:00:00Z") // 3600)
+
+    def runs(self, rest, rs=None, now_h=20):
+        return dash.event_runs(rest, rs or {}, lambda t: t.rsplit("-", 1)[0],
+                               (self.H + now_h) * 3600.0 + 600, gap_h=3)
+
+    def test_the_newest_run_with_short_gaps_bridged(self):
+        H = self.H
+        rest = {"KXA-1": {H + 1: 3600.0, H + 2: 3600.0,
+                          # 3 idle hours (H+3..H+5): a new run from H+6
+                          H + 6: 900.0, H + 7: 3600.0,
+                          # 2 idle hours (the Thursday pause): the same run
+                          H + 10: 3600.0},
+                "KXA-2": {H + 6: 0.0}}
+        rs = {"KXA-1": {H + 6: (H + 6) * 3600 + 2700}}
+        r = self.runs(rest, rs)["KXA"]
+        self.assertEqual(r["since"], (H + 6) * 3600.0 + 2700)
+        self.assertTrue(r["exact"])
+        self.assertEqual(r["first"], (H + 1) * 3600.0)         # no rs for H+1, next hour full
+        self.assertTrue(r["older"])                           # the history's first hour
+
+    def test_without_rs_the_start_is_estimated_from_the_first_hours_share(self):
+        H = self.H
+        rest = {"KXB-1": {H + 4: 900.0, H + 5: 3600.0}, "KXC-1": {H + 2: 7200.0}}
+        out = self.runs(rest)
+        self.assertEqual(out["KXB"]["since"], (H + 5) * 3600.0 - 900.0)   # a quarter of H+4
+        self.assertFalse(out["KXB"]["exact"])
+        self.assertFalse(out["KXB"]["older"])
+        # no full hour after it: the hour's start
+        late = self.runs({"KXD-1": {H + 20: 100.0}, "KXC-1": {H + 2: 1.0}})["KXD"]
+        self.assertEqual(late["since"], (H + 20) * 3600.0)
+        # several markets: the event's earliest
+        two = self.runs({"KXE-1": {H + 8: 10.0}, "KXE-2": {H + 8: 10.0}, "KXC-1": {H: 1.0}},
+                        {"KXE-1": {H + 8: (H + 8) * 3600 + 900}, "KXE-2": {H + 8: (H + 8) * 3600 + 60}})
+        self.assertEqual(two["KXE"]["since"], (H + 8) * 3600.0 + 60)
+
+
 class BuilderIntegrationTests(unittest.TestCase):
     """One synthetic ET day through the whole Builder."""
 
@@ -1297,6 +1353,34 @@ class BuilderIntegrationTests(unittest.TestCase):
         self.assertEqual(by[("Reward credits", "reward")], 5.5)        # 1000 -> 1000 less -5.5 of moves
         self.assertEqual(C["path"][-1], [round(a1["ts"]), 1000.0])
         self.assertNotIn("cash", m["acct"].get("live") or {})
+
+    def test_events_section_lists_the_quoted_event_and_the_upcoming_ones(self):
+        # Jack 2026-11-14: "add a section of running events quoted
+        # chronologically by recency, and upcoming events that expect to be
+        # quoted"
+        b = dash.Builder(self.NOW, api=False, api_force=False)
+        up = lambda k, s, start: {"series": s, "label": s + "-X", "events": [s + "-X"], "n_ev": 1,
+                                  "n": 3, "n_yes": 3 if k == "yes" else 0,
+                                  "n_maybe": 3 if k == "maybe" else 0, "n_no": 3 if k == "no" else 0,
+                                  "kind": k, "why_maybe": "", "why_no": "", "quote": k,
+                                  "pool": 300.0, "pool_day": 100.0, "start": start,
+                                  "end": self.NOW + 5 * 86400, "est": 4.0, "est_day": 1.0,
+                                  "est_src": ""}
+        b.upcoming_fn = lambda: {"rows": [up("yes", "KXLATE", self.NOW + 7200),
+                                          up("maybe", "KXSOON", self.NOW + 600),
+                                          up("no", "KXNOPE", self.NOW + 60)],
+                                 "renewals": [4, 50.0], "n_new": 9, "n_events": 3, "books": 3,
+                                 "horizon_days": 14.0}
+        E = b.build()["evq"]
+        self.assertEqual([r["ev"] for r in E["live"]], ["KXA"])
+        r = E["live"][0]
+        # the fixture's first credited cycle is 04:00:30Z (the 04:00:00 one has no gap before it)
+        self.assertEqual((r["since"], r["ex"], r["nq"], r["two"]), (round(_ts("2026-09-28T04:00:30Z")), 1, 1, 1))
+        self.assertEqual(r["first"], r["since"])
+        self.assertEqual([x["series"] for x in E["up"]["rows"]], ["KXSOON", "KXLATE"])     # soonest first
+        self.assertEqual([x["series"] for x in E["up"]["no"]], ["KXNOPE"])
+        self.assertEqual(E["up"]["n_no"], 1)
+        json.dumps(E)
 
     def test_halts_and_guards(self):
         m = dash.Builder(self.NOW, api=False, api_force=False).build()
