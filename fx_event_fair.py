@@ -77,6 +77,11 @@ VOL_ERR = 0.25                   # pvd_wave_tune --fair-vol-err
 REQUOTE_MIN = 3.0                # how long a quote may rest before the bot requotes it
 REQUOTE_SD = 2.0                 # weekday margin: this many sd of the source's move over REQUOTE_MIN
 JUMP_SD = 0.35                   # a move > this x the daily sigma inside the window = a jump (BTC 1% ~ 0.36)
+# A WIDE BOOK'S MID IS NOT A PRICE (2026-11-14, first live hour): Bitso's weekend USD/MXN book
+# flickers -- its spread 0.005% <-> 0.29% as the ask side thins, the mid 0.23% in 3 min -- and
+# tripped the jump hold (0.27%) on noise. A read whose spread is wider than MAX_SPREAD is not
+# taken; the series keeps its last good price, and a book wide past the gate's TTL stands it aside.
+MAX_SPREAD = 0.0012
 JUMP_WINDOW_SECS = 300
 JUMP_HOLD_SECS = 300
 
@@ -123,6 +128,9 @@ def fetch_mids(get: Callable = None) -> Tuple[Dict[str, float], Dict[str, str]]:
             if not (0 < b <= a):
                 err[s] = f"kraken:{pair} bad book {b} / {a}"
                 continue
+            if (a - b) / ((a + b) / 2) > MAX_SPREAD:
+                err[s] = f"kraken:{pair} book {100 * (a - b) / ((a + b) / 2):.2f}% wide"
+                continue
             out[s] = (b + a) / 2
     except Exception as e:  # noqa: BLE001
         for s in by_src.get("kraken", []):
@@ -133,6 +141,9 @@ def fetch_mids(get: Callable = None) -> Tuple[Dict[str, float], Dict[str, str]]:
             b, a = float(t["bid"]), float(t["ask"])
             if not (0 < b <= a):
                 raise ValueError(f"bad book {b} / {a}")
+            if (a - b) / ((a + b) / 2) > MAX_SPREAD:
+                err[s] = f"bitso:{PROXY[s][1]} book {100 * (a - b) / ((a + b) / 2):.2f}% wide"
+                continue
             out[s] = (b + a) / 2
         except Exception as e:  # noqa: BLE001
             err[s] = f"bitso: {type(e).__name__}: {str(e)[:80]}"
@@ -361,6 +372,7 @@ class FxEventWatch:
             "close_at": t0.strftime("%Y-%m-%dT%H:%MZ"), "reopen": reopen.strftime("%Y-%m-%dT%H:%MZ"),
             "series": ser, "markets": mk, "errors": errors,
             "model": {"vol_err": VOL_ERR, "requote_min": REQUOTE_MIN, "requote_sd": REQUOTE_SD,
+                      "max_spread": MAX_SPREAD,
                       "jump_sd": JUMP_SD, "jump_window_s": JUMP_WINDOW_SECS, "jump_hold_s": JUMP_HOLD_SECS,
                       "cutoff_h": CUTOFF_H, "floor": WEEKDAY_FLOOR if weekday else WEEKEND_FLOOR},
         }

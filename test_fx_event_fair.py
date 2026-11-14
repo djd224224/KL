@@ -189,16 +189,46 @@ class Mids(unittest.TestCase):
                 return [{"universe": [{"name": n} for n in names]},
                         [{"midPx": str(i + 1.5)} for i in range(len(names))]]
             if "kraken" in url:
-                return {"error": [], "result": {"AUDUSD": {"b": ["0.674"], "a": ["0.676"]},
-                                                "ZUSDZCAD": {"b": ["1.430"], "a": ["1.432"]}}}
-            return {"payload": {"bid": "18.68", "ask": "18.72"}}
+                return {"error": [], "result": {"AUDUSD": {"b": ["0.6745"], "a": ["0.6747"]},
+                                                "ZUSDZCAD": {"b": ["1.4305"], "a": ["1.4307"]}}}
+            return {"payload": {"bid": "18.695", "ask": "18.705"}}
         mids, err = fx.fetch_mids(get)
         self.assertEqual(err, {})
         self.assertEqual(len(calls), 3)
         self.assertAlmostEqual(mids["KXGOLDEVENT"], 1.5)
-        self.assertAlmostEqual(mids["KXUSDCADEVENT"], 1.431)
-        self.assertAlmostEqual(mids["KXAUDUSDEVENT"], 0.675)
+        self.assertAlmostEqual(mids["KXUSDCADEVENT"], 1.4306)
+        self.assertAlmostEqual(mids["KXAUDUSDEVENT"], 0.6746)
         self.assertAlmostEqual(mids["KXUSDMXNEVENT"], 18.70)
+
+    def test_a_wide_book_is_not_a_price(self):
+        # Bitso's weekend USD/MXN: the spread flickered 0.005% <-> 0.29% and the mid with it
+        def get(url, body=None):
+            if "hyperliquid" in url:
+                return [{"universe": [{"name": "xyz:GOLD"}]}, [{"midPx": "3800"}]]
+            if "kraken" in url:
+                return {"error": [], "result": {"AUDUSD": {"b": ["0.6743"], "a": ["0.6749"]},
+                                                "ZUSDZCAD": {"b": ["1.4300"], "a": ["1.4330"]}}}
+            return {"payload": {"bid": "18.6760", "ask": "18.7230"}}
+        mids, err = fx.fetch_mids(get)
+        self.assertNotIn("KXUSDMXNEVENT", mids)
+        self.assertIn("0.25% wide", err["KXUSDMXNEVENT"])
+        self.assertNotIn("KXUSDCADEVENT", mids)                  # 0.21% wide
+        self.assertAlmostEqual(mids["KXAUDUSDEVENT"], 0.6746)     # 0.09%: taken
+
+    def test_a_wide_book_keeps_the_last_good_price(self):
+        w = Watch("test_a_weekend_read")
+        w.setUp()
+        try:
+            watch = w.watch()
+            t1 = U(2026, 11, 14, 12).timestamp()
+            watch.refresh(t1)
+            w.mids.pop("KXUSDMXNEVENT")
+            w.fail["KXUSDMXNEVENT"] = "bitso:usd_mxn book 0.25% wide"
+            snap = watch.refresh(t1 + 30)
+            self.assertEqual(snap["series"]["KXUSDMXNEVENT"]["mid_ts"], t1)
+            self.assertIsNone(snap["series"]["KXUSDMXNEVENT"]["hold_until"])
+        finally:
+            w.tearDown()
 
     def test_a_source_down_fails_only_its_series(self):
         def get(url, body=None):
@@ -206,7 +236,7 @@ class Mids(unittest.TestCase):
                 raise OSError("down")
             if "hyperliquid" in url:
                 return [{"universe": [{"name": "xyz:GOLD"}]}, [{"midPx": "3800"}]]
-            return {"payload": {"bid": "18.68", "ask": "18.72"}}
+            return {"payload": {"bid": "18.695", "ask": "18.705"}}
         mids, err = fx.fetch_mids(get)
         self.assertEqual(set(err), {"KXAUDUSDEVENT", "KXUSDCADEVENT", "KXSILVEREVENT", "KXCOPPEREVENT",
                                     "KXUSDJPYEVENT", "KXEURUSDEVENT", "KXGBPUSDEVENT"})
