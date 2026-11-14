@@ -2,7 +2,7 @@
 
 Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read the section you need.
 
-## Tools (all in KL; the wave tools are untracked or uncommitted until Jack says "commit")
+## Tools (all in KL; committed at 8e426c5 on 11/14 -- later edits are committed only on Jack's "commit")
 
 | Tool | Role |
 |---|---|
