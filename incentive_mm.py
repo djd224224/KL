@@ -14591,6 +14591,11 @@ _CONFIG_CODE_KNOBS = (
     "UNWIND_WAVES_AT_COST",       # the waves' unwind at the close clamp's bound, not cost (2026-11-12)
     # the twin check in mutually exclusive events (2026-11-11)
     "TWIN_CHECK_MODE", "TWIN_CHECK_TOL_C",
+    # heightened bait mode, dry (2026-11-13)
+    "HEIGHTENED_MODE", "HEIGHTENED_FLASH_MAX_SECS", "HEIGHTENED_MIN_C",
+    "HEIGHTENED_WINDOW_MIN", "HEIGHTENED_PULLS", "HEIGHTENED_HOLD_MIN",
+    "HEIGHTENED_PRINT_GRACE_SECS", "HEIGHTENED_CHECK_SECS", "HEIGHTENED_SKIP",
+    "HEIGHTENED_OWN_LINGER_SECS", "HEIGHTENED_MAX_PER_CHECK",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N", "OFF_USUAL_BIG_TO",
@@ -24527,6 +24532,52 @@ def et_day_end_ts(ts: float) -> float:
     return ET.localize(datetime(d.year, d.month, d.day) + timedelta(days=1)).timestamp()
 
 
+# HEIGHTENED BAIT MODE, DRY (Jack 2026-11-13: "anytime there is suspicious
+# activity e.g. show better price and pull 3 times, move to 'heightened
+# awareness bait mode' and increase vigilance on the event and market", then
+# "Build it dry"). The detector lives in imm_heightened.py (its docstring has
+# the rule and the pre-registered go / no-go). Between cycles and inside them
+# (every HEIGHTENED_CHECK_SECS) the WS books of the markets in events we rest
+# in are read with our own orders netted out; a side's external reference
+# (target/5) that improves by HEIGHTENED_MIN_C and reverts inside
+# HEIGHTENED_FLASH_MAX_SECS with no print at the better price is a PULL.
+# HEIGHTENED_PULLS pulls in HEIGHTENED_WINDOW_MIN on a market (or across an
+# event) open a window HEIGHTENED_HOLD_MIN past the last pull (a second trip
+# the same ET day: to ET midnight). Dry: the pulls, trips, clears, our fills
+# inside windows and repeat sizes go to heightened_<date>.jsonl, trips and
+# clears to the day log; no quote changes. imm_heightened_report.py scores it.
+# A series with a HEIGHTENED_SKIP name part, or a crypto series, is still
+# watched but its rows say `exempt` (their own gates cover them).
+# IMM_HEIGHTENED: "dry" (default) or "off". The live actions are not built:
+# any other value runs dry.
+HEIGHTENED_MODE = os.environ.get("IMM_HEIGHTENED", "dry").strip().lower()
+if HEIGHTENED_MODE != "off":
+    HEIGHTENED_MODE = "dry"
+HEIGHTENED_FLASH_MAX_SECS = _env_float("IMM_HEIGHTENED_FLASH_MAX_SECS", 120.0)
+HEIGHTENED_MIN_C = _env_float("IMM_HEIGHTENED_MIN_C", 1.0)
+HEIGHTENED_WINDOW_MIN = _env_float("IMM_HEIGHTENED_WINDOW_MIN", 30.0)
+HEIGHTENED_PULLS = _env_int("IMM_HEIGHTENED_PULLS", 3)
+HEIGHTENED_HOLD_MIN = _env_float("IMM_HEIGHTENED_HOLD_MIN", 60.0)
+HEIGHTENED_PRINT_GRACE_SECS = _env_float("IMM_HEIGHTENED_PRINT_GRACE_SECS", 3.0)
+HEIGHTENED_CHECK_SECS = _env_float("IMM_HEIGHTENED_CHECK_SECS", 1.0)
+HEIGHTENED_OWN_LINGER_SECS = _env_float("IMM_HEIGHTENED_OWN_LINGER_SECS", 5.0)
+HEIGHTENED_MAX_PER_CHECK = max(1, _env_int("IMM_HEIGHTENED_MAX_PER_CHECK", 500))
+HEIGHTENED_SKIP: Tuple[str, ...] = tuple(
+    p.strip().upper() for p in os.environ.get("IMM_HEIGHTENED_SKIP", "MENTION").split(",")
+    if p.strip())
+
+
+def heightened_exempt(ticker: str) -> Optional[str]:
+    """Why a market's heightened rows are marked exempt (None = they count):
+    a HEIGHTENED_SKIP name part (the mention books' live gates), or crypto."""
+    s = series_of(ticker)
+    if any(p in s for p in HEIGHTENED_SKIP):
+        return "skip"
+    if s in CRYPTO_FLEET_SERIES or s in CRYPTO_CATEGORY_SERIES:
+        return "crypto"
+    return None
+
+
 # JOIN WAIT (2026-11-02, Jack: "Build it", on "Build the anchored join wait
 # bot-wide at 2 seconds per dollar with $50 free?", after "what about building
 # the dwell corresponding to size-at-risk? larger size, longer dwell", "what
@@ -27237,6 +27288,9 @@ class BotState:
     # lone-ref guard runs ON -> until. Persisted.
     bait_side_until: Dict[str, float] = field(default_factory=dict)
     bait_event_until: Dict[str, float] = field(default_factory=dict)
+    # Heightened bait mode, dry (HEIGHTENED_MODE, 2026-11-13): the watch's
+    # payload as loaded (open windows, today's trips, recent pulls, sizes).
+    heightened: Dict[str, dict] = field(default_factory=dict)
     # Join wait (JOIN_WAIT_MODE, 2026-11-02): each at-ref side's clocks
     # "ticker|book_side" -> join_wait_step's state. Persisted (join_wait_payload).
     join_wait: Dict[str, dict] = field(default_factory=dict)
@@ -27685,6 +27739,22 @@ class IncentiveMarketMaker:
         # ids already queued, and the counters for the status file
         self._bait_pending: List[dict] = []
         self._bait_seen: Dict[str, float] = {}
+        # heightened bait mode, dry (HEIGHTENED_MODE): the watch (built on
+        # first use, from state.heightened), the books changed since its last
+        # look, our own orders by market (rebuilt when they change), and its
+        # 10-minute summary counters
+        self._hz = None
+        self._hz_dirty: Dict[str, None] = {}      # oldest change first
+        self._hz_at = 0.0
+        self._hz_own_key: Optional[tuple] = None
+        self._hz_own: Dict[str, List[Tuple[str, float, float]]] = {}
+        self._hz_own_orders: Dict[str, Tuple[str, str, float, float]] = {}
+        self._hz_linger: Dict[str, Tuple[float, str, str, float, float]] = {}
+        self._hz_events: Set[str] = set()
+        self._hz_failed = False
+        self._hz_sum_at = time.time()
+        self._hz_sum_base: Dict[str, int] = {}
+        self._hz_cost = {"n": 0, "secs": 0.0, "max": 0.0}
         self._bait = {"candidates": 0, "tape_reads": 0, "tape_fails": 0,
                       "not_on_tape": 0, "bigger_taker": 0, "fingerprints": 0,
                       "stops": 0, "last": None}
@@ -29091,6 +29161,9 @@ class IncentiveMarketMaker:
             self.state.bait_event_until = {
                 str(e): float(v)
                 for e, v in (data.get("bait_event_until") or {}).items()}
+            # heightened bait mode (dry): open windows ride a restart
+            hz_saved = data.get("heightened")
+            self.state.heightened = dict(hz_saved) if isinstance(hz_saved, dict) else {}
             # join-wait clocks: a restart mid-wait keeps waiting
             self.state.join_wait = join_wait_load(data.get("join_wait"))
             self.state.join_wait_last = join_wait_last_load(data.get("join_wait_last"))
@@ -29549,6 +29622,7 @@ class IncentiveMarketMaker:
                                e: round(v, 1)
                                for e, v in self.state.bait_event_until.items()
                                if v > time.time()},
+                           "heightened": self._hz_payload(),
                            "join_wait": join_wait_payload(self.state.join_wait,
                                                           time.time()),
                            "join_wait_last": join_wait_last_payload(
@@ -30240,11 +30314,16 @@ class IncentiveMarketMaker:
             if kind == "fill":
                 self._ws_fast["fills"] += 1
                 self._sweep_note_fill(body, now_ts)
+                self._hz_note_fill(body, now_ts)
                 if fast and not in_cycle:
                     self._ws_wake = True
         # the public tape (TAPE_TRIGGER), after our own fills, so a burst
         # that took ours already knows it
         self._tape_process(now_ts)
+        # heightened bait mode (dry): the changed books, after the tape, so a
+        # better price that traded already has its print
+        if ok:
+            self._hz_check(dirty, now_ts)
         if (fast or fast_dry) and (not in_cycle or WS_CHECK_IN_CYCLE):
             if dropped or self._ws_recheck_all:
                 # a fresh view: every market once, not just the books that
@@ -31059,6 +31138,12 @@ class IncentiveMarketMaker:
         if body.get("is_block_trade"):
             st["blocks"] += 1          # negotiated off the book: it sweeps nothing
             return
+        if HEIGHTENED_MODE != "off":
+            # a better price that traded was taken, not pulled
+            try:
+                self._hz_watch().note_print(t, side, px, n, ts)
+            except Exception:
+                pass
         ev = self._event_of(t)
         g = risk_group_of(t)
         if sweep_hold_key(ev) not in self._tape_keys and \
@@ -35317,6 +35402,236 @@ class IncentiveMarketMaker:
                     log(f"{self.tag} lone-ref guard{tag} {t} {side}: clear")
             out.append(bool(trip))
         return out[0], out[1]
+
+    # ---- heightened bait mode, dry (2026-11-13, HEIGHTENED_MODE) -------------
+
+    def _hz_watch(self):
+        """The heightened-mode watch, built on first use from the payload
+        the state file carried across the restart."""
+        if self._hz is None:
+            import imm_heightened
+            self._hz = imm_heightened.HeightenedWatch(
+                day_end=et_day_end_ts,
+                flash_max_secs=HEIGHTENED_FLASH_MAX_SECS, min_c=HEIGHTENED_MIN_C,
+                window_secs=HEIGHTENED_WINDOW_MIN * 60.0, pulls=HEIGHTENED_PULLS,
+                hold_secs=HEIGHTENED_HOLD_MIN * 60.0,
+                print_grace_secs=HEIGHTENED_PRINT_GRACE_SECS,
+                exempt=heightened_exempt)
+            self._hz.load(self.state.heightened, time.time())
+        return self._hz
+
+    def _hz_payload(self) -> dict:
+        """What the state file keeps of the watch (the loaded payload until
+        the watch is built). Never raises."""
+        hz = getattr(self, "_hz", None)
+        try:
+            return hz.payload(time.time()) if hz is not None \
+                else dict(self.state.heightened or {})
+        except Exception:
+            return {}
+
+    def _hz_own_index(self, now_ts: float) -> Dict[str, List[Tuple[str, float, float]]]:
+        """Our resting orders by market, [(book side, YES cents, remaining)]:
+        the cycle's view (this cycle's cancels out, its amends at their new
+        price) plus what the ledger placed since -- rebuilt only when one of
+        them changed. The ledger is written as a placement returns, before
+        any tick, so a new order never reads as someone else's level. A
+        cancel or an amend is recorded as ITS call returns, while the feed
+        may still show the old level a moment longer: an order of ours that
+        went away (or moved) stays netted out at its old price for
+        HEIGHTENED_OWN_LINGER_SECS, or it would read as a better price
+        shown and pulled."""
+        view, cc, ca = self._resting_view, self._cycle_cancelled, self._cycle_amended
+        led = self.state.ledger
+        key = (id(view), id(cc), len(cc), id(ca), len(ca), len(led),
+               self._ws_fast.get("fills", 0))
+        expired = [oid for oid, v in self._hz_linger.items() if v[0] <= now_ts]
+        if key == self._hz_own_key and not expired:
+            return self._hz_own
+        for oid in expired:
+            del self._hz_linger[oid]
+        cur: Dict[str, Tuple[str, str, float, float]] = {}
+        for t, lst in view.items():
+            for o in lst:
+                oid = o["order_id"]
+                if oid in cc or o["rem"] <= 0:
+                    cur.setdefault(oid, None)          # known, not resting
+                    continue
+                px = float(ca[oid]) if oid in ca else float(o["px"])
+                cur[oid] = (t, o["side"], px, float(o["rem"]))
+        for oid, l in list(led.items()):
+            if oid in cur or oid in cc:
+                continue
+            rem = float(l.get("remaining_count") or 0.0)
+            t = str(l.get("ticker") or "")
+            if rem <= 0 or not t:
+                continue
+            pxe = l.get("yes_price_exact")
+            px = float(pxe) if pxe is not None else float(l.get("yes_price") or 0)
+            cur[oid] = (t, str(l.get("book_side") or ""), px, rem)
+        cur = {k: v for k, v in cur.items() if v is not None}
+        until = now_ts + HEIGHTENED_OWN_LINGER_SECS
+        for oid, (t, side, px, rem) in self._hz_own_orders.items():
+            c = cur.get(oid)
+            if c is None or abs(c[2] - px) > 1e-9:
+                self._hz_linger[oid] = (until, t, side, px, rem)
+        self._hz_own_orders = cur
+        idx: Dict[str, List[Tuple[str, float, float]]] = {}
+        for t, side, px, rem in cur.values():
+            idx.setdefault(t, []).append((side, px, rem))
+        for _u, t, side, px, rem in self._hz_linger.values():
+            idx.setdefault(t, []).append((side, px, rem))
+        self._hz_own_key, self._hz_own = key, idx
+        self._hz_events = {self._event_of(v[0]) for v in cur.values()}
+        return idx
+
+    def _hz_check(self, dirty: Set[str], now_ts: float) -> None:
+        """Feed the changed books of markets in events we rest in to the
+        watch, at most every HEIGHTENED_CHECK_SECS (the books changed since
+        the last look are kept), then settle its clock. Dry: rows only.
+        Never raises."""
+        if HEIGHTENED_MODE == "off":
+            return
+        ws = self._ws
+        if ws is None:
+            return
+        for t in dirty:
+            self._hz_dirty.setdefault(t, None)
+        if now_ts - self._hz_at < HEIGHTENED_CHECK_SECS:
+            return
+        self._hz_at = now_ts
+        # at most HEIGHTENED_MAX_PER_CHECK books a look (the rest wait a
+        # second), so a busy second never stalls the cycle
+        if len(self._hz_dirty) > HEIGHTENED_MAX_PER_CHECK:
+            todo = list(self._hz_dirty)[:HEIGHTENED_MAX_PER_CHECK]
+            for t in todo:
+                del self._hz_dirty[t]
+        else:
+            todo, self._hz_dirty = list(self._hz_dirty), {}
+        t_start = time.perf_counter()
+        try:
+            hz = self._hz_watch()
+            rows: List[dict] = []
+            own_idx = self._hz_own_index(now_ts)
+            events = self._hz_events
+            for t in todo:
+                if self._event_of(t) not in events:
+                    continue
+                tgt = float((self._last_panel.get(t) or {}).get("target") or 0.0)
+                if tgt <= 0:
+                    continue
+                lv = ws.book_levels(t)
+                if lv is None:
+                    continue
+                own_y: Dict[float, float] = {}
+                own_n: Dict[float, float] = {}
+                for bs, px, rem in own_idx.get(t, ()):
+                    if bs == "bid":
+                        k = round(px, 2)
+                        own_y[k] = own_y.get(k, 0.0) + rem
+                    elif bs == "ask":
+                        k = round(100.0 - px, 2)
+                        own_n[k] = own_n.get(k, 0.0) + rem
+                ev = self._event_of(t)
+                for side, book, own in (("bid", lv[0], own_y), ("ask", lv[1], own_n)):
+                    ext: Dict[float, float] = {}
+                    for p, q in book.items():
+                        c = round(float(p) * 100.0, 2)
+                        q2 = float(q) - own.get(c, 0.0)
+                        if q2 > 0.01:
+                            ext[c] = q2
+                    rows.extend(hz.observe(t, ev, side, ext, tgt, now_ts,
+                                           max(own) if own else None))
+            rows.extend(hz.tick(now_ts))
+            self._hz_emit(rows)
+            took = time.perf_counter() - t_start
+            c = self._hz_cost
+            c["n"] += 1
+            c["secs"] += took
+            c["max"] = max(c["max"], took)
+            self._hz_summary(now_ts)
+        except Exception as e:
+            if not self._hz_failed:
+                self._hz_failed = True
+                log(f"{self.tag} ! heightened bait mode check failed ({e}); "
+                    f"logged once, the check keeps running")
+
+    def _hz_note_fill(self, body: dict, now_ts: float) -> None:
+        """One of our WS fills: a `fill` row when a heightened window holds
+        its market or event. Never raises."""
+        if HEIGHTENED_MODE == "off" or body.get("is_taker"):
+            return
+        try:
+            oid = str(body.get("order_id") or "")
+            t = str(body.get("market_ticker") or body.get("ticker") or "")
+            raw = body.get("count_fp")
+            n = float(raw if raw not in (None, "") else (body.get("count") or 0.0))
+            if not oid or not t or n <= 0:
+                return
+            fts = body.get("ts_ms")
+            fts = float(fts) / 1000.0 if fts else float(body.get("ts") or now_ts)
+            mine = next((o for o in self._resting_view.get(t, ())
+                         if o["order_id"] == oid), None)
+            led = self.state.ledger.get(oid) or {}
+            side = mine["side"] if mine is not None else str(led.get("book_side") or "")
+            pxd = body.get("yes_price_dollars")
+            if pxd not in (None, ""):
+                px = round(float(pxd) * 100.0, 2)
+            elif mine is not None:
+                px = float(mine["px"])
+            else:
+                px = float(led.get("yes_price_exact") or led.get("yes_price") or 0.0)
+            self._hz_emit(self._hz_watch().note_fill(
+                t, self._event_of(t), side, px, n, fts, oid))
+        except Exception:
+            pass
+
+    def _hz_emit(self, rows: List[dict]) -> None:
+        """The watch's rows to the `heightened` sink; trips and clears to the
+        day log too."""
+        for r in rows:
+            r = dict(r, mode=HEIGHTENED_MODE)
+            self._sink("heightened", r)
+            kind = r.get("ev")
+            if kind not in ("trip", "clear"):
+                continue
+            name = r.get("ticker") if r.get("scope") == "market" else r.get("event")
+            ex = f"; exempt ({r['exempt']})" if r.get("exempt") else ""
+            if kind == "trip":
+                until = datetime.fromtimestamp(float(r["until"]), timezone.utc) \
+                    .astimezone(ET).strftime("%H:%M")
+                pulls = ", ".join(
+                    f"{p['ticker'].rsplit('-', 1)[-1]} {p['side']} "
+                    f"{p['px']:g}c over {'none' if p['base'] is None else format(p['base'], 'g') + 'c'}"
+                    f" {p['life_s']:.0f}s" for p in r.get("pulls") or [])
+                log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}) "
+                    f"{r['scope']} {name}: {len(r.get('pulls') or [])} pulls in "
+                    f"{HEIGHTENED_WINDOW_MIN:g} min ({pulls}) -- would run heightened "
+                    f"until {until} ET"
+                    + (" (2nd trip today: to midnight)" if r.get("to_midnight") else "")
+                    + ex)
+            else:
+                log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}) "
+                    f"{r['scope']} {name}: clear after {r['dur_min']:g} min -- "
+                    f"{r['pulls']} pulls, {r['fills']} fills of ours inside "
+                    f"({r['fill_ct']:g} contracts){ex}")
+
+    def _hz_summary(self, now_ts: float) -> None:
+        """Every 10 minutes, one day-log line of the watch's counters."""
+        if now_ts - self._hz_sum_at < 600.0 or self._hz is None:
+            return
+        self._hz_sum_at = now_ts
+        st = dict(self._hz.stats)
+        d = {k: v - self._hz_sum_base.get(k, 0) for k, v in st.items()}
+        self._hz_sum_base = st
+        c = self._hz_cost
+        log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}), last 10 min: "
+            f"{d['flashes']} better prices, {d['pulls']} pulled ({d['taken']} taken, "
+            f"{d['stood']} stood), {d['trips']} trips, {d['fills']} fills of ours "
+            f"inside, {d['actors']} repeat sizes; {len(self._hz.windows)} windows open; "
+            f"{c['n']} looks, {1000.0 * c['secs'] / max(1, c['n']):.1f} ms avg / "
+            f"{1000.0 * c['max']:.0f} ms max, {len(self._hz_dirty)} books waiting")
+        self._hz_cost = {"n": 0, "secs": 0.0, "max": 0.0}
 
     # ---- bait-fingerprint stop (2026-10-22, BAIT_STOP_MODE) -----------------
 
@@ -45580,6 +45895,17 @@ class IncentiveMarketMaker:
                + ("" if JOIN_WAIT_MODE == "on" else " (dry: logged, nothing held)")
                if _jw_live and LADDER_MODE == "atref"
                else " (inactive: needs IMM_LADDER_MODE=atref)" if _jw_live else ""))
+        log(f"heightened bait mode (2026-11-13): {HEIGHTENED_MODE}"
+            + (f" -- a side's external target/5 reference that improves "
+               f"{HEIGHTENED_MIN_C:g}c+ and reverts within {HEIGHTENED_FLASH_MAX_SECS:g}s "
+               f"untraded is a pull; {HEIGHTENED_PULLS} in {HEIGHTENED_WINDOW_MIN:g} min "
+               f"on a market or across an event open a {HEIGHTENED_HOLD_MIN:g}-min "
+               f"window (a 2nd trip the same day: to ET midnight); logged to "
+               f"heightened_<date>.jsonl, no quote changed; exempt rows: "
+               f"{','.join(HEIGHTENED_SKIP) or 'nothing'}, crypto"
+               + ("" if TAPE_TRIGGER != "off"
+                  else " (no trade tape: a better price that traded reads as pulled)")
+               if HEIGHTENED_MODE != "off" else ""))
         log("company KPIs (2026-11-08): "
             + (f"OFF -- every series Kalshi tags KPIs in {', '.join(sorted(COMPANY_KPI_CATEGORIES))} "
                f"is frozen ({len(_COMPANY_KPI_SNAPSHOT)} in the snapshot, "
