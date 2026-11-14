@@ -9901,7 +9901,8 @@ def no_side_only(ticker: str) -> bool:
     (KXPRESRUN-28-28NOV07-TMAS), which that helper would keep."""
     return any(ticker == ev or ticker.startswith(ev + "-")
                for ev in NO_SIDE_ONLY_EVENTS) \
-        or crypto_open_series(ticker.split("-")[0])     # CRYPTO OPEN FAMILY
+        or (crypto_open_series(ticker.split("-")[0])     # CRYPTO OPEN FAMILY
+            and not crypto_event_series(ticker.split("-")[0]))   # (its *EVENT: both sides)
 
 # KXGENERALMOV (Jack 2026-10-23: "What multiplier are they at?" -> the family
 # x2 -> "Increase to 3x"). The margin-of-victory races: 11 Senate and 4
@@ -14426,6 +14427,10 @@ _CONFIG_CODE_KNOBS = (
     "HOME_ENABLE", "HOME_SERIES", "HOME_FAIR_TOL_CENTS", "HOME_FAIR_TTL_MIN",
     "HOME_FAIR_REFRESH_SECS", "HOME_RELEASE_HOLD_MIN", "HOME_SIZE_MULT", "HOME_EDGES",
     "HOME_AUTO", "HOME_AUTO_PATTERN",
+    # crypto event fair (2026-11-13)
+    "CRYPTO_EVENT_FAIR", "CRYPTO_EVENT_LEAD", "CRYPTO_EVENT_TOL_CENTS",
+    "CRYPTO_EVENT_SPOT_BAND", "CRYPTO_EVENT_VOL_LO", "CRYPTO_EVENT_VOL_HI",
+    "CRYPTO_EVENT_TTL_SECS", "CRYPTO_EVENT_JUMP_PCT", "CRYPTO_EVENT_JUMP_HOLD_SECS",
     # upcoming programs (2026-11-12)
     "UPCOMING_ENABLE", "UPCOMING_REFRESH_SECS", "UPCOMING_RETRY_SECS",
     "UPCOMING_GRACE_SECS", "UPCOMING_MIN_GAP_SECS", "UPCOMING_VERIFY_HOURS",
@@ -19657,6 +19662,114 @@ def refresh_crypto_open_series(client, now_ts: Optional[float] = None) -> int:
     return n + len(new)
 
 
+# CRYPTO EVENT FAIR (Jack 2026-11-13: "you can quote both sides on these,
+# built around fair value", of the *EVENT strikes: "Will Bitcoin be above
+# $78000 on Dec 9 at 3:30pm ET?"). The four "<asset> after economic events"
+# series (KXBTCEVENT, KXETHEVENT, KXSOLEVENT, KXHYPEEVENT: 8 events x 17
+# strikes each on 11/13) left NO SIDE ONLY for both sides around a model.
+#   FAIR: crypto_event_fair.py (refresher thread "crypto-event-fair", every
+#     CRYPTO_EVENT_REFRESH_SECS) -- the crypto fleet's terminal model:
+#     driftless GBM N(d2) on Kraken spot (Coinbase fallback, the fleet's
+#     jump cross-check) and the monthly fleet's shrunk daily sigma, at the
+#     market's close_time (the 60-second BRTI / RTI average it settles on).
+#     Only a terminal strike prices (terminal_shape: no early close, rules
+#     naming an index average "immediately before"); the touch markets
+#     (KXBTCHITBY, KXSOLABOVEBY, ...) stay NO side only.
+#   BAND: each strike's [p_lo, p_hi] over spot x (1 +- CRYPTO_EVENT_SPOT_
+#     BAND) and sigma x CRYPTO_EVENT_VOL_LO / _HI. The IMM requotes a market
+#     every ~1.5-2.5 min, so the 1% is the spot moving under a resting
+#     quote: a Nov 17 strike near the money moves ~9c on it, a Dec 9 one
+#     ~3c. Every bid is at most p_lo - CRYPTO_EVENT_TOL_CENTS, every ask at
+#     least p_hi + it (mort_cap_quotes, LAST). On the 01:00Z 11/14 read
+#     KXBTCEVENT-09DEC261530-T7150000 priced 31.2c (band 24.1-36.7): bids
+#     <= 21c, asks >= 40c, against a 5c x 92c book.
+#   STAND ASIDE (cancel, fail closed): no read, a spot older than
+#     CRYPTO_EVENT_TTL_SECS, an asset in its JUMP HOLD (spot moved more than
+#     CRYPTO_EVENT_JUMP_PCT inside 5 min: 10 min out), a strike the model
+#     does not price, a touch fighting the band by more than the tolerance
+#     (the book knows something the read does not), or no side left.
+#   FAIR LEAD: the family leads off the model (crypto_event_fair_c), one
+#     target/5 rung a side at the cheapest price ahead of the wall, inside
+#     the band caps; no FAIR CLOSE (a close at the model's own price is a
+#     quote with no room for the spot to move). BOOK LEAD stays off.
+#   Size x CRYPTO_OPEN_SIZE_MULT (5), band 1-99c, the family's cutoffs.
+# IMM_CRYPTO_EVENT_FAIR=0 puts the series back to NO side only;
+# IMM_CRYPTO_EVENT_LEAD=0 keeps the gate without the leads.
+CRYPTO_EVENT_FAIR = os.environ.get("IMM_CRYPTO_EVENT_FAIR", "1") == "1"
+CRYPTO_EVENT_LEAD = os.environ.get("IMM_CRYPTO_EVENT_LEAD", "1") == "1"
+CRYPTO_EVENT_TOL_CENTS = _env_int("IMM_CRYPTO_EVENT_TOL_CENTS", 3)
+CRYPTO_EVENT_SPOT_BAND = _env_float("IMM_CRYPTO_EVENT_SPOT_BAND", 0.01)
+CRYPTO_EVENT_VOL_LO = _env_float("IMM_CRYPTO_EVENT_VOL_LO", 0.8)
+CRYPTO_EVENT_VOL_HI = _env_float("IMM_CRYPTO_EVENT_VOL_HI", 1.25)
+CRYPTO_EVENT_TTL_SECS = _env_int("IMM_CRYPTO_EVENT_TTL_SECS", 180)
+CRYPTO_EVENT_REFRESH_SECS = _env_int("IMM_CRYPTO_EVENT_REFRESH_SECS", 15)
+CRYPTO_EVENT_JUMP_PCT = _env_float("IMM_CRYPTO_EVENT_JUMP_PCT", 0.01)
+CRYPTO_EVENT_JUMP_HOLD_SECS = _env_int("IMM_CRYPTO_EVENT_JUMP_HOLD_SECS", 600)
+CRYPTO_EVENT_FAIR_FILE = os.environ.get(
+    "IMM_CRYPTO_EVENT_FAIR_FILE", os.path.join(STATUS_DIR, "crypto_event_fair.json"))
+_CRYPTO_EVENT_RE = re.compile(r"^KX(" + "|".join(_CRYPTO_ASSETS) + r")EVENT$")
+_crypto_event_state: dict = {"snap": None}
+
+
+def crypto_event_series(series: str) -> bool:
+    """A crypto open family *EVENT series, quoted both sides off the crypto
+    event fair (CRYPTO EVENT FAIR)."""
+    return CRYPTO_EVENT_FAIR and bool(_CRYPTO_EVENT_RE.match(series or "")) \
+        and crypto_open_series(series)
+
+
+def crypto_event_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                      ext_ask: Optional[float]
+                      ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when a crypto event strike may
+    quote -- bids at most bid_cap, asks at least ask_floor, None = that side
+    not at all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    snap = _crypto_event_state.get("snap")
+    if snap is None:
+        return "no crypto event read yet", {"reason": "no_read"}, None
+    e = (snap.get("markets") or {}).get(ticker)
+    if e is None:
+        return "market not in the crypto event read", {"reason": "no_market"}, None
+    if e.get("err") or e.get("p") is None:
+        why = str(e.get("err") or "no fair")[:160]
+        return f"not modelled: {why}", {"reason": "model", "why": why}, None
+    age = now_ts - float(e.get("spot_ts") or 0.0)
+    if age > CRYPTO_EVENT_TTL_SECS:
+        return (f"{e.get('asset')} spot is {age:.0f}s old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    hold = e.get("hold_until")
+    asset_hold = ((snap.get("assets") or {}).get(e.get("asset")) or {}).get("hold_until")
+    hold = max(float(hold or 0.0), float(asset_hold or 0.0))
+    if hold > now_ts:
+        return (f"{e.get('asset')} jump hold ({(hold - now_ts) / 60:.0f}m left)",
+                {"reason": "jump_hold", "left_s": round(hold - now_ts)}, None)
+    fair = float(e["p"]) * 100.0
+    lo_c, hi_c = float(e["p_lo"]) * 100.0, float(e["p_hi"]) * 100.0
+    inputs = {"fair": round(fair, 2), "band": [round(lo_c, 2), round(hi_c, 2)],
+              "spot": e.get("spot"), "sigma": e.get("sigma"), "t_days": e.get("t_days"),
+              "tol": CRYPTO_EVENT_TOL_CENTS}
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, lo_c, CRYPTO_EVENT_TOL_CENTS, hi_c)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.1f}c (band {lo_c:.1f}-"
+                f"{hi_c:.1f}, tol {CRYPTO_EVENT_TOL_CENTS}c, "
+                f"{'bid' if bid_bad else 'ask'} side; spot {e.get('spot')})",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
+    bid_cap = int(math.floor(lo_c - CRYPTO_EVENT_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(hi_c + CRYPTO_EVENT_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side {CRYPTO_EVENT_TOL_CENTS}c clear of the band {lo_c:.1f}-"
+                f"{hi_c:.1f}c", dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+def crypto_event_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """`ticker`'s crypto event fair (YES cents) while the gate reads it (the
+    book test apart), else None: FAIR LEAD's view of the family."""
+    why, inputs, _caps = crypto_event_gate(ticker, now_ts, None, None)
+    return None if why else float(inputs["fair"])
+
+
 def vercel_measured_day(event_ticker: str) -> Optional[datetime]:
     """00:00Z of the UTC day D a Vercel event measures: lab series DDMMMYY =
     D, KXOPENSOURCESHARE YYMMMDD = D + 1. None when it does not parse."""
@@ -24253,6 +24366,7 @@ def fair_gate_of(series: str) -> str:
         ("treasury", lambda: treasury_gated_series(series)),
         ("mortgage", lambda: mort_series(series)),
         ("zillow home", lambda: home_series(series)),
+        ("crypto event", lambda: crypto_event_series(series)),
         ("pokemon", lambda: poke_series(series)),
         ("nfl props", lambda: nfl_series(series)),
     )
@@ -25563,6 +25677,8 @@ def fair_lead_margin(series: str) -> int:
     own tolerance for the Zillow family (HOME LEADS), else FAIR_LEAD_MARGIN_C."""
     if home_series(series):
         return max(FAIR_LEAD_MARGIN_C, HOME_FAIR_TOL_CENTS)
+    if crypto_event_series(series):
+        return max(FAIR_LEAD_MARGIN_C, CRYPTO_EVENT_TOL_CENTS)
     return FAIR_LEAD_MARGIN_C
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
@@ -25659,20 +25775,24 @@ def in_fair_lead_series(series: str) -> bool:
     """FAIR_LEAD_SERIES, with any rain-day series while the weekend family
     is in it (AUTO DAY SERIES: it takes the weekend family's kit), the
     ARRAY TAIL LEADS arrays (CA_ARRAY_LEAD_SERIES), and the auto-enrolled
-    Zillow series while the hand-named ones lead (HOME_AUTO_LEAD), and the
-    discovered Vercel series while the family's base leads."""
+    Zillow series while the hand-named ones lead (HOME_AUTO_LEAD), the
+    discovered Vercel series while the family's base leads, and the crypto
+    event strikes (CRYPTO_EVENT_LEAD)."""
     return series in FAIR_LEAD_SERIES or (
         "KXRAINWKND" in FAIR_LEAD_SERIES and rain_day_series(series)) \
         or ca_array_lead_series(series) \
         or (HOME_AUTO_LEAD and home_auto_allowed(series)) \
-        or (vercel_series(series) and any(s in FAIR_LEAD_SERIES for s in VERCEL_BASE_SERIES))
+        or (vercel_series(series) and any(s in FAIR_LEAD_SERIES for s in VERCEL_BASE_SERIES)) \
+        or (CRYPTO_EVENT_LEAD and crypto_event_series(series))
 
 
 def fair_close_series(series: str) -> bool:
     """May this fair-lead series' positions close off its model (FAIR CLOSE)?
     Not the ARRAY TAIL LEADS arrays: their fair is a shadow read no settled
-    month has scored yet."""
-    return in_fair_lead_series(series) and not ca_array_lead_series(series)
+    month has scored yet. Not the crypto event strikes: a close at the
+    model's own price leaves no room for the spot to move under it."""
+    return in_fair_lead_series(series) and not ca_array_lead_series(series) \
+        and not crypto_event_series(series)
 
 
 def fair_lead_series(series: str) -> bool:
@@ -25702,6 +25822,8 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
         return or_fair_c(ticker, now_ts)
     if home_series(series):
         return home_fair_c(ticker, now_ts)
+    if crypto_event_series(series):
+        return crypto_event_fair_c(ticker, now_ts)
     return None
 
 
@@ -25726,6 +25848,8 @@ def fair_model_label(series: str) -> str:
         return "the Carbon Arc array fair"
     if home_series(series):
         return "the Zillow fair"
+    if crypto_event_series(series):
+        return "the crypto spot fair"
     return "its model fair"
 
 
@@ -27380,6 +27504,7 @@ class IncentiveMarketMaker:
         self._mort_stood: Set[str] = set()        # mortgage gate stand-asides
         self._home_stood: Set[str] = set()        # zillow home gate stand-asides
         self._home_edges: Set[str] = set()        # ...and its edges-only markets
+        self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -37456,6 +37581,10 @@ class IncentiveMarketMaker:
                 # (a touch fighting the fair: the 1c / 99c edges alone, HOME_EDGES)
                 _hw, _hi, _hc = home_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if _hc is None else mort_cap_quotes(out, *_hc)
+            if crypto_event_series(meta.series):
+                # crypto event gate: the same, the band plus CRYPTO_EVENT_TOL_CENTS
+                _cw, _ci, _cc = crypto_event_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_cw or _cc is None) else mort_cap_quotes(out, *_cc)
             if poke_series(meta.series):
                 # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
                 _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
@@ -40315,6 +40444,25 @@ class IncentiveMarketMaker:
                 self._home_stood.discard(t)
                 log(f"{self.tag} home-value resume {t}")
 
+            # CRYPTO EVENT GATE (Jack 2026-11-13, see CRYPTO_EVENT_FAIR): stand
+            # aside (cancel) without a fresh spot, in an asset's jump hold, on
+            # a strike the model does not price, or when the touch fights the
+            # band; otherwise every rung below stays CRYPTO_EVENT_TOL_CENTS
+            # outside the band (bids <= p_lo - tol, asks >= p_hi + tol).
+            cev_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if crypto_event_series(meta.series):
+                ce_why, ce_in, cev_caps = crypto_event_gate(t, now_ts, ext_bid, ext_ask)
+                if ce_why or cev_caps is None:
+                    if t not in self._cev_stood:
+                        self._cev_stood.add(t)
+                        log(f"{self.tag} crypto-event stand-aside {t}: {ce_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "crypto_event_fair", lambda: ce_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._cev_stood:
+                self._cev_stood.discard(t)
+                log(f"{self.tag} crypto-event resume {t}")
+
             # POKEMON GATE (Jack 2026-10-03, see POKE_ENABLE): stand aside
             # (cancel) without a fresh TCGplayer fair, on an unmapped event
             # or one whose rules name another item, just after the item's
@@ -41079,6 +41227,9 @@ class IncentiveMarketMaker:
             # Zillow home gate: likewise last, HOME_FAIR_TOL_CENTS clear
             if home_caps is not None:
                 mq = mort_cap_quotes(mq, *home_caps)
+            # crypto event gate: likewise last, outside the band by the tolerance
+            if cev_caps is not None:
+                mq = mort_cap_quotes(mq, *cev_caps)
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
             if poke_caps is not None:
                 mq = mort_cap_quotes(mq, *poke_caps)
@@ -44314,6 +44465,57 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_mort_fair_refresh, daemon=True,
                              name="mort-fair").start()
+        if CRYPTO_EVENT_FAIR and CRYPTO_OPEN and not once:
+            # crypto event fair refresher (2026-11-13): market lists every
+            # 10 min, sigma hourly, spots every CRYPTO_EVENT_REFRESH_SECS; the
+            # gate reads _crypto_event_state. A failed spot leaves its spot_ts
+            # behind, so the gate fails closed after CRYPTO_EVENT_TTL_SECS.
+            def _crypto_event_fair_refresh():
+                try:
+                    import crypto_event_fair
+                except Exception as e:
+                    log(f"{self.tag} ! crypto event refresher disabled: {e}")
+                    return
+                watch = crypto_event_fair.CryptoEventWatch(
+                    fair_reader(),
+                    lambda: sorted(s_ for s_ in CRYPTO_CATEGORY_SERIES
+                                   if crypto_event_series(s_)),
+                    spot_band=CRYPTO_EVENT_SPOT_BAND, vol_lo=CRYPTO_EVENT_VOL_LO,
+                    vol_hi=CRYPTO_EVENT_VOL_HI, jump_pct=CRYPTO_EVENT_JUMP_PCT,
+                    jump_hold_s=CRYPTO_EVENT_JUMP_HOLD_SECS)
+                last = None
+                status_at = 0.0
+                while True:
+                    try:
+                        snap = watch.refresh()
+                        _crypto_event_state["snap"] = snap
+                        ents = snap.get("markets") or {}
+                        n_ok = sum(1 for e in ents.values() if "p" in e)
+                        holds = sorted(a for a, v in (snap.get("assets") or {}).items()
+                                       if (v.get("hold_until") or 0) > time.time())
+                        key = (n_ok, len(ents), tuple(holds), len(snap.get("errors") or []))
+                        if last != key:
+                            log(f"{self.tag} crypto-event fair: {n_ok}/{len(ents)} "
+                                f"strikes priced; "
+                                + ", ".join(f"{a} ${v.get('spot') or 0:,.2f} "
+                                            f"sigma {100 * (v.get('sigma') or 0):.2f}%/d"
+                                            for a, v in sorted((snap.get('assets') or {}).items()))
+                                + (f"; JUMP HOLD {', '.join(holds)}" if holds else "")
+                                + (f"; {'; '.join(snap['errors'])[:200]}"
+                                   if snap.get("errors") else ""))
+                        last = key
+                        if time.time() - status_at >= 60:
+                            status_at = time.time()
+                            try:
+                                crypto_event_fair.write_status(CRYPTO_EVENT_FAIR_FILE, snap)
+                            except Exception:
+                                pass      # observability only
+                    except Exception as e:
+                        log(f"{self.tag} ! crypto-event fair refresh: "
+                            f"{type(e).__name__}: {str(e)[:120]}")
+                    time.sleep(max(5, CRYPTO_EVENT_REFRESH_SECS))
+            threading.Thread(target=_crypto_event_fair_refresh, daemon=True,
+                             name="crypto-event-fair").start()
         if HOME_ENABLE and (HOME_SERIES or HOME_AUTO) and not once:
             # Zillow home value refresher (2026-11-12): the mortgage
             # refresher's shape. Kalshi markets every 15 min, the Zillow CSVs

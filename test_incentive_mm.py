@@ -178,6 +178,7 @@ def setUpModule():
     imm.FINECON_EXTRA_FILE = os.path.join(tmp, "finecon_extra_series.json")
     imm.VERCEL_SERIES_FILE = os.path.join(tmp, "vercel_series.json")
     imm.CRYPTO_OPEN_FILE = os.path.join(tmp, "crypto_series.json")
+    imm.CRYPTO_EVENT_FAIR_FILE = os.path.join(tmp, "crypto_event_fair.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -27165,7 +27166,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + an RT settled strike that stops qualifying past the release-week
         # stand-down (2026-11-01)
         # + the Zillow home value gate (2026-11-12)
-        self.assertEqual(len(conts), 57)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
+        # + the crypto event gate (2026-11-14)
+        self.assertEqual(len(conts), 58)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -44898,3 +44900,180 @@ class TestCryptoOpenFamily(unittest.TestCase):
         self.assertEqual(rest, [])
         self.assertTrue(any("'crypto_budget'" in s_ for s_ in lines if "universe:" in s_),
                         [s_ for s_ in lines if "universe:" in s_][-2:])
+
+
+class TestCryptoEventFair(unittest.TestCase):
+    """CRYPTO EVENT FAIR (Jack 2026-11-13: "you can quote both sides on these,
+    built around fair value"): the *EVENT strikes quote both sides, every
+    bid at most p_lo - tol and every ask at least p_hi + tol of the crypto
+    event fair, failing closed, leading off the model. Fixture: the 01:00Z
+    11/14 read of KXBTCEVENT-09DEC261530-T7150000 (31.2c, band 24.1-36.7)
+    on its 5c x 92c book (32,000 YES at 5c, 35,150 NO at 8c)."""
+
+    CATEGORY = TestCryptoOpenFamily.CATEGORY
+    setUp = TestCryptoOpenFamily.setUp
+
+    def _t(self):
+        d = datetime.now(timezone.utc) + timedelta(days=40)
+        seg = f"{d.day:02d}{d.strftime('%b').upper()}{d.year % 100:02d}1530"
+        return f"KXBTCEVENT-{seg}-T7150000", d
+
+    def _snap(self, t, p=0.312, lo=0.241, hi=0.367, spot_age=5.0, hold=None,
+              err=None, asset_hold=None):
+        now = time.time()
+        imm._crypto_event_state["snap"] = {
+            "checked_ts": now,
+            "assets": {"BTC": {"spot": 68238.6, "hold_until": asset_hold}},
+            "markets": {t: ({"asset": "BTC", "err": err} if err else
+                            {"asset": "BTC", "kind": "greater", "lo": 71500.0, "p": p,
+                             "p_lo": lo, "p_hi": hi, "spot": 68238.6,
+                             "spot_ts": now - spot_age, "sigma": 0.0211,
+                             "t_days": 40.0, "hold_until": hold})}}
+        self.addCleanup(imm._crypto_event_state.update, snap=None)
+
+    def test_the_event_series_quote_both_sides_and_lead(self):
+        imm._crypto_open_enroll(["KXBTCEVENT", "KXBTCHITBY"])
+        t, _d = self._t()
+        self.assertTrue(imm.crypto_event_series("KXBTCEVENT"))
+        self.assertFalse(imm.no_side_only(t))
+        self.assertTrue(imm.no_side_only("KXBTCHITBY-01JAN270000-10500000-YES"))
+        self.assertFalse(imm.crypto_event_series("KXBTCHITBY"))
+        self.assertTrue(imm.in_fair_lead_series("KXBTCEVENT"))
+        self.assertFalse(imm.fair_close_series("KXBTCEVENT"))
+        self.assertFalse(imm.in_fair_lead_series("KXBTCHITBY"))
+        self.assertEqual(imm.fair_lead_margin("KXBTCEVENT"),
+                         max(imm.FAIR_LEAD_MARGIN_C, imm.CRYPTO_EVENT_TOL_CENTS))
+        self.assertEqual(imm.fair_model_label("KXBTCEVENT"), "the crypto spot fair")
+        with mock.patch.object(imm, "CRYPTO_EVENT_FAIR", False):
+            self.assertTrue(imm.no_side_only(t))           # back to NO side only
+            self.assertFalse(imm.in_fair_lead_series("KXBTCEVENT"))
+        with mock.patch.object(imm, "CRYPTO_EVENT_LEAD", False):
+            self.assertFalse(imm.in_fair_lead_series("KXBTCEVENT"))
+            self.assertFalse(imm.no_side_only(t))
+
+    def test_gate_reasons_fail_closed(self):
+        t, _d = self._t()
+        now = time.time()
+        r = lambda b=5, a=92: imm.crypto_event_gate(t, now, b, a)[1].get("reason")
+        imm._crypto_event_state["snap"] = None
+        self.assertEqual(r(), "no_read")
+        self._snap("KXBTCEVENT-OTHER-T1")
+        self.assertEqual(r(), "no_market")
+        self._snap(t, err="not a terminal index-average strike")
+        self.assertEqual(r(), "model")
+        self._snap(t, spot_age=imm.CRYPTO_EVENT_TTL_SECS + 5)
+        self.assertEqual(r(), "stale")
+        self._snap(t, hold=now + 300)
+        self.assertEqual(r(), "jump_hold")
+        self._snap(t, asset_hold=now + 300)
+        self.assertEqual(r(), "jump_hold")
+        self._snap(t, hold=now - 1)
+        self.assertIsNone(r())
+        self._snap(t)
+        self.assertEqual(r(b=40), "band")                  # bid over 36.7 + 3
+        self.assertEqual(r(a=21), "band")                  # ask under 24.1 - 3
+        self.assertIsNone(r(b=39, a=22))
+        why, inputs, caps = imm.crypto_event_gate(t, now, 5, 92)
+        self.assertEqual((why, caps), ("", (21, 40)))
+        self.assertEqual(inputs["fair"], 31.2)
+        self.assertAlmostEqual(imm.crypto_event_fair_c(t, now), 31.2)
+        self._snap(t, p=0.004, lo=0.0, hi=0.02)            # far out: asks only
+        self.assertEqual(imm.crypto_event_gate(t, now, 1, 50)[2], (None, 5))
+        self._snap(t, p=0.995, lo=0.98, hi=1.0)            # deep in: bids only
+        self.assertEqual(imm.crypto_event_gate(t, now, 50, 99)[2], (95, None))
+        with mock.patch.object(imm, "CRYPTO_EVENT_TOL_CENTS", 70):
+            self._snap(t)
+            self.assertEqual(r(b=None, a=None), "decided")
+
+    def _cycle(self, p=0.312, lo=0.241, hi=0.367, yes=(("0.05", "32000"),),
+               no=(("0.08", "35150"),)):
+        imm._crypto_open_enroll(["KXBTCEVENT"])
+        imm._crypto_open_state["next_read"] = 1e12
+        t, d = self._t()
+        self._snap(t, p, lo, hi)
+        client = FakeClient()
+        close = d.replace(hour=20, minute=30, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.programs.append(
+            {"market_ticker": t, "incentive_type": "liquidity",
+             "period_reward": 9000000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[t] = {
+            "ticker": t, "event_ticker": t.rsplit("-", 1)[0], "status": "active",
+            "close_time": close, "expected_expiration_time": close,
+            "yes_bid_dollars": yes[-1][0], "yes_ask_dollars": f"{1 - float(no[-1][0]):.4f}",
+            "volume_fp": "0.00"}
+        client.books[t] = {"orderbook_fp": {"yes_dollars": [list(x) for x in yes],
+                                            "no_dollars": [list(x) for x in no]}}
+        for p_ in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "LADDER_MODE", "atref"),
+                   mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                   mock.patch.object(imm, "SERIES_HOUR_MULTS", [])):
+            p_.start()
+            self.addCleanup(p_.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            self._snap(t, p, lo, hi)                       # keep the read fresh
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rest = sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                      for o in bot.state.sim_orders.values() if o["ticker"] == t
+                      and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+        return bot, t, rest, lines
+
+    def test_both_sides_rest_outside_the_band(self):
+        bot, t, rest, lines = self._cycle()
+        self.assertIn(t, bot.state.selected, [s_ for s_ in lines if "universe:" in s_][-2:])
+        sides = {side for side, _px, _n in rest}
+        self.assertEqual(sides, {"bid", "ask"}, rest)
+        self.assertTrue(all(px <= 21 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 40 for side, px, _n in rest if side == "ask"), rest)
+        # the leads: 12 ticks ahead of each wall (~95% of the side under the
+        # 0.5 discount), inside the band caps, off the crypto spot fair
+        self.assertIn(("bid", 17, 200), rest)
+        self.assertIn(("ask", 80, 200), rest)
+        self.assertTrue(any(f"fair lead {t} bid: 200 @ 17c" in s_ and "the crypto spot fair" in s_
+                            for s_ in lines), [s_ for s_ in lines if "fair lead" in s_])
+
+    def test_a_wall_inside_the_band_is_joined_only_outside_it(self):
+        # YES wall at 20c and NO at 55c (a 45c offer): the bid joins at the
+        # 20c reference, under the 21c cap; the offer at 45 sits over 40
+        bot, t, rest, lines = self._cycle(yes=(("0.20", "5000"),), no=(("0.55", "5000"),))
+        self.assertTrue(rest, lines[-30:])
+        self.assertTrue(all(px <= 21 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 40 for side, px, _n in rest if side == "ask"), rest)
+
+    def _resting(self, bot, t):
+        return sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
+                      if o["ticker"] == t)
+
+    def test_a_touch_fighting_the_band_stands_aside(self):
+        bot, t, rest, lines = self._cycle()
+        self.assertTrue(rest)
+        # a 45c bid over the 36.7c top of the band + 3: the book knows more
+        bot.client.books[t] = {"orderbook_fp": {"yes_dollars": [["0.45", "5000"]],
+                                                "no_dollars": [["0.50", "5000"]]}}
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+        self.assertEqual(self._resting(bot, t), [])
+        self.assertIn(t, bot._cev_stood)
+        self.assertTrue(any(f"crypto-event stand-aside {t}: book" in s_ for s_ in lines),
+                        [s_ for s_ in lines if "crypto-event" in s_])
+
+    def test_a_stale_spot_or_a_jump_takes_everything_off(self):
+        for kw in ({"spot_age": imm.CRYPTO_EVENT_TTL_SECS + 30},
+                   {"asset_hold": time.time() + 600}):
+            bot, t, rest, lines = self._cycle()
+            self.assertTrue(rest)
+            self._snap(t, **kw)
+            with mock.patch.object(imm, "log"):
+                bot.run_cycle()
+            self.assertEqual(self._resting(bot, t), [], kw)
+            self.assertIn(t, bot._cev_stood)
