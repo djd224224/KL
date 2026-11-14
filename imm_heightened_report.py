@@ -52,6 +52,10 @@ MIN_DAYS = 7
 MAX_TRIPS_PER_DAY = 30.0
 GO_MIN_PER_DAY = 5.0
 WATCH_SHARE = 0.25
+# the narrowed trigger went live in run b41c0d4 at 2026-11-14 03:17:32Z;
+# rows before it (and windows its predecessor opened, which rode the restart
+# in the state file) are the un-narrowed rule's
+NARROWED_FROM_TS = 1794626252.0
 
 
 def series_of(ticker):
@@ -192,6 +196,8 @@ def main(argv=None):
     ap.add_argument("--dir", default=DEFAULT_DIR)
     ap.add_argument("--since", default="2026-11-14")
     ap.add_argument("--until", default=today.isoformat())
+    ap.add_argument("--from-ts", type=float, default=NARROWED_FROM_TS,
+                    help="ignore rows (and windows tripped) before this epoch")
     a = ap.parse_args(argv)
     since, until = date.fromisoformat(a.since), date.fromisoformat(a.until)
     days = (until - since).days + 1
@@ -199,6 +205,12 @@ def main(argv=None):
     rows = load_rows(a.dir, since, until)
     marks = load_markouts(a.dir)
     rates = load_reward_rates(a.dir)
+    for k in ("pull", "trip", "strike", "actor", "clear"):
+        rows[k] = [r for r in rows.get(k, ()) if float(r.get("ts") or 0) >= a.from_ts]
+    rows["fill"] = [r for r in rows.get("fill", ())
+                    if float(r.get("trip_ts") or 0) >= a.from_ts]
+    rows["actor"] = [r for r in rows["actor"]
+                     if float(r.get("first_seen_ts") or 0) >= a.from_ts]
     wins = windows_of(rows, now_ts)
     live = [w for w in wins if not w["exempt"]]
     exempt = [w for w in wins if w["exempt"]]
@@ -222,6 +234,7 @@ def main(argv=None):
     # inside vs outside, every maker fill of ours over the same days
     t_lo = datetime(since.year, since.month, since.day, tzinfo=timezone.utc).timestamp()
     t_hi = t_lo + days * 86400.0
+    t_lo = max(t_lo, a.from_ts)
     ins = {"n": 0, "ct": 0.0, "usd": 0.0}
     out = {"n": 0, "ct": 0.0, "usd": 0.0}
     for f in load_our_fills(a.dir, since, until):

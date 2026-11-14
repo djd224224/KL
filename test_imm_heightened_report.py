@@ -70,7 +70,8 @@ class TestReport(unittest.TestCase):
         import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            R.main(["--dir", self.d, "--since", "2026-11-14", "--until", "2026-11-14"])
+            R.main(["--dir", self.d, "--since", "2026-11-14", "--until", "2026-11-14",
+                    "--from-ts", "0"])
         path = buf.getvalue().strip()
         with open(path, encoding="utf-8") as f:
             txt = f.read()
@@ -85,6 +86,18 @@ class TestReport(unittest.TestCase):
         self.assertIn("Strikes (our fill at a better price than the base, within 2 min "
                       "after a counted pull on its side): 1 fills, 100 contracts, "
                       "$12.00 lost at 4 h (0 unmarked).", txt)
+
+    def test_rows_before_the_narrowed_rule_are_left_out(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            R.main(["--dir", self.d, "--since", "2026-11-14", "--until", "2026-11-14",
+                    "--from-ts", str(self.t0 + 1)])
+        with open(buf.getvalue().strip(), encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("lost **$0.00** at 4 h", txt)          # its trip came first
+        self.assertIn("Pulls: 0 (0.0 a day", txt)
 
     def test_windows_close_at_their_clear(self):
         rows = R.load_rows(self.d, datetime(2026, 11, 14).date(),
