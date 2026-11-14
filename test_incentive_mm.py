@@ -40559,6 +40559,35 @@ class TestLowTempPeriods(unittest.TestCase):
         self.assertEqual(g(self.T, now, 39, 48)[1]["reason"], "band")  # ask under fair - tol
         self.assertEqual(g(self.EV + "-T30", now, 1, 44)[1]["reason"], "no_market")
 
+    def test_a_live_period_stands_aside(self):
+        # Jack 2026-11-14: "stop quoting KXLOWPERIOD when its live (ok to
+        # quote before the time period)"
+        self.assertTrue(imm.LOWT_PERIOD_PRE_ONLY)
+        g = imm.lowt_period_gate
+        P = ["2026-11-12", "2026-11-15"]
+        start = utc(2026, 11, 12, 5, 0).timestamp()                   # 00:00 ET Nov 12
+        self._read(start - 60, period=P)
+        self.assertEqual(g(self.T, start - 60, 39, 98)[0], "")        # before: quotes
+        self._read(start, period=P)
+        why, inputs = g(self.T, start, 39, 98)
+        self.assertEqual((inputs["reason"], inputs["period"]), ("period_live", P))
+        self.assertIn("2026-11-12", why)
+        self.assertEqual(g(self.EV + "-T40", start, 98, 99)[1]["reason"], "period_live")
+        # a stale or skipped read still knows its dates
+        self._read(start + 3600, ts=start - 7200, skip="x", period=P)
+        self.assertEqual(g(self.T, start + 3600, 39, 98)[1]["reason"], "period_live")
+        # the rules' zone: a Chicago period starts an hour later
+        self._read(start, period=P, tz="America/Chicago")
+        self.assertEqual(g(self.T, start, 39, 98)[0], "")
+        self.assertEqual(g(self.T, start + 3600, 39, 98)[1]["reason"], "period_live")
+        # no period in the read: the other checks decide, as before
+        self._read(start + 60)
+        self.assertEqual(g(self.T, start + 60, 39, 98)[0], "")
+        with mock.patch.object(imm, "LOWT_PERIOD_PRE_ONLY", False):
+            self._read(start + 60, period=P)
+            self.assertEqual(g(self.T, start + 60, 39, 98)[0], "")
+        self.assertIn("LOWT_PERIOD_PRE_ONLY", imm._CONFIG_CODE_KNOBS)
+
     def test_the_period_file_reloads_by_mtime(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "lowt_period_fair.json")

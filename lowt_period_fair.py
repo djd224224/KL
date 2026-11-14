@@ -410,7 +410,8 @@ def write_fair_file(path: str, get_json: Optional[Callable] = None,
             skipped += 1
             continue
         base.update(date=info["end"].isoformat(), station=info["icao"],
-                    period=[info["start"].isoformat(), info["end"].isoformat()])
+                    period=[info["start"].isoformat(), info["end"].isoformat()],
+                    tz=info["tz"])                 # the gate's live-period start
         try:
             st = station_row(info["icao"], stations, http_get)
             obs = observed(st, info["start"], info["end"], now_utc, http_get)

@@ -14346,6 +14346,7 @@ _CONFIG_CODE_KNOBS = (
     "LOWT_DAILY_LOSS_LIMIT", "LOWT_SIZE_MULT", "LOWT_PRICE_MIN", "LOWT_PRICE_MAX",
     # ...its period lows (2026-11-13)
     "LOWT_PERIOD_ENABLE", "LOWT_PERIOD_FAIR_TOL_CENTS", "LOWT_PERIOD_FAIR_TTL_MIN",
+    "LOWT_PERIOD_PRE_ONLY",
     # ...and the high-temperature family (2026-10-23)
     "HIGHT_ENABLE", "HIGHT_STOP_BEFORE_MIN", "HIGHT_FAIR_TOL_CENTS",
     "HIGHT_FAIR_TTL_MIN", "HIGHT_DAILY_LOSS_LIMIT", "HIGHT_SIZE_MULT",
@@ -15960,6 +15961,13 @@ def lowt_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 #   - HOURS: the ticker-date rule, out at 00:00 ET of the period's last day
 #     (KXLOWTPERIOD-26NOV15EWR: Nov 15 00:00 ET), so the last day, when the
 #     answer is mostly in, is never quoted.
+#   - BEFORE THE PERIOD ONLY (Jack 2026-11-14: "stop quoting KXLOWPERIOD
+#     when its live (ok to quote before the time period)"): from 00:00 local
+#     (the rules' zone, ET when the file names none) of the period's first
+#     day every strike of the event stands aside, both sides, until it
+#     settles. The 11/12-15 events listed on 11/12 1:10pm ET, already live,
+#     so they quote no more. IMM_LOWT_PERIOD_PRE_ONLY=0 quotes through the
+#     period again (decided / near / 30c).
 # Kill switch IMM_LOWT_PERIOD_ENABLE=0 (an env change: restart_imm.ps1 -Task):
 # the series then stands aside on lowt_gate again (no fair), as before.
 LOWT_PERIOD_ENABLE = os.environ.get("IMM_LOWT_PERIOD_ENABLE", "1") == "1"
@@ -15969,6 +15977,7 @@ LOWT_PERIOD_FAIR_FILE = os.environ.get(
 LOWT_PERIOD_FAIR_TOL_CENTS = _env_int("IMM_LOWT_PERIOD_FAIR_TOL_CENTS", 30)
 LOWT_PERIOD_FAIR_TTL_MIN = _env_int("IMM_LOWT_PERIOD_FAIR_TTL_MIN", 30)
 LOWT_PERIOD_REFRESH_SECS = _env_int("IMM_LOWT_PERIOD_REFRESH_SECS", 600)
+LOWT_PERIOD_PRE_ONLY = os.environ.get("IMM_LOWT_PERIOD_PRE_ONLY", "1") == "1"
 _lowt_period_state: dict = {"mtime": 0.0, "events": {}}
 
 
@@ -15984,6 +15993,20 @@ def load_lowt_period_fair() -> int:
     return _load_temp_fair(LOWT_PERIOD_FAIR_FILE, _lowt_period_state, "low-temp period")
 
 
+def lowt_period_start_ts(e: dict) -> Optional[float]:
+    """00:00 local of a period event's first day (the rules' zone, else
+    America/New_York) in epoch seconds, else None (no period read)."""
+    try:
+        d0 = date.fromisoformat(str((e.get("period") or [None])[0]))
+    except (TypeError, ValueError):
+        return None
+    try:
+        tz = pytz.timezone(str(e.get("tz") or "America/New_York"))
+    except pytz.UnknownTimeZoneError:
+        tz = pytz.timezone("America/New_York")
+    return tz.localize(datetime(d0.year, d0.month, d0.day)).timestamp()
+
+
 def lowt_period_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                      ext_ask: Optional[float]) -> Tuple[str, dict]:
     """('', inputs) when a period strike may quote, else (why, inputs): a
@@ -15991,9 +16014,19 @@ def lowt_period_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     read, stale, skipped, unmodelled, the band) at the period tolerance.
     Reloads the file itself (an mtime check) rather than waiting for the
     next universe refresh: a new decided or near strike reaches the book
-    on the cycle after the writer's, not up to 10 minutes later."""
+    on the cycle after the writer's, not up to 10 minutes later.
+    First of all, a LIVE period (LOWT_PERIOD_PRE_ONLY): its dates hold on
+    a stale or skipped read too."""
     load_lowt_period_fair()
     e = _lowt_period_state["events"].get(ticker.rsplit("-", 1)[0])
+    if LOWT_PERIOD_PRE_ONLY and e is not None:
+        st = lowt_period_start_ts(e)
+        if st is not None and now_ts >= st:
+            p = list(e.get("period") or [])
+            return (f"live: the period {p[0]} to {p[-1]} started "
+                    f"{datetime.fromtimestamp(st, timezone.utc):%Y-%m-%d %H:%MZ}"
+                    f" -- quoted before the period only",
+                    {"reason": "period_live", "period": p})
     if e is not None and not e.get("skip") and \
             now_ts - float(e.get("ts") or 0.0) <= LOWT_PERIOD_FAIR_TTL_MIN * 60:
         obs = e.get("obs") or {}
