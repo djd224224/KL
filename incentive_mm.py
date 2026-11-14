@@ -19783,6 +19783,18 @@ def refresh_crypto_open_series(client, now_ts: Optional[float] = None) -> int:
 #     the band caps; no FAIR CLOSE (a close at the model's own price is a
 #     quote with no room for the spot to move). BOOK LEAD stays off.
 #   Size x CRYPTO_OPEN_SIZE_MULT (5), band 1-99c, the family's cutoffs.
+# WAVE BOOKS (Jack 2026-11-14: "why is it leading on one side and sitting
+#   outside of reward earning range on the other side? it should function
+#   like the other market-wave books", of KXHYPEEVENT-04DEC260930-T7400 on
+#   wave w1114-cryptoev). A strike on the wave list (pvd_entry) quotes like
+#   every other wave book: no FAIR LEAD (crypto_event_fair_c reads None), its
+#   rungs at the wave's reference on both sides inside the list's limits, and
+#   the fair only bounds them -- no bid over the band's top (p_hi), no ask
+#   under its bottom (p_lo). On the 03:27Z book (27x37 around a 29.4c fair,
+#   band 27.0-31.4) the old caps led the bid 5c over a 22c wall and held the
+#   ask at 38-39c behind 2,482 offered at 37c, out of the scored range. Every
+#   fail-closed stand-aside (no read, stale spot, jump hold, an unpriced
+#   strike, a touch fighting the band by more than the tolerance) holds.
 # IMM_CRYPTO_EVENT_FAIR=0 puts the series back to NO side only;
 # IMM_CRYPTO_EVENT_LEAD=0 keeps the gate without the leads.
 CRYPTO_EVENT_FAIR = os.environ.get("IMM_CRYPTO_EVENT_FAIR", "1") == "1"
@@ -19844,6 +19856,17 @@ def crypto_event_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
                 f"{hi_c:.1f}, tol {CRYPTO_EVENT_TOL_CENTS}c, "
                 f"{'bid' if bid_bad else 'ask'} side; spot {e.get('spot')})",
                 dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
+    if pvd_entry(ticker) is not None:
+        # WAVE BOOK: the wave's reference on both sides, bounded by the band
+        # itself -- never a bid over p_hi, never an ask under p_lo
+        bid_cap = int(math.floor(hi_c + 1e-9))
+        ask_floor = int(math.ceil(lo_c - 1e-9))
+        caps = (min(bid_cap, 99) if bid_cap >= 1 else None,
+                max(ask_floor, 1) if ask_floor <= 99 else None)
+        if caps == (None, None):
+            return (f"no side inside 1-99c of the band {lo_c:.1f}-{hi_c:.1f}c",
+                    dict(inputs, reason="decided", wave=True), None)
+        return "", dict(inputs, wave=True, bid_cap=caps[0], ask_floor=caps[1]), caps
     bid_cap = int(math.floor(lo_c - CRYPTO_EVENT_TOL_CENTS + 1e-9))
     ask_floor = int(math.ceil(hi_c + CRYPTO_EVENT_TOL_CENTS - 1e-9))
     caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
@@ -19855,7 +19878,10 @@ def crypto_event_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 
 def crypto_event_fair_c(ticker: str, now_ts: float) -> Optional[float]:
     """`ticker`'s crypto event fair (YES cents) while the gate reads it (the
-    book test apart), else None: FAIR LEAD's view of the family."""
+    book test apart), else None: FAIR LEAD's view of the family. None on a
+    wave-listed strike too: a wave book never leads (WAVE BOOKS)."""
+    if pvd_entry(ticker) is not None:
+        return None
     why, inputs, _caps = crypto_event_gate(ticker, now_ts, None, None)
     return None if why else float(inputs["fair"])
 

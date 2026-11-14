@@ -45194,6 +45194,25 @@ class TestCryptoEventFair(unittest.TestCase):
         self.assertTrue(any(f"crypto-event stand-aside {t}: book" in s_ for s_ in lines),
                         [s_ for s_ in lines if "crypto-event" in s_])
 
+    def test_a_wave_listed_strike_quotes_like_a_wave_book(self):
+        # Jack 2026-11-14: "it should function like the other market-wave
+        # books" -- no lead, both sides at the wave reference, bounded by the
+        # band itself (KXHYPEEVENT-04DEC260930-T7400: 27x37 on 29.4c, 27.0-31.4)
+        t, _d = self._t()
+        now = time.time()
+        self._snap(t, p=0.294, lo=0.270, hi=0.314)
+        self.assertEqual(imm.crypto_event_gate(t, now, 27, 37)[2], (25, 34))   # unlisted
+        self.assertAlmostEqual(imm.crypto_event_fair_c(t, now), 29.4)
+        with mock.patch.object(imm, "pvd_entry", lambda tk, now_utc=None: {"stop": None}):
+            why, inputs, caps = imm.crypto_event_gate(t, now, 27, 37)
+            self.assertEqual((why, caps), ("", (31, 27)))
+            self.assertTrue(inputs["wave"])
+            self.assertIsNone(imm.crypto_event_fair_c(t, now))                 # no FAIR LEAD
+            # a touch fighting the band still stands it aside, as does a jump hold
+            self.assertEqual(imm.crypto_event_gate(t, now, 34, 37)[1]["reason"], "band")
+            self._snap(t, p=0.294, lo=0.270, hi=0.314, asset_hold=now + 300)
+            self.assertEqual(imm.crypto_event_gate(t, now, 27, 37)[1]["reason"], "jump_hold")
+
     def test_the_narrowed_band(self):
         # Jack 2026-11-14: "Yes, narrow it" -- spot +-0.5%, sigma x0.9 /
         # x1.11, 2c (from +-1%, x0.8 / x1.25, 3c)
