@@ -33,7 +33,10 @@ wider band sat behind other makers' walls on 119 of the 544 strikes.
 
 JUMP HOLD. An asset whose spot moved more than jump_pct inside jump_window_s
 (from any sample in the window to now) holds every one of its markets for
-jump_hold_s: the gate stands them aside, as a release hold does.
+jump_hold_s (5 min since 2026-11-14, was 10): the gate stands them aside,
+as a release hold does. Every spot read still more than jump_pct off the
+window's high or low re-arms it, so one quick 1% move holds ~5 min while
+the old price is in the window, then jump_hold_s.
 
 Dry read (no orders):  python crypto_event_fair.py KXBTCEVENT,KXETHEVENT
 """
@@ -60,7 +63,7 @@ VOL_LO = 0.9                    # ... was x0.8
 VOL_HI = 1.11                   # ... was x1.25
 JUMP_PCT = 0.01
 JUMP_WINDOW_SECS = 300
-JUMP_HOLD_SECS = 600
+JUMP_HOLD_SECS = 300   # 5 min (Jack 2026-11-14: "Stay down for 5min instead of 10min"); was 600
 
 
 def series_asset(series: str) -> Optional[str]:

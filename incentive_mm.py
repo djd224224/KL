@@ -19802,7 +19802,7 @@ def refresh_crypto_open_series(client, now_ts: Optional[float] = None) -> int:
 #     moves ~4-5c on the 0.5% (~9c on the old 1%), a Dec 9 one ~1.5c.
 #   STAND ASIDE (cancel, fail closed): no read, a spot older than
 #     CRYPTO_EVENT_TTL_SECS, an asset in its JUMP HOLD (spot moved more than
-#     CRYPTO_EVENT_JUMP_PCT inside 5 min: 10 min out), a strike the model
+#     CRYPTO_EVENT_JUMP_PCT inside 5 min: 5 min out, was 10), a strike the model
 #     does not price, a touch fighting the band by more than the tolerance
 #     (the book knows something the read does not), or no side left.
 #   FAIR LEAD: the family leads off the model (crypto_event_fair_c), one
@@ -19833,7 +19833,9 @@ CRYPTO_EVENT_VOL_HI = _env_float("IMM_CRYPTO_EVENT_VOL_HI", 1.11)
 CRYPTO_EVENT_TTL_SECS = _env_int("IMM_CRYPTO_EVENT_TTL_SECS", 180)
 CRYPTO_EVENT_REFRESH_SECS = _env_int("IMM_CRYPTO_EVENT_REFRESH_SECS", 15)
 CRYPTO_EVENT_JUMP_PCT = _env_float("IMM_CRYPTO_EVENT_JUMP_PCT", 0.01)
-CRYPTO_EVENT_JUMP_HOLD_SECS = _env_int("IMM_CRYPTO_EVENT_JUMP_HOLD_SECS", 600)
+# Jack 2026-11-14: "Stay down for 5min instead of 10min" -- the 20:50-21:34Z
+# selloff held all four coins dark ~45 min (HYPE 42 of 43 min); was 600.
+CRYPTO_EVENT_JUMP_HOLD_SECS = _env_int("IMM_CRYPTO_EVENT_JUMP_HOLD_SECS", 300)
 CRYPTO_EVENT_FAIR_FILE = os.environ.get(
     "IMM_CRYPTO_EVENT_FAIR_FILE", os.path.join(STATUS_DIR, "crypto_event_fair.json"))
 _CRYPTO_EVENT_RE = re.compile(r"^KX(" + "|".join(_CRYPTO_ASSETS) + r")EVENT$")
