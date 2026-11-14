@@ -20,6 +20,23 @@ KXVOTEGENERAL, other makers repricing; such a price lasted 20 s at the
 median, 99 s at p90. Counting only reference moves that revert untraded is
 the narrower signal.
 
+NARROWED (Jack 2026-11-14: "narrow the trips"). Live 02:02-02:43Z 11/14
+every pull counted: 3,119 pulls, ~18,500 trips a day -- 80% the spot-priced
+*EVENT strikes (FX, metals, crypto), the rest mostly target/5 flickers of
+other makers' bots. A pull now COUNTS only when it is
+  * outside the exempt series (the bot's: mention books, crypto, *EVENT),
+  * count_min_c (10c) or more over the base, or from no reference at all,
+  * stood min_life_secs (10 s) or more -- our rung moves on the cycle, so a
+    shorter one cannot drag it,
+  * FOLLOWED: our rung rested at the better price as it went away and had
+    not been there when it came (the probe that maps our reaction).
+On that sample (with a looser follow test) this left ~210 trips a day.
+Our own fills are netted out of the "was it taken" test, so a bait pulled
+while a taker hits us is still a pull, and a fill of ours at a price better
+than the base within strike_secs after (or during) a counted pull is logged
+as a `strike` -- the hit the probes set up. Uncounted pulls are counters in
+the stats, not rows.
+
 The trip. PULLS pulls inside WINDOW_SECS on one market (either side) open a
 MARKET window; PULLS across one event's markets open an EVENT window. A
 window runs HOLD_SECS past its last pull; a second trip of the same key on
@@ -79,7 +96,9 @@ class HeightenedWatch:
                  flash_max_secs: float = 120.0, min_c: float = 1.0,
                  window_secs: float = 1800.0, pulls: int = 3,
                  hold_secs: float = 3600.0, print_grace_secs: float = 3.0,
-                 exempt: Optional[Callable[[str], Optional[str]]] = None):
+                 exempt: Optional[Callable[[str], Optional[str]]] = None,
+                 count_min_c: float = 10.0, min_life_secs: float = 10.0,
+                 followed_only: bool = True, strike_secs: float = 120.0):
         self.day_end = day_end
         self.flash_max_secs = float(flash_max_secs)
         self.min_c = float(min_c)
@@ -88,6 +107,15 @@ class HeightenedWatch:
         self.hold_secs = float(hold_secs)
         self.print_grace_secs = float(print_grace_secs)
         self.exempt = exempt or (lambda ticker: None)
+        # which pulls COUNT toward a trip (the narrowed trigger, 2026-11-14)
+        self.count_min_c = float(count_min_c)
+        self.min_life_secs = float(min_life_secs)
+        self.followed_only = bool(followed_only)
+        self.strike_secs = float(strike_secs)
+        # (t, side) -> deque[(ts, own px, n, order id)]: our recent fills
+        self.own_fills: Dict[Tuple[str, str], Deque[Tuple[float, float, float, str]]] = {}
+        # (t, side) -> deque[counted pull]: for strikes after the pull
+        self.counted_recent: Dict[Tuple[str, str], Deque[dict]] = {}
         # (t, side) -> {"base", "flash", "levels", "seen"}
         self.sides: Dict[Tuple[str, str], dict] = {}
         # t -> deque[(ts, taker_side, yes_px, n)]
@@ -99,8 +127,10 @@ class HeightenedWatch:
         self.trips_day: Dict[str, Tuple[float, int]] = {}  # key -> (day end, trips)
         self.sizes: Dict[str, Dict[float, float]] = {}     # event -> {size: ts}
         self.actor_seen: Dict[Tuple[str, str, float, float], float] = {}
-        self.stats = {"flashes": 0, "stood": 0, "taken": 0, "pulls": 0,
-                      "trips": 0, "fills": 0, "actors": 0}
+        self.stats = {"flashes": 0, "stood": 0, "taken": 0, "raw_pulls": 0,
+                      "pulls": 0, "unc_exempt": 0, "unc_small": 0, "unc_brief": 0,
+                      "unc_unfollowed": 0, "trips": 0, "fills": 0, "strikes": 0,
+                      "actors": 0}
 
     # ---- inputs -------------------------------------------------------------
 
@@ -119,8 +149,9 @@ class HeightenedWatch:
                 ) -> List[dict]:
         """One side's external book (own cents -> size, our orders netted
         out) after a change; the watch keeps the dict, so pass a fresh one.
-        `own_best` is our best resting price on that side (own cents), for
-        the `joined` flag. Returns actor rows."""
+        `own_best` is our best resting price on that side (own cents): a
+        pull is FOLLOWED when our rung rested at the better price as it went
+        away and had not been there when it came. Returns actor rows."""
         key = (t, side)
         st = self.sides.get(key)
         if st is not None and levels == st["levels"]:
@@ -143,7 +174,8 @@ class HeightenedWatch:
                 self.stats["flashes"] += 1
                 added = ref_q - prev_levels.get(ref, 0.0)
                 st["flash"] = {"t0": now, "base": base, "px": ref, "px_hi": ref,
-                               "size_hi": ref_q, "added": max(0.0, added)}
+                               "size_hi": ref_q, "added": max(0.0, added),
+                               "own0": own_best}
             else:
                 st["base"] = ref
             return out
@@ -162,17 +194,34 @@ class HeightenedWatch:
         # back to the base or worse
         st["base"], st["flash"] = ref, None
         if age <= self.flash_max_secs:
+            there = own_best is not None and own_best >= fl["px_hi"] - EPS
+            own0 = fl.get("own0")
             self.pending.append({
                 "t": t, "ev": ev, "side": side, "base": fl["base"],
                 "px_hi": fl["px_hi"], "size_hi": fl["size_hi"],
                 "added": fl["added"], "t0": fl["t0"], "t1": now,
-                "joined": own_best is not None and own_best >= fl["px_hi"] - EPS,
+                "joined": there,
+                "followed": there and (own0 is None or own0 < fl["px_hi"] - EPS),
                 "after": ref})
         return out
 
     def note_fill(self, t: str, ev: str, side: str, yes_px: float, n: float,
                   ts: float, order_id: str) -> List[dict]:
-        """One of our maker fills: a `fill` row when a window holds it."""
+        """One of our maker fills: kept a few minutes (a better price that
+        "traded" only into us was still pulled), a `strike` row when it came
+        within strike_secs after a counted pull on that side at a price
+        better than the pull's base, and a `fill` row when a window holds
+        it."""
+        out: List[dict] = []
+        own = float(yes_px) if side == "bid" else 100.0 - float(yes_px)
+        key = (t, side)
+        if side in ("bid", "ask"):
+            self.own_fills.setdefault(key, deque(maxlen=200)).append(
+                (float(ts), own, float(n), order_id))
+            for p in self.counted_recent.get(key, ()):
+                if 0.0 <= ts - p["ts"] <= self.strike_secs and \
+                        (p["_base"] is None or own >= p["_base"] + self.min_c - EPS):
+                    out.append(self._strike(p, ts, yes_px, n, order_id))
         mk, ek = "m|" + t, "e|" + ev
         w = self.windows.get(mk) if self._window_open(mk, ts) else None
         scope = "market"
@@ -180,12 +229,12 @@ class HeightenedWatch:
             w = self.windows.get(ek) if self._window_open(ek, ts) else None
             scope = "event"
         if w is None:
-            return []
+            return out
         self.stats["fills"] += 1
         w["fills"] = w.get("fills", 0) + 1
         w["fill_ct"] = w.get("fill_ct", 0.0) + float(n)
         side_pulled = any(p["side"] == side for p in self.pulls_mkt.get(t, ()))
-        return [{"ev": "fill", "ts": round(ts, 3), "ticker": t, "event": ev,
+        return out + [{"ev": "fill", "ts": round(ts, 3), "ticker": t, "event": ev,
                  "side": side, "px": yes_px, "count": round(float(n), 2),
                  "order_id": order_id, "scope": scope, "key": w["key"],
                  "trip_ts": round(w["since"], 3),
@@ -207,7 +256,7 @@ class HeightenedWatch:
                 if self._traded(p):
                     self.stats["taken"] += 1
                     continue
-                out.extend(self._pull(p))
+                out.extend(self._pull(p, now))
             self.pending = keep
         for k in [k for k, w in self.windows.items() if w["until"] <= now]:
             w = self.windows.pop(k)
@@ -225,27 +274,54 @@ class HeightenedWatch:
     # ---- internals ----------------------------------------------------------
 
     def _traded(self, p: dict) -> bool:
-        """A print hitting that side at a price better than the base, while
-        the better price stood (a slack of a second or two either side: the
-        tape rides its own connection)."""
+        """Did the better price trade? The prints hitting that side at a
+        price better than the base while it stood (a slack of a second or two
+        either side: the tape rides its own connection), less our own fills
+        there, must reach half the size that came: a bait pulled while a
+        taker hits us (and the other followers) is still a pull."""
         lo, hi = p["t0"] - 2.0, p["t1"] + self.print_grace_secs
         hits = "no" if p["side"] == "bid" else "yes"
-        for ts, tk, ypx, _n in self.prints.get(p["t"], ()):
-            if not (lo <= ts <= hi) or tk != hits:
-                continue
-            own = ypx if p["side"] == "bid" else 100.0 - ypx
-            if p["base"] is None or own >= p["base"] + self.min_c - EPS:
-                return True
-        return False
+
+        def better(own: float) -> bool:
+            return p["base"] is None or own >= p["base"] + self.min_c - EPS
+        printed = 0.0
+        for ts, tk, ypx, n in self.prints.get(p["t"], ()):
+            if lo <= ts <= hi and tk == hits and \
+                    better(ypx if p["side"] == "bid" else 100.0 - ypx):
+                printed += n
+        if printed <= 0:
+            return False
+        mine = sum(n for ts, own, n, _oid in self.own_fills.get((p["t"], p["side"]), ())
+                   if lo <= ts <= hi and better(own))
+        return printed - mine >= max(1.0, 0.5 * p["added"])
 
     def _window_open(self, key: str, ts: float) -> bool:
         w = self.windows.get(key)
         return w is not None and w["until"] > ts
 
-    def _pull(self, p: dict) -> List[dict]:
-        self.stats["pulls"] += 1
+    def _pull(self, p: dict, now: float) -> List[dict]:
+        """A better price pulled. It COUNTS toward a trip only outside the
+        exempt series, at count_min_c+ over the base (or from no reference),
+        having stood min_life_secs+ (our rung moves on the cycle, so a
+        shorter one cannot drag it), and -- followed_only -- followed by our
+        rung. The rest are counted in the stats, not logged."""
+        self.stats["raw_pulls"] += 1
         t, ev, ts = p["t"], p["ev"], p["t1"]
         ex = self.exempt(t)
+        gain = None if p["base"] is None else p["px_hi"] - p["base"]
+        if ex:
+            self.stats["unc_exempt"] += 1
+            return []
+        if gain is not None and gain < self.count_min_c - EPS:
+            self.stats["unc_small"] += 1
+            return []
+        if ts - p["t0"] < self.min_life_secs - EPS:
+            self.stats["unc_brief"] += 1
+            return []
+        if self.followed_only and not p.get("followed"):
+            self.stats["unc_unfollowed"] += 1
+            return []
+        self.stats["pulls"] += 1
 
         def yes(px: Optional[float]) -> Optional[float]:
             if px is None:
@@ -257,7 +333,8 @@ class HeightenedWatch:
                "gain_c": None if p["base"] is None
                else round(p["px_hi"] - p["base"], 2),
                "life_s": round(ts - p["t0"], 1), "size": round(p["size_hi"], 2),
-               "added": round(p["added"], 2), "joined": p["joined"]}
+               "added": round(p["added"], 2), "joined": p["joined"],
+               "followed": bool(p.get("followed"))}
         dm = self.pulls_mkt.setdefault(t, deque())
         de = self.pulls_ev.setdefault(ev, deque())
         dm.append(rec)
@@ -268,6 +345,15 @@ class HeightenedWatch:
         if p["added"] > 0:
             self.sizes.setdefault(ev, {})[round(p["added"], 2)] = ts
         out = [dict(rec, ev="pull", n_market=len(dm), n_event=len(de), exempt=ex)]
+        # strikes: our fills on that side, at a price better than the base,
+        # from the better price's start to now; later ones come via note_fill
+        cr = dict(rec, _base=p["base"])
+        for f_ts, own, n, oid in self.own_fills.get((t, p["side"]), ()):
+            if p["t0"] - 2.0 <= f_ts <= now and \
+                    (p["base"] is None or own >= p["base"] + self.min_c - EPS):
+                ypx = own if p["side"] == "bid" else 100.0 - own
+                out.append(self._strike(cr, f_ts, ypx, n, oid))
+        self.counted_recent.setdefault((t, p["side"]), deque(maxlen=20)).append(cr)
         for key, scope, dq in (("m|" + t, "market", dm), ("e|" + ev, "event", de)):
             w = self.windows.get(key)
             if w is not None and w["until"] > ts:
@@ -278,6 +364,17 @@ class HeightenedWatch:
                 continue
             out.append(self._trip(key, scope, t, ev, list(dq)[-self.pulls:], ts, ex))
         return out
+
+    def _strike(self, p: dict, ts: float, yes_px: float, n: float,
+                order_id: str) -> dict:
+        """One fill of ours after (or during) a counted pull on its side: the
+        bait's hit."""
+        self.stats["strikes"] += 1
+        return {"ev": "strike", "ts": round(float(ts), 3), "ticker": p["ticker"],
+                "event": p["event"], "side": p["side"], "px": round(float(yes_px), 2),
+                "count": round(float(n), 2), "order_id": order_id,
+                "pull_ts": p["ts"], "since_pull_s": round(float(ts) - p["ts"], 1),
+                "pull_px": p["px"], "pull_base": p["base"]}
 
     def _trip(self, key: str, scope: str, t: str, ev: str, pulls: List[dict],
               ts: float, ex: Optional[str]) -> dict:
@@ -342,6 +439,12 @@ class HeightenedWatch:
             del self.sizes[ev]
         for k in [k for k, v in self.actor_seen.items() if v < now - 600.0]:
             del self.actor_seen[k]
+        for k in [k for k, dq in self.own_fills.items()
+                  if not dq or dq[-1][0] < now - 300.0]:
+            del self.own_fills[k]
+        for k in [k for k, dq in self.counted_recent.items()
+                  if not dq or dq[-1]["ts"] < now - self.strike_secs]:
+            del self.counted_recent[k]
 
     # ---- persistence (imm_state.json) ---------------------------------------
 

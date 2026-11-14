@@ -6,8 +6,11 @@ times, move to 'heightened awareness bait mode'", then "Build it dry").
 Since 2026-11-13 the IMM counts PULLS -- a side's external target/5
 reference that improves and reverts within 2 min with no print at the better
 price -- and opens a window on a market (or its event) after 3 in 30 min
-(imm_heightened.py). Dry, nothing changes; this weighs what acting would
-have been worth:
+(imm_heightened.py). Since 2026-11-14 (Jack: "narrow the trips") a pull
+counts only at 10c+ over its base, 10 s+, followed by our rung, outside the
+*EVENT / mention / crypto series, and a fill of ours within 2 min after one
+is a STRIKE. Dry, nothing changes; this weighs what acting would have been
+worth:
 
   lost      our maker fills inside the windows, marked out (4 h, + = the fill
             lost money): the most the live actions could have saved
@@ -260,6 +263,15 @@ def main(argv=None):
              f"{sum(1 for t in trips if t.get('scope') == 'event')} event; "
              f"{sum(1 for t in trips if t.get('to_midnight'))} ran to midnight), "
              f"{len(exempt)} exempt. Repeat sizes seen: {len(rows.get('actor', []))}.")
+    strikes = rows.get("strike", [])
+    if strikes:
+        sm = [mark(f, marks)[1] for f in strikes]
+        s_lost = -sum(m for m in sm if m is not None)
+        s_ct = sum(float(f.get("count") or 0) for f in strikes)
+        L.append(f"Strikes (our fill at a better price than the base, within 2 min "
+                 f"after a counted pull on its side): {len(strikes)} fills, "
+                 f"{s_ct:,.0f} contracts, ${s_lost:,.2f} lost at 4 h "
+                 f"({sum(1 for m in sm if m is None)} unmarked).")
     if inside_ex:
         ex_lost = -sum(m for m in (mark(f, marks)[1] for f in inside_ex) if m is not None)
         L.append(f"Exempt windows (mention, crypto): {len(inside_ex)} fills inside, "

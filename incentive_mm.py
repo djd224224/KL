@@ -14620,6 +14620,8 @@ _CONFIG_CODE_KNOBS = (
     "HEIGHTENED_WINDOW_MIN", "HEIGHTENED_PULLS", "HEIGHTENED_HOLD_MIN",
     "HEIGHTENED_PRINT_GRACE_SECS", "HEIGHTENED_CHECK_SECS", "HEIGHTENED_SKIP",
     "HEIGHTENED_OWN_LINGER_SECS", "HEIGHTENED_MAX_PER_CHECK",
+    "HEIGHTENED_COUNT_MIN_C", "HEIGHTENED_MIN_LIFE_SECS", "HEIGHTENED_FOLLOWED_ONLY",
+    "HEIGHTENED_STRIKE_SECS",
     "MARK_EXTERNAL", "MARK_EXT_BOOK_READS", "MARK_EXT_FIRST_READS", "MARK_EXT_TTL_SECS", "MARK_EXT_FILL_DAYS",
     "PVD_OFF_USUAL_MIN_N", "PVD_OFF_USUAL_SAMPLE_S", "PVD_OFF_USUAL_COLD",
     "OFF_USUAL_BIG_MODE", "OFF_USUAL_BIG_MIN", "OFF_USUAL_BIG_MIN_N", "OFF_USUAL_BIG_TO",
@@ -24570,8 +24572,9 @@ def et_day_end_ts(ts: float) -> float:
 # the same ET day: to ET midnight). Dry: the pulls, trips, clears, our fills
 # inside windows and repeat sizes go to heightened_<date>.jsonl, trips and
 # clears to the day log; no quote changes. imm_heightened_report.py scores it.
-# A series with a HEIGHTENED_SKIP name part, or a crypto series, is still
-# watched but its rows say `exempt` (their own gates cover them).
+# A series with a HEIGHTENED_SKIP name part, a crypto series or (since
+# 2026-11-14) a spot-priced *EVENT strike is watched, but its pulls never
+# count toward a trip (heightened_exempt).
 # IMM_HEIGHTENED: "dry" (default) or "off". The live actions are not built:
 # any other value runs dry.
 HEIGHTENED_MODE = os.environ.get("IMM_HEIGHTENED", "dry").strip().lower()
@@ -24586,19 +24589,35 @@ HEIGHTENED_PRINT_GRACE_SECS = _env_float("IMM_HEIGHTENED_PRINT_GRACE_SECS", 3.0)
 HEIGHTENED_CHECK_SECS = _env_float("IMM_HEIGHTENED_CHECK_SECS", 1.0)
 HEIGHTENED_OWN_LINGER_SECS = _env_float("IMM_HEIGHTENED_OWN_LINGER_SECS", 5.0)
 HEIGHTENED_MAX_PER_CHECK = max(1, _env_int("IMM_HEIGHTENED_MAX_PER_CHECK", 500))
+# NARROWED TRIPS (Jack 2026-11-14: "narrow the trips", after the first live
+# 41 min counted 3,119 pulls, ~18,500 trips a day, 80% the spot-priced *EVENT
+# strikes): a pull COUNTS toward a trip only at HEIGHTENED_COUNT_MIN_C+ over
+# its base, having stood HEIGHTENED_MIN_LIFE_SECS+, outside the exempt series
+# (now *EVENT too), and -- HEIGHTENED_FOLLOWED_ONLY -- when our rung followed
+# it. A fill of ours within HEIGHTENED_STRIKE_SECS after a counted pull on its
+# side, at a price better than the pull's base, is a `strike` row.
+HEIGHTENED_COUNT_MIN_C = _env_float("IMM_HEIGHTENED_COUNT_MIN_C", 10.0)
+HEIGHTENED_MIN_LIFE_SECS = _env_float("IMM_HEIGHTENED_MIN_LIFE_SECS", 10.0)
+HEIGHTENED_FOLLOWED_ONLY = os.environ.get("IMM_HEIGHTENED_FOLLOWED_ONLY", "1") == "1"
+HEIGHTENED_STRIKE_SECS = _env_float("IMM_HEIGHTENED_STRIKE_SECS", 120.0)
+_HEIGHTENED_SPOT_RE = re.compile(r"^KX[A-Z0-9]+EVENT$")
 HEIGHTENED_SKIP: Tuple[str, ...] = tuple(
     p.strip().upper() for p in os.environ.get("IMM_HEIGHTENED_SKIP", "MENTION").split(",")
     if p.strip())
 
 
 def heightened_exempt(ticker: str) -> Optional[str]:
-    """Why a market's heightened rows are marked exempt (None = they count):
-    a HEIGHTENED_SKIP name part (the mention books' live gates), or crypto."""
+    """Why a market's pulls never count toward a trip (None = they count):
+    a HEIGHTENED_SKIP name part (the mention books' live gates), crypto, or
+    a spot-priced *EVENT strike (FX, metals, crypto: their makers requote
+    with spot, 80% of the first live pulls)."""
     s = series_of(ticker)
     if any(p in s for p in HEIGHTENED_SKIP):
         return "skip"
     if s in CRYPTO_FLEET_SERIES or s in CRYPTO_CATEGORY_SERIES:
         return "crypto"
+    if _HEIGHTENED_SPOT_RE.match(s):
+        return "spot"
     return None
 
 
@@ -35441,7 +35460,10 @@ class IncentiveMarketMaker:
                 window_secs=HEIGHTENED_WINDOW_MIN * 60.0, pulls=HEIGHTENED_PULLS,
                 hold_secs=HEIGHTENED_HOLD_MIN * 60.0,
                 print_grace_secs=HEIGHTENED_PRINT_GRACE_SECS,
-                exempt=heightened_exempt)
+                exempt=heightened_exempt, count_min_c=HEIGHTENED_COUNT_MIN_C,
+                min_life_secs=HEIGHTENED_MIN_LIFE_SECS,
+                followed_only=HEIGHTENED_FOLLOWED_ONLY,
+                strike_secs=HEIGHTENED_STRIKE_SECS)
             self._hz.load(self.state.heightened, time.time())
         return self._hz
 
@@ -35468,7 +35490,9 @@ class IncentiveMarketMaker:
         shown and pulled."""
         view, cc, ca = self._resting_view, self._cycle_cancelled, self._cycle_amended
         led = self.state.ledger
-        key = (id(view), id(cc), len(cc), id(ca), len(ca), len(led),
+        # (the amends' price sum too: a second amend of one order in a cycle
+        # leaves their count alone)
+        key = (id(view), id(cc), len(cc), id(ca), len(ca), sum(ca.values()), len(led),
                self._ws_fast.get("fills", 0))
         expired = [oid for oid, v in self._hz_linger.items() if v[0] <= now_ts]
         if key == self._hz_own_key and not expired:
@@ -35636,9 +35660,13 @@ class IncentiveMarketMaker:
         n_ex = self._hz_trip_series.get("exempt", 0)
         most = ", ".join(f"{k} {n}" for n, k in top) + (f"; exempt {n_ex}" if n_ex else "")
         log(f"{self.tag} heightened bait mode ({HEIGHTENED_MODE}), last 10 min: "
-            f"{d['flashes']} better prices, {d['pulls']} pulled ({d['taken']} taken, "
-            f"{d['stood']} stood), {d['trips']} trips, {d['fills']} fills of ours "
-            f"inside, {d['actors']} repeat sizes; {len(self._hz.windows)} windows open"
+            f"{d['flashes']} better prices ({d['taken']} taken, {d['stood']} stood), "
+            f"{d['raw_pulls']} pulled, {d['pulls']} counted (not: {d['unc_exempt']} "
+            f"exempt, {d['unc_small']} under {HEIGHTENED_COUNT_MIN_C:g}c, "
+            f"{d['unc_brief']} under {HEIGHTENED_MIN_LIFE_SECS:g}s, "
+            f"{d['unc_unfollowed']} not followed), {d['trips']} trips, "
+            f"{d['strikes']} strikes, {d['fills']} fills of ours inside, "
+            f"{d['actors']} repeat sizes; {len(self._hz.windows)} windows open"
             + (f" (most trips: {most})" if most else "") + "; "
             f"{c['n']} looks, {1000.0 * c['secs'] / max(1, c['n']):.1f} ms avg / "
             f"{1000.0 * c['max']:.0f} ms max, {len(self._hz_dirty)} books waiting")
@@ -45968,12 +45996,16 @@ class IncentiveMarketMaker:
         log(f"heightened bait mode (2026-11-13): {HEIGHTENED_MODE}"
             + (f" -- a side's external target/5 reference that improves "
                f"{HEIGHTENED_MIN_C:g}c+ and reverts within {HEIGHTENED_FLASH_MAX_SECS:g}s "
-               f"untraded is a pull; {HEIGHTENED_PULLS} in {HEIGHTENED_WINDOW_MIN:g} min "
+               f"untraded is a pull; it counts at {HEIGHTENED_COUNT_MIN_C:g}c+ over its "
+               f"base, {HEIGHTENED_MIN_LIFE_SECS:g}s+ "
+               + ("and followed by our rung" if HEIGHTENED_FOLLOWED_ONLY else "followed or not")
+               + f" (2026-11-14); {HEIGHTENED_PULLS} counted in {HEIGHTENED_WINDOW_MIN:g} min "
                f"on a market or across an event open a {HEIGHTENED_HOLD_MIN:g}-min "
                f"window (a 2nd trip the same day: to ET midnight); logged to "
                f"heightened_<date>.jsonl (trips counted in a 10-min summary line), no "
-               f"quote changed; exempt rows: "
-               f"{','.join(HEIGHTENED_SKIP) or 'nothing'}, crypto"
+               f"quote changed; never counted: "
+               f"{','.join(HEIGHTENED_SKIP) or 'nothing'}, crypto, *EVENT strikes; our "
+               f"fill within {HEIGHTENED_STRIKE_SECS:g}s of a counted pull is a strike"
                + ("" if TAPE_TRIGGER != "off"
                   else " (no trade tape: a better price that traded reads as pulled)")
                if HEIGHTENED_MODE != "off" else ""))

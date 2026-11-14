@@ -42,6 +42,8 @@ class TestReport(unittest.TestCase):
              "event": EV, "until": t0 + 3600, "exempt": None},
             {"ev": "fill", "ts": t0 + 60, "ticker": A, "side": "bid", "px": 55.0,
              "count": 100.0, "order_id": "o1", "scope": "market", "exempt": None},
+            {"ev": "strike", "ts": t0 + 60, "ticker": A, "side": "bid", "px": 55.0,
+             "count": 100.0, "order_id": "o1"},
             {"ev": "clear", "ts": t0 + 1800, "key": "m|" + A, "scope": "market",
              "since": t0, "until": t0 + 1800},
             {"ev": "clear", "ts": t0 + 1800, "key": "e|" + EV, "scope": "event",
@@ -80,6 +82,9 @@ class TestReport(unittest.TestCase):
         self.assertIn("marked -12.00c a contract at 4 h (1 fills", txt)
         self.assertIn("everywhere else +2.00c (1 fills", txt)
         self.assertIn("Pulls: 1 (1.0 a day; our rung had followed 1)", txt)
+        self.assertIn("Strikes (our fill at a better price than the base, within 2 min "
+                      "after a counted pull on its side): 1 fills, 100 contracts, "
+                      "$12.00 lost at 4 h (0 unmarked).", txt)
 
     def test_windows_close_at_their_clear(self):
         rows = R.load_rows(self.d, datetime(2026, 11, 14).date(),

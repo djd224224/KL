@@ -34,15 +34,16 @@ class TestHeightenedWatch(unittest.TestCase):
         self.base = {42.0: 300.0}      # the standing reference: 42c
 
     def _flash(self, t0, t=None, side="bid", px=55.0, size=10456.0, life=20.0,
-               own_best=None):
-        """A better price shown at t0 and gone `life` s later, then the
-        tape grace run out; the rows of both ticks."""
+               follow=True, own0=None):
+        """A better price shown at t0 and gone `life` s later -- our rung
+        (at `own0` before it came) at the better price as it goes when
+        `follow` -- then the tape grace run out; the rows of the tick."""
         t = t or self.T
         w = self.w
-        w.observe(t, self.EV, side, dict(self.base), 1000, t0 - 30.0)
-        w.observe(t, self.EV, side, {**self.base, px: size}, 1000, t0)
+        w.observe(t, self.EV, side, dict(self.base), 1000, t0 - 30.0, own_best=own0)
+        w.observe(t, self.EV, side, {**self.base, px: size}, 1000, t0, own_best=own0)
         w.observe(t, self.EV, side, dict(self.base), 1000, t0 + life,
-                  own_best=own_best)
+                  own_best=px if follow else own0)
         return w.tick(t0 + life + 5.0)
 
     def test_a_better_price_pulled_untraded_is_a_pull(self):
@@ -50,16 +51,17 @@ class TestHeightenedWatch(unittest.TestCase):
         pull, = [r for r in rows if r["ev"] == "pull"]
         self.assertEqual((pull["ticker"], pull["side"], pull["base"], pull["px"],
                           pull["gain_c"], pull["life_s"], pull["size"], pull["added"],
-                          pull["n_market"], pull["n_event"], pull["joined"]),
+                          pull["n_market"], pull["n_event"], pull["joined"],
+                          pull["followed"]),
                          (self.T, "bid", 42.0, 55.0, 13.0, 20.0, 10456.0, 10456.0,
-                          1, 1, False))
+                          1, 1, True, True))
         self.assertEqual(self.w.stats["pulls"], 1)
 
     def test_the_tape_grace_waits_before_it_counts(self):
         w = self.w
         w.observe(self.T, self.EV, "bid", dict(self.base), 1000, T0 - 30)
         w.observe(self.T, self.EV, "bid", {**self.base, 55.0: 500}, 1000, T0)
-        w.observe(self.T, self.EV, "bid", dict(self.base), 1000, T0 + 20)
+        w.observe(self.T, self.EV, "bid", dict(self.base), 1000, T0 + 20, own_best=55.0)
         self.assertEqual(w.tick(T0 + 21), [])                 # inside the grace
         self.assertEqual(len(w.pending), 1)
         self.assertEqual([r["ev"] for r in w.tick(T0 + 24)], ["pull"])
@@ -115,14 +117,14 @@ class TestHeightenedWatch(unittest.TestCase):
         w.observe(self.T, self.EV, "bid", {42.0: 300, 44.0: 10456}, 1000, T0)
         w.observe(self.T, self.EV, "bid", {42.0: 300, 50.0: 10456}, 1000, T0 + 18)
         w.observe(self.T, self.EV, "bid", {42.0: 300, 55.0: 10456}, 1000, T0 + 35)
-        w.observe(self.T, self.EV, "bid", {42.0: 300}, 1000, T0 + 56)
+        w.observe(self.T, self.EV, "bid", {42.0: 300}, 1000, T0 + 56, own_best=55.0)
         pull, = w.tick(T0 + 60)
         self.assertEqual((pull["px"], pull["base"], pull["life_s"]), (55.0, 42.0, 56.0))
 
     def test_three_pulls_in_30_min_trip_the_market_and_the_event(self):
         self._flash(T0)
         self._flash(T0 + 300)
-        rows = self._flash(T0 + 900, own_best=55.0)
+        rows = self._flash(T0 + 900)
         trips = {r["key"]: r for r in rows if r["ev"] == "trip"}
         self.assertEqual(sorted(trips), ["e|" + self.EV, "m|" + self.T])
         m = trips["m|" + self.T]
@@ -165,10 +167,11 @@ class TestHeightenedWatch(unittest.TestCase):
                          (2, True, DAY_END))
 
     def test_fills_inside_a_window_are_logged(self):
-        self.assertEqual(self.w.note_fill(self.T, self.EV, "bid", 55.0, 100, T0, "o1"), [])
+        self.assertEqual(self.w.note_fill(self.T, self.EV, "bid", 40.0, 100, T0, "o1"), [])
         for k in range(3):
             self._flash(T0 + 60 * k)
-        f, = self.w.note_fill(self.T, self.EV, "bid", 55.0, 4000, T0 + 200, "o1")
+        # at the old base: no strike, just the window's fill
+        f, = self.w.note_fill(self.T, self.EV, "bid", 42.0, 4000, T0 + 200, "o1")
         self.assertEqual((f["scope"], f["key"], f["count"], f["side_pulled"]),
                          ("market", "m|" + self.T, 4000.0, True))
         self.assertAlmostEqual(f["since_trip_s"], 200 - 140, places=1)
@@ -195,12 +198,52 @@ class TestHeightenedWatch(unittest.TestCase):
         self.assertEqual(w.observe(self.T, self.EV, "ask", {42.0: 300, 55.0: 10456.0},
                                    1000, T0 + 380), [])
 
-    def test_exempt_series_are_marked(self):
-        self.w.exempt = lambda t: "skip"
-        rows = []
-        for k in range(3):
-            rows = self._flash(T0 + 60 * k)
-        self.assertTrue(all(r["exempt"] == "skip" for r in rows))
+    def test_uncounted_pulls_are_stats_only(self):
+        w = self.w
+        self.assertEqual(self._flash(T0, px=45.0), [])                 # 3c over
+        self.assertEqual(self._flash(T0 + 300, life=5.0), [])          # stood 5 s
+        self.assertEqual(self._flash(T0 + 600, follow=False), [])      # not followed
+        # our rung was at the better price before it came: not a follow
+        self.assertEqual(self._flash(T0 + 900, own0=55.0), [])
+        w.exempt = lambda t: "spot"
+        self.assertEqual(self._flash(T0 + 1200), [])
+        self.assertEqual((w.stats["raw_pulls"], w.stats["pulls"], w.stats["unc_small"],
+                          w.stats["unc_brief"], w.stats["unc_unfollowed"],
+                          w.stats["unc_exempt"]), (5, 0, 1, 1, 2, 1))
+        self.assertEqual((w.pulls_mkt, w.windows), ({}, {}))
+        # the knobs: every pull counts with them off
+        w2 = H.HeightenedWatch(day_end=day_end, count_min_c=1, min_life_secs=0,
+                               followed_only=False)
+        self.w = w2
+        self.assertEqual([r["ev"] for r in self._flash(T0, px=45.0, life=5.0,
+                                                      follow=False)], ["pull"])
+
+    def test_a_fill_of_ours_after_a_counted_pull_is_a_strike(self):
+        self._flash(T0)                                   # pulled at T0 + 20
+        s, = self.w.note_fill(self.T, self.EV, "bid", 55.0, 4000, T0 + 50, "o1")
+        self.assertEqual((s["ev"], s["px"], s["count"], s["since_pull_s"], s["pull_px"],
+                          s["pull_base"], s["order_id"]),
+                         ("strike", 55.0, 4000.0, 30.0, 55.0, 42.0, "o1"))
+        # at the old base, the other side, or too late: none
+        self.assertEqual(self.w.note_fill(self.T, self.EV, "bid", 42.0, 10, T0 + 60, "o2"), [])
+        self.assertEqual(self.w.note_fill(self.T, self.EV, "ask", 45.0, 10, T0 + 60, "o3"), [])
+        self.assertEqual(self.w.note_fill(self.T, self.EV, "bid", 55.0, 10, T0 + 141, "o4"), [])
+        self.assertEqual(self.w.stats["strikes"], 1)
+
+    def test_hit_while_it_was_pulled_is_a_pull_and_a_strike_not_a_take(self):
+        # Paris 11/02: the lot vanished as a taker sold 4,456 at 55 -- our
+        # 4,000 and 456 of the other followers'
+        self.w.note_print(self.T, "no", 55.0, 4000, T0 + 19.8)
+        self.w.note_print(self.T, "no", 55.0, 456, T0 + 19.8)
+        self.w.note_fill(self.T, self.EV, "bid", 55.0, 4000, T0 + 19.9, "o1")
+        rows = self._flash(T0)
+        self.assertEqual([r["ev"] for r in rows], ["pull", "strike"])
+        self.assertEqual(rows[1]["since_pull_s"], -0.1)
+        self.assertEqual(self.w.stats["taken"], 0)
+        # ...while a print mostly of someone else's size is a take
+        self.w.note_print(self.T, "no", 55.0, 6000, T0 + 619.8)
+        self.assertEqual(self._flash(T0 + 600), [])
+        self.assertEqual(self.w.stats["taken"], 1)
 
     def test_a_restart_keeps_windows_pulls_and_sizes(self):
         for k in range(2):

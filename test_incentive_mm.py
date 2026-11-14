@@ -45217,14 +45217,17 @@ class TestCryptoEventFair(unittest.TestCase):
             self.assertIn(t, bot._cev_stood)
 
 
+
 class TestHeightenedBait1113(unittest.TestCase):
     """HEIGHTENED BAIT MODE, dry (Jack 2026-11-13: "anytime there is
     suspicious activity e.g. show better price and pull 3 times, move to
     'heightened awareness bait mode' and increase vigilance on the event and
-    market", then "Build it dry"): the WS drain feeds the changed books of
-    markets in events we rest in to imm_heightened's watch, our own orders
-    netted out; pulls, trips and our fills inside windows go to the
-    `heightened` sink, and no quote changes."""
+    market", then "Build it dry"; 2026-11-14: "narrow the trips"): the WS
+    drain feeds the changed books of markets in events we rest in to
+    imm_heightened's watch, our own orders netted out; a pull counts only at
+    10c+ over its base, 10 s+, followed by our rung, outside *EVENT / mention
+    / crypto; counted pulls, trips, strikes and our fills inside windows go to
+    the `heightened` sink, and no quote changes."""
     E = "KXEVT-26NOV13"
     A, B = E + "-A", E + "-B"
 
@@ -45247,39 +45250,65 @@ class TestHeightenedBait1113(unittest.TestCase):
             p = mock.patch.object(imm, name, v)
             p.start()
             self.addCleanup(p.stop)
+        # our 20-lot bid rests at 40c under a 42c external top (in the view)
         self.bot._resting_view = {
             self.A: [{"order_id": "o1", "side": "bid", "px": 40.0, "rem": 20.0,
                       "placed": self.now - 100.0, "pad": False}]}
         self.bot._last_panel = {t: {"target": 1000, "est_frac": 0.1,
                                     "pool_per_day": 20.0} for t in (self.A, self.B)}
-        self.yes = {0.42: 300.0, 0.40: 20.0}       # our 20 @ 40c rest under a 42c top
+        self.ext_yes = {0.42: 300.0}
         self.no = {0.42: 300.0}
+        self.rung = {"oid": "o1", "px": 40.0}
+        self.n_oid = 1
 
     def _book(self, dt, t=None, extra=None):
         t = t or self.A
-        yes = dict(self.yes)
-        yes.update(extra or {})
+        yes = dict(self.ext_yes)
+        if t == self.A:
+            k = round(self.rung["px"] / 100.0, 4)
+            yes[k] = yes.get(k, 0.0) + 20.0
+        for p, q in (extra or {}).items():
+            yes[p] = yes.get(p, 0.0) + q
         self.feed.books[t] = (yes, dict(self.no))
         self.feed.dirty = {t}
         self.bot._ws_process_events(self.now + dt)
 
-    def _flash(self, dt, px=0.55, size=10456.0, t=None):
+    def _move(self, px):
+        """The cycle cancels our rung and places it again at `px`."""
+        self.bot._cycle_cancelled.add(self.rung["oid"])
+        self.n_oid += 1
+        oid = f"o{self.n_oid}"
+        self.bot.state.ledger[oid] = {"ticker": self.A, "book_side": "bid",
+                                      "yes_price": int(px), "yes_price_exact": float(px),
+                                      "remaining_count": 20.0}
+        self.rung = {"oid": oid, "px": px}
+
+    def _flash(self, dt, px=0.55, size=10456.0, t=None, follow=True):
+        """A better price shown at dt+1 and pulled at dt+21; our rung
+        follows it at dt+11 (and goes back after) when `follow`."""
         self._book(dt, t)
         self._book(dt + 1, t, {px: size})
+        if follow:
+            self._move(round(px * 100.0, 2))
+            self._book(dt + 11, t, {px: size})
         self._book(dt + 21, t)
         self.bot._ws_process_events(self.now + dt + 26)     # the tape grace
+        if follow:
+            self._move(40.0)
+            self._book(dt + 30, t)
 
     def _rows(self, ev=None):
         return [r for name, r in self.recs
                 if name == "heightened" and (ev is None or r["ev"] == ev)]
 
-    def test_three_pulls_trip_the_market_dry_and_nothing_is_pulled(self):
+    def test_three_followed_pulls_trip_the_market_dry_and_nothing_is_pulled(self):
         with mock.patch.object(imm, "log") as lg:
             for k in range(3):
                 self._flash(120.0 * k)
         pulls = self._rows("pull")
-        self.assertEqual([(p["ticker"], p["side"], p["base"], p["px"], p["mode"])
-                          for p in pulls], [(self.A, "bid", 42.0, 55.0, "dry")] * 3)
+        self.assertEqual([(p["ticker"], p["side"], p["base"], p["px"], p["followed"],
+                           p["mode"]) for p in pulls],
+                         [(self.A, "bid", 42.0, 55.0, True, "dry")] * 3)
         trips = {r["key"]: r for r in self._rows("trip")}
         self.assertEqual(sorted(trips), ["e|" + self.E, "m|" + self.A])
         self.assertEqual(self.cancelled, [])
@@ -45290,6 +45319,19 @@ class TestHeightenedBait1113(unittest.TestCase):
         # the state file keeps the windows
         self.assertEqual(sorted(self.bot._hz_payload()["windows"]),
                          ["e|" + self.E, "m|" + self.A])
+
+    def test_pulls_our_rung_did_not_follow_are_not_counted(self):
+        for k in range(3):
+            self._flash(120.0 * k, follow=False)
+        self.assertEqual(self._rows(), [])
+        self.assertEqual((self.bot._hz.stats["raw_pulls"],
+                          self.bot._hz.stats["unc_unfollowed"]), (3, 3))
+
+    def test_spot_priced_event_strikes_never_count(self):
+        self.assertEqual(imm.heightened_exempt("KXSILVEREVENT-25NOV260930-T58000"), "spot")
+        self.assertEqual(imm.heightened_exempt("KXUSDCADEVENT-16DEC260930-T14125"), "spot")
+        self.assertEqual(imm.heightened_exempt("KXTRUMPMENTION-26NOV14-X"), "skip")
+        self.assertIsNone(imm.heightened_exempt(self.A))
 
     def test_our_own_new_order_is_not_a_flash(self):
         # placed this cycle: in the ledger, not yet in the view
@@ -45302,7 +45344,6 @@ class TestHeightenedBait1113(unittest.TestCase):
         self.bot._cycle_cancelled.add("o9")
         self._book(21.0)
         self.bot._ws_process_events(self.now + 30.0)
-        self.assertEqual(self._rows("pull"), [])
         self.assertEqual(self.bot._hz.stats["flashes"], 0)
 
     def test_our_cancel_racing_the_feed_is_not_a_pull(self):
@@ -45317,7 +45358,6 @@ class TestHeightenedBait1113(unittest.TestCase):
         self._book(2.5, extra={0.55: 4000.0})       # ...for two looks
         self._book(3.0)                             # ...and catches up
         self.bot._ws_process_events(self.now + 10.0)
-        self.assertEqual(self._rows("pull"), [])
         self.assertEqual(self.bot._hz.stats["flashes"], 0)
         # the linger runs out: nothing of ours is netted at 55c any more
         self.bot._ws_process_events(self.now + 10.0)
@@ -45339,33 +45379,52 @@ class TestHeightenedBait1113(unittest.TestCase):
     def test_a_market_in_an_event_we_do_not_rest_in_is_not_watched(self):
         self.bot._resting_view = {}
         for k in range(3):
-            self._flash(120.0 * k)
+            self._flash(120.0 * k, follow=False)
         self.assertEqual(self._rows(), [])
+        self.assertEqual(self.bot._hz.stats["flashes"], 0)
+
+    def test_our_fill_after_a_counted_pull_is_a_strike(self):
+        self._flash(0.0)
+        # our followed rung was hit at 55 before the cycle moved it back
+        self.feed.events = [("fill", {
+            "order_id": "o2", "market_ticker": self.A, "count_fp": "20.00",
+            "yes_price_dollars": "0.5500", "is_taker": False,
+            "ts_ms": int((self.now + 40.0) * 1000), "trade_id": "f1"})]
+        self.bot._ws_process_events(self.now + 40.0)
+        s, = self._rows("strike")
+        self.assertEqual((s["ticker"], s["side"], s["px"], s["count"], s["order_id"],
+                          s["pull_base"], s["pull_px"]),
+                         (self.A, "bid", 55.0, 20.0, "o2", 42.0, 55.0))
+        self.assertAlmostEqual(s["since_pull_s"], 19.0, places=0)
 
     def test_our_fill_inside_the_window_is_logged(self):
         with mock.patch.object(imm, "log"):
             for k in range(3):
                 self._flash(120.0 * k)
+            oid = self.rung["oid"]
             self.feed.events = [("fill", {
-                "order_id": "o1", "market_ticker": self.A, "count_fp": "20.00",
+                "order_id": oid, "market_ticker": self.A, "count_fp": "20.00",
                 "yes_price_dollars": "0.4000", "is_taker": False,
                 "ts_ms": int((self.now + 400.0) * 1000), "trade_id": "f1"})]
             self.bot._ws_process_events(self.now + 400.0)
         f, = self._rows("fill")
         self.assertEqual((f["ticker"], f["side"], f["px"], f["count"], f["scope"],
                           f["order_id"], f["side_pulled"]),
-                         (self.A, "bid", 40.0, 20.0, "market", "o1", True))
+                         (self.A, "bid", 40.0, 20.0, "market", oid, True))
+        self.assertEqual(self._rows("strike"), [])          # at 40c: under the base
 
     def test_the_ten_minute_summary(self):
         with mock.patch.object(imm, "log") as lg:
             for k in range(3):
                 self._flash(120.0 * k)
+            self._flash(400.0, follow=False)
             self.bot._hz_sum_at = self.now - 601.0
             self.bot._hz_check(set(), self.now + 700.0)
         said = [str(c.args[0]) for c in lg.call_args_list
                 if "last 10 min" in str(c.args[0])]
         self.assertEqual(len(said), 1)
-        self.assertIn("3 pulled (0 taken, 0 stood), 2 trips", said[0])
+        self.assertIn("4 pulled, 3 counted (not: 0 exempt, 0 under 10c, 0 under 10s, "
+                      "1 not followed), 2 trips, 0 strikes", said[0])
         self.assertIn("2 windows open (most trips: KXEVT 2); ", said[0])
         self.assertIn("ms avg", said[0])
         self.assertEqual(self.bot._hz_trip_series, {})     # counted afresh
