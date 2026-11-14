@@ -179,6 +179,7 @@ def setUpModule():
     imm.VERCEL_SERIES_FILE = os.path.join(tmp, "vercel_series.json")
     imm.CRYPTO_OPEN_FILE = os.path.join(tmp, "crypto_series.json")
     imm.CRYPTO_EVENT_FAIR_FILE = os.path.join(tmp, "crypto_event_fair.json")
+    imm.CRYPTO_EVENT_STOP_FILE = os.path.join(tmp, "crypto_event_stop.json")
     # the family source verdicts (2026-09-22) load from the live file at
     # import: redirect the path AND forget what was loaded, or membership
     # tests would depend on the trading box's verdict file
@@ -45274,6 +45275,27 @@ class TestCryptoEventFair(unittest.TestCase):
         out, _ = imm.pvd_off_usual_cut([Quote("T", "bid", 20, 300)], None, None, 300,
                                        cold_sides=("bid",), cold_cap=400)
         self.assertEqual([x.count for x in out], [300])
+
+    def test_a_stopped_strike_stands_aside_until_its_period_ends(self):
+        # Jack 2026-11-14: "after these increases, stop quoting markets still pacing <$1"
+        t, _d = self._t()
+        now = time.time()
+        self._snap(t)
+        self.addCleanup(lambda: os.path.exists(imm.CRYPTO_EVENT_STOP_FILE)
+                        and os.remove(imm.CRYPTO_EVENT_STOP_FILE))
+        self.assertIsNone(imm.crypto_event_gate(t, now, 5, 92)[0] or None)
+
+        def write(until):
+            with open(imm.CRYPTO_EVENT_STOP_FILE, "w", encoding="utf-8") as f:
+                json.dump({"tickers": {t: {"until": until, "why": "pacing $0.41 < $1"}}}, f)
+            os.utime(imm.CRYPTO_EVENT_STOP_FILE, (now + len(until), now + len(until)))
+        write(datetime.fromtimestamp(now + 3600, timezone.utc).isoformat())
+        why, inputs, caps = imm.crypto_event_gate(t, now, 5, 92)
+        self.assertEqual((inputs["reason"], caps), ("stopped", None))
+        self.assertIn("pacing $0.41", why)
+        self.assertIsNone(imm.crypto_event_fair_c(t, now))
+        write(datetime.fromtimestamp(now - 60, timezone.utc).isoformat() + " ")   # the period ended
+        self.assertEqual(imm.crypto_event_gate(t, now, 5, 92)[2], (22, 39))
 
     def test_the_narrowed_band(self):
         # Jack 2026-11-14: "Yes, narrow it" -- spot +-0.5%, sigma x0.9 /

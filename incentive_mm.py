@@ -19838,6 +19838,39 @@ CRYPTO_EVENT_FAIR_FILE = os.environ.get(
     "IMM_CRYPTO_EVENT_FAIR_FILE", os.path.join(STATUS_DIR, "crypto_event_fair.json"))
 _CRYPTO_EVENT_RE = re.compile(r"^KX(" + "|".join(_CRYPTO_ASSETS) + r")EVENT$")
 _crypto_event_state: dict = {"snap": None}
+# STOPPED STRIKES (Jack 2026-11-14: "after these increases, stop quoting
+# markets still pacing <$1" -- Kalshi pays a program period nothing under $1,
+# so such a strike's quotes are risk with no reward). CRYPTO_EVENT_STOP_FILE
+# {"tickers": {ticker: {"until": ISO, "why": text}}}, hot-loaded by mtime: a
+# listed strike there stands aside (cancel) until its "until" (the period's
+# end), so a later period quotes it again. Written by hand / a pacing script.
+CRYPTO_EVENT_STOP_FILE = os.environ.get(
+    "IMM_CRYPTO_EVENT_STOP_FILE", os.path.join(STATUS_DIR, "crypto_event_stop.json"))
+_crypto_event_stop: dict = {"mtime": None, "tickers": {}}
+
+
+def crypto_event_stopped(ticker: str, now_ts: float) -> Optional[str]:
+    """Why `ticker` is stopped (CRYPTO_EVENT_STOP_FILE) while its "until" is
+    ahead, else None."""
+    try:
+        mt = os.path.getmtime(CRYPTO_EVENT_STOP_FILE)
+    except OSError:
+        _crypto_event_stop.update(mtime=None, tickers={})
+        return None
+    if mt != _crypto_event_stop["mtime"]:
+        try:
+            with open(CRYPTO_EVENT_STOP_FILE, encoding="utf-8") as f:
+                tk = (json.load(f) or {}).get("tickers") or {}
+            _crypto_event_stop.update(mtime=mt, tickers=tk if isinstance(tk, dict) else {})
+        except (OSError, ValueError):
+            pass                                   # keep the last good read
+    e = _crypto_event_stop["tickers"].get(ticker)
+    if not isinstance(e, dict):
+        return None
+    until = parse_iso_utc(str(e.get("until") or ""))
+    if until is None or until.timestamp() <= now_ts:
+        return None
+    return str(e.get("why") or "stopped")[:120]
 
 
 def crypto_event_series(series: str) -> bool:
@@ -19853,6 +19886,9 @@ def crypto_event_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
     """('', inputs, (bid_cap, ask_floor)) when a crypto event strike may
     quote -- bids at most bid_cap, asks at least ask_floor, None = that side
     not at all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    stop_why = crypto_event_stopped(ticker, now_ts)
+    if stop_why:
+        return f"stopped: {stop_why}", {"reason": "stopped", "why": stop_why}, None
     snap = _crypto_event_state.get("snap")
     if snap is None:
         return "no crypto event read yet", {"reason": "no_read"}, None
