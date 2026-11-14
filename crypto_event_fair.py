@@ -24,10 +24,12 @@ in-progress UTC day dropped.
 
 THE BAND. Each market carries p (the model at spot and sigma) and [p_lo,
 p_hi], the extremes over spot x (1 +- spot_band) and sigma x vol_lo / vol_hi:
-the 1% covers the spot moving while a quote rests (the IMM requotes a market
-every ~1.5-2.5 min), the vol factors the realized-vol model's own error and
-the event day's extra variance. The gate bids at most p_lo - tol and asks at
-least p_hi + tol.
+the spot band covers the spot moving while a quote rests (the IMM requotes a
+market every ~1.5-2.5 min), the vol factors the realized-vol model's own
+error and the event day's extra variance. The gate bids at most p_lo - tol
+and asks at least p_hi + tol. Since 2026-11-14 (Jack: "Yes, narrow it")
++-0.5% and x0.9 / x1.11 with a 2c tol, from +-1%, x0.8 / x1.25 and 3c: the
+wider band sat behind other makers' walls on 119 of the 544 strikes.
 
 JUMP HOLD. An asset whose spot moved more than jump_pct inside jump_window_s
 (from any sample in the window to now) holds every one of its markets for
@@ -53,9 +55,9 @@ SERIES_RE = re.compile(r"^KX([A-Z0-9]+?)EVENT$")
 META_REFRESH_SECS = 600          # Kalshi market lists
 VOL_REFRESH_SECS = 3600          # daily candles -> sigma
 VOL_SHRINK_W = ctm.VOL_SHRINK_W  # the monthly fleet's 0.25
-SPOT_BAND = 0.01
-VOL_LO = 0.8
-VOL_HI = 1.25
+SPOT_BAND = 0.005               # narrowed 2026-11-14 (Jack: "Yes, narrow it"); was 1%
+VOL_LO = 0.9                    # ... was x0.8
+VOL_HI = 1.11                   # ... was x1.25
 JUMP_PCT = 0.01
 JUMP_WINDOW_SECS = 300
 JUMP_HOLD_SECS = 600

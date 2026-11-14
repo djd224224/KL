@@ -44939,7 +44939,8 @@ class TestCryptoEventFair(unittest.TestCase):
     bid at most p_lo - tol and every ask at least p_hi + tol of the crypto
     event fair, failing closed, leading off the model. Fixture: the 01:00Z
     11/14 read of KXBTCEVENT-09DEC261530-T7150000 (31.2c, band 24.1-36.7)
-    on its 5c x 92c book (32,000 YES at 5c, 35,150 NO at 8c)."""
+    on its 5c x 92c book (32,000 YES at 5c, 35,150 NO at 8c); tol 2c since
+    the band narrowed (Jack 2026-11-14: "Yes, narrow it")."""
 
     CATEGORY = TestCryptoOpenFamily.CATEGORY
     setUp = TestCryptoOpenFamily.setUp
@@ -45001,17 +45002,17 @@ class TestCryptoEventFair(unittest.TestCase):
         self._snap(t, hold=now - 1)
         self.assertIsNone(r())
         self._snap(t)
-        self.assertEqual(r(b=40), "band")                  # bid over 36.7 + 3
-        self.assertEqual(r(a=21), "band")                  # ask under 24.1 - 3
-        self.assertIsNone(r(b=39, a=22))
+        self.assertEqual(r(b=39), "band")                  # bid over 36.7 + 2
+        self.assertEqual(r(a=22), "band")                  # ask under 24.1 - 2
+        self.assertIsNone(r(b=38, a=23))
         why, inputs, caps = imm.crypto_event_gate(t, now, 5, 92)
-        self.assertEqual((why, caps), ("", (21, 40)))
+        self.assertEqual((why, caps), ("", (22, 39)))
         self.assertEqual(inputs["fair"], 31.2)
         self.assertAlmostEqual(imm.crypto_event_fair_c(t, now), 31.2)
         self._snap(t, p=0.004, lo=0.0, hi=0.02)            # far out: asks only
-        self.assertEqual(imm.crypto_event_gate(t, now, 1, 50)[2], (None, 5))
+        self.assertEqual(imm.crypto_event_gate(t, now, 1, 50)[2], (None, 4))
         self._snap(t, p=0.995, lo=0.98, hi=1.0)            # deep in: bids only
-        self.assertEqual(imm.crypto_event_gate(t, now, 50, 99)[2], (95, None))
+        self.assertEqual(imm.crypto_event_gate(t, now, 50, 99)[2], (96, None))
         with mock.patch.object(imm, "CRYPTO_EVENT_TOL_CENTS", 70):
             self._snap(t)
             self.assertEqual(r(b=None, a=None), "decided")
@@ -45063,8 +45064,8 @@ class TestCryptoEventFair(unittest.TestCase):
         self.assertIn(t, bot.state.selected, [s_ for s_ in lines if "universe:" in s_][-2:])
         sides = {side for side, _px, _n in rest}
         self.assertEqual(sides, {"bid", "ask"}, rest)
-        self.assertTrue(all(px <= 21 for side, px, _n in rest if side == "bid"), rest)
-        self.assertTrue(all(px >= 40 for side, px, _n in rest if side == "ask"), rest)
+        self.assertTrue(all(px <= 22 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 39 for side, px, _n in rest if side == "ask"), rest)
         # the leads: 12 ticks ahead of each wall (~95% of the side under the
         # 0.5 discount), inside the band caps, off the crypto spot fair
         self.assertIn(("bid", 17, 200), rest)
@@ -45074,11 +45075,11 @@ class TestCryptoEventFair(unittest.TestCase):
 
     def test_a_wall_inside_the_band_is_joined_only_outside_it(self):
         # YES wall at 20c and NO at 55c (a 45c offer): the bid joins at the
-        # 20c reference, under the 21c cap; the offer at 45 sits over 40
+        # 20c reference, under the 22c cap; the offer at 45 sits over 39
         bot, t, rest, lines = self._cycle(yes=(("0.20", "5000"),), no=(("0.55", "5000"),))
         self.assertTrue(rest, lines[-30:])
-        self.assertTrue(all(px <= 21 for side, px, _n in rest if side == "bid"), rest)
-        self.assertTrue(all(px >= 40 for side, px, _n in rest if side == "ask"), rest)
+        self.assertTrue(all(px <= 22 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 39 for side, px, _n in rest if side == "ask"), rest)
 
     def _resting(self, bot, t):
         return sorted((o["book_side"], o["yes_price"]) for o in bot.state.sim_orders.values()
@@ -45087,7 +45088,7 @@ class TestCryptoEventFair(unittest.TestCase):
     def test_a_touch_fighting_the_band_stands_aside(self):
         bot, t, rest, lines = self._cycle()
         self.assertTrue(rest)
-        # a 45c bid over the 36.7c top of the band + 3: the book knows more
+        # a 45c bid over the 36.7c top of the band + 2: the book knows more
         bot.client.books[t] = {"orderbook_fp": {"yes_dollars": [["0.45", "5000"]],
                                                 "no_dollars": [["0.50", "5000"]]}}
         lines = []
@@ -45097,6 +45098,17 @@ class TestCryptoEventFair(unittest.TestCase):
         self.assertIn(t, bot._cev_stood)
         self.assertTrue(any(f"crypto-event stand-aside {t}: book" in s_ for s_ in lines),
                         [s_ for s_ in lines if "crypto-event" in s_])
+
+    def test_the_narrowed_band(self):
+        # Jack 2026-11-14: "Yes, narrow it" -- spot +-0.5%, sigma x0.9 /
+        # x1.11, 2c (from +-1%, x0.8 / x1.25, 3c)
+        env = {k: os.environ.get(f"IMM_{k}") for k in (
+            "CRYPTO_EVENT_TOL_CENTS", "CRYPTO_EVENT_SPOT_BAND",
+            "CRYPTO_EVENT_VOL_LO", "CRYPTO_EVENT_VOL_HI")}
+        if all(v is None for v in env.values()):
+            self.assertEqual((imm.CRYPTO_EVENT_TOL_CENTS, imm.CRYPTO_EVENT_SPOT_BAND,
+                              imm.CRYPTO_EVENT_VOL_LO, imm.CRYPTO_EVENT_VOL_HI),
+                             (2, 0.005, 0.9, 1.11))
 
     def test_a_stale_spot_or_a_jump_takes_everything_off(self):
         for kw in ({"spot_age": imm.CRYPTO_EVENT_TTL_SECS + 30},

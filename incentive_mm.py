@@ -19727,12 +19727,16 @@ def refresh_crypto_open_series(client, now_ts: Optional[float] = None) -> int:
 #     (KXBTCHITBY, KXSOLABOVEBY, ...) stay NO side only.
 #   BAND: each strike's [p_lo, p_hi] over spot x (1 +- CRYPTO_EVENT_SPOT_
 #     BAND) and sigma x CRYPTO_EVENT_VOL_LO / _HI. The IMM requotes a market
-#     every ~1.5-2.5 min, so the 1% is the spot moving under a resting
-#     quote: a Nov 17 strike near the money moves ~9c on it, a Dec 9 one
-#     ~3c. Every bid is at most p_lo - CRYPTO_EVENT_TOL_CENTS, every ask at
-#     least p_hi + it (mort_cap_quotes, LAST). On the 01:00Z 11/14 read
-#     KXBTCEVENT-09DEC261530-T7150000 priced 31.2c (band 24.1-36.7): bids
-#     <= 21c, asks >= 40c, against a 5c x 92c book.
+#     every ~1.5-2.5 min, so the spot band is the spot moving under a
+#     resting quote. Every bid is at most p_lo - CRYPTO_EVENT_TOL_CENTS,
+#     every ask at least p_hi + it (mort_cap_quotes, LAST).
+#     NARROWED (Jack 2026-11-14: "Yes, narrow it"): shipped at spot +-1%,
+#     sigma x0.8 / x1.25 and 3c; by 01:40Z other makers had moved their
+#     walls in around the fair (KXBTCEVENT-01DEC261100-T7300000 16c x 23c on
+#     a 20.9c fair) and 119 of the 544 strikes sat behind both walls, the
+#     live count 447 -> 386. Now spot +-0.5%, sigma x0.9 / x1.11, 2c: 28
+#     behind both walls on the same books. A Nov 18 strike near the money
+#     moves ~4-5c on the 0.5% (~9c on the old 1%), a Dec 9 one ~1.5c.
 #   STAND ASIDE (cancel, fail closed): no read, a spot older than
 #     CRYPTO_EVENT_TTL_SECS, an asset in its JUMP HOLD (spot moved more than
 #     CRYPTO_EVENT_JUMP_PCT inside 5 min: 10 min out), a strike the model
@@ -19747,10 +19751,10 @@ def refresh_crypto_open_series(client, now_ts: Optional[float] = None) -> int:
 # IMM_CRYPTO_EVENT_LEAD=0 keeps the gate without the leads.
 CRYPTO_EVENT_FAIR = os.environ.get("IMM_CRYPTO_EVENT_FAIR", "1") == "1"
 CRYPTO_EVENT_LEAD = os.environ.get("IMM_CRYPTO_EVENT_LEAD", "1") == "1"
-CRYPTO_EVENT_TOL_CENTS = _env_int("IMM_CRYPTO_EVENT_TOL_CENTS", 3)
-CRYPTO_EVENT_SPOT_BAND = _env_float("IMM_CRYPTO_EVENT_SPOT_BAND", 0.01)
-CRYPTO_EVENT_VOL_LO = _env_float("IMM_CRYPTO_EVENT_VOL_LO", 0.8)
-CRYPTO_EVENT_VOL_HI = _env_float("IMM_CRYPTO_EVENT_VOL_HI", 1.25)
+CRYPTO_EVENT_TOL_CENTS = _env_int("IMM_CRYPTO_EVENT_TOL_CENTS", 2)
+CRYPTO_EVENT_SPOT_BAND = _env_float("IMM_CRYPTO_EVENT_SPOT_BAND", 0.005)
+CRYPTO_EVENT_VOL_LO = _env_float("IMM_CRYPTO_EVENT_VOL_LO", 0.9)
+CRYPTO_EVENT_VOL_HI = _env_float("IMM_CRYPTO_EVENT_VOL_HI", 1.11)
 CRYPTO_EVENT_TTL_SECS = _env_int("IMM_CRYPTO_EVENT_TTL_SECS", 180)
 CRYPTO_EVENT_REFRESH_SECS = _env_int("IMM_CRYPTO_EVENT_REFRESH_SECS", 15)
 CRYPTO_EVENT_JUMP_PCT = _env_float("IMM_CRYPTO_EVENT_JUMP_PCT", 0.01)

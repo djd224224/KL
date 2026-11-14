@@ -58,6 +58,16 @@ class TestShapes(unittest.TestCase):
                                    ud.terminal_prob(spot, k, sig, t), places=12)
         self.assertEqual(cef.terminal_prob(100, 90, 0.02, 0.0), 1.0)
 
+    def test_the_narrowed_defaults(self):
+        # Jack 2026-11-14: "Yes, narrow it"
+        self.assertEqual((cef.SPOT_BAND, cef.VOL_LO, cef.VOL_HI), (0.005, 0.9, 1.11))
+        p, lo, hi = cef.price_band("greater", 73000.0, None, 68248.7, 0.0211, 17.5)
+        p1, lo1, hi1 = cef.price_band("greater", 73000.0, None, 68248.7, 0.0211, 17.5,
+                                      0.01, 0.8, 1.25)
+        self.assertAlmostEqual(p, p1)
+        self.assertGreater(lo, lo1)
+        self.assertLess(hi, hi1)
+
     def test_the_band_holds_the_fair_and_widens_when_the_spot_matters(self):
         p, lo, hi = cef.price_band("greater", 71500.0, None, 68238.6, 0.0211, 25.82)
         self.assertLess(lo, p)
