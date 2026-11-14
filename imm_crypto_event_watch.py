@@ -156,6 +156,14 @@ w.PAGE = (w.PAGE
           .replace("<h1>Post-vote dead books</h1>",
                    "<h1>Crypto after economic events</h1>")
           .replace(".tag{display:inline-block;", ".tag{background:var(--live);display:inline-block;")
+          # kind = the coin here: the dead/live section is a by-coin table,
+          # and its dead-vs-live chart (kchart) has nothing to draw -- hidden,
+          # not removed, so the page script still finds it
+          .replace("<h2>Dead books vs live books</h2>", "<h2>By coin</h2>")
+          .replace('<div class="wrap" style="padding:8px 12px;margin-top:8px"><div class="mut key">'
+                   'Net (est rewards + trading) by kind, cumulative:',
+                   '<div class="wrap" style="display:none"><div class="mut key">'
+                   'Net (est rewards + trading) by kind, cumulative:')
           .replace("(11/04 list = the hand-built list; scan = added by pvd_scan.py every 15 min: "
                    "new programs, relit periods, extended stops)",
                    "(every market with a program; limits = the crypto event fair's band caps)"))
