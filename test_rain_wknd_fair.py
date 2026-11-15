@@ -37,6 +37,10 @@ def setUpModule():
     p = mock.patch.object(r.requests, "get", side_effect=RuntimeError("no network in tests"))
     p.start()
     _NET.append(p)
+    # ...nor for ACIS (LONG LEADS' climatology): a test passes clim_fn
+    p = mock.patch.object(r.requests, "post", side_effect=RuntimeError("no network in tests"))
+    p.start()
+    _NET.append(p)
 
 
 def tearDownModule():
@@ -741,6 +745,143 @@ class TestComposite(unittest.TestCase):
         # 01:01Z next day: the NBE's 00Z run (12Z + 12h, an hour on)
         self._write(now=datetime(2026, 10, 16, 1, 1, tzinfo=UTC))
         self.assertEqual(self.calls["E"], 2)
+
+
+class TestLongLeads(unittest.TestCase):
+    """Jack 2026-11-14: "KXSNOWDAYS-01DEC26-01APR27, KXRAINTHANKSGIVING-26NOV26
+    (and rain/snow markets generally) should have fair value calculations and
+    auto-quoted when they come online"."""
+
+    TURKEY = ("If the total precipitation at New York City (KNYC) in New York City on "
+              "November 26, 2026 is strictly greater than 0 inches, then the market "
+              "resolves to Yes.")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "rain_wknd_fair.json")
+        day = ["2026-11-26", "2026-11-26"]
+        self.events = {"KXRAINTHANKSGIVING-26NOV26": {"sat": "2026-11-26", "days": 1, "markets": {
+            "KXRAINTHANKSGIVING-26NOV26-NYC": {"code": "NYC", "span": day},
+            "KXRAINTHANKSGIVING-26NOV26-SEA": {"code": "SEA", "span": day}}}}
+        self.clim_calls = []
+
+    def clim(self, sid, first, days):
+        self.clim_calls.append((sid, first, days))
+        if sid == "KSEA":
+            raise RuntimeError("ACIS KSEA: under 150 complete windows")
+        return 0.33, 450
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_thanksgivings_on_wording_names_its_day(self):
+        # the 11/13 listing said "on November 26, 2026 is"; the parser knew
+        # only Election Day's "in November 3, 2026 is", so all 48 cities were
+        # rejected ("its rules name no station or no day")
+        self.assertEqual(r.rules_span(self.TURKEY), (date(2026, 11, 26), date(2026, 11, 26)))
+        got, why = r.classify_day_markets([{"ticker": "KXRAINTHANKSGIVING-26NOV26-NYC",
+                                            "event_ticker": "KXRAINTHANKSGIVING-26NOV26",
+                                            "rules_primary": self.TURKEY}])
+        self.assertEqual((got["events"], why), ({"KXRAINTHANKSGIVING-26NOV26": ["2026-11-26", 1]},
+                                                ""))
+
+    def test_an_older_classifiers_rejection_is_read_again_at_once(self):
+        # the live file rejected Thanksgiving at 16:57Z 11/14 with the old
+        # parser; its 6-hour retry would have run past the 01:25Z start
+        now = datetime(2026, 11, 14, 22, tzinfo=UTC).timestamp()
+        old = {"day_discovered_at": now - 600, "day_series": {},
+               "day_rejected": {"KXRAINTHANKSGIVING": {
+                   "at": now - 3600, "why": "KXRAINTHANKSGIVING-26NOV26-TTN: its rules "
+                                            "name no station or no day"}}}
+        calls = []
+
+        def get_json(path, params):
+            calls.append(path)
+            if path == "/series":
+                return {"series": [{"ticker": "KXRAINTHANKSGIVING"}]}
+            return {"markets": [{"ticker": "KXRAINTHANKSGIVING-26NOV26-NYC",
+                                 "event_ticker": "KXRAINTHANKSGIVING-26NOV26",
+                                 "rules_primary": self.TURKEY}]}
+        found, rejected, at = r.discover_day_series(old, now, get_json)
+        self.assertEqual(list(found), ["KXRAINTHANKSGIVING"])
+        self.assertEqual((rejected, at), ({}, now))
+        # a current verdict waits out the hour as before
+        calls.clear()
+        again = {"day_discovered_at": now, "day_series": found,
+                 "day_rejected": {"KXRAINX": {"at": now, "why": "no open market",
+                                              "v": r.DAY_CLASSIFY_VERSION}}}
+        self.assertEqual(r.discover_day_series(again, now + 60, get_json)[2], now)
+        self.assertEqual(calls, [])
+
+    def test_climatology_counts_wet_windows_and_drops_missing_ones(self):
+        daily = {}
+        for y in range(1996, 2026):
+            for k in range(-7, 8):
+                d = date(y, 11, 26) + timedelta(days=k)
+                daily[d.isoformat()] = 0.2 if k == 0 else (0.0 if k % 2 else 0.0)
+        p, n = r.climatology(daily, date(2026, 11, 26), 1)
+        self.assertEqual(n, 450)
+        self.assertAlmostEqual(p, 30 / 450)
+        # a missing day drops its window; under CLIM_MIN_WINDOWS -> None
+        for y in range(1996, 2026):
+            for k in range(-7, 4):                 # 4 windows a year left: 120
+                daily[(date(y, 11, 26) + timedelta(days=k)).isoformat()] = None
+        self.assertIsNone(r.climatology(daily, date(2026, 11, 26), 1))
+        self.assertEqual(r.parse_pcpn("T"), 0.0)
+        self.assertIsNone(r.parse_pcpn("M"))
+        self.assertIsNone(r.parse_pcpn("0.50A"))
+        self.assertEqual(r.parse_pcpn("0.01"), 0.01)
+
+    def test_past_the_fit_the_fair_is_the_climatology(self):
+        # 11/15 01:30Z, the program's start: NYC's day starts 11/26 05:00Z,
+        # ~267 hours out -- past the NBE's 264, so no model weight
+        now = datetime(2026, 11, 15, 1, 30, tzinfo=UTC)
+        run = datetime(2026, 11, 14, 12, tzinfo=UTC)
+        nbe = lambda sid: (run, periods(run, [0.6] * 21))
+        ok, miss = r.write_fair_file(self.path, now=now, events=self.events, nbe_fn=nbe,
+                                     clim_fn=self.clim)
+        self.assertEqual((ok, miss), (1, 1))
+        d = self.read()
+        m = d["markets"]["KXRAINTHANKSGIVING-26NOV26-NYC"]
+        self.assertEqual((m["p"], m["src"], m["w_model"], m["clim"]), (0.33, "C", 0.0, 0.33))
+        self.assertIn("no climatology", d["missing"]["KXRAINTHANKSGIVING-26NOV26-SEA"])
+        self.assertIn("ACIS KSEA", d["missing"]["KXRAINTHANKSGIVING-26NOV26-SEA"])
+        # read once: the next pass reuses the file's (and retries the failure
+        # only after AUTO_RETRY_SECS)
+        r.write_fair_file(self.path, now=now + timedelta(minutes=15), events=self.events,
+                          nbe_fn=nbe, clim_fn=self.clim)
+        self.assertEqual(len(self.clim_calls), 2)
+
+    def test_the_nbm_blends_in_toward_the_fits_edge(self):
+        # lead 204h from the run (+3h lag): weight (264 - 204) / 120 = 0.5
+        run = datetime(2026, 11, 17, 14, tzinfo=UTC)
+        now = run + timedelta(hours=4)
+        nbe = lambda sid: (run, periods(run, [0.6] * 21))
+        r.write_fair_file(self.path, now=now, events=self.events, nbe_fn=nbe, clim_fn=self.clim)
+        m = self.read()["markets"]["KXRAINTHANKSGIVING-26NOV26-NYC"]
+        self.assertEqual((m["lead_h"], m["w_model"], m["src"]), (204.0, 0.5, "E+C"))
+        self.assertAlmostEqual(m["p"], round(0.5 * m["p_model"] + 0.5 * 0.33, 4), places=4)
+        # inside the fit the model alone, as before
+        run2 = datetime(2026, 11, 21, 12, tzinfo=UTC)
+        r.write_fair_file(self.path, now=run2 + timedelta(hours=4), events=self.events,
+                          nbe_fn=lambda sid: (run2, periods(run2, [0.6] * 21)),
+                          clim_fn=self.clim)
+        m = self.read()["markets"]["KXRAINTHANKSGIVING-26NOV26-NYC"]
+        self.assertNotIn("clim", m)
+        self.assertEqual(m["src"], "E")
+
+    def test_the_switch_leaves_the_far_day_without_a_fair(self):
+        now = datetime(2026, 11, 15, 1, 30, tzinfo=UTC)
+        run = datetime(2026, 11, 14, 12, tzinfo=UTC)
+        with mock.patch.object(r, "CLIM_ENABLE", False):
+            ok, _ = r.write_fair_file(self.path, now=now, events=self.events,
+                                      nbe_fn=lambda sid: (run, periods(run, [0.6] * 21)),
+                                      clim_fn=self.clim)
+        self.assertEqual(ok, 0)
+        self.assertEqual(self.clim_calls, [])
+        self.assertIn("lead past the fit",
+                      self.read()["missing"]["KXRAINTHANKSGIVING-26NOV26-NYC"])
 
 
 if __name__ == "__main__":

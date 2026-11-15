@@ -137,6 +137,33 @@ MIN_PERIODS = 10             # a run read back with fewer rows is a failed read
 NBE_LAG_HOURS = 3.0          # a run is usable ~3h after its nominal time
 NBE_MAX_AGE_HOURS = float(os.environ.get("IMM_RAIN_WKND_NBE_MAX_AGE_HOURS", "30"))
 MAX_LEAD_HOURS = float(os.environ.get("IMM_RAIN_WKND_MAX_LEAD_HOURS", "144"))
+# LONG LEADS (Jack 2026-11-14: "KXSNOWDAYS-01DEC26-01APR27,
+# KXRAINTHANKSGIVING-26NOV26 (and rain/snow markets generally) should have
+# fair value calculations and auto-quoted when they come online"). A day
+# series can list weeks ahead -- Thanksgiving (11/26) listed 11/13, its
+# program from 11/15 01:25Z, ~268 hours out -- while the fit stops at
+# MAX_LEAD_HOURS, so it would have had no fair until 11/20, a day before its
+# program ends. Past the fit the fair is the station's CLIMATOLOGY: the share
+# of wet windows (any day >= 0.01 in) among the same window shifted up to
+# CLIM_HALF_DAYS either way in each of the CLIM_YEARS years before it (ACIS
+# daily pcpn at the NBM station; a window with a missing day is dropped,
+# never read as dry). Over (MAX_LEAD_HOURS, CLIM_LEAD_HOURS] -- the NBE
+# reaches 264 hours -- the NBM fair (the last recalibration row) blends in
+# linearly: its weight (CLIM_LEAD_HOURS - lead) / (CLIM_LEAD_HOURS -
+# MAX_LEAD_HOURS), 1 at the fit's edge. That blend is a hedge, NOT a fit:
+# the NBE was never scored past 144 hours. A station without CLIM_MIN_WINDOWS
+# windows gets no fair (the gate stands it aside). Each (station, window) is
+# read once and kept in the file's "clim" for CLIM_TTL_DAYS, at most
+# CLIM_MAX_READS new reads a pass. IMM_RAIN_WKND_CLIM=0: no fair past the fit
+# (as before).
+CLIM_ENABLE = os.environ.get("IMM_RAIN_WKND_CLIM", "1") == "1"
+CLIM_LEAD_HOURS = float(os.environ.get("IMM_RAIN_WKND_CLIM_LEAD_HOURS", "264"))
+CLIM_YEARS = 30
+CLIM_HALF_DAYS = 7
+CLIM_MIN_WINDOWS = 150
+CLIM_TTL_DAYS = 7.0
+CLIM_MAX_READS = 60
+ACIS_URL = "https://data.rcc-acis.org/StnData"
 # THE COMPOSITE (Jack 2026-10-30: "incorporate both hourly and 6 hours for a
 # composite"). The NBE above is issued twice a day (00Z/12Z, at the IEM ~1-2h
 # later), so a fair could lag the forecast by 14 hours. The Blend's
@@ -182,6 +209,10 @@ SERIES_CATEGORY = "Climate and Weather"
 AUTO_DAY_ENABLE = os.environ.get("IMM_RAIN_DAY_AUTO", "1") == "1"
 DAY_DISCOVER_SECS = EVENTS_TTL_SECS
 DAY_RETRY_SECS = 6 * 3600
+# bump when classify_day_markets / rules_span learn new wording: every
+# rejection an older one wrote is re-read at the next pass (2 = 2026-11-14,
+# "on <day> is")
+DAY_CLASSIFY_VERSION = 2
 MAX_SPAN_DAYS = 3
 HTTP_TIMEOUT = 30
 USER_AGENT = "KL-IMM-rain-wknd-fair/1.0"
@@ -190,7 +221,10 @@ _MON = {m: i + 1 for i, m in enumerate(
 _CODE_RE = re.compile(r"\bat (?:CLI)?([A-Z]{3})\b")
 _SPAN_RE = re.compile(r"within ([A-Z][a-z]+ \d{1,2}, \d{4}) through ([A-Z][a-z]+ \d{1,2}, \d{4})")
 _ICAO_RE = re.compile(r"\(K([A-Z]{3})\)")
-_DAY_RE = re.compile(r"\bin ([A-Z][a-z]+ \d{1,2}, \d{4}) is\b")
+# "in November 3, 2026 is" (Election Day) or "on November 26, 2026 is"
+# (Thanksgiving, 2026-11-14: the "in"-only form rejected all 48 cities as
+# "its rules name no station or no day")
+_DAY_RE = re.compile(r"\b(?:in|on) ([A-Z][a-z]+ \d{1,2}, \d{4}) is\b")
 _CITY_SEG_RE = re.compile(r"[A-Z]{2,5}")
 _ZERO_RE = re.compile(r"total precipitation\b.*\bstrictly greater than 0 inches", re.I)
 
@@ -210,7 +244,8 @@ def station_code(rules: str) -> Optional[str]:
 def rules_span(rules: str) -> Optional[Tuple[date, date]]:
     """'... on any day within October 10, 2026 through October 11, 2026 ...'
     -> (date(2026, 10, 10), date(2026, 10, 11)); a one-day market's '... in
-    November 3, 2026 is ...' -> that day twice; else None."""
+    November 3, 2026 is ...' (or '... on November 26, 2026 is ...') -> that
+    day twice; else None."""
     m = _SPAN_RE.search(rules or "")
     days = m.groups() if m else None
     if days is None:
@@ -291,14 +326,15 @@ def weekend_p(periods: List[Tuple[datetime, float]], ws: datetime, we: datetime
 
 def market_fair(periods: List[Tuple[datetime, float]], runtime: datetime,
                 sat: date, lst_hours: int,
-                lag_hours: float = NBE_LAG_HOURS, days: int = 2) -> Optional[dict]:
+                lag_hours: float = NBE_LAG_HOURS, days: int = 2,
+                max_lead: Optional[float] = None) -> Optional[dict]:
     """{'p', 'p_raw', 'lead_h', 'coverage'} for one city's weekend (or its
     one day: `days`), else None (a window that has started, a lead past the
     fit, or periods that do not cover it). The lead runs from `runtime` +
     `lag_hours` (the composite's: its freshest run's)."""
     ws, we = window(sat, lst_hours, days)
     lead = (ws - (runtime + timedelta(hours=lag_hours))).total_seconds() / 3600.0
-    if lead < 0 or lead > MAX_LEAD_HOURS:
+    if lead < 0 or lead > (MAX_LEAD_HOURS if max_lead is None else max_lead):
         return None
     r = weekend_p(periods, ws, we)
     if r is None:
@@ -307,6 +343,60 @@ def market_fair(periods: List[Tuple[datetime, float]], runtime: datetime,
     p = min(max(recalibrate(p_raw, lead), 0.01), 0.99)
     return {"p": round(p, 4), "p_raw": round(p_raw, 4), "lead_h": round(lead, 1),
             "coverage": round(cov, 2)}
+
+
+def parse_pcpn(v) -> Optional[float]:
+    """An ACIS daily value -> inches: 'T' (trace) 0.0, 'M' / 'S' / an
+    accumulated 'A' total / anything else unreadable None (missing)."""
+    s = str(v if v is not None else "").strip()
+    if s in ("T", "t"):
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def climatology(daily: Dict[str, Optional[float]], first: date, days: int,
+                years: int = CLIM_YEARS, half: int = CLIM_HALF_DAYS
+                ) -> Optional[Tuple[float, int]]:
+    """(share of wet windows, windows) over the `days`-long window from
+    `first`, shifted -half..+half days in each of the `years` years before
+    it (LONG LEADS); a window with a missing day is dropped. None under
+    CLIM_MIN_WINDOWS windows."""
+    wet = n = 0
+    for back in range(1, years + 1):
+        try:
+            base = first.replace(year=first.year - back)
+        except ValueError:                       # Feb 29 in a common year
+            base = date(first.year - back, 2, 28)
+        for o in range(-half, half + 1):
+            d0 = base + timedelta(days=o)
+            vals = [daily.get((d0 + timedelta(days=k)).isoformat()) for k in range(days)]
+            if any(v is None for v in vals):
+                continue
+            n += 1
+            wet += any(v >= 0.01 for v in vals)
+    return (wet / n, n) if n >= CLIM_MIN_WINDOWS else None
+
+
+def fetch_clim(sid: str, first: date, days: int) -> Tuple[float, int]:
+    """(p, windows) from ACIS daily precipitation at `sid` (LONG LEADS)."""
+    s = date(first.year - CLIM_YEARS - 1, 1, 1)
+    e = min(date(first.year - 1, 12, 31) + timedelta(days=CLIM_HALF_DAYS + days + 1),
+            datetime.now(timezone.utc).date() - timedelta(days=1))
+    rsp = requests.post(ACIS_URL, json={"sid": sid, "sdate": s.isoformat(),
+                                        "edate": e.isoformat(), "elems": [{"name": "pcpn"}]},
+                        timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+    rsp.raise_for_status()
+    js = rsp.json()
+    if js.get("error"):
+        raise RuntimeError(f"ACIS {sid}: {str(js['error'])[:120]}")
+    daily = {str(d): parse_pcpn(v) for d, v in js.get("data") or []}
+    got = climatology(daily, first, days)
+    if got is None:
+        raise RuntimeError(f"ACIS {sid}: under {CLIM_MIN_WINDOWS} complete windows")
+    return got
 
 
 def _ts(s: str) -> Optional[datetime]:
@@ -632,7 +722,12 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
     at = float(old.get("day_discovered_at") or 0.0)
     if not AUTO_DAY_ENABLE:
         return {}, rejected, at
-    if now_ts - at < DAY_DISCOVER_SECS:
+    # a verdict from an older classifier is re-read at once (2026-11-14: the
+    # parser learned Thanksgiving's "on <day> is" wording, and the 6-hour
+    # retry would have kept the old rejection past the program's start)
+    old_verdicts = any(int(v.get("v") or 1) != DAY_CLASSIFY_VERSION
+                       for v in rejected.values() if isinstance(v, dict))
+    if now_ts - at < DAY_DISCOVER_SECS and not old_verdicts:
         return found, rejected, at
     js = _signed_or_public(get_json, {"category": SERIES_CATEGORY}, path="/series")
     names = sorted({str(s.get("ticker") or "") for s in js.get("series") or []})
@@ -641,7 +736,8 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
         if "RAIN" not in s or s in (SERIES, "KXRAIN") + DAY_SERIES or (skip and skip(s)):
             continue
         last = found.get(s) or rejected.get(s) or {}
-        if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS:
+        if last and now_ts - float(last.get("at") or 0.0) < DAY_RETRY_SECS and (
+                s in found or int(last.get("v") or 1) == DAY_CLASSIFY_VERSION):
             if s in found:
                 out[s] = found[s]
             continue
@@ -654,7 +750,7 @@ def discover_day_series(old: dict, now_ts: float, get_json: Optional[Callable] =
             continue
         got, why = classify_day_markets(mj.get("markets") or [])
         if got is None:
-            rejected[s] = {"at": now_ts, "why": why}
+            rejected[s] = {"at": now_ts, "why": why, "v": DAY_CLASSIFY_VERSION}
             continue
         rejected.pop(s, None)
         out[s] = dict(got, at=now_ts)
@@ -710,7 +806,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                     resolve_fn: Optional[Callable] = None,
                     nbs_fn: Optional[Callable] = None,
                     nbs_hourly_fn: Optional[Callable] = None,
-                    skip: Optional[Callable[[str], bool]] = None) -> Tuple[int, int]:
+                    skip: Optional[Callable[[str], bool]] = None,
+                    clim_fn: Optional[Callable] = None) -> Tuple[int, int]:
     """Build and atomically write the weekend-rain fair file; returns
     (markets with a fair, open markets without one). Kalshi's open events
     are re-read hourly, and every pass while none is open (the Monday gap
@@ -723,7 +820,8 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
     default resolve_station; see AUTO-MAPPED STATIONS). A rain series no
     family claims joins on its contract (AUTO DAY SERIES; `skip`: the
     bot's own rain families); a pass that lists the category re-reads the
-    events."""
+    events. A window past the fit takes the station's climatology (LONG
+    LEADS; clim_fn, default fetch_clim)."""
     now = now or datetime.now(timezone.utc)
     ts = now.timestamp()
     old = _read_json(path)
@@ -836,9 +934,35 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         except Exception as ex:
             _log(f"NBS hourly read failed ({type(ex).__name__}: {str(ex)[:120]}); "
                  f"the file's cycle stands in while young enough")
+    # 2b. LONG LEADS: the climatology of each window that may sit past the
+    # fit (the lead runs from the run, which can be up to NBE_MAX_AGE_HOURS
+    # old), read once and kept CLIM_TTL_DAYS; a failed read is retried after
+    # AUTO_RETRY_SECS
+    clim: Dict[str, dict] = {k: v for k, v in (old.get("clim") or {}).items()
+                             if isinstance(v, dict)
+                             and ts - float(v.get("at") or 0) < CLIM_TTL_DAYS * 86400}
+    reads = 0
+    for t, ev, sat, sid, lst, days in todo if CLIM_ENABLE else ():
+        key = f"{sid}|{sat.isoformat()}|{days}"
+        lead_now = (window(sat, lst, days)[0] - now).total_seconds() / 3600.0
+        c = clim.get(key) or {}
+        if lead_now <= MAX_LEAD_HOURS - NBE_MAX_AGE_HOURS or c.get("p") is not None \
+                or (c.get("why") and ts - float(c.get("at") or 0) < AUTO_RETRY_SECS) \
+                or reads >= CLIM_MAX_READS:
+            continue
+        reads += 1
+        try:
+            p, n = (clim_fn or fetch_clim)(sid, sat, days)
+            clim[key] = {"p": round(p, 4), "n": n, "at": ts}
+            _log(f"climatology {key}: {p:.1%} of {n} windows")
+        except Exception as ex:
+            clim[key] = {"at": ts, "why": f"{type(ex).__name__}: {str(ex)[:160]}"}
+            _log(f"! climatology {key} failed: {clim[key]['why']}")
     # 3. each market's composite: the NBS periods (hourly and 6-hourly blended
     # where both reach), the NBE for the rest, the lead off the freshest run
     for t, ev, sat, sid, lst, days in todo:
+        ws = window(sat, lst, days)[0]
+        c = clim.get(f"{sid}|{sat.isoformat()}|{days}") or {}
         srcs = []
         e_rt, e_per = nbe.get(sid) or (None, [])
         if e_rt is not None and (ts - e_rt.timestamp()) / 3600.0 <= NBE_MAX_AGE_HOURS:
@@ -852,6 +976,17 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                 and (ts - h_rt.timestamp()) / 3600.0 <= NBS_HOURLY_MAX_AGE_HOURS:
             srcs.append(("H", h_rt, NBS_HOURLY_LAG_HOURS, dict(h_per)))
         if not srcs:
+            lead_now = (ws - now).total_seconds() / 3600.0
+            if CLIM_ENABLE and lead_now > MAX_LEAD_HOURS:
+                if c.get("p") is None:
+                    missing[t] = ("past the fit, no fresh NBE run and no climatology"
+                                  + (f" ({c['why']})" if c.get("why") else ""))
+                    continue
+                markets[t] = dict(p=min(max(c["p"], 0.01), 0.99), p_raw=None,
+                                  lead_h=round(lead_now, 1), coverage=None, event=ev,
+                                  station=sid, run=None, fetched_at=stamp, src="C",
+                                  runs={}, clim=c["p"], clim_n=c.get("n"), w_model=0.0)
+                continue
             missing[t] = "no fresh NBE run"
             continue
         by = {k: per for k, _rt, _lag, per in srcs}
@@ -865,6 +1000,31 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
         # the freshest run: the newest runtime (a tie, the one posted soonest)
         _k, f_rt, f_lag, _p = max(srcs, key=lambda s: (s[1], -s[2]))
         f = market_fair(sorted(merged.items()), f_rt, sat, lst, lag_hours=f_lag, days=days)
+        lead = (ws - (f_rt + timedelta(hours=f_lag))).total_seconds() / 3600.0
+        if f is None and CLIM_ENABLE and lead > MAX_LEAD_HOURS:
+            # LONG LEADS: the climatology, with the NBM blended in toward the
+            # fit's edge where it reaches the window
+            if c.get("p") is None:
+                missing[t] = ("past the fit and no climatology"
+                              + (f" ({c['why']})" if c.get("why") else ""))
+                continue
+            fl = market_fair(sorted(merged.items()), f_rt, sat, lst, lag_hours=f_lag,
+                             days=days, max_lead=CLIM_LEAD_HOURS)
+            w = (min(max((CLIM_LEAD_HOURS - lead) / (CLIM_LEAD_HOURS - MAX_LEAD_HOURS),
+                         0.0), 1.0) if fl is not None and CLIM_LEAD_HOURS > MAX_LEAD_HOURS
+                 else 0.0)
+            p = w * (fl["p"] if fl else 0.0) + (1.0 - w) * c["p"]
+            srcs_used = [k for k in ("H", "S", "E") if k in by] if w > 0 else []
+            markets[t] = dict(p=round(min(max(p, 0.01), 0.99), 4),
+                              p_raw=fl["p_raw"] if fl else None, lead_h=round(lead, 1),
+                              coverage=fl["coverage"] if fl else None, event=ev,
+                              station=sid, run=f_rt.isoformat() if w > 0 else None,
+                              fetched_at=stamp, src="+".join(srcs_used + ["C"]),
+                              runs={k: rt.isoformat() for k, rt, _lag, _p in srcs} if w > 0
+                              else {},
+                              clim=c["p"], clim_n=c.get("n"), w_model=round(w, 3),
+                              p_model=fl["p"] if fl else None)
+            continue
         if f is None:
             span = "the weekend" if days == 2 else "the day"
             missing[t] = (f"lead past the fit or periods short of {span}" if "E" in by
@@ -894,9 +1054,11 @@ def write_fair_file(path: str, now: Optional[datetime] = None,
                               "searched": sorted(h_searched)},
                "auto_stations": auto, "unmapped": unmapped,
                "day_series": day_series, "day_rejected": day_rejected,
-               "day_discovered_at": day_at,
+               "day_discovered_at": day_at, "clim": clim,
                "model": {"w": W, "recal": RECAL, "min_coverage": MIN_COVERAGE,
                          "max_lead_h": MAX_LEAD_HOURS, "nbe_max_age_h": NBE_MAX_AGE_HOURS,
+                         "clim": CLIM_ENABLE, "clim_lead_h": CLIM_LEAD_HOURS,
+                         "clim_years": CLIM_YEARS, "clim_half_days": CLIM_HALF_DAYS,
                          "nbs_w_hourly": NBS_W_HOURLY,
                          "nbs_max_age_h": NBS_MAX_AGE_HOURS,
                          "nbs_hourly_max_age_h": NBS_HOURLY_MAX_AGE_HOURS}}
