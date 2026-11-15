@@ -20158,8 +20158,8 @@ def crypto_event_fair_c(ticker: str, now_ts: float) -> Optional[float]:
 #     moved > 0.35 daily sigma inside 5 min: 5 min out); a weekday strike within 12 h of its
 #     measurement (the release it settles one minute after); a strike the model does not price;
 #     no side left.
-#   LIMITS: bids at most bid_max, asks at least ask_min -- fair -/+ (the series' 2c base, copper
-#     6c, + the 25% vol-error term, + on weekdays 2 sd of its source's 3-min move), floors 2c on
+#   LIMITS: bids at most bid_max, asks at least ask_min -- fair -/+ (the 2c base, copper too since
+#     11/14, + the 25% vol-error term, + on weekdays 2 sd of its source's 3-min move), floors 2c on
 #     weekends and 0 on weekdays -- live every cycle in place of the list's 15-min fair-file
 #     limits (pvd_limits), as the crypto wave books (no lead, no book-fight stand-aside: wide
 #     weekend books sit off fair and the limits already hold them out).

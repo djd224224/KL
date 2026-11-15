@@ -25,7 +25,8 @@ MODES (as wave_fair.py):
            CUTOFF_H (12 h) of a strike's measurement (the release it settles one minute after
            outweighs the model's vol-error allowance inside that); floor 0 (no fair = nothing
            rests); and a requote term in the margin (below).
-THE MARGIN (c) per strike: the series' base (2c, copper 6c: Jack 2026-11-14 "tighten to 2c")
+THE MARGIN (c) per strike: the 2c base, every series (Jack 2026-11-14: "tighten to 2c"; copper,
+6c until that evening: "make copper and all metals/fx at the 2c margin")
 + 100 x VOL_ERR x phi(z)|z| (how far the fair moves under a 25% vol error, as the tune's), and
 on weekdays + 100 x phi(z) x REQUOTE_SD x (the source's move over REQUOTE_MIN / the sigma to
 the measurement): a quote rests up to ~3 min between requotes while the market moves. A wave
@@ -65,8 +66,7 @@ PROXY = {"KXGOLDEVENT": ("hl", "xyz:GOLD"), "KXSILVEREVENT": ("hl", "xyz:SILVER"
          "KXEURUSDEVENT": ("hl", "xyz:EUR"), "KXGBPUSDEVENT": ("hl", "xyz:GBP"),
          "KXAUDUSDEVENT": ("kraken", "AUDUSD"), "KXUSDCADEVENT": ("kraken", "USDCAD"),
          "KXUSDMXNEVENT": ("bitso", "usd_mxn")}
-MARGIN = {s: 2.0 for s in SERIES}
-MARGIN["KXCOPPEREVENT"] = 6.0
+MARGIN = {s: 2.0 for s in SERIES}        # copper too since 11/14 evening (was 6c)
 WEEKEND_GAP_DAYS = 0.5
 CUTOFF_H = 12.0
 WEEKEND_FLOOR, WEEKDAY_FLOOR = 2, 0

@@ -32,13 +32,15 @@ class Constants(unittest.TestCase):
         spec.loader.exec_module(wf)
         self.assertEqual(wf.VOL_D, fx.VOL_D)
         self.assertEqual(wf.PROXY, fx.PROXY)
-        self.assertEqual(wf.MARGIN, fx.MARGIN)
+        self.assertEqual(set(wf.MARGIN), set(fx.MARGIN))
         self.assertEqual(set(wf.CLOSE), set(fx.SERIES))
         self.assertEqual(wf.WEEKEND_GAP_DAYS, fx.WEEKEND_GAP_DAYS)
         for k, v in (("WEEKDAY_CUTOFF_H", fx.CUTOFF_H), ("WEEKEND_FLOOR", fx.WEEKEND_FLOOR),
                      ("WEEKDAY_FLOOR", fx.WEEKDAY_FLOOR)):
             if hasattr(wf, k):                   # wave_fair's weekday mode (11/14)
                 self.assertEqual(getattr(wf, k), v, k)
+        if hasattr(wf, "WEEKDAY_CUTOFF_H"):      # that version carries copper's 2c too (11/14 evening)
+            self.assertEqual(wf.MARGIN, fx.MARGIN)
 
 
 class Calendar(unittest.TestCase):
@@ -59,7 +61,7 @@ class Calendar(unittest.TestCase):
         self.assertAlmostEqual(fx.trading_days(U(2026, 11, 23, 15), t0, weekday_from=wed), 3.0 * 1.4 + 0.5)
 
     def test_the_margin(self):
-        # at the money: the 2c base (copper 6c), + on a weekday the requote term
+        # at the money: the 2c base (every series, copper too since 11/14), + on a weekday the requote term
         p, m, b, a = fx.strike_fair("KXGOLDEVENT", 100.0, 100.0, 2.0, False)
         self.assertAlmostEqual(p, 0.5)
         self.assertAlmostEqual(m, 2.0)
@@ -67,7 +69,8 @@ class Calendar(unittest.TestCase):
         p, m, b, a = fx.strike_fair("KXGOLDEVENT", 100.0, 100.0, 2.0, True)
         rq = 100 * fx._phi(0) * fx.REQUOTE_SD * math.sqrt(fx.REQUOTE_MIN / 1440 * 7 / 5) / math.sqrt(2.0)
         self.assertAlmostEqual(m, 2.0 + rq)
-        self.assertAlmostEqual(fx.strike_fair("KXCOPPEREVENT", 100.0, 100.0, 2.0, False)[1], 6.0)
+        self.assertAlmostEqual(fx.strike_fair("KXCOPPEREVENT", 100.0, 100.0, 2.0, False)[1], 2.0)
+        self.assertEqual(set(fx.MARGIN.values()), {2.0})      # Jack 11/14: "make copper and all metals/fx at the 2c margin"
         # a deep tail: floors 2c on the weekend, 0 on a weekday
         self.assertEqual(fx.strike_fair("KXGOLDEVENT", 100.0, 140.0, 2.0, False)[2:], (2, 2))
         self.assertEqual(fx.strike_fair("KXGOLDEVENT", 100.0, 140.0, 2.0, True)[2:], (0, 2))
