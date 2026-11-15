@@ -108,7 +108,49 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
 - **Shard 2:** $1,140 free while the wave's "if everything filled" was far above it; Jack moved $1.5k from shard 0 (02:58Z).
 - **Result 12:50Z 11/14:** ~$405 banked, ~$1,356/day, every quoting strike pacing $1+, 57 stopped, 0 fills.
 
+## 11/14: the upcoming-wave notice (pass 11)
+
+- Jack: "market-wave skill should also scan upcoming rewards markets and callout if a wave would be greenlit so i have advanced notice". `wave_detect.py --upcoming` + `wave_alert.py upcoming`, pass 11 of the relight task.
+- First read 18:53Z: 1,217 upcoming programs (1,155 markets starting within 72 h, 20 start windows; 824 of the 1,206 upcoming markets were next periods of markets paying now): no wave. KXYTVIEWSHIGH (FIT, 140 markets, 16 events, $1,000/day, 11/15 16:00Z) was alerted 11/08, so its start won't re-trigger. A trial with that alert removed: preflight PASS (15 checks); the notice read "UPCOMING WAVE Sun 11:00 AM ET (in 21 h): 16 events would be greenlit, 0 denied (140 mkts, $1,000/day pools)".
+
+## 11/14: known shapes and the type B relights
+
+- Jack, on holding KXYTVIEWSHIGH back: "yes for upcoming new shapes, notify me and it's my call so dont default to turning it on e.g. KXYTVIEWSHIGH. but default to running the wave for elections, after economic events, and things of similar shapes to what's been run on waves so far".
+- `wave_detect.py`: `KNOWN_SHAPES` = Elections, Politics (the categories of the waves he ran and kept; w1107-mixed / w1108-mixed, which he turned off, don't count). A would-be FIT / NEAR in any other category is `NEW`: needs-you, texted (wave_alert), never auto-listed. A known shape settling on a live feed (the bot's `SCAN_LIVE_SOURCE_KEYWORDS`) is CHECK. LISTED now means the list or an ENABLED registry wave whose stop cap hasn't passed: the series of the two turned-off waves had read LISTED forever (7 such series in that day's upcoming and live checks moved to FEW: no alert either way).
+- The gap it closed: both after-economic-events waves were capped at their first program end (05:00Z 11/15), so pass 7 would list nothing of a later batch while the detector called it LISTED: the next weekend would have gone unseen. Now w1113-fxmetals has `window fx-shut` (lists only Fri 5 PM - Sun 5 PM ET, each entry stopping at the reopen) and w1114-cryptoev no cap; `wave_fair.py` rolls its Friday close each weekend (Kalshi weekly settlements reproduce 11/13's metals exactly, Yahoo's last bar the FX within 0.024%; a close more than 0.5% off its 24/7 source is refused: 11/06's copper read 1.06% off).
+- Pass 11 also gives advance notice of a registry RELIGHT over the bar (exit 5, email; text on a preflight FAIL), and of a NEW shape (text, preflight as if he said yes).
+- Checked side by side on live data: the upcoming scan differed only in KXYTVIEWSHIGH (FIT -> NEW) and four w1108-mixed series (LISTED -> FEW); the live check over the 4,784 programs since 11/13 only in three w1107-mixed series (LISTED -> FEW). The new fair matched the old to 0.01c on the same prices.
+
+## 11/14: after-economic-events any time, with a fair
+
+- Jack, the same evening: "after-economic events can quote anytime not just when markets are shut, but need a fair value". w1113-fxmetals' `window fx-shut` came off (no window, no cap) and its tune got `--fair-floor 0`.
+- `wave_fair.py` weekday mode (FX and metals trading): priced from now on the last Friday close moved by the 24/7 source; time from now, with the Sunday gap only across a weekend; per-strike `margin_extra` = 2 sd of the fair's move over ~18 min; no fair within 12 h of a strike's measurement; `floor` 0 so a strike without a fair rests nothing; valid 20 min. Weekend mode unchanged (same 2,490 fairs to 0.01c on the same prices). `pvd_wave_tune.py` reads the file's `floor` and `margin_extra`.
+- Pyth's live prices (the settlement source) need a key (401), so the weekday fair uses the venues. A simulated Wednesday: 2,097 fairs, 393 inside 12 h standing aside, staleness margin median 1.7c, max 8.3c.
+- The weak spot: the fair refreshes every 15 min while the market moves; a bot-side live fair (the crypto strikes' 15-s refresh and jump hold) would tighten the margin. Offered.
+
+## 11/14: the bot's live FX + metals fair (70d05b7 + d736cc4)
+
+- Jack: "Yes, build it" (a 15-second live fair in the bot for FX and metals, like the crypto one). `fx_event_fair.py` + `incentive_mm.fx_event_gate` / `fx_event_wave_limits` (in `pvd_limits`): the listed strikes' limits come from the live fair every cycle; stale, jump-held, unclosed or (weekdays) 12-h-to-measurement strikes stand aside. Same model as wave_fair.py: 0.006c apart on the same spot; on live prices the 15-min file lagged it by up to 8c (USD/MXN moved 0.26% in 20 min).
+- Jack (evening): "make copper and all metals/fx at the 2c margin". ff05c8b: `fx_event_fair.MARGIN` 2c for all nine series (copper had 6c, as its CU/USD feed runs 24/7); KL `wave_fair.py` the same (uncommitted). The vol-error term (up to ~6c at |z| = 1) and the weekday requote term are unchanged: median total margin ~5-6.5c on FX / gold / silver, copper 10c -> 6c.
+
+## 11/14-11/15: the crypto wave after its first night
+
+- **The drop after banking:** when bank-early went 1,500 at 05:09Z 11/14, `--no-drop` came off the tune, so a strike that banked $1.30 dropped 1,500 -> 300 a side and lost ~85-95% of its share (BTC's dropped strikes $174 -> $61/day; 215 of 483 had dropped by 17:35Z): ~$1.4k -> ~$0.6k/day. Jack: "Yes, keep 1,500" (`--base-size 1500`, 18:22Z).
+- **Jump holds:** a 20:50-21:34Z selloff (BTC 65.4k -> 64.0k) held all four coins; 0 crypto orders rested at 21:31Z; the page read $0/day. Every 15 s read re-arms the hold while spot stays 1% off its 5-min range, so a slide holds a coin throughout. Jack: "Stay down for 5min instead of 10min" (fa0c63c, 21:50Z). 13:12Z 11/14 - 04:00Z 11/15: at least one coin held 36% of the time (HYPE 30%, ETH 19%, SOL 18%, BTC 8%); since 18Z the clean hours banked $50-55, the four most-held $5-23; $333 in 10 h against ~$520 clean, with 6 restarts 21:52-02:12Z.
+- **The $313 scare (22:00Z):** holds, the page reading the bot's latest pass (~4-5 min behind, the first pass after a restart before the re-place), and books that widened 2c -> 5c after the drop with 145 asks behind the new touch, walked back by the join wait a step a pass.
+- **Fills:** 4 in ~27 h: three ETH takes of 11-23 lots at 19:02Z (-$1.60 at the next fair); a 1,000-lot SOL T8300 01DEC bid at 9c at 21:58:09Z, mid-selloff, 6 min after a restart, its coin not held (fair ~10c then, 13.4c by 04:00Z: +$44). The page put the period (to 05:00Z 11/15) at $940 banked.
+- **Jack kept the FX vol cushion** on top of the 2c base (11/15 ~02:15Z, "Yes, keep it") after "wdym?" on "the 2c margin": 76 of 1,141 resting off-floor FX sides sat at a limit the cushion set, a median 5c from a flat 2c's.
+
+## 11/15: the Kelly run and what reached the ladders
+
+- **The Kelly run (12:20Z):** a taker bought Mark Kelly YES at 2c in KXDPRESPRIMARY state by state (AK, CA, CO, CT, HI, IA, ID, 80 s): 1,600 contracts off our asks, -$24. Jack: "a bunch of mark kelly quotes filled across multiple events, why didnt that trigger a pause", then "build both, can you also cancel faster?" -> 736cc94: the candidate breaker, hit-name-first pulls, batched fast cancels.
+- **The ladders' check (Jack: "does it have the recent protections just added on the mark kelly fills across events"):** none reached crypto or FX. `risk_group` had no group for a coin or a pair; the gates' stand-asides cancelled one order at a time as the quote loop reached each strike (BTC's 02:05:48Z hold: 128 orders over 95 s); `floor_auto` skipped crypto (no fair file). Jack: "build these to generalize into the market-wave skill" -> 2063782 (the fair hold pull; every wave series with no group its own group: replayed 11/06-11/15, 0 trips) and the wave tools (the floor check reads the bot's own fair; `set NAME floor_max_mult`; w1114-cryptoev on it at max 1, offs only; whydark names FX stand-asides).
+- **The same day, another session:** 1fd880b "earn only" (Jack: "unless purposefully unwinding, no IMM should quote without earning").
+
 ## Open questions closed since 11/08
+
+- 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
+- 11/14: KXSENATENOM-TNR-28's 12 markets pinned at 0 until Blackburn names her appointee (lifting them -- `setarg w1111-statenom pin KXSENATENOM-TNR-28-<X>:0 --unset` each -- is Jack's word); the KXSENATENOM series pin lifted (436 markets back on the tiers: 175,600 -> 1,148,900 contracts listed), KSR-JMOR, ARR-JBOO and COD-MBEN keep their 200 pins.
 
 - Auto-list vs notify-only overnight: keep listing, under the gates (and 24/7 since 11/11).
 - UNWIND_ONLY_WAVES scope (3032ea8) and held-only (470df6c).

@@ -341,7 +341,12 @@ class WhyDark(unittest.TestCase):
             fh.write(f"{s(6)} [IMM] crypto-event stand-aside T-4: SOL jump hold (8m left)\n")
             fh.write(f"{s(5)} [IMM] pvd guard T-5: bid/ask out (limits bid<=1 ask>=99, last 50, book 40x60)\n")
             fh.write(f"{s(4)} [IMM] pvd guard T-5: clear\n")
-        got = pp.log_side_reasons(["T-1", "T-2", "T-3", "T-4", "T-5"], now)
+            fh.write(f"{s(3)} [IMM] fx-event stand-aside T-6: KXUSDMXNEVENT source price is 240s old\n")
+            fh.write(f"{s(3)} [IMM] fx-event stand-aside T-7: KXGOLDEVENT jump hold (4m left)\n")
+            fh.write(f"{s(2)} [IMM] fx-event resume T-7\n")
+        got = pp.log_side_reasons(["T-1", "T-2", "T-3", "T-4", "T-5", "T-6", "T-7"], now)
+        self.assertIn("FX fair stands it aside (KXUSDMXNEVENT source price", got[("T-6", "bid")])
+        self.assertNotIn(("T-7", "ask"), got)             # resumed
         self.assertIn(("T-1", "ask"), got)
         self.assertIn(("T-2", "bid"), got)
         self.assertNotIn(("T-3", "ask"), got)             # dry: logged only
@@ -349,6 +354,142 @@ class WhyDark(unittest.TestCase):
         self.assertIn(("T-4", "ask"), got)
         self.assertNotIn(("T-5", "bid"), got)             # cleared
         os.remove(p)
+
+
+class FloorPass(unittest.TestCase):
+    """The $1-floor check in every 15-min pass (Jack 2026-11-14: "Yes, every 15 min")."""
+
+    def setUp(self):
+        self.mult = os.path.join(TMP, "size_mult_wt.json")
+        self.fair = os.path.join(TMP, "wave_fair_wt.json")
+        self._fair(NOW + timedelta(minutes=30))
+        self.w = _wave(tune=list(pw.PRESETS["default"]) + ["--size-mult-file", self.mult, "--fair-file", self.fair],
+                       floor_auto=True)
+        self.calls = []
+        self.real = pp.cmd_resize
+        pp.cmd_resize = lambda a: self.calls.append(a) or 0
+
+    def tearDown(self):
+        pp.cmd_resize = self.real
+
+    def _fair(self, valid_until):
+        with open(self.fair, "w", encoding="utf-8") as fh:
+            json.dump({"at": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "valid_until": valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")}, fh)
+
+    def test_applies_without_its_own_run_and_never_above_5x(self):
+        self.w["floor"] = {"max_mult": 10}
+        with redirect_stdout(io.StringIO()):
+            pp.pass_resize("wt", self.w, now=NOW)
+        a = self.calls[0]
+        self.assertEqual((a.name, a.apply, a.no_run, a.force, a.no_off), ("wt", True, True, False, False))
+        self.assertEqual((a.aim, a.max_mult), (1.20, 5.0))
+
+    def test_skips_without_a_live_fair_or_a_multiples_file(self):
+        self._fair(NOW - timedelta(minutes=1))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            pp.pass_resize("wt", self.w, now=NOW)
+            os.remove(self.fair)
+            pp.pass_resize("wt", self.w, now=NOW)
+            pp.pass_resize("wt", _wave(tune=list(pw.PRESETS["default"]) + ["--fair-file", self.fair]), now=NOW)
+        self.assertEqual(self.calls, [])
+        self.assertIn("fair file stale", out.getvalue())
+        self.assertIn("fair file unreadable", out.getvalue())
+        self.assertIn("no --size-mult-file", out.getvalue())
+
+    def test_a_wave_the_bot_prices_counts_as_live(self):
+        """Jack 2026-11-15: "build these to generalize into the market-wave skill" -- the
+        crypto wave has no fair file; its fair is the bot's crypto_event_fair.json"""
+        st = os.path.join(INC, "crypto_event_fair.json")
+
+        def bot(age_min, series="KXBTCEVENT"):
+            with open(st, "w", encoding="utf-8") as fh:
+                json.dump({"checked_ts": NOW.timestamp() - age_min * 60,
+                           "markets": {f"{series}-17NOV260930-T7000000": {"p": 0.4}}}, fh)
+        w = _wave(series=["KXBTCEVENT"], tune=list(pw.PRESETS["default"]) + ["--size-mult-file", self.mult],
+                  floor_auto=True)
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                bot(1.0)
+                pp.pass_resize("wcr", w, now=NOW)
+                self.assertEqual(len(self.calls), 1)
+                bot(9.0)                                      # the bot's read stopped
+                pp.pass_resize("wcr", w, now=NOW)
+                bot(1.0, series="KXETHEVENT")                 # it prices other series only
+                pp.pass_resize("wcr", w, now=NOW)
+        finally:
+            os.remove(st)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("the bot's crypto_event_fair.json is 9 min old", out.getvalue())
+        self.assertIn("the bot prices none of its series live", out.getvalue())
+
+    def test_floor_auto_on_adds_the_multiples_file_and_max_mult_caps_it(self):
+        _save_reg({"wt": _wave()})
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_auto", value="on"))
+            pw._set(argparse.Namespace(name="wt", key="floor_auto", value="on"))   # added once
+            pw._set(argparse.Namespace(name="wt", key="floor_max_mult", value="1"))
+        w = pw.load()["waves"]["wt"]
+        self.assertTrue(w["floor_auto"])
+        self.assertEqual(pw._vals(w["tune"], "--size-mult-file"), [pp.size_mult_path("wt")])
+        self.assertEqual(w["floor"], {"max_mult": 1.0})
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="wt", key="floor_max_mult", value="6"))
+        w["floor"] = {"max_mult": 1.0}
+        with redirect_stdout(io.StringIO()):
+            pp.pass_resize("wt", dict(w, tune=w["tune"] + ["--fair-file", self.fair]), now=NOW)
+        self.assertEqual(self.calls[-1].max_mult, 1.0)               # only offs
+
+    def test_the_pass_runs_it_after_the_fair_and_before_the_tune_only_when_on(self):
+        order = []
+        real_one, real_load = pw.run_one, pw.load
+        pw.run_one = lambda cmd, env=None, tail=4: order.append(
+            "tune" if any("pvd_wave_tune" in str(x) for x in cmd) else "scan") or 0
+        pp_pass = pp.pass_resize
+        pp.pass_resize = lambda name, w, now=None: order.append("resize") or 0
+        try:
+            with redirect_stdout(io.StringIO()):
+                pw._run_wave("wt", self.w, argparse.Namespace(write=True))
+                self.assertEqual(order, ["scan", "resize", "tune"])
+                order.clear()
+                pw._run_wave("wt", dict(self.w, floor_auto=False), argparse.Namespace(write=True))
+                self.assertEqual(order, ["scan", "tune"])
+                order.clear()
+                pw._run_wave("wt", self.w, argparse.Namespace(write=False))   # a dry run never resizes
+                self.assertEqual(order, ["scan", "tune"])
+        finally:
+            pw.run_one, pw.load, pp.pass_resize = real_one, real_load, pp_pass
+
+
+class ResizeNoRun(unittest.TestCase):
+    def test_no_run_writes_the_multiples_but_no_setarg_or_wave_run(self):
+        mult = os.path.join(TMP, "size_mult_nr.json")
+        state = os.path.join(TMP, "resize_state_nr.json")
+        with open(state, "w", encoding="utf-8") as fh:
+            json.dump({"at": (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "off_candidates": ["KXA-6"]}, fh)
+        res = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "since_restart_min": 200.0,
+               "dash_age_min": 2.0,
+               "markets": [_m("KXA-2", 0.6, x_aim=2.5, proj_max=1.9), _m("KXA-6", 0.1, proj_max=0.3)]}
+        saved = (pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.subprocess.run)
+        runs = []
+        pp.measure = lambda name, a, now=None: res
+        pp.print_pace = lambda r: None
+        pp.size_mult_path = lambda n: mult
+        pp.resize_state_path = lambda n: state
+        pp.subprocess.run = lambda *a, **k: runs.append(a)
+        try:
+            a = argparse.Namespace(name="nr", aim=1.20, max_mult=5.0, real=0.65, window_min=60.0, keep_within=0.05,
+                                   no_off=False, json=None, apply=True, force=False, no_run=True)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(pp.cmd_resize(a), 0)
+        finally:
+            pp.measure, pp.print_pace, pp.size_mult_path, pp.resize_state_path, pp.subprocess.run = saved
+        with open(mult, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), {"KXA-2": 2.5, "KXA-6": 0})   # up; off on its 2nd read
+        self.assertEqual(runs, [])
 
 
 if __name__ == "__main__":

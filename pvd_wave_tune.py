@@ -89,6 +89,12 @@ after --since, series in --series), idempotently:
                      past its limit stands out (the bot's "pvd guard ... out (limits ...)").
                      No fair for the ticker, a file past valid_until, or an unreadable file:
                      only the floor sides may rest. Entry note "fair_clamp".
+                     The file may also carry (2026-11-14, the after-economic-events
+                     weekday fair; Jack: "after-economic events can quote anytime not just
+                     when markets are shut, but need a fair value"): "floor": c, which
+                     replaces --fair-floor (0 = a ticker with no fair rests NOTHING), and
+                     "margin_extra": {ticker: c}, added to that ticker's margin (how far its
+                     fair can move before the next refresh). A stale file's floor still holds.
 
 Holds pvd_scan's lock while it reads and writes, so a scan can't overwrite it
 (and it waits up to --wait secs for a running scan, then gives up: the next run
@@ -319,13 +325,17 @@ def main() -> int:
             tmult_why = f"; size-mult file unreadable ({ex}): x1"
             tmult = {}
     # FAIR LIMITS (--fair-file): None = off; {} = on with no usable fair (floors only)
-    fair_map, fair_base, fair_why = None, {}, ""
+    fair_map, fair_base, fair_extra, fair_why = None, {}, {}, ""
+    fair_floor = a.fair_floor
     if a.fair_file:
         try:
             with open(a.fair_file, encoding="utf-8") as fh:
                 _fd = json.load(fh)
             fair_map = {k: float(v) for k, v in (_fd.get("fair") or {}).items()}
             fair_base = {k: float(v) for k, v in (_fd.get("margin") or {}).items()}
+            fair_extra = {k: float(v) for k, v in (_fd.get("margin_extra") or {}).items()}
+            if _fd.get("floor") is not None:
+                fair_floor = max(0, min(49, int(_fd["floor"])))
             if _fd.get("valid_until") and now >= ts(_fd["valid_until"]):
                 fair_why = f"fair file stale since {_fd['valid_until']}"
                 fair_map = {}
@@ -537,13 +547,14 @@ def main() -> int:
                 b0, a0 = int(e["bid_max"]), int(e["ask_min"])
                 f_ = fair_map.get(t)
                 if f_ is None:
-                    fb, fa = a.fair_floor, 100 - a.fair_floor
-                    why_f = f"no fair ({fair_why or 'not in the file'}): floors only"
+                    fb, fa = fair_floor, 100 - fair_floor
+                    why_f = (f"no fair ({fair_why or 'not in the file'}): "
+                             + ("floors only" if fair_floor else "nothing rests"))
                     n_fair_none += 1
                 else:
-                    m_ = fair_margin(fair_base.get(t.split("-")[0], a.fair_margin), f_, a.fair_vol_err)
-                    fb = max(a.fair_floor, int(math.floor(f_ - m_)))
-                    fa = min(100 - a.fair_floor, int(math.ceil(f_ + m_)))
+                    m_ = fair_margin(fair_base.get(t.split("-")[0], a.fair_margin), f_, a.fair_vol_err)                         + fair_extra.get(t, 0.0)
+                    fb = max(fair_floor, int(math.floor(f_ - m_)))
+                    fa = min(100 - fair_floor, int(math.ceil(f_ + m_)))
                     why_f = f"fair {f_:g} +-{m_:.1f}c"
                 b1, a1 = min(b0, fb), max(a0, fa)
                 if (b1, a1) != (b0, a0):
@@ -829,8 +840,9 @@ def main() -> int:
             msg += f"; wave added {a.wave_added}: {n_wadd} set"
         if fair_map is not None:
             msg += (f"; fair limits ({os.path.basename(a.fair_file)}, margin {a.fair_margin:g}c + vol err "
-                    f"{a.fair_vol_err:g}, floor {a.fair_floor}c{'; ' + fair_why if fair_why else ''}): "
-                    f"{n_fair} clamped, {n_fair_none} with no fair (floors only)")
+                    f"{a.fair_vol_err:g}{' + staleness' if fair_extra else ''}, floor {fair_floor}c"
+                    f"{'; ' + fair_why if fair_why else ''}): {n_fair} clamped, {n_fair_none} with no fair "
+                    f"({'floors only' if fair_floor else 'nothing rests'})")
         if a.no_halts:
             msg += f"; no halts: {n_nohalt} set"
         elif a.halts_on:

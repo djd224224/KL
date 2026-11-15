@@ -1,6 +1,6 @@
 ---
 name: market-wave
-description: Executable runbook for quoting a wave of newly incentivized Kalshi markets with the IMM (elections, politics, awards, the "after economic events" metals / FX / crypto ladders, any series) without getting picked off, and for sizing a wave over the $1 payout floor. End to end: detect the new programs (wave_detect.py), choose scope by fixed rules, pass the gates (pvd_waves.py preflight: guards, capacity, shard cash, scan budget), list on the default preset (add + run), start the dashboard, verify quoting (whydark), watch pick-offs, then report every parameter and ask what to tune. Use when a wave or batch of programs launches, Jack names series to quote fast, he invokes /market-wave, or the 24/7 wave check reports a wave. Also for a live wave's follow-ups: pacing under $1, "size them up", stopping markets under $1, why a market isn't quoting, "am I getting baited", pick-off / dark / relight alerts, size-ups by cost bucket, new program periods, switch files and the post-mortem.
+description: Executable runbook for quoting a wave of newly incentivized Kalshi markets with the IMM (elections, politics, awards, the "after economic events" metals / FX / crypto ladders, any series) without getting picked off, and for sizing a wave over the $1 payout floor. End to end: detect the new programs (wave_detect.py), choose scope by fixed rules, pass the gates (pvd_waves.py preflight: guards, capacity, shard cash, scan budget), list on the default preset (add + run), start the dashboard, verify quoting (whydark), watch pick-offs, then report and ask what to tune. Use when a wave or batch of programs launches, an upcoming-wave notice arrives or Jack asks what's coming, Jack names series to quote fast, he invokes /market-wave, or the 24/7 wave check reports a wave. Also for a live wave's follow-ups: pacing under $1, "size them up", stopping markets under $1, why a market isn't quoting, "am I getting baited", pick-off / dark / relight alerts, cost-bucket size-ups, new periods, switch files, the post-mortem.
 ---
 
 # Market wave runbook
@@ -13,7 +13,9 @@ What taught it (details and numbers: `history.md` beside this file):
 - **11/11 2028 relight (w1111-elec2028):** 1 of 724 relit markets quoted under the unwind-only lock while the texts said "greenlit". Fixed by stamping, the dark check and registry waves (section 14).
 - **11/11 Senate/Gov nominees (w1111-statenom):** auto-listed; 440 of 654 dark at first (not election-family members); the rate fell ~$4.4k -> ~$0.75k/day in a day as other makers crowded in; Jack's six size-ups by cost bucket; the 11/12 cross-event sweep (18 events, -$256 at marks), not bait -> the group breaker.
 - **11/13 FX + metals "after economic events" (w1113-fxmetals):** quoted only through the weekend program; no fair at first (84 of 1,002 quotes 5c+ on the wrong side); ticker dates misread; tails screened out; the 8,000-order read doubled 3,462 sides; 76% under the $1 floor until sized up to 5x. Sections 11-12.
-- **11/14 crypto after-events strikes (w1114-cryptoev):** quoting around the crypto fair; listed strikes had to behave like wave books; the size model overpromised (45 of 108); bank early at 1,500 a side took 230 -> 469 of 498 strikes to $1+. Sections 11-12.
+- **11/14 known shapes** (Jack: "yes for upcoming new shapes, notify me and it's my call so dont default to turning it on e.g. KXYTVIEWSHIGH. but default to running the wave for elections, after economic events, and things of similar shapes to what's been run on waves so far"): the `NEW` verdict for a shape no wave has run; the after-economic-events waves relight themselves (sections 0.1, 2, 12).
+- **11/14 crypto after-events strikes (w1114-cryptoev):** quoting around the crypto fair; listed strikes had to behave like wave books; the size model overpromised (45 of 108); bank early at 1,500 a side took 230 -> 469 of 498 strikes to $1+; dropping banked strikes to 300 cut ~$1.4k -> ~$0.6k/day until Jack kept 1,500; then jump holds and restarts took about a third of its hours. Sections 10-12.
+- **11/15 one name across states, and the ladders' protections:** a taker bought Mark Kelly YES state by state (KXDPRESPRIMARY, 7 states in 80 s) -> the candidate breaker and the batched fast pull (736cc94). None of that reached the crypto / FX ladders -> the fair hold pull (a held coin's or pair's orders all at once) and a cross-event group for every wave series (2063782); the $1-floor check reads the bot's own fair (crypto: offs only). Sections 1.2, 11, 12.
 
 Background reading, only when time allows: memories `jack-working-style`, `imm-quoting-triage`, `market-wave-playbook`. Lookup tables (tools, list fields, bot knobs, deploy safety, gotchas): `reference.md` beside this file.
 
@@ -45,14 +47,17 @@ Keep Jack posted with one line per step. Before the first tool call, say what li
 | **C. New period of a registry wave** (a relight) | the same series' programs restart | nothing by hand: pass 7 relists and retunes (section 14) | inherits the registry's CURRENT args -- including any size-up Jack made; say so in the report | 2028 relight 11/11 |
 | **D. Hand-named one-off** | Jack names a series or market | 0-8 on his word (it overrides FEW / CHECK; report the verdict anyway) | default | w1109-control |
 
-Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEAR group included) and nothing else. Type B never auto-lists: since 2026-11-14 the detector sends every live-price ladder (`KX<asset>EVENT` in Commodities / Financials / Crypto) to CHECK, so it alerts as needs-you. On 11/13 the metals came back FIT (Commodities) and only the auto run's own judgment kept them off a no-fair default listing.
+**Known shapes run by default; a new shape is Jack's call** (Jack 2026-11-14: "yes for upcoming new shapes, notify me and it's my call so dont default to turning it on e.g. KXYTVIEWSHIGH. but default to running the wave for elections, after economic events, and things of similar shapes to what's been run on waves so far"):
+- **Type A:** auto mode lists the detector's FIT / NEAR series with 5+ events (its NEAR group included), and FIT / NEAR now need a KNOWN SHAPE: a Kalshi category Jack has run as waves and kept (`KNOWN_SHAPES` in `wave_detect.py`: Elections, Politics; the auto waves he turned off, w1107-mixed / w1108-mixed, don't count). Any other category that would be FIT / NEAR is `NEW`: held for him and TEXTED, never auto-listed (KXYTVIEWSHIGH: Entertainment, settles on charts.youtube.com). Adding a shape is his word: add the category to `KNOWN_SHAPES`.
+- **Type B relights itself:** the after-economic-events registry waves list each new batch of their own series in pass 7 (the detector calls those series LISTED): w1113-fxmetals with no stop cap, any time its programs run (Jack 11/14: "after-economic events can quote anytime not just when markets are shut, but need a fair value"), on `wave_fair.py`'s fair (its Friday close rolled each weekend; the weekday mode while FX and metals trade, section 12); w1114-cryptoev with no stop cap, gated by the bot's crypto fair. Nothing rests on a strike without a fair. Each relight starts on the wave's current args (bank-early, floor_auto, margins). A ladder no registry wave lists (yields, a new asset) is CHECK: Jack's call. Auto mode never creates a type B wave.
+- On 11/13 the metals came back FIT (Commodities) and only the auto run's own judgment kept them off a no-fair default listing: since 11/14 every `KX<asset>EVENT` ladder is LISTED (its wave relights it) or CHECK.
 
 **What the skill may do on its own (manual or auto mode):**
 - List FIT series on the `default` preset, and NEAR series as the wave's NEAR group (the 11/04 midterm treatment).
 - Start the dashboard, run the tune, verify, run the pick-off watch.
 - Stand a picked-off REGISTRY-wave market down at its base size (`pickoffs --act`), and turn off a wave it just added that didn't go live (`pvd_waves.py stop`).
-- Exclude SOON / CHECK / MEMBER / FEW series, and say so.
-- Run the read-only `pace`, `whydark`, `darkcheck`, `report`, and `resize` WITHOUT `--apply`, any time.
+- Exclude SOON / CHECK / NEW / MEMBER / FEW series, and say so.
+- Run the read-only `pace`, `whydark`, `darkcheck`, `report`, `resize` WITHOUT `--apply`, and `wave_detect.py --upcoming` WITHOUT `--update-state` (section 2.1), any time.
 - **The $1-floor protocol (section 11) on a type B wave with a live fair, in MANUAL mode** (Jack 2026-11-14: "Yes, pre-approve"): run it without asking first, then report what it did. Bank early up to 5x the base (`setarg NAME bank-size` / `bank-max`, e.g. 1,500 on a 300 base) until $1.30 is banked; `resize --apply` up to 5x aiming at $1.20; off under $1 only on two reads. Only while the fair is live (FX / metals: a fresh `--fair-file` from `fair_cmd`; crypto strikes: `crypto_event_fair`) and preflight passes. Never in auto mode, never above 5x, never on a market Jack turned off, never on a wave without a fair.
 
 **What needs Jack's yes** (offer it in the report; never do it on your own):
@@ -60,7 +65,8 @@ Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEA
 - Any size-up: `--size-mult`, `--series-tier`, `--cheap-tiers` above the default (mid-price tiers included), a bank size above 300, a pin above base, `resize --apply` -- except the $1-floor protocol on a type B wave with a live fair, pre-approved 11/14 (above).
 - The `2028` preset.
 - Extra budget above +$100k (auto mode: never above +$50k).
-- Quoting SOON, CHECK or FEW series, an info-risk title, or any type B wave.
+- Quoting SOON, CHECK, NEW or FEW series, an info-risk title, or a type B ladder outside its registry wave's own relight (a new asset, yields).
+- Adding a shape to `KNOWN_SHAPES` (a NEW shape he runs and wants by default from then on).
 - Lifting a market he turned off ("Keep them off", FX 11/14: don't re-offer the lift for that wave).
 - Removing a pick-off stand-down (a market pin or a series pin).
 - Editing `run_pvd_scan_waves.cmd` (pass 6's args, e.g. a stand-down pin for a pass-6 market) or another wave's settings.
@@ -79,10 +85,11 @@ Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEA
     - `wave_alert.py wave --detect ... --outcome live|not-live|needs-you|error [--wave NAME --listed N --est-day X --report PATH | --why-not "..."] --send`
     - `wave_alert.py relight --relight ... --send`
     - `wave_alert.py pickoff --pickoffs ... --send`
+    - `wave_alert.py upcoming --upcoming ... --send` (pass 11 sends it: section 2.1)
   - Without `--send` it only prints a preview.
 - **Texts and email are the only routes that reliably reach Jack.** A PushNotification from a scheduled run never reached his phone. Send the PUSH line anyway.
   - Texts go through `sms_alert.py --long` (<= 900 chars), capped 1 per 10 min and 10 a day (exit 2 = capped, fine).
-  - It texts for: every quotable wave (exit 3), live or not; a relight of 100+ markets or a 1,000+ program jump; a pick-off of $100+ new, a series trip or a stand-down; dark-check and bait-watch alerts (section 14).
+  - It texts for: every quotable wave (exit 3), live or not; an UPCOMING wave that would be greenlit (pass 11, section 2.1); a relight of 100+ markets or a 1,000+ program jump; a pick-off of $100+ new, a series trip or a stand-down; dark-check and bait-watch alerts (section 14).
   - It emails Jack's inbox (wave_alert.py's ALERT_TO) on every trigger.
 - Jack can answer by text (task "KL sms-inbox" / `phone_actions.py`): pause-overnight writes `run-logs/pvd-scan/OVERNIGHT_PAUSED` and the check stops on its own. Never delete that file.
 - Then end. Jack tunes later in a normal session.
@@ -95,7 +102,8 @@ Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEA
 
 - **11/07-11/08:** every wave fill since 11/04 netted -$4,094 (losing fills -$6,033). Baits on thin books (a lone ~200-lot 9-37c off fair, our rung re-anchored to it, a taker of exactly our size, the bait pulled) cost -$3,653 in 19 fills; real repricing -$550; a cross-market sweep of 90c+ sides -$352; a halt-restart rejoin -$89; a one-event auto-listing -$26. Nothing alerted; the halts were not the bait defense.
 - **11/12 (w1111-statenom), a sweep, not bait:** one seller took the whole top bid level from every maker in 18 KXSENATENOM markets in 21 min (both parties' favorites, 32-91c). Our 17 full fills + 2,071 @ 9.7c (39% of that level after the 6-15c size-up): -$130 at marks, -$256 by evening. The per-event sweep breaker can't stop a taker that moves to the next event -> the group breaker.
-- **11/13-11/14 (type B):** with no fair, 84 of 1,002 FX/metals quotes sat 5c+ on the wrong side (if all filled: -$1,602), and the pick-off watch marked a -$12 fill +$56 off a 26x95 book. The 8,000-order read under a 12,000 cap left 3,462 sides doubled for ~2 h (2 doubled fills, -$34). Crypto: 0 fills.
+- **11/13-11/14 (type B):** with no fair, 84 of 1,002 FX/metals quotes sat 5c+ on the wrong side (if all filled: -$1,602), and the pick-off watch marked a -$12 fill +$56 off a 26x95 book. The 8,000-order read under a 12,000 cap left 3,462 sides doubled for ~2 h (2 doubled fills, -$34). Crypto: 4 fills in ~27 h (three ETH takes of 11-23 lots; a 1,000-lot SOL bid at 9c in the 11/14 21:58Z selloff, ~1c under the fair, +$44 by the next morning).
+- **11/15 (w1111-elec2028), one name across states:** a taker bought Mark Kelly YES at 2c in KXDPRESPRIMARY state by state (AK, CA, CO, CT, HI, IA, ID in 80 s): 1,600 contracts off our asks, about -$24. Every state is its own event; the group breaker tripped on CA 29 s after AK, but its 1,063-order pull ran at 120 cancels a minute in no set order, and five more filled 4-50 s after the trip -> the candidate breaker and the fast pull (736cc94).
 
 ### 1.2 The defense stack (live)
 
@@ -109,10 +117,14 @@ Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEA
 | Lone-ref guard (waves) | bot, 3032ea8 | A listed side whose reference is a lone thin top (< 3 x target/5, 20c+ off the rest) our rung jumped to stands aside. At go-live after darkness every single-maker top counts as a jump: 37 KXPRESSTATE sides (11/11), ~500 statenom sides at its listing and ~155 by the afternoon -- expected, leave it | Logged before every House bait |
 | Twin check | bot, 6fbad53 | Jack 11/11: "make sure the quotes on each side make sense relative to each other". A bid rests at most 100 - the siblings' bids (+2c); a D/R ask at least the other leg's NO bid (-2c); re-priced, never cancelled. Treats a 2-candidate nominee event as a pair (asks move up only) | $736 of the 2028 losers; 0 re-prices when legs agree |
 | Twin block | tune | A D/R pair's same-bet leg rests nothing once one leg holds 200+ | |
-| Group breaker | bot, 76d9201 + 25cbd54 | The 2nd fill of 200+ on the same side in a DIFFERENT event of one group within 10 min holds that side of the whole group 20 min (Jack 11/12-11/13: "after the 3rd fill and hold for 20min", then "on the 2nd fill"). `IMM_SWEEP_GROUP_MIN_EVENTS=3` backs it out | The 11/12 sweep: ~$117 of -$130 avoided, ~$10 of rewards a trip |
+| Group breaker | bot, 76d9201 + 25cbd54; wave series groups 2063782 | The 2nd fill of 200+ on the same side in a DIFFERENT event of one group within 10 min holds that side of the whole group 20 min (Jack 11/12-11/13: "after the 3rd fill and hold for 20min", then "on the 2nd fill"). Groups: NFL games, Carbon Arc, corn yields, US general elections, state legislatures; since 11/15 every other wave series is its own group ("wave KXBTCEVENT": a coin's strikes in its other events, an FX pair's, a politics series), but a no-halts series. `IMM_SWEEP_GROUP_MIN_EVENTS=3` backs it out; `IMM_WAVE_GROUPS=off` drops the series groups | The 11/12 sweep: ~$117 of -$130 avoided, ~$10 of rewards a trip. Series groups replayed 11/06-11/15: 0 trips |
+| Candidate breaker | bot, 736cc94 | A maker fill of 200+ on a name in a per-state series (KXDPRESPRIMARY-28AK-MKEL) holds that name's side in every state 10 min, pulled at once; the other names, the other side and other series keep quoting. Only the presidential primaries have that shape | Replay of 11/15: 1,300 of the 1,600 Kelly contracts never fill |
+| Fast pull | bot, 736cc94 | Breaker pulls and the cycle's cancels go 20 to a batch DELETE, paced to the write tokens; a pull goes most at risk first (the hit name in its series, then its series, the name elsewhere, the rest), at most 20 s. `IMM_PULL_BATCH=1` = one by one | 1,063 orders ~9 s (was ~85 s) |
 | Wave breaker + 200+ tape trigger | bot | Two 200+ fills at 90c+ in 10 min hold 90c+ rungs 15 min -- NO-HALTS series only, so it misses default-preset waves | $207 on 11/07 |
 | Sweep breaker, tape trigger, toxic halts, bait-fingerprint stop | bot | Pull the event or side after a cleared order, a 100+ burst, two pick-offs, or a whole-rung bait fill | Per event only |
-| Fair limits (type B) | tune `--fair-file` / bot `crypto_event_fair` | Bids <= fair - margin, asks >= fair + margin; stale or no fair = floor sides only (bid <= 2c, ask >= 98c) | 0 of 650 FX quotes wrong-side after |
+| Fair limits (type B) | bot `fx_event_fair` (FX + metals, 70d05b7 + d736cc4) and `crypto_event_fair`, live every 15 s; tune `--fair-file` underneath | Bids <= fair - margin, asks >= fair + margin, live every cycle (the margin: section 12). A strike stands aside -- rests NOTHING, weekend or weekday -- on a read 180 s old, a jump hold, no kept close or (weekdays) 12 h to its measurement; the weekend's 2c / 98c floor is only for strikes with a fair | 0 of 650 FX quotes wrong-side after |
+| Fair hold pull | bot, 2063782 | A coin or FX / metals series in its jump hold or on a stale read has EVERY order on it pulled at the feed's next look (~0.5 s), in batches, and nothing placed or amended on it until it is back. It was strike by strike as the quote loop got there: BTC's 02:05Z 11/15 hold took 95 s for its 128 orders. `IMM_FAIR_HOLD_PULL=off`; log `fair hold pull: crypto BTC (...)`, sink `fair_hold_<date>.jsonl` | Built 11/15 |
+| Earn only | bot, 1fd880b (another session, 11/15) | The quote loop's last step: no rung rests that the program's 1,000-contract walk would not pay, except on the side that reduces a position (Jack: "unless purposefully unwinding, no IMM should quote without earning"). `IMM_EARN_ONLY` on / dry / off | 13:49Z 11/15: 273 markets resting earned nothing, 258 of them reduce-only |
 | Full-earn size | bot, 44ffefd | Cuts a listed side to the smallest size keeping 95% of its share | Small |
 | Pick-off watch | `pvd_waves.py pickoffs`, pass 8 | Adding fills marked to the book with OUR orders out; 5c+ and $25+ = flagged; 3+ in a series = series trip; `--act` pins at base | Texts at $100+ |
 | Bait watch | `bait_watch.py`, pass 10 | Texts a bait-fingerprint stop or a 3rd sweep trip in 30 min; emails toxic halts, 2nd sweeps, flashes | 11/11-11/14: 0 texts |
@@ -125,10 +137,10 @@ Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEA
 1. **No listing without `preflight` exit 0** (section 4). Auto mode: `add --auto` enforces it.
 2. **Scope:**
    - 5+ events in the series (Jack: "market WAVES autoquoting overnight should only enroll WAVES, meaning 5+ more events in the same family").
-   - FIT or NEAR only; no company KPIs; nothing on the blocklist.
+   - FIT or NEAR only, which means a known shape (`KNOWN_SHAPES`: Elections, Politics; a `NEW` shape is Jack's call); no company KPIs; nothing on the blocklist.
    - Info-risk titles are Jack's call: personnel, appearances / announcements, counts of reported events, pre-taped TV, company reports.
    - Ask "what moves this price, and can someone see it before our resting order moves?" "Truly far" means the OUTCOME date, not Kalshi's settle date.
-   - Live-price ladders (type B) only with a fair, and only while their market is shut (FX, metals) or the fair is live (crypto).
+   - Live-price ladders (type B) only with a fair (Jack 11/14: "after-economic events can quote anytime not just when markets are shut, but need a fair value"): the bot's live fair every 15 s (FX / metals `fx_event_fair`, crypto `crypto_event_fair`), `wave_fair.py`'s file underneath for FX / metals. A strike the fair stands aside rests nothing, weekend or weekday; the 2c / 98c weekend floor is for strikes with a fair.
 3. **Sizes:**
    - The default preset multiplies only sides costing <= 5c: <= 2c x10, <= 5c x5. 0 fills at 1-2c in the first ~28 h of the 2028 wave; the pick-offs sat at 12-80c.
    - Mid-price tiers, `--size-mult`, series tiers and `resize --apply` are Jack's word. Offer them after a clean day (`pickoffs NAME --hours 24`). Jack sized both 11/11 election waves within 6-11 h; when he asks earlier, do it and say how clean the wave has been (fills, $ against, flags).
@@ -151,7 +163,8 @@ Auto mode lists the detector's FIT / NEAR series with 5+ events (type A, its NEA
 - **Whole-order triggers miss partial fills** (sweep breaker, bait stop).
 - **No wave-level loss stop, and no event cap on listed events** (`IMM_PVD_EVENT_CAP` 10M).
 - **Some guards fail open for one run:** a failed positions read lifts the twin block; a pinned market whose touch read misses loses its side cap.
-- **The fair refreshes every 15 min (FX / metals) or 15 s (crypto):** a jump faster than that fills the bigger sizes before the fair catches up; the crypto 1% jump hold and the WS fast cancel are the cover.
+- **A live fair can still be late:** the bot reprices every 15 s and requotes in ~1.5-2.5 min, so a jump inside that can fill before the limits move; a source that stops stands its series aside (USD/MXN went dark twice 11/14-15 on Bitso's wide book). The jump hold, the fair hold pull (all of the underlying at once, 2063782) and the WS fast cancel are the cover.
+- **Jump holds cost quoting time:** a hold re-arms on every read while the price stays 1% off its 5-min range, so a slide holds a coin the whole way down. 11/14-15: at least one coin was held 36% of the time (HYPE 30%, ETH 19%, SOL 18%, BTC 8%: one 1% trigger for every coin, and HYPE moves ~1.9x BTC); hours with 20-48 min of holds banked $5-23 against $50-55 clean. A per-coin trigger is Jack's call; measure what the holds avoided first.
 - **One-event news risk isn't detected:** e.g. a pending appointment decides a nominee event (KXSENATENOM-TNR-28 waits on Blackburn's appointee: its 12 markets are pinned at 0 on w1111-statenom since 11/14, Jack's "Yes, do 1-5", until she names someone).
 - **A sweep's fills can trip a series stand-down hours later:** the pick-off watch's 6 h lookback flags a fill the first time its mark is 5c+ and $25+ against us, so three of the 11/12 sweep's fills crossing the bar as the books drifted pinned ALL of KXSENATENOM at 200 a side (01:30Z 11/13, a series trip), so his tiers stopped reaching the series until he lifted it on 11/14 ("Yes, do 1-5"; the per-market pins stayed). Removing a stand-down is his word.
 - **Heightened bait mode is dry; the wave dashboards' marks include our quotes.**
@@ -167,24 +180,42 @@ python wave_detect.py --since <ISO: 30 min before the first new program, or the 
 - **What it reads:** every active LIQUIDITY program that started since `--since`, minus markets already on the list or quoted by the bot.
 - **Per series:** markets, events, pool $/day, median horizon, days out, listed / quoted counts, median spread, category, title. Horizon = the EARLIER of `close_time` and `expected_expiration_time`.
 - **Verdicts, in order:**
-  - `LISTED` / `QUOTED`: already handled.
+  - `LISTED` / `QUOTED`: already handled. LISTED = on the list, or a series of an ENABLED registry wave whose stop cap hasn't passed (pass 7 lists its new periods; a relight after a gap says so in `why`). A wave Jack turned off no longer counts (its series are judged like any other).
   - `MEMBER`: the bot's own family admits it; its gates decide (triage with `imm-quoting-triage`).
   - `FEW`: fewer than 5 events lit. Never listed or alerted.
-  - `CHECK`: Jack's call -- a high-info-risk category (Sports, Crypto, Financials, Climate and Weather, Economics), a mention series, an info-risk title (`INFO_RISK`), or blocklisted.
+  - `CHECK`: Jack's call -- a high-info-risk category (Sports, Crypto, Financials, Climate and Weather, Economics), a mention series, an info-risk title (`INFO_RISK`), a known shape settling on a live feed (the bot's own `SCAN_LIVE_SOURCE_KEYWORDS`; Jack 09/24), an after-economic-events ladder no registry wave lists, or blocklisted.
   - `SOON`: settles within a day, or no date. Jack's call.
   - `NEAR`: settles in 1-14 days. Quotable as the NEAR group.
-  - `FIT`: long-dated (>= 14 d) and none of the above.
-- **Wave bar:** new FIT + NEAR series with 5+ events each total >= 40 markets or >= $1,000/day of pools. Exit 3 = a wave; 4 = only CHECK / SOON over the bar (tell Jack; list nothing); 0 = nothing. A series triggers once (state file).
+  - `NEW`: would be NEAR / FIT, but its category isn't a known shape (`KNOWN_SHAPES`): Jack's call, texted (its tags and any live-feed source in `why`; `dated` says which it would be), never auto-listed.
+  - `FIT`: long-dated (>= 14 d), a known shape, and none of the above.
+- **Wave bar:** new FIT + NEAR series with 5+ events each total >= 40 markets or >= $1,000/day of pools. Exit 3 = a wave; 4 = only CHECK / SOON / NEW over the bar (tell Jack; list nothing; `wave_alert.py` texts when the NEW shapes alone clear the bar, `new_shape_over_bar`); 0 = nothing. A series triggers once (state file).
 - **Batches:** size up EVERY start since the last scan, not just the batch Jack named.
-- **The "after economic events" ladders** (`KXGOLDEVENT`, `KXUSDJPYEVENT`, `KXBTCEVENT`, `KX10YRRATEEVENT` ...: "above X one minute after a release") come as CHECK (Financials / Crypto) or NOT LIVE (metals). They are type B: section 12, on Jack's word.
+- **The "after economic events" ladders** (`KXGOLDEVENT`, `KXUSDJPYEVENT`, `KXBTCEVENT`, `KX10YRRATEEVENT` ...: "above X one minute after a release") are type B (section 12). Their registry waves relight them (LISTED); a ladder no registry wave lists (yields, a new asset) is CHECK, Jack's word.
 - **A big RELIGHT jump** ("programs 6903 -> 10573 (+3670)") is new programs, not relit ones: say what they are by series family and which the wave check already judged (11/13: 3,169 after-economic-events held for Jack, 501 small series the bot's selection picks up itself).
 - **If Jack named the series,** take them as the scope (his word overrides FEW / CHECK), but still run the detector and report each verdict.
+
+### 2.1 Upcoming waves: advance notice (pass 11)
+
+Jack 2026-11-14: "market-wave skill should also scan upcoming rewards markets and callout if a wave would be greenlit so i have advanced notice".
+
+```
+python wave_detect.py --upcoming [--horizon-hours 72] [--preflight] [--json OUT]   # read-only; --update-state is pass 11's
+```
+
+- **What it reads:** Kalshi lists programs before they start (`GET /incentive_programs?status=upcoming`): mostly the next 05:00Z roll plus odd-minute starts, a few up to ~2 weeks out. Per market only its NEXT program counts (the bot's `upcoming_by_market`); markets not open yet are read by ticker.
+- **How it judges:** the live check's verdicts, 5+-event rule and wave bar, per START WINDOW (programs starting within 30 min of the window's first start: what one 20-min check sees together), with settle dates measured from the start. A series the live check alerted in the last 30 days never re-triggers, so it doesn't count (the email lists it under ALERTED BEFORE).
+- **Calls:** new FIT / NEAR over the bar = WOULD BE GREENLIT (exit 3): at the start, auto mode lists it if `preflight --auto` passes then. Only CHECK / SOON / NEW over the bar = YOUR CALL (exit 4): a NEW shape (KXYTVIEWSHIGH) is TEXTED, with `preflight` run now as if he said yes; the rest email. A RELIGHT over the bar (exit 5): an active registry wave's series whose markets aren't on the list now (the after-economic-events waves' next batch, a weekly election relight) lists at the start by itself (pass 7, on the wave's current args): email with `preflight NAME` run now, texted only when that FAILs. A renewal of markets listed now is not a relight.
+- **`--preflight`:** `pvd_waves.py preflight --auto` NOW on each newly noticed wave, so a FAIL (shard cash, resting room, scan budget) shows while it can still be fixed. Moving cash is Jack's: give him the command.
+- **Pass 11** (relight task, every 15 min) runs it with `--preflight --update-state`, then `wave_alert.py upcoming --send`: TEXT + email when a wave would be greenlit (line 1 "UPCOMING WAVE Sun 12:00 AM ET (in 11 h): N events would be greenlit, M denied", the reasons, preflight now, names) or a NEW shape would be held for him ("UPCOMING, YOUR CALL (new shape) ..."); email only for any other your-call window and for a relight ("UPCOMING RELIGHT ..."; texted when its preflight FAILs). Each series is noticed once per start (`run-logs/pvd-scan/wave_upcoming_state.json`; the live check's state is only read). At the start the 24/7 check still sends its own WAVE alert.
+- **On a notice, in a session:** check the preflight line; read each greenlit series' title for info risk (1.3 rule 2) and its events for one-announcement news (section 3); for type B, build the fair; then tell Jack what lists when, on which preset. Keeping a series off before its start is his word, and there is no per-series skip yet: his "pause overnight" text stops the check, or `pvd_waves.py stop NAME` right after it lists.
+- **Not covered:** a program Kalshi creates at its start never shows as upcoming; renewals the bot already quotes read QUOTED (the bot's own admission of upcoming programs is the 6:45 email's table, `imm_upcoming.py`).
+- **First read (11/14 18:53Z):** 1,217 upcoming programs, 1,155 markets in 20 windows over 72 h: no wave. KXYTVIEWSHIGH (YouTube highest daily views: 140 markets, 16 events, $1,000/day, 11/15 16:00Z) was the one FIT; since the known-shapes rule it reads NEW: texted, held for Jack, never auto-listed.
 
 ## 3. Choose scope (fixed rules, then report)
 
 - **In:** every FIT series with 5+ events. Series Jack named are in whatever their verdict, but report it.
 - **In, as the NEAR group** (`--near`): every NEAR series with 5+ events. Dead 120 / live 80 a side (300 on a decided side), the bot's kind cushions (dead 2c, live 5c off the last trade), band 3-97c, no tiers / multipliers / bank-early. Jack: "near series should have the dead/live book distinction, and 120/80 base contracts like in the midterms".
-- **Out:** FEW, CHECK, SOON, MEMBER, QUOTED and LISTED, with the reason and the $/day left out, so Jack can say "add X".
+- **Out:** FEW, CHECK, NEW, SOON, MEMBER, QUOTED and LISTED, with the reason and the $/day left out, so Jack can say "add X".
 - **Flag anyway:**
   - NEAR entertainment / TV competitions (pre-taped results leak), and anything that settles on a running count published with a lag (the strait weeklies: the shipping family stands them down 2 days before the week ends, 6e9b248; a wave series on a weekly count wants the same stop).
   - Events one announcement decides (an appointee, a withdrawal): search the news before a size-up and offer an event block (section 1.4).
@@ -363,7 +394,7 @@ python pvd_waves.py run --only <NAME> --write                      # apply now (
 4. Big re-sizes hit the per-cycle amend and placement caps: resting dips for minutes; the dashboard rate lags a re-size ~25 min.
 5. `pickoffs NAME --hours 2` 30-60 min later.
 
-**Off means both side sizes 0.** The bot reads `"size": 0` alone as its default size (PVD_SIZE, 40 a side): the 341 FX markets "turned off" that way kept 40-80 a side until the tune wrote `bid_size`/`ask_size` 0 (fixed 11/14: a 0 pin or a 0 multiple now writes both). A crypto strike's stop also needs its entry moved to the list's "stopped" (crypto_event_stop.json + "stopped", e4dd1f4): an unlisted strike falls back to the family's own quoting.
+**Off means both side sizes 0.** The bot reads `"size": 0` alone as its default size (PVD_SIZE, 40 a side): the 341 FX markets "turned off" that way kept 40-80 a side until the tune wrote `bid_size`/`ask_size` 0 (fixed 11/14: a 0 pin or a 0 multiple now writes both). A listed crypto strike goes off like any other: a 0 multiple keeps it listed at 0 a side (how `floor_auto` stops it). Moving its entry to "stopped" instead UNLISTS it, and an unlisted strike falls back to the family's own quoting: to keep one off for good, `crypto_event_stop.json` too (e4dd1f4, by hand; it covers strikes the wave never listed).
 
 **A decided side** (last trade >= 90 / <= 10) ignores the band AND the limits: to stop such a market, `--pause-at SERIES:0` plus `--side-cap SERIES:0:0` (KXJEFFRIESFIRST 11/11). Keep it listed: delisted, its family could quote it.
 
@@ -371,7 +402,7 @@ python pvd_waves.py run --only <NAME> --write                      # apply now (
 
 | Lever | Flag | Notes |
 |---|---|---|
-| Bank early | `--bank-size 200 --bank-max 300 --bank-by-hrs 6 --bank-usd 1.30 --bank-url <dash>/data --no-drop --hold-max [--base-size N]` | Needs the wave dashboard; sizes only ratchet UP within a period; the bank step waits 25 min after a re-size. Short windows: bank big early (crypto 1,500 until $1.30, then base 300) |
+| Bank early | `--bank-size 200 --bank-max 300 --bank-by-hrs 6 --bank-usd 1.30 --bank-url <dash>/data --no-drop --hold-max [--base-size N]` | Needs the wave dashboard; sizes only ratchet UP within a period; the bank step waits 25 min after a re-size. Short windows: bank big early and KEEP it: `--base-size` = the bank size (crypto 1,500 / 1,500 since Jack 11/14 "Yes, keep 1,500"). A retune of the bank args must keep `--no-drop` or that base: dropping 1,500 -> 300 after $1.30 cut each strike's share ~85-95% (crypto ~$1.4k -> ~$0.6k/day, 11/14 14-18Z) |
 | Cost-per-contract tiers | `--cheap-tiers C:X,...` | First fit wins. Above 5c: Jack's word |
 | Series tiers | `--series-tier SERIES:bid\|ask:C:X` | Checked first; REPLACES the general tiers below its first bound. Jack's word |
 | Scale everything | `--size-mult X` | Once per entry. Jack's word |
@@ -382,7 +413,7 @@ python pvd_waves.py run --only <NAME> --write                      # apply now (
 | Market pause | `--pause-at SERIES:C` | At C c+ (bid or last) a market quotes nothing, or only its unwinding side; resumes under C-2 |
 | Breakers | `--no-halts` / `--halts-on` | Jack's word, both ways |
 | Limits | `--follow-book --reanchor 3 --reanchor-step 5 --reanchor-jump 10 --cushion 0`, `--room`, `--price-min/max` | Never 0 on step / jump |
-| Fair limits | `--fair-file PATH [--fair-margin 3 --fair-vol-err 0.25 --fair-floor 2]` | Bid <= fair - margin, ask >= fair + margin (margin = base + vol-error term); no fair / stale = floor sides only. Put the margin in the fair file's "margin" so a pass started earlier can't revert it. Registry `fair_cmd` refreshes it before each tune |
+| Fair limits | `--fair-file PATH [--fair-margin 3 --fair-vol-err 0.25 --fair-floor 2]` | Bid <= fair - margin, ask >= fair + margin (margin = base + vol-error term); no fair / stale = floor sides only (the bot's live fair, when on, stands such a strike aside entirely). Put the margin in the fair file's "margin" so a pass started earlier can't revert it. Registry `fair_cmd` refreshes it before each tune |
 
 ### Measured (use for advice; details in `history.md`)
 
@@ -412,6 +443,8 @@ Kalshi pays a market's period only from $1; under it the period's share is lost.
 python pvd_waves.py pace NAME [--aim 1.20] [--window-min 60] [--json OUT]       # read-only
 python pvd_waves.py resize NAME [--aim 1.20] [--max-mult 5] [--keep-within 0.05] # dry run: the plan
 python pvd_waves.py resize NAME ... --apply                                      # Jack's word
+python pvd_waves.py set NAME floor_auto on|off                                    # the same, every 15-min pass (Jack's word per wave; adds --size-mult-file)
+python pvd_waves.py set NAME floor_max_mult 1                                     # the check only turns markets off (a wave already at 5x)
 ```
 
 **How `pace` measures** (`pvd_wave_pace.py`):
@@ -420,10 +453,11 @@ python pvd_waves.py resize NAME ... --apply                                     
 - Under-$1 tables: by the multiple each needs for the aim (the model above: an upper bound), with one-sided counts and the cash added if every added contract filled; by side cost (1-2c, 3-5c, 6-10c, 11-20c, 21-35c, 36-50c, 51c+: what Jack asked for 11/14); by series.
 
 **The protocol:**
-1. **Bank early, as big as the window needs: pre-approved up to 5x the base on a type B wave with a live fair (Jack 11/14: "Yes, pre-approve"); elsewhere a bank size above 300 is Jack's word.** On a 1-2 day window the most size from the start paid (crypto: 1,500 a side until $1.30 banked, then base 300: 230 -> 469 of 498 strikes at $1+). Cold starts cost quoting time: crypto strikes rest 400 instead of base while they have no usual price (1f68841).
+1. **Bank early, as big as the window needs: pre-approved up to 5x the base on a type B wave with a live fair (Jack 11/14: "Yes, pre-approve"); elsewhere a bank size above 300 is Jack's word.** On a 1-2 day window the most size from the start paid (crypto: 1,500 a side from the start took 230 -> 469 of 498 strikes to $1+; keep that size after banking: section 10's bank-early row). Cold starts cost quoting time: crypto strikes rest 400 instead of base while they have no usual price (1f68841).
 2. **Read `pace`** once sizes have rested and 15+ min after the last restart.
 3. **`resize` dry run, then `--apply`** (pre-approved on a type B wave with a live fair; elsewhere Jack's word): the smallest quarter-step multiple up to 5x that projects $1.20 (or 5x if that still reaches $1); never lowers a multiple; an off market stays off.
 4. **Two reads before an off:** a market that can't reach $1 even at 5x goes to 0 only when the previous `resize` read, 5-90 min earlier, judged it the same way. One read right after a restart would have stopped 258 strikes (11/14). A market projecting $0.95-1.00 is kept (estimate noise; it keeps its banked share).
+   - **Every pass (`floor_auto`):** Jack 2026-11-14 on w1113-fxmetals, "Yes, every 15 min". With `set NAME floor_auto on`, pass 7 runs `resize --apply` (minus its own wave run) after the fair refresh and before the tune, so a market goes off on its 2nd pass in a row under $1 even at 5x. It needs a live fair -- a fresh `--fair-file`, or with none the bot's own (`crypto_event_fair.json` / `fx_event_fair.json` written within 5 min and listing the wave's series, 11/15) -- and a `--size-mult-file` (`set NAME floor_auto on` adds it); it skips within 15 min of a restart and on a stale dashboard read; never above 5x or the wave's `floor_max_mult`. w1114-cryptoev runs it since 11/15 with `floor_max_mult 1`: it banks at 1,500 = 5x its 300 base already, so only offs. An off stays off into later periods (Jack's "Keep them off" on FX): clear its 0 in `size_mult_NAME.json` to bring it back. `set NAME floor_auto off` stops it.
 5. **Re-measure ~25 min after the sizes rest, and again at +2 h:** other makers answer with size (FX 11/14: within 2 h of the 5x size-up they added ~25M contracts against our 5M; median share 8.8% -> 6.3%, the rate $3.5k -> $2.5k/day; the 12:50Z re-read turned 523 more markets off).
 6. **Say what it costs:** the cash if every added contract filled, by cost bucket; the expensive sides (21-50c) carry most of it.
 
@@ -434,24 +468,31 @@ What a 10x lift would buy, and what turning markets off frees, are not the same 
 Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, EUR/USD, AUD/USD, USD/MXN, USD/CAD, GBP/USD, BTC / ETH / SOL / HYPE, or the 2/5/10/30-year yields be above X one minute after a release. Thousands of strikes, $20 a strike, ~1-2 day programs (11/13 batch: 3,670 programs, $52.7k/day of pools, programs to Sat midnight ET).
 
 **The decision (Jack 11/13 "Do it" on this rule):**
-- **FX + metals:** only while their markets are SHUT (Fri 5 PM - Sun 5 PM ET) with a fair, and only through the program end; if a program runs past the Sunday open, the stop cap is the open (`--stop-cap` 22:00Z Sunday). Never on weekdays without a live feed (the 15-minute markets were passed on for the same reason).
-- **Crypto:** 24/7, so only with the bot's live crypto fair (`crypto_event_fair`, 1442295: the crypto fleet's GBM on Kraken spot, every 15 s; 1% jump hold; stale > 180 s = stand aside). Touch markets ("hit by", early close) stay NO-only.
+- **FX + metals: any time, with a fair** (Jack 11/14: "after-economic events can quote anytime not just when markets are shut, but need a fair value"; it replaced the 11/13 weekend-only rule). w1113-fxmetals has no window and no stop cap: it lists whenever its programs run.
+  - **The fair:** the BOT prices every strike every 15 s (`fx_event_fair.py`, thread "fx-event-fair", 70d05b7 + d736cc4, Jack 11/14 "Yes, build it"): wave_fair.py's lognormal on the kept Friday close, moved by the 24/7 sources; `fx_event_gate` + `pvd_limits` set each listed strike's limits every cycle. The tune's 15-min `--fair-file` limits stay underneath (`IMM_FX_EVENT_FAIR=0` falls back to them). Status `run-logs/incentive-mm/fx_event_fair.json`; log lines "fx-event fair (...)", "fx-event stand-aside" / "fx-event resume" (`whydark` names them).
+  - **The margin (what sets the limits):** bid <= fair - margin, ask >= fair + margin, where margin = the 2c base (every series, copper too since 11/14 evening) + the vol-error cushion (100 x 0.25 x phi(z) x |z|: 0 at the money, ~6c at a 16c / 84c fair, ~2c at 2c / 98c) + on weekdays the requote term (2 sd of the fair's move over a 3-min requote: ~4c at the money a day out, ~2c a week out, ~0 in the tails). The median comes to ~5-6c. Jack kept the cushion on 11/15 ("Yes, keep it"): don't offer a flat 2c again. Give the whole gap, never just the base (11/15: "wdym?").
+  - **Standing aside (cancel; rests nothing):** a source read 180 s old (USD/MXN went dark twice 11/14-15 when Bitso's book went wide: d736cc4 refuses a wide book's mid), a jump hold (the source moved 0.35 daily sigma inside 5 min: 5 min out; the fair hold pull takes every order of the series at once), no kept close, a weekday strike within 12 h of its measurement (the release it settles on outweighs the model inside that), a strike the model doesn't price.
+  - **Weekend vs weekday:** the weekend (Fri 5 PM - Sun 5 PM ET) keeps 2c / 98c floor sides on strikes with a fair; weekdays have no floor and add the requote term. Weekday mode starts Sunday 5 PM ET.
+  - **The fallback file** (`wave_fair.py OUT --live`, the wave's `fair_cmd`): while FX and metals trade (Sun 5 PM - Fri 5 PM ET) `wave_fair.py` runs its WEEKDAY mode: the same model priced from now with its own staleness margin per strike (2 sd of the fair's move over the ~18 min between refreshes: ~8c at the money a day out, ~3c a week out -- the file's, not the bot's), nothing within 12 h of a measurement, "floor": 0 and a 20-min life. A simulated Wednesday on 11/14's books: 2,097 fairs, 393 strikes inside 12 h standing aside, staleness median 1.7c (max 8.3c). The margin lives in the file AND `fx_event_fair.MARGIN`; a test keeps them in step.
+  - Like the crypto strikes, these series skip the lone-ref guard (a fair-gated series). `set NAME window fx-shut` brings the weekend-only rule back.
+- **Crypto:** 24/7, so only with the bot's live crypto fair (`crypto_event_fair`, 1442295: the crypto fleet's GBM on Kraken spot, every 15 s; stale > 180 s = stand aside). THE JUMP HOLD: a 1% move inside 5 min holds the coin 5 min (fa0c63c, Jack 11/14 "Stay down for 5min"), re-armed on every read while it stays 1% off its 5-min range, then ~1-3 min to re-place; the fair hold pull takes all of the coin's orders at once. $0/day on the page during a selloff = holds, not a fault (`whydark` says "jump hold"). After a drop the books widen and our asks sit behind the new touch; the join wait walks them back a step a pass, so the rate takes ~10 min to recover. Touch markets ("hit by", early close) stay NO-only.
 - **Yields:** skip (tiny pools).
 
 **Setup:**
-1. **Fair first.** FX / metals: `wave_fair.py OUT --live` (lognormal on Friday's 5 PM ET close -- metals = Kalshi's weekly settlements KXGOLDW / KXSILVERW / KXCOPPERW, FX = Yahoo -- moved by 24/7 venues: Hyperliquid trade.xyz perps for GOLD / SILVER / COPPER / JPY / EUR / GBP, Kraken for AUD/USD and USD/CAD, Bitso for USD/MXN), in the wave's `fair_cmd`, read by `--fair-file`; valid 45 min after each refresh (a failed source reuses its last price under 45 min old; stale = floor sides only). **Its Friday closes and T0 are hard-coded to 11/13: update CLOSE and T0 in `wave_fair.py` for a new weekend before listing.** Margin 2c (copper 6c) + the vol-error term, set in the fair file. Crypto: the bot's gate, nothing to add.
+1. **Fair first.** FX / metals: `wave_fair.py OUT --live` (lognormal on Friday's 5 PM ET close -- metals = Kalshi's weekly settlements KXGOLDW / KXSILVERW / KXCOPPERW, FX = Yahoo -- moved by 24/7 venues: Hyperliquid trade.xyz perps for GOLD / SILVER / COPPER / JPY / EUR / GBP, Kraken for AUD/USD and USD/CAD, Bitso for USD/MXN), in the wave's `fair_cmd`, read by `--fair-file`; valid 45 min after each refresh (a failed source reuses its last price under 45 min old; stale = floor sides only). **The weekend rolls by itself (11/14):** `fx_shut_window` gives the close and the reopen; each weekend's closes are fetched once (metals: Kalshi's weekly settlement, ~80 min after the close; FX: Yahoo's last 5-min bar) into `run-logs/pvd-scan/wave_fair_closes.json`, and used only within 0.5% of the 24/7 source's own price at the close (11/13: all nine within 0.1%; 11/06: copper 1.06% off, refused). A close not out yet or refused = no fair for that series until a later pass gets it: its strikes rest nothing. Each 24/7 source's own price at the close is kept there too (Kraken serves 5-min bars only ~60 h back). Weekdays: section 12's decision above; the tune reads the file's "floor" and per-strike "margin_extra" (pvd_wave_tune.py, 11/14), and the wave's `--fair-floor 0` keeps an unreadable file at nothing. The 11/13 weekend keeps the closes entered by hand (Kalshi and Yahoo reproduce them within 0.03%). The margin: the decision above (copper 6c until Jack 11/14: "make copper and all metals/fx at the 2c margin"). Crypto: the bot's gate, nothing to add.
 2. **Dates:** these tickers are DDMONYYHHMM (KXGOLDEVENT-17NOV261100 = Nov 17 2026 11:00 ET); the bot reads YYMONDD and drops them (27 of 807 got in on 11/13). `run --write` runs `datefix`, which writes `event_start_overrides.json` rows (hot-reloaded); check its output after the first pass.
 3. **Wave books:** a listed crypto strike quotes like any wave book -- no fair lead, the wave's reference on both sides (20aca4e; Jack 11/14: "it should function like the other market-wave books") -- and its limits come from the live fair every cycle, not the 5c-a-run walk (28837b4).
 4. **Cash:** metals and crypto trade on shard 2 (shared with the crypto bots); FX and yields on shard 0. Preflight checks both. Only Jack moves money.
 5. **Capacity:** 2,000+ markets means the placement queue, the resting cap and the collateral budget (section 7) bind within the first hour.
-6. **Size for the floor from the start** (section 11), pre-approved while the fair is live: bank early up to 5x the base at go-live; `pace` / `resize` once the sizes rest; two-read offs; a stop file for crypto strikes (`crypto_event_stop.json` + the list's "stopped") covers strikes the wave never listed too (Jack 11/14 "Stop them early").
-7. **Deploys:** batch bot deploys during the window: each restart re-queues the book and reads low for ~15 min (8 restarts the night of 11/14).
+6. **Size for the floor from the start** (section 11), pre-approved while the fair is live: bank early up to 5x the base at go-live; `pace` / `resize` once the sizes rest; two-read offs; `set NAME floor_auto on` at go-live (pre-approved on a type B wave with a live fair; the bot's own fair counts), with `set NAME floor_max_mult 1` when the bank size is already 5x the base; `crypto_event_stop.json` (by hand) for strikes the wave never listed (Jack 11/14 "Stop them early").
+7. **Deploys:** batch bot deploys during the window: each restart pulls every coin ~1 min, re-queues the book and reads low ~15 min (8 restarts the night of 11/14; 6 more 21:52-02:12Z 11/14-15, several of them FX fair deploys).
+8. **Check a fair change** (after a margin or model deploy): margins by series from the status file (`fx_event_fair.json` / `crypto_event_fair.json`: each market's `margin`, `bid_max`, `ask_min`); resting strikes by series from the newest COMPLETE cycle of the cycle log (`own_bid_ct + own_ask_ct > 0`; its `quoted` column reads 0 on every row); our tops (`own_bid_top`, `own_ask_top`) against the new limits, and `place` rows in `orders_<date>.jsonl` since the restart outside them: 0 expected. The bot loads a change only at its restart (reference.md, deploy safety).
 
-**What it earned:** FX + metals ~$1.1k/day at first (budget-capped, tails screened, dates misread) -> ~$3.5k/day sized up -> ~$2.2-2.5k after other makers answered; 1 fill in ~20 h. Crypto ~$110 -> ~$1,356/day with fair limits and bank-early; 0 fills; $405 banked by 12:50Z 11/14. The bot's first estimate (~$9k for FX + metals over 30 h) is a ceiling.
+**What it earned:** FX + metals ~$1.1k/day at first (budget-capped, tails screened, dates misread) -> ~$3.5k/day sized up -> ~$2.2-2.5k after other makers answered; 1 fill in ~20 h. Crypto ~$110 -> ~$1,350/day with fair limits and bank-early; ~$600/day while banked strikes dropped to 300; ~$1.25-1.4k/day back at 1,500 (19-20Z 11/14); then jump holds and restarts: $940 banked for the period (to 05:00Z 11/15), 4 fills (+$42 at the next morning's fair). The bot's first estimate (~$9k for FX + metals over 30 h) is a ceiling.
 
 ## 13. Cash, sweeps and the switch files
 
-- **Sweeps:** 11/07 a taker worked the House districts (~1/min, 20 min): 6,450 of our contracts, ~$7k of cash locked to 2029, prices didn't move. 11/12 a seller cleared the top bid of 18 Senate-nominee events in 21 min (section 1.1). The group breaker (2nd fill of 200+ in another event of the group within 10 min -> that side of the group held 20 min) is the standing cross-event protection; the per-event sweep breaker can't stop a taker that moves on.
+- **Sweeps:** 11/07 a taker worked the House districts (~1/min, 20 min): 6,450 of our contracts, ~$7k of cash locked to 2029, prices didn't move. 11/12 a seller cleared the top bid of 18 Senate-nominee events in 21 min (section 1.1). The group breaker (2nd fill of 200+ in another event of the group within 10 min -> that side of the group held 20 min) is the standing cross-event protection; the per-event sweep breaker can't stop a taker that moves on. 11/15 a taker went state by state on one name (Mark Kelly, 7 states in 80 s): the candidate breaker now holds a name in every state after its first 200+ fill, and every breaker pull is batched, most at risk first (736cc94). Every wave series with no group is its own since 2063782.
 - **If Jack sees a sweep:** pause with the tune (`--pause-at`, or a lower `--side-cap`) and run it now, keeping the unwinding sides open; watch `ws_tape_<date>.jsonl` "burst" events with a Monitor; reopen in steps; show fills by price band and the cash tied.
 - **Shard cash funds the bot.** Shard 0 funds most of it; shard 2 funds metals and crypto; shard 3 baseball / basketball / tennis. When a shard runs out, orders there are rejected (404 insufficient_shard_balance). Kalshi holds no cash for resting orders: only fills draw it. Only Jack moves money (`python kalshi_subaccount.py shard <$> --from 0 --to N`, it asks for `MOVE`); transfers need whole cents.
 
@@ -475,10 +516,11 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 | 0 | Dashboard keepalive (registry waves + fixed pages such as :8783) |
 | 1-5 | RETIRED 11/11: the 2028 and political series are registry waves (w1111-elec2028, w1111-w28, w1111-pol) |
 | 6 | The 11/04 post-vote books and other listings outside the registry: 200 floor, stamped |
-| 7 | `pvd_waves.py run --write`: every enabled registry wave, scan + fair + tune + datefix, under each wave's pass lock |
+| 7 | `pvd_waves.py run --write`: every enabled registry wave, scan + fair + tune + datefix, under each wave's pass lock; the after-economic-events waves' relights included |
 | 8 | Pick-off watch + alert |
 | 9 | `darkcheck --act` + `wave_alert.py dark`: listed vs resting on Kalshi |
 | 10 | `bait_watch.py` + `wave_alert.py bait` |
+| 11 | `wave_detect.py --upcoming --preflight` + `wave_alert.py upcoming`: advance notice of a wave that would be greenlit at its start, a NEW shape held for Jack, a registry relight (section 2.1) |
 
 - **A new period (type C):** the scanner rebuilds each relit entry from scratch and the tune applies the registry's CURRENT args. So a relit market starts with every size-up Jack made last period (as of 11/14: statenom `2:30,5:15,15:11.25,30:3,70:1.25`, with Tennessee's 12 Senate-nominee markets pinned at 0 and three nominee markets at 200; elec2028 `2:15,5:15,15:3,30:1.5`, i.e. x15 to 5c, x3 to 15c, x1.5 to 30c). Say so in the relight report. Jack 11/14 on the nominee wave: keep the size-ups into its next period ("Yes, do 1-5"); for any other wave, ask whether the new period starts there or at the default. A relit market with no fresh usual price rests base for ~1 h (cold start) before its tiers apply.
 - **The 11/11 miss** (history.md): relit 2028 markets listed under the old-wave lock rested nothing while the texts said "greenlit"; nothing compared the list with Kalshi. Now: every listing is stamped within a run; relight alerts say "listed", never "greenlit"; the dark check verifies.
@@ -504,19 +546,23 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 ## Talking to Jack
 
 - **Cash per contract, by side:** "sides tying up 90c+". **Multiples against the base:** "20x -> 30x".
+- **Margins and limits:** give the whole gap on each side -- the base + the vol cushion + the weekday term, e.g. "bid <= 48c / ask >= 54c on a 51c fair" -- never just the base (11/15: "wdym?").
 - **Options:** numbered, with $/day and $ at risk, the recommended one first. Short replies approve exactly what was offered.
 - **Measured vs model:** say which every number is. Never "model: enough" (11/14: Jack: "you said there should be 270+57+33+11+11 strikes over $1").
 - **First-hour rates are ceilings;** other makers arrive. Name the wave by date and theme ("11/11 · Senate/Gov nominees"), never a bookkeeping wave as a new one.
 - **Pick-offs:** in $ marked to the book with our orders out, each with its mechanism (bait, sweep, real move, restart).
 - **Commits:** only on "commit". Quote him in commit messages and list notes.
+- **"What's coming?" / "any waves tomorrow?":** `wave_detect.py --upcoming --preflight` (no `--update-state`), then each window: when (ET), what would be greenlit, held for him (a NEW shape: say so) or relit, preflight now. Kalshi usually lists a start about a day ahead.
 
-## Open questions for Jack (as of 11/14)
+## Open questions for Jack (as of 11/15; closed ones in `history.md`)
 
-1. DONE 11/14 ("Yes, pre-approve"): the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair (section 0).
-2. DONE 11/14: KXSENATENOM-TNR-28's 12 markets pinned at 0 until Blackburn names her appointee (lifting them -- `setarg w1111-statenom pin KXSENATENOM-TNR-28-<X>:0 --unset` each -- is Jack's word).
-3. DONE 11/14: the KXSENATENOM series pin lifted (436 markets back on the tiers: 175,600 -> 1,148,900 contracts listed); KSR-JMOR, ARR-JBOO and COD-MBEN keep their 200 pins.
-4. 1c bid / 99c ask edges for crypto tail strikes worth under 1c (offered 11/14); ranking dark sides by $/day in the placement queue (offered 11/14).
-5. Add the under-$1 check to the FX wave's 15-minute pass (asked 11/14 13:57Z), i.e. run `resize` on a schedule?
-6. A wave-level loss stop (e.g. -$500 in an hour of pick-offs) in the bot.
-7. The clamp on every side always (+$263 replayed, lags real moves ~3 h).
-8. Hard-cap crowded cheap sides at the 1,000 target; roll back the <= 5c doubling on 2028.
+1. 1c bid / 99c ask edges for crypto tail strikes worth under 1c (offered 11/14); ranking dark sides by $/day in the placement queue (offered 11/14).
+2. A wave-level loss stop (e.g. -$500 in an hour of pick-offs) in the bot.
+3. The clamp on every side always (+$263 replayed, lags real moves ~3 h).
+4. Hard-cap crowded cheap sides at the 1,000 target; roll back the <= 5c doubling on 2028.
+5. A per-series skip for a noticed upcoming wave, so it stays off at its start (today: the "pause overnight" text, or `stop` right after it lists)? (offered 11/14)
+6. The 24/7 check's prompt still says its needs-you alert "emails, never texts": since 11/14 `wave_alert.py` texts a NEW shape (it decides; the prompt's note is stale but harmless). Updating the prompt is Jack's word.
+7. KXYTVIEWSHIGH (YouTube highest daily views, 140 markets, $1,000/day, from 11/15 16:00Z): NEW, held; recommended off.
+8. USD/MXN's dark spells (Bitso's wide book refused twice 11/14-15): a second source, or accept them.
+9. A per-coin jump-hold trigger (HYPE held 30% of 11/14-15, BTC 8%): measure what the holds avoided first (offered 11/15).
+10. Commit the wave tools and this runbook (uncommitted since 8e426c5: floor_auto and the bot-fair floor check, the upcoming notice, known shapes, the fair file at 2c, whydark's FX lines).

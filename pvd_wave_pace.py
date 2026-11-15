@@ -60,6 +60,7 @@ sized 0 by the bot, else unexplained. darkcheck answers "is a wave dark"; whydar
 """
 from __future__ import annotations
 
+import argparse
 import collections
 import json
 import math
@@ -485,6 +486,11 @@ def cmd_resize(a) -> int:
     os.replace(mp + ".tmp", mp)
     print(f"WROTE {mp}: {n_up} up, {n_off} off ({sum(1 for v in cur.values() if v > 0)} sized, "
           f"{sum(1 for v in cur.values() if v == 0)} off in the file)")
+    if getattr(a, "no_run", False):
+        # pass_resize: the 15-min pass holds this wave's lock and tunes it next, so no setarg
+        # (it would wait on that lock) and no second run
+        print("    (this pass's tune applies them)")
+        return 0
     w = pw.load()["waves"][a.name]
     if mp not in pw._vals(w.get("tune") or [], "--size-mult-file"):
         r = subprocess.run([pw.PY, os.path.join(pw.HERE, "pvd_waves.py"), "setarg", a.name, "size-mult-file", mp],
@@ -499,6 +505,77 @@ def cmd_resize(a) -> int:
     return 0
 
 
+FLOOR_MAX_MULT = 5.0       # never above 5x (Jack 2026-11-14: "go up to 5x every market")
+
+
+# THE BOT'S OWN LIVE FAIRS (Jack 2026-11-15: "build these to generalize into the market-wave
+# skill"): a wave whose fair lives in the bot, not in a fair file -- the crypto wave's
+# (crypto_event_fair) -- counts as live while one of these status files lists its series'
+# strikes and was written within BOT_FAIR_FRESH_MIN.
+BOT_FAIRS = ("crypto_event_fair.json", "fx_event_fair.json")     # in the bot's status dir
+BOT_FAIR_FRESH_MIN = 5.0
+
+
+def _bot_fair_live(w: dict, now: datetime) -> "str | None":
+    """None when the bot prices the wave's series live (BOT_FAIRS), else why not."""
+    mine = set(pw.all_series(w))
+    for fn in BOT_FAIRS:
+        try:
+            with open(os.path.join(os.path.dirname(pw.LIST), fn), encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+        except (OSError, ValueError):
+            continue
+        if not mine & {str(t).split("-")[0] for t in (d.get("markets") or {})}:
+            continue
+        age = now.timestamp() - float(d.get("checked_ts") or 0.0)
+        return None if age <= BOT_FAIR_FRESH_MIN * 60 else f"the bot's {fn} is {age / 60:.0f} min old"
+    return "no --fair-file in its tune, and the bot prices none of its series live"
+
+
+def _fair_live(w: dict, now: datetime) -> "str | None":
+    """None when the wave has a live fair -- its --fair-file fresh (its valid_until ahead),
+    or with no fair file the bot's own live fair for its series (_bot_fair_live) -- else why
+    not."""
+    ff = pw._vals(w.get("tune") or [], "--fair-file")
+    if not ff:
+        return _bot_fair_live(w, now)
+    try:
+        with open(ff[-1], encoding="utf-8") as fh:
+            vu = _ts((json.load(fh) or {}).get("valid_until"))
+    except (OSError, ValueError) as e:
+        return f"fair file unreadable ({e.__class__.__name__})"
+    if vu is None or vu <= now.timestamp():
+        return "fair file stale"
+    return None
+
+
+def pass_resize(name: str, w: dict, now: "datetime | None" = None) -> int:
+    """THE $1-FLOOR CHECK IN EVERY 15-MIN PASS, for a wave with "floor_auto": true (Jack
+    2026-11-14 on w1113-fxmetals: "Yes, every 15 min", to "Run this two-read check
+    automatically in the wave's 15-minute pass until the stop?"). = `resize NAME --apply`
+    with the defaults, minus its own setarg and wave run: the pass calls this right before
+    the wave's tune, which reads the multiples file. Two reads as by hand: a market goes off
+    only when the previous read, 5-90 min earlier (the last pass), judged it the same way.
+    Skips -- and changes nothing -- unless the wave's tune has --size-mult-file and a fresh
+    --fair-file (the floor protocol needs a live fair); cmd_resize itself skips within 15
+    min of a bot restart and on a stale dashboard read. Never above 5x; an off stays off."""
+    now = now or datetime.now(timezone.utc)
+    tune = w.get("tune") or []
+    if not pw._vals(tune, "--size-mult-file"):
+        print("    skipped: no --size-mult-file in its tune (`set NAME floor_auto on` adds it)")
+        return 0
+    why = _fair_live(w, now)
+    if why:
+        print(f"    skipped: {why} (the floor protocol needs a live fair)")
+        return 0
+    fl = w.get("floor") if isinstance(w.get("floor"), dict) else {}
+    a = argparse.Namespace(name=name, aim=float(fl.get("aim", 1.20)),
+                           max_mult=min(FLOOR_MAX_MULT, float(fl.get("max_mult", FLOOR_MAX_MULT))),
+                           real=0.65, window_min=60.0, keep_within=0.05, no_off=False, json=None,
+                           apply=True, force=False, no_run=True)
+    return cmd_resize(a)
+
+
 # ---------------------------------------------------------------------------
 # WHYDARK
 # ---------------------------------------------------------------------------
@@ -509,6 +586,8 @@ _RX_PVD_CLEAR = re.compile(r"\] pvd guard (\S+): clear")
 _RX_LONE = re.compile(r"\] lone-ref guard(?: \(([^)]*)\))? (\S+) (bid|ask): (.*)$")
 _RX_CRYPTO = re.compile(r"\] crypto-event stand-aside (\S+): (.*)$")
 _RX_CRYPTO_RES = re.compile(r"\] crypto-event resume (\S+)")
+_RX_FX = re.compile(r"\] fx-event stand-aside (\S+): (.*)$")
+_RX_FX_RES = re.compile(r"\] fx-event resume (\S+)")
 
 
 def log_side_reasons(tickers, now: datetime) -> dict:
@@ -548,6 +627,16 @@ def log_side_reasons(tickers, now: datetime) -> dict:
                 out[(m.group(1), sd)] = f"crypto fair stands it aside ({m.group(2)[:70]})"
             continue
         m = _RX_CRYPTO_RES.search(ln)
+        if m and m.group(1) in want:
+            out.pop((m.group(1), "bid"), None)
+            out.pop((m.group(1), "ask"), None)
+            continue
+        m = _RX_FX.search(ln)
+        if m and m.group(1) in want:
+            for sd in ("bid", "ask"):
+                out[(m.group(1), sd)] = f"FX fair stands it aside ({m.group(2)[:70]})"
+            continue
+        m = _RX_FX_RES.search(ln)
         if m and m.group(1) in want:
             out.pop((m.group(1), "bid"), None)
             out.pop((m.group(1), "ask"), None)

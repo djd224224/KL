@@ -230,6 +230,33 @@ class FairTuneTests(unittest.TestCase):
         self.assertGreater(mod.fair_margin(3.0, 15.87, 0.25), 8.5)     # z = -1: +6c
         self.assertLess(mod.fair_margin(3.0, 0.01, 0.25), 3.5)          # deep tail: ~base
 
+    def test_a_weekday_file_rests_nothing_without_a_fair_and_widens_by_staleness(self):
+        # 2026-11-14, Jack: "after-economic events can quote anytime not just when markets are
+        # shut, but need a fair value" -- the weekday file says floor 0 and adds margin_extra
+        doc = {"fair": FAIR, "margin": {"KXCOPPEREVENT": 6.0}, "valid_until": "2099-01-01T00:00:00Z",
+               "floor": 0, "margin_extra": {"KXGOLDEVENT-17NOV260930-T388000": 8.0}}
+        L, out = self.run_tune("pvd_wave_tune", ["--fair-file", "FAIR"], fair_text=json.dumps(doc))
+        ag = L["KXSILVEREVENT-17NOV260930-T48000"]
+        self.assertEqual((ag["bid_max"], ag["ask_min"]), (0, 100), ag)        # no fair: nothing rests
+        gold = L["KXGOLDEVENT-17NOV260930-T388000"]
+        self.assertEqual((gold["bid_max"], gold["ask_min"]), (39, 61), gold)  # 3c + 8c staleness
+        mxn = L["KXUSDMXNEVENT-19NOV261500-T195500"]
+        self.assertEqual(mxn["bid_max"], 0, mxn)                              # a ~0c contract: no bid at all
+        self.assertIn("floor 0c", out)
+        self.assertIn("1 with no fair (nothing rests)", out)
+
+    def test_a_stale_weekday_file_still_rests_nothing(self):
+        doc = {"fair": FAIR, "valid_until": "2000-01-01T00:00:00Z", "floor": 0}
+        L, out = self.run_tune("pvd_wave_tune", ["--fair-file", "FAIR"], fair_text=json.dumps(doc))
+        g = L["KXGOLDEVENT-17NOV260930-T388000"]
+        self.assertEqual((g["bid_max"], g["ask_min"]), (0, 100), g)
+        self.assertIn("5 with no fair (nothing rests)", out)
+
+    def test_the_cli_floor_holds_when_the_file_is_unreadable(self):
+        L, _ = self.run_tune("pvd_wave_tune", ["--fair-file", "FAIR", "--fair-floor", "0"], fair_text="{not json")
+        g = L["KXGOLDEVENT-17NOV260930-T388000"]
+        self.assertEqual((g["bid_max"], g["ask_min"]), (0, 100), g)
+
 
 
 

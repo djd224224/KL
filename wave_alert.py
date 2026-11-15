@@ -18,12 +18,18 @@ it now runs this, so every alert reads the same:
     # pick-offs on wave markets (pvd_waves.py pickoffs --json): texts at $100+ new,
     # a series trip or a stand-down; email whenever something new was flagged
     python wave_alert.py pickoff --pickoffs run-logs/pvd-scan/pickoffs_last.json [--send]
+    # an UPCOMING wave (wave_detect.py --upcoming --json, the relight task's pass 11):
+    # advance notice before its programs start; texts when a wave would be greenlit or a
+    # NEW shape is held for you, emails a window that only needs your call and a registry
+    # wave's relight (texted when its preflight now FAILs)
+    python wave_alert.py upcoming --upcoming run-logs/pvd-scan/wave_upcoming_last.json [--send]
 
 Without --send it prints TEXT, PUSH, SUBJECT and BODY. With --send it texts
-(sms_alert.py, capped; only for a live / not-live wave, or a relight of 100+
-markets or a 1,000+ program jump), emails jackdu224@gmail.com
-(send_alert_email.py) and prints the PUSH line for the task's PushNotification.
-Read-only otherwise (a relight's names take one /markets read).
+(sms_alert.py, capped; only for a live / not-live wave, a NEW shape held for your
+call -- Jack 2026-11-14: "for upcoming new shapes, notify me and it's my call so dont
+default to turning it on" -- or a relight of 100+ markets or a 1,000+ program jump),
+emails jackdu224@gmail.com (send_alert_email.py) and prints the PUSH line for the
+task's PushNotification. Read-only otherwise (a relight's names take one /markets read).
 """
 from __future__ import annotations
 
@@ -42,7 +48,10 @@ N_NAMES = 10
 NAME_CHARS = 60          # one name in the text
 TEXT_CHARS = 900         # sms_alert.py --long (T-Mobile delivers a long one as MMS)
 DENIED = ("FEW", "CHECK", "SOON")
+LADDER_WHY = "live-price ladder"     # wave_detect.py's why for the after-economic-events ladders
 TUNE_NOTE = "Reply in a Claude session to tune: the tune menu is at the end of the report."
+NEW_SHAPE_NOTE = ("A new shape is your call: say \"run <SERIES>\" in a Claude session to list it (it then lists "
+                  "like any wave), or nothing and it stays off.")
 
 
 def load(path):
@@ -74,20 +83,32 @@ def _iso(s):
         return None
 
 
-def et_clock(t: datetime, ampm: bool = True) -> str:
-    """'3:08 PM' in US Eastern (DST-aware), or '3:08' with ampm=False."""
+def to_et(t: datetime) -> datetime:
+    """`t` on the US Eastern clock (DST-aware)."""
     try:
         from zoneinfo import ZoneInfo
-        t = t.astimezone(ZoneInfo("America/New_York"))
+        return t.astimezone(ZoneInfo("America/New_York"))
     except Exception:  # noqa: BLE001 -- no tz database: EST/EDT by the US rule
         y = t.year
         start = datetime(y, 3, 8, 7, tzinfo=timezone.utc)      # 2nd Sunday of March, 2 AM EST
         start += timedelta(days=(6 - start.weekday()) % 7)
         end = datetime(y, 11, 1, 6, tzinfo=timezone.utc)       # 1st Sunday of November, 2 AM EDT
         end += timedelta(days=(6 - end.weekday()) % 7)
-        t = t + timedelta(hours=-4 if start <= t < end else -5)
-    s = t.strftime("%I:%M %p").lstrip("0")
+        return t + timedelta(hours=-4 if start <= t < end else -5)
+
+
+def et_clock(t: datetime, ampm: bool = True) -> str:
+    """'3:08 PM' in US Eastern (DST-aware), or '3:08' with ampm=False."""
+    s = to_et(t).strftime("%I:%M %p").lstrip("0")
     return s if ampm else s[:-3]
+
+
+def et_when(t: datetime, now: datetime) -> str:
+    """'Sun 12:00 AM ET (in 5 h)': a start time on Jack's clock, and how far off it is."""
+    mins = max(0.0, (t - now).total_seconds() / 60)
+    ahead = (f"in {mins:.0f} min" if mins < 90 else f"in {mins / 60:.0f} h" if mins < 48 * 60
+             else f"in {mins / 1440:.0f} days")
+    return f"{to_et(t).strftime('%a')} {et_clock(t)} ET ({ahead})"
 
 
 def event_titles(events, cap: int = 2 * N_NAMES) -> dict:
@@ -127,12 +148,14 @@ def text_name(s: str) -> str:
 
 
 def deny_reason(r: dict) -> str:
-    """One short reason per denied series, as the detector decided it."""
+    """One short reason per denied (or held) series, as the detector decided it."""
     v = r["verdict"]
     if v == "FEW":
         return "under 5 events in their series"
     if v == "SOON":
         return "settles within a day"
+    if v == "NEW":
+        return f"new shape ({r.get('category') or 'no category read'}): no wave has run one"
     why = [w for w in r.get("why") or [] if w]
     for w in why:
         if w.startswith("category "):
@@ -141,7 +164,25 @@ def deny_reason(r: dict) -> str:
         return "mention series"
     if any("blocklisted" in w for w in why):
         return "blocklisted"
+    if any(LADDER_WHY in w for w in why):
+        return "live-price ladders with no wave (type B: a fair first)"
+    for w in why:
+        if w.startswith("settles on a live feed"):
+            return w.split(":", 1)[0]            # "settles on a live feed (charts.youtube.com)"
     return "; ".join(why) or "needs your call"
+
+
+def wave_do_text(outcome: str, d: dict) -> bool:
+    """A wave alert texts when a wave listed or failed to; a NEW shape held for Jack texts too
+    (Jack 2026-11-14: "for upcoming new shapes, notify me and it's my call"); any other
+    needs-you stays email only."""
+    return outcome in ("live", "not-live") or (outcome == "needs-you" and bool(d.get("new_shape_over_bar")))
+
+
+def held_new(rows, new_ask) -> list:
+    """The NEW shapes among a check's new series: held for Jack (never denied), whatever else
+    the check found."""
+    return [r for r in rows if r["verdict"] == "NEW" and r["series"] in new_ask]
 
 
 def names_of(rows, mark: str):
@@ -162,7 +203,8 @@ def wave_msg(d: dict, outcome: str, wave: str, why_not: str, listed, est_day, fe
         held = [r for r in rows if r["series"] in new_ask]
     else:
         green = [r for r in rows if r["series"] in new_q]
-        held = []
+        held = held_new(rows, new_ask) if outcome in ("live", "not-live") else []   # new shapes beside a wave
+    shape = d.get("new_shape_over_bar") and outcome == "needs-you"
     denied = [r for r in rows if r["verdict"] in DENIED and r not in held]
     already = [r for r in rows if r["verdict"] in ("LISTED", "QUOTED", "MEMBER")]
     g_ev = sum(r["events"] for r in green)
@@ -177,6 +219,10 @@ def wave_msg(d: dict, outcome: str, wave: str, why_not: str, listed, est_day, fe
         head = f"WAVE {name} LIVE: {plural(g_ev, 'event')} greenlit, {d_ev:,} denied"
     elif outcome == "not-live":
         head = f"WAVE {name} NOT LIVE: {plural(g_ev, 'event')} passed but not quoted, {d_ev:,} denied"
+    elif outcome == "needs-you" and shape:
+        hm, hp = sum(r["markets"] for r in held), sum(r["pool_day"] for r in held)
+        head = (f"WAVE? Your call, new shape: {plural(h_ev, 'event')} held for you ({hm:,} mkts, ${hp:,.0f}/day "
+                f"pools), 0 greenlit, {d_ev:,} denied")
     elif outcome == "needs-you":
         head = f"WAVE? Your call: {plural(h_ev, 'event')} held for you, 0 greenlit, {d_ev:,} denied"
     else:
@@ -189,7 +235,8 @@ def wave_msg(d: dict, outcome: str, wave: str, why_not: str, listed, est_day, fe
     fit = [r for r in green if r["verdict"] == "FIT"]
     near = [r for r in green if r["verdict"] == "NEAR"]
     if fit:
-        gw.append(f"{sum(r['events'] for r in fit)} have 5+ events in one series, settle 14d+ out, safe category")
+        gw.append(f"{sum(r['events'] for r in fit)} have 5+ events in one series, settle 14d+ out, a shape "
+                  f"you've run ({'/'.join(sorted({r.get('category') or '?' for r in fit}))})")
     if near:
         gw.append(f"{sum(r['events'] for r in near)} settle in 1-14d (base size, no multipliers)")
     by = collections.Counter()
@@ -212,8 +259,8 @@ def wave_msg(d: dict, outcome: str, wave: str, why_not: str, listed, est_day, fe
     if not why_lines:
         why_lines.append("Why: nothing new cleared the bar")
 
-    # the 10 names: greenlit (or held) first, then denied
-    first = names_of(green or held, "+" if green else "?")
+    # the 10 names: greenlit first, then held, then denied
+    first = (names_of(green, "+") + names_of(held, "?")) if green else names_of(held, "?")
     rest = names_of(denied, "x")
     names = (first + rest)[:N_NAMES]
     shown = names + (rest[:N_NAMES] if len(first) >= N_NAMES else [])
@@ -234,19 +281,25 @@ def wave_msg(d: dict, outcome: str, wave: str, why_not: str, listed, est_day, fe
              f"{plural(d.get('programs') or 0, 'new program')}, {plural(len(rows), 'series')}.")
     b.append("")
     label = {"live": "GREENLIT (quoting now)", "not-live": "PASSED, NOT LIVE", "needs-you": "HELD FOR YOUR CALL"}
-    if green or held:
-        grp = green or held
-        b.append(f"{label.get(outcome, 'GREENLIT')}: {plural(sum(r['events'] for r in grp), 'event')} "
+    for grp, lab in ((green, label.get(outcome, "GREENLIT")), (held if green else [], "HELD FOR YOUR CALL"),
+                     ([] if green else held, label.get(outcome, "HELD FOR YOUR CALL"))):
+        if not grp:
+            continue
+        b.append(f"{lab}: {plural(sum(r['events'] for r in grp), 'event')} "
                  f"in {plural(len(grp), 'series')}, {sum(r['markets'] for r in grp):,} markets, "
                  f"${sum(r['pool_day'] for r in grp):,.0f}/day of pools")
-        if outcome == "not-live" and why_not:
+        if grp is green and outcome == "not-live" and why_not:
             b.append(f"  Why not live: {why_not}")
         for r in sorted(grp, key=lambda r: -r["pool_day"]):
-            rule = ("5+ events, settles 14d+ out, safe category" if r["verdict"] == "FIT" else
+            rule = ("5+ events, settles 14d+ out, a shape you've run" if r["verdict"] == "FIT" else
                     "settles in 1-14d: base size, no multipliers" if r["verdict"] == "NEAR" else deny_reason(r))
             b.append(f"  {r['series']} ({r['verdict']}): {plural(r['events'], 'event')}, {r['markets']} mkts, "
                      f"${r['pool_day']:,.0f}/day, settles {(r.get('median_settle') or '?')[:10]} -- {rule}"
                      + (f" -- {short(r.get('title') or '', 60)}" if r.get("title") else ""))
+            if r["verdict"] == "NEW":
+                b += [f"      {ascii_text(x)}" for x in (r.get("why") or [])]
+        if any(r["verdict"] == "NEW" for r in grp):
+            b.append(f"  {NEW_SHAPE_NOTE}")
         b.append("")
     if denied:
         b.append(f"DENIED: {plural(d_ev, 'event')} in {plural(len(denied), 'series')}")
@@ -260,7 +313,7 @@ def wave_msg(d: dict, outcome: str, wave: str, why_not: str, listed, est_day, fe
             f"{r['series']} {r['verdict'].lower()}" for r in already[:15])
             + (f", +{len(already) - 15} more" if len(already) > 15 else ""))
         b.append("")
-    b.append(f"{N_NAMES} NAMES ({'+ greenlit' if green else '? held' if held else ''}"
+    b.append(f"{N_NAMES} NAMES ({', '.join(x for x, on in (('+ greenlit', green), ('? held', held)) if on)}"
              f"{', x denied' if rest else ''}, richest pools first)")
     for i, n in enumerate(names, 1):
         b.append(f"  {n['mark']}{i}. {ascii_text(n['name'])}  [{n['event']}, ${n['pool_day']:,.0f}/day]")
@@ -545,6 +598,256 @@ def bait_msg(r: dict):
     return text, short(head, 150), "market-wave bait: " + short(head, 150), "\n".join(body), bool(loud)
 
 
+def upcoming_reason(r: dict) -> str:
+    """deny_reason, with the live-price ladders (type B) named as such."""
+    if any(LADDER_WHY in w for w in r.get("why") or []):
+        return "live-price ladders (type B: a fair first)"
+    return deny_reason(r)
+
+
+def _upcoming_window(w: dict, now: datetime, fetch_titles: bool) -> dict:
+    """One noticed start window: its line 1, reasons, preflight line, names and email block."""
+    rows = w.get("series") or []
+    st = _iso(w.get("start"))
+    when = et_when(st, now) if st else str(w.get("start"))
+    green_s = set(w.get("new_fit_series") or []) | set(w.get("new_near_series") or [])
+    ask_s = set(w.get("new_check_series") or [])
+    if w.get("notice") == "greenlit":
+        green, held = [r for r in rows if r["series"] in green_s], held_new(rows, ask_s)   # new shapes beside it
+    else:
+        green, held = [], [r for r in rows if r["series"] in ask_s]
+    shape = w.get("notice") == "needs-you" and bool(w.get("new_shape_over_bar"))
+    denied = [r for r in rows if r["verdict"] in DENIED and r not in held]
+    before = [r for r in rows if r.get("alerted_before") and r["verdict"] in ("FIT", "NEAR", "NEW")]
+    already = [r for r in rows if r["verdict"] in ("LISTED", "QUOTED", "MEMBER")]
+    g_ev, g_mk = sum(r["events"] for r in green), sum(r["markets"] for r in green)
+    g_pool = sum(r["pool_day"] for r in green)
+    h_ev, d_ev = sum(r["events"] for r in held), sum(r["events"] for r in denied)
+    if green:
+        head = f"UPCOMING WAVE {when}: {plural(g_ev, 'event')} would be greenlit, {d_ev:,} denied"
+        size = f"{g_mk:,} mkts, ${g_pool:,.0f}/day pools"
+        short_head = f"{when}: {plural(g_ev, 'event')} would be greenlit"
+    elif shape:
+        head = (f"UPCOMING, YOUR CALL (new shape) {when}: {plural(h_ev, 'event')} would be held for you, "
+                f"0 greenlit, {d_ev:,} denied")
+        size = f"{sum(r['markets'] for r in held):,} mkts, ${sum(r['pool_day'] for r in held):,.0f}/day pools"
+        short_head = f"{when}: {plural(h_ev, 'event')} new shape, held for you"
+    else:
+        head = (f"UPCOMING, YOUR CALL {when}: {plural(h_ev, 'event')} would be held for you, 0 greenlit, "
+                f"{d_ev:,} denied")
+        size = ""
+        short_head = f"{when}: {plural(h_ev, 'event')} held for you"
+
+    whys = []
+    fit = [r for r in green if r["verdict"] == "FIT"]
+    near = [r for r in green if r["verdict"] == "NEAR"]
+    gw = []
+    if fit:
+        gw.append(f"{sum(r['events'] for r in fit)} have 5+ events in one series, settle 14d+ out, a shape "
+                  f"you've run ({'/'.join(sorted({r.get('category') or '?' for r in fit}))})")
+    if near:
+        gw.append(f"{sum(r['events'] for r in near)} settle in 1-14d (base size, no multipliers)")
+    if gw:
+        whys.append("Greenlit because: " + "; ".join(gw))
+    hb = collections.Counter()
+    for r in held:
+        hb[upcoming_reason(r)] += r["events"]
+    if hb:
+        whys.append("Held for you because: " + "; ".join(f"{n} {why}" for why, n in hb.most_common()))
+    by = collections.Counter()
+    for r in denied:
+        by[upcoming_reason(r)] += r["events"]
+    if by:
+        whys.append("Denied because: " + "; ".join(f"{n} {why}" for why, n in by.most_common()))
+
+    pf = w.get("preflight")
+    if not green and shape:
+        if pf and pf.get("fail"):
+            pre = f" Preflight now, if you say yes: FAIL {short(pf['fail'][0], 80)}."
+        elif pf and not pf.get("error"):
+            pre = (" Preflight now, if you say yes: PASS"
+                   + (f" ({plural(len(pf.get('warn') or []), 'warning')})" if pf.get("warn") else "") + ".")
+        else:
+            pre = ""
+        status = ("Auto mode won't list a shape no wave has run: your call. Say \"run <SERIES>\" in a Claude "
+                  "session before the start to list it." + pre)
+    elif not green:
+        status = "Auto mode won't list these: your call."
+    elif pf and pf.get("error"):
+        status = (f"Preflight now: could not run ({short(pf['error'], 80)}). At the start auto mode lists it "
+                  f"if preflight passes then.")
+    elif pf and pf.get("fail"):
+        status = f"Preflight now: FAIL {short(pf['fail'][0], 90)} -- fix it before the start, or nothing lists."
+    elif pf:
+        status = ("Preflight now: PASS" + (f" ({plural(len(pf.get('warn') or []), 'warning')})" if pf.get("warn")
+                                           else "") + ". At the start auto mode lists it on the default preset.")
+    else:
+        status = "At the start auto mode lists it on the default preset if preflight passes then."
+
+    first = (names_of(green, "+") + names_of(held, "?")) if green else names_of(held, "?")
+    rest = names_of(denied, "x")
+    names = (first + rest)[:N_NAMES]
+    titles = event_titles([n["event"] for n in names]) if fetch_titles else {}
+    for n in first + rest:
+        n["name"] = titles.get(n["event"]) or n["name"]
+
+    b = [head, size] + whys + [status, ""]
+    b.append(f"Programs start {w.get('start')}" + (f" to {w.get('last_start')}" if w.get("last_start") != w.get("start")
+                                                     else "") + f": {plural(w.get('programs') or 0, 'market')} "
+             f"in {plural(len(rows), 'series')} in this window.")
+    if pf:
+        mode = "pvd_waves.py preflight" + (" --auto" if green else ", as if you said yes")
+        b.append("")
+        if pf.get("error"):
+            b.append(f"PREFLIGHT NOW ({mode}, {pf.get('at')}): could not run -- {pf['error']}")
+        else:
+            b.append(f"PREFLIGHT NOW ({mode}, {pf.get('at')}): "
+                     f"{'FAIL' if pf.get('fail') else 'PASS'}, {pf.get('pass', 0)} pass, "
+                     f"{len(pf.get('fail') or [])} fail, {len(pf.get('warn') or [])} warn")
+            b += [f"  FAIL {ascii_text(x)}" for x in pf.get("fail") or []]
+            b += [f"  WARN {ascii_text(x)}" for x in pf.get("warn") or []]
+    for grp, lab in ((green, "WOULD BE GREENLIT"), (held, "WOULD BE HELD FOR YOUR CALL")):
+        if not grp:
+            continue
+        b += ["", f"{lab}: {plural(sum(r['events'] for r in grp), 'event')} in {plural(len(grp), 'series')}, "
+                  f"{sum(r['markets'] for r in grp):,} markets, ${sum(r['pool_day'] for r in grp):,.0f}/day of pools"]
+        for r in sorted(grp, key=lambda r: -r["pool_day"]):
+            rule = ("5+ events, settles 14d+ out, a shape you've run" if r["verdict"] == "FIT" else
+                    "settles in 1-14d: base size, no multipliers" if r["verdict"] == "NEAR" else upcoming_reason(r))
+            b.append(f"  {r['series']} ({r['verdict']}): {plural(r['events'], 'event')}, {r['markets']} mkts, "
+                     f"${r['pool_day']:,.0f}/day, settles {(r.get('median_settle') or '?')[:10]} -- {rule}"
+                     + (f" -- {short(r.get('title') or '', 60)}" if r.get("title") else ""))
+            if r["verdict"] == "NEW":
+                b += [f"      {ascii_text(x)}" for x in (r.get("why") or [])]
+        if any(r["verdict"] == "NEW" for r in grp):
+            b.append(f"  {NEW_SHAPE_NOTE}")
+    if denied:
+        b += ["", f"DENIED: {plural(d_ev, 'event')} in {plural(len(denied), 'series')}"]
+        for why, n in by.most_common():
+            ss = sorted((r for r in denied if upcoming_reason(r) == why), key=lambda r: -r["pool_day"])
+            b.append(f"  {n} {why}: " + ", ".join(f"{r['series']} ({r['events']})" for r in ss[:12])
+                     + (f", +{len(ss) - 12} more" if len(ss) > 12 else ""))
+    if before:
+        b += ["", "ALERTED BEFORE (the start won't re-trigger them): " + ", ".join(
+            f"{r['series']} {r['verdict']} ({str(r['alerted_before'])[:10]})" for r in before)]
+    if already:
+        b += ["", "ALREADY HANDLED (not counted): " + ", ".join(
+            f"{r['series']} {r['verdict'].lower()}" for r in already[:15])
+            + (f", +{len(already) - 15} more" if len(already) > 15 else "")]
+    b += ["", f"{N_NAMES} NAMES ({', '.join(x for x, on in (('+ greenlit', green), ('? held', held)) if on)}"
+              f"{', x denied' if rest else ''}, richest pools first)"]
+    b += [f"  {n['mark']}{i}. {ascii_text(n['name'])}  [{n['event']}, ${n['pool_day']:,.0f}/day]"
+          for i, n in enumerate(names, 1)]
+    return {"head": head, "size": size, "short": short_head, "whys": whys, "status": status,
+            "names": names, "body": [x for x in b if x is not None], "green": bool(green),
+            "loud": bool(green) or shape, "rank": 0 if green else 1 if shape else 3}
+
+
+def _upcoming_relight(w: dict, now: datetime) -> dict:
+    """A noticed RELIGHT in a start window: registry waves whose new period pass 7 lists at the
+    start, on each wave's current args. Nothing is needed from Jack unless its preflight now
+    FAILs (then it texts)."""
+    rl = w.get("relight") or {}
+    waves = rl.get("waves") or {}
+    st = _iso(w.get("start"))
+    when = et_when(st, now) if st else str(w.get("start"))
+    ev = sum(x["events"] for x in waves.values())
+    mk = sum(x["markets"] for x in waves.values())
+    pool = sum(x["pool_day"] for x in waves.values())
+    names = ", ".join(waves)
+    fx = [n for n, x in waves.items() if x.get("window") == "fx-shut"]
+    pfs = rl.get("preflight") or {}
+    fails = [(n, p["fail"][0]) for n, p in pfs.items() if p.get("fail")]
+    errs = [(n, p["error"]) for n, p in pfs.items() if p.get("error")]
+    head = f"UPCOMING RELIGHT {when}: {names} relist {plural(ev, 'event')}"
+    size = f"{mk:,} mkts, ${pool:,.0f}/day pools"
+    why = ("Why: a new period of an active registry wave; pass 7 lists it at the start on the wave's current args "
+           "(its size-ups too)" + (f"; {', '.join(fx)} only in the FX close (Fri 5 PM - Sun 5 PM ET), with the fair"
+                                   if fx else ""))
+    if fails:
+        status = f"Preflight now: FAIL {fails[0][0]}: {short(fails[0][1], 80)} -- fix it before the start."
+    elif errs:
+        status = f"Preflight now: could not run on {errs[0][0]} ({short(errs[0][1], 60)}). Nothing needed otherwise."
+    elif pfs:
+        nw = sum(len(p.get("warn") or []) for p in pfs.values())
+        status = "Preflight now: PASS" + (f" ({plural(nw, 'warning')})" if nw else "") + ". Nothing needed from you."
+    else:
+        status = "Nothing needed from you: it relists on its own."
+    b = [head, size, why, status, ""]
+    for n, x in waves.items():
+        b.append(f"  {n}: {x['markets']:,} markets, {plural(x['events'], 'event')}, ${x['pool_day']:,.0f}/day"
+                 + (" -- FX close only" if x.get("window") == "fx-shut" else "") + ": " + ", ".join(x["series"]))
+        p = pfs.get(n)
+        if p:
+            if p.get("error"):
+                b.append(f"    PREFLIGHT NOW (pvd_waves.py preflight {n}): could not run -- {p['error']}")
+            else:
+                b.append(f"    PREFLIGHT NOW (pvd_waves.py preflight {n}, {p.get('at')}): "
+                         f"{'FAIL' if p.get('fail') else 'PASS'}, {p.get('pass', 0)} pass, "
+                         f"{len(p.get('fail') or [])} fail, {len(p.get('warn') or [])} warn")
+                b += [f"      FAIL {ascii_text(f_)}" for f_ in p.get("fail") or []]
+                b += [f"      WARN {ascii_text(f_)}" for f_ in p.get("warn") or []]
+    return {"head": head, "size": size, "short": f"{when}: {names} relights {mk:,} mkts", "whys": [why],
+            "status": status, "names": [], "body": b, "green": False, "loud": bool(fails),
+            "rank": 2 if fails else 4}
+
+
+def upcoming_msg(u: dict, fetch_titles: bool = True):
+    """An ADVANCE NOTICE from `wave_detect.py --upcoming --json` (Jack 2026-11-14: "market-wave
+    skill should also scan upcoming rewards markets and callout if a wave would be greenlit so i
+    have advanced notice"): a wave the 24/7 check would list when its programs start, in the
+    wave alerts' layout (counts, reasons, 10 names), with preflight run now. Texts for a wave
+    that would be greenlit and for a NEW shape held for you (Jack 2026-11-14: "for upcoming new
+    shapes, notify me and it's my call"); any other window that needs your call (CHECK / SOON
+    over the bar) is email only, as the live check's is; a registry wave's RELIGHT is email
+    only unless its preflight now FAILs."""
+    now = _iso(u.get("at")) or datetime.now(timezone.utc)
+    parts = []
+    for w in u.get("windows") or []:
+        if w.get("notice"):
+            parts.append((str(w.get("start")), _upcoming_window, w))
+        if (w.get("relight") or {}).get("notice"):
+            parts.append((str(w.get("start")), None, w))
+    if not parts:
+        head = "UPCOMING: no new wave would be greenlit or held for you"
+        return head, head, "market-wave upcoming: " + head, head, False
+    built = []
+    for start, fn, w in parts:
+        p = fn(w, now, False) if fn else _upcoming_relight(w, now)
+        p["start"], p["w"], p["fn"] = start, w, fn
+        built.append(p)
+    built.sort(key=lambda p: (p["rank"], p["start"]))
+    if fetch_titles and built[0]["fn"]:
+        built[0] = dict(_upcoming_window(built[0]["w"], now, True), start=built[0]["start"])
+    lead = built[0]
+    lines = [lead["head"] + (f" ({lead['size']})" if lead["size"] else "")] + lead["whys"] + [lead["status"]]
+    if len(built) > 1:
+        lines.append("Also: " + "; ".join(p["short"] for p in built[1:4])
+                     + (f"; +{len(built) - 4} more" if len(built) > 4 else ""))
+    text = "\n".join(lines)
+    for i, n in enumerate(lead["names"], 1):      # whole names, as many as fit (the email has all 10)
+        ln = f"{n['mark']}{i}. {text_name(n['name'])}"
+        if len(text) + 1 + len(ln) > TEXT_CHARS:
+            break
+        text += "\n" + ln
+    if len(text) > TEXT_CHARS:
+        text = text[: TEXT_CHARS - 3] + "..."
+    push = short(lines[0], 150)
+    body = []
+    for p in built:
+        body += p["body"] + ["", "-" * 60, ""]
+    body += [f"Advance notice: wave_detect.py --upcoming ({u.get('at')}, the relight task's pass 11, every "
+             f"15 min) judged Kalshi's upcoming programs ({u.get('markets', 0):,} markets starting within "
+             f"{u.get('horizon_hours', 72):g} h) the way the 24/7 check will judge them at the start: the same "
+             f"verdicts, 5+ events and the wave bar per start window ({u.get('window_min', 30)} min). Known "
+             f"shapes (auto mode lists them): {', '.join(u.get('known_shapes') or []) or 'Elections, Politics'}, "
+             f"plus the after-economic-events waves' own relights. Nothing was listed. Each series is noticed "
+             f"once per start; the 24/7 check sends its own WAVE alert when it lists, the relight alert when "
+             f"pass 7 relists.",
+             "Your call on any of it: answer in a Claude session before the start."]
+    return text, push, "market-wave upcoming: " + push, "\n".join(body), any(p["loud"] for p in built)
+
+
 def send(text, subject, body, do_text: bool) -> int:
     # the log a text reply reads for context (sms_inbox.py / phone_actions.py alerts)
     try:
@@ -592,6 +895,11 @@ def main() -> int:
     bt = sub.add_parser("bait", help="from bait_watch.py --json: suspicious signs of baiting, every market")
     bt.add_argument("--bait", required=True)
     bt.add_argument("--send", action="store_true")
+    up = sub.add_parser("upcoming", help="from wave_detect.py --upcoming --json: advance notice of a wave "
+                                         "that would be greenlit at its start")
+    up.add_argument("--upcoming", required=True)
+    up.add_argument("--send", action="store_true")
+    up.add_argument("--no-titles", action="store_true", help="skip the event-title reads (tests)")
     a = ap.parse_args()
 
     if a.kind == "wave":
@@ -608,13 +916,15 @@ def main() -> int:
             except OSError as ex:
                 body += f"\n\n(report not readable: {ex})"
         body += "\n\n" + TUNE_NOTE
-        do_text = a.outcome in ("live", "not-live")
+        do_text = wave_do_text(a.outcome, d)
     elif a.kind == "pickoff":
         text, push, subject, body, do_text = pickoff_msg(load(a.pickoffs))
     elif a.kind == "dark":
         text, push, subject, body, do_text = dark_msg(load(a.dark))
     elif a.kind == "bait":
         text, push, subject, body, do_text = bait_msg(load(a.bait))
+    elif a.kind == "upcoming":
+        text, push, subject, body, do_text = upcoming_msg(load(a.upcoming), fetch_titles=not a.no_titles)
     else:
         text, push, subject, body, do_text = relight_msg(load(a.relight))
 

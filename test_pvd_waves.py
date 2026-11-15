@@ -689,5 +689,40 @@ class ScanEnvTests(unittest.TestCase):
         self.assertNotIn("PVD_SCAN_FOLLOW_BOOK", env)
         self.assertEqual(env["PVD_SCAN_LIVE_SIZE"], "80")
 
+
+class WindowTests(unittest.TestCase):
+    """2026-11-14 (Jack: "default to running the wave for elections, after economic events, and
+    things of similar shapes to what's been run on waves so far"; his 11/13 rule: FX + metals
+    only while their markets are closed): an "fx-shut" wave lists only in the FX close and
+    each entry stops at the Sunday reopen, every weekend."""
+
+    def U(self, *a):
+        return datetime(*a, tzinfo=timezone.utc)
+
+    def test_fx_shut_caps_at_the_reopen_or_lists_nothing(self):
+        w = {"window": "fx-shut"}
+        self.assertEqual(pw.effective_stop_cap(w, self.U(2026, 11, 14, 12)), "2026-11-15T22:00:00Z")   # Sat
+        self.assertEqual(pw.effective_stop_cap(w, self.U(2026, 11, 18, 15)), "2026-11-18T15:00:00Z")   # Wed: now
+        self.assertEqual(pw.effective_stop_cap(w, self.U(2026, 11, 20, 22, 5)), "2026-11-22T22:00:00Z")  # Fri close
+        # a fixed cap still wins when it is earlier
+        w["stop_cap"] = "2026-11-15T05:00:00Z"
+        self.assertEqual(pw.effective_stop_cap(w, self.U(2026, 11, 14, 12)), "2026-11-15T05:00:00Z")
+        self.assertIsNone(pw.effective_stop_cap({}, self.U(2026, 11, 14, 12)))
+        self.assertEqual(pw.effective_stop_cap({"stop_cap": "2026-11-15T05:00:00Z"}), "2026-11-15T05:00:00Z")
+
+    def test_set_window_and_clear_a_stop_cap(self):
+        with open(os.environ["PVD_WAVES_REGISTRY"], "w", encoding="utf-8") as fh:
+            json.dump({"waves": {"w": {"series": ["KXGOLDEVENT"], "stop_cap": "2026-11-15T05:00:00Z"}}}, fh)
+        with redirect_stdout(io.StringIO()):
+            pw._set(argparse.Namespace(name="w", key="window", value="fx-shut"))
+            pw._set(argparse.Namespace(name="w", key="stop_cap", value="off"))
+        w = pw.load()["waves"]["w"]
+        self.assertEqual((w["window"], w["stop_cap"]), ("fx-shut", None))
+        with self.assertRaises(SystemExit):
+            pw._set(argparse.Namespace(name="w", key="window", value="weekdays"))
+        with self.assertRaises(ValueError):
+            pw._set(argparse.Namespace(name="w", key="stop_cap", value="tomorrow"))
+
+
 if __name__ == "__main__":
     unittest.main()

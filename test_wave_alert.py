@@ -74,6 +74,33 @@ class WaveAlertTests(unittest.TestCase):
         self.assertEqual(wa.plural(2, "series"), "2 series")
         self.assertEqual(wa.plural(2, "event"), "2 events")
 
+    def test_a_new_shape_needs_you_and_texts(self):
+        # Jack 2026-11-14: "for upcoming new shapes, notify me and it's my call so dont default to
+        # turning it on e.g. KXYTVIEWSHIGH"
+        yt = dict(series("KXYTVIEWSHIGH", "NEW", 16, 1000.0, ["new shape: Entertainment -- no wave has run one"]),
+                  category="Entertainment")
+        d = dict(DETECT, series=[yt, DETECT["series"][2]], new_fit_series=[], new_near_series=[],
+                 new_check_series=["KXYTVIEWSHIGH"], new_shape_series=["KXYTVIEWSHIGH"], new_shape_over_bar=True)
+        text, push, subject, body = wa.wave_msg(d, "needs-you", "", "", None, None, fetch_titles=False)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "WAVE? Your call, new shape: 16 events held for you (16 mkts, $1,000/day pools), "
+                                   "0 greenlit, 1 denied")
+        self.assertEqual(lines[1], "Held for you because: 16 new shape (Entertainment): no wave has run one")
+        self.assertIn(wa.NEW_SHAPE_NOTE, body)
+        self.assertTrue(wa.wave_do_text("needs-you", d))
+        self.assertFalse(wa.wave_do_text("needs-you", dict(d, new_shape_over_bar=False)))   # other needs-you: email
+        self.assertTrue(wa.wave_do_text("live", {}))
+
+    def test_a_new_shape_beside_a_live_wave_is_held_not_denied(self):
+        yt = dict(series("KXSHOW", "NEW", 6, 500.0, ["new shape: Entertainment -- no wave has run one"]),
+                  category="Entertainment")
+        d = dict(DETECT, series=DETECT["series"] + [yt], new_check_series=["KXNFLX", "KXSHOW"])
+        text, push, subject, body = wa.wave_msg(d, "live", "w1108-x", "", 12, 40, fetch_titles=False)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "WAVE w1108-x LIVE: 12 events greenlit, 7 denied (12 mkts listed, ~$40/day est)")
+        self.assertIn("Held for you because: 6 new shape (Entertainment): no wave has run one", lines)
+        self.assertIn("HELD FOR YOUR CALL: 6 events in 1 series", body)
+
 
 
 

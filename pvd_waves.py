@@ -15,7 +15,7 @@ dashboard leave registry series alone. Adding a wave never edits the task.
     python pvd_waves.py dash NAME|all                     # start dashboards, detached
     python pvd_waves.py report NAME [--detect detect.json] [--out report.md]
     python pvd_waves.py setarg NAME FLAG [VALUE] [--unset]   # FLAG without dashes, e.g. cheap-tiers 2:20,5:10
-    python pvd_waves.py set NAME KEY VALUE                # scan_size / budget / stop_cap / enabled / ...
+    python pvd_waves.py set NAME KEY VALUE                # scan_size / budget / stop_cap / window / enabled / ...
     python pvd_waves.py list | remove NAME
     python pvd_waves.py stop NAME [--reason TEXT] [--dry-run]   # disable + its live entries -> "stopped"
     python pvd_waves.py preflight [NAME] [--series A,B --near C] [--detect detect.json] [--auto]
@@ -274,12 +274,35 @@ def tune_cmd(name: str, w: dict, write: bool, group: str = "main") -> list:
     return cmd + (["--write"] if write else [])
 
 
+WINDOWS = ("fx-shut",)
+
+
+def effective_stop_cap(w: dict, now: datetime = None) -> "str | None":
+    """The stop cap a pass scans with: the wave's fixed stop_cap, and for a "window" wave the
+    window's own. "fx-shut" (2026-11-14, Jack: "default to running the wave for elections,
+    after economic events, and things of similar shapes to what's been run on waves so far",
+    under his 11/13 rule "FX + metals only while their markets are closed"): while FX and
+    metals are shut (Fri 5 PM - Sun 5 PM ET) entries stop at the Sunday reopen at the latest;
+    while they trade the cap is now, so the scan lists nothing. The wave relights by itself
+    every weekend Kalshi runs its programs, and stops at each reopen."""
+    now = now or datetime.now(timezone.utc)
+    caps = []
+    if w.get("stop_cap"):
+        caps.append(datetime.fromisoformat(str(w["stop_cap"]).replace("Z", "+00:00")))
+    if w.get("window") == "fx-shut":
+        import wave_fair
+        _close, reopen, shut = wave_fair.fx_shut_window(now)
+        caps.append(reopen if shut else now)
+    return min(caps).strftime("%Y-%m-%dT%H:%M:%SZ") if caps else None
+
+
 def scan_cmd(w: dict, write: bool, group: str = "main") -> tuple:
     series = w["near"] if group == "near" else w["series"]
     cmd = [PY, os.path.join(HERE, "pvd_scan.py"), "--series", ",".join(series),
            "--no-vote-check", "--new-since", w["since"]]
-    if w.get("stop_cap"):
-        cmd += ["--stop-cap", w["stop_cap"]]
+    cap = effective_stop_cap(w)
+    if cap:
+        cmd += ["--stop-cap", cap]
     if write:
         cmd.append("--write")
     env = dict(os.environ)
@@ -476,6 +499,21 @@ def _run_wave(name: str, w: dict, a, lk=None) -> int:
                 run_one([PY, os.path.join(HERE, w["fair_cmd"][0]), *w["fair_cmd"][1:]], tail=1)
             else:
                 print("    (dry run: not refreshed)")
+        if group == "main" and w.get("floor_auto"):
+            # THE $1-FLOOR CHECK EVERY PASS (Jack 2026-11-14 on w1113-fxmetals: "Yes, every 15
+            # min"): pvd_wave_pace.pass_resize = `resize NAME --apply` minus its own setarg and
+            # wave run -- the tune below reads the multiples it writes. Two reads: a market goes
+            # off on its 2nd pass in a row under $1 even at 5x. Needs a live fair; never fails
+            # the pass. `set NAME floor_auto off` stops it
+            print(f"== wave {name} {group} {now_z()}: $1-floor resize (two reads)")
+            if a.write:
+                try:
+                    import pvd_wave_pace
+                    pvd_wave_pace.pass_resize(name, w)
+                except Exception as e:      # noqa: BLE001 -- the tune still runs
+                    print(f"    resize failed: {e!r}")
+            else:
+                print("    (dry run: not run)")
         if lk:
             lk.touch()
             # the args as they are NOW: a setarg made while this wave scanned waited for the
@@ -712,7 +750,9 @@ def param_table(name: str, w: dict) -> list:
     r(f"| programs since | {w.get('since')} | the program-start floor the scan and tune work from | "
       f"`set {name} since ISO` | auto (30 min before the first new program) |")
     r(f"| stop cap | {w.get('stop_cap') or 'none: each program end'} | quoting stops here even if a program runs on | "
-      f"`set {name} stop_cap ISO` | you |")
+      f"`set {name} stop_cap ISO` (`off` = each program end) | you |")
+    r(f"| window | {w.get('window') or 'none'} | fx-shut: lists only while FX / metals are shut (Fri 5 PM - Sun 5 PM "
+      f"ET), each entry stopping at the reopen; relights every such weekend | `set {name} window fx-shut|off` | you |")
     r(f"| listing size | {w.get('scan_size')} a side | the size the scan lists at and judges the bar with | "
       f"`set {name} scan_size N` | you |")
     r("| scan bar | $1.10 by the stop | a market lists only if it projects $1.10+ by the stop at the listing size | "
@@ -953,7 +993,7 @@ def cmd_report(a) -> int:
             p("| verdict | series | markets | events | pool $/day | settles | why |")
             p("|---|---|---|---|---|---|---|")
             for r in det["series"]:
-                if r["verdict"] in ("FIT", "NEAR", "SOON", "CHECK") or r["series"] in w["series"]:
+                if r["verdict"] in ("FIT", "NEAR", "NEW", "SOON", "CHECK") or r["series"] in w["series"]:
                     p(f"| {r['verdict']} | {r['series']} | {r['markets']} | {r['events']} | {r['pool_day']:,.0f} | "
                       f"{(r['median_settle'] or '-')[:10]} | {'; '.join(r['why']) or r['category']} |")
             p("")
@@ -971,7 +1011,8 @@ def cmd_report(a) -> int:
       f"(of {len(mine)} on the list), stops {', '.join(s[:16] for s in stops[:4])}{' ...' if len(stops) > 4 else ''}")
     p(f"- Scan: {w['scan_size']} a side at listing, bar $1.10 by the stop, budget ${float(w['budget']):,.0f} of its "
       f"own listings or the shared ${GLOBAL_BUDGET:,.0f} + it across every wave (PVD_SCAN_BUDGET), whichever has "
-      f"more room; stop cap {w.get('stop_cap') or 'none (program end)'}")
+      f"more room; stop cap {w.get('stop_cap') or 'none (program end)'}"
+      + (f"; window {w['window']} (now {effective_stop_cap(w) or 'no cap'})" if w.get("window") else ""))
     p(f"- Sizes now: {', '.join(f'{n} at {s}' for s, n in sorted(sizes.items()))}; {capped} markets with a 90c+ side capped")
     p("")
     L_.extend(param_table(a.name, w))
@@ -1104,11 +1145,36 @@ def _set(a) -> int:
         v = int(v)
     elif a.key == "budget":
         v = float(v)
-    elif a.key == "enabled":
+    elif a.key in ("enabled", "floor_auto"):
         v = v.lower() in ("1", "true", "yes", "on")
     elif a.key in ("series", "near"):
         v = [s.strip() for s in v.split(",") if s.strip()]
+    elif a.key == "stop_cap":
+        if v.strip().lower() in ("", "off", "none"):
+            v = None                                  # each program's end
+        else:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))   # an ISO time, or it raises
+    elif a.key == "window":
+        v = "" if v.strip().lower() in ("", "off", "none") else v.strip()
+        if v and v not in WINDOWS:
+            raise SystemExit(f"window: one of {', '.join(WINDOWS)}, or off")
+    elif a.key == "floor_max_mult":
+        # the $1-floor check's size-up cap (Jack 2026-11-15, "generalize into the market-wave
+        # skill"): 1 = it only turns markets off -- a wave already banking at 5x its base (the
+        # crypto wave: 1,500 a side on a 300 base) -- up to 5 (pvd_wave_pace.FLOOR_MAX_MULT)
+        x = float(v)
+        if not 1.0 <= x <= 5.0:
+            raise SystemExit("floor_max_mult: 1 (only off) to 5")
+        w.setdefault("floor", {})["max_mult"] = x
+        save(reg)
+        print(f"{a.name}: floor max_mult = {x:g}")
+        return 0
     w[a.key] = v
+    if a.key == "floor_auto" and v and not _vals(w.get("tune") or [], "--size-mult-file"):
+        # the check writes per-market multiples the tune must read (pass_resize skips without)
+        import pvd_wave_pace
+        w["tune"] = list(w.get("tune") or []) + ["--size-mult-file", pvd_wave_pace.size_mult_path(a.name)]
+        print(f"{a.name}: --size-mult-file {pvd_wave_pace.size_mult_path(a.name)} added to its tune")
     save(reg)
     print(f"{a.name}: {a.key} = {v}")
     return 0
@@ -2248,6 +2314,8 @@ GUARD_WHY = {
     "release_pause": "a release pause",
     "league_live": "a live game",
     "manual_yield": "a manual standoff",
+    "crypto_event_fair": "the bot's crypto fair stands it aside (stale spot, jump hold, stopped, or the book fights the fair)",
+    "fx_event_fair": "the bot's FX fair stands it aside (stale source, jump hold, no kept close, or within 12 h of its measurement)",
 }
 
 

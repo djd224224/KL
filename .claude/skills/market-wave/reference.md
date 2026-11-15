@@ -6,23 +6,24 @@ Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read th
 
 | Tool | Role |
 |---|---|
-| `wave_detect.py` | Detector + size-up (read-only). `--since --min-markets --min-pool --min-days-out --min-soon-days --min-events --json --update-state`. Exit 3 = wave, 4 = needs Jack, 0 = nothing. FEW = under 5 events; `INFO_RISK` title screen -> CHECK |
+| `wave_detect.py` | Detector + size-up (read-only). `--since --min-markets --min-pool --min-days-out --min-soon-days --min-events --json --update-state`. Exit 3 = wave, 4 = needs Jack, 0 = nothing. FEW = under 5 events; `INFO_RISK` title screen -> CHECK; `KNOWN_SHAPES` (11/14: Elections, Politics) -> any other FIT / NEAR is NEW (Jack's call, texted); LISTED = the list or an enabled, uncapped registry wave. `--upcoming [--horizon-hours 72] [--preflight]` (pass 11, 11/14): the upcoming programs judged per 30-min start window as the check will at the start; exit 3 = a wave would be greenlit, 4 = your call, 5 = a registry relight only; state `run-logs/pvd-scan/wave_upcoming_state.json`. Tests: `test_wave_detect_livefeed.py`, `test_wave_detect_upcoming.py`, `test_wave_detect_shapes.py` |
 | `pvd_waves.py` | Wave registry and gates: `add [--auto --detect] / run [--only --wait-lock] / dash / report [--email] / setarg [--unset VALUE] / set / list / stop / remove / preflight [--budget --no-capacity] / pickoffs / darkcheck / datefix / pace / resize / whydark`. Presets `default`, `near`, `2028` (Jack only). Env: `PVD_WAVES_REGISTRY`, `PVD_PICKOFF_STATE`, `PVD_DARK_STATE`, `PVD_MIN_CASH0` (5000), `PVD_MIN_CASH_OTHER` (1000). Tests: `test_pvd_waves.py`, `test_pvd_waves_fair.py`, `test_pvd_wave_pace.py` |
-| `pvd_wave_pace.py` | `pace` / `resize` / `whydark` (2026-11-14): the projection on the average share since a size landed, the $1-floor sizing with the two-read off rule, per-side "why not resting". Files: `run-logs/pvd-scan/size_mult_NAME.json` (the multiples `resize --apply` writes; the tune's `--size-mult-file`), `resize_state_NAME.json` (the last read, for the two-read rule) |
+| `pvd_wave_pace.py` | `pace` / `resize` / `whydark` (2026-11-14): the projection on the average share since a size landed, the $1-floor sizing with the two-read off rule, per-side "why not resting" (the bot log's crypto- and fx-event stand-aside lines included). `floor_auto` (pass_resize) needs a live fair: the wave's fresh `--fair-file`, or with none the bot's own (`BOT_FAIRS`: `crypto_event_fair.json`, `fx_event_fair.json` written within 5 min and listing the wave's series, 11/15); the registry's `floor.max_mult` (`set NAME floor_max_mult X`) caps its size-up. Files: `run-logs/pvd-scan/size_mult_NAME.json` (the multiples `resize --apply` writes; the tune's `--size-mult-file`), `resize_state_NAME.json` (the last read, for the two-read rule) |
 | `pvd_scan.py` | Scorer and lister. Any-wave mode `--series --no-vote-check --new-since --stop-cap --report`. Env `PVD_SCAN_LIVE/DEAD/DECIDED_SIZE`, `_BAR`, `_BUDGET` (every wave's live scan adds), `_OWN_BUDGET` + `_OWN_SERIES` (the wave's own budget against its own listings, 2026-11-14), `_CHEAP_TIERS`, `_TIER_SKIP`, `_PRICE_MIN/_MAX`, `_CUSHION`, `_FOLLOW_BOOK`, `_SIM_HOURS`. Tests: `test_pvd_scan_tiers.py`, `test_pvd_scan_budget.py` |
-| `pvd_wave_tune.py` | Idempotent tuner: every lever in SKILL.md section 10, `--size-mult-file`, `--fair-file`, `--halts-on`, `--wave-added`. Tests: `test_pvd_wave_tune_mult.py` |
-| `wave_fair.py OUT [--live]` | The FX + metals weekend fair (w1113): lognormal on Friday's close moved by 24/7 venues; CLOSE / T0 hard-coded to 11/13 -- update for a new weekend. Tests: `test_wave_fair.py` |
-| `crypto_event_fair.py` | The bot's crypto *EVENT fair thread (fleet GBM, Kraken spot, every 15 s); status `run-logs/incentive-mm/crypto_event_fair.json`; stop file `crypto_event_stop.json` |
+| `pvd_wave_tune.py` | Idempotent tuner: every lever in SKILL.md section 10, `--size-mult-file`, `--fair-file` (the file's `floor` replaces `--fair-floor`, 0 = nothing rests without a fair; `margin_extra` per ticker), `--halts-on`, `--wave-added`. Tests: `test_pvd_wave_tune_mult.py` |
+| `wave_fair.py OUT [--live]` | The FX + metals fair (w1113): lognormal on Friday's close moved by 24/7 venues. The weekend rolls by itself (11/14): `fx_shut_window` (DST-aware), closes from Kalshi's weekly settlements / Yahoo kept in `run-logs/pvd-scan/wave_fair_closes.json` (with each venue's own close), each within 0.5% of its 24/7 source or refused. Weekday mode while FX trades (11/14, Jack: "can quote anytime ... but need a fair value"): priced from now, `margin_extra` (staleness), nothing within 12 h of a measurement, `floor` 0, valid 20 min. Tests: `test_wave_fair.py` |
+| `crypto_event_fair.py` | The bot's crypto *EVENT fair thread (fleet GBM, Kraken spot, every 15 s); status `run-logs/incentive-mm/crypto_event_fair.json`; stop file `crypto_event_stop.json` (by hand; covers strikes the wave never listed) |
+| `fx_event_fair.py` | The bot's FX + metals *EVENT fair thread (70d05b7 + d736cc4, 11/14): wave_fair.py's model on the kept close (`run-logs/pvd-scan/wave_fair_closes.json`) and Hyperliquid / Kraken / Bitso mids every 15 s; status `run-logs/incentive-mm/fx_event_fair.json`; dry read `python fx_event_fair.py`. Tests: `test_fx_event_fair.py`, `test_incentive_mm.TestFxEventFair` |
 | `pvd_marginal.py` | What-if: marginal $/day per extra $1k by wave x band (read-only, ~12 min) |
 | `imm_pvd_watch.py` | Wave dashboard. Env `PVD_WATCH_GO_LIVE / _DIR / _SERIES / _EXCLUDE / _PACE_BAR / _PACE_SPARE_H`, `PVD_WATCH_HOST / _TOKEN`. `imm_crypto_event_watch.py` wraps it for the crypto strikes (:8783) |
 | `pvd_watch_keepalive.ps1` | Pass 0: restarts down or hung dashboards: every enabled registry wave, plus the fixed :8774 (11/04 books + other listings) and :8783 (crypto page). :8773 / :8771 retired 11/14 |
 | `relight_watch.py` | What the relight tasks listed and the live program count (exit 3 = something); `new_waves` names a wave the check added |
-| `wave_alert.py` | Every wave / relight / pick-off / dark / bait alert in one layout (`--send`); pick-off lines carry the fill time. Tests: `test_wave_alert.py` |
+| `wave_alert.py` | Every wave / relight / pick-off / dark / bait / upcoming alert in one layout (`--send`); pick-off lines carry the fill time; a NEW shape held for Jack texts (wave and upcoming), an upcoming relight emails (texts on a preflight FAIL). Tests: `test_wave_alert.py`, `test_wave_alert_upcoming.py` |
 | `bait_watch.py` | Pass 10: the bot's bait defenses on wave markets. Tests: `test_bait_watch.py` |
 | `imm_heightened_report.py` | Scores heightened bait mode (dry) from its narrowed go-live: `--since 2026-11-14`, from a worktree |
 | `sms_alert.py` / `send_alert_email.py` | Text Jack (T-Mobile gateway, rate-capped; `--long` <= 900 chars) / email |
 | `wave_pocket.py` | Wave Pocket builder (skill `wave-pocket`): "Today #N" tabs, trims older tabs to the 256 KB cap |
-| `run_pvd_scan_waves.cmd` / task **KL pvd-scan waves** | The relight task (passes 0, 6-10; 1-5 retired) |
+| `run_pvd_scan_waves.cmd` / task **KL pvd-scan waves** | The relight task (passes 0, 6-11; 1-5 retired) |
 | `run-logs/incentive-mm/post_vote_dead_books.json` | THE list. Hot-loaded. Write atomically under `run-logs/pvd-scan/scan.lock` |
 | `run-logs/pvd-scan/wave_pass_NAME.lock` | A wave's pass lock (held by `run --write`; setarg / set / stop wait for it; stale after 25 min) |
 | `kalshi_reads.kalshi_get(_all) / read` | Signed list reads (public list reads 429 from this box); one market / order book public first |
@@ -50,7 +51,7 @@ Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read th
 
 ## Bot guard knobs (launcher `run_incentive_mm.ps1` $ProbeEnv or code defaults; a launcher change needs `restart_imm.ps1 -Task`)
 
-| Knob | Live (11/14) |
+| Knob | Live (11/15) |
 |---|---|
 | `IMM_JOIN_WAIT`, `_SUBPENNY`, `_REST_MEMORY_H` | on, on, 24 |
 | `IMM_PVD_OFF_USUAL`, `_C`, `_HOURS`, `_COLD` | on, 3, 6, base (`IMM_CRYPTO_WAVE_COLD_SIZE` 400 for crypto strikes) |
@@ -62,11 +63,16 @@ Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read th
 | `IMM_LONE_REF_PVD` / `IMM_LONE_REF_GUARD` | on (wave list) / dry (rest of the bot) |
 | `IMM_TWIN_CHECK`, `_TOL_C` | on, 2 (6fbad53) |
 | `IMM_SWEEP_GROUP`, `_MIN_EVENTS`, `_MIN_CT`, `_HOLD_MIN` | on, 2, 200, 20 (76d9201, 25cbd54) |
+| `IMM_WAVE_GROUPS` | on (2063782: a wave series with no risk group is its own group for the group breaker) |
+| `IMM_CAND_BREAKER`, `IMM_PULL_BATCH`, `IMM_CYCLE_CANCEL_BATCH` | on, 20, 1 (736cc94: the candidate breaker; breaker pulls and the cycle's cancels 20 a batch) |
+| `IMM_FAIR_HOLD_PULL` | on (2063782: a held or stale coin / FX series, every order pulled at once) |
+| `IMM_EARN_ONLY` | on (1fd880b: no rung rests that the walk would not pay, but the unwind) |
 | `IMM_SWEEP_BREAKER`, `IMM_SWEEP_HOLD_SECS` | on, 600 |
 | `IMM_TAPE_TRIGGER`, `IMM_TAPE_WAVE_MIN_CT`, `IMM_WAVE_BREAKER` | ab 100%, 200, on |
 | `IMM_HEIGHTENED` | dry (b41c0d4) |
 | `IMM_MARK_EXTERNAL`, `IMM_PVD_FULL_EARN`, `IMM_PVD_ZERO_OFF` | on, on, 1 |
-| `IMM_CRYPTO_EVENT_FAIR`, `_LEAD`, `_TOL_CENTS`, `_SPOT_BAND`, `_JUMP_PCT`, `_JUMP_HOLD_SECS` | on, on (listed strikes take no lead), 2, 0.005, 0.01, 600 |
+| `IMM_CRYPTO_EVENT_FAIR`, `_LEAD`, `_TOL_CENTS`, `_SPOT_BAND`, `_JUMP_PCT`, `_JUMP_HOLD_SECS` | on, on (listed strikes take no lead), 2, 0.005, 0.01, 300 (fa0c63c; was 600) |
+| `IMM_FX_EVENT_FAIR`, `_TTL_SECS`, `_REFRESH_SECS`, `_SERIES`, `IMM_FX_EVENT_CLOSES_FILE` | on, 180, 15, the nine FX + metals *EVENT series, `run-logs/pvd-scan/wave_fair_closes.json` (70d05b7 + d736cc4) |
 | `IMM_MAX_TOTAL_RESTING` | 12000 (the own-orders read covers 40,000: 757614b) |
 | `IMM_MAX_PLACEMENTS_PER_CYCLE` | 1500 (e403df0); `IMM_PLACE_PRIORITY` 1 (60c237d: dark sides first) |
 | `IMM_ORDER_TTL_SECS` / `IMM_ORDER_REFRESH_SECS` | 1800 / 1500 (renewals use most of the placement cap) |
@@ -85,7 +91,10 @@ Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read th
 4. Push; `schtasks /run /tn "KL sync-kl-main"`; `restart_imm.ps1 -Task -Now` for a launcher change (`-NoHandoff` when halted). Orders rest UNMANAGED from the exit until the relaunch adopts them: ~1-2 min on a good restart; at 13:05Z 11/13 a low-RAM start took 426 s and, past the old 300 s limit, cancelled the whole book (the limit is 1,200 s since 38f07e9).
 5. Other sessions restart the bot too: check the log before and after. During a short-window wave, batch deploys (8 restarts the night of 11/14; each re-queues the book and reads ~15 min low).
 6. Before a deploy that changes how a live position unwinds, set the list so the OLD code already rests the safe size.
-7. The wave tools run live from KL with no restart (each pass starts a new process). Test them in a scratch copy or worktree, check that KL's copy hasn't changed since you read it (other sessions edit them), then copy. Run the wave test modules one at a time: `test_pvd_waves` / `test_pvd_wave_pace` stub `incentive_mm` / `kalshi_reads` in sys.modules, which breaks tests that import the real ones after them.
+7. **The bot restarts itself only when `incentive_mm.py` changes** (`code_change_exit_due`: >= 60 s after, at ET minute >= 50 or <= 5, or any time with no hourly-temp market selected). A change to a helper module alone (`fx_event_fair.py`, `crypto_event_fair.py`) waits for some other restart: touch `incentive_mm.py` in the same commit (ff05c8b did) or restart on purpose.
+8. **The sync is `git merge --ff-only`:** a commit touching a file modified in KL's working copy refuses the WHOLE deploy (11/14: `wave_fair.py`; the uncommitted wave tools are the same trap until committed). After `schtasks /run`, check KL's `git rev-parse HEAD`: on 11/15 the task's fetch took ~4 min; `sync_kl_main.ps1` run directly does the same thing.
+9. **Fetch before you push:** another session may push to main meanwhile (11/15: 1fd880b landed between the worktree and the push). Rebase, re-run the suite, then push. Tests: `python -m unittest` (no pytest here).
+10. The wave tools run live from KL with no restart (each pass starts a new process). Test them in a scratch copy or worktree, check that KL's copy hasn't changed since you read it (other sessions edit them), then copy. Run the wave test modules one at a time: `test_pvd_waves` / `test_pvd_wave_pace` stub `incentive_mm` / `kalshi_reads` in sys.modules, which breaks tests that import the real ones after them.
 
 ## Gotchas
 
@@ -101,7 +110,10 @@ Lookup tables for the market-wave runbook (`SKILL.md` beside this file). Read th
 - Two sessions editing the list within minutes collide: take `scan.lock`, re-read, write atomically.
 - National / cross-region markets move with every region.
 - **Listed is not selected:** the list gets a market past the allowlist; the bot's screens still apply. Count selected vs listed (`selection_events_<date>.jsonl`, or `whydark`).
-- **Live-feed series have no fair in the bot** (SCAN_EXCLUDE_PREFIXES: FX, indexes, metals, crypto prices) except the crypto *EVENT gate: quote them only with a fair.
+- **Live-feed series have no fair in the bot** (SCAN_EXCLUDE_PREFIXES: FX, indexes, metals, crypto prices) except the *EVENT ladders: crypto (`crypto_event_fair`) and the nine FX + metals series (`fx_event_fair`, since 70d05b7). Anything else on a live feed: quote it only with a fair.
+- **The cycle log's `quoted` column reads 0 on every row:** count resting with `own_bid_ct + own_ask_ct`.
+- **Jump-hold time:** count it from the bot's `crypto-event fair: ... JUMP HOLD` lines (printed on every change of the hold set and at each start); stand-aside -> resume pairs overstate it (some strikes never log a resume).
+- **A wave's stop cap ends its relights:** pass 7 lists nothing past it, and until 11/14 the detector still called its series LISTED, so a later batch went unseen. The after-economic-events waves have no cap since 11/14; `set NAME stop_cap off` clears one (`window fx-shut` would hold a wave to the FX close).
 - **The resting-order read must stay far above the resting cap** (40 x 200 = 8,000 under a 12,000 cap doubled 3,462 sides on 11/14).
 - **Placement cap vs renewals:** every order renews every ~25 min, so ~9,000 resting orders need ~1,000 placements per ~3.6-min cycle just to stand; a big listing waits behind them (dark sides go first).
 - **The collateral budget charges selected markets, not list sizes:** turning list markets off frees nothing while they stay selected.

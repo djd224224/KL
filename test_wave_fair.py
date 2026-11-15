@@ -1,5 +1,5 @@
 """wave_fair.py: the Friday-close reference and the per-source fallback (no network)."""
-import importlib.util, os, sys, unittest
+import importlib.util, json, os, sys, tempfile, unittest
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -10,10 +10,10 @@ NOW = datetime(2026, 11, 14, 2, 0, tzinfo=timezone.utc)
 
 
 def ok(ref=1.0, cur=1.01):
-    return lambda sym: (ref, cur)
+    return lambda sym, starts=None, need_ref=True: (ref if need_ref else None, cur)
 
 
-def boom(sym):
+def boom(sym, starts=None, need_ref=True):
     raise OSError("down")
 
 
@@ -59,6 +59,168 @@ class WaveFairTests(unittest.TestCase):
     def test_weekend_hours_add_no_trading_time(self):
         sat = datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc)
         self.assertAlmostEqual(wf.trading_days(sat), 0.02 + wf.WEEKEND_GAP_DAYS)
+
+    def test_a_later_weekend_counts_from_its_own_close(self):
+        t0 = datetime(2026, 11, 20, 22, 0, tzinfo=timezone.utc)
+        mon = datetime(2026, 11, 23, 22, 0, tzinfo=timezone.utc)      # Sun 22:00Z open + 24 h
+        self.assertAlmostEqual(wf.trading_days(mon, t0), 7 / 5 + wf.WEEKEND_GAP_DAYS)
+
+
+def U(*a):
+    return datetime(*a, tzinfo=timezone.utc)
+
+
+class WeekendRollTests(unittest.TestCase):
+    """2026-11-14 (Jack: "default to running the wave for elections, after economic events, and
+    things of similar shapes to what's been run on waves so far"): each weekend's close rolls by
+    itself, checked against the 24/7 source's own price at the close."""
+
+    def test_the_shut_window_is_et_and_dst_aware(self):
+        self.assertEqual(wf.fx_shut_window(U(2026, 11, 14, 12)), (U(2026, 11, 13, 22), U(2026, 11, 15, 22), True))
+        self.assertEqual(wf.fx_shut_window(U(2026, 11, 15, 22)), (U(2026, 11, 13, 22), U(2026, 11, 15, 22), False))
+        self.assertEqual(wf.fx_shut_window(U(2026, 11, 20, 21, 59))[2], False)        # Fri 4:59 PM ET
+        self.assertEqual(wf.fx_shut_window(U(2026, 11, 20, 22)), (U(2026, 11, 20, 22), U(2026, 11, 22, 22), True))
+        self.assertEqual(wf.fx_shut_window(U(2026, 7, 11, 12)), (U(2026, 7, 10, 21), U(2026, 7, 12, 21), True))
+        # 2027-03-14 springs forward: Fri 5 PM EST to Sun 5 PM EDT
+        self.assertEqual(wf.fx_shut_window(U(2027, 3, 13, 12)), (U(2027, 3, 12, 22), U(2027, 3, 14, 21), True))
+        self.assertEqual(wf.fx_next_window(U(2026, 11, 18, 12)), (U(2026, 11, 20, 22), U(2026, 11, 22, 22)))
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "closes.json")
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fetch(self, vals):
+        def f(kind):
+            def g(sym, t0):
+                self.calls.append(sym)
+                v = vals.get(sym)
+                if v is None:
+                    raise ValueError("not settled yet")
+                return v
+            return g
+        return {"kalshi": f("kalshi"), "yahoo": f("yahoo")}
+
+    def test_the_1113_weekend_keeps_the_closes_entered_by_hand(self):
+        close, src, failed = wf.weekend_closes(wf.T0, {}, fetch=self.fetch({}), path=self.path)
+        self.assertEqual(close, wf.CLOSE_1113)
+        self.assertEqual((failed, self.calls), ({}, []))
+
+    def test_a_new_weekend_fetches_checks_and_keeps_its_closes(self):
+        t0 = U(2026, 11, 20, 22)
+        vals = {"KXGOLDW": 3900.0, "KXSILVERW": 49.0, "KXCOPPERW": 6.2, "JPY=X": 158.0, "EURUSD=X": 1.10,
+                "AUDUSD=X": 0.67, "MXN=X": 18.4, "CAD=X": 1.42, "GBPUSD=X": 1.33}
+        ref = {s: vals[sym] * 1.001 for s, (_k, sym) in wf.CLOSE_SRC.items()}     # venues 0.1% away: fine
+        ref["KXCOPPEREVENT"] = 6.2 * 1.02                                          # 2% away: refused
+        del ref["KXUSDCADEVENT"]                                                   # no venue price: refused
+        close, src, failed = wf.weekend_closes(t0, ref, fetch=self.fetch(vals), path=self.path)
+        self.assertEqual(set(close), set(wf.CLOSE) - {"KXCOPPEREVENT", "KXUSDCADEVENT"})
+        self.assertEqual(close["KXGOLDEVENT"], 3900.0)
+        self.assertEqual(src["KXUSDJPYEVENT"], "yahoo:JPY=X")
+        self.assertIn("off the 24/7 source", failed["KXCOPPEREVENT"])
+        self.assertIn("no 24/7 price", failed["KXUSDCADEVENT"])
+        # the next run fetches only the two still missing
+        self.calls.clear()
+        ref["KXCOPPEREVENT"] = 6.2
+        ref["KXUSDCADEVENT"] = 1.42
+        close, src, failed = wf.weekend_closes(t0, ref, fetch=self.fetch(vals), path=self.path)
+        self.assertEqual(sorted(self.calls), ["CAD=X", "KXCOPPERW"])
+        self.assertEqual((set(close), failed), (set(wf.CLOSE), {}))
+
+    def test_metals_before_kalshi_settles_get_no_fair_yet(self):
+        t0 = U(2026, 11, 20, 22)
+        vals = {"JPY=X": 158.0}
+        close, src, failed = wf.weekend_closes(t0, {"KXUSDJPYEVENT": 158.0, "KXGOLDEVENT": 3900.0},
+                                               fetch=self.fetch(vals), path=self.path)
+        self.assertEqual(set(close), {"KXUSDJPYEVENT"})
+        self.assertIn("not settled yet", failed["KXGOLDEVENT"])
+
+    def test_weekday_time_counts_from_now_with_the_gap_only_across_a_weekend(self):
+        wed = U(2026, 11, 18, 15)
+        self.assertAlmostEqual(wf.trading_days(U(2026, 11, 19, 15), wf.T0, weekday_from=wed), 1.4)
+        # Wed 15:00Z -> Fri 22:00Z (2.29 d) + Sun 22:00Z -> Mon 15:00Z (0.71 d), x 7/5, + the gap
+        self.assertAlmostEqual(wf.trading_days(U(2026, 11, 23, 15), wf.T0, weekday_from=wed), 3.0 * 1.4 + 0.5)
+        # off the hour: steps to whole hours, so the Friday close cuts at 17:00 ET exactly
+        self.assertAlmostEqual(wf.trading_days(U(2026, 11, 20, 23), wf.T0, weekday_from=U(2026, 11, 20, 21, 30)),
+                               0.5 / 24 * 1.4)          # 21:30-22:00Z only, no gap
+
+
+class WeekdayFairTests(unittest.TestCase):
+    """Jack 2026-11-14: "after-economic events can quote anytime not just when markets are shut,
+    but need a fair value": while FX and metals trade the fair prices from now, widens by its
+    staleness, stands aside near a strike's measurement and rests nothing without a fair."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE)
+        wf.CLOSES_FILE = os.path.join(self.tmp.name, "closes.json")
+        self.need_ref = []
+
+        def venue(sym, starts=None, need_ref=True):
+            self.need_ref.append(need_ref)
+            s = next(k for k, (_src, v) in wf.PROXY.items() if v == sym)
+            return (wf.CLOSE_1113[s] if need_ref else None), wf.CLOSE_1113[s] * 1.001
+        wf.FETCH = {"hl": venue, "kraken": venue, "bitso": venue}
+        wf.CLOSE_FETCH = {}
+        self.out = os.path.join(self.tmp.name, "fair.json")
+
+    def tearDown(self):
+        wf.FETCH, wf.CLOSE_FETCH, wf.CLOSES_FILE = self.saved
+        self.tmp.cleanup()
+
+    def markets(self, now):
+        k = round(wf.CLOSE_1113["KXGOLDEVENT"] * 1.001, 2)
+        z = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")     # noqa: E731
+        rows = [{"ticker": "KXGOLDEVENT-SOON-T", "floor_strike": k, "strike_type": "greater",
+                 "close_time": z(now + timedelta(hours=6))},
+                {"ticker": "KXGOLDEVENT-MON-T", "floor_strike": k, "strike_type": "greater",
+                 "close_time": z(U(2026, 11, 23, 15))},
+                {"ticker": "KXGOLDEVENT-MON-FAR", "floor_strike": round(k * 1.10, 2), "strike_type": "greater",
+                 "close_time": z(U(2026, 11, 23, 15))}]
+        return lambda s: rows if s == "KXGOLDEVENT" else []
+
+    def run_main(self, now):
+        rc = wf.main(self.out, True, now=now, list_markets=self.markets(now))
+        self.assertEqual(rc, 0)
+        with open(self.out) as fh:
+            return json.load(fh)
+
+    def test_a_weekday_fair(self):
+        now = U(2026, 11, 18, 15)                                   # Wed 10 AM ET
+        doc = self.run_main(now)
+        self.assertEqual((doc["mode"], doc["floor"], doc["valid_until"]), ("weekday", 0, "2026-11-18T15:20:00Z"))
+        self.assertNotIn("KXGOLDEVENT-SOON-T", doc["fair"])         # 6 h to its measurement: nothing rests
+        self.assertAlmostEqual(doc["fair"]["KXGOLDEVENT-MON-T"], 50.0, delta=0.05)
+        # 2 sd of 18 min of trading over the sigma to Monday: ~4.9c at the money
+        self.assertAlmostEqual(doc["margin_extra"]["KXGOLDEVENT-MON-T"], 4.87, delta=0.1)
+        self.assertLess(doc["margin_extra"]["KXGOLDEVENT-MON-FAR"], 0.2)   # 10% out: ~0
+        self.assertEqual(doc["close_at"], "2026-11-13T22:00Z")
+
+    def test_the_venues_own_close_is_kept_so_a_weekday_reads_only_the_price_now(self):
+        self.run_main(U(2026, 11, 18, 15))
+        self.assertTrue(all(self.need_ref))                          # the first run read the close bars
+        with open(wf.CLOSES_FILE) as fh:
+            book = json.load(fh)
+        self.assertEqual(set(book["2026-11-13T22:00Z"]["venue_ref"]), set(wf.CLOSE))
+        self.assertEqual(book["2026-11-13T22:00Z"]["close"], wf.CLOSE_1113)
+        self.need_ref.clear()
+        self.run_main(U(2026, 11, 18, 15, 15))
+        self.assertEqual(set(self.need_ref), {False})               # ...the next only the price now
+
+    def test_the_weekend_is_unchanged(self):
+        now = U(2026, 11, 14, 12)                                    # Sat
+        doc = self.run_main(now)
+        self.assertEqual((doc["mode"], doc["floor"], doc["margin_extra"]), ("weekend", 2, {}))
+        self.assertEqual(doc["valid_until"], "2026-11-14T12:45:00Z")
+        self.assertIn("KXGOLDEVENT-SOON-T", doc["fair"])             # no weekday cutoff on a weekend
+
+    def test_a_weekday_without_live_prices_writes_nothing(self):
+        rc = wf.main(self.out, False, now=U(2026, 11, 18, 15), list_markets=self.markets(U(2026, 11, 18, 15)))
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.out))
 
 
 if __name__ == "__main__":

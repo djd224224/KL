@@ -24,7 +24,7 @@ rem UNWIND_ONLY_WAVES. Pass 6 skips them via --exclude-registry. KXTRUMPNOMNUM s
 set W28=KXHOUSERACE,KXPRESDISTRICT,KXPOPVOTE,KXGOVRACE,KXCHINA1,KXDPRESPRIMWIN,KXGOPDELMAJ,KXRPRESPRIMWIN,KXDEMDELMAJ,KXRPRESWINCOUNT,KXPAMINWAGE,KXDPRESWINCOUNT,KXRPRESSWEEP,KXTRUMPFIRSTENDORSE,KXGOPFIRSTWINNOM,KXDEMFIRSTWINNOM,KXWIMEDICAIDEXP,KXDPRESSWEEP,KXTHIRDPARTYSTATEWIN,KXRPRESFRACTURED,KXDPRESFRACTURED,KXTPPRESPCT,KXTRUMPNOMNUM,KXWIRTWREPEAL,KXMINWAGEHOUSE,KXGAMEDICAIDEXP,KXKSMEDICAIDEXP,KXACASUBSIDYHOUSE,KXMEDICAIDWORKHOUSE,KXWIMARIJUANA,KXPUBLICOPTIONHOUSE,KXPAMARIJUANA
 set POL=KXDCSTATEHOODHOUSE,KXGOPIMPEACHVOTES,KXGOVTSHUTLENGTH,KXHAGCHAIR,KXHEDUCATIONCHAIR,KXHJUDICIARYRM,KXHOUSEEXPANDLAW,KXITALYEXITTAX,KXJUDGECOUNTYEAR,KXNPVICSTATES,KXNRCCCHAIR,KXOVERSIGHTRM,KXPRSTATEHOUSE,KXROEHOUSE,KXSBANKINGCHAIR,KXSCOTUSEXPANDHOUSE,KXSCOTUSEXPANDLAW,KXSCOTUSTERMHOUSE,KXSHELPRM,KXSJUDICIARYRM,KXTARIFFREPEAL,KXTRUMPGOPCONVICT
 cd /d %KL%
-echo ===== %date% %time% pass 0: dashboard keepalive (8773 2028 wave, 8771 political wave) >> "%LOG%"
+echo ===== %date% %time% pass 0: dashboard keepalive (the wave dashboards) >> "%LOG%"
 rem NOT ">> %LOG%": a dashboard started here would inherit cmd's handle on the log and hold
 rem it open for life, and every later ">> %LOG%" redirect (so every pass) would then fail.
 rem The keepalive appends its own lines to the log instead.
@@ -76,3 +76,13 @@ rem fills against us stay pass 8's. Exit 3 = something new -> wave_alert.py bait
 echo ===== %date% %time% pass 10: bait watch (wave markets) >> "%LOG%"
 "%PY%" "%KL%\bait_watch.py" --update-state --json "%KL%\run-logs\pvd-scan\bait_watch_last.json" >> "%LOG%" 2>&1
 if errorlevel 3 "%PY%" "%KL%\wave_alert.py" bait --bait "%KL%\run-logs\pvd-scan\bait_watch_last.json" --send >> "%LOG%" 2>&1
+rem 11. UPCOMING WAVES, ADVANCE NOTICE (Jack 2026-11-14: "market-wave skill should also scan upcoming
+rem rewards markets and callout if a wave would be greenlit so i have advanced notice"): Kalshi's
+rem status=upcoming programs starting in the next 72 h, judged per start window the way the 24/7 check
+rem judges them at the start (wave_detect.py --upcoming); --preflight runs the auto preflight NOW on a
+rem wave that would be greenlit, so a FAIL can be fixed before the start. Each series is noticed once
+rem per start (run-logs\pvd-scan\wave_upcoming_state.json). Exit 3 = a wave would be greenlit (text +
+rem email), 4 = only your-call series over the bar (email) -> wave_alert.py upcoming. Never lists.
+echo ===== %date% %time% pass 11: upcoming waves (advance notice) >> "%LOG%"
+"%PY%" "%KL%\wave_detect.py" --upcoming --preflight --update-state --json "%KL%\run-logs\pvd-scan\wave_upcoming_last.json" >> "%LOG%" 2>&1
+if errorlevel 3 "%PY%" "%KL%\wave_alert.py" upcoming --upcoming "%KL%\run-logs\pvd-scan\wave_upcoming_last.json" --send >> "%LOG%" 2>&1
