@@ -14610,6 +14610,9 @@ _CONFIG_CODE_KNOBS = (
     "LONE_REF_GUARD_MODE", "LONE_REF_MAX_MULT", "LONE_REF_MIN_GAP_C",
     "LONE_REF_JUMP_WINDOW_MIN", "LONE_REF_SKIP", "LONE_REF_SKIP_FAIR",
     "LONE_REF_PVD_MODE",          # on for the wave list (2026-11-08)
+    # alone-front guard (2026-11-14)
+    "ALONE_FRONT_MODE", "ALONE_FRONT_PVD_MODE", "ALONE_FRONT_MIN_GAP_C",
+    "ALONE_FRONT_JOIN_C", "ALONE_FRONT_WINDOW_MIN",
     # two-market complement lead (2026-10-28)
     "COMP_LEAD_MODE", "COMP_LEAD_SHARE", "COMP_LEAD_MARGIN_C", "COMP_LEAD_SKIP",
     "COMP_LEAD_HOLD_SMALL",       # a few lots ahead are not fought (2026-10-30)
@@ -24797,6 +24800,36 @@ LONE_REF_SKIP_FAIR = os.environ.get("IMM_LONE_REF_SKIP_FAIR", "1") == "1"
 # LONE_REF_PVD_MODE ("on" | "dry" | "off"); every other market keeps
 # LONE_REF_GUARD_MODE. "" = the wave list follows LONE_REF_GUARD_MODE too.
 LONE_REF_PVD_MODE = os.environ.get("IMM_LONE_REF_PVD", "on").strip().lower()
+# ALONE-FRONT GUARD (Jack 2026-11-14: "Yes, build it", to "Build a check that
+# keeps an ask from coming back alone after the other offers leave?"). The
+# at-reference price is read off the FULL book, our own orders in it, so a rung
+# that rested beside other offers stays put when they leave: its own size is
+# then what makes the reference there. 01:34Z 11/15 a Hassan print pulled
+# KXSENATENOM-NHD-28 for 60 s and the ~1,650 outside YES offers at 2.9c on COST
+# left (CWAR, KMAN the same); the next outside offer was 25c, the outside
+# reference 64c. Our 200-lot asks came back at 2.9 / 3.1 / 3.5c, every cycle
+# read them as the reference and kept them there, and at 01:50:33Z one taker
+# bought exactly our 200 on all three (~$580 at risk for ~$19 of premium).
+# A side TRIPS (alone_front_trip) when both hold:
+#   * the full book's reference -- where the side rests -- sits >=
+#     ALONE_FRONT_MIN_GAP_C ahead of the reference the book sets WITHOUT our
+#     orders (0 when that never reaches target/5): our own size holds it;
+#   * within the last ALONE_FRONT_WINDOW_MIN minutes that outside reference
+#     stood within ALONE_FRONT_JOIN_C of the price: the others were with us and
+#     left. A book we rest on alone from the start never trips.
+# "on" rests the side at the outside reference instead (behind the offers
+# still there; the join wait then times any return to the front) or, with no
+# outside reference at all, stands it aside while the window still shows the
+# others at its price; "dry" logs; "off" skips. Not checked: a leading side
+# (the leads price themselves), a side that reduces a position, and the
+# series the lone-reference guard leaves out (mentions, fair gates). Sinks
+# alone_front_<date>.jsonl. IMM_ALONE_FRONT_PVD: a listed wave market ("on");
+# IMM_ALONE_FRONT: every other market ("dry").
+ALONE_FRONT_MODE = os.environ.get("IMM_ALONE_FRONT", "dry").strip().lower()
+ALONE_FRONT_PVD_MODE = os.environ.get("IMM_ALONE_FRONT_PVD", "on").strip().lower()
+ALONE_FRONT_MIN_GAP_C = _env_int("IMM_ALONE_FRONT_MIN_GAP_C", 10)
+ALONE_FRONT_JOIN_C = _env_int("IMM_ALONE_FRONT_JOIN_C", 1)
+ALONE_FRONT_WINDOW_MIN = _env_int("IMM_ALONE_FRONT_WINDOW_MIN", 60)
 
 
 def fair_gate_of(series: str) -> str:
@@ -25258,6 +25291,33 @@ def lone_ref_trip(ext_levels_best_first: List[Tuple[int, float]], target: float,
         if jump < min_gap:
             return None
     return dict(ref=ref, top=top, rest=rest, jump=jump)
+
+
+def alone_front_trip(full_best_first: List[Tuple[int, float]],
+                     ext_best_first: List[Tuple[int, float]], target: float,
+                     ext_ref_window: List[int], min_gap: Optional[int] = None,
+                     join_c: Optional[int] = None) -> Optional[dict]:
+    """The alone-front guard's verdict for one side (see ALONE_FRONT_MODE):
+    None when it does not trip, else {rest, ext_ref, gap}. `full_best_first`
+    is the side's book with our orders in it, `ext_best_first` without them,
+    best price first in the side's own price space (YES cents for a bid, NO
+    cents for an ask); `ext_ref_window` the outside references the side had
+    inside the window. ext_ref None = the outside book never reaches
+    target/5 (the gap is then from 0)."""
+    if min_gap is None:
+        min_gap = ALONE_FRONT_MIN_GAP_C
+    if join_c is None:
+        join_c = ALONE_FRONT_JOIN_C
+    rest = side_reference_level(full_best_first, target)
+    if rest is None:
+        return None
+    ext_ref = side_reference_level(ext_best_first, target)
+    gap = rest - (ext_ref if ext_ref is not None else 0)
+    if gap < max(1, min_gap):
+        return None
+    if not any(p >= rest - join_c for p in ext_ref_window):
+        return None
+    return dict(rest=rest, ext_ref=ext_ref, gap=gap)
 
 
 def _side_share(levels_best_first: List[Tuple[int, float]], own: Dict[int, float],
@@ -28168,6 +28228,11 @@ class IncentiveMarketMaker:
         self._lone_ref_rungs: Dict[Tuple[str, str],
                                    Deque[Tuple[float, Optional[int]]]] = {}
         self._lone_ref_held: Set[Tuple[str, str]] = set()
+        # (ticker, side) -> change points (ts, outside reference or None) for
+        # the alone-front guard, and the sides it has tripped (their verdict)
+        self._alone_front_refs: Dict[Tuple[str, str],
+                                     Deque[Tuple[float, Optional[int]]]] = {}
+        self._alone_front_held: Dict[Tuple[str, str], dict] = {}
         # bait-fingerprint stop: fills awaiting their tape check, the trade
         # ids already queued, and the counters for the status file
         self._bait_pending: List[dict] = []
@@ -35856,6 +35921,96 @@ class IncentiveMarketMaker:
             out.append(bool(trip))
         return out[0], out[1]
 
+    # ---- alone-front guard (2026-11-14, ALONE_FRONT_MODE) --------------------
+
+    def _alone_front_check(self, t: str, meta, yes_levels, no_levels, own_in_book,
+                           now_ts: float, skip_bid: bool = False,
+                           skip_ask: bool = False, on: bool = False
+                           ) -> Tuple[Optional[dict], Optional[dict]]:
+        """(bid, ask): each side's alone-front verdict this cycle (None = no
+        trip; see ALONE_FRONT_MODE and alone_front_trip). Keeps every side's
+        outside reference as change points over the window, a skipped side's
+        too. With `on`, a side that tripped with no outside reference at all
+        stays tripped while the window still shows the others at its price
+        (it has no rung then, so the full book no longer shows it). Logs and
+        sinks each trip once; dry logs the clear too. Never raises."""
+        out: List[Optional[dict]] = []
+        win_start = now_ts - ALONE_FRONT_WINDOW_MIN * 60.0
+        try:
+            ext_yes, ext_no = (external_levels(yes_levels, no_levels, own_in_book)
+                               if own_in_book else (yes_levels, no_levels))
+        except Exception:
+            return None, None
+        for side, full, ext, skip in (("bid", yes_levels, ext_yes, skip_bid),
+                                      ("ask", no_levels, ext_no, skip_ask)):
+            key = (t, side)
+            trip: Optional[dict] = None
+            try:
+                full_d, ext_d = levels_desc(full), levels_desc(ext)
+                ext_ref = side_reference_level(ext_d, meta.target_size)
+                hist = self._alone_front_refs.setdefault(key, deque())
+                if not hist or hist[-1][1] != ext_ref:
+                    hist.append((now_ts, ext_ref))
+                # keep the change point in force at the window's start
+                while len(hist) > 1 and hist[1][0] <= win_start:
+                    hist.popleft()
+                window = [p for _ts, p in hist if p is not None]
+                held = self._alone_front_held.get(key)
+                if not skip:
+                    trip = alone_front_trip(full_d, ext_d, meta.target_size, window)
+                    if (trip is None and on and held is not None
+                            and held["ext_ref"] is None and ext_ref is None
+                            and any(p >= held["rest"] - ALONE_FRONT_JOIN_C for p in window)):
+                        trip = dict(held)          # still deserted: stays aside
+                if trip is not None and held is None:
+                    trip["since"] = now_ts
+                    self._alone_front_held[key] = trip
+                    self._alone_front_note(t, side, meta, trip, own_in_book, now_ts, on)
+                elif trip is None and held is not None:
+                    del self._alone_front_held[key]
+                    if not on:
+                        log(f"{self.tag} alone-front guard (dry) {t} {side}: clear after "
+                            f"{now_ts - float(held.get('since', now_ts)):,.0f}s")
+            except Exception as e:      # never costs the cycle: no verdict
+                trip = None
+                if not getattr(self, "_alone_front_err_logged", False):
+                    self._alone_front_err_logged = True
+                    log(f"{self.tag} ! alone-front guard failed on {t} {side} ({e!r}); "
+                        f"no verdict (logged once)")
+            out.append(trip)
+        if len(self._alone_front_refs) > 20000:       # sides unchanged all window
+            self._alone_front_refs = {k: h for k, h in self._alone_front_refs.items()
+                                      if len(h) > 1 or h[-1][0] > win_start}
+        return out[0], out[1]
+
+    def _alone_front_note(self, t: str, side: str, meta, trip: dict, own_in_book,
+                          now_ts: float, on: bool) -> None:
+        """Log and sink one alone-front trip (alone_front_<date>.jsonl)."""
+        def yes(p: int) -> int:
+            return p if side == "bid" else 100 - p
+
+        rest, ext_ref = int(trip["rest"]), trip["ext_ref"]
+        own_n = sum(float(n) for bs, px, n in own_in_book
+                    if bs == side and (int(px) if side == "bid" else 100 - int(px)) >= rest)
+        where = (f"the outside book's reference is {yes(ext_ref)}c, {trip['gap']}c back"
+                 if ext_ref is not None else
+                 f"the outside book no longer reaches {meta.target_size / 5.0:.0f} contracts")
+        if on:
+            act = (f"moved back to {yes(ext_ref)}c" if ext_ref is not None
+                   else "side stood aside while the window still shows them")
+        else:
+            act = (f"would move back to {yes(ext_ref)}c" if ext_ref is not None
+                   else "would stand aside")
+        log(f"{self.tag} alone-front guard{'' if on else ' (dry)'} {t} {side}: the "
+            f"outside offers at {yes(rest)}c left -- our {own_n:g} hold the reference "
+            f"there alone; {where} (it was at our price inside "
+            f"{ALONE_FRONT_WINDOW_MIN} min) -- {act}")
+        self._sink("alone_front", {
+            "ts": round(now_ts, 3), "mode": "on" if on else "dry", "ticker": t,
+            "event": meta.event_ticker, "side": side, "rest": yes(rest),
+            "ext_ref": None if ext_ref is None else yes(ext_ref), "gap": trip["gap"],
+            "own_n": own_n, "target": meta.target_size})
+
     # ---- heightened bait mode, dry (2026-11-13, HEIGHTENED_MODE) -------------
 
     def _hz_watch(self):
@@ -41661,6 +41816,33 @@ class IncentiveMarketMaker:
                         lv_bid = []
                     if lr_ask:
                         lv_ask = []
+            # ALONE-FRONT GUARD (ALONE_FRONT_MODE, Jack 2026-11-14): a side our
+            # own rung holds >= ALONE_FRONT_MIN_GAP_C ahead of the outside
+            # book's reference, the outside offers at its price within the
+            # window, rests at the outside reference ("on"; none: no rungs) or
+            # is logged ("dry"). Not a leading side, nor one that reduces a
+            # position. A listed wave market runs ALONE_FRONT_PVD_MODE ("on").
+            af_mode = (ALONE_FRONT_PVD_MODE if pvd is not None and ALONE_FRONT_PVD_MODE
+                       in ("on", "dry", "off") else ALONE_FRONT_MODE)
+            if (af_mode in ("on", "dry") and LADDER_MODE == "atref"
+                    and lone_ref_series(meta.series)):
+                _af_pos = own_pos if coexist else pos
+                af_b, af_a = self._alone_front_check(
+                    t, meta, yes_levels, no_levels, own_in_book, now_ts,
+                    skip_bid=lead_b is not None or _af_pos <= -1,
+                    skip_ask=lead_a is not None or _af_pos >= 1,
+                    on=af_mode == "on")
+                if af_mode == "on":
+                    if af_b is not None:
+                        if af_b["ext_ref"] is None:
+                            lv_bid = []
+                        else:
+                            ref_bid_px = int(af_b["ext_ref"])
+                    if af_a is not None:
+                        if af_a["ext_ref"] is None:
+                            lv_ask = []
+                        else:
+                            ref_ask_px = 100 - int(af_a["ext_ref"])
             # a post-vote dead book's rung is the same on both sides (no family
             # lean or long-shot cut); a side a guard above emptied stays dark
             if pvd is not None:
@@ -46536,6 +46718,17 @@ class IncentiveMarketMaker:
                + f"; every other market: {LONE_REF_GUARD_MODE}"
                if LONE_REF_PVD_MODE in ("on", "dry", "off")
                else f"as the rest of the bot ({LONE_REF_GUARD_MODE})"))
+        _af_pvd = (ALONE_FRONT_PVD_MODE if ALONE_FRONT_PVD_MODE in ("on", "dry", "off")
+                   else ALONE_FRONT_MODE)
+        log(f"alone-front guard (2026-11-14): wave list {_af_pvd}, every other market "
+            f"{ALONE_FRONT_MODE}"
+            + (f" -- a side our own rung holds >= {ALONE_FRONT_MIN_GAP_C}c ahead of the "
+               f"outside book's reference, where the outside reference stood within "
+               f"{ALONE_FRONT_JOIN_C}c of its price inside {ALONE_FRONT_WINDOW_MIN} min, "
+               f"rests at the outside reference (none: stands aside) when on, is "
+               f"logged when dry; not a leading or closing side, nor the lone-ref "
+               f"guard's skips"
+               if LADDER_MODE == "atref" else " (inactive: needs IMM_LADDER_MODE=atref)"))
         _bs_live = BAIT_STOP_MODE in ("on", "dry")
         log(f"bait-fingerprint stop (2026-10-22): {BAIT_STOP_MODE}"
             + (" -- a fill that takes our whole rung on a side the lone-reference "

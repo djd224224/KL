@@ -37191,6 +37191,209 @@ class TestLoneReferenceGuard(unittest.TestCase):
         self.assertEqual(bot._lone_ref_rungs, {})
 
 
+class TestAloneFrontGuard(unittest.TestCase):
+    """Jack 2026-11-14: "Yes, build it", to "Build a check that keeps an ask
+    from coming back alone after the other offers leave?". 01:34Z 11/15 the
+    ~1,650 outside YES offers at 2.9c on KXSENATENOM-NHD-28-COST left after a
+    Hassan print; our 200-lot ask, read into its own reference, stayed at 2.9c
+    alone until a taker bought exactly 200 at 01:50:33Z."""
+
+    T = "KXSENATENOM-NHD-28-COST"
+    # COST's NO book (= its YES asks) in cent buckets, our 200 at NO 97 (2.9c)
+    # in it: 01:32:31Z, then 01:36:15Z after the outside offers left
+    BEFORE = [[1, 2056.0], [3, 500.0], [12, 100.0], [32, 2658.0], [34, 100.0],
+              [36, 50.0], [93, 349.0], [97, 1622.0]]
+    AFTER = [[1, 1551.0], [3, 600.0], [12, 100.0], [36, 2313.0], [37, 50.0],
+             [75, 36.0], [97, 236.0]]
+    YES = [[1, 1050.0], [2, 398965.0]]
+    OWN = [("ask", 3, 200.0)]                  # an ask at 2.9c: YES bucket 3
+
+    class Meta:
+        target_size = 1000.0
+        event_ticker = "KXSENATENOM-NHD-28"
+
+    def _bot(self):
+        _clean_persist()
+        return IncentiveMarketMaker(client=FakeClient(), live=False)
+
+    def _ext(self, no, own=None):
+        _y, ext = imm.external_levels(self.YES, no, self.OWN if own is None else own)
+        return imm.levels_desc(ext)
+
+    def test_the_cost_ask_trips_after_the_offers_left(self):
+        full, ext = imm.levels_desc(self.AFTER), self._ext(self.AFTER)
+        self.assertEqual(imm.side_reference_level(full, 1000.0), 97)     # our own 200
+        self.assertEqual(imm.side_reference_level(ext, 1000.0), 36)      # 64c YES
+        self.assertEqual(imm.alone_front_trip(full, ext, 1000.0, [97, 36]),
+                         {"rest": 97, "ext_ref": 36, "gap": 61})
+        # before they left the outside book set the same 97 itself: no trip
+        full, ext = imm.levels_desc(self.BEFORE), self._ext(self.BEFORE)
+        self.assertIsNone(imm.alone_front_trip(full, ext, 1000.0, [97]))
+
+    def test_a_book_we_rest_alone_on_from_the_start_never_trips(self):
+        full, ext = imm.levels_desc(self.AFTER), self._ext(self.AFTER)
+        self.assertIsNone(imm.alone_front_trip(full, ext, 1000.0, [36]))
+        self.assertIsNone(imm.alone_front_trip(full, ext, 1000.0, []))
+        # ...nor a small lead over the outside book (the gap knob)
+        self.assertIsNone(imm.alone_front_trip(full, ext, 1000.0, [97], min_gap=62))
+        self.assertIsNotNone(imm.alone_front_trip(full, ext, 1000.0, [96], join_c=1))
+        self.assertIsNone(imm.alone_front_trip(full, ext, 1000.0, [95], join_c=1))
+        self.assertEqual((imm.ALONE_FRONT_MIN_GAP_C, imm.ALONE_FRONT_JOIN_C,
+                          imm.ALONE_FRONT_WINDOW_MIN), (10, 1, 60))
+
+    def test_no_outside_reference_reads_as_a_gap_from_zero(self):
+        no = [[97, 236.0]]                       # 36 outside contracts in all
+        r = imm.alone_front_trip(imm.levels_desc(no), self._ext(no), 1000.0, [97])
+        self.assertEqual(r, {"rest": 97, "ext_ref": None, "gap": 97})
+
+    def test_on_moves_back_once_and_clears(self):
+        bot, t0 = self._bot(), 1_000_000.0
+        chk = bot._alone_front_check
+        with mock.patch.object(imm, "log") as lg:
+            self.assertEqual(chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0, on=True),
+                             (None, None))
+            b, a = chk(self.T, self.Meta, self.YES, self.AFTER, self.OWN, t0 + 120, on=True)
+            self.assertIsNone(b)
+            self.assertEqual((a["rest"], a["ext_ref"], a["gap"]), (97, 36, 61))
+            # the next cycle: our 200 now rests at NO 36 (64c), behind the outside 2,313
+            moved = [[1, 1551.0], [3, 600.0], [12, 100.0], [36, 2513.0], [37, 50.0],
+                     [75, 36.0], [97, 36.0]]
+            self.assertEqual(chk(self.T, self.Meta, self.YES, moved, [("ask", 64, 200.0)],
+                                 t0 + 300, on=True), (None, None))
+        self.assertEqual(bot._alone_front_held, {})
+        lines = [c.args[0] for c in lg.call_args_list]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("alone-front guard KXSENATENOM-NHD-28-COST ask: the outside offers "
+                      "at 3c left -- our 200 hold the reference there alone; the outside "
+                      "book's reference is 64c, 61c back", lines[0])
+        self.assertIn("moved back to 64c", lines[0])
+
+    def test_dry_logs_the_trip_once_and_its_clear(self):
+        bot, t0 = self._bot(), 1_000_000.0
+        chk = bot._alone_front_check
+        with mock.patch.object(imm, "log") as lg:
+            chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0)
+            for k in range(1, 4):                # alone three cycles running
+                self.assertIsNotNone(chk(self.T, self.Meta, self.YES, self.AFTER, self.OWN,
+                                         t0 + 120 * k)[1])
+            # the outside offers come back
+            self.assertIsNone(chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0 + 600)[1])
+        lines = [c.args[0] for c in lg.call_args_list]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("alone-front guard (dry)", lines[0])
+        self.assertIn("would move back to 64c", lines[0])
+        self.assertIn("clear after 480s", lines[1])
+
+    def test_the_window_runs_from_when_they_left(self):
+        bot, t0 = self._bot(), 1_000_000.0
+        chk = bot._alone_front_check
+        with mock.patch.object(imm, "log"):
+            chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0)
+            # with us for 2 h, then gone: trips (the 97 was in force at the window's start)
+            chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0 + 7200)
+            self.assertIsNotNone(chk(self.T, self.Meta, self.YES, self.AFTER, self.OWN, t0 + 7260)[1])
+            # still alone 61 min after they left: the window no longer shows them
+            self.assertIsNone(chk(self.T, self.Meta, self.YES, self.AFTER, self.OWN,
+                                  t0 + 7260 + 3660)[1])
+
+    def test_skipped_sides_keep_their_history(self):
+        bot, t0 = self._bot(), 1_000_000.0
+        chk = bot._alone_front_check
+        with mock.patch.object(imm, "log"):
+            chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0, skip_ask=True)
+            self.assertIsNone(chk(self.T, self.Meta, self.YES, self.AFTER, self.OWN, t0 + 120,
+                                  skip_ask=True)[1])
+            # the lead (or the position) goes: the history already shows them leaving
+            self.assertIsNotNone(chk(self.T, self.Meta, self.YES, self.AFTER, self.OWN, t0 + 240)[1])
+        self.assertIn((self.T, "ask"), bot._alone_front_refs)
+
+    def test_on_with_no_outside_reference_stays_aside_through_the_window(self):
+        bot, t0 = self._bot(), 1_000_000.0
+        chk = bot._alone_front_check
+        thin = [[97, 236.0]]                     # ours + 36: no outside reference
+        with mock.patch.object(imm, "log"):
+            chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0, on=True)
+            a = chk(self.T, self.Meta, self.YES, thin, self.OWN, t0 + 120, on=True)[1]
+            self.assertEqual((a["ext_ref"], a["gap"]), (None, 97))
+            # stood aside: our ask is gone from the book, still nobody else
+            gone = [[97, 36.0]]
+            self.assertIsNotNone(chk(self.T, self.Meta, self.YES, gone, [], t0 + 300, on=True)[1])
+            self.assertIsNotNone(chk(self.T, self.Meta, self.YES, gone, [], t0 + 3600, on=True)[1])
+            # an hour after they left the window lets it go
+            self.assertIsNone(chk(self.T, self.Meta, self.YES, gone, [], t0 + 120 + 3700, on=True)[1])
+            # ...and an outside reference back ends it at once
+            chk(self.T, self.Meta, self.YES, self.BEFORE, self.OWN, t0 + 9000, on=True)
+            chk(self.T, self.Meta, self.YES, thin, self.OWN, t0 + 9100, on=True)
+            self.assertIsNone(chk(self.T, self.Meta, self.YES, self.BEFORE, [], t0 + 9200, on=True)[1])
+        self.assertEqual(bot._alone_front_held, {})
+
+    def test_a_bad_book_costs_no_cycle(self):
+        bot = self._bot()
+        with mock.patch.object(imm, "log"):
+            self.assertEqual(bot._alone_front_check(self.T, self.Meta, self.YES, [["x", 1]],
+                                                    [], 1.0, on=True), (None, None))
+
+    def test_modes_and_knobs(self):
+        self.assertEqual((imm.ALONE_FRONT_PVD_MODE, imm.ALONE_FRONT_MODE), ("on", "dry"))
+        for k in ("ALONE_FRONT_MODE", "ALONE_FRONT_PVD_MODE", "ALONE_FRONT_MIN_GAP_C",
+                  "ALONE_FRONT_JOIN_C", "ALONE_FRONT_WINDOW_MIN"):
+            self.assertIn(k, imm._CONFIG_CODE_KNOBS)
+
+    # ---- the quote loop: a verdict moves the side's at-ref price ----------
+
+    G = "KXGOOD-99DEC31-A"
+
+    def _asks(self, mode, verdict):
+        """One selecting cycle, then one on a book of bids 2,000 at 20c and
+        NO bids 3,000 at 15c / 1,500 at 27c (asks at 85 / 73), with the check
+        stubbed to `verdict` on the ask side. The YES prices of the ask rungs."""
+        _clean_persist()
+        calls = []
+
+        def stub(_self, t, *a, **kw):
+            calls.append((t, kw.get("on")))
+            return None, verdict
+
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "ALONE_FRONT_MODE", mode), \
+                mock.patch.object(imm, "LONE_REF_GUARD_MODE", "off"), \
+                mock.patch.object(imm, "BAIT_STOP_MODE", "off"), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"), \
+                mock.patch.object(imm, "JOIN_WAIT_MODE", "off"), \
+                mock.patch.object(imm, "LEVELS", [(0, 100)]), \
+                mock.patch.object(imm, "MAX_POSITION_CONTRACTS", 300.0), \
+                mock.patch.object(imm, "MAX_EVENT_CONTRACTS", 1000.0), \
+                mock.patch.object(IncentiveMarketMaker, "_alone_front_check", stub):
+            bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+            bot.run_cycle()
+            self.assertIn(self.G, bot.state.selected)
+            bot.client.books[self.G] = {"orderbook_fp": {
+                "yes_dollars": [["0.20", "2000"]],
+                "no_dollars": [["0.15", "3000"], ["0.27", "1500"]]}}
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+        asks = sorted({o["yes_price"] for o in bot.state.sim_orders.values()
+                       if o["ticker"] == self.G and o["book_side"] == "ask"
+                       and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS})
+        return asks, calls
+
+    def test_on_rests_the_side_at_the_outside_reference(self):
+        asks, calls = self._asks("on", {"rest": 27, "ext_ref": 15, "gap": 12})
+        self.assertEqual(asks, [85])
+        self.assertIn((self.G, True), calls)
+        asks, _calls = self._asks("on", {"rest": 27, "ext_ref": None, "gap": 27})
+        self.assertEqual(asks, [])                           # no outside reference: aside
+        asks, _calls = self._asks("on", None)
+        self.assertEqual(asks, [73])
+
+    def test_dry_and_off_leave_the_price(self):
+        asks, calls = self._asks("dry", {"rest": 27, "ext_ref": 15, "gap": 12})
+        self.assertEqual(asks, [73])
+        self.assertIn((self.G, False), calls)
+        asks, calls = self._asks("off", {"rest": 27, "ext_ref": 15, "gap": 12})
+        self.assertEqual((asks, calls), ([73], []))
+
+
 class TestBaitFingerprintStop(unittest.TestCase):
     """2026-10-22 (Jack: "Build it and put guard on dry mode"): the LoL seller
     sold exactly our size 14 of 16 times while the order ahead of us was
