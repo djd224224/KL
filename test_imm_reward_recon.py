@@ -330,8 +330,70 @@ class TestEventRollup(unittest.TestCase):
         self.assertEqual(rec.event_of("KXRAIN-26AUG03-DEN"), "KXRAIN-26AUG03")
         self.assertEqual(rec.series_of("KXTEMPDCH-26AUG0213-T75.99"), "KXTEMPDCH")
 
+    def _known(self, *events):
+        return mock.patch.multiple(rec, _LEDGER_EVENTS=set(events), _EXTRA_EVENTS=set())
+
     def test_strikes_containing_dashes_still_roll_up(self):
-        self.assertEqual(rec.event_of("KXA-26AUG01-T5.315-X"), "KXA-26AUG01")
+        # a dashed strike under a 2-part event: right once the event is known
+        with self._known("KXA-26AUG01"):
+            self.assertEqual(rec.event_of("KXA-26AUG01-T5.315-X"), "KXA-26AUG01")
+
+    def test_three_part_events_join_their_credits(self):
+        """Jack 2026-11-15: "Yes, fix recon". The election waves' 4-part
+        markets belong to 3-part events; the old two-part rule filed them
+        under a phantom KXSENATENOM-SCD that is never credited."""
+        with self._known("KXSENATENOM-SCD-28", "KXSPAINMOV-26NOV29"):
+            self.assertEqual(rec.event_of("KXSENATENOM-SCD-28-BBRO"),
+                             "KXSENATENOM-SCD-28")
+            # the longest known prefix wins; a known 2-part event still holds
+            self.assertEqual(rec.event_of("KXSPAINMOV-26NOV29-PSOE-5"),
+                             "KXSPAINMOV-26NOV29")
+            # three parts: the old rule, whatever is known
+            self.assertEqual(rec.event_of("KXRAIN-26AUG03-DEN"), "KXRAIN-26AUG03")
+
+    def test_unknown_four_part_ticker_drops_its_last_part(self):
+        # incentive_mm's rule: fits most uncredited wave markets
+        with self._known():
+            self.assertEqual(rec.event_of("KXHOUSERACE-AR02-28-D"),
+                             "KXHOUSERACE-AR02-28")
+            self.assertEqual(rec.event_of("KXA-26AUG01-T5.315-X"),
+                             "KXA-26AUG01-T5.315")
+
+    def test_events_registered_by_a_caller_join_too(self):
+        with self._known():
+            rec.add_known_events(["KXBRPRES2MOVD-BRPRES26LULA", None, ""])
+            self.assertEqual(rec.event_of("KXBRPRES2MOVD-BRPRES26LULA-2-5"),
+                             "KXBRPRES2MOVD-BRPRES26LULA")
+
+    def test_writing_the_ledger_refreshes_the_join(self):
+        d = tempfile.mkdtemp()
+        with self._known(), \
+                mock.patch.object(rec, "STATUS_DIR", d), \
+                mock.patch.object(rec, "LEDGER_PATH", os.path.join(d, "reward_credits.csv")):
+            self.assertEqual(rec.event_of("KXGOVNOM-VTR-28-PSCO-X"), "KXGOVNOM-VTR-28-PSCO")
+            rec.write_ledger([("2026-11-15", "KXGOVNOM-VTR-28", 1.25, "Liquidity")])
+            self.assertEqual(rec.event_of("KXGOVNOM-VTR-28-PSCO-X"), "KXGOVNOM-VTR-28")
+
+    def test_reconcile_joins_a_wave_market_to_its_credits(self):
+        t = 1794700000.0
+        est = {"KXSENATENOM-SCD-28-BBRO": {"est": 2.0, "first": t, "last": t,
+                                            "cycles": 10, "two_sided": 10},
+               "KXSENATENOM-SCD-28-JDOE": {"est": 0.5, "first": t, "last": t,
+                                            "cycles": 10, "two_sided": 10}}
+        ledger = [("2026-11-15", "KXSENATENOM-SCD-28", 2.4, "Liquidity")]
+        with self._known(), \
+                mock.patch.object(rec, "load_ledger", return_value=ledger), \
+                mock.patch.object(rec, "rebuild_estimates", return_value=est), \
+                mock.patch.object(rec, "load_programs", return_value={}), \
+                mock.patch.object(rec, "FLOOR_PER_PERIOD", False):
+            rows, _ = rec.reconcile(now_utc=datetime(2026, 11, 15, 16, tzinfo=timezone.utc))
+        by = {r["event"]: r for r in rows}
+        self.assertEqual(set(by), {"KXSENATENOM-SCD-28"})      # no phantom event
+        r = by["KXSENATENOM-SCD-28"]
+        self.assertTrue(r["imm"])                              # credits count as IMM's
+        self.assertAlmostEqual(r["est"], 2.5)
+        self.assertAlmostEqual(r["credited"], 2.4)
+        self.assertEqual(r["mkts"], 2)
 
 
 class TestDigestCapacity(unittest.TestCase):

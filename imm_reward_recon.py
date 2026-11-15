@@ -114,11 +114,61 @@ def log(msg):
     print(msg, flush=True)
 
 
+# Market ticker -> event ticker (Jack 2026-11-15: "Yes, fix recon"). Most
+# market tickers are SERIES-EVENT-STRIKE, but the Nov 2026 election waves list
+# 4-part markets under 3-part events: KXSENATENOM-SCD-28-BBRO belongs to
+# KXSENATENOM-SCD-28. The old rule (always the first two parts) filed their
+# accrual under a phantom KXSENATENOM-SCD that is never credited. On the
+# 11.15.26 statement that put $8.8k of IMM credits under "not IMM's" and
+# $4.7k of phantom estimate into "still owed" ($9,206 instead of $4,505).
+# No fixed rule fits every series: some 4-part markets DO belong to a 2-part
+# event, where the strike itself has a dash (KXSPAINMOV-26NOV29,
+# KXBRPRES2MOVD-BRPRES26LULA, the *OUTPERFORMRCP-26NOV03 markets: $1.1k
+# credited). Kalshi's program rows carry no event ticker either. So a 4+ part
+# ticker takes the LONGEST prefix that is a known event (credited in the
+# ledger, or registered by a caller via add_known_events), and otherwise
+# incentive_mm's rule (drop the last part: IncentiveMarketMaker._event_of),
+# which fit 765 of the 981 affected events against 79 of 848 for the old
+# rule. Tickers of up to three parts keep the old rule.
+_LEDGER_EVENTS = None        # credited event tickers; None = load on first use
+_EXTRA_EVENTS = set()
+
+
+def add_known_events(events):
+    """Register event tickers known from elsewhere (settlement records, live
+    positions) so event_of can join a 4+ part market to them."""
+    _EXTRA_EVENTS.update(e for e in events if e)
+
+
+def _note_ledger(ledger):
+    """Use this ledger's events for event_of (reconcile passes its own)."""
+    global _LEDGER_EVENTS
+    _LEDGER_EVENTS = {r[1] for r in ledger}
+
+
+def _known_events():
+    global _LEDGER_EVENTS
+    if _LEDGER_EVENTS is None:
+        try:
+            _LEDGER_EVENTS = {r[1] for r in load_ledger()}
+        except (OSError, ValueError, KeyError):
+            _LEDGER_EVENTS = set()
+    return _LEDGER_EVENTS
+
+
 def event_of(ticker):
-    """Market ticker -> event ticker. Kalshi market tickers are
-    SERIES-EVENTSUFFIX-STRIKE; credits are reported per event."""
+    """Market ticker -> event ticker; credits are reported per event. See the
+    note above: up to three parts, the first two; past that, the longest
+    known-event prefix, else all but the last part."""
     parts = ticker.split("-")
-    return "-".join(parts[:2]) if len(parts) >= 2 else ticker
+    if len(parts) <= 3:
+        return "-".join(parts[:2]) if len(parts) >= 2 else ticker
+    known = _known_events()
+    for k in range(len(parts) - 1, 1, -1):
+        e = "-".join(parts[:k])
+        if e in known or e in _EXTRA_EVENTS:
+            return e
+    return "-".join(parts[:-1])
 
 
 def series_of(ticker):
@@ -234,6 +284,7 @@ def write_ledger(rows):
         w.writerow(["credit_date", "event_ticker", "amount", "kind"])
         w.writerows(rows)
     os.replace(tmp, LEDGER_PATH)
+    _note_ledger(rows)            # event_of joins to the events just written
 
 
 # ----------------------------------------------------------------------------
@@ -811,6 +862,7 @@ def ledger_cutoff(ledger, lag_days=None):
 
 def reconcile(since=None, floor=PAYOUT_FLOOR, now_utc=None):
     ledger = load_ledger()
+    _note_ledger(ledger)          # 4+ part markets join to these events
     est = rebuild_estimates()
     progs = load_programs()
     hourly = rebuild_hourly(max_date=HOURLY_MAX_DATE) if FLOOR_PER_PERIOD else {}
