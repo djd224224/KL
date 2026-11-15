@@ -1880,6 +1880,9 @@ def adding_count(r: dict) -> float:
     return max(0.0, abs(pa) - abs(pb))
 
 
+WIDE_C = 10.0     # pickoffs: a book wider than this (c) is marked at its facing touch, not its mid
+
+
 def pickoff_scan(a, reg: dict) -> dict:
     now = datetime.now(timezone.utc)
     t0 = now.timestamp() - a.hours * 3600.0
@@ -1943,13 +1946,27 @@ def pickoff_scan(a, reg: dict) -> dict:
             eb, ea = external_touch(yes, no, own.get(t, []))
         except Exception as ex:  # noqa: BLE001
             g["mark_error"] = str(ex)[:80]
-        mark = (eb + ea) / 2 if eb is not None and ea is not None else (eb if side == "bid" else ea)
-        g.update({"vwap_c": round(vw, 2), "ext_bid": eb, "ext_ask": ea, "mark_c": mark,
+        # A WIDE BOOK'S MID IS NOT A PRICE (Jack 2026-11-14: "yes fix that"): 01:50Z one
+        # taker lifted our 200-lot YES asks on three NH-D Senate long shots at 2.9-3.5c, and
+        # this watch marked them at the mid of a 2.8-3.5c x 49-53c book (~27c): -$142 and a
+        # series trip texted, where the only trades were ours and 85k-378k still bid ~3c.
+        # A book over --wide-c wide is marked at its outside touch FACING the fill -- a sold
+        # contract (our ask) at what outside buyers now bid, a bought one (our bid) at what
+        # outside sellers now ask -- and shows no gain: only a touch that moved through our
+        # price counts against us.
+        wide = eb is not None and ea is not None and ea - eb > getattr(a, "wide_c", WIDE_C)
+        if wide:
+            mark = eb if side == "ask" else ea
+        else:
+            mark = (eb + ea) / 2 if eb is not None and ea is not None else (eb if side == "bid" else ea)
+        g.update({"vwap_c": round(vw, 2), "ext_bid": eb, "ext_ask": ea, "mark_c": mark, "wide": wide,
                   "pos_now": float(pos_now.get(t, 0.0))})
         if mark is None:
             g.update({"adverse_c": None, "adverse_usd": None, "flag": False})
         else:
             adv = (vw - mark) if side == "bid" else (mark - vw)
+            if wide:
+                adv = max(adv, 0.0)
             usd = adv * g["contracts"] / 100.0
             g.update({"adverse_c": round(adv, 2), "adverse_usd": round(usd, 2),
                       "flag": adv >= a.min_c and usd >= a.min_usd})
@@ -2050,8 +2067,11 @@ def cmd_pickoffs(a) -> int:
         if g["adverse_c"] is None:
             mk = "no external book"
         else:
-            mk = (f"mark {g['mark_c']:.1f} ({g['ext_bid']}x{g['ext_ask']}) "
+            mk = (f"mark {g['mark_c']:.1f} ({g['ext_bid']}x{g['ext_ask']}"
+                  + (f", wide: the outside {'bid' if g['side'] == 'ask' else 'ask'}" if g.get("wide") else "")
+                  + ") "
                   + (f"{g['adverse_c']:.1f}c against us, -${g['adverse_usd']:,.0f}" if g["adverse_c"] > 0
+                     else "nothing against us" if g.get("wide")
                      else f"{-g['adverse_c']:.1f}c our way, +${-g['adverse_usd']:,.0f}"))
         print(f"  {'PICKOFF' if g['flag'] else '       '} {g['ticker']:38} {g['side']:3} "
               f"{g['contracts']:>7,.0f} @ {g['vwap_c']:5.1f}  {mk}  held {g['pos_now']:+,.0f}  "
@@ -2623,6 +2643,8 @@ def main() -> int:
     x.add_argument("--min-c", type=float, default=5.0, help="cents against us to flag (default 5)")
     x.add_argument("--min-usd", type=float, default=25.0, help="$ against us to flag (default 25)")
     x.add_argument("--series-trip", type=int, default=3, help="flagged markets in one series = a series trip")
+    x.add_argument("--wide-c", type=float, default=WIDE_C,
+                   help="a book wider than this (c) is marked at its outside touch facing the fill, not its mid")
     x.add_argument("--act", action="store_true",
                    help="pin each flagged registry-wave market (and tripped series) at the wave's base size, re-tune now")
     x.add_argument("--update-state", action="store_true")
