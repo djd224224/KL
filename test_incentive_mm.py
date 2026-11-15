@@ -44636,7 +44636,7 @@ class TestCheapSideBooks(unittest.TestCase):
         scotus_n = [(98.8, 10246.0)]
         q, info = q_(1, scotus_y, scotus_n)
         self.assertEqual(X(q), ("bid", 1, 1.1, 6818))
-        self.assertEqual((info["px"], info["joined_from"]), (1.1, 1))
+        self.assertEqual((info["px"], info["join_px"]), (1, 1.1))   # the listed px stays 1c
         self.assertAlmostEqual(info["share"], 6818 / (33451 + 6818), places=4)
         # ...and EARN ONLY keeps it (nothing strictly in front of 1.1c)
         kept, _ = imm.earning_only_quotes([q], [list(x) for x in scotus_y],

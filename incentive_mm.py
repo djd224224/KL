@@ -10823,7 +10823,11 @@ def cheap_side_quote(ticker: str, entry: dict,
         # level above it -- or, with the reference past the cent, to the
         # cent's best external level; strictly behind the other side's best.
         # It keeps the entry's dollars (n x price <= size x px) and is scored
-        # on the exact book, one tick = 0.1c.
+        # on the exact book, one tick = 0.1c. info["px"] stays the entry's own
+        # cent and the price it rests at is info["join_px"]: the hourly scan
+        # (cheap_scan.rung_cands) writes info["px"] as the listed px, and the
+        # loader takes only 1-2c or 0.1-0.9c (14:26Z 11/15 it wrote px 1.1 on
+        # 8 markets and the loader skipped them).
         mine_x, other_x = _cheap_exact_sides(yes_exact, no_exact, own_exact, side)
         hi = float(p) + 1.0 if limit is None else min(float(p) + 1.0, float(limit))
         ref, cum = None, 0.0
@@ -10841,7 +10845,7 @@ def cheap_side_quote(ticker: str, entry: dict,
         jp = round(jp, 2)
         if jp > p + 1e-9:
             n = int(max(0.0, min(float(n), math.floor(size * px / jp + 1e-9) - max(0.0, held))))
-            info.update(px=jp, joined_from=p, n=n)
+            info.update(join_px=jp, n=n)
             if n < 1:
                 info["why"] = f"at its dollars at {jp:g}c ({held:+.0f} held of {size} @ {px}c)"
                 return None, info
@@ -38938,7 +38942,11 @@ class IncentiveMarketMaker:
             log(f"{self.tag} cheap {t}: {side} side rests nothing -- {info.get('why')}")
             return
         usd = float(info.get("share") or 0.0) / 2.0 * float(meta.dollars_per_day or 0.0)
+        # a whole-cent px on a sub-penny book rests at its join (cheap_side_quote)
+        _jp = info.get("join_px")
+        info = dict(info, px=_jp) if _jp is not None else info
         log(f"{self.tag} cheap {t}: {side} bid {float(info.get('px') or 0):g}c x{q.count}"
+            f"{' (joined the sub-penny reference)' if _jp is not None else ''}"
             f"{' (dry: not placed)' if CHEAP_MODE != 'on' else ''} -- side share "
             f"{float(info.get('share') or 0) * 100:.0f}%, ~${usd:.2f}/day of "
             f"${float(meta.dollars_per_day or 0):.2f}, ${q.count * float(info.get('px') or 0) / 100:.0f} "

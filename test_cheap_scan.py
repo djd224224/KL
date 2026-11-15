@@ -479,6 +479,25 @@ class TestSubPenny(unittest.TestCase):
         # the same book on a whole-cent market: nothing
         self.assertEqual(cs.rung_cands("X-1", self.PR, ob, [], [], 100.0, 48.0, step=0.01), [])
 
+    def test_a_joined_whole_cent_rung_lists_its_own_px_and_size(self):
+        # Jack 2026-11-15 ("Yes, fix it"): on a sub-penny book the bot rests a
+        # 1c rung at the walk's 1.1c reference, fewer contracts at the same
+        # dollars -- but the LIST keeps 1c and the size asked for (14:26Z the
+        # scan wrote px 1.1 / size 6,818 and the loader skipped 8 markets)
+        ob = self._book([(1.1, 33451), (1.0, 961), (0.8, 625)], [(98.8, 10246)])
+        cands = cs.rung_cands("KXSCOTUSPOWER-29-29JAN20-R9-0", self.PR, ob, [], [],
+                              100.0, 48.0, step=0.001)
+        whole = [c for c in cands if c["px"] >= 1]
+        self.assertTrue(whole)
+        self.assertTrue(all(c["px"] in (1, 2) for c in whole), whole)
+        one = [c for c in whole if c["side"] == "yes" and c["px"] == 1]
+        self.assertTrue(one)
+        self.assertTrue(all(c["size"] in cs.SIZES for c in one), one)
+        self.assertTrue(all(abs(c["risk"] - c["size"] / 100.0) < 1e-9 for c in one), one)
+        # every listed rung loads (imm.cheap_px: 1-2c or 0.1-0.9c)
+        self.assertTrue(all(c["px"] in (1, 2) or round(c["px"] * 10) == c["px"] * 10
+                            for c in cands), cands)
+
 
 if __name__ == "__main__":
     unittest.main()

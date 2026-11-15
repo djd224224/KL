@@ -371,8 +371,16 @@ def rung_cands(t, pr, ob, own, own_exact, max_usd, hrs, step=None):
                     continue
                 seen.add(key)
                 usd = float(info["share"]) / 2.0 * pr["pd"]
-                cands.append({"side": side, "px": info["px"], "size": q.count, "share": info["share"],
-                              "usd_day": usd, "risk": q.count * info["px"] / 100.0,
+                # the LISTED rung: info["px"] is the entry's own price and n its
+                # size; on a sub-penny book a whole-cent px rests at its join
+                # (info["join_px"], fewer contracts at the same dollars), so
+                # the listing and its risk stay n at px (Jack 2026-11-15)
+                cands.append({"side": side, "px": info["px"],
+                              "size": n if info.get("join_px") is not None else q.count,
+                              "share": info["share"],
+                              "usd_day": usd,
+                              "risk": (n if info.get("join_px") is not None else q.count)
+                              * info["px"] / 100.0,
                               "proj": usd * hrs / 24.0, "limit": info.get("limit")})
     return cands
 
