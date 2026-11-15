@@ -59,5 +59,26 @@ class Readers(unittest.TestCase):
                 REAL["watch"]("/markets", {"tickers": "A"})
 
 
+class PageFills(unittest.TestCase):
+    def test_every_log_since_go_live(self):
+        # Jack 2026-11-14: "cash held in positions looks wrong" -- the page read
+        # only the newest 3 daily logs and lost a 3-day-old wave's first fills
+        import json, os, tempfile
+        from datetime import datetime, timezone
+        go = datetime(2026, 11, 11, 16, 8, 14, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as d:
+            for day, ts in (("2026-11-10", go - 86400), ("2026-11-11", go - 60),
+                            ("2026-11-11", go + 60), ("2026-11-12", go + 86400),
+                            ("2026-11-13", go + 2 * 86400), ("2026-11-14", go + 3 * 86400),
+                            ("2026-11-15", go + 4 * 86400)):
+                with open(os.path.join(d, f"fills_{day}.jsonl"), "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"ticker": "A", "ts": ts, "count": 1}) + "\n")
+                    fh.write(json.dumps({"ticker": "B", "ts": ts, "count": 1}) + "\n")
+            with mock.patch.object(pw, "LOG_DIR", d):
+                got = pw.bot_fills({"A"}, go)
+        self.assertEqual([r["ts"] for r in got],
+                         [go + 60, go + 86400, go + 2 * 86400, go + 3 * 86400, go + 4 * 86400])
+
+
 if __name__ == "__main__":
     unittest.main()

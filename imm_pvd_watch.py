@@ -144,8 +144,17 @@ def save_hist(h: dict) -> None:
 
 
 def bot_fills(tickers: set, start_ts: float) -> list:
+    """The bot's fills on `tickers` since `start_ts`, from EVERY daily log
+    from the go-live's UTC day on (the logs roll at 00:00Z). It read only the
+    newest 3, so a page live 3+ days lost its first fills: 2026-11-14 the
+    statenom page (live 11/11) showed $1,247.81 held of Kalshi's $5,459.93
+    once 11/15's log opened, the 11/12 sweep gone (Jack: "cash held in
+    positions looks wrong")."""
     rows = []
-    for p in sorted(glob.glob(os.path.join(LOG_DIR, "fills_*.jsonl")))[-3:]:
+    day0 = datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%d")
+    for p in sorted(glob.glob(os.path.join(LOG_DIR, "fills_*.jsonl"))):
+        if os.path.basename(p)[6:16] < day0:
+            continue
         try:
             with open(p, encoding="utf-8") as fh:
                 for line in fh:
