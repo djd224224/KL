@@ -17417,9 +17417,10 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 # of official snowfall at the station in the rules; 22 cities, $175 a market
 # from 11/15 01:25Z, books 1c x 99c placeholders at listing.
 #   - FAIR: snow_days_fair.py (refresher thread "snow-days", every
-#     SNOW_DAYS_REFRESH_SECS) -- the mean payout over the last 40 seasons'
-#     counts at the station (ACIS); out once the season starts (no observed
-#     layer yet).
+#     SNOW_DAYS_REFRESH_SECS) -- the mean payout over the last 10 seasons'
+#     counts at the station (ACIS; 40 read, the 40-season mean ran a median
+#     11c over the book at the start -- Jack 2026-11-15: "Yes, last 10");
+#     out once the season starts (no observed layer yet).
 #   - GATE (snow_days_gate), the crypto event gate's shape, fails CLOSED: no
 #     fair or a stale one, or a touch fighting the fair by more than
 #     SNOW_DAYS_TOL_CENTS, stands the market aside; otherwise every rung
@@ -46142,7 +46143,7 @@ class IncentiveMarketMaker:
         if SNOW_DAYS_ENABLE:
             log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"
                 + (" + any SNOW series on its contract" if SNOW_DAYS_AUTO else "")
-                + f" on snow_days_fair (40-season mean payout, every "
+                + f" on snow_days_fair (last-10-season mean payout, every "
                 f"{SNOW_DAYS_REFRESH_SECS // 60}m), fail-closed, rungs "
                 f"{SNOW_DAYS_TOL_CENTS}c clear of the fair, leads "
                 f"{'on' if SNOW_DAYS_LEAD else 'off'}, x{SNOW_DAYS_SIZE_MULT:g}, 1-99c, "

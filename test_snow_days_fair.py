@@ -112,6 +112,15 @@ class TestContract(unittest.TestCase):
         self.assertEqual(f["p"], round((0 + 0.25 + 0.5 + 1 + 1) / 5, 4))
         self.assertEqual((f["seasons"], f["n_med"]), (40, 2))
 
+    def test_the_fair_reads_the_last_ten_calendar_seasons(self):
+        """Jack 2026-11-15 "Yes, last 10": a dropped season is not replaced
+        by an older one."""
+        counts = [(y, 9) for y in range(2025, 2015, -1)] + [(y, 0) for y in range(2015, 1985, -1)]
+        got = s.recent_counts(counts, date(2026, 12, 1))
+        self.assertEqual([y for y, _n in got], list(range(2025, 2015, -1)))
+        gap = [c for c in counts if c[0] != 2024]
+        self.assertEqual(len(s.recent_counts(gap, date(2026, 12, 1))), 9)
+
 
 class TestWrite(unittest.TestCase):
     NOW = datetime(2026, 11, 15, 1, 30, tzinfo=UTC)
@@ -146,10 +155,11 @@ class TestWrite(unittest.TestCase):
         self.assertEqual((ok, miss), (2, 1))
         d = self.read()
         atl = d["markets"]["KXSNOWDAYS-01DEC26-01APR27-ATL"]
-        self.assertEqual((atl["sid"], atl["seasons"], atl["event"], atl["fetched_at"]),
-                         ("KATL", 40, "KXSNOWDAYS-01DEC26-01APR27", self.NOW.isoformat()))
+        self.assertEqual((atl["sid"], atl["seasons"], atl["seasons_all"], atl["event"],
+                          atl["fetched_at"]),
+                         ("KATL", 10, 40, "KXSNOWDAYS-01DEC26-01APR27", self.NOW.isoformat()))
         # counts 0..4 in turn on a 0-4 range: mean payout (0+.25+.5+.75+1)/5
-        self.assertEqual(atl["p"], 0.5)
+        self.assertEqual((atl["p"], atl["p_all"]), (0.5, 0.5))
         # Houston's Hobby record is short: the Houston Area record stands in
         hou_f = d["markets"]["KXSNOWDAYS-01DEC26-01APR27-HOU"]
         self.assertEqual((hou_f["sid"], hou_f["p"]), ("IAHthr", 0.05))
@@ -173,6 +183,27 @@ class TestWrite(unittest.TestCase):
         s.write_fair_file(self.path, now=self.NOW, markets_in={"KXSNOWDAYS": [market()]},
                           fetch=lambda sid, a, b: {})
         self.assertIn("no history", self.read()["missing"]["KXSNOWDAYS-01DEC26-01APR27-ATL"])
+
+    def test_a_snowy_past_does_not_lift_a_thin_decade(self):
+        """The fair follows the last 10 seasons; under 8 of them complete -> no fair."""
+        def fetch(sid, start, end):
+            return history({y: (0 if y >= 2016 else 4) for y in range(1980, 2026)})
+        s.write_fair_file(self.path, now=self.NOW, markets_in={"KXSNOWDAYS": [market()]},
+                          fetch=fetch)
+        atl = self.read()["markets"]["KXSNOWDAYS-01DEC26-01APR27-ATL"]
+        self.assertEqual((atl["p"], atl["seasons"]), (0.0, 10))
+        self.assertEqual(atl["p_all"], 0.75)               # 30 of 40 seasons at the cap
+        os.remove(self.path)
+
+        def gappy(sid, start, end):
+            # 2016-2018 missing whole winters: 7 of the last 10 complete
+            return history({y: 1 for y in range(1980, 2026) if y not in (2016, 2017, 2018)})
+        s.write_fair_file(self.path, now=self.NOW, markets_in={"KXSNOWDAYS": [market()]},
+                          fetch=gappy)
+        d = self.read()
+        self.assertEqual(d["markets"], {})
+        self.assertIn("7 of the last 10 seasons complete (need 8)",
+                      d["missing"]["KXSNOWDAYS-01DEC26-01APR27-ATL"])
 
     def test_discovery_enrolls_a_snow_series_on_this_contract_only(self):
         calls = []

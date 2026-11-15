@@ -22,10 +22,18 @@ at the station the rules name (its ICAO; the threaded city record "<code>thr"
 when the airport's own is short, as snow_monthly_fair does for Denver),
 counted over the same window in each of the last HIST_SEASONS seasons (a
 season with more than MAX_MISSING_DAYS missing days is dropped, the rest of
-its missing days read as no snow), each season's count put through the
-market's payout, the fair = the mean payout. MIN_SEASONS or fewer -> no fair
+its missing days read as no snow). Fewer than MIN_SEASONS complete -> no fair
 (the gate stands it aside). Each (station, window, threshold) history is read
 once and kept in the file's "hist" for HIST_TTL_DAYS.
+
+THE FAIR = the mean payout over the last FAIR_SEASONS (10) of those seasons
+(Jack 2026-11-15: "Yes, last 10"). At the 11/15 program start the 40-season
+mean sat a median 11c over the other maker's book mid (Boston +20, New York
++18): snow days have thinned, and the last 10 seasons matched the book
+(median +1.6c, mean gap 6.7c). The window is calendar seasons: a dropped one
+is not replaced by an older one, and fewer than FAIR_MIN_SEASONS complete of
+the last FAIR_SEASONS -> no fair. Each market row keeps the full-history
+mean as "p_all" / "seasons_all" for reference.
 
 IN SEASON (from the window's first local day) there is no fair YET: a
 snowstorm moves a 0-4 day city 25c in a day, and the observed layer (the CLI's
@@ -71,6 +79,8 @@ ACIS_URL = "https://data.rcc-acis.org/StnData"
 SERIES_CATEGORY = "Climate and Weather"
 HIST_SEASONS = int(os.environ.get("IMM_SNOW_DAYS_SEASONS", "40"))
 MIN_SEASONS = 25
+FAIR_SEASONS = int(os.environ.get("IMM_SNOW_DAYS_FAIR_SEASONS", "10"))
+FAIR_MIN_SEASONS = int(os.environ.get("IMM_SNOW_DAYS_FAIR_MIN", "8"))
 MAX_MISSING_DAYS = 3
 HIST_TTL_DAYS = 7.0
 HIST_RETRY_SECS = 6 * 3600
@@ -241,6 +251,13 @@ def fair_from_counts(spec: dict, counts: List[Tuple[int, int]]) -> dict:
     return {"p": round(min(max(sum(pays) / len(pays), 0.0), 1.0), 4), "seasons": len(ns),
             "n_med": q(0.5), "n_p10": q(0.1), "n_p90": q(0.9),
             "mean_n": round(sum(ns) / len(ns), 2)}
+
+
+def recent_counts(counts: List[Tuple[int, int]], start: date,
+                  seasons: int = FAIR_SEASONS) -> List[Tuple[int, int]]:
+    """The counts of the last `seasons` calendar seasons before the window
+    starting `start` (a dropped season is not replaced by an older one)."""
+    return [(y, n) for y, n in counts if start.year - seasons <= y < start.year]
 
 
 def _get(get_json: Optional[Callable], path: str, params: dict) -> dict:
@@ -416,14 +433,22 @@ def write_fair_file(path: str = SNOW_DAYS_FILE, now: Optional[datetime] = None,
         if h.get("counts") is None:
             missing[t] = "no history" + (f" ({h['why']})" if h.get("why") else "")
             continue
-        f = fair_from_counts(spec, [tuple(c) for c in h["counts"]])
+        allc = [tuple(c) for c in h["counts"]]
+        rc = recent_counts(allc, date.fromisoformat(spec["start"]))
+        if len(rc) < FAIR_MIN_SEASONS:
+            missing[t] = (f"{len(rc)} of the last {FAIR_SEASONS} seasons complete "
+                          f"(need {FAIR_MIN_SEASONS})")
+            continue
+        f = fair_from_counts(spec, rc)
         out[t] = dict(f, event=spec["event"], fetched_at=stamp, station=spec["station"],
                       sid=h.get("sid"), floor=spec["floor"], cap=spec["cap"],
-                      window=[spec["start"], spec["end"]], thr=spec["thr"])
+                      window=[spec["start"], spec["end"]], thr=spec["thr"],
+                      p_all=fair_from_counts(spec, allc)["p"], seasons_all=len(allc))
     payload = {"generated_at": stamp, "markets": out, "missing": missing,
                "series": joined, "rejected": rejected, "discovered_at": disc_at,
                "specs": specs, "specs_at": specs_at, "hist": hist,
                "model": {"hist_seasons": HIST_SEASONS, "min_seasons": MIN_SEASONS,
+                         "fair_seasons": FAIR_SEASONS, "fair_min_seasons": FAIR_MIN_SEASONS,
                          "max_missing_days": MAX_MISSING_DAYS}}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fo:
