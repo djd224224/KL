@@ -149,6 +149,8 @@ KXCONTROLS + KXCONTROLH 2030 (4 markets) were quoting 120 as Elections members; 
 
 ## Open questions closed since 11/08
 
+- 11/15 ("Yes, commit"): the 11/14-11/15 wave tools and this runbook committed from KL (09225c9).
+
 - 11/14: the $1-floor protocol runs on its own, in manual mode, on type B waves with a live fair ("Yes, pre-approve"); `floor_auto` on w1113-fxmetals ("Yes, every 15 min"), on w1114-cryptoev since 11/15 (offs only).
 - 11/14: KXSENATENOM-TNR-28's 12 markets pinned at 0 until Blackburn names her appointee (lifting them -- `setarg w1111-statenom pin KXSENATENOM-TNR-28-<X>:0 --unset` each -- is Jack's word); the KXSENATENOM series pin lifted (436 markets back on the tiers: 175,600 -> 1,148,900 contracts listed), KSR-JMOR, ARR-JBOO and COD-MBEN keep their 200 pins.
 

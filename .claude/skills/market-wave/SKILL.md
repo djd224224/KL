@@ -565,4 +565,3 @@ Kalshi's "after economic events" series: will gold / silver / copper, USD/JPY, E
 7. KXYTVIEWSHIGH (YouTube highest daily views, 140 markets, $1,000/day, from 11/15 16:00Z): NEW, held; recommended off.
 8. USD/MXN's dark spells (Bitso's wide book refused twice 11/14-15): a second source, or accept them.
 9. A per-coin jump-hold trigger (HYPE held 30% of 11/14-15, BTC 8%): measure what the holds avoided first (offered 11/15).
-10. Commit the wave tools and this runbook (uncommitted since 8e426c5: floor_auto and the bot-fair floor check, the upcoming notice, known shapes, the fair file at 2c, whydark's FX lines).
