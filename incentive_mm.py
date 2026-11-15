@@ -5226,6 +5226,34 @@ def risk_group_of(ticker: str) -> Optional[str]:
         return g
 
 
+# WAVE SERIES GROUPS (Jack 2026-11-15: "build these to generalize into the market-wave
+# skill", after checking which of 11/15's Kelly protections reach the crypto wave: none did --
+# the cross-event breaker below groups only NFL games, Carbon Arc, corn yields and the
+# elections). A series on the wave list that risk_group puts in no group -- a crypto coin's or
+# an FX pair's / metal's strike ladder, a politics series outside the elections, any new wave
+# shape -- is its OWN group for the group breaker: maker fills of SWEEP_GROUP_MIN_CT+ on one
+# side in SWEEP_GROUP_MIN_EVENTS of its events inside the window hold that side of the whole
+# series (every strike of a ladder rides one price). Not a "no_halts" series (no halts there,
+# Jack 2026-11-07; the wave breaker watches those) nor a cheap-side book's. Only the group
+# breaker reads it: risk_group stays the risk pass's and the tape trigger's. Replay of
+# 11/06-11/15: 10 such series filled, 3 fills of 200+, each alone -- 0 trips.
+#    IMM_WAVE_GROUPS=on (default) / off
+WAVE_GROUPS = os.environ.get("IMM_WAVE_GROUPS", "on").strip().lower() != "off"
+
+
+def breaker_group_of(ticker: str) -> Optional[str]:
+    """The group breaker's group: risk_group_of's, else (WAVE_GROUPS) "wave <SERIES>" for a
+    series on the wave list (PVD_GROUP_SERIES) with halts on, else None."""
+    g = risk_group_of(ticker)
+    if g is not None or not WAVE_GROUPS:
+        return g
+    s = series_of(ticker)
+    if s in globals().get("PVD_GROUP_SERIES", ()) and not sweep_exempt(s) \
+            and len(sweep_linked_series(s)) <= 1:
+        return f"wave {s}"
+    return None
+
+
 # CROSS-EVENT BREAKER (#2 of the 10/17 risk-return review). Maker fills on
 # the SAME side (both on our bids, or both on our asks) in SWEEP_GROUP_MIN_EVENTS
 # (2 since 2026-11-13, as designed 10/17; 3 on 11/12) DIFFERENT events of
@@ -10394,6 +10422,9 @@ _pvd_state = {"mtime": 0.0, "forced": frozenset()}
 # and the account-level halts stay. By SERIES because the halts key on series
 # and events; the 2028 wave's series are its own.
 PVD_NO_HALT_SERIES: Set[str] = set()
+# the list's series the group breaker groups by when no risk_group does (WAVE_GROUPS): every
+# entry's but a cheap-side book's or a "no_halts" one's
+PVD_GROUP_SERIES: Set[str] = set()
 # EVENT CAP FOR LISTED EVENTS (Jack 2026-11-07: "cap at 3k contracts per
 # event", then "double cheap sides, remove event cap"): an event with a live
 # entry (its latest stop still ahead) takes PVD_EVENT_CAP net contracts in
@@ -10950,6 +10981,11 @@ def load_pvd_markets() -> int:
         _risk_group_memo.clear()        # risk_group reads sweep_exempt
         log(f"[IMM] post-vote dead books: no halts on {len(no_halt)} series"
             + (f" ({', '.join(sorted(no_halt))})" if no_halt else ""))
+    grp_series = {series_of(t) for t, e in fresh.items()
+                  if not e.get("cheap") and not e.get("no_halts")}
+    if grp_series != PVD_GROUP_SERIES:
+        PVD_GROUP_SERIES.clear()
+        PVD_GROUP_SERIES.update(grp_series)
     PVD_EVENT_STOPS.clear()
     for e in fresh.values():
         if PVD_EVENT_STOPS.get(e["event"]) is None or e["stop"] > PVD_EVENT_STOPS[e["event"]]:
@@ -14850,6 +14886,8 @@ _CONFIG_CODE_KNOBS = (
     "CAND_BREAKER", "CAND_MIN_CT", "CAND_HOLD_SECS", "PULL_BATCH",
     "PULL_TOKENS_PER_SEC", "PULL_BURST_TOKENS", "PULL_MAX_SECS",
     "CYCLE_CANCEL_BATCH",
+    # fair hold pull + wave series groups (2026-11-15)
+    "FAIR_HOLD_PULL", "FAIR_HOLD_RECHECK_SECS", "WAVE_GROUPS",
     # cross-event breaker and the dollar limits + skew, dry (2026-10-17)
     "SWEEP_GROUP", "SWEEP_GROUP_WINDOW_SECS", "SWEEP_GROUP_HOLD_SECS",
     "SWEEP_GROUP_MIN_CT", "SWEEP_GROUP_MIN_EVENTS", "RISK_LIMITS", "RISK_EVENT_FLOOR", "RISK_EVENT_DAYS",
@@ -20362,6 +20400,62 @@ def fx_event_wave_limits(ticker: str, now_ts: float) -> Optional[Tuple[int, int]
     if why or caps is None:
         return None
     return (caps[0] if caps[0] is not None else 0, caps[1] if caps[1] is not None else 100)
+
+
+# FAIR HOLD PULL (Jack 2026-11-15: "build these to generalize into the market-wave skill").
+# The live-fair gates above stand a strike aside as the quote loop reaches it, one cancel at a
+# time: BTC's 02:05:48Z 11/15 jump hold cancelled its 128 orders over 95 s, strike by strike,
+# while the coin moved. Now a live-fair UNDERLYING -- a coin of the crypto event fair, an FX /
+# metals series of the FX event fair -- in its jump hold, or priced off a read older than its
+# gate's TTL (the two stand-asides that take the whole underlying at once), has every order on
+# it pulled at the feed's next look (~0.25-0.5 s, inside cycles too; each cycle's start with
+# no feed), in batches (the fast pull): when its episode starts, then whatever rests there
+# again, every FAIR_HOLD_RECHECK_SECS while it lasts. No amend or placement goes in on it until
+# it comes back, and the gates keep their strike-by-strike stand-asides underneath. It never
+# cancels what the gate would keep: the same two reasons, off the same snapshot.
+#    IMM_FAIR_HOLD_PULL=on (default) / off (the gates alone, strike by strike)
+FAIR_HOLD_PULL = os.environ.get("IMM_FAIR_HOLD_PULL", "on").strip().lower() != "off"
+FAIR_HOLD_RECHECK_SECS = 2.0
+
+
+def fair_underlying_of(ticker: str) -> Optional[str]:
+    """The live-fair underlying a strike rides -- "crypto BTC" (a crypto event series' coin),
+    "fx KXEURUSDEVENT" (an FX / metals event series) -- else None."""
+    s = series_of(ticker)
+    if fx_event_series(s):
+        return f"fx {s}"
+    if crypto_event_series(s):
+        m = _CRYPTO_EVENT_RE.match(s)
+        return f"crypto {m.group(1)}" if m else None
+    return None
+
+
+def fair_underlying_holds(now_ts: float) -> Dict[str, str]:
+    """{underlying: why} for the live-fair underlyings standing aside as a whole at now_ts: in
+    a jump hold, or off a price read older than the gate's TTL. A coin or series whose read
+    carries no time is left to the gate, strike by strike. Empty before the first reads."""
+    out: Dict[str, str] = {}
+    snap = _crypto_event_state.get("snap") if CRYPTO_EVENT_FAIR else None
+    for a, v in ((snap or {}).get("assets") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        h = float(v.get("hold_until") or 0.0)
+        ts = v.get("spot_ts")
+        if h > now_ts:
+            out[f"crypto {a}"] = f"{a} jump hold ({(h - now_ts) / 60:.0f}m left)"
+        elif ts and now_ts - float(ts) > CRYPTO_EVENT_TTL_SECS:
+            out[f"crypto {a}"] = f"{a} spot is {now_ts - float(ts):.0f}s old"
+    snap = _fx_event_state.get("snap") if FX_EVENT_FAIR else None
+    for s, v in ((snap or {}).get("series") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        h = float(v.get("hold_until") or 0.0)
+        ts = v.get("mid_ts")
+        if h > now_ts:
+            out[f"fx {s}"] = f"{s} jump hold ({(h - now_ts) / 60:.0f}m left)"
+        elif ts and now_ts - float(ts) > FX_EVENT_TTL_SECS:
+            out[f"fx {s}"] = f"{s} source price is {now_ts - float(ts):.0f}s old"
+    return out
 
 
 def vercel_measured_day(event_ticker: str) -> Optional[datetime]:
@@ -28686,6 +28780,15 @@ class IncentiveMarketMaker:
         self._pull_st = {"pulls": 0, "batches": 0, "batched": 0, "single": 0,
                          "entry_errors": 0, "retries_429": 0, "call_errors": 0,
                          "left_for_cycle": 0, "longest_s": 0.0, "audit_bad": 0}
+        # fair hold pull (2026-11-15, FAIR_HOLD_PULL): underlying -> its episode
+        # {at, why}; the last look's (ts, holds); when the last recheck ran;
+        # order id -> when a pull last tried it
+        self._fhp_ep: Dict[str, dict] = {}
+        self._fhp_cache: Optional[Tuple[float, Dict[str, str]]] = None
+        self._fhp_last = 0.0
+        self._fhp_tried: Dict[str, float] = {}
+        self._fhp_st = {"episodes": 0, "pulls": 0, "repulls": 0, "cancels": 0,
+                        "skipped_budget": 0, "skipped_writes": 0}
         # tape trigger (2026-11-01, TAPE_TRIGGER): the public-trade feed (its
         # own connection); the open taker bursts, (ticker, taker side) ->
         # burst; hold key -> the window a trip opened {"at", "until", "mode",
@@ -31085,6 +31188,9 @@ class IncentiveMarketMaker:
                 self._hz_note_fill(body, now_ts)
                 if fast and not in_cycle:
                     self._ws_wake = True
+        # a live-fair underlying standing aside as a whole: all of it at once
+        # (FAIR HOLD PULL), after the breakers' fills
+        self._fair_hold_pull(now_ts)
         # the public tape (TAPE_TRIGGER), after our own fills, so a burst
         # that took ours already knows it
         self._tape_process(now_ts)
@@ -31520,7 +31626,7 @@ class IncentiveMarketMaker:
         `side` ('bid' / 'ask') of the ticker's risk_group out of quoting."""
         if SWEEP_GROUP != "on" or not self._grp_hold:
             return False
-        g = risk_group_of(ticker)
+        g = breaker_group_of(ticker)
         return g is not None and self._grp_hold.get((g, side), 0.0) > now_ts
 
     def cand_held(self, ticker: str, side: str, now_ts: float) -> bool:
@@ -31641,6 +31747,111 @@ class IncentiveMarketMaker:
             st["skipped_budget"] += len(left)        # the cycle pulls them
             self._pull_st["left_for_cycle"] += len(left)
 
+    # ---- FAIR HOLD PULL (2026-11-15) ------------------------------------
+
+    def _fair_holds(self, now_ts: float) -> Dict[str, str]:
+        """fair_underlying_holds, read at most once a second (the write loops ask
+        for every order)."""
+        c = self._fhp_cache
+        if c is None or abs(now_ts - c[0]) >= 1.0:
+            c = self._fhp_cache = (now_ts, fair_underlying_holds(now_ts)
+                                   if FAIR_HOLD_PULL else {})
+        return c[1]
+
+    def fair_held(self, ticker: str, now_ts: float) -> bool:
+        """True while the strike's live-fair underlying stands aside as a whole
+        (FAIR HOLD PULL): nothing placed or amended on it until it is back."""
+        holds = self._fair_holds(now_ts)
+        if not holds:
+            return False
+        u = fair_underlying_of(ticker)
+        return u is not None and u in holds
+
+    def _fair_hold_pull(self, now_ts: float) -> None:
+        """FAIR HOLD PULL, at the feed's look: every order on a live-fair
+        underlying standing aside as a whole, pulled at once in batches -- when
+        its episode starts, then whatever rests there again, every
+        FAIR_HOLD_RECHECK_SECS while it lasts (an order a pull tried waits 10 s
+        for the next try; the gate and the cycle get it meanwhile). One log line
+        and one fair_hold_<date>.jsonl row a pull. Never raises."""
+        try:
+            holds = self._fair_holds(now_ts)
+            for u in [u for u in self._fhp_ep if u not in holds]:
+                del self._fhp_ep[u]
+            if not holds:
+                return
+            new = [u for u in holds if u not in self._fhp_ep]
+            if not new and now_ts - self._fhp_last < FAIR_HOLD_RECHECK_SECS:
+                return
+            self._fhp_last = now_ts
+            if len(self._fhp_tried) > 5000:
+                self._fhp_tried = {k: v for k, v in self._fhp_tried.items()
+                                   if now_ts - v < 60.0}
+            pull: Dict[str, List[Tuple[str, dict]]] = {}
+            in_view: Set[str] = set()
+
+            def take(u: str, tk: str, o: dict) -> None:
+                oid = str(o.get("order_id") or "")
+                if not oid or oid in self._cycle_cancelled or \
+                        now_ts - self._fhp_tried.get(oid, -1e9) < 10.0:
+                    return
+                pull.setdefault(u, []).append((tk, o))
+
+            for tk, lst in self._resting_view.items():
+                u = fair_underlying_of(tk)
+                if u is None or u not in holds:
+                    continue
+                for o in lst:
+                    in_view.add(str(o.get("order_id") or ""))
+                    if float(o.get("rem") or 0.0) > 0:
+                        take(u, tk, o)
+            # ...plus what was placed since the cycle's view, which only the
+            # ledger holds yet
+            for l_oid, led in list(self.state.ledger.items()):
+                if l_oid in in_view:
+                    continue
+                l_t = str(led.get("ticker") or "")
+                l_rem = float(led.get("remaining_count") or 0.0)
+                if not l_t or l_rem <= 0:
+                    continue
+                u = fair_underlying_of(l_t)
+                if u is None or u not in holds:
+                    continue
+                l_px = led.get("yes_price_exact")
+                take(u, l_t, {"order_id": l_oid,
+                              "side": str(led.get("book_side") or ""),
+                              "px": float(l_px) if l_px is not None
+                              else float(led.get("yes_price") or 0),
+                              "rem": l_rem})
+            st = self._fhp_st
+            for u in new:
+                self._fhp_ep[u] = {"at": now_ts, "why": holds[u]}
+                st["episodes"] += 1
+            for u, lst in pull.items():
+                ep = self._fhp_ep.setdefault(u, {"at": now_ts, "why": holds[u]})
+                first = u in new
+                for _tk, o in lst:
+                    self._fhp_tried[str(o["order_id"])] = now_ts
+                t0 = time.time()
+                before = st["cancels"]
+                self._ws_pull(lst, "fair_hold", now_ts, st, "fair")
+                secs = time.time() - t0
+                n_ok = st["cancels"] - before
+                st["pulls"] += 1
+                if not first:
+                    st["repulls"] += 1
+                mkts = len({tk for tk, _o in lst})
+                log(f"{self.tag} fair hold pull: {u} ({holds[u]}) -> {n_ok} of "
+                    f"{len(lst)} order(s) on {mkts} market(s) pulled in {secs:.1f}s"
+                    + ("" if first else " (resting again since its hold began)"))
+                self._sink("fair_hold", {
+                    "ev": "pull" if first else "repull", "ts": round(now_ts, 3),
+                    "underlying": u, "why": holds[u],
+                    "since_s": round(now_ts - ep["at"], 1), "orders": len(lst),
+                    "cancelled": n_ok, "markets": mkts, "secs": round(secs, 2)})
+        except Exception as e:
+            log(f"{self.tag} ! fair hold pull failed: {e}")
+
     def _held_first(self, oids: List[str], now_ts: float) -> List[str]:
         """The cycle's cancels, the orders a breaker holds out first (a pull
         the WS left for the cycle), the order kept otherwise."""
@@ -31654,6 +31865,8 @@ class IncentiveMarketMaker:
                 return 0
             if sd and (self.cand_held(t, sd, now_ts)
                        or self.group_held(t, sd, now_ts)):
+                return 0
+            if self.fair_held(t, now_ts):
                 return 0
             return 1
         return sorted(oids, key=tier)
@@ -31876,6 +32089,7 @@ class IncentiveMarketMaker:
                 or self.group_held(ticker, "ask", now_ts)
                 or self.cand_held(ticker, "bid", now_ts)
                 or self.cand_held(ticker, "ask", now_ts)
+                or self.fair_held(ticker, now_ts)
                 or self.wave_any_held(ticker, now_ts)
                 or self._xp_shard_paused(ticker))
 
@@ -31889,7 +32103,7 @@ class IncentiveMarketMaker:
         SWEEP_GROUP_MIN_CT+ fills on the same side within
         SWEEP_GROUP_WINDOW_SECS, the last one trips that side for
         SWEEP_GROUP_HOLD_SECS -- logged dry, held and pulled on."""
-        g = risk_group_of(t)
+        g = breaker_group_of(t)
         if g is None or side not in ("bid", "ask"):
             return
         st = self._grp
@@ -31947,7 +32161,7 @@ class IncentiveMarketMaker:
         pull: List[Tuple[str, dict]] = []
         grp_day, n_mkts = 0.0, 0
         for tk, lst in self._resting_view.items():
-            if risk_group_of(tk) != g:
+            if breaker_group_of(tk) != g:
                 continue
             n_mkts += 1
             pnl = self._last_panel.get(tk) or {}
@@ -31963,7 +32177,7 @@ class IncentiveMarketMaker:
                     or str(led.get("book_side") or "") != side or not l_t \
                     or any(o["order_id"] == l_oid
                            for o in self._resting_view.get(l_t, ())) \
-                    or risk_group_of(l_t) != g:
+                    or breaker_group_of(l_t) != g:
                 continue
             l_px = led.get("yes_price_exact")
             pull.append((l_t, {"order_id": l_oid, "side": side,
@@ -32925,7 +33139,8 @@ class IncentiveMarketMaker:
                     for f_ts, f_oid, _n in self._ws_fill_log) or \
                 self.sweep_held(self._event_of(t), now_ts) or \
                 self.group_held(t, m["side"], now_ts) or \
-                self.cand_held(t, m["side"], now_ts):
+                self.cand_held(t, m["side"], now_ts) or \
+                self.fair_held(t, now_ts):
             st["stale"] += 1
             return
         rec = {"ts": round(now_ts, 3), "mode": BACK_OF_LINE, "ticker": t,
@@ -33956,10 +34171,13 @@ class IncentiveMarketMaker:
             f"{'' if self.live else ' [DRY]'}")
 
     def cancel_market_orders(self, ticker: str, resting: List[dict]) -> int:
+        """Cancel our orders on `ticker` in `resting`; one this cycle already took
+        off (a breaker's or the fair hold's pull, mid-cycle) costs no second call."""
         n = 0
         for o in resting:
-            if o.get("ticker") == ticker and self.cancel_order(
-                    o.get("order_id", ""), reason="market_cancel"):
+            if o.get("ticker") == ticker \
+                    and o.get("order_id", "") not in self._cycle_cancelled \
+                    and self.cancel_order(o.get("order_id", ""), reason="market_cancel"):
                 n += 1
         return n
 
@@ -40559,6 +40777,8 @@ class IncentiveMarketMaker:
             self._ws_process_events(now_ts, in_cycle=True)
         except Exception as e:
             log(f"{self.tag} ! WS event handling failed: {e}")
+        if self._ws is None:
+            self._fair_hold_pull(now_ts)       # FAIR HOLD PULL with no feed
 
         positions = self.fetch_positions()
         # Post-wake grace: reads right after a sleep can SUCCEED with garbage
@@ -43864,6 +44084,10 @@ class IncentiveMarketMaker:
                        if not self.wave_held(q.ticker, q.book_side,
                                              q.price_exact if q.price_exact is not None
                                              else q.price_cents, now_ts)]
+        # ...and a live-fair underlying standing aside as a whole (FAIR HOLD PULL,
+        # 2026-11-15): a hold that began after its gate read the strike
+        if FAIR_HOLD_PULL and self._fair_holds(now_ts):
+            desired = [q for q in desired if not self.fair_held(q.ticker, now_ts)]
 
         # Fast tick: non-fast managed markets built no `desired` this tick —
         # preserve their resting orders through the diff or it would cancel
@@ -43942,6 +44166,9 @@ class IncentiveMarketMaker:
             if self.cand_held(q_am.ticker, q_am.book_side, time.time()):
                 self._cand_st["skipped_writes"] += 1
                 continue                   # the candidate breaker pulled it
+            if self.fair_held(q_am.ticker, time.time()):
+                self._fhp_st["skipped_writes"] += 1
+                continue                   # its live fair's underlying stands aside
             self.amend_order_inplace(o_am, q_am, now_ts)
         if len(to_amend) > MAX_PLACEMENTS_PER_CYCLE:
             log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
@@ -44303,7 +44530,9 @@ class IncentiveMarketMaker:
             held_sweep = self.sweep_held(self._event_of(q.ticker), time.time())
             held_cand = not held_sweep and \
                 self.cand_held(q.ticker, q.book_side, time.time())
-            if held_sweep or held_cand or \
+            held_fair = not (held_sweep or held_cand) and \
+                self.fair_held(q.ticker, time.time())
+            if held_sweep or held_cand or held_fair or \
                     self.group_held(q.ticker, q.book_side, time.time()):
                 # the breaker (or the group breaker, 2026-10-17) tripped after
                 # the cycle's diff: nothing new goes in before its hold ends,
@@ -44314,13 +44543,14 @@ class IncentiveMarketMaker:
                     pacer.wait()
                     if self.cancel_order(old_h, reason="sweep_breaker" if held_sweep
                                          else "cand_breaker" if held_cand
+                                         else "fair_hold" if held_fair
                                          else "group_breaker"):
                         self.state.cancelled_today += 1
                         cancelled_ids.add(old_h)
                     elif old_h in by_id:
                         total_resting += _count(by_id[old_h], 1)   # it still rests
                 (self._sweep if held_sweep else self._cand_st if held_cand
-                 else self._grp)["skipped_writes"] += 1
+                 else self._fhp_st if held_fair else self._grp)["skipped_writes"] += 1
                 continue
             if self._xp_waiting(q.ticker, time.time()):
                 # EXCHANGE PAUSE (2026-10-22): Kalshi refuses writes on this
@@ -44697,6 +44927,12 @@ class IncentiveMarketMaker:
                 tokens_per_sec=PULL_TOKENS_PER_SEC,
                 burst_tokens=PULL_BURST_TOKENS, max_secs=PULL_MAX_SECS,
                 cycle_batch=CYCLE_CANCEL_BATCH, off=self._bcx_off)
+            # the fair hold pull and the wave series groups (2026-11-15)
+            out["fair_hold_pull"] = dict(
+                self._fhp_st, on=FAIR_HOLD_PULL, recheck_s=FAIR_HOLD_RECHECK_SECS,
+                held_now=sorted(fair_underlying_holds(now)) if FAIR_HOLD_PULL else [])
+            out["group_breaker"]["wave_groups"] = WAVE_GROUPS
+            out["group_breaker"]["wave_series"] = len(PVD_GROUP_SERIES)
             # the tape trigger: other traders' sweeps (2026-11-01)
             tape = self._tape
             out["tape"] = dict(
@@ -47180,6 +47416,14 @@ class IncentiveMarketMaker:
                f"{PULL_BURST_TOKENS:g}-token burst (a cancel is "
                f"{CANCEL_TOKENS:g}), a breaker's pull at most {PULL_MAX_SECS:g} s"
                if PULL_BATCH > 1 else " go out one at a time (IMM_PULL_BATCH=1)"))
+        log(f"fair hold pull (2026-11-15): {'on' if FAIR_HOLD_PULL else 'off'}"
+            + (" -- a live-fair coin or FX / metals series in its jump hold or on a "
+               "stale read has every order on it pulled at once (the fast pull), "
+               "nothing new placed on it until it comes back" if FAIR_HOLD_PULL else
+               " -- the fair gates stand strikes aside one by one"))
+        log(f"wave series groups (2026-11-15): {'on' if WAVE_GROUPS else 'off'}"
+            + (" -- a wave series no group above covers (crypto coins, FX / metals, "
+               "politics) is its own group for the group breaker" if WAVE_GROUPS else ""))
         if TAPE_TRIGGER == "ab":
             _tape_how = (
                 f" -- THE LIVE A/B (2026-11-02): a taker of {TAPE_AB_MIN_CT:g}+ "

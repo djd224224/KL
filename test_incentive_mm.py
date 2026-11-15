@@ -285,6 +285,7 @@ def setUpModule():
     imm.PVD_MARKETS.clear()
     imm.PVD_REMOVED.clear()
     imm.PVD_NO_HALT_SERIES.clear()      # ...and its "no_halts" series (2026-11-07)
+    imm.PVD_GROUP_SERIES.clear()        # ...and the group breaker's wave series (2026-11-15)
     imm.PVD_EVENT_STOPS.clear()         # ...and its events' 3k cap (2026-11-07)
     imm.ELECTION_DATES_EXTRA[:] = []
     imm.AWARDS_DATES_EXTRA[:] = []
@@ -43753,6 +43754,21 @@ class TestPostVoteDeadBooks(unittest.TestCase):
         self.assertEqual(imm.PVD_NO_HALT_SERIES, set())
         self.assertFalse(imm.sweep_exempt(s) or imm.toxic_exempt(s))
 
+    def test_listed_series_join_the_group_breaker(self):
+        """WAVE SERIES GROUPS (Jack 2026-11-15: "build these to generalize into the
+        market-wave skill"): a listed series no risk group covers is its own group for
+        the group breaker -- but a "no_halts" one, which keeps no halts at all"""
+        s = self.T.split("-")[0]
+        self._write({self.T: {"bid_max": 40, "ask_min": 60},
+                     "KXOTHER-99DEC31-A": {"bid_max": 40, "ask_min": 60, "no_halts": True}})
+        self.assertEqual(imm.PVD_GROUP_SERIES, {s})
+        self.assertEqual(imm.breaker_group_of(self.T), f"wave {s}")
+        self.assertIsNone(imm.risk_group(self.T))            # the risk pass and tape: as before
+        self.assertIsNone(imm.breaker_group_of("KXOTHER-99DEC31-A"))
+        self._write({})
+        self.assertEqual(imm.PVD_GROUP_SERIES, set())
+        self.assertIsNone(imm.breaker_group_of(self.T))
+
     def test_a_market_s_own_price_band(self):
         """Jack 2026-11-04: "also remove the range cap on these" -- an entry's
         price_min / price_max replaces the 3-97c band for that market only"""
@@ -45667,6 +45683,271 @@ class TestCryptoOpenFamily(unittest.TestCase):
         self.assertEqual(rest, [])
         self.assertTrue(any("'crypto_budget'" in s_ for s_ in lines if "universe:" in s_),
                         [s_ for s_ in lines if "universe:" in s_][-2:])
+
+
+class TestWaveSeriesGroups(unittest.TestCase):
+    """WAVE SERIES GROUPS (Jack 2026-11-15: "build these to generalize into the market-wave
+    skill"): a wave series no risk_group covers -- a crypto coin's strike ladder here -- is
+    its own group for the group breaker: 200+ fills on one side in two of its events inside
+    10 min hold that side of the whole series 20 min."""
+    A = "KXBTCEVENT-17NOV260930-T7000000"
+    B = "KXBTCEVENT-18NOV261430-T7000000"
+    A2 = "KXBTCEVENT-17NOV260930-T7100000"      # A's event, another strike
+    C = "KXETHEVENT-17NOV260930-T200000"        # another coin
+
+    def setUp(self):
+        _clean_persist()
+        imm._risk_group_memo.clear()
+        self.addCleanup(imm._risk_group_memo.clear)
+        saved = (set(imm.PVD_GROUP_SERIES), set(imm.PVD_NO_HALT_SERIES))
+
+        def restore():
+            for live, was in zip((imm.PVD_GROUP_SERIES, imm.PVD_NO_HALT_SERIES), saved):
+                live.clear()
+                live.update(was)
+        self.addCleanup(restore)
+        imm.PVD_GROUP_SERIES.clear()
+        imm.PVD_GROUP_SERIES.update({"KXBTCEVENT", "KXETHEVENT"})
+        imm.PVD_NO_HALT_SERIES.clear()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 120.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "off"), ("SWEEP_GROUP", "on"),
+                        ("SWEEP_GROUP_WINDOW_SECS", 600.0),
+                        ("SWEEP_GROUP_HOLD_SECS", 1200.0), ("SWEEP_GROUP_MIN_CT", 200.0),
+                        ("SWEEP_GROUP_MIN_EVENTS", 2), ("CAND_BREAKER", "off"),
+                        ("WAVE_BREAKER", "off"), ("FAIR_HOLD_PULL", False)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.bot._resting_view = {
+            t: [{"order_id": f"{t[-12:]}-{s}", "side": s,
+                 "px": 40.0 if s == "bid" else 45.0, "rem": 1000.0,
+                 "placed": self.now - 60, "pad": False} for s in ("bid", "ask")]
+            for t in (self.A, self.B, self.A2, self.C)}
+        self.bot._last_panel = {t: {"est_frac": 0.1, "pool_per_day": 20.0}
+                                for t in self.bot._resting_view}
+        self.n = 0
+
+    def _fill(self, dt, t, side="bid", count=250.0):
+        """A partial maker fill on our `side` order of `t`, dt s after now."""
+        oid = next(o["order_id"] for o in self.bot._resting_view[t] if o["side"] == side)
+        self.n += 1
+        self.feed.events = [("fill", {"order_id": oid, "market_ticker": t,
+                                      "count_fp": f"{count:.2f}", "is_taker": False,
+                                      "ts_ms": int((self.now + dt) * 1000),
+                                      "trade_id": f"tr{self.n}"})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _trips(self):
+        return [r for n, r in self.recs if n == "ws_group" and r["ev"] == "trip"]
+
+    def test_a_wave_series_is_its_own_group_for_the_breaker_only(self):
+        self.assertEqual(imm.breaker_group_of(self.A), "wave KXBTCEVENT")
+        self.assertEqual(imm.breaker_group_of(self.C), "wave KXETHEVENT")
+        self.assertIsNone(imm.risk_group(self.A))           # the risk pass / tape: unchanged
+        self.assertIsNone(imm.breaker_group_of("KXOTHER-99DEC31-A"))   # not on the list
+        nfl = "KXNFLLADDERRECYDS-26OCT19DALWSH-DALCLAMB88"
+        imm.PVD_GROUP_SERIES.add("KXNFLLADDERRECYDS")
+        self.assertEqual(imm.breaker_group_of(nfl), "NFL game 26OCT19DALWSH")   # its own wins
+        with mock.patch.object(imm, "WAVE_GROUPS", False):
+            self.assertIsNone(imm.breaker_group_of(self.A))
+        imm.PVD_NO_HALT_SERIES.add("KXBTCEVENT")            # no halts there: no group either
+        imm._risk_group_memo.clear()
+        self.assertIsNone(imm.breaker_group_of(self.A))
+
+    def test_two_events_of_a_coin_trip_and_hold_that_side_of_the_coin(self):
+        self._fill(0, self.A)
+        self._fill(60, self.C)                     # another coin: no trip
+        self.assertEqual(self._trips(), [])
+        self._fill(120, self.B)                    # the coin's 2nd event trips
+        trip, = self._trips()
+        self.assertEqual((trip["group"], trip["side"], trip["mode"]), ("wave KXBTCEVENT", "bid", "on"))
+        self.assertEqual(sorted(o for o, r in self.cancelled if r == "group_breaker"),
+                         sorted(t[-12:] + "-bid" for t in (self.A, self.B, self.A2)))
+        self.assertTrue(self.bot.group_held(self.A2, "bid", self.now + 121))
+        self.assertFalse(self.bot.group_held(self.A2, "ask", self.now + 121))
+        self.assertFalse(self.bot.group_held(self.C, "bid", self.now + 121))
+        self.assertFalse(self.bot.group_held(self.A, "bid", self.now + 120 + 1201))
+
+    def test_one_event_or_small_fills_never_trip(self):
+        self._fill(0, self.A)
+        self._fill(30, self.A2)                    # the same event
+        self._fill(60, self.B, count=150.0)        # under 200
+        self.assertEqual(self._trips(), [])
+
+
+class TestFairHoldPull(unittest.TestCase):
+    """FAIR HOLD PULL (Jack 2026-11-15: "build these to generalize into the market-wave
+    skill"): a live-fair coin or FX series in its jump hold, or on a stale read, has every
+    order on it pulled at once at the feed's look -- not strike by strike as the quote loop
+    reaches it (BTC's 02:05:48Z hold: 128 orders over 95 s) -- and nothing new placed on it
+    until it comes back."""
+    BTC1 = "KXBTCEVENT-17NOV260930-T7000000"
+    BTC2 = "KXBTCEVENT-18NOV261430-T6500000"
+    ETH = "KXETHEVENT-17NOV260930-T200000"
+    EUR = "KXEURUSDEVENT-17NOV261000-T11650"
+    OTHER = "KXHIGHNY-26NOV15-B60"
+
+    def setUp(self):
+        _clean_persist()
+        for name, v in (("crypto_event_series", lambda s: s in ("KXBTCEVENT", "KXETHEVENT")),
+                        ("CRYPTO_EVENT_FAIR", True), ("FX_EVENT_FAIR", True),
+                        ("FAIR_HOLD_PULL", True), ("WS_MODE", "off")):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(imm._crypto_event_state.update, snap=None)
+        self.addCleanup(imm._fx_event_state.update, snap=None)
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.refuse = set()
+
+        def cancel(oid, reason=""):
+            self.cancelled.append((oid, reason))
+            if oid in self.refuse:
+                return False
+            self.bot.state.ledger.pop(oid, None)
+            return True
+        self.bot.cancel_order = cancel
+        self.bot._resting_view = {
+            t: [{"order_id": f"{t}-{s}", "side": s, "px": 40.0 if s == "bid" else 45.0,
+                 "rem": 300.0, "placed": self.now - 60, "pad": False} for s in ("bid", "ask")]
+            for t in (self.BTC1, self.BTC2, self.ETH, self.EUR, self.OTHER)}
+        # placed since the cycle's view: only the ledger has it
+        self.bot.state.ledger["new-btc"] = {"ticker": self.BTC2, "book_side": "bid",
+                                            "yes_price": 30, "remaining_count": 300.0}
+        self._snaps()
+
+    def _snaps(self, btc_hold=None, eth_age=5.0, eur_hold=None, eur_age=5.0, no_ts=False):
+        now = self.now
+        imm._crypto_event_state["snap"] = {"checked_ts": now, "markets": {}, "assets": {
+            "BTC": {"spot": 65000.0, "spot_ts": None if no_ts else now - 5.0,
+                    "hold_until": btc_hold},
+            "ETH": {"spot": 1800.0, "spot_ts": now - eth_age, "hold_until": None}}}
+        imm._fx_event_state["snap"] = {"checked_ts": now, "markets": {}, "series": {
+            "KXEURUSDEVENT": {"mid": 1.16, "mid_ts": now - eur_age, "hold_until": eur_hold,
+                              "err": None},
+            "KXUSDJPYEVENT": {"mid": 155.0, "mid_ts": now - 5.0, "hold_until": None,
+                              "err": None}}}
+        self.bot._fhp_cache = None
+
+    def _pulled(self):
+        return sorted(o for o, r in self.cancelled if r == "fair_hold")
+
+    def test_holds_are_the_two_whole_underlying_reasons(self):
+        self._snaps(btc_hold=self.now + 300, eth_age=imm.CRYPTO_EVENT_TTL_SECS + 10,
+                    eur_hold=self.now + 120)
+        h = imm.fair_underlying_holds(self.now)
+        self.assertEqual(sorted(h), ["crypto BTC", "crypto ETH", "fx KXEURUSDEVENT"])
+        self.assertIn("jump hold", h["crypto BTC"])
+        self.assertIn("s old", h["crypto ETH"])
+        self._snaps(eur_age=imm.FX_EVENT_TTL_SECS + 10)
+        self.assertEqual(sorted(imm.fair_underlying_holds(self.now)), ["fx KXEURUSDEVENT"])
+        self._snaps(no_ts=True)                  # a read with no time: left to the gate
+        self.assertEqual(imm.fair_underlying_holds(self.now), {})
+        self._snaps(btc_hold=self.now - 1)       # a hold that ran out
+        self.assertEqual(imm.fair_underlying_holds(self.now), {})
+        imm._crypto_event_state["snap"] = None
+        imm._fx_event_state["snap"] = None
+        self.assertEqual(imm.fair_underlying_holds(self.now), {})
+
+    def test_the_underlying_of_a_strike(self):
+        self.assertEqual(imm.fair_underlying_of(self.BTC1), "crypto BTC")
+        self.assertEqual(imm.fair_underlying_of(self.ETH), "crypto ETH")
+        self.assertEqual(imm.fair_underlying_of(self.EUR), "fx KXEURUSDEVENT")
+        self.assertIsNone(imm.fair_underlying_of(self.OTHER))
+
+    def test_a_coin_hold_pulls_all_of_that_coin_at_once(self):
+        self._snaps(btc_hold=self.now + 300)
+        self.bot._fair_hold_pull(self.now)
+        want = sorted([f"{t}-{s}" for t in (self.BTC1, self.BTC2) for s in ("bid", "ask")]
+                      + ["new-btc"])
+        self.assertEqual(self._pulled(), want)
+        rec, = [r for n, r in self.recs if n == "fair_hold"]
+        self.assertEqual((rec["ev"], rec["underlying"], rec["orders"], rec["cancelled"],
+                          rec["markets"]), ("pull", "crypto BTC", 5, 5, 2))
+        self.assertEqual(self.bot._fhp_st["episodes"], 1)
+        self.assertTrue(self.bot.fair_held(self.BTC1, self.now))
+        self.assertFalse(self.bot.fair_held(self.ETH, self.now))
+        self.assertFalse(self.bot.fair_held(self.OTHER, self.now))
+
+    def test_once_an_episode_then_only_what_rests_again(self):
+        self._snaps(btc_hold=self.now + 300)
+        self.bot._fair_hold_pull(self.now)
+        n = len(self.cancelled)
+        self.bot._fair_hold_pull(self.now + 1.0)          # inside the recheck: no look
+        self.assertEqual(len(self.cancelled), n)
+        self.bot.state.ledger["newer-btc"] = {"ticker": self.BTC1, "book_side": "ask",
+                                              "yes_price": 60, "remaining_count": 100.0}
+        self.bot._fhp_cache = None
+        self.bot._fair_hold_pull(self.now + 3.0)          # placed since: pulled again
+        self.assertEqual(self.cancelled[n:], [("newer-btc", "fair_hold")])
+        rec = [r for nm, r in self.recs if nm == "fair_hold"][-1]
+        self.assertEqual((rec["ev"], rec["orders"]), ("repull", 1))
+        self.assertEqual((self.bot._fhp_st["episodes"], self.bot._fhp_st["repulls"]), (1, 1))
+
+    def test_a_refused_cancel_waits_10s_for_its_next_try(self):
+        self._snaps(btc_hold=self.now + 300)
+        self.refuse = {f"{self.BTC1}-bid"}
+        self.bot._fair_hold_pull(self.now)
+        n = len(self.cancelled)
+        self.bot._fhp_cache = None
+        self.bot._fair_hold_pull(self.now + 3.0)
+        self.assertEqual(len(self.cancelled), n)          # tried 3 s ago: it waits
+        self.bot._fhp_cache = None
+        self.bot._fair_hold_pull(self.now + 11.0)
+        self.assertEqual(self.cancelled[n:], [(f"{self.BTC1}-bid", "fair_hold")])
+
+    def test_the_episode_ends_with_its_hold(self):
+        self._snaps(btc_hold=self.now + 60)
+        self.bot._fair_hold_pull(self.now)
+        self._snaps()                                     # back
+        self.bot._fair_hold_pull(self.now + 61)
+        self.assertEqual(self.bot._fhp_ep, {})
+        self.assertFalse(self.bot.fair_held(self.BTC1, self.now + 61))
+
+    def test_a_stale_fx_series_pulls_its_strikes(self):
+        self._snaps(eur_age=imm.FX_EVENT_TTL_SECS + 30)
+        self.bot._fair_hold_pull(self.now)
+        self.assertEqual(self._pulled(), [f"{self.EUR}-ask", f"{self.EUR}-bid"])
+
+    def test_off_pulls_nothing_and_holds_nothing(self):
+        self._snaps(btc_hold=self.now + 300)
+        with mock.patch.object(imm, "FAIR_HOLD_PULL", False):
+            self.bot._fhp_cache = None
+            self.bot._fair_hold_pull(self.now)
+            self.assertFalse(self.bot.fair_held(self.BTC1, self.now))
+        self.assertEqual(self.cancelled, [])
+
+    def test_the_feed_s_look_runs_it(self):
+        self._snaps(btc_hold=self.now + 300)
+        self.bot._ws = _FakeFeed()
+        self.bot._ws_process_events(self.now)
+        self.assertEqual(len(self._pulled()), 5)
+
+    def test_cancel_market_orders_skips_what_this_cycle_cancelled(self):
+        resting = [{"ticker": self.BTC1, "order_id": "a"}, {"ticker": self.BTC1, "order_id": "b"}]
+        self.bot._cycle_cancelled.add("a")
+        self.assertEqual(self.bot.cancel_market_orders(self.BTC1, resting), 1)
+        self.assertEqual(self.cancelled, [("b", "market_cancel")])
+
+    def test_both_are_on_by_default(self):
+        src = open(imm.__file__, encoding="utf-8").read()
+        for want in ('os.environ.get("IMM_FAIR_HOLD_PULL", "on")',
+                     'os.environ.get("IMM_WAVE_GROUPS", "on")'):
+            self.assertIn(want, src)
 
 
 class TestCryptoEventFair(unittest.TestCase):
