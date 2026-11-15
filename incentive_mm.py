@@ -2476,9 +2476,41 @@ def ca_category(series: str) -> Optional[str]:
     return None
 
 
+# CARBON ARC AD SPEND AT 1x ON SATURDAY MORNING (Jack 2026-11-15: "take carbon
+# arc ad spend off saturday morning 8x"). Sat 11/14 06:14-08:50 ET six ad-spend
+# rungs of 160-200 lots (x2 Saturday x the Saturday-morning x4, then the 1.5x
+# boosts to the 200 cap) filled 1,040 contracts for -$134, 4.4-7 h after the
+# 01:49 ET read: past the 60-min post-read hold and past the advertising
+# landing window, which ends 10:00Z (05:00 ET in EST). The categories listed
+# here are at 1x -- no hour / Saturday / yield / near-cliff boost, the landing
+# window's treatment -- in the global window's morning hours (0-8 ET) of every
+# Saturday ET day, the hours global_hour_mults puts at SAT_QUIET_HOUR_MULT.
+# The rest of Saturday keeps the Saturday x2. IMM_CA_SAT_AM_1X_CATS: comma
+# list of prism categories (lowercased); empty = off.
+CA_SAT_AM_1X_CATS: Tuple[str, ...] = tuple(sorted({
+    c.strip().lower()
+    for c in os.environ.get("IMM_CA_SAT_AM_1X_CATS", "advertising").split(",")
+    if c.strip()}))
+
+
+def ca_saturday_morning_1x(series: str, now_utc: datetime) -> bool:
+    """True while `series` is a Carbon Arc series of a CA_SAT_AM_1X_CATS
+    category in a Saturday ET morning hour of the global window (0-8 ET)."""
+    if not CA_SAT_AM_1X_CATS:
+        return False
+    et = now_utc.astimezone(ET)
+    if et.weekday() != 5 or et.hour >= 12 or et.hour not in global_hour_mults(et.date()):
+        return False
+    return ca_category(series) in CA_SAT_AM_1X_CATS
+
+
 def ca_landing_window(series: str, now_utc: datetime) -> bool:
     """True while `series` is a Carbon Arc series inside its category's data
-    landing window (CA_LANDING_WINDOWS, UTC hours)."""
+    landing window (CA_LANDING_WINDOWS, UTC hours) -- or, for ad spend, in a
+    Saturday morning hour (ca_saturday_morning_1x): the hours a Carbon Arc
+    market rests at 1x."""
+    if ca_saturday_morning_1x(series, now_utc):
+        return True
     if not CA_LANDING_WINDOWS:
         return False
     cat = ca_category(series)
@@ -14654,6 +14686,7 @@ _CONFIG_CODE_KNOBS = (
     "CA_FAIR_SIGMA_LO_FRAC", "CA_FAIR_MAX_REL_SIGMA", "CA_FAIR_REFRESH_HOLD_MIN",
     "CA_FAIR_REL_SIGMA_EXEMPT", "CA_FAIR_REFRESH_HOLD_BY_CAT",   # ADS / apps (2026-10-10)
     "CA_LANDING_WINDOWS",          # Carbon Arc 1x while data lands (2026-10-10)
+    "CA_SAT_AM_1X_CATS",           # ...and ad spend 1x on Saturday morning (2026-11-15)
     "CA_LATE_TOXIC_SIDE_BY_CAT",   # late-month blocked side per category (2026-10-11)
     # the scheduled-data stand-aside (2026-10-15)
     "CA_SCHEDULE_HOLD", "CA_SCHEDULE_HOLD_CATS", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
@@ -47047,6 +47080,10 @@ class IncentiveMarketMaker:
                     + "; ".join(f"{c} " + "+".join(f"{a:02d}-{b:02d}h" for a, b in w)
                                 for c, w in sorted(CA_LANDING_WINDOWS.items()))
                     + " UTC -- no hour / Saturday / yield / near-cliff boost inside")
+            if CA_SAT_AM_1X_CATS:
+                log("ca 1x on Saturday morning (2026-11-15): "
+                    + ", ".join(CA_SAT_AM_1X_CATS)
+                    + " at 1x in the Saturday 0-8 ET quiet hours (was x8)")
         if CA_LATE_SIZE_MULT < 1.0 or CA_LATE_TOXIC_MULT < 1.0:
             _blk: Dict[str, List[str]] = {}
             for _c, _s in sorted(CA_LATE_TOXIC_SIDE_BY_CAT.items()):

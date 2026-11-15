@@ -13104,6 +13104,36 @@ class TestCarbonArcFairGate(unittest.TestCase):
                           (12, True), (16, False)):
             self.assertEqual(imm.ca_landing_window("KXFAKECC", self._et(h)), inside, h)
 
+    def test_ad_spend_is_1x_on_saturday_morning(self):
+        # Jack 2026-11-15: "take carbon arc ad spend off saturday morning 8x" --
+        # Sat 11/14 06:14-08:50 ET six ad-spend rungs of 160-200 lots filled,
+        # past the advertising window's 10:00Z (05:00 ET) end
+        self._write_fair({"KXFAKECC": dict(self._entry(100.0), category="Advertising")})
+        sat = lambda h, m=0: imm.ET.localize(datetime(2026, 11, 14, h, m)).astimezone(timezone.utc)
+        fri = imm.ET.localize(datetime(2026, 11, 13, 6, 14)).astimezone(timezone.utc)
+        with mock.patch.object(imm, "HOUR_SIZE_MULTS", {h: 3.0 for h in range(9)}), \
+                mock.patch.object(imm, "HOUR_SIZE_MULTS_NEXT", {}):
+            for h, inside in ((0, True), (5, True), (6, True), (8, True), (9, False), (14, False)):
+                self.assertEqual(imm.ca_saturday_morning_1x("KXFAKECC", sat(h)), inside, h)
+            self.assertFalse(imm.ca_saturday_morning_1x("KXFAKECC", fri))     # Friday
+            self.assertTrue(imm.ca_landing_window("KXFAKECC", sat(6, 14)))    # 11:14Z
+            with mock.patch.object(imm, "CA_SAT_AM_1X_CATS", ()):              # off
+                self.assertFalse(imm.ca_landing_window("KXFAKECC", sat(6, 14)))
+            with mock.patch.object(imm, "_hour_window_mult", lambda s, now: 4.0), \
+                    mock.patch.object(imm, "saturday_size_mult", lambda s, now: 2.0):
+                self.assertEqual(imm.hour_size_mult("KXFAKECC", sat(5, 30)), 1.0)
+                # another category keeps its Saturday morning (10:30Z is
+                # outside the point-of-sale window too)
+                self._write_fair({"KXFAKECC": dict(self._entry(100.0), category="Point of Sale",
+                                                   mu=100.5)})
+                self.assertFalse(imm.ca_saturday_morning_1x("KXFAKECC", sat(5, 30)))
+                self.assertEqual(imm.hour_size_mult("KXFAKECC", sat(5, 30)), 8.0)
+        # no global quiet window, no Saturday morning
+        with mock.patch.object(imm, "HOUR_SIZE_MULTS", {}), \
+                mock.patch.object(imm, "HOUR_SIZE_MULTS_NEXT", {}):
+            self._write_fair({"KXFAKECC": dict(self._entry(100.0), category="Advertising", mu=101)})
+            self.assertFalse(imm.ca_saturday_morning_1x("KXFAKECC", sat(6)))
+
     def test_the_windows_keep_their_utc_hours_across_the_clock_change(self):
         # Jack 2026-11-01: "Yes, both" -- Carbon Arc publishes on fixed UTC
         # hours (POS 11:27Z on 10/30 and on 11/01), so the windows are UTC: the
