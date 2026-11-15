@@ -76,6 +76,14 @@ imm.YIELD_SIZE_MULT = 1.0
 # arms it explicitly.
 _SAT_AM_CODE_DEFAULT = (imm.SAT_QUIET_HOUR_MULT, imm.SAT_QUIET_HOUR_MULT_FROM)
 imm.SAT_QUIET_HOUR_MULT = 0.0
+# EARN ONLY (Jack 2026-11-15, the quote loop's last step) drops every rung the
+# program's walk would not pay. The suite's default ladder (IMM_LEVELS
+# 0:5,1:10,2:20, offsets mode: rungs a tick behind the reference; live runs
+# 0:20 at the reference) parks its deeper rungs past the walk of the small
+# fixture books, so the suite judges each feature on the ladder as built.
+# TestEarningOnlyQuotes and TestSnowDaysLoop arm it.
+_EARN_ONLY_CODE_DEFAULT = imm.EARN_ONLY_MODE
+imm.EARN_ONLY_MODE = "off"
 # ...and the Saturday per-market cap (2026-10-30), so a suite run on a
 # Saturday sees the caps it does on any other day. TestSaturdayPositionCap
 # arms it explicitly.
@@ -46460,6 +46468,10 @@ class TestSnowDaysLoop(TestSnowDaysGate):
     def setUp(self):
         super().setUp()
         _clean_persist()
+        # the live default (the suite turns it off, see _EARN_ONLY_CODE_DEFAULT)
+        p = mock.patch.object(imm, "EARN_ONLY_MODE", _EARN_ONLY_CODE_DEFAULT)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _cycle(self, yes=(("0.01", "5000"),), no=(("0.01", "5000"),), p=0.44):
         self._write(p=p)
@@ -46523,3 +46535,166 @@ class TestSnowDaysLoop(TestSnowDaysGate):
                         [s_ for s_ in lines if self.T in s_][-8:])
         self.assertEqual([o for o in bot.state.sim_orders.values() if o["ticker"] == self.T
                           and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS], [])
+
+    def _rest(self, bot):
+        return sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                      for o in bot.state.sim_orders.values() if o["ticker"] == self.T
+                      and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+
+    def test_a_side_the_caps_push_out_of_the_walk_does_not_rest(self):
+        # Jack 2026-11-15: "KXSNOWDAYS-01DEC26-01APR27 is placing contracts
+        # that arent earning". A 40c x 1,500 bid (inside the 44c fair + 10,
+        # so no stand-aside) leaves the bid capped at 34c 1,500 contracts
+        # behind the touch, past the 1,000-contract walk: it earns nothing
+        # and does not rest (EARN ONLY). The ask, alone ahead of the 99c
+        # wall, does.
+        bot, rest, lines = self._cycle()
+        self.assertEqual({side for side, _px, _n in rest}, {"bid", "ask"}, rest)
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "5000"], ["0.40", "1500"]],
+            "no_dollars": [["0.01", "5000"]]}}
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        rest = self._rest(bot)
+        self.assertEqual({side for side, _px, _n in rest}, {"ask"}, rest)
+        self.assertTrue(all(px >= 54 for _side, px, _n in rest), rest)
+        self.assertTrue(any(f"earn-only {self.T}: not resting bid" in s_ and "past the walk" in s_
+                            for s_ in lines), [s_ for s_ in lines if self.T in s_][-8:])
+        self.assertTrue(any("earn-only:" in s_ and "not resting" in s_ for s_ in lines),
+                        [s_ for s_ in lines if "earn-only" in s_])
+        # the touch backs off under the cap: the 34c bid leads it and rests again
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "5000"], ["0.30", "1500"]],
+            "no_dollars": [["0.01", "5000"]]}}
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        rest = self._rest(bot)
+        self.assertEqual({side for side, _px, _n in rest}, {"bid", "ask"}, rest)
+        # neither side in the walk: nothing rests at all
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "5000"], ["0.40", "1500"]],
+            "no_dollars": [["0.01", "5000"], ["0.50", "1500"]]}}
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        self.assertEqual(self._rest(bot), [])
+        # IMM_EARN_ONLY=dry: logged, and everything rests as built
+        with mock.patch.object(imm, "EARN_ONLY_MODE", "dry"):
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                self._write()
+                bot.run_cycle()
+        self.assertEqual({side for side, _px, _n in self._rest(bot)}, {"bid", "ask"})
+        self.assertTrue(any("earn-only (dry: rested anyway):" in s_ for s_ in lines),
+                        [s_ for s_ in lines if "earn-only" in s_])
+
+    def test_a_short_position_keeps_its_non_earning_bid_as_the_unwind(self):
+        # "unless purposefully unwinding": short 25, the bid reduces it. Behind
+        # the 40c x 1,500 pile it earns nothing, yet 25 of it rests -- the
+        # position, no more
+        bot, rest, lines = self._cycle()
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "5000"], ["0.40", "1500"]],
+            "no_dollars": [["0.01", "5000"]]}}
+        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = -25.0, 39.8
+        bot.client.positions[self.T] = -25.0
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        rest = self._rest(bot)
+        bids = [(px, n) for side, px, n in rest if side == "bid"]
+        self.assertEqual(sum(n for _px, n in bids), 25, rest)
+        self.assertTrue(all(px <= 34 for px, _n in bids), rest)
+        self.assertTrue(any(f"earn-only {self.T}:" in s_ and "kept as the unwind of -25" in s_
+                            for s_ in lines), [s_ for s_ in lines if self.T in s_][-8:])
+
+
+class TestEarningOnlyQuotes(unittest.TestCase):
+    """earning_only_quotes (EARN ONLY, Jack 2026-11-15: "fix all gates.
+    unless purposefully unwinding, no IMM should quote without earning")."""
+
+    T = "KXEARNONLY-26DEC31-A"
+
+    def f(self, qs, yes, no, own=(), pos=0.0, target=1000.0):
+        kept, info = imm.earning_only_quotes(qs, yes, no, list(own), target, pos)
+        return [(q.book_side, q.price_cents, q.count) for q in kept], info
+
+    def test_a_rung_behind_the_walk_goes_one_in_it_stays(self):
+        Q, T = imm.Quote, self.T
+        yes, no = [[29, 1617.0], [20, 3000.0]], [[60, 2000.0]]
+        kept, info = self.f([Q(T, "bid", 15, 40), Q(T, "ask", 35, 40)], yes, no)
+        self.assertEqual(kept, [("ask", 35, 40)])          # NO bid 65 leads the 60s
+        self.assertEqual(info["dropped"], [("bid", 15.0, 40)])
+        self.assertEqual(info["short"], [])
+        # joining the 29c pile shares a level the walk reaches: it earns
+        kept, _ = self.f([Q(T, "bid", 29, 40)], yes, no)
+        self.assertEqual(kept, [("bid", 29, 40)])
+        # a ladder keeps the rungs the walk reaches, drops the deeper ones;
+        # our own rungs in front take walk room too
+        kept, info = self.f([Q(T, "bid", 30, 200), Q(T, "bid", 29, 200), Q(T, "bid", 28, 200)],
+                            [[29, 900.0], [20, 3000.0]], no)
+        self.assertEqual(kept, [("bid", 30, 200), ("bid", 29, 200)])   # 1,300 ahead of 28
+        self.assertEqual(info["dropped"], [("bid", 28.0, 200)])
+
+    def test_a_book_side_under_the_target_pays_nobody(self):
+        Q, T = imm.Quote, self.T
+        kept, info = self.f([Q(T, "bid", 30, 100), Q(T, "ask", 40, 100)],
+                            [[29, 5000.0]], [[61, 500.0]])
+        self.assertEqual(kept, [])
+        self.assertEqual(info["short"], ["ask"])
+        # our own size can lift the short side to the target
+        kept, info = self.f([Q(T, "bid", 30, 100), Q(T, "ask", 40, 500)],
+                            [[29, 5000.0]], [[61, 500.0]])
+        self.assertEqual(kept, [("bid", 30, 100), ("ask", 40, 500)])
+
+    def test_our_resting_orders_are_netted_out_at_exact_prices(self):
+        Q, T = imm.Quote, self.T
+        # 15.20 x 1,450 in front of 14.60: of it, ours is netted out
+        yes, no = [[15.2, 1450.0], [14.6, 800.0]], [[83.0, 5000.0]]
+        kept, _ = self.f([Q(T, "bid", 14, 200, price_exact=14.6)], yes, no)
+        self.assertEqual(kept, [])
+        kept, _ = self.f([Q(T, "bid", 14, 200, price_exact=14.6)], yes, no,
+                         own=[("bid", 15.2, 400.0)])
+        self.assertEqual(kept, [])                         # 1,050 still in front
+        kept, _ = self.f([Q(T, "bid", 14, 200, price_exact=14.6)], yes, no,
+                         own=[("bid", 15.2, 500.0)])
+        self.assertEqual(kept, [("bid", 14, 200)])        # 950 in front
+
+    def test_pads_rest_only_beside_an_earning_rung(self):
+        Q, T = imm.Quote, self.T
+        pad = Q(T, "bid", 1, 1000, is_pad=True)
+        yes, no = [[29, 1617.0]], [[60, 2000.0]]
+        kept, _ = self.f([Q(T, "bid", 15, 40), pad], yes, no)
+        self.assertEqual(kept, [])
+        kept, _ = self.f([Q(T, "bid", 15, 40), Q(T, "ask", 35, 40), pad], yes, no)
+        self.assertEqual(kept, [("ask", 35, 40)])          # the pad is behind the walk
+        kept, _ = self.f([Q(T, "bid", 30, 40), Q(T, "bid", 1, 700, is_pad=True)],
+                         [[29, 300.0]], [[60, 2000.0]])
+        self.assertEqual(kept, [("bid", 30, 40), ("bid", 1, 700)])   # the pad qualifies the side
+
+    def test_the_unwind_rests_up_to_the_uncovered_position(self):
+        Q, T = imm.Quote, self.T
+        yes, no = [[29, 1617.0]], [[60, 2000.0]]
+        qs = [Q(T, "bid", 15, 40), Q(T, "bid", 12, 40), Q(T, "ask", 35, 40)]
+        # short 50: the bids reduce it -- 40 @ 15 (best first) + 10 @ 12
+        kept, info = self.f(qs, yes, no, pos=-50.0)
+        self.assertEqual(kept, [("bid", 15, 40), ("bid", 12, 10), ("ask", 35, 40)])
+        self.assertEqual(info["unwind"], [("bid", 15.0, 40), ("bid", 12.0, 10)])
+        self.assertEqual(info["dropped"], [("bid", 12.0, 30)])
+        # long 50: the asks reduce it, and the earning ask covers 40 of it --
+        # the non-earning bids add to the position and go
+        kept, info = self.f(qs, yes, no, pos=50.0)
+        self.assertEqual(kept, [("ask", 35, 40)])
+        self.assertEqual(info["unwind"], [])
+        # a book side under the target: only the unwind rests
+        kept, info = self.f(qs, yes, [[60, 100.0]], pos=-30.0)
+        self.assertEqual(kept, [("bid", 15, 30)])
+        self.assertEqual(info["short"], ["ask"])
+        # flat (under one contract): nothing to unwind
+        kept, _ = self.f(qs, yes, no, pos=-0.4)
+        self.assertEqual(kept, [("ask", 35, 40)])
+

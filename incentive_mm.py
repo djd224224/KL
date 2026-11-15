@@ -22187,6 +22187,107 @@ def drop_unearning_sides(quotes: List["Quote"], yes_levels: List[List[float]],
             if q.is_pad or earns.get(q.book_side) is not False]
 
 
+# EARN ONLY, BOT-WIDE (Jack 2026-11-15: "fix all gates. unless purposefully
+# unwinding, no IMM should quote without earning"). Found on KXSNOWDAYS: the
+# snow-day gate caps its rungs last (10c clear of the fair), and once other
+# makers piled 200k+ a side in, every market's capped side sat 1,500-5,500
+# contracts behind the touch, past the program's 1,000-contract walk -- 16
+# orders earning nothing. The mortgage, Zillow home, crypto event, FX event
+# and Pokemon gates cap the same way, and only the NFL prop and Carbon Arc
+# gates re-checked after their caps. So the quote loop's very LAST step,
+# after every gate, cap, guard, offset and the twin check, judges each rung
+# on the program's own walk (earning_only_quotes): the external book (our
+# resting orders netted out) with every desired rung overlaid. A rung earns
+# iff BOTH sides of the book reach the target -- a snapshot with one short
+# side counts for nobody (estimate_reward_share) -- and the depth strictly in
+# front of it is under the target (a rung joining a level the walk reaches
+# shares it). A rung that does not earn does not rest; a pad rests only
+# while some non-pad rung earns. THE UNWIND: on the side that reduces the
+# bot's own position, rungs that do not earn may still rest, best price
+# first, up to the part of the position the earning rungs on that side leave
+# uncovered -- the closes, breakeven offsets, unwind-only, wave and cheap-
+# side unwinds all quote that side, sized to the position. Logs: `earn-only
+# <t>: not resting ...` when a market's dropped set changes (at most
+# EARN_ONLY_LOG_MAX a cycle) and one `earn-only:` total per full cycle.
+# IMM_EARN_ONLY: on (default) | dry (log what it would drop, rest it all) |
+# off.
+EARN_ONLY_MODE = os.environ.get("IMM_EARN_ONLY", "on").strip().lower()
+EARN_ONLY_LOG_MAX = _env_int("IMM_EARN_ONLY_LOG_MAX", 25)
+
+
+def earning_only_quotes(quotes: List["Quote"], yes_levels: List[List[float]],
+                        no_levels: List[List[float]],
+                        own_in_book: List[Tuple[str, float, float]],
+                        target: float, own_pos: float = 0.0
+                        ) -> Tuple[List["Quote"], Dict[str, list]]:
+    """(kept, info): `quotes` minus every rung the program's walk would not
+    pay, but for the unwind (see EARN ONLY above). yes_levels / no_levels:
+    [price in cents, size] (whole cents or exact) INCLUDING our resting
+    orders, which own_in_book (book side, YES price in cents, size) nets
+    out. own_pos: the bot's YES position in the market. info: "dropped" and
+    "unwind" as [(book side, YES price, contracts)], "short" the book sides
+    under the target (the snapshot then pays nobody)."""
+    info: Dict[str, list] = {"dropped": [], "unwind": [], "short": []}
+    if not quotes or target <= 0:
+        return quotes, info
+
+    def px_of(q: "Quote") -> float:
+        return q.price_exact if q.price_exact is not None else float(q.price_cents)
+
+    def key(side: str, yes_px: float) -> float:
+        # the walk's own price axis: a YES bid as is, an ask as its NO bid
+        return round(yes_px if side == "bid" else 100.0 - yes_px, 2)
+
+    depth: Dict[str, Dict[float, float]] = {"bid": {}, "ask": {}}
+    for side, levels in (("bid", yes_levels), ("ask", no_levels)):
+        for px, n in levels or []:
+            k = round(float(px), 2)
+            depth[side][k] = depth[side].get(k, 0.0) + float(n)
+    for side, yes_px, n in own_in_book or []:
+        s_ = "bid" if side == "bid" else "ask"
+        k = key(s_, float(yes_px))
+        depth[s_][k] = max(0.0, depth[s_].get(k, 0.0) - float(n))
+    for q in quotes:
+        k = key(q.book_side, px_of(q))
+        depth[q.book_side][k] = depth[q.book_side].get(k, 0.0) + float(q.count)
+    short = [s for s in ("bid", "ask") if sum(depth[s].values()) < target - 1e-9]
+    info["short"] = short
+
+    def earns(q: "Quote") -> bool:
+        if short:
+            return False
+        k = key(q.book_side, px_of(q))
+        return sum(n for k2, n in depth[q.book_side].items() if k2 > k + 1e-9) < target
+
+    ok = [earns(q) for q in quotes]
+    any_earning = any(e and not q.is_pad for q, e in zip(quotes, ok))
+    red = "ask" if own_pos >= 1 else ("bid" if own_pos <= -1 else None)
+    keep_n: Dict[int, int] = {}
+    if red is not None:
+        room = int(abs(own_pos)) - sum(q.count for q, e in zip(quotes, ok)
+                                       if e and not q.is_pad and q.book_side == red)
+        for i in sorted((i for i, q in enumerate(quotes)
+                         if not ok[i] and not q.is_pad and q.book_side == red),
+                        key=lambda i: -key(red, px_of(quotes[i]))):   # best price first
+            if room <= 0:
+                break
+            keep_n[i] = min(int(quotes[i].count), room)
+            room -= keep_n[i]
+    kept: List["Quote"] = []
+    for i, q in enumerate(quotes):
+        if ok[i] and (not q.is_pad or any_earning):
+            kept.append(q)
+        elif i in keep_n:
+            n = keep_n[i]
+            kept.append(q if n == q.count else replace(q, count=n))
+            info["unwind"].append((q.book_side, px_of(q), n))
+            if n < q.count:
+                info["dropped"].append((q.book_side, px_of(q), q.count - n))
+        else:
+            info["dropped"].append((q.book_side, px_of(q), q.count))
+    return kept, info
+
+
 # Series stem for per-company earnings-call mentions (KXEARNINGSMENTION<SYMBOL>).
 _EARNINGS_PREFIX = "KXEARNINGSMENTION"
 
@@ -28240,6 +28341,11 @@ class IncentiveMarketMaker:
         self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
         self._fev_stood: Set[str] = set()         # FX event gate stand-asides
         self._sd_stood: Set[str] = set()          # snow-day gate stand-asides
+        # EARN ONLY (EARN_ONLY_MODE): each market's last-logged dropped set,
+        # this cycle's totals, and the once-only failure note
+        self._earn_only_noted: Dict[str, tuple] = {}
+        self._earn_cyc: Dict[str, int] = {}
+        self._earn_only_err_logged = False
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -37031,6 +37137,68 @@ class IncentiveMarketMaker:
             out.append((s, sy, sn))
         return out or None
 
+    def _earn_only(self, t: str, meta, mq: List["Quote"], ob, yes_levels, no_levels,
+                   own_in_book, own_exact, own_pos: float, ext_bid, ext_ask) -> List["Quote"]:
+        """EARN ONLY (see EARN_ONLY_MODE): the market's quotes minus every
+        rung the walk would not pay, but for the unwind; dry logs and keeps
+        them all. A failure never costs the cycle: the quotes as built."""
+        try:
+            if meta.price_step < 0.01:
+                # the walk runs over exact levels (see drop_unearning_sides)
+                _ey, _en = orderbook_exact_levels(ob)
+                kept, info = earning_only_quotes(mq, _ey, _en, own_exact,
+                                                 float(meta.target_size or 0.0), own_pos)
+            else:
+                kept, info = earning_only_quotes(mq, yes_levels, no_levels, own_in_book,
+                                                 float(meta.target_size or 0.0), own_pos)
+        except Exception as e:
+            if not self._earn_only_err_logged:
+                self._earn_only_err_logged = True
+                log(f"{self.tag} ! earn-only failed on {t} ({e!r}); quotes as built "
+                    f"(logged once)")
+            return mq
+        c = self._earn_cyc
+        dropped, unwind, short = info["dropped"], info["unwind"], info["short"]
+        if dropped:
+            c["markets"] = c.get("markets", 0) + 1
+            c["rungs"] = c.get("rungs", 0) + len(dropped)
+            c["contracts"] = c.get("contracts", 0) + int(sum(n for _s, _p, n in dropped))
+            if short:
+                c["short"] = c.get("short", 0) + 1
+        if unwind:
+            c["unwind_markets"] = c.get("unwind_markets", 0) + 1
+            c["unwind_contracts"] = c.get("unwind_contracts", 0) + int(sum(n for _s, _p, n in unwind))
+        sig = (tuple(sorted((s, round(p, 2)) for s, p, _n in dropped)), tuple(short))
+        if sig != self._earn_only_noted.get(t, ((), ())):
+            if dropped and c.get("logged", 0) < EARN_ONLY_LOG_MAX:
+                c["logged"] = c.get("logged", 0) + 1
+                what = ", ".join(f"{s} {n} @ {p:g}c" for s, p, n in dropped)
+                why = (f"the book's {'/'.join(short)} side is under the "
+                       f"{meta.target_size:.0f} target, so the snapshot pays nobody"
+                       if short else
+                       f"{meta.target_size:.0f}+ contracts in front of it, past the walk")
+                kept_u = ""
+                if unwind:
+                    kept_u = (f"; kept as the unwind of {own_pos:+.0f}: "
+                              + ", ".join(f"{s} {n} @ {p:g}c" for s, p, n in unwind))
+                dry = " (dry)" if EARN_ONLY_MODE == "dry" else ""
+                log(f"{self.tag} earn-only{dry} {t}: not resting {what} -- {why} "
+                    f"(book {ext_bid}x{ext_ask}){kept_u}")
+            self._earn_only_noted[t] = sig
+        return mq if EARN_ONLY_MODE == "dry" else kept
+
+    def _earn_only_summary(self) -> None:
+        """One line per full cycle: what EARN ONLY kept off the book."""
+        c = self._earn_cyc
+        if not (c.get("markets") or c.get("unwind_markets")):
+            return
+        dry = " (dry: rested anyway)" if EARN_ONLY_MODE == "dry" else ""
+        log(f"{self.tag} earn-only{dry}: {c.get('rungs', 0)} rung(s), "
+            f"{c.get('contracts', 0)} contracts on {c.get('markets', 0)} market(s) "
+            f"not resting ({c.get('short', 0)} with a book side under the target); "
+            f"{c.get('unwind_contracts', 0)} non-earning contracts rest as unwinds on "
+            f"{c.get('unwind_markets', 0)} market(s)")
+
     def _twin_check(self, t: str, meta, mq: List["Quote"], now_ts: float) -> List["Quote"]:
         """THE TWIN CHECK (TWIN_CHECK_MODE) on market `t`'s rungs as built:
         twin_bounds from its mutually exclusive group's siblings' EXTERNAL
@@ -40680,6 +40848,7 @@ class IncentiveMarketMaker:
         reward_frac_sum = 0.0
         cycle_rate: Dict[str, float] = {}   # ticker -> live est $/day this cycle
         quoted = 0
+        self._earn_cyc = {}                 # EARN ONLY totals, this cycle
         # Round-robin across events (best-paying event first), NOT a flat
         # $/day sort: with many events managed, MAX_PLACEMENTS_PER_CYCLE would
         # be fully consumed by the top events every cycle and the tail (a
@@ -43167,6 +43336,13 @@ class IncentiveMarketMaker:
             # siblings' bids leave this market worth, and in a two-market
             # election pair no ask under what the twin's NO bids pay for it
             mq = self._twin_check(t, meta, mq, now_ts)
+            # EARN ONLY (EARN_ONLY_MODE): the very last step -- no rung the
+            # program's walk would not pay rests, but for the unwind
+            if mq and EARN_ONLY_MODE in ("on", "dry"):
+                mq = self._earn_only(t, meta, mq, ob, yes_levels, no_levels,
+                                     own_in_book,
+                                     own_exact_by_ticker.get(t, []) if self.live else [],
+                                     own_pos, ext_bid, ext_ask)
             desired.extend(mq)
             if mq:
                 quoted += 1
@@ -43834,6 +44010,7 @@ class IncentiveMarketMaker:
         # rate-limit alert (2026-10-17): any 429 rejection, ours or the fleet's
         self._rate_limit_watch(time.time())
         if not fast_only:
+            self._earn_only_summary()
             self.state.cycles_today += 1
             self.state.last_markets_line = (
                 f"{quoted}/{len(managed)} mkts quoted ({len(desired)} quotes), "
@@ -47095,6 +47272,14 @@ class IncentiveMarketMaker:
                f"{SHARD_CASH_PAUSE_SECS / 60:g} min, cheaper ones still sent; "
                f"amends and cancels as before" if SHARD_CASH_PAUSE_SECS > 0
                else "off -- every create sent as before"))
+        log(f"earn only (2026-11-15): {EARN_ONLY_MODE}"
+            + (" -- the quote loop's last step: a rung the program's walk would not "
+               "pay (the depth in front of it at the target, or a book side short of "
+               "it) does not rest, a pad only beside an earning rung; on the side "
+               "that reduces the position, rungs that do not earn rest up to the "
+               "position the earning ones leave uncovered (the unwind)"
+               + (" -- DRY: logged, everything rests" if EARN_ONLY_MODE == "dry" else "")
+               if EARN_ONLY_MODE in ("on", "dry") else " -- every rung rests as built"))
         log(f"fair lead (2026-10-29): {FAIR_LEAD_MODE}"
             + (f" -- {', '.join(FAIR_LEAD_SERIES) or 'no series'}: a side whose touch "
                f"sits ahead of a wall leads with target/5 at the cheapest price "
