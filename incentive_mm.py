@@ -14681,7 +14681,8 @@ _CONFIG_CODE_KNOBS = (
     "SNOW_MONTHLY_SIZE_MULT",
     # ...the snow-day counts (2026-11-14); model knobs in snow_days_fair.py
     "SNOW_DAYS_ENABLE", "SNOW_DAYS_SERIES", "SNOW_DAYS_AUTO", "SNOW_DAYS_LEAD",
-    "SNOW_DAYS_TOL_CENTS", "SNOW_DAYS_TTL_MIN", "SNOW_DAYS_SIZE_MULT",
+    "SNOW_DAYS_TOL_CENTS", "SNOW_DAYS_RUNG_TOL_CENTS", "SNOW_DAYS_TTL_MIN",
+    "SNOW_DAYS_SIZE_MULT",
     # the CPI pilot's fair gate (2026-10-11); model knobs in cpi_fair.py
     "CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP",
     # the weekend rain gate (2026-10-11); model knobs in rain_wknd_fair.py
@@ -17697,12 +17698,19 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
 #     out once the season starts (no observed layer yet).
 #   - GATE (snow_days_gate), the crypto event gate's shape, fails CLOSED: no
 #     fair or a stale one, or a touch fighting the fair by more than
-#     SNOW_DAYS_TOL_CENTS, stands the market aside; otherwise every rung
-#     stays SNOW_DAYS_TOL_CENTS clear of it (bids <= fair - tol, asks >=
-#     fair + tol: mort_cap_quotes, last).
+#     SNOW_DAYS_TOL_CENTS (10c), stands the market aside; otherwise every rung
+#     stays SNOW_DAYS_RUNG_TOL_CENTS clear of it (bids <= fair - margin, asks
+#     >= fair + margin: mort_cap_quotes, last). NO MARGIN (Jack 2026-11-15:
+#     "remove margin filter on snow days"): the margin was the band's 10c
+#     until the books converged near the fair, other makers stacked 1,000+
+#     within 10c of each touch, and the 10c-clear rungs sat past the 1,000
+#     walk -- 15 of 22 strikes benched or deselected on zero share, ~$2.3/day
+#     on 18:4xZ books against ~$10.5 at a 0c margin (40 a side). Now 0: a
+#     rung rests up to the fair, never through it; the band stays 10c.
 #   - LEADS (SNOW_DAYS_LEAD): FAIR LEAD off the same fair, never closer than
-#     the tolerance (fair_lead_margin), so a 1c x 99c book gets a 200 bid and
-#     ask ahead of its walls, as the Zillow cities' did.
+#     the rung margin (fair_lead_margin: FAIR_LEAD_MARGIN_C at least), so a
+#     1c x 99c book gets a 200 bid and ask ahead of its walls, as the Zillow
+#     cities' did.
 #   - HOURS: out 00:00 ET of the window's first day (parse_event_date reads
 #     01DEC26 day-first; the generic YYMONDD read it as 2001-12-26). Price
 #     band 1-99c (the caps do the band's job), x SNOW_DAYS_SIZE_MULT (the snow
@@ -17715,7 +17723,8 @@ SNOW_DAYS_SERIES = frozenset(s.strip() for s in os.environ.get(
     "IMM_SNOW_DAYS_SERIES", "KXSNOWDAYS").split(",") if s.strip())
 SNOW_DAYS_AUTO = os.environ.get("IMM_SNOW_DAYS_AUTO", "1") == "1"
 SNOW_DAYS_LEAD = os.environ.get("IMM_SNOW_DAYS_LEAD", "1") == "1"
-SNOW_DAYS_TOL_CENTS = _env_int("IMM_SNOW_DAYS_TOL_CENTS", 10)
+SNOW_DAYS_TOL_CENTS = _env_int("IMM_SNOW_DAYS_TOL_CENTS", 10)        # the stand-aside band
+SNOW_DAYS_RUNG_TOL_CENTS = max(0, _env_int("IMM_SNOW_DAYS_RUNG_TOL_CENTS", 0))   # the rungs' margin
 SNOW_DAYS_TTL_MIN = _env_int("IMM_SNOW_DAYS_TTL_MIN", 240)
 SNOW_DAYS_REFRESH_SECS = _env_int("IMM_SNOW_DAYS_REFRESH_SECS", 900)
 SNOW_DAYS_SIZE_MULT = _env_float("IMM_SNOW_DAYS_SIZE_MULT", 2.0)
@@ -17771,17 +17780,18 @@ def snow_days_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         return (f"snow-day fair is {age / 60:.0f}m old",
                 {"reason": "stale", "age_s": round(age)}, None)
     fair = float(e["p"]) * 100.0
-    inputs = {"fair": round(fair, 2), "tol": SNOW_DAYS_TOL_CENTS}
+    inputs = {"fair": round(fair, 2), "tol": SNOW_DAYS_TOL_CENTS,
+              "margin": SNOW_DAYS_RUNG_TOL_CENTS}
     bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, SNOW_DAYS_TOL_CENTS)
     if bid_bad or ask_bad:
         return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
                 f"{SNOW_DAYS_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side)",
                 dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
-    bid_cap = int(math.floor(fair - SNOW_DAYS_TOL_CENTS + 1e-9))
-    ask_floor = int(math.ceil(fair + SNOW_DAYS_TOL_CENTS - 1e-9))
+    bid_cap = int(math.floor(fair - SNOW_DAYS_RUNG_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(fair + SNOW_DAYS_RUNG_TOL_CENTS - 1e-9))
     caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
     if caps == (None, None):
-        return (f"no side {SNOW_DAYS_TOL_CENTS}c clear of fair {fair:.0f}c",
+        return (f"no side {SNOW_DAYS_RUNG_TOL_CENTS}c clear of fair {fair:.0f}c",
                 dict(inputs, reason="decided"), None)
     return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
 
@@ -26697,7 +26707,7 @@ def fair_lead_margin(series: str) -> int:
     if crypto_event_series(series):
         return max(FAIR_LEAD_MARGIN_C, CRYPTO_EVENT_TOL_CENTS)
     if snow_days_series(series):
-        return max(FAIR_LEAD_MARGIN_C, SNOW_DAYS_TOL_CENTS)
+        return max(FAIR_LEAD_MARGIN_C, SNOW_DAYS_RUNG_TOL_CENTS)
     return FAIR_LEAD_MARGIN_C
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
@@ -39514,7 +39524,7 @@ class IncentiveMarketMaker:
                 _fw, _fi, _fc = fx_event_gate(meta.ticker, _now.timestamp())
                 out = [] if (_fw or _fc is None) else mort_cap_quotes(out, *_fc)
             if snow_days_series(meta.series):
-                # snow-day gate: the same, SNOW_DAYS_TOL_CENTS clear
+                # snow-day gate: the same, SNOW_DAYS_RUNG_TOL_CENTS clear (0: up to the fair)
                 _sw, _si, _sc = snow_days_gate(meta.ticker, _now.timestamp(), eb, ea)
                 out = [] if (_sw or _sc is None) else mort_cap_quotes(out, *_sc)
             if poke_series(meta.series):
@@ -42441,7 +42451,8 @@ class IncentiveMarketMaker:
             # SNOW-DAY GATE (Jack 2026-11-14, see SNOW_DAYS_ENABLE): stand
             # aside (cancel) without a fresh snow-day fair (the season has
             # started, no history) or when the touch fights it; otherwise
-            # every rung below stays SNOW_DAYS_TOL_CENTS clear of the fair.
+            # every rung below stays SNOW_DAYS_RUNG_TOL_CENTS clear of the fair
+            # (0 since Jack 2026-11-15 "remove margin filter": never through it).
             sd_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
             if snow_days_series(meta.series):
                 sd_why, sd_in, sd_caps = snow_days_gate(t, now_ts, ext_bid, ext_ask)
@@ -43253,7 +43264,7 @@ class IncentiveMarketMaker:
             # FX event gate: likewise last, inside the live limits
             if fev_caps is not None:
                 mq = mort_cap_quotes(mq, *fev_caps)
-            # snow-day gate: likewise last, SNOW_DAYS_TOL_CENTS clear
+            # snow-day gate: likewise last, SNOW_DAYS_RUNG_TOL_CENTS clear
             if sd_caps is not None:
                 mq = mort_cap_quotes(mq, *sd_caps)
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
@@ -47356,8 +47367,9 @@ class IncentiveMarketMaker:
             log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"
                 + (" + any SNOW series on its contract" if SNOW_DAYS_AUTO else "")
                 + f" on snow_days_fair (last-10-season mean payout, every "
-                f"{SNOW_DAYS_REFRESH_SECS // 60}m), fail-closed, rungs "
-                f"{SNOW_DAYS_TOL_CENTS}c clear of the fair, leads "
+                f"{SNOW_DAYS_REFRESH_SECS // 60}m), fail-closed (aside past a "
+                f"{SNOW_DAYS_TOL_CENTS}c band), rungs {SNOW_DAYS_RUNG_TOL_CENTS}c clear of the "
+                f"fair (never through it), leads "
                 f"{'on' if SNOW_DAYS_LEAD else 'off'}, x{SNOW_DAYS_SIZE_MULT:g}, 1-99c, "
                 f"out 00:00 ET of the window's first day, ttl {SNOW_DAYS_TTL_MIN}m")
         if HOME_ENABLE and (HOME_SERIES or HOME_AUTO):

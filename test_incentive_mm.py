@@ -46834,8 +46834,13 @@ class TestSnowDaysGate(unittest.TestCase):
         why, inp, caps = imm.snow_days_gate(self.T, now, 40.0, 50.0)
         self.assertIn("old", why)                                # stale: 4h TTL
         self._write()
+        # NO MARGIN (Jack 2026-11-15: "remove margin filter on snow days"):
+        # the rungs rest up to the fair, never through it; the band stays 10c
         self.assertEqual(imm.snow_days_gate(self.T, now, 40.0, 50.0), (
-            "", {"fair": 44.0, "tol": 10, "bid_cap": 34, "ask_floor": 54}, (34, 54)))
+            "", {"fair": 44.0, "tol": 10, "margin": 0, "bid_cap": 44, "ask_floor": 44},
+            (44, 44)))
+        with mock.patch.object(imm, "SNOW_DAYS_RUNG_TOL_CENTS", 10):     # the 11/14 margin
+            self.assertEqual(imm.snow_days_gate(self.T, now, 40.0, 50.0)[2], (34, 54))
         # a touch fighting the fair by more than the tolerance stands aside
         why, inp, caps = imm.snow_days_gate(self.T, now, 55.0, 60.0)
         self.assertIn("vs fair 44c", why)
@@ -46843,10 +46848,14 @@ class TestSnowDaysGate(unittest.TestCase):
         # the lead reads the fair whatever the book
         self.assertEqual(imm.snow_days_fair_c(self.T, now), 44.0)
         self.assertEqual(imm.fair_model_c(self.T, "KXSNOWDAYS", now), 44.0)
-        self.assertEqual(imm.fair_lead_margin("KXSNOWDAYS"), max(imm.FAIR_LEAD_MARGIN_C, 10))
-        # a fair near 0 keeps the ask alone
+        self.assertEqual(imm.fair_lead_margin("KXSNOWDAYS"), imm.FAIR_LEAD_MARGIN_C)
+        with mock.patch.object(imm, "SNOW_DAYS_RUNG_TOL_CENTS", 10):
+            self.assertEqual(imm.fair_lead_margin("KXSNOWDAYS"), max(imm.FAIR_LEAD_MARGIN_C, 10))
+        # a fair near 0: both sides up to it; at a 10c margin the ask alone
         self._write(p=0.05)
-        self.assertEqual(imm.snow_days_gate(self.T, now, 1.0, 99.0)[2], (None, 15))
+        self.assertEqual(imm.snow_days_gate(self.T, now, 1.0, 99.0)[2], (5, 5))
+        with mock.patch.object(imm, "SNOW_DAYS_RUNG_TOL_CENTS", 10):
+            self.assertEqual(imm.snow_days_gate(self.T, now, 1.0, 99.0)[2], (None, 15))
 
     def test_the_window_day_is_read_first_and_cuts_off_at_its_start(self):
         exp = datetime(2027, 4, 2, 14, tzinfo=timezone.utc)
@@ -46871,8 +46880,9 @@ class TestSnowDaysGate(unittest.TestCase):
 
 class TestSnowDaysLoop(TestSnowDaysGate):
     """The snow-day gate through the quote loop: a 1c x 99c placeholder book
-    (5,000 a side) on a 44c fair rests a bid at most 34c and an ask at least
-    54c, with a 200 lead ahead of each wall off the snow-day fair. Fixture
+    (5,000 a side) on a 44c fair rests a bid at most 44c and an ask at least
+    44c (no margin since Jack 2026-11-15), with a 200 lead ahead of each wall
+    off the snow-day fair. Fixture
     KXSNOWDAYS-01DEC67-01APR68-BOS (cutoff Dec 1, 2067)."""
 
     T = "KXSNOWDAYS-01DEC67-01APR68-BOS"
@@ -46928,8 +46938,8 @@ class TestSnowDaysLoop(TestSnowDaysGate):
         self.assertIn(self.T, bot.state.selected,
                       [s_ for s_ in lines if "universe:" in s_ or self.T in s_][-6:])
         self.assertEqual({side for side, _px, _n in rest}, {"bid", "ask"}, rest)
-        self.assertTrue(all(px <= 34 for side, px, _n in rest if side == "bid"), rest)
-        self.assertTrue(all(px >= 54 for side, px, _n in rest if side == "ask"), rest)
+        self.assertTrue(all(px <= 44 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 44 for side, px, _n in rest if side == "ask"), rest)
         self.assertTrue(any(f"fair lead {self.T}" in s_ and "the snow-day fair" in s_
                             for s_ in lines), [s_ for s_ in lines if "fair lead" in s_])
 
@@ -46959,7 +46969,10 @@ class TestSnowDaysLoop(TestSnowDaysGate):
         # so no stand-aside) leaves the bid capped at 34c 1,500 contracts
         # behind the touch, past the 1,000-contract walk: it earns nothing
         # and does not rest (EARN ONLY). The ask, alone ahead of the 99c
-        # wall, does.
+        # wall, does. (The 11/14 10c margin; no margin since 11/15.)
+        p = mock.patch.object(imm, "SNOW_DAYS_RUNG_TOL_CENTS", 10)
+        p.start()
+        self.addCleanup(p.stop)
         bot, rest, lines = self._cycle()
         self.assertEqual({side for side, _px, _n in rest}, {"bid", "ask"}, rest)
         bot.client.books[self.T] = {"orderbook_fp": {
@@ -47003,10 +47016,35 @@ class TestSnowDaysLoop(TestSnowDaysGate):
         self.assertTrue(any("earn-only (dry: rested anyway):" in s_ for s_ in lines),
                         [s_ for s_ in lines if "earn-only" in s_])
 
+    def test_no_margin_quotes_a_converged_book_at_its_touches(self):
+        # Jack 2026-11-15: "remove margin filter on snow days". A book that
+        # converged near the 44c fair -- 40c x 1,500 / 50c x 1,500 -- with the
+        # 10c margin left both sides past the walk (bid 34 behind 1,500, ask
+        # 54 behind 1,500); with none, each side joins its touch and earns
+        bot, rest, lines = self._cycle()
+        bot.client.books[self.T] = {"orderbook_fp": {
+            "yes_dollars": [["0.01", "5000"], ["0.40", "1500"]],
+            "no_dollars": [["0.01", "5000"], ["0.50", "1500"]]}}
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        rest = self._rest(bot)
+        self.assertEqual({side for side, _px, _n in rest}, {"bid", "ask"}, rest)
+        self.assertTrue(all(px <= 44 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 44 for side, px, _n in rest if side == "ask"), rest)
+        self.assertIn(40, {px for side, px, _n in rest if side == "bid"}, rest)
+        self.assertIn(50, {px for side, px, _n in rest if side == "ask"}, rest)
+        self.assertFalse(any(f"earn-only {self.T}:" in s_ for s_ in lines),
+                         [s_ for s_ in lines if self.T in s_][-8:])
+
     def test_a_short_position_keeps_its_non_earning_bid_as_the_unwind(self):
         # "unless purposefully unwinding": short 25, the bid reduces it. Behind
         # the 40c x 1,500 pile it earns nothing, yet 25 of it rests -- the
-        # position, no more
+        # position, no more (the 11/14 10c margin)
+        p = mock.patch.object(imm, "SNOW_DAYS_RUNG_TOL_CENTS", 10)
+        p.start()
+        self.addCleanup(p.stop)
         bot, rest, lines = self._cycle()
         bot.client.books[self.T] = {"orderbook_fp": {
             "yes_dollars": [["0.01", "5000"], ["0.40", "1500"]],
