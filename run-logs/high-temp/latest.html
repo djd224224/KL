@@ -2,24 +2,21 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>High-Temp Digest — 2026-11-12</title>
+<title>High-Temp Digest — 2026-11-13</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e2e8f0; line-height: 1.6; padding: 32px; }
   .container { max-width: 1200px; margin: 0 auto; }
 
   h1 { font-size: 1.7rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
-  .subtitle { color: #64748b; font-size: 0.875rem; margin-bottom: 16px; }
+  .subtitle { color: #64748b; font-size: 0.875rem; margin-bottom: 28px; }
 
   h2 { font-size: 0.78rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.1em; margin: 28px 0 10px; }
 
   .section { background: #1e2433; border-radius: 10px; padding: 24px; margin-bottom: 20px; }
 
-  /* Data note banner */
-  .note-banner { background: #191f2e; border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; padding: 11px 16px; margin-bottom: 20px; font-size: 0.8rem; color: #94a3b8; line-height: 1.6; }
-
   /* KPI bar */
-  .kpi-bar { display: flex; gap: 12px; margin-bottom: 6px; flex-wrap: wrap; }
+  .kpi-bar { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
   .kpi { background: #1e2433; border-radius: 10px; padding: 16px 22px; flex: 1; min-width: 130px; }
   .kpi-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 4px; }
   .kpi-value { font-size: 1.5rem; font-weight: 700; }
@@ -27,8 +24,6 @@
   .win    { color: #34d399; }
   .neutral { color: #e2e8f0; }
   .warn-color { color: #fbbf24; }
-
-  .imm-line { color: #475569; font-size: 0.78rem; font-style: italic; margin-bottom: 20px; }
 
   /* Summary box at top */
   .summary-box { background: #1e2433; border-radius: 10px; padding: 22px 26px; margin-bottom: 20px; font-size: 0.9rem; color: #cbd5e1; line-height: 1.85; }
@@ -68,6 +63,12 @@
   .warn-banner { background: #2d1f00; border: 1px solid #92400e; border-radius: 8px; padding: 12px 16px; color: #fcd34d; font-size: 0.845rem; }
   .warn-banner strong { color: #fde68a; }
 
+  /* Data note banner */
+  .data-note { background: #0f2d2d; border: 1px solid #0e5a5a; border-radius: 8px; padding: 12px 16px; color: #a5f3e8; font-size: 0.82rem; margin-bottom: 20px; }
+  .data-note code { color: #6ee7d7; }
+
+  .muted-line { color: #64748b; font-size: 0.8rem; font-style: italic; margin: -8px 0 20px; }
+
   .no-alerts { color: #475569; font-style: italic; font-size: 0.845rem; }
   .footnote { font-size: 0.75rem; color: #475569; margin-top: 10px; }
 </style>
@@ -76,34 +77,37 @@
 <div class="container">
 
   <h1>High-Temp Digest</h1>
-  <div class="subtitle">2026-11-12 &nbsp;·&nbsp; KXHIGH series &nbsp;·&nbsp; Settled (evening BQ load last pulled 2026-11-14 01:07 UTC)</div>
+  <div class="subtitle">2026-11-13 &nbsp;·&nbsp; KXHIGH series &nbsp;·&nbsp; Settlements final (BQ settlements last pulled 2026-11-15 00:30 UTC) &nbsp;·&nbsp; P&L from Kalshi fill prices, this bot only</div>
 
-  <div class="note-banner">
-    P&amp;L is per fill: contracts × (payout − price paid) − fees, at Kalshi's fill prices. The IMM's market making on the same account is left out: it has one line of its own below.
+  <div class="data-note">
+    P&amp;L is per fill: contracts &times; (payout &minus; price paid) &minus; fees, at Kalshi's fill prices. The IMM's market making on the same account is left out: it has one line of its own below.
   </div>
 
   <!-- KPI bar -->
   <div class="kpi-bar">
-    <div class="kpi"><div class="kpi-label">Est. P&L</div><div class="kpi-value win">+$134.64</div></div>
-    <div class="kpi"><div class="kpi-label">Return on deployed</div><div class="kpi-value win">+21.7%</div></div>
-    <div class="kpi"><div class="kpi-label">Win / Loss</div><div class="kpi-value neutral">7W / 7L</div></div>
-    <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$620.96</div></div>
-    <div class="kpi"><div class="kpi-label">Contracts filled</div><div class="kpi-value neutral">1,300.4</div></div>
-    <div class="kpi"><div class="kpi-label">Markets ordered</div><div class="kpi-value neutral">45 across 23 cities</div></div>
+    <div class="kpi"><div class="kpi-label">Est. P&L</div><div class="kpi-value win">+$40.15</div></div>
+    <div class="kpi"><div class="kpi-label">Return on deployed</div><div class="kpi-value win">+11.2%</div></div>
+    <div class="kpi"><div class="kpi-label">Win / Loss</div><div class="kpi-value neutral">3W / 3L</div></div>
+    <div class="kpi"><div class="kpi-label">Capital deployed</div><div class="kpi-value neutral">$359.61</div></div>
+    <div class="kpi"><div class="kpi-label">Contracts filled</div><div class="kpi-value neutral">744</div></div>
+    <div class="kpi"><div class="kpi-label">Markets ordered</div><div class="kpi-value neutral">36 across 19 cities</div></div>
   </div>
-  <div class="imm-line">IMM market making on the same account (counted in IMM's own P&amp;L, not here): none</div>
+  <div class="muted-line">IMM market making on the same account (counted in IMM's own P&amp;L, not here): none</div>
 
   <!-- OVERALL SUMMARY -->
   <h2>Overall Summary</h2>
   <div class="summary-box">
-    November 12 closed <strong class="win">+$134.64</strong> on $620.96 deployed (<strong class="win">+21.7%</strong>), 7W/7L across 14 filled markets in 13 of the 23 cities with live orders — Chicago had none — the best day in weeks. New York City supplied the single biggest line: 200 NO contracts on B59.5 ({59,60}°F) at 42.0¢ average, clearing clean when the actual hit 61°F, for <strong class="win">+$116.00</strong> — most of the day's net on its own. Philadelphia (<strong class="win">+$59.88</strong>, actual 65°F vs. a {61,62}°F band) and Oklahoma City (<strong class="win">+$55.47</strong>, actual 68°F vs. {70,71}°F) were the next-largest wins, clearing on opposite sides of their bands. The day's biggest loss was New Orleans: 144.4 NO contracts on B75.5 sold at 47.7¢, undone when the actual landed at 76°F — the top edge of the {75,76}°F band — for <strong class="loss">−$68.88</strong>. Atlanta split its two bands on the same 67°F reading: B64.5 won (<strong class="win">+$55.20</strong>, 67°F clear of {64,65}°F) while B66.5 lost (<strong class="loss">−$21.00</strong>, 67°F landed inside {66,67}°F), two degrees of band apart. No unattributed fills and no IMM market-making on these markets today; every dollar above is this bot's alone.
+    November 13 closed <strong class="win">+$40.15</strong> on $359.61 deployed (<strong class="win">+11.2%</strong>), 3W/3L across six filled markets in five cities. <strong>Los Angeles was the day's biggest winner</strong>: 220 NO contracts on the {70,71}°F band at 48.4¢ average, cashing <strong class="win">+$113.60</strong> as a wet Pacific front held the actual high to 69°F — a full degree below the band. <strong>Seattle split down the middle</strong> on back-to-back bands: the {58,59}°F NO position cleared cleanly when an overnight warm pulse pushed the actual to 61°F (+$91.81), but the {60,61}°F NO position sat directly on that same 61°F reading and lost $67.50 — one degree of real weather, two opposite results from adjacent bands. <strong>Austin was the day's worst position</strong>: 139 NO contracts at 52.3¢ against the {79,80}°F band, and Austin landed at exactly 80°F under clear sunny skies for a $72.67 loss. Chicago's {43,44}°F NO position also lost ($28.93) despite a forecast calling for snow turning to rain and snow — the actual 44°F high landed inside the band regardless. Louisville was a small, clean win (+$3.84) on 7.7 NO contracts as the actual 46°F held a degree below the {47,48}°F band. A rain system shut four Northeast markets out of trading entirely — Boston, New York City, Newark, and Philadelphia never got an order placed, as <code>PRE_TRADE_SKIP_PEAK</code> fired repeatedly when each city's expected peak hour (4–7 AM CT) fell before the 9 AM cutoff; all four posted their actual highs before dawn, consistent with mild air arriving ahead of the rain and temperatures falling through the day. Washington DC also saw no order, though no skip alert fired for it specifically.
   </div>
 
   <!-- FORECASTS -->
   <h2>Forecasts</h2>
   <div class="section">
+    <div class="warn-banner">
+      ⚠️ <strong>Weather Underground partial outage.</strong> <code>temperatureMax</code> came back null (status=200, empty variable) for 5 cities at the 5:02 AM run — Los Angeles, Las Vegas, Seattle, San Francisco, San Diego. NWS forecast_avg filled in for all five and each traded normally; this was a data-provider gap, not a snapshot outage.
+    </div>
     <div class="commentary">
-      <strong>Tight consensus, with one city flagged for zero coverage.</strong> Forecast spread ran 0.0–2.8°F across the 24-city snapshot, tightest (single-model consensus) in Atlanta, Miami, Minneapolis, Phoenix, Trenton, and Washington DC, and loosest in San Diego (2.8°F) and the Texas trio of Austin, Houston, and San Antonio (2.1°F each). Houston's wide spread produced the day's largest resolved miss: NWS called 75°F, the actual hit 80°F, and the bot's B78.5 band caught the upside for +$24.51. Chicago is the outlier worth a second look — the snapshot forecast 44.5°F under "Rain Showers," the actual CLI record logs 48°F with the high-temp time itself missing ("MM") — and no bands were ordered there at all, so nothing was risked on it either way. Nothing here points to an error, but zero orders on a city with a live snapshot and a live CLI reading is worth confirming is deliberate rather than a silent gap.
+      Snapshot coverage is otherwise complete for all 24 cities with a forecast_date of 2026-11-13. The five WU nulls line up exactly with the day's wet Pacific weather (Light Rain / Showers and Thunderstorms / Cloudy conditions) — plausibly a provider-side handling issue for stormy forecasts rather than a systemic failure, since the same five cities' NWS numbers came through clean. Worth a watch if WU keeps dropping temperatureMax specifically on rainy days; it would quietly erode the forecast_std blend on exactly the days volatility is highest.
     </div>
   </div>
 
@@ -128,245 +132,229 @@
         </tr>
       </thead>
       <tbody>
-        <tr class="divider">
-          <td class="left"><span class="city-name">Atlanta</span></td>
-          <td><strong>67°F</strong></td><td>1:07 PM</td>
-          <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B64.5, B66.5</span></td>
-          <td class="left"><span class="band-mono">B64.5</span></td>
-          <td>64–65°F</td><td>120.0</td><td>$0.540</td><td>$64.80</td>
-          <td class="pnl pos">+$55.20</td>
-          <td class="left"><span class="pill win">WIN — above</span></td>
-        </tr>
         <tr>
-          <td class="left"><span class="city-name">Atlanta</span></td>
-          <td><strong>67°F</strong></td><td>1:07 PM</td>
+          <td class="left"><span class="city-name unfilled">Atlanta</span></td>
+          <td>53°F</td><td>3:18 PM</td>
           <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B64.5, B66.5</span></td>
-          <td class="left"><span class="band-mono">B66.5</span></td>
-          <td>66–67°F</td><td>50.0</td><td>$0.420</td><td>$21.00</td>
-          <td class="pnl neg">−$21.00</td>
-          <td class="left"><span class="pill loss">LOSS — in band</span></td>
+          <td class="left"><span class="band-mono">B54.5, B56.5</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr class="divider">
           <td class="left"><span class="city-name">Austin</span></td>
-          <td><strong>78°F</strong></td><td>3:56 PM</td>
+          <td><strong>80°F</strong></td><td>3:37 PM</td>
           <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B75.5, B77.5, T80</span></td>
-          <td class="left"><span class="band-mono">B77.5</span></td>
-          <td>77–78°F</td><td>51.4</td><td>$0.605</td><td>$31.08</td>
-          <td class="pnl neg">−$31.08</td>
+          <td class="left"><span class="band-mono">B77.5, B79.5, T82</span></td>
+          <td class="left"><span class="band-mono">B79.5</span></td>
+          <td>79–80°F</td><td>139.0</td><td>$0.523</td><td>$72.67</td>
+          <td class="pnl neg">−$72.67</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">Boston</span></td>
-          <td><strong>53°F</strong></td><td>2:00 PM</td>
-          <td class="left conditions">Light Rain Likely</td>
-          <td class="left"><span class="band-mono">B52.5, B54.5</span></td>
-          <td class="left"><span class="band-mono">B54.5</span></td>
-          <td>54–55°F</td><td>93.0</td><td>$0.467</td><td>$43.40</td>
-          <td class="pnl pos">+$49.60</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
-        </tr>
         <tr>
-          <td class="left"><span class="city-name unfilled">Chicago</span></td>
-          <td>48°F</td><td class="na">—</td>
-          <td class="left conditions">Rain Showers</td>
+          <td class="left"><span class="city-name unfilled">Boston</span></td>
+          <td>47°F</td><td>12:30 AM †</td>
+          <td class="left conditions">Light Rain Likely</td>
           <td class="left na">—</td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr class="divider">
-          <td class="left"><span class="city-name">Dallas</span></td>
-          <td><strong>79°F</strong></td><td>3:52 PM</td>
-          <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B76.5, B78.5, B80.5</span></td>
-          <td class="left"><span class="band-mono">B78.5</span></td>
-          <td>78–79°F</td><td>26.4</td><td>$0.430</td><td>$11.33</td>
-          <td class="pnl neg">−$11.33</td>
+          <td class="left"><span class="city-name">Chicago</span></td>
+          <td><strong>44°F</strong></td><td>2:25 PM</td>
+          <td class="left conditions">Snow Likely then Rain And Snow</td>
+          <td class="left"><span class="band-mono">B39.5, B41.5, B43.5</span></td>
+          <td class="left"><span class="band-mono">B43.5</span></td>
+          <td>43–44°F</td><td>55.2</td><td>$0.524</td><td>$28.93</td>
+          <td class="pnl neg">−$28.93</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">Denver</span></td>
-          <td><strong>66°F</strong></td><td>2:16 PM</td>
-          <td class="left conditions">Clear</td>
-          <td class="left"><span class="band-mono">B68.5</span></td>
-          <td class="left"><span class="band-mono">B68.5</span></td>
-          <td>68–69°F</td><td>60.0</td><td>$0.560</td><td>$33.60</td>
-          <td class="pnl pos">+$26.40</td>
-          <td class="left"><span class="pill win">WIN — below</span></td>
-        </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">Houston</span></td>
-          <td><strong>80°F</strong></td><td>2:56 PM</td>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Dallas</span></td>
+          <td>68°F</td><td>3:35 PM</td>
           <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B76.5, B78.5, T83</span></td>
-          <td class="left"><span class="band-mono">B78.5</span></td>
-          <td>78–79°F</td><td>57.0</td><td>$0.570</td><td>$32.49</td>
-          <td class="pnl pos">+$24.51</td>
-          <td class="left"><span class="pill win">WIN — above</span></td>
+          <td class="left"><span class="band-mono">B67.5, B71.5</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Denver</span></td>
+          <td>63°F</td><td>2:17 PM</td>
+          <td class="left conditions">Mostly Cloudy</td>
+          <td class="left"><span class="band-mono">B62.5, B66.5, T67</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Houston</span></td>
+          <td>80°F</td><td>3:56 PM</td>
+          <td class="left conditions">Sunny</td>
+          <td class="left"><span class="band-mono">B75.5, B77.5, T80</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">Las Vegas</span></td>
-          <td>74°F</td><td>3:47 PM</td>
-          <td class="left conditions">Clear</td>
-          <td class="left"><span class="band-mono">B72.5</span></td>
-          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
-          <td class="left"><span class="pill none">No fill</span></td>
-        </tr>
-        <tr>
-          <td class="left"><span class="city-name unfilled">Los Angeles</span></td>
-          <td>76°F</td><td>11:44 AM</td>
+          <td>72°F</td><td>12:02 PM</td>
           <td class="left conditions">Mostly Sunny</td>
-          <td class="left"><span class="band-mono">B79.5</span></td>
-          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
-          <td class="left"><span class="pill none">No fill</span></td>
-        </tr>
-        <tr>
-          <td class="left"><span class="city-name unfilled">Louisville</span></td>
-          <td>58°F</td><td>2:56 PM</td>
-          <td class="left conditions">Partly Sunny then Chance Rain Showers</td>
-          <td class="left"><span class="band-mono">T59</span></td>
-          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
-          <td class="left"><span class="pill none">No fill</span></td>
-        </tr>
-        <tr>
-          <td class="left"><span class="city-name unfilled">Miami</span></td>
-          <td>87°F</td><td>1:51 PM</td>
-          <td class="left conditions">Partly Sunny then Slight Chance Showers And Thunderstorms</td>
-          <td class="left"><span class="band-mono">B85.5, B87.5, T88</span></td>
+          <td class="left"><span class="band-mono">B71.5</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr class="divider">
-          <td class="left"><span class="city-name">Minneapolis</span></td>
-          <td><strong>40°F</strong></td><td>3:09 PM</td>
-          <td class="left conditions">Scattered Snow Showers then Partly Sunny</td>
-          <td class="left"><span class="band-mono">B39.5, B43.5</span></td>
-          <td class="left"><span class="band-mono">B39.5</span></td>
-          <td>39–40°F</td><td>98.0</td><td>$0.477</td><td>$46.76</td>
-          <td class="pnl neg">−$46.76</td>
-          <td class="left"><span class="pill loss">LOSS — in band</span></td>
-        </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">New Orleans</span></td>
-          <td><strong>76°F</strong></td><td>3:28 PM</td>
-          <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B75.5</span></td>
-          <td class="left"><span class="band-mono">B75.5</span></td>
-          <td>75–76°F</td><td>144.4</td><td>$0.477</td><td>$68.88</td>
-          <td class="pnl neg">−$68.88</td>
-          <td class="left"><span class="pill loss">LOSS — in band</span></td>
-        </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">New York City</span></td>
-          <td><strong>61°F</strong></td><td>10:14 AM</td>
-          <td class="left conditions">Rain</td>
-          <td class="left"><span class="band-mono">B59.5</span></td>
-          <td class="left"><span class="band-mono">B59.5</span></td>
-          <td>59–60°F</td><td>200.0</td><td>$0.420</td><td>$84.00</td>
-          <td class="pnl pos">+$116.00</td>
-          <td class="left"><span class="pill win">WIN — above</span></td>
-        </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">Newark</span></td>
-          <td><strong>61°F</strong></td><td>10:21 AM</td>
-          <td class="left conditions">Rain</td>
-          <td class="left"><span class="band-mono">B60.5, B62.5</span></td>
-          <td class="left"><span class="band-mono">B60.5</span></td>
-          <td>60–61°F</td><td>60.0</td><td>$0.380</td><td>$22.80</td>
-          <td class="pnl neg">−$22.80</td>
-          <td class="left"><span class="pill loss">LOSS — in band</span></td>
-        </tr>
-        <tr class="divider">
-          <td class="left"><span class="city-name">Oklahoma City</span></td>
-          <td><strong>68°F</strong></td><td>3:51 PM</td>
-          <td class="left conditions">Sunny</td>
+          <td class="left"><span class="city-name">Los Angeles</span></td>
+          <td><strong>69°F</strong></td><td>1:40 PM</td>
+          <td class="left conditions">Light Rain</td>
+          <td class="left"><span class="band-mono">B70.5, B72.5</span></td>
           <td class="left"><span class="band-mono">B70.5</span></td>
-          <td class="left"><span class="band-mono">B70.5</span></td>
-          <td>70–71°F</td><td>115.6</td><td>$0.520</td><td>$60.13</td>
-          <td class="pnl pos">+$55.47</td>
+          <td>70–71°F</td><td>220.0</td><td>$0.484</td><td>$106.40</td>
+          <td class="pnl pos">+$113.60</td>
           <td class="left"><span class="pill win">WIN — below</span></td>
         </tr>
         <tr class="divider">
-          <td class="left"><span class="city-name">Philadelphia</span></td>
-          <td><strong>65°F</strong></td><td>2:07 PM</td>
-          <td class="left conditions">Rain Showers</td>
-          <td class="left"><span class="band-mono">B61.5, B63.5</span></td>
-          <td class="left"><span class="band-mono">B61.5</span></td>
-          <td>61–62°F</td><td>110.0</td><td>$0.456</td><td>$50.12</td>
-          <td class="pnl pos">+$59.88</td>
-          <td class="left"><span class="pill win">WIN — above</span></td>
+          <td class="left"><span class="city-name">Louisville</span></td>
+          <td><strong>46°F</strong></td><td>12:28 PM</td>
+          <td class="left conditions">Chance Rain Showers</td>
+          <td class="left"><span class="band-mono">B45.5, B47.5</span></td>
+          <td class="left"><span class="band-mono">B47.5</span></td>
+          <td>47–48°F</td><td>7.7</td><td>$0.500</td><td>$3.84</td>
+          <td class="pnl pos">+$3.84</td>
+          <td class="left"><span class="pill win">WIN — below</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Miami</span></td>
+          <td>81°F</td><td>12:03 PM</td>
+          <td class="left conditions">Partly Sunny</td>
+          <td class="left"><span class="band-mono">B80.5, B82.5, T83</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Minneapolis</span></td>
+          <td>40°F</td><td>3:23 PM</td>
+          <td class="left conditions">Sunny</td>
+          <td class="left"><span class="band-mono">B41.5</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Newark</span></td>
+          <td>49°F</td><td>12:47 AM †</td>
+          <td class="left conditions">Light Rain</td>
+          <td class="left na">—</td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">New Orleans</span></td>
+          <td>68°F</td><td>3:35 PM</td>
+          <td class="left conditions">Sunny</td>
+          <td class="left"><span class="band-mono">B70.5</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">New York City</span></td>
+          <td>47°F</td><td>1:11 AM †</td>
+          <td class="left conditions">Light Rain</td>
+          <td class="left na">—</td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Oklahoma City</span></td>
+          <td>56°F</td><td>3:23 PM</td>
+          <td class="left conditions">Sunny</td>
+          <td class="left"><span class="band-mono">B57.5</span></td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
+        </tr>
+        <tr>
+          <td class="left"><span class="city-name unfilled">Philadelphia</span></td>
+          <td>51°F</td><td>12:10 AM †</td>
+          <td class="left conditions">Light Rain</td>
+          <td class="left na">—</td>
+          <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
+          <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">Phoenix</span></td>
-          <td>86°F</td><td>3:19 PM</td>
-          <td class="left conditions">Clear</td>
-          <td class="left"><span class="band-mono">B83.5, B87.5</span></td>
+          <td>74°F</td><td>1:40 PM</td>
+          <td class="left conditions">Mostly Clear</td>
+          <td class="left"><span class="band-mono">B77.5</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">San Antonio</span></td>
-          <td>78°F</td><td>3:35 PM</td>
+          <td>78°F</td><td>2:58 PM</td>
           <td class="left conditions">Sunny</td>
-          <td class="left"><span class="band-mono">B75.5, T80</span></td>
+          <td class="left"><span class="band-mono">B76.5</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">San Diego</span></td>
-          <td>77°F</td><td>1:28 PM</td>
-          <td class="left conditions">Mostly Clear</td>
-          <td class="left"><span class="band-mono">B79.5, B81.5</span></td>
+          <td>71°F</td><td>2:17 PM</td>
+          <td class="left conditions">Showers And Thunderstorms</td>
+          <td class="left"><span class="band-mono">B69.5, B73.5</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">San Francisco</span></td>
-          <td>70°F</td><td>1:31 PM</td>
-          <td class="left conditions">Mostly Cloudy</td>
-          <td class="left"><span class="band-mono">B68.5, B70.5, B72.5</span></td>
+          <td>64°F</td><td>2:24 AM †</td>
+          <td class="left conditions">Slight Chance Light Rain</td>
+          <td class="left"><span class="band-mono">T66</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr class="divider">
           <td class="left"><span class="city-name">Seattle</span></td>
-          <td><strong>61°F</strong></td><td>8:05 PM</td>
+          <td><strong>61°F</strong></td><td>5:34 AM †</td>
           <td class="left conditions">Cloudy</td>
-          <td class="left"><span class="band-mono">B59.5, B61.5, T64</span></td>
-          <td class="left"><span class="band-mono">B61.5</span></td>
-          <td>61–62°F</td><td>114.7</td><td>$0.441</td><td>$50.57</td>
-          <td class="pnl neg">−$50.57</td>
+          <td class="left"><span class="band-mono">B58.5, B60.5, T63</span></td>
+          <td class="left"><span class="band-mono">B58.5</span></td>
+          <td>58–59°F</td><td>172.1</td><td>$0.466</td><td>$80.27</td>
+          <td class="pnl pos">+$91.81</td>
+          <td class="left"><span class="pill win">WIN — above</span></td>
+        </tr>
+        <tr class="divider">
+          <td class="left"><span class="city-name">Seattle</span></td>
+          <td><strong>61°F</strong></td><td>5:34 AM †</td>
+          <td class="left conditions">Cloudy</td>
+          <td class="left na">—</td>
+          <td class="left"><span class="band-mono">B60.5</span></td>
+          <td>60–61°F</td><td>150.0</td><td>$0.450</td><td>$67.50</td>
+          <td class="pnl neg">−$67.50</td>
           <td class="left"><span class="pill loss">LOSS — in band</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">Trenton</span></td>
-          <td>64°F</td><td>1:28 PM</td>
-          <td class="left conditions">Showers And Thunderstorms</td>
-          <td class="left"><span class="band-mono">B60.5, B62.5</span></td>
+          <td>48°F</td><td>12:33 AM †</td>
+          <td class="left conditions">Light Rain</td>
+          <td class="left"><span class="band-mono">T50</span></td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr>
           <td class="left"><span class="city-name unfilled">Washington DC</span></td>
-          <td>67°F</td><td>2:18 PM</td>
-          <td class="left conditions">Chance Rain Showers</td>
-          <td class="left"><span class="band-mono">B63.5, B65.5</span></td>
+          <td>52°F</td><td>1:09 PM</td>
+          <td class="left conditions">Mostly Cloudy</td>
+          <td class="left na">—</td>
           <td class="left na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td><td class="na">—</td>
           <td class="left"><span class="pill none">No fill</span></td>
         </tr>
         <tr class="total-row">
-          <td class="left" colspan="7">TOTAL — filled cities only</td>
-          <td>1,300.4</td><td></td><td>$620.96</td>
-          <td class="pnl pos">+$134.64</td>
-          <td class="left">7W / 7L (50%)</td>
+          <td class="left" colspan="7">TOTAL — filled markets only</td>
+          <td>744.0</td><td></td><td>$359.61</td>
+          <td class="pnl pos">+$40.15</td>
+          <td class="left">3W / 3L (50%)</td>
         </tr>
       </tbody>
     </table>
-    <div class="footnote">Bands shown as market-ticker suffixes (e.g. B64.5 = the {64,65}°F band; T-prefixed = tail above the highest ordered band). All fills were NO positions. Atlanta shows two rows — the bot filled both B64.5 and B66.5 there. Chicago had no live orders today, and its CLI record logs the high-temp time as missing ("MM").</div>
+    <div class="footnote">† Overnight/pre-dawn high — a rain system moved through the Northeast (Boston, Newark, New York City, Philadelphia, Trenton) and the West Coast (San Francisco, Seattle) ahead of a frontal passage; mild air arrived overnight and temperatures fell through the daylight hours. Conditions column is <code>nws_short_conditions</code> from the latest same-day snapshot run.</div>
     <div class="commentary">
-      <strong>Every loss landed inside its band; every win landed clean outside it.</strong> Four wins came from actuals above the ordered ceiling — Atlanta's B64.5 (67°F vs. a {64,65}°F band), Houston (80°F vs. {78,79}°F), New York City (61°F vs. {59,60}°F), and Philadelphia (65°F vs. {61,62}°F, a clean 3°F margin) — for +$255.59 combined. Three more came from the cold side: Boston, Denver, and Oklahoma City all settled 2°F or less below their bands for +$131.47. All seven losses — Atlanta's B66.5, Austin, Dallas, Minneapolis, New Orleans, Newark, Seattle — came from an actual landing on or inside the band, several at the exact top edge (New Orleans at 76°F against a {75,76}°F band; Minneapolis at 40°F against {39,40}°F). <strong>Seattle's 8:05 PM high is worth a second look if the pattern recurs</strong> — unusually late for a November peak — though nothing about today's single fill there (B61.5, −$50.57) points to a data problem.
+      <strong>Seattle is the day's cleanest lesson in band math.</strong> One actual reading, 61°F, sat exactly on the boundary between two adjacent Seattle bands bought as NO: it cleared the {58,59}°F band for a +$91.81 win and landed inside the {60,61}°F band for a $67.50 loss, netting +$24.31 on the city. <strong>Austin was the day's largest single loss</strong> — 139 contracts at 52.3¢ against {79,80}°F, undone by an exact 80°F finish under clear sunny skies with nothing unusual in the forecast to explain the miss. Los Angeles was the opposite story: 220 contracts at 48.4¢ against {70,71}°F, saved by a rain-driven actual of 69°F that landed a full degree below the band for +$113.60, the day's largest win. <strong>Chicago is worth flagging operationally</strong>: the snapshot called for "Snow Likely then Rain And Snow" in mid-November, yet the bot still filled a 55.2-contract NO position on {43,44}°F and lost $28.93 when the actual landed exactly inside — a reminder that unusual seasonal conditions (snow this early) don't automatically widen the model's effective edge. The four shut-out Northeast cities (Boston, Newark, New York City, Philadelphia) cost nothing since no capital was ever at risk there, but it is nineteen of twenty-four cities that got an order at all — five cities (plus Washington DC) traded zero markets today.
     </div>
   </div>
 
@@ -375,18 +363,23 @@
   <div class="section">
     <table>
       <thead>
-        <tr><th class="left">Category</th><th class="left">Count</th><th class="left">Detail</th></tr>
+        <tr><th class="left">Category</th><th>Count</th><th class="left">Sample</th></tr>
       </thead>
       <tbody>
         <tr>
+          <td class="left">PRE_TRADE_SKIP_PEAK</td>
+          <td>9</td>
+          <td class="left conditions">New York City / Philadelphia / Boston / Trenton / Newark: peak hr 4–7 &lt; cutoff 9 (two scan passes, 05:03 and 07:03 CT)</td>
+        </tr>
+        <tr>
           <td class="left">FORECAST_FAILED</td>
-          <td class="left">5</td>
-          <td class="left conditions">Weather Underground returned a null temperatureMax for Las Vegas, Los Angeles, San Diego, San Francisco, and Seattle (NWS source unaffected).</td>
+          <td>5</td>
+          <td class="left conditions">WU temperatureMax null for Los Angeles, Las Vegas, Seattle, San Francisco, San Diego (05:02 CT, status=200)</td>
         </tr>
       </tbody>
     </table>
     <div class="commentary">
-      <strong>Secondary-source only — no operational impact today.</strong> All 5 alerts are Weather Underground's <code>temperatureMax[variable]</code> coming back null for the same West Coast/mountain batch seen on prior days; NWS-sourced <code>forecast_avg</code> and <code>forecast_std</code> were unaffected. Seattle is among the five and did fill a band today (B61.5, −$50.57), but that fill and its forecast inputs ran entirely on the NWS side, so the WU gap had no bearing on the outcome. No fix needed unless WU coverage degrades further.
+      <strong>Both alert categories are known, non-fatal conditions, not failures.</strong> <code>PRE_TRADE_SKIP_PEAK</code> is the peak-hour cutoff gate working as designed — it kept the bot out of five Northeast cities whose expected peak fell too early in the day to trade profitably, matching the overnight/pre-dawn actuals those cities posted. <code>FORECAST_FAILED</code> reflects Weather Underground dropping <code>temperatureMax</code> for five rain-affected cities; NWS covered every one of them and all five traded normally. No action needed today, but if WU's null-on-rain pattern repeats, it is worth auditing whether forecast_std (which blends WU and NWS) is quietly narrowing on exactly the days that need the widest band.
     </div>
   </div>
 
