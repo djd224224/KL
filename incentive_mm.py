@@ -4413,6 +4413,38 @@ RENEW_URGENT_SECS = _env_float("IMM_RENEW_URGENT_SECS", 240.0)
 _PLACE_TIER_NAMES = ("dark side", "re-price/urgent renewal", "extra rung/pad", "renewal")
 
 
+class CancelBucket:
+    """The fast pull's write tokens (PULL_TOKENS_PER_SEC, PULL_BURST_TOKENS):
+    take(n) waits until n tokens are free and books them. `clock` / `sleep`
+    exist for tests (a fake sleep must advance the fake clock)."""
+
+    def __init__(self, rate: float, burst: float,
+                 clock: Optional[Callable[[], float]] = None,
+                 sleep: Optional[Callable[[float], None]] = None):
+        self.rate, self.cap = max(1e-6, float(rate)), max(1.0, float(burst))
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self.tokens = self.cap
+        self.t = self.clock()
+        self.slept = 0.0
+
+    def _refill(self) -> None:
+        now = self.clock()
+        if now > self.t:
+            self.tokens = min(self.cap, self.tokens + (now - self.t) * self.rate)
+            self.t = now
+
+    def take(self, n: float) -> None:
+        n = min(float(n), self.cap)
+        self._refill()
+        if self.tokens < n:
+            w = (n - self.tokens) / self.rate
+            self.sleep(w)
+            self.slept += w
+            self._refill()
+        self.tokens -= n
+
+
 class WritePacer:
     """Spaces writes at most `rate` per second. wait(n) blocks until the next
     free slot and then books n slots, so a swap's cancel and its replacement
@@ -5261,6 +5293,104 @@ WAVE_HOLD_SECS = max(0.0, _env_float("IMM_WAVE_HOLD_MIN", 15.0)) * 60.0
 WAVE_MIN_COST = _env_float("IMM_WAVE_MIN_COST", 90.0)
 # (Jack 2026-11-07: "two fills of 25+ contracts ... make that 200+")
 WAVE_MIN_CT = max(0.0, _env_float("IMM_WAVE_MIN_CT", 200.0))
+
+# CANDIDATE BREAKER (Jack 2026-11-15: "build both", after the Mark Kelly run).
+# 12:20:10-12:21:29Z 11/15 a taker bought Mark Kelly YES at 2c state by state
+# in KXDPRESPRIMARY -- AK, CA, CO, CT, HI, IA, ID: our 200-300 asks in each,
+# 1,600 contracts. Every state is its own event, so the sweep breaker and the
+# tape trigger only ever pulled the state just hit; the group breaker tripped
+# on CA, 29 s after AK, but its 1,063-order pull ran on the 120-a-minute
+# fast-cancel budget in no set order, the Kelly asks sat at places 337-960,
+# and five more filled 4-50 s after the trip. Now a maker fill of
+# CAND_MIN_CT+ on a CANDIDATE market of a per-state series -- its event ends
+# in a state code (KXDPRESPRIMARY-28AK), its outcome is a name code of 3+
+# letters (MKEL), cand_key_of -- holds that name's same side in every state of
+# the series for CAND_HOLD_SECS and pulls it at once (the fast pull below),
+# the hit market's other rungs on that side included. The other names, the
+# other side and the other series keep quoting. Since 11/06 the presidential
+# primaries (the only series of this shape we quote) had 21 maker fills, 11
+# of them 200+: 11 trips, ~50 orders out for 10 min each; only 11/15's run
+# reached a second state (1,300 of its 1,600 contracts came after AK).
+#    IMM_CAND_BREAKER=on (default) / dry (ws_cand_<date>.jsonl only) / off
+CAND_BREAKER = os.environ.get("IMM_CAND_BREAKER", "on").strip().lower()
+if CAND_BREAKER not in ("off", "dry", "on"):
+    CAND_BREAKER = "off"
+CAND_MIN_CT = max(0.0, _env_float("IMM_CAND_MIN_CT", 200.0))
+CAND_HOLD_SECS = max(0.0, _env_float("IMM_CAND_HOLD_MIN", 10.0)) * 60.0
+_CAND_STATE_CODES = frozenset((
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS "
+    "MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV "
+    "WI WY DC PR GU VI AS MP DA").split())
+_CAND_EVENT_RE = re.compile(r"^\d*([A-Z]{2})$")
+
+
+def cand_key_of(ticker: str) -> Optional[Tuple[str, str]]:
+    """(series, name code) of a CANDIDATE market of a per-state series (see
+    CAND_BREAKER), else None: SERIES-<digits><state>-<NAME>, the name 3+
+    letters. KXDPRESPRIMARY-28AK-MKEL -> ("KXDPRESPRIMARY", "MKEL"); a party
+    (KXPRESSTATE-CO-28-R), a district (KXHOUSERACE-IN04-28-D) or a strike
+    (KXGOLDEVENT-26NOV1517-T390000) is not one."""
+    parts = str(ticker or "").split("-")
+    if len(parts) != 3:
+        return None
+    s, ev, name = parts
+    m = _CAND_EVENT_RE.match(ev)
+    if m is None or m.group(1) not in _CAND_STATE_CODES:
+        return None
+    if len(name) < 3 or not name.isalpha() or name == "YES":
+        return None
+    return s, name
+
+
+def pull_prio(pull: List[Tuple[str, dict]], hit_ticker: str) -> List[Tuple[str, dict]]:
+    """A breaker's pull, most at risk first (FAST PULL): the hit market's own
+    outcome across its series (the same name in the other states), then the
+    rest of its series, then that name in other series, then everything else
+    -- the order kept inside each."""
+    s = series_of(hit_ticker)
+    name = str(hit_ticker).rsplit("-", 1)[-1]
+
+    def tier(tk: str) -> int:
+        same_s = series_of(tk) == s
+        same_n = tk.rsplit("-", 1)[-1] == name
+        if same_s and same_n:
+            return 0
+        if same_s:
+            return 1
+        if same_n and len(name) >= 3:
+            return 2
+        return 3
+    return sorted(pull, key=lambda p: tier(p[0]))
+
+
+# FAST PULL (Jack 2026-11-15: "can you also cancel faster?"). A breaker's pull
+# went out one DELETE at a time on the WS fast-cancel budget
+# (WS_FAST_MAX_CANCELS_PER_MIN, 120 a minute, shared with the stale-quote
+# cancels), and what that left waited for the cycle, whose cancel loop also
+# ran one at a time (~23 a second): 11/15 the group breaker's 1,063 orders
+# went 12:20:40-12:22:05Z. Kalshi bills a cancel 2 write tokens (a place or
+# amend 10) out of the account's 300 a second (Advanced tier, a 900-token
+# bucket), batched or not, and takes 20 in one DELETE
+# /portfolio/events/orders/batched. Now every breaker pull (candidate, group,
+# sweep, wave) goes out at once in batches of PULL_BATCH, most at risk first
+# (pull_prio), paced to PULL_TOKENS_PER_SEC after a PULL_BURST_TOKENS burst
+# (the crypto fleets share the key's budget), for at most PULL_MAX_SECS (the
+# rest: the cycle, the hold keeps it out of quoting); the cycle's own cancels
+# go the same way (CYCLE_CANCEL_BATCH), held sides first. 1,063 orders: ~150
+# at once, the rest in ~9 s. A batch entry Kalshi answers with an error gets a
+# single cancel to decide (its 404 / 409 = gone, as before); a 429 waits a
+# second and retries once; any other refusal of the batch call turns
+# batching off for the run (single cancels, as before), and so does the
+# audit: a batch-cancelled order still listed by a resting read that began
+# BATCH_AUDIT_SECS+ after the cancel (logged and emailed). The tape trigger
+# keeps the fast-cancel budget. IMM_PULL_BATCH=1: one by one everywhere.
+PULL_BATCH = max(1, min(20, _env_int("IMM_PULL_BATCH", 20)))
+PULL_TOKENS_PER_SEC = max(10.0, _env_float("IMM_PULL_TOKENS_PER_SEC", 200.0))
+PULL_BURST_TOKENS = max(40.0, _env_float("IMM_PULL_BURST_TOKENS", 300.0))
+PULL_MAX_SECS = max(1.0, _env_float("IMM_PULL_MAX_SECS", 20.0))
+CANCEL_TOKENS = 2.0
+CYCLE_CANCEL_BATCH = os.environ.get("IMM_CYCLE_CANCEL_BATCH", "1") == "1"
+BATCH_AUDIT_SECS = 10.0
 
 
 def wave_series(series: str) -> bool:
@@ -14716,6 +14846,10 @@ _CONFIG_CODE_KNOBS = (
     "EXCH_PAUSE_MODE", "EXCH_PAUSE_CODES", "EXCH_PAUSE_POLL_SECS",
     "EXCH_PAUSE_PROBE_SECS", "EXCH_PAUSE_EVENTS", "EXCH_PAUSE_ALERT_MIN",
     "EXCH_PAUSE_OVERRUN_MIN",
+    # candidate breaker + fast pull (2026-11-15)
+    "CAND_BREAKER", "CAND_MIN_CT", "CAND_HOLD_SECS", "PULL_BATCH",
+    "PULL_TOKENS_PER_SEC", "PULL_BURST_TOKENS", "PULL_MAX_SECS",
+    "CYCLE_CANCEL_BATCH",
     # cross-event breaker and the dollar limits + skew, dry (2026-10-17)
     "SWEEP_GROUP", "SWEEP_GROUP_WINDOW_SECS", "SWEEP_GROUP_HOLD_SECS",
     "SWEEP_GROUP_MIN_CT", "SWEEP_GROUP_MIN_EVENTS", "RISK_LIMITS", "RISK_EVENT_FLOOR", "RISK_EVENT_DAYS",
@@ -28429,6 +28563,23 @@ class IncentiveMarketMaker:
         self._grp = {"fills": 0, "trips": 0, "trips_live": 0, "held_fills": 0,
                      "held_ct": 0.0, "cancels": 0, "skipped_budget": 0,
                      "skipped_writes": 0}
+        # candidate breaker (2026-11-15, CAND_BREAKER): (series, name, side)
+        # -> a trip's window end (dry or on); -> a LIVE hold's end
+        self._cand_win: Dict[Tuple[str, str, str], float] = {}
+        self._cand_hold: Dict[Tuple[str, str, str], float] = {}
+        self._cand_st = {"fills": 0, "trips": 0, "trips_live": 0,
+                         "held_fills": 0, "cancels": 0, "skipped_budget": 0,
+                         "skipped_writes": 0}
+        # fast pull (2026-11-15, PULL_BATCH): the write tokens it paces to;
+        # batch-cancelled ids -> when (the resting-read audit); why batching
+        # went off for this run (None: on)
+        self._pull_bucket = CancelBucket(PULL_TOKENS_PER_SEC, PULL_BURST_TOKENS)
+        self._pull_clock: Callable[[], float] = time.monotonic
+        self._bcx_sent: Dict[str, float] = {}
+        self._bcx_off: Optional[str] = None
+        self._pull_st = {"pulls": 0, "batches": 0, "batched": 0, "single": 0,
+                         "entry_errors": 0, "retries_429": 0, "call_errors": 0,
+                         "left_for_cycle": 0, "longest_s": 0.0, "audit_bad": 0}
         # tape trigger (2026-11-01, TAPE_TRIGGER): the public-trade feed (its
         # own connection); the open taker bursts, (ticker, taker side) ->
         # burst; hold key -> the window a trip opened {"at", "until", "mode",
@@ -29815,6 +29966,8 @@ class IncentiveMarketMaker:
                           for k, s in self._sweep_esc.items() if float(s["reset_at"]) > now},
             "grp_hold": {"\t".join(k): round(float(v), 1)
                          for k, v in self._grp_hold.items() if float(v) > now},
+            "cand_hold": {"\t".join(k): round(float(v), 1)
+                          for k, v in self._cand_hold.items() if float(v) > now},
             "fair_moved_at": {name: {str(k): round(float(v), 1)
                                      for k, v in st["moved_at"].items()
                                      if now - float(v) < FAIR_MOVED_KEEP_SECS}
@@ -29852,6 +30005,16 @@ class IncentiveMarketMaker:
                     n["grp_hold"] = n.get("grp_hold", 0) + 1
             except (TypeError, ValueError):
                 log(f"{self.tag} ! state file: bad grp_hold entry {k!r}: {v!r}")
+        for k, v in (data.get("cand_hold") or {}).items():
+            try:
+                parts = tuple(str(k).split("\t"))
+                if float(v) > now and len(parts) == 3:
+                    self._cand_hold[parts] = float(v)
+                    self._cand_win[parts] = max(float(v),
+                                                self._cand_win.get(parts, 0.0))
+                    n["cand_hold"] = n.get("cand_hold", 0) + 1
+            except (TypeError, ValueError):
+                log(f"{self.tag} ! state file: bad cand_hold entry {k!r}: {v!r}")
         for k, v in (data.get("wave_hold") or {}).items():
             try:
                 if float(v) > now and "\t" in k:
@@ -31254,6 +31417,328 @@ class IncentiveMarketMaker:
         g = risk_group_of(ticker)
         return g is not None and self._grp_hold.get((g, side), 0.0) > now_ts
 
+    def cand_held(self, ticker: str, side: str, now_ts: float) -> bool:
+        """True while a LIVE candidate-breaker trip (CAND_BREAKER on) holds
+        `side` of the ticker's name across its per-state series."""
+        if CAND_BREAKER != "on" or not self._cand_hold:
+            return False
+        ck = cand_key_of(ticker)
+        return ck is not None and \
+            self._cand_hold.get((ck[0], ck[1], side), 0.0) > now_ts
+
+    def _cand_note_fill(self, t: str, oid: str, side: str, px: float,
+                        n: float, fts: float, now_ts: float,
+                        trade_id: Any) -> None:
+        """The CANDIDATE BREAKER (CAND_BREAKER) on one of our maker fills,
+        from _sweep_note_fill: a fill of CAND_MIN_CT+ on a candidate market of
+        a per-state series (cand_key_of) holds that name's `side` in every
+        state of the series CAND_HOLD_SECS and pulls those orders at once
+        (on), or logs that it would (dry). A fill inside a trip's window is a
+        `held_fill` line."""
+        ck = cand_key_of(t)
+        if ck is None or side not in ("bid", "ask"):
+            return
+        s, name = ck
+        st = self._cand_st
+        st["fills"] += 1
+        key = (s, name, side)
+        ev = self._event_of(t)
+        if self._cand_win.get(key, 0.0) > now_ts:
+            st["held_fills"] += 1
+            self._sink("ws_cand", {
+                "ev": "held_fill", "ts": round(now_ts, 3), "mode": CAND_BREAKER,
+                "series": s, "name": name, "side": side, "ticker": t,
+                "order_id": oid, "px": px, "count": n, "fill_ts": fts,
+                "trade_id": trade_id})
+            return
+        if n + 1e-9 < CAND_MIN_CT:
+            return
+        for d in (self._cand_win, self._cand_hold):
+            for k_old in [k for k, u in d.items() if u < now_ts - 3600]:
+                del d[k_old]
+        live = CAND_BREAKER == "on"
+        until = now_ts + CAND_HOLD_SECS
+        self._cand_win[key] = until
+        st["trips"] += 1
+        if live:
+            self._cand_hold[key] = until
+            st["trips_live"] += 1
+        # that name's side in every state: the cycle's view, plus what was
+        # placed since, which only the ledger holds yet
+        pull: List[Tuple[str, dict]] = []
+        for tk, lst in self._resting_view.items():
+            if cand_key_of(tk) != ck:
+                continue
+            pull.extend((tk, o) for o in lst
+                        if o["side"] == side and o["rem"] > 0
+                        and o["order_id"] != oid)
+        in_view = {o["order_id"] for _tk, o in pull} | {oid}
+        for l_oid, led in list(self.state.ledger.items()):
+            l_t = str(led.get("ticker") or "")
+            l_rem = float(led.get("remaining_count") or 0.0)
+            if l_oid in in_view or l_oid in self._cycle_cancelled or l_rem <= 0 \
+                    or str(led.get("book_side") or "") != side or not l_t \
+                    or cand_key_of(l_t) != ck \
+                    or any(o["order_id"] == l_oid
+                           for o in self._resting_view.get(l_t, ())):
+                continue
+            l_px = led.get("yes_price_exact")
+            pull.append((l_t, {"order_id": l_oid, "side": side,
+                               "px": float(l_px) if l_px is not None
+                               else float(led.get("yes_price") or 0),
+                               "rem": l_rem}))
+        others = sorted({self._event_of(tk) for tk, _o in pull} - {ev})
+        mode = "on" if live else "dry"
+        self._sink("ws_cand", {
+            "ev": "trip", "ts": round(now_ts, 3), "mode": mode, "series": s,
+            "name": name, "side": side, "ticker": t, "event": ev,
+            "order_id": oid, "px": px, "count": n, "fill_ts": fts,
+            "trade_id": trade_id, "hold_s": CAND_HOLD_SECS,
+            "states": len(others),
+            "pull": [[tk, o["order_id"], o["px"], o["rem"]] for tk, o in pull]})
+        log(f"{self.tag} candidate breaker ({mode}): {t} {side.upper()} @ "
+            f"{px:g}c hit ({n:g}) -> {'holding' if live else 'would hold'} "
+            f"{name} {side.upper()}s across {s} {CAND_HOLD_SECS / 60:.0f} min: "
+            f"{len(pull)} order(s) in {len(others)} other state(s)")
+        if not live:
+            return
+        self._ws_pull(pull, "cand_breaker", now_ts, st, "cand")
+
+    def _ws_pull(self, pull: List[Tuple[str, dict]], reason: str,
+                 now_ts: float, st: dict, by: str) -> None:
+        """A breaker's pull (FAST PULL): every order at once, in the order
+        given, batched and paced (cancel_orders_fast) for at most
+        PULL_MAX_SECS; what is left the cycle pulls (the breaker's hold keeps
+        it out of quoting). Books each cancel in the breaker's stats `st`
+        and the resting view."""
+        orders: Dict[str, dict] = {}
+        for _tk, o in pull:
+            oid = str(o.get("order_id") or "")
+            if oid and float(o.get("rem") or 0.0) > 0 and oid not in orders:
+                orders[oid] = o
+        if not orders:
+            return
+        self._pull_st["pulls"] += 1
+        ok, _bad, left = self.cancel_orders_fast(list(orders), reason,
+                                                 budget_s=PULL_MAX_SECS)
+        for oid in ok:
+            o = orders.get(oid)
+            if o is None:
+                continue
+            self.state.cancelled_today += 1
+            st["cancels"] += 1
+            o["rem"] = 0.0
+            self._ws_suspect.pop(oid, None)
+            if oid in self._ws_flagged:
+                self._ws_episode_end(oid, "cancel", now_ts, by=by)
+        if left:
+            st["skipped_budget"] += len(left)        # the cycle pulls them
+            self._pull_st["left_for_cycle"] += len(left)
+
+    def _held_first(self, oids: List[str], now_ts: float) -> List[str]:
+        """The cycle's cancels, the orders a breaker holds out first (a pull
+        the WS left for the cycle), the order kept otherwise."""
+        def tier(oid: str) -> int:
+            led = self.state.ledger.get(oid) or {}
+            t = str(led.get("ticker") or self._order_ticker.get(oid, "") or "")
+            sd = str(led.get("book_side") or "")
+            if not t:
+                return 1
+            if self.sweep_held(self._event_of(t), now_ts):
+                return 0
+            if sd and (self.cand_held(t, sd, now_ts)
+                       or self.group_held(t, sd, now_ts)):
+                return 0
+            return 1
+        return sorted(oids, key=tier)
+
+    def _book_batch_cancel(self, order_id: str, reason: str) -> None:
+        """cancel_order's books for an order a batch cancel took off."""
+        led = self.state.ledger.get(order_id) or {}
+        placed_at = led.get("_placed_at")
+        self._cycle_cancelled.add(order_id)
+        self.state.order_ages.pop(order_id, None)
+        self.state.ledger.pop(order_id, None)
+        self._log_order(
+            "cancel", led.get("ticker", ""), led.get("book_side", ""),
+            led.get("yes_price"), led.get("remaining_count"), order_id,
+            reason=reason, batched=True,
+            rested_secs=(round(time.time() - placed_at, 1)
+                         if placed_at else None))
+
+    def _cancel_batch(self, chunk: List[str],
+                      reason: str) -> Tuple[Set[str], Set[str], List[str]]:
+        """One batch DELETE of up to PULL_BATCH orders (FAST PULL), after its
+        write tokens. Returns (cancelled or gone, failed, left: Kalshi
+        throttled it twice). An entry Kalshi answers with an error, or does
+        not answer, gets a single cancel_order to decide; an order with no
+        known market too (it cannot be routed). A refused call turns batching
+        off for the run and cancels the chunk one by one; a timeout or a
+        network error cancels the chunk one by one (the single cancels say
+        what is gone)."""
+        ok: Set[str] = set()
+        bad: Set[str] = set()
+
+        def single(oid: str) -> None:
+            self._pull_st["single"] += 1
+            (ok if self.cancel_order(oid, reason=reason) else bad).add(oid)
+
+        items: List[Tuple[str, str]] = []
+        for oid in chunk:
+            led = self.state.ledger.get(oid) or {}
+            t = str(led.get("ticker") or self._order_ticker.get(oid, "") or "")
+            if t:
+                items.append((oid, t))
+            else:
+                single(oid)
+        if not items:
+            return ok, bad, []
+        self._heartbeat = time.time()
+        js: Any = None
+        for attempt in (0, 1):
+            self._pull_bucket.take(CANCEL_TOKENS * len(items))
+            try:
+                js = self.client.batch_cancel_v2(items)
+                break
+            except HttpError as e:
+                if e.status == 429:
+                    self._pull_st["retries_429"] += 1
+                    if attempt == 0:
+                        self._pull_bucket.sleep(1.0)
+                        continue
+                    log(f"{self.tag} ! fast pull: batch cancel throttled twice "
+                        f"(429) -- {len(items)} order(s) left for the cycle")
+                    return ok, bad, [oid for oid, _t in items]
+                body = str(getattr(e, "body", "") or "")[:160]
+                self._pull_st["call_errors"] += 1
+                if self._bcx_off is None:
+                    self._bcx_off = f"batch call refused: {e} {body}".strip()
+                    log(f"{self.tag} ! fast pull: {self._bcx_off} -- batching "
+                        f"OFF for this run, single cancels as before")
+                for oid, _t in items:
+                    single(oid)
+                return ok, bad, []
+            except Exception as e:
+                self._pull_st["call_errors"] += 1
+                log(f"{self.tag} ! fast pull: batch cancel failed ({e}) -- "
+                    f"{len(items)} order(s) one by one")
+                for oid, _t in items:
+                    single(oid)
+                return ok, bad, []
+        self._pull_st["batches"] += 1
+        by_id: Dict[str, dict] = {}
+        for r in (js or {}).get("orders") or []:
+            if isinstance(r, dict):
+                by_id[str(r.get("order_id") or "")] = r
+        sent_at = time.time()
+        codes: List[str] = []
+        for oid, _t in items:
+            r = by_id.get(oid)
+            err = r.get("error") if r is not None else {"code": "unanswered"}
+            if r is not None and not err:
+                self._book_batch_cancel(oid, reason)
+                self._bcx_sent[oid] = sent_at
+                self._pull_st["batched"] += 1
+                ok.add(oid)
+                continue
+            self._pull_st["entry_errors"] += 1
+            codes.append(str(err.get("code") if isinstance(err, dict) else err))
+            single(oid)
+        if codes and any(c != "not_found" for c in codes):
+            log(f"{self.tag} fast pull: {len(codes)} batch entr"
+                f"{'y' if len(codes) == 1 else 'ies'} refused "
+                f"({', '.join(sorted(set(codes)))}) -- cancelled one by one")
+        return ok, bad, []
+
+    def cancel_orders_fast(self, oids: Iterable[str], reason: str,
+                           budget_s: Optional[float] = None,
+                           tick: bool = False
+                           ) -> Tuple[Set[str], Set[str], List[str]]:
+        """FAST PULL (PULL_BATCH): cancel `oids` in the order given, in
+        batches of PULL_BATCH (one DELETE each) paced to the write tokens
+        (_pull_bucket). Returns (cancelled or already gone, failed, left
+        undone: the `budget_s` seconds ran out, or Kalshi throttled twice).
+        Dry, with batching off, or PULL_BATCH 1: one cancel_order at a time,
+        as before. An id this cycle already cancelled counts as done without
+        a call. `tick`: the feed is ticked between writes (the cycle's
+        loop). Never raises."""
+        todo = [o for o in dict.fromkeys(str(x) for x in oids) if o]
+        ok: Set[str] = set()
+        bad: Set[str] = set()
+        left: List[str] = []
+        t0 = self._pull_clock()
+        i = 0
+        try:
+            while i < len(todo):
+                if budget_s is not None and self._pull_clock() - t0 > budget_s:
+                    left = todo[i:]
+                    break
+                if tick:
+                    self._ws_cycle_tick()
+                single = (not self.live or PULL_BATCH <= 1
+                          or self._bcx_off is not None
+                          or not hasattr(self.client, "batch_cancel_v2"))
+                if single:
+                    oid = todo[i]
+                    i += 1
+                    if oid in self._cycle_cancelled:
+                        ok.add(oid)
+                    elif self.cancel_order(oid, reason=reason):
+                        ok.add(oid)
+                    else:
+                        bad.add(oid)
+                    continue
+                chunk: List[str] = []
+                while i < len(todo) and len(chunk) < PULL_BATCH:
+                    oid = todo[i]
+                    i += 1
+                    if oid in self._cycle_cancelled:
+                        ok.add(oid)
+                    else:
+                        chunk.append(oid)
+                if not chunk:
+                    continue
+                c_ok, c_bad, c_left = self._cancel_batch(chunk, reason)
+                ok |= c_ok
+                bad |= c_bad
+                if c_left:
+                    left = c_left + todo[i:]
+                    break
+        except Exception as e:
+            log(f"{self.tag} ! fast pull failed ({e}); the cycle finishes it")
+            left = [o for o in todo if o not in ok and o not in bad]
+        el = self._pull_clock() - t0
+        if el > self._pull_st["longest_s"]:
+            self._pull_st["longest_s"] = round(el, 2)
+        return ok, bad, left
+
+    def _batch_cancel_audit(self, resting: List[dict], read_t0: float) -> None:
+        """FAST PULL audit, at the cycle's resting read: an order a batch
+        cancel took off BATCH_AUDIT_SECS+ before the read began, still listed
+        by it, means Kalshi did not cancel it -- batching goes off for the
+        run (single cancels, as before; the cycle's diff cancels it again),
+        logged and emailed. Never raises."""
+        try:
+            due = {oid for oid, ts in self._bcx_sent.items()
+                   if ts <= read_t0 - BATCH_AUDIT_SECS}
+            if not due:
+                return
+            still = sorted({str(o.get("order_id") or "") for o in resting} & due)
+            for oid in due:
+                self._bcx_sent.pop(oid, None)
+            if not still:
+                return
+            self._pull_st["audit_bad"] += len(still)
+            if self._bcx_off is None:
+                self._bcx_off = (f"audit: {len(still)} batch-cancelled order(s) "
+                                 f"still resting ({', '.join(still[:3])})")
+                msg = (f"fast pull: {self._bcx_off} -- batching OFF for this "
+                       f"run, single cancels as before")
+                log(f"{self.tag} ! {msg}")
+                self.alerter.alert("fast_pull", msg, key="fast_pull_audit")
+        except Exception as e:
+            log(f"{self.tag} ! fast pull audit failed: {e}")
+
     def wave_held(self, ticker: str, side: str, px: float, now_ts: float) -> bool:
         """True while a LIVE wave-breaker trip holds `side` of the ticker's
         series and a rung at `px` there ties up WAVE_MIN_COST+ c a contract."""
@@ -31283,6 +31768,8 @@ class IncentiveMarketMaker:
                 or self.sweep_held(self._event_of(ticker), now_ts)
                 or self.group_held(ticker, "bid", now_ts)
                 or self.group_held(ticker, "ask", now_ts)
+                or self.cand_held(ticker, "bid", now_ts)
+                or self.cand_held(ticker, "ask", now_ts)
                 or self.wave_any_held(ticker, now_ts)
                 or self._xp_shard_paused(ticker))
 
@@ -31399,22 +31886,10 @@ class IncentiveMarketMaker:
             f"{n_mkts} market(s), ~${grp_day / 2.0:.2f}/day of reward")
         if not live:
             return
-        for _tk, o in pull:
-            while self._ws_cancel_times and \
-                    self._ws_cancel_times[0] < now_ts - 60.0:
-                self._ws_cancel_times.popleft()
-            if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
-                st["skipped_budget"] += 1          # the cycle pulls it
-                continue
-            self._ws_cancel_times.append(now_ts)
-            if self.cancel_order(o["order_id"], reason="group_breaker"):
-                self.state.cancelled_today += 1
-                st["cancels"] += 1
-                o["rem"] = 0.0
-                self._ws_suspect.pop(o["order_id"], None)
-                if o["order_id"] in self._ws_flagged:
-                    self._ws_episode_end(o["order_id"], "cancel", now_ts,
-                                         by="group")
+        # all of it at once, the hit name across its series first (FAST
+        # PULL): 11/15 the Kelly asks the taker went on to sat at places
+        # 337-960 of 1,063 and five filled before the cancels got there
+        self._ws_pull(pull_prio(pull, t), "group_breaker", now_ts, st, "group")
 
     def _wave_note_fill(self, t: str, oid: str, side: str, px: float,
                         n: float, fts: float, now_ts: float,
@@ -31495,22 +31970,7 @@ class IncentiveMarketMaker:
         self.alerter.alert("wave_breaker", msg, key=f"{s}-{side}", urgent=True, now_ts=now_ts)
         if not live:
             return
-        for _tk, o in pull:
-            while self._ws_cancel_times and \
-                    self._ws_cancel_times[0] < now_ts - 60.0:
-                self._ws_cancel_times.popleft()
-            if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
-                st["skipped_budget"] += 1          # the cycle pulls it
-                continue
-            self._ws_cancel_times.append(now_ts)
-            if self.cancel_order(o["order_id"], reason="wave_breaker"):
-                self.state.cancelled_today += 1
-                st["cancels"] += 1
-                o["rem"] = 0.0
-                self._ws_suspect.pop(o["order_id"], None)
-                if o["order_id"] in self._ws_flagged:
-                    self._ws_episode_end(o["order_id"], "cancel", now_ts,
-                                         by="wave")
+        self._ws_pull(pull_prio(pull, t), "wave_breaker", now_ts, st, "wave")
 
     def _tape_note_fill(self, t: str, oid: str, side: str, px: float,
                         n: float, fts: float, now_ts: float,
@@ -31933,6 +32393,11 @@ class IncentiveMarketMaker:
                 side = str(led.get("book_side") or "")
                 pxe = led.get("yes_price_exact")
                 px = float(pxe) if pxe is not None else float(led.get("yes_price") or 0)
+            if CAND_BREAKER != "off":
+                # the candidate breaker (2026-11-15): one name across the
+                # states of a per-state series, at its first 200+ fill
+                self._cand_note_fill(t, oid, side, px, n, fts, now_ts,
+                                     body.get("trade_id"))
             if SWEEP_GROUP != "off":
                 # the cross-event breaker counts every maker fill, partial
                 # or not (2026-10-17)
@@ -32077,22 +32542,8 @@ class IncentiveMarketMaker:
                 + f" for {hold_s:.0f}s" + esc_txt)
             if not live:
                 return
-            for _tk, o in pull:
-                while self._ws_cancel_times and \
-                        self._ws_cancel_times[0] < now_ts - 60.0:
-                    self._ws_cancel_times.popleft()
-                if len(self._ws_cancel_times) >= WS_FAST_MAX_CANCELS_PER_MIN:
-                    self._sweep["skipped_budget"] += 1  # the cycle pulls it
-                    continue
-                self._ws_cancel_times.append(now_ts)
-                if self.cancel_order(o["order_id"], reason="sweep_breaker"):
-                    self.state.cancelled_today += 1
-                    self._sweep["cancels"] += 1
-                    o["rem"] = 0.0
-                    self._ws_suspect.pop(o["order_id"], None)
-                    if o["order_id"] in self._ws_flagged:
-                        self._ws_episode_end(o["order_id"], "cancel", now_ts,
-                                             by="sweep")
+            # all of it at once (FAST PULL), batched and paced
+            self._ws_pull(pull, "sweep_breaker", now_ts, self._sweep, "sweep")
         except Exception as e:
             log(f"{self.tag} ! sweep breaker failed: {e}")
 
@@ -32367,7 +32818,8 @@ class IncentiveMarketMaker:
                 any(f_oid == oid and f_ts > p["read_at"] + 1.0
                     for f_ts, f_oid, _n in self._ws_fill_log) or \
                 self.sweep_held(self._event_of(t), now_ts) or \
-                self.group_held(t, m["side"], now_ts):
+                self.group_held(t, m["side"], now_ts) or \
+                self.cand_held(t, m["side"], now_ts):
             st["stale"] += 1
             return
         rec = {"ts": round(now_ts, 3), "mode": BACK_OF_LINE, "ticker": t,
@@ -40067,7 +40519,10 @@ class IncentiveMarketMaker:
         # inventory riding to settlement (review-confirmed P0).
         realized = self.pnl.total_realized() - self.state.realized_baseline
 
+        _rr_t0 = time.time()
         resting = self.fetch_resting_orders(now_ts)   # populates _foreign_resting
+        if self._bcx_sent:
+            self._batch_cancel_audit(resting, _rr_t0)   # FAST PULL audit
         # when that read finished (WS view rebuild: fills after it come off;
         # stamped at the END of a paged read, so a fill during it can only be
         # under-subtracted -- a missed sweep trip, never a false one)
@@ -43221,6 +43676,11 @@ class IncentiveMarketMaker:
         if SWEEP_GROUP == "on" and self._grp_hold:
             desired = [q for q in desired
                        if not self.group_held(q.ticker, q.book_side, now_ts)]
+        # ...and the candidate breaker's held names (on, 2026-11-15, see
+        # CAND_BREAKER): that name's side in no state until the hold ends
+        if CAND_BREAKER == "on" and self._cand_hold:
+            desired = [q for q in desired
+                       if not self.cand_held(q.ticker, q.book_side, now_ts)]
         # ...and the wave breaker's held sides (on, 2026-11-07, see WAVE_BREAKER):
         # no WAVE_MIN_COST+ rung on that side of the series until the hold ends
         if WAVE_BREAKER == "on" and self._wave_hold:
@@ -43303,6 +43763,9 @@ class IncentiveMarketMaker:
             if self.group_held(q_am.ticker, q_am.book_side, time.time()):
                 self._grp["skipped_writes"] += 1
                 continue                   # the group breaker pulled it
+            if self.cand_held(q_am.ticker, q_am.book_side, time.time()):
+                self._cand_st["skipped_writes"] += 1
+                continue                   # the candidate breaker pulled it
             self.amend_order_inplace(o_am, q_am, now_ts)
         if len(to_amend) > MAX_PLACEMENTS_PER_CYCLE:
             log(f"{self.tag} amend cap: {len(to_amend) - MAX_PLACEMENTS_PER_CYCLE} "
@@ -43317,13 +43780,26 @@ class IncentiveMarketMaker:
             replaces, first_cancels = {}, list(to_cancel)
         cancel_failures = 0
         cancelled_ids: Set[str] = set()
-        for oid in first_cancels:
-            self._ws_cycle_tick()
-            if self.cancel_order(oid, reason="requote_diff"):
+        if CYCLE_CANCEL_BATCH and self.live and PULL_BATCH > 1 and \
+                self._bcx_off is None and len(first_cancels) >= 2:
+            # FAST PULL (2026-11-15): batches of PULL_BATCH paced to the write
+            # tokens, a held side's orders first (what a breaker's pull left
+            # for the cycle); the feed is still ticked between batches
+            ok_c, bad_c, left_c = self.cancel_orders_fast(
+                self._held_first(list(first_cancels), time.time()),
+                "requote_diff", tick=True)
+            for oid in ok_c:
                 self.state.cancelled_today += 1
                 cancelled_ids.add(oid)
-            else:
-                cancel_failures += 1
+            cancel_failures = len(bad_c) + len(left_c)
+        else:
+            for oid in first_cancels:
+                self._ws_cycle_tick()
+                if self.cancel_order(oid, reason="requote_diff"):
+                    self.state.cancelled_today += 1
+                    cancelled_ids.add(oid)
+                else:
+                    cancel_failures += 1
         if cancel_failures:
             raise RuntimeError(f"{cancel_failures} cancel(s) failed")
 
@@ -43648,7 +44124,10 @@ class IncentiveMarketMaker:
         for i, q in enumerate(to_place):
             self._ws_cycle_tick()          # the in-cycle stale check / breaker
             held_sweep = self.sweep_held(self._event_of(q.ticker), time.time())
-            if held_sweep or self.group_held(q.ticker, q.book_side, time.time()):
+            held_cand = not held_sweep and \
+                self.cand_held(q.ticker, q.book_side, time.time())
+            if held_sweep or held_cand or \
+                    self.group_held(q.ticker, q.book_side, time.time()):
                 # the breaker (or the group breaker, 2026-10-17) tripped after
                 # the cycle's diff: nothing new goes in before its hold ends,
                 # but an order this placement would have replaced still
@@ -43657,12 +44136,14 @@ class IncentiveMarketMaker:
                 if old_h is not None:
                     pacer.wait()
                     if self.cancel_order(old_h, reason="sweep_breaker" if held_sweep
+                                         else "cand_breaker" if held_cand
                                          else "group_breaker"):
                         self.state.cancelled_today += 1
                         cancelled_ids.add(old_h)
                     elif old_h in by_id:
                         total_resting += _count(by_id[old_h], 1)   # it still rests
-                (self._sweep if held_sweep else self._grp)["skipped_writes"] += 1
+                (self._sweep if held_sweep else self._cand_st if held_cand
+                 else self._grp)["skipped_writes"] += 1
                 continue
             if self._xp_waiting(q.ticker, time.time()):
                 # EXCHANGE PAUSE (2026-10-22): Kalshi refuses writes on this
@@ -44029,6 +44510,16 @@ class IncentiveMarketMaker:
                 held_now=sum(1 for u in self._grp_hold.values() if u > now),
                 windows_now=sum(1 for w in self._grp_win.values()
                                 if w["until"] > now))
+            # the candidate breaker and the fast pull (2026-11-15)
+            out["cand_breaker"] = dict(
+                self._cand_st, mode=CAND_BREAKER, min_ct=CAND_MIN_CT,
+                hold_min=CAND_HOLD_SECS / 60,
+                held_now=sum(1 for u in self._cand_hold.values() if u > now))
+            out["fast_pull"] = dict(
+                self._pull_st, batch=PULL_BATCH,
+                tokens_per_sec=PULL_TOKENS_PER_SEC,
+                burst_tokens=PULL_BURST_TOKENS, max_secs=PULL_MAX_SECS,
+                cycle_batch=CYCLE_CANCEL_BATCH, off=self._bcx_off)
             # the tape trigger: other traders' sweeps (2026-11-01)
             tape = self._tape
             out["tape"] = dict(
@@ -46496,6 +46987,22 @@ class IncentiveMarketMaker:
                   if SWEEP_GROUP == "dry" else "")
                + ("" if SWEEP_BREAKER != "off" else
                   " (inactive: it reads the sweep breaker's fills, which is off)")))
+        log(f"candidate breaker (2026-11-15): {CAND_BREAKER}"
+            + ("" if CAND_BREAKER == "off" else
+               f" -- a maker fill of {CAND_MIN_CT:g}+ on a name in a per-state "
+               f"series (KXDPRESPRIMARY-28AK-MKEL) holds that name's side in "
+               f"every state {CAND_HOLD_SECS / 60:g} min"
+               + (" -- LOGGED only (ws_cand_<date>.jsonl), nothing pulled"
+                  if CAND_BREAKER == "dry" else "")
+               + ("" if SWEEP_BREAKER != "off" else
+                  " (inactive: it reads the sweep breaker's fills, which is off)")))
+        log("fast pull (2026-11-15): breaker pulls"
+            + (" and the cycle's cancels" if CYCLE_CANCEL_BATCH else "")
+            + (f" go out in batches of {PULL_BATCH}, most at risk first, paced "
+               f"to {PULL_TOKENS_PER_SEC:g} write tokens/s after a "
+               f"{PULL_BURST_TOKENS:g}-token burst (a cancel is "
+               f"{CANCEL_TOKENS:g}), a breaker's pull at most {PULL_MAX_SECS:g} s"
+               if PULL_BATCH > 1 else " go out one at a time (IMM_PULL_BATCH=1)"))
         if TAPE_TRIGGER == "ab":
             _tape_how = (
                 f" -- THE LIVE A/B (2026-11-02): a taker of {TAPE_AB_MIN_CT:g}+ "

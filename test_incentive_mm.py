@@ -31093,12 +31093,15 @@ class TestSweepBreaker(unittest.TestCase):
         self.assertEqual(self.bot._sweep["cancels"], 2)
         self.assertEqual(self._trips()[0]["mode"], "on")
 
-    def test_on_respects_the_fast_cancel_budget(self):
+    def test_on_pulls_the_whole_event_whatever_the_fast_cancel_budget(self):
+        # FAST PULL (Jack 2026-11-15: "can you also cancel faster?"): a
+        # breaker's pull goes out at once, batched and paced to the write
+        # tokens; the 120-a-minute budget is the stale-quote cancels' only
         with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
                 mock.patch.object(imm, "WS_FAST_MAX_CANCELS_PER_MIN", 1):
             self._fill("o1", 20)
         self.assertEqual((len(self.cancelled), self.bot._sweep["skipped_budget"]),
-                         (1, 1))
+                         (2, 0))
 
     def test_the_holdout_keeps_a_random_share_of_trips_as_a_dry_control(self):
         with mock.patch.object(imm, "SWEEP_BREAKER", "on"), \
@@ -39644,6 +39647,374 @@ class TestGroupBreaker(unittest.TestCase):
             self.assertEqual(self._lines("trip"), [])
             self._fill(180, self.B, count=300.0)
             self.assertEqual(len(self._lines("trip")), 1)
+
+
+class TestCandidateBreaker(unittest.TestCase):
+    """The CANDIDATE BREAKER (CAND_BREAKER, Jack 2026-11-15: "build both",
+    after a taker bought Mark Kelly YES off our asks state by state in
+    KXDPRESPRIMARY): a 200+ maker fill on a name in a per-state series holds
+    that name's side in every state 10 min and pulls it at once."""
+    S = "KXDPRESPRIMARY"
+    AK, CA, CO = S + "-28AK-MKEL", S + "-28CA-MKEL", S + "-28CO-MKEL"
+    CAJ = S + "-28CA-JTAL"                       # another name, same state
+    AZS = "KXSENATENOM-AZD-28-MKEL"              # the name in another series
+
+    def setUp(self):
+        _clean_persist()
+        self.bot = IncentiveMarketMaker(client=FakeClient(), live=False)
+        self.feed = _FakeFeed()
+        self.bot._ws = self.feed
+        self.now = time.time()
+        self.recs = []
+        self.bot._sink = lambda name, rec: self.recs.append((name, dict(rec)))
+        self.cancelled = []
+        self.bot.cancel_order = lambda oid, reason="": \
+            self.cancelled.append((oid, reason)) or True
+        for name, v in (("WS_MODE", "shadow"), ("SWEEP_BREAKER", "on"),
+                        ("SWEEP_HOLD_SECS", 600.0), ("SWEEP_HOLDOUT", 0.0),
+                        ("SWEEP_ESCALATE", "off"), ("SWEEP_GROUP", "off"),
+                        ("WAVE_BREAKER", "off"), ("TAPE_TRIGGER", "off"),
+                        ("CAND_BREAKER", "on"), ("CAND_MIN_CT", 200.0),
+                        ("CAND_HOLD_SECS", 600.0)):
+            p = mock.patch.object(imm, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+        def o(oid, side, px, rem=300.0):
+            return {"order_id": oid, "side": side, "px": px, "rem": rem,
+                    "placed": self.now - 60, "pad": False}
+        self.bot._resting_view = {
+            self.AK: [o("ak-a1", "ask", 2.0), o("ak-a2", "ask", 3.0),
+                      o("ak-b", "bid", 1.0)],
+            self.CA: [o("ca-a", "ask", 2.0), o("ca-b", "bid", 1.0)],
+            self.CO: [o("co-a", "ask", 2.0)],
+            self.CAJ: [o("caj-a", "ask", 2.0)],
+            self.AZS: [o("azs-a", "ask", 57.0)]}
+        self.n = 0
+
+    def _fill(self, dt, oid, count=250.0):
+        """A maker fill of `count` on our order `oid` (partial: the event's
+        own sweep breaker stays out of it), dt s after now."""
+        t = next(tk for tk, lst in self.bot._resting_view.items()
+                 if any(x["order_id"] == oid for x in lst))
+        self.n += 1
+        self.feed.events = [("fill", {"order_id": oid, "market_ticker": t,
+                                      "count_fp": f"{count:.2f}", "is_taker": False,
+                                      "ts_ms": int((self.now + dt) * 1000),
+                                      "trade_id": f"tr{self.n}"})]
+        self.bot._ws_process_events(self.now + dt)
+
+    def _lines(self, ev=None):
+        return [r for name, r in self.recs
+                if name == "ws_cand" and (ev is None or r["ev"] == ev)]
+
+    def test_the_key_is_a_name_in_a_per_state_series(self):
+        f = imm.cand_key_of
+        self.assertEqual(f(self.AK), (self.S, "MKEL"))
+        self.assertEqual(f("KXRPRESPRIMARY-28NH-RDES"), ("KXRPRESPRIMARY", "RDES"))
+        self.assertEqual(f("KXDPRESPRIMARY-28DC-WMOO"), ("KXDPRESPRIMARY", "WMOO"))
+        for t in (self.AZS, "KXPRESSTATE-CO-28-R", "KXHOUSERACE-IN04-28-D",
+                  "KXGOLDEVENT-26NOV1517-T390000", "KXDPRESPRIMARY-28XX-MKEL",
+                  "KXDPRESPRIMARY-28AK-AO", "KXDPRESPRIMARY-28AK", "", None):
+            self.assertIsNone(f(t), t)
+
+    def test_on_pulls_the_name_in_every_state_and_holds_that_side(self):
+        self._fill(0, "ak-a1")
+        self.assertEqual(sorted(self.cancelled),
+                         [("ak-a2", "cand_breaker"), ("ca-a", "cand_breaker"),
+                          ("co-a", "cand_breaker")])
+        trip, = self._lines("trip")
+        self.assertEqual((trip["mode"], trip["series"], trip["name"], trip["side"],
+                          trip["states"], len(trip["pull"]), trip["hold_s"]),
+                         ("on", self.S, "MKEL", "ask", 2, 3, 600.0))
+        for tk in (self.AK, self.CA, self.CO, self.S + "-28WY-MKEL"):
+            self.assertTrue(self.bot.cand_held(tk, "ask", self.now + 1), tk)
+            self.assertFalse(self.bot.cand_held(tk, "bid", self.now + 1), tk)
+        self.assertFalse(self.bot.cand_held(self.CAJ, "ask", self.now + 1))
+        self.assertFalse(self.bot.cand_held(self.AZS, "ask", self.now + 1))
+        self.assertFalse(self.bot.cand_held(self.CO, "ask", self.now + 601))
+        self.assertTrue(self.bot.coverage_exempt(self.CO, self.now + 1))
+        st = self.bot._cand_st
+        self.assertEqual((st["trips"], st["trips_live"], st["cancels"]), (1, 1, 3))
+        self.assertEqual([o["rem"] for o in self.bot._resting_view[self.CO]], [0.0])
+        # the next state's fill inside the hold is a held_fill, no new trip
+        self._fill(30, "ca-a")
+        self.assertEqual((len(self._lines("trip")), len(self._lines("held_fill"))), (1, 1))
+
+    def test_dry_logs_the_trip_and_pulls_nothing(self):
+        with mock.patch.object(imm, "CAND_BREAKER", "dry"):
+            self._fill(0, "ak-a1")
+            self.assertFalse(self.bot.cand_held(self.CO, "ask", self.now + 1))
+            self._fill(40, "co-a")
+        self.assertEqual(self.cancelled, [])
+        trip, = self._lines("trip")
+        held, = self._lines("held_fill")
+        self.assertEqual((trip["mode"], held["ticker"]), ("dry", self.CO))
+
+    def test_small_fills_other_shapes_and_off_never_trip(self):
+        self._fill(0, "ak-a1", count=150.0)         # under 200
+        self._fill(10, "azs-a", count=250.0)        # not a per-state name
+        self.assertEqual((self._lines("trip"), self.cancelled), ([], []))
+        with mock.patch.object(imm, "CAND_BREAKER", "off"):
+            self._fill(20, "ak-a1", count=250.0)
+        self.assertEqual(self._lines(), [])
+
+    def test_the_hold_survives_a_restart(self):
+        self._fill(0, "ak-a1")
+        payload = self.bot._guard_holds_payload()
+        self.assertIn(f"{self.S}\tMKEL\task", payload["cand_hold"])
+        bot2 = IncentiveMarketMaker(client=FakeClient(), live=False)
+        bot2._restore_guard_holds(json.loads(json.dumps(payload)))
+        self.assertTrue(bot2.cand_held(self.CO, "ask", time.time() + 1))
+        self.assertFalse(bot2.cand_held(self.CO, "bid", time.time() + 1))
+
+    def test_the_cycle_cancels_held_orders_first(self):
+        self.bot.state.ledger.update({
+            "x1": {"ticker": self.CAJ, "book_side": "ask"},
+            "x2": {"ticker": self.CO, "book_side": "ask"},
+            "x3": {"ticker": self.CO, "book_side": "bid"},
+            "x4": {"ticker": self.AZS, "book_side": "ask"}})
+        self._fill(0, "ak-a1")
+        self.assertEqual(self.bot._held_first(["x1", "x2", "x3", "x4", "zz"],
+                                              self.now + 1),
+                         ["x2", "x1", "x3", "x4", "zz"])
+
+    def test_live_defaults_are_on_200_up_10_min(self):
+        src = open(imm.__file__, encoding="utf-8").read()
+        for want in ('os.environ.get("IMM_CAND_BREAKER", "on")',
+                     '_env_float("IMM_CAND_MIN_CT", 200.0)',
+                     '_env_float("IMM_CAND_HOLD_MIN", 10.0)',
+                     '_env_int("IMM_PULL_BATCH", 20)',
+                     '_env_float("IMM_PULL_TOKENS_PER_SEC", 200.0)',
+                     '_env_float("IMM_PULL_BURST_TOKENS", 300.0)',
+                     '_env_float("IMM_PULL_MAX_SECS", 20.0)',
+                     'os.environ.get("IMM_CYCLE_CANCEL_BATCH", "1")'):
+            self.assertIn(want, src)
+
+
+class TestPullPriority(unittest.TestCase):
+    """A breaker's pull goes most at risk first (FAST PULL): the hit name
+    across its series, its series, the name elsewhere, the rest."""
+
+    def test_the_hit_name_across_its_series_goes_first(self):
+        hit = "KXDPRESPRIMARY-28CA-MKEL"
+        tks = ["KXHOUSERACE-IN04-28-D", "KXDPRESPRIMARY-28AL-JTAL",
+               "KXSENATENOM-AZD-28-MKEL", "KXDPRESPRIMARY-28HI-MKEL",
+               "KXDPRESPRIMARY-28WY-AELS", "KXDPRESPRIMARY-28ID-MKEL",
+               "KXPRESSTATE-CO-28-R"]
+        out = [tk for tk, _o in imm.pull_prio([(tk, {}) for tk in tks], hit)]
+        self.assertEqual(out, ["KXDPRESPRIMARY-28HI-MKEL", "KXDPRESPRIMARY-28ID-MKEL",
+                               "KXDPRESPRIMARY-28AL-JTAL", "KXDPRESPRIMARY-28WY-AELS",
+                               "KXSENATENOM-AZD-28-MKEL", "KXHOUSERACE-IN04-28-D",
+                               "KXPRESSTATE-CO-28-R"])
+
+    def test_a_one_letter_outcome_is_no_name(self):
+        out = [tk for tk, _o in imm.pull_prio(
+            [("KXAGRACE-NV-28-D", {}), ("KXHOUSERACE-IN04-28-R", {}),
+             ("KXHOUSERACE-AZ08-28-D", {})], "KXHOUSERACE-IL16-28-D")]
+        self.assertEqual(out, ["KXHOUSERACE-AZ08-28-D", "KXHOUSERACE-IN04-28-R",
+                               "KXAGRACE-NV-28-D"])
+
+
+class _BatchClient:
+    """Kalshi's batch cancel as the fast pull sees it: every call recorded;
+    `fail` raises one exception a call, in order; `entry_err` answers an
+    order with an entry error; a single cancel of an id in `gone` is a 404;
+    `on_batch` runs on every batch call (a test clock)."""
+
+    def __init__(self):
+        self.batches, self.singles, self.fail = [], [], []
+        self.entry_err, self.gone = {}, set()
+        self.on_batch = None
+
+    def batch_cancel_v2(self, items):
+        self.batches.append(list(items))
+        if self.on_batch is not None:
+            self.on_batch()
+        if self.fail:
+            raise self.fail.pop(0)
+        return {"orders": [
+            {"order_id": oid, "reduced_by": "0.00" if oid in self.entry_err else "200.00",
+             "error": ({"code": self.entry_err[oid], "message": "x"}
+                       if oid in self.entry_err else None)}
+            for oid, _t in items]}
+
+    def cancel_order(self, order_id, exchange_index=None, market_ticker=None):
+        self.singles.append(order_id)
+        if order_id in self.gone:
+            raise HttpError("Not Found", 404)
+        return {}
+
+
+def _http_err(status, body=""):
+    e = HttpError("x", status)
+    e.body = body
+    return e
+
+
+class TestFastPull(unittest.TestCase):
+    """The FAST PULL (Jack 2026-11-15: "can you also cancel faster?"):
+    cancels go out in batches of 20 (one DELETE each), paced to the write
+    tokens; an entry error gets a single cancel; a 429 retries once; a
+    refused call or a failed audit turns batching off for the run."""
+
+    def setUp(self):
+        _clean_persist()
+        self.client = _BatchClient()
+        self.bot = IncentiveMarketMaker(client=self.client, live=False)
+        self.bot.live = True
+        self.rows = []
+        self.bot._log_order = lambda kind, *a, **kw: self.rows.append((kind, a, kw))
+        self.clock = [0.0]
+
+        def sleep(s):
+            self.clock[0] += s
+        self.bucket = imm.CancelBucket(200.0, 300.0, clock=lambda: self.clock[0],
+                                       sleep=sleep)
+        self.bot._pull_bucket = self.bucket
+        self.bot._pull_clock = lambda: self.clock[0]
+        self.oids = [f"o{i:02d}" for i in range(45)]
+        for i, oid in enumerate(self.oids):
+            self.bot.state.ledger[oid] = {
+                "ticker": f"KXDPRESPRIMARY-28S{i % 10}-MKEL", "book_side": "ask",
+                "yes_price": 2, "remaining_count": 200.0}
+
+    def test_batches_of_20_routed_by_market_and_booked(self):
+        ok, bad, left = self.bot.cancel_orders_fast(self.oids, "group_breaker")
+        self.assertEqual((ok, bad, left), (set(self.oids), set(), []))
+        self.assertEqual([len(b) for b in self.client.batches], [20, 20, 5])
+        self.assertEqual(self.client.batches[0][3],
+                         ("o03", "KXDPRESPRIMARY-28S3-MKEL"))
+        self.assertEqual(self.client.singles, [])
+        self.assertEqual(self.bot.state.ledger, {})
+        self.assertEqual(len(self.rows), 45)
+        self.assertTrue(all(k == "cancel" and kw["reason"] == "group_breaker"
+                            and kw["batched"] for k, _a, kw in self.rows))
+        self.assertTrue(set(self.oids) <= self.bot._cycle_cancelled)
+        self.assertEqual(sorted(self.bot._bcx_sent), self.oids)
+        self.assertEqual(self.bucket.slept, 0.0)        # 90 tokens: the burst
+        self.assertEqual((self.bot._pull_st["batches"], self.bot._pull_st["batched"]),
+                         (3, 45))
+
+    def test_paced_to_the_write_tokens(self):
+        self.bot._pull_bucket = imm.CancelBucket(
+            40.0, 40.0, clock=lambda: self.clock[0],
+            sleep=lambda s: self.clock.__setitem__(0, self.clock[0] + s))
+        self.bot.cancel_orders_fast(self.oids, "requote_diff")
+        # 40 tokens free, then 40 more after 1 s, then 10 after 0.25 s
+        self.assertAlmostEqual(self.clock[0], 1.25)
+
+    def test_an_entry_error_gets_a_single_cancel_to_decide(self):
+        five = self.oids[:5]
+        self.client.entry_err = {"o01": "not_found", "o02": "market_closed"}
+        self.client.gone = {"o01"}
+        ok, bad, left = self.bot.cancel_orders_fast(five, "sweep_breaker")
+        self.assertEqual((ok, bad, left), (set(five), set(), []))
+        self.assertEqual(sorted(self.client.singles), ["o01", "o02"])
+        self.assertEqual(sorted(self.bot._bcx_sent), ["o00", "o03", "o04"])
+        self.assertEqual(self.bot._pull_st["entry_errors"], 2)
+
+    def test_a_429_retries_once_then_leaves_the_rest_for_the_cycle(self):
+        self.client.fail = [_http_err(429)]
+        ok, _bad, left = self.bot.cancel_orders_fast(self.oids[:5], "group_breaker")
+        self.assertEqual((ok, left, len(self.client.batches)), (set(self.oids[:5]), [], 2))
+        self.assertGreaterEqual(self.clock[0], 1.0)
+        self.client.batches, self.client.fail = [], [_http_err(429), _http_err(429)]
+        ok, _bad, left = self.bot.cancel_orders_fast(self.oids[5:], "group_breaker")
+        self.assertEqual((ok, left), (set(), self.oids[5:]))
+        self.assertIsNone(self.bot._bcx_off)
+
+    def test_a_refused_call_turns_batching_off_for_the_run(self):
+        self.client.fail = [_http_err(410, "deprecated")]
+        ok, bad, left = self.bot.cancel_orders_fast(self.oids, "group_breaker")
+        self.assertEqual((ok, bad, left), (set(self.oids), set(), []))
+        self.assertEqual(len(self.client.batches), 1)
+        self.assertEqual(sorted(self.client.singles), self.oids)
+        self.assertIn("410", self.bot._bcx_off)
+        # the cycle goes one by one from now on
+        self.assertEqual(self.bot._pull_st["call_errors"], 1)
+
+    def test_a_timeout_cancels_its_chunk_one_by_one_and_keeps_batching(self):
+        self.client.fail = [TimeoutError("read timed out")]
+        ok, _bad, _left = self.bot.cancel_orders_fast(self.oids, "group_breaker")
+        self.assertEqual(ok, set(self.oids))
+        self.assertEqual(sorted(self.client.singles), self.oids[:20])
+        self.assertEqual([len(b) for b in self.client.batches], [20, 20, 5])
+        self.assertIsNone(self.bot._bcx_off)
+
+    def test_the_time_budget_leaves_the_rest(self):
+        self.client.on_batch = lambda: self.clock.__setitem__(0, self.clock[0] + 1.0)
+        ok, _bad, left = self.bot.cancel_orders_fast(self.oids, "group_breaker",
+                                                     budget_s=1.5)
+        self.assertEqual((len(ok), left), (40, self.oids[40:]))
+
+    def test_dry_batching_off_or_batch_1_goes_one_by_one(self):
+        calls = []
+        self.bot.cancel_order = lambda oid, reason="": calls.append(oid) or True
+        self.bot.live = False
+        self.bot.cancel_orders_fast(self.oids[:3], "x")
+        self.bot.live = True
+        with mock.patch.object(imm, "PULL_BATCH", 1):
+            self.bot.cancel_orders_fast(self.oids[3:5], "x")
+        self.bot._bcx_off = "test"
+        self.bot.cancel_orders_fast(self.oids[5:7], "x")
+        self.assertEqual((calls, self.client.batches), (self.oids[:7], []))
+
+    def test_an_order_already_cancelled_costs_no_call(self):
+        self.bot._cycle_cancelled.add("o00")
+        ok, _bad, _left = self.bot.cancel_orders_fast(["o00", "o01", "o01"], "x")
+        self.assertEqual((ok, self.client.batches), ({"o00", "o01"},
+                                                     [[("o01", "KXDPRESPRIMARY-28S1-MKEL")]]))
+
+    def test_the_audit_turns_batching_off_when_a_cancelled_order_still_rests(self):
+        alerts = []
+        self.bot.alerter.alert = lambda *a, **kw: alerts.append(a)
+        self.bot._bcx_sent = {"o01": 100.0, "o02": 105.0}
+        self.bot._batch_cancel_audit([{"order_id": "o02"}], 112.0)   # o02 too young
+        self.assertIsNone(self.bot._bcx_off)
+        self.assertEqual(sorted(self.bot._bcx_sent), ["o02"])
+        self.bot._batch_cancel_audit([{"order_id": "o02"}, {"order_id": "o09"}], 116.0)
+        self.assertIn("audit: 1", self.bot._bcx_off)
+        self.assertEqual((self.bot._bcx_sent, len(alerts), self.bot._pull_st["audit_bad"]),
+                         ({}, 1, 1))
+
+    def test_a_breaker_pull_books_its_cancels(self):
+        view = [(f"KXDPRESPRIMARY-28S{i}-MKEL",
+                 {"order_id": self.oids[i], "side": "ask", "px": 2.0, "rem": 200.0})
+                for i in range(3)]
+        st = {"cancels": 0, "skipped_budget": 0}
+        before = self.bot.state.cancelled_today
+        self.bot._ws_pull(view + [view[0]], "cand_breaker", 0.0, st, "cand")
+        self.assertEqual((st["cancels"], st["skipped_budget"],
+                          self.bot.state.cancelled_today - before), (3, 0, 3))
+        self.assertEqual([o["rem"] for _t, o in view], [0.0, 0.0, 0.0])
+        self.assertEqual(len(self.client.batches), 1)
+
+    def test_the_client_sends_one_delete_with_a_body(self):
+        import KalshiClientsBaseV2ApiKey_FIXED as kc
+        sent = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"orders": []}
+
+        class _Http:
+            def request(self, method, url, data=None, headers=None, timeout=None):
+                sent.update(method=method, url=url, data=json.loads(data))
+                return _Resp()
+        c = kc.ExchangeClient.__new__(kc.ExchangeClient)
+        c.host, c.http_timeout = "https://h/trade-api/v2", 5
+        c.last_api_call = datetime.now()
+        c.events_orders_url = "/portfolio/events/orders"
+        c._http = lambda: _Http()
+        c.request_headers = lambda m, p: {"m": m, "p": p}
+        c.batch_cancel_v2([("a", "KXA-1-B"), ("b", "")])
+        self.assertEqual(sent, {"method": "DELETE",
+                                "url": "https://h/trade-api/v2/portfolio/events/orders/batched",
+                                "data": {"orders": [{"order_id": "a", "market_ticker": "KXA-1-B"},
+                                                    {"order_id": "b"}]}})
 
 
 class TestTapeTrigger(unittest.TestCase):

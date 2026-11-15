@@ -585,6 +585,31 @@ class ExchangeClient(KalshiClient):
         always correct, no body needed."""
         return [self.cancel_order(oid) for oid in order_ids]
 
+    def batch_cancel_v2(self, items: list):
+        """DELETE /portfolio/events/orders/batched, the V2 batch cancel
+        (incentive_mm's fast pull, 2026-11-15). items: (order_id,
+        market_ticker) pairs, at most 20; every entry carries its
+        market_ticker, so Kalshi routes it to the order's shard (exchange_index
+        left out = auto-route). The base delete() cannot send a body, so the
+        request is built here. Returns the response JSON, {"orders":
+        [{order_id, reduced_by, ts_ms, error: {code, message, details} |
+        None}, ...]}: not atomic -- an entry's error leaves the others done.
+        Kalshi bills 2 write tokens an entry, as for a single cancel."""
+        orders = []
+        for it in items:
+            d = {'order_id': str(it[0])}
+            if len(it) > 1 and it[1]:
+                d['market_ticker'] = str(it[1])
+            orders.append(d)
+        path = self.events_orders_url + '/batched'
+        self.rate_limit()
+        response = self._http().request(
+            'DELETE', self.host + path, data=json.dumps({'orders': orders}),
+            headers=self.request_headers('DELETE', path),
+            timeout=self.http_timeout)
+        self.raise_if_bad_response(response)
+        return response.json()
+
     # ==================================================================
     # V2 read-side normalization (migrated 2026-07-02). The same V2
     # migration wave that retired the legacy order-mutation endpoints
