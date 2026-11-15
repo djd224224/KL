@@ -44732,7 +44732,8 @@ class TestCheapSideBooks(unittest.TestCase):
     def test_dry_cycle_unwinds_at_the_100_dollar_stop(self):
         """GATT after its fill: listed YES 0.6c x 1,667, the bot long 10,000 at
         1c ($100): no bid; the whole 10,000 rests as a YES ask at 1c (behind the
-        0.7c ask); at $50 held the bid quotes as before"""
+        0.7c ask); at $50 held -- still over its 1,667 cap -- THE AT-CAP UNWIND
+        (2026-11-15) rests the 5,000 the same way"""
         def gatt():
             c = self._long_shot(FakeClient(), yes=(("0.0050", "4400"), ("0.0040", "44198")),
                                 no=(("0.9930", "10583"), ("0.9920", "6705")))
@@ -44742,7 +44743,7 @@ class TestCheapSideBooks(unittest.TestCase):
             return c
         self._write({self.T: {"side": "yes", "px": 0.6, "size": 1667}})
         for held, want in ((10000.0, [("ask", 1, None, 10000.0)]),
-                           (5000.0, [])):                            # $50: at its 1,667 cap
+                           (5000.0, [("ask", 1, None, 5000.0)])):   # $50: at its 1,667 cap
             c = gatt()
             bot = IncentiveMarketMaker(client=c, live=False)
             bot.pnl.pos[self.T], bot.pnl.avg[self.T] = held, 1.0
@@ -44759,10 +44760,13 @@ class TestCheapSideBooks(unittest.TestCase):
                                     in x for x in lines), [x for x in lines if "cheap" in x])
                 self.assertEqual(bot._cheap_unwind.get(self.T), ("ask", 10000))
             else:
-                self.assertTrue(any("at its cap (+5000 of 1667)" in x for x in lines),
+                self.assertTrue(any("$50.00 held on its YES side" in x
+                                    and "the at-cap unwind (+5000 of 1667)" in x
+                                    and "unwinding ASK 5000 @ 1c" in x for x in lines),
                                 [x for x in lines if "cheap" in x])
-        # off: the old rule (at its cap, nothing rests)
-        with mock.patch.object(imm, "CHEAP_STOP_USD", 0.0):
+        # both off: the old rule (at its cap, nothing rests)
+        with mock.patch.object(imm, "CHEAP_STOP_USD", 0.0), \
+                mock.patch.object(imm, "CHEAP_CAP_UNWIND", False):
             c = gatt()
             bot = IncentiveMarketMaker(client=c, live=False)
             bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 10000.0, 1.0
@@ -44770,6 +44774,74 @@ class TestCheapSideBooks(unittest.TestCase):
             with mock.patch.object(imm, "log", lambda *a: None):
                 bot.run_cycle()
             self.assertEqual([o for o in bot.state.sim_orders.values() if o["ticker"] == self.T], [])
+
+    def test_the_at_cap_unwind_keeps_unwinding_until_flat(self):
+        """Jack 2026-11-15: "Yes, build it", to "Should cheap books that fill to
+        their cap start unwinding?" -- KXFRENCHPRES-27-FBAY's 18,750 YES bid at
+        0.4c filled out ($75, under the $100 stop), the scan then cut the rung
+        to 2,500, and nothing rested. Now the whole 18,750 rests as a YES ask
+        joining the 0.5c outside ask; a partial fill keeps it unwinding (the
+        bid never re-arms), across a restart too; flat, the unwind ends"""
+        f = imm.cheap_cap_unwinds
+        self.assertTrue(f("yes", 2500, 18750.0, False))
+        self.assertTrue(f("yes", 2500, 2500.0, False))          # exactly full
+        self.assertTrue(f("yes", 2500, 2499.5, False))          # under a contract of room
+        self.assertFalse(f("yes", 2500, 2499.0, False))         # room for 1: the rung rests
+        self.assertTrue(f("yes", 2500, 1000.0, True))           # unwinding already: keeps on
+        self.assertFalse(f("yes", 2500, 0.5, True))             # flat on its side
+        self.assertTrue(f("no", 2500, -2500.0, False))          # NO held
+        self.assertFalse(f("no", 2500, 3000.0, False))          # held on the other side
+        self.assertFalse(f("yes", 2500, 0.0, False))
+        with mock.patch.object(imm, "CHEAP_CAP_UNWIND", False):
+            self.assertFalse(f("yes", 2500, 18750.0, True))
+
+        def fbay():
+            c = self._long_shot(FakeClient(), yes=(("0.0030", "22860"), ("0.0010", "5351")),
+                                no=(("0.9950", "27246"), ("0.9940", "2939")))
+            c.markets[self.T].update(yes_bid_dollars="0.0030", yes_ask_dollars="0.0050",
+                                     price_ranges=[{"start": "0.0000", "end": "1.0000",
+                                                    "step": "0.0010"}])
+            return c
+
+        def run(bot, c, held):
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = held, 0.4
+            c.positions[self.T] = held
+            bot.state.universe_at = 0.0
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+            got = sorted((o["book_side"], o.get("yes_price_exact"), o["remaining_count"])
+                         for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+            return got, [x for x in lines if "cheap" in x]
+
+        self._write({self.T: {"side": "yes", "px": 0.4, "size": 2500}})
+        c = fbay()
+        bot = IncentiveMarketMaker(client=c, live=False)
+        got, lines = run(bot, c, 18750.0)
+        self.assertEqual(got, [("ask", 0.5, 18750.0)], lines)
+        self.assertTrue(any("$75.00 held on its YES side" in x
+                            and "the at-cap unwind (+18750 of 2500)" in x
+                            and "unwinding ASK 18750 @ 0.5c" in x for x in lines), lines)
+        self.assertIn(self.T, bot.state.cheap_cap_unwind)
+        self.assertEqual(bot._cheap_unwind.get(self.T), ("ask", 18750))
+        # 17,750 of it sold: 1,000 left, under the 2,500 cap -- still the unwind
+        got, lines = run(bot, c, 1000.0)
+        self.assertEqual(got, [("ask", 0.5, 1000.0)], lines)
+        # ...and after a restart
+        bot._save_persist()
+        c2 = fbay()
+        bot2 = IncentiveMarketMaker(client=c2, live=False)
+        self.assertIn(self.T, bot2.state.cheap_cap_unwind)
+        got, lines = run(bot2, c2, 1000.0)
+        self.assertEqual(got, [("ask", 0.5, 1000.0)], lines)
+        # flat: the unwind ends, nothing of it is kept or persisted
+        got, lines = run(bot2, c2, 0.0)
+        self.assertNotIn(("ask", 0.5, 1000.0), got)
+        self.assertFalse([g for g in got if g[0] == "ask"], got)
+        self.assertNotIn(self.T, bot2.state.cheap_cap_unwind)
+        bot2._save_persist()
+        with open(bot2.PERSIST_PATH, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh).get("cheap_cap_unwind"), {})
 
     def test_dry_cycle_rests_a_subpenny_rung(self):
         """A market priced in tenths of a cent, YES 0.2x0.3, listed YES 0.2c x
@@ -44842,14 +44914,19 @@ class TestCheapSideBooks(unittest.TestCase):
         bot, lines = self._cycle(self._long_shot(FakeClient()), mode="dry")
         self.assertEqual(self._orders(bot), [])
         self.assertTrue(any("(dry: not placed)" in x for x in lines), lines)
-        # long the full 1,000 (its fill): the side is at its cap, nothing rests
-        c = self._long_shot(FakeClient())
-        bot = IncentiveMarketMaker(client=c, live=False)
-        bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 1000.0, 2.0
-        c.positions[self.T] = 1000.0
-        with mock.patch.object(imm, "log", lambda *a: None):
-            bot.run_cycle()
-        self.assertEqual(self._orders(bot), [])
+        # long the full 1,000 (its fill): the side is at its cap -- with THE
+        # AT-CAP UNWIND off nothing rests; on, the 1,000 rest as a YES ask at the
+        # 3c outside ask (over the 2c cost)
+        for on, want in ((False, []), (True, [("ask", 3, 1000.0)])):
+            _clean_persist()
+            c = self._long_shot(FakeClient())
+            bot = IncentiveMarketMaker(client=c, live=False)
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = 1000.0, 2.0
+            c.positions[self.T] = 1000.0
+            with mock.patch.object(imm, "log", lambda *a: None), \
+                    mock.patch.object(imm, "CHEAP_CAP_UNWIND", on):
+                bot.run_cycle()
+            self.assertEqual(self._orders(bot), want)
 
     def test_not_a_wave(self):
         """UNWIND_ONLY_WAVES (the waves alone unwind) leaves a cheap-side book

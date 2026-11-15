@@ -10515,6 +10515,18 @@ CHEAP_MIN_SHARE = _env_float("IMM_CHEAP_MIN_SHARE", 0.01)
 # book). The hourly scan keeps such a market listed while it is held, so the
 # unwind outlives the program period. IMM_CHEAP_STOP_USD=0 turns it off.
 CHEAP_STOP_USD = _env_float("IMM_CHEAP_STOP_USD", 100.0)
+# THE AT-CAP UNWIND (Jack 2026-11-15: "Yes, build it", to "Should cheap books
+# that fill to their cap start unwinding?"). KXFRENCHPRES-27-FBAY's 18,750 YES
+# bid at 0.4c filled out at 17:24Z 11/15 -- $75, under the $100 stop -- and the
+# market rested nothing after it: its side at its cap ("at its cap (+18750 of
+# 2500)" every cycle once the scan cut the rung), no unwind, the position
+# riding. Now a cheap market whose own side is AT ITS CAP (the rung has nothing
+# left to rest) unwinds exactly as at the $100 stop (cheap_unwind_quote: the
+# whole position on the reducing side, breakeven or better, never leading),
+# and keeps unwinding while it holds 1+ there, so a partial fill never re-arms
+# the bid (state.cheap_cap_unwind, persisted; cheap_scan.held_keep reads it to
+# keep the market listed). IMM_CHEAP_CAP_UNWIND=off turns it off.
+CHEAP_CAP_UNWIND = os.environ.get("IMM_CHEAP_CAP_UNWIND", "on").strip().lower() != "off"
 
 
 def cheap_path() -> str:
@@ -10648,6 +10660,36 @@ def cheap_exposure(side: str, pos: float, avg: Optional[float], px: float) -> fl
     else:
         c = float(avg) if side == "yes" else 100.0 - float(avg)
     return held * max(0.0, c) / 100.0
+
+
+def cheap_cap_unwinds(side: str, size, pos: float, latched: bool) -> bool:
+    """THE AT-CAP UNWIND: does a cheap market (listed `side`, rung `size`; `pos`
+    the bot's YES position) unwind its side this cycle? While the bot holds 1+
+    there: once the side is at its cap (size - held < 1, the rung has nothing
+    left to rest -- cheap_side_quote's "at its cap"), and from then on while it
+    is still unwinding (`latched`). Off with CHEAP_CAP_UNWIND."""
+    if not CHEAP_CAP_UNWIND:
+        return False
+    held = pos if side == "yes" else -pos
+    if held < 1:
+        return False
+    try:
+        room = float(size) - held
+    except (TypeError, ValueError):
+        return bool(latched)
+    return bool(latched) or int(max(0.0, room)) < 1
+
+
+def cheap_cap_unwind_load(raw) -> Dict[str, float]:
+    """state.cheap_cap_unwind from its persisted form ({ticker: unix secs})."""
+    out: Dict[str, float] = {}
+    if isinstance(raw, dict):
+        for t, v in raw.items():
+            try:
+                out[str(t)] = float(v)
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
 def cheap_unwind_quote(ticker: str, side: str, pos: float, avg: Optional[float],
@@ -28177,6 +28219,10 @@ class BotState:
     # OFF-USUAL SIZE (2026-11-08): each listed market's touch samples,
     # [[unix secs, bid c, ask c], ...] over PVD_OFF_USUAL_HOURS. Persisted.
     pvd_usual: Dict[str, list] = field(default_factory=dict)
+    # THE AT-CAP UNWIND (2026-11-15): cheap markets unwinding since a fill took
+    # their side to its cap, ticker -> unix secs it started. Persisted (while
+    # the bot still holds the market), read by cheap_scan.held_keep too.
+    cheap_cap_unwind: Dict[str, float] = field(default_factory=dict)
     zero_share_streak: Dict[str, int] = field(default_factory=dict)
     blind_streak: Dict[str, int] = field(default_factory=dict)
     order_ages: Dict[str, float] = field(default_factory=dict)
@@ -30084,6 +30130,8 @@ class IncentiveMarketMaker:
             self.state.join_wait = join_wait_load(data.get("join_wait"))
             self.state.join_wait_last = join_wait_last_load(data.get("join_wait_last"))
             self.state.pvd_usual = pvd_usual_load(data.get("pvd_usual"))
+            # at-cap unwinds: a restart mid-unwind keeps unwinding
+            self.state.cheap_cap_unwind = cheap_cap_unwind_load(data.get("cheap_cap_unwind"))
             # every other breaker / hold still running (GUARDS ACROSS RESTARTS)
             try:
                 self._restore_guard_holds(data)
@@ -30557,6 +30605,10 @@ class IncentiveMarketMaker:
                                self.state.join_wait_last, time.time()),
                            "pvd_usual": pvd_usual_payload(self.state.pvd_usual,
                                                           time.time()),
+                           "cheap_cap_unwind": {
+                               t: round(v, 1)
+                               for t, v in self.state.cheap_cap_unwind.items()
+                               if abs(self.pnl.pos.get(t, 0.0)) >= 1},
                            # every other breaker / hold still running
                            # (GUARDS ACROSS RESTARTS)
                            **self._guard_holds_payload()}, f)
@@ -38908,8 +38960,8 @@ class IncentiveMarketMaker:
             self._unwind_waves_only and self._waves_switch_covers(t))
 
     def _cheap_unwind_note(self, t: str, q: Optional["Quote"], info: dict) -> None:
-        """Log THE $100 STOP on a cheap market when its unwind starts, moves or
-        stands aside."""
+        """Log THE $100 STOP (or THE AT-CAP UNWIND) on a cheap market when its
+        unwind starts, moves or stands aside."""
         key = ("unwind", None, info.get("why")) if q is None else (
             "unwind", q.book_side, q.price_cents, q.price_exact, q.count)
         if self._cheap_noted.get(t) == key:
@@ -38919,8 +38971,8 @@ class IncentiveMarketMaker:
         avg = info.get("avg")
         head = (f"{self.tag} cheap {t}: ${float(info.get('exposure') or 0):,.2f} held on its {side} "
                 f"side ({float(info.get('held') or 0):,.0f} at avg "
-                f"{'?' if avg is None else f'{float(avg):.2f}'}c) -- the $100 stop: {side} side "
-                f"rests nothing")
+                f"{'?' if avg is None else f'{float(avg):.2f}'}c) -- "
+                f"{info.get('trigger') or 'the $100 stop'}: {side} side rests nothing")
         if q is None:
             log(f"{head}; no unwind ({info.get('why')})")
             return
@@ -43457,12 +43509,21 @@ class IncentiveMarketMaker:
             # only while it earns; dry logs it and rests nothing; a reduce-only
             # market (out of the selection) rests nothing, its position riding.
             # THE $100 STOP: $100+ held on its side -> that side rests nothing
-            # and the one order is the unwind at breakeven or better
+            # and the one order is the unwind at breakeven or better.
+            # THE AT-CAP UNWIND: the same once a fill took the side to its cap,
+            # kept until the side is flat
             if cheap is not None:
                 _cs = cheap["cheap"]["side"]
                 _cavg = self.pnl.avg.get(t)
                 _cexp = cheap_exposure(_cs, cap_pos, _cavg, cheap["cheap"]["px"])
-                if CHEAP_STOP_USD > 0 and _cexp >= CHEAP_STOP_USD - 0.005:
+                _cstop = CHEAP_STOP_USD > 0 and _cexp >= CHEAP_STOP_USD - 0.005
+                _ccap = cheap_cap_unwinds(_cs, cheap.get("size"), cap_pos,
+                                          t in self.state.cheap_cap_unwind)
+                if _ccap:
+                    self.state.cheap_cap_unwind.setdefault(t, now_ts)
+                else:
+                    self.state.cheap_cap_unwind.pop(t, None)
+                if _cstop or _ccap:
                     try:
                         _cq, _ci = cheap_unwind_quote(
                             t, _cs, own_pos, _cavg, *orderbook_exact_levels(ob),
@@ -43471,6 +43532,10 @@ class IncentiveMarketMaker:
                     except Exception as e:  # never costs the cycle: nothing rests
                         _cq, _ci = None, {"why": f"unwind failed ({e!r})"}
                     _ci["exposure"] = _cexp
+                    if not _cstop:
+                        _ci["trigger"] = (f"the at-cap unwind "
+                                          f"({(cap_pos if _cs == 'yes' else -cap_pos):+.0f} "
+                                          f"of {cheap.get('size')})")
                     if _cq is not None:
                         self._cheap_unwind[t] = (_cq.book_side, _cq.count)
                     else:

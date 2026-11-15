@@ -437,8 +437,37 @@ class TestHeldKeep(_TempPaths):
         self.assertIn("$100 stop", out["G-1"]["held"])
         self.assertEqual(listed["G-1"]["stop"], "2026-11-12T05:00:00Z")  # the input untouched
         self.assertEqual(cs.held_keep(listed, set(), lambda t: t != "G-1", held, now).keys(), {"N-1"})
+        # (G-1 and N-1 also fill their sides to the cap: THE AT-CAP UNWIND keeps them)
         with mock.patch.object(imm, "CHEAP_STOP_USD", 0.0):
+            self.assertEqual(set(cs.held_keep(listed, set(), lambda t: True, held, now)),
+                             {"G-1", "N-1"})
+        with mock.patch.object(imm, "CHEAP_STOP_USD", 0.0), \
+                mock.patch.object(imm, "CHEAP_CAP_UNWIND", False):
             self.assertEqual(cs.held_keep(listed, set(), lambda t: True, held, now), {})
+
+    def test_an_at_cap_unwind_stays_listed(self):
+        """THE AT-CAP UNWIND (Jack 2026-11-15 "Yes, build it"): a listed market
+        whose side a fill took to its cap stays listed while the bot holds it,
+        and so does one still unwinding from that (the bot's state), under $100"""
+        p = os.path.join(self.dir, "imm_state.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"own_pos": {"F-1": 18750.0, "M-1": 1000.0, "E-1": 7440.0},
+                       "own_avg": {"F-1": 0.4, "M-1": 0.4, "E-1": 1.0},
+                       "cheap_cap_unwind": {"M-1": 1763000000.0, "bad": "x"}}, fh)
+        self.assertEqual(cs.cap_unwinding(p), {"M-1"})
+        self.assertEqual(cs.cap_unwinding(os.path.join(self.dir, "missing.json")), set())
+        held = cs.held_positions(p)
+        now = datetime(2026, 11, 15, 18, 0, tzinfo=timezone.utc)
+        listed = {"F-1": {"side": "yes", "px": 0.4, "size": 2500, "stop": "2026-11-15T20:00:00Z"},
+                  "M-1": {"side": "yes", "px": 0.4, "size": 2500, "stop": "2026-11-15T20:00:00Z"},
+                  "E-1": {"side": "yes", "px": 1, "size": 7500, "stop": "2026-11-15T20:00:00Z"}}
+        out = cs.held_keep(listed, set(), lambda t: True, held, now, cs.cap_unwinding(p))
+        self.assertEqual(set(out), {"F-1", "M-1"})               # E-1: room left, $74
+        self.assertIn("at-cap unwind", out["F-1"]["held"])
+        self.assertEqual(out["F-1"]["stop"], "2026-11-17T06:00:00Z")
+        self.assertEqual(set(cs.held_keep(listed, set(), lambda t: True, held, now)), {"F-1"})
+        with mock.patch.object(imm, "CHEAP_CAP_UNWIND", False):
+            self.assertEqual(cs.held_keep(listed, set(), lambda t: True, held, now, {"M-1"}), {})
 
 
 class TestSubPenny(unittest.TestCase):

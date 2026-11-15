@@ -470,20 +470,36 @@ def held_positions(path=None):
 HELD_KEEP_HOURS = 36.0
 
 
-def held_keep(listed_now, skip, keep, held, now):
-    """THE $100 STOP's listed markets to keep: {ticker: entry} for each market
-    on the list (not in `skip`, in scope) where the bot's own position on the
-    entry's side costs imm.CHEAP_STOP_USD+, its stop rolled forward."""
+def cap_unwinding(path=None):
+    """THE AT-CAP UNWIND's markets still unwinding, from the bot's state
+    (imm_state.json cheap_cap_unwind). An empty set when unreadable."""
+    try:
+        with open(path or imm.IncentiveMarketMaker.PERSIST_PATH, encoding="utf-8") as fh:
+            s = json.load(fh) or {}
+    except (OSError, ValueError):
+        return set()
+    return set(imm.cheap_cap_unwind_load(s.get("cheap_cap_unwind")))
+
+
+def held_keep(listed_now, skip, keep, held, now, latched=frozenset()):
+    """THE $100 STOP's (and THE AT-CAP UNWIND's) listed markets to keep:
+    {ticker: entry} for each market on the list (not in `skip`, in scope) where
+    the bot's own position on the entry's side costs imm.CHEAP_STOP_USD+, or
+    fills the side to its cap, or is still unwinding from that (`latched`, the
+    bot's state) -- its stop rolled forward."""
     out = {}
-    if imm.CHEAP_STOP_USD <= 0:
-        return out
     for t, e in listed_now.items():
         if t in skip or not keep(t):
             continue
         px = imm.cheap_px(e.get("px"))
+        side = str(e.get("side") or "")
         pos, avg = held.get(t, (0.0, None))
-        if px is None or imm.cheap_exposure(str(e.get("side") or ""), pos, avg, px) \
-                < imm.CHEAP_STOP_USD - 0.005:
+        if px is None:
+            continue
+        stop100 = imm.CHEAP_STOP_USD > 0 and imm.cheap_exposure(side, pos, avg, px) \
+            >= imm.CHEAP_STOP_USD - 0.005
+        at_cap = imm.cheap_cap_unwinds(side, e.get("size"), pos, t in latched)
+        if not (stop100 or at_cap):
             continue
         try:
             stop = ts(e.get("stop") or "1970-01-01T00:00:00Z")
@@ -492,7 +508,8 @@ def held_keep(listed_now, skip, keep, held, now):
         e = dict(e)
         if (stop - now).total_seconds() < HELD_KEEP_HOURS * 1800:
             e["stop"] = zs(now + timedelta(hours=HELD_KEEP_HOURS))
-        e["held"] = (f"{now.strftime('%Y-%m-%dT%H:%MZ')} $100 stop: the bot holds "
+        e["held"] = (f"{now.strftime('%Y-%m-%dT%H:%MZ')} "
+                     f"{'$100 stop' if stop100 else 'at-cap unwind'}: the bot holds "
                      f"{abs(pos):,.0f} at {'?' if avg is None else f'{avg:.2f}'}c -- kept listed "
                      f"while it unwinds at breakeven or better")
         out[t] = e
@@ -693,13 +710,13 @@ def scan(a) -> int:
     take = [r for r in rows if r["verdict"] == "LIST"]
     kept = {t: e for t, e in listed_now.items() if t in unread and keep(t)
             and ts(e.get("stop") or "1970-01-01T00:00:00Z") > now and t not in {r["ticker"] for r in take}}
-    # THE $100 STOP: a listed market the bot holds $100+ on stays while held
+    # THE $100 STOP / AT-CAP UNWIND: a listed market the bot unwinds stays while held
     held = held_keep(listed_now, {r["ticker"] for r in take} | set(kept), keep,
-                     held_positions(), now)
+                     held_positions(), now, cap_unwinding())
     log(f"cheap_scan: {len(progs)} program markets in {names}; "
         f"{len(far)} at {a.min_days:.0f}d+; listing {len(take)} "
         f"({sum(1 for r in take if r['same_period'])} already this period); unread {len(unread)} "
-        f"(kept {len(kept)} listed); held $100+ kept {len(held)} {sorted(held)[:6]}; skipped {why}")
+        f"(kept {len(kept)} listed); held $100+ / at cap kept {len(held)} {sorted(held)[:6]}; skipped {why}")
     print(f"{'ticker':36} {'sub':24} {'side':4} {'px':>3} {'size':>6} {'share':>6} {'$/day':>6} "
           f"{'risk$':>6} {'proj$':>6} {'now$/d':>6} stop")
     for r in sorted(rows, key=lambda r: -((r["pick"] or {}).get("usd_day") or 0)):
