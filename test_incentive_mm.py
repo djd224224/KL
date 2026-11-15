@@ -311,6 +311,9 @@ def setUpModule():
     imm._cpi_fair_state.update(mtime=0.0, markets={}, events={})
     imm.RAIN_WKND_FILE = os.path.join(tmp, "rain_wknd_fair.json")
     imm._rain_wknd_state.update(mtime=0.0, markets={}, events={})
+    # the snow-day counts (2026-11-14)
+    imm.SNOW_DAYS_FILE = os.path.join(tmp, "snow_days_fair.json")
+    imm._snow_days_state.update(mtime=0.0, markets={}, events={}, auto=frozenset())
     imm.RT_FAIR_FILE = os.path.join(tmp, "rt_fair.json")
     imm._rt_fair_state.update(mtime=0.0, markets={})
     # the 2026-10-22 family side leans size by the dashboard's family of a
@@ -27221,7 +27224,8 @@ class TestGuardSkipSink(unittest.TestCase):
         # + the Zillow home value gate (2026-11-12)
         # + the crypto event gate (2026-11-14)
         # + the FX event gate (2026-11-14)
-        self.assertEqual(len(conts), 59)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
+        # + the snow-day gate (2026-11-14)
+        self.assertEqual(len(conts), 60)   # +1 2026-11-04: pvd_removed (a market off the PVD list)
         self.assertEqual(len(bare), 1, bare)
         self.assertIn("fast_only", bare[0])            # not a guard
 
@@ -29555,8 +29559,8 @@ class TestSignedFairReads(unittest.TestCase):
         write_fair_file (the threads live inside run(), so read its source)."""
         import inspect
         src = inspect.getsource(imm.IncentiveMarketMaker.run)
-        # ... and the period lows (2026-11-13)
-        self.assertEqual(src.count("kalshi_get = fair_reader()"), 18)
+        # ... and the period lows (2026-11-13), the snow-day counts (2026-11-14)
+        self.assertEqual(src.count("kalshi_get = fair_reader()"), 19)
         for mod, path in (("rain_fair", "RAIN_FAIR_FILE"),
                           ("carbon_arc_fair", "CA_FAIR_FILE"),
                           ("openrouter_fair", "OR_FAIR_FILE"),
@@ -29566,6 +29570,7 @@ class TestSignedFairReads(unittest.TestCase):
                           ("gasbuddy_fair", "GB_FAIR_FILE"),
                           ("cpi_fair", "CPI_FAIR_FILE"),
                           ("rain_wknd_fair", "RAIN_WKND_FILE"),
+                          ("snow_days_fair", "SNOW_DAYS_FILE"),
                           ("rt_fair", "RT_FAIR_FILE"),
                           ("resort_snow_fair", "RESORT_SNOW_FILE"),
                           ("lowt_fair", "LOWT_FAIR_FILE"),
@@ -45793,3 +45798,154 @@ class TestRestingReadPages(unittest.TestCase):
     def test_read_capacity_clears_the_resting_cap(self):
         # pages x limit stays above the launcher's IMM_MAX_TOTAL_RESTING (12,000)
         self.assertGreaterEqual(imm.RESTING_READ_PAGES * imm.RESTING_READ_LIMIT, 3 * 12000)
+
+
+class TestSnowDaysGate(unittest.TestCase):
+    """Jack 2026-11-14: "KXSNOWDAYS-01DEC26-01APR27, KXRAINTHANKSGIVING-26NOV26
+    (and rain/snow markets generally) should have fair value calculations and
+    auto-quoted when they come online". snow_days_fair's file -> load_snow_days
+    -> snow_days_gate: fail closed, a touch fighting the fair stands aside,
+    every rung SNOW_DAYS_TOL_CENTS clear of it; out 00:00 ET Dec 1."""
+
+    T = "KXSNOWDAYS-01DEC26-01APR27-BOS"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "snow_days_fair.json")
+        self._saved = (imm.SNOW_DAYS_FILE, dict(imm._snow_days_state))
+        imm.SNOW_DAYS_FILE = self.path
+        imm._snow_days_state.update(mtime=0.0, markets={}, events={}, auto=frozenset())
+
+    def tearDown(self):
+        imm.SNOW_DAYS_FILE = self._saved[0]
+        imm._snow_days_state.clear()
+        imm._snow_days_state.update(self._saved[1])
+        imm.SERIES_OVERRIDES.pop("KXSNOWDAYSB", None)
+
+    def _write(self, p=0.44, age=0.0, series=None):
+        at = datetime.now(timezone.utc) - timedelta(seconds=age)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"markets": {self.T: {"p": p, "event": "KXSNOWDAYS-01DEC26-01APR27",
+                                            "fetched_at": at.isoformat()}},
+                       "series": series or {}}, f)
+        imm._snow_days_state["mtime"] = 0.0
+        return imm.load_snow_days()
+
+    def test_fails_closed_then_caps_every_rung_clear_of_the_fair(self):
+        now = time.time()
+        why, inp, caps = imm.snow_days_gate(self.T, now, 40.0, 50.0)
+        self.assertIn("no snow-day fair", why)
+        self.assertIsNone(caps)
+        self.assertEqual(self._write(age=5 * 3600), 1)
+        why, inp, caps = imm.snow_days_gate(self.T, now, 40.0, 50.0)
+        self.assertIn("old", why)                                # stale: 4h TTL
+        self._write()
+        self.assertEqual(imm.snow_days_gate(self.T, now, 40.0, 50.0), (
+            "", {"fair": 44.0, "tol": 10, "bid_cap": 34, "ask_floor": 54}, (34, 54)))
+        # a touch fighting the fair by more than the tolerance stands aside
+        why, inp, caps = imm.snow_days_gate(self.T, now, 55.0, 60.0)
+        self.assertIn("vs fair 44c", why)
+        self.assertEqual((inp["reason"], caps), ("band", None))
+        # the lead reads the fair whatever the book
+        self.assertEqual(imm.snow_days_fair_c(self.T, now), 44.0)
+        self.assertEqual(imm.fair_model_c(self.T, "KXSNOWDAYS", now), 44.0)
+        self.assertEqual(imm.fair_lead_margin("KXSNOWDAYS"), max(imm.FAIR_LEAD_MARGIN_C, 10))
+        # a fair near 0 keeps the ask alone
+        self._write(p=0.05)
+        self.assertEqual(imm.snow_days_gate(self.T, now, 1.0, 99.0)[2], (None, 15))
+
+    def test_the_window_day_is_read_first_and_cuts_off_at_its_start(self):
+        exp = datetime(2027, 4, 2, 14, tzinfo=timezone.utc)
+        self.assertEqual(imm.parse_event_date("KXSNOWDAYS-01DEC26-01APR27"),
+                         datetime(2026, 12, 1, 5, tzinfo=timezone.utc))
+        self.assertEqual(imm.trade_cutoff_utc("KXSNOWDAYS-01DEC26-01APR27", exp, exp),
+                         datetime(2026, 12, 1, 5, tzinfo=timezone.utc))
+        self.assertIsNone(imm.parse_event_date("KXSNOWDAYS-01APR27-01DEC26"))
+        ov = imm.SERIES_OVERRIDES["KXSNOWDAYS"]
+        self.assertEqual((ov.price_min_cents, ov.price_max_cents, ov.size_mult),
+                         (1, 99, imm.SNOW_DAYS_SIZE_MULT))
+
+    def test_the_writers_series_join_with_the_override(self):
+        self.assertFalse(imm.snow_days_series("KXSNOWDAYSB"))
+        self._write(series={"KXSNOWDAYSB": {"sample": "KXSNOWDAYSB-01DEC26-01APR27-BOS"}})
+        self.assertTrue(imm.snow_days_series("KXSNOWDAYSB"))
+        self.assertIs(imm.SERIES_OVERRIDES["KXSNOWDAYSB"], imm.SERIES_OVERRIDES["KXSNOWDAYS"])
+        self.assertTrue(imm.in_fair_lead_series("KXSNOWDAYSB"))
+        with mock.patch.object(imm, "SNOW_DAYS_ENABLE", False):
+            self.assertFalse(imm.snow_days_series("KXSNOWDAYS"))
+
+
+class TestSnowDaysLoop(TestSnowDaysGate):
+    """The snow-day gate through the quote loop: a 1c x 99c placeholder book
+    (5,000 a side) on a 44c fair rests a bid at most 34c and an ask at least
+    54c, with a 200 lead ahead of each wall off the snow-day fair. Fixture
+    KXSNOWDAYS-01DEC67-01APR68-BOS (cutoff Dec 1, 2067)."""
+
+    T = "KXSNOWDAYS-01DEC67-01APR68-BOS"
+
+    def setUp(self):
+        super().setUp()
+        _clean_persist()
+
+    def _cycle(self, yes=(("0.01", "5000"),), no=(("0.01", "5000"),), p=0.44):
+        self._write(p=p)
+        client = FakeClient()
+        close = "2068-04-02T04:59:00Z"
+        client.programs.append(
+            {"market_ticker": self.T, "incentive_type": "liquidity",
+             "period_reward": 1750000, "target_size_fp": "1000.00",
+             "discount_factor_bps": 5000, "paid_out": False,
+             "start_date": client.programs[0]["start_date"],
+             "end_date": client.programs[0]["end_date"]})
+        client.markets[self.T] = {
+            "ticker": self.T, "event_ticker": self.T.rsplit("-", 1)[0], "status": "active",
+            "close_time": close, "expected_expiration_time": close,
+            "yes_bid_dollars": yes[-1][0], "yes_ask_dollars": f"{1 - float(no[-1][0]):.4f}",
+            "volume_fp": "0.00"}
+        client.books[self.T] = {"orderbook_fp": {"yes_dollars": [list(x) for x in yes],
+                                                 "no_dollars": [list(x) for x in no]}}
+        for p_ in (mock.patch.object(imm, "series_in_blackout", return_value=False),
+                   mock.patch.object(imm, "LADDER_MODE", "atref"),
+                   mock.patch.object(imm, "FAIR_LEAD_MODE", "on"),
+                   mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99),
+                   mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"),
+                   mock.patch.object(imm, "SERIES_HOUR_MULTS", [])):
+            p_.start()
+            self.addCleanup(p_.stop)
+        bot = IncentiveMarketMaker(client=client, live=False)
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            bot.run_cycle()
+            self._write(p=p)                                 # keep the read fresh
+            bot.state.universe_at = time.time()
+            bot.run_cycle()
+            bot.run_cycle()
+        rest = sorted((o["book_side"], o["yes_price"], int(o["remaining_count"]))
+                      for o in bot.state.sim_orders.values() if o["ticker"] == self.T
+                      and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS)
+        return bot, rest, lines
+
+    def test_both_sides_rest_clear_of_the_fair_and_lead(self):
+        bot, rest, lines = self._cycle()
+        self.assertIn(self.T, bot.state.selected,
+                      [s_ for s_ in lines if "universe:" in s_ or self.T in s_][-6:])
+        self.assertEqual({side for side, _px, _n in rest}, {"bid", "ask"}, rest)
+        self.assertTrue(all(px <= 34 for side, px, _n in rest if side == "bid"), rest)
+        self.assertTrue(all(px >= 54 for side, px, _n in rest if side == "ask"), rest)
+        self.assertTrue(any(f"fair lead {self.T}" in s_ and "the snow-day fair" in s_
+                            for s_ in lines), [s_ for s_ in lines if "fair lead" in s_])
+
+    def test_a_touch_fighting_the_fair_stands_aside(self):
+        bot, rest, lines = self._cycle()
+        self.assertTrue(rest)
+        # a 60c bid over the 44c fair + 10: the book knows more
+        bot.client.books[self.T] = {"orderbook_fp": {"yes_dollars": [["0.60", "5000"]],
+                                                     "no_dollars": [["0.30", "5000"]]}}
+        lines = []
+        with mock.patch.object(imm, "log", lines.append):
+            self._write()
+            bot.run_cycle()
+        self.assertTrue(any(f"snow-days stand-aside {self.T}: book 60" in s_ for s_ in lines),
+                        [s_ for s_ in lines if self.T in s_][-8:])
+        self.assertEqual([o for o in bot.state.sim_orders.values() if o["ticker"] == self.T
+                          and imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS], [])

@@ -2099,6 +2099,11 @@ def is_daily_series(series: str) -> bool:
     # KXRAIN floor covers: x1 at every hour, no Saturday or yield size
     if snow_monthly_series(series):
         return True
+    # ...and the snow-day counts (2026-11-14), x1 at every hour like them
+    # (read at call time: defined further down)
+    _sds = globals().get("snow_days_series")
+    if _sds is not None and _sds(series):
+        return True
     # the YouTube #2 pilot (2026-10-05) is x1 at every hour by spec -- not
     # left to the feed classifier (read at call time: defined further down)
     if series in globals().get("YT2_SERIES", ()) and globals().get("YT2_ENABLE"):
@@ -14409,6 +14414,9 @@ _CONFIG_CODE_KNOBS = (
     "SNOW_MONTHLY_ENABLE", "SNOW_MONTHLY_TOL_CENTS", "SNOW_MONTHLY_TTL_MIN",
     "SNOW_MONTHLY_DRY_MIN", "SNOW_MONTHLY_CUTOFF_FROM_CLOSE_MIN", "SNOW_MONTHLY_CAP",
     "SNOW_MONTHLY_SIZE_MULT",
+    # ...the snow-day counts (2026-11-14); model knobs in snow_days_fair.py
+    "SNOW_DAYS_ENABLE", "SNOW_DAYS_SERIES", "SNOW_DAYS_AUTO", "SNOW_DAYS_LEAD",
+    "SNOW_DAYS_TOL_CENTS", "SNOW_DAYS_TTL_MIN", "SNOW_DAYS_SIZE_MULT",
     # the CPI pilot's fair gate (2026-10-11); model knobs in cpi_fair.py
     "CPI_FAIR_ENABLE", "CPI_FAIR_TOL_CENTS", "CPI_FAIR_TTL_MIN", "CPI_FAIR_CAP",
     # the weekend rain gate (2026-10-11); model knobs in rain_wknd_fair.py
@@ -17397,6 +17405,137 @@ def snow_monthly_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
         dry_min=SNOW_MONTHLY_DRY_MIN, label="monthly snow",
         wet=("snowing", "snowed"))
     return _cap_band_breach(why, inp, SNOW_MONTHLY_TOL_CENTS, SNOW_MONTHLY_CAP)
+
+
+# ----------------------------------------------------------------------------
+# SNOW-DAY COUNTS (Jack 2026-11-14: "KXSNOWDAYS-01DEC26-01APR27,
+# KXRAINTHANKSGIVING-26NOV26 (and rain/snow markets generally) should have
+# fair value calculations and auto-quoted when they come online. these come
+# online later today"). KXSNOWDAYS-01DEC26-01APR27-<CITY> is a SCALAR: YES
+# pays linearly from $0 at the city's floor count to $1 at its cap (Atlanta
+# 0-4, Boston 11-31) of days Dec 1 - Apr 1 with 0.1 in (1 in for six cities)
+# of official snowfall at the station in the rules; 22 cities, $175 a market
+# from 11/15 01:25Z, books 1c x 99c placeholders at listing.
+#   - FAIR: snow_days_fair.py (refresher thread "snow-days", every
+#     SNOW_DAYS_REFRESH_SECS) -- the mean payout over the last 40 seasons'
+#     counts at the station (ACIS); out once the season starts (no observed
+#     layer yet).
+#   - GATE (snow_days_gate), the crypto event gate's shape, fails CLOSED: no
+#     fair or a stale one, or a touch fighting the fair by more than
+#     SNOW_DAYS_TOL_CENTS, stands the market aside; otherwise every rung
+#     stays SNOW_DAYS_TOL_CENTS clear of it (bids <= fair - tol, asks >=
+#     fair + tol: mort_cap_quotes, last).
+#   - LEADS (SNOW_DAYS_LEAD): FAIR LEAD off the same fair, never closer than
+#     the tolerance (fair_lead_margin), so a 1c x 99c book gets a 200 bid and
+#     ask ahead of its walls, as the Zillow cities' did.
+#   - HOURS: out 00:00 ET of the window's first day (parse_event_date reads
+#     01DEC26 day-first; the generic YYMONDD read it as 2001-12-26). Price
+#     band 1-99c (the caps do the band's job), x SNOW_DAYS_SIZE_MULT (the snow
+#     families' x2), x1 at every hour.
+#   - AUTO-ENROLL: the writer's "series" (a SNOW series every market of which
+#     parses as this contract) joins with the KXSNOWDAYS override.
+# Kill switch IMM_SNOW_DAYS_ENABLE=0 (an env change: restart_imm.ps1 -Task).
+SNOW_DAYS_ENABLE = os.environ.get("IMM_SNOW_DAYS_ENABLE", "1") == "1"
+SNOW_DAYS_SERIES = frozenset(s.strip() for s in os.environ.get(
+    "IMM_SNOW_DAYS_SERIES", "KXSNOWDAYS").split(",") if s.strip())
+SNOW_DAYS_AUTO = os.environ.get("IMM_SNOW_DAYS_AUTO", "1") == "1"
+SNOW_DAYS_LEAD = os.environ.get("IMM_SNOW_DAYS_LEAD", "1") == "1"
+SNOW_DAYS_TOL_CENTS = _env_int("IMM_SNOW_DAYS_TOL_CENTS", 10)
+SNOW_DAYS_TTL_MIN = _env_int("IMM_SNOW_DAYS_TTL_MIN", 240)
+SNOW_DAYS_REFRESH_SECS = _env_int("IMM_SNOW_DAYS_REFRESH_SECS", 900)
+SNOW_DAYS_SIZE_MULT = _env_float("IMM_SNOW_DAYS_SIZE_MULT", 2.0)
+SNOW_DAYS_FILE = os.environ.get(
+    "IMM_SNOW_DAYS_FILE", os.path.join(STATUS_DIR, "snow_days_fair.json"))
+SNOW_DAYS_ARCHETYPE = "KXSNOWDAYS"
+_snow_days_state: dict = {"mtime": 0.0, "markets": {}, "events": {}, "auto": frozenset()}
+SERIES_OVERRIDES[SNOW_DAYS_ARCHETYPE] = SeriesOverride(
+    price_min_cents=1, price_max_cents=99, size_mult=SNOW_DAYS_SIZE_MULT)
+for _s in SNOW_DAYS_SERIES:
+    SERIES_OVERRIDES[_s] = SERIES_OVERRIDES[SNOW_DAYS_ARCHETYPE]
+SIZE_TEST_EXCLUDE = SIZE_TEST_EXCLUDE | SNOW_DAYS_SERIES | {SNOW_DAYS_ARCHETYPE}
+
+
+def snow_days_series(series: str) -> bool:
+    """A snow-day count series: named (SNOW_DAYS_SERIES) or found by the
+    writer on its contract (SNOW_DAYS_AUTO)."""
+    return SNOW_DAYS_ENABLE and (series in SNOW_DAYS_SERIES or (
+        SNOW_DAYS_AUTO and series in _snow_days_state["auto"]))
+
+
+def load_snow_days() -> int:
+    """Hot-reload SNOW_DAYS_FILE by mtime (the weather loader), with the
+    writer's auto-enrolled series: a new one takes the KXSNOWDAYS override."""
+    n = _load_weather_fair(SNOW_DAYS_FILE, _snow_days_state, "snow days")
+    if n < 0:
+        return n
+    try:
+        with open(SNOW_DAYS_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return n
+    auto = frozenset(str(s) for s in (data.get("series") or {})) if SNOW_DAYS_AUTO else frozenset()
+    for s in sorted(auto - _snow_days_state["auto"] - SNOW_DAYS_SERIES):
+        if s not in SERIES_OVERRIDES:
+            SERIES_OVERRIDES[s] = SERIES_OVERRIDES[SNOW_DAYS_ARCHETYPE]
+        log(f"[IMM] snow days {s}: joins the family on its contract")
+    _snow_days_state["auto"] = auto
+    return n
+
+
+def snow_days_gate(ticker: str, now_ts: float, ext_bid: Optional[float],
+                   ext_ask: Optional[float]
+                   ) -> Tuple[str, dict, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """('', inputs, (bid_cap, ask_floor)) when a snow-day market may quote --
+    bids at most bid_cap, asks at least ask_floor, None = that side not at
+    all -- else (why, guard-skip inputs, None). Fails CLOSED."""
+    e = _snow_days_state["markets"].get(ticker)
+    if e is None:
+        return "no snow-day fair for this market", {"reason": "no_fair"}, None
+    age = now_ts - float(e["ts"])
+    if age > SNOW_DAYS_TTL_MIN * 60:
+        return (f"snow-day fair is {age / 60:.0f}m old",
+                {"reason": "stale", "age_s": round(age)}, None)
+    fair = float(e["p"]) * 100.0
+    inputs = {"fair": round(fair, 2), "tol": SNOW_DAYS_TOL_CENTS}
+    bid_bad, ask_bad = fair_gate_breach(ext_bid, ext_ask, fair, SNOW_DAYS_TOL_CENTS)
+    if bid_bad or ask_bad:
+        return (f"book {ext_bid}x{ext_ask} vs fair {fair:.0f}c (tol "
+                f"{SNOW_DAYS_TOL_CENTS}c, {'bid' if bid_bad else 'ask'} side)",
+                dict(inputs, reason="band", bid_bad=bid_bad, ask_bad=ask_bad), None)
+    bid_cap = int(math.floor(fair - SNOW_DAYS_TOL_CENTS + 1e-9))
+    ask_floor = int(math.ceil(fair + SNOW_DAYS_TOL_CENTS - 1e-9))
+    caps = (bid_cap if bid_cap >= 1 else None, ask_floor if ask_floor <= 99 else None)
+    if caps == (None, None):
+        return (f"no side {SNOW_DAYS_TOL_CENTS}c clear of fair {fair:.0f}c",
+                dict(inputs, reason="decided"), None)
+    return "", dict(inputs, bid_cap=caps[0], ask_floor=caps[1]), caps
+
+
+def snow_days_fair_c(ticker: str, now_ts: float) -> Optional[float]:
+    """`ticker`'s snow-day fair (YES cents) while the gate reads it (the book
+    test apart), else None: FAIR LEAD's view of the family."""
+    why, inputs, _caps = snow_days_gate(ticker, now_ts, None, None)
+    return None if why else float(inputs["fair"])
+
+
+def snow_days_event_date(event_ticker: str) -> Optional[date]:
+    """The window's first day of a snow-day event ticker, two DDMONYY
+    segments, day FIRST: KXSNOWDAYS-01DEC26-01APR27 -> 2026-12-01; else
+    None."""
+    parts = (event_ticker or "").split("-")
+    if len(parts) < 3:
+        return None
+    days = []
+    for seg in parts[1:3]:
+        m = _RAIN_PERIOD_SEG_RE.fullmatch(seg)
+        month = _MONTHS.get(m.group(2)) if m else None
+        if month is None:
+            return None
+        try:
+            days.append(date(2000 + int(m.group(3)), month, int(m.group(1))))
+        except ValueError:
+            return None
+    return days[0] if days[0] < days[1] else None
 
 
 # ----------------------------------------------------------------------------
@@ -21962,6 +22101,13 @@ def parse_event_date(event_ticker: str) -> Optional[datetime]:
     if per is not None:
         return ET.localize(datetime(per[0].year, per[0].month, per[0].day)) \
             .astimezone(timezone.utc)
+    # a snow-day count (2026-11-14) reads its window's FIRST day too:
+    # KXSNOWDAYS-01DEC26-01APR27 -> Dec 1, 2026 (YYMONDD: 2001-12-26)
+    if snow_days_series(event_ticker.split("-")[0]):
+        sd = snow_days_event_date(event_ticker)
+        if sd is None:
+            return None
+        return ET.localize(datetime(sd.year, sd.month, sd.day)).astimezone(timezone.utc)
     # the per-city rain dailies' YYMMDD (KXRAINDNYC-261031) and the cold
     # thresholds' period end, written either way round (2026-10-30)
     day = rain_daily_city_date(event_ticker)
@@ -24665,6 +24811,7 @@ def fair_gate_of(series: str) -> str:
         ("rain monthly", lambda: rain_monthly_series(series)),
         ("rain period", lambda: rain_period_gated(t)),
         ("snow monthly", lambda: snow_monthly_series(series)),
+        ("snow days", lambda: snow_days_series(series)),
         ("resort snow", lambda: resort_snow_series(series)),
         ("broadway", lambda: bway_fair_series(series)),
         ("rcp approval", lambda: approve_fair_series(series)),
@@ -26060,6 +26207,8 @@ def fair_lead_margin(series: str) -> int:
         return max(FAIR_LEAD_MARGIN_C, HOME_FAIR_TOL_CENTS)
     if crypto_event_series(series):
         return max(FAIR_LEAD_MARGIN_C, CRYPTO_EVENT_TOL_CENTS)
+    if snow_days_series(series):
+        return max(FAIR_LEAD_MARGIN_C, SNOW_DAYS_TOL_CENTS)
     return FAIR_LEAD_MARGIN_C
 FAIR_LEAD_MAX_POSITION = _env_float("IMM_FAIR_LEAD_MAX_POSITION", 200.0)
 FAIR_LEAD_EVENT_CAP = _env_float("IMM_FAIR_LEAD_EVENT_CAP", 2000.0)
@@ -26164,7 +26313,8 @@ def in_fair_lead_series(series: str) -> bool:
         or ca_array_lead_series(series) \
         or (HOME_AUTO_LEAD and home_auto_allowed(series)) \
         or (vercel_series(series) and any(s in FAIR_LEAD_SERIES for s in VERCEL_BASE_SERIES)) \
-        or (CRYPTO_EVENT_LEAD and crypto_event_series(series))
+        or (CRYPTO_EVENT_LEAD and crypto_event_series(series)) \
+        or (SNOW_DAYS_LEAD and snow_days_series(series))
 
 
 def fair_close_series(series: str) -> bool:
@@ -26205,6 +26355,8 @@ def fair_model_c(ticker: str, series: str, now_ts: float) -> Optional[float]:
         return home_fair_c(ticker, now_ts)
     if crypto_event_series(series):
         return crypto_event_fair_c(ticker, now_ts)
+    if snow_days_series(series):
+        return snow_days_fair_c(ticker, now_ts)
     return None
 
 
@@ -26231,6 +26383,8 @@ def fair_model_label(series: str) -> str:
         return "the Zillow fair"
     if crypto_event_series(series):
         return "the crypto spot fair"
+    if snow_days_series(series):
+        return "the snow-day fair"
     return "its model fair"
 
 
@@ -27890,6 +28044,7 @@ class IncentiveMarketMaker:
         self._home_edges: Set[str] = set()        # ...and its edges-only markets
         self._cev_stood: Set[str] = set()         # crypto event gate stand-asides
         self._fev_stood: Set[str] = set()         # FX event gate stand-asides
+        self._sd_stood: Set[str] = set()          # snow-day gate stand-asides
         self._lowt_stood: Set[str] = set()        # low-temperature gate stand-asides
         self._hight_stood: Set[str] = set()       # high-temperature gate stand-asides
         self._poke_stood: Set[str] = set()        # Pokemon gate stand-asides
@@ -33783,6 +33938,7 @@ class IncentiveMarketMaker:
             ytw_pilot_ticker(ticker) or \
             twk_event_ticker(ticker) or \
             snow_monthly_series(series) or \
+            snow_days_series(series) or \
             bigsky_series(series) or \
             temp_threshold_series(series) or \
             rain_daily_city_ticker(ticker) or \
@@ -34113,6 +34269,7 @@ class IncentiveMarketMaker:
         load_snow_monthly()
         load_cpi_fair()
         load_rain_wknd()
+        load_snow_days()              # snow-day counts (2026-11-14)
         load_resort_snow()
         load_bway_fair()              # Broadway weekly attendance (2026-10-25)
         load_approve_fair()           # RCP approval (2026-10-26)
@@ -38249,6 +38406,10 @@ class IncentiveMarketMaker:
                 # FX event gate: the same, inside the live limits
                 _fw, _fi, _fc = fx_event_gate(meta.ticker, _now.timestamp())
                 out = [] if (_fw or _fc is None) else mort_cap_quotes(out, *_fc)
+            if snow_days_series(meta.series):
+                # snow-day gate: the same, SNOW_DAYS_TOL_CENTS clear
+                _sw, _si, _sc = snow_days_gate(meta.ticker, _now.timestamp(), eb, ea)
+                out = [] if (_sw or _sc is None) else mort_cap_quotes(out, *_sc)
             if poke_series(meta.series):
                 # Pokemon gate: the same, POKE_FAIR_TOL_CENTS clear
                 _pw, _pi, _pc = poke_gate(meta.ticker, _now.timestamp(), eb, ea)
@@ -41164,6 +41325,23 @@ class IncentiveMarketMaker:
             if t in self._fev_stood:
                 self._fev_stood.discard(t)
                 log(f"{self.tag} fx-event resume {t}")
+            # SNOW-DAY GATE (Jack 2026-11-14, see SNOW_DAYS_ENABLE): stand
+            # aside (cancel) without a fresh snow-day fair (the season has
+            # started, no history) or when the touch fights it; otherwise
+            # every rung below stays SNOW_DAYS_TOL_CENTS clear of the fair.
+            sd_caps: Optional[Tuple[Optional[int], Optional[int]]] = None
+            if snow_days_series(meta.series):
+                sd_why, sd_in, sd_caps = snow_days_gate(t, now_ts, ext_bid, ext_ask)
+                if sd_why or sd_caps is None:
+                    if t not in self._sd_stood:
+                        self._sd_stood.add(t)
+                        log(f"{self.tag} snow-days stand-aside {t}: {sd_why}")
+                    self.cancel_market_orders(t, resting)
+                    self._gskip(t, "snow_days_fair", lambda: sd_in, book=lambda: (ext_bid, ext_ask, yes_levels, no_levels))
+                    continue
+            if t in self._sd_stood:
+                self._sd_stood.discard(t)
+                log(f"{self.tag} snow-days resume {t}")
 
             # POKEMON GATE (Jack 2026-10-03, see POKE_ENABLE): stand aside
             # (cancel) without a fresh TCGplayer fair, on an unmapped event
@@ -41935,6 +42113,9 @@ class IncentiveMarketMaker:
             # FX event gate: likewise last, inside the live limits
             if fev_caps is not None:
                 mq = mort_cap_quotes(mq, *fev_caps)
+            # snow-day gate: likewise last, SNOW_DAYS_TOL_CENTS clear
+            if sd_caps is not None:
+                mq = mort_cap_quotes(mq, *sd_caps)
             # Pokemon gate: likewise last, POKE_FAIR_TOL_CENTS clear
             if poke_caps is not None:
                 mq = mort_cap_quotes(mq, *poke_caps)
@@ -44616,6 +44797,39 @@ class IncentiveMarketMaker:
                     time.sleep(delay)
             threading.Thread(target=_rain_wknd_refresh, daemon=True,
                              name="rain-wknd").start()
+        if SNOW_DAYS_ENABLE and not once:
+            # snow-day count refresher (2026-11-14): the rain-wknd
+            # refresher's contract on snow_days_fair.py and SNOW_DAYS_FILE --
+            # Kalshi's weather category and open markets hourly (cached in
+            # the file), each station's ACIS history once a week.
+            def _snow_days_refresh():
+                try:
+                    import snow_days_fair
+                except Exception as e:
+                    log(f"{self.tag} ! snow-days refresher disabled: {e}")
+                    return
+                kalshi_get = fair_reader()
+                last = None
+                while True:
+                    delay = max(60, SNOW_DAYS_REFRESH_SECS)
+                    try:
+                        ok, miss = snow_days_fair.write_fair_file(
+                            SNOW_DAYS_FILE, get_json=kalshi_get)
+                        if last != (ok, miss):
+                            log(f"{self.tag} snow-days refresh: {ok} markets "
+                                f"with a fair"
+                                + (f", {miss} without one" if miss else ""))
+                        last = (ok, miss)
+                    except Exception as e:
+                        err = f"err:{type(e).__name__}:{str(e)[:80]}"
+                        if last != err:
+                            log(f"{self.tag} ! snow-days refresh failed: "
+                                f"{type(e).__name__}: {str(e)[:120]}")
+                        last = err
+                        delay = min(delay, 300)
+                    time.sleep(delay)
+            threading.Thread(target=_snow_days_refresh, daemon=True,
+                             name="snow-days").start()
         if RESORT_SNOW_ENABLE and not once:
             # ski-resort snowfall refresher (2026-10-22): the rain-wknd
             # refresher's contract on resort_snow_fair.py and
@@ -45925,6 +46139,14 @@ class IncentiveMarketMaker:
                 f"{7 + MORT_CUTOFF_BUFFER_DAYS}d before the first print that "
                 f"can settle, ttl {MORT_FAIR_TTL_MIN}m, refresh "
                 f"{MORT_FAIR_REFRESH_SECS}s, status {MORT_STATUS_FILE}")
+        if SNOW_DAYS_ENABLE:
+            log(f"snow-day counts (2026-11-14): {','.join(sorted(SNOW_DAYS_SERIES))}"
+                + (" + any SNOW series on its contract" if SNOW_DAYS_AUTO else "")
+                + f" on snow_days_fair (40-season mean payout, every "
+                f"{SNOW_DAYS_REFRESH_SECS // 60}m), fail-closed, rungs "
+                f"{SNOW_DAYS_TOL_CENTS}c clear of the fair, leads "
+                f"{'on' if SNOW_DAYS_LEAD else 'off'}, x{SNOW_DAYS_SIZE_MULT:g}, 1-99c, "
+                f"out 00:00 ET of the window's first day, ttl {SNOW_DAYS_TTL_MIN}m")
         if HOME_ENABLE and (HOME_SERIES or HOME_AUTO):
             log(f"zillow home gate: {','.join(sorted(HOME_SERIES))}"
                 + (f" + auto {','.join(sorted(home_auto_series())) or '-'} "
