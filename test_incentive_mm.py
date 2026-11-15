@@ -44617,6 +44617,60 @@ class TestCheapSideBooks(unittest.TestCase):
         q, _ = q_(0.2, [(99.7, 5000.0)], [(0.1, 9000.0), (0.2, 4.0)], side="no")
         self.assertEqual(X(q), ("ask", 100, 99.8, 5000))
 
+    def test_a_whole_cent_rung_joins_the_subpenny_reference(self):
+        """Jack 2026-11-15: "Yes, fix it" (have the cheap-side books join the
+        sub-penny pile so they earn). KXSCOTUSPOWER-29-29JAN20-R9-0 at 14:09Z:
+        YES 1.1c x 33,451 over 1.0c x 961; the 7,500 at 1c sat past the
+        walk, scored 18% in the cent buckets. It joins the 1.1c reference at
+        the same dollars (7,500 x 1c -> 6,818 x 1.1c), scored on the exact book."""
+        X = lambda q: None if q is None else (q.book_side, q.price_cents, q.price_exact, q.count)
+
+        def q_(px, ye, ne, side="yes", size=7500, step=0.001, own=(), pos=0.0):
+            e = {"size": size, "cheap": {"side": side, "px": px}}
+            y0 = [[int(p), n] for p, n in ye]           # the cent buckets, floored
+            n0 = [[int(p), n] for p, n in ne]
+            return imm.cheap_side_quote(self.T, e, y0, n0, [], [list(x) for x in ye],
+                                        [list(x) for x in ne], list(own), 1000.0, 0.5, pos,
+                                        step=step)
+        scotus_y = [(1.1, 33451.0), (1.0, 961.0), (0.8, 625.0)]
+        scotus_n = [(98.8, 10246.0)]
+        q, info = q_(1, scotus_y, scotus_n)
+        self.assertEqual(X(q), ("bid", 1, 1.1, 6818))
+        self.assertEqual((info["px"], info["joined_from"]), (1.1, 1))
+        self.assertAlmostEqual(info["share"], 6818 / (33451 + 6818), places=4)
+        # ...and EARN ONLY keeps it (nothing strictly in front of 1.1c)
+        kept, _ = imm.earning_only_quotes([q], [list(x) for x in scotus_y],
+                                          [list(x) for x in scotus_n], [], 1000.0)
+        self.assertEqual(len(kept), 1)
+        # KXMOONMAN-31-E: 1.3c x 25,835 over 1.2c x 85,750 -> 1.3c, 5,769
+        q, _ = q_(1, [(1.3, 25835.0), (1.2, 85750.0)], [(98.6, 5481.0)])
+        self.assertEqual(X(q), ("bid", 1, 1.3, 5769))
+        # a reference past the cent (2.4c holds the first 200): the cent's best
+        # level, 1.6c -- never a level at or over 2c
+        q, info = q_(1, [(2.4, 300.0), (1.6, 150.0), (1.2, 100.0)], [(97.0, 5000.0)])
+        self.assertEqual(X(q)[:3], ("bid", 1, 1.6))
+        self.assertEqual(q.count, 4687)                    # 7,500 x 1c / 1.6c
+        # the reference at or under the rung's own cent: it stays at 1c
+        q, _ = q_(1, [(1.0, 5000.0), (0.8, 625.0)], [(98.8, 10246.0)])
+        self.assertEqual(X(q), ("bid", 1, 1.0, 7500))
+        # never a thin level over the reference: 150 at 1.3c, then 100 at 1.2c
+        # reach the first 200 -> 1.2c (YES ask 1.4c)
+        q, info = q_(1, [(1.3, 150.0), (1.2, 100.0), (0.9, 5000.0)], [(98.6, 10246.0)])
+        self.assertEqual(X(q), ("bid", 1, 1.2, 6250))
+        # our own resting rung is netted out: it never joins itself
+        q, _ = q_(1, [(1.1, 33451.0 + 6818.0), (1.0, 961.0)], scotus_n,
+                  own=[("bid", 1.1, 6818.0)])
+        self.assertEqual(X(q), ("bid", 1, 1.1, 6818))
+        # held contracts count against the dollars: 2,000 held -> 4,818 more
+        q, _ = q_(1, scotus_y, scotus_n, pos=2000.0)
+        self.assertEqual(q.count, 4818)
+        # a NO bid on a near-certainty: NO 1.2c x 5,000 -> the YES ask at 98.8c
+        q, _ = q_(1, [(97.0, 5000.0)], [(1.2, 5000.0), (1.0, 300.0)], side="no", size=5000)
+        self.assertEqual(X(q), ("ask", 99, 98.8, 4166))
+        # a whole-cent market keeps the old whole-cent rung
+        q, _ = q_(1, [(1.0, 300.0)], [(97.0, 1500.0)], step=0.01)
+        self.assertEqual(X(q), ("bid", 1, None, 7500))
+
     def test_the_100_dollar_stop_and_its_unwind(self):
         """Jack 2026-11-10: "if i already have $100 of exposure, stop quoting that
         side. and try to unwind at breakeven or better" -- after 10,000

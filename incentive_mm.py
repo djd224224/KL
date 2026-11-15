@@ -10811,6 +10811,59 @@ def cheap_side_quote(ticker: str, entry: dict,
     if p < 1:
         info["why"] = f"would cross (the other side's best is {limit:.2f}c)"
         return None, info
+    if (yes_exact or no_exact) and _fine_book(step, yes_exact, no_exact):
+        # A WHOLE-CENT px ON A SUB-PENNY BOOK (Jack 2026-11-15: "Yes, fix it",
+        # to "Have the cheap-side books join the sub-penny pile so they
+        # earn?"). The walk runs over exact prices: KXSCOTUSPOWER-29-29JAN20-
+        # R9-0's 7,500 at 1c sat behind 33,451 at 1.1c, past the walk, though
+        # the cent buckets scored it 18% of its side (EARN ONLY then pulled
+        # it). The rung moves up inside its own cent to the walk's REFERENCE
+        # -- the first external level, best first, where the size reaches
+        # target/5: the cheapest price scoring full weight, never a thin bait
+        # level above it -- or, with the reference past the cent, to the
+        # cent's best external level; strictly behind the other side's best.
+        # It keeps the entry's dollars (n x price <= size x px) and is scored
+        # on the exact book, one tick = 0.1c.
+        mine_x, other_x = _cheap_exact_sides(yes_exact, no_exact, own_exact, side)
+        hi = float(p) + 1.0 if limit is None else min(float(p) + 1.0, float(limit))
+        ref, cum = None, 0.0
+        for k in sorted(mine_x, reverse=True):
+            cum += mine_x[k]
+            if cum >= target / 5.0 - 1e-9:
+                ref = k
+                break
+        jp = float(p)
+        if ref is not None and ref > p + 1e-9:
+            if ref < hi - 1e-9:
+                jp = ref
+            else:
+                jp = max((k for k in mine_x if p + 1e-9 < k < hi - 1e-9), default=float(p))
+        jp = round(jp, 2)
+        if jp > p + 1e-9:
+            n = int(max(0.0, min(float(n), math.floor(size * px / jp + 1e-9) - max(0.0, held))))
+            info.update(px=jp, joined_from=p, n=n)
+            if n < 1:
+                info["why"] = f"at its dollars at {jp:g}c ({held:+.0f} held of {size} @ {px}c)"
+                return None, info
+        k0 = int(round(jp * 10))
+        walk = dict(_tick_walk(mine_x))
+        walk[k0] = walk.get(k0, 0.0) + n
+        share, ok_mine = _side_share(sorted(walk.items(), key=lambda kv: -kv[0]),
+                                     {k0: float(n)}, target, df)
+        _, ok_other = _side_share(_tick_walk(other_x), {}, target, df)
+        info["share"] = round(share, 4)
+        if not ok_other:
+            info["why"] = "the other side is under target (the snapshot pays nobody)"
+            return None, info
+        if not ok_mine or share <= 0 or share < CHEAP_MIN_SHARE:
+            info["why"] = (f"the rung scores {share * 100:.1f}% of its side (under "
+                           f"{CHEAP_MIN_SHARE * 100:g}%)" if ok_mine and share > 0
+                           else "the rung is out of the scored walk")
+            return None, info
+        if side == "yes":
+            return Quote(ticker, "bid", int(math.floor(jp + 1e-9)), n, price_exact=jp), info
+        return Quote(ticker, "ask", int(math.ceil(100.0 - jp - 1e-9)), n,
+                     price_exact=round(100.0 - jp, 2)), info
     mine, other = (ye, ne) if side == "yes" else (ne, ye)
     lv: Dict[int, float] = {}
     for a, b in mine:
