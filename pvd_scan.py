@@ -55,6 +55,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 LOG_DIR = os.path.join(HERE, "run-logs", "incentive-mm")
 LIST = os.path.join(LOG_DIR, "post_vote_dead_books.json")
+# CHEAP-SIDE BOOKS WIN (Jack 2026-11-16: "Yes, move them", to "Move the 154 primaries off
+# the 2028 wave onto the cheap-side books?"). The bot lets a wave entry win over a
+# cheap-side entry ("also on the wave list keep their wave entry"), so the 154
+# KXDPRESPRIMARY / KXPRESSTATE / KXRPRESPRIMARY markets he approved for the cheap-side
+# books that morning never rested their cheap rung. They went to "stopped" by hand for
+# this period; this keeps every later scan off a market on the cheap-side list
+# (cheap_side_books.json, rewritten hourly by cheap_scan.py). A market the cheap scan
+# drops is the wave's again. PVD_SCAN_CHEAP_SKIP=off turns it off.
+CHEAP_LIST = os.path.join(LOG_DIR, "cheap_side_books.json")
+CHEAP_SKIP = os.environ.get("PVD_SCAN_CHEAP_SKIP", "on").strip().lower() != "off"
 OUT_DIR = os.path.join(HERE, "run-logs", "pvd-scan")
 os.makedirs(OUT_DIR, exist_ok=True)
 LOCK = os.path.join(OUT_DIR, "scan.lock")
@@ -133,6 +143,20 @@ import kalshi_reads                              # noqa: E402
 import send_imm_new_programs as snp             # noqa: E402
 
 _loc = threading.local()
+
+
+def cheap_listed(path: str = None) -> set:
+    """The markets on the cheap-side list, which the scan leaves alone (CHEAP_SKIP):
+    every entry, its stop passed or not -- the hourly cheap scan rewrites the file, so a
+    market it still holds stays the cheap books' across a period roll. Empty when off,
+    missing or unreadable (the scan then lists as before)."""
+    if not CHEAP_SKIP:
+        return set()
+    try:
+        with open(path or CHEAP_LIST, encoding="utf-8") as fh:
+            return set((json.load(fh) or {}).get("markets") or {})
+    except (OSError, ValueError, AttributeError, TypeError):
+        return set()
 
 
 def log(msg: str) -> None:
@@ -233,11 +257,12 @@ def scan(write: bool) -> int:
     cur = json.load(open(LIST)) if os.path.exists(LIST) else {"markets": {}}
     L = cur.setdefault("markets", {})
     cands, series_ok = {}, {}
-    n_listed_cur = n_old_wave = n_stopped = 0
+    n_listed_cur = n_old_wave = n_stopped = n_cheap = 0
     # markets Jack stopped by hand ("stopped": {ticker: {"at", "reason", "entry"}},
     # which the bot never reads): left alone until a program period starting
     # after the stop relights them
     stopped = cur.get("stopped") or {}
+    cheap = cheap_listed()
     for t, pr in progs.items():
         s = t.split("-")[0]
         if s not in series_ok:
@@ -246,6 +271,9 @@ def scan(write: bool) -> int:
             series_ok[s] = member and not imm.series_blocklisted(s)
         if not series_ok[s]:
             continue
+        if t in cheap:
+            n_cheap += 1
+            continue                        # the cheap-side books hold it (CHEAP_SKIP)
         e = L.get(t)
         hs = stopped.get(t)
         if SIM_HOURS:
@@ -270,11 +298,12 @@ def scan(write: bool) -> int:
     n_ext = sum(1 for t in cands if cands[t].get("extend"))
     n_relit = sum(1 for t in cands if t in L) - n_ext
     summary.update(programs=len(progs), listed_current=n_listed_cur, old_wave_skipped=n_old_wave,
-                   stopped_by_hand=n_stopped,
+                   stopped_by_hand=n_stopped, cheap_side_skipped=n_cheap,
                    candidates=len(cands), extend_candidates=n_ext, relit_candidates=n_relit,
                    new_candidates=len(cands) - n_relit - n_ext)
     log(f"programs {len(progs)} | election family: {n_listed_cur} listed for this period, {n_old_wave} from the "
-        f"11/04 wave left as judged | candidates {len(cands)} (same program runs past the listed stop "
+        f"11/04 wave left as judged, {n_cheap} on the cheap-side books left to them"
+        f" | candidates {len(cands)} (same program runs past the listed stop "
         f"{n_ext}, relit {n_relit}, new {len(cands) - n_relit - n_ext})")
     taken = []
     if cands:
