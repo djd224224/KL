@@ -15015,6 +15015,9 @@ _CONFIG_CODE_KNOBS = (
     "UNWIND_WAVES_AT_COST",       # the waves' unwind at the close clamp's bound, not cost (2026-11-12)
     # the twin check in mutually exclusive events (2026-11-11)
     "TWIN_CHECK_MODE", "TWIN_CHECK_TOL_C",
+    # the national nominee floor on state-primary asks (2026-11-16)
+    "NATNOM_FLOOR_MODE", "NATNOM_EVENTS", "NATNOM_FLOOR_ADJ_C", "NATNOM_TTL_SECS",
+    "NATNOM_NAMES_TTL_SECS",
     # heightened bait mode, dry (2026-11-13)
     "HEIGHTENED_MODE", "HEIGHTENED_FLASH_MAX_SECS", "HEIGHTENED_MIN_C",
     "HEIGHTENED_WINDOW_MIN", "HEIGHTENED_PULLS", "HEIGHTENED_HOLD_MIN",
@@ -26673,6 +26676,123 @@ def twin_check_quotes(quotes: List["Quote"], bid_cap: Optional[float],
     return out, moved
 
 
+# NATIONAL NOMINEE FLOOR (Jack 2026-11-16: "Yes, build it", to "Add a
+# national-price floor on state-primary asks?"). Why it exists: at
+# 16:11:40Z a taker bought DeSantis YES at 13c in 30 KXRPRESPRIMARY states
+# within 32 ms. Our 300-lot ask in each state filled: 9,000 contracts, -$475
+# at the hour's marks.
+#
+# The state books had sat at 12/13c for days, while Kalshi's national market
+# on the same name winning the nomination (KXPRESNOMR-28-RDS) traded 15/16c.
+# The bot had no fair there and joined each state's best ask, so the gap was
+# a free option. Every breaker fired after the fills.
+#
+# The rule: a nominee wins nearly every state primary, so a state's YES is
+# worth about the national price or more. OUR YES ASK on a state-primary
+# market therefore rests at least the national market's YES bid
+# (+ NATNOM_FLOOR_ADJ_C).
+#   * A rung under the floor is RE-PRICED at it (twin_check_quotes: a pad is
+#     dropped, a bound outside 1-99c drops the rung).
+#   * Bids are left alone. A long shot's state books trade over its national
+#     price, because a candidate can win a state and still lose the nomination.
+#   * It runs right after THE TWIN CHECK and before EARN ONLY, after every path
+#     that adds a rung.
+#
+# Where the inputs come from:
+#   * State market -> name: the market's ticker suffix (the name code, "RDES")
+#     -> Kalshi's YES subtitle ("Ron DeSantis"), read per series from /events
+#     every NATNOM_NAMES_TTL_SECS, and sooner (10 min) when a code is missing.
+#   * The national YES bids: the national event, every NATNOM_TTL_SECS.
+#   * A failed read keeps the last prices; a floor only ever moves our ask up.
+#   * A name with no national market, or a national market with no bid, has
+#     no floor.
+#
+# Knobs:
+#   * IMM_NATNOM_FLOOR: "on" (default), "dry" (logged, nothing re-priced), "off".
+#   * IMM_NATNOM_EVENTS: "STATE_SERIES:NATIONAL_EVENT,...".
+#   * The bid is matched by name, so the codes may differ (RDES state, RDS
+#     national).
+NATNOM_FLOOR_MODE = os.environ.get("IMM_NATNOM_FLOOR", "on").strip().lower()
+if NATNOM_FLOOR_MODE not in ("on", "dry", "off"):
+    NATNOM_FLOOR_MODE = "on"
+NATNOM_EVENTS: Dict[str, str] = {}
+for _nn in os.environ.get(
+        "IMM_NATNOM_EVENTS",
+        "KXRPRESPRIMARY:KXPRESNOMR-28,KXDPRESPRIMARY:KXPRESNOMD-28").split(","):
+    if ":" in _nn:
+        _nn_s, _nn_e = (x.strip().upper() for x in _nn.split(":", 1))
+        if _nn_s and _nn_e:
+            NATNOM_EVENTS[_nn_s] = _nn_e
+NATNOM_FLOOR_ADJ_C = _env_float("IMM_NATNOM_FLOOR_ADJ_C", 0.0)
+NATNOM_TTL_SECS = max(15.0, _env_float("IMM_NATNOM_TTL_S", 60.0))
+NATNOM_NAMES_TTL_SECS = max(600.0, _env_float("IMM_NATNOM_NAMES_TTL_H", 6.0) * 3600.0)
+
+
+def natnom_key(name) -> str:
+    """A candidate's name as THE NATIONAL NOMINEE FLOOR matches it: its
+    letters and digits in lower case ("J.D. Vance" -> "jdvance")."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def natnom_names_from_events(events) -> Dict[str, str]:
+    """{name code (a market ticker's last part, "RDES") -> natnom_key of its
+    YES subtitle} over a state series' events, each read with nested
+    markets."""
+    out: Dict[str, str] = {}
+    for e in events or []:
+        for m in (e.get("markets") or []) if isinstance(e, dict) else []:
+            t = str(m.get("ticker") or "")
+            k = natnom_key(m.get("yes_sub_title"))
+            if "-" in t and k:
+                out[t.rsplit("-", 1)[1].upper()] = k
+    return out
+
+
+def natnom_prices_from_event(js) -> Dict[str, Tuple[str, float]]:
+    """{natnom_key of the YES subtitle -> (national market ticker, its YES bid
+    in cents, to 0.01)} for each open market of a national event read with
+    nested markets that has a bid."""
+    js = js if isinstance(js, dict) else {}
+    e = js.get("event") or {}
+    out: Dict[str, Tuple[str, float]] = {}
+    for m in (e.get("markets") or js.get("markets") or []):
+        if str(m.get("status") or "").lower() not in ("active", "open"):
+            continue
+        k = natnom_key(m.get("yes_sub_title"))
+        bid: Optional[float] = None
+        v = m.get("yes_bid_dollars")
+        if v is not None:
+            try:
+                bid = round(float(v) * 100.0, 2)
+            except (TypeError, ValueError):
+                bid = None
+        if bid is None:
+            c = market_cents(m, "yes_bid")
+            bid = None if c is None else float(c)
+        if k and bid is not None and 0.0 < bid < 100.0:
+            out[k] = (str(m.get("ticker") or ""), bid)
+    return out
+
+
+def natnom_ask_floor(ticker: str, names: Dict[str, str],
+                     prices: Dict[str, Tuple[str, float]],
+                     adj: Optional[float] = None
+                     ) -> Optional[Tuple[float, str, float]]:
+    """THE NATIONAL NOMINEE FLOOR for one state-primary market: (the floor in
+    YES cents, the national ticker, its YES bid), or None when its name code
+    is unknown (`names`: code -> key, its series') or the name has no
+    national bid (`prices`: key -> (national ticker, bid))."""
+    code = str(ticker or "").rsplit("-", 1)[-1].upper()
+    k = names.get(code)
+    if not k:
+        return None
+    p = prices.get(k)
+    if not p or p[1] is None or p[1] <= 0:
+        return None
+    adj = NATNOM_FLOOR_ADJ_C if adj is None else float(adj)
+    return float(p[1]) + adj, p[0], float(p[1])
+
+
 def ladder_lead_group(yes_levels: List[List[float]], no_levels: List[List[float]],
                       easier: List[Tuple[List[List[float]], List[List[float]]]],
                       harder: List[Tuple[List[List[float]], List[List[float]]]],
@@ -28718,6 +28838,17 @@ class IncentiveMarketMaker:
         self._pvd_clamp: Dict[str, Optional[tuple]] = {}  # CLOSE CLAMP: t -> (side, from, to) last logged
         self._twin_noted: Dict[str, tuple] = {}            # TWIN CHECK: t -> what it last logged
         self._twin_books: Tuple[float, Dict[str, tuple]] = (0.0, {})  # (cycle ts, sibling books)
+        # NATIONAL NOMINEE FLOOR: per state series, name code -> name key and
+        # name key -> (national ticker, YES bid); when each was last read; the
+        # codes quoted without a name; what each market last logged
+        self._natnom_names: Dict[str, Dict[str, str]] = {}
+        self._natnom_names_at: Dict[str, float] = {}
+        self._natnom_px: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        self._natnom_px_at: Dict[str, float] = {}
+        self._natnom_try_at = 0.0
+        self._natnom_missing: Dict[str, Set[str]] = {}
+        self._natnom_noted: Dict[str, tuple] = {}
+        self._natnom_summary: Optional[tuple] = None
         # a flip-through entry's (bid, ask) rung as the quote loop sized it this
         # cycle (pvd_side_sizes on the position it judged) -- place_with_caps'
         # side cap reads it, so a 400 ask beside a long 200 isn't "blocked at 0/200"
@@ -37718,6 +37849,136 @@ class IncentiveMarketMaker:
                 "side": side, "from": a, "to": b, "cap": cap, "floor": floor,
                 "sibs": len(sibs), "books": n_books})
 
+    # ---- national nominee floor (2026-11-16, NATNOM_FLOOR_MODE) --------------
+
+    def _natnom_refresh(self, now_ts: float, force: bool = False) -> None:
+        """Read THE NATIONAL NOMINEE FLOOR's inputs.
+          * When: every NATNOM_TTL_SECS while a paired state series
+            (NATNOM_EVENTS) is selected. With `force` (the quote loop meeting
+            a paired series that has no prices yet: a fresh run or a fresh
+            selection), at once, at most every 15 s.
+          * Per paired series, every time: its national event's YES bids.
+          * Its name codes' YES subtitles (/events?series_ticker=...): when
+            older than NATNOM_NAMES_TTL_SECS, or 10 min after the last read
+            when a quoted code had no name.
+        A failed read keeps what it had and is logged once. Never raises."""
+        if NATNOM_FLOOR_MODE not in ("on", "dry") or not NATNOM_EVENTS:
+            return
+        if force:
+            if now_ts - self._natnom_try_at < 15.0:
+                return
+        else:
+            if now_ts - self._natnom_try_at < NATNOM_TTL_SECS:
+                return
+            try:
+                if not any(m.series in NATNOM_EVENTS
+                           for m in self.state.selected.values()):
+                    return
+            except Exception:  # noqa: BLE001
+                return
+        self._natnom_try_at = now_ts
+        for series, nat_ev in sorted(NATNOM_EVENTS.items()):
+            try:
+                at = self._natnom_names_at.get(series, 0.0)
+                missing = self._natnom_missing.get(series) or set()
+                if (now_ts - at >= NATNOM_NAMES_TTL_SECS
+                        or (missing and now_ts - at >= 600.0)):
+                    events: List[dict] = []
+                    cursor = None
+                    for _page in range(5):
+                        params = {"series_ticker": series, "with_nested_markets": "true",
+                                  "status": "open", "limit": 200}
+                        if cursor:
+                            params["cursor"] = cursor
+                        js = self.client.get("/events", params=params) or {}
+                        events.extend(js.get("events") or [])
+                        cursor = js.get("cursor")
+                        if not cursor:
+                            break
+                    names = natnom_names_from_events(events)
+                    self._natnom_names_at[series] = now_ts
+                    if names:
+                        self._natnom_names[series] = names
+                        self._natnom_missing[series] = {
+                            c for c in missing if c not in names}
+                js = self.client.get(f"/events/{nat_ev}",
+                                     params={"with_nested_markets": "true"}) or {}
+                px = natnom_prices_from_event(js)
+                if px:
+                    self._natnom_px[series] = px
+                    self._natnom_px_at[series] = now_ts
+            except Exception as e:  # noqa: BLE001 -- a read failure keeps the last prices
+                if not getattr(self, "_natnom_err_logged", False):
+                    self._natnom_err_logged = True
+                    log(f"{self.tag} ! national nominee floor: read for {series} / "
+                        f"{nat_ev} failed ({e!r}); keeping the last prices (logged once)")
+        summ = tuple(sorted(
+            (s, len(self._natnom_names.get(s) or {}), len(self._natnom_px.get(s) or {}))
+            for s in NATNOM_EVENTS))
+        if summ != self._natnom_summary:
+            self._natnom_summary = summ
+            log(f"{self.tag} national nominee floor: " + "; ".join(
+                f"{s} <- {NATNOM_EVENTS[s]}: {nc} name code(s), {npx} national bid(s)"
+                for s, nc, npx in summ))
+
+    def _natnom_floor(self, t: str, meta, mq: List["Quote"], now_ts: float) -> List["Quote"]:
+        """THE NATIONAL NOMINEE FLOOR (NATNOM_FLOOR_MODE) on market `t`'s rungs
+        as built: in a paired state-primary series, no YES ask under the
+        national nominee market's YES bid (+ NATNOM_FLOOR_ADJ_C).
+        twin_check_quotes re-prices a rung at the floor. "dry" logs what it
+        would do and returns the rungs as built. Never raises: a failure
+        leaves them as built (logged once)."""
+        if NATNOM_FLOOR_MODE not in ("on", "dry") or not mq or meta.series not in NATNOM_EVENTS:
+            return mq
+        try:
+            if meta.series not in self._natnom_px_at:
+                self._natnom_refresh(now_ts, force=True)
+            names = self._natnom_names.get(meta.series) or {}
+            code = t.rsplit("-", 1)[-1].upper()
+            if names and code not in names:
+                self._natnom_missing.setdefault(meta.series, set()).add(code)
+            fl = natnom_ask_floor(t, names, self._natnom_px.get(meta.series) or {})
+            if fl is None:
+                self._natnom_note(t, {}, None)
+                return mq
+            out, moved = twin_check_quotes(mq, None, fl[0])
+            self._natnom_note(t, moved, fl)
+            return out if NATNOM_FLOOR_MODE == "on" else mq
+        except Exception as e:  # noqa: BLE001 -- a guard's failure never costs the cycle
+            if not getattr(self, "_natnom_fail_logged", False):
+                self._natnom_fail_logged = True
+                log(f"{self.tag} ! national nominee floor failed on {t} ({e!r}); its "
+                    f"rungs rest as built (logged once)")
+            return mq
+
+    def _natnom_note(self, t: str, moved: Dict[str, Tuple[float, Optional[float]]],
+                     fl: Optional[Tuple[float, str, float]]) -> None:
+        """Log (and sink, natnom_floor_<date>.jsonl) THE NATIONAL NOMINEE
+        FLOOR on a market when what it re-prices there changes, and "clear"
+        once it stops."""
+        tag = "" if NATNOM_FLOOR_MODE == "on" else " (dry)"
+        mv = moved.get("ask")
+        key = () if mv is None or fl is None else (
+            round(mv[0], 2), None if mv[1] is None else round(mv[1], 2), round(fl[2], 2))
+        prev = self._natnom_noted.get(t)
+        if not key:
+            if prev:
+                self._natnom_noted.pop(t, None)
+                log(f"{self.tag} national nominee floor{tag} {t}: clear")
+            return
+        if prev == key:
+            return
+        self._natnom_noted[t] = key
+        a, b = mv
+        to = "out of 1-99c, not resting" if b is None else f"{b:g}c"
+        log(f"{self.tag} national nominee floor{tag} {t} ask: {a:g}c -> {to} -- "
+            f"{fl[1]} (the same name as the nominee) is bid {fl[2]:g}c"
+            + (f" ({NATNOM_FLOOR_ADJ_C:+g}c)" if NATNOM_FLOOR_ADJ_C else ""))
+        self._sink("natnom_floor", {
+            "ts": round(time.time(), 3), "mode": NATNOM_FLOOR_MODE, "ticker": t,
+            "side": "ask", "from": a, "to": b, "floor": round(fl[0], 2),
+            "national": fl[1], "national_bid": fl[2]})
+
     def _comp_lead(self, meta, yes_ext: List[List[float]], no_ext: List[List[float]]
                    ) -> Tuple[Optional[Tuple[int, int, int]],
                               Optional[Tuple[int, int, int]]]:
@@ -41009,6 +41270,8 @@ class IncentiveMarketMaker:
             log(f"{self.tag} ! WS event handling failed: {e}")
         if self._ws is None:
             self._fair_hold_pull(now_ts)       # FAIR HOLD PULL with no feed
+        # NATIONAL NOMINEE FLOOR's national bids (every NATNOM_TTL_SECS)
+        self._natnom_refresh(now_ts)
 
         positions = self.fetch_positions()
         # Post-wake grace: reads right after a sleep can SUCCEED with garbage
@@ -43822,6 +44085,9 @@ class IncentiveMarketMaker:
             # siblings' bids leave this market worth, and in a two-market
             # election pair no ask under what the twin's NO bids pay for it
             mq = self._twin_check(t, meta, mq, now_ts)
+            # NATIONAL NOMINEE FLOOR (NATNOM_FLOOR_MODE): a state primary's
+            # YES ask rests at least the national nominee market's YES bid
+            mq = self._natnom_floor(t, meta, mq, now_ts)
             # EARN ONLY (EARN_ONLY_MODE): the very last step -- no rung the
             # program's walk would not pay rests, but for the unwind
             if mq and EARN_ONLY_MODE in ("on", "dry"):
@@ -48019,6 +48285,16 @@ class IncentiveMarketMaker:
                f"without our own orders; a rung past it is re-priced at the bound"
                + ("" if TWIN_CHECK_MODE == "on" else " (dry: logged, nothing re-priced)")
                if TWIN_CHECK_MODE in ("on", "dry") else " (IMM_TWIN_CHECK=off)"))
+        log(f"national nominee floor (2026-11-16): {NATNOM_FLOOR_MODE}"
+            + (f" -- a YES ask on " + ", ".join(
+                f"{s} rests at least {e}'s YES bid for the same name"
+                for s, e in sorted(NATNOM_EVENTS.items()))
+               + (f" {NATNOM_FLOOR_ADJ_C:+g}c" if NATNOM_FLOOR_ADJ_C else "")
+               + f" (read every {NATNOM_TTL_SECS:g}s); bids untouched; a rung under it is "
+               f"re-priced at the floor"
+               + ("" if NATNOM_FLOOR_MODE == "on" else " (dry: logged, nothing re-priced)")
+               if NATNOM_FLOOR_MODE in ("on", "dry") and NATNOM_EVENTS
+               else " (IMM_NATNOM_FLOOR=off)"))
         log(f"unwind-only waves scope (2026-11-08): "
             + ("existing waves -- UNWIND_ONLY_WAVES covers the waves listed before the switch "
                "file appeared; a wave added after it quotes as usual"

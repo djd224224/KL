@@ -45625,6 +45625,164 @@ class TestTwinCheck(unittest.TestCase):
                              for s in lines if "(2026-11-11)" not in s))
 
 
+class TestNationalNomineeFloor(unittest.TestCase):
+    """Jack 2026-11-16: "Yes, build it", to "Add a national-price floor on
+    state-primary asks?", after a taker bought DeSantis YES at 13c in 30
+    KXRPRESPRIMARY states in 32 ms while the national nominee market
+    (KXPRESNOMR-28-RDS) was bid 15c. A state primary's YES ask rests at least
+    the national market's YES bid for the same name; bids are left alone."""
+
+    SER, NAT = "KXFOOPRIM", "KXFOONOM-28"
+    EV = "KXFOOPRIM-28AL"
+    T = "KXFOOPRIM-28AL-RDES"
+
+    def test_names_prices_and_the_floor(self):
+        self.assertEqual(imm.natnom_key("J.D. Vance"), "jdvance")
+        self.assertEqual(imm.natnom_key(" Alexandria Ocasio-Cortez "), "alexandriaocasiocortez")
+        names = imm.natnom_names_from_events([
+            {"markets": [{"ticker": "KXRPRESPRIMARY-28AL-RDES", "yes_sub_title": "Ron DeSantis"},
+                         {"ticker": "KXRPRESPRIMARY-28AL-JVAN", "yes_sub_title": "J.D. Vance"}]},
+            {"markets": [{"ticker": "KXRPRESPRIMARY-28NH-TMAS", "yes_sub_title": "Thomas Massie"},
+                         {"ticker": "KXRPRESPRIMARY-28NH-XX", "yes_sub_title": ""}]}])
+        self.assertEqual(names, {"RDES": "rondesantis", "JVAN": "jdvance", "TMAS": "thomasmassie"})
+        px = imm.natnom_prices_from_event({"event": {"markets": [
+            # the national codes differ from the state ones: matched by name
+            {"ticker": "KXPRESNOMR-28-RDS", "yes_sub_title": "Ron DeSantis",
+             "status": "active", "yes_bid_dollars": "0.1500"},
+            # a sub-penny bid keeps its tenths
+            {"ticker": "KXPRESNOMR-28-TMAS", "yes_sub_title": "Thomas Massie",
+             "status": "active", "yes_bid_dollars": "0.0220"},
+            # the legacy integer-cent field when the dollars one is absent
+            {"ticker": "KXPRESNOMR-28-JDV", "yes_sub_title": "J.D. Vance",
+             "status": "active", "yes_bid": 36},
+            # no bid, or a closed market: no price
+            {"ticker": "KXPRESNOMR-28-NOB", "yes_sub_title": "No Bid",
+             "status": "active", "yes_bid_dollars": "0.0000"},
+            {"ticker": "KXPRESNOMR-28-CLO", "yes_sub_title": "Closed Name",
+             "status": "closed", "yes_bid_dollars": "0.3000"}]}})
+        self.assertEqual(px, {"rondesantis": ("KXPRESNOMR-28-RDS", 15.0),
+                              "thomasmassie": ("KXPRESNOMR-28-TMAS", 2.2),
+                              "jdvance": ("KXPRESNOMR-28-JDV", 36.0)})
+        self.assertEqual(imm.natnom_ask_floor("KXRPRESPRIMARY-28AL-RDES", names, px, adj=0),
+                         (15.0, "KXPRESNOMR-28-RDS", 15.0))
+        self.assertEqual(imm.natnom_ask_floor("KXRPRESPRIMARY-28AL-RDES", names, px, adj=1),
+                         (16.0, "KXPRESNOMR-28-RDS", 15.0))
+        # a code without a name, or a name without a national bid: no floor
+        self.assertIsNone(imm.natnom_ask_floor("KXRPRESPRIMARY-28AL-ZZZZ", names, px))
+        self.assertIsNone(imm.natnom_ask_floor("KXRPRESPRIMARY-28AL-RDES", names, {}))
+
+    def test_the_sweep_rung_is_repriced_at_the_national_bid(self):
+        # the 16:11:40Z book in miniature: our 13c ask under a 15c national bid
+        # goes up to 15c; a 2.2c national bid re-prices a sub-penny ask on the
+        # 0.1c grid and leaves a whole-cent one at the next cent up
+        q = imm.Quote
+        out, moved = imm.twin_check_quotes(
+            [q(self.T, "bid", 12, 900), q(self.T, "ask", 13, 300),
+             q(self.T, "ask", 99, 5000, is_pad=True)], None, 15.0)
+        self.assertEqual(sorted((x.book_side, x.price_cents, x.count) for x in out),
+                         [("ask", 15, 300), ("ask", 99, 5000), ("bid", 12, 900)])
+        self.assertEqual(moved, {"ask": (13.0, 15.0)})
+        out, _m = imm.twin_check_quotes([q(self.T, "ask", 2, 200, price_exact=1.9)], None, 2.2)
+        self.assertEqual((out[0].price_cents, out[0].price_exact), (3, 2.2))
+        out, _m = imm.twin_check_quotes([q(self.T, "ask", 2, 200)], None, 2.2)
+        self.assertEqual((out[0].price_cents, out[0].price_exact), (3, None))
+
+    def _cycle(self, mode, nat_bid="0.1500", fail=False):
+        _clean_persist()
+        test = self
+        reads = []
+
+        class _PrimClient(FakeClient):
+            def __init__(self_):
+                super().__init__()
+                now = datetime.now(timezone.utc)
+                start = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                end = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                far = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self_.programs = [
+                    {"market_ticker": test.T, "incentive_type": "liquidity",
+                     "period_reward": 7000000, "target_size_fp": "1000.00",
+                     "discount_factor_bps": 5000, "paid_out": False,
+                     "start_date": start, "end_date": end}]
+                self_.markets = {test.T: {
+                    "ticker": test.T, "event_ticker": test.EV, "status": "active",
+                    "close_time": far, "yes_bid_dollars": "0.1200",
+                    "yes_ask_dollars": "0.1300", "volume_fp": "3000.00"}}
+                self_.books = {test.T: {"orderbook_fp": {
+                    "yes_dollars": [["0.11", "2000"], ["0.12", "1500"]],
+                    "no_dollars": [["0.86", "2000"], ["0.87", "1500"]]}}}
+
+            def get(self_, path, params=None):
+                if path == "/events" and (params or {}).get("series_ticker") == test.SER:
+                    reads.append(path)
+                    if fail:
+                        raise RuntimeError("read failed")
+                    return {"events": [{"event_ticker": test.EV, "markets": [
+                        {"ticker": test.T, "yes_sub_title": "Ron DeSantis"}]}], "cursor": ""}
+                if path == f"/events/{test.NAT}":
+                    reads.append(path)
+                    if fail:
+                        raise RuntimeError("read failed")
+                    return {"event": {"markets": [
+                        {"ticker": f"{test.NAT}-RDS", "yes_sub_title": "Ron DeSantis",
+                         "status": "active", "yes_bid_dollars": nat_bid}]}}
+                return super().get(path, params)
+
+        with mock.patch.object(imm, "LADDER_MODE", "atref"), \
+                mock.patch.object(imm, "NATNOM_FLOOR_MODE", mode), \
+                mock.patch.object(imm, "NATNOM_EVENTS", {self.SER: self.NAT}), \
+                mock.patch.object(imm, "NATNOM_FLOOR_ADJ_C", 0.0), \
+                mock.patch.object(imm, "LONE_REF_GUARD_MODE", "off"), \
+                mock.patch.object(imm, "LEVELS", [(0, 20)]), \
+                mock.patch.object(imm, "MAX_JOIN_SPREAD_CENTS", 99), \
+                mock.patch.object(imm, "JOIN_AHEAD_MODE", "off"):
+            bot = IncentiveMarketMaker(client=_PrimClient(), live=False)
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+                bot.state.universe_at = time.time()
+                bot.run_cycle()
+                bot.run_cycle()
+        rungs = {(o["ticker"], o["book_side"]): o["yes_price"]
+                 for o in bot.state.sim_orders.values()
+                 if imm.PAD_BID_CENTS < o["yes_price"] < imm.PAD_ASK_CENTS}
+        return bot, rungs, lines, reads
+
+    def test_off_the_ask_joins_the_stale_state_book(self):
+        bot, rungs, lines, reads = self._cycle("off")
+        self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
+        self.assertEqual(reads, [])
+
+    def test_on_the_ask_rests_at_the_national_bid(self):
+        bot, rungs, lines, reads = self._cycle("on")
+        self.assertEqual(rungs.get((self.T, "ask")), 15, (rungs, [s for s in lines if "nominee" in s]))
+        # the bid is left alone
+        self.assertEqual(rungs.get((self.T, "bid")), 12, rungs)
+        self.assertTrue(any(
+            "national nominee floor KXFOOPRIM-28AL-RDES ask: 13c -> 15c -- KXFOONOM-28-RDS "
+            "(the same name as the nominee) is bid 15c" in s for s in lines),
+            [s for s in lines if "nominee" in s])
+        self.assertEqual(bot._natnom_names.get(self.SER), {"RDES": "rondesantis"})
+        # the national bids are read once a TTL, not every cycle
+        self.assertLessEqual(reads.count(f"/events/{self.NAT}"), 2, reads)
+
+    def test_a_national_bid_under_the_state_book_moves_nothing(self):
+        bot, rungs, lines, reads = self._cycle("on", nat_bid="0.1000")
+        self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
+        self.assertFalse(any("nominee floor KXFOOPRIM" in s for s in lines))
+
+    def test_dry_logs_and_rests_as_built(self):
+        bot, rungs, lines, reads = self._cycle("dry")
+        self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
+        self.assertTrue(any("national nominee floor (dry) KXFOOPRIM-28AL-RDES ask: 13c -> 15c"
+                            in s for s in lines), [s for s in lines if "nominee" in s])
+
+    def test_a_failed_read_quotes_as_before_and_logs_once(self):
+        bot, rungs, lines, reads = self._cycle("on", fail=True)
+        self.assertEqual(rungs.get((self.T, "ask")), 13, rungs)
+        self.assertEqual(sum("! national nominee floor: read" in s for s in lines), 1, lines[-20:])
+
+
 class TestOscarsWinnersBand(unittest.TestCase):
     """OSCARS 1-99c (Jack 2026-11-13: "be open to quoting oscars when they
     launch KXOSCARS-EDIT27, KXOSCARS-SOUND27, etc"): the KXOSCARS winners
