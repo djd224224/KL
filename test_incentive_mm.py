@@ -14827,8 +14827,15 @@ class TestCpiFairGate(unittest.TestCase):
         imm.SERIES_HOUR_MULTS = []
         self._blackout = mock.patch.object(imm, "series_in_blackout", return_value=False)
         self._blackout.start()
+        # the gate is the pilot's: it runs while the pilot is open. The pilot
+        # ended 2026-11-11 01:48Z (Jack: "stop quoting CPI", 4a2d4eb), and
+        # with that default the .*CPI.* block keeps the fixture out of the
+        # selection before any gate -- test_the_ended_pilot_rests_nothing
+        self._pilot = mock.patch.object(imm, "CPI_PILOT_UNTIL", None)
+        self._pilot.start()
 
     def tearDown(self):
+        self._pilot.stop()
         self._blackout.stop()
         imm.SERIES_HOUR_MULTS = self._saved_hour_mults
         imm.CPI_FAIR_CAP = True
@@ -14919,6 +14926,30 @@ class TestCpiFairGate(unittest.TestCase):
         bot.run_cycle()
         self.assertEqual({s for s, _ in self._quotes(bot)}, {"ask"})
         self.assertEqual(bot._rain_period_unearning[self.T], {"bid"})
+
+
+class TestCpiPilotEnded(unittest.TestCase):
+    """The shipped default since 2026-11-11 01:48Z (Jack: "stop quoting CPI",
+    4a2d4eb): the block closes over the pilot family again, so even a fresh
+    CPI fair quotes nothing -- the market never reaches the gate. Its own
+    class: TestRainWkndGate / TestRtFairGate subclass TestCpiFairGate."""
+    T, EV, _bump = TestCpiFairGate.T, TestCpiFairGate.EV, 1
+    setUp, tearDown = TestCpiFairGate.setUp, TestCpiFairGate.tearDown
+    _write, _bot, _quotes = TestCpiFairGate._write, TestCpiFairGate._bot, TestCpiFairGate._quotes
+
+    def test_the_ended_pilot_rests_nothing(self):
+        self._pilot.stop()                  # the shipped CPI_PILOT_UNTIL
+        try:
+            self.assertEqual(imm.CPI_PILOT_UNTIL,
+                             datetime(2026, 11, 11, 1, 48, tzinfo=timezone.utc))
+            self.assertTrue(IncentiveMarketMaker._blocked(self.T))
+            self._write()
+            bot = self._bot()
+            bot.run_cycle()
+            self.assertEqual(self._quotes(bot), [])
+            self.assertNotIn(self.T, bot.state.selected)
+        finally:
+            self._pilot.start()
 
 
 class TestRainWkndGate(TestCpiFairGate):
