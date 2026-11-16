@@ -44929,6 +44929,95 @@ class TestCheapSideBooks(unittest.TestCase):
         with open(bot2.PERSIST_PATH, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh).get("cheap_cap_unwind"), {})
 
+    def test_the_near_cap_unwind(self):
+        """Jack 2026-11-16: "Yes, fix it", to "Fix E45's near-cap gap so it
+        unwinds?" -- KXDSENATESEATS-29-E45 held 7,440 YES at 1c against its
+        7,500 cap: the 60 left scored 0.2% of its side (under 1%), so nothing
+        rested and no unwind ran. Now a rung that stands aside ONLY because of
+        what the side holds (a full-size rung would rest) is at its cap once
+        the side holds half its size: the whole 7,440 rests as a YES ask
+        joining the 2c outside ask, latched until flat"""
+        f = imm.cheap_cap_unwinds
+        self.assertTrue(f("yes", 7500, 7440.0, False, short=True))
+        self.assertTrue(f("yes", 7500, 3750.0, False, short=True))    # half its size
+        self.assertFalse(f("yes", 7500, 3749.0, False, short=True))   # under half: no unwind
+        self.assertFalse(f("yes", 7500, 7440.0, False))               # the rung earns: it rests
+        self.assertTrue(f("no", 7500, -7440.0, False, short=True))    # NO held
+        self.assertFalse(f("no", 7500, 7440.0, False, short=True))    # held on the other side
+        self.assertFalse(f("yes", 7500, 0.5, False, short=True))      # flat
+        with mock.patch.object(imm, "CHEAP_NEAR_CAP_FRAC", 0.0):
+            self.assertFalse(f("yes", 7500, 7440.0, False, short=True))
+        with mock.patch.object(imm, "CHEAP_CAP_UNWIND", False):
+            self.assertFalse(f("yes", 7500, 7440.0, False, short=True))
+
+        # the rung on E45's book: a 30,000 pile at 1c, 2c offered
+        e = {"side": "yes", "px": 1, "size": 7500}
+        q, info = self._q(e, [(1, 30000)], [(98, 20000)], pos=7440.0)
+        self.assertIsNone(q)
+        self.assertIn("scores 0.2%", info["why"])
+        q, info = self._q(e, [(1, 30000)], [(98, 20000)], pos=0.0)
+        self.assertEqual((q.book_side, q.price_cents, q.count), ("bid", 1, 7500))
+        self.assertAlmostEqual(info["share"], 0.2)
+
+        def e45(no=(("0.9800", "20000"),)):
+            c = self._long_shot(FakeClient(), yes=(("0.0100", "30000"),), no=no)
+            c.markets[self.T].update(yes_bid_dollars="0.0100", yes_ask_dollars="0.0200")
+            return c
+
+        def run(bot, c, held):
+            bot.pnl.pos[self.T], bot.pnl.avg[self.T] = held, 1.0
+            c.positions[self.T] = held
+            bot.state.universe_at = 0.0
+            lines = []
+            with mock.patch.object(imm, "log", lines.append):
+                bot.run_cycle()
+            got = sorted((o["book_side"], o["yes_price"], o["remaining_count"])
+                         for o in bot.state.sim_orders.values() if o["ticker"] == self.T)
+            return got, [x for x in lines if "cheap" in x]
+
+        self._write({self.T: e})
+        c = e45()
+        bot = IncentiveMarketMaker(client=c, live=False)
+        got, lines = run(bot, c, 7440.0)
+        self.assertEqual(got, [("ask", 2, 7440.0)], lines)
+        self.assertTrue(any("$74.40 held on its YES side" in x
+                            and "the near-cap unwind (+7440 of 7500; what is left: the rung "
+                                "scores 0.2% of its side" in x
+                            and "unwinding ASK 7440 @ 2c" in x for x in lines), lines)
+        self.assertIn(self.T, bot.state.cheap_cap_unwind)
+        # 4,440 sold: 3,000 left, under half the cap -- latched, still the unwind
+        got, lines = run(bot, c, 3000.0)
+        self.assertEqual(got, [("ask", 2, 3000.0)], lines)
+        # flat: the unwind ends and the bid comes back
+        got, lines = run(bot, c, 0.0)
+        self.assertEqual(got, [("bid", 1, 7500.0)], lines)
+        self.assertNotIn(self.T, bot.state.cheap_cap_unwind)
+
+        # under half its size: the rung that cannot earn just stands aside
+        _clean_persist()
+        c = e45()
+        bot = IncentiveMarketMaker(client=c, live=False)
+        with mock.patch.object(imm, "CHEAP_NEAR_CAP_FRAC", 0.995):
+            got, lines = run(bot, c, 7440.0)
+        self.assertEqual(got, [], lines)
+        self.assertNotIn(self.T, bot.state.cheap_cap_unwind)
+        # a full-size rung would not rest either (the other side under target):
+        # no unwind -- the book, not the position, keeps the bid out
+        _clean_persist()
+        c = e45(no=(("0.9800", "500"),))
+        bot = IncentiveMarketMaker(client=c, live=False)
+        got, lines = run(bot, c, 7440.0)
+        self.assertEqual(got, [], lines)
+        self.assertNotIn(self.T, bot.state.cheap_cap_unwind)
+        self.assertTrue(any("under target" in x for x in lines), lines)
+        # off: as before -- nothing rests, nothing unwinds
+        _clean_persist()
+        c = e45()
+        bot = IncentiveMarketMaker(client=c, live=False)
+        with mock.patch.object(imm, "CHEAP_NEAR_CAP_FRAC", 0.0):
+            got, lines = run(bot, c, 7440.0)
+        self.assertEqual(got, [], lines)
+
     def test_dry_cycle_rests_a_subpenny_rung(self):
         """A market priced in tenths of a cent, YES 0.2x0.3, listed YES 0.2c x
         5,000: the bot rests that bid at its exact price, and keeps it"""

@@ -10583,6 +10583,18 @@ CHEAP_STOP_USD = _env_float("IMM_CHEAP_STOP_USD", 100.0)
 # the bid (state.cheap_cap_unwind, persisted; cheap_scan.held_keep reads it to
 # keep the market listed). IMM_CHEAP_CAP_UNWIND=off turns it off.
 CHEAP_CAP_UNWIND = os.environ.get("IMM_CHEAP_CAP_UNWIND", "on").strip().lower() != "off"
+# THE NEAR-CAP UNWIND (Jack 2026-11-16: "Yes, fix it", to "Fix E45's near-cap
+# gap so it unwinds?"). KXDSENATESEATS-29-E45 held 7,440 YES at 1c against its
+# 7,500 cap (7,560 bought, 120 sold): 60 contracts of room, so it was never "at
+# its cap" -- but a 60-lot rung scores 0.0-0.2% of its side, under the 1% bar,
+# so nothing rested (0% quoted on 11/15) and no unwind ran: idle, a +$37 mark
+# gain with no order working it. Now a side also counts as AT ITS CAP when the
+# rung stands aside ONLY because of what the side already holds -- what is left
+# of the cap cannot earn, while a full-size rung on the same book would rest --
+# and the side holds CHEAP_NEAR_CAP_FRAC of its size or more (so a small fill
+# on a rung hovering at the 1% bar never latches an unwind). From then on it is
+# the at-cap unwind, latched until flat. IMM_CHEAP_NEAR_CAP_FRAC=0 turns it off.
+CHEAP_NEAR_CAP_FRAC = _env_float("IMM_CHEAP_NEAR_CAP_FRAC", 0.5)
 
 
 def cheap_path() -> str:
@@ -10718,12 +10730,18 @@ def cheap_exposure(side: str, pos: float, avg: Optional[float], px: float) -> fl
     return held * max(0.0, c) / 100.0
 
 
-def cheap_cap_unwinds(side: str, size, pos: float, latched: bool) -> bool:
+def cheap_cap_unwinds(side: str, size, pos: float, latched: bool,
+                      short: bool = False) -> bool:
     """THE AT-CAP UNWIND: does a cheap market (listed `side`, rung `size`; `pos`
     the bot's YES position) unwind its side this cycle? While the bot holds 1+
     there: once the side is at its cap (size - held < 1, the rung has nothing
     left to rest -- cheap_side_quote's "at its cap"), and from then on while it
-    is still unwinding (`latched`). Off with CHEAP_CAP_UNWIND."""
+    is still unwinding (`latched`). Off with CHEAP_CAP_UNWIND.
+
+    THE NEAR-CAP UNWIND: `short` -- the rung stood aside this cycle only
+    because of what the side holds (what is left of the cap cannot earn, a
+    full-size rung would rest) -- counts as at its cap too once the side holds
+    CHEAP_NEAR_CAP_FRAC of its size or more (off at 0)."""
     if not CHEAP_CAP_UNWIND:
         return False
     held = pos if side == "yes" else -pos
@@ -10733,7 +10751,10 @@ def cheap_cap_unwinds(side: str, size, pos: float, latched: bool) -> bool:
         room = float(size) - held
     except (TypeError, ValueError):
         return bool(latched)
-    return bool(latched) or int(max(0.0, room)) < 1
+    if bool(latched) or int(max(0.0, room)) < 1:
+        return True
+    return bool(short) and CHEAP_NEAR_CAP_FRAC > 0 \
+        and held >= CHEAP_NEAR_CAP_FRAC * float(size) - 1e-9
 
 
 def cheap_cap_unwind_load(raw) -> Dict[str, float]:
@@ -43609,6 +43630,8 @@ class IncentiveMarketMaker:
             # and the one order is the unwind at breakeven or better.
             # THE AT-CAP UNWIND: the same once a fill took the side to its cap,
             # kept until the side is flat
+            # THE NEAR-CAP UNWIND: the same when the rung stands aside only
+            # because of what the side holds (a full-size rung would rest)
             if cheap is not None:
                 _cs = cheap["cheap"]["side"]
                 _cavg = self.pnl.avg.get(t)
@@ -43616,6 +43639,33 @@ class IncentiveMarketMaker:
                 _cstop = CHEAP_STOP_USD > 0 and _cexp >= CHEAP_STOP_USD - 0.005
                 _ccap = cheap_cap_unwinds(_cs, cheap.get("size"), cap_pos,
                                           t in self.state.cheap_cap_unwind)
+
+                def _csq(p, _t=t, _cheap=cheap, _meta=meta, _ob=ob):
+                    return cheap_side_quote(
+                        _t, _cheap, yes_levels, no_levels, own_in_book,
+                        *orderbook_exact_levels(_ob),
+                        own_exact_by_ticker.get(_t, []) if self.live else [],
+                        _meta.target_size, _meta.discount_factor, p,
+                        step=_meta.price_step)
+                _rung = None
+                _cnear = None
+                if not (_cstop or _ccap):
+                    try:
+                        _rung = _csq(cap_pos)
+                    except Exception as e:  # never costs the cycle: nothing rests
+                        _rung = (None, {"why": f"failed ({e!r})"})
+                    _rheld = cap_pos if _cs == "yes" else -cap_pos
+                    if _rung[0] is None and _rheld >= 1 and CHEAP_CAP_UNWIND \
+                            and CHEAP_NEAR_CAP_FRAC > 0 \
+                            and "at its cap" not in str(_rung[1].get("why", "")):
+                        try:
+                            _full = _csq(0.0)[0]
+                        except Exception:   # no probe, no near-cap unwind
+                            _full = None
+                        if _full is not None and cheap_cap_unwinds(
+                                _cs, cheap.get("size"), cap_pos, False, short=True):
+                            _ccap = True
+                            _cnear = _rung[1].get("why")
                 if _ccap:
                     self.state.cheap_cap_unwind.setdefault(t, now_ts)
                 else:
@@ -43630,9 +43680,10 @@ class IncentiveMarketMaker:
                         _cq, _ci = None, {"why": f"unwind failed ({e!r})"}
                     _ci["exposure"] = _cexp
                     if not _cstop:
-                        _ci["trigger"] = (f"the at-cap unwind "
+                        _ci["trigger"] = (f"the {'near-cap' if _cnear else 'at-cap'} unwind "
                                           f"({(cap_pos if _cs == 'yes' else -cap_pos):+.0f} "
-                                          f"of {cheap.get('size')})")
+                                          f"of {cheap.get('size')}"
+                                          f"{'; what is left: ' + str(_cnear) if _cnear else ''})")
                     if _cq is not None:
                         self._cheap_unwind[t] = (_cq.book_side, _cq.count)
                     else:
@@ -43641,15 +43692,7 @@ class IncentiveMarketMaker:
                     mq = [_cq] if (_cq is not None and CHEAP_MODE == "on") else []
                 else:
                     self._cheap_unwind.pop(t, None)
-                    try:
-                        _cq, _ci = cheap_side_quote(
-                            t, cheap, yes_levels, no_levels, own_in_book,
-                            *orderbook_exact_levels(ob),
-                            own_exact_by_ticker.get(t, []) if self.live else [],
-                            meta.target_size, meta.discount_factor, cap_pos,
-                            step=meta.price_step)
-                    except Exception as e:  # never costs the cycle: nothing rests
-                        _cq, _ci = None, {"why": f"failed ({e!r})"}
+                    _cq, _ci = _rung if _rung is not None else (None, {"why": "no rung built"})
                     if reduce_only and _cq is not None:
                         _cq, _ci = None, dict(_ci, why="reduce-only (out of the selection)")
                     self._cheap_side_note(t, _cq, _ci, meta)
