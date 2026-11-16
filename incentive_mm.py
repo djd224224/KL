@@ -6426,6 +6426,26 @@ FAMILY_MAX_SERIES_FETCHES = _env_int("IMM_FAMILY_MAX_SERIES_FETCHES", 80)
 # series -> {"carbon_arc": bool, "ts": float, "title": str}: the in-memory
 # mirror of FAMILY_VERDICT_FILE (see load_family_verdicts).
 FAMILY_VERDICTS: Dict[str, dict] = {}
+# EVERY CARBON ARC SERIES IS A FAMILY MEMBER (Jack 2026-11-16: "all carbon arc
+# events should be part of the carbon arc family", after "Yes, move them" on
+# the sector arrays). The overrides task files a Carbon Arc series whose name
+# fits no family suffix in the finecon group, whose 35 seats members never
+# give up: on 11/16 12:21Z 28 of the 35 were array strikes projecting under
+# the $1.10 bar while KXFASTARRAY-26DEC05 T98 ($4.29), T96 ($2.60) and
+# KXAIAPPARRAY-26DEC08-T600 ($2.50) sat out as `finecon_top_n` -- the
+# TikTok Shop case of 11/13 (87ed13b) again. With this on, ANY series whose
+# source verdict says Carbon Arc (carbon_arc_settled) is allowed into the
+# normal book as a family member (family_series_allowed), the finecon loader
+# refuses it, and it takes the Carbon Arc guard set (FAMILY_OVERRIDE_PARENTS).
+# Verdicts are read for the suffix families, FT / APP / ARRAY
+# (FAMILY_VERDICT_EXTRA_SUFFIXES) and every series in the finecon extra file
+# (_FINECON_EXTRA_RAW), so a new Carbon Arc shape the task files there
+# leaves finecon one refresh after its verdict lands. IMM_CA_FAMILY_ALL=0
+# reverts to the suffix families only.
+CA_FAMILY_ALL = os.environ.get("IMM_CA_FAMILY_ALL", "1") == "1"
+# every series named in the finecon extra file, as last read (before the
+# family refusals): their source verdicts are read too
+_FINECON_EXTRA_RAW: Set[str] = set()
 
 
 def series_family_suffix(series: str) -> bool:
@@ -6462,10 +6482,11 @@ def family_verdict(series: str) -> Optional[bool]:
 
 
 def family_series_allowed(series: str) -> bool:
-    """The family-suffix arm of _allowed: suffix match AND (source check off
-    OR a True verdict). Unknown -> False, fail closed."""
+    """The Carbon Arc family arm of _allowed: suffix match AND (source check
+    off OR a True verdict) -- or, with CA_FAMILY_ALL, any series with a True
+    Carbon Arc verdict whatever its name. Unknown -> False, fail closed."""
     if not series_family_suffix(series):
-        return False
+        return CA_FAMILY_ALL and FAMILY_SOURCE_CHECK and family_verdict(series) is True
     if not FAMILY_SOURCE_CHECK:
         return True
     return family_verdict(series) is True
@@ -6492,9 +6513,12 @@ FAMILY_VERDICT_EXTRA_SUFFIXES = tuple(
 
 def series_verdict_wanted(series: str) -> bool:
     """Series the bot source-verifies: the suffix families plus the
-    exact-list Carbon Arc families."""
+    exact-list Carbon Arc families -- and, with CA_FAMILY_ALL, every series
+    the finecon extra file names (the overrides task files new Carbon Arc
+    shapes there)."""
     return series_family_suffix(series) or any(
-        series.endswith(suf) for suf in FAMILY_VERDICT_EXTRA_SUFFIXES)
+        series.endswith(suf) for suf in FAMILY_VERDICT_EXTRA_SUFFIXES) or (
+        CA_FAMILY_ALL and series in _FINECON_EXTRA_RAW)
 
 
 def carbon_arc_settled(series: str) -> bool:
@@ -12983,6 +13007,10 @@ FAMILY_OVERRIDE_PARENTS = (
     # set (safe-join, no rate bar), the same one every Carbon Arc family has
     ("family_suffix", "TTS", "KXDRPEPPERPOS"),
     ("family_suffix", "TTSARRAY", "KXDRPEPPERPOS"),
+    # every other Carbon Arc-verified series (2026-11-16, CA_FAMILY_ALL): the
+    # sector arrays and any new shape take the same guard set (FT / APP
+    # keep their own archetypes above, the identical values)
+    ("predicate", lambda s: CA_FAMILY_ALL and carbon_arc_settled(s), "KXDRPEPPERPOS"),
     # regex kind (2026-09-24): the sports ladder / escalator families
     ("pattern", SPORTS_LADDER_LEAGUE_RE, "KXNFLLADDERREC"),
     # monthly rain cities beyond the named list (2026-10-26, see
@@ -14687,6 +14715,7 @@ _CONFIG_CODE_KNOBS = (
     "CA_FAIR_REL_SIGMA_EXEMPT", "CA_FAIR_REFRESH_HOLD_BY_CAT",   # ADS / apps (2026-10-10)
     "CA_LANDING_WINDOWS",          # Carbon Arc 1x while data lands (2026-10-10)
     "CA_SAT_AM_1X_CATS",           # ...and ad spend 1x on Saturday morning (2026-11-15)
+    "CA_FAMILY_ALL",               # every Carbon Arc series a family member (2026-11-16)
     "CA_LATE_TOXIC_SIDE_BY_CAT",   # late-month blocked side per category (2026-10-11)
     # the scheduled-data stand-aside (2026-10-15)
     "CA_SCHEDULE_HOLD", "CA_SCHEDULE_HOLD_CATS", "CA_SCHEDULE_PRE_MIN", "CA_SCHEDULE_POST_MIN",
@@ -15805,12 +15834,23 @@ def finecon_expand_family(series_seen) -> int:
     return len(added)
 
 
+def _finecon_extra_ca() -> frozenset:
+    """The finecon extra file's series that are Carbon Arc-verified (they
+    belong to the Carbon Arc family with CA_FAMILY_ALL, 2026-11-16)."""
+    if not CA_FAMILY_ALL:
+        return frozenset()
+    return frozenset(s for s in _FINECON_EXTRA_RAW if carbon_arc_settled(s))
+
+
 def load_finecon_extra_series() -> int:
     try:
         mtime = os.path.getmtime(FINECON_EXTRA_FILE)
     except OSError:
         return 0
-    if mtime == _finecon_extra_state["mtime"]:
+    # re-read on a new file OR on a new Carbon Arc verdict for one of its
+    # series (that series leaves the group: CA_FAMILY_ALL)
+    if mtime == _finecon_extra_state["mtime"] \
+            and _finecon_extra_ca() == _finecon_extra_state.get("ca"):
         return 0
     _finecon_extra_state["mtime"] = mtime
     try:
@@ -15820,6 +15860,7 @@ def load_finecon_extra_series() -> int:
         log(f"[IMM] ! finecon extra file unreadable: {e}")
         return 0
     fresh: Set[str] = set()
+    raw: Set[str] = set()
     for s in data.get("series") or []:
         s = str(s).strip()
         if not s or not s.startswith("KX"):
@@ -15828,6 +15869,7 @@ def load_finecon_extra_series() -> int:
                 or series_pattern_blocked(s):
             log(f"[IMM] ! refused blocklisted series in finecon extra: {s}")
             continue
+        raw.add(s)
         # A name-pattern family member belongs to the NORMAL book (2026-09-22:
         # the 17 *POS entries the Carbon Arc self-extend wrote here were
         # walked/capped as finecon and mostly unquoted). Skipped and logged
@@ -15838,7 +15880,18 @@ def load_finecon_extra_series() -> int:
                 log(f"[IMM] finecon extra: {s} matches a family suffix "
                     f"-> normal book (ALLOW_FAMILY_SUFFIXES), not finecon")
             continue
+        # ...and so does any other Carbon Arc-verified series (2026-11-16,
+        # CA_FAMILY_ALL: the sector arrays, a new shape)
+        if CA_FAMILY_ALL and carbon_arc_settled(s):
+            if s not in _finecon_family_skipped:
+                _finecon_family_skipped.add(s)
+                log(f"[IMM] finecon extra: {s} is Carbon Arc-settled -> the "
+                    f"Carbon Arc family (normal book), not finecon")
+            continue
         fresh.add(s)
+    _FINECON_EXTRA_RAW.clear()
+    _FINECON_EXTRA_RAW.update(raw)
+    _finecon_extra_state["ca"] = _finecon_extra_ca()
     target = _FINECON_BASE | FINECON_FAMILY | fresh
     changed = len(target ^ FINECON_SERIES)
     if changed:
@@ -47031,6 +47084,11 @@ class IncentiveMarketMaker:
             log(f"cold thresholds (2026-10-30): KX<CITY>LOWT safe-join, "
                 f"x{TEMP_THRESHOLD_SIZE_MULT:g} (cap {MAX_POSITION_CONTRACTS * TEMP_THRESHOLD_SIZE_MULT:g}), "
                 f"out {TEMP_THRESHOLD_STOP_DAYS:g}d before the period's first day")
+        log("ca family (2026-11-16): "
+            + ("every Carbon Arc-verified series (arrays, any new shape) is a "
+               "family member in the normal book, never finecon"
+               if CA_FAMILY_ALL and FAMILY_SOURCE_CHECK else
+               f"suffixes {','.join(ALLOW_FAMILY_SUFFIXES)} only"))
         if CA_FAIR_ENABLE:
             log(f"ca-fair gate: Carbon Arc-settled at-touch, tol "
                 f"{CA_FAIR_TOL_CENTS}c, band sigma x{CA_FAIR_SIGMA_LO_FRAC:g}-1, "

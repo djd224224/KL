@@ -19529,6 +19529,56 @@ class TestFineconFamilyRule(unittest.TestCase):
             except OSError: pass
             imm._finecon_extra_state["mtime"] = 0.0
 
+    def test_a_carbon_arc_series_leaves_finecon_for_the_ca_family(self):
+        # Jack 2026-11-16: "all carbon arc events should be part of the carbon
+        # arc family" -- KXFASTARRAY-26DEC05 T96 / T98 ($2.60 / $4.29) sat out
+        # as finecon_top_n behind 28 array strikes under the $1.10 bar
+        import json as _json, os as _os
+        _os.makedirs(imm.STATUS_DIR, exist_ok=True)
+        with open(imm.FINECON_EXTRA_FILE, "w") as f:
+            _json.dump({"series": ["KXFAKEARRAY", "KXFAKENEWSHAPE", "KXNOTCA"]}, f)
+        raw = set(imm._FINECON_EXTRA_RAW)
+        try:
+            with mock.patch.dict(imm.FAMILY_VERDICTS, {"KXFAKEARRAY": {
+                    "carbon_arc": True, "ts": 1.0, "title": "Fake spend array"}}):
+                imm._finecon_extra_state["mtime"] = 0.0
+                imm.load_finecon_extra_series()
+                self.assertNotIn("KXFAKEARRAY", imm.FINECON_SERIES)
+                self.assertTrue(imm.family_series_allowed("KXFAKEARRAY"))
+                self.assertTrue(imm.IncentiveMarketMaker._allowed("KXFAKEARRAY-26DEC05-T96"))
+                # no verdict yet: stays in finecon, and its verdict is read
+                # because the file names it
+                self.assertIn("KXFAKENEWSHAPE", imm.FINECON_SERIES)
+                self.assertFalse(imm.family_series_allowed("KXFAKENEWSHAPE"))
+                self.assertTrue(imm.series_verdict_wanted("KXFAKENEWSHAPE"))
+                self.assertFalse(imm.series_verdict_wanted("KXGOODNOTLISTED"))
+                # the verdicts land: the next refresh moves it, file unchanged
+                imm.FAMILY_VERDICTS["KXFAKENEWSHAPE"] = {"carbon_arc": True, "ts": 1.0, "title": ""}
+                imm.FAMILY_VERDICTS["KXNOTCA"] = {"carbon_arc": False, "ts": 1.0, "title": ""}
+                self.assertGreater(imm.load_finecon_extra_series(), 0)
+                self.assertNotIn("KXFAKENEWSHAPE", imm.FINECON_SERIES)
+                self.assertTrue(imm.family_series_allowed("KXFAKENEWSHAPE"))
+                self.assertIn("KXNOTCA", imm.FINECON_SERIES)            # not Carbon Arc
+                self.assertFalse(imm.family_series_allowed("KXNOTCA"))
+                self.assertEqual(imm.load_finecon_extra_series(), 0)    # settled
+                # the Carbon Arc guard set
+                imm.SERIES_OVERRIDES.pop("KXFAKEARRAY", None)
+                imm.ensure_family_override("KXFAKEARRAY")
+                self.assertEqual(imm.SERIES_OVERRIDES["KXFAKEARRAY"],
+                                 imm.SERIES_OVERRIDES["KXDRPEPPERPOS"])
+                # IMM_CA_FAMILY_ALL=0: the suffix families only, as before
+                with mock.patch.object(imm, "CA_FAMILY_ALL", False):
+                    self.assertFalse(imm.family_series_allowed("KXFAKEARRAY"))
+                    imm._finecon_extra_state["mtime"] = 0.0
+                    imm.load_finecon_extra_series()
+                    self.assertIn("KXFAKEARRAY", imm.FINECON_SERIES)
+        finally:
+            try: _os.remove(imm.FINECON_EXTRA_FILE)
+            except OSError: pass
+            imm._finecon_extra_state["mtime"] = 0.0
+            imm._finecon_extra_state.pop("ca", None)
+            imm._FINECON_EXTRA_RAW.clear(); imm._FINECON_EXTRA_RAW.update(raw)
+
 
 class TestLifetimeSlotRelease(unittest.TestCase):
     """Jack 2026-09-09: "release a lifetime slot if <=5 contracts were filled
@@ -21562,9 +21612,15 @@ class TestFamilySourceVerdicts(unittest.TestCase):
         self.assertTrue(imm.carbon_arc_settled("KXNEWFT"))
         self.assertFalse(imm.carbon_arc_settled("KXNFLDRAFT"))
         self.assertFalse(imm.carbon_arc_settled("KXGOOD"))      # never read
-        # neither is a suffix-family member: admission is unchanged
+        # neither is a suffix-family member, but a verified Carbon Arc series
+        # is a family member whatever its name (CA_FAMILY_ALL, Jack
+        # 2026-11-16: "all carbon arc events should be part of the carbon
+        # arc family"); the draft series is not
         self.assertFalse(imm.series_family_suffix("KXNEWFT"))
-        self.assertFalse(imm.family_series_allowed("KXNEWFT"))
+        self.assertTrue(imm.family_series_allowed("KXNEWFT"))
+        self.assertFalse(imm.family_series_allowed("KXNFLDRAFT"))
+        with mock.patch.object(imm, "CA_FAMILY_ALL", False):
+            self.assertFalse(imm.family_series_allowed("KXNEWFT"))
         self.assertTrue(imm.series_verdict_wanted("KXNEWFT"))
         self.assertTrue(imm.series_verdict_wanted("KXURBNCC"))
         self.assertFalse(imm.series_verdict_wanted("KXGOOD"))
